@@ -20,8 +20,12 @@ const SEQ_SELM_CHOICES: &[&str] = &["All", "Specified", "Mask"];
 /// `:78`). Both switch on `(fieldIndex - indexof(DLY0)) & 3 == 0`, the DLYn
 /// slot of each four-field link group, so the predicate is the same one the
 /// graphic arm uses. The `DOn` slot (`& 3 == 2`) reads its units/precision
-/// from the DOLn link instead; an unset link supplies neither, which is the
-/// `""` / `prec->prec` the port already serves.
+/// from the DOLn link instead, and `dbGetPrecision` on a CONSTANT link fails
+/// (`S_db_noLSET`) into the same `prec->prec` fall-through every other field
+/// takes — which is
+/// [`route_field_metadata`](crate::server::record::RecordInstance)'s answer,
+/// not this override's. A CONNECTED DOLn is the one arm the port does not
+/// model: it serves seq's own PREC where C serves the upstream record's.
 fn seq_metadata_override(
     _rec: &SeqRecord,
     field: &str,

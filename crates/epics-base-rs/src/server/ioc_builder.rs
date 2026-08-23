@@ -363,12 +363,13 @@ impl IocBuilder {
                             }
                         }
                     }
+                    // Unconditional, as in `IocApp` — see the invariant on
+                    // `field_io::SnamPut`.
                     if let Some(EpicsValue::String(snam)) = instance.record.get_field("SNAM") {
-                        if let Some(sub_fn) =
-                            self.subroutine_registry.get(snam.as_str_lossy().as_ref())
-                        {
-                            instance.subroutine = Some(sub_fn.clone());
-                        }
+                        instance.subroutine = self
+                            .subroutine_registry
+                            .get(snam.as_str_lossy().as_ref())
+                            .cloned();
                     }
                 }
             }

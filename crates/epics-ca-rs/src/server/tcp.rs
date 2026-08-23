@@ -898,37 +898,38 @@ impl ClientState {
     ///. The trap flag is `false` for `SimplePv`/`RecordField`
     /// targets whose access was not resolved through a `TRAPWRITE`
     /// rule — including the no-ACF permissive fallback.
-    /// resolve an ASG's `INP*` links to live numeric values
-    /// (A..U) from the record database. `None` when a declared link is
-    /// unresolvable / bad — the CALC-gated rule then fails closed.
-    /// Caller must NOT hold a record read-guard that a link could point
-    /// back to (would re-read the same lock).
+    /// Resolve one ASG `INP*` link (`record` or `record.FIELD`) to its live
+    /// numeric value. `None` — the `asCa.c` "channel not connected" case —
+    /// marks that ONE input bad; which rules that disables is
+    /// `AccessSecurityConfig`'s decision, not this server's.
+    ///
+    /// Caller must NOT hold a record read-guard that a link could point back
+    /// to (would re-read the same lock).
+    fn resolve_inp_link(&self, link: &str) -> Option<f64> {
+        let (base, field) = epics_base_rs::server::access_security::inp_link_target(link);
+        let rec = self.db.get_record(base)?;
+        let inst = rec.read();
+        inst.resolve_field(field).and_then(|v| v.to_f64())
+    }
+
+    /// This ASG's live `INP*` state, walked by the owner in `epics-base-rs`.
     fn calc_inputs(
         &self,
         cfg: &AccessSecurityConfig,
         asg_name: &str,
-    ) -> Option<epics_base_rs::calc::NumericInputs> {
-        let group = cfg.asg.get(asg_name).or_else(|| cfg.asg.get("DEFAULT"))?;
-        let mut inputs = epics_base_rs::calc::NumericInputs::new();
-        for inp in &group.inp {
-            let idx = inp.index as usize;
-            if idx >= epics_base_rs::calc::CALC_NARGS {
-                continue;
-            }
-            let (base, field) = parse_pv_name(&inp.link);
-            let field = if field.is_empty() { "VAL" } else { field };
-            let rec = self.db.get_record(base)?;
-            let inst = rec.read();
-            match inst.resolve_field(field).and_then(|v| v.to_f64()) {
-                Some(v) => inputs.vars[idx] = v,
-                None => return None,
-            }
-        }
-        Some(inputs)
+    ) -> epics_base_rs::server::access_security::AsgInputs {
+        cfg.resolve_asg_inputs(asg_name, &|link| self.resolve_inp_link(link))
     }
 
-    /// evaluate `cfg`'s rules for `asg_name`, with CALC clauses
-    /// gated against the resolved `INP*` values.
+    /// Evaluate `cfg`'s rules for `asg_name`, with CALC clauses gated against
+    /// the resolved `INP*` values.
+    ///
+    /// The rule walk and the CALC truth test both belong to
+    /// `AccessSecurityConfig::compute_rules`; this server only resolves the
+    /// links and hands the values over. It used to carry its own evaluator,
+    /// a second copy of the one in `epics-base-rs` — and the copies drifted
+    /// together rather than apart: both tested `result != 0.0` where C tests
+    /// the `(0.99, 1.01)` band.
     fn access_for_asg(
         &self,
         cfg: &AccessSecurityConfig,
@@ -936,14 +937,6 @@ impl ClientState {
         asl: u8,
     ) -> (AccessLevel, bool) {
         let calc_inputs = self.calc_inputs(cfg, asg_name);
-        let calc_ok = |compiled: &epics_base_rs::calc::CompiledExpr| -> bool {
-            match calc_inputs {
-                Some(ref i) => epics_base_rs::calc::eval(compiled, &mut i.clone())
-                    .map(|r| r != 0.0)
-                    .unwrap_or(false),
-                None => false,
-            }
-        };
         cfg.compute_for_name(
             asg_name,
             self.hostname.as_str(),
@@ -952,7 +945,7 @@ impl ClientState {
             asl,
             &self.auth_method,
             &self.auth_authority,
-            &calc_ok,
+            Some(&calc_inputs),
         )
     }
 

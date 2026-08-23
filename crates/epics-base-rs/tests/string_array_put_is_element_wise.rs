@@ -3,7 +3,7 @@
 //!
 //! `caput -a` sends `DBR_STRING` unless told otherwise, so this is the default
 //! array-write path for every shell/script client. C converts it with the
-//! `putString*` family (`dbConvert.c:941-1148`), which runs the same per-element
+//! `putString*` family (`dbConvert.c:941-1147`), which runs the same per-element
 //! parse over all `nRequest` elements:
 //!
 //! ```c

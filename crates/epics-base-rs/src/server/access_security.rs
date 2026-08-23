@@ -257,6 +257,26 @@ pub fn new_acf_cell(initial: Option<AccessSecurityConfig>) -> AcfCell {
     )))
 }
 
+/// Build a shared [`AcfCell`] that serves `db`, with its ASG `INP*` watcher
+/// already running (C `asCa.c`, see [`spawn_asg_inp_watcher`]).
+///
+/// The constructor every server that enforces a policy over a record database
+/// must use. Access levels are cached per channel, so a policy cell without
+/// the watcher silently keeps a `CALC`-gated grant alive after the gate
+/// closes; welding the watcher to construction is what stops the next serving
+/// entry point from re-opening that hole. [`new_acf_cell`] stays for the cells
+/// that gate no database — the gateways' proxied namespace, fixtures.
+///
+/// Must be called from within the runtime: it spawns.
+pub fn new_acf_cell_watching(
+    initial: Option<AccessSecurityConfig>,
+    db: &std::sync::Arc<crate::server::database::PvDatabase>,
+) -> AcfCell {
+    let cell = new_acf_cell(initial);
+    spawn_asg_inp_watcher(db, &cell);
+    cell
+}
+
 /// HAG DNS re-resolution cadence — the same 60 s the CA client's
 /// `refresh_dns` interval uses for its half of epics-base#863.
 const HAG_DNS_REFRESH: std::time::Duration = std::time::Duration::from_secs(60);
@@ -295,6 +315,138 @@ pub fn spawn_hag_refresh(cell: &AcfCell) {
             }
         }
     });
+}
+
+/// Retry cadence for an ASG `INP*` link whose record is not in the database
+/// yet. C reaches the same place through CA: `asCaStart` creates a channel per
+/// link (`asCa.c:180-205`) and the search retries until the record appears, so
+/// an input declared before its record loads is still monitored afterwards.
+const ASG_INP_RETRY: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Spawn the ASG `INP*` value watcher for `cell` over `db` — C `asCa.c`.
+///
+/// C monitors every ASG input link and each update runs
+/// `pasg->inpChanged |= (1<<idx); if(!caInitializing) asComputeAsg(pasg);`
+/// (`asCa.c:148-161`), reaching `asComputePvt` (`asLibRoutines.c:1049-1051`)
+/// which fires `asClientCOAR` for every client whose level moved. The port had
+/// no such monitor: a level was recomputed only on an ACF reload or a write to
+/// a record's `ASG` field, so shutting a `CALC`-gated interlock left every
+/// already-connected client holding the WRITE grant it was given when the gate
+/// was open, and a client that connected while it was shut stayed read-only
+/// after it opened.
+///
+/// This is that monitor, in-process: one `EventMask::VALUE` subscription per
+/// distinct link target ([`AccessSecurityConfig::inp_link_targets`]), and
+/// [`notify_asg_field_changed`] on any post. That is the signal
+/// [`AcfCell::store`] already raises, so the CA server's `reeval_access_rights`
+/// and the QSRV grant cache need no new plumbing. Like C's `asComputeAsg` this
+/// re-evaluates every client rather than only the ASGs reading the changed
+/// link; the downstream `oldaccess != access` gate keeps the wire cost at zero
+/// when no level moved.
+///
+/// The task holds only `Weak`s to the cell and the database, and ends when the
+/// owning IOC drops either.
+fn spawn_asg_inp_watcher(db: &std::sync::Arc<crate::server::database::PvDatabase>, cell: &AcfCell) {
+    let weak_cell = std::sync::Arc::downgrade(&cell.0);
+    let weak_db = std::sync::Arc::downgrade(db);
+    let mut acf_rx = subscribe_asg_changes();
+    crate::runtime::task::spawn(async move {
+        enum Wake {
+            /// A watched link posted a new value.
+            Values,
+            /// Re-derive the watch set (policy may have been replaced, or a
+            /// link's record may have loaded since the last attempt).
+            Rebuild,
+            Stop,
+        }
+        let mut readers: Vec<crate::server::event_queue::EventReader> = Vec::new();
+        // Targets not yet attached because their record is not loaded.
+        let mut pending: Vec<(String, String)> = Vec::new();
+        // Identity of the policy `readers` was built from. A notification this
+        // task raises itself does not move it, so the watcher cannot re-enter
+        // its own rebuild.
+        let mut built_from: usize = 0;
+
+        loop {
+            let (Some(inner), Some(db)) = (weak_cell.upgrade(), weak_db.upgrade()) else {
+                break;
+            };
+            let config = inner.load_full();
+            drop(inner);
+            let id = config
+                .as_ref()
+                .map_or(0, |c| std::sync::Arc::as_ptr(c) as usize);
+            if id != built_from {
+                built_from = id;
+                readers.clear();
+                pending = config.map(|c| c.inp_link_targets()).unwrap_or_default();
+            }
+            pending.retain(|(record, field)| !attach_asg_inp(&db, record, field, &mut readers));
+            drop(db);
+
+            let wake = tokio::select! {
+                r = acf_rx.recv() => match r {
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => Wake::Stop,
+                    _ => Wake::Rebuild,
+                },
+                () = drain_any_asg_inp(&mut readers) => Wake::Values,
+                () = crate::runtime::task::sleep(ASG_INP_RETRY) => Wake::Rebuild,
+            };
+            match wake {
+                Wake::Stop => break,
+                Wake::Rebuild => {}
+                Wake::Values => notify_asg_field_changed(),
+            }
+        }
+    });
+}
+
+/// Subscribe one `INP*` target to its record's value events. `false` = not
+/// attached, retry later; the record is not in the database yet, or its
+/// subscriber cap is full (which frees again as clients disconnect, and losing
+/// a security monitor is worth the retry's log noise).
+fn attach_asg_inp(
+    db: &crate::server::database::PvDatabase,
+    record: &str,
+    field: &str,
+    readers: &mut Vec<crate::server::event_queue::EventReader>,
+) -> bool {
+    let Some(rec) = db.get_record(record) else {
+        return false;
+    };
+    let reader = rec.write().add_subscriber(
+        field,
+        0,
+        crate::types::DbFieldType::Double,
+        crate::server::recgbl::EventMask::VALUE.bits(),
+    );
+    match reader {
+        Some(reader) => {
+            readers.push(reader);
+            true
+        }
+        None => false,
+    }
+}
+
+/// Resolve once any watched link has posted, having drained every queued post
+/// so one re-evaluation covers a burst. C coalesces the same way — many
+/// `asComputeAsg` calls, one `asClientCOAR` per actual level change.
+async fn drain_any_asg_inp(readers: &mut [crate::server::event_queue::EventReader]) {
+    std::future::poll_fn(|cx| {
+        let mut fired = false;
+        for reader in readers.iter_mut() {
+            while let std::task::Poll::Ready(Some(_)) = reader.poll_recv(cx) {
+                fired = true;
+            }
+        }
+        if fired {
+            std::task::Poll::Ready(())
+        } else {
+            std::task::Poll::Pending
+        }
+    })
+    .await
 }
 
 #[derive(Clone)]
@@ -492,43 +644,29 @@ impl AccessGate {
                         // or any input is bad/disconnected → CALC fails
                         // closed. Each rule's expression is then evaluated
                         // synchronously in `compute_rules`.
-                        let inp_values: Option<crate::calc::NumericInputs> = match self.inp_resolver
-                        {
+                        let inp_values: Option<AsgInputs> = match self.inp_resolver {
                             None => None,
                             Some(ref res) => {
-                                match cfg.asg.get(&asg).or_else(|| cfg.asg.get("DEFAULT")) {
-                                    None => None,
-                                    Some(group) => {
-                                        let mut inputs = crate::calc::NumericInputs::new();
-                                        let mut ok = true;
-                                        for inp in &group.inp {
-                                            let idx = inp.index as usize;
-                                            if idx >= crate::calc::CALC_NARGS {
-                                                continue;
-                                            }
-                                            match res(inp.link.clone()).await {
-                                                Some(v) => inputs.vars[idx] = v,
-                                                None => {
-                                                    ok = false;
-                                                    break;
-                                                }
-                                            }
-                                        }
-                                        ok.then_some(inputs)
+                                let mut inputs = AsgInputs::default();
+                                if let Some(group) =
+                                    cfg.asg.get(&asg).or_else(|| cfg.asg.get("DEFAULT"))
+                                {
+                                    for inp in &group.inp {
+                                        inputs.record(inp.index, res(inp.link.clone()).await);
                                     }
                                 }
+                                Some(inputs)
                             }
                         };
-                        let calc_ok = |compiled: &crate::calc::CompiledExpr| -> bool {
-                            let Some(ref inputs) = inp_values else {
-                                return false;
-                            };
-                            crate::calc::eval(compiled, &mut inputs.clone())
-                                .map(|r| r != 0.0)
-                                .unwrap_or(false)
-                        };
                         let (level, rule_was_trap) = cfg.compute_for_name(
-                            &asg, host, user, roles, asl, method, authority, &calc_ok,
+                            &asg,
+                            host,
+                            user,
+                            roles,
+                            asl,
+                            method,
+                            authority,
+                            inp_values.as_ref(),
                         );
                         if let Some(key) = key {
                             let mut cache = self.check_cache.write();
@@ -716,6 +854,12 @@ pub struct AccessRule {
     /// that carries `calc` text without the compiled form fails closed
     /// in `compute_rules`.
     pub calc_compiled: Option<crate::calc::CompiledExpr>,
+    /// The arguments this rule's CALC expression READS, as a bitmap over
+    /// A..U — C's `pasgrule->inpUsed`, computed once at load by
+    /// `calcArgUsage` (`asLibRoutines.c:1416`). `asComputePvt` (`:1048`)
+    /// intersects it with the ASG's `inpBad` so an unresolvable link disables
+    /// only the rules that actually read it. `0` for a rule with no CALC.
+    pub inp_used: u32,
     /// True when the rule must be treated as inert by `asComputePvt`.
     /// C `asAsgRuleDisable` (`asLib.y:300-306`) sets `pasgrule->ignore`
     /// for a RULE that contains an unsupported keyword. This port also
@@ -736,6 +880,22 @@ fn rule_access(rule: &AccessRule) -> AccessLevel {
         RuleAccess::Read => AccessLevel::Read,
         RuleAccess::Write => AccessLevel::ReadWrite,
     }
+}
+
+/// C's truth test for a `RULE(...) { CALC(...) }` result
+/// (`asLibRoutines.c:972`):
+///
+/// ```c
+/// pasgrule->result = ((result>.99) && (result<1.01)) ? 1 : 0;
+/// ```
+///
+/// consumed at `:1048` as `pasgrule->result==1`. The open interval is a
+/// deliberate tolerance for float error around 1, NOT a shorthand for
+/// "non-zero": C refuses a rule whose CALC returns 2, -1, 0.5 or 3. Testing
+/// `result != 0.0` instead — which both of this port's former evaluators did
+/// — grants WRITE on every truthy non-unity result.
+fn calc_result_is_true(result: f64) -> bool {
+    result > 0.99 && result < 1.01
 }
 
 /// Monotonic ordering of access levels used by `asComputePvt`'s
@@ -760,6 +920,50 @@ pub struct AccessSecurityGroup {
     pub inp: Vec<AsgInp>,
 }
 
+/// The live state of an ASG's `INP(A..U)` links: the resolved values C keeps
+/// in `pasg->pavalue[]` and the `inpBad` bitmap it keeps alongside them.
+///
+/// C sets a bit per *input* (`asCa.c connectCallback:91-105`, on a channel
+/// that is not connected) and `asComputePvt` (`asLibRoutines.c:1048`) tests it
+/// against the *rule's* own `inpUsed`:
+///
+/// ```c
+/// if(!pasgrule->calc
+/// || (!(pasg->inpBad & pasgrule->inpUsed) && (pasgrule->result==1)))
+/// ```
+///
+/// so a bad input disables only the rules that read it. Both of this port's
+/// resolvers used to abort their link walk on the first unresolvable link and
+/// hand `None` to the evaluator, which failed EVERY CALC rule in the group —
+/// one typo in an `INPB` no rule mentions took writes away from the whole ASG.
+#[derive(Debug, Clone, Default)]
+pub struct AsgInputs {
+    /// Resolved values, indexed A..U.
+    pub values: crate::calc::NumericInputs,
+    /// Bit `i` set ⟹ `INP(i)` is declared but could not be resolved.
+    pub bad: u32,
+}
+
+impl AsgInputs {
+    /// Record one declared link's resolution. `None` — no such record, no such
+    /// field, a non-numeric value, a disconnected CA link — sets the input's
+    /// `bad` bit and leaves its value at 0, which is what C holds for a
+    /// channel that never connected.
+    ///
+    /// This is the single owner of "what an unresolvable INP link means";
+    /// every resolver drives it rather than deciding for itself.
+    pub fn record(&mut self, index: u8, value: Option<f64>) {
+        let idx = index as usize;
+        if idx >= crate::calc::CALC_NARGS {
+            return;
+        }
+        match value {
+            Some(v) => self.values.vars[idx] = v,
+            None => self.bad |= 1u32 << idx,
+        }
+    }
+}
+
 /// A single `INP(A..U)` link declaration within an ASG.
 #[derive(Debug, Clone)]
 pub struct AsgInp {
@@ -767,6 +971,18 @@ pub struct AsgInp {
     pub index: u8,
     /// The link string (typically a record.field PV name).
     pub link: String,
+}
+
+/// Split an ASG `INP*` link into the `(record, field)` it names — C's
+/// `dbNameToAddr` on the link string, with the `VAL` default a bare record
+/// name carries.
+///
+/// The single owner of that split. The resolvers that READ a link and the
+/// watcher that SUBSCRIBES to it must name the same field, or a value change
+/// fires no re-evaluation.
+pub fn inp_link_target(link: &str) -> (&str, &str) {
+    let (record, field) = crate::server::database::parse_pv_name(link);
+    (record, if field.is_empty() { "VAL" } else { field })
 }
 
 /// Access Security Configuration parsed from an ACF file.
@@ -940,8 +1156,9 @@ impl AccessSecurityConfig {
     /// matching rule carried `NOTRAPWRITE`, and when it carried no
     /// trap option at all.
     /// Resolve `asg_name` (falling back to `DEFAULT`) and evaluate its
-    /// rules with the given `roles` and CALC `calc_ok`. The single entry
-    /// the role-/CALC-aware [`AccessGate::check_with_roles`] uses.
+    /// rules with the given `roles` and the ASG's resolved `INP*` values.
+    /// The single entry every CALC-aware caller uses — the CA server and
+    /// [`AccessGate::check_with_roles`] alike.
     #[allow(clippy::too_many_arguments)]
     pub fn compute_for_name(
         &self,
@@ -952,7 +1169,7 @@ impl AccessSecurityConfig {
         record_asl: u8,
         method: &str,
         authority: &str,
-        calc_ok: &dyn Fn(&crate::calc::CompiledExpr) -> bool,
+        inputs: Option<&AsgInputs>,
     ) -> (AccessLevel, bool) {
         let asg = match self.asg.get(asg_name) {
             Some(a) => a,
@@ -962,7 +1179,7 @@ impl AccessSecurityConfig {
             },
         };
         self.compute_rules(
-            asg, host, user, roles, record_asl, method, authority, calc_ok,
+            asg, host, user, roles, record_asl, method, authority, inputs,
         )
     }
 
@@ -1010,19 +1227,25 @@ impl AccessSecurityConfig {
         // matching rule's `trapMask` only on the lines that also raise
         // `access` (`asLibRoutines.c:986`, `:1042`). A `NoAccess`
         // outcome therefore always carries `trap = false`.
-        self.compute_rules(asg, host, user, &[], record_asl, method, authority, &|_| {
-            false
-        })
+        // No INP* resolution on this sync path, so a CALC-gated rule has no
+        // values to evaluate against and fails CLOSED — see `compute_rules`.
+        self.compute_rules(asg, host, user, &[], record_asl, method, authority, None)
     }
 
-    /// The single rule-matching loop, parameterised
-    /// by the client's `roles` (for `role/<name>` UAG members, QSRV
-    /// `documentation/ioc.rst:181-188`) and a `calc_ok(expr)` evaluator
-    /// — a CALC-gated rule grants only when it returns true.
-    /// [`Self::check_access_method_trap`] passes no roles and a
-    /// fail-closed calc evaluator (so the sync path stays closed when no
-    /// INP* resolver is installed); [`AccessGate::check`] supplies the
-    /// real roles and an INP*-resolving evaluator.
+    /// The single rule-matching loop — C `asComputePvt`
+    /// (`asLibRoutines.c:992-1062`) — parameterised by the client's `roles`
+    /// (for `role/<name>` UAG members, QSRV `documentation/ioc.rst:181-188`)
+    /// and by the ASG's resolved `INP*` values.
+    ///
+    /// CALC evaluation lives HERE and nowhere else. C has one owner too:
+    /// `asComputeAsgPvt` (`asLibRoutines.c:953-990`) computes
+    /// `pasgrule->result` and `asComputePvt` (`:1048`) consumes it. The port
+    /// used to take a `calc_ok` closure instead, which every caller wrote for
+    /// itself — and both callers wrote the same wrong truth test.
+    ///
+    /// `inputs` is `None` on the sync path
+    /// ([`Self::check_access_method_trap`]), which resolves no links; a
+    /// CALC-gated rule then fails CLOSED.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn compute_rules(
         &self,
@@ -1033,7 +1256,7 @@ impl AccessSecurityConfig {
         record_asl: u8,
         method: &str,
         authority: &str,
-        calc_ok: &dyn Fn(&crate::calc::CompiledExpr) -> bool,
+        inputs: Option<&AsgInputs>,
     ) -> (AccessLevel, bool) {
         let mut access = AccessLevel::NoAccess;
         let mut trap = false;
@@ -1113,18 +1336,26 @@ impl AccessSecurityConfig {
             if !authority_match {
                 continue;
             }
-            // a CALC-gated rule grants only while its expression
-            // evaluates true against the resolved INP* link values. C
-            // `asLibRoutines.c:957-1042` evaluates `calcPerform()` and
-            // grants on a true result with good inputs. `calc_ok` returns
-            // false when the expression is false, an input is bad, or no
-            // INP* resolver is installed (fail closed). The program was
-            // compiled once at ACF parse; a rule holding `calc` text with
-            // no compiled form (hand-built, bypassing `parse_acf`) fails
-            // closed here.
+            // A CALC-gated rule grants only while its expression evaluates
+            // true against the resolved INP* link values. The program was
+            // compiled once at ACF parse; a rule holding `calc` text with no
+            // compiled form (hand-built, bypassing `parse_acf`) fails closed
+            // here, as does one with no resolved inputs at all.
             if rule.calc.is_some() {
-                match rule.calc_compiled {
-                    Some(ref compiled) if calc_ok(compiled) => {}
+                let Some(compiled) = rule.calc_compiled.as_ref() else {
+                    continue;
+                };
+                let Some(inputs) = inputs else {
+                    continue;
+                };
+                // C `asLibRoutines.c:1048`: `!(pasg->inpBad & pasgrule->inpUsed)`.
+                // A bad input the rule READS disables it; a bad input elsewhere
+                // in the group is none of this rule's business.
+                if inputs.bad & rule.inp_used != 0 {
+                    continue;
+                }
+                match crate::calc::eval(compiled, &mut inputs.values.clone()) {
+                    Ok(result) if calc_result_is_true(result) => {}
                     _ => continue,
                 }
             }
@@ -1136,6 +1367,44 @@ impl AccessSecurityConfig {
             trap = rule.trap;
         }
         (access, trap)
+    }
+
+    /// Walk `asg_name`'s declared `INP(A..U)` links (falling back to
+    /// `DEFAULT`, as every other lookup here does) and resolve each with
+    /// `resolve`, returning C's per-ASG input state. This is `asCa.c`'s job
+    /// done on demand: the port has no standing CA monitor per link, so the
+    /// values are read when the rules are evaluated.
+    ///
+    /// An unknown ASG with no `DEFAULT` yields empty inputs — no links, so no
+    /// bad bits, and a CALC rule then evaluates against zeros exactly as C
+    /// does for an ASG that declares none.
+    pub fn resolve_asg_inputs(
+        &self,
+        asg_name: &str,
+        resolve: &dyn Fn(&str) -> Option<f64>,
+    ) -> AsgInputs {
+        let mut inputs = AsgInputs::default();
+        let Some(group) = self.asg.get(asg_name).or_else(|| self.asg.get("DEFAULT")) else {
+            return inputs;
+        };
+        for inp in &group.inp {
+            inputs.record(inp.index, resolve(&inp.link));
+        }
+        inputs
+    }
+
+    /// Every distinct `(record, field)` an `INP*` link in this policy names,
+    /// across all ASGs — the set a re-evaluation trigger must watch. C builds
+    /// the same set one CA channel at a time in `asCaStart`.
+    pub fn inp_link_targets(&self) -> Vec<(String, String)> {
+        let mut targets = std::collections::BTreeSet::new();
+        for group in self.asg.values() {
+            for inp in &group.inp {
+                let (record, field) = inp_link_target(&inp.link);
+                targets.insert((record.to_string(), field.to_string()));
+            }
+        }
+        targets.into_iter().collect()
     }
 
     /// Check access taking the per-record ASL into account.
@@ -2270,13 +2539,39 @@ fn parse_rule(chars: &mut std::iter::Peekable<std::str::Chars>) -> CaResult<Acce
     // INP* resolver is installed the evaluator returns false (fail
     // closed), preserving the previous deny behaviour without
     // hard-disabling the rule.
-    let calc_compiled =
-        match calc {
-            Some(ref expr) => Some(crate::calc::compile(expr).map_err(|e| {
+    let mut inp_used: u32 = 0;
+    let calc_compiled = match calc {
+        Some(ref expr) => {
+            let compiled = crate::calc::compile(expr).map_err(|e| {
                 CaError::Protocol(format!("ACF: bad CALC expression '{expr}': {e}"))
-            })?),
-            None => None,
-        };
+            })?;
+            // C `asAsgRuleCalc` (`asLibRoutines.c:1416-1425`) runs
+            // `calcArgUsage` right after `postfix()` and refuses the rule when
+            // the expression stores into an argument:
+            //
+            //     /* Until someone proves stores are not dangerous, don't allow them */
+            //     if (stores) { … status = S_asLib_badCalc; … }
+            //
+            // `asLib.y:294-299` turns that status into `yyerror("")`, so the
+            // WHOLE file is rejected and a running IOC keeps its previous rule
+            // set. Accepting the rest of the file instead would be strictly
+            // less safe than C: the operator's edit would silently install a
+            // weaker policy than the one they wrote.
+            //
+            // The danger is concrete — `CALC("A:=1")` evaluates to 1 whatever
+            // the INP links read, so the rule becomes an unconditional grant
+            // to everyone in the group.
+            let (used, stores) = compiled.arg_usage();
+            if stores != 0 {
+                return Err(CaError::Protocol(format!(
+                    "ACF: assignment operator used in CALC expression '{expr}'"
+                )));
+            }
+            inp_used = used;
+            Some(compiled)
+        }
+        None => None,
+    };
 
     Ok(AccessRule {
         level,
@@ -2288,6 +2583,7 @@ fn parse_rule(chars: &mut std::iter::Peekable<std::str::Chars>) -> CaResult<Acce
         trap,
         calc,
         calc_compiled,
+        inp_used,
         ignore,
     })
 }
@@ -3262,6 +3558,29 @@ ASG(LOCKED)    { }
         );
     }
 
+    /// The watch set the ASG `INP*` re-evaluation trigger builds: one entry
+    /// per distinct `(record, field)`, with the `VAL` default a bare record
+    /// name carries, and no duplicate when two ASGs read the same link.
+    #[test]
+    fn inp_link_targets_are_deduplicated_across_groups() {
+        let cfg = parse_acf(
+            r#"
+            ASG(A) { INPA("gate") INPB("gate.RVAL") RULE(1, WRITE) { CALC("A") } }
+            ASG(B) { INPA("gate") INPB("other.SEVR") RULE(1, WRITE) { CALC("A") } }
+            "#,
+        )
+        .expect("parse");
+        assert_eq!(
+            cfg.inp_link_targets(),
+            vec![
+                ("gate".to_string(), "RVAL".to_string()),
+                ("gate".to_string(), "VAL".to_string()),
+                ("other".to_string(), "SEVR".to_string()),
+            ],
+            "`gate` is read by both groups but is one subscription"
+        );
+    }
+
     /// with an `INP*` resolver installed, a CALC-gated rule
     /// grants when the expression is true, denies when false, denies on
     /// a bad input, and denies when no resolver is installed.
@@ -3312,15 +3631,13 @@ ASG(LOCKED)    { }
             parse_acf(r#"UAG(special) { "role/op" } ASG(G) { RULE(1, WRITE) { UAG(special) } }"#)
                 .unwrap();
         let (lvl, _) =
-            cfg.compute_for_name("G", "h", "acct", &["op".to_string()], 0, "ca", "", &|_| {
-                false
-            });
+            cfg.compute_for_name("G", "h", "acct", &["op".to_string()], 0, "ca", "", None);
         assert_eq!(
             lvl,
             AccessLevel::ReadWrite,
             "role/op member matches a client holding role 'op'"
         );
-        let (lvl_none, _) = cfg.compute_for_name("G", "h", "acct", &[], 0, "ca", "", &|_| false);
+        let (lvl_none, _) = cfg.compute_for_name("G", "h", "acct", &[], 0, "ca", "", None);
         assert_eq!(
             lvl_none,
             AccessLevel::NoAccess,

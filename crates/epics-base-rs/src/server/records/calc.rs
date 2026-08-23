@@ -342,6 +342,12 @@ impl CalcRecord {
 }
 
 impl Record for CalcRecord {
+    /// C `calcRecord.c::init_record` (:90-114) ends without touching
+    /// MLST/ALST/LALM — `sub` and `calcout`, the two records closest to it,
+    /// both do seed (`subRecord.c:130-132`, `calcoutRecord.c:217-219`), so
+    /// this is per-type and not derivable from the record's shape.
+    fn seed_deadband_tracking(&mut self) {}
+
     fn record_type(&self) -> &'static str {
         "calc"
     }

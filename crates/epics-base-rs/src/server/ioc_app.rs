@@ -670,7 +670,12 @@ impl IocApplication {
         // afterwards observe the same store (upstream issue #667
         // adjacent: a config that only lands in a shell-local copy is
         // access security silently OFF).
-        let acf = access_security::new_acf_cell(acf);
+        // Watched over this IOC's database: an ASG `INP*` value change must
+        // re-evaluate live access rights (C `asCa.c`). The database is still
+        // empty here — the startup script loads it — and so is the policy if
+        // the script's `asInit` supplies it; the watcher attaches to each link
+        // when its record and its policy turn up.
+        let acf = access_security::new_acf_cell_watching(acf, &db);
         // Periodic HAG DNS re-resolution under asCheckClientIP — C
         // freezes HAG IPs at ACF load until a manual asInit
         // (epics-base#863 / UI-107). Weak-referenced: ends when this
@@ -1292,12 +1297,15 @@ async fn wire_subroutines(db: &PvDatabase, registry: &HashMap<String, Arc<Subrou
                         }
                     }
                 }
+                // C `init_record`'s `prec->sadr = registryFunctionFind(...)`,
+                // assigned whatever the lookup returned. Unconditional so the
+                // invariant "`subroutine` is the resolution of the current
+                // SNAM" holds by construction rather than by this field
+                // happening to start out `None`.
                 if let Some(crate::types::EpicsValue::String(snam)) =
                     instance.record.get_field("SNAM")
                 {
-                    if let Some(sub_fn) = registry.get(snam.as_str_lossy().as_ref()) {
-                        instance.subroutine = Some(sub_fn.clone());
-                    }
+                    instance.subroutine = registry.get(snam.as_str_lossy().as_ref()).cloned();
                 }
             }
         }

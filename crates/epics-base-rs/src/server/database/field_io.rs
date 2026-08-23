@@ -6,6 +6,22 @@ use crate::types::EpicsValue;
 
 use super::PvDatabase;
 
+/// pvxs's `record._options.process` term (`ioc/iocsource.cpp:426-448`)
+/// as the database sees it: how much processing an EXTERNAL client put
+/// drives. The one enum behind both PVA sources and the QSRV group put,
+/// so `True`/`False`/`Unset` are spelled once.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ProcessMode {
+    /// pvxs `Unset` — process only when the record's own rules say so
+    /// (C `dbPutField`'s `pp(TRUE)` + `SCAN=Passive` test).
+    #[default]
+    Passive,
+    /// pvxs `True` — force a processing cycle after the write.
+    Force,
+    /// pvxs `False` — write the field and stop.
+    Inhibit,
+}
+
 /// C `dbPutField`'s put-disable gate (`dbAccess.c:1255-1257`):
 /// `precord->disp && paddr->pfield != &precord->disp` → `S_db_putDisabled`.
 ///
@@ -54,7 +70,7 @@ fn check_put_disabled(
 /// The declaration itself lives in [`RecordInstance::is_no_mod`](crate::server::record::RecordInstance::is_no_mod), which C
 /// exposes as `dbChannelSpecial(...) == SPC_NOMOD` and reads from TWO places:
 /// this gate (`dbPut`, dbAccess.c:123-126) and `rsrvCheckPut`
-/// (camessage.c:2540-2551), which feeds the CA ACCESS_RIGHTS write bit. This
+/// (camessage.c:2608-2619), which feeds the CA ACCESS_RIGHTS write bit. This
 /// function is the first consumer; `epics-ca-rs`'s `compute_access` is the
 /// second.
 ///
@@ -158,6 +174,72 @@ fn emit_cycle_posts(instance: &mut crate::server::record::RecordInstance) {
     }
 }
 
+/// The registry half of a SNAM `special()` — C `subRecord.c::special`
+/// (`:170-195`) and `aSubRecord.c::special` (`:552-578`), which resolve
+/// `prec->snam` through `registryFunctionFind` and assign `prec->sadr`.
+///
+/// C runs it as `dbPutSpecial(paddr, 1)`, AFTER the field is stored
+/// (`dbAccess.c:1355-1404`), so the name resolved is the STORED one:
+/// `putStringString` truncates a DBF_STRING put to `field_size - 1` — 39 for
+/// sub's `size(40)`, 40 for aSub's `size(41)` — and C looks up whatever
+/// survived that. Resolving the value the caller handed in would bind a
+/// routine whose name the record does not hold.
+///
+/// `sadr` takes the lookup result UNCONDITIONALLY, NULL included, and only then
+/// does the status decide: a non-empty unregistered name is `S_db_BadSub`,
+/// which `dbPut` adopts as the put's status (`if (status2) status = status2;`)
+/// and whose `goto done` skips the UDF clear, the field's monitor post and — in
+/// `dbPutField` — the process. The name stays stored either way.
+///
+/// INVARIANT: `RecordInstance::subroutine` is the registry resolution of the
+/// record's current SNAM, C's `prec->sadr`. Three owners perform that
+/// transition and nothing else under `src/` writes the field:
+///
+/// - `IocApp` (`ioc_app.rs`) and `IocBuilder` (`ioc_builder.rs`) at iocInit —
+///   C's `init_record`, a different function running the same lookup.
+/// - `apply_asub_dynamic_sub` (`processing.rs`) for aSub `LFLG=READ`, whose C
+///   rule deliberately differs: `fetch_values` (`aSubRecord.c:262-266`) returns
+///   `S_db_BadSub` BEFORE assigning `sadr`, so READ mode KEEPS the old routine
+///   on an unregistered name. Routing it through this owner would clear it.
+/// - this function, for every `dbPut` route, because [`special_after_put`] is
+///   the one caller and every route goes through that.
+///
+/// `RecordInstance::new` initialises the field to `None`, which is the initial
+/// state and not a transition. `put_pv_no_process` (the autosave-restore entry)
+/// writes SNAM while running NEITHER `special()` pass, so it leaves the binding
+/// stale — a whole missing `dbPutSpecial`, not this rule's half. The remaining
+/// writers are `#[test]` fixtures binding a routine without a registry.
+fn snam_special_after_put(
+    db: &PvDatabase,
+    instance: &mut crate::server::record::RecordInstance,
+    field: &str,
+) -> CaResult<()> {
+    if !instance.record.is_subroutine_name_field(field) {
+        return Ok(());
+    }
+    let Some(EpicsValue::String(stored)) = instance.record.get_field(field) else {
+        return Ok(());
+    };
+    let name = stored.as_str_lossy();
+    if name.is_empty() {
+        // aSub: `pfunc = 0` with no error, so `caput X.SNAM ""` unbinds and
+        // succeeds (`aSubRecord.c:560-561`, stored at `:575`). sub's C leaves
+        // `sadr` alone and parks PACT instead (`subRecord.c:182-186`); this
+        // port clears, because
+        // the put-side park is not implemented here and a retained routine would
+        // keep RUNNING every scan where C's parked record does nothing at all.
+        instance.subroutine = None;
+        return Ok(());
+    }
+    let resolved = db.find_subroutine_named(name.as_ref());
+    let bad_sub = resolved.is_none();
+    instance.subroutine = resolved;
+    if bad_sub {
+        return Err(CaError::BadField("SNAM: Subroutine not found".into()));
+    }
+    Ok(())
+}
+
 /// C `dbPutSpecial(paddr, 1)` — the after-put `special()`, paired with the drain
 /// of the link writes it queued ([`Record::take_special_actions`](crate::server::record::Record::take_special_actions)).
 ///
@@ -175,11 +257,19 @@ fn emit_cycle_posts(instance: &mut crate::server::record::RecordInstance) {
 /// only for the SIMM↔SSCN swap below, which the caller applies through
 /// `update_scan_index` once the record lock is down.
 fn special_after_put(
+    db: &PvDatabase,
     instance: &mut crate::server::record::RecordInstance,
     field: &str,
     out: &mut Vec<crate::server::record::ProcessAction>,
 ) -> CaResult<crate::server::record::CommonFieldPutResult> {
-    let status = instance.record.special(field, true);
+    let mut status = instance.record.special(field, true);
+    // The record's half above and the registry half here are ONE C function,
+    // `special(paddr, 1)`, so they share the action drain, the error-path post
+    // emission and the status. The record cannot do the lookup itself — the
+    // function registry belongs to the database, not to the record.
+    if status.is_ok() {
+        status = snam_special_after_put(db, instance, field);
+    }
     out.extend(instance.record.take_special_actions());
     if status.is_err() {
         // The POSTS `special()` made are drained on the failing path for the same
@@ -244,7 +334,7 @@ fn special_after_put(
 ///
 /// The other pass-0 body is `subRecord.c::special`'s park release:
 /// `if (prec->snam[0] == 0 && prec->pact) { prec->pact = FALSE; prec->rpro =
-/// FALSE; }` (`subRecord.c:183-187`) — the record is parked exactly while it
+/// FALSE; }` (`subRecord.c:175-178`) — the record is parked exactly while it
 /// cannot process, so the store about to happen gets a clean slate and
 /// [`special_after_put`] re-takes the park if the NEW value still leaves the
 /// record unable to run. The record cannot reach PACT, so it answers
@@ -267,6 +357,26 @@ fn special_before_put(
     None
 }
 
+/// Who arms the queued put-notify restart that a PACT release owes.
+///
+/// C reaches `restartCheck` only from `dbNotifyCompletion` ← `recGblFwdLink`
+/// (`recGbl.c:295`) — the tail of a process CYCLE, never the `pact = FALSE`
+/// store itself. A put body that arms it directly is therefore only correct
+/// when no cycle follows the put; when one does, the replay races it.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum RestartOwner {
+    /// The put is the whole transaction. Nothing else will reach the record,
+    /// so the put body is the only site that can arm the restart.
+    ThisPut,
+    /// The caller drives a process cycle on the SAME record the moment this
+    /// put returns — an OUT link's `processTarget`, QSRV's `Force` mode. That
+    /// cycle's tail is C's owner; arming here lets the replay take the
+    /// record's gate first and the record then processes the replayed put
+    /// BEFORE the put that released the park (measured: `bump` twice, VAL 5.0
+    /// where C gives 4.0).
+    TheCycleThisPutOwes,
+}
+
 /// The finalizer for the PACT release [`special_before_put`] performs.
 ///
 /// Declared BEFORE the `rec.write()` guard at every put body, so Rust's
@@ -278,14 +388,20 @@ fn special_before_put(
 /// A guard and not a call because the release sits ABOVE the fallible tail of
 /// the put — `special_after_put`, `put_common_field`, the rejected-conversion
 /// `Err` — and C `dbNotifyCompletion` is reached from `recGblFwdLink` on EVERY
-/// path that ends the cycle. A token that never reaches the consumer is what
-/// [`PactExit`](crate::server::record::PactExit)'s `Drop` canary reports, and
-/// the put's value is lost with it.
+/// path that ends the cycle. Nothing reports a token that never reaches the
+/// consumer: [`PactExit`](crate::server::record::PactExit) has no `Drop`, and
+/// its `#[must_use]` fires only on an unused *expression*, never on a
+/// `let`-bound token left behind by a `?`. The guard is the whole enforcement.
+///
+/// The cycle body has the same debt at a different scope; its owner is
+/// `processing::CycleEndGuard`, which pays the full `end_process_cycle` tail
+/// rather than the restart drain alone.
 struct PactExitGuard<'a> {
     db: &'a PvDatabase,
     name: &'a str,
     rec: &'a std::sync::Arc<parking_lot::RwLock<crate::server::record::RecordInstance>>,
     exit: Option<crate::server::record::PactExit>,
+    owner: RestartOwner,
 }
 
 impl<'a> PactExitGuard<'a> {
@@ -293,12 +409,14 @@ impl<'a> PactExitGuard<'a> {
         db: &'a PvDatabase,
         name: &'a str,
         rec: &'a std::sync::Arc<parking_lot::RwLock<crate::server::record::RecordInstance>>,
+        owner: RestartOwner,
     ) -> Self {
         PactExitGuard {
             db,
             name,
             rec,
             exit: None,
+            owner,
         }
     }
 
@@ -310,7 +428,15 @@ impl<'a> PactExitGuard<'a> {
 
 impl Drop for PactExitGuard<'_> {
     fn drop(&mut self) {
-        if let Some(exit) = self.exit.take() {
+        let Some(exit) = self.exit.take() else {
+            return;
+        };
+        // `TheCycleThisPutOwes` drops the token on purpose and loses nothing:
+        // the tail re-derives it from the record
+        // (`RecordInstance::pact_exit_without_release` reads
+        // `notify_restart_pending()` at cycle end), so the restart is armed
+        // once, by C's owner, in C's order.
+        if self.owner == RestartOwner::ThisPut {
             self.db.apply_pact_exit(self.name, self.rec, exit);
         }
     }
@@ -322,39 +448,6 @@ fn pact_park_field(record: &dyn crate::server::record::Record, field: &str) -> b
         .pact_park_fields()
         .iter()
         .any(|f| f.eq_ignore_ascii_case(field))
-}
-
-/// C `special()` pass 1's re-bind: `prec->sadr = (SUBFUNCPTR)registryFunctionFind(
-/// prec->snam)` (`subRecord.c:188`, and `aSubRecord.c:557-575` under
-/// `lflg == aSubLFLG_IGNORE`). `RecordInstance::subroutine` IS `sadr`, and it was
-/// bound once at build, so a record went on calling the function its OLD name
-/// named. [`Record::is_subroutine_name_field`] already carries C's per-record
-/// gate, including aSub's LFLG one.
-///
-/// Runs after the store, so it reads the name that was just written. An empty
-/// name binds nothing, but not by returning quietly: C logs `"%s.SNAM is
-/// empty"`, sets `pact = TRUE` again and returns BEFORE the lookup
-/// (`subRecord.c:182-186`), so C keeps the previous name's binding in `sadr`
-/// while this clears it. Neither is observable — that same branch re-parks
-/// PACT, and `run_subroutine_body` treats "no binding, empty SNAM" as the
-/// no-op C does.
-fn rebind_subroutine(
-    db: &PvDatabase,
-    instance: &mut crate::server::record::RecordInstance,
-    field: &str,
-) {
-    if !instance.record.is_subroutine_name_field(field) {
-        return;
-    }
-    let name = match instance.record.get_field(field) {
-        Some(EpicsValue::String(s)) => s.as_str_lossy().into_owned(),
-        _ => return,
-    };
-    instance.subroutine = if name.is_empty() {
-        None
-    } else {
-        db.find_subroutine_named(&name)
-    };
 }
 
 /// The `recGblResetAlarms` half of a C `monitor()` that a `special()` invokes
@@ -751,7 +844,22 @@ impl PvDatabase {
     /// This is the whole `dbPut` body — the gate-held region, and it is a
     /// `fn`. See `acquire_put_gate`.
     pub fn put_pv_already_locked(&self, name: &str, value: EpicsValue) -> CaResult<()> {
-        self.put_pv_body(name, value)
+        self.put_pv_body(name, value, RestartOwner::ThisPut)
+    }
+
+    /// [`Self::put_pv_already_locked`] for a caller that drives a process
+    /// cycle on the SAME record the moment this returns — an OUT link's
+    /// `processTarget`, QSRV's `Force` mode.
+    ///
+    /// The only difference is who arms a queued put-notify restart when this
+    /// put releases a PACT park: that cycle's tail, as in C, rather than this
+    /// put body. See [`RestartOwner`].
+    pub fn put_pv_already_locked_before_process(
+        &self,
+        name: &str,
+        value: EpicsValue,
+    ) -> CaResult<()> {
+        self.put_pv_body(name, value, RestartOwner::TheCycleThisPutOwes)
     }
 
     /// Take the L1 advisory write gate a put to `name` needs, if any.
@@ -856,7 +964,7 @@ impl PvDatabase {
         crate::types::dbf_link_class(guard.record.record_type(), &field_upper).is_some()
     }
 
-    fn put_pv_body(&self, name: &str, value: EpicsValue) -> CaResult<()> {
+    fn put_pv_body(&self, name: &str, value: EpicsValue, owner: RestartOwner) -> CaResult<()> {
         let (base, field) = super::parse_pv_name(name);
         let field = field.to_ascii_uppercase();
 
@@ -891,7 +999,7 @@ impl PvDatabase {
             // Yields the owned outputs those tails consume. Note this is the
             // record's DATA lock coming down, not the advisory gate above.
             use crate::server::record::CommonFieldPutResult;
-            let mut pact_exit = PactExitGuard::new(self, base, &rec);
+            let mut pact_exit = PactExitGuard::new(self, base, &rec, owner);
             let (common_result, special_actions) = {
                 let mut instance = rec.write();
 
@@ -954,9 +1062,12 @@ impl PvDatabase {
                                 // `pp(TRUE)` process. `calcRecord::special` uses
                                 // that to refuse an uncompilable CALC with
                                 // S_db_badField, so the status must not be dropped.
-                                let result =
-                                    special_after_put(&mut instance, &field, &mut special_actions)?;
-                                rebind_subroutine(self, &mut instance, &field);
+                                let result = special_after_put(
+                                    self,
+                                    &mut instance,
+                                    &field,
+                                    &mut special_actions,
+                                )?;
                                 // C `dbAccess.c::dbPut:1410-1411` clears ONLY
                                 // `precord->udf = FALSE` on a value-field put —
                                 // the same clear (and the same
@@ -1216,7 +1327,7 @@ impl PvDatabase {
             // advisory `_record_gate` still holds the processing-exclusion
             // window across the whole helper.
             use crate::server::record::CommonFieldPutResult;
-            let mut pact_exit = PactExitGuard::new(self, base, &rec);
+            let mut pact_exit = PactExitGuard::new(self, base, &rec, RestartOwner::ThisPut);
             let (common_result, special_actions) = {
                 let mut instance = rec.write();
 
@@ -1259,9 +1370,12 @@ impl PvDatabase {
                                 // `dbPut` (dbAccess.c:1399-1405) — before the UDF
                                 // clear and the monitor post below, both of which
                                 // `goto done` skips on a non-zero status.
-                                let result =
-                                    special_after_put(&mut instance, &field, &mut special_actions)?;
-                                rebind_subroutine(self, &mut instance, &field);
+                                let result = special_after_put(
+                                    self,
+                                    &mut instance,
+                                    &field,
+                                    &mut special_actions,
+                                )?;
                                 // C `dbAccess.c::dbPut:1411` clears ONLY `precord->udf
                                 // = FALSE` on a value-field put, and nothing else. It
                                 // does NOT touch stat/sevr: the UDF_ALARM stays until
@@ -1480,6 +1594,88 @@ impl PvDatabase {
         let _origin_scope = crate::server::record::ambient_write_origin_scope(origin);
         self.put_record_field_from_ca_body(record_name, field, value, NotifyRequest::None)
             .map(|_| ())
+    }
+
+    /// The one router for an EXTERNAL client PUT that carries pvxs's
+    /// `record._options.process` / `.block` terms — QSRV's whole
+    /// `onPut` decision tree (`ioc/singlesource.cpp:346-384`,
+    /// `ioc/iocsource.cpp:397-419`) in one place, so the QSRV bridge
+    /// channel and the native PVA source cannot disagree about what
+    /// `process=false` or `block=true` means.
+    ///
+    /// A DBF link field ignores the requested mode: pvxs sends it down
+    /// `dbPutField` whatever the client asked (`iocsource.cpp:451-458`,
+    /// `dbNotify.c:337-353`), and the `dbPut`-analogue bodies refuse link
+    /// fields outright, so the Passive route is the only one that can
+    /// carry it.
+    ///
+    /// `doPreProcessing`'s two gates (`SPC_ATTRIBUTE` → `S_db_noMod`,
+    /// `DISP` → `S_db_putDisabled`) run here for every mode. The Passive
+    /// route re-checks them inside `put_record_field_from_ca`, but the
+    /// Force / Inhibit routes go through `put_pv` — the internal `dbPut`
+    /// analogue, which by design does not gate `DISP` — so the gate has
+    /// to be at this boundary for the invariant to hold by construction.
+    /// A caller that needs the rejection to precede its own ACF check
+    /// (pvxs runs `doPreProcessing` before `doFieldPreProcessing`) still
+    /// calls [`Self::check_external_put_preconditions`] itself; the check
+    /// is idempotent.
+    pub async fn put_field_from_client(
+        &self,
+        record_name: &str,
+        field: &str,
+        value: EpicsValue,
+        process: ProcessMode,
+        block: bool,
+    ) -> CaResult<()> {
+        let process = if self.is_dbf_link_field(record_name, field) {
+            ProcessMode::Passive
+        } else {
+            process
+        };
+        self.check_external_put_preconditions(record_name, field)
+            .await?;
+        match process {
+            ProcessMode::Inhibit => self.put_pv(&format!("{record_name}.{field}"), value).await,
+            ProcessMode::Passive => {
+                if block {
+                    let completion = self
+                        .put_record_field_from_ca(record_name, field, value)
+                        .await?;
+                    Self::await_completion(completion).await;
+                    Ok(())
+                } else {
+                    self.put_record_field_from_ca_no_notify(record_name, field, value)
+                        .await
+                }
+            }
+            ProcessMode::Force => {
+                self.put_pv(&format!("{record_name}.{field}"), value)
+                    .await?;
+                if block {
+                    // A blocking forced put is C `dbProcessNotify`
+                    // (`singlesource.cpp:360-369`): the reply waits for the
+                    // whole chain, async device completion included. The
+                    // bare `process_record_with_links` returns as soon as
+                    // the record goes PACT.
+                    let completion = self.process_record_with_notify(record_name).await?;
+                    Self::await_completion(completion).await;
+                    Ok(())
+                } else {
+                    // `doPostProcessing(forceProcessing == True)`
+                    // (`iocsource.cpp:404-419`) splits on PACT: an
+                    // async-active record takes `rpro = TRUE` and does not
+                    // process, an idle one takes `putf = TRUE` and does.
+                    // `put_driven_process` is that transition's owner.
+                    self.put_driven_process(record_name).await
+                }
+            }
+        }
+    }
+
+    async fn await_completion(completion: crate::server::record::ProcessCompletion) {
+        if let crate::server::record::ProcessCompletion::Async(rx) = completion {
+            let _ = rx.await;
+        }
     }
 
     /// C `dbPut`'s alarm-acknowledge interception (`dbAccess.c:1331-1335`) —
@@ -1820,34 +2016,6 @@ impl PvDatabase {
             check_no_mod(&instance, &field)?;
         }
 
-        // C `aSubRecord.c::special` / `subRecord.c::special` (SPC_MOD on SNAM):
-        // the put owner resolves the subroutine name against the registry — the
-        // record's `special()` cannot, having no DB handle. A non-empty,
-        // unregistered name will make the after-put `special()` refuse the
-        // write (`S_db_BadSub` → `ECA_PUTFAIL`) AFTER the value is stored, so
-        // the lookup is done up front here and its verdict applied inside the
-        // write below. An empty name names no routine and is accepted.
-        let snam_registry_reject = {
-            let name_to_resolve: Option<String> = {
-                let guard = rec.read();
-                if guard.record.is_subroutine_name_field(&field) {
-                    match &value {
-                        EpicsValue::String(s) => {
-                            let name = s.as_str_lossy();
-                            (!name.is_empty()).then(|| name.into_owned())
-                        }
-                        _ => None,
-                    }
-                } else {
-                    None
-                }
-            };
-            match name_to_resolve {
-                Some(name) => self.find_subroutine_named(&name).is_none(),
-                None => false,
-            }
-        };
-
         // C `processNotifyCommon` (dbNotify.c:225-231) tests PACT ABOVE the
         // put — `if (precord->pact) { ... pnotify->state =
         // notifyRestartCallbackRequested; ... return; }` — so a put-notify that
@@ -2088,7 +2256,7 @@ impl PvDatabase {
         // guard) before the notify-process / scan-index awaits below. Yields
         // either the success `CommonFieldPutResult`, or `(error, should_process)`
         // so the notify-driven process on a rejected put runs guard-free.
-        let mut pact_exit = PactExitGuard::new(self, record_name, &rec);
+        let mut pact_exit = PactExitGuard::new(self, record_name, &rec, RestartOwner::ThisPut);
         let outcome: Result<crate::server::record::CommonFieldPutResult, (CaError, bool)> = {
             let mut instance = rec.write();
 
@@ -2147,25 +2315,12 @@ impl PvDatabase {
                                 // and the field's monitor post, and `dbPutField`
                                 // skips the process. Propagating the error here
                                 // reproduces all three.
-                                let result =
-                                    special_after_put(&mut instance, &field, &mut special_actions)?;
-                                rebind_subroutine(self, &mut instance, &field);
-                                // C `aSubRecord.c::special` / `subRecord.c::special`
-                                // (SPC_MOD on SNAM): the name was stored by
-                                // `put_field` above (C keeps `prec->snam`), but an
-                                // unregistered name makes `special(after)` return
-                                // `S_db_BadSub`. The registry is the DB's,
-                                // unreachable from the record's `special()`, so the
-                                // lookup was performed up front and its refusal is
-                                // applied here — the same point C's `dbPut` returns
-                                // the after-put `special()` status: value kept, no
-                                // field monitor post, no `pp` process, client sees
-                                // `ECA_PUTFAIL` ("Channel write request failed").
-                                if snam_registry_reject {
-                                    return Err(CaError::BadField(
-                                        "SNAM: Subroutine not found".into(),
-                                    ));
-                                }
+                                let result = special_after_put(
+                                    self,
+                                    &mut instance,
+                                    &field,
+                                    &mut special_actions,
+                                )?;
                                 // C `dbAccess.c::dbPut:1410-1411` clears
                                 // `precord->udf = FALSE` synchronously when the
                                 // put target is the record-type's primary value

@@ -878,7 +878,7 @@ impl BridgeProvider {
     /// Which NT property leaves the channel `name` (`REC`, `REC.FIELD`, or a
     /// group member's channel) actually SUPPLIES — the record type's rset
     /// slots narrowed to the addressed field, as `dbChannelGet` narrows
-    /// `getProperties`'s option mask (`dbAccess.c:336-430`).
+    /// `getProperties`'s option mask (`dbAccess.c:336-427`).
     ///
     /// This is the same mask every [`Snapshot`](epics_base_rs::server::snapshot::Snapshot)
     /// carries; it is exposed separately for the paths that must decide which

@@ -92,6 +92,13 @@ impl MbboDirectRecord {
 }
 
 impl Record for MbboDirectRecord {
+    /// C `mbboDirectRecord.c:160` — `prec->mlst = prec->val`. MLST is
+    /// `special(SPC_NOMOD)` so it has no `put_field` arm for the trait default
+    /// to go through; the record seeds its own cell.
+    fn seed_deadband_tracking(&mut self) {
+        self.mlst = self.val;
+    }
+
     fn record_type(&self) -> &'static str {
         "mbboDirect"
     }
@@ -567,6 +574,7 @@ mod tests {
         rec_gbl_check_udf(
             &mut common,
             rec.udf_alarm_on_exact_one(),
+            rec.udf_alarm_severity(),
             rec.udf_alarm_message(),
         );
         assert_eq!(common.nsta, alarm_status::UDF_ALARM);

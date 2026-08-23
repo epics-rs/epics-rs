@@ -126,7 +126,7 @@ pub const FORM_CHOICES: [&str; 7] = [
 ///
 /// `getProperties` asks `dbChannelGet` for all six DBR property groups, and
 /// `dbGet` **clears** the option bit of every group the record type left NULL
-/// (`dbAccess.c:336-430`). Each NT leaf is then assigned only under its
+/// (`dbAccess.c:336-427`). Each NT leaf is then assigned only under its
 /// surviving bit, so [`PropertySupport`] — already narrowed to the addressed
 /// field by the DB layer — is the whole input to this decision.
 ///

@@ -278,7 +278,7 @@ impl CaServerBuilder {
     /// [`CaServer::tcp_port`] for the port actually bound.
     pub async fn build(self) -> CaResult<CaServer> {
         let (db, autosave_config) = self.ioc.build().await?;
-        let acf = epics_base_rs::server::access_security::new_acf_cell(self.acf);
+        let acf = epics_base_rs::server::access_security::new_acf_cell_watching(self.acf, &db);
         #[cfg(feature = "experimental-rust-tls")]
         let tls = self.tls.and_then(|t| match t {
             crate::tls::TlsConfig::Server(arc) => Some(Arc::new(std::sync::RwLock::new(arc))),

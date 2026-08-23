@@ -42,10 +42,10 @@ pub use record_instance::{
 pub(crate) use record_instance::{ambient_write_origin, value_as_dbr_string};
 pub use record_trait::{
     ArrayMonitorPost, Asl, CommonFieldPutResult, ConstantInitLink, CyclePostMask,
-    EPICS_TIME_EVENT_DEVICE_TIME, FieldDeclaration, FieldDesc, FieldMetadataOverride,
-    InputFetchPolicy, LinkReadAs, OutTarget, ProcessAction, ProcessContext, ProcessOutcome,
-    ProcessSnapshot, RawSoftEntry, Record, RecordProcessResult, Special, SubroutineFn,
-    ValuePostGate, coerce_put_value, put_field_internal_default, seed_input_links,
+    DelayedCallbackOutcome, EPICS_TIME_EVENT_DEVICE_TIME, FieldDeclaration, FieldDesc,
+    FieldMetadataOverride, InputFetchPolicy, LinkReadAs, OutTarget, ProcessAction, ProcessContext,
+    ProcessOutcome, ProcessSnapshot, RawSoftEntry, Record, RecordProcessResult, Special,
+    SubroutineFn, ValuePostGate, coerce_put_value, put_field_internal_default, seed_input_links,
 };
 pub(crate) use record_trait::{AuxPostMask, value_gate};
 pub use scan::{ScanList, ScanType, SimModeScan};

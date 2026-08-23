@@ -76,6 +76,13 @@ pub(crate) const BIT_NAMES: [&str; 32] = [
 ];
 
 impl Record for MbbiDirectRecord {
+    /// C `mbbiDirectRecord.c:128` — `prec->mlst = prec->val`, the whole of this
+    /// record's init tail. MLST is `special(SPC_NOMOD)` so it has no `put_field`
+    /// arm for the trait default to go through; the record seeds its own cell.
+    fn seed_deadband_tracking(&mut self) {
+        self.mlst = self.val;
+    }
+
     fn record_type(&self) -> &'static str {
         "mbbiDirect"
     }
@@ -123,6 +130,21 @@ impl Record for MbbiDirectRecord {
     /// `value_changed`.
     fn monitor_value_changed(&self) -> Option<bool> {
         Some(self.value_changed)
+    }
+
+    /// C `mbbiDirectRecord.c:168-169` raises UDF with the literal `INVALID_ALARM`, not
+    /// `prec->udfs`:
+    ///
+    /// ```c
+    /// if (prec->udf)
+    ///     recGblSetSevr(prec, UDF_ALARM, INVALID_ALARM);
+    /// ```
+    ///
+    /// so `UDFS` cannot weaken or silence this record's UDF alarm. `mbboDirect`, the other half of the Direct pair, passes
+    /// `prec->udfs` (`mbboDirectRecord.c:191`), and so does `mbbi`
+    /// (`mbbiRecord.c:302`) — the split is per-record, not per-family.
+    fn udf_alarm_severity(&self) -> Option<crate::server::record::AlarmSeverity> {
+        Some(crate::server::record::AlarmSeverity::Invalid)
     }
 
     fn init_record(&mut self, pass: u8) -> CaResult<()> {

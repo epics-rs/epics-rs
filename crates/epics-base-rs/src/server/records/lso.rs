@@ -184,6 +184,20 @@ impl Record for LsoRecord {
         false
     }
 
+    /// C `lsoRecord.c:117-118` raises UDF with the literal `INVALID_ALARM`, not
+    /// `prec->udfs`:
+    ///
+    /// ```c
+    /// if (prec->udf)
+    ///     recGblSetSevr(prec, UDF_ALARM, INVALID_ALARM);
+    /// ```
+    ///
+    /// so `UDFS` cannot weaken or silence this record's UDF alarm. `stringout`, the same shape of output record, passes `prec->udfs`
+    /// (`stringoutRecord.c:147`), so this is not a long-string or an output rule.
+    fn udf_alarm_severity(&self) -> Option<crate::server::record::AlarmSeverity> {
+        Some(crate::server::record::AlarmSeverity::Invalid)
+    }
+
     fn monitor_always_post(&self) -> (bool, bool) {
         // C `lsoRecord.c` monitor: `if (mpst == menuPost_Always) events |=
         // DBE_VALUE; if (apst == menuPost_Always) events |= DBE_LOG;`.

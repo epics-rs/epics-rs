@@ -94,6 +94,13 @@ pub struct ScalcoutRecord {
     /// owner of the ten-field alarm surface this record shares with
     /// calc/calcout/ai/ao.
     pub lalm: f64,
+    /// MLST / ALST — C `sCalcoutRecord.dbd`, both `DBF_DOUBLE`
+    /// `special(SPC_NOMOD)`. `monitor()` deadbands VAL against them
+    /// (sCalcoutRecord.c:828,837). The record served neither, so the
+    /// framework had no cell to remember the last posted value in and
+    /// treated every cycle as the first one.
+    pub mlst: f64,
+    pub alst: f64,
     /// PSVL — C `sCalcoutRecord.dbd:63` `field(PSVL,DBF_STRING)`,
     /// `special(SPC_NOMOD)`.
     ///
@@ -187,6 +194,8 @@ impl Default for ScalcoutRecord {
             str_vals: Default::default(),
             pval: 0.0,
             lalm: 0.0,
+            mlst: 0.0,
+            alst: 0.0,
             psvl: PvString::new(),
             calc_alarm: false,
             fetch_gate_failed: false,
@@ -253,6 +262,59 @@ impl ScalcoutRecord {
     fn apply_result(&mut self, result: &ScalcResult) {
         self.val = result.val;
         self.sval = PvString::from_bytes(result.sval.as_bytes());
+    }
+
+    /// C `sCalcoutRecord.c::execOutput` (755-777), the "Determine output data"
+    /// half: the DOPT switch that fills OVAL/OSV.
+    ///
+    /// The single owner of that switch, called from the two places C calls
+    /// `execOutput`: the immediate output at `:410` and the delayed
+    /// continuation at `:429`. C's ODLY arm returns at `:407` with the switch
+    /// UNRUN, so on a delayed cycle OCAL runs against the A..L / AA..LL present
+    /// at EXPIRY. Evaluating it while scheduling made the delay a no-op for
+    /// every input that moved inside the window — and made an OCAL with stores
+    /// (`A:=A+1`) land at scheduling time.
+    ///
+    /// Runs on EVERY output cycle, before the IVOA decision (whose Don't_drive
+    /// `break` is at `:795`), so OVAL/OSV are recomputed even when the OUT
+    /// write is vetoed.
+    fn exec_output_data(&mut self) {
+        if self.dopt != 1 {
+            // Use CALC result.
+            self.oval = self.val;
+            self.osv = self.sval.clone();
+            return;
+        }
+        // Use OCAL. C `:768` calls sCalcPerform on ORPC unconditionally on this
+        // branch, so an empty, uncompilable or failing OCAL are one case — the
+        // empty program fails like any other broken one. `presult = &pcalc->oval,
+        // psresult = pcalc->osv`, so the VAL/SVAL tokens in OCAL read the
+        // previous OVAL/OSV, not the VAL/SVAL this cycle computed; only the
+        // RESULT cells differ between the passes, the arg set is the record's
+        // own A..L / AA..LL that CALC stored into.
+        let mut inputs = self.build_inputs(self.oval, &self.osv);
+        match scalc_perform(&self.compiled_ocal, &mut inputs, self.prec) {
+            // As on the CALC side: a non-finite OCAL result is C's -1 with the
+            // cells written, and `execOutput` reads only the status — so it
+            // takes the OVAL=-1 sentinel branch too.
+            Ok(result) if !result.non_finite => {
+                // The OCAL-side mirror of `apply_result`: C passes
+                // `&pcalc->oval, pcalc->osv` and the SAME `pcalc->prec` to the
+                // same sCalcPerform (`:768-770`), so the same epilogue fills
+                // both cells.
+                self.oval = result.val;
+                self.osv = PvString::from_bytes(result.sval.as_bytes());
+            }
+            _ => {
+                // C `:771-773`: a failed OCAL sCalcPerform forces OVAL=-1 and
+                // OSV="***ERROR***" — the OCAL-side mirror of the CALC-fail
+                // VAL=-1 sentinel.
+                self.oval = -1.0;
+                self.osv = PvString::from("***ERROR***");
+                self.calc_alarm = true;
+            }
+        }
+        self.apply_stores(&inputs);
     }
 
     /// C `sCalcoutRecord.c:374-395` — the OOPT switch. "On Change" is the
@@ -434,6 +496,10 @@ const SCALCOUT_DOPT_CHOICES: &[&str] = &["Use CALC", "Use OCAL"];
 const SCALCOUT_WAIT_CHOICES: &[&str] = &["NoWait", "Wait"];
 
 impl Record for ScalcoutRecord {
+    /// C `sCalcoutRecord.c::init_record` (:203-322) ends without touching
+    /// LALM; every write to it is in `checkAlarms` (:727-750).
+    fn seed_deadband_tracking(&mut self) {}
+
     fn record_type(&self) -> &'static str {
         "scalcout"
     }
@@ -551,14 +617,16 @@ impl Record for ScalcoutRecord {
     fn process(&mut self) -> CaResult<ProcessOutcome> {
         // ODLY continuation: this is the delayed re-process scheduled by a
         // previous cycle (C `sCalcoutRecord.c::process` `pact==TRUE` + `dlya`
-        // branch, lines 421-432). Do NOT re-evaluate CALC / OCAL / should_output
-        // — C clears DLYA and runs `execOutput` directly. Honour the output
-        // decision the original cycle captured, clear DLYA, and let the
-        // framework write the OUT link. Mirrors calcout.rs.
+        // branch, lines 421-432). No input fetch and no CALC pass — C's `pact`
+        // arm re-enters below them — but `execOutput` DOES run here (`:429`),
+        // and the DOPT switch is its first half (`:757-777`), so OVAL/OSV are
+        // computed now, from the A..L / AA..LL present at expiry. Mirrors
+        // calcout.rs.
         if self.dlya == 1 {
             self.dlya = 0;
             self.cached_should_output = self.pending_output;
             self.pending_output = false;
+            self.exec_output_data();
             self.sync_psvl();
             return Ok(ProcessOutcome::complete());
         }
@@ -650,58 +718,10 @@ impl Record for ScalcoutRecord {
         // happens on the ODLY-scheduling cycle, which returns at `:407` before
         // `monitor()`.
         self.pval = self.val;
-        // C `execOutput` (sCalcoutRecord.c:760-777) computes OVAL/OSV via the
-        // DOPT switch on EVERY output cycle, *before* the IVOA decision (the
-        // Don't_drive `break` is at :795). So OVAL is recomputed even when the
-        // OUT write is vetoed — gate this on `oopt_fires`, not `write_out`.
-        // (`write_out` still gates the OUT write below via cached_should_output;
-        // on every non-Don't_drive path the two are equal, so OVAL is unchanged
-        // there.)
-        if oopt_fires {
-            if self.dopt == 1 {
-                // Use OCAL. C `execOutput` (sCalcoutRecord.c:768) calls
-                // sCalcPerform on ORPC unconditionally on this branch, so an
-                // empty, uncompilable or failing OCAL are one case — the empty
-                // program fails like any other broken one.
-                //
-                // C `sCalcoutRecord.c:768-770` — presult = &pcalc->oval,
-                // psresult = pcalc->osv, so the VAL/SVAL tokens in OCAL
-                // read the previous OVAL/OSV, not the VAL/SVAL this
-                // cycle just computed. Only the RESULT cells change between the
-                // passes; the arg set is the same one CALC stored into.
-                inputs.prev_val = self.oval;
-                inputs.prev_sval = ScalcString::from_c(self.osv.as_bytes());
-                match scalc_perform(&self.compiled_ocal, &mut inputs, self.prec) {
-                    // As on the CALC side: a non-finite OCAL result is C's -1
-                    // with the cells written, and `execOutput` reads only the
-                    // status — so it takes the OVAL=-1 sentinel branch too.
-                    Ok(result) if !result.non_finite => {
-                        // The OCAL-side mirror of `apply_result`: C passes
-                        // `&pcalc->oval, pcalc->osv` and the SAME `pcalc->prec`
-                        // to the same sCalcPerform (`sCalcoutRecord.c:768-770`),
-                        // so the same epilogue fills both cells.
-                        self.oval = result.val;
-                        self.osv = PvString::from_bytes(result.sval.as_bytes());
-                    }
-                    _ => {
-                        // C execOutput Use_OVAL (sCalcoutRecord.c:771-773):
-                        // a failed OCAL sCalcPerform forces OVAL=-1 and
-                        // OSV="***ERROR***" — the OCAL-side mirror of the
-                        // CALC-fail VAL=-1 sentinel.
-                        self.oval = -1.0;
-                        self.osv = PvString::from("***ERROR***");
-                        self.calc_alarm = true;
-                    }
-                }
-            } else {
-                // Use CALC result
-                self.oval = self.val;
-                self.osv = self.sval.clone();
-            }
-        }
-        // Both passes' stores land here, before the ODLY early return — C wrote
-        // them into A..L / AA..LL through `&pcalc->a` / `pcalc->strs` as each
-        // pass ran, so a deferred output cycle carries them just the same.
+        // The CALC pass's stores. C wrote them into A..L / AA..LL through
+        // `&pcalc->a` / `pcalc->strs` as the pass ran, above the ODLY early
+        // return, so a deferred cycle carries them just the same;
+        // `exec_output_data` reads them back for the OCAL pass at expiry.
         self.apply_stores(&inputs);
 
         // ODLY (C `sCalcoutRecord.c::process` lines 399-408): when an output
@@ -729,6 +749,12 @@ impl Record for ScalcoutRecord {
         }
 
         self.cached_should_output = write_out;
+        if oopt_fires {
+            // C `:410`, the immediate arm of `if (doOutput)`. Gated on
+            // `oopt_fires`, not `write_out`: the IVOA Don't_drive veto removes
+            // the write, not the DOPT switch that precedes it.
+            self.exec_output_data();
+        }
         self.sync_psvl();
         Ok(ProcessOutcome::complete())
     }
@@ -739,6 +765,8 @@ impl Record for ScalcoutRecord {
             "SVAL" => Some(EpicsValue::String(self.sval.clone())),
             "PVAL" => Some(EpicsValue::Double(self.pval)),
             "LALM" => Some(EpicsValue::Double(self.lalm)),
+            "MLST" => Some(EpicsValue::Double(self.mlst)),
+            "ALST" => Some(EpicsValue::Double(self.alst)),
             "PSVL" => Some(EpicsValue::String(self.psvl.clone())),
             "CALC" => Some(EpicsValue::String(self.calc.clone().into())),
             "CLCV" => Some(EpicsValue::Long(self.clcv)),
@@ -818,6 +846,18 @@ impl Record for ScalcoutRecord {
                 self.lalm = value
                     .to_f64()
                     .ok_or_else(|| CaError::TypeMismatch("LALM".into()))?;
+                Ok(())
+            }
+            "MLST" => {
+                self.mlst = value
+                    .to_f64()
+                    .ok_or_else(|| CaError::TypeMismatch("MLST".into()))?;
+                Ok(())
+            }
+            "ALST" => {
+                self.alst = value
+                    .to_f64()
+                    .ok_or_else(|| CaError::TypeMismatch("ALST".into()))?;
                 Ok(())
             }
             // C `dbPut` stores the string; `special()` compiles it and records

@@ -60,6 +60,20 @@ fn asub_output_event_fields() -> &'static [&'static str] {
     })
 }
 
+/// The CLOSED set of fields a process cycle of an aSub may post, under
+/// `EFLG != NEVER`: `VAL` plus [`asub_output_event_fields`]. `VAL` belongs in
+/// it because the deadband post is a post and the framework routes it through
+/// the same gate; the `EFLG == NEVER` arm is `VAL` alone.
+fn asub_posted_fields() -> &'static [&'static str] {
+    use std::sync::OnceLock;
+    static FIELDS: OnceLock<Vec<&'static str>> = OnceLock::new();
+    FIELDS.get_or_init(|| {
+        std::iter::once("VAL")
+            .chain(asub_output_event_fields().iter().copied())
+            .collect()
+    })
+}
+
 /// aSub (array subroutine) record.
 ///
 /// C `aSubRecord.c` exposes 21 input channels `A..U` (fed from
@@ -75,7 +89,7 @@ fn asub_output_event_fields() -> &'static [&'static str] {
 /// `FTx` field selects the interpretation. The subroutine itself is
 /// invoked by the framework (`RecordInstance::subroutine`).
 pub struct ASubRecord {
-    /// The subroutine return status, published as VAL (`aSubRecord.c:223`
+    /// The subroutine return status, published as VAL (`aSubRecord.c:224`
     /// `prec->val = status`). VAL is `DBF_LONG` (`aSubRecord.dbd.pod:126`), i.e.
     /// `epicsInt32`, so a string caput parses via `epicsParseLong` and an
     /// out-of-i32-range or fractional value is REFUSED — modeling it as i32
@@ -278,6 +292,23 @@ fn wrap_one_element(scalar: EpicsValue, ftype: Ftype) -> EpicsValue {
     }
 }
 
+/// What a delivery leaves in a channel cell.
+///
+/// C `dbGet` clamps `nRequest` to the source's element count and then runs no
+/// converter at all when the clamped count is not positive
+/// (dbAccess.c:1016-1017, `if (n <= 0) { ; /*do nothing*/ }`), so a
+/// zero-element source leaves `(&prec->a)[i]` holding exactly what it held
+/// before while `fetch_values` still records `NEx = 0` (aSubRecord.c:287). A
+/// "new buffer plus a count" cannot express that — every value it can carry
+/// is a buffer the caller would write — so the no-delivery case is its own
+/// variant and the cell write is unreachable from it.
+enum ChannelDelivery {
+    /// `n > 0` elements were converted into the cell.
+    Delivered { value: EpicsValue, count: i32 },
+    /// `n <= 0`: the cell keeps its contents, only NEx/NEVx moves.
+    Empty,
+}
+
 /// Shape a value entering a channel cell — a framework link delivery, a
 /// direct put, or a subroutine's output write — to the cell's declared
 /// type/capacity. On the input side this is C `fetch_values`'s
@@ -286,9 +317,8 @@ fn wrap_one_element(scalar: EpicsValue, ftype: Ftype) -> EpicsValue {
 /// source element-wise into the FTx-typed buffer and clamps the delivered
 /// count to NOx. On the output side it is the buffer itself: a C
 /// subroutine writes *into* the FTVx-typed NOVx-element `vala[i]`, so no
-/// other shape can exist there. Returns the shaped value and the new
-/// NEx/NEVx.
-fn shape_channel_value(value: EpicsValue, ft: i16, no: i32) -> (EpicsValue, i32) {
+/// other shape can exist there.
+fn shape_channel_value(value: EpicsValue, ft: i16, no: i32) -> ChannelDelivery {
     let ftype = channel_ftype(ft);
     let elem = ftype.element_type();
     if no > 1 {
@@ -299,29 +329,30 @@ fn shape_channel_value(value: EpicsValue, ft: i16, no: i32) -> (EpicsValue, i32)
             wrap_one_element(converted, ftype)
         };
         arr.truncate(no as usize);
-        let ne = arr.count() as i32;
-        (arr, ne)
+        let count = arr.count() as i32;
+        if count <= 0 {
+            return ChannelDelivery::Empty;
+        }
+        ChannelDelivery::Delivered { value: arr, count }
     } else {
         // A one-element destination takes element 0 (C `dbGet` converts the
         // source field at offset 0).
         let scalar = match value.first_element() {
             Some(first) => first,
-            // An empty array source delivers zero elements: C `dbGet` clamps
-            // `nRequest` to the source count (dbAccess.c:999-1000) and
-            // `fetch_values` records it as NEx (aSubRecord.c:287).
-            None if value.is_array() => return (channel_default(ft, no), 0),
+            None if value.is_array() => return ChannelDelivery::Empty,
             None => value,
         };
         let converted = scalar.convert_to(elem);
         // `convert_to` has one array-producing scalar arm (String into a
         // CHAR target yields the byte buffer); a one-element cell keeps
-        // element 0 of it.
+        // element 0 of it. The source still delivered its one element, so
+        // this is a delivery of the typed zero, not a retain.
         let v = match converted.first_element() {
             Some(first) => first,
             None if converted.is_array() => channel_default(ft, no),
             None => converted,
         };
-        (v, 1)
+        ChannelDelivery::Delivered { value: v, count: 1 }
     }
 }
 
@@ -487,11 +518,13 @@ impl Record for ASubRecord {
             // NOx-element buffer (aSubRecord.c:278-288); a direct put takes
             // the same conversion through `dbPut` into that buffer. NEx
             // tracks the elements actually delivered.
-            "" => {
-                let (value, ne) = shape_channel_value(value, self.fta[idx], self.noa[idx]);
-                self.nea[idx] = ne;
-                self.a[idx] = value;
-            }
+            "" => match shape_channel_value(value, self.fta[idx], self.noa[idx]) {
+                ChannelDelivery::Delivered { value, count } => {
+                    self.nea[idx] = count;
+                    self.a[idx] = value;
+                }
+                ChannelDelivery::Empty => self.nea[idx] = 0,
+            },
             "INP" | "OUT" => {
                 let s = match value {
                     EpicsValue::String(s) => s.as_str_lossy().into_owned(),
@@ -509,11 +542,13 @@ impl Record for ASubRecord {
             // shape can leave `do_sub`, and the OUT push reads that buffer
             // (`dbPutLink(&(&prec->outa)[i], (&prec->ftva)[i], ...)`,
             // aSubRecord.c:236-238). NEVx tracks the elements written.
-            "VAL" => {
-                let (value, ne) = shape_channel_value(value, self.ftva[idx], self.nova[idx]);
-                self.neva[idx] = ne;
-                self.vala[idx] = value;
-            }
+            "VAL" => match shape_channel_value(value, self.ftva[idx], self.nova[idx]) {
+                ChannelDelivery::Delivered { value, count } => {
+                    self.neva[idx] = count;
+                    self.vala[idx] = value;
+                }
+                ChannelDelivery::Empty => self.neva[idx] = 0,
+            },
             "FT" | "FTV" | "NO" | "NOV" | "NE" | "NEV" => {
                 let v = match value {
                     EpicsValue::Short(v) => v as i32,
@@ -594,15 +629,46 @@ impl Record for ASubRecord {
         }
     }
 
-    fn event_posted_fields(&self) -> &'static [&'static str] {
-        // EFLG=NEVER: C `monitor()` posts no `vala[i]`/`neva[i]` events.
-        // Excluding them from generic change-detection suppresses the post.
-        // (VAL, the scalar return status, is not in this set — C posts it on
-        // change independent of EFLG.)
-        if self.eflg == EFLG_NEVER {
-            asub_output_event_fields()
+    /// C `aSubRecord.c` holds exactly five `db_post_events` calls, all inside
+    /// `monitor()` (`:405-451`): `VAL` on `val != oval`, and the
+    /// `vala[i]`/`neva[i]` pairs inside `switch (prec->eflg)`. There is none
+    /// for `a[i]`, `nea[i]`, `snam`/`onam`, `FTx`, `NOx` or `INPx` — yet
+    /// `fetch_values` (`:250-289`) writes `a[i]` and `nea[i]` on every cycle,
+    /// and under `LFLG=READ` rewrites `snam`/`onam` too. Naming the set C
+    /// posts is what keeps those writes silent; the blacklist this replaces
+    /// would have had to name every field the record may ever write, and the
+    /// ones `fetch_values` touches were missing from it, so an `INPA` that
+    /// moved emitted `.A` and `.NEA` events C cannot produce.
+    ///
+    /// The three-way `EFLG` switch is here, in one place: `NEVER` admits
+    /// `VAL` alone, the other two arms also admit the output pairs. They
+    /// differ only in whether an UNCHANGED pair still posts, which is
+    /// [`Record::force_posted_fields`].
+    fn process_posted_fields(&self) -> Option<&'static [&'static str]> {
+        Some(if self.eflg == EFLG_NEVER {
+            &["VAL"]
         } else {
-            &[]
+            asub_posted_fields()
+        })
+    }
+
+    /// C `cvt_dbaddr` (aSubRecord.c:485-486, :493-494) pins an input channel's
+    /// `no_elements` at `NOx` and an output channel's at `NOVx` — the DECLARED
+    /// capacity — while `get_array_info` (:515, :519) reports the live
+    /// `NEx`/`NEVx`. `dbChannelElements`, and so `ca_element_count`, is the
+    /// fixed `no_elements`.
+    ///
+    /// Without this the announced count was the current value's length, which
+    /// both understates the channel (`caget -# 10 X.VALA` refused where C
+    /// serves it) and CHANGES over the channel's lifetime — NOVA before the
+    /// first process, NEVA after — which the CA create-channel contract does
+    /// not permit.
+    fn field_native_count(&self, field: &str) -> Option<u32> {
+        let (prefix, idx) = parse_channel(field)?;
+        match prefix {
+            "" => Some(self.noa[idx].max(0) as u32),
+            "VAL" => Some(self.nova[idx].max(0) as u32),
+            _ => None,
         }
     }
 
@@ -825,13 +891,49 @@ mod tests {
 
         // An EMPTY array source delivers zero elements — dbGet clamps
         // nRequest to the source count (dbAccess.c:999-1000) and NEx records
-        // it (aSubRecord.c:287) — on both cell shapes.
+        // it (aSubRecord.c:287) — but the clamped count then runs NO
+        // converter (dbAccess.c:1016-1017), so the cell keeps what the last
+        // real delivery left there. Both cell shapes.
         rec.put_field("B", EpicsValue::DoubleArray(vec![])).unwrap();
-        assert_eq!(rec.get_field("B"), Some(EpicsValue::Double(0.0)));
+        assert_eq!(
+            rec.get_field("B"),
+            Some(EpicsValue::Double(5.5)),
+            "one-element cell retains the previous delivery"
+        );
         assert_eq!(rec.get_field("NEB"), Some(EpicsValue::Long(0)));
         rec.put_field("A", EpicsValue::DoubleArray(vec![])).unwrap();
-        assert_eq!(rec.get_field("A"), Some(EpicsValue::LongArray(vec![])));
+        assert_eq!(
+            rec.get_field("A"),
+            Some(EpicsValue::LongArray(vec![7])),
+            "NOx > 1 cell retains the previous delivery"
+        );
         assert_eq!(rec.get_field("NEA"), Some(EpicsValue::Long(0)));
+
+        // A non-empty delivery after the empty one overwrites normally.
+        rec.put_field("A", EpicsValue::DoubleArray(vec![8.0, 9.0]))
+            .unwrap();
+        assert_eq!(rec.get_field("A"), Some(EpicsValue::LongArray(vec![8, 9])));
+        assert_eq!(rec.get_field("NEA"), Some(EpicsValue::Long(2)));
+    }
+
+    /// An output cell follows the same `dbGet` rule: a subroutine that writes
+    /// nothing into `vala[i]` leaves the buffer alone and only moves NEVx.
+    #[test]
+    fn empty_output_write_retains_the_output_cell() {
+        let mut rec = ASubRecord::default();
+        rec.put_field("FTVA", EpicsValue::Short(10)).unwrap(); // DOUBLE
+        rec.put_field("NOVA", EpicsValue::Long(3)).unwrap();
+        rec.put_field("VALA", EpicsValue::DoubleArray(vec![1.0, 2.0]))
+            .unwrap();
+        assert_eq!(rec.get_field("NEVA"), Some(EpicsValue::Long(2)));
+
+        rec.put_field("VALA", EpicsValue::DoubleArray(vec![]))
+            .unwrap();
+        assert_eq!(
+            rec.get_field("VALA"),
+            Some(EpicsValue::DoubleArray(vec![1.0, 2.0]))
+        );
+        assert_eq!(rec.get_field("NEVA"), Some(EpicsValue::Long(0)));
     }
 
     /// FTVx/NOVx declare the output cell the same way (C `initFields` runs
@@ -943,7 +1045,14 @@ mod tests {
         // Default ON CHANGE: neither force-post nor suppress.
         assert_eq!(rec.eflg, EFLG_ON_CHANGE);
         assert!(rec.force_posted_fields().is_empty());
-        assert!(rec.event_posted_fields().is_empty());
+        let posted = rec.process_posted_fields().expect("aSub closes the set");
+        assert_eq!(posted.len(), NUM_ARGS * 2 + 1);
+        assert!(posted.contains(&"VAL"));
+        assert!(posted.contains(&"VALA"));
+        assert!(posted.contains(&"NEVU"));
+        // The input side is outside the set in every arm.
+        assert!(!posted.contains(&"A"));
+        assert!(!posted.contains(&"NEA"));
 
         // ALWAYS: VALx/NEVx force-posted every cycle (21 + 21 = 42 fields).
         rec.put_field("EFLG", EpicsValue::Short(EFLG_ALWAYS))
@@ -952,15 +1061,16 @@ mod tests {
         assert_eq!(rec.force_posted_fields().len(), NUM_ARGS * 2);
         assert!(rec.force_posted_fields().contains(&"VALA"));
         assert!(rec.force_posted_fields().contains(&"NEVU"));
-        assert!(rec.event_posted_fields().is_empty());
+        assert_eq!(
+            rec.process_posted_fields().map(<[&str]>::len),
+            Some(NUM_ARGS * 2 + 1)
+        );
 
-        // NEVER: VALx/NEVx excluded from posting; VAL scalar not in the set.
+        // NEVER: the set narrows to VAL, which C posts outside the switch.
         rec.put_field("EFLG", EpicsValue::Short(EFLG_NEVER))
             .unwrap();
         assert!(rec.force_posted_fields().is_empty());
-        assert_eq!(rec.event_posted_fields().len(), NUM_ARGS * 2);
-        assert!(rec.event_posted_fields().contains(&"VALA"));
-        assert!(!rec.event_posted_fields().contains(&"VAL"));
+        assert_eq!(rec.process_posted_fields(), Some(&["VAL"][..]));
     }
 
     /// EFLG loads from a `.db` menu label (C `field(EFLG,"ALWAYS")`).

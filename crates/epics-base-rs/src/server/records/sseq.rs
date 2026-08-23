@@ -737,7 +737,17 @@ impl SseqRecord {
                 // machine advances. C `processCallback` increments `pcb->index`
                 // and calls `processNextLink` straight after firing, leaving the
                 // just-fired step `waiting` for the barrier scan to honour.
-                self.dispatch_waiting_step(i, value, live);
+                if !self.dispatch_waiting_step(i, value, live) {
+                    // The put was refused, so C's `abort` is set and every
+                    // remaining step is skipped: `processNextLink` takes the
+                    // no-delay path (`:443`, gated on `!pR->abort`) and the
+                    // callback it requests bails at `processCallback`'s abort
+                    // gate (`:621-627`) straight into `asyncFinish`. Emptying
+                    // the cursor is that skip; outstanding callbacks from
+                    // earlier steps still drain first.
+                    self.cursor = self.active.len();
+                    return self.advance_sequence(live);
+                }
                 self.cursor += 1;
                 return self.advance_sequence(live);
             }
@@ -768,6 +778,18 @@ impl SseqRecord {
     /// machine: record it in `in_flight`, raise `WTGn`, and spawn a waiter
     /// that marks the entry done and wakes the machine on completion.
     ///
+    /// Returns whether the put was ISSUED. C reads the status of
+    /// `dbCaPutLinkCallback` itself and branches on it in all three class arms
+    /// (`sseqRecord.c:727-733`, `:748-753`, `:779-784`): a non-zero status —
+    /// `dbCa.c:557-561`, the link not connected or not writable — sets
+    /// `abort` and prints, and ONLY a zero status raises `waiting`. Raising
+    /// `waiting` for a put that was never issued strands the barrier on a
+    /// completion that can never arrive, and lets the rest of the sequence run
+    /// where C stops it. The status is available here because the gate is a
+    /// cached-state probe (`AsyncDbHandle::put_link_admitted`); the put itself
+    /// still has to be deferred, since it re-enters the database from inside
+    /// this record's own process cycle.
+    ///
     /// Called ONLY with the buffer [`Self::fire_current_step`] already decided
     /// on — C raises `waiting` inside the `dbCaPutLinkCallback` branch of a
     /// class arm (sseqRecord.c:727-729, :748-750, :779-781), never before the
@@ -787,7 +809,19 @@ impl SseqRecord {
         i: usize,
         value: EpicsValue,
         live: &mut Vec<(String, EpicsValue)>,
-    ) {
+    ) -> bool {
+        let admitted = match &self.async_ctx {
+            Some((_, handle)) => handle.put_link_admitted(&self.steps[i].lnk),
+            // No database to refuse it — the spawn below is skipped too, so
+            // the step completes as an issued put with nothing behind it.
+            None => true,
+        };
+        if !admitted {
+            self.abort = 1;
+            live.push(("ABORT".to_string(), EpicsValue::Short(1)));
+            eprintln!("sseq:processCallback: dbCaPutLinkCallback for link {i} failed.  Aborting.");
+            return false;
+        }
         self.steps[i].waiting = 1;
         live.push((WTG_FIELDS[i].to_string(), EpicsValue::Short(1)));
         let done = Arc::new(AtomicBool::new(false));
@@ -814,6 +848,7 @@ impl SseqRecord {
                 wake.notify_one();
             });
         }
+        true
     }
 
     /// Park a task on the per-sequence wake bridge that re-enters the
@@ -1123,10 +1158,12 @@ impl Record for SseqRecord {
         // An abort in flight drains the outstanding put-callbacks, then
         // finishes — C `processNextLink` under `pR->abort` returns until the
         // last callback drains, and `process` takes the `pact` path to
-        // `asyncFinish`. `aborting` is the machine's own drain flag, set by
-        // `special` the moment an abort is accepted, so this gate fires ahead
-        // of any step work.
-        let outcome = if self.busy != 0 && self.aborting != 0 {
+        // `asyncFinish`. The gate is `abort`, the flag C's `processCallback`
+        // itself tests (`sseqRecord.c:621`), not the `aborting` request flag:
+        // a client abort sets both (the put stores `abort`, `special` raises
+        // `aborting`), while a refused `dbCaPutLinkCallback` sets only `abort`
+        // (`:745-748`) and must stop the sequence just the same.
+        let outcome = if self.busy != 0 && self.abort != 0 {
             self.drain_abort(&mut live)
         } else {
             // `busy == 0` (phase `Idle`) is a genuine start: the framework

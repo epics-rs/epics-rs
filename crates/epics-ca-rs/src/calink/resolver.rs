@@ -21,6 +21,7 @@ use epics_base_rs::server::database::{
     LinkDbfType, LinkMetadata, LinkPutOp, LinkSet, PutAdmission, PvDatabase,
 };
 use epics_base_rs::server::snapshot::{DbrClass, Snapshot};
+use epics_base_rs::types::DBR_CTRL_DOUBLE;
 use epics_base_rs::types::EpicsValue;
 use parking_lot::RwLock;
 
@@ -861,50 +862,95 @@ async fn fetch_link_metadata(
         Ok(info) => (Some(info.native_type), Some(info.element_count)),
         Err(_) => (None, None),
     };
-    // Limits/precision/units from a single DBR_CTRL get. Count 1: the
-    // limits live in the metadata header, so there is no need to pull a
-    // whole waveform just for attributes (C issues the attribute get as a
-    // scalar `ca_get_callback(DBR_CTRL_DOUBLE, ...)`).
-    let ctrl = match channel.get_with_metadata_count(DbrClass::Ctrl, 1).await {
-        Ok(snap) => Some(snap),
-        Err(e) => {
-            tracing::debug!(
-                pv = %pv_name,
-                error = %e,
-                "calink: CTRL attribute get failed; serving DBF type / element count only"
-            );
-            None
+    // Limits/precision/units from a single DBR_CTRL get, at a FIXED
+    // `DBR_CTRL_DOUBLE` and gated on the native type — both straight from C.
+    // `dbCa.c:926-928` asks for attributes for every channel whose
+    // `pca->dbrType` is not `DBR_STRING`, and `:1275` issues that get as
+    // `ca_get_callback(DBR_CTRL_DOUBLE, ...)` whatever the native type is, so
+    // the server converts and `gotAttributes` goes TRUE for an ENUM target
+    // too. Requesting the NATIVE CTRL type instead put a `DBR_CTRL_ENUM` on
+    // the wire for an enum channel — a struct with no precision, units or
+    // limit members at all (`db_access.h struct dbr_ctrl_enum`) — so every
+    // attribute stayed `None` where C serves precision 0, empty units and
+    // zeroed limits. Count 1: the attributes live in the metadata header, so
+    // there is no need to pull a whole waveform for them.
+    let attrs = if dbf == Some(DbFieldType::String) {
+        // C never issues the get for a string channel; `gotAttributes` stays
+        // FALSE and every getter returns -1. Skipping it is that gate.
+        None
+    } else {
+        match channel.get_with_dbr_type(DBR_CTRL_DOUBLE, 1).await {
+            Ok(snap) => Some(snap),
+            Err(e) => {
+                tracing::debug!(
+                    pv = %pv_name,
+                    error = %e,
+                    "calink: CTRL attribute get failed; serving DBF type / element count only"
+                );
+                None
+            }
         }
+    };
+    // The enum state-label table is this port's own cache and has no dbCa
+    // analogue on this path — C renders a remote enum as text through a
+    // second `DBR_STRING` monitor (`pgetString`), not through the attribute
+    // get. It needs the native `DBR_CTRL_ENUM` reply, which the fixed-DOUBLE
+    // get above cannot carry, so it rides its own request.
+    let labels = if dbf == Some(DbFieldType::Enum) {
+        channel
+            .get_with_metadata_count(DbrClass::Ctrl, 1)
+            .await
+            .inspect_err(|e| {
+                tracing::debug!(
+                    pv = %pv_name,
+                    error = %e,
+                    "calink: enum label get failed; serving no choice table"
+                );
+            })
+            .ok()
+    } else {
+        None
     };
     meta.store(Arc::new(Some(build_link_metadata(
         dbf,
         element_count,
-        ctrl.as_ref(),
+        attrs.as_ref(),
+        labels.as_ref(),
     ))));
 }
 
-/// Map a fetched CTRL [`Snapshot`] plus the channel's native DBF type /
-/// element count into a [`LinkMetadata`]. Pure transform, factored out
-/// of [`fetch_link_metadata`] so the field mapping is unit-testable
+/// Map the fetched attribute [`Snapshot`] plus the channel's native DBF
+/// type / element count into a [`LinkMetadata`]. Pure transform, factored
+/// out of [`fetch_link_metadata`] so the field mapping is unit-testable
 /// without a live CA server.
 ///
-/// Each `LinkMetadata` field is `None` when the source carried nothing:
-/// a String/Enum PV's CTRL reply has no `display`/`control`, so its
-/// limits/precision/units stay `None` and the owning record keeps its
-/// local defaults — exactly as the C getters leave the caller's buffer
-/// untouched on a missing attribute. Alarm-limit order is
-/// `(lolo, lo, hi, hihi)`, matching C `getAlarmLimits` (`dbCa.c:758`).
+/// The two snapshots are different requests and each carries exactly one
+/// thing: `attrs` is the fixed `DBR_CTRL_DOUBLE` attribute get and is the
+/// only source of limits/precision/units; `labels` is the native
+/// `DBR_CTRL_ENUM` get an enum channel also gets, and is the only source of
+/// the choice table.
+///
+/// A `None` attribute field means the source carried nothing, and only a
+/// DBR_STRING channel reaches that state for the whole set: C never issues
+/// the get for one (`dbCa.c:926-928`), `pca->gotAttributes` stays FALSE and
+/// `getPrecision`/`getUnits`/the limit getters return -1 with the caller's
+/// buffer untouched. An ENUM channel is NOT that case — C's get is a fixed
+/// `DBR_CTRL_DOUBLE` (`:1275`), the server converts, `gotAttributes` goes
+/// TRUE, and the getters SUCCEED with precision 0, empty units and zeroed
+/// limits. Alarm-limit order is `(lolo, lo, hi, hihi)`, matching C
+/// `getAlarmLimits` (`dbCa.c:758`).
 fn build_link_metadata(
     dbf: Option<DbFieldType>,
     element_count: Option<u32>,
-    ctrl: Option<&Snapshot>,
+    attrs: Option<&Snapshot>,
+    labels: Option<&Snapshot>,
 ) -> LinkMetadata {
     let mut md = LinkMetadata {
         dbf_type: dbf.map(map_dbf_type),
         element_count: element_count.map(|n| n as i64),
         ..LinkMetadata::default()
     };
-    if let Some(snap) = ctrl {
+    if let Some(snap) = attrs {
         if let Some(d) = snap.display.as_ref() {
             md.graphic_limits = Some((d.lower_disp_limit, d.upper_disp_limit));
             md.alarm_limits = Some((
@@ -929,21 +975,22 @@ fn build_link_metadata(
         if let Some(c) = snap.control.as_ref() {
             md.control_limits = Some((c.lower_ctrl_limit, c.upper_ctrl_limit));
         }
-        // An enum channel's CTRL reply is `DBR_CTRL_ENUM`, whose metadata IS
-        // the state-label table. Cached so a `DBR_STRING`-requesting reader
-        // (stringin/lsi INP, printf `%s`) renders the remote index as its
-        // label — C `dbCa` keeps a second `DBR_STRING` monitor (`pgetString`)
-        // for that read; here the labels ride the attribute fetch.
-        if let Some(e) = snap.enums.as_ref()
-            && !e.strings.is_empty()
-        {
-            md.enum_choices = Some(
-                e.strings
-                    .iter()
-                    .map(|s| s.as_str_lossy().into_owned())
-                    .collect(),
-            );
-        }
+    }
+    // An enum channel's native CTRL reply is `DBR_CTRL_ENUM`, whose metadata
+    // IS the state-label table. Cached so a `DBR_STRING`-requesting reader
+    // (stringin/lsi INP, printf `%s`) renders the remote index as its label —
+    // C `dbCa` keeps a second `DBR_STRING` monitor (`pgetString`) for that
+    // read. It is a separate request from the attribute get, which is a fixed
+    // DBR_CTRL_DOUBLE and carries no labels.
+    if let Some(e) = labels.and_then(|s| s.enums.as_ref())
+        && !e.strings.is_empty()
+    {
+        md.enum_choices = Some(
+            e.strings
+                .iter()
+                .map(|s| s.as_str_lossy().into_owned())
+                .collect(),
+        );
     }
     md
 }
@@ -1069,6 +1116,37 @@ impl LinkSet for CaLinkResolver {
             .await
             .ok_or_else(|| format!("CA link {name} not open"))?;
         let channel = link.channel.clone();
+        // The clamp C applies before the CA request is ever built:
+        // `dbCaPutLinkCallback` converts the caller's buffer to the
+        // channel's native type and bounds the request to the channel's
+        // element count in the same step — `if(nRequest>pca->nelements)
+        // nRequest = pca->nelements;` then `aConvert(..., nRequest,
+        // pca->nelements, 0)` (`dbCa.c:604-606`), against
+        // `pca->nelements = ca_element_count(chid)` (`:906`). The surplus
+        // elements are DROPPED and the put succeeds; the same rule holds
+        // for a DB target (`dbAccess.c:1365`), so an oversized array put
+        // behaves identically whether the link is CA or DB.
+        //
+        // It has to happen HERE and not in `CaChannel::put`, because
+        // libca genuinely refuses an oversized direct `ca_array_put`:
+        // `nciu::write` throws `outOfBounds` on `countIn > this->count`
+        // (`nciu.cpp:332-334`) and `ca_array_put` maps it to
+        // ECA_BADCOUNT (`oldChannelNotify.cpp:512`). C reaches that only
+        // from a direct client write, never from a link put — dbCa has
+        // already clamped. Clamping the converted value keeps
+        // `validate_put_count` unreachable from this path by
+        // construction rather than by a second bound inside the client.
+        let value = match (channel.native_field_type(), channel.element_count()) {
+            (Ok(native), Ok(nelements)) => {
+                let mut converted = value.convert_to(native);
+                converted.truncate(nelements as usize);
+                converted
+            }
+            // No native description yet: the channel is not operational,
+            // so there is nothing to clamp against and the write below
+            // reports the disconnect itself.
+            _ => value,
+        };
         match op {
             LinkPutOp::Plain => channel.put_nowait(&value).await,
             LinkPutOp::Async => channel.put(&value).await,
@@ -1436,7 +1514,7 @@ mod tests {
     #[test]
     fn build_link_metadata_numeric_maps_all_fields() {
         let snap = ctrl_snapshot();
-        let md = build_link_metadata(Some(DbFieldType::Double), Some(1), Some(&snap));
+        let md = build_link_metadata(Some(DbFieldType::Double), Some(1), Some(&snap), None);
         assert_eq!(md.dbf_type, Some(LinkDbfType::Double));
         assert_eq!(md.element_count, Some(1));
         assert_eq!(md.graphic_limits, Some((-50.0, 100.0)));
@@ -1446,18 +1524,15 @@ mod tests {
         assert_eq!(md.units.as_deref(), Some("degC"));
     }
 
-    /// a CTRL reply with no `display`/`control` (a
-    /// String/Enum PV) yields only the channel-info fields; every limit
-    /// stays `None` so the owning record keeps its local default.
+    /// a String channel gets no attribute request at all — C
+    /// `dbCa.c:926-928` sets `CA_GET_ATTRIBUTES` only when
+    /// `pca->dbrType != DBR_STRING`, so `gotAttributes` stays FALSE and
+    /// every getter returns -1 with the caller's buffer untouched. Here
+    /// that is `attrs = None`, and every limit stays `None` so the owning
+    /// record keeps its local default.
     #[test]
     fn build_link_metadata_string_pv_has_no_limits() {
-        let snap = Snapshot::new(
-            EpicsValue::String("x".into()),
-            0,
-            0,
-            std::time::SystemTime::UNIX_EPOCH,
-        );
-        let md = build_link_metadata(Some(DbFieldType::String), Some(1), Some(&snap));
+        let md = build_link_metadata(Some(DbFieldType::String), Some(1), None, None);
         assert_eq!(md.dbf_type, Some(LinkDbfType::String));
         assert_eq!(md.element_count, Some(1));
         assert_eq!(md.graphic_limits, None);
@@ -1477,7 +1552,7 @@ mod tests {
         use epics_base_rs::server::snapshot::EnumInfo;
         let mut snap = Snapshot::new(EpicsValue::Enum(1), 0, 0, std::time::SystemTime::UNIX_EPOCH);
         snap.enums = Some(EnumInfo::new(vec!["off".into(), "on".into()]));
-        let md = build_link_metadata(Some(DbFieldType::Enum), Some(1), Some(&snap));
+        let md = build_link_metadata(Some(DbFieldType::Enum), Some(1), None, Some(&snap));
         assert_eq!(md.dbf_type, Some(LinkDbfType::Enum));
         assert_eq!(
             md.enum_choices,
@@ -1485,8 +1560,27 @@ mod tests {
         );
 
         let empty = Snapshot::new(EpicsValue::Enum(0), 0, 0, std::time::SystemTime::UNIX_EPOCH);
-        let md = build_link_metadata(Some(DbFieldType::Enum), Some(1), Some(&empty));
+        let md = build_link_metadata(Some(DbFieldType::Enum), Some(1), None, Some(&empty));
         assert_eq!(md.enum_choices, None);
+
+        // The two replies compose: the fixed DBR_CTRL_DOUBLE attribute get
+        // carries an enum target's precision/units/limits (all zero, as C's
+        // does) while the native DBR_CTRL_ENUM get carries the labels.
+        use epics_base_rs::server::snapshot::DisplayInfo;
+        let mut attrs = Snapshot::new(
+            EpicsValue::Double(1.0),
+            0,
+            0,
+            std::time::SystemTime::UNIX_EPOCH,
+        );
+        attrs.display = Some(DisplayInfo::default());
+        let md = build_link_metadata(Some(DbFieldType::Enum), Some(1), Some(&attrs), Some(&snap));
+        assert_eq!(md.precision, Some(0));
+        assert_eq!(md.graphic_limits, Some((0.0, 0.0)));
+        assert_eq!(
+            md.enum_choices,
+            Some(vec!["off".to_string(), "on".to_string()])
+        );
     }
 
     /// when the channel info fetch failed (`None` dbf /
@@ -1494,7 +1588,7 @@ mod tests {
     /// link reports "no metadata yet" rather than fabricating zeros.
     #[test]
     fn build_link_metadata_no_info_no_ctrl_is_all_none() {
-        let md = build_link_metadata(None, None, None);
+        let md = build_link_metadata(None, None, None, None);
         assert_eq!(md, LinkMetadata::default());
     }
 
@@ -1514,7 +1608,7 @@ mod tests {
             precision: 0,
             ..Default::default()
         });
-        let md = build_link_metadata(Some(DbFieldType::Double), Some(1), Some(&snap));
+        let md = build_link_metadata(Some(DbFieldType::Double), Some(1), Some(&snap), None);
         assert_eq!(md.units, None);
         assert_eq!(md.precision, Some(0));
     }

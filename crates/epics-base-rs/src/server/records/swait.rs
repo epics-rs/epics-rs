@@ -5,7 +5,8 @@ use crate::calc::{CompiledExpr, ExprKind, eval as calc_eval};
 use crate::error::{CaError, CaResult};
 use crate::server::database::AsyncDbHandle;
 use crate::server::record::{
-    InputFetchPolicy, MENU_YES_NO, ProcessAction, ProcessOutcome, Record, RecordProcessResult,
+    FieldMetadataOverride, InputFetchPolicy, MENU_YES_NO, ProcessAction, ProcessOutcome, Record,
+    RecordProcessResult,
 };
 use crate::types::EpicsValue;
 
@@ -103,6 +104,13 @@ pub struct SwaitRecord {
     // makes their DBE_LOG bit conditional (see `fields_posted_with_monitor_mask`).
     pub mdel: f64,
     pub adel: f64,
+    /// MLST / ALST — C `swaitRecord.dbd`, both `DBF_DOUBLE`
+    /// `special(SPC_NOMOD)`. `monitor()` deadbands VAL against them
+    /// (swaitRecord.c:630,639). The record served neither, so the
+    /// framework had no cell to remember the last posted value in and
+    /// treated every cycle as the first one.
+    pub mlst: f64,
+    pub alst: f64,
     // INxN: input link names; INxP: process passive flags (0/1)
     pub inp_names: [String; 12], // INAN..INLN
     pub inp_passive: [i16; 12],  // INAP..INLP
@@ -202,6 +210,8 @@ impl Default for SwaitRecord {
             prec: 0,
             mdel: 0.0,
             adel: 0.0,
+            mlst: 0.0,
+            alst: 0.0,
             inp_names: Default::default(),
             inp_passive: [0; 12],
             num_vals: [0.0; 12],
@@ -285,10 +295,15 @@ impl SwaitRecord {
     ///
     /// "On Change" is a MDEL-deadband test, not an inequality: C
     /// `swaitRecord.c:432` is `if (fabs(pwait->oval - pwait->val) > pwait->mdel)`,
-    /// the same rule as calcout (`calcoutRecord.c:257`), sCalcout
-    /// (`sCalcoutRecord.c:379`) and aCalcout (`aCalcoutRecord.c:318`). With the
-    /// default MDEL=0 the two rules agree; a configured MDEL makes a sub-deadband
-    /// change fire the OUT link on the port and not on C.
+    /// the same rule as sCalcout (`sCalcoutRecord.c:379`) and aCalcout
+    /// (`aCalcoutRecord.c:318`). With the default MDEL=0 the two rules agree; a
+    /// configured MDEL makes a sub-deadband change fire the OUT link on the port
+    /// and not on C.
+    ///
+    /// `calcout` is NOT in that group and must not be copied from here: base
+    /// writes it as `!(fabs(pval-val) <= mdel)` (`calcoutRecord.c:257`), which
+    /// takes the opposite branch on NaN. These four records have four separate
+    /// upstreams and only three of them agree.
     fn eval_should_output(&self, old: f64) -> bool {
         match self.oopt {
             0 => true,
@@ -409,7 +424,27 @@ const SWAIT_OOPT_CHOICES: &[&str] = &[
 /// result), 1="Use DOL" (the value fetched through the `DOL` link).
 const SWAIT_DOPT_CHOICES: &[&str] = &["Use VAL", "Use DOL"];
 
+/// C `swaitRecord.c` `get_precision`: `else if (paddr->pfield == (void *)&pwait->odly)
+/// *precision = 3;` — the one field swait answers with a literal instead of PREC.
+const SWAIT_ODLY_PRECISION: i16 = 3;
+
 impl Record for SwaitRecord {
+    /// C `swaitRecord.c::init_record` (:266-) ends without touching
+    /// MLST/ALST; both writes are in `monitor()` (:630,:639).
+    fn seed_deadband_tracking(&mut self) {}
+
+    /// The same rset shape as `bo`'s `HIGH` and `busy`'s `HIGH`: one named
+    /// field answered with a constant. `ODLY` is `DBF_FLOAT`, so it clears
+    /// `dbAccess.c:388-389`'s float/double gate and the 3 reaches the wire.
+    fn field_metadata_override(&self, field: &str) -> Option<FieldMetadataOverride> {
+        field
+            .eq_ignore_ascii_case("ODLY")
+            .then(|| FieldMetadataOverride {
+                precision: Some(SWAIT_ODLY_PRECISION),
+                ..Default::default()
+            })
+    }
+
     fn record_type(&self) -> &'static str {
         "swait"
     }
@@ -823,6 +858,8 @@ impl Record for SwaitRecord {
             "PREC" => Some(EpicsValue::Short(self.prec)),
             "MDEL" => Some(EpicsValue::Double(self.mdel)),
             "ADEL" => Some(EpicsValue::Double(self.adel)),
+            "MLST" => Some(EpicsValue::Double(self.mlst)),
+            "ALST" => Some(EpicsValue::Double(self.alst)),
             _ => {
                 if let Some(idx) = Self::num_val_index(name) {
                     return Some(EpicsValue::Double(self.num_vals[idx]));
@@ -934,6 +971,16 @@ impl Record for SwaitRecord {
                 self.adel = value
                     .to_f64()
                     .ok_or_else(|| CaError::TypeMismatch("ADEL".into()))?;
+            }
+            "MLST" => {
+                self.mlst = value
+                    .to_f64()
+                    .ok_or_else(|| CaError::TypeMismatch("MLST".into()))?;
+            }
+            "ALST" => {
+                self.alst = value
+                    .to_f64()
+                    .ok_or_else(|| CaError::TypeMismatch("ALST".into()))?;
             }
             "PREC" => {
                 if let EpicsValue::Short(v) = value {

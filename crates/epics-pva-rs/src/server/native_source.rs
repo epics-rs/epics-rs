@@ -94,8 +94,7 @@ impl PvDatabaseSource {
         let inp_resolver: InpResolver = Arc::new(move |link: String| {
             let db = inp_db.clone();
             Box::pin(async move {
-                let (base, field) = parse_pv_name(&link);
-                let field = if field.is_empty() { "VAL" } else { field };
+                let (base, field) = epics_base_rs::server::access_security::inp_link_target(&link);
                 let rec = db.get_record(base)?;
                 let inst = rec.read();
                 inst.resolve_field(field).and_then(|v| v.to_f64())

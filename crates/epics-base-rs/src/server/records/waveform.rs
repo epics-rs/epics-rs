@@ -4,7 +4,7 @@ use crate::server::record::{
     parse_link_v2,
 };
 use crate::server::records::count_put;
-use crate::types::{DbFieldType, EpicsValue, PvString};
+use crate::types::{DbFieldType, EpicsValue, PvString, c_parse};
 
 /// Which EPICS record-type name a [`WaveformRecord`] reports. The four
 /// upstream array record types (`waveform`, `aai`, `aao`, `subArray`)
@@ -1107,17 +1107,29 @@ impl Record for WaveformRecord {
     fn put_field(&mut self, name: &str, value: EpicsValue) -> CaResult<()> {
         match name {
             "VAL" => {
-                // Coerce value to match FTVL (e.g. String → CharArray for
-                // FTVL=CHAR, String → UCharArray for FTVL=UCHAR): a text source
-                // into a char-element buffer is the string's BYTES, not a
-                // numeric parse of it.
-                let value = match (&value, self.ftvl) {
-                    (EpicsValue::String(s), Ftype::Char) => {
-                        EpicsValue::CharArray(s.as_bytes().to_vec())
+                // A DBR_STRING source is C's `putString<FTVL>` row
+                // (`dbConvert.c:941-1147`): each of the `nRequest` elements is
+                // PARSED with `epicsParse*` at `dbConvertBase` 0, and a
+                // non-zero status aborts the whole `dbPut` so the field keeps
+                // its old value. A scalar string is `nRequest == 1`, so it
+                // lands as ONE element.
+                //
+                // Measured on the compiled softIoc, `caput` then `caget`:
+                // `FTVL=CHAR` refuses "hi" and stores 65 for "65";
+                // `FTVL=DOUBLE`/`LONG` refuse "hi", take `0x10` as 16, and
+                // `LONG` truncates 1.7 to 1. The rule does not vary with FTVL,
+                // so neither does this branch. Treating a string as the
+                // buffer's BYTES for CHAR/UCHAR — and silently coercing it to
+                // 0 for every other FTVL — was a special case at one boundary
+                // that C does not have anywhere: the byte carry is what a
+                // client asking DBR_CHAR gets (`caput -S`), which arrives here
+                // already as a `CharArray` and is untouched by this branch.
+                let value = match (&value, c_parse::NumericField::of(self.ftvl_element_type())) {
+                    (EpicsValue::String(s), Some(numeric)) => {
+                        c_parse::put_string(name, numeric, &s.as_str_lossy())?
                     }
-                    (EpicsValue::String(s), Ftype::UChar) => {
-                        EpicsValue::UCharArray(s.as_bytes().to_vec())
-                    }
+                    // FTVL=STRING is `putStringString`, a text copy, not a
+                    // parse — `NumericField::of` reports None for it.
                     _ => value,
                 };
                 // C `dbAccess.c:1415` `if (isValueField) precord->udf = FALSE;`

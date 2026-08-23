@@ -372,7 +372,7 @@ impl Snapshot {
 ///
 /// This is the primitive the port was missing. `dbGet` asks for every
 /// property, then **clears** the `DBR_*` option bit of each slot the record
-/// type left NULL (`dbAccess.c:336-430`: `*options ^= DBR_UNITS`,
+/// type left NULL (`dbAccess.c:336-427`: `*options ^= DBR_UNITS`,
 /// `^= DBR_PRECISION`, `^= DBR_GR_DOUBLE`, `^= DBR_CTRL_DOUBLE`,
 /// `^= DBR_AL_DOUBLE`, `^= DBR_ENUM_STRS`). QSRV then assigns each NT leaf
 /// only under the surviving bit (pvxs `ioc/iocsource.cpp:263-305`), so a

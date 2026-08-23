@@ -1926,10 +1926,16 @@ gates `display.precision` on its own `DBR_PRECISION` slot, independent of
 the fat PVA dbd, this is the whole family — every field of the seven types
 whose rset supplies `get_precision` but NULLs `get_graphic_double`
 (`bo`/`mbbiDirect`/`mbboDirect` in base; `busy`/`asyn`/`transform`/`sseq`
-in the modules), 62 channels, of which only `bo.HIGH` carries a meaningful
-value (2 = `boHIGHprecision`); the other 61 serve `0`, the `recGblGetPrec`
-default — the same value CA serves, so this is PVA-vs-CA consistency, not a
-new number. The deviation is carried on the oracle allowlist as CBUG-G1
+in the modules), 62 channels, of which **two** carry a meaningful value:
+`bo.HIGH` (2 = `boHIGHprecision`) and `busy.HIGH` (2, a literal at
+`busyRecord.c:280` — `if(paddr->pfield == (void *)&prec->high)
+*precision=2;`). This paragraph previously named `bo.HIGH` as the only one
+and counted `busy.HIGH` among the zeros; that reading of `busyRecord.c` was
+wrong, and the port served 0 for `busy.HIGH` until
+`crates/epics-base-rs/src/server/records/busy.rs` grew the matching
+`field_metadata_override`. The other 60 serve `0`, the `recGblGetPrec`
+default — the same value CA serves, so that part is PVA-vs-CA consistency,
+not a new number. The deviation is carried on the oracle allowlist as CBUG-G1
 (`crates/epics-oracle-rs/allowlist/expected-deviations.toml`,
 `port_adds_leaves = ["display.precision"]`, content-constrained so it
 justifies only the precision add and launders no other marking diff); the
@@ -1945,3 +1951,71 @@ Proof: `iocsource.cpp:274` (units, independent gate) vs `:287-294`
 (precision + control supplied, graphic NULL) and `:301-308` (`HIGH` →
 `boHIGHprecision`) quoted; `softIocPVX` GET of `bo.HIGH` shows units +
 control, no precision.
+
+## Batch H — filed 2026-08-23 (transform expression conversion, found while porting `convertExpression`)
+
+One entry. Found while closing the port's transform-CLCx conversion gap (the
+port compiled the raw infix where C compiles the CONVERTED text): reading
+`convertShortcuts`'s replacement table against `sCalcPostfix`'s element table
+showed the replacements name a token the parser does not carry. Proof is a
+compiled-C driver on this host (gcc 13.3, x86-64 Linux) linked against the real
+`libcalc` (`/home/stevek/work/epics-modules/calc/lib/linux-x86_64`).
+
+| id | upstream | one line | severity | bucket |
+|---|---|---|---|---|
+| CBUG-H1 | synApps calc (`transformRecord`) | `convertShortcuts` expands `$P(` to `$PRINTF(`, a spelling `sCalcPostfix` cannot lex — every `transform` CLCx using one of the six shortcuts silently fails to compile and its channel is never evaluated | Medium | NOT-REPRODUCED |
+
+### CBUG-H1: `transformRecord`'s shortcut expansion produces a token `sCalcPostfix` does not carry
+Bucket: NOT-REPRODUCED · Severity: Medium
+C: `transformRecord.c:333-341` `shortcuts[]`, applied by `convertShortcuts`
+(`:368-380`) inside `convertExpression` (`:384-389`), which both compile sites
+run before `sCalcPostfix` (`:481-482` in `init_record`, `:682-684` in
+`special`):
+```c
+struct shortcut { char target[4]; char replace[MAXSHORTCUT]; }
+shortcuts[NUMSHORTCUTS] = {
+    {"$P(", "$PRINTF("}, {"$T(", "$TR_ESC("}, {"$W(", "$WRITE("},
+    {"$S(", "$SSCANF("}, {"$R(", "$READ("},  {"$E(", "$ESC("}
+};
+```
+Each replacement is the `$` short spelling's long name with the `$` KEPT.
+`sCalcPostfix.c` carries the two spellings as separate elements — `{"$P", …,
+PRINTF}` at `:173` and `{"PRINTF", …, PRINTF}` at `:174`, and the same pairing
+for `$E`/`ESC`, `$R`/`READ`, `$S`/`SSCANF`, `$T`/`TR_ESC`, `$W`/`WRITE` — but
+there is no `$PRINTF` element, and none of the other five `$`-prefixed long
+names exists either. `get_element` (`:255-283`) walks the table backwards and
+takes the first entry that prefixes the text, i.e. the longest table symbol, so
+`$PRINTF(` lexes as `$P` followed by the unknown operand `RINTF`.
+Defect: the conversion turns a valid expression into an invalid one. A
+`transform` record whose CLCx uses any of the six shortcuts gets
+`CALC_ERR_SYNTAX` from `sCalcPostfix`, `init_record` reports "Illegal CALC
+field" once to errlog, `CxV` goes non-zero, and `process` then skips that
+channel forever (`:585` `postfix_ok`) — the channel silently keeps its old
+value. The same expression compiles in every other sCalc record, because only
+`transform` runs `convertExpression`.
+Proof: compiled-C driver calling `sCalcPostfix` directly:
+```text
+$P("%d",3)         -> status=0  err=0  (OK)
+$PRINTF("%d",3)    -> status=-1 err=11 (Syntax error, unknown operator/operand)
+PRINTF("%d",3)     -> status=0  err=0  (OK)
+$E("a")            -> status=0  err=0  (OK)
+$ESC("a")          -> status=-1 err=11 (Syntax error, unknown operator/operand)
+$S("7","%d")       -> status=0  err=0  (OK)
+$SSCANF("7","%d")  -> status=-1 err=11 (Syntax error, unknown operator/operand)
+$W("%d",3)         -> status=0  err=0  (OK)
+$WRITE("%d",3)     -> status=-1 err=11 (Syntax error, unknown operator/operand)
+```
+Port: **deviates — does not reproduce.**
+`crates/epics-base-rs/src/server/records/transform.rs` `SHORTCUTS` drops the
+leading `$` from the replacement (`$P(` -> `PRINTF(`). `PRINTF` and `$P` are the
+same element, so a working expression keeps working and keeps its value, while
+the ordering the table exists for still holds: the shortcut is consumed before
+the macro pass and the result carries no `$` for a macro to match — in fact the
+port is stricter here than C, whose `$PRINTF(` still contains a `$P` for a
+user macro named `$P` to eat. Pinned by
+`crates/epics-base-rs/tests/transform_clcx_macro_expansion.rs`
+(`the_shortcut_expansion_keeps_the_expression_compilable`,
+`a_shortcut_is_expanded_before_the_macro_pass`).
+Impact: on a C IOC, `field(CLCB,"$S($A,\"%d\")")` in a `transform` record is a
+dead channel — no value, one errlog line at init, and `CBV` non-zero as the only
+running indication.

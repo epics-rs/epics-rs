@@ -802,6 +802,12 @@ const ACALCOUT_SIZE_NUSE: i16 = 1;
 const ACALCOUT_INAV_CHOICES: &[&str] = &["Ext PV NC", "Ext PV OK", "Local PV", "Constant"];
 
 impl Record for AcalcoutRecord {
+    /// C `aCalcoutRecord.c::init_record` (:171-281) ends without touching
+    /// MLST/ALST/LALM, unlike the `calcout` it is modelled on
+    /// (`calcoutRecord.c:217-219`). An `acalcout` given a nonzero initial
+    /// VAL posts that value once on its first cycle in C.
+    fn seed_deadband_tracking(&mut self) {}
+
     fn record_type(&self) -> &'static str {
         "acalcout"
     }
@@ -1218,6 +1224,17 @@ impl Record for AcalcoutRecord {
             self.set_output_to_ivov();
         }
         Ok(())
+    }
+
+    /// C `cvt_dbaddr` (aCalcoutRecord.c:627-631) pins an array channel at
+    /// [`Self::dbaddr_no_elements`], while `get_array_info` (:672) reports
+    /// [`Self::num_elements`] — the NUSE window that
+    /// [`Self::array_field_value`] serves. Under the default `SIZE = NELM`
+    /// those differ whenever `0 < NUSE < NELM`, and `ca_element_count` is the
+    /// former; SIZE=NUSE exists precisely to make the two agree.
+    fn field_native_count(&self, field: &str) -> Option<u32> {
+        let is_array = matches!(field, "AVAL" | "OAV") || Self::arr_index(field).is_some();
+        is_array.then(|| self.dbaddr_no_elements() as u32)
     }
 
     fn get_field(&self, name: &str) -> Option<EpicsValue> {

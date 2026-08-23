@@ -100,8 +100,16 @@ fn convert_value_to_dbr_string(
     value: &EpicsValue,
     snapshot: &crate::server::snapshot::Snapshot,
 ) -> EpicsValue {
-    // C precision = record `get_precision` (PREC field), default 6 when the
-    // record exposes no `get_precision` RSET (here: no display metadata).
+    // C `getDoubleString` (`dbConvert.c:772-790`) opens with
+    // `long precision = 6;` and overwrites it only `if (prset &&
+    // prset->get_precision)`. The 6 is therefore the answer for every record
+    // type that NULLs the slot — `biRecord.c:58` is literally
+    // `#define get_precision NULL`, and sixteen siblings say the same — and
+    // `Snapshot::precision` is what reports that, `None` for an unsupplied
+    // slot. Reading `display.precision` raw could not: `DisplayInfo` is minted
+    // for every snapshot (the DESC leaf, which pvxs fills for every record
+    // type), so its `Option` says nothing about the rset and the seed was
+    // unreachable.
     //
     // A NEGATIVE PREC is not clamped: C hands the `long precision` straight to
     // `cvtDoubleToString(double, char*, epicsUInt16 precision)`
@@ -109,11 +117,7 @@ fn convert_value_to_dbr_string(
     // arrives as 65535, which takes the `precision > 8` branch, caps at 17 and
     // renders `%*.*e` (compiled: `caget -S` of a PREC=-1 ai gives
     // ` 3.70000000000000018e+00`). Clamping to 0 printed `4` instead.
-    let prec = snapshot
-        .display
-        .as_ref()
-        .map(|d| d.precision as u16)
-        .unwrap_or(6);
+    let prec = snapshot.precision().map(|p| p as u16).unwrap_or(6);
     match value {
         EpicsValue::Double(v) => EpicsValue::String(cvt_double_to_string(*v, prec).into()),
         EpicsValue::Float(v) => EpicsValue::String(cvt_float_to_string(*v, prec).into()),
@@ -686,8 +690,8 @@ fn write_gr_ctrl_meta(
 /// Write units field (8 bytes, null-padded).
 fn encode_units(buf: &mut Vec<u8>, snapshot: &crate::server::snapshot::Snapshot) {
     let mut units_buf = [0u8; MAX_UNITS_SIZE];
-    if let Some(ref disp) = snapshot.display {
-        let bytes = disp.units.as_bytes();
+    if let Some(units) = snapshot.units() {
+        let bytes = units.as_bytes();
         let len = bytes.len().min(MAX_UNITS_SIZE - 1);
         units_buf[..len].copy_from_slice(&bytes[..len]);
     }
@@ -695,32 +699,44 @@ fn encode_units(buf: &mut Vec<u8>, snapshot: &crate::server::snapshot::Snapshot)
 }
 
 /// Get the 6 display limits + optional 2 control limits from snapshot.
+///
+/// Each group comes from its own supply-gated accessor, because each is a
+/// SEPARATE rset slot: `dbAccess.c:336-427` clears the option bit of every
+/// NULL slot, and the reply buffer keeps the memset zero. One `Option` on
+/// `DisplayInfo` cannot say which of `get_graphic_double` and
+/// `get_alarm_double` the record type supplies.
 fn get_limits(snapshot: &crate::server::snapshot::Snapshot, n_limits: usize) -> [f64; 8] {
     let mut limits = [0.0f64; 8];
-    if let Some(ref disp) = snapshot.display {
-        limits[0] = disp.upper_disp_limit;
-        limits[1] = disp.lower_disp_limit;
-        limits[2] = disp.upper_alarm_limit;
-        limits[3] = disp.upper_warning_limit;
-        limits[4] = disp.lower_warning_limit;
-        limits[5] = disp.lower_alarm_limit;
+    if let Some((lower, upper)) = snapshot.graphic_limits() {
+        limits[0] = upper;
+        limits[1] = lower;
     }
-    if n_limits > 6 {
-        if let Some(ref ctrl) = snapshot.control {
-            limits[6] = ctrl.upper_ctrl_limit;
-            limits[7] = ctrl.lower_ctrl_limit;
-        }
+    if let Some((lolo, low, high, hihi)) = snapshot.alarm_limits() {
+        limits[2] = hihi;
+        limits[3] = high;
+        limits[4] = low;
+        limits[5] = lolo;
+    }
+    if n_limits > 6
+        && let Some((lower, upper)) = snapshot.control_limits()
+    {
+        limits[6] = upper;
+        limits[7] = lower;
     }
     limits
 }
 
-/// precision(2) + pad(2) + units(8) + n limits as f64
+/// precision(2) + pad(2) + units(8) + n limits as f64.
+///
+/// Unlike the `DBR_STRING` conversion, this reply carries the memset zero for
+/// a NULL `get_precision`: `dbAccess.c` clears `DBR_PRECISION` before the
+/// buffer is filled, so the 6 that `getDoubleString` seeds never reaches here.
 fn encode_prec_units_limits_f64(
     buf: &mut Vec<u8>,
     snapshot: &crate::server::snapshot::Snapshot,
     n_limits: usize,
 ) {
-    let prec = snapshot.display.as_ref().map(|d| d.precision).unwrap_or(0);
+    let prec = snapshot.precision().unwrap_or(0);
     buf.extend_from_slice(&prec.to_be_bytes());
     buf.extend_from_slice(&[0, 0]); // RISC_pad
     encode_units(buf, snapshot);
@@ -736,7 +752,7 @@ fn encode_prec_units_limits_f32(
     snapshot: &crate::server::snapshot::Snapshot,
     n_limits: usize,
 ) {
-    let prec = snapshot.display.as_ref().map(|d| d.precision).unwrap_or(0);
+    let prec = snapshot.precision().unwrap_or(0);
     buf.extend_from_slice(&prec.to_be_bytes());
     buf.extend_from_slice(&[0, 0]); // RISC_pad
     encode_units(buf, snapshot);
@@ -1232,6 +1248,21 @@ fn decode_gr_ctrl(
 
     let value = EpicsValue::from_bytes_array(native, &data[off..], count)?;
     let mut snap = Snapshot::new(value, status, severity, SystemTime::UNIX_EPOCH);
+    // The CA wire carries no supply mask — `dbAccess.c` clears the option bit
+    // BEFORE the reply is filled, so an unsupplied leaf arrives as the memset
+    // zero and is indistinguishable from a supplied zero. What a client CAN
+    // say is which leaves this reply class carried, and that is the mask: the
+    // same rule `Pv::apply_metadata` applies to a bare PV. Assigned by the one
+    // owner that mints the blocks, so mask and values cannot disagree.
+    snap.properties = crate::server::snapshot::PropertySupport {
+        units: display.is_some(),
+        precision: display.is_some(),
+        graphic_double: display.is_some(),
+        alarm_double: display.is_some(),
+        control_double: control.is_some(),
+        enum_strs: enums.is_some(),
+    }
+    .narrowed_to_field(snap.value.db_field_type(), false);
     snap.display = display;
     snap.control = control;
     snap.enums = enums;
@@ -1685,15 +1716,22 @@ mod r17_1_negative_precision_tests {
     //! ` 3.70000000000000018e+00`; `cvtFloatToString(3.7f, b, (short)-1)`:
     //! `3.700000047684e+00` (its own cap is 12).
     use super::{EpicsValue, convert_value_to_dbr_string};
-    use crate::server::snapshot::{DisplayInfo, Snapshot};
+    use crate::server::snapshot::{DisplayInfo, PropertySupport, Snapshot};
     use std::time::SystemTime;
 
+    /// A channel whose record type SUPPLIES `get_precision` — the mask says so,
+    /// because `display.is_some()` cannot: every snapshot carries a
+    /// `DisplayInfo` for its DESC leaf.
     fn snap_with_prec(value: EpicsValue, precision: i16) -> Snapshot {
         let mut s = Snapshot::new(value, 0, 0, SystemTime::UNIX_EPOCH);
         s.display = Some(DisplayInfo {
             precision,
             ..Default::default()
         });
+        s.properties = PropertySupport {
+            precision: true,
+            ..PropertySupport::NONE
+        };
         s
     }
 

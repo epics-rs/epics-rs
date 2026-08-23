@@ -312,6 +312,80 @@ impl CalcoutRecord {
         }
     }
 
+    /// The 21 `LX` advances as one step. C reaches them in `monitor`
+    /// (`calcoutRecord.c:679-685`), which `process` calls at `:306` — below
+    /// the ODLY early return at `:282`, so both the immediate cycle and the
+    /// delayed continuation run them and the delaying cycle does not.
+    fn advance_prev_all(&mut self) {
+        Self::advance_prev(self.a, &mut self.la);
+        Self::advance_prev(self.b, &mut self.lb);
+        Self::advance_prev(self.c, &mut self.lc);
+        Self::advance_prev(self.d, &mut self.ld);
+        Self::advance_prev(self.e, &mut self.le);
+        Self::advance_prev(self.f, &mut self.lf);
+        Self::advance_prev(self.g, &mut self.lg);
+        Self::advance_prev(self.h, &mut self.lh);
+        Self::advance_prev(self.i, &mut self.li);
+        Self::advance_prev(self.j, &mut self.lj);
+        Self::advance_prev(self.k, &mut self.lk);
+        Self::advance_prev(self.l, &mut self.ll);
+        Self::advance_prev(self.m, &mut self.lm);
+        Self::advance_prev(self.n, &mut self.ln);
+        Self::advance_prev(self.o, &mut self.lo);
+        Self::advance_prev(self.p, &mut self.lp);
+        Self::advance_prev(self.q, &mut self.lq);
+        Self::advance_prev(self.r, &mut self.lr);
+        Self::advance_prev(self.s, &mut self.ls);
+        Self::advance_prev(self.t, &mut self.lt);
+        Self::advance_prev(self.u, &mut self.lu);
+    }
+
+    /// C `calcoutRecord.c::execOutput` (613-627), the "Determine output data"
+    /// half: the DOPT switch that fills OVAL and the `udf = isnan(oval)` it
+    /// leaves behind on the Use_OVAL branch.
+    ///
+    /// The single owner of that switch, called from the two places C calls
+    /// `execOutput`: the immediate output at `:283` and the delayed
+    /// continuation at `:296`. C's ODLY arm returns at `:282` with the switch
+    /// UNRUN, so on a delayed cycle OCAL runs against the A..U present at
+    /// EXPIRY. Evaluating it while scheduling made the delay a no-op for every
+    /// input that moved inside the window.
+    ///
+    /// `calcPerform(&prec->a, &prec->oval, prec->orpc)` (`:621`) takes the
+    /// record's own A..U as its arg set, so this pass reads back the CALC
+    /// pass's stores and writes its own into the same cells.
+    fn exec_output_data(&mut self) {
+        if self.dopt != 1 {
+            self.oval = self.val;
+            return;
+        }
+        // Use OCAL. C `:621` calls calcPerform on ORPC unconditionally on this
+        // branch — an empty OCAL with DOPT=Use_OCAL is the empty program, so it
+        // fails and raises CALC_ALARM instead of leaving OVAL stale and silent.
+        // `presult = &oval`, so the OCAL `VAL` token reads the *previous* OVAL,
+        // not VAL.
+        let mut inputs = crate::calc::NumericInputs::with_vars(self.get_vars());
+        inputs.prev_val = self.oval;
+        match crate::calc::eval(&self.orpc, &mut inputs) {
+            Ok(v) => {
+                self.oval = v;
+                // C `:624`: `prec->udf = isnan(prec->oval)` on the
+                // successful-OCAL branch. A NaN OVAL then raises UDF_ALARM
+                // (`:628`) so IVOA gates the OUT write — without this a finite
+                // VAL but NaN OVAL drives NaN to OUT with NO_ALARM.
+                self.ocal_udf_override = Some(self.oval.is_nan());
+            }
+            // C `:622`: OCAL calcPerform failure raises CALC_ALARM (amsg "OCAL
+            // calcPerform") and leaves udf VAL-based (no override).
+            // `get_or_insert` keeps a prior CALC "calcPerform" if CALC also
+            // failed this cycle — matching C's raise-only order.
+            Err(_) => {
+                self.calc_alarm.get_or_insert("OCAL calcPerform");
+            }
+        }
+        self.apply_stores(&inputs.vars);
+    }
+
     fn get_vars(&self) -> [f64; 21] {
         [
             self.a, self.b, self.c, self.d, self.e, self.f, self.g, self.h, self.i, self.j, self.k,
@@ -335,15 +409,39 @@ impl CalcoutRecord {
         ] = *vars;
     }
 
+    /// C `calcoutRecord.c:257`:
+    ///
+    /// ```c
+    /// doOutput = ! (fabs(prec->pval - prec->val) <= prec->mdel);
+    /// ```
+    ///
+    /// The negated `<=` is not a spelling of `>`: every IEEE comparison
+    /// involving NaN is false, so a NaN VAL (`CALC="0/0"`, or any input that
+    /// went undefined) makes C's `<=` false and `doOutput` TRUE, while a `>`
+    /// makes it FALSE. This record was written to agree with `scalcout` /
+    /// `acalcout`, whose own upstreams (`sCalcoutRecord.c:379`,
+    /// `aCalcoutRecord.c:318`) genuinely DO use `>`; that is why the `>` looked
+    /// right. It cost the OUT link on every NaN cycle, and with it the target's
+    /// FLNK chain.
+    ///
+    /// Spelled as the three-way compare rather than as C's negation: `None` is
+    /// the NaN arm C reaches by falling through a false `<=`, and naming it
+    /// stops the next reader from "simplifying" this back to `>`. `Less` and
+    /// `Equal` are both inside the deadband, which is what makes C's `<=`
+    /// inclusive — an exact-MDEL change does not fire.
     fn should_output(&self) -> bool {
         match self.oopt {
-            0 => true,                                     // Every Time
-            1 => (self.pval - self.val).abs() > self.mdel, // On Change (use MDEL like C)
-            2 => self.val == 0.0,                          // When Zero
-            3 => self.val != 0.0,                          // When Non-zero
-            4 => self.pval != 0.0 && self.val == 0.0,      // Transition to Zero
-            5 => self.pval == 0.0 && self.val != 0.0,      // Transition to Non-zero
-            _ => false,                                    // Unknown: don't output (like C)
+            0 => true, // Every Time
+            // On Change
+            1 => matches!(
+                (self.pval - self.val).abs().partial_cmp(&self.mdel),
+                None | Some(std::cmp::Ordering::Greater)
+            ),
+            2 => self.val == 0.0,                     // When Zero
+            3 => self.val != 0.0,                     // When Non-zero
+            4 => self.pval != 0.0 && self.val == 0.0, // Transition to Zero
+            5 => self.pval == 0.0 && self.val != 0.0, // Transition to Non-zero
+            _ => false, // Unknown: C's `doOutput = 0` default (`:270-272`)
         }
     }
 
@@ -548,15 +646,17 @@ impl Record for CalcoutRecord {
 
     fn process(&mut self) -> CaResult<ProcessOutcome> {
         // ODLY continuation: this is the delayed re-process scheduled by a
-        // previous cycle (C `calcoutRecord.c::process` `pact==TRUE` +
-        // `dlya` branch). Do NOT re-evaluate CALC / should_output here —
-        // C runs `execOutput` directly. Honour the output decision the
-        // original cycle captured, clear DLYA, and let the framework
-        // write the OUT link.
+        // previous cycle (C `calcoutRecord.c::process` `pact==TRUE` + `dlya`
+        // branch, `:293-303`). No input fetch and no CALC pass — C's `pact`
+        // arm re-enters below them — but `execOutput` DOES run here, and the
+        // DOPT switch is its first half, so OVAL is computed now, from the
+        // A..U present at expiry.
         if self.dlya == 1 {
             self.dlya = 0;
             self.cached_should_output = self.pending_output;
             self.pending_output = false;
+            self.exec_output_data();
+            self.advance_prev_all();
             return Ok(ProcessOutcome::complete());
         }
 
@@ -569,10 +669,11 @@ impl Record for CalcoutRecord {
         // UDF and raises no CALC_ALARM; the OOPT decision below then runs
         // against that frozen VAL (C leaves the switch OUTSIDE the gate), so an
         // OOPT of Every_Time still drives OUT with the previous value.
-        // ONE var set for the whole cycle — C hands BOTH passes the same
+        // The arg set is the record's own A..U: C hands BOTH passes
         // `&prec->a`, so a CALC-pass store (`A:=A+1`) is what the OCAL pass
-        // fetches, and both land in the record's A..U. Two independent copies
-        // made CALC's stores invisible to OCAL and dropped them both.
+        // fetches, and both land in the record's fields. Hence the store below
+        // lands before `exec_output_data` reads the vars back; two independent
+        // copies made CALC's stores invisible to OCAL and dropped them both.
         let mut inputs = crate::calc::NumericInputs::with_vars(self.get_vars());
         if !self.fetch_gate_failed {
             // C `calcoutRecord.c:238-241` — `calcPerform` runs unconditionally
@@ -594,79 +695,19 @@ impl Record for CalcoutRecord {
             }
         }
 
-        // Determine output and evaluate OCAL if needed. C runs this in
-        // `execOutput`, called only when the OOPT predicate (`should_output`)
-        // fired — so the OCAL-derived udf below is reset every cycle and set
-        // only on an actual Use_OVAL output cycle.
+        // C `:240` `prec->udf = isnan(prec->val)` — the CALC-pass half of udf.
+        // The OCAL half lives in `exec_output_data` (C `execOutput:624`) and is
+        // therefore absent during an ODLY window, exactly as in C, where udf is
+        // VAL-based until the delayed `execOutput` runs.
         self.ocal_udf_override = None;
-        if self.should_output() {
-            if self.dopt == 1 {
-                // Use OCAL. C `execOutput:621` calls calcPerform on ORPC
-                // unconditionally on this branch — an empty OCAL with DOPT=Use_OCAL
-                // is the empty program, so it fails and raises CALC_ALARM instead
-                // of leaving OVAL stale and silent.
-                // C `calcPerform(&prec->a, &prec->oval, orpc)`
-                // (calcoutRecord.c:621) passes `presult = &oval`, so the
-                // OCAL `VAL` token reads the *previous* OVAL, not VAL.
-                inputs.prev_val = self.oval;
-                match crate::calc::eval(&self.orpc, &mut inputs) {
-                    Ok(v) => {
-                        self.oval = v;
-                        // C `execOutput:624`: `prec->udf = isnan(prec->oval)`
-                        // on the successful-OCAL branch. A NaN OVAL then
-                        // raises UDF_ALARM (execOutput:628) so IVOA gates the
-                        // OUT write — without this a finite VAL but NaN OVAL
-                        // drives NaN to OUT with NO_ALARM (silent-wrong-value).
-                        self.ocal_udf_override = Some(self.oval.is_nan());
-                    }
-                    // C `execOutput:622`: OCAL calcPerform failure raises
-                    // CALC_ALARM (amsg "OCAL calcPerform") and leaves udf
-                    // VAL-based (no override). `get_or_insert` keeps a prior
-                    // CALC "calcPerform" if CALC also failed this cycle —
-                    // matching C's raise-only order (CALC set first wins).
-                    Err(_) => {
-                        self.calc_alarm.get_or_insert("OCAL calcPerform");
-                    }
-                }
-            } else {
-                self.oval = self.val;
-            }
-        }
-        // Both passes' stores land here, before LA..LU advance — C wrote them
-        // into A..U through `&prec->a` as each pass ran.
+
+        // The CALC pass's stores. C wrote them into A..U through `&prec->a` as
+        // the pass ran; `exec_output_data` reads them back for the OCAL pass.
         self.apply_stores(&inputs.vars);
-        // Update LA-LU. C `calcoutRecord.c::monitor` (lines 679-685)
-        // advances `*pprev = *pnew` only inside the per-field change test
-        // (`if (*pnew != *pprev || monitor_mask & DBE_ALARM)`), i.e. only
-        // for inputs that actually changed since the last monitor post.
-        Self::advance_prev(self.a, &mut self.la);
-        Self::advance_prev(self.b, &mut self.lb);
-        Self::advance_prev(self.c, &mut self.lc);
-        Self::advance_prev(self.d, &mut self.ld);
-        Self::advance_prev(self.e, &mut self.le);
-        Self::advance_prev(self.f, &mut self.lf);
-        Self::advance_prev(self.g, &mut self.lg);
-        Self::advance_prev(self.h, &mut self.lh);
-        Self::advance_prev(self.i, &mut self.li);
-        Self::advance_prev(self.j, &mut self.lj);
-        Self::advance_prev(self.k, &mut self.lk);
-        Self::advance_prev(self.l, &mut self.ll);
-        Self::advance_prev(self.m, &mut self.lm);
-        Self::advance_prev(self.n, &mut self.ln);
-        Self::advance_prev(self.o, &mut self.lo);
-        Self::advance_prev(self.p, &mut self.lp);
-        Self::advance_prev(self.q, &mut self.lq);
-        Self::advance_prev(self.r, &mut self.lr);
-        Self::advance_prev(self.s, &mut self.ls);
-        Self::advance_prev(self.t, &mut self.lt);
-        Self::advance_prev(self.u, &mut self.lu);
-
-        // Cache should_output result BEFORE updating pval, because
-        // framework calls should_output() after process() returns,
-        // but by then pval would already equal val.
+        // C `:255-272` reads PVAL in the OOPT switch and `:275` advances it,
+        // both above the ODLY branch — so PVAL advances even on a cycle that
+        // returns to wait the delay out.
         let do_output = self.should_output();
-
-        // Now update pval for next cycle
         self.pval = self.val;
 
         // ODLY (C `calcoutRecord.c::process` lines 276-288): when an
@@ -702,6 +743,11 @@ impl Record for CalcoutRecord {
         }
 
         self.cached_should_output = do_output;
+        if do_output {
+            // C `:283`, the immediate arm of `if (doOutput)`.
+            self.exec_output_data();
+        }
+        self.advance_prev_all();
         Ok(ProcessOutcome::complete())
     }
 
@@ -1511,6 +1557,51 @@ mod process_tests {
         assert_eq!(rec.val, 1.0);
         rec.process().unwrap();
         assert_eq!(rec.val, 2.0);
+    }
+
+    /// OOPT="On Change" is C's negated inclusive deadband
+    /// (`calcoutRecord.c:257`), not `>`. The boundaries that separate the two
+    /// spellings: NaN on either side (every IEEE comparison with NaN is false,
+    /// so the negation fires and `>` does not) and |PVAL-VAL| exactly equal to
+    /// MDEL (C's `<=` is inclusive, so it must NOT fire — the case a naive
+    /// `>=` rewrite breaks).
+    #[test]
+    fn on_change_matches_c_negated_deadband_at_nan_and_at_mdel() {
+        let nan = f64::NAN;
+        for (pval, val, mdel, want, why) in [
+            (0.0, nan, 0.0, true, "VAL NaN, PVAL finite"),
+            (nan, 0.0, 0.0, true, "PVAL NaN, VAL finite"),
+            (
+                nan,
+                nan,
+                0.0,
+                true,
+                "both NaN: fabs(NaN-NaN) is NaN, <= false",
+            ),
+            (1.0, nan, 5.0, true, "NaN ignores MDEL entirely"),
+            (
+                0.0,
+                1.0,
+                1.0,
+                false,
+                "|PVAL-VAL| exactly MDEL: C's <= is inclusive",
+            ),
+            (0.0, 1.5, 1.0, true, "|PVAL-VAL| above MDEL"),
+            (2.0, 2.0, 0.0, false, "unchanged finite value, MDEL 0"),
+        ] {
+            let rec = CalcoutRecord {
+                oopt: 1,
+                pval,
+                val,
+                mdel,
+                ..Default::default()
+            };
+            assert_eq!(
+                rec.should_output(),
+                want,
+                "{why}: PVAL={pval} VAL={val} MDEL={mdel}"
+            );
+        }
     }
 
     /// OCAL `VAL` token reads the previous OVAL, not VAL (C `presult =

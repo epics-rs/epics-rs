@@ -5,6 +5,25 @@ use crate::server::record::{
 use crate::server::records::convert_phase::ConvertPhase;
 use crate::types::{EpicsValue, PvString};
 
+/// The soft `ai` dset's own "a read has completed" state — `prec->dpvt` in
+/// `devAiSoft.c` (set at :90, cleared at :94) and `pdevPvt->smooth` in
+/// `devAiSoftCallback.c` (:194, :182). It is the second term of the three-part
+/// `SMOO` guard, and it is what makes the FIRST soft read of a record — and
+/// the first after a failed one — land unblended.
+///
+/// Named rather than a bare `bool` because the state it carries is not "SMOO
+/// is armed" but "`VAL` currently holds a previous reading": `VAL` alone
+/// cannot say so (a caput, a `SIMM` landing and a constant-`INP` load all
+/// leave a perfectly finite `VAL` that C refuses to blend against).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+enum SoftReadHistory {
+    /// C `dpvt == NULL` / `smooth == FALSE`.
+    #[default]
+    Absent,
+    /// C `dpvt != NULL` / `smooth == TRUE`.
+    Prior,
+}
+
 /// Analog input record with conversion support.
 /// LINR: 0=NO_CONVERSION, 1=SLOPE, 2=LINEAR
 pub struct AiRecord {
@@ -48,6 +67,10 @@ pub struct AiRecord {
     /// `SPC_LINCONV` put, cleared at the end of every `process`.
     pub init: ConvertPhase,
     skip_convert: bool,
+    /// C's soft-dset history flag — see [`SoftReadHistory`]. Owned by
+    /// [`Record::soft_input_read`], which is the only place C touches
+    /// `dpvt`/`smooth` too.
+    soft_history: SoftReadHistory,
     /// Set by `process()` when a `LINR >= 3` breakpoint-table conversion
     /// fails — the table could not be resolved, or the raw value fell past
     /// an end of the table. C `aiRecord.c::convert` raises
@@ -106,6 +129,7 @@ impl Default for AiRecord {
             mlst: 0.0,
             init: ConvertPhase::default(),
             skip_convert: false,
+            soft_history: SoftReadHistory::default(),
             bpt_error: false,
             bpt_registry: None,
             bpt_table: None,
@@ -585,6 +609,35 @@ impl Record for AiRecord {
     /// `read_ai` returns 2 ("don't convert").
     fn soft_channel_skips_convert(&self) -> bool {
         true
+    }
+
+    /// C `devAiSoft.c::read_ai` (:81-93) and `devAiSoftCallback.c::read_ai`
+    /// (:180-194): both soft `ai` dsets apply `SMOO` themselves, before the
+    /// record body ever runs. `aiRecord.c:439-444` — the copy `process()`
+    /// runs — is reached only when `convert()` does, i.e. only under
+    /// `devAiSoftRaw`, so with the filter written there alone `SMOO` had no
+    /// effect at any value on the default `ai` DTYP.
+    ///
+    /// C's guard is three-part: `smoo != 0.0 && prec->dpvt && finite(prec->val)`,
+    /// and at that point `prec->val` is still the PREVIOUS value — the reading
+    /// is `vt.val`. So the finiteness test is on what is being blended INTO,
+    /// and `dpvt` is the separate answer to "is there anything to blend into".
+    fn soft_input_read(&mut self, value: Option<EpicsValue>) -> CaResult<()> {
+        let Some(value) = value else {
+            self.soft_history = SoftReadHistory::Absent;
+            return Ok(());
+        };
+        let previous = self.val;
+        let history = self.soft_history;
+        // `set_val` stays the coercion owner (an array source delivers
+        // `wf[0]`, C `dbGetLink` with `nRequest = NULL`), so the reading is
+        // taken through it and blended afterwards.
+        self.set_val(value)?;
+        if self.smoo != 0.0 && history == SoftReadHistory::Prior && previous.is_finite() {
+            self.val = self.val * (1.0 - self.smoo) + previous * self.smoo;
+        }
+        self.soft_history = SoftReadHistory::Prior;
+        Ok(())
     }
 
     /// C `devAiSoftRaw` — `recGblInitConstantLink(&prec->inp, DBF_LONG,

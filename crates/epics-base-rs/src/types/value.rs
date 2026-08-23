@@ -922,7 +922,7 @@ impl EpicsValue {
             // the epicsInt8 sign-reinterpret arm in `convert_to`.
             Self::UCharArray(a) => Some(a.iter().map(|&v| v as f64).collect()),
             // DBR_STRING → numeric IS an array conversion in C: the
-            // `putString*` family (`dbConvert.c:941-1148`) runs the SAME
+            // `putString*` family (`dbConvert.c:941-1147`) runs the SAME
             // per-element scalar parse (`epicsParseInt32`/`epicsParseFloat64`,
             // `dbConvertBase` = 0 so `"0x10"` is 16) over all `nRequest`
             // elements. Taking the numeric view here makes the array path

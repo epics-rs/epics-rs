@@ -56,6 +56,13 @@ pub struct SelRecord {
     pub llsv: i16, // LOLO severity
     pub hyst: f64, // alarm deadband
     pub lalm: f64, // last alarmed value (C `prec->lalm`)
+    /// MLST / ALST — C `selRecord.dbd`, both `DBF_DOUBLE`
+    /// `special(SPC_NOMOD)`. `monitor()` deadbands VAL against them
+    /// (selRecord.c:316,319). The record served neither, so the
+    /// framework had no cell to remember the last posted value in and
+    /// treated every cycle as the first one.
+    pub mlst: f64,
+    pub alst: f64,
     /// True when `do_sel` detected an out-of-range SELN in Specified
     /// mode — raises `SOFT_ALARM/INVALID` in `check_alarms`.
     soft_alarm: bool,
@@ -111,6 +118,8 @@ impl Default for SelRecord {
             llsv: 0,
             hyst: 0.0,
             lalm: 0.0,
+            mlst: 0.0,
+            alst: 0.0,
             soft_alarm: false,
             fetch_gate_failed: false,
         }
@@ -127,6 +136,11 @@ impl SelRecord {
 }
 
 impl Record for SelRecord {
+    /// C `selRecord.c::init_record` (:88-110) seeds the A..L inputs to NaN and
+    /// returns; it never touches LALM, whose only writes are in
+    /// `checkAlarms` (:270-302).
+    fn seed_deadband_tracking(&mut self) {}
+
     fn record_type(&self) -> &'static str {
         "sel"
     }
@@ -340,6 +354,8 @@ impl Record for SelRecord {
             "LLSV" => Some(EpicsValue::Short(self.llsv)),
             "HYST" => Some(EpicsValue::Double(self.hyst)),
             "LALM" => Some(EpicsValue::Double(self.lalm)),
+            "MLST" => Some(EpicsValue::Double(self.mlst)),
+            "ALST" => Some(EpicsValue::Double(self.alst)),
             _ => None,
         }
     }
@@ -433,7 +449,7 @@ impl Record for SelRecord {
                 }
                 Ok(())
             }
-            "HIHI" | "HIGH" | "LOW" | "LOLO" | "HYST" | "LALM" => {
+            "HIHI" | "HIGH" | "LOW" | "LOLO" | "HYST" | "LALM" | "MLST" | "ALST" => {
                 let v = value
                     .to_f64()
                     .ok_or_else(|| CaError::TypeMismatch(name.into()))?;
@@ -444,6 +460,8 @@ impl Record for SelRecord {
                     "LOLO" => self.lolo = v,
                     "HYST" => self.hyst = v,
                     "LALM" => self.lalm = v,
+                    "MLST" => self.mlst = v,
+                    "ALST" => self.alst = v,
                     _ => unreachable!(),
                 }
                 Ok(())

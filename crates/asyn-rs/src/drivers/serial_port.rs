@@ -16,8 +16,11 @@ use crate::trace::TraceMask;
 use crate::user::AsynUser;
 use crate::{asyn_trace, asyn_trace_io};
 
-use super::option_parse::{bad_number, parse_yn_option, sscanf_int, sscanf_uint};
+use super::option_parse::{
+    bad_number, option_key, option_value, parse_yn_option, sscanf_int, sscanf_uint,
+};
 use super::serial_config::{DataBits, FlowControl, Parity, SerialConfig, StopBits};
+use super::wait_millis;
 
 /// The termios facilities this driver needs, resolved once per target.
 ///
@@ -627,7 +630,220 @@ impl SerialIoState {
 }
 
 fn duration_to_poll_ms(d: Duration) -> i32 {
-    d.as_millis().min(i32::MAX as u128) as i32
+    wait_millis(d).min(i32::MAX as u128) as i32
+}
+
+fn timeout_err(message: &str) -> AsynError {
+    AsynError::Status {
+        status: AsynStatus::Timeout,
+        message: message.into(),
+    }
+}
+
+/// The three fd calls the read and write loops make, behind one seam.
+///
+/// The production implementation is [`RawFd`] and adds nothing to it. It
+/// exists because the condition the loops below have to survive — a descriptor
+/// that keeps reporting `POLLERR` while `read`/`write` keep returning `EAGAIN`
+/// — has no reproducible pty or socketpair equivalent, so a scripted fake is
+/// the only deterministic way to drive the loops through it.
+trait SerialFd {
+    /// One `poll` for `events`: `Ok(None)` when the interval expired with
+    /// nothing ready, `Ok(Some(revents))` otherwise. `EINTR` is surfaced
+    /// rather than retried here, because the retry is precisely what the total
+    /// deadline has to bound — [`wait_until`] owns it.
+    fn poll_ready(
+        &self,
+        events: libc::c_short,
+        timeout_ms: i32,
+    ) -> std::io::Result<Option<libc::c_short>>;
+    fn read(&self, buf: &mut [u8]) -> std::io::Result<usize>;
+    fn write(&self, data: &[u8]) -> std::io::Result<usize>;
+}
+
+impl SerialFd for RawFd {
+    fn poll_ready(
+        &self,
+        events: libc::c_short,
+        timeout_ms: i32,
+    ) -> std::io::Result<Option<libc::c_short>> {
+        let mut pfd = libc::pollfd {
+            fd: *self,
+            events,
+            revents: 0,
+        };
+        // SAFETY: one initialised `pollfd` whose `fd` is this open descriptor;
+        // `poll` reads `fd`/`events` and writes only `revents`.
+        let ret = unsafe { libc::poll(&mut pfd, 1, timeout_ms) };
+        match ret {
+            n if n < 0 => Err(std::io::Error::last_os_error()),
+            0 => Ok(None),
+            _ => Ok(Some(pfd.revents)),
+        }
+    }
+
+    fn read(&self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let n = unsafe { libc::read(*self, buf.as_mut_ptr() as *mut libc::c_void, buf.len()) };
+        if n < 0 {
+            Err(std::io::Error::last_os_error())
+        } else {
+            Ok(n as usize)
+        }
+    }
+
+    fn write(&self, data: &[u8]) -> std::io::Result<usize> {
+        let n = unsafe { libc::write(*self, data.as_ptr() as *const libc::c_void, data.len()) };
+        if n < 0 {
+            Err(std::io::Error::last_os_error())
+        } else {
+            Ok(n as usize)
+        }
+    }
+}
+
+/// What one bounded wait produced.
+enum Wake {
+    /// `poll` reported the descriptor ready — or in error; the raw `revents`.
+    Ready(libc::c_short),
+    /// The total deadline passed without the descriptor becoming ready.
+    Expired,
+}
+
+/// Wait for `events`, and own the rule both loops obey: **every retry
+/// re-derives its budget from the one total deadline; only the first attempt
+/// ever gets the caller's whole timeout.**
+///
+/// C `readIt`/`writeIt` arm a single timer for the whole call
+/// (drvAsynSerialPort.c:815-842) and break when it fires, so the timeout
+/// bounds the total rather than each syscall. The write path already had that
+/// deadline; the read path computed `timeout_ms` once *outside* its loop and
+/// re-entered `poll` with the full value after every retry, so an
+/// `asynOctetRead` with `TMOT=1.0` returned after k x 1.0 s.
+///
+/// An exhausted budget still polls, with a zero interval: that is C's own
+/// `writeTimeout == 0` behaviour — one non-blocking attempt, then bail — and
+/// keeping it here is why a `timeout == 0` write of a writable port still
+/// sends.
+fn wait_until(fd: &impl SerialFd, events: libc::c_short, deadline: Instant) -> AsynResult<Wake> {
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        match fd.poll_ready(events, duration_to_poll_ms(remaining)) {
+            Ok(Some(revents)) => return Ok(Wake::Ready(revents)),
+            Ok(None) => return Ok(Wake::Expired),
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {
+                if Instant::now() >= deadline {
+                    return Ok(Wake::Expired);
+                }
+            }
+            Err(e) => return Err(AsynError::Io(e)),
+        }
+    }
+}
+
+/// Classify a wake that the following `read`/`write` could not consume.
+///
+/// `POLLERR`, `POLLHUP` and `POLLNVAL` come back regardless of `events` and
+/// are level-triggered: a descriptor that latches one hands the next `poll`
+/// the same bits immediately. Both loops retry `EAGAIN` because a spurious
+/// wake is benign, but a latched error bit paired with a permanent `EAGAIN`
+/// turns that retry into a hot spin — one that on the read path nothing
+/// stopped at all, leaving the port actor thread inside the driver call while
+/// every request queued behind it, `AQR` included, waited with it. Only a wake
+/// that carried the readiness actually asked for is worth retrying; anything
+/// else is the device's error and belongs to the caller.
+fn wake_error(revents: libc::c_short, ready: libc::c_short) -> Option<AsynError> {
+    let broken = libc::POLLERR | libc::POLLHUP | libc::POLLNVAL;
+    if revents & ready == 0 && revents & broken != 0 {
+        Some(AsynError::Status {
+            status: AsynStatus::Disconnected,
+            message: format!("serial port poll error (revents {revents:#x})"),
+        })
+    } else {
+        None
+    }
+}
+
+/// C `readIt`'s poll/read loop, bounded by one deadline.
+fn read_until(fd: &impl SerialFd, buf: &mut [u8], deadline: Instant) -> AsynResult<usize> {
+    loop {
+        let revents = match wait_until(fd, libc::POLLIN, deadline)? {
+            Wake::Ready(revents) => revents,
+            Wake::Expired => return Err(timeout_err("serial read timeout")),
+        };
+
+        match fd.read(buf) {
+            Ok(0) => {
+                return Err(AsynError::Status {
+                    status: AsynStatus::Disconnected,
+                    message: "serial port EOF".into(),
+                });
+            }
+            Ok(n) => return Ok(n),
+            // C parity (drvAsynSerialPort.c): retry on EINTR (a signal
+            // interrupted the call) and EAGAIN/EWOULDBLOCK (spurious wakeup);
+            // only a real error is fatal. Without this, a benign signal would
+            // be surfaced as a fatal Io error and tear the connection down.
+            Err(e)
+                if e.kind() == std::io::ErrorKind::Interrupted
+                    || e.kind() == std::io::ErrorKind::WouldBlock =>
+            {
+                if let Some(err) = wake_error(revents, libc::POLLIN) {
+                    return Err(err);
+                }
+                if Instant::now() >= deadline {
+                    return Err(timeout_err("serial read timeout"));
+                }
+            }
+            Err(e) => return Err(AsynError::Io(e)),
+        }
+    }
+}
+
+/// C `writeIt`'s poll/write loop on the same deadline.
+///
+/// `transferred` is C's `*nbytesTransfered` (drvAsynSerialPort.c:849): it is
+/// advanced in place so the count the port took survives every exit — timeout
+/// and fatal errno alike — instead of being dropped by the error.
+fn write_until(
+    fd: &impl SerialFd,
+    data: &[u8],
+    deadline: Instant,
+    transferred: &mut usize,
+) -> AsynResult<()> {
+    while *transferred < data.len() {
+        let revents = match wait_until(fd, libc::POLLOUT, deadline)? {
+            Wake::Ready(revents) => revents,
+            Wake::Expired => return Err(timeout_err("serial write timeout")),
+        };
+
+        match fd.write(&data[*transferred..]) {
+            Ok(n) => {
+                *transferred += n;
+                // C parity (drvAsynSerialPort.c:827): after each write, if the
+                // total deadline has passed stop with asynTimeout even though
+                // some bytes went out. A non-blocking poll that finds free
+                // space (a slow peer that drains a little each gap) would
+                // otherwise let the write run past the deadline.
+                if *transferred < data.len() && Instant::now() >= deadline {
+                    return Err(timeout_err("serial write timeout"));
+                }
+            }
+            // C parity: retry on EINTR/EAGAIN; only a real error is fatal.
+            Err(e)
+                if e.kind() == std::io::ErrorKind::Interrupted
+                    || e.kind() == std::io::ErrorKind::WouldBlock =>
+            {
+                if let Some(err) = wake_error(revents, libc::POLLOUT) {
+                    return Err(err);
+                }
+                if Instant::now() >= deadline {
+                    return Err(timeout_err("serial write timeout"));
+                }
+            }
+            Err(e) => return Err(AsynError::Io(e)),
+        }
+    }
+    Ok(())
 }
 
 impl OctetNext for SerialIoState {
@@ -645,62 +861,18 @@ impl OctetNext for SerialIoState {
                 message: "maxchars 0 Why <=0?".into(),
             });
         }
-        let timeout_ms = duration_to_poll_ms(user.timeout);
 
-        // C parity (drvAsynSerialPort.c): retry poll/read on EINTR (a signal
-        // interrupted the call) and EAGAIN/EWOULDBLOCK (spurious wakeup);
-        // only a real error is fatal. Without this, a benign signal would be
-        // surfaced as a fatal Io error and tear the connection down.
-        loop {
-            let mut pfd = libc::pollfd {
-                fd,
-                events: libc::POLLIN,
-                revents: 0,
-            };
-
-            let ret = unsafe { libc::poll(&mut pfd, 1, timeout_ms) };
-            if ret < 0 {
-                let err = std::io::Error::last_os_error();
-                if err.kind() == std::io::ErrorKind::Interrupted {
-                    continue;
-                }
-                return Err(AsynError::Io(err));
-            }
-            if ret == 0 {
-                return Err(AsynError::Status {
-                    status: AsynStatus::Timeout,
-                    message: "serial read timeout".into(),
-                });
-            }
-
-            let n = unsafe { libc::read(fd, buf.as_mut_ptr() as *mut libc::c_void, buf.len()) };
-            if n < 0 {
-                let err = std::io::Error::last_os_error();
-                if err.kind() == std::io::ErrorKind::Interrupted
-                    || err.kind() == std::io::ErrorKind::WouldBlock
-                {
-                    continue;
-                }
-                return Err(AsynError::Io(err));
-            }
-            if n == 0 {
-                return Err(AsynError::Status {
-                    status: AsynStatus::Disconnected,
-                    message: "serial port EOF".into(),
-                });
-            }
-
-            self.n_read += n as u64; // C parity: tty->nRead += thisRead
-            return Ok(OctetReadResult {
-                nbytes_transferred: n as usize,
-                // C parity: CNT only when the requested count was reached.
-                eom_reason: if n as usize >= buf.len() {
-                    EomReason::CNT
-                } else {
-                    EomReason::empty()
-                },
-            });
-        }
+        let n = read_until(&fd, buf, Instant::now() + user.timeout)?;
+        self.n_read += n as u64; // C parity: tty->nRead += thisRead
+        Ok(OctetReadResult {
+            nbytes_transferred: n,
+            // C parity: CNT only when the requested count was reached.
+            eom_reason: if n >= buf.len() {
+                EomReason::CNT
+            } else {
+                EomReason::empty()
+            },
+        })
     }
 
     fn write(&mut self, user: &mut AsynUser, data: &[u8]) -> AsynResult<usize> {
@@ -715,83 +887,9 @@ impl OctetNext for SerialIoState {
         // This driver has no such timer; a permanently non-blocking fd is what
         // replaces it, so each `write` returns immediately with what fit (or
         // EAGAIN) and the poll/deadline loop bounds the whole write.
-
-        // C parity (drvAsynSerialPort.c:815-842): writeIt arms a single timer
-        // for the whole writeTimeout *before* the loop and breaks when it fires,
-        // so the timeout bounds the TOTAL write, not each chunk. Bound total
-        // time with one deadline and poll with the remaining budget each
-        // iteration (the IP driver's write_with_retry total-deadline model).
-        // The previous code reused the full per-call timeout on every poll, so
-        // a slowly-draining peer could keep a multi-chunk write alive for up to
-        // timeout x iterations.
-        let deadline = Instant::now() + user.timeout;
-        // C parity (drvAsynSerialPort.c:849): `*nbytesTransfered = numchars -
-        // nleft` runs on the way out of the loop for *every* break — timeout
-        // and fatal errno alike — so the caller always learns how much of its
-        // message the device took. `total` therefore lives outside the loop
-        // and rides out on the error via `with_partial_write`.
         let mut total = 0usize;
-        let result: AsynResult<()> = loop {
-            if total >= data.len() {
-                break Ok(());
-            }
-            let poll_ms = duration_to_poll_ms(deadline.saturating_duration_since(Instant::now()));
-            let mut pfd = libc::pollfd {
-                fd,
-                events: libc::POLLOUT,
-                revents: 0,
-            };
-
-            let ret = unsafe { libc::poll(&mut pfd, 1, poll_ms) };
-            if ret < 0 {
-                let err = std::io::Error::last_os_error();
-                if err.kind() == std::io::ErrorKind::Interrupted {
-                    continue;
-                }
-                break Err(AsynError::Io(err));
-            }
-            if ret == 0 {
-                break Err(AsynError::Status {
-                    status: AsynStatus::Timeout,
-                    message: "serial write timeout".into(),
-                });
-            }
-
-            let n = unsafe {
-                libc::write(
-                    fd,
-                    data[total..].as_ptr() as *const libc::c_void,
-                    data.len() - total,
-                )
-            };
-            if n < 0 {
-                // C parity: retry on EINTR/EAGAIN; only a real error is fatal.
-                let err = std::io::Error::last_os_error();
-                if err.kind() == std::io::ErrorKind::Interrupted
-                    || err.kind() == std::io::ErrorKind::WouldBlock
-                {
-                    continue;
-                }
-                break Err(AsynError::Io(err));
-            }
-            total += n as usize;
-            self.n_written += n as u64; // C parity: tty->nWritten += thisWrite
-
-            // C parity (drvAsynSerialPort.c:827): after each write, if the
-            // total deadline has passed stop with asynTimeout even though
-            // some bytes went out. A non-blocking poll that finds free space
-            // (e.g. a slow peer that drains a little each gap) would
-            // otherwise let the write keep going past the deadline, since
-            // `poll(0)` returns POLLOUT instead of timing out. (timeout==0
-            // collapses to a single write attempt then bail, matching
-            // writeIt's `writeTimeout==0`.)
-            if total < data.len() && Instant::now() >= deadline {
-                break Err(AsynError::Status {
-                    status: AsynStatus::Timeout,
-                    message: "serial write timeout".into(),
-                });
-            }
-        };
+        let result = write_until(&fd, data, Instant::now() + user.timeout, &mut total);
+        self.n_written += total as u64; // C parity: tty->nWritten += thisWrite
 
         match result {
             Ok(()) => Ok(total),
@@ -1297,8 +1395,13 @@ impl PortDriver for DrvAsynSerialPort {
     /// were silently dropped while down and erased at the next connect by the
     /// rebuild from config.
     fn set_option(&mut self, _user: &mut AsynUser, key: &str, value: &str) -> AsynResult<()> {
-        let key = key.trim().to_ascii_lowercase();
-        let value = value.trim();
+        let key = option_key(key);
+        // C compares every option value with `epicsStrCaseCmp` as well
+        // (`drvAsynSerialPort.c:361-528`), so the fold belongs at the entry
+        // rather than in each arm — the `parity` arm used to carry its own and
+        // `break` carried none.
+        let value = option_value(value);
+        let value = value.as_str();
 
         // C keeps `baudPrev`/`termiosPrev` for the applyOptions rollback
         // (:341-346, :599-606). `platform::termios` is Copy, so this is the same
@@ -1355,8 +1458,7 @@ impl PortDriver for DrvAsynSerialPort {
                 // "none"/"even"/"odd" (case-insensitive); anything else is
                 // asynError "Invalid parity." The single-char aliases n/e/o
                 // were a Rust-only superset and are dropped to match C.
-                let val_lower = value.to_ascii_lowercase();
-                match val_lower.as_str() {
+                match value {
                     "none" => self.termios.c_cflag &= !platform::PARENB,
                     "even" => {
                         self.termios.c_cflag |= platform::PARENB;
@@ -1498,7 +1600,11 @@ impl PortDriver for DrvAsynSerialPort {
     }
 
     fn get_option(&self, key: &str) -> AsynResult<String> {
-        match key {
+        // C `getOption` dispatches with `epicsStrCaseCmp` exactly as `setOption`
+        // does (:143-587), so both halves enter through the same normalisation
+        // and a key set under any spelling reads back.
+        let key = option_key(key);
+        match key.as_str() {
             // C `getOption` (drvAsynSerialPort.c:135-207) answers every key
             // from the cache — it never calls tcgetattr. So the readback is
             // the *configured* state whether or not the port is open, and it
@@ -1577,13 +1683,13 @@ impl PortDriver for DrvAsynSerialPort {
             | "rs485_rts_on_send"
             | "rs485_rts_after_send"
             | "rs485_delay_rts_before_send"
-            | "rs485_delay_rts_after_send" => self.get_rs485_option(key),
+            | "rs485_delay_rts_after_send" => self.get_rs485_option(&key),
             _ => self
                 .base
                 .options
-                .get(key)
+                .get(&key)
                 .cloned()
-                .ok_or_else(|| AsynError::OptionNotFound(key.to_string())),
+                .ok_or_else(|| AsynError::OptionNotFound(key.clone())),
         }
     }
 }
@@ -1641,6 +1747,10 @@ impl DrvAsynSerialPort {
         Ok(())
     }
 
+    /// `key` arrives already folded by `option_parse::option_key` — both
+    /// `set_option` and `get_option` normalise before they dispatch — so the
+    /// literals below are the whole rule and there is no second copy of C's
+    /// `epicsStrCaseCmp` here.
     fn set_rs485_option(&mut self, key: &str, value: &str) -> AsynResult<()> {
         let fd = self.io.fd.ok_or_else(|| AsynError::Status {
             status: AsynStatus::Disconnected,
@@ -1703,6 +1813,10 @@ impl DrvAsynSerialPort {
         Ok(())
     }
 
+    /// `key` arrives already folded by `option_parse::option_key` — both
+    /// `set_option` and `get_option` normalise before they dispatch — so the
+    /// literals below are the whole rule and there is no second copy of C's
+    /// `epicsStrCaseCmp` here.
     fn get_rs485_option(&self, key: &str) -> AsynResult<String> {
         let fd = self.io.fd.ok_or_else(|| AsynError::Status {
             status: AsynStatus::Disconnected,
@@ -3312,6 +3426,265 @@ mod tests {
         );
     }
 
+    /// D4: the read arm of the same rule. C `readIt` bounds the TOTAL read with
+    /// the one timer `writeIt` uses; the Rust read computed `timeout_ms` once
+    /// *outside* its loop and re-entered `poll` with the full value after every
+    /// `EINTR`, so each signal that landed inside a wait pushed the return out
+    /// by another whole timeout. `poll` is never restarted by `SA_RESTART`, so
+    /// three `pthread_kill`s spaced wider than the timeout interrupt three
+    /// successive waits on an otherwise silent pty: with the total deadline the
+    /// read gives up at ~200 ms, with the per-poll bug at ~650 ms.
+    #[test]
+    fn pty_read_timeout_bounds_total_not_per_poll() {
+        extern "C" fn absorb_sigusr1(_sig: libc::c_int) {}
+
+        let (master, slave, slave_name) = match create_pty_pair() {
+            Some(v) => v,
+            None => {
+                eprintln!("openpty not available, skipping test");
+                return;
+            }
+        };
+        let _guard = PtyGuard { master, slave };
+
+        let mut drv = DrvAsynSerialPort::new("pty_read_total", &slave_name).unwrap();
+        drv.connect(&AsynUser::default()).unwrap();
+
+        // SIGUSR1 terminates by default; install a handler so the interruption
+        // reaches the driver as `poll`'s EINTR instead of killing the process.
+        unsafe {
+            libc::signal(
+                libc::SIGUSR1,
+                absorb_sigusr1 as *const () as libc::sighandler_t,
+            )
+        };
+        let target = unsafe { libc::pthread_self() } as usize;
+        let waker = std::thread::spawn(move || {
+            for _ in 0..3 {
+                std::thread::sleep(Duration::from_millis(150));
+                unsafe { libc::pthread_kill(target as libc::pthread_t, libc::SIGUSR1) };
+            }
+        });
+
+        let mut buf = [0u8; 32];
+        let user = AsynUser::new(0).with_timeout(Duration::from_millis(200));
+        let start = Instant::now();
+        let res = drv.read_octet(&user, &mut buf);
+        let elapsed = start.elapsed();
+        let _ = waker.join();
+
+        let err = match res {
+            Err(e) => e,
+            other => panic!("expected the read to time out, got {other:?}"),
+        };
+        assert_eq!(err.status(), AsynStatus::Timeout, "got {err:?}");
+        assert!(
+            elapsed < Duration::from_millis(450),
+            "an EINTR must not restart the timeout: the read took {elapsed:?} \
+             against a declared 200 ms"
+        );
+
+        drv.disconnect(&AsynUser::default()).ok();
+    }
+
+    /// A scripted [`SerialFd`] for the loop tests: no real descriptor can be
+    /// made to hold `POLLERR` while `read`/`write` keep returning `EAGAIN`.
+    ///
+    /// `budget` caps how many wakes the fake will report before it claims
+    /// expiry, so a loop that fails to terminate fails the assertion instead of
+    /// hanging the suite.
+    struct FakeFd {
+        revents: libc::c_short,
+        budget: std::cell::Cell<u32>,
+        polls: std::cell::Cell<u32>,
+        /// The interval the *first* poll was given, which is the one derived
+        /// from the caller's timeout rather than from a shrunken remainder.
+        first_ms: std::cell::Cell<i32>,
+    }
+
+    impl FakeFd {
+        fn new(revents: libc::c_short, budget: u32) -> Self {
+            Self {
+                revents,
+                budget: std::cell::Cell::new(budget),
+                polls: std::cell::Cell::new(0),
+                first_ms: std::cell::Cell::new(-1),
+            }
+        }
+    }
+
+    impl SerialFd for FakeFd {
+        fn poll_ready(
+            &self,
+            _events: libc::c_short,
+            timeout_ms: i32,
+        ) -> std::io::Result<Option<libc::c_short>> {
+            if self.polls.get() == 0 {
+                self.first_ms.set(timeout_ms);
+            }
+            self.polls.set(self.polls.get() + 1);
+            if self.budget.get() == 0 {
+                return Ok(None);
+            }
+            self.budget.set(self.budget.get() - 1);
+            Ok(Some(self.revents))
+        }
+
+        fn read(&self, _buf: &mut [u8]) -> std::io::Result<usize> {
+            Err(std::io::Error::from(std::io::ErrorKind::WouldBlock))
+        }
+
+        fn write(&self, _data: &[u8]) -> std::io::Result<usize> {
+            Err(std::io::Error::from(std::io::ErrorKind::WouldBlock))
+        }
+    }
+
+    /// D4, second half: a `POLLERR` the descriptor keeps re-reporting while
+    /// `read` keeps answering `EAGAIN` used to spin the retry forever, because
+    /// `pfd.revents` was never looked at. The deadline is 30 s here on purpose
+    /// — what has to end the read is the error, not the clock.
+    #[test]
+    fn read_reports_a_latched_poll_error_instead_of_retrying() {
+        let fd = FakeFd::new(libc::POLLERR, 1000);
+        let mut buf = [0u8; 8];
+        let err = read_until(&fd, &mut buf, Instant::now() + Duration::from_secs(30))
+            .expect_err("a latched POLLERR with EAGAIN must not read successfully");
+        assert_eq!(err.status(), AsynStatus::Disconnected, "got {err:?}");
+        assert_eq!(
+            fd.polls.get(),
+            1,
+            "the error must end the read on the first wake, not be retried"
+        );
+    }
+
+    /// The write arm of the same defect: its deadline could not stop the spin
+    /// either, because a latched `POLLERR` makes `poll` return > 0 even with a
+    /// zero interval, so the `ret == 0` timeout exit is never taken and the
+    /// `EAGAIN` `continue` skips the post-write deadline check.
+    #[test]
+    fn write_reports_a_latched_poll_error_instead_of_retrying() {
+        let fd = FakeFd::new(libc::POLLERR, 1000);
+        let mut sent = 0usize;
+        let err = write_until(
+            &fd,
+            b"hello",
+            Instant::now() + Duration::from_secs(30),
+            &mut sent,
+        )
+        .expect_err("a latched POLLERR with EAGAIN must not write successfully");
+        assert_eq!(err.status(), AsynStatus::Disconnected, "got {err:?}");
+        assert_eq!(sent, 0, "nothing was accepted by the port");
+        assert_eq!(
+            fd.polls.get(),
+            1,
+            "the error must end the write on the first wake, not be retried"
+        );
+    }
+
+    /// D4, first half without signals: a wake that *does* carry `POLLIN` is
+    /// legitimately retried, so only the total deadline can end it. A
+    /// descriptor that reports readiness forever while `read` answers `EAGAIN`
+    /// must therefore time out at the deadline rather than spin.
+    #[test]
+    fn read_deadline_bounds_a_ready_but_unreadable_descriptor() {
+        let fd = FakeFd::new(libc::POLLIN, u32::MAX);
+        let mut buf = [0u8; 8];
+        let start = Instant::now();
+        let err = read_until(&fd, &mut buf, start + Duration::from_millis(50))
+            .expect_err("a descriptor that never delivers must time out");
+        assert_eq!(err.status(), AsynStatus::Timeout, "got {err:?}");
+        assert!(
+            start.elapsed() < Duration::from_secs(5),
+            "the retry must be bounded by the deadline, took {:?}",
+            start.elapsed()
+        );
+        assert!(
+            fd.polls.get() > 1,
+            "the POLLIN wake must be retried, not treated as an error"
+        );
+        assert!(
+            fd.budget.get() > 0,
+            "the fake never ran out of wakes, so the deadline is what ended the read"
+        );
+    }
+
+    /// D5: a positive budget under a millisecond used to truncate to
+    /// `poll(fd, 1, 0)`, so a `TMOT` of 500 us produced "serial read timeout"
+    /// with zero bytes without waiting at all — a device answering in 300 us
+    /// alarmed on every scan. It must now be given a whole tick.
+    #[test]
+    fn a_sub_millisecond_budget_waits_a_whole_tick() {
+        let fd = FakeFd::new(libc::POLLIN, u32::MAX);
+        let mut buf = [0u8; 8];
+        let err = read_until(&fd, &mut buf, Instant::now() + Duration::from_micros(500))
+            .expect_err("the fake never delivers, so the read must time out");
+        assert_eq!(err.status(), AsynStatus::Timeout, "got {err:?}");
+        assert_eq!(
+            fd.first_ms.get(),
+            1,
+            "a 500 us timeout must reach poll as one whole millisecond"
+        );
+    }
+
+    /// D5's other zero. An already-expired deadline must stay a non-blocking
+    /// probe: flooring every budget to a tick would collapse it into the
+    /// sub-millisecond case above and hand a timeout that has already run out
+    /// a fresh millisecond on every retry.
+    #[test]
+    fn an_expired_deadline_stays_a_non_blocking_probe() {
+        let fd = FakeFd::new(libc::POLLIN, u32::MAX);
+        let mut buf = [0u8; 8];
+        let past = Instant::now()
+            .checked_sub(Duration::from_millis(5))
+            .expect("the monotonic clock is older than 5 ms");
+        let err = read_until(&fd, &mut buf, past)
+            .expect_err("an expired deadline cannot produce a successful read");
+        assert_eq!(err.status(), AsynStatus::Timeout, "got {err:?}");
+        assert_eq!(
+            fd.first_ms.get(),
+            0,
+            "an exhausted budget must not be rounded up into another wait"
+        );
+        assert_eq!(fd.polls.get(), 1, "and must not be retried");
+    }
+
+    /// The same conversion through the real driver: the read that reports the
+    /// sub-millisecond timeout has to have actually waited for it. `poll` waits
+    /// at least its interval, so a 500 us `TMOT` on a silent pty cannot return
+    /// in the few microseconds the truncated `poll(fd, 1, 0)` took.
+    #[test]
+    fn pty_sub_millisecond_read_timeout_waits_for_the_device() {
+        let (master, slave, slave_name) = match create_pty_pair() {
+            Some(v) => v,
+            None => {
+                eprintln!("openpty not available, skipping test");
+                return;
+            }
+        };
+        let _guard = PtyGuard { master, slave };
+
+        let mut drv = DrvAsynSerialPort::new("pty_subms", &slave_name).unwrap();
+        drv.connect(&AsynUser::default()).unwrap();
+
+        let mut buf = [0u8; 8];
+        let user = AsynUser::new(0).with_timeout(Duration::from_micros(500));
+        let start = Instant::now();
+        let res = drv.read_octet(&user, &mut buf);
+        let elapsed = start.elapsed();
+
+        let err = match res {
+            Err(e) => e,
+            other => panic!("the pty is silent, expected a timeout, got {other:?}"),
+        };
+        assert_eq!(err.status(), AsynStatus::Timeout, "got {err:?}");
+        assert!(
+            elapsed >= Duration::from_micros(400),
+            "a 500 us TMOT must wait, not poll non-blocking: returned in {elapsed:?}"
+        );
+
+        drv.disconnect(&AsynUser::default()).ok();
+    }
+
     /// DRV-41: C connectIt (drvAsynSerialPort.c:713-722) sets FD_CLOEXEC on the
     /// serial fd right after open so it is not inherited across exec.
     #[test]
@@ -3374,5 +3747,95 @@ mod tests {
         let mut out = String::new();
         drv.report(&mut out, 0);
         drv.report(&mut out, 2);
+    }
+
+    /// C dispatches every option key through `epicsStrCaseCmp` on both halves —
+    /// `getOption` at `drvAsynSerialPort.c:143-587`, `setOption` at `:262-594` —
+    /// so a key the operator wrote as `BAUD`, which `set_option` already
+    /// accepted, has to read back through `get_option` too. It used to fall
+    /// past the lowercase literals into the generic option map and report
+    /// `OptionNotFound`, which is what an `asynRecord` readback of that field
+    /// shows as blank.
+    #[test]
+    fn get_option_folds_the_key_case_like_set_option() {
+        let mut drv = DrvAsynSerialPort::new("s_key_case", "/dev/ttyS0").unwrap();
+        drv.set_option(&mut AsynUser::default(), "BAUD", "19200")
+            .unwrap();
+
+        for spelling in ["baud", "BAUD", "Baud", " baud "] {
+            assert_eq!(
+                drv.get_option(spelling).unwrap(),
+                "19200",
+                "{spelling} must reach the same handler set_option did"
+            );
+        }
+        assert_eq!(drv.get_option("Break").unwrap(), "off");
+        assert_eq!(
+            drv.get_option("CLOCAL").unwrap(),
+            drv.get_option("clocal").unwrap()
+        );
+    }
+
+    /// The RS485 keys re-match `key` inside their own helper, so the fold has to
+    /// happen before the dispatch reaches them, not inside each arm. With the
+    /// port down the helper answers `Disconnected`; the pre-fix failure was
+    /// `OptionNotFound`, i.e. the helper was never entered at all.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn get_option_folds_the_case_of_the_rs485_keys_too() {
+        let drv = DrvAsynSerialPort::new("s_rs485_case", "/dev/ttyS0").unwrap();
+        for spelling in ["rs485_enable", "RS485_ENABLE", "RS485_Delay_Rts_After_Send"] {
+            let err = drv
+                .get_option(spelling)
+                .expect_err("the port is down, so the helper cannot read the line");
+            assert_eq!(
+                err.status(),
+                AsynStatus::Disconnected,
+                "{spelling} must reach get_rs485_option, not the generic map"
+            );
+        }
+    }
+
+    /// C matches option values with `epicsStrCaseCmp` exactly as it matches the
+    /// keys (`drvAsynSerialPort.c:361-528`), so `asynSetOption port 0 break ON`
+    /// is C's standard-break request. Here it fell past both `"on"` and
+    /// `"off"` into the numeric arm and came back "Bad number" — the operator
+    /// is told the value is malformed when it is the case fold that is missing.
+    #[test]
+    fn option_values_are_matched_case_insensitively_like_c() {
+        let mut drv = DrvAsynSerialPort::new("s_val_case", "/dev/ttyS0").unwrap();
+        let mut user = AsynUser::default();
+
+        // C `:511`: "off" returns asynSuccess without touching the fd, so it
+        // succeeds on a closed port in any spelling.
+        drv.set_option(&mut user, "break", "OFF").unwrap();
+        drv.set_option(&mut user, "break", "Off").unwrap();
+
+        // C `:510`: "on" is the standard break, which on a closed port fails at
+        // tcsendbreak — not at the value parse.
+        let err = drv
+            .set_option(&mut user, "break", "ON")
+            .expect_err("a real break on a closed port must fail");
+        assert_ne!(
+            err.message(),
+            "Bad number",
+            "ON is C's on arm, not a malformed duration"
+        );
+        assert_eq!(err.status(), AsynStatus::Disconnected);
+
+        // A number is still the only timed form and still rejects garbage.
+        assert_eq!(
+            drv.set_option(&mut user, "break", "not-a-number")
+                .unwrap_err()
+                .message(),
+            "Bad number"
+        );
+
+        // The parity arm kept the case-insensitivity it used to hold locally,
+        // now that the fold lives at the entry.
+        drv.set_option(&mut user, "parity", "EVEN").unwrap();
+        assert_eq!(drv.get_option("parity").unwrap(), "even");
+        drv.set_option(&mut user, "CLOCAL", "y").unwrap();
+        assert_eq!(drv.get_option("clocal").unwrap(), "Y");
     }
 }

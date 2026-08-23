@@ -50,7 +50,7 @@ use std::net::{IpAddr, SocketAddr, TcpListener, TcpStream, UdpSocket};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::JoinHandle;
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, Instant, SystemTime};
 
 // parking_lot::Mutex — consistent with the rest of asyn-rs and
 // poison-tolerant: a panic in a worker thread cannot poison the lock
@@ -61,6 +61,7 @@ use parking_lot::Mutex;
 use crate::asyn_trace;
 use crate::drivers::ip_port::{
     DrvAsynIPPort, is_nonfatal_read_timeout, maxchars_zero_error, socket_poll_timeout,
+    write_with_retry,
 };
 use crate::drivers::option_parse::parse_yn_option;
 use crate::error::{AsynError, AsynResult, AsynStatus};
@@ -390,8 +391,8 @@ impl ClientSlot {
                 message: format!("{device} has no client"),
             }));
         };
-        // C parity: the child `drvAsynIPPort`'s `readRaw` floors a zero request
-        // timeout to a 1 ms poll (drvAsynIPPort.c:741-743) and re-applies it on
+        // C parity: the child `drvAsynIPPort`'s `readIt` floors a zero request
+        // timeout to a 1 ms poll (drvAsynIPPort.c:775-777) and re-applies it on
         // every read. `socket_poll_timeout` is the shared owner of that mapping;
         // setting it unconditionally (rather than skipping on `timeout == 0`)
         // keeps a poll request a 1 ms poll instead of blocking on the accept-time
@@ -432,7 +433,30 @@ impl ClientSlot {
     /// the `EWOULDBLOCK`/`EINTR` class it retries (:661-672). Single owner of "a
     /// client slot dies on a write", shared by the parent's addressed and
     /// broadcast writes and the child port's.
-    fn write_or_close(&self, data: &[u8], device: &str) -> Result<(), SlotFailure> {
+    /// Bounded by `timeout` through [`write_with_retry`] — the same owner the
+    /// client port writes through, so the accepted-byte count rides out on the
+    /// failure as C's `*nbytesTransfered` (drvAsynIPPort.c:718-733). This used
+    /// to be a bare `write_all`, which parks forever against a peer that has
+    /// stopped reading: no `asynTimeout`, no record alarm, and a parent
+    /// broadcast wedged on whichever slot went silent first.
+    ///
+    /// The slot mutex is held across the whole bounded write on purpose. It is
+    /// what keeps two writers from interleaving bytes on one socket, the read
+    /// twin already holds it for its own timeout, and the hold is now bounded
+    /// by the caller's deadline — where before it had no bound at all.
+    ///
+    /// Takes the caller's `deadline`, not a `Duration`, because the broadcast
+    /// write fans one `pasynUser->timeout` out over every occupied slot: a
+    /// per-slot `Instant::now() + timeout` would let N silent peers stretch a
+    /// TMOT of 1.0 into N seconds of PACT=1 with the port queue behind it.
+    /// The budget belongs to the call, so the instant it expires is computed
+    /// once by whoever owns that call and cannot be restarted here.
+    fn write_or_close(
+        &self,
+        data: &[u8],
+        deadline: Instant,
+        device: &str,
+    ) -> Result<usize, SlotFailure> {
         let mut guard = self.stream.lock();
         let Some(stream) = guard.as_mut() else {
             return Err(SlotFailure::kept(AsynError::Status {
@@ -440,11 +464,12 @@ impl ClientSlot {
                 message: format!("{device} has no client"),
             }));
         };
-        let res = stream.write_all(data).and_then(|()| stream.flush());
+        let res = write_with_retry(&*stream, data, deadline);
+        // `clear()` re-locks the stream, so the write guard must go first.
         drop(guard);
         match res {
-            Ok(()) => Ok(()),
-            Err(e) => Err(self.classify_io_error(e, device, "write")),
+            Ok(n) => Ok(n),
+            Err(e) => Err(self.classify_write_failure(e, device)),
         }
     }
 
@@ -493,17 +518,26 @@ impl ClientSlot {
     /// term, it retries `EWOULDBLOCK`/`EINTR` (:661-672) and reports
     /// `asynTimeout` with the socket intact. The branch that closes the socket is
     /// the branch that reports `asynError`.
-    fn classify_io_error(&self, e: std::io::Error, device: &str, what: &str) -> SlotFailure {
-        if is_nonfatal_read_timeout(e.kind()) {
-            return SlotFailure::kept(AsynError::Status {
-                status: AsynStatus::Timeout,
-                message: format!("{what} timeout"),
-            });
+    ///
+    /// Asks [`AsynError::is_fatal_transport`] rather than testing an errno
+    /// here: that is the crate's single owner of the `closeConnection` rule for
+    /// every octet driver, and it answers *through* the partial-write carrier,
+    /// so a half-accepted write is classified on its cause instead of on having
+    /// moved bytes.
+    fn classify_write_failure(&self, e: AsynError, device: &str) -> SlotFailure {
+        if !e.is_fatal_transport() {
+            return SlotFailure::kept(e);
         }
         self.clear();
-        SlotFailure::closed(AsynError::Status {
+        let closed = AsynError::Status {
             status: AsynStatus::Error,
-            message: format!("{device} {what} error: {e}"),
+            message: format!("{device} write error: {e}"),
+        };
+        // C assigns `*nbytesTransfered` on the fatal branch too (:718-733), so
+        // the count has to survive the re-stamp that adds the device name.
+        SlotFailure::closed(match e.partial_write() {
+            Some(n) => closed.with_partial_write(n),
+            None => closed,
         })
     }
 
@@ -1258,11 +1292,15 @@ impl PortDriver for DrvAsynIPServerPort {
             // Broadcast: send to every connected slot. Errors per
             // slot are logged but never abort the broadcast — a dead
             // peer mustn't take out the rest.
+            // One deadline for the whole broadcast: the caller stated a single
+            // budget for the operation, so slot N+1 inherits what slot N left
+            // of it rather than starting the clock again.
+            let deadline = Instant::now() + user.timeout;
             for (i, slot) in self.slots.iter().enumerate() {
                 if !slot.is_occupied() {
                     continue;
                 }
-                if let Err(f) = self.write_to_slot(slot, i as i32, data) {
+                if let Err(f) = self.write_to_slot(slot, i as i32, data, deadline) {
                     tracing::debug!(
                         target: "asyn_rs::ip_server_port",
                         addr = i,
@@ -1282,8 +1320,8 @@ impl PortDriver for DrvAsynIPServerPort {
             return Ok(data.len());
         }
         let arc = self.slot_arc(user.addr)?;
-        match self.write_to_slot(&arc, user.addr, data) {
-            Ok(()) => Ok(data.len()),
+        match self.write_to_slot(&arc, user.addr, data, Instant::now() + user.timeout) {
+            Ok(n) => Ok(n),
             Err(f) => Err(self.finish_slot_failure(user.addr, f)),
         }
     }
@@ -1357,8 +1395,14 @@ impl DrvAsynIPServerPort {
         format!("{}:{}", self.base.port_name, addr)
     }
 
-    fn write_to_slot(&self, slot: &ClientSlot, addr: i32, data: &[u8]) -> Result<(), SlotFailure> {
-        slot.write_or_close(data, &self.slot_device_name(addr))
+    fn write_to_slot(
+        &self,
+        slot: &ClientSlot,
+        addr: i32,
+        data: &[u8],
+        deadline: Instant,
+    ) -> Result<usize, SlotFailure> {
+        slot.write_or_close(data, deadline, &self.slot_device_name(addr))
     }
 
     /// UDP-mode read: copy at most `buf.len()` bytes from the cache,
@@ -1683,10 +1727,13 @@ impl PortDriver for DrvAsynIPSubport {
         }
     }
 
-    fn write_octet(&mut self, _user: &mut AsynUser, data: &[u8]) -> AsynResult<usize> {
+    fn write_octet(&mut self, user: &mut AsynUser, data: &[u8]) -> AsynResult<usize> {
         let device = self.base.port_name.clone();
-        match self.slot.write_or_close(data, &device) {
-            Ok(()) => Ok(data.len()),
+        match self
+            .slot
+            .write_or_close(data, Instant::now() + user.timeout, &device)
+        {
+            Ok(n) => Ok(n),
             Err(f) => Err(self.finish_slot_failure(f)),
         }
     }
@@ -3090,5 +3137,192 @@ mod tests {
         sub.write_octet(&mut user, b"hello").unwrap();
         let buf = client_handle.join().unwrap();
         assert_eq!(&buf, b"hello");
+    }
+
+    /// F1 regression: a slot write against a peer that has stopped reading.
+    ///
+    /// Both socket buffers are pinned to the kernel minimum, so a 1 MiB
+    /// payload cannot fit in the pipe and the write must genuinely block —
+    /// the condition a sleep can only approximate. Before the bound, this
+    /// wedged the calling actor forever, taking a parent broadcast with it.
+    #[cfg(unix)]
+    #[test]
+    fn a_slot_write_to_a_peer_that_never_reads_expires_and_reports_what_it_sent() {
+        use std::os::fd::AsRawFd;
+
+        fn pin_buffer(fd: std::os::fd::RawFd, opt: libc::c_int) {
+            let size: libc::c_int = 1;
+            // SAFETY: `opt` is a `SOL_SOCKET` size option taking the `c_int`
+            // passed here; the kernel clamps upward to its own minimum.
+            unsafe {
+                libc::setsockopt(
+                    fd,
+                    libc::SOL_SOCKET,
+                    opt,
+                    std::ptr::addr_of!(size).cast(),
+                    std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+                );
+            }
+        }
+
+        const PAYLOAD: usize = 1 << 20;
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        pin_buffer(client.as_raw_fd(), libc::SO_RCVBUF);
+        let (server_side, peer) = listener.accept().unwrap();
+        pin_buffer(server_side.as_raw_fd(), libc::SO_SNDBUF);
+
+        let slot = Arc::new(ClientSlot::new_empty());
+        slot.assign(server_side, peer);
+
+        // The wait runs on its own thread and reports through a channel, so an
+        // unbounded write fails this test in seconds instead of hanging it.
+        let writer = Arc::clone(&slot);
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let started = Instant::now();
+            let res = writer.write_or_close(
+                &vec![0x5a; PAYLOAD],
+                Instant::now() + Duration::from_millis(200),
+                "srv:0",
+            );
+            let _ = done_tx.send((started.elapsed(), res));
+        });
+
+        let (elapsed, res) = done_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the slot write never returned: it is running with no deadline");
+        // Held until here so the peer stays connected and silent for the whole
+        // write; dropping it earlier would end the write as a reset instead.
+        drop(client);
+
+        // A tolerance, not a floor: `wait_writable` returns on `poll`'s own
+        // `rc == 0` without re-reading the deadline, and `wait_millis`
+        // truncates the interval it asks for (`Duration::as_millis`), so a
+        // deadline exit lands up to one whole millisecond early. Asserting
+        // `elapsed >= 200ms` at microsecond resolution failed here at
+        // 199.936288ms. One tick is the mechanism's own bound on the
+        // undershoot; the point of the assertion — that the write waited
+        // rather than polling non-blocking — survives it.
+        const TICK: Duration = Duration::from_millis(1);
+        assert!(
+            elapsed + TICK >= Duration::from_millis(200),
+            "returned a tick or more before the deadline it was given: {elapsed:?}"
+        );
+        let failure = res.expect_err("a 1 MiB write cannot fit in a pinned socket buffer");
+        assert_eq!(
+            failure.error.status(),
+            AsynStatus::Timeout,
+            "a stalled write is C's asynTimeout, not asynError: {}",
+            failure.error
+        );
+        // C keeps the socket on the branch it retries (drvAsynIPPort.c:661-672):
+        // the peer is alive, it is merely slow.
+        assert!(
+            !failure.closed,
+            "an asynTimeout must not tear the slot down"
+        );
+        assert!(slot.is_occupied(), "the slot must survive a write timeout");
+        let sent = failure
+            .error
+            .partial_write()
+            .expect("C reports *nbytesTransfered beside the asynTimeout");
+        assert!(
+            (1..PAYLOAD).contains(&sent),
+            "the caller cannot resync without a real accepted count, got {sent}"
+        );
+    }
+
+    /// R-3 regression: a broadcast write must spend the caller's budget once,
+    /// not once per slot.
+    ///
+    /// Eight peers that have stopped reading, each with its send buffer pinned
+    /// to the kernel minimum so a 1 MiB payload genuinely blocks. With a
+    /// per-slot `Instant::now() + timeout` a TMOT of 200 ms became 1.6 s of
+    /// PACT=1 with the port queue stalled behind it; with one deadline for the
+    /// whole fan-out the eighth slot inherits what the first left of it.
+    #[cfg(unix)]
+    #[test]
+    fn a_broadcast_write_spends_the_caller_budget_once_not_once_per_slot() {
+        use std::os::fd::AsRawFd;
+
+        fn pin_buffer(fd: std::os::fd::RawFd, opt: libc::c_int) {
+            let size: libc::c_int = 1;
+            // SAFETY: `opt` is a `SOL_SOCKET` size option taking the `c_int`
+            // passed here; the kernel clamps upward to its own minimum.
+            unsafe {
+                libc::setsockopt(
+                    fd,
+                    libc::SOL_SOCKET,
+                    opt,
+                    std::ptr::addr_of!(size).cast(),
+                    std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+                );
+            }
+        }
+
+        const SLOTS: usize = 8;
+        const PAYLOAD: usize = 1 << 20;
+        const BUDGET: Duration = Duration::from_millis(200);
+
+        let mut srv = DrvAsynIPServerPort::with_config(
+            "srv_bcast_budget",
+            IpServerConfig {
+                max_clients: SLOTS,
+                ..IpServerConfig::parse("127.0.0.1:0").unwrap()
+            },
+        )
+        .unwrap();
+
+        // Slots are assigned directly rather than through the accept loop: the
+        // fan-out is what is under test, and a real accept would add ordering
+        // slack to a measurement of elapsed time.
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let mut clients = Vec::with_capacity(SLOTS);
+        for slot in &srv.slots {
+            let client = TcpStream::connect(addr).unwrap();
+            pin_buffer(client.as_raw_fd(), libc::SO_RCVBUF);
+            let (server_side, peer) = listener.accept().unwrap();
+            pin_buffer(server_side.as_raw_fd(), libc::SO_SNDBUF);
+            slot.assign(server_side, peer);
+            clients.push(client);
+        }
+
+        // Measured off-thread so an unbounded fan-out fails this test rather
+        // than hanging the suite.
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let mut user = AsynUser {
+                addr: -1,
+                timeout: BUDGET,
+                ..AsynUser::default()
+            };
+            let started = Instant::now();
+            let res = srv.write_octet(&mut user, &vec![0x5a; PAYLOAD]);
+            let _ = done_tx.send((started.elapsed(), res, srv));
+        });
+
+        let (elapsed, res, srv) = done_rx
+            .recv_timeout(Duration::from_secs(30))
+            .expect("the broadcast never returned");
+        // Held until here so every peer stays connected and silent for the
+        // whole broadcast; dropping earlier would end the writes as resets.
+        drop(clients);
+
+        res.expect("a broadcast reports success; per-slot failures are logged");
+        // 5x the budget is loose enough for a loaded box and still less than
+        // a third of the 8 x 200 ms the per-slot deadline cost.
+        assert!(
+            elapsed < BUDGET * 5,
+            "the broadcast spent the budget per slot, not per call: {elapsed:?} \
+             against a stated {BUDGET:?}"
+        );
+        for (i, slot) in srv.slots.iter().enumerate() {
+            assert!(
+                slot.is_occupied(),
+                "slot {i} was torn down by a write timeout"
+            );
+        }
     }
 }

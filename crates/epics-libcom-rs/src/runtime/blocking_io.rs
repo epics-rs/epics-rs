@@ -783,21 +783,27 @@ impl tokio::io::AsyncWrite for ChannelWriter {
 
 /// `POLLOUT` and `MSG_DONTWAIT` for this target.
 ///
-/// Deliberately not `libc::POLLOUT` / `libc::MSG_DONTWAIT`. On
-/// `armv7-rtems-eabihf` the `libc` crate glob-re-exports both
-/// `unix/newlib/arm` and `unix/newlib/rtems`, and those two modules define
-/// these names with **different values** — `POLLOUT` `0x10` against `0x0004`,
-/// `MSG_DONTWAIT` `4` against `0x80`, 16 names colliding that way in total. A
-/// glob-versus-glob collision is an ambiguity error at the use site, so naming
-/// them through `libc` does not compile there; and taking the `arm` values
-/// would be wrong regardless, because RTEMS's stack is libbsd and the FreeBSD
-/// values are the true ones (`sys/poll.h`, `sys/socket.h`). Stated here for the
-/// same reason [`FIONREAD_REQUEST`] above is stated: the constant is derived
-/// from the target's own headers rather than from whichever module the glob
-/// happened to win.
+/// Deliberately not `libc::POLLOUT` / `libc::MSG_DONTWAIT` — but by choice,
+/// not because a bare name fails to resolve. It once did: `unix/newlib/arm`
+/// and `unix/newlib/rtems` defined 16 of these names with **different
+/// values** — `POLLOUT` `0x10` against `0x0004`, `MSG_DONTWAIT` `4` against
+/// `0x80` — and that glob-versus-glob collision made naming them through
+/// `libc` an ambiguity error on `armv7-rtems-eabihf`. The pinned `libc` fork
+/// (`Cargo.lock:2076-2078`) closed it in `6f64e70d`, "newlib: gate the arm
+/// prelude import on not(rtems)", so each name now has exactly one definition
+/// there and a bare `libc::POLLOUT` both compiles and carries the right
+/// value — `asyn-rs`'s serial driver names `libc::POLLIN`/`POLLOUT` directly
+/// and is inside the RTEMS gate's build. Nobody needs to re-derive that.
 ///
-/// Every other Unix — the hosted hosts and `*-wrs-vxworks*`, where one module
-/// defines each name — takes `libc`'s.
+/// What survives is the half of the reason that never depended on the
+/// collision, and it is the better half: RTEMS's stack is libbsd, so the
+/// FreeBSD values are the true ones (`sys/poll.h`, `sys/socket.h`), and these
+/// constants are pinned to the target's own headers rather than inherited
+/// from whichever module the glob happened to win. [`FIONREAD_REQUEST`] above
+/// is stated for that same reason — except that one is still *required*,
+/// because `FIONREAD` is defined in neither newlib module.
+///
+/// Every other Unix — the hosted hosts and `*-wrs-vxworks*` — takes `libc`'s.
 #[cfg(target_os = "rtems")]
 const POLLOUT_EVENT: libc::c_short = 0x0004;
 #[cfg(target_os = "rtems")]

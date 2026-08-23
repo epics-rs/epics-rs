@@ -14,6 +14,9 @@
 //! The CRC-16 and LRC are spec-compliant (`CRC-16/MODBUS`, poly `0xA001`;
 //! 8-bit two's-complement LRC).
 
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU16, Ordering};
+
 use crate::error::{ModbusError, ModbusResult};
 use crate::protocol::{MAX_MODBUS_FRAME_SIZE, MBAP_HEADER_SIZE, MbapHeader};
 
@@ -97,12 +100,47 @@ fn hex_digit(c: u8) -> ModbusResult<u8> {
     }
 }
 
-/// Modbus link-layer framer. Holds the link type and — for MBAP links — the
-/// rolling transaction-ID counter.
+/// The rolling MBAP transaction-ID counter. In C this is `modbusPvt`'s
+/// `transactionId` field (`modbusInterpose.c:91`, bumped at `:254`), and
+/// `modbusPvt` is the interpose layer's private data — **one instance per
+/// octet port**, not per Modbus port. Several `drvModbusAsyn` ports sharing
+/// one octet port therefore draw their IDs from one sequence, which is what
+/// makes their concurrent requests distinguishable on the wire.
+///
+/// Shared by handle so that ownership follows the octet port rather than the
+/// caller; a framer that owns its link outright gets a private one from
+/// [`ModbusFramer::new`].
+#[derive(Debug, Clone, Default)]
+pub struct TransactionIdCounter(Arc<AtomicU16>);
+
+impl TransactionIdCounter {
+    /// Advance and return the next transaction ID (C `(transactionId + 1) &
+    /// 0xFFFF`, so the first request off a fresh counter carries 1).
+    fn next(&self) -> u16 {
+        self.0.fetch_add(1, Ordering::Relaxed).wrapping_add(1)
+    }
+}
+
+/// Modbus link-layer framer. Holds the link type and — for MBAP links — a
+/// handle on the octet port's transaction-ID counter.
 #[derive(Debug)]
 pub struct ModbusFramer {
     link_type: LinkType,
-    transaction_id: u16,
+    transaction_id: TransactionIdCounter,
+}
+
+/// A framed request together with the transaction ID it was stamped with.
+///
+/// The ID is returned rather than read back from the framer afterwards: the
+/// counter is shared with every other Modbus port on the same octet port, so
+/// a later read would report whichever port framed most recently, not this
+/// request's own ID.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FramedRequest {
+    /// The on-wire frame.
+    pub bytes: Vec<u8>,
+    /// Transaction ID stamped into the MBAP header (`None` for RTU/ASCII).
+    pub transaction_id: Option<u16>,
 }
 
 /// An unwrapped response: the PDU bytes (function-code first) plus, for MBAP
@@ -116,11 +154,19 @@ pub struct UnwrappedResponse {
 }
 
 impl ModbusFramer {
-    /// Create a framer for the given link type.
+    /// Create a framer with a transaction-ID counter of its own. Correct only
+    /// where the caller owns the link outright; a framer over a shared octet
+    /// port must be built with [`Self::with_transaction_counter`].
     pub fn new(link_type: LinkType) -> Self {
+        Self::with_transaction_counter(link_type, TransactionIdCounter::default())
+    }
+
+    /// Create a framer drawing transaction IDs from the octet port's shared
+    /// counter (C's per-`modbusPvt` `transactionId`).
+    pub fn with_transaction_counter(link_type: LinkType, counter: TransactionIdCounter) -> Self {
         Self {
             link_type,
-            transaction_id: 0,
+            transaction_id: counter,
         }
     }
 
@@ -129,27 +175,25 @@ impl ModbusFramer {
         self.link_type
     }
 
-    /// Transaction ID of the most recently framed request (MBAP links only).
-    pub fn last_transaction_id(&self) -> u16 {
-        self.transaction_id
-    }
-
     /// Wrap a bare request PDU (`[slave, fcode, ...]`) into an on-wire frame.
     ///
-    /// For MBAP links this advances the transaction-ID counter; the value
-    /// used is then available via [`Self::last_transaction_id`]. The CR/LF
-    /// terminator for ASCII frames is added by the underlying serial port's
-    /// output EOS, not here — matching the C driver.
-    pub fn frame_request(&mut self, pdu: &[u8]) -> ModbusResult<Vec<u8>> {
+    /// For MBAP links this advances the octet port's transaction-ID counter
+    /// and reports the ID it used. The CR/LF terminator for ASCII frames is
+    /// added by the underlying serial port's output EOS, not here — matching
+    /// the C driver.
+    pub fn frame_request(&mut self, pdu: &[u8]) -> ModbusResult<FramedRequest> {
         match self.link_type {
             LinkType::Tcp | LinkType::Udp => {
-                self.transaction_id = self.transaction_id.wrapping_add(1);
-                let header = MbapHeader::new(self.transaction_id, pdu.len() as u16);
+                let transaction_id = self.transaction_id.next();
+                let header = MbapHeader::new(transaction_id, pdu.len() as u16);
                 let mut frame = Vec::with_capacity(MBAP_HEADER_SIZE + pdu.len());
                 frame.extend_from_slice(&header.to_bytes());
                 frame.extend_from_slice(pdu);
                 Self::check_size(frame.len())?;
-                Ok(frame)
+                Ok(FramedRequest {
+                    bytes: frame,
+                    transaction_id: Some(transaction_id),
+                })
             }
             LinkType::Rtu => {
                 let crc = compute_crc(pdu);
@@ -159,7 +203,10 @@ impl ModbusFramer {
                 frame.push((crc & 0xFF) as u8);
                 frame.push((crc >> 8) as u8);
                 Self::check_size(frame.len())?;
-                Ok(frame)
+                Ok(FramedRequest {
+                    bytes: frame,
+                    transaction_id: None,
+                })
             }
             LinkType::Ascii => {
                 let lrc = compute_lrc(pdu);
@@ -170,7 +217,10 @@ impl ModbusFramer {
                 }
                 encode_ascii(lrc, &mut frame);
                 Self::check_size(frame.len())?;
-                Ok(frame)
+                Ok(FramedRequest {
+                    bytes: frame,
+                    transaction_id: None,
+                })
             }
         }
     }
@@ -317,7 +367,9 @@ mod tests {
     fn tcp_frame_roundtrip() {
         let mut framer = ModbusFramer::new(LinkType::Tcp);
         let pdu = [0x01u8, 0x03, 0x00, 0x64, 0x00, 0x0A];
-        let frame = framer.frame_request(&pdu).unwrap();
+        let framed = framer.frame_request(&pdu).unwrap();
+        assert_eq!(framed.transaction_id, Some(1));
+        let frame = framed.bytes;
         // MBAP: txid=1, proto=0, len=6.
         assert_eq!(&frame[..6], &[0x00, 0x01, 0x00, 0x00, 0x00, 0x06]);
         assert_eq!(&frame[6..], &pdu);
@@ -335,17 +387,42 @@ mod tests {
     #[test]
     fn tcp_transaction_id_increments() {
         let mut framer = ModbusFramer::new(LinkType::Tcp);
-        framer.frame_request(&[0x01, 0x03]).unwrap();
-        assert_eq!(framer.last_transaction_id(), 1);
-        framer.frame_request(&[0x01, 0x03]).unwrap();
-        assert_eq!(framer.last_transaction_id(), 2);
+        let first = framer.frame_request(&[0x01, 0x03]).unwrap();
+        assert_eq!(first.transaction_id, Some(1));
+        let second = framer.frame_request(&[0x01, 0x03]).unwrap();
+        assert_eq!(second.transaction_id, Some(2));
+    }
+
+    #[test]
+    fn framers_on_one_octet_port_never_reuse_a_transaction_id() {
+        // C keeps `transactionId` on the interpose `modbusPvt`
+        // (`modbusInterpose.c:91`), which is per OCTET port, so two Modbus
+        // ports sharing one octet port draw from one sequence. With a counter
+        // each, both would stamp 1 on their first request and neither could
+        // tell its own reply from the other's.
+        let counter = TransactionIdCounter::default();
+        let mut coils = ModbusFramer::with_transaction_counter(LinkType::Tcp, counter.clone());
+        let mut holding = ModbusFramer::with_transaction_counter(LinkType::Tcp, counter);
+        let a = coils.frame_request(&[0x01, 0x01]).unwrap().transaction_id;
+        let b = holding.frame_request(&[0x01, 0x03]).unwrap().transaction_id;
+        let c = coils.frame_request(&[0x01, 0x01]).unwrap().transaction_id;
+        assert_eq!((a, b, c), (Some(1), Some(2), Some(3)));
+
+        // A framer that owns its link outright still gets a private sequence.
+        let mut alone = ModbusFramer::new(LinkType::Tcp);
+        assert_eq!(
+            alone.frame_request(&[0x01, 0x03]).unwrap().transaction_id,
+            Some(1)
+        );
     }
 
     #[test]
     fn rtu_frame_roundtrip() {
         let mut framer = ModbusFramer::new(LinkType::Rtu);
         let pdu = [0x01u8, 0x03, 0x00, 0x00, 0x00, 0x0A];
-        let frame = framer.frame_request(&pdu).unwrap();
+        let framed = framer.frame_request(&pdu).unwrap();
+        assert_eq!(framed.transaction_id, None);
+        let frame = framed.bytes;
         assert_eq!(&frame[..pdu.len()], &pdu);
         assert_eq!(frame.len(), pdu.len() + 2);
 
@@ -375,7 +452,9 @@ mod tests {
     fn ascii_frame_roundtrip() {
         let mut framer = ModbusFramer::new(LinkType::Ascii);
         let pdu = [0x01u8, 0x03, 0x00, 0x6B, 0x00, 0x03];
-        let frame = framer.frame_request(&pdu).unwrap();
+        let framed = framer.frame_request(&pdu).unwrap();
+        assert_eq!(framed.transaction_id, None);
+        let frame = framed.bytes;
         assert_eq!(frame[0], b':');
         // ':' + 6 PDU bytes (12 hex) + LRC (2 hex) = 15 chars.
         assert_eq!(frame.len(), 1 + 12 + 2);

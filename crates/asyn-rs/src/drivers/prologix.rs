@@ -325,6 +325,63 @@ impl DrvAsynPrologixPort {
     }
 }
 
+/// Owns the inner IP port's connection for the length of the `++ver`
+/// handshake and gives it back unless [`Self::commit`] runs.
+///
+/// **Invariant: the inner port is connected only while the outer Prologix
+/// port is, or while this guard is alive.** The handshake has four exits
+/// after the dial — a failed init write, a bridge that closed, a version
+/// string past the 200-byte cap, and a read that timed out — and a cleanup
+/// branch on each is a patch that the next exit re-opens. Holding the
+/// connection in a guard instead means `?`, an explicit `return` and an
+/// unwind all give it back, so a half-built session cannot be constructed.
+///
+/// This is a deliberate deviation from C: `prologixConnect` returns at
+/// `drvPrologixGPIB.c:189`, `:196` and `:202` without disconnecting
+/// `pasynUserTCPcommon`, which leaves the TCP port holding a socket while the
+/// GPIB port stays down, and every retry then answers `drvAsynIPPort.c:424-427`
+/// `"Link already open!"`. See `doc/upstream-c-bugs.md`.
+struct HandshakeLink<'a> {
+    port: &'a mut super::ip_port::DrvAsynIPPort,
+    /// C's `prologixConnect` disconnects with the same `pasynUser` it
+    /// connected with; keeping it here is what lets `Drop` do the same.
+    user: &'a AsynUser,
+    committed: bool,
+}
+
+impl<'a> HandshakeLink<'a> {
+    /// Dial the inner port and take ownership of the connection.
+    fn open(port: &'a mut super::ip_port::DrvAsynIPPort, user: &'a AsynUser) -> AsynResult<Self> {
+        port.connect(user)?;
+        Ok(Self {
+            port,
+            user,
+            committed: false,
+        })
+    }
+
+    /// The transport, for the handshake's own writes and reads.
+    fn port(&mut self) -> &mut super::ip_port::DrvAsynIPPort {
+        self.port
+    }
+
+    /// The handshake completed — the connection stays.
+    fn commit(mut self) {
+        self.committed = true;
+    }
+}
+
+impl Drop for HandshakeLink<'_> {
+    fn drop(&mut self) {
+        if !self.committed {
+            // The handshake's own error is what the caller reports; the only
+            // thing this has to guarantee is that no socket is left for the
+            // already-open guard to trip over on the next connect.
+            let _ = self.port.disconnect(self.user);
+        }
+    }
+}
+
 impl PortDriver for DrvAsynPrologixPort {
     fn base(&self) -> &PortDriverBase {
         &self.base
@@ -373,7 +430,7 @@ impl PortDriver for DrvAsynPrologixPort {
         // beyond announcing the exception, since GPIB devices live
         // behind the single shared TCP socket.
         if user.addr < 0 {
-            self.inner.connect(user)?;
+            let mut link = HandshakeLink::open(&mut self.inner, user)?;
             // 8-line init burst — sent as one TCP write to match
             // C asyn (single `pasynOctetSyncIO->write`). C hardcodes
             // `++eot_enable 1` here (drvPrologixGPIB.c:182) because its
@@ -387,14 +444,14 @@ impl PortDriver for DrvAsynPrologixPort {
                  ++eot_char {EOT_MARKER}\n++eot_enable {eot_enable}\n++ver\n",
             );
             let mut tu = AsynUser::default().with_timeout(Duration::from_secs(1));
-            self.inner.write_octet(&mut tu, init.as_bytes())?;
+            link.port().write_octet(&mut tu, init.as_bytes())?;
             // Read the version response — chars accumulate until the
             // bridge sends `\r\n`. C asyn caps at 200 bytes total.
             let mut acc = Vec::with_capacity(64);
             let mut buf = [0u8; 64];
             loop {
                 let ru = AsynUser::default().with_timeout(Duration::from_millis(500));
-                let n = self.inner.read_octet(&ru, &mut buf)?;
+                let n = link.port().read_octet(&ru, &mut buf)?;
                 if n == 0 {
                     return Err(AsynError::Status {
                         status: AsynStatus::Error,
@@ -414,6 +471,7 @@ impl PortDriver for DrvAsynPrologixPort {
                     break;
                 }
             }
+            link.commit();
         }
         self.base.set_connected(true);
         Ok(())
@@ -827,6 +885,94 @@ mod tests {
             s.starts_with(&expected_init),
             "init burst mismatch — got: {s:?}"
         );
+    }
+
+    /// How the fake bridge answers `++ver` — one variant per exit the
+    /// handshake can take after the inner port has been dialled.
+    #[derive(Clone, Copy)]
+    enum BridgeReply {
+        /// Read the init burst and answer nothing. The 500 ms handshake read
+        /// times out, and a plain timeout does not tear the inner port down
+        /// (`disconnect_on_read_timeout` is false by C parity), so this is the
+        /// exit that used to wedge the bus.
+        Silent,
+        /// Read the init burst, then close.
+        Close,
+        /// Answer past the 200-byte cap with no `\r\n` terminator.
+        Overlong,
+    }
+
+    /// A bridge that never completes the handshake and keeps accepting, so a
+    /// second `connect()` has somewhere to land.
+    fn start_failing_bridge(reply: BridgeReply) -> u16 {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        thread::spawn(move || {
+            // Accepted sockets are parked rather than dropped: dropping one
+            // closes it, which would collapse every variant into `Close`.
+            let mut held = Vec::new();
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { break };
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(2)))
+                    .unwrap();
+                // Take the init burst first, so the failure lands on the
+                // `++ver` read rather than on the write before it.
+                let mut buf = [0u8; 4096];
+                let _ = stream.read(&mut buf);
+                match reply {
+                    BridgeReply::Silent => held.push(stream),
+                    BridgeReply::Close => drop(stream),
+                    BridgeReply::Overlong => {
+                        let _ = stream.write_all(&[b'v'; 256]);
+                        held.push(stream);
+                    }
+                }
+            }
+        });
+        port
+    }
+
+    /// What every handshake exit owes: the inner transport is given back, and
+    /// the next connect reaches the handshake again instead of answering
+    /// `"Link already open!"` for the life of the IOC.
+    fn assert_handshake_exit_is_retryable(reply: BridgeReply) {
+        let port = start_failing_bridge(reply);
+        let mut drv =
+            DrvAsynPrologixPort::new("p_retry", &format!("127.0.0.1:{port}"), false).unwrap();
+        let user = AsynUser::default().with_addr(-1);
+
+        let first = drv
+            .connect(&user)
+            .expect_err("the bridge never completes the handshake");
+        assert!(!drv.base.is_connected());
+        assert!(
+            !drv.inner.base().is_connected(),
+            "the inner port must be given back, first connect said: {first}"
+        );
+
+        let second = drv
+            .connect(&user)
+            .expect_err("the bridge never completes the handshake");
+        assert!(
+            !second.to_string().contains("Link already open"),
+            "the retry must reach the handshake again, got: {second}"
+        );
+    }
+
+    #[test]
+    fn a_silent_bridge_leaves_the_gpib_port_retryable() {
+        assert_handshake_exit_is_retryable(BridgeReply::Silent);
+    }
+
+    #[test]
+    fn a_bridge_that_closes_mid_handshake_leaves_the_gpib_port_retryable() {
+        assert_handshake_exit_is_retryable(BridgeReply::Close);
+    }
+
+    #[test]
+    fn an_overlong_version_string_leaves_the_gpib_port_retryable() {
+        assert_handshake_exit_is_retryable(BridgeReply::Overlong);
     }
 
     /// `++addr` only emitted when address changes (C parity:

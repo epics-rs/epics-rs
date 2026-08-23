@@ -21,8 +21,8 @@ use epics_base_rs::error::{CaError, CaResult};
 use epics_base_rs::server::database::AsyncDbHandle;
 use epics_base_rs::server::recgbl::{alarm_status, rec_gbl_set_sevr};
 use epics_base_rs::server::record::{
-    AlarmSeverity, CommonFields, FieldDeclaration, ProcessOutcome, Record, RecordProcessResult,
-    ScanType,
+    AlarmSeverity, CommonFields, FieldDeclaration, FieldMetadataOverride, ProcessOutcome, Record,
+    RecordProcessResult, ScanType,
 };
 use epics_base_rs::types::{DbFieldType, EpicsValue};
 
@@ -630,7 +630,7 @@ impl Default for AsynRecord {
 struct IoInFlight {
     /// Shared with the orchestration task. Cancelling it makes the actor drop
     /// the request at its cancel check (a still-queued phase is removed,
-    /// C `cancelRequest` `wasQueued==true`, asynManager.c:1630-1666), so
+    /// C `cancelRequest` `wasQueued==true`, asynManager.c:1663-1668), so
     /// `run_io_plan` records the `AQR` "I/O request canceled" outcome. An
     /// `AQR` write (asynRecord.c:393-408) sets this; the completion re-entry
     /// then applies the cancel and finishes the record.
@@ -1376,7 +1376,7 @@ fn record_phase_result(
 
 /// Run `performIO`'s flush/write/read phases off the scan thread against the
 /// port actor, threading the shared `CancelToken` so an `AQR`/`cancelRequest`
-/// (asynManager.c:1630) aborts a still-queued phase. Mirrors the synchronous
+/// (asynManager.c:1632) aborts a still-queued phase. Mirrors the synchronous
 /// [`AsynRecord::perform_io`] phase order; both feed
 /// [`AsynRecord::apply_io_outcome`], so the field mapping lives in one place.
 ///
@@ -2975,11 +2975,11 @@ impl AsynRecord {
     /// is three-valued, and the transports read all three:
     ///
     /// * `> 0` — bounded wait.
-    /// * `== 0` — non-blocking poll. `drvAsynIPPort.c:741-742` computes
-    ///   `readPollmsec = (int)(timeout * 1000)` and floors a zero to a 1 ms
+    /// * `== 0` — non-blocking poll. `drvAsynIPPort.c:775-776` computes
+    ///   `readPollmsec = (int)(timeout * 1000.0)` and floors a zero to a 1 ms
     ///   poll; `drvAsynSerialPort.c:902-905` sets `VMIN=0, VTIME=0`, the termios
     ///   "return whatever is already buffered" read.
-    /// * `< 0` — wait forever (`readPollmsec = -1`).
+    /// * `< 0` — wait forever (`readPollmsec = -1`, `drvAsynIPPort.c:777`).
     ///
     /// The port used to substitute a 1 s wait for BOTH non-positive cases, so an
     /// operator asking for a poll got a one-second block on a silent device.
@@ -3453,6 +3453,40 @@ impl Record for AsynRecord {
         P {
             precision: true,
             ..P::NONE
+        }
+    }
+
+    /// The one field asyn serves a non-default precision for.
+    ///
+    /// `asynRecord.c:994-1004` is the whole rule:
+    ///
+    /// ```c
+    /// static long get_precision(const struct dbAddr * paddr, long *precision)
+    /// {
+    ///     int fieldIndex = dbGetFieldIndex(paddr);
+    ///     *precision = 0;
+    ///     if(fieldIndex == asynRecordTMOT) { *precision = 4; return (0); }
+    ///     recGblGetPrec(paddr, precision);
+    ///     return (0);
+    /// }
+    /// ```
+    ///
+    /// Every other field keeps the literal 0, which is what the port already
+    /// serves, so TMOT is the sole divergence: `caget -s A.TMOT` printed `1`
+    /// where C prints `1.0000`. [`Record::property_support`] above already
+    /// declares `precision: true`; nothing supplied it.
+    ///
+    /// TMOT's early return skips `recGblGetPrec`, but that is not separately
+    /// observable — TMOT is `DBF_DOUBLE` and `recGblGetPrec` only clamps a
+    /// double precision outside `[0, 15]` (`recGbl.c:135-139`), so 4 would
+    /// survive the call unchanged. Only the 4 itself is reproducible.
+    fn field_metadata_override(&self, field: &str) -> Option<FieldMetadataOverride> {
+        match field {
+            "TMOT" => Some(FieldMetadataOverride {
+                precision: Some(4),
+                ..Default::default()
+            }),
+            _ => None,
         }
     }
 
@@ -4473,6 +4507,32 @@ impl Drop for AsynRecord {
 mod tests {
     use super::*;
     use epics_base_rs::server::record::RecordProcessResult;
+
+    /// `asynRecord.c:994-1004`: `*precision = 0` for every field, then a
+    /// single `fieldIndex == asynRecordTMOT` arm that returns 4. Both halves
+    /// matter — TMOT is the ONLY asyn field with a non-default precision, so a
+    /// blanket precision arm would be as wrong as none at all. With TMOT at its
+    /// default 1.0, C's `caget -s A.TMOT` prints `1.0000`.
+    #[test]
+    fn only_tmot_carries_a_non_default_precision() {
+        let rec = AsynRecord::default();
+
+        let prec = |f: &str| rec.field_metadata_override(f).and_then(|o| o.precision);
+        assert_eq!(prec("TMOT"), Some(4), "asynRecordTMOT arm");
+
+        // The other two DBF_DOUBLE fields fall to C's literal 0, as does every
+        // non-double field; `recGblGetPrec` leaves an in-range double alone.
+        for field in ["F64INP", "F64OUT", "VAL", "AOUT", "AINP", "NRRD", "ADDR"] {
+            assert!(
+                rec.field_metadata_override(field).is_none(),
+                "{field} must not override precision"
+            );
+        }
+
+        // The record declares precision as supplied; that declaration is only
+        // honest because the arm above exists.
+        assert!(rec.property_support().precision);
+    }
 
     #[test]
     fn test_default_fields() {
@@ -7559,7 +7619,7 @@ mod tests {
     /// R9-46: C `asynCallbackProcess` assigns TMOT to the asynUser verbatim —
     /// `pasynUser->timeout = pasynRec->tmot` (asynRecord.c:818) — and the value
     /// is three-valued: `>0` bounded wait, `==0` non-blocking poll
-    /// (`drvAsynIPPort.c:741-742` floors the poll to 1 ms;
+    /// (`drvAsynIPPort.c:775-776` floors the poll to 1 ms;
     /// `drvAsynSerialPort.c:902-905` sets `VMIN=0,VTIME=0`), `<0` wait forever.
     /// The port substituted a 1 s wait for BOTH non-positive cases, so an
     /// operator asking for a poll got a one-second block on a silent device.

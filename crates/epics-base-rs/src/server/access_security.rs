@@ -350,7 +350,7 @@ fn spawn_asg_inp_watcher(db: &std::sync::Arc<crate::server::database::PvDatabase
     let weak_cell = std::sync::Arc::downgrade(&cell.0);
     let weak_db = std::sync::Arc::downgrade(db);
     let mut acf_rx = subscribe_asg_changes();
-    crate::runtime::task::spawn(async move {
+    crate::runtime::task::spawn_background(async move {
         enum Wake {
             /// A watched link posted a new value.
             Values,
@@ -390,7 +390,7 @@ fn spawn_asg_inp_watcher(db: &std::sync::Arc<crate::server::database::PvDatabase
                     _ => Wake::Rebuild,
                 },
                 () = drain_any_asg_inp(&mut readers) => Wake::Values,
-                () = crate::runtime::task::sleep(ASG_INP_RETRY) => Wake::Rebuild,
+                () = crate::runtime::task::sleep_background(ASG_INP_RETRY) => Wake::Rebuild,
             };
             match wake {
                 Wake::Stop => break,

@@ -1546,7 +1546,11 @@ impl GroupChannel {
                 }
                 ProcessMode::Force => {
                     let pv = format!("{record_name}.{field_name}");
-                    self.db.put_pv_already_locked(&pv, value).map_err(to_err)?;
+                    // The cycle two lines down owns any put-notify restart
+                    // this put's PACT release arms — see `RestartOwner`.
+                    self.db
+                        .put_pv_already_locked_before_process(&pv, value)
+                        .map_err(to_err)?;
                     let mut visited = std::collections::HashSet::new();
                     self.db
                         .process_record_with_links_already_locked(record_name, &mut visited, 0)

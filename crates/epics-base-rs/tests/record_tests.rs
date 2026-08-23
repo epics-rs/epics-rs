@@ -698,7 +698,10 @@ fn test_common_field_put() {
     instance
         .put_common_field("HIHI", EpicsValue::Double(100.0))
         .unwrap();
-    assert_eq!(instance.common.analog_alarm.as_ref().unwrap().hihi, 100.0);
+    assert_eq!(
+        instance.common.analog_alarm.as_ref().unwrap().hihi,
+        AlarmLimit::Double(100.0)
+    );
 }
 
 #[test]
@@ -1193,10 +1196,10 @@ fn test_deadband_alarm_on_change_bypasses_value_deadband() {
     // HIGH=0.5/Major so VAL=1.0 trips a HIGH alarm — a real
     // NoAlarm -> Major SEVR transition.
     instance.common.analog_alarm = Some(AnalogAlarmConfig {
-        hihi: 1000.0,
-        high: 0.5,
-        low: -1000.0,
-        lolo: -2000.0,
+        hihi: AlarmLimit::Double(1000.0),
+        high: AlarmLimit::Double(0.5),
+        low: AlarmLimit::Double(-1000.0),
+        lolo: AlarmLimit::Double(-2000.0),
         hhsv: AlarmSeverity::Major as i16,
         hsv: AlarmSeverity::Major as i16,
         lsv: AlarmSeverity::Minor as i16,
@@ -1347,10 +1350,10 @@ fn test_acks_posts_once_with_dbe_value_only() {
     // HIGH=0.5/Major so VAL=1.0 raises a NoAlarm -> Major transition, which
     // makes `recGblResetAlarms` fire the ack rule and move ACKS 0 -> 2.
     instance.common.analog_alarm = Some(AnalogAlarmConfig {
-        hihi: 1000.0,
-        high: 0.5,
-        low: -1000.0,
-        lolo: -2000.0,
+        hihi: AlarmLimit::Double(1000.0),
+        high: AlarmLimit::Double(0.5),
+        low: AlarmLimit::Double(-1000.0),
+        lolo: AlarmLimit::Double(-2000.0),
         hhsv: AlarmSeverity::Major as i16,
         hsv: AlarmSeverity::Major as i16,
         lsv: AlarmSeverity::Minor as i16,
@@ -1428,10 +1431,10 @@ fn test_alarm_cycle_does_not_fan_out_for_default_records() {
     rec.mdel = 100.0;
     let mut instance = RecordInstance::new("TEST".into(), rec);
     instance.common.analog_alarm = Some(AnalogAlarmConfig {
-        hihi: 1000.0,
-        high: 0.5,
-        low: -1000.0,
-        lolo: -2000.0,
+        hihi: AlarmLimit::Double(1000.0),
+        high: AlarmLimit::Double(0.5),
+        low: AlarmLimit::Double(-1000.0),
+        lolo: AlarmLimit::Double(-2000.0),
         hhsv: AlarmSeverity::Major as i16,
         hsv: AlarmSeverity::Major as i16,
         lsv: AlarmSeverity::Minor as i16,
@@ -1508,10 +1511,10 @@ fn test_ai_rval_alarm_only_cycle_posts_alarm_mask_not_value_log() {
     rec.adel = 100.0;
     let mut instance = RecordInstance::new("TEST".into(), rec);
     instance.common.analog_alarm = Some(AnalogAlarmConfig {
-        hihi: 1000.0,
-        high: 0.5,
-        low: -1000.0,
-        lolo: -2000.0,
+        hihi: AlarmLimit::Double(1000.0),
+        high: AlarmLimit::Double(0.5),
+        low: AlarmLimit::Double(-1000.0),
+        lolo: AlarmLimit::Double(-2000.0),
         hhsv: AlarmSeverity::Major as i16,
         hsv: AlarmSeverity::Major as i16,
         lsv: AlarmSeverity::Minor as i16,
@@ -1556,10 +1559,10 @@ fn test_ai_udf_cycle_leaves_lalm_and_zeroes_afvl() {
     rec.aftc = 10.0; // AFTC-capable filter enabled (ai carries AFVL)
     let mut instance = RecordInstance::new("TEST".into(), rec);
     instance.common.analog_alarm = Some(AnalogAlarmConfig {
-        hihi: 1.0,
-        high: 0.5,
-        low: -1000.0,
-        lolo: -2000.0,
+        hihi: AlarmLimit::Double(1.0),
+        high: AlarmLimit::Double(0.5),
+        low: AlarmLimit::Double(-1000.0),
+        lolo: AlarmLimit::Double(-2000.0),
         hhsv: AlarmSeverity::Major as i16,
         hsv: AlarmSeverity::Major as i16,
         lsv: AlarmSeverity::Minor as i16,
@@ -2078,10 +2081,10 @@ fn test_snapshot_ai_with_display_metadata() {
     rec.lopr = -50.0;
     let mut inst = RecordInstance::new("AI:TEST".into(), rec);
     inst.common.analog_alarm = Some(AnalogAlarmConfig {
-        hihi: 90.0,
-        high: 80.0,
-        low: -20.0,
-        lolo: -40.0,
+        hihi: AlarmLimit::Double(90.0),
+        high: AlarmLimit::Double(80.0),
+        low: AlarmLimit::Double(-20.0),
+        lolo: AlarmLimit::Double(-40.0),
         hhsv: AlarmSeverity::Major as i16,
         hsv: AlarmSeverity::Minor as i16,
         lsv: AlarmSeverity::Minor as i16,
@@ -2664,10 +2667,10 @@ fn test_ai_aftc_filter_engages_and_seeds() {
     let mut inst = RecordInstance::new("AI:AFTC".into(), rec);
     inst.common.udf = 0;
     inst.common.analog_alarm = Some(AnalogAlarmConfig {
-        hihi: 100.0,
-        high: 80.0,
-        low: -20.0,
-        lolo: -40.0,
+        hihi: AlarmLimit::Double(100.0),
+        high: AlarmLimit::Double(80.0),
+        low: AlarmLimit::Double(-20.0),
+        lolo: AlarmLimit::Double(-40.0),
         hhsv: AlarmSeverity::Major as i16,
         hsv: AlarmSeverity::Minor as i16,
         lsv: AlarmSeverity::Minor as i16,
@@ -2705,10 +2708,10 @@ fn test_longin_aftc_filter_engages_and_seeds() {
     let mut inst = RecordInstance::new("LONGIN:AFTC".into(), rec);
     inst.common.udf = 0;
     inst.common.analog_alarm = Some(AnalogAlarmConfig {
-        hihi: 100.0,
-        high: 80.0,
-        low: -20.0,
-        lolo: -40.0,
+        hihi: AlarmLimit::Double(100.0),
+        high: AlarmLimit::Double(80.0),
+        low: AlarmLimit::Double(-20.0),
+        lolo: AlarmLimit::Double(-40.0),
         hhsv: AlarmSeverity::Major as i16,
         hsv: AlarmSeverity::Minor as i16,
         lsv: AlarmSeverity::Minor as i16,
@@ -2742,10 +2745,10 @@ fn test_int64in_aftc_filter_engages_and_seeds() {
     let mut inst = RecordInstance::new("INT64IN:AFTC".into(), rec);
     inst.common.udf = 0;
     inst.common.analog_alarm = Some(AnalogAlarmConfig {
-        hihi: 100.0,
-        high: 80.0,
-        low: -20.0,
-        lolo: -40.0,
+        hihi: AlarmLimit::Double(100.0),
+        high: AlarmLimit::Double(80.0),
+        low: AlarmLimit::Double(-20.0),
+        lolo: AlarmLimit::Double(-40.0),
         hhsv: AlarmSeverity::Major as i16,
         hsv: AlarmSeverity::Minor as i16,
         lsv: AlarmSeverity::Minor as i16,
@@ -2780,10 +2783,10 @@ fn test_ai_aftc_disabled_resets_stale_afvl() {
     let mut inst = RecordInstance::new("AI:AFTC".into(), rec);
     inst.common.udf = 0;
     inst.common.analog_alarm = Some(AnalogAlarmConfig {
-        hihi: 100.0,
-        high: 80.0,
-        low: -20.0,
-        lolo: -40.0,
+        hihi: AlarmLimit::Double(100.0),
+        high: AlarmLimit::Double(80.0),
+        low: AlarmLimit::Double(-20.0),
+        lolo: AlarmLimit::Double(-40.0),
         hhsv: AlarmSeverity::Major as i16,
         hsv: AlarmSeverity::Minor as i16,
         lsv: AlarmSeverity::Minor as i16,

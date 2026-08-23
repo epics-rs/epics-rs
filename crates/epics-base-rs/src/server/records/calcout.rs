@@ -1,5 +1,7 @@
 use super::calc_compile;
-use super::link_status::{LINK_CON, LINK_STATUS_CHOICES, LinkRole, LinkStatusGen, classify_link};
+use super::link_status::{
+    LINK_CON, LINK_STATUS_CHOICES, LinkRole, LinkStatusGen, post_link_status,
+};
 use crate::error::{CaError, CaResult};
 use crate::server::database::AsyncDbHandle;
 use crate::server::record::{
@@ -406,42 +408,14 @@ impl CalcoutRecord {
     /// `check_alarms` observes the OUT link change. No-op without an async
     /// context.
     fn refresh_link_status(&self) {
-        let Some((name, handle)) = &self.async_ctx else {
-            return;
-        };
-        let name = name.clone();
-        let handle = handle.clone();
-        let inputs = self.input_links();
-        let out = self.out.clone();
-        let link_gen = self.link_gen.clone();
-        // Stamp this refresh. A concurrent later refresh issues a newer
-        // token; this task then sees its token is stale and drops its post so
-        // it cannot clobber the newer classification (e.g. an init-time
-        // snapshot finishing after a runtime INP re-point).
-        let token = link_gen.next();
-        let sched = handle.clone();
-        // Through the database's `iocInit` owner: queued while records are
-        // still loading (so a forward-referenced target is LOCAL, and the
-        // status is final when `iocInit` returns), spawned at once once the
-        // database is complete.
-        // The parking key; `name` itself moves into the future below.
-        let init_key = name.clone();
-        sched.schedule_record_init(&init_key, async move {
-            let mut fields: Vec<(String, EpicsValue)> = Vec::with_capacity(22);
-            for (i, link) in inputs.iter().enumerate() {
-                let (status, _ft) = classify_link(&handle, link, LinkRole::Input);
-                fields.push((
-                    CALCOUT_INAV_FIELDS[i].to_string(),
-                    EpicsValue::Enum(status as u16),
-                ));
-            }
-            let (out_status, _ft) = classify_link(&handle, &out, LinkRole::Output);
-            fields.push(("OUTV".to_string(), EpicsValue::Enum(out_status as u16)));
-            // Publish only if no newer refresh was issued meanwhile.
-            if link_gen.is_current(token) {
-                let _ = handle.post_fields(&name, fields);
-            }
-        });
+        let mut links: Vec<(&'static str, String, LinkRole)> = self
+            .input_links()
+            .into_iter()
+            .enumerate()
+            .map(|(i, link)| (CALCOUT_INAV_FIELDS[i], link, LinkRole::Input))
+            .collect();
+        links.push(("OUTV", self.out.clone(), LinkRole::Output));
+        post_link_status(self.async_ctx.as_ref(), &self.link_gen, links);
     }
 }
 

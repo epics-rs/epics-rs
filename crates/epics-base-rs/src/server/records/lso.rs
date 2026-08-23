@@ -111,6 +111,12 @@ impl Record for LsoRecord {
         "lso"
     }
 
+    /// C `lsoRecord.c:108-122`: the scalar `dbGetLink(&prec->dol, ..., &prec->val, 0, 0)`
+    /// under `dol.type != CONSTANT && omsl == menuOmslclosed_loop`.
+    fn fetches_dol_closed_loop(&self) -> bool {
+        true
+    }
+
     /// C reads the closed-loop DOL through `dbGetLinkLS` (`lsoRecord.c:114`,
     /// `dbLink.c:497-505`), whose switch is on the SOURCE class: a
     /// `DBF_CHAR`/`DBF_UCHAR` source is read as the bytes it spells (capped

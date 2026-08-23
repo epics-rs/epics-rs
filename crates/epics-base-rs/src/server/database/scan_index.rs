@@ -37,7 +37,7 @@ impl PvDatabase {
         old_phas: i16,
         _new_phas: i16,
     ) {
-        let _gate = self.inner.registration_mutex.lock();
+        let _gate = self.lock_registration("update_scan_index");
         let _ = old_phas; // entry matched by name; PHAS not needed.
         // 1) Remove the OLD entry the caller knew about — even if
         // remove_record already swept it. Match by record name so a
@@ -428,7 +428,76 @@ pub(crate) fn normalize_event_name(name: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    use super::PvDatabase;
     use super::normalize_event_name;
+    use crate::server::record::ScanType;
+
+    /// The ordering rule, stated as the thing that must hold rather than as
+    /// the record shape that once broke it: **`update_scan_index` takes L46
+    /// itself, so no caller may hold L46 when calling it.**
+    ///
+    /// A caller that breaks it used to park on itself forever, because
+    /// `PriorityInheritanceMutex` is not reentrant. The failure reached CI as
+    /// a 120-second timeout on whatever test happened to register a record —
+    /// a shape that reads as a load flake and hides which caller is at fault.
+    /// This pins the replacement: the violating call panics, immediately, and
+    /// names both ends.
+    ///
+    /// Deliberately expressed with a bare `lock_registration` + direct
+    /// `update_scan_index` pair and no record, no SIML and no SCAN field: the
+    /// rule belongs to the caller/owner contract, not to the one composition
+    /// (`add_loaded_record` → `rec_gbl_init_simm` → `apply_simm_scan_swap`)
+    /// that first exposed it. Any future tail added under a registration gate
+    /// trips this the same way.
+    #[test]
+    fn a_caller_holding_l46_cannot_reach_the_scan_index_owner() {
+        let db = PvDatabase::new();
+        let held = db.lock_registration("a_test_standing_in_for_a_registration_entry_point");
+
+        let violation = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            db.update_scan_index("ANY", ScanType::Passive, ScanType::Sec01, 0, 0);
+        }));
+
+        let payload = violation
+            .expect_err("holding L46 across update_scan_index must panic, not park the thread");
+        let msg = payload
+            .downcast_ref::<String>()
+            .map(String::as_str)
+            .or_else(|| payload.downcast_ref::<&str>().copied())
+            .unwrap_or("");
+        assert!(
+            msg.contains("not reentrant") && msg.contains("update_scan_index"),
+            "the panic must name the rule and the violating site, got: {msg}"
+        );
+        drop(held);
+    }
+
+    /// The other side of the same boundary — with no gate held, the owner
+    /// takes L46 itself and completes. Without this case the test above would
+    /// still pass if `update_scan_index` panicked unconditionally.
+    #[test]
+    fn the_scan_index_owner_takes_l46_itself_when_no_caller_holds_it() {
+        let db = PvDatabase::new();
+        db.update_scan_index("ANY", ScanType::Passive, ScanType::Sec01, 0, 0);
+    }
+
+    /// The gate is released on drop, including by unwinding out of a panic
+    /// between acquisitions. A leaked flag would make every later
+    /// registration on this thread panic and turn the tripwire into its own
+    /// outage.
+    #[test]
+    fn the_registration_gate_clears_on_drop_and_on_unwind() {
+        let db = PvDatabase::new();
+        drop(db.lock_registration("first"));
+        let _second = db.lock_registration("second");
+        drop(_second);
+
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _g = db.lock_registration("panics_while_held");
+            panic!("unwind with the gate live");
+        }));
+        drop(db.lock_registration("after_unwind"));
+    }
 
     #[test]
     fn event_name_numeric_normalisation() {

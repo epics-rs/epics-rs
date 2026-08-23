@@ -445,6 +445,43 @@ impl CompressRecord {
         }
     }
 
+    /// C `compress_array`'s Low/High scan (`compressRecord.c:183-196`) — the
+    /// shape a fold over a ±INF identity cannot express:
+    ///
+    /// ```c
+    ///     value = *psource++;
+    ///     for (j = 1; j < n; j++, psource++)
+    ///         if (value > *psource) value = *psource;   /* High uses < */
+    /// ```
+    ///
+    /// The seed is the chunk's FIRST sample and `value` moves only on a STRICT
+    /// comparison, so NaN is not filtered but decided by position: a NaN seed
+    /// survives every false comparison and the chunk answers NaN, while a NaN
+    /// anywhere later loses every comparison and is skipped. `f64::min` /
+    /// `f64::max` discard NaN in both positions, and the ±INF identity they
+    /// need leaks out of an all-NaN chunk as ±inf. `compressRecord.c` has no
+    /// `isnan` anywhere — unlike `selRecord.c:361-377`, which really does seed
+    /// ±epicsINF and guard `!isnan`, and unlike `calcPerform.c:191-207`, whose
+    /// `isnan(d)` clause lets a NaN ARGUMENT win.
+    ///
+    /// `reduce` seeds from the first element exactly as `*psource++` does; the
+    /// `None` arm is C's own `double value = 0.0` initializer
+    /// (`compressRecord.c:160`), which is what the switch would leave behind
+    /// for a chunk the loop never entered.
+    fn extremum(chunk: &[f64], replace: impl Fn(f64, f64) -> bool) -> f64 {
+        chunk
+            .iter()
+            .copied()
+            .reduce(|value, source| {
+                if replace(value, source) {
+                    source
+                } else {
+                    value
+                }
+            })
+            .unwrap_or(0.0)
+    }
+
     /// C `compress_array` (compressRecord.c:154-221). Skips a
     /// **leading** run of out-of-limit samples (NOT a per-sample
     /// filter — an out-of-limit sample in the middle of the array is
@@ -473,10 +510,10 @@ impl CompressRecord {
             let chunk_len = n.min(remaining);
             let chunk = &source[pos..pos + chunk_len];
             let value = match self.alg {
-                // N_to_1_Low_Value
-                0 => chunk.iter().cloned().fold(f64::INFINITY, f64::min),
-                // N_to_1_High_Value
-                1 => chunk.iter().cloned().fold(f64::NEG_INFINITY, f64::max),
+                // N_to_1_Low_Value: `if (value > *psource) value = *psource;`
+                0 => Self::extremum(chunk, |value, source| value > source),
+                // N_to_1_High_Value: `if (value < *psource) value = *psource;`
+                1 => Self::extremum(chunk, |value, source| value < source),
                 // N_to_1_Average
                 2 => chunk.iter().sum::<f64>() / chunk_len as f64,
                 // N_to_1_Median: middle element after sort (C `psource[n/2]`).
@@ -544,6 +581,15 @@ const COMPRESS_SPC_RESET_FIELDS: &[&str] = &["RES", "ALG", "PBUF", "BALG", "N"];
 impl Record for CompressRecord {
     fn record_type(&self) -> &'static str {
         "compress"
+    }
+
+    /// `compressRecord.c:341-366`: a failed `dbGetLink` on INP raises
+    /// LINK/INVALID and then FOLDS the failure away — `status = 0` — so the
+    /// tail's `if (status != 1) prec->udf = FALSE;` clears UDF on the broken
+    /// cycle just as it does on a good one. compress is the one scalar-ish
+    /// record that joins the array records here.
+    fn derives_udf_on_read_failure(&self) -> bool {
+        true
     }
 
     /// `compressRecord.c:479-493` `get_control_double` lists `VAL`, `IHIL` and

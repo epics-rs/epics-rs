@@ -127,6 +127,12 @@ impl Record for BoRecord {
         "bo"
     }
 
+    /// C `boRecord.c:191-205`: the scalar `dbGetLink(&prec->dol, ..., &val, 0, 0)`
+    /// under `dol.type != CONSTANT && omsl == menuOmslclosed_loop`.
+    fn fetches_dol_closed_loop(&self) -> bool {
+        true
+    }
+
     /// `HIGH` is bo's only DBF_DOUBLE field, and both metadata literals in the
     /// rset are its: `get_units` (`:294-299`) answers `"s"` and `get_precision`
     /// (`:301-308`) answers `boHIGHprecision`; every other field falls to
@@ -239,7 +245,7 @@ impl Record for BoRecord {
         // DOL/OMSL: a real (DB/CA/PVA) link is fetched and applied to VAL
         // by the framework before process(). A *constant* DOL is applied
         // once at init_record (`recGblInitConstantLink` parity) and is NOT
-        // re-sourced here; C `boRecord.c:227` gates the fetch on
+        // re-sourced here; C `boRecord.c:192` gates the fetch on
         // `!dbLinkIsConstant`, so a client caput to VAL is never clobbered
         // by the constant every cycle.
 

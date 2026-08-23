@@ -172,6 +172,16 @@ pub struct AlarmResetResult {
 }
 
 /// Set new alarm severity if it's higher than current nsta/nsev.
+///
+/// Returns C's `int` result (`recGbl.c:254`/`:256`): TRUE only when
+/// `prec->nsev < new_sevr` actually raised the pending state. That return
+/// is not decoration — it is the gate on every hysteresis latch in the
+/// tree (`if (recGblSetSevr(...)) prec->lalm = alev;`, `aiRecord.c:404-406`
+/// and its siblings). A level that fires but LOSES the severity compare
+/// must not move `LALM`, or the next cycle's
+/// `lalm == alev && val >= alev - hyst` clause re-fires an alarm C never
+/// armed. Callers wanting only the side effect ignore it, as C's do.
+///
 /// Matches EPICS `recGblSetSevr` (recGbl.c:258-261): `recGblSetSevr`
 /// delegates to `recGblSetSevrMsg(..., NULL)` → `recGblSetSevrVMsg`
 /// with `msg == NULL`. When the new severity raises the pending
@@ -182,13 +192,15 @@ pub struct AlarmResetResult {
 /// no-message alarm raises the record severity; otherwise the
 /// record's final `amsg` carries an unrelated upstream record's
 /// alarm text.
-pub fn rec_gbl_set_sevr(common: &mut CommonFields, stat: u16, sevr: AlarmSeverity) {
+pub fn rec_gbl_set_sevr(common: &mut CommonFields, stat: u16, sevr: AlarmSeverity) -> bool {
     if (sevr as u16) > (common.nsev as u16) {
         common.nsta = stat;
         common.nsev = sevr;
         // C `msg == NULL` branch clears the pending message.
         common.namsg.clear();
+        return true;
     }
+    false
 }
 
 /// `rec_gbl_set_sevr` for a severity that is a **raw menu ordinal**, comparing
@@ -211,31 +223,38 @@ pub fn rec_gbl_set_sevr(common: &mut CommonFields, stat: u16, sevr: AlarmSeverit
 /// `recGblResetAlarms` (recGbl.c:188), and this stores the clamped
 /// [`AlarmSeverity`] so both sides show `INVALID`. `raw_sevr == 0` is a no-op
 /// (NO_ALARM never raises), matching C's `recGblSetSevr(.., 0)`.
-pub fn rec_gbl_set_sevr_raw(common: &mut CommonFields, stat: u16, raw_sevr: u16) {
+///
+/// Returns the raise, same as [`rec_gbl_set_sevr`].
+pub fn rec_gbl_set_sevr_raw(common: &mut CommonFields, stat: u16, raw_sevr: u16) -> bool {
     if raw_sevr > (common.nsev as u16) {
         common.nsta = stat;
         common.nsev = AlarmSeverity::from_u16(raw_sevr);
         // C `msg == NULL` branch clears the pending message.
         common.namsg.clear();
+        return true;
     }
+    false
 }
 
 /// Set new alarm severity AND attach an alarm message (epics-base PR
 /// #568 `recGblSetSevrMsg`). Same "raise only" rule as `rec_gbl_set_sevr`;
 /// when the new severity raises the pending state, both `nsta`/`nsev`
 /// AND `namsg` are written together. Empty `msg` clears the pending
-/// message — non-empty replaces it.
+/// message — non-empty replaces it. Returns the raise, same as
+/// [`rec_gbl_set_sevr`].
 pub fn rec_gbl_set_sevr_msg(
     common: &mut CommonFields,
     stat: u16,
     sevr: AlarmSeverity,
     msg: impl Into<String>,
-) {
+) -> bool {
     if (sevr as u16) > (common.nsev as u16) {
         common.nsta = stat;
         common.nsev = sevr;
         common.namsg = msg.into();
+        return true;
     }
+    false
 }
 
 /// C `setLinkAlarm` (dbLink.c:318-323) — **the single owner of "a link

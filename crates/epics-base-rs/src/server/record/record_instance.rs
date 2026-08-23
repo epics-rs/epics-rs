@@ -12,7 +12,7 @@ use crate::server::snapshot::{
 };
 use crate::types::{DbFieldType, EpicsValue, PvString, c_parse};
 
-use super::alarm::{AlarmSeverity, AnalogAlarmConfig};
+use super::alarm::{AlarmLimit, AlarmSeverity, AnalogAlarmConfig};
 use super::common_fields::CommonFields;
 use super::link::{
     ParsedLink, out_link_discards_cp, parse_forward_link_v2, parse_link_v2, parse_output_link_v2,
@@ -471,11 +471,12 @@ fn menu_ordinal_raw(value: &EpicsValue) -> i16 {
 /// - `S_stdlib_extraneous` — trailing non-space bytes with `units == NULL`
 /// - `S_stdlib_overflow` — outside `epicsInt32`
 ///
-/// Leading and trailing ASCII whitespace and a leading `+`/`-` sign are
-/// accepted, matching `epicsParseLong`'s `isspace` skips and `strtol`.
+/// Leading and trailing whitespace — C `isspace`, vertical tab included — and
+/// a leading `+`/`-` sign are accepted, matching `epicsParseLong`'s skips and
+/// `strtol`.
 fn epics_parse_int32_base10(s: &str) -> Option<i32> {
     // `while ((c = *str) && isspace(c)) ++str;` then `strtol(str, &endp, 10)`.
-    let body = s.trim_start_matches(|c: char| c.is_ascii_whitespace());
+    let body = s.trim_start_matches(crate::runtime::stdlib::c_isspace);
     let (sign, digits) = match body.strip_prefix(['+', '-']) {
         Some(rest) if body.starts_with('-') => (-1i64, rest),
         Some(rest) => (1i64, rest),
@@ -490,7 +491,7 @@ fn epics_parse_int32_base10(s: &str) -> Option<i32> {
     // `if (c && !units) return S_stdlib_extraneous;` after skipping trailing
     // whitespace.
     if !digits[end..]
-        .trim_start_matches(|c: char| c.is_ascii_whitespace())
+        .trim_start_matches(crate::runtime::stdlib::c_isspace)
         .is_empty()
     {
         return None;
@@ -507,20 +508,27 @@ fn epics_parse_int32_base10(s: &str) -> Option<i32> {
 ///
 /// String-typed common fields (DESC, ASG, OUT, TSEL, …) have no entry: their
 /// arms take the string verbatim.
-fn stored_common_field_type(name: &str) -> Option<DbFieldType> {
+fn stored_common_field_type(name: &str, declared: Option<DbFieldType>) -> Option<DbFieldType> {
     Some(match name {
         "SCAN" | "SSCN" | "PINI" => DbFieldType::Enum,
         "TSE" | "PHAS" | "PRIO" | "DISV" | "DISA" | "DISS" | "LCNT" | "UDFS" | "ACKT" | "ACKS"
         | "SEVR" | "STAT" | "NSEV" | "NSTA" => DbFieldType::Short,
-        // The analog-alarm limits and the hysteresis margin — `DBF_DOUBLE` in
-        // every dbd that declares them (`aiRecord.dbd.pod:357-388`,
-        // `calcRecord.dbd.pod:716-744`, `sCalcoutRecord.dbd:479-531`). A field
-        // missing from this table reaches its arm as whatever variant the caller
-        // built, and an arm that binds a typed variant then drops it: that is
-        // how `field(HYST,"2")` silently became 0 on every record whose
-        // hysteresis lives in `common.hyst`
-        // (calc/calcout/scalcout/ai/ao/longin/int64in).
-        "HIHI" | "HIGH" | "LOW" | "LOLO" | "HYST" => DbFieldType::Double,
+        // The analog-alarm limits and the hysteresis margin are the one row
+        // here whose stored type is the DECLARED type, and it varies by record:
+        // `DBF_DOUBLE` on ai/ao/calc/calcout/sub/scalcout, `DBF_LONG` on
+        // longin/longout, `DBF_INT64` on int64in/int64out
+        // (`int64inRecord.dbd.pod:152-208`). Naming `Double` for all of them
+        // discarded the record's own `.dbd` row on both writers — the `.db`
+        // string parse and a runtime `dbPut` — so an `epicsInt64` limit above
+        // 2^53 was rounded before it ever reached storage. Ask the record's
+        // generated field table instead; a caller with no table (a hand-built
+        // test record) keeps the `DBF_DOUBLE` majority.
+        //
+        // A field missing from this table entirely reaches its arm as whatever
+        // variant the caller built, and an arm that binds a typed variant then
+        // drops it: that is how `field(HYST,"2")` silently became 0 on every
+        // record whose hysteresis lives in `common.hyst`.
+        "HIHI" | "HIGH" | "LOW" | "LOLO" | "HYST" => declared.unwrap_or(DbFieldType::Double),
         // The `DBF_UCHAR` flags. `bool` here, a NUMBER in C.
         "DISP" | "UDF" | "TPRO" | "RPRO" | "BKPT" | "PROC" => DbFieldType::Char,
         _ => return None,
@@ -543,8 +551,13 @@ fn stored_common_field_type(name: &str) -> Option<DbFieldType> {
 /// An unparseable String is returned as-is so the arm drops it, and a menu
 /// field's bad label FAILS the put (`S_db_badChoice`) rather than landing as
 /// index 0.
-fn coerce_common_field(name: &str, value: EpicsValue, bound: MenuBound) -> CaResult<EpicsValue> {
-    let Some(dbf) = stored_common_field_type(name) else {
+fn coerce_common_field(
+    name: &str,
+    value: EpicsValue,
+    bound: MenuBound,
+    declared: Option<DbFieldType>,
+) -> CaResult<EpicsValue> {
+    let Some(dbf) = stored_common_field_type(name, declared) else {
         return Ok(value);
     };
     let EpicsValue::String(s) = &value else {
@@ -718,6 +731,31 @@ pub struct RecordInstance {
     /// field still reads its `.dbd` initial. Empty for a record whose declared
     /// fields are all modeled.
     declared_overrides: HashMap<String, EpicsValue>,
+    /// This record's OWN link fields whose target supplies some field's
+    /// units/precision/graphic/alarm — the distinct answers of
+    /// [`Record::link_backed_metadata_field`] over the record's declared
+    /// field list, collected ONCE here.
+    ///
+    /// Derived, never declared a second time: the record type states the
+    /// mapping in one place and this is the reverse index of that one
+    /// statement, so the two cannot drift the way the central
+    /// `match rtype` list they replace drifted away from `aSub`.
+    link_backed_metadata_links: Vec<String>,
+    /// The target metadata behind those links, keyed by LINK field name
+    /// (`"INPA"`, `"OUTC"`, `"DOL3"`).
+    ///
+    /// C fetches this live inside `get_units` / `get_precision` /
+    /// `get_graphic_double` / `get_alarm_double` (`dbGetUnits` and friends,
+    /// which lock the TARGET record). The port cannot: both `Snapshot`
+    /// producers run with this record's lock held, and reaching for a second
+    /// record's lock from under it inverts the lock order that record
+    /// processing takes (write here, then read there). So `PvDatabase` — the
+    /// only owner that can see both records — resolves it with no record lock
+    /// held and commits the whole map through
+    /// [`Self::commit_link_backed_metadata`], and the serving path reads it
+    /// from here. A link the owner has not resolved yet is absent, which
+    /// serves each slot's C seed.
+    link_backed_metadata: HashMap<String, crate::server::database::LinkMetadata>,
     /// Set by `check_deadband_ext` for waveform/aai/aao when their
     /// content hash changed this cycle (C `monitor()` On Change mode,
     /// waveformRecord.c:310-319). The snapshot builders read it to post
@@ -804,8 +842,37 @@ pub struct RecordInstance {
 /// `do_sub` was skipped — C's `fetch_values` failure / `S_db_BadSub` path, which
 /// leaves `process`'s `status` non-zero (aSubRecord.c:216-224).
 const SUBROUTINE_STATUS_SKIPPED: i64 = -1;
-/// No subroutine is bound: C `do_sub` returns `S_db_BadSub` (aSubRecord.c:255).
-const SUBROUTINE_STATUS_NO_SUB: i64 = -2;
+/// Which C `do_sub` a record type owns. Only `subRecord.c` and `aSubRecord.c`
+/// define one; every other record type reaches
+/// [`RecordInstance::run_registered_subroutine`] with no subroutine bound for
+/// the trivial reason that it never had one, and must not be handed `do_sub`'s
+/// bad-sub verdict. Resolving the kind once also keeps the two record types'
+/// three points of divergence (empty-SNAM exemption, bad-sub status, UDF
+/// clear) reading off one decision instead of three `record_type()` compares.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SubroutineKind {
+    /// `subRecord.c::do_sub` — VAL is the subroutine's computed value.
+    Sub,
+    /// `aSubRecord.c::do_sub` — VAL is the returned status.
+    ASub,
+}
+
+impl SubroutineKind {
+    fn of(record_type: &str) -> Option<Self> {
+        match record_type {
+            "sub" => Some(Self::Sub),
+            "aSub" => Some(Self::ASub),
+            _ => None,
+        }
+    }
+}
+
+/// C `S_db_BadSub` — `(M_dbAccess | 35)` with `M_dbAccess = 511 << 16`
+/// (`dbAccessDefs.h:189`, `errMdef.h:39`), i.e. 33488931. aSub's `do_sub`
+/// returns it verbatim for an unregistered SNAM and `process` publishes it as
+/// VAL, so the number is observable on the wire and cannot be a private
+/// sentinel.
+const S_DB_BAD_SUB: i64 = (511 << 16) | 35;
 /// The bound subroutine returned `Err` — no C counterpart (a C subroutine
 /// returns a `long`), and a failed cycle either way.
 const SUBROUTINE_STATUS_ERROR: i64 = -3;
@@ -993,8 +1060,43 @@ impl RecordInstance {
         })
     }
 
+    /// The link fields whose target metadata this record's rset serves — the
+    /// work list [`PvDatabase::refresh_link_backed_metadata`] resolves.
+    ///
+    /// [`PvDatabase::refresh_link_backed_metadata`]: crate::server::database::PvDatabase::refresh_link_backed_metadata
+    pub fn link_backed_metadata_links(&self) -> &[String] {
+        &self.link_backed_metadata_links
+    }
+
+    /// Install the target metadata the database resolved for those links.
+    ///
+    /// Whole-map replacement, not a merge: a link that stopped resolving loses
+    /// its entry and the serving path falls back to the slot's C seed, instead
+    /// of serving the last limits it ever saw as though they were current.
+    pub fn commit_link_backed_metadata(
+        &mut self,
+        resolved: HashMap<String, crate::server::database::LinkMetadata>,
+    ) {
+        self.link_backed_metadata = resolved;
+    }
+
     pub fn new_boxed(name: String, record: Box<dyn Record>) -> Self {
         let rtype = record.record_type();
+        // The reverse index of `Record::link_backed_metadata_field`, built once
+        // from the record's own declaration so no second list can go stale.
+        // Empty for every record type that answers `None` — which is all but
+        // calc, calcout, sub, seq and aSub.
+        let link_backed_metadata_links: Vec<String> = {
+            use crate::server::record::FieldDeclaration;
+            let mut links: Vec<String> = record
+                .field_list()
+                .iter()
+                .filter_map(|d| record.link_backed_metadata_field(d.name))
+                .collect();
+            links.sort_unstable();
+            links.dedup();
+            links
+        };
         let analog_alarm = match rtype {
             // C parity: every record type whose dbd carries
             // HIHI/HIGH/LOW/LOLO/HHSV/HSV/LSV/LLSV gets an analog-alarm
@@ -1041,6 +1143,8 @@ impl RecordInstance {
             notify_restart_list: std::collections::VecDeque::new(),
             last_posted: HashMap::new(),
             declared_overrides: HashMap::new(),
+            link_backed_metadata_links,
+            link_backed_metadata: HashMap::new(),
             array_hash_changed: false,
             suppress_subroutine_run: false,
             reprocess_generation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
@@ -1132,11 +1236,11 @@ impl RecordInstance {
         }
         // C `init_record` can END with `prec->pact = TRUE` to disable a record
         // it cannot process (`subRecord.c:119-123`, an empty SNAM). PACT has one
-        // owner, so the record declares the fact and the owner parks it — after
-        // the passes, so the `leave_pact()` above cannot undo it. There is
-        // nothing to release later: `dbProcess` takes the PACT-active branch on
-        // every scan from here on, which is exactly the point.
-        if self.record.init_record_parks_pact() {
+        // owner, so the record answers the predicate and the owner parks it —
+        // after the passes, so the `leave_pact()` above cannot undo it. The
+        // release is not lost: a put to a `pact_park_fields()` field re-asks,
+        // the way C's `special()` does.
+        if self.record.parks_pact() {
             self.enter_pact();
         }
     }
@@ -1335,9 +1439,9 @@ impl RecordInstance {
     ///
     /// * `dbPut` (`dbAccess.c:123-126`, via `dbPutSpecial(paddr, 0)`) refuses
     ///   the write — the port's `check_no_mod` gate;
-    /// * `rsrvCheckPut` (`rsrv/camessage.c:2540-2551`) — `if
+    /// * `rsrvCheckPut` (`rsrv/camessage.c:2608-2619`) — `if
     ///   (dbChannelSpecial(pciu->dbch) == SPC_NOMOD) return 0;` — which feeds
-    ///   the CA `ACCESS_RIGHTS` write bit (`camessage.c:1123-1124`) as well as
+    ///   the CA `ACCESS_RIGHTS` write bit (`camessage.c:1154-1156`) as well as
     ///   both put paths, so a client sees `Access: read, no write` and never
     ///   sends the doomed write.
     ///
@@ -1384,10 +1488,16 @@ impl RecordInstance {
 
     /// C `prec->pact = FALSE` — the ONLY release of PACT.
     ///
-    /// The returned [`PactExit`] is `#[must_use]`, so a release site cannot skip
-    /// the cycle tail where a queued put-notify is restarted — the omission the
-    /// open-coded `processing.store(false)` at the ODLY continuation and the
-    /// three SIM/SDLY releases made.
+    /// The returned [`PactExit`] carries the release's debt to the cycle tail,
+    /// where a queued put-notify is restarted — the omission the open-coded
+    /// `processing.store(false)` at the ODLY continuation and the three SIM/SDLY
+    /// releases made.
+    ///
+    /// `#[must_use]` does NOT enforce that debt and never did: the lint fires on
+    /// an unused *expression*, so a site that binds the token with `let` and then
+    /// leaves by `?` or an early `return` warns about nothing. The enforcement is
+    /// `processing::CycleEndGuard`, whose `Drop` pays the tail for every exit
+    /// that did not.
     pub fn leave_pact(&mut self) -> PactExit {
         self.pact.store(false, std::sync::atomic::Ordering::Release);
         PactExit::new(self.notify_restart_pending())
@@ -2179,191 +2289,65 @@ impl RecordInstance {
         )
     }
 
+    /// The record-level display metadata cache: units, precision and display
+    /// limits as C's `get_units` / `get_precision` / `get_graphic_double`
+    /// answer them for the fields their rset lists.
+    ///
+    /// Driven by [`Record::property_support`], not by a `match` on the record
+    /// type. Those were two independent tables answering the same question,
+    /// and nothing kept them in step: `default_property_support` declares
+    /// units and precision for twenty-five record types where the arm list
+    /// here covered nine, so the other sixteen declared the leaf and served
+    /// `""` / `0` — `sel`, `sub`, `dfanout`, `subArray`, `scalcout`,
+    /// `acalcout`, `epid`, `scaler`, `swait`, `sseq`, `seq`, `mca`,
+    /// `histogram`, `transform`, `throttle` and `asyn`. Deriving the cache
+    /// from the declaration makes "declares the slot" and "supplies the slot"
+    /// one fact rather than two that can disagree.
+    ///
+    /// Precision matters well beyond `caget -d`: it is also what the
+    /// DBF_DOUBLE to DBR_STRING conversion renders with, in C
+    /// (`dbConvert.c:783-786` calls `prset->get_precision` with no field-type
+    /// gate) and here (`codec.rs::convert_value_to_dbr_string`), so a missing
+    /// slot changed the digits of a plain `caget`.
+    ///
+    /// The sources are the same in every C rset that supplies them — `EGU` for
+    /// `get_units` and `PREC` for `get_precision` — so only the graphic pair
+    /// needs a per-type table ([`graphic_limit_fields`]). Per-FIELD departures
+    /// from the record's own values stay where C puts them, in that record's
+    /// [`Record::field_metadata_override`], which is applied after this and
+    /// wins.
     fn populate_display_info(&self, snap: &mut super::super::snapshot::Snapshot) {
-        let rtype = self.record.record_type();
-        match rtype {
-            "ai" | "ao" | "calc" | "calcout" => {
-                let egu = self
-                    .record
-                    .get_field("EGU")
-                    .and_then(|v| {
-                        if let EpicsValue::String(s) = v {
-                            Some(s)
-                        } else {
-                            None
-                        }
-                    })
-                    .unwrap_or_default();
-                let prec = self
-                    .record
-                    .get_field("PREC")
-                    .and_then(|v| v.to_f64())
-                    .unwrap_or(0.0) as i16;
-                let hopr = self
-                    .record
-                    .get_field("HOPR")
-                    .and_then(|v| v.to_f64())
-                    .unwrap_or(0.0);
-                let lopr = self
-                    .record
-                    .get_field("LOPR")
-                    .and_then(|v| v.to_f64())
-                    .unwrap_or(0.0);
-                snap.display = Some(super::super::snapshot::DisplayInfo {
-                    units: egu,
-                    precision: prec,
-                    upper_disp_limit: hopr,
-                    lower_disp_limit: lopr,
-                    ..Default::default()
-                });
-            }
-            "longin" | "longout" | "int64in" | "int64out" => {
-                let egu = self
-                    .record
-                    .get_field("EGU")
-                    .and_then(|v| {
-                        if let EpicsValue::String(s) = v {
-                            Some(s)
-                        } else {
-                            None
-                        }
-                    })
-                    .unwrap_or_default();
-                let hopr = self
-                    .record
-                    .get_field("HOPR")
-                    .and_then(|v| v.to_f64())
-                    .unwrap_or(0.0);
-                let lopr = self
-                    .record
-                    .get_field("LOPR")
-                    .and_then(|v| v.to_f64())
-                    .unwrap_or(0.0);
-                snap.display = Some(super::super::snapshot::DisplayInfo {
-                    units: egu,
-                    precision: 0,
-                    upper_disp_limit: hopr,
-                    lower_disp_limit: lopr,
-                    ..Default::default()
-                });
-            }
-            // waveform/aai/aao — HOPR/LOPR/PREC/EGU for VAL display limits.
-            // (waveformRecord.c:251-252,239; aaiRecord.c:280-281,268; aaoRecord.c:283-284)
-            "waveform" | "aai" | "aao" => {
-                let egu = self
-                    .record
-                    .get_field("EGU")
-                    .and_then(|v| {
-                        if let EpicsValue::String(s) = v {
-                            Some(s)
-                        } else {
-                            None
-                        }
-                    })
-                    .unwrap_or_default();
-                let prec = self
-                    .record
-                    .get_field("PREC")
-                    .and_then(|v| v.to_f64())
-                    .unwrap_or(0.0) as i16;
-                let hopr = self
-                    .record
-                    .get_field("HOPR")
-                    .and_then(|v| v.to_f64())
-                    .unwrap_or(0.0);
-                let lopr = self
-                    .record
-                    .get_field("LOPR")
-                    .and_then(|v| v.to_f64())
-                    .unwrap_or(0.0);
-                snap.display = Some(super::super::snapshot::DisplayInfo {
-                    units: egu,
-                    precision: prec,
-                    upper_disp_limit: hopr,
-                    lower_disp_limit: lopr,
-                    ..Default::default()
-                });
-            }
-            // compress — HOPR/LOPR/PREC/EGU for VAL display limits.
-            // (compressRecord.c:478-479,464,455)
-            "compress" => {
-                let egu = self
-                    .record
-                    .get_field("EGU")
-                    .and_then(|v| {
-                        if let EpicsValue::String(s) = v {
-                            Some(s)
-                        } else {
-                            None
-                        }
-                    })
-                    .unwrap_or_default();
-                let prec = self
-                    .record
-                    .get_field("PREC")
-                    .and_then(|v| v.to_f64())
-                    .unwrap_or(0.0) as i16;
-                let hopr = self
-                    .record
-                    .get_field("HOPR")
-                    .and_then(|v| v.to_f64())
-                    .unwrap_or(0.0);
-                let lopr = self
-                    .record
-                    .get_field("LOPR")
-                    .and_then(|v| v.to_f64())
-                    .unwrap_or(0.0);
-                snap.display = Some(super::super::snapshot::DisplayInfo {
-                    units: egu,
-                    precision: prec,
-                    upper_disp_limit: hopr,
-                    lower_disp_limit: lopr,
-                    ..Default::default()
-                });
-            }
-            "motor" => {
-                let egu = self
-                    .record
-                    .get_field("EGU")
-                    .and_then(|v| {
-                        if let EpicsValue::String(s) = v {
-                            Some(s)
-                        } else {
-                            None
-                        }
-                    })
-                    .unwrap_or_default();
-                let prec = self
-                    .record
-                    .get_field("PREC")
-                    .and_then(|v| v.to_f64())
-                    .unwrap_or(0.0) as i16;
-                let hlm = self
-                    .record
-                    .get_field("HLM")
-                    .and_then(|v| v.to_f64())
-                    .unwrap_or(0.0);
-                let llm = self
-                    .record
-                    .get_field("LLM")
-                    .and_then(|v| v.to_f64())
-                    .unwrap_or(0.0);
-                snap.display = Some(super::super::snapshot::DisplayInfo {
-                    units: egu,
-                    precision: prec,
-                    upper_disp_limit: hlm,
-                    lower_disp_limit: llm,
-                    ..Default::default()
-                });
-            }
-            _ => {}
+        let slots = self.record.property_support();
+        if slots.units || slots.precision || slots.graphic_double {
+            let (upper, lower) = if slots.graphic_double {
+                let (hi, lo) = super::record_trait::graphic_limit_fields(self.record.record_type());
+                (self.metadata_limit(hi), self.metadata_limit(lo))
+            } else {
+                (0.0, 0.0)
+            };
+            snap.display = Some(super::super::snapshot::DisplayInfo {
+                units: if slots.units {
+                    self.metadata_units()
+                } else {
+                    Default::default()
+                },
+                precision: if slots.precision {
+                    self.metadata_limit("PREC") as i16
+                } else {
+                    0
+                },
+                upper_disp_limit: upper,
+                lower_disp_limit: lower,
+                ..Default::default()
+            });
         }
-        // Apply the `Q:form` display-format hint. The match above builds
-        // `snap.display` only for numeric record types — the same set for
-        // which pvxs emits `display.form.choices`. This cache is
-        // record-level (it is the VAL field's metadata); the VAL-only rule
-        // pvxs applies to `display.form.index` (`iocsource.cpp:53`) is
-        // enforced per served field in `apply_field_metadata_override`.
+        // Apply the `Q:form` display-format hint. The block above builds
+        // `snap.display` for every record type that supplies at least one
+        // display slot — the same set for which pvxs emits
+        // `display.form.choices`. This cache is record-level (it is the VAL
+        // field's metadata); the VAL-only rule pvxs applies to
+        // `display.form.index` (`iocsource.cpp:53`) is enforced per served
+        // field in `apply_field_metadata_override`.
         if let Some(display) = snap.display.as_mut() {
             if let Some(form) = self.q_form_index() {
                 display.form = form;
@@ -2382,118 +2366,146 @@ impl RecordInstance {
             .description = self.common.desc.clone();
     }
 
-    /// Populate ControlInfo from record fields if applicable.
+    /// The record-level control-limit cache — what C's `get_control_double`
+    /// answers for the fields its rset lists.
+    ///
+    /// Gated on the declared slot for the same reason as
+    /// [`Self::populate_display_info`], and with the same effect: the arm list
+    /// this replaces covered thirteen record types where
+    /// `default_property_support` declares `control_double` for twenty-three,
+    /// so `sel`, `sub`, `dfanout`, `subArray`, `histogram`, `scalcout`,
+    /// `acalcout` and `epid` served 0/0 on `VAL` — a channel whose C rset
+    /// answers the record's own operator range.
+    ///
+    /// Which of the record's fields that range comes from is the one thing
+    /// that varies by type, and it lives in [`control_limit_source`].
     fn populate_control_info(&self, snap: &mut super::super::snapshot::Snapshot) {
-        let rtype = self.record.record_type();
-        match rtype {
-            // ao unconditionally uses DRVH/DRVL (aoRecord.c:356-357).
-            "ao" => {
-                let upper = self
-                    .record
-                    .get_field("DRVH")
-                    .and_then(|v| v.to_f64())
-                    .unwrap_or(0.0);
-                let lower = self
-                    .record
-                    .get_field("DRVL")
-                    .and_then(|v| v.to_f64())
-                    .unwrap_or(0.0);
-                snap.control = Some(super::super::snapshot::ControlInfo {
-                    upper_ctrl_limit: upper,
-                    lower_ctrl_limit: lower,
-                });
-            }
-            // longout/int64out use DRVH/DRVL only when drvh > drvl, else HOPR/LOPR
-            // (longoutRecord.c:282-287, int64outRecord.c:265-270).
-            "longout" | "int64out" => {
-                let drvh = self
-                    .record
-                    .get_field("DRVH")
-                    .and_then(|v| v.to_f64())
-                    .unwrap_or(0.0);
-                let drvl = self
-                    .record
-                    .get_field("DRVL")
-                    .and_then(|v| v.to_f64())
-                    .unwrap_or(0.0);
-                let (upper, lower) = if drvh > drvl {
-                    (drvh, drvl)
-                } else {
-                    let hopr = self
-                        .record
-                        .get_field("HOPR")
-                        .and_then(|v| v.to_f64())
-                        .unwrap_or(0.0);
-                    let lopr = self
-                        .record
-                        .get_field("LOPR")
-                        .and_then(|v| v.to_f64())
-                        .unwrap_or(0.0);
-                    (hopr, lopr)
-                };
-                snap.control = Some(super::super::snapshot::ControlInfo {
-                    upper_ctrl_limit: upper,
-                    lower_ctrl_limit: lower,
-                });
-            }
-            "motor" => {
-                // Motor records use HLM/LLM as control limits
-                let hlm = self
-                    .record
-                    .get_field("HLM")
-                    .and_then(|v| v.to_f64())
-                    .unwrap_or(0.0);
-                let llm = self
-                    .record
-                    .get_field("LLM")
-                    .and_then(|v| v.to_f64())
-                    .unwrap_or(0.0);
-                snap.control = Some(super::super::snapshot::ControlInfo {
-                    upper_ctrl_limit: hlm,
-                    lower_ctrl_limit: llm,
-                });
-            }
-            // int64in uses HOPR/LOPR as control limits (int64inRecord.c:226-227)
-            "ai" | "int64in" | "longin" | "calc" | "calcout" => {
-                // Input records use HOPR/LOPR as control limits
-                let hopr = self
-                    .record
-                    .get_field("HOPR")
-                    .and_then(|v| v.to_f64())
-                    .unwrap_or(0.0);
-                let lopr = self
-                    .record
-                    .get_field("LOPR")
-                    .and_then(|v| v.to_f64())
-                    .unwrap_or(0.0);
-                snap.control = Some(super::super::snapshot::ControlInfo {
-                    upper_ctrl_limit: hopr,
-                    lower_ctrl_limit: lopr,
-                });
-            }
-            // Array records map their VAL control limits to HOPR/LOPR, exactly
-            // like the display limits above (waveformRecord.c get_control_double
-            // VAL case; aaiRecord.c:293-303; aaoRecord.c; compressRecord.c:487-501).
-            // Without this arm an array DBR_CTRL collapses the control range to
-            // 0/0 while the scalar records expose it.
-            "waveform" | "aai" | "aao" | "compress" => {
-                let hopr = self
-                    .record
-                    .get_field("HOPR")
-                    .and_then(|v| v.to_f64())
-                    .unwrap_or(0.0);
-                let lopr = self
-                    .record
-                    .get_field("LOPR")
-                    .and_then(|v| v.to_f64())
-                    .unwrap_or(0.0);
-                snap.control = Some(super::super::snapshot::ControlInfo {
-                    upper_ctrl_limit: hopr,
-                    lower_ctrl_limit: lopr,
-                });
-            }
-            _ => {}
+        use super::record_trait::ControlLimitSource;
+
+        if !self.record.property_support().control_double {
+            return;
         }
+        let (upper, lower) =
+            match super::record_trait::control_limit_source(self.record.record_type()) {
+                ControlLimitSource::Drive => {
+                    (self.metadata_limit("DRVH"), self.metadata_limit("DRVL"))
+                }
+                ControlLimitSource::DriveWhenSet => {
+                    let (drvh, drvl) = (self.metadata_limit("DRVH"), self.metadata_limit("DRVL"));
+                    if drvh > drvl {
+                        (drvh, drvl)
+                    } else {
+                        (self.metadata_limit("HOPR"), self.metadata_limit("LOPR"))
+                    }
+                }
+                ControlLimitSource::SoftLimits => {
+                    (self.metadata_limit("HLM"), self.metadata_limit("LLM"))
+                }
+                ControlLimitSource::Operator => {
+                    (self.metadata_limit("HOPR"), self.metadata_limit("LOPR"))
+                }
+            };
+        snap.control = Some(super::super::snapshot::ControlInfo {
+            upper_ctrl_limit: upper,
+            lower_ctrl_limit: lower,
+        });
+    }
+
+    /// A numeric metadata field (`PREC`, `HOPR`, `DRVH`, ...) as C reads it —
+    /// straight out of record memory, which for C means every field the `.dbd`
+    /// declares.
+    ///
+    /// Through [`Self::resolve_field`], NOT `Record::get_field`, and that is
+    /// the whole reason this cache used to read zero for the types it now
+    /// serves: a Rust record implements only the fields it has behaviour for,
+    /// so `sel`, `sub`, `dfanout` and their siblings model no `PREC`/`HOPR`
+    /// cell at all and `get_field` answers `None` for them. Their `.db` values
+    /// live in `declared_overrides`, and their unset defaults in the `.dbd`
+    /// `initial()`, both of which only `resolve_field` reaches.
+    fn metadata_limit(&self, field: &str) -> f64 {
+        self.resolve_field(field)
+            .and_then(|v| v.to_f64())
+            .unwrap_or(0.0)
+    }
+
+    /// `EGU`, the source every ported C `get_units` copies from. Empty for a
+    /// record type whose `.dbd` declares no `EGU` — `seq` and `histogram` have
+    /// none, and C writes nothing into the `dbAccess.c:378` seed for either.
+    fn metadata_units(&self) -> crate::types::PvString {
+        match self.resolve_field("EGU") {
+            Some(EpicsValue::String(s)) => s,
+            _ => Default::default(),
+        }
+    }
+
+    /// Whether C's `get_units` copies the record's own `EGU` into `field`.
+    ///
+    /// The fourth membership question, and the one the port never asked. Units
+    /// had no per-field step at all: the record-level cache was the entire
+    /// answer, so every field of a type that supplies the slot was served
+    /// `EGU` — including the fields whose C rset tests first and writes
+    /// nothing, leaving the `dbAccess.c:378` empty seed. Measured shape:
+    /// `caget -d DBR_GR_DOUBLE AI.SMOO` served `EGU` where `aiRecord.c:223-226`
+    /// deliberately skips the three raw-conversion fields.
+    ///
+    /// * `ai`/`ao` (`aiRecord.c:217-232`, `aoRecord.c:284-298`) — a DBF_DOUBLE
+    ///   field other than the raw-conversion ones, which carry no engineering
+    ///   units.
+    /// * `calc`/`calcout`/`sub`/`sel`/`dfanout` (`calcRecord.c:169-182`,
+    ///   `calcoutRecord.c:425-444`, `subRecord.c:206-219`,
+    ///   `selRecord.c:136-143`, `dfanoutRecord.c:155-163`) — any DBF_DOUBLE
+    ///   field.
+    /// * `longin`/`longout` (`longinRecord.c:183-191`) test DBF_LONG and the
+    ///   int64 pair (`int64inRecord.c:179-187`) DBF_INT64: the record's own VAL
+    ///   type, not DOUBLE.
+    /// * `compress` (`compressRecord.c:449-458`) widens the DBF_DOUBLE test
+    ///   with `VAL`, whose served type comes from the record rather than the
+    ///   dbd.
+    /// * the array types (`waveformRecord.c:220-233`, `aaiRecord.c`,
+    ///   `aaoRecord.c`, `subArrayRecord.c:206-219`) name `VAL`, `HOPR` and
+    ///   `LOPR`, and drop `VAL` when `FTVL` makes it strings or enums.
+    /// * `histogram`, `seq`, `bo`, `table` and `aSub` never write `EGU` at all;
+    ///   each answers a literal or a link for a named set and nothing
+    ///   elsewhere, and the literals come from
+    ///   [`Record::field_metadata_override`].
+    ///
+    /// Every other ported type copies `EGU` with no test whatever
+    /// (`sCalcoutRecord.c:603-609`, `aCalcoutRecord.c:743-749`,
+    /// `epidRecord.c:217-223`, `mcaRecord.c:884-890`, `motorRecord.cc`'s
+    /// `default:` arm).
+    fn units_from_egu(&self, rtype: &str, field: &str) -> bool {
+        use crate::types::DbFieldType as T;
+        let f = field.to_ascii_uppercase();
+        // The link arm is NOT here: `route_field_metadata` asks
+        // [`Record::link_backed_metadata_field`] first and only falls through
+        // to this EGU question for a field no link backs. This function
+        // answers C's `else strncpy(units, prec->egu, ...)` branch alone.
+        let own = |t: T| self.static_field_type(&f) == Some(t);
+        match rtype {
+            "ai" => own(T::Double) && !matches!(f.as_str(), "ASLO" | "AOFF" | "SMOO"),
+            "ao" => own(T::Double) && !matches!(f.as_str(), "ASLO" | "AOFF"),
+            "calc" | "calcout" | "sub" | "sel" | "dfanout" => own(T::Double),
+            "longin" | "longout" => own(T::Long),
+            "int64in" | "int64out" => own(T::Int64),
+            "compress" => own(T::Double) || f == "VAL",
+            "waveform" | "aai" | "aao" | "subArray" => {
+                matches!(f.as_str(), "HOPR" | "LOPR")
+                    || (f == "VAL" && !self.ftvl_is_string_or_enum())
+            }
+            "histogram" | "seq" | "bo" | "table" | "aSub" => false,
+            _ => true,
+        }
+    }
+
+    /// `FTVL` names `DBF_STRING` or `DBF_ENUM` — the two element types for
+    /// which the array rsets break out of the `VAL` case before copying `EGU`.
+    /// `menuFtype` is declared in `DBF_` code order, so `0` is STRING and `11`
+    /// is ENUM.
+    fn ftvl_is_string_or_enum(&self) -> bool {
+        matches!(
+            self.resolve_field("FTVL").and_then(|v| v.to_f64()),
+            Some(x) if x == 0.0 || x == 11.0
+        )
     }
 
     /// Populate EnumInfo — C rset `get_enum_strs`.
@@ -2607,22 +2619,22 @@ impl RecordInstance {
                 .common
                 .analog_alarm
                 .as_ref()
-                .map(|a| EpicsValue::Double(a.hihi)),
+                .map(|a| a.hihi.to_epics_value()),
             "HIGH" => self
                 .common
                 .analog_alarm
                 .as_ref()
-                .map(|a| EpicsValue::Double(a.high)),
+                .map(|a| a.high.to_epics_value()),
             "LOW" => self
                 .common
                 .analog_alarm
                 .as_ref()
-                .map(|a| EpicsValue::Double(a.low)),
+                .map(|a| a.low.to_epics_value()),
             "LOLO" => self
                 .common
                 .analog_alarm
                 .as_ref()
-                .map(|a| EpicsValue::Double(a.lolo)),
+                .map(|a| a.lolo.to_epics_value()),
             "HHSV" => self
                 .common
                 .analog_alarm
@@ -2882,7 +2894,8 @@ impl RecordInstance {
         // typed arms below apply a `field(PHAS, "1")` / `field(PRIO, "HIGH")`
         // directive instead of silently dropping it at IOC load. String-typed
         // and already-typed values pass through unchanged.
-        let value = coerce_common_field(&name, value, bound)?;
+        let declared = declared_field_type_of(self.record.as_ref(), &name);
+        let value = coerce_common_field(&name, value, bound, declared)?;
         // C `dbPutString`/`dbPutField` route every link field's text through
         // `dbParseLink`, whose brace arm hands it to `dbJLinkParse`
         // (`dbStaticLib.c:2280-2286`); an unusable JSON link is
@@ -3277,26 +3290,39 @@ impl RecordInstance {
                 }
             }
             // Analog alarm limits. The DB-load String was already coerced to
-            // `Double` by `coerce_common_field` — the one owner of
-            // "what type does this common field hold" — so every writer
-            // (`.db` load, `caput`, a link) lands here with a numeric value.
+            // the field's DECLARED `.dbd` type by `coerce_common_field` — the
+            // one owner of "what type does this common field hold" — so every
+            // writer (`.db` load, `caput`, a link) lands here with a numeric
+            // value in the record's own alarm domain, `epicsInt64` included.
             "HIHI" => {
-                if let (Some(v), Some(a)) = (value.to_f64(), self.common.analog_alarm.as_mut()) {
+                if let (Some(v), Some(a)) = (
+                    AlarmLimit::from_stored(&value),
+                    self.common.analog_alarm.as_mut(),
+                ) {
                     a.hihi = v;
                 }
             }
             "HIGH" => {
-                if let (Some(v), Some(a)) = (value.to_f64(), self.common.analog_alarm.as_mut()) {
+                if let (Some(v), Some(a)) = (
+                    AlarmLimit::from_stored(&value),
+                    self.common.analog_alarm.as_mut(),
+                ) {
                     a.high = v;
                 }
             }
             "LOW" => {
-                if let (Some(v), Some(a)) = (value.to_f64(), self.common.analog_alarm.as_mut()) {
+                if let (Some(v), Some(a)) = (
+                    AlarmLimit::from_stored(&value),
+                    self.common.analog_alarm.as_mut(),
+                ) {
                     a.low = v;
                 }
             }
             "LOLO" => {
-                if let (Some(v), Some(a)) = (value.to_f64(), self.common.analog_alarm.as_mut()) {
+                if let (Some(v), Some(a)) = (
+                    AlarmLimit::from_stored(&value),
+                    self.common.analog_alarm.as_mut(),
+                ) {
                     a.lolo = v;
                 }
             }
@@ -3351,7 +3377,7 @@ impl RecordInstance {
             // reflects it. `put_declared_override` still returns
             // `unknown_field_error` for a name with no `dbFldDes`, so a
             // misspelled field is refused exactly as before.
-            _ => return self.put_declared_override(&name, value),
+            _ => return self.put_declared_override(&name, value, bound),
         }
         self.record.on_put(&name);
         // C `dbPut` (dbAccess.c:1399-1405) returns the after-put
@@ -3428,6 +3454,7 @@ impl RecordInstance {
         &mut self,
         name: &str,
         value: EpicsValue,
+        bound: MenuBound,
     ) -> CaResult<CommonFieldPutResult> {
         let Some(desc) = self.field_desc(name) else {
             return Err(self.unknown_field_error(name.to_string()));
@@ -3435,8 +3462,19 @@ impl RecordInstance {
         if desc.runtime_typed {
             return Err(self.unknown_field_error(name.to_string()));
         }
-        if self.is_no_mod(name) {
-            // C `dbPutSpecial` pass 0 refuses SPC_NOMOD with `S_db_noMod`.
+        if matches!(bound, MenuBound::DbPut) && self.is_no_mod(name) {
+            // C `dbPutSpecial` pass 0 refuses SPC_NOMOD with `S_db_noMod`
+            // (dbAccess.c:123-127) — and `dbPutSpecial` is reached only from
+            // `dbPutField`/`dbPut`, the RUNTIME path. `dbLoadRecords` writes
+            // through dbStatic's `dbPutString` (dbStaticLib.c:2570), which
+            // consults `special` for `SPC_CALC` alone; SPC_NOMOD appears in
+            // that layer only as a filter on `dbLexRoutines.c:1285`'s
+            // misspelled-field guesser, never as a refusal of a field the
+            // `.db` names outright. Refusing both paths dropped every
+            // `field(<SPC_NOMOD>,…)` directive with a stderr line —
+            // `mca`'s SIOL/SIML, `sub`'s LA..LU, `sel`'s LA..NLST,
+            // `scalcout`'s PA..MLST, `asyn`'s AINP/NORD/ERRS and `swait`'s
+            // VERS — so a simulated `mca` could not be given a SIOL at all.
             return Err(CaError::ReadOnlyField(name.to_string()));
         }
         // The override is the WRITABLE TWIN of `declared_default`, and
@@ -3495,6 +3533,7 @@ impl RecordInstance {
             recgbl::rec_gbl_check_udf(
                 &mut self.common,
                 self.record.udf_alarm_on_exact_one(),
+                self.record.udf_alarm_severity(),
                 self.record.udf_alarm_message(),
             );
         }
@@ -3510,17 +3549,19 @@ impl RecordInstance {
         // those records carry no analog config, so they never reach here and
         // cannot double-raise.
         if let Some(ref alarm_cfg) = self.common.analog_alarm.clone() {
+            // VAL goes down in the variant the record stores it in, not
+            // flattened to `f64`: it is what picks the ladder's comparison
+            // domain, and `Int64(v) as f64` had already rounded the value
+            // before the first comparison ran.
             let val = match self.record.val() {
-                Some(EpicsValue::Double(v)) => v,
-                Some(EpicsValue::Long(v)) => v as f64,
-                Some(EpicsValue::Int64(v)) => v as f64,
+                Some(v @ (EpicsValue::Double(_) | EpicsValue::Long(_) | EpicsValue::Int64(_))) => v,
                 _ => return,
             };
             self.evaluate_analog_alarm(val, alarm_cfg);
         }
     }
 
-    fn evaluate_analog_alarm(&mut self, val: f64, cfg: &AnalogAlarmConfig) {
+    fn evaluate_analog_alarm(&mut self, val: EpicsValue, cfg: &AnalogAlarmConfig) {
         use crate::server::recgbl::{self, alarm_status};
 
         // C `checkAlarms` returns immediately on a UDF cycle: it raises
@@ -3548,12 +3589,21 @@ impl RecordInstance {
             return;
         }
 
-        let hyst = self.common.hyst;
-        let lalm = self
-            .record
-            .get_field("LALM")
-            .and_then(|v| v.to_f64())
-            .unwrap_or(val);
+        // One rule for every ladder input: a record that DECLARES the field
+        // owns it, because `Record::put_field` absorbs the client's put before
+        // `put_common_field` ever runs, and only an undeclared field falls
+        // through to `CommonFields`. MDEL/ADEL/MLST/ALST in
+        // `check_monitor_deadbands` already read this way; HYST did not, so
+        // `int64in`/`int64out`'s `pub hyst` swallowed every put while the
+        // hysteresis compared against a permanent 0.0 — with `caget .HYST`
+        // reading the value back, which is what made it silent.
+        //
+        // `common.hyst` stays an `f64` and stays exact: after the limits moved
+        // to the declared type its only remaining readers are the
+        // `DBF_DOUBLE` records and longin/longout, and every `epicsInt32` is
+        // an `f64` exactly.
+        let hyst_field = self.record.get_field("HYST");
+        let lalm_field = self.record.get_field("LALM");
 
         // C-style per-level hysteresis: alarm fires if val passes the level,
         // OR if we were already at that alarm level (lalm == alev) and val
@@ -3571,40 +3621,79 @@ impl RecordInstance {
         // SEVR=INVALID/STAT=HIHI — reproduced by testing `!= 0` and mapping the
         // ordinal through [`AlarmSeverity::from_u16`] (which clamps `>= 3` to
         // `Invalid`).
-        let (mut new_sevr, mut new_stat, mut alev, mut alarm_range) = if cfg.hhsv != 0
-            && (val >= cfg.hihi || (lalm == cfg.hihi && val >= cfg.hihi - hyst))
-        {
-            (
-                AlarmSeverity::from_u16(cfg.hhsv as u16),
-                alarm_status::HIHI_ALARM,
-                cfg.hihi,
-                5u16,
-            )
-        } else if cfg.llsv != 0 && (val <= cfg.lolo || (lalm == cfg.lolo && val <= cfg.lolo + hyst))
-        {
-            (
-                AlarmSeverity::from_u16(cfg.llsv as u16),
-                alarm_status::LOLO_ALARM,
-                cfg.lolo,
-                1u16,
-            )
-        } else if cfg.hsv != 0 && (val >= cfg.high || (lalm == cfg.high && val >= cfg.high - hyst))
-        {
-            (
-                AlarmSeverity::from_u16(cfg.hsv as u16),
-                alarm_status::HIGH_ALARM,
-                cfg.high,
-                4u16,
-            )
-        } else if cfg.lsv != 0 && (val <= cfg.low || (lalm == cfg.low && val <= cfg.low + hyst)) {
-            (
-                AlarmSeverity::from_u16(cfg.lsv as u16),
-                alarm_status::LOW_ALARM,
-                cfg.low,
-                2u16,
-            )
-        } else {
-            (AlarmSeverity::NoAlarm, alarm_status::NO_ALARM, val, 3u16)
+        let sevs = [cfg.hhsv, cfg.llsv, cfg.hsv, cfg.lsv];
+        let mut alarm_range = match &val {
+            // The `DBF_LONG`/`DBF_INT64` records. `convert_to(Int64)` is the
+            // workspace's one value-coercion owner, so a limit, a hysteresis
+            // and a LALM all land here as the exact `epicsInt64` C compares.
+            EpicsValue::Long(_) | EpicsValue::Int64(_) => {
+                let int = |v: Option<EpicsValue>, dflt: i128| -> i128 {
+                    match v.map(|v| v.convert_to(DbFieldType::Int64)) {
+                        Some(EpicsValue::Int64(i)) => i as i128,
+                        _ => dflt,
+                    }
+                };
+                let v = int(Some(val.clone()), 0);
+                super::alarm::analog_alarm_range(
+                    v,
+                    int(hyst_field, self.common.hyst as i128),
+                    int(lalm_field, v),
+                    [
+                        cfg.hihi.as_i128(),
+                        cfg.lolo.as_i128(),
+                        cfg.high.as_i128(),
+                        cfg.low.as_i128(),
+                    ],
+                    sevs,
+                )
+            }
+            _ => {
+                let v = val.to_f64().unwrap_or(0.0);
+                super::alarm::analog_alarm_range(
+                    v,
+                    hyst_field
+                        .and_then(|h| h.to_f64())
+                        .unwrap_or(self.common.hyst),
+                    lalm_field.and_then(|l| l.to_f64()).unwrap_or(v),
+                    [
+                        cfg.hihi.as_f64(),
+                        cfg.lolo.as_f64(),
+                        cfg.high.as_f64(),
+                        cfg.low.as_f64(),
+                    ],
+                    sevs,
+                )
+            }
+        };
+
+        // C `range_stat[]` (`int64inRecord.c:250-253`) plus the severity and
+        // `alev` each range selects. ONE table, because C reaches the same
+        // mapping twice — once out of the ladder and once out of the AFTC
+        // filter's `switch (alarmRange)` (`:326-346`).
+        let resolve = |range: u16| -> (AlarmSeverity, u16, Option<AlarmLimit>) {
+            match range {
+                5 => (
+                    AlarmSeverity::from_u16(cfg.hhsv as u16),
+                    alarm_status::HIHI_ALARM,
+                    Some(cfg.hihi),
+                ),
+                4 => (
+                    AlarmSeverity::from_u16(cfg.hsv as u16),
+                    alarm_status::HIGH_ALARM,
+                    Some(cfg.high),
+                ),
+                2 => (
+                    AlarmSeverity::from_u16(cfg.lsv as u16),
+                    alarm_status::LOW_ALARM,
+                    Some(cfg.low),
+                ),
+                1 => (
+                    AlarmSeverity::from_u16(cfg.llsv as u16),
+                    alarm_status::LOLO_ALARM,
+                    Some(cfg.lolo),
+                ),
+                _ => (AlarmSeverity::NoAlarm, alarm_status::NO_ALARM, None),
+            }
         };
 
         // C parity: the alarm-range AFTC low-pass filter
@@ -3638,36 +3727,10 @@ impl RecordInstance {
                     now,
                 );
                 let _ = self.record.put_field("AFVL", EpicsValue::Double(new_afvl));
-                if filtered_range != alarm_range {
-                    // Re-map filtered range back to (sevr, stat, alev).
-                    let (mapped_sevr, mapped_stat, mapped_alev) = match filtered_range {
-                        5 => (
-                            AlarmSeverity::from_u16(cfg.hhsv as u16),
-                            alarm_status::HIHI_ALARM,
-                            cfg.hihi,
-                        ),
-                        4 => (
-                            AlarmSeverity::from_u16(cfg.hsv as u16),
-                            alarm_status::HIGH_ALARM,
-                            cfg.high,
-                        ),
-                        2 => (
-                            AlarmSeverity::from_u16(cfg.lsv as u16),
-                            alarm_status::LOW_ALARM,
-                            cfg.low,
-                        ),
-                        1 => (
-                            AlarmSeverity::from_u16(cfg.llsv as u16),
-                            alarm_status::LOLO_ALARM,
-                            cfg.lolo,
-                        ),
-                        _ => (AlarmSeverity::NoAlarm, alarm_status::NO_ALARM, val),
-                    };
-                    new_sevr = mapped_sevr;
-                    new_stat = mapped_stat;
-                    alev = mapped_alev;
-                    alarm_range = filtered_range;
-                }
+                // C re-maps through the SAME `switch (alarmRange)` the ladder
+                // fell out of, so the filter changes only the range and
+                // `resolve` below answers for both.
+                alarm_range = filtered_range;
             } else {
                 // aftc <= 0 disables the filter. C `checkAlarms`
                 // (e.g. aiRecord.c:356,402) initialises the local
@@ -3681,15 +3744,23 @@ impl RecordInstance {
                 }
             }
         }
-        let _ = alarm_range; // suppress unused-var on non-calc paths
+        let (new_sevr, new_stat, alev) = resolve(alarm_range);
 
         if new_sevr != AlarmSeverity::NoAlarm {
-            recgbl::rec_gbl_set_sevr(&mut self.common, new_stat, new_sevr);
-            // C sets LALM to the alarm threshold level, not the current value
-            let _ = self.record.put_field("LALM", EpicsValue::Double(alev));
+            // C `aiRecord.c:404-406` — the latch is armed to the THRESHOLD, and
+            // only when `recGblSetSevr` returns TRUE. A level that fires while a
+            // higher-or-equal severity is already pending (an MS input link, a
+            // SIMM alarm, a device INVALID) raises nothing, so C leaves LALM
+            // where it was; arming it there would let the next cycle's
+            // `lalm == alev && val >= alev - hyst` clause hold an alarm C has
+            // already cleared.
+            if recgbl::rec_gbl_set_sevr(&mut self.common, new_stat, new_sevr) {
+                self.put_coerced("LALM", alev.map(|l| l.to_epics_value()).unwrap_or(val));
+            }
         } else {
-            // No alarm condition: reset LALM to current value (like C)
-            let _ = self.record.put_field("LALM", EpicsValue::Double(val));
+            // No alarm condition: reset LALM to current value. C `aiRecord.c:409`
+            // does this unconditionally — only the alarm arm is gated.
+            self.put_coerced("LALM", val);
         }
     }
 
@@ -3724,9 +3795,15 @@ impl RecordInstance {
 
     /// Returns C `process`'s `status` for this cycle: 0 only when `do_sub` ran
     /// and returned 0.
+    ///
+    /// This is C `process`'s
+    /// `if (!status) { status = do_sub(prec); prec->val = status; }`
+    /// (aSubRecord.c:216-224, subRecord.c:142-147). The VAL publish is HERE
+    /// rather than inside [`Self::do_sub`] precisely because C puts it here:
+    /// every `do_sub` exit — empty SNAM, unregistered SNAM, the subroutine's
+    /// own return — publishes its status as aSub's VAL from this one site, and
+    /// only the pre-`do_sub` skip (a failed `fetch_values`) leaves VAL alone.
     fn run_subroutine_body(&mut self) -> CaResult<i64> {
-        use crate::server::recgbl::{self, alarm_status};
-
         // aSub `LFLG=READ`: a `SUBL` re-resolution that found a bad/unregistered
         // name (C `fetch_values` -> `S_db_BadSub`) or failed to read the link
         // signals "skip do_sub this cycle" — C `process` runs `do_sub` only on
@@ -3738,58 +3815,72 @@ impl RecordInstance {
             return Ok(SUBROUTINE_STATUS_SKIPPED);
         }
 
-        // Clone the Arc so the borrow on `self.subroutine` is released
-        // before we mutate `self.record` / `self.common` below.
-        let Some(sub_fn) = self.subroutine.clone() else {
-            // C `do_sub` (aSubRecord.c:459-465, subRecord.c:118-123)
-            // short-circuits an EMPTY SNAM to `return 0` BEFORE the
-            // `pfunc == NULL` -> `S_db_BadSub` check: a subroutine record with
-            // no SNAM is not a bad-sub, it is a no-op that completes with
-            // status 0. Only a NON-empty, unregistered SNAM yields
-            // `S_db_BadSub`.
-            //
-            // aSub depends on this: C `process` (aSubRecord.c:224) runs
-            // `prec->val = status` (= 0) every cycle, forcing VAL back to 0.
-            // C `monitor()` (aSubRecord.c:414) posts VAL only on
-            // `val != oval`, so with val==oval==0 a periodic (SCAN) cycle
-            // posts nothing — the driven `dbPut`s are the only VAL events.
-            // Without the reset the port leaves VAL holding the last client
-            // put, and the deadband gate re-posts it on every scan (the aSub
-            // scanned monitor over-posts: 7 updates where C posts 4). `sub`
-            // never reaches here with an empty SNAM — it parks PACT at init
-            // (`Record::init_record_parks_pact`, subRecord.c:119-123) and does
-            // not process — so the VAL write is scoped to aSub, whose VAL is
-            // the do_sub status.
-            let snam_empty = matches!(
-                self.record.get_field("SNAM"),
-                Some(EpicsValue::String(s)) if s.is_empty()
-            );
-            if snam_empty {
-                if self.record.record_type() == "aSub" {
-                    // C `prec->val = do_sub() = 0`.
-                    let _ = self.record.put_field("VAL", EpicsValue::Long(0));
-                }
-                return Ok(0);
-            }
-            // A non-empty but unregistered SNAM: C `do_sub` returns
-            // `S_db_BadSub`, so the cycle's status is non-zero.
-            return Ok(SUBROUTINE_STATUS_NO_SUB);
+        // Every record type reaches this call on the process path, but only
+        // `sub` and `aSub` have a `do_sub` in their rset at all. For all the
+        // others "no subroutine is bound" is their permanent normal state, not
+        // an unresolved SNAM, so they must not take `do_sub`'s bad-sub exit.
+        let Some(kind) = SubroutineKind::of(self.record.record_type()) else {
+            return Ok(SUBROUTINE_STATUS_SKIPPED);
         };
-        // C `do_sub` returns the subroutine's `long` status.
-        let status = sub_fn(&mut *self.record)?;
 
-        // aSub publishes the status as VAL (C `aSubRecord.c:223`
+        let status = self.do_sub(kind)?;
+
+        // aSub publishes the status as VAL (C `aSubRecord.c:224`
         // `prec->val = status`). The subroutine's computed outputs live in
         // VALA..VALU, so VAL is the return code and overwrites whatever the
         // closure may have written to VAL. `sub` does NOT do this — its VAL
-        // is the value the subroutine computed.
-        if self.record.record_type() == "aSub" {
-            // aSub VAL is DBF_LONG (epicsInt32); the do_sub status is a C `long`
-            // truncated into it (`prec->val = status`).
+        // is the value the subroutine computed. aSub VAL is DBF_LONG
+        // (epicsInt32); the status is a C `long` truncated into it.
+        if kind == SubroutineKind::ASub {
             let _ = self
                 .record
                 .put_field("VAL", EpicsValue::Long(status as i32));
         }
+        Ok(status)
+    }
+
+    /// C `do_sub` — `aSubRecord.c:454-473` and `subRecord.c:420-437`, which
+    /// differ in exactly two places and agree everywhere else:
+    ///
+    /// * aSub short-circuits an EMPTY SNAM to `return 0` BEFORE the null-pointer
+    ///   check (`if (prec->snam[0] == 0) return 0;`), so a bare
+    ///   `record(aSub,"X"){}` is a no-op that completes with status 0, not a
+    ///   bad-sub. `sub` has no such branch — it cannot reach here with an empty
+    ///   SNAM because `init_record` parks PACT
+    ///   (`Record::init_record_parks_pact`, subRecord.c:119-123).
+    /// * an unresolved subroutine raises `BAD_SUB_ALARM` at `INVALID_ALARM` in
+    ///   both, but aSub returns `S_db_BadSub` (which `run_subroutine_body`
+    ///   publishes as VAL and aSub's OUT gate reads as "push nothing") while
+    ///   `sub` returns 0.
+    ///
+    /// The raise is per-cycle, not a one-shot init diagnostic: C `iocInit`
+    /// discards `init_record`'s status (iocInit.c:569-570), so the record loads
+    /// and scans and every process cycle re-raises BAD_SUB/INVALID.
+    fn do_sub(&mut self, kind: SubroutineKind) -> CaResult<i64> {
+        use crate::server::recgbl::{self, alarm_status};
+
+        // Clone the Arc so the borrow on `self.subroutine` is released
+        // before we mutate `self.record` / `self.common` below.
+        let Some(sub_fn) = self.subroutine.clone() else {
+            let snam_empty = matches!(
+                self.record.get_field("SNAM"),
+                Some(EpicsValue::String(s)) if s.is_empty()
+            );
+            if kind == SubroutineKind::ASub && snam_empty {
+                return Ok(0);
+            }
+            recgbl::rec_gbl_set_sevr(
+                &mut self.common,
+                alarm_status::BAD_SUB_ALARM,
+                AlarmSeverity::Invalid,
+            );
+            return Ok(match kind {
+                SubroutineKind::ASub => S_DB_BAD_SUB,
+                SubroutineKind::Sub => 0,
+            });
+        };
+        // C `do_sub` returns the subroutine's `long` status.
+        let status = sub_fn(&mut *self.record)?;
 
         // A negative status raises SOFT_ALARM at the record's BRSV severity
         // (C `do_sub`: `if (status < 0) recGblSetSevr(SOFT_ALARM,
@@ -3806,7 +3897,7 @@ impl RecordInstance {
                 .map(|f| AlarmSeverity::from_u16(f as u16))
                 .unwrap_or(AlarmSeverity::NoAlarm);
             recgbl::rec_gbl_set_sevr(&mut self.common, alarm_status::SOFT_ALARM, brsv);
-        } else if self.record.record_type() == "aSub" {
+        } else if kind == SubroutineKind::ASub {
             // C `aSubRecord.c::do_sub` (469-470): a subroutine that ran and
             // returned `>= 0` DEFINES the record — `else prec->udf = FALSE`.
             // aSub opts out of the framework's per-cycle blanket UDF re-derive
@@ -3878,7 +3969,11 @@ impl RecordInstance {
         let force_fields = self.record.force_posted_fields();
         // TAKE — this also clears the state it answers from (C's
         // `pcalc->newm = 0`), which is why this loop may run only once per cycle.
-        let cycle_posted = self.record.take_cycle_posted_fields();
+        let mut cycle_posted = self.record.take_cycle_posted_fields();
+        // The record-lifetime sibling: C's `firstCalcPosted == 0` term, which
+        // iocInit's per-cycle drain must not be able to eat. Merged here so
+        // both reach the same branch with the same mask mapping.
+        cycle_posted.extend(self.record.take_first_monitor_cycle());
         let log_swept = self.record.log_swept_fields();
         // C change-detects nothing about these fields; only the record's own
         // per-cycle mark may post them (aCalcout AA..LL — no PAA..PLL previous
@@ -4221,7 +4316,7 @@ impl RecordInstance {
                 if changed {
                     if name == "VAL" {
                         if let Some(f) = val.to_f64() {
-                            self.put_coerced("MLST", f);
+                            self.put_coerced("MLST", EpicsValue::Double(f));
                             self.common.mlst = Some(f);
                         }
                     }
@@ -4391,15 +4486,24 @@ impl RecordInstance {
         Ok((ProcessSnapshot { changed_fields }, alarm_posts))
     }
 
-    /// Put a f64 value into a record field, coercing to the field's native type.
-    pub(crate) fn put_coerced(&mut self, field: &str, val: f64) {
-        use crate::types::EpicsValue;
+    /// **The single owner of "write a value into a record field in the type
+    /// that field stores"** — a `put_field` arm binds ONE variant and silently
+    /// drops the rest, and the trackers this writes differ in type per record:
+    /// C declares LALM/ALST/MLST with the record's VAL type, `DBF_INT64` on
+    /// int64in/int64out (`int64inRecord.dbd.pod:233-243`), `DBF_LONG` on
+    /// longin/longout, `DBF_DOUBLE` elsewhere.
+    ///
+    /// Takes the value in the CALLER's domain rather than an `f64`: the alarm
+    /// ladder's `alev` is an `epicsInt64` on the int64 records and going
+    /// through a double would have rounded the very threshold LALM exists to
+    /// remember.
+    pub(crate) fn put_coerced(&mut self, field: &str, val: EpicsValue) {
         let target_type = self
             .record
             .get_field(field)
             .map(|v| v.db_field_type())
             .unwrap_or(crate::types::DbFieldType::Double);
-        let coerced = EpicsValue::Double(val).convert_to(target_type);
+        let coerced = val.convert_to(target_type);
         let _ = self.record.put_field(field, coerced);
     }
 
@@ -4411,26 +4515,10 @@ impl RecordInstance {
     /// MDEL/ADEL (e.g. motor) default to deadband=0 (any actual
     /// change triggers).
     ///
-    /// Delegates per-axis deadband comparison to the free function
-    /// [`check_deadband`] below — see that function's docstring for
-    /// the four-quadrant NaN/infinity rule mirroring C
-    /// `recGblCheckDeadband` (recGbl.c:345-370).
-    ///
-    /// **C-parity design note**: the Rust port uses `NaN` as the
-    /// "never posted" sentinel for `MLST`/`ALST`. C achieves the
-    /// same first-publish guarantee by allocating MLST/ALST in
-    /// BSS-zeroed storage with a value of 0.0 that the C code is
-    /// allowed to match against — but the first observed value is
-    /// not necessarily 0.0, and the C rule "MLST==0 means never
-    /// posted" relies on the deadband comparison `abs(val - 0.0)`
-    /// firing on any non-zero first value. NaN is strictly more
-    /// correct for the Rust port because a legitimate first
-    /// `val=0.0` still fires on `NaN.is_nan() → true`. This
-    /// sentinel-as-design is intentional, documented inside
-    /// [`check_deadband`] (the `oldval.is_nan() → return true` short
-    /// circuit). It is NOT a deviation inherited from an earlier
-    /// silent compromise — `record_tests.rs::deadband_*` pins both
-    /// the NaN-sentinel behaviour and the C four-quadrant transitions.
+    /// Delegates the comparison to the free function [`check_deadband`]
+    /// below, which ports C `recGblCheckDeadband` (recGbl.c:345-370).
+    /// `None` there is "this record type carries no MLST/ALST cell and
+    /// nothing has been posted yet", the only state C does not have.
     /// The single owner of the deadband field's monitor post — C `monitor()`'s
     /// `db_post_events(&prec->val, monitor_mask)`, the one post every record
     /// makes for the value it deadbands.
@@ -4580,29 +4668,30 @@ impl RecordInstance {
             .and_then(|v| v.to_f64())
             .unwrap_or(0.0);
 
-        // Use record's MLST/ALST fields if available, otherwise fall back to CommonFields
+        // Use record's MLST/ALST fields if available, otherwise fall back to
+        // CommonFields. `None` survives to `check_deadband` as the "nothing
+        // posted yet" state: record types that carry no MLST/ALST cell (sel,
+        // scalcout) have nowhere to hold a last-posted value.
         let mlst = self
             .record
             .get_field("MLST")
             .and_then(|v| v.to_f64())
-            .or(self.common.mlst)
-            .unwrap_or(f64::NAN);
+            .or(self.common.mlst);
         let alst = self
             .record
             .get_field("ALST")
             .and_then(|v| v.to_f64())
-            .or(self.common.alst)
-            .unwrap_or(f64::NAN);
+            .or(self.common.alst);
 
         let monitor_trigger = check_deadband(val, mlst, mdel);
         let archive_trigger = check_deadband(val, alst, adel);
 
         if archive_trigger {
-            self.put_coerced("ALST", val);
+            self.put_coerced("ALST", EpicsValue::Double(val));
             self.common.alst = Some(val);
         }
         if monitor_trigger {
-            self.put_coerced("MLST", val);
+            self.put_coerced("MLST", EpicsValue::Double(val));
             self.common.mlst = Some(val);
         }
 
@@ -4712,21 +4801,22 @@ impl RecordInstance {
     /// `.PHAS` (DBF_SHORT, unlisted) serves control ±32767 — the SHRT range —
     /// while `.VAL` and `.HIHI` (both listed) serve 0/0 from HOPR/LOPR.
     ///
-    /// Deliberately NOT routed here, and why:
+    /// Display (graphic) limits differ from control in one way: the `default:`
+    /// arm of `get_graphic_double` tries a LINK first (`calcRecord.c`
+    /// `get_linkNumber` → `dbGetGraphicLimits`) and only falls to `recGbl` for
+    /// a field that backs no link. A constant (unset) link has no metadata
+    /// getters, so the `dbAccess.c:216` 0/0 seed stands — measured: `CALC.A`
+    /// serves display 0/0 but control ±1e300. [`Self::graphic_link_backed_field`]
+    /// carries that per-record C knowledge.
     ///
-    /// * **display (graphic) limits.** Unlike control, the `default:` arm of
-    ///   `get_graphic_double` tries a LINK first
-    ///   (`calcRecord.c` `get_linkNumber` → `dbGetGraphicLimits`) and only
-    ///   falls to `recGbl` for a field that backs no link. A constant (unset)
-    ///   link has no metadata getters, so the `dbAccess.c:216` 0/0 seed stands
-    ///   — measured: `CALC.A` serves display 0/0 but control ±1e300. Which
-    ///   fields back links is per-record C knowledge the port models nowhere
-    ///   (no `FieldDesc` relation, no trait hook), so defaulting display to the
-    ///   type range would CREATE defects on every link-backed field.
-    /// * **units / precision.** Same link-first shape
-    ///   (`calcRecord.c` `get_units`, `get_precision`).
-    ///
-    /// Both remain a measured residue rather than a guess.
+    /// Units and precision are routed here too, and they are NOT the
+    /// `get_*_double` shape: neither has a `recGbl` range arm, so a field the
+    /// type's switch does not name keeps `dbAccess.c`'s memset — empty units,
+    /// and the precision seed. They were built into the record-level cache
+    /// until `subArray`/`sel`/`sub`/`dfanout` were measured serving `""`/`0`
+    /// against C's EGU/PREC, which is the same dual meaning the alarm leaves
+    /// had: whether a field carried the record's own value depended on a
+    /// `match rtype` in a different function.
     ///
     /// The last arm is not the same for every record type — a slot can also
     /// fall through WITHOUT delegating, keeping the seed. That fact is one bit
@@ -4739,6 +4829,51 @@ impl RecordInstance {
         // suppress it (`codec.rs` `get_limits` reads these structs ungated).
         let slots = self.record.property_support();
         let rtype = self.record.record_type();
+        let f = field.to_ascii_uppercase();
+
+        // C's `get_linkNumber` question, asked ONCE per snapshot: which of this
+        // record's own link fields, if any, supplies this field's metadata.
+        // Four of the six slots consult it — `aSubRecord.c:306-404` is the
+        // complete specimen — and control does not, because
+        // `dbGetControlLimits` has no caller anywhere in base.
+        let link_backed = self.record.link_backed_metadata_field(&f);
+        let link_meta = link_backed
+            .as_ref()
+            .and_then(|lf| self.link_backed_metadata.get(lf));
+
+        // C `get_units`'s "no case" arm — the field the rset tests for and
+        // declines to write, leaving `dbAccess.c:378`'s zeroed buffer. The
+        // record-level cache holds `EGU` for every type that supplies the
+        // slot, so this is the step that takes it back off the fields C never
+        // gives it to. See [`Self::units_from_egu`].
+        if slots.units {
+            if link_backed.is_some() {
+                // C's link arm — `dbGetUnits(&prec->inpa + n, ...)`, which
+                // writes only what the TARGET record supplies. A constant or
+                // unresolved link supplies nothing and `dbAccess.c:378`'s
+                // zeroed buffer stands.
+                snap.display.get_or_insert_with(Default::default).units = link_meta
+                    .and_then(|m| m.units.as_deref())
+                    .map(crate::types::PvString::from)
+                    .unwrap_or_default();
+            } else if !self.units_from_egu(rtype, &f) {
+                snap.display.get_or_insert_with(Default::default).units = Default::default();
+            }
+        }
+
+        // C `get_precision`'s link arm, which the port had no arm for at all.
+        // All five link-routing types seed `*pprecision = prec->prec` — the
+        // record's own PREC, already in the metadata cache — and overwrite it
+        // only when `dbGetPrecision` on the backing link SUCCEEDS
+        // (`calcRecord.c:184-203`, `aSubRecord.c:323-348`). So an unresolved or
+        // constant link means "leave the cache alone", which is the `None`
+        // arm here.
+        if slots.precision
+            && link_backed.is_some()
+            && let Some(precision) = link_meta.and_then(|m| m.precision)
+        {
+            snap.display.get_or_insert_with(Default::default).precision = precision;
+        }
 
         // C `get_control_double`'s last arm. No base record routes control
         // through a link: `dbGetControlLimits` has zero callers in all of
@@ -4769,14 +4904,14 @@ impl RecordInstance {
         // branch ahead of the recGbl call, so the three answers are: keep the
         // cache (listed on HOPR/LOPR), the link's limits, or the default arm.
         if slots.graphic_double && !Self::graphic_explicit_field(rtype, field) {
-            let (upper, lower) = if Self::graphic_link_backed_field(rtype, field) {
-                // `dbGetGraphicLimits` on a CONSTANT link writes nothing — a
-                // constant has no metadata getters — so the `dbAccess.c:216`
-                // seed stands. The port has no link metadata to consult, and a
-                // link that IS connected would be answered by the upstream
-                // record, which this routing does not model either; both land
-                // here as the seed.
-                (0.0, 0.0)
+            let (upper, lower) = if link_backed.is_some() {
+                // `dbGetGraphicLimits` on the backing link. A CONSTANT link has
+                // no metadata getters and an unresolved one has nothing cached,
+                // so in both cases the `dbAccess.c:216` 0/0 seed stands.
+                link_meta
+                    .and_then(|m| m.graphic_limits)
+                    .map(|(lower, upper)| (upper, lower))
+                    .unwrap_or((0.0, 0.0))
             } else {
                 match super::record_trait::graphic_default_arm(rtype) {
                     super::record_trait::RsetDefaultArm::RecGblRange => {
@@ -4806,10 +4941,14 @@ impl RecordInstance {
         if slots.alarm_double {
             let (hihi, high, low, lolo) = if Self::alarm_explicit_field(rtype, field) {
                 self.explicit_alarm_limits(rtype)
+            } else if link_backed.is_some() {
+                // `dbGetAlarmLimits` on the backing link; `dbAccess.c:294`'s
+                // four NaN stand when it supplies nothing.
+                link_meta
+                    .and_then(|m| m.alarm_limits)
+                    .map(|(lolo, low, high, hihi)| (hihi, high, low, lolo))
+                    .unwrap_or_else(crate::server::recgbl::rec_gbl_get_alarm_double)
             } else {
-                // The link-backed sibling arm lands on the same answer:
-                // `dbAccess.c:294` seeds four NaN, and a constant link supplies
-                // no alarm limits to overwrite them.
                 crate::server::recgbl::rec_gbl_get_alarm_double()
             };
             // The four alarm limits live on DisplayInfo because that mirrors
@@ -4904,8 +5043,16 @@ impl RecordInstance {
     /// separate field lists, so one shared predicate could only ever be right
     /// for one of them.
     fn control_explicit_field(rtype: &str, field: &str) -> bool {
-        // The two types that list nothing the cache can answer, VAL included.
-        if matches!(rtype, "aSub" | "seq" | "bo") {
+        // The types that list nothing the cache can answer, VAL included.
+        //
+        // `tableRecord.c:795-810` and `mcaRecord.c:929-943` are the same
+        // shape as `aSub`: a small named set (table's six user coordinates
+        // `AX`..`Z`, mca's dead `BPTR` arm) and `recGblGetControlDouble` for
+        // everything else — VAL and the alarm bands included. Both named sets
+        // answer a literal rather than the record's HOPR/LOPR, so they come
+        // from [`Record::field_metadata_override`] and nothing here keeps the
+        // cache.
+        if matches!(rtype, "aSub" | "seq" | "bo" | "table" | "mca") {
             return false;
         }
         if crate::server::database::is_value_field(field) {
@@ -4943,7 +5090,10 @@ impl RecordInstance {
     /// `aiRecord.c:293`, `aoRecord.c:365`, `calcRecord.c:258`,
     /// `calcoutRecord.c`, `dfanoutRecord.c:216`, `int64inRecord.c:235`,
     /// `int64outRecord.c`, `longinRecord.c`, `longoutRecord.c`,
-    /// `selRecord.c:222`, `subRecord.c:236`.
+    /// `selRecord.c:241`. `subRecord.c:294-317` reaches the same NaN for a
+    /// band field without that shape: it tries `get_linkNumber` first, and only
+    /// a field that is neither VAL nor an `A`..`U`/`INPA`..`INPU` slot falls
+    /// through to `recGblGetAlarmDouble` (`:313-314`).
     ///
     /// So `.HIHI` serves VAL's *control* limits but NOT VAL's *alarm* limits —
     /// the band fields' four alarm limits are the recGbl NaN. Routing both
@@ -4990,7 +5140,7 @@ impl RecordInstance {
     ///
     /// * base analog (`aiRecord.c:244-266`, `aoRecord.c:316-339`,
     ///   `calcRecord.c:187-212`, `calcoutRecord.c:452-484`,
-    ///   `subRecord.c:222-247`, `selRecord.c:181-201`,
+    ///   `subRecord.c:242-270`, `selRecord.c:181-201`,
     ///   `dfanoutRecord.c:181-195`, `longinRecord.c:190-204`,
     ///   `longoutRecord.c`, `int64inRecord.c:196-210`, `int64outRecord.c`):
     ///   the eight.
@@ -5020,7 +5170,13 @@ impl RecordInstance {
         //
         // Measured: `SEQ.VAL` served display 0/0 — the empty VAL cache — where
         // C serves the DBF_LONG range.
-        if matches!(rtype, "seq" | "aSub") {
+        //
+        // `tableRecord.c:778-792` and `mcaRecord.c:910-927` key on a named set
+        // too — table's `AX`..`Z` window, mca's `DTIM`/`IDTIM` percent scale
+        // and dead `BPTR` arm — and hand every other field, VAL included, to
+        // `recGblGetGraphicDouble`. Both named sets answer literals through
+        // [`Record::field_metadata_override`], so neither type keeps the cache.
+        if matches!(rtype, "seq" | "aSub" | "table" | "mca") {
             return false;
         }
         if crate::server::database::is_value_field(field) {
@@ -5028,7 +5184,11 @@ impl RecordInstance {
         }
         let f = field.to_ascii_uppercase();
         let bands: &[&str] = match rtype {
-            "acalcout" | "scalcout" => &["HIHI", "HIGH", "LOW", "LOLO"],
+            "acalcout" | "scalcout" | "epid" => &["HIHI", "HIGH", "LOW", "LOLO"],
+            // `swaitRecord.c:597-606` is a bare `pfield == &pwait->val` test,
+            // so its `ALST`/`MLST` take `recGblGetGraphicDouble` — and swait
+            // has no HIHI/HIGH/LOW/LOLO to ask about.
+            "swait" => &[],
             _ => &["HIHI", "HIGH", "LOW", "LOLO", "LALM", "ALST", "MLST"],
         };
         if bands.contains(&f.as_str()) {
@@ -5045,46 +5205,10 @@ impl RecordInstance {
                 Self::calc_arg_field(&f, 12)
                     || matches!(f.as_bytes(), [b'P', c] if c.is_ascii_uppercase() && *c <= b'L')
             }
-            _ => false,
-        }
-    }
-
-    /// The fields whose C `get_graphic_double` routes through a LINK —
-    /// `dbGetGraphicLimits` on the link that backs the field, not the field's
-    /// own type range.
-    ///
-    /// This is the one thing display needs that control never did:
-    /// `dbGetControlLimits` has zero callers in all of base, so the control
-    /// arm had no link branch to model. Graphic does, and it is what makes the
-    /// display default arm NOT a straight flip to the type range.
-    ///
-    /// A link left unset is a CONSTANT link, which supplies no metadata
-    /// getters, so `dbGetGraphicLimits` writes nothing and the
-    /// `dbAccess.c:216` `(0.0, 0.0)` seed stands — measured: `CALC.A` serves
-    /// display 0/0 where its DBF_DOUBLE type range would be ±1e300, while
-    /// `CALC.PHAS` (no link) serves the DBF_SHORT range ±32767.
-    ///
-    /// Four types, both by mechanical index test:
-    /// * `calc`/`calcout`/`sub` — `get_linkNumber` (`calcRecord.c:161-167`,
-    ///   `calcoutRecord.c:417-423`, `subRecord.c:198-204`): `A`..`A+NARGS` and
-    ///   `LA`..`LA+NARGS`, both onto `&prec->inpa + n`. calc/calcout use
-    ///   `CALCPERFORM_NARGS` (21); `sub` uses `INP_ARG_MAX`
-    ///   (`subRecord.c:89`), also 21.
-    /// * `seq` — `seqRecord.c:322-338`: field offset from `DLY0` with
-    ///   `offset & 3 == 2` is `DOn`, routed through `get_dol(prec, offset)`.
-    ///
-    /// `sel` names its args the same way and is deliberately NOT here: its
-    /// rset lists them explicitly on HOPR/LOPR and calls `dbGetGraphicLimits`
-    /// nowhere.
-    fn graphic_link_backed_field(rtype: &str, field: &str) -> bool {
-        let f = field.to_ascii_uppercase();
-        match rtype {
-            "calc" | "calcout" | "sub" => Self::calc_arg_field(&f, 21),
-            // DLY0/DOL0/DO0/LNK0, DLY1/... — DOn is offset 2 of each group of
-            // four, i.e. the `DO` prefix over the same 0-F suffix set.
-            "seq" => {
-                matches!(f.as_bytes(), [b'D', b'O', c] if c.is_ascii_digit() || (b'A'..=b'F').contains(c))
-            }
+            // `epidRecord.c:238-248` names CVAL alongside VAL and the four
+            // bands — the same list its `get_control_double` (`:263-273`) has
+            // and this predicate did not.
+            "epid" => f == "CVAL",
             _ => false,
         }
     }
@@ -5116,12 +5240,12 @@ impl RecordInstance {
 
     /// Notify subscribers from a snapshot (call outside lock).
     /// Each entry carries its own posting mask: only subscribers whose
-    /// mask intersects that field's mask are notified, and the
-    /// delivered [`MonitorEvent`] reports exactly that field's classes
-    /// (C `db_post_events(prec, &field, mask)` per-field granularity).
+    /// mask intersects that field's mask are notified, and the delivered
+    /// [`MonitorEvent`] reports that intersection — C
+    /// `db_post_events(prec, &field, mask)` per-field granularity, then
+    /// `pLog->mask = caEventMask & pevent->select` per subscriber.
     pub fn notify_from_snapshot(&self, snapshot: &ProcessSnapshot) {
         use crate::server::database::filters::FilteredMonitorEvent;
-        use crate::server::recgbl::EventMask;
 
         // Same ambient-origin inheritance as `notify_field_with_origin`:
         // a process cycle driven by an in-process writer's put tags its
@@ -5145,14 +5269,16 @@ impl RecordInstance {
                     if !sub.active {
                         continue;
                     }
-                    let sub_mask = EventMask::from_bits(sub.mask);
-                    // Only send when posting mask intersects subscriber mask.
-                    // Empty posting mask means nothing changed — skip.
-                    if !posting_mask.is_empty() && sub_mask.intersects(posting_mask) {
+                    // Gate and narrow in one step through
+                    // `Subscriber::delivered_mask`, which owns C's
+                    // twice-used `caEventMask & pevent->select`. An empty
+                    // posting mask means nothing changed and ands to zero,
+                    // so it skips there rather than needing a check here.
+                    if let Some(mask) = sub.delivered_mask(posting_mask) {
                         let event = MonitorEvent {
                             snapshot: mon_snap.clone(),
                             origin,
-                            mask: posting_mask,
+                            mask,
                         };
                         // Server-side filter chain (3.15.7). Empty chain
                         // is identity, so no behaviour change for the
@@ -5243,8 +5369,9 @@ impl RecordInstance {
                     if !sub.active {
                         continue;
                     }
-                    let sub_mask = crate::server::recgbl::EventMask::from_bits(sub.mask);
-                    if mask.is_empty() || sub_mask.intersects(mask) {
+                    // Same single owner as the snapshot path: gate and
+                    // narrow are one operation (C `dbEvent.c:896-900`).
+                    if let Some(mask) = sub.delivered_mask(mask) {
                         let event = MonitorEvent {
                             snapshot: mon_snap.clone(),
                             origin,
@@ -5409,50 +5536,50 @@ impl RecordInstance {
     }
 }
 
-/// C `recGblCheckDeadband` parity (recGbl.c:345-370). The four branches
-/// the C path enumerates:
+/// C `recGblCheckDeadband` (recGbl.c:345-370), spelled as C spells it:
 ///
-/// 1. Both `newval` and `oldval` finite: `delta = |old - new|`, fire when
-///    `delta > deadband`.
-/// 2. Exactly one of {newval, oldval} is NaN, the other not — OR exactly
-///    one is +/-inf, the other not: `delta = +inf`, always fires.
-/// 3. Both infinite with opposite signs: `delta = +inf`, always fires.
-/// 4. Otherwise (e.g. both NaN, both same-signed infinity): no fire.
+/// ```c
+/// double delta = 0;
+/// if (finite(newval) && finite(*poldval)) {
+///     delta = *poldval - newval;
+///     if (delta < 0.0) delta = -delta;
+/// }
+/// else if (!isnan(newval) != !isnan(*poldval) ||
+///          !isinf(newval) != !isinf(*poldval)) delta = epicsINF;
+/// else if (isinf(newval) && newval != *poldval) delta = epicsINF;
+/// if (delta > deadband) { *monitor_mask |= add_mask; *poldval = newval; }
+/// ```
 ///
-/// `oldval = NaN` is treated as "never posted" and fires (matches the
-/// `mlst.is_nan() → trigger` short-circuit the Rust port already had).
-/// `deadband < 0` fires unconditionally (matches `delta > deadband`
-/// with a negative deadband — same effect on every numeric value).
-pub(crate) fn check_deadband(newval: f64, oldval: f64, deadband: f64) -> bool {
-    // Fire unconditionally when no prior posting has happened. C achieves
-    // the same effect through the field being default-initialised to a
-    // sentinel; Rust uses NaN-as-sentinel.
-    if oldval.is_nan() {
+/// The `delta = 0` initialiser is load-bearing: the pairs no branch matches
+/// — both NaN, or two same-signed infinities — reach `0 > deadband`, so they
+/// fire only for a negative deadband and otherwise leave `*poldval` alone.
+/// That is why the whole rule has to stay a single `delta > deadband` rather
+/// than a chain of early returns, and why NaN cannot be read as a marker
+/// here: C compares a NaN `*poldval` against a NaN `newval` by these rules
+/// and finds them unchanged. `dbnd.c parse_ok` relies on exactly that when it
+/// seeds its own `last` to `epicsNAN`.
+///
+/// `oldval` is `None` for the record types that carry no MLST/ALST cell to
+/// hold a last-posted value; nothing was posted, so the first post is
+/// unconditional. C has no such state — its MLST is a plain double the record
+/// type initialises (0 for `calc` and `sel`, `prec->val` for `ai`,
+/// aiRecord.c:129-130).
+pub(crate) fn check_deadband(newval: f64, oldval: Option<f64>, deadband: f64) -> bool {
+    let Some(oldval) = oldval else {
         return true;
-    }
-    // Negative deadband short-circuits — any value passes.
-    if deadband < 0.0 {
-        return true;
-    }
-    let new_finite = newval.is_finite();
-    let old_finite = oldval.is_finite();
-    if new_finite && old_finite {
-        return (newval - oldval).abs() > deadband;
-    }
-    // From here on, at least one of the two is not finite. We've already
-    // ruled out oldval=NaN above, so any newval=NaN here is the "newval
-    // went NaN while oldval was finite/inf" case — must fire (C case 2).
-    if newval.is_nan() {
-        return true;
-    }
-    // Exactly one infinite, the other finite: C case 2 → fire.
-    if new_finite != old_finite {
-        return true;
-    }
-    // Both infinite. Opposite signs → fire (C case 3); same sign → no
-    // fire (C path leaves delta=0 and the `delta > deadband` check fails
-    // for any non-negative deadband).
-    newval != oldval
+    };
+    let delta = if newval.is_finite() && oldval.is_finite() {
+        (oldval - newval).abs()
+    } else if newval.is_nan() != oldval.is_nan() || newval.is_infinite() != oldval.is_infinite() {
+        // One is NaN or +/-inf and the other is not.
+        f64::INFINITY
+    } else if newval.is_infinite() && newval != oldval {
+        // One is +inf, the other -inf.
+        f64::INFINITY
+    } else {
+        0.0
+    };
+    delta > deadband
 }
 
 #[cfg(test)]
@@ -6094,7 +6221,7 @@ mod metadata_cache_tests {
     }
 
     /// R19-41: every snapshot carries the mask of which properties the
-    /// channel SUPPLIES — C's `rset` slots (`dbAccess.c:336-430` clears the
+    /// channel SUPPLIES — C's `rset` slots (`dbAccess.c:336-427` clears the
     /// option bit of each NULL slot) narrowed to the addressed field. One
     /// case per gate boundary; the three record types are the ones measured
     /// against pvxs, which marks none of these leaves.
@@ -7243,71 +7370,92 @@ mod aftc_filter_tests {
 mod check_deadband_tests {
     use super::check_deadband;
 
-    /// Sentinel: `oldval=NaN` means "no prior posting", always fire.
+    const NAN: f64 = f64::NAN;
+    const INF: f64 = f64::INFINITY;
+
+    /// C's own test for this function, transcribed:
+    /// `modules/database/test/ioc/db/recGblCheckDeadbandTest.c` runs all 19
+    /// (oldval, newval) pairs it can build from {below-band, above-band,
+    /// unchanged, -0.0, NaN, +inf, -inf} against deadbands -1, 0 and 1.5, and
+    /// carries the expected mask for each of the 57 cells. Transcribing the
+    /// table rather than writing cases per story is what keeps the pairs no C
+    /// branch matches — `(NaN, NaN)` and same-signed infinity — from being
+    /// dropped, since they are exactly the ones a reader is tempted to fold
+    /// into "not comparable, so post".
     #[test]
-    fn nan_old_value_fires() {
-        assert!(check_deadband(0.0, f64::NAN, 1.0));
-        assert!(check_deadband(f64::NAN, f64::NAN, 1.0));
+    fn matches_the_c_recgblcheckdeadband_truth_table() {
+        // t_SetValues: [oldval, newval]
+        let pairs: [(f64, f64); 19] = [
+            (1.0, 2.0),
+            (0.0, 2.0),
+            (0.0, 0.0),
+            (-0.0, 0.0),
+            (1.0, NAN),
+            (1.0, INF),
+            (1.0, -INF),
+            (NAN, 1.0),
+            (NAN, NAN),
+            (NAN, INF),
+            (NAN, -INF),
+            (INF, 1.0),
+            (INF, NAN),
+            (INF, INF),
+            (INF, -INF),
+            (-INF, 1.0),
+            (-INF, NAN),
+            (-INF, INF),
+            (-INF, -INF),
+        ];
+        // t_ExpectedUpdates, one row per deadband in t_Deadband.
+        let expected: [(f64, [bool; 19]); 3] = [
+            (
+                -1.0,
+                [
+                    true, true, true, true, true, true, true, true, true, true, true, true, true,
+                    true, true, true, true, true, true,
+                ],
+            ),
+            (
+                0.0,
+                [
+                    true, true, false, false, true, true, true, true, false, true, true, true,
+                    true, false, true, true, true, true, false,
+                ],
+            ),
+            (
+                1.5,
+                [
+                    false, true, false, false, true, true, true, true, false, true, true, true,
+                    true, false, true, true, true, true, false,
+                ],
+            ),
+        ];
+
+        for (deadband, row) in expected {
+            for (i, ((oldval, newval), want)) in pairs.iter().zip(row).enumerate() {
+                assert_eq!(
+                    check_deadband(*newval, Some(*oldval), deadband),
+                    want,
+                    "C pattern {i}: deadband={deadband} oldval={oldval} newval={newval}"
+                );
+            }
+        }
     }
 
-    /// C path: `delta > deadband` with both finite. delta within deadband
-    /// must NOT fire.
+    /// The port-only state: a record type with no MLST/ALST cell has posted
+    /// nothing, so the first comparison has no baseline and must fire whatever
+    /// the value and the deadband are — including the value C's table says
+    /// would not fire against an equal baseline.
     #[test]
-    fn within_finite_deadband_does_not_fire() {
-        assert!(!check_deadband(10.0, 10.5, 1.0));
-        assert!(!check_deadband(10.0, 9.5, 1.0));
-        // Boundary: `delta == deadband` is NOT strictly greater.
-        assert!(!check_deadband(10.0, 11.0, 1.0));
-    }
-
-    /// `delta > deadband` with both finite, beyond → fire.
-    #[test]
-    fn beyond_finite_deadband_fires() {
-        assert!(check_deadband(10.0, 12.0, 1.0));
-    }
-
-    /// Negative deadband acts as "always fire" (C `delta > deadband` is
-    /// trivially true for any non-negative delta).
-    #[test]
-    fn negative_deadband_fires() {
-        assert!(check_deadband(10.0, 10.0, -1.0));
-    }
-
-    /// C parity bug fix (recGbl.c:355-358): exactly one of {newval,
-    /// oldval} is NaN — fire. Rust port previously short-circuited only
-    /// on `oldval=NaN`; `newval=NaN` with `oldval=finite` produced
-    /// `(NaN - finite).abs() = NaN`, `NaN > deadband = false` →
-    /// silently dropped the NaN transition. End effect: a record that
-    /// went UDF (e.g. divide-by-zero in calc) never posted the change
-    /// to monitors, leaving every camonitor seeing the last valid value.
-    #[test]
-    fn newval_nan_with_finite_oldval_fires() {
-        assert!(check_deadband(f64::NAN, 10.0, 1.0));
-    }
-
-    /// C path case 2 (recGbl.c:355): exactly one infinite, the other
-    /// finite — fire.
-    #[test]
-    fn one_finite_one_infinite_fires() {
-        assert!(check_deadband(f64::INFINITY, 10.0, 1.0));
-        assert!(check_deadband(10.0, f64::INFINITY, 1.0));
-        assert!(check_deadband(f64::NEG_INFINITY, 10.0, 1.0));
-    }
-
-    /// C path case 3 (recGbl.c:360-362): both infinite with opposite
-    /// signs — fire.
-    #[test]
-    fn opposite_signed_infinities_fire() {
-        assert!(check_deadband(f64::INFINITY, f64::NEG_INFINITY, 1.0));
-        assert!(check_deadband(f64::NEG_INFINITY, f64::INFINITY, 1.0));
-    }
-
-    /// Same-signed infinity → no fire (C path leaves `delta = 0`,
-    /// `0 > deadband` is false for any non-negative deadband).
-    #[test]
-    fn same_signed_infinity_does_not_fire() {
-        assert!(!check_deadband(f64::INFINITY, f64::INFINITY, 1.0));
-        assert!(!check_deadband(f64::NEG_INFINITY, f64::NEG_INFINITY, 1.0));
+    fn never_posted_fires_regardless_of_value_or_deadband() {
+        for value in [0.0, 1.0, NAN, INF, -INF] {
+            for deadband in [-1.0, 0.0, 1.5] {
+                assert!(
+                    check_deadband(value, None, deadband),
+                    "never-posted must fire: value={value} deadband={deadband}"
+                );
+            }
+        }
     }
 }
 

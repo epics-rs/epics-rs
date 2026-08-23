@@ -96,6 +96,12 @@ impl Record for MbboDirectRecord {
         "mbboDirect"
     }
 
+    /// C `mbboDirectRecord.c:176-190`: the scalar `dbGetLink(&prec->dol, ..., &prec->val, 0, 0)`
+    /// under `dol.type != CONSTANT && omsl == menuOmslclosed_loop`.
+    fn fetches_dol_closed_loop(&self) -> bool {
+        true
+    }
+
     /// C `devMbboDirectSoftRaw::write_mbbo` (`devMbboDirectSoftRaw.c:40-46`):
     /// `data = prec->rval & prec->mask; dbPutLink(&prec->out, DBR_ULONG, &data,
     /// 1)`, with the same dset-init mask (`nobt == 0` ⇒ `0xffffffff`, then
@@ -115,6 +121,42 @@ impl Record for MbboDirectRecord {
 
     fn set_device_did_compute(&mut self, did: bool) {
         self.skip_convert = did;
+    }
+
+    /// C `mbboDirectRecord.c::special` (263-269), the pre-store pass:
+    ///
+    /// ```c
+    ///     if(after==0 && fieldIndex >= mbboDirectRecordB0
+    ///                 && fieldIndex <= mbboDirectRecordB1F) {
+    ///         if(prec->omsl == menuOmslclosed_loop) {
+    ///             return S_db_noMod;
+    ///         }
+    ///     }
+    /// ```
+    ///
+    /// `dbPut` propagates a non-zero pass-0 status straight out before the
+    /// store (`dbAccess.c:1350-1352`), so the bit never lands and `bitsToVAL`
+    /// never runs — VAL keeps the setpoint DOL is driving. Without this a
+    /// `caput M.B3 1` on a closed-loop record moved VAL until the next process
+    /// cycle overwrote it, which is the confusion C is refusing to allow.
+    ///
+    /// Only the pass-0 arm is a refusal. The pass-1 arm (`:271-291`, the bit
+    /// into VAL plus OBIT and `convert`) is the framework's `put_field` +
+    /// `bits_to_val`, which is why this hook has nothing to do when `after`.
+    fn special(&mut self, field: &str, after: bool) -> CaResult<()> {
+        if !after && self.omsl == 1 && BIT_NAMES.contains(&field) {
+            return Err(CaError::ReadOnlyField(field.to_string()));
+        }
+        Ok(())
+    }
+
+    /// C `mbboDirectRecord.c:184-186` — a failed closed-loop DOL read takes
+    /// `goto CONTINUE`, jumping past `prec->udf = FALSE`, `bitsFromVAL(prec)`,
+    /// `convert(prec)` and the pre-output `recGblGetTimeStampSimm`. Suppressing
+    /// the convert holds RVAL and the B0..B1F bit fields at what the last
+    /// successful read produced.
+    fn closed_loop_dol_read_failed(&mut self) {
+        self.skip_convert = true;
     }
 
     /// C `mbboDirectRecord.c:190-202` — the `else if (prec->udf) goto CONTINUE`
@@ -238,38 +280,47 @@ impl Record for MbboDirectRecord {
         Ok(())
     }
 
-    /// epics-base PR `dabcf89` (2021): when the record initialises
-    /// with no VAL set (UDF=true) but the operator populated B0..B1F
-    /// bits in the .db file, fold those bits into VAL and clear UDF.
-    /// Otherwise (VAL was set explicitly), derive bits from VAL.
+    /// epics-base PR `dabcf89` (2021), C `mbboDirectRecord.c:144-157`: when
+    /// the record initialises with no VAL set (UDF=true) but the operator
+    /// populated B0..B1F bits in the .db file, fold those bits into VAL and
+    /// clear UDF.
+    ///
+    /// The `!prec->udf` arm of the same `if` — `bitsFromVAL(prec)` — is NOT
+    /// here: it must observe the constant-DOL seed, and the seed owner runs
+    /// after this hook. It lives in [`Self::seed_deadband_tracking`], the
+    /// post-seed tail, where C's own `bitsFromVAL` sits relative to the seed.
     fn post_init_finalize_undef(&mut self, common_udf: &mut bool) -> CaResult<()> {
-        // C `mbboDirectRecord.c::init_record` applies a constant DOL to VAL
-        // once via `recGblInitConstantLink(&prec->dol, DBF_LONG, &prec->val)`,
-        // which clears UDF on success; the bit fields B0..B1F are then
-        // derived from VAL. The framework gate (`processing.rs`) excludes a
-        // constant DOL from the per-cycle closed-loop fetch (C
-        // `!dbLinkIsConstant`), so the constant must be seeded here. Clearing
-        // `common_udf` both matches C (recGblInitConstantLink → udf=FALSE)
-        // and routes the finalize below through `val_to_bits`, so the
-        // observable bit fields reflect the seeded VAL.
-        if let crate::server::record::ParsedLink::Constant(s) =
-            crate::server::record::parse_link_v2(&self.dol)
-        {
-            if let Ok(v) = s.trim().parse::<f64>() {
-                self.val = v as u32;
-                *common_udf = false;
-            }
-        }
-        if !*common_udf {
-            self.val_to_bits();
-        } else {
-            let any_bit_set = self.bits.iter().any(|&b| b != 0);
-            if any_bit_set {
-                self.bits_to_val();
-                *common_udf = false;
-            }
+        if *common_udf && self.bits.iter().any(|&b| b != 0) {
+            self.bits_to_val();
+            *common_udf = false;
         }
         Ok(())
+    }
+
+    /// C `mbboDirectRecord.c:119-120`:
+    /// `if (recGblInitConstantLink(&prec->dol, DBF_ULONG, &prec->val))
+    ///      prec->udf = FALSE;`
+    /// The framework gate (`processing.rs`) excludes a constant DOL from the
+    /// per-cycle closed-loop fetch (C `!dbLinkIsConstant`), so the init-seed
+    /// owner is the only place a constant DOL can reach VAL.
+    fn constant_init_links(&self) -> Vec<crate::server::record::ConstantInitLink> {
+        vec![crate::server::record::ConstantInitLink::dol_to_val(
+            "DOL", "VAL",
+        )]
+    }
+
+    /// C `mbboDirectRecord.c:142-143,160-162` — the init tail, run right after
+    /// the constant load: `bitsFromVAL(prec)` re-derives B0..B1F from whatever
+    /// VAL now holds, then `mlst = val; oraw = rval; orbv = rbv`. C runs
+    /// `bitsFromVAL` only on the `!udf` arm, but every path that leaves UDF set
+    /// also leaves VAL and the bits both zero, so the unconditional form is the
+    /// same derivation. No `convert()`: C does not translate VAL to RVAL at
+    /// init on this record.
+    fn seed_deadband_tracking(&mut self) {
+        self.val_to_bits();
+        self.mlst = self.val;
+        self.oraw = self.rval;
+        self.orbv = self.rbv;
     }
 
     /// C `mbboDirectRecord.c::process` (line 198) calls `convert(prec)`
@@ -280,19 +331,25 @@ impl Record for MbboDirectRecord {
     /// `soft_channel_skips_convert` — the soft-channel convert-skip
     /// applies only to INPUT records.
     fn process(&mut self) -> CaResult<ProcessOutcome> {
-        // C `mbboDirectRecord.c::convert` — RVAL = (VAL << SHFT) & MASK on a
-        // 32-bit epicsUInt32 (RVAL/MASK are DBF_ULONG) — unless a device
-        // readback (`apply_raw_readback`) already set both RVAL and VAL, in
-        // which case skip the forward convert that would recompute RVAL from
-        // VAL and discard it. One-shot (C `processMbboDirect` readback returns
-        // without re-converting; a normal process always converts).
+        // C `mbboDirectRecord.c:342-349` is the whole convert:
+        //
+        //     prec->rval = prec->val;
+        //     if (prec->shft > 0) prec->rval <<= prec->shft;
+        //
+        // MASK is not read. It belongs to device support, which positions it
+        // (`prec->mask <<= prec->shft`, devMbboDirectSoftRaw.c:31) and applies
+        // it on the way OUT (`data = prec->rval & prec->mask`, `:40`) — so the
+        // record's RVAL stays the full shifted value and only the wire word is
+        // trimmed. Masking here with the record's own UNSHIFTED NOBT mask
+        // cleared exactly the bits the shift had just placed.
+        //
+        // Skipped when a device readback (`apply_raw_readback`) already set
+        // both RVAL and VAL, and when a failed closed-loop DOL read took C's
+        // `goto CONTINUE` (`closed_loop_dol_read_failed`).
         if !self.skip_convert {
             let mut raw = self.val;
             if self.shft > 0 {
                 raw = raw.wrapping_shl(self.shft as u32);
-            }
-            if self.mask != 0 {
-                raw &= self.mask;
             }
             self.rval = raw;
         }

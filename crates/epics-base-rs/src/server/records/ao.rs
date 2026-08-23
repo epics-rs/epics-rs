@@ -335,6 +335,15 @@ impl Record for AoRecord {
         "ao"
     }
 
+    /// C `aoRecord.c:181-184`: the `!dbLinkIsConstant(&prec->dol) && omsl ==
+    /// menuOmslclosed_loop` gate calls `fetch_value` (`:433-455`), which unlike
+    /// its siblings reads into a LOCAL — `dbGetLink(&prec->dol, DBR_DOUBLE,
+    /// pvalue, 0, 0)` at `:444` — and adds VAL when `OIF = Incremental`
+    /// (`:452-453`).
+    fn fetches_dol_closed_loop(&self) -> bool {
+        true
+    }
+
     /// `aoRecord.c:329-350` `get_control_double` lists `OVAL` and `PVAL`
     /// alongside `VAL` and the alarm bands, all answering the record's
     /// `DRVH`/`DRVL` (not `HOPR`/`LOPR` — `ao` is the output record). The
@@ -449,6 +458,27 @@ impl Record for AoRecord {
 
     fn set_device_did_compute(&mut self, did_compute: bool) {
         self.skip_convert = did_compute;
+    }
+
+    /// C `aoRecord.c` closed-loop DOL failure, both halves:
+    ///
+    /// ```c
+    /// prec->val = prec->pval;                       /* fetch_value, :441 */
+    /// status = dbGetLink(&prec->dol, DBR_DOUBLE, pvalue, 0, 0);
+    /// if (status) { recGblSetSevr(prec, LINK_ALARM, INVALID_ALARM); return status; }
+    /// ...
+    /// if (!status) convert(prec, value);            /* process, :188 */
+    /// ```
+    ///
+    /// The revert is written before the read, so a client `caput REC.VAL` made
+    /// between cycles is discarded ("don't allow dbputs to val field") and a
+    /// failed read publishes the last actual output, not the put. Skipping
+    /// `convert` then freezes PVAL, OVAL and RVAL — with a non-zero OROC the
+    /// output ramp holds instead of taking another step toward a setpoint the
+    /// link can no longer confirm.
+    fn closed_loop_dol_read_failed(&mut self) {
+        self.val = self.pval;
+        self.skip_convert = true;
     }
 
     fn install_breaktable_registry(

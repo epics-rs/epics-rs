@@ -178,6 +178,17 @@
 //! this chain: route it through `update_scan_index` instead, or the order
 //! above stops being checkable by reading one function.
 //!
+//! The table orders the rungs against each other; it does not say what
+//! happens when one rung is taken twice. For L46 that matters, because
+//! `update_scan_index` takes L46 itself: **no caller may hold L46 when
+//! reaching it.** `PriorityInheritanceMutex` is not reentrant, so a caller
+//! that does parks on itself, and the symptom is a hung registration rather
+//! than an error. Every L46 acquisition therefore goes through
+//! [`PvDatabase::lock_registration`], which knows whether this thread already
+//! holds the gate and panics naming both ends instead of parking. The rule is
+//! C's too: `iterateRecords` (`iocInit.c:562-586`) walks an already-built
+//! database in a separate pass, holding no registration lock.
+//!
 //! ### The rule's teeth are structural, and now they cover L1 too
 //!
 //! Every guard in the list above is `!Send`. A `!Send` value held across an

@@ -426,6 +426,10 @@ struct PvDatabaseInner {
     /// holders were audited before the conversion and the only suspension
     /// points any of them had were acquisitions of `simple_pvs` and
     /// `scan_index`, both blocking now.
+    ///
+    /// Acquired ONLY through [`PvDatabase::lock_registration`], never
+    /// directly — that funnel is what turns a re-entrant take into a named
+    /// panic instead of a parked thread. See [`RegistrationGate`].
     registration_mutex: crate::runtime::sync::PriorityInheritanceMutex<()>,
     /// The IOC lifecycle phase — the port's `iocInit` boundary. See
     /// [`DbInitPhase`], [`PvDatabase::begin_load`],
@@ -523,6 +527,39 @@ struct PvDatabaseInner {
     /// with nothing at all on the read side.
     /// `doc/rtems-priority-locks-design.md` §3 row L8k.
     breaktable_registry: SnapshotCell<crate::server::cvt_bpt::BreakTableRegistry>,
+}
+
+thread_local! {
+    /// Set for exactly as long as this thread holds L46. Read only by
+    /// [`PvDatabase::lock_registration`].
+    static REGISTRATION_GATE_HELD: std::cell::Cell<Option<&'static str>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// RAII guard for L46, `PvDatabaseInner::registration_mutex`.
+///
+/// L46 is a `PriorityInheritanceMutex` and is therefore NOT reentrant: a
+/// thread that takes it twice parks on itself forever. That makes the
+/// caller-side rule a MUST, and it is the half the lock-order table in
+/// [`super::record_lock`] did not state —
+/// [`PvDatabase::update_scan_index`] is the single owner of a scan-index
+/// transition and takes L46 **itself**, so no caller may hold L46 across a
+/// call to it. Releasing early is also what C does: `iterateRecords`
+/// (`iocInit.c:562-586`) is a separate pass over an already-built database,
+/// holding no registration lock at all.
+///
+/// A violation used to surface as a hung thread, which reads as a flaky
+/// timeout and costs a bisect to attribute. This guard makes it surface as a
+/// panic naming both the holder and the re-entrant site.
+#[must_use = "L46 is released as soon as the guard is dropped"]
+pub(crate) struct RegistrationGate<'a> {
+    _guard: crate::runtime::sync::PriorityInheritanceMutexGuard<'a, ()>,
+}
+
+impl Drop for RegistrationGate<'_> {
+    fn drop(&mut self) {
+        REGISTRATION_GATE_HELD.with(|h| h.set(None));
+    }
 }
 
 /// Database of all process variables hosted by this server.
@@ -765,6 +802,35 @@ pub(crate) fn select_link_indices_ex(
 }
 
 impl PvDatabase {
+    /// Acquire L46, `registration_mutex` — the ONE acquisition site.
+    ///
+    /// `site` names the acquiring function and appears in the panic message
+    /// when the rule below is broken, so the report identifies the violator
+    /// without a debugger.
+    ///
+    /// # Panics
+    ///
+    /// If this thread already holds L46. That is not a defensive check
+    /// against an impossible input: L46 is a `PriorityInheritanceMutex`, so
+    /// the second acquisition would park the thread on itself and never
+    /// return. The panic replaces a hang, which is the worst failure shape
+    /// available — it reaches CI as a timeout, and a timeout reads as a load
+    /// flake rather than as the ordering bug it is.
+    pub(crate) fn lock_registration(&self, site: &'static str) -> RegistrationGate<'_> {
+        if let Some(holder) = REGISTRATION_GATE_HELD.with(|h| h.get()) {
+            panic!(
+                "L46 registration_mutex is not reentrant: `{site}` took it while \
+                 this thread still holds it from `{holder}`. `update_scan_index` \
+                 takes L46 itself and is the single owner of a scan-index \
+                 transition, so a caller must DROP its registration gate before \
+                 reaching it — see `RegistrationGate`."
+            );
+        }
+        let guard = self.inner.registration_mutex.lock();
+        REGISTRATION_GATE_HELD.with(|h| h.set(Some(site)));
+        RegistrationGate { _guard: guard }
+    }
+
     pub fn new() -> Self {
         Self {
             inner: Arc::new(PvDatabaseInner {
@@ -825,7 +891,7 @@ impl PvDatabase {
         // holds this gate across its whole body (registry read + map insert),
         // so taking it here closes that TOCTOU window. No `add_breaktables`
         // caller already holds the gate, so this is reentrancy-safe.
-        let _gate = self.inner.registration_mutex.lock();
+        let _gate = self.lock_registration("add_breaktables");
         if tables.is_empty() {
             return self.inner.breaktable_registry.load_full();
         }
@@ -1354,7 +1420,7 @@ impl PvDatabase {
     /// order across all add_*/remove_* methods is identical (no
     /// cross-namespace deadlock).
     pub async fn add_pv(&self, name: &str, initial: EpicsValue) -> CaResult<()> {
-        let _gate = self.inner.registration_mutex.lock();
+        let _gate = self.lock_registration("add_pv");
         self.check_name_free(name)?;
         let pv = Arc::new(ProcessVariable::new(name.to_string(), initial));
         self.inner.simple_pvs.lock().insert(name.to_string(), pv);
@@ -1415,7 +1481,7 @@ impl PvDatabase {
         access_hook: Option<crate::server::pv::AccessHook>,
         read_hook: Option<crate::server::pv::ReadHook>,
     ) -> CaResult<()> {
-        let _gate = self.inner.registration_mutex.lock();
+        let _gate = self.lock_registration("add_pv_with_hooks_full");
         self.check_name_free(name)?;
         let pv = Arc::new(ProcessVariable::new(name.to_string(), initial));
         pv.set_write_hook(write_hook);
@@ -1439,7 +1505,7 @@ impl PvDatabase {
     /// "already registered as an alias" even though its target is
     /// gone).
     pub async fn remove_simple_pv(&self, name: &str) -> Option<Arc<ProcessVariable>> {
-        let _gate = self.inner.registration_mutex.lock();
+        let _gate = self.lock_registration("remove_simple_pv");
         // Simple PVs cannot be alias targets (aliases point at
         // records), but a stale alias whose name MATCHES this PV
         // would have been rejected at add_alias time. No alias
@@ -1629,7 +1695,7 @@ impl PvDatabase {
         record: Box<dyn Record>,
         load: RecordLoad,
     ) -> CaResult<()> {
-        let _gate = self.inner.registration_mutex.lock();
+        let _gate = self.lock_registration("add_loaded_record");
         self.check_name_free(name)?;
         let mut instance = RecordInstance::new_boxed(name.to_string(), record);
         // Hand the record a cycle-free handle to its own database so it can
@@ -1782,7 +1848,7 @@ impl PvDatabase {
     /// when the `RecordInstance` is dropped — they observe `Closed` on
     /// next recv, matching the existing dbEvent cancel flow.
     pub async fn remove_record(&self, name: &str) -> bool {
-        let _gate = self.inner.registration_mutex.lock();
+        let _gate = self.lock_registration("remove_record");
         // 1) Remove from main map; keep scan + phas for scan-index cleanup.
         let removed = self.inner.records.write().remove(name);
         let Some(rec_arc) = removed else {
@@ -1880,7 +1946,7 @@ impl PvDatabase {
     /// order. Now we run the same cross-namespace `check_name_free`
     /// guard the other add_* paths use.
     pub async fn add_alias(&self, alias: &str, target: &str) -> CaResult<()> {
-        let _gate = self.inner.registration_mutex.lock();
+        let _gate = self.lock_registration("add_alias");
         if !self.inner.records.read().contains_key(target) {
             return Err(CaError::ChannelNotFound(format!(
                 "alias target '{target}' is not a registered record"

@@ -219,6 +219,14 @@ fn special_after_put(
     //   `recGblCheckSimm((dbCommon *)prec, &prec->sscn, prec->oldsimm, prec->simm);`
     // Paired with `special_before_put`'s pass 0 (`recGblSaveSimm`), and gated
     // per record type by `Record::uses_recgbl_simm_helpers`.
+    // C `subRecord.c::special` pass 1 (`:189-193`): the value is stored, so ask
+    // again — an SNAM that is still empty re-parks PACT, a real one leaves the
+    // record released by `special_before_put`. Only `enter_pact` here; C's pass 1
+    // never clears PACT, and neither may this.
+    if pact_park_field(&*instance.record, field) && instance.record.parks_pact() {
+        instance.enter_pact();
+    }
+
     Ok(if field == "SIMM" {
         instance.rec_gbl_check_simm()
     } else {
@@ -233,10 +241,120 @@ fn special_after_put(
 /// SIMM: `recGblSaveSimm` latches the outgoing simulation mode into OLDSIMM so
 /// the after-put pass can see the transition. Paired with
 /// [`special_after_put`]; every `dbPut` path in this module calls both.
-fn special_before_put(instance: &mut crate::server::record::RecordInstance, field: &str) {
+///
+/// The other pass-0 body is `subRecord.c::special`'s park release:
+/// `if (prec->snam[0] == 0 && prec->pact) { prec->pact = FALSE; prec->rpro =
+/// FALSE; }` (`subRecord.c:183-187`) — the record is parked exactly while it
+/// cannot process, so the store about to happen gets a clean slate and
+/// [`special_after_put`] re-takes the park if the NEW value still leaves the
+/// record unable to run. The record cannot reach PACT, so it answers
+/// [`Record::parks_pact`] and this performs the transition; the returned
+/// [`PactExit`] carries any put-notify the release freed.
+fn special_before_put(
+    instance: &mut crate::server::record::RecordInstance,
+    field: &str,
+) -> Option<crate::server::record::PactExit> {
     if field == "SIMM" {
         instance.rec_gbl_save_simm();
     }
+    if pact_park_field(&*instance.record, field)
+        && instance.record.parks_pact()
+        && instance.is_processing()
+    {
+        instance.common.rpro = 0;
+        return Some(instance.leave_pact());
+    }
+    None
+}
+
+/// The finalizer for the PACT release [`special_before_put`] performs.
+///
+/// Declared BEFORE the `rec.write()` guard at every put body, so Rust's
+/// reverse-declaration drop order puts the record's DATA lock down first and
+/// this second. `PvDatabase::apply_pact_exit` re-enters the record it is handed;
+/// `parking_lot::RwLock` is not reentrant, so arming the restart from inside the
+/// put's own write guard is a deadlock, not an error.
+///
+/// A guard and not a call because the release sits ABOVE the fallible tail of
+/// the put — `special_after_put`, `put_common_field`, the rejected-conversion
+/// `Err` — and C `dbNotifyCompletion` is reached from `recGblFwdLink` on EVERY
+/// path that ends the cycle. A token that never reaches the consumer is what
+/// [`PactExit`](crate::server::record::PactExit)'s `Drop` canary reports, and
+/// the put's value is lost with it.
+struct PactExitGuard<'a> {
+    db: &'a PvDatabase,
+    name: &'a str,
+    rec: &'a std::sync::Arc<parking_lot::RwLock<crate::server::record::RecordInstance>>,
+    exit: Option<crate::server::record::PactExit>,
+}
+
+impl<'a> PactExitGuard<'a> {
+    fn new(
+        db: &'a PvDatabase,
+        name: &'a str,
+        rec: &'a std::sync::Arc<parking_lot::RwLock<crate::server::record::RecordInstance>>,
+    ) -> Self {
+        PactExitGuard {
+            db,
+            name,
+            rec,
+            exit: None,
+        }
+    }
+
+    /// Take the token [`special_before_put`] produced, if it released a park.
+    fn arm(&mut self, exit: Option<crate::server::record::PactExit>) {
+        self.exit = exit;
+    }
+}
+
+impl Drop for PactExitGuard<'_> {
+    fn drop(&mut self) {
+        if let Some(exit) = self.exit.take() {
+            self.db.apply_pact_exit(self.name, self.rec, exit);
+        }
+    }
+}
+
+/// Is `field` one C marks `special(SPC_MOD)` for this record's PACT park?
+fn pact_park_field(record: &dyn crate::server::record::Record, field: &str) -> bool {
+    record
+        .pact_park_fields()
+        .iter()
+        .any(|f| f.eq_ignore_ascii_case(field))
+}
+
+/// C `special()` pass 1's re-bind: `prec->sadr = (SUBFUNCPTR)registryFunctionFind(
+/// prec->snam)` (`subRecord.c:188`, and `aSubRecord.c:557-575` under
+/// `lflg == aSubLFLG_IGNORE`). `RecordInstance::subroutine` IS `sadr`, and it was
+/// bound once at build, so a record went on calling the function its OLD name
+/// named. [`Record::is_subroutine_name_field`] already carries C's per-record
+/// gate, including aSub's LFLG one.
+///
+/// Runs after the store, so it reads the name that was just written. An empty
+/// name binds nothing, but not by returning quietly: C logs `"%s.SNAM is
+/// empty"`, sets `pact = TRUE` again and returns BEFORE the lookup
+/// (`subRecord.c:182-186`), so C keeps the previous name's binding in `sadr`
+/// while this clears it. Neither is observable — that same branch re-parks
+/// PACT, and `run_subroutine_body` treats "no binding, empty SNAM" as the
+/// no-op C does.
+fn rebind_subroutine(
+    db: &PvDatabase,
+    instance: &mut crate::server::record::RecordInstance,
+    field: &str,
+) {
+    if !instance.record.is_subroutine_name_field(field) {
+        return;
+    }
+    let name = match instance.record.get_field(field) {
+        Some(EpicsValue::String(s)) => s.as_str_lossy().into_owned(),
+        _ => return,
+    };
+    instance.subroutine = if name.is_empty() {
+        None
+    } else {
+        db.find_subroutine_named(&name)
+    };
 }
 
 /// The `recGblResetAlarms` half of a C `monitor()` that a `special()` invokes
@@ -773,6 +891,7 @@ impl PvDatabase {
             // Yields the owned outputs those tails consume. Note this is the
             // record's DATA lock coming down, not the advisory gate above.
             use crate::server::record::CommonFieldPutResult;
+            let mut pact_exit = PactExitGuard::new(self, base, &rec);
             let (common_result, special_actions) = {
                 let mut instance = rec.write();
 
@@ -824,7 +943,7 @@ impl PvDatabase {
                         CommonFieldPutResult::NoChange
                     }
                     PutRequest::Write(value) => {
-                        special_before_put(&mut instance, &field);
+                        pact_exit.arm(special_before_put(&mut instance, &field));
                         match instance.record.put_field(&field, value.clone()) {
                             Ok(()) => {
                                 instance.record.on_put(&field);
@@ -837,6 +956,7 @@ impl PvDatabase {
                                 // S_db_badField, so the status must not be dropped.
                                 let result =
                                     special_after_put(&mut instance, &field, &mut special_actions)?;
+                                rebind_subroutine(self, &mut instance, &field);
                                 // C `dbAccess.c::dbPut:1410-1411` clears ONLY
                                 // `precord->udf = FALSE` on a value-field put —
                                 // the same clear (and the same
@@ -902,6 +1022,8 @@ impl PvDatabase {
 
                 (common_result, special_actions)
             };
+            // Lock down: arm any put-notify the SNAM park release freed.
+            drop(pact_exit);
             // The record DATA lock is now down (scope ended above) before the
             // scan-index update and the `special()` link writes below, which
             // re-enter the database (they can process their target). The
@@ -1094,6 +1216,7 @@ impl PvDatabase {
             // advisory `_record_gate` still holds the processing-exclusion
             // window across the whole helper.
             use crate::server::record::CommonFieldPutResult;
+            let mut pact_exit = PactExitGuard::new(self, base, &rec);
             let (common_result, special_actions) = {
                 let mut instance = rec.write();
 
@@ -1128,7 +1251,7 @@ impl PvDatabase {
                         CommonFieldPutResult::NoChange
                     }
                     PutRequest::Write(value) => {
-                        special_before_put(&mut instance, &field);
+                        pact_exit.arm(special_before_put(&mut instance, &field));
                         match instance.record.put_field(&field, value.clone()) {
                             Ok(()) => {
                                 instance.record.on_put(&field);
@@ -1138,6 +1261,7 @@ impl PvDatabase {
                                 // `goto done` skips on a non-zero status.
                                 let result =
                                     special_after_put(&mut instance, &field, &mut special_actions)?;
+                                rebind_subroutine(self, &mut instance, &field);
                                 // C `dbAccess.c::dbPut:1411` clears ONLY `precord->udf
                                 // = FALSE` on a value-field put, and nothing else. It
                                 // does NOT touch stat/sevr: the UDF_ALARM stays until
@@ -1201,6 +1325,8 @@ impl PvDatabase {
                 // inside `dbPut`, before it returns to its caller.
                 (common_result, special_actions)
             };
+            // Lock down: arm any put-notify the SNAM park release freed.
+            drop(pact_exit);
 
             // Same scan-index owner every other `dbPut` path routes through:
             // a SCAN put and the SIMM↔SSCN swap (`recGblCheckSimm`) both move
@@ -1962,6 +2088,7 @@ impl PvDatabase {
         // guard) before the notify-process / scan-index awaits below. Yields
         // either the success `CommonFieldPutResult`, or `(error, should_process)`
         // so the notify-driven process on a rejected put runs guard-free.
+        let mut pact_exit = PactExitGuard::new(self, record_name, &rec);
         let outcome: Result<crate::server::record::CommonFieldPutResult, (CaError, bool)> = {
             let mut instance = rec.write();
 
@@ -1989,7 +2116,7 @@ impl PvDatabase {
 
                 // Pre-write special hook (C EPICS dbPutSpecial pass=0)
                 instance.record.special(&field, false)?;
-                special_before_put(&mut instance, &field);
+                pact_exit.arm(special_before_put(&mut instance, &field));
 
                 // Capture pre-put value for faac1df1 idempotent-write suppression.
                 let prev_value = instance.record.get_field(&field);
@@ -2022,6 +2149,7 @@ impl PvDatabase {
                                 // reproduces all three.
                                 let result =
                                     special_after_put(&mut instance, &field, &mut special_actions)?;
+                                rebind_subroutine(self, &mut instance, &field);
                                 // C `aSubRecord.c::special` / `subRecord.c::special`
                                 // (SPC_MOD on SNAM): the name was stored by
                                 // `put_field` above (C keeps `prec->snam`), but an
@@ -2243,6 +2371,8 @@ impl PvDatabase {
                 }
             }
         };
+        // Lock down: arm any put-notify the SNAM park release freed.
+        drop(pact_exit);
 
         let common_result = match outcome {
             Ok(cr) => cr,
@@ -2505,6 +2635,17 @@ impl PvDatabase {
             let _record_gate = self.lock_record(&canonical_base);
 
             let mut instance = rec.write();
+
+            // C `dbPutSpecial(paddr, 0)` — the pre-store pass, which
+            // `dbPut` runs on every entry path including the `dbPutField`
+            // this body models (autosave's `reboot_restore`). A non-zero
+            // status returns before the store (`dbAccess.c:1350-1352`), so a
+            // restore cannot write a field the record is currently refusing
+            // (mbboDirect B0..B1F while OMSL=closed_loop,
+            // `mbboDirectRecord.c:263-269`). The other two `dbPut` bodies in
+            // this module already ran it; this one did not.
+            instance.record.special(&field, false)?;
+
             let prev_value = instance.record.get_field(&field);
             match instance.record.put_field(&field, value.clone()) {
                 Ok(()) => {}

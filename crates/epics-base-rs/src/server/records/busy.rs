@@ -140,6 +140,44 @@ impl Record for BusyRecord {
         "busy"
     }
 
+    /// C `busyRecord.c:151-159`:
+    /// `if (prec->dol.type == CONSTANT) { unsigned short ival = 0;
+    ///      if (recGblInitConstantLink(&prec->dol, DBF_USHORT, &ival)) {
+    ///          prec->val = ival ? 1 : 0; prec->udf = FALSE; } }`
+    /// — boRecord's shape: the constant loads into a temporary and VAL takes
+    /// its BOOLEAN, so `field(DOL,"5")` leaves VAL=1.
+    fn constant_init_links(&self) -> Vec<crate::server::record::ConstantInitLink> {
+        vec![crate::server::record::ConstantInitLink::dol_to_bool_val(
+            "DOL", "VAL",
+        )]
+    }
+
+    /// C `busyRecord.c:175-179`, the last statement of `init_record`: VAL is
+    /// converted to RVAL through MASK, with the `mask == 0` arm passing VAL
+    /// through as `(epicsUInt32)prec->val` rather than zeroing RVAL. It runs
+    /// after the constant DOL load two dozen lines above it, so a
+    /// `field(DOL,"5")` busy reaches its first process with RVAL already
+    /// holding MASK.
+    fn init_record_tail(&mut self) {
+        self.convert_val_to_rval();
+    }
+
+    /// C `busyRecord.c:140-181` assigns neither `mlst` nor `lalm`, unlike
+    /// `boRecord.c:172-173` which seeds both from VAL — so busy's first
+    /// `monitor()` (`:365`, `mlst != prec->val`) must find them at 0 even when
+    /// a constant DOL has already driven VAL to 1, and post the change C
+    /// posts. busy serves both fields to clients, so the framework default
+    /// would try to seed them; that attempt is inert today only because busy's
+    /// `put_field` binds no MLST/LALM arm, and this override is what keeps it
+    /// inert if one is ever added.
+    fn seed_deadband_tracking(&mut self) {}
+
+    /// C `busyRecord.c:196-208`: the scalar `dbGetLink(&prec->dol, ..., &prec->val, 0, 0)`
+    /// under `dol.type != CONSTANT && omsl == menuOmslclosed_loop`.
+    fn fetches_dol_closed_loop(&self) -> bool {
+        true
+    }
+
     /// C `busyRecord.c:195-208`: `process()` clears `udf` to FALSE only on a
     /// successful closed-loop DOL fetch (`if(status==0){ prec->val = val;
     /// prec->udf = FALSE; }`, `:202-204`); a bare (no-DOL) record reads the
@@ -202,8 +240,6 @@ impl Record for BusyRecord {
             self.high_reset_pending = false;
             self.val = 0;
         }
-
-        // Step 1: DOL reading handled by framework (OMSL=ClosedLoop)
 
         // Step 2: VAL → RVAL conversion — unless a device readback
         // (`apply_raw_readback`) already set both RVAL and VAL, in which case

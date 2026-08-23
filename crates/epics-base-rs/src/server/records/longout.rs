@@ -24,8 +24,10 @@ pub struct LongoutRecord {
     // record-local copy is a second, never-consulted owner, which is why a
     // `caput LO.HHSV INVALID` never fired the alarm. Omitting the fields
     // routes get/put through the common-field path (the single owner), as
-    // `ao`/`int64out` do. LALM (last-alarmed value) IS record state and stays.
-    pub lalm: f64,
+    // `ao`/`int64out` do. LALM (last-alarmed value) IS record state and stays,
+    // as C's `epicsInt32 lalm` (`longoutRecord.c:313`) — the type its `.dbd`
+    // declares and the type the ladder compares in.
+    pub lalm: i32,
     pub ivoa: i16,
     pub ivov: i32,
     // ADEL/MDEL are `DBF_LONG` (longoutRecord.dbd.pod) — integer archive and
@@ -84,6 +86,13 @@ pub struct LongoutRecord {
     /// process cycle to write the current VAL regardless of OOPT
     /// (epics-base PR #6c573b4 part 2, `longoutRecord.c:223`).
     pub ooch: i16,
+    /// Suppresses THIS cycle's `convert()` — C `int64outRecord.c:146` /
+    /// `longoutRecord.c:155` `if (!status) convert(prec, value)`, whose convert
+    /// is the DRVH/DRVL clamp. Set by
+    /// [`Record::closed_loop_dol_read_failed`] and cleared by `process()`, so a
+    /// dead closed-loop DOL leaves VAL exactly as the last successful cycle (or
+    /// a client put) left it instead of re-clamping it into the drive window.
+    pub skip_convert: bool,
 }
 
 impl Default for LongoutRecord {
@@ -95,7 +104,7 @@ impl Default for LongoutRecord {
             lopr: 0,
             drvh: 0, // C defaults both to 0 (equal = no clamping)
             drvl: 0,
-            lalm: 0.0,
+            lalm: 0,
             ivoa: 0,
             ivov: 0,
             adel: 0,
@@ -119,6 +128,7 @@ impl Default for LongoutRecord {
             // ignores OOCH), where YES forces the first write after an OUT
             // re-point.
             ooch: 1,
+            skip_convert: false,
         }
     }
 }
@@ -173,6 +183,12 @@ impl Record for LongoutRecord {
         "longout"
     }
 
+    /// C `longoutRecord.c:147-158`: the scalar `dbGetLink(&prec->dol, ..., &prec->val, 0, 0)`
+    /// under `dol.type != CONSTANT && omsl == menuOmslclosed_loop`.
+    fn fetches_dol_closed_loop(&self) -> bool {
+        true
+    }
+
     /// C `longoutRecord.c:145-153`: `process()` clears `udf` to FALSE only on a
     /// successful closed-loop DOL fetch (`if (!dbLinkIsConstant(&prec->dol) &&
     /// !status) prec->udf=FALSE;`); the no-DOL arm reads the current VAL and
@@ -204,10 +220,18 @@ impl Record for LongoutRecord {
     /// operator or DOL link writing outside the window propagates the
     /// unclamped value to the OUT link / device.
     fn process(&mut self) -> CaResult<ProcessOutcome> {
-        if self.drvh > self.drvl {
+        if !self.skip_convert && self.drvh > self.drvl {
             self.val = self.val.clamp(self.drvl, self.drvh);
         }
+        self.skip_convert = false;
         Ok(ProcessOutcome::complete())
+    }
+
+    /// C `longoutRecord.c:155` — `if (!status) convert(prec, value)`: a failed
+    /// closed-loop DOL read skips the convert, so the DRVH/DRVL clamp does not
+    /// run and VAL keeps whatever it held.
+    fn closed_loop_dol_read_failed(&mut self) {
+        self.skip_convert = true;
     }
 
     /// `DBF_MENU` fields, served as `DBR_ENUM` with the menu's choice labels
@@ -235,7 +259,7 @@ impl Record for LongoutRecord {
             "DRVL" => Some(EpicsValue::Long(self.drvl)),
             // HIHI/HIGH/LOW/LOLO/HHSV/HSV/LSV/LLSV/HYST fall through to the
             // common-field path (their single owner) — see the struct comment.
-            "LALM" => Some(EpicsValue::Double(self.lalm)),
+            "LALM" => Some(EpicsValue::Long(self.lalm)),
             "IVOA" => Some(EpicsValue::Short(self.ivoa)),
             "IVOV" => Some(EpicsValue::Long(self.ivov)),
             "ADEL" => Some(EpicsValue::Long(self.adel)),
@@ -293,7 +317,7 @@ impl Record for LongoutRecord {
             // they hit the `_ =>` arm below and fall through to
             // `put_common_field`, the single owner of the analog-alarm ladder.
             "LALM" => {
-                if let EpicsValue::Double(v) = value {
+                if let EpicsValue::Long(v) = value {
                     self.lalm = v;
                 }
             }
@@ -446,11 +470,11 @@ mod tests {
         let mut r = LongoutRecord::new(5);
         assert_eq!(r.mlst, 0.0, "precondition: tracker is the 0.0 default");
         assert_eq!(r.alst, 0.0);
-        assert_eq!(r.lalm, 0.0);
+        assert_eq!(r.lalm, 0);
         r.seed_deadband_tracking();
         assert_eq!(r.mlst, 5.0, "mlst seeded from val");
         assert_eq!(r.alst, 5.0, "alst seeded from val");
-        assert_eq!(r.lalm, 5.0, "lalm seeded from val");
+        assert_eq!(r.lalm, 5, "lalm seeded from val");
         // First process leaves val unchanged: DELTA(mlst=5, val=5)=0 is not
         // > mdel(0), so no DBE_VALUE/DBE_LOG post — matching C.
         assert!((5.0_f64 - r.mlst).abs() <= 0.0);

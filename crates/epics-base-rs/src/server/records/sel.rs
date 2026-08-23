@@ -59,9 +59,9 @@ pub struct SelRecord {
     /// True when `do_sel` detected an out-of-range SELN in Specified
     /// mode — raises `SOFT_ALARM/INVALID` in `check_alarms`.
     soft_alarm: bool,
-    /// Set by the framework (`set_fetch_gate_failed`) when the
-    /// Specified-mode selected input or NVL link was configured but did
-    /// not resolve this cycle. C `selRecord.c::process` (line 114) runs
+    /// Set by the framework (`set_fetch_gate_failed`) when this cycle's
+    /// `fetch_values` failed — the LAST input link read, in any SELM, or the
+    /// NVL read in `Specified`. C `selRecord.c::process` (113-115) runs
     /// `do_sel` only when `fetch_values` succeeds, so on failure VAL/UDF
     /// must freeze. Consumed (reset to false) each `process()` so the
     /// by-name dispatch path — which never reports a fetch outcome —
@@ -136,12 +136,15 @@ impl Record for SelRecord {
     /// no valid input exists or the selected input is undefined.
     fn process(&mut self) -> CaResult<ProcessOutcome> {
         self.soft_alarm = false;
-        // C `selRecord.c::process` (114) runs `do_sel` only when
-        // `fetch_values` succeeds. The framework reports a Specified-mode
-        // fetch failure here; consume it as a one-shot so the by-name
-        // path (no fetch report) never freezes.
-        let fetch_gate_failed = self.fetch_gate_failed;
-        self.fetch_gate_failed = false;
+        // C `selRecord.c::process` (113-115) wraps the WHOLE of `do_sel` in
+        // `if (RTN_SUCCESS(fetch_values(prec)))` — one gate for every SELM,
+        // not a Specified-mode special case. A failed read leaves VAL (and
+        // UDF, which derives from it) and SELN at the previous cycle's value,
+        // and raises none of `do_sel`'s own alarms. Consumed as a one-shot so
+        // the by-name path, which files no fetch report, never freezes.
+        if std::mem::take(&mut self.fetch_gate_failed) {
+            return Ok(ProcessOutcome::complete());
+        }
         let vals = self.get_values();
         match self.selm {
             0 => {
@@ -149,22 +152,12 @@ impl Record for SelRecord {
                 // SOFT_ALARM/INVALID and returns (VAL unchanged) when
                 // SELN >= SEL_MAX. SELN is `DBF_USHORT` (u16), so an
                 // out-of-range client value lands as a large index.
-                if fetch_gate_failed {
-                    // C `fetch_values` returned failure (configured
-                    // selected input or NVL link did not resolve): do_sel
-                    // is skipped, so VAL — and UDF, which derives from VAL
-                    // — freeze at the previous cycle's value. An *empty*
-                    // selected link is not a failure (C `dbGetLink` on an
-                    // unset link returns success), so the framework leaves
-                    // this flag clear and the NaN branch below runs.
+                let idx = self.seln as usize;
+                if idx >= SEL_MAX {
+                    self.soft_alarm = true;
                 } else {
-                    let idx = self.seln as usize;
-                    if idx >= SEL_MAX {
-                        self.soft_alarm = true;
-                    } else {
-                        // C: `prec->val = val;` then `udf = isnan(val)`.
-                        self.val = vals[idx];
-                    }
+                    // C: `prec->val = val;` then `udf = isnan(val)`.
+                    self.val = vals[idx];
                 }
             }
             1 => {
@@ -261,22 +254,14 @@ impl Record for SelRecord {
         let hyst = self.hyst;
         let lalm = self.lalm;
 
-        // C `recGblSetSevr` returns true when it actually raised the
-        // severity (new severity strictly greater than the pending
-        // one). The Rust helper returns `()`, so mirror its gate here.
-        let raised = |common: &crate::server::record::CommonFields, sev: AlarmSeverity| {
-            (sev as u16) > (common.nsev as u16)
-        };
-
         // hihi
         let hhsv = AlarmSeverity::from_u16(self.hhsv as u16);
         if hhsv != AlarmSeverity::NoAlarm
             && (val >= self.hihi || (lalm == self.hihi && val >= self.hihi - hyst))
         {
-            if raised(common, hhsv) {
+            if recgbl::rec_gbl_set_sevr(common, alarm_status::HIHI_ALARM, hhsv) {
                 self.lalm = self.hihi;
             }
-            recgbl::rec_gbl_set_sevr(common, alarm_status::HIHI_ALARM, hhsv);
             return;
         }
         // lolo
@@ -284,10 +269,9 @@ impl Record for SelRecord {
         if llsv != AlarmSeverity::NoAlarm
             && (val <= self.lolo || (lalm == self.lolo && val <= self.lolo + hyst))
         {
-            if raised(common, llsv) {
+            if recgbl::rec_gbl_set_sevr(common, alarm_status::LOLO_ALARM, llsv) {
                 self.lalm = self.lolo;
             }
-            recgbl::rec_gbl_set_sevr(common, alarm_status::LOLO_ALARM, llsv);
             return;
         }
         // high
@@ -295,10 +279,9 @@ impl Record for SelRecord {
         if hsv != AlarmSeverity::NoAlarm
             && (val >= self.high || (lalm == self.high && val >= self.high - hyst))
         {
-            if raised(common, hsv) {
+            if recgbl::rec_gbl_set_sevr(common, alarm_status::HIGH_ALARM, hsv) {
                 self.lalm = self.high;
             }
-            recgbl::rec_gbl_set_sevr(common, alarm_status::HIGH_ALARM, hsv);
             return;
         }
         // low
@@ -306,10 +289,9 @@ impl Record for SelRecord {
         if lsv != AlarmSeverity::NoAlarm
             && (val <= self.low || (lalm == self.low && val <= self.low + hyst))
         {
-            if raised(common, lsv) {
+            if recgbl::rec_gbl_set_sevr(common, alarm_status::LOW_ALARM, lsv) {
                 self.lalm = self.low;
             }
-            recgbl::rec_gbl_set_sevr(common, alarm_status::LOW_ALARM, lsv);
             return;
         }
         // out of alarm by at least hyst
@@ -525,6 +507,12 @@ impl Record for SelRecord {
     /// this cycle (the framework reads NVL before the input fetch), else the
     /// record's current SELN. A SELN >= SEL_MAX fetches nothing — C
     /// bounds-checks before the input read.
+    /// C `selRecord.c::fetch_values` returns the status of its LAST
+    /// `dbGetLink` (`:433-436`), which `process` gates `do_sel` on.
+    fn input_fetch_policy(&self) -> crate::server::record::InputFetchPolicy {
+        crate::server::record::InputFetchPolicy::ReadAllGateOnLastFailure
+    }
+
     fn select_input_links(
         &self,
         selector: Option<u16>,
@@ -542,14 +530,13 @@ impl Record for SelRecord {
         }
     }
 
-    /// C `selRecord.c::process` (line 114) gates `do_sel` on
-    /// `fetch_values` success. The framework reports here whether the
-    /// Specified-mode selected input / NVL link was configured but failed
-    /// to resolve this cycle; `process()` consumes the flag and freezes
-    /// VAL/UDF on failure. High/Low/Median never set it (those modes read
-    /// every input and skip NaNs, so a single broken link does not gate —
-    /// C's "freeze when the *last* link fails" is a reference-side quirk
-    /// of its overwritten `status`, not replicated here).
+    /// C `selRecord.c::process` (113-115) gates `do_sel` on `fetch_values`
+    /// success in EVERY mode. `fetch_values` (`:433-436`) assigns `status`
+    /// unguarded on every pass and returns it, so the gate is the LAST link
+    /// read: INPL's for High/Low/Median, the selected input's (or a failed
+    /// NVL read) for Specified. A failed INPA therefore does NOT gate a High
+    /// selection — that asymmetry is C's, from the overwritten `status`, and
+    /// the port matches it rather than inventing an "any input failed" rule.
     fn set_fetch_gate_failed(&mut self, failed: bool) {
         self.fetch_gate_failed = failed;
     }

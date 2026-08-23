@@ -263,10 +263,12 @@ pub struct CalcLink {
     /// …). At most [`CALC_NARGS`] of them — C stops the parse at the
     /// limit rather than truncating (`lnkCalc.c:135-139`).
     pub args: Vec<CalcArg>,
-    /// Input letter whose timestamp should be used for the result,
-    /// normalised to upper case and bounded by [`CALC_NARGS`]
-    /// (`lnkCalc.c:180-186`). `None` skips timestamp passthrough — the
-    /// consumer uses its own `apply_timestamp` time.
+    /// C `clink->tinp` (`lnkCalc.c:184`) as its letter: the input whose
+    /// timestamp and userTag the reading record adopts. Normalised to upper
+    /// case and bounded by [`CALC_NARGS`] (`lnkCalc.c:180-186`), so it
+    /// indexes `args` directly. `None` is C's `tinp = -1` —
+    /// `lnkCalc_getTimestampTag` returns -1 and the consumer keeps its own
+    /// `apply_timestamp` time.
     pub time_source: Option<char>,
 }
 

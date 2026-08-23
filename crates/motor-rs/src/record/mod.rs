@@ -364,9 +364,14 @@ impl Record for MotorRecord {
     /// `RTN_SUCCESS(dbGetLink(&pmr->rdbl, ...))` in `process_motor_info`
     /// (motorRecord.cc:3687-3698). A failed RDBL read latches
     /// `rdbl_error`; the completion/planner paths stop an in-flight
-    /// motion and refuse new ones while it is set. An empty RDBL is
-    /// skipped by the framework (CONSTANT link in C — a successful
-    /// dbGetLink), so it never reports as an error here.
+    /// motion and refuse new ones while it is set.
+    ///
+    /// The report is C's status, so every RDBL form C calls successful is
+    /// present in it — an empty link and a constant one included
+    /// (`dbConstGetValue` returns 0). The gate here is therefore exactly the
+    /// gate `pre_process_actions` requested the read under, and nothing more:
+    /// a second, local "is the link empty" test was the port re-deriving a rule
+    /// the framework owns, and it did not cover `field(RDBL,"5")`.
     fn set_resolved_input_links(&mut self, resolved: &[&'static str]) {
         // C closed-loop DOL collection (motorRecord.cc:1994-2005): a
         // failed dbGetLink on DOL sets `udf = TRUE` and aborts the pass
@@ -378,7 +383,7 @@ impl Record for MotorRecord {
         if self.stat.dmov && self.closed_loop_dol_collection() {
             self.internal.dol_udf = Some(!resolved.contains(&"DOL"));
         }
-        if self.conv.urip && !self.conv.ueip && !self.links.rdbl.is_empty() {
+        if self.conv.urip && !self.conv.ueip {
             self.conv.rdbl_error = !resolved.contains(&"RDBL");
         }
     }

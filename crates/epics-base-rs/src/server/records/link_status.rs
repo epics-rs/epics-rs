@@ -14,7 +14,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::server::database::AsyncDbHandle;
 use crate::server::record::{LinkType, parse_link_v2};
-use crate::types::DbFieldType;
+use crate::types::{DbFieldType, EpicsValue};
 
 /// Monotonic generation gate for spawned async link-status refreshes.
 ///
@@ -170,6 +170,55 @@ pub fn classify_link(handle: &AsyncDbHandle, link: &str, role: LinkRole) -> (i16
         // remote field's connection state or type — report not-connected.
         LinkType::Ca | LinkType::Other => (LINK_EXT_NC, DBF_UNKNOWN),
     }
+}
+
+/// Classify a record's links and publish the resulting connection-status menu
+/// fields — the shared body of C's `init_record` link loop and its `special()`
+/// re-classification (`calcoutRecord.c:160-189`, `transformRecord.c:443-472`
+/// and `:712-740`, `sCalcoutRecord.c:254-287` and `:513-569`,
+/// `aCalcoutRecord.c:209-242` and `:509-533`).
+///
+/// `links` pairs each status FIELD with the link string it describes and that
+/// link's [`LinkRole`]. Every caller passes its complete set, so a refresh is
+/// always a whole-record classification, never a per-field patch — which is
+/// what makes the [`LinkStatusGen`] gate sufficient to keep "only the latest
+/// classification is published" true.
+///
+/// The work is scheduled through [`AsyncDbHandle::schedule_record_init`], the
+/// database's `iocInit` owner: queued while records are still loading, so a
+/// forward-referenced target classifies LOCAL and the result is final when
+/// `iocInit` returns; spawned at once on a complete database. No-op for a
+/// record with no async context.
+pub fn post_link_status(
+    ctx: Option<&(String, AsyncDbHandle)>,
+    generation: &LinkStatusGen,
+    links: Vec<(&'static str, String, LinkRole)>,
+) {
+    let Some((name, handle)) = ctx else {
+        return;
+    };
+    let name = name.clone();
+    let handle = handle.clone();
+    let generation = generation.clone();
+    // Stamp before the spawn, on the caller's thread: every refresh site runs
+    // under the record's write lock, so tokens are strictly increasing and a
+    // task that finds its token stale drops its post rather than clobbering a
+    // newer classification.
+    let token = generation.next();
+    let sched = handle.clone();
+    let init_key = name.clone();
+    sched.schedule_record_init(&init_key, async move {
+        let fields: Vec<(String, EpicsValue)> = links
+            .into_iter()
+            .map(|(field, link, role)| {
+                let (status, _ft) = classify_link(&handle, &link, role);
+                (field.to_string(), EpicsValue::Enum(status as u16))
+            })
+            .collect();
+        if generation.is_current(token) {
+            let _ = handle.post_fields(&name, fields);
+        }
+    });
 }
 
 /// Choice labels for swait's PV-status menu, in index order. C

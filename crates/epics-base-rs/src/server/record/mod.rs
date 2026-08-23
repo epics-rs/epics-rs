@@ -14,7 +14,7 @@ mod scan;
 
 // Re-export all public types so existing imports continue to work.
 pub use crate::server::recgbl::EventMask;
-pub use alarm::{AlarmSeverity, AnalogAlarmConfig};
+pub use alarm::{AlarmLimit, AlarmSeverity, AnalogAlarmConfig};
 pub use common_fields::CommonFields;
 pub use constant_link::{rec_gbl_init_constant_link, reseed_constant_input_link};
 pub use device_menu_registry::register_device_menu;
@@ -31,8 +31,8 @@ pub use menu_choices::{
     Ftype, MENU_ALARM_SEVR, MENU_ALARM_STAT, MENU_CONVERT, MENU_FTYPE, MENU_IVOA, MENU_OMSL,
     MENU_PINI, MENU_POST, MENU_PRIORITY, MENU_SCAN, MENU_SIMM, MENU_YES_NO, binary_enum_states,
     binary_enum_string_form, multibit_enum_states, multibit_enum_string_form,
-    resolve_enum_state_string, resolve_menu_field_string, resolve_menu_field_string_db_load,
-    shared_menu_choices,
+    multibit_state_string_index, resolve_enum_state_string, resolve_menu_field_string,
+    resolve_menu_field_string_db_load, shared_menu_choices,
 };
 pub use pini::PiniMode;
 pub use record_instance::{

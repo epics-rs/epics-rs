@@ -546,6 +546,16 @@ impl Record for SwaitRecord {
         self.fetch_gate_failed = failed;
     }
 
+    /// swait's input fetch is NOT `dbGetLink`. `fetch_values`
+    /// (`swaitRecord.c:686-705`) reads INAA..INPL with `recDynLinkGet`, a
+    /// CA-style get that has no `setLinkAlarm`; the failure is answered by
+    /// `process` with `recGblSetSevr(pwait, READ_ALARM, INVALID_ALARM)`
+    /// (`swaitRecord.c:412`). Its SIML/SIOL reads ARE `dbGetLink`
+    /// (`:401`, `:415`) and keep the framework's uniform rule.
+    fn multi_input_fetch_is_db_get_link(&self) -> bool {
+        false
+    }
+
     /// C `swaitRecord.c:401-421` — swait's simulation replaces `fetch_values()`
     /// and `calcPerform()`, and nothing else: the OOPT switch (`:424`),
     /// `execOutput`, the monitors and the forward link all still run. So it is

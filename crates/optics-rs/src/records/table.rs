@@ -2623,6 +2623,23 @@ impl Record for TableRecord {
             "GEOM" => Some(EpicsValue::Enum(self.geom as u16)),
             "TORAD" => Some(EpicsValue::Double(self.torad)),
             "AUNIT" => Some(EpicsValue::Enum(self.aunit as u16)),
+            // The eight `special(SPC_DBADDR)` fields. `tableRecord.dbd`
+            // declares each `DBF_NOACCESS` and C's `cvt_dbaddr`
+            // (`tableRecord.c:727-745`) supplies the real channel: the two
+            // matrices flatten row-major to nine `DBF_DOUBLE` elements
+            // (`paddr->pfield = ptbl->a[0]`, `no_elements = 9`) and each
+            // pivot point serves three. Serving the array here IS the
+            // redirect — an array `EpicsValue` already carries the element
+            // type `cvt_dbaddr` sets and the count it reports, so no
+            // separate `Special::DbAddr` path is needed for the value.
+            "A" => Some(EpicsValue::DoubleArray(self.a.concat())),
+            "B" => Some(EpicsValue::DoubleArray(self.b.concat())),
+            "PP0" => Some(EpicsValue::DoubleArray(self.pp0.to_vec())),
+            "PP1" => Some(EpicsValue::DoubleArray(self.pp1.to_vec())),
+            "PP2" => Some(EpicsValue::DoubleArray(self.pp2.to_vec())),
+            "PPO0" => Some(EpicsValue::DoubleArray(self.ppo0.to_vec())),
+            "PPO1" => Some(EpicsValue::DoubleArray(self.ppo1.to_vec())),
+            "PPO2" => Some(EpicsValue::DoubleArray(self.ppo2.to_vec())),
             _ => None,
         }
     }

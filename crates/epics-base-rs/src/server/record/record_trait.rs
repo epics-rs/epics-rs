@@ -1219,6 +1219,16 @@ pub enum InputFetchPolicy {
     /// `aCalcoutRecord.c` (1068-1071 fetch, 399 gate) and
     /// `swaitRecord.c` (686-705 fetch, 408 gate) are the same shape.
     AbortOnFirstFailure,
+    /// Read every configured link and gate the body on the LAST link's status.
+    ///
+    /// C `selRecord.c::fetch_values` (433-436) assigns `status` unguarded on
+    /// every pass of its all-inputs loop and returns it, so what
+    /// `selRecord.c::process` (113-115) gates `do_sel` on is INPL's status
+    /// alone — a failed INPA is read, posted, and then ignored. In
+    /// `Specified` mode the loop is one link (`:421-431`), so the same rule
+    /// reads as "the selected input's status". Faithful to C, quirk included:
+    /// see `sel`'s doc for why the quirk is C's and not ours.
+    ReadAllGateOnLastFailure,
 }
 
 /// **The** field declaration of a record type, and the only way to obtain one.
@@ -2316,19 +2326,36 @@ pub trait Record: Send + Sync + 'static {
     ///
     /// `subRecord.c:119-123` is the live case: an empty `SNAM` has no
     /// subroutine to call, so C prints `"%s.SNAM is empty"`, sets `pact = TRUE`
-    /// and returns 0. The record exists and serves its fields, but `dbProcess`
-    /// takes the PACT-active branch on every scan from then on — it never runs
-    /// record support again. `caget X.PACT` on a bare `record(sub,"X"){}` reads
-    /// 1 on a C IOC.
+    /// and returns 0. `dbProcess` then takes the PACT-active branch on every
+    /// scan — the record serves its fields but never runs record support.
+    /// `caget X.PACT` on a bare `record(sub,"X"){}` reads 1 on a C IOC.
+    ///
+    /// This is a STATE PREDICATE over the record's current fields, not a
+    /// one-time init verdict: C re-asks it on every put to a field in
+    /// [`Self::pact_park_fields`], through the two passes of `special()`
+    /// (`subRecord.c:170-194`). Pass 0 releases the park, pass 1 re-takes it if
+    /// the value just stored still leaves the record unable to run, so
+    /// `caput X.SNAM mySub` revives a parked record and `caput X.SNAM ""` parks
+    /// a running one.
     ///
     /// PACT is a `dbCommon` field with a single owner
     /// ([`crate::server::record::RecordInstance::enter_pact`] / [`leave_pact`]), so a record cannot
-    /// park it from `init_record`. It reports the fact here and the owner
-    /// performs the transition, once, at the end of the init passes.
+    /// park it itself. It answers here and the owner performs the transition —
+    /// at the end of the init passes, and either side of a park-field put.
     ///
     /// [`leave_pact`]: crate::server::record::RecordInstance::leave_pact
-    fn init_record_parks_pact(&self) -> bool {
+    fn parks_pact(&self) -> bool {
         false
+    }
+
+    /// The fields whose put can change [`Self::parks_pact`]'s answer — C's
+    /// `special(SPC_MOD)` set for the PACT park (`subRecord.dbd.pod` marks only
+    /// `SNAM`). Nothing else re-asks the question, so a put to an unrelated
+    /// field of a parked record cannot disturb the park the way an
+    /// every-put re-assertion would. Default: none, so the whole mechanism is
+    /// inert for every record type that does not use PACT as a self-disable.
+    fn pact_park_fields(&self) -> &'static [&'static str] {
+        &[]
     }
 
     /// Post-init finalisation hook with mutable access to the
@@ -2379,6 +2406,25 @@ pub trait Record: Send + Sync + 'static {
         None
     }
 
+    /// The part of C's `init_record` tail that is NOT tracker seeding: an
+    /// output record's closing VAL→RVAL conversion, run at the same point
+    /// [`Self::seed_deadband_tracking`] is and immediately before it, which is
+    /// the order C writes the two in (`boRecord.c:166-175` converts, then
+    /// seeds).
+    ///
+    /// It cannot live in [`Self::init_record`]: that runs before the
+    /// `recGblInitConstantLink` table, so a record whose VAL arrives from a
+    /// constant DOL would convert the pre-seed VAL. C has no such split —
+    /// `busyRecord.c:151-179` is one function with the constant load at the
+    /// top and the conversion at the bottom.
+    ///
+    /// busy is the only implementor: `busyRecord.c:175-179` converts through
+    /// MASK and seeds no MLST/LALM, so it needs this half of the tail without
+    /// the other. Every other record whose init tail converts (bo, mbbo,
+    /// mbboDirect, ao) also seeds trackers and carries both together in
+    /// `seed_deadband_tracking`. Default: empty.
+    fn init_record_tail(&mut self) {}
+
     /// Seed the monitor/archive/alarm deadband trackers (MLST/ALST/LALM)
     /// from the initial value at iocInit, called once by the builder after
     /// both `init_record` passes and `post_init_finalize_undef`.
@@ -2406,8 +2452,14 @@ pub trait Record: Send + Sync + 'static {
             _ => return,
         };
         for field in ["MLST", "ALST", "LALM"] {
-            if self.get_field(field).is_some() {
-                let _ = self.put_field(field, EpicsValue::Double(seed));
+            // Seeded in the variant the record actually stores the tracker in
+            // — a `put_field` arm binds ONE variant and drops the rest, and C
+            // declares LALM/ALST/MLST with the record's VAL type: `DBF_INT64`
+            // on int64in/int64out, `DBF_LONG` on longin/longout. The same rule
+            // `RecordInstance::put_coerced` applies at the other writer.
+            if let Some(current) = self.get_field(field) {
+                let seeded = EpicsValue::Double(seed).convert_to(current.db_field_type());
+                let _ = self.put_field(field, seeded);
             }
         }
     }
@@ -2452,6 +2504,94 @@ pub trait Record: Send + Sync + 'static {
     /// Default: ignore (records with no fetch gate). Same framework-set hook
     /// pattern as [`Record::set_resolved_input_links`].
     fn set_fetch_gate_failed(&mut self, _failed: bool) {}
+
+    /// Whether this record's multi-input fetch ([`Self::multi_input_links`]) is
+    /// C `dbGetLink` — which raises `setLinkAlarm` (LINK/INVALID, AMSG
+    /// `field <NAME>`) on every failed read — or a `recDynLink` CA-style get,
+    /// which raises nothing.
+    ///
+    /// `true` for every base record and for sCalcout/aCalcout/transform
+    /// (`calcRecord.c:439`, `calcoutRecord.c:705`, `subRecord.c:414`,
+    /// `aSubRecord.c:282`, `selRecord.c:430`, `printfRecord.c:54`,
+    /// `sCalcoutRecord.c:886`, `aCalcoutRecord.c:1070`,
+    /// `transformRecord.c:537`). `false` only for swait, whose `fetch_values`
+    /// (`swaitRecord.c:702`) reads INAA..INPL with `recDynLinkGet` and answers a
+    /// failure with `recGblSetSevr(READ_ALARM, INVALID_ALARM)` at
+    /// `swaitRecord.c:412` instead. Both alarms are INVALID and
+    /// `rec_gbl_set_sevr*` is strict-greater, so raising the wrong one first
+    /// wins the tie and publishes the wrong STAT.
+    fn multi_input_fetch_is_db_get_link(&self) -> bool {
+        true
+    }
+
+    /// Whether this record's C `process()` performs the SCALAR closed-loop DOL
+    /// fetch — `dbGetLink(&prec->dol, <dbr>, &prec->val, 0, 0)` guarded by
+    /// `prec->dol.type != CONSTANT && prec->omsl == menuOmslclosed_loop`
+    /// (`boRecord.c:191-205`, `busyRecord.c:196-208`, `dfanoutRecord.c:116-122`,
+    /// and the same block in ao/longout/int64out/mbbo/mbboDirect/stringout/lso).
+    /// The framework then owns the fetch, its LINK/INVALID failure arm
+    /// ([`Self::closed_loop_dol_read_failed`]) and the UDF clear.
+    ///
+    /// Declaring both `menu(menuOmsl)` and `field(DOL,DBF_INLINK)` is NOT the
+    /// same question and cannot stand in for this one: `aao` declares both and
+    /// copies DOL as an ARRAY (`aaoRecord.c::fetchValue`), `motor` declares both
+    /// and drives DOL through its own C code. Both source DOL record-locally and
+    /// answer `false` here. `epid` has `menuOmsl` and no DOL at all — it fetches
+    /// from `STPL`.
+    ///
+    /// This was a record-name match inside the process cycle. A list the
+    /// compiler cannot check, in a file no record author reads, had already
+    /// been wrong twice — `dfanout` once and `busy` again — so the fact moved
+    /// to the record that owns it. Default: false.
+    fn fetches_dol_closed_loop(&self) -> bool {
+        false
+    }
+
+    /// C's failure arm for THIS cycle's closed-loop DOL read: the framework
+    /// calls it when `dbGetLink(&prec->dol, ...)` returned a non-zero status
+    /// with `OMSL = closed_loop` and a non-constant DOL.
+    ///
+    /// The LINK/INVALID alarm is not this hook's business — `db_get_link` owns
+    /// it, exactly as C's `dbGetLink` does. What is left is the per-record body
+    /// gate, and C writes a different one in each record:
+    ///
+    /// * ao — `fetch_value` (aoRecord.c:442) sets `prec->val = prec->pval`
+    ///   BEFORE the read, and `if(!status) convert(prec, value)` (:188) then
+    ///   skips the convert, so VAL falls back to the last actual output and
+    ///   OVAL/PVAL/RVAL freeze (an OROC ramp stops advancing).
+    /// * longout (:155) / int64out (:146) — same `if (!status) convert(...)`,
+    ///   whose convert is the DRVH/DRVL clamp.
+    /// * mbbo (:206) / mbboDirect (:186) — `goto CONTINUE` past `udf = FALSE`,
+    ///   `bitsFromVAL`, `convert` and the pre-output timestamp.
+    /// * bo (:200-204), stringout, lso, dfanout — nothing: bo converts VAL to
+    ///   RVAL whether the read succeeded or not, and the other three have no
+    ///   convert step at all. They keep the default no-op.
+    ///
+    /// Additive, framework-set-hook pattern, same shape as
+    /// [`Self::set_fetch_gate_failed`]. Default: ignore.
+    fn closed_loop_dol_read_failed(&mut self) {}
+
+    /// The INP counterpart of [`Self::closed_loop_dol_read_failed`]: the
+    /// framework calls it when a soft-channel `read_xxx`'s `dbGetLink(&prec->inp,
+    /// ...)` returned a non-zero status, so no value was sourced this cycle.
+    ///
+    /// The LINK/INVALID alarm is not this hook's business — `db_get_link` owns
+    /// it, as C's `dbGetLink` does. What is left is what the record makes of a
+    /// cycle that read nothing, and C writes that per record:
+    ///
+    /// * subArray — `read_sa` skips `subset()` entirely on a non-zero status
+    ///   (`devSASoft.c:118-120`), `readValue` returns it, and `process` does
+    ///   `prec->udf = !!status` (`subArrayRecord.c:148`). An UNDEFINED subArray
+    ///   then serves ZERO elements, not the stale slice
+    ///   (`get_array_info`, `:181-184`) — the only array record with that rule.
+    /// * waveform/aai/aao — nothing: they clear UDF on the line after
+    ///   `readValue` whatever it returned ([`Self::clears_udf_unconditionally`]).
+    /// * the scalar soft records — nothing here either; C leaves `prec->udf`
+    ///   untouched on a failed read (`if (status == 0) … prec->udf = FALSE`),
+    ///   which is the framework's per-cycle re-derive, not a record hook.
+    ///
+    /// Additive, framework-set-hook pattern. Default: ignore.
+    fn soft_input_read_failed(&mut self) {}
 
     /// Report this cycle's subroutine status — C `process`'s `status` variable
     /// for `sub`/`aSub`:
@@ -2715,6 +2855,30 @@ pub trait Record: Send + Sync + 'static {
     /// Consulted by the simulation tail, which otherwise gates the clear on the
     /// SIOL fetch status. Default `false` — the status-gated majority.
     fn clears_udf_unconditionally(&self) -> bool {
+        false
+    }
+
+    /// Does this record's C `process()` assign `udf` on a cycle whose INP read
+    /// FAILED?
+    ///
+    /// The scalar input records do not — the assignment sits inside
+    /// `if (status == 0)`: `aiRecord.c:161`, `biRecord.c:144-148`,
+    /// `mbbiRecord.c:168-174`, `mbbiDirectRecord.c:155-164`,
+    /// `longinRecord.c:148`, `int64inRecord.c:144`. A broken link therefore
+    /// leaves the record at whatever UDF it already had, and that is what makes
+    /// the `if (prec->udf) recGblSetSevr(prec, UDF_ALARM, ...)` on the next line
+    /// reachable at all (`mbbiDirectRecord.c:168-169`).
+    ///
+    /// The array records and `compress` do — `prec->udf = FALSE` runs after
+    /// `readValue` whatever it returned (`waveformRecord.c:144`,
+    /// `aaiRecord.c:174`, `aaoRecord.c:165`); `compressRecord.c:341-366` folds a
+    /// failed `dbGetLink` into `status = 0` and clears anyway; and subArray's
+    /// `prec->udf = !!status` (`subArrayRecord.c:148`) IS the status.
+    ///
+    /// Default `false` — the status-gated majority. Records whose
+    /// [`Self::clears_udf`] is false never reach the question: their gate is
+    /// already "a value was sourced this cycle", which a failed read fails.
+    fn derives_udf_on_read_failure(&self) -> bool {
         false
     }
 

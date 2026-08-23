@@ -735,14 +735,10 @@ impl Record for EpidRecord {
             recgbl::rec_gbl_set_sevr(common, alarm_status::SOFT_ALARM, AlarmSeverity::Invalid);
         }
         if let Some((stat, sevr, alev)) = EpidRecord::check_alarms(self) {
-            // C `aiRecord.c:403-406`: `if (recGblSetSevr(...)) prec->lalm = alev;`
+            // C `aiRecord.c:404-406`: `if (recGblSetSevr(...)) prec->lalm = alev;`
             // — the LALM update is gated on `recGblSetSevr` returning TRUE,
             // i.e. on the alarm actually raising the pending severity.
-            // `rec_gbl_set_sevr` is raise-only and returns nothing, so detect
-            // the raise by observing whether `nsev` increased across the call.
-            let before = common.nsev;
-            recgbl::rec_gbl_set_sevr(common, stat, sevr);
-            if common.nsev != before {
+            if recgbl::rec_gbl_set_sevr(common, stat, sevr) {
                 self.lalm = alev;
             }
         }

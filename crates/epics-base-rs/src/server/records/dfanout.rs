@@ -185,6 +185,12 @@ impl Record for DfanoutRecord {
         "dfanout"
     }
 
+    /// C `dfanoutRecord.c:116-122`: the scalar `dbGetLink(&prec->dol, ..., &prec->val, 0, 0)`
+    /// under `dol.type != CONSTANT && omsl == menuOmslclosed_loop`.
+    fn fetches_dol_closed_loop(&self) -> bool {
+        true
+    }
+
     fn menu_field_choices(&self, field: &str) -> Option<&'static [&'static str]> {
         match field {
             "SELM" => Some(DFANOUT_SELM_CHOICES),
@@ -264,48 +270,41 @@ impl Record for DfanoutRecord {
         let val = self.val;
         let hyst = self.hyst;
         let lalm = self.lalm;
-        let raised = |common: &crate::server::record::CommonFields, sev: AlarmSeverity| {
-            (sev as u16) > (common.nsev as u16)
-        };
 
         let hhsv = AlarmSeverity::from_u16(self.hhsv as u16);
         if hhsv != AlarmSeverity::NoAlarm
             && (val >= self.hihi || (lalm == self.hihi && val >= self.hihi - hyst))
         {
-            if raised(common, hhsv) {
+            if recgbl::rec_gbl_set_sevr(common, alarm_status::HIHI_ALARM, hhsv) {
                 self.lalm = self.hihi;
             }
-            recgbl::rec_gbl_set_sevr(common, alarm_status::HIHI_ALARM, hhsv);
             return;
         }
         let llsv = AlarmSeverity::from_u16(self.llsv as u16);
         if llsv != AlarmSeverity::NoAlarm
             && (val <= self.lolo || (lalm == self.lolo && val <= self.lolo + hyst))
         {
-            if raised(common, llsv) {
+            if recgbl::rec_gbl_set_sevr(common, alarm_status::LOLO_ALARM, llsv) {
                 self.lalm = self.lolo;
             }
-            recgbl::rec_gbl_set_sevr(common, alarm_status::LOLO_ALARM, llsv);
             return;
         }
         let hsv = AlarmSeverity::from_u16(self.hsv as u16);
         if hsv != AlarmSeverity::NoAlarm
             && (val >= self.high || (lalm == self.high && val >= self.high - hyst))
         {
-            if raised(common, hsv) {
+            if recgbl::rec_gbl_set_sevr(common, alarm_status::HIGH_ALARM, hsv) {
                 self.lalm = self.high;
             }
-            recgbl::rec_gbl_set_sevr(common, alarm_status::HIGH_ALARM, hsv);
             return;
         }
         let lsv = AlarmSeverity::from_u16(self.lsv as u16);
         if lsv != AlarmSeverity::NoAlarm
             && (val <= self.low || (lalm == self.low && val <= self.low + hyst))
         {
-            if raised(common, lsv) {
+            if recgbl::rec_gbl_set_sevr(common, alarm_status::LOW_ALARM, lsv) {
                 self.lalm = self.low;
             }
-            recgbl::rec_gbl_set_sevr(common, alarm_status::LOW_ALARM, lsv);
             return;
         }
         self.lalm = val;

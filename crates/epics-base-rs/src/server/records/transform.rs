@@ -7,7 +7,10 @@ use crate::types::EpicsValue;
 
 use crate::calc::{CompiledExpr, StringInputs, scalc_compile, scalc_perform};
 
-use super::link_status::{LINK_CON, LINK_STATUS_CHOICES};
+use super::link_status::{
+    LINK_CON, LINK_STATUS_CHOICES, LinkRole, LinkStatusGen, post_link_status,
+};
+use crate::server::database::AsyncDbHandle;
 
 const NUM_CHANNELS: usize = 16; // A-P
 
@@ -77,6 +80,17 @@ pub struct TransformRecord {
     /// express it. Both [`Record::value_is_undefined`] and
     /// [`Record::check_alarms`] read this cell.
     calc_failed: bool,
+    /// `IAV..IPV` / `OAV..OPV` — the per-channel link-connection status C
+    /// derives in `init_record` (`transformRecord.c:443-472`) and re-derives in
+    /// `special()` on any INPx/OUTx put (`:712-740`). Written only by
+    /// [`Self::refresh_link_status`] (through `post_fields`), never by a
+    /// client: the fields are `special(SPC_NOMOD)`.
+    in_status: [i16; NUM_CHANNELS],
+    out_status: [i16; NUM_CHANNELS],
+    /// Async surface + generation gate for `refresh_link_status`, the shape
+    /// calcout/sseq/swait use (see `link_status::post_link_status`).
+    async_ctx: Option<(String, AsyncDbHandle)>,
+    link_gen: LinkStatusGen,
 }
 
 impl Default for TransformRecord {
@@ -95,6 +109,12 @@ impl Default for TransformRecord {
             map: [false; NUM_CHANNELS],
             nsev: AlarmSeverity::NoAlarm,
             calc_failed: false,
+            // C's post-`init_record` value for a default record: every link is
+            // CONSTANT, so every status is `transformIAV_CON`.
+            in_status: [LINK_CON; NUM_CHANNELS],
+            out_status: [LINK_CON; NUM_CHANNELS],
+            async_ctx: None,
+            link_gen: LinkStatusGen::default(),
         }
     }
 }
@@ -222,12 +242,41 @@ impl TransformRecord {
     /// `init_record` overwrites — serving it raw (what `declared_default` did
     /// for these un-modeled fields) reported `Ext PV OK` where C reports
     /// `Constant`.
-    fn is_link_status_field(name: &str) -> bool {
+    fn link_status_index(name: &str) -> Option<(LinkRole, usize)> {
         let b = name.as_bytes();
-        name.len() == 3
-            && (b[0] == b'I' || b[0] == b'O')
-            && (b'A'..=b'P').contains(&b[1])
-            && b[2] == b'V'
+        if name.len() != 3 || b[2] != b'V' || !(b'A'..=b'P').contains(&b[1]) {
+            return None;
+        }
+        let role = match b[0] {
+            b'I' => LinkRole::Input,
+            b'O' => LinkRole::Output,
+            _ => return None,
+        };
+        Some((role, (b[1] - b'A') as usize))
+    }
+
+    fn is_link_status_field(name: &str) -> bool {
+        Self::link_status_index(name).is_some()
+    }
+
+    /// Classify all 32 links and publish `IAV..IPV` / `OAV..OPV`, mirroring C
+    /// `transformRecord.c::init_record` (443-472) and the `special()`
+    /// re-classification (712-740). No-op without an async context.
+    fn refresh_link_status(&self) {
+        let mut links: Vec<(&'static str, String, LinkRole)> = Vec::with_capacity(2 * NUM_CHANNELS);
+        for i in 0..NUM_CHANNELS {
+            links.push((
+                IAV_FIELD_NAMES[i],
+                self.inp_links[i].clone(),
+                LinkRole::Input,
+            ));
+            links.push((
+                OAV_FIELD_NAMES[i],
+                self.out_links[i].clone(),
+                LinkRole::Output,
+            ));
+        }
+        post_link_status(self.async_ctx.as_ref(), &self.link_gen, links);
     }
 
     /// LA..LP — "Prev Value of A".."Prev Value of P"
@@ -495,10 +544,12 @@ impl Record for TransformRecord {
         if let Some(idx) = Self::last_value_index(name) {
             return Some(EpicsValue::Double(self.lvals[idx]));
         }
-        if Self::is_link_status_field(name) {
-            // Link-derived, `Constant` for the default record's constant links
-            // (see [`Self::is_link_status_field`]).
-            return Some(EpicsValue::Enum(LINK_CON as u16));
+        if let Some((role, idx)) = Self::link_status_index(name) {
+            let status = match role {
+                LinkRole::Input => self.in_status[idx],
+                LinkRole::Output => self.out_status[idx],
+            };
+            return Some(EpicsValue::Enum(status as u16));
         }
         None
     }
@@ -577,7 +628,29 @@ impl Record for TransformRecord {
                 _ => return Err(CaError::TypeMismatch(name.into())),
             }
         }
+        // IAV..IPV / OAV..OPV are `special(SPC_NOMOD)` to clients; this arm
+        // exists for the link-status refresh (`post_fields` ->
+        // `put_field_internal`), which is their only writer.
+        if let Some((role, idx)) = Self::link_status_index(name) {
+            let status = value
+                .to_f64()
+                .ok_or_else(|| CaError::TypeMismatch(name.into()))? as i16;
+            match role {
+                LinkRole::Input => self.in_status[idx] = status,
+                LinkRole::Output => self.out_status[idx] = status,
+            }
+            return Ok(());
+        }
         Err(CaError::FieldNotFound(name.to_string()))
+    }
+
+    fn set_async_context(&mut self, name: String, db: AsyncDbHandle) {
+        self.async_ctx = Some((name, db));
+        // C `init_record` (transformRecord.c:443-472) classifies all 32 links
+        // before any process. Both link tables are transform-owned fields,
+        // already applied by the time `add_record` runs, so one refresh here
+        // covers what C's init loop does.
+        self.refresh_link_status();
     }
 
     /// S5 — set C's `map` bit for a value channel `A..P` written by an
@@ -596,6 +669,11 @@ impl Record for TransformRecord {
             // so a put to VAL marks nothing — it is not a channel.
             if let Some(i) = Self::channel_index(field) {
                 self.map[i] = true;
+            }
+            // C `transformRecord.c:708-741` re-classifies the link a put just
+            // re-pointed, over the whole INPA..OUTP range.
+            if Self::inp_field_index(field).is_some() || Self::out_field_index(field).is_some() {
+                self.refresh_link_status();
             }
         }
         Ok(())
@@ -763,6 +841,18 @@ impl Record for TransformRecord {
         }
     }
 }
+
+/// `IAV..IPV` — input-link status field names, indexed by channel 0..15.
+static IAV_FIELD_NAMES: [&str; NUM_CHANNELS] = [
+    "IAV", "IBV", "ICV", "IDV", "IEV", "IFV", "IGV", "IHV", "IIV", "IJV", "IKV", "ILV", "IMV",
+    "INV", "IOV", "IPV",
+];
+
+/// `OAV..OPV` — output-link status field names, indexed by channel 0..15.
+static OAV_FIELD_NAMES: [&str; NUM_CHANNELS] = [
+    "OAV", "OBV", "OCV", "ODV", "OEV", "OFV", "OGV", "OHV", "OIV", "OJV", "OKV", "OLV", "OMV",
+    "ONV", "OOV", "OPV",
+];
 
 /// OUTA..OUTP field names, indexed by channel 0..15. Used by
 /// `process()` to name the per-channel OUT link for a `WriteDbLink`

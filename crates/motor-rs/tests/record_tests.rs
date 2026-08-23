@@ -1317,15 +1317,25 @@ fn test_field_list_coverage() {
 /// now, so the gap is a list — and it is a RATCHET: a new unimplemented field
 /// has to be added here, and implementing one has to remove it.
 ///
-/// What C does with each, so the list is a work item and not a shrug:
-/// `CARD` (card number, `motorRecord.cc:596`), `HSV`/`LSV` (HIGH/LOW alarm
-/// severities, `alarm_sub:3411`), `LSPG` (limit-switch stop/pause/go,
-/// `motorRecord.cc:2622`), `PP` ("post process" flag, `:1590`), `INIT`
-/// (startup command string, `:604`), `PREM` (pre-move command, `:2213`) and
-/// `LOCK` (lock the record against moves, `:2050`). A client asking a C IOC for
-/// any of them gets a value; asking this port gets a field-not-found — which is
-/// what it got before too, just without anything saying so.
-const UNIMPLEMENTED: &[&str] = &["CARD", "HSV", "LSV", "LSPG", "PP", "INIT", "PREM", "LOCK"];
+/// What remains is the set `motorRecord.cc` never assigns outside
+/// `init_record`, so serving one from record state would give it nothing to
+/// track: `CARD` (set once from the OUT link type, `motorRecord.cc:650-665`),
+/// `HSV`/`LSV` (declared but read by nothing in `motorRecord.cc` — `alarm_sub`
+/// raises both limit alarms at `HLSV`, `:3401-3407`), `INIT` (startup command
+/// string, consumed by device support at `motordevCom.cc:310`), `PREM`
+/// (pre-move command, consumed by vendor device support, e.g.
+/// `devPM304.cc:209-211`) and `LOCK` (soft-channel position lock, read at
+/// `devSoft.cc:237`).
+///
+/// Being on this list is not the same as being unreachable. A client asking
+/// this port for one of them gets an answer: `RecordInstance::resolve_field`
+/// falls through to `declared_default`, which serves the `.dbd`
+/// `initial(...)`, and a put lands in `declared_overrides` and reads back. For
+/// a field the record genuinely never writes that IS C's value. That is also
+/// why the list has to stay honest — `LSPG` and `PP` sat here while the record
+/// was writing them all along, and the fallback answered `3` and `0` forever
+/// with nothing to show anything was wrong.
+const UNIMPLEMENTED: &[&str] = &["CARD", "HSV", "LSV", "INIT", "PREM", "LOCK"];
 
 #[test]
 fn test_dly_delays_finalization() {

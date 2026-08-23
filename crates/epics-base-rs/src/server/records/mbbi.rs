@@ -358,6 +358,33 @@ impl Record for MbbiRecord {
         "mbbi"
     }
 
+    /// C `mbbiRecord.c:221-226` — the `db_post_events` inside `special()`
+    /// after a `SPC_MOD` write:
+    ///
+    /// ```c
+    /// if (fieldIndex >= mbbiRecordZRST && fieldIndex <= mbbiRecordFFST
+    ///         && prec->val == fieldIndex - mbbiRecordZRST) {
+    ///     db_post_events(prec, &prec->val, DBE_VALUE | DBE_LOG);
+    /// }
+    /// ```
+    ///
+    /// Re-labelling the state VAL currently sits on changes what a
+    /// `DBR_*_STRING` subscriber renders without changing VAL, so C posts VAL
+    /// to push the new label out; every operator display reads a `mbbi` as
+    /// a string. The equality is the whole gate — editing any OTHER state's
+    /// label posts nothing, because no subscriber's rendering moved.
+    ///
+    /// ZRVL..FFVL are `SPC_MOD` too, and C's own comment there says so, but they
+    /// fall outside the index range and post nothing. What they DO reach is
+    /// `init_common`, whose `sdef` this port derives on demand
+    /// ([`Self::sdef`]) rather than caching, so that half needs no hook.
+    fn monitor_side_effect_fields(&self, put_field: &str) -> &'static [&'static str] {
+        match crate::server::record::multibit_state_string_index(put_field) {
+            Some(state) if state == self.val => &["VAL"],
+            _ => &[],
+        }
+    }
+
     /// `SIMM` is `DBF_MENU menu(menuSimm)` (`mbbiRecord.dbd.pod`): the
     /// multibit records carry the three-choice NO/YES/RAW simulation menu.
     /// Served as `DBR_ENUM` with these labels. The state severities and

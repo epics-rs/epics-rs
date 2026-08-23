@@ -162,10 +162,10 @@ fn ai_alarm_thresholds() {
 
     // Configure alarm limits
     inst.common.analog_alarm = Some(epics_base_rs::server::record::AnalogAlarmConfig {
-        hihi: 90.0,
-        high: 70.0,
-        low: 30.0,
-        lolo: 10.0,
+        hihi: epics_base_rs::server::record::AlarmLimit::Double(90.0),
+        high: epics_base_rs::server::record::AlarmLimit::Double(70.0),
+        low: epics_base_rs::server::record::AlarmLimit::Double(30.0),
+        lolo: epics_base_rs::server::record::AlarmLimit::Double(10.0),
         hhsv: AlarmSeverity::Major as i16,
         hsv: AlarmSeverity::Minor as i16,
         lsv: AlarmSeverity::Minor as i16,

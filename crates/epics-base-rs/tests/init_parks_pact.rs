@@ -10,10 +10,12 @@
 //!     }
 //! ```
 //!
-//! PACT stays TRUE for the life of the IOC, so `dbProcess` takes its
-//! PACT-active branch on every scan and record support never runs again. It is
-//! how C disables a `sub` with no subroutine — the record still serves its
-//! fields, it just cannot process. Measured on the compiled softIoc:
+//! PACT stays TRUE for as long as SNAM stays empty, so `dbProcess` takes its
+//! PACT-active branch on every scan and record support does not run. It is how
+//! C disables a `sub` with no subroutine — the record still serves its fields,
+//! it just cannot process. The park is released by an SNAM put and by nothing
+//! else (`subRecord.c:180-187`, covered in
+//! `sub_snam_put_moves_the_pact_park.rs`). Measured on the compiled softIoc:
 //!
 //! ```text
 //! $ caget -t P:SUB.PACT   -> 1        (record(sub,"P:SUB"){}, no SNAM)
@@ -22,8 +24,9 @@
 //!
 //! The boundary is SNAM: empty parks, non-empty does not. PACT is a `dbCommon`
 //! field with one owner, so the transition happens in the init owner
-//! (`RecordInstance::run_init_passes`) off the record's `init_record_parks_pact`,
-//! not by a record reaching into common state.
+//! (`RecordInstance::run_init_passes`) off the record's `Record::parks_pact`,
+//! not by a record reaching into common state. The put owner re-asks the same
+//! predicate either side of an SNAM put, which is C's two-pass `special()`.
 
 use epics_base_rs::server::database::PvDatabase;
 use epics_base_rs::server::record::Record;
@@ -63,8 +66,9 @@ async fn r21_a_sub_with_an_snam_is_not_parked() {
     );
 }
 
-/// The park is not a one-shot flag a later process clears: C never releases it,
-/// so every scan from then on hits the PACT-active branch and VAL never moves.
+/// The park is not a one-shot flag a later process clears: no process cycle
+/// releases it — only an SNAM put does — so every scan hits the PACT-active
+/// branch and VAL never moves.
 #[epics_macros_rs::epics_test]
 async fn r21_a_parked_sub_never_runs_record_support() {
     let db = PvDatabase::new();

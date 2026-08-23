@@ -141,10 +141,21 @@ impl Record for MbbiDirectRecord {
 
     fn process(&mut self) -> CaResult<ProcessOutcome> {
         if !self.skip_convert {
+            // C `mbbiDirectRecord.c:155-163` is the whole convert:
+            //
+            //     epicsUInt32 rval = prec->rval;
+            //     if (prec->shft > 0) rval >>= prec->shft;
+            //     prec->val = rval;
+            //
+            // MASK is not read. It belongs to device support, which positions
+            // it (`prec->mask <<= prec->shft`, devMbbiDirectSoftRaw.c:48) and
+            // applies it to RVAL before the record ever sees it (`:55`), or —
+            // under asyn — overwrites MASK with the driver's already-positioned
+            // hardware mask (devAsynUInt32Digital.c:1008-1009). Masking here
+            // with the record's own UNSHIFTED NOBT mask destroyed the value it
+            // was meant to protect: NOBT=4 SHFT=4 RVAL=240 gives `240 & 0x0F`
+            // = 0 instead of 15.
             let mut raw = self.rval;
-            if self.mask != 0 {
-                raw &= self.mask;
-            }
             if self.shft > 0 {
                 // Same defect family as mbbi/mbbo: a CA-written SHFT
                 // >= 32 panics a bare `>>` in debug builds. `checked_shr`

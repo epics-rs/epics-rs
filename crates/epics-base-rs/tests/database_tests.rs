@@ -5700,7 +5700,7 @@ async fn test_dfanout_value_write() {
     }
 }
 
-/// C `dfanoutRecord.c:115-122` reads VAL from DOL on every process
+/// C `dfanoutRecord.c:116-122` reads VAL from DOL on every process
 /// cycle when `omsl == menuOmslclosed_loop`. The Rust port previously
 /// omitted dfanout from the DOL-eligible record-type list in
 /// `processing.rs::process_record_with_links_inner`, so a dfanout
@@ -7595,8 +7595,8 @@ async fn test_complete_async_record_updates_timestamp_at_completion() {
 /// In the Rust port the equivalent flag is `LongoutRecord::first_output_done`
 /// (`crates/epics-base-rs/src/server/records/longout.rs:69`):
 /// `compute_should_output` short-circuits to `true` while it is
-/// false, then the framework's `on_output_complete` flips it to
-/// `true` after the OUT link / device write succeeds.
+/// false, then the framework's `after_output_decision` flips it to
+/// `true` at the end of the cycle — whether or not that cycle wrote.
 ///
 /// This test pins the integration: a first process cycle with
 /// OOPT=1 must drive write_db_link_value (observed via the target
@@ -8343,13 +8343,13 @@ async fn test_mbbo_direct_initialises_val_from_bits_when_undef() {
 
 /// epics-base PR `e3c9d590` / `20404003` regression: `lnkCalc` JSON
 /// link `{calc:{expr:"...", args:[...], time:"X"}}` parses into
-/// `ParsedLink::Calc`, the read path evaluates the expression by
-/// fetching each input PV and binding A..L slots, and timestamp
-/// passthrough from the chosen input is available via
-/// `evaluate_calc_link_with_time`.
+/// `ParsedLink::Calc` and the read path evaluates the expression by
+/// fetching each input PV and binding the `A..` slots in order. What the
+/// record then DOES with `time_source` is a processing-path question and
+/// lives in `calc_link_adopts_its_time_inputs_stamp.rs`.
 #[epics_macros_rs::epics_test]
-async fn test_lnk_calc_parses_evaluates_and_passes_timestamp() {
-    use epics_base_rs::server::record::{CalcArg, CalcLink, ParsedLink, parse_link_v2};
+async fn test_lnk_calc_parses_and_evaluates() {
+    use epics_base_rs::server::record::{CalcLink, ParsedLink, parse_link_v2};
     use epics_base_rs::server::records::ai::AiRecord;
 
     // The port's string-arg shorthand: one `args` slot holding a link to
@@ -8408,7 +8408,7 @@ async fn test_lnk_calc_parses_evaluates_and_passes_timestamp() {
         args: vec![name_arg("pv_a"), name_arg("pv_b")],
         time_source: Some('A'),
     };
-    let parsed = ParsedLink::Calc(calc.clone());
+    let parsed = ParsedLink::Calc(calc);
     let mut visited = HashSet::new();
     let value = db
         .read_link_value_soft(&parsed, true, &mut visited, 0)
@@ -8417,33 +8417,17 @@ async fn test_lnk_calc_parses_evaluates_and_passes_timestamp() {
         EpicsValue::Double(v) => assert!((v - 13.0).abs() < 1e-9, "expected 3+5*2=13, got {v}"),
         other => panic!("expected Double, got {other:?}"),
     }
-
-    // Timestamp passthrough: nudge pv_a's common.time to a known
-    // value, then verify evaluate_calc_link_with_time returns it.
-    let known = std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000);
-    if let Some(rec) = db.get_record("pv_a") {
-        rec.write().common.time = known;
-    }
-    let (v, t) = db
-        .evaluate_calc_link_with_time(&calc)
-        .await
-        .expect("calc evaluates with time");
-    match v {
-        EpicsValue::Double(x) => assert!((x - 13.0).abs() < 1e-9),
-        other => panic!("expected Double, got {other:?}"),
-    }
-    assert_eq!(t, Some(known), "time pulled from pv_a (letter 'A')");
 }
 
 /// A `lnkCalc` `{calc:...}` link whose input record is NON-LOCAL must
-/// read that input through the external CA path, and its timestamp
-/// passthrough must adopt the remote `.TIME` — each `A..L` input is its
-/// own `dbInitLink` link, so a non-local input is a CA link. The pre-fix
-/// loop read every input with a local-only `get_pv` (and the time source
-/// with a local-only `get_record`), so a single non-local input made the
-/// whole evaluation return `None` and the time fell back to the
-/// consumer's own. Sibling of the non-local Db read / OUT-write / TSEL
-/// `.TIME` fixes — same `dbInitLink` locality cause, the lnkCalc inputs.
+/// read that input through the external CA path — each `A..` input is its
+/// own `dbInitLink` link (`lnkCalc.c:353`), so a non-local input is a CA
+/// link. The pre-fix loop read every input with a local-only `get_pv`, so
+/// a single non-local input made the whole evaluation return `None`.
+/// Sibling of the non-local Db read / OUT-write / TSEL `.TIME` fixes —
+/// same `dbInitLink` locality cause, the lnkCalc inputs. The matching
+/// non-local TIMESTAMP boundary is in
+/// `calc_link_adopts_its_time_inputs_stamp.rs`, which owns that half.
 #[epics_macros_rs::epics_test]
 async fn test_lnk_calc_nonlocal_input_resolves_externally() {
     use epics_base_rs::server::database::LinkSet;
@@ -8493,9 +8477,14 @@ async fn test_lnk_calc_nonlocal_input_resolves_externally() {
         time_source: Some('A'),
     };
 
-    let (value, time) = db
-        .evaluate_calc_link_with_time(&calc)
-        .await
+    let mut visited = HashSet::new();
+    let value = db
+        .read_link_value_soft(
+            &epics_base_rs::server::record::ParsedLink::Calc(calc),
+            true,
+            &mut visited,
+            0,
+        )
         .expect("calc with a non-local input must still evaluate");
     match value {
         // 10 (remote A) + 5 (local B) * 2 = 20.
@@ -8505,12 +8494,6 @@ async fn test_lnk_calc_nonlocal_input_resolves_externally() {
         ),
         other => panic!("expected Double, got {other:?}"),
     }
-    let expected = std::time::UNIX_EPOCH + std::time::Duration::new(1_700_000_456, 321);
-    assert_eq!(
-        time,
-        Some(expected),
-        "time source 'A' is non-local → adopt the remote .TIME via the CA path"
-    );
 }
 
 /// Regression: a CA put to `mbbo.VAL` must recompute RVAL/ORAW.
@@ -9659,7 +9642,7 @@ async fn sub_record_negative_status_raises_soft_alarm_at_brsv() {
 }
 
 /// An `aSub` publishes the subroutine's return status as VAL (C
-/// `aSubRecord.c:223` `prec->val = status`), overwriting whatever the
+/// `aSubRecord.c:224` `prec->val = status`), overwriting whatever the
 /// closure wrote to VAL, and a negative status raises SOFT_ALARM at BRSV.
 #[epics_macros_rs::epics_test]
 async fn asub_record_val_is_return_status_and_negative_soft_alarms() {
@@ -10450,20 +10433,29 @@ async fn init_applies_constant_dol_across_record_types() {
     }
 
     // mbbo_direct: constant seeds VAL and the bit fields decompose from it
-    // (5 = 0b101 → B0=1, B1=0, B2=1); UDF cleared.
+    // (5 = 0b101 → B0=1, B1=0, B2=1); UDF cleared. Driven through the record
+    // creation sink like its siblings above — the seed belongs to the init-seed
+    // owner, not to `post_init_finalize_undef`, which runs before it.
     let mut mbd = MbboDirectRecord::default();
     mbd.omsl = 1;
     mbd.dol = "5".to_string();
-    let mut udf = true;
-    mbd.post_init_finalize_undef(&mut udf).unwrap();
-    assert_eq!(mbd.val, 5, "mbbo_direct constant DOL → VAL=5");
-    assert_eq!(mbd.bits[0], 1, "mbbo_direct B0 from VAL=5");
-    assert_eq!(mbd.bits[1], 0, "mbbo_direct B1 from VAL=5");
-    assert_eq!(mbd.bits[2], 1, "mbbo_direct B2 from VAL=5");
-    assert!(
-        !udf,
-        "mbbo_direct constant DOL clears UDF (recGblInitConstantLink)"
-    );
+    db.add_record("MBD_CONST", Box::new(mbd)).await.unwrap();
+    {
+        let rec = db.get_record("MBD_CONST").unwrap();
+        let inst = rec.read();
+        assert_eq!(
+            inst.record.get_field("VAL"),
+            Some(EpicsValue::Long(5)),
+            "mbbo_direct constant DOL → VAL=5"
+        );
+        assert_eq!(inst.record.get_field("B0"), Some(EpicsValue::UChar(1)));
+        assert_eq!(inst.record.get_field("B1"), Some(EpicsValue::UChar(0)));
+        assert_eq!(inst.record.get_field("B2"), Some(EpicsValue::UChar(1)));
+        assert!(
+            inst.common.udf == 0,
+            "mbbo_direct constant DOL clears UDF (recGblInitConstantLink)"
+        );
+    }
 }
 
 /// A calcout with ODLY > 0 defers its forward link (and VAL/OVAL monitors)

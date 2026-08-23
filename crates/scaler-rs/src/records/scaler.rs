@@ -88,6 +88,24 @@ impl CountDelay {
     }
 }
 
+/// Which C callback the record's one pending re-entry stands for.
+///
+/// C arms three independent `callbackRequestDelayed` timers and only two of
+/// them process the record: `delayCallbackFunc` (scalerRecord.c:216-231) and
+/// `autoCallbackFunc` (:233-239) end in `scanOnce`, while
+/// `updateCallbackFunc` (:203-214) calls `updateCounts` and returns — it
+/// cannot reach `recGblFwdLink` at :480. The framework has one re-entry shape,
+/// `ProcessAction::ReprocessAfter`, and it is always a `process()`, so which
+/// callback a timer models has to be recorded when it is armed rather than
+/// inferred from record state when it fires.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum ReentryKind {
+    /// `updateCallbackFunc` — the periodic display refresh.
+    DisplayRefresh,
+    /// `delayCallbackFunc` / `autoCallbackFunc` — a real process cycle.
+    Process,
+}
+
 pub struct ScalerRecord {
     // --- Control/Status ---
     pub val: f64,
@@ -147,6 +165,16 @@ pub struct ScalerRecord {
     /// scheduled interval has elapsed. `secs` is the delay the timer was armed
     /// WITH — as in C, a DLY written mid-wait cannot retime the armed wait.
     count_delay: Option<CountDelay>,
+    /// The kind of the one re-entry this record currently has armed, set by
+    /// `arm_reentry` — the sole emitter of `ProcessAction::ReprocessAfter`
+    /// here. Consumed by `process()` on the cycle the framework flags as a
+    /// continuation. Only one can be outstanding: arming mints a fresh async
+    /// token, which supersedes any pending one.
+    pending_reentry: Option<ReentryKind>,
+    /// Set by the framework immediately before `process()` when this cycle is
+    /// the record's own scheduled re-entry rather than a put, scan or forward
+    /// link. Read once, with `pending_reentry`, at the top of `process()`.
+    continuation: bool,
 
     // --- Done flag (set by device support read, consumed by process) ---
     /// Set by device support's read() when counting has completed.
@@ -262,6 +290,8 @@ impl Default for ScalerRecord {
             delay_start: None,
             autocount_delay: 0.0,
             count_delay: None,
+            pending_reentry: None,
+            continuation: false,
             done_flag: false,
             reqstart_old_pr1: 0,
             special_actions: Vec::new(),
@@ -283,6 +313,14 @@ impl ScalerRecord {
         if self.freq > 0.0 {
             self.t = self.s[0] as f64 / self.freq;
         }
+    }
+
+    /// Arm this record's one pending re-entry, recording which C callback it
+    /// stands for. The sole emitter of `ProcessAction::ReprocessAfter` here, so
+    /// a timer cannot be armed without declaring its kind.
+    fn arm_reentry(&mut self, kind: ReentryKind, delay: std::time::Duration) -> ProcessAction {
+        self.pending_reentry = Some(kind);
+        ProcessAction::ReprocessAfter(delay)
     }
 
     /// Port of C `updateCounts()` (scalerRecord.c:549-601).
@@ -514,9 +552,11 @@ impl ScalerRecord {
         // earlier this process cycle (scalerRecord.c:453) and saw `ss !=
         // COUNTING`, so it could not queue this — emit it here directly.
         if self.rat1 > 0.1 {
-            actions.push(ProcessAction::ReprocessAfter(
+            let refresh = self.arm_reentry(
+                ReentryKind::DisplayRefresh,
                 std::time::Duration::from_secs_f64(1.0 / self.rat1 as f64),
-            ));
+            );
+            actions.push(refresh);
         }
         actions
     }
@@ -641,6 +681,36 @@ impl Record for ScalerRecord {
         // process() cycle; every path that leaves process() without
         // reaching `scalerRecord.c:480` leaves the link unfired.
         self.fire_fwd_link = false;
+
+        // C `updateCallbackFunc` (scalerRecord.c:203-214) calls `updateCounts`
+        // and nothing else, so a periodic display refresh never reaches
+        // `recGblFwdLink` (:480). `updateCounts` in turn refuses the call
+        // outright when it did not come from `process()` and the count is over
+        // (:562-568):
+        //
+        //     called_by_process = (pscal->pact == TRUE);
+        //     if (!called_by_process) {
+        //         if (pscal->ss != SCALER_STATE_IDLE) pscal->pact = TRUE;
+        //         else return;
+        //     }
+        //
+        // The port's refresh is a `ReprocessAfter` re-entry — a whole
+        // `process()` — so without that gate a refresh armed while counting
+        // lands after the count has stopped, reaches the "done counting?" block
+        // with `ss`/`pcnt`/`us` all clear, and fires FLNK a second time. The
+        // refresh still runs the full cycle while `ss != IDLE`: unlike C, which
+        // is driven to `process()` by `deviceCallbackFunc` on completion, this
+        // port polls `done()` from the process cycle, and the refresh IS that
+        // poll while a count is live.
+        let reentry = if std::mem::take(&mut self.continuation) {
+            self.pending_reentry.take()
+        } else {
+            None
+        };
+        if reentry == Some(ReentryKind::DisplayRefresh) && self.ss == SCALER_STATE_IDLE {
+            return Ok(ProcessOutcome::complete_with(Vec::new()));
+        }
+
         let mut just_finished_user_count = false;
         let mut just_started_user_count = false;
         let mut actions = Vec::new();
@@ -747,7 +817,8 @@ impl Record for ScalerRecord {
         // zeroes the display while us==WAITING, recomputes T from S1/FREQ,
         // and (while counting) schedules the next periodic update.
         if let Some(reprocess) = self.update_counts() {
-            actions.push(ProcessAction::ReprocessAfter(reprocess));
+            let refresh = self.arm_reentry(ReentryKind::DisplayRefresh, reprocess);
+            actions.push(refresh);
         }
 
         // C scalerRecord.c:455-468 — COUT on either edge, then a SECOND COUTP put
@@ -796,9 +867,11 @@ impl Record for ScalerRecord {
                 self.ss = SCALER_STATE_WAITING;
                 self.delay_start = Some(Instant::now());
                 self.autocount_delay = dly_sec;
-                actions.push(ProcessAction::ReprocessAfter(
+                let auto = self.arm_reentry(
+                    ReentryKind::Process,
                     std::time::Duration::from_secs_f64(dly_sec),
-                ));
+                );
+                actions.push(auto);
                 return Ok(ProcessOutcome::complete_with(actions));
             } else if self.ss == SCALER_STATE_WAITING {
                 // Already WAITING: only start once the scheduled delay
@@ -813,9 +886,11 @@ impl Record for ScalerRecord {
                     self.ss = SCALER_STATE_COUNTING;
                 } else {
                     let remaining = self.autocount_delay - elapsed;
-                    actions.push(ProcessAction::ReprocessAfter(
+                    let auto = self.arm_reentry(
+                        ReentryKind::Process,
                         std::time::Duration::from_secs_f64(remaining),
-                    ));
+                    );
+                    actions.push(auto);
                     return Ok(ProcessOutcome::complete_with(actions));
                 }
             } else {
@@ -835,6 +910,14 @@ impl Record for ScalerRecord {
     /// nothing hands back nothing.
     fn take_special_actions(&mut self) -> Vec<ProcessAction> {
         std::mem::take(&mut self.special_actions)
+    }
+
+    /// C hands each delayed callback to a function of its own; the framework
+    /// has one re-entry shape, so it reports whether this cycle IS that
+    /// re-entry and `process()` pairs the answer with `pending_reentry` to
+    /// recover which callback fired.
+    fn set_process_continuation(&mut self, continuation: bool) {
+        self.continuation = continuation;
     }
 
     fn special(&mut self, field: &str, after: bool) -> CaResult<()> {
@@ -876,13 +959,17 @@ impl Record for ScalerRecord {
                         // C:641-653 — abort any counting / start request.
                         match self.us {
                             USER_STATE_WAITING => {
-                                // C:643-647 — cancel the pending delay
-                                // watchdog (`epicsTimerCancel`). The armed
-                                // `ReprocessAfter` still fires, but it finds
-                                // no `count_delay` and `us == IDLE`, so the
-                                // `delayCallbackFunc` transition below is a
-                                // no-op — C's own `us == WAITING && cnt`
-                                // guard is what makes a raced callback safe.
+                                // C:643-647 — `if (pdelayCallback->timer)
+                                // epicsTimerCancel(...)`, the first statement of
+                                // the arm. C's own callback is a two-line guarded
+                                // transition, so a raced one costs nothing; the
+                                // port's is a whole `process()`, which reaches the
+                                // "done counting?" block and fires FLNK a second
+                                // time DLY seconds after the user stopped the
+                                // count. Cancelling advances the re-entry
+                                // generation, so the armed timer is gone rather
+                                // than merely harmless.
+                                self.special_actions.push(ProcessAction::CancelReprocess);
                                 self.count_delay = None;
                                 self.us = USER_STATE_IDLE;
                             }
@@ -925,9 +1012,11 @@ impl Record for ScalerRecord {
                         start: Instant::now(),
                         secs,
                     });
-                    self.special_actions.push(ProcessAction::ReprocessAfter(
+                    let start = self.arm_reentry(
+                        ReentryKind::Process,
                         std::time::Duration::from_secs_f64(secs),
-                    ));
+                    );
+                    self.special_actions.push(start);
                 }
             }
             // C scalerRecord.c:664-668 — CONT. The write changes auto-count

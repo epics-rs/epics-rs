@@ -15,13 +15,10 @@
 //! iocInit()
 //! ```
 
-use std::collections::HashMap;
-use std::fmt::Write;
-
-use epics_base_rs::server::db_loader;
 use epics_base_rs::server::iocsh::registry::*;
 
 use crate::address::TopicAddress;
+use crate::db_gen::RecordWriter;
 use crate::ioc::register_pending_topic;
 
 /// A single record definition to be generated.
@@ -36,7 +33,36 @@ struct RecordDef {
     scan_io_intr: bool,
 }
 
-/// Generate a .db string from record definitions and load it via db_loader.
+/// Render record definitions as `.db` text.
+///
+/// Split out from [`load_records`] so the generated text can be parsed in a
+/// test without a live database: a topic containing a space is written with
+/// quotes around it, and getting the escaping wrong fails `parse_db` for the
+/// whole device rather than for one field.
+fn build_db_string(prefix: &str, dev: &str, port: &str, records: &[RecordDef]) -> String {
+    let mut db_string = String::new();
+    for r in records {
+        let pv_name = format!("{prefix}{dev}:{}", r.suffix);
+        let mut w = RecordWriter::new(&mut db_string, r.record_type, &pv_name);
+        w.field("DTYP", r.dtyp);
+        if r.scan_io_intr {
+            w.field("SCAN", "I/O Intr");
+        }
+        // `drv_info` carries the caller's topic, and a Z2M friendly name with
+        // a space is spelled with quotes around it (`TopicAddress::to_drv_info`).
+        w.field(r.link_field, &format!("@asyn({port}) {}", r.drv_info));
+        if !r.egu.is_empty() {
+            w.field("EGU", r.egu);
+        }
+        if let Some(prec) = r.prec {
+            w.field("PREC", &prec.to_string());
+        }
+        w.end();
+    }
+    db_string
+}
+
+/// Generate a .db string from record definitions and load it.
 fn load_records(
     prefix: &str,
     dev: &str,
@@ -44,75 +70,7 @@ fn load_records(
     records: &[RecordDef],
     ctx: &CommandContext,
 ) -> Result<(), String> {
-    let mut db_string = String::new();
-    for r in records {
-        let pv_name = format!("{prefix}{dev}:{}", r.suffix);
-        let _ = writeln!(db_string, "record({}, \"{pv_name}\") {{", r.record_type);
-        let _ = writeln!(db_string, "    field(DTYP, \"{}\")", r.dtyp);
-        if r.scan_io_intr {
-            let _ = writeln!(db_string, "    field(SCAN, \"I/O Intr\")");
-        }
-        let _ = writeln!(
-            db_string,
-            "    field({}, \"@asyn({port}) {}\")",
-            r.link_field, r.drv_info
-        );
-        if !r.egu.is_empty() {
-            let _ = writeln!(db_string, "    field(EGU, \"{}\")", r.egu);
-        }
-        if let Some(prec) = r.prec {
-            let _ = writeln!(db_string, "    field(PREC, \"{prec}\")");
-        }
-        let _ = writeln!(db_string, "}}");
-    }
-
-    let macros = HashMap::new();
-    // Per-record failures are printed and accumulated so the command ends
-    // in Err and `on error` sees a device whose records did not land
-    // (epics-base#498 / UI-105).
-    let mut deferred: Vec<String> = Vec::new();
-    let defs = db_loader::parse_db(&db_string, &macros)
-        .map_err(|e| format!("z2m: parse_db failed: {e}"))?;
-    for def in defs {
-        match db_loader::create_record(&def.record_type) {
-            Ok(mut record) => {
-                let mut common_fields = Vec::new();
-                if let Err(e) =
-                    db_loader::apply_fields(&mut record, &def.fields, &mut common_fields)
-                {
-                    let msg = format!("z2m: apply_fields for {}: {e}", def.name);
-                    eprintln!("{msg}");
-                    deferred.push(msg);
-                    continue;
-                }
-                // Record + loaded common fields in one call: the sink
-                // runs the `iocInit` passes against the final field
-                // set, not a pre-load one (see `ioc.rs`).
-                let load =
-                    epics_base_rs::server::database::RecordLoad::from_common_fields(common_fields);
-                ctx.block_on(async {
-                    if let Err(e) = ctx.db().add_loaded_record(&def.name, record, load).await {
-                        let msg = format!("z2m: register '{}' skipped: {e}", def.name);
-                        eprintln!("{msg}");
-                        deferred.push(msg);
-                    }
-                });
-            }
-            Err(e) => {
-                let msg = format!("z2m: create_record({}): {e}", def.record_type);
-                eprintln!("{msg}");
-                deferred.push(msg);
-            }
-        }
-    }
-    if let Some(first) = deferred.first() {
-        return Err(if deferred.len() == 1 {
-            first.clone()
-        } else {
-            format!("{first} (+{} more)", deferred.len() - 1)
-        });
-    }
-    Ok(())
+    crate::db_gen::load_generated_db("z2m", &build_db_string(prefix, dev, port, records), ctx)
 }
 
 /// Register a Z2M JSON topic and return its canonical drvInfo (param name).
@@ -519,4 +477,51 @@ pub fn register_z2m_commands(
         .register_startup_command(cmd_z2m_switch())
         .register_startup_command(cmd_z2m_motion())
         .register_startup_command(cmd_z2m_remote2())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashMap;
+
+    use epics_base_rs::server::db_loader;
+
+    use super::*;
+
+    /// The module's own documented invocation (`z2m.rs:8`): a Z2M friendly
+    /// name with a space, which `TopicAddress::to_drv_info` spells with quotes
+    /// around the topic. Those quotes land inside a quoted `.db` field value,
+    /// so an unescaped one ends the value early and `parse_db` fails for the
+    /// WHOLE device — not one record of the five is created.
+    #[test]
+    fn test_spaced_topic_generates_loadable_db() {
+        let drv_info = TopicAddress::parse("JSON:FLOAT \"zigbee2mqtt/living room plug\" power")
+            .unwrap()
+            .to_drv_info();
+        assert!(drv_info.contains('"'), "drv_info = {drv_info:?}");
+
+        let records = [RecordDef {
+            record_type: "ai",
+            suffix: "Power",
+            dtyp: "asynFloat64",
+            link_field: "INP",
+            drv_info: drv_info.clone(),
+            egu: "W",
+            prec: Some(1),
+            scan_io_intr: true,
+        }];
+        let db = build_db_string("TEST:MQTT:", "SWR:Plug", "MQTT1", &records);
+        let defs = db_loader::parse_db(&db, &HashMap::new())
+            .unwrap_or_else(|e| panic!("parse_db failed: {e}\n{db}"));
+
+        assert_eq!(defs.len(), 1);
+        assert_eq!(defs[0].name, "TEST:MQTT:SWR:Plug:Power");
+        let (_, inp) = defs[0]
+            .fields
+            .iter()
+            .find(|(k, _)| k == "INP")
+            .expect("INP field");
+        // The loader must hand the driver back the exact param name the
+        // driver registered under `addr.to_drv_info()`.
+        assert_eq!(inp.to_string(), format!("@asyn(MQTT1) {drv_info}"));
+    }
 }

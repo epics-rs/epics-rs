@@ -413,6 +413,22 @@ impl Record for ASubRecord {
         Ok(ProcessOutcome::complete())
     }
 
+    /// C `cvt_dbaddr` (`aSubRecord.c:476-495`) reads the capacity out of the
+    /// channel's own count field — `(&prec->noa)[offset]` for `A..U`,
+    /// `(&prec->nova)[offset]` for `VALA..VALU` — while `get_array_info` serves
+    /// `NEx`/`NEVx`, the elements the last link fetch or subroutine actually
+    /// delivered. `initFields` allocates each cell at its full `NOx` and never
+    /// resizes it, so the capacity belongs to the declaration and only the
+    /// served count moves.
+    fn dbaddr_capacity(&self, field: &str) -> Option<u32> {
+        let (prefix, idx) = parse_channel(field)?;
+        match prefix {
+            "" => Some(self.noa[idx].max(0) as u32),
+            "VAL" => Some(self.nova[idx].max(0) as u32),
+            _ => None,
+        }
+    }
+
     fn get_field(&self, name: &str) -> Option<EpicsValue> {
         match name {
             "VAL" => return Some(EpicsValue::Long(self.val)),

@@ -366,10 +366,25 @@ pub fn dbf_link_class(record_type: &str, field: &str) -> Option<DbfLinkClass> {
 /// (the output records). Input records declare `SIOL` as `DBF_INLINK`.
 /// Same output-record set as the device-write records — compare
 /// `crate::server::record::Record::can_device_write`.
+///
+/// The population is every `field(SIOL,DBF_OUTLINK)` in the record types this
+/// workspace ports: the nine Base output records plus synApps `busy`
+/// (`busyRecord.dbd`), a `bo` derivative whose SIOL is an output like its
+/// parent's. Every other SIOL-bearing type — `ai` `bi` `mbbi` `mbbiDirect`
+/// `longin` `int64in` `stringin` `lsi` `event` `waveform` `aai` `histogram`,
+/// synApps `swait` and `mca` — declares `DBF_INLINK`.
 fn is_output_record_type(record_type: &str) -> bool {
     matches!(
         record_type,
-        "ao" | "bo" | "longout" | "int64out" | "mbbo" | "mbboDirect" | "stringout" | "lso" | "aao"
+        "ao" | "bo"
+            | "busy"
+            | "longout"
+            | "int64out"
+            | "mbbo"
+            | "mbboDirect"
+            | "stringout"
+            | "lso"
+            | "aao"
     )
 }
 
@@ -651,6 +666,78 @@ mod dbf_link_class_tests {
         // SIML is always DBF_INLINK regardless of direction.
         assert_eq!(dbf_link_class("bo", "SIML"), Some(DbfLinkClass::InLink));
         assert_eq!(dbf_link_class("ai", "SIML"), Some(DbfLinkClass::InLink));
+    }
+
+    /// Every `field(SIOL,DBF_*)` in the record types this workspace ports,
+    /// read out of the C dbds. synApps `busy` is the one non-Base output
+    /// record — it derives from `bo` and declares `field(SIOL,DBF_OUTLINK)`
+    /// (`busyRecord.dbd`) — while synApps `swait` (`swaitRecord.dbd`) and
+    /// `mca` (`mcaRecord.dbd`) declare `DBF_INLINK`. A missing output entry is
+    /// silent: the classifier defaults to `InLink`, and the CP/CPP mask C
+    /// applies to an output link (`dbStaticLib.c:2380-2391`) is then skipped.
+    #[test]
+    fn siol_direction_matches_every_c_dbd_this_workspace_ports() {
+        for rtype in [
+            "ao",
+            "bo",
+            "busy",
+            "longout",
+            "int64out",
+            "mbbo",
+            "mbboDirect",
+            "stringout",
+            "lso",
+            "aao",
+        ] {
+            assert_eq!(
+                dbf_link_class(rtype, "SIOL"),
+                Some(DbfLinkClass::OutLink),
+                "{rtype} declares field(SIOL,DBF_OUTLINK)"
+            );
+        }
+        for rtype in [
+            "ai",
+            "bi",
+            "mbbi",
+            "mbbiDirect",
+            "longin",
+            "int64in",
+            "stringin",
+            "lsi",
+            "event",
+            "waveform",
+            "aai",
+            "histogram",
+            "swait",
+            "mca",
+        ] {
+            assert_eq!(
+                dbf_link_class(rtype, "SIOL"),
+                Some(DbfLinkClass::InLink),
+                "{rtype} declares field(SIOL,DBF_INLINK)"
+            );
+        }
+    }
+
+    /// The consequence a misclassified SIOL actually has: `check_link_assignment`
+    /// turns the class into a [`LinkFieldType`], and only the `Out` arm applies
+    /// C's `modifiers &= ~(pvlOptCPP|pvlOptCP)`. Classified as an input, a
+    /// `busy` SIOL would keep a CPP that C strips.
+    #[test]
+    fn a_busy_siol_discards_cp_the_way_an_output_link_must() {
+        use crate::server::record::{
+            LinkFieldType, LinkProcessPolicy, ParsedLink, parse_link_field,
+        };
+
+        let ftype = match dbf_link_class("busy", "SIOL").unwrap() {
+            DbfLinkClass::InLink => LinkFieldType::In,
+            DbfLinkClass::OutLink => LinkFieldType::Out,
+            DbfLinkClass::FwdLink => LinkFieldType::Fwd,
+        };
+        match parse_link_field("TGT.VAL CPP", ftype) {
+            ParsedLink::Db(db) => assert_eq!(db.policy, LinkProcessPolicy::NoProcess),
+            other => panic!("expected a db link, got {other:?}"),
+        }
     }
 
     /// `LNK0..LNKF` shares

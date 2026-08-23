@@ -90,7 +90,8 @@ pub struct Int64inRecord {
     // int64inRecord.dbd.pod:301-307). A non-negative SDLY makes the simulated SIOL read asynchronous:
     // C's `readValue` arms `callbackRequestProcessCallbackDelayed(..., sdly)`
     // and holds PACT across the delay (int64inRecord.c:398-405). The framework reads the delay
-    // via `get_field("SDLY")`, so the field must exist for a `.db` to set it.
+    // via `resolve_field("SDLY")`, which falls back to the dbd `initial`, so
+    // this field is the record's own store for it rather than a requirement.
     #[field(type = "Double")]
     pub sdly: f64,
 }

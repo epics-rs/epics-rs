@@ -98,7 +98,7 @@ fn test_process_sends_value_no_delay() {
     // sets STS=Success / advances SENT — for a non-CONSTANT OUT link.
     rec.out = "OUTPUT:PV".to_string();
     rec.val = 42.0;
-    rec.process().unwrap();
+    process_ok(&mut rec);
     assert_eq!(rec.sent, 42.0);
     assert_eq!(rec.sts, 2); // Success
     assert_eq!(rec.wait, 0); // Not busy (no delay)
@@ -110,20 +110,18 @@ fn test_process_sends_value_with_delay() {
     rec.dly = 1.0; // 1 second delay
     rec.out = "OUTPUT:PV".to_string();
     rec.val = 42.0;
-    let outcome = rec.process().unwrap();
+    let actions = process_ok(&mut rec);
     assert_eq!(rec.sent, 42.0);
     // C `valuePut` clears `prec->wait = FALSE` right after the OUT write
     // (throttleRecord.c:575): the value is written, nothing is queued, so
     // WAIT is clear through the cooldown even though the timer is armed.
     assert_eq!(rec.wait, 0, "immediate send wrote the value -> WAIT clear");
     // Should have ReprocessAfter action and WriteDbLink for OUT
-    let has_reprocess = outcome
-        .actions
+    let has_reprocess = actions
         .iter()
         .any(|a| matches!(a, ProcessAction::ReprocessAfter(_)));
     assert!(has_reprocess, "Should have ReprocessAfter action");
-    let has_write = outcome
-        .actions
+    let has_write = actions
         .iter()
         .any(|a| matches!(a, ProcessAction::WriteDbLink { .. }));
     assert!(has_write, "Should have WriteDbLink action for OUT");
@@ -135,7 +133,7 @@ fn test_process_queues_during_delay() {
     rec.dly = 10.0; // Long delay
     rec.out = "OUTPUT:PV".to_string();
     rec.val = 42.0;
-    rec.process().unwrap(); // First value sent, delay starts
+    process_ok(&mut rec); // First value sent, delay starts
     assert_eq!(rec.sent, 42.0);
     // First (immediate) send wrote the value; nothing is queued, so WAIT
     // is clear during the cooldown (C `valuePut` clears it at
@@ -144,14 +142,16 @@ fn test_process_queues_during_delay() {
 
     // Second value during delay — should be queued
     rec.val = 99.0;
-    let outcome = rec.process().unwrap();
-    let has_reprocess = outcome
-        .actions
+    let actions = process_ok(&mut rec);
+    // C `enterValue` (throttleRecord.c:522-526) only sets `wait_flag` when a
+    // cooldown is running; it requests NO second callback. The timer armed by
+    // the first send is still pending and will drain this value.
+    let has_reprocess = actions
         .iter()
         .any(|a| matches!(a, ProcessAction::ReprocessAfter(_)));
     assert!(
-        has_reprocess,
-        "Should have ReprocessAfter for pending drain"
+        !has_reprocess,
+        "queuing must not re-arm the cooldown — C `enterValue` requests no callback"
     );
     assert_eq!(rec.sent, 42.0); // Not sent yet — still in delay
     // A value is now queued, un-written: C `process()` set `prec->wait =
@@ -179,12 +179,12 @@ fn test_process_osent_tracking() {
     rec.dly = 0.0;
     rec.out = "OUTPUT:PV".to_string();
     rec.val = 10.0;
-    rec.process().unwrap();
+    process_ok(&mut rec);
     assert_eq!(rec.sent, 10.0);
     assert_eq!(rec.osent, 0.0); // Previous sent was 0
 
     rec.val = 20.0;
-    rec.process().unwrap();
+    process_ok(&mut rec);
     assert_eq!(rec.sent, 20.0);
     assert_eq!(rec.osent, 10.0); // Previous sent was 10
 }
@@ -204,7 +204,7 @@ fn test_limit_clipping_on() {
     rec.init_record(1).unwrap();
 
     rec.val = 150.0;
-    rec.process().unwrap();
+    process_ok(&mut rec);
     assert_eq!(rec.sent, 100.0);
     assert_eq!(rec.drvls, 2); // High limit
     assert_eq!(rec.sts, 2); // Success (clamped but sent)
@@ -221,7 +221,7 @@ fn test_limit_clipping_low() {
     rec.init_record(1).unwrap();
 
     rec.val = 5.0;
-    rec.process().unwrap();
+    process_ok(&mut rec);
     assert_eq!(rec.sent, 10.0);
     assert_eq!(rec.drvls, 1); // Low limit
 }
@@ -262,7 +262,7 @@ fn test_no_limits_when_equal() {
     rec.init_record(1).unwrap();
 
     rec.val = 999.0;
-    rec.process().unwrap();
+    process_ok(&mut rec);
     assert_eq!(rec.sent, 999.0);
     assert_eq!(rec.drvls, 0); // Normal
 }
@@ -287,26 +287,25 @@ fn test_pending_value_clamped_to_drive_limit_on_drain() {
 
     // First (in-range) value: sent immediately, delay window opens.
     rec.val = 50.0;
-    rec.process().unwrap();
+    process_ok(&mut rec);
     assert_eq!(rec.sent, 50.0);
     // Immediate send wrote the value -> WAIT clear (C `valuePut`:575).
     assert_eq!(rec.wait, 0, "immediate send -> WAIT clear, none queued");
 
     // Out-of-range value arrives DURING the delay window — queued RAW.
     rec.val = 150.0;
-    rec.process().unwrap();
+    process_ok(&mut rec);
     assert_eq!(rec.sent, 50.0, "queued value must not be sent yet");
     // The clamped value is now queued, un-written -> WAIT set (C :287).
     assert_eq!(rec.wait, 1, "value queued during the delay -> WAIT set");
 
-    // Wait past the delay, then reprocess to drain the queued value.
-    std::thread::sleep(std::time::Duration::from_millis(60));
-    let outcome = rec.process().unwrap();
+    // Fire the cooldown timer to drain the queued value.
+    let actions = fire_timer(&mut rec);
 
     // The drained value must be CLAMPED to DRVLH, not the raw 150.0.
     assert_eq!(rec.sent, 100.0, "drained value must be clamped to DRVLH");
     assert_eq!(rec.drvls, 2, "DRVLS must report High limit");
-    let written = outcome.actions.iter().find_map(|a| match a {
+    let written = actions.iter().find_map(|a| match a {
         ProcessAction::WriteDbLink { value, .. } => Some(value),
         _ => None,
     });
@@ -335,24 +334,22 @@ fn test_pending_value_rejected_on_drain_when_clipping_off() {
     rec.init_record(1).unwrap();
 
     rec.val = 50.0;
-    rec.process().unwrap();
+    process_ok(&mut rec);
     assert_eq!(rec.sent, 50.0);
 
     rec.val = 150.0; // out of range — rejected by this process()'s limit block
-    rec.process().unwrap();
+    process_ok(&mut rec);
     assert_eq!(rec.val, 50.0, "out-of-range value restored to OVAL=50");
     assert_eq!(rec.drvls, 2, "DRVLS reports High limit");
 
-    std::thread::sleep(std::time::Duration::from_millis(60));
-    let outcome = rec.process().unwrap();
+    let actions = fire_timer(&mut rec);
 
     assert_eq!(rec.sent, 50.0, "rejected value must not reach OUT");
     assert_eq!(
         rec.sts, 2,
         "STS stays Success from the first send — C never sets STS on a limit rejection"
     );
-    let has_write = outcome
-        .actions
+    let has_write = actions
         .iter()
         .any(|a| matches!(a, ProcessAction::WriteDbLink { .. }));
     assert!(!has_write, "drain has nothing queued — no OUT write");
@@ -466,7 +463,7 @@ fn test_limit_clipping_low_bound_order() {
     rec.init_record(1).unwrap();
 
     rec.val = -50.0; // below low limit
-    rec.process().unwrap();
+    process_ok(&mut rec);
     assert_eq!(rec.sent, 10.0, "clamped to DRVLL");
     assert_eq!(rec.drvls, 1, "DRVLS Low");
 }
@@ -561,8 +558,8 @@ fn test_no_forward_link_on_drain_with_nothing_queued() {
     rec.process().unwrap(); // send + arm delay timer
     assert!(rec.should_fire_forward_link());
 
-    // Drain the delay window with NOTHING queued.
-    std::thread::sleep(std::time::Duration::from_millis(60));
+    // Fire the cooldown timer with NOTHING queued.
+    rec.set_process_continuation(true);
     rec.process().unwrap();
     assert!(
         !rec.should_fire_forward_link(),
@@ -629,12 +626,11 @@ fn test_real_out_link_reports_success_and_writes() {
     rec.dly = 0.0;
     rec.out = "OUTPUT:PV".to_string(); // real DB link
     rec.val = 42.0;
-    let outcome = rec.process().unwrap();
+    let actions = process_ok(&mut rec);
 
     assert_eq!(rec.sts, 2, "a real OUT link write reports STS=Success");
     assert_eq!(rec.sent, 42.0, "a real OUT link advances SENT");
-    let has_write = outcome
-        .actions
+    let has_write = actions
         .iter()
         .any(|a| matches!(a, ProcessAction::WriteDbLink { .. }));
     assert!(has_write, "a real OUT link emits a WriteDbLink");
@@ -729,10 +725,9 @@ fn test_dly_huge_finite_does_not_panic_process() {
     // process() reaches the `self.dly > 0.0` branch decision and the
     // immediate-send path; with DLY = 0.0 it builds no Duration and
     // must not panic.
-    let outcome = rec.process().unwrap();
+    process_ok(&mut rec);
     assert_eq!(rec.sent, 1.0, "value must have been sent");
     assert_eq!(rec.wait, 0, "no delay armed, WAIT stays clear");
-    let _ = outcome;
 }
 
 #[test]
@@ -765,4 +760,299 @@ fn test_dly_huge_finite_assigned_directly_does_not_panic_process() {
         "a positive DLY arms the delay but the value is written -> WAIT clear"
     );
     let _ = outcome;
+}
+
+// ============================================================
+// T-R3-1 — the DLY cooldown timer's callback is its own event.
+//
+// C keeps two paths: `process()` -> `enterValue` for a client value, and
+// `delayFuncCallback` -> `valuePut` for the cooldown expiring
+// (throttleRecord.c:517-538). The port reaches both through `process()`, so
+// the framework's continuation marker — not a clock reading — is what says
+// which one this is. Boundary matrix: {DLY unchanged, raised, lowered,
+// zeroed} x {value queued, nothing queued}.
+// ============================================================
+
+/// A throttle with a real OUT link whose first value has been written and
+/// whose DLY cooldown is therefore armed.
+fn armed(dly: f64) -> ThrottleRecord {
+    let mut rec = ThrottleRecord::default();
+    rec.out = "OUTPUT:PV".to_string();
+    rec.dly = dly;
+    rec.val = 5.0;
+    process_ok(&mut rec);
+    assert_eq!(rec.sent, 5.0, "first value is written immediately");
+    assert_eq!(rec.wait, 0, "written, nothing waiting");
+    rec
+}
+
+/// A client put of DLY: the field write plus C's `special()` (:392-409) and
+/// the framework's paired drain of whatever it queued. Returns the re-anchor
+/// actions `special()` asked for.
+fn put_dly(rec: &mut ThrottleRecord, dly: f64) -> Vec<ProcessAction> {
+    rec.put_field("DLY", EpicsValue::Double(dly)).unwrap();
+    rec.special("DLY", true).unwrap();
+    rec.take_special_actions()
+}
+
+/// The cooldown timer firing — C `delayFuncCallback` (:530-538). The
+/// framework marks its own `ReprocessAfter` re-entry; nothing else does.
+fn fire_timer(rec: &mut ThrottleRecord) -> Vec<ProcessAction> {
+    rec.set_process_continuation(true);
+    process_ok(rec)
+}
+
+fn writes(actions: &[ProcessAction]) -> Vec<f64> {
+    actions
+        .iter()
+        .filter_map(|a| match a {
+            ProcessAction::WriteDbLink {
+                value: EpicsValue::Double(v),
+                ..
+            } => Some(*v),
+            _ => None,
+        })
+        .collect()
+}
+
+/// The timer fired with nothing waiting: C `valuePut`'s `else` arm
+/// (:597-599) clears `delay_flag` and does nothing else — no write, no
+/// queue, no FLNK. Whether DLY moved under the running cooldown, and by how
+/// much, cannot change that.
+fn timer_with_nothing_queued(dly_move: Option<f64>) {
+    let mut rec = armed(10.0);
+    if let Some(dly) = dly_move {
+        put_dly(&mut rec, dly);
+    }
+
+    let actions = fire_timer(&mut rec);
+
+    assert_eq!(writes(&actions), Vec::<f64>::new(), "nothing to write");
+    assert_eq!(rec.sent, 5.0, "SENT must not move");
+    assert_eq!(rec.wait, 0, "nothing is waiting — WAIT must stay clear");
+    assert!(
+        !rec.should_fire_forward_link(),
+        "no OUT write — C never reaches recGblFwdLink"
+    );
+}
+
+#[test]
+fn timer_fire_with_nothing_queued_and_dly_unchanged_writes_nothing() {
+    timer_with_nothing_queued(None);
+}
+
+#[test]
+fn timer_fire_with_nothing_queued_and_dly_raised_writes_nothing() {
+    timer_with_nothing_queued(Some(60.0));
+}
+
+#[test]
+fn timer_fire_with_nothing_queued_and_dly_lowered_writes_nothing() {
+    timer_with_nothing_queued(Some(0.5));
+}
+
+#[test]
+fn timer_fire_with_nothing_queued_and_dly_zeroed_writes_nothing() {
+    timer_with_nothing_queued(Some(0.0));
+}
+
+/// The timer fired with a value waiting: C `valuePut`'s `wait_flag` arm
+/// writes it ONCE, clears WAIT and fires FLNK. A second fire finds the queue
+/// empty and must write nothing — the value cannot be sent twice, whatever
+/// DLY did meanwhile.
+fn timer_with_value_queued(dly_move: Option<f64>) {
+    let mut rec = armed(10.0);
+
+    rec.val = 9.0;
+    let queued = process_ok(&mut rec);
+    assert_eq!(writes(&queued), Vec::<f64>::new(), "queued, not sent");
+    assert_eq!(rec.wait, 1, "a value is waiting");
+
+    if let Some(dly) = dly_move {
+        put_dly(&mut rec, dly);
+    }
+
+    let actions = fire_timer(&mut rec);
+    assert_eq!(
+        writes(&actions),
+        vec![9.0],
+        "the queued value goes out once"
+    );
+    assert_eq!(rec.sent, 9.0);
+    assert_eq!(rec.wait, 0, "written — WAIT clears (C :575)");
+    assert!(
+        rec.should_fire_forward_link(),
+        "a real OUT write fires FLNK"
+    );
+
+    let again = fire_timer(&mut rec);
+    assert_eq!(
+        writes(&again),
+        Vec::<f64>::new(),
+        "the queue was drained — a second fire must not resend"
+    );
+    assert!(
+        !rec.should_fire_forward_link(),
+        "no second OUT write — no second FLNK"
+    );
+}
+
+#[test]
+fn timer_fire_with_value_queued_and_dly_unchanged_sends_it_once() {
+    timer_with_value_queued(None);
+}
+
+#[test]
+fn timer_fire_with_value_queued_and_dly_raised_sends_it_once() {
+    timer_with_value_queued(Some(60.0));
+}
+
+#[test]
+fn timer_fire_with_value_queued_and_dly_lowered_sends_it_once() {
+    timer_with_value_queued(Some(0.5));
+}
+
+#[test]
+fn timer_fire_with_value_queued_and_dly_zeroed_sends_it_once() {
+    timer_with_value_queued(Some(0.0));
+}
+
+/// C `special()` DLY (:400-408) cancels the in-flight callback and re-requests
+/// it with the new delay, but ONLY while one is in flight. The port's
+/// re-anchor rides out as a fresh `ReprocessAfter` whose minted token
+/// supersedes the pending one.
+#[test]
+fn dly_put_reanchors_the_running_cooldown() {
+    let mut rec = armed(10.0);
+    let actions = put_dly(&mut rec, 2.0);
+    assert_eq!(
+        actions
+            .iter()
+            .filter_map(|a| match a {
+                ProcessAction::ReprocessAfter(d) => Some(d.as_secs_f64()),
+                _ => None,
+            })
+            .collect::<Vec<_>>(),
+        vec![2.0],
+        "a DLY put during the cooldown re-arms the timer with the NEW delay"
+    );
+}
+
+#[test]
+fn dly_put_with_no_cooldown_running_arms_nothing() {
+    let mut rec = ThrottleRecord::default();
+    rec.out = "OUTPUT:PV".to_string();
+    let actions = put_dly(&mut rec, 2.0);
+    assert!(
+        actions.is_empty(),
+        "C only cancels/re-requests when delay_flag is set (:400)"
+    );
+}
+
+// ============================================================
+// T-R3-3 — STS and SENT come from the OUT put's result.
+//
+// C `valuePut` (throttleRecord.c:564-575) sets `sts = throttleSTS_SUC` and
+// `sent = oval` inside `if (RTN_SUCCESS(status))`, and `throttleSTS_ERR` in
+// the `else`. The port emits the put as a `ProcessAction::WriteDbLink`, so
+// the result arrives through `set_out_link_write_status`.
+// ============================================================
+
+/// The framework reporting the outcome of the `WriteDbLink` the record
+/// emitted, the way `execute_process_actions` does.
+fn report_put(rec: &mut ThrottleRecord, actions: &[ProcessAction], failed: bool) {
+    for a in actions {
+        if let ProcessAction::WriteDbLink { link_field, value } = a {
+            rec.set_out_link_write_status(link_field, value, failed);
+        }
+    }
+}
+
+/// One full cycle: `process()` plus the framework's report that the OUT put
+/// it emitted landed. STS and SENT are decided only by that report, so a test
+/// that reads them has to run both halves, as the framework does.
+fn process_ok(rec: &mut ThrottleRecord) -> Vec<ProcessAction> {
+    let actions = rec.process().unwrap().actions;
+    report_put(rec, &actions, false);
+    actions
+}
+
+#[test]
+fn process_commits_no_sts_or_sent_before_the_out_put_runs() {
+    let mut rec = ThrottleRecord::default();
+    rec.out = "OUTPUT:PV".to_string();
+    rec.val = 5.0;
+    let outcome = rec.process().unwrap();
+
+    assert_eq!(writes(&outcome.actions), vec![5.0], "the put is emitted");
+    assert_eq!(
+        rec.sts, 0,
+        "STS stays Unknown until the put reports — C reads it from dbPutLink"
+    );
+    assert_eq!(rec.sent, 0.0, "SENT advances only on a successful put");
+}
+
+#[test]
+fn successful_out_put_sets_sts_success_and_advances_sent() {
+    let mut rec = ThrottleRecord::default();
+    rec.out = "OUTPUT:PV".to_string();
+
+    rec.val = 5.0;
+    let first = rec.process().unwrap();
+    report_put(&mut rec, &first.actions, false);
+    assert_eq!(rec.sts, 2, "STS=Success (C :567)");
+    assert_eq!(rec.sent, 5.0, "SENT takes the value that landed (C :568)");
+    assert_eq!(rec.osent, 0.0);
+
+    rec.val = 7.0;
+    let second = rec.process().unwrap();
+    report_put(&mut rec, &second.actions, false);
+    assert_eq!(rec.sent, 7.0);
+    assert_eq!(rec.osent, 5.0, "OSENT trails SENT by one send");
+}
+
+#[test]
+fn failed_out_put_sets_sts_error_and_leaves_sent() {
+    let mut rec = ThrottleRecord::default();
+    rec.out = "NO:SUCH:REMOTE:PV".to_string();
+    rec.val = 5.0;
+    let outcome = rec.process().unwrap();
+    report_put(&mut rec, &outcome.actions, true);
+
+    assert_eq!(rec.sts, 1, "STS=Error (C :574-575)");
+    assert_eq!(rec.sent, 0.0, "a put that failed must not advance SENT");
+    assert_eq!(rec.osent, 0.0);
+}
+
+/// A failed put still fired the forward link: C `recGblFwdLink` sits on the
+/// whole non-CONSTANT arm (:580), outside the `RTN_SUCCESS` branch.
+#[test]
+fn failed_out_put_still_fires_the_forward_link() {
+    let mut rec = ThrottleRecord::default();
+    rec.out = "NO:SUCH:REMOTE:PV".to_string();
+    rec.val = 5.0;
+    let outcome = rec.process().unwrap();
+    report_put(&mut rec, &outcome.actions, true);
+    assert!(rec.should_fire_forward_link());
+}
+
+/// A later failure must not leave STS reading Success from the send before it.
+#[test]
+fn a_failed_put_after_a_successful_one_reports_error() {
+    let mut rec = ThrottleRecord::default();
+    rec.out = "OUTPUT:PV".to_string();
+
+    rec.val = 5.0;
+    let ok = rec.process().unwrap();
+    report_put(&mut rec, &ok.actions, false);
+    assert_eq!(rec.sts, 2);
+
+    rec.val = 6.0;
+    let bad = rec.process().unwrap();
+    report_put(&mut rec, &bad.actions, true);
+    assert_eq!(
+        rec.sts, 1,
+        "STS follows the latest put, not the last good one"
+    );
+    assert_eq!(rec.sent, 5.0, "SENT still reads the value that landed");
 }

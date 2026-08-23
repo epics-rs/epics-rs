@@ -1169,6 +1169,19 @@ impl ParamBatch {
     }
 }
 
+/// The `NDArrayAddr`, `maxThreads` and initial `numThreads` that C takes as
+/// `NDPluginDriver` constructor arguments (NDPluginDriver.cpp:153, :158, :159).
+///
+/// The port's `*Configure` entry points take none of them: a plugin runtime
+/// spawns exactly one `plugin-data-<port>` thread and its `WiringRegistry` is
+/// keyed by port name, address 0. They are named rather than inlined so the
+/// constructor's param block and `SharedProcessorInner`'s initial state cannot
+/// drift — publishing one value to the RBV and running on another is what a
+/// reader of MaxThreads_RBV would have no way to detect.
+const PLUGIN_NDARRAY_ADDR: i32 = 0;
+const PLUGIN_MAX_THREADS: i32 = 1;
+const PLUGIN_NUM_THREADS: i32 = 1;
+
 /// PortDriver implementation for a plugin's control plane.
 #[allow(dead_code)]
 pub struct PluginPortDriver {
@@ -1192,6 +1205,7 @@ impl PluginPortDriver {
         param_change_tx: tokio::sync::mpsc::UnboundedSender<PluginParamMsg>,
         processor: &mut P,
         array_data: Option<Arc<parking_lot::Mutex<Option<Arc<NDArray>>>>>,
+        pool: &NDArrayPool,
     ) -> AsynResult<Self> {
         let mut base = PortDriverBase::new(
             port_name,
@@ -1205,48 +1219,54 @@ impl PluginPortDriver {
         let ndarray_params = NDArrayDriverParams::create(&mut base)?;
         let plugin_params = PluginBaseParams::create(&mut base)?;
 
-        // Set defaults (EnableCallbacks=0: Disable by default, matching EPICS ADCore)
-        base.set_int32_param(plugin_params.enable_callbacks, 0, 0)?;
-        base.set_int32_param(plugin_params.blocking_callbacks, 0, 0)?;
-        base.set_int32_param(plugin_params.queue_size, 0, queue_size as i32)?;
+        // C++ `NDPluginDriver::NDPluginDriver` (NDPluginDriver.cpp:152-160)
+        // initialises exactly these nine read-only / read-back params here,
+        // under a comment that states the mechanism: "If a value is not set
+        // here then the read request will return an error (uninitialized)".
+        // `PluginPortDriver` does not override `read_int32`, so an unset one
+        // reaches `get_int32_strict` (asyn-rs/src/port.rs:1663-1665) and the
+        // record it feeds sits UDF/INVALID until something else happens to
+        // write it — which for MaxThreads_RBV (SCAN "I/O Intr", no PINI, no
+        // output partner) is never.
+        base.set_string_param(plugin_params.nd_array_port, 0, ndarray_port.into())?;
+        base.set_int32_param(plugin_params.nd_array_addr, 0, PLUGIN_NDARRAY_ADDR)?;
         base.set_int32_param(plugin_params.dropped_arrays, 0, 0)?;
-        base.set_int32_param(plugin_params.queue_use, 0, 0)?;
+        base.set_int32_param(plugin_params.dropped_output_arrays, 0, 0)?;
+        base.set_int32_param(plugin_params.queue_size, 0, queue_size as i32)?;
+        // C `:157` — an empty queue has every slot free. The param is spelled
+        // QUEUE_FREE (params.rs:40) whatever the struct field is called, so 0
+        // here published a permanently full queue on an idle plugin.
+        base.set_int32_param(plugin_params.queue_use, 0, queue_size as i32)?;
+        base.set_int32_param(plugin_params.max_threads, 0, PLUGIN_MAX_THREADS)?;
+        base.set_int32_param(plugin_params.num_threads, 0, PLUGIN_NUM_THREADS)?;
+        // C `:160` passes its `blockingCallbacks` constructor argument; the
+        // port has no such argument and starts `blocking_mode` false.
+        base.set_int32_param(plugin_params.blocking_callbacks, 0, 0)?;
+
+        // EnableCallbacks=0 (Disable) by default, matching EPICS ADCore.
+        base.set_int32_param(plugin_params.enable_callbacks, 0, 0)?;
         base.set_string_param(plugin_params.plugin_type, 0, plugin_type_name.into())?;
+
+        // C++ `NDPluginDriver` derives from `asynNDArrayDriver`, so the base
+        // constructor's read-only block (asynNDArrayDriver.cpp:954-1005) runs
+        // for every plugin as well.
+        crate::driver::ndarray_driver::init_read_only_params(
+            &mut base,
+            &ndarray_params,
+            port_name,
+        )?;
+        crate::driver::ndarray_driver::refresh_pool_stats(&mut base, &ndarray_params, pool)?;
+        // Not in C's block: NDArrayCallbacks is a database parameter there,
+        // but a plugin that never emits arrays must publish 0 rather than let
+        // the DB turn its output on.
         base.set_int32_param(
             ndarray_params.array_callbacks,
             0,
             processor.does_array_callbacks() as i32,
         )?;
-        base.set_int32_param(ndarray_params.write_file, 0, 0)?;
-        base.set_int32_param(ndarray_params.read_file, 0, 0)?;
-        base.set_int32_param(ndarray_params.capture, 0, 0)?;
-        base.set_int32_param(ndarray_params.file_write_status, 0, 0)?;
-        base.set_string_param(ndarray_params.file_write_message, 0, "".into())?;
-        base.set_string_param(ndarray_params.file_path, 0, "".into())?;
-        base.set_string_param(ndarray_params.file_name, 0, "".into())?;
-        base.set_int32_param(ndarray_params.file_number, 0, 0)?;
-        base.set_int32_param(ndarray_params.auto_increment, 0, 0)?;
-        base.set_string_param(ndarray_params.file_template, 0, "%s%s_%3.3d.dat".into())?;
+        // Not in C's block either — `NDFullFileName_RBV` is only written by a
+        // file plugin after a successful write.
         base.set_string_param(ndarray_params.full_file_name, 0, "".into())?;
-        base.set_int32_param(ndarray_params.create_dir, 0, 0)?;
-        base.set_string_param(ndarray_params.temp_suffix, 0, "".into())?;
-
-        // Set plugin identity params
-        base.set_string_param(ndarray_params.port_name_self, 0, port_name.into())?;
-        base.set_string_param(
-            ndarray_params.ad_core_version,
-            0,
-            env!("CARGO_PKG_VERSION").into(),
-        )?;
-        base.set_string_param(
-            ndarray_params.driver_version,
-            0,
-            env!("CARGO_PKG_VERSION").into(),
-        )?;
-        if !ndarray_port.is_empty() {
-            base.set_string_param(plugin_params.nd_array_port, 0, ndarray_port.into())?;
-        }
-
         // Create STD_ARRAY_DATA param for StdArrays plugins (triggers I/O Intr on ArrayData waveform)
         let std_array_data_param = if array_data.is_some() {
             Some(base.create_param("STD_ARRAY_DATA", asyn_rs::param::ParamType::GenericPointer)?)
@@ -1677,6 +1697,7 @@ pub fn create_plugin_runtime_multi_addr<P: NDPluginProcess>(
         param_tx,
         &mut processor,
         array_data,
+        &pool,
     )
     .expect("failed to create plugin port driver");
 
@@ -1743,9 +1764,9 @@ pub fn create_plugin_runtime_multi_addr<P: NDPluginProcess>(
         throttler: super::throttler::Throttler::new(0.0),
         prev_input_array: None,
         dims_prev: vec![0i32; crate::ndarray::ND_ARRAY_MAX_DIMS],
-        nd_array_addr: 0,
-        max_threads: 1,
-        num_threads: 1,
+        nd_array_addr: PLUGIN_NDARRAY_ADDR,
+        max_threads: PLUGIN_MAX_THREADS,
+        num_threads: PLUGIN_NUM_THREADS,
     }));
 
     let data_enabled = enabled.clone();
@@ -2248,6 +2269,7 @@ pub fn create_plugin_runtime_with_output<P: NDPluginProcess>(
         param_tx,
         &mut processor,
         array_data,
+        &pool,
     )
     .expect("failed to create plugin port driver");
 
@@ -2300,9 +2322,9 @@ pub fn create_plugin_runtime_with_output<P: NDPluginProcess>(
         throttler: super::throttler::Throttler::new(0.0),
         prev_input_array: None,
         dims_prev: vec![0i32; crate::ndarray::ND_ARRAY_MAX_DIMS],
-        nd_array_addr: 0,
-        max_threads: 1,
-        num_threads: 1,
+        nd_array_addr: PLUGIN_NDARRAY_ADDR,
+        max_threads: PLUGIN_MAX_THREADS,
+        num_threads: PLUGIN_NUM_THREADS,
     }));
 
     let data_enabled = enabled.clone();
@@ -2956,6 +2978,119 @@ mod tests {
 
         assert_eq!(buf.len(), 2);
         assert_eq!(buf.dropped_output_arrays, 1);
+    }
+
+    #[test]
+    fn test_constructor_initialises_c_read_only_params() {
+        // C++ NDPluginDriver.cpp:152-160 initialises these in the constructor
+        // precisely so a read before any array flows returns a value instead
+        // of "uninitialized". Nothing here enables callbacks or sends an
+        // array: this is the idle plugin an operator sees right after
+        // iocInit, which is when QueueFree_RBV read 0 (full) and
+        // MaxThreads_RBV read UDF/INVALID.
+        let pool = Arc::new(NDArrayPool::new(1_000_000));
+        let (handle, _data_jh) = create_plugin_runtime_with_output(
+            "CTOR_TEST",
+            PassthroughProcessor,
+            pool,
+            20,
+            NDArrayOutput::new(),
+            "",
+            test_wiring(),
+        );
+        let port = handle.port_runtime().port_handle();
+        let read = |reason: usize| port.read_int32_blocking(reason, 0);
+
+        // C `:156` / `:157` — an idle queue is entirely free.
+        assert_eq!(read(handle.plugin_params.queue_size).unwrap(), 20);
+        assert_eq!(read(handle.plugin_params.queue_use).unwrap(), 20);
+        // C `:153` / `:158` / `:159`. These have no other writer: MaxThreads
+        // is a longin with SCAN "I/O Intr", no PINI and no output partner, so
+        // an unset param leaves it UDF forever.
+        assert_eq!(
+            read(handle.plugin_params.nd_array_addr).unwrap(),
+            PLUGIN_NDARRAY_ADDR
+        );
+        assert_eq!(
+            read(handle.plugin_params.max_threads).unwrap(),
+            PLUGIN_MAX_THREADS
+        );
+        assert_eq!(
+            read(handle.plugin_params.num_threads).unwrap(),
+            PLUGIN_NUM_THREADS
+        );
+        // C `:154` / `:155`.
+        assert_eq!(read(handle.plugin_params.dropped_arrays).unwrap(), 0);
+        assert_eq!(read(handle.plugin_params.dropped_output_arrays).unwrap(), 0);
+    }
+
+    #[test]
+    fn test_constructor_initialises_the_ndarray_read_only_block() {
+        // C++ `NDPluginDriver` derives from `asynNDArrayDriver`, so the base
+        // constructor's block (asynNDArrayDriver.cpp:954-1005) runs for a
+        // plugin as well. Read through the port handle, which is the same
+        // path a record takes: an unwritten param comes back as an error.
+        let pool = Arc::new(NDArrayPool::new(2_097_152));
+        let (handle, _data_jh) = create_plugin_runtime_with_output(
+            "NDCTOR_TEST",
+            PassthroughProcessor,
+            pool,
+            20,
+            NDArrayOutput::new(),
+            "",
+            test_wiring(),
+        );
+        let port = handle.port_runtime().port_handle();
+        let p = &handle.ndarray_params;
+        for (name, reason, want) in [
+            ("ARRAY_SIZE_X", p.array_size_x, 0),
+            ("ARRAY_SIZE_Y", p.array_size_y, 0),
+            ("ARRAY_SIZE_Z", p.array_size_z, 0),
+            ("ARRAY_SIZE", p.array_size, 0),
+            ("ND_DIMENSIONS", p.n_dimensions, 0),
+            (
+                "COLOR_MODE",
+                p.color_mode,
+                crate::color::NDColorMode::Mono as i32,
+            ),
+            ("UNIQUE_ID", p.unique_id, 0),
+            ("EPICS_TS_SEC", p.epics_ts_sec, 0),
+            ("EPICS_TS_NSEC", p.epics_ts_nsec, 0),
+            ("BAYER_PATTERN", p.bayer_pattern, 0),
+            ("ARRAY_COUNTER", p.array_counter, 0),
+            ("NUM_CAPTURED", p.num_captured, 0),
+            ("FREE_CAPTURE", p.free_capture, 0),
+            (
+                "ND_ATTRIBUTES_STATUS",
+                p.attributes_status,
+                crate::driver::ndarray_driver::ATTR_STATUS_FILE_NOT_FOUND,
+            ),
+            ("NUM_QUEUED_ARRAYS", p.num_queued_arrays, 0),
+            ("POOL_ALLOC_BUFFERS", p.pool_alloc_buffers, 0),
+            ("POOL_FREE_BUFFERS", p.pool_free_buffers, 0),
+        ] {
+            assert_eq!(
+                port.read_int32_blocking(reason, 0)
+                    .unwrap_or_else(|e| panic!("{name} unset after construction: {e:?}")),
+                want,
+                "{name}"
+            );
+        }
+        assert_eq!(
+            port.read_float64_blocking(p.pool_max_memory, 0)
+                .expect("POOL_MAX_MEMORY unset after construction"),
+            2.0
+        );
+        assert_eq!(
+            port.read_float64_blocking(p.pool_used_memory, 0)
+                .expect("POOL_USED_MEMORY unset after construction"),
+            0.0
+        );
+        assert_eq!(
+            port.read_float64_blocking(p.timestamp_rbv, 0)
+                .expect("TIME_STAMP unset after construction"),
+            0.0
+        );
     }
 
     #[test]

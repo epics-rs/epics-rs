@@ -363,6 +363,15 @@ pub trait OctetTransport: Send + Sync {
         self.write_frame(data)?;
         self.read_frame(timeout)
     }
+    /// Discard any partially received frame.
+    ///
+    /// `ModbusEngine::transact` calls this whenever a transaction ends
+    /// without a matching reply. Modbus/TCP is strictly request/response, so
+    /// bytes still held at that point are the head of a reply nobody will
+    /// finish reading, and a stream transport that reassembles frames must
+    /// drop them or read the next reply at the wrong offset. The default is a
+    /// no-op for the message-oriented links that keep nothing between reads.
+    fn reset_stream(&mut self) {}
 }
 
 /// The Modbus driver engine: request construction, the write/read cycle,
@@ -674,7 +683,30 @@ impl ModbusEngine {
     /// Transmit `framed` and receive the matching response PDU. For TCP the
     /// read loops until the MBAP transaction ID matches; for UDP a read
     /// failure retransmits up to [`UDP_MAX_RETRIES`] times.
+    ///
+    /// A transaction that ends in error takes the transport's partial frame
+    /// with it. Doing it here rather than at each failing site is the point:
+    /// the inner loop has a write `?`, a resend `?`, a read error, a malformed
+    /// header and two stale-frame ceilings, and every one of them leaves the
+    /// same residue, so the single exit is what keeps the next fallible call
+    /// someone adds from re-opening it.
     fn transact(
+        &mut self,
+        transport: &mut dyn OctetTransport,
+        framed: &[u8],
+        expected_txid: Option<u16>,
+        is_udp: bool,
+    ) -> ModbusResult<Vec<u8>> {
+        let result = self.transact_frame(transport, framed, expected_txid, is_udp);
+        if result.is_err() {
+            transport.reset_stream();
+        }
+        result
+    }
+
+    /// The body of [`Self::transact`] — every exit is routed through that
+    /// function so the partial-frame reset cannot be missed on a new one.
+    fn transact_frame(
         &mut self,
         transport: &mut dyn OctetTransport,
         framed: &[u8],

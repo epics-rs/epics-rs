@@ -907,6 +907,15 @@ impl Record for CompressRecord {
         field == "VAL" && self.balg == 1
     }
 
+    /// The other half of the same `cvt_dbaddr`: `paddr->no_elements =
+    /// prec->nsam` — the whole ring, not the `NUSE` that `get_array_info`
+    /// serves out of it. Sizing the channel from the fill level stranded a
+    /// client that connected before the ring filled, since `ca_element_count`
+    /// is settled once at create-channel time.
+    fn dbaddr_capacity(&self, _field: &str) -> Option<u32> {
+        Some(self.nsam.max(0) as u32)
+    }
+
     fn menu_field_choices(&self, field: &str) -> Option<&'static [&'static str]> {
         match field {
             "ALG" => Some(COMPRESS_ALG_CHOICES),

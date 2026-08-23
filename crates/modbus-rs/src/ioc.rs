@@ -57,7 +57,7 @@ use crate::driver::{
     ModbusConfig, ModbusEngine, ModbusFunctionCode, ModbusIoResponse, OctetTransport,
 };
 use crate::error::ModbusError;
-use crate::interpose::{LinkType, TransactionIdCounter};
+use crate::interpose::{LinkType, MbapAccumulator, TransactionIdCounter};
 use crate::protocol::MAX_MODBUS_FRAME_SIZE;
 
 /// `drvInfo` used by records that want the port's *default* data type — the C
@@ -169,21 +169,60 @@ pub struct SyncIoTransport {
     /// `epicsThreadSleep(writeDelay)` (`modbusInterpose.c:246`); zero disables
     /// it. Needed by slow serial PLCs that require an inter-frame gap.
     write_delay: Duration,
+    /// Stream reassembly for Modbus/TCP. `None` for the links that deliver one
+    /// message per read: UDP datagrams, and the serial links whose framing the
+    /// port's EOS or inter-character gap already resolves.
+    mbap: Option<MbapAccumulator>,
 }
 
 impl SyncIoTransport {
     /// Wrap a sync-I/O handle to the underlying octet port, with no pre-write
     /// delay (the `modbusInterposeConfig writeDelayMsec` default).
-    pub fn new(handle: SyncIOHandle) -> Self {
-        Self::with_write_delay(handle, Duration::ZERO)
+    pub fn new(handle: SyncIOHandle, link: LinkType) -> Self {
+        Self::with_write_delay(handle, Duration::ZERO, link)
     }
 
     /// Wrap a sync-I/O handle with an explicit pre-write delay
     /// (C `modbusInterposeConfig writeDelayMsec`).
-    pub fn with_write_delay(handle: SyncIOHandle, write_delay: Duration) -> Self {
+    ///
+    /// `link` is required rather than defaulted: a Modbus/TCP transport that
+    /// does not reassemble is the desynchronising reader this exists to
+    /// prevent, so it must not be constructible by omission.
+    pub fn with_write_delay(handle: SyncIOHandle, write_delay: Duration, link: LinkType) -> Self {
         Self {
             handle,
             write_delay,
+            mbap: matches!(link, LinkType::Tcp).then(MbapAccumulator::new),
+        }
+    }
+
+    /// The single reader: every byte this transport takes off the port passes
+    /// through here, so a Modbus/TCP link's reassembly cannot be bypassed by
+    /// adding a second read path — which is exactly what a `write_read` that
+    /// returned the raw chunk did, truncating any reply split across segments.
+    ///
+    /// `first` is the chunk a combined write-read op already has in hand; the
+    /// accumulator asks the port for more only when that chunk is short of a
+    /// whole MBAP frame.
+    fn frame_from(&mut self, first: Option<Vec<u8>>) -> crate::error::ModbusResult<Vec<u8>> {
+        let handle = &self.handle;
+        let mut first = first;
+        let mut read_chunk = move || match first.take() {
+            Some(buf) => Ok(buf),
+            None => handle
+                .read_octet(0, MAX_MODBUS_FRAME_SIZE)
+                .map_err(from_asyn),
+        };
+        match self.mbap.as_mut() {
+            // Modbus/TCP: one read is a slice of the stream, not a frame.
+            Some(acc) => acc.read_frame(read_chunk),
+            None => {
+                let buf = read_chunk()?;
+                if buf.is_empty() {
+                    return Err(ModbusError::Timeout);
+                }
+                Ok(buf)
+            }
         }
     }
 }
@@ -213,15 +252,14 @@ impl OctetTransport for SyncIoTransport {
             .map_err(from_asyn)
     }
 
-    fn read_frame(&mut self, _timeout: Duration) -> crate::error::ModbusResult<Vec<u8>> {
-        let buf = self
-            .handle
-            .read_octet(0, MAX_MODBUS_FRAME_SIZE)
-            .map_err(from_asyn)?;
-        if buf.is_empty() {
-            return Err(ModbusError::Timeout);
+    fn reset_stream(&mut self) {
+        if let Some(acc) = self.mbap.as_mut() {
+            acc.reset();
         }
-        Ok(buf)
+    }
+
+    fn read_frame(&mut self, _timeout: Duration) -> crate::error::ModbusResult<Vec<u8>> {
+        self.frame_from(None)
     }
 
     /// C `asynOctetSyncIO.c:231-276` through `SyncIOHandle::write_read`: the
@@ -242,14 +280,14 @@ impl OctetTransport for SyncIoTransport {
         if !self.write_delay.is_zero() {
             std::thread::sleep(self.write_delay);
         }
-        let buf = self
+        let first = self
             .handle
             .write_read(0, data, MAX_MODBUS_FRAME_SIZE)
             .map_err(from_asyn)?;
-        if buf.is_empty() {
+        if first.is_empty() {
             return Err(ModbusError::Timeout);
         }
-        Ok(buf)
+        self.frame_from(Some(first))
     }
 }
 
@@ -1366,9 +1404,10 @@ impl PortDriver for ModbusPortDriver {
         }
         let data = self.polled_data()?;
         let mut n = 0;
-        while n < buf.len() && (user.addr as usize + (n + 1) * rc) <= data.len() {
-            let regs = &data[user.addr as usize + n * rc..];
-            buf[n] = datatype::read_int32(dt, regs).map_err(to_asyn)?.0;
+        while n < buf.len() && (n + 1) * rc <= data.len() {
+            buf[n] = datatype::read_int32(dt, &data[n * rc..])
+                .map_err(to_asyn)?
+                .0;
             n += 1;
         }
         Ok(n)
@@ -1413,9 +1452,10 @@ impl PortDriver for ModbusPortDriver {
         }
         let data = self.polled_data()?;
         let mut n = 0;
-        while n < buf.len() && (user.addr as usize + (n + 1) * rc) <= data.len() {
-            let regs = &data[user.addr as usize + n * rc..];
-            buf[n] = datatype::read_float(dt, regs).map_err(to_asyn)?.0;
+        while n < buf.len() && (n + 1) * rc <= data.len() {
+            buf[n] = datatype::read_float(dt, &data[n * rc..])
+                .map_err(to_asyn)?
+                .0;
             n += 1;
         }
         Ok(n)
@@ -2004,6 +2044,7 @@ impl CommandHandler for ModbusConfigHandler {
         let transport = Box::new(SyncIoTransport::with_write_delay(
             sync,
             interpose.write_delay,
+            link,
         ));
 
         // C's transaction-ID counter lives on the interpose `modbusPvt`, one
@@ -2359,11 +2400,14 @@ mod tests {
         let clients: Vec<_> = [0xA0u8, 0xB0u8]
             .into_iter()
             .map(|tag| {
-                let mut transport = SyncIoTransport::new(SyncIOHandle::from_handle(
-                    runtime.port_handle().clone(),
-                    0,
-                    crate::driver::READ_TIMEOUT,
-                ));
+                let mut transport = SyncIoTransport::new(
+                    SyncIOHandle::from_handle(
+                        runtime.port_handle().clone(),
+                        0,
+                        crate::driver::READ_TIMEOUT,
+                    ),
+                    LinkType::Rtu,
+                );
                 std::thread::spawn(move || {
                     for i in 0..EXCHANGES {
                         let req = [tag, i as u8];
@@ -2444,7 +2488,7 @@ mod tests {
             "MB_SILENT",
             test_config(0, 4),
             LinkType::Rtu,
-            Box::new(SyncIoTransport::new(sync)),
+            Box::new(SyncIoTransport::new(sync, LinkType::Rtu)),
         )
         .expect("an RTU read config must build");
 
@@ -2463,11 +2507,14 @@ mod tests {
             "MB_SILENT_ABS",
             test_config(-1, 4),
             LinkType::Rtu,
-            Box::new(SyncIoTransport::new(SyncIOHandle::from_handle(
-                runtime.port_handle().clone(),
-                0,
-                crate::driver::READ_TIMEOUT,
-            ))),
+            Box::new(SyncIoTransport::new(
+                SyncIOHandle::from_handle(
+                    runtime.port_handle().clone(),
+                    0,
+                    crate::driver::READ_TIMEOUT,
+                ),
+                LinkType::Rtu,
+            )),
         )
         .expect("an RTU read config must build");
         let reason = absolute
@@ -2520,7 +2567,7 @@ mod tests {
             0,
             crate::driver::READ_TIMEOUT,
         );
-        let mut transport = SyncIoTransport::new(sync);
+        let mut transport = SyncIoTransport::new(sync, LinkType::Rtu);
         let mut engine = ModbusEngine::new(test_config(0, 1), LinkType::Rtu)
             .expect("an RTU read config must build");
         engine.poll(&mut transport).expect("the poll must succeed");
@@ -2563,6 +2610,93 @@ mod tests {
             poll_delay: Duration::ZERO,
             ..test_config(0, length)
         }
+    }
+
+    /// An octet port that delivers one 259-byte MBAP reply across two reads,
+    /// 140 bytes then 119 — what a real TCP socket does to a full-length
+    /// Modbus/TCP response.
+    struct SplitReplyPort {
+        base: PortDriverBase,
+        chunks: Arc<std::sync::Mutex<Vec<Vec<u8>>>>,
+    }
+
+    impl PortDriver for SplitReplyPort {
+        fn base(&self) -> &PortDriverBase {
+            &self.base
+        }
+        fn base_mut(&mut self) -> &mut PortDriverBase {
+            &mut self.base
+        }
+        fn io_write_octet(&mut self, _user: &mut AsynUser, data: &[u8]) -> AsynResult<usize> {
+            Ok(data.len())
+        }
+        fn io_read_octet(&mut self, _user: &AsynUser, buf: &mut [u8]) -> AsynResult<usize> {
+            let mut g = self.chunks.lock().unwrap();
+            if g.is_empty() {
+                return Err(AsynError::Status {
+                    status: AsynStatus::Timeout,
+                    message: "no more chunks".into(),
+                });
+            }
+            let c = g.remove(0);
+            buf[..c.len()].copy_from_slice(&c);
+            Ok(c.len())
+        }
+    }
+
+    /// `write_read` is a SECOND read path into the same transport, so it has to
+    /// reach the same MBAP reassembly `read_frame` does. It did not: the
+    /// combined op returned whatever one `write_read` produced, so a reply
+    /// split across TCP segments arrived truncated and the transaction died on
+    /// a short frame. Both paths now go through `SyncIoTransport::frame_from`.
+    #[test]
+    fn a_reply_split_across_two_reads_is_reassembled_by_write_read() {
+        // 125 registers: 6 MBAP + unit + fn + bytecount + 250 = 259 bytes.
+        let mut pdu = vec![0x01u8, 0x03, 0xFA];
+        for i in 0..125u16 {
+            pdu.extend_from_slice(&i.to_be_bytes());
+        }
+        let mut frame = Vec::new();
+        frame.extend_from_slice(&1u16.to_be_bytes()); // transaction id
+        frame.extend_from_slice(&0u16.to_be_bytes()); // protocol id
+        frame.extend_from_slice(&(pdu.len() as u16).to_be_bytes());
+        frame.extend_from_slice(&pdu);
+        assert_eq!(frame.len(), 259, "the reply must be the 259 bytes cited");
+        let (a, b) = frame.split_at(140);
+
+        let chunks = Arc::new(std::sync::Mutex::new(vec![a.to_vec(), b.to_vec()]));
+        let (runtime, _jh) = create_port_runtime(
+            SplitReplyPort {
+                base: PortDriverBase::new("MB_OCTET_SPLIT", 1, PortFlags::default()),
+                chunks,
+            },
+            RuntimeConfig::default(),
+        )
+        .expect("port runtime must start");
+        let mut driver = ModbusPortDriver::new(
+            "MB_SPLIT",
+            test_config(0, 125),
+            LinkType::Tcp,
+            Box::new(SyncIoTransport::new(
+                SyncIOHandle::from_handle(
+                    runtime.port_handle().clone(),
+                    0,
+                    crate::driver::READ_TIMEOUT,
+                ),
+                LinkType::Tcp,
+            )),
+        )
+        .expect("a TCP read config must build");
+
+        driver.poll_cycle().expect("the cycle must complete");
+        assert_eq!(
+            driver.io_status,
+            AsynStatus::Success,
+            "a split reply must be reassembled and served"
+        );
+        assert_eq!(driver.engine.data()[124], 124);
+
+        runtime.shutdown();
     }
 
     fn test_config(start_address: i32, length: usize) -> ModbusConfig {
@@ -5820,5 +5954,113 @@ mod tests {
             .await
             .expect("the poller must exit once the port actor is gone")
             .expect("the poller task must not panic");
+    }
+
+    /// MB-2 regression: no relative-addressing reader may serve the register
+    /// cache after a failed poll. C gates every one of them on `ioStatus_`
+    /// (drvModbusAsyn.cpp:531/681/842/988/1130/1299/1469); without that gate a
+    /// dead PLC keeps a record reading its last good value at NO_ALARM forever.
+    /// The three boundaries are poll-succeeded / poll-failed / poll-recovered,
+    /// each crossed by all seven readers.
+    #[test]
+    fn no_reader_serves_the_cache_after_a_failed_poll() {
+        let mut driver = ModbusPortDriver::new(
+            "MB_IOSTATUS_GATE",
+            test_config(0, 4),
+            LinkType::Tcp,
+            Box::new(ReplayTransport::new(vec![
+                Ok(tcp_response(1, &regs_pdu([0x0041, 2, 3, 4]))),
+                Err(ModbusError::Timeout),
+                Ok(tcp_response(3, &regs_pdu([0x0042, 5, 6, 7]))),
+            ])),
+        )
+        .expect("relative config must build");
+
+        let num = driver
+            .base
+            .find_param(ModbusDataType::UInt16.as_str())
+            .expect("UINT16 parameter must exist");
+        let text = driver
+            .base
+            .find_param(ModbusDataType::StringHigh.as_str())
+            .expect("STRING_HIGH parameter must exist");
+        let mut nuser = AsynUser::new(num);
+        nuser.addr = 0;
+        let mut suser = AsynUser::new(text);
+        suser.addr = 0;
+
+        // Every reader, run once. `Ok`/`Err` is all each boundary asserts;
+        // the values are covered by the decode tests.
+        macro_rules! read_all {
+            ($d:expr) => {{
+                let mut i32s = [0i32; 2];
+                let mut f64s = [0f64; 2];
+                let mut sbuf = [0u8; 4];
+                vec![
+                    ("read_int32", $d.read_int32(&nuser).is_ok()),
+                    ("read_int64", $d.read_int64(&nuser).is_ok()),
+                    ("read_float64", $d.read_float64(&nuser).is_ok()),
+                    (
+                        "read_uint32_digital",
+                        $d.read_uint32_digital(&nuser, 0).is_ok(),
+                    ),
+                    ("read_octet", $d.read_octet(&suser, &mut sbuf).is_ok()),
+                    (
+                        "read_int32_array",
+                        $d.read_int32_array(&nuser, &mut i32s).is_ok(),
+                    ),
+                    (
+                        "read_float64_array",
+                        $d.read_float64_array(&nuser, &mut f64s).is_ok(),
+                    ),
+                ]
+            }};
+        }
+
+        driver.poll_cycle().expect("poll 1 must complete");
+        for (name, ok) in read_all!(driver) {
+            assert!(ok, "{name} must serve the cache after a successful poll");
+        }
+
+        // The poll fails; the cache still holds poll 1's block, which is
+        // exactly what must not reach a record.
+        driver
+            .poll_cycle()
+            .expect("a failed poll still completes a cycle");
+        assert_ne!(driver.io_status, AsynStatus::Success);
+        assert_eq!(
+            driver.engine.data()[0],
+            0x0041,
+            "the failed poll leaves the stale block in place — the gate, not the \
+             cache, is what stops it reaching a record"
+        );
+        for (name, ok) in read_all!(driver) {
+            assert!(
+                !ok,
+                "{name} must not serve the stale cache after a failed poll"
+            );
+        }
+        // The status reaches the record verbatim, so the alarm mapping in
+        // `port_actor::combine_read_alarm` sees TIMEOUT rather than a flat error.
+        match driver.read_int32(&nuser) {
+            Err(AsynError::Status { status, .. }) => {
+                assert_eq!(
+                    status,
+                    AsynStatus::Timeout,
+                    "the poll status reaches the record"
+                )
+            }
+            other => panic!("expected the stored poll status, got {other:?}"),
+        }
+
+        // Recovery: the next good poll re-opens every reader.
+        driver.poll_cycle().expect("poll 3 must complete");
+        assert_eq!(driver.io_status, AsynStatus::Success);
+        for (name, ok) in read_all!(driver) {
+            assert!(
+                ok,
+                "{name} must serve the cache again once the poll recovers"
+            );
+        }
     }
 }

@@ -23,6 +23,7 @@ pub mod color_layout;
 pub mod convert;
 pub mod driver;
 pub mod error;
+pub mod finalize;
 pub mod ndarray;
 pub mod ndarray_handle;
 pub mod ndarray_pool;

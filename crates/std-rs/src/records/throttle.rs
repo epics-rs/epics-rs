@@ -1,5 +1,3 @@
-use std::time::Instant;
-
 use super::dbd_generated;
 use epics_base_rs::error::{CaError, CaResult};
 use epics_base_rs::server::database::AsyncDbHandle;
@@ -75,12 +73,31 @@ pub struct ThrottleRecord {
     // --- Private runtime state ---
     /// Whether limits are active (drvlh > drvll)
     limit_flag: bool,
-    /// Whether a delay is currently in progress
+    /// Whether the DLY cooldown timer is armed — C `rpvtStruct.delay_flag`.
     delay_active: bool,
-    /// When the last output was sent (for delay enforcement)
-    last_send_time: Option<Instant>,
-    /// Value queued during delay period (sent when delay expires)
+    /// The value waiting to be written to OUT — C `rpvtStruct.wait_flag`
+    /// together with the `prec->val` its `valuePut` reads at drain time.
+    /// `is_some()` is exactly C's `wait_flag == 1`, the only thing
+    /// `valuePut` branches on (throttleRecord.c:551).
     pending_value: Option<f64>,
+    /// Set by `set_process_continuation` when the framework is re-entering
+    /// `process()` for this record's own `ReprocessAfter` — the port's
+    /// stand-in for C's `delayFuncCallback` (throttleRecord.c:530-538),
+    /// which is a separate function and needs no marker. Consumed by the
+    /// `process()` it marks, so a path that never sets it runs as a fresh
+    /// cycle.
+    timer_fire: bool,
+    /// A SYNC request has been made but not yet carried out — C
+    /// `rpvtStruct.sync_flag`. Set while a value is still waiting to reach
+    /// OUT, because C `valueSync` returns early in that case
+    /// (throttleRecord.c:625-627) and the successful `dbPutLink` arm of
+    /// `valuePut` finishes the sync instead (:571-572).
+    sync_flag: bool,
+    /// A DLY put landed while the cooldown was running, so the timer must be
+    /// re-anchored to the new delay — C `special()` cancels and re-requests
+    /// the callback (throttleRecord.c:400-408). Drained by
+    /// `take_special_actions`.
+    rearm_delay: bool,
     /// Whether the most recent `process()` cycle actually issued an OUT
     /// write. C `throttleRecord.c:308` has `recGblFwdLink` commented out
     /// in `process()`; the forward link fires ONLY inside `valuePut`
@@ -132,8 +149,10 @@ impl Default for ThrottleRecord {
             sync: 0, // Idle
             limit_flag: false,
             delay_active: false,
-            last_send_time: None,
             pending_value: None,
+            timer_fire: false,
+            sync_flag: false,
+            rearm_delay: false,
             out_written: false,
             async_ctx: None,
             link_gen: LinkStatusGen::default(),
@@ -225,14 +244,18 @@ impl ThrottleRecord {
         });
     }
 
-    /// C `valueSync` (throttleRecord.c:616-656): read SINP into VAL as
-    /// `DBR_DOUBLE` and post VAL/STS/SYNC — NO OUT write, NO process, NO
-    /// FLNK. A CONSTANT SINP (SIV=`Constant`) yields STS=Error with no read
-    /// (C's `plink->type == CONSTANT` else branch); a local read failure
-    /// also yields STS=Error. SYNC is reset to Idle on completion. Only
-    /// called for SIV ∈ {Local, Constant} (the `EXT_NC` skip is in
-    /// `special`). Not generation-gated: a rare double-SYNC resolves
-    /// last-scheduled-wins, benign because VAL is latest-value anyway.
+    /// The body of C `valueSync` past its early return
+    /// (throttleRecord.c:629-655): read SINP into VAL as `DBR_DOUBLE` and
+    /// post VAL/STS/SYNC — NO OUT write, NO process, NO FLNK. A CONSTANT
+    /// SINP (SIV=`Constant`) yields STS=Error with no read (C's
+    /// `plink->type == CONSTANT` else branch); a local read failure also
+    /// yields STS=Error. SYNC is reset to Idle on completion.
+    ///
+    /// Reached only through [`Self::value_sync`], which owns the
+    /// `wait_flag` deferral C puts in front of it, and only for SIV ∈
+    /// {Local, Constant} (the `EXT_NC` skip is in `special`). Not
+    /// generation-gated: a rare double-SYNC resolves last-scheduled-wins,
+    /// benign because VAL is latest-value anyway.
     fn spawn_value_sync(&self) {
         let Some((name, handle)) = &self.async_ctx else {
             return;
@@ -262,6 +285,25 @@ impl ThrottleRecord {
             fields.push(("SYNC".to_string(), EpicsValue::Short(THROTTLE_SYNC_IDLE)));
             let _ = handle.post_fields(&name, fields);
         });
+    }
+
+    /// C `valueSync` (throttleRecord.c:618-656) — the single entry to a
+    /// SINP sync, and the owner of the deferral in front of it.
+    ///
+    /// A sync must not overwrite VAL while a value is still waiting to reach
+    /// OUT: C marks the request and returns (:623-627), and `valuePut`
+    /// finishes it from its successful `dbPutLink` arm (:571-572), so VAL
+    /// takes the SINP value read AFTER the queued value went out, not one
+    /// read while it was still queued. Without the deferral the port read
+    /// SINP at request time and posted a VAL that the later drain never
+    /// corrected.
+    fn value_sync(&mut self) {
+        self.sync_flag = true;
+        if self.pending_value.is_some() {
+            return;
+        }
+        self.spawn_value_sync();
+        self.sync_flag = false;
     }
 
     /// Check drive limits and optionally clip the value.
@@ -304,48 +346,58 @@ impl ThrottleRecord {
         Ok(val)
     }
 
-    /// Send the value to the output — C `throttleRecord.c::valuePut`
-    /// (lines 540-594).
+    /// C `valuePut` (throttleRecord.c:540-600) — the single owner of the OUT
+    /// write, the WAIT clear and the cooldown re-arm.
     ///
-    /// C `valuePut` line 557 branches on the OUT link type:
-    ///   - `if (plink->type != CONSTANT)` — `dbPutLink` is issued and
-    ///     STS is set from its result (`throttleSTS_SUC` on success,
-    ///     `throttleSTS_ERR` on failure), SENT/OSENT advance, the
-    ///     forward link fires (line 580).
-    ///   - `else` (CONSTANT/empty OUT) — no write happens, STS is forced
-    ///     to `throttleSTS_ERR`, SENT/OSENT do NOT advance, no FLNK.
-    ///
-    /// Returns `true` when the caller must emit the `WriteDbLink{OUT}`
-    /// action (a real, non-CONSTANT link). The port cannot observe the
-    /// `dbPutLink` result inline, so a real link is treated optimistically
-    /// as STS=Success — the emitted write either lands or the framework
-    /// raises its own link alarm.
-    fn send_value(&mut self, value: f64) -> bool {
-        if link_field_type(&self.out) == LinkType::Constant
-            || link_field_type(&self.out) == LinkType::Empty
-        {
-            // CONSTANT / empty OUT — C `valuePut` else branch: STS=Error,
-            // SENT/OSENT unchanged, no write, no FLNK.
-            self.sts = 1; // throttleSTS_ERR
-            self.out_written = false;
-            return false;
-        }
-        self.osent = self.sent;
-        self.sent = value;
-        self.last_send_time = Some(Instant::now());
-        self.sts = 2; // throttleSTS_SUC
-        self.out_written = true;
-        true
-    }
+    /// Reached from exactly the two places C reaches it from: `enterValue`
+    /// when no cooldown is running (:523-524), and the cooldown timer
+    /// expiring (:530-538). Which of the two it is does not change what
+    /// happens here — C branches only on `wait_flag`, i.e. on whether a value
+    /// is actually waiting.
+    fn value_put(&mut self, actions: &mut Vec<ProcessAction>) {
+        let Some(value) = self.pending_value.take() else {
+            // C :597-599 — the timer found nothing waiting. It writes
+            // nothing, queues nothing and posts nothing; it only clears
+            // `delay_flag`.
+            self.delay_active = false;
+            return;
+        };
 
-    /// Check if the delay period has elapsed since last send.
-    fn delay_elapsed(&self) -> bool {
-        if self.dly <= 0.0 {
-            return true;
+        // C :556-587 branches on the OUT link type. A CONSTANT/empty OUT is
+        // never written: STS is forced to Error, SENT/OSENT stay put and the
+        // forward link does not fire (:583-587). A real link gets the
+        // `dbPutLink` — and C reads STS and SENT out of ITS result (:565-575),
+        // which the port learns only once the framework has executed this
+        // action and called `set_out_link_write_status`. So nothing about the
+        // outcome is committed here; only the attempt is. Both arms clear
+        // WAIT (:575/:587), and C fires the forward link on the whole
+        // non-CONSTANT arm, success or not (:580).
+        let out_type = link_field_type(&self.out);
+        if out_type == LinkType::Constant || out_type == LinkType::Empty {
+            self.sts = THROTTLE_STS_ERR;
+            self.out_written = false;
+        } else {
+            self.out_written = true;
+            actions.push(ProcessAction::WriteDbLink {
+                link_field: "OUT",
+                value: EpicsValue::Double(value),
+            });
         }
-        match self.last_send_time {
-            Some(t) => t.elapsed().as_secs_f64() >= self.dly,
-            None => true, // Never sent before
+        self.wait = 0;
+
+        // C :590-591 re-arms unconditionally, even for `delay == 0`: a
+        // zero-delay `callbackRequestDelayed` fires at once, finds
+        // `wait_flag == 0` and clears `delay_flag` again. The port collapses
+        // that round trip — with DLY = 0 there is no cooldown, so the next
+        // value goes straight out — rather than spawning a timer task per put
+        // whose only job is to switch a flag back off.
+        if self.dly > 0.0 {
+            self.delay_active = true;
+            actions.push(ProcessAction::ReprocessAfter(
+                std::time::Duration::from_secs_f64(self.dly),
+            ));
+        } else {
+            self.delay_active = false;
         }
     }
 }
@@ -356,97 +408,41 @@ impl Record for ThrottleRecord {
     }
 
     fn process(&mut self) -> CaResult<ProcessOutcome> {
-        // C `throttleRecord.c:231-312`. The control flow here mirrors C's
-        // `process()`:
+        // C `throttleRecord.c:231-312`. TWO different C entry points arrive at
+        // this one Rust function, and the framework's continuation marker is
+        // what tells them apart:
         //
-        //   1. The drive-limit block (C lines 242-283) runs on EVERY
-        //      process() call, regardless of whether a delay is pending.
-        //      It updates DRVLS and, on a clip-off out-of-range value,
-        //      sets `proc_flag = 0` (reject: restore `val = oval`, skip
-        //      the send).
-        //   2. If `proc_flag` (C lines 285-296): the value is "entered".
-        //      C `enterValue()` sets `wait_flag = 1`; if no delay is in
-        //      progress (`!delay_flag`) it calls `valuePut()` to write
-        //      OUT immediately and arm the delay timer. If a delay IS in
-        //      progress the value just waits — the running delay timer
-        //      will pick up the latest `prec->val` when it fires.
-        //
-        // The Rust port has no `callbackRequestDelayed` handle, so the
-        // delay timer is modelled by `ReprocessAfter`: the current cycle
-        // writes OUT, then the framework re-invokes `process()` after
-        // DLY. `delay_active` is C's `delay_flag`; `pending_value` plus
-        // re-entry through this same limit block reproduces C taking the
-        // latest limit-checked `prec->val` at timer-fire time.
+        //   * `delayFuncCallback` (:530-538) — the DLY cooldown expiring. C
+        //     dispatches it straight to `valuePut()`; the port models the
+        //     timer with `ProcessAction::ReprocessAfter`, so it comes back as
+        //     a re-entrant `process()` flagged by `set_process_continuation`.
+        //   * a fresh put / scan / forward link — C's `process()` proper: the
+        //     drive-limit block (:242-283), then `enterValue()` (:517-528),
+        //     which marks the value pending and calls `valuePut()` only when
+        //     no cooldown is running.
         let mut actions = Vec::new();
 
         // C `throttleRecord.c:308` keeps `recGblFwdLink` commented out in
         // `process()`; the forward link fires ONLY from `valuePut`'s
-        // non-CONSTANT branch (line 580). Reset the per-cycle FLNK flag
-        // here so a queuing-during-delay cycle, a rejected out-of-range
-        // cycle, or a drain with nothing queued does NOT fire FLNK —
-        // only a real OUT write (via `send_value`) sets it true.
+        // non-CONSTANT branch (:580). Reset the per-cycle FLNK flag here so a
+        // queuing-during-delay cycle, a rejected out-of-range cycle, or a
+        // timer fire with nothing waiting does NOT fire FLNK — only a real
+        // OUT write (via `value_put`) sets it true.
         self.out_written = false;
 
-        // --- Drain path: the post-delay timer callback (C `valuePut()`
-        //     reached via `delayFuncCallback`, lines 530-538/540-594) ---
-        //
-        // C runs the drain in `valuePut()`, a code path SEPARATE from
-        // `process()`: it does NOT re-run the drive-limit block and does
-        // NOT touch the OVAL end-of-process update. The port models the
-        // timer with `ReprocessAfter`, so the drain arrives as a
-        // re-entrant `process()` call — identified here by an armed
-        // delay whose window has elapsed. It must therefore short-circuit
-        // BEFORE the limit block so a previously limit-checked queued
-        // value is sent as-is and DRVLS (set by the queuing process()) is
-        // left intact.
-        if self.delay_active && self.delay_elapsed() {
-            self.delay_active = false;
-            self.wait = 0;
-            match self.pending_value.take() {
-                // C `valuePut`: `wait_flag` set -> a value arrived during
-                // the delay; send the (already limit-checked) queued
-                // value, set SENT/OSENT/STS, and re-arm the timer.
-                Some(pv) => {
-                    // C `valuePut`: a CONSTANT/empty OUT yields STS=Error
-                    // and no write; a real link yields the WriteDbLink.
-                    if self.send_value(pv) {
-                        actions.push(ProcessAction::WriteDbLink {
-                            link_field: "OUT",
-                            value: EpicsValue::Double(self.sent),
-                        });
-                    }
-                    // C `valuePut` clears `prec->wait = FALSE` immediately
-                    // after the OUT write (throttleRecord.c:575) and only
-                    // THEN re-arms the timer (:592-593). WAIT means "an
-                    // un-written value is pending", not "a delay timer is
-                    // running": the just-drained value is now written, the
-                    // queue is empty (`pending_value` was taken), so WAIT
-                    // stays clear through the new cooldown. A value that
-                    // arrives during it re-sets WAIT in the queue branch
-                    // below.
-                    if self.dly > 0.0 {
-                        self.delay_active = true;
-                        self.wait = 0;
-                        let delay = std::time::Duration::from_secs_f64(self.dly);
-                        actions.push(ProcessAction::ReprocessAfter(delay));
-                    }
-                    return Ok(ProcessOutcome::complete_with(actions));
-                }
-                // C `valuePut`: `wait_flag` clear -> nothing queued; the
-                // callback merely clears `delay_flag` (line 597).
-                None => {
-                    return Ok(ProcessOutcome::complete_with(actions));
-                }
-            }
+        // C `delayFuncCallback`: the cooldown expired, so run `valuePut` and
+        // nothing else — no limit block, no `enterValue`, no OVAL update.
+        if std::mem::take(&mut self.timer_fire) {
+            self.value_put(&mut actions);
+            return Ok(ProcessOutcome::complete_with(actions));
         }
 
-        // --- Step 1: drive-limit block (C lines 242-283), runs on every
-        //     fresh process() call ---
+        // --- Drive-limit block (C :242-283), every fresh process() ---
         //
-        // C restores `prec->val = prec->oval` and sets `proc_flag = 0` on
-        // a rejected (out-of-range, clipping Off) value; it does NOT set
-        // STS and does NOT touch WAIT. STS is only ever written after a
-        // real link operation (valuePut / valueSync).
+        // C restores `prec->val = prec->oval` and sets `proc_flag = 0` on a
+        // rejected (out-of-range, clipping Off) value; it does NOT set STS and
+        // does NOT touch WAIT. STS is written only after a real link
+        // operation (`valuePut` / `valueSync`).
         let proc_flag = match self.check_limits(self.val) {
             Ok(clamped) => {
                 self.val = clamped;
@@ -459,78 +455,33 @@ impl Record for ThrottleRecord {
         };
 
         if !proc_flag {
-            // Rejected: skip enterValue entirely (C `proc_flag == 0`).
-            // A delay already in progress is left running — its
-            // ReprocessAfter still fires and drains whatever value was
-            // queued. C's end-of-process OVAL block is a no-op here
-            // because `val` was just restored to `oval`.
+            // C `proc_flag == 0`: skip `enterValue` entirely. A cooldown
+            // already running is left alone — its timer still fires and
+            // drains whatever is waiting. C's end-of-process OVAL block is a
+            // no-op here because `val` was just restored to `oval`.
             return Ok(ProcessOutcome::complete_with(actions));
         }
 
-        // OVAL end-of-process update (C lines 299-303): on a fresh,
-        // accepted process() OVAL tracks the just-checked VAL.
+        // C :285-286 — every accepted process marks the record busy; only
+        // `valuePut` clears it.
+        self.wait = 1;
+
+        // C `enterValue` (:517-528): set `wait_flag` — the waiting value is
+        // `prec->val` itself, last one wins — then call `valuePut` only when
+        // no cooldown is running. With one running, the timer armed at the
+        // last send is still pending and will pick this value up; C requests
+        // no second callback here, and neither may the port, or the record
+        // would re-anchor its own cooldown on every put.
+        self.pending_value = Some(self.val);
+        if !self.delay_active {
+            self.value_put(&mut actions);
+        }
+
+        // OVAL end-of-process update (C :299-303). `prec->oval` (the OVAL
+        // field) is distinct from the `prpvt->oval` that `valuePut` hands to
+        // `dbPutLink`.
         self.oval = self.val;
 
-        // --- Step 2: enterValue() (C lines 518-528) ---
-        //
-        // A delay timer is in progress. C `enterValue()` sets
-        // `wait_flag = 1` and returns; the running `delayFuncCb` will
-        // call `valuePut()` and send whatever `prec->val` is when it
-        // fires. The port stashes the latest limit-checked value (last
-        // value wins, as in C) so the drain re-process sends it. This is
-        // the ONE state where C leaves WAIT set: `process()` set
-        // `prec->wait = TRUE` (throttleRecord.c:287) and, with a delay in
-        // progress, `enterValue` does NOT call `valuePut` (:525), so
-        // nothing clears it — the value is now queued, un-written. WAIT=1
-        // therefore means exactly `pending_value.is_some()`; the
-        // in-flight ReprocessAfter is left to fire.
-        if self.delay_active {
-            self.pending_value = Some(self.val);
-            self.wait = 1;
-            let remaining = self.dly
-                - self
-                    .last_send_time
-                    .map(|t| t.elapsed().as_secs_f64())
-                    .unwrap_or(0.0);
-            let delay = std::time::Duration::from_secs_f64(remaining.max(0.001));
-            actions.push(ProcessAction::ReprocessAfter(delay));
-            return Ok(ProcessOutcome::complete_with(actions));
-        }
-
-        // No delay in progress: send immediately (C `enterValue` calls
-        // `valuePut` directly when `!delay_flag`). C `valuePut` writes the
-        // OUT link and sets SENT/OSENT and STS=Success only for a
-        // non-CONSTANT OUT; a CONSTANT/empty OUT yields STS=Error and no
-        // write.
-        if self.send_value(self.val) {
-            actions.push(ProcessAction::WriteDbLink {
-                link_field: "OUT",
-                value: EpicsValue::Double(self.sent),
-            });
-        }
-
-        // Arm the delay timer (C `callbackRequestDelayed`, lines 592-593)
-        // when DLY > 0, and clear WAIT. C `process()` sets `prec->wait =
-        // TRUE` before `enterValue` (throttleRecord.c:287), but on this
-        // immediate path `valuePut` runs in the same cycle and clears
-        // `prec->wait = FALSE` right after the OUT write (:575) BEFORE
-        // re-arming the timer. C's WAIT means "an un-written value is
-        // pending", not "a delay timer is running": the value just
-        // written is no longer pending, so WAIT is clear through the
-        // cooldown even though the timer is armed. WAIT is re-set only
-        // when a value is queued during the delay (the branch above).
-        if self.dly > 0.0 {
-            self.delay_active = true;
-            self.wait = 0;
-            let delay = std::time::Duration::from_secs_f64(self.dly);
-            actions.push(ProcessAction::ReprocessAfter(delay));
-            return Ok(ProcessOutcome::complete_with(actions));
-        }
-
-        // No delay: C `valuePut` sets WAIT=False after the immediate
-        // write (lines 575/587).
-        self.delay_active = false;
-        self.wait = 0;
         Ok(ProcessOutcome::complete_with(actions))
     }
 
@@ -544,11 +495,13 @@ impl Record for ThrottleRecord {
         }
         match field {
             // C `special()` DLY case (lines 392-409). A negative delay
-            // is clamped to 0. C also cancels/restarts the in-flight
-            // `delayFuncCb` so a previously-set huge delay does not keep
-            // the record Busy; the port re-derives the remaining delay
-            // from `last_send_time` + the new DLY on the next process,
-            // so a shrunk DLY takes effect on the next drain attempt.
+            // is clamped to 0, and a delay changed while the cooldown is
+            // running cancels the in-flight `delayFuncCb` and re-requests
+            // it with the NEW delay (:400-408) — so a delay "set crazy
+            // big" cannot hold the record forever and a shrunk one takes
+            // effect at once. `take_special_actions` carries that re-anchor
+            // out as a fresh `ReprocessAfter`; minting its token supersedes
+            // the pending one, which IS C's `callbackCancelDelayed`.
             //
             // `special()` runs after the field write. `put_field("DLY")`
             // already rejects non-finite and huge-but-finite values via
@@ -564,6 +517,9 @@ impl Record for ThrottleRecord {
                     // Non-finite or >= MAX_DLY: clamp to the operational
                     // ceiling so `process()` never panics.
                     self.dly = MAX_DLY;
+                }
+                if self.delay_active {
+                    self.rearm_delay = true;
                 }
             }
             // C `special()` DRVLH/DRVLL case (lines 411-440). When the
@@ -599,7 +555,7 @@ impl Record for ThrottleRecord {
             // is left in `Process`, matching C leaving it pending.
             "SYNC" => {
                 if self.sync == THROTTLE_SYNC_PROCESS && self.siv != LINK_EXT_NC {
-                    self.spawn_value_sync();
+                    self.value_sync();
                 }
             }
             _ => {}
@@ -758,10 +714,70 @@ impl Record for ThrottleRecord {
     /// fire it on a queuing-during-delay cycle, a rejected out-of-range
     /// cycle, a drain with nothing queued, and a CONSTANT-OUT cycle —
     /// none of which write OUT in C. `process()` maintains `out_written`
-    /// (reset to false each cycle, set true only by `send_value` on a
+    /// (reset to false each cycle, set true only by `value_put` on a
     /// real OUT write); this hook returns it.
     fn should_fire_forward_link(&self) -> bool {
         self.out_written
+    }
+
+    /// Carries out the DLY re-anchor C `special()` performs at
+    /// `throttleRecord.c:400-408`. The framework drains this in the same step
+    /// as the `special()` that queued it, so a re-arm can never outlive its
+    /// put; `self.dly` is already clamped by that `special()`, so the
+    /// `Duration` is always representable.
+    fn take_special_actions(&mut self) -> Vec<ProcessAction> {
+        if std::mem::take(&mut self.rearm_delay) {
+            vec![ProcessAction::ReprocessAfter(
+                std::time::Duration::from_secs_f64(self.dly),
+            )]
+        } else {
+            Vec::new()
+        }
+    }
+
+    /// The framework's continuation marker is what separates C's two entry
+    /// points into `valuePut`: the DLY cooldown timer firing
+    /// (`delayFuncCallback`, throttleRecord.c:530-538) from a fresh
+    /// put/scan/forward-link `process()` (:231). C never needed a marker —
+    /// the timer dispatches to its own function — so the port takes the one
+    /// the framework already computes rather than guessing from a clock,
+    /// which a DLY change mid-cooldown silently falsifies.
+    fn set_process_continuation(&mut self, continuation: bool) {
+        self.timer_fire = continuation;
+    }
+
+    /// C `valuePut`'s `dbPutLink` result branch (throttleRecord.c:564-575):
+    /// STS is `throttleSTS_SUC` only when the put succeeded and
+    /// `throttleSTS_ERR` when it did not, and SENT advances only on success.
+    /// The record has a dedicated STS field precisely so a client can tell a
+    /// value that reached the device from one that did not, so it is derived
+    /// from the put here rather than assumed when the write is emitted.
+    fn set_out_link_write_status(
+        &mut self,
+        link_field: &'static str,
+        value: &EpicsValue,
+        failed: bool,
+    ) {
+        if link_field != "OUT" {
+            return;
+        }
+        if failed {
+            self.sts = THROTTLE_STS_ERR;
+            return;
+        }
+        self.sts = THROTTLE_STS_SUC;
+        // OSENT trails SENT by one send, as C's `monitor()` keeps it
+        // (throttleRecord.c:608-612).
+        if let Some(v) = value.to_f64() {
+            self.osent = self.sent;
+            self.sent = v;
+        }
+        // C :571-572 — a SYNC deferred behind this value completes here, and
+        // only from the successful arm: a put that failed leaves the request
+        // standing for the next one.
+        if self.sync_flag {
+            self.value_sync();
+        }
     }
 
     fn init_record(&mut self, pass: u8) -> CaResult<()> {
@@ -778,8 +794,10 @@ impl Record for ThrottleRecord {
             self.val = 0.0;
             self.limit_flag = self.drvlh > self.drvll;
             self.delay_active = false;
-            self.last_send_time = None;
             self.pending_value = None;
+            self.timer_fire = false;
+            self.sync_flag = false;
+            self.rearm_delay = false;
             self.out_written = false;
         }
         Ok(())

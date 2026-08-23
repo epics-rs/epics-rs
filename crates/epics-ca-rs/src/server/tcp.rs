@@ -251,7 +251,7 @@ use epics_base_rs::runtime::accept::AcceptBackoff;
 use epics_base_rs::server::access_security::{AccessLevel, AccessSecurityConfig};
 use epics_base_rs::server::database::{PvDatabase, PvEntry, parse_pv_name};
 use epics_base_rs::server::pv::ProcessVariable;
-use epics_base_rs::server::record::RecordInstance;
+use epics_base_rs::server::record::{FieldDeclaration, RecordInstance};
 use epics_base_rs::types::{DbFieldType, EpicsValue, encode_dbr_into, native_type_for_dbr};
 
 #[derive(Clone)]

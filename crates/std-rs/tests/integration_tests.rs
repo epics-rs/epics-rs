@@ -1054,3 +1054,249 @@ record(epid, "TEST:PIDNV") {
          recompute to ~500 (got {p_after:?})"
     );
 }
+
+// ============================================================
+// Throttle: STS reports what the OUT put did, not what the record meant.
+//
+// C `throttleRecord.c:564-575` sets `sts = throttleSTS_SUC` and
+// `sent = oval` only inside `if (RTN_SUCCESS(status))`, and
+// `throttleSTS_ERR` in the `else`. A put through an unresolvable OUT link
+// therefore leaves STS reading Error with SENT unmoved.
+// ============================================================
+
+#[tokio::test]
+async fn test_throttle_sts_reports_a_failed_out_put() {
+    let db_str = r#"
+record(throttle, "TEST:THRERR") {
+    field(DLY, "0")
+    field(OUT, "NO:SUCH:REMOTE:PV PP")
+}
+"#;
+    let macros = HashMap::new();
+    let server = CaServerBuilder::new()
+        .port(0)
+        .register_record_type("throttle", || Box::new(std_rs::ThrottleRecord::default()))
+        .register_record_type("ao", || Box::new(AoRecord::default()))
+        .db_string(db_str, &macros)
+        .unwrap()
+        .build()
+        .await
+        .unwrap();
+    let db = server.database().clone();
+
+    server
+        .put("TEST:THRERR", EpicsValue::Double(5.0))
+        .await
+        .unwrap();
+    db.put_record_field_from_ca("TEST:THRERR", "PROC", EpicsValue::Short(1))
+        .await
+        .unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+
+    assert_eq!(
+        server.get("TEST:THRERR.STS").await.unwrap(),
+        EpicsValue::Short(1),
+        "an OUT put that never landed must read STS=Error"
+    );
+    assert_eq!(
+        server.get("TEST:THRERR.SENT").await.unwrap(),
+        EpicsValue::Double(0.0),
+        "SENT advances only on a successful put (C :568)"
+    );
+}
+
+// ============================================================
+// Throttle: SYNC=Process defers behind a value that has not reached OUT.
+//
+// C `valueSync` marks the request and returns while `wait_flag` is set
+// (throttleRecord.c:623-627); `valuePut` finishes it from its successful
+// `dbPutLink` arm (:571-572). So VAL takes a SINP value read AFTER the
+// queued value went out, and a failed put leaves the request standing.
+// Boundaries: {sync while idle, sync while waiting} x {put succeeds, fails}.
+// ============================================================
+
+/// Build a throttle with a `DLY` cooldown, a local `SINP` source and the
+/// given `OUT` link, and let the OV/SIV classification settle.
+async fn sync_fixture(
+    prefix: &str,
+    out: &str,
+) -> (
+    epics_ca_rs::server::CaServer,
+    std::sync::Arc<epics_base_rs::server::database::PvDatabase>,
+) {
+    let db_str = format!(
+        r#"
+record(ao, "{prefix}:SRC") {{
+    field(VAL, "100")
+}}
+record(ao, "{prefix}:TGT") {{
+    field(VAL, "0")
+}}
+record(throttle, "{prefix}") {{
+    field(DLY, "0.3")
+    field(SINP, "{prefix}:SRC")
+    field(OUT, "{out}")
+}}
+"#
+    );
+    let macros = HashMap::new();
+    let server = CaServerBuilder::new()
+        .port(0)
+        .register_record_type("throttle", || Box::new(std_rs::ThrottleRecord::default()))
+        .register_record_type("ao", || Box::new(AoRecord::default()))
+        .db_string(&db_str, &macros)
+        .unwrap()
+        .build()
+        .await
+        .unwrap();
+    let db = server.database().clone();
+    // The OV/SIV classification is async; the SYNC arm is gated on SIV.
+    tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+    (server, db)
+}
+
+async fn put_and_process(
+    server: &epics_ca_rs::server::CaServer,
+    db: &std::sync::Arc<epics_base_rs::server::database::PvDatabase>,
+    name: &str,
+    v: f64,
+) {
+    server.put(name, EpicsValue::Double(v)).await.unwrap();
+    db.put_record_field_from_ca(name, "PROC", EpicsValue::Short(1))
+        .await
+        .unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+}
+
+#[tokio::test]
+async fn test_throttle_sync_defers_behind_a_queued_value() {
+    let (server, db) = sync_fixture("TEST:THRSYNCQ", "TEST:THRSYNCQ:TGT PP").await;
+
+    put_and_process(&server, &db, "TEST:THRSYNCQ", 1.0).await;
+    put_and_process(&server, &db, "TEST:THRSYNCQ", 2.0).await;
+    assert_eq!(
+        server.get("TEST:THRSYNCQ.WAIT").await.unwrap(),
+        EpicsValue::Short(1),
+        "the second value is queued behind the cooldown"
+    );
+
+    db.put_record_field_from_ca("TEST:THRSYNCQ", "SYNC", EpicsValue::Short(1))
+        .await
+        .unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+    assert_eq!(
+        server.get("TEST:THRSYNCQ.SYNC").await.unwrap(),
+        EpicsValue::Short(1),
+        "the sync is deferred, so SYNC still reads Process (C :625-627)"
+    );
+    assert_eq!(
+        server.get("TEST:THRSYNCQ.VAL").await.unwrap(),
+        EpicsValue::Double(2.0),
+        "VAL must still be the queued value, not the SINP read"
+    );
+
+    // The SINP source moves between the request and the drain: C reads it at
+    // drain time, so this is the value VAL must end up with.
+    server
+        .put("TEST:THRSYNCQ:SRC", EpicsValue::Double(300.0))
+        .await
+        .unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+
+    assert_eq!(
+        server.get("TEST:THRSYNCQ.SENT").await.unwrap(),
+        EpicsValue::Double(2.0),
+        "the queued value went out first"
+    );
+    assert_eq!(
+        server.get("TEST:THRSYNCQ.VAL").await.unwrap(),
+        EpicsValue::Double(300.0),
+        "the deferred sync read SINP after the put, not at request time"
+    );
+    assert_eq!(
+        server.get("TEST:THRSYNCQ.SYNC").await.unwrap(),
+        EpicsValue::Short(0),
+        "SYNC returns to Idle once the deferred sync runs"
+    );
+}
+
+#[tokio::test]
+async fn test_throttle_deferred_sync_stays_pending_when_the_put_fails() {
+    let (server, db) = sync_fixture("TEST:THRSYNCE", "NO:SUCH:REMOTE:PV PP").await;
+
+    put_and_process(&server, &db, "TEST:THRSYNCE", 1.0).await;
+    put_and_process(&server, &db, "TEST:THRSYNCE", 2.0).await;
+
+    db.put_record_field_from_ca("TEST:THRSYNCE", "SYNC", EpicsValue::Short(1))
+        .await
+        .unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+
+    assert_eq!(
+        server.get("TEST:THRSYNCE.SYNC").await.unwrap(),
+        EpicsValue::Short(1),
+        "C fires the deferred sync only from valuePut's successful arm (:571)"
+    );
+    assert_eq!(
+        server.get("TEST:THRSYNCE.VAL").await.unwrap(),
+        EpicsValue::Double(2.0),
+        "a sync that never ran must not have touched VAL"
+    );
+}
+
+#[tokio::test]
+async fn test_throttle_sync_runs_at_once_while_the_cooldown_has_nothing_queued() {
+    let (server, db) = sync_fixture("TEST:THRSYNCC", "TEST:THRSYNCC:TGT PP").await;
+
+    // One value, written immediately: the cooldown is armed but nothing is
+    // waiting. C gates on `wait_flag`, not on `delay_flag`.
+    put_and_process(&server, &db, "TEST:THRSYNCC", 1.0).await;
+    assert_eq!(
+        server.get("TEST:THRSYNCC.WAIT").await.unwrap(),
+        EpicsValue::Short(0)
+    );
+
+    db.put_record_field_from_ca("TEST:THRSYNCC", "SYNC", EpicsValue::Short(1))
+        .await
+        .unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+
+    assert_eq!(
+        server.get("TEST:THRSYNCC.VAL").await.unwrap(),
+        EpicsValue::Double(100.0),
+        "nothing is waiting — the sync runs now"
+    );
+    assert_eq!(
+        server.get("TEST:THRSYNCC.SYNC").await.unwrap(),
+        EpicsValue::Short(0)
+    );
+}
+
+#[tokio::test]
+async fn test_throttle_sync_runs_at_once_after_a_failed_put_leaves_nothing_queued() {
+    let (server, db) = sync_fixture("TEST:THRSYNCF", "NO:SUCH:REMOTE:PV PP").await;
+
+    // The put fails, but it emptied the queue — C's gate is `wait_flag`, not
+    // the put's status, so the sync is not deferred.
+    put_and_process(&server, &db, "TEST:THRSYNCF", 1.0).await;
+    assert_eq!(
+        server.get("TEST:THRSYNCF.STS").await.unwrap(),
+        EpicsValue::Short(1),
+        "the OUT put failed"
+    );
+
+    db.put_record_field_from_ca("TEST:THRSYNCF", "SYNC", EpicsValue::Short(1))
+        .await
+        .unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+
+    assert_eq!(
+        server.get("TEST:THRSYNCF.VAL").await.unwrap(),
+        EpicsValue::Double(100.0),
+        "nothing waiting — the sync runs now despite the failed put"
+    );
+    assert_eq!(
+        server.get("TEST:THRSYNCF.SYNC").await.unwrap(),
+        EpicsValue::Short(0)
+    );
+}

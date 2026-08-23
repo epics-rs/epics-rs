@@ -72,14 +72,14 @@
 //!   array target gets the stale `OAV`, and under `DOPT=Use CALC` the
 //!   substitution is a no-op (C quirk, reproduced). See
 //!   `set_output_to_ivov` / `multi_output_scalar_companion`.
-//! - `SIZE` (NELM vs NUSE) is stored but does not gate the client-advertised
-//!   array capacity: the served element count is always
-//!   `acalcGetNumElements()` (C `get_array_info`), matching C's served data.
-//!   C `cvt_dbaddr` additionally advertises `NELM` as the channel capacity
-//!   under the default `SIZE=NELM`; the single-length model serves that count
-//!   directly, so the advertised capacity differs only when `NUSE` is set to
-//!   `0 < NUSE < NELM` under `SIZE=NELM`. `NELM=0` (degenerate; dbd
-//!   initial 1) serves a 1-element array, where C serves 0.
+//! - `SIZE` (NELM vs NUSE) gates the client-advertised array capacity, C's
+//!   `cvt_dbaddr` half
+//!   ([`crate::server::record::FieldDeclaration::field_native_count`] →
+//!   `AcalcoutRecord::dbaddr_no_elements`); the SERVED element count stays
+//!   `acalcGetNumElements()`, C's `get_array_info` half. The two differ under
+//!   the default `SIZE=NELM` with `0 < NUSE < NELM`, which is C's design and
+//!   not a rounding. Still deviating: `NELM=0` (degenerate; dbd initial 1)
+//!   advertises and serves a 1-element array, where C advertises and serves 0.
 //! - `UDF` is C's `pcalc->udf`, owned directly as the framework's `dbCommon.udf`
 //!   `epicsUInt8` (no shadow cell): undefined until a calc successfully defines
 //!   VAL. C `aCalcoutRecord.c:305-307` clears it `else pcalc->udf = FALSE` only
@@ -1066,7 +1066,7 @@ impl Record for AcalcoutRecord {
             self.dlya = 1;
             self.pending_output = write_out;
             self.cached_should_output = false;
-            let delay = std::time::Duration::from_secs_f64(self.odly);
+            let delay = crate::runtime::time::duration_from_secs(self.odly);
             return Ok(ProcessOutcome {
                 result: RecordProcessResult::AsyncPendingNotify(vec![(
                     "DLYA".to_string(),
@@ -1226,15 +1226,20 @@ impl Record for AcalcoutRecord {
         Ok(())
     }
 
-    /// C `cvt_dbaddr` (aCalcoutRecord.c:627-631) pins an array channel at
-    /// [`Self::dbaddr_no_elements`], while `get_array_info` (:672) reports
-    /// [`Self::num_elements`] — the NUSE window that
-    /// [`Self::array_field_value`] serves. Under the default `SIZE = NELM`
-    /// those differ whenever `0 < NUSE < NELM`, and `ca_element_count` is the
-    /// former; SIZE=NUSE exists precisely to make the two agree.
-    fn field_native_count(&self, field: &str) -> Option<u32> {
-        let is_array = matches!(field, "AVAL" | "OAV") || Self::arr_index(field).is_some();
-        is_array.then(|| self.dbaddr_no_elements() as u32)
+    /// The CHANNEL capacity of the fourteen `special(SPC_DBADDR)` array fields
+    /// — `AVAL`, `AA..LL`, `OAV` — which is `Self::dbaddr_no_elements`, NOT
+    /// the served `Self::num_elements`. C computes the two in two hooks and
+    /// they disagree by design under the default `SIZE=NELM` with a `NUSE`
+    /// window open: `cvt_dbaddr` (`aCalcoutRecord.c:627-631`) reports `NELM`
+    /// while `get_array_info` (`:672`) reports `acalcGetNumElements`.
+    ///
+    /// Advertising the served count instead sized the client's buffer at
+    /// `NUSE`, and `ca_element_count` is settled once at create-channel time,
+    /// so that client never saw the array widen when `NUSE` grew — the exact
+    /// reconnect problem the `SIZE` menu's own comment (`:619-626`) describes,
+    /// arriving under the setting chosen to avoid it.
+    fn dbaddr_capacity(&self, _field: &str) -> Option<u32> {
+        Some(self.dbaddr_no_elements() as u32)
     }
 
     fn get_field(&self, name: &str) -> Option<EpicsValue> {

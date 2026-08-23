@@ -4353,7 +4353,7 @@ impl Record for AsynRecord {
     /// buffer capacity, `80` by default — while `get_array_info` reports the
     /// current transferred length (`nowt`/`nord`). So `ca_element_count` is the
     /// capacity even though `get_field` serves the shorter transferred bytes.
-    fn field_native_count(&self, field: &str) -> Option<u32> {
+    fn dbaddr_capacity(&self, field: &str) -> Option<u32> {
         match field {
             "BOUT" => Some(self.omax.max(0) as u32),
             "BINP" => Some(self.imax.max(0) as u32),

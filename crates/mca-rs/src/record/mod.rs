@@ -319,10 +319,25 @@ impl McaRecord {
         self.ftvl.element_type()
     }
 
+    /// How many channels this record's two spectrum buffers hold — C's `NMAX`
+    /// under the floor `init_record` puts on it (`mcaRecord.c:424`):
+    ///
+    /// ```c
+    /// if (pmca->nmax <= 0) pmca->nmax=1;
+    /// ```
+    ///
+    /// Everything that sizes a buffer or advertises a channel width reads it
+    /// from here, so the allocation, the served cut and the capacity CA is told
+    /// cannot drift apart. `NMAX` is `special(SPC_NOMOD)`
+    /// (`mcaRecord.dbd:78-82`), so this is fixed for the life of the record.
+    fn capacity(&self) -> usize {
+        self.nmax.max(1) as usize
+    }
+
     /// An all-zero buffer `NMAX` elements deep, in the `FTVL` element type — C's
     /// `calloc(pmca->nmax, sizeofTypes[pmca->ftvl])` (`mcaRecord.c:430-431`).
     fn zeroed_buffer(&self) -> EpicsValue {
-        let n = self.nmax.max(1) as usize;
+        let n = self.capacity();
         match self.ftvl {
             Ftype::String => EpicsValue::StringArray(vec![PvString::new(); n]),
             Ftype::Char => EpicsValue::CharArray(vec![0; n]),
@@ -375,22 +390,57 @@ impl McaRecord {
         }
     }
 
-    /// Land a written spectrum in the `NMAX`-deep, `FTVL`-typed buffer and set
-    /// `NORD` to what was written — C's `put_array_info`
-    /// (`mcaRecord.c:875-882`): `pmca->nord = nNew`, clamped to `NMAX`.
+    /// Land a written array in one of the two `special(SPC_DBADDR)` buffers and
+    /// set `NORD` from it — C `put_array_info` (`mcaRecord.c:875-881`):
     ///
-    /// The buffer keeps its full `NMAX` width on every path, so the CA channel's
-    /// element count never moves.
+    /// ```c
+    /// pmca->nord = nNew;
+    /// if (pmca->nord > pmca->nmax) pmca->nord = pmca->nmax;
+    /// ```
+    ///
+    /// There is no `fieldIndex` branch, and `dbPut` calls the hook for every
+    /// `SPC_DBADDR` field it writes (`dbAccess.c:1370-1373`), so the record's
+    /// ONE `NORD` follows whichever of `VAL`/`BG` was written last. Nor does
+    /// `get_array_info` branch, so that count then governs what both fields
+    /// serve. Both writes go through here so no arm can move a buffer without
+    /// moving the count that reads it. The `NMAX` clamp is already applied:
+    /// [`McaRecord::land_buffer`] cuts the reported count to the capacity.
+    fn land_array_field(
+        &mut self,
+        value: EpicsValue,
+        pick: fn(&mut Self) -> &mut EpicsValue,
+    ) -> CaResult<()> {
+        let (buf, written) = self.land_buffer(value)?;
+        *pick(self) = buf;
+        self.nord = written as i32;
+        Ok(())
+    }
+
+    /// The `VAL` arm of [`McaRecord::land_array_field`].
     fn land_spectrum(&mut self, value: EpicsValue) -> CaResult<()> {
-        let cap = self.nmax.max(1) as usize;
+        self.land_array_field(value, |r| &mut r.val)
+    }
+
+    /// Convert a written array to the `FTVL` element type and give it the
+    /// record's fixed geometry — `capacity()` channels, zero-filled past what
+    /// was written — reporting how many channels the writer actually supplied.
+    ///
+    /// This is the ONLY place either spectrum buffer is built from a value. C
+    /// `calloc`s `bptr` and `pbg` once in `init_record` (`mcaRecord.c:426-431`)
+    /// and never reallocates either, so their width is a property of the
+    /// record's capacity, not of the last value written; `cvt_dbaddr` then
+    /// hands CA `no_elements = pmca->nmax` against that standing allocation.
+    /// Routing both puts through one call is what keeps a short `caput` from
+    /// leaving a buffer narrower than the channel advertising it.
+    fn land_buffer(&self, value: EpicsValue) -> CaResult<(EpicsValue, usize)> {
+        let cap = self.capacity();
         let converted = value.convert_to(self.element_type());
         macro_rules! land {
             ($src:expr, $variant:ident, $zero:expr) => {{
                 let mut arr = $src;
-                self.nord = arr.len().min(cap) as i32;
+                let written = arr.len().min(cap);
                 arr.resize(cap, $zero);
-                self.val = EpicsValue::$variant(arr);
-                Ok(())
+                Ok((EpicsValue::$variant(arr), written))
             }};
         }
         match converted {
@@ -419,16 +469,29 @@ impl McaRecord {
             EpicsValue::Enum(x) => land!(vec![x], EnumArray, 0),
             EpicsValue::String(x) => land!(vec![x], StringArray, PvString::new()),
             other => Err(CaError::TypeMismatch(format!(
-                "VAL: {other:?} does not convert to the FTVL element type"
+                "mca spectrum buffer: {other:?} does not convert to the FTVL \
+                 element type"
             ))),
         }
     }
 
-    /// The valid head of the spectrum — C `get_array_info`'s `*no_elements =
-    /// pmca->nord` (`mcaRecord.c:865-873`).
+    /// The valid head of the spectrum — C `get_array_info`
+    /// (`mcaRecord.c:865-873`):
+    ///
+    /// ```c
+    /// *no_elements =  pmca->nord;
+    /// if (*no_elements == 0) *no_elements = 1;
+    /// ```
+    ///
+    /// The floor is C's, not a rounding convenience: `nord` is 0 on a record
+    /// that has not acquired yet, and a zero-length array is not a value any
+    /// CA client can take — `oldChannelNotify.cpp:287` refuses a request for
+    /// zero elements outright. C therefore serves the first (zeroed) channel
+    /// of the `NMAX`-wide buffer `init_record` allocated. `get_array_info` has
+    /// no `fieldIndex` branch, so the same count governs `VAL` and `BG`.
     fn served_array(&self, buf: &EpicsValue) -> EpicsValue {
         let mut out = buf.clone();
-        let n = self.nord.max(0) as usize;
+        let n = self.nord.max(1) as usize;
         macro_rules! cut {
             ($v:expr) => {{
                 $v.truncate(n);
@@ -504,6 +567,24 @@ impl Record for McaRecord {
 
     fn declared_noaccess_fields(&self) -> &'static [&'static str] {
         dbd_generated::MCA_NOACCESS
+    }
+
+    /// C `cvt_dbaddr` (`mcaRecord.c:846-863`) ends with
+    /// `paddr->no_elements = pmca->nmax;` — outside the `fieldIndex` branch
+    /// that picks `bptr` or `pbg`, so the channel capacity is `NMAX` for both
+    /// `VAL` and `BG`. Those two are exactly the `special(SPC_DBADDR)` fields
+    /// (`mcaRecord.dbd`), which is what routes a channel through `cvt_dbaddr`
+    /// at all; every other field keeps its value's own count.
+    ///
+    /// Without this the channel was sized from the *served* count, which
+    /// `get_array_info` floors at 1 — so a client connecting before the first
+    /// acquisition fixed its buffer at one channel and never saw the spectrum
+    /// widen, because `ca_element_count` is settled at create-channel time.
+    ///
+    /// `McaRecord::capacity` is what sizes the buffers, so the advertised
+    /// capacity cannot drift from the allocation behind it.
+    fn dbaddr_capacity(&self, _field: &str) -> Option<u32> {
+        Some(self.capacity() as u32)
     }
 
     fn get_field(&self, name: &str) -> Option<EpicsValue> {
@@ -605,14 +686,7 @@ impl Record for McaRecord {
         match name {
             "VERS" => self.vers = as_f64(name, &value)?,
             "VAL" => self.land_spectrum(value)?,
-            "BG" => {
-                let cap = self.nmax.max(1) as usize;
-                let mut buf = value.convert_to(self.element_type());
-                if let EpicsValue::DoubleArray(v) = &mut buf {
-                    v.resize(cap, 0.0);
-                }
-                self.bg = buf;
-            }
+            "BG" => self.land_array_field(value, |r| &mut r.bg)?,
             "HOPR" => self.hopr = as_f64(name, &value)?,
             "LOPR" => self.lopr = as_f64(name, &value)?,
             "NMAX" => self.nmax = as_i32(name, &value)?,

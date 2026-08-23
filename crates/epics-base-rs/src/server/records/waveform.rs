@@ -101,8 +101,8 @@ pub struct WaveformRecord {
     /// simulated SIOL round-trip asynchronous: C's `readValue`/`writeValue`
     /// arms the `callbackRequestProcessCallbackDelayed(..., prec->sdly)`
     /// watchdog and holds PACT across the delay (aaiRecord.c:365-374). The
-    /// framework reads it via `get_field("SDLY")`, so the field must exist —
-    /// an absent SDLY defaults to -1.0 (synchronous) there.
+    /// framework reads it via `resolve_field("SDLY")`, which falls back to the
+    /// dbd `initial("-1.0")` (synchronous) for a record that does not store it.
     pub sdly: f64,
     /// aao-only: output mode select, `menu(menuOmsl)` (0=supervisory,
     /// 1=closed_loop). When `closed_loop`, aao sources VAL from `DOL`
@@ -965,8 +965,8 @@ impl Record for WaveformRecord {
     /// (`subArrayRecord.c:168`). Reporting it only for the waveform kind left
     /// aai/aao/subArray advertising a 0-length channel, so every array put/get
     /// was refused "Invalid element count requested".
-    fn field_native_count(&self, field: &str) -> Option<u32> {
-        (field == "VAL").then(|| self.val_capacity() as u32)
+    fn dbaddr_capacity(&self, _field: &str) -> Option<u32> {
+        Some(self.val_capacity() as u32)
     }
 
     /// `aao` is an output record; the rest of the array family read

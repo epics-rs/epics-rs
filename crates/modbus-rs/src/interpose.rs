@@ -18,7 +18,9 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU16, Ordering};
 
 use crate::error::{ModbusError, ModbusResult};
-use crate::protocol::{MAX_MODBUS_FRAME_SIZE, MBAP_HEADER_SIZE, MbapHeader};
+use crate::protocol::{
+    MAX_MODBUS_FRAME_SIZE, MBAP_HEADER_SIZE, MBAP_MIN_CMD_LENGTH, MODBUS_PROTOCOL_ID, MbapHeader,
+};
 
 /// Default response timeout when none is configured (matches the C
 /// `DEFAULT_TIMEOUT` of 2.0 s).
@@ -153,6 +155,105 @@ pub struct UnwrappedResponse {
     pub transaction_id: Option<u16>,
 }
 
+/// Total on-wire length of the frame an MBAP header introduces.
+///
+/// `cmd_length` counts the unit identifier plus the PDU. A header declaring
+/// fewer than [`MBAP_MIN_CMD_LENGTH`] bytes, more than the link allows, or a
+/// protocol identifier other than [`MODBUS_PROTOCOL_ID`] is not a Modbus
+/// header at all, so the position of the next frame in the stream is unknown.
+fn mbap_frame_len(header: &MbapHeader) -> ModbusResult<usize> {
+    let len = header.cmd_length as usize;
+    if header.protocol_type != MODBUS_PROTOCOL_ID
+        || len < MBAP_MIN_CMD_LENGTH
+        || MBAP_HEADER_SIZE + len > MAX_MODBUS_FRAME_SIZE
+    {
+        return Err(ModbusError::MalformedResponse(format!(
+            "MBAP header declares protocol {} length {}",
+            header.protocol_type, len
+        )));
+    }
+    Ok(MBAP_HEADER_SIZE + len)
+}
+
+/// Reassembles MBAP frames from a byte stream.
+///
+/// Modbus/TCP carries no terminator, so a reader that treats one `recv` as one
+/// frame desynchronises the moment the network splits or coalesces replies:
+/// the tail of a split reply is parsed as the next transaction's MBAP header
+/// and the port stays one frame behind for good. The frame length is the
+/// header's `cmd_length` — the same field [`ModbusFramer::frame_request`]
+/// writes — so this reads until that many bytes are present and keeps whatever
+/// arrived beyond them for the next frame.
+///
+/// UDP needs none of this: a datagram is delivered whole or not at all, and
+/// carrying leftovers between datagrams would desynchronise a link that cannot
+/// otherwise lose framing.
+#[derive(Debug, Default)]
+pub struct MbapAccumulator {
+    buf: Vec<u8>,
+}
+
+impl MbapAccumulator {
+    /// An empty accumulator.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Add bytes as they arrive from the link.
+    pub fn extend(&mut self, bytes: &[u8]) {
+        self.buf.extend_from_slice(bytes);
+    }
+
+    /// Drop whatever partial frame is buffered.
+    ///
+    /// Bytes held here are only meaningful as the head of the reply to the
+    /// request that is still outstanding. Once that transaction ends without a
+    /// frame, they belong to nothing, and leaving them makes the next reply's
+    /// head read as the tail of a message that will never be completed.
+    pub fn reset(&mut self) {
+        self.buf.clear();
+    }
+
+    /// Remove and return the next complete frame, or `None` while the buffered
+    /// bytes are still short of the length its header declares.
+    ///
+    /// A header that cannot be a Modbus header leaves the stream position
+    /// unknown, so the buffer is dropped along with the error rather than
+    /// re-parsed at the same offset on the next call.
+    pub fn next_frame(&mut self) -> ModbusResult<Option<Vec<u8>>> {
+        if self.buf.len() < MBAP_HEADER_SIZE {
+            return Ok(None);
+        }
+        let header = MbapHeader::from_bytes(&self.buf[..MBAP_HEADER_SIZE])?;
+        let need = mbap_frame_len(&header).inspect_err(|_| self.buf.clear())?;
+        if self.buf.len() < need {
+            return Ok(None);
+        }
+        Ok(Some(self.buf.drain(..need).collect()))
+    }
+
+    /// Return one whole frame, pulling more bytes through `read_chunk` until
+    /// the length its header declares is satisfied.
+    ///
+    /// `read_chunk` returns whatever a single read of the link produced; an
+    /// empty chunk is the underlying port's timeout.
+    pub fn read_frame(
+        &mut self,
+        mut read_chunk: impl FnMut() -> ModbusResult<Vec<u8>>,
+    ) -> ModbusResult<Vec<u8>> {
+        loop {
+            if let Some(frame) = self.next_frame()? {
+                return Ok(frame);
+            }
+            let chunk = read_chunk()?;
+            if chunk.is_empty() {
+                return Err(ModbusError::Timeout);
+            }
+            self.extend(&chunk);
+        }
+    }
+}
+
 impl ModbusFramer {
     /// Create a framer with a transaction-ID counter of its own. Correct only
     /// where the caller owns the link outright; a framer over a shared octet
@@ -242,8 +343,18 @@ impl ModbusFramer {
                     });
                 }
                 let header = MbapHeader::from_bytes(&frame[..MBAP_HEADER_SIZE])?;
+                let need = mbap_frame_len(&header)?;
+                // The header's own `cmd_length` delimits the frame: anything
+                // short of it is a truncated reply, and anything past it
+                // belongs to the next transaction, not to this PDU.
+                if frame.len() < need {
+                    return Err(ModbusError::FrameTooShort {
+                        got: frame.len(),
+                        need,
+                    });
+                }
                 // Skip MBAP header + the 1-byte slave/unit ID.
-                let pdu = frame[MBAP_HEADER_SIZE + 1..].to_vec();
+                let pdu = frame[MBAP_HEADER_SIZE + 1..need].to_vec();
                 Ok(UnwrappedResponse {
                     pdu,
                     transaction_id: Some(header.transaction_id),
@@ -504,5 +615,87 @@ mod tests {
         assert_eq!(LinkType::from_i32(2), Some(LinkType::Ascii));
         assert_eq!(LinkType::from_i32(3), Some(LinkType::Udp));
         assert_eq!(LinkType::from_i32(4), None);
+    }
+
+    // ── F3: MBAP framing over a byte stream ──────────────────────────────
+
+    /// A Modbus/TCP reply to a 125-register read: 6 MBAP bytes plus the 253
+    /// the header declares (unit, function code, byte count, 250 data bytes).
+    fn read_125_registers_reply(txid: u16) -> Vec<u8> {
+        let mut frame = MbapHeader::new(txid, 253).to_bytes().to_vec();
+        frame.extend_from_slice(&[0x01, 0x03, 250]);
+        frame.extend((0..250u16).map(|i| i as u8));
+        assert_eq!(frame.len(), 259);
+        frame
+    }
+
+    /// F3: the network is free to split a 259-byte reply across two reads. The
+    /// old reader took whatever one read returned as a whole frame, so the tail
+    /// became the next transaction's MBAP header and the port never resynced.
+    #[test]
+    fn a_split_tcp_reply_is_reassembled_into_one_frame() {
+        let frame = read_125_registers_reply(7);
+        let mut chunks = vec![frame[..140].to_vec(), frame[140..].to_vec()].into_iter();
+
+        let mut acc = MbapAccumulator::new();
+        let got = acc
+            .read_frame(|| Ok(chunks.next().unwrap_or_default()))
+            .unwrap();
+
+        assert_eq!(got, frame, "both reads must land in one frame");
+        assert_eq!(chunks.next(), None, "no bytes may be left unread");
+    }
+
+    /// F3: the network is equally free to coalesce two replies into one read.
+    /// The surplus belongs to the next frame, not to this one.
+    #[test]
+    fn two_coalesced_tcp_replies_are_returned_as_separate_frames() {
+        let first = read_125_registers_reply(7);
+        let second = read_125_registers_reply(8);
+        let mut both = first.clone();
+        both.extend_from_slice(&second);
+        let mut chunks = vec![both].into_iter();
+
+        let mut acc = MbapAccumulator::new();
+        let mut read = || Ok(chunks.next().unwrap_or_default());
+        assert_eq!(acc.read_frame(&mut read).unwrap(), first);
+        // The second frame comes out of the buffer: reading again would block
+        // on a link that has already sent everything it is going to send.
+        assert_eq!(acc.read_frame(&mut read).unwrap(), second);
+    }
+
+    /// F3: `cmd_length` is the frame delimiter, so a reply cut short of it is a
+    /// truncated frame and not a PDU. It used to be unwrapped into a short PDU
+    /// whose transaction ID still matched.
+    #[test]
+    fn a_truncated_mbap_reply_is_rejected() {
+        let framer = ModbusFramer::new(LinkType::Tcp);
+        let frame = read_125_registers_reply(7);
+
+        let err = framer.unwrap_response(&frame[..140]).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                ModbusError::FrameTooShort {
+                    got: 140,
+                    need: 259
+                }
+            ),
+            "expected a short-frame rejection, got {err:?}"
+        );
+    }
+
+    /// F3: bytes past `cmd_length` are the next transaction's, so they must not
+    /// reach this response's PDU.
+    #[test]
+    fn bytes_past_cmd_length_stay_out_of_the_pdu() {
+        let framer = ModbusFramer::new(LinkType::Tcp);
+        let mut frame = read_125_registers_reply(7);
+        frame.extend_from_slice(&read_125_registers_reply(8)[..40]);
+
+        let unwrapped = framer.unwrap_response(&frame).unwrap();
+        assert_eq!(unwrapped.transaction_id, Some(7));
+        // 253 declared bytes less the unit identifier the unwrap strips.
+        assert_eq!(unwrapped.pdu.len(), 252);
     }
 }

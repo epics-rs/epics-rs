@@ -118,7 +118,7 @@ async fn naming_a_parked_sub_releases_the_park_and_it_processes() {
     assert_eq!(pact(&db, "BARE"), 1, "an empty SNAM parks at init");
 
     put_snam(&db, "BARE", "bump").await.unwrap();
-    assert_eq!(pact(&db, "BARE"), 0, "subRecord.c:183-187 releases it");
+    assert_eq!(pact(&db, "BARE"), 0, "subRecord.c:175-178 releases it");
 
     proc(&db, "BARE").await;
     assert_eq!(val(&db, "BARE"), 1.0, "record support runs again");
@@ -134,7 +134,7 @@ async fn emptying_a_running_subs_snam_parks_it() {
     assert_eq!(val(&db, "NAMED"), 1.0, "baseline: it was processing");
 
     put_snam(&db, "NAMED", "").await.unwrap();
-    assert_eq!(pact(&db, "NAMED"), 1, "subRecord.c:189-193 re-parks");
+    assert_eq!(pact(&db, "NAMED"), 1, "subRecord.c:182-186 re-parks");
 
     proc(&db, "NAMED").await;
     assert_eq!(val(&db, "NAMED"), 1.0, "a parked record does not run");
@@ -168,7 +168,7 @@ async fn renaming_a_running_sub_rebinds_it_to_the_new_routine() {
 /// Boundary: named -> a name the registry does not know. C looks it up, stores
 /// the NULL, and returns `S_db_BadSub`, so the put fails AND the old binding is
 /// gone; the next cycle reaches `do_sub`'s `psubroutine == NULL` arm
-/// (`subRecord.c:212-215`) and runs nothing.
+/// (`subRecord.c:425-428`) and runs nothing.
 #[epics_macros_rs::epics_test]
 async fn renaming_a_sub_to_an_unregistered_name_drops_the_old_binding() {
     let db = build().await;

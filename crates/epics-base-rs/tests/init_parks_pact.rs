@@ -14,7 +14,7 @@
 //! PACT-active branch on every scan and record support does not run. It is how
 //! C disables a `sub` with no subroutine — the record still serves its fields,
 //! it just cannot process. The park is released by an SNAM put and by nothing
-//! else (`subRecord.c:180-187`, covered in
+//! else (`subRecord.c:170-194`, covered in
 //! `sub_snam_put_moves_the_pact_park.rs`). Measured on the compiled softIoc:
 //!
 //! ```text

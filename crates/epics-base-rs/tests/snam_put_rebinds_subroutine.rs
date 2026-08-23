@@ -277,7 +277,7 @@ async fn posting_internal_put_of_an_unregistered_snam_is_refused_and_unbinds() {
 
     db.put_pv_and_post("Y.SNAM", EpicsValue::String("nope".into()))
         .await
-        .expect_err("subRecord.c:194 returns S_db_BadSub");
+        .expect_err("subRecord.c:193 returns S_db_BadSub");
 
     db.get_record("Y")
         .unwrap()

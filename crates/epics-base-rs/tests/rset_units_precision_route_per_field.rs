@@ -10,7 +10,7 @@
 //! ```text
 //! subArrayRecord.c:206-219 VAL/HOPR/LOPR -> EGU   :221-229 -> PREC
 //! selRecord.c:135-143      DBF_DOUBLE    -> EGU   :146-165 -> PREC
-//! subRecord.c:206-220      DBF_DOUBLE    -> EGU   :222-242 -> PREC
+//! subRecord.c:206-219      DBF_DOUBLE    -> EGU   :221-240 -> PREC
 //! dfanoutRecord.c:170-179  DBF_DOUBLE    -> EGU   :181-188 -> PREC
 //! sCalcoutRecord.c:607     (no gate)     -> EGU   :616     -> PREC
 //! aCalcoutRecord.c:747     (no gate)     -> EGU   :756     -> PREC

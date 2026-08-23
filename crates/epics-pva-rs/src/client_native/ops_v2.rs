@@ -6,7 +6,7 @@
 //!
 //! - GET / PUT / RPC: re-queued and re-issued when the channel is lost
 //!   mid-op, bounded by the caller's `op_timeout` — see
-//!   [`requeue_on_disconnect`]. pvxs does NOT surface the loss to the
+//!   `requeue_on_disconnect`. pvxs does NOT surface the loss to the
 //!   caller: `GPROp::disconnected` (`clientget.cpp:380-404`) returns the
 //!   op to `chan->pending` for every one-call (`autoExec`) op, GET and PUT
 //!   alike.

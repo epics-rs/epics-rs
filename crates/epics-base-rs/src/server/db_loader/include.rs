@@ -416,7 +416,7 @@ pub(crate) fn parse_macro_defns(defns: &str) -> Vec<(String, String)> {
 /// `dbReadCOM` (`:244-253`) installs `"."`, which is the same file the
 /// bare open reaches, so the empty-list branch here matches it.
 ///
-/// Both C callers run [`db_expand_file_name`] (`macEnvExpand`) on the
+/// Both C callers run `db_expand_file_name` (`macEnvExpand`) on the
 /// name immediately before calling `dbOpenFile` — `dbReadCOM`
 /// (`:276`) and `dbIncludeNew` (`:449`) — so the expansion is done
 /// here, once, rather than at each caller.

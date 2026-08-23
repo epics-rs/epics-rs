@@ -75,7 +75,7 @@ pub const SERVER_SOURCE_NAME: &str = "__server";
 /// NOT pvxs's `"__builtin"`. That key belongs to `Server::Pvt::builtinsrc`
 /// (`serverconn.h:265`), a source the *server* owns and only
 /// `Server::addPV` writes into (`server.cpp:174-181`); an application never
-/// hands one in. [`super::PvaServer::start`] takes the application's own
+/// hands one in. `PvaServer::start` takes the application's own
 /// source, which is pvxs's `Server::addSource(name, src, order)` shape, and
 /// that defaults to order 0 (`pvxs/server.h:116-118`) — behind both
 /// internals. epics-rs has no `addPV` equivalent, so nothing occupies

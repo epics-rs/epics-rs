@@ -6183,7 +6183,7 @@ impl PvDatabase {
     /// A CONSTANT link hands its value to the record exactly ONCE, here, via
     /// `dbLoadLink` — at process time `dbGetLink` on a constant delivers
     /// nothing. This is the other half of the rule
-    /// [`Self::fetch_link`] enforces; without it a `field(SIOL, "42")`
+    /// `Self::fetch_link` enforces; without it a `field(SIOL, "42")`
     /// would never reach SVAL at all.
     ///
     /// Must be called once per record, after its fields are applied — the

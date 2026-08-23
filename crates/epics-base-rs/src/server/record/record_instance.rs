@@ -297,7 +297,7 @@ pub enum DeferredNotify {
 ///
 /// Carries one bit: whether the record owed a restart at the moment the token
 /// was minted. Queued put-notifies live on the record
-/// ([`RecordInstance::notify_restart_list`]) from arrival to replay and are
+/// (`RecordInstance::notify_restart_list`) from arrival to replay and are
 /// promoted by one owner, `PvDatabase::apply_pact_exit` — so a release path
 /// that forgets its tail delays a restart, it cannot strand one inside a
 /// dropped value.
@@ -309,7 +309,7 @@ pub enum DeferredNotify {
 /// a `Drop`, where a still-live write guard in the same scope would otherwise
 /// deadlock parking_lot. A stale `true` costs one no-op drain: the drain
 /// re-reads the queue under the write lock via
-/// [`RecordInstance::take_next_notify_restart`] and returns if it is empty.
+/// `RecordInstance::take_next_notify_restart` and returns if it is empty.
 ///
 /// The token is `#[must_use]` because that tail is where the restart happens:
 /// C `recGbl.c:295` (`if (pdbc->ppn) dbNotifyCompletion(pdbc)`) →
@@ -1364,8 +1364,8 @@ impl RecordInstance {
     /// `propertyUpdate` flag).
     ///
     /// The two effects have independent gates. Invalidation follows
-    /// [`is_metadata_cache_source`] (what this port's cache reads); the post
-    /// follows [`Self::field_posts_property`] (what the `.dbd` declares). A
+    /// `is_metadata_cache_source` (what this port's cache reads); the post
+    /// follows `Self::field_posts_property` (what the `.dbd` declares). A
     /// field can be either without being both.
     ///
     /// `prev` is the value captured BEFORE the put. Callers that don't need the
@@ -1522,7 +1522,7 @@ impl RecordInstance {
     /// A RESTARTED put is not asked this: it is already the record's owner (C
     /// `precord->ppn == ppn`, state `notifyRestartCallbackRequested`, which
     /// dbNotify.c:213 exempts by name) and only PACT can stop it — see
-    /// [`Self::requeue_notify_put`].
+    /// `Self::requeue_notify_put`.
     pub fn notify_put_is_owned(&self) -> bool {
         self.notify.is_some() || self.is_processing() || !self.notify_restart_list.is_empty()
     }
@@ -2312,7 +2312,7 @@ impl RecordInstance {
     ///
     /// The sources are the same in every C rset that supplies them — `EGU` for
     /// `get_units` and `PREC` for `get_precision` — so only the graphic pair
-    /// needs a per-type table ([`graphic_limit_fields`]). Per-FIELD departures
+    /// needs a per-type table (`graphic_limit_fields`). Per-FIELD departures
     /// from the record's own values stay where C puts them, in that record's
     /// [`Record::field_metadata_override`], which is applied after this and
     /// wins.
@@ -2378,7 +2378,7 @@ impl RecordInstance {
     /// answers the record's own operator range.
     ///
     /// Which of the record's fields that range comes from is the one thing
-    /// that varies by type, and it lives in [`control_limit_source`].
+    /// that varies by type, and it lives in `control_limit_source`.
     fn populate_control_info(&self, snap: &mut super::super::snapshot::Snapshot) {
         use super::record_trait::ControlLimitSource;
 
@@ -4806,7 +4806,7 @@ impl RecordInstance {
     /// `get_linkNumber` → `dbGetGraphicLimits`) and only falls to `recGbl` for
     /// a field that backs no link. A constant (unset) link has no metadata
     /// getters, so the `dbAccess.c:216` 0/0 seed stands — measured: `CALC.A`
-    /// serves display 0/0 but control ±1e300. [`Self::graphic_link_backed_field`]
+    /// serves display 0/0 but control ±1e300. [`Record::link_backed_metadata_field`]
     /// carries that per-record C knowledge.
     ///
     /// Units and precision are routed here too, and they are NOT the

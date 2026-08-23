@@ -231,7 +231,7 @@ pub struct MonitorEvent {
     /// log (`pLog->mask = caEventMask & pevent->select`,
     /// `dbEvent.c:896-900`) and pvxs narrows per event from
     /// `pDbFieldLog->mask` (`groupsource.cpp:331-337`). The intersection
-    /// is produced by [`Subscriber::delivered_mask`], which is also the
+    /// is produced by `Subscriber::delivered_mask`, which is also the
     /// delivery gate, so the two cannot drift apart. Carrying it on the
     /// event lets subscribers narrow what they decode (e.g. a QSRV group
     /// monitor updating only alarm leaves on a `DBE_ALARM`-only event)

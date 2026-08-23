@@ -389,7 +389,7 @@ pub type BackgroundTaskHandle<T> = crate::runtime::background::JoinFuture<T>;
 /// hosted build it needs a tokio runtime entered on the calling thread, while
 /// this one always lands on the same executor no matter who calls it. Record
 /// processing is reached from a plain `std::thread` — every blocking CA/PVA
-/// connection thread drives it through [`block_on_sync`] → [`park_on`] — so a
+/// connection thread drives it through [`block_on_sync`] → `park_on` — so a
 /// tail it defers must not depend on the caller's thread having a runtime.
 ///
 /// Anything awaited inside `future` is subject to the same rule: use

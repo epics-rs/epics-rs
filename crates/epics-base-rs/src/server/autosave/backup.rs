@@ -92,7 +92,7 @@ pub(super) async fn publish_copy(src: &Path, dst: &Path) -> AutosaveResult<()> {
 ///
 /// Each field is a watermark meaning "the artefact it governs is on
 /// disk". They are private, and the two transitions that move them
-/// ([`Self::rotate_seq`] and [`Self::write_dated`]) publish first and
+/// (`Self::rotate_seq` and `Self::write_dated`) publish first and
 /// advance after, so a watermark standing ahead of the file it names
 /// cannot be constructed. Advancing `seq_index` past a copy that did not
 /// happen is what used to leave a destroyed slot unrewritten for a whole
@@ -190,7 +190,7 @@ async fn modified_time(path: &Path) -> Option<SystemTime> {
 /// The first two are a real ordering: `.savB` is refreshed from `.sav` on
 /// every rotation cycle, so it is never older than a sequence slot, which
 /// is refreshed only once per `seq_period`. The slots are not an ordering.
-/// [`BackupState::rotate_seq`] fills them round-robin, so once the index
+/// `BackupState::rotate_seq` fills them round-robin, so once the index
 /// has wrapped, slot 0 is as likely to hold the oldest generation as the
 /// newest — reading them by index restored a file up to
 /// `num_seq_files - 1` rotation periods stale and named it in

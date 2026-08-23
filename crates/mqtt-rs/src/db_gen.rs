@@ -3,7 +3,7 @@
 //! Every `.db` line `z2m` and `ioc` produce goes through here. They
 //! interpolate caller-supplied text — an MQTT topic named in `st.cmd`, an
 //! asyn port name — into a *quoted field value*, and the loader reads that as
-//! a `jsonSTRING` ([`db_loader::read_field_value`] →
+//! a `jsonSTRING` (`db_loader::read_field_value` →
 //! `read_json_string`), which ends at the first unescaped `"`. A raw quote
 //! there does not corrupt one field: the parse fails, `parse_db` returns
 //! `Err` for the whole string, and not one record of the device is created.

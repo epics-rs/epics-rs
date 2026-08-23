@@ -56,7 +56,7 @@ pub mod serial_port;
 /// `Duration` cannot carry and this function therefore never sees.
 ///
 /// This is deliberately *not*
-/// [`ip_port::socket_poll_timeout`](ip_port::socket_poll_timeout), which owns
+/// [`ip_port::socket_poll_timeout`], which owns
 /// the other half: a `timeout == 0` *caller request* becoming C's 1 ms poll on
 /// the IP transports. That one is about what the caller asked for and yields a
 /// `Duration` for the socket-option sites; this one is about what is left to

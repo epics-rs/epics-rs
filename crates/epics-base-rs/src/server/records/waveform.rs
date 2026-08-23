@@ -1535,7 +1535,7 @@ impl Record for WaveformRecord {
     /// reported through [`Self::soft_input_read_failed`]) OR when the slice came
     /// out empty — INDX walked past the data, which an empty-INP subArray
     /// re-subsetting its own buffer or a client caput to INDX can both produce.
-    /// The framework owns `common.udf`; [`Self::served_element_count`] reads the
+    /// The framework owns `common.udf`; `Self::served_element_count` reads the
     /// same predicate so the served count follows without a second rule.
     ///
     /// waveform/aai/aao keep the default answer for an array VAL (defined) —

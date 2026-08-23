@@ -426,7 +426,7 @@ impl Record for MbboRecord {
     /// ZRVL..FFVL are `SPC_MOD` too, and C's own comment there says so, but they
     /// fall outside the index range and post nothing. What they DO reach is
     /// `init_common`, whose `sdef` this port derives on demand
-    /// ([`Self::sdef`]) rather than caching, so that half needs no hook.
+    /// (`Self::sdef`) rather than caching, so that half needs no hook.
     fn monitor_side_effect_fields(&self, put_field: &str) -> &'static [&'static str] {
         match crate::server::record::multibit_state_string_index(put_field) {
             Some(state) if state == self.val => &["VAL"],

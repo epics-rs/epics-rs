@@ -258,7 +258,7 @@ pub fn new_acf_cell(initial: Option<AccessSecurityConfig>) -> AcfCell {
 }
 
 /// Build a shared [`AcfCell`] that serves `db`, with its ASG `INP*` watcher
-/// already running (C `asCa.c`, see [`spawn_asg_inp_watcher`]).
+/// already running (C `asCa.c`, see `spawn_asg_inp_watcher`).
 ///
 /// The constructor every server that enforces a policy over a record database
 /// must use. Access levels are cached per channel, so a policy cell without

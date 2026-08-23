@@ -190,7 +190,7 @@ struct LinkConnState {
     /// after every `Connected`, so the default only lives for that gap.
     read_access: AtomicBool,
     /// C `pca->hasWriteAccess` (`dbCa.c:876`, `:1090`) — the write half of
-    /// the same rights event, consulted by [`CaResolver::put_admission`]
+    /// the same rights event, consulted by `CaResolver::put_admission`
     /// because `dbCaPutLinkCallback`'s gate is
     /// `if (!pca->isConnected || !pca->hasWriteAccess)` (`dbCa.c:558-561`):
     /// BOTH operands, tested before anything is staged. The client's own

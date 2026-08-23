@@ -453,7 +453,7 @@ impl Parser {
 
 /// Parse a `.substitutions` file body into the list of template loads
 /// it describes. Does not touch the filesystem — see
-/// [`load_substitution_file`] for the loading entry point.
+/// `load_substitution_file` for the loading entry point.
 pub fn parse_substitutions(input: &str) -> CaResult<Vec<TemplateLoad>> {
     let toks = lex(input)?;
     Parser::new(toks).parse()

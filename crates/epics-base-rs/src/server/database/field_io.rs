@@ -338,8 +338,8 @@ fn special_after_put(
 /// cannot process, so the store about to happen gets a clean slate and
 /// [`special_after_put`] re-takes the park if the NEW value still leaves the
 /// record unable to run. The record cannot reach PACT, so it answers
-/// [`Record::parks_pact`] and this performs the transition; the returned
-/// [`PactExit`] carries any put-notify the release freed.
+/// [`Record::parks_pact`](crate::server::record::Record::parks_pact) and this performs the transition; the returned
+/// [`PactExit`](crate::server::record::PactExit) carries any put-notify the release freed.
 fn special_before_put(
     instance: &mut crate::server::record::RecordInstance,
     field: &str,
@@ -853,7 +853,7 @@ impl PvDatabase {
     ///
     /// The only difference is who arms a queued put-notify restart when this
     /// put releases a PACT park: that cycle's tail, as in C, rather than this
-    /// put body. See [`RestartOwner`].
+    /// put body. See `RestartOwner`.
     pub fn put_pv_already_locked_before_process(
         &self,
         name: &str,

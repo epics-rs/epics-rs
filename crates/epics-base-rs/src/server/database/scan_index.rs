@@ -103,14 +103,14 @@ impl PvDatabase {
     }
 
     /// A **snapshot** of a scan list, in C's order: PHAS, then DBD
-    /// record-type order, then `.db` load order — see [`ScanKey`]. The stable
+    /// record-type order, then `.db` load order — see `ScanKey`. The stable
     /// same-PHAS FIFO is `addToList`; the order it is a FIFO over is
     /// `buildScanLists`, and both are in the key.
     ///
     /// For reporting and counting only (`scanppl`, `dbstat`). A sweep that
     /// PROCESSES the list must not use this: `dbProcess` can change the SCAN
     /// field of an arbitrary number of records, so a snapshot processes
-    /// records the list no longer holds. [`Self::scan_list_once`] is the sweep.
+    /// records the list no longer holds. `Self::scan_list_once` is the sweep.
     ///
     /// A SCAN value that names no list (`Passive`, or an index outside
     /// `menuScan`) holds no records — there is no such bucket to look up.
@@ -194,7 +194,7 @@ impl PvDatabase {
     /// `iterateRecords`, which walks the record-type / record-instance lists in
     /// the order the `.db` declared them. That order is what makes two
     /// same-`PHAS` records process deterministically; `load_order` is one of
-    /// the `scan_index` sort keys for the same reason (see [`ScanKey`], which
+    /// the `scan_index` sort keys for the same reason (see `ScanKey`, which
     /// also carries the record-type ordinal C's `iterateRecords` walks first —
     /// this PINI sweep does not, and that is a separate gap).
     ///

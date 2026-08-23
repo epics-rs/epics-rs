@@ -191,7 +191,7 @@ fn print_fields_list(ctx: &CommandContext, name: &str, fields: &[String]) {
 /// type's own list — the order its records were loaded — before the
 /// next type is touched. Sorting every name once interleaves the
 /// types, which C never does, and throws away the load order
-/// [`PvDatabase::all_record_names`] preserves.
+/// [`PvDatabase::all_record_names`](crate::server::database::PvDatabase::all_record_names) preserves.
 ///
 /// The type sequence is `dbd_generated::RECORD_TYPES`, which the
 /// generator emits in name order; C's is `recordTypeList`, the order

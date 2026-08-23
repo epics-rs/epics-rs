@@ -524,7 +524,7 @@ pub(crate) fn handle_pool_write_int32(
 /// whose [`crate::attributes::LiveValueCell`] it writes into. Every path that
 /// replaces the attribute list -- a fresh `NDAttributesFile`, a file that
 /// cannot be opened, XML that does not parse -- goes through
-/// [`NDArrayDriverBase::clear_attributes`], which replaces both together.
+/// `NDArrayDriverBase::clear_attributes`, which replaces both together.
 #[cfg(feature = "ioc")]
 #[derive(Default)]
 pub struct CaMonitorSet(Vec<tokio::task::JoinHandle<()>>);

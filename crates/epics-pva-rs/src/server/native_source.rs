@@ -1263,7 +1263,7 @@ async fn put_record_field(
 ///
 /// pvxs reads both inside `onPut` from the INIT pvRequest, never from the
 /// data-phase value (`ioc/singlesource.cpp:346-352`); the wire layer hands
-/// that request down as [`ChannelContext::pv_request`]. An unsupported
+/// that request down as `ChannelContext::pv_request`. An unsupported
 /// `process` value is reported to the client through the operation's
 /// `RemoteLog` by the shared parser, exactly as `setForceProcessingFlag`
 /// does (`ioc/iocsource.cpp:446-447`).

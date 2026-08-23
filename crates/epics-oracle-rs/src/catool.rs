@@ -301,7 +301,7 @@ impl CaTools {
     /// `Ok` is a *reading*: put accept/reject is observable behavior (a
     /// `SPC_NOMOD` field must refuse the write, an out-of-range enum must
     /// refuse it), so a rejection is a finding, not a failure of the harness.
-    /// `Err` is the absence of a reading. See [`Self::put`] for why the two
+    /// `Err` is the absence of a reading. See `Self::put` for why the two
     /// cannot be one value.
     pub fn caput(&self, pv: &str, value: &str) -> Result<PutOutcome, ToolError> {
         let mut args = put_args();

@@ -502,7 +502,7 @@ impl IocShell {
     /// macros go onto the shell's one macro handle (C `iocsh.cpp:1118`
     /// `macPushScope` + `macInstallMacros`), so the loaded script's
     /// `$(KEY)` and its environment references expand together in the
-    /// single pass [`Self::run_script`] performs.
+    /// single pass `Self::run_script` performs.
     ///
     /// As the `iocshLoad` mirror this is also the level that records
     /// `IOCSH_STARTUP_SCRIPT` — top-level loads enter here (C

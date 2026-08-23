@@ -103,7 +103,7 @@ pub enum ParsedLink {
     /// inputs. JSON form:
     /// `{calc: {expr:"A*B", args:[{pva:"record"}, 1.5], time:"a"}}`
     /// — `time` is the input letter whose timestamp the result should
-    /// carry, upper or lower case, `A` through the [`CALC_NARGS`]th
+    /// carry, upper or lower case, `A` through the [`CALC_NARGS`](crate::calc::CALC_NARGS)th
     /// letter (`lnkCalc.c:180-186`). `time` may be omitted (no timestamp
     /// passthrough).
     Calc(CalcLink),
@@ -256,16 +256,16 @@ pub enum CalcArg {
 pub struct CalcLink {
     /// Calc expression in epics-base postfix syntax — e.g. `"A+B*2"`,
     /// `"MAX(A,B,C)"`. Variables A.. bind to `args` by position, up to
-    /// [`CALC_NARGS`].
+    /// [`CALC_NARGS`](crate::calc::CALC_NARGS).
     pub expr: String,
     /// Input arguments. Each `args[i]` is resolved at link-read time and
     /// bound to the calc engine's variable slot at index `i` (0→A, 1→B,
-    /// …). At most [`CALC_NARGS`] of them — C stops the parse at the
+    /// …). At most [`CALC_NARGS`](crate::calc::CALC_NARGS) of them — C stops the parse at the
     /// limit rather than truncating (`lnkCalc.c:135-139`).
     pub args: Vec<CalcArg>,
     /// C `clink->tinp` (`lnkCalc.c:184`) as its letter: the input whose
     /// timestamp and userTag the reading record adopts. Normalised to upper
-    /// case and bounded by [`CALC_NARGS`] (`lnkCalc.c:180-186`), so it
+    /// case and bounded by [`CALC_NARGS`](crate::calc::CALC_NARGS) (`lnkCalc.c:180-186`), so it
     /// indexes `args` directly. `None` is C's `tinp = -1` —
     /// `lnkCalc_getTimestampTag` returns -1 and the consumer keeps its own
     /// `apply_timestamp` time.

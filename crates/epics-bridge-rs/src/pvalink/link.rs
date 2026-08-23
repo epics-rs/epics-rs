@@ -1081,7 +1081,7 @@ impl PvaLink {
     /// process, transferring no value. Mirrors pvxs `pvaScanForward`
     /// (`pvxs/ioc/pvalink_lset.cpp:680-695`), which is `lchan->put(true)`
     /// at `:691` — the forced arm of the same channel put every OUT write
-    /// takes, so it goes through [`Self::issue_put`] here too.
+    /// takes, so it goes through `Self::issue_put` here too.
     ///
     /// It must NOT be a PVA `PROCESS` (cmd 16): pvxs implements no handler
     /// for that command anywhere. `CMD_PROCESS` occurs once in its tree, as

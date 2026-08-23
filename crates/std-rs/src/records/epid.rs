@@ -466,7 +466,7 @@ impl EpidRecord {
     /// the flag and returns `ProcessOutcome::async_pending()` so the
     /// trigger pass skips the process tail (checkAlarms / monitor /
     /// recGblFwdLink) — C `devEpidSoftCallback.c:143-145` +
-    /// `epidRecord.c:205-210`. See [`EpidRecord::ca_trig`].
+    /// `epidRecord.c:205-210`. See `EpidRecord::ca_trig`.
     pub fn ca_trig_phase(&self) -> CaTrigPhase {
         self.ca_trig
     }

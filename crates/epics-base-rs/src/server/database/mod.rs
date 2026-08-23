@@ -266,7 +266,7 @@ pub struct CpTarget {
 #[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Debug)]
 struct ScanKey {
     phas: i16,
-    /// Position in [`dbd_generated::RECORD_TYPE_ORDER`]. A record type no
+    /// Position in [`RECORD_TYPE_ORDER`](crate::server::record::dbd_generated::RECORD_TYPE_ORDER). A record type no
     /// vendored `.dbd` declares sorts after every one that is declared, which
     /// is where C puts it too — a module `.dbd` is included after `base.dbd`,
     /// so its types join `recordTypeList` behind base's.
@@ -552,7 +552,7 @@ thread_local! {
 /// L46 is a `PriorityInheritanceMutex` and is therefore NOT reentrant: a
 /// thread that takes it twice parks on itself forever. That makes the
 /// caller-side rule a MUST, and it is the half the lock-order table in
-/// [`super::record_lock`] did not state —
+/// `super::record_lock` did not state —
 /// [`PvDatabase::update_scan_index`] is the single owner of a scan-index
 /// transition and takes L46 **itself**, so no caller may hold L46 across a
 /// call to it. Releasing early is also what C does: `iterateRecords`

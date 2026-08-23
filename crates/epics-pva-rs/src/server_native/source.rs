@@ -181,7 +181,7 @@ impl Default for PutOptions {
 ///
 /// `True`/`False`/`Unset` map to Force/Inhibit/Passive here. The `as<bool>`
 /// coercion is the *same* one `record._options.atomic`/`block` use, so it
-/// routes through the shared [`epics_pva_rs::pvdata::convert::as_bool`] owner
+/// routes through the shared [`as_bool`](crate::pvdata::convert::as_bool) owner
 /// rather than being re-derived: a bool, any signed/unsigned integer or real
 /// scalar maps by nonzero truthiness (`copyOutScalar` `bool(src)`,
 /// src/data.cpp:402-408), and a string is accepted only as the exact tokens
@@ -490,7 +490,7 @@ fn dbe_value_class_mask(raw: u16) -> u16 {
 /// no scalar arm for array storage (`data.cpp:466-499`). So an ARRAY-typed
 /// `DBE` of integer, real, or string element kind reaches the conversion and
 /// raises `NoConvert` — `Err` here, which the caller
-/// ([`ChannelSource::check_monitor_request`](epics_pva_rs::server_native::source::ChannelSource::check_monitor_request))
+/// (`ChannelSource::check_monitor_request`(epics_pva_rs::server_native::source::ChannelSource::check_monitor_request))
 /// turns into an op-level error reply. pvxs instead lets the throw reset the
 /// whole TCP circuit; that is CBUG-C2 and the port deliberately does not
 /// reproduce it. A BOOLEAN array does not throw: `Kind::Bool` never reaches a

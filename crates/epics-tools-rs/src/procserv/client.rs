@@ -154,7 +154,7 @@ const CLIENT_SEND_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(
 /// write task then writes what is already queued and shuts the socket, at
 /// which point both halves of the split stream are gone and the fd is
 /// closed. It cannot outlive that by more than the queue depth times
-/// [`CLIENT_SEND_TIMEOUT`], because every write it makes carries that
+/// `CLIENT_SEND_TIMEOUT`, because every write it makes carries that
 /// deadline — which is the whole reason the deadline sits on the write.
 ///
 /// Draining rather than aborting is what C does, though C gets it for
@@ -171,7 +171,7 @@ pub struct ClientHandle {
 
 impl ClientHandle {
     /// Queue one frame for this client. `false` ⟹ the write task is gone
-    /// (socket dead, or a write missed [`CLIENT_SEND_TIMEOUT`]) and the
+    /// (socket dead, or a write missed `CLIENT_SEND_TIMEOUT`) and the
     /// supervisor should drop the client — C's `_status = -1` out of
     /// `writeToFd`.
     pub async fn send(&self, frame: OutboundFrame) -> bool {

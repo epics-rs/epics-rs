@@ -30,7 +30,7 @@
 //! * `sCalcout` — `no_elements = STRING_SIZE`, a constant, with no
 //!   `get_array_info` to disagree with it.
 
-use epics_base_rs::server::record::Record;
+use epics_base_rs::server::record::{FieldDeclaration, Record};
 use epics_base_rs::server::records::acalcout::AcalcoutRecord;
 use epics_base_rs::server::records::asub_record::ASubRecord;
 use epics_base_rs::server::records::compress::CompressRecord;

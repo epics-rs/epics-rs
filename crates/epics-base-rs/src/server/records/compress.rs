@@ -688,13 +688,6 @@ impl Record for CompressRecord {
         Ok(ProcessOutcome::complete())
     }
 
-    /// C `cvt_dbaddr` (compressRecord.c:399) pins the channel at `NSAM`, the
-    /// allocated buffer, while `get_array_info` (:428) reports the live `NUSE`
-    /// that [`Self::linearise_val`] serves. `ca_element_count` is the former.
-    fn field_native_count(&self, field: &str) -> Option<u32> {
-        (field == "VAL").then(|| self.nsam.max(0) as u32)
-    }
-
     // CompressRecord missing egu/hopr/lopr/prec struct fields entirely;
     // DBR_GR display limits zeroed for compress PVs (compressRecord.c:478-479,455).
     fn get_field(&self, name: &str) -> Option<EpicsValue> {

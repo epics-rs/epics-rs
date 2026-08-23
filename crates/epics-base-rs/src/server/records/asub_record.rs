@@ -681,26 +681,6 @@ impl Record for ASubRecord {
         })
     }
 
-    /// C `cvt_dbaddr` (aSubRecord.c:485-486, :493-494) pins an input channel's
-    /// `no_elements` at `NOx` and an output channel's at `NOVx` — the DECLARED
-    /// capacity — while `get_array_info` (:515, :519) reports the live
-    /// `NEx`/`NEVx`. `dbChannelElements`, and so `ca_element_count`, is the
-    /// fixed `no_elements`.
-    ///
-    /// Without this the announced count was the current value's length, which
-    /// both understates the channel (`caget -# 10 X.VALA` refused where C
-    /// serves it) and CHANGES over the channel's lifetime — NOVA before the
-    /// first process, NEVA after — which the CA create-channel contract does
-    /// not permit.
-    fn field_native_count(&self, field: &str) -> Option<u32> {
-        let (prefix, idx) = parse_channel(field)?;
-        match prefix {
-            "" => Some(self.noa[idx].max(0) as u32),
-            "VAL" => Some(self.nova[idx].max(0) as u32),
-            _ => None,
-        }
-    }
-
     fn field_metadata_override(&self, field: &str) -> Option<FieldMetadataOverride> {
         // C `aSubRecord.c::get_precision` reports `prec->prec` as VAL's display
         // precision. (The per-channel value fields use their link's precision

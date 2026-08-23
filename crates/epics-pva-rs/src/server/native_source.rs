@@ -19,7 +19,7 @@ use crate::server_native::source::{MonitorStream, UpstreamMonitor};
 use epics_base_rs::server::database::filters::{
     ChannelName, FilterChain, parse_channel_name, try_parse_filter_chain,
 };
-use epics_base_rs::server::database::{PvDatabase, PvEntry, parse_pv_name};
+use epics_base_rs::server::database::{PvDatabase, PvEntry};
 use epics_base_rs::server::recgbl::{alarm_condition_string, alarm_status};
 use epics_base_rs::server::snapshot::Snapshot;
 use epics_base_rs::types::{EpicsValue, WallTime};

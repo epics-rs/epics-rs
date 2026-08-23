@@ -1720,7 +1720,7 @@ impl PvDatabase {
         record: Box<dyn Record>,
         load: RecordLoad,
     ) -> CaResult<()> {
-        let _gate = self.lock_registration("add_loaded_record");
+        let gate = self.lock_registration("add_loaded_record");
         self.check_name_free(name)?;
         let mut instance = RecordInstance::new_boxed(name.to_string(), record);
         // Hand the record a cycle-free handle to its own database so it can
@@ -1819,6 +1819,17 @@ impl PvDatabase {
                 .insert(ScanKey::new(phas, record_type, seq, name));
         }
 
+        // Registration is complete and the name is published, so the gate has
+        // nothing left to serialize. It is released HERE, before the tail
+        // below, and that is load-bearing rather than tidy:
+        // `recGblInitSimm` can swap SCAN, and a scan change is applied by
+        // `update_scan_index`, which takes this same `registration_mutex`
+        // itself as the single owner of a scan-index transition. Holding it
+        // across the call is a self-deadlock on a non-reentrant mutex — the
+        // record only has to carry a constant SIML and a periodic SCAN to
+        // reach it.
+        drop(gate);
+
         // The rest of C's `init_record` pass 1, which needs the record
         // REGISTERED and so cannot run with `run_init_passes` above:
         // `recGblInitSimm` plus its `recGblInitConstantLink(&siol, …, &sval)`
@@ -1827,7 +1838,9 @@ impl PvDatabase {
         // (`iocInit.c:562-586`), which visits every record in the database
         // whatever created it; here they sat on the loader callers instead, so
         // an inline or `dbCreateRecord` record got neither. Both are no-ops for
-        // a record type that declares no SIMM / no SDEL.
+        // a record type that declares no SIMM / no SDEL. Running them outside
+        // the gate is also what C does: `iterateRecords` is a separate pass
+        // over an already-built database, holding no registration lock.
         self.rec_gbl_init_simm(&rec_arc);
         self.arm_watchdog(name);
         Ok(())

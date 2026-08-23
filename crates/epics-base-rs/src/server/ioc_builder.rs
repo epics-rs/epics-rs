@@ -371,7 +371,7 @@ impl IocBuilder {
                         }
                     }
                     // Unconditional, as in `IocApp` — see the invariant on
-                    // `field_io::SnamPut`.
+                    // `field_io::snam_special_after_put`.
                     if let Some(EpicsValue::String(snam)) = instance.record.get_field("SNAM") {
                         instance.subroutine = self
                             .subroutine_registry

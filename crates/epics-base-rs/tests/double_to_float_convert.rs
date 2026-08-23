@@ -25,7 +25,7 @@ use std::time::SystemTime;
 
 use epics_base_rs::server::record::Record;
 use epics_base_rs::server::records::swait::SwaitRecord;
-use epics_base_rs::server::snapshot::{DisplayInfo, Snapshot};
+use epics_base_rs::server::snapshot::{DisplayInfo, PropertySupport, Snapshot};
 use epics_base_rs::types::c_cast::f64_to_f32;
 use epics_base_rs::types::{DbFieldType, EpicsValue, encode_dbr};
 
@@ -135,6 +135,12 @@ fn gr_float_limits_clamp_on_the_wire() {
         lower_alarm_limit: -1e-300,
         ..Default::default()
     });
+    // The encoder reads the rset-slot MASK, not `display.is_some()`: a
+    // `DisplayInfo` is minted for every snapshot to carry the DESC leaf, so
+    // its `Option` says nothing about which `get_*` slots the record type
+    // has. `ao` is the `NUMERIC` shape, which is what makes this a
+    // `DRVH=1e300` reply rather than a memset zero.
+    snap.properties = PropertySupport::NUMERIC.narrowed_to_field(snap.value.db_field_type(), false);
     let data = encode_dbr(DBR_GR_FLOAT, &snap).unwrap();
     let word = |i: usize| f32::from_be_bytes(data[i..i + 4].try_into().unwrap());
     assert_eq!(word(16), f32::MAX, "upper_disp_limit");

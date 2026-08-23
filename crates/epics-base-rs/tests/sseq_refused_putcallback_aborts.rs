@@ -130,7 +130,7 @@ async fn three_step_sseq(db: &PvDatabase, prefix: &str, admission: PutAdmission)
 #[epics_macros_rs::epics_test]
 async fn a_refused_put_callback_aborts_the_whole_sequence() {
     let db = PvDatabase::new();
-    three_step_sseq(&db, "SS_REF", PutAdmission::Disconnected).await;
+    three_step_sseq(&db, "SS_REF", PutAdmission::Refused).await;
 
     let mut abort_rx = db
         .get_record("SS_REF")

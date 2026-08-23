@@ -2630,7 +2630,13 @@ impl AsynRecord {
         // rather than re-entered here. It lands as soon as this put returns —
         // C's `dbScanLock` is recursive, this one is not.
         let passive = EpicsValue::Enum(ScanType::Passive.to_u16());
-        tokio::spawn(async move {
+        // Background executor, not the ambient one: `special()` is a
+        // record-support callback and the framework reaches it from threads
+        // that have no tokio runtime — a blocking CA/PVA connection thread
+        // through `block_on_sync` → `park_on`, or the callback pool a record
+        // tail was deferred to. The database put awaited below needs no
+        // reactor.
+        epics_libcom_rs::runtime::task::spawn_background(async move {
             let _ = db.put_pv(&format!("{name}.SCAN"), passive).await;
         });
     }
@@ -3335,7 +3341,13 @@ impl AsynRecord {
 
         let cancel_task = cancel.clone();
         let slot_task = slot.clone();
-        tokio::spawn(async move {
+        // Background executor, not the ambient one: `process_cycle` is reached
+        // from every thread that can process a record, including ones with no
+        // tokio runtime. `run_io_plan` is safe there — its only timer,
+        // `PortHandle::await_reply`'s queue-wait deadline, already gates itself
+        // on `Handle::try_current()` and falls back to the actor's dequeue
+        // re-check, which is what C does for a blocked caller anyway.
+        epics_libcom_rs::runtime::task::spawn_background(async move {
             let outcome = run_io_plan(handle, plan, cancel_task).await;
             *slot_task.lock().unwrap() = Some(outcome);
             // Mint a fresh re-entry token (superseding any older one) wired

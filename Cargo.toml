@@ -24,6 +24,9 @@ default-members = [
     # table — a gate you have to remember to invoke is not a gate.
     "tools/dbd-codegen",
     "tools/env-codegen",
+    # Same reason: the record-processing runtime-seam census's own boundary
+    # tests. The per-crate halves ride their crates; these prove the slicer.
+    "tools/record-seam-gate",
 ]
 resolver = "3"
 

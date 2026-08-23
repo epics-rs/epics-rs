@@ -256,6 +256,15 @@ impl ThrottleRecord {
     /// {Local, Constant} (the `EXT_NC` skip is in `special`). Not
     /// generation-gated: a rare double-SYNC resolves last-scheduled-wins,
     /// benign because VAL is latest-value anyway.
+    ///
+    /// Deferred on the process-global background executor, not the ambient
+    /// one: both entries are record-support callbacks (`special` for the SYNC
+    /// put, `set_out_link_write_status` for the deferred completion), and the
+    /// framework drives those from threads with no tokio runtime — a blocking
+    /// CA/PVA connection thread through `block_on_sync` → `park_on`, or the
+    /// callback pool a record tail was deferred to. Nothing awaited below
+    /// needs a reactor: the SINP read is a database call and `post_fields` is
+    /// synchronous.
     fn spawn_value_sync(&self) {
         let Some((name, handle)) = &self.async_ctx else {
             return;
@@ -264,8 +273,8 @@ impl ThrottleRecord {
         let handle = handle.clone();
         let sinp = self.sinp.clone();
         let siv = self.siv;
-        tokio::spawn(async move {
-            tokio::task::yield_now().await;
+        epics_base_rs::runtime::task::spawn_background(async move {
+            epics_base_rs::runtime::task::yield_now().await;
             let mut fields: Vec<(String, EpicsValue)> = Vec::with_capacity(3);
             if siv == LINK_CON {
                 // C `valueSync`: a CONSTANT SINP is never read → STS=Error.

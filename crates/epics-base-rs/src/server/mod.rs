@@ -46,6 +46,12 @@ mod deferred_tail_owner_tests {
     //! background executor that awaits `runtime::task::sleep` has moved the
     //! panic rather than removed it: the hosted `sleep` is `tokio::time`, which
     //! needs the same runtime the tail no longer has.
+    //!
+    //! The rule itself lives in `record-seam-gate`, not here: `include_str!`
+    //! may not escape a published crate's package directory, so a census
+    //! written inline stops at the crate boundary — and the defect crossed it,
+    //! into `std-rs` and `asyn-rs`. This module now supplies only the list
+    //! below, which is the part that is genuinely this crate's.
 
     /// Every production source file that defers a record tail. Two files in
     /// `server/` are deliberately absent, each for a reason the reader should
@@ -76,65 +82,8 @@ mod deferred_tail_owner_tests {
         ("pv.rs", include_str!("pv.rs")),
     ];
 
-    /// The file with its `#[cfg(test)]` modules removed — every column-0
-    /// `#[cfg(test)]` through the next column-0 `}`. Test code may name the
-    /// ambient seam freely; it runs under `#[tokio::test]`.
-    fn production_scope(src: &str) -> String {
-        let mut out = String::with_capacity(src.len());
-        let mut in_test = false;
-        for line in src.lines() {
-            if !in_test && line.starts_with("#[cfg(test)]") {
-                in_test = true;
-                continue;
-            }
-            if in_test {
-                if line.starts_with('}') {
-                    in_test = false;
-                }
-                continue;
-            }
-            out.push_str(line);
-            out.push('\n');
-        }
-        out
-    }
-
-    /// Count occurrences that are a real call, not a doc mention: the seam is
-    /// always named by its full path at a call site.
-    fn count(hay: &str, needle: &str) -> usize {
-        hay.match_indices(needle).count()
-    }
-
     #[test]
     fn a_deferred_record_tail_never_uses_the_ambient_seam() {
-        for (name, src) in SOURCES {
-            let prod = production_scope(src);
-
-            // Fail closed: if the slicer ever eats the whole file, the counts
-            // below are trivially zero and this census proves nothing.
-            assert!(
-                prod.contains("crate::runtime::task::"),
-                "{name}: production scope lost the runtime seam entirely — \
-                 the `#[cfg(test)]` slicer is wrong, not the source"
-            );
-
-            for banned in [
-                concat!("crate::runtime::task::", "spawn("),
-                concat!("crate::runtime::task::", "spawn_blocking("),
-                concat!("crate::runtime::task::", "sleep("),
-                concat!("crate::runtime::task::", "interval("),
-                concat!("tokio", "::spawn("),
-            ] {
-                assert_eq!(
-                    count(&prod, banned),
-                    0,
-                    "{name}: `{banned}` in production scope. A deferred record \
-                     tail must use the `_background` counterpart — it runs on a \
-                     thread that has no runtime. If this site is genuinely a \
-                     caller's own await rather than a spawned tail, move it out \
-                     of this list with the reason."
-                );
-            }
-        }
+        record_seam_gate::assert_no_ambient_seam(SOURCES);
     }
 }

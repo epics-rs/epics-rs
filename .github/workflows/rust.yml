@@ -40,7 +40,7 @@ jobs:
     # excluded from CI here — not silenced — and still runs locally where the
     # tree exists.
     - name: Run tests (nextest)
-      run: cargo nextest run --workspace --exclude epics-oracle-rs
+      run: cargo nextest run --profile ci --workspace --exclude epics-oracle-rs
     - name: Run doctests
       run: cargo test --doc --workspace
     # A crate whose IOC binding sits behind a non-default `ioc` feature has
@@ -62,7 +62,7 @@ jobs:
           | sort -u \
           | while read -r pkg feat; do
               echo "::group::$pkg --features $feat"
-              cargo nextest run -p "$pkg" --features "$feat" --no-tests=pass
+              cargo nextest run --profile ci -p "$pkg" --features "$feat" --no-tests=pass
               echo "::endgroup::"
             done
 
@@ -96,13 +96,13 @@ jobs:
       with:
         key: rtems-exec-model
     - name: epics-base-rs (rtems-exec-model)
-      run: cargo nextest run -p epics-base-rs --features rtems-exec-model
+      run: cargo nextest run --profile ci -p epics-base-rs --features rtems-exec-model
     - name: epics-ca-rs (rtems-exec-model)
-      run: cargo nextest run -p epics-ca-rs --features rtems-exec-model
+      run: cargo nextest run --profile ci -p epics-ca-rs --features rtems-exec-model
     - name: epics-pva-rs (rtems-exec-model)
-      run: cargo nextest run -p epics-pva-rs --features rtems-exec-model
+      run: cargo nextest run --profile ci -p epics-pva-rs --features rtems-exec-model
     - name: epics-bridge-rs (rtems-exec-model)
-      run: cargo nextest run -p epics-bridge-rs --features rtems-exec-model
+      run: cargo nextest run --profile ci -p epics-bridge-rs --features rtems-exec-model
     # `./scripts/rtems-check.sh` — the RTEMS *target* gate — runs in its own
     # `rtems-closure` job below, not here: it needs a nightly toolchain
     # (`-Zbuild-std`) while this job runs the pinned stable, and its feature
@@ -203,9 +203,9 @@ jobs:
       with:
         key: linux-rt
     - name: epics-libcom-rs (linux-rt)
-      run: cargo nextest run -p epics-libcom-rs --features linux-rt
+      run: cargo nextest run --profile ci -p epics-libcom-rs --features linux-rt
     - name: epics-base-rs (linux-rt)
-      run: cargo nextest run -p epics-base-rs --features linux-rt
+      run: cargo nextest run --profile ci -p epics-base-rs --features linux-rt
 
   # Commit b7a6b0ab found the no-default-features debt was three masked *build
   # breaks*, not warnings — code that simply does not compile once the default
@@ -280,7 +280,7 @@ jobs:
         iterations=50
         for i in $(seq 1 "$iterations"); do
           echo "::group::iteration $i/$iterations"
-          if ! cargo nextest run -p epics-pva-rs --features rtems-exec-model \
+          if ! cargo nextest run --profile ci -p epics-pva-rs --features rtems-exec-model \
                --lib --retries 0 \
                -E 'test(/^client_native::operation::tests::/)'; then
             echo "::endgroup::"

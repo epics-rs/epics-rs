@@ -89,6 +89,15 @@ default-filter = """
 #
 # Keep the two lists in step: an addition to profile.default's list belongs
 # here too, or CI silently runs a suite the default loop does not.
+#
+# INVARIANT: every `cargo nextest run` in `.github/workflows/` passes
+# `--profile ci` (or `--profile interop`, whose filter is an allow-list of
+# interop binaries). None may run on `profile.default` — that is the dev-loop
+# profile, and it deliberately does NOT exclude the reference-tree suites
+# because locally the checkout exists and a silent skip there is the bug this
+# whole arrangement was built to stop. A CI job left on the default profile
+# fails on `reference.rs`'s panic instead, which is how linux-rt and
+# rtems-exec-model were caught.
 [profile.ci]
 fail-fast = false
 retries = 2

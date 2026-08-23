@@ -96,5 +96,10 @@ jobs:
       # ground truth and fails loudly (by design) without the C EPICS tree,
       # which no runner has. Excluded here — not silenced — and still runs
       # locally where the tree exists.
+      # The reference-tree parity suites (reference_trees, dbd_initial_parity,
+      # base_device_parity, stdsupport_device_parity) are excluded the same way
+      # and for the same reason, via profile.ci's default-filter in
+      # .config/nextest.toml — they read epics-base / epics-modules sources
+      # directly and this job provisions neither.
       - name: Test (nextest)
         run: cargo nextest run --workspace --exclude epics-oracle-rs --profile ci

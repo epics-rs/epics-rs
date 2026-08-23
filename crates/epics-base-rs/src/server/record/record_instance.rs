@@ -273,66 +273,77 @@ pub struct DeferredNotifyPut {
     pub completion: crate::runtime::sync::oneshot::Sender<()>,
 }
 
+/// One entry of C `precord->ppnr->restartList` — a whole `processNotify`
+/// waiting for the record, not just a put.
+///
+/// C queues the *request* (`ellSafeAdd(&restartList, &ppn->restartNode)`,
+/// dbNotify.c:217) and `restartCheck` re-enters `processNotifyCommon`, which
+/// dispatches on `ppn->requestType`. A queue that could hold only a
+/// field-and-value put left the other request type — C `processGetRequest`,
+/// the port's [`crate::server::database::PvDatabase::process_record_with_notify`]
+/// — with nowhere to wait, so its entry refused instead of queueing.
+pub enum DeferredNotify {
+    /// C `putProcessRequest` / `putProcessGetRequest`: write the field, then
+    /// process; the callback fires on the replayed cycle.
+    Put(DeferredNotifyPut),
+    /// C `processGetRequest`: process the record, write nothing.
+    Process {
+        /// The client's completion channel, armed on the replayed process.
+        completion: crate::runtime::sync::oneshot::Sender<()>,
+    },
+}
+
 /// The PACT→idle transition, as a value.
 ///
-/// # Invariant
+/// Carries one bit: whether the record owed a restart at the moment the token
+/// was minted. Queued put-notifies live on the record
+/// ([`RecordInstance::notify_restart_list`]) from arrival to replay and are
+/// promoted by one owner, `PvDatabase::apply_pact_exit` — so a release path
+/// that forgets its tail delays a restart, it cannot strand one inside a
+/// dropped value.
 ///
-/// `RecordInstance::deferred_notify_put.is_some()` ⟹ PACT is held. A
-/// put-notify is parked ONLY on the `is_processing()` arm of the put entry
-/// ([`RecordInstance::park_notify_put`]), and PACT can be released ONLY by
-/// [`RecordInstance::leave_pact`], which takes the park with it. So the
-/// deferral cannot outlive the PACT window it was parked in — the strand is
-/// unrepresentable rather than guarded against.
+/// The bit is a HINT, not a second home for the queue. It is minted under a
+/// record lock the minting site already holds (every constructor is reached
+/// from `&mut self` or an explicit read), which is what lets
+/// `apply_pact_exit` take NO record lock at all — so it is safe to call from
+/// a `Drop`, where a still-live write guard in the same scope would otherwise
+/// deadlock parking_lot. A stale `true` costs one no-op drain: the drain
+/// re-reads the queue under the write lock via
+/// [`RecordInstance::take_next_notify_restart`] and returns if it is empty.
 ///
-/// The token is `#[must_use]`: a release site cannot silently drop the parked
-/// put. Its single consumer is `PvDatabase::apply_pact_exit`, called from the
-/// released cycle's `recGblFwdLink` tail — C `recGbl.c:295` (`if (pdbc->ppn)
-/// dbNotifyCompletion(pdbc)`), which is where C queues the restart callback
-/// (`dbNotify.c:466-469`, state `notifyRestartInProgress`). Holding the token
-/// to the tail rather than replaying at the `pact = FALSE` store is what keeps
-/// the replay behind the rest of the cycle, exactly as C's queued callback is.
-#[must_use = "a put-notify parked on this record is stranded unless the PactExit \
-              reaches PvDatabase::apply_pact_exit"]
-pub struct PactExit(Option<DeferredNotifyPut>);
-
-impl Drop for PactExit {
-    /// Last-resort canary. Every release site hands its token to
-    /// `PvDatabase::apply_pact_exit`; a token reaching here still holding a
-    /// parked put means a PACT release path was added without a tail. The
-    /// client is not left hanging (dropping `completion` errors its receiver),
-    /// but the put's value IS lost, so say so.
-    fn drop(&mut self) {
-        if self.0.is_some() {
-            tracing::error!(
-                "PactExit dropped with a put-notify still parked: a PACT release \
-                 path is not routed through PvDatabase::apply_pact_exit"
-            );
-        }
-    }
+/// The token is `#[must_use]` because that tail is where the restart happens:
+/// C `recGbl.c:295` (`if (pdbc->ppn) dbNotifyCompletion(pdbc)`) →
+/// `dbNotifyCompletion` → `restartCheck` (`dbNotify.c:149-170`). Holding it to
+/// the tail rather than promoting at the `pact = FALSE` store is what keeps the
+/// replay behind the rest of the cycle, exactly as C's queued callback is.
+#[must_use = "a PACT release must reach PvDatabase::apply_pact_exit, which is \
+              where a queued put-notify is restarted"]
+pub struct PactExit {
+    restart_pending: bool,
 }
 
 impl PactExit {
-    /// The put-notify this release freed, if one was parked.
-    pub(crate) fn into_deferred(mut self) -> Option<DeferredNotifyPut> {
-        self.0.take()
+    /// Mint a token from the record's queue state, read under the caller's
+    /// lock.
+    pub(crate) fn new(restart_pending: bool) -> PactExit {
+        PactExit { restart_pending }
     }
 
     /// Fold two releases of the same cycle into one token.
     ///
     /// A simulated SDLY continuation releases PACT inside `check_simulation_mode`
-    /// and again at the `is_continuation` arm; the second release finds PACT
-    /// already clear and carries nothing, because the first took the park.
-    pub(crate) fn merge(mut self, mut other: PactExit) -> PactExit {
-        debug_assert!(
-            self.0.is_none() || other.0.is_none(),
-            "a parked put-notify can be released only once per cycle"
-        );
-        PactExit(self.0.take().or_else(|| other.0.take()))
+    /// and again at the `is_continuation` arm; one restart check covers both, so
+    /// either half owing a restart makes the folded token owe one.
+    pub(crate) fn merge(self, other: PactExit) -> PactExit {
+        PactExit {
+            restart_pending: self.restart_pending || other.restart_pending,
+        }
     }
 
-    /// A cycle that released no PACT (and therefore freed no put-notify).
-    pub(crate) fn none() -> PactExit {
-        PactExit(None)
+    /// Whether the minting site saw a queued notify. See the type docs: this
+    /// is a hint the drain re-validates, never the queue itself.
+    pub(crate) fn restart_pending(&self) -> bool {
+        self.restart_pending
     }
 }
 
@@ -354,56 +365,39 @@ pub(crate) struct MetadataSnapshot {
     pub enums: Option<EnumInfo>,
 }
 
-/// Returns true if this field is property-class — the C `prop(YES)`
-/// dbd attribute: writing a changed value posts `DBE_PROPERTY` to the
-/// record's subscribers AND invalidates the metadata cache. Field name
-/// is expected uppercase.
+/// Does a write to this field make [`RecordInstance::metadata_cache`] stale?
 ///
-/// **Every field read by `populate_display_info`,
-/// `populate_control_info`, or `populate_enum_info` MUST be in this
-/// set** — otherwise the cache serves stale metadata until some other
-/// tracked field is written. The reverse does not hold: a field may be
-/// property-class without being a cache source (e.g. the motor fields
-/// below feed the live-computed `field_metadata_override`, never the
-/// cache — its invalidation on their write is harmless).
+/// **Cache bookkeeping only** — NOT the `DBE_PROPERTY` gate, which is the
+/// field's own `prop(YES)` declaration ([`RecordInstance::field_posts_property`]).
+/// The two used to be one hand-written list, so every field this port had to
+/// invalidate on became a property event C does not post, and every `prop(YES)`
+/// field nobody had listed posted nothing. They answer different questions and
+/// the sets genuinely differ in both directions: `busy.ZNAM` is a cache source
+/// that C does not mark `prop(YES)` (busy's `.dbd` declares no `prop` at all),
+/// and `histogram.ULIM` is `prop(YES)` yet feeds only the live-computed
+/// `apply_field_metadata_override`.
 ///
-/// Deliberate exception: `DESC` feeds `display.description`
-/// (`populate_display_info`) but stays OUT of this set — C never marks
-/// it prop(YES) (epics-base#785), so a DESC write must not post
-/// DBE_PROPERTY. Its cache invalidation is owned by the DESC arm of
-/// `put_common_field`, the single writer of `common.desc`. The
-/// `Q:form` info tag is now wired (`populate_display_info` ->
-/// `display.form`), but as an immutable load-time info tag — not a
-/// runtime field — it needs no cache invalidation and so is
-/// intentionally absent from this field set.
-fn is_metadata_field(name: &str) -> bool {
+/// The rule: **every field read by `populate_display_info`,
+/// `populate_control_info`, or `populate_enum_info` MUST be in this set** —
+/// otherwise the cache serves stale metadata until some other source field is
+/// written. Field name is expected uppercase.
+///
+/// `DESC` feeds `display.description` but is deliberately absent: its
+/// invalidation is owned by the DESC arm of `put_common_field`, the single
+/// writer of `common.desc`. The `Q:form` info tag (`populate_display_info` ->
+/// `display.form`) is an immutable load-time tag, not a runtime field, so it
+/// needs no invalidation either.
+fn is_metadata_cache_source(name: &str) -> bool {
     matches!(
         name,
-        // Display info (analog + integer + motor) — `prop(YES)` in
-        // ai/ao/longin/longout DBDs.
+        // `populate_display_info` — units/precision/display limits for the
+        // analog, integer, array and motor arms.
         "EGU" | "PREC" | "HOPR" | "LOPR" | "HLM" | "LLM"
-        // Alarm limits (used by both display and the analog_alarm config) —
-        // ai/ao/longin/longout `prop(YES)`.
-        | "HIHI" | "HIGH" | "LOW" | "LOLO"
-        // Alarm severities for the four limit thresholds —
-        // ai/ao/longin/longout `prop(YES)` per upstream DBDs
-        // (`aiRecord.dbd.pod` lines 357-388).
-        | "HHSV" | "HSV" | "LSV" | "LLSV"
-        // Output ctrl limits — ao/longout `prop(YES)`.
+        // `populate_control_info` — the ao/longout/int64out drive limits.
         | "DRVH" | "DRVL"
-        // motor `prop(YES)` (`motorRecord.dbd` 154/161/289/361/368):
-        // VBAS/VMAX bound VELO's range, MRES the RVAL/RRBV raw range,
-        // DHLM/DLLM the DVAL/DRBV range — all served per field by
-        // `Record::field_metadata_override` (C get_graphic_double /
-        // get_control_double). HLM/LLM/EGU/PREC and the alarm limits
-        // are motor `prop(YES)` too, already listed above.
-        | "VBAS" | "VMAX" | "MRES" | "DHLM" | "DLLM"
-        // bi/bo/busy enum strings — `prop(YES)`.
+        // `populate_enum_info` via `Record::enum_state_strings` — bi/bo/busy
+        // two-state names and the sixteen mbbi/mbbo state strings.
         | "ZNAM" | "ONAM"
-        // bi/bo state severities — `biRecord.dbd.pod` / `boRecord.dbd.pod`
-        // `prop(YES)` for ZSV/OSV/COSV (zero / one / change-of-state).
-        | "ZSV" | "OSV" | "COSV"
-        // mbbi/mbbo state strings (16 levels) — `prop(YES)`.
         | "ZRST" | "ONST" | "TWST" | "THST" | "FRST" | "FVST" | "SXST" | "SVST"
         | "EIST" | "NIST" | "TEST" | "ELST" | "TVST" | "TTST" | "FTST" | "FFST"
     )
@@ -642,9 +636,10 @@ pub struct RecordInstance {
     ///
     /// PRIVATE by construction: entered through [`RecordInstance::enter_pact`]
     /// and released ONLY through [`RecordInstance::leave_pact`], which hands
-    /// back the [`PactExit`] carrying any put-notify parked on this PACT window.
-    /// A `pact.store(false)` open-coded at a release site is what stranded the
-    /// deferral on the ODLY/SDLY paths; it is no longer expressible.
+    /// back the [`PactExit`] that routes the release to the cycle tail where
+    /// queued put-notifies are restarted. A `pact.store(false)` open-coded at
+    /// a release site is what skipped that tail on the ODLY/SDLY paths; it is
+    /// no longer expressible.
     pact: AtomicBool,
     // Put-notify wait-set this record currently belongs to (C
     // `precord->ppn`). Set when the record joins an active put-notify
@@ -652,19 +647,23 @@ pub struct RecordInstance {
     // taken + `leave`d when the record's processing completes. `None`
     // outside any put-notify. See [`NotifyWaitSet`].
     pub notify: Option<Arc<NotifyWaitSet>>,
-    /// A put-notify that arrived while this record was PACT, deferred WHOLE —
-    /// C `processNotifyCommon` (dbNotify.c:225-231) tests `precord->pact`
-    /// ABOVE `putCallback`, so a `dbPutNotify` onto a busy record writes
-    /// nothing: no value, no RPRO. The record is parked on the notify's wait
-    /// list and the entire put — value, process, callback — is restarted once
-    /// the async cycle completes. See [`DeferredNotifyPut`] and
-    /// `PvDatabase::restart_deferred_notify_put`, the single owner that applies
-    /// it. `None` outside that window.
+    /// C `precord->ppnr->restartList` — put-notifies waiting to take this
+    /// record, oldest first.
     ///
-    /// PRIVATE, and paired with [`Self::pact`] by the [`PactExit`] invariant:
-    /// parked only by [`Self::park_notify_put`] (reachable only from the
-    /// PACT arm of the put entry), taken only by [`Self::leave_pact`].
-    deferred_notify_put: Option<DeferredNotifyPut>,
+    /// `processNotifyCommon` (dbNotify.c:213-219, 225-231) tests both
+    /// "another processNotify owns the record" and `precord->pact` ABOVE
+    /// `putCallback`, so a `dbPutNotify` onto a busy record writes nothing:
+    /// no value, no RPRO. The whole put — value, process, callback — is
+    /// deferred and restarted later. C queues them with `ellSafeAdd` and
+    /// promotes one per completion (`restartCheck`, dbNotify.c:149-170); this
+    /// is that list, and modelling it as a list rather than one slot is what
+    /// stops the second concurrent `caput -c` being refused with an
+    /// `ECA_PUTCBINPROG` C never sends.
+    ///
+    /// PRIVATE. Appended only by [`Self::queue_notify_put`], drained only by
+    /// [`Self::take_next_notify_restart`], which pops only onto a record no
+    /// put-notify owns.
+    notify_restart_list: std::collections::VecDeque<DeferredNotify>,
     /// The value of each subscribed field as ALREADY PUBLISHED to that
     /// field's `DBE_VALUE`/`DBE_LOG` subscribers. The generic
     /// change-detection loop in every snapshot builder posts a field only
@@ -766,8 +765,8 @@ pub struct RecordInstance {
     /// # Cache invariant (CONTRACT)
     ///
     /// The cache is **only correct under the following contract**: every
-    /// code path that mutates a metadata-class field (the set defined in
-    /// the file-private `is_metadata_field` predicate) MUST call
+    /// code path that mutates a cache-source field (the set defined in
+    /// the file-private [`is_metadata_cache_source`] predicate) MUST call
     /// [`RecordInstance::notify_field_written`] (or
     /// [`RecordInstance::invalidate_metadata_cache`] directly) afterward.
     ///
@@ -777,26 +776,27 @@ pub struct RecordInstance {
     /// - calls `instance.record.put_field(...)` directly, OR
     /// - mutates record fields from inside `Record::process()`,
     ///   `Record::on_put`, or `Record::special` and that mutation could
-    ///   touch a metadata-class field, OR
+    ///   touch a cache-source field, OR
     /// - lets a `Box<dyn Record>` implementation expose its own
-    ///   mutation methods that change metadata fields,
+    ///   mutation methods that change cache-source fields,
     ///
     /// then call `instance.notify_field_written(field_name)` to keep the
     /// cache consistent. Forgetting will produce a stale snapshot —
     /// monitors will continue to see the old EGU/PREC/limits until the
-    /// next legitimate metadata-field write triggers invalidation.
+    /// next legitimate cache-source write triggers invalidation.
     ///
     /// # Symmetric note for `populate_*` extensions
     ///
     /// If a future change adds a new field to `populate_display_info`,
     /// `populate_control_info`, or `populate_enum_info`, the new source
-    /// field name MUST also be added to `is_metadata_field` so writes
-    /// to it invalidate the cache — unless, like DESC
-    /// (`display.description`), the field must not post DBE_PROPERTY;
-    /// then its write owner invalidates directly (see the DESC arm of
-    /// `put_common_field`). (The `Q:form` -> `display.form` mapping is
-    /// exempt: it reads an immutable load-time info tag, not a runtime
-    /// field.)
+    /// field name MUST also be added to [`is_metadata_cache_source`] so
+    /// writes to it invalidate the cache — unless, like DESC
+    /// (`display.description`), its write owner invalidates directly (see
+    /// the DESC arm of `put_common_field`). This set says nothing about
+    /// `DBE_PROPERTY`, which the field's own `prop(YES)` declaration
+    /// decides ([`RecordInstance::field_posts_property`]). (The `Q:form`
+    /// -> `display.form` mapping is exempt: it reads an immutable
+    /// load-time info tag, not a runtime field.)
     pub(crate) metadata_cache: StdMutex<Option<MetadataSnapshot>>,
 }
 
@@ -1038,7 +1038,7 @@ impl RecordInstance {
             subroutine: None,
             pact: AtomicBool::new(false),
             notify: None,
-            deferred_notify_put: None,
+            notify_restart_list: std::collections::VecDeque::new(),
             last_posted: HashMap::new(),
             declared_overrides: HashMap::new(),
             array_hash_changed: false,
@@ -1087,14 +1087,12 @@ impl RecordInstance {
     pub(crate) fn run_init_passes(&mut self, name: &str) {
         // C's `precord->pact = FALSE` — a record cannot be mid-process at init,
         // so this release provably frees nothing: no client put has run, so the
-        // `PactExit` invariant (`deferred_notify_put.is_some()` ⟹ PACT) makes a
-        // parked put-notify here unreachable.
-        let deferred = self.leave_pact().into_deferred();
+        // restart list is empty.
         debug_assert!(
-            deferred.is_none(),
-            "a record cannot hold a parked put-notify at init"
+            self.notify_restart_list.is_empty(),
+            "a record cannot hold a queued put-notify at init"
         );
-        drop(deferred);
+        let _ = self.leave_pact();
         if self.common.udf != 0
             && self.common.stat == crate::server::recgbl::alarm_status::UDF_ALARM
         {
@@ -1226,38 +1224,64 @@ impl RecordInstance {
         }
     }
 
-    /// Hook called by the database after a field is written. If the
-    /// field is in the metadata-class set, the cache is invalidated so
-    /// the next snapshot picks up the new value.
+    /// **The** `DBE_PROPERTY` gate: C `dbAccess.c:1330`
+    /// `paddr->pfldDes->prop`, read from the field's own declaration.
+    ///
+    /// C never consults a list of field names — it asks the `.dbd`, per record
+    /// type, which is why `histogram.ULIM` is a property and `bi.ZSV` (declared
+    /// `pp(TRUE)`, no `prop`) is not, and why `bi.ZNAM` is one while
+    /// `busy.ZNAM` is not. Asking [`Self::field_desc`] gives the port the same
+    /// per-type answer from the same generated `.dbd` tables.
+    ///
+    /// A field with no declaration at all — a virtual field (`RTYP`, `TIME`) —
+    /// has no `dbFldDes` in C either, so it is not property-class.
+    pub(crate) fn field_posts_property(&self, field: &str) -> bool {
+        self.field_desc(field).is_some_and(|d| d.prop)
+    }
+
+    /// Hook called by the database after a field is written. If the field is a
+    /// metadata-cache source, the cache is invalidated so the next snapshot
+    /// picks up the new value. Posts nothing — a caller that also owes the
+    /// `DBE_PROPERTY` event uses [`Self::notify_field_written_if_changed`].
     ///
     /// Field name is automatically uppercased.
     pub fn notify_field_written(&self, field: &str) {
         let upper = field.to_ascii_uppercase();
-        if is_metadata_field(&upper) {
+        if is_metadata_cache_source(&upper) {
             self.invalidate_metadata_cache();
         }
     }
 
-    /// Like [`Self::notify_field_written`] but skips the invalidation when
-    /// the put did not actually change the field's value. Mirrors
-    /// epics-base `faac1df1` — `DBE_PROPERTY` events fire only on
-    /// real changes, not on idempotent writes (the C path compares
-    /// `paddr->pfield` against the converted payload before setting
-    /// the `propertyUpdate` flag).
+    /// Like [`Self::notify_field_written`], plus the `DBE_PROPERTY` post C
+    /// makes from `dbPut` — and both are skipped when the put did not actually
+    /// change the field's value. Mirrors epics-base `faac1df1`: property events
+    /// fire only on real changes, not on idempotent writes (the C path compares
+    /// `paddr->pfield` against the converted payload before setting the
+    /// `propertyUpdate` flag).
     ///
-    /// `prev` is the value captured BEFORE the put. Callers that
-    /// don't need the change-detection (e.g. internal writers that
-    /// know the field is non-metadata) can keep using
-    /// [`Self::notify_field_written`].
-    // must post EventMask::PROPERTY to all field subscribers when metadata changes
+    /// The two effects have independent gates. Invalidation follows
+    /// [`is_metadata_cache_source`] (what this port's cache reads); the post
+    /// follows [`Self::field_posts_property`] (what the `.dbd` declares). A
+    /// field can be either without being both.
+    ///
+    /// `prev` is the value captured BEFORE the put. Callers that don't need the
+    /// change-detection (e.g. internal writers that know the field is neither)
+    /// can keep using [`Self::notify_field_written`].
     pub fn notify_field_written_if_changed(&mut self, field: &str, prev: Option<&EpicsValue>) {
         let upper = field.to_ascii_uppercase();
-        if !is_metadata_field(&upper) {
+        let cache_source = is_metadata_cache_source(&upper);
+        let posts_property = self.field_posts_property(&upper);
+        if !cache_source && !posts_property {
             return;
         }
         let now = self.record.get_field(&upper);
-        if prev != now.as_ref() {
+        if prev == now.as_ref() {
+            return;
+        }
+        if cache_source {
             self.invalidate_metadata_cache();
+        }
+        if posts_property {
             // mirror C dbAccess.c:1396-1397 db_post_events(precord, NULL, DBE_PROPERTY).
             // Collect keys first to avoid a re-entrant immutable borrow on subscribers.
             let fields: Vec<String> = self.subscribers.keys().cloned().collect();
@@ -1360,43 +1384,154 @@ impl RecordInstance {
 
     /// C `prec->pact = FALSE` — the ONLY release of PACT.
     ///
-    /// Every PACT→idle transition takes the put-notify parked on that window
-    /// with it (C `dbNotifyCompletion`, reached from `recGblFwdLink` on every
-    /// path that ends a cycle). The returned [`PactExit`] is `#[must_use]`, so
-    /// a release site cannot strand the deferral the way the open-coded
-    /// `processing.store(false)` at the ODLY continuation and the three SIM/SDLY
-    /// releases did.
+    /// The returned [`PactExit`] is `#[must_use]`, so a release site cannot skip
+    /// the cycle tail where a queued put-notify is restarted — the omission the
+    /// open-coded `processing.store(false)` at the ODLY continuation and the
+    /// three SIM/SDLY releases made.
     pub fn leave_pact(&mut self) -> PactExit {
         self.pact.store(false, std::sync::atomic::Ordering::Release);
-        PactExit(self.deferred_notify_put.take())
+        PactExit::new(self.notify_restart_pending())
     }
 
-    /// True when a put-notify already owns this record — an in-flight wait-set
-    /// (C `precord->ppn`) or a park from a previous PACT arm. C
-    /// `processNotifyCommon` (dbNotify.c:213-217) queues a second notify on the
-    /// record's restart list; the port refuses it (`S_db_Blocked` /
-    /// `ECA_PUTCBINPROG`) — see [`Self::park_notify_put`].
-    pub fn put_notify_busy(&self) -> bool {
-        self.notify.is_some() || self.deferred_notify_put.is_some()
-    }
-
-    /// Park a put-notify that landed on a PACT record (C `processNotifyCommon`,
-    /// dbNotify.c:225-231). `Err(put)` hands the put back when another
-    /// put-notify already owns the record.
+    /// The cycle-tail token for a record this cycle did NOT release PACT on.
     ///
-    /// The [`PactExit`] invariant — `deferred_notify_put.is_some()` ⟹ PACT —
-    /// is established here: this is the only park, and it is only reachable
-    /// from the caller's `is_processing()` arm.
-    pub fn park_notify_put(&mut self, put: DeferredNotifyPut) -> Result<(), DeferredNotifyPut> {
+    /// Still consults the queue: a notify parked behind an in-flight wait-set
+    /// on an idle record is freed by the wait-set completion, and the tail is
+    /// what promotes it.
+    pub fn pact_exit_without_release(&self) -> PactExit {
+        PactExit::new(self.notify_restart_pending())
+    }
+
+    /// C `processNotifyCommon`'s two defer tests (dbNotify.c:213, 225), as one
+    /// question: may a NEWLY ARRIVING put-notify take this record now?
+    ///
+    /// `true` for an in-flight wait-set (`precord->ppn`), for PACT, and for a
+    /// non-empty restart list — the last so a notify arriving in the window
+    /// between a completion and the restart check cannot jump the queue.
+    ///
+    /// A RESTARTED put is not asked this: it is already the record's owner (C
+    /// `precord->ppn == ppn`, state `notifyRestartCallbackRequested`, which
+    /// dbNotify.c:213 exempts by name) and only PACT can stop it — see
+    /// [`Self::requeue_notify_put`].
+    pub fn notify_put_is_owned(&self) -> bool {
+        self.notify.is_some() || self.is_processing() || !self.notify_restart_list.is_empty()
+    }
+
+    /// C `processNotifyCommon`'s FIRST defer test alone (dbNotify.c:213):
+    /// another `processNotify` owns this record, or one is already queued
+    /// behind it. [`Self::notify_put_is_owned`] folds in the PACT arm
+    /// (`:225`) as well.
+    ///
+    /// A DBF link-field put waits on ownership but NOT on PACT. A bare `sub`
+    /// with an empty `SNAM` parks PACT=TRUE forever (subRecord.c:119-122), so
+    /// a link put that waited on the PACT arm there would never be written and
+    /// `caput <sub>.INPA 0` would read back empty. Ownership carries no such
+    /// trap: the restart check drains the queue at every cycle end.
+    pub fn notify_put_has_owner(&self) -> bool {
+        self.notify.is_some() || !self.notify_restart_list.is_empty()
+    }
+
+    /// C `ellSafeAdd(&precord->ppnr->restartList, &ppn->restartNode)` — the
+    /// arriving put-notify joins the back of the queue, unwritten.
+    ///
+    /// Infallible: C has no "refuse" arm here, and a refusal loses the client's
+    /// write. Call only under [`Self::notify_put_is_owned`].
+    /// Take this record's put-notify slot, or queue behind whoever holds it.
+    ///
+    /// C `processNotifyCommon` (dbNotify.c:211-231) has exactly two outcomes
+    /// and no third: the record is free and the notify takes it, or it is
+    /// owned and the notify joins `precord->ppnr->restartList`. There is no
+    /// refusal arm — `ECA_PUTCBINPROG` has one sender in all of base, the
+    /// 60-second put-callback timeout in `rsrv/camessage.c:1745`.
+    ///
+    /// `None` means queued, and the caller MUST NOT process: the replay
+    /// drives the record and fires the callback, so processing here would
+    /// run the cycle twice for one client request.
+    ///
+    /// Ownership alone decides — NOT [`Self::notify_put_has_owner`]. A
+    /// non-empty restart list stops a *fresh* arrival at the entry gate, but a
+    /// replay reaching here has already been popped off that list and must
+    /// take the slot with its successors still queued behind it, exactly as
+    /// C `restartCheck` (dbNotify.c:158-168) assigns `precord->ppn = pfirst`
+    /// while leaving the rest of `restartList` in place.
+    pub fn install_or_queue_notify(
+        &mut self,
+        completion: crate::runtime::sync::oneshot::Sender<()>,
+    ) -> Option<Arc<NotifyWaitSet>> {
+        if self.notify.is_some() {
+            self.queue_notify_put(DeferredNotify::Process { completion });
+            return None;
+        }
+        let notify = NotifyWaitSet::new(completion);
+        self.notify = Some(notify.clone());
+        Some(notify)
+    }
+
+    /// C `dbNotifyAdd` (dbNotify.c:477-501): a link target joins the wait-set
+    /// of the put-notify driving the chain, so the initiator's completion
+    /// waits for this record's cycle too.
+    ///
+    /// The second and last writer of [`Self::notify`]; the first is
+    /// [`Self::install_or_queue_notify`]. Both live here so the slot has no
+    /// assignment site outside this module — an open-coded one elsewhere is
+    /// how a wait-set came to be installed without the record's write gate.
+    ///
+    /// A record already carrying a wait-set keeps it (C's `if (!pto->ppn …)`
+    /// at `:492`), so this never displaces a live one, and the `enter` is
+    /// paired with the `leave` the target's own cycle tail performs.
+    pub fn join_put_notify(&mut self, src: Option<&Arc<NotifyWaitSet>>) {
+        if self.notify.is_some() {
+            return;
+        }
+        if let Some(ws) = src {
+            self.notify = Some(ws.clone());
+            ws.enter();
+        }
+    }
+
+    pub fn queue_notify_put(&mut self, put: DeferredNotify) {
+        debug_assert!(
+            self.notify_put_is_owned(),
+            "a put-notify is queued only when the record is owned; otherwise it \
+             takes the record directly"
+        );
+        self.notify_restart_list.push_back(put);
+    }
+
+    /// C `processNotifyCommon`'s `precord->pact` arm reached by a RESTARTED
+    /// notify (dbNotify.c:225-231): it stays `precord->ppn` and waits for the
+    /// next completion, so it does NOT fall in behind puts that arrived after
+    /// it. Back to the head.
+    ///
+    /// The only way a promotion can find the record busy is a scan that took
+    /// PACT between the pop and the replay; the record's advisory write gate,
+    /// held across both, keeps every other put out of that window.
+    pub(crate) fn requeue_notify_put(&mut self, put: DeferredNotify) {
         debug_assert!(
             self.is_processing(),
-            "a put-notify may be parked only on a PACT record"
+            "a promoted put-notify returns to the head only because the record \
+             went PACT under it"
         );
-        if self.put_notify_busy() {
-            return Err(put);
+        self.notify_restart_list.push_front(put);
+    }
+
+    /// C `restartCheck` (dbNotify.c:149-170) — promote the queue head once the
+    /// record is free, or leave it queued for the next completion.
+    ///
+    /// **The only drain.** The freedom test lives here rather than at the call
+    /// site, so promoting onto a record that is still PACT or still carries a
+    /// wait-set is not expressible.
+    pub(crate) fn take_next_notify_restart(&mut self) -> Option<DeferredNotify> {
+        if self.notify.is_some() || self.is_processing() {
+            return None;
         }
-        self.deferred_notify_put = Some(put);
-        Ok(())
+        self.notify_restart_list.pop_front()
+    }
+
+    /// Does this record owe anyone a restart? The cheap read that keeps the
+    /// per-cycle restart check off the spawn path when nothing is queued.
+    pub(crate) fn notify_restart_pending(&self) -> bool {
+        !self.notify_restart_list.is_empty()
     }
 
     /// Unified field resolution: record fields → common fields → virtual fields.
@@ -2748,6 +2883,21 @@ impl RecordInstance {
         // directive instead of silently dropping it at IOC load. String-typed
         // and already-typed values pass through unchanged.
         let value = coerce_common_field(&name, value, bound)?;
+        // C `dbPutString`/`dbPutField` route every link field's text through
+        // `dbParseLink`, whose brace arm hands it to `dbJLinkParse`
+        // (`dbStaticLib.c:2280-2286`); an unusable JSON link is
+        // `S_dbLib_badField` and the field never takes the value. This is the
+        // one funnel every common link field crosses — SDIS, TSEL, FLNK, DOL,
+        // SIML, SIOL, INP, OUT — on both the db-load and the runtime put path,
+        // so the rule holds without being restated per field.
+        if let EpicsValue::String(ref s) = value {
+            let text = s.as_str_lossy();
+            if text.trim_start().starts_with('{')
+                && crate::types::dbf_link_class(self.record.record_type(), &name).is_some()
+            {
+                super::check_json_link_text(&text)?;
+            }
+        }
         match name.as_str() {
             // `special(SPC_NOMOD)` — C `dbPutSpecial` refuses the put with
             // `S_db_noMod` (dbAccess.c:123-127). OLDSIMM is written only by the
@@ -3949,15 +4099,15 @@ impl RecordInstance {
         // fields).
         //
         // This is the one PACT release that does not go through `leave_pact`,
-        // and it provably frees nothing: `process_local` holds `&mut self` for
-        // the whole PACT window, and a put-notify is parked only through
-        // `park_notify_put`, which needs that same `&mut`. So no deferral can
-        // be created inside the window, and the `swap(true)` above proved none
-        // existed on entry (`deferred_notify_put.is_some()` ⟹ PACT).
+        // and it provably owes no restart: `process_local` holds `&mut self` for
+        // the whole PACT window, and a put-notify is queued only through
+        // `queue_notify_put`, which needs that same `&mut`. So nothing can join
+        // the restart list inside the window, and the `swap(true)` above proved
+        // the record was idle on entry.
         debug_assert!(
-            self.deferred_notify_put.is_none(),
-            "PactExit invariant: a parked put-notify implies PACT, which the \
-             swap above proved was clear"
+            self.notify_restart_list.is_empty(),
+            "a queued put-notify implies the record was owned, which the swap \
+             above proved it was not"
         );
         struct ProcessGuard(*const AtomicBool);
         // SAFETY: AtomicBool is Sync; raw pointers don't auto-derive
@@ -4482,7 +4632,7 @@ impl RecordInstance {
     /// over the cached record-level metadata. Shared by the GET and
     /// monitor snapshot builders. Computed live on every call — never
     /// cached — so overrides derived from fields outside the
-    /// `is_metadata_field` set cannot go stale.
+    /// [`is_metadata_cache_source`] set cannot go stale.
     ///
     /// This is also where the record-level `Q:form` info tag is narrowed to
     /// the served field: QSRV assigns `display.form.index` only when the
@@ -5516,23 +5666,26 @@ mod metadata_cache_tests {
     }
 
     #[test]
-    fn metadata_field_set_check() {
-        // Sanity check that the metadata field set is recognized.
-        assert!(is_metadata_field("EGU"));
-        assert!(is_metadata_field("PREC"));
-        assert!(is_metadata_field("HOPR"));
-        assert!(is_metadata_field("LOPR"));
-        assert!(is_metadata_field("HIHI"));
-        assert!(is_metadata_field("DRVH"));
-        assert!(is_metadata_field("ZNAM"));
-        assert!(is_metadata_field("ZRST"));
-        assert!(is_metadata_field("FFST"));
+    fn metadata_cache_source_set_check() {
+        // Every field `populate_display_info` / `populate_control_info` /
+        // `populate_enum_info` reads.
+        assert!(is_metadata_cache_source("EGU"));
+        assert!(is_metadata_cache_source("PREC"));
+        assert!(is_metadata_cache_source("HOPR"));
+        assert!(is_metadata_cache_source("LOPR"));
+        assert!(is_metadata_cache_source("DRVH"));
+        assert!(is_metadata_cache_source("ZNAM"));
+        assert!(is_metadata_cache_source("ZRST"));
+        assert!(is_metadata_cache_source("FFST"));
 
-        // Non-metadata fields should NOT invalidate the cache
-        assert!(!is_metadata_field("VAL"));
-        assert!(!is_metadata_field("DESC"));
-        assert!(!is_metadata_field("SCAN"));
-        assert!(!is_metadata_field("PHAS"));
+        // The cache holds no alarm limits — `explicit_alarm_limits` is on the
+        // live `apply_field_metadata_override` path — so HIHI is property-class
+        // without being a cache source.
+        assert!(!is_metadata_cache_source("HIHI"));
+        assert!(!is_metadata_cache_source("VAL"));
+        assert!(!is_metadata_cache_source("DESC"));
+        assert!(!is_metadata_cache_source("SCAN"));
+        assert!(!is_metadata_cache_source("PHAS"));
     }
 
     #[test]
@@ -5915,8 +6068,8 @@ mod metadata_cache_tests {
         let mut inst = ai_instance();
         let _ = inst.snapshot_for_field("VAL");
         assert!(inst.metadata_cache.lock().unwrap().is_some());
-        // VAL is not in is_metadata_field set — must be skipped even
-        // with a changed value.
+        // VAL is neither a cache source nor `prop(YES)` — must be skipped
+        // even with a changed value.
         inst.notify_field_written_if_changed("VAL", None);
         assert!(inst.metadata_cache.lock().unwrap().is_some());
     }
@@ -6844,16 +6997,56 @@ mod metadata_cache_tests {
 
     // ── Regression: DBE_PROPERTY event delivery boundaries ──────────────
 
-    /// motor `prop(YES)` fields (motorRecord.dbd 154/161/289/361/368)
-    /// are property-class: a changed write must post DBE_PROPERTY
-    /// (C dbAccess.c dbPut, `pfldDes->prop`). They feed the
-    /// live-computed `field_metadata_override`, not the cache, but the
-    /// posting gate is this same set.
+    /// Subscribe `VAL` for PROPERTY, put `field`, run the post gate, and report
+    /// whether an event was delivered. `put` must differ from the field's
+    /// current value or the change-detection suppresses the post either way.
+    fn property_event_on_put<R: Record>(rec: R, field: &str, put: EpicsValue) -> bool {
+        use crate::server::recgbl::EventMask;
+        let mut inst = RecordInstance::new("PROPGATE".to_string(), rec);
+        let mut rx = inst
+            .add_subscriber(
+                "VAL",
+                1,
+                crate::types::DbFieldType::Double,
+                EventMask::PROPERTY.bits(),
+            )
+            .expect("subscriber added");
+        let prev = inst.record.get_field(field);
+        assert_ne!(prev.as_ref(), Some(&put), "{field}: put must be a change");
+        inst.record.put_field(field, put).expect("put accepted");
+        inst.notify_field_written_if_changed(field, prev.as_ref());
+        rx.try_recv().is_ok()
+    }
+
+    /// Boundary: `prop(YES)`. `histogramRecord.dbd.pod` declares ULIM
+    /// `special(SPC_RESET)` + `prop(YES)`, so C's `dbPut` sets
+    /// `propertyUpdate` (dbAccess.c:1330) and posts DBE_PROPERTY. ULIM is
+    /// nobody's cache source — it reaches the wire through the live
+    /// `apply_field_metadata_override` — so a set keyed on cache sources
+    /// cannot answer this, which is why the gate reads the declaration.
     #[test]
-    fn motor_prop_yes_fields_are_property_class() {
-        for f in ["VBAS", "VMAX", "MRES", "DHLM", "DLLM"] {
-            assert!(is_metadata_field(f), "{f} must be property-class");
-        }
+    fn prop_yes_field_posts_property_event() {
+        use crate::server::records::histogram::HistogramRecord;
+        assert!(
+            property_event_on_put(
+                HistogramRecord::default(),
+                "ULIM",
+                EpicsValue::Double(100.0)
+            ),
+            "histogram.ULIM is prop(YES) — a changed put must post DBE_PROPERTY"
+        );
+    }
+
+    /// Boundary: `pp(TRUE)` without `prop`. `biRecord.dbd.pod` declares ZSV
+    /// `pp(TRUE)`, `menu(menuAlarmSevr)` and no `prop`, so C's
+    /// `paddr->pfldDes->prop` is 0 and no property event is posted.
+    #[test]
+    fn pp_true_without_prop_posts_no_property_event() {
+        use crate::server::records::bi::BiRecord;
+        assert!(
+            !property_event_on_put(BiRecord::default(), "ZSV", EpicsValue::Short(2)),
+            "bi.ZSV is pp(TRUE) but not prop(YES) — it must post no DBE_PROPERTY"
+        );
     }
 
     /// Boundary 1: metadata field written with a CHANGED value, subscriber
@@ -7272,5 +7465,35 @@ mod declared_override_tests {
             inst.declared_overrides.is_empty(),
             "a field the record serves via get_field must not enter the override map"
         );
+    }
+}
+
+#[cfg(test)]
+mod pact_exit_tests {
+    use super::*;
+    use crate::server::records::ai::AiRecord;
+
+    fn instance() -> RecordInstance {
+        RecordInstance::new("PACT:REC".to_string(), AiRecord::new(0.0))
+    }
+
+    /// The two boundary values of the bit `leave_pact` mints. It is minted
+    /// under the `&mut self` the caller already holds, which is what lets
+    /// `PvDatabase::apply_pact_exit` take no record lock and so be safe to
+    /// call from a `Drop` that still has a `rec.write()` alive in scope.
+    #[test]
+    fn leave_pact_reports_an_empty_restart_queue_as_nothing_to_do() {
+        let mut inst = instance();
+        inst.enter_pact();
+        assert!(!inst.leave_pact().restart_pending());
+    }
+
+    #[test]
+    fn leave_pact_reports_a_queued_notify_so_the_tail_drains_it() {
+        let mut inst = instance();
+        inst.enter_pact();
+        let (tx, _rx) = crate::runtime::sync::oneshot::channel();
+        inst.queue_notify_put(DeferredNotify::Process { completion: tx });
+        assert!(inst.leave_pact().restart_pending());
     }
 }

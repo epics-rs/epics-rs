@@ -407,9 +407,51 @@ enum NotifyRequest {
     Deferred(crate::runtime::sync::oneshot::Sender<()>),
 }
 
+/// Which of C `processNotifyCommon`'s two entries a put-notify arrives on
+/// (its `first` argument, dbNotify.c:207).
+///
+/// The two differ only in what defers them, and that difference is why the
+/// entry test cannot live inside the install owner: a fresh arrival must not
+/// jump a queue, a replay IS the queue head.
+#[derive(Clone, Copy)]
+enum NotifyArrival {
+    /// `dbProcessNotify` -> `processNotifyCommon(ppn, precord, 1)`: reaching
+    /// the record for the first time.
+    Fresh,
+    /// `notifyCallback` -> `processNotifyCommon(ppn, precord, 0)`: already
+    /// popped off the restart list by `take_next_notify_restart`, C
+    /// `restartCheck` (dbNotify.c:158-168).
+    Replay,
+}
+
+impl NotifyArrival {
+    /// Must this arrival queue rather than take the slot?
+    ///
+    /// A FRESH notify defers on the full test (owned, PACT, or someone already
+    /// queued) -- C `processNotifyCommon:213` plus the PACT arm at `:225`, and
+    /// the restart-list term so a notify arriving between a completion and the
+    /// restart check cannot jump the queue. A REPLAY defers only on an
+    /// occupied slot: it must take the record with its successors still queued
+    /// behind it, exactly as `restartCheck` assigns `precord->ppn = pfirst`
+    /// while leaving the rest of `restartList` in place.
+    fn defers(self, record: &crate::server::record::RecordInstance) -> bool {
+        match self {
+            NotifyArrival::Fresh => record.notify_put_is_owned(),
+            NotifyArrival::Replay => record.notify.is_some(),
+        }
+    }
+}
+
 impl NotifyRequest {
     fn wants_notify(&self) -> bool {
         !matches!(self, NotifyRequest::None)
+    }
+
+    /// C `pnotifyPvt->state == notifyRestartCallbackRequested` (dbNotify.c:213)
+    /// — this put already owns the record, so the ownership test that stops a
+    /// fresh arrival does not apply to it.
+    fn is_restart(&self) -> bool {
+        matches!(self, NotifyRequest::Deferred(_))
     }
 
     /// The completion sender, plus the receiver to hand back — `Some` only for
@@ -1389,43 +1431,41 @@ impl PvDatabase {
     /// unconditional [`Self::process_record_with_links`] cycle (C `dbProcess`,
     /// the Force analogue). A fully synchronous chain returns `Ok(None)` (the
     /// wait-set already drained); an async record returns `Ok(Some(rx))` for
-    /// the caller to await. A concurrent put-callback already in flight on the
-    /// record is rejected with `PutCallbackInProgress`, matching the PROC path.
+    /// the caller to await. A notify already in flight on the record does not
+    /// refuse this one: it joins the record's restart queue and replays when
+    /// the record frees, which is C's only outcome here.
     pub async fn process_record_with_notify(
         &self,
         record_name: &str,
     ) -> CaResult<crate::server::record::ProcessCompletion> {
         let (completion_tx, completion_rx) = crate::runtime::sync::oneshot::channel();
-        let notify = crate::server::record::NotifyWaitSet::new(completion_tx);
-        {
-            // Collect-then-act: clone the handle under a brief map read, drop
-            // the map lock before taking the per-record write lock.
-            let rec_arc = {
-                let recs = self.inner.records.read();
-                recs.get(record_name).cloned()
-            };
-            let Some(rec_arc) = rec_arc else {
-                return Err(CaError::ChannelNotFound(record_name.to_string()));
-            };
-            let mut guard = rec_arc.write();
-            if guard.notify.is_some() {
-                return Err(CaError::PutCallbackInProgress(record_name.to_string()));
-            }
-            guard.notify = Some(notify.clone());
-        }
-        let mut visited = HashSet::new();
-        self.process_record_with_links(record_name, &mut visited, 0)
-            .await?;
+        // The gate wraps the install AND the cycle it arms, as C's does:
+        // `dbProcessNotify` takes `dbScanLock(precord)` (dbNotify.c:355) and
+        // `processNotifyCommon` assigns `precord->ppn` and calls `dbProcess`
+        // before the matching `dbScanUnlock` (`:257-262`). Installing ahead of
+        // the gate let a gate-holding put's cycle reach `complete_put_notify`
+        // on a slot it did not fill, `take` this client's wait-set and `leave`
+        // it -- firing a `block=true` completion for a cycle the client never
+        // requested, and leaving this one to run unarmed.
+        let installed = {
+            let _record_gate = self.acquire_put_gate(record_name);
+            self.install_notify_and_process_already_locked(
+                record_name,
+                completion_tx,
+                NotifyArrival::Fresh,
+            )
+        }?;
         // The wait-set fires the oneshot only after the whole FLNK/OUT chain
-        // (sync + async) settles. Already-completed ⟹ fully synchronous ⟹
-        // report immediate success; otherwise hand the receiver back to await
-        // the deferred async completion.
-        if notify.completed() {
-            Ok(crate::server::record::ProcessCompletion::Sync)
-        } else {
-            Ok(crate::server::record::ProcessCompletion::Async(
+        // (sync + async) settles. Already-completed ==> fully synchronous ==>
+        // report immediate success. Queued (`None`) or still pending ==> hand
+        // the receiver back to await the deferred completion.
+        match installed {
+            Some(notify) if notify.completed() => {
+                Ok(crate::server::record::ProcessCompletion::Sync)
+            }
+            _ => Ok(crate::server::record::ProcessCompletion::Async(
                 completion_rx,
-            ))
+            )),
         }
     }
 
@@ -1493,34 +1533,108 @@ impl PvDatabase {
         self.process_record_with_links_already_locked(record_name, &mut visited, 0)
     }
 
-    /// C `dbNotifyCompletion` → restart (dbNotify.c:207-231, state
-    /// `notifyRestartInProgress`): replay a put-notify that landed on a PACT
-    /// record, now that the record is idle. The single owner that consumes a
-    /// [`DeferredNotifyPut`](crate::server::record::DeferredNotifyPut); called only from the async-completion tail.
+    /// C `restartCheck` (dbNotify.c:149-170) plus the restarted
+    /// `processNotifyCommon` it queues: pop the oldest put-notify waiting on
+    /// `record_name` and replay it whole — value, process, callback.
     ///
-    /// The replay goes back through the ordinary put entry, so if the record
-    /// has ALREADY gone active again (a scan fired between the completion and
-    /// this replay), the same PACT test defers it once more rather than writing
-    /// into a busy record — the deferral is closed under its own restart.
-    pub(crate) async fn restart_deferred_notify_put(
+    /// The pop happens **after** the record's advisory write gate is taken and
+    /// **before** the replay releases it, so the promoted put owns the record
+    /// across the whole promotion, as C's `precord->ppn = pfirst` does. Without
+    /// that, a client put arriving in the gap would take the record and the
+    /// longer-waiting notify would end up behind it.
+    ///
+    /// The replay goes back through the ordinary put entry, so if the record has
+    /// ALREADY gone active again (a scan fired between the completion and this
+    /// replay), the same test queues it once more rather than writing into a
+    /// busy record — the deferral is closed under its own restart. Called only
+    /// from `PvDatabase::apply_pact_exit`, the single drain owner.
+    pub(crate) async fn restart_next_notify_put(&self, record_name: &str) {
+        // The clients already hold their receivers; a failure here (record gone,
+        // field refused) must still release them, which dropping the senders
+        // does — the same completion a `dbNotifyCancel` gives the C client.
+        let _record_gate = self.acquire_put_gate(record_name);
+        let Some(rec) = self.get_record(record_name) else {
+            return;
+        };
+        let Some(queued) = rec.write().take_next_notify_restart() else {
+            return;
+        };
+        match queued {
+            crate::server::record::DeferredNotify::Put(
+                crate::server::record::DeferredNotifyPut {
+                    field,
+                    value,
+                    completion,
+                },
+            ) => {
+                let _ = self.put_record_field_from_ca_body(
+                    record_name,
+                    &field,
+                    value,
+                    NotifyRequest::Deferred(completion),
+                );
+            }
+            // C `processGetRequest` on restart: `processNotifyCommon` re-enters
+            // with no `putCallback`, so the replay is the process alone. The
+            // gate is already held, so this takes the already-locked entry.
+            crate::server::record::DeferredNotify::Process { completion } => {
+                let _ = self.install_notify_and_process_already_locked(
+                    record_name,
+                    completion,
+                    NotifyArrival::Replay,
+                );
+            }
+        }
+    }
+
+    /// Arm `record_name`'s wait-set around `completion` and drive one process
+    /// cycle -- the gate-held body behind every put-notify entry in this file,
+    /// and the only one that reaches the record's `notify` slot.
+    ///
+    /// **The caller MUST hold `record_name`'s advisory write gate.** That is
+    /// the whole of C's gated region: both entries take the record lock before
+    /// `processNotifyCommon` runs -- `dbProcessNotify` at dbNotify.c:355 for a
+    /// fresh arrival, `notifyCallback` at `:282` for a replay -- and hold it
+    /// across the `precord->ppn` assignment and the `dbProcess` it arms
+    /// (`:257-262`). Being an `_already_locked` body this contains no `.await`,
+    /// so the gate cannot be held across a suspension.
+    ///
+    /// Returns the wait-set so the caller can ask whether the chain settled
+    /// synchronously. `Ok(None)` means this call drove nothing -- the notify
+    /// queued behind the record's current owner, and the replay is what
+    /// processes, so processing here too would run one client request twice.
+    fn install_notify_and_process_already_locked(
         &self,
         record_name: &str,
-        put: crate::server::record::DeferredNotifyPut,
-    ) {
-        let crate::server::record::DeferredNotifyPut {
-            field,
-            value,
-            completion,
-        } = put;
-        // The client already holds the receiver; a failure here (record gone,
-        // field refused) must still release it, which dropping the sender does.
-        let _record_gate = self.acquire_put_gate(record_name);
-        let _ = self.put_record_field_from_ca_body(
-            record_name,
-            &field,
-            value,
-            NotifyRequest::Deferred(completion),
-        );
+        completion: crate::runtime::sync::oneshot::Sender<()>,
+        arrival: NotifyArrival,
+    ) -> CaResult<Option<std::sync::Arc<crate::server::record::NotifyWaitSet>>> {
+        // Collect-then-act: clone the handle under a brief map read, drop the
+        // map lock before taking the per-record write lock.
+        let rec_arc = {
+            let recs = self.inner.records.read();
+            recs.get(record_name).cloned()
+        }
+        .ok_or_else(|| CaError::ChannelNotFound(record_name.to_string()))?;
+        let notify = {
+            let mut guard = rec_arc.write();
+            if arrival.defers(&guard) {
+                guard.queue_notify_put(crate::server::record::DeferredNotify::Process {
+                    completion,
+                });
+                return Ok(None);
+            }
+            // Through the one install owner. Assigning the slot here instead
+            // would drop the prior client's Sender, and its receiver then wakes
+            // with the RecvError the CA dispatcher reads as success.
+            match guard.install_or_queue_notify(completion) {
+                Some(notify) => notify,
+                None => return Ok(None),
+            }
+        };
+        let mut visited = HashSet::new();
+        self.process_record_with_links_already_locked(record_name, &mut visited, 0)?;
+        Ok(Some(notify))
     }
 
     /// The gate-held body of the whole CA field-put family — a `fn`, so
@@ -1618,17 +1732,18 @@ impl PvDatabase {
         // completed the callback one cycle early, on work that never saw this
         // value.
         //
-        // The PACT test and the park are ONE critical section (C holds
-        // `dbScanLock` across both): a park on a record that left PACT in
-        // between would sit in a slot no PACT release will ever take, which is
-        // precisely the strand the `PactExit` invariant forbids. A record that
-        // goes idle in the window falls through and takes the put the ordinary
-        // way.
+        // The ownership test and the enqueue are ONE critical section (C holds
+        // `dbScanLock` across both): a put queued onto a record that went idle
+        // in between would wait for a restart check that already ran. A record
+        // that goes idle in the window falls through and takes the put the
+        // ordinary way.
         //
         // A second put-notify onto a record that already owns one is C's
-        // "another processNotify owns the record" (dbNotify.c:213-217); the port
-        // reports it to the client as `PutCallbackInProgress` (C `S_db_Blocked`
-        // / `ECA_PUTCBINPROG`) rather than queueing a restart list.
+        // "another processNotify owns the record" (dbNotify.c:213-217): it joins
+        // the SAME queue, at the back (`ellSafeAdd`). Both tests are one arm
+        // here because both have the same answer — the put waits, unwritten.
+        // Refusing it instead (`S_db_Blocked` / `ECA_PUTCBINPROG`) drops the
+        // client's value, and C never sends that status from this path.
         //
         // A fire-and-forget `dbPutField` is NOT deferred: it writes and raises
         // RPRO (dbAccess.c:1263-1277). Only the notify route waits.
@@ -1651,27 +1766,47 @@ impl PvDatabase {
         // only correction the special case needs is to keep a link field OUT
         // of the notify PACT-defer park.
         let is_dbf_link_field = self.is_dbf_link_field(record_name, &field);
-        if want_notify && !is_dbf_link_field {
+        if want_notify {
+            let is_restart = notify_request.is_restart();
             let mut guard = rec.write();
-            if guard.is_processing() {
+            // A restart is already the record's owner, so only PACT can stop it
+            // (C skips dbNotify.c:213 for it and falls straight to :225).
+            let must_wait = if is_restart {
+                guard.is_processing()
+            } else if is_dbf_link_field {
+                // Ownership only — see `notify_put_has_owner`. Keeping link
+                // fields out of the whole decision (not just the PACT arm) left
+                // an owned record's link put falling through to the wait-set
+                // install below, whose only answer to an occupied slot was
+                // `PutCallbackInProgress`.
+                guard.notify_put_has_owner()
+            } else {
+                guard.notify_put_is_owned()
+            };
+            if must_wait {
                 let Some((completion, completion_rx)) = notify_request.into_completion() else {
                     // Unreachable: `want_notify` is exactly "this request
 
                     // carries a completion".
                     return Ok(crate::server::record::ProcessCompletion::Sync);
                 };
-                guard
-                    .park_notify_put(crate::server::record::DeferredNotifyPut {
-                        field,
-                        value,
-                        completion,
-                    })
-                    .map_err(|_| CaError::PutCallbackInProgress(record_name.to_string()))?;
-                // A put-notify parked on a PACT record IS async: it replays and
-                // completes on the record's PACT release (C `notifyRestartInProgress`,
-                // dbNotify.c:225-231). `Deferred` replays carry only the sender, so
-                // `completion_rx` is `None` there and this maps to `Sync` — but that
-                // path is the internal restart, not a fresh client put.
+                let put = crate::server::record::DeferredNotifyPut {
+                    field,
+                    value,
+                    completion,
+                };
+                let put = crate::server::record::DeferredNotify::Put(put);
+                if is_restart {
+                    guard.requeue_notify_put(put);
+                } else {
+                    guard.queue_notify_put(put);
+                }
+                // A queued put-notify IS async: it replays and completes on the
+                // restart check that frees it (C `notifyRestartInProgress` /
+                // `notifyWaitForRestart`, dbNotify.c:213-231). `Deferred` replays
+                // carry only the sender, so `completion_rx` is `None` there and
+                // this maps to `Sync` — but that path is the internal restart,
+                // not a fresh client put.
                 return Ok(crate::server::record::ProcessCompletion::from_signal(
                     completion_rx,
                 ));
@@ -1748,23 +1883,37 @@ impl PvDatabase {
             let parked = if let Some((completion_tx, completion_rx)) =
                 notify_request.into_completion()
             {
-                let notify = crate::server::record::NotifyWaitSet::new(completion_tx);
-                {
-                    // Collect-then-act: clone the handle under a brief map
-                    // read, drop the map lock before the per-record write.
-                    let rec_arc = {
-                        let recs = self.inner.records.read();
-                        recs.get(record_name).cloned()
-                    };
-                    if let Some(rec_arc) = rec_arc {
-                        let mut guard = rec_arc.write();
-                        if guard.notify.is_some() {
-                            return Err(CaError::PutCallbackInProgress(record_name.to_string()));
+                // Collect-then-act: clone the handle under a brief map
+                // read, drop the map lock before the per-record write.
+                let rec_arc = {
+                    let recs = self.inner.records.read();
+                    recs.get(record_name).cloned()
+                };
+                match rec_arc {
+                    Some(rec_arc) => {
+                        match rec_arc.write().install_or_queue_notify(completion_tx) {
+                            Some(notify) => Some((notify, completion_rx)),
+                            // Queued: the entry gate let this put through, then
+                            // another notify took the slot before the install
+                            // (`process_record_with_notify` does not hold the
+                            // put gate). C queues here rather than refusing, and
+                            // the replay is what processes — so return without
+                            // driving the record.
+                            None => {
+                                return Ok(crate::server::record::ProcessCompletion::from_signal(
+                                    completion_rx,
+                                ));
+                            }
                         }
-                        guard.notify = Some(notify.clone());
                     }
+                    // Record gone between the put and the park: nothing to
+                    // install on. Dropping the wait-set releases the client,
+                    // which is the completion C gives a `dbNotifyCancel`.
+                    None => Some((
+                        crate::server::record::NotifyWaitSet::new(completion_tx),
+                        completion_rx,
+                    )),
                 }
-                Some((notify, completion_rx))
             } else {
                 None
             };
@@ -2171,11 +2320,16 @@ impl PvDatabase {
         // fires `completion_tx` only after the originating record AND
         // every FLNK/OUT chain target it triggers (sync or async) has
         // completed — C `dbNotify.c` `processNotify`/`dbNotifyCompletion`.
-        // Refuse a second concurrent WRITE_NOTIFY on the same record:
-        // C EPICS returns S_db_Blocked / ECA_PUTCBINPROG, and silently
-        // overwriting the wait-set would drop the prior Sender, waking
-        // the prior caller's rx with RecvError that the CA dispatcher
-        // treats as success.
+        // An occupied slot is QUEUED, never refused. C
+        // `processNotifyCommon` answers "another processNotify owns the
+        // record" with `ellSafeAdd` onto `restartList` (dbNotify.c:211-217)
+        // and carries no refusal arm: `S_db_Blocked` is raised by a test
+        // record's own put hook (test/ioc/db/xRecord.c:89), never by the
+        // notify machinery, and `ECA_PUTCBINPROG` has exactly one sender in
+        // all of base — the put-callback timeout at rsrv/camessage.c:1745.
+        // Overwriting the slot instead would drop the prior Sender, waking
+        // the prior caller's rx with RecvError that the CA dispatcher treats
+        // as success, so the install goes through the one owner.
         //
         // A fire-and-forget put parks NOTHING — C builds a `putNotify`
         // only in `dbPutNotify`; `dbPutField` processes the record with
@@ -2183,23 +2337,29 @@ impl PvDatabase {
         // nor disturbs a WRITE_NOTIFY already parked on the record.
         let parked = if let Some((completion_tx, completion_rx)) = notify_request.into_completion()
         {
-            let notify = crate::server::record::NotifyWaitSet::new(completion_tx);
-            {
-                // Collect-then-act: clone the handle under a brief map read,
-                // drop the map lock before the per-record write.
-                let rec_arc = {
-                    let recs = self.inner.records.read();
-                    recs.get(record_name).cloned()
-                };
-                if let Some(rec_arc) = rec_arc {
-                    let mut guard = rec_arc.write();
-                    if guard.notify.is_some() {
-                        return Err(CaError::PutCallbackInProgress(record_name.to_string()));
+            // Collect-then-act: clone the handle under a brief map read,
+            // drop the map lock before the per-record write.
+            let rec_arc = {
+                let recs = self.inner.records.read();
+                recs.get(record_name).cloned()
+            };
+            match rec_arc {
+                Some(rec_arc) => match rec_arc.write().install_or_queue_notify(completion_tx) {
+                    Some(notify) => Some((notify, completion_rx)),
+                    // Queued behind the slot's current owner — see the PROC
+                    // path above. The replay drives the record; returning here
+                    // is what keeps one client request to one process cycle.
+                    None => {
+                        return Ok(crate::server::record::ProcessCompletion::from_signal(
+                            completion_rx,
+                        ));
                     }
-                    guard.notify = Some(notify.clone());
-                }
+                },
+                None => Some((
+                    crate::server::record::NotifyWaitSet::new(completion_tx),
+                    completion_rx,
+                )),
             }
-            Some((notify, completion_rx))
         } else {
             None
         };
@@ -2353,6 +2513,14 @@ impl PvDatabase {
                 }
                 Err(e) => return Err(e),
             }
+            // C `dbAccess.c::dbPut:1414` `if (isValueField) precord->udf =
+            // FALSE;` — the same clear, through the same predicate, as the
+            // three other put bodies. An autosave restore of VAL defines the
+            // record in C, and a record that is left UDF here reports the
+            // born UDF_ALARM on its first process cycle.
+            if instance.record.is_udf_defining_put(&field) {
+                instance.common.udf = 0;
+            }
             // Invalidate metadata cache only if the metadata-class
             // field actually changed (faac1df1).
             instance.notify_field_written_if_changed(&field, prev_value.as_ref());
@@ -2387,6 +2555,7 @@ fn metadata_from_snapshot(snapshot: &Snapshot) -> crate::server::pv::PvMetadata 
 #[cfg(test)]
 mod tests {
     use super::super::PvDatabase;
+    use super::NotifyArrival;
     use crate::types::EpicsValue;
 
     /// Regression: prior to fixing B1, `put_pv_and_post` walked only
@@ -2869,6 +3038,87 @@ mod tests {
         assert_eq!(
             seq, want,
             "record burst delivery must be {{earlier distinct backlog…, coalesced tail}}"
+        );
+    }
+
+    /// The notify slot has exactly two states when a restart replay installs
+    /// on it, and both must be handled by the one install owner.
+    ///
+    /// C cannot reach the occupied one: `restartCheck` (dbNotify.c:149-168)
+    /// pops the head and assigns `precord->ppn = pfirst` under a single lock,
+    /// so a restarted notify already owns the record before its callback runs.
+    /// The port pops under the put gate and installs a moment later, both
+    /// through the one gate-held owner. Assigning over the slot would drop the
+    /// prior client's
+    /// Sender, and its receiver then wakes with `RecvError`, which the CA
+    /// dispatcher reads as a successful put-callback: the client is told its
+    /// write completed on a cycle that never ran.
+    #[epics_macros_rs::epics_test]
+    async fn a_replay_onto_a_taken_notify_slot_queues_instead_of_overwriting() {
+        use crate::server::records::ai::AiRecord;
+
+        let db = PvDatabase::new();
+        db.add_record("REPLAY:TAKEN", Box::new(AiRecord::new(0.0)))
+            .await
+            .unwrap();
+        let rec = db.get_record("REPLAY:TAKEN").expect("record exists");
+
+        let (owner_tx, _owner_rx) = crate::runtime::sync::oneshot::channel();
+        let owner = rec
+            .write()
+            .install_or_queue_notify(owner_tx)
+            .expect("a free slot installs");
+
+        let (client_tx, _client_rx) = crate::runtime::sync::oneshot::channel();
+        assert!(
+            db.install_notify_and_process_already_locked(
+                "REPLAY:TAKEN",
+                client_tx,
+                NotifyArrival::Replay
+            )
+            .expect("the record is loaded")
+            .is_none(),
+            "the slot is owned, so the replay must drive no process cycle"
+        );
+        assert!(
+            rec.read()
+                .notify
+                .as_ref()
+                .is_some_and(|n| std::sync::Arc::ptr_eq(n, &owner)),
+            "the owner's wait-set must survive the replay"
+        );
+        assert!(
+            rec.read().notify_restart_pending(),
+            "the replay must be queued behind the owner, not dropped"
+        );
+    }
+
+    /// The other boundary value of the same slot: free, so the replay installs
+    /// and drives the cycle.
+    #[epics_macros_rs::epics_test]
+    async fn a_replay_onto_a_free_notify_slot_installs_and_drives_the_cycle() {
+        use crate::server::records::ai::AiRecord;
+
+        let db = PvDatabase::new();
+        db.add_record("REPLAY:FREE", Box::new(AiRecord::new(0.0)))
+            .await
+            .unwrap();
+        let rec = db.get_record("REPLAY:FREE").expect("record exists");
+
+        let (client_tx, _client_rx) = crate::runtime::sync::oneshot::channel();
+        assert!(
+            db.install_notify_and_process_already_locked(
+                "REPLAY:FREE",
+                client_tx,
+                NotifyArrival::Replay
+            )
+            .expect("the record is loaded")
+            .is_some(),
+            "a free slot installs and processes"
+        );
+        assert!(
+            !rec.read().notify_restart_pending(),
+            "nothing is queued when the replay took the slot"
         );
     }
 }

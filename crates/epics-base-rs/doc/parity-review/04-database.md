@@ -191,12 +191,12 @@ None found.
   latent correctness hazard, not an active defect.
 
 ### L4 — `evaluate_calc_link` truncates input arg list at 12 silently
-- **Rust:** `links.rs:77` `for (i, arg) in calc.args.iter().enumerate().take(12)`.
-- **C:** `lnkCalc` (`dbJLink`/`calcLink`) supports A..L (12) — matches — but Rust's
-  `.take(12)` silently drops any 13th+ arg instead of being a hard limit at parse
-  time.
-- **Runtime impact:** None today (calc engine is 12 vars). Noted only as a silent
-  truncation rather than a validated bound.
+- **CLOSED, and the C claim in it was wrong.** `lnkCalc` supports `CALCPERFORM_NARGS`
+  inputs, which `postfix.h:29` defines as **21** (A..U), not 12; `links.dbd.pod:131`
+  says "up to 24" and is also wrong. C does not truncate at the limit either — it
+  returns `jlif_stop` (`lnkCalc.c:135-139`), refusing the link.
+- The parser now refuses more than `CALC_NARGS`, and `evaluate_calc_link` keeps the
+  same bound for links built in-process.
 
 ---
 

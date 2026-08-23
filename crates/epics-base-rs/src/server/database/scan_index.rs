@@ -1,4 +1,4 @@
-use crate::server::record::{PiniMode, RecordInstance, ScanType};
+use crate::server::record::{PiniMode, RecordInstance, ScanList, ScanType};
 
 use super::PvDatabase;
 
@@ -47,7 +47,7 @@ impl PvDatabase {
                 .scan_index
                 .bucket(list)
                 .lock()
-                .retain(|(_, _, n)| n != name);
+                .retain(|k| k.name != name);
         }
         // 2) Look up the LIVE record under the mutex. If concurrent
         // remove+re-add replaced the Arc with a fresh one whose
@@ -61,9 +61,13 @@ impl PvDatabase {
             Some(r) => r,
             None => return,
         };
-        let (cur_scan, cur_phas) = {
+        let (cur_scan, cur_phas, cur_type) = {
             let inst = rec_arc.read();
-            (inst.common.scan, inst.common.phas)
+            (
+                inst.common.scan,
+                inst.common.phas,
+                inst.record.record_type(),
+            )
         };
         // C `scanAdd` refuses both `Passive` and an out-of-menu index — the
         // latter with "scanAdd detected illegal SCAN value" — so neither can
@@ -78,12 +82,35 @@ impl PvDatabase {
                 .scan_index
                 .bucket(list)
                 .lock()
-                .insert((cur_phas, seq, name.to_string()));
+                .insert(super::ScanKey::new(cur_phas, cur_type, seq, name));
         }
     }
 
-    /// Get record names for a given scan type, sorted by PHAS then
-    /// database load order (C `dbScan.c` stable same-PHAS FIFO).
+    /// Count one over-run for `scan`'s list — C `ppsl->overruns++`
+    /// (`dbScan.c:827`). The periodic scan thread for that rate is the only
+    /// caller; a SCAN value naming no list has no counter to move.
+    pub(crate) fn record_scan_overrun(&self, scan: ScanType) {
+        if let Some(list) = scan.scan_list() {
+            self.inner.scan_index.overruns[list.slot()]
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
+    /// How many times `list`'s sweep has run past its deadline since boot —
+    /// what C's `scanppl` prints as `(%lu over-runs)` (`dbScan.c:408-409`).
+    pub(crate) fn scan_overruns(&self, list: crate::server::record::ScanList) -> u64 {
+        self.inner.scan_index.overruns[list.slot()].load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// A **snapshot** of a scan list, in C's order: PHAS, then DBD
+    /// record-type order, then `.db` load order — see [`ScanKey`]. The stable
+    /// same-PHAS FIFO is `addToList`; the order it is a FIFO over is
+    /// `buildScanLists`, and both are in the key.
+    ///
+    /// For reporting and counting only (`scanppl`, `dbstat`). A sweep that
+    /// PROCESSES the list must not use this: `dbProcess` can change the SCAN
+    /// field of an arbitrary number of records, so a snapshot processes
+    /// records the list no longer holds. [`Self::scan_list_once`] is the sweep.
     ///
     /// A SCAN value that names no list (`Passive`, or an index outside
     /// `menuScan`) holds no records — there is no such bucket to look up.
@@ -91,17 +118,50 @@ impl PvDatabase {
         let Some(list) = scan_type.scan_list() else {
             return Vec::new();
         };
-        // One bucket's lock, held for the clone only and released before the
-        // caller's processing loop — C `scanList` (`dbScan.c:1007-1051`) holds
-        // `psl->lock` for the cursor step alone and releases it around every
-        // `dbProcess`. Neither holds its lock across processing.
+        // One bucket's lock, held for the clone alone. C `scanList`
+        // (`dbScan.c:1007-1051`) also releases `psl->lock` around every
+        // `dbProcess` — but it releases it holding a cursor INTO the list and
+        // re-reads `ellNext` under the lock on the next step, so the two are
+        // not the same construction and this must not be read as parity with
+        // it. Detaching from the list is only sound because nothing here
+        // processes; [`Self::scan_list_once`] is what C's `scanList` is.
         self.inner
             .scan_index
             .bucket(list)
             .lock()
             .iter()
-            .map(|(_, _, name)| name.clone())
+            .map(|k| k.name.clone())
             .collect()
+    }
+
+    /// The scan key `name` would be inserted under RIGHT NOW — its live PHAS,
+    /// record type and load-order sequence. `None` if the record is gone.
+    fn live_scan_key(&self, name: &str) -> Option<super::ScanKey> {
+        let rec = self.get_record_no_resolve(name)?;
+        let (phas, record_type) = {
+            let inst = rec.read();
+            (inst.common.phas, inst.record.record_type())
+        };
+        let seq = self.inner.load_order.load().get(name).copied().unwrap_or(0);
+        Some(super::ScanKey::new(phas, record_type, seq, name))
+    }
+
+    /// A cursor over `list` as it stands at each step — see [`ScanCursor`].
+    pub(crate) fn scan_cursor(&self, list: ScanList) -> ScanCursor {
+        ScanCursor { list, at: None }
+    }
+
+    /// Sweep one scan list, processing every record still in it — C `scanList`
+    /// (`dbScan.c:998-1051`), the single owner of "walk a scan list and
+    /// process it". Every driver goes through here: the periodic threads, and
+    /// the event lists, whose `eventCallback` (`dbScan.c:459-465`) is a bare
+    /// `scanList` call.
+    pub(crate) async fn scan_list_once(&self, list: ScanList) {
+        let mut cursor = self.scan_cursor(list);
+        while let Some(name) = cursor.next(self) {
+            let mut visited = std::collections::HashSet::new();
+            let _ = self.process_record_with_links(&name, &mut visited, 0).await;
+        }
     }
 
     /// Get all record names whose `PINI` is **exactly** `mode`.
@@ -133,9 +193,10 @@ impl PvDatabase {
     /// Every record, in database **load order** — the port's analogue of C's
     /// `iterateRecords`, which walks the record-type / record-instance lists in
     /// the order the `.db` declared them. That order is what makes two
-    /// same-`PHAS` records process deterministically; `load_order` is already
-    /// the `scan_index` secondary sort key for the same reason
-    /// (`database/mod.rs:184`).
+    /// same-`PHAS` records process deterministically; `load_order` is one of
+    /// the `scan_index` sort keys for the same reason (see [`ScanKey`], which
+    /// also carries the record-type ordinal C's `iterateRecords` walks first —
+    /// this PINI sweep does not, and that is a separate gap).
     ///
     /// Snapshots the map under the records read lock and releases it before the
     /// caller takes any per-record lock.
@@ -225,10 +286,8 @@ impl PvDatabase {
     /// routing — see `dbScan.c:548-552` `post_event` →
     /// `postEvent(pevent_list[event])`.
     pub async fn post_event(&self) {
-        let names = self.records_for_scan(ScanType::Event).await;
-        for name in &names {
-            let mut visited = std::collections::HashSet::new();
-            let _ = self.process_record_with_links(name, &mut visited, 0).await;
+        if let Some(list) = ScanType::Event.scan_list() {
+            self.scan_list_once(list).await;
         }
     }
 
@@ -247,12 +306,20 @@ impl PvDatabase {
             // `eventNameToHandle` returns NULL for "0"/empty — no event.
             return;
         }
-        let names = self.records_for_scan(ScanType::Event).await;
-        for name in &names {
+        let Some(list) = ScanType::Event.scan_list() else {
+            return;
+        };
+        // Same live cursor as every other sweep: C keeps one `scan_list` per
+        // (event, priority) and `eventCallback` hands it to `scanList`
+        // (`dbScan.c:459-465`), so a record whose SCAN changes mid-sweep leaves
+        // the walk here exactly as it does on a periodic list. The port keeps
+        // one Event list and filters by EVNT at the cursor instead.
+        let mut cursor = self.scan_cursor(list);
+        while let Some(name) = cursor.next(self) {
             // Read the record's EVNT and compare against the posted
             // event name. Records that do not match are skipped — a
             // record configured `EVNT=5` only fires on event 5.
-            let evnt = match self.get_record(name) {
+            let evnt = match self.get_record(&name) {
                 Some(rec) => rec.read().common.evnt.clone(),
                 None => continue,
             };
@@ -260,8 +327,74 @@ impl PvDatabase {
                 continue;
             }
             let mut visited = std::collections::HashSet::new();
-            let _ = self.process_record_with_links(name, &mut visited, 0).await;
+            let _ = self.process_record_with_links(&name, &mut visited, 0).await;
         }
+    }
+}
+
+/// A cursor over a LIVE scan list — C `scanList`'s `pse` (`dbScan.c:998-1051`).
+///
+/// The invariant: **the sweep observes the list, it does not own a copy of it.**
+/// C re-reads `ellNext(&pse->node)` under `psl->lock` on every step and carries
+/// a cursor-repair walk that exists precisely because `dbProcess` can change
+/// the SCAN field of an arbitrary number of records mid-sweep. A snapshot taken
+/// once at the top of the tick processes records the list no longer holds.
+///
+/// The port's list is an ordered set, not a linked list, so "my element left
+/// the list" has one answer instead of C's three: the next key strictly greater
+/// than where the cursor stood. That subsumes C's prev/next repair
+/// (`dbScan.c:1030-1044`) — and, because the position is a key rather than a
+/// pointer, it has no counterpart to C's "too many changes, wait till the next
+/// period" (`:1045-1048`), which is an artefact of losing the place rather than
+/// a scanning rule.
+///
+/// The step re-reads the last record's CURRENT key before advancing, so a
+/// record that moved within this list (its own processing changed its PHAS) is
+/// advanced from where it is now — C's `pse->pscan_list == psl` branch
+/// (`:1023-1029`).
+pub(crate) struct ScanCursor {
+    list: ScanList,
+    /// Where the cursor stands: the key of the record it last handed out.
+    at: Option<super::ScanKey>,
+}
+
+impl ScanCursor {
+    /// The next record still in the list, or `None` at its end.
+    ///
+    /// Takes the bucket lock for the step only, never across processing — C
+    /// holds `psl->lock` for the cursor step and releases it around every
+    /// `dbProcess`.
+    pub(crate) fn next(&mut self, db: &PvDatabase) -> Option<String> {
+        use std::ops::Bound;
+
+        let resume = match self.at.take() {
+            None => None,
+            Some(was) => {
+                let live = db.live_scan_key(&was.name);
+                let moved_but_present = match &live {
+                    Some(k) => db.inner.scan_index.bucket(self.list).lock().contains(k),
+                    None => false,
+                };
+                Some(if moved_but_present {
+                    live.expect("checked present")
+                } else {
+                    was
+                })
+            }
+        };
+
+        let next = {
+            let bucket = db.inner.scan_index.bucket(self.list).lock();
+            match &resume {
+                None => bucket.iter().next().cloned(),
+                Some(at) => bucket
+                    .range((Bound::Excluded(at.clone()), Bound::Unbounded))
+                    .next()
+                    .cloned(),
+            }
+        };
+        self.at = next.clone();
+        next.map(|k| k.name)
     }
 }
 

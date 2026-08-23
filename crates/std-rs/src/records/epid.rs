@@ -253,8 +253,9 @@ pub struct EpidRecord {
     /// DSETs — `devEpidSoft` (`devEpidSoft.c`, no TRIG handling) and
     /// `devEpidSoftCallback` (`devEpidSoftCallback.c`, which drives the
     /// TRIG readback link). [`Record::pre_input_link_actions`] checks
-    /// this to emit the TRIG write only when the callback DSET (DTYP
-    /// `"Epid Async Soft"`) is selected.
+    /// this via [`EpidRecord::is_async_callback_dtyp`] to emit the TRIG
+    /// write only when the callback DSET (`stdSupport.dbd:14`, DTYP
+    /// `"Async Soft Channel"`) is selected.
     dtyp: String,
     /// Epid-owned `dbCommon.udf` projection, returned by
     /// [`Record::value_is_undefined`]. C `epidRecord.c` has
@@ -273,9 +274,15 @@ pub struct EpidRecord {
     /// supervisory / empty-STPL epid permanently undefined, exactly as
     /// C leaves `udf == TRUE` forever for such a record.
     value_undefined: bool,
-    /// Set by [`crate::device_support::epid_soft_callback::
-    /// EpidSoftCallbackDeviceSupport::read`] on the first (trigger) pass
-    /// of a CA-type TRIG link, cleared by `process()`.
+    /// Which pass of a CA-type TRIG link this record is in.
+    ///
+    /// Owned end-to-end by [`EpidRecord::pre_input_link_actions`], the
+    /// single site that fires TRIG: it advances `Idle ->
+    /// AwaitingCallback` when it fires an asynchronous trigger and back
+    /// to `Idle` on the callback (reprocess) pass. This is C's
+    /// `pepid->pact`, which `devEpidSoftCallback.c:116` reads as
+    /// `if (!pepid->pact)` to skip the whole trigger block on the
+    /// second pass.
     ///
     /// C `devEpidSoftCallback.c:143-145`: a CA TRIG link fires the
     /// readback trigger asynchronously (`dbCaPutLinkCallback`), sets
@@ -286,16 +293,30 @@ pub struct EpidRecord {
     /// process tail; the tail runs exactly once, on the callback
     /// (reprocess) pass.
     ///
-    /// The Rust framework runs device support `read()` before
-    /// `process()`; `read()` cannot itself short-circuit the cycle.
-    /// This flag is `read()`'s signal to `process()` that the cycle is
-    /// a CA-trigger pass — `process()` consumes it and returns
-    /// `ProcessOutcome::async_pending()`, which makes the framework
-    /// skip the alarm/timestamp/snapshot/OUT/FLNK tail for this cycle
-    /// (the `read()`-returned `WriteDbLink{TRIG}` + `ReprocessAfter`
-    /// actions are still executed). The reprocess pass runs `do_pid`
-    /// and the tail exactly once.
-    ca_trig_pending: bool,
+    /// `process()` reads (but does not clear) `AwaitingCallback` and
+    /// returns `ProcessOutcome::async_pending()`, which makes the
+    /// framework skip the alarm/timestamp/snapshot/OUT/FLNK tail for
+    /// the trigger cycle while still executing the emitted
+    /// `WriteDbLink{TRIG}` + `ReprocessAfter`. The reprocess pass runs
+    /// `do_pid` and the tail exactly once.
+    ca_trig: CaTrigPhase,
+}
+
+/// Which pass of an asynchronous (CA-link) TRIG readback an epid record
+/// is in — the port's `pepid->pact` for the trigger path.
+///
+/// Two variants rather than a bool because the state has exactly one
+/// owner and one transition each way; a bool invited a second copy of it
+/// to live in the device support, where the record could not see it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum CaTrigPhase {
+    /// No trigger outstanding. The next process pass may fire one.
+    #[default]
+    Idle,
+    /// A `dbCaPutLinkCallback`-equivalent trigger is outstanding; the
+    /// next pass is the callback pass and must run the PID, not
+    /// re-trigger.
+    AwaitingCallback,
 }
 
 impl Default for EpidRecord {
@@ -364,7 +385,7 @@ impl Default for EpidRecord {
             // C `epidRecord.c` init: `udf` starts TRUE and is cleared
             // only by the two clear-conditions — see `value_undefined`.
             value_undefined: true,
-            ca_trig_pending: false,
+            ca_trig: CaTrigPhase::Idle,
         }
     }
 }
@@ -445,9 +466,24 @@ impl EpidRecord {
     /// the flag and returns `ProcessOutcome::async_pending()` so the
     /// trigger pass skips the process tail (checkAlarms / monitor /
     /// recGblFwdLink) — C `devEpidSoftCallback.c:143-145` +
-    /// `epidRecord.c:205-210`. See `EpidRecord::ca_trig_pending`.
-    pub fn set_ca_trig_pending(&mut self) {
-        self.ca_trig_pending = true;
+    /// `epidRecord.c:205-210`. See [`EpidRecord::ca_trig`].
+    pub fn ca_trig_phase(&self) -> CaTrigPhase {
+        self.ca_trig
+    }
+
+    /// True when DTYP selects the `devEpidSoftCB` DSET — the only epid
+    /// device support that touches the TRIG readback link.
+    ///
+    /// The string is the one `stdSupport.dbd:14` registers,
+    /// `device(epid,CONSTANT,devEpidSoftCB,"Async Soft Channel")`, and
+    /// is what a `.db` written against the C module sets (this crate
+    /// ships one: `db/async_pid_control.db`). epid deliberately reuses
+    /// base's soft-channel DTYP strings for record-specific behaviour,
+    /// so device selection is by the (record type, DTYP) pair and the
+    /// match belongs here in the epid body rather than in base's
+    /// `is_soft_dtyp`, which is keyed on DTYP alone.
+    pub fn is_async_callback_dtyp(&self) -> bool {
+        self.dtyp == "Async Soft Channel"
     }
 
     /// Owner setter for `EpidRecord::outl_write`. Only `do_pid` calls
@@ -589,27 +625,27 @@ impl Record for EpidRecord {
         self.compute_skipped = false;
 
         // CA-TRIG trigger pass — C `devEpidSoftCallback.c:143-145` +
-        // `epidRecord.c:205-210`. `EpidSoftCallbackDeviceSupport::read`
-        // ran first this cycle, saw a CA-type TRIG link, fired the
-        // asynchronous readback trigger (returning `WriteDbLink{TRIG}` +
-        // `ReprocessAfter` actions), and set `ca_trig_pending` — the
-        // analogue of C `do_pid` setting `pepid->pact = TRUE` and
-        // `return(0)`.
+        // `epidRecord.c:205-210`. `pre_input_link_actions` ran first
+        // this cycle, saw a CA-type TRIG link, fired the asynchronous
+        // readback trigger (`WriteDbLink{TRIG}` + `ReprocessAfter`) and
+        // moved `ca_trig` to `AwaitingCallback` — the analogue of C
+        // `do_pid` setting `pepid->pact = TRUE` and `return(0)`. The
+        // phase is NOT cleared here: `pre_input_link_actions` owns both
+        // transitions, and clears it on the callback pass.
         //
         // C `epidRecord.c:207` `if (!pact && pepid->pact) return(0)`
         // then returns BEFORE `recGblGetTimeStamp` / `checkAlarms` /
         // `monitor` / `recGblFwdLink`: the trigger pass runs NONE of
         // the process tail. Return `async_pending` so the framework
         // skips the alarm/timestamp/snapshot/OUT/FLNK tail for this
-        // cycle. The `read()`-returned actions were merged by the
-        // framework and are still executed; the reprocess pass runs
+        // cycle. The emitted actions were merged by the framework and
+        // are still executed; the reprocess pass runs
         // `do_pid` and the tail exactly once.
         //
         // `device_did_compute` is cleared here because the trigger pass
         // performed NO compute — without this reset the reprocess pass
         // could observe a stale `true`.
-        if self.ca_trig_pending {
-            self.ca_trig_pending = false;
+        if self.ca_trig == CaTrigPhase::AwaitingCallback {
             self.device_did_compute = false;
             return Ok(ProcessOutcome::async_pending());
         }
@@ -1089,27 +1125,49 @@ impl Record for EpidRecord {
     /// here, from `pre_input_link_actions`, which the framework runs
     /// strictly before the input-link fetch.
     ///
-    /// Only the `devEpidSoftCallback` DSET (DTYP `"Epid Async Soft"`)
-    /// drives the TRIG link — `devEpidSoft` (`devEpidSoft.c`) has no
-    /// TRIG handling at all. The action is therefore gated on `dtyp`.
+    /// Only the `devEpidSoftCallback` DSET drives the TRIG link —
+    /// `devEpidSoft` (`devEpidSoft.c`) and `devEpidFast`
+    /// (`devEpidFast.c`) contain no reference to `trig` at all. That
+    /// DSET is selected by `stdSupport.dbd:14`
+    /// `device(epid,CONSTANT,devEpidSoftCB,"Async Soft Channel")`, so
+    /// the gate is the dbd DTYP string and nothing else.
     ///
-    /// The CA-type TRIG link is deliberately NOT emitted here: C
-    /// `devEpidSoftCallback.c:133-147` cannot wait synchronously on a
-    /// CA link, so it uses `dbCaPutLinkCallback` + `pact=TRUE` and
-    /// re-processes on the callback. That two-pass path stays in
-    /// `EpidSoftCallbackDeviceSupport::read` (`WriteDbLink` +
-    /// `ReprocessAfter`).
+    /// Both TRIG link types are fired from here, making this the single
+    /// site that writes TRIG. C branches on the link type inside one
+    /// `if (!pepid->pact)` block (`devEpidSoftCallback.c:116-147`): a
+    /// DB link is written synchronously and falls through to the PID in
+    /// the same pass; a CA link cannot be waited on, so C fires
+    /// `dbCaPutLinkCallback`, sets `pact` and returns, and the PID runs
+    /// on the callback pass. `ca_trig` is that `pact`, and the
+    /// `AwaitingCallback` arm below is C's `!pepid->pact` guard: on the
+    /// callback pass the trigger block is skipped entirely.
     fn pre_input_link_actions(&mut self) -> Vec<ProcessAction> {
-        if self.dtyp != "Epid Async Soft" {
+        if !self.is_async_callback_dtyp() {
             return Vec::new();
         }
-        if link_field_type(&self.trig) == LinkType::Db {
-            return vec![ProcessAction::WriteDbLink {
-                link_field: "TRIG",
-                value: EpicsValue::Double(self.tval),
-            }];
+        // C `devEpidSoftCallback.c:116` `if (!pepid->pact)` — the
+        // callback pass re-processes to run the PID, never to re-fire.
+        if self.ca_trig == CaTrigPhase::AwaitingCallback {
+            self.ca_trig = CaTrigPhase::Idle;
+            return Vec::new();
         }
-        Vec::new()
+        let write = ProcessAction::WriteDbLink {
+            link_field: "TRIG",
+            value: EpicsValue::Double(self.tval),
+        };
+        match link_field_type(&self.trig) {
+            LinkType::Db => vec![write],
+            LinkType::Ca => {
+                self.ca_trig = CaTrigPhase::AwaitingCallback;
+                vec![
+                    write,
+                    ProcessAction::ReprocessAfter(std::time::Duration::from_millis(1)),
+                ]
+            }
+            // C `ptriglink->type` is CONSTANT/empty: `dbPutLink` to a
+            // constant link is a no-op, and the PID runs in this pass.
+            LinkType::Constant | LinkType::Empty | LinkType::Other => Vec::new(),
+        }
     }
 
     /// Framework report of which `multi_input_links` fetches produced a

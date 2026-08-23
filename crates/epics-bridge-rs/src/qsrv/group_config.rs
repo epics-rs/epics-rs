@@ -229,134 +229,28 @@ pub enum TriggerDef {
     None,
 }
 
-/// Normalize the relaxed JSON dialect that upstream QSRV accepts into
-/// the strict JSON `serde_json` requires.
+/// Normalize a QSRV group body from EPICS's relaxed-JSON dialect into the
+/// strict JSON `serde_json` requires, through the single owner of that
+/// dialect.
 ///
-/// pva2pva enables YAJL `allow_comments` for both external group files
-/// and record `info(Q:group, ...)` bodies (pva2pva
-/// `pdbApp/configparse.cpp:224-254`), and EPICS-base db-file
-/// `info(Q:group, ...)` bodies additionally use unquoted `+`-prefixed
-/// option keys — e.g. `{+channel:"VAL", +putorder:0}` (pva2pva
-/// `testApp/testpdb-groups.db:4-5`) and `+id`/`+type`/`+trigger`
-/// (`iocBoot/iocimagedemo/image.db:38-44`). The shipped `image.json`
-/// example also opens with a C-style block comment
-/// (`iocBoot/iocimagedemo/image.json:1`). All of these are valid for the
-/// reference parser but rejected by strict `serde_json`, so the same
-/// configuration text that loads under pva2pva fails to load here before
-/// any group semantics are reached.
-///
-/// Two string-literal-aware transformations (quoted payloads such as a
-/// channel value `"a/*b*/c"` or `"+notakey"` are never rewritten):
-///   1. replace `/* block */` and `// line` comments with whitespace;
-///   2. wrap bare `+ident` object keys in double quotes.
-///
-/// YAJL treats a comment as a single run of whitespace, so it SEPARATES
-/// the tokens on either side and an unterminated `/* ... */` is a parse
-/// error. The comment is therefore replaced with whitespace rather than
-/// deleted (deleting it with no separator would splice `1/*x*/2` into the
-/// single token `12`, turning input YAJL rejects into a different valid
-/// document), and an unterminated block comment returns an error instead
-/// of being silently stripped to EOF.
-///
-/// Group names and member field names are always quoted in the upstream
-/// dialect, so only `+`-prefixed option keys are ever unquoted; this
-/// keeps the transform minimal rather than guessing at arbitrary bare
-/// keys. The existing typed validation runs unchanged on the parsed
-/// result, so parser leniency never hides an invalid group field.
-fn normalize_relaxed_group_json(src: &str) -> BridgeResult<String> {
-    let chars: Vec<char> = src.chars().collect();
-    let n = chars.len();
-    let mut out = String::with_capacity(src.len());
-    let mut i = 0;
-    while i < n {
-        let c = chars[i];
-        match c {
-            // String literal: copy verbatim, honoring backslash escapes,
-            // so comment markers or `+` inside a quoted value are untouched.
-            '"' => {
-                out.push(c);
-                i += 1;
-                while i < n {
-                    let d = chars[i];
-                    out.push(d);
-                    i += 1;
-                    if d == '\\' {
-                        if i < n {
-                            out.push(chars[i]);
-                            i += 1;
-                        }
-                    } else if d == '"' {
-                        break;
-                    }
-                }
-            }
-            // Block comment `/* ... */`. YAJL treats it as whitespace, so it
-            // SEPARATES the surrounding tokens; emit one space in its place
-            // and fail on a `/*` that never closes (matching YAJL, which
-            // reports a parse error rather than accepting the truncated text).
-            '/' if i + 1 < n && chars[i + 1] == '*' => {
-                i += 2;
-                let mut closed = false;
-                while i + 1 < n {
-                    if chars[i] == '*' && chars[i + 1] == '/' {
-                        i += 2;
-                        closed = true;
-                        break;
-                    }
-                    i += 1;
-                }
-                if !closed {
-                    return Err(BridgeError::GroupConfigError(
-                        "unterminated block comment '/* ... */' in QSRV group JSON".into(),
-                    ));
-                }
-                out.push(' ');
-            }
-            // Line comment `// ...`.
-            '/' if i + 1 < n && chars[i + 1] == '/' => {
-                i += 2;
-                while i < n && chars[i] != '\n' {
-                    i += 1;
-                }
-            }
-            // Bare `+ident` option key → `"+ident"`. Only quoted when an
-            // identifier follows and the next non-space token is `:` (an
-            // object-key position); otherwise emitted verbatim — the
-            // dialect uses a leading `+` exclusively for option keys, so
-            // the else branch is defensive.
-            '+' => {
-                let mut j = i + 1;
-                while j < n && (chars[j].is_ascii_alphanumeric() || chars[j] == '_') {
-                    j += 1;
-                }
-                let mut k = j;
-                while k < n && chars[k].is_whitespace() {
-                    k += 1;
-                }
-                if j > i + 1 && k < n && chars[k] == ':' {
-                    out.push('"');
-                    out.extend(chars[i..j].iter());
-                    out.push('"');
-                    i = j;
-                } else {
-                    out.push(c);
-                    i += 1;
-                }
-            }
-            _ => {
-                out.push(c);
-                i += 1;
-            }
-        }
-    }
-    Ok(out)
+/// Group bodies are not a dialect of their own: pvxs parses them with the very
+/// same `yajl_alloc` handle the `.db` link parser uses
+/// (`ioc/groupconfigprocessor.cpp:825-828`, whose `yajl_config(...,
+/// yajl_allow_comments, 1)` is redundant because `yajl.c:77` already set
+/// `yajl_allow_json5 | yajl_allow_comments`). This crate used to carry a second
+/// partial reader that handled comments but not bare identifier keys, while
+/// `epics_base_rs::json5` handled bare identifier keys but not comments, so each
+/// rejected text the other accepted and both rejected text C accepts.
+fn relaxed_group_json(src: &str) -> BridgeResult<String> {
+    epics_base_rs::json5::relaxed_to_strict(src)
+        .map_err(|e| BridgeError::GroupConfigError(format!("{e} in QSRV group JSON")))
 }
 
 /// Parse group definitions from a JSON string.
 ///
 /// The JSON is a top-level object where each key is a group name.
 pub fn parse_group_config(json: &str) -> BridgeResult<Vec<GroupPvDef>> {
-    let normalized = normalize_relaxed_group_json(json)?;
+    let normalized = relaxed_group_json(json)?;
     let root: HashMap<String, RawGroupDef> = serde_json::from_str(&normalized)
         .map_err(|e| BridgeError::GroupConfigError(e.to_string()))?;
 
@@ -393,7 +287,7 @@ pub fn parse_group_config(json: &str) -> BridgeResult<Vec<GroupPvDef>> {
 /// The `record_name` is used as channel prefix: if `+channel` is a bare field
 /// name (no `:` separator), it becomes `"record_name.FIELD"`.
 pub fn parse_info_group(record_name: &str, json: &str) -> BridgeResult<Vec<GroupPvDef>> {
-    let normalized = normalize_relaxed_group_json(json)?;
+    let normalized = relaxed_group_json(json)?;
     let root: HashMap<String, RawGroupDef> = serde_json::from_str(&normalized)
         .map_err(|e| BridgeError::GroupConfigError(e.to_string()))?;
 
@@ -1338,6 +1232,21 @@ mod tests {
             }
             other => panic!("expected named trigger fields, got {other:?}"),
         }
+    }
+
+    /// BOUNDARY: a bare identifier group key. Group bodies go through the same
+    /// `yajl_alloc` handle as `.db` link bodies
+    /// (`groupconfigprocessor.cpp:825`), whose flags include
+    /// `yajl_allow_json5` (`yajl.c:77`), so an unquoted key is legal at every
+    /// depth — not only the `+`-prefixed option keys. Measured against base's
+    /// yajl compiled standalone: `{expr:"A*B"}` parses.
+    #[test]
+    fn bare_identifier_group_and_field_keys_parse() {
+        let json = r#"{ grp: { fld: { +channel: "X.VAL" } } }"#;
+        let defs = parse_group_config(json).expect("bare identifier keys are JSON5");
+        assert_eq!(defs.len(), 1);
+        assert_eq!(defs[0].name, "grp");
+        assert_eq!(defs[0].members[0].channel, "X.VAL");
     }
 
     /// pva2pva enables YAJL `allow_comments` (pva2pva

@@ -31,8 +31,8 @@ const STRING_FIELD_MAX_LEN: usize = 39;
 /// so a refusal is never a silent success: the record carries SCAN_ALARM /
 /// INVALID with the reason in `AMSG`, and the transition is posted. Every
 /// refusal the port can make routes through here — C's `MAX_LOCK` re-entry and
-/// the port's own `MAX_LINK_DEPTH` / `MAX_LINK_OPS` bounds, which C does not
-/// have at all and which must therefore be at least as audible as C's.
+/// the port's own `MAX_LINK_DEPTH` bound, which C does not have at all and
+/// which must therefore be at least as audible as C's.
 ///
 /// Returns the post set for the caller to hand to `notify_from_snapshot` after
 /// releasing the write guard, or `None` when the record already carries this
@@ -385,24 +385,6 @@ impl AsyncDbHandle {
     }
 }
 
-/// C `dbNotifyAdd`: a will-process PP target (FLNK / OUT) joins the active
-/// put-notify wait-set exactly once, so the completion waits for it. Called
-/// only on the `!pact` (will-process) branch — a busy target sets RPRO and
-/// does not join (matching the pre-fix drop behaviour), and the
-/// `notify.is_none()` guard prevents a double-join when a record is reached
-/// again within the same chain.
-pub(super) fn join_put_notify(
-    target: &mut RecordInstance,
-    src_notify: Option<&Arc<NotifyWaitSet>>,
-) {
-    if target.notify.is_none() {
-        if let Some(ws) = src_notify {
-            target.notify = Some(ws.clone());
-            ws.enter();
-        }
-    }
-}
-
 /// C `dbNotifyCompletion`: this record finished its contribution to the
 /// put-notify (sync completion, async completion, or SDIS-disable bail).
 /// Take its wait-set membership and leave — the completion oneshot fires on
@@ -540,15 +522,54 @@ pub(crate) fn alarm_field_posts(
     posts
 }
 
-/// The source record's put-propagation context for the forward-link tail.
+/// What one process cycle hands to its forward-link tail.
+///
 /// C `processTarget` (dbDbLink.c:460-474) carries `psrc->putf` and
 /// `psrc->ppn` to each target as a unit — the PUTF bit and the put-notify
-/// wait-set always travel together. Bundled so the tail threads one
-/// snapshot instead of a `(putf, notify)` pair.
+/// wait-set always travel together — and the CP/CPP dispatch at the same tail
+/// needs what the cycle PUBLISHED (see [`CyclePosts`]). Bundled so the tail
+/// threads one value rather than three loose arguments.
 #[derive(Clone, Copy)]
-struct PutNotifyCtx<'a> {
+struct TailCtx<'a> {
     putf: bool,
     notify: Option<&'a Arc<NotifyWaitSet>>,
+    posts: CyclePosts,
+}
+
+/// What one process cycle published to monitors: the union of every `DBE_*`
+/// class it posted, across the value snapshot and the `recGblResetAlarms`
+/// fields.
+///
+/// This exists so the CP/CPP trigger reads a *post*, never a *process*. C
+/// serves every CP/CPP link — local target or not — through a CA
+/// subscription taken with `DBE_VALUE | DBE_ALARM` (`dbCa.c:1290-1294` →
+/// `cadef.h:2010-2011`), and only its `eventCallback` adds `CA_DBPROCESS`
+/// (`dbCa.c:1005-1012`, run at `:1313-1320`). A cycle that posts nothing —
+/// an unchanged value inside `MDEL`, no alarm movement — therefore leaves
+/// the holder unprocessed. Passing this value into the forward-link tail is
+/// what makes "dispatch a CP edge without a post" unrepresentable at the
+/// call site: there is no argument-less way to reach
+/// [`PvDatabase::dispatch_cp_targets`].
+#[derive(Clone, Copy)]
+struct CyclePosts(crate::server::recgbl::EventMask);
+
+impl CyclePosts {
+    /// The classes a value snapshot published.
+    fn of(snapshot: &crate::server::record::ProcessSnapshot) -> Self {
+        Self(snapshot.published_mask())
+    }
+
+    /// Fold in one more posted field (the `recGblResetAlarms` posts, which
+    /// are emitted outside the snapshot).
+    fn with(self, mask: crate::server::recgbl::EventMask) -> Self {
+        Self(self.0 | mask)
+    }
+
+    /// True when this cycle published a class a CP/CPP subscription selects.
+    fn triggers_cp(self) -> bool {
+        use crate::server::recgbl::EventMask;
+        self.0.intersects(EventMask::VALUE | EventMask::ALARM)
+    }
 }
 
 /// Result of the simulation-mode check.
@@ -572,7 +593,11 @@ enum SimOutcome {
     /// (`readValue` precedes the body). The caller must still run the
     /// forward-link / CP / RPRO tail exactly as `recGblFwdLink` does for a
     /// real process cycle, but skips the (already-substituted) body.
-    Simulated,
+    ///
+    /// Carries the cycle's [`CyclePosts`] because `sim_process_tail` already
+    /// published this cycle's monitors here; only this arm has a post set to
+    /// report, which is why it is on the variant rather than on the tuple.
+    Simulated(CyclePosts),
     /// Simulated record whose simulation replaces only the INPUT STAGE of its
     /// body ([`Record::simulation_substitutes_input_stage`](crate::server::record::Record::simulation_substitutes_input_stage)) — swait. The SIOL
     /// read, the `VAL = SVAL` / `UDF = FALSE` write and the SIMM_ALARM raise
@@ -806,10 +831,80 @@ impl PvDatabase {
         visited: &mut HashSet<String>,
         depth: usize,
     ) -> CaResult<()> {
+        self.run_process_frame(name, visited, depth, false, false, false)
+    }
+
+    /// One record's process frame: entry bookkeeping, the optional advisory
+    /// write gate, the cycle, and the unwind that takes this frame's cycle
+    /// marker back out of `visited`.
+    ///
+    /// **Invariant:** a name is in `visited` exactly while its frame is on the
+    /// CURRENT PROCESS STACK — never "somewhere earlier in this cascade".
+    /// Both of C's equivalents are stack conditions and nothing else:
+    /// `processTarget` claims `procThread` at `dbDbLink.c:502-504` and clears
+    /// it at `:521-526`, around one `dbProcess`; `dbProcess` itself tests
+    /// `precord->pact` (`dbAccess.c:537`), set for the duration of a cycle.
+    /// There is no set of already-processed records anywhere in C, and
+    /// `dbProcess(pdst)` at `dbDbLink.c:511` is unconditional.
+    ///
+    /// **Owner/gate:** this function. [`Self::process_entry_prelude`]
+    /// returning `Some` means THIS frame inserted the name, and this is the
+    /// only place that takes it out again. A `Some` returning through any
+    /// other path would leave a marker outliving the stack it describes, and
+    /// the guard would start refusing records C processes again — which is
+    /// exactly what a diamond FLNK (`F` → `A`,`B`; `A` → `C`; `B` → `C`) hit.
+    fn run_process_frame(
+        &self,
+        name: &str,
+        visited: &mut HashSet<String>,
+        depth: usize,
+        acquire_gate: bool,
+        is_continuation: bool,
+        device_callback: bool,
+    ) -> CaResult<()> {
+        // A `None` here never inserted (the depth bound returns above the
+        // insert) or found the name already present, in which case the marker
+        // is the outer frame's — either way there is nothing to unwind.
         let Some((name, rec)) = self.process_entry_prelude(name, visited, depth)? else {
             return Ok(());
         };
-        self.process_record_with_links_body(&name, &rec, visited, depth, false, false)
+
+        // advisory write gate (`dbScanLock(precord)` analogue).
+        // A foreign full-processing entry (scan loop, scan_event, FLNK
+        // dispatch from another chain, CA put, PINI/startup) acquires
+        // the entry record's gate so it cannot interleave with a QSRV
+        // atomic group or a pvalink atomic scan epoch holding
+        // `lock_records` over the same record. `name` is already the
+        // alias-resolved canonical name, the same key `lock_records`
+        // uses. Not acquired when `acquire_gate` is false: either a
+        // transaction owner already holds the gate via `lock_records`
+        // (`process_record_with_links_already_locked`), or this is a
+        // recursive FLNK/OUT/CP call within one chain
+        // (`process_record_with_links_recursive`) — C `processTarget`
+        // processes a link target under the lock set the caller already
+        // owns, and re-acquiring would deadlock the non-reentrant gate.
+        let _record_gate = if acquire_gate {
+            Some(self.lock_record(&name))
+        } else {
+            None
+        };
+
+        // NO `.await` may appear below this line while `_record_gate` is
+        // live — see the module note on `process_record_with_links_body`.
+        let result = self.process_record_with_links_body(
+            &name,
+            &rec,
+            visited,
+            depth,
+            is_continuation,
+            device_callback,
+        );
+
+        // The unwind. C `dbDbLink.c:521-526`, `if (claim_dst)
+        // dbRec2Pvt(pdst)->procThread = NULL;` — after `dbProcess`, whatever
+        // it returned.
+        visited.remove(&name);
+        result
     }
 
     /// recursive FLNK / OUT / CP fan-out entry within a single
@@ -830,10 +925,7 @@ impl PvDatabase {
         visited: &mut HashSet<String>,
         depth: usize,
     ) -> CaResult<()> {
-        let Some((name, rec)) = self.process_entry_prelude(name, visited, depth)? else {
-            return Ok(());
-        };
-        self.process_record_with_links_body(&name, &rec, visited, depth, false, false)
+        self.run_process_frame(name, visited, depth, false, false, false)
     }
 
     /// Owner-driven continuation re-entry — bypasses the PACT entry guard.
@@ -1335,7 +1427,6 @@ impl PvDatabase {
         depth: usize,
     ) -> CaResult<Option<(String, Arc<parking_lot::RwLock<RecordInstance>>)>> {
         const MAX_LINK_DEPTH: usize = 16;
-        const MAX_LINK_OPS: usize = 256;
 
         // Normalise to the canonical record name once at entry — both
         // for cycle-detection (`visited` would otherwise treat alias
@@ -1347,22 +1438,25 @@ impl PvDatabase {
             return self
                 .refuse_bounded_entry(&name, &format!("link chain depth limit {MAX_LINK_DEPTH}"));
         }
-        if visited.len() >= MAX_LINK_OPS {
-            return self
-                .refuse_bounded_entry(&name, &format!("link chain ops limit {MAX_LINK_OPS}"));
-        }
         let rec = {
             let records = self.inner.records.read();
             records.get(&name).cloned()
         };
 
         if !visited.insert(name.clone()) {
-            // C has no counterpart to raise here: `processTarget`
-            // (`dbDbLink.c:436`) stops a cycle with `psrc->pact = TRUE` and
-            // `dbProcess` returns 0 for an already-active record without any
-            // alarm until MAX_LOCK. Re-reaching a record inside one cascade is
-            // ordinary FLNK-graph shape, not a refusal, so this stays SILENT —
-            // but silent is about the alarm, not about the wait-set.
+            // The name is already on the CURRENT STACK, so this is a genuine
+            // cycle: C's `processTarget` would find `procThread == self` and
+            // its `psrc->pact = TRUE` (`dbDbLink.c:456`) would make
+            // `dbProcess` return without running the record
+            // (`dbAccess.c:537`). Silent, like C's, and the marker belongs to
+            // the OUTER frame — only that frame may remove it, which is why
+            // this path must not.
+            //
+            // Re-reaching a record that has already FINISHED elsewhere in the
+            // cascade is a different thing entirely and does NOT arrive here:
+            // its frame took its marker back out on unwind, so the diamond
+            // processes twice exactly as C's unconditional
+            // `dbProcess(pdst)` (`dbDbLink.c:511`) does.
             return self.entry_did_not_run(rec.as_ref());
         }
 
@@ -1505,37 +1599,11 @@ impl PvDatabase {
         // Always `false` for client/FLNK/scan entries.
         device_callback: bool,
     ) -> CaResult<()> {
-        let Some((name, rec)) = self.process_entry_prelude(name, visited, depth)? else {
-            return Ok(());
-        };
-
-        // advisory write gate (`dbScanLock(precord)` analogue).
-        // A foreign full-processing entry (scan loop, scan_event, FLNK
-        // dispatch from another chain, CA put, PINI/startup) acquires
-        // the entry record's gate so it cannot interleave with a QSRV
-        // atomic group or a pvalink atomic scan epoch holding
-        // `lock_records` over the same record. `name` is already the
-        // alias-resolved canonical name, the same key `lock_records`
-        // uses. Not acquired when `acquire_gate` is false: either a
-        // transaction owner already holds the gate via `lock_records`
-        // (`process_record_with_links_already_locked`), or this is a
-        // recursive FLNK/OUT/CP call within one chain
-        // (`process_record_with_links_recursive`) — C `processTarget`
-        // processes a link target under the lock set the caller already
-        // owns, and re-acquiring would deadlock the non-reentrant gate.
-        let _record_gate = if acquire_gate {
-            Some(self.lock_record(&name))
-        } else {
-            None
-        };
-
-        // NO `.await` may appear below this line while `_record_gate` is
-        // live — see the module note on `process_record_with_links_body`.
-        self.process_record_with_links_body(
-            &name,
-            &rec,
+        self.run_process_frame(
+            name,
             visited,
             depth,
+            acquire_gate,
             is_continuation,
             device_callback,
         )
@@ -1580,9 +1648,11 @@ impl PvDatabase {
         // CA put_notify on PUTF) would re-enter `record.process()` while the
         // device's first response is still in flight — corrupting the
         // record's internal state machine and bypassing the C-parity
-        // contract that callers see for `dbProcess`. The pre-existing
-        // `dispatch_cp_targets` path already did this check (sets RPRO=true
-        // and skips); the main entry was missing it.
+        // contract that callers see for `dbProcess`. This is the ONLY place
+        // the port decides what an active record does with a foreign process
+        // request; `process_one_cp_target` used to pre-empt it with an
+        // RPRO-and-skip of its own, which is how a starved CP target got an
+        // extra device write instead of C's SCAN_ALARM.
         if !is_continuation {
             const MAX_LOCK: i16 = 10;
             let mut instance = rec.write();
@@ -1879,8 +1949,8 @@ impl PvDatabase {
         let (sim_outcome, sim_pact_exit) = self.check_simulation_mode(&rec);
         let sim_output = match sim_outcome {
             SimOutcome::NotSimulated => None,
-            SimOutcome::Simulated => {
-                self.run_forward_link_tail(name, &rec, visited, depth);
+            SimOutcome::Simulated(posts) => {
+                self.run_forward_link_tail(name, &rec, posts, visited, depth);
                 self.end_process_cycle(name, &rec, sim_pact_exit);
                 return Ok(());
             }
@@ -1903,11 +1973,11 @@ impl PvDatabase {
                     // already pending; commit it, post the monitors and fire the
                     // forward link — C `process()` runs `checkAlarms`,
                     // `monitor()` and `recGblFwdLink()` regardless of the -1.
-                    {
+                    let posts = {
                         let mut instance = rec.write();
-                        sim_process_tail(&mut instance, false);
-                    }
-                    self.run_forward_link_tail(name, &rec, visited, depth);
+                        sim_process_tail(&mut instance, false)
+                    };
+                    self.run_forward_link_tail(name, &rec, posts, visited, depth);
                     self.end_process_cycle(name, &rec, sim_pact_exit);
                     return Ok(());
                 }
@@ -1932,10 +2002,10 @@ impl PvDatabase {
                     instance.enter_pact();
                 }
                 self.schedule_delayed_reprocess(name, delay);
-                // This arm is reachable only with PACT clear on entry, so the
-                // exit is empty; consume it through the single owner anyway so
+                // This arm is reachable only with PACT clear on entry, so nothing
+                // can be queued; run the check through the single owner anyway so
                 // no path drops a token blind.
-                self.apply_pact_exit(name, sim_pact_exit);
+                self.apply_pact_exit(name, &rec, sim_pact_exit);
                 return Ok(());
             }
             SimOutcome::RedirectOutputToSiol {
@@ -2980,10 +3050,10 @@ impl PvDatabase {
                 // But still execute any actions (e.g., ReprocessAfter for delayed re-entry).
                 self.execute_process_actions(name, &rec, process_actions, visited, depth);
                 // The SIM continuation released the SDLY PACT and the body then
-                // went async again: replay the parked put through the single
-                // consumer, which re-parks it on the new PACT window (the
+                // went async again: still run the restart check, which finds the
+                // record busy again and leaves the queue head where it is (the
                 // deferral is closed under its own restart).
-                self.apply_pact_exit(name, sim_pact_exit);
+                self.apply_pact_exit(name, &rec, sim_pact_exit);
                 return Ok(());
             }
             if process_result == crate::server::record::RecordProcessResult::CompleteNoEmit {
@@ -3006,9 +3076,9 @@ impl PvDatabase {
                     process_actions.is_empty(),
                     "CompleteNoEmit must carry no process actions"
                 );
-                // The record is idle (this path sets no PACT), so a put parked
+                // The record is idle (this path sets no PACT), so a notify queued
                 // on a released SDLY window replays straight away.
-                self.apply_pact_exit(name, sim_pact_exit);
+                self.apply_pact_exit(name, &rec, sim_pact_exit);
                 return Ok(());
             }
             if let crate::server::record::RecordProcessResult::AsyncPendingNotify(fields) =
@@ -3116,9 +3186,9 @@ impl PvDatabase {
                     inst.notify_from_snapshot(&snapshot);
                 }
                 self.execute_process_actions(name, &rec, deferred_actions, visited, depth);
-                // Same as the `AsyncPending` arm: hand the parked put back to the
-                // single consumer, which re-parks it if this pass re-took PACT.
-                self.apply_pact_exit(name, sim_pact_exit);
+                // Same as the `AsyncPending` arm: run the restart check through the
+                // single drain owner, which is a no-op if this pass re-took PACT.
+                self.apply_pact_exit(name, &rec, sim_pact_exit);
                 return Ok(());
             }
 
@@ -3146,13 +3216,12 @@ impl PvDatabase {
             // before the OUT/FLNK tail) mirrors the C ordering where
             // `pact` is already `FALSE` when `recGblFwdLink` runs.
             //
-            // The release hands back the put-notify parked on this PACT window
-            // (`PactExit`); it is carried to this cycle's `recGblFwdLink` tail
-            // below, where C queues the restart (`recGbl.c:295` →
-            // `dbNotifyCompletion`). Replaying it here instead — at the
-            // `pact = FALSE` store, before the OUT/FLNK tail — would let the
-            // replayed put process the record concurrently with the tail it is
-            // still running.
+            // The release is carried to this cycle's `recGblFwdLink` tail below
+            // as the `PactExit`, which is where C runs the restart check
+            // (`recGbl.c:295` → `dbNotifyCompletion` → `restartCheck`).
+            // Restarting at the `pact = FALSE` store instead — before the
+            // OUT/FLNK tail — would let the replayed put process the record
+            // concurrently with the tail it is still running.
             // Segment C (guarded): the alarm / UDF / timestamp epilogue, the IVOA
             // output veto, and the output-time-link read list. Re-acquire the data
             // lock (Segments A/B committed their writes under their own guards).
@@ -3162,7 +3231,7 @@ impl PvDatabase {
                 let continuation_pact_exit = if is_continuation {
                     instance.leave_pact()
                 } else {
-                    crate::server::record::PactExit::none()
+                    instance.pact_exit_without_release()
                 };
 
                 // NOTE: the MS-class input-link alarm propagation
@@ -3742,7 +3811,7 @@ impl PvDatabase {
             // chain cannot complete ahead of it.
             if dispatched.went_async {
                 self.execute_process_actions(name, &rec, process_actions, visited, depth);
-                self.apply_pact_exit(name, sim_pact_exit);
+                self.apply_pact_exit(name, &rec, sim_pact_exit);
                 return Ok(());
             }
             let push_alarm = dispatched.alarm;
@@ -3868,7 +3937,7 @@ impl PvDatabase {
         };
 
         // 3. Notify subscribers (outside lock)
-        {
+        let posts = {
             // Write guard: a value-class post advances the record's
             // already-published state (`RecordInstance::record_value_post`),
             // so posting is a `&mut` operation.
@@ -3876,10 +3945,13 @@ impl PvDatabase {
             instance.notify_from_snapshot(&snapshot);
             // Post the alarm fields (SEVR/STAT/AMSG/ACKS) with their
             // individual C masks — see recGblResetAlarms above.
+            let mut posts = CyclePosts::of(&snapshot);
             for &(field, mask) in &alarm_posts {
                 instance.notify_field(field, mask);
+                posts = posts.with(mask);
             }
-        }
+            posts
+        };
 
         // C `swaitRecord.c::process` (lines 425-481): `schedOutput` armed the
         // ODLY watchdog (`async=TRUE`), so `process` ran `monitor()` — the
@@ -3937,9 +4009,10 @@ impl PvDatabase {
                 name,
                 &rec,
                 flnk_name.as_deref(),
-                PutNotifyCtx {
+                TailCtx {
                     putf: src_putf,
                     notify: src_notify.as_ref(),
+                    posts,
                 },
                 visited,
                 depth,
@@ -4033,24 +4106,41 @@ impl PvDatabase {
                 complete_put_notify(&mut guard);
             }
         }
-        self.apply_pact_exit(name, exit);
+        self.apply_pact_exit(name, rec, exit);
     }
 
-    /// The single consumer of a [`PactExit`] — C `dbNotifyCompletion`'s restart
-    /// arm (`dbNotify.c:466-469`), reached from `recGblFwdLink` (`recGbl.c:295`)
-    /// at the tail of the cycle that released PACT.
+    /// C `restartCheck` (`dbNotify.c:149-170`), reached from
+    /// `dbNotifyCompletion` (`:445-475`) via `recGblFwdLink` (`recGbl.c:295`)
+    /// at the tail of the cycle that released the record.
     ///
-    /// Queued, not recursed — the same `scanOnce` shape as the RPRO restart. The
-    /// replay takes the record's advisory write gate, which no process path
-    /// holds.
-    fn apply_pact_exit(&self, name: &str, exit: PactExit) {
-        let Some(put) = exit.into_deferred() else {
+    /// **The single owner of the restart-list drain.** Every cycle end routes
+    /// through it — including cycles that released no PACT, because a notify
+    /// queued behind an in-flight wait-set on an idle record is freed by
+    /// `complete_put_notify` above, not by a PACT release.
+    ///
+    /// Queued, not recursed — the same `scanOnce` shape as the RPRO restart.
+    /// The pop itself happens inside `restart_next_notify_put`, under the
+    /// record's advisory write gate, so a client put racing this spawn cannot
+    /// take the record between the pop and the replay and thereby overtake a
+    /// notify that has been waiting longer.
+    pub(super) fn apply_pact_exit(
+        &self,
+        name: &str,
+        _rec: &Arc<parking_lot::RwLock<RecordInstance>>,
+        exit: PactExit,
+    ) {
+        // NO record lock here, deliberately. This runs from cycle tails and
+        // from a `Drop` that can fire while a `rec.write()` guard is still
+        // alive in the same scope; parking_lot is not reentrant, so a read
+        // here would deadlock on drop order. The bit was minted under the
+        // releasing site's own lock instead — see `PactExit`.
+        if !exit.restart_pending() {
             return;
-        };
+        }
         let db = self.clone();
         let put_name = name.to_string();
         crate::runtime::task::spawn(async move {
-            db.restart_deferred_notify_put(&put_name, put).await;
+            db.restart_next_notify_put(&put_name).await;
         });
     }
 
@@ -4069,6 +4159,7 @@ impl PvDatabase {
         &self,
         name: &str,
         rec: &Arc<parking_lot::RwLock<RecordInstance>>,
+        posts: CyclePosts,
         visited: &mut std::collections::HashSet<String>,
         depth: usize,
     ) {
@@ -4089,9 +4180,10 @@ impl PvDatabase {
             name,
             rec,
             flnk_name.as_deref(),
-            PutNotifyCtx {
+            TailCtx {
                 putf: src_putf,
                 notify: src_notify.as_ref(),
+                posts,
             },
             visited,
             depth,
@@ -4108,7 +4200,7 @@ impl PvDatabase {
         name: &str,
         rec: &Arc<parking_lot::RwLock<RecordInstance>>,
         flnk_name: Option<&str>,
-        src: PutNotifyCtx<'_>,
+        src: TailCtx<'_>,
         visited: &mut std::collections::HashSet<String>,
         depth: usize,
     ) {
@@ -4156,8 +4248,10 @@ impl PvDatabase {
         // single owner.
         self.dispatch_external_forward_link(rec);
 
-        // 6. CP link targets -- process records that have CP input links from this record
-        self.dispatch_cp_targets(name, visited, depth);
+        // 6. CP link targets -- holders of a CP/CPP link on this record,
+        // driven by what this cycle POSTED (see `CyclePosts`), not by the
+        // fact that it processed.
+        self.dispatch_cp_targets(name, src.posts, visited, depth);
 
         // 7. RPRO: if reprocess requested, clear flag and queue a
         // fresh process pass.
@@ -4169,11 +4263,13 @@ impl PvDatabase {
         // NOT recurse inline within the current link chain.
         //
         // Spawning a detached task is the Rust equivalent of the
-        // scanOnce queue: the reprocess runs with a clean (empty)
-        // `visited` set and starts at depth 0, so it cannot be
-        // silently skipped by the current chain's cycle guard nor hit
-        // the MAX_LINK_DEPTH / MAX_LINK_OPS budget the current chain
-        // has already consumed.
+        // scanOnce queue: the reprocess runs on its own task, so it must
+        // carry its own `visited` and start at depth 0 — the current
+        // chain's set is a `&mut` local to that stack and cannot be
+        // shared. That is now the ONLY reason for the fresh set. It used
+        // to be doing double duty as an escape hatch from the cycle
+        // guard, which over-blocked; the guard is frame-scoped now
+        // ([`Self::run_process_frame`]), so there is nothing to escape.
         {
             let needs_rpro = {
                 let mut instance = rec.write();
@@ -4716,15 +4812,18 @@ impl PvDatabase {
         };
 
         // Seed the cycle guard with this record's own name — mirrors
-        // the synchronous main path (`process_record_with_links_inner`
-        // does `visited.insert(name)` before the body). Without this
+        // the synchronous main path ([`Self::run_process_frame`] does
+        // `visited.insert(name)` before the body). Without this
         // the async-completion FLNK / OUT / CP dispatch can re-enter
         // the just-completed record: an async FLNK chain that loops
         // back (A async -> completes -> FLNK -> B -> FLNK -> A) would
         // re-process A unbounded, because PACT is cleared below before
         // the FLNK dispatch and nothing else blocks the re-entry.
+        //
+        // This is a frame like any other, so it owes the same unwind at the
+        // tail — see the invariant on [`Self::run_process_frame`].
         if !visited.insert(name.to_string()) {
-            return Ok(()); // Cycle detected, skip
+            return Ok(()); // Already on this stack, skip
         }
 
         let (snapshot, flnk_name, alarm_posts, pact_exit) = {
@@ -5026,7 +5125,7 @@ impl PvDatabase {
         };
 
         // Notify subscribers
-        {
+        let posts = {
             // Write guard: a value-class post advances the record's
             // already-published state (`RecordInstance::record_value_post`),
             // so posting is a `&mut` operation.
@@ -5034,10 +5133,13 @@ impl PvDatabase {
             instance.notify_from_snapshot(&snapshot);
             // Post the alarm fields (SEVR/STAT/AMSG/ACKS) with their
             // individual C masks — see recGblResetAlarms above.
+            let mut posts = CyclePosts::of(&snapshot);
             for &(field, mask) in &alarm_posts {
                 instance.notify_field(field, mask);
+                posts = posts.with(mask);
             }
-        }
+            posts
+        };
 
         // Snapshot source PUTF + put-notify wait-set for processTarget /
         // dbNotifyAdd propagation (see `write_db_link_value` doc). For the
@@ -5094,8 +5196,9 @@ impl PvDatabase {
         // names a local DB target.
         self.dispatch_external_forward_link(&rec);
 
-        // CP link targets
-        self.dispatch_cp_targets(name, visited, depth);
+        // CP link targets — gated on what this cycle posted, as on the
+        // synchronous tail.
+        self.dispatch_cp_targets(name, posts, visited, depth);
 
         // RPRO: C `recGblFwdLink` consumes a pending reprocess via
         // `scanOnce` — queued, not recursed. Mirror the synchronous
@@ -5150,43 +5253,75 @@ impl PvDatabase {
             complete_put_notify(&mut guard);
         }
 
-        // C `dbNotifyCompletion` (dbNotify.c:466-469): a put-notify that arrived
-        // while this record was PACT wrote nothing and parked on the window. The
-        // window's release handed it to us as the `PactExit`; PACT is clear and
-        // this cycle's wait-set has drained, so the record is now the idle record
-        // that put was meant to see — replay it whole (value + process +
-        // callback), through the single consumer.
-        self.apply_pact_exit(name, pact_exit);
+        // C `dbNotifyCompletion` (dbNotify.c:459-470) → `restartCheck`: the
+        // put-notifies that arrived while this record was PACT wrote nothing and
+        // queued. PACT is clear and this cycle's wait-set has drained, so the
+        // record is now the idle record the queue head was meant to see — replay
+        // it whole (value + process + callback), through the single drain owner.
+        self.apply_pact_exit(name, &rec, pact_exit);
 
+        // The unwind for the seed above: this frame is leaving the stack, so
+        // its marker goes with it (C `dbDbLink.c:521-526`).
+        visited.remove(name);
         Ok(())
     }
 
-    /// Dispatch CP-link targets that take a CP/CPP input link from `name`.
+    /// Dispatch CP-link targets that take a CP/CPP input link from `name`,
+    /// when this cycle published a class the CP subscription selects.
     ///
-    /// C parity (a4bc0db): the CP-driven dispatch is the moral equivalent of
-    /// dbCaTask's CA_DBPROCESS handler invoking `db_process(prec)`. Before
-    /// processing each target, set PUTF=true; if the target is already
-    /// processing (async record mid-flight), set RPRO=true instead so the
-    /// in-flight pass reprocesses on completion. Already-visited targets
-    /// (current process chain) are skipped via the `visited` cycle guard.
+    /// **The trigger is a monitor post, never a process.** C serves every
+    /// CP/CPP link as a CA link — `dbInitLink` tests the modifier BEFORE
+    /// locality and short-circuits `dbDbInitLink` entirely, so a CP link to a
+    /// record in this very IOC is still a CA link (`dbLink.c:118-122`; the
+    /// `isLocal` at `:128` is computed only to pick the init-callback hint).
+    /// That subscription is taken with `DBE_VALUE | DBE_ALARM`
+    /// (`dbCa.c:1290-1294` → `cadef.h:2010-2011`), and only its
+    /// `eventCallback` adds `CA_DBPROCESS` (`dbCa.c:1005-1012`), which the
+    /// worker runs as a bare `db_process` (`:1313-1320`). A source cycle that
+    /// posts nothing — an unchanged value inside `MDEL`, no alarm movement —
+    /// therefore leaves every CP holder unprocessed.
+    ///
+    /// The port keeps a local CP target as a `Db` link rather than routing it
+    /// through the CA client (the `ca` link set lives in another crate and is
+    /// optional, so C's literal structure would silently disable local CP
+    /// links in a bare `epics-base-rs` IOC). `posts` is what restores the C
+    /// rule on top of that shape: the same `DBE_VALUE|DBE_ALARM` gate the
+    /// cross-IOC path gets from its remote monitor
+    /// ([`Self::dispatch_external_cp_targets`]), so "CP dispatch" means one
+    /// thing on both paths.
+    ///
+    /// The dispatch itself is the moral equivalent of dbCaTask's
+    /// `CA_DBPROCESS` handler invoking `db_process(prec)` and nothing else —
+    /// no PUTF, no RPRO. Already-visited targets (current process chain) are
+    /// skipped via the `visited` cycle guard.
     fn dispatch_cp_targets(
         &self,
         name: &str,
+        posts: CyclePosts,
         visited: &mut std::collections::HashSet<String>,
         depth: usize,
     ) {
+        if !posts.triggers_cp() {
+            return;
+        }
         let cp_targets = self.get_cp_targets(name);
         for target in cp_targets {
             self.process_one_cp_target(&target, visited, depth);
         }
     }
 
-    /// Process a single CP/CPP target edge, applying the CPP passive gate
-    /// and the PACT/RPRO pre-check. This is the single owner of the
-    /// scan-time CP-dispatch decision, shared by the local-source path
-    /// ([`Self::dispatch_cp_targets`]) and the cross-IOC path
-    /// ([`Self::dispatch_external_cp_targets`]) so both honour the same
-    /// `dbCa.c` semantics.
+    /// Process a single CP/CPP target edge, applying the CPP passive gate.
+    /// This is the single owner of the scan-time CP-dispatch decision, shared
+    /// by the local-source path ([`Self::dispatch_cp_targets`]) and the
+    /// cross-IOC path ([`Self::dispatch_external_cp_targets`]) so both honour
+    /// the same `dbCa.c` semantics.
+    ///
+    /// The passive gate is the ONLY thing decided here. C's `CA_DBPROCESS`
+    /// worker (`dbCa.c:1314-1320`) is bare `dbScanLock` / `db_process` /
+    /// `dbScanUnlock`, so an active target is handled by `dbProcess` itself —
+    /// which the port models once, in the PACT entry guard of
+    /// [`Self::process_record_with_links_body`]. Deciding PACT a second time
+    /// here is what let this path diverge from that owner.
     fn process_one_cp_target(
         &self,
         target: &super::CpTarget,
@@ -5200,27 +5335,23 @@ impl PvDatabase {
             let records = self.inner.records.read();
             records.get(&target.record).cloned()
         };
-        let mut skip = false;
-        if let Some(ref t) = target_rec {
-            let mut tg = t.write();
-            if target.passive_only && tg.common.scan != crate::server::record::ScanType::Passive {
-                // CPP gate (`dbCa.c:854,994,1072`): a CPP link adds
-                // `CA_DBPROCESS` only when the link-holder's SCAN is
-                // Passive. A non-Passive target is reached by its own
-                // periodic/event scan, so skip it here — no process,
-                // no RPRO. A CP link (`passive_only == false`) never
-                // takes this branch and always processes.
-                skip = true;
-            } else if tg.is_processing() {
-                tg.common.rpro = 1;
-                skip = true;
+        let skip = match target_rec {
+            // CPP gate (`dbCa.c:854,994,1072`): a CPP link adds
+            // `CA_DBPROCESS` only when the link-holder's SCAN is Passive. A
+            // non-Passive target is reached by its own periodic/event scan, so
+            // it is not dispatched here. A CP link (`passive_only == false`)
+            // never takes this branch and always dispatches.
+            //
+            // epics-base PR #3fb10b6: PUTF must remain false on CP-driven
+            // targets — only the record directly receiving the dbPut reports
+            // PUTF=1 to dbNotify/onChange observers, so we deliberately do NOT
+            // set PUTF here.
+            Some(t) => {
+                let tg = t.read();
+                target.passive_only && tg.common.scan != crate::server::record::ScanType::Passive
             }
-            // else (not processing): fall through and process below.
-            // epics-base PR #3fb10b6: PUTF must remain false on
-            // CP-driven targets — only the record directly receiving
-            // the dbPut reports PUTF=1 to dbNotify/onChange observers,
-            // so we deliberately do NOT set PUTF here.
-        }
+            None => false,
+        };
         if skip {
             return;
         }
@@ -5944,7 +6075,11 @@ impl PvDatabase {
             // record, because an unset SIOL is exactly the case C serves from
             // SVAL (R12-61).
             if instance.record.get_field("SIMM").is_none() {
-                return (SimOutcome::NotSimulated, PactExit::none()); // no simulation block
+                // no simulation block
+                return (
+                    SimOutcome::NotSimulated,
+                    instance.pact_exit_without_release(),
+                );
             }
 
             let siml_parsed = crate::server::record::parse_link_v2(siml.as_str_lossy().as_ref());
@@ -6012,7 +6147,8 @@ impl PvDatabase {
                 };
                 if aborts {
                     // Reachable only under `!pact_held`, so no PACT to release.
-                    return (SimOutcome::AbortedBeforeWrite, PactExit::none());
+                    let exit = rec.read().pact_exit_without_release();
+                    return (SimOutcome::AbortedBeforeWrite, exit);
                 }
             }
         }
@@ -6028,7 +6164,8 @@ impl PvDatabase {
         if !mode.is_simulated() {
             // PACT, if held, belongs to the continuation arm of the uniform
             // body — released there, with its park.
-            return (SimOutcome::NotSimulated, PactExit::none()); // menuSimmNO
+            let exit = rec.read().pact_exit_without_release();
+            return (SimOutcome::NotSimulated, exit); // menuSimmNO
         }
 
         // C `default:` arm — `recGblSetSevr(prec, SOFT_ALARM, INVALID_ALARM)`
@@ -6059,7 +6196,7 @@ impl PvDatabase {
             let exit = if pact_held {
                 instance.leave_pact()
             } else {
-                PactExit::none()
+                instance.pact_exit_without_release()
             };
             let is_output = !is_input;
             drop(instance);
@@ -6088,9 +6225,10 @@ impl PvDatabase {
         // the synchronous branch below.
         if !pact_held && sdly >= 0.0 {
             // Reachable only under `!pact_held`: this is the arm that TAKES PACT.
+            let exit = rec.read().pact_exit_without_release();
             return (
                 SimOutcome::DeferRead(std::time::Duration::from_secs_f64(sdly)),
-                PactExit::none(),
+                exit,
             );
         }
 
@@ -6150,8 +6288,11 @@ impl PvDatabase {
                 sev,
             );
             // swait keeps the cycle going through the uniform body; a held PACT
-            // is released at its continuation arm, with its park.
-            return (SimOutcome::SimulatedInputStage, PactExit::none());
+            // is released at its continuation arm, with its park. Mint the
+            // token from the write guard already held — parking_lot is not
+            // reentrant, so a fresh `rec.read()` here deadlocks.
+            let exit = instance.pact_exit_without_release();
+            return (SimOutcome::SimulatedInputStage, exit);
         }
 
         // OUTPUT record: C `writeValue` substitutes the device write with the
@@ -6169,7 +6310,7 @@ impl PvDatabase {
                 let mut instance = rec.write();
                 instance.leave_pact()
             } else {
-                PactExit::none()
+                rec.read().pact_exit_without_release()
             };
             return (
                 SimOutcome::RedirectOutputToSiol {
@@ -6196,7 +6337,7 @@ impl PvDatabase {
         // write follows the body), so only an INPUT record reaches here — its
         // `readValue` precedes the body, so the SIOL read + convert are done
         // in place and the caller short-circuits.
-        {
+        let sim_posts = {
             // C `readValue` raises the SIMM severity at the TOP of the
             // `case menuYesNoYES:` arm — BEFORE the SIOL read
             // (`longinRecord.c:414` `recGblSetSevr(prec, SIMM_ALARM, prec->sims)`,
@@ -6350,8 +6491,8 @@ impl PvDatabase {
             // having landed (R12-61). UDF is the one part C does gate on the
             // read's status (`if (status == 0) prec->udf = FALSE`), and a
             // constant SIOL is status 0.
-            sim_process_tail(&mut instance, fetch.is_ok());
-        }
+            sim_process_tail(&mut instance, fetch.is_ok())
+        };
 
         // C `readValue`/`writeValue` clears `pact` on the synchronous branch
         // (`prec->pact = FALSE`, aiRecord.c:496 / aoRecord.c:578). On the
@@ -6365,10 +6506,10 @@ impl PvDatabase {
             let mut instance = rec.write();
             instance.leave_pact()
         } else {
-            PactExit::none()
+            rec.read().pact_exit_without_release()
         };
 
-        (SimOutcome::Simulated, exit)
+        (SimOutcome::Simulated(sim_posts), exit)
     }
 }
 
@@ -6410,7 +6551,7 @@ impl PvDatabase {
 /// result — every simulated cycle re-sent unchanged alarm fields,
 /// stamped `DBE_ALARM` on cycles whose alarm state never moved, and
 /// bypassed the MDEL/ADEL deadband entirely.
-fn sim_process_tail(instance: &mut RecordInstance, clear_udf: bool) {
+fn sim_process_tail(instance: &mut RecordInstance, clear_udf: bool) -> CyclePosts {
     use crate::server::recgbl::EventMask;
 
     apply_timestamp(&mut instance.common, true);
@@ -6494,14 +6635,19 @@ fn sim_process_tail(instance: &mut RecordInstance, clear_udf: bool) {
 
     let snapshot = crate::server::record::ProcessSnapshot { changed_fields };
     instance.notify_from_snapshot(&snapshot);
+    let mut posts = CyclePosts::of(&snapshot);
     if sevr_changed {
         instance.notify_field("SEVR", EventMask::VALUE);
+        posts = posts.with(EventMask::VALUE);
     }
     if !stat_mask.is_empty() {
         instance.notify_field("STAT", stat_mask);
         instance.notify_field("AMSG", stat_mask);
+        posts = posts.with(stat_mask);
     }
     if alarm_result.acks_posted {
         instance.notify_field("ACKS", EventMask::VALUE);
+        posts = posts.with(EventMask::VALUE);
     }
+    posts
 }

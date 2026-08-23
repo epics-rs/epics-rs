@@ -77,12 +77,40 @@ default-filter = """
 
 # CI profile: friendlier output + retries for the genuinely flaky
 # integration suites. Use via `cargo nextest run --profile ci`.
+#
+# Its default-filter repeats profile.default's list and adds the suites that
+# read an upstream C/C++ reference checkout. Those fail loudly (by design)
+# without the tree — `epics_base_rs::reference` panics rather than skipping,
+# because a skip reports as a pass — and no cross-platform runner provisions
+# one. Excluded here, not silenced: they still run locally and on any runner
+# where the tree exists. Moving them to profile.interop would not work either;
+# interop.yml provisions epics-base and pvxs but never epics-modules, so
+# `stdsupport_device_parity` could not run there.
+#
+# Keep the two lists in step: an addition to profile.default's list belongs
+# here too, or CI silently runs a suite the default loop does not.
 [profile.ci]
 fail-fast = false
 retries = 2
 slow-timeout = { period = "60s", terminate-after = 4 }
 status-level = "retry"
 final-status-level = "flaky"
+default-filter = """
+  not (
+    binary(interop_c_client_rust_ioc) |
+    binary(interop_rust_client_c_ioc) |
+    binary(differential_libca) |
+    binary(stress_load) |
+    binary(parity_interop) |
+    binary(wire_golden_pvxs) |
+    binary(wire_golden_ext) |
+    binary(interop_pvxs) |
+    binary(reference_trees) |
+    binary(dbd_initial_parity) |
+    binary(base_device_parity) |
+    binary(stdsupport_device_parity)
+  )
+"""
 
 # Test groups — cap per-group parallelism to match the resource the
 # group contends on (network ports, env vars, tempfiles).

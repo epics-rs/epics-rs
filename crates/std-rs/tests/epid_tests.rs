@@ -1247,8 +1247,8 @@ fn test_db_trig_link_synchronous_fallthrough() {
     rec.fbop = 1;
 
     // The TRIG write is a pre-input-link action emitted by the record,
-    // gated on the callback DSET (DTYP "Epid Async Soft").
-    rec.set_process_context(&ctx_with_dtyp("Epid Async Soft"));
+    // gated on the callback DSET (DTYP "Async Soft Channel").
+    rec.set_process_context(&ctx_with_dtyp("Async Soft Channel"));
     let pre = rec.pre_input_link_actions();
     assert!(
         pre.iter().any(|a| matches!(
@@ -1309,13 +1309,13 @@ fn test_ca_trig_link_deferred_second_pass() {
     rec.fbon = 1;
     rec.fbop = 1;
 
-    let mut dev = EpidSoftCallbackDeviceSupport::new();
-    let outcome = dev.read(&mut rec).expect("read ok");
+    rec.set_process_context(&ctx_with_dtyp("Async Soft Channel"));
 
     // CA link: both a WriteDbLink for TRIG and a ReprocessAfter — the
     // PID compute is deferred to the re-process pass.
+    let actions = rec.pre_input_link_actions();
     assert!(
-        outcome.actions.iter().any(|a| matches!(
+        actions.iter().any(|a| matches!(
             a,
             ProcessAction::WriteDbLink {
                 link_field: "TRIG",
@@ -1325,18 +1325,17 @@ fn test_ca_trig_link_deferred_second_pass() {
         "CA TRIG must emit a WriteDbLink"
     );
     assert!(
-        outcome
-            .actions
+        actions
             .iter()
             .any(|a| matches!(a, ProcessAction::ReprocessAfter(_))),
         "CA TRIG must defer PID to a second pass"
     );
 
-    // Second pass: now the PID runs.
-    let outcome2 = dev.read(&mut rec).expect("second read ok");
-    assert!(outcome2.did_compute);
+    // Second pass is the callback pass — C `devEpidSoftCallback.c:116`
+    // `if (!pepid->pact)` skips the whole trigger block, so nothing is
+    // re-fired and the PID runs.
     assert!(
-        outcome2.actions.is_empty(),
+        rec.pre_input_link_actions().is_empty(),
         "second pass must not re-trigger"
     );
 }
@@ -1620,12 +1619,12 @@ fn test_ca_trig_trigger_pass_returns_async_pending_tail_skipped() {
     let mut udf = true;
     rec.post_init_finalize_undef(&mut udf).unwrap();
 
-    let mut dev = EpidSoftCallbackDeviceSupport::new();
+    rec.set_process_context(&ctx_with_dtyp("Async Soft Channel"));
 
-    // --- Trigger pass: read() fires the CA trigger ---
-    let outcome1 = dev.read(&mut rec).expect("trigger-pass read ok");
+    // --- Trigger pass: pre_input_link_actions fires the CA trigger ---
+    let actions1 = rec.pre_input_link_actions();
     assert!(
-        outcome1.actions.iter().any(|a| matches!(
+        actions1.iter().any(|a| matches!(
             a,
             ProcessAction::WriteDbLink {
                 link_field: "TRIG",
@@ -1635,15 +1634,15 @@ fn test_ca_trig_trigger_pass_returns_async_pending_tail_skipped() {
         "CA TRIG trigger pass must emit a WriteDbLink{{TRIG}}"
     );
     assert!(
-        outcome1
-            .actions
+        actions1
             .iter()
             .any(|a| matches!(a, ProcessAction::ReprocessAfter(_))),
         "CA TRIG trigger pass must emit a ReprocessAfter"
     );
 
-    // The framework hands read()'s did_compute to the record.
-    rec.set_device_did_compute(outcome1.did_compute);
+    // No device attaches for this DTYP (is_soft_dtyp short-circuits),
+    // so the record body owns the compute.
+    rec.set_device_did_compute(false);
     let proc1 = rec.process().expect("trigger-pass process ok");
     assert_eq!(
         proc1.result,
@@ -1653,13 +1652,12 @@ fn test_ca_trig_trigger_pass_returns_async_pending_tail_skipped() {
          (C epidRecord.c:207 returns before the tail)"
     );
 
-    // --- Reprocess (callback) pass: read() runs the PID ---
-    let outcome2 = dev.read(&mut rec).expect("reprocess-pass read ok");
+    // --- Reprocess (callback) pass: the trigger block is skipped ---
     assert!(
-        outcome2.actions.is_empty(),
+        rec.pre_input_link_actions().is_empty(),
         "reprocess pass must not re-trigger"
     );
-    rec.set_device_did_compute(outcome2.did_compute);
+    rec.set_device_did_compute(false);
     let proc2 = rec.process().expect("reprocess-pass process ok");
     assert_eq!(
         proc2.result,

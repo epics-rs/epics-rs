@@ -20,11 +20,12 @@ pub use constant_link::{rec_gbl_init_constant_link, reseed_constant_input_link};
 pub use device_menu_registry::register_device_menu;
 pub(crate) use device_menu_registry::{contributed_device_menu, merged_device_menu};
 pub use link::{
-    CaLink, CalcLink, DbLink, DbLinkType, HwLink, HwLinkKind, JlinkValue, LinkAddress,
-    LinkFieldType, LinkProcessPolicy, LinkType, LsLoad, MonitorSwitch, PVAJSON_IDENTITY_SEP,
-    ParsedLink, PvaJsonLink, check_link_assignment, declared_link_type, link_field_type,
-    load_link_ls, out_link_discards_cp, parse_c_double, parse_forward_link_v2, parse_link,
-    parse_link_field, parse_link_v2, parse_output_link_v2, pvajson_identity_key,
+    CaLink, CalcArg, CalcLink, DbLink, DbLinkType, HwLink, HwLinkKind, JlinkValue, JsonLinkParse,
+    LinkAddress, LinkFieldType, LinkProcessPolicy, LinkType, LsLoad, MonitorSwitch,
+    PVAJSON_IDENTITY_SEP, ParsedLink, PvaJsonLink, check_json_link_text, check_link_assignment,
+    declared_link_type, link_field_type, load_link_ls, out_link_discards_cp, parse_c_double,
+    parse_forward_link_v2, parse_link, parse_link_field, parse_link_v2, parse_output_link_v2,
+    pvajson_identity_key,
 };
 pub use menu_choices::{
     Ftype, MENU_ALARM_SEVR, MENU_ALARM_STAT, MENU_CONVERT, MENU_FTYPE, MENU_IVOA, MENU_OMSL,
@@ -35,7 +36,7 @@ pub use menu_choices::{
 };
 pub use pini::PiniMode;
 pub use record_instance::{
-    AlarmAck, AmbientWriteOriginScope, DeferredNotifyPut, NotifyWaitSet, PactExit,
+    AlarmAck, AmbientWriteOriginScope, DeferredNotify, DeferredNotifyPut, NotifyWaitSet, PactExit,
     ProcessCompletion, RecordInstance, ambient_write_origin_scope,
 };
 pub(crate) use record_instance::{ambient_write_origin, value_as_dbr_string};

@@ -631,7 +631,24 @@ fn cmd_scanppl() -> CommandDef {
             for st in &scan_types {
                 let names = ctx.block_on(ctx.db().records_for_scan(*st));
                 if !names.is_empty() {
-                    ctx.println(&format!("{st}: {} records", names.len()));
+                    // C prints the list's cumulative over-run count in the
+                    // header — `Records with SCAN = '%s' (%lu over-runs):`
+                    // (`dbScan.c:408-409`). It is the observable half of the
+                    // over-run rule: without it a list that keeps missing its
+                    // deadline looks identical to one that never does. Only
+                    // periodic rates have the counter; C keeps it on
+                    // `periodic_scan_list`, and the event and passive lists
+                    // are not one.
+                    let overruns = crate::server::scan::PERIODIC_SCANS
+                        .contains(st)
+                        .then(|| st.scan_list().map(|l| ctx.db().scan_overruns(l)))
+                        .flatten();
+                    match overruns {
+                        Some(n) => {
+                            ctx.println(&format!("{st}: {} records ({n} over-runs)", names.len()))
+                        }
+                        None => ctx.println(&format!("{st}: {} records", names.len())),
+                    }
                     for name in &names {
                         ctx.println(&format!("  {name}"));
                     }
@@ -1309,16 +1326,17 @@ async fn install_record_defs(
             // `init_record` — the only site that loads a constant INP
             // into the record's value.
             ctx.db().rec_gbl_init_constant_links(&rec_arc);
-            // C `recGblInitSimm` + `recGblInitConstantLink(&siol, …,
-            // &sval)`, run from every SIML-bearing `init_record`
-            // (pass 1) — the only site that loads a constant
-            // SIML/SIOL into SIMM/SVAL.
-            ctx.db().rec_gbl_init_simm(&rec_arc);
-            // C `wdogInit(prec)` from `init_record` pass 1
-            // (histogramRecord.c:168) — arms the SDEL monitor
-            // watchdog; a re-arm supersedes the previous one, which is
-            // what the merge re-init above needs.
-            ctx.db().arm_watchdog(&def.name);
+            if is_merge {
+                // A merge re-ran `run_init_passes` above against the new
+                // field set, so the rest of pass 1 owes a re-run too: a
+                // second block may have introduced SIML/SIOL or moved SDEL.
+                // A FRESH record takes both from the creation sink
+                // (`PvDatabase::add_loaded_record`) and must not repeat them
+                // here — `arm_watchdog` would spawn a second task and
+                // supersede the first for nothing.
+                ctx.db().rec_gbl_init_simm(&rec_arc);
+                ctx.db().arm_watchdog(&def.name);
+            }
             Ok(())
         }
         .await;
@@ -1924,6 +1942,65 @@ mod tests {
         // Leak the runtime so it stays alive for the test
         std::mem::forget(rt);
         (db, ctx)
+    }
+
+    /// `scanppl` prints each periodic list's cumulative over-run count —
+    /// C `Records with SCAN = '%s' (%lu over-runs):` (`dbScan.c:408-409`).
+    /// It is the observable half of the over-run rule: without it a list
+    /// that keeps missing its deadline reads exactly like one that never
+    /// does. The event and passive lists have no such counter in C.
+    #[test]
+    fn scanppl_prints_the_over_run_count_for_periodic_lists() {
+        use crate::server::record::ScanType;
+        use std::io::Write;
+        use std::sync::Mutex;
+
+        struct Sink(Arc<Mutex<Vec<u8>>>);
+        impl Write for Sink {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let (db, ctx) = make_ctx();
+        ctx.block_on(async {
+            db.add_record("TICKER", Box::new(AiRecord::new(1.0)))
+                .await
+                .unwrap();
+            db.add_record("IDLE", Box::new(AiRecord::new(1.0)))
+                .await
+                .unwrap();
+        });
+        db.get_record("TICKER").unwrap().write().common.scan = ScanType::Sec1;
+        db.update_scan_index("TICKER", ScanType::Passive, ScanType::Sec1, 0, 0);
+        db.get_record("IDLE").unwrap().write().common.scan = ScanType::Event;
+        db.update_scan_index("IDLE", ScanType::Passive, ScanType::Event, 0, 0);
+        for _ in 0..3 {
+            db.record_scan_overrun(ScanType::Sec1);
+        }
+
+        let buf = Arc::new(Mutex::new(Vec::new()));
+        let mut registry = CommandRegistry::new();
+        register_builtins(&mut registry);
+        let cmd = registry.get("scanppl").unwrap();
+        let args = parse_args(&[], &cmd.args).unwrap();
+        ctx.with_output(Sink(buf.clone()), || {
+            cmd.handler.call(&args, &ctx).unwrap();
+        });
+        let out = String::from_utf8(buf.lock().unwrap().clone()).unwrap();
+
+        assert!(
+            out.contains("1 second: 1 records (3 over-runs)"),
+            "periodic list carries its over-run count — got:\n{out}"
+        );
+        assert!(
+            out.contains("Event: 1 records\n"),
+            "a non-periodic list has no over-run counter in C — got:\n{out}"
+        );
     }
 
     #[test]

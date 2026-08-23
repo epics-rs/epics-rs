@@ -727,7 +727,7 @@ record(calc, "CTR") {
     field(CALC, "A+1")
 }
 record(epid, "PID") {
-    field(DTYP, "Epid Async Soft")
+    field(DTYP, "Async Soft Channel")
     field(STPL, "100")
     field(KP, "1.0")
     field(KI, "0")
@@ -748,7 +748,7 @@ record(epid, "PID") {
         .register_record_type("calc", || {
             Box::new(epics_base_rs::server::records::calc::CalcRecord::new("A+1"))
         })
-        .register_device_support("Epid Async Soft", || {
+        .register_device_support("Async Soft Channel", || {
             Box::new(
                 std_rs::device_support::epid_soft_callback::EpidSoftCallbackDeviceSupport::new(),
             )

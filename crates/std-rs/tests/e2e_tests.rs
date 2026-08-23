@@ -581,7 +581,7 @@ record(ao, "SRC") {
     field(VAL, "1.0")
 }
 record(epid, "PID") {
-    field(DTYP, "Epid Async Soft")
+    field(DTYP, "Async Soft Channel")
     field(KP, "1.0")
     field(KI, "0.0")
     field(KD, "0.0")
@@ -601,7 +601,7 @@ record(epid, "PID") {
         .port(0)
         .register_record_type("epid", || Box::new(std_rs::EpidRecord::default()))
         .register_record_type("ao", || Box::new(AoRecord::default()))
-        .register_device_support("Epid Async Soft", || {
+        .register_device_support("Async Soft Channel", || {
             Box::new(
                 std_rs::device_support::epid_soft_callback::EpidSoftCallbackDeviceSupport::new(),
             )

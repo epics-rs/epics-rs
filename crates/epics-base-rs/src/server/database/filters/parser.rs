@@ -251,76 +251,6 @@ impl std::fmt::Display for FilterParseError {
 
 impl std::error::Error for FilterParseError {}
 
-/// Rewrite the documented EPICS JSON5 channel-filter forms into the
-/// strict JSON that `serde_json` accepts.
-///
-/// EPICS base parses filter suffixes with a JSON5-capable yajl, and its
-/// own documentation and shipped examples use unquoted object keys,
-/// e.g. `{"arr":{s:2,i:2,e:8}}` (`filters.dbd.pod:73-99, 415-419`). The
-/// only JSON5 extension the documented filter grammar relies on is
-/// unquoted identifier keys, so this quotes bareword keys — an
-/// identifier token in key position (the next non-whitespace char is
-/// `:`) that is not already quoted — and leaves string contents,
-/// numbers, and bareword values (`true` / `false` / `null`) untouched.
-/// Already-strict JSON round-trips unchanged.
-fn json5_filter_to_json(src: &str) -> String {
-    let mut out = String::with_capacity(src.len() + 16);
-    let mut chars = src.chars().peekable();
-    while let Some(c) = chars.next() {
-        match c {
-            '"' => {
-                // Copy a string literal verbatim, honouring `\`-escapes
-                // so an embedded `"` or `:` is never mistaken for
-                // structure.
-                out.push('"');
-                while let Some(sc) = chars.next() {
-                    out.push(sc);
-                    if sc == '\\' {
-                        if let Some(esc) = chars.next() {
-                            out.push(esc);
-                        }
-                    } else if sc == '"' {
-                        break;
-                    }
-                }
-            }
-            c if c.is_ascii_alphabetic() || c == '_' || c == '$' => {
-                let mut word = String::new();
-                word.push(c);
-                while let Some(&pc) = chars.peek() {
-                    if pc.is_ascii_alphanumeric() || pc == '_' || pc == '$' {
-                        word.push(pc);
-                        chars.next();
-                    } else {
-                        break;
-                    }
-                }
-                // Buffer trailing whitespace so a `key :` form still
-                // resolves as a key without dropping the spacing.
-                let mut ws = String::new();
-                while let Some(&pc) = chars.peek() {
-                    if pc.is_whitespace() {
-                        ws.push(pc);
-                        chars.next();
-                    } else {
-                        break;
-                    }
-                }
-                if chars.peek() == Some(&':') {
-                    out.push('"');
-                    out.push_str(&word);
-                    out.push('"');
-                } else {
-                    out.push_str(&word);
-                }
-                out.push_str(&ws);
-            }
-            other => out.push(other),
-        }
-    }
-    out
-}
-
 /// Parse the JSON suffix into a [`FilterChain`], rejecting any
 /// syntactically-present-but-unparseable filter request.
 ///
@@ -330,9 +260,13 @@ fn json5_filter_to_json(src: &str) -> String {
 /// filter whose own parser rejects its configuration. An empty object
 /// (`{}`) is a valid no-filter request and yields an empty chain. The
 /// documented JSON5 unquoted-key forms are accepted via
-/// `json5_filter_to_json`.
+/// [`crate::json5::relaxed_to_strict`].
 pub fn try_parse_filter_chain(json: &str) -> Result<FilterChain, FilterParseError> {
-    let normalized = json5_filter_to_json(json);
+    let normalized =
+        crate::json5::relaxed_to_strict(json).map_err(|e| FilterParseError::InvalidJson {
+            suffix: json.to_string(),
+            message: e.to_string(),
+        })?;
     let value: serde_json::Value =
         serde_json::from_str(&normalized).map_err(|e| FilterParseError::InvalidJson {
             suffix: json.to_string(),
@@ -361,7 +295,17 @@ pub fn try_parse_filter_chain(json: &str) -> Result<FilterChain, FilterParseErro
 /// requested semantics. JSON5 unquoted keys are accepted here too.
 pub fn parse_filter_chain(json: &str) -> FilterChain {
     let mut chain = FilterChain::new();
-    let normalized = json5_filter_to_json(json);
+    let normalized = match crate::json5::relaxed_to_strict(json) {
+        Ok(normalized) => normalized,
+        Err(e) => {
+            tracing::warn!(
+                json = %json,
+                error = %e,
+                "channel filter JSON parse failed; subscription proceeds without filters",
+            );
+            return chain;
+        }
+    };
     let value: serde_json::Value = match serde_json::from_str(&normalized) {
         Ok(v) => v,
         Err(e) => {
@@ -896,19 +840,5 @@ mod tests {
         // first `parse_stop`, not a silently-reduced chain.
         let err = try_parse_filter_chain(r#"{"dbnd":{"d":0.1},"no_such":{}}"#).unwrap_err();
         assert!(matches!(err, FilterParseError::UnknownFilter { .. }));
-    }
-
-    #[test]
-    fn json5_normalizer_leaves_quoted_json_untouched() {
-        let strict = r#"{"arr":{"s":2,"i":2,"e":8}}"#;
-        assert_eq!(json5_filter_to_json(strict), strict);
-    }
-
-    #[test]
-    fn json5_normalizer_does_not_quote_string_values() {
-        // Only bareword KEYS are quoted; quoted string values (and the
-        // `:` inside them) are preserved verbatim.
-        let src = r#"{"sync":{"m":"after","s":"SYS:TRIG"}}"#;
-        assert_eq!(json5_filter_to_json(src), src);
     }
 }

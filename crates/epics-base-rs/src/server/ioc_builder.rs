@@ -219,19 +219,10 @@ impl IocBuilder {
             // to classify or fold.
             db.add_record(&name, record).await?;
             if let Some(rec_arc) = db.get_record(&name) {
-                {
-                    let mut instance = rec_arc.write();
-                    // Seed MLST/ALST/LALM from val so the first process posts a
-                    // monitor only on a real change (C init_record invariant).
-                    instance.record.seed_deadband_tracking();
-                }
-                // C `recGblInitSimm` + `recGblInitConstantLink(&siol, …,
-                // &sval)`, run from every SIML-bearing `init_record` (pass 1).
-                db.rec_gbl_init_simm(&rec_arc);
-                // C `wdogInit(prec)` from `init_record` pass 1
-                // (histogramRecord.c:168) — arms the SDEL monitor watchdog.
-                // No-op for every record type without one.
-                db.arm_watchdog(&name);
+                let mut instance = rec_arc.write();
+                // Seed MLST/ALST/LALM from val so the first process posts a
+                // monitor only on a real change (C init_record invariant).
+                instance.record.seed_deadband_tracking();
             }
         }
 
@@ -311,14 +302,6 @@ impl IocBuilder {
                     instance.record.seed_deadband_tracking();
                 }
 
-                // C `recGblInitSimm` + `recGblInitConstantLink(&siol, …,
-                // &sval)`, run from every SIML-bearing `init_record` (pass 1).
-                // The lock is released and retaken by the owner, which is the
-                // only site allowed to load a constant SIML/SIOL.
-                db.rec_gbl_init_simm(&rec_arc);
-                // C `wdogInit(prec)` from `init_record` pass 1
-                // (histogramRecord.c:168) — arms the SDEL monitor watchdog.
-                db.arm_watchdog(&def.name);
                 let mut instance = rec_arc.write();
 
                 // Device support based on DTYP

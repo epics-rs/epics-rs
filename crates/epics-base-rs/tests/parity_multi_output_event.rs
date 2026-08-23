@@ -9,6 +9,7 @@ use std::sync::Arc;
 use epics_base_rs::server::database::PvDatabase;
 use epics_base_rs::server::record::Record;
 use epics_base_rs::server::records::ai::AiRecord;
+use epics_base_rs::server::records::calc::CalcRecord;
 use epics_base_rs::server::records::dfanout::DfanoutRecord;
 use epics_base_rs::server::records::event::EventRecord;
 use epics_base_rs::server::records::fanout::FanoutRecord;
@@ -39,9 +40,12 @@ fn fanout_has_lnk0_field() {
 #[epics_macros_rs::epics_test]
 async fn fanout_selm_all_processes_lnk0_target() {
     let db = Arc::new(PvDatabase::new());
-    db.add_record("DOWNSTREAM", Box::new(AiRecord::new(0.0)))
-        .await
-        .unwrap();
+    // A counter: `VAL+1` reads the previous VAL, so VAL counts processes.
+    // `visited` cannot be the oracle — it is scoped to the process frame and
+    // is empty again once the chain unwinds.
+    let mut tgt = CalcRecord::new("VAL+1");
+    tgt.init_record(0).unwrap();
+    db.add_record("DOWNSTREAM", Box::new(tgt)).await.unwrap();
     let mut fan = FanoutRecord::new();
     // LNK0 carries the primary fan-out target, PP so it processes.
     fan.put_field("LNK0", EpicsValue::String("DOWNSTREAM PP".into()))
@@ -53,11 +57,10 @@ async fn fanout_selm_all_processes_lnk0_target() {
     db.process_record_with_links("FAN", &mut visited, 0)
         .await
         .unwrap();
-    // The LNK0 target must have been processed (it appears in the
-    // current process chain's visited set).
-    assert!(
-        visited.contains("DOWNSTREAM"),
-        "fanout SELM=All must process its LNK0 target: {visited:?}"
+    assert_eq!(
+        db.get_pv("DOWNSTREAM").unwrap().to_f64(),
+        Some(1.0),
+        "fanout SELM=All must process its LNK0 target"
     );
 }
 
@@ -250,15 +253,15 @@ async fn fanout_lnk_skips_non_passive_target() {
     use epics_base_rs::server::record::ScanType;
 
     let db = Arc::new(PvDatabase::new());
+    // Counters (see `fanout_selm_all_processes_lnk0_target`).
     // PASS_TGT is Passive — must be processed.
-    db.add_record("PASS_TGT", Box::new(AiRecord::new(0.0)))
-        .await
-        .unwrap();
     // PERIODIC_TGT is Periodic — its own scan owns it; the fanout
     // must NOT re-process it.
-    db.add_record("PERIODIC_TGT", Box::new(AiRecord::new(0.0)))
-        .await
-        .unwrap();
+    for name in ["PASS_TGT", "PERIODIC_TGT"] {
+        let mut tgt = CalcRecord::new("VAL+1");
+        tgt.init_record(0).unwrap();
+        db.add_record(name, Box::new(tgt)).await.unwrap();
+    }
     {
         let r = db.get_record("PERIODIC_TGT").unwrap();
         let mut inst = r.write();
@@ -278,13 +281,15 @@ async fn fanout_lnk_skips_non_passive_target() {
         .await
         .unwrap();
 
-    assert!(
-        visited.contains("PASS_TGT"),
-        "fanout LNK0 Passive target must be processed: {visited:?}"
+    assert_eq!(
+        db.get_pv("PASS_TGT").unwrap().to_f64(),
+        Some(1.0),
+        "fanout LNK0 Passive target must be processed"
     );
-    assert!(
-        !visited.contains("PERIODIC_TGT"),
-        "fanout LNK1 Periodic target must NOT be processed by the fanout: {visited:?}"
+    assert_eq!(
+        db.get_pv("PERIODIC_TGT").unwrap().to_f64(),
+        Some(0.0),
+        "fanout LNK1 Periodic target must NOT be processed by the fanout"
     );
 }
 

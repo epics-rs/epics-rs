@@ -1159,6 +1159,22 @@ pub struct ProcessSnapshot {
     pub changed_fields: Vec<(String, EpicsValue, crate::server::recgbl::EventMask)>,
 }
 
+impl ProcessSnapshot {
+    /// The union of every `DBE_*` class this cycle actually published — the
+    /// port's answer to "what did `db_post_events` send for this record".
+    ///
+    /// A field carrying an empty mask is not posted at all
+    /// (`RecordInstance::notify_from_snapshot` skips it), so an empty union
+    /// means the cycle published nothing and no monitor of any class fired.
+    pub fn published_mask(&self) -> crate::server::recgbl::EventMask {
+        self.changed_fields
+            .iter()
+            .fold(crate::server::recgbl::EventMask::NONE, |acc, (_, _, m)| {
+                acc | *m
+            })
+    }
+}
+
 /// What C's `fetch_values()` does when one of the record's input links fails
 /// to read, and whether that failure gates the record body.
 ///

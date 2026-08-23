@@ -112,3 +112,63 @@ async fn force_block_async_record_withholds_completion_until_processing_done() {
         "OUT must stay deferred until the delay completes, got {v:?}"
     );
 }
+
+/// The install is *inside* the record's advisory write gate, not ahead of it.
+///
+/// C `dbProcessNotify` takes `dbScanLock(precord)` (dbNotify.c:355) and
+/// `processNotifyCommon` assigns `precord->ppn = ppn` and calls
+/// `dbProcess(precord)` before the matching `dbScanUnlock` (`:257-262`), so
+/// nothing else can run a cycle on the record between the install and the
+/// cycle that install arms. An install placed ahead of the gate opens exactly
+/// that window: a gate-holding put's cycle ends in `complete_put_notify`,
+/// which `take`s whatever wait-set it finds in the slot and `leave`s it —
+/// firing this client's `block=true` completion for a cycle it never
+/// requested, and leaving its own cycle to run unarmed.
+///
+/// The boundary is the gate's two states. Gate held ⇒ the slot must stay
+/// empty (here). Gate free ⇒ the install proceeds (every other test above).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn force_block_install_waits_for_the_record_put_gate() {
+    let db = PvDatabase::new();
+    db.add_record("GATED", Box::new(AiRecord::new(0.0)))
+        .await
+        .unwrap();
+    let rec = db.get_record("GATED").expect("record loaded");
+
+    // Stands in for the CA put that holds the gate across its whole
+    // put-and-process transaction, C's `dbScanLock` … `dbScanUnlock`.
+    let gate = db.lock_record("GATED");
+
+    let forced = tokio::spawn({
+        let db = db.clone();
+        async move { db.process_record_with_notify("GATED").await }
+    });
+
+    // Long enough that an install placed ahead of the gate lands well inside
+    // the window; a gated install spends the whole budget blocked instead.
+    for _ in 0..40 {
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        if rec.read().notify.is_some() {
+            break;
+        }
+    }
+    assert!(
+        rec.read().notify.is_none(),
+        "no put-notify may take the record's slot while another put holds its \
+         write gate"
+    );
+
+    drop(gate);
+    let completion = forced
+        .await
+        .expect("the forced process task must not panic")
+        .expect("process must succeed once the gate is free");
+    assert!(
+        completion.is_sync(),
+        "the forced cycle runs to completion once it owns the gate"
+    );
+    assert!(
+        rec.read().notify.is_none(),
+        "the cycle drains the wait-set it installed"
+    );
+}

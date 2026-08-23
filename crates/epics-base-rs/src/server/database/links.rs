@@ -5,7 +5,6 @@ use crate::server::record::{AlarmSeverity, NotifyWaitSet, OutTarget, RecordInsta
 use crate::types::{DbFieldType, EpicsValue, PvString};
 
 use super::link_set::LinkDbfType;
-use super::processing::join_put_notify;
 use super::{LinkPutOp, PvDatabase, SelmKind, SelmResult, dbr_ushort_cast, select_link_indices_ex};
 
 /// **The one classifier of a process-time read that delivered no value.**
@@ -665,31 +664,60 @@ impl PvDatabase {
         }
     }
 
-    /// lnkCalc evaluation: fetch each input PV, bind to calc engine
-    /// vars A..L, run `expr`, return the result as `EpicsValue::Double`.
-    /// Returns `None` if any input fetch fails, expr compile fails, or
-    /// eval fails — the caller treats the link as unresolvable.
+    /// The record name a `time` argument's timestamp comes from, or `None`
+    /// when that slot holds a numeric literal (nothing to read a time from).
+    fn calc_time_source_record(arg: &crate::server::record::CalcArg) -> Option<String> {
+        use crate::server::record::{CalcArg, ParsedLink};
+        let CalcArg::Link(link) = arg else {
+            return None;
+        };
+        let name = match link.as_ref() {
+            // Strip the `.FIELD` suffix to land on the record name.
+            ParsedLink::Db(db) => db.record.clone(),
+            ParsedLink::Ca(ca) => ca.pv.clone(),
+            ParsedLink::Pva(pv) => pv.clone(),
+            ParsedLink::PvaJson(j) => j.pv.clone(),
+            ParsedLink::None
+            | ParsedLink::Constant(_)
+            | ParsedLink::Hw(_)
+            | ParsedLink::Calc(_) => return None,
+        };
+        Some(
+            name.rsplit_once('.')
+                .map(|(r, _)| r.to_string())
+                .unwrap_or(name),
+        )
+    }
+
+    /// lnkCalc evaluation: resolve each input, bind the calc engine's
+    /// variable slots by position, run `expr`, return the result as
+    /// `EpicsValue::Double`. Returns `None` if any input fetch fails, expr
+    /// compile fails, or eval fails — the caller treats the link as
+    /// unresolvable.
     pub fn evaluate_calc_link(&self, calc: &crate::server::record::CalcLink) -> Option<EpicsValue> {
         use crate::calc::engine::{CALC_NARGS, NumericInputs};
-        // lnkCalc binds inputs to calc engine vars A..L (12). A link
-        // string carrying more than `CALC_NARGS` inputs is malformed —
-        // reject it rather than silently dropping the overflow args
-        // (the pre-fix `.take(12)` masked the misconfiguration).
+        use crate::server::record::CalcArg;
+        // The parser already refuses an over-long `args`; a link built
+        // in-process could still carry one, and C's limit is a refusal
+        // everywhere it appears (`lnkCalc.c:135-139`).
         if calc.args.len() > CALC_NARGS {
             return None;
         }
         let mut vars = [0.0f64; CALC_NARGS];
         for (i, arg) in calc.args.iter().enumerate() {
-            // Each lnkCalc input is its own `dbInitLink` link, so a
-            // non-local input record is a CA link — read it through the
-            // locality owner, not a local-only `get_pv`. `arg` is a bare
-            // record name or `record.FIELD`; split on the last `.`.
-            let (record, field) = match arg.rsplit_once('.') {
-                Some((r, f)) => (r, f),
-                None => (arg.as_str(), "VAL"),
+            vars[i] = match arg {
+                // Nothing reads over a literal: C's matching `inp[i]` is a
+                // zeroed CONSTANT link and `dbGetLink` on it delivers
+                // nothing (`dbConstLink.c:219-225`).
+                CalcArg::Literal(n) => *n,
+                // C `dbGetLink(child, DBR_DOUBLE, &clink->arg[i], …)`
+                // (`lnkCalc.c:585`) — a read that never processes the
+                // target, which is what `read_link_value_no_process` owns.
+                // It also carries the locality split each input needs, since
+                // every lnkCalc input is its own `dbInitLink` link and a
+                // non-local one is a CA link.
+                CalcArg::Link(link) => self.read_link_value_no_process(link)?.to_f64()?,
             };
-            let v = self.read_target_value(record, field)?;
-            vars[i] = v.to_f64()?;
         }
         let compiled = crate::calc::compile(&calc.expr).ok()?;
         let mut inputs = NumericInputs::with_vars(vars);
@@ -711,9 +739,11 @@ impl PvDatabase {
         let time = match calc.time_source {
             Some(letter) => {
                 let idx = (letter as u8).saturating_sub(b'A') as usize;
-                let src = calc.args.get(idx)?;
-                // Strip `.FIELD` suffix to land on the record name.
-                let record_name = src.rsplit_once('.').map(|(r, _)| r).unwrap_or(src);
+                // A literal argument has no timestamp to adopt: C's
+                // `readLocked` runs against a zeroed child link and leaves
+                // `clink->time` at its `calloc` zero (`lnkCalc.c:571-575`).
+                let record_name = Self::calc_time_source_record(calc.args.get(idx)?)?;
+                let record_name = record_name.as_str();
                 if self.has_name_no_resolve(record_name) {
                     let rec = self.get_record(record_name)?;
                     let inst = rec.read();
@@ -1459,7 +1489,7 @@ impl PvDatabase {
             let pact = tg.is_processing();
             if !pact {
                 tg.common.putf = src_putf;
-                join_put_notify(&mut tg, src_notify);
+                tg.join_put_notify(src_notify);
             } else if src_putf && !visited.contains(target_name) {
                 tg.common.rpro = 1;
                 tg.common.putf = false;
@@ -2937,6 +2967,16 @@ impl PvDatabase {
     /// one. Restricting it to CP/CPP left every plain non-local `Db` link
     /// unconverted and unopened.
     ///
+    /// **Deviation, deliberate.** Because C skips `dbDbInitLink` for a
+    /// `CA`/`CP`/`CPP` link, C makes a CP link to a LOCAL record a CA link
+    /// too. This function does not: it leaves a local CP target as `Db`,
+    /// because the `ca` link set lives in `epics-ca-rs` and an IOC built on
+    /// `epics-base-rs` alone would be left with a local CP link that resolves
+    /// nowhere. What C buys with that conversion — a holder processed only on
+    /// a `DBE_VALUE|DBE_ALARM` post, never on a bare source process — is paid
+    /// for instead at the trigger, by the `CyclePosts` gate in
+    /// `PvDatabase::dispatch_cp_targets`.
+    ///
     /// **Decided once.** C sets `DBLINK_FLAG_INITIALIZED` on entry and
     /// returns early on every later call (`dbLink.c:95-101`), so a record
     /// added to the IOC *after* iocInit does NOT un-convert a link that was
@@ -3612,9 +3652,13 @@ mod cp_link_locality_tests {
 
     /// A CP/CPP link with no explicit `CA` modifier whose target is NOT a
     /// local record must be served as an external (CA) link — both the
-    /// trigger and the value read. C `dbInitLink` (`dbLink.c:118-130`)
-    /// makes any `CP`/`CPP` link a CA link, and `dbDbInitLink` keeps it
-    /// local only when the named record exists in this IOC.
+    /// trigger and the value read. C `dbInitLink` (`dbLink.c:118-122`) tests
+    /// the `CA`/`CP`/`CPP` modifier FIRST and skips `dbDbInitLink` entirely
+    /// when one is present, so in C a CP link is a CA link whether or not the
+    /// named record is local; `dbLink.c:128` computes `isLocal` only to pick
+    /// the init-callback hint. The port keeps a LOCAL CP target as a `Db`
+    /// link instead (see `cp_link_to_local_target_stays_db`) and restores the
+    /// C semantics at the trigger, so only the non-local case converts here.
     ///
     /// Here `INP="OTHER:PV CP"` parses to `ParsedLink::Db` (bare name, no
     /// `CA`), but `OTHER:PV` is not local. The holder's `parsed_inp` must be
@@ -3657,10 +3701,27 @@ mod cp_link_locality_tests {
         );
     }
 
-    /// A CP link whose target IS a local record keeps the local fast-path:
-    /// neither `initialize_link_locality` nor `setup_cp_links` may rewrite
-    /// its `parsed_inp` to `Ca`, and it must NOT be registered as an external
-    /// CP link.
+    /// A CP link whose target IS a local record keeps the `Db` SHAPE — and
+    /// that is a deliberate port DEVIATION, not C parity.
+    ///
+    /// C `dbInitLink` (`dbLink.c:118-122`) would make this link a CA link:
+    /// the modifier test precedes and short-circuits `dbDbInitLink`, so `SRC`
+    /// being local changes nothing about the link's class. The port cannot
+    /// follow that literally — the `ca` link set lives in `epics-ca-rs`, which
+    /// `epics-base-rs` does not depend on, so converting a local CP link to
+    /// `Ca` would leave it unresolvable (and its holder never processed) in a
+    /// bare `epics-base-rs` IOC.
+    ///
+    /// What this test therefore pins is the deviation TOGETHER with what
+    /// compensates for it: the link keeps the `Db` shape, it is NOT an
+    /// external CP trigger, and it IS registered in the LOCAL CP registry —
+    /// the registry `PvDatabase::dispatch_cp_targets` drives, and which since
+    /// the `CyclePosts` gate fires only on a `DBE_VALUE|DBE_ALARM` post from
+    /// `SRC`, exactly as C's CA subscription would (`dbCa.c:1290-1294` →
+    /// `cadef.h:2010-2011`). The observable rule is proven by
+    /// `tests/cp_link_trigger_is_a_post.rs`; a `Db` shape with no local
+    /// registration would satisfy the old assertion and still never process
+    /// the holder.
     #[epics_macros_rs::epics_test]
     async fn cp_link_to_local_target_stays_db() {
         let db = PvDatabase::new();
@@ -3685,11 +3746,19 @@ mod cp_link_locality_tests {
         let inp = db.get_record("HOLDER").unwrap().read().parsed_inp.clone();
         assert!(
             matches!(inp, ParsedLink::Db(_)),
-            "local CP link must stay a Db link, got {inp:?}"
+            "the port keeps a local CP link in the Db shape (C would make it a \
+             CA link); got {inp:?}"
         );
         assert!(
             !db.external_cp_pv_names().await.contains(&"SRC".to_string()),
             "a local CP target must not be registered as an external CP link"
+        );
+        assert!(
+            db.get_cp_targets("SRC")
+                .iter()
+                .any(|t| t.record == "HOLDER" && !t.passive_only),
+            "the Db shape is only sound because the edge lands in the LOCAL CP \
+             registry, where the post gate drives it"
         );
     }
 }

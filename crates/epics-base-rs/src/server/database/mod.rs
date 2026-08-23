@@ -238,9 +238,56 @@ pub struct CpTarget {
 /// path on which a lookup could take the wrong lock.
 ///
 /// `doc/rtems-priority-locks-design.md` §5.3 addendum, row L8b.
+/// A scan list's sort key — C's feed order into `addToList`, spelled out.
+///
+/// `buildScanLists` (`dbScan.c:1054-1076`) feeds `scanAdd` **record-type-major**:
+/// the outer loop walks `pdbbase->recordTypeList`, which is DBD load order, and
+/// the inner loop walks that type's instances in `.db` load order. `addToList`
+/// (`:1085-1091`) appends after the last element whose `phas <=` the new
+/// record's, so within one PHAS the list is a stable FIFO over exactly that
+/// feed order. A key ordered by `.db` load order alone inverts, by one whole
+/// scan cycle, every same-PHAS reader/writer pair whose declaration order
+/// contradicts DBD order.
+///
+/// A struct rather than a tuple because the field order IS the sort rule: the
+/// derived `Ord` reads top to bottom, and a positional tuple gave the type
+/// ordinal and the load-order sequence the same shape.
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Debug)]
+struct ScanKey {
+    phas: i16,
+    /// Position in [`dbd_generated::RECORD_TYPE_ORDER`]. A record type no
+    /// vendored `.dbd` declares sorts after every one that is declared, which
+    /// is where C puts it too — a module `.dbd` is included after `base.dbd`,
+    /// so its types join `recordTypeList` behind base's.
+    record_type: u32,
+    load_order: u64,
+    name: String,
+}
+
+impl ScanKey {
+    fn new(phas: i16, record_type: &str, load_order: u64, name: &str) -> Self {
+        use crate::server::record::dbd_generated::RECORD_TYPE_ORDER;
+        Self {
+            phas,
+            record_type: RECORD_TYPE_ORDER
+                .iter()
+                .position(|t| *t == record_type)
+                .unwrap_or(RECORD_TYPE_ORDER.len()) as u32,
+            load_order,
+            name: name.to_string(),
+        }
+    }
+}
+
 struct ScanIndex {
-    buckets: [crate::runtime::sync::PriorityInheritanceMutex<BTreeSet<(i16, u64, String)>>;
-        ScanList::COUNT],
+    buckets: [crate::runtime::sync::PriorityInheritanceMutex<BTreeSet<ScanKey>>; ScanList::COUNT],
+    /// Cumulative over-runs per list — C `periodic_scan_list::overruns`
+    /// (`dbScan.c:95`), which `scanppl` prints beside the list it belongs to
+    /// (`dbScan.c:408-409`). It lives here for the same reason C puts it on
+    /// `periodic_scan_list`: one owner per rate holds both the list and its
+    /// over-run count, so the counter cannot drift away from the list it
+    /// counts. Only the periodic scan threads write it.
+    overruns: [std::sync::atomic::AtomicU64; ScanList::COUNT],
 }
 
 impl ScanIndex {
@@ -249,6 +296,7 @@ impl ScanIndex {
             buckets: std::array::from_fn(|_| {
                 crate::runtime::sync::PriorityInheritanceMutex::new(BTreeSet::new())
             }),
+            overruns: std::array::from_fn(|_| std::sync::atomic::AtomicU64::new(0)),
         }
     }
 
@@ -256,7 +304,7 @@ impl ScanIndex {
     fn bucket(
         &self,
         list: ScanList,
-    ) -> &crate::runtime::sync::PriorityInheritanceMutex<BTreeSet<(i16, u64, String)>> {
+    ) -> &crate::runtime::sync::PriorityInheritanceMutex<BTreeSet<ScanKey>> {
         &self.buckets[list.slot()]
     }
 }
@@ -282,17 +330,16 @@ struct PvDatabaseInner {
     simple_pvs:
         crate::runtime::sync::PriorityInheritanceMutex<HashMap<String, Arc<ProcessVariable>>>,
     records: parking_lot::RwLock<HashMap<String, Arc<parking_lot::RwLock<RecordInstance>>>>,
-    /// Scan index: maps scan type → sorted set of
-    /// `(PHAS, load_order, record_name)`.
+    /// Scan index: maps scan list → sorted set of [`ScanKey`].
     ///
-    /// C parity (`dbScan.c:1052-1095`): `buildScanLists` walks records
-    /// in database / record-type **load order** and `addToList`
-    /// inserts each after the last element with `phas <= precord->phas`
-    /// — so within one PHAS value the scan list is a stable FIFO in
-    /// load order. The secondary sort key is the per-record
-    /// `load_order` sequence (NOT the record name), so two records
-    /// sharing a PHAS scan in the order they were loaded, matching a
-    /// C IOC built from the same `.db` file.
+    /// C parity (`dbScan.c:1052-1095`): `buildScanLists` walks record types in
+    /// DBD load order and, within each, that type's instances in `.db` load
+    /// order; `addToList` inserts each after the last element with
+    /// `phas <= precord->phas`, so within one PHAS the list is a stable FIFO
+    /// over that feed order. Both halves of the feed order are in the key —
+    /// the record-type ordinal first, the `.db` load sequence second. The
+    /// record name is only a final tiebreak and never decides the order of two
+    /// real records.
     /// Keyed by [`ScanList`], not `ScanType`: a `Passive` or illegal SCAN names
     /// no list (C `scanAdd`, dbScan.c:241-251) and so cannot be a key at all.
     ///
@@ -1652,10 +1699,12 @@ impl PvDatabase {
 
         let scan = instance.common.scan;
         let phas = instance.common.phas;
-        self.inner.records.write().insert(
-            name.to_string(),
-            Arc::new(parking_lot::RwLock::new(instance)),
-        );
+        let record_type = instance.record.record_type();
+        let rec_arc = Arc::new(parking_lot::RwLock::new(instance));
+        self.inner
+            .records
+            .write()
+            .insert(name.to_string(), rec_arc.clone());
         // The record is reachable from this line on, so anything its
         // `set_async_context` parked above may now run. This is the only
         // release site because this is the only site that registers the name.
@@ -1676,8 +1725,20 @@ impl PvDatabase {
                 .scan_index
                 .bucket(list)
                 .lock()
-                .insert((phas, seq, name.to_string()));
+                .insert(ScanKey::new(phas, record_type, seq, name));
         }
+
+        // The rest of C's `init_record` pass 1, which needs the record
+        // REGISTERED and so cannot run with `run_init_passes` above:
+        // `recGblInitSimm` plus its `recGblInitConstantLink(&siol, …, &sval)`
+        // (recGbl.c:438-444, from e.g. aiRecord.c:101), then `wdogInit`
+        // (histogramRecord.c:168). C reaches both through `iterateRecords`
+        // (`iocInit.c:562-586`), which visits every record in the database
+        // whatever created it; here they sat on the loader callers instead, so
+        // an inline or `dbCreateRecord` record got neither. Both are no-ops for
+        // a record type that declares no SIMM / no SDEL.
+        self.rec_gbl_init_simm(&rec_arc);
+        self.arm_watchdog(name);
         Ok(())
     }
 
@@ -1740,7 +1801,7 @@ impl PvDatabase {
                 .scan_index
                 .bucket(list)
                 .lock()
-                .retain(|(_, _, n)| n != name);
+                .retain(|k| k.name != name);
         }
 
         // 2b) Drop the load-order entry.
@@ -2798,19 +2859,33 @@ mod tests {
         .unwrap();
         db.add_alias("ALIAS", "TARGET").await.unwrap();
 
+        // The marker's lifetime is the frame, so by the time the call
+        // returns the stack is empty and so is the set — see the invariant on
+        // `run_process_frame`. What this pins is that the alias resolved to
+        // the canonical name on the way IN: seed the set with "TARGET" and the
+        // entry must find itself already on the stack and decline.
         let mut visited = std::collections::HashSet::new();
         db.process_record_with_links("ALIAS", &mut visited, 0)
             .await
             .unwrap();
-
-        // visited should contain the *canonical* name only.
         assert!(
-            visited.contains("TARGET"),
-            "visited must record the canonical name: {visited:?}",
+            visited.is_empty(),
+            "a finished frame leaves no marker behind: {visited:?}",
         );
+
+        let mut seeded = std::collections::HashSet::new();
+        seeded.insert("TARGET".to_string());
+        db.process_record_with_links("ALIAS", &mut seeded, 0)
+            .await
+            .unwrap();
         assert!(
-            !visited.contains("ALIAS"),
-            "visited must NOT record the alias form: {visited:?}",
+            !seeded.contains("ALIAS"),
+            "the alias form must never enter the set: {seeded:?}",
+        );
+        assert_eq!(
+            seeded.len(),
+            1,
+            "the alias resolved to TARGET and was declined, adding nothing: {seeded:?}",
         );
     }
 

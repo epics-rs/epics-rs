@@ -32483,6 +32483,61 @@ pub fn device_link_type(record_type: &str, dtyp: &str) -> Option<DbLinkType> {
         .map(|(_, lt)| *lt)
 }
 
+/// Every record type this port declares, in DBD **load** order — the order
+/// C's `pdbbase->recordTypeList` holds.
+///
+/// `buildScanLists` (`dbScan.c:1054-1076`) feeds `scanAdd` record-type-major:
+/// the outer loop walks `recordTypeList`, the inner one walks that type's
+/// instances in `.db` order. So this table, not `.db` declaration order alone,
+/// is what decides which of two same-`PHAS` records scans first.
+///
+/// Base's own types come from `stdRecords.dbd`, vendored beside the `.dbd`
+/// files it names; every other type this port vendors sorts after all of them,
+/// where a C IOC also puts a module `.dbd` included after `base.dbd`.
+pub static RECORD_TYPE_ORDER: &[&str] = &[
+    "aai",
+    "aao",
+    "ai",
+    "ao",
+    "aSub",
+    "bi",
+    "bo",
+    "calc",
+    "calcout",
+    "compress",
+    "dfanout",
+    "event",
+    "fanout",
+    "histogram",
+    "int64in",
+    "int64out",
+    "longin",
+    "longout",
+    "lsi",
+    "lso",
+    "mbbi",
+    "mbbiDirect",
+    "mbbo",
+    "mbboDirect",
+    "permissive",
+    "printf",
+    "sel",
+    "seq",
+    "state",
+    "stringin",
+    "stringout",
+    "sub",
+    "subArray",
+    "waveform",
+    "acalcout",
+    "asyn",
+    "busy",
+    "scalcout",
+    "sseq",
+    "swait",
+    "transform",
+];
+
 /// The record-own field table for a record type name, or `None` for a type
 /// no vendored `.dbd` declares.
 pub fn record_fields(record_type: &str) -> Option<&'static [FieldDesc]> {

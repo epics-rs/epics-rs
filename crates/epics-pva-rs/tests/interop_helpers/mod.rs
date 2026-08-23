@@ -1,9 +1,9 @@
 //! Helpers shared across `interop_pvxs.rs` sub-modules.
 //!
 //! pvxs binaries are not on PATH by default. We look them up
-//! under `~/codes/pvxs/bin/<host-arch>/` (the layout the user's
-//! local build produces), then fall back to PATH. When spawning
-//! the binary, prepend `~/codes/pvxs/lib/<host-arch>/` to
+//! under `<pvxs>/bin/<host-arch>/` (the layout a local build
+//! produces), then fall back to PATH. When spawning
+//! the binary, prepend `<pvxs>/lib/<host-arch>/` to
 //! `DYLD_LIBRARY_PATH` (mac) / `LD_LIBRARY_PATH` (linux) so the
 //! bundled libpvxs is found.
 
@@ -14,14 +14,17 @@ pub mod pv_builders;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 
-/// `~/codes/pvxs` per the project convention. Override via
-/// `PVXS_HOME` env var.
+/// The pvxs checkout, via the shared resolver (`PVXS_HOME` overrides it).
+///
+/// This used to fall back to `$HOME/codes/pvxs`, and before that to a
+/// hard-coded `/Users/<name>/codes/pvxs`; on a machine where the checkout
+/// lives anywhere else every interop test silently reported SKIP — which
+/// nextest prints as a pass. Resolution failure is now fatal, matching the
+/// parity guards; a resolved tree whose binaries are simply not built still
+/// skips, because that is an absent build artifact rather than a
+/// misconfigured path (see `require_pvxs`).
 fn pvxs_home() -> PathBuf {
-    if let Ok(h) = std::env::var("PVXS_HOME") {
-        return PathBuf::from(h);
-    }
-    let home = std::env::var("HOME").unwrap_or_else(|_| "/Users/stevek".to_string());
-    PathBuf::from(home).join("codes/pvxs")
+    epics_base_rs::reference::reference_root(epics_base_rs::reference::ReferenceTree::Pvxs)
 }
 
 /// Host-arch name pvxs uses for its `bin/` and `lib/`

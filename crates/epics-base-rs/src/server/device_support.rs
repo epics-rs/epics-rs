@@ -312,10 +312,16 @@ pub trait DeviceSupport: Send + Sync + 'static {
 /// 3. `init(record)` — driver `init_record` equivalent.
 ///
 /// On `init()` failure the record is flagged `INVALID` severity with
-/// a `SOFT` status and a diagnostic is logged — matching C
-/// `initDevSup`/`init_record` failure handling (the record is marked,
-/// not silently attached as healthy). On success, UDF is cleared if
-/// the driver produced a value.
+/// a `SOFT` status and a diagnostic is logged, so the failure is
+/// observable rather than silently attached as healthy.
+///
+/// Success clears NOTHING. In C, whether an `init_record` defines the
+/// record is a property of the individual dset, not of the framework:
+/// `devTimestamp.c` declares no `init_record` at all and clears
+/// `prec->udf` only inside `read_ai`/`read_stringin` (`:40`, `:65`),
+/// and `iocInit.c::doInitRecord0` (`:508-533`) only READS `udf` to
+/// derive the initial severity. A record whose device support has
+/// produced no value is still undefined, and says so.
 ///
 /// The device is attached (`instance.device = Some(dev)`) regardless
 /// of init outcome so the record is addressable; a failed init leaves
@@ -324,24 +330,15 @@ pub fn wire_device_to_record(instance: &mut RecordInstance, mut dev: Box<dyn Dev
     let name = instance.name.clone();
     dev.set_record_info(&name, instance.common.scan);
     dev.apply_record_info(&instance.info);
-    match dev.init(&mut *instance.record) {
-        Ok(()) => {
-            // Clear UDF if init successfully produced a value
-            // (e.g. an initial readback).
-            if instance.record.val().is_some() {
-                instance.common.udf = 0;
-            }
-        }
-        Err(e) => {
-            eprintln!(
-                "device support init failed for record '{name}' (DTYP '{}'): {e}",
-                instance.common.dtyp
-            );
-            // Flag the record so the failure is observable rather
-            // than presenting a healthy-looking record.
-            instance.common.sevr = AlarmSeverity::Invalid;
-            instance.common.stat = crate::server::recgbl::alarm_status::SOFT_ALARM;
-        }
+    if let Err(e) = dev.init(&mut *instance.record) {
+        eprintln!(
+            "device support init failed for record '{name}' (DTYP '{}'): {e}",
+            instance.common.dtyp
+        );
+        // Flag the record so the failure is observable rather
+        // than presenting a healthy-looking record.
+        instance.common.sevr = AlarmSeverity::Invalid;
+        instance.common.stat = crate::server::recgbl::alarm_status::SOFT_ALARM;
     }
     instance.device = Some(dev);
 }

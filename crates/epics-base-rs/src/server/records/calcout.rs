@@ -537,6 +537,11 @@ impl Record for CalcoutRecord {
         "calcout"
     }
 
+    /// `calcoutRecord.c:417-423` `get_linkNumber` — identical to `calc`'s.
+    fn link_backed_metadata_field(&self, field: &str) -> Option<String> {
+        crate::server::record::calc_class_link_backed_metadata_field(field)
+    }
+
     /// `ODLY` is the one field in base whose graphic case is neither the
     /// record's limits, nor a link, nor a plain `default:` arm
     /// (`calcoutRecord.c:471-474`):

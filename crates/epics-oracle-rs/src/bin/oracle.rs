@@ -1,9 +1,11 @@
 //! The differential oracle, as a command.
 //!
-//! Exit code is the verdict: **non-zero if there is any DEFECT or any ERROR**.
-//! An unmeasurable case fails the run exactly like a wrong one, because a
-//! harness that exits 0 when it could not look is the thing that produced 21
-//! false-clean verdicts in the audit loop.
+//! Exit code is the verdict, and the rule lives in one place for every phase:
+//! [`epics_oracle_rs::report::run_failures`]. Non-zero for any DEFECT, any
+//! ERROR, and any record type the port could not implement. An unmeasurable
+//! case fails the run exactly like a wrong one, because a harness that exits 0
+//! when it could not look is the thing that produced 21 false-clean verdicts in
+//! the audit loop.
 
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -12,10 +14,10 @@ use clap::{Parser, ValueEnum};
 use epics_oracle_rs::allowlist::Allowlist;
 use epics_oracle_rs::dbd::Dbd;
 use epics_oracle_rs::ioc::{CTools, PvxTools};
-use epics_oracle_rs::report::{Counts, Denominator, Report, StaleRow};
+use epics_oracle_rs::report::CaseResult;
+use epics_oracle_rs::report::{Counts, Denominator, Report, StaleRow, exit_status, run_failures};
 use epics_oracle_rs::runner::{Runner, select_types, workdir};
-use epics_oracle_rs::surface::{Coverage, Surface, probe_supported_record_types};
-use epics_oracle_rs::{Verdict, report::CaseResult};
+use epics_oracle_rs::surface::{Surface, probe_supported_record_types};
 use epics_oracle_rs::{pvamonitor, pvaread};
 
 #[derive(Copy, Clone, PartialEq, Eq, ValueEnum)]
@@ -26,8 +28,9 @@ enum Phase {
     Put,
     /// Monitor event sequence and count.
     Monitor,
-    /// Array put-and-readback across element-count boundaries (single, partial,
-    /// exactly NELM, one past NELM) for record types whose VAL is a bounded
+    /// Array put-and-readback across element-count boundaries (zero-length,
+    /// single, partial, exactly NELM, one past NELM) for record types whose
+    /// VAL is a bounded
     /// array (waveform/aai/aao/subArray). Part of `All`: same C ground truth,
     /// same CA tools, same allowlist — it just reaches the `DBF_NOACCESS` array
     /// VAL the scalar phases exclude.
@@ -125,7 +128,7 @@ async fn run() -> Result<ExitCode, String> {
     // source -- the field tables are being regenerated concurrently, so source
     // would be stale.
     eprintln!("probing which record types the port implements...");
-    let supported = probe_supported_record_types(&dbd).await;
+    let supported = probe_supported_record_types(&dbd).await?;
     let surface = Surface::build(&dbd, &supported);
     let types = select_types(&surface, &args.record_types);
 
@@ -138,6 +141,7 @@ async fn run() -> Result<ExitCode, String> {
 
     let runner = Runner::new(tools, dbd, workdir(None)?);
     let mut cases: Vec<CaseResult> = Vec::new();
+    let drives_puts = matches!(args.phase, Phase::Put | Phase::Monitor | Phase::All);
 
     for (i, rt) in types.iter().enumerate() {
         eprintln!("[{}/{}] {rt}", i + 1, types.len());
@@ -145,23 +149,24 @@ async fn run() -> Result<ExitCode, String> {
         if matches!(args.phase, Phase::Read | Phase::All) {
             cases.extend(runner.probe_reads(rt, &surface, &mut allowlist));
         }
-        if matches!(args.phase, Phase::Put | Phase::All) {
-            if epics_oracle_rs::puts_are_measurable(rt) {
-                cases.extend(runner.probe_puts(rt, &surface, &mut allowlist, args.max_put_cases));
-            } else {
-                // Loud, by-policy skip — NOT a silent false-clean. See
-                // `puts_are_measurable`: this record's puts cannot complete
-                // against the disconnected ORACLEASYN port, so driving them
-                // would only manufacture timeouts. The omission is declared
-                // here so a clean `--phase all` exit never implies asyn puts
-                // were measured.
-                eprintln!(
-                    "    put phase skipped for {rt}: read/monitor-only \
-                     (unmeasurable against the disconnected ORACLEASYN port)"
-                );
-            }
+        // One predicate for every phase that drives a put, announced once.
+        // The monitor phase stimulates its subscription with puts, so a record
+        // whose puts cannot complete cannot be monitored either: its trace
+        // would be empty on both sides and score AGREED on an experiment that
+        // never ran. Loud and by policy — NOT a silent false-clean — so a clean
+        // `--phase all` exit never implies these were measured.
+        let drivable = epics_oracle_rs::puts_are_measurable(rt);
+        if drives_puts && !drivable {
+            eprintln!(
+                "    put-driven phases (put, monitor) skipped for {rt}: read-only \
+                 (unmeasurable against the disconnected ORACLEASYN port)"
+            );
         }
-        if matches!(args.phase, Phase::Monitor | Phase::All) {
+
+        if matches!(args.phase, Phase::Put | Phase::All) && drivable {
+            cases.extend(runner.probe_puts(rt, &surface, &mut allowlist, args.max_put_cases));
+        }
+        if matches!(args.phase, Phase::Monitor | Phase::All) && drivable {
             cases.extend(runner.probe_monitor(rt, &surface, &mut allowlist));
         }
         if matches!(args.phase, Phase::Array | Phase::All) {
@@ -169,36 +174,10 @@ async fn run() -> Result<ExitCode, String> {
         }
     }
 
-    // Field coverage is measured over the READ probe, which is the phase that
-    // visits every field of the denominator exactly once. A field is "covered"
-    // only if BOTH sides produced a reading for it.
-    let field_coverage = if matches!(args.phase, Phase::Read | Phase::All) {
-        let read_cases: Vec<&CaseResult> = cases
-            .iter()
-            .filter(|c| c.class.is_none() && !c.field.is_empty())
-            .collect();
-        let measured = read_cases
-            .iter()
-            .filter(|c| c.verdict != Verdict::Errored)
-            .count();
-        let errored = read_cases.len().saturating_sub(measured);
-        Coverage {
-            enumerated: surface.denominator(),
-            // Only fields we actually visited count; a --record-types filter
-            // shrinks what was measured but NOT the denominator, so a partial
-            // run honestly reports partial coverage.
-            measured,
-            errored,
-        }
-    } else {
-        // The put/monitor phases do not visit every field, so claiming field
-        // coverage from them would be an inflated number. Say zero and mean it.
-        Coverage {
-            enumerated: surface.denominator(),
-            measured: 0,
-            errored: 0,
-        }
-    };
+    // Field coverage counts the READ probe and nothing else, by the phase each
+    // case records; see `report::field_coverage` for why that has to be the
+    // recorded phase and not the absence of a boundary class.
+    let field_coverage = epics_oracle_rs::report::field_coverage(&cases, surface.denominator());
 
     let counts = Counts::tally(&cases);
     counts.check()?;
@@ -234,13 +213,28 @@ async fn run() -> Result<ExitCode, String> {
     }
     println!("{}", report.human());
 
-    // A DEFECT or an ERROR both fail the run. "Could not measure" is not a pass.
-    let ok = report.counts.defect == 0 && report.counts.errored == 0;
-    Ok(if ok {
-        ExitCode::SUCCESS
-    } else {
-        ExitCode::FAILURE
-    })
+    Ok(verdict_exit(
+        &report.counts,
+        &surface.unimplemented_types,
+        &report.stale_allowlist_rows,
+    ))
+}
+
+/// The exit code, from the single owner in [`run_failures`].
+///
+/// Every phase ends here so the rule cannot diverge between them; each failure
+/// reason is printed by name, because a bare non-zero exit tells a CI log
+/// nothing about which finding produced it.
+fn verdict_exit(counts: &Counts, unimplemented: &[String], stale: &[StaleRow]) -> ExitCode {
+    let failures = run_failures(counts, unimplemented, stale);
+    if failures.is_empty() {
+        return ExitCode::from(exit_status(&failures));
+    }
+    eprintln!("oracle: run FAILED:");
+    for f in &failures {
+        eprintln!("  - {f}");
+    }
+    ExitCode::from(exit_status(&failures))
 }
 
 /// The PVA read phase. Its own path rather than a branch inside the CA run: it
@@ -261,7 +255,7 @@ async fn run_pva_read(args: &Args) -> Result<ExitCode, String> {
     // Which record types the port implements is MEASURED, not read out of its
     // source -- the same probe the CA phases use, for the same reason.
     eprintln!("probing which record types the port implements...");
-    let supported = probe_supported_record_types(&dbd).await;
+    let supported = probe_supported_record_types(&dbd).await?;
     let surface = Surface::build(&dbd, &supported);
     let types = select_types(&surface, &args.record_types);
 
@@ -286,14 +280,11 @@ async fn run_pva_read(args: &Args) -> Result<ExitCode, String> {
     }
     println!("{}", report.human());
 
-    // Same rule as the CA phases: a case that could not run fails the run
-    // exactly like a wrong one.
-    let ok = report.counts.defect == 0 && report.counts.errored == 0;
-    Ok(if ok {
-        ExitCode::SUCCESS
-    } else {
-        ExitCode::FAILURE
-    })
+    Ok(verdict_exit(
+        &report.counts,
+        &surface.unimplemented_types,
+        &report.stale_allowlist_rows,
+    ))
 }
 
 /// The PVA monitor phase: the analogue of CA's Phase C, one protocol over.
@@ -303,7 +294,7 @@ async fn run_pva_monitor(args: &Args) -> Result<ExitCode, String> {
     let dbd = Dbd::parse_file(&args.dbd)?;
 
     eprintln!("probing which record types the port implements...");
-    let supported = probe_supported_record_types(&dbd).await;
+    let supported = probe_supported_record_types(&dbd).await?;
     let surface = Surface::build(&dbd, &supported);
     let types = select_types(&surface, &args.record_types);
 
@@ -328,12 +319,9 @@ async fn run_pva_monitor(args: &Args) -> Result<ExitCode, String> {
     }
     println!("{}", report.human());
 
-    // Same rule as every other phase: a case that could not run fails the run
-    // exactly like a wrong one.
-    let ok = report.counts.defect == 0 && report.counts.errored == 0;
-    Ok(if ok {
-        ExitCode::SUCCESS
-    } else {
-        ExitCode::FAILURE
-    })
+    Ok(verdict_exit(
+        &report.counts,
+        &surface.unimplemented_types,
+        &report.stale_allowlist_rows,
+    ))
 }

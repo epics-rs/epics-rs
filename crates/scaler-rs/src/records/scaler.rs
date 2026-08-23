@@ -4,7 +4,9 @@ use std::time::Instant;
 
 use super::dbd_generated;
 use epics_base_rs::error::{CaError, CaResult};
-use epics_base_rs::server::record::{FieldDesc, ProcessAction, ProcessOutcome, Record};
+use epics_base_rs::server::record::{
+    FieldDesc, FieldMetadataOverride, ProcessAction, ProcessOutcome, Record,
+};
 use epics_base_rs::types::{EpicsValue, PvString};
 
 /// Maximum number of scaler channels.
@@ -609,9 +611,28 @@ static PROCESS_POSTED_BY_NCH: LazyLock<Vec<Vec<&'static str>>> = LazyLock::new(|
         .collect()
 });
 
+/// C `scalerRecord.c:735` writes the literal `*precision = 2` for `VERS`, the
+/// record-support version number.
+const SCALER_VERS_PRECISION: i16 = 2;
+
 impl Record for ScalerRecord {
     fn record_type(&self) -> &'static str {
         "scaler"
+    }
+
+    /// `scalerRecord.c:728-742` seeds `pscal->prec`, then answers `VERS` with a
+    /// literal 2 and every field at or after `VAL` with `pscal->prec` again —
+    /// and its `recGblGetPrec` arm only reaches dbCommon, which has no
+    /// DBF_DOUBLE field, so the seed survives everywhere else too. That leaves
+    /// `VERS` as the sole per-field departure, and it is the one the
+    /// record-level PREC cache would otherwise answer wrongly.
+    fn field_metadata_override(&self, field: &str) -> Option<FieldMetadataOverride> {
+        field
+            .eq_ignore_ascii_case("VERS")
+            .then(|| FieldMetadataOverride {
+                precision: Some(SCALER_VERS_PRECISION),
+                ..Default::default()
+            })
     }
 
     fn process(&mut self) -> CaResult<ProcessOutcome> {

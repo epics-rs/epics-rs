@@ -5208,3 +5208,46 @@ mod menu_choice_tests {
         assert_eq!(menu("VAL"), None);
     }
 }
+
+#[cfg(test)]
+mod rset_routing_tests {
+    use super::TableRecord;
+    use epics_base_rs::server::record::RecordInstance;
+
+    /// `tableRecord.c:778-792` / `:795-810` list ONE window — the six user
+    /// coordinates `AX`..`Z`, answered from `hlax[i]`/`llax[i]` — and hand
+    /// every other field to `recGblGetGraphicDouble` /
+    /// `recGblGetControlDouble`. `VAL` is not in that window, so C serves it
+    /// the DBF_DOUBLE type range (`recGbl.c:55` `getMaxRangeValues`), and the
+    /// port served the record-level cache instead — which `table` never
+    /// populates, so the wire carried 0/0 on a channel that declares both
+    /// leaves.
+    #[test]
+    fn table_val_takes_the_recgbl_range_not_an_empty_cache() {
+        let inst = RecordInstance::new("TBL:LIM".into(), TableRecord::new());
+        let snap = inst.snapshot_for_field("VAL").unwrap();
+
+        assert!(
+            snap.properties.graphic_double && snap.properties.control_double,
+            "table declares both slots (tableRecord.c:175-182 NULLs only \
+             get_enum_str and get_alarm_double)"
+        );
+        assert_eq!(snap.display_limits(), Some((-1e300, 1e300)));
+        assert_eq!(snap.control_limits(), Some((-1e300, 1e300)));
+    }
+
+    /// The window itself keeps answering from the record, through
+    /// `field_metadata_override` — the routing change must not cost `AX` its
+    /// limits.
+    #[test]
+    fn table_coordinate_window_keeps_its_own_limits() {
+        let mut rec = TableRecord::new();
+        rec.set_calc_hi_limit(&[1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
+        rec.set_calc_lo_limit(&[-1.0, -2.0, -3.0, -4.0, -5.0, -6.0]);
+        let inst = RecordInstance::new("TBL:LIM".into(), rec);
+
+        let snap = inst.snapshot_for_field("AX").unwrap();
+        assert_eq!(snap.display_limits(), Some((-1.0, 1.0)));
+        assert_eq!(snap.control_limits(), Some((-1.0, 1.0)));
+    }
+}

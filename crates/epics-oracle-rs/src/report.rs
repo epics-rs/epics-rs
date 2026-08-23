@@ -46,12 +46,43 @@ impl Reproducer {
     }
 }
 
+/// Which probe produced a case.
+///
+/// Recorded by the producer, never inferred at a consumer. It exists because
+/// [`CaseResult::class`] cannot answer the question: `class` is the boundary
+/// *value* driven, and it is `None` for the read phase and the monitor phase
+/// alike, so `class.is_none()` selects two different experiments.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum CasePhase {
+    Read,
+    Put,
+    Monitor,
+    Array,
+}
+
+impl CasePhase {
+    /// The one spelling: the same word serde writes, so a JSON reader and a
+    /// human reader name the same probe.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Read => "read",
+            Self::Put => "put",
+            Self::Monitor => "monitor",
+            Self::Array => "array",
+        }
+    }
+}
+
 /// One adjudicated case.
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct CaseResult {
     pub record_type: String,
     pub field: String,
-    /// The boundary class driven, for put cases.
+    /// The probe this case came from. Not derivable from `class`.
+    pub phase: CasePhase,
+    /// The boundary value class driven, for the put and array phases. `None`
+    /// says "no boundary value", NOT "read phase" — see [`CasePhase`].
     pub class: Option<String>,
     pub verdict: Verdict,
     pub differences: Vec<Difference>,
@@ -65,11 +96,62 @@ pub struct CaseResult {
 }
 
 impl CaseResult {
+    /// What a human types back to re-find this case.
+    ///
+    /// It must name the probe. Four phases put cases into one report, and the
+    /// read and monitor phases both drive `VAL` with no boundary class, so
+    /// `record_type.field` alone rendered two different measurements of `ai.VAL`
+    /// as one string in the DEFECTS list — the reader cannot tell which
+    /// experiment the difference came from, and the two entries read as a
+    /// duplicate rather than as two findings.
     pub fn id(&self) -> String {
         match &self.class {
-            Some(c) => format!("{}.{}[{}]", self.record_type, self.field, c),
-            None => format!("{}.{}", self.record_type, self.field),
+            Some(c) => format!(
+                "{}.{} {}[{}]",
+                self.record_type,
+                self.field,
+                self.phase.as_str(),
+                c
+            ),
+            None => format!(
+                "{}.{} {}",
+                self.record_type,
+                self.field,
+                self.phase.as_str()
+            ),
         }
+    }
+}
+
+/// Field coverage, over the **read** probe alone.
+///
+/// The read probe is the only phase that visits every field of the denominator
+/// exactly once, so it is the only phase whose case count is commensurable with
+/// that denominator. Selecting it by [`CasePhase::Read`] rather than by "has no
+/// boundary class" is what keeps the fraction honest: one monitor case per
+/// record type also carries no class, and counting those inflated `measured`
+/// past the fields actually read — far worse, a monitor agreement then offset a
+/// read ERROR and the measurement failure vanished from the number.
+///
+/// Phases that visit only part of the surface contribute nothing here and need
+/// no special case: a run without a read phase simply has no read cases, and
+/// honestly reports zero.
+pub fn field_coverage(cases: &[CaseResult], enumerated: usize) -> Coverage {
+    let read: Vec<&CaseResult> = cases
+        .iter()
+        .filter(|c| c.phase == CasePhase::Read && !c.field.is_empty())
+        .collect();
+    let measured = read
+        .iter()
+        .filter(|c| c.verdict != Verdict::Errored)
+        .count();
+    Coverage {
+        enumerated,
+        // Only fields actually visited count; a --record-types filter shrinks
+        // what was measured but NOT the denominator, so a partial run honestly
+        // reports partial coverage.
+        measured,
+        errored: read.len() - measured,
     }
 }
 
@@ -119,6 +201,76 @@ impl Counts {
         }
         Ok(())
     }
+}
+
+/// Why this run must fail — one line per reason, empty iff the run is clean.
+///
+/// **The single owner of the exit code**, for every phase. The rule used to be
+/// written out three times (`bin/oracle.rs`, once per phase) as
+/// `defect == 0 && errored == 0`, and each copy read only the two counters it
+/// happened to know about. Everything else the run reported — an unimplemented
+/// record type, a stale allowlist row — was printed and then discarded by the
+/// caller, so a finding the harness had correctly detected still exited 0.
+///
+/// A reason here is a *finding the run made*, not a bucket: the caller prints
+/// the lines and exits non-zero if there are any, so adding a finding class
+/// means adding it once, here.
+///
+/// - **DEFECT / ERROR** — the original two. "Could not measure" fails exactly
+///   like "measured wrong"; that is the rule the audit loop lacked.
+/// - **Unimplemented record type** — the port cannot load a type the `.dbd`
+///   declares, so every field of it went unmeasured. It is in the denominator
+///   (see [`crate::surface`]), so coverage already fell; the exit code must say
+///   so too, or a record type going dark is a green run.
+/// - **Stale allowlist row** — a justified deviation whose scope this run did
+///   observe and which never fired, so the deviation stopped happening: either
+///   the port regressed onto C's bug or C fixed it upstream. Both are findings
+///   the harness detected correctly and the caller then discarded. Rows the run
+///   never exercised are NOT here — see [`crate::allowlist::Allowlist::
+///   unexercised_rows`]; failing on those would make every scoped run red.
+pub fn run_failures(
+    counts: &Counts,
+    unimplemented_types: &[String],
+    stale_rows: &[StaleRow],
+) -> Vec<String> {
+    let mut out = Vec::new();
+    if counts.defect > 0 {
+        out.push(format!("{} DEFECT case(s)", counts.defect));
+    }
+    if counts.errored > 0 {
+        out.push(format!(
+            "{} ERROR case(s) — could not measure, which is not a pass",
+            counts.errored
+        ));
+    }
+    if !unimplemented_types.is_empty() {
+        out.push(format!(
+            "{} record type(s) the port does not implement: {} — every field of \
+             each went unmeasured",
+            unimplemented_types.len(),
+            unimplemented_types.join(", ")
+        ));
+    }
+    if !stale_rows.is_empty() {
+        let ids: Vec<&str> = stale_rows.iter().map(|r| r.id.as_str()).collect();
+        out.push(format!(
+            "{} STALE allowlist row(s): {} — the justified deviation stopped \
+             happening where the run looked",
+            stale_rows.len(),
+            ids.join(", ")
+        ));
+    }
+    out
+}
+
+/// The process exit code the run's findings require: 0 iff there are none.
+///
+/// The companion to [`run_failures`] and the reason the exit rule is a library
+/// value rather than a branch inside `bin/oracle.rs`: an exit code that only
+/// exists inside a binary cannot be asserted by a test, and this harness's
+/// whole output is its exit code.
+pub fn exit_status(failures: &[String]) -> u8 {
+    u8::from(!failures.is_empty())
 }
 
 /// A stale allowlist row: a justified deviation that stopped happening.
@@ -328,8 +480,20 @@ impl Report {
             s.push('\n');
         }
 
-        if c.defect == 0 && c.errored == 0 {
-            s.push_str("No defects, no errors. Every case ran and was adjudicated.\n");
+        // The printed verdict comes from the same owner as the exit code, so a
+        // run cannot exit non-zero while its report says it was clean — or,
+        // worse, print "every case ran" while a whole record type went dark.
+        let failures = run_failures(c, &d.record_types_unimplemented, &self.stale_allowlist_rows);
+        if failures.is_empty() {
+            s.push_str(
+                "No defects, no errors, every record type implemented. \
+                 Every case ran and was adjudicated.\n",
+            );
+        } else {
+            s.push_str("RUN FAILED\n");
+            for f in &failures {
+                s.push_str(&format!("  - {f}\n"));
+            }
         }
         s
     }
@@ -353,6 +517,7 @@ mod tests {
         CaseResult {
             record_type: "ai".into(),
             field: "VAL".into(),
+            phase: CasePhase::Read,
             class: None,
             verdict: v,
             differences: vec![],
@@ -421,6 +586,123 @@ mod tests {
         assert!((cov.percent() - 50.0).abs() < 1e-9, "50%, not 100%");
     }
 
+    /// A monitor case must not be able to pay for a read case's measurement
+    /// failure.
+    ///
+    /// Both phases leave `class` at `None`, so selecting the read probe by
+    /// "no boundary class" swept the monitor cases into the field-coverage
+    /// fraction. One field then failed to read while one monitor agreed, and
+    /// the two cancelled: the instrument printed full coverage over a surface
+    /// it had not managed to look at. The exit code still failed the run on the
+    /// ERROR, which is exactly what made the coverage line the lie — a reader
+    /// reconciling "why did this fail" against "100 % measured" is told the
+    /// failure was somewhere the harness had already covered.
+    #[test]
+    fn a_monitor_agreement_cannot_mask_a_read_measurement_failure() {
+        let mut read_err = case(Verdict::Errored);
+        read_err.field = "HIHI".into();
+        let mut mon_ok = case(Verdict::Agreed);
+        mon_ok.phase = CasePhase::Monitor;
+        let cases = vec![case(Verdict::Agreed), read_err, mon_ok];
+
+        let rep = Report {
+            denominator: Denominator {
+                dbd: "softIoc.dbd".into(),
+                record_types_in_dbd: 1,
+                record_types_covered: vec!["ai".into()],
+                record_types_unimplemented: vec![],
+                observable_fields: 2,
+                excluded_noaccess_fields: 0,
+            },
+            field_coverage: field_coverage(&cases, 2),
+            counts: Counts::tally(&cases),
+            stale_allowlist_rows: vec![],
+            unexercised_allowlist_rows: vec![],
+            fired_allowlist_rows: vec![],
+            cases,
+        };
+        let h = rep.human();
+        assert!(
+            h.contains("1/2 = 50.0%"),
+            "one of two fields was read; the monitor case is not a field. got:\n{h}"
+        );
+        assert!(
+            h.contains("fields that errored (NOT coverage): 1"),
+            "the read failure must survive in the number. got:\n{h}"
+        );
+        assert!(h.contains("RUN FAILED"), "an ERROR case fails the run");
+        assert_eq!(
+            exit_status(&run_failures(&rep.counts, &[], &[])),
+            1,
+            "and the exit code says the same"
+        );
+    }
+
+    /// Two probes measuring the same field must be two rows a reader can tell
+    /// apart, in the human report and in the JSON alike.
+    ///
+    /// The read and monitor phases both drive `VAL` carrying no boundary class,
+    /// so `ai.VAL` named both. A DEFECT found by the monitor probe and one found
+    /// by the read probe then printed under the same identifier: the reader who
+    /// pastes it back re-runs the wrong experiment, or reads two findings as one
+    /// duplicated line.
+    #[test]
+    fn a_read_case_and_a_monitor_case_on_one_field_are_two_identifiable_findings() {
+        let read = case(Verdict::Defect);
+        let mut mon = case(Verdict::Defect);
+        mon.phase = CasePhase::Monitor;
+        assert_eq!(read.record_type, mon.record_type);
+        assert_eq!(read.field, mon.field);
+        assert_ne!(
+            read.id(),
+            mon.id(),
+            "two probes of the same field must not share one identifier"
+        );
+
+        let cases = vec![read, mon];
+        let rep = Report {
+            denominator: Denominator {
+                dbd: "softIoc.dbd".into(),
+                record_types_in_dbd: 1,
+                record_types_covered: vec!["ai".into()],
+                record_types_unimplemented: vec![],
+                observable_fields: 1,
+                excluded_noaccess_fields: 0,
+            },
+            field_coverage: field_coverage(&cases, 1),
+            counts: Counts::tally(&cases),
+            stale_allowlist_rows: vec![],
+            unexercised_allowlist_rows: vec![],
+            fired_allowlist_rows: vec![],
+            cases,
+        };
+
+        let h = rep.human();
+        assert!(
+            h.contains("DEFECTS (2)"),
+            "both defects are listed. got:\n{h}"
+        );
+        assert!(h.contains("[ai.VAL read]"), "the read case names its probe");
+        assert!(
+            h.contains("[ai.VAL monitor]"),
+            "the monitor case names its probe. got:\n{h}"
+        );
+        assert!(h.contains("RUN FAILED"));
+        assert_eq!(
+            exit_status(&run_failures(&rep.counts, &[], &[])),
+            1,
+            "two DEFECTs fail the run"
+        );
+
+        let json: serde_json::Value =
+            serde_json::from_str(&serde_json::to_string(&rep).expect("report serializes"))
+                .expect("valid json");
+        let arr = json["cases"].as_array().expect("cases is an array");
+        assert_eq!(arr.len(), 2, "both cases survive into the JSON");
+        assert_eq!(arr[0]["phase"], "read");
+        assert_eq!(arr[1]["phase"], "monitor");
+    }
+
     #[test]
     fn reproducer_renders_a_pasteable_db_and_ops() {
         let r = Reproducer {
@@ -465,6 +747,53 @@ mod tests {
         assert!(h.contains("STALE ALLOWLIST ROWS"));
         assert!(h.contains("ERROR"));
         assert!(!h.contains("No defects, no errors"));
+        assert!(
+            h.contains("RUN FAILED"),
+            "the printed verdict must match the exit code"
+        );
+    }
+
+    /// The report's printed verdict and the exit code are the same judgement.
+    /// A run with nothing wrong and nothing errored, but a record type that
+    /// never loaded, printed "Every case ran and was adjudicated" and exited 0
+    /// — a whole record type going dark, reported as a clean sweep.
+    #[test]
+    fn a_dark_record_type_fails_the_verdict_the_report_prints() {
+        let rep = Report {
+            denominator: Denominator {
+                dbd: "softIoc.dbd".into(),
+                record_types_in_dbd: 2,
+                record_types_covered: vec!["ai".into()],
+                record_types_unimplemented: vec!["calc".into()],
+                observable_fields: 100,
+                excluded_noaccess_fields: 0,
+            },
+            field_coverage: Coverage {
+                enumerated: 100,
+                measured: 20,
+                errored: 0,
+            },
+            counts: Counts::tally(&[case(Verdict::Agreed)]),
+            stale_allowlist_rows: vec![],
+            unexercised_allowlist_rows: vec![],
+            fired_allowlist_rows: vec![],
+            cases: vec![case(Verdict::Agreed)],
+        };
+        assert_eq!(rep.counts.defect, 0);
+        assert_eq!(rep.counts.errored, 0);
+
+        let h = rep.human();
+        assert!(h.contains("RUN FAILED"), "{h}");
+        assert!(h.contains("calc"), "the dark type must be named: {h}");
+        assert!(!h.contains("Every case ran and was adjudicated"), "{h}");
+        assert_eq!(
+            exit_status(&run_failures(
+                &rep.counts,
+                &rep.denominator.record_types_unimplemented,
+                &rep.stale_allowlist_rows,
+            )),
+            1,
+        );
     }
 
     #[test]
@@ -495,5 +824,121 @@ mod tests {
         assert!(j.contains("\"native_type\""));
         assert!(j.contains("DBF_ULONG"));
         assert!(j.contains("\"defect\""));
+    }
+
+    /// A run where every case AGREED but a record type never loaded has not
+    /// measured that record type at all. Before this, the exit rule read only
+    /// `defect` and `errored`, so the whole type going dark exited 0 and the
+    /// run read as clean — the false-clean this harness exists to prevent,
+    /// committed by the harness itself.
+    #[test]
+    fn an_unimplemented_record_type_fails_the_run_with_zero_defects_and_zero_errors() {
+        let counts = Counts::tally(&[case(Verdict::Agreed), case(Verdict::Agreed)]);
+        assert_eq!(counts.defect, 0);
+        assert_eq!(counts.errored, 0);
+
+        let failures = run_failures(&counts, &["aai".to_string(), "waveform".to_string()], &[]);
+        assert_eq!(exit_status(&failures), 1, "the run must exit non-zero");
+        assert_eq!(
+            failures.len(),
+            1,
+            "one reason, naming the types: {failures:?}"
+        );
+        assert!(failures[0].contains("aai"), "{failures:?}");
+        assert!(failures[0].contains("waveform"), "{failures:?}");
+    }
+
+    /// The other side of the same rule: with nothing wrong and nothing
+    /// unmeasured, the run exits 0. Without this the fix above could be
+    /// "always fail", which reports nothing at all.
+    #[test]
+    fn a_clean_fully_implemented_run_exits_zero() {
+        let counts = Counts::tally(&[case(Verdict::Agreed), case(Verdict::ExpectedDeviation)]);
+        let failures = run_failures(&counts, &[], &[]);
+        assert!(failures.is_empty(), "{failures:?}");
+        assert_eq!(exit_status(&failures), 0);
+    }
+
+    /// A justified deviation that stopped happening is a finding, and the run
+    /// must fail on it. The row is driven stale through the real allowlist —
+    /// the scope is exercised and nothing fires — rather than hand-built, so
+    /// this pins the path a run actually takes.
+    ///
+    /// Before this, `stale_rows()` was correct, the report printed the row, and
+    /// the exit code ignored it: the one place where "the harness noticed" and
+    /// "the harness reported clean" coexisted.
+    #[test]
+    fn a_stale_allowlist_row_fails_the_run_with_zero_defects_and_zero_errors() {
+        const F6: &str = r#"
+schema = 1
+[[deviation]]
+id = "CBUG-F6"
+bucket = "NOT-REPRODUCED"
+record_types = ["calc"]
+fields = ["INPM"]
+surface = ["put_accepted"]
+why = "C's special() rejects SPC_MOD; port accepts."
+"#;
+        let mut al = crate::allowlist::Allowlist::parse(F6).expect("fixture parses");
+        let ctx = crate::allowlist::MatchContext {
+            record_type: "calc",
+            field: "INPM",
+            dbf: crate::dbd::DbfType::InLink,
+            class: Some("link-constant"),
+        };
+        // The run drove the put and the two sides agreed: the deviation the row
+        // documents did not happen where the row points.
+        al.note_compared(&ctx, &[Surface::PutAccepted]);
+        let stale: Vec<StaleRow> = al
+            .stale_rows()
+            .into_iter()
+            .map(|r| StaleRow {
+                id: r.id.clone(),
+                why: r.why.trim().to_string(),
+            })
+            .collect();
+        assert_eq!(stale.len(), 1, "the row must be stale, not unexercised");
+
+        let counts = Counts::tally(&[case(Verdict::Agreed)]);
+        assert_eq!(counts.defect, 0);
+        assert_eq!(counts.errored, 0);
+
+        let failures = run_failures(&counts, &[], &stale);
+        assert_eq!(exit_status(&failures), 1, "{failures:?}");
+        assert!(failures[0].contains("CBUG-F6"), "{failures:?}");
+
+        let rep = Report {
+            denominator: Denominator {
+                dbd: "softIoc.dbd".into(),
+                record_types_in_dbd: 1,
+                record_types_covered: vec!["calc".into()],
+                record_types_unimplemented: vec![],
+                observable_fields: 10,
+                excluded_noaccess_fields: 0,
+            },
+            field_coverage: Coverage {
+                enumerated: 10,
+                measured: 10,
+                errored: 0,
+            },
+            counts,
+            stale_allowlist_rows: stale,
+            unexercised_allowlist_rows: vec![],
+            fired_allowlist_rows: vec![],
+            cases: vec![case(Verdict::Agreed)],
+        };
+        let h = rep.human();
+        assert!(h.contains("RUN FAILED"), "{h}");
+        assert!(!h.contains("Every case ran and was adjudicated"), "{h}");
+    }
+
+    /// The pre-existing half of the rule, kept asserted at the new owner: an
+    /// unmeasurable case fails exactly like a wrong one.
+    #[test]
+    fn a_defect_and_an_error_each_fail_the_run_on_their_own() {
+        let d = Counts::tally(&[case(Verdict::Defect)]);
+        assert_eq!(exit_status(&run_failures(&d, &[], &[])), 1);
+        let e = Counts::tally(&[case(Verdict::Errored)]);
+        assert_eq!(exit_status(&run_failures(&e, &[], &[])), 1);
     }
 }

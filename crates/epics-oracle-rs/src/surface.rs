@@ -17,10 +17,13 @@
 //!   any oracle. Counting them would silently inflate the denominator (they are
 //!   594 of the declarations) and make coverage look worse than it is while
 //!   measuring nothing.
-//! - **Record types the port does not implement are excluded from the
-//!   denominator but reported explicitly** as an unmeasured gap. They are a
-//!   real hole in coverage; they are just not a hole this harness can diff,
-//!   since there is nothing on the Rust side to diff against.
+//! - **Record types the port does not implement stay IN the denominator** and
+//!   are named separately. Their fields are CA-observable — C serves every one
+//!   of them — so the port not implementing the type is precisely why they went
+//!   unmeasured, not a reason to stop counting them. Dropping them shrank the
+//!   numerator and the denominator together, so a record type going dark left
+//!   the coverage percent unchanged and read as the port getting better; that
+//!   is the failure this module exists to make impossible.
 //!
 //! Which record types the port implements is **measured, not assumed** — see
 //! [`probe_supported_record_types`]. The port's field tables are being
@@ -52,10 +55,11 @@ pub struct Surface {
     /// Record types present in the `.dbd` **and** implemented by the port.
     pub covered_types: Vec<String>,
     /// Record types in the `.dbd` the port does not implement: a real coverage
-    /// gap, named so it cannot be quietly dropped.
+    /// gap, named so it cannot be quietly dropped, and counted in the
+    /// denominator so it cannot be quietly *shrunk* either.
     pub unimplemented_types: Vec<String>,
-    /// Every CA-observable (record type, field) pair of the covered types.
-    /// This is the denominator.
+    /// Every CA-observable (record type, field) pair of **every** record type in
+    /// the `.dbd`, implemented or not. This is the denominator.
     pub fields: Vec<FieldRef>,
     /// `DBF_NOACCESS` declarations excluded from the denominator, counted so
     /// the exclusion is auditable.
@@ -71,11 +75,14 @@ impl Surface {
         let mut excluded_noaccess = 0;
 
         for rt in &dbd.record_types {
-            if !supported.contains(&rt.name) {
+            if supported.contains(&rt.name) {
+                covered_types.push(rt.name.clone());
+            } else {
+                // Named, and its fields still counted below: an unimplemented
+                // type is an unmeasured part of the surface, not a smaller
+                // surface.
                 unimplemented_types.push(rt.name.clone());
-                continue;
             }
-            covered_types.push(rt.name.clone());
             for f in &rt.fields {
                 if !f.dbf.is_ca_observable() {
                     excluded_noaccess += 1;
@@ -96,7 +103,8 @@ impl Surface {
         }
     }
 
-    /// The denominator: CA-observable fields across the implemented types.
+    /// The denominator: CA-observable fields across every record type the
+    /// `.dbd` declares, whether or not the port implements it.
     pub fn denominator(&self) -> usize {
         self.fields.len()
     }
@@ -144,11 +152,22 @@ impl Coverage {
 /// accepts a record of this type and the server serves it".
 ///
 /// A type that fails to load is reported as unimplemented rather than being
-/// allowed to abort the run.
-pub async fn probe_supported_record_types(dbd: &Dbd) -> BTreeSet<String> {
-    use epics_base_rs::server::ioc_builder::IocBuilder;
+/// allowed to abort the run — but the *probe* failing to configure itself is
+/// not that, so it is an error rather than an empty answer. An unconfigurable
+/// probe would report every record type unimplemented, which now reads as a
+/// wholly unmeasured surface rather than as a clean run.
+///
+/// The IOC is built through [`crate::register_port_ioc_devices`] and
+/// [`crate::port_ioc_builder`] — the same pair `oracle-ioc` uses — so the
+/// denominator is measured from the configuration actually under test. A bare
+/// `IocBuilder` answers for a *different* IOC: `asyn` resolves to
+/// epics-base-rs's CNCT-only stub record instead of asyn-rs's `AsynRecord` on
+/// `ORACLEASYN`, so the probe would be vouching for a record type the measured
+/// IOC never serves — in either direction, and silently.
+pub async fn probe_supported_record_types(dbd: &Dbd) -> Result<BTreeSet<String>, String> {
     use std::collections::HashMap;
 
+    let _devices = crate::register_port_ioc_devices()?;
     let mut supported = BTreeSet::new();
     let macros: HashMap<String, String> = HashMap::new();
 
@@ -157,7 +176,7 @@ pub async fn probe_supported_record_types(dbd: &Dbd) -> BTreeSet<String> {
         // Parsing is not enough: `db_string` only reads the grammar, while
         // `build()` is what instantiates the record type. A type can parse and
         // still have no implementation behind it, so require the full build.
-        let ok = match IocBuilder::new().db_string(&db, &macros) {
+        let ok = match crate::port_ioc_builder().db_string(&db, &macros) {
             Ok(b) => b.build().await.is_ok(),
             Err(_) => false,
         };
@@ -165,7 +184,7 @@ pub async fn probe_supported_record_types(dbd: &Dbd) -> BTreeSet<String> {
             supported.insert(rt.name.clone());
         }
     }
-    supported
+    Ok(supported)
 }
 
 /// Is this field worth attempting a client write against?
@@ -236,20 +255,29 @@ recordtype(aai) {
 
     #[test]
     fn denominator_excludes_noaccess_fields() {
-        let s = surface_with(&["ai"]);
-        // ai declares 4 fields; RPVT is DBF_NOACCESS and unreachable by CA.
-        assert_eq!(s.denominator(), 3);
-        assert_eq!(s.excluded_noaccess, 1);
+        let s = surface_with(&["ai", "aai"]);
+        // ai declares 4 fields (RPVT is DBF_NOACCESS) and aai declares 2 (VAL
+        // is DBF_NOACCESS), so 4 CA-observable fields and 2 exclusions.
+        assert_eq!(s.denominator(), 4);
+        assert_eq!(s.excluded_noaccess, 2);
         assert!(s.fields.iter().all(|f| f.field.name != "RPVT"));
     }
 
+    /// An unimplemented record type is an unmeasured part of the surface, not a
+    /// smaller surface. If its fields left the denominator with it, a type that
+    /// stopped booting would shrink numerator and denominator together and the
+    /// coverage percent would not move.
     #[test]
-    fn unimplemented_types_are_named_not_silently_dropped() {
-        let s = surface_with(&["ai"]);
-        assert_eq!(s.unimplemented_types, ["aai"]);
-        // ...and contribute nothing to the denominator, so coverage is not
-        // diluted by types the harness cannot diff at all.
-        assert!(s.fields.iter().all(|f| f.record_type == "ai"));
+    fn an_unimplemented_type_keeps_its_fields_in_the_denominator() {
+        let all = surface_with(&["ai", "aai"]);
+        let without_aai = surface_with(&["ai"]);
+        assert_eq!(without_aai.unimplemented_types, ["aai"]);
+        assert_eq!(
+            without_aai.denominator(),
+            all.denominator(),
+            "the denominator is the .dbd's surface, not the port's"
+        );
+        assert!(without_aai.fields.iter().any(|f| f.record_type == "aai"));
     }
 
     #[test]

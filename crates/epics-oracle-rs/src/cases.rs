@@ -192,6 +192,11 @@ pub fn boundary_cases(f: &FieldDef, menu_choices: Option<&[String]>) -> Vec<Boun
 pub fn array_cases(nelm: u32) -> Vec<(Vec<String>, &'static str)> {
     let mk = |n: usize| (0..n).map(|i| i.to_string()).collect::<Vec<_>>();
     let mut v = vec![
+        // `caput -a <pv> 0` with no values: the CA client sends a write of
+        // count 0 (only `countIn > native count` is refused, nciu.cpp:354), so
+        // what each server does with it is genuinely observable — and a port
+        // that turns it into a 1-element put differs in NORD.
+        (mk(0), "array-zero-length"),
         (mk(1), "array-single-element"),
         (mk(nelm as usize), "array-exactly-nelm"),
     ];
@@ -314,12 +319,20 @@ recordtype(ai) {
         assert!(!cs[0].value.contains('.'));
     }
 
+    /// The two boundaries this module's own doc calls the port-breaking ones
+    /// must both produce a case. The zero-length one was named here and never
+    /// generated, so the test passed while the boundary contributed nothing.
     #[test]
     fn array_cases_cover_zero_exact_and_over_nelm() {
         let cs = array_cases(4);
         let cl: Vec<&str> = cs.iter().map(|c| c.1).collect();
-        assert!(cl.contains(&"array-exactly-nelm"));
-        assert!(cl.contains(&"array-over-nelm"));
+        assert!(cl.contains(&"array-zero-length"), "{cl:?}");
+        assert!(cl.contains(&"array-exactly-nelm"), "{cl:?}");
+        assert!(cl.contains(&"array-over-nelm"), "{cl:?}");
+        let zero = cs.iter().find(|c| c.1 == "array-zero-length").unwrap();
+        assert!(zero.0.is_empty(), "zero-length means no elements at all");
+        let exact = cs.iter().find(|c| c.1 == "array-exactly-nelm").unwrap();
+        assert_eq!(exact.0.len(), 4, "exactly NELM=4");
         let over = cs.iter().find(|c| c.1 == "array-over-nelm").unwrap();
         assert_eq!(over.0.len(), 5, "one past NELM=4");
     }

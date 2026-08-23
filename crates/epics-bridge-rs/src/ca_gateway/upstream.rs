@@ -2803,6 +2803,27 @@ ASG(NewGroup) {
             .expect("ensure_subscribed connects to the hosted upstream");
 
         let pv = db.find_pv(name).await.expect("shadow PV registered");
+
+        // The cached-mode subscribe above leaves the upstream monitor's first
+        // event in flight, and the forwarding task writes it into the very
+        // cell this test is about to plant SENTINEL in. Land that write first,
+        // or the two writers race and the event can overwrite the sentinel in
+        // the window between the set and the read below. `post_event_count` is
+        // bumped immediately after `put_pv_and_post_snapshot` returns Ok and is
+        // monotonic, so reading it is correct whichever side wins; only this
+        // one PV is subscribed, so the count is unambiguous. Upstream never
+        // changes value again and the property task writes metadata only, so
+        // no later event can reach the value cell.
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while mgr.write_env.stats.post_event_count.load(Ordering::Relaxed) == 0 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the upstream monitor's first event never reached the shadow PV; \
+                 without it this test cannot tell a cached GET from a lost race"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
         pv.set(EpicsValue::Double(SENTINEL));
 
         let read = pv.read_snapshot().await.expect("cached GET never errors");

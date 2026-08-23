@@ -188,17 +188,22 @@ fn each_side_is_the_sole_server_on_its_port() {
 #[test]
 fn every_channel_of_the_dbd_surface_gets_exactly_one_case() {
     let (surface, report) = sweep(RT);
+    let enumerated_for_rt = surface.fields_of(RT).count();
     assert!(
-        surface.denominator() > 1,
-        "the surface must be non-trivial, got {}",
-        surface.denominator()
+        enumerated_for_rt > 1,
+        "the surface must be non-trivial, got {enumerated_for_rt}"
     );
     assert_eq!(
-        report.counts.ran,
-        surface.denominator(),
+        report.counts.ran, enumerated_for_rt,
         "one case per enumerated channel — no channel dropped, none invented",
     );
+    // The reported denominator stays the whole `.dbd`'s, so a one-type sweep
+    // reports partial coverage rather than 100% of what it chose to run.
     assert_eq!(report.channel_coverage.enumerated, surface.denominator());
+    assert!(
+        surface.denominator() > report.counts.ran,
+        "a one-type sweep must not read as a full sweep"
+    );
     report.counts.check().expect("buckets must reconcile");
 
     let want: BTreeSet<String> = surface
@@ -217,8 +222,13 @@ fn coverage_counts_only_fully_measured_channels() {
     let cov = &report.channel_coverage;
     assert_eq!(
         cov.measured + cov.errored,
+        surface.fields_of(RT).count(),
+        "every channel VISITED is either measured or errored — there is no third, silent bucket",
+    );
+    assert_eq!(
+        cov.enumerated,
         surface.denominator(),
-        "every channel is either measured or errored — there is no third, silent bucket",
+        "the denominator is the whole .dbd's, not the subset this sweep ran",
     );
     assert_eq!(
         cov.measured,
@@ -371,6 +381,7 @@ fn an_unreachable_pv_scores_error_never_agreement() {
     let ch = pvaread::ChannelRef {
         record_type: "ai".into(),
         field: "NOPE".into(),
+        dbf: epics_oracle_rs::dbd::DbfType::Double,
         pv: MISSING.into(),
         expected_shape: None,
         db: String::new(),

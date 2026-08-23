@@ -5,8 +5,8 @@ use super::dbd_generated;
 use epics_base_rs::error::{CaError, CaResult};
 use epics_base_rs::server::recgbl::{self, alarm_status};
 use epics_base_rs::server::record::{
-    AlarmSeverity, CommonFields, FieldDesc, LinkType, ProcessAction, ProcessContext,
-    ProcessOutcome, Record, link_field_type,
+    AlarmSeverity, CommonFields, FieldDesc, FieldMetadataOverride, LinkType, ProcessAction,
+    ProcessContext, ProcessOutcome, Record, link_field_type,
 };
 use epics_base_rs::types::{EpicsValue, PvString};
 
@@ -524,6 +524,24 @@ impl EpidRecord {
 impl Record for EpidRecord {
     fn record_type(&self) -> &'static str {
         "epid"
+    }
+
+    /// `epidRecord.c:238-261` and `:263-286` are one switch with TWO windows,
+    /// not one: `VAL`/`HIHI`/`HIGH`/`LOW`/`LOLO`/`CVAL` answer `hopr`/`lopr`,
+    /// and `OVAL`/`P`/`I`/`D` — the controller output and its three gain terms
+    /// — answer `drvh`/`drvl` instead, because they live on the actuator's
+    /// scale and not the process variable's. The first window is the
+    /// record-level cache; the second cannot be, since a record has only one
+    /// cache and epid needs two ranges at once.
+    fn field_metadata_override(&self, field: &str) -> Option<FieldMetadataOverride> {
+        ["OVAL", "P", "I", "D"]
+            .iter()
+            .any(|f| field.eq_ignore_ascii_case(f))
+            .then(|| FieldMetadataOverride {
+                disp_limits: Some((self.drvh, self.drvl)),
+                ctrl_limits: Some((self.drvh, self.drvl)),
+                ..Default::default()
+            })
     }
 
     /// Bumpless-transfer readback — C `devEpidSoft.c:153-158` (PID) and

@@ -28,11 +28,11 @@ use std::time::Duration;
 use crate::allowlist::{Allowlist, MatchContext};
 use crate::cases::{BoundaryCase, boundary_cases};
 use crate::catool::{CaTools, PutOutcome, ToolError};
-use crate::dbd::Dbd;
+use crate::dbd::{Dbd, DbfType};
 use crate::diff::{Comparison, Observation, Verdict, compare};
 use crate::ioc::{CTools, Ioc, Pair, Side};
-use crate::report::{CaseResult, Reproducer};
-use crate::surface::{Surface, is_put_candidate};
+use crate::report::{CasePhase, CaseResult, Reproducer};
+use crate::surface::{FieldRef, Surface, is_put_candidate};
 
 /// How long to let monitor updates settle after driving the puts. A port that
 /// posts *extra* events must be caught, so we cannot stop listening the moment
@@ -84,25 +84,32 @@ impl Runner {
         let rec = format!("ORACLE:{}", record_type.to_uppercase());
         let db_text = crate::record_stmt(record_type, &rec);
 
-        let fields: Vec<String> = surface
-            .fields_of(record_type)
-            .map(|f| f.field.name.clone())
-            .collect();
+        let fields: Vec<FieldRef> = surface.fields_of(record_type).cloned().collect();
         if fields.is_empty() {
             return Vec::new();
         }
-        let pvs: Vec<String> = fields.iter().map(|f| format!("{rec}.{f}")).collect();
+        let names: Vec<String> = fields.iter().map(|f| f.field.name.clone()).collect();
+        let pvs: Vec<String> = names.iter().map(|f| format!("{rec}.{f}")).collect();
 
         let db = match self.write_db(&format!("read_{record_type}"), &db_text) {
             Ok(p) => p,
-            Err(e) => return errored_cases(record_type, &fields, None, &db_text, &e),
+            Err(e) => {
+                return errored_cases(record_type, &names, CasePhase::Read, None, &db_text, &e);
+            }
         };
         let pair = match Pair::boot(&self.tools, &db, &rec) {
             Ok(p) => p,
             // The IOC would not boot: every field of this type is an ERROR, and
             // not one of them is scored as agreement.
             Err(e) => {
-                return errored_cases(record_type, &fields, None, &db_text, &e.to_string());
+                return errored_cases(
+                    record_type,
+                    &names,
+                    CasePhase::Read,
+                    None,
+                    &db_text,
+                    &e.to_string(),
+                );
             }
         };
 
@@ -114,12 +121,25 @@ impl Runner {
         fields
             .iter()
             .enumerate()
-            .map(|(i, f)| {
+            .map(|(i, fr)| {
+                let f = &fr.field.name;
                 let repro = Reproducer {
                     db: db_text.clone(),
                     ops: vec![format!("caget {rec}.{f}"), format!("cainfo {rec}.{f}")],
                 };
-                adjudicate(record_type, f, None, repro, &obs_c[i], &obs_r[i], allowlist)
+                adjudicate(
+                    CaseRef {
+                        record_type,
+                        phase: CasePhase::Read,
+                        field: f,
+                        dbf: fr.field.dbf,
+                        class: None,
+                    },
+                    repro,
+                    &obs_c[i],
+                    &obs_r[i],
+                    allowlist,
+                )
             })
             .collect()
     }
@@ -135,14 +155,14 @@ impl Runner {
         max_cases: Option<usize>,
     ) -> Vec<CaseResult> {
         // Build the case list first: (field, boundary) -> its own record.
-        let mut plan: Vec<(String, BoundaryCase)> = Vec::new();
+        let mut plan: Vec<(FieldRef, BoundaryCase)> = Vec::new();
         for fr in surface.fields_of(record_type) {
             if !is_put_candidate(&fr.field) {
                 continue;
             }
             let choices = self.dbd.menu_choices(&fr.field);
             for bc in boundary_cases(&fr.field, choices) {
-                plan.push((fr.field.name.clone(), bc));
+                plan.push((fr.clone(), bc));
             }
         }
         if let Some(m) = max_cases {
@@ -159,7 +179,7 @@ impl Runner {
             db_text.push_str(&crate::record_stmt(record_type, &rec_of(i)));
         }
 
-        let names: Vec<String> = plan.iter().map(|(f, _)| f.clone()).collect();
+        let names: Vec<String> = plan.iter().map(|(f, _)| f.field.name.clone()).collect();
         let classes: Vec<&str> = plan.iter().map(|(_, b)| b.class).collect();
 
         let db = match self.write_db(&format!("put_{record_type}"), &db_text) {
@@ -190,7 +210,7 @@ impl Runner {
         let val_pvs: Vec<String> = plan
             .iter()
             .enumerate()
-            .map(|(i, (f, _))| format!("{}.{f}", rec_of(i)))
+            .map(|(i, (fr, _))| format!("{}.{}", rec_of(i), fr.field.name))
             .collect();
         let stat_pvs: Vec<String> = (0..plan.len())
             .map(|i| format!("{}.STAT", rec_of(i)))
@@ -204,7 +224,7 @@ impl Runner {
 
         plan.iter()
             .enumerate()
-            .map(|(i, (_, bc))| {
+            .map(|(i, (fr, bc))| {
                 let rec = rec_of(i);
                 let f = &names[i];
                 let repro = Reproducer {
@@ -217,9 +237,13 @@ impl Runner {
                     ],
                 };
                 adjudicate(
-                    record_type,
-                    f,
-                    Some(classes[i]),
+                    CaseRef {
+                        record_type,
+                        phase: CasePhase::Put,
+                        field: f,
+                        dbf: fr.field.dbf,
+                        class: Some(classes[i]),
+                    },
                     repro,
                     &obs_c[i],
                     &obs_r[i],
@@ -250,6 +274,7 @@ impl Runner {
         if !is_put_candidate(&val.field) || val.field.dbf.is_link() {
             return None;
         }
+        let val_dbf = val.field.dbf;
 
         let rec = format!("ORACLE:MON:{}", record_type.to_uppercase());
         let db_text = crate::record_stmt(record_type, &rec);
@@ -266,7 +291,16 @@ impl Runner {
 
         let db = match self.write_db(&format!("mon_{record_type}"), &db_text) {
             Ok(p) => p,
-            Err(e) => return Some(errored_case(record_type, "VAL", None, repro, &e)),
+            Err(e) => {
+                return Some(errored_case(
+                    record_type,
+                    "VAL",
+                    CasePhase::Monitor,
+                    None,
+                    repro,
+                    &e,
+                ));
+            }
         };
         let pair = match Pair::boot(&self.tools, &db, &rec) {
             Ok(p) => p,
@@ -274,6 +308,7 @@ impl Runner {
                 return Some(errored_case(
                     record_type,
                     "VAL",
+                    CasePhase::Monitor,
                     None,
                     repro,
                     &e.to_string(),
@@ -282,15 +317,18 @@ impl Runner {
         };
 
         let pvs = vec![rec.clone()];
-        let drive = |t: &CaTools| {
+        // Every put in the sequence must land, or the trace below is a
+        // measurement of nothing: see `CaTools::caput_drive`.
+        let drive = |t: &CaTools| -> Result<(), ToolError> {
             for v in seq {
-                t.caput(&rec, v);
+                t.caput_drive(&rec, v)?;
                 // Space the puts so that a server which *does* post per change
                 // has time to emit each one; without this, two puts inside one
                 // scan period could legitimately coalesce on BOTH sides and the
                 // probe would measure nothing.
                 std::thread::sleep(Duration::from_millis(120));
             }
+            Ok(())
         };
 
         let obs = |port: u16, side: Side| -> Observation {
@@ -310,9 +348,13 @@ impl Runner {
         let obs_r = obs(pair.rust.port(), Side::Rust);
 
         Some(adjudicate(
-            record_type,
-            "VAL",
-            None,
+            CaseRef {
+                record_type,
+                phase: CasePhase::Monitor,
+                field: "VAL",
+                dbf: val_dbf,
+                class: None,
+            },
             repro,
             &obs_c,
             &obs_r,
@@ -335,13 +377,19 @@ impl Runner {
     pub fn probe_array(&self, record_type: &str, allowlist: &mut Allowlist) -> Vec<CaseResult> {
         // Array-capable iff the record declares both a capacity (NELM) and an
         // element type (FTVL). Determined from the .dbd, not hard-listed.
-        let is_array = self
+        // `VAL`'s declared type comes along: it is `DBF_NOACCESS` for these
+        // types (the record's raw BPTR), and the allowlist has to see that
+        // rather than a guess, or a row scoped by destination type would match
+        // the array phase on a type it never named.
+        let val_dbf = self
             .dbd
             .record_type(record_type)
-            .is_some_and(|r| r.field("NELM").is_some() && r.field("FTVL").is_some());
-        if !is_array {
+            .filter(|r| r.field("NELM").is_some() && r.field("FTVL").is_some())
+            .and_then(|r| r.field("VAL"))
+            .map(|f| f.dbf);
+        let Some(val_dbf) = val_dbf else {
             return Vec::new();
-        }
+        };
 
         let plan = crate::cases::array_cases(ARRAY_NELM);
         let rec_of = |i: usize| format!("ORACLE:ARR:{}:{i}", record_type.to_uppercase());
@@ -391,9 +439,13 @@ impl Runner {
                     ],
                 };
                 adjudicate(
-                    record_type,
-                    "VAL",
-                    Some(class),
+                    CaseRef {
+                        record_type,
+                        phase: CasePhase::Array,
+                        field: "VAL",
+                        dbf: val_dbf,
+                        class: Some(class),
+                    },
                     repro,
                     &obs_c[i],
                     &obs_r[i],
@@ -529,11 +581,15 @@ fn put_lanes() -> usize {
 }
 
 /// Drive one side's puts, `put_lanes()` at a time, preserving case order.
+///
+/// An element is `Err` when the put could not be measured at all — the tool
+/// never reached a server, or this harness could not run it. That is not a
+/// refusal and [`readback`] must not let it become one.
 fn drive_puts(
     t: &CaTools,
-    plan: &[(String, BoundaryCase)],
+    plan: &[(FieldRef, BoundaryCase)],
     rec_of: &(impl Fn(usize) -> String + Sync),
-) -> Vec<PutOutcome> {
+) -> Vec<Result<PutOutcome, ToolError>> {
     let lanes = put_lanes().min(plan.len().max(1));
     let chunk = plan.len().div_ceil(lanes);
 
@@ -547,8 +603,11 @@ fn drive_puts(
                     cases
                         .iter()
                         .enumerate()
-                        .map(|(j, (f, bc))| {
-                            t.caput(&format!("{}.{f}", rec_of(base + j)), &bc.value)
+                        .map(|(j, (fr, bc))| {
+                            t.caput(
+                                &format!("{}.{}", rec_of(base + j), fr.field.name),
+                                &bc.value,
+                            )
                         })
                         .collect::<Vec<_>>()
                 })
@@ -567,10 +626,25 @@ fn drive_puts(
 /// Drive one array put per case and read back what each side stored: the array
 /// payload (with its leading returned count), `NORD`, native shape, and alarm.
 ///
-/// The array payload is the primary observable, so a failure to read it back is
-/// an ERROR for that case (recorded in `errors`), never a silently skipped
-/// surface. `NORD`/`STAT`/`SEVR` are supplementary and best-effort, matching the
-/// scalar [`readback`].
+/// Every surface is obtained or recorded as an error, never silently absent —
+/// the same rule as the scalar [`readback`]. `NORD` in particular is not
+/// supplementary here: it is *the* discriminator of this phase (C truncates an
+/// over-capacity put to `NELM`; a port that rejects it or writes past the end
+/// differs in `NORD` and often in nothing else), so dropping it left the
+/// truncation contract scored AGREED while unverified.
+/// Take the reading, or record why it could not be taken. The two outcomes stay
+/// distinguishable, which is the whole point: `None` may only ever mean "this
+/// surface does not apply", never "we tried and failed".
+fn keep<T>(r: Result<T, ToolError>, errors: &mut Vec<ToolError>) -> Option<T> {
+    match r {
+        Ok(v) => Some(v),
+        Err(e) => {
+            errors.push(e);
+            None
+        }
+    }
+}
+
 fn drive_array(
     t: &CaTools,
     plan: &[(Vec<String>, &'static str)],
@@ -580,12 +654,21 @@ fn drive_array(
         .enumerate()
         .map(|(i, (values, _))| {
             let rec = rec_of(i);
-            let put = t.caput_array(&rec, values);
+            // Same rule as the scalar put phase: a put that could not be
+            // measured is an ERROR for the case, never a refusal both sides
+            // can agree on.
+            let mut errors = Vec::new();
+            let put = match t.caput_array(&rec, values) {
+                Ok(p) => Some(p),
+                Err(e) => {
+                    errors.push(e);
+                    None
+                }
+            };
 
             // Read back the whole declared capacity so a port that stored too
             // many or too few elements shows a different leading count and
             // payload than C's truncate-to-NELM.
-            let mut errors = Vec::new();
             let value_string = match t.caget_array(&rec, ARRAY_NELM) {
                 Ok(v) => Some(v),
                 Err(e) => {
@@ -603,10 +686,10 @@ fn drive_array(
             Observation {
                 info,
                 value_string,
-                value_numeric: t.caget_numeric(&format!("{rec}.NORD")).ok(),
-                stat: t.caget_string(&format!("{rec}.STAT")).ok(),
-                sevr: t.caget_string(&format!("{rec}.SEVR")).ok(),
-                put: Some(put),
+                value_numeric: keep(t.caget_numeric(&format!("{rec}.NORD")), &mut errors),
+                stat: keep(t.caget_string(&format!("{rec}.STAT")), &mut errors),
+                sevr: keep(t.caget_string(&format!("{rec}.SEVR")), &mut errors),
+                put,
                 monitor: None,
                 errors,
             }
@@ -627,6 +710,7 @@ fn errored_array(
             errored_case(
                 record_type,
                 "VAL",
+                CasePhase::Array,
                 Some(class),
                 Reproducer {
                     db: db.to_string(),
@@ -642,21 +726,63 @@ fn errored_array(
         .collect()
 }
 
+/// Read one string field across many records, attributing a failed batch to the
+/// exact PV that caused it.
+///
+/// The same [`probe_bisect`] mechanism [`read_observations`] uses for the value
+/// surface, and the reason it is a named helper: STAT and SEVR used to be
+/// `caget_batch(..).ok()`, so one unconnectable `.STAT` PV — the all-or-nothing
+/// batch contract of [`CaTools::caget_batch`] — silently removed the alarm
+/// comparison from *every* put case of that record type while all of them went
+/// on being scored AGREED.
+fn probe_strings(t: &CaTools, pvs: &[String]) -> Vec<Result<String, ToolError>> {
+    probe_bisect(pvs, &|p: &[String]| t.caget_batch(p, false), &|pv: &str| {
+        t.caget_string(pv)
+    })
+}
+
 /// Batch the post-put readback: what each side stored, and what alarm it raised.
+///
+/// Every surface here is read the same way: obtained, or recorded as a
+/// [`ToolError`] on the case it belongs to. There is no third state in which a
+/// surface is quietly absent, because that state is indistinguishable from
+/// "both sides agreed".
 fn readback(
     t: &CaTools,
     val_pvs: &[String],
     stat_pvs: &[String],
     sevr_pvs: &[String],
-    puts: Vec<PutOutcome>,
+    puts: Vec<Result<PutOutcome, ToolError>>,
 ) -> Vec<Observation> {
     let mut obs = read_observations(t, val_pvs);
-    let stats = t.caget_batch(stat_pvs, false).ok();
-    let sevrs = t.caget_batch(sevr_pvs, false).ok();
-    for (i, o) in obs.iter_mut().enumerate() {
-        o.put = puts.get(i).cloned();
-        o.stat = stats.as_ref().and_then(|s| s.get(i).cloned());
-        o.sevr = sevrs.as_ref().and_then(|s| s.get(i).cloned());
+    let (stats, sevrs) = std::thread::scope(|s| {
+        let hs = s.spawn(|| probe_strings(t, stat_pvs));
+        let hv = s.spawn(|| probe_strings(t, sevr_pvs));
+        (
+            hs.join().expect("STAT lane panicked"),
+            hv.join().expect("SEVR lane panicked"),
+        )
+    });
+    for (o, put) in obs.iter_mut().zip(puts) {
+        // A put that could not be measured lands in `errors`, where
+        // `adjudicate` scores it ERROR. Writing it into `put` as a refusal
+        // would make both sides agree about a write neither one performed.
+        match put {
+            Ok(p) => o.put = Some(p),
+            Err(e) => o.errors.push(e),
+        }
+    }
+    for (o, r) in obs.iter_mut().zip(stats) {
+        match r {
+            Ok(v) => o.stat = Some(v),
+            Err(e) => o.errors.push(e),
+        }
+    }
+    for (o, r) in obs.iter_mut().zip(sevrs) {
+        match r {
+            Ok(v) => o.sevr = Some(v),
+            Err(e) => o.errors.push(e),
+        }
     }
     obs
 }
@@ -674,15 +800,36 @@ fn readback(
 /// Step 3 requires **every** difference to be justified. A case where one diff
 /// is allowlisted and another is not is a DEFECT, not a partial pass — the
 /// unjustified diff does not get laundered by the justified one.
+/// Everything a CA case needs to identify itself, passed as one value so
+/// [`adjudicate`] keeps a signature a caller can read — the same shape
+/// [`crate::pvaread::ChannelRef`] gives the PVA phases.
+struct CaseRef<'a> {
+    record_type: &'a str,
+    field: &'a str,
+    /// Which probe this case came from. Stamped here so no consumer has to
+    /// guess it from `class`, which the read and monitor phases both leave
+    /// `None`.
+    phase: CasePhase,
+    /// The destination field's declared `.dbd` type. Carried because an
+    /// allowlist row may be scoped by it (see [`crate::allowlist::MatchContext`]).
+    dbf: DbfType,
+    class: Option<&'a str>,
+}
+
 fn adjudicate(
-    record_type: &str,
-    field: &str,
-    class: Option<&str>,
+    cr: CaseRef<'_>,
     repro: Reproducer,
     c: &Observation,
     r: &Observation,
     allowlist: &mut Allowlist,
 ) -> CaseResult {
+    let CaseRef {
+        record_type,
+        field,
+        phase,
+        dbf,
+        class,
+    } = cr;
     let mut errors: Vec<ToolError> = Vec::new();
     errors.extend(c.errors.iter().cloned());
     errors.extend(r.errors.iter().cloned());
@@ -690,6 +837,7 @@ fn adjudicate(
     let base = CaseResult {
         record_type: record_type.to_string(),
         field: field.to_string(),
+        phase,
         class: class.map(str::to_string),
         verdict: Verdict::Errored,
         differences: Vec::new(),
@@ -712,6 +860,7 @@ fn adjudicate(
     let ctx = MatchContext {
         record_type,
         field,
+        dbf,
         class,
     };
     // Tell the allowlist what this case LOOKED at, agreement or not — that is what
@@ -749,6 +898,7 @@ fn adjudicate(
 fn errored_case(
     record_type: &str,
     field: &str,
+    phase: CasePhase,
     class: Option<&str>,
     repro: Reproducer,
     msg: &str,
@@ -756,6 +906,7 @@ fn errored_case(
     CaseResult {
         record_type: record_type.to_string(),
         field: field.to_string(),
+        phase,
         class: class.map(str::to_string),
         verdict: Verdict::Errored,
         differences: Vec::new(),
@@ -786,6 +937,7 @@ fn errored_case(
 fn errored_cases(
     record_type: &str,
     fields: &[String],
+    phase: CasePhase,
     class: Option<&str>,
     db: &str,
     msg: &str,
@@ -796,6 +948,7 @@ fn errored_cases(
             errored_case(
                 record_type,
                 f,
+                phase,
                 class,
                 Reproducer {
                     db: db.to_string(),
@@ -809,15 +962,17 @@ fn errored_cases(
 
 fn errored_puts(
     record_type: &str,
-    plan: &[(String, BoundaryCase)],
+    plan: &[(FieldRef, BoundaryCase)],
     db: &str,
     msg: &str,
 ) -> Vec<CaseResult> {
     plan.iter()
-        .map(|(f, bc)| {
+        .map(|(fr, bc)| {
+            let f = &fr.field.name;
             errored_case(
                 record_type,
                 f,
+                CasePhase::Put,
                 Some(bc.class),
                 Reproducer {
                     db: db.to_string(),
@@ -987,5 +1142,369 @@ mod bisect_tests {
         let out = run(&t, &[]);
         assert!(out.is_empty());
         assert_eq!(t.spawns(), 0);
+    }
+}
+
+/// The adjudication rule, exercised against the **shipped** allowlist with a
+/// planted disagreement.
+///
+/// A planted difference is the only way to test an instrument's verdict: a live
+/// run reports whatever the port happens to do today, so it can pass while the
+/// rule underneath it is wrong. These plant a difference whose correct verdict
+/// is known and assert the verdict the harness reaches, and the bucket the exit
+/// code is computed from.
+#[cfg(test)]
+mod adjudicate_tests {
+    use super::*;
+    use crate::dbd::DbfType;
+    use crate::report::Counts;
+
+    fn shipped() -> Allowlist {
+        Allowlist::load(&Allowlist::default_path()).expect("shipped allowlist loads")
+    }
+
+    fn repro() -> Reproducer {
+        Reproducer {
+            db: String::new(),
+            ops: Vec::new(),
+        }
+    }
+
+    fn value(s: &str) -> Observation {
+        Observation {
+            value_string: Some(s.to_string()),
+            ..Default::default()
+        }
+    }
+
+    /// `ai.VAL` is `DBF_DOUBLE`. CBUG-E2 is `dbConvert`'s double->**integer**
+    /// cast, so nothing about it justifies a difference here: C reporting `0`
+    /// where the port reports `inf` is a DEFECT, and the run must fail on it.
+    /// This is the exact shape of the 32 `over-double-max` cases the row used to
+    /// absorb (`FINDINGS.md:133`).
+    #[test]
+    fn an_out_of_range_double_into_a_double_field_is_a_defect_not_an_expected_deviation() {
+        let case = adjudicate(
+            CaseRef {
+                record_type: "ai",
+                phase: CasePhase::Put,
+                field: "VAL",
+                dbf: DbfType::Double,
+                class: Some("over-double-max"),
+            },
+            repro(),
+            &value("0"),
+            &value("inf"),
+            &mut shipped(),
+        );
+        assert_eq!(
+            case.verdict,
+            Verdict::Defect,
+            "CBUG-E2 describes a double->integer cast; ai.VAL is DBF_DOUBLE, \
+             so it must not justify this. allowlisted={:?}",
+            case.allowlisted
+        );
+        // The bucket the run's exit code is computed from.
+        assert_eq!(Counts::tally(&[case]).defect, 1);
+    }
+
+    /// The other half of the same rule: on an **integer** destination the row is
+    /// exactly what justifies the difference, so this must stay an EXPECTED
+    /// DEVIATION. Narrowing the row must not have blinded the harness to the bug
+    /// it was written for.
+    #[test]
+    fn the_same_class_on_an_integer_field_is_still_expected_deviation() {
+        let case = adjudicate(
+            CaseRef {
+                record_type: "longin",
+                phase: CasePhase::Put,
+                field: "VAL",
+                dbf: DbfType::Long,
+                class: Some("over-max"),
+            },
+            repro(),
+            &value("-2147483648"),
+            &value("2147483647"),
+            &mut shipped(),
+        );
+        assert_eq!(case.verdict, Verdict::ExpectedDeviation);
+        assert_eq!(case.allowlisted, ["CBUG-E2"]);
+        assert_eq!(Counts::tally(&[case]).defect, 0);
+    }
+
+    /// A put that never reached a server must score ERROR and fail the run.
+    ///
+    /// The measurement failure is planted for real: both `CaTools` are aimed at
+    /// a port nothing is listening on, so `caput` cannot connect. Before this,
+    /// every `Err` from the tool became `PutOutcome { accepted: false, … }`, the
+    /// two sides "agreed" the write had been refused, and the case was scored
+    /// AGREED and counted as put coverage — an agreement claim about a write
+    /// neither IOC ever saw.
+    #[test]
+    fn a_put_that_never_reached_a_server_is_an_error_not_a_refusal() {
+        let tools = CTools::discover().expect(
+            "the C EPICS tree must be built for the oracle to have ground truth; \
+             set EPICS_BASE_BIN if it is not at the default path",
+        );
+        let dead = crate::ioc::alloc_free_port().expect("a port to aim at");
+
+        let side_err = |side: Side| -> ToolError {
+            CaTools::new(&tools, dead, side)
+                .caput("ORACLE:NOSUCHPV.VAL", "1")
+                .expect_err("a put that never reached a server is not a refusal")
+        };
+        let obs = |e: ToolError| Observation {
+            errors: vec![e],
+            ..Default::default()
+        };
+
+        let case = adjudicate(
+            CaseRef {
+                record_type: "ai",
+                phase: CasePhase::Put,
+                field: "VAL",
+                dbf: DbfType::Double,
+                class: Some("over-max"),
+            },
+            repro(),
+            &obs(side_err(Side::C)),
+            &obs(side_err(Side::Rust)),
+            &mut shipped(),
+        );
+        assert_eq!(case.verdict, Verdict::Errored, "{:?}", case.errors);
+
+        let counts = Counts::tally(&[case]);
+        assert_eq!(counts.agreed, 0, "an unrun experiment is not agreement");
+        assert_eq!(
+            crate::report::exit_status(&crate::report::run_failures(&counts, &[], &[])),
+            1,
+        );
+    }
+
+    /// An unreadable `NORD` must ERROR the array case, not vanish from it.
+    ///
+    /// `NORD` is the array phase's discriminator: C truncates an over-capacity
+    /// put to `NELM`, and a port that rejects it or writes past the end often
+    /// differs in nothing else. Dropping it with `.ok()` left both sides with
+    /// `value_numeric: None`, so `compare` skipped the surface and the
+    /// truncation contract was reported AGREED while unverified.
+    ///
+    /// The plant is a record type that genuinely has no `NORD`: `ai`. The put
+    /// and every other surface read fine, so only the missing discriminator is
+    /// under test.
+    #[test]
+    fn an_unreadable_nord_errors_the_array_case_instead_of_agreeing() {
+        let tools = CTools::discover().expect(
+            "the C EPICS tree must be built for the oracle to have ground truth; \
+             set EPICS_BASE_BIN if it is not at the default path",
+        );
+        let dir = workdir(None).expect("workdir");
+        let db = dir.join("array_nord.db");
+        std::fs::write(&db, crate::record_stmt("ai", "ORACLE:ARR:0")).expect("write db");
+        let pair = Pair::boot(&tools, &db, "ORACLE:ARR:0").expect("both IOCs must boot");
+
+        let plan: Vec<(Vec<String>, &'static str)> =
+            vec![(vec!["1".to_string()], "array-single-element")];
+        let rec_of = |_: usize| "ORACLE:ARR:0".to_string();
+        let side = |port: u16, s: Side| drive_array(&CaTools::new(&tools, port, s), &plan, &rec_of);
+        let obs_c = side(pair.c.port(), Side::C);
+        let obs_r = side(pair.rust.port(), Side::Rust);
+        assert!(
+            obs_c[0].value_numeric.is_none() && obs_r[0].value_numeric.is_none(),
+            "ai has no NORD, so neither side can produce the discriminator"
+        );
+
+        let case = adjudicate(
+            CaseRef {
+                record_type: "ai",
+                phase: CasePhase::Array,
+                field: "VAL",
+                dbf: DbfType::Double,
+                class: Some("array-single-element"),
+            },
+            repro(),
+            &obs_c[0],
+            &obs_r[0],
+            &mut shipped(),
+        );
+        assert_eq!(
+            case.verdict,
+            Verdict::Errored,
+            "a missing discriminator is not an agreement"
+        );
+        let counts = Counts::tally(&[case]);
+        assert_eq!(
+            crate::report::exit_status(&crate::report::run_failures(&counts, &[], &[])),
+            1,
+        );
+    }
+
+    /// A `.STAT` PV that will not connect must ERROR **its own case**, and only
+    /// its own case.
+    ///
+    /// Both halves matter. `caget_batch` is all-or-nothing, so the old
+    /// `caget_batch(stat_pvs, false).ok()` turned one unconnectable `.STAT`
+    /// into `stat: None` for every case of the record type: `compare` then
+    /// skipped the alarm surface on all of them and they stayed AGREED, so a
+    /// port that stopped serving STAT reported as an improvement. The other
+    /// half is that the fix must not paint every case ERROR — the good PV in
+    /// the same batch is still measured, via `probe_bisect`.
+    #[test]
+    fn a_stat_pv_that_does_not_connect_errors_only_its_own_case() {
+        let tools = CTools::discover().expect(
+            "the C EPICS tree must be built for the oracle to have ground truth; \
+             set EPICS_BASE_BIN if it is not at the default path",
+        );
+        let dir = workdir(None).expect("workdir");
+        let db_text = format!(
+            "{}{}",
+            crate::record_stmt("ai", "ORACLE:RB:0"),
+            crate::record_stmt("ai", "ORACLE:RB:1")
+        );
+        let db = dir.join("readback_stat.db");
+        std::fs::write(&db, &db_text).expect("write db");
+        let pair = Pair::boot(&tools, &db, "ORACLE:RB:0").expect("both IOCs must boot");
+
+        let val_pvs = ["ORACLE:RB:0.VAL".to_string(), "ORACLE:RB:1.VAL".to_string()];
+        // Case 1's STAT does not exist on either side: the reading cannot be
+        // taken, which is not the same as the two sides agreeing about it.
+        let stat_pvs = [
+            "ORACLE:RB:0.STAT".to_string(),
+            "ORACLE:NOSUCHRECORD.STAT".to_string(),
+        ];
+        let sevr_pvs = [
+            "ORACLE:RB:0.SEVR".to_string(),
+            "ORACLE:RB:1.SEVR".to_string(),
+        ];
+        let accepted = || {
+            vec![
+                Ok(PutOutcome {
+                    accepted: true,
+                    error: None,
+                }),
+                Ok(PutOutcome {
+                    accepted: true,
+                    error: None,
+                }),
+            ]
+        };
+
+        let side = |port: u16, s: Side| {
+            let t = CaTools::new(&tools, port, s);
+            readback(&t, &val_pvs, &stat_pvs, &sevr_pvs, accepted())
+        };
+        let obs_c = side(pair.c.port(), Side::C);
+        let obs_r = side(pair.rust.port(), Side::Rust);
+
+        let verdict = |i: usize| {
+            adjudicate(
+                CaseRef {
+                    record_type: "ai",
+                    phase: CasePhase::Put,
+                    field: "VAL",
+                    dbf: DbfType::Double,
+                    class: Some("over-max"),
+                },
+                repro(),
+                &obs_c[i],
+                &obs_r[i],
+                &mut shipped(),
+            )
+        };
+
+        let measured = verdict(0);
+        assert_ne!(
+            measured.verdict,
+            Verdict::Errored,
+            "the case whose STAT connected must still be measured: {:?}",
+            measured.errors
+        );
+        assert!(
+            obs_c[0].stat.is_some() && obs_r[0].stat.is_some(),
+            "the alarm surface must be read where it can be"
+        );
+
+        let lost = verdict(1);
+        assert_eq!(
+            lost.verdict,
+            Verdict::Errored,
+            "an unread STAT is not an agreement"
+        );
+        let counts = Counts::tally(&[lost]);
+        assert_eq!(
+            crate::report::exit_status(&crate::report::run_failures(&counts, &[], &[])),
+            1,
+        );
+    }
+
+    /// A monitor case whose **drive** failed must score ERROR.
+    ///
+    /// The plant is a real refusal against the real pair: `NAME` is
+    /// `special(SPC_NOMOD)`, so the put is refused on both sides, the
+    /// subscription is never stimulated, and both traces are empty. Before
+    /// this, the drive's outcome was discarded, `compare` found no difference
+    /// between two empty traces, and the case was scored AGREED and counted as
+    /// monitor coverage — a positive agreement claim about a subscription that
+    /// was never given anything to post on.
+    #[test]
+    fn a_monitor_whose_drive_was_refused_scores_error_not_agreement() {
+        let tools = CTools::discover().expect(
+            "the C EPICS tree must be built for the oracle to have ground truth; \
+             set EPICS_BASE_BIN if it is not at the default path",
+        );
+        let dir = workdir(None).expect("workdir");
+        let db = dir.join("mon_drive_refused.db");
+        std::fs::write(&db, crate::record_stmt("ai", "ORACLE:MONDRIVE")).expect("write db");
+        let pair = Pair::boot(&tools, &db, "ORACLE:MONDRIVE").expect("both IOCs must boot");
+
+        let pvs = vec!["ORACLE:MONDRIVE".to_string()];
+        let obs = |port: u16, side: Side| -> Observation {
+            let t = CaTools::new(&tools, port, side);
+            match t.monitor(&pvs, MONITOR_SETTLE, MONITOR_CONNECT_TIMEOUT, |tt| {
+                tt.caput_drive("ORACLE:MONDRIVE.NAME", "NOPE")
+            }) {
+                Ok(tr) => Observation {
+                    monitor: Some(tr),
+                    ..Default::default()
+                },
+                Err(e) => Observation {
+                    errors: vec![e],
+                    ..Default::default()
+                },
+            }
+        };
+        let c = obs(pair.c.port(), Side::C);
+        let r = obs(pair.rust.port(), Side::Rust);
+
+        let case = adjudicate(
+            CaseRef {
+                record_type: "ai",
+                phase: CasePhase::Monitor,
+                field: "VAL",
+                dbf: DbfType::Double,
+                class: None,
+            },
+            repro(),
+            &c,
+            &r,
+            &mut shipped(),
+        );
+        assert_eq!(
+            case.verdict,
+            Verdict::Errored,
+            "c_monitor={:?} rust_monitor={:?}",
+            c.monitor,
+            r.monitor
+        );
+
+        let counts = Counts::tally(&[case]);
+        assert_eq!(
+            counts.agreed, 0,
+            "an unstimulated subscription is not agreement"
+        );
+        assert_eq!(
+            crate::report::exit_status(&crate::report::run_failures(&counts, &[], &[])),
+            1,
+        );
     }
 }

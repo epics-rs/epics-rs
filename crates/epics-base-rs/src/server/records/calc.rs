@@ -352,6 +352,12 @@ impl Record for CalcRecord {
         "calc"
     }
 
+    /// `calcRecord.c:161-167` `get_linkNumber` — `A`..`U` and `LA`..`LU` both
+    /// read their units/precision/graphic/alarm from `INPA`..`INPU`.
+    fn link_backed_metadata_field(&self, field: &str) -> Option<String> {
+        crate::server::record::calc_class_link_backed_metadata_field(field)
+    }
+
     fn init_record(&mut self, pass: u8) -> CaResult<()> {
         if pass == 0 {
             // C `calcRecord.c::init_record:105-110` — postfix() into RPCL; a

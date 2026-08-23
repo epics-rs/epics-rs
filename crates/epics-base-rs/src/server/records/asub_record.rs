@@ -372,6 +372,19 @@ impl Record for ASubRecord {
         "aSub"
     }
 
+    /// `aSubRecord.c:294-304` — the ONE record type that routes metadata
+    /// through OUT links as well: `get_inlinkNumber` maps `A`..`U` onto
+    /// `INPA`..`INPU`, `get_outlinkNumber` maps `VALA`..`VALU` onto
+    /// `OUTA`..`OUTU`, and all four metadata slots consult both
+    /// (`:306-403`).
+    fn link_backed_metadata_field(&self, field: &str) -> Option<String> {
+        use crate::server::record::{arg_letter_offset, arg_link_field};
+        let n = NUM_ARGS as u8;
+        arg_letter_offset(field, "", n)
+            .map(|i| arg_link_field("INP", i))
+            .or_else(|| arg_letter_offset(field, "VAL", n).map(|i| arg_link_field("OUT", i)))
+    }
+
     /// `aSubRecord.c::process` has no unconditional UDF re-derive: UDF is
     /// cleared only inside `do_sub` when the subroutine actually ran and
     /// returned `>= 0` (`aSubRecord.c:469-470` `prec->udf = FALSE`). The

@@ -53,7 +53,37 @@ pub enum DbfType {
 }
 
 impl DbfType {
-    fn parse(s: &str) -> Option<Self> {
+    /// The `.dbd` spelling of this type, e.g. `DBF_DOUBLE`.
+    ///
+    /// The inverse of [`DbfType::from_dbd_name`]. Both are public because the
+    /// allowlist's `dbf_types` scope constraint is written in `.dbd` spellings
+    /// (`crates/epics-oracle-rs/allowlist/expected-deviations.toml`), so the
+    /// row text and the measured field type have to meet on one vocabulary.
+    pub fn as_dbd_name(self) -> &'static str {
+        match self {
+            Self::String => "DBF_STRING",
+            Self::Char => "DBF_CHAR",
+            Self::UChar => "DBF_UCHAR",
+            Self::Short => "DBF_SHORT",
+            Self::UShort => "DBF_USHORT",
+            Self::Long => "DBF_LONG",
+            Self::ULong => "DBF_ULONG",
+            Self::Int64 => "DBF_INT64",
+            Self::UInt64 => "DBF_UINT64",
+            Self::Float => "DBF_FLOAT",
+            Self::Double => "DBF_DOUBLE",
+            Self::Enum => "DBF_ENUM",
+            Self::Menu => "DBF_MENU",
+            Self::Device => "DBF_DEVICE",
+            Self::InLink => "DBF_INLINK",
+            Self::OutLink => "DBF_OUTLINK",
+            Self::FwdLink => "DBF_FWDLINK",
+            Self::NoAccess => "DBF_NOACCESS",
+        }
+    }
+
+    /// Parse a `.dbd` type spelling. `None` for anything not a `DBF_*` name.
+    pub fn from_dbd_name(s: &str) -> Option<Self> {
         Some(match s {
             "DBF_STRING" => Self::String,
             "DBF_CHAR" => Self::Char,
@@ -284,7 +314,7 @@ impl Parser<'_> {
                 return Ok(fields);
             }
             if let Some((name, ty)) = field_head(line) {
-                let Some(dbf) = DbfType::parse(&ty) else {
+                let Some(dbf) = DbfType::from_dbd_name(&ty) else {
                     return Err(format!("unknown DBF type `{ty}` on field `{name}`"));
                 };
                 self.i += 1;

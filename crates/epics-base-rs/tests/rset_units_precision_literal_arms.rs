@@ -123,7 +123,7 @@ fn calcouts_val_still_takes_egu_and_prec() {
     );
 }
 
-/// `histogramRecord.c:419-437` is a switch: SDEL takes the literal while
+/// `histogramRecord.c:420-439` is a switch: SDEL takes the literal while
 /// ULIM/LLIM/SGNL/SVAL/WDTH take `prec->prec`. Pin that the literal is SDEL's
 /// alone and does not leak onto the switch's other cases.
 ///

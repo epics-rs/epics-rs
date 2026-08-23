@@ -20,7 +20,8 @@
 //! the transcription's only check. They are written against the C rset table
 //! above rather than against a measured `pvxget`.
 
-use epics_base_rs::server::record::RecordInstance;
+use epics_base_rs::server::record::{Record, RecordInstance};
+use epics_base_rs::types::EpicsValue;
 use scaler_rs::records::scaler::ScalerRecord;
 
 fn scaler() -> RecordInstance {
@@ -95,4 +96,31 @@ fn a_scaler_val_snapshot_carries_no_alarm_limits() {
         snap.alarm_limits().is_none(),
         "no alarm limits are assigned for a type whose rset NULLs the slot"
     );
+}
+
+/// What that one slot ANSWERS, which is the half a property bit cannot say.
+/// `scalerRecord.c:728-742` seeds `pscal->prec` and departs from it for `VERS`
+/// alone (a literal 2); `recGblGetPrec` reaches only dbCommon, which has no
+/// DBF_DOUBLE field, so `TP` and its siblings keep `PREC`.
+///
+/// Precision is not only a `caget -d` leaf: it is what the DBF_DOUBLE to
+/// DBR_STRING conversion renders with (`dbConvert.c:783-786`), so a plain
+/// `caget T:SCALER.TP` printed `1` where C prints `1.000`.
+#[test]
+fn scaler_precision_is_prec_everywhere_but_vers() {
+    let mut rec = ScalerRecord::default();
+    rec.put_field("PREC", EpicsValue::Short(3))
+        .expect("scaler models PREC");
+    let inst = RecordInstance::new("T:SCALER".to_string(), rec);
+
+    let prec_of = |field: &str| {
+        inst.snapshot_for_field(field)
+            .unwrap_or_else(|| panic!("{field} has no snapshot"))
+            .precision()
+            .unwrap_or_else(|| panic!("{field} serves no precision leaf"))
+    };
+
+    assert_eq!(prec_of("TP"), 3);
+    assert_eq!(prec_of("FREQ"), 3);
+    assert_eq!(prec_of("VERS"), 2);
 }

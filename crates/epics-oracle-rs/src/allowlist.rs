@@ -55,6 +55,7 @@
 use std::collections::BTreeSet;
 use std::path::Path;
 
+use crate::dbd::DbfType;
 use crate::diff::{Difference, Surface};
 
 /// A C-bug refusal transcribed from `doc/upstream-c-bugs.md` and expected to
@@ -100,6 +101,17 @@ pub struct Deviation {
     pub record_types: Vec<String>,
     #[serde(default)]
     pub fields: Vec<String>,
+    /// Declared `DBF_*` types of the destination field this deviation is limited
+    /// to, in `.dbd` spelling.
+    ///
+    /// The third way to anchor a row to a part of the surface, and the only one
+    /// that fits a deviation whose family is a *type* family rather than a place:
+    /// CBUG-E2 is `dbConvert`'s double->integer cast, which reaches every integer
+    /// and `epicsEnum16` destination of every record type and no float one. No
+    /// `record_types`/`fields` list can say that without either lying by omission
+    /// or restating the `.dbd`.
+    #[serde(default)]
+    pub dbf_types: Vec<String>,
     /// Observable surfaces this deviation may show up on (`diff::Surface`).
     #[serde(default)]
     pub surface: Vec<String>,
@@ -167,6 +179,14 @@ pub struct Allowlist {
 pub struct MatchContext<'a> {
     pub record_type: &'a str,
     pub field: &'a str,
+    /// The destination field's declared type, from the `.dbd`.
+    ///
+    /// Not optional. `record_type` + `field` name *where* a case ran but not
+    /// *what it wrote into*, and a deviation about a conversion is about the
+    /// destination type: `ai.VAL` and `longin.VAL` are the same place-shaped
+    /// context and opposite answers for CBUG-E2. Every path that adjudicates
+    /// supplies it, so a row's `dbf_types` can never be silently unenforced.
+    pub dbf: DbfType,
     /// The boundary class driven, if this case drove a put.
     pub class: Option<&'a str>,
 }
@@ -241,6 +261,32 @@ impl Allowlist {
                 return Err(format!(
                     "allowlist row {} has no justification — an allowlist entry \
                      without a `why` is a suppression, not an expected deviation",
+                    d.id
+                ));
+            }
+            // Every `dbf_types` entry must be a real `.dbd` spelling, or the row
+            // silently narrows to nothing and reads as a bound it does not have.
+            for t in &d.dbf_types {
+                if DbfType::from_dbd_name(t).is_none() {
+                    return Err(format!(
+                        "allowlist row {} names `{t}` in `dbf_types`, which is not a \
+                         .dbd DBF_* type",
+                        d.id
+                    ));
+                }
+            }
+            // A row must be anchored to some part of the surface. `surface` and
+            // `classes` say which observable and which written value, not WHERE:
+            // a row constraining neither the record type, nor the field, nor the
+            // destination type applies to the whole denominator, and an
+            // allowlist whose rows can do that justifies every difference the
+            // run will ever find. That is the one failure this mechanism exists
+            // to prevent, so it is rejected at load rather than measured around.
+            if d.record_types.is_empty() && d.fields.is_empty() && d.dbf_types.is_empty() {
+                return Err(format!(
+                    "allowlist row {} is unbounded — it names no `record_types`, no \
+                     `fields` and no `dbf_types`, so it matches the entire surface. \
+                     A deviation must state where it happens.",
                     d.id
                 ));
             }
@@ -367,8 +413,15 @@ impl Allowlist {
 }
 
 impl Deviation {
+    /// CA match: scope + surface + the content constraint.
+    ///
+    /// Identical in shape to [`Self::matches_pva`], and that is the point. The
+    /// content predicate used to be reachable only from the PVA path, so a CA
+    /// row could claim a difference with no constraint at all on what the two
+    /// sides actually said. One rule now decides both, with the CA
+    /// [`Difference`]'s two readings standing in for the PVA renderings.
     fn matches(&self, ctx: &MatchContext<'_>, d: &Difference) -> bool {
-        self.in_scope(ctx) && self.covers_surface(d.surface)
+        self.in_scope(ctx) && self.covers_surface(d.surface) && self.content_ok(&d.c, &d.rust)
     }
 
     /// Everything about a row except the surface: does this row point at the case
@@ -383,6 +436,7 @@ impl Deviation {
 
         ok(&self.record_types, ctx.record_type)
             && ok(&self.fields, ctx.field)
+            && ok(&self.dbf_types, ctx.dbf.as_dbd_name())
             && match ctx.class {
                 Some(c) => ok(&self.classes, c),
                 // A case with no boundary class (a pure read probe) can only
@@ -537,10 +591,11 @@ mod tests {
         }
     }
 
-    fn ctx<'a>(rt: &'a str, f: &'a str, class: Option<&'a str>) -> MatchContext<'a> {
+    fn ctx<'a>(rt: &'a str, f: &'a str, dbf: DbfType, class: Option<&'a str>) -> MatchContext<'a> {
         MatchContext {
             record_type: rt,
             field: f,
+            dbf,
             class,
         }
     }
@@ -561,7 +616,7 @@ why = "C's special() rejects SPC_MOD; port accepts. Documented fields unwritable
     fn a_matching_diff_is_an_expected_deviation() {
         let mut al = Allowlist::parse(F6).unwrap();
         let hit = al.match_diff(
-            &ctx("calc", "INPM", Some("link-constant")),
+            &ctx("calc", "INPM", DbfType::InLink, Some("link-constant")),
             &diff(Surface::PutAccepted, "false", "true"),
         );
         assert_eq!(hit.as_deref(), Some("CBUG-F6"));
@@ -574,7 +629,7 @@ why = "C's special() rejects SPC_MOD; port accepts. Documented fields unwritable
         // put_accepted diff there is a genuine port defect.
         assert!(
             al.match_diff(
-                &ctx("calc", "INPA", Some("link-constant")),
+                &ctx("calc", "INPA", DbfType::InLink, Some("link-constant")),
                 &diff(Surface::PutAccepted, "false", "true")
             )
             .is_none()
@@ -586,7 +641,7 @@ why = "C's special() rejects SPC_MOD; port accepts. Documented fields unwritable
         let mut al = Allowlist::parse(F6).unwrap();
         assert!(
             al.match_diff(
-                &ctx("ai", "INPM", Some("link-constant")),
+                &ctx("ai", "INPM", DbfType::InLink, Some("link-constant")),
                 &diff(Surface::PutAccepted, "false", "true")
             )
             .is_none()
@@ -600,7 +655,7 @@ why = "C's special() rejects SPC_MOD; port accepts. Documented fields unwritable
         let mut al = Allowlist::parse(F6).unwrap();
         assert!(
             al.match_diff(
-                &ctx("calc", "INPM", Some("link-constant")),
+                &ctx("calc", "INPM", DbfType::InLink, Some("link-constant")),
                 &diff(Surface::ValueString, "1", "2")
             )
             .is_none()
@@ -613,7 +668,7 @@ why = "C's special() rejects SPC_MOD; port accepts. Documented fields unwritable
     #[test]
     fn a_row_whose_scope_was_exercised_and_did_not_fire_is_stale() {
         let mut al = Allowlist::parse(F6).unwrap();
-        let c = ctx("calc", "INPM", Some("link-constant"));
+        let c = ctx("calc", "INPM", DbfType::InLink, Some("link-constant"));
 
         al.note_compared(&c, &[Surface::PutAccepted]);
         assert_eq!(
@@ -644,7 +699,7 @@ why = "C's special() rejects SPC_MOD; port accepts. Documented fields unwritable
 
         // A read-phase sweep over the very same field: every read surface is
         // compared, but the put surface the row names never is.
-        let c = ctx("calc", "INPM", None);
+        let c = ctx("calc", "INPM", DbfType::InLink, None);
         al.note_compared(
             &c,
             &[
@@ -666,7 +721,7 @@ why = "C's special() rejects SPC_MOD; port accepts. Documented fields unwritable
     fn a_case_outside_the_rows_scope_does_not_exercise_it() {
         let mut al = Allowlist::parse(F6).unwrap();
         al.note_compared(
-            &ctx("ai", "INPM", Some("link-constant")),
+            &ctx("ai", "INPM", DbfType::InLink, Some("link-constant")),
             &[Surface::PutAccepted],
         );
         assert!(
@@ -686,19 +741,23 @@ schema = 1
 id = "CBUG-E2"
 bucket = "REPRODUCED"
 enabled = false
+record_types = ["ai"]
 surface = ["value_string"]
 why = "port reproduces C's bare cast on purpose; agreement expected today"
 "#;
         let mut al = Allowlist::parse(toml).unwrap();
         assert!(
             al.match_diff(
-                &ctx("ai", "VAL", Some("over-max")),
+                &ctx("ai", "VAL", DbfType::Double, Some("over-max")),
                 &diff(Surface::ValueString, "-2147483648", "2147483647")
             )
             .is_none(),
             "a REPRODUCED row must not launder a diff into 'expected'"
         );
-        al.note_compared(&ctx("ai", "VAL", Some("over-max")), &[Surface::ValueString]);
+        al.note_compared(
+            &ctx("ai", "VAL", DbfType::Double, Some("over-max")),
+            &[Surface::ValueString],
+        );
         assert!(al.stale_rows().is_empty(), "disabled rows are not stale");
         assert!(
             al.unexercised_rows().is_empty(),
@@ -765,7 +824,7 @@ why = "port lifts C's fixed 80-byte OMAX cap and serves the live written length"
 "#;
         let mut al =
             Allowlist::parse(toml).expect("design-divergence row parses without a CBUG id");
-        let bout = ctx("asyn", "BOUT", None);
+        let bout = ctx("asyn", "BOUT", DbfType::Char, None);
         // The PVA value/marking contract is the surface a BOUT value diff reports
         // on (pvaread.rs). An empty `port_adds_leaves` means scope+surface
         // decides, and the field-level scope keeps it to this one channel.
@@ -775,8 +834,13 @@ why = "port lifts C's fixed 80-byte OMAX cap and serves the live written length"
 
         // Same diff on a field the row does not name is still unjustified.
         assert!(
-            al.match_pva_diff(&ctx("asyn", "AOUT", None), "value_marking", "a", "b")
-                .is_none(),
+            al.match_pva_diff(
+                &ctx("asyn", "AOUT", DbfType::String, None),
+                "value_marking",
+                "a",
+                "b"
+            )
+            .is_none(),
             "the row is scoped to BOUT; another field is a separate finding"
         );
     }
@@ -805,6 +869,7 @@ schema = 1
 [[deviation]]
 id = "DESIGN-1"
 bucket = "DESIGN-DIVERGENCE"
+record_types = ["ai"]
 why = "intentional port design choice, justified here rather than by a CBUG"
 "#;
         assert!(Allowlist::parse(design_without_cbug).is_ok());
@@ -815,9 +880,87 @@ schema = 1
 [[deviation]]
 id = "INSTR-1"
 bucket = "INSTRUMENT-SUPERSET"
+record_types = ["ai"]
 why = "ground-truth instrument dbd superset, justified here rather than by a CBUG"
 "#;
         assert!(Allowlist::parse(instrument_without_cbug).is_ok());
+    }
+
+    /// A row that names no record type, no field and no destination type
+    /// matches the whole denominator, so it justifies every difference the run
+    /// will ever find. That is the one failure the allowlist exists to prevent,
+    /// and it is refused at load rather than measured around.
+    #[test]
+    fn a_row_bounded_by_nothing_is_rejected_at_parse() {
+        let toml = r#"
+schema = 1
+[[deviation]]
+id = "CBUG-Z1"
+bucket = "NOT-REPRODUCED"
+surface = ["value_string"]
+classes = ["over-max"]
+why = "surface and class say WHAT, never WHERE — this row is the whole surface"
+"#;
+        let err = Allowlist::parse(toml).unwrap_err();
+        assert!(err.contains("unbounded"), "got: {err}");
+
+        // Any one of the three anchors is enough.
+        for anchor in [
+            "record_types = [\"ai\"]",
+            "fields = [\"VAL\"]",
+            "dbf_types = [\"DBF_LONG\"]",
+        ] {
+            let bounded = toml.replace("surface =", &format!("{anchor}\nsurface ="));
+            assert!(
+                Allowlist::parse(&bounded).is_ok(),
+                "{anchor} bounds the row: {:?}",
+                Allowlist::parse(&bounded).err()
+            );
+        }
+    }
+
+    /// A `dbf_types` entry that is not a `.dbd` spelling would narrow the row to
+    /// nothing while reading as a bound, so it is a load error, not a silent
+    /// never-match.
+    #[test]
+    fn an_unknown_dbf_type_spelling_is_rejected() {
+        let toml = r#"
+schema = 1
+[[deviation]]
+id = "CBUG-Z2"
+bucket = "NOT-REPRODUCED"
+dbf_types = ["DBF_LNOG"]
+why = "typo'd destination type must not read as a bound"
+"#;
+        let err = Allowlist::parse(toml).unwrap_err();
+        assert!(err.contains("dbf_types"), "got: {err}");
+    }
+
+    /// The CA path and the PVA path now decide with ONE rule. A row carrying a
+    /// content constraint used to be scope-and-surface only on the CA side, so
+    /// it justified any difference on the channel; the constraint is honoured
+    /// there too now.
+    #[test]
+    fn a_content_constrained_row_does_not_launder_an_unrelated_ca_difference() {
+        let toml = r#"
+schema = 1
+[[deviation]]
+id = "CBUG-Z3"
+bucket = "NOT-REPRODUCED"
+record_types = ["ai"]
+surface = ["value_string"]
+port_adds_leaves = ["display.precision"]
+why = "the port serves a leaf the reference drops — and nothing else may move"
+"#;
+        let mut al = Allowlist::parse(toml).unwrap();
+        assert!(
+            al.match_diff(
+                &ctx("ai", "VAL", DbfType::Double, None),
+                &diff(Surface::ValueString, "0", "inf")
+            )
+            .is_none(),
+            "the readings are a changed value, not an added leaf"
+        );
     }
 
     /// An unknown bucket string is a typo, not a fifth policy — rejected.
@@ -880,7 +1023,7 @@ why = "typo'd bucket must not silently become a wildcard"
     fn an_instrument_superset_row_matches_a_ground_truth_added_choice() {
         let mut al = longin_instr_allowlist();
         let hit = al.match_pva_diff(
-            &ctx("longin", "DTYP", None),
+            &ctx("longin", "DTYP", DbfType::Device, None),
             "value_marking",
             &dtyp_blob(LONGIN_REF),
             &dtyp_blob(LONGIN_PORT),
@@ -899,7 +1042,7 @@ why = "typo'd bucket must not silently become a wildcard"
             .replace("alarm.severity int32_t = 3", "alarm.severity int32_t = 4");
         assert!(
             al.match_pva_diff(
-                &ctx("longin", "DTYP", None),
+                &ctx("longin", "DTYP", DbfType::Device, None),
                 "value_marking",
                 &dtyp_blob(LONGIN_REF),
                 &port,
@@ -917,7 +1060,7 @@ why = "typo'd bucket must not silently become a wildcard"
         let ref_two = "value.choices string[] = {8}[\"Soft Channel\", \"Async Soft Channel\", \"General Time\", \"asynInt32\", \"asynUInt32Digital\", \"asynInt64\", \"QSRV2 Set UTag\", \"Surprise Choice\"]";
         assert!(
             al.match_pva_diff(
-                &ctx("longin", "DTYP", None),
+                &ctx("longin", "DTYP", DbfType::Device, None),
                 "value_marking",
                 &dtyp_blob(ref_two),
                 &dtyp_blob(LONGIN_PORT),
@@ -935,7 +1078,7 @@ why = "typo'd bucket must not silently become a wildcard"
         let port_extra = "value.choices string[] = {7}[\"Soft Channel\", \"Async Soft Channel\", \"General Time\", \"asynInt32\", \"asynUInt32Digital\", \"asynInt64\", \"Port Only\"]";
         assert!(
             al.match_pva_diff(
-                &ctx("longin", "DTYP", None),
+                &ctx("longin", "DTYP", DbfType::Device, None),
                 "value_marking",
                 &dtyp_blob(LONGIN_REF),
                 &dtyp_blob(port_extra),
@@ -970,14 +1113,14 @@ why = "cannot point both directions at once"
     fn the_shipped_instrument_superset_rows_fire_on_the_residual_qsrv2_diffs() {
         let mut al = Allowlist::load(&Allowlist::default_path()).unwrap();
         let longin = al.match_pva_diff(
-            &ctx("longin", "DTYP", None),
+            &ctx("longin", "DTYP", DbfType::Device, None),
             "value_marking",
             &dtyp_blob(LONGIN_REF),
             &dtyp_blob(LONGIN_PORT),
         );
         assert_eq!(longin.as_deref(), Some("INSTR-QSRV2-LONGIN-UTAG"));
         let waveform = al.match_pva_diff(
-            &ctx("waveform", "DTYP", None),
+            &ctx("waveform", "DTYP", DbfType::Device, None),
             "value_marking",
             &dtyp_blob(WAVEFORM_REF),
             &dtyp_blob(WAVEFORM_PORT),

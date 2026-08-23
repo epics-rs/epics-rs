@@ -1643,8 +1643,11 @@ impl PvDatabase {
             match std::mem::replace(&mut *phase, DbInitPhase::Running) {
                 DbInitPhase::Loading(queued) => queued,
                 // An IOC that loaded nothing (programmatic / unit-test database)
-                // still crosses the barrier: the phase becomes terminal.
-                DbInitPhase::Unloaded => return,
+                // still crosses the barrier: the phase becomes terminal. It
+                // owes no per-record init pass, but it does owe the
+                // link-backed metadata resolution below, so it falls through
+                // rather than returning.
+                DbInitPhase::Unloaded => Vec::new(),
                 DbInitPhase::Running => return,
             }
         };
@@ -1652,6 +1655,17 @@ impl PvDatabase {
         // now-immutable record set, and C's `init_record` pass is a loop too.
         for init in owed {
             init.await;
+        }
+        // Link-backed metadata (C's `dbGetUnits`/`dbGetPrecision`/
+        // `dbGetGraphicLimits`/`dbGetAlarmLimits` inside the rset). This is the
+        // first moment every record exists and every link's locality is
+        // settled, so it is the earliest point resolution can succeed
+        // regardless of `.db` load order — and the only point that covers a
+        // record which never processes. The map guard is released before the
+        // loop: `refresh_link_backed_metadata` takes record locks.
+        let instances: Vec<_> = self.inner.records.read().values().cloned().collect();
+        for rec in &instances {
+            self.refresh_link_backed_metadata(rec);
         }
     }
 

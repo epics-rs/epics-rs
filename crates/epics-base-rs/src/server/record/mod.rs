@@ -45,7 +45,9 @@ pub use record_trait::{
     DelayedCallbackOutcome, EPICS_TIME_EVENT_DEVICE_TIME, FieldDeclaration, FieldDesc,
     FieldMetadataOverride, InputFetchPolicy, LinkReadAs, OutTarget, ProcessAction, ProcessContext,
     ProcessOutcome, ProcessSnapshot, RawSoftEntry, Record, RecordProcessResult, Special,
-    SubroutineFn, ValuePostGate, coerce_put_value, put_field_internal_default, seed_input_links,
+    SubroutineFn, ValuePostGate, arg_letter_offset, arg_link_field,
+    calc_class_link_backed_metadata_field, coerce_put_value, put_field_internal_default,
+    seed_input_links,
 };
 pub(crate) use record_trait::{AuxPostMask, value_gate};
 pub use scan::{ScanList, ScanType, SimModeScan};

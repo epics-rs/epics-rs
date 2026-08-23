@@ -101,6 +101,12 @@ impl Record for SubRecord {
         "sub"
     }
 
+    /// `subRecord.c:198-204` `get_linkNumber` — same shape as `calc`'s over
+    /// `INP_ARG_MAX` (`subRecord.c:89`), also 21.
+    fn link_backed_metadata_field(&self, field: &str) -> Option<String> {
+        crate::server::record::calc_class_link_backed_metadata_field(field)
+    }
+
     fn init_record(&mut self, pass: u8) -> CaResult<()> {
         if pass == 0 {
             // C `subRecord.c::init_record` (lines 130-132) seeds the

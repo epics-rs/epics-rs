@@ -18,9 +18,9 @@ use epics_oracle_rs::catool::CaTools;
 use epics_oracle_rs::dbd::Dbd;
 use epics_oracle_rs::diff::Verdict;
 use epics_oracle_rs::ioc::{CTools, Ioc, Pair, Side};
-use epics_oracle_rs::report::Counts;
+use epics_oracle_rs::report::{Counts, exit_status, field_coverage, run_failures};
 use epics_oracle_rs::runner::{Runner, workdir};
-use epics_oracle_rs::surface::Surface;
+use epics_oracle_rs::surface::{Surface, probe_supported_record_types};
 
 fn tools() -> CTools {
     CTools::discover().expect(
@@ -153,9 +153,31 @@ fn a_real_run_reconciles_its_counts_and_reports_coverage() {
 
     // Coverage is a fraction of the FULL denominator, not of what we chose to
     // run. A two-record-type run must therefore report low coverage, not 100%.
+    //
+    // Asserting that against `cases.len()` was not enough: it bounds how many
+    // cases ran, not what the coverage line claims. The claim has to be checked
+    // against the read probe's own arithmetic — it visits every field of the
+    // two types exactly once, so measured + errored is exactly that many, no
+    // matter what other phases contributed to `cases`.
+    let read_fields = surface.fields_of("ai").count() + surface.fields_of("bi").count();
+    let mon = runner
+        .probe_monitor("ai", &surface, &mut allowlist)
+        .expect("ai.VAL is drivable, so the monitor phase must produce a case");
+    cases.push(mon);
+
+    let cov = field_coverage(&cases, surface.denominator());
+    assert_eq!(
+        cov.measured + cov.errored,
+        read_fields,
+        "the coverage line must account for the fields read and nothing else"
+    );
     assert!(
-        surface.denominator() >= cases.len(),
+        cov.measured + cov.errored <= cov.enumerated,
         "coverage can never exceed the denominator"
+    );
+    assert!(
+        cov.percent() < 100.0,
+        "a two-record-type run is not a full sweep"
     );
 }
 
@@ -185,5 +207,72 @@ fn every_reported_difference_carries_a_runnable_reproducer() {
         let rendered = c.reproducer.render("");
         assert!(rendered.contains("softIoc"), "must show how to run C");
         assert!(rendered.contains("oracle-ioc"), "must show how to run port");
+    }
+}
+
+/// The denominator probe must be able to configure itself, and what it reports
+/// must not fail a clean run.
+///
+/// `asyn` is the type where the probe's configuration and the measured IOC's
+/// diverge — base's CNCT-only stub record versus asyn-rs's `AsynRecord` on
+/// `ORACLEASYN` — so it is the one to pin now that the exit rule consults the
+/// unimplemented list. This is a guard, not a regression test: measured on this
+/// host, both configurations accept `asyn`, so it passes with the probe built
+/// either way. It fails if the shared configuration owner stops configuring, or
+/// if `asyn` ever stops loading under the configuration actually measured.
+#[tokio::test]
+async fn the_denominator_probe_uses_the_configuration_under_test() {
+    let mut d = dbd();
+    d.record_types.retain(|r| r.name == "asyn");
+    assert_eq!(
+        d.record_types.len(),
+        1,
+        "the oracle dbd must declare asyn for this to measure anything"
+    );
+
+    let supported = probe_supported_record_types(&d)
+        .await
+        .expect("the probe must be able to configure itself");
+    let surface = Surface::build(&d, &supported);
+
+    // A run in which nothing disagreed and nothing errored.
+    let failures = run_failures(&Counts::default(), &surface.unimplemented_types, &[]);
+    assert_eq!(
+        exit_status(&failures),
+        0,
+        "asyn must not read as unimplemented: {failures:?}"
+    );
+}
+
+/// A refusal the server actually issued must stay a **reading**.
+///
+/// The other direction of the put contract: `caput` failing because the server
+/// said no is observable behaviour (`NAME` is `special(SPC_NOMOD)`, so both
+/// sides must refuse), and a fix that turned every non-zero `caput` exit into a
+/// measurement failure would bury that finding under ERROR instead of scoring
+/// it. Driven against the real pair, because the discriminator is the C tool's
+/// own message.
+#[test]
+fn a_server_issued_refusal_is_a_reading_not_a_measurement_failure() {
+    let t = tools();
+    let dir = workdir(None).unwrap();
+    let db = dir.join("put_nomod.db");
+    std::fs::write(&db, "record(ai, \"ORACLE:NOMOD\") {}\n").unwrap();
+    let pair = Pair::boot(&t, &db, "ORACLE:NOMOD").expect("both IOCs must boot");
+
+    for (port, side) in [(pair.c.port(), Side::C), (pair.rust.port(), Side::Rust)] {
+        let out = CaTools::new(&t, port, side)
+            .caput("ORACLE:NOMOD.NAME", "SOMETHINGELSE")
+            .unwrap_or_else(|e| {
+                panic!("{side}: a refusal by the server must be a reading, got ERROR: {e}")
+            });
+        assert!(
+            !out.accepted,
+            "{side}: NAME is special(SPC_NOMOD); the write must be refused"
+        );
+        assert!(
+            out.error.is_some(),
+            "{side}: a refusal must carry the server's complaint"
+        );
     }
 }

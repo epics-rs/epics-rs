@@ -8,7 +8,7 @@ use crate::server::record::{
     FieldMetadataOverride, InputFetchPolicy, MENU_YES_NO, ProcessAction, ProcessOutcome, Record,
     RecordProcessResult,
 };
-use crate::types::EpicsValue;
+use crate::types::{EpicsValue, c_cast};
 
 /// The PV-status fields, in C's `NUM_LINKS` order: the twelve inputs
 /// (`INAV`..`INLV`), then `DOLV`, then `OUTV`. C keeps the statuses in one
@@ -713,7 +713,7 @@ impl Record for SwaitRecord {
             self.pending_output = self.cached_should_output;
             self.output_wait = true;
             self.cached_should_output = false;
-            let delay = std::time::Duration::from_secs_f64(self.odly as f64);
+            let delay = crate::runtime::time::duration_from_secs(self.odly as f64);
             // `CompleteDeferOutput`, NOT bare `AsyncPending`: swait posts the
             // value side at the START of the delay (C `monitor()` at line 475,
             // reached because `schedOutput` set `async=TRUE` but `process` falls
@@ -931,10 +931,11 @@ impl Record for SwaitRecord {
                     as u16;
             }
             "ODLY" => {
-                self.odly = value
-                    .to_f64()
-                    .ok_or_else(|| CaError::TypeMismatch("ODLY".into()))?
-                    as f32;
+                self.odly = c_cast::f64_to_f32(
+                    value
+                        .to_f64()
+                        .ok_or_else(|| CaError::TypeMismatch("ODLY".into()))?,
+                );
             }
             // OUTN falls through to put_common_field which mirrors to common.out.
             "SIML" => match value {

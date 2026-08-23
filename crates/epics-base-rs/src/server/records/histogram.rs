@@ -228,11 +228,22 @@ impl Record for HistogramRecord {
                 ..Default::default()
             });
         }
-        field
-            .eq_ignore_ascii_case("SDEL")
-            .then(|| FieldMetadataOverride {
+        if field.eq_ignore_ascii_case("SDEL") {
+            return Some(FieldMetadataOverride {
                 units: Some("s".into()),
                 precision: Some(HISTOGRAM_SDEL_PRECISION),
+                ..Default::default()
+            });
+        }
+        // `SDLY` is the one DBF_DOUBLE field histogram's precision switch does
+        // NOT list, so it takes the `default: recGblGetPrec` arm — which for a
+        // DBF_DOUBLE only clamps an out-of-range value (`recGbl.c:135-139`) and
+        // therefore leaves `dbAccess.c:388`'s zeroed buffer standing. The
+        // record-level PREC cache would otherwise reach it.
+        field
+            .eq_ignore_ascii_case("SDLY")
+            .then(|| FieldMetadataOverride {
+                precision: Some(0),
                 ..Default::default()
             })
     }

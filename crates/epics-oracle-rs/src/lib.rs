@@ -132,6 +132,72 @@ pub fn puts_are_measurable(record_type: &str) -> bool {
     record_type != "asyn"
 }
 
+/// Keep-alive for the process-global registrations
+/// [`register_port_ioc_devices`] performs. Dropping it tears the asyn port's
+/// runtime down, so it must outlive every IOC built against it.
+pub struct PortIocDevices {
+    _asyn_manager: asyn_rs::manager::PortManager,
+    _asyn_port: asyn_rs::runtime::PortRuntimeHandle,
+}
+
+/// The process-global half of the port IOC's configuration: the disconnected
+/// `ORACLEASYN` port and asyn's `DTYP` device menus.
+///
+/// Paired with [`port_ioc_builder`], and the two are the **single owner** of
+/// "how the port under test is configured". Both the measured IOC
+/// (`oracle-ioc`) and [`crate::surface::probe_supported_record_types`] go
+/// through them, because a denominator measured from a *different*
+/// configuration than the thing under test is not a denominator. `asyn` is
+/// where the two used to diverge: without this, the probe loads
+/// epics-base-rs's CNCT-only stub record and answers "implemented" for an IOC
+/// nobody runs, while the measured IOC serves asyn-rs's `AsynRecord` attached
+/// to this port.
+///
+/// A `drvAsynIPPort` on `localhost:1`, `noAutoConnect=1`, `noProcessEos=0` —
+/// the exact C st.cmd `drvAsynIPPortConfigure("ORACLEASYN","localhost:1",
+/// 0,1,0)`. Nothing listens on `localhost:1` and `noAutoConnect` keeps the port
+/// from ever dialing, so it stays permanently disconnected on both sides while
+/// still answering HOSTINFO / DRTO exactly as C does.
+///
+/// The menu registration is menu-only on purpose: it does NOT install the
+/// universal asyn factory, so no record's read fields or processing change —
+/// only the `DTYP` `value.choices` a client reads, matching the fat-C ground
+/// truth.
+pub fn register_port_ioc_devices() -> Result<PortIocDevices, String> {
+    use asyn_rs::drivers::ip_port::DrvAsynIPPort;
+    use asyn_rs::manager::PortManager;
+
+    let manager = PortManager::new();
+    let port = manager
+        .register_port(
+            DrvAsynIPPort::new_configured(
+                ORACLE_ASYN_PORT,
+                "localhost:1",
+                true,  // noAutoConnect — never dial; stay permanently disconnected
+                false, // noProcessEos=0 — install the default EOS interpose, as C does
+            )
+            .map_err(|e| format!("configure {ORACLE_ASYN_PORT}: {e}"))?,
+        )
+        .map_err(|e| format!("register {ORACLE_ASYN_PORT}: {e}"))?;
+
+    asyn_rs::adapter::register_asyn_device_menus();
+
+    Ok(PortIocDevices {
+        _asyn_manager: manager,
+        _asyn_port: port,
+    })
+}
+
+/// The per-builder half of the port IOC's configuration: route the `asyn`
+/// record type to asyn-rs's full `AsynRecord` rather than epics-base-rs's
+/// CNCT-only display stub. See [`register_port_ioc_devices`] for why the two
+/// halves must stay together.
+pub fn port_ioc_builder() -> epics_base_rs::server::ioc_builder::IocBuilder {
+    let (asyn_type, asyn_factory) = asyn_rs::asyn_record::asyn_record_factory();
+    epics_base_rs::server::ioc_builder::IocBuilder::new()
+        .register_record_type(asyn_type, asyn_factory)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

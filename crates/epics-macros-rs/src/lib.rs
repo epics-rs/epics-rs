@@ -259,6 +259,16 @@ struct RecordAttrs {
     /// [`RecordAttrs::init`]: a free function, so the derive need not assume an
     /// inherent method exists.
     metadata_override: Option<syn::Path>,
+    /// `#[record(link_metadata_field = some_fn)]` — the record type's C rset
+    /// answers some fields' `get_units` / `get_precision` /
+    /// `get_graphic_double` / `get_alarm_double` from one of the record's own
+    /// LINK fields rather than from the record (C's `get_linkNumber` /
+    /// `get_dol` shape). Point this at a free function
+    /// `fn(&Self, &str) -> Option<String>` returning the backing link field's
+    /// name, and the derive emits `Record::link_backed_metadata_field`
+    /// delegating to it. Same free-function shape as
+    /// [`RecordAttrs::metadata_override`].
+    link_metadata_field: Option<syn::Path>,
     /// `#[record(no_value_monitor)]` — the record's process cycle posts no VAL
     /// value monitor (`Record::process_posts_value_monitor` → `false`). Set for
     /// the "trigger" records `fanout`/`seq`, whose C `process()` posts VAL only
@@ -444,6 +454,19 @@ fn impl_epics_record(input: &DeriveInput) -> syn::Result<proc_macro2::TokenStrea
         None => quote! {},
     };
 
+    // `#[record(link_metadata_field = some_fn)]` — emit
+    // `Record::link_backed_metadata_field` delegating to the named free
+    // function. Omitted entirely when the record declares none, so the trait
+    // default (`None` — no field's metadata comes from a link) applies.
+    let link_metadata_field_method = match &attrs.link_metadata_field {
+        Some(path) => quote! {
+            fn link_backed_metadata_field(&self, field: &str) -> Option<String> {
+                #path(self, field)
+            }
+        },
+        None => quote! {},
+    };
+
     // `#[record(no_value_monitor)]` — emit `Record::process_posts_value_monitor`
     // returning `false` (fanout/seq trigger-VAL). Omitted when the flag is
     // absent, so the trait default (`true`) applies to every value record.
@@ -463,6 +486,7 @@ fn impl_epics_record(input: &DeriveInput) -> syn::Result<proc_macro2::TokenStrea
             #init_method
             #value_monitor_method
             #metadata_override_method
+            #link_metadata_field_method
 
             fn record_type(&self) -> &'static str {
                 #record_type_str
@@ -500,6 +524,7 @@ fn parse_record_attrs(input: &DeriveInput) -> syn::Result<RecordAttrs> {
     let mut constant_init: Vec<(String, String)> = Vec::new();
     let mut init: Option<syn::Path> = None;
     let mut metadata_override: Option<syn::Path> = None;
+    let mut link_metadata_field: Option<syn::Path> = None;
     let mut no_value_monitor = false;
 
     for attr in &input.attrs {
@@ -538,6 +563,9 @@ fn parse_record_attrs(input: &DeriveInput) -> syn::Result<RecordAttrs> {
                 } else if meta.path.is_ident("metadata_override") {
                     metadata_override = Some(meta.value()?.parse()?);
                     Ok(())
+                } else if meta.path.is_ident("link_metadata_field") {
+                    link_metadata_field = Some(meta.value()?.parse()?);
+                    Ok(())
                 } else if meta.path.is_ident("no_value_monitor") {
                     // Bare flag, like a field's `read_only`: no `= value`.
                     no_value_monitor = true;
@@ -545,7 +573,8 @@ fn parse_record_attrs(input: &DeriveInput) -> syn::Result<RecordAttrs> {
                 } else {
                     Err(meta.error(
                         "expected `type`, `crate_path`, `constant_init`, `init`, \
-                         `metadata_override` or `no_value_monitor`",
+                         `metadata_override`, `link_metadata_field` or \
+                         `no_value_monitor`",
                     ))
                 }
             })?;
@@ -561,6 +590,7 @@ fn parse_record_attrs(input: &DeriveInput) -> syn::Result<RecordAttrs> {
         constant_init,
         init,
         metadata_override,
+        link_metadata_field,
         no_value_monitor,
     })
 }

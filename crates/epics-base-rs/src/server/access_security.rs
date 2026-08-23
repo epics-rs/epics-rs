@@ -1753,6 +1753,120 @@ impl Drop for TrapWriteGuard {
     }
 }
 
+/// Per-write trap-log identity that does not depend on the value being
+/// written. Borrows the caller's identity strings (matching the C
+/// `asTrapWriteMessage` by-reference lifetime, `asLib.h:34-56`).
+pub struct TrapWriteMeta<'a> {
+    /// The channel (`record.FIELD`) being written — pvxs passes
+    /// `dbChannelName(pChan)`.
+    pub pv_name: &'a str,
+    /// Authenticated account name (pvxs `cred->account`).
+    pub user: &'a str,
+    /// Client host (pvxs `cred->host`).
+    pub host: &'a str,
+    /// Client peer ("ip:port") when the caller has the socket address;
+    /// callers whose identity block carries no separate peer pass the
+    /// host again.
+    pub peer: &'a str,
+    /// Final field DBF type of the channel (pvxs
+    /// `dbChannelFinalFieldType`).
+    pub dbr_type: u16,
+}
+
+/// The C `asActive && trapMask` gate (`asLib.h:57-60`), as one function.
+///
+/// `rule_was_trap` is the matched ACF/ASG rule's `TRAPWRITE` flag,
+/// resolved once by the access layer ([`AccessChecked::rule_was_trap`]);
+/// the listener probe is the `asActive` half. A caller that must pay for
+/// something *before* opening the bracket — rendering a value, resolving
+/// the channel's DBF type — asks here rather than re-spelling the
+/// conjunction, so there is exactly one statement of when a put is
+/// audited.
+pub fn trap_write_armed(rule_was_trap: bool) -> bool {
+    rule_was_trap && has_trap_write_listeners()
+}
+
+/// Bracket one backing record PUT with the EPICS `asTrapWrite`
+/// put-logging hook, then run and return the write's result.
+///
+/// The single write-owner shared by every server that writes a local
+/// record on behalf of a remote client: the QSRV bridge, the native PVA
+/// [`ChannelSource`](crate::server::database::PvDatabase) over a
+/// `PvDatabase`, and any future source with the same job. pvxs keeps the
+/// equivalent bracket in ONE place too — `IOCSource::doPreProcessing`
+/// builds a `SecurityLogger` (`ioc/iocsource.cpp:363-374`,
+/// `ioc/securitylogger.h:29-58`) that every IOC source's put runs
+/// through (`ioc/singlesource.cpp:354-360`,
+/// `ioc/groupsource.cpp:594-602`).
+///
+/// When the write is not trapped ([`trap_write_armed`] is false) the
+/// write runs unbracketed and nothing is dispatched. On a trapped write
+/// this emits exactly one `BeforeWrite` (before the put) and exactly one
+/// `AfterWrite` (after the put completes, on every exit path — including
+/// the future being dropped mid-write) carrying the same `event_id`,
+/// value string and `ok`/`fail` status. The value is rendered once
+/// (truncated to 64 elements, like the CA dispatcher) only when actually
+/// emitting.
+pub async fn put_with_trap<T, E, F, Fut>(
+    rule_was_trap: bool,
+    meta: TrapWriteMeta<'_>,
+    value: crate::types::EpicsValue,
+    write: F,
+) -> Result<T, E>
+where
+    F: FnOnce(crate::types::EpicsValue) -> Fut,
+    Fut: std::future::Future<Output = Result<T, E>>,
+{
+    if !trap_write_armed(rule_was_trap) {
+        return write(value).await;
+    }
+
+    let mut guard = TrapWriteGuard::begin(trap_fields(&meta, &value));
+    let result = write(value).await;
+    guard.complete(if result.is_ok() { "ok" } else { "fail" });
+    result
+}
+
+/// [`put_with_trap`]'s synchronous twin, for a write already holding the
+/// record's advisory gate (the QSRV atomic group PUT, `already_locked`
+/// entries). C's `SecurityLogger` bracket is plain synchronous C++ with
+/// no `async` concept at all — this is that shape. There is no
+/// cancellation-mid-write case; the same RAII guard still balances the
+/// trap log on a panic unwinding through `write`.
+pub fn put_with_trap_blocking<T, E, F>(
+    rule_was_trap: bool,
+    meta: TrapWriteMeta<'_>,
+    value: crate::types::EpicsValue,
+    write: F,
+) -> Result<T, E>
+where
+    F: FnOnce(crate::types::EpicsValue) -> Result<T, E>,
+{
+    if !trap_write_armed(rule_was_trap) {
+        return write(value);
+    }
+
+    let mut guard = TrapWriteGuard::begin(trap_fields(&meta, &value));
+    let result = write(value);
+    guard.complete(if result.is_ok() { "ok" } else { "fail" });
+    result
+}
+
+fn trap_fields(meta: &TrapWriteMeta<'_>, value: &crate::types::EpicsValue) -> TrapWriteFields {
+    TrapWriteFields {
+        pv_name: meta.pv_name.to_string(),
+        user: meta.user.to_string(),
+        host: meta.host.to_string(),
+        peer: meta.peer.to_string(),
+        value_str: value.display_truncated(64),
+        dbr_type: meta.dbr_type,
+        no_elements: value.count(),
+        event_id: next_trap_write_event_id(),
+        rule_was_trap: true,
+        cancel_status: "cancel".to_string(),
+    }
+}
+
 /// ASG-field change notifier.
 ///
 /// C `database/src/ioc/as/asDbLib.c:107-110,144` registers

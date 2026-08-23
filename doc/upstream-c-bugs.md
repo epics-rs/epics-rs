@@ -130,6 +130,7 @@ proven defect (see "Leads rejected").
 | CBUG-B25 | ADCore | `NDPluginTimeSeries` narrows the sum *before* dividing — integer averaging corrupted | Medium | NOT-REPRODUCED (fixed upstream #596) |
 | CBUG-B26 | ADCore | `NDPluginStats` broadcasts an uninitialized `NDStats_t` on dark frames | High | NOT-REPRODUCED |
 | CBUG-B27 | ADCore | `NDPluginStats` histogram divides by `(histMax − histMin)` — `(int)NaN` UB | Medium | NOT-REPRODUCED |
+| CBUG-B28 | modbus | `doModbusIO` never checks that the reply echoes the request's function code — the comment asks the question and no code answers it | High | NOT-REPRODUCED |
 
 ---
 
@@ -1155,6 +1156,42 @@ silently edited above.
 
 ### Batch C (appended 2026-07-13, from the Round-13 candidate list — 6 entries: 1 REPRODUCED, 5 NOT-REPRODUCED)
 
+
+### CBUG-B28: `doModbusIO` never verifies that the reply echoes the request's function code — the comment asks the question and no code answers it
+Bucket: NOT-REPRODUCED · Severity: High
+C: `modbus/modbusApp/src/drvModbusAsyn.cpp:2248-2251` (`doModbusIO`), immediately
+after the exception-code branch:
+```c
+    /* Make sure the function code in the response is the same as the one
+     * in the request? */
+
+    switch (function) {
+        case MODBUS_READ_COILS:
+```
+Defect: the check the comment describes is never written. The `switch` dispatches
+on `function` — the **request's** code, a `doModbusIO` parameter — so the reply's
+own function byte (`readResp->fcode`, read at `:2228` only to test the 0x80
+exception bit) is never compared against it. Only that bit is examined;
+a well-formed reply carrying a *different* function code is decoded under the
+request's code as if it belonged to this transaction.
+Port: `crates/modbus-rs/src/driver.rs` (`ModbusEngine::parse_response`) —
+**refuses** the bug: the response function is compared against
+`ModbusFunctionCode::wire_code()` before any payload is decoded, and a mismatch
+returns `ModbusError::FunctionMismatch { requested, got }`. The two driver
+pseudo-codes 123/223 both map to wire FC 0x17, so they compare as 0x17.
+Impact: this is the last line of defence when a reply arrives that does not
+belong to the current transaction — a late reply from a timed-out earlier poll
+on an RTU/ASCII link (no transaction ID exists there), or a reply for another
+master on a shared bus. The payload then decodes under the wrong function and
+the word-count check does not catch it whenever the lengths coincide: a
+`MODBUS_WRITE_MULTIPLE_REGISTERS` acknowledgement for address 0x0400 presents its
+address-high byte 0x04 where a read response carries `byteCount`, so a
+2-register read accepts it and publishes two garbage registers with
+`STAT=NO_ALARM SEVR=NO_ALARM`. Silent wrong data to the operator, not an alarm.
+Proof: `:2248-2249` the comment, `:2251` `switch (function)` on the request
+parameter, `:2228` the only place `modbusReply_`'s function byte is read (the
+exception-bit test) — nowhere is it compared to `function`.
+
 ### CBUG-C1: sCalc `LRC`/`AMODBUS` on an empty operand is an unbounded read — segfaults the IOC
 Bucket: NOT-REPRODUCED · Severity: High
 C: `sCalcPerform.c:247` — the LRC loop bound is `i < strlen(rawInput)-1` with `strlen` returning
@@ -2019,3 +2056,191 @@ user macro named `$P` to eat. Pinned by
 Impact: on a C IOC, `field(CLCB,"$S($A,\"%d\")")` in a `transform` record is a
 dead channel — no value, one errlog line at init, and `CBV` non-zero as the only
 running indication.
+
+---
+
+## Batch I — filed 2026-08-23 (QSRV group PUT / PVA formatter review round)
+
+Found while fixing port findings rather than by a sweep: a reviewer asked
+why the port refuses something pvxs is documented to refuse, and the C++
+turned out not to refuse it at all. Citations re-read in the local trees
+(`/home/stevek/work/epics-modules/pvxs` at `bd2243db` (`1.5.2-26-gbd2243d`),
+`/home/stevek/work/epics-base`).
+
+| id | upstream | one line | severity | bucket |
+|---|---|---|---|---|
+| CBUG-I1 | pvxs (QSRV2) | the group-PUT guard refusing a link-field member is dead code — the channel was retyped to `DBR_CHAR` before `dbChannelOpen`, so `dbChannelFinalFieldType` is never a link type and a PUT into a `FLNK`-bound member is accepted | Low | NOT-REPRODUCED |
+| CBUG-I2 | Base (pvDataCPP) | `hexdigit` compares `c<9` instead of `c<10`, so a nibble of value 9 renders as `@`: a string byte `0x19` prints as `\x1@` in every escaped/CSV `pvget` output | Low | NOT-REPRODUCED |
+
+### CBUG-I1: pvxs's group-PUT link guard cannot fire — the channel it tests was retyped to `DBR_CHAR` before it was opened
+Bucket: NOT-REPRODUCED · Severity: Low
+C++: `pvxs/ioc/groupsource.cpp:603-606`, the per-member PUT pre-pass:
+```cpp
+if (dbChannelFinalFieldType(pDbChannel) >= DBF_INLINK
+        && dbChannelFinalFieldType(pDbChannel) <= DBF_FWDLINK) {
+    throw std::runtime_error("Links not supported for put");
+}
+```
+`dbChannelFinalFieldType` is `chan->final_type`
+(`base/modules/database/src/ioc/db/dbChannel.h:452`), which
+`dbChannelOpen` seeds from the channel's EXPORT type — `probe.field_type =
+dbChannelExportType(chan)` at `dbChannel.c:579`, committed as
+`chan->final_type = probe.field_type` at `:619-621`, where
+`dbChannelExportType` is `addr.dbr_field_type` (`dbChannel.h:424`). But
+pvxs rewrites exactly that field for a link before it opens the channel —
+`pvxs/ioc/channel.cpp:69-73`:
+```cpp
+} else if(field_type >= DBF_INLINK && field_type <= DBF_FWDLINK) {
+    chan->addr.no_elements = PVLINK_STRINGSZ;
+    chan->addr.field_size = 1;
+    chan->addr.dbr_field_type = DBR_CHAR;
+    form = "String";
+}
+```
+and only then calls `dbChannelOpen` at `:76`. So a link member's
+`final_type` is `DBR_CHAR`, the range test at `groupsource.cpp:603-604` is
+false for every link field, and the `throw` is unreachable.
+Defect: the refusal pvxs states in code does not happen. A group member
+bound to a link field is admitted to the PUT path and the link's string
+form is written like any other `DBR_CHAR` member. The reachable case is
+`DBF_FWDLINK`: `getChannelValueType(chan, errOnLinks=true)`
+(`ioc/iocsource.cpp:619-630`, the test at `:629`) already refuses
+`DBF_INLINK..DBF_OUTLINK` at group BUILD time (its two callers,
+`groupconfigprocessor.cpp:891` and `:962`) and deliberately
+excludes `DBF_FWDLINK`, so an `FLNK`-bound member is the one that reaches
+a PUT — and this guard was the only thing that would have stopped it.
+Port: **deviates — does not reproduce.** `crates/epics-bridge-rs/src/
+qsrv/group.rs` refuses the PUT for a member that is both marked and
+putable and whose channel resolves to any link class, with pvxs's own
+message text, and `crates/epics-bridge-rs/src/qsrv/provider.rs`
+`group_creation_error` refuses the group at build time for the non-forward
+link classes, matching `getChannelValueType(errOnLinks=true)`. So the port
+matches pvxs on the build half and refuses where pvxs's dead guard meant
+to refuse.
+Impact: a QSRV2 group PUT whose member binds a record's `FLNK` writes the
+forward-link string, which is a device-configuration field, through a
+data-plane operation the group's author expected to be rejected.
+Proof: the three citations above quoted; `dbChannel.h:424/452` macro
+definitions and `dbChannel.c:579/618-621` read in the local base tree. Upstream
+half-noticed it: `iocsource.cpp:620-622` comments "for links, could check
+dbChannelFieldType(). ... dbChannelCreate() '$' handling overwrites
+dbAddr::field_type", naming both the overwrite and the accessor that
+survives it, but that note never reached the PUT pre-pass.
+
+### CBUG-I2: pvData `hexdigit` maps nibble 9 to `@` — every `\xHH` escape with a 9 in it is wrong
+Bucket: NOT-REPRODUCED · Severity: Low
+C++: `pvDataCPP/src/misc/printer.cpp:467-473`:
+```cpp
+c &= 0xf;
+if(c<9) return '0'+c;
+else    return 'A'+c-10;
+```
+The first arm must be `c<10`. For `c == 9` the second arm runs and yields
+`'A' + 9 - 10 == '@'`.
+Defect: any byte whose high or low nibble is 9 escapes wrongly wherever
+pvData writes `\xHH`, which is both escape styles — the default `escape`
+(`style_t::C`, printer.cpp:485-516) used by `maybeQuote` for ordinary
+string display, and `csvEscape` (printer.cpp:178-192) used for
+`printTable` columns. A `string` field holding the byte `0x19` prints as
+`\x1@`; `0x9A` prints as `@A`-prefixed, i.e. `\x@A`. Values 0-8 and A-F
+are unaffected, so the bug is invisible in the common `\x00`/`\xFF`
+cases and shows only on the sixteen-plus-sixteen nibble-9 bytes.
+Port: **deviates — does not reproduce.** In `crates/epics-pva-rs/src/
+format.rs` the hex comes from `escape_bytes` (the body behind
+`escape_display` and `escape_pvxs`) and from `csv_escape`, all of which
+write a plain two-digit hex; the doc comment on `escape_display` says the
+Base off-by-one is deliberately not reproduced. Emitting `@` for a hex
+nibble would produce output no hex reader can parse back, so the port
+prints correct hex and accepts the character-level difference. Note the
+separate axis: nibble-9 correctness is uniform, but hex CASE is not —
+Base's `hexdigit` is uppercase and pvxs's `Escaper` (util.cpp:230-235) is
+lowercase, which is why the port has two named escape owners rather than
+one.
+Impact: a client that round-trips pvData's escaped form — copying a
+`pvget` string out of a log and back into a `pvput`, or parsing
+`pvget -F table` columns — silently corrupts every nibble-9 byte. The
+practical exposure is binary-ish payloads carried in `string` fields.
+Proof: the three-line quotation above is the lead's verbatim read of the
+upstream file. pvDataCPP is **not** checked out on this machine — `fd
+'^printer\.cpp$'` across `/home/stevek/work/epics-base` and
+`/home/stevek/work/epics-modules` returns nothing, and there is no
+`pvData*` directory under `/home/stevek/work` — so this entry's C
+citation is not independently re-read here; the arithmetic (`'A'+9-10 ==
+'@'`) is what is verified locally. The port half is verified: both
+`format.rs` sites quoted above.
+
+## Batch J — filed 2026-08-22 (asyn connect-path strong-state sweep)
+
+One entry. Found while closing the port's own publish-last defect in
+`drvAsynIPPort`'s Rust counterpart: the same invariant is broken one layer up
+in `drvPrologixGPIB`, where the C is the only member of the pair that does not
+undo its inner connection on a failed exit. Citations re-read in the local asyn
+tree (`R4-45-74-g731d616e`) before filing.
+
+| id | upstream | one line | severity | bucket |
+|---|---|---|---|---|
+| CBUG-J1 | asyn | `prologixConnect` leaves the inner TCP port connected on every failed `++ver` handshake exit, and `connectIt`'s already-open guard then rejects every retry for the life of the IOC | High | NOT-REPRODUCED |
+
+### CBUG-J1: `prologixConnect` leaves the inner TCP port connected when the `++ver` handshake fails — the GPIB bus is dead until an operator disconnects by hand
+Bucket: NOT-REPRODUCED · Severity: High
+C: `asyn/drvPrologixGPIB/drvPrologixGPIB.c:157` `prologixConnect()`. `:172`
+connects the inner TCP port:
+```c
+    status = pasynCommonSyncIO->connectDevice(pdpvt->pasynUserTCPcommon);
+    if (status != asynSuccess)
+        return status;                       /* :174 — nothing to undo yet */
+    ...
+    status = pasynOctetSyncIO->write(...);   /* init burst */
+    if (status != asynSuccess)
+        return status;                       /* :189 — inner port still connected */
+    for (;;) {
+        status = pasynOctetSyncIO->read(pdpvt->pasynUserTCPoctet, cp, n, 0.5, &nt, &eom);
+        if (status != asynSuccess)
+            return status;                   /* :196 — ditto */
+        n -= nt;
+        if (n == 0) {
+            ... "Version string too long");
+            return asynError;                /* :202 — ditto */
+        }
+        ...
+    }
+```
+The only `disconnectDevice` in the file is in `prologixDisconnect` (`:227`), so
+none of the three exits above undoes `:172`. `pasynManager->exceptionConnect`
+(`:213`) is likewise never reached, so the GPIB port stays *down* while the TCP
+port stays *up*.
+Defect: the next auto-connect calls `connectDevice` again and lands on
+`drvAsynIPPort.c:424-427`, which rejects a connect on an already-open link:
+```c
+    if (tty->fd != INVALID_SOCKET) {
+        epicsSnprintf(pasynUser->errorMessage, pasynUser->errorMessageSize,
+                      "%s: Link already open!", tty->IPDeviceName);
+        return asynError;
+    }
+```
+That guard is correct in itself — it is what keeps `connectIt` from leaking the
+first socket — but with the inner port left connected it can never clear, so
+every retry fails identically and every GPIB transfer reports
+`asynDisconnected`. Only an explicit `asynCommon->disconnect` (iocsh `CNCT`)
+recovers the port; auto-connect cannot.
+Trigger: a bridge that does not answer `++ver` with a `\r\n`-terminated line
+within the 0.5 s read timeout (`:194`) — a slow or wedged Prologix
+GPIB-Ethernet bridge, or one already holding a session for another client. The
+timeout is a plain `asynTimeout`, so `drvAsynIPPort`'s
+`disconnectOnReadTimeout` (default off, `calloc`'d to 0) does not close the
+socket either. The established TCP connection also survives, so a
+single-client bridge keeps refusing every other client.
+Port: **deviates — does not reproduce.** `crates/asyn-rs/src/drivers/prologix.rs`
+holds the inner connection in a `HandshakeLink` guard for the length of the
+handshake; it is committed only when the version line has been parsed, so every
+exit — `?`, an explicit `return`, or an unwind — disconnects the inner port and
+leaves the GPIB port retryable. A cleanup branch at each of the four exits was
+rejected as the patch form: the next `return` added to the handshake re-opens
+the defect.
+Impact: an IOC running the C loses the whole GPIB bus behind the bridge on a
+single slow handshake, silently and permanently, with no alarm beyond the
+per-record `asynDisconnected`, until someone issues a manual disconnect.
+Proof: `drvPrologixGPIB.c:172` (connect), `:189`/`:196`/`:202` (exits with no
+`disconnectDevice`), `:227` (the only `disconnectDevice`, in
+`prologixDisconnect`), and `drvAsynIPPort.c:424-427` (the guard that makes it
+permanent), all quoted from the local tree above.

@@ -3,16 +3,22 @@
 //! Builds NTScalar and NTScalarArray `PvField` values directly from
 //! `Snapshot`s, with full alarm/timeStamp/display metadata.
 
+// RTEMS-EXEC-MODEL-ALLOW(6): checked - the six channel-name tests run and pass
+// under --features rtems-exec-model.
+
 use std::sync::Arc;
 
 use tokio::sync::mpsc;
 
 use crate::nt::NTScalar;
 use crate::pvdata::{FieldDesc, PvField, PvStructure, ScalarType, ScalarValue, TypedScalarArray};
-use crate::server_native::source::SourceRead;
+use crate::server_native::source::{PutOptions, SourceRead};
 use crate::server_native::{ChannelSource, OpError};
 
 use crate::server_native::source::{MonitorStream, UpstreamMonitor};
+use epics_base_rs::server::database::filters::{
+    ChannelName, FilterChain, parse_channel_name, try_parse_filter_chain,
+};
 use epics_base_rs::server::database::{PvDatabase, PvEntry, parse_pv_name};
 use epics_base_rs::server::recgbl::{alarm_condition_string, alarm_status};
 use epics_base_rs::server::snapshot::Snapshot;
@@ -79,8 +85,15 @@ impl PvDatabaseSource {
         let resolver: AsgAslResolver = Arc::new(move |pv_name| {
             let db = asg_db.clone();
             Box::pin(async move {
-                let (base, _field) = parse_pv_name(&pv_name);
-                if let Some(rec) = db.get_record(base) {
+                // The ASG must come off the record the CHANNEL addresses,
+                // so the name is resolved the same way every operation on
+                // it resolves it; a `$` or filter-suffixed name used to miss
+                // the record entirely and fall through to DEFAULT/ASL 0.
+                let base = match resolve_channel(&pv_name) {
+                    Some((cn, _filters)) => cn.record,
+                    None => return ("DEFAULT".to_string(), 0u8),
+                };
+                if let Some(rec) = db.get_record(&base) {
                     let inst = rec.read();
                     return (inst.common.access_group().to_string(), inst.common.asl);
                 }
@@ -565,15 +578,109 @@ fn read_leaves(snap: &Snapshot, is_value_field: bool) -> Vec<String> {
 
 // ── ChannelSource impl ────────────────────────────────────────────────────
 
+/// The channel a client-supplied name addresses on this source and the
+/// filter chain it asked for, or `None` when this source will serve none.
+///
+/// The one place a raw channel name becomes a record, a field and a
+/// [`FilterChain`], so every operation on the channel — create, read, put,
+/// process, monitor and the ASG lookup — agrees on what it addressed.
+/// [`parse_channel_name`] is the shared owner of the `{json}` / `[range]` /
+/// `$` / `record.FIELD` order (the QSRV bridge channel and CA
+/// CREATE_CHANNEL resolve through it too).
+///
+/// Every filtered name used to be refused here, because one union
+/// subscription had nowhere to hang a chain. Both subscriptions now exist
+/// as separate subscriber slots, each taking its own chain, so the only
+/// refusal left is C's own: a syntactically-present suffix that will not
+/// parse. `dbChannelCreate` runs `chf_parse` and, on failure, reaches
+/// `finish:` where it does `dbChannelDelete(chan); chan = NULL`
+/// (`dbChannel.c:514-527`), with an unknown filter name stopping the parse
+/// at `:179`; [`try_parse_filter_chain`] is that contract's owner in this
+/// workspace. `{}` is a valid no-filter request and yields an empty chain.
+///
+/// Filters are read-side. C runs the pre/post chains from `dbChannelGet`
+/// and from the event queue, never from `dbChannelPut`, so the PUT and
+/// PROCESS paths resolve the name and drop the chain on the floor.
+fn resolve_channel(name: &str) -> Option<(ChannelName, FilterChain)> {
+    let cn = parse_channel_name(name);
+    let chain = match cn.json_suffix.as_deref() {
+        Some(json) => try_parse_filter_chain(json).ok()?,
+        None => FilterChain::new(),
+    };
+    Some((cn, chain))
+}
+
+/// The database entry a resolved channel addresses.
+///
+/// A mailbox [`PvEntry::Simple`] is the pvxs `SharedPV` server API: it has
+/// no `dbChannel`, no field log and no filter machinery, and pvxs finds it
+/// by exact name in the source's map, so a filtered name matches nothing
+/// there. Refusing it here keeps that answer rather than peeling the
+/// suffix off and serving the mailbox raw under a name the client believes
+/// it filtered.
+async fn channel_entry(db: &PvDatabase, cn: &ChannelName) -> Option<PvEntry> {
+    let entry = db.find_entry(&cn.record_path).await?;
+    if cn.json_suffix.is_some() && matches!(entry, PvEntry::Simple(_)) {
+        return None;
+    }
+    Some(entry)
+}
+
 async fn snapshot_for(db: &PvDatabase, name: &str) -> Option<Snapshot> {
-    let (_base, field) = parse_pv_name(name);
-    match db.find_entry(name).await? {
-        PvEntry::Simple(pv) => Some(pv.snapshot()),
+    let (cn, filters) = resolve_channel(name)?;
+    channel_snapshot(db, &cn, &filters).await
+}
+
+/// One read of an already-resolved channel, with its chain applied in read
+/// context.
+///
+/// pvxs wraps every QSRV GET in a `LocalFieldLog` and runs the pre/post
+/// chain before serialization (`singlesource.cpp:286-291`,
+/// `localfieldlog.cpp:15-24`), so a GET on a filtered channel returns the
+/// same transformed value the monitor does. A chain that DROPS the read
+/// leaves `pFieldLog` NULL, and `IOCSource::get` then reads the live field
+/// through `dbChannelGet(…, nullptr)` (`iocsource.cpp:79-80`, `:127-128`) —
+/// so `dbnd` refusing a sub-deadband read suppresses a monitor update but
+/// never a GET. That fallback is the reason this cannot simply propagate
+/// the `None`.
+async fn channel_snapshot(
+    db: &PvDatabase,
+    cn: &ChannelName,
+    filters: &FilterChain,
+) -> Option<Snapshot> {
+    let mut snap = match channel_entry(db, cn).await? {
+        // A mailbox SharedPV has no field to address; `$` re-views a
+        // string as a character array, so it is the same value and only
+        // the eligibility gate applies (C `dbChannel.c:486-505`).
+        PvEntry::Simple(pv) => {
+            let snap = pv.snapshot();
+            if cn.string_view && !matches!(snap.value, EpicsValue::String(_)) {
+                return None;
+            }
+            snap
+        }
         PvEntry::Record(rec) => {
             let inst = rec.read();
-            inst.snapshot_for_field(field)
+            // `$` is `S_dbLib_fieldNotFound` on anything but a
+            // `DBF_STRING` field (`dbChannel.c:486-505`), which aborts
+            // channel creation; `resolve_string_view_field` is the base's
+            // owner of that eligibility rule, the same one the QSRV bridge
+            // channel consults. An eligible field is served as its
+            // ordinary string snapshot: pvxs collapses the `DBR_CHAR` `$`
+            // view back to a NUL-terminated `pvString`
+            // (`ioc/iocsource.cpp:133-136`), so the view IS the string.
+            if cn.string_view {
+                inst.resolve_string_view_field(&cn.field)?;
+            }
+            inst.snapshot_for_field(&cn.field)?
         }
+    };
+    if !filters.is_empty()
+        && let Some(value) = filters.apply_to_read_value(snap.value.clone())
+    {
+        snap.value = value;
     }
+    Some(snap)
 }
 
 impl ChannelSource for PvDatabaseSource {
@@ -688,14 +795,14 @@ impl ChannelSource for PvDatabaseSource {
         let db = self.db.clone();
         async move {
             let name = checked.pv_name().to_string();
-            let snap = snapshot_for(&db, &name).await?;
+            let (cn, filters) = resolve_channel(&name)?;
+            let snap = channel_snapshot(&db, &cn, &filters).await?;
             let value = snapshot_to_pv_field(&snap);
-            let (_base, field) = parse_pv_name(&name);
             Some(SourceRead::marked(
                 value,
                 read_leaves(
                     &snap,
-                    epics_base_rs::server::database::is_value_field(field),
+                    epics_base_rs::server::database::is_value_field(&cn.field),
                 ),
             ))
         }
@@ -723,7 +830,10 @@ impl ChannelSource for PvDatabaseSource {
             // them from local defaults. A record-backed channel keeps the
             // field-write path: the record owns its alarm/time through
             // processing, and the client cannot stamp them.
-            match db.find_entry(&name).await {
+            let Some((cn, _filters)) = resolve_channel(&name) else {
+                return Err(OpError::failed(format!("PUT: no such PV '{name}'")));
+            };
+            match channel_entry(&db, &cn).await {
                 Some(PvEntry::Simple(pv)) => {
                     let prior = pv.snapshot();
                     let snap = pv_field_to_snapshot(&value, &prior).ok_or_else(|| {
@@ -749,22 +859,100 @@ impl ChannelSource for PvDatabaseSource {
                 // parking a wait-set whose receiver is dropped would occupy
                 // `RecordInstance::notify` until the record's async work ends.
                 Some(PvEntry::Record(_)) => {
-                    let scalar = extract_put_value_leaf(&value)
-                        .ok_or_else(|| OpError::failed("PUT missing 'value' field"))?;
-                    let epics = pv_field_to_epics(&scalar).ok_or_else(|| {
-                        OpError::failed("PUT value not representable as EpicsValue")
-                    })?;
-                    // PUT targets a field; split the name the way `process`
-                    // below does so an alias resolves in the database.
-                    let (base, field) = parse_pv_name(&name);
-                    db.put_record_field_from_ca_no_notify(base, field, epics)
-                        .await
-                        .map_err(|e| OpError::failed(e.to_string()))
+                    put_record_field(
+                        &db,
+                        &cn,
+                        put_payload_to_epics(&value)?,
+                        &PutOptions::default(),
+                    )
+                    .await
                 }
                 // Name not in the database: report it rather than falling
                 // through to a write that would silently find nothing.
                 None => Err(OpError::failed(format!("PUT: no such PV '{name}'"))),
             }
+        }
+    }
+
+    /// Serve a PUT the way pvxs's `SingleSource::onPut` does: honour the
+    /// INIT pvRequest's `record._options.process` / `.block`, and bracket
+    /// the backing record write with the EPICS `asTrapWrite` put-logging
+    /// hook — the audit surface caPutLog and every site put-logger
+    /// attach to.
+    ///
+    /// pvxs opens a `SecurityLogger` for EVERY QSRV put, in
+    /// `IOCSource::doPreProcessing` (`ioc/iocsource.cpp:363-374`,
+    /// `ioc/securitylogger.h:29-58`), which `SingleSource::onPut`
+    /// (`ioc/singlesource.cpp:354-360`) and the group source
+    /// (`ioc/groupsource.cpp:594-602`) both run through. This source is
+    /// the PVA-only IOC's production put path and had no bracket at all,
+    /// so a `pvput` against it was silently unaudited while the same
+    /// write over CA — or over PVA through the QSRV bridge — logged.
+    ///
+    /// The bracket itself is not written here: it is the workspace's one
+    /// put-log owner, [`epics_base_rs::server::access_security::put_with_trap`],
+    /// which the QSRV bridge also calls. Only a record-backed channel is
+    /// audited — a mailbox `SharedPV` has no `dbChannel` and no ASG, and
+    /// pvxs opens no `SecurityLogger` for one either.
+    ///
+    /// The two `doPreProcessing` gates above the logger — `SPC_ATTRIBUTE`
+    /// (`S_db_noMod`) and `DISP` (`S_db_putDisabled`) — are already owned
+    /// by `put_record_field_from_ca_no_notify`'s body (`epics-base-rs`
+    /// `field_io.rs`, `check_no_mod` / `check_put_disabled`), so they hold
+    /// for this path without being restated.
+    fn put_value_checked(
+        &self,
+        checked: epics_base_rs::server::access_security::AccessChecked,
+        value: PvField,
+        ctx: crate::server_native::ChannelContext,
+    ) -> impl std::future::Future<Output = Result<(), OpError>> + Send {
+        use epics_base_rs::server::access_security as acs;
+        let db = self.db.clone();
+        async move {
+            if !checked.allows_write() {
+                return Err(crate::server_native::source::put_denied(&checked, &ctx));
+            }
+            let name = checked.pv_name().to_string();
+            let Some((cn, _filters)) = resolve_channel(&name) else {
+                return Err(OpError::failed(format!("PUT: no such PV '{name}'")));
+            };
+            let Some(PvEntry::Record(rec)) = channel_entry(&db, &cn).await else {
+                return self.put_value(&name, value).await;
+            };
+            let epics = put_payload_to_epics(&value)?;
+            // pvxs reads `record._options.process` / `.block` off the INIT
+            // pvRequest inside `onPut` (`singlesource.cpp:346-352`) and
+            // routes the write on them; this source used to write
+            // unconditionally through the Passive no-notify entry, so
+            // `process=false` still processed, `process=true` never forced,
+            // and `block=true` replied before processing finished.
+            let opts = put_options_from_ctx(&ctx);
+            // pvxs logs `dbChannelFinalFieldType(pChan)`, i.e. the DBF of
+            // the addressed field, not the type the client sent. This
+            // source keeps no per-channel state, so the field is resolved
+            // here — and only when an event would actually be dispatched,
+            // since resolving it clones the field's current value.
+            let dbr_type = if acs::trap_write_armed(checked.rule_was_trap()) {
+                let dbf = rec
+                    .read()
+                    .client_field_value(&cn.field)
+                    .map(|v| v.db_field_type());
+                dbf.map(|t| t as u16).unwrap_or_default()
+            } else {
+                0
+            };
+            let peer = ctx.peer.to_string();
+            let meta = acs::TrapWriteMeta {
+                pv_name: &name,
+                user: &ctx.creds.account,
+                host: &ctx.creds.host,
+                peer: &peer,
+                dbr_type,
+            };
+            acs::put_with_trap(checked.rule_was_trap(), meta, epics, |v| {
+                put_record_field(&db, &cn, v, &opts)
+            })
+            .await
         }
     }
 
@@ -785,15 +973,15 @@ impl ChannelSource for PvDatabaseSource {
             // guards. The previous no-op default returned success while
             // the record never processed (alarms, monitors, OUT links and
             // the FLNK chain all skipped).
-            match db.find_entry(&name).await {
+            let Some((cn, _filters)) = resolve_channel(&name) else {
+                return Err(OpError::failed(format!("no record serves '{name}'")));
+            };
+            match channel_entry(&db, &cn).await {
                 Some(PvEntry::Record(_)) => {
-                    // PROCESS targets the whole record, not a field —
-                    // drop any `.FIELD` suffix so the record/alias name
-                    // resolves in `process_record_with_links`.
-                    let (base, _field) = parse_pv_name(&name);
-                    let base = base.to_string();
+                    // PROCESS targets the whole record, not a field, so it
+                    // runs on the resolved record name.
                     let mut visited = std::collections::HashSet::new();
-                    db.process_record_with_links(&base, &mut visited, 0)
+                    db.process_record_with_links(&cn.record, &mut visited, 0)
                         .await
                         .map_err(|e| OpError::failed(e.to_string()))
                 }
@@ -820,6 +1008,52 @@ impl ChannelSource for PvDatabaseSource {
         let db = self.db.clone();
         let name = name.to_string();
         async move { db.has_name(&name).await }
+    }
+
+    /// pvxs's `SingleSource::onSubscribe` reads `record._options.DBE`
+    /// through the THROWING `Value::as<T>()` (`singlesource.cpp:117-140`),
+    /// so this source owns both outcomes of that read: an array-typed
+    /// `DBE` that no `copyOut` scalar arm converts fails the operation,
+    /// and a present `DBE` selecting nothing in the value class draws the
+    /// `selects empty mask` warning (`:128-130`) before the `VALUE|ALARM`
+    /// fallback serves it. The wire layer runs this at INIT and drains
+    /// `ctx.log` on the Ok path, so the client sees the warning ahead of
+    /// the INIT reply, which is pvxs's order.
+    ///
+    /// DEVIATION from C++, deliberate — CBUG-C2: pvxs lets the throw
+    /// unwind into `conn.cpp:277-282`'s `bev.reset()`, dropping every
+    /// other channel on the circuit. Here it is an [`OpError`], so only
+    /// this MONITOR fails.
+    ///
+    /// Scoped to record-backed names, because that is the only pvxs
+    /// source that reads `DBE`: a mailbox [`PvEntry::Simple`] is the
+    /// `SharedPV` server API, whose `onSubscribe` reads no
+    /// `record._options` at all.
+    fn check_monitor_request(
+        &self,
+        checked: &epics_base_rs::server::access_security::AccessChecked,
+        ctx: &crate::server_native::ChannelContext,
+    ) -> impl std::future::Future<Output = Result<(), crate::server_native::source::OpError>> + Send
+    {
+        let db = self.db.clone();
+        let name = checked.pv_name().to_string();
+        let pv_request = ctx.pv_request.clone();
+        // The op's `RemoteLogger` sink — drained by the wire layer after
+        // this hook returns Ok, before the INIT reply.
+        let log = ctx.log.clone();
+        async move {
+            let Some(PvField::Structure(req)) = pv_request else {
+                return Ok(());
+            };
+            let Some((cn, _filters)) = resolve_channel(&name) else {
+                return Ok(());
+            };
+            if !matches!(channel_entry(&db, &cn).await, Some(PvEntry::Record(_))) {
+                return Ok(());
+            }
+            crate::server_native::source::dbe_mask_from_pv_request(&req, &log)?;
+            Ok(())
+        }
     }
 
     /// A record-backed monitor UPDATE marks only the leaves its own `DBE_*`
@@ -849,9 +1083,19 @@ impl ChannelSource for PvDatabaseSource {
                 return None;
             }
             let name = checked.pv_name().to_string();
+            let (cn, value_filters) = resolve_channel(&name)?;
+            // The property subscription re-parses the SAME suffix into its
+            // own chain. pvxs builds `pPropertiesChannel` from
+            // `dbChannelName(sInfo->chan)` — the filtered name itself
+            // (`singlesrcsubscriptionctx.cpp:24`) — and `dbChannelCreate`
+            // parses the suffix per channel, so the two dbChannels own
+            // independent filter instances. Sharing one chain would let a
+            // `DBE_PROPERTY` event move the `dbnd` baseline or the `dec`
+            // counter the client set for its value stream.
+            let (_, property_filters) = resolve_channel(&name)?;
             // A mailbox SharedPV posts a wholly-assigned value and has no
             // record events to classify — keep the unmarked default.
-            if !matches!(db.find_entry(&name).await?, PvEntry::Record(_)) {
+            if !matches!(channel_entry(&db, &cn).await?, PvEntry::Record(_)) {
                 return self
                     .subscribe_checked_opts(checked, ctx, opts)
                     .await
@@ -859,21 +1103,36 @@ impl ChannelSource for PvDatabaseSource {
             }
 
             use epics_base_rs::server::database::db_access::DbSubscription;
-            // The union of pvxs's two subscriptions (value + property), so the
-            // same events arrive; each is narrowed by its own posted mask
-            // below. The prior VALUE|LOG subscription could not deliver a
-            // DBE_PROPERTY event at all.
-            let sub = DbSubscription::subscribe_with_mask(
+            // pvxs's TWO subscriptions, not their union
+            // (`singlesource.cpp:155-167`). The value half carries the
+            // client's resolved `record._options.DBE` (`opts.dbe`, already
+            // reduced to the value classes); the property half is
+            // unconditional — pvxs opens it with `DBE_PROPERTY` whatever
+            // `DBE` said. Each half is a separate subscriber slot with its
+            // own event queue, which is the point: a union subscription let
+            // a queued value post swallow the metadata post that followed
+            // it.
+            let value_sub = DbSubscription::subscribe_with_mask_and_filters(
                 &db,
-                &name,
+                &cn.record_path,
                 0,
-                crate::nt::monitor_mask().bits(),
+                opts.dbe,
+                Some(&value_filters),
             )
             .await?;
-            // The subscription IS the stream: `marked_update` runs as the
-            // server pulls, so no task stands between the two.
-            Some(MonitorStream::Upstream(UpstreamMonitor::from_db(
-                sub,
+            let property_sub = DbSubscription::subscribe_with_mask_and_filters(
+                &db,
+                &cn.record_path,
+                0,
+                epics_base_rs::server::recgbl::EventMask::PROPERTY.bits(),
+                Some(&property_filters),
+            )
+            .await?;
+            // The subscriptions ARE the stream: `marked_update` runs as the
+            // server pulls, so no task stands between them.
+            Some(MonitorStream::Upstream(UpstreamMonitor::from_db_pair(
+                value_sub,
+                property_sub,
                 marked_update,
             )))
         }
@@ -886,7 +1145,8 @@ impl ChannelSource for PvDatabaseSource {
         let db = self.db.clone();
         let name = name.to_string();
         async move {
-            let entry = db.find_entry(&name).await?;
+            let (cn, filters) = resolve_channel(&name)?;
+            let entry = channel_entry(&db, &cn).await?;
             match entry {
                 PvEntry::Simple(pv) => {
                     // Register the live subscriber BEFORE reading the
@@ -921,9 +1181,22 @@ impl ChannelSource for PvDatabaseSource {
                     }
                 }
                 PvEntry::Record(_rec) => {
-                    // Subscribe via the public DbSubscription API.
+                    // Subscribe via the public DbSubscription API. The mask
+                    // is the one `DbSubscription::subscribe_filtered` picks
+                    // for the unclassified entry (`db_access.rs:297`); it is
+                    // spelled out here because the filtered constructor is
+                    // the only one that takes a chain, and a filtered name
+                    // must not reach a raw stream.
                     use epics_base_rs::server::database::db_access::DbSubscription;
-                    let sub = DbSubscription::subscribe(&db, &name).await?;
+                    use epics_base_rs::server::recgbl::EventMask;
+                    let sub = DbSubscription::subscribe_with_mask_and_filters(
+                        &db,
+                        &cn.record_path,
+                        0,
+                        (EventMask::VALUE | EventMask::LOG).bits(),
+                        Some(&filters),
+                    )
+                    .await?;
                     Some(MonitorStream::Upstream(UpstreamMonitor::from_db(
                         sub,
                         event_field,
@@ -963,6 +1236,51 @@ fn event_field(ev: epics_base_rs::server::pv::MonitorEvent) -> Option<PvField> {
 }
 
 // ── PvField → EpicsValue (PUT path) ────────────────────────────────────
+
+/// The record-arm backing write of a PVA PUT, shared by the ctx-less
+/// [`ChannelSource::put_value`] and the audited `put_value_checked`.
+///
+/// A record-backed channel is an EXTERNAL client put, so it owes C
+/// `dbPutField` (`dbAccess.c:1252-1332`), not `dbPut`: the DISP/no-mod
+/// gates, the field write, the device write, the process the client's
+/// `record._options.process` asked for and the monitor post.
+/// [`PvDatabase::put_field_from_client`] is the one owner of that routing
+/// — the QSRV bridge channel reaches the same entry — so the two PVA
+/// servers cannot disagree about what `process=false` or `block=true`
+/// means.
+async fn put_record_field(
+    db: &PvDatabase,
+    cn: &ChannelName,
+    epics: EpicsValue,
+    opts: &PutOptions,
+) -> Result<(), OpError> {
+    db.put_field_from_client(&cn.record, &cn.field, epics, opts.process, opts.block)
+        .await
+        .map_err(|e| OpError::failed(e.to_string()))
+}
+
+/// Read the PUT INIT pvRequest's `record._options.process` / `.block`.
+///
+/// pvxs reads both inside `onPut` from the INIT pvRequest, never from the
+/// data-phase value (`ioc/singlesource.cpp:346-352`); the wire layer hands
+/// that request down as [`ChannelContext::pv_request`]. An unsupported
+/// `process` value is reported to the client through the operation's
+/// `RemoteLog` by the shared parser, exactly as `setForceProcessingFlag`
+/// does (`ioc/iocsource.cpp:446-447`).
+fn put_options_from_ctx(ctx: &crate::server_native::ChannelContext) -> PutOptions {
+    match ctx.pv_request.as_ref() {
+        Some(PvField::Structure(s)) => PutOptions::from_pv_request(s, &ctx.log),
+        _ => PutOptions::default(),
+    }
+}
+
+/// Decode a record PUT payload down to the [`EpicsValue`] the field takes.
+fn put_payload_to_epics(value: &PvField) -> Result<EpicsValue, OpError> {
+    let scalar = extract_put_value_leaf(value)
+        .ok_or_else(|| OpError::failed("PUT missing 'value' field"))?;
+    pv_field_to_epics(&scalar)
+        .ok_or_else(|| OpError::failed("PUT value not representable as EpicsValue"))
+}
 
 /// Extract the value leaf of a PUT `PvField`: the `value` member of an
 /// NT structure, or the field itself for a bare scalar/array. An NTEnum
@@ -3475,6 +3793,848 @@ ASG(DEFAULT) {
         assert!(
             source.process_checked(checked, ctx).await.is_err(),
             "PROCESS on a simple PV must be unsupported, not silent success"
+        );
+    }
+    /// asTrapWrite parity: a PVA PUT served by the NATIVE source must
+    /// fire the EPICS put-logging hook when the matched ACF rule carries
+    /// `TRAPWRITE`, exactly as the QSRV bridge and the CA server already
+    /// do (pvxs `IOCSource::doPreProcessing` builds a `SecurityLogger`
+    /// for every put, `ioc/iocsource.cpp:363-374`). Before the fix this
+    /// source had no bracket anywhere, so a `pvput` against the PVA-only
+    /// IOC was silently unaudited.
+    #[epics_macros_rs::epics_test]
+    async fn native_put_emits_trap_write_when_rule_is_trapped() {
+        use epics_base_rs::server::access_security::{TrapWriteOp, register_trap_write_listener};
+        use epics_base_rs::server::records::ai::AiRecord;
+        use std::sync::Mutex;
+
+        let acf = parse_acf(
+            r#"
+ASG(AUDIT) {
+    RULE(1, READ)
+    RULE(1, WRITE, TRAPWRITE)
+}
+"#,
+        )
+        .unwrap();
+
+        let db = Arc::new(PvDatabase::new());
+        db.add_record("AI:AUDIT", Box::new(AiRecord::new(0.0)))
+            .await
+            .unwrap();
+        db.get_record("AI:AUDIT").unwrap().write().common.asg = "AUDIT".to_string();
+
+        let source = PvDatabaseSource::new_with_acf(
+            db.clone(),
+            epics_base_rs::server::access_security::new_acf_cell(Some(acf)),
+        );
+
+        // Filter by PV so the assertion holds even under a single-process
+        // `cargo test` where another test's put shares the registry.
+        type Seen = Arc<Mutex<Vec<(TrapWriteOp, Option<String>, String, String, u32)>>>;
+        let seen: Seen = Arc::new(Mutex::new(Vec::new()));
+        let sink = seen.clone();
+        let _handle = register_trap_write_listener(Arc::new(move |msg| {
+            if msg.pv_name == "AI:AUDIT" {
+                sink.lock().unwrap().push((
+                    msg.op,
+                    msg.status.map(str::to_string),
+                    msg.user.to_string(),
+                    msg.value_str.to_string(),
+                    msg.no_elements,
+                ));
+            }
+        }));
+
+        source
+            .put_value_ctx("AI:AUDIT", pv_double(7.5), make_ctx("lab-pc1", "op", "ca"))
+            .await
+            .expect("PUT must succeed");
+
+        let got = seen.lock().unwrap().clone();
+        assert_eq!(
+            got.len(),
+            2,
+            "a TRAPWRITE-matched PUT owes exactly one Before/After pair: {got:?}"
+        );
+        assert_eq!(got[0].0, TrapWriteOp::BeforeWrite);
+        assert_eq!(got[0].1, None, "BeforeWrite carries no status");
+        assert_eq!(got[1].0, TrapWriteOp::AfterWrite);
+        assert_eq!(got[1].1, Some("ok".to_string()), "successful put -> ok");
+        assert_eq!(got[0].2, "op", "the authenticated account is logged");
+        assert_eq!(got[0].4, 1, "scalar put -> no_elements = 1");
+        assert!(
+            got[0].3.contains("7.5"),
+            "the written value must reach the log: {:?}",
+            got[0].3
+        );
+    }
+
+    /// The gate half: a rule with no `TRAPWRITE` option dispatches
+    /// nothing, and the write still lands (C `asActive && trapMask`,
+    /// `asLib.h:57-60`).
+    #[epics_macros_rs::epics_test]
+    async fn native_put_emits_nothing_when_rule_is_not_trapped() {
+        use epics_base_rs::server::access_security::register_trap_write_listener;
+        use epics_base_rs::server::records::ai::AiRecord;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let acf = parse_acf(
+            r#"
+ASG(PLAIN) {
+    RULE(1, READ)
+    RULE(1, WRITE)
+}
+"#,
+        )
+        .unwrap();
+
+        let db = Arc::new(PvDatabase::new());
+        db.add_record("AI:PLAIN", Box::new(AiRecord::new(0.0)))
+            .await
+            .unwrap();
+        db.get_record("AI:PLAIN").unwrap().write().common.asg = "PLAIN".to_string();
+
+        let source = PvDatabaseSource::new_with_acf(
+            db.clone(),
+            epics_base_rs::server::access_security::new_acf_cell(Some(acf)),
+        );
+
+        let hits = Arc::new(AtomicUsize::new(0));
+        let sink = hits.clone();
+        let _handle = register_trap_write_listener(Arc::new(move |msg| {
+            if msg.pv_name == "AI:PLAIN" {
+                sink.fetch_add(1, Ordering::Relaxed);
+            }
+        }));
+
+        source
+            .put_value_ctx("AI:PLAIN", pv_double(3.25), make_ctx("lab-pc1", "op", "ca"))
+            .await
+            .expect("PUT must succeed");
+
+        assert_eq!(
+            hits.load(Ordering::Relaxed),
+            0,
+            "a rule without TRAPWRITE must dispatch no put-log event"
+        );
+        let v = db
+            .get_record("AI:PLAIN")
+            .unwrap()
+            .read()
+            .resolve_field("VAL")
+            .and_then(|v| v.to_f64())
+            .unwrap();
+        assert_eq!(v, 3.25, "the write itself must still land");
+    }
+
+    /// Build a PUT INIT pvRequest carrying `record._options.<pairs>` — the
+    /// shape `pvput -r 'record[process=false]'` puts on the wire.
+    fn options_request(pairs: &[(&str, PvField)]) -> PvField {
+        let mut options = PvStructure::new("");
+        for (k, v) in pairs {
+            options.fields.push(((*k).to_string(), v.clone()));
+        }
+        let mut record = PvStructure::new("");
+        record
+            .fields
+            .push(("_options".to_string(), PvField::Structure(options)));
+        let mut root = PvStructure::new("");
+        root.fields
+            .push(("record".to_string(), PvField::Structure(record)));
+        PvField::Structure(root)
+    }
+
+    fn ctx_with_options(pairs: &[(&str, PvField)]) -> ChannelContext {
+        let mut ctx = make_ctx("lab-pc1", "op", "ca");
+        ctx.pv_request = Some(options_request(pairs));
+        ctx
+    }
+
+    /// A record that has never processed still carries the EPICS epoch in
+    /// `TIME`; a processing cycle stamps it from the wall clock. That is the
+    /// discriminator every `record._options.process` case below reads.
+    fn has_processed(db: &PvDatabase, record: &str) -> bool {
+        let rec = db.get_record(record).expect("record");
+        let t = rec.read().common.time;
+        t.duration_since(std::time::UNIX_EPOCH)
+            .expect("post-1970")
+            .as_secs()
+            > 700_000_000
+    }
+
+    async fn ai_db(name: &str) -> Arc<PvDatabase> {
+        use epics_base_rs::server::records::ai::AiRecord;
+        let db = Arc::new(PvDatabase::new());
+        db.add_record(name, Box::new(AiRecord::new(0.0)))
+            .await
+            .unwrap();
+        db
+    }
+
+    fn val_of(db: &PvDatabase, record: &str) -> f64 {
+        db.get_record(record)
+            .unwrap()
+            .read()
+            .resolve_field("VAL")
+            .and_then(|v| v.to_f64())
+            .unwrap()
+    }
+
+    /// `record[process=false]` — pvxs `setForceProcessingFlag` maps it to
+    /// `TriState::False`, and `doPostProcessing` then processes nothing
+    /// (`ioc/singlesource.cpp:348-352`, `ioc/iocsource.cpp:397-403`). The
+    /// native source ignored the option entirely and always took the
+    /// Passive `dbPutField` route, so a passive record processed anyway —
+    /// FLNK fired, monitors posted, TIME advanced.
+    #[epics_macros_rs::epics_test]
+    async fn put_option_process_false_writes_without_processing() {
+        let db = ai_db("AI:NOPROC").await;
+        let source = PvDatabaseSource::new(db.clone());
+        source
+            .put_value_ctx(
+                "AI:NOPROC",
+                pv_double(5.0),
+                ctx_with_options(&[("process", PvField::Scalar(ScalarValue::Boolean(false)))]),
+            )
+            .await
+            .expect("PUT must succeed");
+
+        assert_eq!(val_of(&db, "AI:NOPROC"), 5.0, "the field is still written");
+        assert!(
+            !has_processed(&db, "AI:NOPROC"),
+            "process=false must write the field only — the record must not process"
+        );
+    }
+
+    /// The other side of the same boundary: with no `process` option the
+    /// same passive record DOES process, so the assertion above is about
+    /// the option and not about the record being inert.
+    #[epics_macros_rs::epics_test]
+    async fn put_without_process_option_still_processes_a_passive_record() {
+        let db = ai_db("AI:DEFPROC").await;
+        let source = PvDatabaseSource::new(db.clone());
+        source
+            .put_value_ctx(
+                "AI:DEFPROC",
+                pv_double(5.0),
+                make_ctx("lab-pc1", "op", "ca"),
+            )
+            .await
+            .expect("PUT must succeed");
+        assert!(
+            has_processed(&db, "AI:DEFPROC"),
+            "a pp(TRUE) field on a Passive record processes by default"
+        );
+    }
+
+    /// `record[process=true]` forces a cycle on a record the Passive rule
+    /// would leave alone — pvxs `doPostProcessing(forceProcessing == True)`
+    /// (`ioc/iocsource.cpp:397-419`). A periodically-scanned record is the
+    /// boundary: `dbPutField`'s own test requires `scan == 0`.
+    #[epics_macros_rs::epics_test]
+    async fn put_option_process_true_forces_a_scanned_record() {
+        use epics_base_rs::server::record::ScanType;
+
+        let db = ai_db("AI:FORCE").await;
+        db.get_record("AI:FORCE").unwrap().write().common.scan = ScanType::Sec1;
+        let source = PvDatabaseSource::new(db.clone());
+        source
+            .put_value_ctx(
+                "AI:FORCE",
+                pv_double(5.0),
+                ctx_with_options(&[("process", PvField::Scalar(ScalarValue::Boolean(true)))]),
+            )
+            .await
+            .expect("PUT must succeed");
+        assert!(
+            has_processed(&db, "AI:FORCE"),
+            "process=true must force the cycle a SCAN=1 second record would not take"
+        );
+    }
+
+    /// `record[process=true,block=true]` routes through the put-notify
+    /// barrier (`dbProcessNotify`, `ioc/singlesource.cpp:360-369`) instead
+    /// of the fire-and-forget post-processing call. A fully synchronous
+    /// record settles inside the call either way; what this pins is that
+    /// the blocking route is reached and completes rather than being
+    /// dropped on the floor as it was before.
+    #[epics_macros_rs::epics_test]
+    async fn put_option_block_true_takes_the_notify_route() {
+        use epics_base_rs::server::record::ScanType;
+
+        let db = ai_db("AI:BLOCK").await;
+        db.get_record("AI:BLOCK").unwrap().write().common.scan = ScanType::Sec1;
+        let source = PvDatabaseSource::new(db.clone());
+        source
+            .put_value_ctx(
+                "AI:BLOCK",
+                pv_double(5.0),
+                ctx_with_options(&[
+                    ("process", PvField::Scalar(ScalarValue::Boolean(true))),
+                    ("block", PvField::Scalar(ScalarValue::Boolean(true))),
+                ]),
+            )
+            .await
+            .expect("PUT must succeed");
+        assert_eq!(val_of(&db, "AI:BLOCK"), 5.0);
+        assert!(
+            has_processed(&db, "AI:BLOCK"),
+            "a blocking forced put must have processed by the time it returns"
+        );
+    }
+
+    /// pvxs reports an unusable `record._options.process` to the client
+    /// (`ioc/iocsource.cpp:446-447` `logRemote(Warn, "Ignoring unsupported
+    /// ...")`) and keeps the passive default. The native source emitted no
+    /// diagnostic at all because it never read the option.
+    #[epics_macros_rs::epics_test]
+    async fn put_option_unsupported_process_value_warns_the_client() {
+        let db = ai_db("AI:BADOPT").await;
+        let source = PvDatabaseSource::new(db.clone());
+        let ctx = ctx_with_options(&[(
+            "process",
+            PvField::Scalar(ScalarValue::String("maybe".into())),
+        )]);
+        let log = ctx.log.clone();
+        source
+            .put_value_ctx("AI:BADOPT", pv_double(5.0), ctx)
+            .await
+            .expect("an unusable option keeps the passive default, it does not fail the PUT");
+
+        let msgs = log.take();
+        assert_eq!(msgs.len(), 1, "exactly one diagnostic: {msgs:?}");
+        assert!(
+            msgs[0].message.contains("Ignoring unsupported"),
+            "pvxs's wording must reach the client: {:?}",
+            msgs[0].message
+        );
+        assert!(
+            has_processed(&db, "AI:BADOPT"),
+            "the unusable value keeps the Passive default, so the record still processes"
+        );
+    }
+
+    /// Subscribe `name` with the DBE the pvRequest options ask for, through
+    /// the same `resolve_dbe` the wire layer runs at MONITOR INIT.
+    async fn dbe_monitor(
+        source: &PvDatabaseSource,
+        name: &str,
+        options: &[(&str, PvField)],
+    ) -> MonitorStream<crate::server_native::source::MonitorUpdate> {
+        use crate::server_native::source::MonitorOptions;
+        let ctx = ctx_with_options(options);
+        let checked = source
+            .access()
+            .check(
+                name,
+                &ctx.creds.host,
+                &ctx.creds.account,
+                &ctx.creds.method,
+                "",
+            )
+            .await;
+        let opts = MonitorOptions {
+            dbe: MonitorOptions::resolve_dbe(ctx.pv_request.as_ref()),
+            ..Default::default()
+        };
+        source
+            .subscribe_checked_opts_marked(checked, ctx, opts)
+            .await
+            .expect("record subscribe")
+    }
+
+    /// pvxs opens the value subscription with the client's
+    /// `record._options.DBE` (`singlesource.cpp:117-159`), so a
+    /// `DBE="ALARM"` monitor is woken by alarm transitions and by nothing
+    /// else. The native source subscribed with a FIXED
+    /// `VALUE|LOG|ALARM|PROPERTY` mask, so it served every value change to
+    /// a client that asked for alarms only.
+    ///
+    /// Both monitors are fed by the same `db_post_events` dispatch, so the
+    /// default one arriving proves the post happened — no timing margin is
+    /// involved in the alarm-only one staying empty.
+    #[epics_macros_rs::epics_test]
+    async fn a_dbe_alarm_monitor_is_not_woken_by_a_value_only_post() {
+        use tokio::sync::mpsc::error::TryRecvError;
+
+        let db = ai_db("AI:DBEALARM").await;
+        let source = PvDatabaseSource::new(db.clone());
+        let mut alarm_only = dbe_monitor(
+            &source,
+            "AI:DBEALARM",
+            &[("DBE", PvField::Scalar(ScalarValue::String("ALARM".into())))],
+        )
+        .await;
+        let mut every_class = dbe_monitor(&source, "AI:DBEALARM", &[]).await;
+
+        // First cycle: UDF -> NO_ALARM changes the alarm, so the record's
+        // post carries DBE_ALARM and both monitors are woken.
+        db.put_record_field_from_ca_no_notify("AI:DBEALARM", "VAL", EpicsValue::Double(1.0))
+            .await
+            .expect("put");
+        for rx in [&mut every_class, &mut alarm_only] {
+            epics_base_rs::runtime::task::timeout(std::time::Duration::from_secs(2), rx.recv())
+                .await
+                .expect("the alarm transition must post within 2s")
+                .expect("stream open");
+        }
+
+        // Second cycle: the alarm does not move, so the post is
+        // DBE_VALUE|DBE_LOG — outside the alarm-only selection.
+        db.put_record_field_from_ca_no_notify("AI:DBEALARM", "VAL", EpicsValue::Double(2.0))
+            .await
+            .expect("put");
+        epics_base_rs::runtime::task::timeout(
+            std::time::Duration::from_secs(2),
+            every_class.recv(),
+        )
+        .await
+        .expect("the default DBE_VALUE|DBE_ALARM monitor takes a value post")
+        .expect("stream open");
+        assert!(
+            matches!(alarm_only.try_recv(), Err(TryRecvError::Empty)),
+            "DBE=\"ALARM\" selects DBE_ALARM alone; a value-only post must not \
+             reach that monitor"
+        );
+    }
+
+    /// The property half of the pair is unconditional — pvxs opens the
+    /// second subscription with `DBE_PROPERTY` whatever `DBE` selected
+    /// (`singlesource.cpp:161-167`), so narrowing the value half must not
+    /// cost a metadata update.
+    #[epics_macros_rs::epics_test]
+    async fn a_narrow_dbe_still_receives_the_property_subscription() {
+        let db = ai_db("AI:DBEPROP").await;
+        let source = PvDatabaseSource::new(db.clone());
+        let mut rx = dbe_monitor(
+            &source,
+            "AI:DBEPROP",
+            &[("DBE", PvField::Scalar(ScalarValue::String("ALARM".into())))],
+        )
+        .await;
+
+        // EGU is a DBE_PROPERTY field: writing it posts on the property
+        // class alone.
+        db.put_pv("AI:DBEPROP.EGU", EpicsValue::String("mm".into()))
+            .await
+            .expect("put EGU");
+
+        let update =
+            epics_base_rs::runtime::task::timeout(std::time::Duration::from_secs(2), rx.recv())
+                .await
+                .expect("a DBE_PROPERTY post must reach every monitor")
+                .expect("stream open");
+        let marked = update.marked.expect("a record update declares its marks");
+        assert!(
+            marked.iter().any(|m| m.starts_with("display.")),
+            "a property post marks the getProperties leaves, got {marked:?}"
+        );
+    }
+
+    /// pvxs opens TWO subscriptions per single channel, never their union
+    /// (`singlesource.cpp:155-167`). The difference is observable the
+    /// moment the value stream has a backlog: on a by-reference channel —
+    /// an array VAL — the subscriber queue latches latest-only
+    /// (`event_queue.rs:436-438`), so a union subscription collapsed the
+    /// arriving `DBE_PROPERTY` post onto the value post already queued and
+    /// the client got ONE update, learning about the metadata change only
+    /// as extra marks on a value event. Two queues cannot do that to each
+    /// other.
+    #[epics_macros_rs::epics_test]
+    async fn a_property_post_is_not_collapsed_onto_a_queued_value_post() {
+        use epics_base_rs::server::records::waveform::WaveformRecord;
+        use epics_base_rs::types::DbFieldType;
+
+        let db = Arc::new(PvDatabase::new());
+        db.add_record(
+            "WF:SPLIT",
+            Box::new(WaveformRecord::new(4, DbFieldType::Long)),
+        )
+        .await
+        .unwrap();
+        let source = PvDatabaseSource::new(db.clone());
+        let mut rx = dbe_monitor(&source, "WF:SPLIT", &[]).await;
+
+        // Post a value change and then a metadata change WITHOUT draining
+        // in between, so both are pending when the client next pulls.
+        db.put_record_field_from_ca_no_notify(
+            "WF:SPLIT",
+            "VAL",
+            EpicsValue::LongArray(vec![1, 2, 3, 4]),
+        )
+        .await
+        .expect("put VAL");
+        db.put_pv("WF:SPLIT.EGU", EpicsValue::String("mm".into()))
+            .await
+            .expect("put EGU");
+
+        let mut marked_sets = Vec::new();
+        for nth in 0..2 {
+            let update =
+                epics_base_rs::runtime::task::timeout(std::time::Duration::from_secs(2), rx.recv())
+                    .await
+                    .unwrap_or_else(|_| {
+                        panic!(
+                            "the value post and the property post are separate \
+                             subscriptions, so both must arrive; update {nth} did not \
+                             (so far: {marked_sets:?})"
+                        )
+                    })
+                    .expect("stream open");
+            marked_sets.push(update.marked.expect("a record update declares its marks"));
+        }
+
+        assert!(
+            marked_sets
+                .iter()
+                .any(|m| m.iter().any(|l| l == "value")
+                    && !m.iter().any(|l| l.starts_with("display."))),
+            "one update is the value post alone, got {marked_sets:?}"
+        );
+        assert!(
+            marked_sets
+                .iter()
+                .any(|m| m.iter().any(|l| l.starts_with("display."))
+                    && !m.iter().any(|l| l == "value")),
+            "the other is the property post alone, got {marked_sets:?}"
+        );
+    }
+
+    /// `check_monitor_request` is the port's INIT half of pvxs's
+    /// `onSubscribe`, so the native source owns the throwing half of its
+    /// `DBE` read: an array-typed `DBE` reaches `Value::as<uint8_t>()`,
+    /// which has no scalar arm for array storage. pvxs turns that into a
+    /// circuit reset; the port answers this one operation with an error
+    /// (CBUG-C2). Before the fix the native source read no `DBE` at all,
+    /// so the malformed option was served as if absent.
+    #[epics_macros_rs::epics_test]
+    async fn an_array_typed_dbe_fails_the_native_monitor_init() {
+        use crate::pvdata::TypedScalarArray;
+
+        let db = ai_db("AI:DBEBAD").await;
+        let source = PvDatabaseSource::new(db.clone());
+        let ctx = ctx_with_options(&[(
+            "DBE",
+            PvField::ScalarArrayTyped(TypedScalarArray::Int(vec![1].into())),
+        )]);
+        let checked = source
+            .access()
+            .check(
+                "AI:DBEBAD",
+                &ctx.creds.host,
+                &ctx.creds.account,
+                &ctx.creds.method,
+                "",
+            )
+            .await;
+        assert!(
+            source.check_monitor_request(&checked, &ctx).await.is_err(),
+            "an array-typed DBE must fail this MONITOR, not be served as absent"
+        );
+
+        // A mailbox PV is the `SharedPV` server API, whose `onSubscribe`
+        // reads no `record._options` — the same malformed option is served.
+        db.add_pv("MAILBOX:DBEBAD", EpicsValue::Double(1.0))
+            .await
+            .unwrap();
+        let mut mailbox_ctx = ctx.clone();
+        mailbox_ctx.pv_request = ctx.pv_request.clone();
+        let mailbox_checked = source
+            .access()
+            .check(
+                "MAILBOX:DBEBAD",
+                &ctx.creds.host,
+                &ctx.creds.account,
+                &ctx.creds.method,
+                "",
+            )
+            .await;
+        assert!(
+            source
+                .check_monitor_request(&mailbox_checked, &mailbox_ctx)
+                .await
+                .is_ok(),
+            "only a record-backed channel reads DBE; a SharedPV name must not \
+             gain a new failure"
+        );
+    }
+
+    /// The other outcome pvxs's `onSubscribe` owns: a present `DBE` that
+    /// selects nothing in the value class is honoured by the `VALUE|ALARM`
+    /// fallback, but the client is told first (`singlesource.cpp:128-130`).
+    /// `LOG` is not one of the three recognized spellings — only `ARCHIVE`
+    /// selects that bit.
+    #[epics_macros_rs::epics_test]
+    async fn a_dbe_selecting_an_empty_mask_warns_the_client() {
+        let db = ai_db("AI:DBEEMPTY").await;
+        let source = PvDatabaseSource::new(db.clone());
+        let ctx = ctx_with_options(&[("DBE", PvField::Scalar(ScalarValue::String("LOG".into())))]);
+        let checked = source
+            .access()
+            .check(
+                "AI:DBEEMPTY",
+                &ctx.creds.host,
+                &ctx.creds.account,
+                &ctx.creds.method,
+                "",
+            )
+            .await;
+        source
+            .check_monitor_request(&checked, &ctx)
+            .await
+            .expect("an empty selection is served by the fallback, not refused");
+
+        let logged = ctx.log.take();
+        assert_eq!(logged.len(), 1, "exactly one diagnostic, got {logged:?}");
+        assert_eq!(logged[0].level, crate::proto::MessageType::Warning);
+        assert!(
+            logged[0].message.contains("selects empty mask"),
+            "pvxs reports the empty selection before falling back, got {:?}",
+            logged[0].message
+        );
+    }
+
+    // ── Channel-name resolution: `$`, `{json}` and `[range]` ──
+
+    /// `REC.DESC$` connects and serves the field's string.
+    ///
+    /// pvxs binds every channel through `dbChannelCreate`
+    /// (`ioc/singlesource.cpp:428-435` → `ioc/channel.cpp:29-77`), which
+    /// peels the `$` long-string modifier and re-views a `DBF_STRING` field
+    /// as a `DBR_CHAR` array — collapsed straight back to a NUL-terminated
+    /// `pvString` on the wire (`ioc/iocsource.cpp:133-136`), so the value
+    /// IS the string. Applying a bare `parse_pv_name` to the whole client
+    /// name left the `$` glued to the field, `DESC$` resolved to nothing,
+    /// and `softIocPVX`'s `pvget REC.DESC$` had no answer here.
+    #[tokio::test]
+    async fn a_dollar_long_string_channel_serves_the_field() {
+        let db = ai_db("AI:LS").await;
+        db.get_record("AI:LS").unwrap().write().common.desc = "a description".into();
+        let source = PvDatabaseSource::new(db.clone());
+
+        assert!(
+            source.has_pv("AI:LS.DESC$").await,
+            "`$` on a DBF_STRING field must create the channel"
+        );
+        let value = source.get_value("AI:LS.DESC$").await.expect("a value");
+        let PvField::Structure(s) = &value else {
+            panic!("expected an NTScalar structure, got {value:?}");
+        };
+        assert_eq!(
+            s.get_field("value"),
+            Some(&PvField::Scalar(ScalarValue::String(
+                "a description".into()
+            ))),
+        );
+    }
+
+    /// `$` on a field that is not a string is `S_dbLib_fieldNotFound`, which
+    /// aborts channel creation (C `dbChannel.c:486-505`) — the eligibility
+    /// rule is the record's (`resolve_string_view_field`), not this source's.
+    #[tokio::test]
+    async fn a_dollar_on_an_ineligible_field_is_refused() {
+        let db = ai_db("AI:NOLS").await;
+        let source = PvDatabaseSource::new(db);
+        assert!(
+            !source.has_pv("AI:NOLS.VAL$").await,
+            "`$` on a DBF_DOUBLE field must refuse the channel"
+        );
+    }
+
+    /// A four-element waveform seeded with `[10, 20, 30, 40]`, for the
+    /// channel-filter tests below.
+    async fn wf_db(name: &str) -> Arc<PvDatabase> {
+        use epics_base_rs::server::records::waveform::WaveformRecord;
+        use epics_base_rs::types::DbFieldType;
+
+        let db = Arc::new(PvDatabase::new());
+        db.add_record(name, Box::new(WaveformRecord::new(4, DbFieldType::Long)))
+            .await
+            .unwrap();
+        db.put_record_field_from_ca_no_notify(
+            name,
+            "VAL",
+            EpicsValue::LongArray(vec![10, 20, 30, 40]),
+        )
+        .await
+        .expect("seed VAL");
+        db
+    }
+
+    /// The `value` leaf of an NT structure, as an `i32` slice.
+    fn int_value_leaf(field: &PvField) -> Vec<i32> {
+        let PvField::Structure(s) = field else {
+            panic!("expected an NT structure, got {field:?}");
+        };
+        match s.get_field("value") {
+            Some(PvField::ScalarArrayTyped(TypedScalarArray::Int(a))) => a.to_vec(),
+            Some(PvField::ScalarArray(v)) => v
+                .iter()
+                .map(|e| match e {
+                    ScalarValue::Int(i) => *i,
+                    other => panic!("expected int elements, got {other:?}"),
+                })
+                .collect(),
+            other => panic!("expected an int array `value` leaf, got {other:?}"),
+        }
+    }
+
+    /// A channel name carrying a filter is SERVED, with the filter applied.
+    ///
+    /// The refusal this replaced was forced by the single union
+    /// subscription: with one subscriber slot there was nowhere to hang a
+    /// per-channel chain, so every filtered name had to be turned away.
+    /// The value and property subscriptions are separate slots now, each
+    /// with its own chain, and the read path runs the same chain in read
+    /// context the way pvxs's `LocalFieldLog` does
+    /// (`singlesource.cpp:286-291`).
+    #[tokio::test]
+    async fn a_filtered_channel_name_is_served_with_its_slice() {
+        let db = wf_db("WF:FILT").await;
+        let source = PvDatabaseSource::new(db);
+        let name = r#"WF:FILT{"arr":{"s":1,"e":2}}"#;
+        assert!(source.has_pv(name).await, "a parseable filter must connect");
+        let value = source
+            .get_value(name)
+            .await
+            .expect("GET on a filtered channel");
+        assert_eq!(
+            int_value_leaf(&value),
+            vec![20, 30],
+            "the GET must return the slice the client asked for, not the raw array"
+        );
+    }
+
+    /// The other half of the coin flip this replaced: a suffix whose JSON
+    /// happens to contain a `.` used to be refused only because the
+    /// last-dot split tore it apart, while an undotted one connected raw.
+    /// Both are decided by the filter parser now.
+    ///
+    /// `dbnd` is also the read-context case that must NOT suppress a GET:
+    /// pvxs leaves `pFieldLog` NULL when the chain drops the read log and
+    /// `IOCSource::get` then reads the live field.
+    #[tokio::test]
+    async fn a_dotted_filter_suffix_is_served_and_never_suppresses_the_read() {
+        let db = ai_db("AI:FILT2").await;
+        let source = PvDatabaseSource::new(db);
+        let name = r#"AI:FILT2{"dbnd":{"d":0.5}}"#;
+        assert!(
+            source.has_pv(name).await,
+            "a dotted suffix parses like any other"
+        );
+        assert!(
+            source.get_value(name).await.is_some(),
+            "a deadband filter gates the monitor stream, never the one-shot read"
+        );
+    }
+
+    /// `[range]` is the same surface: `split_channel_name` folds it into a
+    /// leading `arr` filter (C `dbChannel.c:507-510`), so it slices here
+    /// exactly as the JSON form does.
+    #[tokio::test]
+    async fn a_range_suffixed_channel_name_is_served_as_an_arr_filter() {
+        let db = wf_db("WF:RANGE").await;
+        let source = PvDatabaseSource::new(db);
+        let value = source
+            .get_value("WF:RANGE.VAL[1:2]")
+            .await
+            .expect("GET on a range-suffixed channel");
+        assert_eq!(
+            int_value_leaf(&value),
+            vec![20, 30],
+            "the legacy range modifier is an `arr` filter and slices the read"
+        );
+    }
+
+    /// The one refusal C keeps: a syntactically-present suffix that will
+    /// not parse. `chf_parse` stops on an unknown filter name
+    /// (`dbChannel.c:179`) and `dbChannelCreate` reaches `finish:`, where
+    /// `dbChannelDelete(chan); chan = NULL` (`:514-527`) — base never
+    /// connects a channel whose filter it could not build, because serving
+    /// it raw would silently drop the semantics the client asked for.
+    #[tokio::test]
+    async fn an_unparseable_filter_suffix_is_still_refused() {
+        let db = wf_db("WF:BADF").await;
+        let source = PvDatabaseSource::new(db);
+        assert!(
+            !source.has_pv(r#"WF:BADF{"nosuchfilter":{}}"#).await,
+            "an unknown filter name must refuse the channel, not connect it raw"
+        );
+    }
+
+    /// A mailbox `SharedPV` has no `dbChannel`, no field log and no filter
+    /// machinery; pvxs finds one by exact name in its source map, so a
+    /// filtered name matches nothing there. Refusing keeps that answer
+    /// instead of peeling the suffix off and serving the mailbox raw.
+    #[tokio::test]
+    async fn a_filtered_mailbox_name_is_refused() {
+        let db = Arc::new(PvDatabase::new());
+        db.add_pv("MB:FILT", EpicsValue::Double(1.0)).await.unwrap();
+        let source = PvDatabaseSource::new(db);
+        assert!(
+            source.has_pv("MB:FILT").await,
+            "the mailbox itself is served"
+        );
+        assert!(
+            !source.has_pv(r#"MB:FILT{"arr":{"s":0,"e":1}}"#).await,
+            "a mailbox has no filter machinery, so a filtered name addresses nothing"
+        );
+    }
+
+    /// The monitor half: the chain rides on the VALUE subscription's own
+    /// subscriber slot, so every update the client pulls is already
+    /// sliced. This is what the union subscription could not do — there
+    /// was one slot for both event classes and no place to attach a chain
+    /// that must not see `DBE_PROPERTY` events.
+    #[epics_macros_rs::epics_test]
+    async fn a_filtered_monitor_applies_the_chain_to_its_value_stream() {
+        let db = wf_db("WF:MFILT").await;
+        let source = PvDatabaseSource::new(db.clone());
+        let mut rx = dbe_monitor(&source, r#"WF:MFILT{"arr":{"s":1,"e":2}}"#, &[]).await;
+
+        db.put_record_field_from_ca_no_notify(
+            "WF:MFILT",
+            "VAL",
+            EpicsValue::LongArray(vec![1, 2, 3, 4]),
+        )
+        .await
+        .expect("put VAL");
+
+        loop {
+            let update =
+                epics_base_rs::runtime::task::timeout(std::time::Duration::from_secs(2), rx.recv())
+                    .await
+                    .expect("the value post must arrive within 2s")
+                    .expect("stream open");
+            let marks = update
+                .marked
+                .clone()
+                .expect("a record update declares its marks");
+            if !marks.iter().any(|m| m == "value") {
+                // the DBE_PROPERTY subscription's own post — not this test's
+                continue;
+            }
+            assert_eq!(
+                int_value_leaf(&update.value),
+                vec![2, 3],
+                "the monitor update must carry the slice, not the raw array"
+            );
+            break;
+        }
+    }
+
+    /// A refused channel is still SEARCH-advertised, so the client sends
+    /// CREATE_CHANNEL and hears the refusal instead of timing out — the same
+    /// asymmetry `has_pv` already documents for an unservable field.
+    #[tokio::test]
+    async fn a_filtered_channel_name_is_still_searchable() {
+        let db = ai_db("AI:SRCH").await;
+        let source = PvDatabaseSource::new(db);
+        assert!(
+            source.searchable(r#"AI:SRCH{"arr":{"s":0}}"#).await,
+            "search claims what dbChannelTest resolves; the refusal belongs at \
+             create, where the client can be told"
         );
     }
 }

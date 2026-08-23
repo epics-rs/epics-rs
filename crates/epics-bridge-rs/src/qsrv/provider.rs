@@ -258,8 +258,8 @@ impl AcfAccessControl {
     /// after the record appears (post-init `dbLoadRecords`), with no
     /// ASG-field put to move the invalidation generation.
     async fn resolve_asg_and_asl(&self, channel: &str) -> (String, u8, bool) {
-        let (record_name, _field) = epics_base_rs::server::database::parse_pv_name(channel);
-        if let Some(rec) = self.db.get_record(record_name) {
+        let cn = epics_base_rs::server::database::filters::parse_channel_name(channel);
+        if let Some(rec) = self.db.get_record(&cn.record) {
             let inst = rec.read();
             return (
                 inst.common.access_group().to_string(),
@@ -864,8 +864,8 @@ impl BridgeProvider {
         if self.is_servable_group(name).await {
             return true;
         }
-        let (record, _field) = epics_base_rs::server::database::parse_pv_name(name);
-        let Some(rec_arc) = self.db.get_record(record) else {
+        let cn = epics_base_rs::server::database::filters::parse_channel_name(name);
+        let Some(rec_arc) = self.db.get_record(&cn.record) else {
             // PVA-plugin PVs (NTNDArray) aren't records — caller
             // (qsrv pva_adapter) should consult its own pva_pvs map.
             // Default false here so unknown names refuse PUT upfront.
@@ -1174,7 +1174,10 @@ impl BridgeProvider {
     /// pvxs builds one `dbChannel` per `+channel` while constructing the
     /// group's fields; a `+channel` that `dbChannelCreate` refuses throws out
     /// of `Field::Field` (ioc/field.cpp:23-25 → ioc/channel.cpp:37) and
-    /// `createGroups` drops the WHOLE group. This is the port's single
+    /// `createGroups` drops the WHOLE group. Building the group's value
+    /// template throws for the same reason on a link-class member, and from
+    /// the same `try` block (groupconfigprocessor.cpp:461-465), so both
+    /// refusals belong to this one gate. This is the port's single
     /// creation gate: the same answer feeds the `processGroups` report and
     /// [`Self::servable_group`], so a group with an unresolvable member can
     /// neither be counted as created nor reach a client — the "half-created
@@ -1189,6 +1192,20 @@ impl BridgeProvider {
             }
             if let Err(e) = super::channel::resolve_db_channel(&self.db, &member.channel).await {
                 return Some(e);
+            }
+            // A group member bound to an input or output link is refused
+            // while the value template is built:
+            // `GroupConfigProcessor::getTypeDefForChannel` asks
+            // `IOCSource::getChannelValueType(chan, errOnLinks = true)`,
+            // which throws "Link fields not allowed in this context" for
+            // `DBF_INLINK..=DBF_OUTLINK` (iocsource.cpp:626-630).
+            // `DBF_FWDLINK` is deliberately outside that range and builds.
+            // The single-record path passes `errOnLinks = false`
+            // (singlesource.cpp:192), so `REC.INP` stays servable on its own.
+            if let Some(class) = super::channel::channel_link_class(&self.db, &member.channel)
+                && class != epics_base_rs::types::DbfLinkClass::FwdLink
+            {
+                return Some("Link fields not allowed in this context".to_string());
             }
         }
         None
@@ -1257,12 +1274,15 @@ impl BridgeProvider {
     /// (`channel_find`, `create_channel*`, `channel_list`) goes
     /// through this gate, so the dual meaning cannot reach a client.
     ///
-    /// The gate also applies pvxs's CREATION test: a group whose `+channel`
-    /// does not resolve to a dbChannel is never created by `createGroups`
-    /// (groupconfigprocessor.cpp:429-444), so it must not answer a search
-    /// either — the client gets a clean "PV not found" instead of a group
-    /// that connects and then fails every operation. See
-    /// [`Self::group_creation_error`].
+    /// The gate also applies a CREATION test that pvxs does NOT carry
+    /// through to its serve path. A group whose `+channel` does not
+    /// resolve to a dbChannel is reported as not created by `createGroups`
+    /// (groupconfigprocessor.cpp:429-444) and yet stays advertised and
+    /// search-claimed, so pvxs connects a client to a group that then
+    /// fails every operation. Withholding it here is a deliberate
+    /// deviation from that upstream defect (PVXSUP-6), not a
+    /// transcription of pvxs: the client gets a clean "PV not found"
+    /// instead. See [`Self::group_creation_error`].
     pub(crate) async fn servable_group(&self, name: &str) -> Option<GroupPvDef> {
         let def = self.groups.read().get(name).cloned()?;
         if self.record_exists(name).await {
@@ -1429,9 +1449,10 @@ impl ChannelProvider for BridgeProvider {
         names.extend(self.db.all_alias_names());
         // Only groups the serve gate hands out are listed: a name shadowed by
         // a record is listed once (as the record — the record wins, pvxs
-        // `defineGroups` ioc/groupconfigprocessor.cpp:177), and a group that
-        // `createGroups` would refuse never enters `groupMap`
-        // (:429-444), so groupsource.cpp:75-89 cannot list it.
+        // `defineGroups` ioc/groupconfigprocessor.cpp:177), and a group
+        // `createGroups` refuses (:429-444) is withheld here although pvxs
+        // keeps listing it — the deliberate deviation recorded on
+        // `servable_group` (PVXSUP-6).
         let existing: std::collections::HashSet<String> = names.iter().cloned().collect();
         let group_keys: Vec<String> = self.groups.read().keys().cloned().collect();
         for k in group_keys {
@@ -1520,19 +1541,14 @@ impl BridgeProvider {
         // JSON suffix before record/field resolution. The filter
         // chain stays on `BridgeChannel`; resolution and cache
         // lookup use the record-path-only form.
-        let parsed = epics_base_rs::server::database::filters::split_channel_name(name);
-        // Peel the EPICS `$` long-string modifier (C `dbChannel.c:486-505`)
-        // off the record path so the underlying record/field resolves at
-        // the `has_name` gate below; `BridgeChannel::new` re-reads the
-        // modifier from the full name to select the long-string view. The
-        // `$` is left on the record path by `split_channel_name` (the CA
-        // server detects it there as well).
-        let resolution_name = parsed
-            .record_path
-            .strip_suffix('$')
-            .unwrap_or(parsed.record_path.as_str());
-        let (record_name, field) = epics_base_rs::server::database::parse_pv_name(resolution_name);
-        let field_upper = field.to_ascii_uppercase();
+        // `parse_channel_name` also peels the EPICS `$` long-string modifier
+        // (C `dbChannel.c:486-505`) so the underlying record/field resolves
+        // at the `has_name` gate below; `BridgeChannel::new` re-reads the
+        // modifier from the full name to select the long-string view.
+        let parsed = epics_base_rs::server::database::filters::parse_channel_name(name);
+        let resolution_name = parsed.record_path.as_str();
+        let record_name = parsed.record.as_str();
+        let field_upper = parsed.field.clone();
 
         // Cache hit only when the requested name has no filter
         // suffix — a filtered subscription must take a fresh
@@ -1589,12 +1605,12 @@ pub async fn channel_property_support(
     db: &PvDatabase,
     name: &str,
 ) -> epics_base_rs::server::snapshot::PropertySupport {
-    let (record, field) = epics_base_rs::server::database::parse_pv_name(name);
-    let Some(rec_arc) = db.get_record(record) else {
+    let cn = epics_base_rs::server::database::filters::parse_channel_name(name);
+    let Some(rec_arc) = db.get_record(&cn.record) else {
         return epics_base_rs::server::snapshot::PropertySupport::NONE;
     };
     let inst = rec_arc.read();
-    inst.property_support_for_field(field)
+    inst.property_support_for_field(&cn.field)
 }
 
 #[cfg(test)]
@@ -1614,6 +1630,11 @@ mod tests {
     ///   see `channel::resolve_db_channel`: the group path has no `$` view,
     ///   so admitting it yields a group that answers `FieldNotFound` to every
     ///   GET — refused with a named reason instead)
+    /// - member bound to a DBF_INLINK field → group NOT created
+    ///   (`IOCSource::getChannelValueType(chan, true)` throws
+    ///   "Link fields not allowed in this context", iocsource.cpp:629-630)
+    /// - member bound to the DBF_FWDLINK FLNK → group created; that class
+    ///   is outside the range the type builder refuses
     /// - every member resolves              → group created
     ///
     /// "Not created" is asserted at the client boundary, not just in the
@@ -1623,6 +1644,7 @@ mod tests {
     async fn a_group_whose_channel_does_not_resolve_is_not_created() {
         use epics_base_rs::server::database::PvDatabase;
         use epics_base_rs::server::records::ai::AiRecord;
+        use epics_base_rs::server::records::calc::CalcRecord;
         use epics_base_rs::server::records::stringin::StringinRecord;
         use epics_base_rs::server::records::waveform::WaveformRecord;
         use epics_base_rs::types::DbFieldType;
@@ -1637,6 +1659,9 @@ mod tests {
         db.add_record("G:wf", Box::new(WaveformRecord::new(40, DbFieldType::Char)))
             .await
             .unwrap();
+        db.add_record("G:calc", Box::new(CalcRecord::new("A")))
+            .await
+            .unwrap();
 
         let provider = Arc::new(BridgeProvider::new(db));
         provider
@@ -1646,17 +1671,19 @@ mod tests {
                     "G:missingfield": { "value": { "+channel": "G:ai.NOPE",    "+type": "plain" } },
                     "G:dollarchar":   { "value": { "+channel": "G:wf.VAL$",    "+type": "plain" } },
                     "G:dollarstr":    { "value": { "+channel": "G:si.VAL$",    "+type": "plain" } },
+                    "G:inlink":       { "value": { "+channel": "G:calc.INPA",  "+type": "plain" } },
+                    "G:fwdlink":      { "value": { "+channel": "G:calc.FLNK",  "+type": "plain" } },
                     "G:ok":           { "value": { "+channel": "G:ai.VAL",     "+type": "plain" } }
                 }"#,
             )
             .unwrap();
 
-        // All five are configured; only the creatable ones are created.
-        assert_eq!(provider.group_count(), 5, "all five parse into the config");
+        // All seven are configured; only the creatable ones are created.
+        assert_eq!(provider.group_count(), 7, "all seven parse into the config");
         assert_eq!(
             provider.process_groups().await,
-            1,
-            "only `G:ok` binds a channel this server can serve"
+            2,
+            "`G:ok` and `G:fwdlink` bind a channel this server can serve"
         );
 
         for refused in [
@@ -1664,6 +1691,7 @@ mod tests {
             "G:missingfield",
             "G:dollarchar",
             "G:dollarstr",
+            "G:inlink",
         ] {
             assert!(
                 !provider.channel_find(refused).await,
@@ -1682,12 +1710,23 @@ mod tests {
             AnyChannel::Group(_) => {}
             AnyChannel::Single(_) => panic!("G:ok must build as a group"),
         }
+        match provider.create_channel("G:fwdlink").await.unwrap() {
+            AnyChannel::Group(_) => {}
+            AnyChannel::Single(_) => panic!("G:fwdlink must build as a group"),
+        }
+        // The refusal is the GROUP path's alone: `getValuePrototype` asks
+        // the same function with `errOnLinks = false` (singlesource.cpp:192),
+        // so the very field that killed `G:inlink` still serves on its own.
+        match provider.create_channel("G:calc.INPA").await.unwrap() {
+            AnyChannel::Single(_) => {}
+            AnyChannel::Group(_) => panic!("G:calc.INPA must build as a single channel"),
+        }
 
         let listed = provider.channel_list().await;
         assert_eq!(
             listed.iter().filter(|n| n.starts_with("G:")).count(),
-            4,
-            "the three records and the one created group, nothing else: {listed:?}"
+            6,
+            "the four records and the two created groups, nothing else: {listed:?}"
         );
         assert!(
             listed.contains(&"G:ok".to_string()),

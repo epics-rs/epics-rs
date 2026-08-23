@@ -1,8 +1,10 @@
 //! QSRV PUT trap-write (`asTrapWrite`) emission.
 //!
-//! The single write-owner that brackets every QSRV record PUT with the
-//! EPICS access-security put-logging hook. caPutLog and site put-loggers
-//! attach to this hook (registered via
+//! The QSRV-typed face of the workspace's one put-log write-owner,
+//! [`epics_base_rs::server::access_security::put_with_trap`]: this module
+//! only reads the trap flag out of a [`WriteGrant`] and hands the write
+//! down. caPutLog and site put-loggers attach to the hook underneath
+//! (registered via
 //! [`epics_base_rs::server::access_security::register_trap_write_listener`]).
 //!
 //! Parity reference — pvxs wraps each QSRV put in a `SecurityLogger`
@@ -35,45 +37,23 @@
 
 // RTEMS-EXEC-MODEL-ALLOW(2): checked - these run and pass in the feature-ON suite.
 
-use epics_base_rs::server::access_security::{self, TrapWriteFields, TrapWriteGuard};
+use epics_base_rs::server::access_security;
 use epics_base_rs::types::EpicsValue;
+
+pub(crate) use epics_base_rs::server::access_security::TrapWriteMeta;
 
 use super::provider::WriteGrant;
 use crate::error::BridgeResult;
-
-/// Per-write trap-log identity that does not depend on the value being
-/// written. Borrows the caller's identity strings (matching the C
-/// `asTrapWriteMessage` by-reference lifetime, `asLib.h:34-56`).
-pub(crate) struct TrapWriteMeta<'a> {
-    /// The channel (record.FIELD) being written — pvxs passes
-    /// `dbChannelName(pChan)`.
-    pub pv_name: &'a str,
-    /// Authenticated account name (pvxs `cred->account`).
-    pub user: &'a str,
-    /// Client host (pvxs `cred->host`).
-    pub host: &'a str,
-    /// Client peer ("ip:port"). The QSRV [`super::provider::AccessContext`]
-    /// does not carry the socket peer separately, so callers pass the
-    /// connection host — the closest available identity.
-    pub peer: &'a str,
-    /// Final field DBR type of the channel (pvxs `dbChannelFinalCAType`).
-    pub dbr_type: u16,
-}
 
 /// Bracket one backing record PUT with the EPICS `asTrapWrite`
 /// put-logging hook, then run and return the write's result.
 ///
 /// `grant` is the SINGLE source of "is this a trapped write" — the
 /// matched ACF/ASG rule's `TRAPWRITE` flag, decided once by the access
-/// layer (see [`WriteGrant`]). When the grant is not trapped, or no
-/// listener is registered, the write runs unbracketed and nothing is
-/// dispatched (the C `asActive && trapMask` gate, `asLib.h:57`).
-///
-/// On a trapped write this emits exactly one `BeforeWrite` (before the
-/// put) and exactly one `AfterWrite` (after the put completes, on every
-/// exit path) carrying the same `event_id`, value string, and `ok`/`fail`
-/// status. The value is rendered once (truncated to 64 elements, like
-/// the CA dispatcher) only when actually emitting.
+/// layer (see [`WriteGrant`]). Reading that one flag out of the grant is
+/// all this wrapper does; the bracket itself lives in
+/// [`access_security::put_with_trap`], shared with the native PVA source
+/// so both servers emit the same put-log for the same write.
 pub(crate) async fn put_with_trap<F, Fut>(
     grant: WriteGrant,
     meta: TrapWriteMeta<'_>,
@@ -84,55 +64,12 @@ where
     F: FnOnce(EpicsValue) -> Fut,
     Fut: std::future::Future<Output = BridgeResult<()>>,
 {
-    // The grant alone decides trap; `has_trap_write_listeners` only
-    // skips the value render + dispatch cost when nothing would consume
-    // the event (mirrors the C `asActive` half of the gate).
-    if !(grant.rule_was_trap && access_security::has_trap_write_listeners()) {
-        return write(value).await;
-    }
-
-    let value_str = value.display_truncated(64);
-    let no_elements = value.count();
-    let event_id = access_security::next_trap_write_event_id();
-
-    // One RAII guard owns the Before/After pair: BeforeWrite on
-    // construction, AfterWrite on `complete` (normal path) OR on Drop
-    // (this future cancelled mid-write — the QSRV connection/RPC torn
-    // down while `write(...).await` is parked). The Drop arm is what
-    // keeps the put-log balanced; the pre-guard code dispatched the
-    // AfterWrite from an explicit call below the await, which a
-    // cancellation skipped, leaving a BeforeWrite with no match. The C
-    // invariant pairs every `asTrapWriteWithData` with one
-    // `asTrapWriteAfter` on all exit paths; pvxs `SecurityLogger`'s
-    // destructor enforces the same.
-    let mut guard = TrapWriteGuard::begin(TrapWriteFields {
-        pv_name: meta.pv_name.to_string(),
-        user: meta.user.to_string(),
-        host: meta.host.to_string(),
-        peer: meta.peer.to_string(),
-        value_str,
-        dbr_type: meta.dbr_type,
-        no_elements,
-        event_id,
-        rule_was_trap: true,
-        cancel_status: "cancel".to_string(),
-    });
-
-    let result = write(value).await;
-
-    guard.complete(if result.is_ok() { "ok" } else { "fail" });
-
-    result
+    access_security::put_with_trap(grant.rule_was_trap, meta, value, write).await
 }
 
 /// [`put_with_trap`]'s synchronous twin, for a write already holding the
-/// member-record advisory gate (the QSRV atomic group PUT, `already_locked`
-/// entries). C's `SecurityLogger` bracket (`pvxs/ioc/securitylogger.h:23-59`)
-/// is plain synchronous C++ with no `async` concept at all — this is that
-/// shape. `write` cannot itself suspend (its `_already_locked` callees are
-/// synchronous post-H6), so there is no cancellation-mid-write case as in
-/// [`put_with_trap`]; the same RAII guard still balances the trap log on a
-/// panic unwinding through `write`.
+/// member-record advisory gate (the QSRV atomic group PUT,
+/// `already_locked` entries).
 pub(crate) fn put_with_trap_already_locked<F>(
     grant: WriteGrant,
     meta: TrapWriteMeta<'_>,
@@ -142,32 +79,7 @@ pub(crate) fn put_with_trap_already_locked<F>(
 where
     F: FnOnce(EpicsValue) -> BridgeResult<()>,
 {
-    if !(grant.rule_was_trap && access_security::has_trap_write_listeners()) {
-        return write(value);
-    }
-
-    let value_str = value.display_truncated(64);
-    let no_elements = value.count();
-    let event_id = access_security::next_trap_write_event_id();
-
-    let mut guard = TrapWriteGuard::begin(TrapWriteFields {
-        pv_name: meta.pv_name.to_string(),
-        user: meta.user.to_string(),
-        host: meta.host.to_string(),
-        peer: meta.peer.to_string(),
-        value_str,
-        dbr_type: meta.dbr_type,
-        no_elements,
-        event_id,
-        rule_was_trap: true,
-        cancel_status: "cancel".to_string(),
-    });
-
-    let result = write(value);
-
-    guard.complete(if result.is_ok() { "ok" } else { "fail" });
-
-    result
+    access_security::put_with_trap_blocking(grant.rule_was_trap, meta, value, write)
 }
 
 #[cfg(test)]

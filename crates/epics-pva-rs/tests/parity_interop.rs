@@ -26,6 +26,8 @@ mod test_monitor_reload_deny_composite;
 mod test_put_get_process;
 #[path = "parity/test_pvrequest_filter.rs"]
 mod test_pvrequest_filter;
+#[path = "parity/test_requeue_on_destroy.rs"]
+mod test_requeue_on_destroy;
 #[path = "parity/test_sharedpv_lazy_open.rs"]
 mod test_sharedpv_lazy_open;
 #[path = "parity/testbitmask_port.rs"]

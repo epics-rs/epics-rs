@@ -20,24 +20,6 @@
 use epics_base_rs::server::recgbl::EventMask;
 use epics_base_rs::server::snapshot::PropertySupport;
 
-/// The DBE classes a QSRV single-record monitor subscribes to.
-///
-/// pvxs opens TWO db subscriptions per channel: the value one with
-/// `dbe = DBE_VALUE | DBE_ALARM` (the default when the request names no
-/// `record._options.DBE`, `singlesource.cpp:142-144`) and the property one
-/// with `DBE_PROPERTY` (`singlesource.cpp:155-166`). It posts on either.
-/// The port has one subscriber per channel, so the union is what makes the
-/// same events arrive; [`event_leaves`] then narrows each event by its own
-/// posted mask, which is what keeps the two from merging into one
-/// everything-marked post.
-///
-/// `LOG` is the port's `DBE_ARCHIVE` (same bit): a record's `monitor()` posts
-/// `DBE_VALUE | DBE_LOG` together, and `event_leaves` folds LOG into VALUE
-/// exactly as pvxs's callback does.
-pub fn monitor_mask() -> EventMask {
-    EventMask::VALUE | EventMask::LOG | EventMask::ALARM | EventMask::PROPERTY
-}
-
 /// Which NT leaves ONE posted event marks, given its `DBE_*` class.
 ///
 /// **The single owner of the event-class → leaf-set rule**, for the monitor

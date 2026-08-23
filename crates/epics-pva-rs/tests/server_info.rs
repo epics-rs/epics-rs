@@ -249,55 +249,115 @@ async fn rpc_op_errors_carry_pvxs_contract_text() {
     drop(server);
 }
 
-/// Regression: pvxs registers its built-in `ServerSource` at
-/// `(order = -1, "__server")` (server.cpp:542-547), BEFORE default-order
-/// (0) user sources, and the lowest order is consulted first
-/// (server.h:108-118). So a user source serving a PV literally named
-/// `server` at default order does NOT shadow the diagnostic source —
-/// `CREATE_CHANNEL`/GET/RPC for `server` reach the built-in source. The
-/// Rust server previously registered the built-in at `i32::MAX` (lowest
-/// priority), letting a user `server` PV win and hiding diagnostics from
-/// `pvlist`-style clients. A user that genuinely wants `server` must now
-/// register at an explicit order `< -1`.
+/// Name collision: a database record named literally `server`.
+///
+/// `record(ai,"server"){}` is legal, so the reserved diagnostic channel and
+/// a user PV can want the same name. pvxs settles it by priority band, not
+/// by name: its internals sit at `order = -1` (`server.cpp:542-546`) and an
+/// application source added through `Server::addSource` defaults to
+/// `order = 0` (`pvxs/server.h:116-118`), which is where QSRV's own sources
+/// go (`ioc/singlesourcehooks.cpp:158`, `ioc/groupsourcehooks.cpp:219`).
+/// CREATE_CHANNEL walks the registry ascending (`serverchan.cpp:304`), so
+/// `ServerSource::onCreate` claims the `server` channel
+/// (`serversource.cpp:30-33`) before the user source is ever asked, and the
+/// record is shadowed. That is what keeps `pvxlist` alive: it reaches a
+/// server by RPC-ing that same channel name (`tools/list.cpp:159-161`), so
+/// a user PV winning the name is exactly what takes `pvxlist` / `pvxinfo`
+/// off the air. Only pvxs's `addPV`-backed `builtinsrc` outranks the
+/// diagnostic (`server.cpp:174-181`), and a hand-in source is not that.
+///
+/// Asserted as observable behaviour, not as a priority number, so a future
+/// re-numbering that preserves the outcome keeps the test green.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn builtin_server_source_shadows_default_order_user_server_pv() {
-    let user_server = SharedPV::new();
+async fn a_user_pv_named_server_does_not_take_pvxlist_off_the_air() {
+    let colliding = SharedPV::new();
     let sentinel: f64 = 123.5;
-    user_server
+    colliding
         .open(f64::descriptor(), f64::to_pv_field(&sentinel))
         .unwrap();
+    let ordinary = SharedPV::new();
+    let ordinary_value: f64 = 7.25;
+    ordinary
+        .open(f64::descriptor(), f64::to_pv_field(&ordinary_value))
+        .unwrap();
+
     let source = SharedSource::new();
-    source.add("server", user_server);
+    source.add("server", colliding);
+    source.add("test:ordinary", ordinary);
 
     let server = PvaServer::isolated(Arc::new(source)).expect("isolated test server must start");
     let client = server.client_config();
 
-    // RPC `op=info` against `server` must reach the built-in __server
-    // source (returning the implLang/version identity), not the user's
-    // NTScalar<f64> PV which has no RPC handler. GET is no longer the
-    // discriminator — the built-in source has no GET surface (pvxs
-    // onRPC-only); shadowing is proven by RPC reaching the built-in.
-    let (desc, value) = nturi_op("info");
+    // 1. `pvxlist` still answers, and it answers from the diagnostic source.
+    let (desc, value) = nturi_op("channels");
     let (_, resp) = tokio::time::timeout(
         Duration::from_secs(5),
         client.pvrpc("server", &desc, &value),
     )
     .await
-    .expect("op=info rpc timed out")
-    .expect("built-in __server must answer op=info, shadowing the user PV")
+    .expect("op=channels rpc timed out")
+    .expect("a user PV named `server` must not take op=channels off the air")
     .into_value()
     .expect("value reply");
-    match resp {
-        PvField::Structure(s) => {
-            assert!(
-                s.get_field("implLang").is_some() && s.get_field("version").is_some(),
-                "built-in __server source must answer op=info, not the user PV: {s:?}"
+
+    let names = match resp {
+        PvField::Structure(s) => match s.get_field("value") {
+            Some(PvField::ScalarArrayTyped(TypedScalarArray::String(a))) => a.to_vec(),
+            Some(PvField::ScalarArray(arr)) => arr
+                .iter()
+                .map(|v| match v {
+                    ScalarValue::String(s) => s.clone(),
+                    other => panic!("non-string channel name: {other:?}"),
+                })
+                .collect(),
+            other => panic!("unexpected channels value shape: {other:?}"),
+        },
+        other => panic!("unexpected channels wrapper: {other:?}"),
+    };
+    assert!(
+        names.contains(&"test:ordinary".into()),
+        "channel list must still enumerate the user source — got {names:?}"
+    );
+    assert!(
+        names.contains(&"server".into()),
+        "the colliding record is still hosted and must still be listed — \
+         pvxs unions Source::onList() over every source and ServerSource \
+         contributes none — got {names:?}"
+    );
+
+    // 2. The record is shadowed for GET, because the diagnostic source
+    //    claimed the channel and installs only onRPC
+    //    (`serversource.cpp:36-95`) — there is no GET surface behind it.
+    let got = tokio::time::timeout(Duration::from_secs(5), client.pvget("server"))
+        .await
+        .expect("GET server timed out");
+    match got {
+        Err(e) => {
+            let _ = e;
+        }
+        Ok(v) => {
+            let read = f64::from_pv_field(&v).ok();
+            assert_ne!(
+                read,
+                Some(sentinel),
+                "the diagnostic source must claim the `server` channel; a GET \
+                 that reaches the colliding record means the user source was \
+                 consulted first and `pvxlist` is one step from dead: {v:?}"
             );
         }
-        other => panic!(
-            "expected the built-in info structure to shadow the user 'server' PV, got {other:?}"
-        ),
     }
+
+    // 3. Every other name still falls through to the user source, so the
+    //    band change costs the application nothing else.
+    let resp = tokio::time::timeout(Duration::from_secs(5), client.pvget("test:ordinary"))
+        .await
+        .expect("GET test:ordinary timed out")
+        .expect("a non-colliding user PV must still answer GET");
+    assert_eq!(
+        f64::from_pv_field(&resp).expect("user PV value"),
+        ordinary_value,
+        "non-colliding user PVs must be unaffected: {resp:?}"
+    );
 
     drop(server);
 }

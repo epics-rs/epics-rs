@@ -5,7 +5,11 @@
 
 use std::fmt::Write as _;
 
-use crate::pvdata::{FieldDesc, PvField, PvStructure, ScalarType, ScalarValue, TypedScalarArray};
+use epics_base_rs::server::records::printf::format_g;
+
+use crate::pvdata::{
+    FieldDesc, PvField, PvStructure, ScalarType, ScalarValue, TypedScalarArray, VariantValue,
+};
 
 // ─── pvinfo formatting (type descriptor) ────────────────────────────────────
 
@@ -178,35 +182,7 @@ fn write_raw_field(out: &mut String, name: &str, desc: &FieldDesc, value: &PvFie
     let indent = "    ".repeat(depth);
     match (desc, value) {
         (FieldDesc::Structure { struct_id, fields }, PvField::Structure(s)) => {
-            let id = if struct_id.is_empty() {
-                "structure"
-            } else {
-                struct_id
-            };
-            if struct_id == "time_t" {
-                // EPICS Base raw formatter: `id ' ' name ' '` then
-                // `printTimeTx` then `'\n'` (printer.cpp:368,372-374,379).
-                // The block carries the `setw(24)` padding and the
-                // trailing space(s) Base streams, so the line ends with
-                // them as Base's does.
-                let ts_block = format_time_tx(Some(s));
-                let _ = writeln!(out, "{indent}{id} {name} {ts_block}");
-            } else if struct_id == "enum_t" {
-                let summary = format_enum_summary(s);
-                let _ = writeln!(out, "{indent}{id} {name} {summary}");
-            } else if struct_id == "alarm_t" {
-                // EPICS Base raw formatter appends the one-line alarm
-                // summary on the `alarm_t` structure line (printer.cpp:368-372).
-                let summary = format_alarm_summary(s);
-                let _ = writeln!(out, "{indent}{id} {name} {summary}");
-            } else {
-                let _ = writeln!(out, "{indent}{id} {name}");
-            }
-            for (n, child_desc) in fields {
-                if let Some(child_val) = s.get_field(n) {
-                    write_raw_field(out, n, child_desc, child_val, depth + 1);
-                }
-            }
+            write_raw_structure(out, struct_id, name, fields, s, depth);
         }
         (FieldDesc::StructureArray { struct_id, fields }, PvField::StructureArray(items)) => {
             let id = if struct_id.is_empty() {
@@ -216,38 +192,189 @@ fn write_raw_field(out: &mut String, name: &str, desc: &FieldDesc, value: &PvFie
             };
             let _ = writeln!(out, "{indent}{id}[] {name}");
             for s in items {
-                // a `None` element is a null (absent) element.
-                let Some(s) = s else {
-                    let _ = writeln!(out, "{indent}    (null)");
-                    continue;
-                };
-                let _ = writeln!(out, "{indent}    {id} ");
-                for (n, child_desc) in fields {
-                    if let Some(child_val) = s.get_field(n) {
-                        write_raw_field(out, n, child_desc, child_val, depth + 2);
+                match s {
+                    // Base `PVStructureArray::dumpValue`
+                    // (PVStructureArray.cpp:230-239) hands each present
+                    // element to the element's own
+                    // `PVStructure::dumpValue` — the same writer a named
+                    // structure field goes through, only with no field
+                    // name — and prints `(none)` for an absent one. The
+                    // element header was spelled out a second time here,
+                    // which is how it drifted to `(null)`.
+                    Some(s) => write_raw_structure(out, struct_id, "", fields, s, depth + 1),
+                    None => {
+                        let _ = writeln!(out, "{indent}    (none)");
                     }
                 }
             }
         }
         (
-            FieldDesc::Union { .. },
+            FieldDesc::Union {
+                struct_id,
+                variants,
+            },
             PvField::Union {
+                selector,
                 variant_name,
                 value,
-                ..
             },
         ) => {
-            // Show selected variant on the same line as `union`.
-            let _ = writeln!(
-                out,
-                "{indent}union {name}\n{indent}    {} {variant_name} {}",
-                value_type_name(value),
-                format_value_inline(value),
-            );
+            let id = if struct_id.is_empty() {
+                "union"
+            } else {
+                struct_id
+            };
+            let _ = writeln!(out, "{indent}{id} {name}");
+            write_raw_union_member(out, variants, *selector, variant_name, value, depth + 1);
+        }
+        (
+            FieldDesc::UnionArray {
+                struct_id,
+                variants,
+            },
+            PvField::UnionArray(items),
+        ) => {
+            let id = if struct_id.is_empty() {
+                "union"
+            } else {
+                struct_id
+            };
+            let _ = writeln!(out, "{indent}{id}[] {name}");
+            for it in items {
+                match it {
+                    Some(it) => write_raw_union_member(
+                        out,
+                        variants,
+                        it.selector,
+                        &it.variant_name,
+                        &it.value,
+                        depth + 1,
+                    ),
+                    None => {
+                        let _ = writeln!(out, "{indent}    (none)");
+                    }
+                }
+            }
+        }
+        (FieldDesc::Variant, PvField::Variant(v)) => {
+            let _ = writeln!(out, "{indent}any {name}");
+            write_raw_variant_member(out, v, depth + 1);
+        }
+        (FieldDesc::VariantArray, PvField::VariantArray(items)) => {
+            let _ = writeln!(out, "{indent}any[] {name}");
+            for it in items {
+                match it {
+                    Some(v) => write_raw_variant_member(out, v, depth + 1),
+                    None => {
+                        let _ = writeln!(out, "{indent}    (none)");
+                    }
+                }
+            }
         }
         _ => {
             let tn = type_name(desc);
             let _ = writeln!(out, "{indent}{tn} {name} {}", format_value_inline(value));
+        }
+    }
+}
+
+/// A structure as EPICS Base `PVStructure::dumpValue` prints it: the
+/// header `id fieldName` — with the `time_t` / `enum_t` / `alarm_t`
+/// one-line summaries Base appends (printer.cpp:368-379) — then every
+/// field of the descriptor that the value carries. The one owner for
+/// both a named structure field and an element of a structure array,
+/// which has the same shape with an empty field name.
+fn write_raw_structure(
+    out: &mut String,
+    struct_id: &str,
+    name: &str,
+    fields: &[(String, FieldDesc)],
+    s: &PvStructure,
+    depth: usize,
+) {
+    let indent = "    ".repeat(depth);
+    let id = if struct_id.is_empty() {
+        "structure"
+    } else {
+        struct_id
+    };
+    if struct_id == "time_t" {
+        // EPICS Base raw formatter: `id ' ' name ' '` then
+        // `printTimeTx` then `'\n'` (printer.cpp:368,372-374,379).
+        // The block carries the `setw(24)` padding and the trailing
+        // space(s) Base streams, so the line ends with them as Base's
+        // does.
+        let ts_block = format_time_tx(Some(s));
+        let _ = writeln!(out, "{indent}{id} {name} {ts_block}");
+    } else if struct_id == "enum_t" {
+        let summary = format_enum_summary(s);
+        let _ = writeln!(out, "{indent}{id} {name} {summary}");
+    } else if struct_id == "alarm_t" {
+        // EPICS Base raw formatter appends the one-line alarm summary on
+        // the `alarm_t` structure line (printer.cpp:368-372).
+        let summary = format_alarm_summary(s);
+        let _ = writeln!(out, "{indent}{id} {name} {summary}");
+    } else {
+        let _ = writeln!(out, "{indent}{id} {name}");
+    }
+    for (n, child_desc) in fields {
+        if let Some(child_val) = s.get_field(n) {
+            write_raw_field(out, n, child_desc, child_val, depth + 1);
+        }
+    }
+}
+
+/// One union member as EPICS Base `PVUnion::dumpValue` prints it
+/// (PVUnion.cpp:181-195): `(none)` when no variant is selected, otherwise
+/// the selected member through ITS OWN dump one level deeper — so a
+/// scalar member is the single line `type memberName value` and a
+/// structure member prints every one of its fields.
+///
+/// Rendering the member with [`format_value_inline`] instead sent it to
+/// the [`PvField`] `Display`, a diagnostic that collapses a structure to
+/// its `value` subfield and drops every sibling
+/// (`pvdata/structure.rs:440-452`). A diagnostic shortcut is not a
+/// wire-output renderer, so the raw writer recurses into itself here.
+fn write_raw_union_member(
+    out: &mut String,
+    variants: &[(String, FieldDesc)],
+    selector: i32,
+    variant_name: &str,
+    value: &PvField,
+    depth: usize,
+) {
+    let member = if selector < 0 {
+        None
+    } else {
+        variants
+            .iter()
+            .find(|(n, _)| n == variant_name)
+            .map(|(_, d)| d.clone())
+            // A value always knows its own shape even when the union
+            // descriptor and the value disagree about the member name.
+            .or_else(|| value.wire_descriptor())
+    };
+    match member {
+        Some(d) => write_raw_field(out, variant_name, &d, value, depth),
+        None => {
+            let _ = writeln!(out, "{}(none)", "    ".repeat(depth));
+        }
+    }
+}
+
+/// The `any` counterpart of [`write_raw_union_member`]: a variant union
+/// stores its member with no field name, so the member line carries the
+/// type and the value with an empty name between them, exactly as Base
+/// streams `getID() << ' ' << getFieldName() << ' ' << value`.
+fn write_raw_variant_member(out: &mut String, v: &VariantValue, depth: usize) {
+    let desc = match v.value {
+        PvField::Null => None,
+        _ => v.desc.clone().or_else(|| v.value.wire_descriptor()),
+    };
+    match desc {
+        Some(d) => write_raw_field(out, "", &d, &v.value, depth),
+        None => {
+            let _ = writeln!(out, "{}(none)", "    ".repeat(depth));
         }
     }
 }
@@ -381,72 +508,10 @@ fn nt_scalar_value_str(v: &PvField) -> String {
     }
 }
 
-/// `%g`-equivalent formatter (precision = significant digits). Mirrors
-/// C `printf("%.*g", precision, x)` semantics: shortest of `%f`/`%e`,
-/// trailing zeros stripped, signed two-digit-min exponent.
-fn format_g(x: f64, precision: usize) -> String {
-    if x == 0.0 {
-        return "0".to_string();
-    }
-    if !x.is_finite() {
-        return format!("{x}");
-    }
-    let abs = x.abs();
-    let exp = abs.log10().floor() as i32;
-    if exp >= -4 && exp < precision as i32 {
-        let digits = (precision as i32 - 1 - exp).max(0) as usize;
-        let s = format!("{x:.digits$}");
-        if !s.contains('.') {
-            return s;
-        }
-        s.trim_end_matches('0').trim_end_matches('.').to_string()
-    } else {
-        let s = format!("{:.*e}", precision - 1, x);
-        rewrite_e(&s, true)
-    }
-}
-
-fn rewrite_e(s: &str, trim_mantissa: bool) -> String {
-    let Some(e_pos) = s.find('e') else {
-        return s.to_string();
-    };
-    let mantissa = &s[..e_pos];
-    let exp_part = &s[e_pos + 1..];
-    let mantissa_out = if trim_mantissa && mantissa.contains('.') {
-        mantissa
-            .trim_end_matches('0')
-            .trim_end_matches('.')
-            .to_string()
-    } else {
-        mantissa.to_string()
-    };
-    let (sign, digits) = if let Some(d) = exp_part.strip_prefix('-') {
-        ('-', d)
-    } else if let Some(d) = exp_part.strip_prefix('+') {
-        ('+', d)
-    } else {
-        ('+', exp_part)
-    };
-    let exp_padded = if digits.len() < 2 {
-        format!("{sign}0{digits}")
-    } else {
-        format!("{sign}{digits}")
-    };
-    format!("{mantissa_out}e{exp_padded}")
-}
-
 fn format_nt_enum(pv_name: &str, s: &PvStructure) -> String {
     let ts_block = top_time_tx(s);
     let (idx, choice) = match s.get_field("value") {
-        Some(PvField::Structure(es)) => {
-            let i = es
-                .get_field("index")
-                .map(format_value_inline)
-                .unwrap_or_else(|| "0".to_string());
-            let n: usize = i.parse().unwrap_or(0);
-            let choice = enum_choice_for_index(es.get_field("choices"), n);
-            (i, choice)
-        }
+        Some(PvField::Structure(es)) => enum_index_and_choice(es),
         _ => ("0".to_string(), String::new()),
     };
     // EPICS Base NTEnum order is `<timeStamp> <alarm> (index) choice`
@@ -740,34 +805,73 @@ fn structure_to_json(s: &PvStructure) -> String {
 fn scalar_to_json(v: &ScalarValue) -> String {
     match v {
         ScalarValue::String(s) => json_string(&s.as_str_lossy()),
-        ScalarValue::Float(f) => {
-            if f.fract() == 0.0 {
-                format!("{f:.1}")
-            } else {
-                format!("{f}")
-            }
-        }
-        ScalarValue::Double(f) => {
-            if f.fract() == 0.0 {
-                format!("{f:.1}")
-            } else {
-                format!("{f}")
-            }
-        }
+        ScalarValue::Float(f) => json_double(*f as f64),
+        ScalarValue::Double(f) => json_double(*f),
         other => format!("{other}"),
+    }
+}
+
+/// A double as C `yajl_gen_double` writes it (libCom yajl_gen.c:222-247),
+/// which is the generator every EPICS JSON writer goes through:
+///
+/// ```c
+/// if (isnan(number)) strcpy(i, "NaN");
+/// else if (isinf(number)) sprintf(i, "%cInfinity", number < 0 ? '-' : '+');
+/// else { sprintf(i, "%.17g", number);
+///        if (strspn(i, "0123456789-") == strlen(i)) strcat(i, ".0"); }
+/// ```
+///
+/// The sign character on `Infinity` is explicit and `+Infinity` is the
+/// only spelling a JSON5 reader accepts; Rust's `{}` writes `inf`, which
+/// no JSON or JSON5 parser reads back. `%.17g` is also not the shortest
+/// round-trip form Rust prints, and the `.0` suffix belongs only on a
+/// rendering that is nothing but digits and `-`, so it must not be
+/// appended to `1e+30`.
+fn json_double(x: f64) -> String {
+    if x.is_nan() {
+        return "NaN".to_string();
+    }
+    if x.is_infinite() {
+        return if x < 0.0 { "-Infinity" } else { "+Infinity" }.to_string();
+    }
+    let s = format_g(x, 17);
+    if s.bytes().all(|b| b.is_ascii_digit() || b == b'-') {
+        format!("{s}.0")
+    } else {
+        s
     }
 }
 
 // ─── Helpers ────────────────────────────────────────────────────────────────
 
 fn format_enum_summary(s: &PvStructure) -> String {
-    let idx = s
+    let (idx, choice) = enum_index_and_choice(s);
+    format!("({idx}) {choice}")
+}
+
+/// The index text and choice text of an `enum_t`, the one owner of both
+/// halves for the NT line ([`format_nt_enum`]) and the raw structure line
+/// ([`format_enum_summary`]).
+///
+/// EPICS Base `printEnumT` (pvData printer.cpp:168-175) reads the index
+/// with `getAs<uint32>`, which REINTERPRETS a negative int32 rather than
+/// clamping it: index -1 is 4294967295, out of range for any `choices`
+/// array, so Base prints `(4294967295) <undefined>`. The printed number
+/// and the array subscript are the same uint32, which is why they are
+/// produced together here — parsing the rendered text into `usize` and
+/// falling back to 0 printed choice 0, naming a state the PV is not in.
+fn enum_index_and_choice(s: &PvStructure) -> (String, String) {
+    let raw = s
         .get_field("index")
         .map(format_value_inline)
         .unwrap_or_else(|| "0".to_string());
-    let n: usize = idx.parse().unwrap_or(0);
-    let choice = enum_choice_for_index(s.get_field("choices"), n);
-    format!("({idx}) {choice}")
+    // An index that is not an integer at all cannot name a choice, so it
+    // takes the same path as a negative one.
+    let n = raw.parse::<i64>().unwrap_or(-1) as u32;
+    (
+        n.to_string(),
+        enum_choice_for_index(s.get_field("choices"), n as usize),
+    )
 }
 
 /// Extract the NTEnum choice text for `index` from a `choices` field that
@@ -1066,14 +1170,17 @@ fn maybe_quote(s: &[u8]) -> String {
     }
 }
 
-/// Byte-wise escape mirroring EPICS Base's default `escape` style
-/// (`style_t::C`, pvData printer.cpp:485-516): named backslash escapes
-/// for `\a \b \f \n \r \t \v`, `\\`, `\'`, and `\"`; any other
-/// non-printable byte as `\xHH`; printable ASCII verbatim. Byte-wise to
-/// match Base's `isprint((unsigned char)C)`, so a non-ASCII UTF-8 byte
-/// becomes `\xHH`. Base's `hexdigit` off-by-one (nibble 9 → `@`) is not
-/// reproduced; correct `{:02X}` hex is emitted.
-fn escape_display(s: &[u8]) -> String {
+/// Byte-wise escape body shared by the two references this formatter
+/// serves. They agree on every escape — named backslash escapes for
+/// `\a \b \f \n \r \t \v`, `\\`, `\'`, `\"`, any other non-printable
+/// byte as `\xHH`, printable ASCII verbatim — and on the printable test
+/// (Base `isprint((unsigned char)C)`, pvxs `c>=' ' && c<='~'`), so a
+/// non-ASCII UTF-8 byte becomes `\xHH` under both. They disagree on one
+/// thing only, the case of the hex digits, which is why this takes
+/// `hex_upper` rather than being two copies. Call it through
+/// [`escape_display`] or [`escape_pvxs`], never directly, so each call
+/// site names the reference it is reproducing.
+fn escape_bytes(s: &[u8], hex_upper: bool) -> String {
     let mut out = String::with_capacity(s.len());
     for &b in s {
         match b {
@@ -1088,27 +1195,34 @@ fn escape_display(s: &[u8]) -> String {
             b'\'' => out.push_str("\\'"),
             b'"' => out.push_str("\\\""),
             0x20..=0x7e => out.push(b as char),
-            other => {
+            other if hex_upper => {
                 let _ = write!(out, "\\x{other:02X}");
+            }
+            other => {
+                let _ = write!(out, "\\x{other:02x}");
             }
         }
     }
     out
 }
 
-fn value_type_name(v: &PvField) -> &'static str {
-    match v {
-        PvField::Scalar(sv) => scalar_type_name(sv.scalar_type()),
-        PvField::ScalarArray(_) => "array",
-        PvField::ScalarArrayTyped(_) => "array",
-        PvField::Structure(_) => "structure",
-        PvField::StructureArray(_) => "structure[]",
-        PvField::Union { .. } => "union",
-        PvField::UnionArray(_) => "union[]",
-        PvField::Variant(_) => "any",
-        PvField::VariantArray(_) => "any[]",
-        PvField::Null => "null",
-    }
+/// EPICS Base's default `escape` style (`style_t::C`, pvData
+/// printer.cpp:485-516), whose `hexdigit` (printer.cpp:467-473) is
+/// uppercase. That `hexdigit` also carries an off-by-one mapping a nibble
+/// of 9 to `@` (CBUG-H2 in doc/upstream-c-bugs.md); this does not
+/// reproduce it and emits correct hex.
+fn escape_display(s: &[u8]) -> String {
+    escape_bytes(s, true)
+}
+
+/// pvxs's `Escaper` (src/util.cpp:230-235), which writes
+/// `"\\x" << std::hex << setw(2) << setfill('0')` with no
+/// `std::uppercase`, so its hex digits are lowercase. Every printer on
+/// the `datafmt.cpp` path goes through it (`escape(...)` at
+/// datafmt.cpp:27, 38, 153), so the `-F tree` and Delta printers here
+/// must too.
+fn escape_pvxs(s: &[u8]) -> String {
+    escape_bytes(s, false)
 }
 
 // ─── pvxs `Value::format()` — Tree / Delta output (datafmt.cpp) ──────────────
@@ -1316,7 +1430,7 @@ fn pvxs_array(items: &[ScalarValue], limit: usize) -> String {
 fn pvxs_array_elem(v: &ScalarValue) -> String {
     match v {
         ScalarValue::Boolean(b) => (if *b { "1" } else { "0" }).to_string(),
-        ScalarValue::String(s) => format!("\"{}\"", escape_display(s.as_bytes())),
+        ScalarValue::String(s) => format!("\"{}\"", escape_pvxs(s.as_bytes())),
         ScalarValue::Float(f) => format_g(*f as f64, 6),
         ScalarValue::Double(f) => format_g(*f, 6),
         // signed / unsigned integer types print as decimal via Display.
@@ -1391,7 +1505,7 @@ fn tree_show_value(out: &mut String, value: &PvField, fmt: &ValueFmt) {
             ScalarValue::Float(f) => out.push_str(&format_g(*f as f64, 6)),
             ScalarValue::Double(f) => out.push_str(&format_g(*f, 6)),
             ScalarValue::String(s) => {
-                let _ = write!(out, "\"{}\"", escape_display(s.as_bytes()));
+                let _ = write!(out, "\"{}\"", escape_pvxs(s.as_bytes()));
             }
             other => {
                 let _ = write!(out, "{other}");
@@ -1626,7 +1740,7 @@ fn delta_field(
     if let FieldDesc::Structure { struct_id, .. } = desc {
         if !struct_id.is_empty() {
             // Delta escapes the id (datafmt.cpp:27: `escape(val.id())`).
-            let _ = write!(out, " \"{}\"", escape_display(struct_id.as_bytes()));
+            let _ = write!(out, " \"{}\"", escape_pvxs(struct_id.as_bytes()));
         }
     }
     if fmt.show_value {
@@ -1635,6 +1749,20 @@ fn delta_field(
     out.push('\n');
 
     // datafmt.cpp:53-97: recurse into union/any (`->`) and arrays-of-value.
+    //
+    // `marked` holds ROOT-relative dotted paths and a union, an any and a
+    // value-array are each a LEAF in it
+    // (`client_native::ops_v2::changed_bitset_to_marked_paths`), so this
+    // recursion has already crossed out of its key space: the paths built
+    // below — `attribute[0].name`, `value->sub.x` — are not spellings that
+    // set ever contains, and looking them up in it silently drops every
+    // field of the element. pvxs does no lookup at all here: the nested
+    // Value carries its OWN valid bits, and encoding a struct into a
+    // StructureArray sets them for every non-struct descendant
+    // (dataencode.cpp:460-471), so `top()` iterating `val.imarked()` sees
+    // the whole element marked. `nested` is that state, and it is what
+    // every one of these re-entries passes instead of the caller's set.
+    let nested: Option<&std::collections::HashSet<String>> = None;
     match desc {
         FieldDesc::Union { variants, .. } => {
             let mut cprefix = String::from(prefix);
@@ -1655,7 +1783,7 @@ fn delta_field(
                 }
                 _ => (FieldDesc::Variant, None),
             };
-            delta_top(out, &cprefix, &cdesc, cval, false, fmt, marked, base_depth);
+            delta_top(out, &cprefix, &cdesc, cval, false, fmt, nested, base_depth);
         }
         FieldDesc::Variant => {
             let mut cprefix = String::from(prefix);
@@ -1670,7 +1798,7 @@ fn delta_field(
                         Some(&v.value),
                         false,
                         fmt,
-                        marked,
+                        nested,
                         base_depth,
                     );
                 }
@@ -1681,7 +1809,7 @@ fn delta_field(
                     None,
                     false,
                     fmt,
-                    marked,
+                    nested,
                     base_depth,
                 ),
             }
@@ -1698,7 +1826,7 @@ fn delta_field(
                     eval.as_ref(),
                     false,
                     fmt,
-                    marked,
+                    nested,
                     base_depth,
                 );
             }
@@ -1724,7 +1852,7 @@ fn delta_show_value(out: &mut String, value: Option<&PvField>, fmt: &ValueFmt) {
                 let _ = write!(out, " = {}", if *b { "true" } else { "false" });
             }
             ScalarValue::String(s) => {
-                let _ = write!(out, " = \"{}\"", escape_display(s.as_bytes()));
+                let _ = write!(out, " = \"{}\"", escape_pvxs(s.as_bytes()));
             }
             other => {
                 let _ = write!(out, " = {other}");
@@ -1861,6 +1989,180 @@ fn array_elements(desc: &FieldDesc, value: Option<&PvField>) -> Vec<(FieldDesc, 
 mod tests {
     use super::*;
     use crate::pvdata::VariantValue;
+
+    /// C `%g` rounds to `precision` significant digits BEFORE deciding
+    /// between fixed and scientific notation (C99 7.19.6.1p8 takes the
+    /// decision exponent X from the style-`e` conversion, which rounds).
+    /// Reading `log10` off the raw value misses the carry into the next
+    /// decade, so `pvget`/`pvmonitor`/`pvinfo` printed `1000000` where
+    /// `caget`, `pvxs` and C `printf("%.6g")` all print `1e+06`.
+    #[test]
+    fn g_style_comes_from_the_rounded_exponent() {
+        // Carry at the top: 999999.5 rounds to 1000000, exponent 5 -> 6,
+        // which is no longer < 6, so the style flips to scientific.
+        let big = PvField::Scalar(ScalarValue::Double(999999.5));
+        assert_eq!(format_value_inline(&big), "1e+06");
+        assert_eq!(nt_scalar_value_str(&big), "1e+06");
+        assert_eq!(scalar_cell_text(&ScalarValue::Double(999999.5)), "1e+06");
+        assert_eq!(
+            format_value_inline(&PvField::Scalar(ScalarValue::Float(-999999.5))),
+            "-1e+06"
+        );
+
+        // Carry at the bottom: 9.9999995e-05 rounds to 0.0001, exponent
+        // -5 -> -4, which is no longer < -4, so the style flips to fixed.
+        let small = PvField::Scalar(ScalarValue::Double(9.9999995e-05));
+        assert_eq!(format_value_inline(&small), "0.0001");
+        assert_eq!(
+            scalar_cell_text(&ScalarValue::Double(9.9999995e-05)),
+            "0.0001"
+        );
+
+        // Values that do not round across a decade are unaffected.
+        assert_eq!(
+            format_value_inline(&PvField::Scalar(ScalarValue::Double(999998.0))),
+            "999998"
+        );
+        assert_eq!(
+            format_value_inline(&PvField::Scalar(ScalarValue::Double(1234567.0))),
+            "1.23457e+06"
+        );
+        assert_eq!(
+            format_value_inline(&PvField::Scalar(ScalarValue::Double(0.000123456))),
+            "0.000123456"
+        );
+    }
+
+    /// An absent structure-array element prints `(none)`, the spelling
+    /// EPICS Base `PVStructureArray::dumpValue` uses
+    /// (PVStructureArray.cpp:230-239); `(null)` is the `PvField`
+    /// diagnostic Display's word and had been copied into the output
+    /// path. The present element goes through the same writer a named
+    /// structure field uses, with an empty field name, so its header
+    /// stays `id ` and its fields keep their own indent.
+    #[test]
+    fn raw_absent_structure_array_element_is_none() {
+        let desc = FieldDesc::Structure {
+            struct_id: "epics:nt/NTNDArray:1.0".into(),
+            fields: vec![(
+                "attribute".into(),
+                FieldDesc::StructureArray {
+                    struct_id: "epics:nt/NTAttribute:1.0".into(),
+                    fields: vec![("name".into(), FieldDesc::Scalar(ScalarType::String))],
+                },
+            )],
+        };
+        let mut elem = PvStructure::new("epics:nt/NTAttribute:1.0");
+        elem.set(
+            "name",
+            PvField::Scalar(ScalarValue::String("ColorMode".into())),
+        );
+        let mut top = PvStructure::new("epics:nt/NTNDArray:1.0");
+        top.set("attribute", PvField::StructureArray(vec![Some(elem), None]));
+
+        let out = format_raw("X", &desc, &PvField::Structure(top));
+        assert!(
+            out.contains("    epics:nt/NTAttribute:1.0[] attribute\n"),
+            "got: {out}"
+        );
+        assert!(
+            out.contains("        epics:nt/NTAttribute:1.0 \n            string name ColorMode\n"),
+            "got: {out}"
+        );
+        assert!(out.contains("        (none)\n"), "got: {out}");
+        assert!(!out.contains("(null)"), "got: {out}");
+    }
+
+    /// `-M raw` must render a union member through the raw writer, not
+    /// through the `PvField` `Display`: that Display is a diagnostic that
+    /// collapses a structure to its `value` subfield and drops every
+    /// sibling (pvdata/structure.rs:440-452), so a union selecting a
+    /// structure printed one number and lost the rest of the member.
+    /// Base `PVUnion::dumpValue` (PVUnion.cpp:181-195) prints the union
+    /// id and field name, then the selection through its own dump one
+    /// level deeper, and `(none)` when no variant is selected.
+    #[test]
+    fn raw_union_member_prints_every_field_of_a_structure_selection() {
+        let member = FieldDesc::Structure {
+            struct_id: "epics:nt/NTAttribute:1.0".into(),
+            fields: vec![
+                ("value".into(), FieldDesc::Scalar(ScalarType::Double)),
+                ("name".into(), FieldDesc::Scalar(ScalarType::String)),
+            ],
+        };
+        let desc = FieldDesc::Structure {
+            struct_id: "epics:nt/NTNDArray:1.0".into(),
+            fields: vec![(
+                "u".into(),
+                FieldDesc::Union {
+                    struct_id: String::new(),
+                    variants: vec![("s".into(), member)],
+                },
+            )],
+        };
+        let mut inner = PvStructure::new("epics:nt/NTAttribute:1.0");
+        inner.set("value", PvField::Scalar(ScalarValue::Double(1.5)));
+        inner.set(
+            "name",
+            PvField::Scalar(ScalarValue::String("ColorMode".into())),
+        );
+        let mut top = PvStructure::new("epics:nt/NTNDArray:1.0");
+        top.set(
+            "u",
+            PvField::Union {
+                selector: 0,
+                variant_name: "s".into(),
+                value: Box::new(PvField::Structure(inner)),
+            },
+        );
+
+        let out = format_raw("X", &desc, &PvField::Structure(top.clone()));
+        assert!(out.contains("    union u\n"), "got: {out}");
+        assert!(
+            out.contains("        epics:nt/NTAttribute:1.0 s\n"),
+            "got: {out}"
+        );
+        assert!(out.contains("            double value 1.5\n"), "got: {out}");
+        assert!(
+            out.contains("            string name ColorMode\n"),
+            "got: {out}"
+        );
+
+        // No variant selected: `(none)`, not the Display's `null`.
+        top.set(
+            "u",
+            PvField::Union {
+                selector: -1,
+                variant_name: String::new(),
+                value: Box::new(PvField::Null),
+            },
+        );
+        let out = format_raw("X", &desc, &PvField::Structure(top));
+        assert!(out.contains("    union u\n        (none)\n"), "got: {out}");
+    }
+
+    /// The `any` half of the same delegation: a variant union stores its
+    /// member with no field name, so the member line carries the type and
+    /// the value with an empty name between them, and an empty `any` is
+    /// `(none)`.
+    #[test]
+    fn raw_any_member_prints_through_the_raw_writer() {
+        let desc = FieldDesc::Structure {
+            struct_id: String::new(),
+            fields: vec![("p".into(), FieldDesc::Variant)],
+        };
+        let mut top = PvStructure::new("");
+        top.set(
+            "p",
+            PvField::Variant(Box::new(VariantValue::scalar(ScalarValue::Int(5)))),
+        );
+        let out = format_raw("X", &desc, &PvField::Structure(top.clone()));
+        assert!(out.contains("    any p\n        int  5\n"), "got: {out}");
+
+        top.set("p", PvField::Variant(Box::new(VariantValue::null())));
+        let out = format_raw("X", &desc, &PvField::Structure(top));
+        assert!(out.contains("    any p\n        (none)\n"), "got: {out}");
+    }
 
     /// pvxs#46 residue: the Tree inline branch (`any` / `any[]` /
     /// valued `union`) must emit the member name before the union
@@ -2138,6 +2440,33 @@ mod tests {
 
     /// Extract the JSON payload from a `format_json("X", ..)` line:
     /// `"X <json>\n"` → `<json>`.
+    /// `-M json` numbers must read back: C `yajl_gen_double`
+    /// (yajl_gen.c:222-247) writes `NaN` and a sign-bearing
+    /// `+Infinity`/`-Infinity`, and otherwise `%.17g` with `.0` appended
+    /// only when the text is nothing but digits and `-`. The port wrote
+    /// Rust's `{}`, so a non-finite came out as `inf` — a token no JSON
+    /// or JSON5 parser accepts — and a finite one came out in the
+    /// shortest round-trip form, or fully expanded to hundreds of digits
+    /// when `fract() == 0`.
+    #[test]
+    fn json_doubles_follow_yajl_gen_double() {
+        let j = |v: f64| scalar_to_json(&ScalarValue::Double(v));
+        assert_eq!(j(f64::INFINITY), "+Infinity");
+        assert_eq!(j(f64::NEG_INFINITY), "-Infinity");
+        assert_eq!(j(f64::NAN), "NaN");
+        // %.17g, not the shortest round-trip form.
+        assert_eq!(j(0.1), "0.10000000000000001");
+        // `.0` only when the text is digits and `-` alone...
+        assert_eq!(j(1.0), "1.0");
+        assert_eq!(j(-2.0), "-2.0");
+        assert_eq!(j(-0.0), "-0.0");
+        // ...so an exponent form keeps its own shape, and a whole double
+        // of that magnitude is no longer expanded to 31 digits.
+        assert_eq!(j(1e30), "1e+30");
+        // A float widens to double first, as the C generator's argument does.
+        assert_eq!(scalar_to_json(&ScalarValue::Float(1.5)), "1.5");
+    }
+
     fn json_payload(out: &str) -> &str {
         out.strip_prefix("X ")
             .and_then(|s| s.strip_suffix('\n'))
@@ -2323,7 +2652,8 @@ mod tests {
         assert_eq!(maybe_quote(b"a\\b"), "\"a\\\\b\"");
         assert_eq!(maybe_quote(b"a'b"), "\"a\\'b\"");
         assert_eq!(maybe_quote(b"\x01"), "\"\\x01\"");
-        // a raw non-UTF-8 byte (0xFF) → quoted "\xFF" (pvxs byte-wise).
+        // a raw non-UTF-8 byte (0xFF) → quoted "\xFF"; Base `hexdigit` is
+        // uppercase, so this path stays uppercase (see `escape_pvxs`).
         assert_eq!(maybe_quote(b"\xff"), "\"\\xFF\"");
     }
 
@@ -2402,6 +2732,36 @@ mod tests {
             ]),
         );
         assert_eq!(format_enum_summary(&e), "(5) <undefined>");
+    }
+
+    /// EPICS Base `printEnumT` reads the index with `getAs<uint32>`
+    /// (pvData printer.cpp:168-175), so a negative index reinterprets
+    /// instead of clamping and lands out of range: -1 prints
+    /// `(4294967295) <undefined>`. The port parsed the rendered text into
+    /// `usize` and fell back to 0 on failure, so `pvget`/`pvmonitor`
+    /// reported the FIRST choice for an NTEnum whose index is negative —
+    /// naming a state the device is not in.
+    #[test]
+    fn nt_enum_negative_index_is_undefined_not_the_first_choice() {
+        let mut e = PvStructure::new("enum_t");
+        e.set("index", PvField::Scalar(ScalarValue::Int(-1)));
+        e.set(
+            "choices",
+            PvField::ScalarArray(vec![
+                ScalarValue::String("off".into()),
+                ScalarValue::String("on".into()),
+            ]),
+        );
+        assert_eq!(format_enum_summary(&e), "(4294967295) <undefined>");
+
+        // The NT line is the second reader of the same rule.
+        let mut nt = PvStructure::new("epics:nt/NTEnum:1.0");
+        nt.set("value", PvField::Structure(e));
+        assert!(
+            format_nt_enum("X", &nt).contains("(4294967295) <undefined>"),
+            "got: {:?}",
+            format_nt_enum("X", &nt)
+        );
     }
 
     /// A raw double scalar prints with six significant digits, matching
@@ -2632,6 +2992,49 @@ mod tests {
         );
     }
 
+    /// pvxs escapes through `Escaper` (src/util.cpp:230-235), whose
+    /// `std::hex` carries no `std::uppercase`, so every printer on the
+    /// `datafmt.cpp` path emits lowercase `\xhh`. Base's `hexdigit`
+    /// (pvData printer.cpp:467-473) is uppercase, and that is what
+    /// `maybeQuote` uses. One escape helper served both references, so
+    /// `-F tree` and `-F delta` printed Base's case where pvxget prints
+    /// pvxs's.
+    #[test]
+    fn datafmt_hex_escapes_are_lowercase_like_pvxs() {
+        let desc = FieldDesc::Structure {
+            struct_id: String::new(),
+            fields: vec![("value".into(), FieldDesc::Scalar(ScalarType::String))],
+        };
+        let mut s = PvStructure::new("");
+        s.set(
+            "value",
+            PvField::Scalar(ScalarValue::String("\u{e9}\u{19}".into())),
+        );
+        let val = PvField::Structure(s);
+
+        let t = tree(&desc, Some(&val), true);
+        assert!(t.contains("string value = \"\\xc3\\xa9\\x19\""), "{t}");
+
+        let d = format_value(
+            &desc,
+            Some(&val),
+            &ValueFmt {
+                format: ValueFormat::Delta,
+                array_limit: 0,
+                show_value: true,
+            },
+            None,
+            0,
+        );
+        assert!(d.contains("= \"\\xc3\\xa9\\x19\""), "{d}");
+
+        // The Base-referenced path keeps Base's uppercase hex.
+        assert_eq!(
+            maybe_quote("\u{e9}\u{19}".as_bytes()),
+            "\"\\xC3\\xA9\\x19\""
+        );
+    }
+
     /// pvget `-F delta`: flat dotted-path lines, `path type = value`, with
     /// every leaf shown when nothing restricts the marked set (a GET marks
     /// every field it returns). Mirrors datafmt.cpp FmtDelta.
@@ -2656,6 +3059,71 @@ mod tests {
              timeStamp.secondsPastEpoch int64_t = 0\n\
              timeStamp.nanoseconds int32_t = 0\n\
              timeStamp.userTag int32_t = 0\n"
+        );
+    }
+
+    /// A monitor's changed set holds ROOT-relative paths and a `structure[]`
+    /// is ONE leaf in it (`changed_bitset_to_marked_paths`), so the
+    /// recursion into an element must stop consulting it. pvxs prints the
+    /// element's fields because the element Value carries its own valid
+    /// bits, set for every non-struct descendant when a struct is encoded
+    /// into a StructureArray (dataencode.cpp:460-471). The port looked up
+    /// `name` / `value` in a set holding only `attribute`, every lookup
+    /// missed, and the element printed as an empty header line.
+    #[test]
+    fn pvxs_delta_marked_structure_array_prints_its_element_fields() {
+        let elem = vec![
+            ("name".to_string(), FieldDesc::Scalar(ScalarType::String)),
+            ("value".to_string(), FieldDesc::Scalar(ScalarType::Double)),
+        ];
+        let desc = FieldDesc::Structure {
+            struct_id: "epics:nt/NTNDArray:1.0".into(),
+            fields: vec![
+                ("value".into(), FieldDesc::Scalar(ScalarType::Double)),
+                (
+                    "attribute".into(),
+                    FieldDesc::StructureArray {
+                        struct_id: "epics:nt/NTAttribute:1.0".into(),
+                        fields: elem,
+                    },
+                ),
+            ],
+        };
+        let mut attr = PvStructure::new("epics:nt/NTAttribute:1.0");
+        attr.fields.push((
+            "name".into(),
+            PvField::Scalar(ScalarValue::String("ColorMode".into())),
+        ));
+        attr.fields
+            .push(("value".into(), PvField::Scalar(ScalarValue::Double(1.5))));
+        let mut root = PvStructure::new("epics:nt/NTNDArray:1.0");
+        root.fields
+            .push(("value".into(), PvField::Scalar(ScalarValue::Double(7.0))));
+        root.fields.push((
+            "attribute".into(),
+            PvField::StructureArray(vec![Some(attr)]),
+        ));
+
+        let mut marked = std::collections::HashSet::new();
+        marked.insert("attribute".to_string());
+        let out = format_value(
+            &desc,
+            Some(&PvField::Structure(root)),
+            &ValueFmt {
+                format: ValueFormat::Delta,
+                array_limit: 0,
+                show_value: true,
+            },
+            Some(&marked),
+            0,
+        );
+        assert_eq!(
+            out,
+            "struct \"epics:nt/NTNDArray:1.0\"\n\
+             attribute struct[]\n\
+             attribute[0] struct \"epics:nt/NTAttribute:1.0\"\n\
+             attribute[0].name string = \"ColorMode\"\n\
+             attribute[0].value double = 1.5\n"
         );
     }
 

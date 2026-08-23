@@ -9,8 +9,9 @@ use tokio::sync::mpsc;
 use tokio::sync::mpsc::error::TryRecvError;
 
 use crate::proto::{MessageType, Status};
-use crate::pvdata::{FieldDesc, PvField, RpcReply};
+use crate::pvdata::{FieldDesc, NoConvert, PvField, PvStructure, RpcReply, ScalarValue, convert};
 pub use epics_base_rs::server::access_security::{AccessChecked, AccessGate};
+pub use epics_base_rs::server::database::ProcessMode;
 
 /// One pvxs `RemoteLogger::logRemote()` diagnostic recorded by a source
 /// while serving an operation. The wire layer turns each into an
@@ -125,6 +126,173 @@ pub struct ChannelContext {
     pub log: RemoteLog,
 }
 
+/// The WRITE denial an access-gated source reports for a token that is
+/// not `ReadWrite` — one wording for every source, so a client sees the
+/// same refusal whichever one served its channel. Named here because
+/// sources that override [`ChannelSource::put_value_checked`] (to bracket
+/// the write, to route it upstream) still owe the same denial as the
+/// default arm above them.
+pub fn put_denied(checked: &AccessChecked, ctx: &ChannelContext) -> OpError {
+    OpError::denied(format!(
+        "PUT denied by access security: '{}' from {}/{}/{}",
+        checked.pv_name(),
+        ctx.creds.host,
+        ctx.creds.account,
+        ctx.creds.method,
+    ))
+}
+
+// ── PUT pvRequest options ─────────────────────────────────────────────────
+
+/// Per-operation options decoded from a PUT INIT pvRequest, the write-side
+/// sibling of [`MonitorOptions`].
+///
+/// pvxs reads both terms off the INIT pvRequest inside `onPut`
+/// (`ioc/singlesource.cpp:346-352`), never off the data-phase value, and
+/// hands them to the same `IOCSource` routing every IOC source shares.
+/// This is that decode, owned once for the native `PvDatabaseSource` and
+/// the QSRV bridge alike; [`ProcessMode`] belongs to the database, whose
+/// `put_field_from_client` is what routes on it.
+#[derive(Debug, Clone)]
+pub struct PutOptions {
+    pub process: ProcessMode,
+    /// If true, block until record processing completes (uses put_notify).
+    pub block: bool,
+}
+
+impl Default for PutOptions {
+    fn default() -> Self {
+        Self {
+            process: ProcessMode::Passive,
+            block: false,
+        }
+    }
+}
+
+/// Map a present `record._options.process` field to a [`ProcessMode`],
+/// mirroring pvxs `setForceProcessingFlag` (ioc/iocsource.cpp:426-448)
+/// including which values it reports to the client:
+///
+/// ```text
+///   proc.as<bool>() succeeds  -> forceProc = True | False   (silent)
+///   else "passive"            -> forceProc = Unset          (silent)
+///   else                      -> forceProc left Unset, logRemote(Warn)
+/// ```
+///
+/// `True`/`False`/`Unset` map to Force/Inhibit/Passive here. The `as<bool>`
+/// coercion is the *same* one `record._options.atomic`/`block` use, so it
+/// routes through the shared [`epics_pva_rs::pvdata::convert::as_bool`] owner
+/// rather than being re-derived: a bool, any signed/unsigned integer or real
+/// scalar maps by nonzero truthiness (`copyOutScalar` `bool(src)`,
+/// src/data.cpp:402-408), and a string is accepted only as the exact tokens
+/// `"true"`/`"false"` — no trim, case sensitive (src/data.cpp:459-461).
+///
+/// The third arm is what this function exists for: `"passive"` is a
+/// SUPPORTED spelling of the default and is silent, while a
+/// whitespace-wrapped `" false "`, a typo, or a non-scalar field is an
+/// UNSUPPORTED value — same passive outcome, but pvxs names it to the
+/// client. Collapsing both into a silent passive (as this did) loses that
+/// distinction, which is the only thing the client can act on: the PUT it
+/// asked to force will silently not process.
+fn process_mode_from_field(field: &PvField, log: &RemoteLog) -> ProcessMode {
+    match convert::as_bool(field) {
+        Ok(true) => return ProcessMode::Force,
+        Ok(false) => return ProcessMode::Inhibit,
+        // NoConvert — pvxs falls through to its `proc.as(s)` check.
+        Err(_) => {
+            if matches!(field, PvField::Scalar(ScalarValue::String(s)) if s.as_str_lossy() == "passive")
+            {
+                return ProcessMode::Passive;
+            }
+        }
+    }
+    // pvxs iocsource.cpp:446-447 — "oops, unsupported type or unexpected
+    // value". `forceProc` keeps its incoming default (Unset ⇒ Passive) and
+    // the client is told which option was ignored, and with what value.
+    log.warn(format!(
+        "Ignoring unsupported record._options.process: {}",
+        render_option_value(field)
+    ));
+    ProcessMode::Passive
+}
+
+/// Render a pvRequest option value the way pvxs's `SB()<<value` does —
+/// [`epics_pva_rs::pvdata::render_value`], the single owner of that
+/// rendering, shared with the native PVA server's monitor-option
+/// diagnostics.
+///
+/// This used to be a second, divergent copy: it invented the pvData type
+/// spellings (`int32`, `float64`) where pvxs's `TypeCode::name()` prints the
+/// C-ish `int32_t` / `double` (`src/type.cpp:126-166`), and it collapsed every
+/// non-scalar to `<non-scalar>` (R10-36).
+use crate::pvdata::render_value as render_option_value;
+
+impl PutOptions {
+    /// Extract process/block options from a PvStructure.
+    ///
+    /// Looks for `record._options.process` (bool / integer / "true" /
+    /// "false" / "passive") and `record._options.block` (bool / integer /
+    /// unsigned / real / "true" / "false", via pvxs `as<bool>` coercion).
+    ///
+    /// `log` is the operation's [`RemoteLog`]: a `process` value pvxs
+    /// cannot interpret is reported to the client rather than silently
+    /// defaulted (see `process_mode_from_field`).
+    pub fn from_pv_request(request: &PvStructure, log: &RemoteLog) -> Self {
+        let mut opts = Self::default();
+
+        // Navigate: record -> _options -> process/block
+        let options = request
+            .get_field("record")
+            .and_then(|f| match f {
+                PvField::Structure(s) => s.get_field("_options"),
+                _ => None,
+            })
+            .and_then(|f| match f {
+                PvField::Structure(s) => Some(s),
+                _ => None,
+            });
+
+        if let Some(opt_struct) = options {
+            // process option. pvxs reads `record._options.process` via
+            // `Value::as<bool>` first — accepting an actual bool, an
+            // integer, or a bool-parsable string — then falls back to the
+            // literal string "passive"; anything else keeps the passive
+            // default AND is reported to the client
+            // (ioc/iocsource.cpp:426-448). An ABSENT option is not a value
+            // at all: pvxs returns before the log, so the field must be
+            // matched on presence, not on being a scalar — a non-scalar
+            // `process` is a present-but-unsupported value and draws the
+            // same warning.
+            if let Some(field) = opt_struct.get_field("process") {
+                opts.process = process_mode_from_field(field, log);
+            }
+
+            // block option. pvxs reads `record._options.block` via
+            // `Value::as<bool>` (ioc/singlesource.cpp:346-352), which
+            // coerces bool / integer / unsigned / real / `"true"` /
+            // `"false"` through `copyOutScalar`. The earlier path matched
+            // only `Boolean`, silently dropping the integer and string
+            // forms a PVA client can legally send — so a `block=1` or
+            // `block="true"` lost the put-notify completion barrier.
+            if let Some(field) = opt_struct.get_field("block")
+                && let Ok(b) = convert::as_bool(field)
+            {
+                opts.block = b;
+            }
+            // No point blocking if processing is inhibited
+            // (singlesource.cpp:350-352: `doWait` is cleared whenever the
+            // PUT does not process). Applied uniformly after parsing, so
+            // the invariant `process == Inhibit ⇒ !block` holds for every
+            // accepted `block` encoding, not only the boolean one.
+            if opts.process == ProcessMode::Inhibit {
+                opts.block = false;
+            }
+        }
+
+        opts
+    }
+}
+
 /// Event-affecting options decoded from a downstream MONITOR INIT
 /// pvRequest, surfaced to [`ChannelSource`] implementors that need to
 /// reason about whether they can honor them.
@@ -194,6 +362,18 @@ pub struct MonitorOptions {
     /// fanout gateway on a shared upstream stream is not equivalent to
     /// the upstream server running it per subscription.
     pub server_filter: bool,
+    /// The RESOLVED `DBE_*` value-class mask the value subscription runs
+    /// with — `record._options.DBE` reduced through
+    /// [`dbe_mask_from_pv_request`], or pvxs's `DBE_VALUE | DBE_ALARM`
+    /// fallback (`singlesource.cpp:141-144`). Never empty and never
+    /// carrying `DBE_PROPERTY`: the property subscription is separate and
+    /// unconditional (`:161-167`), so a source ORs that bit in itself.
+    ///
+    /// Resolved ONCE, by the wire layer at MONITOR INIT, exactly like
+    /// [`Self::queue_size`] — a source reads this field instead of
+    /// re-parsing the pvRequest, so the mask a source subscribes with and
+    /// the mask the INIT hook validated cannot disagree.
+    pub dbe: u16,
 }
 
 /// pvxs `MonitorOp::limit = 4u` (`servermon.cpp:66`) — the depth a
@@ -215,6 +395,7 @@ impl Default for MonitorOptions {
             pipeline: false,
             queue_size: DEFAULT_MONITOR_QUEUE_LIMIT,
             server_filter: false,
+            dbe: DEFAULT_DBE_MASK,
         }
     }
 }
@@ -234,6 +415,197 @@ impl MonitorOptions {
     pub fn affects_upstream_events(&self) -> bool {
         self.server_filter
     }
+
+    /// Resolve [`Self::dbe`] from a MONITOR INIT pvRequest.
+    ///
+    /// The `NoConvert` an array-typed `DBE` raises is deliberately NOT
+    /// reported here: whether an unconvertible `DBE` fails the operation
+    /// is the SOURCE's call, because it depends on the name — pvxs reads
+    /// `DBE` only in `SingleSource::onSubscribe`, while `GroupSource` and
+    /// the `SharedPV` server API never look at it — and each source makes
+    /// that call in [`ChannelSource::check_monitor_request`], which the
+    /// wire layer runs at INIT before the reply. This resolves the mask
+    /// the surviving request subscribes with, and takes pvxs's own
+    /// `dbe = 0` fallback for the request that a source lets through.
+    pub fn resolve_dbe(request: Option<&PvField>) -> u16 {
+        let Some(PvField::Structure(req)) = request else {
+            return DEFAULT_DBE_MASK;
+        };
+        dbe_mask_from_pv_request(req, &RemoteLog::default())
+            .unwrap_or(None)
+            .unwrap_or(DEFAULT_DBE_MASK)
+    }
+}
+
+/// pvxs's `dbe = DBE_VALUE | DBE_ALARM` fallback for a MONITOR whose
+/// pvRequest names no usable `record._options.DBE`
+/// (`ioc/singlesource.cpp:142-144`).
+pub const DEFAULT_DBE_MASK: u16 = {
+    use epics_base_rs::server::recgbl::EventMask;
+    EventMask::VALUE.bits() | EventMask::ALARM.bits()
+};
+
+/// Reduce a parsed numeric DBE mask to pvxs's value-subscription
+/// class. pvxs masks `record._options.DBE` down to the value-class
+/// bits `DBE_VALUE | DBE_ARCHIVE | DBE_ALARM` and falls back to
+/// `DBE_VALUE | DBE_ALARM` when nothing in that class survives
+/// (ioc/singlesource.cpp:142-144). PROPERTY and any out-of-class bits
+/// must never reach the value subscription — the property
+/// subscription is opened separately and unconditionally
+/// (singlesource.cpp:161-167). EPICS `DBE_*` bit values coincide with
+/// [`epics_base_rs::server::recgbl::EventMask`] bits (VALUE=1, ARCHIVE/LOG=2, ALARM=4), so the raw
+/// client mask maps straight through.
+fn dbe_value_class_mask(raw: u16) -> u16 {
+    use epics_base_rs::server::recgbl::EventMask;
+    let m = raw & (EventMask::VALUE | EventMask::LOG | EventMask::ALARM).bits();
+    if m == 0 {
+        (EventMask::VALUE | EventMask::ALARM).bits()
+    } else {
+        m
+    }
+}
+
+/// parse `record._options.DBE` from a MONITOR INIT pvRequest into the
+/// value-subscription mask. `Ok(None)` only when the option is
+/// absent; a present option always resolves to a non-empty value-class
+/// mask (pvxs's `VALUE|ALARM` fallback applies when nothing in the
+/// value class is selected).
+///
+/// pvxs dispatches DBE on the field's KIND — `fld.type().kind()`
+/// (singlesource.cpp:118), the class nibble of the type code (`code & 0xe0`,
+/// data.h:140-147) — and then CONVERTS. Exactly two arms read a value:
+///
+/// * `Kind::String` → `fld.as<std::string>()`, then the sloppy substring scan
+///   (`:119-133`);
+/// * `Kind::Integer` / `Kind::Real` → `dbe = fld.as<uint8_t>()` (`:134-137`).
+///
+/// Every other kind — `Kind::Bool` and `Kind::Compound` (struct / union / any)
+/// included — hits `default: break` (`:138-139`) with `dbe` still 0, so the
+/// value class selects nothing and the `DBE_VALUE | DBE_ALARM` fallback applies
+/// (`:141-144`). `as<uint8_t>()` *could* convert bool storage
+/// (data.cpp:428-435); pvxs simply never calls it for a bool.
+///
+/// Both value-reading arms use the THROWING `as<T>()`, and KIND IS NOT STORAGE:
+/// `Int32A` is `Kind::Integer` but stores as an array, and `Value::copyOut` has
+/// no scalar arm for array storage (`data.cpp:466-499`). So an ARRAY-typed
+/// `DBE` of integer, real, or string element kind reaches the conversion and
+/// raises `NoConvert` — `Err` here, which the caller
+/// ([`ChannelSource::check_monitor_request`](epics_pva_rs::server_native::source::ChannelSource::check_monitor_request))
+/// turns into an op-level error reply. pvxs instead lets the throw reset the
+/// whole TCP circuit; that is CBUG-C2 and the port deliberately does not
+/// reproduce it. A BOOLEAN array does not throw: `Kind::Bool` never reaches a
+/// conversion. (R9-35 — the port used to serve VALUE|ALARM for every array.)
+///
+/// String form mirrors pvxs's "sloppy" substring parse
+/// (singlesource.cpp:122-127): only `VALUE`, `ARCHIVE`, and `ALARM` are
+/// recognized for the value mask. `LOG` is not a recognized spelling,
+/// and `PROPERTY` is deliberately excluded — the property subscription
+/// is separate and unconditional (singlesource.cpp:161-167).
+///
+/// `log` is the operation's [`RemoteLog`]: a string DBE that selects
+/// NOTHING in the value class still falls back to `VALUE|ALARM`, but pvxs
+/// tells the client so first (singlesource.cpp:128-130) rather than
+/// letting the fallback pass for an honored request.
+pub fn dbe_mask_from_pv_request(
+    request: &PvStructure,
+    log: &RemoteLog,
+) -> Result<Option<u16>, NoConvert> {
+    use epics_base_rs::server::recgbl::EventMask;
+
+    let options = request
+        .get_field("record")
+        .and_then(|f| match f {
+            PvField::Structure(s) => s.get_field("_options"),
+            _ => None,
+        })
+        .and_then(|f| match f {
+            PvField::Structure(s) => Some(s),
+            _ => None,
+        });
+    let Some(options) = options else {
+        return Ok(None);
+    };
+    let Some(dbe) = options.get_field("DBE") else {
+        return Ok(None);
+    };
+    // pvxs `switch(fld.type().kind())`, through the shared kind owner
+    // (`convert::kind` IS `Value::type().kind()`). Every arm converges on the
+    // single value-class mask + `VALUE|ALARM` fallback below
+    // (singlesource.cpp:141-144), so PROPERTY / out-of-class bits are stripped
+    // in one place and cannot leak into the value subscription.
+    let raw = match convert::kind(dbe) {
+        // `fld.as<std::string>()` — throws on a string ARRAY.
+        convert::Kind::String => convert::as_string(dbe)?,
+        // `dbe = fld.as<uint8_t>()` — throws on an integer / real ARRAY. The
+        // narrowing to `u8` is C's `(uint8_t)` truncation in `copyOutScalar`
+        // (data.cpp:402-416); DBE bits live in the low nibble, so the high bits
+        // pvxs discards are irrelevant.
+        convert::Kind::Integer | convert::Kind::Real => {
+            return Ok(Some(dbe_value_class_mask(u16::from(convert::as_u8(dbe)?))));
+        }
+        // pvxs's `default: break` — Bool and Compound select no DBE bit and
+        // never reach a conversion, so they cannot throw. This is NOT `None`
+        // (which the caller reads as "the option is absent"): the option is
+        // present, it just selects nothing.
+        convert::Kind::Bool | convert::Kind::Compound | convert::Kind::Null => {
+            return Ok(Some(dbe_value_class_mask(0)));
+        }
+    };
+
+    // A String-typed DBE is NEVER parsed numerically. pvxs switches on the
+    // field's *kind* (singlesource.cpp:117-140): `Kind::String` runs the
+    // substring scan below and nothing else, while only `Kind::Integer` /
+    // `Kind::Real` reach `fld.as<uint8_t>()`. So `DBE="1"` selects no bit,
+    // draws the empty-mask warning, and falls back to VALUE|ALARM — it does
+    // NOT mean DBE_VALUE. (This is unlike `queueSize`/`block`/`atomic`, which
+    // pvxs reads with `as<T>()` regardless of kind; `Value::as` does
+    // `parseTo<int64_t>` on string storage, data.cpp:442-449, so their
+    // numeric-string parse is correct.) The port used to parse the string
+    // first, so `DBE="1"` selected VALUE-only where pvxs gives VALUE|ALARM,
+    // and the warning never fired.
+
+    // String DBE: pvxs does "sloppy" substring matching for only VALUE,
+    // ARCHIVE, and ALARM (singlesource.cpp:122-127). `LOG` is NOT a
+    // recognized spelling — the DBE_LOG/DBE_ARCHIVE bit (they are the
+    // same EPICS bit) is selected only by the substring `ARCHIVE`. And
+    // PROPERTY is deliberately excluded from the value mask
+    // (`CASE(PROPERTY)` is commented out): the property subscription is
+    // opened separately and unconditionally (singlesource.cpp:161-167),
+    // so a `PROPERTY` token must never reach the value subscription.
+    // Unknown text is ignored (pure substring search). The value-class
+    // mask + VALUE|ALARM fallback (singlesource.cpp:142-144) then
+    // applies, so a present `DBE` that selects an empty value mask
+    // (PROPERTY-only, or unrecognized text like `LOG`) falls back to
+    // VALUE|ALARM rather than leaving the value subscription empty.
+    // Case-SENSITIVE substring search on the original string, exactly like
+    // pvxs `mask.find("VALUE"/"ARCHIVE"/"ALARM")` (singlesource.cpp:122-125).
+    // pvxs does NOT case-fold the option, so a lowercase token such as
+    // `"alarm"` or `"value"` matches nothing, selects an empty value mask,
+    // and falls through to the `VALUE|ALARM` fallback below — whereas an
+    // uppercase substring (including a prefixed spelling like `"DBE_VALUE"`)
+    // selects its bit. Folding to uppercase first (as Rust previously did)
+    // made lowercase tokens select a narrower mask than pvxs, hiding value
+    // changes from clients that used lowercase option strings.
+    let mut raw_mask = 0u16;
+    if raw.contains("VALUE") {
+        raw_mask |= EventMask::VALUE.bits();
+    }
+    if raw.contains("ARCHIVE") {
+        raw_mask |= EventMask::LOG.bits();
+    }
+    if raw.contains("ALARM") {
+        raw_mask |= EventMask::ALARM.bits();
+    }
+    // pvxs `singlesource.cpp:128-130` — `if(!dbe && !mask.empty())`. The
+    // client named an event class the substring parse recognized nothing in
+    // (`"LOG"`, a lowercase `"value"`, `"PROPERTY"` alone), so the request
+    // is honored by the `VALUE|ALARM` fallback below rather than by what was
+    // asked for. pvxs reports that before falling back; an empty string
+    // (`DBE=""`) is not a selection at all and draws no warning.
+    if raw_mask == 0 && !raw.is_empty() {
+        log.warn(format!("record._options.DBE=\"{raw}\" selects empty mask"));
+    }
+    Ok(Some(dbe_value_class_mask(raw_mask)))
 }
 
 /// which pipeline-window watermark transition a downstream
@@ -624,6 +996,33 @@ pub trait ChannelSource: Send + Sync + 'static {
         self.get_introspection(name)
     }
 
+    /// [`Self::get_introspection_checked`], but allowed to WAIT for a
+    /// descriptor this source has not published yet.
+    ///
+    /// pvxs answers an operation on a `SharedPV` that has not been
+    /// `open()`ed by PARKING it, not by refusing it: `onOp` inserts the
+    /// `ConnectOp` into `pending` (`sharedpv.cpp:239-249`), `onSubscribe`
+    /// puts the `MonitorSetupOp` into `mpending` (`:259-275`), and
+    /// `SharedPV::open` runs `connectOp`/`connectSub` over both sets
+    /// (`:348-384`). GET_FIELD parks through the same channel callback
+    /// (`serverintrospect.cpp:174-176`), and the search answers
+    /// regardless of open state (`sharedpv.cpp:478-488`) — which is why a
+    /// pvxs client gets its channel and then simply waits.
+    ///
+    /// The default resolves immediately, so a source whose descriptor is
+    /// decided at channel creation — the IOC database, a gateway —
+    /// refuses exactly as before: `None` here is "never", not "not yet".
+    /// Only a source that can publish later (a [`SharedPV`](crate::server_native::SharedPV))
+    /// overrides it, and the wait is cancelled by dropping the future,
+    /// which is all pvxs's `conn->onClose` erase amounts to.
+    fn await_introspection(
+        &self,
+        name: &str,
+        ctx: ChannelContext,
+    ) -> impl std::future::Future<Output = Option<FieldDesc>> + Send {
+        self.get_introspection_checked(name, ctx)
+    }
+
     /// Resolve the source that OWNS `name` for this peer, to be bound
     /// into the channel at CREATE_CHANNEL so every later operation
     /// dispatches to the same source that accepted the channel — never
@@ -801,13 +1200,7 @@ pub trait ChannelSource: Send + Sync + 'static {
     ) -> impl std::future::Future<Output = Result<(), OpError>> + Send {
         async move {
             if !checked.allows_write() {
-                return Err(OpError::denied(format!(
-                    "PUT denied by access security: '{}' from {}/{}/{}",
-                    checked.pv_name(),
-                    ctx.creds.host,
-                    ctx.creds.account,
-                    ctx.creds.method,
-                )));
+                return Err(put_denied(&checked, &ctx));
             }
             self.put_value(checked.pv_name(), value).await
         }
@@ -1890,7 +2283,85 @@ pub struct UpstreamMonitor<T> {
 
 enum UpstreamSub {
     Db(epics_base_rs::server::database::db_access::DbSubscription),
+    /// pvxs's TWO record subscriptions for one single-record channel —
+    /// `ioc/singlesource.cpp:155-167`, under the comment "Two subscription
+    /// are made for pvxs": the value half on the client's resolved `DBE`
+    /// and the property half on a bare `DBE_PROPERTY`, each on its own
+    /// `dbChannel` (`pPropertiesChannel`, built from the same channel name
+    /// at `singlesrcsubscriptionctx.cpp:24`) and therefore its own event
+    /// queue.
+    ///
+    /// The separation is load-bearing, not cosmetic. A by-reference
+    /// channel's subscriber queue latches latest-only
+    /// (`event_queue.rs:436-438`), so a single union subscription collapses
+    /// an arriving `DBE_PROPERTY` post onto the value post already queued
+    /// and the client is told about the metadata change only as extra
+    /// marks on a value update — or, when the value stream is busy, not at
+    /// all. Two queues cannot do that to each other.
+    DbPair {
+        value: epics_base_rs::server::database::db_access::DbSubscription,
+        property: epics_base_rs::server::database::db_access::DbSubscription,
+    },
     Pv(epics_base_rs::server::pv::PvSubscription),
+}
+
+/// Take the next event from either half of a split subscription, value
+/// half first.
+///
+/// The property half needs no mask rewrite, where pvxs's property callback
+/// passes `UpdateType::Property` unconditionally (`singlesource.cpp:100`):
+/// an event's mask is the post narrowed to the subscriber's own select
+/// (`Subscriber::delivered_mask`), and this subscriber's select IS
+/// `DBE_PROPERTY`, so the class is right by construction.
+///
+/// `None` only once BOTH halves have closed — one closed half leaves the
+/// monitor running on the other, as pvxs's two independent subscriptions
+/// do.
+async fn recv_pair(
+    value: &mut epics_base_rs::server::database::db_access::DbSubscription,
+    property: &mut epics_base_rs::server::database::db_access::DbSubscription,
+) -> Option<epics_base_rs::server::pv::MonitorEvent> {
+    use std::task::Poll;
+    std::future::poll_fn(|cx| {
+        let mut open = false;
+        match value.poll_recv_event(cx) {
+            Poll::Ready(Some(ev)) => return Poll::Ready(Some(ev)),
+            Poll::Ready(None) => {}
+            Poll::Pending => open = true,
+        }
+        match property.poll_recv_event(cx) {
+            Poll::Ready(Some(ev)) => return Poll::Ready(Some(ev)),
+            Poll::Ready(None) => {}
+            Poll::Pending => open = true,
+        }
+        if open {
+            Poll::Pending
+        } else {
+            Poll::Ready(None)
+        }
+    })
+    .await
+}
+
+/// [`recv_pair`]'s poll-free twin, with the same value-first order and the
+/// same both-halves rule for `Disconnected`.
+fn try_recv_pair(
+    value: &mut epics_base_rs::server::database::db_access::DbSubscription,
+    property: &mut epics_base_rs::server::database::db_access::DbSubscription,
+) -> Result<epics_base_rs::server::pv::MonitorEvent, epics_base_rs::server::event_queue::TryRecvError>
+{
+    use epics_base_rs::server::event_queue::TryRecvError as QueueErr;
+    let value_err = match value.try_recv_event() {
+        Ok(ev) => return Ok(ev),
+        Err(e) => e,
+    };
+    match property.try_recv_event() {
+        Ok(ev) => Ok(ev),
+        Err(QueueErr::Disconnected) if matches!(value_err, QueueErr::Disconnected) => {
+            Err(QueueErr::Disconnected)
+        }
+        Err(_) => Err(QueueErr::Empty),
+    }
 }
 
 /// `epics-base-rs`'s event queue defines its own `TryRecvError` mirror
@@ -1915,6 +2386,23 @@ impl<T> UpstreamMonitor<T> {
     ) -> Self {
         Self {
             upstream: UpstreamSub::Db(sub),
+            map,
+            seed: None,
+        }
+    }
+
+    /// Serve a PVA monitor off pvxs's PAIR of record subscriptions — the
+    /// client's `DBE` value half and the unconditional `DBE_PROPERTY` half
+    /// (`singlesource.cpp:155-167`). Both feed the same per-event
+    /// transform: the class each event carries is its own subscriber's,
+    /// so one `map` classifies both halves without asking which one woke.
+    pub fn from_db_pair(
+        value: epics_base_rs::server::database::db_access::DbSubscription,
+        property: epics_base_rs::server::database::db_access::DbSubscription,
+        map: fn(epics_base_rs::server::pv::MonitorEvent) -> Option<T>,
+    ) -> Self {
+        Self {
+            upstream: UpstreamSub::DbPair { value, property },
             map,
             seed: None,
         }
@@ -1945,6 +2433,7 @@ impl<T> UpstreamMonitor<T> {
         loop {
             let ev = match &mut self.upstream {
                 UpstreamSub::Db(s) => s.recv_event().await?,
+                UpstreamSub::DbPair { value, property } => recv_pair(value, property).await?,
                 UpstreamSub::Pv(s) => s.recv_event().await?,
             };
             if let Some(v) = (self.map)(ev) {
@@ -1960,6 +2449,9 @@ impl<T> UpstreamMonitor<T> {
         loop {
             let ev = match &mut self.upstream {
                 UpstreamSub::Db(s) => s.try_recv_event().map_err(from_queue_err)?,
+                UpstreamSub::DbPair { value, property } => {
+                    try_recv_pair(value, property).map_err(from_queue_err)?
+                }
                 UpstreamSub::Pv(s) => s.try_recv_event().map_err(from_queue_err)?,
             };
             if let Some(v) = (self.map)(ev) {
@@ -2113,6 +2605,12 @@ pub trait ChannelSourceObj: Send + Sync {
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send + 'a>>;
     /// dyn forwarder for credential-aware introspection.
     fn get_introspection_checked<'a>(
+        &'a self,
+        name: &'a str,
+        ctx: ChannelContext,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Option<FieldDesc>> + Send + 'a>>;
+    /// dyn forwarder for the parking introspection wait.
+    fn await_introspection<'a>(
         &'a self,
         name: &'a str,
         ctx: ChannelContext,
@@ -2395,6 +2893,15 @@ impl<T: ChannelSource + 'static> ChannelSourceObj for T {
         ctx: ChannelContext,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Option<FieldDesc>> + Send + 'a>> {
         Box::pin(<Self as ChannelSource>::get_introspection_checked(
+            self, name, ctx,
+        ))
+    }
+    fn await_introspection<'a>(
+        &'a self,
+        name: &'a str,
+        ctx: ChannelContext,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Option<FieldDesc>> + Send + 'a>> {
+        Box::pin(<Self as ChannelSource>::await_introspection(
             self, name, ctx,
         ))
     }
@@ -2818,5 +3325,564 @@ mod tests {
             live.try_recv().expect("live sees Y").to_vec(),
             vec!["Y".to_string()]
         );
+    }
+
+    #[test]
+    fn put_options_default() {
+        let opts = PutOptions::default();
+        assert_eq!(opts.process, ProcessMode::Passive);
+        assert!(!opts.block);
+    }
+
+    #[test]
+    fn put_options_from_empty_request() {
+        let req = PvStructure::new("empty");
+        let opts = PutOptions::from_pv_request(&req, &RemoteLog::default());
+        assert_eq!(opts.process, ProcessMode::Passive);
+        assert!(!opts.block);
+    }
+
+    #[test]
+    fn put_options_process_true() {
+        let mut options = PvStructure::new("");
+        options.fields.push((
+            "process".into(),
+            PvField::Scalar(ScalarValue::String("true".into())),
+        ));
+        options
+            .fields
+            .push(("block".into(), PvField::Scalar(ScalarValue::Boolean(true))));
+
+        let mut record = PvStructure::new("");
+        record
+            .fields
+            .push(("_options".into(), PvField::Structure(options)));
+
+        let mut req = PvStructure::new("request");
+        req.fields
+            .push(("record".into(), PvField::Structure(record)));
+
+        let opts = PutOptions::from_pv_request(&req, &RemoteLog::default());
+        assert_eq!(opts.process, ProcessMode::Force);
+        assert!(opts.block);
+    }
+
+    #[test]
+    fn put_options_inhibit_disables_block() {
+        let mut options = PvStructure::new("");
+        options.fields.push((
+            "process".into(),
+            PvField::Scalar(ScalarValue::String("false".into())),
+        ));
+        options
+            .fields
+            .push(("block".into(), PvField::Scalar(ScalarValue::Boolean(true))));
+
+        let mut record = PvStructure::new("");
+        record
+            .fields
+            .push(("_options".into(), PvField::Structure(options)));
+
+        let mut req = PvStructure::new("request");
+        req.fields
+            .push(("record".into(), PvField::Structure(record)));
+
+        let opts = PutOptions::from_pv_request(&req, &RemoteLog::default());
+        assert_eq!(opts.process, ProcessMode::Inhibit);
+        assert!(!opts.block); // block disabled when process=false
+    }
+
+    fn req_with_process(value: PvField) -> PvStructure {
+        let mut options = PvStructure::new("");
+        options.fields.push(("process".into(), value));
+        let mut record = PvStructure::new("");
+        record
+            .fields
+            .push(("_options".into(), PvField::Structure(options)));
+        let mut req = PvStructure::new("request");
+        req.fields
+            .push(("record".into(), PvField::Structure(record)));
+        req
+    }
+
+    /// pvxs reads `record._options.process` via `as<bool>` (bool,
+    /// integer, or bool-parsable string) before the "passive" string
+    /// (iocsource.cpp:426-448). Boolean and integer scalar forms must
+    /// map to Force/Inhibit, not silently fall back to passive.
+    #[test]
+    fn put_options_process_accepts_boolean_and_integer_scalars() {
+        let f = |v| {
+            PutOptions::from_pv_request(
+                &req_with_process(PvField::Scalar(v)),
+                &RemoteLog::default(),
+            )
+            .process
+        };
+
+        assert_eq!(f(ScalarValue::Boolean(true)), ProcessMode::Force);
+        assert_eq!(f(ScalarValue::Boolean(false)), ProcessMode::Inhibit);
+        assert_eq!(f(ScalarValue::Int(1)), ProcessMode::Force);
+        assert_eq!(f(ScalarValue::Int(0)), ProcessMode::Inhibit);
+        assert_eq!(f(ScalarValue::Long(5)), ProcessMode::Force);
+        // String forms still resolve; "passive" stays passive.
+        assert_eq!(f(ScalarValue::String("true".into())), ProcessMode::Force);
+        assert_eq!(f(ScalarValue::String("false".into())), ProcessMode::Inhibit);
+        assert_eq!(
+            f(ScalarValue::String("passive".into())),
+            ProcessMode::Passive
+        );
+    }
+
+    /// pvxs reads `record._options.process` through the SAME `proc.as<bool>`
+    /// coercion as `atomic`/`block` (iocsource.cpp:436 → copyOutScalar /
+    /// string store). Real scalars therefore coerce by nonzero truthiness
+    /// (`bool(src)`, data.cpp:402-408), and the string store is exact:
+    /// `" true "`/`" false "` are NoConvert and stay passive (data.cpp:
+    /// 459-461). The earlier parser forced real scalars to passive and
+    /// `.trim()`-ed strings, so `Double(1.0)` was dropped to passive and a
+    /// whitespace-wrapped `" false "` wrongly inhibited processing.
+    #[test]
+    fn put_options_process_real_truthiness_and_no_trim() {
+        let f = |v| {
+            PutOptions::from_pv_request(
+                &req_with_process(PvField::Scalar(v)),
+                &RemoteLog::default(),
+            )
+            .process
+        };
+
+        // real scalars coerce by nonzero truthiness, not silently passive
+        assert_eq!(f(ScalarValue::Double(1.0)), ProcessMode::Force);
+        assert_eq!(f(ScalarValue::Double(0.0)), ProcessMode::Inhibit);
+        assert_eq!(f(ScalarValue::Float(2.5)), ProcessMode::Force);
+        assert_eq!(f(ScalarValue::Float(0.0)), ProcessMode::Inhibit);
+        // unsigned integer truthiness
+        assert_eq!(f(ScalarValue::UInt(1)), ProcessMode::Force);
+        // strings are matched exactly: surrounding whitespace is NoConvert,
+        // so the mode stays passive (pvxs never trims before the
+        // "true"/"false" store) instead of the trimmed parser's
+        // Force/Inhibit.
+        assert_eq!(
+            f(ScalarValue::String(" true ".into())),
+            ProcessMode::Passive
+        );
+        assert_eq!(
+            f(ScalarValue::String(" false ".into())),
+            ProcessMode::Passive
+        );
+        // case-sensitive, like pvxs's exact string store
+        assert_eq!(f(ScalarValue::String("TRUE".into())), ProcessMode::Passive);
+    }
+
+    fn req_with_block(value: PvField) -> PvStructure {
+        let mut options = PvStructure::new("");
+        // A non-Inhibit process so the block flag is not cleared by the
+        // `process == Inhibit ⇒ !block` rule — isolates the block parse.
+        options.fields.push((
+            "process".into(),
+            PvField::Scalar(ScalarValue::Boolean(true)),
+        ));
+        options.fields.push(("block".into(), value));
+        let mut record = PvStructure::new("");
+        record
+            .fields
+            .push(("_options".into(), PvField::Structure(options)));
+        let mut req = PvStructure::new("request");
+        req.fields
+            .push(("record".into(), PvField::Structure(record)));
+        req
+    }
+
+    /// pvxs reads `record._options.block` via `as<bool>`
+    /// (singlesource.cpp:346-352), coercing bool, integer, unsigned,
+    /// real, and the exact strings `"true"`/`"false"` (data.cpp:399-409,
+    /// 459-462). The earlier parser accepted only a boolean scalar, so a
+    /// client sending `block=1` or `block="true"` lost the put-notify
+    /// completion barrier.
+    #[test]
+    fn put_options_block_accepts_integer_and_string_forms() {
+        let f = |v| {
+            PutOptions::from_pv_request(&req_with_block(PvField::Scalar(v)), &RemoteLog::default())
+                .block
+        };
+
+        // boolean (already worked)
+        assert!(f(ScalarValue::Boolean(true)));
+        assert!(!f(ScalarValue::Boolean(false)));
+        // integer 1 / 0
+        assert!(f(ScalarValue::Int(1)));
+        assert!(!f(ScalarValue::Int(0)));
+        // unsigned + 64-bit integer
+        assert!(f(ScalarValue::UInt(1)));
+        assert!(f(ScalarValue::Long(5)));
+        // real
+        assert!(f(ScalarValue::Double(1.0)));
+        assert!(!f(ScalarValue::Double(0.0)));
+        // exact "true" / "false" strings
+        assert!(f(ScalarValue::String("true".into())));
+        assert!(!f(ScalarValue::String("false".into())));
+        // unconvertible string keeps the default (false)
+        assert!(!f(ScalarValue::String("yes".into())));
+    }
+
+    /// The `process == Inhibit ⇒ !block` rule (singlesource.cpp:350-352)
+    /// must hold for every accepted `block` encoding, not only boolean.
+    #[test]
+    fn put_options_inhibit_disables_integer_block() {
+        let mut options = PvStructure::new("");
+        options.fields.push((
+            "process".into(),
+            PvField::Scalar(ScalarValue::String("false".into())),
+        ));
+        options
+            .fields
+            .push(("block".into(), PvField::Scalar(ScalarValue::Int(1))));
+        let mut record = PvStructure::new("");
+        record
+            .fields
+            .push(("_options".into(), PvField::Structure(options)));
+        let mut req = PvStructure::new("request");
+        req.fields
+            .push(("record".into(), PvField::Structure(record)));
+
+        let opts = PutOptions::from_pv_request(&req, &RemoteLog::default());
+        assert_eq!(opts.process, ProcessMode::Inhibit);
+        assert!(!opts.block, "block=1 must be cleared when process=false");
+    }
+
+    /// Unwrap the DBE mask, asserting the option CONVERTED. An `Err` here is
+    /// pvxs throwing out of `onSubscribe` and resetting the circuit — see
+    /// [`dbe_array_typed_throws_and_resets_the_circuit`].
+    fn dbe_mask(req: &PvStructure, log: &RemoteLog) -> Option<u16> {
+        dbe_mask_from_pv_request(req, log)
+            .expect("DBE must convert; an Err would reset the circuit in pvxs")
+    }
+
+    fn req_with_dbe(value: PvField) -> PvStructure {
+        let mut options = PvStructure::new("");
+        options.fields.push(("DBE".into(), value));
+        let mut record = PvStructure::new("");
+        record
+            .fields
+            .push(("_options".into(), PvField::Structure(options)));
+        let mut req = PvStructure::new("request");
+        req.fields
+            .push(("record".into(), PvField::Structure(record)));
+        req
+    }
+
+    /// pvxs-style flag string with `|`-separated tokens
+    /// resolves to the corresponding EPICS event mask bits.
+    #[test]
+    fn dbe_mask_parses_value_alarm() {
+        use epics_base_rs::server::recgbl::EventMask;
+        let req = req_with_dbe(PvField::Scalar(ScalarValue::String("VALUE | ALARM".into())));
+        let mask = dbe_mask(&req, &RemoteLog::default()).expect("must parse");
+        assert_eq!(mask, (EventMask::VALUE | EventMask::ALARM).bits());
+    }
+
+    /// String DBE substring-matches VALUE and ARCHIVE (the DBE_LOG bit),
+    /// but a `PROPERTY` token must NOT enter the value mask — pvxs
+    /// comments out `CASE(PROPERTY)` because the property subscription is
+    /// separate (singlesource.cpp:126,161-167). `DBE_`-prefixed spellings
+    /// still match by substring.
+    #[test]
+    fn dbe_string_archive_selected_property_excluded() {
+        use epics_base_rs::server::recgbl::EventMask;
+        let req = req_with_dbe(PvField::Scalar(ScalarValue::String(
+            "DBE_VALUE,DBE_ARCHIVE,PROPERTY".into(),
+        )));
+        let mask = dbe_mask(&req, &RemoteLog::default()).expect("must parse");
+        assert_eq!(
+            mask,
+            (EventMask::VALUE | EventMask::LOG).bits(),
+            "ARCHIVE selects the LOG bit; PROPERTY is excluded from the value mask"
+        );
+    }
+
+    /// A `PROPERTY`-only string carries no value-class bit, so pvxs warns
+    /// and falls back to VALUE|ALARM for the value subscription
+    /// (singlesource.cpp:128-131,142-144). Before the fix the Rust value
+    /// subscription became PROPERTY-only, so VALUE/ALARM posts stopped
+    /// waking the monitor.
+    #[test]
+    fn dbe_string_property_only_falls_back_to_value_alarm() {
+        use epics_base_rs::server::recgbl::EventMask;
+        let req = req_with_dbe(PvField::Scalar(ScalarValue::String("PROPERTY".into())));
+        let mask = dbe_mask(&req, &RemoteLog::default()).expect("must parse");
+        assert_eq!(mask, (EventMask::VALUE | EventMask::ALARM).bits());
+    }
+
+    /// The `LOG` spelling is NOT recognized by pvxs's string parser (only
+    /// `ARCHIVE` selects the DBE_LOG bit); a lone `LOG` selects an empty
+    /// value class and falls back to VALUE|ALARM, unlike the prior Rust
+    /// behavior that treated `LOG` as the archive bit.
+    #[test]
+    fn dbe_string_log_spelling_not_recognized() {
+        use epics_base_rs::server::recgbl::EventMask;
+        let req = req_with_dbe(PvField::Scalar(ScalarValue::String("LOG".into())));
+        let mask = dbe_mask(&req, &RemoteLog::default()).expect("must parse");
+        assert_eq!(mask, (EventMask::VALUE | EventMask::ALARM).bits());
+    }
+
+    /// pvxs's string DBE parse is
+    /// case-SENSITIVE (`mask.find("VALUE"/"ARCHIVE"/"ALARM")`,
+    /// singlesource.cpp:122-125), so a lowercase token selects an empty value
+    /// mask and falls back to `VALUE|ALARM`. Before the fix Rust uppercased
+    /// the option first, so `"alarm"` subscribed alarm-only and `"archive"`
+    /// archive/log-only — narrower than pvxs and hiding value changes.
+    #[test]
+    fn dbe_string_lowercase_tokens_fall_back_to_value_alarm() {
+        use epics_base_rs::server::recgbl::EventMask;
+        let fallback = (EventMask::VALUE | EventMask::ALARM).bits();
+        for token in ["alarm", "value", "archive", "value | alarm", "dbe_value"] {
+            let req = req_with_dbe(PvField::Scalar(ScalarValue::String(token.into())));
+            let mask = dbe_mask(&req, &RemoteLog::default()).expect("present option must parse");
+            assert_eq!(
+                mask, fallback,
+                "lowercase DBE token {token:?} matches no uppercase substring, so pvxs falls back to VALUE|ALARM"
+            );
+        }
+    }
+
+    /// An uppercase substring inside
+    /// mixed-case text still selects its bit, because pvxs searches for the
+    /// exact uppercase substring rather than tokenizing. `"alarmALARM"`
+    /// therefore selects ALARM (the embedded uppercase `ALARM`), proving the
+    /// match is a case-sensitive substring search, not a case fold.
+    #[test]
+    fn dbe_string_uppercase_substring_in_mixed_case_still_selects() {
+        use epics_base_rs::server::recgbl::EventMask;
+        let req = req_with_dbe(PvField::Scalar(ScalarValue::String("alarmALARM".into())));
+        let mask = dbe_mask(&req, &RemoteLog::default()).expect("present option must parse");
+        assert_eq!(mask, EventMask::ALARM.bits());
+    }
+
+    /// numeric integer DBE within the value class passes through
+    /// unchanged (`5` = VALUE|ALARM).
+    #[test]
+    fn dbe_mask_accepts_integer_form() {
+        let req = req_with_dbe(PvField::Scalar(ScalarValue::Int(5)));
+        let mask = dbe_mask(&req, &RemoteLog::default()).expect("must parse");
+        assert_eq!(mask, 5);
+    }
+
+    /// A numeric DBE selecting only PROPERTY (8) carries no
+    /// value-class bit, so pvxs falls back to VALUE|ALARM for the value
+    /// subscription (singlesource.cpp:142-144); PROPERTY is delivered
+    /// by the separate property subscription.
+    #[test]
+    fn dbe_numeric_property_only_falls_back_to_value_alarm() {
+        use epics_base_rs::server::recgbl::EventMask;
+        let req = req_with_dbe(PvField::Scalar(ScalarValue::Int(
+            EventMask::PROPERTY.bits() as i32,
+        )));
+        let mask = dbe_mask(&req, &RemoteLog::default()).expect("must parse");
+        assert_eq!(mask, (EventMask::VALUE | EventMask::ALARM).bits());
+    }
+
+    /// numeric DBE=0 still yields the pvxs value-class fallback, not
+    /// an empty value subscription.
+    #[test]
+    fn dbe_numeric_zero_falls_back_to_value_alarm() {
+        use epics_base_rs::server::recgbl::EventMask;
+        let req = req_with_dbe(PvField::Scalar(ScalarValue::Int(0)));
+        let mask = dbe_mask(&req, &RemoteLog::default()).expect("must parse");
+        assert_eq!(mask, (EventMask::VALUE | EventMask::ALARM).bits());
+    }
+
+    /// numeric DBE with an out-of-class PROPERTY bit alongside VALUE
+    /// (9 = VALUE|PROPERTY) keeps only the value-class VALUE bit.
+    #[test]
+    fn dbe_numeric_strips_property_bit_from_value_mask() {
+        use epics_base_rs::server::recgbl::EventMask;
+        let raw = (EventMask::VALUE | EventMask::PROPERTY).bits();
+        let req = req_with_dbe(PvField::Scalar(ScalarValue::Int(raw as i32)));
+        let mask = dbe_mask(&req, &RemoteLog::default()).expect("must parse");
+        assert_eq!(mask, EventMask::VALUE.bits());
+    }
+
+    /// A String-typed DBE is never parsed numerically. pvxs switches on the
+    /// field's kind (singlesource.cpp:117-140): `Kind::String` does the
+    /// substring scan and nothing else — only `Kind::Integer`/`Kind::Real`
+    /// reach `fld.as<uint8_t>()`. So `"1"` does NOT mean DBE_VALUE: it
+    /// matches no token, selects an empty mask, draws the warning, and falls
+    /// back to VALUE|ALARM. The port used to parse it, giving VALUE-only and
+    /// no warning. Boundary cases: `"1"`/`"2"` (would have been a strict
+    /// subset of the fallback), `"7"` (would have equalled it silently),
+    /// `"8"` (PROPERTY-only), `"0"`.
+    #[test]
+    fn dbe_numeric_string_is_not_parsed_numerically() {
+        use epics_base_rs::server::recgbl::EventMask;
+        let fallback = (EventMask::VALUE | EventMask::ALARM).bits();
+        for raw in ["0", "1", "2", "7", "8", " 5 "] {
+            let log = RemoteLog::default();
+            let req = req_with_dbe(PvField::Scalar(ScalarValue::String(raw.into())));
+            let mask = dbe_mask(&req, &log).expect("must parse");
+            assert_eq!(
+                mask, fallback,
+                "a numeric string selects no event class, so DBE={raw:?} falls back to VALUE|ALARM"
+            );
+            let logged = log.take();
+            assert_eq!(
+                logged.len(),
+                1,
+                "an empty-mask selection owes the client one warning, DBE={raw:?}: {logged:?}"
+            );
+            assert_eq!(
+                logged[0].message,
+                format!("record._options.DBE=\"{raw}\" selects empty mask")
+            );
+        }
+    }
+
+    /// missing DBE option resolves to None so the monitor
+    /// falls back to the pvxs-parity default mask.
+    #[test]
+    fn dbe_mask_absent_returns_none() {
+        let req = PvStructure::new("request");
+        assert!(dbe_mask(&req, &RemoteLog::default()).is_none());
+    }
+
+    /// A numeric `record._options.DBE`
+    /// option must select the requested value class regardless of which PVA
+    /// numeric scalar type carries it. pvxs reads the field as
+    /// `fld.as<uint8_t>()` (singlesource.cpp:134-137) for the `Kind::Integer`
+    /// and `Kind::Real` arms of its kind switch, coercing every such storage
+    /// through one `copyOutScalar()` path (data.cpp:402-416). Before the fix
+    /// only `Int`/`Long` were handled and every other numeric scalar fell to
+    /// `None`, so the monitor silently used the default `VALUE|ALARM` (5)
+    /// mask. Each value below resolves to a class distinct from that default,
+    /// proving the coercion actually ran.
+    ///
+    /// `Boolean` is deliberately NOT in this list: it is `Kind::Bool`, which
+    /// pvxs's switch does not route to `as<uint8_t>()` at all — see
+    /// [`dbe_bool_is_unselected_and_falls_back`].
+    #[test]
+    fn dbe_numeric_coerces_every_scalar_variant() {
+        use epics_base_rs::server::recgbl::EventMask;
+        let cases = [
+            (PvField::Scalar(ScalarValue::UInt(2)), EventMask::LOG.bits()),
+            (
+                PvField::Scalar(ScalarValue::UByte(4)),
+                EventMask::ALARM.bits(),
+            ),
+            (
+                PvField::Scalar(ScalarValue::Short(2)),
+                EventMask::LOG.bits(),
+            ),
+            (
+                PvField::Scalar(ScalarValue::Double(2.0)),
+                EventMask::LOG.bits(),
+            ),
+        ];
+        for (field, expected) in cases {
+            let label = format!("{field:?}");
+            let req = req_with_dbe(field);
+            let mask = dbe_mask(&req, &RemoteLog::default())
+                .unwrap_or_else(|| panic!("DBE {label} must coerce to a value-class mask"));
+            assert_eq!(
+                mask, expected,
+                "DBE {label} resolved to the wrong value mask"
+            );
+        }
+    }
+
+    /// R9-31. A BOOLEAN `record._options.DBE` is `Kind::Bool`, which pvxs's
+    /// kind switch (singlesource.cpp:118-140) does not read: it falls to
+    /// `default: break` with `dbe` still 0, so `dbe &= 7` leaves 0 and the
+    /// `DBE_VALUE | DBE_ALARM` fallback fires (`:141-144`). `Value::as<uint8_t>()`
+    /// *can* convert bool storage (data.cpp:428-435) — pvxs just never calls it
+    /// for this kind.
+    ///
+    /// The port used to map `Boolean(b)` through the numeric arm as `b as u8`,
+    /// so `DBE=true` became mask 1 = DBE_VALUE: a VALUE-only subscription that
+    /// never delivers the alarm-only transitions pvxs sends. `DBE=false`
+    /// coincidentally agreed (0 → fallback), which is why only the `true`
+    /// boundary showed the defect. A prior version of
+    /// `dbe_numeric_coerces_every_scalar_variant` asserted the buggy
+    /// `Boolean(true) → VALUE`; that expectation was invented, not taken from
+    /// pvxs, and is corrected here.
+    #[test]
+    fn dbe_bool_is_unselected_and_falls_back() {
+        use epics_base_rs::server::recgbl::EventMask;
+        let fallback = (EventMask::VALUE | EventMask::ALARM).bits();
+        for b in [true, false] {
+            let req = req_with_dbe(PvField::Scalar(ScalarValue::Boolean(b)));
+            let mask = dbe_mask(&req, &RemoteLog::default())
+                .expect("a present DBE option always resolves to a mask");
+            assert_eq!(
+                mask, fallback,
+                "DBE={b} (Kind::Bool) must hit pvxs's `default: break` and fall back to \
+                 VALUE|ALARM, not select DBE_VALUE"
+            );
+        }
+    }
+
+    /// R9-35. pvxs dispatches DBE on KIND but converts through STORAGE, and the
+    /// two disagree for arrays: `Int32A` is `Kind::Integer` (`code & 0xe0`), so
+    /// it reaches `fld.as<uint8_t>()` (singlesource.cpp:134-137) — and
+    /// `Value::copyOut` has no scalar arm for array storage, so it raises
+    /// `NoConvert` (data.cpp:466-499). Same for a real array, and for a STRING
+    /// array (`StringA` is `Kind::String` → `fld.as<std::string>()`).
+    ///
+    /// Nothing catches that inside `onSubscribe`; `conn.cpp:277-282` does
+    /// `bev.reset()`. The port used to fall into its non-scalar `_ =>` arm and
+    /// serve VALUE|ALARM — handing the client a working monitor where pvxs hangs
+    /// the circuit up.
+    #[test]
+    fn dbe_array_typed_throws_and_resets_the_circuit() {
+        use crate::pvdata::TypedScalarArray;
+        let throwing = [
+            // Kind::Integer, array storage.
+            PvField::ScalarArrayTyped(TypedScalarArray::Int(vec![1].into())),
+            PvField::ScalarArrayTyped(TypedScalarArray::UByte(vec![4].into())),
+            // Kind::Real, array storage.
+            PvField::ScalarArrayTyped(TypedScalarArray::Double(vec![2.0].into())),
+            // Kind::String, array storage.
+            PvField::ScalarArrayTyped(TypedScalarArray::String(vec!["VALUE".into()].into())),
+            // An empty array is still array storage — the throw is about the
+            // storage class, not the element count.
+            PvField::ScalarArrayTyped(TypedScalarArray::Int(Vec::new().into())),
+        ];
+        for field in throwing {
+            let label = format!("{field:?}");
+            let req = req_with_dbe(field);
+            assert!(
+                dbe_mask_from_pv_request(&req, &RemoteLog::default()).is_err(),
+                "DBE {label} must throw NoConvert (circuit reset), not serve a mask"
+            );
+        }
+    }
+
+    /// R9-35, the kind boundary. `BoolA` is `Kind::Bool` and a struct / union is
+    /// `Kind::Compound`; BOTH hit pvxs's `default: break` and never reach a
+    /// conversion, so they cannot throw — they select nothing and take the
+    /// `VALUE|ALARM` fallback. Only the Integer / Real / String kinds convert,
+    /// and only those can therefore reset the circuit.
+    #[test]
+    fn dbe_bool_array_and_compound_do_not_throw() {
+        use crate::pvdata::TypedScalarArray;
+        use epics_base_rs::server::recgbl::EventMask;
+        let fallback = (EventMask::VALUE | EventMask::ALARM).bits();
+        let non_throwing = [
+            PvField::ScalarArrayTyped(TypedScalarArray::Boolean(vec![true].into())),
+            PvField::Structure(PvStructure::new("")),
+            PvField::Union {
+                selector: -1,
+                variant_name: String::new(),
+                value: Box::new(PvField::Null),
+            },
+        ];
+        for field in non_throwing {
+            let label = format!("{field:?}");
+            let req = req_with_dbe(field);
+            let mask = dbe_mask(&req, &RemoteLog::default())
+                .expect("a present DBE option always resolves to a mask");
+            assert_eq!(
+                mask, fallback,
+                "DBE {label} is a `default: break` kind: no conversion, no throw, VALUE|ALARM"
+            );
+        }
     }
 }

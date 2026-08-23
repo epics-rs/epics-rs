@@ -6,7 +6,7 @@
 //! All values flow through [`epics_pva_rs::pvdata::PvField`] end-to-end —
 //! only native types appear in this module.
 
-// RTEMS-EXEC-MODEL-ALLOW(21): checked - these run and pass in the feature-ON suite.
+// RTEMS-EXEC-MODEL-ALLOW(23): checked - these run and pass in the feature-ON suite.
 
 use epics_pva_rs::server_native::MonitorStream;
 use std::collections::HashMap;
@@ -431,25 +431,15 @@ async fn open_monitor(
     // `BridgeChannel::create_monitor_with_value_mask`; group
     // and pva_pv-registered channels fall through to the
     // default mask (their DBE selection is not yet wired).
-    // An unconvertible (array-typed) DBE never reaches here: it fails
-    // `QsrvPvStore::check_monitor_request` at INIT, which errors the op (CBUG-C2
-    // — pvxs resets the whole circuit there instead) before it is registered. If
-    // one somehow arrives, take pvxs's `dbe = 0` fallback rather than inventing
-    // a third behaviour.
     //
-    // R10-37: this START-time parse resolves the MASK only. The
-    // `selects empty mask` warning it can raise belongs to INIT — pvxs writes it
-    // inside `onSubscribe`, before `connect()` sends the INIT reply — so
-    // `check_monitor_request` (the port's INIT half of `onSubscribe`) owns the
-    // reporting and this call parses against a log nobody flushes. Passing
-    // `ctx.log` here too would emit the message twice, and after the reply.
-    let discard = epics_pva_rs::server_native::source::RemoteLog::default();
-    let dbe_mask = match ctx.pv_request {
-        Some(PvField::Structure(ref req)) => {
-            crate::qsrv::channel::dbe_mask_from_pv_request(req, &discard).unwrap_or(None)
-        }
-        _ => None,
-    };
+    // R10-37: `opts.dbe` is the mask the WIRE LAYER resolved at INIT, not a
+    // second reading of the pvRequest — the same rule `opts.queue_size`
+    // follows. The parse this used to run here duplicated that resolution and
+    // had to discard its `RemoteLog`, because the `selects empty mask` warning
+    // belongs to INIT: pvxs writes it inside `onSubscribe`, before `connect()`
+    // sends the INIT reply, so `check_monitor_request` (the port's INIT half of
+    // `onSubscribe`) owns the reporting.
+    let dbe_mask = Some(opts.dbe);
     // R10-33: the negotiated monitor queue limit is the SERVER's, not a
     // second reading of the pvRequest. pvxs `GroupSource::onSubscribe` asks
     // the subscription control what depth it actually got
@@ -930,11 +920,11 @@ impl epics_pva_rs::server_native::ChannelSource for QsrvPvStore {
                     "PROCESS not supported for group PV '{name}' (no record-level chain)"
                 )));
             }
-            let (record_name, _field) = epics_base_rs::server::database::parse_pv_name(&name);
+            let cn = epics_base_rs::server::database::filters::parse_channel_name(&name);
             let mut visited = std::collections::HashSet::new();
             provider
                 .database()
-                .process_record_with_links(record_name, &mut visited, 0)
+                .process_record_with_links(&cn.record, &mut visited, 0)
                 .await
                 .map_err(|e| OpError::failed(format!("PROCESS on '{name}': {e}")))
         }
@@ -1498,6 +1488,68 @@ pub async fn build_qsrv_mount(
     }
 }
 
+/// The handles [`QsrvMount::install_sources`] hands back when QSRV2 is on.
+///
+/// Only the pvalink resolver: the two channel sources go straight onto the
+/// caller's [`CompositeSource`](epics_pva_rs::server_native::composite::CompositeSource)
+/// and are never touched again, whereas the resolver still owes the caller
+/// its link count for the boot banner. Empty when QSRV2 is disabled — which
+/// is the whole point of returning a value rather than `()`.
+#[derive(Default)]
+pub struct Qsrv2Sources {
+    /// The resolver `pvalink_enable()` installed, `None` when QSRV2 is off.
+    #[cfg(feature = "pvalink")]
+    pub pvalink: Option<crate::pvalink::PvaLinkResolver>,
+}
+
+impl QsrvMount {
+    /// Mount everything the QSRV2 enable decision turns on — all of it or
+    /// none of it.
+    ///
+    /// pvxs runs `single_enable(); group_enable(); pvalink_enable();` as
+    /// three statements inside ONE `if(enableQ)` (`ioc/iochooks.cpp:485-496`),
+    /// so a C IOC with `PVXS_QSRV_ENABLE=NO` serves no single record, no
+    /// group and resolves no `pva://` link. Three separate `if`s at a call
+    /// site are three chances to gate one and forget the others; this is
+    /// that one block, on the type that already carries the decision, so
+    /// there is no second place the answer can be re-derived.
+    ///
+    /// Registration uses pvxs's own source names and orders, "lower order
+    /// first": `qsrvSingle` at 0 (`ioc/singlesourcehooks.cpp:159`) and
+    /// `qsrvGroup` at 1 (`ioc/groupsourcehooks.cpp:219`). A single record is
+    /// in the database under its own name and answers at order 0; a group PV
+    /// is not, so it falls through to the QSRV store at order 1.
+    ///
+    /// Errors carry the [`CompositeSource`](epics_pva_rs::server_native::composite::CompositeSource)
+    /// rejection verbatim (a duplicate `(name, order)`); the caller decides
+    /// whether that is fatal.
+    pub async fn install_sources(
+        &self,
+        db: &Arc<epics_base_rs::server::database::PvDatabase>,
+        composite: &epics_pva_rs::server_native::composite::CompositeSource,
+    ) -> Result<Qsrv2Sources, String> {
+        if !self.enabled {
+            return Ok(Qsrv2Sources::default());
+        }
+        composite.add_source(
+            "qsrvSingle",
+            Arc::new(epics_pva_rs::server::PvDatabaseSource::new(db.clone())),
+            0,
+        )?;
+        composite.add_source("qsrvGroup", self.store.clone(), 1)?;
+        #[cfg(feature = "pvalink")]
+        {
+            Ok(Qsrv2Sources {
+                pvalink: Some(crate::pvalink::install_pvalink_resolver(db).await),
+            })
+        }
+        #[cfg(not(feature = "pvalink"))]
+        {
+            Ok(Qsrv2Sources::default())
+        }
+    }
+}
+
 /// Async link-set installer for
 /// [`epics_base_rs::server::ioc_app::IocApplication::register_link_set_installer`].
 ///
@@ -1856,6 +1908,84 @@ mod tests {
             store.has_pv("NATIVE:PV").await,
             "native PVA PV stays served even when QSRV2 DB serving is off"
         );
+    }
+
+    // ── The QSRV2 mount gate (QsrvMount::install_sources) ──
+
+    async fn mount_with(
+        enabled: bool,
+    ) -> (Arc<epics_base_rs::server::database::PvDatabase>, QsrvMount) {
+        use epics_base_rs::server::database::PvDatabase;
+        let db = Arc::new(PvDatabase::new());
+        db.add_pv("TEST:GATE", epics_base_rs::types::EpicsValue::Double(1.0))
+            .await
+            .unwrap();
+        let provider = Arc::new(BridgeProvider::new_with_serving(db.clone(), enabled));
+        let mount = QsrvMount {
+            store: Arc::new(QsrvPvStore::new(provider)),
+            enabled,
+        };
+        (db, mount)
+    }
+
+    /// QSRV2 off mounts NOTHING — not the group source, and not the
+    /// single-record source either.
+    ///
+    /// pvxs gates `single_enable()`, `group_enable()` and `pvalink_enable()`
+    /// inside one `if(enableQ)` (`ioc/iochooks.cpp:485-496`), so a C IOC with
+    /// `PVXS_QSRV_ENABLE=NO` answers no record over PVA at all. Gating only
+    /// the group half leaves an IOC that still serves every single record
+    /// while claiming the decision was honoured — visible only to a client.
+    #[tokio::test]
+    async fn qsrv2_disabled_mounts_no_source_at_all() {
+        let (db, mount) = mount_with(false).await;
+        let composite = epics_pva_rs::server_native::composite::CompositeSource::new();
+
+        let sources = mount
+            .install_sources(&db, &composite)
+            .await
+            .expect("mounting nothing cannot fail");
+
+        assert!(
+            composite.list_source().is_empty(),
+            "QSRV2 is disabled, so neither qsrvSingle nor qsrvGroup may be \
+             registered; got {:?}",
+            composite.list_source()
+        );
+        #[cfg(feature = "pvalink")]
+        assert!(
+            sources.pvalink.is_none(),
+            "QSRV2 is disabled, so pvalink_enable() must not have run"
+        );
+        let _ = sources;
+    }
+
+    /// QSRV2 on mounts both sources under pvxs's own names and orders —
+    /// `qsrvSingle` at 0 (`ioc/singlesourcehooks.cpp:159`) and `qsrvGroup` at
+    /// 1 (`ioc/groupsourcehooks.cpp:219`), "lower order first", because the
+    /// order is what decides which source answers a name both could claim.
+    #[tokio::test]
+    async fn qsrv2_enabled_mounts_both_sources_at_the_pvxs_orders() {
+        let (db, mount) = mount_with(true).await;
+        let composite = epics_pva_rs::server_native::composite::CompositeSource::new();
+
+        let sources = mount
+            .install_sources(&db, &composite)
+            .await
+            .expect("a fresh composite accepts both sources");
+
+        let mut got = composite.list_source();
+        got.sort_by_key(|(_, order)| *order);
+        assert_eq!(
+            got,
+            vec![("qsrvSingle".to_string(), 0), ("qsrvGroup".to_string(), 1)]
+        );
+        #[cfg(feature = "pvalink")]
+        assert!(
+            sources.pvalink.is_some(),
+            "QSRV2 is enabled, so pvalink_enable() must have installed a resolver"
+        );
+        let _ = sources;
     }
 
     #[tokio::test]

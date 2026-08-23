@@ -146,8 +146,10 @@ async fn w10_a5_an_array_in_both_masks_is_posted_twice_with_the_two_c_masks() {
         .expect("monitor() posts the NEWM-flagged AA with the alarm bit (:1031-1036)");
     assert_eq!(
         only.mask,
-        EventMask::ALARM | EventMask::VALUE | EventMask::LOG,
-        "this cycle's NoAlarm -> Minor transition puts DBE_ALARM in monitor_mask"
+        EventMask::ALARM,
+        "monitor() posts monitor_mask|DBE_VALUE|DBE_LOG, but the log this \
+         subscription receives carries `caEventMask & pevent->select` \
+         (dbEvent.c:896-900) — DBE_ALARM alone for an ALARM-only select"
     );
     assert!(alarm_rx.try_recv().is_err());
 }

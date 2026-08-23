@@ -4,6 +4,7 @@
 // RTEMS-EXEC-MODEL-ALLOW(1): the test's subject is arming a *tokio* timer with
 // INDEFINITE_TIMEOUT; the tokio timer is the property under test. These run and pass in the
 // feature-ON suite on the tokio driver.
+use epics_base_rs::server::records::printf::format_g;
 use epics_base_rs::server::snapshot::Snapshot;
 use epics_base_rs::types::{DbFieldType, EpicsValue, PvString, WallTime};
 
@@ -976,76 +977,6 @@ fn format_float(x: f64, fmt: &ValueFormat) -> String {
         FloatStyle::E => format_e(x, p),
         FloatStyle::G => format_g(x, p.max(1)),
     }
-}
-
-/// Decimal exponent of `abs` after rounding to `precision` significant
-/// digits — i.e. `floor(log10(round_to_sig_digits(abs, precision)))`.
-///
-/// C `%g` rounds to `precision` significant digits FIRST and only then
-/// decides between `%e` and `%f`. At a rounding boundary the rounded
-/// magnitude can tick up by a power of ten (e.g. `999999.5` at
-/// precision 6 rounds to `1000000`, exponent 5 → 6), which flips the
-/// fixed-vs-scientific choice. Computing the decision exponent from the
-/// UNROUNDED value misses that — see the regression test
-/// `g_rounding_boundary_picks_scientific`.
-fn decision_exponent(abs: f64, precision: usize) -> i32 {
-    let raw_exp = abs.log10().floor() as i32;
-    // Scale so the value has `precision` digits before the decimal
-    // point, round half-to-even, and read back the magnitude. If the
-    // round carries into a new decade the exponent increments.
-    let scale = 10f64.powi(precision as i32 - 1 - raw_exp);
-    // For magnitudes near the f64 range limits the scale factor can
-    // overflow to ±inf (or underflow to 0); `abs * scale` then yields a
-    // non-finite product whose `log10` saturates to a garbage exponent.
-    // The rounded magnitude cannot meaningfully differ from the raw one
-    // at those scales, so fall back to `raw_exp`.
-    if !scale.is_finite() || scale == 0.0 {
-        return raw_exp;
-    }
-    let rounded_scaled = (abs * scale).round();
-    if !rounded_scaled.is_finite() || rounded_scaled <= 0.0 {
-        return raw_exp;
-    }
-    raw_exp + (rounded_scaled.log10().floor() as i32 - (precision as i32 - 1))
-}
-
-/// `%g`-equivalent formatter. C semantics: choose `%e` or `%f`
-/// depending on the exponent, drop trailing zeros and the trailing
-/// decimal point. Precision is the *significant-digit* count.
-fn format_g(x: f64, precision: usize) -> String {
-    if x == 0.0 {
-        return "0".to_string();
-    }
-    let abs = x.abs();
-    // C `%g` rounds to `precision` significant digits before choosing
-    // the format, so the decision exponent must come from the rounded
-    // magnitude, not the raw value.
-    let exp = decision_exponent(abs, precision);
-    // C `%g` uses fixed-point when `precision > exp >= -4`. Compare as
-    // i32 to avoid the silent `i32 → usize` wrap for negative `exp`.
-    if exp >= -4 && exp < precision as i32 {
-        // Fixed-point. Digits after the decimal point = precision-1-exp.
-        let digits = (precision as i32 - 1 - exp).max(0) as usize;
-        let s = format!("{x:.digits$}");
-        trim_g_fixed(&s)
-    } else {
-        format_g_scientific(x, precision)
-    }
-}
-
-fn trim_g_fixed(s: &str) -> String {
-    if !s.contains('.') {
-        return s.to_string();
-    }
-    s.trim_end_matches('0').trim_end_matches('.').to_string()
-}
-
-fn format_g_scientific(x: f64, precision: usize) -> String {
-    // Rust `{:e}` precision means digits after the decimal in the
-    // mantissa. C `%g` with N significant digits is mantissa
-    // precision N-1.
-    let s = format!("{:.*e}", precision - 1, x);
-    rewrite_rust_e_as_c(&s, true)
 }
 
 /// Pure `%e`: precision is digits AFTER the decimal point.

@@ -91,11 +91,11 @@ impl EventMask {
         (self.0 & other.0) != 0
     }
 
-    pub fn bits(self) -> u16 {
+    pub const fn bits(self) -> u16 {
         self.0
     }
 
-    pub fn from_bits(bits: u16) -> Self {
+    pub const fn from_bits(bits: u16) -> Self {
         Self(bits)
     }
 }

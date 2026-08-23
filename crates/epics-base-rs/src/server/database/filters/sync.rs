@@ -132,22 +132,6 @@ pub enum SyncMode {
     Unless,
 }
 
-impl SyncMode {
-    /// Parse the JSON mode keyword. Returns `None` on unrecognised
-    /// strings so the chain parser can warn-and-skip.
-    pub fn from_keyword(s: &str) -> Option<Self> {
-        match s {
-            "before" => Some(Self::Before),
-            "first" => Some(Self::First),
-            "last" => Some(Self::Last),
-            "after" => Some(Self::After),
-            "while" => Some(Self::While),
-            "unless" => Some(Self::Unless),
-            _ => None,
-        }
-    }
-}
-
 /// `sync` filter. Holds:
 ///
 /// * `mode` — which of the six gating policies to apply.
@@ -165,8 +149,13 @@ pub struct SyncFilter {
 }
 
 impl SyncFilter {
-    pub fn new(mode: SyncMode, state_name: impl Into<String>) -> Self {
-        let state = db_state_registry().get_or_create(&state_name.into());
+    /// Takes the state itself, not its name: `sync.c`'s `parse_ok`
+    /// resolves the name with `dbStateFind` and returns -1 when it is
+    /// unknown (`sync.c:87-93`), so a filter over an undeclared state is
+    /// not a thing C can build. Handing the resolved `Arc<DbState>` in
+    /// keeps that true by construction here — the filter has no way to
+    /// create one. `parser::build_sync` is the resolver.
+    pub fn new(mode: SyncMode, state: Arc<DbState>) -> Self {
         Self {
             mode,
             last_state: AtomicBool::new(state.get()),
@@ -289,7 +278,10 @@ mod tests {
 
     #[test]
     fn while_passes_when_state_set() {
-        let f = SyncFilter::new(SyncMode::While, "UNIT:T:WHILE:1");
+        let f = SyncFilter::new(
+            SyncMode::While,
+            db_state_registry().get_or_create("UNIT:T:WHILE:1"),
+        );
         // state starts false → drop
         assert!(f.apply(ev(1.0, EventMask::VALUE)).is_none());
         db_state_registry().set("UNIT:T:WHILE:1", true);
@@ -301,7 +293,10 @@ mod tests {
 
     #[test]
     fn unless_passes_when_state_clear() {
-        let f = SyncFilter::new(SyncMode::Unless, "UNIT:T:UNLESS:1");
+        let f = SyncFilter::new(
+            SyncMode::Unless,
+            db_state_registry().get_or_create("UNIT:T:UNLESS:1"),
+        );
         // state starts false → pass
         assert_eq!(val(&f.apply(ev(1.0, EventMask::VALUE)).unwrap()), 1.0);
         db_state_registry().set("UNIT:T:UNLESS:1", true);
@@ -314,7 +309,10 @@ mod tests {
 
     #[test]
     fn first_passes_first_event_after_0_to_1_transition() {
-        let f = SyncFilter::new(SyncMode::First, "UNIT:T:FIRST:1");
+        let f = SyncFilter::new(
+            SyncMode::First,
+            db_state_registry().get_or_create("UNIT:T:FIRST:1"),
+        );
         // No transition yet → drop
         assert!(f.apply(ev(0.0, EventMask::VALUE)).is_none());
         // Flip state up. The NEXT apply observes the transition.
@@ -340,7 +338,10 @@ mod tests {
 
     #[test]
     fn after_passes_first_event_after_1_to_0_transition() {
-        let f = SyncFilter::new(SyncMode::After, "UNIT:T:AFTER:1");
+        let f = SyncFilter::new(
+            SyncMode::After,
+            db_state_registry().get_or_create("UNIT:T:AFTER:1"),
+        );
         // Start with state=1 so the first downward transition is
         // observable.
         db_state_registry().set("UNIT:T:AFTER:1", true);
@@ -356,7 +357,10 @@ mod tests {
 
     #[test]
     fn before_emits_cached_pre_transition_event() {
-        let f = SyncFilter::new(SyncMode::Before, "UNIT:T:BEFORE:1");
+        let f = SyncFilter::new(
+            SyncMode::Before,
+            db_state_registry().get_or_create("UNIT:T:BEFORE:1"),
+        );
         // Pre-transition events get cached, dropped from the stream.
         assert!(f.apply(ev(10.0, EventMask::VALUE)).is_none());
         assert!(f.apply(ev(20.0, EventMask::VALUE)).is_none());
@@ -375,7 +379,10 @@ mod tests {
 
     #[test]
     fn last_emits_cached_on_downward_transition() {
-        let f = SyncFilter::new(SyncMode::Last, "UNIT:T:LAST:1");
+        let f = SyncFilter::new(
+            SyncMode::Last,
+            db_state_registry().get_or_create("UNIT:T:LAST:1"),
+        );
         db_state_registry().set("UNIT:T:LAST:1", true);
         // While state=1: events get cached, dropped.
         assert!(f.apply(ev(10.0, EventMask::VALUE)).is_none());
@@ -398,7 +405,7 @@ mod tests {
             SyncMode::While,
             SyncMode::Unless,
         ] {
-            let f = SyncFilter::new(mode, "UNIT:T:PROP");
+            let f = SyncFilter::new(mode, db_state_registry().get_or_create("UNIT:T:PROP"));
             assert!(
                 f.apply(ev(0.0, EventMask::PROPERTY)).is_some(),
                 "{mode:?} must pass property"
@@ -412,7 +419,10 @@ mod tests {
     #[test]
     fn alarm_event_runs_through_state_machine_in_while_mode() {
         let state_name = "UNIT:T:ALARM_GATED";
-        let f = SyncFilter::new(SyncMode::While, state_name);
+        let f = SyncFilter::new(
+            SyncMode::While,
+            db_state_registry().get_or_create(state_name),
+        );
         db_state_registry().set(state_name, false);
         assert!(
             f.apply(ev(0.0, EventMask::ALARM)).is_none(),
@@ -433,16 +443,5 @@ mod tests {
         let b = db_state_registry().get_or_create("UNIT:T:SHARED");
         a.set(true);
         assert!(b.get(), "both Arcs view the same AtomicBool");
-    }
-
-    #[test]
-    fn mode_keyword_parsing() {
-        assert_eq!(SyncMode::from_keyword("before"), Some(SyncMode::Before));
-        assert_eq!(SyncMode::from_keyword("first"), Some(SyncMode::First));
-        assert_eq!(SyncMode::from_keyword("last"), Some(SyncMode::Last));
-        assert_eq!(SyncMode::from_keyword("after"), Some(SyncMode::After));
-        assert_eq!(SyncMode::from_keyword("while"), Some(SyncMode::While));
-        assert_eq!(SyncMode::from_keyword("unless"), Some(SyncMode::Unless));
-        assert_eq!(SyncMode::from_keyword("nonsense"), None);
     }
 }

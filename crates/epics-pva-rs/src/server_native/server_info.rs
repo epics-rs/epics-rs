@@ -70,6 +70,19 @@ const NO_SUCH_FIELD: &str = "No such field";
 /// `__` marks it internal (pvxs convention, see `composite.rs`).
 pub const SERVER_SOURCE_NAME: &str = "__server";
 
+/// Source name under which the hand-in user source is registered.
+///
+/// NOT pvxs's `"__builtin"`. That key belongs to `Server::Pvt::builtinsrc`
+/// (`serverconn.h:265`), a source the *server* owns and only
+/// `Server::addPV` writes into (`server.cpp:174-181`); an application never
+/// hands one in. [`super::PvaServer::start`] takes the application's own
+/// source, which is pvxs's `Server::addSource(name, src, order)` shape, and
+/// that defaults to order 0 (`pvxs/server.h:116-118`) — behind both
+/// internals. epics-rs has no `addPV` equivalent, so nothing occupies
+/// `(-1, "__builtin")` and claiming that key for a hand-in source would put
+/// an application source in the band pvxs reserves for its own.
+pub const USER_SOURCE_NAME: &str = "__user";
+
 /// Wrap a user source in the composite every PVA server must serve from.
 ///
 /// # Why this is a function and not two call sites
@@ -92,14 +105,29 @@ pub const SERVER_SOURCE_NAME: &str = "__server";
 ///
 /// # The rule
 ///
-/// The built-in `__server` source registers at order **-1**, ahead of the
-/// default-order (0) user source, matching pvxs registering its `ServerSource`
-/// at `(order = -1, "__server")` (`server.cpp:542-547`) where the lowest order
-/// is consulted first (`server.h:108-118`). The built-in source only claims
-/// the reserved `server` name, so running it first shadows a user PV called
-/// `server` — the pvxs diagnostic-source contract — while every other name
-/// still falls through. A user that genuinely wants to own `server` must
-/// register at an explicit order < -1.
+/// pvxs registers both of its internal sources at order **-1**
+/// (`server.cpp:542-546`) and keys the registry by `(order, name)`
+/// (`serverconn.h:268`, `server.cpp:91`), iterating it ascending at
+/// CREATE_CHANNEL (`serverchan.cpp:304`). Application sources go in through
+/// `Server::addSource`, whose order defaults to **0**
+/// (`pvxs/server.h:116-118`) — QSRV is the worked example, `qsrvSingle` at 0
+/// (`ioc/singlesourcehooks.cpp:158`) and `qsrvGroup` at 1
+/// (`ioc/groupsourcehooks.cpp:219`). So every application source sits
+/// strictly behind the internals, and that is the band the hand-in source
+/// gets here.
+///
+/// The consequence is deliberate and is pvxs's, not ours: a database record
+/// named literally `server` is SHADOWED. `ServerSource::onSearch` is empty
+/// — "our `server` PV is not advertised" (`serversource.cpp:25-28`) — so the
+/// SEARCH is answered only because the user source advertises the record,
+/// but `onCreate` then claims any channel whose name is `server`
+/// (`serversource.cpp:30-33`) before the order-0 source is consulted. Since
+/// `pvxlist` reaches the facility by RPC-ing that same channel name
+/// (`tools/list.cpp:159-161`), letting a user PV win the name is exactly
+/// what takes `pvxlist` and `pvxinfo` off the air. Only pvxs's own
+/// `addPV`-backed `builtinsrc` outranks the diagnostic, and epics-rs has no
+/// `addPV`. Every name other than `server` falls through to the user
+/// source, because the built-in source claims nothing else.
 ///
 /// The channel lister enumerates the **user** source directly rather than the
 /// composite. Going through the composite would also include the built-in
@@ -121,7 +149,7 @@ pub fn compose_with_server_info(user_source: super::DynSource) -> Result<super::
     }));
 
     let composite = super::CompositeSource::new();
-    composite.add_source("__user", user_source, 0)?;
+    composite.add_source(USER_SOURCE_NAME, user_source, 0)?;
     composite.add_source(SERVER_SOURCE_NAME, server_info as super::DynSource, -1)?;
     Ok(composite as super::DynSource)
 }

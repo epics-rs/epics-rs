@@ -741,7 +741,10 @@ fn monitor_pipeline_options(
     }))
 }
 
-#[derive(Clone)]
+// Not `Clone`: `parked` owns the abort handles for the descriptor waits
+// suspended on this channel, and a second copy of those guards would let a
+// dropped clone cancel a wait the live channel still needs. Nothing clones
+// a channel — the read loop owns the one instance and hands out `&`/`&mut`.
 #[allow(dead_code)]
 struct ChannelState {
     name: String,
@@ -779,6 +782,21 @@ struct ChannelState {
     open_cred: Arc<ClientCredentials>,
     /// ioid → (introspection negotiated for this op, kind)
     ops: HashMap<u32, OpState>,
+    /// ioid → an operation INIT held because the channel has no
+    /// descriptor YET.
+    ///
+    /// pvxs never answers such an INIT with an error: `SharedPV::onOp`
+    /// inserts the `ConnectOp` into `pending` (`sharedpv.cpp:239-249`),
+    /// `onSubscribe` puts the `MonitorSetupOp` into `mpending`
+    /// (`:259-275`), and `SharedPV::open` walks both sets running
+    /// `connectOp`/`connectSub` (`:348-384`), so a client that connected
+    /// before `open()` gets its INIT reply the moment the PV opens. This
+    /// map is the connection's half of those two sets; the PV's half is
+    /// the task suspended in [`SharedPV::wait_open`](crate::server_native::SharedPV::wait_open),
+    /// whose abort handle each entry owns. Dropping the entry — channel
+    /// teardown, DESTROY_REQUEST, connection end — cancels the wait, which
+    /// is exactly what pvxs's `conn->onClose` erase does.
+    parked: HashMap<u32, ParkedOp>,
     /// Reusable PUT-delta decode scratch, keyed by the op intro it was
     /// built for (`Arc::ptr_eq`). A PUT/PUT_GET EXEC takes it, decodes
     /// the marked fields in place ([`decode_pv_field_with_bitset_into`])
@@ -817,6 +835,36 @@ impl std::fmt::Debug for ChannelState {
             .field("ops", &self.ops)
             .finish()
     }
+}
+
+/// One operation INIT held until its channel has a descriptor. See
+/// [`ChannelState::parked`].
+#[derive(Debug)]
+struct ParkedOp {
+    /// The INIT frame verbatim, replayed through its own handler once the
+    /// descriptor lands — so the parked path negotiates the pvRequest,
+    /// the field mask and the op state through exactly the same code the
+    /// unparked path did, never a second transcription of it.
+    frame: Frame,
+    kind: OpKind,
+    /// INIT subcommand, kept for the refusal reply: a source that answers
+    /// "no descriptor, ever" still owes this op an error, and the reply
+    /// echoes the subcommand it arrived with.
+    subcmd: u8,
+    /// Aborts the descriptor wait when this entry is dropped.
+    _wait: Option<AbortOnDrop>,
+}
+
+/// A parked op's descriptor answer, sent from the waiting task back to the
+/// read loop that owns the channel table.
+#[derive(Debug)]
+struct IntroReady {
+    sid: u32,
+    ioid: u32,
+    /// `None` is the source's permanent answer — no descriptor will come —
+    /// and the parked op is refused. It is NOT "not yet": a source that
+    /// can publish later suspends inside `await_introspection` instead.
+    desc: Option<Arc<FieldDesc>>,
 }
 
 /// Shared abort guard: when the last clone is dropped (HashMap removal,
@@ -861,6 +909,68 @@ where
         std::task::Poll::Ready(()) => None,
         std::task::Poll::Pending => Some(epics_base_rs::runtime::task::spawn(fut).abort_handle()),
     }
+}
+
+/// What the park owner needs from its caller that is not on the channel.
+struct ParkCtx<'a> {
+    peer: std::net::SocketAddr,
+    cred: &'a Arc<ClientCredentials>,
+    ready_tx: &'a mpsc::UnboundedSender<IntroReady>,
+}
+
+/// Hold an operation INIT that arrived before its channel had a
+/// descriptor, and start the wait for one.
+///
+/// The single owner of the port's `pending`/`mpending` (pvxs
+/// `sharedpv.cpp:239-249`, `:259-275`): every INIT that needs a prototype
+/// comes here when the channel has none, whatever the command, so a PV
+/// opened after a client connected serves GET, PUT, MONITOR, PUT_GET and
+/// PROCESS alike — `SharedPV::open` completes them all at once
+/// (`:348-384`), and the search that let the client connect never
+/// consulted the open state either (`:478-488`).
+///
+/// A source with no descriptor to give answers `None` and the op is
+/// refused from the read loop, so "no such field" still fails fast; only
+/// a source that CAN publish later suspends. Dropping the returned entry
+/// cancels the wait, which is the whole of pvxs's `conn->onClose` erase.
+fn park_op_for_intro(
+    ch: &mut ChannelState,
+    frame: &Frame,
+    kind: OpKind,
+    subcmd: u8,
+    sid: u32,
+    ioid: u32,
+    ctx: &ParkCtx<'_>,
+) {
+    let name = ch.name.clone();
+    let source = ch.source.clone();
+    // The wait runs under the connection's own credential, like every
+    // other per-operation source call (pvxs builds each op from
+    // `conn->cred`).
+    let wait_ctx = crate::server_native::source::ChannelContext {
+        peer: ctx.peer,
+        creds: ctx.cred.clone(),
+        pv_request: None,
+        log: Default::default(),
+    };
+    let ready_tx = ctx.ready_tx.clone();
+    let wait = poll_inline_or_spawn(async move {
+        let desc = source.await_introspection(&name, wait_ctx).await;
+        let _ = ready_tx.send(IntroReady {
+            sid,
+            ioid,
+            desc: desc.map(Arc::new),
+        });
+    });
+    ch.parked.insert(
+        ioid,
+        ParkedOp {
+            frame: frame.clone(),
+            kind,
+            subcmd,
+            _wait: wait.map(AbortOnDrop),
+        },
+    );
 }
 
 /// Apply the data-phase op continuation after a GET/PUT/RPC EXEC body
@@ -1154,7 +1264,9 @@ fn apply_exec_finish(channels: &mut HashMap<u32, ChannelState>, fin: ExecFinishe
 /// the duplicate-IOID rule holds across channels by construction rather than
 /// maintaining a redundant secondary index that could desync.
 fn ioid_live_on_conn(channels: &HashMap<u32, ChannelState>, ioid: u32) -> bool {
-    channels.values().any(|c| c.ops.contains_key(&ioid))
+    channels
+        .values()
+        .any(|c| c.ops.contains_key(&ioid) || c.parked.contains_key(&ioid))
 }
 
 /// SID of the channel that owns the operation `ioid`, scanning the whole
@@ -1162,9 +1274,9 @@ fn ioid_live_on_conn(channels: &HashMap<u32, ChannelState>, ioid: u32) -> bool {
 /// `opByIOID` and only then consults the SID (`serverconn.cpp:262-346`); with
 /// connection-wide IOID uniqueness an IOID maps to at most one channel.
 fn op_owner_sid(channels: &HashMap<u32, ChannelState>, ioid: u32) -> Option<u32> {
-    channels
-        .iter()
-        .find_map(|(sid, c)| c.ops.contains_key(&ioid).then_some(*sid))
+    channels.iter().find_map(|(sid, c)| {
+        (c.ops.contains_key(&ioid) || c.parked.contains_key(&ioid)).then_some(*sid)
+    })
 }
 
 /// Resolve which channel should service a data-phase (non-INIT) operation
@@ -3473,6 +3585,10 @@ pub(super) async fn handle_connection_io(
     // (see [`ExecFinished`]/[`apply_exec_finish`]). Same unbounded-so-Drop-
     // never-loses rationale as `mon_fin_tx`.
     let (exec_fin_tx, mut exec_fin_rx) = mpsc::unbounded_channel::<ExecFinished>();
+    // Descriptor answers for ops parked in `ChannelState::parked`, sent by
+    // the waiting tasks back to this loop — the only owner of the channel
+    // table, so the only place a parked INIT can be replayed or refused.
+    let (intro_ready_tx, mut intro_ready_rx) = mpsc::unbounded_channel::<IntroReady>();
     // Count of in-flight CREATE_CHANNEL resolver tasks. Used in the
     // per-connection channel cap check: channels being resolved count
     // against the limit to prevent a burst of concurrent requests from
@@ -3542,6 +3658,7 @@ pub(super) async fn handle_connection_io(
                             stat: stat.clone(),
                             open_cred: cc.open_cred,
                             ops: HashMap::new(),
+                            parked: HashMap::new(),
                             put_scratch: None,
                     intro_wire: None,
                         });
@@ -3572,9 +3689,13 @@ pub(super) async fn handle_connection_io(
                         // operations from the owner's post-open descriptor; bind
                         // the owner, drive its open hook, THEN obtain and cache
                         // the descriptor from that SAME owner — so a GET / PUT /
-                        // MONITOR INIT reads a real prototype instead of replying
-                        // "must provide prototype" against a PV the hook just
-                        // opened. Only fires when the snapshot was absent; an
+                        // MONITOR INIT reads a real prototype straight away
+                        // instead of parking on a PV the hook just opened. This
+                        // is a cache warm, not a second gate: an INIT that still
+                        // finds no descriptor parks (`park_op_for_intro`) and is
+                        // replayed when one arrives, which is what covers an
+                        // ASYNCHRONOUS `open()` landing after CREATE_CHANNEL.
+                        // Only fires when the snapshot was absent; an
                         // already-resolved descriptor (the common case) is left
                         // untouched, so this adds no source round-trip for a PV
                         // that was open at resolve time.
@@ -3656,6 +3777,89 @@ pub(super) async fn handle_connection_io(
                 // (a `lastRequest` op was already removed and is a no-op here).
                 if let Some(fin) = exec_opt {
                     apply_exec_finish(&mut channels, fin);
+                }
+                continue;
+            }
+            ready_opt = intro_ready_rx.recv() => {
+                // A descriptor wait for a parked INIT finished. This loop
+                // owns the channel table, so it is the only place the
+                // parked frame can be replayed — and replaying the frame
+                // through its own handler is what keeps the parked and
+                // unparked paths one implementation.
+                let Some(ready) = ready_opt else { continue };
+                let Some(ch) = channels.get_mut(&ready.sid) else { continue };
+                let Some(parked) = ch.parked.remove(&ready.ioid) else { continue };
+                let chan_tx = ChannelTx::new(tx.clone(), ch.stat.clone());
+                let Some(desc) = ready.desc else {
+                    // The source has no descriptor for this channel and
+                    // never will — a park is not an indefinite hold.
+                    send_chan_op_error(
+                        &chan_tx,
+                        parked.kind,
+                        ready.ioid,
+                        parked.subcmd,
+                        Status::error("must provide prototype"),
+                        order,
+                    )
+                    .await?;
+                    continue;
+                };
+                // Cache it on the channel the way CREATE_CHANNEL would
+                // have, so the replay — and every later op on this
+                // channel — reads a real prototype.
+                ch.introspection = Some(desc);
+                let frame = parked.frame;
+                match parked.kind {
+                    OpKind::PutGet => {
+                        handle_put_get(
+                            &frame,
+                            &tx,
+                            &mut channels,
+                            order,
+                            &config,
+                            &mut encode_type_cache,
+                            &mut rx_type_cache,
+                            peer,
+                            &cred,
+                            &exec_fin_tx,
+                            &ParkCtx { peer, cred: &cred, ready_tx: &intro_ready_tx },
+                        )
+                        .await?;
+                    }
+                    OpKind::Process => {
+                        handle_process(
+                            &frame,
+                            &tx,
+                            &mut channels,
+                            order,
+                            &config,
+                            &mut rx_type_cache,
+                            peer,
+                            &cred,
+                            &exec_fin_tx,
+                            &ParkCtx { peer, cred: &cred, ready_tx: &intro_ready_tx },
+                        )
+                        .await?;
+                    }
+                    kind => {
+                        handle_op(
+                            &frame,
+                            &tx,
+                            &mut channels,
+                            order,
+                            &out_order,
+                            kind,
+                            &config,
+                            &mut encode_type_cache,
+                            &mut rx_type_cache,
+                            peer,
+                            &cred,
+                            &mon_fin_tx,
+                            &exec_fin_tx,
+                            &ParkCtx { peer, cred: &cred, ready_tx: &intro_ready_tx },
+                        )
+                        .await?;
+                    }
                 }
                 continue;
             }
@@ -3863,6 +4067,15 @@ pub(super) async fn handle_connection_io(
             }
         }
 
+        // Where an operation INIT goes when its channel has no descriptor
+        // yet. Rebuilt per frame because `cred` is re-assigned by a
+        // mid-stream re-auth, and a park must wait under the credential
+        // in force when its INIT arrived.
+        let park = ParkCtx {
+            peer,
+            cred: &cred,
+            ready_tx: &intro_ready_tx,
+        };
         // Application messages
         match Command::from_code(frame.header.command) {
             Some(Command::CreateChannel) => {
@@ -3914,6 +4127,7 @@ pub(super) async fn handle_connection_io(
                     &cred,
                     &mon_fin_tx,
                     &exec_fin_tx,
+                    &park,
                 )
                 .await?;
             }
@@ -3933,6 +4147,7 @@ pub(super) async fn handle_connection_io(
                     &cred,
                     &mon_fin_tx,
                     &exec_fin_tx,
+                    &park,
                 )
                 .await?;
             }
@@ -3952,6 +4167,7 @@ pub(super) async fn handle_connection_io(
                     &cred,
                     &mon_fin_tx,
                     &exec_fin_tx,
+                    &park,
                 )
                 .await?;
             }
@@ -3971,6 +4187,7 @@ pub(super) async fn handle_connection_io(
                     &cred,
                     &mon_fin_tx,
                     &exec_fin_tx,
+                    &park,
                 )
                 .await?;
             }
@@ -4022,6 +4239,7 @@ pub(super) async fn handle_connection_io(
                     peer,
                     &cred,
                     &exec_fin_tx,
+                    &park,
                 )
                 .await?;
             }
@@ -4041,6 +4259,7 @@ pub(super) async fn handle_connection_io(
                     peer,
                     &cred,
                     &exec_fin_tx,
+                    &park,
                 )
                 .await?;
             }
@@ -4370,6 +4589,9 @@ async fn handle_put_get(
     // PUT_GET exec task installs an `ExecFinishGuard` so the owner returns
     // the op to `Idle` when its readback reply is sent.
     exec_fin_tx: &mpsc::UnboundedSender<ExecFinished>,
+    // Where an INIT goes when the channel has no descriptor yet — the
+    // port's `pending`/`mpending`. See [`park_op_for_intro`].
+    park: &ParkCtx<'_>,
 ) -> PvaResult<()> {
     // Inbound payload decodes with the frame's own header order (pvxs
     // latches `peerBE` per received message, conn.cpp:195-198); `order`
@@ -4469,19 +4691,11 @@ async fn handle_put_get(
             .await?;
             return Ok(());
         }
-        // PUT_GET also requires a descriptor.
+        // PUT_GET also requires a descriptor — park until one exists.
         let intro = match ch.introspection.clone() {
             Some(d) => d,
             None => {
-                send_chan_op_error(
-                    &chan_tx,
-                    OpKind::PutGet,
-                    ioid,
-                    subcmd,
-                    Status::error("must provide prototype"),
-                    order,
-                )
-                .await?;
+                park_op_for_intro(ch, frame, OpKind::PutGet, subcmd, sid, ioid, park);
                 return Ok(());
             }
         };
@@ -4834,6 +5048,9 @@ async fn handle_process(
     // PROCESS exec task installs an `ExecFinishGuard` so the owner returns
     // the op to `Idle` when its reply is sent.
     exec_fin_tx: &mpsc::UnboundedSender<ExecFinished>,
+    // Where an INIT goes when the channel has no descriptor yet — the
+    // port's `pending`/`mpending`. See [`park_op_for_intro`].
+    park: &ParkCtx<'_>,
 ) -> PvaResult<()> {
     // Inbound payload decodes with the frame's own header order (pvxs
     // latches `peerBE` per received message, conn.cpp:195-198); `order`
@@ -4912,20 +5129,12 @@ async fn handle_process(
         // PROCESS still requires a descriptor — even though
         // PROCESS has no value payload, the source must commit to
         // *some* introspection at channel creation. A missing
-        // descriptor means the source can't describe what PROCESS
-        // would act on.
+        // descriptor means the source cannot yet describe what PROCESS
+        // would act on, so the op parks until it can.
         let intro = match ch.introspection.clone() {
             Some(d) => d,
             None => {
-                send_chan_op_error(
-                    &chan_tx,
-                    OpKind::Process,
-                    ioid,
-                    subcmd,
-                    Status::error("must provide prototype"),
-                    order,
-                )
-                .await?;
+                park_op_for_intro(ch, frame, OpKind::Process, subcmd, sid, ioid, park);
                 return Ok(());
             }
         };
@@ -5764,8 +5973,13 @@ fn close_channel(ch: ChannelState, peer: SocketAddr) {
         source,
         open_cred,
         ops,
+        parked,
         ..
     } = ch;
+    // A channel teardown cancels every wait parked on it, exactly as
+    // pvxs's `conn->onClose` erases the op from `pending` / `mpending`
+    // (`sharedpv.cpp:231-237`, `:263-270`).
+    drop(parked);
     drop(ops);
     let ctx = channel_lifecycle_ctx(peer, &open_cred);
     source.notify_channel_close(&name, &ctx);
@@ -6175,6 +6389,10 @@ fn handle_destroy_request(
         // Removing the op drops `monitor_abort: Option<Arc<AbortOnDrop>>`.
         // Once the last clone is dropped, the subscriber task aborts.
         ch.ops.remove(&ioid);
+        // A DESTROY on an op still parked for its descriptor cancels the
+        // wait — pvxs's `conn->onClose` erasing it from `pending` /
+        // `mpending` (`sharedpv.cpp:231-237`, `:263-270`).
+        ch.parked.remove(&ioid);
     }
     Ok(())
 }
@@ -6292,6 +6510,9 @@ async fn handle_op(
     // GET/PUT/RPC data task installs an `ExecFinishGuard` cloned from this so
     // the owner returns the op to `Idle` when the response is sent.
     exec_fin_tx: &mpsc::UnboundedSender<ExecFinished>,
+    // Where an INIT goes when the channel has no descriptor yet — the
+    // port's `pending`/`mpending`. See [`park_op_for_intro`].
+    park: &ParkCtx<'_>,
 ) -> PvaResult<()> {
     // Inbound payload decodes with the frame's own header order (pvxs
     // latches `peerBE` per received message, conn.cpp:195-198); `order`
@@ -6392,27 +6613,24 @@ async fn handle_op(
             return Ok(());
         }
 
-        // pvxs `serverget.cpp:182-193` rejects missing
-        // prototype for non-RPC operations with "Must provide
-        // prototype". Rust's previous fallback turned a source bug
-        // (no `get_introspection`) into a successful GET/PUT/MONITOR
-        // INIT with a `Variant` descriptor — masking the bug and
-        // letting later mismatched-value encoding look valid. RPC
-        // can still proceed without a prototype (descriptor-late).
+        // A non-RPC operation needs a prototype, and a channel that has
+        // none yet PARKS the INIT rather than refusing it — see
+        // [`park_op_for_intro`]. The refusal this replaced cited pvxs
+        // `serverget.cpp:182-193` as its authority, which that code is
+        // not: the `throw std::invalid_argument("Must provide prototype")`
+        // there guards an APPLICATION calling `ConnectOp::connect()` with
+        // an empty prototype, and `serverget.cpp:409-413` catches it and
+        // logs it, so the text never reaches the wire. pvxs has no path
+        // that answers a client "must provide prototype"; a closed
+        // `SharedPV` parks the op instead (`sharedpv.cpp:239-275`). RPC
+        // still proceeds without a prototype (descriptor-late), which is
+        // why it never parks.
         let intro = match (kind, ch.introspection.clone()) {
             (OpKind::Rpc, Some(d)) => d,
             (OpKind::Rpc, None) => Arc::new(FieldDesc::Variant),
             (_, Some(d)) => d,
             (_, None) => {
-                send_chan_op_error(
-                    &chan_tx,
-                    kind,
-                    ioid,
-                    subcmd,
-                    Status::error("must provide prototype"),
-                    order,
-                )
-                .await?;
+                park_op_for_intro(ch, frame, kind, subcmd, sid, ioid, park);
                 return Ok(());
             }
         };
@@ -6710,12 +6928,15 @@ async fn handle_op(
         // enabled (pvxs `op->limit = qSize` is honoured for plain
         // monitors too, servermon.cpp:533-543) — the START path reads it
         // as the per-op squash threshold. `server_filter` reflects
-        // whether a non-empty `_filter` chain was present.
+        // whether a non-empty `_filter` chain was present. `dbe` is the
+        // resolved `record._options.DBE` value-class mask, read here once
+        // so no source re-parses it at START.
         let monitor_options = if kind == OpKind::Monitor {
             crate::server_native::source::MonitorOptions {
                 pipeline: pipeline_opt.is_some(),
                 queue_size: negotiated_limit,
                 server_filter: !monitor_filters.is_empty(),
+                dbe: crate::server_native::source::MonitorOptions::resolve_dbe(req_value.as_ref()),
             }
         } else {
             crate::server_native::source::MonitorOptions::default()
@@ -7892,7 +8113,12 @@ async fn handle_get_field(
             tx: exec_fin_tx_task,
             fin: exec_fin,
         };
-        let intro = src.get_introspection_checked(&pv_name, conn_ctx).await;
+        // GET_FIELD parks like every other op: pvxs routes it through the
+        // channel's own `onOp` (`serverintrospect.cpp:174-176`), so a
+        // closed `SharedPV` puts this introspect in `pending` too and
+        // answers when `open()` runs. The reserved IOID's abort guard
+        // cancels the wait if the channel or connection goes away first.
+        let intro = src.await_introspection(&pv_name, conn_ctx).await;
         let mut payload = Vec::new();
         payload.put_u32(ioid, order);
         match intro {
@@ -8551,6 +8777,10 @@ mod tests {
     /// these tests never call [`apply_exec_finish`]). Tests that assert the
     /// return-to-`Idle` build a real channel and keep the receiver.
     fn discard_exec_fin() -> mpsc::UnboundedSender<ExecFinished> {
+        mpsc::unbounded_channel().0
+    }
+
+    fn discard_intro_ready() -> mpsc::UnboundedSender<IntroReady> {
         mpsc::unbounded_channel().0
     }
 
@@ -10184,6 +10414,7 @@ mod tests {
                     stat: crate::server_native::peers::ChannelStat::new(String::new()),
                     open_cred: Arc::new(ClientCredentials::anonymous(TEST_PEER)),
                     ops: HashMap::new(),
+                    parked: HashMap::new(),
                     put_scratch: None,
                     intro_wire: None,
                 },
@@ -10222,6 +10453,11 @@ mod tests {
                 &cred,
                 &discard_mon_fin(),
                 &discard_exec_fin(),
+                &ParkCtx {
+                    peer,
+                    cred: &Arc::new(ClientCredentials::anonymous(peer)),
+                    ready_tx: &discard_intro_ready(),
+                },
             )
             .await
             .map(|()| {
@@ -10281,6 +10517,7 @@ mod tests {
                     stat: crate::server_native::peers::ChannelStat::new(String::new()),
                     open_cred: Arc::new(ClientCredentials::anonymous(TEST_PEER)),
                     ops: HashMap::new(),
+                    parked: HashMap::new(),
                     put_scratch: None,
                     intro_wire: None,
                 },
@@ -10318,6 +10555,11 @@ mod tests {
                 &cred,
                 &discard_mon_fin(),
                 &discard_exec_fin(),
+                &ParkCtx {
+                    peer,
+                    cred: &Arc::new(ClientCredentials::anonymous(peer)),
+                    ready_tx: &discard_intro_ready(),
+                },
             )
             .await;
             let fatal = result.is_err();
@@ -10377,6 +10619,7 @@ mod tests {
                 stat: crate::server_native::peers::ChannelStat::new(String::new()),
                 open_cred: Arc::new(ClientCredentials::anonymous(TEST_PEER)),
                 ops: HashMap::new(),
+                parked: HashMap::new(),
                 put_scratch: None,
                 intro_wire: None,
             },
@@ -10412,6 +10655,11 @@ mod tests {
             &cred,
             &discard_mon_fin(),
             &discard_exec_fin(),
+            &ParkCtx {
+                peer,
+                cred: &Arc::new(ClientCredentials::anonymous(peer)),
+                ready_tx: &discard_intro_ready(),
+            },
         )
         .await;
         assert!(
@@ -10474,6 +10722,7 @@ mod tests {
                     stat: crate::server_native::peers::ChannelStat::new(String::new()),
                     open_cred: Arc::new(ClientCredentials::anonymous(TEST_PEER)),
                     ops: HashMap::new(),
+                    parked: HashMap::new(),
                     put_scratch: None,
                     intro_wire: None,
                 },
@@ -10510,6 +10759,11 @@ mod tests {
                 &cred,
                 &discard_mon_fin(),
                 &discard_exec_fin(),
+                &ParkCtx {
+                    peer,
+                    cred: &Arc::new(ClientCredentials::anonymous(peer)),
+                    ready_tx: &discard_intro_ready(),
+                },
             )
             .await
             .is_err();
@@ -11139,6 +11393,7 @@ mod tests {
                 stat: crate::server_native::peers::ChannelStat::new(String::new()),
                 open_cred: Arc::new(ClientCredentials::anonymous(TEST_PEER)),
                 ops: HashMap::new(),
+                parked: HashMap::new(),
                 put_scratch: None,
                 intro_wire: None,
             },
@@ -11178,6 +11433,11 @@ mod tests {
             &cred,
             &discard_mon_fin(),
             &discard_exec_fin(),
+            &ParkCtx {
+                peer,
+                cred: &Arc::new(ClientCredentials::anonymous(peer)),
+                ready_tx: &discard_intro_ready(),
+            },
         )
         .await
         .expect("MONITOR INIT ok");
@@ -11251,6 +11511,7 @@ mod tests {
                 stat: crate::server_native::peers::ChannelStat::new(String::new()),
                 open_cred: Arc::new(ClientCredentials::anonymous(TEST_PEER)),
                 ops: HashMap::new(),
+                parked: HashMap::new(),
                 put_scratch: None,
                 intro_wire: None,
             },
@@ -11294,6 +11555,11 @@ mod tests {
             &cred,
             &discard_mon_fin(),
             &discard_exec_fin(),
+            &ParkCtx {
+                peer,
+                cred: &Arc::new(ClientCredentials::anonymous(peer)),
+                ready_tx: &discard_intro_ready(),
+            },
         )
         .await;
         assert!(
@@ -11346,6 +11612,7 @@ mod tests {
                 stat: crate::server_native::peers::ChannelStat::new(String::new()),
                 open_cred: Arc::new(ClientCredentials::anonymous(TEST_PEER)),
                 ops: HashMap::new(),
+                parked: HashMap::new(),
                 put_scratch: None,
                 intro_wire: None,
             },
@@ -11387,6 +11654,11 @@ mod tests {
             &cred,
             &discard_mon_fin(),
             &discard_exec_fin(),
+            &ParkCtx {
+                peer,
+                cred: &Arc::new(ClientCredentials::anonymous(peer)),
+                ready_tx: &discard_intro_ready(),
+            },
         )
         .await
         .expect("pipeline MONITOR INIT ok");
@@ -11606,6 +11878,7 @@ mod tests {
                 stat: crate::server_native::peers::ChannelStat::new(String::new()),
                 open_cred: Arc::new(ClientCredentials::anonymous(TEST_PEER)),
                 ops: HashMap::new(),
+                parked: HashMap::new(),
                 put_scratch: None,
                 intro_wire: None,
             },
@@ -11649,6 +11922,11 @@ mod tests {
             &cred,
             &discard_mon_fin(),
             &discard_exec_fin(),
+            &ParkCtx {
+                peer,
+                cred: &Arc::new(ClientCredentials::anonymous(peer)),
+                ready_tx: &discard_intro_ready(),
+            },
         )
         .await
         .expect("MONITOR INIT ok");
@@ -11675,6 +11953,11 @@ mod tests {
             &cred,
             &discard_mon_fin(),
             &discard_exec_fin(),
+            &ParkCtx {
+                peer,
+                cred: &Arc::new(ClientCredentials::anonymous(peer)),
+                ready_tx: &discard_intro_ready(),
+            },
         )
         .await
         .expect("MONITOR START ok");
@@ -11776,6 +12059,7 @@ mod tests {
                 stat: crate::server_native::peers::ChannelStat::new(String::new()),
                 open_cred: Arc::new(ClientCredentials::anonymous(TEST_PEER)),
                 ops: HashMap::new(),
+                parked: HashMap::new(),
                 put_scratch: None,
                 intro_wire: None,
             },
@@ -11812,6 +12096,11 @@ mod tests {
             cred,
             mon_fin,
             &discard_exec_fin(),
+            &ParkCtx {
+                peer,
+                cred: &Arc::new(ClientCredentials::anonymous(peer)),
+                ready_tx: &discard_intro_ready(),
+            },
         )
         .await
     }
@@ -12533,6 +12822,7 @@ mod tests {
                 stat: crate::server_native::peers::ChannelStat::new(String::new()),
                 open_cred: Arc::new(ClientCredentials::anonymous(TEST_PEER)),
                 ops: HashMap::new(),
+                parked: HashMap::new(),
                 put_scratch: None,
                 intro_wire: None,
             },
@@ -12764,6 +13054,7 @@ mod tests {
                 stat: crate::server_native::peers::ChannelStat::new(String::new()),
                 open_cred: Arc::new(ClientCredentials::anonymous(TEST_PEER)),
                 ops: HashMap::new(),
+                parked: HashMap::new(),
                 put_scratch: None,
                 intro_wire: None,
             },
@@ -12933,6 +13224,7 @@ mod tests {
                 stat: crate::server_native::peers::ChannelStat::new(String::new()),
                 open_cred: Arc::new(ClientCredentials::anonymous(TEST_PEER)),
                 ops: HashMap::new(),
+                parked: HashMap::new(),
                 put_scratch: None,
                 intro_wire: None,
             },
@@ -13030,6 +13322,7 @@ mod tests {
                 stat: crate::server_native::peers::ChannelStat::new(String::new()),
                 open_cred: Arc::new(ClientCredentials::anonymous(TEST_PEER)),
                 ops: HashMap::new(),
+                parked: HashMap::new(),
                 put_scratch: None,
                 intro_wire: None,
             },
@@ -13070,6 +13363,11 @@ mod tests {
             &cred,
             &discard_mon_fin(),
             &discard_exec_fin(),
+            &ParkCtx {
+                peer,
+                cred: &Arc::new(ClientCredentials::anonymous(peer)),
+                ready_tx: &discard_intro_ready(),
+            },
         )
         .await
         .expect("MONITOR INIT ok");
@@ -13095,6 +13393,11 @@ mod tests {
             &cred,
             &discard_mon_fin(),
             &discard_exec_fin(),
+            &ParkCtx {
+                peer,
+                cred: &Arc::new(ClientCredentials::anonymous(peer)),
+                ready_tx: &discard_intro_ready(),
+            },
         )
         .await
         .expect("MONITOR START ok");
@@ -13158,6 +13461,7 @@ mod tests {
                 stat: crate::server_native::peers::ChannelStat::new(String::new()),
                 open_cred: Arc::new(ClientCredentials::anonymous(TEST_PEER)),
                 ops: HashMap::new(),
+                parked: HashMap::new(),
                 put_scratch: None,
                 intro_wire: None,
             },
@@ -13200,6 +13504,11 @@ mod tests {
             &cred,
             &discard_mon_fin(),
             &discard_exec_fin(),
+            &ParkCtx {
+                peer,
+                cred: &Arc::new(ClientCredentials::anonymous(peer)),
+                ready_tx: &discard_intro_ready(),
+            },
         )
         .await
         .expect("non-pipeline MONITOR INIT ok");
@@ -13261,6 +13570,7 @@ mod tests {
                 stat: crate::server_native::peers::ChannelStat::new(String::new()),
                 open_cred: Arc::new(ClientCredentials::anonymous(TEST_PEER)),
                 ops: HashMap::new(),
+                parked: HashMap::new(),
                 put_scratch: None,
                 intro_wire: None,
             },
@@ -13299,6 +13609,11 @@ mod tests {
             &cred,
             &discard_mon_fin(),
             &discard_exec_fin(),
+            &ParkCtx {
+                peer,
+                cred: &Arc::new(ClientCredentials::anonymous(peer)),
+                ready_tx: &discard_intro_ready(),
+            },
         )
         .await
         .expect("MONITOR INIT ok");
@@ -13349,6 +13664,11 @@ mod tests {
             &cred,
             &discard_mon_fin(),
             &discard_exec_fin(),
+            &ParkCtx {
+                peer,
+                cred: &Arc::new(ClientCredentials::anonymous(peer)),
+                ready_tx: &discard_intro_ready(),
+            },
         )
         .await
         .expect("0x00 control ok");
@@ -13372,6 +13692,11 @@ mod tests {
             &cred,
             &discard_mon_fin(),
             &discard_exec_fin(),
+            &ParkCtx {
+                peer,
+                cred: &Arc::new(ClientCredentials::anonymous(peer)),
+                ready_tx: &discard_intro_ready(),
+            },
         )
         .await
         .expect("ACK control ok");
@@ -13395,6 +13720,11 @@ mod tests {
             &cred,
             &discard_mon_fin(),
             &discard_exec_fin(),
+            &ParkCtx {
+                peer,
+                cred: &Arc::new(ClientCredentials::anonymous(peer)),
+                ready_tx: &discard_intro_ready(),
+            },
         )
         .await
         .expect("START control ok");
@@ -13452,6 +13782,7 @@ mod tests {
                 stat: crate::server_native::peers::ChannelStat::new(String::new()),
                 open_cred: Arc::new(ClientCredentials::anonymous(TEST_PEER)),
                 ops,
+                parked: HashMap::new(),
                 put_scratch: None,
                 intro_wire: None,
             },
@@ -13500,6 +13831,11 @@ mod tests {
             &cred,
             &discard_mon_fin(),
             &discard_exec_fin(),
+            &ParkCtx {
+                peer,
+                cred: &Arc::new(ClientCredentials::anonymous(peer)),
+                ready_tx: &discard_intro_ready(),
+            },
         )
         .await
         .expect_err("truncated MONITOR ACK must be connection-fatal");
@@ -13553,6 +13889,11 @@ mod tests {
             &cred,
             &discard_mon_fin(),
             &discard_exec_fin(),
+            &ParkCtx {
+                peer,
+                cred: &Arc::new(ClientCredentials::anonymous(peer)),
+                ready_tx: &discard_intro_ready(),
+            },
         )
         .await
         .expect("well-formed MONITOR ACK ok");
@@ -13606,6 +13947,11 @@ mod tests {
             &cred,
             &discard_mon_fin(),
             &discard_exec_fin(),
+            &ParkCtx {
+                peer,
+                cred: &Arc::new(ClientCredentials::anonymous(peer)),
+                ready_tx: &discard_intro_ready(),
+            },
         )
         .await
         .expect("well-formed MONITOR ACK ok");
@@ -13730,6 +14076,7 @@ mod tests {
                 stat: crate::server_native::peers::ChannelStat::new(String::new()),
                 open_cred: Arc::new(ClientCredentials::anonymous(TEST_PEER)),
                 ops,
+                parked: HashMap::new(),
                 put_scratch: None,
                 intro_wire: None,
             },
@@ -13796,6 +14143,11 @@ mod tests {
             &cred,
             &discard_mon_fin(),
             &discard_exec_fin(),
+            &ParkCtx {
+                peer,
+                cred: &Arc::new(ClientCredentials::anonymous(peer)),
+                ready_tx: &discard_intro_ready(),
+            },
         )
         .await
         .expect_err("truncated ACK|START must be connection-fatal");
@@ -13872,6 +14224,11 @@ mod tests {
             &cred,
             &discard_mon_fin(),
             &discard_exec_fin(),
+            &ParkCtx {
+                peer,
+                cred: &Arc::new(ClientCredentials::anonymous(peer)),
+                ready_tx: &discard_intro_ready(),
+            },
         )
         .await
         .expect_err("truncated ACK|STOP must be connection-fatal");
@@ -13948,6 +14305,11 @@ mod tests {
             &cred,
             &discard_mon_fin(),
             &discard_exec_fin(),
+            &ParkCtx {
+                peer,
+                cred: &Arc::new(ClientCredentials::anonymous(peer)),
+                ready_tx: &discard_intro_ready(),
+            },
         )
         .await
         .expect("well-formed ACK|START ok");
@@ -14179,6 +14541,7 @@ mod tests {
                 stat: crate::server_native::peers::ChannelStat::new(String::new()),
                 open_cred: Arc::new(ClientCredentials::anonymous(TEST_PEER)),
                 ops,
+                parked: HashMap::new(),
                 put_scratch: None,
                 intro_wire: None,
             },
@@ -14226,6 +14589,7 @@ mod tests {
                 stat: crate::server_native::peers::ChannelStat::new(String::new()),
                 open_cred: Arc::new(ClientCredentials::anonymous(TEST_PEER)),
                 ops,
+                parked: HashMap::new(),
                 put_scratch: None,
                 intro_wire: None,
             }
@@ -14316,6 +14680,7 @@ mod tests {
                 stat: crate::server_native::peers::ChannelStat::new(String::new()),
                 open_cred: Arc::new(ClientCredentials::anonymous(TEST_PEER)),
                 ops,
+                parked: HashMap::new(),
                 put_scratch: None,
                 intro_wire: None,
             },
@@ -14427,6 +14792,7 @@ mod tests {
                 stat: crate::server_native::peers::ChannelStat::new(String::new()),
                 open_cred: Arc::new(ClientCredentials::anonymous(TEST_PEER)),
                 ops,
+                parked: HashMap::new(),
                 put_scratch: None,
                 intro_wire: None,
             },
@@ -14538,6 +14904,7 @@ mod tests {
                 stat: crate::server_native::peers::ChannelStat::new(String::new()),
                 open_cred: Arc::new(ClientCredentials::anonymous(TEST_PEER)),
                 ops,
+                parked: HashMap::new(),
                 put_scratch: None,
                 intro_wire: None,
             },
@@ -14631,6 +14998,7 @@ mod tests {
                 stat: crate::server_native::peers::ChannelStat::new(String::new()),
                 open_cred: Arc::new(ClientCredentials::anonymous(TEST_PEER)),
                 ops,
+                parked: HashMap::new(),
                 put_scratch: None,
                 intro_wire: None,
             },
@@ -15247,6 +15615,7 @@ mod tests {
                 stat: crate::server_native::peers::ChannelStat::new(String::new()),
                 open_cred: Arc::new(ClientCredentials::anonymous(TEST_PEER)),
                 ops: HashMap::new(),
+                parked: HashMap::new(),
                 put_scratch: None,
                 intro_wire: None,
             },
@@ -15307,6 +15676,7 @@ mod tests {
                 stat: crate::server_native::peers::ChannelStat::new(String::new()),
                 open_cred: Arc::new(ClientCredentials::anonymous(TEST_PEER)),
                 ops: HashMap::new(),
+                parked: HashMap::new(),
                 put_scratch: None,
                 intro_wire: None,
             },
@@ -15384,6 +15754,11 @@ mod tests {
             &cred,
             &discard_mon_fin(),
             &discard_exec_fin(),
+            &ParkCtx {
+                peer,
+                cred: &Arc::new(ClientCredentials::anonymous(peer)),
+                ready_tx: &discard_intro_ready(),
+            },
         )
         .await
         .expect("well-formed BE MONITOR ACK ok");
@@ -15461,6 +15836,7 @@ mod tests {
                 stat: crate::server_native::peers::ChannelStat::new(String::new()),
                 open_cred: Arc::new(ClientCredentials::anonymous(TEST_PEER)),
                 ops: HashMap::new(),
+                parked: HashMap::new(),
                 put_scratch: None,
                 intro_wire: None,
             },
@@ -15673,6 +16049,7 @@ mod tests {
                 stat: crate::server_native::peers::ChannelStat::new(String::new()),
                 open_cred: completion.open_cred,
                 ops: HashMap::new(),
+                parked: HashMap::new(),
                 put_scratch: None,
                 intro_wire: None,
             },
@@ -15720,6 +16097,7 @@ mod tests {
                 // Channel was created under alice/ca.
                 open_cred: cred_ca("alice"),
                 ops: HashMap::new(),
+                parked: HashMap::new(),
                 put_scratch: None,
                 intro_wire: None,
             },
@@ -15784,6 +16162,7 @@ mod tests {
                 stat: crate::server_native::peers::ChannelStat::new(String::new()),
                 open_cred: cred_ca("alice"),
                 ops: HashMap::new(),
+                parked: HashMap::new(),
                 put_scratch: None,
                 intro_wire: None,
             },
@@ -15859,6 +16238,7 @@ mod tests {
                 // Channel was created under alice/ca.
                 open_cred: cred_ca("alice"),
                 ops,
+                parked: HashMap::new(),
                 put_scratch: None,
                 intro_wire: None,
             },
@@ -15891,6 +16271,11 @@ mod tests {
             &bob,
             &discard_mon_fin(),
             &discard_exec_fin(),
+            &ParkCtx {
+                peer,
+                cred: &Arc::new(ClientCredentials::anonymous(peer)),
+                ready_tx: &discard_intro_ready(),
+            },
         )
         .await
         .expect("GET EXEC ok");
@@ -15934,6 +16319,7 @@ mod tests {
                     stat: stat.clone(),
                     open_cred: Arc::new(ClientCredentials::anonymous(TEST_PEER)),
                     ops: HashMap::new(),
+                    parked: HashMap::new(),
                     put_scratch: None,
                     intro_wire: None,
                 },
@@ -16009,6 +16395,7 @@ mod tests {
                 stat: stat.clone(),
                 open_cred: Arc::new(ClientCredentials::anonymous(TEST_PEER)),
                 ops: HashMap::new(),
+                parked: HashMap::new(),
                 put_scratch: None,
                 intro_wire: None,
             },
@@ -16090,6 +16477,7 @@ mod tests {
                 stat: crate::server_native::peers::ChannelStat::new(String::new()),
                 open_cred: Arc::new(ClientCredentials::anonymous(TEST_PEER)),
                 ops: HashMap::new(),
+                parked: HashMap::new(),
                 put_scratch: None,
                 intro_wire: None,
             },
@@ -16129,6 +16517,11 @@ mod tests {
             &cred,
             &discard_mon_fin(),
             &discard_exec_fin(),
+            &ParkCtx {
+                peer,
+                cred: &Arc::new(ClientCredentials::anonymous(peer)),
+                ready_tx: &discard_intro_ready(),
+            },
         )
         .await
         .expect("PUT INIT ok");
@@ -16166,6 +16559,11 @@ mod tests {
             &cred,
             &discard_mon_fin(),
             &discard_exec_fin(),
+            &ParkCtx {
+                peer,
+                cred: &Arc::new(ClientCredentials::anonymous(peer)),
+                ready_tx: &discard_intro_ready(),
+            },
         )
         .await
         .expect("PUT EXEC ok");
@@ -16225,6 +16623,7 @@ mod tests {
                 stat: crate::server_native::peers::ChannelStat::new(String::new()),
                 open_cred: Arc::new(ClientCredentials::anonymous(TEST_PEER)),
                 ops: HashMap::new(),
+                parked: HashMap::new(),
                 put_scratch: None,
                 intro_wire: None,
             },
@@ -16262,6 +16661,11 @@ mod tests {
             &cred,
             &discard_mon_fin(),
             &discard_exec_fin(),
+            &ParkCtx {
+                peer,
+                cred: &Arc::new(ClientCredentials::anonymous(peer)),
+                ready_tx: &discard_intro_ready(),
+            },
         )
         .await
         .expect("PUT INIT ok");
@@ -16297,6 +16701,11 @@ mod tests {
             &cred,
             &discard_mon_fin(),
             &discard_exec_fin(),
+            &ParkCtx {
+                peer,
+                cred: &Arc::new(ClientCredentials::anonymous(peer)),
+                ready_tx: &discard_intro_ready(),
+            },
         )
         .await
         .expect("PUT EXEC ok");
@@ -16372,6 +16781,7 @@ mod tests {
                     stat: crate::server_native::peers::ChannelStat::new(String::new()),
                     open_cred: Arc::new(ClientCredentials::anonymous(TEST_PEER)),
                     ops,
+                    parked: HashMap::new(),
                     put_scratch: None,
                     intro_wire: None,
                 },
@@ -16406,6 +16816,11 @@ mod tests {
             &cred,
             &discard_mon_fin(),
             &exec_fin_tx,
+            &ParkCtx {
+                peer,
+                cred: &Arc::new(ClientCredentials::anonymous(peer)),
+                ready_tx: &discard_intro_ready(),
+            },
         )
         .await
         .expect("GET EXEC (last request) ok");
@@ -16467,6 +16882,11 @@ mod tests {
             &cred,
             &discard_mon_fin(),
             &exec_fin_tx,
+            &ParkCtx {
+                peer,
+                cred: &Arc::new(ClientCredentials::anonymous(peer)),
+                ready_tx: &discard_intro_ready(),
+            },
         )
         .await
         .expect("GET EXEC (not last request) ok");
@@ -16532,6 +16952,7 @@ mod tests {
                 stat: crate::server_native::peers::ChannelStat::new(String::new()),
                 open_cred: Arc::new(ClientCredentials::anonymous(TEST_PEER)),
                 ops: HashMap::new(),
+                parked: HashMap::new(),
                 put_scratch: None,
                 intro_wire: None,
             },
@@ -16591,6 +17012,11 @@ mod tests {
             &cred,
             &discard_mon_fin(),
             &discard_exec_fin(),
+            &ParkCtx {
+                peer,
+                cred: &Arc::new(ClientCredentials::anonymous(peer)),
+                ready_tx: &discard_intro_ready(),
+            },
         )
         .await
         .expect("GET INIT defining the pvRequest descriptor must succeed");
@@ -16614,6 +17040,11 @@ mod tests {
             &cred,
             &discard_mon_fin(),
             &discard_exec_fin(),
+            &ParkCtx {
+                peer,
+                cred: &Arc::new(ClientCredentials::anonymous(peer)),
+                ready_tx: &discard_intro_ready(),
+            },
         )
         .await
         .expect("GET INIT referencing the cached pvRequest descriptor must succeed");
@@ -16637,6 +17068,7 @@ mod tests {
                 stat: crate::server_native::peers::ChannelStat::new(String::new()),
                 open_cred: Arc::new(ClientCredentials::anonymous(TEST_PEER)),
                 ops: HashMap::new(),
+                parked: HashMap::new(),
                 put_scratch: None,
                 intro_wire: None,
             },
@@ -16656,6 +17088,11 @@ mod tests {
             &cred,
             &discard_mon_fin(),
             &discard_exec_fin(),
+            &ParkCtx {
+                peer,
+                cred: &Arc::new(ClientCredentials::anonymous(peer)),
+                ready_tx: &discard_intro_ready(),
+            },
         )
         .await
         .expect_err("a 0xFE reference with no prior define must be a decode error");
@@ -17040,6 +17477,7 @@ mod tests {
                 stat: crate::server_native::peers::ChannelStat::new(String::new()),
                 open_cred: Arc::new(ClientCredentials::anonymous(TEST_PEER)),
                 ops: HashMap::new(),
+                parked: HashMap::new(),
                 put_scratch: None,
                 intro_wire: None,
             },
@@ -17078,6 +17516,11 @@ mod tests {
             &cred,
             &discard_mon_fin(),
             &discard_exec_fin(),
+            &ParkCtx {
+                peer,
+                cred: &Arc::new(ClientCredentials::anonymous(peer)),
+                ready_tx: &discard_intro_ready(),
+            },
         )
         .await
         .expect("PUT INIT ok");
@@ -17120,6 +17563,11 @@ mod tests {
             &cred,
             &discard_mon_fin(),
             &discard_exec_fin(),
+            &ParkCtx {
+                peer,
+                cred: &Arc::new(ClientCredentials::anonymous(peer)),
+                ready_tx: &discard_intro_ready(),
+            },
         )
         .await
         .expect("PUT EXEC ok");
@@ -17173,6 +17621,7 @@ mod tests {
                 stat: crate::server_native::peers::ChannelStat::new(String::new()),
                 open_cred: Arc::new(ClientCredentials::anonymous(TEST_PEER)),
                 ops: HashMap::new(),
+                parked: HashMap::new(),
                 put_scratch: None,
                 intro_wire: None,
             },
@@ -17208,6 +17657,11 @@ mod tests {
             peer,
             &cred,
             &discard_exec_fin(),
+            &ParkCtx {
+                peer,
+                cred: &Arc::new(ClientCredentials::anonymous(peer)),
+                ready_tx: &discard_intro_ready(),
+            },
         )
         .await
         .expect("PUT_GET INIT ok");
@@ -17244,6 +17698,11 @@ mod tests {
             peer,
             &cred,
             &discard_exec_fin(),
+            &ParkCtx {
+                peer,
+                cred: &Arc::new(ClientCredentials::anonymous(peer)),
+                ready_tx: &discard_intro_ready(),
+            },
         )
         .await
         .expect("PUT_GET data ok");
@@ -17528,6 +17987,7 @@ mod tests {
                 stat: crate::server_native::peers::ChannelStat::new(String::new()),
                 open_cred: Arc::new(ClientCredentials::anonymous(TEST_PEER)),
                 ops,
+                parked: HashMap::new(),
                 put_scratch: None,
                 intro_wire: None,
             },
@@ -17905,6 +18365,11 @@ mod tests {
             peer,
             &x509_cred("MyCA"),
             &discard_exec_fin(),
+            &ParkCtx {
+                peer,
+                cred: &Arc::new(ClientCredentials::anonymous(peer)),
+                ready_tx: &discard_intro_ready(),
+            },
         )
         .await
         .expect("handle_process ok");
@@ -17963,6 +18428,11 @@ mod tests {
             peer,
             &x509_cred("OtherCA"),
             &discard_exec_fin(),
+            &ParkCtx {
+                peer,
+                cred: &Arc::new(ClientCredentials::anonymous(peer)),
+                ready_tx: &discard_intro_ready(),
+            },
         )
         .await
         .expect("handle_process ok");
@@ -18014,6 +18484,7 @@ mod tests {
                 stat: crate::server_native::peers::ChannelStat::new(String::new()),
                 open_cred: Arc::new(ClientCredentials::anonymous(TEST_PEER)),
                 ops,
+                parked: HashMap::new(),
                 put_scratch: None,
                 intro_wire: None,
             },
@@ -18060,6 +18531,11 @@ mod tests {
             peer,
             &x509_cred("MyCA"),
             &discard_exec_fin(),
+            &ParkCtx {
+                peer,
+                cred: &Arc::new(ClientCredentials::anonymous(peer)),
+                ready_tx: &discard_intro_ready(),
+            },
         )
         .await;
         assert!(
@@ -18105,6 +18581,11 @@ mod tests {
             peer,
             &x509_cred("MyCA"),
             &discard_exec_fin(),
+            &ParkCtx {
+                peer,
+                cred: &Arc::new(ClientCredentials::anonymous(peer)),
+                ready_tx: &discard_intro_ready(),
+            },
         )
         .await;
         assert!(
@@ -18136,6 +18617,7 @@ mod tests {
                 stat: crate::server_native::peers::ChannelStat::new(String::new()),
                 open_cred: Arc::new(ClientCredentials::anonymous(TEST_PEER)),
                 ops: HashMap::new(),
+                parked: HashMap::new(),
                 put_scratch: None,
                 intro_wire: None,
             },
@@ -18183,6 +18665,11 @@ mod tests {
             peer,
             &x509_cred("MyCA"),
             &discard_exec_fin(),
+            &ParkCtx {
+                peer,
+                cred: &Arc::new(ClientCredentials::anonymous(peer)),
+                ready_tx: &discard_intro_ready(),
+            },
         )
         .await;
         let fatal = result.is_err();
@@ -18423,6 +18910,11 @@ mod tests {
             peer,
             &x509_cred("MyCA"),
             &discard_exec_fin(),
+            &ParkCtx {
+                peer,
+                cred: &Arc::new(ClientCredentials::anonymous(peer)),
+                ready_tx: &discard_intro_ready(),
+            },
         )
         .await;
         assert!(
@@ -18476,6 +18968,11 @@ mod tests {
             peer,
             &x509_cred("MyCA"),
             &discard_exec_fin(),
+            &ParkCtx {
+                peer,
+                cred: &Arc::new(ClientCredentials::anonymous(peer)),
+                ready_tx: &discard_intro_ready(),
+            },
         )
         .await;
         assert!(
@@ -18520,6 +19017,7 @@ mod tests {
                 stat: crate::server_native::peers::ChannelStat::new(String::new()),
                 open_cred: Arc::new(ClientCredentials::anonymous(TEST_PEER)),
                 ops,
+                parked: HashMap::new(),
                 put_scratch: None,
                 intro_wire: None,
             },
@@ -18564,6 +19062,11 @@ mod tests {
             peer,
             &x509_cred("MyCA"),
             &discard_exec_fin(),
+            &ParkCtx {
+                peer,
+                cred: &Arc::new(ClientCredentials::anonymous(peer)),
+                ready_tx: &discard_intro_ready(),
+            },
         )
         .await
         .expect("handle_put_get ok");
@@ -18634,6 +19137,11 @@ mod tests {
             peer,
             &x509_cred("MyCA"),
             &exec_fin_tx,
+            &ParkCtx {
+                peer,
+                cred: &Arc::new(ClientCredentials::anonymous(peer)),
+                ready_tx: &discard_intro_ready(),
+            },
         )
         .await
         .expect("handle_process ok");
@@ -18709,6 +19217,7 @@ mod tests {
                 stat: crate::server_native::peers::ChannelStat::new(String::new()),
                 open_cred: Arc::new(ClientCredentials::anonymous(TEST_PEER)),
                 ops,
+                parked: HashMap::new(),
                 put_scratch: None,
                 intro_wire: None,
             },
@@ -18750,6 +19259,11 @@ mod tests {
             peer,
             &x509_cred("MyCA"),
             &exec_fin_tx,
+            &ParkCtx {
+                peer,
+                cred: &Arc::new(ClientCredentials::anonymous(peer)),
+                ready_tx: &discard_intro_ready(),
+            },
         )
         .await
         .expect("handle_put_get ok");
@@ -18850,6 +19364,7 @@ mod tests {
                 stat: crate::server_native::peers::ChannelStat::new(String::new()),
                 open_cred: Arc::new(ClientCredentials::anonymous(TEST_PEER)),
                 ops,
+                parked: HashMap::new(),
                 put_scratch: None,
                 intro_wire: None,
             },
@@ -18912,6 +19427,7 @@ mod tests {
                 stat: crate::server_native::peers::ChannelStat::new(String::new()),
                 open_cred: Arc::new(ClientCredentials::anonymous(TEST_PEER)),
                 ops: HashMap::new(),
+                parked: HashMap::new(),
                 put_scratch: None,
                 intro_wire: None,
             },
@@ -18981,6 +19497,7 @@ mod tests {
                 stat: stat.clone(),
                 open_cred: Arc::new(ClientCredentials::anonymous(TEST_PEER)),
                 ops: HashMap::new(),
+                parked: HashMap::new(),
                 put_scratch: None,
                 intro_wire: None,
             },
@@ -19088,6 +19605,7 @@ mod tests {
                     stat: stat.clone(),
                     open_cred: Arc::new(ClientCredentials::anonymous(TEST_PEER)),
                     ops: HashMap::new(),
+                    parked: HashMap::new(),
                     put_scratch: None,
                     intro_wire: None,
                 },
@@ -19166,6 +19684,7 @@ mod tests {
                 stat: crate::server_native::peers::ChannelStat::new(String::new()),
                 open_cred: Arc::new(ClientCredentials::anonymous(TEST_PEER)),
                 ops: HashMap::new(),
+                parked: HashMap::new(),
                 put_scratch: None,
                 intro_wire: None,
             },
@@ -19252,6 +19771,7 @@ mod tests {
                 stat: crate::server_native::peers::ChannelStat::new(String::new()),
                 open_cred: Arc::new(ClientCredentials::anonymous(TEST_PEER)),
                 ops: HashMap::new(),
+                parked: HashMap::new(),
                 put_scratch: None,
                 intro_wire: None,
             },
@@ -19360,6 +19880,7 @@ mod tests {
                 stat: crate::server_native::peers::ChannelStat::new(String::new()),
                 open_cred: Arc::new(ClientCredentials::anonymous(TEST_PEER)),
                 ops: HashMap::new(),
+                parked: HashMap::new(),
                 put_scratch: None,
                 intro_wire: None,
             },
@@ -19788,6 +20309,7 @@ mod tests {
                 stat: crate::server_native::peers::ChannelStat::new(String::new()),
                 open_cred: Arc::new(ClientCredentials::anonymous(TEST_PEER)),
                 ops,
+                parked: HashMap::new(),
                 put_scratch: None,
                 intro_wire: None,
             },
@@ -20144,6 +20666,7 @@ mod tests {
                 stat: crate::server_native::peers::ChannelStat::new(String::new()),
                 open_cred: Arc::new(ClientCredentials::anonymous(TEST_PEER)),
                 ops: HashMap::new(),
+                parked: HashMap::new(),
                 put_scratch: None,
                 intro_wire: None,
             },
@@ -20183,6 +20706,11 @@ mod tests {
             &cred,
             &mon_fin_tx,
             &discard_exec_fin(),
+            &ParkCtx {
+                peer,
+                cred: &Arc::new(ClientCredentials::anonymous(peer)),
+                ready_tx: &discard_intro_ready(),
+            },
         )
         .await
         .expect("MONITOR INIT ok");
@@ -20212,6 +20740,11 @@ mod tests {
             &cred,
             &mon_fin_tx,
             &discard_exec_fin(),
+            &ParkCtx {
+                peer,
+                cred: &Arc::new(ClientCredentials::anonymous(peer)),
+                ready_tx: &discard_intro_ready(),
+            },
         )
         .await
         .expect("MONITOR START ok");
@@ -20322,6 +20855,7 @@ mod tests {
                 stat: crate::server_native::peers::ChannelStat::new(String::new()),
                 open_cred: Arc::new(ClientCredentials::anonymous(TEST_PEER)),
                 ops: HashMap::new(),
+                parked: HashMap::new(),
                 put_scratch: None,
                 intro_wire: None,
             },
@@ -20396,6 +20930,11 @@ mod tests {
             &cred,
             &discard_mon_fin(),
             &discard_exec_fin(),
+            &ParkCtx {
+                peer,
+                cred: &Arc::new(ClientCredentials::anonymous(peer)),
+                ready_tx: &discard_intro_ready(),
+            },
         )
         .await
         .expect("GET INIT ok");
@@ -20421,6 +20960,11 @@ mod tests {
             &cred,
             &discard_mon_fin(),
             &discard_exec_fin(),
+            &ParkCtx {
+                peer,
+                cred: &Arc::new(ClientCredentials::anonymous(peer)),
+                ready_tx: &discard_intro_ready(),
+            },
         )
         .await
         .expect("GET EXEC ok");
@@ -20454,6 +20998,7 @@ mod tests {
                     stat: crate::server_native::peers::ChannelStat::new(String::new()),
                     open_cred: Arc::new(ClientCredentials::anonymous(TEST_PEER)),
                     ops: HashMap::new(),
+                    parked: HashMap::new(),
                     put_scratch: None,
                     intro_wire: None,
                 },
@@ -20511,6 +21056,11 @@ mod tests {
             &cred,
             &discard_mon_fin(),
             &discard_exec_fin(),
+            &ParkCtx {
+                peer,
+                cred: &Arc::new(ClientCredentials::anonymous(peer)),
+                ready_tx: &discard_intro_ready(),
+            },
         )
         .await
         .expect_err("reusing an IOID live on another channel is connection-fatal");
@@ -20592,6 +21142,11 @@ mod tests {
             &cred,
             &discard_mon_fin(),
             &discard_exec_fin(),
+            &ParkCtx {
+                peer,
+                cred: &Arc::new(ClientCredentials::anonymous(peer)),
+                ready_tx: &discard_intro_ready(),
+            },
         )
         .await
         .expect("PUT INIT ok");
@@ -20618,6 +21173,11 @@ mod tests {
             &cred,
             &discard_mon_fin(),
             &discard_exec_fin(),
+            &ParkCtx {
+                peer,
+                cred: &Arc::new(ClientCredentials::anonymous(peer)),
+                ready_tx: &discard_intro_ready(),
+            },
         )
         .await
         .expect("PUT readback EXEC ok");
@@ -20634,21 +21194,26 @@ mod tests {
         );
     }
 
-    /// Boundary: an INIT-phase negotiation failure (here a
-    /// missing prototype) must still echo the INIT subcmd `0x08`. The
-    /// fix makes error replies echo the *request* subcmd uniformly, so
-    /// an INIT request stays `0x08` while a data request becomes
-    /// `0x00`/`0x40` — it does not flip every error to `0x00`.
+    /// Boundary: an INIT-phase negotiation failure (here a pvRequest
+    /// whose `field` entry is a scalar, so the mask resolves empty)
+    /// must still echo the INIT subcmd `0x08`. The fix makes error
+    /// replies echo the *request* subcmd uniformly, so an INIT request
+    /// stays `0x08` while a data request becomes `0x00`/`0x40` — it does
+    /// not flip every error to `0x00`. The trigger used to be a channel
+    /// with no prototype; that case now parks (see
+    /// `bfr13_init_without_a_prototype_parks_instead_of_replying`), so
+    /// the boundary is exercised through a negotiation error that is
+    /// still answered inline.
     #[epics_macros_rs::epics_test]
     async fn bfr13_init_phase_error_still_echoes_0x08() {
+        use crate::pvdata::ScalarType;
         use crate::server_native::runtime::PvaServerConfig;
         use crate::server_native::tcp::ClientCredentials;
 
         let order = ByteOrder::Little;
         let (sid, ioid) = (1u32, 702u32);
         let source: DynSource = Arc::new(Bfr13FailSource);
-        // No prototype on the channel → INIT fails "must provide prototype".
-        let mut channels = bfr13_channels(None, source.clone());
+        let mut channels = bfr13_channels(Some(three_field_intro()), source.clone());
         let (tx, mut rx) = test_srv_tx(16);
         let config = PvaServerConfig::default();
         let mut encode_cache = crate::pvdata::encode::EncodeTypeCache::new();
@@ -20659,6 +21224,17 @@ mod tests {
         init_payload.put_u32(sid, order);
         init_payload.put_u32(ioid, order);
         init_payload.put_u8(0x08);
+        // `field` present but not a sub-structure → `request_to_mask`
+        // reports `EmptyMask`, pvxs's "must select at least one field".
+        let req_desc = FieldDesc::Structure {
+            struct_id: String::new(),
+            fields: vec![("field".to_string(), FieldDesc::Scalar(ScalarType::Int))],
+        };
+        let mut req_struct = PvStructure::new("");
+        req_struct.set("field", PvField::Scalar(ScalarValue::Int(0)));
+        let req_val = PvField::Structure(req_struct);
+        crate::pvdata::encode::encode_type_desc(&req_desc, order, &mut init_payload);
+        crate::pvdata::encode::encode_pv_field(&req_val, &req_desc, order, &mut init_payload);
         let init_frame = synth_frame(Command::Get, order, init_payload);
         handle_op(
             &init_frame,
@@ -20674,6 +21250,11 @@ mod tests {
             &cred,
             &discard_mon_fin(),
             &discard_exec_fin(),
+            &ParkCtx {
+                peer,
+                cred: &Arc::new(ClientCredentials::anonymous(peer)),
+                ready_tx: &discard_intro_ready(),
+            },
         )
         .await
         .expect("GET INIT handled");
@@ -20687,6 +21268,78 @@ mod tests {
         assert!(
             !status.is_success(),
             "INIT negotiation failure carries an error status"
+        );
+    }
+
+    /// A channel that has no prototype yet PARKS its INIT instead of
+    /// answering "must provide prototype": pvxs `sharedpv.cpp:239-249`
+    /// inserts the `ConnectOp` into `pending` and `SharedPV::open`
+    /// (`:348-384`) runs it later. Nothing goes on the wire, the ioid
+    /// stays live on the channel, and the descriptor wait reports back
+    /// so the connection loop can replay the original frame.
+    #[epics_macros_rs::epics_test]
+    async fn bfr13_init_without_a_prototype_parks_instead_of_replying() {
+        use crate::server_native::runtime::PvaServerConfig;
+        use crate::server_native::tcp::ClientCredentials;
+
+        let order = ByteOrder::Little;
+        let (sid, ioid) = (1u32, 703u32);
+        let source: DynSource = Arc::new(Bfr13FailSource);
+        let mut channels = bfr13_channels(None, source.clone());
+        let (tx, mut rx) = test_srv_tx(16);
+        let config = PvaServerConfig::default();
+        let mut encode_cache = crate::pvdata::encode::EncodeTypeCache::new();
+        let peer: SocketAddr = "127.0.0.1:5075".parse().unwrap();
+        let cred = Arc::new(ClientCredentials::anonymous(TEST_PEER));
+        let (ready_tx, mut ready_rx) = mpsc::unbounded_channel::<IntroReady>();
+
+        let mut init_payload = Vec::new();
+        init_payload.put_u32(sid, order);
+        init_payload.put_u32(ioid, order);
+        init_payload.put_u8(0x08);
+        bfr13_init_pv_request(order, &mut init_payload);
+        let init_frame = synth_frame(Command::Get, order, init_payload);
+        handle_op(
+            &init_frame,
+            &tx,
+            &mut channels,
+            order,
+            &fixed_out_order(order),
+            OpKind::Get,
+            &config,
+            &mut encode_cache,
+            &mut TypeCache::new(),
+            peer,
+            &cred,
+            &discard_mon_fin(),
+            &discard_exec_fin(),
+            &ParkCtx {
+                peer,
+                cred: &Arc::new(ClientCredentials::anonymous(peer)),
+                ready_tx: &ready_tx,
+            },
+        )
+        .await
+        .expect("GET INIT handled");
+
+        assert!(
+            rx.try_recv().is_err(),
+            "a parked INIT must not answer the client at all"
+        );
+        let ch = channels.get(&sid).expect("channel still open");
+        assert!(
+            ch.parked.contains_key(&ioid),
+            "the INIT frame is held on the channel until the descriptor arrives"
+        );
+        assert!(
+            ioid_live_on_conn(&channels, ioid),
+            "a parked ioid is live, so a re-used ioid is still refused as a duplicate"
+        );
+        let ready = ready_rx.recv().await.expect("descriptor wait reports back");
+        assert_eq!((ready.sid, ready.ioid), (sid, ioid));
+        assert!(
+            ready.desc.is_some(),
+            "the source resolved a prototype, so the replay carries one"
         );
     }
 
@@ -21051,6 +21704,10 @@ mod autoexec_tests {
         mpsc::unbounded_channel().0
     }
 
+    fn discard_intro_ready() -> mpsc::UnboundedSender<IntroReady> {
+        mpsc::unbounded_channel().0
+    }
+
     /// Drive a PUT INIT (carrying `pv_request`) + PUT EXEC (writing 2.5)
     /// through `handle_op`, and return the PV's value afterwards.
     async fn put_through(pv_request: PvField) -> Option<PvField> {
@@ -21085,6 +21742,7 @@ mod autoexec_tests {
                 stat: crate::server_native::peers::ChannelStat::new(String::new()),
                 open_cred: Arc::new(ClientCredentials::anonymous(TEST_PEER)),
                 ops: HashMap::new(),
+                parked: HashMap::new(),
                 put_scratch: None,
                 intro_wire: None,
             },
@@ -21118,6 +21776,11 @@ mod autoexec_tests {
             &cred,
             &discard_mon_fin(),
             &discard_exec_fin(),
+            &ParkCtx {
+                peer,
+                cred: &Arc::new(ClientCredentials::anonymous(peer)),
+                ready_tx: &discard_intro_ready(),
+            },
         )
         .await
         .expect("PUT INIT ok");
@@ -21151,6 +21814,11 @@ mod autoexec_tests {
             &cred,
             &discard_mon_fin(),
             &discard_exec_fin(),
+            &ParkCtx {
+                peer,
+                cred: &Arc::new(ClientCredentials::anonymous(peer)),
+                ready_tx: &discard_intro_ready(),
+            },
         )
         .await
         .expect("PUT EXEC ok");
@@ -21237,6 +21905,10 @@ mod r14_tests {
     use std::collections::HashMap;
     use std::net::SocketAddr;
 
+    fn discard_intro_ready() -> mpsc::UnboundedSender<IntroReady> {
+        mpsc::unbounded_channel().0
+    }
+
     fn synth_frame(command: Command, order: ByteOrder, payload: Vec<u8>) -> Frame {
         let header = PvaHeader::application(false, order, command.code(), payload.len() as u32);
         Frame { header, payload }
@@ -21306,6 +21978,7 @@ mod r14_tests {
                 stat: crate::server_native::peers::ChannelStat::new(String::new()),
                 open_cred: Arc::new(ClientCredentials::anonymous(TEST_PEER)),
                 ops,
+                parked: HashMap::new(),
                 put_scratch: None,
                 intro_wire: None,
             },
@@ -21341,6 +22014,11 @@ mod r14_tests {
             &cred,
             &mon_fin_tx,
             &exec_fin_tx,
+            &ParkCtx {
+                peer,
+                cred: &Arc::new(ClientCredentials::anonymous(peer)),
+                ready_tx: &discard_intro_ready(),
+            },
         )
         .await
         .expect("GET EXEC ok");
@@ -21389,6 +22067,10 @@ mod bfr15_tests {
     use std::net::SocketAddr;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    fn discard_intro_ready() -> mpsc::UnboundedSender<IntroReady> {
+        mpsc::unbounded_channel().0
+    }
 
     fn synth_frame(command: Command, order: ByteOrder, payload: Vec<u8>) -> Frame {
         let header = PvaHeader::application(false, order, command.code(), payload.len() as u32);
@@ -21493,6 +22175,7 @@ mod bfr15_tests {
                 stat: crate::server_native::peers::ChannelStat::new(String::new()),
                 open_cred: Arc::new(ClientCredentials::anonymous(TEST_PEER)),
                 ops,
+                parked: HashMap::new(),
                 put_scratch: None,
                 intro_wire: None,
             },
@@ -21621,6 +22304,11 @@ mod bfr15_tests {
             &cred,
             &mon,
             &exec_tx,
+            &ParkCtx {
+                peer,
+                cred: &Arc::new(ClientCredentials::anonymous(peer)),
+                ready_tx: &discard_intro_ready(),
+            },
         )
         .await
         .expect("first GET EXEC ok");
@@ -21643,6 +22331,11 @@ mod bfr15_tests {
             &cred,
             &mon,
             &exec_tx,
+            &ParkCtx {
+                peer,
+                cred: &Arc::new(ClientCredentials::anonymous(peer)),
+                ready_tx: &discard_intro_ready(),
+            },
         )
         .await
         .expect("second GET EXEC ok (ignored)");
@@ -21713,6 +22406,11 @@ mod bfr15_tests {
             &cred,
             &mon,
             &exec_tx,
+            &ParkCtx {
+                peer,
+                cred: &Arc::new(ClientCredentials::anonymous(peer)),
+                ready_tx: &discard_intro_ready(),
+            },
         )
         .await
         .expect("first PUT EXEC ok");
@@ -21734,6 +22432,11 @@ mod bfr15_tests {
             &cred,
             &mon,
             &exec_tx,
+            &ParkCtx {
+                peer,
+                cred: &Arc::new(ClientCredentials::anonymous(peer)),
+                ready_tx: &discard_intro_ready(),
+            },
         )
         .await
         .expect("second PUT EXEC ok (ignored)");
@@ -21801,6 +22504,11 @@ mod bfr15_tests {
             &cred,
             &mon,
             &exec_tx,
+            &ParkCtx {
+                peer,
+                cred: &Arc::new(ClientCredentials::anonymous(peer)),
+                ready_tx: &discard_intro_ready(),
+            },
         )
         .await
         .expect("GET EXEC ok");
@@ -21859,6 +22567,11 @@ mod bfr15_tests {
             &cred,
             &mon,
             &exec_tx,
+            &ParkCtx {
+                peer,
+                cred: &Arc::new(ClientCredentials::anonymous(peer)),
+                ready_tx: &discard_intro_ready(),
+            },
         )
         .await
         .expect("first GET EXEC ok");
@@ -21886,6 +22599,11 @@ mod bfr15_tests {
             &cred,
             &mon,
             &exec_tx,
+            &ParkCtx {
+                peer,
+                cred: &Arc::new(ClientCredentials::anonymous(peer)),
+                ready_tx: &discard_intro_ready(),
+            },
         )
         .await
         .expect("re-EXEC ok");
@@ -21978,6 +22696,7 @@ mod bfr15_tests {
                 stat: crate::server_native::peers::ChannelStat::new(String::new()),
                 open_cred: Arc::new(ClientCredentials::anonymous(TEST_PEER)),
                 ops,
+                parked: HashMap::new(),
                 put_scratch: None,
                 intro_wire: None,
             },
@@ -22063,6 +22782,7 @@ mod bfr15_tests {
                 stat: crate::server_native::peers::ChannelStat::new(String::new()),
                 open_cred: Arc::new(ClientCredentials::anonymous(TEST_PEER)),
                 ops,
+                parked: HashMap::new(),
                 put_scratch: None,
                 intro_wire: None,
             },

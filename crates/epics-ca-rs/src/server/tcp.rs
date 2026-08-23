@@ -2637,28 +2637,19 @@ pub(crate) async fn dispatch_message(
             // events still surface the literal string the client
             // used. `filter_suffix` is stashed on the channel so
             // EVENT_ADD can build a `FilterChain` from it later.
+            //
+            // The `$` long-string modifier (C dbChannel.c:482-507) is peeled
+            // there too, after the suffix and before the `record.FIELD`
+            // split — including for a bare `REC$` with no explicit `.FIELD`,
+            // which used to leave `$` on the record key so `find_entry_from`
+            // missed the record entirely. `long_string` makes every delivery
+            // path convert the value to DBR_CHAR with a NUL terminator.
             let parsed_channel =
-                epics_base_rs::server::database::filters::split_channel_name(&pv_name);
-            let record_path_raw = parsed_channel.record_path;
+                epics_base_rs::server::database::filters::parse_channel_name(&pv_name);
             let filter_suffix = parsed_channel.json_suffix;
-            // detect the `$` long-string modifier (C dbChannel.c:482-507).
-            // C strips it AFTER the record/field name lookup, so it modifies
-            // the resolved field — the explicit `.FIELD` or, for a bare
-            // `REC$`, the default VAL. Strip it from the whole channel name
-            // first so a record-level `REC$` (no explicit `.FIELD`) is handled
-            // too, not only `REC.FIELD$`: leaving `$` on the record key made
-            // `find_entry_from` miss the record and return CREATE_CH_FAIL,
-            // where C serves the field's long string. `long_string` makes
-            // every delivery path convert the value to DBR_CHAR with a NUL
-            // terminator.
-            let long_string = record_path_raw.ends_with('$');
-            let record_path = if long_string {
-                &record_path_raw[..record_path_raw.len() - 1]
-            } else {
-                record_path_raw.as_str()
-            };
-            let (_base, field_raw) = parse_pv_name(record_path);
-            let field = field_raw.to_ascii_uppercase();
+            let long_string = parsed_channel.string_view;
+            let record_path = parsed_channel.record_path.as_str();
+            let field = parsed_channel.field.clone();
 
             // thread the connection peer into the search
             // resolver so the CA gateway applies host-scoped `.pvlist`
@@ -9863,10 +9854,18 @@ mod bfr7_event_context_filter_tests {
     /// Asserts the subscription actually opened so a missing initial
     /// frame is never a vacuous pass.
     async fn subscribe_and_collect(pv_name: &str, port: u16) -> Vec<(u16, usize)> {
+        subscribe_then_put(pv_name, port, &[]).await
+    }
+
+    /// [`subscribe_and_collect`] plus values written to the PV once the
+    /// subscription is open, so a test can observe what the filter chain
+    /// does to the monitor stream and not only to the initial post.
+    async fn subscribe_then_put(pv_name: &str, port: u16, then_put: &[f64]) -> Vec<(u16, usize)> {
         let db = Arc::new(PvDatabase::new());
         db.add_pv("bfr7:pv", EpicsValue::Double(42.0))
             .await
             .expect("add pv");
+        let put_db = Arc::clone(&db);
         let (mut client, handle, mut conn_rx, _acf_reload_tx) = spawn_server(db, port);
 
         client.write_all(&version_frame()).await.expect("version");
@@ -9892,6 +9891,13 @@ mod bfr7_event_context_filter_tests {
             "subscription must open (else the no-initial-frame assertion is vacuous): got {opened:?}"
         );
 
+        for v in then_put {
+            put_db
+                .put_pv_and_post("bfr7:pv", EpicsValue::Double(*v))
+                .await
+                .expect("put bfr7:pv");
+        }
+
         let frames = collect_frames(&mut client, Duration::from_millis(700)).await;
         drop(client);
         let _ = tokio::time::timeout(Duration::from_secs(2), handle).await;
@@ -9906,6 +9912,11 @@ mod bfr7_event_context_filter_tests {
     /// fails against that behaviour.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn event_context_sync_gate_suppresses_initial_event() {
+        // `sync.c`'s `parse_ok` resolves the state with `dbStateFind`, so
+        // the state has to be declared for the channel to open at all; it
+        // is simply never set.
+        epics_base_rs::server::database::filters::db_state_registry()
+            .get_or_create("BFR7:NEVERSET");
         let pv = r#"bfr7:pv.{"sync":{"while":"BFR7:NEVERSET"}}"#;
         let frames = subscribe_and_collect(pv, 55301).await;
         let event_adds: Vec<_> = frames
@@ -9938,23 +9949,30 @@ mod bfr7_event_context_filter_tests {
         );
     }
 
-    /// a `dec` filter whose window offset skips slot 0
-    /// (`offset = 1`) drops the FIRST event in EVENT context — the
-    /// initial monitor post lands on a fresh decimator counter at
-    /// position 0, which is decimated away. READ context would bypass
-    /// the decimator and send it.
+    /// The monitor stream runs through the decimator: C forwards window
+    /// slot 0 and drops the rest (`decimate.c:63`, `if (i++ == 0)`), so
+    /// with `n=2` the first of two value changes is sent and the second is
+    /// not. The initial post carries its own chain (see
+    /// `ChannelEntry::filter_chain`) and takes slot 0 of that one, so three
+    /// posts reach the client as two frames.
+    ///
+    /// `offset` is deliberately absent: `decimate.c`'s opts table defines
+    /// `n` alone, so the port's old `offset` extension — which is what let
+    /// an earlier version of this test suppress the initial post — no
+    /// longer parses.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn event_context_decimator_suppresses_initial_event() {
-        let pv = r#"bfr7:pv.{"dec":{"n":2,"offset":1}}"#;
-        let frames = subscribe_and_collect(pv, 55303).await;
+    async fn event_context_decimator_drops_the_second_update() {
+        let pv = r#"bfr7:pv.{"dec":{"n":2}}"#;
+        let frames = subscribe_then_put(pv, 55303, &[43.0, 44.0]).await;
         let event_adds: Vec<_> = frames
             .iter()
             .filter(|(cmd, _)| *cmd == CA_PROTO_EVENT_ADD)
             .collect();
-        assert!(
-            event_adds.is_empty(),
-            "the event-context decimator must drop the initial \
-             EVENT_ADD post (offset 1 skips window slot 0): got {event_adds:?}"
+        assert_eq!(
+            event_adds.len(),
+            2,
+            "initial post plus the first update; the second update is \
+             decimated away: got {frames:?}"
         );
     }
 }

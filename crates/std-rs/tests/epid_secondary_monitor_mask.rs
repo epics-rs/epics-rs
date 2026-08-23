@@ -248,7 +248,11 @@ async fn r11_64_a_value_subscriber_still_sees_the_secondary_change() {
     // The setpoint stays at 1, below HIHI: no alarm on any of these cycles.
     process(&db, "PID").await;
     let first = oval_rx.try_recv().expect("OVAL posts its first value");
-    assert_eq!(first.mask, EventMask::VALUE | EventMask::LOG);
+    // The post is a literal DBE_VALUE|DBE_LOG (epidRecord.c:376, pinned by
+    // the `full`-mask subscription above); what THIS subscription's log
+    // carries is `caEventMask & pevent->select` (dbEvent.c:896-900), so a
+    // DBE_VALUE-only client reads DBE_VALUE.
+    assert_eq!(first.mask, EventMask::VALUE);
 
     // Move the readback: ERR changes, so OVAL changes, so C posts again.
     set(&db, "RBV", -4.0).await;
@@ -258,7 +262,7 @@ async fn r11_64_a_value_subscriber_still_sees_the_secondary_change() {
         second.snapshot.value, first.snapshot.value,
         "the readback moved, so the PID output moved"
     );
-    assert_eq!(second.mask, EventMask::VALUE | EventMask::LOG);
+    assert_eq!(second.mask, EventMask::VALUE);
     {
         let g = inst.read();
         assert_eq!(g.common.sevr, AlarmSeverity::NoAlarm, "no alarm was raised");

@@ -9,6 +9,7 @@ mod record_lock;
 mod scan_index;
 mod snapshot;
 
+pub use field_io::ProcessMode;
 pub use link_set::{
     DynLinkSet, LinkDbfType, LinkMetadata, LinkPutOp, LinkSet, LinkSetRegistry, PutAdmission,
     RemoteAlarm,

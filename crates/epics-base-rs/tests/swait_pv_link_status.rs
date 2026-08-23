@@ -258,9 +258,16 @@ async fn r9_76_connected_dol_is_fetched_at_output_time() {
 }
 
 /// The status fields are published by a spawned classification task, so they
-/// are not a gate: a cycle that runs BEFORE that task lands (no `settle()`
-/// here, DOLV still reads NO_PV) must still fetch a DOL that resolves. Gating
-/// the fetch on `DOLV == PV_OK` made this cycle skip a get C performs.
+/// are not a gate: a cycle that runs while DOLV still reads NO_PV must still
+/// fetch a DOL that resolves. Gating the fetch on `DOLV == PV_OK` made this
+/// cycle skip a get C performs.
+///
+/// The pre-state is OBSERVED, not asserted. The classification runs on the
+/// process-global background executor, which is a real parallel executor, so
+/// "the task has not landed yet" is a race the test cannot win reliably — it
+/// failed 2 of 18 full-suite runs when it was an assertion. What the contract
+/// needs is that the fetch is independent of DOLV, which the final assertion
+/// pins whichever way the race went; the observed value rides in its message.
 #[epics_macros_rs::epics_test]
 async fn r9_76_dol_fetch_does_not_wait_for_the_classification_task() {
     let db = PvDatabase::new();
@@ -276,19 +283,16 @@ async fn r9_76_dol_fetch_does_not_wait_for_the_classification_task() {
     w.put_field("DOLD", EpicsValue::Double(42.0)).unwrap();
     db.add_record("W", Box::new(w)).await.unwrap();
 
-    // No settle(): process on the heels of add_record, while DOLV is still the
-    // init NO_PV.
-    assert_eq!(
-        field(&db, "W", "DOLV").await,
-        Some(EpicsValue::Enum(NO_PV)),
-        "the classification has not published yet"
-    );
+    // No settle(): process on the heels of add_record, so DOLV is usually
+    // still the init NO_PV.
+    let dolv_before = field(&db, "W", "DOLV").await;
 
     process(&db, "W").await;
 
     assert_eq!(
         field(&db, "W", "DOLD").await,
         Some(EpicsValue::Double(7.0)),
-        "the DOL resolves, so the get runs — regardless of what DOLV reads yet"
+        "the DOL resolves, so the get runs — regardless of DOLV, which read \
+         {dolv_before:?} when this cycle started"
     );
 }

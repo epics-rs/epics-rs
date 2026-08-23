@@ -34,9 +34,6 @@ use std::path::{Path, PathBuf};
 
 use crate::error::{CaError, CaResult};
 
-use super::DbRecordDef;
-use super::include::{DbLoadConfig, parse_db_file};
-
 /// Token from the substitutions-file lexer (`dbLoadTemplate_lex.l`).
 #[derive(Debug, Clone, PartialEq)]
 enum Tok {
@@ -351,16 +348,21 @@ impl Parser {
         Ok(())
     }
 
-    /// `{ "v1", "v2", ... }` — a positional value row.
-    fn parse_pattern_row(&mut self) -> CaResult<Vec<String>> {
+    /// `{ "v1", "v2", ... }` — a positional value row. Each value
+    /// carries the line it was read from, because a surplus one is
+    /// reported by line number.
+    fn parse_pattern_row(&mut self) -> CaResult<Vec<(String, usize)>> {
         self.expect(&Tok::OBrace)?;
-        let mut values: Vec<String> = Vec::new();
+        let mut values: Vec<(String, usize)> = Vec::new();
         while self.peek() != Some(&Tok::CBrace) {
             match self.peek() {
                 Some(Tok::Comma) => {
                     self.next();
                 }
-                Some(Tok::Str(_)) => values.push(self.expect_str()?),
+                Some(Tok::Str(_)) => {
+                    let line = self.line();
+                    values.push((self.expect_str()?, line));
+                }
                 Some(other) => {
                     return Err(self.err(format!("expected substitution value, got {other:?}")));
                 }
@@ -371,14 +373,20 @@ impl Parser {
         Ok(values)
     }
 
-    /// Zip pattern names with a value row (C `pattern_value`: extra
-    /// values past `var_count` are dropped with a warning; missing
-    /// values simply leave that name unbound).
-    fn pattern_macros(&self, names: &[String], row: &[String]) -> Vec<(String, String)> {
+    /// Zip pattern names with a value row. C `pattern_value` binds
+    /// only while `sub_count < var_count` and reports every value past
+    /// the last name (`dbLoadTemplate.y:233`, `:250`); `msi.cpp:933`
+    /// reports the same surplus as "Warning, too many values given".
+    /// Neither aborts the load, and a short row leaving the remaining
+    /// names unbound is silent in C, so only the surplus is reported.
+    fn pattern_macros(&self, names: &[String], row: &[(String, usize)]) -> Vec<(String, String)> {
+        for (_, line) in row.iter().skip(names.len()) {
+            tracing::warn!("dbLoadTemplate: Too many values given, line {line}.");
+        }
         names
             .iter()
             .zip(row.iter())
-            .map(|(n, v)| (n.clone(), v.clone()))
+            .map(|(n, (v, _))| (n.clone(), v.clone()))
             .collect()
     }
 
@@ -451,72 +459,47 @@ pub fn parse_substitutions(input: &str) -> CaResult<Vec<TemplateLoad>> {
     Parser::new(toks).parse()
 }
 
-/// Load a `.substitutions` file: parse it, then for every template
-/// load it describes call [`parse_db_file`] with the merged macro set
-/// (caller macros + globals + row), concatenating all resulting
-/// records. Mirrors `dbLoadTemplate` driving `dbLoadRecords`.
+/// Resolve a `.substitutions` file into the ordered list of
+/// `dbLoadRecords` calls it describes — one row per substitution, each
+/// carrying the merged macro set (caller macros, then the row's own
+/// globals + values overriding them).
 ///
-/// Template filenames are resolved relative to the substitutions
-/// file's own directory first, then `config.include_paths` — matching
-/// C msi's search behavior.
-pub fn load_substitution_file(
+/// Nothing here touches the filesystem beyond reading the
+/// `.substitutions` text, and nothing batches: C `dbLoadTemplate` runs
+/// `msiLoadRecords` from the `pattern_definition` action
+/// (`dbLoadTemplate.y:186`), so every row's records are already in
+/// `pdbbase` before the next row is read and a later failure loses only
+/// the remainder. The caller — the only party that owns a database — is
+/// therefore the one that must resolve, parse and install row by row.
+pub fn substitution_rows(
     path: &Path,
     macros: &HashMap<String, String>,
-    config: &DbLoadConfig,
-) -> CaResult<Vec<DbRecordDef>> {
+) -> CaResult<Vec<(String, HashMap<String, String>)>> {
     let content = std::fs::read_to_string(path).map_err(|e| CaError::DbParseError {
         line: 0,
         column: 0,
         message: format!("cannot read substitutions file '{}': {}", path.display(), e),
     })?;
-    let loads = parse_substitutions(&content)?;
-
-    let base_dir = path.parent().map(Path::to_path_buf).unwrap_or_default();
-    let mut records: Vec<DbRecordDef> = Vec::new();
-    for load in loads {
-        // Merge: caller macros first, then per-load (globals + row)
-        // overriding. macLib's last-definition-wins is reproduced by
-        // inserting row entries after the caller's into a HashMap.
-        let mut merged: HashMap<String, String> = macros.clone();
-        for (k, v) in &load.macros {
-            merged.insert(k.clone(), v.clone());
-        }
-        let template_path = resolve_template(&load.file, &base_dir, &config.include_paths)?;
-        let defs = parse_db_file(&template_path, &merged, config)?;
-        records.extend(defs);
-    }
-    Ok(records)
+    Ok(parse_substitutions(&content)?
+        .into_iter()
+        .map(|load| {
+            // macLib last-definition-wins: the caller's macros go in
+            // first so a row entry of the same name overrides them.
+            let mut merged = macros.clone();
+            merged.extend(load.macros);
+            (load.file, merged)
+        })
+        .collect())
 }
 
-/// Resolve a template filename: substitutions-file directory first,
-/// then the configured include paths.
-fn resolve_template(
-    filename: &str,
-    base_dir: &Path,
-    include_paths: &[PathBuf],
-) -> CaResult<PathBuf> {
-    let file_path = Path::new(filename);
-    if file_path.is_absolute() {
-        if file_path.exists() {
-            return Ok(file_path.to_path_buf());
-        }
-        return Err(CaError::DbParseError {
-            line: 0,
-            column: 0,
-            message: format!("template file not found: '{filename}'"),
-        });
-    }
-    let local = base_dir.join(file_path);
-    if local.exists() {
-        return Ok(local);
-    }
-    for dir in include_paths {
-        let cand = dir.join(file_path);
-        if cand.exists() {
-            return Ok(cand);
-        }
-    }
-    Err(CaError::DbParseError {
+/// Resolve a template filename through C `dbOpenFile`, which owns the
+/// `macEnvExpand` pass `dbReadCOM` (`dbLexRoutines.c:276`) runs on
+/// every name `dbLoadRecords` is handed — and a `.substitutions`
+/// `file` name is handed straight to `dbLoadRecords`
+/// (`dbLoadTemplate.y:51`) without any earlier expansion, so the
+/// environment is the only thing that can resolve it.
+pub(crate) fn resolve_template(filename: &str, include_paths: &[PathBuf]) -> CaResult<PathBuf> {
+    super::include::db_open_file(filename, include_paths).ok_or_else(|| CaError::DbParseError {
         line: 0,
         column: 0,
         message: format!("template file not found: '{filename}'"),
@@ -525,7 +508,29 @@ fn resolve_template(
 
 #[cfg(test)]
 mod tests {
+    use super::super::include::{DbLoadConfig, parse_db_file_with_breaktables};
     use super::*;
+
+    /// Drive a `.substitutions` file the way `dbLoadTemplate` does:
+    /// resolve, parse and collect one row at a time. The command
+    /// installs each row's records here; these tests only need the
+    /// records, so they concatenate them instead.
+    fn load_rows(
+        subs: &Path,
+        macros: &HashMap<String, String>,
+        config: &DbLoadConfig,
+    ) -> Vec<super::super::DbRecordDef> {
+        substitution_rows(subs, macros)
+            .unwrap()
+            .into_iter()
+            .flat_map(|(file, merged)| {
+                let template = resolve_template(&file, &config.include_paths).unwrap();
+                parse_db_file_with_breaktables(&template, &merged, config)
+                    .unwrap()
+                    .records
+            })
+            .collect()
+    }
 
     #[test]
     fn parse_pattern_substitution() {
@@ -629,11 +634,9 @@ file "rec.db" {
         assert!(loads.is_empty());
     }
 
-    /// epics-base#666: the zero-load entry stays legal (pinned above),
-    /// but must no longer be silent. All three row-less shapes warn;
-    /// an entry with rows does not.
-    #[test]
-    fn zero_load_file_entry_warns() {
+    /// Parse `src` with a `WARN`-level subscriber installed and return
+    /// everything it wrote.
+    fn captured(src: &str) -> String {
         use std::sync::{Arc, Mutex};
         use tracing_subscriber::fmt::MakeWriter;
 
@@ -655,17 +658,21 @@ file "rec.db" {
             }
         }
 
-        let captured = |src: &str| {
-            let buf = Buf::default();
-            let subscriber = tracing_subscriber::fmt()
-                .with_writer(buf.clone())
-                .with_max_level(tracing::Level::WARN)
-                .finish();
-            let _guard = tracing::subscriber::set_default(subscriber);
-            parse_substitutions(src).unwrap();
-            String::from_utf8_lossy(&buf.0.lock().unwrap()).into_owned()
-        };
+        let buf = Buf::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(buf.clone())
+            .with_max_level(tracing::Level::WARN)
+            .finish();
+        let _guard = tracing::subscriber::set_default(subscriber);
+        parse_substitutions(src).unwrap();
+        String::from_utf8_lossy(&buf.0.lock().unwrap()).into_owned()
+    }
 
+    /// epics-base#666: the zero-load entry stays legal (pinned above),
+    /// but must no longer be silent. All three row-less shapes warn;
+    /// an entry with rows does not.
+    #[test]
+    fn zero_load_file_entry_warns() {
         for src in [
             r#"file "rec.db" { }"#,
             r#"file "rec.db" { pattern {N} }"#,
@@ -681,6 +688,46 @@ file "rec.db" {
             captured(r#"file "rec.db" { { A=1 } }"#),
             "",
             "an entry with rows must not warn"
+        );
+    }
+
+    /// C `pattern_value` reports every value past the last pattern name
+    /// (`dbLoadTemplate.y:233`, `:250`; `msi.cpp:933`) and drops it. The
+    /// port dropped it silently, so a `.substitutions` row that had
+    /// drifted out of step with its `pattern` line loaded a template
+    /// with the wrong macro set and said nothing. The short row is the
+    /// other half of the same rule and stays silent: C leaves the
+    /// unmatched name unbound without a diagnostic.
+    #[test]
+    fn a_value_past_the_last_pattern_name_is_reported() {
+        let out = captured("file \"rec.db\" {\n  pattern { A, B }\n  { \"1\", \"2\", \"3\" }\n}");
+        assert!(
+            out.contains("Too many values given, line 3."),
+            "the surplus value must be reported with its line, got: {out:?}"
+        );
+        assert_eq!(
+            out.matches("Too many values given").count(),
+            1,
+            "one report per surplus value, got: {out:?}"
+        );
+
+        let loads = parse_substitutions(
+            "file \"rec.db\" {\n  pattern { A, B }\n  { \"1\", \"2\", \"3\" }\n}",
+        )
+        .unwrap();
+        assert_eq!(
+            loads[0].macros,
+            vec![
+                ("A".to_string(), "1".to_string()),
+                ("B".to_string(), "2".to_string())
+            ],
+            "the surplus value is dropped, the rest still bind"
+        );
+
+        assert_eq!(
+            captured("file \"rec.db\" {\n  pattern { A, B }\n  { \"1\" }\n}"),
+            "",
+            "a short row leaves B unbound without a diagnostic, as in C"
         );
     }
 
@@ -753,7 +800,7 @@ file "b.db" { { Y=2 } }
     }
 
     #[test]
-    fn load_substitution_file_drives_template_loads() {
+    fn substitution_rows_drives_template_loads() {
         use std::io::Write;
         let dir = tempfile::tempdir().unwrap();
 
@@ -770,8 +817,13 @@ file "b.db" { { Y=2 } }
         writeln!(f, r#"        {{ "2" }}"#).unwrap();
         writeln!(f, r#"}}"#).unwrap();
 
-        let config = DbLoadConfig::default();
-        let recs = load_substitution_file(&subs, &HashMap::new(), &config).unwrap();
+        // The template goes through `dbLoadRecords`, so it is found on
+        // the path list — not next to the substitutions file.
+        let config = DbLoadConfig {
+            include_paths: vec![dir.path().to_path_buf()],
+            max_include_depth: 32,
+        };
+        let recs = load_rows(&subs, &HashMap::new(), &config);
         assert_eq!(recs.len(), 2);
         assert_eq!(recs[0].name, "IOC:1");
         assert_eq!(recs[0].fields[0].1, "1");
@@ -779,8 +831,66 @@ file "b.db" { { Y=2 } }
         assert_eq!(recs[1].fields[0].1, "2");
     }
 
+    /// I-R3-3: a template that also exists next to the `.substitutions`
+    /// file must still be taken from the path list. `dbLoadTemplate`
+    /// (`dbLoadTemplate.y:51`) hands each `file` entry to
+    /// `dbLoadRecords`, whose `dbOpenFile` never looks at the
+    /// substitutions file's own directory.
     #[test]
-    fn load_substitution_file_caller_macros_overridden_by_row() {
+    fn substitution_rows_takes_templates_from_the_path_list() {
+        use std::io::Write;
+        let dir = tempfile::tempdir().unwrap();
+        let path_dir = tempfile::tempdir().unwrap();
+
+        let mut f = std::fs::File::create(path_dir.path().join("rec.db")).unwrap();
+        writeln!(f, r#"record(ai, "FROM_PATH") {{ }}"#).unwrap();
+        let mut f = std::fs::File::create(dir.path().join("rec.db")).unwrap();
+        writeln!(f, r#"record(ai, "FROM_SUBS_DIR") {{ }}"#).unwrap();
+
+        let subs = dir.path().join("t.substitutions");
+        let mut f = std::fs::File::create(&subs).unwrap();
+        writeln!(f, r#"file "rec.db" {{ {{ }} }}"#).unwrap();
+
+        let config = DbLoadConfig {
+            include_paths: vec![path_dir.path().to_path_buf()],
+            max_include_depth: 32,
+        };
+        let recs = load_rows(&subs, &HashMap::new(), &config);
+        assert_eq!(recs.len(), 1);
+        assert_eq!(recs[0].name, "FROM_PATH");
+    }
+
+    /// A `.substitutions` `file` name is never touched by the iocsh
+    /// expansion — only `dbReadCOM`'s `macEnvExpand`
+    /// (`dbLexRoutines.c:276`) can resolve it, so `$(TOP)/x.template`
+    /// loads exactly when `TOP` is an environment variable.
+    #[test]
+    #[serial_test::serial(epics_env)]
+    fn substitution_rows_env_expands_the_template_name() {
+        use std::io::Write;
+        let dir = tempfile::tempdir().unwrap();
+        let tpl_dir = tempfile::tempdir().unwrap();
+        let key = "EPICS_RS_TEST_SUBS_TOP";
+
+        let mut f = std::fs::File::create(tpl_dir.path().join("t.template")).unwrap();
+        writeln!(f, r#"record(ai, "FROM_ENV") {{ }}"#).unwrap();
+
+        let subs = dir.path().join("t.substitutions");
+        let mut f = std::fs::File::create(&subs).unwrap();
+        writeln!(f, r#"file "$({key})/t.template" {{ {{ }} }}"#).unwrap();
+
+        // SAFETY: single-threaded under the `epics_env` serial group.
+        unsafe { std::env::set_var(key, tpl_dir.path()) };
+        let recs = load_rows(&subs, &HashMap::new(), &DbLoadConfig::default());
+        // SAFETY: same serial group.
+        unsafe { std::env::remove_var(key) };
+
+        assert_eq!(recs.len(), 1);
+        assert_eq!(recs[0].name, "FROM_ENV");
+    }
+
+    #[test]
+    fn substitution_rows_caller_macros_overridden_by_row() {
         use std::io::Write;
         let dir = tempfile::tempdir().unwrap();
 
@@ -795,8 +905,11 @@ file "b.db" { { Y=2 } }
         // Caller passes N=CALLER; the row's N=ROW must win.
         let mut macros = HashMap::new();
         macros.insert("N".to_string(), "CALLER".to_string());
-        let config = DbLoadConfig::default();
-        let recs = load_substitution_file(&subs, &macros, &config).unwrap();
+        let config = DbLoadConfig {
+            include_paths: vec![dir.path().to_path_buf()],
+            max_include_depth: 32,
+        };
+        let recs = load_rows(&subs, &macros, &config);
         assert_eq!(recs.len(), 1);
         assert_eq!(recs[0].name, "ROW");
     }

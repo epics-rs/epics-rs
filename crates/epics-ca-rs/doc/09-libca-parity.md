@@ -82,7 +82,7 @@ the C ABI surface**. Details below.
 | Hostname-based access | ✅ | ✅ |
 | Username-based access | ✅ | ✅ |
 | INPA-INPL evaluation in rules | ✅ | ⚠️ partial |
-| `asCheckClientIP` toggle | ✅ (iocsh var) | ✅ (iocsh command; default `0`, client-claimed name authoritative) |
+| `asCheckClientIP` toggle | ✅ (iocsh var) | ✅ (iocsh var; default `0`, client-claimed name authoritative) |
 | Reverse-DNS lookup | ⚠️ (most builds skip) | ❌ |
 | Late access-rights re-evaluation on HOST/CLIENT_NAME change | ✅ | ✅ |
 | `CA_PROTO_ACCESS_RIGHTS` event broadcast | ✅ | ✅ |

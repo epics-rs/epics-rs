@@ -737,7 +737,7 @@ impl Record for ScalcoutRecord {
             self.dlya = 1;
             self.pending_output = write_out;
             self.cached_should_output = false;
-            let delay = std::time::Duration::from_secs_f64(self.odly);
+            let delay = crate::runtime::time::duration_from_secs(self.odly);
             return Ok(ProcessOutcome {
                 result: RecordProcessResult::AsyncPendingNotify(vec![(
                     "DLYA".to_string(),

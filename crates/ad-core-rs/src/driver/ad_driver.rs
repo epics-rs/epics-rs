@@ -209,7 +209,7 @@ impl ADDriverBase {
                 // C++: epicsThreadSleep(shutterOpenDelay - shutterCloseDelay).
                 let delay = open_delay - close_delay;
                 if delay > 0.0 {
-                    std::thread::sleep(std::time::Duration::from_secs_f64(delay));
+                    std::thread::sleep(epics_libcom_rs::runtime::time::duration_from_secs(delay));
                 }
             }
         }

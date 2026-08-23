@@ -343,7 +343,7 @@ struct Digits {
 fn scan_int(s: &str) -> Digits {
     let b = s.as_bytes();
     let mut i = 0;
-    while i < b.len() && b[i].is_ascii_whitespace() {
+    while i < b.len() && crate::runtime::stdlib::c_isspace(b[i] as char) {
         i += 1;
     }
     let negative = i < b.len() && b[i] == b'-';
@@ -463,7 +463,7 @@ enum Literal {
 /// The hex form is not decoration — `strtod` accepts it and so does the
 /// reference IOC: `caput REC.VAL 0x10` stores 16.
 fn strtod(s: &str) -> Option<(f64, Literal)> {
-    let t = s.trim_start_matches(|c: char| c.is_ascii_whitespace());
+    let t = s.trim_start_matches(crate::runtime::stdlib::c_isspace);
     let (sign, body) = match t.as_bytes().first() {
         Some(b'-') => (-1.0, &t[1..]),
         Some(b'+') => (1.0, &t[1..]),
@@ -592,6 +592,22 @@ mod tests {
         assert_eq!(put(NumericField::Long, "-2147483649"), None);
         assert_eq!(put(NumericField::Char, "128"), None);
         assert_eq!(put(NumericField::Char, "-129"), None);
+    }
+
+    /// C `strtol`/`strtod` skip leading whitespace by `isspace`, whose set
+    /// includes the vertical tab; Rust's `is_ascii_whitespace` omits it. A
+    /// `caput` whose value carries a leading VT converts on a C IOC, so
+    /// refusing it here would reject a put C accepts.
+    #[test]
+    fn a_leading_vertical_tab_is_whitespace_as_it_is_to_c() {
+        assert_eq!(
+            put(NumericField::Long, "\u{0b}42"),
+            Some(EpicsValue::Long(42))
+        );
+        assert_eq!(
+            put(NumericField::Double, "\u{0b}1.5"),
+            Some(EpicsValue::Double(1.5))
+        );
     }
 
     #[test]

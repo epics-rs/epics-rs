@@ -5,6 +5,25 @@
 
 use std::time::Duration;
 
+/// Parse the command line, exiting the way the C tools exit.
+///
+/// clap's own `Error::exit` uses 2 for a usage error. No pvAccess tool
+/// does: `getopt`'s three failure arms all `return 1`
+/// (`pvget.cpp:340,357,362,365`, `pvput.cpp:342,351,356,359`), and `-h`
+/// / `-V` `return 0` (`pvget.cpp:283,300`). Measured on the built
+/// binaries: `pvget -Z` exits 1. clap already routes help and version to
+/// stdout and errors to stderr, and `use_stderr()` is exactly that
+/// split, so only the code is ours.
+pub fn parse_or_exit<T: clap::Parser>() -> T {
+    match T::try_parse() {
+        Ok(args) => args,
+        Err(e) => {
+            let _ = e.print();
+            std::process::exit(i32::from(e.use_stderr()));
+        }
+    }
+}
+
 /// Default PVA CLI timeout in seconds when a user-supplied `-w`
 /// is missing or non-finite. Matches `pvget-rs` default of 5.0 s
 /// (epics-base `pvget` likewise defaults to 5 s, vs CA tools' 1 s).

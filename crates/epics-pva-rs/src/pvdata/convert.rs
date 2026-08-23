@@ -321,7 +321,7 @@ pub fn as_string(f: &PvField) -> Result<String, NoConvert> {
 pub fn parse_to_u64(s: &str) -> Result<u64, NoConvert> {
     let b = s.as_bytes();
     let mut i = 0usize;
-    while i < b.len() && b[i].is_ascii_whitespace() {
+    while i < b.len() && epics_base_rs::runtime::stdlib::c_isspace(b[i] as char) {
         i += 1;
     }
     let negate = match b.get(i) {
@@ -359,7 +359,7 @@ pub fn parse_to_u64(s: &str) -> Result<u64, NoConvert> {
         v = v.wrapping_neg();
     }
     let mut j = end;
-    while j < b.len() && b[j].is_ascii_whitespace() {
+    while j < b.len() && epics_base_rs::runtime::stdlib::c_isspace(b[j] as char) {
         j += 1;
     }
     if j != b.len() {
@@ -505,6 +505,15 @@ mod tests {
             Ok(5)
         );
         assert_eq!(as_u8(&PvField::Scalar(ScalarValue::Int(0x1_05))), Ok(5));
+    }
+
+    /// `std::stoull` defers to `strtoull`, whose leading skip is `isspace` —
+    /// vertical tab included. Rust's `is_ascii_whitespace` omits it, which
+    /// turned a value pvxs converts into `NoConvert`.
+    #[test]
+    fn a_leading_vertical_tab_is_whitespace_as_it_is_to_strtoull() {
+        assert_eq!(parse_to_u64("\u{0b}16"), Ok(16));
+        assert_eq!(parse_to_u64("16\u{0b}"), Ok(16));
     }
 
     #[test]

@@ -35,8 +35,9 @@ struct Args {
     #[arg(short = 'V', long = "version")]
     version: bool,
 
-    /// PV name of the RPC endpoint
-    #[arg(required_unless_present = "version")]
+    /// PV name of the RPC endpoint. Not clap-required: C makes the check
+    /// itself and returns 1 (pvcall.cpp:172-174), where a clap-enforced
+    /// argument would exit 2.
     pv_name: Option<String>,
 
     /// `field=value` arguments. Repeat for multiple args.
@@ -113,7 +114,7 @@ fn build_nturi(pv_name: &str, args: &[(String, ScalarValue)]) -> (FieldDesc, PvF
 
 #[tokio::main]
 async fn main() {
-    let args = Args::parse();
+    let args: Args = epics_pva_rs::cli::parse_or_exit();
 
     // pvxs `-V` prints version_information and exits before any client
     // setup (tools/call.cpp:55).
@@ -127,9 +128,12 @@ async fn main() {
     // mirroring pvxs `logger_config_env()` + `-d` (tools/call.cpp:47-64).
     epics_pva_rs::log::install_cli_logging(args.debug);
 
-    let pv_name = args
-        .pv_name
-        .expect("clap enforces required unless --version");
+    // pvcall.cpp:172-174 prints the pvput wording, `pvput -h` and all;
+    // this is a transcription, not a copy-paste slip.
+    let Some(pv_name) = args.pv_name else {
+        eprintln!("No pv name specified. ('pvput -h' for help.)");
+        std::process::exit(1);
+    };
 
     let parsed_args: Vec<(String, ScalarValue)> = match collect_args(&args.args) {
         Ok(v) => v,
@@ -164,11 +168,16 @@ async fn main() {
             if let Some((resp_desc, resp_value)) = reply.into_value() {
                 match args.mode.as_str() {
                     "json" => {
-                        let s = epics_pva_rs::format::format_json(&pv_name, &resp_value);
+                        let s = epics_pva_rs::format::format_json(&pv_name, &resp_value, None);
                         println!("{s}");
                     }
                     "raw" => {
-                        let s = epics_pva_rs::format::format_raw(&pv_name, &resp_desc, &resp_value);
+                        let s = epics_pva_rs::format::format_raw(
+                            &pv_name,
+                            &resp_desc,
+                            &resp_value,
+                            None,
+                        );
                         println!("{s}");
                     }
                     _ => {

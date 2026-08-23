@@ -220,18 +220,16 @@ impl CommandRegistry {
 /// C++ syntax: `command("arg1", arg2, $(VAR))` — parens delimit args, commas separate.
 /// Legacy syntax: `command "arg1" arg2` — whitespace separates.
 ///
-/// `$(VAR)` references are resolved from environment variables.
-///
-/// C parity (`iocsh.cpp:1184` `macDefExpand` → `:1215` `tokenize.split`):
+/// C parity (`iocsh.cpp:1190` `macDefExpand` → `:1215` `tokenize.split`):
 /// macros are expanded across the WHOLE line *before* it is split into
-/// words, not per-token afterwards. So a macro whose value contains a
-/// separator (`$(CMD)` with `CMD="dbpr REC 2"`) is re-tokenized into
-/// multiple words, and a leading `$(MACRO)` at command position resolves
-/// before the command name is taken. (A per-token expansion would instead
-/// mis-split the leading `$(` and leave a multi-word value as one token.)
+/// words, and `split` itself expands nothing. So a macro whose value
+/// contains a separator (`$(CMD)` with `CMD="dbpr REC 2"`) is
+/// re-tokenized into multiple words, and a leading `$(MACRO)` at command
+/// position resolves before the command name is taken. The caller
+/// ([`super::IocShell::execute_line`]) owns that one expansion; this
+/// function must not perform a second one.
 pub(crate) fn tokenize(line: &str) -> Vec<String> {
-    let expanded = substitute_env_vars(line);
-    let line = expanded.trim();
+    let line = line.trim();
     if line.is_empty() {
         return Vec::new();
     }
@@ -255,8 +253,8 @@ pub(crate) fn tokenize(line: &str) -> Vec<String> {
         return Vec::new();
     }
 
-    // Macros were already expanded on the whole line above, so the
-    // tokens are pushed verbatim (no per-token substitution).
+    // The whole line was expanded once by the caller, so the tokens are
+    // pushed verbatim (no per-token substitution).
     let mut tokens = vec![cmd_name.to_string()];
 
     if has_parens {
@@ -496,84 +494,78 @@ fn split_space_args(s: &str) -> Vec<String> {
 /// well-formed. L-5: C marks such a line errored; the Rust tokenizer
 /// previously consumed them silently.
 pub(crate) fn lint_line(line: &str) -> Option<&'static str> {
-    let mut quote: char = '\0';
-    let mut backslash = false;
-    for ch in line.chars() {
-        if backslash {
-            backslash = false;
-            continue;
-        }
-        if ch == '\\' {
-            backslash = true;
-            continue;
-        }
-        if quote != '\0' {
-            if ch == quote {
-                quote = '\0';
-            }
-        } else if ch == '"' || ch == '\'' {
-            quote = ch;
-        }
+    let mut scan = ShellScan::default();
+    for &b in line.as_bytes() {
+        scan.feed(b);
     }
-    if quote != '\0' {
+    // C reports these after the same loop, from the same two pieces of
+    // state (`iocsh.cpp:349-360`).
+    if scan.unbalanced_quote() {
         return Some("Unbalanced quote.");
     }
-    if backslash {
+    if scan.trailing_backslash() {
         return Some("Trailing backslash.");
     }
     None
 }
 
-/// Substitute `$(NAME)` and `${NAME}` references with environment variable
-/// values. Mirrors C macLib (macCore.c:777) which accepts both bracket
-/// forms: `(*r++ == '(') ? "=,)" : "=,}"`. Default values via
-/// `$(NAME=DEFAULT)` / `${NAME=DEFAULT}` are supported.
+/// The one owner of C `split()`'s quote/backslash state
+/// (`iocsh.cpp:262-346`).
 ///
-/// Unresolved references are passed through verbatim using the bracket
-/// pair they came in with — so `${X}` with X unset emits `${X}`, not
-/// `$(X)`.
-pub(crate) fn substitute_env_vars(s: &str) -> String {
-    if !s.contains("$(") && !s.contains("${") {
-        return s.to_string();
-    }
-    let mut result = String::with_capacity(s.len());
-    let chars: Vec<char> = s.chars().collect();
-    let mut i = 0;
-    while i < chars.len() {
-        if i + 1 < chars.len() && chars[i] == '$' && (chars[i + 1] == '(' || chars[i + 1] == '{') {
-            // Track the bracket pair so the verbatim passthrough on
-            // lookup miss reproduces the original syntax.
-            let (open, close) = if chars[i + 1] == '(' {
-                ('(', ')')
-            } else {
-                ('{', '}')
-            };
-            if let Some(end) = chars[i + 2..].iter().position(|&c| c == close) {
-                let var_expr: String = chars[i + 2..i + 2 + end].iter().collect();
-                // Support $(VAR=DEFAULT) / ${VAR=DEFAULT} syntax
-                let (var_name, default_val) = if let Some(eq_pos) = var_expr.find('=') {
-                    (&var_expr[..eq_pos], Some(&var_expr[eq_pos + 1..]))
-                } else {
-                    (var_expr.as_str(), None)
-                };
-                if let Some(val) = crate::runtime::env::get(var_name) {
-                    result.push_str(&val);
-                } else if let Some(def) = default_val {
-                    result.push_str(def);
-                } else {
-                    result.push('$');
-                    result.push(open);
-                    result.push_str(&var_expr);
-                    result.push(close);
-                }
-                i += 2 + end + 1;
-                continue;
-            }
+/// C keeps a single `quote` character — which remembers *which* quote
+/// opened, so only the matching one closes it — and a single
+/// `backslash` flag, and gates every syntactic decision it makes on
+/// `!quote && !backslash`: the separator test at `:272`, the whole
+/// redirect block at `:274-303`, and quote termination at `:306`. A
+/// scanner that tracks a subset of that state disagrees with the
+/// tokenizer about where a token ends, which is how a `>` inside a
+/// single-quoted argument became a redirect and truncated a file.
+///
+/// Note the backslash is only ever armed outside a quote (`:273-276`
+/// sits inside the `!quote` block), so inside quotes a backslash is
+/// ordinary data to C.
+#[derive(Default)]
+pub(crate) struct ShellScan {
+    /// The byte that opened the current quote, or 0 outside quotes.
+    quote: u8,
+    backslash: bool,
+}
+
+impl ShellScan {
+    /// Feed the next byte and report whether it is SYNTAX — C's
+    /// `!quote && !backslash`. Quote characters, escapes and everything
+    /// they cover are data and answer `false`.
+    pub(crate) fn feed(&mut self, c: u8) -> bool {
+        if self.backslash {
+            self.backslash = false;
+            return false;
         }
-        result.push(chars[i]);
-        i += 1;
+        if self.quote != 0 {
+            if c == self.quote {
+                self.quote = 0;
+            }
+            return false;
+        }
+        match c {
+            b'\\' => {
+                self.backslash = true;
+                false
+            }
+            b'"' | b'\'' => {
+                self.quote = c;
+                false
+            }
+            _ => true,
+        }
     }
-    result
+
+    pub(crate) fn unbalanced_quote(&self) -> bool {
+        self.quote != 0
+    }
+
+    pub(crate) fn trailing_backslash(&self) -> bool {
+        self.backslash
+    }
 }
 
 /// Parse an `iocshArgInt` token the way C `cvtArg` does
@@ -768,42 +760,6 @@ mod tests {
     }
 
     #[test]
-    fn test_tokenize_cpp_env_var() {
-        unsafe { std::env::set_var("_TEST_TOK_VAR", "HELLO") };
-        assert_eq!(
-            tokenize(r#"cmd("$(_TEST_TOK_VAR)", $(_TEST_TOK_VAR))"#),
-            vec!["cmd", "HELLO", "HELLO"]
-        );
-        unsafe { std::env::remove_var("_TEST_TOK_VAR") };
-    }
-
-    #[test]
-    fn test_tokenize_cpp_env_var_unset() {
-        // Unset env vars kept as $(NAME)
-        assert_eq!(
-            tokenize(r#"cmd($(UNLIKELY_VAR_XYZ))"#),
-            vec!["cmd", "$(UNLIKELY_VAR_XYZ)"]
-        );
-    }
-
-    #[test]
-    fn test_tokenize_expands_whole_line_before_split() {
-        // C `iocsh.cpp:1184` macDefExpand runs on the whole line before
-        // `:1215` split, so a macro value containing separators is
-        // re-tokenized. A per-token expansion would leave "dbpr REC 2"
-        // as a single bad token and mis-split the leading "$(".
-        unsafe { std::env::set_var("_TEST_TOK_MULTIWORD", "dbpr REC 2") };
-        // Leading macro at command position expands then splits.
-        assert_eq!(tokenize("$(_TEST_TOK_MULTIWORD)"), vec!["dbpr", "REC", "2"]);
-        // …and trailing words after the macro are kept as separate tokens.
-        assert_eq!(
-            tokenize("$(_TEST_TOK_MULTIWORD) EXTRA"),
-            vec!["dbpr", "REC", "2", "EXTRA"]
-        );
-        unsafe { std::env::remove_var("_TEST_TOK_MULTIWORD") };
-    }
-
-    #[test]
     fn test_tokenize_cpp_dbloadrecords() {
         // Matches real C++ EPICS syntax
         assert_eq!(
@@ -947,47 +903,5 @@ mod tests {
         assert!(reg.get("test").is_some());
         assert!(reg.get("nonexistent").is_none());
         assert_eq!(reg.list(), vec!["test"]);
-    }
-
-    // C macLib (macCore.c:777) accepts both `$(NAME)` and `${NAME}` bracket
-    // forms — `(*r++ == '(') ? "=,)" : "=,}"`. Rust port previously only
-    // honored `$(...)`. iocsh scripts that used `${IOC}/db/foo.db`
-    // (the shell-style form many sites adopted in `st.cmd`) had their
-    // variables silently left unexpanded.
-    #[test]
-    #[serial_test::serial(epics_env)]
-    fn substitute_env_vars_handles_brace_form() {
-        // SAFETY: serial(epics_env) serialises every env-mutating test in
-        // the crate, and we restore the prior state below.
-        let prev = std::env::var("EPICS_PARITY_TEST_BRACE").ok();
-        unsafe {
-            std::env::set_var("EPICS_PARITY_TEST_BRACE", "expanded");
-        }
-
-        let expanded = substitute_env_vars("prefix-${EPICS_PARITY_TEST_BRACE}-suffix");
-        assert_eq!(expanded, "prefix-expanded-suffix");
-
-        // Default value via ${VAR=default} — same syntax C macLib supports.
-        unsafe {
-            std::env::remove_var("EPICS_PARITY_TEST_BRACE_UNSET");
-        }
-        let expanded = substitute_env_vars("${EPICS_PARITY_TEST_BRACE_UNSET=fallback}");
-        assert_eq!(expanded, "fallback");
-
-        // Unset without default — passes through verbatim using the bracket
-        // pair it came in with. Caller may then resubstitute later.
-        let expanded = substitute_env_vars("${EPICS_PARITY_TEST_BRACE_UNSET}");
-        assert_eq!(expanded, "${EPICS_PARITY_TEST_BRACE_UNSET}");
-
-        // $(...) still works exactly as before.
-        let expanded = substitute_env_vars("$(EPICS_PARITY_TEST_BRACE)");
-        assert_eq!(expanded, "expanded");
-
-        unsafe {
-            match prev {
-                Some(v) => std::env::set_var("EPICS_PARITY_TEST_BRACE", v),
-                None => std::env::remove_var("EPICS_PARITY_TEST_BRACE"),
-            }
-        }
     }
 }

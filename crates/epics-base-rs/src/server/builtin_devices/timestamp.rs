@@ -319,7 +319,10 @@ impl DeviceSupport for SoftTimestampDeviceSupport {
     }
 
     fn read(&mut self, record: &mut dyn Record) -> CaResult<DeviceReadOutcome> {
-        let ts = get_time_stamp(self.tse, self.time);
+        // C `recGblGetTimeStamp` leaves `prec->time` alone when
+        // `epicsTimeGetEvent` fails, and the record-level owner
+        // (`apply_timestamp`) emits the errlog this cycle.
+        let ts = get_time_stamp(self.tse, self.time).unwrap_or(self.time);
         match record.record_type() {
             "ai" => {
                 // C `devTimestamp.c:38-41` `read_ai`: `prec->val =

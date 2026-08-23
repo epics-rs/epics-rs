@@ -379,13 +379,27 @@ pub fn highest_current_name() -> Option<String> {
 
 /// Get the time for a specific event number.
 ///
+/// C parity: `epicsGeneralTime.c:342-349` `epicsTimeGetEvent` plus
+/// `generalTimeGetEventPriority` (`:241-338`). `None` is C's non-zero
+/// status — the caller must treat it as C treats it, leaving the
+/// destination stamp untouched:
+///
+/// - `event < -1`: `S_time_badEvent` (`:254-255`, and
+///   `epicsTimeEventBestTime == -1` in `epicsTime.h:103`).
 /// - `event == 0`: delegates to [`get_current()`].
 /// - `event == -1`: "BestTime" — queries current providers with its own ratchet.
 /// - `event 1..=255`: per-slot ratcheted event time from event providers.
 /// - `event >= 256`: event time from event providers, no ratchet.
-pub fn get_event(event: i32) -> SystemTime {
+/// - no event provider answers: `S_time_noProvider` (`:243`, the initial
+///   `status`). C installs no event provider by default —
+///   `installLastResortEventProvider` (`:521-525`) is an iocsh command —
+///   so an IOC with none holds the old stamp instead of stamping now.
+pub fn get_event(event: i32) -> Option<SystemTime> {
+    if event < -1 {
+        return None;
+    }
     if event == 0 {
-        return get_current();
+        return Some(get_current());
     }
 
     let mut inner = GENERAL_TIME.lock().unwrap();
@@ -398,16 +412,16 @@ pub fn get_event(event: i32) -> SystemTime {
                 if t >= inner.last_best_time {
                     inner.last_best_time = t;
                     inner.last_event_name = Some(name);
-                    return t;
+                    return Some(t);
                 } else {
                     ERROR_COUNTS.fetch_add(1, Ordering::Relaxed);
                     inner.last_event_name = Some(name);
-                    return inner.last_best_time;
+                    return Some(inner.last_best_time);
                 }
             }
         }
         ERROR_COUNTS.fetch_add(1, Ordering::Relaxed);
-        return inner.last_best_time;
+        return Some(inner.last_best_time);
     }
 
     // Positive event: query event providers.
@@ -420,25 +434,36 @@ pub fn get_event(event: i32) -> SystemTime {
                 let slot = event as usize;
                 if t >= inner.event_times[slot] {
                     inner.event_times[slot] = t;
-                    return t;
+                    return Some(t);
                 } else {
                     ERROR_COUNTS.fetch_add(1, Ordering::Relaxed);
-                    return inner.event_times[slot];
+                    return Some(inner.event_times[slot]);
                 }
             }
             // event >= 256: no ratchet
-            return t;
+            return Some(t);
         }
     }
 
-    // No event provider succeeded — fall back to get_current().
-    drop(inner);
-    get_current()
+    // No event provider answered: C's `status` is still `S_time_noProvider`.
+    None
 }
 
-/// Install a last-resort event provider that returns `SystemTime::now()` for any event.
+/// C `installLastResortEventProvider` (`epicsGeneralTime.c:521-525`) —
+/// register `lastResortGetEvent`, which answers every event number with
+/// the current time, at `LAST_RESORT_PRIORITY` (999).
+///
+/// This is the ONLY thing that makes an event stamp fall back to the wall
+/// clock. C never calls it during init: `libComRegister.c` registers it as
+/// the `installLastResortEventProvider` iocsh command, so it is an
+/// operator opt-in and an IOC without it leaves `prec->time` alone for a
+/// `TSE` no provider serves.
+///
+/// The provider's name is C's `"Last Resort Event"`, which is what
+/// `generalTimeReport` prints; `"OS Clock"` is the name of the *current
+/// time* provider (`osiClockTime.c:116`), a different table.
 pub fn install_last_resort_event_provider() {
-    register_event_provider("OS Clock", 999, |_| Some(SystemTime::now()));
+    register_event_provider("Last Resort Event", 999, |_| Some(SystemTime::now()));
 }
 
 /// Return the cumulative count of monotonic-enforcement errors.
@@ -621,7 +646,44 @@ mod tests {
         register_current_provider("Fixed", 10, move || Some(fixed));
 
         let t = get_event(0);
-        assert_eq!(t, fixed);
+        assert_eq!(t, Some(fixed));
+    }
+
+    /// C `generalTimeGetEventPriority` (`epicsGeneralTime.c:254-255`):
+    /// `if (eventNumber < epicsTimeEventBestTime) return S_time_badEvent;`
+    /// `epicsTimeEventBestTime` is -1 (`epicsTime.h:103`), so every TSE a
+    /// record can hold below it — `TSE` is `epicsInt16`, hence -32768..-3 —
+    /// is a bad event, not a request for the wall clock.
+    #[test]
+    fn an_event_below_best_time_is_a_bad_event() {
+        let _g = TEST_LOCK.lock().unwrap();
+        _reset_for_testing();
+        let fixed = SystemTime::UNIX_EPOCH + Duration::from_secs(2_000_000_000);
+        register_current_provider("Fixed", 10, move || Some(fixed));
+        register_event_provider("EventSrc", 10, move |_ev| Some(fixed));
+
+        assert_eq!(get_event(-3), None);
+        assert_eq!(get_event(i16::MIN as i32), None);
+        // -1 and 0 stay answerable: they are C's BestTime and CurrentTime.
+        assert_eq!(get_event(-1), Some(fixed));
+        assert_eq!(get_event(0), Some(fixed));
+    }
+
+    /// C `generalTimeGetEventPriority` enters with
+    /// `status = S_time_noProvider` (`epicsGeneralTime.c:243`) and only an
+    /// answering provider clears it. Nothing registers an event provider by
+    /// default — `installLastResortEventProvider` (`:521-525`) is an iocsh
+    /// command — so an event number no provider serves is an error, not the
+    /// current time.
+    #[test]
+    fn an_event_no_provider_serves_is_not_the_current_time() {
+        let _g = TEST_LOCK.lock().unwrap();
+        _reset_for_testing();
+        let fixed = SystemTime::UNIX_EPOCH + Duration::from_secs(2_000_000_000);
+        register_current_provider("Fixed", 10, move || Some(fixed));
+
+        assert_eq!(get_event(42), None);
+        assert_eq!(get_event(300), None);
     }
 
     #[test]
@@ -646,15 +708,15 @@ mod tests {
 
         reset_error_counts();
         let first = get_event(42);
-        assert_eq!(first, t1);
+        assert_eq!(first, Some(t1));
 
         let second = get_event(42);
         // Ratcheted: returns t1, not t2
-        assert_eq!(second, t1);
+        assert_eq!(second, Some(t1));
         assert_eq!(error_counts(), 1);
 
         let third = get_event(42);
-        assert_eq!(third, t3);
+        assert_eq!(third, Some(t3));
     }
 
     #[test]
@@ -677,10 +739,10 @@ mod tests {
 
         reset_error_counts();
         let first = get_event(-1);
-        assert_eq!(first, t1);
+        assert_eq!(first, Some(t1));
 
         let second = get_event(-1);
-        assert_eq!(second, t1); // ratcheted
+        assert_eq!(second, Some(t1)); // ratcheted
         assert_eq!(error_counts(), 1);
     }
 

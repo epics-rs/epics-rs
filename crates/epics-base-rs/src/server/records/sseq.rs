@@ -665,7 +665,7 @@ impl SseqRecord {
         // when `DLYn == 0` (`callbackRequest`); `ReprocessAfter` is the
         // uniform port of both, so there is no special-cased `DLYn == 0`.
         self.phase = SeqPhase::Fire;
-        let dly = std::time::Duration::from_secs_f64(self.steps[current].dly.max(0.0));
+        let dly = crate::runtime::time::duration_from_secs(self.steps[current].dly);
         ProcessOutcome {
             result: RecordProcessResult::AsyncPending,
             actions: vec![ProcessAction::ReprocessAfter(dly)],

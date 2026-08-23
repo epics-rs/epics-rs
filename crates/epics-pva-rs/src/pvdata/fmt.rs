@@ -61,44 +61,57 @@ pub fn escape(s: &str) -> String {
     out
 }
 
-/// C++ `operator<<(std::ostream&, double)` with the default stream state:
-/// `defaultfloat` + `precision(6)`, i.e. `printf("%g")`.
+/// C `printf("%.*g", precision, v)` — the crate's single owner of
+/// "double → text".
 ///
-/// pvxs prints every real through `fld.as<double>()` (`datafmt.cpp:148-151`),
-/// so a `float` renders as its widened double. Rust's `{}` prints the shortest
-/// round-tripping form (`0.1f64` → `0.1`, but `1e6` → `1000000` and
-/// `1.0/3.0` → `0.3333333333333333`), which is NOT `%g` — hence this.
+/// pvxs streams every real through `operator<<(std::ostream&, double)` with
+/// the default stream state, `defaultfloat` + `precision(6)`
+/// (`datafmt.cpp:148-151`); pvData's CLI printer sets the same six digits
+/// explicitly (`printer.cpp:431,440`); the JSON generator asks for seventeen
+/// (`yajl_gen.c:236`). All three are this one conversion, and splitting it
+/// across modules is how the CLI formatter came to print `NaN` where every
+/// other caller printed `nan`.
 ///
 /// `%g` with precision `P`: round to `P` significant digits; let `X` be the
 /// resulting decimal exponent. Use `%e` when `X < -4 || X >= P`, else `%f`
 /// with `P-1-X` decimals. Either way strip trailing zeros and any trailing
 /// `.`. The `%e` exponent carries a sign and at least two digits.
-fn render_real(v: f64) -> String {
-    // libstdc++ prints the sign of a negative NaN.
+///
+/// Rust's `{}` is not `%g`: it prints the shortest round-tripping form
+/// (`0.1f64` → `0.1`, but `1e6` → `1000000` and `1.0/3.0` →
+/// `0.3333333333333333`) and spells a NaN `NaN`.
+pub(crate) fn format_g(v: f64, precision: usize) -> String {
+    // glibc prints the same three words for %g, %f and %e, and libstdc++
+    // carries the sign bit of a NaN through to the text.
     if v.is_nan() {
         return if v.is_sign_negative() { "-nan" } else { "nan" }.to_string();
     }
     if v.is_infinite() {
         return if v < 0.0 { "-inf" } else { "inf" }.to_string();
     }
-    const PRECISION: i32 = 6;
-    // `{:.5e}` rounds the mantissa to 6 significant digits AND renormalizes
-    // the exponent (`9_999_999.0` → `1.00000e7`), so the exponent read back
-    // here is the one `%g` branches on.
-    let sci = format!("{:.*e}", (PRECISION - 1) as usize, v);
+    // `{:.*e}` rounds the mantissa to `precision` significant digits AND
+    // renormalizes the exponent (`9_999_999.0` → `1.00000e7`), so the
+    // exponent read back here is the one `%g` branches on.
+    let sci = format!("{:.*e}", precision - 1, v);
     let (mantissa, exponent) = sci
         .split_once('e')
         .expect("LowerExp always emits an 'e' separator");
     let exp: i32 = exponent
         .parse()
         .expect("LowerExp always emits a decimal exponent");
-    if !(-4..PRECISION).contains(&exp) {
+    if exp < -4 || exp >= precision as i32 {
         let sign = if exp < 0 { '-' } else { '+' };
         format!("{}e{sign}{:02}", strip_trailing_zeros(mantissa), exp.abs())
     } else {
-        let decimals = (PRECISION - 1 - exp).max(0) as usize;
+        let decimals = (precision as i32 - 1 - exp).max(0) as usize;
         strip_trailing_zeros(&format!("{v:.decimals$}"))
     }
+}
+
+/// pvxs's precision for a real (`datafmt.cpp:148-151`): the C++ stream
+/// default of six significant digits.
+fn render_real(v: f64) -> String {
+    format_g(v, 6)
 }
 
 /// `%g`'s trailing-zero removal: only meaningful for a fractional form, and

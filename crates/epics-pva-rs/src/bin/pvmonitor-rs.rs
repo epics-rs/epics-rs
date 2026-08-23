@@ -18,8 +18,9 @@ struct Args {
     #[arg(short = 'V', long = "version")]
     version: bool,
 
-    /// PV names to monitor
-    #[arg(required_unless_present = "version")]
+    /// PV names to monitor. `pvmonitor.cpp` is `pvget.cpp` compiled with
+    /// PVMONITOR, so it inherits the same absent check: no argument
+    /// prints nothing and exits 0 (measured).
     pv_names: Vec<String>,
 
     /// Output mode: raw, nt, json. The full structure is shown with
@@ -80,7 +81,7 @@ struct Args {
 
 #[tokio::main]
 async fn main() {
-    let args = Args::parse();
+    let args: Args = cli::parse_or_exit();
 
     // pvxs `-V` prints version_information and exits before any client
     // setup (tools/monitor.cpp:63).
@@ -181,9 +182,15 @@ async fn main() {
                             format::format_value(&intro, Some(&value), &fmt, marked.as_ref(), 1)
                         )
                     } else {
+                        // pvget.cpp:239 `fmt.show(mon.changed)` — the raw
+                        // and JSON printers restrict themselves to this
+                        // update's changed set, so a monitor reprints only
+                        // what moved. The NT branch never reads
+                        // `Formatter::xshow` (printer.cpp:414-452), so it
+                        // stays a full summary line.
                         match mode.as_str() {
-                            "json" => format::format_json(&pv_name, &value),
-                            "raw" => format::format_raw(&pv_name, &intro, &value),
+                            "json" => format::format_json(&pv_name, &value, marked.as_ref()),
+                            "raw" => format::format_raw(&pv_name, &intro, &value, marked.as_ref()),
                             _ => format::format_nt(&pv_name, &intro, &value),
                         }
                     };

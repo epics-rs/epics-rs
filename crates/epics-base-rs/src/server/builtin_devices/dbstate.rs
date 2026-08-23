@@ -85,10 +85,9 @@ impl DeviceSupport for DbStateDeviceSupport {
         }
 
         // C `add_record`: `dbStateFind`, and if absent AND non-empty, log an
-        // `errlogInfo` notice then `dbStateCreate`. `errlogInfo` is below the
-        // default `sevToLog` (Minor), so the notice is suppressed unless the
-        // threshold is lowered — `errlog_sev_printf(Info, …)` mirrors both the
-        // message and that suppression exactly.
+        // `errlogInfo` notice then `dbStateCreate`. The notice reaches the
+        // console: `errlogSevVprintf` (`errlog.c:379-391`) consults no
+        // threshold, so `sevToLog` cannot hide it whatever it is set to.
         let registry = db_state_registry();
         self.state = Some(match registry.find(name) {
             Some(s) => s,

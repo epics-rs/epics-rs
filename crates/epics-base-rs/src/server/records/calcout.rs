@@ -724,7 +724,7 @@ impl Record for CalcoutRecord {
             self.dlya = 1;
             self.pending_output = true;
             self.cached_should_output = false;
-            let delay = std::time::Duration::from_secs_f64(self.odly);
+            let delay = crate::runtime::time::duration_from_secs(self.odly);
             // C `calcoutRecord.c::process` (lines 277-282): the delaying
             // cycle sets DLYA, posts it (`db_post_events(&prec->dlya,
             // DBE_VALUE)`), schedules the delayed callback, and `return 0`

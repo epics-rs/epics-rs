@@ -241,8 +241,8 @@ fn truncate_to_c_buffer(raw: &str) -> &str {
 fn sscanf_long(text: &str) -> Option<i64> {
     let bytes = text.as_bytes();
     let mut i = 0;
-    // Skip leading whitespace (C `isspace`: space, \t, \n, \r, \v, \f).
-    while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+    // Skip leading whitespace (C `isspace`: space, \t, \n, \v, \f, \r).
+    while i < bytes.len() && crate::runtime::stdlib::c_isspace(bytes[i] as char) {
         i += 1;
     }
     let mut neg = false;
@@ -425,6 +425,17 @@ mod tests {
         assert_eq!(sscanf_long("not_a_number"), None);
         assert_eq!(sscanf_long(""), None);
         assert_eq!(sscanf_long("   "), None);
+    }
+
+    /// C `sscanf` skips leading whitespace by `isspace`, which includes the
+    /// vertical tab (`envSubr.c:315`). `EPICS_CA_SERVER_PORT=$'\v5064'`
+    /// therefore resolves to 5064 on a C IOC; reading no integer here would
+    /// discard the operator's port and silently bind the compiled default.
+    #[test]
+    fn a_leading_vertical_tab_is_whitespace_as_it_is_to_c() {
+        assert_eq!(sscanf_long("\u{0b}5064"), Some(5064));
+        assert_eq!(sscanf_long("\u{0b}\t \u{0c}-1"), Some(-1));
+        assert_eq!(sscanf_long("\u{0b}"), None);
     }
 
     /// The compiled default resolves when the environment is silent — the whole

@@ -96,7 +96,7 @@ pub struct Sleep {
 /// A future completing `dur` from now — mirrors `tokio::time::sleep`. The
 /// deadline is fixed at construction; the timer entry arms on first poll.
 pub fn sleep(timer: &TimerHandle, dur: Duration) -> Sleep {
-    sleep_until(timer, Instant::now() + dur)
+    sleep_until(timer, crate::runtime::time::deadline_from_now(dur))
 }
 
 /// A future completing at `deadline` — mirrors `tokio::time::sleep_until`. A
@@ -195,7 +195,7 @@ pub fn interval(timer: &TimerHandle, period: Duration) -> TimerInterval {
     TimerInterval {
         timer: timer.clone(),
         period,
-        next: Instant::now() + period,
+        next: crate::runtime::time::deadline_from_now(period),
         first: true,
     }
 }
@@ -212,7 +212,7 @@ impl TimerInterval {
         sleep_until(&self.timer, self.next).await;
         // Advance by a whole period from the previous deadline (not from now),
         // so overdue deadlines stay in the past and the next tick bursts.
-        self.next += self.period;
+        self.next = crate::runtime::time::deadline_after(self.next, self.period);
     }
 }
 
@@ -238,6 +238,31 @@ mod tests {
         fn wake_by_ref(self: &Arc<Self>) {
             self.0.fetch_add(1, Ordering::SeqCst);
         }
+    }
+
+    /// A delay past `Duration`'s representable range must never fire
+    /// rather than unwind the task. `duration_from_secs` maps `+inf`,
+    /// `NaN` and `1e300` to `Duration::MAX` — a record `HIGH` field is
+    /// network-settable — and `Instant + Duration::MAX` panics, where
+    /// `tokio::time::sleep` saturates to `far_future()`. The two
+    /// backends disagreeing is the defect, so this pins the exec side to
+    /// tokio's answer.
+    #[test]
+    fn an_unrepresentable_delay_never_fires_instead_of_panicking() {
+        let pool = CallbackPool::new();
+        let timer = DelayedTimer::new(pool.handle());
+        let count = Arc::new(AtomicUsize::new(0));
+        let waker = Waker::from(Arc::new(CountWaker(Arc::clone(&count))));
+        let mut cx = Context::from_waker(&waker);
+
+        let mut s = Box::pin(sleep(&timer.handle(), Duration::MAX));
+        assert!(s.as_mut().poll(&mut cx).is_pending());
+        drop(s);
+        // The ticker anchors its first deadline the same way, and
+        // advances it with the same owner.
+        let mut every = interval(&timer.handle(), Duration::MAX);
+        every.next = crate::runtime::time::deadline_after(every.next, every.period);
+        assert_eq!(count.load(Ordering::SeqCst), 0);
     }
 
     #[test]

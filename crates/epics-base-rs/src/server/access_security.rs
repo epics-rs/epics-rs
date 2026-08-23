@@ -2158,9 +2158,9 @@ pub fn as_check_client_ip() -> bool {
 
 /// Set the `AS_CHECK_CLIENT_IP` mode. C exposes this as an iocsh
 /// *variable* (`var asCheckClientIP 1`, registered in
-/// `libComRegister.c:476`); this port has no iocsh variable mechanism, so
-/// the closest idiom is the `asCheckClientIP <0|1>` iocsh command that
-/// calls this.
+/// `libComRegister.c:491-495`, `:535-537`), and so does this port —
+/// `var asCheckClientIP 1` reaches this setter through the iocsh
+/// variable table.
 ///
 /// Ordering is C's: `hag_members` reads the flag when the ACF is
 /// *parsed*, so — exactly as in C — it must be set **before** `asInit`,

@@ -24,6 +24,55 @@ pub(crate) fn register(registry: &mut CommandRegistry) {
     registry.register(cmd_epics_prt_env_params());
     registry.register(cmd_epics_param_show());
     registry.register(cmd_epics_thread_sleep());
+    registry.register(cmd_install_last_resort_event_provider());
+    // C `libComRegister.c:504` calls `updatePWD()` right after
+    // registering `cd`/`pwd`, so `$(PWD)` is already correct on a
+    // fresh shell that has not run a `cd`.
+    update_pwd();
+}
+
+/// The single writer of `PWD` — C `updatePWD` (`libComRegister.c:36-43`),
+/// which is `epicsEnvSet("PWD", getcwd(...))` and therefore also clears
+/// a shell macro shadowing the name.
+fn update_pwd() {
+    let Ok(cwd) = std::env::current_dir() else {
+        return;
+    };
+    super::iocsh_env_clear("PWD");
+    // SAFETY: same single-threaded-shell rationale as `epicsEnvSet`.
+    unsafe { std::env::set_var("PWD", cwd) };
+}
+
+/// The only way the shell changes its working directory. Routing every
+/// caller through here is what keeps `$(PWD)` equal to the process cwd
+/// by construction rather than by each command remembering to update it.
+pub(super) fn set_working_dir(dir: impl AsRef<std::path::Path>) -> std::io::Result<()> {
+    std::env::set_current_dir(dir)?;
+    update_pwd();
+    Ok(())
+}
+
+/// `installLastResortEventProvider` — C `libComRegister.c:483-489`,
+/// a zero-argument command wrapping
+/// `installLastResortEventProvider()` (`epicsGeneralTime.c:521-525`).
+///
+/// It is the only way an event stamp falls back to the wall clock, and C
+/// exposes it as an operator opt-in rather than an init step: without it
+/// a `TSE` no provider serves leaves `prec->time` alone and
+/// `recGblGetTimeStampSimm` errlogs. Registering the command is what
+/// makes that opt-in reachable at all.
+fn cmd_install_last_resort_event_provider() -> CommandDef {
+    CommandDef::new(
+        "installLastResortEventProvider",
+        vec![],
+        "installLastResortEventProvider — Install the Last Resort event \
+         provider at priority 999, which returns the current time for every \
+         event number.",
+        |_args: &[ArgValue], _ctx: &CommandContext| {
+            crate::runtime::general_time::install_last_resort_event_provider();
+            Ok(CommandOutcome::Continue)
+        },
+    )
 }
 
 /// `#` — the comment command. C `iocsh.cpp` registers `#` so it
@@ -69,14 +118,66 @@ fn cmd_echo() -> CommandDef {
 }
 
 /// `date` — print the current local date and time. Mirrors C `date`.
+/// Translate an `epicsTimeToStrftime` format into chrono's. The two
+/// agree except on the fractional-second conversions EPICS adds on top
+/// of the C library's (`epicsTime.cpp`): `%f` is nanoseconds and `%0Nf`
+/// is N digits, which chrono spells `%9f` and `%Nf`.
+fn epics_strftime_to_chrono(fmt: &str) -> String {
+    let c: Vec<char> = fmt.chars().collect();
+    let mut out = String::with_capacity(fmt.len());
+    let mut i = 0;
+    while i < c.len() {
+        if c[i] != '%' {
+            out.push(c[i]);
+            i += 1;
+            continue;
+        }
+        let mut j = i + 1;
+        if j < c.len() && c[j] == '%' {
+            out.push_str("%%");
+            i = j + 1;
+            continue;
+        }
+        if j < c.len() && c[j] == '0' {
+            j += 1;
+        }
+        let digits_at = j;
+        while j < c.len() && c[j].is_ascii_digit() {
+            j += 1;
+        }
+        if j < c.len() && c[j] == 'f' {
+            let digits: String = c[digits_at..j].iter().collect();
+            let n = digits.parse::<usize>().unwrap_or(9).clamp(1, 9);
+            out.push_str(&format!("%{n}f"));
+            i = j + 1;
+            continue;
+        }
+        out.push('%');
+        i += 1;
+    }
+    out
+}
+
+/// `date [format]` — C `date` (`libComRegister.c:59-72`) takes an
+/// optional `strftime` format and falls back to
+/// `"%Y/%m/%d %H:%M:%S.%06f"`; the port declared no argument at all, so
+/// a format was silently discarded and the default did not match.
 fn cmd_date() -> CommandDef {
     CommandDef::new(
         "date",
-        vec![],
-        "date — Print the current date and time.",
-        |_args: &[ArgValue], ctx: &CommandContext| {
+        vec![ArgDesc {
+            name: "format",
+            arg_type: ArgType::String,
+            optional: true,
+        }],
+        "date [format] — Print the current date and time.",
+        |args: &[ArgValue], ctx: &CommandContext| {
+            let fmt = match &args[0] {
+                ArgValue::String(f) if !f.is_empty() => f.as_str(),
+                _ => "%Y/%m/%d %H:%M:%S.%06f",
+            };
             let now = chrono::Local::now();
-            ctx.println(&now.format("%Y-%m-%d %H:%M:%S%.6f %z").to_string());
+            ctx.println(&now.format(&epics_strftime_to_chrono(fmt)).to_string());
             Ok(CommandOutcome::Continue)
         },
     )
@@ -110,15 +211,15 @@ fn cmd_cd() -> CommandDef {
     )
 }
 
-fn chdir_handler(args: &[ArgValue], ctx: &CommandContext) -> CommandResult {
+/// C `chdirCallFunc` (`libComRegister.c:104-116`) prints nothing on
+/// success — it only calls `updatePWD()`. The cwd line the port used to
+/// echo here has no counterpart in C.
+fn chdir_handler(args: &[ArgValue], _ctx: &CommandContext) -> CommandResult {
     let dir = match &args[0] {
         ArgValue::String(s) => s,
         _ => return Err("chdir: missing directory".into()),
     };
-    std::env::set_current_dir(dir).map_err(|e| format!("chdir: {dir}: {e}"))?;
-    if let Ok(cwd) = std::env::current_dir() {
-        ctx.println(&cwd.display().to_string());
-    }
+    set_working_dir(dir).map_err(|e| format!("chdir: {dir}: {e}"))?;
     Ok(CommandOutcome::Continue)
 }
 
@@ -154,6 +255,11 @@ fn cmd_epics_env_unset() -> CommandDef {
                 ArgValue::String(s) => s,
                 _ => return Err("epicsEnvUnset: missing name".into()),
             };
+            // C `epicsEnvUnset` (`osdEnv.c:58-63`) clears the shell
+            // macro first, exactly as `epicsEnvSet` does — otherwise an
+            // unset variable stays readable through the macro that was
+            // shadowing it.
+            super::iocsh_env_clear(name);
             // SAFETY: matches C iocsh behaviour; mutated only from the
             // single-threaded REPL thread.
             unsafe { std::env::remove_var(name) };
@@ -163,29 +269,38 @@ fn cmd_epics_env_unset() -> CommandDef {
 }
 
 /// `epicsEnvShow [name]` — show one or all environment variables.
-/// Mirrors C `epicsEnvShow`.
+///
+/// C (`osdEnv.c:66-77`) walks `environ` and prints every entry whose
+/// NAME half `epicsStrnGlobMatch`es the argument, so the argument is a
+/// PATTERN and not a key: `epicsEnvShow "EPICS_CA_*"` is the documented
+/// use. An entry that matches nothing prints nothing — C has no
+/// "is not set" line — and the listing keeps `environ` order rather
+/// than being sorted.
 fn cmd_epics_env_show() -> CommandDef {
     CommandDef::new(
         "epicsEnvShow",
         vec![ArgDesc {
-            name: "name",
+            name: "[name]",
             arg_type: ArgType::String,
             optional: true,
         }],
-        "epicsEnvShow [name] — Show one or all environment variables.",
+        "epicsEnvShow [name] — Show environment variables matching a pattern.",
         |args: &[ArgValue], ctx: &CommandContext| {
-            match &args[0] {
-                ArgValue::String(name) => match std::env::var(name) {
-                    Ok(v) => ctx.println(&format!("{name}={v}")),
-                    Err(_) => ctx.println(&format!("{name} is not set")),
-                },
-                _ => {
-                    let mut vars: Vec<(String, String)> = std::env::vars().collect();
-                    vars.sort();
-                    for (k, v) in vars {
-                        ctx.println(&format!("{k}={v}"));
-                    }
+            let pattern = match &args[0] {
+                ArgValue::String(p) => Some(p.as_str()),
+                _ => None,
+            };
+            for (k, v) in std::env::vars() {
+                if let Some(pattern) = pattern
+                    && !super::commands::epics_strn_glob_match(
+                        k.as_bytes(),
+                        k.len(),
+                        pattern.as_bytes(),
+                    )
+                {
+                    continue;
                 }
+                ctx.println(&format!("{k}={v}"));
             }
             Ok(CommandOutcome::Continue)
         },
@@ -275,6 +390,86 @@ mod tests {
         ctx
     }
 
+    fn run_env_show(ctx: &CommandContext, tokens: &[&str]) -> String {
+        let mut reg = CommandRegistry::new();
+        register(&mut reg);
+        let cmd = reg.get("epicsEnvShow").unwrap();
+        let tokens: Vec<String> = tokens.iter().map(|t| t.to_string()).collect();
+        let args = parse_args(&tokens, &cmd.args).unwrap();
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let path = tmp.path().to_path_buf();
+        ctx.with_output(std::fs::File::create(&path).unwrap(), || {
+            cmd.handler.call(&args, ctx).unwrap();
+        });
+        std::fs::read_to_string(&path).unwrap()
+    }
+
+    /// C `epicsEnvShow` (`osdEnv.c:66-77`): the argument is an
+    /// `epicsStrnGlobMatch` pattern over the NAME half, and an entry
+    /// that matches nothing prints nothing at all.
+    #[test]
+    #[serial_test::serial(epics_env)]
+    fn epics_env_show_glob_matches_and_is_silent_on_no_match() {
+        let ctx = make_ctx();
+        // SAFETY: single-threaded under the `epics_env` serial group.
+        unsafe {
+            std::env::set_var("EPICS_RS_SHOW_ONE", "1");
+            std::env::set_var("EPICS_RS_SHOW_TWO", "2");
+        }
+
+        let globbed = run_env_show(&ctx, &["EPICS_RS_SHOW_*"]);
+        let mut lines: Vec<&str> = globbed.lines().collect();
+        lines.sort();
+        assert_eq!(lines, ["EPICS_RS_SHOW_ONE=1", "EPICS_RS_SHOW_TWO=2"]);
+
+        assert_eq!(
+            run_env_show(&ctx, &["EPICS_RS_SHOW_ONE"]),
+            "EPICS_RS_SHOW_ONE=1\n"
+        );
+        // No match, no output — C invents no "is not set" line.
+        assert_eq!(run_env_show(&ctx, &["EPICS_RS_NO_SUCH_VAR"]), "");
+
+        // SAFETY: same serial group.
+        unsafe {
+            std::env::remove_var("EPICS_RS_SHOW_ONE");
+            std::env::remove_var("EPICS_RS_SHOW_TWO");
+        }
+    }
+
+    /// C `date` takes a format (`libComRegister.c:74`,
+    /// `dateArg0 = {"format", iocshArgString}`) and defaults to
+    /// `%Y/%m/%d %H:%M:%S.%06f`.
+    #[test]
+    fn date_takes_a_format_argument() {
+        let ctx = make_ctx();
+        let mut reg = CommandRegistry::new();
+        register(&mut reg);
+        let cmd = reg.get("date").unwrap();
+        assert_eq!(cmd.args.len(), 1, "C declares one argument");
+
+        let args = parse_args(&["%Y".to_string()], &cmd.args).unwrap();
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let path = tmp.path().to_path_buf();
+        ctx.with_output(std::fs::File::create(&path).unwrap(), || {
+            cmd.handler.call(&args, &ctx).unwrap();
+        });
+        let out = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(
+            out.trim().len(),
+            4,
+            "a %Y-only format prints just a year: {out:?}"
+        );
+
+        // The default carries the EPICS `%06f` fraction, which chrono
+        // spells `%6f`.
+        assert_eq!(
+            epics_strftime_to_chrono("%Y/%m/%d %H:%M:%S.%06f"),
+            "%Y/%m/%d %H:%M:%S.%6f"
+        );
+        assert_eq!(epics_strftime_to_chrono("%f"), "%9f");
+        assert_eq!(epics_strftime_to_chrono("%d%%%H"), "%d%%%H");
+    }
+
     #[test]
     fn echo_and_pwd_run() {
         let ctx = make_ctx();
@@ -288,6 +483,89 @@ mod tests {
                 "{name} must run cleanly"
             );
         }
+    }
+
+    /// C `chdirCallFunc` (`libComRegister.c:104-116`) prints nothing on
+    /// success and calls `updatePWD()`, and `libComRegister.c:504` calls
+    /// `updatePWD()` at registration, so `$(PWD)` is already right on a
+    /// shell that has not run a `cd` yet.
+    #[test]
+    #[serial_test::serial(epics_env)]
+    fn cd_updates_pwd_and_prints_nothing() {
+        use std::path::PathBuf;
+
+        let start = std::env::current_dir().unwrap();
+        let ctx = make_ctx();
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().canonicalize().unwrap();
+        // SAFETY: single-threaded under the `epics_env` serial group.
+        unsafe { std::env::remove_var("PWD") };
+
+        let mut reg = CommandRegistry::new();
+        register(&mut reg);
+        assert_eq!(
+            std::env::var("PWD").ok().map(PathBuf::from),
+            Some(start.clone()),
+            "registration must set PWD before any cd"
+        );
+
+        let cmd = reg.get("cd").unwrap();
+        let args = parse_args(&[target.to_str().unwrap().to_string()], &cmd.args).unwrap();
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let out_path = tmp.path().to_path_buf();
+        ctx.with_output(std::fs::File::create(&out_path).unwrap(), || {
+            cmd.handler.call(&args, &ctx).unwrap();
+        });
+
+        assert_eq!(
+            std::fs::read_to_string(&out_path).unwrap(),
+            "",
+            "C `cd` prints nothing on success"
+        );
+        assert_eq!(
+            PathBuf::from(std::env::var("PWD").unwrap()),
+            target,
+            "`cd` must update PWD like C `updatePWD`"
+        );
+
+        std::env::set_current_dir(&start).unwrap();
+    }
+
+    /// C registers `installLastResortEventProvider`
+    /// (`libComRegister.c:483-489`, `:531`) as the operator's opt-in into
+    /// the wall-clock event fallback. Without the command the provider
+    /// cannot be installed at all, so `epicsTimeGetEvent` fails forever
+    /// on an IOC that has no event provider.
+    #[test]
+    fn install_last_resort_event_provider_is_reachable_from_the_shell() {
+        let ctx = make_ctx();
+        let mut reg = CommandRegistry::new();
+        register(&mut reg);
+        let cmd = reg
+            .get("installLastResortEventProvider")
+            .expect("C registers this command");
+        assert!(cmd.args.is_empty(), "C declares zero arguments");
+
+        // No event provider is registered in this process, so C's
+        // `S_time_noProvider` is the answer.
+        assert!(
+            crate::runtime::general_time::get_event(1).is_none(),
+            "an IOC with no event provider must fail the event stamp"
+        );
+
+        let args = parse_args(&[], &cmd.args).unwrap();
+        cmd.handler.call(&args, &ctx).unwrap();
+
+        assert!(
+            crate::runtime::general_time::get_event(1).is_some(),
+            "the last-resort provider answers every event number"
+        );
+        // C's report names the EVENT provider "Last Resort Event"; "OS
+        // Clock" is the current-time provider in a different table.
+        assert!(
+            crate::runtime::general_time::report(1).contains("Last Resort Event"),
+            "generalTimeReport must name the provider as C does"
+        );
     }
 
     #[test]

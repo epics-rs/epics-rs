@@ -5,8 +5,7 @@
 
 use std::fmt::Write as _;
 
-use epics_base_rs::server::records::printf::format_g;
-
+use crate::pvdata::fmt::format_g;
 use crate::pvdata::{
     FieldDesc, PvField, PvStructure, ScalarType, ScalarValue, TypedScalarArray, VariantValue,
 };
@@ -164,25 +163,97 @@ fn scalar_array_type_name(st: ScalarType) -> &'static str {
 // ─── pvget raw / verbose formatting (type + value) ──────────────────────────
 
 /// Format value with type descriptors in pvxs raw/verbose style.
-pub fn format_raw(pv_name: &str, desc: &FieldDesc, value: &PvField) -> String {
+///
+/// `marked` is C's `Formatter::show` bitset (pvget.cpp:239
+/// `fmt.show(mon.changed)`): a monitor update prints only the fields the
+/// server flagged changed, so `pvmonitor -M raw` emits the eight lines
+/// that moved rather than the whole structure again. `None` is C's
+/// default `BitSet().set(0)` — a GET, a PUT readback and an RPC reply
+/// carry no changed set and print everything.
+pub fn format_raw(
+    pv_name: &str,
+    desc: &FieldDesc,
+    value: &PvField,
+    marked: Option<&std::collections::HashSet<String>>,
+) -> String {
     let mut out = String::new();
     let id = struct_id_or_default(desc, "structure");
     let _ = writeln!(out, "{pv_name} {id} ");
     if let (FieldDesc::Structure { fields, .. }, PvField::Structure(s)) = (desc, value) {
+        let root = Mask {
+            set: marked,
+            path: "",
+        };
         for (name, child_desc) in fields {
+            if !root.covers(name) {
+                continue;
+            }
             if let Some(child_val) = s.get_field(name) {
-                write_raw_field(&mut out, name, child_desc, child_val, 1);
+                write_raw_field(&mut out, name, child_desc, child_val, 1, root.at(name));
             }
         }
     }
     out
 }
 
-fn write_raw_field(out: &mut String, name: &str, desc: &FieldDesc, value: &PvField, depth: usize) {
+/// The changed-set walk carried as one value: a writer cannot take the mask
+/// without the path it is tested against, so a nested body can no longer be
+/// handed its parent's path by accident.
+#[derive(Clone, Copy)]
+struct Mask<'a> {
+    /// `None` is C's default `BitSet().set(0)` wildcard: everything prints.
+    set: Option<&'a std::collections::HashSet<String>>,
+    path: &'a str,
+}
+
+impl<'a> Mask<'a> {
+    /// The unmasked walk. A structure-array element, a union member and a
+    /// variant member all dump through their own writer with no bit set
+    /// (jprint.cpp:204, printer.cpp:391, PVUnion.cpp:181-195), so the mask
+    /// stops at that boundary rather than being threaded past it.
+    const ALL: Mask<'static> = Mask {
+        set: None,
+        path: "",
+    };
+
+    /// The dotted path of one child of this field.
+    fn child_path(&self, name: &str) -> String {
+        if self.path.is_empty() {
+            name.to_string()
+        } else {
+            format!("{}.{}", self.path, name)
+        }
+    }
+
+    /// Re-root the walk at `path`, which comes from [`Self::child_path`].
+    fn at<'b>(&self, path: &'b str) -> Mask<'b>
+    where
+        'a: 'b,
+    {
+        Mask {
+            set: self.set,
+            path,
+        }
+    }
+
+    /// Does any marked leaf lie at or under `path`? — [`subtree_marked`].
+    fn covers(&self, path: &str) -> bool {
+        subtree_marked(self.set, path)
+    }
+}
+
+fn write_raw_field(
+    out: &mut String,
+    name: &str,
+    desc: &FieldDesc,
+    value: &PvField,
+    depth: usize,
+    mask: Mask<'_>,
+) {
     let indent = "    ".repeat(depth);
     match (desc, value) {
         (FieldDesc::Structure { struct_id, fields }, PvField::Structure(s)) => {
-            write_raw_structure(out, struct_id, name, fields, s, depth);
+            write_raw_structure(out, struct_id, name, fields, s, depth, mask);
         }
         (FieldDesc::StructureArray { struct_id, fields }, PvField::StructureArray(items)) => {
             let id = if struct_id.is_empty() {
@@ -201,7 +272,14 @@ fn write_raw_field(out: &mut String, name: &str, desc: &FieldDesc, value: &PvFie
                     // name — and prints `(none)` for an absent one. The
                     // element header was spelled out a second time here,
                     // which is how it drifted to `(null)`.
-                    Some(s) => write_raw_structure(out, struct_id, "", fields, s, depth + 1),
+                    //
+                    // C `show_struct(A, arr[i].get(), 0)` (jprint.cpp:204) /
+                    // `strm<<*cur.first` (printer.cpp:391) pass no bit set,
+                    // so the changed-set mask does not reach inside an
+                    // element: it dumps whole.
+                    Some(s) => {
+                        write_raw_structure(out, struct_id, "", fields, s, depth + 1, Mask::ALL)
+                    }
                     None => {
                         let _ = writeln!(out, "{indent}    (none)");
                     }
@@ -291,6 +369,7 @@ fn write_raw_structure(
     fields: &[(String, FieldDesc)],
     s: &PvStructure,
     depth: usize,
+    mask: Mask<'_>,
 ) {
     let indent = "    ".repeat(depth);
     let id = if struct_id.is_empty() {
@@ -318,8 +397,12 @@ fn write_raw_structure(
         let _ = writeln!(out, "{indent}{id} {name}");
     }
     for (n, child_desc) in fields {
+        let cpath = mask.child_path(n);
+        if !mask.covers(&cpath) {
+            continue;
+        }
         if let Some(child_val) = s.get_field(n) {
-            write_raw_field(out, n, child_desc, child_val, depth + 1);
+            write_raw_field(out, n, child_desc, child_val, depth + 1, mask.at(&cpath));
         }
     }
 }
@@ -355,7 +438,7 @@ fn write_raw_union_member(
             .or_else(|| value.wire_descriptor())
     };
     match member {
-        Some(d) => write_raw_field(out, variant_name, &d, value, depth),
+        Some(d) => write_raw_field(out, variant_name, &d, value, depth, Mask::ALL),
         None => {
             let _ = writeln!(out, "{}(none)", "    ".repeat(depth));
         }
@@ -372,7 +455,7 @@ fn write_raw_variant_member(out: &mut String, v: &VariantValue, depth: usize) {
         _ => v.desc.clone().or_else(|| v.value.wire_descriptor()),
     };
     match desc {
-        Some(d) => write_raw_field(out, "", &d, &v.value, depth),
+        Some(d) => write_raw_field(out, "", &d, &v.value, depth, Mask::ALL),
         None => {
             let _ = writeln!(out, "{}(none)", "    ".repeat(depth));
         }
@@ -393,7 +476,8 @@ pub fn format_nt(pv_name: &str, desc: &FieldDesc, value: &PvField) -> String {
         // printTable (printer.cpp:414-421). printTable cowardly refuses
         // a malformed table (`return false`); we mirror that by falling
         // back to the raw formatter when the table is not well-formed.
-        return format_nt_table(pv_name, s).unwrap_or_else(|| format_raw(pv_name, desc, value));
+        return format_nt_table(pv_name, s)
+            .unwrap_or_else(|| format_raw(pv_name, desc, value, None));
     }
     // Every other NT shape — NTScalar, NTScalarArray, NTEnum, "or anything
     // with '.value'" — is dispatched by the TYPE of the `value` subfield,
@@ -419,7 +503,7 @@ pub fn format_nt(pv_name: &str, desc: &FieldDesc, value: &PvField) -> String {
         Some(PvField::Structure(es)) if is_enum_t(es) => format_nt_enum(pv_name, s),
         // No `.value`, or an unsupported value type: raw fallback
         // (printer.cpp:449-462).
-        _ => format_raw(pv_name, desc, value),
+        _ => format_raw(pv_name, desc, value, None),
     }
 }
 
@@ -720,8 +804,23 @@ fn csv_escape(s: &[u8]) -> String {
 // ─── JSON formatting ────────────────────────────────────────────────────────
 
 /// Format value as JSON (pvget -M json style).
-pub fn format_json(pv_name: &str, value: &PvField) -> String {
-    format!("{pv_name} {}\n", value_to_json(value))
+///
+/// `marked` is C's `Formatter::show` bitset, handed to `printJSON` as its
+/// mask (printer.cpp:410, `jprint.cpp:123` skips an unmasked child): a
+/// monitor update serialises only the changed members. `None` is C's
+/// default `BitSet().set(0)` — everything.
+pub fn format_json(
+    pv_name: &str,
+    value: &PvField,
+    marked: Option<&std::collections::HashSet<String>>,
+) -> String {
+    // C `printJSON` masks only the top structure's members; a non-struct
+    // top has no members to mask.
+    let body = match value {
+        PvField::Structure(s) => structure_to_json(s, marked, ""),
+        other => value_to_json(other),
+    };
+    format!("{pv_name} {body}\n")
 }
 
 fn value_to_json(value: &PvField) -> String {
@@ -731,13 +830,15 @@ fn value_to_json(value: &PvField) -> String {
             let parts: Vec<String> = items.iter().map(scalar_to_json).collect();
             format!("[{}]", parts.join(","))
         }
-        PvField::Structure(s) => structure_to_json(s),
+        // Reached from inside an array/union only; C passes mask 0 there
+        // (jprint.cpp:204,220).
+        PvField::Structure(s) => structure_to_json(s, None, ""),
         PvField::StructureArray(items) => {
             // a `None` element renders as JSON `null`.
             let parts: Vec<String> = items
                 .iter()
                 .map(|s| match s {
-                    Some(s) => structure_to_json(s),
+                    Some(s) => structure_to_json(s, None, ""),
                     None => "null".to_string(),
                 })
                 .collect();
@@ -775,21 +876,80 @@ fn value_to_json(value: &PvField) -> String {
     }
 }
 
-/// Emit a single JSON string token, delegating all escaping to
-/// `serde_json`. This is the one owner of "string → JSON token" for the
-/// CLI JSON formatter: both structure member names and string scalars
-/// go through it, so quotes, backslashes, control characters (newline,
-/// tab, NUL, …), and non-ASCII are emitted as valid JSON instead of the
-/// prior hand-rolled escaper that quoted neither keys nor control chars.
-/// EPICS Base routes the same tokens through YAJL's `yg_string()`
-/// (`pvData/src/json/jprint.cpp:112-164`).
+/// Emit a quoted JSON5 string token: EPICS Base's `yajl_string_encode()`
+/// (`libcom/src/yajl/yajl_encode.c:31-95`) with `output_json5` set, which
+/// is how `printJSON` runs — `printer.cpp:404-412` sets `opts.json5 = true`
+/// for Base >= 7.0.6.1 and `jprint.cpp:88` passes it to the generator.
+///
+/// JSON5 escaping is not strict-JSON escaping: NUL is `\0`, vertical tab
+/// is `\v`, and any other control character is `\xNN` with upper-case hex,
+/// where strict JSON has no `\0`/`\v` and writes `\u00nn`. Delegating to
+/// `serde_json` therefore emitted bytes C never emits, so this is a
+/// transcription rather than a call-out.
 fn json_string(s: &str) -> String {
-    // `Value::String(..).to_string()` is the compact, fully-escaped
-    // JSON token (e.g. `"a\nb"`); it never fails.
-    serde_json::Value::String(s.to_owned()).to_string()
+    use std::fmt::Write;
+    // Every escape trigger is ASCII and UTF-8 continuation bytes are all
+    // >= 0x80, so a `char` walk is byte-identical to C's `unsigned char`
+    // walk. `escape_solidus` is off (jprint.cpp never sets it), so `/`
+    // stays bare.
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('"');
+    for c in s.chars() {
+        match c {
+            '\r' => out.push_str("\\r"),
+            '\n' => out.push_str("\\n"),
+            '\\' => out.push_str("\\\\"),
+            '"' => out.push_str("\\\""),
+            '\u{c}' => out.push_str("\\f"),
+            '\u{8}' => out.push_str("\\b"),
+            '\t' => out.push_str("\\t"),
+            '\0' => out.push_str("\\0"),
+            '\u{b}' => out.push_str("\\v"),
+            c if (c as u32) < 32 => {
+                let _ = write!(out, "\\x{:02X}", c as u32);
+            }
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    out
 }
 
-fn structure_to_json(s: &PvStructure) -> String {
+/// Whether `s` may be printed as a bare JSON5 object key — EPICS Base
+/// `yajl_string_validate_identifier()` (`yajl_encode.c:263-286`): the
+/// first byte is one of `[$_A-Za-z]`, every later byte one of
+/// `[$_A-Za-z0-9]`, and an empty name is never an identifier. The rule is
+/// byte-wise and ASCII-only, so any multi-byte character disqualifies the
+/// name.
+fn json5_identifier(s: &str) -> bool {
+    let mut bytes = s.bytes();
+    let Some(first) = bytes.next() else {
+        return false;
+    };
+    if first != b'$' && first != b'_' && !first.is_ascii_alphabetic() {
+        return false;
+    }
+    bytes.all(|c| c == b'$' || c == b'_' || c.is_ascii_alphanumeric())
+}
+
+/// Emit an object key. `yajl_gen_string()` (`yajl_gen.c:273-285`) prints
+/// the name unquoted when the generator is in map-key state and the name
+/// passes [`json5_identifier`]; everything else falls through to the
+/// quoted token. Quoting a key C leaves bare shifts every byte of the
+/// line, so this is the interop half of the JSON5 contract.
+fn json_key(s: &str) -> String {
+    if json5_identifier(s) {
+        s.to_owned()
+    } else {
+        json_string(s)
+    }
+}
+
+fn structure_to_json(
+    s: &PvStructure,
+    marked: Option<&std::collections::HashSet<String>>,
+    path: &str,
+) -> String {
     // Member order is preserved by iterating `fields` in declared order
     // (EPICS Base prints `names[i]` in structure order); a
     // `serde_json::Map` would re-sort keys and break that parity, so the
@@ -797,14 +957,51 @@ fn structure_to_json(s: &PvStructure) -> String {
     let parts: Vec<String> = s
         .fields
         .iter()
-        .map(|(n, v)| format!("{}:{}", json_string(n), value_to_json(v)))
+        .filter_map(|(n, v)| {
+            let cpath = if path.is_empty() {
+                n.clone()
+            } else {
+                format!("{path}.{n}")
+            };
+            if !subtree_marked(marked, &cpath) {
+                return None;
+            }
+            // C `show_field` recurses with the SAME mask for a nested
+            // structure (jprint.cpp:195) and drops it for everything else.
+            let rendered = match v {
+                PvField::Structure(cs) => structure_to_json(cs, marked, &cpath),
+                other => value_to_json(other),
+            };
+            Some(format!("{}:{}", json_key(n), rendered))
+        })
         .collect();
     format!("{{{}}}", parts.join(","))
+}
+
+/// Whether anything at or below `path` is in the change set — C's
+/// `expandBS` (printer.cpp:288-312, jprint.cpp:248-270) plus the
+/// `show.get(offset)` test each printer applies to a child.
+///
+/// After `expandBS` a field prints when its own bit is set, when an
+/// ancestor's is, or when a descendant's is. `changed_bitset_to_marked_paths`
+/// already pushed an interior bit down to every descendant leaf, so the
+/// only direction left is upward: a container prints iff some marked leaf
+/// lies under it. Distinct from [`is_marked`], which is the exact-leaf test
+/// the Delta renderer wants.
+///
+/// `None` is C's default `BitSet().set(0)` wildcard: everything prints.
+fn subtree_marked(marked: Option<&std::collections::HashSet<String>>, path: &str) -> bool {
+    let Some(set) = marked else { return true };
+    set.iter()
+        .any(|p| p == path || (p.starts_with(path) && p.as_bytes().get(path.len()) == Some(&b'.')))
 }
 
 fn scalar_to_json(v: &ScalarValue) -> String {
     match v {
         ScalarValue::String(s) => json_string(&s.as_str_lossy()),
+        // `pvFloat` widens to double and takes the same generator call as
+        // `pvDouble` (jprint.cpp:142-143), so a float prints all 17
+        // significant digits of its widened value.
         ScalarValue::Float(f) => json_double(*f as f64),
         ScalarValue::Double(f) => json_double(*f),
         other => format!("{other}"),
@@ -827,6 +1024,10 @@ fn scalar_to_json(v: &ScalarValue) -> String {
 /// round-trip form Rust prints, and the `.0` suffix belongs only on a
 /// rendering that is nothing but digits and `-`, so it must not be
 /// appended to `1e+30`.
+///
+/// They are legal output only because `printJSON` enables JSON5
+/// (printer.cpp:404-412); with JSON5 off `yajl_gen_double` refuses them
+/// with `yajl_gen_invalid_number`.
 fn json_double(x: f64) -> String {
     if x.is_nan() {
         return "NaN".to_string();
@@ -912,35 +1113,64 @@ fn enum_choice_text(v: &ScalarValue) -> String {
     }
 }
 
-/// The CLI sentinel for a timestamp with no valid time (missing or zero
-/// `secondsPastEpoch`). EPICS Base never emits this — it would format the
-/// 1990 EPICS epoch — but the Rust CLI prints it instead of a fake date.
+/// C `POSIX_TIME_AT_EPICS_EPOCH` (`epicsTime.h:27`) — the seconds between
+/// the POSIX and the EPICS epoch. A PVA `timeStamp` carries
+/// `secondsPastEpoch` in the POSIX epoch (QSRV adds this constant when it
+/// converts the record's `epicsTimeStamp`), so a record that has never
+/// processed reaches the client as 631152000, never as 0.
+const POSIX_TIME_AT_EPICS_EPOCH: i64 = 631_152_000;
+
+/// The sentinel `epicsTimeToStrftime` writes for an uninitialised
+/// timestamp (`epicsTime.cpp:175-179`: *"presume that EPOCH date is an
+/// uninitialized time stamp"*), reached whenever the EPICS-epoch seconds
+/// AND the nanoseconds are both zero. EPICS Base does emit it — pvData's
+/// own `testprinter.cpp:139` pins `"<undefined>              -42 "` — so
+/// it belongs in the same 24-column field as a real time text.
 const UNDEFINED_TS: &str = "<undefined>";
 
-/// The timestamp text EPICS Base would format from a `time_t` structure
-/// (`YYYY-MM-DD HH:MM:SS.mmm`, local time), or `None` when the CLI renders
-/// the time as undefined ([`UNDEFINED_TS`]): missing/zero
-/// `secondsPastEpoch`, or a value `chrono` cannot represent.
-fn timestamp_text(s: &PvStructure) -> Option<String> {
-    let sec = match s.get_field("secondsPastEpoch") {
+/// The timestamp text EPICS Base formats from a `time_t` structure — a
+/// local-time `YYYY-MM-DD HH:MM:SS.mmm`, or [`UNDEFINED_TS`].
+///
+/// C `printTimeTx` (pvData printer.cpp:116-133) first moves
+/// `secondsPastEpoch` from the POSIX epoch into the EPICS epoch, clamping
+/// anything at or below the epoch to zero, and only then calls
+/// `epicsTimeToStrftime`, whose zero-seconds-and-zero-nanoseconds test is
+/// what produces the sentinel. Gating on `secondsPastEpoch == 0` instead
+/// tests the wrong epoch and never fires on the value QSRV actually
+/// sends for an unprocessed record.
+///
+/// `None` (no `time_t` substructure at all) reads as an all-zero stamp,
+/// which is what C's null `getSubField` checks produce.
+fn timestamp_text(s: Option<&PvStructure>) -> String {
+    let sec = match s.and_then(|s| s.get_field("secondsPastEpoch")) {
         Some(PvField::Scalar(ScalarValue::Long(v))) => *v,
         Some(PvField::Scalar(ScalarValue::Int(v))) => *v as i64,
-        _ => return None,
+        _ => 0,
     };
-    if sec == 0 {
-        return None;
-    }
-    let nsec = match s.get_field("nanoseconds") {
+    let nsec = match s.and_then(|s| s.get_field("nanoseconds")) {
         Some(PvField::Scalar(ScalarValue::Int(v))) => *v as u32,
         Some(PvField::Scalar(ScalarValue::UInt(v))) => *v,
         _ => 0,
     };
-    let dt = chrono::DateTime::from_timestamp(sec, nsec)?;
-    Some(
-        dt.with_timezone(&chrono::Local)
+    let epics_sec = if sec > POSIX_TIME_AT_EPICS_EPOCH {
+        sec - POSIX_TIME_AT_EPICS_EPOCH
+    } else {
+        0
+    };
+    if epics_sec == 0 && nsec == 0 {
+        return UNDEFINED_TS.to_string();
+    }
+    // Format the CLAMPED value: C discards a sub-epoch `secondsPastEpoch`
+    // rather than rendering a pre-1990 date.
+    match chrono::DateTime::from_timestamp(epics_sec + POSIX_TIME_AT_EPICS_EPOCH, nsec) {
+        Some(dt) => dt
+            .with_timezone(&chrono::Local)
             .format("%Y-%m-%d %H:%M:%S.%3f")
             .to_string(),
-    )
+        // Out of `chrono`'s range; C's `strftime` would emit its own
+        // garbage here, and the sentinel is the honest answer.
+        None => UNDEFINED_TS.to_string(),
+    }
 }
 
 /// The `userTag` of a `time_t` structure, or `0` when absent. Base reads
@@ -978,22 +1208,16 @@ fn timestamp_user_tag(s: &PvStructure) -> i64 {
 ///    produced.
 ///
 /// `ts == None` (no `timeStamp` field at all) renders the undefined
-/// block. The Rust [`UNDEFINED_TS`] sentinel is not padded to the
-/// 24-column — Base never produces it, so there is no Base column to
-/// align it to; its established two-space spacing is preserved.
+/// block. [`UNDEFINED_TS`] goes through the SAME `setw(24)` field as a
+/// real time text — Base streams one string whatever
+/// `epicsTimeToStrftime` wrote into it — so no column after the block
+/// shifts when a timestamp is undefined.
 fn format_time_tx(ts: Option<&PvStructure>) -> String {
     use std::fmt::Write;
-    let (text, tag) = match ts {
-        Some(ts) => (timestamp_text(ts), timestamp_user_tag(ts)),
-        None => (None, 0),
-    };
-    let mut out = match text {
-        // Real timestamp: `setw(24) << left << timeText << ' '`
-        // (printer.cpp:134).
-        Some(t) => format!("{t:<24} "),
-        // Undefined sentinel: keep two-space spacing (see doc above).
-        None => format!("{UNDEFINED_TS}  "),
-    };
+    let text = timestamp_text(ts);
+    let tag = ts.map(timestamp_user_tag).unwrap_or(0);
+    // `setw(24) << left << timeText << ' '` (printer.cpp:134).
+    let mut out = format!("{text:<24} ");
     if tag != 0 {
         // Base `tag << ' '` (printer.cpp:138) — tag then its own space.
         let _ = write!(out, "{tag} ");
@@ -1209,7 +1433,7 @@ fn escape_bytes(s: &[u8], hex_upper: bool) -> String {
 /// EPICS Base's default `escape` style (`style_t::C`, pvData
 /// printer.cpp:485-516), whose `hexdigit` (printer.cpp:467-473) is
 /// uppercase. That `hexdigit` also carries an off-by-one mapping a nibble
-/// of 9 to `@` (CBUG-H2 in doc/upstream-c-bugs.md); this does not
+/// of 9 to `@` (CBUG-I2 in doc/upstream-c-bugs.md); this does not
 /// reproduce it and emits correct hex.
 fn escape_display(s: &[u8]) -> String {
     escape_bytes(s, true)
@@ -2060,7 +2284,7 @@ mod tests {
         let mut top = PvStructure::new("epics:nt/NTNDArray:1.0");
         top.set("attribute", PvField::StructureArray(vec![Some(elem), None]));
 
-        let out = format_raw("X", &desc, &PvField::Structure(top));
+        let out = format_raw("X", &desc, &PvField::Structure(top), None);
         assert!(
             out.contains("    epics:nt/NTAttribute:1.0[] attribute\n"),
             "got: {out}"
@@ -2116,7 +2340,7 @@ mod tests {
             },
         );
 
-        let out = format_raw("X", &desc, &PvField::Structure(top.clone()));
+        let out = format_raw("X", &desc, &PvField::Structure(top.clone()), None);
         assert!(out.contains("    union u\n"), "got: {out}");
         assert!(
             out.contains("        epics:nt/NTAttribute:1.0 s\n"),
@@ -2137,7 +2361,7 @@ mod tests {
                 value: Box::new(PvField::Null),
             },
         );
-        let out = format_raw("X", &desc, &PvField::Structure(top));
+        let out = format_raw("X", &desc, &PvField::Structure(top), None);
         assert!(out.contains("    union u\n        (none)\n"), "got: {out}");
     }
 
@@ -2156,11 +2380,11 @@ mod tests {
             "p",
             PvField::Variant(Box::new(VariantValue::scalar(ScalarValue::Int(5)))),
         );
-        let out = format_raw("X", &desc, &PvField::Structure(top.clone()));
+        let out = format_raw("X", &desc, &PvField::Structure(top.clone()), None);
         assert!(out.contains("    any p\n        int  5\n"), "got: {out}");
 
         top.set("p", PvField::Variant(Box::new(VariantValue::null())));
-        let out = format_raw("X", &desc, &PvField::Structure(top));
+        let out = format_raw("X", &desc, &PvField::Structure(top), None);
         assert!(out.contains("    any p\n        (none)\n"), "got: {out}");
     }
 
@@ -2334,14 +2558,18 @@ mod tests {
             t.set("userTag", PvField::Scalar(ScalarValue::Int(tag)));
             t
         };
+        // pvData `testprinter.cpp:139` pins the sentinel in the same
+        // 24-column field as a real time text, plus the stream's space.
+        const UNDEF: &str = "<undefined>              ";
 
-        // Undefined (sec == 0) + nonzero tag: the tag is STILL emitted
-        // (Base reads userTag after the time text). Fully deterministic.
-        assert_eq!(format_time_tx(Some(&ts0(0, 142))), "<undefined>  142 ");
-        // Undefined + zero tag: sentinel, two spaces, no tag.
-        assert_eq!(format_time_tx(Some(&ts0(0, 0))), "<undefined>  ");
+        // Undefined + nonzero tag: the tag is STILL emitted (Base reads
+        // userTag after the time text). Fully deterministic.
+        assert_eq!(format_time_tx(Some(&ts0(0, 142))), format!("{UNDEF}142 "));
+        // Undefined + zero tag: sentinel padded to the column, no tag.
+        assert_eq!(format_time_tx(Some(&ts0(0, 0))), UNDEF);
         // No `timeStamp` substructure at all → undefined block.
-        assert_eq!(format_time_tx(None), "<undefined>  ");
+        assert_eq!(format_time_tx(None), UNDEF);
+        assert_eq!(UNDEF.len(), 25, "setw(24) + the streamed space");
 
         // Valid timestamp: the date text is local-timezone dependent, so
         // assert the column/tag SHAPE and exact lengths (always 23-char
@@ -2365,6 +2593,38 @@ mod tests {
         let no_tag = format_time_tx(Some(&ts0(1_700_000_000, 0)));
         assert!(no_tag.ends_with("  "), "two trailing spaces: {no_tag:?}");
         assert_eq!(no_tag.len(), 23 + 2, "23-char ts + 2sp");
+    }
+
+    /// C `printTimeTx` (pvData printer.cpp:127-130) moves
+    /// `secondsPastEpoch` out of the POSIX epoch BEFORE
+    /// `epicsTimeToStrftime` applies its zero-seconds-and-zero-nanoseconds
+    /// sentinel test (`epicsTime.cpp:175-179`). A record that has never
+    /// processed reaches the client with `secondsPastEpoch` =
+    /// POSIX_TIME_AT_EPICS_EPOCH, so a gate on `secondsPastEpoch == 0`
+    /// never fires and the CLI prints 1990-01-01 instead of the sentinel.
+    /// One case per side of each boundary.
+    #[test]
+    fn the_undefined_gate_is_on_the_epics_epoch_not_on_zero() {
+        let ts = |sec: i64, nsec: i32| {
+            let mut t = PvStructure::new("time_t");
+            t.set("secondsPastEpoch", PvField::Scalar(ScalarValue::Long(sec)));
+            t.set("nanoseconds", PvField::Scalar(ScalarValue::Int(nsec)));
+            t
+        };
+        let text = |sec, nsec| timestamp_text(Some(&ts(sec, nsec)));
+
+        // The value QSRV sends for an unprocessed record.
+        assert_eq!(text(POSIX_TIME_AT_EPICS_EPOCH, 0), UNDEFINED_TS);
+        // Below the epoch: C clamps to zero, so still undefined.
+        assert_eq!(text(0, 0), UNDEFINED_TS);
+        assert_eq!(text(1_000, 0), UNDEFINED_TS);
+        // Both sides of the sentinel: nonzero nanoseconds alone, and one
+        // second past the epoch, are real times.
+        assert_ne!(text(POSIX_TIME_AT_EPICS_EPOCH, 1), UNDEFINED_TS);
+        assert_ne!(text(POSIX_TIME_AT_EPICS_EPOCH + 1, 0), UNDEFINED_TS);
+        // A sub-epoch stamp with nanoseconds renders the CLAMPED time,
+        // never a pre-1990 date.
+        assert_eq!(text(1_000, 5), text(POSIX_TIME_AT_EPICS_EPOCH, 5));
     }
 
     fn alarm_struct(severity: i32, status: i32, message: &str) -> PvField {
@@ -2434,7 +2694,7 @@ mod tests {
     #[test]
     fn json_formatting_for_scalar_array() {
         let v = PvField::ScalarArray(vec![ScalarValue::Int(1), ScalarValue::Int(2)]);
-        let out = format_json("X", &v);
+        let out = format_json("X", &v, None);
         assert_eq!(out, "X [1,2]\n");
     }
 
@@ -2473,17 +2733,16 @@ mod tests {
             .expect("format_json output shape")
     }
 
-    /// A structure member name that is not a bare JSON5 identifier
-    /// (space, dash) must be emitted as a quoted, escaped key, and the
-    /// whole line must be strict-JSON parseable. Pre-fix the key was
-    /// spliced in unquoted (`{alarm message:...}`), which no JSON parser
-    /// accepts. Member order must survive (declared order, not sorted).
+    /// The negative half of `yajl_string_validate_identifier`: a member
+    /// name carrying a space or a dash is not an identifier, so it keeps
+    /// its quotes even under JSON5 and the line stays strict-JSON
+    /// parseable. Member order must survive (declared order, not sorted).
     #[test]
     fn json_quotes_and_escapes_structure_keys() {
         let mut s = PvStructure::new("");
         s.set("alarm message", PvField::Scalar(ScalarValue::Int(1)));
         s.set("a-b", PvField::Scalar(ScalarValue::Int(2)));
-        let out = format_json("X", &PvField::Structure(s));
+        let out = format_json("X", &PvField::Structure(s), None);
         let payload = json_payload(&out);
         let parsed: serde_json::Value = serde_json::from_str(payload).expect("must be strict JSON");
         assert_eq!(parsed["alarm message"], serde_json::json!(1));
@@ -2492,20 +2751,151 @@ mod tests {
         assert_eq!(payload, r#"{"alarm message":1,"a-b":2}"#);
     }
 
-    /// A string scalar carrying control characters (newline, tab, NUL,
-    /// carriage return) plus a quote and a backslash must be escaped by
-    /// the JSON generator, not emitted raw. The result must parse as
-    /// strict JSON and round-trip back to the exact original bytes.
+    /// A string scalar carrying control characters plus a quote and a
+    /// backslash is escaped the way `yajl_string_encode` escapes it with
+    /// `output_json5` on (yajl_encode.c:53-88): NUL is `\0`, vertical tab
+    /// is `\v`, and a control character with no named escape is `\xNN` in
+    /// upper-case hex. This test used to demand strict JSON, which pinned
+    /// `serde_json`'s `\u0000`/`\u000b`/`\u0001` spellings — bytes C
+    /// never writes.
     #[test]
-    fn json_escapes_string_control_characters() {
-        let raw = "line1\nline2\tx\r\0\"q\\z";
+    fn json_escapes_string_control_characters_the_json5_way() {
+        let raw = "line1\nline2\tx\r\0\u{b}\u{1}\"q\\z";
         let v = PvField::Scalar(ScalarValue::String(raw.into()));
-        let out = format_json("X", &v);
-        let payload = json_payload(&out);
-        let parsed: serde_json::Value = serde_json::from_str(payload).expect("must be strict JSON");
-        assert_eq!(parsed, serde_json::Value::String(raw.to_string()));
+        let out = format_json("X", &v, None);
+        assert_eq!(json_payload(&out), r#""line1\nline2\tx\r\0\v\x01\"q\\z""#);
         // No raw newline leaked into the token.
-        assert!(!payload.contains('\n'));
+        assert!(!json_payload(&out).contains('\n'));
+    }
+
+    /// C spells a non-finite double `nan` / `-nan` / `inf` / `-inf` for
+    /// every conversion (glibc; libstdc++ hands `operator<<(double)` to
+    /// the same printf), where Rust's `{}` writes `NaN` and loses the sign
+    /// bit. Expectations are glibc `printf("%g")` output.
+    #[test]
+    fn non_finite_reals_take_the_c_printf_spelling() {
+        for (v, want) in [
+            (f64::NAN, "nan"),
+            (-f64::NAN, "-nan"),
+            (f64::INFINITY, "inf"),
+            (f64::NEG_INFINITY, "-inf"),
+        ] {
+            assert_eq!(
+                format_value_inline(&PvField::Scalar(ScalarValue::Double(v))),
+                want,
+                "double {v}"
+            );
+            assert_eq!(
+                format_value_inline(&PvField::Scalar(ScalarValue::Float(v as f32))),
+                want,
+                "float {v}"
+            );
+        }
+        assert_eq!(
+            format_value_inline(&PvField::ScalarArray(vec![
+                ScalarValue::Double(f64::NAN),
+                ScalarValue::Double(f64::NEG_INFINITY),
+            ])),
+            "[nan,-inf]"
+        );
+        // And it reaches the user through the NT line an unprocessed
+        // `ao` with a NaN VAL produces.
+        let (desc, _) = nt_scalar_with_meta();
+        let mut val = PvStructure::new("epics:nt/NTScalar:1.0");
+        val.set("value", PvField::Scalar(ScalarValue::Double(f64::NAN)));
+        let line = format_nt("PV", &desc, &PvField::Structure(val));
+        // `nt_payload` shape: `<ts><value> <alarm>\n`, alarm empty here.
+        assert!(line.ends_with(" nan \n"), "{line:?}");
+    }
+
+    /// `yajl_gen_double` renders through `%.17g` and re-marks a bare
+    /// integer rendering with `.0` (yajl_gen.c:236-240). Every expectation
+    /// below is the byte string glibc produces for that value, taken from
+    /// a `printf("%.17g")` run of the same list, so this is an interop
+    /// pin, not a restatement of the Rust code.
+    #[test]
+    fn json_doubles_take_the_yajl_percent_17g_rendering() {
+        for (v, want) in [
+            (0.0_f64, "0.0"),
+            (-0.0, "-0.0"),
+            (1.0, "1.0"),
+            (-1.0, "-1.0"),
+            (1.5, "1.5"),
+            (100.0, "100.0"),
+            (0.1, "0.10000000000000001"),
+            (1.0 / 3.0, "0.33333333333333331"),
+            (1234567.0, "1234567.0"),
+            (1e15, "1000000000000000.0"),
+            (1e16, "10000000000000000.0"),
+            (1e17, "1e+17"),
+            (1e20, "1e+20"),
+            (1e-4, "0.0001"),
+            (1e-5, "1.0000000000000001e-05"),
+            (1e300, "1.0000000000000001e+300"),
+            (f64::MAX, "1.7976931348623157e+308"),
+            (5e-324, "4.9406564584124654e-324"),
+        ] {
+            let out = format_json("X", &PvField::Scalar(ScalarValue::Double(v)), None);
+            assert_eq!(json_payload(&out), want, "double {v:?}");
+        }
+        // A float widens to double first (jprint.cpp:142-143), so the
+        // widening error is visible in the output.
+        let out = format_json("X", &PvField::Scalar(ScalarValue::Float(0.1)), None);
+        assert_eq!(json_payload(&out), "0.10000000149011612");
+        // Arrays take the same generator call.
+        let out = format_json(
+            "X",
+            &PvField::ScalarArray(vec![ScalarValue::Double(1.0), ScalarValue::Double(0.1)]),
+            None,
+        );
+        assert_eq!(json_payload(&out), "[1.0,0.10000000000000001]");
+    }
+
+    /// C picks `%g`'s `%e`-vs-`%f` style from the exponent of the value
+    /// already rounded to `precision` digits, so a value that rounds up
+    /// into the next decade changes style. Deriving the exponent from
+    /// `log10().floor()` got both of these wrong, and the `x == 0.0`
+    /// short-circuit dropped the sign of negative zero. Expectations are
+    /// glibc `printf("%g")` output.
+    #[test]
+    fn format_g_takes_its_style_from_the_rounded_exponent() {
+        assert_eq!(format_g(9.9999999e-5, 6), "0.0001");
+        // 1e23 is the double 9.9999999999999992e22; %g at precision 6
+        // rounds it up a decade, so C switches to %e style.
+        assert_eq!(format_g(1e23, 6), "1e+23");
+        assert_eq!(format_g(-0.0, 6), "-0");
+        assert_eq!(format_g(0.0, 6), "0");
+        assert_eq!(format_g(1234567.0, 6), "1.23457e+06");
+        assert_eq!(format_g(1e-5, 6), "1e-05");
+        assert_eq!(format_g(0.00012345, 6), "0.00012345");
+    }
+
+    /// `yajl_gen_string` prints an object key bare when
+    /// `yajl_string_validate_identifier` holds and quotes it otherwise
+    /// (yajl_gen.c:273-285); `printJSON` runs with `opts.json5 = true`
+    /// (printer.cpp:404-412), so pvget/pvmonitor `-M json` output is
+    /// JSON5, not strict JSON. String *values* stay quoted — the bare
+    /// form is a map-key state, not a string rule.
+    #[test]
+    fn json5_object_keys_are_bare_when_they_are_identifiers() {
+        let mut inner = PvStructure::new("");
+        inner.set("severity", PvField::Scalar(ScalarValue::Int(0)));
+        let mut s = PvStructure::new("");
+        s.set("value", PvField::Scalar(ScalarValue::Int(1)));
+        s.set("_x", PvField::Scalar(ScalarValue::Int(2)));
+        s.set("$a", PvField::Scalar(ScalarValue::Int(3)));
+        s.set("a9$_Z", PvField::Scalar(ScalarValue::Int(4)));
+        s.set("alarm", PvField::Structure(inner));
+        // Not identifiers: leading digit, dash, empty, non-ASCII.
+        s.set("9lives", PvField::Scalar(ScalarValue::Int(5)));
+        s.set("a-b", PvField::Scalar(ScalarValue::Int(6)));
+        s.set("", PvField::Scalar(ScalarValue::Int(7)));
+        s.set("é", PvField::Scalar(ScalarValue::Int(8)));
+        s.set("s", PvField::Scalar(ScalarValue::String("v".into())));
+        assert_eq!(
+            json_payload(&format_json("X", &PvField::Structure(s), None)),
+            r#"{value:1,_x:2,$a:3,a9$_Z:4,alarm:{severity:0},"9lives":5,"a-b":6,"":7,"é":8,s:"v"}"#
+        );
     }
 
     /// A string-array element with control characters is escaped per
@@ -2516,7 +2906,7 @@ mod tests {
             ScalarValue::String("a\nb".into()),
             ScalarValue::String("c\"d".into()),
         ]);
-        let out = format_json("X", &v);
+        let out = format_json("X", &v, None);
         let parsed: serde_json::Value =
             serde_json::from_str(json_payload(&out)).expect("must be strict JSON");
         assert_eq!(parsed, serde_json::json!(["a\nb", "c\"d"]));
@@ -2829,6 +3219,118 @@ mod tests {
     /// `value`, an epoch-0 (`<undefined>`) timestamp, and optionally an
     /// alarm. epoch-0 keeps the timestamp text deterministic across
     /// machine timezones.
+    /// An NTScalar-shaped `(desc, value)` with the three substructures a
+    /// monitor update actually carries, for the change-mask tests.
+    fn nt_scalar_with_meta() -> (FieldDesc, PvField) {
+        let ts_fields = vec![
+            (
+                "secondsPastEpoch".to_string(),
+                FieldDesc::Scalar(ScalarType::Long),
+            ),
+            (
+                "nanoseconds".to_string(),
+                FieldDesc::Scalar(ScalarType::Int),
+            ),
+            ("userTag".to_string(), FieldDesc::Scalar(ScalarType::Int)),
+        ];
+        let alarm_fields = vec![
+            ("severity".to_string(), FieldDesc::Scalar(ScalarType::Int)),
+            ("status".to_string(), FieldDesc::Scalar(ScalarType::Int)),
+            ("message".to_string(), FieldDesc::Scalar(ScalarType::String)),
+        ];
+        let desc = FieldDesc::Structure {
+            struct_id: "epics:nt/NTScalar:1.0".into(),
+            fields: vec![
+                ("value".to_string(), FieldDesc::Scalar(ScalarType::Double)),
+                (
+                    "alarm".to_string(),
+                    FieldDesc::Structure {
+                        struct_id: "alarm_t".into(),
+                        fields: alarm_fields,
+                    },
+                ),
+                (
+                    "timeStamp".to_string(),
+                    FieldDesc::Structure {
+                        struct_id: "time_t".into(),
+                        fields: ts_fields,
+                    },
+                ),
+            ],
+        };
+        let mut alarm = PvStructure::new("alarm_t");
+        alarm.set("severity", PvField::Scalar(ScalarValue::Int(0)));
+        alarm.set("status", PvField::Scalar(ScalarValue::Int(0)));
+        alarm.set("message", PvField::Scalar(ScalarValue::String("".into())));
+        let mut ts = PvStructure::new("time_t");
+        ts.set(
+            "secondsPastEpoch",
+            PvField::Scalar(ScalarValue::Long(1_700_000_000)),
+        );
+        ts.set("nanoseconds", PvField::Scalar(ScalarValue::Int(0)));
+        ts.set("userTag", PvField::Scalar(ScalarValue::Int(0)));
+        let mut s = PvStructure::new("epics:nt/NTScalar:1.0");
+        s.set("value", PvField::Scalar(ScalarValue::Double(1.5)));
+        s.set("alarm", PvField::Structure(alarm));
+        s.set("timeStamp", PvField::Structure(ts));
+        (desc, PvField::Structure(s))
+    }
+
+    /// C `pvget.cpp:239` calls `fmt.show(mon.changed)` for every monitor
+    /// update, and both the raw printer (`printer.cpp:326-364`) and the
+    /// JSON printer (`jprint.cpp:123`) drop a child whose bit the mask
+    /// leaves clear. `expandBS` marks the ancestors of a marked field, so a
+    /// container survives exactly when a marked leaf lies under it.
+    /// One case per boundary: no mask, a leaf-only mask, a mask reaching
+    /// only into one substructure, and a mask naming nothing present.
+    #[test]
+    fn a_monitor_change_mask_restricts_the_raw_and_json_renderers() {
+        use std::collections::HashSet;
+        let (desc, val) = nt_scalar_with_meta();
+        let set =
+            |paths: &[&str]| -> HashSet<String> { paths.iter().map(|p| p.to_string()).collect() };
+
+        // No mask (a GET, or a monitor's first update): everything.
+        let all = format_raw("PV", &desc, &val, None);
+        assert!(all.contains("double value"), "{all:?}");
+        assert!(all.contains("alarm_t alarm"), "{all:?}");
+        assert!(all.contains("time_t timeStamp"), "{all:?}");
+
+        // Only `value` changed: the two metadata containers are gone.
+        let only_value = format_raw("PV", &desc, &val, Some(&set(&["value"])));
+        assert!(only_value.contains("double value 1.5"), "{only_value:?}");
+        assert!(!only_value.contains("alarm"), "{only_value:?}");
+        assert!(!only_value.contains("timeStamp"), "{only_value:?}");
+
+        // Only one timestamp leaf changed: the `time_t` container line
+        // survives (expandBS marks parents), its unmarked siblings do not,
+        // and `value`/`alarm` are gone.
+        let one_leaf = format_raw(
+            "PV",
+            &desc,
+            &val,
+            Some(&set(&["timeStamp.secondsPastEpoch"])),
+        );
+        assert!(one_leaf.contains("time_t timeStamp"), "{one_leaf:?}");
+        assert!(one_leaf.contains("long secondsPastEpoch"), "{one_leaf:?}");
+        assert!(!one_leaf.contains("nanoseconds"), "{one_leaf:?}");
+        assert!(!one_leaf.contains("userTag"), "{one_leaf:?}");
+        assert!(!one_leaf.contains("double value"), "{one_leaf:?}");
+
+        // JSON takes the same mask through printJSON.
+        assert_eq!(
+            format_json("PV", &val, Some(&set(&["value"]))),
+            "PV {value:1.5}\n"
+        );
+        assert_eq!(
+            format_json("PV", &val, Some(&set(&["alarm.severity"]))),
+            "PV {alarm:{severity:0}}\n"
+        );
+        // A mask naming nothing present prints an empty object, never the
+        // whole structure.
+        assert_eq!(format_json("PV", &val, Some(&set(&["absent"]))), "PV {}\n");
+    }
+
     fn nt_scalar_array(value: PvField, alarm: Option<PvField>) -> (FieldDesc, PvField) {
         let desc = FieldDesc::Structure {
             struct_id: "epics:nt/NTScalarArray:1.0".into(),
@@ -2858,7 +3360,7 @@ mod tests {
             None,
         );
         let out = format_nt("PV", &desc, &val);
-        assert_eq!(out, "PV <undefined>  [1.5,2.5]\n");
+        assert_eq!(out, "PV <undefined>              [1.5,2.5]\n");
         // Single line: the only newline is the terminator.
         assert_eq!(out.matches('\n').count(), 1);
     }
@@ -2876,7 +3378,7 @@ mod tests {
             None,
         );
         let out = format_nt("PV", &desc, &val);
-        assert_eq!(out, "PV <undefined>  [\"a b\", c]\n");
+        assert_eq!(out, "PV <undefined>              [\"a b\", c]\n");
     }
 
     /// For a scalar ARRAY, Base prints the alarm BEFORE the value
@@ -2890,7 +3392,7 @@ mod tests {
             Some(alarm_struct(2, 3, "HIGH")),
         );
         let out = format_nt("PV", &desc, &val);
-        assert_eq!(out, "PV <undefined>  MAJOR RECORD HIGH [7,8]\n");
+        assert_eq!(out, "PV <undefined>              MAJOR RECORD HIGH [7,8]\n");
         let ai = out.find("MAJOR").expect("alarm present");
         let vi = out.find("[7,8]").expect("value present");
         assert!(ai < vi, "alarm must precede the array value: {out:?}");
@@ -2904,7 +3406,7 @@ mod tests {
             Some(alarm_struct(0, 0, "ignored")),
         );
         let out = format_nt("PV", &desc, &val);
-        assert_eq!(out, "PV <undefined>  [1]\n");
+        assert_eq!(out, "PV <undefined>              [1]\n");
     }
 
     /// Structural check: the `.value` dispatch is keyed on the value TYPE,
@@ -2923,7 +3425,7 @@ mod tests {
             PvField::ScalarArray(vec![ScalarValue::Int(1), ScalarValue::Int(2)]),
         );
         let out = format_nt("PV", &desc, &PvField::Structure(s));
-        assert_eq!(out, "PV <undefined>  [1,2]\n");
+        assert_eq!(out, "PV <undefined>              [1,2]\n");
     }
 
     #[test]

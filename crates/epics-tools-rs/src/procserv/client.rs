@@ -5,7 +5,11 @@
 //! - **Read task**: `socket → TelnetParser::feed → InboundEvent::Data
 //!   { ... }` (or `Reply` → outbound). Emits `Disconnected` on EOF.
 //! - **Write task**: drains the supervisor's outbound mpsc, IAC-
-//!   escapes `Bytes`, writes `RawIac` verbatim, exits on `Disconnect`.
+//!   escapes `Bytes`, writes `RawIac` verbatim.
+//!
+//! Both tasks belong to a [`ClientHandle`], which is the whole of C's
+//! `clientItem` lifetime: dropping it is `~clientItem`
+//! (`clientFactory.cc:73-80`).
 //!
 //! Read-only clients (`readonly: true`) silently drop their input
 //! after IAC stripping, matching `clientItem::readFromFd:192`.
@@ -70,9 +74,6 @@ pub enum OutboundFrame {
     /// Raw IAC reply emitted by [`super::telnet`] (negotiation
     /// responses); already correctly formatted, do NOT re-escape.
     RawIac(Vec<u8>),
-    /// Disconnect this client gracefully. Write task drains queued
-    /// frames first, then closes the socket.
-    Disconnect,
 }
 
 /// Direction of the per-client mpsc — client-to-supervisor.
@@ -125,8 +126,72 @@ pub struct ClientMeta {
     pub readonly: bool,
 }
 
-/// Spawn the per-client read+write task pair. Returns metadata + an
-/// outbound mpsc the supervisor uses to push frames to this client.
+/// C's `SO_SNDTIMEO` on an accepted client socket: 10 s
+/// (`clientFactory.cc:104-105` builds the `timeval`, `:147` arms it).
+/// C's fds are blocking, so a `write()` to a peer that has stopped
+/// reading returns -1 once this elapses and `writeToFd` marks the client
+/// `_markedForDeletion` (`clientFactory.cc:283-290`).
+///
+/// The deadline belongs on the socket write, which is where C arms it —
+/// not on the queue in front of it. A queue-level deadline lets the write
+/// itself pend forever, which is the whole of PS-25: the supervisor drops
+/// the roster entry while the write task is still parked in `write_all`,
+/// so the fd and both tasks outlive the client.
+const CLIENT_SEND_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// The supervisor's sole handle on one client: the outbound queue plus
+/// both of the client's tasks.
+///
+/// C parity: `clientItem` and its destructor (`clientFactory.cc:73-80`,
+/// `shutdown(_fd, SHUT_RDWR); close(_fd)`). C reaches that destructor from
+/// every path that removes a connection — `DeleteConnection`
+/// (`procServ.cc:837-852`) and the shutdown sweep (`procServ.cc:688-692`)
+/// — and so does this: the handle is the only way to reach the client, so
+/// a client that leaves the supervisor's roster is torn down by
+/// construction rather than by each removal site remembering to.
+///
+/// Dropping it closes the outbound channel and aborts the read task. The
+/// write task then writes what is already queued and shuts the socket, at
+/// which point both halves of the split stream are gone and the fd is
+/// closed. It cannot outlive that by more than the queue depth times
+/// [`CLIENT_SEND_TIMEOUT`], because every write it makes carries that
+/// deadline — which is the whole reason the deadline sits on the write.
+///
+/// Draining rather than aborting is what C does, though C gets it for
+/// free: `SendToAll` writes synchronously, so everything the supervisor
+/// wrote is in the kernel before the item is ever deleted. The port queues
+/// those writes instead, and cutting the queue at removal loses the last
+/// thing the operator is told — the `@@@ ... server will exit` line on the
+/// shutdown path, which is emitted and then immediately followed by the
+/// roster going away.
+pub struct ClientHandle {
+    out_tx: mpsc::Sender<OutboundFrame>,
+    read_task: tokio::task::JoinHandle<()>,
+}
+
+impl ClientHandle {
+    /// Queue one frame for this client. `false` ⟹ the write task is gone
+    /// (socket dead, or a write missed [`CLIENT_SEND_TIMEOUT`]) and the
+    /// supervisor should drop the client — C's `_status = -1` out of
+    /// `writeToFd`.
+    pub async fn send(&self, frame: OutboundFrame) -> bool {
+        self.out_tx.send(frame).await.is_ok()
+    }
+}
+
+impl Drop for ClientHandle {
+    fn drop(&mut self) {
+        // `out_tx` drops with the rest of the struct, which is what lets the
+        // write task finish. The read task has no such signal — it is parked
+        // in `read()` on a peer that may never send another byte or close —
+        // so it has to be aborted, and it holds the read half of the split
+        // stream, without which the fd cannot close.
+        self.read_task.abort();
+    }
+}
+
+/// Spawn the per-client read+write task pair. Returns metadata + the
+/// [`ClientHandle`] that owns them.
 ///
 /// The two tasks share the socket via `tokio::io::split`. The read
 /// task takes the read-half, feeds bytes into a [`TelnetParser`],
@@ -136,7 +201,17 @@ pub struct ClientMeta {
 pub fn spawn_client(
     incoming: IncomingClient,
     inbound_tx: mpsc::Sender<(ClientId, InboundEvent)>,
-) -> (ClientMeta, mpsc::Sender<OutboundFrame>) {
+) -> (ClientMeta, ClientHandle) {
+    spawn_client_with_deadline(incoming, inbound_tx, CLIENT_SEND_TIMEOUT)
+}
+
+/// Body of [`spawn_client`] with the socket send deadline as a parameter,
+/// so the teardown tests can exercise it without a real ten-second wait.
+fn spawn_client_with_deadline(
+    incoming: IncomingClient,
+    inbound_tx: mpsc::Sender<(ClientId, InboundEvent)>,
+    send_timeout: std::time::Duration,
+) -> (ClientMeta, ClientHandle) {
     let id = ClientId::new();
     let meta = ClientMeta {
         id,
@@ -145,7 +220,7 @@ pub fn spawn_client(
     };
     let (out_tx, out_rx) = mpsc::channel::<OutboundFrame>(64);
 
-    match incoming.stream {
+    let [read_task, write_task] = match incoming.stream {
         ClientStream::Tcp(s) => {
             // C enables SO_KEEPALIVE on every accepted client socket
             // (clientFactory.cc:146) so a silently-dropped peer (cable
@@ -153,17 +228,25 @@ pub fn spawn_client(
             // pending forever. UNIX sockets have no meaningful keepalive,
             // so this is TCP-only, as in C.
             set_keepalive(&s);
-            spawn_split(s, id, incoming.readonly, inbound_tx, out_rx)
+            spawn_split(s, id, incoming.readonly, inbound_tx, out_rx, send_timeout)
         }
         #[cfg(unix)]
-        ClientStream::Unix(s) => spawn_split(s, id, incoming.readonly, inbound_tx, out_rx),
+        ClientStream::Unix(s) => {
+            spawn_split(s, id, incoming.readonly, inbound_tx, out_rx, send_timeout)
+        }
         // The terminal gets the same read/write task pair — including the
         // telnet parser, which C also runs on its fd-0 client
         // (`clientFactory.cc:167` `telnet_init`).
-        ClientStream::Console(s) => spawn_split(s, id, incoming.readonly, inbound_tx, out_rx),
-    }
+        ClientStream::Console(s) => {
+            spawn_split(s, id, incoming.readonly, inbound_tx, out_rx, send_timeout)
+        }
+    };
+    // The write task is deliberately detached: it must outlive the handle
+    // just long enough to drain the queue, and it terminates on its own
+    // when the channel closes or a write misses `send_timeout`.
+    drop(write_task);
 
-    (meta, out_tx)
+    (meta, ClientHandle { out_tx, read_task })
 }
 
 /// Enable `SO_KEEPALIVE` on a TCP client socket (C `clientFactory.cc:146`).
@@ -193,22 +276,37 @@ fn set_keepalive(stream: &TcpStream) {
     }
 }
 
+/// Run one socket operation under C's `SO_SNDTIMEO`. `false` ⟹ the write
+/// errored or missed its deadline — C `writeToFd` taking the `-1` branch
+/// and setting `_markedForDeletion` (`clientFactory.cc:283-290`).
+async fn under_send_deadline<F>(deadline: std::time::Duration, op: F) -> bool
+where
+    F: std::future::Future<Output = std::io::Result<()>>,
+{
+    matches!(tokio::time::timeout(deadline, op).await, Ok(Ok(())))
+}
+
 /// Generic helper that splits any AsyncRead+AsyncWrite stream and
 /// spawns the read+write tasks. Monomorphized once per stream type.
+/// Returns the two `JoinHandle`s for [`ClientHandle`] to own; `send_timeout`
+/// is [`CLIENT_SEND_TIMEOUT`] in production and a short value in the tests
+/// that exercise the deadline.
 fn spawn_split<S>(
     stream: S,
     id: ClientId,
     readonly: bool,
     inbound_tx: mpsc::Sender<(ClientId, InboundEvent)>,
     mut outbound_rx: mpsc::Receiver<OutboundFrame>,
-) where
+    send_timeout: std::time::Duration,
+) -> [tokio::task::JoinHandle<()>; 2]
+where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Send + 'static,
 {
     let (mut reader, mut writer) = tokio::io::split(stream);
 
     // Read task: pump socket → telnet parser → inbound events.
     let inbound = inbound_tx.clone();
-    tokio::spawn(async move {
+    let read_task = tokio::spawn(async move {
         let mut parser = TelnetParser::new();
         let mut buf = vec![0u8; 1024];
         loop {
@@ -262,28 +360,27 @@ fn spawn_split<S>(
     // (clientFactory.cc:153-174), so the supervisor enqueues the banner
     // `Bytes` frame followed by the negotiation `RawIac` frame (PS-26).
     // This loop just drains them in order.
-    tokio::spawn(async move {
+    //
+    // Every socket operation carries `send_timeout`, C's `SO_SNDTIMEO`: a
+    // peer that stops reading wedges `write_all` forever otherwise, and a
+    // wedged write task never returns to `recv()`, so it never notices the
+    // supervisor letting go of the client.
+    let write_task = tokio::spawn(async move {
         while let Some(frame) = outbound_rx.recv().await {
-            match frame {
-                OutboundFrame::Bytes(b) => {
-                    let escaped = iac_escape(&b);
-                    if writer.write_all(&escaped).await.is_err() {
-                        break;
-                    }
-                }
-                OutboundFrame::RawIac(b) => {
-                    if writer.write_all(&b).await.is_err() {
-                        break;
-                    }
-                }
-                OutboundFrame::Disconnect => break,
-            }
-            if writer.flush().await.is_err() {
+            let payload = match frame {
+                OutboundFrame::Bytes(b) => iac_escape(&b),
+                OutboundFrame::RawIac(b) => b,
+            };
+            if !under_send_deadline(send_timeout, writer.write_all(&payload)).await
+                || !under_send_deadline(send_timeout, writer.flush()).await
+            {
                 break;
             }
         }
-        let _ = writer.shutdown().await;
+        let _ = tokio::time::timeout(send_timeout, writer.shutdown()).await;
     });
+
+    [read_task, write_task]
 }
 
 #[cfg(test)]
@@ -333,7 +430,7 @@ mod tests {
     async fn read_data_propagates_inbound_event() {
         let (server, mut client) = paired_streams().await;
         let (in_tx, mut in_rx) = mpsc::channel(8);
-        let (_meta, out_tx) = spawn_client(
+        let (_meta, handle) = spawn_client(
             IncomingClient {
                 stream: ClientStream::Tcp(server),
                 peer: ClientPeer::Tcp("127.0.0.1:1".parse().unwrap()),
@@ -355,7 +452,7 @@ mod tests {
             (_, InboundEvent::Data { bytes }) => assert_eq!(bytes, b"hi\n"),
             other => panic!("unexpected event: {other:?}"),
         }
-        drop(out_tx);
+        drop(handle);
     }
 
     #[tokio::test]
@@ -436,7 +533,7 @@ mod tests {
     async fn write_iac_escapes_payload_bytes() {
         let (server, mut client) = paired_streams().await;
         let (in_tx, _in_rx) = mpsc::channel(8);
-        let (_meta, out_tx) = spawn_client(
+        let (_meta, handle) = spawn_client(
             IncomingClient {
                 stream: ClientStream::Tcp(server),
                 peer: ClientPeer::Tcp("127.0.0.1:1".parse().unwrap()),
@@ -449,13 +546,123 @@ mod tests {
         // this payload, IAC-escaped.
         // Send a payload containing a literal 0xFF — must be doubled
         // on the wire.
-        out_tx
-            .send(OutboundFrame::Bytes(vec![0x41, 0xFF, 0x42]))
-            .await
-            .unwrap();
+        assert!(
+            handle
+                .send(OutboundFrame::Bytes(vec![0x41, 0xFF, 0x42]))
+                .await
+        );
 
         let mut got = [0u8; 4];
         client.read_exact(&mut got).await.unwrap();
         assert_eq!(got, [0x41, 0xFF, 0xFF, 0x42]);
+    }
+
+    /// I1: a client that stops reading must not outlive its removal from
+    /// the supervisor's roster. C `~clientItem` (`clientFactory.cc:73-80`)
+    /// does `shutdown(_fd, SHUT_RDWR); close(_fd)`, so the peer's socket is
+    /// gone once the item leaves the connection list. With both tasks
+    /// detached instead, the write task stays parked in `write_all`, the
+    /// read task stays parked in `read`, and the fd survives for the
+    /// supervisor's whole lifetime — repeat the connect-and-stall and
+    /// procServ runs out of descriptors.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn dropping_the_handle_closes_a_stalled_clients_socket() {
+        let (sock, mut peer) = tokio::net::UnixStream::pair().unwrap();
+        let (in_tx, mut in_rx) = mpsc::channel(8);
+        // Keep the inbound channel drained so the read task never parks on
+        // a full `inbound_tx` — the socket must be held open by the tasks
+        // themselves, not by back-pressure from this test.
+        tokio::spawn(async move { while in_rx.recv().await.is_some() {} });
+        let (_meta, handle) = spawn_client_with_deadline(
+            IncomingClient {
+                stream: ClientStream::Unix(sock),
+                peer: ClientPeer::Unix(None),
+                readonly: false,
+            },
+            in_tx,
+            Duration::from_millis(100),
+        );
+
+        // The peer never reads, so the write task wedges in `write_all` and
+        // the 64-deep channel backs up behind it.
+        for _ in 0..64 {
+            if timeout(
+                Duration::from_millis(100),
+                handle.send(OutboundFrame::Bytes(vec![0u8; 64 * 1024])),
+            )
+            .await
+            .is_err()
+            {
+                break;
+            }
+        }
+
+        drop(handle);
+
+        // The peer must see the socket go away. It stays readable (bytes
+        // already delivered are still queued), but writing to a socket whose
+        // peer has closed fails — whereas a surviving read task would go on
+        // consuming these single bytes for as long as the test waits.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+        let mut closed = false;
+        while tokio::time::Instant::now() < deadline {
+            if peer.write_all(b"x").await.is_err() {
+                closed = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(
+            closed,
+            "dropping the ClientHandle must end both tasks and close the \
+             socket, as C ~clientItem does"
+        );
+    }
+
+    /// I1: C arms `SO_SNDTIMEO` at 10 s on every accepted client socket
+    /// (`clientFactory.cc:104-105` builds the `timeval`, `:147` arms it),
+    /// so one stalled `write()` is enough to finish the client off —
+    /// `writeToFd` takes the -1 branch and marks it (`:283-290`). Without a
+    /// deadline on the write itself the task parks in `write_all` for good,
+    /// never returns to `recv()`, and so never notices the supervisor
+    /// letting go of the outbound channel.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_write_that_misses_its_deadline_ends_the_write_task() {
+        // `_peer` stays alive and never reads: closing it would fail the
+        // write for the wrong reason.
+        let (sock, _peer) = tokio::net::UnixStream::pair().unwrap();
+        let (in_tx, _in_rx) = mpsc::channel(8);
+        let (out_tx, out_rx) = mpsc::channel::<OutboundFrame>(64);
+        let tasks = spawn_split(
+            sock,
+            ClientId::new(),
+            true,
+            in_tx,
+            out_rx,
+            Duration::from_millis(100),
+        );
+
+        // The peer never reads, so once the socket buffers fill `write_all`
+        // pends and the 64-deep channel backs up behind it.
+        for _ in 0..64 {
+            if out_tx
+                .try_send(OutboundFrame::Bytes(vec![0u8; 64 * 1024]))
+                .is_err()
+            {
+                break;
+            }
+        }
+
+        let ended = timeout(Duration::from_secs(3), out_tx.closed()).await;
+        for task in tasks {
+            task.abort();
+        }
+        assert!(
+            ended.is_ok(),
+            "a write past SO_SNDTIMEO must end the write task, which closes \
+             the outbound channel and tells the supervisor the client is dead"
+        );
     }
 }

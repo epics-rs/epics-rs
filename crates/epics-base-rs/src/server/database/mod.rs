@@ -89,19 +89,29 @@ pub fn is_value_field(field: &str) -> bool {
 ///   - `epicsTimeEventDeviceTime  = -2` → device support already set time
 ///   - `1..` → event-number providers
 ///
-/// The C path is symmetric: every non-`-2` case unconditionally
-/// overwrites `precord->time` via `epicsTimeGetEvent(tse)`, which
-/// delegates to `epicsTimeGetCurrent` for `tse==0` and to
+/// Every non-`-2` case goes through one C call, `epicsTimeGetEvent(tse)`,
+/// which delegates to `epicsTimeGetCurrent` for `tse==0` and to
 /// `generalTimeGetEventPriority` otherwise. Only `-2` (device time)
 /// is left untouched because the device support has already written
 /// the timestamp before `recGblGetTimeStamp` is called.
-fn apply_timestamp(common: &mut super::record::CommonFields, _is_soft: bool) {
+///
+/// A TSE C rejects — anything below `epicsTimeEventBestTime`, or any event
+/// number with no provider to answer it — is not a stamp: C writes nothing
+/// into `precord->time` and errlogs, so a misconfigured record holds its
+/// stale stamp rather than timestamping as if healthy.
+fn apply_timestamp(name: &str, common: &mut super::record::CommonFields, _is_soft: bool) {
     // Single owner of TSE -> TIME resolution; device support that must
     // format the record's resolved time during `read()` routes through the
     // same helper so the two never drift (see `recgbl::get_time_stamp`).
     // For TSE=-2 the helper returns `common.time` unchanged, preserving the
     // device-time "leave it alone" semantics.
-    common.time = crate::server::recgbl::get_time_stamp(common.tse, common.time);
+    match crate::server::recgbl::get_time_stamp(common.tse, common.time) {
+        Some(t) => common.time = t,
+        None => crate::runtime::log::errlog_printf(&format!(
+            "recGblGetTimeStampSimm: epicsTimeGetEvent failed, {name}.TSE = {}\n",
+            common.tse
+        )),
+    }
 }
 
 /// Unified entry in the PV database.
@@ -2286,7 +2296,7 @@ mod tests {
         common.tse = -1;
         common.time = stale;
 
-        apply_timestamp(&mut common, false);
+        apply_timestamp("REC", &mut common, false);
 
         // BestTime must have run unconditionally — `common.time` is
         // no longer the stale sentinel.
@@ -2311,11 +2321,70 @@ mod tests {
         common.tse = -2;
         common.time = device_time;
 
-        apply_timestamp(&mut common, false);
+        apply_timestamp("REC", &mut common, false);
 
         assert_eq!(
             common.time, device_time,
             "TSE=-2 (epicsTimeEventDeviceTime) must preserve device-provided time"
+        );
+    }
+
+    /// C `generalTimeGetEventPriority` rejects every event below
+    /// `epicsTimeEventBestTime` with `S_time_badEvent`
+    /// (`epicsGeneralTime.c:254-255`), and `recGblGetTimeStampSimm`
+    /// (`recGbl.c:324-328`) writes nothing into `prec->time` on that status —
+    /// it errlogs and the record keeps the stamp it had. `TSE` is
+    /// `epicsInt16`, so `caput X.TSE -3` reaches this path.
+    #[test]
+    fn apply_timestamp_below_best_time_keeps_the_stale_stamp_and_errlogs() {
+        use crate::server::record::CommonFields;
+        use std::io::Write;
+        use std::sync::{Arc, Mutex};
+        use std::time::{Duration, SystemTime};
+        use tracing_subscriber::fmt::MakeWriter;
+
+        #[derive(Clone, Default)]
+        struct CaptureBuf(Arc<Mutex<Vec<u8>>>);
+        impl Write for CaptureBuf {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        impl<'a> MakeWriter<'a> for CaptureBuf {
+            type Writer = CaptureBuf;
+            fn make_writer(&'a self) -> Self::Writer {
+                self.clone()
+            }
+        }
+
+        let buf = CaptureBuf::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(buf.clone())
+            .with_max_level(tracing::Level::INFO)
+            .with_target(false)
+            .without_time()
+            .finish();
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        let stale = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000);
+        let mut common = CommonFields::default();
+        common.tse = -3;
+        common.time = stale;
+
+        apply_timestamp("X", &mut common, false);
+
+        assert_eq!(
+            common.time, stale,
+            "TSE below epicsTimeEventBestTime must leave TIME alone, not stamp now"
+        );
+        let logged = String::from_utf8_lossy(&buf.0.lock().unwrap()).into_owned();
+        assert!(
+            logged.contains("recGblGetTimeStampSimm: epicsTimeGetEvent failed, X.TSE = -3"),
+            "C errlogs the failed event lookup; captured: {logged:?}"
         );
     }
 

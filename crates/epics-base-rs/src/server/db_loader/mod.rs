@@ -9,8 +9,12 @@ mod include;
 mod substitution;
 #[cfg(test)]
 pub(crate) use include::parse_include_directive;
-pub use include::{DbLoadConfig, expand_includes, parse_db_file, parse_db_file_with_breaktables};
-pub use substitution::{TemplateLoad, load_substitution_file, parse_substitutions};
+pub use include::{
+    DbLoadConfig, db_add_path, db_open_file, db_path, expand_includes, parse_db_file,
+    parse_db_file_with_breaktables,
+};
+pub(crate) use substitution::resolve_template;
+pub use substitution::{TemplateLoad, parse_substitutions, substitution_rows};
 
 /// Factory function that creates a record instance.
 pub type RecordFactory = Box<dyn Fn() -> Box<dyn Record> + Send + Sync>;
@@ -97,19 +101,106 @@ pub(crate) fn validate_record_name(name: &str, line: usize, col: usize) -> CaRes
     Ok(())
 }
 
-/// Parse an EPICS .db file with macro substitution.
-pub fn parse_db(input: &str, macros: &HashMap<String, String>) -> CaResult<Vec<DbRecordDef>> {
-    parse_db_with_breaktables(input, macros).map(|(records, _breaktables)| records)
+/// The single owner of C's `yyerror` / `yyerrorAbort` distinction.
+///
+/// C's `.db` reader has two error routines and uses both inside the same
+/// file: `yyerror(NULL)` (`dbLexRoutines.c:452`, `:1175`) records the
+/// failure, leaves everything already parsed in `pdbbase`, and lets
+/// `pvt_yy_parse` return -1 once the whole text has been read
+/// (`dbYacc.y:370-397`); `yyerrorAbort` (`:1133`, `:1159-1165`) stops the
+/// parse outright.
+///
+/// Invariant: a per-item failure records a diagnostic and a non-zero final
+/// status but MUST NOT discard items already parsed; only an abort-class
+/// failure — an `Err` return out of the parse — stops it. Every
+/// recoverable site reports through [`DbFaults::recoverable`], which is
+/// the one place that decides what a recoverable failure does, so no
+/// caller has to re-derive the classification.
+#[derive(Debug, Default)]
+pub struct DbFaults {
+    messages: Vec<String>,
 }
 
-/// Like [`parse_db`] but also returns the `breaktable(...)` definitions found
-/// in the text (C `dbBreakBody`, `dbLexRoutines.c`). The IOC builder feeds
-/// these into the breakpoint-table registry so `ai`/`ao` records with
-/// `LINR >= 3` can resolve their linearisation table.
+impl DbFaults {
+    /// C `yyerror(NULL)`: print the diagnostic, remember that the load
+    /// failed, and let the caller carry on with the next item.
+    pub fn recoverable(&mut self, message: String) {
+        eprintln!("{message}");
+        self.messages.push(message);
+    }
+
+    /// Take over the faults a nested parse layer collected — an
+    /// `include`, a `.substitutions` row — so the outermost load still
+    /// reports them exactly once.
+    pub fn absorb(&mut self, other: DbFaults) {
+        self.messages.extend(other.messages);
+    }
+
+    /// Whether anything recoverable was reported.
+    pub fn is_empty(&self) -> bool {
+        self.messages.is_empty()
+    }
+
+    /// C `pvt_yy_parse` returning -1 with `yyFailed` set: the load's
+    /// status is non-zero when anything was reported. The first
+    /// diagnostic is the one the caller surfaces.
+    pub fn status(&self) -> Result<(), String> {
+        match self.messages.split_first() {
+            None => Ok(()),
+            Some((first, [])) => Err(first.clone()),
+            Some((first, rest)) => Err(format!("{first} (+{} more)", rest.len())),
+        }
+    }
+}
+
+/// Everything one `.db` text yields.
+pub struct ParsedDb {
+    pub records: Vec<DbRecordDef>,
+    /// `breaktable(...)` definitions found in the text (C `dbBreakBody`,
+    /// `dbLexRoutines.c`). The IOC builder feeds these into the
+    /// breakpoint-table registry so `ai`/`ao` records with `LINR >= 3`
+    /// can resolve their linearisation table.
+    pub breaktables: Vec<crate::server::cvt_bpt::BrkTable>,
+    /// File-scope `alias("record","new")` directives whose target is not
+    /// declared in this text. C `dbAlias` (`dbLexRoutines.c:1508`) looks
+    /// the target up in `savedPdbbase` — the whole accumulated database
+    /// — so only a caller that owns that database can resolve them, and
+    /// the parser must not decide their fate on its own.
+    pub unresolved_aliases: Vec<(String, String)>,
+    /// Recoverable failures this text produced (C `yyerror(NULL)`). The
+    /// records above are everything that parsed in spite of them; the
+    /// caller turns a non-empty set into the load's non-zero status.
+    pub faults: DbFaults,
+}
+
+/// C `dbAlias`'s diagnostic for a target no database knows
+/// (`dbLexRoutines.c:1509-1513`). C follows it with `yyerror(NULL)`,
+/// which sets `yyFailed` and returns 0: the load's status goes
+/// non-zero, the parse continues, and everything already read stays.
+pub fn unknown_alias_message(alias: &str, target: &str) -> String {
+    format!("ERROR: Alias '{alias}' names an unknown record '{target}'")
+}
+
+/// Parse an EPICS .db file with macro substitution.
+///
+/// The records-only entry point: it has no database to resolve a
+/// file-scope alias against, so an unmatched one is reported to stderr
+/// and dropped. C keeps the records it already read too — callers that
+/// own a database ([`crate::server::ioc_builder`], `dbLoadRecords`)
+/// take [`ParsedDb::unresolved_aliases`] instead and resolve them.
+pub fn parse_db(input: &str, macros: &HashMap<String, String>) -> CaResult<Vec<DbRecordDef>> {
+    let parsed = parse_db_with_breaktables(input, macros)?;
+    for (target, alias) in &parsed.unresolved_aliases {
+        eprintln!("{}", unknown_alias_message(alias, target));
+    }
+    Ok(parsed.records)
+}
+
+/// Like [`parse_db`] but returns the whole [`ParsedDb`].
 pub fn parse_db_with_breaktables(
     input: &str,
     macros: &HashMap<String, String>,
-) -> CaResult<(Vec<DbRecordDef>, Vec<crate::server::cvt_bpt::BrkTable>)> {
+) -> CaResult<ParsedDb> {
     // Per LINE, not per file: C's loader expands each `fgets` line
     // separately (`dbLexRoutines.c:375-391`), so quote state cannot leak
     // across lines — see `substitute_macros_per_line`.
@@ -120,6 +211,12 @@ pub fn parse_db_with_breaktables(
     // Resolved against the record list after the full file is parsed
     // so the alias target may appear before or after the directive.
     let mut global_aliases: Vec<(String, String)> = Vec::new();
+    // `dbYacc.y` declares no `error` productions, so a genuine syntax
+    // error ends `yyparse` and the whole text is lost in C too: every
+    // `?` below is abort-class by C's own choice. Only the semantic
+    // actions C guards with `yyerror(NULL)` are recoverable, and those
+    // live in the layers that own a database — see [`DbFaults`].
+    let faults = DbFaults::default();
     let chars: Vec<char> = expanded.chars().collect();
     let mut pos = 0;
     let mut line = 1;
@@ -293,92 +390,100 @@ pub fn parse_db_with_breaktables(
         expect_char(&chars, &mut pos, &mut col, ')', line)?;
 
         skip_whitespace_and_comments(&chars, &mut pos, &mut line, &mut col);
-        expect_char(&chars, &mut pos, &mut col, '{', line)?;
-
         let mut fields = Vec::new();
         let mut aliases: Vec<String> = Vec::new();
         let mut info_tags: Vec<(String, String)> = Vec::new();
-        loop {
-            skip_whitespace_and_comments(&chars, &mut pos, &mut line, &mut col);
-            if pos >= chars.len() {
-                return Err(CaError::DbParseError {
-                    line,
-                    column: col,
-                    message: "unexpected end of file in record body".into(),
-                });
-            }
-            if chars[pos] == '}' {
-                pos += 1;
-                col += 1;
-                break;
-            }
+        // C `dbYacc.y:237-241`: `record_body: /* empty */` is the FIRST
+        // alternative, ahead of `'{' '}'` and `'{' record_field_list '}'`,
+        // and `tokenRECORD` and `tokenGRECORD` share it — so
+        // `record(ai,"TEMP")` with no braces is an all-defaults record,
+        // not a syntax error. `record`/`grecord` reach this through the
+        // same path above, so both forms are covered here.
+        if pos < chars.len() && chars[pos] == '{' {
+            pos += 1;
+            col += 1;
+            loop {
+                skip_whitespace_and_comments(&chars, &mut pos, &mut line, &mut col);
+                if pos >= chars.len() {
+                    return Err(CaError::DbParseError {
+                        line,
+                        column: col,
+                        message: "unexpected end of file in record body".into(),
+                    });
+                }
+                if chars[pos] == '}' {
+                    pos += 1;
+                    col += 1;
+                    break;
+                }
 
-            let kw = read_word(&chars, &mut pos, &mut col);
-            if kw != "field" && kw != "info" && kw != "alias" {
-                return Err(CaError::DbParseError {
-                    line,
-                    column: col,
-                    message: format!("expected 'field', got '{kw}'"),
-                });
-            }
+                let kw = read_word(&chars, &mut pos, &mut col);
+                if kw != "field" && kw != "info" && kw != "alias" {
+                    return Err(CaError::DbParseError {
+                        line,
+                        column: col,
+                        message: format!("expected 'field', got '{kw}'"),
+                    });
+                }
 
-            if kw == "alias" {
-                // alias("name") — capture and validate per PR #336.
+                if kw == "alias" {
+                    // alias("name") — capture and validate per PR #336.
+                    skip_whitespace_and_comments(&chars, &mut pos, &mut line, &mut col);
+                    expect_char(&chars, &mut pos, &mut col, '(', line)?;
+                    skip_whitespace_and_comments(&chars, &mut pos, &mut line, &mut col);
+                    let alias_name = read_token_string(&chars, &mut pos, &mut line, &mut col)?;
+                    validate_record_name(&alias_name, line, col)?;
+                    skip_whitespace_and_comments(&chars, &mut pos, &mut line, &mut col);
+                    expect_char(&chars, &mut pos, &mut col, ')', line)?;
+                    aliases.push(alias_name);
+                    continue;
+                }
+                if kw == "info" {
+                    // info(tag, value) — capture for downstream consumers
+                    // (asyn:READBACK, Q:form, etc.). PR #60 / #208 needs
+                    // the asyn:READBACK tag in particular.
+                    //
+                    // Both `tag` and `value` accept quoted *or* unquoted
+                    // tokens. Base's dbStaticLib parser tolerates either
+                    // form and ad-core templates rely on the unquoted
+                    // shape (`info(asyn:READBACK, "1")`).
+                    //
+                    // C `info(tokenSTRING, json_value)` (dbYacc.y:262-267): the tag
+                    // is a `tokenSTRING` — the same raw, untranslated token a record
+                    // NAME is — and only the value is a `jsonSTRING` that
+                    // `dbRecordInfo` runs `dbTranslateEscape` over
+                    // (dbLexRoutines.c:1435-1440). Hence the two different readers.
+                    skip_whitespace_and_comments(&chars, &mut pos, &mut line, &mut col);
+                    expect_char(&chars, &mut pos, &mut col, '(', line)?;
+                    skip_whitespace_and_comments(&chars, &mut pos, &mut line, &mut col);
+                    let tag = read_token_string(&chars, &mut pos, &mut line, &mut col)?;
+                    skip_whitespace_and_comments(&chars, &mut pos, &mut line, &mut col);
+                    expect_char(&chars, &mut pos, &mut col, ',', line)?;
+                    skip_whitespace_and_comments(&chars, &mut pos, &mut line, &mut col);
+                    let value = read_field_value(&chars, &mut pos, &mut line, &mut col)?;
+                    skip_whitespace_and_comments(&chars, &mut pos, &mut line, &mut col);
+                    expect_char(&chars, &mut pos, &mut col, ')', line)?;
+                    info_tags.push((tag, value.as_str_lossy().into_owned()));
+                    continue;
+                }
+
                 skip_whitespace_and_comments(&chars, &mut pos, &mut line, &mut col);
                 expect_char(&chars, &mut pos, &mut col, '(', line)?;
+
                 skip_whitespace_and_comments(&chars, &mut pos, &mut line, &mut col);
-                let alias_name = read_token_string(&chars, &mut pos, &mut line, &mut col)?;
-                validate_record_name(&alias_name, line, col)?;
-                skip_whitespace_and_comments(&chars, &mut pos, &mut line, &mut col);
-                expect_char(&chars, &mut pos, &mut col, ')', line)?;
-                aliases.push(alias_name);
-                continue;
-            }
-            if kw == "info" {
-                // info(tag, value) — capture for downstream consumers
-                // (asyn:READBACK, Q:form, etc.). PR #60 / #208 needs
-                // the asyn:READBACK tag in particular.
-                //
-                // Both `tag` and `value` accept quoted *or* unquoted
-                // tokens. Base's dbStaticLib parser tolerates either
-                // form and ad-core templates rely on the unquoted
-                // shape (`info(asyn:READBACK, "1")`).
-                //
-                // C `info(tokenSTRING, json_value)` (dbYacc.y:262-267): the tag
-                // is a `tokenSTRING` — the same raw, untranslated token a record
-                // NAME is — and only the value is a `jsonSTRING` that
-                // `dbRecordInfo` runs `dbTranslateEscape` over
-                // (dbLexRoutines.c:1435-1440). Hence the two different readers.
-                skip_whitespace_and_comments(&chars, &mut pos, &mut line, &mut col);
-                expect_char(&chars, &mut pos, &mut col, '(', line)?;
-                skip_whitespace_and_comments(&chars, &mut pos, &mut line, &mut col);
-                let tag = read_token_string(&chars, &mut pos, &mut line, &mut col)?;
+                let field_name = read_token_string(&chars, &mut pos, &mut line, &mut col)?;
+
                 skip_whitespace_and_comments(&chars, &mut pos, &mut line, &mut col);
                 expect_char(&chars, &mut pos, &mut col, ',', line)?;
+
                 skip_whitespace_and_comments(&chars, &mut pos, &mut line, &mut col);
-                let value = read_field_value(&chars, &mut pos, &mut line, &mut col)?;
+                let field_value = read_field_value(&chars, &mut pos, &mut line, &mut col)?;
+
                 skip_whitespace_and_comments(&chars, &mut pos, &mut line, &mut col);
                 expect_char(&chars, &mut pos, &mut col, ')', line)?;
-                info_tags.push((tag, value.as_str_lossy().into_owned()));
-                continue;
+
+                fields.push((field_name, field_value));
             }
-
-            skip_whitespace_and_comments(&chars, &mut pos, &mut line, &mut col);
-            expect_char(&chars, &mut pos, &mut col, '(', line)?;
-
-            skip_whitespace_and_comments(&chars, &mut pos, &mut line, &mut col);
-            let field_name = read_token_string(&chars, &mut pos, &mut line, &mut col)?;
-
-            skip_whitespace_and_comments(&chars, &mut pos, &mut line, &mut col);
-            expect_char(&chars, &mut pos, &mut col, ',', line)?;
-
-            skip_whitespace_and_comments(&chars, &mut pos, &mut line, &mut col);
-            let field_value = read_field_value(&chars, &mut pos, &mut line, &mut col)?;
-
-            skip_whitespace_and_comments(&chars, &mut pos, &mut line, &mut col);
-            expect_char(&chars, &mut pos, &mut col, ')', line)?;
-
-            fields.push((field_name, field_value));
         }
 
         records.push(DbRecordDef {
@@ -391,25 +496,24 @@ pub fn parse_db_with_breaktables(
     }
 
     // Attach standalone `alias("record","newname")` directives to the
-    // matching record (C `dbAlias`). An alias whose target record is
-    // not present in this database is a hard error, matching base
-    // where `dbAlias` fails on an unknown record name.
+    // matching record (C `dbAlias`). A target this text does not
+    // declare is NOT an error here: C resolves it against
+    // `savedPdbbase`, so an earlier `dbLoadRecords` may own it. Hand it
+    // to the caller, which is the only party that can see the database.
+    let mut unresolved_aliases = Vec::new();
     for (target, alias_name) in global_aliases {
         match records.iter_mut().find(|r| r.name == target) {
             Some(rec) => rec.aliases.push(alias_name),
-            None => {
-                return Err(CaError::DbParseError {
-                    line: 0,
-                    column: 0,
-                    message: format!(
-                        "alias \"{alias_name}\" refers to unknown record \"{target}\""
-                    ),
-                });
-            }
+            None => unresolved_aliases.push((target, alias_name)),
         }
     }
 
-    Ok((records, breaktables))
+    Ok(ParsedDb {
+        records,
+        breaktables,
+        unresolved_aliases,
+        faults,
+    })
 }
 
 /// Resolution options for the macLib expansion engine ([`expand_macros`]).
@@ -454,9 +558,12 @@ struct ExpandCtx<'a> {
 /// per-caller [`MacroExpandOptions`]) rather than re-implementing it.
 /// Implemented behaviors:
 ///
-///   - `\<char>` blocks macro detection and copies both bytes verbatim
-///     (`trans:740-749`; `macLib.plt:52`).
-///   - macros are NOT expanded inside single quotes (`trans:722-733`).
+///   - `\<char>` blocks macro detection; both bytes reach the output in
+///     the caller's own string, and the backslash is dropped from
+///     anything that arrived through a macro (`trans:700-703,738-745`;
+///     `macLib.plt:52`).
+///   - macros are NOT expanded inside single quotes (`trans:713-723`);
+///     the quote characters themselves survive only at level 0.
 ///   - a reference name is itself macro-expanded before lookup
 ///     (`refer` runs `trans` on the name — `$($(WHICH))`).
 ///   - the name terminates at `=`, `,` or the closing bracket
@@ -541,6 +648,13 @@ fn trans(
     visiting: &mut Vec<String>,
     out: &mut String,
 ) {
+    // C `macCore.c:700-703`: "discard quotes and escapes if level is > 0
+    // (i.e. if these aren't the user's quotes and escapes)". Level 0 is
+    // the string the caller handed `macExpandString`; every recursion out
+    // of `refer` — a macro's value, a reference name, a default, a scoped
+    // definition — runs at `level + 1`, so a quote or a backslash that
+    // arrived through a macro is syntax and never reaches the output.
+    let discard = level > 0;
     let mut quote: Option<char> = None;
     let mut i = 0;
     while i < chars.len() {
@@ -550,9 +664,17 @@ fn trans(
         if let Some(q) = quote {
             if c == q {
                 quote = None;
+                if discard {
+                    i += 1;
+                    continue;
+                }
             }
         } else if c == '"' || c == '\'' {
             quote = Some(c);
+            if discard {
+                i += 1;
+                continue;
+            }
         }
 
         // `$$` → literal `$` (opt-in; autosave `.req` convenience).
@@ -562,9 +684,12 @@ fn trans(
             continue;
         }
 
-        // `\<char>`: emit both verbatim, skip macro detection.
+        // `\<char>`: skip macro detection; the backslash itself is
+        // emitted only at level 0 (C `if (v < valend && !discard)`).
         if c == '\\' && i + 1 < chars.len() {
-            out.push('\\');
+            if !discard {
+                out.push('\\');
+            }
             out.push(chars[i + 1]);
             i += 2;
             continue;
@@ -697,10 +822,10 @@ fn refer(
         }
         None => match default {
             Some(def_chars) => {
-                // Strip a single layer of surrounding quotes from the
-                // default (`$(NAME="value")` → value).
-                let def = strip_outer_quotes(def_chars);
-                trans(def, level + 1, ctx, scopes, visiting, out);
+                // C `refer` translates the default at `level + 1`
+                // (`macCore.c:909`), so every quote in it is discarded —
+                // not just a surrounding pair.
+                trans(def_chars, level + 1, ctx, scopes, visiting, out);
             }
             None => {
                 // L-4: undefined macro placeholder. C emits
@@ -803,15 +928,6 @@ fn top_level_comma(body: &[char]) -> Option<usize> {
         i += 1;
     }
     None
-}
-
-/// Strip one layer of matching surrounding quotes from a char slice.
-fn strip_outer_quotes(s: &[char]) -> &[char] {
-    if s.len() >= 2 && s[0] == '"' && s[s.len() - 1] == '"' {
-        &s[1..s.len() - 1]
-    } else {
-        s
-    }
 }
 
 fn skip_whitespace_and_comments(
@@ -1057,6 +1173,11 @@ fn read_json_value(
     col: &mut usize,
 ) -> CaResult<String> {
     let start_line = *line;
+    let close = if chars.get(*pos) == Some(&'[') {
+        ']'
+    } else {
+        '}'
+    };
     let mut s = String::new();
     let mut depth = 0usize;
     let mut in_string = false;
@@ -1085,8 +1206,8 @@ fn read_json_value(
         }
         match c {
             '"' => in_string = true,
-            '{' => depth += 1,
-            '}' => {
+            '{' | '[' => depth += 1,
+            '}' | ']' => {
                 depth -= 1;
                 if depth == 0 {
                     return Ok(s);
@@ -1099,7 +1220,7 @@ fn read_json_value(
     Err(CaError::DbParseError {
         line: start_line,
         column: *col,
-        message: "unterminated JSON value (missing '}')".into(),
+        message: format!("unterminated JSON value (missing '{close}')"),
     })
 }
 
@@ -1172,12 +1293,17 @@ fn read_field_value(
         return read_json_string(chars, pos, line, col);
     }
 
-    // JSON value: C's dbLex tokenizes a brace-delimited field value as JSON
-    // (`field(DOL, {const:"hello"})`, `field(INP, {pva:"PV"})`) and hands the
-    // raw text to `dbParseLink`, which sees the braces and calls
-    // `dbJLinkParse` (dbStaticLib.c:2280-2285). Keep the text verbatim — the
-    // link parser is the one that interprets it.
-    if *pos < chars.len() && chars[*pos] == '{' {
+    // JSON value: C's dbLex tokenizes a brace- or bracket-delimited field
+    // value as JSON (`field(DOL, {const:"hello"})`, `field(INP, {pva:"PV"})`,
+    // `field(INP, [1, 2, 3])`) and hands the raw text to `dbParseLink`, which
+    // calls `dbJLinkParse` for an object (dbStaticLib.c:2280-2285) and takes
+    // a bracketed value as an array CONSTANT (`:2352-2356`). `json_array` is
+    // a `json_value` alternative just like `json_object` (dbYacc.y:328-337,
+    // `:356-363`), so both open the same way; the port had no `[` branch, so
+    // `[1, 2, 3]` fell through to the bareword reader, stopped at the first
+    // comma and failed the whole file. Keep the text verbatim — the link
+    // parser is the one that interprets it.
+    if matches!(chars.get(*pos), Some('{' | '[')) {
         // The brace text is JSON source — ASCII/UTF-8 by construction, and the
         // escapes inside it belong to yajl, not to the `.db` lexer (R19-67).
         return read_json_value(chars, pos, line, col).map(PvString::from);
@@ -1940,8 +2066,10 @@ mod tests {
 
         let mut macros = HashMap::new();
         macros.insert("P".to_string(), "IOC:".to_string());
+        // C `dbOpenFile` searches the path list, never the including
+        // file's directory, so the tempdir has to be ON the list.
         let config = DbLoadConfig {
-            include_paths: vec![],
+            include_paths: vec![dir.path().to_path_buf()],
             max_include_depth: 10,
         };
         let records = parse_db_file(&parent, &macros, &config).unwrap();
@@ -2221,8 +2349,9 @@ breaktable(typeJdegC) {
 }
 record(ai, "T") { field(LINR, "typeJdegC") }
 "#;
-        let (records, breaktables) = parse_db_with_breaktables(input, &HashMap::new()).unwrap();
-        assert_eq!(records.len(), 1);
+        let parsed = parse_db_with_breaktables(input, &HashMap::new()).unwrap();
+        let breaktables = parsed.breaktables;
+        assert_eq!(parsed.records.len(), 1);
         assert_eq!(breaktables.len(), 1);
         let t = &breaktables[0];
         assert_eq!(t.name, "typeJdegC");
@@ -2236,7 +2365,9 @@ record(ai, "T") { field(LINR, "typeJdegC") }
     #[test]
     fn test_parse_breaktable_quoted_name_and_commas() {
         let input = r#"breaktable("tbl") { 0,0, 10,100 }"#;
-        let (_records, breaktables) = parse_db_with_breaktables(input, &HashMap::new()).unwrap();
+        let breaktables = parse_db_with_breaktables(input, &HashMap::new())
+            .unwrap()
+            .breaktables;
         assert_eq!(breaktables.len(), 1);
         assert_eq!(breaktables[0].name, "tbl");
         assert_eq!(breaktables[0].points.len(), 2);
@@ -2246,7 +2377,9 @@ record(ai, "T") { field(LINR, "typeJdegC") }
     #[test]
     fn test_parse_breaktable_odd_count_errors() {
         let input = r#"breaktable(bad) { 0 0 10 }"#;
-        let err = parse_db_with_breaktables(input, &HashMap::new()).unwrap_err();
+        let Err(err) = parse_db_with_breaktables(input, &HashMap::new()) else {
+            panic!("odd point count must be a parse error");
+        };
         match err {
             CaError::DbParseError { message, .. } => {
                 assert!(message.contains("Raw value missing"), "{message}")
@@ -2392,8 +2525,17 @@ record(ai, "T") { field(LINR, "typeJdegC") }
         writeln!(f, r#"}}"#).unwrap();
         writeln!(f, r#"include "child.db""#).unwrap();
 
-        let config = DbLoadConfig::default();
-        let result = expand_includes(&parent_path, &HashMap::new(), &config).unwrap();
+        let config = DbLoadConfig {
+            include_paths: vec![dir.path().to_path_buf()],
+            max_include_depth: 32,
+        };
+        let result = expand_includes(
+            &parent_path,
+            &HashMap::new(),
+            &config,
+            &mut DbFaults::default(),
+        )
+        .unwrap();
         assert!(result.contains(r#"record(ao, "PARENT")"#));
         assert!(result.contains(r#"record(ai, "CHILD")"#));
 
@@ -2416,8 +2558,11 @@ record(ai, "T") { field(LINR, "typeJdegC") }
         let mut fb = std::fs::File::create(&b_path).unwrap();
         writeln!(fb, r#"include "a.template""#).unwrap();
 
-        let config = DbLoadConfig::default();
-        let result = expand_includes(&a_path, &HashMap::new(), &config);
+        let config = DbLoadConfig {
+            include_paths: vec![dir.path().to_path_buf()],
+            max_include_depth: 32,
+        };
+        let result = expand_includes(&a_path, &HashMap::new(), &config, &mut DbFaults::default());
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
         assert!(err.contains("circular include"), "error was: {err}");
@@ -2440,8 +2585,17 @@ record(ai, "T") { field(LINR, "typeJdegC") }
         writeln!(f, r#"include "shared.db""#).unwrap();
         writeln!(f, r#"include "shared.db""#).unwrap();
 
-        let config = DbLoadConfig::default();
-        let result = expand_includes(&main_path, &HashMap::new(), &config).unwrap();
+        let config = DbLoadConfig {
+            include_paths: vec![dir.path().to_path_buf()],
+            max_include_depth: 32,
+        };
+        let result = expand_includes(
+            &main_path,
+            &HashMap::new(),
+            &config,
+            &mut DbFaults::default(),
+        )
+        .unwrap();
         // shared.db content appears twice
         assert_eq!(result.matches(r#"record(ai, "SHARED")"#).count(), 2);
     }
@@ -2465,29 +2619,44 @@ record(ai, "T") { field(LINR, "typeJdegC") }
         }
 
         let config = DbLoadConfig {
-            include_paths: vec![],
+            include_paths: vec![dir.path().to_path_buf()],
             max_include_depth: 32,
         };
-        let result = expand_includes(&dir.path().join("file0.db"), &HashMap::new(), &config);
+        let result = expand_includes(
+            &dir.path().join("file0.db"),
+            &HashMap::new(),
+            &config,
+            &mut DbFaults::default(),
+        );
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
         assert!(err.contains("depth limit"), "error was: {err}");
     }
 
+    /// R5-3: C `dbIncludeNew` (`dbLexRoutines.c:450-456`) reports an
+    /// unopenable include with `yyerror(NULL)`, so the include is skipped
+    /// and the rest of the file is still read. This test used to assert
+    /// the opposite — that the whole expansion failed.
     #[test]
-    fn test_include_not_found_error() {
+    fn test_include_not_found_is_recoverable() {
         use std::io::Write;
         let dir = tempfile::tempdir().unwrap();
 
         let path = dir.path().join("main.db");
         let mut f = std::fs::File::create(&path).unwrap();
+        writeln!(f, r#"record(ai, "SIM:A") {{ field(VAL, "1") }}"#).unwrap();
         writeln!(f, r#"include "nonexistent.db""#).unwrap();
+        writeln!(f, r#"record(ai, "SIM:B") {{ field(VAL, "2") }}"#).unwrap();
 
         let config = DbLoadConfig::default();
-        let result = expand_includes(&path, &HashMap::new(), &config);
-        assert!(result.is_err());
-        let err = result.unwrap_err().to_string();
-        assert!(err.contains("not found"), "error was: {err}");
+        let mut faults = DbFaults::default();
+        let text = expand_includes(&path, &HashMap::new(), &config, &mut faults)
+            .expect("a missing include must not fail the expansion");
+        assert!(text.contains("SIM:A") && text.contains("SIM:B"));
+        let err = faults
+            .status()
+            .expect_err("the load's status must go non-zero");
+        assert_eq!(err, "ERROR: Can't open include file 'nonexistent.db'");
     }
 
     #[test]
@@ -2511,7 +2680,8 @@ record(ai, "T") { field(LINR, "typeJdegC") }
         macros.insert("DIR".to_string(), subdir.to_string_lossy().to_string());
 
         let config = DbLoadConfig::default();
-        let result = expand_includes(&main_path, &macros, &config).unwrap();
+        let result =
+            expand_includes(&main_path, &macros, &config, &mut DbFaults::default()).unwrap();
         assert!(result.contains(r#"record(ai, "CHILD")"#));
     }
 
@@ -2537,17 +2707,47 @@ record(ai, "T") { field(LINR, "typeJdegC") }
             include_paths: vec![inc_dir.clone()],
             max_include_depth: 32,
         };
-        let result = expand_includes(&main_path, &HashMap::new(), &config).unwrap();
+        let result = expand_includes(
+            &main_path,
+            &HashMap::new(),
+            &config,
+            &mut DbFaults::default(),
+        )
+        .unwrap();
         assert!(result.contains(r#"record(ai, "FROM_INC")"#));
 
-        // Now also put a file in current dir — it should take priority
+        // I-R3-3: a same-named file next to the INCLUDING file must not
+        // win. C `dbIncludeNew` (`dbLexRoutines.c:450`) goes through
+        // `dbOpenFile`, which walks the path list and never looks at the
+        // parent file's directory or the process CWD.
         let local_child = dir.path().join("child.db");
         let mut f = std::fs::File::create(&local_child).unwrap();
         writeln!(f, r#"record(ai, "FROM_LOCAL") {{"#).unwrap();
         writeln!(f, r#"    field(VAL, "0")"#).unwrap();
         writeln!(f, r#"}}"#).unwrap();
 
-        let result = expand_includes(&main_path, &HashMap::new(), &config).unwrap();
+        let result = expand_includes(
+            &main_path,
+            &HashMap::new(),
+            &config,
+            &mut DbFaults::default(),
+        )
+        .unwrap();
+        assert!(result.contains(r#"record(ai, "FROM_INC")"#));
+        assert!(!result.contains(r#"record(ai, "FROM_LOCAL")"#));
+
+        // …and a name that already carries a separator bypasses the list
+        // entirely, exactly as C's `strchr(filename, '/')` gate does.
+        let sep_main = dir.path().join("sep_main.db");
+        let mut f = std::fs::File::create(&sep_main).unwrap();
+        writeln!(f, r#"include "{}""#, local_child.display()).unwrap();
+        let result = expand_includes(
+            &sep_main,
+            &HashMap::new(),
+            &config,
+            &mut DbFaults::default(),
+        )
+        .unwrap();
         assert!(result.contains(r#"record(ai, "FROM_LOCAL")"#));
     }
 
@@ -2573,7 +2773,8 @@ record(ai, "T") { field(LINR, "typeJdegC") }
         // No include path in config — only the addpath directive can
         // make this resolve.
         let config = DbLoadConfig::default();
-        let result = expand_includes(&main, &HashMap::new(), &config).unwrap();
+        let result =
+            expand_includes(&main, &HashMap::new(), &config, &mut DbFaults::default()).unwrap();
         assert!(result.contains(r#"record(ai, "FROM_ADDPATH")"#));
     }
 
@@ -2595,7 +2796,8 @@ record(ai, "T") { field(LINR, "typeJdegC") }
         writeln!(f, r#"include "c.db""#).unwrap();
 
         let config = DbLoadConfig::default();
-        let result = expand_includes(&main, &HashMap::new(), &config).unwrap();
+        let result =
+            expand_includes(&main, &HashMap::new(), &config, &mut DbFaults::default()).unwrap();
         assert!(result.contains(r#"record(ai, "VIA_PATH")"#));
     }
 
@@ -2728,6 +2930,39 @@ record(ao, "$(P)_noDtyp") {
         }
     }
 
+    /// R5-1: a bare `[...]` array constant is a `json_value`
+    /// (`dbYacc.y:328-337`), so C loads this record. The port had no `[`
+    /// branch in `read_field_value`, consumed `[1` as a bareword and
+    /// stopped at the comma, so the whole file parsed to nothing. Both
+    /// lines are transcribed from base's own test databases —
+    /// `modules/database/test/std/rec/arrayOpTest.db:4` and
+    /// `linkInitTest.db:15`.
+    #[test]
+    fn parse_db_accepts_a_bare_array_constant() {
+        let src = r#"
+record(waveform, "wfrec") {
+    field(NELM, "10")
+    field(FTVL, "LONG")
+    field(INP, [1, 2, 3])
+}
+record(lsi, "longstr4") {
+  field(SIZV, "100")
+  field(INP, ["One","Two","Three","Four"])
+}
+"#;
+        let recs = parse_db(src, &HashMap::new()).expect("base's own test database must load");
+        assert_eq!(recs.len(), 2);
+        let inp = |r: &DbRecordDef| {
+            r.fields
+                .iter()
+                .find(|(n, _)| n == "INP")
+                .map(|(_, v)| v.as_str_lossy().into_owned())
+                .unwrap()
+        };
+        assert_eq!(inp(&recs[0]), "[1, 2, 3]");
+        assert_eq!(inp(&recs[1]), r#"["One","Two","Three","Four"]"#);
+    }
+
     #[test]
     fn parse_db_propagates_name_validation_error() {
         let bad = r#"record(ai, "BAD NAME") { }"#;
@@ -2812,11 +3047,56 @@ record(ao, "$(P)_noDtyp") {
         assert_eq!(recs[0].aliases, vec!["EARLY_ALIAS"]);
     }
 
+    /// I-R3-5: C `dbYacc.y:237-241` puts `record_body: /* empty */`
+    /// FIRST, ahead of `'{' '}'` and `'{' record_field_list '}'`, and
+    /// `tokenRECORD` / `tokenGRECORD` (`:60-61`) share it — so a
+    /// bodyless declaration is an all-defaults record. The port
+    /// demanded `{` and the rejection discarded every record in the
+    /// file.
     #[test]
-    fn parse_db_global_alias_unknown_record_errors() {
-        let src = r#"alias("NOSUCH", "X")"#;
-        let res = parse_db(src, &HashMap::new());
-        assert!(matches!(res, Err(CaError::DbParseError { .. })));
+    fn parse_db_record_without_a_body_is_valid() {
+        let src = r#"
+record(ai, "TEMP")
+record(ai, "PRESS") { field(SCAN, "1 second") }
+grecord(ai, "GTEMP")
+record(ai, "EMPTY") { }
+"#;
+        let recs = parse_db(src, &HashMap::new()).unwrap();
+        let names: Vec<&str> = recs.iter().map(|r| r.name.as_str()).collect();
+        assert_eq!(names, vec!["TEMP", "PRESS", "GTEMP", "EMPTY"]);
+        assert!(recs[0].fields.is_empty(), "bodyless record takes defaults");
+        assert_eq!(recs[1].fields.len(), 1);
+        assert!(recs[2].fields.is_empty(), "grecord shares record_body");
+        assert!(recs[3].fields.is_empty());
+
+        // Boundary: the bodyless record is the last token in the file,
+        // so there is nothing after the head at all.
+        let recs = parse_db(r#"record(ai, "LAST")"#, &HashMap::new()).unwrap();
+        assert_eq!(recs.len(), 1);
+        assert_eq!(recs[0].name, "LAST");
+    }
+
+    /// I-R3-4: C `dbAlias` resolves the target against `savedPdbbase`
+    /// (`dbLexRoutines.c:1508`), the accumulated database, so a target
+    /// this text does not declare is not the parser's to reject — an
+    /// earlier `dbLoadRecords` may own it. The parser hands it out
+    /// unresolved and keeps every record it read; C's own failure path
+    /// (`yyerror(NULL)`, `dbYacc.y:370-383`) also keeps them.
+    #[test]
+    fn parse_db_global_alias_unknown_record_is_deferred_not_rejected() {
+        let src = r#"
+            alias("NOSUCH", "X")
+            record(ai, "KEPT") { field(VAL, "1") }
+        "#;
+        let parsed = parse_db_with_breaktables(src, &HashMap::new()).unwrap();
+        assert_eq!(
+            parsed.unresolved_aliases,
+            vec![("NOSUCH".to_string(), "X".to_string())]
+        );
+        assert_eq!(parsed.records.len(), 1);
+        assert_eq!(parsed.records[0].name, "KEPT");
+        // The records-only wrapper still yields what parsed.
+        assert_eq!(parse_db(src, &HashMap::new()).unwrap().len(), 1);
     }
 
     // L-5 — unquoted field values are restricted to the C bareword set.
@@ -2954,6 +3234,63 @@ record(ai, "REC") {
         assert_eq!(r.text, "$(A,undefined)def$(C,undefined)");
         // B had a default → not undefined; A and C are, in scan order.
         assert_eq!(r.undefined, vec!["A".to_string(), "C".to_string()]);
+    }
+
+    /// C `macCore.c:700-703` — "discard quotes and escapes if level
+    /// is > 0 (i.e. if these aren't the user's quotes and escapes)".
+    /// One case per boundary of that rule, both sides of level 0,
+    /// measured against `macExpandString` from libCom 3.25.1.
+    #[test]
+    fn quotes_and_escapes_survive_only_at_level_zero() {
+        let mut macros = HashMap::new();
+        macros.insert("X".to_string(), "1".to_string());
+        let l0 = |src: &str| expand_macros(src, &macros, MacroExpandOptions::default()).text;
+        let l1 = |raw: &str| {
+            let mut m = macros.clone();
+            m.insert("M".to_string(), raw.to_string());
+            expand_macros("$(M)", &m, MacroExpandOptions::default()).text
+        };
+
+        for (src, at_l0, at_l1) in [
+            (r#""abc""#, r#""abc""#, "abc"),
+            ("'abc'", "'abc'", "abc"),
+            (r"a\b", r"a\b", "ab"),
+            (r"a\\b", r"a\\b", r"a\b"),
+            (r#""$(X)""#, r#""1""#, "1"),
+            ("'$(X)'", "'$(X)'", "$(X)"),
+            ("Beam's energy", "Beam's energy", "Beams energy"),
+            (r#"a"b"#, r#"a"b"#, "ab"),
+            ("$(X)'s", "1's", "1s"),
+        ] {
+            assert_eq!(l0(src), at_l0, "level 0 keeps the user's own: {src}");
+            assert_eq!(l1(src), at_l1, "level 1 discards: {src}");
+        }
+
+        // A default value is translated at `level + 1` too
+        // (`macCore.c:909`), so every quote in it goes — not just a
+        // surrounding pair, which is what the port used to strip.
+        assert_eq!(l0("$(NOSUCH=Beam's energy)"), "Beams energy");
+        assert_eq!(l0(r"$(NOSUCH=a\b)"), "ab");
+        assert_eq!(l0(r#"$(NOSUCH="q")"#), "q");
+    }
+
+    /// The `.db` shape the rule changes: a field default carrying an
+    /// apostrophe. C loads `Beams energy` because the default is
+    /// translated below level 0; the port used to load the apostrophe.
+    #[test]
+    fn a_db_field_default_loses_its_apostrophe_like_c() {
+        let recs = parse_db(
+            "record(ai,\"X:B\") { field(DESC, \"$(BEAM=Beam's energy)\") }",
+            &HashMap::new(),
+        )
+        .expect("record must parse");
+        assert_eq!(recs.len(), 1);
+        let desc = recs[0]
+            .fields
+            .iter()
+            .find(|(name, _)| name == "DESC")
+            .map(|(_, value)| value.to_string());
+        assert_eq!(desc.as_deref(), Some("Beams energy"));
     }
 
     // The default options match `.db` parse semantics: no env fallback,

@@ -271,13 +271,11 @@ pub fn shared_menu_choices(field: &str) -> Option<&'static [&'static str]> {
 /// Returns `(value, rest)`; `None` is C's `S_stdlib_noConversion` /
 /// `S_stdlib_overflow`.
 fn c_strtoul_base0(s: &str) -> Option<(u64, &str)> {
-    fn c_isspace(b: u8) -> bool {
-        matches!(b, b' ' | b'\t' | b'\n' | 0x0b | 0x0c | b'\r')
-    }
+    use crate::runtime::stdlib::c_isspace;
 
     let b = s.as_bytes();
     let mut i = 0;
-    while i < b.len() && c_isspace(b[i]) {
+    while i < b.len() && c_isspace(b[i] as char) {
         i += 1;
     }
     let mut negate = false;
@@ -335,7 +333,7 @@ fn epics_parse_uint16(s: &str) -> Option<u16> {
     let (value, rest) = c_strtoul_base0(s)?;
     if !rest
         .bytes()
-        .all(|b| matches!(b, b' ' | b'\t' | b'\n' | 0x0b | 0x0c | b'\r'))
+        .all(|b| crate::runtime::stdlib::c_isspace(b as char))
     {
         return None; // S_stdlib_extraneous
     }

@@ -151,7 +151,7 @@ pub fn sscanf(input: &[u8], fmt: &[u8]) -> Result<StackValue, CalcError> {
     while i < fmt.len() {
         let c = fmt[i];
         // A whitespace directive matches any run of whitespace, including none.
-        if c.is_ascii_whitespace() {
+        if crate::runtime::stdlib::c_isspace(c as char) {
             p += leading_whitespace(&input[p..]);
             i += 1;
             continue;
@@ -197,7 +197,9 @@ pub fn sscanf(input: &[u8], fmt: &[u8]) -> Result<StackValue, CalcError> {
 }
 
 fn leading_whitespace(s: &[u8]) -> usize {
-    s.iter().take_while(|b| b.is_ascii_whitespace()).count()
+    s.iter()
+        .take_while(|b| crate::runtime::stdlib::c_isspace(**b as char))
+        .count()
 }
 
 /// One conversion specification: `%`, optional `*`, optional width, optional
@@ -291,7 +293,11 @@ impl Spec {
                 *p += leading_whitespace(&input[*p..]);
                 let max = self.width.unwrap_or(usize::MAX);
                 let mut n = 0;
-                while n < max && input.get(*p + n).is_some_and(|c| !c.is_ascii_whitespace()) {
+                while n < max
+                    && input
+                        .get(*p + n)
+                        .is_some_and(|c| !crate::runtime::stdlib::c_isspace(*c as char))
+                {
                     n += 1;
                 }
                 if n == 0 {

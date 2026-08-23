@@ -17,7 +17,9 @@ struct Args {
     version: bool,
 
     /// PV names to query
-    #[arg(required_unless_present_any = ["describe", "version"])]
+    /// Not clap-required: C makes the check itself and returns 1 with
+    /// its own message (pvinfo.cpp:166-170), where a clap-enforced
+    /// argument would exit 2. `-D` keeps its own name-less form.
     pv_names: Vec<String>,
 
     /// Wait time in seconds
@@ -141,7 +143,7 @@ fn target_information() {
 
 #[tokio::main]
 async fn main() {
-    let args = Args::parse();
+    let args: Args = cli::parse_or_exit();
 
     // pvxs `-V` prints version_information and exits before any client
     // setup (tools/info.cpp `case 'V'`).
@@ -158,11 +160,19 @@ async fn main() {
 
     // pvxs `-D` prints host troubleshooting info and exits before any
     // server contact (`tools/info.cpp:62-64`: `target_information();
-    // return 0;`). No PV name is required (enforced by
-    // `required_unless_present`).
+    // return 0;`), so it is the one form that needs no PV name and it is
+    // tested before the name check below.
     if args.describe {
         target_information();
         return;
+    }
+
+    // C's own check, in C's wording (pvinfo.cpp:166-170) — note the
+    // `(s)`, which pvput and pvcall do not have. It returns 1; a
+    // clap-required argument would have exited 2.
+    if args.pv_names.is_empty() {
+        eprintln!("No pv name(s) specified. ('pvinfo -h' for help.)");
+        std::process::exit(1);
     }
 
     // pvxs `pvxinfo -v` prints the effective client config once, before
@@ -306,20 +316,24 @@ mod tests {
     }
 
     /// `-D` is a self-contained host-info dump: pvxs exits before
-    /// requiring a PV name (`tools/info.cpp:62-64`). So `pvinfo-rs -D`
-    /// with no PV must parse, while a bare invocation with no PV and no
-    /// `-D` must still error.
+    /// requiring a PV name (`tools/info.cpp:62-64`), so `pvinfo-rs -D`
+    /// with no PV must parse.
+    ///
+    /// A bare invocation must parse too, and that is the change: C
+    /// checks the missing name itself and returns 1 with its own message
+    /// (pvinfo.cpp:166-170), so leaving it to clap exited 2. This test
+    /// used to assert the clap rejection. The diagnostic and the exit
+    /// code are pinned in `tests/cli_missing_pv_name_exit.rs`, which is
+    /// where the check now lives.
     #[test]
-    fn describe_flag_requires_no_pv_name() {
+    fn a_pv_name_is_not_a_clap_requirement() {
         let d = Args::try_parse_from(["pvinfo-rs", "-D"]).expect("-D needs no PV name");
         assert!(d.describe);
         assert!(d.pv_names.is_empty());
 
-        // Without -D, at least one PV name is still required.
-        assert!(
-            Args::try_parse_from(["pvinfo-rs"]).is_err(),
-            "no PV and no -D must be a usage error"
-        );
+        let bare = Args::try_parse_from(["pvinfo-rs"]).expect("main owns the missing-name check");
+        assert!(!bare.describe);
+        assert!(bare.pv_names.is_empty());
     }
 
     /// `-d` parses into a real flag wired to `install_cli_logging`

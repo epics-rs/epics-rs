@@ -39,7 +39,7 @@ pub struct Strtod {
 /// a hexadecimal significand, or a decimal one.
 pub fn strtod(s: &[u8]) -> Strtod {
     let mut i = 0;
-    while i < s.len() && s[i].is_ascii_whitespace() {
+    while i < s.len() && crate::runtime::stdlib::c_isspace(s[i] as char) {
         i += 1;
     }
     let negative = match s.get(i) {

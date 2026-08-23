@@ -450,32 +450,21 @@ pub fn rec_gbl_check_udf(
 /// `devTimeOfDay.c` `recGblGetTimeStamp(psi)` call, before the
 /// record-level application runs) route through here, so the two never
 /// drift.
-pub fn get_time_stamp(tse: i16, device_time: std::time::SystemTime) -> std::time::SystemTime {
-    match tse {
-        0 => {
-            // generalTime current time (default behavior).
-            // C EPICS recGblGetTimeStamp sets TIME on every process.
-            crate::runtime::general_time::get_current()
-        }
-        -1 => {
-            // C `epicsTimeEventBestTime` (epicsTime.h:103). The C path
-            // calls `epicsTimeGetEvent(-1)` unconditionally, which routes
-            // to `generalTimeGetEventPriority(-1)` — the BestTime ratchet
-            // across current-time providers. Device time is signalled by
-            // TSE=-2 (`epicsTimeEventDeviceTime`), not TSE=-1.
-            crate::runtime::general_time::get_event(-1)
-        }
-        -2 => {
-            // `epicsTimeEventDeviceTime` (epicsTime.h:104). Device support
-            // has already written the time; leave it alone (C recGbl.c:333-343
-            // also skips the assignment).
-            device_time
-        }
-        _ => {
-            // Positive event number — event providers via generalTime.
-            crate::runtime::general_time::get_event(tse as i32)
-        }
+pub fn get_time_stamp(
+    tse: i16,
+    device_time: std::time::SystemTime,
+) -> Option<std::time::SystemTime> {
+    if tse == crate::server::record::EPICS_TIME_EVENT_DEVICE_TIME {
+        // `epicsTimeEventDeviceTime` (epicsTime.h:104). Device support has
+        // already written the time; C recGbl.c:323-341 makes this the only
+        // TSE that does not go through `epicsTimeGetEvent`.
+        return Some(device_time);
     }
+    // Every other TSE is one C call — `epicsTimeGetEvent(&prec->time,
+    // prec->tse)` — including 0 and -1, which it dispatches itself. `None`
+    // is C's non-zero status: `prec->time` keeps its old value and
+    // `recGblGetTimeStampSimm` errlogs (recGbl.c:324-328).
+    crate::runtime::general_time::get_event(tse as i32)
 }
 
 /// C's `getMaxRangeValues` (`recGbl.c:372-419`) — the DBF-type numeric range a

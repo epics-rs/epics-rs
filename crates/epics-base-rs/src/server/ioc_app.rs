@@ -969,7 +969,7 @@ impl IocApplication {
             .max(0.0);
         if link_wait_secs > 0.0 {
             let (connected, total) = db
-                .wait_for_external_links(std::time::Duration::from_secs_f64(link_wait_secs))
+                .wait_for_external_links(crate::runtime::time::duration_from_secs(link_wait_secs))
                 .await;
             if total > 0 {
                 if connected == total {

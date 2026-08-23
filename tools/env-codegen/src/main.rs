@@ -163,10 +163,9 @@ fn generate_env_table(dir: &Path) -> Result<String, String> {
     let mut values: BTreeMap<String, String> = BTreeMap::new();
     for cfg in ["CONFIG_ENV", "CONFIG_SITE_ENV"] {
         let text = read(&dir.join(cfg))?;
-        for (k, v) in parse_config(&text) {
-            values.insert(k, v);
-        }
+        read_release(&text, cfg, &mut values)?;
     }
+    expand_release(&mut values)?;
 
     let mut rows = Vec::with_capacity(names.len());
     for name in &names {
@@ -216,25 +215,182 @@ fn parse_env_defs(text: &str) -> Vec<String> {
     names
 }
 
-/// C `EPICS::Release::readRelease`: skip comment lines, take `NAME = value`,
-/// later files override earlier ones.
-fn parse_config(text: &str) -> Vec<(String, String)> {
-    let mut out = Vec::new();
-    for line in text.lines() {
-        let line = line.trim_end_matches(['\r', '\n']);
-        if line.trim_start().starts_with('#') {
-            continue;
+/// C `$MVAR` (`Release.pm:10`), `[A-Za-z_][A-Za-z_0-9-]*` — the length of the
+/// variable name at the head of `s`, or 0 when there is none. Note the
+/// hyphen, which C admits and a plain "alphanumeric or underscore" test does
+/// not, and the leading character, which C forbids from being a digit.
+fn mvar_len(s: &str) -> usize {
+    let mut chars = s.char_indices();
+    match chars.next() {
+        Some((_, c)) if c.is_ascii_alphabetic() || c == '_' => {}
+        _ => return 0,
+    }
+    for (i, c) in chars {
+        if !(c.is_ascii_alphanumeric() || c == '_' || c == '-') {
+            return i;
         }
-        let Some((lhs, rhs)) = line.split_once('=') else {
-            continue;
-        };
-        let name = lhs.trim();
-        if name.is_empty() || !name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
-            continue;
+    }
+    s.len()
+}
+
+/// C's `m/ (.*) \$\( ($MVAR) \) (.*) /x` (`Release.pm:111`). Both `(.*)` are
+/// greedy, so the match is the RIGHTMOST `$(VAR)` in the string; returns
+/// `(before, name, after)`.
+fn split_macro_ref(s: &str) -> Option<(String, String, String)> {
+    let mut found = None;
+    let mut from = 0;
+    while let Some(i) = s[from..].find("$(") {
+        let start = from + i;
+        let n = mvar_len(&s[start + 2..]);
+        if n > 0 && s[start + 2 + n..].starts_with(')') {
+            found = Some((start, n));
         }
-        out.push((name.to_string(), rhs.trim().to_string()));
+        from = start + 2;
+    }
+    let (start, n) = found?;
+    Some((
+        s[..start].to_string(),
+        s[start + 2..start + 2 + n].to_string(),
+        s[start + 3 + n..].to_string(),
+    ))
+}
+
+/// C `EPICS::Release::expandMacros` (`Release.pm:105-115`): substitute
+/// `$(VAR)` until one is undefined, and leave that one as written. This is
+/// the expansion a `:=` assignment performs on its own value, at the moment
+/// it is read.
+fn expand_macros(s: &str, macros: &BTreeMap<String, String>) -> String {
+    let mut out = s.to_string();
+    while let Some((pre, var, post)) = split_macro_ref(&out) {
+        let Some(val) = macros.get(&var) else { break };
+        out = format!("{pre}{val}{post}");
     }
     out
+}
+
+/// C `EPICS::Release::expandRelease` (`Release.pm:119-137`): substitute
+/// `$(VAR)` throughout every value once all the files have been read. An
+/// undefined variable warns and expands to nothing — C's `$Rmacros->{$var}`
+/// is `undef` there — and a definition that reaches itself is fatal. Any
+/// cycle terminates on that second rule, because going round it substitutes
+/// the variable being expanded.
+fn expand_release(macros: &mut BTreeMap<String, String>) -> Result<(), String> {
+    for name in macros.keys().cloned().collect::<Vec<_>>() {
+        let mut val = macros[&name].clone();
+        while let Some((pre, var, post)) = split_macro_ref(&val) {
+            if var == name {
+                return Err(format!("Circular definition of variable {var}"));
+            }
+            let sub = match macros.get(&var) {
+                Some(v) => v.clone(),
+                None => {
+                    eprintln!("env-codegen: Undefined variable $({var}) used");
+                    String::new()
+                }
+            };
+            val = format!("{pre}{sub}{post}");
+            macros.insert(name.clone(), val.clone());
+        }
+    }
+    Ok(())
+}
+
+/// C `EPICS::Release::readRelease` (`Release.pm:44-99`), applied to `macros`
+/// so that a later file overrides an earlier one exactly as C's shared
+/// `%values` hash does.
+///
+/// The per-line pipeline is C's, in C's order: strip a trailing CR, strip
+/// leading whitespace, then strip everything from the first `#` to the end of
+/// the line, then strip trailing whitespace. That comment rule is why
+/// `EPICS_CA_ADDR_LIST = 10.0.0.1  # site gateway` is one address and not
+/// three, and it is also what empties a whole-line comment, so there is no
+/// separate rule for those.
+///
+/// An assignment is `NAME`, then `=`, `?=` or `:=`, then the value: `?=`
+/// keeps an existing definition, `:=` expands `$(VAR)` in its value there and
+/// then. A line matching none of C's three forms is an error here, where C
+/// ignores it: these two files exist to be site-edited, and a setting that
+/// vanishes without a word is the failure this refuses to have.
+fn read_release(
+    text: &str,
+    file: &str,
+    macros: &mut BTreeMap<String, String>,
+) -> Result<(), String> {
+    for (n, raw) in text.lines().enumerate() {
+        let line = raw.trim_end_matches('\r').trim_start();
+        let line = match line.find('#') {
+            Some(i) => &line[..i],
+            None => line,
+        }
+        .trim_end();
+        if line.is_empty() {
+            continue;
+        }
+
+        // `undefine <var>` (`Release.pm:66-72`). C requires whitespace and a
+        // name after the keyword; without both the line falls through to the
+        // matchers below, so this does too.
+        if let Some(rest) = line.strip_prefix("undefine")
+            && rest.starts_with(char::is_whitespace)
+        {
+            let rest = rest.trim_start();
+            let len = mvar_len(rest);
+            if len > 0 {
+                macros.remove(&rest[..len]);
+                continue;
+            }
+        }
+
+        // `include <path>` / `-include <path>` (`Release.pm:74-83`). C
+        // resolves the path against the caller's working directory; this
+        // generator reads a vendored `envconfig/` copy from the workspace
+        // root, so there is no directory it could resolve one against without
+        // inventing a rule C does not state. Refuse rather than guess — and
+        // rather than drop it in silence.
+        for op in ["-include", "include"] {
+            if let Some(rest) = line.strip_prefix(op)
+                && rest.starts_with(char::is_whitespace)
+            {
+                return Err(format!(
+                    "{file}:{}: `{op}` is not supported by the offline generator; \
+                     inline the file into the vendored envconfig/ copy",
+                    n + 1
+                ));
+            }
+        }
+
+        // `<var> = <value>` and the `?=` / `:=` variants (`Release.pm:85-98`).
+        let (name, rest) = line.split_at(mvar_len(line));
+        let rest = rest.trim_start();
+        let Some((op, value)) = ["?=", ":=", "="]
+            .into_iter()
+            .find_map(|op| rest.strip_prefix(op).map(|v| (op, v)))
+        else {
+            return Err(format!(
+                "{file}:{}: not a comment, an `undefine`, or a `NAME =/?=/:= value` \
+                 assignment: `{line}`",
+                n + 1
+            ));
+        };
+
+        // C folds every INSTALL_LOCATION* spelling onto TOP (`Release.pm:88`).
+        let name = if name.starts_with("INSTALL_LOCATION") {
+            "TOP"
+        } else {
+            name
+        };
+        if op == "?=" && macros.contains_key(name) {
+            continue;
+        }
+        let value = value.trim_start();
+        let value = if op == ":=" {
+            expand_macros(value, macros)
+        } else {
+            value.to_string()
+        };
+        macros.insert(name.to_string(), value);
+    }
+    Ok(())
 }
 
 /// The C preprocessor's view of the value `bldEnvData.pl` pastes into
@@ -445,8 +601,14 @@ fn parse_base_version(text: &str) -> Result<BaseVersion, String> {
         num("EPICS_MODIFICATION").ok_or("CONFIG_BASE_VERSION: no EPICS_MODIFICATION")?;
     let patch_level =
         num("EPICS_PATCH_LEVEL").ok_or("CONFIG_BASE_VERSION: no EPICS_PATCH_LEVEL")?;
-    let snapshot = assignment(text, "EPICS_DEV_SNAPSHOT")
-        .ok_or("CONFIG_BASE_VERSION: no EPICS_DEV_SNAPSHOT")?;
+    // C captures `([-\w]*)` (`makeEpicsVersion.pl:43`), i.e. the leading run
+    // of word characters and hyphens — so `-DEV # bumped` is `-DEV`, and the
+    // suffix never carries a trailing comment into `epicsVersion.h`.
+    let snapshot: String = assignment(text, "EPICS_DEV_SNAPSHOT")
+        .ok_or("CONFIG_BASE_VERSION: no EPICS_DEV_SNAPSHOT")?
+        .chars()
+        .take_while(|c| c.is_ascii_alphanumeric() || *c == '_' || *c == '-')
+        .collect();
     // C's Makefile passes this in from CONFIG_SITE (`-v`); no site version is
     // vendored here, and the reference build likewise has it empty.
     let site = assignment(text, "EPICS_SITE_VERSION").unwrap_or_default();
@@ -469,6 +631,11 @@ fn parse_base_version(text: &str) -> Result<BaseVersion, String> {
 
 /// The right-hand side of the first `^KEY = value` line, comments skipped —
 /// the Perl `m/^KEY\s*=\s*.../` scan, which never sees a `#` line.
+/// C `makeEpicsVersion.pl:36-43` — a different reader from
+/// [`read_release`]: it skips whole-line comments only and matches
+/// `^KEY\s*=` per key, and each key's own capture group decides where its
+/// value stops, so the trimming that belongs to a value happens at the call
+/// site rather than here.
 fn assignment(text: &str, key: &str) -> Option<String> {
     text.lines()
         .filter(|l| !l.trim_start().starts_with('#'))
@@ -644,5 +811,92 @@ mod tests {
         assert_eq!(super::expand_value("ANSI_ESC_RED").unwrap(), "\x1b[31;1m");
         // An unknown macro is a hard error, not a silently pasted literal.
         assert!(super::expand_value("ANSI_TEAL(\"x\")").is_err());
+    }
+
+    fn read(text: &str) -> std::collections::BTreeMap<String, String> {
+        let mut m = std::collections::BTreeMap::new();
+        super::read_release(text, "CONFIG_SITE_ENV", &mut m).expect("parses");
+        m
+    }
+
+    /// C strips `#` to end-of-line from ANYWHERE in the line
+    /// (`Release.pm:63`), not just from column zero. Keeping the comment puts
+    /// `#`, `site` and `gateway` into the CA address list every client and
+    /// server in the workspace then tries to resolve.
+    #[test]
+    fn a_trailing_comment_is_not_part_of_the_value() {
+        let m = read("EPICS_CA_ADDR_LIST = 10.0.0.1  # site gateway\n");
+        assert_eq!(m["EPICS_CA_ADDR_LIST"], "10.0.0.1");
+        // The whole-line case falls out of the same rule.
+        assert!(read("# EPICS_TZ = \"JST-9\"\n").is_empty());
+    }
+
+    /// C's assignment operator is `([?:]?=)` (`Release.pm:87`). A site that
+    /// writes the `?=` spelling — the one that means "unless already set" —
+    /// had its whole line dropped, so the parameter silently kept
+    /// `CONFIG_ENV`'s value with nothing said.
+    #[test]
+    fn conditional_and_immediate_assignment_are_both_accepted() {
+        // `?=` defines when unset...
+        let m = read("EPICS_CA_ADDR_LIST ?= 10.0.0.1\n");
+        assert_eq!(m["EPICS_CA_ADDR_LIST"], "10.0.0.1");
+        // ...and keeps the earlier definition when set (Release.pm:91).
+        let m = read("EPICS_CA_ADDR_LIST = 10.0.0.1\nEPICS_CA_ADDR_LIST ?= 10.0.0.2\n");
+        assert_eq!(m["EPICS_CA_ADDR_LIST"], "10.0.0.1");
+        // `:=` expands its value at the point of assignment (Release.pm:95).
+        let m = read("HOST = 10.0.0.1\nEPICS_CA_ADDR_LIST := $(HOST)\nHOST = 10.0.0.9\n");
+        assert_eq!(m["EPICS_CA_ADDR_LIST"], "10.0.0.1");
+    }
+
+    /// `expandRelease` (`Release.pm:119-137`) runs over the finished table, so
+    /// a `=` value picks up a definition that appears after it.
+    #[test]
+    fn dollar_paren_references_expand_after_every_file_is_read() {
+        let mut m = read("EPICS_CA_ADDR_LIST = $(HOST)\nHOST = 10.0.0.9\n");
+        super::expand_release(&mut m).expect("expands");
+        assert_eq!(m["EPICS_CA_ADDR_LIST"], "10.0.0.9");
+
+        // A definition that reaches itself is fatal in C, and so a cycle
+        // terminates rather than spinning.
+        let mut cycle = read("A = $(B)\nB = $(A)\n");
+        let err = super::expand_release(&mut cycle).expect_err("cycle must be refused");
+        assert!(err.contains("Circular definition"), "{err}");
+    }
+
+    /// The silent skip is the worst half of this: a site operator editing the
+    /// file that exists to be edited must not get silence.
+    #[test]
+    fn a_line_that_matches_none_of_cs_forms_is_an_error() {
+        let mut m = std::collections::BTreeMap::new();
+        let err = super::read_release("EPICS_CA_ADDR_LIST 10.0.0.1\n", "CONFIG_SITE_ENV", &mut m)
+            .expect_err("an unparseable line must be reported");
+        assert!(err.contains("CONFIG_SITE_ENV:1"), "{err}");
+        assert!(err.contains("EPICS_CA_ADDR_LIST 10.0.0.1"), "{err}");
+    }
+
+    /// `undefine` deletes the macro (`Release.pm:66-72`); C's `$MVAR` admits a
+    /// hyphen and forbids a leading digit (`Release.pm:10`).
+    #[test]
+    fn undefine_and_the_c_variable_charset() {
+        let m = read("EPICS_TZ = \"JST-9\"\nundefine EPICS_TZ\n");
+        assert!(!m.contains_key("EPICS_TZ"));
+        let m = read("MY-VAR = 1\n");
+        assert_eq!(m["MY-VAR"], "1");
+        let mut bad = std::collections::BTreeMap::new();
+        assert!(super::read_release("9VAR = 1\n", "CONFIG_ENV", &mut bad).is_err());
+    }
+
+    /// C's `EPICS_DEV_SNAPSHOT` capture is `([-\w]*)`
+    /// (`makeEpicsVersion.pl:43`), which stops at the space before a comment.
+    /// Carrying it through would put `# bumped` inside the version string
+    /// every tool banner prints.
+    #[test]
+    fn dev_snapshot_stops_where_cs_capture_stops() {
+        let v = super::parse_base_version(
+            "EPICS_VERSION = 7\nEPICS_REVISION = 0\nEPICS_MODIFICATION = 10\n\
+             EPICS_PATCH_LEVEL = 1\nEPICS_DEV_SNAPSHOT=-DEV # bumped after the release\n",
+        )
+        .expect("parses");
+        assert_eq!(v.full(), "7.0.10.1-DEV");
     }
 }

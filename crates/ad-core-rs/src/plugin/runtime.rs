@@ -2137,7 +2137,9 @@ fn plugin_data_loop<P: NDPluginProcess>(
                                     } else {
                                         sort_flush_active = guard.sort_time > 0.0;
                                         if sort_flush_active {
-                                            let dur = std::time::Duration::from_secs_f64(guard.sort_time);
+                                            let dur = epics_libcom_rs::runtime::time::duration_from_secs(
+                                                guard.sort_time,
+                                            );
                                             sort_flush_interval = tokio::time::interval(dur);
                                         }
                                         None
@@ -2154,7 +2156,7 @@ fn plugin_data_loop<P: NDPluginProcess>(
                                 guard.sort_time = t;
                                 if guard.sort_mode != 0 && t > 0.0 {
                                     sort_flush_active = true;
-                                    let dur = std::time::Duration::from_secs_f64(t);
+                                    let dur = epics_libcom_rs::runtime::time::duration_from_secs(t);
                                     sort_flush_interval = tokio::time::interval(dur);
                                 } else {
                                     sort_flush_active = false;

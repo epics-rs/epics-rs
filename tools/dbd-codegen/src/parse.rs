@@ -431,7 +431,29 @@ fn parse_field(p: &mut Parser) -> Result<Field, String> {
                     "prompt" => f.prompt = Some(arg),
                     "promptgroup" => f.promptgroup = Some(arg),
                     "special" => f.special = Some(arg),
-                    "pp" => f.pp = arg.eq_ignore_ascii_case("TRUE"),
+                    // C `dbRecordtypeFieldItem` (`dbLexRoutines.c:637-645`):
+                    // YES or TRUE sets `process_passive`, NO or FALSE clears
+                    // it, and any other spelling is
+                    // `yyerror("Invalid 'pp' value, ...")`, which sets
+                    // `yyFailed` and so fails the whole `.dbd` load
+                    // (`dbYacc.y:370-397`). The tests are `strcmp`, so they are
+                    // case-sensitive: `pp(true)` is a load error in C, not a
+                    // true. Defaulting an unrecognised value to `false` would
+                    // give the flag two meanings — "the file said NO" and "we
+                    // did not understand the file" — and only the first is a
+                    // thing C can produce.
+                    "pp" => {
+                        f.pp = match arg.as_str() {
+                            "YES" | "TRUE" => true,
+                            "NO" | "FALSE" => false,
+                            other => {
+                                return Err(format!(
+                                    "{}: Invalid 'pp' value '{other}', must be YES/NO/TRUE/FALSE",
+                                    f.name
+                                ));
+                            }
+                        }
+                    }
                     "asl" => f.asl = Some(arg),
                     "size" => {
                         f.size = Some(
@@ -447,7 +469,13 @@ fn parse_field(p: &mut Parser) -> Result<Field, String> {
                                 .map_err(|_| format!("{}: bad interest({arg})", f.name))?,
                         )
                     }
-                    "prop" => f.prop = arg.eq_ignore_ascii_case("YES"),
+                    // C (`dbLexRoutines.c:677-682`) is a bare
+                    // `strcmp(value,"YES")`: exactly that spelling sets
+                    // `prop`, every other one — `yes` included — leaves it 0,
+                    // and there is no error arm. A field that advertises
+                    // `DBE_PROPERTY` where C does not fires property monitors
+                    // no C IOC sends.
+                    "prop" => f.prop = arg == "YES",
                     "base" => f.base = Some(arg),
                     "extra" => f.extra = Some(arg),
                     other => return Err(format!("{}: unknown field attribute {other}", f.name)),
@@ -536,6 +564,64 @@ recordtype(demo) {
         assert_eq!(nm.base.as_deref(), Some("HEX"));
         assert_eq!(nm.extra.as_deref(), Some("void *p"));
         assert!(!nm.pp);
+    }
+
+    /// C's `pp` table is `YES|TRUE` -> TRUE, `NO|FALSE` -> FALSE, anything
+    /// else -> `yyerror` (`dbLexRoutines.c:637-645`). All four spellings are
+    /// C's, and `pp(YES)` mapping to `false` here would leave a `dbPutField`
+    /// on that field failing to process a record a C IOC processes.
+    #[test]
+    fn pp_takes_every_spelling_c_accepts() {
+        for (spelling, want) in [
+            ("YES", true),
+            ("TRUE", true),
+            ("NO", false),
+            ("FALSE", false),
+        ] {
+            let src = format!("recordtype(demo) {{ field(FOO,DBF_LONG) {{ pp({spelling}) }} }}");
+            let dbd = parse_str(&src, "demo.dbd", &[])
+                .unwrap_or_else(|e| panic!("pp({spelling}) must parse: {e}"));
+            assert_eq!(
+                dbd.records[0].fields[0].pp, want,
+                "pp({spelling}) must map to {want}"
+            );
+        }
+    }
+
+    /// An unrecognised `pp` fails the whole load in C — `yyerror` sets
+    /// `yyFailed` and `pvt_yy_parse` returns -1 (`dbYacc.y:370-397`). Silently
+    /// emitting `pp: false` would ship a record type whose PP links are dead
+    /// and say nothing. `strcmp` is case-sensitive, so `pp(true)` is one of
+    /// the values C rejects.
+    #[test]
+    fn an_unrecognised_pp_value_fails_the_load_as_c_does() {
+        for spelling in ["Ture", "true", "Yes", ""] {
+            let src = format!("recordtype(demo) {{ field(FOO,DBF_LONG) {{ pp({spelling}) }} }}");
+            let err = parse_str(&src, "demo.dbd", &[])
+                .err()
+                .unwrap_or_else(|| panic!("pp({spelling}) must be rejected"));
+            assert!(
+                err.contains("Invalid 'pp' value"),
+                "pp({spelling}) must report C's message, got: {err}"
+            );
+        }
+    }
+
+    /// C's `prop` is a bare `strcmp(value,"YES")` with no error arm
+    /// (`dbLexRoutines.c:677-682`), so `prop(yes)` leaves it 0. Accepting the
+    /// lowercase spelling here would set `DBE_PROPERTY` on a field C does not,
+    /// and the record would fire property monitors no C IOC sends.
+    #[test]
+    fn prop_is_the_exact_case_sensitive_yes_c_tests_for() {
+        for (spelling, want) in [("YES", true), ("yes", false), ("Yes", false), ("NO", false)] {
+            let src = format!("recordtype(demo) {{ field(FOO,DBF_LONG) {{ prop({spelling}) }} }}");
+            let dbd = parse_str(&src, "demo.dbd", &[])
+                .unwrap_or_else(|e| panic!("prop({spelling}) must parse: {e}"));
+            assert_eq!(
+                dbd.records[0].fields[0].prop, want,
+                "prop({spelling}) must map to {want}"
+            );
+        }
     }
 
     #[test]

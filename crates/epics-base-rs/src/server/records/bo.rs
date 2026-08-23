@@ -257,7 +257,7 @@ impl Record for BoRecord {
         let mut actions = Vec::new();
         if self.val == 1 && self.high > 0.0 {
             actions.push(ProcessAction::DelayedCallbackAfter(
-                std::time::Duration::from_secs_f64(self.high),
+                crate::runtime::time::duration_from_secs(self.high),
             ));
         }
 
@@ -287,15 +287,15 @@ impl Record for BoRecord {
             return DelayedCallbackOutcome::Reprocess;
         }
         // Mid-async-cycle: C changes nothing and waits another full HIGH.
-        // A HIGH past `Duration`'s range (`caput REC.HIGH 1e300`, which C
-        // ACCEPTS — HIGH is DBF_DOUBLE and `callbackRequestDelayed` just
-        // schedules past any run's lifetime) has no representable deadline, so
-        // the one-shot is dropped rather than re-armed: same observable, and
-        // `from_secs_f64` would panic on exactly the values C takes. Same rule
-        // as `HistogramRecord::watchdog_interval`.
+        // The conversion is `runtime::time::duration_from_secs`, the same one
+        // `process()` arms with, so `self.high` cannot mean two deadlines in
+        // two adjacent functions: a HIGH past `Duration`'s range (`caput
+        // REC.HIGH 1e300`, which C ACCEPTS) becomes `Duration::MAX`, C's
+        // queued callback that no comparison ever reaches. `Drop` is then left
+        // with its one meaning — the one-shot is no longer live — instead of
+        // also standing for "the delay would not fit".
         match (self.val == 1 && self.high > 0.0)
-            .then(|| std::time::Duration::try_from_secs_f64(self.high).ok())
-            .flatten()
+            .then(|| crate::runtime::time::duration_from_secs(self.high))
         {
             Some(delay) => DelayedCallbackOutcome::Rearm(delay),
             None => DelayedCallbackOutcome::Drop,

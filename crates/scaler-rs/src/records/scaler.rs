@@ -348,7 +348,9 @@ impl ScalerRecord {
                 self.rat1
             };
             if rate > 0.1 {
-                return Some(std::time::Duration::from_secs_f64(1.0 / rate as f64));
+                return Some(epics_base_rs::runtime::time::duration_from_secs(
+                    1.0 / rate as f64,
+                ));
             }
         }
         None
@@ -554,7 +556,7 @@ impl ScalerRecord {
         if self.rat1 > 0.1 {
             let refresh = self.arm_reentry(
                 ReentryKind::DisplayRefresh,
-                std::time::Duration::from_secs_f64(1.0 / self.rat1 as f64),
+                epics_base_rs::runtime::time::duration_from_secs(1.0 / self.rat1 as f64),
             );
             actions.push(refresh);
         }
@@ -869,7 +871,7 @@ impl Record for ScalerRecord {
                 self.autocount_delay = dly_sec;
                 let auto = self.arm_reentry(
                     ReentryKind::Process,
-                    std::time::Duration::from_secs_f64(dly_sec),
+                    epics_base_rs::runtime::time::duration_from_secs(dly_sec),
                 );
                 actions.push(auto);
                 return Ok(ProcessOutcome::complete_with(actions));
@@ -888,7 +890,7 @@ impl Record for ScalerRecord {
                     let remaining = self.autocount_delay - elapsed;
                     let auto = self.arm_reentry(
                         ReentryKind::Process,
-                        std::time::Duration::from_secs_f64(remaining),
+                        epics_base_rs::runtime::time::duration_from_secs(remaining),
                     );
                     actions.push(auto);
                     return Ok(ProcessOutcome::complete_with(actions));
@@ -1014,7 +1016,7 @@ impl Record for ScalerRecord {
                     });
                     let start = self.arm_reentry(
                         ReentryKind::Process,
-                        std::time::Duration::from_secs_f64(secs),
+                        epics_base_rs::runtime::time::duration_from_secs(secs),
                     );
                     self.special_actions.push(start);
                 }

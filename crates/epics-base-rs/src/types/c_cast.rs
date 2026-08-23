@@ -1,4 +1,4 @@
-//! C's `double -> integer` cast, saturated — the single owner of the conversion.
+//! C's narrowing `double -> T` conversions — the single owner of each.
 //!
 //! `dbConvert.c` converts a `DBF_DOUBLE` value into an integer field with a
 //! bare C cast — the PUT/GET macros are literally `*pdst = (typeb) *psrc`
@@ -50,6 +50,16 @@
 //! This module remains the SINGLE OWNER of the cast. Every `double -> integer`
 //! conversion that models a `dbConvert` cast calls it; no such site may use a
 //! bare `as`, so that the policy above is changeable in exactly one place.
+//!
+//! # `double -> float` is the opposite case
+//!
+//! [`f64_to_f32`] is not part of the story above. C narrows a `double` to a
+//! `DBF_FLOAT` through a named helper, `epicsConvertDoubleToFloat`, so the
+//! behaviour is specified rather than undefined and the port reproduces it
+//! exactly — Tier 1, because the clamped magnitude is what goes on the wire in
+//! a `DBR_FLOAT` reply. It shares this module only because the ownership rule
+//! is the same: a field, link, or wire conversion may not narrow with a bare
+//! `as f32`.
 
 /// C `(epicsInt32) d`, saturated: clamps to `i32`'s range, NaN -> 0.
 pub fn f64_to_i32(v: f64) -> i32 {
@@ -92,6 +102,45 @@ pub fn f64_to_u32(v: f64) -> u32 {
 /// NaN -> 0.
 pub fn f64_to_u64(v: f64) -> u64 {
     v as u64
+}
+
+/// C `epicsConvertDoubleToFloat` (`epicsConvert.c:19-34`), verbatim.
+///
+/// ```c
+/// if (value == 0 || !finite(value))  return (float) value;
+/// abs = fabs(value);
+/// if (abs >= FLT_MAX)  return (value > 0) ?  FLT_MAX : -FLT_MAX;
+/// if (abs <= FLT_MIN)  return (value > 0) ?  FLT_MIN : -FLT_MIN;
+/// return (float) value;
+/// ```
+///
+/// Not saturation: zero and non-finite pass straight through, so a NaN stays a
+/// NaN and a genuine infinity stays an infinity — only a finite magnitude is
+/// clamped. Both bounds are inclusive, and the lower one clamps to `FLT_MIN`,
+/// the smallest NORMAL float, keeping the sign: a tiny non-zero double
+/// (`1e-300`) reaches a `DBF_FLOAT` field as `1.17549e-38`, never as `0.0`.
+///
+/// Every C `double -> float` conversion goes through this helper —
+/// `getDoubleFloat`/`putDoubleFloat` (`dbConvert.c:815,822,1646,1651`),
+/// `cvt_d_f` (`dbFastLinkConv.c:1426`), and the `DBR_GR_FLOAT`/`DBR_CTRL_FLOAT`
+/// limit fill (`db_access.c:480-485,629-636`) — which is why the port has one
+/// owner here rather than a clamp at each site.
+pub fn f64_to_f32(v: f64) -> f32 {
+    if v == 0.0 || !v.is_finite() {
+        return v as f32;
+    }
+    let abs = v.abs();
+    if abs >= f32::MAX as f64 {
+        return if v > 0.0 { f32::MAX } else { -f32::MAX };
+    }
+    if abs <= f32::MIN_POSITIVE as f64 {
+        return if v > 0.0 {
+            f32::MIN_POSITIVE
+        } else {
+            -f32::MIN_POSITIVE
+        };
+    }
+    v as f32
 }
 
 #[cfg(test)]

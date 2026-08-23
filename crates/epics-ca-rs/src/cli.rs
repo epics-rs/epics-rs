@@ -367,7 +367,12 @@ pub fn format_time(ts: WallTime) -> String {
 /// outside 0..=38 (C `INVALID_DB_REQ`).
 pub fn dbr_value_field_type(dbr_type: u16) -> Option<DbFieldType> {
     match dbr_type {
-        0..=34 => DbFieldType::from_u16(dbr_type % 7).ok(),
+        // The carrier a *wire* payload of this code arrives in, so the
+        // zeroed placeholder has the same shape a real reply would
+        // (`DbFieldType::wire_carrier`: `DBR_CHAR` is `epicsUInt8`).
+        0..=34 => DbFieldType::from_u16(dbr_type % 7)
+            .ok()
+            .map(DbFieldType::wire_carrier),
         // DBR_PUT_ACKT / DBR_PUT_ACKS: a bare `dbr_put_ackt_t` (u16).
         35 | 36 => Some(DbFieldType::UShort),
         // DBR_STSACK_STRING / DBR_CLASS_NAME: a `dbr_string_t`.
@@ -617,7 +622,7 @@ pub fn format_value(
     // DIRECTLY and is present on the specifiedDbr block too (`caget.c:318`),
     // so it does NOT follow `count_prefix`, and it returns before C's count
     // printf — a long-string never carries the count.
-    if let EpicsValue::CharArray(arr) = v
+    if let EpicsValue::CharArray(arr) | EpicsValue::UCharArray(arr) = v
         && fmt.char_array_as_string
         && (req_elems || arr.len() > 1)
     {
@@ -699,9 +704,14 @@ fn render_elements(v: &EpicsValue, fmt: &ValueFormat, enum_strings: Option<&[PvS
         // plain integer formatter is correct — no wide-unsigned path needed.
         EpicsValue::UShort(n) => format_int_i64(*n as i64, fmt.int_style),
         EpicsValue::ULong(n) => format_int_i64(*n as i64, fmt.int_style),
-        EpicsValue::Char(n) => format_char((*n as i8) as i64),
-        // epicsUInt8 formats unsigned (0xFF -> 255), unlike the signed `Char`.
-        EpicsValue::UChar(n) => format_char(*n as i64),
+        // C `val2str` has ONE `case DBR_CHAR:` and it narrows through a
+        // plain `char ch` before `sprintf("%d")` (`tool_lib.c:114`,
+        // `:160-161`), so a byte the wire called 200 prints -56. Both byte
+        // carriers reach this formatter from the same DBR_CHAR wire code —
+        // `DBF_UCHAR` has no wire code of its own — so both take that one
+        // case. This is where the signedness lives now that the carrier
+        // itself is the wire's unsigned one.
+        EpicsValue::Char(n) | EpicsValue::UChar(n) => format_char((*n as i8) as i64),
         EpicsValue::Enum(idx) => format_enum(*idx as i64, fmt, enum_strings),
         // Transient NTEnum carrier never reaches CA serialization (coerced in
         // base at the link-write boundary); format its index like a DBF_ENUM.
@@ -740,11 +750,7 @@ fn render_elements(v: &EpicsValue, fmt: &ValueFormat, enum_strings: Option<&[PvS
             arr.len(),
             fmt,
         ),
-        // DBF_UCHAR[] is numeric unsigned-byte image data: render each element
-        // unsigned (0xFF -> 255), not the signed-i8 / long-string CharArray path.
-        EpicsValue::UCharArray(arr) => {
-            join_elements(arr.iter().map(|&b| format_char(b as i64)), arr.len(), fmt)
-        }
+
         EpicsValue::EnumArray(arr) => join_elements(
             arr.iter()
                 .map(|&idx| format_enum(idx as i64, fmt, enum_strings)),
@@ -760,8 +766,9 @@ fn render_elements(v: &EpicsValue, fmt: &ValueFormat, enum_strings: Option<&[PvS
             join_elements(arr.iter().map(|&x| format_float(x, fmt)), arr.len(), fmt)
         }
         // The `-S` long-string form is handled by `format_value` before this
-        // is reached; here a CHAR array is always numeric (signed i8).
-        EpicsValue::CharArray(arr) => join_elements(
+        // is reached; here a byte array is always numeric, narrowed by C's
+        // single `val2str` DBR_CHAR case exactly like the scalar arm above.
+        EpicsValue::CharArray(arr) | EpicsValue::UCharArray(arr) => join_elements(
             arr.iter().map(|&b| format_char((b as i8) as i64)),
             arr.len(),
             fmt,
@@ -1407,10 +1414,14 @@ mod tests {
                 "-1",
                 "DBR_CHAR is %d, never sprint_long ({style:?})"
             );
+            // The wire carrier of a CHAR channel. C's `val2str` narrows it
+            // through `char ch` (`tool_lib.c:114`, `:160-161`) before
+            // `%d`, so it renders identically to the signed carrier — the
+            // formatter, not the carrier, is where the sign is applied.
             assert_eq!(
                 fv(&EpicsValue::UChar(255), &fmt, None, false),
-                "255",
-                "the unsigned CHAR carrier is %d too ({style:?})"
+                "-1",
+                "the wire CHAR carrier takes the same val2str narrowing ({style:?})"
             );
             assert_eq!(
                 fv(&EpicsValue::CharArray(vec![255, 1]), &fmt, None, false),
@@ -1419,8 +1430,8 @@ mod tests {
             );
             assert_eq!(
                 fv(&EpicsValue::UCharArray(vec![255, 1]), &fmt, None, false),
-                "2 255 1",
-                "an unsigned CHAR array likewise ({style:?})"
+                "2 -1 1",
+                "a wire CHAR array likewise ({style:?})"
             );
         }
         // Negative control: DBR_INT / DBR_LONG DO carry the base — the

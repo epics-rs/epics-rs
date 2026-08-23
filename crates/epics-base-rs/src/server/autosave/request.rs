@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use super::error::{AutosaveError, AutosaveResult};
@@ -177,13 +177,21 @@ fn parse_request_inner(
             // Expand macros in file path
             let expanded_path = macros.expand(&file_path, &source_str, line_no)?;
 
-            // Merge inline macros — expand through parent context first so that
-            // `file "foo.req", P=$(P)` resolves $(P) to its current value.
+            // Merge inline macros in macLib's order: split the RAW text into
+            // definitions, THEN expand each value through the parent context
+            // (C `macParseDefns` keeps values verbatim, `macUtil.c:74-196`,
+            // and `macGetValue` expands them on lookup). Expanding the whole
+            // string first let a comma that arrived from INSIDE a value act
+            // as a separator: with a parent `SUB=a,b`, `file "sub.req",
+            // P=$(P), S=$(SUB)` became `P=IOC:,S=a,b` and then `S=a`, with
+            // the bare `b` dropped and no message.
             let child_macros = if inline_macros.is_empty() {
                 macros.clone()
             } else {
-                let expanded_macros = macros.expand(&inline_macros, &source_str, line_no)?;
-                let overrides = MacroContext::parse_inline(&expanded_macros);
+                let mut overrides = HashMap::new();
+                for (name, raw) in MacroContext::parse_inline(&inline_macros) {
+                    overrides.insert(name, macros.expand(&raw, &source_str, line_no)?);
+                }
                 macros.with_overrides(&overrides)
             };
 

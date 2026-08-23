@@ -36,7 +36,7 @@ async fn test_write_read_roundtrip() {
 
     write_save_file(&path, &entries).await.unwrap();
 
-    let loaded = read_save_file(&path).await.unwrap().unwrap();
+    let loaded = read_save_file(&path).await.unwrap().unwrap().entries;
     assert_eq!(loaded.len(), 4);
     assert_eq!(loaded[0].pv_name, "TEMP");
     assert!(loaded[0].connected);
@@ -89,7 +89,7 @@ async fn test_c_autosave_array_format() {
         .await
         .unwrap();
 
-    let entries = read_save_file(&path).await.unwrap().unwrap();
+    let entries = read_save_file(&path).await.unwrap().unwrap().entries;
     assert_eq!(entries.len(), 1);
     assert_eq!(entries[0].pv_name, "ARRAY_PV");
     assert_eq!(entries[0].value, "[1.0,2.0,3.0]");
@@ -109,7 +109,7 @@ async fn test_string_with_special_chars() {
     }];
 
     write_save_file(&path, &entries).await.unwrap();
-    let loaded = read_save_file(&path).await.unwrap().unwrap();
+    let loaded = read_save_file(&path).await.unwrap().unwrap().entries;
 
     let parsed = parse_save_value(&loaded[0].value, &EpicsValue::String(PvString::new())).unwrap();
     match parsed {
@@ -129,7 +129,7 @@ async fn test_windows_line_endings() {
         .await
         .unwrap();
 
-    let entries = read_save_file(&path).await.unwrap().unwrap();
+    let entries = read_save_file(&path).await.unwrap().unwrap().entries;
     assert_eq!(entries.len(), 2);
     assert_eq!(entries[0].pv_name, "PV1");
     assert_eq!(entries[0].value, "42");
@@ -145,7 +145,7 @@ async fn test_multiple_header_lines() {
         .await
         .unwrap();
 
-    let entries = read_save_file(&path).await.unwrap().unwrap();
+    let entries = read_save_file(&path).await.unwrap().unwrap().entries;
     assert_eq!(entries.len(), 1);
     assert_eq!(entries[0].pv_name, "PV1");
 }
@@ -169,7 +169,7 @@ async fn test_disconnected_pv_roundtrip() {
     ];
 
     write_save_file(&path, &entries).await.unwrap();
-    let loaded = read_save_file(&path).await.unwrap().unwrap();
+    let loaded = read_save_file(&path).await.unwrap().unwrap().entries;
     assert_eq!(loaded.len(), 2);
     assert!(loaded[0].connected);
     assert!(!loaded[1].connected);

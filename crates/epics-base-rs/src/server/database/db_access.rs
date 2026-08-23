@@ -504,17 +504,15 @@ impl Drop for DbSubscription {
     fn drop(&mut self) {
         let record = self.record.clone();
         let sid = self.sid;
-        // Drop runs in sync context but we need an async write lock.
-        // Spawn a fire-and-forget cleanup task. If no tokio runtime is
-        // current (e.g., subscription created in a sync test that
-        // never started a runtime), `task::spawn` will panic (it
-        // delegates to `tokio::spawn`) — but that scenario can't have
-        // an active subscription anyway.
-        if tokio::runtime::Handle::try_current().is_ok() {
-            crate::runtime::task::spawn(async move {
-                record.write().remove_subscriber(sid);
-            });
-        }
+        // Drop runs in sync context but we need an async write lock, so the
+        // unsubscribe is a fire-and-forget tail. It goes to the background
+        // executor rather than the ambient seam because a subscription can be
+        // dropped on any thread — including a blocking CA connection thread
+        // that has no runtime — and dropping the cleanup there would leak the
+        // subscriber into the record for the life of the IOC.
+        crate::runtime::task::spawn_background(async move {
+            record.write().remove_subscriber(sid);
+        });
     }
 }
 
@@ -568,8 +566,10 @@ impl DbMultiMonitor {
                     Err(_) => continue,
                 }
             }
-            // No events ready — yield briefly then retry
-            crate::runtime::task::sleep(Duration::from_millis(10)).await;
+            // No events ready — yield briefly then retry. The background
+            // timer, not the ambient one: a caller can await this from a
+            // blocking connection thread that has no runtime.
+            crate::runtime::task::sleep_background(Duration::from_millis(10)).await;
         }
     }
 }

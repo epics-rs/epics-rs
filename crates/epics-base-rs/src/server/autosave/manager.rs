@@ -13,6 +13,7 @@ use super::save_file;
 use super::save_set::{
     RestoreResult, SaveSet, SaveSetConfig, SaveSetStatus, SaveStrategy, TriggerMode,
 };
+use super::watermark::{ChangeWatermark, Tick};
 
 /// Builder for constructing an AutosaveManager.
 pub struct AutosaveBuilder {
@@ -56,30 +57,57 @@ impl AutosaveBuilder {
         self
     }
 
-    pub async fn build(self) -> AutosaveResult<AutosaveManager> {
+    /// Build the manager.
+    ///
+    /// Infallible by construction. A save set that cannot be built is one
+    /// set's fault, and there is no longer a whole-manager error for that
+    /// fault to become: the `?` that used to sit here abandoned every set
+    /// already constructed, so one `.req` line naming an undefined macro
+    /// left the IOC saving nothing at all and `fdblist` listing nothing to
+    /// say so. The failure is announced on the error log when it happens
+    /// and kept as that set's [`SaveSetStatus::Error`], which is what
+    /// `fdblist` and `asStatus` read.
+    pub async fn build(self) -> AutosaveManager {
         let mut sets = Vec::new();
+        let mut failed = Vec::new();
         for mut cfg in self.save_sets {
             // Merge global macros (config overrides globals)
             for (k, v) in &self.global_macros {
                 cfg.macros.entry(k.clone()).or_insert_with(|| v.clone());
             }
-            let save_set = SaveSet::new_with_mode(cfg, self.compat).await?;
-            sets.push((Arc::new(save_set), Arc::new(tokio::sync::Mutex::new(()))));
+            let name = cfg.name.clone();
+            match SaveSet::new_with_mode(cfg, self.compat).await {
+                Ok(save_set) => {
+                    sets.push((Arc::new(save_set), Arc::new(tokio::sync::Mutex::new(()))));
+                }
+                Err(e) => {
+                    crate::runtime::log::errlog_printf(&format!(
+                        "autosave: save set '{name}' not built: {e} - its PVs are not saved"
+                    ));
+                    failed.push((name, e.to_string()));
+                }
+            }
         }
 
         let (shutdown_tx, _) = watch::channel(false);
 
-        Ok(AutosaveManager {
+        AutosaveManager {
             sets,
+            failed,
             status_prefix: self.status_prefix,
             shutdown: shutdown_tx,
-        })
+        }
     }
 }
 
 /// Manages multiple save sets with task orchestration.
 pub struct AutosaveManager {
     sets: Vec<(Arc<SaveSet>, Arc<tokio::sync::Mutex<()>>)>,
+    /// The configured sets that never became a [`SaveSet`], by name and
+    /// reason. They hold no state to save or restore, so they exist only
+    /// to be counted: [`Self::status_all`] is the one place a set that
+    /// failed and a set that is working are listed together.
+    failed: Vec<(String, String)>,
     status_prefix: Option<String>,
     shutdown: watch::Sender<bool>,
 }
@@ -100,6 +128,13 @@ impl AutosaveManager {
     }
 
     /// Start all periodic/triggered/onchange tasks. Returns a join handle.
+    ///
+    /// The *ambient* seam, unlike every deferred record tail: a save writes
+    /// through `runtime::fs`, whose hosted implementation is
+    /// `tokio::task::spawn_blocking` and panics off a runtime thread. Autosave
+    /// is started from `IocApplication::run`, which is async, so the ambient
+    /// runtime is the right one — this is not on the synchronous record-
+    /// processing chain that reaches a runtime-less connection thread.
     pub fn start(self: Arc<Self>, db: Arc<PvDatabase>) -> TaskHandle<()> {
         crate::runtime::task::spawn(async move {
             let mut handles = Vec::new();
@@ -119,6 +154,10 @@ impl AutosaveManager {
                             loop {
                                 tokio::select! {
                                     _ = ticker.tick() => {
+                                        // No watermark to gate: a Periodic set
+                                        // re-saves the whole set every interval,
+                                        // so the next tick retries a failed save
+                                        // by construction.
                                         let _guard = lock.lock().await;
                                         let result = set.save_once(&db).await;
                                         if let Some(ref prefix) = status_prefix {
@@ -141,56 +180,21 @@ impl AutosaveManager {
                     } => {
                         crate::runtime::task::spawn(async move {
                             let mut ticker = crate::runtime::task::interval(poll_interval);
-                            let mut last_value: Option<String> = None;
-                            let mut armed = true; // For NonZero: armed when last was 0
+                            let mut watermark = ChangeWatermark::new(
+                                TriggerState {
+                                    last_value: None,
+                                    armed: true, // For NonZero: armed when last was 0
+                                },
+                                set,
+                                lock,
+                                db,
+                                status_prefix,
+                            );
 
                             loop {
                                 tokio::select! {
                                     _ = ticker.tick() => {
-                                        let current = db.get_pv(&trigger_pv).ok();
-                                        let current_str = current.as_ref().map(|v| v.to_string());
-
-                                        let should_save = match mode {
-                                            TriggerMode::AnyChange => {
-                                                // L5: the first poll only establishes
-                                                // the baseline (`last_value` is `None`),
-                                                // so no save fires until the trigger PV
-                                                // is next seen to change. This is
-                                                // intentional — it avoids a spurious
-                                                // save at IOC startup — and the latency
-                                                // is bounded by `poll_interval` (1s by
-                                                // default for a `create_triggered_set`).
-                                                let changed = last_value.as_ref() != current_str.as_ref()
-                                                    && last_value.is_some();
-                                                last_value = current_str;
-                                                changed
-                                            }
-                                            TriggerMode::NonZero => {
-                                                let is_nonzero = current.as_ref()
-                                                    .and_then(|v| v.to_f64())
-                                                    .map_or(false, |v| v != 0.0);
-                                                if !is_nonzero {
-                                                    armed = true;
-                                                    last_value = current_str;
-                                                    false
-                                                } else if armed && last_value.is_some() {
-                                                    armed = false;
-                                                    last_value = current_str;
-                                                    true
-                                                } else {
-                                                    last_value = current_str;
-                                                    false
-                                                }
-                                            }
-                                        };
-
-                                        if should_save {
-                                            let _guard = lock.lock().await;
-                                            let result = set.save_once(&db).await;
-                                            if let Some(ref prefix) = status_prefix {
-                                                update_status_pvs(&db, prefix, &set, &result).await;
-                                            }
-                                        }
+                                        triggered_poll(&mut watermark, &trigger_pv, mode).await;
                                     }
                                     _ = shutdown_rx.changed() => {
                                         if *shutdown_rx.borrow() {
@@ -206,35 +210,13 @@ impl AutosaveManager {
                         float_epsilon,
                     } => crate::runtime::task::spawn(async move {
                         let mut ticker = crate::runtime::task::interval(min_interval);
-                        let mut last_snapshot: HashMap<String, String> = HashMap::new();
+                        let mut watermark =
+                            ChangeWatermark::new(HashMap::new(), set, lock, db, status_prefix);
 
                         loop {
                             tokio::select! {
                                 _ = ticker.tick() => {
-                                    let pv_names = set.pv_names();
-                                    let mut current_snapshot = HashMap::new();
-                                    let mut changed = false;
-
-                                    for pv in &pv_names {
-                                        if let Ok(val) = db.get_pv(pv) {
-                                            let val_str = save_file::value_to_save_str(&val);
-                                            if let Some(old_str) = last_snapshot.get(pv) {
-                                                if !values_equal_str(old_str, &val_str, float_epsilon) {
-                                                    changed = true;
-                                                }
-                                            }
-                                            current_snapshot.insert(pv.clone(), val_str);
-                                        }
-                                    }
-
-                                    if changed && !last_snapshot.is_empty() {
-                                        let _guard = lock.lock().await;
-                                        let result = set.save_once(&db).await;
-                                        if let Some(ref prefix) = status_prefix {
-                                            update_status_pvs(&db, prefix, &set, &result).await;
-                                        }
-                                    }
-                                    last_snapshot = current_snapshot;
+                                    onchange_poll(&mut watermark, float_epsilon).await;
                                 }
                                 _ = shutdown_rx.changed() => {
                                     if *shutdown_rx.borrow() {
@@ -283,11 +265,18 @@ impl AutosaveManager {
         set.restore_once(db).await
     }
 
-    /// Get status of all save sets.
+    /// Get status of all save sets, built and unbuilt alike.
+    ///
+    /// A set whose construction failed reports [`SaveSetStatus::Error`]
+    /// permanently - nothing retries it, and omitting it is what let an
+    /// IOC that had dropped a save set read as a healthy one.
     pub async fn status_all(&self) -> Vec<(String, SaveSetStatus)> {
         let mut results = Vec::new();
         for (set, _) in &self.sets {
             results.push((set.config().name.clone(), set.status().await));
+        }
+        for (name, reason) in &self.failed {
+            results.push((name.clone(), SaveSetStatus::Error(reason.clone())));
         }
         results
     }
@@ -331,8 +320,104 @@ fn values_equal_str(a: &str, b: &str, epsilon: f64) -> bool {
     false
 }
 
+/// The `Triggered` arm's watermark: the trigger reading that has been
+/// accounted for, plus — for [`TriggerMode::NonZero`] — whether the
+/// next non-zero reading is a rising edge.
+struct TriggerState {
+    last_value: Option<String>,
+    armed: bool,
+}
+
+/// One poll of a `Triggered` save set.
+async fn triggered_poll(
+    watermark: &mut ChangeWatermark<TriggerState>,
+    trigger_pv: &str,
+    mode: TriggerMode,
+) {
+    let current = watermark.db().get_pv(trigger_pv).ok();
+    let current_str = current.as_ref().map(|v| v.to_string());
+
+    let tick = match mode {
+        TriggerMode::AnyChange => {
+            // L5: the first poll only establishes the baseline
+            // (`last_value` is `None`), so no save fires until the
+            // trigger PV is next seen to change. This is intentional —
+            // it avoids a spurious save at IOC startup — and the
+            // latency is bounded by `poll_interval` (1s by default for
+            // a `create_triggered_set`).
+            let changed = watermark.state().last_value.as_ref() != current_str.as_ref()
+                && watermark.state().last_value.is_some();
+            let next = TriggerState {
+                last_value: current_str,
+                armed: watermark.state().armed,
+            };
+            if changed {
+                Tick::Changed(next)
+            } else {
+                Tick::Unchanged(next)
+            }
+        }
+        TriggerMode::NonZero => {
+            let is_nonzero = current
+                .as_ref()
+                .and_then(|v| v.to_f64())
+                .is_some_and(|v| v != 0.0);
+            if !is_nonzero {
+                Tick::Unchanged(TriggerState {
+                    last_value: current_str,
+                    armed: true,
+                })
+            } else if watermark.state().armed && watermark.state().last_value.is_some() {
+                Tick::Changed(TriggerState {
+                    last_value: current_str,
+                    armed: false,
+                })
+            } else {
+                Tick::Unchanged(TriggerState {
+                    last_value: current_str,
+                    armed: watermark.state().armed,
+                })
+            }
+        }
+    };
+
+    watermark.advance(tick).await;
+}
+
+/// One poll of an `OnChange` save set.
+async fn onchange_poll(
+    watermark: &mut ChangeWatermark<HashMap<String, String>>,
+    float_epsilon: f64,
+) {
+    let pv_names = watermark.set().pv_names();
+    let mut current_snapshot = HashMap::new();
+    let mut changed = false;
+
+    for pv in &pv_names {
+        if let Ok(val) = watermark.db().get_pv(pv) {
+            let val_str = save_file::value_to_save_str(&val);
+            if let Some(old_str) = watermark.state().get(pv)
+                && !values_equal_str(old_str, &val_str, float_epsilon)
+            {
+                changed = true;
+            }
+            current_snapshot.insert(pv.clone(), val_str);
+        }
+    }
+
+    // An empty watermark is the pre-baseline state of a freshly
+    // started set, not a set whose PVs all vanished.
+    let tick = if changed && !watermark.state().is_empty() {
+        Tick::Changed(current_snapshot)
+    } else {
+        Tick::Unchanged(current_snapshot)
+    };
+
+    watermark.advance(tick).await;
+}
+
 /// Update status PVs after a save cycle.
-async fn update_status_pvs(
+pub(super) async fn update_status_pvs(
     db: &PvDatabase,
     prefix: &str,
     set: &SaveSet,

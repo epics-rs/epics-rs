@@ -123,11 +123,17 @@ pub enum PutAdmission {
     /// The lset tracks this link and its channel is up — stage the write.
     /// C's fall-through to `addAction` (`dbCa.c:622`).
     Connected,
-    /// The lset tracks this link and the channel is DOWN. C refuses the put
-    /// with `-1` and stages nothing (`dbCa.c:558-561`); the caller raises the
-    /// owning record's LINK/INVALID through `dbPutLink`'s `setLinkAlarm`
+    /// The lset tracks this link and will not take the write — the channel
+    /// is down, or it is up but the server denies write access. One variant
+    /// for both because C has one outcome for both: `-1`, stage nothing
+    /// (`dbCa.c:558-561`). The caller raises the owning record's
+    /// LINK/INVALID through `dbPutLink`'s `setLinkAlarm`
     /// (`dbLink.c:434-448`).
-    Disconnected,
+    ///
+    /// Named for the answer rather than for one of its two causes: the
+    /// earlier name `Disconnected` was why an implementation of this trait
+    /// answered `is_connected()` alone and admitted every write-denied link.
+    Refused,
     /// The lset has never opened this link, so it cannot answer. C cannot
     /// reach this state: `dbCaAddLink` opens every CA link at record-init
     /// time (`dbCa.c` `addAction(pca, CA_CONNECT)`), so by the first
@@ -324,15 +330,17 @@ pub trait LinkSet: Send + Sync {
     /// that nothing there touches the network.
     ///
     /// Default: derive from [`Self::is_connected`], which the trait already
-    /// documents as answerable "without blocking". An lset whose OUT links
-    /// live in a different cache than its INP links (pvalink keys its
-    /// registry on direction) MUST override, or every OUT write to a
-    /// perfectly healthy channel is refused.
+    /// documents as answerable "without blocking" — i.e. only C's FIRST
+    /// operand. An lset whose protocol also carries a write right MUST
+    /// override and test both, because the default cannot see the second
+    /// one; so MUST an lset whose OUT links live in a different cache than
+    /// its INP links (pvalink keys its registry on direction), or every OUT
+    /// write to a perfectly healthy channel is refused.
     fn put_admission(&self, name: &str) -> PutAdmission {
         if self.is_connected(name) {
             PutAdmission::Connected
         } else {
-            PutAdmission::Disconnected
+            PutAdmission::Refused
         }
     }
 

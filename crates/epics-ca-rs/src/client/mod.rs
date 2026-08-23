@@ -1875,7 +1875,11 @@ impl CaChannel {
                 count,
                 data,
             } => {
-                let dbr_type = DbFieldType::from_u16(data_type)?;
+                // The array/`count != 1` half of the same READ_NOTIFY
+                // decode `make_read_reply` does for scalars — same wire
+                // carrier, or a CHAR waveform would answer differently from
+                // a CHAR scalar on one channel.
+                let dbr_type = DbFieldType::from_u16(data_type)?.wire_carrier();
                 EpicsValue::from_bytes_array(dbr_type, &data, count as usize)
                     .map(|value| (dbr_type, value))
             }
@@ -2971,7 +2975,7 @@ impl CaChannel {
     ///
     /// The server reports the record's CURRENT element count in every
     /// event's response header and sends only that many elements
-    /// (`rsrv/camessage.c:504-509,537-568`), so a dynamic waveform
+    /// (`rsrv/camessage.c:509-514,563-573`), so a dynamic waveform
     /// (`NORD < NELM`) delivers `NORD` elements per event instead of a
     /// max-capacity array with a padded/stale tail. Identical wire
     /// behaviour to [`Self::subscribe_with_mask`] (which also requests no

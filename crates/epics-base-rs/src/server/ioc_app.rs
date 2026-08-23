@@ -635,14 +635,12 @@ impl IocApplication {
         db.begin_load()
             .expect("a database created a line ago has not run iocInit");
 
-        // On an embedded target (RTEMS or VxWorks), bring up the background
-        // executor (callback pool, delayed timer, scanOnce worker) before any
-        // record processing can defer a tail — C parity: `callbackInit` runs
-        // early in `iocInit` (callback.c:286). Hosted builds drive tails on
-        // the tokio runtime and skip this; a spawn/sleep/interval on a path
-        // that never reaches here still lazy-inits the same executor on
-        // first use.
-        #[cfg(epics_embedded_target)]
+        // Bring up the background executor (callback pool, delayed timer,
+        // scanOnce worker) before any record processing can defer a tail — C
+        // parity: `callbackInit` runs early in `iocInit` (callback.c:286).
+        // Every backend, because every deferred record tail lands there; a
+        // `spawn_background` on a path that never reaches here still
+        // lazy-inits the same executor on first use.
         crate::runtime::task::background_init();
 
         let bridge = crate::runtime::task::BlockingBridge::capture();
@@ -1021,16 +1019,12 @@ impl IocApplication {
 
         // Phase 2d: Build AutosaveManager from startup config
         let autosave_manager = if let Some(builder) = builder_opt {
-            match builder.build().await {
-                Ok(mgr) => {
-                    eprintln!("autosave: {} save set(s) configured", mgr.set_names().len());
-                    Some(Arc::new(mgr))
-                }
-                Err(e) => {
-                    eprintln!("autosave: failed to build manager: {e}");
-                    None
-                }
-            }
+            // `build` cannot fail: a set it could not construct is reported
+            // on the error log and carried as that set's error status, so
+            // one bad `.req` file no longer costs the IOC every other set.
+            let mgr = builder.build().await;
+            eprintln!("autosave: {} save set(s) configured", mgr.set_names().len());
+            Some(Arc::new(mgr))
         } else {
             None
         };
@@ -1396,7 +1390,7 @@ pub(crate) async fn setup_io_intr(db: Arc<PvDatabase>) -> usize {
             let db_clone = db.clone();
             let rec_name = name.clone();
             let rec_arc_clone = rec_arc.clone();
-            crate::runtime::task::spawn(async move {
+            crate::runtime::task::spawn_background(async move {
                 while intr_rx.recv().await.is_some() {
                     // Process if the device drives SCAN-independently,
                     // or the record is still on I/O Intr scan.
@@ -1450,7 +1444,7 @@ pub(crate) async fn setup_property_posts(db: Arc<PvDatabase>) -> usize {
                 if let Some(mut rx) = dev.property_post_receiver() {
                     let db_clone = db.clone();
                     let rec_name = name.clone();
-                    crate::runtime::task::spawn(async move {
+                    crate::runtime::task::spawn_background(async move {
                         // Each message is the full setEnums field block; post
                         // it DBE_PROPERTY so clients re-read the choices.
                         while let Some(fields) = rx.recv().await {

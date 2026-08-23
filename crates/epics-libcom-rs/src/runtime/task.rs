@@ -196,6 +196,14 @@ impl BlockingBridge {
         }
     }
 
+    /// [`capture`](Self::capture) for a caller that has somewhere else to be
+    /// if no runtime is entered — `None` instead of a panic.
+    pub fn try_capture() -> Option<Self> {
+        RuntimeHandle::try_current()
+            .ok()
+            .map(|handle| Self { handle })
+    }
+
     /// Drive `fut` to completion on this thread, with the captured runtime
     /// entered so the future may spawn and use the reactor.
     ///
@@ -228,6 +236,11 @@ impl BlockingBridge {
     /// and never panics.
     pub fn capture() -> Self {
         Self
+    }
+
+    /// See the `tokio_backend` definition; capturing never fails here.
+    pub fn try_capture() -> Option<Self> {
+        Some(Self)
     }
 
     /// Drive `fut` on this thread via `park_on`; whatever it spawns or
@@ -329,30 +342,28 @@ pub type TaskAbortHandle = crate::runtime::background::future_exec::AbortHandle;
 pub type TaskJoinError = crate::runtime::background::future_exec::JoinError;
 
 // ---------------------------------------------------------------------------
-// Process-global background executor (RTEMS spawn/timer backend)
+// Process-global background executor (C `callbackInit` facilities)
 //
-// On RTEMS the seam routes every spawn/sleep/interval into one process-global
-// `BackgroundExecutor` (callback pool + delayed timer + scanOnce worker). Two
-// init paths, both landing on the same `OnceLock`:
+// One process-global `BackgroundExecutor` — callback pool + delayed timer +
+// scanOnce worker — on *every* backend, because it is the only executor whose
+// existence does not depend on an ambient runtime. Two init paths, both
+// landing on the same `OnceLock`:
 //
 //   * Explicit — `background_init()` from `IocApplication::run`, mirroring C's
 //     `callbackInit` running early in `iocInit` (callback.c:286) so the
 //     facilities exist before any record processing can defer a tail.
-//   * Lazy fallback — the first `spawn`/`sleep`/`interval` on a path that
-//     never went through `run` (a unit test, an embedded harness) initialises
-//     it on demand via the same `get_or_init`.
+//   * Lazy fallback — the first `spawn_background`/`sleep_background` on a path
+//     that never went through `run` (a unit test, an embedded harness)
+//     initialises it on demand via the same `get_or_init`.
 //
-// Compiled on RTEMS and under `cfg(test)` (so the wiring is host-exercised);
-// on a hosted non-test build the tokio runtime is the backend and this is not
-// compiled.
+// `exec_backend` additionally routes the *ambient* seam (`spawn`, `sleep`,
+// `interval`) here, because on that backend there is nothing else to route to.
 // ---------------------------------------------------------------------------
 
-#[cfg(any(exec_backend, test))]
 static BACKGROUND: std::sync::OnceLock<crate::runtime::background::BackgroundExecutor> =
     std::sync::OnceLock::new();
 
 /// The process-global background executor, initialised on first use.
-#[cfg(any(exec_backend, test))]
 fn background() -> &'static crate::runtime::background::BackgroundExecutor {
     BACKGROUND.get_or_init(crate::runtime::background::BackgroundExecutor::new)
 }
@@ -360,11 +371,72 @@ fn background() -> &'static crate::runtime::background::BackgroundExecutor {
 /// Eagerly start the process-global background executor — C `callbackInit`
 /// parity (callback.c:286), called once from `IocApplication::run`. Idempotent:
 /// a second call (or a prior lazy init) is a no-op, matching `callbackInit`'s
-/// own re-entry guard (callback.c:292-295). Only the RTEMS build uses the
-/// executor; hosted builds drive tails on the tokio runtime.
-#[cfg(any(exec_backend, test))]
+/// own re-entry guard (callback.c:292-295).
 pub fn background_init() {
     let _ = background();
+}
+
+/// Handle to a task spawned on the process-global background executor —
+/// `await` for its result, `abort()` to cancel. Distinct from [`TaskHandle`]
+/// because that one is the *ambient* executor's handle and is
+/// `tokio::task::JoinHandle` on a hosted build.
+pub type BackgroundTaskHandle<T> = crate::runtime::background::JoinFuture<T>;
+
+/// Spawn a deferred tail on the process-global background executor.
+///
+/// The counterpart to [`spawn`], and the difference is the whole point of
+/// having both: [`spawn`] follows the *ambient* execution model, so on a
+/// hosted build it needs a tokio runtime entered on the calling thread, while
+/// this one always lands on the same executor no matter who calls it. Record
+/// processing is reached from a plain `std::thread` — every blocking CA/PVA
+/// connection thread drives it through [`block_on_sync`] → [`park_on`] — so a
+/// tail it defers must not depend on the caller's thread having a runtime.
+///
+/// Anything awaited inside `future` is subject to the same rule: use
+/// [`sleep_background`], [`interval_background`] and [`spawn_blocking_background`]
+/// rather than their ambient counterparts, and no `tokio::net` socket, whose
+/// reactor this executor deliberately does not have.
+pub fn spawn_background<F>(future: F) -> BackgroundTaskHandle<F::Output>
+where
+    F: Future + Send + 'static,
+    F::Output: Send + 'static,
+{
+    use crate::runtime::background::{DEFAULT_SPAWN_PRIORITY, spawn_future};
+    spawn_future(
+        &background().callbacks().handle(),
+        DEFAULT_SPAWN_PRIORITY,
+        future,
+    )
+}
+
+/// [`spawn_background`] for a blocking closure — runs it on a callback-pool
+/// worker at the default Medium band.
+pub fn spawn_blocking_background<F, R>(f: F) -> BackgroundTaskHandle<R>
+where
+    F: FnOnce() -> R + Send + 'static,
+    R: Send + 'static,
+{
+    use crate::runtime::background::{DEFAULT_SPAWN_PRIORITY, spawn_blocking_on};
+    spawn_blocking_on(
+        &background().callbacks().handle(),
+        DEFAULT_SPAWN_PRIORITY,
+        f,
+    )
+}
+
+/// Sleep on the process-global delayed-callback timer — C
+/// `callbackRequestDelayed` (callback.c:410) — measured on `std::time`.
+///
+/// The delay counterpart to [`spawn_background`]: a tail deferred there must
+/// wait on a timer that exists without a runtime, which `tokio::time` does not.
+pub async fn sleep_background(duration: Duration) {
+    crate::runtime::background::timer_sleep::sleep(&background().timer().handle(), duration).await;
+}
+
+/// Periodic ticker on the process-global delayed-callback timer — the
+/// [`interval`] counterpart for work spawned by [`spawn_background`].
+pub fn interval_background(period: Duration) -> crate::runtime::background::TimerInterval {
+    crate::runtime::background::timer_sleep::interval(&background().timer().handle(), period)
 }
 
 #[cfg(tokio_backend)]
@@ -376,20 +448,15 @@ where
     tokio::spawn(future)
 }
 
-/// RTEMS: drive the tail on a callback-pool worker via the host-tested future
-/// executor, at the default Medium band.
+/// RTEMS: there is no ambient runtime to follow, so the ambient seam *is* the
+/// background executor — [`spawn_background`] verbatim.
 #[cfg(exec_backend)]
 pub fn spawn<F>(future: F) -> TaskHandle<F::Output>
 where
     F: Future + Send + 'static,
     F::Output: Send + 'static,
 {
-    use crate::runtime::background::future_exec::{DEFAULT_SPAWN_PRIORITY, spawn_future};
-    spawn_future(
-        &background().callbacks().handle(),
-        DEFAULT_SPAWN_PRIORITY,
-        future,
-    )
+    spawn_background(future)
 }
 
 /// Yield the current task once — the seam replacement for
@@ -431,20 +498,14 @@ where
     tokio::task::spawn_blocking(f)
 }
 
-/// RTEMS: run the blocking closure on a callback-pool worker at the default
-/// Medium band via the host-tested future executor.
+/// RTEMS: see [`spawn`] — the ambient seam is the background executor.
 #[cfg(exec_backend)]
 pub fn spawn_blocking<F, R>(f: F) -> TaskHandle<R>
 where
     F: FnOnce() -> R + Send + 'static,
     R: Send + 'static,
 {
-    use crate::runtime::background::future_exec::{DEFAULT_SPAWN_PRIORITY, spawn_blocking_on};
-    spawn_blocking_on(
-        &background().callbacks().handle(),
-        DEFAULT_SPAWN_PRIORITY,
-        f,
-    )
+    spawn_blocking_background(f)
 }
 
 /// A set of spawned tasks, joined as they complete — the seam replacement for
@@ -551,10 +612,10 @@ pub async fn sleep(duration: Duration) {
     tokio::time::sleep(duration).await;
 }
 
-/// RTEMS: sleep on the delayed-callback timer via the host-tested `Sleep`.
+/// RTEMS: see [`spawn`] — the ambient seam is the background executor.
 #[cfg(exec_backend)]
 pub async fn sleep(duration: Duration) {
-    crate::runtime::background::timer_sleep::sleep(&background().timer().handle(), duration).await;
+    sleep_background(duration).await;
 }
 
 /// The instant [`sleep_until`] measures deadlines against — **the backend's own

@@ -947,17 +947,12 @@ impl CaServer {
             Some(mgr.start(db_save))
         } else if let Some(ref cfg) = self.autosave_config {
             let builder = autosave::AutosaveBuilder::new().add_set(cfg.clone());
-            match builder.build().await {
-                Ok(mgr) => {
-                    let mgr = Arc::new(mgr);
-                    let db_save = self.db.clone();
-                    Some(mgr.start(db_save))
-                }
-                Err(e) => {
-                    eprintln!("autosave: failed to start: {e}");
-                    None
-                }
-            }
+            // `build` cannot fail: a set it could not construct is reported
+            // on the error log and carried as that set's error status, so
+            // there is nothing left here to abandon the autosave task for.
+            let mgr = Arc::new(builder.build().await);
+            let db_save = self.db.clone();
+            Some(mgr.start(db_save))
         } else {
             None
         };

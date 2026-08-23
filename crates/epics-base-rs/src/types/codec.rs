@@ -1,7 +1,7 @@
 use crate::error::{CaError, CaResult};
 use std::time::SystemTime;
 
-use super::{DbFieldType, EpicsValue, PvString, WallTime};
+use super::{DbFieldType, EpicsValue, PvString, WallTime, c_cast};
 
 // db_access.h constants
 const MAX_UNITS_SIZE: usize = 8;
@@ -56,19 +56,24 @@ fn epics_timestamp_parts(timestamp: WallTime) -> (u32, u32) {
 /// Convert value to the target native type and serialize to bytes.
 fn convert_and_serialize(native: DbFieldType, value: &EpicsValue) -> CaResult<Vec<u8>> {
     let mut buf = Vec::new();
-    convert_and_serialize_into(native, value, &mut buf);
+    convert_and_serialize_into(native, value, &mut buf)?;
     Ok(buf)
 }
 
 /// [`convert_and_serialize`] appending into a caller-owned buffer. When the
 /// value already has the requested native type — every monitor on an
 /// unconverted field — the bytes go straight onto `dst` with no intermediate.
-fn convert_and_serialize_into(native: DbFieldType, value: &EpicsValue, dst: &mut Vec<u8>) {
+fn convert_and_serialize_into(
+    native: DbFieldType,
+    value: &EpicsValue,
+    dst: &mut Vec<u8>,
+) -> CaResult<()> {
     if value.dbr_type() == native {
         value.write_into(dst);
     } else {
-        value.convert_to(native).write_into(dst);
+        value.get_convert(native)?.write_into(dst);
     }
+    Ok(())
 }
 
 // precision-aware `*_STRING` rendering of a numeric field.
@@ -99,7 +104,7 @@ const FRAC_MULTIPLIER: [i32; 9] = [
 fn convert_value_to_dbr_string(
     value: &EpicsValue,
     snapshot: &crate::server::snapshot::Snapshot,
-) -> EpicsValue {
+) -> CaResult<EpicsValue> {
     // C `getDoubleString` (`dbConvert.c:772-790`) opens with
     // `long precision = 6;` and overwrites it only `if (prset &&
     // prset->get_precision)`. The 6 is therefore the answer for every record
@@ -118,7 +123,7 @@ fn convert_value_to_dbr_string(
     // renders `%*.*e` (compiled: `caget -S` of a PREC=-1 ai gives
     // ` 3.70000000000000018e+00`). Clamping to 0 printed `4` instead.
     let prec = snapshot.precision().map(|p| p as u16).unwrap_or(6);
-    match value {
+    Ok(match value {
         EpicsValue::Double(v) => EpicsValue::String(cvt_double_to_string(*v, prec).into()),
         EpicsValue::Float(v) => EpicsValue::String(cvt_float_to_string(*v, prec).into()),
         EpicsValue::DoubleArray(a) => EpicsValue::StringArray(
@@ -139,8 +144,8 @@ fn convert_value_to_dbr_string(
         EpicsValue::EnumArray(a) => {
             EpicsValue::StringArray(a.iter().map(|v| enum_label(snapshot, *v)).collect())
         }
-        other => other.convert_to(DbFieldType::String),
-    }
+        other => other.get_convert(DbFieldType::String)?,
+    })
 }
 
 /// Render an enum index as C's `get_enum_str` does, through the channel's
@@ -616,9 +621,9 @@ pub fn encode_dbr_into(
     // `EpicsValue::convert_to(String)` (value.rs) has no record context, so
     // route string requests through the precision-aware converter here.
     if native == DbFieldType::String {
-        convert_value_to_dbr_string(&snapshot.value, snapshot).write_into(dst);
+        convert_value_to_dbr_string(&snapshot.value, snapshot)?.write_into(dst);
     } else {
-        convert_and_serialize_into(native, &snapshot.value, dst);
+        convert_and_serialize_into(native, &snapshot.value, dst)?;
     }
     Ok(())
 }
@@ -758,7 +763,7 @@ fn encode_prec_units_limits_f32(
     encode_units(buf, snapshot);
     let limits = get_limits(snapshot, n_limits);
     for l in &limits[..n_limits] {
-        buf.extend_from_slice(&(*l as f32).to_be_bytes());
+        buf.extend_from_slice(&c_cast::f64_to_f32(*l).to_be_bytes());
     }
 }
 
@@ -981,7 +986,14 @@ pub fn decode_dbr(dbr_type: u16, data: &[u8], count: usize) -> CaResult<Snapshot
         snap.alarm.acks = Some(acks);
         return Ok(snap);
     }
-    let native = super::native_type_for_dbr(dbr_type)?;
+    // These bytes came off the CA wire, so the value carrier is the wire's,
+    // not the database's: `wire_carrier` is the single owner of that one
+    // differing row (`DBR_CHAR` is `epicsUInt8`). Every struct-layout
+    // question below — `sts_pad`, `time_pad`, `gr_ctrl_meta_size`,
+    // `decode_gr_ctrl`'s arms — already treats `Char` and `UChar` as the
+    // same wire form, so the substitution moves the value's signedness and
+    // nothing else.
+    let native = super::native_type_for_dbr(dbr_type)?.wire_carrier();
     // Guard a truncated metadata-prefixed payload before any decode_*
     // helper slices `&data[meta..]`. `dbr_meta_size` is the exact count
     // of metadata bytes preceding `value[0]` for this (type, native) — it
@@ -1615,12 +1627,12 @@ mod r58_enum_label_tests {
     fn enum_renders_label_not_index() {
         let s = snap_with_enum(EpicsValue::Enum(1), &["Off", "On"]);
         assert_eq!(
-            convert_value_to_dbr_string(&s.value, &s),
+            convert_value_to_dbr_string(&s.value, &s).unwrap(),
             EpicsValue::String("On".into())
         );
         let s0 = snap_with_enum(EpicsValue::Enum(0), &["Off", "On"]);
         assert_eq!(
-            convert_value_to_dbr_string(&s0.value, &s0),
+            convert_value_to_dbr_string(&s0.value, &s0).unwrap(),
             EpicsValue::String("Off".into())
         );
     }
@@ -1629,7 +1641,7 @@ mod r58_enum_label_tests {
     fn enum_array_renders_labels() {
         let s = snap_with_enum(EpicsValue::EnumArray(vec![0, 1, 0]), &["Off", "On"]);
         assert_eq!(
-            convert_value_to_dbr_string(&s.value, &s),
+            convert_value_to_dbr_string(&s.value, &s).unwrap(),
             EpicsValue::StringArray(vec!["Off".into(), "On".into(), "Off".into()])
         );
     }
@@ -1644,7 +1656,7 @@ mod r58_enum_label_tests {
     fn enum_out_of_range_renders_the_overflow_never_the_index() {
         let s = snap_with_enum(EpicsValue::Enum(5), &["Off", "On"]);
         assert_eq!(
-            convert_value_to_dbr_string(&s.value, &s),
+            convert_value_to_dbr_string(&s.value, &s).unwrap(),
             EpicsValue::String("".into())
         );
     }
@@ -1664,7 +1676,7 @@ mod r58_enum_label_tests {
             EnumStringForm::states(slots, "Illegal Value".into()),
         ));
         assert_eq!(
-            convert_value_to_dbr_string(&s.value, &s),
+            convert_value_to_dbr_string(&s.value, &s).unwrap(),
             EpicsValue::String("Illegal Value".into())
         );
     }
@@ -1684,7 +1696,7 @@ mod r58_enum_label_tests {
             EnumStringForm::states(slots, "Illegal Value".into()),
         ));
         assert_eq!(
-            convert_value_to_dbr_string(&s.value, &s),
+            convert_value_to_dbr_string(&s.value, &s).unwrap(),
             EpicsValue::String("".into())
         );
     }
@@ -1697,7 +1709,7 @@ mod r58_enum_label_tests {
     fn enum_without_metadata_renders_empty_never_the_index() {
         let s = Snapshot::new(EpicsValue::Enum(1), 0, 0, SystemTime::UNIX_EPOCH);
         assert_eq!(
-            convert_value_to_dbr_string(&s.value, &s),
+            convert_value_to_dbr_string(&s.value, &s).unwrap(),
             EpicsValue::String("".into())
         );
     }
@@ -1739,7 +1751,7 @@ mod r17_1_negative_precision_tests {
     fn double_with_negative_prec_renders_seventeen_digit_exponential() {
         let s = snap_with_prec(EpicsValue::Double(3.7), -1);
         assert_eq!(
-            convert_value_to_dbr_string(&s.value, &s),
+            convert_value_to_dbr_string(&s.value, &s).unwrap(),
             EpicsValue::String(" 3.70000000000000018e+00".into()),
             "PREC=-1 is epicsUInt16 65535, not a clamp to 0"
         );
@@ -1749,7 +1761,7 @@ mod r17_1_negative_precision_tests {
     fn float_with_negative_prec_renders_twelve_digit_exponential() {
         let s = snap_with_prec(EpicsValue::Float(3.7), -1);
         assert_eq!(
-            convert_value_to_dbr_string(&s.value, &s),
+            convert_value_to_dbr_string(&s.value, &s).unwrap(),
             EpicsValue::String("3.700000047684e+00".into()),
             "cvtFloatToString caps the reinterpreted precision at 12"
         );
@@ -1759,7 +1771,7 @@ mod r17_1_negative_precision_tests {
     fn non_negative_prec_is_unchanged() {
         let s = snap_with_prec(EpicsValue::Double(3.7), 2);
         assert_eq!(
-            convert_value_to_dbr_string(&s.value, &s),
+            convert_value_to_dbr_string(&s.value, &s).unwrap(),
             EpicsValue::String("3.70".into())
         );
     }

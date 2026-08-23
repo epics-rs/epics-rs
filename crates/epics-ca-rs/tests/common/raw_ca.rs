@@ -130,7 +130,7 @@ impl Circuit {
 
     /// Wait for the EVENT_CANCEL acknowledgement.
     ///
-    /// C `event_cancel_reply` (`camessage.c:2002-2014`) echoes the stored
+    /// C `event_cancel_reply` (`camessage.c:2089-2091`) echoes the stored
     /// EVENT_ADD request — same data_type / count / sid / sub-id — with a
     /// **zero payload**, rather than echoing the EVENT_CANCEL opcode. The zero
     /// postsize is what distinguishes the ack from a genuine monitor update

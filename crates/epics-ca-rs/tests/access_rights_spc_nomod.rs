@@ -4,9 +4,9 @@
 //! only the first:
 //!
 //! * `dbPut` (`dbAccess.c:123-126`) — refuses the write. The port's gate.
-//! * `rsrvCheckPut` (`rsrv/camessage.c:2540-2551`) —
+//! * `rsrvCheckPut` (`rsrv/camessage.c:2608-2619`) —
 //!   `if (dbChannelSpecial(pciu->dbch) == SPC_NOMOD) return 0;` — which feeds
-//!   the `CA_PROTO_ACCESS_RIGHTS` write bit (`camessage.c:1123-1124`). Missing
+//!   the `CA_PROTO_ACCESS_RIGHTS` write bit (`camessage.c:1154-1156`). Missing
 //!   here, so the server advertised WRITE on ~15 dbCommon fields of every
 //!   record; medm/CSS enable the write widget, the client sends the put, and
 //!   the server-side gate refuses it with an async exception instead of C's

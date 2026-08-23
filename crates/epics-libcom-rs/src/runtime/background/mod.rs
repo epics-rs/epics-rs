@@ -53,6 +53,8 @@ pub use delayed_timer::{DelayedTimer, TimerHandle};
 pub use future_exec::{
     AbortHandle, DEFAULT_SPAWN_PRIORITY, JoinError, JoinFuture, spawn_blocking_on, spawn_future,
 };
+pub use timer_sleep::{Sleep, TimerInterval};
+
 pub use scan_once::{
     DEFAULT_ONCE_QUEUE_SIZE, OnceCallback, ScanOnceHandle, ScanOnceOverflow, ScanOnceQueue,
 };

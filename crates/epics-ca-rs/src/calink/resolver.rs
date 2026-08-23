@@ -176,12 +176,7 @@ struct LinkConnState {
     /// ([`CaLink::value`]), exactly as C consults it only in `dbCaGetLink`
     /// (`dbCa.c:459`); the severity/timestamp/metadata getters (`pcaGetCheck`,
     /// `dbCa.c:650-660`) and the lset `isConnected` (`dbCa.c:633-641`) check
-    /// `isConnected` alone. The write half (`pca->hasWriteAccess`, consulted
-    /// by `dbCaPutLinkCallback`, `dbCa.c:558`) is deliberately NOT stored
-    /// here: this port enforces it inside the client's put path itself
-    /// (`send_write_notify_fast` / `send_write_nowait_fast` refuse on the
-    /// cached rights — the libca `nciu::write` ECA_NOWTACCESS parity), so a
-    /// second stored copy would have no consumer.
+    /// `isConnected` alone.
     ///
     /// `true` at rest, NOT C's calloc-FALSE. C sets `isConnected` and both
     /// access flags inside one `pca->lock` critical section
@@ -194,6 +189,20 @@ struct LinkConnState {
     /// never shows. The coordinator broadcasts the real rights immediately
     /// after every `Connected`, so the default only lives for that gap.
     read_access: AtomicBool,
+    /// C `pca->hasWriteAccess` (`dbCa.c:876`, `:1090`) — the write half of
+    /// the same rights event, consulted by [`CaResolver::put_admission`]
+    /// because `dbCaPutLinkCallback`'s gate is
+    /// `if (!pca->isConnected || !pca->hasWriteAccess)` (`dbCa.c:558-561`):
+    /// BOTH operands, tested before anything is staged. The client's own
+    /// put path also refuses a write-denied channel (libca `nciu::write`
+    /// ECA_NOWTACCESS parity), but that refusal happens on the link work
+    /// owner, long after the record cycle that issued the write has
+    /// finished — so it lands no LINK/INVALID on the owning record, and the
+    /// put-notify flavour completes its wait-set as a success. The gate has
+    /// to be whole HERE, where C puts it.
+    ///
+    /// `true` at rest for the same reason as `read_access` above.
+    write_access: AtomicBool,
     /// The database whose CP/CPP holders of `pv_name` must be processed on a
     /// disconnect. Attached after the resolver is mounted, hence the lock and
     /// the `Option`; a `None` here is a link opened with no database, which
@@ -207,6 +216,7 @@ impl LinkConnState {
         Self {
             flag: AtomicBool::new(false),
             read_access: AtomicBool::new(true),
+            write_access: AtomicBool::new(true),
             db,
             pv_name,
         }
@@ -244,6 +254,12 @@ impl LinkConnState {
         self.read_access.load(Ordering::Acquire)
     }
 
+    /// The write half — `dbCaPutLinkCallback`'s `!pca->hasWriteAccess`
+    /// operand (`dbCa.c:558`).
+    fn has_write_access(&self) -> bool {
+        self.write_access.load(Ordering::Acquire)
+    }
+
     /// C `accessRightsCallback` (`dbCa.c:1076-1102`) as one owned
     /// transition. Returns `true` iff the CP/CPP holders were dispatched.
     ///
@@ -255,7 +271,7 @@ impl LinkConnState {
     ///   superseded, and skipping is what keeps a stale rights event
     ///   queued behind a `Disconnected` from double-dispatching an outage
     ///   the disconnect edge already dispatched.
-    /// * **Connected:** cache the new read right, then dispatch the
+    /// * **Connected:** cache both new rights, then dispatch the
     ///   holders UNLESS both read and write are held (`dbCa.c:1091`
     ///   `if (hasReadAccess && hasWriteAccess) goto done`). C processes on
     ///   the loss of EITHER right — not read loss alone — and processes
@@ -274,6 +290,7 @@ impl LinkConnState {
             return false;
         }
         self.read_access.store(read, Ordering::Release);
+        self.write_access.store(write, Ordering::Release);
         if read && write {
             return false;
         }
@@ -365,6 +382,14 @@ impl CaLink {
     /// circuit-state flag, and BRIDGE-106 added the type/count match.
     pub fn is_connected(&self) -> bool {
         self.with_servable(|_| ()).is_some()
+    }
+
+    /// The cached write right — `dbCaPutLinkCallback`'s second operand
+    /// (`dbCa.c:558`). Separate from [`Self::is_connected`] because C tests
+    /// them separately and a write-denied link is still connected: it keeps
+    /// serving values to `dbCaGetLink`, which does not consult this.
+    pub fn has_write_access(&self) -> bool {
+        self.connected.has_write_access()
     }
 
     /// The iocInit wait's all-conditions gate for this link — C
@@ -1072,23 +1097,33 @@ impl LinkSet for CaLinkResolver {
 
     /// C `dbCaPutLinkCallback`'s `if (!pca->isConnected || !pca->hasWriteAccess)
     /// return -1;` (`dbCa.c:558-561`), answered from cached state: the links
-    /// map plus the `CaLink::connected` flag the connection watcher owns
-    /// (`note_conn_event`). No I/O — the database asks this on the
+    /// map plus the `CaLink::connected` owner, which carries both the
+    /// connection flag (`note_conn_event`) and the cached rights
+    /// (`note_access_rights`). No I/O — the database asks this on the
     /// record-processing thread, inside the record's advisory write gate.
     ///
+    /// BOTH of C's operands are tested here, not just the first. A
+    /// write-denied but connected link that passed this gate was staged and
+    /// then refused on the link work owner, one full record cycle late: the
+    /// owning record stayed NO_ALARM where C shows LINK/INVALID every
+    /// cycle, and the put-notify flavour resolved its wait-set as a success
+    /// because the completion channel carries no status back to the record.
+    /// Both flavours are closed by refusing here; neither needs a second,
+    /// later check.
+    ///
     /// A link this resolver has never opened reports `Unopened` rather than
-    /// `Disconnected`: C opens at `dbCaAddLink` (record init) so the `caLink`
+    /// `Refused`: C opens at `dbCaAddLink` (record init) so the `caLink`
     /// always exists by the first put, while this resolver opens lazily
-    /// inside `put_value` / `get_value`. Reporting `Disconnected` would
-    /// refuse the very write whose staging performs the open, and the link
-    /// would never connect.
+    /// inside `put_value` / `get_value`. Reporting `Refused` would refuse
+    /// the very write whose staging performs the open, and the link would
+    /// never connect.
     fn put_admission(&self, name: &str) -> PutAdmission {
         let name = strip_ca_scheme(name);
         let links = self.links.read();
         match links.get(name) {
             None => PutAdmission::Unopened,
-            Some(link) if link.is_connected() => PutAdmission::Connected,
-            Some(_) => PutAdmission::Disconnected,
+            Some(link) if link.is_connected() && link.has_write_access() => PutAdmission::Connected,
+            Some(_) => PutAdmission::Refused,
         }
     }
 

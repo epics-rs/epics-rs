@@ -227,7 +227,7 @@ impl FilterChain {
     }
 
     /// epics-base parity for a CA monitor single-event post
-    /// (`db_post_single_event`, `rsrv/camessage.c:1085-1093`,
+    /// (`db_post_single_event`, `rsrv/camessage.c:1117-1122`,
     /// `1851-1853`): the initial monitor event and access-rights
     /// transition events are queued via `db_create_event_log`
     /// (`dbEvent.c:746-752`, `dbfl_context_event`) then run through

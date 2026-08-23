@@ -18,13 +18,38 @@ use super::save_set::{SaveSetConfig, SaveStrategy, TriggerMode};
 #[derive(Debug, Clone)]
 pub struct MonitorSetDef {
     pub filename: String,
-    pub period_seconds: u32,
+    /// The save period for a monitor set, or the trigger-watcher
+    /// debounce for a triggered one. Always a legal interval: build it
+    /// with [`MonitorSetDef::poll_period`].
+    pub period: Duration,
     pub macros: String,
     /// Trigger PV name for a triggered save set. `None` for periodic
     /// monitor sets (`create_monitor_set`). `Some(pv)` for
     /// `create_triggered_set` — the set is saved whenever this PV
     /// changes, mapped to [`SaveStrategy::Triggered`].
     pub trigger_pv: Option<String>,
+}
+
+impl MonitorSetDef {
+    /// Turn the `period` argument of `create_monitor_set` /
+    /// `create_triggered_set` into an interval that is legal on both task
+    /// backends.
+    ///
+    /// The iocsh argument is an `i64` and both ends of it were unsafe.
+    /// Zero panics tokio's `interval` on the async backend and
+    /// busy-rewrites the `.sav` forever on the blocking one, which does
+    /// not assert; a negative value cast to `u32` became 4294967295
+    /// seconds, so the set never saved again while `fdblist` reported it
+    /// idle. One second is the floor already used for the trigger
+    /// debounce.
+    ///
+    /// The clamp belongs here and not in `into_builder`, because that is
+    /// two loops: the monitor loop used the number raw and the triggered
+    /// loop clamped it, which is how one `u32` came to mean both "what
+    /// the operator typed" and "the interval to run at".
+    pub fn poll_period(seconds: i64) -> Duration {
+        Duration::from_secs(seconds.max(1) as u64)
+    }
 }
 
 /// Definition of a restore file from st.cmd.
@@ -58,25 +83,6 @@ impl AutosaveStartupConfig {
         Self::default()
     }
 
-    /// Resolve a request file by searching request_file_paths.
-    pub fn resolve_request_file(&self, filename: &str) -> Option<PathBuf> {
-        let path = PathBuf::from(filename);
-        if path.is_absolute() && path.exists() {
-            return Some(path);
-        }
-        for dir in &self.request_file_paths {
-            let candidate = dir.join(filename);
-            if candidate.exists() {
-                return Some(candidate);
-            }
-        }
-        // Try current directory
-        if path.exists() {
-            return Some(path);
-        }
-        None
-    }
-
     /// Resolve a save file path from a request filename.
     pub fn resolve_save_file(&self, filename: &str) -> PathBuf {
         let base = filename.trim_end_matches(".req");
@@ -101,7 +107,18 @@ impl AutosaveStartupConfig {
 
         // Add monitor sets (periodic strategy)
         for def in &self.monitor_sets {
-            let request_file = self.resolve_request_file(&def.filename);
+            // The NAME, not a pre-resolved path.
+            // `SaveSet::load_entries` hands it to
+            // `load_request_file_with_search_paths`, which searches
+            // `search_paths` (the same `request_file_paths`) and returns
+            // `AutosaveError::RequestFile` when nothing matches, so
+            // `build()` refuses the set. Pre-resolving here turned that
+            // failure into `request_file: None`, which is this field's
+            // OTHER meaning — "this set has no request file, its members
+            // are `request_pvs`" — and the set then built with zero
+            // entries and overwrote a good `.sav` with a two-line file on
+            // its first tick.
+            let request_file = Some(PathBuf::from(&def.filename));
             let save_path = self.resolve_save_file(&def.filename);
             let macros = if def.macros.is_empty() {
                 HashMap::new()
@@ -112,7 +129,7 @@ impl AutosaveStartupConfig {
                 name: def.filename.clone(),
                 save_path,
                 strategy: SaveStrategy::Periodic {
-                    interval: Duration::from_secs(def.period_seconds as u64),
+                    interval: def.period,
                 },
                 request_file,
                 request_pvs: Vec::new(),
@@ -129,22 +146,21 @@ impl AutosaveStartupConfig {
         // argument is the trigger-watcher poll interval (debounce),
         // matching the `poll_interval` of `SaveStrategy::Triggered`.
         for def in &self.triggered_sets {
-            let request_file = self.resolve_request_file(&def.filename);
+            // Same as the monitor loop above: the name travels, so an
+            // unresolvable request file fails the build instead of
+            // impersonating an inline-PV set.
+            let request_file = Some(PathBuf::from(&def.filename));
             let save_path = self.resolve_save_file(&def.filename);
             let macros = if def.macros.is_empty() {
                 HashMap::new()
             } else {
                 MacroContext::parse_inline(&def.macros)
             };
-            // A poll interval of 0 would busy-loop the watcher; clamp
-            // to 1s so a bare `create_triggered_set(file, pv)` has a
-            // sane debounce.
-            let poll_secs = def.period_seconds.max(1) as u64;
             let strategy = match &def.trigger_pv {
                 Some(pv) => SaveStrategy::Triggered {
                     trigger_pv: pv.clone(),
                     mode: TriggerMode::AnyChange,
-                    poll_interval: Duration::from_secs(poll_secs),
+                    poll_interval: def.period,
                 },
                 None => {
                     // No trigger PV supplied — fall back to OnChange
@@ -154,7 +170,7 @@ impl AutosaveStartupConfig {
                         def.filename
                     );
                     SaveStrategy::OnChange {
-                        min_interval: Duration::from_secs(poll_secs),
+                        min_interval: def.period,
                         float_epsilon: 0.0,
                     }
                 }
@@ -282,17 +298,20 @@ impl AutosaveStartupConfig {
                         _ => return Err("filename argument required".into()),
                     };
                     let period = match &args[1] {
-                        ArgValue::Int(n) => *n as u32,
+                        ArgValue::Int(n) => MonitorSetDef::poll_period(*n),
                         _ => return Err("period argument required".into()),
                     };
                     let macros = match args.get(2) {
                         Some(ArgValue::String(s)) => s.clone(),
                         _ => String::new(),
                     };
-                    eprintln!("create_monitor_set: {filename}, period={period}s");
+                    eprintln!(
+                        "create_monitor_set: {filename}, period={}s",
+                        period.as_secs()
+                    );
                     h.lock().unwrap().monitor_sets.push(MonitorSetDef {
                         filename,
-                        period_seconds: period,
+                        period,
                         macros,
                         trigger_pv: None,
                     });
@@ -346,9 +365,9 @@ impl AutosaveStartupConfig {
                     eprintln!("create_triggered_set: {filename}, trigger={trigger_channel}");
                     h.lock().unwrap().triggered_sets.push(MonitorSetDef {
                         filename,
-                        // Trigger-watcher poll interval (debounce).
-                        // 0 → clamped to 1s in `into_builder`.
-                        period_seconds: 0,
+                        // The command takes no period: the debounce is
+                        // whatever the shared owner makes of "unset".
+                        period: MonitorSetDef::poll_period(0),
                         macros,
                         trigger_pv: Some(trigger_channel),
                     });
@@ -505,12 +524,24 @@ mod tests {
     /// mapped every triggered set to `OnChange`, so the
     /// `SaveStrategy::Triggered` variant was unreachable from the
     /// iocsh `create_triggered_set` command.
+    /// A real, loadable request file, plus the search path that finds it.
+    /// A set that names a request file it cannot load no longer builds at
+    /// all (see `autosave_unresolvable_request_file.rs`), so a strategy
+    /// test has to give it one.
+    fn with_request_file(cfg: &mut AutosaveStartupConfig, dir: &tempfile::TempDir) {
+        std::fs::write(dir.path().join("settings.req"), "IOC:setpoint\n").unwrap();
+        cfg.request_file_paths.push(dir.path().to_path_buf());
+        cfg.save_file_path = Some(dir.path().to_path_buf());
+    }
+
     #[test]
     fn triggered_set_maps_to_triggered_strategy() {
+        let dir = tempfile::tempdir().unwrap();
         let mut cfg = AutosaveStartupConfig::new();
+        with_request_file(&mut cfg, &dir);
         cfg.triggered_sets.push(MonitorSetDef {
             filename: "settings.req".to_string(),
-            period_seconds: 0,
+            period: MonitorSetDef::poll_period(0),
             macros: String::new(),
             trigger_pv: Some("IOC:saveTrigger".to_string()),
         });
@@ -523,7 +554,7 @@ mod tests {
         // Direct check: `into_builder` is the public mapping; assert
         // the strategy via a SaveSet built from it.
         let rt = tokio::runtime::Runtime::new().unwrap();
-        let mgr = rt.block_on(builder.build()).expect("builder must build");
+        let mgr = rt.block_on(builder.build());
         let sets = mgr.sets();
         assert_eq!(sets.len(), 1, "one triggered set expected");
         match &sets[0].0.config().strategy {
@@ -547,17 +578,19 @@ mod tests {
     /// `MonitorSetDef` could omit it).
     #[test]
     fn triggered_set_without_trigger_pv_falls_back_to_onchange() {
+        let dir = tempfile::tempdir().unwrap();
         let mut cfg = AutosaveStartupConfig::new();
+        with_request_file(&mut cfg, &dir);
         cfg.triggered_sets.push(MonitorSetDef {
             filename: "settings.req".to_string(),
-            period_seconds: 5,
+            period: MonitorSetDef::poll_period(5),
             macros: String::new(),
             trigger_pv: None,
         });
 
         let builder = cfg.into_builder();
         let rt = tokio::runtime::Runtime::new().unwrap();
-        let mgr = rt.block_on(builder.build()).expect("builder must build");
+        let mgr = rt.block_on(builder.build());
         match &mgr.sets()[0].0.config().strategy {
             SaveStrategy::OnChange { min_interval, .. } => {
                 assert_eq!(*min_interval, Duration::from_secs(5));

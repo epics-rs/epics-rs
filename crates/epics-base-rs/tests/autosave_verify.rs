@@ -42,10 +42,10 @@ async fn test_verify_all_match() {
     .await
     .unwrap();
 
-    let results = verify(&db, &path).await.unwrap();
-    assert_eq!(results.len(), 2);
-    assert!(matches!(results[0].result, MatchResult::Match));
-    assert!(matches!(results[1].result, MatchResult::Match));
+    let report = verify(&db, &path).await.unwrap();
+    assert_eq!(report.entries.len(), 2);
+    assert!(matches!(report.entries[0].result, MatchResult::Match));
+    assert!(matches!(report.entries[1].result, MatchResult::Match));
 }
 
 #[epics_macros_rs::epics_test]
@@ -65,9 +65,12 @@ async fn test_verify_mismatch() {
     .await
     .unwrap();
 
-    let results = verify(&db, &path).await.unwrap();
-    assert_eq!(results.len(), 1);
-    assert!(matches!(results[0].result, MatchResult::Mismatch { .. }));
+    let report = verify(&db, &path).await.unwrap();
+    assert_eq!(report.entries.len(), 1);
+    assert!(matches!(
+        report.entries[0].result,
+        MatchResult::Mismatch { .. }
+    ));
 }
 
 #[epics_macros_rs::epics_test]
@@ -87,9 +90,9 @@ async fn test_verify_pv_not_found() {
     .await
     .unwrap();
 
-    let results = verify(&db, &path).await.unwrap();
-    assert_eq!(results.len(), 1);
-    assert!(matches!(results[0].result, MatchResult::PvNotFound));
+    let report = verify(&db, &path).await.unwrap();
+    assert_eq!(report.entries.len(), 1);
+    assert!(matches!(report.entries[0].result, MatchResult::PvNotFound));
 }
 
 #[epics_macros_rs::epics_test]
@@ -121,8 +124,7 @@ async fn test_verify_report_format() {
     .await
     .unwrap();
 
-    let results = verify(&db, &path).await.unwrap();
-    let report = format_verify_report(&results);
+    let report = format_verify_report(&verify(&db, &path).await.unwrap());
     assert!(report.contains("MISMATCH: PV2"));
     assert!(report.contains("NOT_FOUND: MISSING"));
     assert!(report.contains("1 match"));

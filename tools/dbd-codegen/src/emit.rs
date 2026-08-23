@@ -62,7 +62,7 @@ pub struct CvtDbAddr {
     pub dbf: String,
     /// The `special` C leaves on the DBADDR. Usually still `SPC_DBADDR`, but
     /// `lsi`/`lso`/`asyn` raise `SPC_NOMOD` (making the field unwritable over
-    /// CA — `rsrv/camessage.c:2545`) or `SPC_MOD` inside `cvt_dbaddr` itself.
+    /// CA — `rsrv/camessage.c:2611-2613`) or `SPC_MOD` inside `cvt_dbaddr` itself.
     pub special: String,
     /// The field whose value selects the type at runtime (`FTVL`, `SDEF`,
     /// `FTA`), or `None` when C's `cvt_dbaddr` always yields the same type.

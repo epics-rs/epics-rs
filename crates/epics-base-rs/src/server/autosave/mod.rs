@@ -9,6 +9,7 @@ pub mod save_file;
 pub mod save_set;
 pub mod startup;
 pub mod verify;
+mod watermark;
 
 pub use backup::BackupConfig;
 pub use error::{AutosaveError, AutosaveResult};

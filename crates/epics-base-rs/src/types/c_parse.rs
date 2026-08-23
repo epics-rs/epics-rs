@@ -104,6 +104,98 @@ pub fn put_string(field: &str, target: NumericField, s: &str) -> CaResult<EpicsV
     parse(target, s).ok_or_else(|| refuse(field, s, target))
 }
 
+/// C `dbGetConvertRoutine[DBF_STRING][target]` / `dbFastGetConvertRoutine` —
+/// the same `epicsParse*` as [`put_string`], with the get direction's own
+/// empty-string rule.
+///
+/// `cvt_st_c` (`dbFastLinkConv.c:91-101`), `cvt_st_d` (`:233-244`) and the
+/// array twin `getStringDouble` (`dbConvert.c:392-414`) all test the empty
+/// string FIRST and answer with a successful zero:
+///
+/// ```c
+/// if (*from == 0) { *to = 0; return 0; }
+/// ```
+///
+/// The put row has no such test (`putStringDouble`, `dbConvert.c:1130-1147`),
+/// so an empty `DBF_STRING` field READS as 0 while an empty `caput` is refused.
+/// That asymmetry is why the two directions cannot share one entry point. A
+/// whitespace-only field is not empty by this test and reaches `epicsParse*`,
+/// which refuses it.
+pub fn get_string(target: NumericField, s: &str) -> CaResult<EpicsValue> {
+    if s.is_empty() {
+        return Ok(zero(target));
+    }
+    parse(target, s).ok_or_else(|| {
+        CaError::GetConvertFailed(format!(
+            "cannot convert \"{s}\" to {target:?} (C epicsParse* returns a non-zero status)"
+        ))
+    })
+}
+
+/// C `dbGetConvertRoutine[DBF_STRING][target]` — [`get_string`] run over a
+/// whole `DBF_STRING` array into `target`'s array variant.
+///
+/// `getStringDouble` (`dbConvert.c:392-414`) and its per-width siblings loop
+/// `nRequest` times and `return status` from inside the loop, so the first
+/// element C cannot parse aborts the entire get; the caller's buffer is never
+/// completed and rsrv answers ECA_GETFAIL. Nothing partial reaches the client,
+/// which is why this collects rather than substituting a value per element.
+pub fn get_string_array(
+    target: NumericField,
+    elems: &[crate::types::PvString],
+) -> CaResult<EpicsValue> {
+    // Every arm is the same loop over a different width; `get_string` returns
+    // the row's own scalar variant by construction, so the row and the variant
+    // are named together here and nowhere else.
+    macro_rules! rows {
+        ($(($row:ident, $scalar:ident, $array:ident)),+ $(,)?) => {
+            match target {
+                $(NumericField::$row => {
+                    let mut out = Vec::with_capacity(elems.len());
+                    for s in elems {
+                        match get_string(target, &s.as_str_lossy())? {
+                            EpicsValue::$scalar(v) => out.push(v),
+                            other => return Err(CaError::GetConvertFailed(format!(
+                                "{target:?} row produced {other:?}"
+                            ))),
+                        }
+                    }
+                    Ok(EpicsValue::$array(out))
+                })+
+            }
+        };
+    }
+    rows!(
+        (Char, Char, CharArray),
+        (UChar, UChar, UCharArray),
+        (Short, Short, ShortArray),
+        (UShort, UShort, UShortArray),
+        (Long, Long, LongArray),
+        (ULong, ULong, ULongArray),
+        (Int64, Int64, Int64Array),
+        (UInt64, UInt64, UInt64Array),
+        (Float, Float, FloatArray),
+        (Double, Double, DoubleArray),
+    )
+}
+
+/// The value C's empty-string carve-out stores: `*to = 0` in the destination's
+/// own type.
+fn zero(target: NumericField) -> EpicsValue {
+    match target {
+        NumericField::Char => EpicsValue::Char(0),
+        NumericField::UChar => EpicsValue::UChar(0),
+        NumericField::Short => EpicsValue::Short(0),
+        NumericField::UShort => EpicsValue::UShort(0),
+        NumericField::Long => EpicsValue::Long(0),
+        NumericField::ULong => EpicsValue::ULong(0),
+        NumericField::Int64 => EpicsValue::Int64(0),
+        NumericField::UInt64 => EpicsValue::UInt64(0),
+        NumericField::Float => EpicsValue::Float(0.0),
+        NumericField::Double => EpicsValue::Double(0.0),
+    }
+}
+
 fn parse(target: NumericField, s: &str) -> Option<EpicsValue> {
     Some(match target {
         // The signed widths range-check against the destination and refuse a
@@ -132,22 +224,41 @@ fn parse(target: NumericField, s: &str) -> Option<EpicsValue> {
         // No band: the destination is as wide as `unsigned long`.
         NumericField::UInt64 => EpicsValue::UInt64(parse_ulong(s)?),
 
-        // `epicsParseFloat` (`epicsStdlib.c:318-335`) parses a double and then
-        // refuses anything the `float` cast would destroy — but only for a
-        // FINITE magnitude, so `Inf` and `NaN` are stored, not refused.
-        NumericField::Float => {
-            let v = parse_double(s)?;
-            let abs = v.abs();
-            if v > 0.0 && abs <= f32::MIN_POSITIVE as f64 {
-                return None; // S_stdlib_underflow
-            }
-            if v.is_finite() && abs >= f32::MAX as f64 {
-                return None; // S_stdlib_overflow
-            }
-            EpicsValue::Float(v as f32)
-        }
+        NumericField::Float => EpicsValue::Float(narrow_to_f32(parse_double(s)?)?),
         NumericField::Double => EpicsValue::Double(parse_double(s)?),
     })
+}
+
+/// The narrowing half of C `epicsParseFloat` (`epicsStdlib.c:318-335`), which
+/// every `DBF_FLOAT` string conversion runs after its double parse:
+///
+/// ```c
+/// abs = fabs(value);
+/// if (value > 0 && abs <= FLT_MIN)      return S_stdlib_underflow;
+/// if (finite(value) && abs >= FLT_MAX)  return S_stdlib_overflow;
+/// *to = (float) value;
+/// ```
+///
+/// `None` is C's non-zero status, which refuses the whole conversion — a
+/// `float` field never stores the `inf` a bare `as f32` would produce for
+/// `1e300`. Only a FINITE magnitude is gated, so an `Inf`/`NaN` LITERAL passes
+/// and is stored, and the underflow test is deliberately one-sided (`value >
+/// 0`), so `-1e-40` is accepted where `1e-40` is refused.
+///
+/// The single owner of that gate: `dbConvert.c` reaches it from both
+/// directions (`putStringFloat` at `:1119`, `getStringFloat` at `:379`,
+/// `cvt_st_f` in `dbFastLinkConv.c`) and `dbStaticLib.c:2797` reaches it from
+/// the `.db` load, so [`EpicsValue::parse`](super::EpicsValue::parse) must run
+/// it too or the same text is refused over CA and accepted from a `.db` file.
+pub(crate) fn narrow_to_f32(v: f64) -> Option<f32> {
+    let abs = v.abs();
+    if v > 0.0 && abs <= f32::MIN_POSITIVE as f64 {
+        return None; // S_stdlib_underflow
+    }
+    if v.is_finite() && abs >= f32::MAX as f64 {
+        return None; // S_stdlib_overflow
+    }
+    Some(v as f32)
 }
 
 /// `value < lo || value > hi` -> `S_stdlib_overflow`.

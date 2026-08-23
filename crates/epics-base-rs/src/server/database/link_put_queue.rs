@@ -196,6 +196,21 @@ pub(crate) struct LinkPutQueue {
     idle: tokio::sync::Notify,
     /// Set once the owner task has been spawned.
     owner_started: std::sync::atomic::AtomicBool,
+    /// The reactor the network half of this queue needs, captured where one is
+    /// known to exist — construction time, which for an IOC is inside
+    /// `IocApplication::run` and for a test is inside its `#[tokio::test]`.
+    ///
+    /// The queue is the one place on the record-processing chain that cannot
+    /// live on the background executor: `LinkSet::connect_link` for a `ca://`
+    /// target builds a `CaClient`, whose transport manager and search engine
+    /// own `tokio::net` sockets. Staging, by contrast, happens on whatever
+    /// thread processed the record — often a blocking connection thread with
+    /// no runtime — so the capability has to be carried here rather than read
+    /// off the staging thread. `None` means no runtime existed at all when the
+    /// database was built, and then an external link could not have worked
+    /// under any arrangement; the tail falls back to the background executor
+    /// so a purely local `LinkSet` still runs.
+    reactor: Option<crate::runtime::task::BlockingBridge>,
 }
 
 impl Default for LinkPutQueue {
@@ -205,6 +220,7 @@ impl Default for LinkPutQueue {
             work: Arc::new(tokio::sync::Notify::new()),
             idle: tokio::sync::Notify::new(),
             owner_started: std::sync::atomic::AtomicBool::new(false),
+            reactor: crate::runtime::task::BlockingBridge::try_capture(),
         }
     }
 }
@@ -223,6 +239,23 @@ impl Drop for LinkPutQueue {
 }
 
 impl LinkPutQueue {
+    /// Dispatch one link's network work on the captured reactor — the single
+    /// owner of "this future may touch a socket", so no other site in the
+    /// queue has to know which executor it is on.
+    fn spawn_network<F>(&self, fut: F)
+    where
+        F: Future<Output = ()> + Send + 'static,
+    {
+        match &self.reactor {
+            Some(reactor) => {
+                reactor.spawn(fut);
+            }
+            None => {
+                crate::runtime::task::spawn_background(fut);
+            }
+        }
+    }
+
     /// Stage `value` on `key`, coalescing latest-wins onto any pending value
     /// (C `dbCa.c:611-612`). Returns the completion receiver for an
     /// [`LinkPutOp::Async`] put — the caller awaits it, which is the
@@ -434,6 +467,11 @@ impl LinkPutQueue {
 
     /// Start the single owner task, once. `db` is weak so the task cannot
     /// keep the database alive; it exits when the database is dropped.
+    ///
+    /// Reached from the staging path, which record processing enters on
+    /// whatever thread processed the record, so the loop itself goes to the
+    /// background executor. The network work it dispatches goes to
+    /// [`Self::reactor`] instead — see that field.
     pub(crate) fn ensure_owner(self: &Arc<Self>, db: Weak<super::PvDatabaseInner>) {
         if self
             .owner_started
@@ -443,7 +481,7 @@ impl LinkPutQueue {
         }
         let queue = Arc::downgrade(self);
         let work = self.work.clone();
-        crate::runtime::task::spawn(owner_loop(queue, work, db));
+        crate::runtime::task::spawn_background(owner_loop(queue, work, db));
     }
 }
 
@@ -476,7 +514,7 @@ async fn owner_loop(
                 let lsets = resolve_lsets(&inner, &key.target);
                 drop(inner);
                 let q2 = q.clone();
-                crate::runtime::task::spawn(async move {
+                q.spawn_network(async move {
                     for lset in &lsets {
                         lset.connect_link(&key.name).await;
                     }
@@ -488,7 +526,7 @@ async fn owner_loop(
                 let lsets = resolve_lsets(&inner, &key.target);
                 drop(inner);
                 let q2 = q.clone();
-                crate::runtime::task::spawn(async move {
+                q.spawn_network(async move {
                     run_put(&lsets, &key, staged).await;
                     q2.finish(key);
                 });

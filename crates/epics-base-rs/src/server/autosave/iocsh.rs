@@ -43,6 +43,12 @@ pub fn autosave_commands(manager: Arc<AutosaveManager>) -> Vec<CommandDef> {
                             if !result.failed_puts.is_empty() {
                                 eprintln!("  {} put failures", result.failed_puts.len());
                             }
+                            for line in &result.malformed_lines {
+                                eprintln!(
+                                    "  line {}: unparseable, skipped: {}",
+                                    line.line_no, line.text
+                                );
+                            }
                         }
                         Err(e) => eprintln!("fdbrestore error: {e}"),
                     }
@@ -133,8 +139,8 @@ pub fn autosave_commands(manager: Arc<AutosaveManager>) -> Vec<CommandDef> {
 
                     match save_path {
                         Some(path) => match verify::verify(&db, &path).await {
-                            Ok(entries) => {
-                                eprint!("{}", verify::format_verify_report(&entries));
+                            Ok(report) => {
+                                eprint!("{}", verify::format_verify_report(&report));
                             }
                             Err(e) => eprintln!("asVerify error: {e}"),
                         },

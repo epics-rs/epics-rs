@@ -372,8 +372,7 @@ record(epid, "TEST:PID") {
             search_paths: vec![],
         })
         .build()
-        .await
-        .unwrap();
+        .await;
 
     // Save
     let saved = mgr.manual_save("test", &db).await.unwrap();

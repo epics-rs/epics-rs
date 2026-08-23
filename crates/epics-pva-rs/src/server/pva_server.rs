@@ -264,13 +264,10 @@ impl PvaServer {
             Some(mgr.clone().start(self.db.clone()))
         } else if let Some(ref cfg) = self.autosave_config {
             let builder = autosave::AutosaveBuilder::new().add_set(cfg.clone());
-            match builder.build().await {
-                Ok(mgr) => Some(Arc::new(mgr).start(self.db.clone())),
-                Err(e) => {
-                    eprintln!("autosave: failed to start: {e}");
-                    None
-                }
-            }
+            // `build` cannot fail: a set it could not construct is reported
+            // on the error log and carried as that set's error status, so
+            // there is nothing left here to abandon the autosave task for.
+            Some(Arc::new(builder.build().await).start(self.db.clone()))
         } else {
             None
         };

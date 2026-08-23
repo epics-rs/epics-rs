@@ -67,8 +67,8 @@ async fn read_with_optional_timeout<R: tokio::io::AsyncReadExt + Unpin>(
 /// Parse an opt-in resource cap from an env value. `None` (variable
 /// unset, empty, or unparseable) means **unbounded** — C rsrv imposes
 /// no per-client channel count limit in `claim_ciu_action`
-/// (`camessage.c:1182-1291`) and no per-channel subscription count
-/// limit in `event_add_action` (`camessage.c:1762-1823`); both refuse
+/// (`camessage.c:1213-1322`) and no per-channel subscription count
+/// limit in `event_add_action` (`camessage.c:1812-1920`); both refuse
 /// only on genuine memory exhaustion (`casCreateChannel` /
 /// `freeListCalloc` / `db_add_event` returning NULL → `ECA_ALLOCMEM`),
 /// never on a fixed count. A default cap diverged from this: a single
@@ -237,7 +237,7 @@ use crate::server::outbox::Outbox;
 // user of it is the async `handle_client`; host-only, same gate as that fn.
 // The embedded driver reaches the same primitive from `server::blocking`.
 #[cfg(not(epics_embedded_target))]
-use crate::server::recv::{Admit, RecvAccumulator, Refused};
+use crate::server::recv::{Admit, Gate, RecvAccumulator};
 // `OutboxDrain` is consumed only by the async `drain_and_flush`; host-only.
 use crate::server::frame::{FrameBuf, size_dbr_reply};
 #[cfg(not(epics_embedded_target))]
@@ -266,12 +266,13 @@ pub(crate) enum ChannelTarget {
 /// The CA status a *database put* reports to the client.
 ///
 /// C decides this by LAYER, not by which database error came back:
-/// `write_action` (`rsrv/camessage.c:781-789`) answers a failed
+/// `write_action` (`rsrv/camessage.c:804-820`) answers a failed
 /// `dbChannel_put` with `ECA_PUTFAIL` whatever the `dbStatus` was, and
-/// `write_notify_reply` (`camessage.c:1386-1391`) maps every
+/// `write_notify_reply` (`camessage.c:1417-1421`) maps every
 /// `status != notifyOK` to the same `ECA_PUTFAIL`. The type errors —
-/// `ECA_BADTYPE` — belong to the gates ABOVE the put (`caNetConvert`,
-/// `camessage.c:753`, and the DBR-type gate), which run first and tear the
+/// `ECA_BADTYPE` — belong to the gates ABOVE the put (the `INVALID_DB_REQ`
+/// DBR-type gate, `camessage.c:753-756`, and `caNetConvert`,
+/// `camessage.c:784-790`), which run first and tear the
 /// connection down; a *value* that the field's converter refuses is not a
 /// wire-type error and can never be reported as one.
 ///
@@ -300,8 +301,13 @@ impl PutStatus {
             // backs the CA gateway, whose "database" is an upstream channel.
             // A dead upstream is actionable as ECA_DISCONN, not as "Put fail".
             CaError::Disconnected | CaError::Shutdown | CaError::Io(_) => ECA_DISCONN,
-            // C `camessage.c:1660-1707`: the superseded put-callback, not this
-            // one, is the request that hears ECA_PUTCBINPROG.
+            // A refusal raised BELOW this layer: the database would not take a
+            // second put-callback for the record, so it answers the request
+            // that drew it — the arriving one. That is a different path from
+            // the CA layer's own ECA_PUTCBINPROG ([`PutNotifySlot`], which only
+            // ever answers a timed-out predecessor), and turning that refusal
+            // into a queued restart is the database's to do, so nothing here
+            // second-guesses it.
             CaError::PutCallbackInProgress(_) => ECA_PUTCBINPROG,
             // Every other way the database can refuse a put — a value the
             // field's converter rejects, a menu string that names no choice, a
@@ -378,99 +384,153 @@ mod put_status_tests {
     }
 }
 
-/// One async `CA_PROTO_WRITE_NOTIFY` put-callback awaiting record
-/// processing completion, owned by [`PutNotifySlot`].
-struct InFlightPutNotify {
-    /// Cancels the completion task's wait when this put-callback is
-    /// superseded by a newer WRITE_NOTIFY on the same channel
-    /// (C `dbNotifyCancel`, `camessage.c:1686`).
-    abort: tokio::task::AbortHandle,
-    /// Owns this put-callback's single client reply. The first of
-    /// {completion task, superseding request} to swap this `true`
-    /// sends the reply; the loser skips. Closes the race where a put
-    /// completes at the exact moment it is superseded — without it the
-    /// one ioid would get two replies (a success *and* an
-    /// ECA_PUTCBINPROG).
-    responded: Arc<AtomicBool>,
-    /// The WRITE_NOTIFY request header, echoed if this put-callback's reply
-    /// turns out to be unframeable for a pre-V49 client (C keeps `mp` and
-    /// hands it to `send_err`).
-    req_hdr: CaHeader,
-    /// Reply shape echoed in the superseded request's ECA_PUTCBINPROG
-    /// (C `putNotifyErrorReply(client, &pPutNotify->msg, …)` preserves
-    /// the original `m_dataType`/`m_count`/ioid, `camessage.c:1703`).
-    ioid: u32,
-    dbr_type: u16,
-    count: u32,
+/// How long C lets a channel's previous put-callback stay busy before it
+/// gives up on it — `epicsEventWaitWithTimeout(client->blockSem, 60.0)` in
+/// `write_notify_action` (`camessage.c:1711`). Reaching it is the ONLY
+/// condition under which this layer emits ECA_PUTCBINPROG.
+const PUT_NOTIFY_BLOCK_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// Who owns one in-flight put-callback's single client reply — and, with it,
+/// that put's put-log bracket.
+///
+/// C carries both on `pciu->pPutNotify`: `busy` says the put-callback is still
+/// outstanding, and `asWritePvt` is the `asTrapWriteWithData` handle whichever
+/// path answers the request must close — `camessage.c:1735-1747` lifts it out
+/// of the record and calls `asTrapWriteAfter` itself. Holding them in one cell
+/// is what stops a reply and its bracket from being closed by different paths:
+/// [`claim`](Self::claim) hands out both together, once.
+///
+/// "Still busy" is the negation of "reply claimed", so it is one atomic with
+/// one meaning rather than a `busy` flag and a `responded` flag that can
+/// disagree.
+struct PutNotifyCompletion {
+    replied: AtomicBool,
+    trap_guard: std::sync::Mutex<Option<epics_base_rs::server::access_security::TrapWriteGuard>>,
 }
 
-/// Single owner of a channel's in-flight `CA_PROTO_WRITE_NOTIFY`
-/// put-callback.
+/// Proof that its holder owns a put-callback's one client reply, carrying the
+/// put-log bracket that has to be closed with it. Dropping it without
+/// completing the guard fires the guard's cancel AfterWrite, the balance C
+/// gets from `asTrapWriteAfter` on a cancelled put.
+struct PutNotifyReply(Option<epics_base_rs::server::access_security::TrapWriteGuard>);
+
+impl PutNotifyCompletion {
+    fn new(
+        trap_guard: Option<epics_base_rs::server::access_security::TrapWriteGuard>,
+    ) -> Arc<Self> {
+        Arc::new(Self {
+            replied: AtomicBool::new(false),
+            trap_guard: std::sync::Mutex::new(trap_guard),
+        })
+    }
+
+    /// C `pciu->pPutNotify->busy`.
+    fn is_busy(&self) -> bool {
+        !self.replied.load(Ordering::Acquire)
+    }
+
+    /// Take this put-callback's reply. `None` for every caller after the
+    /// first, so one ioid can never draw two replies.
+    fn claim(&self) -> Option<PutNotifyReply> {
+        if self.replied.swap(true, Ordering::AcqRel) {
+            return None;
+        }
+        Some(PutNotifyReply(
+            self.trap_guard
+                .lock()
+                .expect("put-notify trap guard poisoned")
+                .take(),
+        ))
+    }
+}
+
+/// A channel's registered in-flight `CA_PROTO_WRITE_NOTIFY` put-callback — C
+/// `pciu->pPutNotify` once `busy = TRUE` (`camessage.c:1773`).
+struct InFlightPutNotify {
+    completion: Arc<PutNotifyCompletion>,
+    /// Reply shape the overdue branch echoes: C
+    /// `putNotifyErrorReply(client, &pPutNotify->msg, ECA_PUTCBINPROG)`
+    /// (`camessage.c:1745`) frames it from the SAVED request, never from the
+    /// one that just arrived.
+    reply: WriteNotifyReply,
+    /// When it was registered — `camessage.c:1712` measures its 60 s
+    /// `blockSem` wait from here.
+    busy_since: std::time::Instant,
+}
+
+/// Single owner of a channel's in-flight put-callback registration, and of the
+/// one rule this layer has about ECA_PUTCBINPROG.
 ///
-/// C `write_notify_action` (`rsrv/camessage.c:1660-1707`) keeps one
-/// `pciu->pPutNotify` per channel. A second WRITE_NOTIFY arriving while
-/// it is still busy does NOT reject the new request: it waits on
-/// `blockSem` for natural completion (up to 60s) and, only if the
-/// previous is still running, `dbNotifyCancel`s it and replies
-/// ECA_PUTCBINPROG to the *previous* request — then runs the new put.
-/// The new request is never refused.
+/// C `write_notify_action` (`camessage.c:1704-1750`) does not refuse a
+/// WRITE_NOTIFY that arrives while the channel's previous put-callback is
+/// still busy: it waits on `client->blockSem`, and only when that wait runs
+/// out does it `dbNotifyCancel` the predecessor and send ECA_PUTCBINPROG,
+/// addressed to the PREDECESSOR's saved `msg` (`camessage.c:1745` — the sole
+/// site that status has in all of rsrv). The arriving request is never the one
+/// refused.
 ///
-/// The async port supersedes the previous put-callback immediately
-/// rather than parking the connection's dispatch task on a 60s blocking
-/// wait (which would stall every later message on the connection). This
-/// matches C's force-cancel branch: a still-in-flight put-callback is
-/// aborted and its request gets ECA_PUTCBINPROG, while a put that has
-/// already completed naturally keeps its real reply (the `responded`
-/// CAS makes the late supersede a no-op). Only `is_notify` puts occupy
-/// the slot; a put that completes synchronously within the handler
-/// never installs an entry.
+/// So the rule here is "emit only on C's timeout path": a predecessor that has
+/// settled, or that is still inside [`PUT_NOTIFY_BLOCK_TIMEOUT`], draws no
+/// frame at all. Serialising concurrent put-callbacks — queueing the second on
+/// the record's restart list versus refusing it — belongs to the database
+/// below, so nothing here suppresses a `CaError::PutCallbackInProgress` coming
+/// up from there.
+///
+/// Both receive loops reach this through [`serve_write_head`], which also
+/// performs the registration, so neither can serialise on its own terms.
 #[derive(Clone, Default)]
 pub(crate) struct PutNotifySlot {
     inner: Arc<std::sync::Mutex<Option<InFlightPutNotify>>>,
 }
 
 impl PutNotifySlot {
-    /// Remove and return the channel's current in-flight put-callback
-    /// so the caller can supersede it. Leaves the slot empty.
-    fn take(&self) -> Option<InFlightPutNotify> {
-        self.inner.lock().expect("put-notify slot poisoned").take()
-    }
-
-    /// Install a freshly spawned put-callback as the channel's
-    /// in-flight one (replacing any stale completed entry the slot
-    /// still held).
+    /// Register a freshly forked put-callback as the channel's in-flight one,
+    /// replacing whatever the slot held — C overwrites the single
+    /// `pciu->pPutNotify` the same way.
     fn install(&self, inflight: InFlightPutNotify) {
         *self.inner.lock().expect("put-notify slot poisoned") = Some(inflight);
     }
-}
 
-/// Supersede a previously in-flight put-callback, if any: cancel its
-/// completion-wait and, when this path wins the response-ownership
-/// race, reply ECA_PUTCBINPROG to the superseded request. C
-/// `write_notify_action` cancel branch (`camessage.c:1686-1704`). The
-/// new WRITE_NOTIFY then proceeds — it is never rejected.
-fn supersede_put_notify(
-    prev: Option<InFlightPutNotify>,
-    writer: &Outbox,
-    client_minor: u16,
-) -> CaResult<()> {
-    if let Some(prev) = prev {
-        prev.abort.abort();
-        if !prev.responded.swap(true, Ordering::AcqRel) {
-            send_put_notify_response(
-                writer,
-                prev.dbr_type,
-                prev.count,
-                ECA_PUTCBINPROG,
-                prev.ioid,
-                ReplyContext {
-                    req_hdr: prev.req_hdr,
-                    client_minor,
-                },
-            )?;
-        }
+    /// C `write_notify_action`'s serialisation block (`camessage.c:1704-1750`),
+    /// run before this WRITE_NOTIFY's first side effect. The arriving request
+    /// proceeds on every arm; only a predecessor that has outstayed
+    /// [`PUT_NOTIFY_BLOCK_TIMEOUT`] draws ECA_PUTCBINPROG, and it draws it for
+    /// its own ioid.
+    fn serialize(&self, writer: &Outbox) -> CaResult<()> {
+        // Deregister once the predecessor can no longer be waited on: either it
+        // settled (C's `blockSem` returns at once) or it outstayed the wait. One
+        // still inside the wait stays registered and draws nothing.
+        let expired = {
+            let mut slot = self.inner.lock().expect("put-notify slot poisoned");
+            let done = slot.as_ref().is_some_and(|reg| {
+                !reg.completion.is_busy() || reg.busy_since.elapsed() >= PUT_NOTIFY_BLOCK_TIMEOUT
+            });
+            if done { slot.take() } else { None }
+        };
+        let Some(reg) = expired else { return Ok(()) };
+        // A settled predecessor has already spent its reply, so `claim` says no
+        // and nothing goes out; only the overdue one reaches the frame. Losing
+        // the claim here is C's second `busy` re-test under `putNotifyLock`
+        // (`camessage.c:1730`): a put that finished mid-decision keeps its real
+        // reply.
+        let Some(reply_token) = reg.completion.claim() else {
+            return Ok(());
+        };
+        // Dropping the token un-completed closes the put-log bracket with the
+        // guard's cancel AfterWrite — C `asTrapWriteAfter(asWritePvtTmp)`.
+        drop(reply_token);
+        send_put_notify_response(
+            writer,
+            reg.reply.write_type,
+            reg.reply.write_count,
+            ECA_PUTCBINPROG,
+            reg.reply.ioid,
+            ReplyContext {
+                req_hdr: reg.reply.req_hdr,
+                client_minor: reg.reply.client_minor,
+            },
+        )
     }
-    Ok(())
 }
 
 struct ChannelEntry {
@@ -490,11 +550,10 @@ struct ChannelEntry {
     /// and the READ path get a fresh stateful chain.
     filter_suffix: Option<String>,
     /// Single owner of this channel's in-flight `CA_PROTO_WRITE_NOTIFY`
-    /// put-callback. C `write_notify_action`
-    /// (`rsrv/camessage.c:1660-1707`) keeps one `pciu->pPutNotify` per
-    /// channel; a second WRITE_NOTIFY supersedes (cancels) the previous
-    /// one rather than rejecting the new request. See [`PutNotifySlot`].
-    /// `Arc`-backed so the async completion task and a superseding
+    /// put-callback registration — C `pciu->pPutNotify`, one per channel
+    /// (`rsrv/camessage.c:1704-1776`). Registered and consulted by
+    /// [`serve_write_head`], so both receive loops get the same rule. See
+    /// [`PutNotifySlot`]. `Arc`-backed so the completion path and a later
     /// request share it without re-borrowing `state.channels`.
     put_notify_slot: PutNotifySlot,
     /// long-string boundary conversion this channel applies on every
@@ -555,7 +614,7 @@ impl ChannelEntry {
 impl SubscriptionEntry {
     /// C `pevext->msg` — the EVENT_ADD request header rsrv stores alongside
     /// the subscription and echoes back on the error path (`read_reply`
-    /// `camessage.c:520`, `no_read_access_event` `camessage.c:450-480`).
+    /// `camessage.c:516-524`, `no_read_access_event` `camessage.c:455-485`).
     /// Rebuilt from the fields the entry already keeps, so it is the header
     /// the client actually sent.
     fn request_header(&self) -> CaHeader {
@@ -584,7 +643,7 @@ struct SubscriptionEntry {
     /// Gate flipped by `reeval_access_rights` when read access is
     /// revoked / restored for `channel_sid`. While `true`, the
     /// producer task drops events at the send step (matches C
-    /// `casAccessRightsCB`, `rsrv/camessage.c:1080-1095`, which
+    /// `casAccessRightsCB`, `rsrv/camessage.c:1116-1124`, which
     /// calls `db_event_disable` rather than tearing the
     /// subscription down — so an ACF reload that later restores
     /// access can resume the same camonitor).
@@ -689,7 +748,7 @@ pub(crate) struct ClientState {
     /// async device doesn't leak the task forever, and also aborted
     /// when the owning channel is freed via `CA_PROTO_CLEAR_CHANNEL`
     /// (C parity: `clear_channel_reply` calls `rsrvFreePutNotify`
-    /// per-channel — `camessage.c:1889`). The sid tag lets us drain
+    /// per-channel — `camessage.c:1943`). The sid tag lets us drain
     /// only the channel-scoped tasks on CLEAR_CHANNEL without
     /// disturbing other channels' in-flight WRITE_NOTIFYs.
     write_notify_tasks: Vec<(u32, tokio::task::AbortHandle)>,
@@ -711,15 +770,15 @@ pub(crate) struct ClientState {
 ///
 /// * `asCheckClientIP == 0` (**C's default**) — `create_tcp_client` leaves
 ///   it NULL and `host_name_action` stores whatever name the client sends
-///   in `CA_PROTO_HOST_NAME`, unconditionally (`camessage.c:845-875`).
-///   Until then the identity is `""` (`camessage.c:770` passes
+///   in `CA_PROTO_HOST_NAME`, unconditionally (`camessage.c:880-903`).
+///   Until then the identity is `""` (`camessage.c:1276-1281` passes
 ///   `pHostName ? pHostName : ""` to `asAddClient`), which matches no HAG.
 ///   HAG entries are host *names* in this mode, so this is the identity
 ///   `HOST(...)` rules are written against.
 /// * `asCheckClientIP == 1` — `create_tcp_client` fills it with the peer's
 ///   dotted-quad IP (`caservertask.c:1425-1437`) and `host_name_action`
 ///   returns early without storing the claimed name
-///   (`camessage.c:839-843`).
+///   (`camessage.c:869-875`).
 ///
 /// The port adds a third source with no C counterpart: an mTLS-verified
 /// certificate identity, which likewise cannot be overwritten by a
@@ -836,8 +895,9 @@ impl ClientState {
     }
 
     /// The negotiated CA minor protocol version of the peer. Needed by the
-    /// blocking driver's framing loop (`CaHeader::from_bytes_for_peer`) and
-    /// its error replies (`send_ca_error`), which live outside this module.
+    /// blocking driver's receive loop, which feeds it to the shared gate
+    /// (`RecvAccumulator::next_message`) and to its error replies
+    /// (`send_ca_error`) from outside this module.
     pub(crate) fn client_minor_version(&self) -> u16 {
         self.client_minor_version
     }
@@ -1000,13 +1060,13 @@ impl ClientState {
                 // same lock.
                 let (is_ro, asg, asl) = {
                     let instance = record.read();
-                    // C `rsrvCheckPut` (rsrv/camessage.c:2540-2551):
+                    // C `rsrvCheckPut` (rsrv/camessage.c:2608-2619):
                     //
                     //     /* SPC_NOMOD fields are always unwritable */
                     //     if (dbChannelSpecial(pciu->dbch) == SPC_NOMOD) return 0;
                     //
                     // and its `0` clears the ACCESS_RIGHTS write bit at
-                    // camessage.c:1123-1124. The declaration has one owner
+                    // camessage.c:1154-1156. The declaration has one owner
                     // (`RecordInstance::is_no_mod`), shared with the `dbPut`
                     // gate — reading `field_list().read_only` alone here saw
                     // neither the dbCommon NOMOD set (NAME/STAT/SEVR/ACKS/…,
@@ -1933,7 +1993,7 @@ where
             }
 
             // The single growth point. `accept` runs C's drain preamble
-            // (`camessage.c:2375-2384` — bytes owed to an already-refused
+            // (`camessage.c:2428-2439` — bytes owed to an already-refused
             // message are discarded before any header parsing) and enforces
             // the accumulation ceiling before appending.
             match accumulated.accept(&buf[..n]) {
@@ -1949,157 +2009,61 @@ where
                 }
             }
 
-            let mut offset = 0;
-            while offset + CaHeader::SIZE <= accumulated.len() {
-                // Every extended-form step below — the partial-annex
-                // wait and the annex parse itself — is gated on the peer
-                // speaking V49, exactly as C gates the whole branch on
-                // `CA_V49(client->minor_version_number)`
-                // (`camessage.c:2410`). A pre-V49 peer that sends
-                // `m_postsize == 0xffff` therefore keeps a 16-byte header
-                // with postsize 0xffff, and the alignment check below
-                // rejects it (0xffff + 16 is not 8-aligned) —
-                // `camessage.c:2452`.
-                let peer_v49 = crate::protocol::ca_v49(state.client_minor_version);
-                let buf = &accumulated.bytes()[offset..];
-                // C `rsrv/camessage.c:~2410`: when the buffer holds a
-                // partial extended-form header (16..24 bytes of a message
-                // whose `m_postsize == 0xffff`), C does `status = RSRV_OK;
-                // break;` to await the remaining bytes — it does NOT
-                // disconnect. Without this guard, `from_bytes_extended`
-                // returns `Err("extended header incomplete")` and the `?`
-                // below closes the connection on a benign TCP segment
-                // boundary. The oversize gate now runs after the parse, so
-                // it cannot mask this 16..24 window.
-                if peer_v49 && buf.len() < 24 && buf[2] == 0xFF && buf[3] == 0xFF {
-                    break;
-                }
-                let (hdr, hdr_size) =
-                    match CaHeader::from_bytes_for_peer(buf, state.client_minor_version) {
-                        Ok(v) => v,
-                        Err(e) => break 'client_loop Err(e),
-                    };
-                let actual_post = hdr.actual_postsize();
-
-                // C `camessage.c:2471-2489`: a declared body the receive
-                // buffer can never hold earns ECA_TOLARGE and a drain, not
-                // a disconnect — the client keeps every channel and
-                // subscription it holds.
-                //
-                // Placed here, before `hdr_size + actual_post` is formed
-                // anywhere, and not at C's textual position after the
-                // version and alignment tests: C computes `msgsize` once at
-                // `:2418`/`:2422` ahead of all three, and `actual_post` is a
-                // `u32` straight off the wire. On a 32-bit target — which is
-                // what RTEMS is — `hdr_size + actual_post` wraps for a
-                // declared body near `u32::MAX`, so every later use of
-                // `msg_len` is only meaningful once this gate has passed.
-                // Applied to the declared body of every message, normal form
-                // and extended alike, so there is no boundary at which the
-                // rule changes.
-                if let Err(ceiling) = RecvAccumulator::admits_body(actual_post) {
-                    let _ = send_ca_error(
-                        &outbox,
-                        &hdr,
-                        ECA_TOLARGE,
-                        0xFFFF_FFFF,
-                        &crate::server::recv::too_large_message(ceiling),
-                        state.client_minor_version,
-                    );
-                    let _ = drain_and_flush(&mut sock, &mut outbox_drain).await;
-                    tracing::warn!(
-                        peer = %state.peer,
-                        declared = actual_post,
-                        max = ceiling,
-                        "CAS: server unable to load large request message"
-                    );
-                    let msg_len = hdr_size.saturating_add(actual_post);
-                    match accumulated.refuse(offset, msg_len) {
-                        Refused::ResumeAt(next) => {
-                            offset = next;
-                            continue;
-                        }
-                        Refused::DrainPending => {
-                            offset = accumulated.len();
-                            break;
-                        }
+            // Every protocol gate between "a header parsed" and "dispatch
+            // this message" belongs to `RecvAccumulator::next_message`, which
+            // the blocking driver's loop calls too. Neither loop can see the
+            // individual tests, reorder them, skip one, or move the parse
+            // cursor itself — which is what stopped these two loops carrying
+            // two hand-maintained lists that drift.
+            let mut parsed_any = false;
+            loop {
+                let (hdr, payload) = match accumulated.next_message(state.client_minor_version) {
+                    Gate::NeedMore => break,
+                    Gate::Deliver { hdr, payload } => (hdr, payload),
+                    Gate::Refuse(err) => {
+                        // C `RSRV_OK`: the peer keeps every channel and
+                        // subscription it holds; only this message is lost.
+                        parsed_any = true;
+                        tracing::warn!(
+                            peer = %state.peer,
+                            cmmd = err.hdr.cmmd,
+                            status = err.status,
+                            diagnostic = %err.diagnostic,
+                            "CAS: message refused, circuit kept"
+                        );
+                        let _ = send_ca_error(
+                            &outbox,
+                            &err.hdr,
+                            err.status,
+                            0xFFFF_FFFF,
+                            &err.diagnostic,
+                            state.client_minor_version,
+                        );
+                        let _ = drain_and_flush(&mut sock, &mut outbox_drain).await;
+                        continue;
                     }
-                }
-
-                // C `camessage.c:2426-2445`: the "client version too old"
-                // gate runs BEFORE the alignment test at 2452, and it
-                // keeps the connection open — `send_err(ECA_DEFUNCT)`,
-                // then `client->recvBytesToDrain = msgsize - bytes_left`
-                // and `status = RSRV_OK`. Order matters now that a
-                // pre-V49 `m_postsize == 0xffff` falls through to the
-                // alignment test: a pre-V44 peer must still get
-                // ECA_DEFUNCT and keep its circuit, not the V44+ peer's
-                // ECA_INTERNAL disconnect.
-                if hdr.cmmd != CA_PROTO_VERSION
-                    && state.client_minor_version < CA_MINIMUM_SUPPORTED_VERSION
-                {
-                    let _ = send_ca_error(
-                        &outbox,
-                        &hdr,
-                        ECA_DEFUNCT,
-                        0xFFFF_FFFF,
-                        &format!("CAS: Client version {} too old", state.client_minor_version),
-                        state.client_minor_version,
-                    );
-                    let _ = drain_and_flush(&mut sock, &mut outbox_drain).await;
-                    // Same refuse-but-keep-serving shape as ECA_TOLARGE
-                    // above, through the same owner.
-                    let msg_len = hdr_size + actual_post;
-                    match accumulated.refuse(offset, msg_len) {
-                        Refused::ResumeAt(next) => {
-                            offset = next;
-                            continue;
+                    Gate::TearDown { error, reason } => {
+                        // C `RSRV_ERROR`: send what C sends, then close.
+                        tracing::warn!(
+                            peer = %state.peer,
+                            reason = %reason,
+                            "CAS: circuit torn down by the receive gate"
+                        );
+                        if let Some(err) = error {
+                            let _ = send_ca_error(
+                                &outbox,
+                                &err.hdr,
+                                err.status,
+                                0xFFFF_FFFF,
+                                &err.diagnostic,
+                                state.client_minor_version,
+                            );
                         }
-                        Refused::DrainPending => {
-                            offset = accumulated.len();
-                            break;
-                        }
+                        let _ = drain_and_flush(&mut sock, &mut outbox_drain).await;
+                        break 'client_loop Err(reason);
                     }
-                }
-
-                // C `rsrv/camessage.c:2452` rejects misaligned payloads
-                // ("CAS: Missaligned protocol rejected") with an
-                // ECA_INTERNAL error and disconnects the client. Our
-                // previous code silently rounded up via `align8`, which on
-                // a hostile peer would cause us to read into the next
-                // message's header and de-sync the stream. Now: emit
-                // CA_PROTO_ERROR + drop the connection (match C).
-                if actual_post & 0x7 != 0 {
-                    tracing::warn!(
-                        peer = %state.peer,
-                        cmmd = hdr.cmmd,
-                        postsize = actual_post,
-                        "CAS: Missaligned protocol rejected"
-                    );
-                    let _ = send_ca_error(
-                        &outbox,
-                        &hdr,
-                        ECA_INTERNAL,
-                        0xFFFF_FFFF,
-                        "CAS: Missaligned protocol rejected",
-                        state.client_minor_version,
-                    );
-                    let _ = drain_and_flush(&mut sock, &mut outbox_drain).await;
-                    break 'client_loop Err(epics_base_rs::error::CaError::Protocol(
-                        "misaligned CA payload".into(),
-                    ));
-                }
-                let msg_len = hdr_size + actual_post;
-
-                if offset + msg_len > accumulated.len() {
-                    break;
-                }
-
-                let payload = if actual_post > 0 {
-                    accumulated.bytes()[offset + hdr_size..offset + hdr_size + actual_post].to_vec()
-                } else {
-                    Vec::new()
                 };
+                parsed_any = true;
 
                 // Rate-limit gate: drop messages when the bucket is empty;
                 // disconnect the client once it accumulates enough strikes.
@@ -2117,7 +2081,8 @@ where
                             disconnect_reason = "rate_limited";
                             break 'client_loop Ok(());
                         }
-                        offset += msg_len;
+                        // The cursor is already past this message — the
+                        // gate advanced it when it handed the message over.
                         continue;
                     } else if state.rate_limit_strikes > 0 {
                         state.rate_limit_strikes = 0;
@@ -2186,11 +2151,9 @@ where
                         break 'client_loop Ok(());
                     }
                 }
-                offset += msg_len;
             }
 
-            if offset > 0 {
-                accumulated.consume(offset);
+            if parsed_any {
                 // Batched flush: dispatch_message pushed all responses for
                 // this read iteration into the outbox without touching the
                 // socket. Drain them into the BufWriter and flush once now so
@@ -2304,24 +2267,25 @@ pub(crate) async fn dispatch_message(
     peer: SocketAddr,
     conn_events: Option<&broadcast::Sender<ServerConnectionEvent>>,
 ) -> CaResult<()> {
-    // The "client version too old" (ECA_DEFUNCT) gate lives in the
-    // framing loop, not here: C runs it at `camessage.c:2426` — before
-    // the alignment test at 2452 — and it needs the framing loop's
-    // drain bookkeeping (`client->recvBytesToDrain`) to swallow the
-    // rest of the rejected message. Keeping it here would have run it
-    // after alignment, giving a pre-V44 peer the V44+ peer's
-    // ECA_INTERNAL disconnect for the same bytes.
+    // The "client version too old" (ECA_DEFUNCT) gate is not here: it is
+    // `RecvAccumulator::next_message`'s, shared with the blocking driver.
+    // C runs it at `camessage.c:2489` — before the alignment test at 2520 —
+    // and it needs the receive buffer's drain bookkeeping
+    // (`client->recvBytesToDrain`) to swallow the rest of the rejected
+    // message. Running it here would put it after alignment, giving a
+    // pre-V44 peer the V44+ peer's ECA_INTERNAL disconnect for the same
+    // bytes.
 
     match hdr.cmmd {
         CA_PROTO_VERSION => {
-            // C `tcp_version_action` (camessage.c:366-369): rejects
+            // C `tcp_version_action` (camessage.c:371-374): rejects
             // clients whose minor version < CA_MINIMUM_SUPPORTED_VERSION
             // (=4) with RSRV_ERROR, which tears the connection down.
             // Without this gate, an ancient client could complete the
             // VERSION handshake and proceed to CREATE_CHAN with a
             // wire format we no longer fully support — silently
             // diverging from C IOC behaviour.
-            if hdr.count < CA_MINIMUM_SUPPORTED_VERSION {
+            if !declares_supported_version(hdr) {
                 tracing::warn!(
                     peer = ?peer,
                     minor = hdr.count,
@@ -2357,7 +2321,7 @@ pub(crate) async fn dispatch_message(
                 )));
             }
             state.client_minor_version = hdr.count;
-            // C `rsrv_version_reply` (camessage.c:2115) emits VERSION
+            // C `rsrv_version_reply` (camessage.c:2178-2180) emits VERSION
             // with all fields zero except `m_count = CA_MINOR_PROTOCOL_REVISION`.
             // The previous Rust defaults (`data_type=1, cid=1`) drifted
             // from byte-exact parity — C clients only consult `m_count`
@@ -2387,7 +2351,7 @@ pub(crate) async fn dispatch_message(
                 )?;
                 return Ok(());
             }
-            // C `camessage.c:824-825`: `size = strnlen(pName, m_postsize)
+            // C `camessage.c:855-856`: `size = strnlen(pName, m_postsize)
             // + 1; if (size > 512 || size > m_postsize) reject`.
             // The second condition rejects payloads with no null
             // terminator within m_postsize bytes (strnlen returns
@@ -2400,7 +2364,7 @@ pub(crate) async fn dispatch_message(
             let null_pos = payload.iter().position(|&b| b == 0);
             let end = null_pos.unwrap_or(payload.len());
             if null_pos.is_none() || end >= 512 {
-                // C `host_name_action` (camessage.c:825-836): a name
+                // C `host_name_action` (camessage.c:854-867): a name
                 // longer than 511 bytes is a protocol violation —
                 // send_err + return RSRV_ERROR (disconnect). The
                 // post-claim freeze branch above returns RSRV_OK
@@ -2465,7 +2429,7 @@ pub(crate) async fn dispatch_message(
                 )?;
                 return Ok(());
             }
-            // C `camessage.c:911-912`: same 512-byte cap as host
+            // C `camessage.c:942-943`: same 512-byte cap as host
             // name, AND same null-termination requirement. C
             // computes `size = strnlen(pName, m_postsize) + 1`
             // then rejects on `size > m_postsize`, which catches
@@ -2475,7 +2439,7 @@ pub(crate) async fn dispatch_message(
             let null_pos = payload.iter().position(|&b| b == 0);
             let end = null_pos.unwrap_or(payload.len());
             if null_pos.is_none() || end >= 512 {
-                // C `client_name_action` (camessage.c:912-923): same
+                // C `client_name_action` (camessage.c:941-954): same
                 // 511-byte cap as host_name; send_err + RSRV_ERROR
                 // (disconnect). Post-claim freeze branch returns
                 // RSRV_OK; size cap returns RSRV_ERROR.
@@ -2552,12 +2516,12 @@ pub(crate) async fn dispatch_message(
 
         CA_PROTO_CREATE_CHAN => {
             // Pre-CA-4.4 clients send claims with no PV name (postsize=0).
-            // Silently ignore these, matching C server behavior (camessage.c:1204).
+            // Silently ignore these, matching C server behavior (camessage.c:1235-1239).
             // The client will retry with v4.4+ format after receiving our VERSION.
             if hdr.actual_postsize() <= 1 {
                 return Ok(());
             }
-            // C `rsrv/camessage.c:1196` `claim_ciu_action` writes
+            // C `rsrv/camessage.c:1227` `claim_ciu_action` writes
             // `client->minor_version_number = mp->m_available;`
             // UNCONDITIONALLY, then rejects the channel outright if the
             // result is below 4.4 (`if (!CA_V44(...)) return RSRV_ERROR;`).
@@ -2609,12 +2573,12 @@ pub(crate) async fn dispatch_message(
                         "rejecting CREATE_CHAN: per-client channel limit reached"
                     );
                     metrics::counter!("ca_server_channel_limit_rejects_total").increment(1);
-                    // C parity: `claim_ciu_action` (rsrv/camessage.c:1229-1239)
+                    // C parity: `claim_ciu_action` (rsrv/camessage.c:1260-1270)
                     // routes channel-allocation failure through
                     // `send_err(mp, ECA_ALLOCMEM, …)`, NOT
                     // CREATE_CH_FAIL. CREATE_CH_FAIL is reserved for the
                     // `dbChannel_create` (PV/field not found) branch
-                    // (camessage.c:1212-1219). libca
+                    // (camessage.c:1242-1251). libca
                     // `exceptionRespAction` surfaces the ECA_ALLOCMEM
                     // status to the user-level callback so the client
                     // knows "server out of resources" vs CREATE_CH_FAIL's
@@ -2632,7 +2596,7 @@ pub(crate) async fn dispatch_message(
                         "channel limit reached",
                         state.client_minor_version,
                     )?;
-                    // C `claim_ciu_action` (camessage.c:1229-1240): when
+                    // C `claim_ciu_action` (camessage.c:1260-1270): when
                     // the server's channel-allocation pool is exhausted,
                     // send_err(ECA_ALLOCMEM) is followed by RSRV_ERROR
                     // which tears the connection down. The Rust per-
@@ -2891,7 +2855,7 @@ pub(crate) async fn dispatch_message(
                 ar.cid = client_cid;
                 ar.available = access;
 
-                // C `claim_ciu_reply` (camessage.c:1157-1167): clients
+                // C `claim_ciu_reply` (camessage.c:1188-1195): clients
                 // whose minor version is below CA_V49 (= 9) cannot parse
                 // extended-form headers. For those peers, `nElem` is
                 // capped at 0xfffe so the CREATE_CHAN reply stays in
@@ -2954,11 +2918,11 @@ pub(crate) async fn dispatch_message(
             // `INVALID_DB_REQ(m_dataType)` type check sits relative to
             // the channel lookup.
             //
-            // C `read_notify_action` (`rsrv/camessage.c:693-697`) checks
+            // C `read_notify_action` (`rsrv/camessage.c:703-705`) checks
             // the type BEFORE the lookup and returns RSRV_ERROR with no
             // wire frame, so READ_NOTIFY is handled here, silently.
             //
-            // C `read_action` (`rsrv/camessage.c:608-619`) resolves the
+            // C `read_action` (`rsrv/camessage.c:606-621`) resolves the
             // channel FIRST (`if(!pciu){logBadId;return}` — `logBadId`
             // sends an ECA_INTERNAL "Bad Resource ID" frame with a
             // cid=0xFFFFFFFF sentinel) and only THEN, if the type is
@@ -2983,16 +2947,16 @@ pub(crate) async fn dispatch_message(
             let entry = match state.channels.get(&sid) {
                 Some(e) => e,
                 None => {
-                    // C `read_action` (camessage.c:608-610) and
-                    // `read_notify_action` (700-703) bad-SID:
+                    // C `read_action` (camessage.c:613-616) and
+                    // `read_notify_action` (707-711) bad-SID:
                     // `if (!pciu) { logBadId; return RSRV_ERROR; }`.
-                    // `logBadId` (camessage.c:307-320) is NOT log-only —
+                    // `logBadId` (camessage.c:312-325) is NOT log-only —
                     // it calls `send_err(ECA_INTERNAL, "Bad Resource ID
                     // at %s.%d")`, buffering a CA_PROTO_ERROR frame that
                     // camsgtask.c:142 flushes ("flush any queued messages
                     // before shutdown") before the disconnect. Since
                     // `MPTOPCIU` returned NULL, `vsend_err` stamps
-                    // cid=0xFFFFFFFF (camessage.c:163-167). So C emits one
+                    // cid=0xFFFFFFFF (camessage.c:172-178). So C emits one
                     // ECA_INTERNAL frame, then drops the connection.
                     send_ca_error(
                         writer,
@@ -3063,7 +3027,7 @@ pub(crate) async fn dispatch_message(
                     if is_notify {
                         // C `read_notify_action` →
                         // `read_reply` → `no_read_access_event`
-                        // (`rsrv/camessage.c:450-480`) builds a
+                        // (`rsrv/camessage.c:455-485`) builds a
                         // CA_PROTO_READ_NOTIFY frame with the
                         // ORIGINAL requested count and a
                         // `dbr_size_n`-sized zero payload, abusing
@@ -3087,7 +3051,7 @@ pub(crate) async fn dispatch_message(
                             },
                         )?;
                     } else {
-                        // C `read_action` (`rsrv/camessage.c:636-642`)
+                        // C `read_action` (`rsrv/camessage.c:644-650`)
                         // sends `send_err(mp, ECA_NORDACCESS, client,
                         // RECORD_NAME(pciu->dbch))` — i.e.
                         // CA_PROTO_ERROR — for the deprecated
@@ -3095,7 +3059,7 @@ pub(crate) async fn dispatch_message(
                         // silently returned, so a libca client saw a
                         // timeout instead of the C error callback.
                         // outer cid is `pciu->cid` per
-                        // `vsend_err` (camessage.c:160-170).
+                        // `vsend_err` (camessage.c:172-175).
                         let audit_pv = match &entry.target {
                             ChannelTarget::SimplePv(pv) => pv.name.clone(),
                             ChannelTarget::RecordField { record, field } => {
@@ -3292,7 +3256,7 @@ pub(crate) async fn dispatch_message(
                     // emit the error + drop the connection.
                     //
                     // C `read_notify_action`
-                    // (`rsrv/camessage.c:693-697`) returns
+                    // (`rsrv/camessage.c:703-705`) returns
                     // `RSRV_ERROR` on `INVALID_DB_REQ` WITHOUT
                     // emitting any wire frame — only the deprecated
                     // `read_action` (camessage.c:616-620) calls
@@ -3318,9 +3282,37 @@ pub(crate) async fn dispatch_message(
                         requested_type
                     )));
                 }
+                Err(ReadReplyError::GetFail) => {
+                    // C `read_reply`'s `dbChannel_get_count() < 0` branch
+                    // (`camessage.c:544-560`) — the same wire shape the
+                    // read-hook failure above emits, reached here because the
+                    // conversion itself refused the field.
+                    if is_notify {
+                        return send_no_read_access_event(
+                            writer,
+                            CA_PROTO_READ_NOTIFY,
+                            requested_type,
+                            requested_count,
+                            ioid,
+                            ECA_GETFAIL,
+                            ReplyContext {
+                                req_hdr: *hdr,
+                                client_minor: state.client_minor_version,
+                            },
+                        );
+                    }
+                    return send_ca_error(
+                        writer,
+                        hdr,
+                        ECA_GETFAIL,
+                        entry.cid,
+                        "get conversion failed",
+                        state.client_minor_version,
+                    );
+                }
                 Err(ReadReplyError::Oversize) => {
                     // C client TCP parser requires 8-byte aligned postsize.
-                    // C `read_action` (`camessage.c:625-631`): a reply needing
+                    // C `read_action` (`camessage.c:630-639`): a reply needing
                     // the extended header for a pre-V49 client is not framed —
                     // the server answers ECA_16KARRAYCLIENT and keeps the
                     // circuit.
@@ -3344,66 +3336,30 @@ pub(crate) async fn dispatch_message(
             // receiver to its event thread. Wire behavior is unchanged.
             match serve_write_head(hdr, payload, state, db, writer).await? {
                 WriteHeadOutcome::Done => {}
-                WriteHeadOutcome::AsyncPending(pending) => {
-                    // This put-callback is now async (record processing is still
-                    // running). Mint its response-ownership token: whichever of
-                    // {this completion task, a superseding WRITE_NOTIFY} swaps
-                    // `responded` to `true` first owns the single client reply, so
-                    // the two can never both reply for this ioid.
-                    let responded = Arc::new(AtomicBool::new(false));
-                    let responded_task = responded.clone();
+                WriteHeadOutcome::AsyncPending(mut pending) => {
+                    // Registration and the ECA_PUTCBINPROG rule both live in
+                    // `serve_write_head`; all this loop owes the put-callback is
+                    // the wait and the shared tail.
+                    let sid = pending.sid;
                     // Clone the outbox handle for the completion task: it pushes the
                     // deferred reply into the same per-connection outbox the loop
                     // drains — it never touches the socket writer directly.
                     let outbox_c = writer.clone();
-                    let PendingWriteNotify {
-                        rx,
-                        mut trap_guard,
-                        eca_status,
-                        reply,
-                        put_notify_slot,
-                        sid,
-                    } = pending;
                     let join = tokio::spawn(async move {
                         // Wait indefinitely for record processing to complete,
-                        // matching C rsrv. RecvError means the Sender was dropped
-                        // without firing (processing aborted) — surface as
-                        // ECA_PUTFAIL so the client doesn't observe a false success.
-                        let final_status = match rx.await {
-                            Ok(()) => eca_status,
-                            Err(_) => ECA_PUTFAIL,
-                        };
-                        // Claim this put-callback's single reply. If a superseding
-                        // WRITE_NOTIFY already won the race it sent ECA_PUTCBINPROG
-                        // for this ioid and aborted this task; skip the reply.
-                        // Returning here drops `trap_guard` un-completed, so its
-                        // Drop still fires the cancel AfterWrite for this superseded
-                        // put (C `camessage.c:1700`).
-                        if responded_task.swap(true, Ordering::AcqRel) {
-                            return;
-                        }
-                        let _ =
-                            finish_write_notify(&mut trap_guard, final_status, &reply, &outbox_c);
-                    });
-                    // Publish as the channel's in-flight put-callback so a later
-                    // WRITE_NOTIFY on this channel supersedes it (C `dbNotifyCancel`
-                    // + ECA_PUTCBINPROG). Replaces any stale completed entry; that
-                    // entry's `responded` is already `true`, so superseding it is a
-                    // harmless no-op.
-                    put_notify_slot.install(InFlightPutNotify {
-                        req_hdr: reply.req_hdr,
-                        abort: join.abort_handle(),
-                        responded,
-                        ioid: reply.ioid,
-                        dbr_type: reply.write_type,
-                        count: reply.write_count,
+                        // matching C rsrv.
+                        let chain = (&mut pending.rx).await;
+                        let _ = pending.settle(chain, &outbox_c);
                     });
                     // Track for connection-scoped cleanup: a stuck async record
                     // would otherwise pin this task and the captured `Outbox`
                     // handle forever after the client drops. Reap finished handles
                     // opportunistically; the `sid` tag also lets
                     // `CA_PROTO_CLEAR_CHANNEL` drain only the cleared channel's
-                    // tasks (C `rsrvFreePutNotify`).
+                    // tasks (C `rsrvFreePutNotify`). Aborting the task drops the
+                    // last reference to its completion token with the put-log
+                    // bracket still inside, so the cancel AfterWrite fires there
+                    // too (C `camessage.c:1650-1652`).
                     state.write_notify_tasks.retain(|(_, h)| !h.is_finished());
                     state.write_notify_tasks.push((sid, join.abort_handle()));
                 }
@@ -3505,7 +3461,7 @@ pub(crate) async fn dispatch_message(
 
         CA_PROTO_EVENTS_OFF | CA_PROTO_EVENTS_ON => {
             // C `db_event_flow_ctrl_mode_on/off` on this circuit's event user
-            // (`camessage.c:1745-1757`). Under EVENTS_OFF each post replaces the
+            // (`camessage.c:430-445`). Under EVENTS_OFF each post replaces the
             // monitor's last queued entry in place and readers suspend once the
             // queue holds no duplicates — the queue owns both rules.
             if hdr.cmmd == CA_PROTO_EVENTS_OFF {
@@ -3516,7 +3472,7 @@ pub(crate) async fn dispatch_message(
         }
 
         CA_PROTO_READ_SYNC => {
-            // C `read_sync_reply` (camessage.c:2053-2067): server
+            // C `read_sync_reply` (camessage.c:2107-2121): server
             // echoes the request header back with cmmd=CA_PROTO_READ_SYNC,
             // m_postsize=0, and the request's m_dataType / m_count /
             // m_cid / m_available preserved. libca client treats this
@@ -3540,7 +3496,7 @@ pub(crate) async fn dispatch_message(
         }
 
         CA_PROTO_ECHO => {
-            // C `tcp_echo_action` (`rsrv/camessage.c:403-420`) echoes
+            // C `tcp_echo_action` (`rsrv/camessage.c:410-425`) echoes
             // the *full* request back to the client — same m_cmmd,
             // m_postsize, m_dataType, m_count, m_cid, m_available, and
             // the m_postsize-byte payload. Real clients (libca
@@ -3583,24 +3539,21 @@ pub(crate) async fn dispatch_message(
         }
 
         CA_PROTO_SEARCH => {
-            // C `search_reply_tcp` (camessage.c:2238-2241): if
-            // `!CA_VSUPPORTED(m_count)` (minor < 4) the handler
-            // returns RSRV_ERROR which tears the TCP connection
-            // down. Note that the *UDP* SEARCH path returns RSRV_OK
-            // on the same condition (silently skips the reply, no
-            // datagram-level disconnect) — those two paths share
-            // the version-check logic but differ in fatality.
-            //
-            // Pre-fix Rust silently `return Ok(())`-ed, keeping the
-            // connection. A peer could spam unsupported-minor TCP
-            // SEARCH frames indefinitely.
-            if state.client_minor_version < 4 {
+            // C `search_reply_tcp` (`camessage.c:2292-2295`) gates on the
+            // SEARCH frame's own `m_count` and answers `RSRV_ERROR`, which
+            // tears the circuit down. The searcher's version rides in the
+            // frame because a SEARCH is not bound to the handshake that
+            // opened the circuit; reading the negotiated version here served
+            // an ancient searcher a v4.13 reply it cannot parse whenever some
+            // other peer's handshake had raised the circuit.
+            if !declares_supported_version(hdr) {
                 return Err(epics_base_rs::error::CaError::Protocol(format!(
-                    "TCP SEARCH from minor {} (< 4) — C search_reply_tcp RSRV_ERROR parity",
-                    state.client_minor_version
+                    "TCP SEARCH declaring minor {} (< {CA_MINIMUM_SUPPORTED_VERSION}) — \
+                     C search_reply_tcp RSRV_ERROR parity",
+                    hdr.count
                 )));
             }
-            // C `search_reply_tcp` (rsrv/camessage.c:2246) rejects
+            // C `search_reply_tcp` (rsrv/camessage.c:2292-2295) rejects
             // SEARCH whose `m_postsize <= 1` and silently returns
             // RSRV_OK. Mirror that here so an attacker's empty-name
             // SEARCH burst on an open TCP connection cannot drive
@@ -3627,7 +3580,7 @@ pub(crate) async fn dispatch_message(
             // the client host to `gateAs::findEntry`.
             if db.has_name_from(&pv_name, Some(peer)).await {
                 // C parity: `search_reply_tcp`
-                // (`rsrv/camessage.c:2229-2287`) sends:
+                // (`rsrv/camessage.c:2329-2331`) sends:
                 //   m_postsize  = 0  (no payload — TCP search reply
                 //                 carries no minor-version trailer,
                 //                 unlike UDP)
@@ -3659,7 +3612,7 @@ pub(crate) async fn dispatch_message(
                 // Explicit negative reply requested — send NOT_FOUND so
                 // the client doesn't have to wait for a search timeout.
                 //
-                // C parity: `search_fail_reply` (rsrv/camessage.c:2079)
+                // C parity: `search_fail_reply` (rsrv/camessage.c:2129-2143)
                 // copies the request's `m_dataType`/`m_count`/`m_cid`/
                 // `m_available` verbatim into the response. The previous
                 // Rust path overwrote `count` with the server's
@@ -3682,7 +3635,7 @@ pub(crate) async fn dispatch_message(
         CA_PROTO_CLEAR_CHANNEL => {
             let sid = hdr.cid;
             let cid = hdr.available;
-            // C `clear_channel_reply` (camessage.c:1883-1887)
+            // C `clear_channel_reply` (camessage.c:1937-1941)
             // disconnects on a bad SID via `logBadId` + RSRV_ERROR;
             // `logBadId` emits an ECA_INTERNAL "Bad Resource ID" frame
             // (cid=0xFFFFFFFF) flushed before the close. Channels in this
@@ -3720,7 +3673,7 @@ pub(crate) async fn dispatch_message(
                     });
                 }
 
-                // C parity: `clear_channel_reply` (`camessage.c:1889`)
+                // C parity: `clear_channel_reply` (`camessage.c:1943`)
                 // calls `rsrvFreePutNotify` to drain pending PUT_NOTIFY
                 // operations for this channel. Without aborting the
                 // matching tasks, a stuck async record could later
@@ -3768,19 +3721,15 @@ pub(crate) async fn dispatch_message(
         }
 
         _ => {
-            // Unknown command — match C `bad_tcp_cmd_action`
-            // (`camessage.c:337-352`): send CA_PROTO_ERROR with
-            // ECA_INTERNAL and the 0xFFFFFFFF cid sentinel (per
-            // `vsend_err` non-channel-scoped convention), then
-            // tear down the connection. C returns `RSRV_ERROR`
-            // which breaks the dispatcher's message loop
-            // (`camessage.c:2519-2524`) — its comment is
-            // explicit: "by default, clients don't recover from
-            // this". Without the tear-down, a misbehaving or
-            // malicious peer can flood the server with unknown
-            // commands and force one CA_PROTO_ERROR reply per
-            // frame indefinitely.
-            let error_msg = format!("Unsupported command {}", hdr.cmmd);
+            // A LEGAL CA opcode with no arm above. An ILLEGAL one never
+            // reaches here: `RecvAccumulator::next_message` answers those
+            // with C `bad_tcp_cmd_action` (`camessage.c:342-357`) —
+            // ECA_INTERNAL and a tear-down — for both drivers, so this arm
+            // no longer carries a second copy of that rule. The set is
+            // empty today (`every_legal_tcp_command_is_routed_by_this_driver`
+            // pins it), and C's answer is the right fail-closed default for
+            // a routing table that fell behind the protocol.
+            let error_msg = format!("Unrouted command {}", hdr.cmmd);
             send_ca_error(
                 writer,
                 hdr,
@@ -3790,7 +3739,7 @@ pub(crate) async fn dispatch_message(
                 state.client_minor_version,
             )?;
             return Err(epics_base_rs::error::CaError::Protocol(format!(
-                "unsupported TCP command {} (matches C bad_tcp_cmd_action drop)",
+                "legal but unrouted TCP command {}",
                 hdr.cmmd
             )));
         }
@@ -3806,7 +3755,7 @@ pub(crate) async fn dispatch_message(
 /// has passed C's protocol bound and the circuit is no longer at risk.
 ///
 /// C's bound is `LAST_BUFFER_TYPE` (= `DBR_CLASS_NAME`, 38), applied by
-/// `INVALID_DB_REQ` in `write_notify_action` (`rsrv/camessage.c:1673`) and by
+/// `INVALID_DB_REQ` in `write_notify_action` (`rsrv/camessage.c:1678`) and by
 /// `caNetConvert` (`ca/src/client/convert.cpp:1421`) on the `write_action`
 /// path. Anything above it is a protocol violation and RSRV drops the circuit;
 /// anything at or below it keeps the circuit whatever the put then does.
@@ -3842,7 +3791,7 @@ impl AcceptedWriteType {
     /// answer `ECA_BADTYPE` and drop, as RSRV does.
     fn classify(data_type: u16) -> Option<Self> {
         if let Ok(native) = DbFieldType::from_u16(data_type) {
-            return Some(Self::Native(native));
+            return Some(Self::Native(native.wire_carrier()));
         }
         if data_type > epics_base_rs::types::LAST_BUFFER_TYPE {
             return None;
@@ -3855,13 +3804,43 @@ impl AcceptedWriteType {
             _ => Self::MetadataOnly,
         })
     }
+
+    /// The value this WRITE payload puts, in the carrier `dbChannel_put`
+    /// gives it. `None` for [`Self::MetadataOnly`]: those buffers carry no
+    /// value member.
+    ///
+    /// Both arms take the carrier from
+    /// [`DbFieldType::wire_carrier`](epics_base_rs::types::DbFieldType::wire_carrier)
+    /// — `classify` composes it for the native codes and `decode_dbr` for
+    /// the compound ones — so the CHAR row cannot answer differently here
+    /// than it does on the client's read and monitor paths.
+    ///
+    /// That row is where C's two maps disagree: `dbChannel_put`
+    /// (`db/db_access.c:820-...`) puts `oldDBR_CHAR` — and each of its
+    /// `STS_`/`TIME_`/`GR_`/`CTRL_` compounds, and `mapOldType` (`:988`) on
+    /// the WRITE_NOTIFY path — as `DBR_UCHAR`, so the widening row it
+    /// reaches is `putUcharLong` (`dbConvert.c`, `PUT` body
+    /// `*pdst = (typeb) *psrc`) and 0xC8 widens to 200; the signed
+    /// `putCharLong` is unreachable from CA.
+    fn decode(self, data_type: u16, payload: &[u8], count: usize) -> Option<CaResult<EpicsValue>> {
+        Some(match self {
+            Self::Native(native) => EpicsValue::from_bytes_array(native, payload, count),
+            // C `dbChannel_put`'s per-type arms are a header skip plus a put
+            // of the base type. `decode_dbr` performs exactly that skip — one
+            // owner for the compound layouts, shared with the read/monitor
+            // path, and bounds-checked where C casts the struct unchecked.
+            Self::Compound => epics_base_rs::types::decode_dbr(data_type, payload, count)
+                .map(|snapshot| snapshot.value),
+            Self::MetadataOnly => return None,
+        })
+    }
 }
 
 /// What the put stage does with a frame that has cleared both gates.
 ///
 /// Both variants are *put results*, reached only after the trap-write bracket
 /// is armed: C runs `asTrapWriteWithData` before `dbChannel_put` /
-/// `dbProcessNotify` unconditionally (`rsrv/camessage.c:794-804`, `:1775`), so
+/// `dbProcessNotify` unconditionally (`rsrv/camessage.c:799-804`, `:1795-1802`), so
 /// a put-log listener sees the attempt whether or not the buffer type has a
 /// put arm. Deciding refusal *here* rather than at the type gate is what keeps
 /// that bracket around it.
@@ -3923,8 +3902,8 @@ pub(crate) async fn serve_write_head(
         let entry = match state.channels.get(&sid) {
             Some(e) => e,
             None => {
-                // C `write_action` (camessage.c:736-738) +
-                // `write_notify_action` (camessage.c:1642-1645):
+                // C `write_action` (camessage.c:747-751) +
+                // `write_notify_action` (camessage.c:1672-1676):
                 // `if (!pciu) { logBadId; return RSRV_ERROR; }`.
                 // `logBadId` emits an ECA_INTERNAL "Bad Resource
                 // ID" frame (cid=0xFFFFFFFF), flushed before the
@@ -4004,7 +3983,7 @@ pub(crate) async fn serve_write_head(
                         },
                     )?;
                 } else {
-                    // C `write_action` (`rsrv/camessage.c:741-751`)
+                    // C `write_action` (`rsrv/camessage.c:772-779`)
                     // sends `send_err(mp, ECA_NOWTACCESS, client,
                     // RECORD_NAME(pciu->dbch))` even for the no-
                     // notify WRITE. DBR_PUT_ACKT/DBR_PUT_ACKS
@@ -4051,19 +4030,15 @@ pub(crate) async fn serve_write_head(
             epics_base_rs::server::record::AlarmAck::Severity
         };
         // DBR_PUT_ACKT/ACKS WRITE_NOTIFY travels C
-        // `write_notify_action`, so it shares the same
-        // per-channel put-callback serialisation as a regular
-        // WRITE_NOTIFY. Supersede any in-flight put-callback on
-        // this channel *before* the alarm-ack side effect — C
-        // cancels the previous `pPutNotify` and replies
-        // ECA_PUTCBINPROG to the superseded request rather than
-        // rejecting this one (`camessage.c:1660-1707`). The
-        // alarm-ack completes synchronously, so it never installs
-        // an entry of its own. The deprecated fire-and-forget
-        // CA_PROTO_WRITE path is not serialised in C.
+        // `write_notify_action`, so it meets the same per-channel
+        // put-callback serialisation as a regular WRITE_NOTIFY, and
+        // it meets it *before* the alarm-ack side effect
+        // (`camessage.c:1704-1750`). The alarm-ack completes
+        // synchronously, so it never registers an entry of its own.
+        // The deprecated fire-and-forget CA_PROTO_WRITE path is not
+        // serialised in C.
         if is_notify {
-            let prev = entry.put_notify_slot.take();
-            supersede_put_notify(prev, writer, state.client_minor_version)?;
+            entry.put_notify_slot.serialize(writer)?;
         }
         let result = match &entry.target {
             ChannelTarget::RecordField { record, field } => {
@@ -4122,8 +4097,8 @@ pub(crate) async fn serve_write_head(
         return Ok(WriteHeadOutcome::Done);
     }
 
-    // C `write_action` (`rsrv/camessage.c:735-739`) and
-    // `write_notify_action` (`camessage.c:1641-1645`) call
+    // C `write_action` (`rsrv/camessage.c:747-751`) and
+    // `write_notify_action` (`camessage.c:1672-1676`) call
     // `MPTOPCIU(mp)` BEFORE any DBR-type check, so a bad SID
     // path goes through `logBadId` + RSRV_ERROR — emitting the
     // ECA_INTERNAL "Bad Resource ID" frame (cid=0xFFFFFFFF)
@@ -4203,7 +4178,7 @@ pub(crate) async fn serve_write_head(
             // corrupted dispatcher or is probing, so C drops. A compound
             // type is BELOW that bound and therefore never reaches here.
             if is_notify {
-                // C `putNotifyErrorReply` (camessage.c:1482-1501)
+                // C `putNotifyErrorReply` (camessage.c:1513-1533)
                 // preserves `m_dataType`/`m_count` from the request —
                 // the count is pre-clamp here, as in C.
                 send_put_notify_response(
@@ -4283,7 +4258,7 @@ pub(crate) async fn serve_write_head(
                 // the extended-form count instead of the u16
                 // marker. The echoed type is the REQUEST's
                 // (`putNotifyErrorReply` preserves `m_dataType`,
-                // camessage.c:1482-1501); the count is the CLAMPED
+                // camessage.c:1513-1533); the count is the CLAMPED
                 // one — C reads the mutated `mp->m_count`.
                 send_put_notify_response(
                     writer,
@@ -4329,33 +4304,25 @@ pub(crate) async fn serve_write_head(
 
     // the write-trap mask of the ACF rule that
     // authorised this write. C `asTrapWriteWithData`
-    // (`rsrv/camessage.c:768-779`) consults
+    // (`rsrv/camessage.c:799-802`) consults
     // `pasgclient->trapMask` so a `NOTRAPWRITE` rule — or a
     // rule with no trap option — is not reported to
     // put-logging listeners. Pre-fix Rust hard-coded
     // `rule_was_trap: true` for every accepted write.
     let rule_was_trap = write_grant.rule_was_trap();
 
-    // Supersede any in-flight put-callback on this channel here —
-    // after the SID/type/access checks and *before* any side
-    // effect (payload conversion, trap-write `BeforeWrite`
-    // dispatch, the database/PV write, or the async device
-    // kickoff). C `write_notify_action`
-    // (`rsrv/camessage.c:1660-1707`) reaches this boundary —
-    // after `rsrvCheckPut` and before `caNetConvert` /
-    // `asTrapWriteWithData` / `dbProcessNotify` — with the
-    // channel's previous `pPutNotify` either already completed or
-    // cancelled (`dbNotifyCancel` + ECA_PUTCBINPROG to the
-    // superseded request). It never rejects the new request.
-    // `supersede_put_notify` does exactly that: it cancels the
-    // prior put-callback's completion-wait and replies
-    // ECA_PUTCBINPROG to the superseded ioid (when this path wins
-    // the response-ownership race), then this put proceeds. The
-    // deprecated fire-and-forget CA_PROTO_WRITE path is not
-    // serialised in C, so it is left untouched.
+    // Serialise against this channel's previous put-callback here — after
+    // the SID/type/access checks and *before* any side effect (payload
+    // conversion, trap-write `BeforeWrite` dispatch, the database/PV write,
+    // or the async device kickoff). C `write_notify_action` reaches the
+    // same boundary, after `rsrvCheckPut` and before `caNetConvert` /
+    // `asTrapWriteWithData` / `dbProcessNotify`. This request proceeds on
+    // every arm; only a predecessor past C's `blockSem` deadline is
+    // cancelled and answered ECA_PUTCBINPROG, for its own ioid. The
+    // deprecated fire-and-forget CA_PROTO_WRITE path is not serialised in
+    // C, so it is left untouched.
     if is_notify {
-        let prev = put_notify_slot.take();
-        supersede_put_notify(prev, writer, state.client_minor_version)?;
+        put_notify_slot.serialize(writer)?;
     }
 
     // The CLAMPED full 32-bit count flows to the decode, the put and the
@@ -4378,13 +4345,13 @@ pub(crate) async fn serve_write_head(
     // and must still be bracketed by the trap-write pair below, as C's
     // unconditional `asTrapWriteWithData` does. ECA_PUTFAIL is C's answer
     // on either opcode — `send_err(mp, ECA_PUTFAIL, ...)` + RSRV_OK
-    // (`camessage.c:806-816`) and `notifyError` → `ECA_PUTFAIL`
-    // (`camessage.c:1412-1413`) — and neither drops the circuit.
+    // (`camessage.c:812-820`) and `notifyError` → `ECA_PUTFAIL`
+    // (`camessage.c:1417-1419`) — and neither drops the circuit.
 
     // A malformed payload is a protocol violation on every buffer type: C
     // sizes the frame against `dbr_size_n` of the WIRE type and returns
-    // RSRV_ERROR before it looks at the put (`camessage.c:761-764`,
-    // `:1688-1691`), and `caNetConvert` failure does the same. One closure so
+    // RSRV_ERROR before it looks at the put (`camessage.c:768-770`,
+    // `:1700-1702`), and `caNetConvert` failure does the same. One closure so
     // that drop rule cannot fork between the native and compound decoders.
     let value_or_drop = |decoded: CaResult<EpicsValue>| -> CaResult<EpicsValue> {
         if decoded.is_ok() {
@@ -4420,21 +4387,13 @@ pub(crate) async fn serve_write_head(
         )))
     };
 
-    let plan = match wire_type {
-        AcceptedWriteType::Native(native) => PutPlan::Write {
-            value: value_or_drop(EpicsValue::from_bytes_array(native, payload, count))?,
-        },
-        // C `dbChannel_put`'s per-type arms (`db/db_access.c:820`) are a
-        // header skip plus a put of the base type. `decode_dbr` performs
-        // exactly that skip — one owner for the compound layouts, shared
-        // with the read/monitor path, and bounds-checked where C casts the
-        // struct unchecked.
-        AcceptedWriteType::Compound => {
-            let value = value_or_drop(
-                epics_base_rs::types::decode_dbr(hdr.data_type, payload, count)
-                    .map(|snapshot| snapshot.value),
-            )?;
-            if is_notify {
+    let plan = match wire_type.decode(hdr.data_type, payload, count) {
+        // C's `default:` arm on either opcode; these buffers carry no value
+        // member for the put-log to render.
+        None => PutPlan::Refuse { logged_value: None },
+        Some(decoded) => {
+            let value = value_or_drop(decoded)?;
+            if is_notify && wire_type == AcceptedWriteType::Compound {
                 // `mapOldType` (`db_access.c:988`) maps only the native
                 // types, so this one reaches `notifyError`.
                 PutPlan::Refuse {
@@ -4444,9 +4403,6 @@ pub(crate) async fn serve_write_head(
                 PutPlan::Write { value }
             }
         }
-        // C's `default:` arm on either opcode; these buffers carry no value
-        // member for the put-log to render.
-        AcceptedWriteType::MetadataOnly => PutPlan::Refuse { logged_value: None },
     };
 
     // Stringify the value once for the audit log; skipped when
@@ -4481,14 +4437,14 @@ pub(crate) async fn serve_write_head(
     // Drop. This makes the C invariant hold by construction:
     // every `asTrapWriteWithData` is matched by exactly one
     // `asTrapWriteAfter` on all rsrv exit paths — completion
-    // (`camessage.c:1400`), still-busy teardown
+    // (`camessage.c:1431`), still-busy teardown
     // (`rsrvFreePutNotify`, :1620), and supersede-cancel
     // (`write_notify_action`, :1700). Pre-fix the AfterWrite was
     // an explicit dispatch that the abort paths skipped, leaving
     // a BeforeWrite with no match in the put-log.
     //
     // BeforeWrite still sits here (not inside each write arm):
-    // C `asTrapWriteWithData` (`camessage.c:768-779`) fires
+    // C `asTrapWriteWithData` (`camessage.c:799-802`) fires
     // before `dbChannel_put`, and narrowing the bracket into the
     // match arms would not remove the pre-storage over-log
     // (RecordField pre-rejections happen inside the called
@@ -4501,7 +4457,7 @@ pub(crate) async fn serve_write_head(
                 host: state.hostname.as_str().to_string(),
                 peer: state.peer.clone(),
                 value_str: display_value.clone(),
-                // C `asTrapWriteWithData` (`camessage.c:768-779`) logs
+                // C `asTrapWriteWithData` (`camessage.c:799-802`) logs
                 // `mp->m_dataType` — the type the client SENT, which for a
                 // compound put differs from the base type the record took.
                 dbr_type: hdr.data_type,
@@ -4588,7 +4544,7 @@ pub(crate) async fn serve_write_head(
         }
     }
 
-    // C `write_action` (`rsrv/camessage.c:781-789`):
+    // C `write_action` (`rsrv/camessage.c:812-820`):
     // even the deprecated fire-and-forget `CA_PROTO_WRITE`
     // surfaces a failed `dbChannel_put` to the client via
     // `send_err(mp, ECA_PUTFAIL, ...)`. Pre-fix Rust dropped
@@ -4631,26 +4587,37 @@ pub(crate) async fn serve_write_head(
         // carries no completion to await).
         let completion_rx = write_result.ok().and_then(ProcessCompletion::into_handle);
         if let Some(rx) = completion_rx {
+            let reply = WriteNotifyReply {
+                // C `write_notify_reply` (`camessage.c:1417-1434`) frames the
+                // completion from the saved request header, so the echoed type
+                // is always the one the client SENT — the same value as the
+                // native type for a native put, and the only available answer
+                // for the compound and refused ones.
+                write_type: hdr.data_type,
+                write_count,
+                ioid,
+                req_hdr: *hdr,
+                client_minor: state.client_minor_version,
+            };
+            // The trap-write bracket moves into the completion token rather
+            // than travelling with the receiver, so that whichever path
+            // answers this ioid closes it — C keeps `asWritePvt` on
+            // `pciu->pPutNotify` for the same reason.
+            let completion = PutNotifyCompletion::new(trap_guard.take());
+            // Register HERE, in the head both receive loops run, not in the
+            // caller: an unregistered channel silently opts out of the
+            // serialisation above, which is exactly how the two loops came to
+            // answer a concurrent put-callback differently.
+            put_notify_slot.install(InFlightPutNotify {
+                completion: completion.clone(),
+                reply,
+                busy_since: std::time::Instant::now(),
+            });
             return Ok(WriteHeadOutcome::AsyncPending(PendingWriteNotify {
                 rx,
-                // Handed on UN-completed so the trap-write AfterWrite
-                // fires at real device-side completion, from whoever
-                // awaits `rx` (C `write_notify_reply:1400`).
-                trap_guard: trap_guard.take(),
                 eca_status,
-                reply: WriteNotifyReply {
-                    // C `write_notify_reply` (`camessage.c:1417-1434`) frames
-                    // the completion from the saved request header, so the
-                    // echoed type is always the one the client SENT — the same
-                    // value as the native type for a native put, and the only
-                    // available answer for the compound and refused ones.
-                    write_type: hdr.data_type,
-                    write_count,
-                    ioid,
-                    req_hdr: *hdr,
-                    client_minor: state.client_minor_version,
-                },
-                put_notify_slot,
+                reply,
+                completion,
                 sid,
             }));
         }
@@ -4734,17 +4701,44 @@ pub(crate) enum WriteHeadOutcome {
 }
 
 /// One in-flight async `CA_PROTO_WRITE_NOTIFY` handed back by
-/// [`serve_write_head`] for the caller to complete when the record's chain
-/// settles. `put_notify_slot` / `sid` are the async server's connection-scoped
-/// bookkeeping (in-flight-slot install + task tracking); the blocking driver
-/// ignores them and just awaits `rx` on its event thread.
+/// [`serve_write_head`] for the caller to await. The channel registration is
+/// already done by the head, so all a receive loop owes this value is
+/// [`settle`](Self::settle) once `rx` reports. `sid` is the async server's
+/// connection-scoped task tracking (`CA_PROTO_CLEAR_CHANNEL` drains by it);
+/// the blocking driver ignores it and awaits `rx` on its event thread.
 pub(crate) struct PendingWriteNotify {
     pub rx: tokio::sync::oneshot::Receiver<()>,
-    pub trap_guard: Option<epics_base_rs::server::access_security::TrapWriteGuard>,
     pub eca_status: u32,
     pub reply: WriteNotifyReply,
-    pub put_notify_slot: PutNotifySlot,
+    completion: Arc<PutNotifyCompletion>,
     pub sid: u32,
+}
+
+impl PendingWriteNotify {
+    /// Answer this put-callback now that its record chain has reported — the
+    /// ONE completion tail both receive loops run, so neither can decide on
+    /// its own whether a reply is still owed.
+    ///
+    /// `chain` is what the completion receiver yielded: `Err` means the sender
+    /// was dropped without firing (processing aborted), which surfaces as
+    /// ECA_PUTFAIL so the client never sees a false success — C rsrv.
+    pub(crate) fn settle(
+        &mut self,
+        chain: Result<(), tokio::sync::oneshot::error::RecvError>,
+        writer: &Outbox,
+    ) -> CaResult<()> {
+        // Losing the claim means a predecessor-timeout supersede already
+        // answered this ioid with ECA_PUTCBINPROG and closed its put-log
+        // bracket with it. One ioid, one reply.
+        let Some(mut owned) = self.completion.claim() else {
+            return Ok(());
+        };
+        let final_status = match chain {
+            Ok(()) => self.eca_status,
+            Err(_) => ECA_PUTFAIL,
+        };
+        finish_write_notify(&mut owned.0, final_status, &self.reply, writer)
+    }
 }
 
 fn get_full_snapshot(target: &ChannelTarget) -> Option<epics_base_rs::server::snapshot::Snapshot> {
@@ -4843,7 +4837,7 @@ pub(crate) struct CancelInfo {
 }
 
 /// Validate and register a CA subscription (C `event_add_action`,
-/// `rsrv/camessage.c:1762-1880`): the caps / dedup / DBR-type / mask /
+/// `rsrv/camessage.c:1812-1920`): the caps / dedup / DBR-type / mask /
 /// PR-#934 count-clamp / access / filter-chain parity logic plus the
 /// initial `db_post_single_event` snapshot, extracted so the async TCP
 /// dispatch and the blocking (RTEMS) driver share ONE copy. It performs
@@ -4908,7 +4902,7 @@ pub(crate) async fn register_subscription(
     let native_type = match native_type_for_dbr(requested_type) {
         Ok(t) => t,
         Err(_) => {
-            // C `event_add_action` (camessage.c:1769-1771):
+            // C `event_add_action` (camessage.c:1819-1821):
             // `INVALID_DB_REQ` (data_type > LAST_BUFFER_TYPE = 38)
             // returns RSRV_ERROR with NO error reply — the
             // connection just drops. Unlike WRITE / READ where
@@ -4940,7 +4934,7 @@ pub(crate) async fn register_subscription(
     let entry = match state.channels.get(&sid) {
         Some(e) => e,
         None => {
-            // C `event_add_action` (camessage.c:1773-1777):
+            // C `event_add_action` (camessage.c:1823-1827):
             // `logBadId` + RSRV_ERROR on missing channel.
             // `logBadId` emits an ECA_INTERNAL "Bad Resource ID"
             // frame (cid=0xFFFFFFFF) before the disconnect — the
@@ -4982,7 +4976,7 @@ pub(crate) async fn register_subscription(
 
     // C `db_add_event` (dbEvent.c:437-439) returns NULL when
     // `select == 0 || select > UCHAR_MAX`, which propagates as
-    // ECA_ALLOCMEM + disconnect (`camessage.c:1814-1822`). A zero mask
+    // ECA_ALLOCMEM + disconnect (`camessage.c:1866-1877`). A zero mask
     // installs a subscription that never triggers; a mask above
     // UCHAR_MAX (the CA wire mask is a `u16`, so 256..=65535 is
     // reachable) is not a valid event select. Reject both immediately.
@@ -5021,7 +5015,7 @@ pub(crate) async fn register_subscription(
     // missing per-op check; the typed `require_read` shape
     // is the path every future MONITOR-class op should
     // mirror.
-    // C `event_add_action` (`rsrv/camessage.c:1762-1880`)
+    // C `event_add_action` (`rsrv/camessage.c:1812-1920`)
     // installs the event unconditionally and conditionally
     // enables it via `db_event_enable` only when
     // `asCheckGet(pciu->asClientPVT)` allows reads; on no-read
@@ -5113,13 +5107,13 @@ pub(crate) async fn register_subscription(
                 // access is granted, `no_read_access_event` when
                 // denied (C `event_add_action` → `read_reply`
                 // routes denial through `no_read_access_event`,
-                // `rsrv/camessage.c:529-534`).
+                // `rsrv/camessage.c:534-540`).
                 if access_denied {
                     // an autosize (`count == 0`) request
                     // must be normalised to the target's live
                     // element count before sizing the zero-
                     // filled denial payload. C `read_reply`
-                    // (`camessage.c:507-509`) maps `m_count==0`
+                    // (`camessage.c:509-514`) maps `m_count==0`
                     // to `paddr->no_elements`; the denial frame
                     // must match so it carries a nonzero DBR
                     // body. A zero-payload `CA_PROTO_EVENT_ADD`
@@ -5130,7 +5124,7 @@ pub(crate) async fn register_subscription(
                     // returns on `m_postsize == 0`).
                     // C calls `db_post_single_event`
                     // unconditionally at monitor creation
-                    // (`camessage.c:1853`, BEFORE the access
+                    // (`camessage.c:1907`, BEFORE the access
                     // check at 1858), so even the initial
                     // DENIED post runs through the event-context
                     // pre-chain; the ECA_NORDACCESS frame is
@@ -5211,7 +5205,7 @@ pub(crate) async fn register_subscription(
                             )?;
                             // Initial subscription value — C posts
                             // it via `db_post_single_event` at
-                            // monitor creation (`camessage.c:1853`),
+                            // monitor creation (`camessage.c:1907`),
                             // so it counts as one posted and one
                             // processed subscription event (PCAS
                             // parity). Future updates flow through
@@ -5359,7 +5353,7 @@ pub(crate) async fn register_subscription(
                     // the denial count matches what a granted monitor
                     // on the same field would carry. C
                     // `event_add_action` calls `db_post_single_event`
-                    // unconditionally (`camessage.c:1853`, before the
+                    // unconditionally (`camessage.c:1907`, before the
                     // access check), so the DENIED initial post is
                     // gated by the event-context chain too:
                     // `Some(count)` => send the ECA_NORDACCESS frame,
@@ -5443,7 +5437,7 @@ pub(crate) async fn register_subscription(
                     )?;
                     // Initial subscription value posted and
                     // processed (C `db_post_single_event` at
-                    // monitor creation, `camessage.c:1853`); PCAS
+                    // monitor creation, `camessage.c:1907`); PCAS
                     // parity. Later updates flow through the
                     // monitor task below.
                     if let Some(ref s) = state.stats {
@@ -5513,7 +5507,7 @@ pub(crate) async fn register_subscription(
                             s.subscription_events_posted.fetch_add(1, Ordering::Relaxed);
                         }
                         // C `casAccessRightsCB`
-                        // (`rsrv/camessage.c:1080-1095`)
+                        // (`rsrv/camessage.c:1116-1124`)
                         // suppresses delivery via
                         // `db_event_disable` while read access
                         // is denied, without tearing the
@@ -5552,8 +5546,30 @@ pub(crate) async fn register_subscription(
                         // straight into it — see `server::frame` for the C
                         // `cas_copy_in_header` shape this ports.
                         let mut frame = FrameBuf::acquire(outbox_clone.pool(), 0);
-                        if encode_dbr_into(frame.dst(), requested_type, &event.snapshot).is_err() {
-                            break;
+                        match encode_dbr_into(frame.dst(), requested_type, &event.snapshot) {
+                            Ok(()) => {}
+                            Err(epics_base_rs::error::CaError::GetConvertFailed(_)) => {
+                                // C `read_reply` serves EVENT_ADD from the same
+                                // body as READ_NOTIFY, so a refused conversion
+                                // is a zeroed ECA_GETFAIL update
+                                // (`camessage.c:544-560`), not a dropped
+                                // subscription. The client keeps the monitor
+                                // and sees the status on each update.
+                                let _ = send_no_read_access_event(
+                                    &outbox_clone,
+                                    CA_PROTO_EVENT_ADD,
+                                    requested_type,
+                                    requested_count,
+                                    sub_id,
+                                    ECA_GETFAIL,
+                                    ReplyContext {
+                                        req_hdr,
+                                        client_minor,
+                                    },
+                                );
+                                continue;
+                            }
+                            Err(_) => break,
                         }
                         // CA-268: see GET path note — fixed 1.
                         //
@@ -5640,7 +5656,7 @@ pub(crate) async fn register_subscription(
 }
 
 /// Shared EVENT_CANCEL wire logic (C `event_cancel_reply`,
-/// `rsrv/camessage.c:1992-2021`): validates the addressed channel and monitor
+/// `rsrv/camessage.c:2035-2102`): validates the addressed channel and monitor
 /// id and queues the cancel acknowledgement. Returns `Ok(true)` when the
 /// subscription is valid and the ACK is queued — the caller then performs its
 /// (driver-specific) teardown. Bad SID / bad mon-id already pushed the
@@ -5701,7 +5717,7 @@ pub(crate) fn cancel_subscription_reply(
         )));
     }
     let info = sub_info.expect("channel_matches ⟹ sub_info is Some");
-    // C `event_cancel_reply` (`camessage.c:2002-2014`): echo the stored
+    // C `event_cancel_reply` (`camessage.c:2089-2091`): echo the stored
     // EVENT_ADD request — m_dataType / m_count / m_cid (the SID) / m_available —
     // with a zero payload, in the extended form when the count needs it.
     let mut resp = CaHeader::new(CA_PROTO_EVENT_ADD);
@@ -5830,9 +5846,9 @@ async fn next_event_step(
 /// dispatch thread, forbidden from blocking on a put-callback (C `camsgtask`),
 /// hands each [`PendingWriteNotify`] here via [`EventTaskControl::WriteComplete`];
 /// this thread awaits the completion oneshot in the same `select` and, when it
-/// fires, sends the deferred reply via [`finish_write_notify`] under the send
-/// lock. So there is no third socket writer — monitors and write completions
-/// share this one owner.
+/// fires, sends the deferred reply via [`PendingWriteNotify::settle`] under the
+/// send lock. So there is no third socket writer — monitors and write
+/// completions share this one owner.
 ///
 /// `write_frame` writes one complete frame under the send lock; on its first
 /// error (peer gone) the thread exits. It returns when the control sender is
@@ -5934,19 +5950,13 @@ pub(crate) async fn run_event_task<W>(
             }
             EventStep::WriteDone(idx, res) => {
                 // A deferred WRITE_NOTIFY's record chain settled. Send its
-                // completion reply under the send lock — the SAME shared tail the
-                // async server's completion task runs (`finish_write_notify`), so
-                // the deferred-reply bytes are identical. `Err` (sender dropped,
-                // e.g. processing aborted) surfaces as ECA_PUTFAIL, matching C
-                // rsrv, so the client never sees a false success.
+                // completion reply under the send lock through the SAME shared
+                // tail the async server's completion task runs
+                // (`PendingWriteNotify::settle`), so the deferred-reply bytes and
+                // the decision about whether a reply is still owed are one copy,
+                // not two.
                 let mut p = pending_writes.remove(idx);
-                let final_status = match res {
-                    Ok(()) => p.eca_status,
-                    Err(_) => ECA_PUTFAIL,
-                };
-                if finish_write_notify(&mut p.trap_guard, final_status, &p.reply, &ev_outbox)
-                    .is_err()
-                {
+                if p.settle(res, &ev_outbox).is_err() {
                     // Encoding the reply failed (16k-array boundary): the reply
                     // is unshippable, drop this completion and keep serving.
                     continue;
@@ -6020,7 +6030,24 @@ fn send_monitor_snapshot(
     // Header space reserved up front, payload encoded straight into it — see
     // `server::frame` for the C `cas_copy_in_header` shape this ports.
     let mut frame = FrameBuf::acquire(writer.pool(), 0);
-    encode_dbr_into(frame.dst(), data_type, snapshot)?;
+    match encode_dbr_into(frame.dst(), data_type, snapshot) {
+        Ok(()) => {}
+        // Same C branch as the steady-state producer: the initial monitor
+        // update carries ECA_GETFAIL with a zeroed body rather than failing
+        // the subscription (`camessage.c:545-561`).
+        Err(epics_base_rs::error::CaError::GetConvertFailed(_)) => {
+            return send_no_read_access_event(
+                writer,
+                CA_PROTO_EVENT_ADD,
+                data_type,
+                requested_count,
+                sub_id,
+                ECA_GETFAIL,
+                reply,
+            );
+        }
+        Err(e) => return Err(e),
+    }
     // Size the payload to the request count *before* the 8-byte alignment
     // resize, so the header count and the payload shape agree.
     let element_count = size_dbr_reply(
@@ -6059,7 +6086,7 @@ fn send_monitor_snapshot(
 /// `no_read_access_event` frame and silence subsequent deliveries,
 /// while a read-access gain must re-enable deliveries and push one
 /// current snapshot. C `casAccessRightsCB`
-/// (`rsrv/camessage.c:1055-1106`) walks the channel's `eventq` and
+/// (`rsrv/camessage.c:1070-1138`) walks the channel's `eventq` and
 /// calls `db_event_disable` / `db_event_enable` plus
 /// `db_post_single_event` — the subscription itself is never
 /// removed. Pre-fix Rust permanently destroyed the subscription
@@ -6164,7 +6191,7 @@ async fn reeval_access_rights(state: &mut ClientState, writer: &Outbox) -> CaRes
                 };
                 // C posts the access-revoked event through
                 // `db_post_single_event` (event-context pre-chain)
-                // BEFORE `db_event_disable` (`camessage.c:1090-1092`);
+                // BEFORE `db_event_disable` (`camessage.c:1121-1123`);
                 // the ECA_NORDACCESS frame is only sent when the chain
                 // passes the post (`db_queue_event_log` fires only
                 // `if(pLog)`). Run a fresh event-context chain on the
@@ -6190,7 +6217,7 @@ async fn reeval_access_rights(state: &mut ClientState, writer: &Outbox) -> CaRes
                 // notification is the same zero-payload
                 // `CA_PROTO_EVENT_ADD` the client drops as a
                 // cancel-ack. Same C `read_reply` autosize parity
-                // (`camessage.c:507-509`) as the initial EVENT_ADD
+                // (`camessage.c:509-514`) as the initial EVENT_ADD
                 // denial path.
                 let denied_count = if data_count == 0 {
                     let actual = snap.as_ref().map(|snap| snap.value.count()).unwrap_or(1);
@@ -6251,7 +6278,7 @@ async fn reeval_access_rights(state: &mut ClientState, writer: &Outbox) -> CaRes
                     // C enables the event (`db_event_enable`)
                     // THEN posts the current value through the
                     // event-context pre-chain
-                    // (`db_post_single_event`, `camessage.c:1086-1088`);
+                    // (`db_post_single_event`, `camessage.c:1117-1119`);
                     // the restore frame is sent only when the chain
                     // passes (`db_queue_event_log` fires only
                     // `if(pLog)`) and carries the FILTERED value. The
@@ -6283,7 +6310,7 @@ async fn reeval_access_rights(state: &mut ClientState, writer: &Outbox) -> CaRes
                         },
                     )?;
                     // Access-restore post — C `db_event_enable` then
-                    // `db_post_single_event` (`camessage.c:1086-1088`):
+                    // `db_post_single_event` (`camessage.c:1117-1119`):
                     // one posted and one processed subscription event,
                     // same PCAS accounting as the initial value.
                     if let Some(ref s) = state.stats {
@@ -6300,7 +6327,7 @@ async fn reeval_access_rights(state: &mut ClientState, writer: &Outbox) -> CaRes
 
 /// CA_PROTO_WRITE_NOTIFY reply with extended-form
 /// count support. C `putNotifyErrorReply` / `write_notify_reply`
-/// (`rsrv/camessage.c:1482-1501` / `1731+`) call
+/// (`rsrv/camessage.c:1513-1533` / `1438-1441`) call
 /// `cas_copy_in_header` with `mp->m_count` / `msgtmp.m_count` from
 /// `caHdrLargeArray`, which is the decoded 32-bit count for
 /// extended requests and re-emits in extended form when needed.
@@ -6332,7 +6359,7 @@ fn send_put_notify_response(
 }
 
 /// normalise an EVENT_ADD request count for a no-read-access
-/// denial frame. C `read_reply` (`rsrv/camessage.c:507-509`) treats a
+/// denial frame. C `read_reply` (`rsrv/camessage.c:509-514`) treats a
 /// zero element count as autosize and substitutes `paddr->no_elements`
 /// — the target's live element count. The `no_read_access_event`
 /// denial path must do the same, otherwise a `count == 0` monitor on
@@ -6361,7 +6388,7 @@ fn no_read_access_count(requested_count: u32, actual_count: u32) -> u32 {
 /// Send a `no_read_access_event`-shaped reply: same wire frame as the
 /// original READ_NOTIFY / EVENT_ADD command, with `m_cid` carrying the
 /// ECA status and a `dbr_buffer_size`-sized zero payload. C
-/// `no_read_access_event` (`rsrv/camessage.c:450-480`) and `read_reply`
+/// `no_read_access_event` (`rsrv/camessage.c:455-485`) and `read_reply`
 /// (`camessage.c:540-557`) use this shape for READ_NOTIFY denials and
 /// dbChannel_get failures — preserving the requested count and DBR
 /// type so libca-style clients see the correct callback metadata even
@@ -6416,8 +6443,14 @@ enum ReadReplyError {
     BadType,
     /// The framed payload needs the extended (24-byte) header but the client
     /// is pre-V49 and cannot parse it — C answers `ECA_16KARRAYCLIENT` and
-    /// keeps the circuit (`camessage.c:625-631`).
+    /// keeps the circuit (`camessage.c:630-639`).
     Oversize,
+    /// `dbChannel_get`'s conversion returned a non-zero status — C
+    /// `read_reply` answers with a zeroed payload and `m_cid = ECA_GETFAIL`
+    /// (`camessage.c:544-560`), keeping the circuit. Distinct from
+    /// [`Self::BadType`], which is a request the server can never serve and
+    /// which tears the connection down.
+    GetFail,
 }
 
 /// Sans-io core of the READ / READ_NOTIFY reply: turn a fully-materialized
@@ -6449,7 +6482,13 @@ fn build_read_reply(
     // Header space reserved up front, payload encoded straight into it — see
     // `server::frame` for the C `cas_copy_in_header` shape this ports.
     let mut frame = FrameBuf::acquire(pool, 0);
-    encode_dbr_into(frame.dst(), requested_type, snapshot).map_err(|_| ReadReplyError::BadType)?;
+    match encode_dbr_into(frame.dst(), requested_type, snapshot) {
+        Ok(()) => {}
+        Err(epics_base_rs::error::CaError::GetConvertFailed(_)) => {
+            return Err(ReadReplyError::GetFail);
+        }
+        Err(_) => return Err(ReadReplyError::BadType),
+    }
     // C `read_reply` (`rsrv/camessage.c:507-571`) keeps
     // the request count in the header and zero-fills the
     // payload when fewer elements are returned than requested
@@ -6478,7 +6517,7 @@ fn build_read_reply(
         // `dbr_size_n(type, m_count)`, writes the header count as
         // `m_count`, and calls `dbChannel_get(.., m_count, ..)`
         // — all VERBATIM. Only `read_reply` (READ_NOTIFY /
-        // EVENT_ADD, camessage.c:507-509) interprets m_count==0 as
+        // EVENT_ADD, camessage.c:509-514) interprets m_count==0 as
         // "all available elements". So a deprecated READ with
         // count==0 must ship count=0 and a value-less payload of
         // `dbr_size_n(type, 0)` bytes == the type's metadata only
@@ -6555,7 +6594,7 @@ fn build_read_reply(
 
     // For deprecated CA_PROTO_READ (cmd=3), the response carries
     // the *client-side* CID (`pciu->cid` in C `read_action`
-    // — `camessage.c:622-624` passes `pciu->cid`, NOT
+    // — `camessage.c:631-632` passes `pciu->cid`, NOT
     // `pciu->sid`, to `cas_copy_in_header`). Modern libca's
     // `readRespAction` demuxes by ioid (`m_available`) and
     // ignores `m_cid` for READ responses, but pre-3.14 clients
@@ -6597,7 +6636,7 @@ fn build_read_reply(
 /// Send a CA_PROTO_ERROR response with the original header echoed
 /// into the payload and an error message.
 ///
-/// Layout follows C `vsend_err` (`rsrv/camessage.c:139`):
+/// Layout follows C `vsend_err` (`rsrv/camessage.c:149-255`):
 ///   * outer `m_cid` carries the *channel client cid* (i.e. the
 ///     client-side identifier of the channel the error relates to),
 ///     or `0xFFFFFFFF` for commands that aren't channel-scoped.
@@ -6610,7 +6649,7 @@ fn build_read_reply(
 /// (`cac.cpp:1118`) — which reads the status from `hdr.m_available` —
 /// would surface every server-emitted CA_PROTO_ERROR as ECA_NORMAL
 /// (status 0), silently masking the failure.
-/// C `vsend_err` (rsrv/camessage.c:147,229-242) allocates a fixed
+/// C `vsend_err` (rsrv/camessage.c:157,225-233) allocates a fixed
 /// 512-byte buffer for the entire reply (outer header + echoed
 /// request header + diagnostic + NUL), and `epicsVsnprintf` truncates
 /// the formatted diagnostic if it would overflow. Mirror that bound
@@ -6634,16 +6673,10 @@ pub(crate) struct ReplyContext {
     pub(crate) client_minor: u16,
 }
 
-/// C `caProto.h:34` `CA_MINIMUM_SUPPORTED_VERSION`. A non-VERSION message
-/// from a peer below this minor version is answered with ECA_DEFUNCT and
-/// drained (`camessage.c:2426-2445`); a TCP VERSION below it is dropped
-/// (`tcp_version_action`, `camessage.c:366-369`).
-const CA_MINIMUM_SUPPORTED_VERSION: u16 = 4;
-
 /// On `CA_PROTO_CLEAR_CHANNEL`, abort any pending WRITE_NOTIFY
 /// completion task whose owning channel `sid` is being freed (C
 /// parity: `clear_channel_reply` calls `rsrvFreePutNotify` per
-/// channel — `camessage.c:1889`). Finished handles are reaped
+/// channel — `camessage.c:1943`). Finished handles are reaped
 /// opportunistically while iterating so the per-connection Vec stays
 /// bounded across many WRITE_NOTIFYs over a long-lived connection.
 /// Pure transformation extracted so the drain semantics are unit-
@@ -6739,24 +6772,34 @@ pub(crate) fn build_ca_error_frame(
     client_minor: u16,
 ) -> Vec<u8> {
     let error_msg_bytes = pad_string(truncate_diag(message));
-    // C `vsend_err` (`rsrv/camessage.c:201-214`) gates the extended echo on
-    // `(m_postsize >= 0xffff || m_count >= 0xffff) && CA_V49(minor)`. A
-    // pre-V49 client gets the 16-byte form with the size/count fields
-    // truncated to u16 (`htons((ca_uint16_t) curp->m_postsize)`) — it has no
-    // code to parse the 8-byte annex, and a 24-byte echo would de-sync it.
-    let orig_bytes = if crate::protocol::ca_v49(client_minor) {
-        original_hdr.to_bytes_extended()
-    } else {
-        // C `vsend_err` else-branch (`camessage.c:215-221`) echoes the LOW
-        // 16 BITS of the request's real postsize / count —
-        // `htons((ca_uint16_t) curp->m_postsize)` — not the 0xffff extended
-        // marker, which is only a framing artefact of the request header.
-        let mut echo = *original_hdr;
-        echo.postsize = original_hdr.actual_postsize() as u16;
-        echo.count = original_hdr.actual_count() as u16;
-        echo.extended_postsize = None;
-        echo.extended_count = None;
-        echo.to_bytes().to_vec()
+    // C `vsend_err` (`rsrv/camessage.c:210-235`) picks the echo's form from
+    // the request's ACTUAL size and count — `(m_postsize >= 0xffff ||
+    // m_count >= 0xffff) && CA_V49(minor)` — never from the form the request
+    // arrived in. Those are different questions in both directions: a
+    // normal-form request may carry `m_count == 0xffff`, and an extended
+    // request may declare a size and count that both fit in 16 bits.
+    //
+    // `set_payload_size` is that rule's owner already, which is why the echo
+    // is re-derived through it rather than asking the parsed header whether
+    // it happened to carry an annex.
+    let mut echo = *original_hdr;
+    let orig_bytes = match echo.set_payload_size(
+        original_hdr.actual_postsize(),
+        original_hdr.actual_count(),
+        client_minor,
+    ) {
+        Ok(()) => echo.to_bytes_extended(),
+        // A pre-V49 peer has no code to parse the 8-byte annex, so C does not
+        // withhold the reply: it keeps the 16-byte form and truncates the two
+        // fields to `u16` (`htons((ca_uint16_t) curp->m_postsize)`,
+        // `camessage.c:226-235`).
+        Err(ExtendedHeaderUnsupported) => {
+            echo.postsize = original_hdr.actual_postsize() as u16;
+            echo.count = original_hdr.actual_count() as u16;
+            echo.extended_postsize = None;
+            echo.extended_count = None;
+            echo.to_bytes().to_vec()
+        }
     };
     // payload_size must use the echo header's ACTUAL byte length (16 or 24
     // for extended), not the constant CaHeader::SIZE=16.
@@ -6874,27 +6917,26 @@ mod write_notify_drain_tests {
 }
 
 #[cfg(test)]
-mod put_notify_supersede_tests {
-    //! A second `CA_PROTO_WRITE_NOTIFY` on a channel with an in-flight
-    //! put-callback must *supersede* the previous one (cancel it, reply
-    //! ECA_PUTCBINPROG to the superseded request) and proceed — never
-    //! reject the new request. C `write_notify_action`
-    //! (`rsrv/camessage.c:1660-1707`). The single owner of the channel's
-    //! in-flight put-callback is [`PutNotifySlot`]; the single owner of
-    //! each put-callback's reply is its `responded` token.
-    use super::{ECA_PUTCBINPROG, InFlightPutNotify, PutNotifySlot, supersede_put_notify};
+mod put_notify_serialize_tests {
+    //! The boundaries of the ONE rule this layer has about ECA_PUTCBINPROG:
+    //! a channel's registered put-callback draws the status only once it has
+    //! outstayed C's `blockSem` wait, and it draws it for its own ioid
+    //! (`putNotifyErrorReply(client, &pPutNotify->msg, ECA_PUTCBINPROG)`,
+    //! `camessage.c:1745`). One case per boundary — registered vs not,
+    //! inside the wait vs past it, still busy vs already answered.
+    use super::{
+        ECA_PUTCBINPROG, InFlightPutNotify, PUT_NOTIFY_BLOCK_TIMEOUT, PutNotifyCompletion,
+        PutNotifySlot, WriteNotifyReply,
+    };
     use crate::server::outbox::{Outbox, OutboxDrain};
-    use std::sync::Arc;
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::time::Instant;
 
-    /// Build a live outbox + its drain for a test emit site.
     fn live_outbox() -> (Outbox, OutboxDrain) {
         crate::server::outbox::channel()
     }
 
-    /// Drain every frame pushed to the outbox, in push order. Each push is
-    /// one complete contiguous frame, so this is exactly the per-frame view
-    /// the old `RecordingWriter::batches` gave (one `write_all` == one frame).
+    /// Every frame pushed to the outbox, in push order (one push == one
+    /// complete frame).
     fn drain_frames(drain: &mut OutboxDrain) -> Vec<Vec<u8>> {
         let mut frames = Vec::new();
         while let Some(f) = drain.try_next() {
@@ -6903,189 +6945,192 @@ mod put_notify_supersede_tests {
         frames
     }
 
-    /// A never-completing task so the in-flight put-callback has a real
-    /// `AbortHandle` for the supersede to cancel.
-    fn pending_abort_handle() -> tokio::task::AbortHandle {
-        tokio::spawn(async {
-            loop {
-                tokio::task::yield_now().await;
-            }
-        })
-        .abort_handle()
-    }
-
-    fn inflight(ioid: u32, responded: Arc<AtomicBool>) -> InFlightPutNotify {
-        InFlightPutNotify {
-            abort: pending_abort_handle(),
-            responded,
+    fn reply_shape(ioid: u32) -> WriteNotifyReply {
+        WriteNotifyReply {
+            write_type: epics_base_rs::types::DBR_LONG,
+            write_count: 1,
             ioid,
-            dbr_type: epics_base_rs::types::DBR_LONG,
-            count: 1,
             req_hdr: crate::protocol::CaHeader::new(crate::protocol::CA_PROTO_WRITE_NOTIFY),
+            client_minor: crate::protocol::CA_MINOR_VERSION,
         }
     }
 
-    /// take/install round-trips the channel's in-flight put-callback;
-    /// `take` leaves the slot empty so the same entry is never
-    /// superseded twice.
-    #[tokio::test]
-    async fn slot_take_install_roundtrip() {
+    /// A slot holding one registered put-callback, registered `age` ago.
+    fn slot_registered_for(ioid: u32, age: std::time::Duration) -> PutNotifySlot {
         let slot = PutNotifySlot::default();
-        assert!(slot.take().is_none(), "fresh slot holds no put-callback");
-        slot.install(inflight(7, Arc::new(AtomicBool::new(false))));
-        let taken = slot.take().expect("installed entry is taken back");
-        assert_eq!(taken.ioid, 7);
-        assert!(slot.take().is_none(), "take leaves the slot empty");
+        slot.install(InFlightPutNotify {
+            completion: PutNotifyCompletion::new(None),
+            reply: reply_shape(ioid),
+            busy_since: Instant::now() - age,
+        });
+        slot
     }
 
-    /// A still-in-flight put-callback (responded == false) that is
-    /// superseded gets ECA_PUTCBINPROG sent to ITS ioid — the new
-    /// request is never the one refused. Mirrors C
-    /// `putNotifyErrorReply(client, &pPutNotify->msg, ECA_PUTCBINPROG)`.
-    #[tokio::test]
-    async fn supersede_replies_putcbinprog_to_the_superseded_request() {
+    /// The ECA status and ioid a WRITE_NOTIFY-shaped reply frame carries:
+    /// param1 at `[8..12]`, param2 at `[12..16]`.
+    fn status_and_ioid(frame: &[u8]) -> (u32, u32) {
+        (
+            u32::from_be_bytes([frame[8], frame[9], frame[10], frame[11]]),
+            u32::from_be_bytes([frame[12], frame[13], frame[14], frame[15]]),
+        )
+    }
+
+    /// Boundary: nothing registered. C reaches the `else` arm and allocates a
+    /// fresh `pPutNotify` without sending anything.
+    #[test]
+    fn an_unregistered_channel_draws_no_frame() {
         let (outbox, mut drain) = live_outbox();
-        let responded = Arc::new(AtomicBool::new(false));
-        let prev = Some(inflight(0x1234, responded.clone()));
+        PutNotifySlot::default().serialize(&outbox).unwrap();
+        assert!(drain_frames(&mut drain).is_empty());
+    }
 
-        supersede_put_notify(prev, &outbox, crate::protocol::CA_MINOR_VERSION)
-            .expect("supersede sends the superseded request its reply");
-
+    /// Boundary: registered, still busy, still inside the wait. This is the
+    /// arm the port used to answer with ECA_PUTCBINPROG on every arrival; C
+    /// sends nothing until `epicsEventWaitWithTimeout` actually times out.
+    #[test]
+    fn a_predecessor_inside_the_wait_draws_no_frame() {
+        let (outbox, mut drain) = live_outbox();
+        let slot = slot_registered_for(0x1234, PUT_NOTIFY_BLOCK_TIMEOUT / 2);
+        slot.serialize(&outbox).unwrap();
         assert!(
-            responded.load(Ordering::Acquire),
-            "supersede claims the superseded put-callback's reply"
+            drain_frames(&mut drain).is_empty(),
+            "C sends nothing while the blockSem wait is still running"
         );
-        let batches = drain_frames(&mut drain);
-        assert_eq!(batches.len(), 1, "exactly one ECA_PUTCBINPROG reply");
-        let frame = &batches[0];
-        // CA header: param1 (ECA status) at [8..12], param2 (ioid) at [12..16].
-        let eca = u32::from_be_bytes([frame[8], frame[9], frame[10], frame[11]]);
-        let ioid = u32::from_be_bytes([frame[12], frame[13], frame[14], frame[15]]);
-        assert_eq!(
-            eca, ECA_PUTCBINPROG,
-            "superseded request gets ECA_PUTCBINPROG"
-        );
-        assert_eq!(ioid, 0x1234, "the reply targets the superseded ioid");
     }
 
-    /// A put-callback that completed naturally (its completion task
-    /// already won the `responded` race and replied) must NOT get a
-    /// second reply when a later WRITE_NOTIFY supersedes the stale slot
-    /// entry — one ioid, one reply.
-    #[tokio::test]
-    async fn supersede_after_completion_sends_no_second_reply() {
+    /// ...and it stays registered, so it is still the predecessor a later
+    /// request measures against rather than being silently forgotten.
+    #[test]
+    fn a_predecessor_inside_the_wait_stays_registered() {
         let (outbox, mut drain) = live_outbox();
-        let responded = Arc::new(AtomicBool::new(true)); // completion already replied
-        let prev = Some(inflight(0x55, responded.clone()));
+        let slot = slot_registered_for(0x1234, PUT_NOTIFY_BLOCK_TIMEOUT / 2);
+        slot.serialize(&outbox).unwrap();
+        slot.serialize(&outbox).unwrap();
+        assert!(drain_frames(&mut drain).is_empty());
+        assert!(
+            slot.inner.lock().unwrap().is_some(),
+            "a predecessor still inside the wait is not deregistered"
+        );
+    }
 
-        supersede_put_notify(prev, &outbox, crate::protocol::CA_MINOR_VERSION)
-            .expect("supersede of a completed put-callback is a no-op reply");
+    /// Boundary: registered and past the wait. C cancels it and answers the
+    /// SAVED request — `&pPutNotify->msg`, not the arriving one.
+    #[test]
+    fn an_overdue_predecessor_draws_putcbinprog_for_its_own_ioid() {
+        let (outbox, mut drain) = live_outbox();
+        let slot = slot_registered_for(0x1234, PUT_NOTIFY_BLOCK_TIMEOUT);
+        slot.serialize(&outbox).unwrap();
 
+        let frames = drain_frames(&mut drain);
+        assert_eq!(frames.len(), 1, "exactly one reply");
+        assert_eq!(
+            status_and_ioid(&frames[0]),
+            (ECA_PUTCBINPROG, 0x1234),
+            "the timed-out predecessor's ioid hears ECA_PUTCBINPROG"
+        );
+        assert!(
+            slot.inner.lock().unwrap().is_none(),
+            "and it is deregistered, so it cannot be answered twice"
+        );
+    }
+
+    /// Boundary: registered, past the wait, but already answered by its own
+    /// completion. C re-tests `busy` under `putNotifyLock` before replying
+    /// (`camessage.c:1730`); a put that finished keeps its real reply.
+    #[test]
+    fn an_already_answered_predecessor_draws_no_second_frame() {
+        let (outbox, mut drain) = live_outbox();
+        let completion = PutNotifyCompletion::new(None);
+        assert!(completion.claim().is_some(), "the completion path replies");
+        let slot = PutNotifySlot::default();
+        slot.install(InFlightPutNotify {
+            completion,
+            reply: reply_shape(0x55),
+            busy_since: Instant::now() - PUT_NOTIFY_BLOCK_TIMEOUT,
+        });
+
+        slot.serialize(&outbox).unwrap();
         assert!(
             drain_frames(&mut drain).is_empty(),
             "no second reply for an already-answered ioid"
         );
     }
 
-    /// Exactly one of {completion task, superseding request} owns the
-    /// reply. The first `responded` swap wins; the loser must observe
-    /// `true` and stay silent. This is the invariant that prevents a
-    /// double reply when a put completes at the instant it is
-    /// superseded.
-    #[tokio::test]
-    async fn responded_token_grants_a_single_reply_owner() {
-        let (outbox, mut drain) = live_outbox();
-        let responded = Arc::new(AtomicBool::new(false));
-
-        // Simulate the completion task winning first.
-        assert!(
-            !responded.swap(true, Ordering::AcqRel),
-            "completion task claims the reply"
-        );
-        // The superseding request now finds it already claimed.
-        let prev = Some(inflight(0x99, responded.clone()));
-        supersede_put_notify(prev, &outbox, crate::protocol::CA_MINOR_VERSION).unwrap();
-
-        assert!(
-            drain_frames(&mut drain).is_empty(),
-            "superseding path must not reply once the completion task has"
-        );
+    /// A settled predecessor is deregistered on the way past, so the slot
+    /// tracks "may still be busy" and nothing else.
+    #[test]
+    fn a_settled_predecessor_is_deregistered() {
+        let (outbox, _drain) = live_outbox();
+        let completion = PutNotifyCompletion::new(None);
+        completion.claim();
+        let slot = PutNotifySlot::default();
+        slot.install(InFlightPutNotify {
+            completion,
+            reply: reply_shape(0x55),
+            busy_since: Instant::now(),
+        });
+        slot.serialize(&outbox).unwrap();
+        assert!(slot.inner.lock().unwrap().is_none());
     }
 
-    /// Superseding an in-flight put-callback whose completion task holds
-    /// a `TrapWriteGuard` fires the guard's cancel AfterWrite via Drop,
-    /// so the put-log carries a balanced Before/After for the superseded
-    /// put. C `write_notify_action` calls `asTrapWriteAfter` on the
-    /// cancelled put (`camessage.c:1700`); pre-guard Rust aborted the
-    /// task and dropped the AfterWrite, leaving an unbalanced
-    /// BeforeWrite. The same abort-then-Drop mechanism covers the
-    /// teardown path (`write_notify_tasks` drain → `abort`, C
-    /// `rsrvFreePutNotify`, `camessage.c:1620`).
-    #[tokio::test]
-    async fn supersede_fires_cancel_after_write_via_guard_drop() {
+    /// `claim` hands out the reply and the put-log bracket together, once —
+    /// the property that keeps a reply and its `asTrapWriteAfter` from being
+    /// closed by different paths.
+    #[test]
+    fn claim_grants_a_single_reply_owner() {
+        let completion = PutNotifyCompletion::new(None);
+        assert!(completion.is_busy(), "a fresh put-callback is busy");
+        assert!(completion.claim().is_some(), "the first caller owns it");
+        assert!(completion.claim().is_none(), "every later caller does not");
+        assert!(!completion.is_busy(), "and it is no longer busy");
+    }
+
+    /// Cancelling an overdue predecessor fires its cancel AfterWrite, so the
+    /// put-log carries a balanced Before/After — C `asTrapWriteAfter` on the
+    /// cancelled put (`camessage.c:1744`). The bracket rides in the
+    /// completion token, so it goes wherever the reply goes.
+    #[test]
+    fn an_overdue_predecessor_closes_its_put_log_bracket() {
         use epics_base_rs::server::access_security::{
             TrapWriteFields, TrapWriteGuard, TrapWriteOp, next_trap_write_event_id,
             register_trap_write_listener,
         };
+        use std::sync::{Arc, Mutex};
 
-        // Capture trap events for THIS test's unique pv only — the
-        // listener registry is process-global.
-        let events = Arc::new(std::sync::Mutex::new(Vec::new()));
+        // The listener registry is process-global; filter to this test's pv.
+        let events = Arc::new(Mutex::new(Vec::new()));
         let sink = events.clone();
         let _handle = register_trap_write_listener(Arc::new(move |msg| {
-            if msg.pv_name == "supersede:trap" {
+            if msg.pv_name == "overdue:trap" {
                 sink.lock()
                     .unwrap()
                     .push((msg.op, msg.status.map(str::to_owned)));
             }
         }));
 
-        // A completion task parked on a never-firing receiver, holding
-        // the guard exactly as the WRITE_NOTIFY completion task does.
-        let (_tx, rx) = tokio::sync::oneshot::channel::<()>();
-        let task = tokio::spawn(async move {
-            let _guard = TrapWriteGuard::begin(TrapWriteFields {
-                pv_name: "supersede:trap".to_string(),
-                user: "u".to_string(),
-                host: "h".to_string(),
-                peer: "h:5064".to_string(),
-                value_str: "1".to_string(),
-                dbr_type: epics_base_rs::types::DBR_LONG,
-                no_elements: 1,
-                event_id: next_trap_write_event_id(),
-                rule_was_trap: true,
-                cancel_status: "cancel".to_string(),
-            });
-            let _ = rx.await; // parked until aborted
-        });
-        let abort = task.abort_handle();
-        // Ensure the task ran far enough to fire BeforeWrite and park on
-        // `rx` BEFORE we abort — aborting an unpolled task would drop a
-        // future whose guard was never constructed (no Before, no
-        // After), which is a different scenario.
-        while events.lock().unwrap().is_empty() {
-            tokio::task::yield_now().await;
-        }
-
-        let prev = Some(InFlightPutNotify {
-            abort,
-            responded: Arc::new(AtomicBool::new(false)),
-            ioid: 0x77,
+        let guard = TrapWriteGuard::begin(TrapWriteFields {
+            pv_name: "overdue:trap".to_string(),
+            user: "u".to_string(),
+            host: "h".to_string(),
+            peer: "h:5064".to_string(),
+            value_str: "1".to_string(),
             dbr_type: epics_base_rs::types::DBR_LONG,
-            count: 1,
-            req_hdr: crate::protocol::CaHeader::new(crate::protocol::CA_PROTO_WRITE_NOTIFY),
+            no_elements: 1,
+            event_id: next_trap_write_event_id(),
+            rule_was_trap: true,
+            cancel_status: "cancel".to_string(),
         });
-        supersede_put_notify(prev, &live_outbox().0, crate::protocol::CA_MINOR_VERSION).unwrap();
+        let slot = PutNotifySlot::default();
+        slot.install(InFlightPutNotify {
+            completion: PutNotifyCompletion::new(Some(guard)),
+            reply: reply_shape(0x77),
+            busy_since: Instant::now() - PUT_NOTIFY_BLOCK_TIMEOUT,
+        });
 
-        // Joining the aborted task guarantees its guard Drop has run.
-        assert!(
-            task.await.unwrap_err().is_cancelled(),
-            "superseded completion task is cancelled"
-        );
+        slot.serialize(&live_outbox().0).unwrap();
 
-        let got = events.lock().unwrap().clone();
         assert_eq!(
-            got,
+            events.lock().unwrap().clone(),
             vec![
                 (TrapWriteOp::BeforeWrite, None),
                 (TrapWriteOp::AfterWrite, Some("cancel".to_string())),
@@ -7318,11 +7363,11 @@ mod pre_v49_peer_tests {
     //!
     //! * receive: `m_postsize == 0xffff` from a pre-V49 peer is NOT an
     //!   extended marker. C reads it as a plain header with a 65,535-byte
-    //!   body (`camessage.c:2410` else-branch), so `msgsize = 65551` fails
-    //!   the `msgsize & 0x7` test at `camessage.c:2452` →
+    //!   body (`camessage.c:2483-2486` else-branch), so `msgsize = 65551` fails
+    //!   the `msgsize & 0x7` test at `camessage.c:2520` →
     //!   ECA_INTERNAL "CAS: Missaligned protocol rejected" + disconnect.
     //! * send: an error echo for a pre-V49 peer is the 16-byte form
-    //!   (`vsend_err`, `camessage.c:201-214`).
+    //!   (`vsend_err`, `camessage.c:225-233`).
     use super::single_write_all_framing_tests::{drain_frames, live_outbox};
     use super::*;
     use epics_base_rs::server::database::PvDatabase;
@@ -7393,7 +7438,7 @@ mod pre_v49_peer_tests {
                     // NUL-terminated diagnostic string.
                     let body = &rx[body_start..body_end];
                     // The echoed request header is 24 bytes only for a V49
-                    // peer (`vsend_err`, camessage.c:201-214) — a pre-V49
+                    // peer (`vsend_err`, camessage.c:211-233) — a pre-V49
                     // echo is 16 bytes even when its truncated postsize
                     // happens to read 0xffff, which is precisely why the
                     // real client keys this off its own version, not off
@@ -7459,7 +7504,7 @@ mod pre_v49_peer_tests {
         assert_eq!(
             diag, "CAS: Missaligned protocol rejected",
             "C reads the pre-V49 0xffff postsize as a 65,551-byte message and \
-             rejects it at the alignment test (camessage.c:2452)"
+             rejects it at the alignment test (camessage.c:2520)"
         );
         assert_eq!(
             eca, ECA_INTERNAL,
@@ -7515,7 +7560,7 @@ mod pre_v49_peer_tests {
         let _ = tokio::time::timeout(Duration::from_secs(2), handle).await;
     }
 
-    /// C `vsend_err` (`camessage.c:201-214`) echoes the request header in
+    /// C `vsend_err` (`camessage.c:211-233`) echoes the request header in
     /// extended form only when `CA_V49(minor)`. For a pre-V49 peer the
     /// echo is the plain 16-byte header — a 24-byte echo would de-sync a
     /// client with no annex parser.
@@ -7583,9 +7628,105 @@ mod pre_v49_peer_tests {
         );
     }
 
+    /// C `vsend_err` chooses the echo's form from the request's real size
+    /// and count, and its condition is an OR over BOTH
+    /// (`camessage.c:210-211`). A normal-form request carrying
+    /// `m_count == 0xffff` therefore gets the 24-byte echo, even though it
+    /// arrived in 16 bytes with no annex of its own.
+    ///
+    /// The port asked the parsed header whether it had arrived extended, so
+    /// this request was echoed in 16 bytes: eight bytes shorter than a C
+    /// softIoc's answer to the identical frame, with the diagnostic starting
+    /// at a different offset.
+    #[epics_macros_rs::epics_test]
+    async fn a_max_count_request_in_normal_form_is_echoed_extended() {
+        let (outbox, mut drain) = live_outbox();
+        // Normal form on the wire: no annex, `m_count` at its 16-bit ceiling.
+        let mut original = CaHeader::new(CA_PROTO_EVENT_ADD);
+        original.count = 0xFFFF;
+        assert!(!original.is_extended(), "the request arrived in 16 bytes");
+
+        send_ca_error(
+            &outbox,
+            &original,
+            ECA_INTERNAL,
+            0xFFFF_FFFF,
+            "boom",
+            CA_MINOR_VERSION,
+        )
+        .expect("send_ca_error succeeds");
+
+        let frames = drain_frames(&mut drain);
+        let frame = &frames[0];
+        let diag = pad_string("boom");
+        assert_eq!(
+            frame.len(),
+            CaHeader::SIZE + 24 + diag.len(),
+            "m_count >= 0xffff alone selects the extended echo"
+        );
+        assert_eq!(
+            u16::from_be_bytes([frame[18], frame[19]]),
+            0xFFFF,
+            "the echo carries the extended marker C writes"
+        );
+        assert_eq!(
+            u16::from_be_bytes([frame[22], frame[23]]),
+            0,
+            "C zeroes the 16-bit m_count when the annex carries the real one"
+        );
+        assert_eq!(
+            u32::from_be_bytes([frame[36], frame[37], frame[38], frame[39]]),
+            0xFFFF,
+            "the annex carries the request's real count"
+        );
+    }
+
+    /// The converse, from the same OR: an extended request whose real size
+    /// and count both fit in 16 bits is echoed in the SHORT form, because C
+    /// reads the values and not the layout they arrived in.
+    #[epics_macros_rs::epics_test]
+    async fn an_extended_request_with_small_values_is_echoed_short() {
+        let (outbox, mut drain) = live_outbox();
+        // Extended on the wire, but neither value needs the annex.
+        let mut original = CaHeader::new(CA_PROTO_READ_NOTIFY);
+        original.postsize = 0xFFFF;
+        original.extended_postsize = Some(8);
+        original.extended_count = Some(3);
+        assert!(original.is_extended(), "the request arrived in 24 bytes");
+
+        send_ca_error(
+            &outbox,
+            &original,
+            ECA_INTERNAL,
+            0xFFFF_FFFF,
+            "boom",
+            CA_MINOR_VERSION,
+        )
+        .expect("send_ca_error succeeds");
+
+        let frames = drain_frames(&mut drain);
+        let frame = &frames[0];
+        let diag = pad_string("boom");
+        assert_eq!(
+            frame.len(),
+            CaHeader::SIZE + 16 + diag.len(),
+            "neither value reaches 0xffff, so C echoes the 16-byte form"
+        );
+        assert_eq!(
+            u16::from_be_bytes([frame[18], frame[19]]),
+            8,
+            "the echoed postsize is the request's real one, not the marker"
+        );
+        assert_eq!(
+            u16::from_be_bytes([frame[22], frame[23]]),
+            3,
+            "the echoed count is the request's real one"
+        );
+    }
+
     /// A response too large for the 16-bit header cannot be framed for a
     /// pre-V49 peer. C `read_reply` / `read_action` answer with
-    /// `send_err(ECA_16KARRAYCLIENT)` (`camessage.c:~700`) rather than
+    /// `send_err(ECA_16KARRAYCLIENT)` (`camessage.c:630-639`) rather than
     /// emitting an extended header the peer cannot parse.
     #[epics_macros_rs::epics_test]
     async fn oversize_reply_to_pre_v49_peer_is_eca_16karrayclient() {
@@ -7634,7 +7775,7 @@ mod extended_header_split_tests {
     //! C-parity regression: a TCP segment that ends in the middle of an
     //! extended-form header (16..24 bytes, `m_postsize == 0xffff`) must
     //! make the framing loop *wait* for the rest of the header, not
-    //! disconnect the client. C `rsrv/camessage.c:~2410` does
+    //! disconnect the client. C `rsrv/camessage.c:2466-2469` does
     //! `status = RSRV_OK; break;` for this partial-header case.
     use super::*;
     use epics_base_rs::server::database::PvDatabase;
@@ -7691,7 +7832,7 @@ mod extended_header_split_tests {
 
         let mut client = client_io;
         // Identify as V49 first: C only parses the extended annex when
-        // `CA_V49(client->minor_version_number)` (`camessage.c:2410`), so
+        // `CA_V49(client->minor_version_number)` (`camessage.c:2464`), so
         // the partial-annex wait is reachable only for a V49 peer. A
         // pre-V49 peer sending the same bytes is rejected — see
         // `pre_v49_extended_marker_rejected_as_misaligned`.
@@ -7733,7 +7874,7 @@ mod host_identity_tests {
     //!
     //! C rsrv's default (`asCheckClientIP == 0`, `asLibRoutines.c:34`) is to
     //! store the hostname the client claims over `CA_PROTO_HOST_NAME`
-    //! unconditionally (`camessage.c:845-875`) and match HAGs against that
+    //! unconditionally (`camessage.c:880-903`) and match HAGs against that
     //! name (`asLibRoutines.c:1223`). The port instead keyed ACF on the peer
     //! IP unless a fictitious `EPICS_CAS_USE_HOST_NAMES=YES` was set — a
     //! variable that does not exist anywhere in epics-base — so a
@@ -7755,7 +7896,7 @@ mod host_identity_tests {
         assert_eq!(
             id.as_str(),
             "opi-01.lab",
-            "C stores the client-supplied name unconditionally (camessage.c:845-875)"
+            "C stores the client-supplied name unconditionally (camessage.c:880-903)"
         );
     }
 
@@ -7763,7 +7904,7 @@ mod host_identity_tests {
     fn pinned_identity_ignores_the_client_supplied_name() {
         // C's `asCheckClientIP == 1` path: the peer IP is the identity and
         // `host_name_action` returns early without storing the claim
-        // (camessage.c:839-843). The port's mTLS identity is pinned the
+        // (camessage.c:869-875). The port's mTLS identity is pinned the
         // same way.
         let mut id = HostIdentity::Pinned("10.0.0.7".into());
         assert!(
@@ -7822,7 +7963,7 @@ mod host_identity_tests {
 mod oversize_request_tests {
     //! R7-18: an oversize inbound request must NOT tear the circuit down.
     //!
-    //! C `camessage.c:2472-2489` answers a message it cannot buffer with
+    //! C `camessage.c:2539-2556` answers a message it cannot buffer with
     //! `send_err(ECA_TOLARGE)`, sets `recvBytesToDrain` to skip the body,
     //! and returns `RSRV_OK` — the circuit and every channel and
     //! subscription on it survive. The port used to `break 'client_loop
@@ -7841,7 +7982,7 @@ mod oversize_request_tests {
     /// The bound is only a *bound* when `EPICS_CA_AUTO_ARRAY_BYTES` is off:
     /// that is the sole configuration in which C's server allocates a fixed
     /// `rsrvSizeofLargeBufTCP` buffer and answers ECA_TOLARGE past it
-    /// (`caservertask.c:534-538`, `camessage.c:2471-2489`). With it ON — the
+    /// (`caservertask.c:534-538`, `camessage.c:2539-2556`). With it ON — the
     /// compiled default — C grows the buffer to whatever the peer announced and
     /// refuses nothing, so an oversize request is not a thing that exists.
     ///
@@ -7946,7 +8087,7 @@ mod oversize_request_tests {
         assert_eq!(
             u32::from_be_bytes([reply[12], reply[13], reply[14], reply[15]]),
             ECA_TOLARGE,
-            "C answers an unbufferable request with ECA_TOLARGE (camessage.c:2478)"
+            "C answers an unbufferable request with ECA_TOLARGE (camessage.c:2544)"
         );
 
         // The circuit must still be up: pre-fix this had already been torn
@@ -8501,21 +8642,21 @@ mod non_graceful_disconnect_teardown_tests {
 
 #[cfg(test)]
 mod write_gate_order_tests {
-    //! The deprecated `CA_PROTO_WRITE` (cmd 4) and `CA_PROTO_WRITE_NOTIFY`
-    //! (cmd 19) run their DBR-type gate and their write-access gate in
-    //! OPPOSITE orders, and the order is observable when BOTH fail:
+    //! Both the deprecated `CA_PROTO_WRITE` (cmd 4) and
+    //! `CA_PROTO_WRITE_NOTIFY` (cmd 19) run their DBR-type gate BEFORE
+    //! their write-access gate. What differs is what the peer is told when
+    //! the type fails, and that is observable when BOTH gates would fail:
     //!
-    //! * `write_notify_action` (rsrv/camessage.c:1647-1656): TYPE first
-    //!   (ECA_BADTYPE → RSRV_ERROR / connection DROPPED), THEN access.
-    //! * `write_action` (rsrv/camessage.c:741-766): ACCESS first
-    //!   (ECA_NOWTACCESS → RSRV_OK / connection KEPT), the type is
-    //!   validated only afterwards by `caNetConvert`.
+    //! * `write_action` (rsrv/camessage.c:753-756): TYPE first, and a bad
+    //!   type is `log_header` + RSRV_ERROR with no frame at all — the
+    //!   access gate at `camessage.c:772-775` is never reached, so the peer
+    //!   sees silence and a dropped connection.
+    //! * `write_notify_action` (rsrv/camessage.c:1678-1682): TYPE first
+    //!   too, but it answers `putNotifyErrorReply(ECA_BADTYPE)` before
+    //!   RSRV_ERROR, so the peer sees the status and then the drop.
     //!
-    //! So a peer that sends a deprecated WRITE which is BOTH access-denied
-    //! AND carries an unsupported DBR type must receive ECA_NOWTACCESS and
-    //! keep its connection — NOT ECA_BADTYPE + drop. Pre-fix Rust ran the
-    //! type gate first for both opcodes, inverting `write_action`. These
-    //! two tests pin each opcode's ordering.
+    //! Neither opcode answers ECA_NOWTACCESS in that case. These two tests
+    //! pin each opcode's outcome.
     use super::non_graceful_disconnect_teardown_tests::{
         create_chan_frame, read_create_chan_sid, version_frame,
     };
@@ -8730,10 +8871,10 @@ mod write_gate_order_tests {
 mod deprecated_read_autosize_tests {
     //! The deprecated synchronous CA_PROTO_READ (cmd 3) does NOT
     //! autosize a zero element count. C `read_action`
-    //! (rsrv/camessage.c:622-645) sizes the reply with
+    //! (rsrv/camessage.c:626-653) sizes the reply with
     //! `dbr_size_n(type, m_count)`, writes the header count as `m_count`,
     //! and calls `dbChannel_get(.., m_count, ..)` — all verbatim. Only
-    //! `read_reply` (READ_NOTIFY / EVENT_ADD, camessage.c:507-509) treats
+    //! `read_reply` (READ_NOTIFY / EVENT_ADD, camessage.c:509-514) treats
     //! `m_count == 0` as "all available elements". So a deprecated READ
     //! with count==0 against a 3-element waveform must reply count=0 with
     //! a value-less payload, while a READ_NOTIFY with count==0 autosizes
@@ -9559,7 +9700,7 @@ mod ex_r6_no_read_access_count_tests {
 
     /// Autosize (`requested_count == 0`) must normalise to the
     /// target's live element count — mirrors C `read_reply`
-    /// substituting `paddr->no_elements` (`camessage.c:507-509`).
+    /// substituting `paddr->no_elements` (`camessage.c:509-514`).
     #[test]
     fn ex_r6_autosize_normalises_to_actual_count() {
         assert_eq!(no_read_access_count(0, 7), 7);
@@ -9611,7 +9752,7 @@ mod ex_r6_no_read_access_count_tests {
 #[cfg(test)]
 mod bfr7_event_context_filter_tests {
     //! a CA monitor initial single-event post
-    //! (`db_post_single_event`, `rsrv/camessage.c:1853`) runs the
+    //! (`db_post_single_event`, `rsrv/camessage.c:1907`) runs the
     //! channel filter chain in EVENT context (`db_create_event_log` →
     //! `dbfl_context_event`), NOT in one-shot READ context. `dec`/`sync`
     //! therefore decimate/gate the initial event, and a chain that drops
@@ -9984,7 +10125,7 @@ mod r46_zero_mask_event_add_tests {
     /// wire mask is a `u16`) must be rejected exactly like mask==0. C
     /// `db_add_event` (dbEvent.c:437) returns NULL for
     /// `select == 0 || select > UCHAR_MAX`, which `event_add_action` turns
-    /// into ECA_ALLOCMEM + RSRV_ERROR (camessage.c:1814-1822). The previous
+    /// into ECA_ALLOCMEM + RSRV_ERROR (camessage.c:1866-1877). The previous
     /// guard checked only mask==0, so a mask in 256..=65535 silently
     /// installed a never-firing subscription.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -10092,9 +10233,9 @@ mod r46_zero_mask_event_add_tests {
     /// SID *and* mask==0 must emit the bad-SID `ECA_INTERNAL` "Bad
     /// Resource ID" frame, NOT the spurious `ECA_ALLOCMEM` mask frame. In
     /// C `event_add_action` the missing-channel branch (`if (!pciu) {
-    /// logBadId; return RSRV_ERROR; }`, camessage.c:1773-1777) runs
+    /// logBadId; return RSRV_ERROR; }`, camessage.c:1823-1827) runs
     /// *before* the `db_add_event` NULL (select==0) ALLOCMEM path
-    /// (camessage.c:1814-1822). `logBadId` (camessage.c:307-320) sends
+    /// (camessage.c:1866-1877). `logBadId` (camessage.c:312-325) sends
     /// `send_err(ECA_INTERNAL, "Bad Resource ID")` with the cid=0xFFFFFFFF
     /// sentinel (MPTOPCIU→NULL), flushed by camsgtask.c:142 before the
     /// disconnect — so an unknown SID draws ECA_INTERNAL regardless of
@@ -10256,10 +10397,10 @@ mod r46_zero_mask_event_add_tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn deprecated_read_unknown_sid_bad_type_sends_bad_resource_id() {
-        // C `read_action` (`rsrv/camessage.c:608-619`) resolves the
+        // C `read_action` (`rsrv/camessage.c:606-621`) resolves the
         // channel BEFORE checking the DBR type, so an unknown SID takes
         // the bad-SID `logBadId` branch even when the requested type is
-        // also invalid. `logBadId` (camessage.c:307-320) sends
+        // also invalid. `logBadId` (camessage.c:312-325) sends
         // ECA_INTERNAL ("Bad Resource ID", cid=0xFFFFFFFF), flushed by
         // camsgtask.c:142 before the disconnect — NOT the post-lookup
         // ECA_BADTYPE. Pre-fix Rust checked the type first and emitted a
@@ -10351,7 +10492,7 @@ mod r46_zero_mask_event_add_tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn deprecated_read_known_sid_bad_type_sends_badtype_with_real_cid() {
         // with a VALID channel, C `read_action`
-        // (`rsrv/camessage.c:616-619`) sends ECA_BADTYPE carrying the
+        // (`rsrv/camessage.c:621-624`) sends ECA_BADTYPE carrying the
         // channel's real cid (`pciu->cid`) + record name — never the
         // 0xFFFFFFFF sentinel the pre-fix code used.
         let db = Arc::new(PvDatabase::new());
@@ -10543,6 +10684,87 @@ mod read_reply_sans_io_tests {
 
     fn scalar_long(v: i32) -> Snapshot {
         Snapshot::new(EpicsValue::Long(v), 0, 0, std::time::SystemTime::UNIX_EPOCH)
+    }
+
+    /// A refused get conversion is `ReadReplyError::GetFail`, which the
+    /// dispatch answers with C's zeroed ECA_GETFAIL frame
+    /// (`camessage.c:545-561`) and a live circuit — NOT `BadType`, which tears
+    /// the connection down for a request the server can never serve.
+    #[test]
+    fn unparseable_string_field_read_as_double_is_err_getfail() {
+        let snap = Snapshot::new(
+            EpicsValue::String("hello".into()),
+            0,
+            0,
+            std::time::SystemTime::UNIX_EPOCH,
+        );
+        let err = build_read_reply(
+            &pool(),
+            epics_base_rs::types::DBR_DOUBLE,
+            1,
+            true,
+            &snap,
+            0,
+            0x11,
+            CA_MINOR_VERSION,
+        )
+        .expect_err("a string that is not a number cannot be served as DBR_DOUBLE");
+        assert!(matches!(err, ReadReplyError::GetFail));
+
+        // A parseable one still frames normally.
+        let ok = Snapshot::new(
+            EpicsValue::String("3.125".into()),
+            0,
+            0,
+            std::time::SystemTime::UNIX_EPOCH,
+        );
+        let frame = build_read_reply(
+            &pool(),
+            epics_base_rs::types::DBR_DOUBLE,
+            1,
+            true,
+            &ok,
+            0,
+            0x11,
+            CA_MINOR_VERSION,
+        )
+        .expect("a numeric string frames");
+        assert_eq!(f64::from_be_bytes(frame[16..24].try_into().unwrap()), 3.125);
+    }
+
+    /// A `DBF_CHAR` waveform read as `DBR_STRING` ships one MAX_STRING_SIZE
+    /// slot per element, so the declared count and the body agree: C
+    /// `getCharString` (`dbConvert.c:417-437`) gives `m_count = 10` with
+    /// `m_postsize = 400`. The collapsed conversion declared ten elements over
+    /// a 40-byte body, and `size_dbr_reply` cannot repair that — it resizes
+    /// only when the requested count differs from the live one, which here it
+    /// does not.
+    #[test]
+    fn read_notify_char_waveform_as_string_is_forty_bytes_per_element() {
+        let snap = Snapshot::new(
+            EpicsValue::CharArray(b"ABCDEFGHIJ".to_vec()),
+            0,
+            0,
+            std::time::SystemTime::UNIX_EPOCH,
+        );
+        let frame = build_read_reply(
+            &pool(),
+            DBR_STRING,
+            0, // notify autosize -> the live count, 10
+            true,
+            &snap,
+            0,
+            0x99,
+            CA_MINOR_VERSION,
+        )
+        .expect("char waveform as DBR_STRING frames");
+
+        let hdr = CaHeader::from_bytes(&frame[..16]).expect("parse header");
+        assert_eq!(hdr.count, 10, "one element per waveform byte");
+        assert_eq!(hdr.postsize, 400, "ten MAX_STRING_SIZE slots");
+        assert_eq!(frame.len(), 16 + 400);
+        assert_eq!(&frame[16..18], b"65", "element 0 is cvtCharToString('A')");
+        assert_eq!(&frame[16 + 360..16 + 362], b"74", "element 9 is 'J'");
     }
 
     /// A scalar READ_NOTIFY frame is header + the 8-aligned value payload,

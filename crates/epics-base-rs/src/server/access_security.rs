@@ -296,9 +296,9 @@ const HAG_DNS_REFRESH: std::time::Duration = std::time::Duration::from_secs(60);
 /// drops it.
 pub fn spawn_hag_refresh(cell: &AcfCell) {
     let weak = std::sync::Arc::downgrade(&cell.0);
-    crate::runtime::task::spawn(async move {
+    crate::runtime::task::spawn_background(async move {
         loop {
-            crate::runtime::task::sleep(HAG_DNS_REFRESH).await;
+            crate::runtime::task::sleep_background(HAG_DNS_REFRESH).await;
             let Some(inner) = weak.upgrade() else { break };
             if !as_check_client_ip() {
                 continue;
@@ -1148,7 +1148,7 @@ impl AccessSecurityConfig {
     /// `trapMask` (`asLibRoutines.c:1041-1042`). The final
     /// `pasgclient->trapMask` (`:1048`) is therefore the trap flag of
     /// the last rule that set the granted access — exactly the value
-    /// `asTrapWriteWithData` (`rsrv/camessage.c:768-779`) consults to
+    /// `asTrapWriteWithData` (`rsrv/camessage.c:799-802`) consults to
     /// decide whether to invoke put-logging listeners.
     ///
     /// Returns `(level, rule_was_trap)`. `rule_was_trap` is `false`
@@ -1436,7 +1436,7 @@ impl AccessSecurityConfig {
 ///
 /// C `libcom/src/as/asLib.h:57-62` defines `asTrapWriteWithData` which
 /// is invoked unconditionally around every `dbChannel_put` in
-/// `rsrv/camessage.c:768-779`. Listeners registered via
+/// `rsrv/camessage.c:799-810`. Listeners registered via
 /// `asTrapWriteRegisterListener` receive the put event — this is the
 /// hook `caPutLog` and site put-loggers attach to. Pre-fix Rust
 /// parsed the `TRAPWRITE`/`NOTRAPWRITE` keyword into
@@ -1687,9 +1687,9 @@ impl TrapWriteFields {
 /// This makes the C invariant hold *by construction*: every
 /// `asTrapWriteWithData` (BeforeWrite) is matched by exactly one
 /// `asTrapWriteAfter` (AfterWrite) on all rsrv exit paths — normal
-/// completion (`rsrv/camessage.c:1400`), still-busy teardown
-/// (`rsrvFreePutNotify`, `camessage.c:1620`), and supersede-cancel
-/// (`write_notify_action`, `camessage.c:1700`) — and mirrors pvxs's
+/// completion (`rsrv/camessage.c:1431`), still-busy teardown
+/// (`rsrvFreePutNotify`, `camessage.c:1621-1660`), and supersede-cancel
+/// (`write_notify_action`, `camessage.c:1741-1744`) — and mirrors pvxs's
 /// `SecurityLogger`, whose destructor calls `asTrapWriteAfterWrite`
 /// (`ioc/securitylogger.h:23-59`). Before this guard the Rust emitters
 /// dispatched AfterWrite from an explicit call that an

@@ -51,7 +51,8 @@
 //! C's ring bounds entries: `EVENTQUESIZE` of them, `EVENTENTRIES` reserved
 //! per monitor. It gets away with that because an entry is a fixed-size
 //! `db_field_log`. For anything wider than `union native_value` — every array
-//! field — `db_create_field_log` (`dbEvent.c:726-732`) takes the
+//! field, and every `DBF_STRING` field, whose declared 40 bytes exceed the
+//! union's 8 — `db_create_field_log` (`dbEvent.c:726-732`) takes the
 //! `dbfl_type_ref` branch and copies **nothing**:
 //!
 //! ```c

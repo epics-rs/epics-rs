@@ -1761,7 +1761,7 @@ fn handle_search_response(
             break;
         };
 
-        // C `rsrv/camessage.c:2452` rejects misaligned `m_postsize`.
+        // C `rsrv/camessage.c:2520` rejects misaligned `m_postsize`.
         // For UDP (where this loop runs), C silently drops the
         // datagram without emitting an error — we do the same by
         // breaking out of the chained-message parse. Without this

@@ -435,7 +435,7 @@ async fn run_beacon_monitor_inner(
             let Ok(hdr) = CaHeader::from_bytes(&buf[offset..len]) else {
                 break;
             };
-            // C `rsrv/camessage.c:2452` rejects misaligned m_postsize.
+            // C `rsrv/camessage.c:2520` rejects misaligned m_postsize.
             // UDP path drops silently. Without this check, the
             // round-up below would advance into the next message's
             // header bytes.

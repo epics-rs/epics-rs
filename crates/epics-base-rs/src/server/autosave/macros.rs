@@ -17,23 +17,26 @@ impl MacroContext {
         Self { macros }
     }
 
-    /// Parse inline macro definitions like `"P=IOC:,M=m1"`.
+    /// Parse inline macro definitions like `"P=IOC:,M=m1"` into their RAW
+    /// values — no `$(...)` expansion, matching C `macParseDefns`
+    /// (`macUtil.c:74-196`), which keeps values verbatim because "unlike
+    /// values, they will not be re-parsed". The caller expands each value
+    /// afterwards, which is the order that keeps a comma arriving from
+    /// inside a value from terminating the definition after it.
+    ///
+    /// The grammar comes from
+    /// [`macro_defn_pairs`](crate::server::iocsh::macro_defn_pairs), the
+    /// crate's one owner of it, so a quoted or escaped comma (`S='a,b'`)
+    /// stays inside its value here exactly as it does for `dbLoadRecords`.
+    /// A fragment with no `=` is C's macro DELETION; autosave has no
+    /// delete path, so it is ignored rather than silently defining an
+    /// empty macro.
     pub fn parse_inline(s: &str) -> HashMap<String, String> {
-        let mut map = HashMap::new();
-        if s.trim().is_empty() {
-            return map;
-        }
-        for pair in s.split(',') {
-            let pair = pair.trim();
-            if let Some(eq_pos) = pair.find('=') {
-                let key = pair[..eq_pos].trim().to_string();
-                let val = pair[eq_pos + 1..].trim().to_string();
-                if !key.is_empty() {
-                    map.insert(key, val);
-                }
-            }
-        }
-        map
+        crate::server::iocsh::macro_defn_pairs(s)
+            .into_iter()
+            .filter(|(name, _)| !name.is_empty())
+            .filter_map(|(name, value)| value.map(|v| (name, v)))
+            .collect()
     }
 
     /// Create a child context by merging additional macros (child overrides parent).

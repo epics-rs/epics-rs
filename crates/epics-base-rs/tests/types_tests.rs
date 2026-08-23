@@ -700,7 +700,13 @@ fn test_decode_time_char_roundtrip() {
     let val = EpicsValue::Char(0xBE);
     let data = serialize_dbr(18, &val, 0, 0, ts).unwrap();
     let snap = decode_dbr(18, &data, 1).unwrap();
-    assert_eq!(snap.value, EpicsValue::Char(0xBE));
+    // Byte-identical round-trip, but not label-identical, and deliberately
+    // so: the encoder takes the carrier the SERVER holds (a `DBF_CHAR`
+    // field is `epicsInt8`), while the decoder answers with the carrier the
+    // WIRE defines (`dbr_char_t` is `epicsUInt8`, `db_access.h:40`) —
+    // `DbFieldType::wire_carrier`. Only a later widening can tell them
+    // apart, and there the wire's answer is the one C's CA client gives.
+    assert_eq!(snap.value, EpicsValue::UChar(0xBE));
 }
 
 #[test]
@@ -796,7 +802,8 @@ fn test_decode_ctrl_char_roundtrip() {
     let snap_orig = full_snapshot(EpicsValue::Char(0xAB));
     let data = encode_dbr(32, &snap_orig).unwrap();
     let snap = decode_dbr(32, &data, 1).unwrap();
-    assert_eq!(snap.value, EpicsValue::Char(0xAB));
+    // Wire carrier on the way back, exactly as in the TIME_CHAR case above.
+    assert_eq!(snap.value, EpicsValue::UChar(0xAB));
     let disp = snap.display.unwrap();
     assert_eq!(disp.units, "degC");
 }

@@ -714,7 +714,7 @@ pub(crate) struct InFlightOps {
     ///
     /// Entries outlive the channel on purpose. They are removed when the
     /// server can no longer answer for the cid: the `CA_PROTO_CLEAR_CHANNEL`
-    /// confirmation (`rsrv/camessage.c:1944-1957` echoes `m_cid`/
+    /// confirmation (`rsrv/camessage.c:1966-1968` echoes `m_cid`/
     /// `m_available`, and a circuit answers in order, so it is a fence and
     /// not a delay), `CA_PROTO_SERVER_DISCONN`, or a `DropChannel` that
     /// sent no CLEAR_CHANNEL because the channel was not operational.
@@ -1394,16 +1394,18 @@ pub(crate) struct ServerErrorFrame {
     /// `CA_PROTO_ERROR`. This is what `ca_extract_msg_no(stat)` would parse
     /// on the C side.
     pub(crate) eca_status: u32,
-    /// Original request command that triggered the error (from the first u16
-    /// of the error payload's copy of the original header). Diagnostic only —
-    /// distinct from `eca_status`.
-    pub(crate) original_request: Option<u16>,
+    /// Original request command that triggered the error, from the error
+    /// payload's copy of the original header. Diagnostic only — distinct from
+    /// `eca_status`. Not optional: a `CA_PROTO_ERROR` whose body is too short
+    /// to carry the echo ends the circuit at the decoder
+    /// (`transport::EchoedRequest::parse`, C `cac.cpp:1085-1104`).
+    pub(crate) original_request: u16,
     pub(crate) message: String,
     pub(crate) server_addr: SocketAddr,
     /// DBR type and element count of the echoed request header — libca's
     /// `hdr.m_dataType` / `hdr.m_count`, which the exception block prints.
-    pub(crate) data_type: Option<u16>,
-    pub(crate) count: Option<u32>,
+    pub(crate) data_type: u16,
+    pub(crate) count: u32,
     /// Channel name the failing request was issued against, taken from
     /// [`InFlightOps::write_identities`] by the cid the ECHOED request header
     /// carries. Resolved on the circuit that owns the request, so the
@@ -1429,12 +1431,10 @@ pub(crate) fn raise_server_exception(slot: &CaExceptionSlot, err: ServerErrorFra
     // instead. The caller has already completed those waiters.
     let routed_to_a_callback = matches!(
         original_request,
-        Some(
-            crate::protocol::CA_PROTO_READ
-                | crate::protocol::CA_PROTO_READ_NOTIFY
-                | crate::protocol::CA_PROTO_WRITE_NOTIFY
-                | crate::protocol::CA_PROTO_EVENT_ADD
-        )
+        crate::protocol::CA_PROTO_READ
+            | crate::protocol::CA_PROTO_READ_NOTIFY
+            | crate::protocol::CA_PROTO_WRITE_NOTIFY
+            | crate::protocol::CA_PROTO_EVENT_ADD
     );
     if routed_to_a_callback {
         return;
@@ -1443,11 +1443,11 @@ pub(crate) fn raise_server_exception(slot: &CaExceptionSlot, err: ServerErrorFra
     // callback to complete, so libca takes it to
     // `oldChannelNotify::writeException`, `cac.cpp:1049-1061`) and
     // `cac::defaultExcep` for every other command.
-    let op = if original_request == Some(crate::protocol::CA_PROTO_WRITE) {
+    let op = if original_request == crate::protocol::CA_PROTO_WRITE {
         CaOp::Put
-    } else if original_request == Some(crate::protocol::CA_PROTO_EVENT_CANCEL) {
+    } else if original_request == crate::protocol::CA_PROTO_EVENT_CANCEL {
         CaOp::ClearEvent
-    } else if original_request == Some(crate::protocol::CA_PROTO_CREATE_CHAN) {
+    } else if original_request == crate::protocol::CA_PROTO_CREATE_CHAN {
         CaOp::CreateChannel
     } else {
         CaOp::Other
@@ -1486,8 +1486,8 @@ pub(crate) fn raise_server_exception(slot: &CaExceptionSlot, err: ServerErrorFra
             pv_name,
             status: Some(eca_status),
             op,
-            data_type: is_channel_exception.then_some(data_type).flatten(),
-            count: is_channel_exception.then_some(count).flatten(),
+            data_type: is_channel_exception.then_some(data_type),
+            count: is_channel_exception.then_some(count),
             // `cac::defaultExcep` (`cac.cpp:1006-1016`) is libca's one
             // null-file producer, so it is the one block with no
             // `Source File:` line; the channel-write exception carries its

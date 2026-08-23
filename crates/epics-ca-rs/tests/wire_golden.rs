@@ -203,7 +203,7 @@ fn extended_header_for_large_payload() {
 
 #[test]
 fn proto_error_field_assignment_matches_c() {
-    // C `vsend_err` (`rsrv/camessage.c:139-224`) writes CA_PROTO_ERROR
+    // C `vsend_err` (`rsrv/camessage.c:149-233`) writes CA_PROTO_ERROR
     // as:
     //   m_cmmd      = CA_PROTO_ERROR
     //   m_postsize  = 24 (extended form when payload >= 0xFFFF — for
@@ -239,7 +239,7 @@ fn proto_error_field_assignment_matches_c() {
 
 #[test]
 fn event_cancel_unknown_sub_id_error_shape() {
-    // Per C `event_cancel_reply` (`camessage.c:1998-2021`), when the
+    // Per C `event_cancel_reply` (`camessage.c:2035-2102`), when the
     // sub-id (m_available of the request) doesn't match any active
     // subscription on the addressed channel, the server replies with
     // CA_PROTO_ERROR carrying ECA_BADMONID. The payload echoes the
@@ -301,7 +301,7 @@ fn search_reply_udp_matches_c_sid_sentinel() {
 
 #[test]
 fn search_reply_tcp_matches_c_zero_postsize_sid_sentinel() {
-    // C `search_reply_tcp` (`rsrv/camessage.c:2275-2283`):
+    // C `search_reply_tcp` (`rsrv/camessage.c:2329-2331`):
     //   m_cmmd      = CA_PROTO_SEARCH (6)
     //   m_postsize  = 0  (no payload — TCP search reply carries no
     //                 minor-version trailer, unlike UDP)
@@ -362,7 +362,7 @@ fn create_chan_cap_reached_uses_proto_error_eca_allocmem() {
 
 #[test]
 fn search_fail_reply_tcp_echoes_request_header_fields() {
-    // C `search_fail_reply` (`rsrv/camessage.c:2075-2089`) calls
+    // C `search_fail_reply` (`rsrv/camessage.c:2129-2143`) calls
     // `cas_copy_in_header(CA_PROTO_NOT_FOUND, 0u, mp->m_dataType,
     // mp->m_count, mp->m_cid, mp->m_available, NULL)` — every
     // identifying field of the incoming search request is echoed

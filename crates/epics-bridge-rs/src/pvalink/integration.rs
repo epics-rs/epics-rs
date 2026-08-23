@@ -1317,11 +1317,11 @@ impl LinkSet for PvaLinkResolver {
         if !self.is_enabled() {
             // `put_value` would reject it — refuse at the gate so the owning
             // record alarms in this cycle, as a `-1` from C does.
-            return PutAdmission::Disconnected;
+            return PutAdmission::Refused;
         }
         let Some(full) = strip_scheme(name) else {
             // A `ca://` name reaching the pva lset: `put_value` rejects it.
-            return PutAdmission::Disconnected;
+            return PutAdmission::Refused;
         };
         let bare = link_pv_name(full);
         if full != bare {
@@ -1342,7 +1342,7 @@ impl LinkSet for PvaLinkResolver {
         {
             None => PutAdmission::Unopened,
             Some(link) if link.is_connected() => PutAdmission::Connected,
-            Some(_) => PutAdmission::Disconnected,
+            Some(_) => PutAdmission::Refused,
         }
     }
 

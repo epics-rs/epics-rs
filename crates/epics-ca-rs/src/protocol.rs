@@ -26,6 +26,70 @@ pub const CA_PROTO_READ_SYNC: u16 = 10; // legacy echo (used by older clients)
 pub const CA_PROTO_ERROR: u16 = 11;
 pub const CA_PROTO_CREATE_CH_FAIL: u16 = 26;
 
+/// C `caProto.h:34` `CA_MINIMUM_SUPPORTED_VERSION`. A non-VERSION message
+/// from a peer below this minor version is answered with ECA_DEFUNCT and
+/// drained (`camessage.c:2489-2513`); a TCP VERSION below it is dropped
+/// (`tcp_version_action`, `camessage.c:366-369`).
+pub const CA_MINIMUM_SUPPORTED_VERSION: u16 = 4;
+
+/// **The one owner of "does this message declare a version we still serve?"**
+///
+/// C `CA_VSUPPORTED` (`caProto.h:35`), and it gates four handlers:
+/// `tcp_version_action` (`camessage.c:371`), `udp_version_action` (`:2152`),
+/// `search_reply_udp` (`:2205`) and `search_reply_tcp` (`:2292`). All four
+/// read `mp->m_count` — the version the message in hand declares — and all
+/// four answer `RSRV_ERROR`, which stops the server reading from that peer.
+///
+/// It takes the header rather than a number on purpose. The other version a
+/// CA server holds is the one its circuit negotiated
+/// (`client->minor_version_number`, the framing gate at `camessage.c:2489`),
+/// they are both `u16`, and reading that one here is exactly the defect this
+/// signature makes unwritable: a SEARCH may arrive on a circuit whose
+/// handshake said something else entirely, and C answers the frame.
+pub fn declares_supported_version(hdr: &CaHeader) -> bool {
+    hdr.count >= CA_MINIMUM_SUPPORTED_VERSION
+}
+
+/// **The one owner of "is this a CA opcode a TCP circuit may carry?"**
+///
+/// C has no third category: every one of `tcpJumpTable`'s 28 slots is either
+/// a real handler or `bad_tcp_cmd_action`, and any index at or past its end
+/// is `bad_tcp_cmd_action` too (`rsrv/camessage.c:2348-2377`, dispatched at
+/// `:2587-2594`). An illegal opcode is answered `ECA_INTERNAL` "invalid
+/// (damaged?) request code from TCP" and the circuit is torn down
+/// (`camessage.c:342-357`).
+///
+/// This exists because "not a legal CA opcode" and "legal, but this driver
+/// does not route it" are different facts that had been conflated into one
+/// allowlist in the blocking driver, which answered both with a
+/// keep-serving `ECA_UNAVAILINSERV`. Legality is a property of the wire
+/// protocol, so it lives here and the receive gate is its only consumer;
+/// what each driver can route is that driver's own business.
+pub fn is_legal_tcp_command(cmmd: u16) -> bool {
+    matches!(
+        cmmd,
+        CA_PROTO_VERSION            // 0  tcp_version_action
+            | CA_PROTO_EVENT_ADD    // 1  event_add_action
+            | CA_PROTO_EVENT_CANCEL // 2  event_cancel_reply
+            | CA_PROTO_READ         // 3  read_action
+            | CA_PROTO_WRITE        // 4  write_action
+            | CA_PROTO_SEARCH       // 6  search_reply_tcp
+            | CA_PROTO_EVENTS_OFF   // 8  events_off_action
+            | CA_PROTO_EVENTS_ON    // 9  events_on_action
+            | CA_PROTO_READ_SYNC    // 10 read_sync_reply
+            | CA_PROTO_CLEAR_CHANNEL // 12 clear_channel_reply
+            | CA_PROTO_READ_NOTIFY  // 15 read_notify_action
+            | CA_PROTO_CREATE_CHAN  // 18 claim_ciu_action
+            | CA_PROTO_WRITE_NOTIFY // 19 write_notify_action
+            | CA_PROTO_CLIENT_NAME  // 20 client_name_action
+            | CA_PROTO_HOST_NAME    // 21 host_name_action
+            | CA_PROTO_ECHO // 23 tcp_echo_action
+    )
+}
+
+/// C's text at `camessage.c:344`.
+pub(crate) const BAD_TCP_COMMAND_DIAGNOSTIC: &str = "invalid (damaged?) request code from TCP";
+
 // Ports — re-exported from the one owner, `epics-base-rs`, which const-derives
 // them from the generated `ENV_PARAM` table (`configure/CONFIG_ENV`).
 pub use epics_base_rs::runtime::net::{CA_REPEATER_PORT, CA_SERVER_PORT};
@@ -668,7 +732,7 @@ impl CaHeader {
     ///
     /// Wire detection is by `postsize == 0xFFFF` alone, matching C
     /// `tcpiiu.cpp::processIncoming` (line 1168), `cac.cpp:1097`, and
-    /// `rsrv/camessage.c:2410`. The `count == 0` field is set by the
+    /// `rsrv/camessage.c:2464`. The `count == 0` field is set by the
     /// emit-side per the spec but is NOT checked on receive — a peer
     /// sending garbage in `m_count` of an extended header is still
     /// correctly parsed by C. We mirror C's lenient receive behavior.
@@ -812,7 +876,7 @@ impl CaHeader {
             // — and what to do at it — belongs to whichever loop owns the
             // receive buffer: the client applies [`max_recv_body_bytes`] and
             // drains, the server applies its own `maxstk` check and replies
-            // ECA_TOLARGE (`camessage.c:2471-2489`, `server/tcp.rs`).
+            // ECA_TOLARGE (`camessage.c:2539-2556`, `server/tcp.rs`).
             hdr.extended_postsize = Some(ext_post);
             hdr.extended_count = Some(ext_count);
             consumed = 24;
@@ -828,7 +892,7 @@ impl CaHeader {
     /// `CA_V49(client->minor_version_number) && msg.m_postsize ==
     /// 0xffff`. A pre-V49 peer that sends `m_postsize == 0xffff` takes
     /// the else branch, so `msgsize = 0xffff + 16 = 65551`, which fails
-    /// the `msgsize & 0x7` alignment test at `camessage.c:2452` and gets
+    /// the `msgsize & 0x7` alignment test at `camessage.c:2520` and gets
     /// "CAS: Missaligned protocol rejected" (ECA_INTERNAL) + disconnect.
     /// Reproduce that by keeping `postsize = 0xFFFF` on the plain header
     /// and letting the caller's alignment check reject it — never by
@@ -860,6 +924,24 @@ pub fn pad_string(s: &str) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// [`is_legal_tcp_command`] is a transcription of C's `tcpJumpTable`
+    /// (`rsrv/camessage.c:2348-2377`). Pinned against the table's own shape:
+    /// 28 slots, of which these indices are `bad_tcp_cmd_action`, and every
+    /// index at or past the end is too (`camessage.c:2594-2596`).
+    #[test]
+    fn legal_tcp_commands_are_c_s_jump_table() {
+        const BAD_SLOTS: [u16; 12] = [5, 7, 11, 13, 14, 16, 17, 22, 24, 25, 26, 27];
+        const TABLE_LEN: u16 = 28;
+        for cmmd in 0u16..=u16::MAX {
+            let expected = cmmd < TABLE_LEN && !BAD_SLOTS.contains(&cmmd);
+            assert_eq!(
+                is_legal_tcp_command(cmmd),
+                expected,
+                "opcode {cmmd} disagrees with C's tcpJumpTable"
+            );
+        }
+    }
 
     // DBR_TIME_DOUBLE (20): C `dbr_time_double` is status(2) + severity(2) +
     // stamp(8) + RISC pad(4) + value(8), so `dbr_size[20]` = 24 and

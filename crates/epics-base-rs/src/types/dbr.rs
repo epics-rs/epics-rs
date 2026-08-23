@@ -117,6 +117,36 @@ pub enum DbFieldType {
 }
 
 impl DbFieldType {
+    /// This type as the CA **wire** carries its value.
+    ///
+    /// The single owner of the one row where the wire and the database
+    /// disagree. `db_access.h:40` is `typedef epicsUInt8 dbr_char_t;`, so a
+    /// `DBR_CHAR` element off the network is UNSIGNED; the `DBF_CHAR` it
+    /// shares a name with is `epicsInt8` (`epicsTypes.h:44`). Every other
+    /// row names the same type twice, and `DBF_UCHAR` has no wire code of
+    /// its own — it promotes to `DBR_CHAR` (`db_convert.h`
+    /// `dbDBRnewToDBRold`), which is why one carrier serves both.
+    ///
+    /// [`Self::from_u16`] and [`crate::types::native_type_for_dbr`] answer
+    /// the DATABASE question: which field type does this code name. Neither
+    /// is the wire's answer, so every site that turns *received* CA bytes
+    /// into a value composes one of them with this. The naive answer costs
+    /// a sign: byte `0xC8` is 200 to C and -56 without this.
+    ///
+    /// The signed reading is not lost, it is just not the carrier's. C
+    /// re-creates it at the DISPLAY step — `val2str` assigns the
+    /// `dbr_char_t` into a plain `char` before `sprintf("%d")`
+    /// (`ca/src/tools/tool_lib.c:114`, `:160-161`) — which is why C's own
+    /// `caget` prints -56 for a byte the wire called 200.
+    pub fn wire_carrier(self) -> Self {
+        match self {
+            Self::Char => Self::UChar,
+            other => other,
+        }
+    }
+
+    /// The DATABASE field type a `DBF_` index names. **Not** the carrier of
+    /// a CA wire payload — compose with [`Self::wire_carrier`] for that.
     pub fn from_u16(v: u16) -> CaResult<Self> {
         match v {
             0 => Ok(Self::String),
@@ -395,6 +425,12 @@ fn dbr_native_index(dbr_type: u16) -> Option<u16> {
     }
 }
 
+/// The DATABASE field type a CA DBR code is named after.
+///
+/// **Not** the carrier of a payload that arrived over the wire: compose
+/// with [`DbFieldType::wire_carrier`] for that. The two answers differ for
+/// the CHAR row only, and that one row is the whole of CA's signedness
+/// mismatch.
 pub fn native_type_for_dbr(dbr_type: u16) -> CaResult<DbFieldType> {
     match dbr_native_index(dbr_type) {
         Some(idx) => DbFieldType::from_u16(idx),

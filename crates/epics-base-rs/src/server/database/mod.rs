@@ -1115,11 +1115,11 @@ impl PvDatabase {
         if total == 0 {
             return (0, 0);
         }
-        // `std::time::Instant`, not `crate::runtime::task::Instant`: the sleep below
-        // is the runtime seam, whose clock is std's on both backends. Reading
-        // the deadline off tokio's clock made the two disagree — under
-        // `start_paused` tokio's clock advances only when the runtime decides
-        // to, while the RTEMS backend's timer thread follows the real one, so
+        // `std::time::Instant`, not `crate::runtime::task::Instant`: the sleep
+        // below is the background timer, which measures on std's clock on both
+        // backends. Reading the deadline off tokio's clock made the two
+        // disagree — under `start_paused` tokio's clock advances only when the
+        // runtime decides to, while the timer thread follows the real one, so
         // the loop could sleep against one clock and expire against another.
         let deadline = std::time::Instant::now() + timeout;
         loop {
@@ -1139,7 +1139,7 @@ impl PvDatabase {
             if std::time::Instant::now() >= deadline {
                 return (connected, total);
             }
-            crate::runtime::task::sleep(std::time::Duration::from_millis(100)).await;
+            crate::runtime::task::sleep_background(std::time::Duration::from_millis(100)).await;
         }
     }
 
@@ -1610,7 +1610,7 @@ impl PvDatabase {
             DbInitPhase::Loading(queued) => queued.push(init),
             DbInitPhase::Unloaded | DbInitPhase::Running => {
                 drop(phase);
-                crate::runtime::task::spawn(init);
+                crate::runtime::task::spawn_background(init);
             }
         }
     }

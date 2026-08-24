@@ -24,7 +24,14 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
-  EPICS_BASE_VERSION: R7.0.8
+  # R7.0.9 is the floor, not a preference: before base 3d70e7064
+  # `dbAllocRecord()` reaches every field through `&ppvt->common`, so
+  # `__builtin_object_size()` bounds the write to `sizeof(dbCommon)` and
+  # `-D_FORTIFY_SOURCE=3` — the ubuntu-latest gcc default — aborts on any
+  # DBF_STRING field with an `initial` past that, e.g. `calcRecord.CALC`.
+  # Under R7.0.8 `softIocPVX` therefore died in `dbLoadRecords` for every
+  # db holding a calc record, which is what `pipeline_r1` loads.
+  EPICS_BASE_VERSION: R7.0.10
   PVXS_VERSION: 1.3.3
 
 jobs:

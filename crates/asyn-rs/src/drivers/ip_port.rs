@@ -384,16 +384,20 @@ pub(super) trait SendWithoutParking {
     fn send_without_parking(&self, buf: &[u8]) -> std::io::Result<usize>;
 }
 
-/// The blocking mode this driver owns for a live socket, applied once at
-/// connect by [`IpIoInner::own_blocking_mode`].
+/// The blocking mode this driver owns for a live socket, applied at the two
+/// points a socket becomes one: [`IpIoInner::own_blocking_mode`] for a client
+/// connect, and `ip_server_port`'s `ClientSlot::assign` for a served
+/// connection.
 ///
-/// Non-blocking on unix, which is C's `setNonBlock(fd, 1)` at connect
-/// (`drvAsynIPPort.c:511`) under `USE_POLL`. With the mode owned, neither
+/// Non-blocking on unix, which is C's `setNonBlock(fd, 1)`
+/// (`drvAsynIPPort.c:511`) under `USE_POLL` — one statement covering both,
+/// since the server-accepted fd reaches `connectIt` through
+/// `pasynUser->reason` (:434-436) and passes the same line. With the mode owned, neither
 /// direction can park whatever the target does with `MSG_DONTWAIT`,
 /// `SO_SNDTIMEO` or `SO_RCVTIMEO`, and the bound is the poll in
 /// [`WaitWritable`] / [`BoundNextRead`] on every unix alike. Blocking
 /// elsewhere: Windows implements both options and both bounds ride on them.
-const OWNED_NONBLOCKING: bool = cfg!(unix);
+pub(super) const OWNED_NONBLOCKING: bool = cfg!(unix);
 
 /// Make the `read`/`recv_from` that follows return within `timeout`.
 ///
@@ -411,7 +415,7 @@ const OWNED_NONBLOCKING: bool = cfg!(unix);
 /// records a failed `setsockopt(SO_RCVTIMEO)` and proceeds to `recv` anyway
 /// (`drvAsynIPPort.c:744-756`), letting the recv outcome govern teardown
 /// (`:797-821`).
-trait BoundNextRead {
+pub(super) trait BoundNextRead {
     fn bound_next_read(&self, timeout: Duration);
 }
 

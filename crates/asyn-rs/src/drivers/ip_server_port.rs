@@ -60,8 +60,8 @@ use parking_lot::Mutex;
 
 use crate::asyn_trace;
 use crate::drivers::ip_port::{
-    DrvAsynIPPort, is_nonfatal_read_timeout, maxchars_zero_error, socket_poll_timeout,
-    write_with_retry,
+    BoundNextRead, DrvAsynIPPort, OWNED_NONBLOCKING, is_nonfatal_read_timeout, maxchars_zero_error,
+    socket_poll_timeout, write_with_retry,
 };
 use crate::drivers::option_parse::parse_yn_option;
 use crate::error::{AsynError, AsynResult, AsynStatus};
@@ -334,13 +334,50 @@ impl ClientSlot {
         Arc::clone(&self.occupied)
     }
 
-    fn assign(&self, stream: TcpStream, peer: SocketAddr) {
+    /// Put a live socket in this slot.
+    ///
+    /// The one point at which a socket becomes a slot socket, so it is where
+    /// the socket takes the mode this crate owns ([`OWNED_NONBLOCKING`]).
+    /// C reaches the same mode by the same single point: the accept hands the
+    /// fd to a full `drvAsynIPPort` child (drvAsynIPServerPort.c:369-371 sets
+    /// `pasynUser->reason = clientFd` and calls `connectDevice`), whose
+    /// `connectIt` takes the fd from `reason` (drvAsynIPPort.c:434-436) and
+    /// then runs `setNonBlock(fd, 1)` under USE_POLL (:510-517) — the same
+    /// statement the client path runs, ahead of the branch that connects. A
+    /// served connection is therefore non-blocking on every target that is not
+    /// RTEMS (`USE_SOCKTIMEOUT` is `#if defined(__rtems__)`, :71-72), with both
+    /// directions poll-bounded.
+    ///
+    /// Owning it here, not at the accept, is what makes the bounds hold by
+    /// construction: no caller can build a slot whose socket the read and write
+    /// bounds do not apply to. As an accept-site `set_nonblocking(false)` the
+    /// slot socket was the one socket in the driver left blocking, and `send`'s
+    /// `MSG_DONTWAIT` was the only thing holding a slot write out of a park — a
+    /// flag Darwin's `sosend` does not consult
+    /// (`doc/darwin-send-dontwait-gap.md`), so a write to a peer that had
+    /// stopped reading outlived its deadline there and took the parent
+    /// broadcast with it.
+    ///
+    /// The mode has to be set, not inherited: macOS/BSD accepted sockets
+    /// inherit `O_NONBLOCK` from the listener and Linux resets it, and this
+    /// listener is non-blocking because the poll loop needs it to be.
+    ///
+    /// A failure drops the stream on the way out, which is C's
+    /// `epicsSocketDestroy(fd)` on the same failure (drvAsynIPPort.c:511-516).
+    fn assign(&self, stream: TcpStream, peer: SocketAddr) -> AsynResult<()> {
+        stream
+            .set_nonblocking(OWNED_NONBLOCKING)
+            .map_err(|e| AsynError::Status {
+                status: AsynStatus::Error,
+                message: format!("set_nonblocking on accepted client failed: {e}"),
+            })?;
         *self.stream.lock() = Some(stream);
         *self.peer.lock() = Some(peer);
         // Publish last: the socket and the peer are in place before any observer
         // (the child port's actor, the parent's free-slot scan) can see the slot
         // as occupied.
         self.occupied.store(true, Ordering::Release);
+        Ok(())
     }
 
     fn clear(&self) {
@@ -394,23 +431,26 @@ impl ClientSlot {
         // C parity: the child `drvAsynIPPort`'s `readIt` floors a zero request
         // timeout to a 1 ms poll (drvAsynIPPort.c:775-777) and re-applies it on
         // every read. `socket_poll_timeout` is the shared owner of that mapping;
-        // setting it unconditionally (rather than skipping on `timeout == 0`)
+        // arming it unconditionally (rather than skipping on `timeout == 0`)
         // keeps a poll request a 1 ms poll instead of blocking on the accept-time
         // timeout.
-        // C readRaw (drvAsynIPPort.c:744-756): under USE_SOCKTIMEOUT a failed
-        // setsockopt(SO_RCVTIMEO) records asynError but does NOT return — it
-        // falls through to recv() (:791), and the recv outcome governs teardown
-        // (:797-821). This is load-bearing on macOS: setsockopt(SO_RCVTIMEO)
-        // returns EINVAL on a socket whose peer sent RST (Darwin marks the reset
-        // socket invalid), so returning here — as this used to — skips the recv
-        // that would see ECONNRESET, `clear()` the slot and issue the disconnect.
-        // The slot then leaks on every abortive close, and once the table fills
-        // no client can ever reconnect. Mirror C's fall-through: the setsockopt
-        // failure only taints status — which C returns as asynError-with-bytes
-        // for a >0-byte read (:822-831), an unreachable branch here since the
-        // EINVAL cause is a reset socket whose read cannot succeed — so drop it
-        // and let the read below classify the outcome and own the teardown.
-        let _ = stream.set_read_timeout(Some(socket_poll_timeout(timeout)));
+        //
+        // Through `BoundNextRead`, not `SO_RCVTIMEO`: the slot socket is in the
+        // mode this crate owns ([`OWNED_NONBLOCKING`]), which is C's
+        // `setNonBlock(fd, 1)` under USE_POLL (drvAsynIPPort.c:510-517), and on
+        // a non-blocking socket the option governs nothing. `BoundNextRead` is
+        // the same POLLIN wait the client port uses and the same one C's
+        // `readIt` uses (:792-806) — one bound for both drivers, on whichever
+        // mechanism the platform's mode makes real.
+        //
+        // It also keeps C's fall-through: a failed bound taints nothing and the
+        // read below still runs (C `readRaw` records a failed
+        // setsockopt(SO_RCVTIMEO) and recv()s anyway, :744-756 then :791), which
+        // is load-bearing on macOS — setsockopt(SO_RCVTIMEO) returns EINVAL on a
+        // socket whose peer sent RST, and returning early there skipped the recv
+        // that sees ECONNRESET, `clear()`s the slot and issues the disconnect.
+        // The slot leaked on every abortive close and the table filled.
+        stream.bound_next_read(socket_poll_timeout(timeout));
         let res = stream.read(buf);
         // `clear()` re-locks the stream, so the read guard must go first.
         drop(guard);
@@ -555,8 +595,10 @@ impl ClientSlot {
     fn drain_input(&self) {
         let mut g = self.stream.lock();
         let Some(stream) = g.as_mut() else { return };
-        // C toggles non-blocking around the drain (setNonBlock 1 then 0);
-        // restore blocking afterwards so the next timed read behaves.
+        // C toggles non-blocking around the drain (setNonBlock 1 then 0) because
+        // its flush runs on whatever mode the port is in; restore this crate's
+        // owned mode afterwards rather than a literal `false`, so the drain
+        // cannot hand the next read a socket the bound no longer applies to.
         if stream.set_nonblocking(true).is_err() {
             return;
         }
@@ -572,7 +614,7 @@ impl ClientSlot {
                 Err(_) => break,
             }
         }
-        let _ = stream.set_nonblocking(false);
+        let _ = stream.set_nonblocking(OWNED_NONBLOCKING);
     }
 }
 
@@ -634,20 +676,9 @@ impl Acceptor {
                 });
             }
         };
-        // C's connectionListener accepts on a BLOCKING listener
-        // (epicsSocketAccept, :326), so its child fds are blocking and
-        // SO_RCVTIMEO governs every slot read. This listener is non-blocking
-        // (the poll loop needs it), and macOS/BSD accepted sockets INHERIT
-        // O_NONBLOCK from the listener (Linux resets it) — an inherited
-        // non-blocking child turns every timed slot read into an instant
-        // EWOULDBLOCK poll and SO_RCVTIMEO into a no-op. Restore blocking
-        // explicitly so the child matches C on every platform.
-        stream
-            .set_nonblocking(false)
-            .map_err(|e| AsynError::Status {
-                status: AsynStatus::Error,
-                message: format!("set_nonblocking(false) on accepted client failed: {e}"),
-            })?;
+        // The accepted socket's blocking mode is not decided here — it is
+        // [`ClientSlot::assign`]'s, the one point at which a socket becomes a
+        // slot socket.
         if let Some(t) = self.read_timeout {
             stream
                 .set_read_timeout(Some(t))
@@ -660,7 +691,7 @@ impl Acceptor {
         // loop (:342-350).
         for (i, slot) in self.slots.iter().enumerate() {
             if !slot.is_occupied() {
-                slot.assign(stream, peer);
+                slot.assign(stream, peer)?;
                 self.announcer.announce(AsynException::Connect, i as i32);
                 let child = format!("{}:{}", self.port_name, i);
                 // C :367-369 — "Set the new port to initially have the same
@@ -3139,6 +3170,56 @@ mod tests {
         assert_eq!(&buf, b"hello");
     }
 
+    /// The invariant the slot read and write bounds rest on: a socket that has
+    /// become a slot socket is in the mode this crate owns, on both sides of a
+    /// flush drain.
+    ///
+    /// Asserted rather than inferred from a timing test because Linux hides
+    /// the failure: with the socket blocking, the only thing keeping a slot
+    /// write out of a park is `send`'s `MSG_DONTWAIT`, which Linux honours and
+    /// Darwin's `sosend` ignores.
+    #[cfg(unix)]
+    #[test]
+    fn a_slot_socket_is_in_the_mode_the_crate_owns() {
+        use std::os::fd::AsRawFd;
+
+        let mut config = IpServerConfig::parse("127.0.0.1:0 TCP").unwrap();
+        config.max_clients = 1;
+        let mut srv = DrvAsynIPServerPort::with_config("owned_mode", config).unwrap();
+        srv.connect(&AsynUser::default()).unwrap();
+        let _client = TcpStream::connect(format!("127.0.0.1:{}", srv.local_port())).unwrap();
+        wait_for_slot(&srv, 0);
+
+        let nonblocking = || {
+            let guard = srv.slots[0].stream.lock();
+            let fd = guard
+                .as_ref()
+                .expect("the slot holds the socket")
+                .as_raw_fd();
+            // SAFETY: `fd` is the slot's live socket, held open by the guard;
+            // `F_GETFL` only reads the descriptor's status flags.
+            let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+            assert!(
+                flags >= 0,
+                "F_GETFL on the slot socket failed: {}",
+                std::io::Error::last_os_error()
+            );
+            flags & libc::O_NONBLOCK != 0
+        };
+
+        assert_eq!(
+            nonblocking(),
+            OWNED_NONBLOCKING,
+            "the accept left the slot socket in a mode the bounds do not apply to"
+        );
+        srv.slots[0].drain_input();
+        assert_eq!(
+            nonblocking(),
+            OWNED_NONBLOCKING,
+            "the flush drain did not restore the owned mode"
+        );
+    }
+
     /// F1 regression: a slot write against a peer that has stopped reading.
     ///
     /// Both socket buffers are pinned to the kernel minimum, so a 1 MiB
@@ -3173,7 +3254,7 @@ mod tests {
         pin_buffer(server_side.as_raw_fd(), libc::SO_SNDBUF);
 
         let slot = Arc::new(ClientSlot::new_empty());
-        slot.assign(server_side, peer);
+        slot.assign(server_side, peer).unwrap();
 
         // The wait runs on its own thread and reports through a channel, so an
         // unbounded write fails this test in seconds instead of hanging it.
@@ -3285,7 +3366,7 @@ mod tests {
             pin_buffer(client.as_raw_fd(), libc::SO_RCVBUF);
             let (server_side, peer) = listener.accept().unwrap();
             pin_buffer(server_side.as_raw_fd(), libc::SO_SNDBUF);
-            slot.assign(server_side, peer);
+            slot.assign(server_side, peer).unwrap();
             clients.push(client);
         }
 

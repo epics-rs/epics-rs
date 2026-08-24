@@ -3341,6 +3341,11 @@ mod tests {
     ///
     /// SAFETY: `std::env::set_var` in a multi-threaded process; every caller
     /// is `#[serial_test::serial]`, the same key `conn_tmo_env_tests` uses.
+    ///
+    /// Carries the callers' own gate: both tests that shrink the timers dial
+    /// a TCP circuit, so they are compiled out under `rtems-exec-model` and
+    /// this helper would be dead code there.
+    #[cfg(not(feature = "rtems-exec-model"))]
     fn shrink_circuit_timers(secs: u64) -> Duration {
         // SAFETY: as above — every caller is `#[serial_test::serial]`.
         unsafe { std::env::set_var("EPICS_CA_CONN_TMO", secs.to_string()) };

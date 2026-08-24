@@ -70,6 +70,25 @@ jobs:
     timeout-minutes: 60
 
     steps:
+    # ── Runner disk ────────────────────────────────────────────
+    # This is the only job that holds three large trees at once: the
+    # restored /opt/epics-base (~3 GB) and /opt/pvxs, plus a
+    # `cargo build --workspace --tests` target dir for 149 crates. That
+    # exceeded the ~14 GB an ubuntu-latest runner leaves free on `/`,
+    # and the runner died mid-suite writing its own diagnostic log
+    # ("System.IO.IOException: No space left on device") — which also
+    # loses the job log, so the failure arrives with no test output at
+    # all. Reclaim the preinstalled SDKs this job never uses; `df` is
+    # printed so a recurrence is diagnosable from the log instead of a
+    # runner crash annotation.
+    - name: Reclaim runner disk
+      run: |
+        df -h /
+        sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc \
+                    /usr/local/.ghcup /usr/share/swift \
+                    /usr/local/share/powershell /usr/local/share/chromium
+        df -h /
+
     - uses: actions/checkout@v4
 
     # ── Toolchain ──────────────────────────────────────────────

@@ -4,7 +4,7 @@
 // runtime seam and `start_paused` cannot advance the seam's clock. Ratcheted
 // DOWN, never up, without running the survivors under the feature.
 
-// RTEMS-EXEC-MODEL-ALLOW(11): the flavored tests drive the TCP transport
+// RTEMS-EXEC-MODEL-ALLOW(14): the flavored tests drive the TCP transport
 // over tokio::net, which needs the reactor. These run and pass in the
 // feature-ON suite on the tokio driver.
 //
@@ -12,6 +12,13 @@
 // write exception to its request rather than to the channel. Both were run
 // under `--features rtems-exec-model` before this count moved, per the
 // ratchet rule above, and both pass.
+//
+// 11 -> 14 for the three the 2026-08-23 parity round added
+// (`an_error_body_too_short_for_the_echo_closes_the_circuit`,
+// `an_echo_promising_an_annex_it_omits_closes_the_circuit`,
+// `an_error_body_that_holds_the_echo_keeps_the_circuit`). The whole
+// crate was run under `--features rtems-exec-model` before this count moved,
+// per the ratchet rule above, and every one of the 14 passes.
 use std::collections::HashMap;
 use std::net::SocketAddr;
 #[cfg(feature = "experimental-rust-tls")]

@@ -67,7 +67,7 @@ async fn caput(db: &PvDatabase, field: &str, value: EpicsValue) {
 
 /// Boundary: the edited string IS the one VAL selects. Both records, because
 /// the two C bodies are the same body and the port must not fix one of them.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn editing_the_selected_state_label_posts_val() {
     for rtype in ["mbbi", "mbbo"] {
         let db = db_with(rtype, 0).await;
@@ -94,7 +94,7 @@ async fn editing_the_selected_state_label_posts_val() {
 
 /// The mask is C's literal `DBE_VALUE | DBE_LOG`, so a LOG-only subscriber —
 /// an archiver — is woken too.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn the_post_carries_the_log_bit() {
     for rtype in ["mbbi", "mbbo"] {
         let db = db_with(rtype, 0).await;
@@ -111,7 +111,7 @@ async fn the_post_carries_the_log_bit() {
 
 /// Boundary: the other side of C's equality. VAL sits on state 1, so editing
 /// state 0's label changes nothing any subscriber renders.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn editing_an_unselected_state_label_posts_nothing() {
     for rtype in ["mbbi", "mbbo"] {
         let db = db_with(rtype, 1).await;
@@ -128,7 +128,7 @@ async fn editing_an_unselected_state_label_posts_nothing() {
 
 /// Boundary: the last state slot, to pin that the range is ZRST..=FFST and not
 /// just its first entry.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn the_range_reaches_the_sixteenth_state() {
     for rtype in ["mbbi", "mbbo"] {
         let db = db_with(rtype, 15).await;
@@ -146,7 +146,7 @@ async fn the_range_reaches_the_sixteenth_state() {
 /// Boundary: the VALUE fields. C's comment flags that ZRVL..FFVL are `SPC_MOD`
 /// too; they run `init_common` and stop short of the post, because the index
 /// test excludes them.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn editing_a_state_value_posts_no_val() {
     for rtype in ["mbbi", "mbbo"] {
         let db = db_with(rtype, 0).await;

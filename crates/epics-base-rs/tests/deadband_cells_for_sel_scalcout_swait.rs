@@ -1,4 +1,3 @@
-// RTEMS-EXEC-MODEL-ALLOW(1): a sync test that touches no runtime.
 //! `sel`, `scalcout` and `swait` must carry the MLST/ALST cells their C
 //! records have.
 //!

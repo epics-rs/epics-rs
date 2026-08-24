@@ -1,3 +1,4 @@
+// RTEMS-EXEC-MODEL-ALLOW(1): a multi-thread-flavored tokio test — the gated install has to block on a second worker; runs and passes in the feature-ON suite.
 //! `PvDatabase::process_record_with_notify` — the QSRV
 //! `record[process=true,block=true]` (Force + block) completion barrier.
 //!

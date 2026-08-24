@@ -18,7 +18,7 @@
 
 #![cfg(test)]
 
-// RTEMS-EXEC-MODEL-ALLOW(2): not run by the default nextest profile - this file is a module of the `parity_interop` binary, which `.config/nextest.toml`'s default-filter excludes.
+// RTEMS-EXEC-MODEL-ALLOW(4): not run by the default nextest profile - this file is a module of the `parity_interop` binary, which `.config/nextest.toml`'s default-filter excludes.
 
 use std::sync::Arc;
 use std::time::Duration;

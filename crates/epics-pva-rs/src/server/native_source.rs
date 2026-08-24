@@ -3,9 +3,6 @@
 //! Builds NTScalar and NTScalarArray `PvField` values directly from
 //! `Snapshot`s, with full alarm/timeStamp/display metadata.
 
-// RTEMS-EXEC-MODEL-ALLOW(6): checked - the six channel-name tests run and pass
-// under --features rtems-exec-model.
-
 use std::sync::Arc;
 
 use tokio::sync::mpsc;
@@ -4407,7 +4404,7 @@ ASG(PLAIN) {
     /// IS the string. Applying a bare `parse_pv_name` to the whole client
     /// name left the `$` glued to the field, `DESC$` resolved to nothing,
     /// and `softIocPVX`'s `pvget REC.DESC$` had no answer here.
-    #[tokio::test]
+    #[epics_macros_rs::epics_test]
     async fn a_dollar_long_string_channel_serves_the_field() {
         let db = ai_db("AI:LS").await;
         db.get_record("AI:LS").unwrap().write().common.desc = "a description".into();
@@ -4432,7 +4429,7 @@ ASG(PLAIN) {
     /// `$` on a field that is not a string is `S_dbLib_fieldNotFound`, which
     /// aborts channel creation (C `dbChannel.c:486-505`) — the eligibility
     /// rule is the record's (`resolve_string_view_field`), not this source's.
-    #[tokio::test]
+    #[epics_macros_rs::epics_test]
     async fn a_dollar_on_an_ineligible_field_is_refused() {
         let db = ai_db("AI:NOLS").await;
         let source = PvDatabaseSource::new(db);
@@ -4489,7 +4486,7 @@ ASG(PLAIN) {
     /// with its own chain, and the read path runs the same chain in read
     /// context the way pvxs's `LocalFieldLog` does
     /// (`singlesource.cpp:286-291`).
-    #[tokio::test]
+    #[epics_macros_rs::epics_test]
     async fn a_filtered_channel_name_is_served_with_its_slice() {
         let db = wf_db("WF:FILT").await;
         let source = PvDatabaseSource::new(db);
@@ -4514,7 +4511,7 @@ ASG(PLAIN) {
     /// `dbnd` is also the read-context case that must NOT suppress a GET:
     /// pvxs leaves `pFieldLog` NULL when the chain drops the read log and
     /// `IOCSource::get` then reads the live field.
-    #[tokio::test]
+    #[epics_macros_rs::epics_test]
     async fn a_dotted_filter_suffix_is_served_and_never_suppresses_the_read() {
         let db = ai_db("AI:FILT2").await;
         let source = PvDatabaseSource::new(db);
@@ -4532,7 +4529,7 @@ ASG(PLAIN) {
     /// `[range]` is the same surface: `split_channel_name` folds it into a
     /// leading `arr` filter (C `dbChannel.c:507-510`), so it slices here
     /// exactly as the JSON form does.
-    #[tokio::test]
+    #[epics_macros_rs::epics_test]
     async fn a_range_suffixed_channel_name_is_served_as_an_arr_filter() {
         let db = wf_db("WF:RANGE").await;
         let source = PvDatabaseSource::new(db);
@@ -4553,7 +4550,7 @@ ASG(PLAIN) {
     /// `dbChannelDelete(chan); chan = NULL` (`:514-527`) — base never
     /// connects a channel whose filter it could not build, because serving
     /// it raw would silently drop the semantics the client asked for.
-    #[tokio::test]
+    #[epics_macros_rs::epics_test]
     async fn an_unparseable_filter_suffix_is_still_refused() {
         let db = wf_db("WF:BADF").await;
         let source = PvDatabaseSource::new(db);
@@ -4567,7 +4564,7 @@ ASG(PLAIN) {
     /// machinery; pvxs finds one by exact name in its source map, so a
     /// filtered name matches nothing there. Refusing keeps that answer
     /// instead of peeling the suffix off and serving the mailbox raw.
-    #[tokio::test]
+    #[epics_macros_rs::epics_test]
     async fn a_filtered_mailbox_name_is_refused() {
         let db = Arc::new(PvDatabase::new());
         db.add_pv("MB:FILT", EpicsValue::Double(1.0)).await.unwrap();
@@ -4627,7 +4624,7 @@ ASG(PLAIN) {
     /// A refused channel is still SEARCH-advertised, so the client sends
     /// CREATE_CHANNEL and hears the refusal instead of timing out — the same
     /// asymmetry `has_pv` already documents for an unservable field.
-    #[tokio::test]
+    #[epics_macros_rs::epics_test]
     async fn a_filtered_channel_name_is_still_searchable() {
         let db = ai_db("AI:SRCH").await;
         let source = PvDatabaseSource::new(db);

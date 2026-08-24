@@ -42,7 +42,7 @@ async fn load(db: &PvDatabase, text: &str) {
 /// `subRecord.dbd:338-342` declares `LA` as `DBF_DOUBLE` with
 /// `special(SPC_NOMOD)`, and `SubRecord` does not model it, so the `.db` value
 /// has to land in the declared-override store to be readable at all.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn a_db_file_may_set_a_spc_nomod_field() {
     let db = PvDatabase::new();
     load(&db, DB).await;
@@ -55,7 +55,7 @@ async fn a_db_file_may_set_a_spc_nomod_field() {
 
 /// The other half: `dbPutSpecial` still refuses the same field at runtime, so
 /// relaxing the loader must not open a `caput` route to it.
-#[tokio::test]
+#[epics_macros_rs::epics_test]
 async fn a_runtime_put_to_a_spc_nomod_field_is_still_refused() {
     let db = PvDatabase::new();
     load(&db, DB).await;

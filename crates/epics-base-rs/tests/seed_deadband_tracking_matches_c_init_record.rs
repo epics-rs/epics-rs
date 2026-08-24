@@ -1,4 +1,3 @@
-// RTEMS-EXEC-MODEL-ALLOW(1): a sync test that touches no runtime.
 //! `Record::seed_deadband_tracking` must seed MLST/ALST/LALM from VAL for
 //! exactly the record types whose C `init_record` does, and for no others.
 //!

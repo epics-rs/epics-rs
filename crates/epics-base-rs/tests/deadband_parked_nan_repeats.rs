@@ -1,4 +1,3 @@
-// RTEMS-EXEC-MODEL-ALLOW(1): a sync test that touches no runtime.
 //! A record parked at NaN must post its VALUE/LOG monitor once, not once per
 //! process cycle.
 //!

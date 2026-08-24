@@ -1,3 +1,4 @@
+// RTEMS-EXEC-MODEL-ALLOW(2): sync tests that hand-build their own tokio runtime; run and pass in the feature-ON suite.
 //! `create_monitor_set`'s period argument has to survive both ends of
 //! the `i64` the shell hands it.
 //!

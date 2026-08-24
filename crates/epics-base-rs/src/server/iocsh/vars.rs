@@ -1,3 +1,4 @@
+// RTEMS-EXEC-MODEL-ALLOW(1): a sync test that hand-builds its own tokio runtime; runs and passes in the feature-ON suite.
 //! The iocsh *variable* table and the `var` command — C
 //! `iocshRegisterVariable` (`iocsh.cpp:721-771`) and `varCallFunc` /
 //! `varHandler` (`iocsh.cpp:1394-1473`).

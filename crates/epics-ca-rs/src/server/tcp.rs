@@ -1,6 +1,12 @@
-// RTEMS-EXEC-MODEL-ALLOW(35): the flavored tests drive the async CA TCP server
+// RTEMS-EXEC-MODEL-ALLOW(30): the flavored tests drive the async CA TCP server
 // (tokio::net, tokio::spawn AbortHandle machinery), which needs the reactor. These run and pass in the
 // feature-ON suite on the tokio driver.
+//
+// 35 -> 30: six left (`responded_token_grants_a_single_reply_owner`,
+// `slot_take_install_roundtrip`, the three `supersede_*`, and
+// `event_context_decimator_suppresses_initial_event`) and one arrived
+// (`event_context_decimator_drops_the_second_update`). A ratchet DOWN, which
+// needs no re-vouching.
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;

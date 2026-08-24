@@ -1,0 +1,82 @@
+diff --git a/src/unix/newlib/arm/mod.rs b/src/unix/newlib/arm/mod.rs
+index 9b5978fc5..9b235edb3 100644
+--- a/src/unix/newlib/arm/mod.rs
++++ b/src/unix/newlib/arm/mod.rs
+@@ -1,5 +1,7 @@
+ use crate::prelude::*;
+ 
++// RTEMS overrides this in `newlib/rtems`; see the comment there.
++#[cfg(not(target_os = "rtems"))]
+ pub type clock_t = c_long;
+ pub type wchar_t = u32;
+ 
+diff --git a/src/unix/newlib/mod.rs b/src/unix/newlib/mod.rs
+index ee6abcced..2fb30d18e 100644
+--- a/src/unix/newlib/mod.rs
++++ b/src/unix/newlib/mod.rs
+@@ -3,7 +3,13 @@ use crate::prelude::*;
+ pub type blkcnt_t = i32;
+ pub type blksize_t = i32;
+ 
+-pub type clockid_t = c_ulong;
++cfg_if! {
++    if #[cfg(target_os = "rtems")] {
++        pub type clockid_t = c_int;
++    } else {
++        pub type clockid_t = c_ulong;
++    }
++}
+ 
+ cfg_if! {
+     if #[cfg(any(target_os = "espidf"))] {
+@@ -14,6 +20,10 @@ cfg_if! {
+         pub type dev_t = c_short;
+         pub type ino_t = c_ushort;
+         pub type off_t = c_int;
++    } else if #[cfg(target_os = "rtems")] {
++        pub type dev_t = u64;
++        pub type ino_t = u64;
++        pub type off_t = i64;
+     } else {
+         pub type dev_t = u32;
+         pub type ino_t = u32;
+@@ -31,7 +41,13 @@ pub type nfds_t = u32;
+ pub type nlink_t = c_ushort;
+ pub type pthread_t = c_ulong;
+ pub type pthread_key_t = c_uint;
+-pub type rlim_t = u32;
++cfg_if! {
++    if #[cfg(target_os = "rtems")] {
++        pub type rlim_t = i64;
++    } else {
++        pub type rlim_t = u32;
++    }
++}
+ 
+ cfg_if! {
+     if #[cfg(target_os = "horizon")] {
+@@ -56,6 +72,7 @@ pub type useconds_t = u32;
+ cfg_if! {
+     if #[cfg(any(
+         target_os = "horizon",
++        target_os = "rtems",
+         all(target_os = "espidf", not(espidf_time32))
+     ))] {
+         pub type time_t = c_longlong;
+diff --git a/src/unix/newlib/rtems/mod.rs b/src/unix/newlib/rtems/mod.rs
+index fca95f0e9..433b27ce5 100644
+--- a/src/unix/newlib/rtems/mod.rs
++++ b/src/unix/newlib/rtems/mod.rs
+@@ -2,6 +2,12 @@
+ 
+ use crate::prelude::*;
+ 
++// RTEMS defines `clock_t` as `__uint64_t` (`<machine/_types.h>` via
++// `<sys/types.h>`), not as the `long` that plain newlib arm/aarch64/vita use.
++// Measured with `arm-rtems6-gcc` on `armv7-rtems-eabihf`:
++// `sizeof(clock_t) == 8`, `_Alignof(clock_t) == 8`, unsigned.
++pub type clock_t = c_ulonglong;
++
+ s! {
+     pub struct sockaddr_un {
+         pub sun_family: crate::sa_family_t,

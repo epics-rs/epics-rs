@@ -69,8 +69,13 @@ async fn interop_r1_pipeline_option_visible_to_pvxs_server() {
         // hosts where another IOC owns it.
         .env("EPICS_CAS_SERVER_PORT", "0")
         .env("EPICS_CA_SERVER_PORT", "0")
-        // The signal we depend on.
-        .env("PVXS_LOG", "pvxs.tcp.setup=DEBUG")
+        // The signal we depend on. `pvxs.tcp.*` rather than
+        // `pvxs.tcp.setup` alone so the failure path below also captures
+        // the server's per-reply flow-control decisions from `connio`
+        // ("Skip reply sch=.. w=..", "IOID .. acks ..") — a stalled
+        // credit window and a subscription that was never started look
+        // identical from the client side.
+        .env("PVXS_LOG", "pvxs.tcp.*=DEBUG")
         .stdout(Stdio::from(
             std::fs::File::create(&stdout_path).expect("stdout"),
         ))
@@ -108,15 +113,23 @@ async fn interop_r1_pipeline_option_visible_to_pvxs_server() {
         .server_addr(server_addr)
         .build();
 
+    // `pvmonitor_handle` awaits only channel creation, so its success
+    // says nothing about the MONITOR INIT. The connection transitions are
+    // recorded alongside the event count because the two stalls have
+    // different causes and the message has to name which one happened:
+    // no `Connected` means INIT/START never completed, `Connected` with
+    // no data means the server accepted the subscription and sent nothing.
     let events = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
     let events_cb = events.clone();
+    let conn = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+    let conn_cb = conn.clone();
     let handle = client
         .pvmonitor_handle(
             "R1:CNT",
             move |_desc, _v| {
                 events_cb.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             },
-            |_| {},
+            move |e| conn_cb.lock().unwrap().push(format!("{e:?}")),
         )
         .await
         .expect("subscribe");
@@ -129,10 +142,17 @@ async fn interop_r1_pipeline_option_visible_to_pvxs_server() {
     {
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
-    assert!(
-        events.load(std::sync::atomic::Ordering::Relaxed) >= 2,
-        "Rust client did not receive 2 events within 3s — IOC alive but monitor stuck"
-    );
+    let seen = events.load(std::sync::atomic::Ordering::Relaxed);
+    if seen < 2 {
+        let transitions = conn.lock().unwrap().join(", ");
+        let err = std::fs::read_to_string(&stderr_path).unwrap_or_default();
+        let out = std::fs::read_to_string(&stdout_path).unwrap_or_default();
+        panic!(
+            "Rust client received {seen} of 2 events within 3s — IOC alive but \
+             monitor stuck.\nconnection transitions: [{transitions}]\n\
+             pvxs stdout:\n{out}\npvxs stderr:\n{err}"
+        );
+    }
     handle.stop();
 
     // Give the pvxs server a moment to flush its log buffer.

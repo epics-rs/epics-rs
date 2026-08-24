@@ -160,6 +160,16 @@ jobs:
     # ── PATH plumbing ──────────────────────────────────────────
     # Tests probe PATH for `softIoc`, `caget`, `pvget`, etc. Put
     # the EPICS host-arch bin dirs first so the tests find them.
+    #
+    # PVXS_HOME is the other half. `interop_pvxs` resolves the pvxs
+    # *source* checkout through `epics_base_rs::reference` (sentinel
+    # `src/clientreq.cpp`, which `cp -r .` puts under /opt/pvxs), and it
+    # is the only binary in `profile.interop` that reads a reference
+    # tree — the four dedicated reference suites are excluded from both
+    # `profile.ci` and `profile.interop`. Unset, the resolver used to
+    # fall back to `$HOME/codes/pvxs`, so all 18 pvxs interop tests
+    # SKIPPED on CI and nextest reported the skips as passes; the
+    # resolver now panics instead, which is what surfaced this gap.
     - name: Add EPICS bin dirs to PATH
       run: |
         HOST_ARCH=$(ls /opt/epics-base/bin | head -n1)
@@ -167,6 +177,11 @@ jobs:
         echo "/opt/pvxs/bin/${HOST_ARCH}" >> "$GITHUB_PATH"
         echo "LD_LIBRARY_PATH=/opt/epics-base/lib/${HOST_ARCH}:/opt/pvxs/lib/${HOST_ARCH}" \
           >> "$GITHUB_ENV"
+        if [ ! -f /opt/pvxs/src/clientreq.cpp ]; then
+          echo "::error::/opt/pvxs is not a pvxs source checkout — the cache holds an install prefix, not the tree interop_pvxs reads"
+          exit 1
+        fi
+        echo "PVXS_HOME=/opt/pvxs" >> "$GITHUB_ENV"
 
     # ── Dynamic-linker registration ────────────────────────────
     # The reference binaries link libpvxs.so.1.3 / libca.so by SONAME.

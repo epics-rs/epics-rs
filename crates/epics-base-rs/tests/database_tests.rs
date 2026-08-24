@@ -3722,8 +3722,17 @@ async fn test_reprocess_after_continuation_bypasses_pact_guard() {
         "foreign re-entry during AsyncPending must NOT call process()"
     );
 
-    // Wait for the ReprocessAfter timer to fire.
-    epics_base_rs::runtime::task::sleep(std::time::Duration::from_millis(80)).await;
+    // Wait for the ReprocessAfter timer to fire. Polled to a deadline
+    // rather than slept for a fixed interval: the fire runs on the
+    // process-global background executor, which this test's own
+    // `spawn_background` constructs from cold, and a whole-suite run on a
+    // loaded machine puts that construction plus a 20 ms timer well past
+    // any interval short enough to be worth writing. The deadline is a
+    // failure bound, not the expected latency (20.7 ms, idle Linux).
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while process_count.load(Ordering::SeqCst) < 2 && std::time::Instant::now() < deadline {
+        epics_base_rs::runtime::task::sleep(std::time::Duration::from_millis(1)).await;
+    }
 
     // Continuation fired: process() ran a second time despite
     // pact=true.
@@ -4382,10 +4391,14 @@ async fn scan_once_is_not_joined_to_put_notify_completion() {
     // The queued scanOnce lands independently after the synchronous put
     // returned: the record is re-processed a second time, off the put's
     // completion path.
-    for _ in 0..50 {
-        epics_base_rs::runtime::task::yield_now().await;
+    // Polled to a deadline for the same reason the `ReprocessAfter`
+    // continuation is: the scanOnce is a spawned cycle, so how long it takes
+    // to land is the machine's business, and a fixed settle only encodes the
+    // load the test was written under.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while count.load(Ordering::SeqCst) < 2 && std::time::Instant::now() < deadline {
+        epics_base_rs::runtime::task::sleep(std::time::Duration::from_millis(1)).await;
     }
-    epics_base_rs::runtime::task::sleep(std::time::Duration::from_millis(50)).await;
     assert!(
         count.load(Ordering::SeqCst) >= 2,
         "the scanOnce must run as its own cycle after the put completed, got \

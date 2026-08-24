@@ -38,6 +38,39 @@ fn epics_base_home() -> PathBuf {
     epics_base_rs::reference::reference_root(epics_base_rs::reference::ReferenceTree::Base)
 }
 
+/// The TLS-enabled pvxs build, when this host has one.
+///
+/// pvxs master still links without OpenSSL — the feature lives on the
+/// upstream `tls` branch, so it is a *separate* checkout from
+/// [`pvxs_home`] and a host without it is normal, which is why this
+/// returns `None` instead of resolving through
+/// `epics_base_rs::reference` (that resolver is deliberately fatal).
+///
+/// `PVXS_TLS_HOME` names it; otherwise we walk the ancestors of this
+/// crate for a `pvxs-tls` sibling, the convention `reference` uses,
+/// rather than the `$HOME/codes/pvxs-tls` that `tls_interop` and
+/// `tls_mtls` each hard-coded — on a host that keeps it anywhere else
+/// both tests skipped, and nextest prints a skip as a pass.
+pub fn pvxs_tls_home() -> Option<PathBuf> {
+    const CANDIDATES: &[&str] = &[
+        "pvxs-tls",
+        "codes/pvxs-tls",
+        "work/pvxs-tls",
+        "epics-modules/pvxs-tls",
+        "work/epics-modules/pvxs-tls",
+    ];
+    // A built tree is the sentinel: the point of this checkout is the
+    // binaries, and an unbuilt one is as useless as an absent one.
+    let built = |root: PathBuf| root.join("bin").join(pvxs_arch()).is_dir().then_some(root);
+    if let Ok(explicit) = std::env::var("PVXS_TLS_HOME") {
+        return built(PathBuf::from(explicit));
+    }
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .ancestors()
+        .flat_map(|a| CANDIDATES.iter().map(move |c| a.join(c)))
+        .find_map(built)
+}
+
 /// Host-arch name pvxs uses for its `bin/` and `lib/`
 /// subdirectories. Matches `EPICS_HOST_ARCH`. We only support
 /// the platforms the maintainer actually builds on.

@@ -2,8 +2,9 @@
 //!
 //! The master pvxs build (used by every other interop test) is
 //! linked WITHOUT OpenSSL — the TLS feature lives on the
-//! `origin/tls` branch and is built into a separate worktree at
-//! `~/codes/pvxs-tls`. We prefer that build when present; if
+//! `origin/tls` branch and is built into a separate worktree
+//! (`PVXS_TLS_HOME`, or a `pvxs-tls` sibling — see
+//! `interop_helpers::pvxs_tls_home`). We prefer that build when present; if
 //! neither install exposes the `EPICS_PVA_TLS_KEYCHAIN` env var
 //! in `pvxinfo -D` output, the test SKIPs cleanly.
 //!
@@ -32,21 +33,8 @@ fn env_key() -> &'static str {
     }
 }
 
-fn tls_pvxs_root() -> Option<PathBuf> {
-    let home = std::env::var("HOME").unwrap_or_default();
-    let root = PathBuf::from(&home).join("codes/pvxs-tls");
-    if root
-        .join("bin")
-        .join(super::interop_helpers::pvxs_arch())
-        .is_dir()
-    {
-        return Some(root);
-    }
-    None
-}
-
 fn locate_tls_binary(name: &str) -> Option<PathBuf> {
-    if let Some(root) = tls_pvxs_root() {
+    if let Some(root) = super::interop_helpers::pvxs_tls_home() {
         let p = root
             .join("bin")
             .join(super::interop_helpers::pvxs_arch())
@@ -59,7 +47,8 @@ fn locate_tls_binary(name: &str) -> Option<PathBuf> {
 }
 
 fn tls_lib_dir() -> Option<PathBuf> {
-    tls_pvxs_root().map(|r| r.join("lib").join(super::interop_helpers::pvxs_arch()))
+    super::interop_helpers::pvxs_tls_home()
+        .map(|r| r.join("lib").join(super::interop_helpers::pvxs_arch()))
 }
 
 fn effective_lib_dir() -> PathBuf {
@@ -89,7 +78,8 @@ fn pvxs_has_tls() -> bool {
 async fn interop_tls_a_pvxget_over_tls_to_rust_server() {
     if !pvxs_has_tls() {
         eprintln!(
-            "SKIP: no TLS-enabled pvxs found (looked in ~/codes/pvxs-tls/bin/<arch>/). \
+            "SKIP: no TLS-enabled pvxs found (set PVXS_TLS_HOME, or keep the \
+             worktree as a `pvxs-tls` sibling). \
              Rust-side TLS is covered by tests/tls.rs; rebuild pvxs on the `origin/tls` \
              branch with libevent+OpenSSL to enable this interop test."
         );

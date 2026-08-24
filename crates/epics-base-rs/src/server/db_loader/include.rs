@@ -646,7 +646,7 @@ mod db_open_file_tests {
         std::fs::write(dir.path().join("common.db"), "").unwrap();
         let key = "EPICS_RS_TEST_DB_TOP";
         // SAFETY: single-threaded under the `epics_env` serial group.
-        unsafe { std::env::set_var(key, dir.path()) };
+        unsafe { std::env::set_var(key, super::super::macro_safe_path(dir.path())) };
 
         let raw = format!("$({key})/common.db");
         assert_eq!(
@@ -683,7 +683,7 @@ mod db_open_file_tests {
         let key = "EPICS_RS_TEST_INC_TOP";
         std::fs::write(&main, format!("include \"$({key})/inc.db\"\n")).unwrap();
         // SAFETY: single-threaded under the `epics_env` serial group.
-        unsafe { std::env::set_var(key, dir.path()) };
+        unsafe { std::env::set_var(key, super::super::macro_safe_path(dir.path())) };
 
         let out = expand_includes(
             &main,

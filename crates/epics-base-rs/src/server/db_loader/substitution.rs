@@ -880,7 +880,7 @@ file "b.db" { { Y=2 } }
         writeln!(f, r#"file "$({key})/t.template" {{ {{ }} }}"#).unwrap();
 
         // SAFETY: single-threaded under the `epics_env` serial group.
-        unsafe { std::env::set_var(key, tpl_dir.path()) };
+        unsafe { std::env::set_var(key, super::super::macro_safe_path(tpl_dir.path())) };
         let recs = load_rows(&subs, &HashMap::new(), &DbLoadConfig::default());
         // SAFETY: same serial group.
         unsafe { std::env::remove_var(key) };

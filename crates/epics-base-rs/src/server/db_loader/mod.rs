@@ -1773,6 +1773,20 @@ pub fn apply_fields(
     Ok(())
 }
 
+/// Render a fixture path so it survives being used as a MACRO or
+/// ENVIRONMENT value.
+///
+/// `trans` discards escapes in a substituted value (C
+/// `macCore.c:700-703`), so every `\` in a Windows path is eaten the
+/// moment the value is re-scanned and `$(TOP)/x.db` resolves against a
+/// separator-less string. Win32 accepts `/` as a separator, which is
+/// why EPICS build systems put `TOP` in forward-slash form there; a
+/// test that feeds `tempdir()` into a macro has to do the same.
+#[cfg(test)]
+pub(crate) fn macro_safe_path(path: &std::path::Path) -> String {
+    path.to_string_lossy().replace('\\', "/")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2677,7 +2691,7 @@ record(ai, "T") { field(LINR, "typeJdegC") }
         writeln!(f, r#"include "$(DIR)/child.db""#).unwrap();
 
         let mut macros = HashMap::new();
-        macros.insert("DIR".to_string(), subdir.to_string_lossy().to_string());
+        macros.insert("DIR".to_string(), macro_safe_path(&subdir));
 
         let config = DbLoadConfig::default();
         let result =

@@ -524,8 +524,17 @@ mod macro_defns_tests {
 mod db_add_path_tests {
     use super::*;
 
+    /// A list literal is written with `:`, and rendered here into the
+    /// ONE separator the platform under test splits on. Writing `:`
+    /// directly would assert the Unix build's separator on Windows,
+    /// where `PATH_LIST_SEPARATOR` is `;` and a `:` is the ordinary
+    /// character of a drive prefix.
+    fn sep(list: &str) -> String {
+        list.replace(':', &PATH_LIST_SEPARATOR.to_string())
+    }
+
     fn p(list: &str) -> Vec<String> {
-        db_add_path(list)
+        db_add_path(&sep(list))
             .iter()
             .map(|d| d.display().to_string())
             .collect()
@@ -575,7 +584,7 @@ mod db_add_path_tests {
             "an empty list is the current directory"
         );
         assert!(db_path("   ").is_empty(), "a blank list is not empty");
-        assert_eq!(db_path("a:"), db_add_path("a:"));
+        assert_eq!(db_path(&sep("a:")), db_add_path(&sep("a:")));
     }
 }
 

@@ -12,6 +12,13 @@
     non_snake_case
 )]
 
+/// Shared with `interop_pvxs`: the pvxs tree resolver and the compile-time
+/// host-arch name. Compiled into this binary too so the parity guards below
+/// stop each rolling their own `PVXS_HOME` lookup — theirs read the variable
+/// directly and returned early when it was unset, which reads as a pass.
+#[path = "interop_helpers/mod.rs"]
+mod interop_helpers;
+
 #[path = "parity/interop.rs"]
 mod interop;
 #[path = "parity/stability_interop.rs"]

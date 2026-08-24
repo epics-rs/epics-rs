@@ -110,7 +110,7 @@ pub fn pvxs_dbd_dir() -> PathBuf {
 }
 
 /// Locate a pvxs binary by name. Returns the full path if found,
-/// `None` otherwise. Searches `~/codes/pvxs/bin/<arch>/<name>`
+/// `None` otherwise. Searches the resolved tree's `bin/<arch>/<name>`
 /// first; falls back to PATH via `which`.
 pub fn locate_pvxs(name: &str) -> Option<PathBuf> {
     let direct = pvxs_bin_dir().join(name);

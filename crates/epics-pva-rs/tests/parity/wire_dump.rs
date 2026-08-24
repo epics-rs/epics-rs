@@ -12,10 +12,19 @@ use std::time::Duration;
 
 use tokio::process::Command as TokioCommand;
 
+/// Locate a pvxs binary in the resolved checkout (`PVXS_HOME` overrides it).
+///
+/// This read `PVXS_HOME` and `EPICS_HOST_ARCH` itself, defaulting the arch
+/// to `darwin-aarch64`, so on any host that had set neither it returned
+/// `None` and the test below printed a line and passed. The tree is now
+/// resolved fatally; `None` means only that the binary is not built.
 fn find_pvxs_bin(name: &str) -> Option<PathBuf> {
-    let home = std::env::var("PVXS_HOME").ok()?;
-    let host = std::env::var("EPICS_HOST_ARCH").unwrap_or_else(|_| "darwin-aarch64".into());
-    let p = PathBuf::from(home).join("bin").join(host).join(name);
+    let root =
+        epics_base_rs::reference::reference_root(epics_base_rs::reference::ReferenceTree::Pvxs);
+    let p = root
+        .join("bin")
+        .join(crate::interop_helpers::pvxs_arch())
+        .join(name);
     if p.is_file() { Some(p) } else { None }
 }
 

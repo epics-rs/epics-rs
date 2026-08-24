@@ -240,28 +240,228 @@ async fn deferred_put_is_replayed_and_completes_after_it() {
     );
 }
 
-/// C `dbNotify.c:213-217`: a record already owning a put-notify restart refuses
-/// the next one (`S_db_Blocked` → ECA_PUTCBINPROG), rather than silently
-/// dropping the first caller's sender.
+/// C `dbNotify.c:213-217`: a record that already owns a put-notify puts the
+/// next one on `restartList` (`ellSafeAdd`) — it is neither refused nor
+/// written. Boundary: queue depth 1 → 2, the first depth the old single
+/// `Option` could not hold.
 #[epics_macros_rs::epics_test]
-async fn a_second_put_notify_onto_a_deferred_record_is_refused() {
+async fn a_second_put_notify_onto_a_deferred_record_queues_behind_it() {
     let f = busy_record().await;
 
-    let _rx =
+    let first =
         f.db.put_record_field_from_ca("ASY", "VAL", EpicsValue::Long(7))
             .await
             .unwrap()
             .into_handle()
             .expect("first put deferred");
-
-    let err =
+    let second =
         f.db.put_record_field_from_ca("ASY", "VAL", EpicsValue::Long(8))
             .await
-            .expect_err("a second put-notify onto the same deferred record is refused");
-    assert!(
-        matches!(err, CaError::PutCallbackInProgress(_)),
-        "expected PutCallbackInProgress (C S_db_Blocked), got {err:?}"
+            .expect("C queues the second put-notify; it never returns S_db_Blocked here")
+            .into_handle()
+            .expect("second put deferred");
+
+    assert_eq!(
+        val(&f.db).await,
+        5,
+        "both puts are BELOW the ownership test: a busy record keeps its old VAL"
     );
+
+    f.db.complete_async_record("ASY").await.unwrap();
+
+    expect_callback(first, "the first queued put").await;
+    expect_callback(second, "the second queued put").await;
+
+    assert_eq!(
+        val(&f.db).await,
+        8,
+        "FIFO: 7 is replayed first, then 8, so 8 is the value left standing"
+    );
+    let seen = f.seen.lock().unwrap().clone();
+    assert_eq!(
+        seen,
+        vec![5, 7, 8],
+        "each replay processed the record with its own value, oldest first"
+    );
+}
+
+/// The OWNERSHIP arm, reached by a process-only notify (C `processGetRequest`,
+/// the port's `process_record_with_notify` — QSRV's `record[process=true]`).
+///
+/// C `processNotifyCommon` (dbNotify.c:211-219) tests `precord->ppn` before it
+/// looks at the request type, so a process-only notify onto an owned record
+/// queues exactly like a put does. The port's restart list could hold only a
+/// field-and-value put, so this entry had nowhere to wait and refused with
+/// `PutCallbackInProgress` — an `ECA_PUTCBINPROG` whose only sender in C is
+/// `rsrv/camessage.c:1745`, a put-callback TIMEOUT, never a second-request
+/// refusal.
+///
+/// Boundary: `notify.is_some()` (owned), PACT held by that same notify.
+#[epics_macros_rs::epics_test]
+async fn process_notify_onto_an_owned_record_queues_instead_of_refusing() {
+    let db = Arc::new(PvDatabase::new());
+    let count = Arc::new(AtomicU32::new(0));
+    let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+    db.add_record(
+        "ASY",
+        Box::new(AsyncOnceRecord {
+            val: 5,
+            pending: true,
+            process_count: count.clone(),
+            seen_by_process: seen.clone(),
+        }),
+    )
+    .await
+    .unwrap();
+
+    // First process-notify takes the record: it installs the wait-set and the
+    // record goes async under it, so `notify.is_some()` AND PACT.
+    let first = db
+        .process_record_with_notify("ASY")
+        .await
+        .expect("the first process-notify takes the record")
+        .into_handle()
+        .expect("the record went async, so a completion handle comes back");
+    {
+        let rec = db.get_record("ASY").unwrap();
+        let inst = rec.read();
+        assert!(inst.notify.is_some(), "the first notify owns the record");
+        assert!(inst.is_processing(), "and holds it PACT");
+    }
+
+    // The second one must QUEUE, not refuse.
+    let second = db
+        .process_record_with_notify("ASY")
+        .await
+        .expect("C queues a notify arriving on an owned record; it never refuses here")
+        .into_handle()
+        .expect("a queued notify is async — it completes on the replay");
+
+    assert_eq!(
+        count.load(Ordering::Relaxed),
+        1,
+        "queueing drives no extra process cycle"
+    );
+
+    db.complete_async_record("ASY").await.unwrap();
+
+    expect_callback(first, "the owning process-notify").await;
+    expect_callback(second, "the queued process-notify").await;
+    assert_eq!(
+        count.load(Ordering::Relaxed),
+        2,
+        "the replay is one further process cycle, not a re-put"
+    );
+    assert_eq!(
+        val(&db).await,
+        5,
+        "a process-only notify writes nothing on the replay"
+    );
+}
+
+/// The same ownership arm reached by a DBF LINK-field put.
+///
+/// Link fields are deliberately kept out of the PACT arm — a bare `sub` with an
+/// empty `SNAM` parks PACT=TRUE forever (subRecord.c:119-122) and a link put
+/// parked there would never be written. That exclusion used to cover the WHOLE
+/// decision, so an owned record's link put fell through to the wait-set install
+/// and got `PutCallbackInProgress`.
+///
+/// Boundary: owned (`notify.is_some()`) but NOT PACT — the arm the link-field
+/// exclusion must not skip.
+#[epics_macros_rs::epics_test]
+async fn link_field_put_notify_onto_an_owned_idle_record_queues_instead_of_refusing() {
+    let db = Arc::new(PvDatabase::new());
+    db.add_record("AI1", Box::new(AiRecord::new(0.0)))
+        .await
+        .unwrap();
+
+    // Own the record without making it PACT: this isolates the ownership arm
+    // from the PACT arm, which is exactly what the link-field rule splits.
+    let (owner_tx, _owner_rx) = epics_base_rs::runtime::sync::oneshot::channel();
+    {
+        let rec = db.get_record("AI1").unwrap();
+        let mut inst = rec.write();
+        inst.notify = Some(NotifyWaitSet::new(owner_tx));
+        assert!(!inst.is_processing(), "owned, but idle");
+    }
+
+    let queued = db
+        .put_record_field_from_ca("AI1", "INP", EpicsValue::String("7".into()))
+        .await
+        .expect("C queues a link-field put-notify onto an owned record; no refusal arm exists")
+        .into_handle()
+        .expect("a queued put-notify is async");
+    drop(queued);
+
+    let rec = db.get_record("AI1").unwrap();
+    assert!(
+        !matches!(rec.read().record.get_field("INP"), Some(EpicsValue::String(ref s)) if s == "7"),
+        "C holds the queued value UNWRITTEN in the restartList node until the replay"
+    );
+}
+
+/// A queued put-notify whose client has gone (the receiver dropped) must not
+/// wedge the queue: the record still drains, and the put behind it replays.
+/// Boundary: the head of the queue has no live client.
+#[epics_macros_rs::epics_test]
+async fn a_queued_put_whose_client_vanished_does_not_block_the_queue() {
+    let f = busy_record().await;
+
+    // The CA connection dies while the put waits: C's `dbNotifyCancel` unlinks
+    // it and `restartCheck` promotes the next one regardless.
+    drop(
+        f.db.put_record_field_from_ca("ASY", "VAL", EpicsValue::Long(7))
+            .await
+            .unwrap(),
+    );
+    let second =
+        f.db.put_record_field_from_ca("ASY", "VAL", EpicsValue::Long(8))
+            .await
+            .unwrap()
+            .into_handle()
+            .expect("second put deferred");
+
+    f.db.complete_async_record("ASY").await.unwrap();
+
+    expect_callback(second, "the put behind an abandoned one").await;
+    assert_eq!(val(&f.db).await, 8, "the surviving put's value still lands");
+}
+
+/// Deleting the record under a queued put-notify must complete the client, not
+/// leak its completion: the sender drops with the record, which wakes the
+/// receiver. Boundary: the queue is non-empty when the record disappears.
+#[epics_macros_rs::epics_test]
+async fn deleting_a_record_releases_its_queued_put_notifies() {
+    let f = busy_record().await;
+
+    let first =
+        f.db.put_record_field_from_ca("ASY", "VAL", EpicsValue::Long(7))
+            .await
+            .unwrap()
+            .into_handle()
+            .expect("first put deferred");
+    let second =
+        f.db.put_record_field_from_ca("ASY", "VAL", EpicsValue::Long(8))
+            .await
+            .unwrap()
+            .into_handle()
+            .expect("second put deferred");
+
+    assert!(f.db.remove_record("ASY").await, "ASY must exist to remove");
+
+    for (rx, which) in [(first, "first"), (second, "second")] {
+        let woken = epics_base_rs::runtime::task::timeout(std::time::Duration::from_secs(5), rx)
+            .await
+            .unwrap_or_else(|_| {
+                panic!("the {which} queued put-notify leaked: its client is still waiting")
+            });
+        assert!(
+            woken.is_err(),
+            "the {which} put never ran, so its completion must arrive as a dropped \
+             sender, not a success"
+        );
+    }
 }
 
 /// Await a deferred put's callback, failing the test rather than hanging.

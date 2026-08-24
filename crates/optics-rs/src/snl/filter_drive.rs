@@ -659,7 +659,7 @@ pub async fn run(
 
 /// Apply filter blade changes: first insert, wait, then remove.
 async fn apply_filter_changes(ch_set: &[DbChannel], changes: &[(usize, bool)], wait_time: f64) {
-    use tokio::time::{Duration, sleep};
+    use tokio::time::sleep;
 
     // Phase 1: insert filters
     let mut any_insert = false;
@@ -670,7 +670,7 @@ async fn apply_filter_changes(ch_set: &[DbChannel], changes: &[(usize, bool)], w
         }
     }
     if any_insert {
-        sleep(Duration::from_secs_f64(wait_time)).await;
+        sleep(epics_base_rs::runtime::time::duration_from_secs(wait_time)).await;
     }
 
     // Phase 2: remove filters
@@ -682,7 +682,7 @@ async fn apply_filter_changes(ch_set: &[DbChannel], changes: &[(usize, bool)], w
         }
     }
     if any_remove {
-        sleep(Duration::from_secs_f64(wait_time)).await;
+        sleep(epics_base_rs::runtime::time::duration_from_secs(wait_time)).await;
     }
 }
 

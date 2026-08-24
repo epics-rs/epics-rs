@@ -18,6 +18,13 @@ pub const MODBUS_EXCEPTION_FCN: u8 = 0x80;
 /// Size of the Modbus/TCP MBAP header in bytes.
 pub const MBAP_HEADER_SIZE: usize = 6;
 
+/// Protocol identifier carried in the MBAP header — always 0 for Modbus.
+pub const MODBUS_PROTOCOL_ID: u16 = 0;
+
+/// Smallest `cmd_length` an MBAP header may declare: the unit identifier plus
+/// the function code.
+pub const MBAP_MIN_CMD_LENGTH: usize = 2;
+
 /// Modbus function codes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]

@@ -6,12 +6,12 @@ use std::time::Duration;
 use crate::server::database::PvDatabase;
 use tokio::sync::RwLock;
 
-use super::backup::{BackupConfig, BackupState, find_best_save_file, rotate_backups};
+use super::backup::{BackupConfig, BackupState, find_best_save_file, publish_copy, rotate_backups};
 use super::error::{AutosaveError, AutosaveResult};
 use super::format::CompatMode;
 use super::macros::MacroContext;
 use super::request::{self, RequestEntry};
-use super::save_file::{self, SaveEntry, read_save_file, write_save_file_with_mode};
+use super::save_file::{self, MalformedLine, SaveEntry, read_save_file, write_save_file_with_mode};
 
 /// Save strategy for a save set.
 #[derive(Debug, Clone)]
@@ -94,9 +94,14 @@ pub struct RestoreResult {
     pub source_file: PathBuf,
     pub restored: usize,
     pub failed_puts: Vec<PvRestoreError>,
+    /// PV names whose saved value would not parse into the live type.
     pub parse_failed: Vec<String>,
     pub not_found: Vec<String>,
     pub disconnected_skipped: Vec<String>,
+    /// Lines of the save file that named no PV at all. Distinct from
+    /// `parse_failed`, which is per-PV: these lines never became an
+    /// entry, so nothing else in this result can account for them.
+    pub malformed_lines: Vec<MalformedLine>,
 }
 
 /// A save set: a named group of PVs with save/restore logic.
@@ -135,6 +140,20 @@ impl SaveSet {
         })
     }
 
+    /// Build the set's member list - and the one place an empty one is
+    /// refused.
+    ///
+    /// A set with no members cannot save anything, but `save_once` would
+    /// still run for it: `rotate_backups` copies the previous `.sav` into
+    /// `.savB` and the sequence slots, and `write_save_file_with_mode`
+    /// then renames a header-plus-`<END>` file over the `.sav` itself, so
+    /// within `num_seq_files` periods every generation of a real save set
+    /// is gone and the next boot restores nothing while reporting
+    /// success. Refusing the set here keeps it out of `SaveSet` entirely,
+    /// where `AutosaveBuilder::build` drops it like any other unbuildable
+    /// set and keeps it in `status_all` as an error, so no strategy needs
+    /// its own emptiness check before calling `save_once` and
+    /// `reload_request` cannot empty a set that is already running.
     async fn load_entries(config: &SaveSetConfig) -> AutosaveResult<Vec<RequestEntry>> {
         let macros = MacroContext::from_map(config.macros.clone());
         let mut entries = Vec::new();
@@ -160,6 +179,15 @@ impl SaveSet {
         }
 
         entries = request::dedup_entries(entries);
+        if entries.is_empty() {
+            return Err(AutosaveError::EmptySaveSet {
+                name: config.name.clone(),
+                reason: match &config.request_file {
+                    Some(f) => format!("'{}' declared no PVs", f.display()),
+                    None => "no request file, and no inline PVs".to_string(),
+                },
+            });
+        }
         Ok(entries)
     }
 
@@ -170,10 +198,17 @@ impl SaveSet {
             *s = SaveSetStatus::Saving;
         }
 
-        // Rotate backups
-        {
+        // Rotate backups. A rotation that could not preserve the current
+        // `.sav` aborts the cycle instead of overwriting the generation it
+        // failed to copy, and it lands in the same bookkeeping a failed
+        // write does — an early `?` here left the set stuck in `Saving`
+        // with the error counter untouched.
+        let rotated = {
             let mut bs = self.backup_state.write().await;
-            rotate_backups(&self.config.save_path, &self.config.backup, &mut bs).await?;
+            rotate_backups(&self.config.save_path, &self.config.backup, &mut bs).await
+        };
+        if let Err(e) = rotated {
+            return Err(self.record_save_failure(e).await);
         }
 
         // Collect PV values
@@ -227,24 +262,34 @@ impl SaveSet {
                 // backup file does not yet exist, so backup depth
                 // matches C autosave (one cycle behind) from the
                 // first save onward.
+                //
+                // Through `publish_copy` like every other backup write, and
+                // non-fatal: the `.sav` is already on disk, and a seed that
+                // did not land simply leaves `.savB` absent for the next
+                // cycle's `rotate_backups` to create.
                 if self.config.backup.enable_savb {
                     let savb_path = self.config.save_path.with_extension("savB");
                     if !savb_path.exists() {
-                        let _ = crate::runtime::fs::copy(&self.config.save_path, &savb_path).await;
+                        let _ = publish_copy(&self.config.save_path, &savb_path).await;
                     }
                 }
 
                 Ok(saved_count)
             }
-            Err(e) => {
-                self.stats.error_count.fetch_add(1, Ordering::Relaxed);
-                let now = chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
-                *self.stats.last_error_time.write().await = Some(now);
-                let msg = e.to_string();
-                *self.status.write().await = SaveSetStatus::Error(msg);
-                Err(e)
-            }
+            Err(e) => Err(self.record_save_failure(e).await),
         }
+    }
+
+    /// The one place a failed save cycle is recorded. Both fallible steps
+    /// — the backup rotation and the `.sav` write — go through it, so the
+    /// status PVs and the error counters cannot disagree about whether the
+    /// cycle failed. Returns the error it recorded so callers can `?` it.
+    async fn record_save_failure(&self, e: AutosaveError) -> AutosaveError {
+        self.stats.error_count.fetch_add(1, Ordering::Relaxed);
+        let now = chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
+        *self.stats.last_error_time.write().await = Some(now);
+        *self.status.write().await = SaveSetStatus::Error(e.to_string());
+        e
     }
 
     /// Perform one restore: find best file -> read -> put_pv_no_process.
@@ -326,7 +371,7 @@ pub async fn restore_from_entries_with_mode(
     path: &std::path::Path,
     mode: RestoreMode,
 ) -> AutosaveResult<RestoreResult> {
-    let entries = read_save_file(path)
+    let contents = read_save_file(path)
         .await?
         .ok_or_else(|| AutosaveError::CorruptSaveFile {
             path: path.display().to_string(),
@@ -340,9 +385,10 @@ pub async fn restore_from_entries_with_mode(
         parse_failed: Vec::new(),
         not_found: Vec::new(),
         disconnected_skipped: Vec::new(),
+        malformed_lines: contents.malformed,
     };
 
-    for entry in &entries {
+    for entry in &contents.entries {
         if !entry.connected {
             result.disconnected_skipped.push(entry.pv_name.clone());
             continue;

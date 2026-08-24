@@ -62,7 +62,7 @@ pub struct CvtDbAddr {
     pub dbf: String,
     /// The `special` C leaves on the DBADDR. Usually still `SPC_DBADDR`, but
     /// `lsi`/`lso`/`asyn` raise `SPC_NOMOD` (making the field unwritable over
-    /// CA — `rsrv/camessage.c:2545`) or `SPC_MOD` inside `cvt_dbaddr` itself.
+    /// CA — `rsrv/camessage.c:2611-2613`) or `SPC_MOD` inside `cvt_dbaddr` itself.
     pub special: String,
     /// The field whose value selects the type at runtime (`FTVL`, `SDEF`,
     /// `FTA`), or `None` when C's `cvt_dbaddr` always yields the same type.
@@ -206,6 +206,9 @@ pub struct Input<'a> {
     /// mapped to base's generated const path. Empty for the base target, which
     /// declares every menu it references.
     pub external_menus: &'a BTreeMap<String, String>,
+    /// Record type names in DBD load order. Emitted only by the base target;
+    /// empty everywhere else.
+    pub order: &'a [String],
 }
 
 /// The type to emit for one field: the `.dbd`'s `DBF_*`, except for a
@@ -507,6 +510,27 @@ pub fn emit(input: &Input<'_>) -> Result<String, String> {
 
     if !input.devices.is_empty() {
         emit_devices(&mut out, input)?;
+    }
+
+    if !input.order.is_empty() {
+        out.push_str(
+            "/// Every record type this port declares, in DBD **load** order — the order\n\
+             /// C's `pdbbase->recordTypeList` holds.\n\
+             ///\n\
+             /// `buildScanLists` (`dbScan.c:1054-1076`) feeds `scanAdd` record-type-major:\n\
+             /// the outer loop walks `recordTypeList`, the inner one walks that type's\n\
+             /// instances in `.db` order. So this table, not `.db` declaration order alone,\n\
+             /// is what decides which of two same-`PHAS` records scans first.\n\
+             ///\n\
+             /// Base's own types come from `stdRecords.dbd`, vendored beside the `.dbd`\n\
+             /// files it names; every other type this port vendors sorts after all of them,\n\
+             /// where a C IOC also puts a module `.dbd` included after `base.dbd`.\n\
+             pub static RECORD_TYPE_ORDER: &[&str] = &[\n",
+        );
+        for name in input.order {
+            let _ = writeln!(out, "    {:?},", name);
+        }
+        out.push_str("];\n\n");
     }
 
     // --- registry -------------------------------------------------------

@@ -119,6 +119,18 @@ pub enum CaError {
     /// to `ECA_BADCOUNT`. Raised locally — no byte reaches the wire.
     #[error("element count out of bounds for this CA circuit (ECA_BADCOUNT)")]
     BadCount,
+
+    /// A get conversion returned a non-zero status: C
+    /// `dbGetConvertRoutine`/`dbFastGetConvertRoutine` refusing to render a
+    /// field in the requested DBR type, which for the `DBF_STRING` row means
+    /// `epicsParse*` rejecting the stored text (`cvt_st_d`,
+    /// `dbFastLinkConv.c:233-244`). `dbChannel_get` turns it into -1
+    /// (`db_access.c:816`) and rsrv answers the read with a ZEROED payload and
+    /// `m_cid = ECA_GETFAIL` (`camessage.c:545-561`) rather than a value.
+    /// Distinct from [`Self::InvalidValue`], which the put direction raises and
+    /// rsrv answers `ECA_PUTFAIL`.
+    #[error("get conversion failed: {0}")]
+    GetConvertFailed(String),
 }
 
 // ECA status constants (originally from protocol.rs, now in epics-ca-rs)
@@ -130,6 +142,7 @@ const ECA_DISCONN: u32 = 192; // defmsg(CA_K_WARNING, 24)
 const ECA_PUTCBINPROG: u32 = 362; // defmsg(CA_K_ERROR, 45) = (45 << 3) | 2
 const ECA_TOLARGE: u32 = 72; // defmsg(CA_K_WARNING, 9)
 const ECA_BADCOUNT: u32 = 176; // defmsg(CA_K_WARNING, 22)
+const ECA_GETFAIL: u32 = 152; // defmsg(CA_K_WARNING, 19)
 
 impl CaError {
     pub fn to_eca_status(&self) -> u32 {
@@ -146,7 +159,7 @@ impl CaError {
             CaError::BadField(_) => ECA_PUTFAIL,
             // Likewise `S_db_badChoice` from the string→menu converter: the
             // put-notify path maps any non-`notifyOK` status to ECA_PUTFAIL
-            // (`db_access.c::db_put_process:1041`, `camessage.c:1386`).
+            // (`db_access.c::db_put_process:1041`, `camessage.c:1417-1421`).
             CaError::BadChoice(_) => ECA_PUTFAIL,
             // Disconnection / shutdown are surfaced as ECA_DISCONN so a
             // downstream client (e.g. caput on a CA gateway whose
@@ -163,6 +176,7 @@ impl CaError {
             CaError::ServerError(code) => *code,
             CaError::TooLarge => ECA_TOLARGE,
             CaError::BadCount => ECA_BADCOUNT,
+            CaError::GetConvertFailed(_) => ECA_GETFAIL,
             _ => ECA_PUTFAIL,
         }
     }

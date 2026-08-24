@@ -9,6 +9,7 @@ mod record_lock;
 mod scan_index;
 mod snapshot;
 
+pub use field_io::ProcessMode;
 pub use link_set::{
     DynLinkSet, LinkDbfType, LinkMetadata, LinkPutOp, LinkSet, LinkSetRegistry, PutAdmission,
     RemoteAlarm,
@@ -88,19 +89,29 @@ pub fn is_value_field(field: &str) -> bool {
 ///   - `epicsTimeEventDeviceTime  = -2` → device support already set time
 ///   - `1..` → event-number providers
 ///
-/// The C path is symmetric: every non-`-2` case unconditionally
-/// overwrites `precord->time` via `epicsTimeGetEvent(tse)`, which
-/// delegates to `epicsTimeGetCurrent` for `tse==0` and to
+/// Every non-`-2` case goes through one C call, `epicsTimeGetEvent(tse)`,
+/// which delegates to `epicsTimeGetCurrent` for `tse==0` and to
 /// `generalTimeGetEventPriority` otherwise. Only `-2` (device time)
 /// is left untouched because the device support has already written
 /// the timestamp before `recGblGetTimeStamp` is called.
-fn apply_timestamp(common: &mut super::record::CommonFields, _is_soft: bool) {
+///
+/// A TSE C rejects — anything below `epicsTimeEventBestTime`, or any event
+/// number with no provider to answer it — is not a stamp: C writes nothing
+/// into `precord->time` and errlogs, so a misconfigured record holds its
+/// stale stamp rather than timestamping as if healthy.
+fn apply_timestamp(name: &str, common: &mut super::record::CommonFields, _is_soft: bool) {
     // Single owner of TSE -> TIME resolution; device support that must
     // format the record's resolved time during `read()` routes through the
     // same helper so the two never drift (see `recgbl::get_time_stamp`).
     // For TSE=-2 the helper returns `common.time` unchanged, preserving the
     // device-time "leave it alone" semantics.
-    common.time = crate::server::recgbl::get_time_stamp(common.tse, common.time);
+    match crate::server::recgbl::get_time_stamp(common.tse, common.time) {
+        Some(t) => common.time = t,
+        None => crate::runtime::log::errlog_printf(&format!(
+            "recGblGetTimeStampSimm: epicsTimeGetEvent failed, {name}.TSE = {}\n",
+            common.tse
+        )),
+    }
 }
 
 /// Unified entry in the PV database.
@@ -238,9 +249,56 @@ pub struct CpTarget {
 /// path on which a lookup could take the wrong lock.
 ///
 /// `doc/rtems-priority-locks-design.md` §5.3 addendum, row L8b.
+/// A scan list's sort key — C's feed order into `addToList`, spelled out.
+///
+/// `buildScanLists` (`dbScan.c:1054-1076`) feeds `scanAdd` **record-type-major**:
+/// the outer loop walks `pdbbase->recordTypeList`, which is DBD load order, and
+/// the inner loop walks that type's instances in `.db` load order. `addToList`
+/// (`:1085-1091`) appends after the last element whose `phas <=` the new
+/// record's, so within one PHAS the list is a stable FIFO over exactly that
+/// feed order. A key ordered by `.db` load order alone inverts, by one whole
+/// scan cycle, every same-PHAS reader/writer pair whose declaration order
+/// contradicts DBD order.
+///
+/// A struct rather than a tuple because the field order IS the sort rule: the
+/// derived `Ord` reads top to bottom, and a positional tuple gave the type
+/// ordinal and the load-order sequence the same shape.
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Debug)]
+struct ScanKey {
+    phas: i16,
+    /// Position in [`RECORD_TYPE_ORDER`](crate::server::record::dbd_generated::RECORD_TYPE_ORDER). A record type no
+    /// vendored `.dbd` declares sorts after every one that is declared, which
+    /// is where C puts it too — a module `.dbd` is included after `base.dbd`,
+    /// so its types join `recordTypeList` behind base's.
+    record_type: u32,
+    load_order: u64,
+    name: String,
+}
+
+impl ScanKey {
+    fn new(phas: i16, record_type: &str, load_order: u64, name: &str) -> Self {
+        use crate::server::record::dbd_generated::RECORD_TYPE_ORDER;
+        Self {
+            phas,
+            record_type: RECORD_TYPE_ORDER
+                .iter()
+                .position(|t| *t == record_type)
+                .unwrap_or(RECORD_TYPE_ORDER.len()) as u32,
+            load_order,
+            name: name.to_string(),
+        }
+    }
+}
+
 struct ScanIndex {
-    buckets: [crate::runtime::sync::PriorityInheritanceMutex<BTreeSet<(i16, u64, String)>>;
-        ScanList::COUNT],
+    buckets: [crate::runtime::sync::PriorityInheritanceMutex<BTreeSet<ScanKey>>; ScanList::COUNT],
+    /// Cumulative over-runs per list — C `periodic_scan_list::overruns`
+    /// (`dbScan.c:95`), which `scanppl` prints beside the list it belongs to
+    /// (`dbScan.c:408-409`). It lives here for the same reason C puts it on
+    /// `periodic_scan_list`: one owner per rate holds both the list and its
+    /// over-run count, so the counter cannot drift away from the list it
+    /// counts. Only the periodic scan threads write it.
+    overruns: [std::sync::atomic::AtomicU64; ScanList::COUNT],
 }
 
 impl ScanIndex {
@@ -249,6 +307,7 @@ impl ScanIndex {
             buckets: std::array::from_fn(|_| {
                 crate::runtime::sync::PriorityInheritanceMutex::new(BTreeSet::new())
             }),
+            overruns: std::array::from_fn(|_| std::sync::atomic::AtomicU64::new(0)),
         }
     }
 
@@ -256,7 +315,7 @@ impl ScanIndex {
     fn bucket(
         &self,
         list: ScanList,
-    ) -> &crate::runtime::sync::PriorityInheritanceMutex<BTreeSet<(i16, u64, String)>> {
+    ) -> &crate::runtime::sync::PriorityInheritanceMutex<BTreeSet<ScanKey>> {
         &self.buckets[list.slot()]
     }
 }
@@ -282,17 +341,16 @@ struct PvDatabaseInner {
     simple_pvs:
         crate::runtime::sync::PriorityInheritanceMutex<HashMap<String, Arc<ProcessVariable>>>,
     records: parking_lot::RwLock<HashMap<String, Arc<parking_lot::RwLock<RecordInstance>>>>,
-    /// Scan index: maps scan type → sorted set of
-    /// `(PHAS, load_order, record_name)`.
+    /// Scan index: maps scan list → sorted set of [`ScanKey`].
     ///
-    /// C parity (`dbScan.c:1052-1095`): `buildScanLists` walks records
-    /// in database / record-type **load order** and `addToList`
-    /// inserts each after the last element with `phas <= precord->phas`
-    /// — so within one PHAS value the scan list is a stable FIFO in
-    /// load order. The secondary sort key is the per-record
-    /// `load_order` sequence (NOT the record name), so two records
-    /// sharing a PHAS scan in the order they were loaded, matching a
-    /// C IOC built from the same `.db` file.
+    /// C parity (`dbScan.c:1052-1095`): `buildScanLists` walks record types in
+    /// DBD load order and, within each, that type's instances in `.db` load
+    /// order; `addToList` inserts each after the last element with
+    /// `phas <= precord->phas`, so within one PHAS the list is a stable FIFO
+    /// over that feed order. Both halves of the feed order are in the key —
+    /// the record-type ordinal first, the `.db` load sequence second. The
+    /// record name is only a final tiebreak and never decides the order of two
+    /// real records.
     /// Keyed by [`ScanList`], not `ScanType`: a `Passive` or illegal SCAN names
     /// no list (C `scanAdd`, dbScan.c:241-251) and so cannot be a key at all.
     ///
@@ -379,6 +437,10 @@ struct PvDatabaseInner {
     /// holders were audited before the conversion and the only suspension
     /// points any of them had were acquisitions of `simple_pvs` and
     /// `scan_index`, both blocking now.
+    ///
+    /// Acquired ONLY through [`PvDatabase::lock_registration`], never
+    /// directly — that funnel is what turns a re-entrant take into a named
+    /// panic instead of a parked thread. See [`RegistrationGate`].
     registration_mutex: crate::runtime::sync::PriorityInheritanceMutex<()>,
     /// The IOC lifecycle phase — the port's `iocInit` boundary. See
     /// [`DbInitPhase`], [`PvDatabase::begin_load`],
@@ -476,6 +538,39 @@ struct PvDatabaseInner {
     /// with nothing at all on the read side.
     /// `doc/rtems-priority-locks-design.md` §3 row L8k.
     breaktable_registry: SnapshotCell<crate::server::cvt_bpt::BreakTableRegistry>,
+}
+
+thread_local! {
+    /// Set for exactly as long as this thread holds L46. Read only by
+    /// [`PvDatabase::lock_registration`].
+    static REGISTRATION_GATE_HELD: std::cell::Cell<Option<&'static str>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// RAII guard for L46, `PvDatabaseInner::registration_mutex`.
+///
+/// L46 is a `PriorityInheritanceMutex` and is therefore NOT reentrant: a
+/// thread that takes it twice parks on itself forever. That makes the
+/// caller-side rule a MUST, and it is the half the lock-order table in
+/// `super::record_lock` did not state —
+/// [`PvDatabase::update_scan_index`] is the single owner of a scan-index
+/// transition and takes L46 **itself**, so no caller may hold L46 across a
+/// call to it. Releasing early is also what C does: `iterateRecords`
+/// (`iocInit.c:562-586`) is a separate pass over an already-built database,
+/// holding no registration lock at all.
+///
+/// A violation used to surface as a hung thread, which reads as a flaky
+/// timeout and costs a bisect to attribute. This guard makes it surface as a
+/// panic naming both the holder and the re-entrant site.
+#[must_use = "L46 is released as soon as the guard is dropped"]
+pub(crate) struct RegistrationGate<'a> {
+    _guard: crate::runtime::sync::PriorityInheritanceMutexGuard<'a, ()>,
+}
+
+impl Drop for RegistrationGate<'_> {
+    fn drop(&mut self) {
+        REGISTRATION_GATE_HELD.with(|h| h.set(None));
+    }
 }
 
 /// Database of all process variables hosted by this server.
@@ -718,6 +813,35 @@ pub(crate) fn select_link_indices_ex(
 }
 
 impl PvDatabase {
+    /// Acquire L46, `registration_mutex` — the ONE acquisition site.
+    ///
+    /// `site` names the acquiring function and appears in the panic message
+    /// when the rule below is broken, so the report identifies the violator
+    /// without a debugger.
+    ///
+    /// # Panics
+    ///
+    /// If this thread already holds L46. That is not a defensive check
+    /// against an impossible input: L46 is a `PriorityInheritanceMutex`, so
+    /// the second acquisition would park the thread on itself and never
+    /// return. The panic replaces a hang, which is the worst failure shape
+    /// available — it reaches CI as a timeout, and a timeout reads as a load
+    /// flake rather than as the ordering bug it is.
+    pub(crate) fn lock_registration(&self, site: &'static str) -> RegistrationGate<'_> {
+        if let Some(holder) = REGISTRATION_GATE_HELD.with(|h| h.get()) {
+            panic!(
+                "L46 registration_mutex is not reentrant: `{site}` took it while \
+                 this thread still holds it from `{holder}`. `update_scan_index` \
+                 takes L46 itself and is the single owner of a scan-index \
+                 transition, so a caller must DROP its registration gate before \
+                 reaching it — see `RegistrationGate`."
+            );
+        }
+        let guard = self.inner.registration_mutex.lock();
+        REGISTRATION_GATE_HELD.with(|h| h.set(Some(site)));
+        RegistrationGate { _guard: guard }
+    }
+
     pub fn new() -> Self {
         Self {
             inner: Arc::new(PvDatabaseInner {
@@ -778,7 +902,7 @@ impl PvDatabase {
         // holds this gate across its whole body (registry read + map insert),
         // so taking it here closes that TOCTOU window. No `add_breaktables`
         // caller already holds the gate, so this is reentrancy-safe.
-        let _gate = self.inner.registration_mutex.lock();
+        let _gate = self.lock_registration("add_breaktables");
         if tables.is_empty() {
             return self.inner.breaktable_registry.load_full();
         }
@@ -1002,11 +1126,11 @@ impl PvDatabase {
         if total == 0 {
             return (0, 0);
         }
-        // `std::time::Instant`, not `crate::runtime::task::Instant`: the sleep below
-        // is the runtime seam, whose clock is std's on both backends. Reading
-        // the deadline off tokio's clock made the two disagree — under
-        // `start_paused` tokio's clock advances only when the runtime decides
-        // to, while the RTEMS backend's timer thread follows the real one, so
+        // `std::time::Instant`, not `crate::runtime::task::Instant`: the sleep
+        // below is the background timer, which measures on std's clock on both
+        // backends. Reading the deadline off tokio's clock made the two
+        // disagree — under `start_paused` tokio's clock advances only when the
+        // runtime decides to, while the timer thread follows the real one, so
         // the loop could sleep against one clock and expire against another.
         let deadline = std::time::Instant::now() + timeout;
         loop {
@@ -1026,7 +1150,7 @@ impl PvDatabase {
             if std::time::Instant::now() >= deadline {
                 return (connected, total);
             }
-            crate::runtime::task::sleep(std::time::Duration::from_millis(100)).await;
+            crate::runtime::task::sleep_background(std::time::Duration::from_millis(100)).await;
         }
     }
 
@@ -1307,7 +1431,7 @@ impl PvDatabase {
     /// order across all add_*/remove_* methods is identical (no
     /// cross-namespace deadlock).
     pub async fn add_pv(&self, name: &str, initial: EpicsValue) -> CaResult<()> {
-        let _gate = self.inner.registration_mutex.lock();
+        let _gate = self.lock_registration("add_pv");
         self.check_name_free(name)?;
         let pv = Arc::new(ProcessVariable::new(name.to_string(), initial));
         self.inner.simple_pvs.lock().insert(name.to_string(), pv);
@@ -1368,7 +1492,7 @@ impl PvDatabase {
         access_hook: Option<crate::server::pv::AccessHook>,
         read_hook: Option<crate::server::pv::ReadHook>,
     ) -> CaResult<()> {
-        let _gate = self.inner.registration_mutex.lock();
+        let _gate = self.lock_registration("add_pv_with_hooks_full");
         self.check_name_free(name)?;
         let pv = Arc::new(ProcessVariable::new(name.to_string(), initial));
         pv.set_write_hook(write_hook);
@@ -1392,7 +1516,7 @@ impl PvDatabase {
     /// "already registered as an alias" even though its target is
     /// gone).
     pub async fn remove_simple_pv(&self, name: &str) -> Option<Arc<ProcessVariable>> {
-        let _gate = self.inner.registration_mutex.lock();
+        let _gate = self.lock_registration("remove_simple_pv");
         // Simple PVs cannot be alias targets (aliases point at
         // records), but a stale alias whose name MATCHES this PV
         // would have been rejected at add_alias time. No alias
@@ -1497,7 +1621,7 @@ impl PvDatabase {
             DbInitPhase::Loading(queued) => queued.push(init),
             DbInitPhase::Unloaded | DbInitPhase::Running => {
                 drop(phase);
-                crate::runtime::task::spawn(init);
+                crate::runtime::task::spawn_background(init);
             }
         }
     }
@@ -1530,8 +1654,11 @@ impl PvDatabase {
             match std::mem::replace(&mut *phase, DbInitPhase::Running) {
                 DbInitPhase::Loading(queued) => queued,
                 // An IOC that loaded nothing (programmatic / unit-test database)
-                // still crosses the barrier: the phase becomes terminal.
-                DbInitPhase::Unloaded => return,
+                // still crosses the barrier: the phase becomes terminal. It
+                // owes no per-record init pass, but it does owe the
+                // link-backed metadata resolution below, so it falls through
+                // rather than returning.
+                DbInitPhase::Unloaded => Vec::new(),
                 DbInitPhase::Running => return,
             }
         };
@@ -1539,6 +1666,17 @@ impl PvDatabase {
         // now-immutable record set, and C's `init_record` pass is a loop too.
         for init in owed {
             init.await;
+        }
+        // Link-backed metadata (C's `dbGetUnits`/`dbGetPrecision`/
+        // `dbGetGraphicLimits`/`dbGetAlarmLimits` inside the rset). This is the
+        // first moment every record exists and every link's locality is
+        // settled, so it is the earliest point resolution can succeed
+        // regardless of `.db` load order — and the only point that covers a
+        // record which never processes. The map guard is released before the
+        // loop: `refresh_link_backed_metadata` takes record locks.
+        let instances: Vec<_> = self.inner.records.read().values().cloned().collect();
+        for rec in &instances {
+            self.refresh_link_backed_metadata(rec);
         }
     }
 
@@ -1582,7 +1720,7 @@ impl PvDatabase {
         record: Box<dyn Record>,
         load: RecordLoad,
     ) -> CaResult<()> {
-        let _gate = self.inner.registration_mutex.lock();
+        let gate = self.lock_registration("add_loaded_record");
         self.check_name_free(name)?;
         let mut instance = RecordInstance::new_boxed(name.to_string(), record);
         // Hand the record a cycle-free handle to its own database so it can
@@ -1652,10 +1790,12 @@ impl PvDatabase {
 
         let scan = instance.common.scan;
         let phas = instance.common.phas;
-        self.inner.records.write().insert(
-            name.to_string(),
-            Arc::new(parking_lot::RwLock::new(instance)),
-        );
+        let record_type = instance.record.record_type();
+        let rec_arc = Arc::new(parking_lot::RwLock::new(instance));
+        self.inner
+            .records
+            .write()
+            .insert(name.to_string(), rec_arc.clone());
         // The record is reachable from this line on, so anything its
         // `set_async_context` parked above may now run. This is the only
         // release site because this is the only site that registers the name.
@@ -1676,8 +1816,33 @@ impl PvDatabase {
                 .scan_index
                 .bucket(list)
                 .lock()
-                .insert((phas, seq, name.to_string()));
+                .insert(ScanKey::new(phas, record_type, seq, name));
         }
+
+        // Registration is complete and the name is published, so the gate has
+        // nothing left to serialize. It is released HERE, before the tail
+        // below, and that is load-bearing rather than tidy:
+        // `recGblInitSimm` can swap SCAN, and a scan change is applied by
+        // `update_scan_index`, which takes this same `registration_mutex`
+        // itself as the single owner of a scan-index transition. Holding it
+        // across the call is a self-deadlock on a non-reentrant mutex — the
+        // record only has to carry a constant SIML and a periodic SCAN to
+        // reach it.
+        drop(gate);
+
+        // The rest of C's `init_record` pass 1, which needs the record
+        // REGISTERED and so cannot run with `run_init_passes` above:
+        // `recGblInitSimm` plus its `recGblInitConstantLink(&siol, …, &sval)`
+        // (recGbl.c:438-444, from e.g. aiRecord.c:101), then `wdogInit`
+        // (histogramRecord.c:168). C reaches both through `iterateRecords`
+        // (`iocInit.c:562-586`), which visits every record in the database
+        // whatever created it; here they sat on the loader callers instead, so
+        // an inline or `dbCreateRecord` record got neither. Both are no-ops for
+        // a record type that declares no SIMM / no SDEL. Running them outside
+        // the gate is also what C does: `iterateRecords` is a separate pass
+        // over an already-built database, holding no registration lock.
+        self.rec_gbl_init_simm(&rec_arc);
+        self.arm_watchdog(name);
         Ok(())
     }
 
@@ -1721,7 +1886,7 @@ impl PvDatabase {
     /// when the `RecordInstance` is dropped — they observe `Closed` on
     /// next recv, matching the existing dbEvent cancel flow.
     pub async fn remove_record(&self, name: &str) -> bool {
-        let _gate = self.inner.registration_mutex.lock();
+        let _gate = self.lock_registration("remove_record");
         // 1) Remove from main map; keep scan + phas for scan-index cleanup.
         let removed = self.inner.records.write().remove(name);
         let Some(rec_arc) = removed else {
@@ -1740,7 +1905,7 @@ impl PvDatabase {
                 .scan_index
                 .bucket(list)
                 .lock()
-                .retain(|(_, _, n)| n != name);
+                .retain(|k| k.name != name);
         }
 
         // 2b) Drop the load-order entry.
@@ -1819,7 +1984,7 @@ impl PvDatabase {
     /// order. Now we run the same cross-namespace `check_name_free`
     /// guard the other add_* paths use.
     pub async fn add_alias(&self, alias: &str, target: &str) -> CaResult<()> {
-        let _gate = self.inner.registration_mutex.lock();
+        let _gate = self.lock_registration("add_alias");
         if !self.inner.records.read().contains_key(target) {
             return Err(CaError::ChannelNotFound(format!(
                 "alias target '{target}' is not a registered record"
@@ -2144,7 +2309,7 @@ mod tests {
         common.tse = -1;
         common.time = stale;
 
-        apply_timestamp(&mut common, false);
+        apply_timestamp("REC", &mut common, false);
 
         // BestTime must have run unconditionally — `common.time` is
         // no longer the stale sentinel.
@@ -2169,11 +2334,70 @@ mod tests {
         common.tse = -2;
         common.time = device_time;
 
-        apply_timestamp(&mut common, false);
+        apply_timestamp("REC", &mut common, false);
 
         assert_eq!(
             common.time, device_time,
             "TSE=-2 (epicsTimeEventDeviceTime) must preserve device-provided time"
+        );
+    }
+
+    /// C `generalTimeGetEventPriority` rejects every event below
+    /// `epicsTimeEventBestTime` with `S_time_badEvent`
+    /// (`epicsGeneralTime.c:254-255`), and `recGblGetTimeStampSimm`
+    /// (`recGbl.c:324-328`) writes nothing into `prec->time` on that status —
+    /// it errlogs and the record keeps the stamp it had. `TSE` is
+    /// `epicsInt16`, so `caput X.TSE -3` reaches this path.
+    #[test]
+    fn apply_timestamp_below_best_time_keeps_the_stale_stamp_and_errlogs() {
+        use crate::server::record::CommonFields;
+        use std::io::Write;
+        use std::sync::{Arc, Mutex};
+        use std::time::{Duration, SystemTime};
+        use tracing_subscriber::fmt::MakeWriter;
+
+        #[derive(Clone, Default)]
+        struct CaptureBuf(Arc<Mutex<Vec<u8>>>);
+        impl Write for CaptureBuf {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        impl<'a> MakeWriter<'a> for CaptureBuf {
+            type Writer = CaptureBuf;
+            fn make_writer(&'a self) -> Self::Writer {
+                self.clone()
+            }
+        }
+
+        let buf = CaptureBuf::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(buf.clone())
+            .with_max_level(tracing::Level::INFO)
+            .with_target(false)
+            .without_time()
+            .finish();
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        let stale = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000);
+        let mut common = CommonFields::default();
+        common.tse = -3;
+        common.time = stale;
+
+        apply_timestamp("X", &mut common, false);
+
+        assert_eq!(
+            common.time, stale,
+            "TSE below epicsTimeEventBestTime must leave TIME alone, not stamp now"
+        );
+        let logged = String::from_utf8_lossy(&buf.0.lock().unwrap()).into_owned();
+        assert!(
+            logged.contains("recGblGetTimeStampSimm: epicsTimeGetEvent failed, X.TSE = -3"),
+            "C errlogs the failed event lookup; captured: {logged:?}"
         );
     }
 
@@ -2798,19 +3022,33 @@ mod tests {
         .unwrap();
         db.add_alias("ALIAS", "TARGET").await.unwrap();
 
+        // The marker's lifetime is the frame, so by the time the call
+        // returns the stack is empty and so is the set — see the invariant on
+        // `run_process_frame`. What this pins is that the alias resolved to
+        // the canonical name on the way IN: seed the set with "TARGET" and the
+        // entry must find itself already on the stack and decline.
         let mut visited = std::collections::HashSet::new();
         db.process_record_with_links("ALIAS", &mut visited, 0)
             .await
             .unwrap();
-
-        // visited should contain the *canonical* name only.
         assert!(
-            visited.contains("TARGET"),
-            "visited must record the canonical name: {visited:?}",
+            visited.is_empty(),
+            "a finished frame leaves no marker behind: {visited:?}",
         );
+
+        let mut seeded = std::collections::HashSet::new();
+        seeded.insert("TARGET".to_string());
+        db.process_record_with_links("ALIAS", &mut seeded, 0)
+            .await
+            .unwrap();
         assert!(
-            !visited.contains("ALIAS"),
-            "visited must NOT record the alias form: {visited:?}",
+            !seeded.contains("ALIAS"),
+            "the alias form must never enter the set: {seeded:?}",
+        );
+        assert_eq!(
+            seeded.len(),
+            1,
+            "the alias resolved to TARGET and was declined, adding nothing: {seeded:?}",
         );
     }
 

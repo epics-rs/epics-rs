@@ -18,6 +18,44 @@
 
 use crate::error::{AsynError, AsynResult, AsynStatus};
 
+/// C's `epicsStrCaseCmp(key, ...)` dispatch, as the one normalisation both
+/// halves of a driver's option interface enter through.
+///
+/// Every C option entry point compares the key case-insensitively —
+/// `drvAsynSerialPort.c` `getOption` (:143-587) and `setOption` (:262-594),
+/// `drvAsynSerialPortWin32.c` `getOption` (:110-155) and `setOption`
+/// (:186-340) — so `BAUD`, `Baud` and `baud` name one key on both paths. The
+/// two halves used to disagree here: `setOption` lowercased the key while
+/// `getOption` matched the caller's spelling against lowercase literals, so an
+/// option an operator set as `BAUD` read back `OptionNotFound` and an
+/// `asynRecord` readback of it stayed blank.
+///
+/// The `trim` is this crate's, not C's, and it lives here for the same reason:
+/// whatever `setOption` accepts, `getOption` has to be able to answer.
+pub fn option_key(key: &str) -> String {
+    key.trim().to_ascii_lowercase()
+}
+
+/// C's `epicsStrCaseCmp(val, ...)` — the value half of the same rule
+/// [`option_key`] owns for the key.
+///
+/// Every value C matches against a word it matches case-insensitively:
+/// `drvAsynSerialPort.c:361-528` and `drvAsynSerialPortWin32.c:211-308` run
+/// `none`/`odd`/`even`, `Y`/`N`, `on`/`off` and even the digit literals through
+/// `epicsStrCaseCmp`. Folding once at each driver's `setOption` entry is what
+/// keeps the literals below it from each needing their own comparison, the way
+/// `parity` used to with a local `val_lower` while `break` had none — which is
+/// how `asynSetOption port 0 break ON` came to report "Bad number" where C
+/// asserts the line.
+///
+/// Only the option surface may use this. A value that is *data* rather than a
+/// keyword must not be folded: C `epicsStrDup`s `hostInfo` verbatim
+/// (`drvAsynIPPort.c:297`), so that port compares its own keywords
+/// case-insensitively instead and keeps the value as typed.
+pub fn option_value(value: &str) -> String {
+    value.trim().to_ascii_lowercase()
+}
+
 /// C `sscanf(val, "%d", &n)` — the grammar every numeric option key is parsed
 /// with (baud, bits on Win32).
 ///
@@ -112,9 +150,110 @@ pub fn parse_yn_option(key: &str, value: &str) -> AsynResult<bool> {
     }
 }
 
+/// What C's three-way `break` rule decides for one `setOption` call, given the
+/// port's current `tty->break_active`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BreakAction {
+    /// C's `on`: assert the line (`FlushFileBuffers` then `SetCommBreak`).
+    pub assert_break: bool,
+    /// C's `len`, with `Sleep(break_len > 0 ? break_len : 250)` already
+    /// resolved. `None` means the form is not timed at all.
+    pub hold_ms: Option<u64>,
+    /// C's `off`: release the line (`ClearCommBreak`).
+    pub clear_break: bool,
+}
+
+/// C-Win32 `setOption`'s `break` arm (`drvAsynSerialPortWin32.c:302-323`) as a
+/// pure decision over the latch, so the driver holds no second copy of the rule
+/// and the rule is reachable by a test without a COM port:
+///
+/// ```text
+/// "on"   on = break_active ? 0 : 1;   off = len = 0
+/// "off"  off = break_active ? 1 : 0;  on  = len = 0
+/// else   on = break_active ? 0 : 1;   off = len = 1
+/// ```
+///
+/// The consequence that matters is that `"on"` sets `len` to 0, so C never
+/// sleeps and never clears: the break stays asserted until `"off"` or a timed
+/// form releases it. Only the numeric and empty forms are timed.
+///
+/// `value` arrives folded through [`option_value`], which is why the literals
+/// below are bare `==` and not a second copy of C's `epicsStrCaseCmp`.
+///
+/// This is Win32 only. The POSIX driver has no `break_active` field at all and
+/// its break really is a momentary `tcsendbreak` with `"off"` a bare
+/// `return asynSuccess` (`drvAsynSerialPort.c:507-528`); that asymmetry is C's
+/// own.
+pub fn break_action(value: &str, break_active: bool) -> AsynResult<BreakAction> {
+    if value == "on" {
+        Ok(BreakAction {
+            assert_break: !break_active,
+            hold_ms: None,
+            clear_break: false,
+        })
+    } else if value == "off" {
+        Ok(BreakAction {
+            assert_break: false,
+            hold_ms: None,
+            clear_break: break_active,
+        })
+    } else {
+        // C skips the `sscanf` when the value is empty, leaving `break_len` 0,
+        // which the `Sleep` then reads as the conventional 250 ms.
+        let ms = if value.is_empty() {
+            0
+        } else {
+            u64::from(sscanf_uint(value).ok_or_else(bad_number)?)
+        };
+        Ok(BreakAction {
+            assert_break: !break_active,
+            hold_ms: Some(if ms > 0 { ms } else { 250 }),
+            clear_break: true,
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    use super::BreakAction;
     use super::*;
+
+    /// C matches option *values* case-insensitively too, so `break ON` is the
+    /// same request as `break on`. Without the fold it fell past both words
+    /// into the numeric arm and errored "Bad number".
+    #[test]
+    fn option_value_folds_case_so_break_on_is_the_on_arm() {
+        assert_eq!(option_value(" ON "), "on");
+        assert_eq!(option_value("Off"), "off");
+        assert_eq!(option_value("EVEN"), "even");
+
+        let asserted = break_action(&option_value("ON"), false).unwrap();
+        assert_eq!(asserted, break_action("on", false).unwrap());
+        assert!(asserted.assert_break, "ON must assert the line");
+        assert_eq!(asserted.hold_ms, None, "the on arm is never timed");
+
+        let released = break_action(&option_value("OFF"), true).unwrap();
+        assert_eq!(released, break_action("off", true).unwrap());
+        assert!(released.clear_break);
+
+        // A number still parses, and is still the only timed form.
+        assert_eq!(
+            break_action(&option_value("100"), false).unwrap().hold_ms,
+            Some(100)
+        );
+    }
+
+    /// C dispatches option keys through `epicsStrCaseCmp` on both the get and
+    /// the set path, so the key an operator writes in any case has to reach the
+    /// same handler and read back through it.
+    #[test]
+    fn option_key_folds_case_and_surrounding_space() {
+        assert_eq!(option_key("BAUD"), "baud");
+        assert_eq!(option_key("Baud"), "baud");
+        assert_eq!(option_key(" rs485_Enable "), "rs485_enable");
+        assert_eq!(option_key("Break"), "break");
+        assert_eq!(option_key(""), "");
+    }
 
     /// R11-49: C parses every numeric option value with `sscanf("%d")`, a prefix
     /// parse. `str::parse` is not one: it rejects the trailing garbage C ignores,
@@ -157,6 +296,87 @@ mod tests {
         assert_eq!(sscanf_uint("on"), None);
         // Stated deviation from C's wrap-around %u.
         assert_eq!(sscanf_uint("-1"), None);
+    }
+
+    /// One case per branch of C's three-way break rule crossed with the latch
+    /// state it reads (`drvAsynSerialPortWin32.c:302-323`). The first case is
+    /// the defect: `"on"` must assert and STOP — no hold, no clear — because
+    /// C's `"on"` arm leaves `len` and `off` at 0 and returns with the line
+    /// still in break.
+    #[test]
+    fn break_on_latches_and_only_off_or_a_timed_form_releases_it() {
+        let act = |v: &str, active: bool| super::break_action(v, active).unwrap();
+
+        // "on", latch down: assert, hold nothing, clear nothing.
+        assert_eq!(
+            act("on", false),
+            BreakAction {
+                assert_break: true,
+                hold_ms: None,
+                clear_break: false
+            }
+        );
+        // "on" again while held is a no-op in C (on = break_active ? 0 : 1).
+        assert_eq!(
+            act("on", true),
+            BreakAction {
+                assert_break: false,
+                hold_ms: None,
+                clear_break: false
+            }
+        );
+        // "off" releases only what is actually held.
+        assert_eq!(
+            act("off", true),
+            BreakAction {
+                assert_break: false,
+                hold_ms: None,
+                clear_break: true
+            }
+        );
+        assert_eq!(
+            act("off", false),
+            BreakAction {
+                assert_break: false,
+                hold_ms: None,
+                clear_break: false
+            }
+        );
+        // Empty value: timed, and C's break_len 0 resolves to 250 ms.
+        assert_eq!(
+            act("", false),
+            BreakAction {
+                assert_break: true,
+                hold_ms: Some(250),
+                clear_break: true
+            }
+        );
+        // Timed while already held: C sets off = len = 1 regardless, so the
+        // hold still runs and the line is released at the end.
+        assert_eq!(
+            act("", true),
+            BreakAction {
+                assert_break: false,
+                hold_ms: Some(250),
+                clear_break: true
+            }
+        );
+        // Numeric form carries its own duration.
+        assert_eq!(
+            act("50", false),
+            BreakAction {
+                assert_break: true,
+                hold_ms: Some(50),
+                clear_break: true
+            }
+        );
+        // Explicit 0 is C's `break_len > 0 ? break_len : 250`.
+        assert_eq!(act("0", false).hold_ms, Some(250));
+        // Anything else is C's "Bad number".
+        assert_eq!(
+            super::break_action("soon", false).unwrap_err().message(),
+            "Bad number"
+        );
     }
 
     #[test]

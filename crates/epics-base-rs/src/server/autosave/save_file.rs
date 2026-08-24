@@ -14,6 +14,30 @@ pub struct SaveEntry {
     pub connected: bool,
 }
 
+/// A line of a `.sav` file that declares no entry this grammar
+/// understands — a truncated write, a hand edit, a line whose
+/// `@array@` braces do not close.
+///
+/// Kept rather than dropped: a restore that silently skips such a line
+/// reports the PVs it did write and nothing else, so a partially
+/// written file looks like a clean restore.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MalformedLine {
+    /// 1-based line number within the file.
+    pub line_no: usize,
+    /// The line as it appeared, minus its terminator.
+    pub text: String,
+}
+
+/// Everything a `.sav` file body says: the entries it declares, and the
+/// lines it could not turn into one. Every reader gets both halves —
+/// there is no entries-only parse that can lose the second.
+#[derive(Debug, Clone, Default)]
+pub struct SaveFileContents {
+    pub entries: Vec<SaveEntry>,
+    pub malformed: Vec<MalformedLine>,
+}
+
 /// Write a .sav file atomically (tmp -> fsync -> rename).
 ///
 /// Uses the autosave-rs native format ([`CompatMode::Native`]). For a
@@ -113,7 +137,7 @@ pub async fn write_save_file_with_mode(
 
 /// Read a .sav file and validate `<END>` marker.
 /// Returns None for corrupt files (no END marker).
-pub async fn read_save_file(path: &Path) -> AutosaveResult<Option<Vec<SaveEntry>>> {
+pub async fn read_save_file(path: &Path) -> AutosaveResult<Option<SaveFileContents>> {
     let content = crate::runtime::fs::read_to_string(path)
         .await
         .map_err(|e| {
@@ -131,8 +155,7 @@ pub async fn read_save_file(path: &Path) -> AutosaveResult<Option<Vec<SaveEntry>
         return Ok(None);
     }
 
-    let entries = parse_save_content(&content);
-    Ok(Some(entries))
+    Ok(Some(parse_save_content(&content)))
 }
 
 /// Quick check if a .sav file has a valid `<END>` marker.
@@ -152,25 +175,38 @@ fn has_end_marker(content: &str) -> bool {
     false
 }
 
-fn parse_save_content(content: &str) -> Vec<SaveEntry> {
-    let mut entries = Vec::new();
+fn parse_save_content(content: &str) -> SaveFileContents {
+    let mut out = SaveFileContents::default();
 
-    for line in content.lines() {
-        let line = line.trim();
-        if line.is_empty() {
+    for (idx, raw) in content.lines().enumerate() {
+        // Leading indentation is framing; a TRAILING space is not. The
+        // writer emits `PVNAME<space>VALUE`, so the value of a PV whose
+        // value is the empty string is the empty tail after that space —
+        // trimming the line first is what used to erase the separator and
+        // drop the entry.
+        let line = raw.trim_start();
+        let framing = line.trim_end();
+        if framing.is_empty() {
             continue;
         }
-        if line == END_MARKER {
+        if framing == END_MARKER {
             break;
         }
+        let malformed = |out: &mut SaveFileContents| {
+            out.malformed.push(MalformedLine {
+                line_no: idx + 1,
+                text: raw.to_string(),
+            });
+        };
+
         // Header/comment lines
-        if line.starts_with('#') {
+        if framing.starts_with('#') {
             // Check for disconnected PV: #PVNAME\t(not connected)
-            let inner = &line[1..];
+            let inner = &framing[1..];
             if inner.contains("(not connected)") {
                 let pv_name = inner.split(['\t', ' ']).next().unwrap_or("").trim();
                 if !pv_name.is_empty() {
-                    entries.push(SaveEntry {
+                    out.entries.push(SaveEntry {
                         pv_name: pv_name.to_string(),
                         value: String::new(),
                         connected: false,
@@ -180,31 +216,138 @@ fn parse_save_content(content: &str) -> Vec<SaveEntry> {
             continue;
         }
 
-        // C autosave @array@ format
-        if line.contains(ARRAY_MARKER) {
-            if let Some(entry) = parse_c_array_line(line, content) {
-                entries.push(entry);
-                continue;
+        // C autosave @array@ format. The marker settles what the line is,
+        // so a line carrying it either parses as an array or is malformed —
+        // falling through to the scalar rule would turn `PV @array@ { 1 2`
+        // into a PV whose value is the literal text `@array@ { 1 2`.
+        if framing.contains(ARRAY_MARKER) {
+            match parse_c_array_line(framing) {
+                Some(entry) => out.entries.push(entry),
+                None => malformed(&mut out),
             }
+            continue;
         }
 
         // Normal line: PV_NAME<space>VALUE
-        if let Some(space_pos) = line.find(' ') {
-            let pv_name = &line[..space_pos];
-            let value = &line[space_pos + 1..];
-            entries.push(SaveEntry {
+        match line.split_once(' ') {
+            Some((pv_name, value)) if !pv_name.is_empty() => out.entries.push(SaveEntry {
                 pv_name: pv_name.to_string(),
                 value: value.to_string(),
                 connected: true,
-            });
+            }),
+            _ => malformed(&mut out),
         }
     }
 
-    entries
+    out
+}
+
+/// The native array text `[e1,e2,e3]` — the one owner of that form, in
+/// both directions.
+///
+/// An element is written verbatim unless it would be ambiguous against
+/// the punctuation of the form itself — it contains `,`, `]`, `"` or
+/// `\`, has surrounding whitespace, or is empty — in which case it is
+/// double-quoted with `"` and `\` backslash-escaped. Numbers never
+/// qualify, so numeric arrays keep the text they always had.
+/// [`decode_array_text`] undoes exactly this, so any element survives
+/// the round trip. Nothing else in this module may join or split array
+/// text: an element carrying a separator is precisely the case an
+/// ad-hoc `join(",")` / `split(',')` pair loses.
+fn encode_array_text<I, S>(elements: I) -> String
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<str>,
+{
+    let mut out = String::from("[");
+    for (i, elem) in elements.into_iter().enumerate() {
+        if i > 0 {
+            out.push(',');
+        }
+        let elem = elem.as_ref();
+        let ambiguous = elem.is_empty()
+            || elem.contains([',', ']', '"', '\\'])
+            || elem.starts_with(char::is_whitespace)
+            || elem.ends_with(char::is_whitespace);
+        if ambiguous {
+            out.push('"');
+            for c in elem.chars() {
+                if c == '"' || c == '\\' {
+                    out.push('\\');
+                }
+                out.push(c);
+            }
+            out.push('"');
+        } else {
+            out.push_str(elem);
+        }
+    }
+    out.push(']');
+    out
+}
+
+/// Read back the text [`encode_array_text`] writes, unquoting and
+/// unescaping the elements that were quoted. Unquoted elements keep the
+/// old tolerance for surrounding whitespace, so hand-written `[1, 2]`
+/// still reads as two elements.
+fn decode_array_text(s: &str) -> Vec<String> {
+    let inner = s.strip_prefix('[').unwrap_or(s);
+    // `strip_suffix`, not `trim_end_matches`: only the form's own
+    // closing bracket comes off, so `]` inside a quoted element cannot
+    // be eaten from the end of the text.
+    let inner = inner.strip_suffix(']').unwrap_or(inner);
+
+    let mut out = Vec::new();
+    let mut chars = inner.chars().peekable();
+    loop {
+        while chars.peek().is_some_and(|c| c.is_whitespace()) {
+            chars.next();
+        }
+        match chars.peek() {
+            None if out.is_empty() => break,
+            // A trailing separator still declares a final empty element.
+            None => {
+                out.push(String::new());
+                break;
+            }
+            Some('"') => {
+                chars.next();
+                let mut elem = String::new();
+                loop {
+                    match chars.next() {
+                        Some('\\') => {
+                            if let Some(c) = chars.next() {
+                                elem.push(c);
+                            }
+                        }
+                        Some('"') | None => break,
+                        Some(c) => elem.push(c),
+                    }
+                }
+                out.push(elem);
+                // Skip to the separator that follows the closing quote.
+                while chars.peek().is_some_and(|&c| c != ',') {
+                    chars.next();
+                }
+            }
+            Some(_) => {
+                let mut elem = String::new();
+                while chars.peek().is_some_and(|&c| c != ',') {
+                    elem.push(chars.next().unwrap());
+                }
+                out.push(elem.trim_end().to_string());
+            }
+        }
+        match chars.next() {
+            Some(',') => continue,
+            _ => break,
+        }
+    }
+    out
 }
 
 /// Parse a C autosave @array@ line.
-fn parse_c_array_line(line: &str, _full_content: &str) -> Option<SaveEntry> {
+fn parse_c_array_line(line: &str) -> Option<SaveEntry> {
     // Format: PV_NAME @array@ { "e1" "e2" "e3" }
     let marker_pos = line.find(ARRAY_MARKER)?;
     let pv_name = line[..marker_pos].trim();
@@ -216,7 +359,7 @@ fn parse_c_array_line(line: &str, _full_content: &str) -> Option<SaveEntry> {
 
     let inner = rest[1..rest.len() - 1].trim();
     let elements = parse_c_array_elements(inner);
-    let value = format!("[{}]", elements.join(","));
+    let value = encode_array_text(&elements);
 
     Some(SaveEntry {
         pv_name: pv_name.to_string(),
@@ -290,64 +433,24 @@ pub fn value_to_save_str(value: &EpicsValue) -> String {
         EpicsValue::EnumWithChoices { index, .. } => index.to_string(),
         EpicsValue::Char(v) => v.to_string(),
         EpicsValue::DoubleArray(arr) => {
-            let parts: Vec<_> = arr.iter().map(|v| format!("{:.14e}", v)).collect();
-            format!("[{}]", parts.join(","))
+            encode_array_text(arr.iter().map(|v| format!("{:.14e}", v)))
         }
-        EpicsValue::LongArray(arr) => {
-            let parts: Vec<_> = arr.iter().map(|v| v.to_string()).collect();
-            format!("[{}]", parts.join(","))
-        }
-        EpicsValue::CharArray(arr) => {
-            let parts: Vec<_> = arr.iter().map(|v| v.to_string()).collect();
-            format!("[{}]", parts.join(","))
-        }
-        EpicsValue::ShortArray(arr) => {
-            let parts: Vec<_> = arr.iter().map(|v| v.to_string()).collect();
-            format!("[{}]", parts.join(","))
-        }
-        EpicsValue::FloatArray(arr) => {
-            let parts: Vec<_> = arr.iter().map(|v| format!("{:.7e}", v)).collect();
-            format!("[{}]", parts.join(","))
-        }
-        EpicsValue::EnumArray(arr) => {
-            let parts: Vec<_> = arr.iter().map(|v| v.to_string()).collect();
-            format!("[{}]", parts.join(","))
-        }
-        EpicsValue::Int64Array(arr) => {
-            let parts: Vec<_> = arr.iter().map(|v| v.to_string()).collect();
-            format!("[{}]", parts.join(","))
-        }
+        EpicsValue::LongArray(arr) => encode_array_text(arr.iter().map(|v| v.to_string())),
+        EpicsValue::CharArray(arr) => encode_array_text(arr.iter().map(|v| v.to_string())),
+        EpicsValue::ShortArray(arr) => encode_array_text(arr.iter().map(|v| v.to_string())),
+        EpicsValue::FloatArray(arr) => encode_array_text(arr.iter().map(|v| format!("{:.7e}", v))),
+        EpicsValue::EnumArray(arr) => encode_array_text(arr.iter().map(|v| v.to_string())),
+        EpicsValue::Int64Array(arr) => encode_array_text(arr.iter().map(|v| v.to_string())),
         EpicsValue::UInt64(v) => v.to_string(),
-        EpicsValue::UInt64Array(arr) => {
-            let parts: Vec<_> = arr.iter().map(|v| v.to_string()).collect();
-            format!("[{}]", parts.join(","))
-        }
+        EpicsValue::UInt64Array(arr) => encode_array_text(arr.iter().map(|v| v.to_string())),
         EpicsValue::UShort(v) => v.to_string(),
         EpicsValue::ULong(v) => v.to_string(),
-        EpicsValue::UShortArray(arr) => {
-            let parts: Vec<_> = arr.iter().map(|v| v.to_string()).collect();
-            format!("[{}]", parts.join(","))
-        }
-        EpicsValue::ULongArray(arr) => {
-            let parts: Vec<_> = arr.iter().map(|v| v.to_string()).collect();
-            format!("[{}]", parts.join(","))
-        }
+        EpicsValue::UShortArray(arr) => encode_array_text(arr.iter().map(|v| v.to_string())),
+        EpicsValue::ULongArray(arr) => encode_array_text(arr.iter().map(|v| v.to_string())),
         EpicsValue::UChar(v) => v.to_string(),
-        EpicsValue::UCharArray(arr) => {
-            let parts: Vec<_> = arr.iter().map(|v| v.to_string()).collect();
-            format!("[{}]", parts.join(","))
-        }
+        EpicsValue::UCharArray(arr) => encode_array_text(arr.iter().map(|v| v.to_string())),
         EpicsValue::StringArray(arr) => {
-            let parts: Vec<_> = arr
-                .iter()
-                .map(|s| {
-                    format!(
-                        "\"{}\"",
-                        s.as_str_lossy().replace('\\', "\\\\").replace('"', "\\\"")
-                    )
-                })
-                .collect();
-            format!("[{}]", parts.join(","))
+            encode_array_text(arr.iter().map(|s| s.as_str_lossy().into_owned()))
         }
     }
 }
@@ -473,27 +576,9 @@ pub fn parse_save_value(s: &str, template: &EpicsValue) -> Option<EpicsValue> {
         EpicsValue::UCharArray(_) => {
             parse_array_str(s, |v| v.parse::<u8>().ok()).map(EpicsValue::UCharArray)
         }
-        EpicsValue::StringArray(_) => {
-            let inner = s.trim_start_matches('[').trim_end_matches(']');
-            if inner.is_empty() {
-                return Some(EpicsValue::StringArray(Vec::new()));
-            }
-            let mut out = Vec::new();
-            for tok in inner.split(',') {
-                let tok = tok.trim();
-                let unq = if tok.starts_with('"') && tok.ends_with('"') && tok.len() >= 2 {
-                    tok[1..tok.len() - 1]
-                        .replace("\\\"", "\"")
-                        .replace("\\\\", "\\")
-                } else {
-                    tok.to_string()
-                };
-                out.push(unq);
-            }
-            Some(EpicsValue::StringArray(
-                out.into_iter().map(Into::into).collect(),
-            ))
-        }
+        EpicsValue::StringArray(_) => Some(EpicsValue::StringArray(
+            decode_array_text(s).into_iter().map(Into::into).collect(),
+        )),
     }
 }
 
@@ -501,11 +586,7 @@ fn parse_array_str<T, F>(s: &str, parse_elem: F) -> Option<Vec<T>>
 where
     F: Fn(&str) -> Option<T>,
 {
-    let inner = s.trim_start_matches('[').trim_end_matches(']');
-    if inner.is_empty() {
-        return Some(Vec::new());
-    }
-    inner.split(',').map(|v| parse_elem(v.trim())).collect()
+    decode_array_text(s).iter().map(|v| parse_elem(v)).collect()
 }
 
 #[cfg(test)]
@@ -566,7 +647,11 @@ mod tests {
         assert!(content.contains("PV:ARRAY @array@ { \"10\" \"20\" }"));
 
         // Reader accepts the C-format file.
-        let read = read_save_file(&path).await.unwrap().expect("valid file");
+        let read = read_save_file(&path)
+            .await
+            .unwrap()
+            .expect("valid file")
+            .entries;
         assert_eq!(read.len(), 2);
         let arr = read.iter().find(|e| e.pv_name == "PV:ARRAY").unwrap();
         assert_eq!(arr.value, "[10,20]");

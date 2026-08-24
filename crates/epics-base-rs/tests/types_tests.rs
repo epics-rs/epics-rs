@@ -295,6 +295,14 @@ fn bare_snapshot(value: EpicsValue) -> Snapshot {
     Snapshot::new(value, 0, 0, SystemTime::UNIX_EPOCH)
 }
 
+/// The rset-slot mask a channel carrying this much metadata supplies. The
+/// encoder reads the MASK, not `display.is_some()`: a `DisplayInfo` is minted
+/// for every snapshot to carry the DESC leaf, so its `Option` says nothing
+/// about which `get_*` slots the record type has.
+fn supplies_every_slot(snap: &mut Snapshot) {
+    snap.properties = PropertySupport::NUMERIC.narrowed_to_field(snap.value.db_field_type(), false);
+}
+
 fn full_snapshot(value: EpicsValue) -> Snapshot {
     let mut snap = Snapshot::new(value, 3, 2, SystemTime::UNIX_EPOCH);
     snap.display = Some(DisplayInfo {
@@ -312,6 +320,7 @@ fn full_snapshot(value: EpicsValue) -> Snapshot {
         upper_ctrl_limit: 95.0,
         lower_ctrl_limit: -45.0,
     });
+    supplies_every_slot(&mut snap);
     snap
 }
 
@@ -403,6 +412,7 @@ fn test_encode_gr_short_with_metadata() {
         lower_alarm_limit: -90.0,
         ..Default::default()
     });
+    supplies_every_slot(&mut snap);
     let data = encode_dbr(22, &snap).unwrap();
     assert_eq!(data.len(), 26);
     assert_eq!(&data[4..6], b"mm");
@@ -420,6 +430,7 @@ fn test_encode_gr_float_with_metadata() {
         lower_disp_limit: 0.0,
         ..Default::default()
     });
+    supplies_every_slot(&mut snap);
     let data = encode_dbr(23, &snap).unwrap();
     assert_eq!(data.len(), 44);
     assert_eq!(&data[4..6], &2i16.to_be_bytes());
@@ -436,6 +447,7 @@ fn test_encode_gr_long_with_metadata() {
         lower_disp_limit: 0.0,
         ..Default::default()
     });
+    supplies_every_slot(&mut snap);
     let data = encode_dbr(26, &snap).unwrap();
     assert_eq!(data.len(), 40);
     assert_eq!(&data[12..16], &10000i32.to_be_bytes());
@@ -456,6 +468,7 @@ fn test_encode_gr_char_with_metadata() {
         lower_disp_limit: -10.0,
         ..Default::default()
     });
+    supplies_every_slot(&mut snap);
     let data = encode_dbr(25, &snap).unwrap();
     assert_eq!(data.len(), 20);
     assert_eq!(data[12], 100u8); // 100 fits i8 → 100u8.
@@ -473,6 +486,7 @@ fn test_encode_gr_char_saturates_out_of_range() {
         lower_disp_limit: -200.0,
         ..Default::default()
     });
+    supplies_every_slot(&mut snap);
     let data = encode_dbr(25, &snap).unwrap();
     assert_eq!(data[12], 127u8); // saturated i8::MAX
     assert_eq!(data[13], 0x80u8); // saturated i8::MIN bit-pattern
@@ -522,6 +536,7 @@ fn test_encode_ctrl_short_with_ctrl_limits() {
         upper_ctrl_limit: 80.0,
         lower_ctrl_limit: 5.0,
     });
+    supplies_every_slot(&mut snap);
     let data = encode_dbr(29, &snap).unwrap();
     assert_eq!(data.len(), 30);
     assert_eq!(&data[12..14], &100i16.to_be_bytes());
@@ -685,7 +700,13 @@ fn test_decode_time_char_roundtrip() {
     let val = EpicsValue::Char(0xBE);
     let data = serialize_dbr(18, &val, 0, 0, ts).unwrap();
     let snap = decode_dbr(18, &data, 1).unwrap();
-    assert_eq!(snap.value, EpicsValue::Char(0xBE));
+    // Byte-identical round-trip, but not label-identical, and deliberately
+    // so: the encoder takes the carrier the SERVER holds (a `DBF_CHAR`
+    // field is `epicsInt8`), while the decoder answers with the carrier the
+    // WIRE defines (`dbr_char_t` is `epicsUInt8`, `db_access.h:40`) —
+    // `DbFieldType::wire_carrier`. Only a later widening can tell them
+    // apart, and there the wire's answer is the one C's CA client gives.
+    assert_eq!(snap.value, EpicsValue::UChar(0xBE));
 }
 
 #[test]
@@ -781,7 +802,8 @@ fn test_decode_ctrl_char_roundtrip() {
     let snap_orig = full_snapshot(EpicsValue::Char(0xAB));
     let data = encode_dbr(32, &snap_orig).unwrap();
     let snap = decode_dbr(32, &data, 1).unwrap();
-    assert_eq!(snap.value, EpicsValue::Char(0xAB));
+    // Wire carrier on the way back, exactly as in the TIME_CHAR case above.
+    assert_eq!(snap.value, EpicsValue::UChar(0xAB));
     let disp = snap.display.unwrap();
     assert_eq!(disp.units, "degC");
 }

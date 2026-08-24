@@ -51,23 +51,25 @@ concurrent calls converge on the same `Active` state via
 explicit interruption beyond the optional `MonitorEvent::Disconnected`
 event.
 
-Holdoff: after a full pass where every searched candidate failed to
-reach Active (TCP setup or `CREATE_CHANNEL` bounced), `holdoff_until`
-is set to `now + 2^min(connect_fail_count-1, 4)` seconds — an
-exponential `1 → 2 → 4 → 8 → 16`s ladder capped at 16s
-(`channel.rs:826-832`). A successful Active resets the counter and
-clears the holdoff, so the next disconnect restarts the ladder at 1s.
-Subsequent `ensure_active` calls return immediately with an error until
-the deadline passes — prevents reconnect storms against a flapping
-server.
+Holdoff: after a full pass where every candidate failed to reach Active,
+`reconnect_holdoff` (`channel.rs`) sets `holdoff_until` from the failure
+class *and* the resolver kind, because pvxs paces the two kinds through
+different machinery. A searched channel is paced by where it re-enters the
+search ring — 10 buckets out for a pre-`CREATE_CHANNEL` TCP failure
+(`SEARCH_RING_HOLDOFF`, ~10s at the 1Hz tick, `client.cpp:156-165`), the
+current bucket for a `Creating`/`Active` disconnect (no holdoff), a full
+revolution for a `CREATE_CHANNEL` refusal. A forced-server channel has no
+ring: pvxs rebuilds its circuit and the `reconn` flag arms a flat 2s timer
+before `startConnecting()` (`DIRECT_RECONNECT_HOLDOFF`,
+`clientconn.cpp:26-32`). Subsequent `ensure_active` calls sleep out the
+remainder before retrying; a successful Active clears it, so the next
+disconnect re-derives its own pacing.
 
-This is an intentional tuning deviation from pvxs, which applies a flat
-~10s holdoff *only* to a pre-`CREATE_CHANNEL` (`Connecting`-phase)
-failure — "likely lower level networking issue" — and `0` for
-`Creating`/`Active` disconnects, expressed as a search-bucket offset
-(`client.cpp:156-174,209-213`). pva-rs instead escalates on consecutive
-failures regardless of phase; both bound the reconnect rate and neither
-affects wire behaviour.
+One deviation remains: a refused *direct* `CREATE_CHANNEL`. pvxs drops it
+and retries only on the next circuit rebuild (`clientconn.cpp:386-392`),
+which our pooled reconnect may never produce, so `DIRECT_REFUSAL_HOLDOFF`
+substitutes a long fixed wait for that unbounded one. Neither the holdoffs
+nor the deviation affects wire behaviour.
 
 Multi-server failover: `find_all` collects every responder for a PV
 within `MULTI_SERVER_WINDOW` (200ms). The fastest is tried first; the

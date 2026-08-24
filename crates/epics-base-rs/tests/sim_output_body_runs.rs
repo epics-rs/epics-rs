@@ -21,6 +21,7 @@
 use std::collections::HashSet;
 
 use epics_base_rs::server::database::PvDatabase;
+use epics_base_rs::server::record::DelayedCallbackOutcome;
 use epics_base_rs::server::records::ao::AoRecord;
 use epics_base_rs::server::records::bo::BoRecord;
 use epics_base_rs::types::EpicsValue;
@@ -79,12 +80,12 @@ async fn sim_output_runs_ao_oroc_body_writes_limited_oval_to_siol() {
 }
 
 /// `bo` with `HIGH > 0` in SIMM=YES mode: the body's HIGH state machine arms a
-/// one-shot momentary reset (C `boRecord.c::process` schedules a reprocess that
-/// drives VAL back to 0). The first cycle writes VAL=1 to SIOL and arms the
-/// reset; the reset reprocess (driven here directly, the timer being unfireable)
-/// runs the body again, sees the pending reset, sets VAL=0, and writes 0 to
-/// SIOL. The pre-fix short-circuit never ran the body, so the reset never armed
-/// and the simulated output stayed latched at 1.
+/// one-shot momentary reset (C `boRecord.c:257-262` schedules a delayed
+/// callback whose body drives VAL back to 0). The first cycle writes VAL=1 to
+/// SIOL and arms the callback; the callback body is then run directly (the
+/// timer itself is unfireable at HIGH=100) and its reprocess writes 0 to SIOL.
+/// The pre-fix short-circuit never ran the body, so the reset never armed and
+/// the simulated output stayed latched at 1.
 #[epics_macros_rs::epics_test]
 async fn sim_output_runs_bo_high_momentary_reset_in_sim_mode() {
     let db = PvDatabase::new();
@@ -115,9 +116,18 @@ async fn sim_output_runs_bo_high_momentary_reset_in_sim_mode() {
         "SIOL target received the simulated bo output VAL=1, got {tgt:?}"
     );
 
-    // HIGH reset reprocess (the one-shot the body armed): the body runs again,
-    // drives VAL back to 0, and the simulated write sends 0 to SIOL. Pre-fix
-    // the body never ran, so the reset never armed and the target stayed at 1.
+    // The timer body C `myCallbackFunc:115-117` runs, then its `dbProcess`:
+    // VAL goes to 0 and the simulated write sends 0 to SIOL. Pre-fix the body
+    // never ran, so the callback never armed and the target stayed at 1.
+    {
+        let rec = db.get_record("BOHI").unwrap();
+        let mut inst = rec.write();
+        assert_eq!(
+            inst.record.delayed_callback_fire(false),
+            DelayedCallbackOutcome::Reprocess,
+            "the arming cycle left a HIGH one-shot for the timer to release"
+        );
+    }
     let mut v2 = HashSet::new();
     db.process_record_continuation("BOHI", &mut v2, 0)
         .await

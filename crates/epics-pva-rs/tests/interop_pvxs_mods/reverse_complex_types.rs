@@ -19,7 +19,7 @@
 
 // RTEMS-EXEC-MODEL-ALLOW(1): not run by the default nextest profile - this file is a module of the `interop_pvxs` binary, which `.config/nextest.toml`'s default-filter excludes.
 
-use super::interop_helpers::{pvxs_arch, pvxs_lib_dir};
+use super::interop_helpers::pvxs_lib_dir;
 
 use epics_pva_rs::pvdata::{PvField, ScalarValue};
 
@@ -34,93 +34,8 @@ fn array_to_vec(v: &PvField) -> Option<Vec<ScalarValue>> {
     }
 }
 
-use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::Duration;
-
-fn epics_base_home() -> PathBuf {
-    if let Ok(h) = std::env::var("EPICS_BASE") {
-        return PathBuf::from(h);
-    }
-    let home = std::env::var("HOME").unwrap_or_default();
-    PathBuf::from(home).join("epics/epics-base")
-}
-
-fn pvxs_home() -> PathBuf {
-    if let Ok(h) = std::env::var("PVXS_HOME") {
-        return PathBuf::from(h);
-    }
-    let home = std::env::var("HOME").unwrap_or_default();
-    PathBuf::from(home).join("codes/pvxs")
-}
-
-fn build_reverse_server() -> Option<PathBuf> {
-    let src = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("tests/interop_pvxs_mods/cpp_helpers/reverse_server.cpp");
-    if !src.is_file() {
-        eprintln!("SKIP: reverse_server source missing: {src:?}");
-        return None;
-    }
-    let out_dir = std::env::var("CARGO_TARGET_TMPDIR")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| std::env::temp_dir());
-    std::fs::create_dir_all(&out_dir).ok();
-    let out = out_dir.join("reverse_server");
-    let need_rebuild = !out.is_file()
-        || std::fs::metadata(&src).and_then(|m| m.modified()).ok()
-            > std::fs::metadata(&out).and_then(|m| m.modified()).ok();
-    if !need_rebuild {
-        return Some(out);
-    }
-
-    let pvxs = pvxs_home();
-    let base = epics_base_home();
-    let arch = pvxs_arch();
-    let pvxs_include = pvxs.join("include");
-    let base_include = base.join("include");
-    let base_compiler_include = base.join("include/compiler/clang");
-    let base_os_include = if cfg!(target_os = "macos") {
-        base.join("include/os/Darwin")
-    } else {
-        base.join("include/os/Linux")
-    };
-    let pvxs_lib = pvxs.join("lib").join(arch);
-    let base_lib = base.join("lib").join(arch);
-    for p in [&pvxs_include, &base_include, &pvxs_lib, &base_lib] {
-        if !p.exists() {
-            eprintln!("SKIP: required path missing for reverse_server build: {p:?}");
-            return None;
-        }
-    }
-
-    let status = Command::new("c++")
-        .args(["-std=c++17", "-O0", "-g"])
-        .arg(format!("-I{}", pvxs_include.display()))
-        .arg(format!("-I{}", base_include.display()))
-        .arg(format!("-I{}", base_compiler_include.display()))
-        .arg(format!("-I{}", base_os_include.display()))
-        .arg(&src)
-        .arg(format!("-L{}", pvxs_lib.display()))
-        .arg("-lpvxs")
-        .arg(format!("-L{}", base_lib.display()))
-        .arg("-lCom")
-        .arg(format!("-Wl,-rpath,{}", pvxs_lib.display()))
-        .arg(format!("-Wl,-rpath,{}", base_lib.display()))
-        .arg("-o")
-        .arg(&out)
-        .status();
-    match status {
-        Ok(s) if s.success() => Some(out),
-        Ok(s) => {
-            eprintln!("SKIP: c++ build of reverse_server failed (exit {s})");
-            None
-        }
-        Err(e) => {
-            eprintln!("SKIP: c++ compiler unavailable: {e}");
-            None
-        }
-    }
-}
 
 /// Walk into a struct value and pull the `value` leaf (or return
 /// the struct itself when it's a 2-level value-and-choices enum).
@@ -142,7 +57,7 @@ fn extract_value(decoded: &PvField, path: &str) -> Option<PvField> {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn interop_reverse_complex_types_rust_client_decodes_pvxs() {
-    let Some(helper) = build_reverse_server() else {
+    let Some(helper) = super::interop_helpers::cpp_helper("reverse_server") else {
         return;
     };
 

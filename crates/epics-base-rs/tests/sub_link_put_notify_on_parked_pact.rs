@@ -23,8 +23,8 @@
 //! A bare `record(sub, "…") {}` has an empty `SNAM`, so C `subRecord.c:119-122`
 //! sets `prec->pact = TRUE` and the record is parked forever (verified:
 //! `caget SUB.PACT` reads 1). Without C's link-field special case, a put-notify
-//! to such a record parks on a `PactExit` that never comes: the value is never
-//! written and the callback never fires. Ground truth, C softIoc
+//! to such a record joins a restart list no PACT release will ever drain: the
+//! value is never written and the callback never fires. Ground truth, C softIoc
 //! (`bin/linux-x86_64`):
 //!
 //! ```text

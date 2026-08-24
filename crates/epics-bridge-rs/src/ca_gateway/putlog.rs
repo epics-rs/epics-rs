@@ -284,7 +284,7 @@ mod tests {
     /// wire, and a CA `CLIENT_NAME`/`HOST_NAME` may legally contain a
     /// newline — the server checks only NUL-termination and a 511-byte cap
     /// (`epics-ca-rs/src/server/tcp.rs:2416`), and C is byte-identical
-    /// (`camessage.c:824-825`). A verified cap-token's `claims.sub` reaches
+    /// (`camessage.c:855-856`). A verified cap-token's `claims.sub` reaches
     /// the same field, so this is not gated on forging an identity.
     ///
     /// Boundary sweep over the fields, not a story about one of them: each

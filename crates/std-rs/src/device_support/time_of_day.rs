@@ -83,7 +83,10 @@ impl DeviceSupport for TimeOfDayStringDeviceSupport {
     fn read(&mut self, record: &mut dyn Record) -> CaResult<DeviceReadOutcome> {
         // C `devTimeOfDay.c:121` `createString`: `recGblGetTimeStamp(psi)`
         // resolves `psi->time` from TSE *now*, then formats that stamp.
-        let ts = get_time_stamp(self.tse, self.time);
+        // C `recGblGetTimeStamp` leaves `prec->time` alone when
+        // `epicsTimeGetEvent` fails, and the record-level owner
+        // (`apply_timestamp`) emits the errlog this cycle.
+        let ts = get_time_stamp(self.tse, self.time).unwrap_or(self.time);
         let (sec_past_epoch, nsec) = epics_time_parts(ts);
 
         // C `devTimeOfDay.c:122` `createString`: `if (psi->phas)` selects
@@ -170,7 +173,10 @@ impl DeviceSupport for SecPastEpochDeviceSupport {
         // pai->time.secPastEpoch`. An epoch (uninitialized) stamp yields
         // `secPastEpoch == 0`, so `val == 0.0` — no separate sentinel is
         // needed for the ai path.
-        let ts = get_time_stamp(self.tse, self.time);
+        // C `recGblGetTimeStamp` leaves `prec->time` alone when
+        // `epicsTimeGetEvent` fails, and the record-level owner
+        // (`apply_timestamp`) emits the errlog this cycle.
+        let ts = get_time_stamp(self.tse, self.time).unwrap_or(self.time);
         let (sec_past_epoch, nsec) = epics_time_parts(ts);
 
         // C `devTimeOfDay.c:148` `aiReadTs`: `if (pai->phas)` adds the

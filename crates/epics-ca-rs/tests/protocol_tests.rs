@@ -854,7 +854,7 @@ async fn server_database_accessor() {
     assert!(!db.has_name("NONEXISTENT").await);
 }
 
-/// C `tcp_echo_action` (`rsrv/camessage.c:403-420`) echoes the full
+/// C `tcp_echo_action` (`rsrv/camessage.c:410-425`) echoes the full
 /// request header AND payload back to the client. The previous Rust
 /// behaviour replied with an all-zero CA_PROTO_ECHO header, dropping
 /// the request fields and any payload. Real clients (libca
@@ -967,11 +967,11 @@ async fn server_echo_round_trips_request_header_and_payload() {
     );
 }
 
-/// C `event_cancel_reply` (`rsrv/camessage.c:1992-1996`)
+/// C `event_cancel_reply` (`rsrv/camessage.c:2046-2050`)
 /// calls `MPTOPCIU(mp)` first. If the request's channel id is
 /// unknown or belongs to another client, rsrv calls `logBadId` —
 /// which sends `send_err(ECA_INTERNAL, "Bad Resource ID")` with the
-/// cid=0xFFFFFFFF sentinel (`camessage.c:307-320`), flushed by
+/// cid=0xFFFFFFFF sentinel (`camessage.c:312-325`), flushed by
 /// `camsgtask.c:142` before the disconnect — and returns RSRV_ERROR.
 /// Only after a valid channel resolves does rsrv walk that channel's
 /// event queue and emit ECA_BADMONID for an unknown monitor id.
@@ -1095,11 +1095,11 @@ async fn server_event_cancel_unknown_sid_replies_eca_internal_and_disconnects() 
     );
 }
 
-/// C `bad_tcp_cmd_action` (`rsrv/camessage.c:337-352`) on an unknown
+/// C `bad_tcp_cmd_action` (`rsrv/camessage.c:342-357`) on an unknown
 /// TCP command: (1) emit `CA_PROTO_ERROR` with `ECA_INTERNAL` and the
 /// channel-cid 0xFFFFFFFF sentinel (per `vsend_err` non-channel-scoped
 /// convention), then (2) return `RSRV_ERROR` so the dispatcher
-/// (`camessage.c:2519-2524`) breaks out of the message loop, which
+/// (`camessage`, `camessage.c:2589-2592`) breaks out of the message loop, which
 /// tears down the connection. The C source comment is explicit:
 /// "by default, clients don't recover from this".
 ///
@@ -1276,7 +1276,7 @@ async fn server_tcp_version_below_minimum_drops_connection() {
     );
 }
 
-/// C `write_notify_action` (`rsrv/camessage.c:1647-1651`) emits a
+/// C `write_notify_action` (`rsrv/camessage.c:1678-1682`) emits a
 /// CA_PROTO_WRITE_NOTIFY error reply (`putNotifyErrorReply` with
 /// `m_cid = ECA_BADTYPE`) when the WRITE_NOTIFY data type exceeds
 /// `LAST_BUFFER_TYPE` (= DBR_CLASS_NAME = 38), then returns
@@ -2180,7 +2180,7 @@ async fn server_read_notify_bad_type_closes_silently() {
     );
 }
 
-/// C `read_sync_reply` (`rsrv/camessage.c:2053-2067`) echoes the
+/// C `read_sync_reply` (`rsrv/camessage.c:2107-2121`) echoes the
 /// request header back with cmmd=CA_PROTO_READ_SYNC, m_postsize=0,
 /// and the request's m_dataType / m_count / m_cid / m_available
 /// preserved. libca client treats this as ECHO (`cac.cpp:72-73`).

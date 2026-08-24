@@ -154,6 +154,17 @@ fn stringout_monitor_gate_only_on_change() {
 // End to end: what a `camonitor` subscriber actually receives.
 // ---------------------------------------------------------------------------
 
+/// Number of VAL events a `camonitor`-like subscriber RECEIVES across six
+/// scan cycles.
+///
+/// The reader is drained after every cycle because that is what the oracle
+/// transcript above is: a live `camonitor` whose event task delivers each post
+/// before the next scan. It matters for a string field — `dbChannelFieldSize`
+/// 40 exceeds `sizeof(union native_value)` 8, so C queues a stringin monitor
+/// BY REFERENCE and an undrained one holds a single entry however many posts
+/// arrive (`dbEvent.c:492-500`, `:786-799`). Counting an undrained queue would
+/// measure the queue's early-drop, not the record's posting, which is what
+/// these two cases are about.
 async fn cycles_posted(mpst: i16, name: &str) -> usize {
     let db = PvDatabase::new();
     let mut rec = StringinRecord::new("hello");
@@ -168,16 +179,15 @@ async fn cycles_posted(mpst: i16, name: &str) -> usize {
     };
 
     // Six scan cycles with VAL never written — the oracle's 6 s window.
+    let mut events = 0;
     for _ in 0..6 {
         let mut visited = std::collections::HashSet::new();
         db.process_record_with_links(name, &mut visited, 0)
             .await
             .unwrap();
-    }
-
-    let mut events = 0;
-    while rx.try_recv().is_ok() {
-        events += 1;
+        while rx.try_recv().is_ok() {
+            events += 1;
+        }
     }
     events
 }

@@ -1,7 +1,43 @@
+//! File-writing plugin base: file-name construction, the capture buffer, and
+//! the flush that drains it.
+//!
+//! Two deliberate deviations from C++ `NDPluginFile` / `asynNDArrayDriver`
+//! live here, and they are one decision taken twice.
+//!
+//! C frees the capture buffer unconditionally once a flush ends, at
+//! `NDPluginFile.cpp:325` (`freeCaptureBuffer()`), so a flush that fails on
+//! one frame discards every frame including the ones never written, and a
+//! second `WriteFile` finds an empty buffer and reports "no capture buffer
+//! present". [`NDPluginFileBase::flush_capture`] instead keeps exactly the
+//! frames that have not reached disk, so the operator can free the disk and
+//! resume where the flush stopped.
+//!
+//! C burns the file number when it builds the name, before the write is
+//! attempted, and never rolls it back: `asynNDArrayDriver::createFileName`
+//! increments `NDFileNumber` at `asynNDArrayDriver.cpp:216-219`, and again in
+//! the by-parts variant at `asynNDArrayDriver.cpp:256-259`, while
+//! `openFileBase` calls it at `NDPluginFile.cpp:43` ahead of `openFile` — once
+//! per frame in the single-image capture loop (`NDPluginFile.cpp:288-292`).
+//! So under C the number advances once per ATTEMPT. Here it advances once per
+//! completed file: the increment sits after the write and the rename in both
+//! branches of `flush_capture`.
+//!
+//! Increment-per-attempt is coherent in C only because C never retries. Laid
+//! over a resumable buffer it would put the partial file of a failed frame at
+//! N and its retry at N+1, so a three-frame capture that failed once would
+//! leave four files, two of them the same frame, with a hole in the numbering
+//! — the shape the resumable drain exists to make unconstructible.
+//! Increment-per-success keeps one frame to one file with consecutive
+//! numbers whether or not the flush was retried, at the cost that
+//! `NDFileNumber_RBV` advances more slowly than C's after a failure and that
+//! a retry overwrites the partial file rather than leaving it beside the good
+//! one. Tier 3, correctness over byte parity.
+
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use crate::error::ADResult;
+use crate::error::{ADError, ADResult};
+use crate::finalize::Finalize;
 use crate::ndarray::NDArray;
 
 /// File write modes matching C++ NDFileMode_t.
@@ -36,6 +72,45 @@ pub trait NDFileWriter: Send + Sync {
     /// the capture target (e.g. HDF5 chunk sizing, C `calculateAttributeChunking`)
     /// uses it; the default ignores it.
     fn set_num_capture(&mut self, _n: usize) {}
+    /// Whether [`write_file`](NDFileWriter::write_file) has put the frame on
+    /// disk by the time it returns.
+    ///
+    /// A writer that answers `false` only materialises the file in
+    /// `close_file`; see [`NDPluginFileBase::open_stream`] for what that rules
+    /// out. The default is `true`.
+    fn writes_incrementally(&self) -> bool {
+        true
+    }
+}
+
+/// Open `path`, run `body` against the open writer, and close — exactly once,
+/// on every exit path out of `body`.
+///
+/// The close is the finalizer, so a failing `write_file` or `read_file` cannot
+/// leave the writer holding an open file (for HDF5 an H5 file id, plus a stale
+/// `current_path`). Every [`NDFileWriter::close_file`] is a no-op when nothing
+/// is open, so an `open_file` that itself fails is safe to close as well, and
+/// the guard can cover the open too rather than starting just after it.
+///
+/// The close error is reported only when `body` succeeded: when the body
+/// failed, its error is the one worth returning.
+pub(crate) fn with_open_file<W: NDFileWriter + ?Sized, R>(
+    writer: &mut W,
+    path: &Path,
+    mode: NDFileMode,
+    layout: &NDArray,
+    body: impl FnOnce(&mut W) -> ADResult<R>,
+) -> ADResult<R> {
+    let mut open = Finalize::new(writer, |w: &mut W| {
+        let _ = w.close_file();
+    });
+    let value = open.run(|w| {
+        w.open_file(path, mode, layout)?;
+        body(w)
+    })?;
+    let closed = open.run(|w| w.close_file());
+    open.disarm();
+    closed.map(|()| value)
 }
 
 /// File path/name management and capture buffering for file plugins.
@@ -267,9 +342,9 @@ impl NDPluginFileBase {
             NDFileMode::Single => {
                 self.last_written_name = self.create_file_name();
                 let (write_path, final_path) = self.write_path();
-                writer.open_file(&write_path, NDFileMode::Single, &array)?;
-                writer.write_file(&array)?;
-                writer.close_file()?;
+                with_open_file(writer, &write_path, NDFileMode::Single, &array, |w| {
+                    w.write_file(&array)
+                })?;
                 if let Some(final_path) = final_path {
                     Self::rename_temp(&write_path, &final_path)?;
                 }
@@ -287,18 +362,7 @@ impl NDPluginFileBase {
                 }
             }
             NDFileMode::Stream => {
-                if !self.is_open && !self.lazy_open {
-                    self.last_written_name = self.create_file_name();
-                    let (write_path, _) = self.write_path();
-                    writer.open_file(&write_path, NDFileMode::Stream, &array)?;
-                    self.is_open = true;
-                }
-                if self.lazy_open && !self.is_open {
-                    self.last_written_name = self.create_file_name();
-                    let (write_path, _) = self.write_path();
-                    writer.open_file(&write_path, NDFileMode::Stream, &array)?;
-                    self.is_open = true;
-                }
+                self.open_stream(writer, &array)?;
                 writer.write_file(&array)?;
                 self.maybe_delete_driver_file(&array);
                 self.num_captured += 1;
@@ -313,6 +377,13 @@ impl NDPluginFileBase {
     /// write all frames, and close once.
     /// For single-image writers (JPEG, TIFF), we open/write/close for each
     /// frame individually, auto-incrementing the filename between each.
+    ///
+    /// `capture_buffer` means one thing throughout: the frames that have not
+    /// reached disk. A frame leaves it only once its own file is complete, so
+    /// a flush that fails part way keeps exactly the frames still owed and a
+    /// second `WriteFile` resumes at the first of them instead of starting
+    /// over on files that are already written under numbers `file_number` has
+    /// moved past.
     pub fn flush_capture(&mut self, writer: &mut dyn NDFileWriter) -> ADResult<()> {
         if self.capture_buffer.is_empty() {
             return Ok(());
@@ -320,64 +391,89 @@ impl NDPluginFileBase {
         writer.set_num_capture(self.num_capture);
 
         if writer.supports_multiple_arrays() {
-            // Multi-array format: open once, write all, close once.
+            // Multi-array format: open once, write all, close once. The frames
+            // share one file, so they land together or not at all.
             self.last_written_name = self.create_file_name();
             let (write_path, final_path) = self.write_path();
-            writer.open_file(&write_path, NDFileMode::Capture, &self.capture_buffer[0])?;
-            for arr in &self.capture_buffer {
-                writer.write_file(arr)?;
-            }
-            writer.close_file()?;
+            let buffer = &self.capture_buffer;
+            with_open_file(writer, &write_path, NDFileMode::Capture, &buffer[0], |w| {
+                for arr in buffer {
+                    w.write_file(arr)?;
+                }
+                Ok(())
+            })?;
             if let Some(final_path) = final_path {
                 Self::rename_temp(&write_path, &final_path)?;
             }
+            let landed = self.take_landed(self.capture_buffer.len());
             // C++ deletes the driver file per frame in Capture mode too.
-            let buffer = std::mem::take(&mut self.capture_buffer);
-            for arr in &buffer {
+            for arr in &landed {
                 self.maybe_delete_driver_file(arr);
             }
-            self.capture_buffer = buffer;
             if self.auto_increment {
                 self.file_number += 1;
             }
         } else {
-            // Single-image format: open/write/close per frame with auto-increment.
-            let buffer = std::mem::take(&mut self.capture_buffer);
-            for arr in &buffer {
+            // Single-image format: open/write/close per frame with
+            // auto-increment. The head of the buffer is the resume point: it
+            // is dropped once its file is complete, so the `?` below leaves
+            // the failing frame and everything behind it queued.
+            while !self.capture_buffer.is_empty() {
+                let arr = Arc::clone(&self.capture_buffer[0]);
                 self.last_written_name = self.create_file_name();
                 let (write_path, final_path) = self.write_path();
-                writer.open_file(&write_path, NDFileMode::Single, arr)?;
-                writer.write_file(arr)?;
-                writer.close_file()?;
+                with_open_file(writer, &write_path, NDFileMode::Single, &arr, |w| {
+                    w.write_file(&arr)
+                })?;
                 if let Some(final_path) = final_path {
                     Self::rename_temp(&write_path, &final_path)?;
                 }
-                self.maybe_delete_driver_file(arr);
+                self.take_landed(1);
+                self.maybe_delete_driver_file(&arr);
                 if self.auto_increment {
                     self.file_number += 1;
                 }
             }
-            self.capture_buffer = buffer;
         }
 
-        self.capture_buffer.clear();
-        self.num_captured = 0;
         Ok(())
     }
 
-    /// Eagerly open a stream file before the first frame arrives.
+    /// Drop the first `n` frames from the capture buffer — the only place a
+    /// frame leaves it, and the only place `num_captured` is set while frames
+    /// are queued, so the readback cannot claim frames the buffer no longer
+    /// holds or hide ones it still does.
+    fn take_landed(&mut self, n: usize) -> Vec<Arc<NDArray>> {
+        let landed: Vec<Arc<NDArray>> = self.capture_buffer.drain(..n).collect();
+        self.num_captured = self.capture_buffer.len();
+        landed
+    }
+
+    /// Open the Stream-mode file — the single owner of a stream open.
     ///
-    /// C++ `doCapture` opens the file at capture-start for non-lazy stream
-    /// plugins (NDPluginFile.cpp:478-479) so a bad path is reported then,
-    /// not on the first frame (B9). `array` supplies the layout the writer
-    /// needs at open time.
-    pub fn open_stream_eager(
-        &mut self,
-        writer: &mut dyn NDFileWriter,
-        array: &NDArray,
-    ) -> ADResult<()> {
+    /// The eager open at capture start (C++ `doCapture` opens the file then so
+    /// a bad path is reported at capture-start rather than on the first frame,
+    /// NDPluginFile.cpp:478-479, B9) and the lazy open on the first frame both
+    /// come through here, so Stream mode's precondition is stated once: every
+    /// frame the mode accepts is on disk when `process_array` returns, which is
+    /// what lets the controller publish `NDFileNumCaptured` per frame. A writer
+    /// that holds frames until `close_file` cannot keep that promise, and an
+    /// unbounded stream (`NumCapture=0`) never reaches a close, so the open is
+    /// refused here instead of growing in RAM behind a readback that reports
+    /// those frames as captured.
+    ///
+    /// `array` supplies the layout the writer needs at open time. A no-op when
+    /// a file is already open.
+    pub fn open_stream(&mut self, writer: &mut dyn NDFileWriter, array: &NDArray) -> ADResult<()> {
         if self.is_open {
             return Ok(());
+        }
+        if !writer.writes_incrementally() {
+            return Err(ADError::UnsupportedConversion(
+                "this file format writes the whole file when it is closed and \
+                 cannot stream; use FileWriteMode=Capture"
+                    .into(),
+            ));
         }
         writer.set_num_capture(self.num_capture);
         self.last_written_name = self.create_file_name();
@@ -397,21 +493,29 @@ impl NDPluginFileBase {
     }
 
     /// Close stream mode.
+    ///
+    /// This transition owns `is_open`: from the moment the close begins, the
+    /// guard clears the marker on every exit path, so a failing `close_file` or
+    /// temp rename ends the open state and reports the error instead of
+    /// latching the plugin open against a file it can no longer write.
     pub fn close_stream(&mut self, writer: &mut dyn NDFileWriter) -> ADResult<()> {
-        if self.is_open {
+        if !self.is_open {
+            return Ok(());
+        }
+        let mut closing = Finalize::new(self, |base: &mut Self| base.is_open = false);
+        closing.run(|base| {
             writer.close_file()?;
             // Rename temp to final if temp_suffix was set
-            if !self.temp_suffix.is_empty() {
-                let final_name = self.create_file_name();
-                let temp_name = format!("{}{}", final_name, self.temp_suffix);
+            if !base.temp_suffix.is_empty() {
+                let final_name = base.create_file_name();
+                let temp_name = format!("{}{}", final_name, base.temp_suffix);
                 Self::rename_temp(Path::new(&temp_name), Path::new(&final_name))?;
             }
-            self.is_open = false;
-            if self.auto_increment {
-                self.file_number += 1;
+            if base.auto_increment {
+                base.file_number += 1;
             }
-        }
-        Ok(())
+            Ok(())
+        })
     }
 
     pub fn is_open(&self) -> bool {
@@ -460,6 +564,13 @@ mod tests {
         writes: usize,
         closes: usize,
         multi: bool,
+        /// Make `close_file` fail, standing in for the ENOSPC / read-only-mount
+        /// close that leaves a real writer unable to finalise.
+        fail_close: bool,
+        /// Make `write_file` fail, standing in for the ENOSPC write.
+        fail_write: bool,
+        /// Whether `write_file` is durable, as netCDF's is not.
+        incremental: bool,
     }
 
     impl MockWriter {
@@ -469,6 +580,9 @@ mod tests {
                 writes: 0,
                 closes: 0,
                 multi,
+                fail_close: false,
+                fail_write: false,
+                incremental: true,
             }
         }
     }
@@ -479,6 +593,11 @@ mod tests {
             Ok(())
         }
         fn write_file(&mut self, _array: &NDArray) -> ADResult<()> {
+            if self.fail_write {
+                return Err(crate::error::ADError::UnsupportedConversion(
+                    "disk full".into(),
+                ));
+            }
             self.writes += 1;
             Ok(())
         }
@@ -489,10 +608,18 @@ mod tests {
         }
         fn close_file(&mut self) -> ADResult<()> {
             self.closes += 1;
+            if self.fail_close {
+                return Err(crate::error::ADError::UnsupportedConversion(
+                    "disk full".into(),
+                ));
+            }
             Ok(())
         }
         fn supports_multiple_arrays(&self) -> bool {
             self.multi
+        }
+        fn writes_incrementally(&self) -> bool {
+            self.incremental
         }
     }
 
@@ -744,5 +871,149 @@ mod tests {
         let fb = NDPluginFileBase::new();
         // With create_dir=0 and empty path, should be a no-op
         fb.ensure_directory().unwrap();
+    }
+
+    /// D6: a Single-mode write that fails must still close the file it opened,
+    /// or the writer keeps the handle (for HDF5 an H5 file id) until some later
+    /// open happens to displace it.
+    #[test]
+    fn single_write_closes_the_file_when_the_write_fails() {
+        let mut fb = NDPluginFileBase::new();
+        fb.file_path = "/tmp/".into();
+        fb.file_name = "adcore_single_fail_".into();
+        fb.set_mode(NDFileMode::Single);
+
+        let mut writer = MockWriter::new(false);
+        writer.fail_write = true;
+        assert!(fb.process_array(make_array(1), &mut writer).is_err());
+        assert_eq!(writer.opens.len(), 1);
+        assert_eq!(
+            writer.closes, 1,
+            "a failed write must still close the file it opened"
+        );
+    }
+
+    /// D6: the same open/close pairing inside `flush_capture`.
+    #[test]
+    fn flush_capture_closes_the_file_when_a_frame_write_fails() {
+        let (mut fb, mut writer) = partial_flush_fixture();
+        writer.fail_write = true;
+        assert!(fb.flush_capture(&mut writer).is_err());
+        assert_eq!(
+            writer.closes, 1,
+            "the file opened for the failing frame is still closed"
+        );
+    }
+
+    /// D6, the second resource the failing frame used to take with it: the
+    /// buffer was moved out of `self` and only put back below the `?`, so a
+    /// failed flush silently discarded every queued frame and the retry then
+    /// reported success having written nothing.
+    #[test]
+    fn flush_capture_keeps_the_buffer_when_a_frame_write_fails() {
+        let (mut fb, mut writer) = partial_flush_fixture();
+        writer.fail_write = true;
+        assert!(fb.flush_capture(&mut writer).is_err());
+
+        writer.fail_write = false;
+        fb.flush_capture(&mut writer).unwrap();
+        assert_eq!(
+            writer.writes, 2,
+            "both buffered frames survive the failed flush and are written on retry"
+        );
+    }
+
+    /// Two frames buffered for a single-image (open/write/close per frame)
+    /// writer, ready to flush.
+    fn partial_flush_fixture() -> (NDPluginFileBase, MockWriter) {
+        let mut fb = NDPluginFileBase::new();
+        fb.file_path = "/tmp/".into();
+        fb.file_name = "adcore_partial_".into();
+        fb.set_mode(NDFileMode::Capture);
+        fb.set_num_capture(2);
+        fb.capture_array(make_array(1));
+        fb.capture_array(make_array(2));
+        (fb, MockWriter::new(false))
+    }
+
+    /// D1: a stream close whose `close_file` fails must still leave the base
+    /// closed, so the plugin can open a new file once the disk is freed.
+    #[test]
+    fn close_stream_clears_is_open_when_close_file_fails() {
+        let mut fb = NDPluginFileBase::new();
+        fb.file_path = "/tmp/".into();
+        fb.file_name = "adcore_wedge_".into();
+        fb.set_mode(NDFileMode::Stream);
+
+        let mut writer = MockWriter::new(true);
+        fb.process_array(make_array(1), &mut writer).unwrap();
+        assert!(fb.is_open());
+
+        writer.fail_close = true;
+        assert!(
+            fb.close_stream(&mut writer).is_err(),
+            "the close failure is still reported"
+        );
+        assert!(
+            !fb.is_open(),
+            "a failed close must still end the open state"
+        );
+
+        writer.fail_close = false;
+        fb.process_array(make_array(2), &mut writer).unwrap();
+        assert_eq!(
+            writer.opens.len(),
+            2,
+            "the next frame opens a new stream file instead of appending to the stale handle"
+        );
+    }
+
+    /// D1, second exit path: the temp-to-final rename is the other `?` between
+    /// the close and the marker clear.
+    #[test]
+    fn close_stream_clears_is_open_when_temp_rename_fails() {
+        let mut fb = NDPluginFileBase::new();
+        // A directory that does not exist, so the rename fails with ENOENT.
+        fb.file_path = "/tmp/adcore-no-such-dir-for-close-stream/".into();
+        fb.file_name = "norename_".into();
+        fb.temp_suffix = ".tmp".into();
+        fb.set_mode(NDFileMode::Stream);
+
+        let mut writer = MockWriter::new(true);
+        fb.process_array(make_array(1), &mut writer).unwrap();
+        assert!(fb.is_open());
+
+        assert!(fb.close_stream(&mut writer).is_err());
+        assert!(
+            !fb.is_open(),
+            "a failed temp rename must still end the open state"
+        );
+    }
+
+    /// F4: Stream mode's contract is that a frame `process_array` accepts is on
+    /// disk when it returns — that is what `NDFileNumCaptured` reports. A
+    /// writer that only materialises the file in `close_file` cannot keep it,
+    /// and an unbounded stream never reaches a close, so the open is refused
+    /// rather than accumulating the whole stream in RAM.
+    #[test]
+    fn stream_open_is_refused_for_a_writer_that_writes_only_on_close() {
+        let mut fb = NDPluginFileBase::new();
+        fb.file_path = "/tmp/".into();
+        fb.file_name = "stream_".into();
+        fb.set_mode(NDFileMode::Stream);
+        fb.set_num_capture(0);
+
+        let mut writer = MockWriter::new(true);
+        writer.incremental = false;
+
+        assert!(fb.process_array(make_array(1), &mut writer).is_err());
+        assert!(writer.opens.is_empty(), "no file may be opened");
+        assert_eq!(writer.writes, 0, "no frame may be handed to the writer");
+        assert!(!fb.is_open());
+        assert_eq!(
+            fb.num_captured(),
+            0,
+            "NumCaptured must not count a frame that is not on disk"
+        );
     }
 }

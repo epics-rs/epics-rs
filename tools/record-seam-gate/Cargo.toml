@@ -1,0 +1,9 @@
+[package]
+name = "record-seam-gate"
+version = "0.0.0"
+edition = "2024"
+publish = false
+license = "EPICS"
+description = "Dev-only: the record-processing runtime-seam census, shared by every crate that hosts record or device support"
+
+[dependencies]

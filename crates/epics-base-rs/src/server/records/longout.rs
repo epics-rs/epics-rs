@@ -24,8 +24,10 @@ pub struct LongoutRecord {
     // record-local copy is a second, never-consulted owner, which is why a
     // `caput LO.HHSV INVALID` never fired the alarm. Omitting the fields
     // routes get/put through the common-field path (the single owner), as
-    // `ao`/`int64out` do. LALM (last-alarmed value) IS record state and stays.
-    pub lalm: f64,
+    // `ao`/`int64out` do. LALM (last-alarmed value) IS record state and stays,
+    // as C's `epicsInt32 lalm` (`longoutRecord.c:313`) — the type its `.dbd`
+    // declares and the type the ladder compares in.
+    pub lalm: i32,
     pub ivoa: i16,
     pub ivov: i32,
     // ADEL/MDEL are `DBF_LONG` (longoutRecord.dbd.pod) — integer archive and
@@ -61,9 +63,10 @@ pub struct LongoutRecord {
     /// writes VAL to the OUT link / device. Unknown values default to
     /// `false` (no output) matching C EPICS.
     pub oopt: i16,
-    /// Previous VAL — captured after every output cycle so OOPT=1/4/5
-    /// (transition modes) can detect changes. Initially zero; loops
-    /// after the first successful output.
+    /// Previous VAL — advanced at the end of every process cycle that reaches
+    /// C's `conditional_write`, whether or not that cycle wrote, so OOPT=1/4/5
+    /// (transition modes) can detect changes. Seeded from VAL by `init_record`
+    /// (C `longoutRecord.c:126`).
     pub pval: i32,
     /// Mirrors C `prec->outpvt` (longoutRecord.c).
     ///
@@ -72,8 +75,9 @@ pub struct LongoutRecord {
     /// * `false` — On_Change uses the normal comparison.
     ///
     /// Set true at construction (= C `init_record`'s
-    /// `outpvt = EXEC_OUTPUT`), cleared after every successful
-    /// output (`on_output_complete`). The OUT-change re-trigger
+    /// `outpvt = EXEC_OUTPUT`), cleared by
+    /// [`Record::after_output_decision`] at the end of every cycle that
+    /// reaches C's `conditional_write`. The OUT-change re-trigger
     /// (PR #6c573b4 part 2) is wired through
     /// [`Record::special("OUT", true)`] — `RecordInstance::put_common_field`
     /// fires it after `common.out` is updated, so OUT is owned by
@@ -84,6 +88,13 @@ pub struct LongoutRecord {
     /// process cycle to write the current VAL regardless of OOPT
     /// (epics-base PR #6c573b4 part 2, `longoutRecord.c:223`).
     pub ooch: i16,
+    /// Suppresses THIS cycle's `convert()` — C `int64outRecord.c:146` /
+    /// `longoutRecord.c:155` `if (!status) convert(prec, value)`, whose convert
+    /// is the DRVH/DRVL clamp. Set by
+    /// [`Record::closed_loop_dol_read_failed`] and cleared by `process()`, so a
+    /// dead closed-loop DOL leaves VAL exactly as the last successful cycle (or
+    /// a client put) left it instead of re-clamping it into the drive window.
+    pub skip_convert: bool,
 }
 
 impl Default for LongoutRecord {
@@ -95,7 +106,7 @@ impl Default for LongoutRecord {
             lopr: 0,
             drvh: 0, // C defaults both to 0 (equal = no clamping)
             drvl: 0,
-            lalm: 0.0,
+            lalm: 0,
             ivoa: 0,
             ivov: 0,
             adel: 0,
@@ -119,6 +130,7 @@ impl Default for LongoutRecord {
             // ignores OOCH), where YES forces the first write after an OUT
             // re-point.
             ooch: 1,
+            skip_convert: false,
         }
     }
 }
@@ -173,6 +185,12 @@ impl Record for LongoutRecord {
         "longout"
     }
 
+    /// C `longoutRecord.c:147-158`: the scalar `dbGetLink(&prec->dol, ..., &prec->val, 0, 0)`
+    /// under `dol.type != CONSTANT && omsl == menuOmslclosed_loop`.
+    fn fetches_dol_closed_loop(&self) -> bool {
+        true
+    }
+
     /// C `longoutRecord.c:145-153`: `process()` clears `udf` to FALSE only on a
     /// successful closed-loop DOL fetch (`if (!dbLinkIsConstant(&prec->dol) &&
     /// !status) prec->udf=FALSE;`); the no-DOL arm reads the current VAL and
@@ -203,11 +221,30 @@ impl Record for LongoutRecord {
     /// when `DRVH > DRVL` (equal limits = no clamping). Without this an
     /// operator or DOL link writing outside the window propagates the
     /// unclamped value to the OUT link / device.
+    /// C `longoutRecord.c:126` — `init_record` seeds PVAL from the loaded VAL,
+    /// alongside the MLST/ALST/LALM seed [`Record::seed_deadband_tracking`]
+    /// owns. Without it a `field(VAL,"5")` longout starts with `pval = 0`, so
+    /// the first `caput LO 0` is not a transition to C but is to the port.
+    fn init_record(&mut self, pass: u8) -> CaResult<()> {
+        if pass == 0 {
+            self.pval = self.val;
+        }
+        Ok(())
+    }
+
     fn process(&mut self) -> CaResult<ProcessOutcome> {
-        if self.drvh > self.drvl {
+        if !self.skip_convert && self.drvh > self.drvl {
             self.val = self.val.clamp(self.drvl, self.drvh);
         }
+        self.skip_convert = false;
         Ok(ProcessOutcome::complete())
+    }
+
+    /// C `longoutRecord.c:155` — `if (!status) convert(prec, value)`: a failed
+    /// closed-loop DOL read skips the convert, so the DRVH/DRVL clamp does not
+    /// run and VAL keeps whatever it held.
+    fn closed_loop_dol_read_failed(&mut self) {
+        self.skip_convert = true;
     }
 
     /// `DBF_MENU` fields, served as `DBR_ENUM` with the menu's choice labels
@@ -235,7 +272,7 @@ impl Record for LongoutRecord {
             "DRVL" => Some(EpicsValue::Long(self.drvl)),
             // HIHI/HIGH/LOW/LOLO/HHSV/HSV/LSV/LLSV/HYST fall through to the
             // common-field path (their single owner) — see the struct comment.
-            "LALM" => Some(EpicsValue::Double(self.lalm)),
+            "LALM" => Some(EpicsValue::Long(self.lalm)),
             "IVOA" => Some(EpicsValue::Short(self.ivoa)),
             "IVOV" => Some(EpicsValue::Long(self.ivov)),
             "ADEL" => Some(EpicsValue::Long(self.adel)),
@@ -293,7 +330,7 @@ impl Record for LongoutRecord {
             // they hit the `_ =>` arm below and fall through to
             // `put_common_field`, the single owner of the analog-alarm ladder.
             "LALM" => {
-                if let EpicsValue::Double(v) = value {
+                if let EpicsValue::Long(v) = value {
                     self.lalm = v;
                 }
             }
@@ -370,10 +407,13 @@ impl Record for LongoutRecord {
             "PVAL" => {
                 // PVAL (DBF_LONG, "Previous Value", longoutRecord.dbd.pod:438-440)
                 // carries no `special()`/`pp()`, so C `dbPut` stores it verbatim —
-                // `caput LO.PVAL 5` succeeds. It is TRANSIENT: a successful output
-                // latches `pval = val` (`on_output_complete`, C
-                // longoutRecord.c:105 `prec->pval = prec->val`), so the stored
-                // value stands only until the next output cycle. Mirrors VAL's
+                // `caput LO.PVAL 5` succeeds. It is TRANSIENT: C seeds it from VAL
+                // at `longoutRecord.c:126` and re-latches it at `:492`, outside
+                // `if (doDevSupWrite)`, so the stored value stands only until the
+                // next process cycle — not the next cycle that WRITES. (This
+                // comment used to cite `:105`, which is
+                // `recGblRecordError(S_dev_noDSET, ...)`, and the write-gated
+                // reading it asserted is what the port implemented.) Mirrors VAL's
                 // DBF_LONG arm above. The port previously refused it as read-only.
                 if let EpicsValue::Long(v) = value {
                     self.pval = v;
@@ -400,11 +440,11 @@ impl Record for LongoutRecord {
         self.compute_should_output()
     }
 
-    /// Latch PVAL after a successful output so OOPT=1/4/5 transition
-    /// detection on the next cycle has the right reference point.
-    /// Also marks `first_output_done` so subsequent cycles apply the
-    /// real OOPT comparison rather than the first-cycle force-emit.
-    fn on_output_complete(&mut self) {
+    /// C `conditional_write`'s epilogue (longoutRecord.c:492-493), which sits
+    /// OUTSIDE `if (doDevSupWrite)` — see [`Record::after_output_decision`].
+    /// A transition mode can only ever fire because the earlier cycle, the one
+    /// that wrote nothing, still advanced PVAL.
+    fn after_output_decision(&mut self) {
         self.pval = self.val;
         self.first_output_done = true;
     }
@@ -446,11 +486,11 @@ mod tests {
         let mut r = LongoutRecord::new(5);
         assert_eq!(r.mlst, 0.0, "precondition: tracker is the 0.0 default");
         assert_eq!(r.alst, 0.0);
-        assert_eq!(r.lalm, 0.0);
+        assert_eq!(r.lalm, 0);
         r.seed_deadband_tracking();
         assert_eq!(r.mlst, 5.0, "mlst seeded from val");
         assert_eq!(r.alst, 5.0, "alst seeded from val");
-        assert_eq!(r.lalm, 5.0, "lalm seeded from val");
+        assert_eq!(r.lalm, 5, "lalm seeded from val");
         // First process leaves val unchanged: DELTA(mlst=5, val=5)=0 is not
         // > mdel(0), so no DBE_VALUE/DBE_LOG post — matching C.
         assert!((5.0_f64 - r.mlst).abs() <= 0.0);
@@ -485,25 +525,38 @@ mod tests {
         assert!(r.compute_should_output());
     }
 
+    /// The transition modes driven the way the framework drives them: VAL
+    /// moves, `should_output()` decides, `after_output_decision()` closes the
+    /// cycle. Assigning `pval` by hand — as this test used to — asserts the
+    /// comparison and nothing about what feeds it, which is why it passed while
+    /// the modes never fired: the suppressed cycles never latched.
+    fn cycle(r: &mut LongoutRecord, val: i32) -> bool {
+        r.val = val;
+        let fired = r.compute_should_output();
+        r.after_output_decision();
+        fired
+    }
+
     #[test]
-    fn oopt_transitions() {
+    fn oopt_transition_to_zero_fires_after_a_cycle_that_wrote_nothing() {
         let mut r = LongoutRecord::new(0);
         r.first_output_done = true;
         r.oopt = 4; // Transition to Zero
-        r.pval = 5;
-        r.val = 0;
-        assert!(r.compute_should_output(), "nonzero→zero transition fires");
-        r.pval = 0;
-        r.val = 0;
-        assert!(!r.compute_should_output(), "zero→zero suppressed");
 
+        assert!(!cycle(&mut r, 5), "5 is not a transition to zero");
+        assert!(cycle(&mut r, 0), "5 → 0 fires");
+        assert!(!cycle(&mut r, 0), "0 → 0 is not a transition");
+    }
+
+    #[test]
+    fn oopt_transition_to_non_zero_fires_after_a_cycle_that_wrote_nothing() {
+        let mut r = LongoutRecord::new(0);
+        r.first_output_done = true;
         r.oopt = 5; // Transition to Non-zero
-        r.pval = 0;
-        r.val = 5;
-        assert!(r.compute_should_output(), "zero→nonzero transition fires");
-        r.pval = 5;
-        r.val = 5;
-        assert!(!r.compute_should_output(), "nonzero→nonzero suppressed");
+
+        assert!(!cycle(&mut r, 0), "0 is not a transition to non-zero");
+        assert!(cycle(&mut r, 5), "0 → 5 fires");
+        assert!(!cycle(&mut r, 7), "5 → 7 is not a transition");
     }
 
     #[test]
@@ -529,9 +582,8 @@ mod tests {
             r.compute_should_output(),
             "first cycle must force output regardless of OOPT comparison"
         );
-        // Simulate the framework calling on_output_complete after
-        // the device write succeeds.
-        r.on_output_complete();
+        // The framework's end-of-cycle latch.
+        r.after_output_decision();
         assert!(r.first_output_done);
         // Next cycle with val still equal to pval honours OOPT=1.
         assert!(

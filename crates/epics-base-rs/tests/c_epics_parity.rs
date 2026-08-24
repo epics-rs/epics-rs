@@ -162,10 +162,10 @@ fn ai_alarm_thresholds() {
 
     // Configure alarm limits
     inst.common.analog_alarm = Some(epics_base_rs::server::record::AnalogAlarmConfig {
-        hihi: 90.0,
-        high: 70.0,
-        low: 30.0,
-        lolo: 10.0,
+        hihi: epics_base_rs::server::record::AlarmLimit::Double(90.0),
+        high: epics_base_rs::server::record::AlarmLimit::Double(70.0),
+        low: epics_base_rs::server::record::AlarmLimit::Double(30.0),
+        lolo: epics_base_rs::server::record::AlarmLimit::Double(10.0),
         hhsv: AlarmSeverity::Major as i16,
         hsv: AlarmSeverity::Minor as i16,
         lsv: AlarmSeverity::Minor as i16,
@@ -1868,9 +1868,17 @@ async fn flnk_loop_does_not_infinite_loop() {
         .process_record_with_links("loop_a", &mut visited, 0)
         .await;
     assert!(result.is_ok(), "Circular FLNK should not cause error");
-    // Visited set should contain both records
-    assert!(visited.contains("loop_a"));
-    assert!(visited.contains("loop_b"));
+    // The marker's lifetime is the recursion frame, not the cascade, so a
+    // finished chain leaves nothing behind — C clears `procThread` on unwind
+    // (`dbDbLink.c:521-526`) and restores `psrc->pact` (`:512`). What breaks
+    // the loop is that `loop_a` is still ON THE STACK when its own FLNK comes
+    // back round; `visited` after the call says nothing about that either way.
+    // The bounded-ness itself is pinned by
+    // `tests/process_frame_marker_is_stack_scoped.rs`.
+    assert!(
+        visited.is_empty(),
+        "a finished chain unwinds its markers: {visited:?}"
+    );
 }
 
 /// C EPICS: Chain 4/5 — RPRO reprocessing prevention
@@ -2080,10 +2088,24 @@ fn process_chain_depth_limit() {
             .await;
         assert!(result.is_ok(), "Long FLNK chain should not fail");
 
-        // All records should have been visited
+        // The chain walked as far as the bound and stopped there audibly.
+        // Reading `visited` after the call cannot show this any more — the
+        // markers unwind with their frames — so read the refusal off the
+        // record that hit the bound, which is what an operator sees.
+        let refused = db
+            .get_record("chain16")
+            .expect("chain16 exists")
+            .read()
+            .common
+            .amsg
+            .clone();
         assert!(
-            visited.len() >= 2,
-            "At least some records in chain should be visited"
+            refused.contains("link chain depth limit"),
+            "the record at MAX_LINK_DEPTH must carry the reason, got {refused:?}"
+        );
+        assert!(
+            visited.is_empty(),
+            "a finished chain unwinds its markers: {visited:?}"
         );
     });
 }

@@ -120,6 +120,7 @@ use std::time::Duration;
 
 use crate::allowlist::{Allowlist, MatchContext};
 use crate::catool::ToolError;
+use crate::dbd::DbfType;
 use crate::diff::Verdict;
 use crate::ioc::{Ioc, PvaPair, PvxTools, Side};
 use crate::ntshape::{NT_ENUM, NtShape};
@@ -557,6 +558,9 @@ impl MonReport {
 pub struct CaseRef {
     pub record_type: String,
     pub pv: String,
+    /// `VAL`'s declared `.dbd` type, carried so an allowlist row scoped by
+    /// destination type is enforced here exactly as on the CA path.
+    pub val_dbf: DbfType,
     pub drive: Drive,
     pub db: String,
 }
@@ -596,7 +600,14 @@ pub fn probe(
             );
         }
         eprintln!("[{}/{}] pva monitor: {rt}", i + 1, record_types.len());
-        cases.extend(probe_type(tools, workdir, rt, allowlist));
+        // `Drivable` was just proven, so VAL exists in the surface.
+        let val_dbf = surface
+            .fields_of(rt)
+            .find(|f| f.field.name == "VAL")
+            .expect("val_status returned Drivable, so VAL is in the surface")
+            .field
+            .dbf;
+        cases.extend(probe_type(tools, workdir, rt, val_dbf, allowlist));
     }
     cases
 }
@@ -682,6 +693,7 @@ fn probe_type(
     tools: &PvxTools,
     workdir: &Path,
     record_type: &str,
+    val_dbf: DbfType,
     allowlist: &mut Allowlist,
 ) -> Vec<MonCase> {
     let drives = drives_for(record_type);
@@ -695,6 +707,7 @@ fn probe_type(
         .map(|d| CaseRef {
             record_type: record_type.to_string(),
             pv: d.pv(record_type),
+            val_dbf,
             drive: *d,
             db: db_text.clone(),
         })
@@ -943,6 +956,7 @@ pub fn adjudicate(
     let ctx = MatchContext {
         record_type: &cr.record_type,
         field: "VAL",
+        dbf: cr.val_dbf,
         class: None,
     };
     // Record what this case looked at before the agreed early-out, so a row that
@@ -1095,6 +1109,7 @@ mod tests {
         CaseRef {
             record_type: "ai".into(),
             pv: drive.pv("ai"),
+            val_dbf: DbfType::Double,
             drive,
             db: String::new(),
         }
@@ -1142,6 +1157,7 @@ mod tests {
         let cr = CaseRef {
             record_type: "transform".into(),
             pv: "ORACLE:MON:TRANSFORM".into(),
+            val_dbf: DbfType::Double,
             drive: Drive::Passive,
             db: String::new(),
         };

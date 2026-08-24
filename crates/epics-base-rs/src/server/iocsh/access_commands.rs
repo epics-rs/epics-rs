@@ -19,6 +19,7 @@
 use std::sync::Mutex;
 
 use super::registry::*;
+use super::vars::{VarAccess, VarDef};
 use crate::server::access_security::{
     AccessLevel, AccessSecurityConfig, as_check_client_ip, parse_acf, set_as_check_client_ip,
 };
@@ -74,7 +75,7 @@ pub(crate) fn reset_as_state_for_test() {
 
 /// Register the `as*` command family on `registry`.
 pub(crate) fn register(registry: &mut CommandRegistry) {
-    registry.register(cmd_as_check_client_ip());
+    super::vars::register_variable(as_check_client_ip_var());
     registry.register(cmd_as_set_filename());
     registry.register(cmd_as_set_substitutions());
     registry.register(cmd_as_init());
@@ -87,12 +88,10 @@ pub(crate) fn register(registry: &mut CommandRegistry) {
     registry.register(cmd_ascar());
 }
 
-/// `asCheckClientIP [0|1]` — read or set C's `asCheckClientIP` global.
-///
-/// C registers it as an iocsh *variable* (`libComRegister.c:476`), so a C
-/// startup script says `var asCheckClientIP 1`. This port has no iocsh
-/// variable mechanism, so the same knob is a command; with no argument it
-/// prints the current setting.
+/// C registers `asCheckClientIP` as an iocsh *variable*
+/// (`libComRegister.c:491-495`, `:535-537`), so a startup script says
+/// `var asCheckClientIP 1` and the shell prints nothing. It is not a
+/// command in C and is no longer one here.
 ///
 /// `0` (the default, and C's) — HAG members are host *names* and the CA
 /// server trusts the hostname the client claims over `CA_PROTO_HOST_NAME`.
@@ -100,40 +99,15 @@ pub(crate) fn register(registry: &mut CommandRegistry) {
 /// server uses the peer IP, ignoring the claimed name.
 ///
 /// Order matters exactly as in C: the HAG storage form is chosen when the
-/// ACF is parsed, so this must run **before** `asInit`.
-fn cmd_as_check_client_ip() -> CommandDef {
-    CommandDef::new(
-        "asCheckClientIP",
-        vec![ArgDesc {
-            name: "on",
-            arg_type: ArgType::Int,
-            optional: true,
-        }],
-        "asCheckClientIP [0|1] — 0 (default): match HAGs by client-claimed host name. \
-         1: resolve HAG hosts to IPs and match the peer IP. Set before asInit.",
-        |args: &[ArgValue], ctx: &CommandContext| {
-            match args.first() {
-                Some(ArgValue::Int(v)) => {
-                    set_as_check_client_ip(*v != 0);
-                    ctx.println(&format!(
-                        "asCheckClientIP = {} — HAG hosts are matched by {}. \
-                         Run asInit after this to (re)load the ACF in the matching form.",
-                        i64::from(as_check_client_ip()),
-                        if as_check_client_ip() {
-                            "peer IP"
-                        } else {
-                            "client-supplied host name"
-                        }
-                    ));
-                }
-                _ => ctx.println(&format!(
-                    "asCheckClientIP = {}",
-                    i64::from(as_check_client_ip())
-                )),
-            }
-            Ok(CommandOutcome::Continue)
+/// ACF is parsed, so this must be set **before** `asInit`.
+fn as_check_client_ip_var() -> VarDef {
+    VarDef {
+        name: "asCheckClientIP",
+        access: VarAccess::Int {
+            get: || i64::from(as_check_client_ip()),
+            set: |v| set_as_check_client_ip(v != 0),
         },
-    )
+    }
 }
 
 /// `asSetFilename <ascf>` — record the ACF path. No immediate effect;
@@ -455,32 +429,31 @@ fn cmd_astac() -> CommandDef {
             ArgDesc {
                 name: "recordname",
                 arg_type: ArgType::String,
-                optional: false,
+                optional: true,
             },
             ArgDesc {
                 name: "user",
                 arg_type: ArgType::String,
-                optional: false,
+                optional: true,
             },
             ArgDesc {
                 name: "host",
                 arg_type: ArgType::String,
-                optional: false,
+                optional: true,
             },
         ],
         "astac <record> <user> <host> — Show the access user:host would have on a PV.",
         |args: &[ArgValue], ctx: &CommandContext| {
-            let record = match &args[0] {
-                ArgValue::String(s) => s.clone(),
-                _ => return Err("astac: missing record name".into()),
-            };
-            let user = match &args[1] {
-                ArgValue::String(s) => s.clone(),
-                _ => return Err("astac: missing user".into()),
-            };
-            let host = match &args[2] {
-                ArgValue::String(s) => s.clone(),
-                _ => return Err("astac: missing host".into()),
+            // C `asDbLib.c:243-246`: any argument the shell did not
+            // supply is a usage line on stdout, not a shell error.
+            let (record, user, host) = match (&args[0], &args[1], &args[2]) {
+                (ArgValue::String(r), ArgValue::String(u), ArgValue::String(h)) => {
+                    (r.clone(), u.clone(), h.clone())
+                }
+                _ => {
+                    ctx.println("Usage: astac \"record name\", \"user\", \"host\"");
+                    return Ok(CommandOutcome::Continue);
+                }
             };
             // Resolve the record's ASG and ASL.
             let (asg, asl) = match ctx.db().get_record(&record) {

@@ -2,6 +2,7 @@ use std::path::{Path, PathBuf};
 
 use ad_core_rs::attributes::{NDAttrSource, NDAttrValue};
 use ad_core_rs::error::{ADError, ADResult};
+use ad_core_rs::finalize::Finalize;
 use ad_core_rs::ndarray::{NDArray, NDDataBuffer, NDDataType, NDDimension};
 use ad_core_rs::ndarray_pool::NDArrayPool;
 use ad_core_rs::plugin::file_base::{NDFileMode, NDFileWriter};
@@ -532,81 +533,90 @@ impl NDFileWriter for NetcdfWriter {
         Ok(())
     }
 
+    /// Close the open file — for netCDF this is where the whole file is
+    /// written, from the frames `write_file` buffered.
+    ///
+    /// The buffer belongs to the finalizer for the same reason `current_path`
+    /// is taken up front: every write below is fallible, and frames of a file
+    /// that will never exist must not stay resident until some later
+    /// `open_file` happens to clear them.
     fn close_file(&mut self) -> ADResult<()> {
-        let path = match self.current_path.take() {
-            Some(p) => p,
-            None => return Ok(()),
-        };
+        let mut closing = Finalize::new(self, |w: &mut Self| w.frames.clear());
+        closing.run(|w| {
+            let path = match w.current_path.take() {
+                Some(p) => p,
+                None => return Ok(()),
+            };
 
-        if self.frames.is_empty() {
-            return Ok(());
-        }
+            if w.frames.is_empty() {
+                return Ok(());
+            }
 
-        let map_write = |e: netcdf3::error::WriteError| {
-            ADError::UnsupportedConversion(format!("NetCDF write error: {:?}", e))
-        };
+            let map_write = |e: netcdf3::error::WriteError| {
+                ADError::UnsupportedConversion(format!("NetCDF write error: {:?}", e))
+            };
 
-        let first = &self.frames[0];
-        // C keys the numArrays dimension on the *open mode*, never on how many
-        // frames the file ended up holding (NDFileNetCDF.cpp:117-119).
-        let multi = self.open_multiple;
-        let (ds, attr_var_names) = define_data_set(first, self.frames.len(), multi)?;
+            let first = &w.frames[0];
+            // C keys the numArrays dimension on the *open mode*, never on how many
+            // frames the file ended up holding (NDFileNetCDF.cpp:117-119).
+            let multi = w.open_multiple;
+            let (ds, attr_var_names) = define_data_set(first, w.frames.len(), multi)?;
 
-        // Write
-        let mut writer = FileWriter::open(&path).map_err(map_write)?;
-        writer
-            .set_def(&ds, Version::Classic, 0)
-            .map_err(map_write)?;
+            // Write
+            let mut writer = FileWriter::open(&path).map_err(map_write)?;
+            writer
+                .set_def(&ds, Version::Classic, 0)
+                .map_err(map_write)?;
 
-        if multi {
-            for (i, frame) in self.frames.iter().enumerate() {
-                write_record_data(&mut writer, i, &frame.data)?;
+            if multi {
+                for (i, frame) in w.frames.iter().enumerate() {
+                    write_record_data(&mut writer, i, &frame.data)?;
+                    writer
+                        .write_record_i32("uniqueId", i, &[frame.unique_id])
+                        .map_err(map_write)?;
+                    writer
+                        .write_record_f64("timeStamp", i, &[frame.time_stamp])
+                        .map_err(map_write)?;
+                    writer
+                        .write_record_i32("epicsTSSec", i, &[frame.epics_ts_sec])
+                        .map_err(map_write)?;
+                    writer
+                        .write_record_i32("epicsTSNsec", i, &[frame.epics_ts_nsec])
+                        .map_err(map_write)?;
+                    // Per-attribute values: align to the first frame's attribute
+                    // order; missing attributes in later frames are skipped.
+                    for (attr, var_name) in first.attrs.iter().zip(&attr_var_names) {
+                        let value = frame
+                            .attrs
+                            .iter()
+                            .find(|a| a.name == attr.name)
+                            .map(|a| &a.value)
+                            .unwrap_or(&attr.value);
+                        write_attr_value(&mut writer, var_name, i, true, value)?;
+                    }
+                }
+            } else {
+                write_var_data(&mut writer, &w.frames[0].data)?;
                 writer
-                    .write_record_i32("uniqueId", i, &[frame.unique_id])
+                    .write_var_i32("uniqueId", &[first.unique_id])
                     .map_err(map_write)?;
                 writer
-                    .write_record_f64("timeStamp", i, &[frame.time_stamp])
+                    .write_var_f64("timeStamp", &[first.time_stamp])
                     .map_err(map_write)?;
                 writer
-                    .write_record_i32("epicsTSSec", i, &[frame.epics_ts_sec])
+                    .write_var_i32("epicsTSSec", &[first.epics_ts_sec])
                     .map_err(map_write)?;
                 writer
-                    .write_record_i32("epicsTSNsec", i, &[frame.epics_ts_nsec])
+                    .write_var_i32("epicsTSNsec", &[first.epics_ts_nsec])
                     .map_err(map_write)?;
-                // Per-attribute values: align to the first frame's attribute
-                // order; missing attributes in later frames are skipped.
                 for (attr, var_name) in first.attrs.iter().zip(&attr_var_names) {
-                    let value = frame
-                        .attrs
-                        .iter()
-                        .find(|a| a.name == attr.name)
-                        .map(|a| &a.value)
-                        .unwrap_or(&attr.value);
-                    write_attr_value(&mut writer, var_name, i, true, value)?;
+                    write_attr_value(&mut writer, var_name, 0, false, &attr.value)?;
                 }
             }
-        } else {
-            write_var_data(&mut writer, &self.frames[0].data)?;
-            writer
-                .write_var_i32("uniqueId", &[first.unique_id])
-                .map_err(map_write)?;
-            writer
-                .write_var_f64("timeStamp", &[first.time_stamp])
-                .map_err(map_write)?;
-            writer
-                .write_var_i32("epicsTSSec", &[first.epics_ts_sec])
-                .map_err(map_write)?;
-            writer
-                .write_var_i32("epicsTSNsec", &[first.epics_ts_nsec])
-                .map_err(map_write)?;
-            for (attr, var_name) in first.attrs.iter().zip(&attr_var_names) {
-                write_attr_value(&mut writer, var_name, 0, false, &attr.value)?;
-            }
-        }
 
-        writer.close().map_err(map_write)?;
-        self.frames.clear();
-        Ok(())
+            writer.close().map_err(map_write)?;
+            Ok(())
+        })
     }
 
     fn read_file(&mut self) -> ADResult<NDArray> {
@@ -697,6 +707,16 @@ impl NDFileWriter for NetcdfWriter {
     fn supports_multiple_arrays(&self) -> bool {
         true
     }
+
+    /// netCDF-3 keeps the record count in the header, and `netcdf3` 0.6 fixes
+    /// it when `FileWriter::set_def` writes that header: `set_def` may be
+    /// called once, `write_record_*` rejects any index past the count it
+    /// declared, and `FileWriter::open` truncates rather than appends. The
+    /// whole file therefore has to be written from `close_file`, so a frame is
+    /// not on disk when `write_file` returns.
+    fn writes_incrementally(&self) -> bool {
+        false
+    }
 }
 
 /// NetCDF file processor wrapping NDPluginFileBase + NetcdfWriter.
@@ -753,6 +773,7 @@ impl NDPluginProcess for NetcdfFileProcessor {
 mod tests {
     use super::*;
     use ad_core_rs::attributes::{NDAttrSource, NDAttrValue, NDAttribute};
+    use ad_core_rs::plugin::file_base::NDPluginFileBase;
     use std::sync::atomic::{AtomicU32, Ordering};
 
     static TEST_COUNTER: AtomicU32 = AtomicU32::new(0);
@@ -760,6 +781,36 @@ mod tests {
     fn temp_path(prefix: &str) -> PathBuf {
         let n = TEST_COUNTER.fetch_add(1, Ordering::Relaxed);
         std::env::temp_dir().join(format!("adcore_test_{}_{}.nc", prefix, n))
+    }
+
+    /// D2 sibling: `NetcdfWriter::close_file` is where the buffered frames are
+    /// written, and `frames.clear()` used to sit after all ten fallible writes.
+    /// A failed flush then held the frames resident until some later
+    /// `open_file` happened to clear them.
+    #[test]
+    fn close_file_clears_the_frame_buffer_when_the_write_fails() {
+        // A directory that does not exist, so `FileWriter::open` fails.
+        let path = std::env::temp_dir()
+            .join("adcore-no-such-dir-for-netcdf-close")
+            .join("frames.nc");
+        let mut writer = NetcdfWriter::new();
+
+        let arr = NDArray::new(
+            vec![NDDimension::new(4), NDDimension::new(4)],
+            NDDataType::UInt8,
+        );
+        writer.open_file(&path, NDFileMode::Single, &arr).unwrap();
+        writer.write_file(&arr).unwrap();
+        assert_eq!(writer.frames.len(), 1);
+
+        assert!(
+            writer.close_file().is_err(),
+            "the write into a missing directory must fail the close"
+        );
+        assert!(
+            writer.frames.is_empty(),
+            "a failed close must still drop the frames of the file that was never written"
+        );
     }
 
     #[test]
@@ -1543,5 +1594,25 @@ mod tests {
                 "Attr_Gain_SourceType",
             ]
         );
+    }
+
+    /// F4: with `FileWriteMode=Stream` and `NumCapture=0` the controller never
+    /// reaches a close, so every frame stayed in `frames` with nothing on disk
+    /// while `NumCaptured_RBV` counted it as captured. The stream open is
+    /// refused now that the writer reports it is not incremental.
+    #[test]
+    fn stream_mode_is_refused_rather_than_buffered_in_ram() {
+        let mut fb = NDPluginFileBase::new();
+        fb.file_path = "/tmp/".into();
+        fb.file_name = "nc_stream_".into();
+        fb.set_mode(NDFileMode::Stream);
+        fb.set_num_capture(0);
+
+        let mut writer = NetcdfWriter::new();
+        let array = std::sync::Arc::new(NDArray::new(vec![NDDimension::new(4)], NDDataType::UInt8));
+        assert!(fb.process_array(array, &mut writer).is_err());
+        assert!(writer.frames.is_empty(), "no frame may be buffered");
+        assert!(!fb.is_open());
+        assert_eq!(fb.num_captured(), 0);
     }
 }

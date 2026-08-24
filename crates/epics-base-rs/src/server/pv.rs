@@ -225,13 +225,18 @@ pub struct MonitorEvent {
     /// record completions, driver pollers) run outside any scope and stay
     /// origin 0.
     pub origin: u64,
-    /// The `DBE_*` event class(es) this post carries — C attaches the
-    /// posting mask to each event's field log (`db_field_log.mask`,
-    /// dbEvent.c) and pvxs narrows per event from `pDbFieldLog->mask`
-    /// (`groupsource.cpp:331-337`). Producer-side it was already used to
-    /// gate delivery (`Subscriber::accepts`); carrying it on the event
-    /// lets subscribers narrow what they decode (e.g. a QSRV group
-    /// monitor updating only alarm leaves on a `DBE_ALARM`-only event).
+    /// The `DBE_*` event class(es) this post carries FOR THIS SUBSCRIBER
+    /// — the poster's mask intersected with the subscriber's `select`,
+    /// never the poster's mask alone. C stamps exactly that on the field
+    /// log (`pLog->mask = caEventMask & pevent->select`,
+    /// `dbEvent.c:896-900`) and pvxs narrows per event from
+    /// `pDbFieldLog->mask` (`groupsource.cpp:331-337`). The intersection
+    /// is produced by `Subscriber::delivered_mask`, which is also the
+    /// delivery gate, so the two cannot drift apart. Carrying it on the
+    /// event lets subscribers narrow what they decode (e.g. a QSRV group
+    /// monitor updating only alarm leaves on a `DBE_ALARM`-only event)
+    /// and lets the `.{dbnd}`/`.{sync}`/`.{dec}` pre-chain filters see the
+    /// classes the client actually asked for.
     /// When events coalesce under a slow consumer, masks accumulate by
     /// OR — the surviving snapshot is the newest, the mask reports every
     /// class that changed since the last delivered event.
@@ -268,14 +273,27 @@ pub struct Subscriber {
 }
 
 impl Subscriber {
-    /// a monitor delivery is gated on the requested `DBE_*`
-    /// mask. Returns true only when the post's event class intersects
-    /// this subscriber's mask — the single rule C rsrv enforces with
-    /// `caEventMask & pevent->select` (`dbEvent.c:892-900`) and the
-    /// same intersection the record-field monitor path applies. An
-    /// empty post class (no specific class) delivers unconditionally.
-    fn accepts(&self, post: crate::server::recgbl::EventMask) -> bool {
-        post.is_empty() || crate::server::recgbl::EventMask::from_bits(self.mask).intersects(post)
+    /// The mask this subscriber's field log carries for `post`, or `None`
+    /// when the post is not for it.
+    ///
+    /// C `db_post_events` evaluates `caEventMask & pevent->select` TWICE
+    /// (`dbEvent.c:896-900`): once as the delivery gate, and again as the
+    /// mask stamped on the log the pre-chain filters then see
+    /// (`pLog->mask = caEventMask & pevent->select`). Returning the
+    /// narrowed mask rather than a bool is what keeps the two inseparable
+    /// — a caller cannot learn that it may deliver without also learning
+    /// what mask to deliver under, so the wide poster mask can no longer
+    /// leak past the gate into `dbnd`/`sync`/`dec`.
+    ///
+    /// An all-zero intersection means no delivery, which is also C: an
+    /// empty `caEventMask` ands to zero and the poster loop skips the
+    /// subscriber entirely.
+    pub(crate) fn delivered_mask(
+        &self,
+        post: crate::server::recgbl::EventMask,
+    ) -> Option<crate::server::recgbl::EventMask> {
+        let narrowed = post & crate::server::recgbl::EventMask::from_bits(self.mask);
+        (!narrowed.is_empty()).then_some(narrowed)
     }
 
     /// The single post path for both event sources (`ProcessVariable` value /
@@ -715,15 +733,15 @@ impl ProcessVariable {
             if !sub.active {
                 continue;
             }
-            // Skip subscribers whose requested class does not intersect
-            // this post's event class.
-            if !sub.accepts(post) {
+            // Gate and narrow in one step: `Subscriber::delivered_mask`
+            // owns C's twice-used `caEventMask & pevent->select`.
+            let Some(mask) = sub.delivered_mask(post) else {
                 continue;
-            }
+            };
             let event = MonitorEvent {
                 snapshot: Arc::clone(&snapshot),
                 origin,
-                mask: post,
+                mask,
             };
             // The channel-filter chain may suppress this event (e.g.
             // `dbnd` deadband not crossed); the event's mask tells value
@@ -1024,7 +1042,7 @@ impl Drop for PvSubscription {
         // lock, so remove the slot off-thread. No current runtime means no
         // live subscription to clean up.
         if tokio::runtime::Handle::try_current().is_ok() {
-            crate::runtime::task::spawn(async move {
+            crate::runtime::task::spawn_background(async move {
                 pv.remove_subscriber(sid);
             });
         }
@@ -1117,6 +1135,81 @@ mod mask_gate_tests {
         assert!(
             rx.try_recv().is_ok(),
             "DBE_VALUE subscriber must receive a value post"
+        );
+    }
+
+    /// C `db_post_events` stamps the field log with `caEventMask &
+    /// pevent->select` (`dbEvent.c:896-900`), not with the poster's mask.
+    /// `set_snapshot` posts `VALUE|LOG|ALARM` (the gateway-parity class set
+    /// at `notify_subscribers_from_snapshot`), so a `DBE_VALUE`-only
+    /// subscriber must see `DBE_VALUE` alone on the delivered event.
+    #[epics_macros_rs::epics_test]
+    async fn delivered_mask_is_narrowed_to_the_subscriber_select() {
+        use crate::server::recgbl::EventMask;
+        let pv = pv();
+        let mut rx = pv
+            .add_subscriber(1, DbFieldType::Double, DBE_VALUE)
+            .expect("subscriber added");
+        pv.set_snapshot(snapshot());
+        let ev = rx.try_recv().expect("value-class post delivered");
+        assert_eq!(
+            ev.mask,
+            EventMask::VALUE,
+            "delivered mask must be post & select, not the poster's full class set"
+        );
+
+        // The same narrowing on the other side: an ALARM-only subscriber
+        // hears the same post as DBE_ALARM alone.
+        let mut rx_alarm = pv
+            .add_subscriber(2, DbFieldType::Double, DBE_ALARM)
+            .expect("subscriber added");
+        pv.set_snapshot(snapshot());
+        let ev = rx_alarm.try_recv().expect("alarm-class post delivered");
+        assert_eq!(ev.mask, EventMask::ALARM, "narrowed for an ALARM-only sub");
+    }
+
+    /// The consequence the narrowing exists for: a `.{dbnd}` pre-chain
+    /// filter passes an event unconditionally when the log mask carries a
+    /// class other than `DBE_VALUE`/`DBE_LOG` (`dbnd.c:84`, `send =
+    /// pfl->mask & ~(DBE_VALUE|DBE_LOG)`). Handing it the poster's
+    /// `VALUE|LOG|ALARM` therefore let every sub-deadband update through on
+    /// the `DBE_ALARM` bit the client never subscribed to, silently
+    /// defeating the deadband.
+    #[epics_macros_rs::epics_test]
+    async fn dbnd_on_a_value_only_subscriber_is_not_bypassed_by_the_alarm_bit() {
+        use crate::server::database::filters::parser::parse_filter_chain;
+        let pv = pv();
+        let mut rx = pv
+            .add_subscriber(1, DbFieldType::Double, DBE_VALUE)
+            .expect("subscriber added");
+        pv.attach_filters_to_subscriber(1, parse_filter_chain(r#"{"dbnd":{"d":10}}"#));
+
+        // First event: `dbnd`'s baseline is NaN, so C's `delta > deadband`
+        // is INF > 10 and it always passes.
+        pv.set_snapshot(Snapshot::new(
+            EpicsValue::Double(0.0),
+            0,
+            0,
+            std::time::SystemTime::UNIX_EPOCH,
+        ));
+        assert!(
+            rx.try_recv().is_ok(),
+            "first event establishes the baseline"
+        );
+
+        // Second event moves 0 -> 6 with a MINOR alarm: inside the band, so
+        // C drops it. The alarm class is not in this subscriber's select and
+        // must not reach the filter.
+        pv.set_snapshot(Snapshot::new(
+            EpicsValue::Double(6.0),
+            7,
+            1,
+            std::time::SystemTime::UNIX_EPOCH,
+        ));
+        assert!(
+            rx.try_recv().is_err(),
+            "sub-deadband update must stay dropped; the poster's DBE_ALARM \
+             bit is not part of a DBE_VALUE-only subscription"
         );
     }
 

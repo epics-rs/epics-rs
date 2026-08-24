@@ -184,17 +184,18 @@ What C actually has is the global `asCheckClientIP`
   `CA_PROTO_HOST_NAME`, and resolves every `HAG` entry to an IP when the
   ACF is loaded. Use this when the network is not trusted.
 
-C sets it with an iocsh *variable* (`var asCheckClientIP 1`). This port
-has no iocsh variable mechanism, so the same knob is an iocsh **command**:
+C sets it with an iocsh *variable* (`var asCheckClientIP 1`), and so does
+this port:
 
 ```
-asCheckClientIP 1     # before asInit — the HAG storage form is chosen at parse time
+var asCheckClientIP 1 # before asInit — the HAG storage form is chosen at parse time
 asSetFilename /path/to/facility.acf
 asInit
 ```
 
-With no argument it prints the current setting. Both halves — HAG storage
-and client identity — read the one flag, so they can never disagree.
+`var asCheckClientIP` with no value prints `int asCheckClientIP = 0`, and
+setting it prints nothing, exactly as in C. Both halves — HAG storage and
+client identity — read the one flag, so they can never disagree.
 
 Under mTLS the identity comes from the verified client certificate and
 neither mode applies; see `11-tls-design.md`.

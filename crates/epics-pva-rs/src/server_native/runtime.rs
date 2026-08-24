@@ -207,17 +207,19 @@ impl PvaServer {
     ///
     /// The user-supplied `source` is wrapped in a
     /// [`super::CompositeSource`] together with the built-in
-    /// [`super::server_info::ServerInfoSource`]. The built-in source is
-    /// registered at `order = -1` — BEFORE default-order (0) user
-    /// sources — mirroring pvxs registering its `ServerSource` at
-    /// `(order = -1, "__server")` (server.cpp:542-547), where the lowest
-    /// order is consulted first. It only claims the reserved `server`
-    /// name, so it shadows a user PV named `server` (the pvxs
-    /// diagnostic-source contract) while all other names fall through to
-    /// the user source; a user that wants to own `server` must register
-    /// at an explicit order `< -1`. The built-in source answers GET / RPC
-    /// against the `server` PV so `pvlist`-style clients can enumerate
-    /// hosted channels and read server info (GUID, version, peer counts).
+    /// [`super::server_info::ServerInfoSource`]. The diagnostic source
+    /// goes in at `"__server"`, `order = -1`, where pvxs keeps its
+    /// internals (server.cpp:542-546); the hand-in source goes in at
+    /// `order = 0`, the default `Server::addSource` gives an application
+    /// source (pvxs/server.h:116-118), so it sits strictly behind the
+    /// internals as QSRV's own sources do (ioc/singlesourcehooks.cpp:158,
+    /// ioc/groupsourcehooks.cpp:219). The consequence, and it is pvxs's:
+    /// the channel named `server` is claimed by the diagnostic source
+    /// (serversource.cpp:30-33) even when the user source hosts a PV of
+    /// that name, which is what keeps `pvxlist` — an RPC to that very
+    /// channel name (tools/list.cpp:159-161) — answering. Every other
+    /// name falls through to the user source, since the built-in one
+    /// claims nothing else.
     pub fn start<S>(source: Arc<S>, config: PvaServerConfig) -> PvaResult<Self>
     where
         S: ChannelSource + 'static,

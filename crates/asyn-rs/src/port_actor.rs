@@ -1792,13 +1792,10 @@ impl PortActor {
                     // good ones — and the first error is returned to whoever waits
                     // on the reply.
                     if let Err(e) = outcome {
-                        if let Some(trace) = base.trace.clone() {
-                            trace.output(
-                                &base.port_name,
-                                crate::trace::TraceMask::ERROR,
-                                &format!("callParamCallbacks: param set failed: {e}\n"),
-                            );
-                        }
+                        base.trace_print(
+                            crate::trace::TraceMask::ERROR,
+                            &format!("callParamCallbacks: param set failed: {e}\n"),
+                        );
                         failed.get_or_insert(e);
                     }
                 }

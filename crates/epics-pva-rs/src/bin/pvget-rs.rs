@@ -17,8 +17,10 @@ struct Args {
     #[arg(short = 'V', long = "version")]
     version: bool,
 
-    /// PV names to read
-    #[arg(required_unless_present = "version")]
+    /// PV names to read. C `pvget` has no missing-name check: the
+    /// connect loop runs from `optind` to `argc` (pvget.cpp:400) and an
+    /// empty range leaves `haderror` clear, so `pvget` with no argument
+    /// prints nothing and exits 0 (measured).
     pv_names: Vec<String>,
 
     /// Request, specifies what fields to return and options
@@ -74,7 +76,7 @@ struct Args {
 
 #[tokio::main]
 async fn main() {
-    let args = Args::parse();
+    let args: Args = cli::parse_or_exit();
 
     // pvxs `-V` prints version_information and exits before any client
     // setup (tools/get.cpp:62-64).
@@ -178,10 +180,13 @@ async fn main() {
                         )
                     } else {
                         match mode {
-                            "json" => format::format_json(pv_name, &result.value),
-                            "raw" => {
-                                format::format_raw(pv_name, &result.introspection, &result.value)
-                            }
+                            "json" => format::format_json(pv_name, &result.value, None),
+                            "raw" => format::format_raw(
+                                pv_name,
+                                &result.introspection,
+                                &result.value,
+                                None,
+                            ),
                             _ => format::format_nt(pv_name, &result.introspection, &result.value),
                         }
                     };

@@ -47,7 +47,7 @@ pub use provider::{
 };
 #[cfg(feature = "qsrv-core")]
 pub use pva_adapter::{
-    PvaPvHandle, QsrvMount, QsrvPvStore, build_qsrv_mount, pvalink_link_set_install,
+    PvaPvHandle, Qsrv2Sources, QsrvMount, QsrvPvStore, build_qsrv_mount, pvalink_link_set_install,
     register_pva_pv_global, take_registered_pva_pvs,
 };
 // The host dual-protocol runner: gated with its definition, and the predicate

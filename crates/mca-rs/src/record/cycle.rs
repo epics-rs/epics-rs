@@ -307,12 +307,10 @@ impl McaRecord {
                 idtim <= limit || (lalm == limit && idtim <= limit + hyst)
             };
             if fired {
-                let before = common.nsev;
-                rec_gbl_set_sevr(common, status, AlarmSeverity::from_u16(severity));
                 // C latches LALM only when `recGblSetSevr` actually RAISED the
                 // severity — a limit that lost to a higher pending alarm does not
                 // get to move the latch.
-                if common.nsev != before {
+                if rec_gbl_set_sevr(common, status, AlarmSeverity::from_u16(severity)) {
                     self.lalm = limit;
                 }
                 return;

@@ -6,7 +6,6 @@
 // test go through the exec seam (`block_on_sync` → `park_on`) when the
 // feature is on — all six verified passing under --features
 // rtems-exec-model.
-use std::collections::HashSet;
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
@@ -150,6 +149,137 @@ impl TickDriver {
     }
 }
 
+/// C `dbScan.c:89` — how long after the tenth consecutive over-run the first
+/// warning may be printed.
+const OVERRUN_REPORT_DELAY: f64 = 10.0;
+/// C `dbScan.c:90` — the ceiling the report interval doubles up to.
+const OVERRUN_REPORT_MAX: f64 = 3600.0;
+
+/// What one post-scan bookkeeping step decided.
+struct TickOutcome {
+    /// The sweep ran past its deadline, so the rate's cumulative counter moves.
+    overran: bool,
+    /// The warning this over-run tripped, already formatted.
+    warning: Option<String>,
+}
+
+/// C `periodicTask`'s over-run bookkeeping (`dbScan.c:788-852`) as one owner.
+///
+/// The rule it holds is that an over-running list retries after `penalty`, not
+/// after a whole further period: a 10 s list whose sweep takes 11 s runs on a
+/// ~12 s cycle in C, where waiting out the next period would make it ~21 s.
+/// Keeping the arithmetic in one object rather than inline in the thread body
+/// is what makes the three boundaries — the `period >= 2` penalty branch,
+/// over-run vs on-time, and the ninth vs tenth consecutive over-run — testable
+/// without a running scan thread.
+struct OverrunTracker {
+    /// Names the thread in the warning, exactly C's `ppsl->name`: the
+    /// `menuScan` choice string.
+    scan: ScanType,
+    period: Duration,
+    /// C `dbScan.c:798`.
+    penalty: Duration,
+    /// Over-runs **in a row** — C's local `overruns`, which the report counts
+    /// and divides by. Distinct from the cumulative per-rate counter `scanppl`
+    /// prints (C's `ppsl->overruns`), which never resets.
+    consecutive: u32,
+    /// Seconds of lateness accumulated across the current consecutive run, and
+    /// its extremes. C reseeds all three when `overtime` is back to zero.
+    overtime: f64,
+    over_min: f64,
+    over_max: f64,
+    report_delay: f64,
+    reported: Instant,
+}
+
+impl OverrunTracker {
+    /// C `dbScan.c:798`: `(ppsl->period >= 2) ? 1 : (ppsl->period / 2)`.
+    fn penalty_for(period: Duration) -> Duration {
+        if period >= Duration::from_secs(2) {
+            Duration::from_secs(1)
+        } else {
+            period / 2
+        }
+    }
+
+    fn new(scan: ScanType, period: Duration, start: Instant) -> Self {
+        Self {
+            scan,
+            period,
+            penalty: Self::penalty_for(period),
+            consecutive: 0,
+            overtime: 0.0,
+            over_min: 0.0,
+            over_max: 0.0,
+            report_delay: OVERRUN_REPORT_DELAY,
+            reported: start,
+        }
+    }
+
+    /// One iteration of C's post-scan block (`dbScan.c:809-851`). `next` is the
+    /// deadline accumulator C advances by `period` and then, on an over-run,
+    /// resets to `now + penalty` — the sleeper at the head of the loop waits
+    /// until `next`, so C's separate `delay` needs no counterpart here.
+    fn after_scan(&mut self, next: &mut Instant, now: Instant) -> TickOutcome {
+        *next += self.period;
+        if now < *next {
+            // C `dbScan.c:846-850`. `over_min`/`over_max` are deliberately left
+            // alone; the `overtime == 0.0` test below is what reseeds them.
+            self.consecutive = 0;
+            self.report_delay = OVERRUN_REPORT_DELAY;
+            self.overtime = 0.0;
+            return TickOutcome {
+                overran: false,
+                warning: None,
+            };
+        }
+
+        let over = (now - *next).as_secs_f64();
+        if self.overtime == 0.0 {
+            self.overtime = over;
+            self.over_min = over;
+            self.over_max = over;
+        } else {
+            self.overtime += over;
+            self.over_min = self.over_min.min(over);
+            self.over_max = self.over_max.max(over);
+        }
+        *next = now + self.penalty;
+        self.consecutive += 1;
+
+        let warning =
+            if self.consecutive >= 10 && (now - self.reported).as_secs_f64() > self.report_delay {
+                let period = self.period.as_secs_f64();
+                let scan = self.scan;
+                let msg = format!(
+                    "\ndbScan {} from '{scan}' scan thread:\n\tScan processing \
+                 averages {:.3} seconds ({:.3} .. {:.3}).\n\tOver-runs have now \
+                 happened {} times in a row.\n\tTo fix this, move some records \
+                 to a slower scan rate.\n",
+                    crate::runtime::log::erl_warning(),
+                    period + self.overtime / f64::from(self.consecutive),
+                    period + self.over_min,
+                    period + self.over_max,
+                    self.consecutive,
+                );
+                self.reported = now;
+                if self.report_delay < OVERRUN_REPORT_MAX / 2.0 {
+                    self.report_delay *= 2.0;
+                } else {
+                    self.report_delay = OVERRUN_REPORT_MAX;
+                }
+                Some(msg)
+            } else {
+                None
+            };
+
+        TickOutcome {
+            overran: true,
+            warning,
+        }
+    }
+}
+
 /// One periodic rate's thread body — C `periodicTask`
 /// (`dbScan.c:895-935`): sleep to the next deadline, scan the list,
 /// repeat until told to stop.
@@ -161,6 +291,7 @@ fn periodic_loop(
     driver: TickDriver,
 ) {
     let mut next = Instant::now() + period;
+    let mut overrun = OverrunTracker::new(scan_type, period, Instant::now());
     loop {
         // Sleep until the deadline or the stop signal, whichever first.
         let mut stopped = recover(FACILITY, stop.stopped.lock());
@@ -181,21 +312,22 @@ fn periodic_loop(
         // the same isolation the scanOnce worker gives its tails.
         run_isolated(FACILITY, || {
             driver.drive(async {
-                let names = db.records_for_scan(scan_type).await;
-                for name in &names {
-                    let mut visited = HashSet::new();
-                    let _ = db.process_record_with_links(name, &mut visited, 0).await;
+                if let Some(list) = scan_type.scan_list() {
+                    db.scan_list_once(list).await;
                 }
             });
         });
 
-        // Next deadline; on overrun skip missed ticks rather than
-        // bursting catch-up ticks — C's `periodicTask` also computes
-        // its next delay from "now" after an overlong scan.
-        next += period;
-        let now = Instant::now();
-        if next <= now {
-            next = now + period;
+        // Next deadline. Missed ticks are skipped rather than burst as
+        // catch-up ticks, and an over-running list retries after `penalty`
+        // rather than idling out a whole further period — see
+        // [`OverrunTracker`].
+        let outcome = overrun.after_scan(&mut next, Instant::now());
+        if outcome.overran {
+            db.record_scan_overrun(scan_type);
+        }
+        if let Some(warning) = outcome.warning {
+            crate::runtime::log::errlog_printf(&warning);
         }
     }
 }
@@ -407,6 +539,159 @@ impl Drop for ScanOwner {
             // returns without waiting on the scan threads.
             let _ = join.join();
         }
+    }
+}
+
+#[cfg(test)]
+mod overrun_tests {
+    use super::*;
+
+    /// Drive `ticks` sweeps that each take `sweep` against a `period` list,
+    /// starting from `base`. Returns every warning the tracker emitted.
+    fn run(period: Duration, sweep: Duration, ticks: u32, base: Instant) -> Vec<String> {
+        let mut next = base + period;
+        let mut tracker = OverrunTracker::new(ScanType::Sec1, period, base);
+        let mut warnings = Vec::new();
+        for i in 1..=ticks {
+            let now = base + sweep * i;
+            if let Some(w) = tracker.after_scan(&mut next, now).warning {
+                warnings.push(w);
+            }
+        }
+        warnings
+    }
+
+    /// BOUNDARY: C `dbScan.c:798` — `period >= 2` retries after a flat second,
+    /// anything faster after half its own period. Two seconds exactly is on
+    /// the flat-second side.
+    #[test]
+    fn the_penalty_branches_at_a_two_second_period() {
+        assert_eq!(
+            OverrunTracker::penalty_for(Duration::from_secs(10)),
+            Duration::from_secs(1)
+        );
+        assert_eq!(
+            OverrunTracker::penalty_for(Duration::from_secs(2)),
+            Duration::from_secs(1)
+        );
+        assert_eq!(
+            OverrunTracker::penalty_for(Duration::from_millis(1999)),
+            Duration::from_micros(999_500)
+        );
+        assert_eq!(
+            OverrunTracker::penalty_for(Duration::from_millis(100)),
+            Duration::from_millis(50)
+        );
+    }
+
+    /// BOUNDARY: on time. The deadline advances by exactly one period and
+    /// nothing is counted.
+    #[test]
+    fn an_on_time_sweep_advances_the_deadline_by_one_period() {
+        let base = Instant::now();
+        let period = Duration::from_secs(10);
+        let mut next = base + period;
+        let mut tracker = OverrunTracker::new(ScanType::Sec10, period, base);
+
+        let outcome = tracker.after_scan(&mut next, base + Duration::from_secs(3));
+
+        assert!(!outcome.overran);
+        assert!(outcome.warning.is_none());
+        assert_eq!(next, base + Duration::from_secs(20));
+    }
+
+    /// BOUNDARY: over-run. The retry deadline is `now + penalty`, not
+    /// `now + period`. This is the defect: a 10 s list whose sweep takes 11 s
+    /// starts at its `base + 10 s` deadline and finishes at `base + 21 s`, so
+    /// C's next sweep starts at 22 s — a ~12 s cycle — where waiting out a
+    /// further whole period put it at 31 s, a ~21 s cycle.
+    #[test]
+    fn an_over_run_retries_after_the_penalty_not_a_whole_period() {
+        let base = Instant::now();
+        let period = Duration::from_secs(10);
+        let mut next = base + period;
+        let mut tracker = OverrunTracker::new(ScanType::Sec10, period, base);
+
+        let now = base + Duration::from_secs(21);
+        let outcome = tracker.after_scan(&mut next, now);
+
+        assert!(outcome.overran);
+        assert_eq!(
+            next,
+            base + Duration::from_secs(22),
+            "C `dbScan.c:826-830`: delay = penalty, next = now + delay"
+        );
+    }
+
+    /// BOUNDARY: the deadline is late by exactly zero. C tests `delay <= 0.0`,
+    /// so an exactly-on-the-deadline sweep is an over-run.
+    #[test]
+    fn a_sweep_that_lands_exactly_on_the_deadline_is_an_over_run() {
+        let base = Instant::now();
+        let period = Duration::from_secs(1);
+        let mut next = base + period;
+        let mut tracker = OverrunTracker::new(ScanType::Sec1, period, base);
+
+        let now = base + Duration::from_secs(2);
+        assert!(tracker.after_scan(&mut next, now).overran);
+        assert_eq!(next, now + Duration::from_millis(500));
+    }
+
+    /// BOUNDARY: nine consecutive over-runs are silent, the tenth reports —
+    /// C `dbScan.c:830`, `++overruns >= 10`. Each sweep here takes two
+    /// seconds on a one-second list, so by the ninth tick the report-delay
+    /// half of the condition is long satisfied and only the count gates it.
+    #[test]
+    fn the_report_fires_on_the_tenth_consecutive_over_run() {
+        let base = Instant::now();
+        let period = Duration::from_secs(1);
+        let sweep = Duration::from_secs(2);
+
+        assert!(
+            run(period, sweep, 9, base).is_empty(),
+            "the ninth consecutive over-run is still silent"
+        );
+
+        let warnings = run(period, sweep, 10, base);
+        assert_eq!(warnings.len(), 1, "the tenth reports");
+        let w = &warnings[0];
+        assert!(w.contains("from '1 second' scan thread"), "{w}");
+        assert!(w.contains("10 times in a row"), "{w}");
+        assert!(w.contains("move some records to a slower scan rate"), "{w}");
+    }
+
+    /// BOUNDARY: the report interval doubles after each report
+    /// (`dbScan.c:840-843`). Sweeps take 2 s, so reports are gated by a
+    /// 10 s then a 20 s interval: ticks 10 and 21. A fixed 10 s interval
+    /// would have reported three times over the same span.
+    #[test]
+    fn the_report_interval_doubles_after_each_report() {
+        let base = Instant::now();
+        let warnings = run(Duration::from_secs(1), Duration::from_secs(2), 21, base);
+
+        assert_eq!(warnings.len(), 2, "reports at tick 10 and tick 21");
+        assert!(warnings[1].contains("21 times in a row"), "{}", warnings[1]);
+    }
+
+    /// BOUNDARY: one on-time sweep resets both the consecutive count and the
+    /// report backoff (`dbScan.c:846-850`), so the next run of over-runs has
+    /// to climb to ten again.
+    #[test]
+    fn an_on_time_sweep_resets_the_consecutive_run() {
+        let base = Instant::now();
+        let period = Duration::from_secs(1);
+        let mut next = base + period;
+        let mut tracker = OverrunTracker::new(ScanType::Sec1, period, base);
+
+        // Nine over-runs, then one sweep that beats its deadline.
+        for i in 1..=9u32 {
+            tracker.after_scan(&mut next, base + Duration::from_secs(2) * i);
+        }
+        assert_eq!(tracker.consecutive, 9);
+        next = base + Duration::from_secs(100);
+        tracker.after_scan(&mut next, base + Duration::from_secs(100));
+        assert_eq!(tracker.consecutive, 0);
+        assert_eq!(tracker.report_delay, OVERRUN_REPORT_DELAY);
     }
 }
 

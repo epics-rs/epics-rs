@@ -38,7 +38,8 @@ pub struct EventRecord {
     /// SIOL read asynchronous: C's `readValue` arms
     /// `callbackRequestProcessCallbackDelayed(..., prec->sdly)` and holds PACT
     /// across the delay (eventRecord.c:184-201). The framework reads the delay
-    /// via `get_field("SDLY")`, so the field must exist for a `.db` to set it.
+    /// via `resolve_field("SDLY")`, which falls back to the dbd `initial`, so
+    /// this field is the record's own store for it rather than a requirement.
     pub sdly: f64,
 }
 

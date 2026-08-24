@@ -124,6 +124,29 @@ impl SyncIOHandle {
         Ok(result.nbytes)
     }
 
+    /// Blocking [`PortHandle::write_read`] — C `asynOctetSyncIO.c:231-276`.
+    ///
+    /// The flush, the write and the read are one actor op, so the port
+    /// cannot be served to anyone else between the halves and no stale
+    /// reply survives into this exchange. Protocol drivers doing
+    /// request/response must call this rather than `write_octet` followed
+    /// by `read_octet`.
+    pub fn write_read(&self, reason: usize, data: &[u8], buf_size: usize) -> AsynResult<Vec<u8>> {
+        let user = self.user(reason);
+        let result = self.handle.submit_blocking(
+            RequestOp::OctetWriteRead {
+                data: data.to_vec(),
+                buf_size,
+                flush: true,
+            },
+            user,
+        )?;
+        result.data.ok_or_else(|| crate::error::AsynError::Status {
+            status: crate::error::AsynStatus::Error,
+            message: "octet write/read returned no data".into(),
+        })
+    }
+
     pub fn read_uint32_digital(&self, reason: usize, mask: u32) -> AsynResult<u32> {
         let user = self.user(reason);
         let result = self
@@ -286,6 +309,56 @@ mod tests {
         let (sio, _rt) = make_sync_io();
         sio.write_int64(6, i64::MIN).unwrap();
         assert_eq!(sio.read_int64(6).unwrap(), i64::MIN);
+    }
+
+    /// C `asynOctetSyncIO::writeRead` (`asynOctetSyncIO.c:231-276`) is one
+    /// locked exchange that flushes before it writes. A caller that reaches
+    /// the port through two separate calls gets neither property, so the
+    /// wrapper must be the only thing a request/response protocol needs.
+    #[test]
+    fn write_read_flushes_then_writes_then_reads_in_one_exchange() {
+        use std::sync::{Arc, Mutex};
+
+        struct Sequenced {
+            base: PortDriverBase,
+            seq: Arc<Mutex<Vec<&'static str>>>,
+        }
+        impl PortDriver for Sequenced {
+            fn base(&self) -> &PortDriverBase {
+                &self.base
+            }
+            fn base_mut(&mut self) -> &mut PortDriverBase {
+                &mut self.base
+            }
+            fn io_flush(&mut self, _user: &mut AsynUser) -> AsynResult<()> {
+                self.seq.lock().unwrap().push("flush");
+                Ok(())
+            }
+            fn io_write_octet(&mut self, _user: &mut AsynUser, data: &[u8]) -> AsynResult<usize> {
+                self.seq.lock().unwrap().push("write");
+                Ok(data.len())
+            }
+            fn io_read_octet(&mut self, _user: &AsynUser, buf: &mut [u8]) -> AsynResult<usize> {
+                self.seq.lock().unwrap().push("read");
+                let resp = b"RSP";
+                buf[..resp.len()].copy_from_slice(resp);
+                Ok(resp.len())
+            }
+        }
+
+        let seq = Arc::new(Mutex::new(Vec::new()));
+        let drv = Sequenced {
+            base: PortDriverBase::new("wr_seq", 1, PortFlags::default()),
+            seq: Arc::clone(&seq),
+        };
+        let (rt, _jh) = create_port_runtime(drv, RuntimeConfig::default())
+            .expect("the port runtime thread must start");
+        let sio = SyncIOHandle::from_handle(rt.port_handle().clone(), 0, Duration::from_secs(1));
+        let reply = sio
+            .write_read(0, b"CMD", 16)
+            .expect("the exchange must run");
+        assert_eq!(reply, b"RSP".to_vec());
+        assert_eq!(*seq.lock().unwrap(), vec!["flush", "write", "read"]);
     }
 
     /// R11-48: C `asynOctetSyncIO::connect` resolves a drvInfo only on a port

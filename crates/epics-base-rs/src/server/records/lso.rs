@@ -111,6 +111,12 @@ impl Record for LsoRecord {
         "lso"
     }
 
+    /// C `lsoRecord.c:108-122`: the scalar `dbGetLink(&prec->dol, ..., &prec->val, 0, 0)`
+    /// under `dol.type != CONSTANT && omsl == menuOmslclosed_loop`.
+    fn fetches_dol_closed_loop(&self) -> bool {
+        true
+    }
+
     /// C reads the closed-loop DOL through `dbGetLinkLS` (`lsoRecord.c:114`,
     /// `dbLink.c:497-505`), whose switch is on the SOURCE class: a
     /// `DBF_CHAR`/`DBF_UCHAR` source is read as the bytes it spells (capped
@@ -176,6 +182,20 @@ impl Record for LsoRecord {
     /// `field_io.rs`) and the DOL-apply site (`processing.rs`).
     fn clears_udf(&self) -> bool {
         false
+    }
+
+    /// C `lsoRecord.c:117-118` raises UDF with the literal `INVALID_ALARM`, not
+    /// `prec->udfs`:
+    ///
+    /// ```c
+    /// if (prec->udf)
+    ///     recGblSetSevr(prec, UDF_ALARM, INVALID_ALARM);
+    /// ```
+    ///
+    /// so `UDFS` cannot weaken or silence this record's UDF alarm. `stringout`, the same shape of output record, passes `prec->udfs`
+    /// (`stringoutRecord.c:147`), so this is not a long-string or an output rule.
+    fn udf_alarm_severity(&self) -> Option<crate::server::record::AlarmSeverity> {
+        Some(crate::server::record::AlarmSeverity::Invalid)
     }
 
     fn monitor_always_post(&self) -> (bool, bool) {

@@ -3,15 +3,22 @@ use std::path::Path;
 use crate::server::database::PvDatabase;
 
 use super::error::{AutosaveError, AutosaveResult};
-use super::save_file::{self, read_save_file};
+use super::save_file::{self, MalformedLine, SaveEntry, read_save_file};
 
 /// Result of comparing one PV.
 #[derive(Debug, Clone)]
 pub enum MatchResult {
     Match,
-    Mismatch { saved: String, live: String },
+    Mismatch {
+        saved: String,
+        live: String,
+    },
     PvNotFound,
     ParseError,
+    /// The PV was unreachable when the file was written, so the file
+    /// carries no value to compare. Distinct from every other variant:
+    /// nothing was checked, and nothing can be.
+    DisconnectedAtSave,
 }
 
 /// A single verify entry.
@@ -23,6 +30,19 @@ pub struct VerifyEntry {
     pub result: MatchResult,
 }
 
+/// Everything a verify pass has to say about one save file.
+///
+/// The two halves together account for the whole file: `entries` has one
+/// element per entry the file declared, in file order, and `malformed`
+/// carries the lines that declared no entry at all. A report built from
+/// either half alone under-counts, which is what `asVerify` exists to
+/// prevent.
+#[derive(Debug, Clone, Default)]
+pub struct VerifyReport {
+    pub entries: Vec<VerifyEntry>,
+    pub malformed: Vec<MalformedLine>,
+}
+
 /// Compare saved values against live PV values.
 ///
 /// A corrupt/truncated save file (no `<END>` marker) is surfaced as
@@ -31,8 +51,18 @@ pub struct VerifyEntry {
 /// `0 match, 0 mismatch` and tell an operator everything is fine,
 /// hiding exactly the corruption `asVerify` exists to catch.
 /// Mirrors `restore_from_entries`'s handling of the same `None`.
-pub async fn verify(db: &PvDatabase, save_file_path: &Path) -> AutosaveResult<Vec<VerifyEntry>> {
-    let entries =
+///
+/// Every entry the file declares produces exactly one [`VerifyEntry`],
+/// including the ones written while the PV was unreachable. Skipping
+/// those made the summary counts sum to less than the file's entry
+/// count with nothing saying so — a 24-entry file reported `12 match, 0
+/// mismatch, 0 not found, 0 parse errors` and read as a fully verified
+/// save set while half of it had never been compared. The save side
+/// records them (`connected: false`) and the restore side surfaces them
+/// (`RestoreResult::disconnected_skipped`); verify was the only consumer
+/// that dropped the information.
+pub async fn verify(db: &PvDatabase, save_file_path: &Path) -> AutosaveResult<VerifyReport> {
+    let contents =
         read_save_file(save_file_path)
             .await?
             .ok_or_else(|| AutosaveError::CorruptSaveFile {
@@ -40,101 +70,122 @@ pub async fn verify(db: &PvDatabase, save_file_path: &Path) -> AutosaveResult<Ve
                 message: "missing <END> marker (truncated or corrupt save file)".to_string(),
             })?;
 
-    let mut results = Vec::new();
-
-    for entry in &entries {
-        if !entry.connected {
-            continue;
-        }
-
-        let live = match db.get_pv(&entry.pv_name) {
-            Ok(val) => val,
-            Err(_) => {
-                results.push(VerifyEntry {
-                    pv_name: entry.pv_name.clone(),
-                    saved_value: entry.value.clone(),
-                    live_value: None,
-                    result: MatchResult::PvNotFound,
-                });
-                continue;
-            }
-        };
-
-        let live_str = save_file::value_to_save_str(&live);
-
-        // Try parsing saved value using live type as template
-        let parsed = save_file::parse_save_value(&entry.value, &live);
-        if parsed.is_none() {
-            results.push(VerifyEntry {
+    // One push per entry, unconditionally: the classification decides
+    // which bucket, never whether there is one.
+    let entries = contents
+        .entries
+        .iter()
+        .map(|entry| {
+            let (result, live_value) = classify(db, entry);
+            VerifyEntry {
                 pv_name: entry.pv_name.clone(),
                 saved_value: entry.value.clone(),
-                live_value: Some(live_str),
-                result: MatchResult::ParseError,
-            });
-            continue;
-        }
+                live_value,
+                result,
+            }
+        })
+        .collect();
 
-        let parsed = parsed.unwrap();
-        let result = if parsed == live {
-            MatchResult::Match
-        } else {
+    Ok(VerifyReport {
+        entries,
+        malformed: contents.malformed,
+    })
+}
+
+/// Decide one entry's bucket, and the live text to show beside it.
+fn classify(db: &PvDatabase, entry: &SaveEntry) -> (MatchResult, Option<String>) {
+    if !entry.connected {
+        return (MatchResult::DisconnectedAtSave, None);
+    }
+
+    let Ok(live) = db.get_pv(&entry.pv_name) else {
+        return (MatchResult::PvNotFound, None);
+    };
+    let live_str = save_file::value_to_save_str(&live);
+
+    // Try parsing saved value using live type as template
+    let Some(parsed) = save_file::parse_save_value(&entry.value, &live) else {
+        return (MatchResult::ParseError, Some(live_str));
+    };
+
+    if parsed == live {
+        (MatchResult::Match, Some(live_str))
+    } else {
+        (
             MatchResult::Mismatch {
                 saved: entry.value.clone(),
                 live: live_str.clone(),
-            }
-        };
-
-        results.push(VerifyEntry {
-            pv_name: entry.pv_name.clone(),
-            saved_value: entry.value.clone(),
-            live_value: Some(live_str),
-            result,
-        });
+            },
+            Some(live_str),
+        )
     }
-
-    Ok(results)
 }
 
 /// Format a human-readable verify report.
-pub fn format_verify_report(entries: &[VerifyEntry]) -> String {
-    let mut report = String::new();
+///
+/// The five counts sum to the number of entries in the file, and the
+/// malformed lines are listed under it, so an operator can see that the
+/// report covers everything the file contained.
+pub fn format_verify_report(report: &VerifyReport) -> String {
+    let mut out = String::new();
     let mut match_count = 0;
     let mut mismatch_count = 0;
     let mut not_found_count = 0;
     let mut parse_error_count = 0;
+    let mut disconnected_count = 0;
 
-    for entry in entries {
+    for entry in &report.entries {
         match &entry.result {
             MatchResult::Match => {
                 match_count += 1;
             }
             MatchResult::Mismatch { saved, live } => {
                 mismatch_count += 1;
-                report.push_str(&format!(
+                out.push_str(&format!(
                     "MISMATCH: {} saved={} live={}\n",
                     entry.pv_name, saved, live
                 ));
             }
             MatchResult::PvNotFound => {
                 not_found_count += 1;
-                report.push_str(&format!("NOT_FOUND: {}\n", entry.pv_name));
+                out.push_str(&format!("NOT_FOUND: {}\n", entry.pv_name));
             }
             MatchResult::ParseError => {
                 parse_error_count += 1;
-                report.push_str(&format!(
+                out.push_str(&format!(
                     "PARSE_ERROR: {} saved={}\n",
                     entry.pv_name, entry.saved_value
+                ));
+            }
+            MatchResult::DisconnectedAtSave => {
+                disconnected_count += 1;
+                out.push_str(&format!(
+                    "NOT_CHECKED: {} (disconnected at save)\n",
+                    entry.pv_name
                 ));
             }
         }
     }
 
-    report.push_str(&format!(
-        "\nSummary: {} match, {} mismatch, {} not found, {} parse errors\n",
-        match_count, mismatch_count, not_found_count, parse_error_count
+    for line in &report.malformed {
+        out.push_str(&format!(
+            "MALFORMED: line {}: {}\n",
+            line.line_no, line.text
+        ));
+    }
+
+    out.push_str(&format!(
+        "\nSummary: {} match, {} mismatch, {} not found, {} parse errors, \
+         {} not checked (disconnected at save), {} malformed lines\n",
+        match_count,
+        mismatch_count,
+        not_found_count,
+        parse_error_count,
+        disconnected_count,
+        report.malformed.len()
     ));
 
-    report
+    out
 }
 
 #[cfg(test)]
@@ -187,8 +238,8 @@ mod tests {
             .await
             .unwrap();
 
-        let entries = verify(&db, &path).await.expect("valid file must verify");
-        assert_eq!(entries.len(), 1);
-        assert!(matches!(entries[0].result, MatchResult::Match));
+        let report = verify(&db, &path).await.expect("valid file must verify");
+        assert_eq!(report.entries.len(), 1);
+        assert!(matches!(report.entries[0].result, MatchResult::Match));
     }
 }

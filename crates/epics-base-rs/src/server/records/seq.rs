@@ -20,8 +20,12 @@ const SEQ_SELM_CHOICES: &[&str] = &["All", "Specified", "Mask"];
 /// `:78`). Both switch on `(fieldIndex - indexof(DLY0)) & 3 == 0`, the DLYn
 /// slot of each four-field link group, so the predicate is the same one the
 /// graphic arm uses. The `DOn` slot (`& 3 == 2`) reads its units/precision
-/// from the DOLn link instead; an unset link supplies neither, which is the
-/// `""` / `prec->prec` the port already serves.
+/// from the DOLn link instead, and `dbGetPrecision` on a CONSTANT link fails
+/// (`S_db_noLSET`) into the same `prec->prec` fall-through every other field
+/// takes — which is
+/// [`route_field_metadata`](crate::server::record::RecordInstance)'s answer,
+/// not this override's. A CONNECTED DOLn is the one arm the port does not
+/// model: it serves seq's own PREC where C serves the upstream record's.
 fn seq_metadata_override(
     _rec: &SeqRecord,
     field: &str,
@@ -70,6 +74,7 @@ const SEQ_DLY_LIMIT: f64 = 100000.0;
 #[record(
     type = "seq",
     metadata_override = seq_metadata_override,
+    link_metadata_field = seq_link_metadata_field,
     constant_init = "SELL:SELN,DOL0:DO0,DOL1:DO1,DOL2:DO2,DOL3:DO3,DOL4:DO4,\
                      DOL5:DO5,DOL6:DO6,DOL7:DO7,DOL8:DO8,DOL9:DO9,DOLA:DOA,\
                      DOLB:DOB,DOLC:DOC,DOLD:DOD,DOLE:DOE,DOLF:DOF",
@@ -241,6 +246,18 @@ pub struct SeqRecord {
     pub lnke: String,
     #[field(type = "String")]
     pub lnkf: String,
+}
+
+/// `seqRecord.c:279-280` `get_dol` — within each of the 16 `linkGrp`s the
+/// field at offset 2 is `DOn`, whose units/precision/graphic/alarm C reads
+/// from that group's `DOLn` (`:293`, `:311`, `:333`, `:361`). `DOLn` itself is
+/// four bytes and never matches, so the mapping is exactly `DOn` -> `DOLn`
+/// over the group suffixes `0`..`9`, `A`..`F`.
+fn seq_link_metadata_field(_rec: &SeqRecord, field: &str) -> Option<String> {
+    let &[b'D', b'O', c] = field.as_bytes() else {
+        return None;
+    };
+    (c.is_ascii_digit() || (b'A'..=b'F').contains(&c)).then(|| format!("DOL{}", c as char))
 }
 
 impl Default for SeqRecord {

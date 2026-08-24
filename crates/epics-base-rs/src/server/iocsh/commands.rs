@@ -40,6 +40,9 @@ pub(crate) fn register_builtins(registry: &mut CommandRegistry) {
     // security cannot be loaded from the shell.
     super::core_commands::register(registry);
     super::access_commands::register(registry);
+    // Last: C registers `var` from `iocshRegisterVariable`, so it must
+    // come after everything that contributes to the variable table.
+    super::vars::register(registry);
 }
 
 /// `afterIocRunning <command>` — queue an iocsh command line to run
@@ -143,24 +146,124 @@ fn cmd_help() -> CommandDef {
     )
 }
 
+/// C `splitFieldsList` (`dbTest.c:108-125`): the field list is split on
+/// SPACES, not commas — `epicsStrtok_r(fieldnames, " ", ...)` — so
+/// `dbl("ai","VAL DESC")` asks for two fields and `dbl("ai","VAL,DESC")`
+/// asks for one field literally named `VAL,DESC`.
+fn split_fields_list(fields: &str) -> Vec<String> {
+    fields
+        .split(' ')
+        .filter(|f| !f.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
+/// C `printFieldsList` (`dbTest.c:127-148`) — the per-record field dump
+/// `dbl`, `dbgrep` and `dbglob` share. The caller has already written
+/// the record name with no newline; this appends `, "value"` for each
+/// requested field and terminates the line, so one record is one line.
+/// A field the record does not have contributes a bare `, ` (C prints
+/// the separator and `continue`s), except the pseudo-field
+/// `recordType`, which C answers from `dbGetRecordTypeName` when
+/// `dbFindField` fails.
+fn print_fields_list(ctx: &CommandContext, name: &str, fields: &[String]) {
+    let mut line = String::from(name);
+    let record = ctx.db().get_record(name);
+    for field in fields {
+        let value = record.as_ref().and_then(|rec| {
+            let inst = rec.read();
+            inst.record
+                .get_field(field)
+                .map(|v| v.to_string())
+                .or_else(|| (field == "recordType").then(|| inst.record.record_type().to_string()))
+        });
+        match value {
+            Some(v) => line.push_str(&format!(", \"{v}\"")),
+            None => line.push_str(", "),
+        }
+    }
+    ctx.println(&line);
+}
+
+/// C `dbl` and `dbglob` walk the database record-type MAJOR
+/// (`dbTest.c:181-191`, `:322-341`): `dbFirstRecordType` selects a
+/// record type and `dbFirstRecord`/`dbNextRecord` then walk that
+/// type's own list — the order its records were loaded — before the
+/// next type is touched. Sorting every name once interleaves the
+/// types, which C never does, and throws away the load order
+/// [`PvDatabase::all_record_names`](crate::server::database::PvDatabase::all_record_names) preserves.
+///
+/// The type sequence is `dbd_generated::RECORD_TYPES`, which the
+/// generator emits in name order; C's is `recordTypeList`, the order
+/// the loaded `.dbd` declared them in. The port has no per-database
+/// declaration order to read, so the grouping is C's and the sequence
+/// of the groups is the table's. A type registered at runtime is not
+/// in the table and follows those that are, by name.
+fn record_names_type_major(ctx: &CommandContext) -> Vec<String> {
+    use crate::server::record::dbd_generated::RECORD_TYPES;
+
+    let mut names = ctx.block_on(ctx.db().all_record_names());
+    let rank = |name: &String| {
+        let record_type = ctx
+            .db()
+            .get_record(name)
+            .map(|rec| rec.read().record.record_type().to_string())
+            .unwrap_or_default();
+        match RECORD_TYPES.iter().position(|t| *t == record_type) {
+            Some(i) => (0usize, i, String::new()),
+            None => (1usize, 0, record_type),
+        }
+    };
+    // Stable: records of one type keep the load order they arrived in.
+    names.sort_by_cached_key(rank);
+    names
+}
+
 fn cmd_dbl() -> CommandDef {
     CommandDef::new(
         "dbl",
-        vec![ArgDesc {
-            name: "recordType",
-            arg_type: ArgType::String,
-            optional: true,
-        }],
-        "dbl [recordType] - List record names, optionally filtered by type",
+        vec![
+            ArgDesc {
+                name: "record type",
+                arg_type: ArgType::String,
+                optional: true,
+            },
+            ArgDesc {
+                name: "fields",
+                arg_type: ArgType::String,
+                optional: true,
+            },
+        ],
+        "dbl [record type] [fields] - List record names, optionally filtered by type",
         |args: &[ArgValue], ctx: &CommandContext| {
+            // C `dbl` (`dbTest.c:164-166`): an empty type and the
+            // literal `*` are both the all-types sentinel, collapsed to
+            // `precordTypename = NULL`; an empty field list is likewise
+            // no field list (`:167-168`).
             let type_filter = match &args[0] {
-                ArgValue::String(s) => Some(s.as_str()),
+                ArgValue::String(s) if !s.is_empty() && s != "*" => Some(s.as_str()),
                 _ => None,
             };
+            let fields = match &args[1] {
+                ArgValue::String(s) => split_fields_list(s),
+                _ => Vec::new(),
+            };
 
-            let names = ctx.block_on(ctx.db().all_record_names());
-            let mut names = names;
-            names.sort();
+            let names = record_names_type_major(ctx);
+
+            // C walks the record types and reports an unknown one
+            // before listing anything (`dbTest.c:172-180`).
+            if let Some(filter) = type_filter {
+                let known = names.iter().any(|name| {
+                    ctx.db()
+                        .get_record(name)
+                        .is_some_and(|rec| rec.read().record.record_type() == filter)
+                });
+                if !known {
+                    ctx.println("No record type");
+                    return Ok(CommandOutcome::Continue);
+                }
+            }
 
             for name in &names {
                 if let Some(filter) = type_filter {
@@ -172,7 +275,7 @@ fn cmd_dbl() -> CommandDef {
                         }
                     }
                 }
-                ctx.println(name);
+                print_fields_list(ctx, name, &fields);
             }
 
             Ok(CommandOutcome::Continue)
@@ -180,41 +283,232 @@ fn cmd_dbl() -> CommandDef {
     )
 }
 
+/// C `dbpr_msgOut`'s `TAB_BUFFER` (`dbTest.c:1281-1370`) at
+/// `tab_size` 10 — the layout `dbgf` puts every message through.
+/// Each inserted message is padded out to the next 10-column stop, and
+/// the buffer is flushed as one line when the next message would carry
+/// it past `MAXLINE`. Reproducing the buffer rather than formatting a
+/// line directly is what keeps a multi-element array wrapping where C
+/// wraps it.
+struct TabBuffer {
+    out: String,
+    next_tab: usize,
+    lines: Vec<String>,
+}
+
+impl TabBuffer {
+    const MAXLINE: usize = 80;
+    const TAB: usize = 10;
+
+    fn new() -> Self {
+        Self {
+            out: String::new(),
+            next_tab: Self::TAB,
+            lines: Vec::new(),
+        }
+    }
+
+    /// C reads `out_buff` as a zero-filled fixed buffer, so a position
+    /// past the written text is NUL.
+    fn at(&self, i: usize) -> u8 {
+        self.out.as_bytes().get(i).copied().unwrap_or(0)
+    }
+
+    fn insert(&mut self, msg: &str) {
+        if self.out.len() + msg.len() > Self::MAXLINE {
+            self.flush();
+        }
+        for b in msg.bytes() {
+            self.out.push(b as char);
+            if self.at(self.next_tab - 1) != 0 {
+                self.next_tab += Self::TAB;
+            }
+        }
+        while self.at(self.next_tab - 1) != b' ' && self.out.len() < Self::MAXLINE {
+            self.out.push(' ');
+        }
+    }
+
+    fn flush(&mut self) {
+        if !self.out.is_empty() {
+            self.lines.push(std::mem::take(&mut self.out));
+        }
+        self.next_tab = Self::TAB;
+    }
+
+    fn finish(mut self) -> Vec<String> {
+        self.flush();
+        self.lines
+    }
+}
+
+/// The DBR type name and per-element renderings C `printBuffer`
+/// (`dbTest.c:986-1150`) emits for a value. `dbgf` re-reads a DBR_ENUM
+/// field as DBR_STRING first (`dbTest.c:371-380`), so an enum reports
+/// itself as `DBF_STRING` and carries its choice text.
+fn dbgf_dbr_render(val: &EpicsValue) -> (&'static str, Vec<String>) {
+    use crate::calc::engine::cvt::fmt_g;
+
+    fn quoted(bytes: &[u8]) -> String {
+        format!("\"{}\"", escape_char_array_for_dbgf(bytes))
+    }
+    fn i32_hex(v: i32) -> String {
+        format!("{v} = 0x{:x}", v as u32)
+    }
+    fn i16_hex(v: i16) -> String {
+        format!("{v} = 0x{:x}", v as u16)
+    }
+
+    match val {
+        EpicsValue::String(v) => ("STRING", vec![quoted(v.as_bytes())]),
+        EpicsValue::StringArray(v) => (
+            "STRING",
+            v.iter().map(|s| quoted(s.as_bytes())).collect::<Vec<_>>(),
+        ),
+        // DBR_ENUM read back as DBR_STRING.
+        EpicsValue::Enum(v) => ("STRING", vec![quoted(v.to_string().as_bytes())]),
+        EpicsValue::EnumWithChoices { index, choices } => (
+            "STRING",
+            vec![quoted(
+                &choices
+                    .get(*index as usize)
+                    .map(|c| c.as_bytes().to_vec())
+                    .unwrap_or_else(|| index.to_string().into_bytes()),
+            )],
+        ),
+        EpicsValue::EnumArray(v) => (
+            "STRING",
+            v.iter()
+                .map(|e| quoted(e.to_string().as_bytes()))
+                .collect::<Vec<_>>(),
+        ),
+        // `%d = 0x%x`, plus the printable character when scalar
+        // (`dbTest.c:1015-1023`).
+        EpicsValue::Char(v) => (
+            "CHAR",
+            vec![{
+                let val = *v as i32;
+                if (0x20..0x7f).contains(&(*v as u8 as i32)) {
+                    format!("{val} = 0x{:x} = '{}'", *v as u8, *v as u8 as char)
+                } else {
+                    format!("{val} = 0x{:x}", *v as u8)
+                }
+            }],
+        ),
+        // A CHAR array is one escaped, quoted string (`:1024-1041`).
+        EpicsValue::CharArray(v) => (
+            "CHAR",
+            vec![format!("\"{}\"", escape_char_array_for_dbgf(v))],
+        ),
+        EpicsValue::UChar(v) => ("UCHAR", vec![format!("{v} = 0x{v:x}")]),
+        EpicsValue::UCharArray(v) => (
+            "UCHAR",
+            v.iter().map(|e| format!("{e} = 0x{e:x}")).collect(),
+        ),
+        EpicsValue::Short(v) => ("SHORT", vec![i16_hex(*v)]),
+        EpicsValue::ShortArray(v) => ("SHORT", v.iter().map(|e| i16_hex(*e)).collect()),
+        EpicsValue::UShort(v) => ("USHORT", vec![format!("{v} = 0x{v:x}")]),
+        EpicsValue::UShortArray(v) => (
+            "USHORT",
+            v.iter().map(|e| format!("{e} = 0x{e:x}")).collect(),
+        ),
+        EpicsValue::Long(v) => ("LONG", vec![i32_hex(*v)]),
+        EpicsValue::LongArray(v) => ("LONG", v.iter().map(|e| i32_hex(*e)).collect()),
+        EpicsValue::ULong(v) => ("ULONG", vec![format!("{v} = 0x{v:x}")]),
+        EpicsValue::ULongArray(v) => (
+            "ULONG",
+            v.iter().map(|e| format!("{e} = 0x{e:x}")).collect(),
+        ),
+        EpicsValue::Int64(v) => ("INT64", vec![format!("{v} = 0x{:x}", *v as u64)]),
+        EpicsValue::Int64Array(v) => (
+            "INT64",
+            v.iter()
+                .map(|e| format!("{e} = 0x{:x}", *e as u64))
+                .collect(),
+        ),
+        EpicsValue::UInt64(v) => ("UINT64", vec![format!("{v} = 0x{v:x}")]),
+        EpicsValue::UInt64Array(v) => (
+            "UINT64",
+            v.iter().map(|e| format!("{e} = 0x{e:x}")).collect(),
+        ),
+        EpicsValue::Float(v) => ("FLOAT", vec![fmt_g(*v as f64, 6, false, false)]),
+        EpicsValue::FloatArray(v) => (
+            "FLOAT",
+            v.iter()
+                .map(|e| fmt_g(*e as f64, 6, false, false))
+                .collect(),
+        ),
+        EpicsValue::Double(v) => ("DOUBLE", vec![fmt_g(*v, 12, false, false)]),
+        EpicsValue::DoubleArray(v) => (
+            "DOUBLE",
+            v.iter().map(|e| fmt_g(*e, 12, false, false)).collect(),
+        ),
+    }
+}
+
+/// The lines C `dbgf` prints for a value: the `DBF_<T>:` header
+/// (`dbTest.c:986-992`) followed by the element renderings, all laid
+/// out through the tab buffer.
+fn dbgf_lines(val: &EpicsValue) -> Vec<String> {
+    let (dbr, values) = dbgf_dbr_render(val);
+    let mut buf = TabBuffer::new();
+    // A CHAR array is a single string element to C's printBuffer, but
+    // its `no_elements` is still the byte count.
+    let count = match val {
+        EpicsValue::CharArray(v) => v.len(),
+        _ => values.len(),
+    };
+    if count == 1 {
+        buf.insert(&format!("DBF_{dbr}: "));
+    } else {
+        buf.insert(&format!("DBF_{dbr}[{count}]: "));
+        if count == 0 {
+            buf.insert("(empty)");
+        }
+    }
+    for v in &values {
+        buf.insert(v);
+    }
+    buf.finish()
+}
+
+/// C `nameToAddr` (`dbTest.c:787-795`) — the one place every
+/// `dbTest.c` command reports a name it cannot resolve. C prints this
+/// line on stdout and the caller then returns -1 without printing
+/// anything else, so the port must not route it through the shell's
+/// error channel, which writes to stderr and prefixes `Error:`.
+fn print_pv_not_found(ctx: &CommandContext, pname: &str) {
+    ctx.println(&format!("PV '{pname}' not found"));
+}
+
 fn cmd_dbgf() -> CommandDef {
     CommandDef::new(
         "dbgf",
         vec![ArgDesc {
-            name: "pvname",
+            name: "record name",
             arg_type: ArgType::String,
-            optional: false,
+            optional: true,
         }],
-        "dbgf pvname - Get field value",
+        "dbgf record name - Get field value",
         |args: &[ArgValue], ctx: &CommandContext| {
-            let name = match &args[0] {
-                ArgValue::String(s) => s,
-                _ => return Err("invalid argument".to_string()),
+            // C `dbTest.c:358-361`.
+            let name = match args.first() {
+                Some(ArgValue::String(s)) if !s.is_empty() => s,
+                _ => {
+                    ctx.println("Usage: dbgf \"pv name\"");
+                    return Ok(CommandOutcome::Continue);
+                }
             };
 
             match ctx.db().get_pv(name) {
                 Ok(val) => {
-                    let type_name = dbf_type_name(&val);
-                    // epics-base dc70dfd6: dbgf must C-style-escape
-                    // non-printable bytes in CHAR-array output and
-                    // wrap in double-quotes so a CHAR array carrying
-                    // control bytes does not corrupt the operator's
-                    // terminal. Other types fall through to the
-                    // standard Display formatter.
-                    let formatted = match &val {
-                        EpicsValue::CharArray(arr) => {
-                            format!("\"{}\"", escape_char_array_for_dbgf(arr))
-                        }
-                        _ => format!("{val}"),
-                    };
-                    ctx.println(&format!("{type_name}: {formatted}"));
-                    Ok(CommandOutcome::Continue)
+                    for line in dbgf_lines(&val) {
+                        ctx.println(&line);
+                    }
                 }
-                Err(e) => Err(format!("{e}")),
+                Err(_) => print_pv_not_found(ctx, name),
             }
+            Ok(CommandOutcome::Continue)
         },
     )
 }
@@ -226,24 +520,32 @@ fn cmd_dbpf() -> CommandDef {
             ArgDesc {
                 name: "pvname",
                 arg_type: ArgType::String,
-                optional: false,
+                optional: true,
             },
             ArgDesc {
                 name: "value",
                 arg_type: ArgType::String,
-                optional: false,
+                optional: true,
             },
         ],
         "dbpf pvname value - Put field value",
         |args: &[ArgValue], ctx: &CommandContext| {
-            let name = match &args[0] {
-                ArgValue::String(s) => s,
-                _ => return Err("invalid argument".to_string()),
+            // C `dbTest.c:400-403`: a missing or empty name, or a
+            // missing value, is a usage line on stdout.
+            let (name, value_str) = match (&args[0], &args[1]) {
+                (ArgValue::String(n), ArgValue::String(v)) if !n.is_empty() => (n, v),
+                _ => {
+                    ctx.println("Usage: dbpf \"pv name\", \"value\"");
+                    return Ok(CommandOutcome::Continue);
+                }
             };
-            let value_str = match &args[1] {
-                ArgValue::String(s) => s,
-                _ => return Err("invalid argument".to_string()),
-            };
+
+            // C resolves the name before it puts (`dbTest.c:405-406`),
+            // so an unknown PV never reaches `dbPutField`.
+            if ctx.db().get_pv(name).is_err() {
+                print_pv_not_found(ctx, name);
+                return Ok(CommandOutcome::Continue);
+            }
 
             let (base, field) = parse_pv_name(name);
             let field = field.to_ascii_uppercase();
@@ -303,7 +605,7 @@ fn cmd_dbpf() -> CommandDef {
                     db.put_pv(name, value).await
                 }
             });
-            put_result.map_err(|e| {
+            let put_err = put_result.err().map(|e| {
                 // epics-base PR #689 — when the field
                 // doesn't exist, suggest near-by names so a typo
                 // ("DSEC" instead of "DESC") is caught quickly.
@@ -316,18 +618,22 @@ fn cmd_dbpf() -> CommandDef {
                     }
                 }
                 msg
-            })?;
+            });
 
-            // Read back to confirm
-            match ctx.db().get_pv(name) {
-                Ok(val) => {
-                    let type_name = dbf_type_name(&val);
-                    ctx.println(&format!("{type_name}: {val}"));
+            // C `dbpf` ends with `dbgf(pname)` (`dbTest.c:433`) whatever
+            // `dbPutField` returned, so the read-back is that one
+            // printer rather than a second rendering, and a rejected
+            // put still shows the value the record kept.
+            if let Ok(val) = ctx.db().get_pv(name) {
+                for line in dbgf_lines(&val) {
+                    ctx.println(&line);
                 }
-                Err(_) => {}
             }
 
-            Ok(CommandOutcome::Continue)
+            match put_err {
+                Some(msg) => Err(msg),
+                None => Ok(CommandOutcome::Continue),
+            }
         },
     )
 }
@@ -339,7 +645,7 @@ fn cmd_dbpr() -> CommandDef {
             ArgDesc {
                 name: "record",
                 arg_type: ArgType::String,
-                optional: false,
+                optional: true,
             },
             ArgDesc {
                 name: "level",
@@ -349,9 +655,14 @@ fn cmd_dbpr() -> CommandDef {
         ],
         "dbpr record [level] - Print record fields (level 0-2)",
         |args: &[ArgValue], ctx: &CommandContext| {
+            // C `dbTest.c:445-448`: a missing or empty name is a usage
+            // line on stdout.
             let name = match &args[0] {
-                ArgValue::String(s) => s,
-                _ => return Err("invalid argument".to_string()),
+                ArgValue::String(s) if !s.is_empty() => s,
+                _ => {
+                    ctx.println("Usage: dbpr \"pv name\", level");
+                    return Ok(CommandOutcome::Continue);
+                }
             };
             let level = match &args[1] {
                 ArgValue::Int(n) => *n as i32,
@@ -359,10 +670,13 @@ fn cmd_dbpr() -> CommandDef {
                 _ => 0,
             };
 
-            let rec = ctx
-                .db()
-                .get_record(name)
-                .ok_or_else(|| format!("record '{}' not found", name))?;
+            let rec = match ctx.db().get_record(name) {
+                Some(rec) => rec,
+                None => {
+                    print_pv_not_found(ctx, name);
+                    return Ok(CommandOutcome::Continue);
+                }
+            };
 
             // Collect field values inside lock, format outside
             let fields: Vec<(String, String)> = ctx.block_on(async {
@@ -460,33 +774,27 @@ fn cmd_dbpr() -> CommandDef {
     )
 }
 
-/// Shared handler for the record-name glob search `dbglob` / `dbgrep`.
+/// Shared handler for the record-name glob search `dbglob` / `dbgrep`
+/// (C `dbglob`, `dbTest.c:298-345`; `dbgrep` tail-calls it).
 /// Mirrors epics-base PR #626 (rename `dbgrep` → `dbglob` with alias)
-/// and PR #613 (add fields argument). The `fields` argument is comma-
-/// separated; when present each matching record additionally dumps
-/// the listed field values. (`dbsr` is the *server report* — a
+/// and PR #613 (add fields argument). The `fields` argument is
+/// SPACE-separated (`splitFieldsList`) and each matching record is one
+/// line built by `printFieldsList`. (`dbsr` is the *server report* — a
 /// separate command — not this name search.)
-fn dbsr_handler(args: &[ArgValue], ctx: &CommandContext) -> CommandResult {
-    let pattern = args
-        .first()
-        .and_then(|a| {
-            if let ArgValue::String(s) = a {
-                Some(s.as_str())
-            } else {
-                None
-            }
-        })
-        .unwrap_or("*");
-    let fields: Vec<String> = args
-        .get(1)
-        .and_then(|a| {
-            if let ArgValue::String(s) = a {
-                Some(s.split(',').map(|f| f.trim().to_string()).collect())
-            } else {
-                None
-            }
-        })
-        .unwrap_or_default();
+fn dbglob_handler(args: &[ArgValue], ctx: &CommandContext) -> CommandResult {
+    // C `dbTest.c:306-309`: a missing or empty pattern is a usage
+    // error, not an implicit `*`.
+    let pattern = match args.first() {
+        Some(ArgValue::String(s)) if !s.is_empty() => s.as_str(),
+        _ => {
+            ctx.println("Usage: dbglob \"pattern\" \"fields\"");
+            return Ok(CommandOutcome::Continue);
+        }
+    };
+    let fields: Vec<String> = match args.get(1) {
+        Some(ArgValue::String(s)) => split_fields_list(s),
+        _ => Vec::new(),
+    };
 
     // Walk record names + aliases + simple PVs. Base's
     // `dbFirstRecord` iteration only sees records, but our
@@ -496,36 +804,20 @@ fn dbsr_handler(args: &[ArgValue], ctx: &CommandContext) -> CommandResult {
     // hidden. Field lookup via `get_record` follows alias→canonical;
     // for simple PVs the field-dump branch silently
     // skips since they're not records.
-    let mut names = ctx.block_on(ctx.db().all_record_names());
-    names.extend(ctx.db().all_alias_names());
-    names.extend(ctx.block_on(ctx.db().all_simple_pv_names()));
-    names.sort();
-    names.dedup();
+    let mut names = record_names_type_major(ctx);
+    let mut extra: Vec<String> = ctx.db().all_alias_names();
+    extra.extend(ctx.block_on(ctx.db().all_simple_pv_names()));
+    extra.sort();
+    extra.dedup();
+    extra.retain(|n| !names.contains(n));
+    names.extend(extra);
 
-    let mut count = 0;
     for name in &names {
         if !glob_match(pattern, name) {
             continue;
         }
-        ctx.println(name);
-        count += 1;
-        if fields.is_empty() {
-            continue;
-        }
-        // Dump each requested field for this record.
-        if let Some(rec_arc) = ctx.db().get_record(name) {
-            let inst = rec_arc.read();
-            for fname in &fields {
-                let value = inst
-                    .record
-                    .get_field(fname)
-                    .map(|v| format!("{v:?}"))
-                    .unwrap_or_else(|| "<no field>".to_string());
-                ctx.println(&format!("  {fname:>8}: {value}"));
-            }
-        }
+        print_fields_list(ctx, name, &fields);
     }
-    ctx.println(&format!("Total: {count} records"));
     Ok(CommandOutcome::Continue)
 }
 
@@ -584,7 +876,7 @@ fn cmd_dbglob() -> CommandDef {
         ],
         "dbglob [pattern] [fields] — Search records by name pattern \
          (epics-base PR #626; `?` matches 0-or-1 chars)",
-        dbsr_handler,
+        dbglob_handler,
     )
 }
 
@@ -605,17 +897,28 @@ fn cmd_dbgrep() -> CommandDef {
         ],
         "dbgrep [pattern] [fields] — Search records by name pattern \
          (legacy spelling of dbglob, epics-base PR #626)",
-        dbsr_handler,
+        dbglob_handler,
     )
 }
 
 fn cmd_scanppl() -> CommandDef {
     CommandDef::new(
         "scanppl",
-        vec![],
-        "scanppl — Print scan phase lists",
-        |_args: &[ArgValue], ctx: &CommandContext| {
+        vec![ArgDesc {
+            name: "rate",
+            arg_type: ArgType::Double,
+            optional: true,
+        }],
+        "scanppl [rate] — Print periodic scan lists, optionally just one rate",
+        |args: &[ArgValue], ctx: &CommandContext| {
             use crate::server::record::ScanType;
+            // C `scanppl` (`dbScan.c:394-405`): a positive rate selects
+            // the one periodic list whose period is within 0.05 s; 0 or
+            // no argument prints them all.
+            let rate = match args.first() {
+                Some(ArgValue::Double(r)) if *r > 0.0 => Some(*r),
+                _ => None,
+            };
             let scan_types = [
                 ScanType::Sec01,
                 ScanType::Sec02,
@@ -629,9 +932,34 @@ fn cmd_scanppl() -> CommandDef {
             ];
 
             for st in &scan_types {
+                if let Some(rate) = rate {
+                    let matches = st
+                        .interval()
+                        .is_some_and(|d| (rate - d.as_secs_f64()).abs() <= 0.05);
+                    if !matches {
+                        continue;
+                    }
+                }
                 let names = ctx.block_on(ctx.db().records_for_scan(*st));
                 if !names.is_empty() {
-                    ctx.println(&format!("{st}: {} records", names.len()));
+                    // C prints the list's cumulative over-run count in the
+                    // header — `Records with SCAN = '%s' (%lu over-runs):`
+                    // (`dbScan.c:408-409`). It is the observable half of the
+                    // over-run rule: without it a list that keeps missing its
+                    // deadline looks identical to one that never does. Only
+                    // periodic rates have the counter; C keeps it on
+                    // `periodic_scan_list`, and the event and passive lists
+                    // are not one.
+                    let overruns = crate::server::scan::PERIODIC_SCANS
+                        .contains(st)
+                        .then(|| st.scan_list().map(|l| ctx.db().scan_overruns(l)))
+                        .flatten();
+                    match overruns {
+                        Some(n) => {
+                            ctx.println(&format!("{st}: {} records ({n} over-runs)", names.len()))
+                        }
+                        None => ctx.println(&format!("{st}: {} records", names.len())),
+                    }
                     for name in &names {
                         ctx.println(&format!("  {name}"));
                     }
@@ -641,7 +969,7 @@ fn cmd_scanppl() -> CommandDef {
             let io_count = ctx
                 .block_on(ctx.db().records_for_scan(ScanType::IoIntr))
                 .len();
-            if io_count > 0 {
+            if rate.is_none() && io_count > 0 {
                 ctx.println(&format!("I/O Intr: {io_count} records"));
             }
             Ok(CommandOutcome::Continue)
@@ -669,7 +997,7 @@ fn cmd_pushd() -> CommandDef {
             };
             match &args[0] {
                 ArgValue::String(dir) => {
-                    if let Err(e) = std::env::set_current_dir(dir) {
+                    if let Err(e) = super::core_commands::set_working_dir(dir) {
                         return Err(format!("pushd: {dir}: {e}"));
                     }
                     dir_stack().lock().unwrap().push(cwd);
@@ -680,7 +1008,7 @@ fn cmd_pushd() -> CommandDef {
                     let Some(top) = stack.pop() else {
                         return Err("pushd: directory stack empty".into());
                     };
-                    if let Err(e) = std::env::set_current_dir(&top) {
+                    if let Err(e) = super::core_commands::set_working_dir(&top) {
                         // Restore on failure.
                         stack.push(top);
                         return Err(format!("pushd: {e}"));
@@ -705,7 +1033,7 @@ fn cmd_popd() -> CommandDef {
             let Some(top) = stack.pop() else {
                 return Err("popd: directory stack empty".into());
             };
-            if let Err(e) = std::env::set_current_dir(&top) {
+            if let Err(e) = super::core_commands::set_working_dir(&top) {
                 // Restore the entry — failed cd must not lose stack state.
                 stack.push(top);
                 return Err(format!("popd: {e}"));
@@ -753,37 +1081,52 @@ fn cmd_db_create_record() -> CommandDef {
         "dbCreateRecord",
         vec![
             ArgDesc {
+                name: "pdbbase",
+                arg_type: ArgType::String,
+                optional: true,
+            },
+            ArgDesc {
                 name: "recordType",
                 arg_type: ArgType::String,
-                optional: false,
+                optional: true,
             },
             ArgDesc {
                 name: "recordName",
                 arg_type: ArgType::String,
-                optional: false,
+                optional: true,
             },
         ],
-        "dbCreateRecord <type> <name> — Create a new record of <type> (before iocInit)",
+        "dbCreateRecord pdbbase <type> <name> — Create a new record of <type> (before iocInit)",
         |args: &[ArgValue], ctx: &CommandContext| {
+            // C `dbStaticIocRegister.c:36-42` declares the leading
+            // `iocshArgPdbbase`, and `cvtArg` (`iocsh.cpp:878-890`)
+            // accepts it missing, starting with `0`, or spelled
+            // `pdbbase`, refusing anything else.
+            if let ArgValue::String(pdbbase) = &args[0]
+                && !(pdbbase.is_empty() || pdbbase.starts_with('0') || pdbbase == "pdbbase")
+            {
+                return Err(format!("Expecting 'pdbbase' got '{pdbbase}'."));
+            }
             // Creating a record IS entering the load phase — the record's links
             // are classified by `iocInit`, with the rest of the database. Once
             // `iocInit` has run there is no phase to enter and C refuses.
             if let Err(e) = ctx.db().begin_load() {
                 return Err(e.to_string());
             }
-            let rec_type = match &args[0] {
-                ArgValue::String(s) => s.clone(),
-                _ => {
-                    ctx.println("dbCreateRecord: missing recordType");
-                    return Ok(CommandOutcome::Continue);
-                }
+            // C `dbStaticIocRegister.c:292-296` asks for the NAME
+            // first and counts an empty one as missing
+            // (`S_dbLib_recordNameMissing`), reaching
+            // `S_dbLib_recordTypeNotFound` only once a name is in
+            // hand. Asking about the type first made a bare
+            // `dbCreateRecord pdbbase` complain about the argument the
+            // operator was not being asked for.
+            let name = match &args[2] {
+                ArgValue::String(s) if !s.is_empty() => s.clone(),
+                _ => return Err("Record name is required".to_string()),
             };
-            let name = match &args[1] {
+            let rec_type = match &args[1] {
                 ArgValue::String(s) => s.clone(),
-                _ => {
-                    ctx.println("dbCreateRecord: missing recordName");
-                    return Ok(CommandOutcome::Continue);
-                }
+                _ => return Err("Record Type does not exist".to_string()),
             };
             // Failures return Err so `on error` sees them — current C
             // base wraps exactly these in `iocshSetError`
@@ -817,11 +1160,11 @@ fn cmd_post_event() -> CommandDef {
     CommandDef::new(
         "postEvent",
         vec![ArgDesc {
-            name: "event",
-            arg_type: ArgType::Int,
+            name: "event name",
+            arg_type: ArgType::String,
             optional: true,
         }],
-        "postEvent [event] — Process records with SCAN=Event",
+        "postEvent <event name> — Manually scan all records with EVNT == name.",
         post_event_handler,
     )
 }
@@ -830,96 +1173,81 @@ fn cmd_post_event_alias() -> CommandDef {
     CommandDef::new(
         "post_event",
         vec![ArgDesc {
-            name: "event",
-            arg_type: ArgType::Int,
+            name: "event name",
+            arg_type: ArgType::String,
             optional: true,
         }],
-        "post_event [event] — Back-compat alias of postEvent",
+        "post_event <event name> — Back-compat alias of postEvent",
         post_event_handler,
     )
 }
 
 fn post_event_handler(args: &[ArgValue], ctx: &CommandContext) -> CommandResult {
-    // C `dbIocRegister.c` `postEvent <event>` routes through
-    // `post_event(int)` -> `postEvent(pevent_list[event])`, posting
-    // ONLY the records whose `EVNT` matches that event. Route to
-    // `post_event_named` when an event argument is given; with no
-    // argument fall back to the (non-C) "process every Event record".
+    // C `postEventCallFunc` (`dbIocRegister.c:472-480`) is
+    // `postEvent(eventNameToHandle(args[0].sval))` and nothing else: the
+    // argument is a NAME, not an index, and the command prints nothing.
+    // `eventNameToHandle` returns NULL for a missing or blank name
+    // (`dbScan.c:480-482`) and `postEvent(NULL)` returns at once, so a
+    // bare `postEvent` scans nothing.
     match args.first() {
-        Some(ArgValue::Int(event)) => {
-            ctx.block_on(ctx.db().post_event_named(&event.to_string()));
-            ctx.println(&format!("Posted event {event}"));
-        }
-        Some(ArgValue::String(name)) if !name.is_empty() => {
+        Some(ArgValue::String(name)) if !name.trim().is_empty() => {
             ctx.block_on(ctx.db().post_event_named(name));
-            ctx.println(&format!("Posted event {name}"));
         }
-        _ => {
-            ctx.block_on(ctx.db().post_event());
-            ctx.println("Event scan processed (all SCAN=Event records)");
-        }
+        _ => {}
     }
     Ok(CommandOutcome::Continue)
 }
 
-/// Simple glob matching (* and ? wildcards).
-fn glob_match(pattern: &str, text: &str) -> bool {
-    let mut pi = pattern.chars().peekable();
-    let mut ti = text.chars().peekable();
+/// C `epicsStrnGlobMatch` (`epicsString.c:282-312`) — the matcher
+/// `dbglob` and `epicsEnvShow` both call. `?` consumes exactly one
+/// character: the trailing `while (*pattern == '*') pattern++` skips
+/// only `*`, so a `?` left over once the string is exhausted fails the
+/// match. `dbglob`'s help text (`dbIocRegister.c:246-248`) says "0 or
+/// one characters", but the code is what runs, and this is a
+/// transcription of the code.
+pub(super) fn epics_strn_glob_match(s: &[u8], len: usize, pattern: &[u8]) -> bool {
+    let len = len.min(s.len());
+    let at = |p: usize| pattern.get(p).copied().unwrap_or(0);
+    let mut mp: Option<usize> = None;
+    let mut cp: usize = 0;
+    let mut i: usize = 0;
+    let mut p: usize = 0;
 
-    fn do_match(
-        pat: &mut std::iter::Peekable<std::str::Chars>,
-        txt: &mut std::iter::Peekable<std::str::Chars>,
-    ) -> bool {
-        while let Some(&pc) = pat.peek() {
-            match pc {
-                '*' => {
-                    pat.next();
-                    if pat.peek().is_none() {
-                        return true; // trailing * matches everything
-                    }
-                    // Try matching rest from every position
-                    loop {
-                        let mut pat_clone = pat.clone();
-                        let mut txt_clone = txt.clone();
-                        if do_match(&mut pat_clone, &mut txt_clone) {
-                            return true;
-                        }
-                        if txt.next().is_none() {
-                            return false;
-                        }
-                    }
-                }
-                '?' => {
-                    // L-1: C `dbglob` documents `?` as matching "0 or
-                    // one characters" (dbIocRegister.c:246-248), not
-                    // exactly one. Try both the skip-zero and
-                    // consume-one branches.
-                    pat.next();
-                    {
-                        let mut pat_zero = pat.clone();
-                        let mut txt_zero = txt.clone();
-                        if do_match(&mut pat_zero, &mut txt_zero) {
-                            return true;
-                        }
-                    }
-                    if txt.next().is_none() {
-                        return false;
-                    }
-                }
-                c => {
-                    pat.next();
-                    match txt.next() {
-                        Some(tc) if tc == c => {}
-                        _ => return false,
-                    }
-                }
-            }
+    while i < len && at(p) != b'*' {
+        if at(p) != s[i] && at(p) != b'?' {
+            return false;
         }
-        txt.peek().is_none()
+        p += 1;
+        i += 1;
     }
+    while i < len {
+        if at(p) == b'*' {
+            p += 1;
+            if at(p) == 0 {
+                return true;
+            }
+            mp = Some(p);
+            cp = i + 1;
+        } else if at(p) == s[i] || at(p) == b'?' {
+            p += 1;
+            i += 1;
+        } else {
+            // The first loop returns on any mismatch, so this branch
+            // is only reachable after a `*` set `mp`.
+            p = mp.unwrap_or(0);
+            i = cp;
+            cp += 1;
+        }
+    }
+    while at(p) == b'*' {
+        p += 1;
+    }
+    at(p) == 0
+}
 
-    do_match(&mut pi, &mut ti)
+/// [`epics_strn_glob_match`] over whole strings — C `epicsStrGlobMatch`.
+fn glob_match(pattern: &str, text: &str) -> bool {
+    epics_strn_glob_match(text.as_bytes(), text.len(), pattern.as_bytes())
 }
 
 fn cmd_ioc_stats() -> CommandDef {
@@ -991,7 +1319,7 @@ fn cmd_db_load_records() -> CommandDef {
             ArgDesc {
                 name: "file",
                 arg_type: ArgType::String,
-                optional: false,
+                optional: true,
             },
             ArgDesc {
                 name: "macros",
@@ -1001,9 +1329,14 @@ fn cmd_db_load_records() -> CommandDef {
         ],
         "dbLoadRecords file [macros] - Load records from a .db/.template file",
         |args: &[ArgValue], ctx: &CommandContext| {
+            // C `dbAccess.c:800-803` tests the file name only for NULL,
+            // so an empty name still reaches the open and fails there.
             let path = match &args[0] {
                 ArgValue::String(s) => s,
-                _ => return Err("invalid argument".to_string()),
+                _ => {
+                    ctx.println("Usage: dbLoadRecords \"file\", \"subs\"");
+                    return Ok(CommandOutcome::Continue);
+                }
             };
             let macros_str = match &args[1] {
                 ArgValue::String(s) => s.as_str(),
@@ -1036,34 +1369,35 @@ fn cmd_db_load_records() -> CommandDef {
 
             let macros = parse_macro_string(macros_str);
 
-            // Build include config from EPICS_DB_INCLUDE_PATH and resolve the
-            // file against it (matching C dbLoadRecords behavior). Shared with
-            // `dbLoadTemplate`, which resolves its `.substitutions` file the
-            // same way.
-            let (config, file_path) = resolve_db_include_path(path);
+            let (config, file_path) = resolve_db_file(path);
             // C `dbLoadRecords` macros are pure text substitution (dbLexRoutines.c
             // → macLib): a `DTYP=` macro reaches a record only where the file wrote
             // `field(DTYP,"$(DTYP)")`. It does NOT rewrite a record that spells its
             // DTYP literally. `parse_db_file_with_breaktables` already performs that
             // substitution, so there is nothing further to do for DTYP here.
-            let (defs, breaktables) =
-                db_loader::parse_db_file_with_breaktables(&file_path, &macros, &config)
-                    .map_err(|e| format!("parse error: {e}"))?;
+            let parsed = db_loader::parse_db_file_with_breaktables(&file_path, &macros, &config)
+                .map_err(|e| format!("parse error: {e}"))?;
 
             // Merge any `breaktable(...)` definitions into the database's shared
             // breakpoint-table registry (C `bptList`) and snapshot it for the
             // records loaded by this command. A record resolves a table loaded
             // by an earlier or the same `dbLoadRecords` (C ordering).
             let breaktable_registry =
-                ctx.block_on(async { ctx.db().add_breaktables(breaktables).await });
+                ctx.block_on(async { ctx.db().add_breaktables(parsed.breaktables).await });
 
-            let count = defs.len();
+            let count = parsed.records.len();
 
             // One install path for both `dbLoadRecords` and `dbLoadTemplate`:
             // each expanded record flows through the SAME per-record routine,
             // so template-loaded records are indistinguishable from directly
             // loaded ones.
-            ctx.block_on(install_record_defs(ctx, defs, &breaktable_registry))?;
+            ctx.block_on(install_record_defs(
+                ctx,
+                parsed.records,
+                parsed.unresolved_aliases,
+                &breaktable_registry,
+                parsed.faults,
+            ))?;
 
             ctx.println(&format!("Loaded {count} record(s) from {path}"));
             Ok(CommandOutcome::Continue)
@@ -1071,42 +1405,77 @@ fn cmd_db_load_records() -> CommandDef {
     )
 }
 
-/// Build the DB include config from `EPICS_DB_INCLUDE_PATH` and resolve
-/// `path` against it: an existing path is used directly; otherwise a
-/// relative name is searched across the include paths (matching C
-/// `dbLoadRecords` search). Shared by `dbLoadRecords` and
-/// `dbLoadTemplate`.
-fn resolve_db_include_path(path: &str) -> (db_loader::DbLoadConfig, std::path::PathBuf) {
-    let include_paths: Vec<std::path::PathBuf> =
-        if let Ok(val) = std::env::var("EPICS_DB_INCLUDE_PATH") {
-            split_db_paths(&val)
-        } else {
-            Vec::new()
-        };
-    let config = db_loader::DbLoadConfig {
-        include_paths,
+/// Build the DB include config from `EPICS_DB_INCLUDE_PATH`, the only
+/// source `dbReadCOM` (`dbLexRoutines.c:244-253`) has for a
+/// `dbLoadRecords` call. C installs the variable through `dbPath` and
+/// falls back to `"."` when it is unset, so both spellings of "no
+/// list" reach the same one-entry search path.
+fn db_load_config() -> db_loader::DbLoadConfig {
+    db_loader::DbLoadConfig {
+        include_paths: std::env::var("EPICS_DB_INCLUDE_PATH").map_or_else(
+            |_| vec![std::path::PathBuf::from(".")],
+            |val| db_loader::db_path(&val),
+        ),
         max_include_depth: 32,
-    };
-    let file_path = {
-        let p = std::path::Path::new(path);
-        if p.exists() {
-            p.to_path_buf()
-        } else if !p.is_absolute() {
-            // Search include paths for relative filenames
-            let mut resolved = None;
-            for dir in &config.include_paths {
-                let candidate = dir.join(p);
-                if candidate.exists() {
-                    resolved = Some(candidate);
-                    break;
-                }
-            }
-            resolved.unwrap_or_else(|| p.to_path_buf())
-        } else {
-            p.to_path_buf()
-        }
-    };
+    }
+}
+
+/// Resolve a `dbLoadRecords` file name through C `dbOpenFile`: the path
+/// list is searched FIRST and the process CWD is never consulted for a
+/// bare name. An unresolved name is handed back unchanged so the open
+/// that follows produces the "cannot read" diagnostic C prints.
+fn resolve_db_file(path: &str) -> (db_loader::DbLoadConfig, std::path::PathBuf) {
+    let config = db_load_config();
+    let file_path = db_loader::db_open_file(path, &config.include_paths)
+        .unwrap_or_else(|| std::path::PathBuf::from(path));
     (config, file_path)
+}
+
+/// Resolve a `dbLoadTemplate` `.substitutions` file. C keeps the
+/// opposite gate here from the one it uses for the templates the file
+/// names: `dbLoadTemplate.y:362-370` tries a bare `fopen(sub_file)`
+/// first and only falls back to the path list when that fails and the
+/// name is not absolute. The templates themselves go through
+/// `dbLoadRecords`, i.e. [`resolve_db_file`]'s rule.
+///
+/// `search_path` is the command's third argument, which C substitutes
+/// for `EPICS_DB_INCLUDE_PATH` when it is non-empty (`:363-366`). It
+/// reaches only this lookup: `dbLoadRecords` resets the path list from
+/// the environment for every template, so the argument never affects
+/// the templates the file names.
+fn resolve_substitutions_file(
+    path: &str,
+    search_path: &str,
+) -> (db_loader::DbLoadConfig, std::path::PathBuf) {
+    let config = db_load_config();
+    let direct = std::path::PathBuf::from(path);
+    if direct.exists() {
+        return (config, direct);
+    }
+    if direct.is_absolute() {
+        return (config, direct);
+    }
+    let search = if search_path.is_empty() {
+        config.include_paths.clone()
+    } else {
+        db_loader::db_path(search_path)
+    };
+    let file_path = db_loader::db_open_file(path, &search).unwrap_or(direct);
+    (config, file_path)
+}
+
+/// How C classifies a per-record `.db` failure. `dbRecordHead` and
+/// `dbRecordField` (`dbLexRoutines.c:1123-1197`, `:1199-1380`) reach for
+/// `yyerror(NULL)` when the record can be skipped and the rest of the file
+/// still read, and for `yyerrorAbort` only when the parse cannot continue
+/// — an unknown record type or a `dbCreateRecord` that failed for any
+/// other reason. The port had one class, so the first skippable record
+/// discarded every record after it.
+enum RecordFault {
+    /// C `yyerror(NULL)`: report, skip this record, keep loading.
+    Recoverable(String),
+    /// C `yyerrorAbort`: stop the load here.
+    Fatal(String),
 }
 
 /// Install each parsed record definition into the database through the
@@ -1123,14 +1492,50 @@ fn resolve_db_include_path(path: &str) -> (db_loader::DbLoadConfig, std::path::P
 async fn install_record_defs(
     ctx: &CommandContext,
     defs: Vec<db_loader::DbRecordDef>,
+    unresolved_aliases: Vec<(String, String)>,
     breaktable_registry: &crate::server::cvt_bpt::BreakTableRegistry,
+    mut faults: db_loader::DbFaults,
 ) -> Result<(), String> {
-    // Non-fatal per-record failures (alias reject, merge-field put): the
-    // load continues past them, but the command must still end in Err so
-    // `on error` fires — C's dbLoadRecords returns non-zero after its
-    // parser recovered and kept going (epics-base#498 / UI-105).
-    let mut deferred: Vec<String> = Vec::new();
+    // Non-fatal per-record failures (alias reject, merge-field put) join
+    // whatever the parse itself recovered from, in the one owner that
+    // decides what recoverable means: the load continues past them, but
+    // the command must still end in Err so `on error` fires — C's
+    // dbLoadRecords returns non-zero after its parser recovered and kept
+    // going (epics-base#498 / UI-105).
     for mut def in defs {
+        // C `dbRecordHead` (`dbLexRoutines.c:1136-1157`) reads two record
+        // types as instructions rather than types: `*` modifies the record
+        // already in the database and `#` deletes it. Both skip the body
+        // when the name is unknown (`duplicate = TRUE`), and they report
+        // it differently — `*` with `yyerror(NULL)`, `#` with a bare
+        // WARNING that leaves the load's status clean. The port passed
+        // both to the record factory, so every such block failed as an
+        // unknown record type and took the load with it.
+        if def.record_type == "*" {
+            let existing = ctx
+                .db()
+                .get_record(&def.name)
+                .map(|rec| rec.read().record.record_type().to_string());
+            match existing {
+                // Continue as the type already there: from here on this is
+                // the same field merge a same-type reload performs, which
+                // is what C's pdbentry does after `dbFindRecord`.
+                Some(t) => def.record_type = t,
+                None => {
+                    faults.recoverable(format!("ERROR: Record '{}' not found", def.name));
+                    continue;
+                }
+            }
+        }
+        if def.record_type == "#" {
+            if !ctx.db().remove_record(&def.name).await {
+                // C also names the file and line here; the port does not
+                // carry either as far as the install loop.
+                eprintln!("WARNING: Record '{}' not found, can't delete", def.name);
+            }
+            continue;
+        }
+
         // Resolve a `LINR` field naming a loaded breakpoint table to its
         // menuConvert index (shared with the IocBuilder load path).
         db_loader::resolve_linr_breaktable_names(
@@ -1138,23 +1543,27 @@ async fn install_record_defs(
             &mut def.fields,
             breaktable_registry,
         );
-        let added: Result<(), String> = async {
+        let added: Result<(), RecordFault> = async {
             // C-parity (dbLexRoutines.c:1170-1188): the SAME
             // record name re-loaded with the SAME record_type
             // merges fields into the existing instance (the
             // standard ADCore convention — simDetector.template
             // overrides ColorMode menu choices declared by its
             // included NDArrayBase.template). A different
-            // record_type is fatal. `dbRecordsOnceOnly` global
-            // is not yet wired; tighten here if/when needed.
+            // record_type is skipped with `yyerror(NULL)`, and the
+            // diagnostic names the type being LOADED first and the
+            // type already there last — `recordType` is the new one
+            // and `dbGetRecordTypeName(pdbentry)` the existing one
+            // (`dbLexRoutines.c:1173-1180`). `dbRecordsOnceOnly`
+            // global is not yet wired; tighten here if/when needed.
             let existing = if let Some(rec) = ctx.db().get_record(&def.name) {
                 let r = rec.read();
                 let existing_type = r.record.record_type();
                 if existing_type != def.record_type {
-                    return Err(format!(
-                        "dbLoadRecords: {} record '{}' already exists, can't load {} record",
-                        existing_type, def.name, def.record_type
-                    ));
+                    return Err(RecordFault::Recoverable(format!(
+                        "ERROR: {} record '{}' already exists, can't load {} record",
+                        def.record_type, def.name, existing_type
+                    )));
                 }
                 drop(r);
                 Some(rec)
@@ -1172,20 +1581,27 @@ async fn install_record_defs(
                     if let Err(e) =
                         db_loader::apply_fields(&mut inst.record, &def.fields, &mut common_fields)
                     {
-                        return Err(format!("{e}"));
+                        // C `dbRecordField` ends every one of its failure
+                        // arms in `yyerror(NULL)` — a bad field name or an
+                        // unconvertible value skips that record, never the
+                        // file (`dbLexRoutines.c:1206-1380`).
+                        return Err(RecordFault::Recoverable(format!("{e}")));
                     }
                 }
                 rec_arc
             } else {
-                let mut record =
-                    db_loader::create_record(&def.record_type).map_err(|e| format!("{e}"))?;
+                // C `dbFindRecordType` failing is `yyerrorAbort`
+                // (`dbLexRoutines.c:1159-1165`) — an unknown record type
+                // stops the load on both sides.
+                let mut record = db_loader::create_record(&def.record_type)
+                    .map_err(|e| RecordFault::Fatal(format!("{e}")))?;
                 // The breakpoint-table registry is installed by the
                 // creation sink; apply_fields only needs the LINR
                 // index, already resolved above.
                 if let Err(e) =
                     db_loader::apply_fields(&mut record, &def.fields, &mut common_fields)
                 {
-                    return Err(format!("{e}"));
+                    return Err(RecordFault::Recoverable(format!("{e}")));
                 }
                 // Record + its whole loaded field set in one call: the
                 // sink applies the common fields and info tags, THEN
@@ -1197,13 +1613,19 @@ async fn install_record_defs(
                     info_tags: def.info_tags.clone(),
                 };
                 if let Err(e) = ctx.db().add_loaded_record(&def.name, record, load).await {
-                    return Err(format!("dbLoadRecords: '{}' rejected: {e}", def.name));
+                    // C `dbCreateRecord` failing for anything other than
+                    // `S_dbLib_recExists` is `yyerrorAbort`
+                    // (`dbLexRoutines.c:1187-1192`).
+                    return Err(RecordFault::Fatal(format!(
+                        "dbLoadRecords: '{}' rejected: {e}",
+                        def.name
+                    )));
                 }
                 ctx.db().get_record(&def.name).ok_or_else(|| {
-                    format!(
+                    RecordFault::Fatal(format!(
                         "dbLoadRecords: '{}' vanished between add_record and get_record",
                         def.name
-                    )
+                    ))
                 })?
             };
 
@@ -1214,12 +1636,10 @@ async fn install_record_defs(
             // are also registered (C parser appends).
             for alias in &def.aliases {
                 if let Err(e) = ctx.db().add_alias(alias, &def.name).await {
-                    let msg = format!(
+                    faults.recoverable(format!(
                         "dbLoadRecords: alias '{alias}' for '{}' rejected: {e}",
                         def.name
-                    );
-                    eprintln!("{msg}");
-                    deferred.push(msg);
+                    ));
                 }
             }
 
@@ -1271,10 +1691,10 @@ async fn install_record_defs(
                         }
                         Ok(CommonFieldPutResult::NoChange) => {}
                         Err(e) => {
-                            let msg =
-                                format!("put_common_field({name}) failed for {}: {e}", def.name);
-                            eprintln!("{msg}");
-                            deferred.push(msg);
+                            faults.recoverable(format!(
+                                "put_common_field({name}) failed for {}: {e}",
+                                def.name
+                            ));
                         }
                     }
                 }
@@ -1309,38 +1729,52 @@ async fn install_record_defs(
             // `init_record` — the only site that loads a constant INP
             // into the record's value.
             ctx.db().rec_gbl_init_constant_links(&rec_arc);
-            // C `recGblInitSimm` + `recGblInitConstantLink(&siol, …,
-            // &sval)`, run from every SIML-bearing `init_record`
-            // (pass 1) — the only site that loads a constant
-            // SIML/SIOL into SIMM/SVAL.
-            ctx.db().rec_gbl_init_simm(&rec_arc);
-            // C `wdogInit(prec)` from `init_record` pass 1
-            // (histogramRecord.c:168) — arms the SDEL monitor
-            // watchdog; a re-arm supersedes the previous one, which is
-            // what the merge re-init above needs.
-            ctx.db().arm_watchdog(&def.name);
+            if is_merge {
+                // A merge re-ran `run_init_passes` above against the new
+                // field set, so the rest of pass 1 owes a re-run too: a
+                // second block may have introduced SIML/SIOL or moved SDEL.
+                // A FRESH record takes both from the creation sink
+                // (`PvDatabase::add_loaded_record`) and must not repeat them
+                // here — `arm_watchdog` would spawn a second task and
+                // supersede the first for nothing.
+                ctx.db().rec_gbl_init_simm(&rec_arc);
+                ctx.db().arm_watchdog(&def.name);
+            }
             Ok(())
         }
         .await;
-        if let Err(e) = added {
-            // epics-base 144f975: propagate the failure to the
-            // iocsh script chain (equivalent of `iocshSetError`)
-            // so a startup script returns non-zero on a rejected
-            // record load. The printed message stays for
-            // operator-visible diagnostics; the `Err` return
-            // lets `execute_script` mark its `last_err`.
-            ctx.println(&e);
-            return Err(e);
+        match added {
+            Ok(()) => {}
+            // The load's status still goes non-zero (epics-base 144f975:
+            // the `iocshSetError` equivalent, so a startup script fails),
+            // but the records already installed stay and the ones after
+            // this record are still read.
+            Err(RecordFault::Recoverable(msg)) => faults.recoverable(msg),
+            Err(RecordFault::Fatal(msg)) => {
+                ctx.println(&msg);
+                return Err(msg);
+            }
         }
     }
-    if let Some(first) = deferred.first() {
-        return Err(if deferred.len() == 1 {
-            first.clone()
+    // File-scope `alias("record","new")` whose target this file does not
+    // declare. C `dbAlias` (`dbLexRoutines.c:1508`) resolves against
+    // `savedPdbbase`, so a record installed by an earlier
+    // `dbLoadRecords` is a legal target; running after the loop above
+    // means this file's own records are equally visible. A target
+    // nothing owns gets C's diagnostic and fails the call's status
+    // through the fault owner, leaving every record that parsed installed.
+    for (target, alias) in unresolved_aliases {
+        let msg = if ctx.db().get_record(&target).is_none() {
+            db_loader::unknown_alias_message(&alias, &target)
+        } else if let Err(e) = ctx.db().add_alias(&alias, &target).await {
+            format!("dbLoadRecords: alias '{alias}' for '{target}' rejected: {e}")
         } else {
-            format!("{first} (+{} more)", deferred.len() - 1)
-        });
+            continue;
+        };
+        faults.recoverable(msg);
     }
-    Ok(())
+
+    faults.status()
 }
 
 /// `dbLoadTemplate(subFile [, globalMacros])` — load records described by
@@ -1363,21 +1797,35 @@ fn cmd_db_load_template() -> CommandDef {
             ArgDesc {
                 name: "subFile",
                 arg_type: ArgType::String,
-                optional: false,
+                optional: true,
             },
             ArgDesc {
-                name: "globalMacros",
+                name: "var1=value1,var2=value2",
+                arg_type: ArgType::String,
+                optional: true,
+            },
+            ArgDesc {
+                name: "path1:path2:...",
                 arg_type: ArgType::String,
                 optional: true,
             },
         ],
-        "dbLoadTemplate subFile [globalMacros] - Load records from a .substitutions file",
+        "dbLoadTemplate subFile [globalMacros] [path] - Load records from a .substitutions file",
         |args: &[ArgValue], ctx: &CommandContext| {
+            // C `dbLoadTemplate.y:344-347` diagnoses a missing or empty
+            // name itself, on stderr, and returns -1.
             let path = match &args[0] {
-                ArgValue::String(s) => s,
-                _ => return Err("invalid argument".to_string()),
+                ArgValue::String(s) if !s.is_empty() => s,
+                _ => {
+                    eprintln!("must specify variable substitution file");
+                    return Ok(CommandOutcome::Continue);
+                }
             };
             let macros_str = match &args[1] {
+                ArgValue::String(s) => s.as_str(),
+                _ => "",
+            };
+            let search_path = match &args[2] {
                 ArgValue::String(s) => s.as_str(),
                 _ => "",
             };
@@ -1395,33 +1843,43 @@ fn cmd_db_load_template() -> CommandDef {
 
             let macros = parse_macro_string(macros_str);
 
-            // Resolve the `.substitutions` file the same way `dbLoadRecords`
-            // resolves a `.db` file (existing path, else EPICS_DB_INCLUDE_PATH).
-            let (config, file_path) = resolve_db_include_path(path);
+            let (config, file_path) = resolve_substitutions_file(path, search_path);
 
-            // `load_substitution_file` parses the `.substitutions` file, then
-            // for every template load it describes calls `parse_db_file` with
-            // the merged macro set (globals + row, row winning), concatenating
-            // the records — the same parser `dbLoadRecords` uses. No second
-            // substitutions parser.
-            let defs = db_loader::load_substitution_file(&file_path, &macros, &config)
+            // C `dbLoadTemplate` issues one `dbLoadRecords` per row from
+            // the `pattern_definition` action (`dbLoadTemplate.y:186`), so
+            // each row's records are committed before the next row is even
+            // read and a failing row costs only the rows after it. Resolve,
+            // parse and install one row at a time for the same reason: the
+            // port used to concatenate every row's records and install the
+            // batch, which threw away the rows that had already succeeded.
+            let rows = db_loader::substitution_rows(&file_path, &macros)
                 .map_err(|e| format!("parse error: {e}"))?;
 
-            // `load_substitution_file` does not surface `breaktable(...)`
-            // definitions; snapshot the database's current registry (no
-            // mutation for an empty push) so a template whose `.db` uses a
-            // `LINR` table name loaded by an earlier `dbLoadRecords` still
-            // resolves it, matching that command's install path.
-            let breaktable_registry =
-                ctx.block_on(async { ctx.db().add_breaktables(vec![]).await });
-
-            let count = defs.len();
-
-            // Identical install path to `dbLoadRecords`: same duplicate-name
-            // merge, field application, load-then-init ordering and post-load
-            // passes, so a template-loaded record is indistinguishable from a
-            // directly loaded one.
-            ctx.block_on(install_record_defs(ctx, defs, &breaktable_registry))?;
+            let mut count = 0usize;
+            for (file, merged) in rows {
+                let template = db_loader::resolve_template(&file, &config.include_paths)
+                    .map_err(|e| format!("parse error: {e}"))?;
+                let parsed = db_loader::parse_db_file_with_breaktables(&template, &merged, &config)
+                    .map_err(|e| format!("parse error: {e}"))?;
+                // Each row IS a `dbLoadRecords`, so its `breaktable(...)`
+                // definitions join the database registry exactly as that
+                // command's do, and a later row's `LINR` name resolves
+                // against them.
+                let breaktable_registry =
+                    ctx.block_on(async { ctx.db().add_breaktables(parsed.breaktables).await });
+                count += parsed.records.len();
+                // Identical install path to `dbLoadRecords`: same
+                // duplicate-name merge, field application, load-then-init
+                // ordering and post-load passes, so a template-loaded record
+                // is indistinguishable from a directly loaded one.
+                ctx.block_on(install_record_defs(
+                    ctx,
+                    parsed.records,
+                    parsed.unresolved_aliases,
+                    &breaktable_registry,
+                    parsed.faults,
+                ))?;
+            }
 
             ctx.println(&format!("Loaded {count} record(s) from {path}"));
             Ok(CommandOutcome::Continue)
@@ -1455,6 +1913,11 @@ fn cmd_epics_env_set() -> CommandDef {
                 _ => return Err("invalid argument".to_string()),
             };
 
+            // C `epicsEnvSet` (`osdEnv.c:47-52`) clears the shell macro
+            // of the same name FIRST, so a caller-installed
+            // `iocshLoad("inner.cmd","PORT=OLD")` macro stops shadowing
+            // the variable the loaded script is setting.
+            super::iocsh_env_clear(name);
             // SAFETY: We're single-threaded in the REPL, and this matches C EPICS behavior
             unsafe { std::env::set_var(name, value) };
             Ok(CommandOutcome::Continue)
@@ -1556,6 +2019,21 @@ pub fn macro_defn_pairs(s: &str) -> Vec<(String, Option<String>)> {
     let mut pending_ws = String::new();
     let mut quote: Option<char> = None;
 
+    // Enter the token from a "pre" state if needed and report whether it
+    // is a VALUE: C removes quotes and escapes from names in place
+    // "(unlike values, they will not be re-parsed)" (`macUtil.c:198-200`),
+    // so a value keeps them for the expander's `discard` to strip.
+    macro_rules! enter_token {
+        () => {{
+            match state {
+                St::PreName => state = St::InName,
+                St::PreValue => state = St::InValue,
+                _ => {}
+            }
+            matches!(state, St::InValue)
+        }};
+    }
+
     // Append a literal char to the token for the current state, entering
     // the token from a "pre" state if needed and flushing buffered ws.
     macro_rules! push_lit {
@@ -1581,9 +2059,12 @@ pub fn macro_defn_pairs(s: &str) -> Vec<(String, Option<String>)> {
     while i < chars.len() {
         let c = chars[i];
 
-        // Escape: `\X` makes `X` a literal (and not a delimiter); the
-        // backslash itself is dropped. Quotes do not suppress escapes.
+        // Escape: `\X` makes `X` a literal (and not a delimiter).
+        // Quotes do not suppress escapes.
         if c == '\\' && i + 1 < chars.len() {
+            if enter_token!() {
+                push_lit!('\\');
+            }
             push_lit!(chars[i + 1]);
             i += 2;
             continue;
@@ -1593,6 +2074,9 @@ pub fn macro_defn_pairs(s: &str) -> Vec<(String, Option<String>)> {
         if let Some(q) = quote {
             if c == q {
                 quote = None;
+                if enter_token!() {
+                    push_lit!(c);
+                }
             } else {
                 push_lit!(c);
             }
@@ -1602,10 +2086,8 @@ pub fn macro_defn_pairs(s: &str) -> Vec<(String, Option<String>)> {
         if c == '\'' || c == '"' {
             quote = Some(c);
             // An opening quote also begins the token (e.g. `=""`).
-            match state {
-                St::PreName => state = St::InName,
-                St::PreValue => state = St::InValue,
-                _ => {}
+            if enter_token!() {
+                push_lit!(c);
             }
             i += 1;
             continue;
@@ -1615,7 +2097,7 @@ pub fn macro_defn_pairs(s: &str) -> Vec<(String, Option<String>)> {
             St::PreName => {
                 if c == '=' {
                     state = St::PreValue;
-                } else if !(c.is_ascii_whitespace() || c == ',') {
+                } else if !(crate::runtime::stdlib::c_isspace(c) || c == ',') {
                     state = St::InName;
                     name.push(c);
                 }
@@ -1630,7 +2112,7 @@ pub fn macro_defn_pairs(s: &str) -> Vec<(String, Option<String>)> {
                     pending_ws.clear();
                     out.push((std::mem::take(&mut name), None));
                     state = St::PreName;
-                } else if c.is_ascii_whitespace() {
+                } else if crate::runtime::stdlib::c_isspace(c) {
                     pending_ws.push(c);
                 } else {
                     name.push_str(&pending_ws);
@@ -1642,7 +2124,7 @@ pub fn macro_defn_pairs(s: &str) -> Vec<(String, Option<String>)> {
                 if c == ',' {
                     out.push((std::mem::take(&mut name), Some(String::new())));
                     state = St::PreName;
-                } else if !c.is_ascii_whitespace() {
+                } else if !crate::runtime::stdlib::c_isspace(c) {
                     state = St::InValue;
                     value.push(c);
                 }
@@ -1653,7 +2135,7 @@ pub fn macro_defn_pairs(s: &str) -> Vec<(String, Option<String>)> {
                     pending_ws.clear();
                     out.push((std::mem::take(&mut name), Some(std::mem::take(&mut value))));
                     state = St::PreName;
-                } else if c.is_ascii_whitespace() {
+                } else if crate::runtime::stdlib::c_isspace(c) {
                     pending_ws.push(c);
                 } else {
                     value.push_str(&pending_ws);
@@ -1676,7 +2158,11 @@ pub fn macro_defn_pairs(s: &str) -> Vec<(String, Option<String>)> {
 }
 
 /// Parse a macro string like "P=IOC:,R=TEMP" into a HashMap.
-/// Macro values may reference environment variables via `$(ENVVAR)`.
+///
+/// C `macParseDefns` (`macUtil.c`) receives text `macDefExpand` has
+/// already expanded and never consults the environment itself, so the
+/// values land here verbatim — expanding them again would resolve a
+/// `$(X)` the caller deliberately quoted through.
 ///
 /// Splitting honors quotes/escapes and trims whitespace via
 /// [`macro_defn_pairs`] so `DESC="a,b",P=IOC:` keeps `a,b` as one value
@@ -1690,7 +2176,7 @@ pub(super) fn parse_macro_string(s: &str) -> HashMap<String, String> {
             if k.is_empty() {
                 continue;
             }
-            macros.insert(k, super::registry::substitute_env_vars(&v));
+            macros.insert(k, v);
         }
     }
     macros
@@ -1822,72 +2308,6 @@ fn edit_distance_short(a: &str, b: &str) -> usize {
     prev[b.len()]
 }
 
-/// Get a display name for the DBF type of a value.
-fn dbf_type_name(val: &EpicsValue) -> &'static str {
-    match val {
-        EpicsValue::String(_) => "DBF_STRING",
-        EpicsValue::Short(_) => "DBF_SHORT",
-        EpicsValue::Float(_) => "DBF_FLOAT",
-        EpicsValue::Enum(_) | EpicsValue::EnumWithChoices { .. } => "DBF_ENUM",
-        EpicsValue::Char(_) => "DBF_CHAR",
-        EpicsValue::Long(_) => "DBF_LONG",
-        EpicsValue::Double(_) => "DBF_DOUBLE",
-        EpicsValue::Int64(_) | EpicsValue::Int64Array(_) => "DBF_INT64",
-        EpicsValue::UInt64(_) | EpicsValue::UInt64Array(_) => "DBF_UINT64",
-        EpicsValue::UShort(_) | EpicsValue::UShortArray(_) => "DBF_USHORT",
-        EpicsValue::ULong(_) | EpicsValue::ULongArray(_) => "DBF_ULONG",
-        EpicsValue::UChar(_) | EpicsValue::UCharArray(_) => "DBF_UCHAR",
-        EpicsValue::ShortArray(_) => "DBF_SHORT",
-        EpicsValue::FloatArray(_) => "DBF_FLOAT",
-        EpicsValue::EnumArray(_) => "DBF_ENUM",
-        EpicsValue::DoubleArray(_) => "DBF_DOUBLE",
-        EpicsValue::LongArray(_) => "DBF_LONG",
-        EpicsValue::CharArray(_) => "DBF_CHAR",
-        EpicsValue::StringArray(_) => "DBF_STRING",
-    }
-}
-
-/// Split `EPICS_DB_INCLUDE_PATH` into individual paths.
-///
-/// Supports both `;`-separated (Windows convention) and `:`-separated (Unix convention)
-/// path lists. When splitting on `:`, a single ASCII letter followed by `:` is treated
-/// as a Windows drive letter and is NOT used as a split point.
-fn split_db_paths(val: &str) -> Vec<std::path::PathBuf> {
-    if val.contains(';') {
-        return val
-            .split(';')
-            .filter(|s| !s.is_empty())
-            .map(std::path::PathBuf::from)
-            .collect();
-    }
-    let mut paths = Vec::new();
-    let mut current = String::new();
-    for ch in val.chars() {
-        if ch == ':' {
-            let is_drive = current.len() == 1
-                && current
-                    .chars()
-                    .next()
-                    .map(|c| c.is_ascii_alphabetic())
-                    .unwrap_or(false);
-            if is_drive {
-                current.push(':');
-            } else {
-                if !current.is_empty() {
-                    paths.push(std::path::PathBuf::from(&current));
-                    current.clear();
-                }
-            }
-        } else {
-            current.push(ch);
-        }
-    }
-    if !current.is_empty() {
-        paths.push(std::path::PathBuf::from(current));
-    }
-    paths
-}
-
 /// Map common field names to their DBF types.
 fn common_field_dbf_type(field: &str) -> Option<crate::types::DbFieldType> {
     use crate::types::DbFieldType;
@@ -1924,6 +2344,353 @@ mod tests {
         // Leak the runtime so it stays alive for the test
         std::mem::forget(rt);
         (db, ctx)
+    }
+
+    /// `scanppl` prints each periodic list's cumulative over-run count —
+    /// C `Records with SCAN = '%s' (%lu over-runs):` (`dbScan.c:408-409`).
+    /// It is the observable half of the over-run rule: without it a list
+    /// that keeps missing its deadline reads exactly like one that never
+    /// does. The event and passive lists have no such counter in C.
+    #[test]
+    fn scanppl_prints_the_over_run_count_for_periodic_lists() {
+        use crate::server::record::ScanType;
+        use std::io::Write;
+        use std::sync::Mutex;
+
+        struct Sink(Arc<Mutex<Vec<u8>>>);
+        impl Write for Sink {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let (db, ctx) = make_ctx();
+        ctx.block_on(async {
+            db.add_record("TICKER", Box::new(AiRecord::new(1.0)))
+                .await
+                .unwrap();
+            db.add_record("IDLE", Box::new(AiRecord::new(1.0)))
+                .await
+                .unwrap();
+        });
+        db.get_record("TICKER").unwrap().write().common.scan = ScanType::Sec1;
+        db.update_scan_index("TICKER", ScanType::Passive, ScanType::Sec1, 0, 0);
+        db.get_record("IDLE").unwrap().write().common.scan = ScanType::Event;
+        db.update_scan_index("IDLE", ScanType::Passive, ScanType::Event, 0, 0);
+        for _ in 0..3 {
+            db.record_scan_overrun(ScanType::Sec1);
+        }
+
+        let buf = Arc::new(Mutex::new(Vec::new()));
+        let mut registry = CommandRegistry::new();
+        register_builtins(&mut registry);
+        let cmd = registry.get("scanppl").unwrap();
+        let args = parse_args(&[], &cmd.args).unwrap();
+        ctx.with_output(Sink(buf.clone()), || {
+            cmd.handler.call(&args, &ctx).unwrap();
+        });
+        let out = String::from_utf8(buf.lock().unwrap().clone()).unwrap();
+
+        assert!(
+            out.contains("1 second: 1 records (3 over-runs)"),
+            "periodic list carries its over-run count — got:\n{out}"
+        );
+        assert!(
+            out.contains("Event: 1 records\n"),
+            "a non-periodic list has no over-run counter in C — got:\n{out}"
+        );
+    }
+
+    /// Run `handler` with the context's stdout sink pointed at a temp
+    /// file and return what it wrote.
+    fn capture(ctx: &CommandContext, f: impl FnOnce()) -> String {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let path = tmp.path().to_path_buf();
+        ctx.with_output(std::fs::File::create(&path).unwrap(), f);
+        std::fs::read_to_string(&path).unwrap()
+    }
+
+    fn run_cmd(ctx: &CommandContext, name: &str, tokens: &[&str]) -> String {
+        let mut registry = CommandRegistry::new();
+        register_builtins(&mut registry);
+        let cmd = registry.get(name).unwrap();
+        let tokens: Vec<String> = tokens.iter().map(|t| t.to_string()).collect();
+        let args = parse_args(&tokens, &cmd.args).unwrap();
+        capture(ctx, || {
+            cmd.handler.call(&args, ctx).unwrap();
+        })
+    }
+
+    /// C `dbl` (`dbTest.c:164-180`, registered with TWO args at
+    /// `dbIocRegister.c:203`): `*` and `""` are the all-types sentinel,
+    /// the field list is SPACE separated and printed inline by
+    /// `printFieldsList`, and an unknown type prints `No record type`.
+    #[test]
+    fn dbl_sentinel_fields_and_unknown_type_match_c() {
+        let (db, ctx) = make_ctx();
+        ctx.block_on(async {
+            db.add_record("AI_REC", Box::new(AiRecord::new(1.0)))
+                .await
+                .unwrap();
+            db.add_record(
+                "BO_REC",
+                Box::new(crate::server::records::bo::BoRecord::new(0)),
+            )
+            .await
+            .unwrap();
+        });
+
+        // `*` is the sentinel, not a record type to compare against.
+        let starred = run_cmd(&ctx, "dbl", &["*"]);
+        assert_eq!(
+            starred,
+            "AI_REC
+BO_REC
+",
+            "got {starred:?}"
+        );
+        // So is the empty string.
+        assert_eq!(
+            run_cmd(&ctx, "dbl", &[""]),
+            "AI_REC
+BO_REC
+"
+        );
+
+        // Second argument: space separated, one line per record.
+        let fields = run_cmd(&ctx, "dbl", &["ai", "VAL recordType"]);
+        assert_eq!(fields, "AI_REC, \"1\", \"ai\"\n", "got {fields:?}");
+        // A comma-separated list is ONE field name in C, and no record
+        // has it, so each record contributes a bare separator.
+        let commas = run_cmd(&ctx, "dbl", &["ai", "VAL,recordType"]);
+        assert_eq!(commas, "AI_REC, \n", "got {commas:?}");
+
+        assert_eq!(run_cmd(&ctx, "dbl", &["nosuchtype"]), "No record type\n");
+    }
+
+    /// C `dbglob` (`dbTest.c:298-345`): space-separated field list,
+    /// one `printFieldsList` line per match, no trailing total, and a
+    /// usage line when the pattern is missing or empty.
+    #[test]
+    fn dbglob_line_shape_matches_c() {
+        let (db, ctx) = make_ctx();
+        ctx.block_on(async {
+            db.add_record("SIM:T1", Box::new(AiRecord::new(1.0)))
+                .await
+                .unwrap();
+            db.add_record("SIM:T2", Box::new(AiRecord::new(2.0)))
+                .await
+                .unwrap();
+            db.add_record("OTHER", Box::new(AiRecord::new(3.0)))
+                .await
+                .unwrap();
+        });
+
+        let plain = run_cmd(&ctx, "dbglob", &["SIM:*"]);
+        assert_eq!(plain, "SIM:T1\nSIM:T2\n", "got {plain:?}");
+
+        let with_fields = run_cmd(&ctx, "dbglob", &["SIM:*", "VAL recordType"]);
+        assert_eq!(
+            with_fields, "SIM:T1, \"1\", \"ai\"\nSIM:T2, \"2\", \"ai\"\n",
+            "got {with_fields:?}"
+        );
+
+        assert_eq!(
+            run_cmd(&ctx, "dbglob", &[]),
+            "Usage: dbglob \"pattern\" \"fields\"\n"
+        );
+        assert_eq!(
+            run_cmd(&ctx, "dbgrep", &[""]),
+            "Usage: dbglob \"pattern\" \"fields\"\n"
+        );
+    }
+
+    /// C `printBuffer` (`dbTest.c:986-1150`) through `dbpr_msgOut`'s
+    /// 10-column tab buffer: `DBF_<T>:` padded to the next tab stop,
+    /// integers with a hex companion, strings quoted and escaped,
+    /// doubles at `%.12g`, and a DBR_ENUM field re-read as DBR_STRING.
+    #[test]
+    fn dbgf_line_shape_matches_c() {
+        assert_eq!(
+            dbgf_lines(&EpicsValue::Long(42)),
+            vec![format!("DBF_LONG:{}42 = 0x2a ", " ".repeat(11))]
+        );
+        assert_eq!(
+            dbgf_lines(&EpicsValue::Long(-1)),
+            // The value crosses the 30-column stop, so the fill runs to
+            // 40 exactly as C's dbpr_insert_msg does.
+            vec![format!(
+                "DBF_LONG:{}-1 = 0xffffffff{}",
+                " ".repeat(11),
+                " ".repeat(5)
+            )]
+        );
+        assert_eq!(
+            dbgf_lines(&EpicsValue::Double(25.0)),
+            vec![format!("DBF_DOUBLE:{}25{}", " ".repeat(9), " ".repeat(8))]
+        );
+        // %.12g, not Rust's shortest round-trip.
+        assert_eq!(
+            dbgf_lines(&EpicsValue::Double(1.0 / 3.0))[0].trim_end(),
+            "DBF_DOUBLE:         0.333333333333"
+        );
+        assert_eq!(
+            dbgf_lines(&EpicsValue::String("hi\"there".into()))[0].trim_end(),
+            "DBF_STRING:         \"hi\\\"there\""
+        );
+        // DBR_ENUM is fetched as DBR_STRING, so it reports DBF_STRING
+        // and carries the choice text.
+        assert_eq!(
+            dbgf_lines(&EpicsValue::EnumWithChoices {
+                index: 1,
+                choices: vec!["OFF".into(), "ON".into()],
+            })[0]
+                .trim_end(),
+            "DBF_STRING:         \"ON\""
+        );
+    }
+
+    /// A missing or empty name is C's usage line (`dbTest.c:358-361`).
+    #[test]
+    fn dbgf_missing_name_prints_usage() {
+        let (_db, ctx) = make_ctx();
+        assert_eq!(run_cmd(&ctx, "dbgf", &[]), "Usage: dbgf \"pv name\"\n");
+    }
+
+    /// `epicsStrnGlobMatch` (`epicsString.c:282-312`) consumes exactly
+    /// one character per `?`. `dbglob`'s help text claims "0 or one",
+    /// but the trailing skip loop only skips `*`, so a leftover `?`
+    /// fails the match.
+    #[test]
+    fn glob_match_question_mark_consumes_exactly_one() {
+        assert!(glob_match("ab?", "abc"));
+        assert!(!glob_match("ab?", "ab"));
+        assert!(!glob_match("ab?", "abcd"));
+        assert!(glob_match("*", "anything"));
+        assert!(glob_match("a*d", "abcd"));
+        assert!(!glob_match("a*d", "abce"));
+        assert!(glob_match("", ""));
+        assert!(!glob_match("", "x"));
+    }
+
+    /// Every command the mechanical registration sweep found declaring
+    /// fewer arguments than its C `iocshFuncDef`. A narrower
+    /// declaration silently drops the trailing token, and for
+    /// `dbCreateRecord` it shifts every argument by one.
+    #[test]
+    fn registrations_declare_the_c_argument_count() {
+        let mut reg = CommandRegistry::new();
+        register_builtins(&mut reg);
+        for (name, nargs) in [
+            ("dbLoadTemplate", 3), // dbtoolsIocRegister.c:19-24
+            ("dbCreateRecord", 3), // dbStaticIocRegister.c:36-42
+            ("scanppl", 1),        // dbIocRegister.c scanpplArg0
+            ("dbl", 2),            // dbIocRegister.c:203
+        ] {
+            assert_eq!(
+                reg.get(name).unwrap().args.len(),
+                nargs,
+                "{name} must declare C's argument count"
+            );
+        }
+    }
+
+    /// `cvtArg` for `iocshArgPdbbase` (`iocsh.cpp:878-890`) accepts the
+    /// argument missing, starting with `0`, or spelled `pdbbase`, and
+    /// refuses anything else — which is what stops a C script's
+    /// `dbCreateRecord("pdbbase","ai","X")` from being read as
+    /// type `pdbbase`, name `ai`.
+    #[test]
+    fn db_create_record_takes_the_pdbbase_argument() {
+        let (db, ctx) = make_ctx();
+        let mut reg = CommandRegistry::new();
+        register_builtins(&mut reg);
+        let cmd = reg.get("dbCreateRecord").unwrap();
+
+        let tokens = ["pdbbase", "ai", "SIM:NEW"].map(str::to_string);
+        let args = parse_args(&tokens, &cmd.args).unwrap();
+        cmd.handler
+            .call(&args, &ctx)
+            .expect("must create the record");
+        assert!(db.get_record("SIM:NEW").is_some());
+
+        let bad = ["ai", "SIM:OTHER", "x"].map(str::to_string);
+        let args = parse_args(&bad, &cmd.args).unwrap();
+        let Err(msg) = cmd.handler.call(&args, &ctx) else {
+            panic!("a non-pdbbase first argument must be refused");
+        };
+        assert_eq!(msg, "Expecting 'pdbbase' got 'ai'.");
+    }
+
+    /// C `dbCreateRecordCallFunc` (`dbStaticIocRegister.c:292-296`)
+    /// asks for the record NAME before the record type, and an empty
+    /// name is `S_dbLib_recordNameMissing` just like an absent one.
+    /// Asking about the type first made a bare `dbCreateRecord
+    /// pdbbase` name the wrong argument.
+    #[test]
+    fn db_create_record_asks_for_the_name_before_the_type() {
+        let (db, ctx) = make_ctx();
+        let mut reg = CommandRegistry::new();
+        register_builtins(&mut reg);
+        let cmd = reg.get("dbCreateRecord").unwrap();
+        let call = |tokens: &[&str]| {
+            let tokens: Vec<String> = tokens.iter().map(|t| t.to_string()).collect();
+            let args = parse_args(&tokens, &cmd.args).expect("C accepts a missing argument");
+            match cmd.handler.call(&args, &ctx) {
+                Err(msg) => msg,
+                Ok(_) => panic!("{tokens:?} must fail"),
+            }
+        };
+        assert_eq!(call(&["pdbbase"]), "Record name is required");
+        assert_eq!(call(&["pdbbase", "ai"]), "Record name is required");
+        assert_eq!(call(&["pdbbase", "ai", ""]), "Record name is required");
+        assert_eq!(call(&[]), "Record name is required");
+        assert!(
+            db.get_record("").is_none(),
+            "no record may be created for an empty name"
+        );
+    }
+
+    /// `dbLoadTemplate`'s third argument replaces
+    /// `EPICS_DB_INCLUDE_PATH` when looking for the `.substitutions`
+    /// file itself (`dbLoadTemplate.y:362-368`).
+    #[test]
+    #[serial_test::serial(epics_env)]
+    fn db_load_template_third_argument_finds_the_subs_file() {
+        let (db, ctx) = make_ctx();
+        let subs_dir = tempfile::tempdir().unwrap();
+        let tpl_dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            tpl_dir.path().join("t.template"),
+            "record(ai,\"SIM:FROM_ARG\") { }\n",
+        )
+        .unwrap();
+        std::fs::write(
+            subs_dir.path().join("t.substitutions"),
+            "file \"t.template\" { { } }\n",
+        )
+        .unwrap();
+
+        // The templates still come from EPICS_DB_INCLUDE_PATH: C's
+        // dbLoadRecords resets the path list from the environment.
+        let _guard = DbIncludePath::set(tpl_dir.path());
+        let mut reg = CommandRegistry::new();
+        register_builtins(&mut reg);
+        let cmd = reg.get("dbLoadTemplate").unwrap();
+        let tokens = [
+            "t.substitutions".to_string(),
+            String::new(),
+            subs_dir.path().display().to_string(),
+        ];
+        let args = parse_args(&tokens, &cmd.args).unwrap();
+        cmd.handler
+            .call(&args, &ctx)
+            .expect("the third argument must locate the .substitutions file");
+        assert!(db.get_record("SIM:FROM_ARG").is_some());
     }
 
     #[test]
@@ -1964,17 +2731,149 @@ mod tests {
         assert!(matches!(result, Ok(CommandOutcome::Continue)));
     }
 
+    /// C `dbl` walks `dbFirstRecordType` -> `dbFirstRecord` ...
+    /// `dbNextRecordType` (`dbTest.c:181-191`), so its output is
+    /// grouped by record type and, inside a group, in the order the
+    /// records were loaded. One global sort over every name gave
+    /// neither: it interleaved the types and re-ordered each type's
+    /// records alphabetically.
     #[test]
-    fn test_dbgf_not_found() {
-        let (_db, ctx) = make_ctx();
+    fn dbl_lists_records_type_major_in_load_order() {
+        use crate::server::records::bo::BoRecord;
 
+        let (db, ctx) = make_ctx();
+        ctx.block_on(async {
+            db.add_record("Z:A1", Box::new(AiRecord::new(0.0)))
+                .await
+                .unwrap();
+            db.add_record("A:B1", Box::new(BoRecord::new(0)))
+                .await
+                .unwrap();
+            db.add_record("M:A2", Box::new(AiRecord::new(0.0)))
+                .await
+                .unwrap();
+        });
+
+        // `ai` precedes `bo`, and inside `ai` the load order Z:A1,
+        // M:A2 survives — the alphabetical order would be the reverse.
+        assert_eq!(run_cmd(&ctx, "dbl", &[]), "Z:A1\nM:A2\nA:B1\n");
+        assert_eq!(run_cmd(&ctx, "dbl", &["ai"]), "Z:A1\nM:A2\n");
+    }
+
+    /// C `nameToAddr` (`dbTest.c:787-795`) prints `PV '<name>' not
+    /// found` on STDOUT for `dbgf`, `dbpf` and `dbpr` alike; the
+    /// command then returns -1 and prints nothing else. Reporting it
+    /// through the shell's error channel instead put the port's text
+    /// on stderr, so a script that captured stdout saw nothing at all.
+    #[test]
+    fn an_unknown_pv_is_reported_on_stdout_by_every_db_command() {
+        let (_db, ctx) = make_ctx();
+        assert_eq!(
+            run_cmd(&ctx, "dbgf", &["NONEXISTENT"]),
+            "PV 'NONEXISTENT' not found\n"
+        );
+        assert_eq!(
+            run_cmd(&ctx, "dbpf", &["NONEXISTENT", "1"]),
+            "PV 'NONEXISTENT' not found\n"
+        );
+        assert_eq!(
+            run_cmd(&ctx, "dbpr", &["NONEXISTENT"]),
+            "PV 'NONEXISTENT' not found\n"
+        );
+    }
+
+    /// C `dbpf` ends with `dbgf(pname)` (`dbTest.c:433`), so the
+    /// read-back is byte-identical to what `dbgf` prints — including
+    /// the tab-buffer padding and the `= 0x%x` suffix that the
+    /// hand-rolled `"{type}: {val}"` read-back never had.
+    #[test]
+    fn dbpf_reads_back_through_the_dbgf_printer() {
+        let (db, ctx) = make_ctx();
+        ctx.block_on(async {
+            db.add_record("TEMP", Box::new(AiRecord::new(0.0)))
+                .await
+                .unwrap();
+        });
+
+        let put = run_cmd(&ctx, "dbpf", &["TEMP", "42"]);
+        assert_eq!(put, run_cmd(&ctx, "dbgf", &["TEMP"]));
+        assert_eq!(put.trim_end(), "DBF_DOUBLE:         42");
+
+        // The read-back of an integer-class field carries C's hex
+        // suffix, which is the divergence the second renderer had.
+        let prec = run_cmd(&ctx, "dbpf", &["TEMP.PREC", "3"]);
+        assert_eq!(prec, run_cmd(&ctx, "dbgf", &["TEMP.PREC"]));
+        assert_eq!(prec.trim_end(), "DBF_SHORT:          3 = 0x3");
+
+        // C runs `dbgf` after a failed `dbPutField` too, so a refused
+        // put still reports the value the record kept.
         let mut registry = CommandRegistry::new();
         register_builtins(&mut registry);
-        let cmd = registry.get("dbgf").unwrap();
-        let tokens = vec!["NONEXISTENT".to_string()];
+        let cmd = registry.get("dbpf").unwrap();
+        let tokens = vec!["TEMP.SEVR".to_string(), "0".to_string()];
         let args = parse_args(&tokens, &cmd.args).unwrap();
-        let result = cmd.handler.call(&args, &ctx);
-        assert!(result.is_err());
+        let refused = capture(&ctx, || {
+            assert!(cmd.handler.call(&args, &ctx).is_err());
+        });
+        assert_eq!(refused, run_cmd(&ctx, "dbgf", &["TEMP.SEVR"]));
+    }
+
+    /// Every port command whose C original diagnoses a missing string
+    /// argument itself: C's iocsh hands the body a NULL and the body
+    /// prints one line and returns nonzero, so declaring the argument
+    /// required made the port answer with the registry's "missing
+    /// required argument" on stderr and never run the body at all.
+    /// The C texts are `dbTest.c:308`, `:359`, `:401`, `:447`,
+    /// `dbAccess.c:801`, `dbLoadTemplate.y:345` (stderr) and
+    /// `asDbLib.c:244`.
+    #[test]
+    fn a_missing_argument_reaches_c_s_own_diagnostic() {
+        let (_db, ctx) = make_ctx();
+        assert_eq!(
+            run_cmd(&ctx, "dbpr", &[]),
+            "Usage: dbpr \"pv name\", level\n"
+        );
+        assert_eq!(
+            run_cmd(&ctx, "dbpr", &[""]),
+            "Usage: dbpr \"pv name\", level\n"
+        );
+        assert_eq!(
+            run_cmd(&ctx, "dbLoadRecords", &[]),
+            "Usage: dbLoadRecords \"file\", \"subs\"\n"
+        );
+        assert_eq!(
+            run_cmd(&ctx, "astac", &[]),
+            "Usage: astac \"record name\", \"user\", \"host\"\n"
+        );
+        assert_eq!(
+            run_cmd(&ctx, "astac", &["REC", "user"]),
+            "Usage: astac \"record name\", \"user\", \"host\"\n"
+        );
+        // C prints this one on stderr, so stdout stays empty and the
+        // shell must not have refused the call before the body ran.
+        assert_eq!(run_cmd(&ctx, "dbLoadTemplate", &[]), "");
+        assert_eq!(run_cmd(&ctx, "dbLoadTemplate", &[""]), "");
+        // Already C-shaped; pinned here so the family stays closed.
+        assert_eq!(
+            run_cmd(&ctx, "dbglob", &[]),
+            "Usage: dbglob \"pattern\" \"fields\"\n"
+        );
+        assert_eq!(run_cmd(&ctx, "dbgf", &[]), "Usage: dbgf \"pv name\"\n");
+    }
+
+    /// C `dbTest.c:400-403`: `dbpf` with no arguments is a usage line
+    /// on stdout, not an argument-parse failure.
+    #[test]
+    fn dbpf_missing_arguments_print_usage() {
+        let (_db, ctx) = make_ctx();
+        assert_eq!(
+            run_cmd(&ctx, "dbpf", &[]),
+            "Usage: dbpf \"pv name\", \"value\"\n"
+        );
+        assert_eq!(
+            run_cmd(&ctx, "dbpf", &["TEMP"]),
+            "Usage: dbpf \"pv name\", \"value\"\n"
+        );
     }
 
     /// End-to-end through the real `dbLoadRecords` command: a `DTYP=` macro is
@@ -2414,12 +3313,94 @@ record(ai, "A:BPT") {{ field(LINR, "zebra") }}
         });
     }
 
-    /// Different record type for the same name is fatal — mirrors C
-    /// `dbLexRoutines.c:1173-1180` "record '%s' already exists, can't
-    /// load %s record".
+    /// R5-6: C registers `postEvent` with one `iocshArgString` "event
+    /// name" and its handler is `postEvent(eventNameToHandle(sval))` —
+    /// nothing is printed. The port declared the argument as an Int, so
+    /// `postEvent reset` was refused before the handler ran and every
+    /// named `EVNT` was unreachable from iocsh.
     #[test]
-    fn test_db_load_records_different_type_duplicate_rejected() {
-        use std::io::Write;
+    fn post_event_takes_the_event_name_and_prints_nothing() {
+        let (db, ctx) = make_ctx();
+        let mut reg = CommandRegistry::new();
+        register_builtins(&mut reg);
+        for name in ["postEvent", "post_event"] {
+            let cmd = reg.get(name).unwrap();
+            assert_eq!(cmd.args.len(), 1);
+            assert!(matches!(cmd.args[0].arg_type, ArgType::String));
+        }
+
+        load_records(
+            &ctx,
+            r#"record(ai, "X:E") { field(SCAN, "Event") field(EVNT, "reset") }"#,
+        )
+        .expect("load");
+        ctx.block_on(db.ioc_init());
+
+        let out = run_cmd(&ctx, "postEvent", &["reset"]);
+        assert_eq!(out, "", "C's postEventCallFunc prints nothing");
+    }
+
+    /// R5-2: `record("*", …)` modifies the record already in the database
+    /// and `record("#", …)` deletes it (`dbLexRoutines.c:1136-1157`).
+    /// Neither is a record type, so the port's factory lookup failed and
+    /// took the whole load with it.
+    #[test]
+    fn record_star_modifies_in_place_and_hash_deletes() {
+        let (db, ctx) = make_ctx();
+        load_records(&ctx, r#"record(ai, "X:T") { field(VAL, "5") }"#).expect("first load");
+
+        load_records(&ctx, r#"record("*", "X:T") { field(VAL, "90") }"#)
+            .expect("a '*' block must load");
+        ctx.block_on(async {
+            let rec = db.get_record("X:T").expect("X:T");
+            let inst = rec.read();
+            assert_eq!(
+                inst.record.get_field("VAL"),
+                Some(crate::types::EpicsValue::Double(90.0))
+            );
+        });
+
+        load_records(&ctx, r##"record("#", "X:T") { }"##).expect("a '#' block must load");
+        assert!(!exists(&db, &ctx, "X:T"), "'#' deletes the record");
+    }
+
+    /// The two not-found halves are reported differently: C `yyerror`s the
+    /// `*` miss and only warns on the `#` miss, so the second leaves the
+    /// load's status clean. Either way the block's body is skipped and the
+    /// records after it still load.
+    #[test]
+    fn record_star_and_hash_report_a_missing_name_differently() {
+        let (db, ctx) = make_ctx();
+        let err = load_records(
+            &ctx,
+            r#"
+record("*", "NO:SUCH") { field(VAL, "1") }
+record(ai, "AFTER:STAR") { }
+"#,
+        )
+        .expect_err("a '*' miss must fail the call's status");
+        assert_eq!(err, "ERROR: Record 'NO:SUCH' not found");
+        assert!(exists(&db, &ctx, "AFTER:STAR"));
+
+        load_records(
+            &ctx,
+            r##"
+record("#", "NO:SUCH") { }
+record(ai, "AFTER:HASH") { }
+"##,
+        )
+        .expect("a '#' miss is only a warning");
+        assert!(exists(&db, &ctx, "AFTER:HASH"));
+    }
+
+    /// R5-4: the same name at a different record type is `yyerror(NULL)`
+    /// (`dbLexRoutines.c:1173-1180`), so the record is skipped and the
+    /// rest of the file still loads. The message names the type being
+    /// LOADED first and the type already in the database last —
+    /// `recordType` then `dbGetRecordTypeName(pdbentry)` — which the port
+    /// had the other way round, without C's `ERROR: ` prefix.
+    #[test]
+    fn test_db_load_records_different_type_duplicate_is_skipped() {
         let (db, ctx) = make_ctx();
         // Pre-register DUP:CM as an `ai`.
         ctx.block_on(async {
@@ -2427,31 +3408,31 @@ record(ai, "A:BPT") {{ field(LINR, "zebra") }}
                 .await
                 .unwrap();
         });
-        let tmp = tempfile::Builder::new()
-            .suffix(".db")
-            .tempfile()
-            .expect("tempfile");
-        writeln!(
-            tmp.as_file(),
+        let err = load_records(
+            &ctx,
             r#"
-record(mbbo, "DUP:CM") {{
-    field(ZRST, "Mono")
-}}
-"#
+record(mbbo, "DUP:CM") { field(ZRST, "Mono") }
+record(ai, "SIM:C") { field(VAL, "1") }
+"#,
         )
-        .expect("write tempfile");
-        let mut registry = CommandRegistry::new();
-        register_builtins(&mut registry);
-        let cmd = registry.get("dbLoadRecords").unwrap();
-        let args = parse_args(&[tmp.path().to_string_lossy().to_string()], &cmd.args).unwrap();
-        let result = cmd.handler.call(&args, &ctx);
-        match result {
-            Err(e) => assert!(
-                e.contains("already exists, can't load mbbo"),
-                "expected type-mismatch error; got {e}"
-            ),
-            Ok(_) => panic!("different-type duplicate must error, but call succeeded"),
-        }
+        .expect_err("the load's status must still be non-zero");
+        assert_eq!(
+            err,
+            "ERROR: mbbo record 'DUP:CM' already exists, can't load ai record"
+        );
+        assert!(
+            exists(&db, &ctx, "SIM:C"),
+            "the record after the duplicate must still load"
+        );
+        ctx.block_on(async {
+            let rec = db.get_record("DUP:CM").expect("DUP:CM");
+            let inst = rec.read();
+            assert_eq!(
+                inst.record.record_type(),
+                "ai",
+                "the existing record keeps its own type"
+            );
+        });
     }
 
     // R19-63 — the two record-creating iocsh commands, on either side of the
@@ -2485,12 +3466,141 @@ record(mbbo, "DUP:CM") {{
         let mut registry = CommandRegistry::new();
         register_builtins(&mut registry);
         let cmd = registry.get("dbCreateRecord").unwrap();
-        let args = parse_args(&["ai".to_string(), name.to_string()], &cmd.args).unwrap();
+        let args = parse_args(
+            &["pdbbase".to_string(), "ai".to_string(), name.to_string()],
+            &cmd.args,
+        )
+        .unwrap();
         cmd.handler.call(&args, ctx).map(|_| ())
     }
 
     fn exists(db: &PvDatabase, ctx: &CommandContext, name: &str) -> bool {
         ctx.block_on(async { db.get_record(name).is_some() })
+    }
+
+    /// I-R3-3: `dbLoadRecords` resolves its file through C `dbOpenFile`
+    /// (`dbLexRoutines.c:174-175`), so a name that already carries a
+    /// separator goes straight to a bare open and the path list is not
+    /// consulted — even when the list would have resolved it. The port
+    /// searched the list for any relative name that did not exist in the
+    /// process CWD.
+    #[test]
+    #[serial_test::serial(epics_env)]
+    fn db_load_records_does_not_search_the_path_list_for_a_name_with_a_separator() {
+        let (db, ctx) = make_ctx();
+        let dir = tempfile::tempdir().unwrap();
+        let _path = DbIncludePath::set(dir.path());
+        std::fs::create_dir(dir.path().join("sub")).unwrap();
+        write_file(
+            &dir.path().join("sub"),
+            "sep.db",
+            r#"record(ai, "SEP") { }"#,
+        );
+
+        let mut registry = CommandRegistry::new();
+        register_builtins(&mut registry);
+        let cmd = registry.get("dbLoadRecords").unwrap();
+        let args = parse_args(&["sub/sep.db".to_string()], &cmd.args).unwrap();
+        let Err(err) = cmd.handler.call(&args, &ctx) else {
+            panic!("a name with a separator must not be searched on the path list");
+        };
+        assert!(err.contains("sub/sep.db"), "got: {err}");
+        assert!(!exists(&db, &ctx, "SEP"));
+
+        // Control: the same file under a bare name IS found on the list.
+        write_file(dir.path(), "bare.db", r#"record(ai, "BARE") { }"#);
+        let args = parse_args(&["bare.db".to_string()], &cmd.args).unwrap();
+        cmd.handler
+            .call(&args, &ctx)
+            .expect("bare name on the list");
+        assert!(exists(&db, &ctx, "BARE"));
+    }
+
+    /// I-R3-4(a): a file-scope alias naming a record an EARLIER
+    /// `dbLoadRecords` installed resolves, because C `dbAlias`
+    /// (`dbLexRoutines.c:1508`) looks the target up in `savedPdbbase`,
+    /// not in the file being parsed.
+    #[test]
+    #[serial_test::serial(epics_env)]
+    fn db_load_records_alias_resolves_against_an_earlier_load() {
+        let (db, ctx) = make_ctx();
+        let dir = tempfile::tempdir().unwrap();
+        let _path = DbIncludePath::set(dir.path());
+        write_file(
+            dir.path(),
+            "a.db",
+            "record(ai, \"BASE:TEMP\") { field(DESC, \"t\") }\n",
+        );
+        write_file(
+            dir.path(),
+            "b.db",
+            "alias(\"BASE:TEMP\", \"OLD:TEMP\")\nrecord(ai, \"B:X\") { }\n",
+        );
+
+        let mut registry = CommandRegistry::new();
+        register_builtins(&mut registry);
+        let cmd = registry.get("dbLoadRecords").unwrap();
+        for name in ["a.db", "b.db"] {
+            let args = parse_args(&[name.to_string()], &cmd.args).unwrap();
+            cmd.handler.call(&args, &ctx).unwrap_or_else(|e| {
+                panic!("{name}: {e}");
+            });
+        }
+
+        assert!(exists(&db, &ctx, "BASE:TEMP"));
+        assert!(exists(&db, &ctx, "B:X"), "b.db's own record must load");
+        assert_eq!(db.resolve_alias("OLD:TEMP").as_deref(), Some("BASE:TEMP"));
+    }
+
+    /// I-R3-4(b): a target NO load owns is a diagnostic that fails the
+    /// call's status, and the records that did parse stay installed —
+    /// C's `yyerror(NULL)` sets `yyFailed` and returns 0, so the parse
+    /// runs to the end and `dbReadCOM` still reports the failure.
+    #[test]
+    #[serial_test::serial(epics_env)]
+    fn db_load_records_unknown_alias_target_fails_status_but_keeps_records() {
+        let (db, ctx) = make_ctx();
+        let dir = tempfile::tempdir().unwrap();
+        let _path = DbIncludePath::set(dir.path());
+        write_file(
+            dir.path(),
+            "c.db",
+            "alias(\"NOPE\", \"BAD\")\nrecord(ai, \"C:Y\") { }\n",
+        );
+
+        let mut registry = CommandRegistry::new();
+        register_builtins(&mut registry);
+        let cmd = registry.get("dbLoadRecords").unwrap();
+        let args = parse_args(&["c.db".to_string()], &cmd.args).unwrap();
+        let Err(err) = cmd.handler.call(&args, &ctx) else {
+            panic!("an unknown alias target must fail the call's status");
+        };
+        assert!(err.contains("names an unknown record 'NOPE'"), "got: {err}");
+        assert!(exists(&db, &ctx, "C:Y"), "the record that parsed must stay");
+        assert!(db.resolve_alias("BAD").is_none());
+    }
+
+    /// R5-3: an `include` C cannot open is `yyerror(NULL)`
+    /// (`dbLexRoutines.c:450-456`), not `yyerrorAbort` — the records on
+    /// either side of it still load and only the call's status goes
+    /// non-zero. The port propagated the failure out of the include
+    /// expansion, so `dbl` listed nothing.
+    #[test]
+    #[serial_test::serial(epics_env)]
+    fn an_unopenable_include_keeps_the_records_around_it() {
+        let (db, ctx) = make_ctx();
+        let err = load_records(
+            &ctx,
+            r#"
+record(ai, "SIM:A") { field(VAL, "1") }
+include "missing.db"
+record(ai, "SIM:B") { field(VAL, "2") }
+"#,
+        )
+        .expect_err("the load's status must still be non-zero");
+        assert_eq!(err, "ERROR: Can't open include file 'missing.db'");
+        assert!(exists(&db, &ctx, "SIM:A"));
+        assert!(exists(&db, &ctx, "SIM:B"));
     }
 
     /// Boundary: LOAD phase (pre-`iocInit`). Both creators work — the control
@@ -2564,44 +3674,6 @@ record(ai, "LATER2") { field(VAL, "2") }
     }
 
     #[test]
-    fn test_split_db_paths_unix() {
-        let paths = split_db_paths("/opt/epics/db:/home/user/db");
-        assert_eq!(paths.len(), 2);
-        assert_eq!(paths[0], std::path::PathBuf::from("/opt/epics/db"));
-        assert_eq!(paths[1], std::path::PathBuf::from("/home/user/db"));
-    }
-
-    #[test]
-    fn test_split_db_paths_windows_semicolon() {
-        let paths = split_db_paths(r"C:\epics\db;D:\user\db");
-        assert_eq!(paths.len(), 2);
-        assert_eq!(paths[0], std::path::PathBuf::from(r"C:\epics\db"));
-        assert_eq!(paths[1], std::path::PathBuf::from(r"D:\user\db"));
-    }
-
-    #[test]
-    fn test_split_db_paths_windows_colon_separator() {
-        // st.cmd uses ':' separator even on Windows — must not split inside drive letter
-        let paths = split_db_paths(r"C:\epics\db:D:\user\db");
-        assert_eq!(paths.len(), 2);
-        assert_eq!(paths[0], std::path::PathBuf::from(r"C:\epics\db"));
-        assert_eq!(paths[1], std::path::PathBuf::from(r"D:\user\db"));
-    }
-
-    #[test]
-    fn test_split_db_paths_single() {
-        let paths = split_db_paths("/opt/epics/db");
-        assert_eq!(paths.len(), 1);
-        assert_eq!(paths[0], std::path::PathBuf::from("/opt/epics/db"));
-    }
-
-    #[test]
-    fn test_split_db_paths_empty() {
-        let paths = split_db_paths("");
-        assert!(paths.is_empty());
-    }
-
-    #[test]
     fn test_parse_macro_string() {
         let macros = parse_macro_string("P=IOC:,R=TEMP");
         assert_eq!(macros.get("P").unwrap(), "IOC:");
@@ -2611,28 +3683,48 @@ record(ai, "LATER2") { field(VAL, "2") }
         assert!(empty.is_empty());
     }
 
+    /// C `macParseDefns` removes quotes and escapes from NAMES only —
+    /// its own comment says values are left alone because, unlike names,
+    /// "they will not be re-parsed" is false for them (`macUtil.c:198-200`):
+    /// a value IS re-parsed, by `trans`, whose `discard` does the single
+    /// removal. Both halves are asserted, because stripping here as well
+    /// removes everything twice.
     #[test]
-    fn parse_macro_string_honors_quotes_escapes_whitespace() {
+    fn parse_macro_string_keeps_values_raw_for_the_expander() {
+        use crate::server::db_loader::{MacroExpandOptions, expand_macros};
+        fn expand(m: &HashMap<String, String>, name: &str) -> String {
+            expand_macros(&format!("$({name})"), m, MacroExpandOptions::default()).text
+        }
+
         // Quoted comma stays inside the value (macParseDefns parity):
         // raw split would tear this into `DESC="a` + a stray `b"`.
         let m = parse_macro_string(r#"DESC="a,b",P=IOC:"#);
-        assert_eq!(m.get("DESC").unwrap(), "a,b");
+        assert_eq!(m.get("DESC").unwrap(), r#""a,b""#);
+        assert_eq!(expand(&m, "DESC"), "a,b");
         assert_eq!(m.get("P").unwrap(), "IOC:");
 
-        // Escaped comma is a literal; the backslash is dropped.
+        // Escaped comma is a literal; the backslash survives the parse
+        // and the expansion drops it.
         let m = parse_macro_string(r#"DESC=a\,b,P=IOC:"#);
-        assert_eq!(m.get("DESC").unwrap(), "a,b");
-        assert_eq!(m.get("P").unwrap(), "IOC:");
+        assert_eq!(m.get("DESC").unwrap(), r#"a\,b"#);
+        assert_eq!(expand(&m, "DESC"), "a,b");
 
-        // Whitespace around names and values is trimmed; quoted names
-        // and quoted/escaped names round-trip.
+        // Two backslashes: one removal, not two — C expands this to
+        // `a\b`.
+        let m = parse_macro_string(r#"B=a\\b"#);
+        assert_eq!(m.get("B").unwrap(), r#"a\\b"#);
+        assert_eq!(expand(&m, "B"), r#"a\b"#);
+
+        // Whitespace around names and values is trimmed; a quoted NAME
+        // is stripped in place, because a name is not re-parsed.
         let m = parse_macro_string(r#" P = IOC: , "R" = TEMP "#);
         assert_eq!(m.get("P").unwrap(), "IOC:");
         assert_eq!(m.get("R").unwrap(), "TEMP");
 
         // Quoted whitespace inside a value is preserved.
         let m = parse_macro_string(r#"MSG="a b c""#);
-        assert_eq!(m.get("MSG").unwrap(), "a b c");
+        assert_eq!(m.get("MSG").unwrap(), r#""a b c""#);
+        assert_eq!(expand(&m, "MSG"), "a b c");
 
         // A name with no '=' is a deletion: nothing to remove from a
         // fresh map, and the surrounding assignments still parse.
@@ -2724,6 +3816,33 @@ record(mbboDirect, "MBD0") {{ }}
         p
     }
 
+    /// Put `dir` on `EPICS_DB_INCLUDE_PATH` for the life of the guard.
+    /// C `dbLoadRecords` resolves a `.db` (and every template a
+    /// `.substitutions` names) through `dbOpenFile`, which searches
+    /// only that list.
+    struct DbIncludePath(Option<std::ffi::OsString>);
+
+    impl DbIncludePath {
+        fn set(dir: &std::path::Path) -> Self {
+            let prev = std::env::var_os("EPICS_DB_INCLUDE_PATH");
+            // SAFETY: serial(epics_env) serialises env-mutating tests.
+            unsafe { std::env::set_var("EPICS_DB_INCLUDE_PATH", dir) };
+            Self(prev)
+        }
+    }
+
+    impl Drop for DbIncludePath {
+        fn drop(&mut self) {
+            // SAFETY: as above.
+            unsafe {
+                match self.0.take() {
+                    Some(v) => std::env::set_var("EPICS_DB_INCLUDE_PATH", v),
+                    None => std::env::remove_var("EPICS_DB_INCLUDE_PATH"),
+                }
+            }
+        }
+    }
+
     /// Drive the real `dbLoadTemplate` command over `sub_file`, optionally
     /// with a `globalMacros` argument.
     fn load_template(
@@ -2757,9 +3876,11 @@ record(mbboDirect, "MBD0") {{ }}
     /// A `.substitutions` fixture with per-row macros expands to one record
     /// per row, each with its own macros substituted into name and fields.
     #[test]
+    #[serial_test::serial(epics_env)]
     fn db_load_template_expands_rows_with_per_row_macros() {
         let (db, ctx) = make_ctx();
         let dir = tempfile::tempdir().unwrap();
+        let _path = DbIncludePath::set(dir.path());
         write_file(
             dir.path(),
             "a.db",
@@ -2786,17 +3907,60 @@ file "a.db" {
         assert_eq!(ai_val(&db, &ctx, "IOC:AI2"), 2.5, "row 2 V substituted");
     }
 
+    /// R4-7: C `dbLoadTemplate` calls `dbLoadRecords` from the
+    /// `pattern_definition` action (`dbLoadTemplate.y:186`), so row 1's
+    /// records are in `pdbbase` before row 2 is read and only the rows
+    /// after the failure are lost. The port concatenated every row's
+    /// records and installed the batch, so one unloadable row threw away
+    /// the rows that had already succeeded.
+    #[test]
+    #[serial_test::serial(epics_env)]
+    fn db_load_template_keeps_the_rows_that_already_loaded() {
+        let (db, ctx) = make_ctx();
+        let dir = tempfile::tempdir().unwrap();
+        let _path = DbIncludePath::set(dir.path());
+        write_file(dir.path(), "ok.db", r#"record(ai, "ROW:$(N)") { }"#);
+        let subs = write_file(
+            dir.path(),
+            "partial.substitutions",
+            r#"
+file "ok.db" {
+    { N=1 }
+}
+file "gone.db" {
+    { N=2 }
+}
+file "ok.db" {
+    { N=3 }
+}
+"#,
+        );
+
+        load_template(&ctx, &subs, None).expect_err("the missing template must fail the call");
+
+        assert!(
+            exists(&db, &ctx, "ROW:1"),
+            "the row before the failure stays"
+        );
+        assert!(
+            !exists(&db, &ctx, "ROW:3"),
+            "the rows after it are not loaded"
+        );
+    }
+
     /// `globalMacros` applies to every row; a row-level macro of the same
     /// name overrides the global. Grounded in the reused loader:
-    /// `load_substitution_file` (substitution.rs:449) inserts the caller
-    /// macros (the command's `globalMacros`) first, then each row's macros
-    /// into a last-definition-wins map, so the row wins — the C
-    /// `dbLoadTemplate` precedence (see the loader-level regression
-    /// `load_substitution_file_caller_macros_overridden_by_row`).
+    /// `substitution_rows` (substitution.rs) inserts the caller macros
+    /// (the command's `globalMacros`) first, then each row's macros into a
+    /// last-definition-wins map, so the row wins — the C `dbLoadTemplate`
+    /// precedence (see the loader-level regression
+    /// `substitution_rows_caller_macros_overridden_by_row`).
     #[test]
+    #[serial_test::serial(epics_env)]
     fn db_load_template_global_macros_apply_and_row_overrides() {
         let (db, ctx) = make_ctx();
         let dir = tempfile::tempdir().unwrap();
+        let _path = DbIncludePath::set(dir.path());
         write_file(
             dir.path(),
             "b.db",
@@ -2837,8 +4001,10 @@ file "b.db" {
     /// loader parses each template through the same `parse_db_file` as
     /// `dbLoadRecords`.
     #[test]
+    #[serial_test::serial(epics_env)]
     fn db_load_template_parity_with_hand_written_db_load_records() {
         let dir = tempfile::tempdir().unwrap();
+        let _path = DbIncludePath::set(dir.path());
         write_file(
             dir.path(),
             "p.db",

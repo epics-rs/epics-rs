@@ -26,6 +26,13 @@ pub enum AutosaveError {
         path: String,
         message: String,
     },
+    /// The set's member list came out empty. Refused rather than carried,
+    /// because a set with no members still rotates and rewrites the files
+    /// holding the values it was configured to protect.
+    EmptySaveSet {
+        name: String,
+        reason: String,
+    },
     PvNotFound(String),
     Ca(CaError),
 }
@@ -48,6 +55,9 @@ impl fmt::Display for AutosaveError {
             }
             Self::CorruptSaveFile { path, message } => {
                 write!(f, "corrupt save file '{path}': {message}")
+            }
+            Self::EmptySaveSet { name, reason } => {
+                write!(f, "save set '{name}' has no PVs to save: {reason}")
             }
             Self::PvNotFound(name) => write!(f, "PV not found: {name}"),
             Self::Ca(e) => write!(f, "CA error: {e}"),

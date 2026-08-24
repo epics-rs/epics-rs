@@ -1,7 +1,13 @@
 # epics-oracle-rs — differential oracle harness
 
-Boots the compiled C `softIoc` and the Rust IOC **on the same `.db`**, drives
-both with **identical CA operations**, and diffs only what a client can observe.
+Boots the compiled C IOC and the Rust IOC **on the same `.db`**, drives both
+with **identical client operations**, and diffs only what a client can observe.
+
+Ground truth is the **fat** C IOC built under `oracle-ioc/`, not base's stock
+`softIoc`: it serves base's 34 record types plus `busy`/`transform`/`sseq`/
+`acalcout`/`scalcout`/`asyn`, and its expanded dbd is what supplies the
+denominator. There are two lanes — CA against `softIoc`, and PVA against pvxs
+QSRV2 in `softIocPVX`.
 
 It exists to make "clean" a measurement instead of an opinion. See
 `doc/strategy-2026-07-13.md` §3.2 for the rationale: nineteen audit rounds of
@@ -11,8 +17,8 @@ denominator and "verified clean" verdicts kept turning out false.
 ## Shape
 
 ```
-softIoc.dbd ──► dbd.rs ──► surface.rs ──► THE DENOMINATOR
-  (spec)        (parse)    (enumerate)    record types × CA-observable fields
+oracle-ioc/dbd/softIoc.dbd ──► dbd.rs ──► surface.rs ──► THE DENOMINATOR
+     (the fat spec)           (parse)   (enumerate)   record types × fields
                                 │
                                 ▼
                           cases.rs  boundary values, per DBF type
@@ -22,15 +28,17 @@ softIoc.dbd ──► dbd.rs ──► surface.rs ──► THE DENOMINATOR
       C softIoc  (ground truth)            Rust IOC (oracle-ioc)
              └──────────────┬──────────────────────┘
                             ▼
-                   the SAME C CA tools
-              caget / caput / cainfo / camonitor
+                the SAME reference client tools
+        CA:  caget / caput / cainfo / camonitor
+        PVA: pvxget / pvxinfo / pvxmonitor  (separate phases)
                             │
                             ▼
                    diff.rs ──► allowlist.rs ──► report.rs
                                                  JSON + human + reproducer
 ```
 
-**Both sides are driven by the C client tools.** That is the core of the method.
+**Both sides are driven by the reference implementation's client tools** — base's
+C tools on the CA lane, pvxs's on the PVA lane. That is the core of the method.
 It keeps `epics-ca-rs`'s *client* out of the experiment (a client bug would
 otherwise show up as a server "diff"), and it measures the contract actually
 owed: Tier 1 says *a C client must not be able to tell the difference*, so the
@@ -41,13 +49,15 @@ honest experiment puts a real C client in front of both.
 | verdict | meaning |
 |---|---|
 | **AGREED** | both sides produced a reading, and they match |
-| **EXPECTED DEVIATION** | they differ, and a NOT-REPRODUCED entry in `doc/upstream-c-bugs.md` justifies it (the port deliberately refuses to reproduce a C bug) |
+| **EXPECTED DEVIATION** | they differ, and an enabled allowlist row justifies it. Four buckets, three justification bases: `NOT-REPRODUCED` and `REPRODUCED` must cite a `CBUG-…` id in `doc/upstream-c-bugs.md`; `DESIGN-DIVERGENCE` and `INSTRUMENT-SUPERSET` are justified by their own `why` and are exempt from that citation rule. All four match, fire and go stale identically |
 | **DEFECT** | they differ and nothing justifies it |
 | **ERROR** | no reading was obtained — IOC would not boot, PV never connected, tool timed out. **Never scored as agreement.** |
 
 `ran == agreed + expected_deviation + defect + errored`, asserted by
-`Counts::check()`. The binary exits non-zero on any DEFECT **or any ERROR**: a
-run that could not look is not a pass.
+`Counts::check()`. The run verdict is `report::run_failures`, and the binary's
+exit code is that same judgement — non-zero on any DEFECT, **any ERROR**, any
+record type the port did not implement, and any STALE allowlist row. A run that
+could not look is not a pass, and neither is one that did not look everywhere.
 
 The allowlist is a data file (`allowlist/expected-deviations.toml`) citing CBUG
 ids, not inline code. A row that **stops firing** is reported as STALE — the
@@ -65,9 +75,17 @@ ORACLE_IOC_BIN=target/debug/oracle-ioc \
 cargo run -p epics-oracle-rs --bin oracle -- --phase monitor --record-types calc
 ```
 
-Needs the built C tree (default `/home/stevek/work/epics-base/bin/linux-x86_64`,
-override with `EPICS_BASE_BIN`). If it is absent the harness **fails loudly**
-rather than skipping — a silently skipped oracle is the false-clean we are
+Needs **two** C trees, and `CTools::discover` fails loudly if either is missing:
+
+- base's built tree for the client tools — default
+  `/home/stevek/work/epics-base/bin/linux-x86_64`, override `EPICS_BASE_BIN`.
+- the fat ground-truth IOC — default
+  `/home/stevek/work/oracle-ioc/bin/linux-x86_64/softIoc`, override
+  `EPICS_ORACLE_IOC_BIN`. `--dbd` defaults to that same tree's expanded dbd.
+
+The PVA phases additionally need the pvxs tree (`PVXS_BIN`) and the fat
+`softIocPVX` beside the fat `softIoc`. Nothing is ever skipped when a
+prerequisite is absent — a silently skipped oracle is the false-clean we are
 escaping.
 
 ## Port discipline (this has bitten the repo before)
@@ -102,32 +120,49 @@ was built to end.
 - put accept/reject, and the rejection *reason* when both sides refuse
 - `STAT`/`SEVR` after each put
 - **monitor event sequence and count** (`camonitor` over a fixed window)
+- **array/waveform put-and-readback** across the element-count boundaries
+  (zero-length, single, partial, exactly `NELM`, one past `NELM`), comparing the
+  payload, the returned element count and `NORD`. `record_stmt_fields` gives the
+  reproducer its own `NELM`/`FTVL`, which is what the phase was waiting on.
 
 **Not yet measured — clean seams, not silent gaps**
-- **Array/waveform put-and-readback** (`NORD`/`NELM`, 0-length and over-NELM).
-  `cases::array_cases` and `CaTools::caget_array`/`caput_array` exist and are
-  unit-tested; nothing calls them yet, because array cases need a `.db` that
-  declares `NELM`/`FTVL` per instance rather than the empty `record(t, "N") {}`
-  the generic generator emits. That is the one seam to pick up next.
 - **Multi-put sequences into one record.** The put probe drives exactly one put
   per record instance (that is what makes each case isolated and its reproducer
   minimal). CBUG-E1 needs *three* successive puts into one compress record, so
-  the harness cannot fire it and correctly reports the row STALE.
+  the harness cannot fire it. The row reports **UNEXERCISED, not STALE**, and
+  that distinction now decides the exit code: `compress.VAL` is `DBF_NOACCESS`
+  so the scalar phases never enumerate it, and `compress` declares `NSAM` rather
+  than `NELM`/`FTVL` so the array phase skips it too. No case in the row's scope
+  ever runs, which is coverage rather than a finding — a STALE row would fail
+  every run.
 - **calc-expression cases.** The CBUG-A*/C*/F1..F5 entries live inside the calc
   engines and need a generator that drives `CALC` expressions, not field
   boundaries. Until that exists those rows are deliberately absent from the
   allowlist rather than present-and-never-firing.
-- **PVA.** CA only.
+- **Multi-value PVA puts and the PVA allowlist.** The two PVA phases
+  (`--phase pva-read`, `--phase pva-monitor`) are real and measured, but sit
+  outside `--phase all` on purpose: different ground truth (`softIocPVX`), a
+  different instrument (`pvxget`/`pvxinfo`/`pvxmonitor`), and no CA allowlist,
+  since `doc/upstream-c-bugs.md` is about C's CA behaviour and justifies nothing
+  about QSRV2. Folding them into `all` would merge two populations whose
+  verdicts are not comparable into one set of counts.
 
 ## What the first run measured
+
+The numbers below are from the 2026-07-13 run and **predate the harness fixes
+of 2026-08-22** (measurement failures that were being scored as readings, and a
+field-coverage fraction that counted monitor cases). They stand as the last
+measurement taken, not as the current state; they are owed a re-run.
 
 `FINDINGS.md` carries the numbers and every reproducer. In short: the
 denominator is **2551 CA-observable fields across 34 record types**, of which
 **2462 (96.5 %)** produced a reading on both sides and were diffed. 89 fields
 ERRORED — every one of them because the port does not serve a field C does.
 
-Coverage is reported as a percentage of the `.dbd`-derived denominator
-(record types the port implements × their CA-observable fields). `DBF_NOACCESS`
+Coverage is reported as a percentage of the `.dbd`-derived denominator: **every**
+record type in the dbd × its CA-observable fields. A type the port cannot load
+does not shrink the denominator — its fields are exactly the ones that went
+unmeasured, so removing them would hide the gap. `DBF_NOACCESS`
 fields are excluded from that denominator and counted separately — they are raw C
 pointers in the record struct and no CA client can reach them, so counting them
 would inflate the denominator while measuring nothing.

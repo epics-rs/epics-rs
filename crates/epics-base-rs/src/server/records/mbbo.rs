@@ -401,6 +401,39 @@ impl Record for MbboRecord {
         "mbbo"
     }
 
+    /// C `mbboRecord.c:196-210`: the scalar `dbGetLink(&prec->dol, ..., &prec->val, 0, 0)`
+    /// under `dol.type != CONSTANT && omsl == menuOmslclosed_loop`.
+    fn fetches_dol_closed_loop(&self) -> bool {
+        true
+    }
+
+    /// C `mbboRecord.c:286-291` — the `db_post_events` inside `special()`
+    /// after a `SPC_MOD` write:
+    ///
+    /// ```c
+    /// if (fieldIndex >= mbboRecordZRST && fieldIndex <= mbboRecordFFST
+    ///         && prec->val == fieldIndex - mbboRecordZRST) {
+    ///     db_post_events(prec, &prec->val, DBE_VALUE | DBE_LOG);
+    /// }
+    /// ```
+    ///
+    /// Re-labelling the state VAL currently sits on changes what a
+    /// `DBR_*_STRING` subscriber renders without changing VAL, so C posts VAL
+    /// to push the new label out; every operator display reads a `mbbo` as
+    /// a string. The equality is the whole gate — editing any OTHER state's
+    /// label posts nothing, because no subscriber's rendering moved.
+    ///
+    /// ZRVL..FFVL are `SPC_MOD` too, and C's own comment there says so, but they
+    /// fall outside the index range and post nothing. What they DO reach is
+    /// `init_common`, whose `sdef` this port derives on demand
+    /// (`Self::sdef`) rather than caching, so that half needs no hook.
+    fn monitor_side_effect_fields(&self, put_field: &str) -> &'static [&'static str] {
+        match crate::server::record::multibit_state_string_index(put_field) {
+            Some(state) if state == self.val => &["VAL"],
+            _ => &[],
+        }
+    }
+
     /// C `mbboRecord.c:199-215`: `process()` clears `udf` to FALSE only when a
     /// value SOURCE ran this cycle — a successful closed-loop DOL fetch. With no
     /// DOL (or a constant one), the `else if (prec->udf)` arm raises UDF_ALARM at
@@ -624,6 +657,17 @@ impl Record for MbboRecord {
 
     fn set_device_did_compute(&mut self, did: bool) {
         self.skip_convert = did;
+    }
+
+    /// C `mbboRecord.c:204-206` — a failed closed-loop DOL read takes
+    /// `goto CONTINUE`, jumping past `prec->udf = FALSE`, `convert(prec)` and
+    /// the pre-output `recGblGetTimeStampSimm`. Suppressing the convert is what
+    /// keeps a `caput REC.RVAL` from being recomputed out of a VAL the dead link
+    /// never refreshed; the timestamp half is gated by
+    /// [`Record::skips_timestamp_when_undefined`], which the framework consults
+    /// on the same jump.
+    fn closed_loop_dol_read_failed(&mut self) {
+        self.skip_convert = true;
     }
 
     /// C `mbboRecord.c:210-213` — `else if (prec->udf) goto CONTINUE` skips the

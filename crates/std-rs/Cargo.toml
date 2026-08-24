@@ -16,6 +16,7 @@ tracing = "0.1"
 chrono = { version = "0.4", features = ["std"] }
 
 [dev-dependencies]
+record-seam-gate = { path = "../../tools/record-seam-gate" }
 epics-ca-rs = { workspace = true }
 scaler-rs = { workspace = true }
 tokio = { version = "1", features = ["full", "test-util"] }

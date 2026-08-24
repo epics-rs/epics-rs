@@ -174,58 +174,37 @@ impl CommandHandler for MqttConfigHandler {
         drop(runtime_handle);
 
         // Create Connected PV if name was provided
+        let mut conn_pv_error: Option<String> = None;
         if let Some(pv_name) = conn_pv_name {
-            let db_str = format!(
-                concat!(
-                    "record(bi, \"{pv}\") {{\n",
-                    "    field(DTYP, \"asynInt32\")\n",
-                    "    field(INP, \"@asyn({port}) {param}\")\n",
-                    "    field(SCAN, \"I/O Intr\")\n",
-                    "    field(ZNAM, \"Disconnected\")\n",
-                    "    field(ONAM, \"Connected\")\n",
-                    "    field(ZSV, \"MAJOR\")\n",
-                    "    field(OSV, \"NO_ALARM\")\n",
-                    "}}\n",
-                ),
-                pv = pv_name,
-                port = port_name,
-                param = crate::driver::PARAM_CONNECTED,
+            let mut db_str = String::new();
+            let mut w = crate::db_gen::RecordWriter::new(&mut db_str, "bi", &pv_name);
+            w.field("DTYP", "asynInt32");
+            // The port name reaches here from `st.cmd`, so it is escaped like
+            // any other caller-supplied text going into a quoted value.
+            w.field(
+                "INP",
+                &format!("@asyn({port_name}) {}", crate::driver::PARAM_CONNECTED),
             );
-            let macros = std::collections::HashMap::new();
-            if let Ok(defs) = epics_base_rs::server::db_loader::parse_db(&db_str, &macros) {
-                for def in defs {
-                    if let Ok(mut record) =
-                        epics_base_rs::server::db_loader::create_record(&def.record_type)
-                    {
-                        let mut common_fields = Vec::new();
-                        let _ = epics_base_rs::server::db_loader::apply_fields(
-                            &mut record,
-                            &def.fields,
-                            &mut common_fields,
-                        );
-                        // The record and its loaded common fields enter the
-                        // database together — the creation sink runs the
-                        // `iocInit` passes against the FINAL field set (the
-                        // SCAN="I/O Intr" this .db declares, and the UDF a
-                        // field(VAL,…) clears). Applying them afterwards left
-                        // the record initialised from a pre-load field set.
-                        let load = epics_base_rs::server::database::RecordLoad::from_common_fields(
-                            common_fields,
-                        );
-                        ctx.block_on(async {
-                            if let Err(e) =
-                                ctx.db().add_loaded_record(&def.name, record, load).await
-                            {
-                                eprintln!(
-                                    "mqttDriverConfigure: register '{}' skipped: {e}",
-                                    def.name
-                                );
-                            }
-                        });
-                    }
+            w.field("SCAN", "I/O Intr");
+            w.field("ZNAM", "Disconnected");
+            w.field("ONAM", "Connected");
+            w.field("ZSV", "MAJOR");
+            w.field("OSV", "NO_ALARM");
+            w.end();
+            // A bad `connPvName` (a space, `.`, `$`, `\'` or `"` — rejected by
+            // db_loader::validate_name) used to be discarded here and the
+            // success line printed anyway, so the IOC booted reporting a
+            // Connected PV that `dbl` never listed. The failure is carried to
+            // the end of the command instead of returned here, so the port
+            // this call already registered still gets its init hook and its
+            // event loop.
+            match crate::db_gen::load_generated_db("mqttDriverConfigure", &db_str, ctx) {
+                Ok(()) => println!("mqttDriverConfigure: connected PV = {pv_name}"),
+                Err(e) => {
+                    eprintln!("{e}");
+                    conn_pv_error = Some(e);
                 }
             }
-            println!("mqttDriverConfigure: connected PV = {pv_name}");
         }
 
         // C parity: defer the broker connect (and its first subscribe) until
@@ -260,6 +239,9 @@ impl CommandHandler for MqttConfigHandler {
             .await;
         });
 
+        if let Some(e) = conn_pv_error {
+            return Err(e);
+        }
         Ok(CommandOutcome::Continue)
     }
 }

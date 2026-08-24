@@ -7,7 +7,7 @@
 //! subscription via the typed builder.
 //!
 //! The cpp helper (`cpp_helpers/r20_typed_monitor.cpp`) is built
-//! on the fly via `c++` against `~/codes/pvxs/{include,lib}` if
+//! on the fly via `c++` against the resolved pvxs tree if
 //! the binary is missing. Test is SKIPped (not failed) when
 //! either the compiler or the pvxs/EPICS-base headers are absent
 //! — that way a CI host without pvxs installed isn't a hard
@@ -15,100 +15,11 @@
 
 // RTEMS-EXEC-MODEL-ALLOW(1): not run by the default nextest profile - this file is a module of the `interop_pvxs` binary, which `.config/nextest.toml`'s default-filter excludes.
 
-use super::interop_helpers::{pick_localhost_port, pvxs_arch, pvxs_lib_dir};
+use super::interop_helpers::{pick_localhost_port, pvxs_lib_dir};
 
-use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
-
-fn epics_base_home() -> PathBuf {
-    if let Ok(h) = std::env::var("EPICS_BASE") {
-        return PathBuf::from(h);
-    }
-    let home = std::env::var("HOME").unwrap_or_default();
-    PathBuf::from(home).join("epics/epics-base")
-}
-
-fn pvxs_home() -> PathBuf {
-    if let Ok(h) = std::env::var("PVXS_HOME") {
-        return PathBuf::from(h);
-    }
-    let home = std::env::var("HOME").unwrap_or_default();
-    PathBuf::from(home).join("codes/pvxs")
-}
-
-/// Ensure the helper binary exists. If missing, try to compile it
-/// from `cpp_helpers/r20_typed_monitor.cpp`. Returns `Some(path)`
-/// on success, `None` on skip with a SKIP-prefixed stderr line.
-fn build_helper() -> Option<PathBuf> {
-    let src = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("tests/interop_pvxs_mods/cpp_helpers/r20_typed_monitor.cpp");
-    if !src.is_file() {
-        eprintln!("SKIP: helper source missing: {src:?}");
-        return None;
-    }
-    let out_dir = std::env::var("CARGO_TARGET_TMPDIR")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| std::env::temp_dir());
-    std::fs::create_dir_all(&out_dir).ok();
-    let out = out_dir.join("r20_typed_monitor");
-    let need_rebuild = !out.is_file()
-        || std::fs::metadata(&src).and_then(|m| m.modified()).ok()
-            > std::fs::metadata(&out).and_then(|m| m.modified()).ok();
-    if !need_rebuild {
-        return Some(out);
-    }
-
-    let pvxs = pvxs_home();
-    let base = epics_base_home();
-    let arch = pvxs_arch();
-    let pvxs_include = pvxs.join("include");
-    let base_include = base.join("include");
-    let base_compiler_include = base.join("include/compiler/clang");
-    let base_os_include = if cfg!(target_os = "macos") {
-        base.join("include/os/Darwin")
-    } else {
-        base.join("include/os/Linux")
-    };
-    let pvxs_lib = pvxs.join("lib").join(arch);
-    let base_lib = base.join("lib").join(arch);
-
-    for p in [&pvxs_include, &base_include, &pvxs_lib, &base_lib] {
-        if !p.exists() {
-            eprintln!("SKIP: required path missing for cpp helper build: {p:?}");
-            return None;
-        }
-    }
-
-    let status = Command::new("c++")
-        .args(["-std=c++17", "-O0", "-g"])
-        .arg(format!("-I{}", pvxs_include.display()))
-        .arg(format!("-I{}", base_include.display()))
-        .arg(format!("-I{}", base_compiler_include.display()))
-        .arg(format!("-I{}", base_os_include.display()))
-        .arg(&src)
-        .arg(format!("-L{}", pvxs_lib.display()))
-        .arg("-lpvxs")
-        .arg(format!("-L{}", base_lib.display()))
-        .arg("-lCom")
-        .arg(format!("-Wl,-rpath,{}", pvxs_lib.display()))
-        .arg(format!("-Wl,-rpath,{}", base_lib.display()))
-        .arg("-o")
-        .arg(&out)
-        .status();
-    match status {
-        Ok(s) if s.success() => Some(out),
-        Ok(s) => {
-            eprintln!("SKIP: c++ build of r20 helper failed (exit {s})");
-            None
-        }
-        Err(e) => {
-            eprintln!("SKIP: c++ compiler unavailable: {e}");
-            None
-        }
-    }
-}
 
 /// Shared capture buffer for tracing output emitted by the Rust
 /// server during this test. We install a process-global subscriber
@@ -164,7 +75,7 @@ async fn interop_r20_typed_pipeline_from_pvxs_against_rust_server() {
     use epics_pva_rs::server_native::{PvaServer, SharedPV, SharedSource};
     use std::sync::atomic::{AtomicBool, Ordering};
 
-    let Some(helper) = build_helper() else {
+    let Some(helper) = super::interop_helpers::cpp_helper("r20_typed_monitor") else {
         return;
     };
 

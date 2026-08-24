@@ -71,8 +71,9 @@ struct Args {
     #[arg(short = 'd')]
     debug: bool,
 
-    /// PV name to write to.
-    #[arg(required_unless_present_any = ["version"])]
+    /// PV name to write to. Not clap-required: C makes the check itself
+    /// and returns 1 with its own message (pvput.cpp:363-367), where a
+    /// clap-enforced argument would exit 2.
     pv_name: Option<String>,
 
     /// Value(s) to write. Legacy pvput accepts:
@@ -94,7 +95,7 @@ struct Args {
 
 #[tokio::main]
 async fn main() {
-    let args = Args::parse();
+    let args: Args = cli::parse_or_exit();
 
     // pvxs `-V` prints version_information and exits before any client
     // setup (tools/put.cpp:55).
@@ -125,10 +126,15 @@ async fn main() {
         cli::print_effective_config();
     }
 
-    let pv_name = args.pv_name.expect("clap enforces required");
+    // C's own two argument checks, in C's order and wording
+    // (pvput.cpp:363-377). Both return 1; clap would have exited 2.
+    let Some(pv_name) = args.pv_name else {
+        eprintln!("No pv name specified. ('pvput -h' for help.)");
+        std::process::exit(1);
+    };
 
     if args.values.is_empty() {
-        eprintln!("pvput-rs: missing value");
+        eprintln!("No value(s) specified. ('pvput -h' for help.)");
         std::process::exit(1);
     }
 
@@ -206,8 +212,8 @@ async fn main() {
     let mode = args.mode.as_str();
     let render = |label: &str, value: &PvField, desc: &FieldDesc| -> String {
         match mode {
-            "json" => format::format_json(label, value),
-            "raw" => format::format_raw(label, desc, value),
+            "json" => format::format_json(label, value, None),
+            "raw" => format::format_raw(label, desc, value, None),
             // Default `-M nt`: legacy compact `<label><ts>  <val>` shape.
             _ => match value {
                 PvField::Structure(s) => format_old_new_line(label, s),

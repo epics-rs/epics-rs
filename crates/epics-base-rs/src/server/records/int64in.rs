@@ -50,10 +50,12 @@ pub struct Int64inRecord {
     #[field(type = "Int64")]
     pub hyst: i64,
     // LALM is DBF_INT64 too, but `special(SPC_NOMOD)` (dbd:233-236): read-only,
-    // so no client put reaches the parse. Kept f64 — it is the internal
-    // last-alarmed bookkeeping the alarm filter reads as a double.
-    #[field(type = "Double")]
-    pub lalm: f64,
+    // so no client put reaches the parse. It is the alarm ladder's own
+    // `epicsInt64 lalm` (`int64inRecord.c:262`) — the value the hysteresis
+    // arm compares a threshold against — so it holds that threshold exactly
+    // rather than as a rounded double.
+    #[field(type = "Int64")]
+    pub lalm: i64,
     #[field(type = "Int64")]
     pub adel: i64,
     #[field(type = "Int64")]
@@ -88,7 +90,8 @@ pub struct Int64inRecord {
     // int64inRecord.dbd.pod:301-307). A non-negative SDLY makes the simulated SIOL read asynchronous:
     // C's `readValue` arms `callbackRequestProcessCallbackDelayed(..., sdly)`
     // and holds PACT across the delay (int64inRecord.c:398-405). The framework reads the delay
-    // via `get_field("SDLY")`, so the field must exist for a `.db` to set it.
+    // via `resolve_field("SDLY")`, which falls back to the dbd `initial`, so
+    // this field is the record's own store for it rather than a requirement.
     #[field(type = "Double")]
     pub sdly: f64,
 }
@@ -101,7 +104,7 @@ impl Default for Int64inRecord {
             hopr: 0,
             lopr: 0,
             hyst: 0,
-            lalm: 0.0,
+            lalm: 0,
             adel: 0,
             mdel: 0,
             aftc: 0.0,

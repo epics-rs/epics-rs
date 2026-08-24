@@ -32,3 +32,64 @@ pub mod serial_port;
 #[cfg(windows)]
 #[path = "serial_port_win32.rs"]
 pub mod serial_port;
+
+/// The whole-millisecond interval a wait budget maps to, for every driver that
+/// has to hand one to `poll` or `SetCommTimeouts`.
+///
+/// Two different zeros arrive here and collapsing them is the bug this owner
+/// exists to prevent:
+///
+/// * a **remaining** budget of zero is an expired deadline. It stays zero — a
+///   non-blocking probe — so the retry loop above it can retire the call
+///   instead of waiting another tick on a timeout that has already run out.
+/// * a **positive** budget under a millisecond is a caller who asked to wait.
+///   It rounds up to 1 ms, because truncating it to zero turns
+///   `caput $(P)$(R).TMOT 0.0005` into a read that never waits at all and
+///   alarms on every scan against a device answering in 300 us.
+///
+/// C reaches the same place from the other side: `readIt`/`writeIt` compute
+/// `pollmsec = (int)(timeout * 1000.0)` and then `if (pollmsec == 0) pollmsec =
+/// 1` (`drvAsynIPPort.c:775-777`, `:649-651`). Rounding every positive budget
+/// up is that floor generalised — C only ever sees the caller's timeout here,
+/// whereas the deadline loops also feed this a remainder. Each of those C
+/// triples ends `if (pollmsec < 0) pollmsec = -1`, the wait-forever case a
+/// `Duration` cannot carry and this function therefore never sees.
+///
+/// This is deliberately *not*
+/// [`ip_port::socket_poll_timeout`], which owns
+/// the other half: a `timeout == 0` *caller request* becoming C's 1 ms poll on
+/// the IP transports. That one is about what the caller asked for and yields a
+/// `Duration` for the socket-option sites; this one is about what is left to
+/// wait and yields milliseconds. Merging them is exactly the collapse
+/// described above — and the serial driver's own `timeout == 0` is C's
+/// `VMIN=0, VTIME=0` non-blocking read (`drvAsynSerialPort.c:902-905`), not
+/// the IP driver's 1 ms poll.
+///
+/// The `u128` return is `Duration::as_millis`'s own width; each caller clamps
+/// it to whatever its API takes (`c_int` for `poll`, `DWORD` for
+/// `SetCommTimeouts`).
+pub(crate) fn wait_millis(budget: std::time::Duration) -> u128 {
+    if budget.is_zero() {
+        0
+    } else {
+        budget.as_millis().max(1)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::wait_millis;
+    use std::time::Duration;
+
+    /// The boundary the owner exists to hold: the two zeros stay apart, and
+    /// nothing positive rounds down into the expired one.
+    #[test]
+    fn wait_millis_separates_an_expired_budget_from_a_sub_millisecond_one() {
+        assert_eq!(wait_millis(Duration::ZERO), 0);
+        assert_eq!(wait_millis(Duration::from_nanos(1)), 1);
+        assert_eq!(wait_millis(Duration::from_micros(500)), 1);
+        assert_eq!(wait_millis(Duration::from_millis(1)), 1);
+        assert_eq!(wait_millis(Duration::from_micros(1500)), 1);
+        assert_eq!(wait_millis(Duration::from_millis(250)), 250);
+    }
+}

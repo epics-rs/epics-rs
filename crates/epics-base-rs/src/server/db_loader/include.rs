@@ -3,8 +3,8 @@ use std::path::{Path, PathBuf};
 
 use crate::error::{CaError, CaResult};
 
-use super::DbRecordDef;
 use super::substitute_macros;
+use super::{DbFaults, DbRecordDef};
 
 /// Configuration for file-based DB loading with include support.
 pub struct DbLoadConfig {
@@ -21,25 +21,38 @@ impl Default for DbLoadConfig {
     }
 }
 
-/// File-based entry point: expand includes, substitute macros, parse records.
+/// File-based entry point: expand includes, substitute macros, parse
+/// records. Records-only, so an unresolved file-scope alias is reported
+/// and dropped — see [`super::parse_db`].
 pub fn parse_db_file(
     path: &Path,
     macros: &HashMap<String, String>,
     config: &DbLoadConfig,
 ) -> CaResult<Vec<DbRecordDef>> {
-    parse_db_file_with_breaktables(path, macros, config).map(|(records, _breaktables)| records)
+    let parsed = parse_db_file_with_breaktables(path, macros, config)?;
+    for (target, alias) in &parsed.unresolved_aliases {
+        eprintln!("{}", super::unknown_alias_message(alias, target));
+    }
+    Ok(parsed.records)
 }
 
-/// Like [`parse_db_file`] but also returns the `breaktable(...)` definitions,
-/// for the `dbLoadRecords` runtime path to merge into the database's shared
-/// breakpoint-table registry.
+/// Like [`parse_db_file`] but returns the whole [`super::ParsedDb`], for
+/// the `dbLoadRecords` runtime path that merges the breakpoint tables
+/// into the database registry and resolves file-scope aliases against it.
 pub fn parse_db_file_with_breaktables(
     path: &Path,
     macros: &HashMap<String, String>,
     config: &DbLoadConfig,
-) -> CaResult<(Vec<DbRecordDef>, Vec<crate::server::cvt_bpt::BrkTable>)> {
-    let content = expand_includes(path, macros, config)?;
-    super::parse_db_with_breaktables(&content, macros)
+) -> CaResult<super::ParsedDb> {
+    // The include layer and the record parser both report through the
+    // same owner, so a recoverable failure in either reaches the caller
+    // as one set — see [`DbFaults`].
+    let mut faults = DbFaults::default();
+    let content = expand_includes(path, macros, config, &mut faults)?;
+    let mut parsed = super::parse_db_with_breaktables(&content, macros)?;
+    faults.absorb(parsed.faults);
+    parsed.faults = faults;
+    Ok(parsed)
 }
 
 /// Expand `include "..."` directives recursively.
@@ -47,6 +60,7 @@ pub fn expand_includes(
     path: &Path,
     macros: &HashMap<String, String>,
     config: &DbLoadConfig,
+    faults: &mut DbFaults,
 ) -> CaResult<String> {
     let canonical = path.canonicalize().map_err(|e| CaError::DbParseError {
         line: 0,
@@ -54,7 +68,7 @@ pub fn expand_includes(
         message: format!("cannot resolve '{}': {}", path.display(), e),
     })?;
     let mut stack = Vec::new();
-    expand_includes_inner(&canonical, macros, config, &mut stack)
+    expand_includes_inner(&canonical, macros, config, &mut stack, faults)
 }
 
 fn expand_includes_inner(
@@ -62,6 +76,7 @@ fn expand_includes_inner(
     macros: &HashMap<String, String>,
     config: &DbLoadConfig,
     stack: &mut Vec<PathBuf>,
+    faults: &mut DbFaults,
 ) -> CaResult<String> {
     // Circular include detection
     if stack.iter().any(|p| p == path) {
@@ -96,7 +111,6 @@ fn expand_includes_inner(
         message: format!("cannot read '{}': {}", path.display(), e),
     })?;
 
-    let parent_dir = path.parent().unwrap_or(Path::new("."));
     stack.push(path.to_path_buf());
 
     // Local macro overrides from `substitute` directives.
@@ -124,22 +138,28 @@ fn expand_includes_inner(
             // `path "a:b:c"` — replace the search path. C separates
             // entries with the OS path separator.
             let expanded = substitute_macros(&dirs, &local_macros);
-            local_paths = split_path_list(&expanded);
+            local_paths = db_path(&expanded);
         } else if let Some(dirs) = parse_path_directive(line, "addpath") {
             // `addpath "a:b"` — append to the search path.
             let expanded = substitute_macros(&dirs, &local_macros);
-            local_paths.extend(split_path_list(&expanded));
+            local_paths.extend(db_add_path(&expanded));
         } else if let Some(filename) = parse_include_directive(line) {
             let expanded_filename = substitute_macros(&filename, &local_macros);
-            let include_path = resolve_include_path(&expanded_filename, parent_dir, &local_paths)?;
-            let canonical = include_path
-                .canonicalize()
-                .map_err(|e| CaError::DbParseError {
-                    line: 0,
-                    column: 0,
-                    message: format!("cannot resolve '{}': {}", include_path.display(), e),
-                })?;
-            let included = expand_includes_inner(&canonical, &local_macros, config, stack)?;
+            // C `dbIncludeNew` (`dbLexRoutines.c:450-456`) prints this
+            // exact line and calls `yyerror(NULL)`, NOT `yyerrorAbort`:
+            // the include is skipped, everything already read stays, and
+            // the load's status goes non-zero at the end. The port used
+            // to propagate the failure out of the whole expansion, which
+            // discarded every record in the enclosing file.
+            let Some(canonical) =
+                db_open_file(&expanded_filename, &local_paths).and_then(|p| p.canonicalize().ok())
+            else {
+                faults.recoverable(format!(
+                    "ERROR: Can't open include file '{expanded_filename}'"
+                ));
+                continue;
+            };
+            let included = expand_includes_inner(&canonical, &local_macros, config, stack, faults)?;
             output.push_str(&included);
             output.push('\n');
         } else {
@@ -233,12 +253,66 @@ pub(crate) fn parse_path_directive(line: &str, keyword: &str) -> Option<String> 
     Some(after_quote[..quote_end].to_string())
 }
 
-/// Split an OS path list (`a:b:c` on Unix, `a;b;c` on Windows) into
-/// individual directory paths.
-fn split_path_list(list: &str) -> Vec<PathBuf> {
-    std::env::split_paths(list)
-        .filter(|p| !p.as_os_str().is_empty())
-        .collect()
+/// C `OSI_PATH_LIST_SEPARATOR` (`osiFileName.h:22-28`) — ONE separator
+/// per platform, never both. On Unix a `;` is an ordinary character in
+/// a directory name and there is no `C:` drive prefix, so neither may
+/// be given a second meaning here.
+const PATH_LIST_SEPARATOR: char = if cfg!(windows) { ';' } else { ':' };
+
+/// C `dbAddPath` (`dbStaticLib.c:663-735`) — the directories a path
+/// list contributes to the search path, in order.
+///
+/// White space around an element is removed, and an EMPTY element
+/// anywhere in a non-empty list — leading, doubled or trailing — means
+/// the current directory, which C appends as a single `.` at the END
+/// of the list rather than at the empty element's position. A list
+/// that is entirely white space contributes nothing.
+pub fn db_add_path(list: &str) -> Vec<PathBuf> {
+    use crate::runtime::stdlib::c_isspace;
+
+    let mut out: Vec<PathBuf> = Vec::new();
+    let mut expecting_path = false;
+    let mut saw_missing_path = false;
+    let mut rest = list;
+
+    while let Some(c) = rest.chars().next() {
+        if c_isspace(c) {
+            rest = &rest[c.len_utf8()..];
+            continue;
+        }
+        match rest.find(PATH_LIST_SEPARATOR) {
+            Some(0) => {
+                saw_missing_path = true;
+                rest = &rest[PATH_LIST_SEPARATOR.len_utf8()..];
+            }
+            Some(i) => {
+                expecting_path = true;
+                out.push(PathBuf::from(rest[..i].trim_end_matches(c_isspace)));
+                rest = &rest[i + PATH_LIST_SEPARATOR.len_utf8()..];
+            }
+            None => {
+                expecting_path = false;
+                out.push(PathBuf::from(rest.trim_end_matches(c_isspace)));
+                rest = "";
+            }
+        }
+    }
+
+    if expecting_path || saw_missing_path {
+        out.push(PathBuf::from("."));
+    }
+    out
+}
+
+/// C `dbPath` (`dbStaticLib.c:655-661`) — the same split, but it
+/// REPLACES the search path, and an empty string means `.`. C tests
+/// `strlen(path)==0`, so a list that is blank rather than empty is
+/// still handed to `dbAddPath`, which contributes nothing.
+pub fn db_path(list: &str) -> Vec<PathBuf> {
+    if list.is_empty() {
+        return vec![PathBuf::from(".")];
+    }
+    db_add_path(list)
 }
 
 /// Parse a `name=value,name2=value2,...` macro-definition string into
@@ -329,54 +403,58 @@ pub(crate) fn parse_macro_defns(defns: &str) -> Vec<(String, String)> {
     pairs
 }
 
-/// Resolve an include filename to a path.
-/// Search order: current file's directory → config.include_paths.
-pub(crate) fn resolve_include_path(
-    filename: &str,
-    current_dir: &Path,
-    include_paths: &[PathBuf],
-) -> CaResult<PathBuf> {
-    let file_path = Path::new(filename);
-
-    // Absolute path: use directly
-    if file_path.is_absolute() {
-        if file_path.exists() {
-            return Ok(file_path.to_path_buf());
-        }
-        return Err(CaError::DbParseError {
-            line: 0,
-            column: 0,
-            message: format!("include file not found: '{filename}'"),
-        });
+/// C `dbOpenFile` (`dbLexRoutines.c:166-193`) — the single rule every
+/// `.db` file name is resolved by, whether it arrives as the top-level
+/// `dbLoadRecords` argument (`:282`), an `include` directive (`:450`
+/// `dbIncludeNew`) or a `.substitutions` template (`dbLoadTemplate`
+/// driving `dbLoadRecords`).
+///
+/// A bare open happens ONLY when the path list is empty or the name
+/// already carries a separator; otherwise the list is walked in order
+/// and the first hit wins. C never tries the process CWD and never
+/// tries the including file's directory — with the list unset
+/// `dbReadCOM` (`:244-253`) installs `"."`, which is the same file the
+/// bare open reaches, so the empty-list branch here matches it.
+///
+/// Both C callers run `db_expand_file_name` (`macEnvExpand`) on the
+/// name immediately before calling `dbOpenFile` — `dbReadCOM`
+/// (`:276`) and `dbIncludeNew` (`:449`) — so the expansion is done
+/// here, once, rather than at each caller.
+pub fn db_open_file(filename: &str, path_list: &[PathBuf]) -> Option<PathBuf> {
+    let filename = db_expand_file_name(filename)?;
+    let filename = filename.as_str();
+    if path_list.is_empty() || filename.contains('/') || filename.contains('\\') {
+        let direct = PathBuf::from(filename);
+        return direct.exists().then_some(direct);
     }
+    path_list
+        .iter()
+        .map(|dir| dir.join(filename))
+        .find(|candidate| candidate.exists())
+}
 
-    // Relative: search current dir first
-    let candidate = current_dir.join(file_path);
-    if candidate.exists() {
-        return Ok(candidate);
-    }
-
-    // Then search include paths
-    for dir in include_paths {
-        let candidate = dir.join(file_path);
-        if candidate.exists() {
-            return Ok(candidate);
-        }
-    }
-
-    Err(CaError::DbParseError {
-        line: 0,
-        column: 0,
-        message: format!(
-            "include file not found: '{filename}' (searched: {}, {})",
-            current_dir.display(),
-            include_paths
-                .iter()
-                .map(|p| p.display().to_string())
-                .collect::<Vec<_>>()
-                .join(", ")
-        ),
-    })
+/// C `macEnvExpand` (`macEnv.c:21-30`) — `macDefExpand(str, NULL)`, i.e.
+/// expansion against a handle whose only source is the process
+/// environment. `None` is the C `NULL` return: `macExpandString`
+/// reports a negative length as soon as one reference resolves to
+/// nothing, and both callers treat that as "no file".
+///
+/// The `.db` reader's own macro pass runs first and leaves an
+/// unresolved reference as the re-expandable placeholder
+/// `$(NAME,undefined)` (`macCore.c:911-913`); because that placeholder
+/// is still a reference, this second, environment-backed pass is what
+/// lets `include "$(TOP)/db/common.db"` load when `TOP` is an
+/// environment variable rather than a `dbLoadRecords` substitution.
+pub fn db_expand_file_name(filename: &str) -> Option<String> {
+    let expanded = super::expand_macros(
+        filename,
+        &HashMap::new(),
+        super::MacroExpandOptions {
+            env_fallback: true,
+            ..Default::default()
+        },
+    );
+    expanded.undefined.is_empty().then_some(expanded.text)
 }
 
 #[cfg(test)]
@@ -439,5 +517,193 @@ mod macro_defns_tests {
     #[test]
     fn empty_input() {
         assert!(parse_macro_defns("").is_empty());
+    }
+}
+
+#[cfg(test)]
+mod db_add_path_tests {
+    use super::*;
+
+    /// A list literal is written with `:`, and rendered here into the
+    /// ONE separator the platform under test splits on. Writing `:`
+    /// directly would assert the Unix build's separator on Windows,
+    /// where `PATH_LIST_SEPARATOR` is `;` and a `:` is the ordinary
+    /// character of a drive prefix.
+    fn sep(list: &str) -> String {
+        list.replace(':', &PATH_LIST_SEPARATOR.to_string())
+    }
+
+    fn p(list: &str) -> Vec<String> {
+        db_add_path(&sep(list))
+            .iter()
+            .map(|d| d.display().to_string())
+            .collect()
+    }
+
+    /// The boundaries C `dbAddPath` (`dbStaticLib.c:663-735`)
+    /// distinguishes: where the empty element sits, and how many there
+    /// are. All of them add exactly one `.`, and always last.
+    #[test]
+    fn an_empty_element_anywhere_appends_one_dot_at_the_end() {
+        assert_eq!(p("a:b"), ["a", "b"]);
+        assert_eq!(p(":a"), ["a", "."]);
+        assert_eq!(p("a:"), ["a", "."]);
+        assert_eq!(p("a::b"), ["a", "b", "."]);
+        assert_eq!(p(":a::b:"), ["a", "b", "."]);
+        assert_eq!(p(":"), ["."]);
+    }
+
+    /// White space around an element is removed, and white space
+    /// standing alone between separators is an empty element.
+    #[test]
+    fn white_space_is_trimmed_and_a_blank_element_is_empty() {
+        assert_eq!(p("  a  :\tb\t"), ["a", "b"]);
+        assert_eq!(p("a : : b"), ["a", "b", "."]);
+        assert!(p("   ").is_empty());
+        assert!(p("").is_empty());
+    }
+
+    /// C splits on the ONE platform separator. On Unix that is `:`,
+    /// so a `;` is an ordinary character and a `C:` prefix is two
+    /// elements — the port's drive-letter special case was invented.
+    #[cfg(not(windows))]
+    #[test]
+    fn only_the_platform_separator_splits() {
+        assert_eq!(p("a;b"), ["a;b"]);
+        assert_eq!(p(r"C:\epics\db"), ["C", r"\epics\db"]);
+    }
+
+    /// C `dbPath` maps the empty string to `.` before it splits, but
+    /// tests `strlen`, so a blank list is not empty and contributes
+    /// nothing.
+    #[test]
+    fn db_path_replaces_an_empty_list_with_the_current_directory() {
+        assert_eq!(
+            db_path(""),
+            vec![PathBuf::from(".")],
+            "an empty list is the current directory"
+        );
+        assert!(db_path("   ").is_empty(), "a blank list is not empty");
+        assert_eq!(db_path(&sep("a:")), db_add_path(&sep("a:")));
+    }
+}
+
+#[cfg(test)]
+mod db_open_file_tests {
+    use super::*;
+
+    /// I-R3-3 boundary matrix for C `dbOpenFile`
+    /// (`dbLexRoutines.c:174-175`): {name carries a separator, it does
+    /// not} x {path list set, unset}. The process CWD is reachable only
+    /// through the bare-open branch, never as a fallback after a failed
+    /// list walk.
+    #[test]
+    fn db_open_file_gate_matches_dbopenfile() {
+        // Cargo runs a crate's tests with the package root as the
+        // working directory, so this name resolves against the CWD.
+        assert!(
+            Path::new("Cargo.toml").exists(),
+            "test assumes CWD is the package root"
+        );
+        let on_list = tempfile::tempdir().unwrap();
+        std::fs::write(on_list.path().join("Cargo.toml"), "").unwrap();
+        let empty = tempfile::tempdir().unwrap();
+
+        // No separator, list set: the list wins over the same-named
+        // file in the CWD.
+        assert_eq!(
+            db_open_file("Cargo.toml", &[on_list.path().to_path_buf()]),
+            Some(on_list.path().join("Cargo.toml"))
+        );
+        // No separator, list set but missing the name: not found. The
+        // CWD copy must NOT rescue it.
+        assert_eq!(
+            db_open_file("Cargo.toml", &[empty.path().to_path_buf()]),
+            None
+        );
+        // No separator, list unset: bare open, i.e. the CWD.
+        assert_eq!(
+            db_open_file("Cargo.toml", &[]),
+            Some(PathBuf::from("Cargo.toml"))
+        );
+        // Separator present, list set: bare open, list not consulted —
+        // so a name the list COULD have resolved is still opened bare.
+        assert_eq!(
+            db_open_file("./Cargo.toml", &[on_list.path().to_path_buf()]),
+            Some(PathBuf::from("./Cargo.toml"))
+        );
+        let nested = on_list.path().join("sub");
+        std::fs::create_dir(&nested).unwrap();
+        std::fs::write(nested.join("x.db"), "").unwrap();
+        assert_eq!(
+            db_open_file("sub/x.db", &[on_list.path().to_path_buf()]),
+            None
+        );
+    }
+
+    /// C runs `macEnvExpand` on the name before `dbOpenFile` on both
+    /// paths (`dbLexRoutines.c:276` in `dbReadCOM`, `:449` in
+    /// `dbIncludeNew`), so an environment reference in a `.db`,
+    /// template or `include` name resolves. The second case is the one
+    /// that matters in practice: the `.db` reader's own macro pass has
+    /// already rewritten the reference to `$(TOP,undefined)`, and that
+    /// placeholder is still a live reference for this pass.
+    #[test]
+    #[serial_test::serial(epics_env)]
+    fn db_open_file_env_expands_the_name() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("common.db"), "").unwrap();
+        let key = "EPICS_RS_TEST_DB_TOP";
+        // SAFETY: single-threaded under the `epics_env` serial group.
+        unsafe { std::env::set_var(key, super::super::macro_safe_path(dir.path())) };
+
+        let raw = format!("$({key})/common.db");
+        assert_eq!(
+            db_open_file(&raw, &[]),
+            Some(dir.path().join("common.db")),
+            "environment reference in a bare name must expand"
+        );
+        let placeholder = format!("$({key},undefined)/common.db");
+        assert_eq!(
+            db_open_file(&placeholder, &[]),
+            Some(dir.path().join("common.db")),
+            "the .db reader's undefined-placeholder must re-expand here"
+        );
+        // Undefined everywhere is C's NULL return: no file, no open.
+        assert_eq!(db_open_file("$(NO_SUCH_VAR_HERE)/common.db", &[]), None);
+
+        // SAFETY: same serial group.
+        unsafe { std::env::remove_var(key) };
+    }
+
+    /// The whole-file path: `include "$(VAR)/inc.db"` inside a `.db`
+    /// reaches `dbIncludeNew`, whose `macEnvExpand` is what makes an
+    /// environment-only reference resolve.
+    #[test]
+    #[serial_test::serial(epics_env)]
+    fn include_directive_env_expands_the_name() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("inc.db"),
+            "record(ai,\"SIM:INC\") { field(VAL,\"7\") }\n",
+        )
+        .unwrap();
+        let main = dir.path().join("main.db");
+        let key = "EPICS_RS_TEST_INC_TOP";
+        std::fs::write(&main, format!("include \"$({key})/inc.db\"\n")).unwrap();
+        // SAFETY: single-threaded under the `epics_env` serial group.
+        unsafe { std::env::set_var(key, super::super::macro_safe_path(dir.path())) };
+
+        let out = expand_includes(
+            &main,
+            &HashMap::new(),
+            &DbLoadConfig::default(),
+            &mut DbFaults::default(),
+        )
+        .expect("include with an environment reference must resolve");
+        assert!(out.contains("SIM:INC"), "expanded output was {out:?}");
+
+        // SAFETY: same serial group.
+        unsafe { std::env::remove_var(key) };
     }
 }

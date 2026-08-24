@@ -377,23 +377,113 @@ impl NDAttributeSource for FunctionAttributeSource {
     }
 }
 
+/// The `chtype` an `EPICS_PV` attribute subscribes with — C++ `PVAttribute`'s
+/// `dbrType` member, taken from the XML `dbrtype` attribute.
+///
+/// The variants are named for the `NDAttrDataType` C publishes for each
+/// `DBR_XXX` (PVAttribute.cpp:257-282), not for the CA wire type, because
+/// several DBR types collapse: `DBR_SHORT`, `DBR_INT` and `DBR_ENUM` all
+/// publish `NDAttrInt16`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum PvAttrDbrType {
+    /// C `DBR_NATIVE` — the default when `dbrtype` is omitted. The published
+    /// type follows the PV's own field type (PVAttribute.cpp:224-249).
+    #[default]
+    Native,
+    /// `DBR_STRING` → `NDAttrString`.
+    String,
+    /// `DBR_CHAR` → `NDAttrInt8`.
+    Int8,
+    /// `DBR_SHORT` / `DBR_INT` / `DBR_ENUM` → `NDAttrInt16`.
+    Int16,
+    /// `DBR_LONG` → `NDAttrInt32`.
+    Int32,
+    /// `DBR_FLOAT` → `NDAttrFloat32`.
+    Float32,
+    /// `DBR_DOUBLE` → `NDAttrFloat64`.
+    Float64,
+}
+
+impl PvAttrDbrType {
+    /// Parse the XML `dbrtype` spelling — C's nine-name table
+    /// (asynNDArrayDriver.cpp:421-434).
+    ///
+    /// `None` is C's `else` arm, which prints `unknown dbrType` and returns
+    /// `asynError`: the whole attributes file is refused rather than the one
+    /// attribute being silently dropped, so a typo cannot leave an IOC
+    /// producing arrays that are quietly missing an attribute.
+    pub fn from_xml(dbrtype: &str) -> Option<Self> {
+        match dbrtype {
+            "DBR_CHAR" => Some(Self::Int8),
+            "DBR_SHORT" | "DBR_INT" | "DBR_ENUM" => Some(Self::Int16),
+            "DBR_LONG" => Some(Self::Int32),
+            "DBR_FLOAT" => Some(Self::Float32),
+            "DBR_DOUBLE" => Some(Self::Float64),
+            "DBR_STRING" => Some(Self::String),
+            "DBR_NATIVE" => Some(Self::Native),
+            _ => None,
+        }
+    }
+
+    /// Publish a monitored value as the type this `dbrtype` asked for.
+    ///
+    /// C requests the type on the wire (`ca_add_masked_array_event(dbrType, …)`,
+    /// PVAttribute.cpp:293) and stores whatever arrives into the matching union
+    /// member, so the attribute's `NDAttrDataType` is the REQUESTED type, not
+    /// the PV's. `CaClient::camonitor` subscribes with the channel's native
+    /// type and takes no type argument, so the port converts on arrival
+    /// instead; the published type is the same either way. A value that will
+    /// not convert — a non-numeric string asked for as `DBR_DOUBLE` — stays
+    /// `Undefined`, C's un-set union member.
+    pub fn publish(self, value: NDAttrValue) -> NDAttrValue {
+        if matches!(value, NDAttrValue::Undefined) {
+            return value;
+        }
+        match self {
+            Self::Native => value,
+            Self::String => NDAttrValue::String(value.as_string()),
+            Self::Int8 => value
+                .as_i64()
+                .map_or(NDAttrValue::Undefined, |v| NDAttrValue::Int8(v as i8)),
+            Self::Int16 => value
+                .as_i64()
+                .map_or(NDAttrValue::Undefined, |v| NDAttrValue::Int16(v as i16)),
+            Self::Int32 => value
+                .as_i64()
+                .map_or(NDAttrValue::Undefined, |v| NDAttrValue::Int32(v as i32)),
+            Self::Float32 => value
+                .as_f64()
+                .map_or(NDAttrValue::Undefined, |v| NDAttrValue::Float32(v as f32)),
+            Self::Float64 => value
+                .as_f64()
+                .map_or(NDAttrValue::Undefined, NDAttrValue::Float64),
+        }
+    }
+}
+
 /// Live source for an `EPICS_PV`-type attribute (C++ `PVAttribute`).
 ///
-/// A CA-monitor task feeds fresh values into the shared [`LiveValueCell`];
-/// `evaluate()` returns the latest monitored value. This struct is the
-/// pluggable backend — the CA-monitor feeder task that drives the cell is
-/// provided separately (it requires a live `epics-ca-rs` CA client).
+/// `evaluate()` returns whatever was last written into the shared
+/// [`LiveValueCell`]. The writer is `spawn_ca_monitor`, started by
+/// `NDArrayDriverBase` for every `EPICS_PV` attribute once the IOC has handed
+/// the port a CA client. An IOC that never hands one over leaves the cell at
+/// `Undefined` for its whole life, and `NDArrayDriverBase` reports that
+/// through `ND_ATTRIBUTES_STATUS` rather than letting the file read back as
+/// loaded.
 #[derive(Debug)]
 pub struct EpicsPvAttributeSource {
     /// The PV name this attribute monitors (the XML `source`).
     pub pv_name: String,
+    /// The type the monitored value is published as (the XML `dbrtype`).
+    pub dbr_type: PvAttrDbrType,
     cell: std::sync::Arc<LiveValueCell>,
 }
 
 impl EpicsPvAttributeSource {
-    pub fn new(pv_name: impl Into<String>) -> std::sync::Arc<Self> {
+    pub fn new(pv_name: impl Into<String>, dbr_type: PvAttrDbrType) -> std::sync::Arc<Self> {
         std::sync::Arc::new(Self {
             pv_name: pv_name.into(),
+            dbr_type,
             cell: LiveValueCell::new(NDAttrValue::Undefined),
         })
     }
@@ -422,17 +512,24 @@ impl NDAttributeSource for EpicsPvAttributeSource {
 /// `evaluate()` returns the latest value. The task exits when the monitor
 /// stream ends; the returned [`tokio::task::JoinHandle`] lets the caller abort
 /// it on shutdown.
+///
+/// `runtime` is named rather than taken from the ambient context because the
+/// caller is `NDArrayDriverBase::read_nd_attributes_file`, reached from an
+/// `NDAttributesFile` write on an asyn port thread that is not inside any
+/// runtime.
 #[cfg(feature = "ioc")]
 pub fn spawn_ca_monitor(
+    runtime: &tokio::runtime::Handle,
     client: std::sync::Arc<epics_ca_rs::client::CaClient>,
-    source: std::sync::Arc<EpicsPvAttributeSource>,
+    source: &EpicsPvAttributeSource,
 ) -> tokio::task::JoinHandle<()> {
     let pv_name = source.pv_name.clone();
+    let dbr_type = source.dbr_type;
     let cell = source.cell().clone();
-    tokio::spawn(async move {
+    runtime.spawn(async move {
         let _ = client
             .camonitor(&pv_name, |value| {
-                cell.set(epics_value_to_nd_attr(&value));
+                cell.set(dbr_type.publish(epics_value_to_nd_attr(&value)));
             })
             .await;
     })
@@ -891,10 +988,39 @@ mod tests {
     fn test_epics_pv_source_cell_feeding() {
         // G10: an EpicsPvAttributeSource returns whatever a CA-monitor task
         // last fed into its cell.
-        let src = EpicsPvAttributeSource::new("TST:Temp");
+        let src = EpicsPvAttributeSource::new("TST:Temp", PvAttrDbrType::Native);
         assert_eq!(src.evaluate(), NDAttrValue::Undefined);
         src.cell().set(NDAttrValue::Float64(22.4));
         assert_eq!(src.evaluate(), NDAttrValue::Float64(22.4));
+    }
+
+    #[test]
+    fn test_pv_attr_dbr_type_publish() {
+        // C publishes the REQUESTED dbrType, not the PV's native one
+        // (PVAttribute.cpp:257-282), so a DBR_LONG on a DBF_DOUBLE PV is an
+        // Int32 attribute.
+        assert_eq!(
+            PvAttrDbrType::Int32.publish(NDAttrValue::Float64(22.9)),
+            NDAttrValue::Int32(22)
+        );
+        assert_eq!(
+            PvAttrDbrType::String.publish(NDAttrValue::Int16(7)),
+            NDAttrValue::String("7".into())
+        );
+        assert_eq!(
+            PvAttrDbrType::Native.publish(NDAttrValue::Float64(22.9)),
+            NDAttrValue::Float64(22.9)
+        );
+        // Un-convertible and un-set both stay Undefined rather than becoming a
+        // plausible zero.
+        assert_eq!(
+            PvAttrDbrType::Float64.publish(NDAttrValue::String("warm".into())),
+            NDAttrValue::Undefined
+        );
+        assert_eq!(
+            PvAttrDbrType::String.publish(NDAttrValue::Undefined),
+            NDAttrValue::Undefined
+        );
     }
 
     #[test]

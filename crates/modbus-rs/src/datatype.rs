@@ -435,6 +435,19 @@ pub fn read_float(dt: ModbusDataType, regs: &[u16]) -> ModbusResult<(f64, usize)
     }
 }
 
+/// C's `-(epicsInt16)value`, integer promotion included.
+///
+/// The cast narrows to 16 bits, then C promotes the result to `int` *before*
+/// the unary minus runs, so `-32768` negates to `+32768` instead of
+/// overflowing its own type (`drvModbusAsyn.cpp:2622` for `dataTypeInt16SM`,
+/// `:2631` for `dataTypeBCDSigned`). Negating in `i16` is what made a
+/// `-32768` put panic in an overflow-checked build and run the BCD digit loop
+/// on a wrapped negative magnitude in release. Both write arms take the width
+/// from here so neither can drift back to the narrow one.
+fn negate_promoted_int16(value: i64) -> i32 {
+    -(value as i16 as i32)
+}
+
 /// Encode a signed 64-bit value into Modbus registers for `dt`.
 ///
 /// Returns the registers (1, 2, or 4 of them). Port of `writePlcInt64`; the
@@ -447,7 +460,9 @@ pub fn write_int64(dt: ModbusDataType, value: i64) -> ModbusResult<Vec<u16>> {
         Int16Sm => {
             let mut v = value as u16;
             if v & 0x8000 != 0 {
-                v = (-(v as i16)) as u16;
+                // C truncates the promoted `int` back into `epicsUInt16`
+                // (:2622-2623), which is what keeps 0x8000 at 0x8000.
+                v = negate_promoted_int16(v as i64) as u16;
                 v |= 0x8000;
             }
             Ok(vec![v])
@@ -456,7 +471,7 @@ pub fn write_int64(dt: ModbusDataType, value: i64) -> ModbusResult<Vec<u16>> {
             let mut magnitude = value;
             let negative = dt == BcdSigned && (value as i16) < 0;
             if negative {
-                magnitude = -(value as i16) as i64;
+                magnitude = negate_promoted_int16(value) as i64;
             }
             let mut out: u16 = 0;
             let mut div: i64 = 1000;
@@ -702,6 +717,54 @@ mod tests {
             read_int64(ModbusDataType::BcdSigned, &[0x0042]).unwrap().0,
             42
         );
+    }
+
+    /// MB-1 boundary: `-32768` is the one input whose magnitude does not fit
+    /// the type C casts to. C negates *after* integer promotion
+    /// (`drvModbusAsyn.cpp:2631`), so `+32768` survives into `epicsInt64` and
+    /// the digit loop runs on a positive magnitude. Negating in `i16`
+    /// panicked the IOC in an overflow-checked build and, in release, wrapped
+    /// back to `-32768` and put `0x89A8` on the wire.
+    #[test]
+    fn bcd_signed_negates_int16_min_the_way_c_promotes() {
+        assert_eq!(
+            write_int64(ModbusDataType::BcdSigned, -32768).unwrap(),
+            vec![0x8768]
+        );
+    }
+
+    /// The same boundary on the sign-magnitude arm (`drvModbusAsyn.cpp:2622`).
+    /// C truncates the promoted `int` back into `epicsUInt16`, so the register
+    /// is `0x8000`; only the panic diverged.
+    #[test]
+    fn int16_sm_negates_int16_min_the_way_c_promotes() {
+        assert_eq!(
+            write_int64(ModbusDataType::Int16Sm, -32768).unwrap(),
+            vec![0x8000]
+        );
+    }
+
+    /// The rest of the negative range, pinned so widening the negation cannot
+    /// pay for the boundary with the values C and the port already agreed on.
+    #[test]
+    fn int16_negation_neighbours_are_unchanged() {
+        for (value, bcd, sm) in [
+            (-1i64, 0x8001u16, 0x8001u16),
+            (-1234, 0x9234, 0x84D2),
+            (-9999, 0x9999, 0xA70F),
+            (-32767, 0x8767, 0xFFFF),
+        ] {
+            assert_eq!(
+                write_int64(ModbusDataType::BcdSigned, value).unwrap(),
+                vec![bcd],
+                "BCD_SIGNED {value}"
+            );
+            assert_eq!(
+                write_int64(ModbusDataType::Int16Sm, value).unwrap(),
+                vec![sm],
+                "INT16SM {value}"
+            );
+        }
     }
 
     #[test]

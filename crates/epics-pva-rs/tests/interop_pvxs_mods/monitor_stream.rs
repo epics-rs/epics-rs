@@ -148,7 +148,7 @@ async fn interop_monitor_b_rust_client_streams_from_pvxs_server() {
     let Some(pvxput) = require_pvxs(PVXPUT) else {
         return;
     };
-    let Some(helper) = build_writable_reverse_server() else {
+    let Some(helper) = super::interop_helpers::cpp_helper("reverse_server") else {
         return;
     };
 
@@ -263,73 +263,4 @@ async fn interop_monitor_b_rust_client_streams_from_pvxs_server() {
             "Rust client monitor sequence not monotonic: {seen:?}",
         );
     }
-}
-
-/// Compile reverse_server.cpp on demand. Duplicates a small
-/// snippet from put_cross_impl.rs intentionally — sharing it
-/// would require a 3-way module factor that isn't worth the
-/// indirection for two callers.
-fn build_writable_reverse_server() -> Option<std::path::PathBuf> {
-    use std::path::PathBuf;
-    let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("tests/interop_pvxs_mods/cpp_helpers/reverse_server.cpp");
-    if !src.is_file() {
-        return None;
-    }
-    let out_dir = std::env::var("CARGO_TARGET_TMPDIR")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| std::env::temp_dir());
-    std::fs::create_dir_all(&out_dir).ok();
-    let out = out_dir.join("reverse_server");
-    let need = !out.is_file()
-        || std::fs::metadata(&src).and_then(|m| m.modified()).ok()
-            > std::fs::metadata(&out).and_then(|m| m.modified()).ok();
-    if !need {
-        return Some(out);
-    }
-    let pvxs = std::env::var_os("PVXS_HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| {
-            let h = std::env::var("HOME").unwrap_or_default();
-            PathBuf::from(h).join("codes/pvxs")
-        });
-    let base = std::env::var_os("EPICS_BASE")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| {
-            let h = std::env::var("HOME").unwrap_or_default();
-            PathBuf::from(h).join("epics/epics-base")
-        });
-    let arch = super::interop_helpers::pvxs_arch();
-    let pvxs_lib = pvxs.join("lib").join(arch);
-    let base_lib = base.join("lib").join(arch);
-    if !pvxs_lib.exists() || !base_lib.exists() {
-        return None;
-    }
-    let base_os_include = if cfg!(target_os = "macos") {
-        base.join("include/os/Darwin")
-    } else {
-        base.join("include/os/Linux")
-    };
-    std::process::Command::new("c++")
-        .args(["-std=c++17", "-O0", "-g"])
-        .arg(format!("-I{}", pvxs.join("include").display()))
-        .arg(format!("-I{}", base.join("include").display()))
-        .arg(format!(
-            "-I{}",
-            base.join("include/compiler/clang").display()
-        ))
-        .arg(format!("-I{}", base_os_include.display()))
-        .arg(&src)
-        .arg(format!("-L{}", pvxs_lib.display()))
-        .arg("-lpvxs")
-        .arg(format!("-L{}", base_lib.display()))
-        .arg("-lCom")
-        .arg(format!("-Wl,-rpath,{}", pvxs_lib.display()))
-        .arg(format!("-Wl,-rpath,{}", base_lib.display()))
-        .arg("-o")
-        .arg(&out)
-        .status()
-        .ok()
-        .filter(|s| s.success())
-        .map(|_| out)
 }

@@ -50,7 +50,7 @@ Wall-clock timestamp string with 11 format options:
 | Driver | Used For | Description |
 |--------|----------|-------------|
 | **Epid Soft** | epid | Synchronous PID computation each scan cycle |
-| **Epid Async Soft** | epid | Trigger-driven async PID with callback completion |
+| **Async Soft Channel** | epid | Trigger-driven async PID with callback completion |
 | **Fast Epid** | epid | Interrupt-driven 1 kHz+ PID loop with high-rate readback |
 | **Time of Day** | timestamp | Periodic wall-clock update via interval timer |
 | **Sec Past Epoch** | longin | Unix epoch seconds counter |

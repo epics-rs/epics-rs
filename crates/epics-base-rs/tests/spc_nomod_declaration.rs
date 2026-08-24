@@ -3,7 +3,7 @@
 //!
 //! C reads that one declaration in two unrelated places — `dbPut`
 //! (`dbAccess.c:123-126`) refuses the write, and `rsrvCheckPut`
-//! (`rsrv/camessage.c:2540-2551`) clears the `CA_PROTO_ACCESS_RIGHTS` write bit
+//! (`rsrv/camessage.c:2608-2619`) clears the `CA_PROTO_ACCESS_RIGHTS` write bit
 //! so the client never sends the doomed put. The port routes both through
 //! `RecordInstance::is_no_mod`, so `is_no_mod` is the thing this file pins.
 //!

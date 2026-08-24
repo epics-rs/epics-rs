@@ -105,6 +105,7 @@ libc = "0.2"
 # crate that declares the feature has the same hole, and three copies of a
 # 300-line audit is how three copies of a rule come to disagree.
 rtems-exec-gate = { path = "../../tools/rtems-exec-gate" }
+record-seam-gate = { path = "../../tools/record-seam-gate" }
 epics-ca-rs = { path = "../epics-ca-rs" }
 tempfile = "3"
 serial_test = "3"

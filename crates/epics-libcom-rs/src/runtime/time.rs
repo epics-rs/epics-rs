@@ -16,8 +16,31 @@ pub fn now_mono() -> Instant {
     Instant::now()
 }
 
+/// The instant `base + d`, saturating where `Instant + Duration` would
+/// panic — the single owner of "turn a delay into a deadline".
+///
+/// [`duration_from_secs`] deliberately maps `+inf`, `NaN` and any
+/// magnitude past `Duration`'s range to [`Duration::MAX`], so a deadline
+/// computed from a record delay field can be exactly that sum and
+/// `Instant`'s `Add` panics on it. tokio's `sleep()` does not: it takes
+/// `Instant::now().checked_add(dur)` and falls back to
+/// `Instant::far_future()`, about thirty years out. The hosted build
+/// therefore slept forever where the exec build unwound the task, and it
+/// is that disagreement — not the arithmetic — that is the defect, so
+/// the fallback here is tokio's, to the same constant.
+pub fn deadline_after(base: Instant, d: Duration) -> Instant {
+    base.checked_add(d).unwrap_or_else(far_future)
+}
+
+/// `base` = now. See [`deadline_after`].
 pub fn deadline_from_now(d: Duration) -> Instant {
-    Instant::now() + d
+    deadline_after(Instant::now(), d)
+}
+
+/// Roughly thirty years from now — tokio's `Instant::far_future()`, the
+/// "never fires" deadline an unrepresentable one collapses to.
+fn far_future() -> Instant {
+    Instant::now() + Duration::from_secs(86_400 * 365 * 30)
 }
 
 /// The OS clock-tick period, in seconds — C `epicsThreadSleepQuantum()`.
@@ -142,6 +165,39 @@ fn c_long_cast(f: f64) -> i64 {
     }
 }
 
+/// Seconds as an `f64` → [`Duration`], without the panic
+/// `Duration::from_secs_f64` raises.
+///
+/// This is the libcom time seam's single converter, and every caller
+/// that turns a *record field*, an *environment variable* or any other
+/// externally supplied `double` into a delay must come through it.
+/// `Duration::from_secs_f64` panics on NaN, on either infinity, on a
+/// negative, and on a finite value past `u64::MAX` seconds — and an
+/// `is_finite()` test at the call site is not the rule, because `1e300`
+/// is finite and still panics. `Duration::try_from_secs_f64` is the one
+/// rule that covers all four in a single test.
+///
+/// C never aborts on any of them: `epicsTimeAddSeconds`
+/// (`epicsTime.cpp`) does `nsec += epicsInt64(seconds*1e9 + ...)`, an
+/// out-of-range float→integer conversion, so the deadline is garbage and
+/// the callback fires at the wrong time while the IOC keeps serving
+/// every other PV. The mapping here keeps that "IOC survives" property
+/// and gives the garbage a defined shape:
+///
+/// * negative, including `-inf` → [`Duration::ZERO`] — C's
+///   already-expired deadline, which fires at once.
+/// * `+inf`, `NaN`, or a magnitude beyond `Duration` → [`Duration::MAX`]
+///   — a deadline no comparison ever reaches, i.e. it never fires.
+///   NaN lands here because in C every `now < expire` test against NaN
+///   is false, which is the same "never fires".
+pub fn duration_from_secs(secs: f64) -> Duration {
+    Duration::try_from_secs_f64(secs).unwrap_or(if secs < 0.0 {
+        Duration::ZERO
+    } else {
+        Duration::MAX
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -153,6 +209,31 @@ mod tests {
             Some(i) => &src[..i],
             None => src,
         }
+    }
+
+    /// Boundaries of the one rule, not scenarios: every input
+    /// `Duration::from_secs_f64` would panic on has a defined answer
+    /// here, and the representable ones convert unchanged.
+    #[test]
+    fn duration_from_secs_covers_every_panic_boundary() {
+        assert_eq!(duration_from_secs(f64::INFINITY), Duration::MAX);
+        assert_eq!(duration_from_secs(f64::NEG_INFINITY), Duration::ZERO);
+        assert_eq!(duration_from_secs(f64::NAN), Duration::MAX);
+        // Finite and far too large — the case an `is_finite()` guard
+        // lets through and `from_secs_f64` still panics on.
+        assert_eq!(duration_from_secs(1e300), Duration::MAX);
+        // The representable edge: `u64::MAX` seconds is out of range,
+        // one below the power of two above it is not.
+        assert_eq!(duration_from_secs(u64::MAX as f64), Duration::MAX);
+        assert_eq!(
+            duration_from_secs(9.0e18),
+            Duration::try_from_secs_f64(9.0e18).unwrap()
+        );
+        assert_eq!(duration_from_secs(-1.0), Duration::ZERO);
+        assert_eq!(duration_from_secs(-0.0), Duration::ZERO);
+        assert_eq!(duration_from_secs(0.0), Duration::ZERO);
+        assert_eq!(duration_from_secs(0.25), Duration::from_millis(250));
+        assert_eq!(duration_from_secs(2.5), Duration::from_millis(2500));
     }
 
     /// The tick rate must be ASKED for, never restated.
@@ -220,6 +301,25 @@ mod tests {
         let t1 = now_mono();
         let t2 = now_mono();
         assert!(t2 >= t1);
+    }
+
+    /// Boundaries of the deadline owner: a representable delay converts
+    /// unchanged, and the one `Instant + Duration` panics on —
+    /// `Duration::MAX`, which is exactly what `duration_from_secs`
+    /// returns for `+inf`, `NaN` and `1e300` — saturates instead.
+    #[test]
+    fn deadline_saturates_where_instant_add_would_panic() {
+        let base = Instant::now();
+        assert_eq!(
+            deadline_after(base, Duration::from_secs(10)),
+            base + Duration::from_secs(10)
+        );
+        let never = deadline_after(base, Duration::MAX);
+        assert!(never > base + Duration::from_secs(86_400 * 365));
+        assert!(deadline_from_now(duration_from_secs(f64::INFINITY)) > Instant::now());
+        assert!(deadline_from_now(duration_from_secs(1e300)) > Instant::now());
+        // Saturating twice still saturates.
+        assert!(deadline_after(never, Duration::MAX) > base);
     }
 
     #[test]

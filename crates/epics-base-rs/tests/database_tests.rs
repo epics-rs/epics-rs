@@ -27,13 +27,17 @@ fn sub_with_snam(snam: &str) -> epics_base_rs::server::records::sub_record::SubR
 
 #[epics_macros_rs::epics_test]
 async fn test_write_notify_follows_flnk() {
+    use epics_base_rs::server::records::calc::CalcRecord;
+
     let db = PvDatabase::new();
-    db.add_record("REC_A", Box::new(AoRecord::new(0.0)))
-        .await
-        .unwrap();
-    db.add_record("REC_B", Box::new(AoRecord::new(0.0)))
-        .await
-        .unwrap();
+    // Counters: `VAL+1` reads the previous VAL, so VAL is the number of
+    // times the record processed. `visited` cannot answer that — it is
+    // frame-scoped and empty again once the chain unwinds.
+    for name in ["REC_A", "REC_B"] {
+        let mut rec = CalcRecord::new("VAL+1");
+        rec.init_record(0).unwrap();
+        db.add_record(name, Box::new(rec)).await.unwrap();
+    }
 
     if let Some(rec) = db.get_record("REC_A") {
         let mut inst = rec.write();
@@ -45,8 +49,8 @@ async fn test_write_notify_follows_flnk() {
     db.process_record_with_links("REC_A", &mut visited, 0)
         .await
         .unwrap();
-    assert!(visited.contains("REC_A"));
-    assert!(visited.contains("REC_B"));
+    assert_eq!(db.get_pv("REC_A").unwrap().to_f64(), Some(1.0));
+    assert_eq!(db.get_pv("REC_B").unwrap().to_f64(), Some(1.0));
 }
 
 #[epics_macros_rs::epics_test]
@@ -1369,9 +1373,13 @@ async fn test_cycle_detection() {
     db.process_record_with_links("CYCLE_A", &mut visited, 0)
         .await
         .unwrap();
-    assert!(visited.contains("CYCLE_A"));
-    assert!(visited.contains("CYCLE_B"));
-    assert_eq!(visited.len(), 2);
+    // What breaks the loop is that CYCLE_A is still ON THE STACK when its own
+    // FLNK comes back round, not a record of having processed it earlier — C
+    // stops the same loop with `psrc->pact = TRUE` (`dbDbLink.c:456`), also a
+    // stack condition. The set is therefore empty once the chain unwinds, and
+    // the per-record process counts live in
+    // `tests/process_frame_marker_is_stack_scoped.rs`.
+    assert!(visited.is_empty(), "the frame unwound: {visited:?}");
 }
 
 #[epics_macros_rs::epics_test]
@@ -2346,8 +2354,21 @@ fn test_depth_limit() {
         db.process_record_with_links("CHAIN_0", &mut visited, 0)
             .await
             .unwrap();
-        assert!(visited.len() <= 17);
-        assert!(visited.contains("CHAIN_0"));
+        // Reading the set after the call cannot show how far the chain
+        // walked any more; the refusal on the record at the bound can, and
+        // that is what an operator sees.
+        let refused = db
+            .get_record("CHAIN_16")
+            .expect("CHAIN_16 exists")
+            .read()
+            .common
+            .amsg
+            .clone();
+        assert!(
+            refused.contains("link chain depth limit"),
+            "the record at MAX_LINK_DEPTH must carry the reason, got {refused:?}"
+        );
+        assert!(visited.is_empty(), "the frame unwound: {visited:?}");
     });
 }
 
@@ -3129,8 +3150,10 @@ async fn test_async_pending_skips_post_process() {
     db.process_record_with_links("ASYNC", &mut visited, 0)
         .await
         .unwrap();
-    assert!(visited.contains("ASYNC"));
-    assert!(!visited.contains("FLNK_TARGET"));
+    // `visited` is frame-scoped, so it says nothing after the call returns;
+    // that the FLNK did not fire is what UDF below pins — the record is still
+    // mid-async and C's `dbProcess` returns before `recGblFwdLink`.
+    assert!(visited.is_empty(), "the frame unwound: {visited:?}");
     let rec = db.get_record("ASYNC").unwrap();
     let inst = rec.read();
     assert!(inst.common.udf != 0);
@@ -3142,9 +3165,9 @@ async fn test_complete_async_record() {
     db.add_record("ASYNC", Box::new(AsyncRecord { val: 42.0 }))
         .await
         .unwrap();
-    db.add_record("FLNK_TARGET", Box::new(AoRecord::new(0.0)))
-        .await
-        .unwrap();
+    let mut tgt = epics_base_rs::server::records::calc::CalcRecord::new("VAL+1");
+    tgt.init_record(0).unwrap();
+    db.add_record("FLNK_TARGET", Box::new(tgt)).await.unwrap();
     if let Some(rec) = db.get_record("ASYNC") {
         let mut inst = rec.write();
         inst.put_common_field("FLNK", EpicsValue::String("FLNK_TARGET".into()))
@@ -3154,8 +3177,17 @@ async fn test_complete_async_record() {
     db.process_record_with_links("ASYNC", &mut visited, 0)
         .await
         .unwrap();
-    assert!(!visited.contains("FLNK_TARGET"));
+    assert_eq!(
+        db.get_pv("FLNK_TARGET").unwrap().to_f64(),
+        Some(0.0),
+        "the FLNK must wait for the async completion"
+    );
     db.complete_async_record("ASYNC").await.unwrap();
+    assert_eq!(
+        db.get_pv("FLNK_TARGET").unwrap().to_f64(),
+        Some(1.0),
+        "completion runs recGblFwdLink"
+    );
     let rec = db.get_record("ASYNC").unwrap();
     let inst = rec.read();
     assert!(inst.common.udf == 0);
@@ -3451,6 +3483,152 @@ async fn test_pact_entry_guard_resets_lcnt_after_completion() {
     assert_eq!(inst.common.lcnt, 0, "lcnt must reset when PACT clears");
 }
 
+// D-A: a CP/CPP burst onto a PACT target. C's `CA_DBPROCESS` worker is bare
+// `dbScanLock`/`db_process`/`dbScanUnlock` (`dbCa.c:1314-1320`), so an active
+// target lands in `dbProcess`'s own PACT branch (`dbAccess.c:537-557`): count
+// `lcnt`, and after `MAX_LOCK` raise SCAN_ALARM/INVALID with AMSG "Async in
+// progress". That branch never writes `precord->rpro`.
+//
+// The port used to decide PACT a second time in `process_one_cp_target`,
+// setting RPRO and skipping — so the starved target got an extra device write
+// on PACT release and never raised the alarm that is how an operator sees the
+// starvation at all.
+//
+// Boundaries, one assertion each: RPRO on a blocked dispatch; the device-write
+// count while blocked; `lcnt` at MAX_LOCK and at MAX_LOCK+1; the device-write
+// count after the async completes; and `lcnt` reset once the target is idle.
+#[epics_macros_rs::epics_test]
+async fn test_cp_burst_on_a_pact_target_alarms_instead_of_setting_rpro() {
+    let db = PvDatabase::new();
+    let writes: Arc<std::sync::Mutex<Vec<f64>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
+    db.add_record("CPB_SRC", Box::new(AoRecord::new(0.0)))
+        .await
+        .unwrap();
+    db.add_record(
+        "CPB_TGT",
+        Box::new(AsyncOutRecord {
+            val: 0.0,
+            device_writes: writes.clone(),
+        }),
+    )
+    .await
+    .unwrap();
+    {
+        let rec = db.get_record("CPB_TGT").unwrap();
+        let mut inst = rec.write();
+        inst.put_common_field("INP", EpicsValue::String("CPB_SRC CP".into()))
+            .unwrap();
+        // C alarms a record that HAS completed a cycle and then hangs mid-async;
+        // a never-processed record still carries the init UDF severity and the
+        // `sevr >= INVALID_ALARM` arm suppresses the alarm forever. Put the
+        // target in the state a completed cycle leaves behind.
+        inst.common.udf = 0;
+        inst.common.sevr = AlarmSeverity::NoAlarm;
+        inst.common.stat = epics_base_rs::server::recgbl::alarm_status::NO_ALARM;
+    }
+    // iocInit's CP scan is what puts the edge in the registry the dispatch
+    // reads; without it `get_cp_targets` is empty and nothing is dispatched.
+    db.setup_cp_links().await;
+
+    // Every burst moves CPB_SRC's value, because the CP trigger is the
+    // source's `DBE_VALUE|DBE_ALARM` POST, not the fact that it processed
+    // (`CyclePosts` / C `dbCa.c:1290-1294`). A repeated identical value posts
+    // nothing past `MDEL = 0` and would dispatch nothing at all, leaving every
+    // assertion below vacuous.
+    let burst = |db: PvDatabase, v: f64| async move {
+        {
+            let rec = db.get_record("CPB_SRC").unwrap();
+            let mut inst = rec.write();
+            inst.record.put_field("VAL", EpicsValue::Double(v)).unwrap();
+        }
+        let mut visited = HashSet::new();
+        db.process_record_with_links("CPB_SRC", &mut visited, 0)
+            .await
+            .unwrap();
+    };
+
+    // Burst 1: target is idle, so the CP dispatch processes it — one device
+    // write, and the target goes PACT.
+    burst(db.clone(), 1.0).await;
+    {
+        let inst = db.get_record("CPB_TGT").unwrap();
+        let inst = inst.read();
+        assert!(
+            inst.is_processing(),
+            "CP dispatch must drive the target PACT"
+        );
+        assert_eq!(inst.common.lcnt, 0, "an idle target resets lcnt");
+    }
+    // 1.0 is burst 1's source value, read through the CP link into the
+    // target's VAL before its device write.
+    assert_eq!(
+        *writes.lock().unwrap(),
+        vec![1.0],
+        "one device write so far"
+    );
+
+    // Bursts 2..=11: the target is PACT. MAX_LOCK = 10 of them bail silently.
+    for i in 1..=10 {
+        burst(db.clone(), 1.0 + i as f64).await;
+        let inst = db.get_record("CPB_TGT").unwrap();
+        let inst = inst.read();
+        assert_eq!(
+            inst.common.rpro, 0,
+            "dbCa.c's CA_DBPROCESS never sets RPRO (burst {i})"
+        );
+        assert_eq!(
+            inst.common.lcnt, i as i16,
+            "lcnt counts the blocked dispatch"
+        );
+        assert_eq!(
+            inst.common.sevr,
+            AlarmSeverity::NoAlarm,
+            "no SCAN_ALARM before MAX_LOCK (burst {i})"
+        );
+        assert_eq!(
+            writes.lock().unwrap().len(),
+            1,
+            "a blocked dispatch must not reach the device (burst {i})"
+        );
+    }
+
+    // Burst 12: lcnt is MAX_LOCK before the increment, so the alarm fires.
+    burst(db.clone(), 12.0).await;
+    {
+        let inst = db.get_record("CPB_TGT").unwrap();
+        let inst = inst.read();
+        assert_eq!(inst.common.sevr, AlarmSeverity::Invalid);
+        assert_eq!(
+            inst.common.stat,
+            epics_base_rs::server::recgbl::alarm_status::SCAN_ALARM
+        );
+        assert_eq!(inst.common.amsg, "Async in progress");
+        assert_eq!(inst.common.rpro, 0, "the alarm arm writes no RPRO either");
+    }
+
+    // The device round trip finally completes. No RPRO was ever set, so the
+    // completion tail queues no reprocess and the device sees no second write.
+    db.complete_async_record("CPB_TGT").await.unwrap();
+    for _ in 0..20 {
+        if writes.lock().unwrap().len() > 1 {
+            break;
+        }
+        epics_base_rs::runtime::task::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    assert_eq!(
+        *writes.lock().unwrap(),
+        vec![1.0],
+        "no RPRO means no extra device write on PACT release"
+    );
+
+    // The target is idle again: the next CP dispatch runs the body and resets
+    // lcnt, C's `else { precord->lcnt = 0; }`.
+    burst(db.clone(), 13.0).await;
+    let inst = db.get_record("CPB_TGT").unwrap();
+    let inst = inst.read();
+    assert_eq!(inst.common.lcnt, 0, "an idle target resets lcnt");
+}
+
 // Regression: when a record returns `AsyncPending` paired with a
 // `ReprocessAfter` action (the timer-owned continuation pattern used
 // by scaler DLY / calc AFTC), the spawned timer fire must call
@@ -3544,8 +3722,17 @@ async fn test_reprocess_after_continuation_bypasses_pact_guard() {
         "foreign re-entry during AsyncPending must NOT call process()"
     );
 
-    // Wait for the ReprocessAfter timer to fire.
-    epics_base_rs::runtime::task::sleep(std::time::Duration::from_millis(80)).await;
+    // Wait for the ReprocessAfter timer to fire. Polled to a deadline
+    // rather than slept for a fixed interval: the fire runs on the
+    // process-global background executor, which this test's own
+    // `spawn_background` constructs from cold, and a whole-suite run on a
+    // loaded machine puts that construction plus a 20 ms timer well past
+    // any interval short enough to be worth writing. The deadline is a
+    // failure bound, not the expected latency (20.7 ms, idle Linux).
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while process_count.load(Ordering::SeqCst) < 2 && std::time::Instant::now() < deadline {
+        epics_base_rs::runtime::task::sleep(std::time::Duration::from_millis(1)).await;
+    }
 
     // Continuation fired: process() ran a second time despite
     // pact=true.
@@ -3847,7 +4034,7 @@ async fn test_sdis_disable_fires_put_notify_completion() {
 //   * no async member in the chain   → completes synchronously (Ok(None))
 //   * async member reached via FLNK  → deferred (Ok(Some(rx)), fires later)
 //   * async member reached via OUT PP→ deferred (same, other dispatch edge)
-//   * second WRITE_NOTIFY in-flight  → refused (Ok→Err PutCallbackInProgress)
+//   * second WRITE_NOTIFY in-flight  → queued on the restart list, not refused
 // ---------------------------------------------------------------------------
 
 /// Boundary: a fully synchronous chain (originating record + a sync FLNK
@@ -3966,13 +4153,15 @@ async fn test_put_notify_defers_for_async_out_pp_target() {
         .expect("completion must fire once the async OUT PP target completes");
 }
 
-/// Boundary: a second WRITE_NOTIFY on a record whose put-notify is still
-/// in flight is refused (C returns S_db_Blocked / ECA_PUTCBINPROG).
-/// Silently overwriting the wait-set would drop the prior `Sender`, waking
-/// the prior caller's receiver with a `RecvError` the CA dispatcher treats
-/// as success.
+/// Boundary: a second WRITE_NOTIFY on a record whose put-notify is still in
+/// flight joins C's `restartList` (`dbNotify.c:213-217`) rather than being
+/// refused — `S_db_Blocked` / ECA_PUTCBINPROG is not a status C sends from
+/// this path, and returning it drops the client's value. It must also not
+/// overwrite the wait-set, which would drop the prior `Sender` and wake the
+/// prior caller's receiver with a `RecvError` the CA dispatcher treats as
+/// success.
 #[epics_macros_rs::epics_test]
-async fn test_put_notify_refuses_second_in_flight() {
+async fn test_put_notify_queues_second_in_flight() {
     let db = PvDatabase::new();
     db.add_record("PN_DBL", Box::new(AsyncRecord { val: 0.0 }))
         .await
@@ -3989,15 +4178,27 @@ async fn test_put_notify_refuses_second_in_flight() {
         "async record's first put must return a deferred receiver"
     );
 
-    // Second put while the first is still in flight → refused.
+    // Second put while the first is still in flight → queued, and the client
+    // gets a receiver to wait on instead of an error.
     let second = db
         .put_record_field_from_ca("PN_DBL", "VAL", EpicsValue::Double(2.0))
-        .await;
+        .await
+        .expect("a second WRITE_NOTIFY must be queued, not refused");
     assert!(
-        matches!(second, Err(CaError::PutCallbackInProgress(_))),
-        "a second WRITE_NOTIFY on an in-flight record must be refused with \
-         PutCallbackInProgress; got {second:?}"
+        second.is_async(),
+        "a queued put-notify completes on its own restart, so it must hand \
+         back a receiver; got {second:?}"
     );
+
+    // Nothing was written: C tests ownership above `putCallback`.
+    {
+        let rec = db.get_record("PN_DBL").unwrap();
+        assert_eq!(
+            rec.read().record.get_field("VAL"),
+            Some(EpicsValue::Double(1.0)),
+            "the queued put must write nothing until it is restarted"
+        );
+    }
 }
 
 /// Boundary (the live defect): a fire-and-forget put — C `dbPutField`
@@ -4190,10 +4391,14 @@ async fn scan_once_is_not_joined_to_put_notify_completion() {
     // The queued scanOnce lands independently after the synchronous put
     // returned: the record is re-processed a second time, off the put's
     // completion path.
-    for _ in 0..50 {
-        epics_base_rs::runtime::task::yield_now().await;
+    // Polled to a deadline for the same reason the `ReprocessAfter`
+    // continuation is: the scanOnce is a spawned cycle, so how long it takes
+    // to land is the machine's business, and a fixed settle only encodes the
+    // load the test was written under.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while count.load(Ordering::SeqCst) < 2 && std::time::Instant::now() < deadline {
+        epics_base_rs::runtime::task::sleep(std::time::Duration::from_millis(1)).await;
     }
-    epics_base_rs::runtime::task::sleep(std::time::Duration::from_millis(50)).await;
     assert!(
         count.load(Ordering::SeqCst) >= 2,
         "the scanOnce must run as its own cycle after the put completed, got \
@@ -5420,6 +5625,7 @@ async fn test_calc_record_aftc_filter_delays_alarm() {
 
 #[epics_macros_rs::epics_test]
 async fn test_fanout_all() {
+    use epics_base_rs::server::records::calc::CalcRecord;
     use epics_base_rs::server::records::fanout::FanoutRecord;
     let db = PvDatabase::new();
     let mut fanout = FanoutRecord::new();
@@ -5427,19 +5633,17 @@ async fn test_fanout_all() {
     fanout.lnk1 = "TARGET_1".to_string();
     fanout.lnk2 = "TARGET_2".to_string();
     db.add_record("FANOUT", Box::new(fanout)).await.unwrap();
-    db.add_record("TARGET_1", Box::new(AoRecord::new(0.0)))
-        .await
-        .unwrap();
-    db.add_record("TARGET_2", Box::new(AoRecord::new(0.0)))
-        .await
-        .unwrap();
+    for name in ["TARGET_1", "TARGET_2"] {
+        let mut tgt = CalcRecord::new("VAL+1");
+        tgt.init_record(0).unwrap();
+        db.add_record(name, Box::new(tgt)).await.unwrap();
+    }
     let mut visited = HashSet::new();
     db.process_record_with_links("FANOUT", &mut visited, 0)
         .await
         .unwrap();
-    assert!(visited.contains("FANOUT"));
-    assert!(visited.contains("TARGET_1"));
-    assert!(visited.contains("TARGET_2"));
+    assert_eq!(db.get_pv("TARGET_1").unwrap().to_f64(), Some(1.0));
+    assert_eq!(db.get_pv("TARGET_2").unwrap().to_f64(), Some(1.0));
 }
 
 #[epics_macros_rs::epics_test]
@@ -5448,18 +5652,18 @@ async fn test_fanout_specified() {
     // at index `SELN + OFFS`, 0-based over LNK0..LNKF. With SELN=1,
     // OFFS=0 the selected link is LNK1 (NOT LNK2 — the pre-fix port
     // omitted LNK0 and was off by one).
+    use epics_base_rs::server::records::calc::CalcRecord;
     use epics_base_rs::server::records::fanout::FanoutRecord;
     let db = PvDatabase::new();
     let mut fanout = FanoutRecord::new();
     fanout.selm = 1;
     fanout.seln = 1;
     db.add_record("FANOUT", Box::new(fanout)).await.unwrap();
-    db.add_record("T1", Box::new(AoRecord::new(0.0)))
-        .await
-        .unwrap();
-    db.add_record("T2", Box::new(AoRecord::new(0.0)))
-        .await
-        .unwrap();
+    for name in ["T1", "T2"] {
+        let mut tgt = CalcRecord::new("VAL+1");
+        tgt.init_record(0).unwrap();
+        db.add_record(name, Box::new(tgt)).await.unwrap();
+    }
     if let Some(rec) = db.get_record("FANOUT") {
         let mut inst = rec.write();
         inst.record
@@ -5473,10 +5677,9 @@ async fn test_fanout_specified() {
     db.process_record_with_links("FANOUT", &mut visited, 0)
         .await
         .unwrap();
-    assert!(visited.contains("FANOUT"));
     // SELN=1 → LNK1 → T1 processed; LNK2/T2 NOT processed.
-    assert!(visited.contains("T1"));
-    assert!(!visited.contains("T2"));
+    assert_eq!(db.get_pv("T1").unwrap().to_f64(), Some(1.0));
+    assert_eq!(db.get_pv("T2").unwrap().to_f64(), Some(0.0));
 }
 
 #[epics_macros_rs::epics_test]
@@ -5510,7 +5713,7 @@ async fn test_dfanout_value_write() {
     }
 }
 
-/// C `dfanoutRecord.c:115-122` reads VAL from DOL on every process
+/// C `dfanoutRecord.c:116-122` reads VAL from DOL on every process
 /// cycle when `omsl == menuOmslclosed_loop`. The Rust port previously
 /// omitted dfanout from the DOL-eligible record-type list in
 /// `processing.rs::process_record_with_links_inner`, so a dfanout
@@ -7405,8 +7608,8 @@ async fn test_complete_async_record_updates_timestamp_at_completion() {
 /// In the Rust port the equivalent flag is `LongoutRecord::first_output_done`
 /// (`crates/epics-base-rs/src/server/records/longout.rs:69`):
 /// `compute_should_output` short-circuits to `true` while it is
-/// false, then the framework's `on_output_complete` flips it to
-/// `true` after the OUT link / device write succeeds.
+/// false, then the framework's `after_output_decision` flips it to
+/// `true` at the end of the cycle — whether or not that cycle wrote.
 ///
 /// This test pins the integration: a first process cycle with
 /// OOPT=1 must drive write_db_link_value (observed via the target
@@ -7544,8 +7747,9 @@ async fn test_self_link_out_does_not_loop() {
     );
     result.unwrap().expect("process call must succeed");
 
-    // Confirm the visited set picked up SELF_LO exactly once.
-    assert!(visited.contains("SELF_LO"));
+    // The frame unwound, so the guard released its marker; what the guard
+    // did is proved by the call above returning at all.
+    assert!(visited.is_empty(), "the frame unwound: {visited:?}");
 
     // A subsequent process call (fresh visited) must also complete
     // promptly — the RPRO flag from the first call must not have
@@ -8152,14 +8356,21 @@ async fn test_mbbo_direct_initialises_val_from_bits_when_undef() {
 
 /// epics-base PR `e3c9d590` / `20404003` regression: `lnkCalc` JSON
 /// link `{calc:{expr:"...", args:[...], time:"X"}}` parses into
-/// `ParsedLink::Calc`, the read path evaluates the expression by
-/// fetching each input PV and binding A..L slots, and timestamp
-/// passthrough from the chosen input is available via
-/// `evaluate_calc_link_with_time`.
+/// `ParsedLink::Calc` and the read path evaluates the expression by
+/// fetching each input PV and binding the `A..` slots in order. What the
+/// record then DOES with `time_source` is a processing-path question and
+/// lives in `calc_link_adopts_its_time_inputs_stamp.rs`.
 #[epics_macros_rs::epics_test]
-async fn test_lnk_calc_parses_evaluates_and_passes_timestamp() {
+async fn test_lnk_calc_parses_and_evaluates() {
     use epics_base_rs::server::record::{CalcLink, ParsedLink, parse_link_v2};
     use epics_base_rs::server::records::ai::AiRecord;
+
+    // The port's string-arg shorthand: one `args` slot holding a link to
+    // the named record. C refuses a bare string here (`lnkCalc.c:187-190`);
+    // see the DEVIATION note on `json_calc_arg`.
+    fn name_arg(pv: &str) -> CalcArg {
+        CalcArg::Link(Box::new(parse_link_v2(pv)))
+    }
 
     // Parser: full lnkCalc form.
     let parsed = parse_link_v2(r#"{calc:{"expr":"A+B*2","args":["pv_a","pv_b"],"time":"A"}}"#);
@@ -8168,7 +8379,7 @@ async fn test_lnk_calc_parses_evaluates_and_passes_timestamp() {
         other => panic!("expected ParsedLink::Calc, got {other:?}"),
     };
     assert_eq!(calc.expr, "A+B*2");
-    assert_eq!(calc.args, vec!["pv_a".to_string(), "pv_b".to_string()]);
+    assert_eq!(calc.args, vec![name_arg("pv_a"), name_arg("pv_b")]);
     assert_eq!(calc.time_source, Some('A'));
 
     // Parser without `time` field — time_source must be None.
@@ -8181,13 +8392,19 @@ async fn test_lnk_calc_parses_evaluates_and_passes_timestamp() {
         })
     ));
 
-    // Parser rejects args.len() > 12 (calc engine A..L cap).
-    let too_many = parse_link_v2(
-        r#"{calc:{"expr":"A","args":["a","b","c","d","e","f","g","h","i","j","k","l","m"]}}"#,
-    );
+    // Parser refuses more than CALC_NARGS args — C `lnkCalc.c:135-139`
+    // returns `jlif_stop`, it does not truncate. The 21/22 boundary itself
+    // is pinned in `tests/calc_json_link_body.rs`.
+    let names: Vec<String> = (0..=epics_base_rs::calc::CALC_NARGS)
+        .map(|i| format!("\"pv{i}\""))
+        .collect();
+    let too_many = parse_link_v2(&format!(
+        r#"{{calc:{{"expr":"A","args":[{}]}}}}"#,
+        names.join(",")
+    ));
     assert!(
         !matches!(too_many, ParsedLink::Calc(_)),
-        "13+ args must NOT parse as Calc"
+        "more than CALC_NARGS args must NOT parse as Calc"
     );
 
     // Read-path: feed real PVs, evaluate A+B*2.
@@ -8201,10 +8418,10 @@ async fn test_lnk_calc_parses_evaluates_and_passes_timestamp() {
 
     let calc = CalcLink {
         expr: "A+B*2".into(),
-        args: vec!["pv_a".into(), "pv_b".into()],
+        args: vec![name_arg("pv_a"), name_arg("pv_b")],
         time_source: Some('A'),
     };
-    let parsed = ParsedLink::Calc(calc.clone());
+    let parsed = ParsedLink::Calc(calc);
     let mut visited = HashSet::new();
     let value = db
         .read_link_value_soft(&parsed, true, &mut visited, 0)
@@ -8213,33 +8430,17 @@ async fn test_lnk_calc_parses_evaluates_and_passes_timestamp() {
         EpicsValue::Double(v) => assert!((v - 13.0).abs() < 1e-9, "expected 3+5*2=13, got {v}"),
         other => panic!("expected Double, got {other:?}"),
     }
-
-    // Timestamp passthrough: nudge pv_a's common.time to a known
-    // value, then verify evaluate_calc_link_with_time returns it.
-    let known = std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000);
-    if let Some(rec) = db.get_record("pv_a") {
-        rec.write().common.time = known;
-    }
-    let (v, t) = db
-        .evaluate_calc_link_with_time(&calc)
-        .await
-        .expect("calc evaluates with time");
-    match v {
-        EpicsValue::Double(x) => assert!((x - 13.0).abs() < 1e-9),
-        other => panic!("expected Double, got {other:?}"),
-    }
-    assert_eq!(t, Some(known), "time pulled from pv_a (letter 'A')");
 }
 
 /// A `lnkCalc` `{calc:...}` link whose input record is NON-LOCAL must
-/// read that input through the external CA path, and its timestamp
-/// passthrough must adopt the remote `.TIME` — each `A..L` input is its
-/// own `dbInitLink` link, so a non-local input is a CA link. The pre-fix
-/// loop read every input with a local-only `get_pv` (and the time source
-/// with a local-only `get_record`), so a single non-local input made the
-/// whole evaluation return `None` and the time fell back to the
-/// consumer's own. Sibling of the non-local Db read / OUT-write / TSEL
-/// `.TIME` fixes — same `dbInitLink` locality cause, the lnkCalc inputs.
+/// read that input through the external CA path — each `A..` input is its
+/// own `dbInitLink` link (`lnkCalc.c:353`), so a non-local input is a CA
+/// link. The pre-fix loop read every input with a local-only `get_pv`, so
+/// a single non-local input made the whole evaluation return `None`.
+/// Sibling of the non-local Db read / OUT-write / TSEL `.TIME` fixes —
+/// same `dbInitLink` locality cause, the lnkCalc inputs. The matching
+/// non-local TIMESTAMP boundary is in
+/// `calc_link_adopts_its_time_inputs_stamp.rs`, which owns that half.
 #[epics_macros_rs::epics_test]
 async fn test_lnk_calc_nonlocal_input_resolves_externally() {
     use epics_base_rs::server::database::LinkSet;
@@ -8282,13 +8483,21 @@ async fn test_lnk_calc_nonlocal_input_resolves_externally() {
 
     let calc = CalcLink {
         expr: "A+B*2".into(),
-        args: vec!["REMOTE:A".into(), "pv_b".into()],
+        args: vec![
+            CalcArg::Link(Box::new(parse_link_v2("REMOTE:A"))),
+            CalcArg::Link(Box::new(parse_link_v2("pv_b"))),
+        ],
         time_source: Some('A'),
     };
 
-    let (value, time) = db
-        .evaluate_calc_link_with_time(&calc)
-        .await
+    let mut visited = HashSet::new();
+    let value = db
+        .read_link_value_soft(
+            &epics_base_rs::server::record::ParsedLink::Calc(calc),
+            true,
+            &mut visited,
+            0,
+        )
         .expect("calc with a non-local input must still evaluate");
     match value {
         // 10 (remote A) + 5 (local B) * 2 = 20.
@@ -8298,12 +8507,6 @@ async fn test_lnk_calc_nonlocal_input_resolves_externally() {
         ),
         other => panic!("expected Double, got {other:?}"),
     }
-    let expected = std::time::UNIX_EPOCH + std::time::Duration::new(1_700_000_456, 321);
-    assert_eq!(
-        time,
-        Some(expected),
-        "time source 'A' is non-local → adopt the remote .TIME via the CA path"
-    );
 }
 
 /// Regression: a CA put to `mbbo.VAL` must recompute RVAL/ORAW.
@@ -8401,7 +8604,9 @@ async fn test_simulation_mode_still_fires_forward_link() {
     db.add_record("SIM:SRC", Box::new(AoRecord::new(11.0)))
         .await
         .unwrap();
-    db.add_record("SIM:FLNK_TARGET", Box::new(AoRecord::new(0.0)))
+    let mut tgt = epics_base_rs::server::records::calc::CalcRecord::new("VAL+1");
+    tgt.init_record(0).unwrap();
+    db.add_record("SIM:FLNK_TARGET", Box::new(tgt))
         .await
         .unwrap();
 
@@ -8421,14 +8626,11 @@ async fn test_simulation_mode_still_fires_forward_link() {
         .await
         .unwrap();
 
-    assert!(
-        visited.contains("SIM:AI"),
-        "the simulated record itself must be in the visited set"
-    );
-    assert!(
-        visited.contains("SIM:FLNK_TARGET"),
+    assert_eq!(
+        db.get_pv("SIM:FLNK_TARGET").unwrap().to_f64(),
+        Some(1.0),
         "a SIMM-mode record must still dispatch its FLNK forward link \
-         (C aiRecord.c:168 recGblFwdLink runs unconditionally): {visited:?}"
+         (C aiRecord.c:168 recGblFwdLink runs unconditionally)"
     );
 }
 
@@ -8528,12 +8730,11 @@ async fn test_fanout_resolves_sell_link_into_seln() {
     db.add_record("FANSELL:SRC", Box::new(LonginRecord::new(2)))
         .await
         .unwrap();
-    db.add_record("FANSELL:T2", Box::new(AoRecord::new(0.0)))
-        .await
-        .unwrap();
-    db.add_record("FANSELL:T0", Box::new(AoRecord::new(0.0)))
-        .await
-        .unwrap();
+    for name in ["FANSELL:T2", "FANSELL:T0"] {
+        let mut tgt = epics_base_rs::server::records::calc::CalcRecord::new("VAL+1");
+        tgt.init_record(0).unwrap();
+        db.add_record(name, Box::new(tgt)).await.unwrap();
+    }
 
     let mut fan = FanoutRecord::new();
     fan.put_field("SELM", EpicsValue::Short(1)).unwrap(); // Specified
@@ -8553,14 +8754,15 @@ async fn test_fanout_resolves_sell_link_into_seln() {
         .unwrap();
 
     // SELL resolved SELN to 2 -> SELM=Specified fans out LNK2 only.
-    assert!(
-        visited.contains("FANSELL:T2"),
-        "SELL must resolve SELN=2 so LNK2 is dispatched: {visited:?}"
+    assert_eq!(
+        db.get_pv("FANSELL:T2").unwrap().to_f64(),
+        Some(1.0),
+        "SELL must resolve SELN=2 so LNK2 is dispatched"
     );
-    assert!(
-        !visited.contains("FANSELL:T0"),
-        "with SELL-resolved SELN=2, the stale SELN=0 (LNK0) must NOT \
-         be dispatched: {visited:?}"
+    assert_eq!(
+        db.get_pv("FANSELL:T0").unwrap().to_f64(),
+        Some(0.0),
+        "with SELL-resolved SELN=2, the stale SELN=0 (LNK0) must NOT be dispatched"
     );
     // SELN must now hold the SELL-resolved value.
     let fan_rec = db.get_record("FANSELL:FAN").unwrap();
@@ -8745,9 +8947,11 @@ async fn test_bare_out_link_does_not_process_target() {
     db.add_record("SRC_OUT", Box::new(AoRecord::new(33.0)))
         .await
         .unwrap();
-    db.add_record("TGT_OUT", Box::new(AiRecord::new(0.0)))
-        .await
-        .unwrap();
+    // A counter, so "written but not processed" reads 33 and "written and
+    // processed" would read 34 — a value the assertion below can tell apart.
+    let mut tgt = epics_base_rs::server::records::calc::CalcRecord::new("VAL+1");
+    tgt.init_record(0).unwrap();
+    db.add_record("TGT_OUT", Box::new(tgt)).await.unwrap();
 
     // Bare OUT link — no PP modifier.
     if let Some(rec) = db.get_record("SRC_OUT") {
@@ -8766,12 +8970,8 @@ async fn test_bare_out_link_does_not_process_target() {
     assert_eq!(
         tgt_val.to_f64().unwrap(),
         33.0,
-        "bare OUT link must still write the value to the target"
-    );
-    // ...but the target must NOT have been processed.
-    assert!(
-        !visited.contains("TGT_OUT"),
-        "bare OUT link (NPP) must NOT process its target: {visited:?}"
+        "bare OUT link (NPP) writes the value and must NOT process the \
+         target — a process would have made it 34"
     );
 }
 
@@ -8784,9 +8984,9 @@ async fn test_pp_out_link_processes_passive_target() {
     db.add_record("SRC_PP", Box::new(AoRecord::new(44.0)))
         .await
         .unwrap();
-    db.add_record("TGT_PP", Box::new(AiRecord::new(0.0)))
-        .await
-        .unwrap();
+    let mut tgt = epics_base_rs::server::records::calc::CalcRecord::new("VAL+1");
+    tgt.init_record(0).unwrap();
+    db.add_record("TGT_PP", Box::new(tgt)).await.unwrap();
 
     if let Some(rec) = db.get_record("SRC_PP") {
         let mut inst = rec.write();
@@ -8799,9 +8999,11 @@ async fn test_pp_out_link_processes_passive_target() {
         .await
         .unwrap();
 
-    assert!(
-        visited.contains("TGT_PP"),
-        "explicit PP OUT link must process its Passive target: {visited:?}"
+    assert_eq!(
+        db.get_pv("TGT_PP").unwrap().to_f64(),
+        Some(45.0),
+        "explicit PP OUT link must process its Passive target — 44 written, \
+         then one process turns it into 45"
     );
 }
 
@@ -8876,7 +9078,9 @@ async fn mr_r5_already_locked_process_does_not_self_deadlock() {
     let mut visited = HashSet::new();
     let res = db.process_record_with_links_already_locked("MR_R5_OWNED", &mut visited, 0);
     res.expect("owner-path processing of an owned member must succeed");
-    assert!(visited.contains("MR_R5_OWNED"));
+    // The marker unwinds with the frame (`dbDbLink.c:521-526`), so what a
+    // completed call leaves behind is an empty set, not a record of itself.
+    assert!(visited.is_empty(), "the frame unwound: {visited:?}");
 }
 
 // ---------------------------------------------------------------------
@@ -9451,7 +9655,7 @@ async fn sub_record_negative_status_raises_soft_alarm_at_brsv() {
 }
 
 /// An `aSub` publishes the subroutine's return status as VAL (C
-/// `aSubRecord.c:223` `prec->val = status`), overwriting whatever the
+/// `aSubRecord.c:224` `prec->val = status`), overwriting whatever the
 /// closure wrote to VAL, and a negative status raises SOFT_ALARM at BRSV.
 #[epics_macros_rs::epics_test]
 async fn asub_record_val_is_return_status_and_negative_soft_alarms() {
@@ -10242,20 +10446,29 @@ async fn init_applies_constant_dol_across_record_types() {
     }
 
     // mbbo_direct: constant seeds VAL and the bit fields decompose from it
-    // (5 = 0b101 → B0=1, B1=0, B2=1); UDF cleared.
+    // (5 = 0b101 → B0=1, B1=0, B2=1); UDF cleared. Driven through the record
+    // creation sink like its siblings above — the seed belongs to the init-seed
+    // owner, not to `post_init_finalize_undef`, which runs before it.
     let mut mbd = MbboDirectRecord::default();
     mbd.omsl = 1;
     mbd.dol = "5".to_string();
-    let mut udf = true;
-    mbd.post_init_finalize_undef(&mut udf).unwrap();
-    assert_eq!(mbd.val, 5, "mbbo_direct constant DOL → VAL=5");
-    assert_eq!(mbd.bits[0], 1, "mbbo_direct B0 from VAL=5");
-    assert_eq!(mbd.bits[1], 0, "mbbo_direct B1 from VAL=5");
-    assert_eq!(mbd.bits[2], 1, "mbbo_direct B2 from VAL=5");
-    assert!(
-        !udf,
-        "mbbo_direct constant DOL clears UDF (recGblInitConstantLink)"
-    );
+    db.add_record("MBD_CONST", Box::new(mbd)).await.unwrap();
+    {
+        let rec = db.get_record("MBD_CONST").unwrap();
+        let inst = rec.read();
+        assert_eq!(
+            inst.record.get_field("VAL"),
+            Some(EpicsValue::Long(5)),
+            "mbbo_direct constant DOL → VAL=5"
+        );
+        assert_eq!(inst.record.get_field("B0"), Some(EpicsValue::UChar(1)));
+        assert_eq!(inst.record.get_field("B1"), Some(EpicsValue::UChar(0)));
+        assert_eq!(inst.record.get_field("B2"), Some(EpicsValue::UChar(1)));
+        assert!(
+            inst.common.udf == 0,
+            "mbbo_direct constant DOL clears UDF (recGblInitConstantLink)"
+        );
+    }
 }
 
 /// A calcout with ODLY > 0 defers its forward link (and VAL/OVAL monitors)
@@ -10303,10 +10516,6 @@ async fn calcout_odly_defers_forward_link_to_delayed_cycle() {
     db.process_record_with_links("CO6_SRC", &mut visited, 0)
         .await
         .unwrap();
-    assert!(
-        !visited.contains("CO6_TGT"),
-        "FLNK must not fire on the ODLY delaying cycle"
-    );
     assert_eq!(
         db.get_pv("CO6_TGT").unwrap().to_f64(),
         Some(0.0),
@@ -10318,10 +10527,6 @@ async fn calcout_odly_defers_forward_link_to_delayed_cycle() {
     db.process_record_continuation("CO6_SRC", &mut visited2, 0)
         .await
         .unwrap();
-    assert!(
-        visited2.contains("CO6_TGT"),
-        "FLNK must fire on the delayed cycle"
-    );
     assert_eq!(
         db.get_pv("CO6_TGT").unwrap().to_f64(),
         Some(1.0),

@@ -881,7 +881,10 @@ pub async fn run<R, W>(
                         )
                         .await;
                         // Wait for settling
-                        tokio::time::sleep(Duration::from_secs_f64(ctrl.settling)).await;
+                        tokio::time::sleep(epics_base_rs::runtime::time::duration_from_secs(
+                            ctrl.settling,
+                        ))
+                        .await;
                         // Read current values
                         match send_and_read(
                             &mut writer,
@@ -917,7 +920,7 @@ pub async fn run<R, W>(
                 update_delay = 0.0; // Only delay extra once after gain change
 
                 tokio::select! {
-                    _ = tokio::time::sleep(Duration::from_secs_f64(read_delay)) => {
+                    _ = tokio::time::sleep(epics_base_rs::runtime::time::duration_from_secs(read_delay)) => {
                         // Read all currents
                         match send_and_read(
                             &mut writer,

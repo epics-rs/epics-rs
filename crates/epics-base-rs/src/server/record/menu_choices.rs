@@ -271,13 +271,11 @@ pub fn shared_menu_choices(field: &str) -> Option<&'static [&'static str]> {
 /// Returns `(value, rest)`; `None` is C's `S_stdlib_noConversion` /
 /// `S_stdlib_overflow`.
 fn c_strtoul_base0(s: &str) -> Option<(u64, &str)> {
-    fn c_isspace(b: u8) -> bool {
-        matches!(b, b' ' | b'\t' | b'\n' | 0x0b | 0x0c | b'\r')
-    }
+    use crate::runtime::stdlib::c_isspace;
 
     let b = s.as_bytes();
     let mut i = 0;
-    while i < b.len() && c_isspace(b[i]) {
+    while i < b.len() && c_isspace(b[i] as char) {
         i += 1;
     }
     let mut negate = false;
@@ -335,7 +333,7 @@ fn epics_parse_uint16(s: &str) -> Option<u16> {
     let (value, rest) = c_strtoul_base0(s)?;
     if !rest
         .bytes()
-        .all(|b| matches!(b, b' ' | b'\t' | b'\n' | 0x0b | 0x0c | b'\r'))
+        .all(|b| crate::runtime::stdlib::c_isspace(b as char))
     {
         return None; // S_stdlib_extraneous
     }
@@ -431,6 +429,26 @@ pub fn multibit_enum_states(states: [&PvString; 16]) -> Vec<PvString> {
         .map(|i| i + 1)
         .unwrap_or(0);
     states[..no_str].iter().map(|s| (*s).clone()).collect()
+}
+
+/// The 16 state-string fields of `mbbi`/`mbbo`, in the DBD order that gives
+/// `fieldIndex - ZRST` its meaning (`mbbiRecord.dbd.pod:272-407`). C reads that
+/// arithmetic straight off the generated field indices; the port has no field
+/// index, so the order lives here, once, for both records.
+const MULTIBIT_STATE_STRINGS: [&str; 16] = [
+    "ZRST", "ONST", "TWST", "THST", "FRST", "FVST", "SXST", "SVST", "EIST", "NIST", "TEST", "ELST",
+    "TVST", "TTST", "FTST", "FFST",
+];
+
+/// C `fieldIndex >= mbbiRecordZRST && fieldIndex <= mbbiRecordFFST`, and the
+/// `fieldIndex - mbbiRecordZRST` that follows it (`mbbiRecord.c:223-226`,
+/// `mbboRecord.c:288-291`): the state a given string field labels, or `None`
+/// when the field is not one of the 16.
+pub fn multibit_state_string_index(field: &str) -> Option<u16> {
+    MULTIBIT_STATE_STRINGS
+        .iter()
+        .position(|f| f.eq_ignore_ascii_case(field))
+        .map(|i| i as u16)
 }
 
 /// C `get_enum_str` for the two-state records (`bi`/`bo`/`busy`):

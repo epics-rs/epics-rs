@@ -24,6 +24,7 @@
 //! If absent the test skips with a printed notice, so CI without the synApps
 //! source is not blocked.
 
+use epics_base_rs::reference::{ReferenceTree, reference_path};
 use std::collections::BTreeSet;
 use std::path::PathBuf;
 
@@ -42,11 +43,11 @@ const ALLOWLIST: &[(&str, &str, &str)] = &[
     (
         "epid",
         "Async Soft Channel",
-        "record-internal + KNOWN GAP (epid async TRIG readback): is_soft_dtyp \
-         short-circuits the device, so the sync do_pid runs with NO TRIG. The \
-         record's TRIG / ca_trig_pending readback is gated on the non-dbd DTYP \
-         string 'Epid Async Soft', so it is unreachable for this dbd DTYP. \
-         Tracked; not closed by registration.",
+        "record-internal: is_soft_dtyp short-circuits the device, so the sync \
+         do_pid runs from the record body. The TRIG readback (both DB and CA \
+         link types) is fired by EpidRecord::pre_input_link_actions, gated on \
+         EpidRecord::is_async_callback_dtyp, which matches THIS dbd string. \
+         Closed record-internally, not by registration.",
     ),
     (
         "epid",
@@ -59,17 +60,10 @@ const ALLOWLIST: &[(&str, &str, &str)] = &[
     ),
 ];
 
-/// Locate `stdSupport.dbd`, or `None` to skip the test.
-fn dbd_path() -> Option<PathBuf> {
-    if let Ok(modules) = std::env::var("EPICS_MODULES") {
-        let p = PathBuf::from(modules).join("std/stdApp/src/stdSupport.dbd");
-        if p.is_file() {
-            return Some(p);
-        }
-    }
-    let reference =
-        PathBuf::from("/Users/stevek/codes/epics-modules/std/stdApp/src/stdSupport.dbd");
-    reference.is_file().then_some(reference)
+/// Locate `stdSupport.dbd`. Fails the test if the reference tree is absent —
+/// see `epics_base_rs::reference` for why this must not skip.
+fn dbd_path() -> PathBuf {
+    reference_path(ReferenceTree::Modules, "std/stdApp/src/stdSupport.dbd")
 }
 
 /// Parse `device(recordType, linkType, dset, "DTYP")` rows → (recordType, DTYP).
@@ -98,14 +92,7 @@ fn parse_device_rows(dbd: &str) -> Vec<(String, String)> {
 
 #[test]
 fn stdsupport_device_rows_are_all_accounted_for() {
-    let Some(path) = dbd_path() else {
-        eprintln!(
-            "SKIP stdsupport_device_rows_are_all_accounted_for: stdSupport.dbd \
-             not found (set EPICS_MODULES or place the reference checkout). No \
-             device rows verified."
-        );
-        return;
-    };
+    let path = dbd_path();
     let dbd = std::fs::read_to_string(&path).expect("read stdSupport.dbd");
     let rows = parse_device_rows(&dbd);
     assert!(

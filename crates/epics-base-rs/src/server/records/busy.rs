@@ -1,5 +1,8 @@
 use crate::error::{CaError, CaResult};
-use crate::server::record::{MENU_YES_NO, ProcessAction, ProcessOutcome, Record};
+use crate::server::record::{
+    DelayedCallbackOutcome, FieldMetadataOverride, MENU_YES_NO, ProcessAction, ProcessOutcome,
+    Record,
+};
 use crate::types::{EpicsValue, PvString};
 
 /// EPICS busy record implementation.
@@ -55,10 +58,6 @@ pub struct BusyRecord {
     pub siml: String,
     pub siol: String,
     pub sims: i16,
-    // HIGH timer state — set when a HIGH one-shot is in flight; the
-    // next (timer-driven) process() forces VAL=0, mirroring C
-    // boRecord.c::myCallbackFunc.
-    high_reset_pending: bool,
     // VAL change gate. C
     // busyRecord.c:365-369 monitor() raises DBE_VALUE|DBE_LOG for VAL only
     // when `mlst != val`. Captured in the monitor() owner during process()
@@ -99,7 +98,6 @@ impl Default for BusyRecord {
             siml: String::new(),
             siol: String::new(),
             sims: 0,
-            high_reset_pending: false,
             value_changed: false,
             skip_convert: false,
         }
@@ -135,9 +133,67 @@ impl BusyRecord {
     }
 }
 
+/// C `busyRecord.c:281` — `if(paddr->pfield == (void *)&prec->high) *precision=2;`
+/// A literal, not a `boHIGHprecision`-style exported variable: busy's rset
+/// carries no settable analogue of it.
+const BUSY_HIGH_PRECISION: i16 = 2;
+
 impl Record for BusyRecord {
+    /// C `busyRecord.c:277-284` `get_precision`: `HIGH` — busy's only
+    /// `DBF_DOUBLE` field, so the only one past `dbAccess.c:388-389`'s
+    /// float/double gate — takes 2, everything else `recGblGetPrec`'s
+    /// memset zero. busy's rset NULLs `get_units` and `get_control_double`
+    /// (`:69-71`), which is the whole difference from the `bo`
+    /// [`FieldMetadataOverride`] this mirrors: no `"s"`, no `0 .. 100000`.
+    fn field_metadata_override(&self, field: &str) -> Option<FieldMetadataOverride> {
+        field
+            .eq_ignore_ascii_case("HIGH")
+            .then(|| FieldMetadataOverride {
+                precision: Some(BUSY_HIGH_PRECISION),
+                ..Default::default()
+            })
+    }
+
     fn record_type(&self) -> &'static str {
         "busy"
+    }
+
+    /// C `busyRecord.c:151-159`:
+    /// `if (prec->dol.type == CONSTANT) { unsigned short ival = 0;
+    ///      if (recGblInitConstantLink(&prec->dol, DBF_USHORT, &ival)) {
+    ///          prec->val = ival ? 1 : 0; prec->udf = FALSE; } }`
+    /// — boRecord's shape: the constant loads into a temporary and VAL takes
+    /// its BOOLEAN, so `field(DOL,"5")` leaves VAL=1.
+    fn constant_init_links(&self) -> Vec<crate::server::record::ConstantInitLink> {
+        vec![crate::server::record::ConstantInitLink::dol_to_bool_val(
+            "DOL", "VAL",
+        )]
+    }
+
+    /// C `busyRecord.c:175-179`, the last statement of `init_record`: VAL is
+    /// converted to RVAL through MASK, with the `mask == 0` arm passing VAL
+    /// through as `(epicsUInt32)prec->val` rather than zeroing RVAL. It runs
+    /// after the constant DOL load two dozen lines above it, so a
+    /// `field(DOL,"5")` busy reaches its first process with RVAL already
+    /// holding MASK.
+    fn init_record_tail(&mut self) {
+        self.convert_val_to_rval();
+    }
+
+    /// C `busyRecord.c:140-181` assigns neither `mlst` nor `lalm`, unlike
+    /// `boRecord.c:172-173` which seeds both from VAL — so busy's first
+    /// `monitor()` (`:365`, `mlst != prec->val`) must find them at 0 even when
+    /// a constant DOL has already driven VAL to 1, and post the change C
+    /// posts. busy serves both fields to clients, so the framework default
+    /// would try to seed them; that attempt is inert today only because busy's
+    /// `put_field` binds no MLST/LALM arm, and this override is what keeps it
+    /// inert if one is ever added.
+    fn seed_deadband_tracking(&mut self) {}
+
+    /// C `busyRecord.c:196-208`: the scalar `dbGetLink(&prec->dol, ..., &prec->val, 0, 0)`
+    /// under `dol.type != CONSTANT && omsl == menuOmslclosed_loop`.
+    fn fetches_dol_closed_loop(&self) -> bool {
+        true
     }
 
     /// C `busyRecord.c:195-208`: `process()` clears `udf` to FALSE only on a
@@ -195,14 +251,6 @@ impl Record for BusyRecord {
     }
 
     fn process(&mut self) -> CaResult<ProcessOutcome> {
-        // HIGH one-shot: a pending HIGH timer fired and triggered this
-        // reprocess — drive the busy flag back to Done (VAL=0), as C
-        // boRecord.c::myCallbackFunc does before dbProcess.
-        if self.high_reset_pending {
-            self.high_reset_pending = false;
-            self.val = 0;
-        }
-
         // Step 1: DOL reading handled by framework (OMSL=ClosedLoop)
 
         // Step 2: VAL → RVAL conversion — unless a device readback
@@ -226,18 +274,45 @@ impl Record for BusyRecord {
         // Step 5: Monitor
         self.monitor();
 
-        // Step 6: HIGH one-shot — when the record is busy (VAL=1) and
-        // HIGH > 0, schedule a reprocess that drives VAL back to 0.
+        // Step 6: HIGH one-shot — C `busyRecord.c:258-262` arms
+        // `callbackRequestDelayed` on every process that leaves VAL at 1, and
+        // the timer, never a process cycle, is what drives the flag back to
+        // Done. Arming carries no record state, so a scan step's own FLNK or a
+        // caput inside the window re-arms rather than releasing the busy flag
+        // early — which is the whole point of BUSY=1 gating a synApps step.
         let mut actions = Vec::new();
         if self.val == 1 && self.high > 0.0 {
-            self.high_reset_pending = true;
-            actions.push(ProcessAction::ReprocessAfter(
-                std::time::Duration::from_secs_f64(self.high),
+            actions.push(ProcessAction::DelayedCallbackAfter(
+                crate::runtime::time::duration_from_secs(self.high),
             ));
         }
 
         // Step 7: FLNK handled by should_fire_forward_link()
         Ok(ProcessOutcome::complete_with(actions))
+    }
+
+    /// C `busyRecord.c::myCallbackFunc` (:107-124), boRecord's verbatim — the
+    /// HIGH timer's own body and the only writer of the one-shot's
+    /// `prec->val = 0`.
+    fn delayed_callback_fire(&mut self, pact: bool) -> DelayedCallbackOutcome {
+        if !pact {
+            self.val = 0;
+            return DelayedCallbackOutcome::Reprocess;
+        }
+        // Mid-async-cycle: C changes nothing and waits another full HIGH.
+        // The conversion is `runtime::time::duration_from_secs`, the same one
+        // `process()` arms with, so `self.high` cannot mean two deadlines in
+        // two adjacent functions: a HIGH past `Duration`'s range (`caput
+        // REC.HIGH 1e300`, which C ACCEPTS) becomes `Duration::MAX`, C's
+        // queued callback that no comparison ever reaches. `Drop` is then left
+        // with its one meaning — the one-shot is no longer live — instead of
+        // also standing for "the delay would not fit".
+        match (self.val == 1 && self.high > 0.0)
+            .then(|| crate::runtime::time::duration_from_secs(self.high))
+        {
+            Some(delay) => DelayedCallbackOutcome::Rearm(delay),
+            None => DelayedCallbackOutcome::Drop,
+        }
     }
 
     /// C `busyRecord.c::checkAlarms` (`:332-357`, boRecord's verbatim) — the UDF

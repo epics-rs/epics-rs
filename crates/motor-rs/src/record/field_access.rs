@@ -93,6 +93,10 @@ pub(crate) fn motor_get_field(rec: &MotorRecord, name: &str) -> Option<EpicsValu
         "HLSV" => Some(EpicsValue::Short(rec.limits.hlsv)),
         // Control
         "SPMG" => Some(EpicsValue::Short(rec.ctrl.spmg as i16)),
+        // C `pmr->lspg`, the SPMG the record last acted on
+        // (motorRecord.cc:725 init, :1859 sync). Same menu as SPMG, so
+        // same served form; the declared DBF_MENU makes it a DBR_ENUM.
+        "LSPG" => Some(EpicsValue::Short(rec.internal.lspg as i16)),
         "STOP" => Some(EpicsValue::Short(if rec.ctrl.stop { 1 } else { 0 })),
         "HOMF" => Some(EpicsValue::Short(if rec.ctrl.homf { 1 } else { 0 })),
         "HOMR" => Some(EpicsValue::Short(if rec.ctrl.homr { 1 } else { 0 })),
@@ -156,6 +160,9 @@ pub(crate) fn motor_get_field(rec: &MotorRecord, name: &str) -> Option<EpicsValu
         "MLST" => Some(EpicsValue::Double(rec.disp.mlst)),
         "MMAP" => Some(EpicsValue::Long(rec.internal.mmap as i32)),
         "NMAP" => Some(EpicsValue::Long(rec.internal.nmap as i32)),
+        // C `pmr->pp` — post-process armed for the motion in flight
+        // (15 write sites, motorRecord.cc:825..2523).
+        "PP" => Some(EpicsValue::Short(if rec.internal.pp { 1 } else { 0 })),
         _ => None,
     }
 }

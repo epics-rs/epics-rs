@@ -4,6 +4,7 @@
 // RTEMS-EXEC-MODEL-ALLOW(1): the test's subject is arming a *tokio* timer with
 // INDEFINITE_TIMEOUT; the tokio timer is the property under test. These run and pass in the
 // feature-ON suite on the tokio driver.
+use epics_base_rs::server::records::printf::format_g;
 use epics_base_rs::server::snapshot::Snapshot;
 use epics_base_rs::types::{DbFieldType, EpicsValue, PvString, WallTime};
 
@@ -367,7 +368,12 @@ pub fn format_time(ts: WallTime) -> String {
 /// outside 0..=38 (C `INVALID_DB_REQ`).
 pub fn dbr_value_field_type(dbr_type: u16) -> Option<DbFieldType> {
     match dbr_type {
-        0..=34 => DbFieldType::from_u16(dbr_type % 7).ok(),
+        // The carrier a *wire* payload of this code arrives in, so the
+        // zeroed placeholder has the same shape a real reply would
+        // (`DbFieldType::wire_carrier`: `DBR_CHAR` is `epicsUInt8`).
+        0..=34 => DbFieldType::from_u16(dbr_type % 7)
+            .ok()
+            .map(DbFieldType::wire_carrier),
         // DBR_PUT_ACKT / DBR_PUT_ACKS: a bare `dbr_put_ackt_t` (u16).
         35 | 36 => Some(DbFieldType::UShort),
         // DBR_STSACK_STRING / DBR_CLASS_NAME: a `dbr_string_t`.
@@ -617,7 +623,7 @@ pub fn format_value(
     // DIRECTLY and is present on the specifiedDbr block too (`caget.c:318`),
     // so it does NOT follow `count_prefix`, and it returns before C's count
     // printf — a long-string never carries the count.
-    if let EpicsValue::CharArray(arr) = v
+    if let EpicsValue::CharArray(arr) | EpicsValue::UCharArray(arr) = v
         && fmt.char_array_as_string
         && (req_elems || arr.len() > 1)
     {
@@ -699,9 +705,14 @@ fn render_elements(v: &EpicsValue, fmt: &ValueFormat, enum_strings: Option<&[PvS
         // plain integer formatter is correct — no wide-unsigned path needed.
         EpicsValue::UShort(n) => format_int_i64(*n as i64, fmt.int_style),
         EpicsValue::ULong(n) => format_int_i64(*n as i64, fmt.int_style),
-        EpicsValue::Char(n) => format_char((*n as i8) as i64),
-        // epicsUInt8 formats unsigned (0xFF -> 255), unlike the signed `Char`.
-        EpicsValue::UChar(n) => format_char(*n as i64),
+        // C `val2str` has ONE `case DBR_CHAR:` and it narrows through a
+        // plain `char ch` before `sprintf("%d")` (`tool_lib.c:114`,
+        // `:160-161`), so a byte the wire called 200 prints -56. Both byte
+        // carriers reach this formatter from the same DBR_CHAR wire code —
+        // `DBF_UCHAR` has no wire code of its own — so both take that one
+        // case. This is where the signedness lives now that the carrier
+        // itself is the wire's unsigned one.
+        EpicsValue::Char(n) | EpicsValue::UChar(n) => format_char((*n as i8) as i64),
         EpicsValue::Enum(idx) => format_enum(*idx as i64, fmt, enum_strings),
         // Transient NTEnum carrier never reaches CA serialization (coerced in
         // base at the link-write boundary); format its index like a DBF_ENUM.
@@ -740,11 +751,7 @@ fn render_elements(v: &EpicsValue, fmt: &ValueFormat, enum_strings: Option<&[PvS
             arr.len(),
             fmt,
         ),
-        // DBF_UCHAR[] is numeric unsigned-byte image data: render each element
-        // unsigned (0xFF -> 255), not the signed-i8 / long-string CharArray path.
-        EpicsValue::UCharArray(arr) => {
-            join_elements(arr.iter().map(|&b| format_char(b as i64)), arr.len(), fmt)
-        }
+
         EpicsValue::EnumArray(arr) => join_elements(
             arr.iter()
                 .map(|&idx| format_enum(idx as i64, fmt, enum_strings)),
@@ -760,8 +767,9 @@ fn render_elements(v: &EpicsValue, fmt: &ValueFormat, enum_strings: Option<&[PvS
             join_elements(arr.iter().map(|&x| format_float(x, fmt)), arr.len(), fmt)
         }
         // The `-S` long-string form is handled by `format_value` before this
-        // is reached; here a CHAR array is always numeric (signed i8).
-        EpicsValue::CharArray(arr) => join_elements(
+        // is reached; here a byte array is always numeric, narrowed by C's
+        // single `val2str` DBR_CHAR case exactly like the scalar arm above.
+        EpicsValue::CharArray(arr) | EpicsValue::UCharArray(arr) => join_elements(
             arr.iter().map(|&b| format_char((b as i8) as i64)),
             arr.len(),
             fmt,
@@ -969,76 +977,6 @@ fn format_float(x: f64, fmt: &ValueFormat) -> String {
         FloatStyle::E => format_e(x, p),
         FloatStyle::G => format_g(x, p.max(1)),
     }
-}
-
-/// Decimal exponent of `abs` after rounding to `precision` significant
-/// digits — i.e. `floor(log10(round_to_sig_digits(abs, precision)))`.
-///
-/// C `%g` rounds to `precision` significant digits FIRST and only then
-/// decides between `%e` and `%f`. At a rounding boundary the rounded
-/// magnitude can tick up by a power of ten (e.g. `999999.5` at
-/// precision 6 rounds to `1000000`, exponent 5 → 6), which flips the
-/// fixed-vs-scientific choice. Computing the decision exponent from the
-/// UNROUNDED value misses that — see the regression test
-/// `g_rounding_boundary_picks_scientific`.
-fn decision_exponent(abs: f64, precision: usize) -> i32 {
-    let raw_exp = abs.log10().floor() as i32;
-    // Scale so the value has `precision` digits before the decimal
-    // point, round half-to-even, and read back the magnitude. If the
-    // round carries into a new decade the exponent increments.
-    let scale = 10f64.powi(precision as i32 - 1 - raw_exp);
-    // For magnitudes near the f64 range limits the scale factor can
-    // overflow to ±inf (or underflow to 0); `abs * scale` then yields a
-    // non-finite product whose `log10` saturates to a garbage exponent.
-    // The rounded magnitude cannot meaningfully differ from the raw one
-    // at those scales, so fall back to `raw_exp`.
-    if !scale.is_finite() || scale == 0.0 {
-        return raw_exp;
-    }
-    let rounded_scaled = (abs * scale).round();
-    if !rounded_scaled.is_finite() || rounded_scaled <= 0.0 {
-        return raw_exp;
-    }
-    raw_exp + (rounded_scaled.log10().floor() as i32 - (precision as i32 - 1))
-}
-
-/// `%g`-equivalent formatter. C semantics: choose `%e` or `%f`
-/// depending on the exponent, drop trailing zeros and the trailing
-/// decimal point. Precision is the *significant-digit* count.
-fn format_g(x: f64, precision: usize) -> String {
-    if x == 0.0 {
-        return "0".to_string();
-    }
-    let abs = x.abs();
-    // C `%g` rounds to `precision` significant digits before choosing
-    // the format, so the decision exponent must come from the rounded
-    // magnitude, not the raw value.
-    let exp = decision_exponent(abs, precision);
-    // C `%g` uses fixed-point when `precision > exp >= -4`. Compare as
-    // i32 to avoid the silent `i32 → usize` wrap for negative `exp`.
-    if exp >= -4 && exp < precision as i32 {
-        // Fixed-point. Digits after the decimal point = precision-1-exp.
-        let digits = (precision as i32 - 1 - exp).max(0) as usize;
-        let s = format!("{x:.digits$}");
-        trim_g_fixed(&s)
-    } else {
-        format_g_scientific(x, precision)
-    }
-}
-
-fn trim_g_fixed(s: &str) -> String {
-    if !s.contains('.') {
-        return s.to_string();
-    }
-    s.trim_end_matches('0').trim_end_matches('.').to_string()
-}
-
-fn format_g_scientific(x: f64, precision: usize) -> String {
-    // Rust `{:e}` precision means digits after the decimal in the
-    // mantissa. C `%g` with N significant digits is mantissa
-    // precision N-1.
-    let s = format!("{:.*e}", precision - 1, x);
-    rewrite_rust_e_as_c(&s, true)
 }
 
 /// Pure `%e`: precision is digits AFTER the decimal point.
@@ -1407,10 +1345,14 @@ mod tests {
                 "-1",
                 "DBR_CHAR is %d, never sprint_long ({style:?})"
             );
+            // The wire carrier of a CHAR channel. C's `val2str` narrows it
+            // through `char ch` (`tool_lib.c:114`, `:160-161`) before
+            // `%d`, so it renders identically to the signed carrier — the
+            // formatter, not the carrier, is where the sign is applied.
             assert_eq!(
                 fv(&EpicsValue::UChar(255), &fmt, None, false),
-                "255",
-                "the unsigned CHAR carrier is %d too ({style:?})"
+                "-1",
+                "the wire CHAR carrier takes the same val2str narrowing ({style:?})"
             );
             assert_eq!(
                 fv(&EpicsValue::CharArray(vec![255, 1]), &fmt, None, false),
@@ -1419,8 +1361,8 @@ mod tests {
             );
             assert_eq!(
                 fv(&EpicsValue::UCharArray(vec![255, 1]), &fmt, None, false),
-                "2 255 1",
-                "an unsigned CHAR array likewise ({style:?})"
+                "2 -1 1",
+                "a wire CHAR array likewise ({style:?})"
             );
         }
         // Negative control: DBR_INT / DBR_LONG DO carry the base — the

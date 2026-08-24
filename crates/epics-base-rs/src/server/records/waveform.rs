@@ -4,7 +4,7 @@ use crate::server::record::{
     parse_link_v2,
 };
 use crate::server::records::count_put;
-use crate::types::{DbFieldType, EpicsValue, PvString};
+use crate::types::{DbFieldType, EpicsValue, PvString, c_parse};
 
 /// Which EPICS record-type name a [`WaveformRecord`] reports. The four
 /// upstream array record types (`waveform`, `aai`, `aao`, `subArray`)
@@ -101,8 +101,8 @@ pub struct WaveformRecord {
     /// simulated SIOL round-trip asynchronous: C's `readValue`/`writeValue`
     /// arms the `callbackRequestProcessCallbackDelayed(..., prec->sdly)`
     /// watchdog and holds PACT across the delay (aaiRecord.c:365-374). The
-    /// framework reads it via `get_field("SDLY")`, so the field must exist —
-    /// an absent SDLY defaults to -1.0 (synchronous) there.
+    /// framework reads it via `resolve_field("SDLY")`, which falls back to the
+    /// dbd `initial("-1.0")` (synchronous) for a record that does not store it.
     pub sdly: f64,
     /// aao-only: output mode select, `menu(menuOmsl)` (0=supervisory,
     /// 1=closed_loop). When `closed_loop`, aao sources VAL from `DOL`
@@ -127,6 +127,17 @@ pub struct WaveformRecord {
     /// framework reports the outcome through `set_resolved_input_links`.
     dol_fetch_requested: bool,
     dol_read_failed: bool,
+    /// The INP counterpart of `dol_read_failed`: did the last soft-channel INP
+    /// read fail? C carries it as `read_sa`'s local `status`, because C
+    /// evaluates `udf = !!status` in the same `process` that ran the read; the
+    /// port splits the read (framework) from the UDF derivation (the record),
+    /// so the outcome has to be remembered across the seam. Set by
+    /// [`Record::soft_input_read_failed`] and cleared by the two things that
+    /// clear C's `udf`: [`Self::sa_subset`], which runs on exactly C's
+    /// `if (!status) subset(...)` condition (devSASoft.c:118-120), and a put to
+    /// VAL (`dbAccess.c:1415`). Only subArray reads it; the other three kinds
+    /// clear UDF unconditionally whatever `readValue` returned.
+    inp_read_failed: bool,
     /// The element count the record ARRIVED at `init_record` with — elements an
     /// in-process `record()` build put into VAL before `add_record`. C has no
     /// such path (VAL is `DBF_NOACCESS` on all four `.dbd`s, so a `.db` cannot
@@ -228,6 +239,7 @@ impl Default for WaveformRecord {
             constant_dol_loaded: false,
             dol_fetch_requested: false,
             dol_read_failed: false,
+            inp_read_failed: false,
             prebuilt_nord: 0,
         }
     }
@@ -564,12 +576,18 @@ impl WaveformRecord {
         if (self.nelm as u32) > (malm as u32) {
             self.nelm = malm;
         }
-        if self.indx >= malm {
+        // INDX is DBF_ULONG too (subArrayRecord.dbd.pod:385), and its clamp is
+        // the same unsigned compare one line further down in the same C
+        // function (`if (prec->indx >= prec->malm) prec->indx = prec->malm - 1;`,
+        // subArrayRecord.c:313-314). Signed, `caput SA.INDX -1` — which
+        // `epicsParseUInt32`'s `strtoul` legitimately turns into 0xFFFFFFFF —
+        // read as -1 < malm and slipped through as "start at the beginning";
+        // C clamps it to MALM-1 and the slice comes out empty.
+        if (self.indx as u32) >= (malm as u32) {
             self.indx = malm - 1;
         }
-        if self.indx < 0 {
-            self.indx = 0;
-        }
+        // Both bounds are now in [0, MALM] / [0, MALM-1] BY CONSTRUCTION, so
+        // every consumer below reads them directly — no floors, no re-checks.
     }
 
     /// C `devSASoft.c::subset` (39-56) — the ONE subArray slicing primitive:
@@ -598,9 +616,12 @@ impl WaveformRecord {
     /// with `prec->udf = !!status` (subArrayRecord.c:148), and that status is
     /// `readValue`'s `nord <= 0` test — which is [`Record::value_is_undefined`].
     fn sa_subset(&mut self, n_request: i32) {
+        // Reaching here IS C's `if (!status) subset(prec, ...)` — both callers
+        // are a read that returned 0 — so the remembered failure is over.
+        self.inp_read_failed = false;
         let len = self.val.count() as i32;
         let n_request = n_request.clamp(0, len);
-        let indx = self.indx.max(0);
+        let indx = self.indx;
         let mut ecount = n_request - indx;
         if ecount > 0 {
             if ecount > self.nelm {
@@ -656,17 +677,30 @@ impl WaveformRecord {
     /// `nRequest = 1`.
     fn sa_load_and_subset(&mut self, source: EpicsValue) -> CaResult<()> {
         self.sa_clamp_bounds();
-        let n_request = self
-            .indx
-            .saturating_add(self.nelm)
-            .min(self.malm.max(1))
-            .max(0);
+        let n_request = self.indx.saturating_add(self.nelm).min(self.malm.max(1));
         let mut src = source.convert_to(self.ftvl_element_type());
         src.truncate(n_request as usize);
         let loaded = src.count() as i32;
         self.land_val_in_buffer(src)?;
         self.sa_subset(loaded);
         Ok(())
+    }
+
+    /// The port's `get_array_info`: the one answer to "how many elements of VAL
+    /// does this record serve", shared by every reader so the count cannot
+    /// disagree with [`Record::value_is_undefined`].
+    ///
+    /// C gives subArray its own body — `if (prec->udf) *no_elements = 0; else
+    /// *no_elements = prec->nord;` (subArrayRecord.c:181-184) — where
+    /// `waveformRecord.c:196` and `aaiRecord.c:226` return NORD flat. Deriving
+    /// the zero from the same predicate that produces UDF is what keeps the two
+    /// in step: there is no state in which a record calls itself undefined and
+    /// still hands out its buffer.
+    fn served_element_count(&self) -> usize {
+        if self.value_is_undefined() {
+            return 0;
+        }
+        self.nord.max(0) as usize
     }
 }
 
@@ -857,6 +891,15 @@ impl Record for WaveformRecord {
         !matches!(self.kind, ArrayKind::SubArray)
     }
 
+    /// All four kinds assign UDF on a failed read, for the two different
+    /// reasons named just above: waveform/aai/aao clear it outright on the line
+    /// after `readValue`, and subArray's `prec->udf = !!status`
+    /// (subArrayRecord.c:148) is the status itself — which
+    /// [`Self::value_is_undefined`] now carries. Either way the derive must run.
+    fn derives_udf_on_read_failure(&self) -> bool {
+        true
+    }
+
     /// waveform/aai/aao have NO `checkAlarms` and never name UDF_ALARM: grep
     /// the three record sources and the only severities they raise are
     /// SIMM_ALARM and SOFT_ALARM (aaiRecord.c:364,381; aaoRecord.c:395,421;
@@ -922,8 +965,8 @@ impl Record for WaveformRecord {
     /// (`subArrayRecord.c:168`). Reporting it only for the waveform kind left
     /// aai/aao/subArray advertising a 0-length channel, so every array put/get
     /// was refused "Invalid element count requested".
-    fn field_native_count(&self, field: &str) -> Option<u32> {
-        (field == "VAL").then(|| self.val_capacity() as u32)
+    fn dbaddr_capacity(&self, _field: &str) -> Option<u32> {
+        Some(self.val_capacity() as u32)
     }
 
     /// `aao` is an output record; the rest of the array family read
@@ -1005,7 +1048,7 @@ impl Record for WaveformRecord {
                 // CA clients use the returned element count to interpret the
                 // data (e.g. PyDMImageView computes height = count / width).
                 let mut val = self.val.clone();
-                val.truncate(self.nord.max(0) as usize);
+                val.truncate(self.served_element_count());
                 Some(val)
             }
             // The DBF types are the `.dbd.pod`'s (see `array_field_list!`): NELM
@@ -1064,19 +1107,37 @@ impl Record for WaveformRecord {
     fn put_field(&mut self, name: &str, value: EpicsValue) -> CaResult<()> {
         match name {
             "VAL" => {
-                // Coerce value to match FTVL (e.g. String → CharArray for
-                // FTVL=CHAR, String → UCharArray for FTVL=UCHAR): a text source
-                // into a char-element buffer is the string's BYTES, not a
-                // numeric parse of it.
-                let value = match (&value, self.ftvl) {
-                    (EpicsValue::String(s), Ftype::Char) => {
-                        EpicsValue::CharArray(s.as_bytes().to_vec())
+                // A DBR_STRING source is C's `putString<FTVL>` row
+                // (`dbConvert.c:941-1147`): each of the `nRequest` elements is
+                // PARSED with `epicsParse*` at `dbConvertBase` 0, and a
+                // non-zero status aborts the whole `dbPut` so the field keeps
+                // its old value. A scalar string is `nRequest == 1`, so it
+                // lands as ONE element.
+                //
+                // Measured on the compiled softIoc, `caput` then `caget`:
+                // `FTVL=CHAR` refuses "hi" and stores 65 for "65";
+                // `FTVL=DOUBLE`/`LONG` refuse "hi", take `0x10` as 16, and
+                // `LONG` truncates 1.7 to 1. The rule does not vary with FTVL,
+                // so neither does this branch. Treating a string as the
+                // buffer's BYTES for CHAR/UCHAR — and silently coercing it to
+                // 0 for every other FTVL — was a special case at one boundary
+                // that C does not have anywhere: the byte carry is what a
+                // client asking DBR_CHAR gets (`caput -S`), which arrives here
+                // already as a `CharArray` and is untouched by this branch.
+                let value = match (&value, c_parse::NumericField::of(self.ftvl_element_type())) {
+                    (EpicsValue::String(s), Some(numeric)) => {
+                        c_parse::put_string(name, numeric, &s.as_str_lossy())?
                     }
-                    (EpicsValue::String(s), Ftype::UChar) => {
-                        EpicsValue::UCharArray(s.as_bytes().to_vec())
-                    }
+                    // FTVL=STRING is `putStringString`, a text copy, not a
+                    // parse — `NumericField::of` reports None for it.
                     _ => value,
                 };
+                // C `dbAccess.c:1415` `if (isValueField) precord->udf = FALSE;`
+                // — a put to VAL re-establishes the buffer, so the remembered
+                // read failure no longer describes it. (Reachable without a
+                // process only through an NPP link put; subArray's VAL is
+                // `pp(TRUE)`, so a CA put re-derives UDF a moment later.)
+                self.inp_read_failed = false;
                 self.land_val_in_buffer(value)
             }
             "NELM" => {
@@ -1178,12 +1239,16 @@ impl Record for WaveformRecord {
                 let Some(v) = count_put(&value) else {
                     return Err(CaError::TypeMismatch("INDX".into()));
                 };
-                // Store INDX as given (floored at 0). NO MALM clamp here — C
-                // clamps INDX->MALM-1 at process (subArrayRecord.c:313-314),
-                // never at field put, so the .db load order of INDX vs MALM
-                // cannot matter. `set_val` (the readValue equivalent) applies
-                // the clamp.
-                self.indx = v.max(0);
+                // Store the DBF_ULONG bit pattern verbatim, exactly as the NELM
+                // arm does — `count_put` has already reinterpreted, so a
+                // `caput SA.INDX -1` lands here as -1 carrying C's 0xFFFFFFFF.
+                // Flooring it at 0 threw that away and turned an out-of-range
+                // index into "start at the beginning". NO MALM clamp here
+                // either: C clamps INDX->MALM-1 at process
+                // (subArrayRecord.c:313-314), never at field put, so the .db
+                // load order of INDX vs MALM cannot matter. `sa_clamp_bounds`
+                // (the readValue equivalent) applies it.
+                self.indx = v;
                 Ok(())
             }
             "MALM" if matches!(self.kind, ArrayKind::SubArray) => {
@@ -1457,22 +1522,40 @@ impl Record for WaveformRecord {
         true
     }
 
-    /// C `subArrayRecord.c::readValue` (318-319) `if (prec->nord <= 0) status =
-    /// -1;` + `process` (148-150) `prec->udf = !!status; if (status)
-    /// recGblSetSevr(prec, UDF_ALARM, prec->udfs);` — a subArray whose slice
-    /// came out EMPTY is UNDEFINED and alarms at UDFS. (Reached when INDX walks
-    /// past the data: an empty-INP subArray re-subsetting its own buffer runs
-    /// out of elements, and a client can put INDX beyond NORD.) The framework
-    /// owns `common.udf`; this is the record's half of C's `udf = !!status`.
+    /// The record's half of C `subArrayRecord.c:148` `prec->udf = !!status`.
+    /// That status has BOTH halves of `readValue` (313-319) in it:
+    ///
+    /// ```c
+    /// status = (*pdset->read_sa)(prec);   /* the INP read */
+    /// if (prec->nord <= 0)                /* the empty-slice test */
+    ///     status = -1;
+    /// ```
+    ///
+    /// so a subArray is undefined when its INP read failed (`inp_read_failed`,
+    /// reported through [`Self::soft_input_read_failed`]) OR when the slice came
+    /// out empty — INDX walked past the data, which an empty-INP subArray
+    /// re-subsetting its own buffer or a client caput to INDX can both produce.
+    /// The framework owns `common.udf`; `Self::served_element_count` reads the
+    /// same predicate so the served count follows without a second rule.
     ///
     /// waveform/aai/aao keep the default answer for an array VAL (defined) —
     /// they clear UDF unconditionally in `process()` anyway
     /// ([`Self::clears_udf_unconditionally`]).
     fn value_is_undefined(&self) -> bool {
         if matches!(self.kind, ArrayKind::SubArray) {
-            return self.nord <= 0;
+            return self.inp_read_failed || self.nord <= 0;
         }
         false
+    }
+
+    /// C `devSASoft.c::read_sa` (118-120) runs `subset()` only when the
+    /// `dbLinkDoLocked(readLocked)` status was 0, so a failed INP leaves NORD
+    /// and `bptr` at their pre-failure contents and `readValue` hands the
+    /// non-zero status to `process`. Remember it: without this the record
+    /// cannot tell "the link delivered nothing because there is no link" from
+    /// "the link is broken", and calls its stale slice valid data.
+    fn soft_input_read_failed(&mut self) {
+        self.inp_read_failed = true;
     }
 }
 

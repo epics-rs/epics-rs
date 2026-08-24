@@ -343,9 +343,12 @@ async fn long_string_autosize_returns_40_nul_padded() {
         .get_with_dbr_type(DBR_CHAR, 0)
         .await
         .expect("autosize DBR_CHAR get");
+    // The wire carrier: a `$` channel ships DBR_CHAR, and `dbr_char_t` is
+    // `epicsUInt8` (`db_access.h:40`) — see `DbFieldType::wire_carrier`.
+    // The bytes are what this test is about; the label just names them.
     let bytes = match snap.value {
-        EpicsValue::CharArray(ref b) => b.as_slice(),
-        ref other => panic!("expected CharArray, got {other:?}"),
+        EpicsValue::UCharArray(ref b) => b.as_slice(),
+        ref other => panic!("expected the DBR_CHAR wire carrier, got {other:?}"),
     };
     assert_eq!(
         bytes.len(),
@@ -391,9 +394,12 @@ async fn long_string_count_clamp_trims_char_array() {
         .get_with_dbr_type(DBR_CHAR, 3)
         .await
         .expect("count-3 DBR_CHAR get");
+    // The wire carrier: a `$` channel ships DBR_CHAR, and `dbr_char_t` is
+    // `epicsUInt8` (`db_access.h:40`) — see `DbFieldType::wire_carrier`.
+    // The bytes are what this test is about; the label just names them.
     let bytes = match snap.value {
-        EpicsValue::CharArray(ref b) => b.as_slice(),
-        ref other => panic!("expected CharArray, got {other:?}"),
+        EpicsValue::UCharArray(ref b) => b.as_slice(),
+        ref other => panic!("expected the DBR_CHAR wire carrier, got {other:?}"),
     };
     assert_eq!(
         bytes.len(),

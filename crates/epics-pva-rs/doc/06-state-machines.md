@@ -32,15 +32,19 @@ concurrent ops cannot trip `Connecting` twice.
 
 ### Holdoff
 
-After a connect / `CREATE_CHANNEL` failure:
+After a pass where every candidate failed, `reconnect_holdoff` picks the
+delay from the failure class and the resolver kind — there is no ladder
+across consecutive failures:
 
-```rust
-holdoff_until = now + min(10s × 2^connect_fail_count, MAX_HOLDOFF)
+```text
+searched + TCP failure        → SEARCH_RING_HOLDOFF      (10s)
+searched + CREATE refusal     → none (≤1s ring tick paces it)
+direct   + TCP failure        → DIRECT_RECONNECT_HOLDOFF  (2s)
+direct   + CREATE refusal     → DIRECT_REFUSAL_HOLDOFF   (10s)
 ```
 
-While `holdoff_until > now`, every `ensure_active()` returns
-`PvaError::Disconnected` immediately. On the next successful
-`Active` transition, `connect_fail_count` resets to 0.
+While `holdoff_until > now`, `ensure_active()` sleeps out the remainder
+before its next attempt. A successful `Active` transition clears it.
 
 ## Search backoff
 

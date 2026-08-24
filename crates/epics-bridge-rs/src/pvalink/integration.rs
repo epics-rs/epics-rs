@@ -1317,11 +1317,11 @@ impl LinkSet for PvaLinkResolver {
         if !self.is_enabled() {
             // `put_value` would reject it — refuse at the gate so the owning
             // record alarms in this cycle, as a `-1` from C does.
-            return PutAdmission::Disconnected;
+            return PutAdmission::Refused;
         }
         let Some(full) = strip_scheme(name) else {
             // A `ca://` name reaching the pva lset: `put_value` rejects it.
-            return PutAdmission::Disconnected;
+            return PutAdmission::Refused;
         };
         let bare = link_pv_name(full);
         if full != bare {
@@ -1342,7 +1342,7 @@ impl LinkSet for PvaLinkResolver {
         {
             None => PutAdmission::Unopened,
             Some(link) if link.is_connected() => PutAdmission::Connected,
-            Some(_) => PutAdmission::Disconnected,
+            Some(_) => PutAdmission::Refused,
         }
     }
 
@@ -1417,13 +1417,21 @@ impl LinkSet for PvaLinkResolver {
 
     /// C `dbCa.c:643-648` `scanForward`: the FWD link is a
     /// `dbCaPutLink(plink, DBR_SHORT, &fwdLinkValue, 1)`, i.e. it stages a
-    /// `CA_WRITE_NATIVE` action and **returns** — the `pvprocess` round trip
+    /// `CA_WRITE_NATIVE` action and **returns** — the upstream round trip
     /// is the `dbCaTask`'s work, never the record thread's. The gate before
     /// staging is C's `if (!pca->isConnected) return -1` (`dbCa.c:558-561`),
     /// which pvxs surfaces as `pvaScanForward`'s `is_connected` check
-    /// (`pvalink_lset.cpp:677`); a link this resolver has never opened is
+    /// (`pvalink_lset.cpp:685`); a link this resolver has never opened is
     /// staged for open here and refused for this cycle, exactly as a cache
     /// miss on the value-read path is.
+    ///
+    /// Both refusals return `Err`, which `dbScanFwdLink`'s caller turns into
+    /// LINK/INVALID on the source record — pvxs's `recGblSetSevrMsg(...,
+    /// "Disconn")` at `pvalink_lset.cpp:686`. A failure of the spawned put
+    /// itself stays a console diagnostic and raises no alarm, because pvxs's
+    /// is one too: `linkPutDone` reports it with `errlogPrintf` and carries
+    /// an explicit `// TODO: signal INVALID_ALARM ?`
+    /// (`pvalink_channel.cpp:185-195`).
     fn scan_forward(&self, name: &str) -> Result<(), String> {
         if !self.is_enabled() {
             return Err("pvalink disabled".into());
@@ -1456,9 +1464,15 @@ impl LinkSet for PvaLinkResolver {
             return Err(format!("pvalink forward link '{name}' is not connected"));
         }
         // Staged, signalled, returned — `dbCa.c:622-624`.
+        let channel = bare.to_string();
         task::spawn(async move {
             if let Err(e) = link.scan_forward().await {
-                eprintln!("pvalink forward link scan failed: {e}");
+                // pvxs `linkPutDone`: `errlogPrintf("%s PVA link put ERROR:
+                // %s\n", key.first, e.what())` — named channel, console
+                // only. `eprintln!` is this crate's errlog equivalent (see
+                // `report_open_failure`): the RTEMS target installs no
+                // `tracing` subscriber.
+                eprintln!("{channel} PVA forward link put ERROR: {e}");
             }
         });
         Ok(())

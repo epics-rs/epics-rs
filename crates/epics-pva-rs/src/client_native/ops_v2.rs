@@ -4,10 +4,12 @@
 //! `Connection` with no reconnect logic. The v2 versions take a
 //! [`Channel`] and:
 //!
-//! - GET / PUT / RPC: a single attempt; if the connection dies mid-op the
-//!   error bubbles up and the caller decides whether to retry. (Idempotent
-//!   ops like GET could in principle be auto-retried, but pvxs prefers to
-//!   surface the error so the user can decide.)
+//! - GET / PUT / RPC: re-queued and re-issued when the channel is lost
+//!   mid-op, bounded by the caller's `op_timeout` — see
+//!   `requeue_on_disconnect`. pvxs does NOT surface the loss to the
+//!   caller: `GPROp::disconnected` (`clientget.cpp:380-404`) returns the
+//!   op to `chan->pending` for every one-call (`autoExec`) op, GET and PUT
+//!   alike.
 //! - MONITOR: re-issues INIT + START on every reconnect transparently. The
 //!   `callback` continues firing as long as the channel isn't closed.
 //!
@@ -30,7 +32,9 @@ use crate::codec::PvaCodec;
 use crate::error::{PvaError, PvaResult};
 use crate::proto::{BitSet, ByteOrder, Command, PvaHeader, QosFlags, ReadExt, WriteExt};
 use crate::pv_request::{build_pv_request_fields, build_pv_request_value_only};
-use crate::pvdata::encode::{encode_pv_field, encode_pv_field_with_bitset, encode_type_desc};
+use crate::pvdata::encode::{
+    default_value_for, encode_pv_field, encode_pv_field_with_bitset, encode_type_desc,
+};
 use crate::pvdata::{
     FieldDesc, PvField, PvStructure, RpcReply, ScalarType, ScalarValue, UnionItem, VariantValue,
 };
@@ -515,7 +519,73 @@ pub(crate) async fn ensure_active_with_op_timeout(
     }
 }
 
+/// The single re-queue owner: pvxs `OperationBase::disconnected`
+/// (`clientimpl.h:62`), reached from `Channel::disconnect`
+/// (`client.cpp:198-204`) on a circuit drop AND on a server-initiated
+/// `CMD_DESTROY_CHANNEL`.
+///
+/// pvxs does not fail an in-flight one-shot when its channel goes away.
+/// `GPROp::disconnected` (`clientget.cpp:380-404`) pushes the op back into
+/// `chan->pending` and returns it to `Connecting`, the channel re-enters a
+/// search bucket (`client.cpp:209-213`), and `Channel::createOperations`
+/// (`client.cpp:120-146`) re-issues every pending op once the channel is
+/// Active again; the caller's future stays pending across all of it. The
+/// single exception is `state==Exec && op!=Get && !autoExec` ("can't
+/// restart as server side-effects may occur"), which is the two-phase
+/// application API — every op here is the one-call `autoExec=true` form
+/// (`clientget.cpp:126`), so the rule is uniform and no op opts out. A PUT
+/// is re-issued exactly as pvxs re-issues it.
+///
+/// `attempt` is re-run from the top, including its
+/// [`ensure_active_with_op_timeout`] — that is what re-searches, since
+/// `Channel::ensure_active` forces a fresh search once the server has
+/// destroyed the SID. Only [`PvaError::Disconnected`] re-queues: a remote
+/// `Status`, a decode fault, or an expired deadline is the op's answer.
+/// `op_timeout` is the whole operation's budget, not one attempt's, so a
+/// server that keeps dropping the channel still ends at the caller's
+/// deadline rather than looping forever.
+pub(crate) async fn requeue_on_disconnect<F, Fut, T>(
+    channel: &Arc<Channel>,
+    op_timeout: Duration,
+    attempt: F,
+) -> PvaResult<T>
+where
+    F: Fn(Duration) -> Fut,
+    Fut: std::future::Future<Output = PvaResult<T>>,
+{
+    let deadline = std::time::Instant::now() + op_timeout;
+    loop {
+        let budget = deadline.saturating_duration_since(std::time::Instant::now());
+        if budget.is_zero() {
+            return Err(PvaError::Timeout);
+        }
+        match attempt(budget).await {
+            Err(PvaError::Disconnected) => {
+                debug!(
+                    pv = %channel.pv_name,
+                    "channel lost mid-op — re-queueing (pvxs GPROp::disconnected)"
+                );
+            }
+            other => return other,
+        }
+    }
+}
+
 async fn op_get_inner(
+    channel: &Arc<Channel>,
+    fields: &[&str],
+    raw_pv_req: Option<&[u8]>,
+    op_timeout: Duration,
+) -> PvaResult<MarkedRead> {
+    requeue_on_disconnect(channel, op_timeout, |budget| {
+        op_get_inner_attempt(channel, fields, raw_pv_req, budget)
+    })
+    .await
+}
+
+/// One attempt of [`op_get_inner`]; [`requeue_on_disconnect`] runs it
+/// again from the top when the channel is lost mid-op.
+async fn op_get_inner_attempt(
     channel: &Arc<Channel>,
     fields: &[&str],
     raw_pv_req: Option<&[u8]>,
@@ -760,6 +830,19 @@ pub async fn op_get_field(
     subfield: &str,
     op_timeout: Duration,
 ) -> PvaResult<FieldDesc> {
+    requeue_on_disconnect(channel, op_timeout, |budget| {
+        op_get_field_attempt(channel, subfield, budget)
+    })
+    .await
+}
+
+/// One attempt of [`op_get_field`]; [`requeue_on_disconnect`] runs it
+/// again from the top when the channel is lost mid-op.
+async fn op_get_field_attempt(
+    channel: &Arc<Channel>,
+    subfield: &str,
+    op_timeout: Duration,
+) -> PvaResult<FieldDesc> {
     let (server, sid) = ensure_active_with_op_timeout(channel, op_timeout).await?;
     let order = server.byte_order();
     let big_endian = matches!(order, ByteOrder::Big);
@@ -809,6 +892,43 @@ pub async fn op_put_raw(
     op_timeout: Duration,
 ) -> PvaResult<()> {
     op_put_inner(channel, value_str, Some(pv_req), op_timeout).await
+}
+
+/// PUT that writes no field: the DATA phase carries an EMPTY changed
+/// bitset, so no value bytes reach the wire and the server applies only
+/// the INIT pvRequest's `record._options`.
+///
+/// This is the interoperable spelling of "make the remote record
+/// process". pvxs implements no CMD_PROCESS handler at all — the
+/// constant exists once, in `src/pvaproto.h:632`, and `ConnBase`'s
+/// command switch (`src/conn.cpp:249-275`) drops an unrecognised command
+/// to `default:`, which debug-logs and `evbuffer_drain`s the body
+/// without replying. pvxs's own pvalink forward link is this PUT:
+/// `pvaScanForward` calls `lchan->put(true)` (`ioc/pvalink_lset.cpp:691`)
+/// and `linkBuildPut` returns the prototype untouched when no link
+/// staged a value (`ioc/pvalink_channel.cpp:127-159`), under a pvRequest
+/// carrying `record._options.process = "true"`
+/// (`ioc/pvalink_channel.cpp:255-263`).
+///
+/// Use this, not [`op_process`], on any path whose peer may be a pvxs
+/// server.
+pub async fn op_put_empty(
+    channel: &Arc<Channel>,
+    pv_req: &[u8],
+    op_timeout: Duration,
+) -> PvaResult<()> {
+    op_put_inner_build(
+        channel,
+        Some(pv_req),
+        op_timeout,
+        // Nothing is written, so no snapshot can inform the build.
+        |_intro| false,
+        // The empty bitset is the payload: `encode_pv_field_with_bitset`
+        // emits no bytes for an unset bit, so the prototype-shaped value
+        // only satisfies the builder signature and never reaches the wire.
+        |intro, _previous| Ok((default_value_for(intro), BitSet::new())),
+    )
+    .await
 }
 
 /// PUT the legacy pvAccessCPP positional bare-token form, classified
@@ -876,6 +996,20 @@ pub async fn op_put_args(
 /// pvRequest is forced to `field(<path>)` so the server INIT
 /// negotiation matches the field layout we'll send.
 pub async fn op_put_field(
+    channel: &Arc<Channel>,
+    field_path: &str,
+    value_str: &str,
+    op_timeout: Duration,
+) -> PvaResult<()> {
+    requeue_on_disconnect(channel, op_timeout, |budget| {
+        op_put_field_attempt(channel, field_path, value_str, budget)
+    })
+    .await
+}
+
+/// One attempt of [`op_put_field`]; [`requeue_on_disconnect`] runs it
+/// again from the top when the channel is lost mid-op.
+async fn op_put_field_attempt(
     channel: &Arc<Channel>,
     field_path: &str,
     value_str: &str,
@@ -1052,6 +1186,20 @@ async fn op_put_fields_inner(
     pv_req_override: Option<&[u8]>,
     op_timeout: Duration,
 ) -> PvaResult<()> {
+    requeue_on_disconnect(channel, op_timeout, |budget| {
+        op_put_fields_inner_attempt(channel, assignments, pv_req_override, budget)
+    })
+    .await
+}
+
+/// One attempt of [`op_put_fields_inner`]; [`requeue_on_disconnect`] runs it
+/// again from the top when the channel is lost mid-op.
+async fn op_put_fields_inner_attempt(
+    channel: &Arc<Channel>,
+    assignments: &[(String, PutLeaf)],
+    pv_req_override: Option<&[u8]>,
+    op_timeout: Duration,
+) -> PvaResult<()> {
     if assignments.is_empty() {
         return Err(PvaError::InvalidValue("no field assignments".into()));
     }
@@ -1156,6 +1304,21 @@ pub async fn op_put_field_with_request(
     value_str: &str,
     op_timeout: Duration,
 ) -> PvaResult<()> {
+    requeue_on_disconnect(channel, op_timeout, |budget| {
+        op_put_field_with_request_attempt(channel, field_path, pv_req, value_str, budget)
+    })
+    .await
+}
+
+/// One attempt of [`op_put_field_with_request`]; [`requeue_on_disconnect`] runs it
+/// again from the top when the channel is lost mid-op.
+async fn op_put_field_with_request_attempt(
+    channel: &Arc<Channel>,
+    field_path: &str,
+    pv_req: &[u8],
+    value_str: &str,
+    op_timeout: Duration,
+) -> PvaResult<()> {
     let (server, sid) = ensure_active_with_op_timeout(channel, op_timeout).await?;
     let order = server.byte_order();
     let big_endian = matches!(order, ByteOrder::Big);
@@ -1251,6 +1414,21 @@ pub async fn op_put_field_with_request(
 /// pvxs parity: `pvalink_channel.cpp:127-180` typed array/scalar PUT
 /// into the link's `fieldName` target.
 pub async fn op_put_value_field_with_request(
+    channel: &Arc<Channel>,
+    field_path: &str,
+    pv_req: &[u8],
+    value: &PvField,
+    op_timeout: Duration,
+) -> PvaResult<()> {
+    requeue_on_disconnect(channel, op_timeout, |budget| {
+        op_put_value_field_with_request_attempt(channel, field_path, pv_req, value, budget)
+    })
+    .await
+}
+
+/// One attempt of [`op_put_value_field_with_request`]; [`requeue_on_disconnect`] runs it
+/// again from the top when the channel is lost mid-op.
+async fn op_put_value_field_with_request_attempt(
     channel: &Arc<Channel>,
     field_path: &str,
     pv_req: &[u8],
@@ -1459,6 +1637,19 @@ pub async fn op_put_value(
     value: &PvField,
     op_timeout: Duration,
 ) -> PvaResult<()> {
+    requeue_on_disconnect(channel, op_timeout, |budget| {
+        op_put_value_attempt(channel, value, budget)
+    })
+    .await
+}
+
+/// One attempt of [`op_put_value`]; [`requeue_on_disconnect`] runs it
+/// again from the top when the channel is lost mid-op.
+async fn op_put_value_attempt(
+    channel: &Arc<Channel>,
+    value: &PvField,
+    op_timeout: Duration,
+) -> PvaResult<()> {
     let (server, sid) = ensure_active_with_op_timeout(channel, op_timeout).await?;
     let order = server.byte_order();
     let big_endian = matches!(order, ByteOrder::Big);
@@ -1544,6 +1735,20 @@ pub async fn op_put_value(
 /// default `field(value)` selector. DATA still targets the `"value"`
 /// bit. pvxs `pvalink_channel.cpp:268` parity for typed OUT arrays.
 pub async fn op_put_value_raw(
+    channel: &Arc<Channel>,
+    pv_req: &[u8],
+    value: &PvField,
+    op_timeout: Duration,
+) -> PvaResult<()> {
+    requeue_on_disconnect(channel, op_timeout, |budget| {
+        op_put_value_raw_attempt(channel, pv_req, value, budget)
+    })
+    .await
+}
+
+/// One attempt of [`op_put_value_raw`]; [`requeue_on_disconnect`] runs it
+/// again from the top when the channel is lost mid-op.
+async fn op_put_value_raw_attempt(
     channel: &Arc<Channel>,
     pv_req: &[u8],
     value: &PvField,
@@ -1678,8 +1883,29 @@ async fn op_put_inner_build<FB, WP>(
     build_value: FB,
 ) -> PvaResult<()>
 where
-    FB: FnOnce(&FieldDesc, Option<&PvField>) -> PvaResult<(PvField, BitSet)>,
-    WP: FnOnce(&FieldDesc) -> bool,
+    FB: Fn(&FieldDesc, Option<&PvField>) -> PvaResult<(PvField, BitSet)>,
+    WP: Fn(&FieldDesc) -> bool,
+{
+    requeue_on_disconnect(channel, op_timeout, |budget| {
+        op_put_inner_build_attempt(channel, raw_pv_req, budget, &wants_previous, &build_value)
+    })
+    .await
+}
+
+/// One attempt of [`op_put_inner_build`]; [`requeue_on_disconnect`] runs it
+/// again from the top when the channel is lost mid-op. The builders are
+/// borrowed, not consumed, because a re-issued PUT rebuilds its value
+/// against the prototype the *new* channel returns.
+async fn op_put_inner_build_attempt<FB, WP>(
+    channel: &Arc<Channel>,
+    raw_pv_req: Option<&[u8]>,
+    op_timeout: Duration,
+    wants_previous: &WP,
+    build_value: &FB,
+) -> PvaResult<()>
+where
+    FB: Fn(&FieldDesc, Option<&PvField>) -> PvaResult<(PvField, BitSet)>,
+    WP: Fn(&FieldDesc) -> bool,
 {
     let (server, sid) = ensure_active_with_op_timeout(channel, op_timeout).await?;
     let order = server.byte_order();
@@ -3662,6 +3888,7 @@ where
 /// serializes as `type(arg) + full_value(arg)`. This is distinct from
 /// `FieldDesc::Variant` plus an empty `PvField::Variant`, which is the
 /// "present `any` whose selected value is null" shape.
+#[derive(Clone, Copy)]
 pub enum RpcArg<'a> {
     /// pvxs top-level null argument — the single `0xff` type tag, no
     /// value body.
@@ -3689,6 +3916,21 @@ fn encode_rpc_exec_arg(arg: &RpcArg<'_>, order: ByteOrder, out: &mut Vec<u8>) {
 }
 
 pub async fn op_rpc(
+    channel: &Arc<Channel>,
+    request_desc: &FieldDesc,
+    request_value: &PvField,
+    arg: RpcArg<'_>,
+    op_timeout: Duration,
+) -> PvaResult<RpcReply> {
+    requeue_on_disconnect(channel, op_timeout, |budget| {
+        op_rpc_attempt(channel, request_desc, request_value, arg, budget)
+    })
+    .await
+}
+
+/// One attempt of [`op_rpc`]; [`requeue_on_disconnect`] runs it
+/// again from the top when the channel is lost mid-op.
+async fn op_rpc_attempt(
     channel: &Arc<Channel>,
     request_desc: &FieldDesc,
     request_value: &PvField,
@@ -3965,6 +4207,7 @@ pub async fn op_get_put_with_request(
 /// forward / typed clients) writes a pre-built [`PvField`] (`Typed`). One
 /// enum so every PUT_GET variant shares the single INIT/data/destroy
 /// lifecycle below and cannot drift apart.
+#[derive(Clone, Copy)]
 enum PutGetPut<'a> {
     None,
     Str(&'a str),
@@ -3979,6 +4222,21 @@ enum PutGetPut<'a> {
 /// decode the readback. Factored so every subcommand and value form shares
 /// one INIT/destroy lifecycle and cannot drift apart.
 async fn op_put_get_data(
+    channel: &Arc<Channel>,
+    data_subcmd: u8,
+    req: Option<&[u8]>,
+    put: PutGetPut<'_>,
+    op_timeout: Duration,
+) -> PvaResult<MarkedRead> {
+    requeue_on_disconnect(channel, op_timeout, |budget| {
+        op_put_get_data_attempt(channel, data_subcmd, req, put, budget)
+    })
+    .await
+}
+
+/// One attempt of [`op_put_get_data`]; [`requeue_on_disconnect`] runs it
+/// again from the top when the channel is lost mid-op.
+async fn op_put_get_data_attempt(
     channel: &Arc<Channel>,
     data_subcmd: u8,
     req: Option<&[u8]>,
@@ -4201,6 +4459,7 @@ fn decode_put_get_data(
 
 /// One ChannelArray data-phase sub-request, mirroring the QOS-bit selection
 /// in pvAccessCPP `clientContextImpl.cpp:1580-1612`.
+#[derive(Clone, Copy)]
 enum ArrayReq<'a> {
     /// `getArray` (`QOS_GET`): read the `[offset, count, stride]` slice.
     Get {
@@ -4243,6 +4502,20 @@ enum ArrayResp {
 /// - setLength: data `length`; reply `status`.
 /// - getLength: data (none); reply `status + length`.
 async fn op_array_data(
+    channel: &Arc<Channel>,
+    pv_request: Option<&PvField>,
+    req: ArrayReq<'_>,
+    op_timeout: Duration,
+) -> PvaResult<(FieldDesc, ArrayResp)> {
+    requeue_on_disconnect(channel, op_timeout, |budget| {
+        op_array_data_attempt(channel, pv_request, req, budget)
+    })
+    .await
+}
+
+/// One attempt of [`op_array_data`]; [`requeue_on_disconnect`] runs it
+/// again from the top when the channel is lost mid-op.
+async fn op_array_data_attempt(
     channel: &Arc<Channel>,
     pv_request: Option<&PvField>,
     req: ArrayReq<'_>,
@@ -4535,6 +4808,19 @@ pub async fn op_array_describe(
     pv_request: Option<&PvField>,
     op_timeout: Duration,
 ) -> PvaResult<FieldDesc> {
+    requeue_on_disconnect(channel, op_timeout, |budget| {
+        op_array_describe_attempt(channel, pv_request, budget)
+    })
+    .await
+}
+
+/// One attempt of [`op_array_describe`]; [`requeue_on_disconnect`] runs it
+/// again from the top when the channel is lost mid-op.
+async fn op_array_describe_attempt(
+    channel: &Arc<Channel>,
+    pv_request: Option<&PvField>,
+    op_timeout: Duration,
+) -> PvaResult<FieldDesc> {
     let (server, sid) = ensure_active_with_op_timeout(channel, op_timeout).await?;
     let order = server.byte_order();
     let big_endian = matches!(order, ByteOrder::Big);
@@ -4719,6 +5005,19 @@ pub async fn op_process_with_request(
     pv_req: &[u8],
     op_timeout: Duration,
 ) -> PvaResult<()> {
+    requeue_on_disconnect(channel, op_timeout, |budget| {
+        op_process_with_request_attempt(channel, pv_req, budget)
+    })
+    .await
+}
+
+/// One attempt of [`op_process_with_request`]; [`requeue_on_disconnect`] runs it
+/// again from the top when the channel is lost mid-op.
+async fn op_process_with_request_attempt(
+    channel: &Arc<Channel>,
+    pv_req: &[u8],
+    op_timeout: Duration,
+) -> PvaResult<()> {
     let (server, sid) = ensure_active_with_op_timeout(channel, op_timeout).await?;
     let order = server.byte_order();
     let big_endian = matches!(order, ByteOrder::Big);
@@ -4787,6 +5086,19 @@ pub async fn op_process_with_request(
 /// downstream PROCESS create-time pvRequest upstream
 /// (`ChannelContext.pv_request` → pva2pva createChannelProcess).
 pub async fn op_process_with_request_value(
+    channel: &Arc<Channel>,
+    pv_request: &PvField,
+    op_timeout: Duration,
+) -> PvaResult<()> {
+    requeue_on_disconnect(channel, op_timeout, |budget| {
+        op_process_with_request_value_attempt(channel, pv_request, budget)
+    })
+    .await
+}
+
+/// One attempt of [`op_process_with_request_value`]; [`requeue_on_disconnect`] runs it
+/// again from the top when the channel is lost mid-op.
+async fn op_process_with_request_value_attempt(
     channel: &Arc<Channel>,
     pv_request: &PvField,
     op_timeout: Duration,
@@ -4906,6 +5218,16 @@ fn decode_process_status(
 
 // ── Helpers ────────────────────────────────────────────────────────────
 
+/// Await one frame for an op's IOID.
+///
+/// A closed router slot means this op lost its transport, and that is
+/// [`PvaError::Disconnected`] — pvxs's `Disconnect` exception — not a
+/// protocol error. The two producers are `Channel::disconnect`
+/// (`client.cpp:198-204`), which drops the IOID maps on a server-initiated
+/// `CMD_DESTROY_CHANNEL`, and the reader task's exit. The DESTROY case
+/// leaves the TCP circuit up and still serving this connection's other
+/// channels, so the old "connection closed" text was wrong on its face.
+/// [`requeue_on_disconnect`] is what acts on this variant.
 async fn await_frame(
     stream: &mut mpsc::UnboundedReceiver<super::decode::Frame>,
     op_timeout: Duration,
@@ -4913,7 +5235,7 @@ async fn await_frame(
     let frame = timeout(op_timeout, stream.recv())
         .await
         .map_err(|_| PvaError::Timeout)?
-        .ok_or_else(|| PvaError::Protocol("connection closed".into()))?;
+        .ok_or(PvaError::Disconnected)?;
     Ok(frame)
 }
 
@@ -4979,7 +5301,7 @@ async fn await_oneshot_frame(
     timeout(op_timeout, rx)
         .await
         .map_err(|_| PvaError::Timeout)?
-        .map_err(|_| PvaError::Protocol("connection closed".into()))
+        .map_err(|_| PvaError::Disconnected)
 }
 
 fn sentinel_all_fields() -> &'static [u8] {

@@ -26,6 +26,10 @@ pub struct IocBuilder {
     pvs: Vec<(String, EpicsValue)>,
     records: Vec<(String, Box<dyn Record>)>,
     db_defs: Vec<db_loader::DbRecordDef>,
+    /// File-scope aliases whose target no `.db` added so far declares.
+    /// Resolved at `build` against the accumulated definitions, which is
+    /// this builder's stand-in for C's `savedPdbbase`.
+    db_aliases: Vec<(String, String)>,
     /// `breaktable(...)` definitions parsed from the loaded `.db`/`.dbd` text,
     /// used to populate the breakpoint-table registry for `ai`/`ao` records
     /// with `LINR >= 3`.
@@ -59,6 +63,7 @@ impl IocBuilder {
             pvs: Vec::new(),
             records: Vec::new(),
             db_defs: Vec::new(),
+            db_aliases: Vec::new(),
             breaktables: Vec::new(),
             device_factories,
             // The base built-in device support — all needing the runtime
@@ -94,17 +99,19 @@ impl IocBuilder {
     /// Load records from a .db file.
     pub fn db_file(mut self, path: &str, macros: &HashMap<String, String>) -> CaResult<Self> {
         let content = std::fs::read_to_string(path).map_err(CaError::Io)?;
-        let (defs, breaktables) = db_loader::parse_db_with_breaktables(&content, macros)?;
-        self.db_defs.extend(defs);
-        self.breaktables.extend(breaktables);
+        let parsed = db_loader::parse_db_with_breaktables(&content, macros)?;
+        self.db_defs.extend(parsed.records);
+        self.breaktables.extend(parsed.breaktables);
+        self.db_aliases.extend(parsed.unresolved_aliases);
         Ok(self)
     }
 
     /// Load records from a .db string.
     pub fn db_string(mut self, content: &str, macros: &HashMap<String, String>) -> CaResult<Self> {
-        let (defs, breaktables) = db_loader::parse_db_with_breaktables(content, macros)?;
-        self.db_defs.extend(defs);
-        self.breaktables.extend(breaktables);
+        let parsed = db_loader::parse_db_with_breaktables(content, macros)?;
+        self.db_defs.extend(parsed.records);
+        self.breaktables.extend(parsed.breaktables);
+        self.db_aliases.extend(parsed.unresolved_aliases);
         Ok(self)
     }
 
@@ -219,19 +226,10 @@ impl IocBuilder {
             // to classify or fold.
             db.add_record(&name, record).await?;
             if let Some(rec_arc) = db.get_record(&name) {
-                {
-                    let mut instance = rec_arc.write();
-                    // Seed MLST/ALST/LALM from val so the first process posts a
-                    // monitor only on a real change (C init_record invariant).
-                    instance.record.seed_deadband_tracking();
-                }
-                // C `recGblInitSimm` + `recGblInitConstantLink(&siol, …,
-                // &sval)`, run from every SIML-bearing `init_record` (pass 1).
-                db.rec_gbl_init_simm(&rec_arc);
-                // C `wdogInit(prec)` from `init_record` pass 1
-                // (histogramRecord.c:168) — arms the SDEL monitor watchdog.
-                // No-op for every record type without one.
-                db.arm_watchdog(&name);
+                let mut instance = rec_arc.write();
+                // Seed MLST/ALST/LALM from val so the first process posts a
+                // monitor only on a real change (C init_record invariant).
+                instance.record.seed_deadband_tracking();
             }
         }
 
@@ -311,14 +309,6 @@ impl IocBuilder {
                     instance.record.seed_deadband_tracking();
                 }
 
-                // C `recGblInitSimm` + `recGblInitConstantLink(&siol, …,
-                // &sval)`, run from every SIML-bearing `init_record` (pass 1).
-                // The lock is released and retaken by the owner, which is the
-                // only site allowed to load a constant SIML/SIOL.
-                db.rec_gbl_init_simm(&rec_arc);
-                // C `wdogInit(prec)` from `init_record` pass 1
-                // (histogramRecord.c:168) — arms the SDEL monitor watchdog.
-                db.arm_watchdog(&def.name);
                 let mut instance = rec_arc.write();
 
                 // Device support based on DTYP
@@ -380,14 +370,29 @@ impl IocBuilder {
                             }
                         }
                     }
+                    // Unconditional, as in `IocApp` — see the invariant on
+                    // `field_io::snam_special_after_put`.
                     if let Some(EpicsValue::String(snam)) = instance.record.get_field("SNAM") {
-                        if let Some(sub_fn) =
-                            self.subroutine_registry.get(snam.as_str_lossy().as_ref())
-                        {
-                            instance.subroutine = Some(sub_fn.clone());
-                        }
+                        instance.subroutine = self
+                            .subroutine_registry
+                            .get(snam.as_str_lossy().as_ref())
+                            .cloned();
                     }
                 }
+            }
+        }
+
+        // File-scope `alias("record","new")` that no single `.db` could
+        // resolve on its own. C `dbAlias` looks the target up in
+        // `savedPdbbase` (`dbLexRoutines.c:1508`), the whole accumulated
+        // database — here that is every definition added to the builder,
+        // now installed. An unknown target keeps C's diagnostic and
+        // leaves the records that did load in place.
+        for (target, alias) in self.db_aliases {
+            if db.get_record(&target).is_none() {
+                eprintln!("{}", db_loader::unknown_alias_message(&alias, &target));
+            } else if let Err(e) = db.add_alias(&alias, &target).await {
+                eprintln!("alias({alias}) for {target} rejected: {e}");
             }
         }
 

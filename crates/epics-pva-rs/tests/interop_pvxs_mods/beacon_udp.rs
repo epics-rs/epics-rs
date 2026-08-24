@@ -172,6 +172,8 @@ async fn interop_beacon_b_rust_client_receives_pvxs_beacons() {
         "record(stringout, \"B:HOST\") { field(VAL, \"ok\") }\n",
     )
     .expect("write db");
+    let stdout_path = dir.path().join("ioc.stdout");
+    let stderr_path = dir.path().join("ioc.stderr");
 
     let mut cmd = super::interop_helpers::pvxs_command(&softioc);
     cmd.arg("-D")
@@ -191,8 +193,12 @@ async fn interop_beacon_b_rust_client_receives_pvxs_beacons() {
         // default ports so we don't fight other IOCs on the host.
         .env("EPICS_CAS_SERVER_PORT", "0")
         .env("EPICS_CA_SERVER_PORT", "0")
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null());
+        .stdout(std::process::Stdio::from(
+            std::fs::File::create(&stdout_path).expect("stdout"),
+        ))
+        .stderr(std::process::Stdio::from(
+            std::fs::File::create(&stderr_path).expect("stderr"),
+        ));
 
     let mut child = match cmd.spawn() {
         Ok(c) => c,
@@ -214,8 +220,13 @@ async fn interop_beacon_b_rust_client_receives_pvxs_beacons() {
     if !up {
         let _ = child.kill();
         let _ = child.wait();
-        eprintln!("SKIP: softIocPVX did not bind within 5s");
-        return;
+        let out = std::fs::read_to_string(&stdout_path).unwrap_or_default();
+        let err = std::fs::read_to_string(&stderr_path).unwrap_or_default();
+        panic!(
+            "softIocPVX did not bind {tcp_addr} within 5s. A spawned IOC that \
+             never comes up is a broken reference, not a missing one.\n\
+             pvxs stdout:\n{out}\npvxs stderr:\n{err}"
+        );
     }
 
     // Rust client configured to listen on the same broadcast port

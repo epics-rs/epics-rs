@@ -11,7 +11,7 @@
 //! links.rs   self.process_record_with_links_recursive(target, visited, depth + 1)
 //! ```
 //!
-//! so a target that is then refused by `MAX_LINK_DEPTH` / `MAX_LINK_OPS`, or
+//! so a target that is then refused by `MAX_LINK_DEPTH`, or
 //! stopped by the `visited` cycle guard, was counted into the wait-set and
 //! never counted out. The set could not drain, the completion oneshot never
 //! fired, and a CA `WRITE_NOTIFY` driving that chain got no reply at all.

@@ -27,9 +27,11 @@ pub struct Int64outRecord {
     pub drvl: i64,
     pub hyst: i64,
     // LALM/ALST/MLST are DBF_INT64 too, but `special(SPC_NOMOD)`: read-only, so
-    // no client put reaches the parse. Kept f64 — internal alarm/archive/monitor
-    // bookkeeping the deadband engine reads as doubles.
-    pub lalm: f64,
+    // no client put reaches the parse. LALM is the alarm ladder's own
+    // `epicsInt64 lalm` (`int64outRecord.c:294`) — the threshold its hysteresis
+    // arm compares against — so it holds that exactly; ALST/MLST stay doubles,
+    // read by the monitor deadband engine.
+    pub lalm: i64,
     pub ivoa: i16,
     pub ivov: i64,
     pub adel: i64,
@@ -43,6 +45,13 @@ pub struct Int64outRecord {
     pub siol: String,
     pub sims: i16,
     pub sdly: f64,
+    /// Suppresses THIS cycle's `convert()` — C `int64outRecord.c:146` /
+    /// `longoutRecord.c:155` `if (!status) convert(prec, value)`, whose convert
+    /// is the DRVH/DRVL clamp. Set by
+    /// [`Record::closed_loop_dol_read_failed`] and cleared by `process()`, so a
+    /// dead closed-loop DOL leaves VAL exactly as the last successful cycle (or
+    /// a client put) left it instead of re-clamping it into the drive window.
+    pub skip_convert: bool,
 }
 
 impl Default for Int64outRecord {
@@ -55,7 +64,7 @@ impl Default for Int64outRecord {
             drvh: 0,
             drvl: 0,
             hyst: 0,
-            lalm: 0.0,
+            lalm: 0,
             ivoa: 0,
             ivov: 0,
             adel: 0,
@@ -69,6 +78,7 @@ impl Default for Int64outRecord {
             siol: String::new(),
             sims: 0,
             sdly: -1.0,
+            skip_convert: false,
         }
     }
 }
@@ -85,6 +95,12 @@ impl Int64outRecord {
 impl Record for Int64outRecord {
     fn record_type(&self) -> &'static str {
         "int64out"
+    }
+
+    /// C `int64outRecord.c:139-150`: the scalar `dbGetLink(&prec->dol, ..., &prec->val, 0, 0)`
+    /// under `dol.type != CONSTANT && omsl == menuOmslclosed_loop`.
+    fn fetches_dol_closed_loop(&self) -> bool {
+        true
     }
 
     /// C `int64outRecord.c:135-143`: `process()` clears `udf` to FALSE only on a
@@ -120,14 +136,22 @@ impl Record for Int64outRecord {
     /// comparison and clamp are the direct integer clamp C's `convert`
     /// performs against the `epicsInt64 value`.
     fn process(&mut self) -> CaResult<ProcessOutcome> {
-        if self.drvh > self.drvl {
+        if !self.skip_convert && self.drvh > self.drvl {
             if self.val > self.drvh {
                 self.val = self.drvh;
             } else if self.val < self.drvl {
                 self.val = self.drvl;
             }
         }
+        self.skip_convert = false;
         Ok(ProcessOutcome::complete())
+    }
+
+    /// C `int64outRecord.c:146` — `if (!status) convert(prec, value)`: a failed
+    /// closed-loop DOL read skips the convert, so the DRVH/DRVL clamp does not
+    /// run and VAL keeps whatever it held.
+    fn closed_loop_dol_read_failed(&mut self) {
+        self.skip_convert = true;
     }
 
     /// `SIMM` is `DBF_MENU menu(menuYesNo)` (`int64outRecord.dbd.pod`): the
@@ -151,7 +175,7 @@ impl Record for Int64outRecord {
             "DRVH" => Some(EpicsValue::Int64(self.drvh)),
             "DRVL" => Some(EpicsValue::Int64(self.drvl)),
             "HYST" => Some(EpicsValue::Int64(self.hyst)),
-            "LALM" => Some(EpicsValue::Double(self.lalm)),
+            "LALM" => Some(EpicsValue::Int64(self.lalm)),
             "IVOA" => Some(EpicsValue::Short(self.ivoa)),
             "IVOV" => Some(EpicsValue::Int64(self.ivov)),
             "ADEL" => Some(EpicsValue::Int64(self.adel)),
@@ -222,9 +246,11 @@ impl Record for Int64outRecord {
                 }
             }
             "LALM" => {
-                self.lalm = value
-                    .to_f64()
-                    .ok_or_else(|| CaError::TypeMismatch("LALM".into()))?;
+                if let EpicsValue::Int64(v) = value {
+                    self.lalm = v;
+                } else {
+                    return Err(CaError::TypeMismatch("LALM".into()));
+                }
             }
             "IVOA" => {
                 if let EpicsValue::Short(v) = value {

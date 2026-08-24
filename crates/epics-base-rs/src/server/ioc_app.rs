@@ -635,14 +635,12 @@ impl IocApplication {
         db.begin_load()
             .expect("a database created a line ago has not run iocInit");
 
-        // On an embedded target (RTEMS or VxWorks), bring up the background
-        // executor (callback pool, delayed timer, scanOnce worker) before any
-        // record processing can defer a tail — C parity: `callbackInit` runs
-        // early in `iocInit` (callback.c:286). Hosted builds drive tails on
-        // the tokio runtime and skip this; a spawn/sleep/interval on a path
-        // that never reaches here still lazy-inits the same executor on
-        // first use.
-        #[cfg(epics_embedded_target)]
+        // Bring up the background executor (callback pool, delayed timer,
+        // scanOnce worker) before any record processing can defer a tail — C
+        // parity: `callbackInit` runs early in `iocInit` (callback.c:286).
+        // Every backend, because every deferred record tail lands there; a
+        // `spawn_background` on a path that never reaches here still
+        // lazy-inits the same executor on first use.
         crate::runtime::task::background_init();
 
         let bridge = crate::runtime::task::BlockingBridge::capture();
@@ -670,7 +668,12 @@ impl IocApplication {
         // afterwards observe the same store (upstream issue #667
         // adjacent: a config that only lands in a shell-local copy is
         // access security silently OFF).
-        let acf = access_security::new_acf_cell(acf);
+        // Watched over this IOC's database: an ASG `INP*` value change must
+        // re-evaluate live access rights (C `asCa.c`). The database is still
+        // empty here — the startup script loads it — and so is the policy if
+        // the script's `asInit` supplies it; the watcher attaches to each link
+        // when its record and its policy turn up.
+        let acf = access_security::new_acf_cell_watching(acf, &db);
         // Periodic HAG DNS re-resolution under asCheckClientIP — C
         // freezes HAG IPs at ACF load until a manual asInit
         // (epics-base#863 / UI-107). Weak-referenced: ends when this
@@ -966,7 +969,7 @@ impl IocApplication {
             .max(0.0);
         if link_wait_secs > 0.0 {
             let (connected, total) = db
-                .wait_for_external_links(std::time::Duration::from_secs_f64(link_wait_secs))
+                .wait_for_external_links(crate::runtime::time::duration_from_secs(link_wait_secs))
                 .await;
             if total > 0 {
                 if connected == total {
@@ -1016,16 +1019,12 @@ impl IocApplication {
 
         // Phase 2d: Build AutosaveManager from startup config
         let autosave_manager = if let Some(builder) = builder_opt {
-            match builder.build().await {
-                Ok(mgr) => {
-                    eprintln!("autosave: {} save set(s) configured", mgr.set_names().len());
-                    Some(Arc::new(mgr))
-                }
-                Err(e) => {
-                    eprintln!("autosave: failed to build manager: {e}");
-                    None
-                }
-            }
+            // `build` cannot fail: a set it could not construct is reported
+            // on the error log and carried as that set's error status, so
+            // one bad `.req` file no longer costs the IOC every other set.
+            let mgr = builder.build().await;
+            eprintln!("autosave: {} save set(s) configured", mgr.set_names().len());
+            Some(Arc::new(mgr))
         } else {
             None
         };
@@ -1292,12 +1291,15 @@ async fn wire_subroutines(db: &PvDatabase, registry: &HashMap<String, Arc<Subrou
                         }
                     }
                 }
+                // C `init_record`'s `prec->sadr = registryFunctionFind(...)`,
+                // assigned whatever the lookup returned. Unconditional so the
+                // invariant "`subroutine` is the resolution of the current
+                // SNAM" holds by construction rather than by this field
+                // happening to start out `None`.
                 if let Some(crate::types::EpicsValue::String(snam)) =
                     instance.record.get_field("SNAM")
                 {
-                    if let Some(sub_fn) = registry.get(snam.as_str_lossy().as_ref()) {
-                        instance.subroutine = Some(sub_fn.clone());
-                    }
+                    instance.subroutine = registry.get(snam.as_str_lossy().as_ref()).cloned();
                 }
             }
         }
@@ -1388,7 +1390,7 @@ pub(crate) async fn setup_io_intr(db: Arc<PvDatabase>) -> usize {
             let db_clone = db.clone();
             let rec_name = name.clone();
             let rec_arc_clone = rec_arc.clone();
-            crate::runtime::task::spawn(async move {
+            crate::runtime::task::spawn_background(async move {
                 while intr_rx.recv().await.is_some() {
                     // Process if the device drives SCAN-independently,
                     // or the record is still on I/O Intr scan.
@@ -1442,7 +1444,7 @@ pub(crate) async fn setup_property_posts(db: Arc<PvDatabase>) -> usize {
                 if let Some(mut rx) = dev.property_post_receiver() {
                     let db_clone = db.clone();
                     let rec_name = name.clone();
-                    crate::runtime::task::spawn(async move {
+                    crate::runtime::task::spawn_background(async move {
                         // Each message is the full setEnums field block; post
                         // it DBE_PROPERTY so clients re-read the choices.
                         while let Some(fields) = rx.recv().await {

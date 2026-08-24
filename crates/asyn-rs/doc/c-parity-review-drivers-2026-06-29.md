@@ -58,7 +58,7 @@ impact paragraphs in the round report
 | DRV-8 | DOC | ip_port.rs:861-866,665-667 | drvAsynIPPort.c:525-534,915-947 | `noDelay` is a non-C option key (C has none, sets TCP_NODELAY unconditionally) — KEPT, intentional extension (see Fix Log) |
 | DRV-9 | CLEARED | ip_port.rs:916-945 | drvAsynIPPort.c:902-906,941-945 | setOption/getOption accept+echo arbitrary unknown keys; C closes dispatch (asynError) — FIXED (F4, see Fix Log) |
 | DRV-10 | CLEARED | ip_port.rs:867-869 | drvAsynIPPort.c:924-935 | `disconnectOnReadTimeout` parse accepts extra values, never errors (C: only Y/N) — FIXED (see Fix Log) |
-| DRV-11 | CLEARED | ip_port.rs:264,792-794 | drvAsynIPPort.c:741-743,799 | `timeout==0` read → Duration::ZERO rejected by std → misclassified, disconnects (C floors to 1ms poll); missing `timeout>0` disconnect guard — FIXED a092a777; convergence bff0263d (read EINTR non-fatal + zero-timeout write deadline floor) |
+| DRV-11 | CLEARED | ip_port.rs:264,792-794 | drvAsynIPPort.c:775-777,798 | `timeout==0` read → Duration::ZERO rejected by std → misclassified, disconnects (C floors to 1ms poll); missing `timeout>0` disconnect guard — FIXED a092a777; convergence bff0263d (read EINTR non-fatal + zero-timeout write deadline floor) |
 | DRV-12 | CLEARED | ip_port.rs:661-731 | drvAsynIPPort.c:424-427 | `connect()` doesn't reject already-open link (C: "Link already open!") — FIXED (F6, see Fix Log) |
 | DRV-13 | DOC | ip_port.rs:92,109,553,575 | drvAsynIPPort.c:513-523 | hardcoded 5s connect timeout where C connect is OS-default blocking — intentional divergence, documented b2938e11 |
 | DRV-14 | CLEARED | ip_port.rs:368-371 | drvAsynIPPort.c:613-614 | zero-length write emits an empty UDP datagram; C returns before sending — FIXED (see Fix Log) |
@@ -817,7 +817,7 @@ remain OPEN for sign-off (octet-interface interrupt subsystem).
 
 - **DRV-11** (CONCERN — `timeout==0` socket timeout) — CLEARED a092a777.
   Two clauses, one defect family. (a) C `readRaw`/`writeRaw` floor
-  `(int)(timeout*1000)==0` to a 1 ms poll (drvAsynIPPort.c:741-743 / 615-617);
+  `(int)(timeout*1000)==0` to a 1 ms poll (drvAsynIPPort.c:775-777 / 649-651);
   std rejects a zero `Duration` in `set_read_timeout`/`set_write_timeout`
   (`InvalidInput`), so a `timeout == 0` poll request hard-errored on the
   client read/write paths, and the server-mode reads skipped the setter
@@ -846,7 +846,7 @@ remain OPEN for sign-off (octet-interface interrupt subsystem).
   `classify_read_error` as the single owner of read-error classification,
   mapping `Interrupted` onto the same non-fatal `Timeout` path as
   `WouldBlock`, and collapsed the three duplicated TCP/UDP/Unix Err arms.
-  (b') zero-timeout write deadline defeated. C writeRaw:615-617 floors the
+  (b') zero-timeout write deadline defeated. C writeIt:649-651 floors the
   zero timeout to a 1 ms poll then attempts the send, so a `timeout == 0`
   write of a writable socket succeeds; the Rust write path floored
   `set_write_timeout` but built the retry deadline from the raw

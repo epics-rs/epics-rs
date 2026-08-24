@@ -468,6 +468,27 @@ impl PortDriverBase {
         self.connected = Connection::Shared(cell);
     }
 
+    /// C `asynPrint(pasynUserSelf, mask, ...)` — the port's own diagnostic
+    /// channel, gated by this port's trace mask and routed to this port's
+    /// trace file.
+    ///
+    /// Public because the drivers that need it are not all in this crate. C's
+    /// drivers are separate modules too (`drvModbusAsyn.cpp`,
+    /// `drvAsynIPPort.c`) and every one of them reports a fault it cannot
+    /// return — a poller has no caller to return to — by `asynPrint`ing it at
+    /// `ASYN_TRACE_ERROR`. With the [`TraceManager`] reachable only inside
+    /// this crate, an out-of-crate driver had no way to say anything at all,
+    /// and the failures it could not return became silent.
+    ///
+    /// A port whose services were never bound has no trace manager and the
+    /// call is a no-op; that is the same port that has no trace file to write
+    /// to and no mask to consult.
+    pub fn trace_print(&self, mask: crate::trace::TraceMask, msg: &str) {
+        if let Some(trace) = &self.trace {
+            trace.output(&self.port_name, mask, msg);
+        }
+    }
+
     /// Single owner-API for the port-level `connected` transition.
     ///
     /// C parity: `exceptionConnect` (asynManager.c:2151-2160) and

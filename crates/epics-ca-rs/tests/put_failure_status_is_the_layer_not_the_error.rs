@@ -1,12 +1,12 @@
 //! The CA status of a refused put is decided by the LAYER that refused it,
 //! never by which database error came back.
 //!
-//! C `write_action` (`rsrv/camessage.c:781-789`) answers a failed
+//! C `write_action` (`rsrv/camessage.c:804-820`) answers a failed
 //! `dbChannel_put` with `ECA_PUTFAIL` whatever `dbStatus` was, and
-//! `write_notify_reply` (`camessage.c:1386-1391`) maps every
+//! `write_notify_reply` (`camessage.c:1417-1421`) maps every
 //! `status != notifyOK` to that same `ECA_PUTFAIL`. `ECA_BADTYPE` is
 //! produced only by the gates ABOVE the put — the DBR-type check and
-//! `caNetConvert` (`camessage.c:753`) — which run before the database is
+//! `caNetConvert` (`camessage.c:784-790`) — which run before the database is
 //! touched and tear the connection down.
 //!
 //! Measured on the C softIoc (`softIoc -S -d`, `record(ai,"MEAS:A") {}`):
@@ -109,7 +109,7 @@ async fn a_value_the_field_refuses_is_putfail_not_badtype() {
         assert_eq!(
             eca, ECA_PUTFAIL,
             ".{field} <- {value:?}: C `write_action` answers every failed \
-             dbChannel_put with ECA_PUTFAIL (camessage.c:781-789)"
+             dbChannel_put with ECA_PUTFAIL (camessage.c:804-820)"
         );
     }
 

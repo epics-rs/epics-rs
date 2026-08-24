@@ -91,11 +91,11 @@ impl EventMask {
         (self.0 & other.0) != 0
     }
 
-    pub fn bits(self) -> u16 {
+    pub const fn bits(self) -> u16 {
         self.0
     }
 
-    pub fn from_bits(bits: u16) -> Self {
+    pub const fn from_bits(bits: u16) -> Self {
         Self(bits)
     }
 }
@@ -172,6 +172,16 @@ pub struct AlarmResetResult {
 }
 
 /// Set new alarm severity if it's higher than current nsta/nsev.
+///
+/// Returns C's `int` result (`recGbl.c:254`/`:256`): TRUE only when
+/// `prec->nsev < new_sevr` actually raised the pending state. That return
+/// is not decoration — it is the gate on every hysteresis latch in the
+/// tree (`if (recGblSetSevr(...)) prec->lalm = alev;`, `aiRecord.c:404-406`
+/// and its siblings). A level that fires but LOSES the severity compare
+/// must not move `LALM`, or the next cycle's
+/// `lalm == alev && val >= alev - hyst` clause re-fires an alarm C never
+/// armed. Callers wanting only the side effect ignore it, as C's do.
+///
 /// Matches EPICS `recGblSetSevr` (recGbl.c:258-261): `recGblSetSevr`
 /// delegates to `recGblSetSevrMsg(..., NULL)` → `recGblSetSevrVMsg`
 /// with `msg == NULL`. When the new severity raises the pending
@@ -182,13 +192,15 @@ pub struct AlarmResetResult {
 /// no-message alarm raises the record severity; otherwise the
 /// record's final `amsg` carries an unrelated upstream record's
 /// alarm text.
-pub fn rec_gbl_set_sevr(common: &mut CommonFields, stat: u16, sevr: AlarmSeverity) {
+pub fn rec_gbl_set_sevr(common: &mut CommonFields, stat: u16, sevr: AlarmSeverity) -> bool {
     if (sevr as u16) > (common.nsev as u16) {
         common.nsta = stat;
         common.nsev = sevr;
         // C `msg == NULL` branch clears the pending message.
         common.namsg.clear();
+        return true;
     }
+    false
 }
 
 /// `rec_gbl_set_sevr` for a severity that is a **raw menu ordinal**, comparing
@@ -211,31 +223,38 @@ pub fn rec_gbl_set_sevr(common: &mut CommonFields, stat: u16, sevr: AlarmSeverit
 /// `recGblResetAlarms` (recGbl.c:188), and this stores the clamped
 /// [`AlarmSeverity`] so both sides show `INVALID`. `raw_sevr == 0` is a no-op
 /// (NO_ALARM never raises), matching C's `recGblSetSevr(.., 0)`.
-pub fn rec_gbl_set_sevr_raw(common: &mut CommonFields, stat: u16, raw_sevr: u16) {
+///
+/// Returns the raise, same as [`rec_gbl_set_sevr`].
+pub fn rec_gbl_set_sevr_raw(common: &mut CommonFields, stat: u16, raw_sevr: u16) -> bool {
     if raw_sevr > (common.nsev as u16) {
         common.nsta = stat;
         common.nsev = AlarmSeverity::from_u16(raw_sevr);
         // C `msg == NULL` branch clears the pending message.
         common.namsg.clear();
+        return true;
     }
+    false
 }
 
 /// Set new alarm severity AND attach an alarm message (epics-base PR
 /// #568 `recGblSetSevrMsg`). Same "raise only" rule as `rec_gbl_set_sevr`;
 /// when the new severity raises the pending state, both `nsta`/`nsev`
 /// AND `namsg` are written together. Empty `msg` clears the pending
-/// message — non-empty replaces it.
+/// message — non-empty replaces it. Returns the raise, same as
+/// [`rec_gbl_set_sevr`].
 pub fn rec_gbl_set_sevr_msg(
     common: &mut CommonFields,
     stat: u16,
     sevr: AlarmSeverity,
     msg: impl Into<String>,
-) {
+) -> bool {
     if (sevr as u16) > (common.nsev as u16) {
         common.nsta = stat;
         common.nsev = sevr;
         common.namsg = msg.into();
+        return true;
     }
+    false
 }
 
 /// C `setLinkAlarm` (dbLink.c:318-323) — **the single owner of "a link
@@ -384,9 +403,15 @@ pub fn udf_alarm_active(udf: u8, exact_one: bool) -> bool {
     if exact_one { udf == 1 } else { udf != 0 }
 }
 
-/// Check UDF alarm: if record is still undefined, raise UDF_ALARM with UDFS
-/// severity. `exact_one` selects C's `udf == TRUE` semantics (see
+/// Check UDF alarm: if record is still undefined, raise UDF_ALARM.
+/// `exact_one` selects C's `udf == TRUE` semantics (see
 /// [`udf_alarm_active`]); pass the record's [`crate::server::record::Record::udf_alarm_on_exact_one`].
+///
+/// `severity` is the record's fixed severity
+/// ([`crate::server::record::Record::udf_alarm_severity`]); `None` — the case
+/// for 19 of the 21 raise sites in `std/rec` — means the record's live `UDFS`
+/// field, which stays readable here rather than being pre-baked by the caller.
+/// This is the only place `UDFS` is consulted for a UDF raise.
 ///
 /// `msg` is the record's alarm message ([`crate::server::record::Record::udf_alarm_message`]).
 /// Almost every base record raises UDF via plain
@@ -395,12 +420,17 @@ pub fn udf_alarm_active(udf: u8, exact_one: bool) -> bool {
 /// `""` for them, and PVA then serves the `"UDF"` condition string
 /// (`iocsource.cpp:230-236`). Only `mbboDirectRecord.c:191` passes a
 /// literal (`"UDFS"`).
-pub fn rec_gbl_check_udf(common: &mut CommonFields, exact_one: bool, msg: &str) {
+pub fn rec_gbl_check_udf(
+    common: &mut CommonFields,
+    exact_one: bool,
+    severity: Option<AlarmSeverity>,
+    msg: &str,
+) {
     if udf_alarm_active(common.udf, exact_one) {
         rec_gbl_set_sevr_msg(
             common,
             alarm_status::UDF_ALARM,
-            AlarmSeverity::from_u16(common.udfs as u16),
+            severity.unwrap_or_else(|| AlarmSeverity::from_u16(common.udfs as u16)),
             msg,
         );
     }
@@ -420,32 +450,21 @@ pub fn rec_gbl_check_udf(common: &mut CommonFields, exact_one: bool, msg: &str) 
 /// `devTimeOfDay.c` `recGblGetTimeStamp(psi)` call, before the
 /// record-level application runs) route through here, so the two never
 /// drift.
-pub fn get_time_stamp(tse: i16, device_time: std::time::SystemTime) -> std::time::SystemTime {
-    match tse {
-        0 => {
-            // generalTime current time (default behavior).
-            // C EPICS recGblGetTimeStamp sets TIME on every process.
-            crate::runtime::general_time::get_current()
-        }
-        -1 => {
-            // C `epicsTimeEventBestTime` (epicsTime.h:103). The C path
-            // calls `epicsTimeGetEvent(-1)` unconditionally, which routes
-            // to `generalTimeGetEventPriority(-1)` — the BestTime ratchet
-            // across current-time providers. Device time is signalled by
-            // TSE=-2 (`epicsTimeEventDeviceTime`), not TSE=-1.
-            crate::runtime::general_time::get_event(-1)
-        }
-        -2 => {
-            // `epicsTimeEventDeviceTime` (epicsTime.h:104). Device support
-            // has already written the time; leave it alone (C recGbl.c:333-343
-            // also skips the assignment).
-            device_time
-        }
-        _ => {
-            // Positive event number — event providers via generalTime.
-            crate::runtime::general_time::get_event(tse as i32)
-        }
+pub fn get_time_stamp(
+    tse: i16,
+    device_time: std::time::SystemTime,
+) -> Option<std::time::SystemTime> {
+    if tse == crate::server::record::EPICS_TIME_EVENT_DEVICE_TIME {
+        // `epicsTimeEventDeviceTime` (epicsTime.h:104). Device support has
+        // already written the time; C recGbl.c:323-341 makes this the only
+        // TSE that does not go through `epicsTimeGetEvent`.
+        return Some(device_time);
     }
+    // Every other TSE is one C call — `epicsTimeGetEvent(&prec->time,
+    // prec->tse)` — including 0 and -1, which it dispatches itself. `None`
+    // is C's non-zero status: `prec->time` keeps its old value and
+    // `recGblGetTimeStampSimm` errlogs (recGbl.c:324-328).
+    crate::runtime::general_time::get_event(tse as i32)
 }
 
 /// C's `getMaxRangeValues` (`recGbl.c:372-419`) — the DBF-type numeric range a
@@ -852,7 +871,7 @@ mod tests {
     fn test_check_udf() {
         let mut common = CommonFields::default();
         assert!(common.udf != 0);
-        rec_gbl_check_udf(&mut common, false, "");
+        rec_gbl_check_udf(&mut common, false, None, "");
         assert_eq!(common.nsev, AlarmSeverity::Invalid);
         assert_eq!(common.nsta, alarm_status::UDF_ALARM);
         // C's plain `recGblSetSevr(UDF_ALARM)` forwards a NULL message and
@@ -866,7 +885,7 @@ mod tests {
         let mut common = CommonFields::default();
         assert!(common.udf != 0);
         common.udfs = AlarmSeverity::Minor as i16;
-        rec_gbl_check_udf(&mut common, false, "");
+        rec_gbl_check_udf(&mut common, false, None, "");
         assert_eq!(common.nsev, AlarmSeverity::Minor);
         assert_eq!(common.nsta, alarm_status::UDF_ALARM);
     }
@@ -886,7 +905,7 @@ mod tests {
 
         let mut common = CommonFields::default();
         common.udf = 255;
-        rec_gbl_check_udf(&mut common, true, "");
+        rec_gbl_check_udf(&mut common, true, None, "");
         assert_eq!(common.nsev, AlarmSeverity::NoAlarm);
         assert_eq!(common.nsta, alarm_status::NO_ALARM);
     }

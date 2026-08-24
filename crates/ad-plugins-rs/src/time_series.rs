@@ -311,8 +311,18 @@ impl TimeSeriesPortDriver {
         );
 
         // NDPluginBase params (NDTimeSeries.template includes NDPluginBase.template)
-        let _ = ad_core_rs::params::ndarray_driver::NDArrayDriverParams::create(&mut base);
+        let nd_params =
+            ad_core_rs::params::ndarray_driver::NDArrayDriverParams::create(&mut base).unwrap();
         let _ = ad_core_rs::plugin::params::PluginBaseParams::create(&mut base);
+        // C++ `NDPluginTimeSeries` derives from `NDPluginDriver` and so runs
+        // the `asynNDArrayDriver` constructor's read-only block; without it
+        // every NDPluginBase read-back this port serves reads back
+        // uninitialized. The four pool statistics stay unwritten: this port
+        // owns no `NDArrayPool`, and publishing zeros for a pool that does not
+        // exist would be inventing state rather than reporting it.
+        let _ = ad_core_rs::driver::ndarray_driver::init_read_only_params(
+            &mut base, &nd_params, port_name,
+        );
 
         // Register control params
         let ts_acquire = base.create_param("TS_ACQUIRE", ParamType::Int32).unwrap();
@@ -824,6 +834,49 @@ mod tests {
         assert_eq!(driver.base().port_name, "TEST_TS");
         assert_eq!(driver.num_channels, 3);
         assert!(!driver.base().flags.multi_device);
+    }
+
+    #[test]
+    fn test_ts_port_driver_seeds_the_c_read_only_block() {
+        // C++ `NDPluginTimeSeries` derives from `NDPluginDriver` and so from
+        // `asynNDArrayDriver`, whose constructor seeds
+        // asynNDArrayDriver.cpp:954-1005. This port serves the
+        // NDPluginBase.template records that NDTimeSeries.template pulls in,
+        // so an unseeded read-back leaves them UDF/INVALID for the life of
+        // the IOC. Read through the strict getters, as a record does.
+        let shared = Arc::new(Mutex::new(SharedTsState::new(3, 100)));
+        let driver = TimeSeriesPortDriver::new("TEST_TS", &TEST_CHANNELS, 100, shared);
+        let base = driver.base();
+        for (name, want) in [
+            ("ARRAY_SIZE_X", 0),
+            ("ARRAY_COUNTER", 0),
+            ("COLOR_MODE", ad_core_rs::color::NDColorMode::Mono as i32),
+            (
+                "ND_ATTRIBUTES_STATUS",
+                ad_core_rs::driver::ndarray_driver::ATTR_STATUS_FILE_NOT_FOUND,
+            ),
+            ("NUM_QUEUED_ARRAYS", 0),
+        ] {
+            let index = base
+                .find_param(name)
+                .unwrap_or_else(|| panic!("{name} missing"));
+            assert_eq!(
+                base.get_int32_param_strict(index, 0)
+                    .unwrap_or_else(|e| panic!("{name} unset after construction: {e:?}")),
+                want,
+                "{name}"
+            );
+        }
+        let template = base.find_param("FILE_TEMPLATE").unwrap();
+        assert_eq!(
+            base.get_string_param_strict(template, 0).unwrap(),
+            "%s%s_%3.3d.dat"
+        );
+        let self_name = base.find_param("PORT_NAME_SELF").unwrap();
+        assert_eq!(
+            base.get_string_param_strict(self_name, 0).unwrap(),
+            "TEST_TS"
+        );
     }
 
     #[test]

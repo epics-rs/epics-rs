@@ -23,21 +23,8 @@ fn env_key() -> &'static str {
     }
 }
 
-fn tls_pvxs_root() -> Option<PathBuf> {
-    let home = std::env::var("HOME").unwrap_or_default();
-    let root = PathBuf::from(&home).join("codes/pvxs-tls");
-    if root
-        .join("bin")
-        .join(super::interop_helpers::pvxs_arch())
-        .is_dir()
-    {
-        return Some(root);
-    }
-    None
-}
-
 fn locate_tls_binary(name: &str) -> Option<PathBuf> {
-    tls_pvxs_root().and_then(|r| {
+    super::interop_helpers::pvxs_tls_home().and_then(|r| {
         let p = r
             .join("bin")
             .join(super::interop_helpers::pvxs_arch())
@@ -47,13 +34,14 @@ fn locate_tls_binary(name: &str) -> Option<PathBuf> {
 }
 
 fn tls_lib_dir() -> Option<PathBuf> {
-    tls_pvxs_root().map(|r| r.join("lib").join(super::interop_helpers::pvxs_arch()))
+    super::interop_helpers::pvxs_tls_home()
+        .map(|r| r.join("lib").join(super::interop_helpers::pvxs_arch()))
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn interop_tls_mtls_pvxget_with_client_cert_to_rust_server() {
     let Some(pvxget) = locate_tls_binary("pvxget") else {
-        eprintln!("SKIP: no TLS-enabled pvxs at ~/codes/pvxs-tls (see batch 12)");
+        eprintln!("SKIP: no TLS-enabled pvxs (set PVXS_TLS_HOME; see batch 12)");
         return;
     };
     let Some(lib) = tls_lib_dir() else {

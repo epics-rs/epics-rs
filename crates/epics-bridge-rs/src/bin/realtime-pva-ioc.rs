@@ -94,8 +94,11 @@
 //! source is read straight off the database.
 //!
 //! QSRV2 answers to `PVXS_QSRV_ENABLE` / `EPICS_IOC_IGNORE_SERVERS=qsrv2` here
-//! exactly as it does in a C IOC (pvxs `enable2()`, `ioc/iochooks.cpp:401-448`);
-//! the decision is printed at startup.
+//! exactly as it does in a C IOC (pvxs `enable2()`, `ioc/iochooks.cpp:401-448`),
+//! and it covers the same three facilities C gates in one `if(enableQ)`
+//! (`ioc/iochooks.cpp:485-496`): with QSRV2 off this IOC serves no single
+//! record, no `Q:group` PV and resolves no `pva://` link — the server comes up
+//! and answers nothing. The decision is printed at startup.
 //!
 //! There is no shutdown command: like a C IOC on RTEMS this runs until the
 //! board is reset. The interactive iocsh is host-only, so it is not wired here.
@@ -289,9 +292,7 @@ mod ioc {
     use epics_base_rs::server::ioc_builder::IocBuilder;
     use epics_base_rs::server::status_pv::{StatusPv, serve_status_pvs, target_status_pvs};
     use epics_base_rs::types::EpicsValue;
-    use epics_bridge_rs::pvalink::install_pvalink_resolver;
     use epics_bridge_rs::qsrv::{QsrvMount, build_qsrv_mount};
-    use epics_pva_rs::server::PvDatabaseSource;
     use epics_pva_rs::server_native::blocking::{BlockingPvaServer, bind_udp_search};
     use epics_pva_rs::server_native::composite::CompositeSource;
     use epics_pva_rs::server_native::config::PvaServerConfig;
@@ -633,13 +634,17 @@ mod ioc {
             }
         };
 
-        // (2c) The pvalink resolver: install the pva:// external record-link
-        //      resolver on the database so `INP=pva://...` / `OUT=pva://...`
-        //      fields resolve. C does the equivalent at `pvalink_enable()`
-        //      (ioc/iochooks.cpp:495) during iocInit, after the database exists.
-        //      Installed here — after the database and the QSRV mount, before the
-        //      PVA front-end — so every record's link fields are pre-registered
-        //      before the server answers its first client.
+        // (2c) Everything the QSRV2 enable decision turns on, through the one
+        //      owner that turns all of it on together: the `qsrvSingle`
+        //      database source, the `qsrvGroup` QSRV store, and the pva://
+        //      external record-link resolver so `INP=pva://...` /
+        //      `OUT=pva://...` fields resolve. C runs its three equivalents as
+        //      three statements inside one `if(enableQ)` during iocInit
+        //      (`ioc/iochooks.cpp:485-496`), after the database exists. Run
+        //      here — after the database and the QSRV mount, before the PVA
+        //      front-end and before scanning starts — so every record's link
+        //      fields are pre-registered before the first client and before the
+        //      first scan pass.
         //
         //      On this target the PVA client reaches upstream servers over TCP
         //      name servers alone (`EPICS_PVA_NAME_SERVERS`): the UDP SEARCH
@@ -648,9 +653,18 @@ mod ioc {
         //      callback pool `background_init` started above via
         //      `runtime::task::spawn`, never a tokio runtime. `link_count` is the
         //      number of pva:// links pre-registered from the loaded database.
-        let resolver = block_on_sync(install_pvalink_resolver(&db))
-            .expect("the RTEMS entry point runs on a plain thread with no runtime entered");
-        let link_count = resolver.link_count();
+        let composite = CompositeSource::new();
+        let sources = match block_on_sync(mount.install_sources(&db, &composite))
+            .expect("the RTEMS entry point runs on a plain thread with no runtime entered")
+        {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("realtime-pva-ioc: cannot register the QSRV2 sources: {e}");
+                return ExitCode::FAILURE;
+            }
+        };
+        let resolver = sources.pvalink;
+        let link_count = resolver.as_ref().map_or(0, |r| r.link_count());
 
         // (2b) Periodic scan + PINI. C `iocInit` owns `scanInit` (`dbScan.c`)
         //      independent of any network server; without this step every
@@ -682,29 +696,12 @@ mod ioc {
         let config = PvaServerConfig::default().with_env();
         let (tcp_port, udp_port, bind_ip) = (config.tcp_port, config.udp_port, config.bind_ip);
 
-        //     Two sources under one server, with pvxs's own names and orders:
-        //     `qsrvSingle` at 0 (`ioc/singlesourcehooks.cpp:159`) and
-        //     `qsrvGroup` at 1 (`ioc/groupsourcehooks.cpp:219`), "lower order
-        //     first". Single records resolve on the database source; a group
-        //     PV is not in the database under its own name, so it falls
-        //     through to the QSRV store. The status PVs registered below are
-        //     ordinary records, so they answer from order 0.
-        let composite = CompositeSource::new();
-        if let Err(e) =
-            composite.add_source("qsrvSingle", Arc::new(PvDatabaseSource::new(db.clone())), 0)
-        {
-            eprintln!("realtime-pva-ioc: cannot register the single-record source: {e}");
-            return ExitCode::FAILURE;
-        }
-        // Only when QSRV2 is enabled, matching pvxs calling `group_enable()`
-        // solely inside `if(enableQ)` (`ioc/iochooks.cpp:492-496`). Disabled,
-        // the IOC still serves every single record — it just answers no group.
-        if mount.enabled {
-            if let Err(e) = composite.add_source("qsrvGroup", mount.store.clone(), 1) {
-                eprintln!("realtime-pva-ioc: cannot register the QSRV group source: {e}");
-                return ExitCode::FAILURE;
-            }
-        }
+        //     The sources went onto `composite` at step (2c), under pvxs's
+        //     own names and orders: single records resolve on the database
+        //     source at 0, and a group PV — not in the database under its own
+        //     name — falls through to the QSRV store at 1. The status PVs
+        //     registered below are ordinary records, so they answer from
+        //     order 0, and with QSRV2 disabled they do not answer at all.
 
         let server =
             match BlockingPvaServer::bind(SocketAddr::new(bind_ip, tcp_port), composite, config) {
@@ -837,28 +834,29 @@ mod ioc {
             guid_hex(server.guid()),
         );
         println!(
-            "realtime-pva-ioc: QSRV2 {} — sources: qsrvSingle(0){}",
-            if mount.enabled { "ENABLED" } else { "disabled" },
+            "realtime-pva-ioc: QSRV2 {}",
             if mount.enabled {
-                ", qsrvGroup(1)"
+                "ENABLED — sources: qsrvSingle(0), qsrvGroup(1)"
             } else {
-                " only (set PVXS_QSRV_ENABLE=YES for groups)"
+                "disabled — nothing mounted: this IOC answers no record and no \
+                 group and resolves no pva:// link (set PVXS_QSRV_ENABLE=YES)"
             },
         );
-        // The pvalink resolver is mounted, so `pva://...` INP/OUT links
-        // resolve. Reported at every boot — including `link_count == 0`, when
-        // the loaded database configured none — because on a target with no
-        // shell the console is the only place an operator can confirm the
-        // resolver came up and how many links it pre-registered. The client
-        // reaches upstream servers both ways now: UDP SEARCH broadcast to the
-        // interfaces' own destinations, and any `EPICS_PVA_NAME_SERVERS` over
-        // TCP.
-        println!(
-            "realtime-pva-ioc: pvalink resolver installed — {link_count} pva:// record \
-             link{} pre-registered; pva://... INP/OUT resolve over UDP SEARCH \
-             broadcast and EPICS_PVA_NAME_SERVERS (TCP)",
-            if link_count == 1 { "" } else { "s" },
-        );
+        // The pvalink resolver, when the QSRV2 gate mounted one. Reported at
+        // every boot — including `link_count == 0`, when the loaded database
+        // configured none — because on a target with no shell the console is
+        // the only place an operator can confirm the resolver came up and how
+        // many links it pre-registered. The client reaches upstream servers
+        // both ways now: UDP SEARCH broadcast to the interfaces' own
+        // destinations, and any `EPICS_PVA_NAME_SERVERS` over TCP.
+        if resolver.is_some() {
+            println!(
+                "realtime-pva-ioc: pvalink resolver installed — {link_count} pva:// record \
+                 link{} pre-registered; pva://... INP/OUT resolve over UDP SEARCH \
+                 broadcast and EPICS_PVA_NAME_SERVERS (TCP)",
+                if link_count == 1 { "" } else { "s" },
+            );
+        }
         for name in &names {
             println!("realtime-pva-ioc: {name}");
         }
@@ -868,10 +866,11 @@ mod ioc {
         // is the `rt top` / `rt stackuse` reading criterion 6 asks for on a
         // target that starts no shell. Its own thread with a stated stack
         // class, like every other thread this entry point starts.
+        // The report reads the pvalink resolver, which exists only when
+        // QSRV2 is enabled; with it off there is nothing here to report.
         #[cfg(feature = "bringup-probes")]
-        {
+        if let Some(probe_resolver) = resolver.clone() {
             let probe_db = db.clone();
-            let probe_resolver = resolver.clone();
             println!(
                 "STAGE5 probe: EPICS_PVA_NAME_SERVERS={} (compiled in), reporting every 10 s",
                 STAGE5_NAME_SERVER,
@@ -906,6 +905,10 @@ mod ioc {
                 Ok(_) => {}
                 Err(e) => eprintln!("STAGE5 probe: cannot start the reporter thread: {e}"),
             }
+        } else {
+            println!(
+                "STAGE5 probe: not started \u{2014} QSRV2 is disabled, so this IOC has no pvalink resolver"
+            );
         }
 
         // Runs until the board is reset: an IOC has no self-shutdown path on
@@ -1270,70 +1273,43 @@ mod tests {
         );
     }
 
-    /// The QSRV group source is mounted, under pvxs's names and orders.
+    /// Every QSRV2 facility is mounted through the one gated owner, and the
+    /// banner reports what came up.
     ///
-    /// This is the whole reason the binary moved crates. A regression that
-    /// dropped the second `add_source` would leave an IOC that still boots,
-    /// still serves every single record, still answers searches and still
-    /// passes every other guard here — and silently serves no `Q:group` PV at
-    /// all. There is no shell on the target to notice.
+    /// This is the whole reason the binary moved crates. The three facilities
+    /// C turns on together in one `if(enableQ)` — the single-record source,
+    /// the group source and the pvalink resolver — are mounted here by one
+    /// call to `QsrvMount::install_sources`. A regression that opened any of
+    /// them back up at this call site would leave an IOC that still boots,
+    /// still answers searches and still passes every other guard here, while
+    /// serving a facility a C IOC with the same environment does not. There
+    /// is no shell on the target to notice, so the call-site shape is
+    /// asserted directly: no `add_source` of its own, and the banner lines an
+    /// operator reads instead of a shell.
     #[test]
-    fn the_group_source_is_mounted_at_the_pvxs_order() {
+    fn the_qsrv2_facilities_are_mounted_through_the_one_gate() {
         let src = include_str!("realtime-pva-ioc.rs");
         let prod = match src.find("\n    #[cfg(test)]") {
             Some(i) => &src[..i],
             None => src,
         };
+        // `concat!` so these assertions cannot match their own source text.
         assert!(
-            prod.contains(concat!("add_", "source(\"qsrvSingle\"")),
-            "the single-record source is gone; single-record PVs would stop resolving"
+            prod.contains(concat!("install_", "sources(&db, &composite)")),
+            "the QSRV2 sources are no longer mounted through the one owner that \
+             gates all three together; single records, groups and pva:// links \
+             can drift apart again"
         );
         assert!(
-            prod.contains(concat!("add_", "source(\"qsrvGroup\"")),
-            "the QSRV group source is not mounted — this binary would boot, serve \
-             single records, and answer no Q:group PV, with no shell to say so"
-        );
-        // pvxs `singlesourcehooks.cpp:159` / `groupsourcehooks.cpp:219`: the
-        // orders are the resolution order, and swapping them changes which
-        // source answers a name both could claim.
-        let single = prod
-            .find(concat!("add_", "source(\"qsrvSingle\""))
-            .expect("the single source call site");
-        let group = prod
-            .find(concat!("add_", "source(\"qsrvGroup\""))
-            .expect("the group source call site");
-        assert!(
-            single < group,
-            "qsrvSingle must be registered at the lower order, as in pvxs"
+            !prod.contains(concat!("add_", "source(")),
+            "this entry point registers a source itself again — that is the split \
+             the shared owner exists to close, and the ungated half is invisible \
+             until a client asks"
         );
         assert!(
             prod.contains(concat!("build_qsrv_", "mount(")),
             "the group set must be built through the shared mount owner, which is \
              what finalizes it before the store exposing it exists"
-        );
-    }
-
-    /// The pvalink resolver is mounted, and the banner reports it.
-    ///
-    /// This is the stage-4 counterpart of the group-source guard: a regression
-    /// that dropped the `install_pvalink_resolver` call would leave an IOC that
-    /// still boots, still serves every record and still answers searches — and
-    /// silently resolves no `pva://...` INP/OUT link at all, with no shell on
-    /// the target to notice. The banner line is the only place an operator can
-    /// confirm from the console that the resolver came up and how many links it
-    /// pre-registered, so it is checked too.
-    #[test]
-    fn the_pvalink_resolver_is_mounted_and_the_banner_reports_it() {
-        let src = include_str!("realtime-pva-ioc.rs");
-        let prod = match src.find("\n    #[cfg(test)]") {
-            Some(i) => &src[..i],
-            None => src,
-        };
-        // `concat!` so this assertion cannot match its own source text.
-        assert!(
-            prod.contains(concat!("install_pvalink_", "resolver(&db)")),
-            "the pvalink resolver is no longer installed; pva://... record links \
-             would silently never resolve, and there is no shell on the target to say so"
         );
         assert!(
             prod.contains("pvalink resolver installed"),

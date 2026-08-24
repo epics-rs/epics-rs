@@ -9,7 +9,7 @@
 #![allow(clippy::approx_constant)]
 
 use epics_base_rs::server::recgbl::alarm_status;
-use epics_base_rs::server::record::{AlarmSeverity, CommonFields, Record};
+use epics_base_rs::server::record::{AlarmSeverity, CommonFields, ProcessAction, Record};
 use epics_base_rs::server::records::bi::BiRecord;
 use epics_base_rs::server::records::bo::BoRecord;
 use epics_base_rs::server::records::dfanout::DfanoutRecord;
@@ -145,11 +145,18 @@ fn bo_high_one_shot_resets_val() {
     rec.high = 0.5;
     let outcome = rec.process().unwrap();
     assert!(
-        !outcome.actions.is_empty(),
-        "HIGH>0 with VAL=1 schedules a reprocess"
+        outcome
+            .actions
+            .iter()
+            .any(|a| matches!(a, ProcessAction::DelayedCallbackAfter(_))),
+        "HIGH>0 with VAL=1 arms C's `callbackRequestDelayed` (boRecord.c:257-262)"
     );
-    // The scheduled reprocess drives VAL back to 0.
+    // The timer body, not a process cycle, is what drives VAL back to Done —
+    // `boRecord.c::myCallbackFunc:116` is the only writer of the one-shot's
+    // `prec->val = 0`. A plain reprocess must leave the pulse standing.
     rec.process().unwrap();
+    assert_eq!(rec.val, 1, "a process cycle cannot consume the one-shot");
+    rec.delayed_callback_fire(false);
     assert_eq!(rec.val, 0, "momentary bo returns to Done after HIGH");
 }
 

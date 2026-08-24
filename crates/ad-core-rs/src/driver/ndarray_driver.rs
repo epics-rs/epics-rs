@@ -6,8 +6,9 @@ use asyn_rs::port::{PortDriverBase, PortFlags};
 
 use crate::attributes::{
     EpicsPvAttributeSource, FunctionAttributeSource, NDAttrSource, NDAttrValue, NDAttribute,
-    NDAttributeFunctionRegistry, ParamAttributeSource,
+    NDAttributeFunctionRegistry, ParamAttributeSource, PvAttrDbrType,
 };
+use crate::color::NDColorMode;
 use crate::ndarray::NDArray;
 use crate::ndarray_pool::NDArrayPool;
 use crate::params::ndarray_driver::NDArrayDriverParams;
@@ -70,7 +71,9 @@ fn xml_attr<'a>(tag: &'a str, key: &str) -> Option<&'a str> {
 ///   parameter library (optional `addr` attribute, default 0).
 /// - `FUNCTION` → [`FunctionAttributeSource`], calling a function registered
 ///   in `registry` (optional `param` attribute passed to the function).
-/// - `EPICS_PV` → [`EpicsPvAttributeSource`], fed by a CA-monitor task.
+/// - `EPICS_PV` → [`EpicsPvAttributeSource`], carrying the `dbrtype` the
+///   monitor must publish as. Fed by a CA monitor once the port has a client —
+///   see [`NDArrayDriverBase::read_nd_attributes_file`].
 /// - `CONST` → static value carrying the literal `source` string.
 fn parse_attributes_xml(
     xml: &str,
@@ -100,8 +103,14 @@ fn parse_attributes_xml(
 
         let attr = match attr_type.to_ascii_uppercase().as_str() {
             "EPICS_PV" => {
-                // G10: a CA-monitor task feeds the cell; backend is pluggable.
-                let src = EpicsPvAttributeSource::new(source_str);
+                // C parses `dbrtype` here and returns asynError on a name that
+                // is not one of its nine (asynNDArrayDriver.cpp:421-436), so a
+                // typo fails the whole file rather than silently producing an
+                // attribute of the wrong type.
+                let dbrtype = xml_attr(tag, "dbrtype").unwrap_or("DBR_NATIVE");
+                let dbr_type = PvAttrDbrType::from_xml(dbrtype)
+                    .ok_or_else(|| format!("Attribute {name} unknown dbrType {dbrtype}"))?;
+                let src = EpicsPvAttributeSource::new(source_str, dbr_type);
                 NDAttribute::new_with_source(
                     name,
                     description,
@@ -355,6 +364,83 @@ pub(crate) fn write_array_params(
     Ok(())
 }
 
+/// Write the C++ `asynNDArrayDriver` constructor's "read-only parameters"
+/// block (`asynNDArrayDriver.cpp:954-1005`) onto a freshly created
+/// [`NDArrayDriverParams`].
+///
+/// C states the mechanism in the block's own comment: "If a value is not set
+/// here then the read request will return an error (uninitialized)". A param
+/// this port never writes reaches `get_int32_strict`
+/// (asyn-rs/src/port.rs:1663-1665) as `AsynError::ParamUndefined`, and the
+/// record it feeds sits UDF/INVALID for the life of the IOC unless something
+/// else happens to write it — which for the pure read-backs in this block is
+/// never. Every port that creates `NDArrayDriverParams` is an
+/// `asynNDArrayDriver` in C and therefore runs this block, so it lives here
+/// once rather than being re-typed in each constructor.
+///
+/// The four pool statistics (C `:1000-1003`) are deliberately absent: they
+/// belong to `refresh_pool_stats`, which is this port's single owner of
+/// them. A constructor that owns an [`NDArrayPool`] calls that immediately
+/// after this.
+pub fn init_read_only_params(
+    port_base: &mut PortDriverBase,
+    params: &NDArrayDriverParams,
+    port_name: &str,
+) -> AsynResult<()> {
+    port_base.set_string_param(params.port_name_self, 0, port_name.into())?;
+    // C `:961-966` publishes "ADCORE_VERSION.ADCORE_REVISION.
+    // ADCORE_MODIFICATION" into both strings. There is no ADCore in this
+    // workspace to take a version from, so both carry the `ad-core-rs` crate
+    // version, which is the same artefact's version for this port. C's
+    // comment at `:964-965` applies unchanged: a concrete driver overwrites
+    // DriverVersion after construction.
+    let version = env!("CARGO_PKG_VERSION");
+    port_base.set_string_param(params.ad_core_version, 0, version.into())?;
+    port_base.set_string_param(params.driver_version, 0, version.into())?;
+
+    port_base.set_int32_param(params.array_size_x, 0, 0)?;
+    port_base.set_int32_param(params.array_size_y, 0, 0)?;
+    port_base.set_int32_param(params.array_size_z, 0, 0)?;
+    port_base.set_int32_param(params.array_size, 0, 0)?;
+    port_base.set_int32_param(params.n_dimensions, 0, 0)?;
+    port_base.set_int32_param(params.color_mode, 0, NDColorMode::Mono as i32)?;
+    port_base.set_int32_param(params.unique_id, 0, 0)?;
+    port_base.set_float64_param(params.timestamp_rbv, 0, 0.0)?;
+    port_base.set_int32_param(params.epics_ts_sec, 0, 0)?;
+    port_base.set_int32_param(params.epics_ts_nsec, 0, 0)?;
+    port_base.set_int32_param(params.bayer_pattern, 0, 0)?;
+    port_base.set_int32_param(params.array_counter, 0, 0)?;
+
+    port_base.set_int32_param(params.write_file, 0, 0)?;
+    port_base.set_int32_param(params.read_file, 0, 0)?;
+    port_base.set_int32_param(params.capture, 0, 0)?;
+    port_base.set_int32_param(params.file_write_status, 0, 0)?;
+    port_base.set_string_param(params.file_write_message, 0, String::new())?;
+    port_base.set_string_param(params.file_path, 0, String::new())?;
+    port_base.set_string_param(params.file_name, 0, String::new())?;
+    port_base.set_int32_param(params.file_number, 0, 0)?;
+    port_base.set_int32_param(params.auto_increment, 0, 0)?;
+    // C `:986-987` explains why this one is not left to the database: it is a
+    // waveform record, and the waveform does not read the driver value at
+    // initialization.
+    port_base.set_string_param(params.file_template, 0, "%s%s_%3.3d.dat".into())?;
+    port_base.set_int32_param(params.num_captured, 0, 0)?;
+    port_base.set_int32_param(params.free_capture, 0, 0)?;
+    port_base.set_int32_param(params.create_dir, 0, 0)?;
+    port_base.set_string_param(params.temp_suffix, 0, String::new())?;
+
+    port_base.set_string_param(params.attributes_file, 0, String::new())?;
+    // C `:997`. A port that has not loaded an attribute file reports "File
+    // not found", not OK: `readNDAttributesFile` returns early on an empty
+    // name without touching the status (asynNDArrayDriver.cpp:327), so this
+    // is the value an IOC with no attributes file actually reads.
+    port_base.set_int32_param(params.attributes_status, 0, ATTR_STATUS_FILE_NOT_FOUND)?;
+    port_base.set_string_param(params.attributes_macros, 0, String::new())?;
+
+    port_base.set_int32_param(params.num_queued_arrays, 0, 0)?;
+    Ok(())
+}
+
 /// Refresh the pool-statistics parameters (`POOL_MAX_MEMORY`,
 /// `POOL_USED_MEMORY`, `POOL_ALLOC_BUFFERS`, `POOL_FREE_BUFFERS`) from a pool.
 ///
@@ -431,6 +517,27 @@ pub(crate) fn handle_pool_write_int32(
 }
 
 /// Base state for asynNDArrayDriver (file handling, attribute mgmt, pool).
+/// The CA monitor tasks feeding the current `EPICS_PV` attribute set.
+///
+/// Dropping this aborts every task it holds, and the only way to install a new
+/// set is to overwrite the field, so a monitor cannot outlive the attribute
+/// whose [`crate::attributes::LiveValueCell`] it writes into. Every path that
+/// replaces the attribute list -- a fresh `NDAttributesFile`, a file that
+/// cannot be opened, XML that does not parse -- goes through
+/// `NDArrayDriverBase::clear_attributes`, which replaces both together.
+#[cfg(feature = "ioc")]
+#[derive(Default)]
+pub struct CaMonitorSet(Vec<tokio::task::JoinHandle<()>>);
+
+#[cfg(feature = "ioc")]
+impl Drop for CaMonitorSet {
+    fn drop(&mut self) {
+        for handle in &self.0 {
+            handle.abort();
+        }
+    }
+}
+
 pub struct NDArrayDriverBase {
     pub port_base: PortDriverBase,
     pub params: NDArrayDriverParams,
@@ -446,6 +553,19 @@ pub struct NDArrayDriverBase {
     /// Registry of named attribute functions for `FUNCTION`-type attributes
     /// (C++ `registryFunctionFind` / `registerNDAttributeFunction`).
     pub attr_functions: std::sync::Arc<NDAttributeFunctionRegistry>,
+    /// CA client and the runtime its monitors live on, installed by the IOC
+    /// that owns this port ([`NDArrayDriverBase::set_ca_client`]). C++ has no
+    /// equivalent because `PVAttribute` subscribes through the global CA
+    /// context every IOC already has; here the client is a value someone must
+    /// hand over, and without it an `EPICS_PV` attribute has no feeder.
+    #[cfg(feature = "ioc")]
+    ca_feeder: Option<(
+        std::sync::Arc<epics_ca_rs::client::CaClient>,
+        tokio::runtime::Handle,
+    )>,
+    /// Monitors feeding the attributes currently loaded.
+    #[cfg(feature = "ioc")]
+    ca_monitors: CaMonitorSet,
 }
 
 impl NDArrayDriverBase {
@@ -460,11 +580,14 @@ impl NDArrayDriverBase {
         );
 
         let params = NDArrayDriverParams::create(&mut port_base)?;
-
-        port_base.set_int32_param(params.array_callbacks, 0, 1)?;
-        port_base.set_float64_param(params.pool_max_memory, 0, max_memory as f64 / 1_048_576.0)?;
-
         let pool = Arc::new(NDArrayPool::new(max_memory));
+
+        init_read_only_params(&mut port_base, &params, port_name)?;
+        refresh_pool_stats(&mut port_base, &params, &pool)?;
+        // Not part of C's block: `asynNDArrayDriver` leaves NDArrayCallbacks
+        // to the database. This port has no database behind a bare
+        // `NDArrayDriverBase`, so callbacks default on.
+        port_base.set_int32_param(params.array_callbacks, 0, 1)?;
 
         Ok(Self {
             port_base,
@@ -475,6 +598,10 @@ impl NDArrayDriverBase {
             last_array: None,
             attributes: crate::attributes::NDAttributeList::new(),
             attr_functions: NDAttributeFunctionRegistry::new(),
+            #[cfg(feature = "ioc")]
+            ca_feeder: None,
+            #[cfg(feature = "ioc")]
+            ca_monitors: CaMonitorSet::default(),
         })
     }
 
@@ -750,8 +877,102 @@ impl NDArrayDriverBase {
     /// areaDetector `NDAttributesFile` schema: a root `<Attributes>` element
     /// with `<Attribute name="..." source="..." type="..." .../>` children.
     /// Macro substitution (C++ `ND_ATTRIBUTES_MACROS`) is not supported and is
-    /// ignored. Attributes are stored on `self.attributes`; `ND_ATTRIBUTES_STATUS`
-    /// is set to the resulting status code.
+    /// ignored. Attributes are stored on `self.attributes`; when a file is
+    /// named, `ND_ATTRIBUTES_STATUS` is set to the resulting status code and
+    /// every non-OK code is also returned as an `Err`. An empty name leaves
+    /// the status alone, as C `:327` does.
+    ///
+    /// An `EPICS_PV` attribute is fed from here when the IOC has handed this
+    /// port a CA client through [`Self::set_ca_client`]; each one gets a
+    /// monitor and the status is OK. Without a client there is no feeder, so
+    /// such an attribute evaluates `Undefined` for the life of the IOC and is
+    /// dropped by every file writer — that case keeps a non-OK code rather
+    /// than letting the operator see "Attributes file OK". The rest of the
+    /// file is still loaded, because `PARAM`, `FUNCTION` and `CONST`
+    /// attributes are fed and work; only the status tells the truth about the
+    /// ones that are not. `NDAttributesStatus` is an mbbi with exactly four
+    /// states (NDArrayBase.template:807-824), so `XML_SYNTAX_ERROR` is the
+    /// nearest of C's codes rather than an accurate one.
+    ///
+    /// It is the nearest even though C's own vocabulary has a code for "no
+    /// attribute set is in effect": `NDAttributesFileNotFound` is what the
+    /// constructor seeds (C `:997`) and what an IOC that never loads a file
+    /// keeps. That is exactly why this case cannot borrow it — code 1 is now
+    /// the value every port carries before anything is loaded, so reusing it
+    /// here would make a file whose `PARAM`/`FUNCTION`/`CONST` attributes are
+    /// live and working indistinguishable from a port that loaded nothing at
+    /// all. `write_octet` discards this `Err`, so the mbbi is the operator's
+    /// only signal that the `EPICS_PV` half is dead.
+    /// Install the CA client that feeds `EPICS_PV` attributes, and start
+    /// feeding any that are already loaded.
+    ///
+    /// Feeding the current set here rather than only at load time is what
+    /// makes the order the IOC does things in stop mattering: install first
+    /// then load, or load first then install, and either way every `EPICS_PV`
+    /// attribute ends up with a monitor.
+    ///
+    /// `runtime` is the handle the monitor tasks are spawned on; it is named
+    /// explicitly because `NDAttributesFile` writes arrive on an asyn port
+    /// thread with no ambient runtime.
+    #[cfg(feature = "ioc")]
+    pub fn set_ca_client(
+        &mut self,
+        client: std::sync::Arc<epics_ca_rs::client::CaClient>,
+        runtime: tokio::runtime::Handle,
+    ) {
+        self.ca_feeder = Some((client, runtime));
+        self.feed_epics_pv_attributes();
+    }
+
+    /// Replace the monitor set with one subscription per loaded `EPICS_PV`
+    /// attribute, and return the names left unfed.
+    ///
+    /// The assignment to `ca_monitors` is the finalizer: it drops the previous
+    /// set, and dropping aborts it, so re-reading the attributes file cannot
+    /// leave a monitor writing into a cell nothing reads.
+    #[cfg(feature = "ioc")]
+    fn feed_epics_pv_attributes(&mut self) -> Vec<String> {
+        let Some((client, runtime)) = self.ca_feeder.clone() else {
+            return self
+                .attributes
+                .iter()
+                .filter(|a| matches!(a.source, NDAttrSource::EpicsPV(_)))
+                .map(|a| a.name.clone())
+                .collect();
+        };
+        let handles: Vec<_> = self
+            .attributes
+            .iter()
+            .filter_map(|a| a.epics_pv_source())
+            .map(|src| crate::attributes::spawn_ca_monitor(&runtime, client.clone(), src))
+            .collect();
+        self.ca_monitors = CaMonitorSet(handles);
+        Vec::new()
+    }
+
+    /// Without the `ioc` feature there is no CA client to build a feeder from,
+    /// so every `EPICS_PV` attribute is unfed.
+    #[cfg(not(feature = "ioc"))]
+    fn feed_epics_pv_attributes(&mut self) -> Vec<String> {
+        self.attributes
+            .iter()
+            .filter(|a| matches!(a.source, NDAttrSource::EpicsPV(_)))
+            .map(|a| a.name.clone())
+            .collect()
+    }
+
+    /// Drop the loaded attributes together with the monitors feeding them.
+    ///
+    /// The two are only ever replaced as a pair; separating them is what would
+    /// let a monitor survive the attribute it writes into.
+    fn clear_attributes(&mut self) {
+        self.attributes.clear();
+        #[cfg(feature = "ioc")]
+        {
+            self.ca_monitors = CaMonitorSet::default();
+        }
+    }
+
     pub fn read_nd_attributes_file(&mut self) -> AsynResult<()> {
         let file_param = self
             .port_base
@@ -759,10 +980,13 @@ impl NDArrayDriverBase {
             .to_string();
 
         // Clear any existing attributes (C++ clears unconditionally first).
-        self.attributes.clear();
+        self.clear_attributes();
         if file_param.is_empty() {
-            self.port_base
-                .set_int32_param(self.params.attributes_status, 0, ATTR_STATUS_OK)?;
+            // C `:327` — `if (fileName.length() == 0) return asynSuccess;`
+            // with no `setIntegerParam`. The status keeps whatever it had,
+            // which for an IOC that never loaded a file is the constructor's
+            // `NDAttributesFileNotFound`. Writing OK here erased that value
+            // on every `NDAttributesFile` PINI write (NDArrayBase.template:794).
             return Ok(());
         }
 
@@ -791,9 +1015,28 @@ impl NDArrayDriverBase {
                 for attr in attrs {
                     self.attributes.add(attr);
                 }
-                self.port_base
-                    .set_int32_param(self.params.attributes_status, 0, ATTR_STATUS_OK)?;
-                Ok(())
+                let unfed = self.feed_epics_pv_attributes();
+                if unfed.is_empty() {
+                    self.port_base.set_int32_param(
+                        self.params.attributes_status,
+                        0,
+                        ATTR_STATUS_OK,
+                    )?;
+                    return Ok(());
+                }
+                self.port_base.set_int32_param(
+                    self.params.attributes_status,
+                    0,
+                    ATTR_STATUS_XML_SYNTAX_ERROR,
+                )?;
+                Err(asyn_rs::error::AsynError::Status {
+                    status: asyn_rs::error::AsynStatus::Error,
+                    message: format!(
+                        "readNDAttributesFile: no CA client to monitor EPICS_PV \
+                         attribute(s) {}; they will evaluate Undefined",
+                        unfed.join(", ")
+                    ),
+                })
             }
             Err(msg) => {
                 self.port_base.set_int32_param(
@@ -891,9 +1134,140 @@ impl NDArrayDriverBase {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::plugin::channel::ndarray_channel;
+
+    /// Assert the whole of C++ `asynNDArrayDriver.cpp:954-1005` through the
+    /// *strict* getters — the ones a record read goes through
+    /// (`get_int32_strict`, asyn-rs/src/port.rs:1663). A param the
+    /// constructor never wrote fails here exactly as its record would sit
+    /// UDF/INVALID on a live IOC.
+    pub(crate) fn assert_c_read_only_block(
+        base: &PortDriverBase,
+        params: &NDArrayDriverParams,
+        port_name: &str,
+    ) {
+        let version = env!("CARGO_PKG_VERSION");
+        for (name, index, want) in [
+            ("PORT_NAME_SELF", params.port_name_self, port_name),
+            ("ADCORE_VERSION", params.ad_core_version, version),
+            ("DRIVER_VERSION", params.driver_version, version),
+            ("FILE_WRITE_MESSAGE", params.file_write_message, ""),
+            ("FILE_PATH", params.file_path, ""),
+            ("FILE_NAME", params.file_name, ""),
+            ("FILE_TEMPLATE", params.file_template, "%s%s_%3.3d.dat"),
+            ("TEMP_SUFFIX", params.temp_suffix, ""),
+            ("ND_ATTRIBUTES_FILE", params.attributes_file, ""),
+            ("ND_ATTRIBUTES_MACROS", params.attributes_macros, ""),
+        ] {
+            assert_eq!(
+                base.get_string_param_strict(index, 0)
+                    .unwrap_or_else(|e| { panic!("{name} unset after construction: {e:?}") }),
+                want,
+                "{name}"
+            );
+        }
+
+        for (name, index, want) in [
+            ("ARRAY_SIZE_X", params.array_size_x, 0),
+            ("ARRAY_SIZE_Y", params.array_size_y, 0),
+            ("ARRAY_SIZE_Z", params.array_size_z, 0),
+            ("ARRAY_SIZE", params.array_size, 0),
+            ("ND_DIMENSIONS", params.n_dimensions, 0),
+            ("COLOR_MODE", params.color_mode, NDColorMode::Mono as i32),
+            ("UNIQUE_ID", params.unique_id, 0),
+            ("EPICS_TS_SEC", params.epics_ts_sec, 0),
+            ("EPICS_TS_NSEC", params.epics_ts_nsec, 0),
+            ("BAYER_PATTERN", params.bayer_pattern, 0),
+            ("ARRAY_COUNTER", params.array_counter, 0),
+            ("WRITE_FILE", params.write_file, 0),
+            ("READ_FILE", params.read_file, 0),
+            ("CAPTURE", params.capture, 0),
+            ("FILE_WRITE_STATUS", params.file_write_status, 0),
+            ("FILE_NUMBER", params.file_number, 0),
+            ("AUTO_INCREMENT", params.auto_increment, 0),
+            ("NUM_CAPTURED", params.num_captured, 0),
+            ("FREE_CAPTURE", params.free_capture, 0),
+            ("CREATE_DIR", params.create_dir, 0),
+            (
+                "ND_ATTRIBUTES_STATUS",
+                params.attributes_status,
+                ATTR_STATUS_FILE_NOT_FOUND,
+            ),
+            ("NUM_QUEUED_ARRAYS", params.num_queued_arrays, 0),
+        ] {
+            assert_eq!(
+                base.get_int32_param_strict(index, 0)
+                    .unwrap_or_else(|e| panic!("{name} unset after construction: {e:?}")),
+                want,
+                "{name}"
+            );
+        }
+
+        assert_eq!(
+            base.get_float64_param_strict(params.timestamp_rbv, 0)
+                .expect("TIME_STAMP unset after construction"),
+            0.0
+        );
+    }
+
+    /// The four pool statistics, C `:1000-1003`, for a pool nothing has
+    /// allocated from yet.
+    pub(crate) fn assert_fresh_pool_stats(
+        base: &PortDriverBase,
+        params: &NDArrayDriverParams,
+        max_memory_mb: f64,
+    ) {
+        assert_eq!(
+            base.get_int32_param_strict(params.pool_alloc_buffers, 0)
+                .expect("POOL_ALLOC_BUFFERS unset after construction"),
+            0
+        );
+        assert_eq!(
+            base.get_int32_param_strict(params.pool_free_buffers, 0)
+                .expect("POOL_FREE_BUFFERS unset after construction"),
+            0
+        );
+        assert_eq!(
+            base.get_float64_param_strict(params.pool_used_memory, 0)
+                .expect("POOL_USED_MEMORY unset after construction"),
+            0.0
+        );
+        assert_eq!(
+            base.get_float64_param_strict(params.pool_max_memory, 0)
+                .expect("POOL_MAX_MEMORY unset after construction"),
+            max_memory_mb
+        );
+    }
+
+    #[test]
+    fn test_constructor_seeds_the_c_read_only_block() {
+        let drv = NDArrayDriverBase::new("TEST", 4_194_304).unwrap();
+        assert_c_read_only_block(&drv.port_base, &drv.params, "TEST");
+        // C `:1002-1003` leaves both memory figures at 0 and fills MaxMemory
+        // from the pool later (asynNDArrayDriver.cpp:690). The port has the
+        // pool in hand at construction, so it publishes C's eventual value
+        // from the start rather than a transient 0.
+        assert_fresh_pool_stats(&drv.port_base, &drv.params, 4.0);
+    }
+
+    #[test]
+    fn test_empty_attributes_file_keeps_the_constructor_status() {
+        // C `:327` returns asynSuccess on an empty NDAttributesFile without
+        // touching NDAttributesStatus, so an IOC that never loads one reads
+        // "File not found" — including after the PINI="YES" write that
+        // NDArrayBase.template:794 performs at iocInit.
+        let mut drv = NDArrayDriverBase::new("TEST", 1_000_000).unwrap();
+        drv.read_nd_attributes_file().unwrap();
+        assert_eq!(drv.attributes().len(), 0);
+        assert_eq!(
+            drv.port_base
+                .get_int32_param(drv.params.attributes_status, 0)
+                .unwrap(),
+            ATTR_STATUS_FILE_NOT_FOUND
+        );
+    }
 
     #[test]
     fn test_new_sets_callbacks_enabled() {
@@ -1312,7 +1686,9 @@ mod tests {
         drv.port_base
             .set_string_param(drv.params.attributes_file, 0, xml.into())
             .unwrap();
-        drv.read_nd_attributes_file().unwrap();
+        // The EPICS_PV attribute parses and is kept, but nothing can feed it,
+        // so the file does not load clean — see the status assertion below.
+        assert!(drv.read_nd_attributes_file().is_err());
 
         assert_eq!(drv.attributes().len(), 3);
         let gain = drv.attributes().get("Gain").unwrap();
@@ -1329,8 +1705,118 @@ mod tests {
             drv.port_base
                 .get_int32_param(drv.params.attributes_status, 0)
                 .unwrap(),
+            ATTR_STATUS_XML_SYNTAX_ERROR
+        );
+    }
+
+    #[test]
+    fn test_epics_pv_attribute_is_not_reported_ok() {
+        // An EPICS_PV attribute evaluates Undefined for the life of the IOC
+        // (no CA feeder exists), so NDAttributesStatus must not read
+        // "Attributes file OK" — that is what made the gap invisible.
+        let mut drv = NDArrayDriverBase::new("TEST", 1_000_000).unwrap();
+        drv.port_base
+            .set_string_param(
+                drv.params.attributes_file,
+                0,
+                r#"<Attributes>
+                    <Attribute name="Temp" type="EPICS_PV" source="TST:Temp"/>
+                </Attributes>"#
+                    .into(),
+            )
+            .unwrap();
+        assert!(drv.read_nd_attributes_file().is_err());
+        assert_ne!(
+            drv.port_base
+                .get_int32_param(drv.params.attributes_status, 0)
+                .unwrap(),
             ATTR_STATUS_OK
         );
+        assert_eq!(
+            drv.update_attributes().get("Temp").unwrap().value,
+            NDAttrValue::Undefined
+        );
+
+        // A file with no EPICS_PV attribute still loads clean.
+        drv.port_base
+            .set_string_param(
+                drv.params.attributes_file,
+                0,
+                r#"<Attributes>
+                    <Attribute name="Comment" type="const" source="hello"/>
+                </Attributes>"#
+                    .into(),
+            )
+            .unwrap();
+        drv.read_nd_attributes_file().unwrap();
+        assert_eq!(
+            drv.port_base
+                .get_int32_param(drv.params.attributes_status, 0)
+                .unwrap(),
+            ATTR_STATUS_OK
+        );
+    }
+
+    #[test]
+    fn test_epics_pv_unknown_dbrtype_is_refused() {
+        // C returns asynError on any dbrtype outside its nine names
+        // (asynNDArrayDriver.cpp:421-436); the port must not accept a typo and
+        // publish the attribute as the native type instead.
+        let mut drv = NDArrayDriverBase::new("TEST", 1_000_000).unwrap();
+        drv.port_base
+            .set_string_param(
+                drv.params.attributes_file,
+                0,
+                r#"<Attributes>
+                    <Attribute name="Temp" type="EPICS_PV" source="TST:Temp"
+                               dbrtype="DBR_FLOAT32"/>
+                </Attributes>"#
+                    .into(),
+            )
+            .unwrap();
+        let err = drv.read_nd_attributes_file().unwrap_err().to_string();
+        assert!(err.contains("DBR_FLOAT32"), "{err}");
+        assert_eq!(drv.attributes().len(), 0);
+        assert_eq!(
+            drv.port_base
+                .get_int32_param(drv.params.attributes_status, 0)
+                .unwrap(),
+            ATTR_STATUS_XML_SYNTAX_ERROR
+        );
+
+        // Every one of C's nine spellings still parses.
+        for name in [
+            "DBR_CHAR",
+            "DBR_SHORT",
+            "DBR_INT",
+            "DBR_ENUM",
+            "DBR_LONG",
+            "DBR_FLOAT",
+            "DBR_DOUBLE",
+            "DBR_STRING",
+            "DBR_NATIVE",
+        ] {
+            drv.port_base
+                .set_string_param(
+                    drv.params.attributes_file,
+                    0,
+                    format!(
+                        "<Attributes><Attribute name=\"T\" type=\"EPICS_PV\" \
+                         source=\"TST:Temp\" dbrtype=\"{name}\"/></Attributes>"
+                    ),
+                )
+                .unwrap();
+            // Accepted by the dbrtype table; still refused for having no
+            // feeder, which is the other half of this finding.
+            assert!(
+                !drv.read_nd_attributes_file()
+                    .unwrap_err()
+                    .to_string()
+                    .contains("dbrType"),
+                "{name}"
+            );
+            assert_eq!(drv.attributes().len(), 1, "{name}");
+        }
     }
 
     #[test]
@@ -1484,17 +1970,19 @@ mod tests {
     }
 
     #[test]
-    fn test_read_nd_attributes_file_empty_is_ok() {
-        // G9: an empty ND_ATTRIBUTES_FILE clears attributes and reports OK.
+    fn test_read_nd_attributes_file_empty_clears_attributes() {
+        // G9: an empty ND_ATTRIBUTES_FILE clears the attribute list. The
+        // status it leaves behind is asserted by
+        // `test_empty_attributes_file_keeps_the_constructor_status`.
         let mut drv = NDArrayDriverBase::new("TEST", 1_000_000).unwrap();
+        drv.attributes.add(NDAttribute::new_static(
+            "Gone",
+            "",
+            NDAttrSource::Constant("1".into()),
+            NDAttrValue::Int32(1),
+        ));
         drv.read_nd_attributes_file().unwrap();
         assert_eq!(drv.attributes().len(), 0);
-        assert_eq!(
-            drv.port_base
-                .get_int32_param(drv.params.attributes_status, 0)
-                .unwrap(),
-            ATTR_STATUS_OK
-        );
     }
 
     #[test]

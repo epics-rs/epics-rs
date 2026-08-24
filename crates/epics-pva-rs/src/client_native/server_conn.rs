@@ -1144,13 +1144,20 @@ impl ServerConn {
     /// The writer channel is unbounded so this never blocks. Frames are
     /// batched and flushed by the writer task. This matches CA's
     /// `DirectServerWriter::send_frame` pattern.
+    /// A dead circuit or a gone writer task is [`PvaError::Disconnected`],
+    /// the same condition a dropped IOID slot reports on the receive side:
+    /// the op lost its transport, which pvxs answers by re-queueing the op
+    /// (`client.cpp:198-204` → `clientget.cpp:380-404`), not by handing the
+    /// caller a protocol error. `requeue_on_disconnect` acts on the variant,
+    /// so a send that races the circuit's death re-searches like a lost
+    /// reply does instead of ending the operation.
     pub fn send_sync(&self, frame: Vec<u8>) -> PvaResult<()> {
         if !self.is_alive() {
-            return Err(PvaError::Protocol("server connection closed".into()));
+            return Err(PvaError::Disconnected);
         }
         self.writer_tx
             .send(frame)
-            .map_err(|_| PvaError::Protocol("writer queue closed".into()))
+            .map_err(|_| PvaError::Disconnected)
     }
 
     /// Async wrapper around [`Self::send_sync`] for backward compatibility.

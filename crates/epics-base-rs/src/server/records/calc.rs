@@ -342,8 +342,20 @@ impl CalcRecord {
 }
 
 impl Record for CalcRecord {
+    /// C `calcRecord.c::init_record` (:90-114) ends without touching
+    /// MLST/ALST/LALM — `sub` and `calcout`, the two records closest to it,
+    /// both do seed (`subRecord.c:130-132`, `calcoutRecord.c:217-219`), so
+    /// this is per-type and not derivable from the record's shape.
+    fn seed_deadband_tracking(&mut self) {}
+
     fn record_type(&self) -> &'static str {
         "calc"
+    }
+
+    /// `calcRecord.c:161-167` `get_linkNumber` — `A`..`U` and `LA`..`LU` both
+    /// read their units/precision/graphic/alarm from `INPA`..`INPU`.
+    fn link_backed_metadata_field(&self, field: &str) -> Option<String> {
+        crate::server::record::calc_class_link_backed_metadata_field(field)
     }
 
     fn init_record(&mut self, pass: u8) -> CaResult<()> {

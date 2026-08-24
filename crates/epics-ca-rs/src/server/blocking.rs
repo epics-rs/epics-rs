@@ -102,14 +102,14 @@
 //! `command_drives_without_spawn` stays a *fail-closed* allowlist for
 //! everything not handled by a dedicated branch.
 //!
-//! Not yet mirrored for WRITE_NOTIFY on the blocking driver: the async server's
-//! CHANNEL-level put-callback supersede (a second WRITE_NOTIFY on a channel with
-//! one in flight cancels the previous and replies ECA_PUTCBINPROG to it, C
-//! `write_notify_action:1660-1707`). The blocking driver keeps no per-channel
-//! in-flight-put map, so a second WRITE_NOTIFY is instead refused at the RECORD
-//! level (`dbNotify` `S_db_Blocked` → ECA_PUTCBINPROG on the NEW request) — the
-//! new request never displaces the pending one. Same completion correctness; the
-//! supersede-vs-refuse boundary differs and is a later increment.
+//! The CHANNEL-level put-callback registration is not this driver's to keep:
+//! `serve_write_head` registers and consults it (`PutNotifySlot`), so both loops
+//! answer a concurrent WRITE_NOTIFY the same way — the arriving request is never
+//! refused here, and ECA_PUTCBINPROG goes to a predecessor only once it has
+//! outstayed C's 60 s `blockSem` wait (`camessage.c:1745`). Whether the database
+//! below queues a second put-callback on the record's restart list or refuses
+//! it is the database's decision, and a `PutCallbackInProgress` raised there
+//! reaches the client through the ordinary put-failure mapping on both loops.
 //!
 //! The gateway `-no_cache` read-hook GET (`tcp.rs:3111`) is the one genuinely
 //! async branch a READ can reach; it is unreachable for a local record
@@ -149,10 +149,10 @@ use crate::protocol::{
     CA_PROTO_ECHO, CA_PROTO_EVENT_ADD, CA_PROTO_EVENT_CANCEL, CA_PROTO_EVENTS_OFF,
     CA_PROTO_EVENTS_ON, CA_PROTO_HOST_NAME, CA_PROTO_READ, CA_PROTO_READ_NOTIFY,
     CA_PROTO_READ_SYNC, CA_PROTO_SEARCH, CA_PROTO_VERSION, CA_PROTO_WRITE, CA_PROTO_WRITE_NOTIFY,
-    CaHeader, ECA_TOLARGE, ECA_UNAVAILINSERV, ca_v49,
+    CaHeader, ECA_UNAVAILINSERV,
 };
 use crate::server::outbox::{self, OutboxDrain};
-use crate::server::recv::{Admit, RecvAccumulator, Refused};
+use crate::server::recv::{Admit, Gate, RecvAccumulator};
 use crate::server::tcp::{
     CancelInfo, ChannelTarget, ClientState, EventTaskControl, MonitorDelivery,
     SubscriptionDelivery, SubscriptionOutcome, WriteHeadOutcome, cancel_subscription_reply,
@@ -1030,7 +1030,14 @@ fn handle_udp_search_blocking(
 /// `park_on` can run on a runtime-less thread. This is an ALLOWLIST: it fails
 /// closed. EVENT_ADD / EVENT_CANCEL (S1c part a) and WRITE / WRITE_NOTIFY (S1c
 /// part b) are absent because they have dedicated branches ahead of it, NOT
-/// because they are refused; any genuinely unknown command still is.
+/// because they are refused.
+///
+/// It answers ONE question — does this command need a spawn — and no longer
+/// doubles as "is this a legal CA opcode". That second meaning is
+/// [`crate::protocol::is_legal_tcp_command`]'s, enforced by the receive gate
+/// for both drivers, and conflating the two is what made this driver answer a
+/// damaged opcode with a keep-serving `ECA_UNAVAILINSERV` where C tears the
+/// circuit down.
 fn command_drives_without_spawn(cmmd: u16) -> bool {
     matches!(
         cmmd,
@@ -1290,76 +1297,63 @@ fn handle_client_blocking(
                 }
             }
 
-            let mut offset = 0;
-            while offset + CaHeader::SIZE <= accumulated.len() {
-                let tail = &accumulated.bytes()[offset..];
-                // Partial extended-form header (16..24 bytes of a 0xffff-postsize
-                // frame): wait for the annex. Mirrors `handle_client` tcp.rs:2001.
-                if ca_v49(state.client_minor_version())
-                    && tail.len() < 24
-                    && tail[2] == 0xFF
-                    && tail[3] == 0xFF
-                {
-                    break;
-                }
-                let (hdr, hdr_size) =
-                    match CaHeader::from_bytes_for_peer(tail, state.client_minor_version()) {
-                        Ok(v) => v,
-                        // A partial header at a segment boundary parses as Err;
-                        // wait for more bytes. (A truly malformed frame also lands
-                        // here and ends the circuit — see the module docs on the
-                        // deferred refuse-and-continue parity.)
-                        Err(_) => break,
-                    };
-                let actual_post = hdr.actual_postsize();
-
-                // C `camessage.c:2471-2489`: a declared body the receive
-                // buffer can never hold earns ECA_TOLARGE and a drain, not a
-                // disconnect — the client keeps every channel and
-                // subscription it holds. Without this the loop below waited
-                // for `hdr_size + actual_post` bytes that will never arrive
-                // while `accept` kept buffering the dribble, so a single
-                // 24-byte extended header declaring ~4 GiB was an
-                // out-of-memory kill on a target with 32 MiB.
-                //
-                // Placed before `hdr_size + actual_post` is formed: on a
-                // 32-bit target — which is what RTEMS is — that sum wraps for
-                // a declared body near `u32::MAX`, so `msg_len` is only
-                // meaningful once this gate has passed.
-                if let Err(ceiling) = RecvAccumulator::admits_body(actual_post) {
-                    let _ = send_ca_error(
-                        &outbox,
-                        &hdr,
-                        ECA_TOLARGE,
-                        0xFFFF_FFFF,
-                        &crate::server::recv::too_large_message(ceiling),
-                        state.client_minor_version(),
-                    );
-                    tracing::warn!(
-                        target: "epics_ca_rs::server::blocking",
-                        %peer, declared = actual_post, max = ceiling,
-                        "CAS: server unable to load large request message"
-                    );
-                    let msg_len = hdr_size.saturating_add(actual_post);
-                    match accumulated.refuse(offset, msg_len) {
-                        Refused::ResumeAt(next) => {
-                            offset = next;
-                            continue;
-                        }
-                        Refused::DrainPending => {
-                            offset = accumulated.len();
-                            break;
-                        }
+            // Every protocol gate between "a header parsed" and "dispatch
+            // this message" belongs to `RecvAccumulator::next_message`, which
+            // `handle_client` calls too. This loop cannot see the individual
+            // tests, reorder them, skip one, or move the parse cursor itself
+            // — which is what stopped the two loops carrying two
+            // hand-maintained lists that drift. Before this, the misalignment
+            // gate existed only in the async loop, so a misaligned frame here
+            // was dispatched and then advanced the cursor off an 8-byte
+            // boundary, mis-framing every later message for the life of the
+            // circuit.
+            loop {
+                let (hdr, payload) = match accumulated.next_message(state.client_minor_version()) {
+                    Gate::NeedMore => break,
+                    Gate::Deliver { hdr, payload } => (hdr, payload),
+                    Gate::Refuse(err) => {
+                        // C `RSRV_OK`: the peer keeps every channel and
+                        // subscription it holds; only this message is lost.
+                        tracing::warn!(
+                            target: "epics_ca_rs::server::blocking",
+                            %peer,
+                            cmmd = err.hdr.cmmd,
+                            status = err.status,
+                            diagnostic = %err.diagnostic,
+                            "CAS: message refused, circuit kept"
+                        );
+                        let _ = send_ca_error(
+                            &outbox,
+                            &err.hdr,
+                            err.status,
+                            0xFFFF_FFFF,
+                            &err.diagnostic,
+                            state.client_minor_version(),
+                        );
+                        continue;
                     }
-                }
-
-                let msg_len = hdr_size + actual_post;
-                if offset + msg_len > accumulated.len() {
-                    break; // frame body not fully arrived yet
-                }
-                let payload = accumulated.bytes()
-                    [offset + hdr_size..offset + hdr_size + actual_post]
-                    .to_vec();
+                    Gate::TearDown { error, reason } => {
+                        // C `RSRV_ERROR`: send what C sends, flush it, close.
+                        tracing::warn!(
+                            target: "epics_ca_rs::server::blocking",
+                            %peer,
+                            reason = %reason,
+                            "CAS: circuit torn down by the receive gate"
+                        );
+                        if let Some(err) = error {
+                            let _ = send_ca_error(
+                                &outbox,
+                                &err.hdr,
+                                err.status,
+                                0xFFFF_FFFF,
+                                &err.diagnostic,
+                                state.client_minor_version(),
+                            );
+                        }
+                        let _ = drain_outbox_locked(&send_lock, &mut drain);
+                        return Err(reason);
+                    }
+                };
 
                 if hdr.cmmd == CA_PROTO_EVENT_ADD {
                     // Register the subscription with the SHARED parity logic in
@@ -1540,9 +1534,16 @@ fn handle_client_blocking(
                         }
                     }
                 } else {
-                    // Not handled by any dedicated branch or the spawn-free
-                    // allowlist. Fail closed with a clean CA error and keep serving
-                    // — never a panic or a silent drop.
+                    // A LEGAL CA opcode this driver does not route. It cannot be
+                    // an illegal one: `RecvAccumulator::next_message` answers
+                    // those with C's `bad_tcp_cmd_action` — `ECA_INTERNAL` and a
+                    // tear-down — before a message reaches here, which is the
+                    // fact `command_drives_without_spawn` used to conflate with
+                    // this one. The set is empty today
+                    // (`every_legal_tcp_command_is_routed_by_this_driver` pins
+                    // that), so this is what a routing table that fell behind the
+                    // protocol would produce: fail closed with a keep-serving
+                    // warning rather than punishing the peer for a server gap.
                     let _ = send_ca_error(
                         &outbox,
                         &hdr,
@@ -1552,10 +1553,6 @@ fn handle_client_blocking(
                         state.client_minor_version(),
                     );
                 }
-                offset += msg_len;
-            }
-            if offset > 0 {
-                accumulated.consume(offset);
             }
             // The reply drain lives at the loop top (FIONREAD-gated), not here —
             // holding replies until the socket drains is the C batch-up rule
@@ -1593,6 +1590,7 @@ fn handle_client_blocking(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::protocol::ECA_TOLARGE;
     /// Everything before the first column-0 `#[cfg(test)]`.
     fn production_scope(src: &str) -> &str {
         match src.find("\n#[cfg(test)]") {
@@ -2667,17 +2665,22 @@ mod tests {
         (c, sid)
     }
 
-    /// C1 boundary, ONE OVER the ceiling, in the extended-header form, with
-    /// the body dribbled: a 24-byte write declaring `body_ceiling() + 1`
-    /// payload bytes must earn `ECA_TOLARGE` immediately — before any body
-    /// byte is sent — and must NOT close the circuit.
+    /// C1 boundary, the first admissible step OVER the ceiling, in the
+    /// extended-header form, with the body dribbled: a 24-byte write
+    /// declaring `body_ceiling() + 8` payload bytes must earn `ECA_TOLARGE`
+    /// immediately — before any body byte is sent — and must NOT close the
+    /// circuit.
     ///
-    /// C `camessage.c:2471-2489` is the reference: over-large earns
+    /// C `camessage.c:2538-2555` is the reference: over-large earns
     /// `ECA_TOLARGE` naming `rsrvSizeofLargeBufTCP`, sets
     /// `client->recvBytesToDrain`, and returns `RSRV_OK` — the client keeps
     /// every channel it holds. Before this gate the blocking driver simply
     /// waited for `hdr_size + actual_post` bytes that were never coming,
     /// buffering the dribble the whole time.
+    ///
+    /// The step is 8 and not 1 because C tests alignment first
+    /// (`camessage.c:2519-2530`): `ceiling + 1` is a misaligned message and
+    /// earns `ECA_INTERNAL` and a close, which is a different gate.
     #[test]
     fn an_extended_body_over_the_ceiling_earns_eca_tolarge_without_closing() {
         let db = seed_db(&[("BLK:TL", EpicsValue::Double(7.0))]);
@@ -2689,7 +2692,7 @@ mod tests {
         let (mut c, sid) = connected_client(addr, "BLK:TL");
 
         let ceiling = crate::server::recv::RecvAccumulator::body_ceiling();
-        let declared = (ceiling + 1) as u32;
+        let declared = (ceiling + 8) as u32;
         // Header only. Not one byte of the declared body is ever sent.
         c.write_all(&extended_read_notify_header(sid, 0x99, declared))
             .unwrap();
@@ -2861,24 +2864,28 @@ mod tests {
         );
     }
 
-    /// Source guard for the structural half of C1: BOTH CA server drivers
-    /// must grow their receive buffer only through [`RecvAccumulator`].
+    /// Source guard: BOTH CA server drivers must take their bytes AND their
+    /// messages from [`RecvAccumulator`] — never from a buffer or a header
+    /// parser of their own.
     ///
-    /// The defect this closes existed because the two loops each owned a bare
-    /// `Vec<u8>` and only one of them had learned to bound it. A second
-    /// growth point re-opens the family, so the guard is on the growth point
-    /// and not on the presence of a check.
+    /// The defect family this closes existed because the two loops each owned
+    /// a bare `Vec<u8>` and a hand-written list of protocol gates, and only
+    /// one of them ever learned a given rule. Two rounds of review fixed the
+    /// gates the round was handed and left the lists unequalised, so the guard
+    /// is on the *seam*, not on any one rule: a loop that reaches
+    /// `next_message` cannot be missing a gate, because it cannot see the
+    /// gates at all.
     ///
-    /// The real enforcement is the type: `RecvAccumulator::buf` is private,
-    /// so a raw append onto the buffer does not compile at all — a mutation
-    /// that adds one is rejected by rustc, not by this test. (The needle for
-    /// that case is spelled out below, split, for the same self-match reason
-    /// it cannot be written here.) What this test
-    /// actually catches, verified by mutation, is a loop that abandons the
-    /// primitive: deleting the `admits_body` gate from either driver fails
-    /// the third assertion here as well as the behavioural tests above.
+    /// A *second parse point* needs no guard at all: `RecvAccumulator`'s
+    /// buffer, cursor, drain counter, `admits_body` and `refuse` are private,
+    /// so `next_message` is the only way to get a byte back out and a loop
+    /// that tried to parse for itself would not compile. What the needles
+    /// below catch is the case rustc cannot see — a loop that stops calling
+    /// the primitive and grows a `Vec<u8>` of its own again, which is exactly
+    /// how this started. (They are split and rejoined by `concat!` because
+    /// this guard lives in one of the files it reads.)
     #[test]
-    fn both_ca_drivers_grow_their_recv_buffer_only_through_the_primitive() {
+    fn both_ca_drivers_receive_only_through_the_shared_primitive() {
         // Whole-file scope deliberately, NOT `production_scope`: tcp.rs's
         // first column-0 `#[cfg(test)]` is a helper near the top of the file,
         // so `production_scope` would hand back a 95-line prefix and the
@@ -2904,9 +2911,11 @@ mod tests {
                  route it through RecvAccumulator::accept so the ceiling applies"
             );
             assert!(
-                src.contains(concat!("RecvAccumulator::admits", "_body")),
-                "{file}: the declared-body gate is missing; a peer-declared \
-                 size must be refused with ECA_TOLARGE before it is trusted"
+                src.contains(concat!("accumulated.next_", "message(")),
+                "{file}: the connection loop must take its messages from \
+                 RecvAccumulator::next_message — that is where the protocol \
+                 gate order and the refuse-versus-tear-down outcome live, and \
+                 a loop that parses headers itself is a second copy of them"
             );
         }
     }
@@ -3036,6 +3045,38 @@ mod tests {
         assert!(command_drives_without_spawn(CA_PROTO_CREATE_CHAN));
         // An unknown command falls through to the fail-closed refusal.
         assert!(!command_drives_without_spawn(0xEEEE));
+    }
+
+    /// The fail-closed `else` arm of the dispatch chain must be *vacuous*:
+    /// every opcode C's `tcpJumpTable` binds to a real handler is routed by
+    /// this driver, either by a dedicated branch or by
+    /// [`command_drives_without_spawn`].
+    ///
+    /// This is what keeps the two facts apart now that
+    /// [`crate::protocol::is_legal_tcp_command`] owns legality. The `else`
+    /// arm answers `ECA_UNAVAILINSERV` and keeps serving, which is right for
+    /// "this driver has not caught up with the protocol" and wrong for
+    /// "damaged opcode" — and it was reachable by the second, because the
+    /// allowlist was doing both jobs. Reaching it at all is now a routing gap
+    /// in this file, and this test is the thing that reports one.
+    #[test]
+    fn every_legal_tcp_command_is_routed_by_this_driver() {
+        // The commands with a dedicated branch ahead of the allowlist.
+        const DEDICATED: [u16; 4] = [
+            CA_PROTO_EVENT_ADD,
+            CA_PROTO_EVENT_CANCEL,
+            CA_PROTO_WRITE,
+            CA_PROTO_WRITE_NOTIFY,
+        ];
+        for cmmd in 0u16..=u16::MAX {
+            if !crate::protocol::is_legal_tcp_command(cmmd) {
+                continue;
+            }
+            assert!(
+                DEDICATED.contains(&cmmd) || command_drives_without_spawn(cmmd),
+                "legal TCP command {cmmd} reaches the fail-closed else arm —                  it would be answered ECA_UNAVAILINSERV and the peer would                  never learn the driver simply does not route it"
+            );
+        }
     }
 
     /// A UDP VERSION prelude with a valid sequence number
@@ -4277,12 +4318,8 @@ mod tests {
         block_on_sync(db.complete_async_record("REF:ASYW"))
             .expect("blockable")
             .expect("completion");
-        let final_status = match block_on_sync(&mut p.rx).expect("blockable") {
-            Ok(()) => p.eca_status,
-            Err(_) => crate::protocol::ECA_PUTFAIL,
-        };
-        crate::server::tcp::finish_write_notify(&mut p.trap_guard, final_status, &p.reply, &outbox)
-            .expect("encode completion");
+        let chain = block_on_sync(&mut p.rx).expect("blockable");
+        p.settle(chain, &outbox).expect("encode completion");
 
         while let Some(f) = drain.try_next() {
             if u16::from_be_bytes([f[0], f[1]]) == CA_PROTO_WRITE_NOTIFY {
@@ -4401,9 +4438,9 @@ mod tests {
 
     /// A compound buffer type on a WRITE_NOTIFY is a **failed put**, not a
     /// protocol violation. C `write_notify_action` lets every type at or below
-    /// `LAST_BUFFER_TYPE` past `INVALID_DB_REQ` (`camessage.c:1673`) and only
+    /// `LAST_BUFFER_TYPE` past `INVALID_DB_REQ` (`camessage.c:1678`) and only
     /// `db_put_process` then fails it (`mapOldType` returns -1 for compound
-    /// types), so the client gets ECA_PUTFAIL (`camessage.c:1412-1413`) on a
+    /// types), so the client gets ECA_PUTFAIL (`camessage.c:1417-1419`) on a
     /// circuit that stays up.
     #[test]
     fn compound_dbr_write_notify_is_putfail_and_keeps_the_circuit() {
@@ -4566,8 +4603,8 @@ mod tests {
 
     /// C arms the put-log bracket before it can know whether the put will
     /// succeed: `asTrapWriteWithData` runs unconditionally ahead of
-    /// `dbChannel_put` (`camessage.c:794-804`) and ahead of `dbProcessNotify`
-    /// (`:1775`), with the matching `asTrapWriteAfter` right behind. So a
+    /// `dbChannel_put` (`camessage.c:799-804`) and ahead of `dbProcessNotify`
+    /// (`:1795-1802`), with the matching `asTrapWriteAfter` right behind. So a
     /// put-log listener sees even the buffer types `dbChannel_put` refuses —
     /// which is the whole point of a put-log: the attempt is the record, not
     /// the outcome.

@@ -2,9 +2,10 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use crate::error::{ADError, ADResult};
+use crate::finalize::Finalize;
 use crate::ndarray::{NDArray, NDDataType, NDDimension};
 
-use super::file_base::{NDFileMode, NDFileWriter, NDPluginFileBase};
+use super::file_base::{NDFileMode, NDFileWriter, NDPluginFileBase, with_open_file};
 use super::runtime::{
     ParamChangeResult, ParamChangeValue, ParamUpdate, PluginParamSnapshot, ProcessResult,
 };
@@ -153,7 +154,7 @@ impl<W: NDFileWriter> FilePluginController<W> {
         {
             // B9: eager open — needs a frame to know the layout.
             if let Some(array) = self.latest_array.clone() {
-                self.file_base.open_stream_eager(&mut self.writer, &array)?;
+                self.file_base.open_stream(&mut self.writer, &array)?;
             }
         }
         self.capture_active = true;
@@ -166,15 +167,25 @@ impl<W: NDFileWriter> FilePluginController<W> {
     ///
     /// B8/B17: closes any open stream file, clears `capture_active`, and
     /// emits the `CAPTURE` PV update. Idempotent.
+    ///
+    /// The B8 invariant — that `capture_active`, the file-base capture state
+    /// and the `CAPTURE` PV move together — holds for the failing close as
+    /// well: the finalizer performs the whole transition on every exit path, so
+    /// a `close_stream` error is reported without latching `Capture_RBV` at 1
+    /// against a plugin that is no longer capturing.
     fn stop_capture(&mut self, updates: &mut Vec<ParamUpdate>) -> ADResult<()> {
-        if self.file_base.mode() == NDFileMode::Stream {
-            self.file_base.close_stream(&mut self.writer)?;
-        }
-        self.capture_active = false;
-        self.stream_dims = None;
-        self.stream_data_type = None;
-        self.push_capture_update(updates);
-        Ok(())
+        let mut stopping = Finalize::new(self, |ctrl: &mut Self| {
+            ctrl.capture_active = false;
+            ctrl.stream_dims = None;
+            ctrl.stream_data_type = None;
+            ctrl.push_capture_update(updates);
+        });
+        stopping.run(|ctrl| {
+            if ctrl.file_base.mode() == NDFileMode::Stream {
+                ctrl.file_base.close_stream(&mut ctrl.writer)?;
+            }
+            Ok(())
+        })
     }
 
     /// `isFrameValid` (C++ NDPluginFile.cpp:665): a frame is valid if its
@@ -537,13 +548,14 @@ impl<W: NDFileWriter> FilePluginController<W> {
             if params.value.as_i32() != 0 {
                 let result = (|| -> ADResult<Arc<NDArray>> {
                     let path = PathBuf::from(self.file_base.create_file_name());
-                    self.writer.open_file(
+                    let layout = NDArray::new(vec![NDDimension::new(1)], NDDataType::UInt8);
+                    let array = with_open_file(
+                        &mut self.writer,
                         &path,
                         NDFileMode::Single,
-                        &NDArray::new(vec![NDDimension::new(1)], NDDataType::UInt8),
+                        &layout,
+                        |w| w.read_file().map(Arc::new),
                     )?;
-                    let array = Arc::new(self.writer.read_file()?);
-                    self.writer.close_file()?;
                     self.latest_array = Some(array.clone());
                     Ok(array)
                 })();
@@ -635,13 +647,7 @@ impl<W: NDFileWriter> FilePluginController<W> {
                 value: 0,
             });
         }
-        if let Some(idx) = self.params.capture {
-            updates.push(ParamUpdate::Int32 {
-                reason: idx,
-                addr: 0,
-                value: if self.capture_active { 1 } else { 0 },
-            });
-        }
+        self.push_capture_update(&mut updates);
         if let Some(idx) = self.params.read_file {
             updates.push(ParamUpdate::Int32 {
                 reason: idx,
@@ -723,6 +729,10 @@ impl<W: NDFileWriter> FilePluginController<W> {
                 value: message,
             });
         }
+        // B8: an error return replaces whatever updates the caller accumulated,
+        // so the capture state has to be re-derived here or a `stop_capture`
+        // that failed would report its error with `Capture_RBV` still reading 1.
+        self.push_capture_update(&mut updates);
         updates
     }
 }
@@ -749,6 +759,9 @@ mod tests {
         writes: usize,
         closes: usize,
         multi: bool,
+        /// Make `close_file` fail, standing in for the ENOSPC / read-only-mount
+        /// close that a real writer cannot complete.
+        fail_close: bool,
     }
     impl MockWriter {
         fn new(multi: bool) -> Self {
@@ -757,6 +770,7 @@ mod tests {
                 writes: 0,
                 closes: 0,
                 multi,
+                fail_close: false,
             }
         }
     }
@@ -774,6 +788,9 @@ mod tests {
         }
         fn close_file(&mut self) -> ADResult<()> {
             self.closes += 1;
+            if self.fail_close {
+                return Err(ADError::UnsupportedConversion("disk full".into()));
+            }
             Ok(())
         }
         fn supports_multiple_arrays(&self) -> bool {
@@ -997,6 +1014,113 @@ mod tests {
         // Matching frame: accepted.
         c.process_array(&array(3));
         assert_eq!(c.file_base.num_captured(), 2);
+    }
+
+    /// D6: `ReadFile` on a truncated or malformed file must still close the
+    /// writer it opened, or every attempt leaks another open handle and leaves
+    /// `current_path` set for the next Single-mode write to run against.
+    #[test]
+    fn read_file_closes_the_writer_when_the_read_fails() {
+        let mut c = FilePluginController::new(MockWriter::new(false));
+        c.set_port_name("F");
+        c.params.read_file = Some(9);
+
+        // MockWriter::read_file always fails, standing in for the malformed file.
+        let snap = PluginParamSnapshot {
+            enable_callbacks: true,
+            reason: 9,
+            addr: 0,
+            value: ParamChangeValue::Int32(1),
+        };
+        c.on_param_change(9, &snap);
+
+        assert_eq!(c.writer.opens, 1);
+        assert_eq!(
+            c.writer.closes, 1,
+            "a failed read must still close the file it opened"
+        );
+    }
+
+    /// D3: `stop_capture` owns the whole B8 transition, so a failing
+    /// `close_stream` must not leave `capture_active` set — the error is
+    /// reported, the state still moves.
+    #[test]
+    fn stop_capture_clears_capture_active_when_the_close_fails() {
+        let mut c = FilePluginController::new(MockWriter::new(true));
+        c.set_port_name("F");
+        c.params.capture = Some(7);
+        c.file_base.set_mode(NDFileMode::Stream);
+        c.file_base.set_num_capture(0);
+        c.process_array(&array(1));
+
+        let mut updates = Vec::new();
+        c.start_capture(&mut updates).unwrap();
+        assert!(c.capture_active);
+        assert!(c.file_base.is_open());
+
+        c.writer.fail_close = true;
+        let mut updates = Vec::new();
+        assert!(
+            c.stop_capture(&mut updates).is_err(),
+            "the close failure is still reported"
+        );
+        assert!(
+            !c.capture_active,
+            "capture state must not latch on a failed close"
+        );
+        assert!(
+            updates.iter().any(|u| matches!(
+                u,
+                ParamUpdate::Int32 {
+                    reason: 7,
+                    value: 0,
+                    ..
+                }
+            )),
+            "CAPTURE=0 must still be posted"
+        );
+    }
+
+    /// D3, the operator-visible path: `caput Capture 0` with a failing stream
+    /// close must leave `Capture_RBV` at 0, not latched at 1.
+    #[test]
+    fn capture_off_param_write_reports_error_with_capture_rbv_cleared() {
+        let mut c = FilePluginController::new(MockWriter::new(true));
+        c.set_port_name("F");
+        c.params.capture = Some(7);
+        c.file_base.set_mode(NDFileMode::Stream);
+        c.file_base.set_num_capture(0);
+        c.process_array(&array(1));
+
+        let on = PluginParamSnapshot {
+            enable_callbacks: true,
+            reason: 7,
+            addr: 0,
+            value: ParamChangeValue::Int32(1),
+        };
+        c.on_param_change(7, &on);
+        assert!(c.capture_active);
+
+        c.writer.fail_close = true;
+        let off = PluginParamSnapshot {
+            enable_callbacks: true,
+            reason: 7,
+            addr: 0,
+            value: ParamChangeValue::Int32(0),
+        };
+        let result = c.on_param_change(7, &off);
+        assert!(!c.capture_active);
+        assert!(
+            result.param_updates.iter().any(|u| matches!(
+                u,
+                ParamUpdate::Int32 {
+                    reason: 7,
+                    value: 0,
+                    ..
+                }
+            )),
+            "Capture_RBV must read 0 after the failed close"
+        );
     }
 
     #[test]

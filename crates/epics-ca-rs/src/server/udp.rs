@@ -511,7 +511,7 @@ pub(crate) async fn parse_search_datagram(
             Ok(h) => h,
             Err(_) => break,
         };
-        // C `rsrv/camessage.c:2452` rejects misaligned `m_postsize`.
+        // C `rsrv/camessage.c:2520` rejects misaligned `m_postsize`.
         // UDP path drops silently (no error response). Without this
         // check, the `align8(postsize)` advancement would jump
         // into the next message's body, mis-parsing chained
@@ -547,7 +547,7 @@ pub(crate) async fn parse_search_datagram(
             break;
         }
         if hdr.cmmd == CA_PROTO_VERSION {
-            // C `udp_version_action` (rsrv/camessage.c:2094-2110)
+            // C `udp_version_action` (rsrv/camessage.c:2148-2164)
             // stores `pclient->seqNoOfReq = m_cid` and the version
             // when the leading VERSION header marks the seq valid
             // (`m_dataType == sequenceNoIsValid`, caProto.h:128).
@@ -564,8 +564,7 @@ pub(crate) async fn parse_search_datagram(
             // still elicit a Rust SEARCH reply where rsrv would
             // have dropped the rest. Mirror C: bad version
             // breaks the per-datagram parse.
-            const CA_MINIMUM_SUPPORTED_VERSION: u16 = 4;
-            if hdr.count < CA_MINIMUM_SUPPORTED_VERSION {
+            if !crate::protocol::declares_supported_version(&hdr) {
                 break;
             }
             // track the largest VERSION minor seen so the
@@ -579,7 +578,7 @@ pub(crate) async fn parse_search_datagram(
             }
         }
         if hdr.cmmd == CA_PROTO_SEARCH {
-            // C `search_reply_udp` (rsrv/camessage.c:2151-2154)
+            // C `search_reply_udp` (rsrv/camessage.c:2205-2207)
             // rejects unsupported minor versions BEFORE the
             // empty-name check. `CA_VSUPPORTED(minor) = minor >= 4`
             // (CA_MINIMUM_SUPPORTED_VERSION in caProto.h:34). C
@@ -588,7 +587,7 @@ pub(crate) async fn parse_search_datagram(
             // different layout; emitting our V4.13 reply confuses
             // them or worse, fabricates a usable channel they
             // can't actually open.
-            // C `search_reply_udp` (camessage.c:2151-2154)
+            // C `search_reply_udp` (camessage.c:2205-2207)
             // returns RSRV_ERROR on unsupported minor version and
             // the UDP dispatcher breaks out of the datagram. Pre-
             // fix Rust skipped only the offending SEARCH and kept
@@ -597,11 +596,10 @@ pub(crate) async fn parse_search_datagram(
             // a Rust reply for a later message where rsrv would
             // have dropped the rest. Match C: bad-version SEARCH
             // ends the per-datagram parse.
-            const CA_MINIMUM_SUPPORTED_VERSION: u16 = 4;
-            if hdr.count < CA_MINIMUM_SUPPORTED_VERSION {
+            if !crate::protocol::declares_supported_version(&hdr) {
                 break;
             }
-            // C `search_reply_udp` (rsrv/camessage.c:2159) rejects
+            // C `search_reply_udp` (rsrv/camessage.c:2213-2217) rejects
             // SEARCH whose `m_postsize <= 1` ("empty PV name in UDP
             // search request") and silently returns RSRV_OK. The
             // null-terminator alone is 1 byte; a usable PV name
@@ -642,7 +640,7 @@ pub(crate) async fn parse_search_datagram(
                 // `gateAs::findEntry`).
                 if db.has_name_from(pv_name, Some(lookup_src)).await {
                     // C parity: `search_reply_udp`
-                    // (`rsrv/camessage.c:2193-2207`) sets
+                    // (`rsrv/camessage.c:2247-2251`) sets
                     // `sid = ~0U` (INADDR_BROADCAST), telling
                     // the client to use the UDP packet's source
                     // address as the server IP. The previous
@@ -712,7 +710,7 @@ pub(crate) async fn parse_search_datagram(
                     send_buf.extend_from_slice(&resp_bytes);
                     send_buf.extend_from_slice(&search_payload);
                 }
-                // C parity: `search_reply_udp` (rsrv/camessage.c:2167)
+                // C parity: `search_reply_udp` (rsrv/camessage.c:2221-2224)
                 // silently returns on `dbChannelTest` failure for ALL
                 // UDP searches — there is no DO_REPLY branch on the
                 // UDP path. Only `search_reply_tcp` honours the flag

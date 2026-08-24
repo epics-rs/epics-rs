@@ -58,6 +58,17 @@ operators cannot see queue depth. Also note the param is named `QUEUE_FREE`
 but the struct field is `queue_use` (params.rs:16,40) — a naming inconsistency
 that suggests the semantics were never reconciled.
 
+> **G2 addendum (2026-08-23).** 807b07b6 added the runtime update but left the
+> constructor writing `QUEUE_FREE = 0`, so an idle plugin published a full
+> queue from `iocInit` until its first array arrived. The constructor block is
+> now the whole of C `NDPluginDriver.cpp:152-160`, which also closes
+> `NDARRAY_ADDR`, `DROPPED_OUTPUT_ARRAYS`, `MAX_THREADS` and `NUM_THREADS` —
+> none of which were in G2's or G6's scope, and `MaxThreads_RBV` had no writer
+> on either side, so it read UDF/INVALID for the life of the IOC. G4 stays a
+> deliberate keep-Rust deviation: the port still runs one worker, and
+> `MAX_THREADS`/`NUM_THREADS` now *publish* that 1 instead of publishing
+> nothing.
+
 ### G3. Compression-aware input gating missing (MEDIUM)
 C++ `driverCallback` (NDPluginDriver.cpp:383-394): if the plugin is not
 `compressionAware_` and the array has a non-empty `codec`, the array is dropped

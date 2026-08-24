@@ -237,7 +237,7 @@ async fn disconnected_link_stages_nothing_and_alarms() {
         "ca",
         Arc::new(RecordingLset {
             writes: Arc::clone(&writes),
-            admission: PutAdmission::Disconnected,
+            admission: PutAdmission::Refused,
             status: Ok(()),
         }),
     )

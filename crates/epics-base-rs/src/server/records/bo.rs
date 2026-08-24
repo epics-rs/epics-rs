@@ -1,6 +1,6 @@
 use crate::error::{CaError, CaResult};
 use crate::server::record::{
-    FieldMetadataOverride, MENU_SIMM, ProcessAction, ProcessOutcome, Record,
+    DelayedCallbackOutcome, FieldMetadataOverride, MENU_SIMM, ProcessAction, ProcessOutcome, Record,
 };
 use crate::types::{EpicsValue, PvString};
 
@@ -39,11 +39,6 @@ pub struct BoRecord {
     pub siol: String,
     pub sims: i16,
     pub sdly: f64,
-    /// Set when a HIGH one-shot timer is in flight. The next
-    /// `process()` (the timer-driven reprocess) forces `VAL = 0`,
-    /// mirroring C `boRecord.c::myCallbackFunc` which sets
-    /// `prec->val = 0` before `dbProcess`.
-    high_reset_pending: bool,
     // VAL change gate. C
     // boRecord.c:394-399 monitor() raises DBE_VALUE|DBE_LOG for VAL only
     // when `mlst != val`. Captured during process() because the framework
@@ -84,7 +79,6 @@ impl Default for BoRecord {
             siol: String::new(),
             sims: 0,
             sdly: -1.0,
-            high_reset_pending: false,
             value_changed: false,
             skip_convert: false,
         }
@@ -125,6 +119,12 @@ const BO_HIGH_LIMIT: f64 = 100000.0;
 impl Record for BoRecord {
     fn record_type(&self) -> &'static str {
         "bo"
+    }
+
+    /// C `boRecord.c:191-205`: the scalar `dbGetLink(&prec->dol, ..., &val, 0, 0)`
+    /// under `dol.type != CONSTANT && omsl == menuOmslclosed_loop`.
+    fn fetches_dol_closed_loop(&self) -> bool {
+        true
     }
 
     /// `HIGH` is bo's only DBF_DOUBLE field, and both metadata literals in the
@@ -228,18 +228,10 @@ impl Record for BoRecord {
     }
 
     fn process(&mut self) -> CaResult<ProcessOutcome> {
-        // HIGH one-shot: a pending HIGH timer fired and triggered this
-        // reprocess. C `boRecord.c::myCallbackFunc` sets `prec->val = 0`
-        // before `dbProcess`, driving a momentary output back to Done.
-        if self.high_reset_pending {
-            self.high_reset_pending = false;
-            self.val = 0;
-        }
-
         // DOL/OMSL: a real (DB/CA/PVA) link is fetched and applied to VAL
         // by the framework before process(). A *constant* DOL is applied
         // once at init_record (`recGblInitConstantLink` parity) and is NOT
-        // re-sourced here; C `boRecord.c:227` gates the fetch on
+        // re-sourced here; C `boRecord.c:192` gates the fetch on
         // `!dbLinkIsConstant`, so a client caput to VAL is never clobbered
         // by the constant every cycle.
 
@@ -256,13 +248,16 @@ impl Record for BoRecord {
         self.oraw = self.rval;
         self.orbv = self.rbv;
 
-        // HIGH toggle: if val==1 and high>0, schedule reprocess after HIGH
-        // seconds — the reprocess then drives the output back to 0.
+        // HIGH one-shot: C `boRecord.c:257-262` arms `callbackRequestDelayed`
+        // on every process that leaves VAL at 1, and the timer — never a
+        // process cycle — is what drives the momentary output back to Done.
+        // Arming is therefore idempotent and carries no record state: a caput,
+        // a FLNK or a periodic scan landing inside the window re-arms and moves
+        // the deadline out, exactly as C does, instead of consuming the pulse.
         let mut actions = Vec::new();
         if self.val == 1 && self.high > 0.0 {
-            self.high_reset_pending = true;
-            actions.push(ProcessAction::ReprocessAfter(
-                std::time::Duration::from_secs_f64(self.high),
+            actions.push(ProcessAction::DelayedCallbackAfter(
+                crate::runtime::time::duration_from_secs(self.high),
             ));
         }
 
@@ -280,6 +275,31 @@ impl Record for BoRecord {
             actions,
             device_did_compute: false,
         })
+    }
+
+    /// C `boRecord.c::myCallbackFunc` (:105-118) — the HIGH timer's own body,
+    /// and the only writer of the one-shot's `prec->val = 0` (`rg 'prec->val =
+    /// 0' boRecord.c` returns :116 here, :160 the RVAL convert and :364
+    /// `put_enum_str`).
+    fn delayed_callback_fire(&mut self, pact: bool) -> DelayedCallbackOutcome {
+        if !pact {
+            self.val = 0;
+            return DelayedCallbackOutcome::Reprocess;
+        }
+        // Mid-async-cycle: C changes nothing and waits another full HIGH.
+        // The conversion is `runtime::time::duration_from_secs`, the same one
+        // `process()` arms with, so `self.high` cannot mean two deadlines in
+        // two adjacent functions: a HIGH past `Duration`'s range (`caput
+        // REC.HIGH 1e300`, which C ACCEPTS) becomes `Duration::MAX`, C's
+        // queued callback that no comparison ever reaches. `Drop` is then left
+        // with its one meaning — the one-shot is no longer live — instead of
+        // also standing for "the delay would not fit".
+        match (self.val == 1 && self.high > 0.0)
+            .then(|| crate::runtime::time::duration_from_secs(self.high))
+        {
+            Some(delay) => DelayedCallbackOutcome::Rearm(delay),
+            None => DelayedCallbackOutcome::Drop,
+        }
     }
 
     fn set_device_did_compute(&mut self, did: bool) {

@@ -72,14 +72,14 @@
 //!   array target gets the stale `OAV`, and under `DOPT=Use CALC` the
 //!   substitution is a no-op (C quirk, reproduced). See
 //!   `set_output_to_ivov` / `multi_output_scalar_companion`.
-//! - `SIZE` (NELM vs NUSE) is stored but does not gate the client-advertised
-//!   array capacity: the served element count is always
-//!   `acalcGetNumElements()` (C `get_array_info`), matching C's served data.
-//!   C `cvt_dbaddr` additionally advertises `NELM` as the channel capacity
-//!   under the default `SIZE=NELM`; the single-length model serves that count
-//!   directly, so the advertised capacity differs only when `NUSE` is set to
-//!   `0 < NUSE < NELM` under `SIZE=NELM`. `NELM=0` (degenerate; dbd
-//!   initial 1) serves a 1-element array, where C serves 0.
+//! - `SIZE` (NELM vs NUSE) gates the client-advertised array capacity, C's
+//!   `cvt_dbaddr` half
+//!   ([`crate::server::record::FieldDeclaration::field_native_count`] →
+//!   `AcalcoutRecord::dbaddr_no_elements`); the SERVED element count stays
+//!   `acalcGetNumElements()`, C's `get_array_info` half. The two differ under
+//!   the default `SIZE=NELM` with `0 < NUSE < NELM`, which is C's design and
+//!   not a rounding. Still deviating: `NELM=0` (degenerate; dbd initial 1)
+//!   advertises and serves a 1-element array, where C advertises and serves 0.
 //! - `UDF` is C's `pcalc->udf`, owned directly as the framework's `dbCommon.udf`
 //!   `epicsUInt8` (no shadow cell): undefined until a calc successfully defines
 //!   VAL. C `aCalcoutRecord.c:305-307` clears it `else pcalc->udf = FALSE` only
@@ -109,7 +109,8 @@ use super::calc_compile;
 use crate::calc::{ArrayInputs, CompiledExpr, ExprKind, acalc_eval};
 // `LINK_CON` (= 3, the `Constant` link-status index) is the value C
 // `init_record` writes for an unconfigured link; shared with `calcout`.
-use super::link_status::LINK_CON;
+use super::link_status::{LINK_CON, LinkRole, LinkStatusGen, post_link_status};
+use crate::server::database::AsyncDbHandle;
 
 /// Code version reported by `VERS` (C `#define VERSION 1.4`).
 const VERSION: f64 = 1.4;
@@ -241,10 +242,14 @@ pub struct AcalcoutRecord {
     arr_vals: [Vec<f64>; 12],
     ina_links: [String; 12],
 
-    // --- link status (static, dbd initials) ---
+    // --- link status, derived from the links by `refresh_link_status` ---
     inav: [i16; 12], // INAV..INLV
     iaav: [i16; 12], // IAAV..ILLV
     outv: i16,
+    /// Async surface + generation gate for `refresh_link_status`, the shape
+    /// calcout/scalcout/transform use (see `link_status::post_link_status`).
+    async_ctx: Option<(String, AsyncDbHandle)>,
+    link_gen: LinkStatusGen,
 
     // --- output link + options ---
     out: String,
@@ -334,6 +339,8 @@ impl Default for AcalcoutRecord {
             inav: [LINK_CON; 12],
             iaav: [LINK_CON; 12],
             outv: LINK_CON,
+            async_ctx: None,
+            link_gen: LinkStatusGen::default(),
             out: String::new(),
             oopt: 0,
             odly: 0.0,
@@ -726,6 +733,19 @@ impl AcalcoutRecord {
         name == "OUTV" || Self::inav_index(name).is_some() || Self::iaav_index(name).is_some()
     }
 
+    /// Classify all 25 links and publish INAV..INLV / IAAV..ILLV / OUTV,
+    /// mirroring C `aCalcoutRecord.c::init_record` (209-242) and the
+    /// `special()` re-classification (509-533). No-op without an async context.
+    fn refresh_link_status(&self) {
+        let mut links: Vec<(&'static str, String, LinkRole)> = Vec::with_capacity(25);
+        for i in 0..12 {
+            links.push((INAV_NAMES[i], self.inp_links[i].clone(), LinkRole::Input));
+            links.push((IAAV_NAMES[i], self.ina_links[i].clone(), LinkRole::Input));
+        }
+        links.push(("OUTV", self.out.clone(), LinkRole::Output));
+        post_link_status(self.async_ctx.as_ref(), &self.link_gen, links);
+    }
+
     fn pa_index(name: &str) -> Option<usize> {
         PA_NAMES.iter().position(|&n| n == name)
     }
@@ -782,6 +802,12 @@ const ACALCOUT_SIZE_NUSE: i16 = 1;
 const ACALCOUT_INAV_CHOICES: &[&str] = &["Ext PV NC", "Ext PV OK", "Local PV", "Constant"];
 
 impl Record for AcalcoutRecord {
+    /// C `aCalcoutRecord.c::init_record` (:171-281) ends without touching
+    /// MLST/ALST/LALM, unlike the `calcout` it is modelled on
+    /// (`calcoutRecord.c:217-219`). An `acalcout` given a nonzero initial
+    /// VAL posts that value once on its first cycle in C.
+    fn seed_deadband_tracking(&mut self) {}
+
     fn record_type(&self) -> &'static str {
         "acalcout"
     }
@@ -854,7 +880,20 @@ impl Record for AcalcoutRecord {
             }
             _ => {}
         }
+        // C `aCalcoutRecord.c:503-533` re-classifies the link a put just
+        // re-pointed — the INPA..INPL, INAA..INLL and OUT cases together.
+        if Self::inp_index(field).is_some() || Self::ina_index(field).is_some() || field == "OUT" {
+            self.refresh_link_status();
+        }
         Ok(())
+    }
+
+    fn set_async_context(&mut self, name: String, db: AsyncDbHandle) {
+        self.async_ctx = Some((name, db));
+        // C `init_record` (aCalcoutRecord.c:209-242) classifies all 25 links
+        // before any process. Every one of them is an acalcout-owned field
+        // (OUT included), already applied when `add_record` runs.
+        self.refresh_link_status();
     }
 
     /// C posts the validity field explicitly from `special()`
@@ -1027,7 +1066,7 @@ impl Record for AcalcoutRecord {
             self.dlya = 1;
             self.pending_output = write_out;
             self.cached_should_output = false;
-            let delay = std::time::Duration::from_secs_f64(self.odly);
+            let delay = crate::runtime::time::duration_from_secs(self.odly);
             return Ok(ProcessOutcome {
                 result: RecordProcessResult::AsyncPendingNotify(vec![(
                     "DLYA".to_string(),
@@ -1094,41 +1133,48 @@ impl Record for AcalcoutRecord {
         let hyst = self.hyst;
         let lalm = self.lalm;
 
-        // Per-level hysteresis (C checkAlarms line 865-891). A zero severity
-        // disables that level (C `if (hhsv && ...)`).
+        // Per-level hysteresis (C `aCalcoutRecord.c:865-890`). A zero severity
+        // disables that level (C `if (hhsv && ...)`), and each level's LALM
+        // latch is gated on `recGblSetSevr` actually raising the severity
+        // (`:867`, `:873`, `:879`, `:885`) — a level that fires under an
+        // already-higher pending alarm must not arm the latch.
         if self.hhsv != 0 && (val >= self.hihi || (lalm == self.hihi && val >= self.hihi - hyst)) {
-            recgbl::rec_gbl_set_sevr(
+            if recgbl::rec_gbl_set_sevr(
                 common,
                 alarm_status::HIHI_ALARM,
                 AlarmSeverity::from_u16(self.hhsv as u16),
-            );
-            self.lalm = self.hihi;
+            ) {
+                self.lalm = self.hihi;
+            }
         } else if self.llsv != 0
             && (val <= self.lolo || (lalm == self.lolo && val <= self.lolo + hyst))
         {
-            recgbl::rec_gbl_set_sevr(
+            if recgbl::rec_gbl_set_sevr(
                 common,
                 alarm_status::LOLO_ALARM,
                 AlarmSeverity::from_u16(self.llsv as u16),
-            );
-            self.lalm = self.lolo;
+            ) {
+                self.lalm = self.lolo;
+            }
         } else if self.hsv != 0
             && (val >= self.high || (lalm == self.high && val >= self.high - hyst))
         {
-            recgbl::rec_gbl_set_sevr(
+            if recgbl::rec_gbl_set_sevr(
                 common,
                 alarm_status::HIGH_ALARM,
                 AlarmSeverity::from_u16(self.hsv as u16),
-            );
-            self.lalm = self.high;
+            ) {
+                self.lalm = self.high;
+            }
         } else if self.lsv != 0 && (val <= self.low || (lalm == self.low && val <= self.low + hyst))
         {
-            recgbl::rec_gbl_set_sevr(
+            if recgbl::rec_gbl_set_sevr(
                 common,
                 alarm_status::LOW_ALARM,
                 AlarmSeverity::from_u16(self.lsv as u16),
-            );
-            self.lalm = self.low;
+            ) {
+                self.lalm = self.low;
+            }
         } else {
             // C checkAlarms line 890: out of alarm by at least hyst.
             self.lalm = val;
@@ -1178,6 +1224,22 @@ impl Record for AcalcoutRecord {
             self.set_output_to_ivov();
         }
         Ok(())
+    }
+
+    /// The CHANNEL capacity of the fourteen `special(SPC_DBADDR)` array fields
+    /// — `AVAL`, `AA..LL`, `OAV` — which is `Self::dbaddr_no_elements`, NOT
+    /// the served `Self::num_elements`. C computes the two in two hooks and
+    /// they disagree by design under the default `SIZE=NELM` with a `NUSE`
+    /// window open: `cvt_dbaddr` (`aCalcoutRecord.c:627-631`) reports `NELM`
+    /// while `get_array_info` (`:672`) reports `acalcGetNumElements`.
+    ///
+    /// Advertising the served count instead sized the client's buffer at
+    /// `NUSE`, and `ca_element_count` is settled once at create-channel time,
+    /// so that client never saw the array widen when `NUSE` grew — the exact
+    /// reconnect problem the `SIZE` menu's own comment (`:619-626`) describes,
+    /// arriving under the setting chosen to avoid it.
+    fn dbaddr_capacity(&self, _field: &str) -> Option<u32> {
+        Some(self.dbaddr_no_elements() as u32)
     }
 
     fn get_field(&self, name: &str) -> Option<EpicsValue> {
@@ -1468,11 +1530,17 @@ impl Record for AcalcoutRecord {
             }
             // OUTV is `special(SPC_NOMOD)` (aCalcoutRecord.dbd:414-419): its
             // value is DERIVED from the output link at init/`special`
-            // (aCalcoutRecord.c:216,538 — `*plinkValid = acalcoutINAV_CON` for a
-            // constant link), never set by a client. C `dbPut` rejects the put
-            // with `S_db_noMod` and leaves the link-derived value standing; the
-            // port mirrors that with `ReadOnlyField` (→ `ECA_NOWTACCESS`).
-            "OUTV" => Err(CaError::ReadOnlyField("OUTV".into())),
+            // (aCalcoutRecord.c:216,538). A CLIENT put is refused upstream by
+            // `RecordInstance::is_no_mod`, which is the one gate every record's
+            // SPC_NOMOD fields share; this arm is the link-status refresh's
+            // write (`post_fields` -> `put_field_internal`), its only writer.
+            "OUTV" => {
+                self.outv = value
+                    .to_f64()
+                    .ok_or_else(|| CaError::TypeMismatch("OUTV".into()))?
+                    as i16;
+                Ok(())
+            }
             "EGU" => match value {
                 EpicsValue::String(s) => {
                     self.egu = s;
@@ -1674,13 +1742,21 @@ impl Record for AcalcoutRecord {
                     }
                 }
                 // INAV..INLV / IAAV..ILLV are `special(SPC_NOMOD)`
-                // (aCalcoutRecord.dbd:246-413): each is DERIVED from its input
-                // link's connection state at init/`special`
-                // (aCalcoutRecord.c:216,538), not client-settable. C `dbPut`
-                // rejects with `S_db_noMod`, leaving the derived value; the port
-                // mirrors that rather than storing the raw put over it.
-                if Self::inav_index(name).is_some() || Self::iaav_index(name).is_some() {
-                    return Err(CaError::ReadOnlyField(name.to_string()));
+                // (aCalcoutRecord.dbd:246-413): DERIVED from the link, refused
+                // to clients by `is_no_mod` — see the `OUTV` arm above.
+                if let Some(idx) = Self::inav_index(name) {
+                    self.inav[idx] = value
+                        .to_f64()
+                        .ok_or_else(|| CaError::TypeMismatch(name.into()))?
+                        as i16;
+                    return Ok(());
+                }
+                if let Some(idx) = Self::iaav_index(name) {
+                    self.iaav[idx] = value
+                        .to_f64()
+                        .ok_or_else(|| CaError::TypeMismatch(name.into()))?
+                        as i16;
+                    return Ok(());
                 }
                 if let Some(idx) = Self::pa_index(name) {
                     self.pa[idx] = value
@@ -1942,29 +2018,26 @@ mod tests {
     }
 
     #[test]
-    fn link_status_fields_reject_put_and_keep_derived_value() {
+    fn link_status_fields_are_no_mod_and_read_the_derived_value() {
+        use crate::server::record::RecordInstance;
         // INAV..INLV / IAAV..ILLV / OUTV are `special(SPC_NOMOD)` — derived from
-        // the link, not client-settable. A direct put must be rejected
-        // (`ECA_NOWTACCESS`, C `S_db_noMod`) and leave the link-derived value
-        // standing. A default record has all-constant links → every field = 3
+        // the link, not client-settable. The refusal is the framework's one
+        // SPC_NOMOD gate (`is_no_mod` -> `ECA_NOWTACCESS`, C `S_db_noMod`); the
+        // record's own `put_field` is the refresh's write path and must accept,
+        // which is why the refusal is asserted here and not on `put_field`.
+        // A default record has all-constant links → every field = 3
         // (`acalcoutINAV_CON`). This is the C-parity case the oracle measured:
         // `caput ACALCOUT.INAV 0` then caget → C returns 3, not the put value.
+        let inst = RecordInstance::new("A:LS".into(), AcalcoutRecord::new());
         for name in ["INAV", "INLV", "IAAV", "ILLV", "OUTV"] {
-            let mut rec = AcalcoutRecord::new();
             assert_eq!(
-                rec.get_field(name),
+                inst.resolve_field(name),
                 Some(EpicsValue::Short(LINK_CON)),
-                "{name} should start at derived Constant(3)"
+                "{name} should read derived Constant(3)"
             );
-            let err = rec.put_field(name, EpicsValue::Short(0));
             assert!(
-                matches!(err, Err(CaError::ReadOnlyField(_))),
-                "{name} put should be rejected as read-only, got {err:?}"
-            );
-            assert_eq!(
-                rec.get_field(name),
-                Some(EpicsValue::Short(LINK_CON)),
-                "{name} must stay at the derived Constant(3) after a rejected put"
+                inst.is_no_mod(name),
+                "{name} is SPC_NOMOD — a client put must be refused"
             );
         }
     }

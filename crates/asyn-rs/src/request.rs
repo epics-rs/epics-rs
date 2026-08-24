@@ -665,7 +665,7 @@ impl RequestResult {
 
 /// Lifecycle of a queued request, mirroring C `asynManager` queue/callback
 /// state so that `AQR` cancellation reproduces the `cancelRequest` `wasQueued`
-/// split (asynManager.c:1630-1690) by construction rather than by a runtime
+/// split (asynManager.c:1632-1692) by construction rather than by a runtime
 /// guard.
 ///
 /// `cancelRequest` removes the request and reports `wasQueued==1` ONLY while it

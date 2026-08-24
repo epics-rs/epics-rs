@@ -466,6 +466,13 @@ impl Default for Inner {
 #[derive(Clone)]
 pub struct SharedPV {
     inner: Arc<Mutex<Inner>>,
+    /// Woken by [`Self::open`], awaited by [`Self::wait_open`]. This is
+    /// the port's `pending`/`mpending`: pvxs holds the parked ops in the
+    /// PV and walks them in `open()` (`sharedpv.cpp:239-249`, `:259-275`,
+    /// `:348-384`); here the parked op is a task suspended on this
+    /// notify, so `open()` releases them all with one `notify_waiters`
+    /// and the server never has to own a second copy of the op set.
+    opened: Arc<tokio::sync::Notify>,
 }
 
 impl SharedPV {
@@ -479,6 +486,7 @@ impl SharedPV {
     pub fn new() -> Self {
         Self {
             inner: Arc::new(Mutex::new(Inner::default())),
+            opened: Arc::new(tokio::sync::Notify::new()),
         }
     }
 
@@ -547,7 +555,35 @@ impl SharedPV {
             desc,
             value: initial,
         };
+        drop(g);
+        // Release every op parked on the closed PV. pvxs moves `pending`
+        // and `mpending` out here and runs `connectOp`/`connectSub` on
+        // each (`sharedpv.cpp:355-384`); the parked op is a suspended
+        // task in this port, so waking them is the same act.
+        self.opened.notify_waiters();
         Ok(())
+    }
+
+    /// Resolve to this PV's descriptor, waiting for [`Self::open`] if it
+    /// has not been called yet.
+    ///
+    /// The awaiting side of pvxs's parked-op sets: `SharedPV::onOp`
+    /// inserts a `ConnectOp` into `pending` when `!self->current`
+    /// (`sharedpv.cpp:239-249`) and `onSubscribe` puts a `MonitorSetupOp`
+    /// into `mpending` (`:259-275`) rather than answering an error, and
+    /// `SharedPV::open` completes them all (`:348-384`). Cancelling this
+    /// future is the whole of pvxs's `conn->onClose` erasing the op from
+    /// the set — nothing else has to be undone.
+    pub async fn wait_open(&self) -> FieldDesc {
+        loop {
+            // Register for the wake BEFORE re-reading the state, so an
+            // `open()` landing between the two is not missed.
+            let waiting = self.opened.notified();
+            if let Some(desc) = self.introspection() {
+                return desc;
+            }
+            waiting.await;
+        }
     }
 
     /// Returns true iff the PV has been opened.
@@ -1411,6 +1447,24 @@ impl super::source::ChannelSource for SharedSource {
     ) -> impl std::future::Future<Output = Option<FieldDesc>> + Send {
         let pv = self.pvs.lock().get(name).cloned();
         async move { pv.and_then(|p| p.introspection()) }
+    }
+
+    /// Park until the PV is `open()`ed, instead of answering "not yet"
+    /// as a refusal — pvxs `sharedpv.cpp:239-249` / `:259-275` /
+    /// `:348-384`. A name this source does not host resolves `None`
+    /// immediately: that IS a permanent answer.
+    fn await_introspection(
+        &self,
+        name: &str,
+        _ctx: super::source::ChannelContext,
+    ) -> impl std::future::Future<Output = Option<FieldDesc>> + Send {
+        let pv = self.pvs.lock().get(name).cloned();
+        async move {
+            match pv {
+                Some(pv) => Some(pv.wait_open().await),
+                None => None,
+            }
+        }
     }
 
     fn get_value(&self, name: &str) -> impl std::future::Future<Output = Option<PvField>> + Send {

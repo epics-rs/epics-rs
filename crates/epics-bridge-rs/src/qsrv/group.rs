@@ -4,7 +4,7 @@
 //! A group PV combines fields from multiple EPICS database records
 //! into a single PvStructure.
 
-// RTEMS-EXEC-MODEL-ALLOW(27): checked - these run and pass in the feature-ON suite.
+// RTEMS-EXEC-MODEL-ALLOW(28): checked - these run and pass in the feature-ON suite.
 
 use std::borrow::Cow;
 use std::collections::HashMap;
@@ -14,7 +14,7 @@ use epics_base_rs::server::database::PvDatabase;
 use epics_base_rs::server::database::db_access::{DbSubscription, SubscriptionActivation};
 use epics_base_rs::server::recgbl::EventMask as DbeMask;
 use epics_base_rs::server::snapshot::PropertySupport;
-use epics_base_rs::types::{DbFieldType, dbf_link_class};
+use epics_base_rs::types::DbFieldType;
 use epics_pva_rs::pvdata::{FieldDesc, PvField, PvStructure, ScalarType, VariantValue};
 use epics_pva_rs::server_native::source::RemoteLog;
 
@@ -238,6 +238,31 @@ enum OptionsStamp {
 /// `queueSize = 0`; a MONITOR reports `atomic = true` and the negotiated
 /// limit. `op_atomic` is ignored on the MONITOR path — pvxs stamps `true`
 /// there unconditionally (`groupsource.cpp:401-405`).
+/// Put the built-in `record` branch at member 0, creating it empty when
+/// no group member built one.
+///
+/// pvxs pushes the `record` Struct onto `groupMembersToAdd` BEFORE
+/// `addTemplatesForDefinedFields` and appends the whole vector in that
+/// order (`groupconfigprocessor.cpp:502-518`), while `TypeDef::_append`
+/// merges a user `record` member into that same branch instead of adding
+/// a second one (`type.cpp:374-389`). So upstream `record` is member 0
+/// whichever half created it, which is what fixes `record._options
+/// .queueSize` at bit 3 and `atomic` at bit 4 and leaves every user
+/// member's bit index behind them. Both the descriptor and the value
+/// composer stamp the branch after their member loop, so without this the
+/// branch landed last and shifted every user bit for the same group
+/// definition.
+fn hoist_record_member<T>(fields: &mut Vec<(String, T)>, empty: impl FnOnce() -> T) {
+    match fields.iter().position(|(n, _)| n == "record") {
+        Some(0) => {}
+        Some(pos) => {
+            let entry = fields.remove(pos);
+            fields.insert(0, entry);
+        }
+        None => fields.insert(0, ("record".to_string(), empty())),
+    }
+}
+
 fn push_record_options(pv: &mut PvStructure, op_atomic: bool, stamp: OptionsStamp) {
     use epics_pva_rs::pvdata::ScalarValue;
     let (atomic, queue_size) = match stamp {
@@ -260,6 +285,7 @@ fn push_record_options(pv: &mut PvStructure, op_atomic: bool, stamp: OptionsStam
     // Merge the built-in options under `record._options`, navigating into
     // an existing `record` structure and replacing only the `_options`
     // child — user `record.*` siblings are left intact.
+    hoist_record_member(&mut pv.fields, || PvField::Structure(PvStructure::new("")));
     set_nested_field(pv, "record._options", PvField::Structure(options));
 }
 
@@ -1120,7 +1146,9 @@ impl GroupChannel {
                         field: field_name.to_string(),
                     }
                 })?;
-                let mut meta = PvStructure::new("meta_t");
+                // Same unnamed enclosing structure the descriptor
+                // advertises (see `meta_desc`), so the two cannot drift.
+                let mut meta = PvStructure::new("");
                 meta.fields.push((
                     "alarm".into(),
                     PvField::Structure(build_alarm_from_snapshot(&snapshot)),
@@ -1233,19 +1261,10 @@ impl GroupChannel {
         if member.channel.is_empty() {
             return false;
         }
-        let (record_name, field_name) =
-            epics_base_rs::server::database::parse_pv_name(&member.channel);
-        // Resolve the backing record's type so the two direction-ambiguous
-        // families (`SIOL`, `LNK*`) classify per record type. An
-        // unresolvable backing record cannot occur for a group pvxs would
-        // have loaded (the dbChannel creation would have failed); fall back
-        // to record-type-blind name classification, which still catches the
-        // unambiguous link families.
-        let record_type: &'static str = match self.db.get_record(record_name) {
-            Some(rec) => rec.read().record.record_type(),
-            None => "",
-        };
-        dbf_link_class(record_type, field_name).is_some()
+        // Through the shared classifier so the put gate and the group
+        // CREATION gate (`BridgeProvider::group_creation_error`) answer
+        // "is this a link field" from one table.
+        super::channel::channel_link_class(&self.db, &member.channel).is_some()
     }
 
     /// The node inside the member's incoming value that actually carries
@@ -1527,7 +1546,11 @@ impl GroupChannel {
                 }
                 ProcessMode::Force => {
                     let pv = format!("{record_name}.{field_name}");
-                    self.db.put_pv_already_locked(&pv, value).map_err(to_err)?;
+                    // The cycle two lines down owns any put-notify restart
+                    // this put's PACT release arms — see `RestartOwner`.
+                    self.db
+                        .put_pv_already_locked_before_process(&pv, value)
+                        .map_err(to_err)?;
                     let mut visited = std::collections::HashSet::new();
                     self.db
                         .process_record_with_links_already_locked(record_name, &mut visited, 0)
@@ -1689,19 +1712,27 @@ impl GroupChannel {
         let classify = |m: &GroupMember| -> MemberPutAction { member_put_action(m, value) };
 
         // pvxs's group PUT preparation pass (groupsource.cpp:596-609)
-        // iterates EVERY backing field — before any marked/putable
-        // filtering — and throws "Links not supported for put" for any
-        // field whose `dbChannelFinalFieldType` is link class
-        // (`DBF_INLINK..=DBF_FWDLINK`, groupsource.cpp:603-606). The
-        // rejection is independent of whether the client marked that
-        // member: a sparse PUT marking only a scalar still fails if the
-        // group also binds a link field. Run the check over all members
-        // with a backing channel (not `member_is_active`-gated), and
-        // classify by the actual DBF link class via the canonical
-        // `dbf_link_class` classifier rather than a member-name
-        // heuristic — a name list re-opens the bypass for any record
-        // that spells a link field outside the list and false-rejects
-        // non-link fields whose names collide with the heuristic.
+        // iterates EVERY backing field before any marked/putable filtering
+        // and, on paper, throws "Links not supported for put" for a link
+        // field. It never fires: the test at groupsource.cpp:603-604 reads
+        // `dbChannelFinalFieldType`, and ioc/channel.cpp:69-73 has already
+        // set `addr.dbr_field_type = DBR_CHAR` for every link field before
+        // `dbChannelOpen`, which epics-base seeds into `final_type`
+        // (dbChannel.c:579, :621). So the value is 1, never >= DBF_INLINK,
+        // and pvxs reaches `doDbPut` and really does write link fields.
+        //
+        // Two rulings follow, and they point opposite ways. Refusing a
+        // link member the client asked to WRITE is kept: pvxs writes it
+        // only because it tested the wrong accessor, and reproducing
+        // another server's wrong-accessor bug is not parity. But refusing
+        // the whole operation because of a member nobody is writing is
+        // dropped — that behaviour existed only to mirror the dead test's
+        // position in the prep pass, and it failed `pvput GRP v=1` on any
+        // group that merely binds an FLNK. The check now runs on the
+        // members this PUT writes, classified by the actual DBF link class
+        // through the canonical classifier rather than a member-name
+        // heuristic (a name list re-opens the bypass for any record that
+        // spells a link field outside it).
         for m in &self.def.members {
             // A Structure/Const member has no backing dbChannel — pvxs's
             // prep pass gates each check on `field.value` being non-null
@@ -1723,7 +1754,9 @@ impl GroupChannel {
             // the `Force`/`Inhibit` group routes go through `put_pv`, which
             // does not itself gate DISP.
             super::put_status::check_preconditions(&self.db, record_name, field_name).await?;
-            if self.member_targets_link_field(m).await {
+            if matches!(classify(m), MemberPutAction::Write)
+                && self.member_targets_link_field(m).await
+            {
                 return Err(super::put_status::links_not_supported(&format!(
                     "group {} PUT: member '{}' targets link field '{}'",
                     self.def.name, m.field_name, m.channel
@@ -2105,7 +2138,15 @@ impl super::provider::Channel for GroupChannel {
                     }
                 }
             };
-            if let Some(member_id) = &member.struct_id
+            // `+id` names the struct id of a `+type:"structure"` member and
+            // of nothing else: `groupField.id` is read at exactly one place
+            // upstream, `addMembersForStructureType`
+            // (`groupconfigprocessor.cpp:922-931`). The scalar, plain, any
+            // and meta builders never consult it, so an NT leaf keeps the id
+            // its own type definition gives it and a meta member stays
+            // unnamed.
+            if member.mapping == FieldMapping::Structure
+                && let Some(member_id) = &member.struct_id
                 && let FieldDesc::Structure { struct_id, .. } = &mut desc
             {
                 *struct_id = member_id.clone();
@@ -2118,13 +2159,18 @@ impl super::provider::Channel for GroupChannel {
         }
 
         // Advertise the built-in `record._options` branch the value side
-        // stamps via push_record_options. Merge it under `record` (adding
-        // `record` after members if absent, else descending into the
-        // user-built `record` and replacing only the `_options` child) so
-        // a user `record.*` member descriptor is preserved and descriptor
-        // and payload agree. pvxs carries it in group.valueTemplate via a
-        // recursive `TypeDef::_append()` merge, not a whole-`record`
-        // replacement (groupconfigprocessor.cpp:499-523, type.cpp:374-389).
+        // stamps via push_record_options. Merge it under `record`
+        // (descending into a user-built `record` and replacing only the
+        // `_options` child) so a user `record.*` member descriptor is
+        // preserved and descriptor and payload agree. pvxs carries it in
+        // group.valueTemplate via a recursive `TypeDef::_append()` merge,
+        // not a whole-`record` replacement (groupconfigprocessor.cpp
+        // :499-523, type.cpp:374-389) — and it is member 0 there, which
+        // `hoist_record_member` owns.
+        hoist_record_member(&mut fields, || FieldDesc::Structure {
+            struct_id: String::new(),
+            fields: Vec::new(),
+        });
         set_nested_field_desc(
             &mut fields,
             "record._options",
@@ -2748,9 +2794,20 @@ impl super::provider::PvaMonitor for AnyMonitor {
 // Helpers
 // ---------------------------------------------------------------------------
 
+/// The `+type:"meta"` member shape: `{alarm, timeStamp}` under an
+/// **unnamed** enclosing structure.
+///
+/// pvxs's `addMembersForMetaData` builds only those two members and hands
+/// them to `setFieldTypeDefinition(..., isLeaf = false)`
+/// (`groupconfigprocessor.cpp:940-952`), which wraps each path component
+/// with the two-argument `members::Struct(name, children)` overload
+/// (`:1028-1030`, `include/pvxs/data.h:348-354`) — the one that carries no
+/// id. So the wire shows `structure m` with a single zero id byte, not
+/// `meta_t m` with a seven-byte id string. A root meta member is spliced
+/// straight into the group root and never sees this id at all.
 fn meta_desc() -> FieldDesc {
     FieldDesc::Structure {
-        struct_id: "meta_t".into(),
+        struct_id: String::new(),
         fields: vec![
             (
                 "alarm".into(),
@@ -4419,17 +4476,16 @@ mod tests {
         );
     }
 
-    /// pvxs prepares a group PUT by iterating every backing field and
-    /// throwing "Links not supported for put" for any link-class field
-    /// (`dbChannelFinalFieldType` in `DBF_INLINK..=DBF_FWDLINK`,
-    /// groupsource.cpp:603-606) BEFORE any marked/putable filtering. A
-    /// sparse PUT marking only a scalar member must therefore still be
-    /// rejected when the same group binds a link field. The prior Rust path
-    /// gated the link check on `member_is_active`, so an unmarked link
-    /// member never rejected a partial PUT; it also classified by a
-    /// member-name heuristic rather than the actual DBF link class.
+    /// The two boundaries of the link refusal. pvxs's link test at
+    /// groupsource.cpp:603-604 is dead code — `dbChannelFinalFieldType` is
+    /// `DBR_CHAR` for every link field (ioc/channel.cpp:69-73 →
+    /// dbChannel.c:579, :621) — so pvxs writes link members and refuses
+    /// nothing. The port refuses a link member it is asked to WRITE, and
+    /// only that member: a PUT marking an unrelated scalar must go through
+    /// even though the group also binds `FLNK`, which is what the port used
+    /// to fail.
     #[tokio::test]
-    async fn group_put_rejects_link_member_even_when_unmarked() {
+    async fn group_put_refuses_a_marked_link_member_and_only_that_member() {
         use epics_base_rs::server::records::ai::AiRecord;
         use epics_pva_rs::pvdata::ScalarValue;
 
@@ -4450,19 +4506,28 @@ mod tests {
         let channel = GroupChannel::new(db.clone(), def);
 
         // Partial PUT marking ONLY the scalar value member; the link member
-        // is left unmarked.
+        // is left unmarked, so nothing writes it and it must not veto.
         let mut value = PvStructure::new("structure");
         value.set("v", PvField::Scalar(ScalarValue::Double(2.0)));
-        let res = channel.put(&value).await;
+        channel
+            .put(&value)
+            .await
+            .expect("an untouched link member must not fail a scalar PUT");
+
+        // Marking the link member is the case that still refuses.
+        let mut marked = PvStructure::new("structure");
+        marked.set(
+            "fwd",
+            PvField::Scalar(ScalarValue::String("OTHER:REC".into())),
+        );
+        let res = channel.put(&marked).await;
         assert!(
             matches!(res, Err(BridgeError::PutRejected(_))),
-            "a partial group PUT marking only the scalar must be rejected \
-             when the group binds a link field (pvxs groupsource.cpp:603-606): {res:?}"
+            "writing a link member must be refused: {res:?}"
         );
 
         // Control: a group with only the scalar member accepts the same
-        // partial PUT, proving the rejection is the link member, not the
-        // partial shape.
+        // partial PUT, proving the acceptance above is not accidental.
         let cfg_ok = r#"{ "OK:GRP": {
             "v": {"+type": "plain", "+channel": "LNK:rec.VAL", "+putorder": 0}
         } }"#;
@@ -4523,7 +4588,17 @@ mod tests {
         );
         let mut v = PvStructure::new("structure");
         v.set("v", PvField::Scalar(ScalarValue::Double(2.0)));
-        let err = link.put(&v).await.expect_err("link member must reject");
+        // The refusal follows the member being written, so the link member
+        // has to be the marked one.
+        let mut link_marked = PvStructure::new("structure");
+        link_marked.set(
+            "fwd",
+            PvField::Scalar(ScalarValue::String("OTHER:REC".into())),
+        );
+        let err = link
+            .put(&link_marked)
+            .await
+            .expect_err("link member must reject");
         assert_eq!(wire_message(&err), "Links not supported for put");
 
         // "No fields changed" — a member without `+putorder` is not putable,
@@ -5744,6 +5819,66 @@ mod tests {
         assert!(
             has_processed(&db, "HOOK:rec").await,
             "the proc member's record was processed despite the write deny"
+        );
+    }
+
+    /// pvxs's `addMembersForMetaData` wraps `{alarm, timeStamp}` with the
+    /// TWO-argument `members::Struct(name, children)` overload
+    /// (`groupconfigprocessor.cpp:940-952` → `:1028-1030`,
+    /// `include/pvxs/data.h:348-354`), which carries no id — the wire shows
+    /// `structure m`, one zero byte, not `meta_t m` and a seven-byte id
+    /// string. `groupField.id` is read at exactly one place upstream,
+    /// `addMembersForStructureType` (`:922-931`), so `+id` names a
+    /// `+type:"structure"` member and nothing else.
+    #[tokio::test]
+    async fn meta_member_is_advertised_without_a_struct_id() {
+        use epics_base_rs::server::records::ai::AiRecord;
+        use epics_pva_rs::pvdata::FieldDesc;
+
+        let db = Arc::new(PvDatabase::new());
+        db.add_record("METAID:rec", Box::new(AiRecord::new(0.0)))
+            .await
+            .unwrap();
+
+        let cfg = r#"{ "METAID:GRP": {
+            "m": { "+type": "meta", "+channel": "METAID:rec.VAL", "+id": "ignored/v1" },
+            "s": { "+type": "scalar", "+channel": "METAID:rec.VAL", "+id": "alsoignored/v1" },
+            "c": { "+type": "structure", "+id": "kept/v1" }
+        } }"#;
+        let mut defs = super::super::group_config::parse_group_config(cfg).unwrap();
+        let def = defs.pop().unwrap();
+        let channel = GroupChannel::new(db.clone(), def);
+
+        let desc = channel.get_field().await.expect("get_field");
+        let root = match &desc {
+            FieldDesc::Structure { fields, .. } => fields,
+            other => panic!("group descriptor must be a structure, got {other:?}"),
+        };
+        let id_of = |name: &str| match root.iter().find(|(n, _)| n == name).map(|(_, d)| d) {
+            Some(FieldDesc::Structure { struct_id, fields }) => (struct_id.clone(), fields.clone()),
+            other => panic!("{name} must be a structure, got {other:?}"),
+        };
+
+        let (meta_id, meta_fields) = id_of("m");
+        assert_eq!(meta_id, "", "a meta member's enclosing struct has no id");
+        assert!(
+            matches!(
+                meta_fields.iter().find(|(n, _)| n == "alarm").map(|(_, d)| d),
+                Some(FieldDesc::Structure { struct_id, .. }) if struct_id == "alarm_t"
+            ),
+            "the alarm child keeps the id pvxs gives it, got {meta_fields:?}"
+        );
+
+        let (scalar_id, _) = id_of("s");
+        assert_eq!(
+            scalar_id, "epics:nt/NTScalar:1.0",
+            "an NT leaf keeps the id its own type definition gives it"
+        );
+
+        let (structure_id, _) = id_of("c");
+        assert_eq!(
+            structure_id, "kept/v1",
+            "+id names a +type:\"structure\" member, and only that"
         );
     }
 }

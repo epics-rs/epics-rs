@@ -41,6 +41,10 @@
 //! caput T:C.VAL  Inf         -> inf
 //! caput T:LO.DRVH -1         -> -1
 //! caput T:LO.DRVH 2147483648 -> ERROR ... write request failed
+//! caput T:W      hi          -> ERROR ... write request failed   W unchanged
+//! caput T:W      65          -> 65 0 0 ...   NORD 1
+//! caput -S T:W   hi          -> 104 105 0 ... NORD 3  (DBR_CHAR, with the NUL)
+//! caput T:WU     hi          -> ERROR ... write request failed   WU unchanged
 //! ```
 //!
 //! The cases are the invariant BOUNDARIES of the row — at-limit, just-over,
@@ -191,16 +195,43 @@ async fn integers_parse_base_zero() {
     stored(&db, "C", "VAL", "0x10", EpicsValue::Double(16.0)).await;
 }
 
-/// The array row is NOT this converter: a `DBF_CHAR[]` destination still takes
-/// a string as its bytes. Guards the exemption in `coerce_put_value` — without
-/// it, the parse would reject `"hi"` as unparseable text and the char-waveform
-/// carry would be dead.
+/// The array row is the SAME converter, applied per element:
+/// `dbPutConvertRoutine[DBR_STRING][DBF_CHAR]` is `putStringChar`
+/// (dbConvert.c:941-957), whose body is `epicsParseInt8(psrc, pdst++,
+/// dbConvertBase, &end)`. So a DBR_STRING put of `"hi"` into an `FTVL=CHAR`
+/// waveform is REFUSED, and `"65"` stores the ONE element 65 — not the two
+/// bytes of the text. The string's bytes reach the buffer only when the client
+/// asks for `DBR_CHAR` (`caput -S`), which arrives as a `CharArray` and takes
+/// no conversion at all. The rule does not vary with FTVL: `FTVL=UCHAR`
+/// refuses `"hi"` the same way (`putStringUchar`, :960-977).
 #[epics_macros_rs::epics_test]
-async fn a_string_into_a_char_array_is_still_its_bytes() {
+async fn a_string_into_a_char_array_is_parsed_like_every_other_numeric() {
     let db = build().await;
-    db.put_pv("W.VAL", EpicsValue::String("hi".into()))
+    let before = read(&db, "W.VAL").await;
+
+    assert!(
+        caput(&db, "W", "VAL", "hi").await.is_err(),
+        "W.VAL = \"hi\" must be REFUSED — putStringChar's epicsParseInt8 fails"
+    );
+    assert_eq!(
+        read(&db, "W.VAL").await,
+        before,
+        "a refused array put stores nothing"
+    );
+
+    caput(&db, "W", "VAL", "65").await.unwrap();
+    let EpicsValue::CharArray(bytes) = read(&db, "W.VAL").await else {
+        panic!("FTVL=CHAR stores a CharArray")
+    };
+    assert_eq!(
+        bytes[0], 65,
+        "one PARSED element, not the two text bytes of \"65\""
+    );
+
+    // DBR_CHAR (`caput -S`): the bytes, and no conversion row at all.
+    db.put_record_field_from_ca("W", "VAL", EpicsValue::CharArray(b"hi".to_vec()))
         .await
-        .expect("a char waveform takes a string as bytes");
+        .expect("a DBR_CHAR put carries the bytes");
     let EpicsValue::CharArray(bytes) = read(&db, "W.VAL").await else {
         panic!("FTVL=CHAR stores a CharArray")
     };

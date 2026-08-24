@@ -106,6 +106,20 @@ impl DeviceSupport for ScalerAsynDeviceSupport {
 
         let mut driver = self.driver.lock().unwrap();
 
+        // Read all channel counts into the record.
+        //
+        // The read comes first and its failure propagates: `processing`
+        // raises READ_ALARM/INVALID on an `Err` from device support and
+        // nothing else does, so a swallowed error left the record showing
+        // the previous scan's counts at NO_ALARM. It also has to come
+        // before the done latch below, because that latch is read-and-clear
+        // (see `ScalerDriver::done`): consuming the completion and then
+        // failing the read would drop it for good, and no later scan could
+        // re-deliver it.
+        let mut counts = [0u32; MAX_SCALER_CHANNELS];
+        driver.read(&mut counts)?;
+        scaler.s = counts;
+
         // Check if counting completed. C devScalerAsyn.c:292-301
         // `scaler_done()` is the dset entry the record polls every
         // process cycle (scalerRecord.c:367); it is read-and-clear, so
@@ -113,12 +127,6 @@ impl DeviceSupport for ScalerAsynDeviceSupport {
         // support marks the record done before process() runs.
         if driver.done() {
             scaler.set_done();
-        }
-
-        // Read all channel counts into the record
-        let mut counts = [0u32; MAX_SCALER_CHANNELS];
-        if driver.read(&mut counts).is_ok() {
-            scaler.s = counts;
         }
 
         Ok(DeviceReadOutcome::ok())

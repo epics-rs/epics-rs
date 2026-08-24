@@ -228,11 +228,22 @@ impl Record for HistogramRecord {
                 ..Default::default()
             });
         }
-        field
-            .eq_ignore_ascii_case("SDEL")
-            .then(|| FieldMetadataOverride {
+        if field.eq_ignore_ascii_case("SDEL") {
+            return Some(FieldMetadataOverride {
                 units: Some("s".into()),
                 precision: Some(HISTOGRAM_SDEL_PRECISION),
+                ..Default::default()
+            });
+        }
+        // `SDLY` is the one DBF_DOUBLE field histogram's precision switch does
+        // NOT list, so it takes the `default: recGblGetPrec` arm — which for a
+        // DBF_DOUBLE only clamps an out-of-range value (`recGbl.c:135-139`) and
+        // therefore leaves `dbAccess.c:388`'s zeroed buffer standing. The
+        // record-level PREC cache would otherwise reach it.
+        field
+            .eq_ignore_ascii_case("SDLY")
+            .then(|| FieldMetadataOverride {
+                precision: Some(0),
                 ..Default::default()
             })
     }
@@ -433,12 +444,13 @@ impl Record for HistogramRecord {
     /// callback so far in the future it never fires. `Duration::from_secs_f64`
     /// PANICS on a non-finite or Duration-overflowing value, so it cannot be the
     /// converter here: a store of `1e308`/`1e39`/`inf` would abort the put the
-    /// oracle expects to succeed. `try_from_secs_f64` maps every such value to
-    /// `None` (no watchdog arms — behaviourally identical to C's never-firing
-    /// callback), leaving the store itself accepted for the whole double range.
+    /// oracle expects to succeed. `runtime::time::duration_from_secs` — the
+    /// seam's one converter for a record field — maps them to `Duration::MAX`,
+    /// C's never-firing deadline, so `None` here keeps its single meaning:
+    /// C's `sdel > 0` test said there is no watchdog.
     fn watchdog_interval(&self) -> Option<std::time::Duration> {
         if self.sdel > 0.0 {
-            std::time::Duration::try_from_secs_f64(self.sdel).ok()
+            Some(crate::runtime::time::duration_from_secs(self.sdel))
         } else {
             None
         }

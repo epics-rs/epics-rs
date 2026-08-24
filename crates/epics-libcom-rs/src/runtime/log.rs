@@ -9,8 +9,11 @@
 //!
 //! The `errlog`-severity API mirrors `errlogSevEnum`,
 //! `errlogSevEnumString`, `errlogSetSevToLog`/`errlogGetSevToLog`, and
-//! `errlogSevPrintf` — a record's error messages can be suppressed
-//! below a configurable severity threshold, exactly as a C IOC does.
+//! `errlogSevPrintf`. Note what C does *not* do: `errlogSevVprintf`
+//! (`errlog.c:379-391`) consults no threshold, and nothing else in base
+//! reads `pvt.sevToLog` either — `errlogSetSevToLog`/`errlogGetSevToLog`
+//! are a stored setting and no more. A C IOC therefore prints every
+//! `errlogSevPrintf` line whatever the setting says, and so does this.
 
 use std::sync::atomic::{AtomicU8, Ordering};
 
@@ -297,20 +300,28 @@ pub fn errlog_sev_enum_string(severity: ErrlogSevEnum) -> &'static str {
     severity.as_str()
 }
 
-/// Severity threshold below which `errlog_sev_printf` messages are
-/// suppressed from being logged. C parity: `pvt.sevToLog`, default
-/// `errlogMinor` (`errlog.c` static init).
-static SEV_TO_LOG: AtomicU8 = AtomicU8::new(ErrlogSevEnum::Minor as u8);
+/// Backing store for `errlogSetSevToLog`/`errlogGetSevToLog`. C parity:
+/// `pvt.sevToLog` (`errlog.c:99`), which lives in the file-scope static
+/// `pvt` and is therefore zero-initialised — `errlogInfo`, not
+/// `errlogMinor`. Nothing may consult it; see [`errlog_set_sev_to_log`].
+static SEV_TO_LOG: AtomicU8 = AtomicU8::new(ErrlogSevEnum::Info as u8);
 
-/// Set the severity-to-log threshold — C `errlogSetSevToLog`
-/// (`errlog.c:399-405`). Messages with a severity below this value are
-/// suppressed.
+/// Store the severity-to-log setting — C `errlogSetSevToLog`
+/// (`errlog.c:402-408`).
+///
+/// This sets a value and changes no behaviour, which is exactly what the
+/// C call does: `rg sevToLog` over base finds the struct member
+/// (`errlog.c:99`), this store (`:406`) and the read-back in
+/// [`errlog_get_sev_to_log`] (`:415`) and nothing else, so no message is
+/// ever filtered by it. Do not add a suppression test against this value
+/// — that would drop lines a C IOC prints.
 pub fn errlog_set_sev_to_log(severity: ErrlogSevEnum) {
     SEV_TO_LOG.store(severity as u8, Ordering::Relaxed);
 }
 
-/// Get the current severity-to-log threshold — C `errlogGetSevToLog`
-/// (`errlog.c:407-415`).
+/// Read the severity-to-log setting back — C `errlogGetSevToLog`
+/// (`errlog.c:410-418`). Round-trips [`errlog_set_sev_to_log`]; carries
+/// no filtering authority.
 pub fn errlog_get_sev_to_log() -> ErrlogSevEnum {
     ErrlogSevEnum::from_u8(SEV_TO_LOG.load(Ordering::Relaxed))
 }
@@ -339,18 +350,17 @@ pub fn erl_warning() -> &'static str {
     }
 }
 
-/// Emit a pre-formatted error message at the given severity, suppressed
-/// when `severity` is below the [`errlog_get_sev_to_log`] threshold.
+/// Emit a pre-formatted error message at the given severity.
 ///
-/// C parity: `errlogSevVprintf`/`errlogSevPrintf` (`errlog.c:366-389`)
-/// — the C code prefixes `"sevr=%s "` and routes to the message queue.
-/// Here the prefix is preserved and the message is routed through
-/// `tracing` at a level mapped from the severity. Returns `true` when
-/// the message was emitted, `false` when suppressed by the threshold.
-pub fn errlog_sev_printf(severity: ErrlogSevEnum, message: &str) -> bool {
-    if severity < errlog_get_sev_to_log() {
-        return false;
-    }
+/// C parity: `errlogSevVprintf`/`errlogSevPrintf` (`errlog.c:371-391`)
+/// — the C code prefixes `"sevr=%s "` and routes to the message queue,
+/// unconditionally. Here the prefix is preserved and the message is
+/// routed through `tracing` at a level mapped from the severity.
+///
+/// Unconditionally is the whole point: `errlogSevVprintf` tests no
+/// threshold, so an `errlogInfo` line reaches a C console whatever
+/// `errlogSetSevToLog` was told. See [`errlog_set_sev_to_log`].
+pub fn errlog_sev_printf(severity: ErrlogSevEnum, message: &str) {
     let line = format!("sevr={} {}", severity.as_str(), message);
     match severity {
         ErrlogSevEnum::Info => {
@@ -364,16 +374,15 @@ pub fn errlog_sev_printf(severity: ErrlogSevEnum, message: &str) -> bool {
         }
     }
     console_fallback(&format_args!("{line}"));
-    true
 }
 
 /// Emit a pre-formatted message through the errlog facility
 /// unconditionally — C `errlogVprintf`/`errlogPrintf`
 /// (`errlog.c:333-364`), the *no-severity* variant.
 ///
-/// Unlike [`errlog_sev_printf`] this carries no `sevr=` prefix and is
-/// never gated by the [`errlog_get_sev_to_log`] threshold (C
-/// `errlogVprintf` always enqueues). Routed through `tracing` at info
+/// Unlike [`errlog_sev_printf`] this carries no `sevr=` prefix (C
+/// `errlogVprintf` enqueues the caller's bytes verbatim). Neither call
+/// is gated: see [`errlog_set_sev_to_log`]. Routed through `tracing` at info
 /// level on the same `epics_base_rs::errlog` target, so an application's
 /// subscriber sees it on the errlog sink. Used by `stdio` device support
 /// for the `"errlog"` output stream (`devStdio.c` `logPrintf`).
@@ -563,21 +572,58 @@ mod tests {
         errlog_set_sev_to_log(ErrlogSevEnum::Major);
         assert_eq!(errlog_get_sev_to_log(), ErrlogSevEnum::Major);
         // Restore the C default.
-        errlog_set_sev_to_log(ErrlogSevEnum::Minor);
-        assert_eq!(errlog_get_sev_to_log(), ErrlogSevEnum::Minor);
+        errlog_set_sev_to_log(ErrlogSevEnum::Info);
+        assert_eq!(errlog_get_sev_to_log(), ErrlogSevEnum::Info);
     }
 
+    /// C's `pvt` is a file-scope static, so `pvt.sevToLog` starts at 0 —
+    /// `errlogInfo`. Every test in the `errlog_sev` group restores that
+    /// value, so this holds whichever order they run in.
     #[test]
     #[serial(errlog_sev)]
-    fn sev_printf_suppresses_below_threshold() {
-        errlog_set_sev_to_log(ErrlogSevEnum::Major);
-        // Below threshold -> suppressed.
-        assert!(!errlog_sev_printf(ErrlogSevEnum::Info, "quiet"));
-        assert!(!errlog_sev_printf(ErrlogSevEnum::Minor, "quiet"));
-        // At or above threshold -> emitted.
-        assert!(errlog_sev_printf(ErrlogSevEnum::Major, "loud"));
-        assert!(errlog_sev_printf(ErrlogSevEnum::Fatal, "loud"));
-        errlog_set_sev_to_log(ErrlogSevEnum::Minor);
+    fn sev_to_log_defaults_to_info_like_c_zero_init() {
+        assert_eq!(
+            errlog_get_sev_to_log(),
+            ErrlogSevEnum::Info,
+            "C zero-initialises pvt.sevToLog to errlogInfo, not errlogMinor"
+        );
+    }
+
+    /// The setting is inert. `errlogSevVprintf` (`errlog.c:379-391`) tests
+    /// no threshold, and no other C function reads `pvt.sevToLog`, so a
+    /// C IOC prints `sevr=info` lines even after `errlogSetSevToLog(major)`
+    /// — e.g. `devBiDbState`'s "Creating new db state" notice at iocInit.
+    #[test]
+    #[serial(errlog_sev)]
+    fn sev_printf_emits_every_severity_whatever_sev_to_log_says() {
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        errlog_set_sev_to_log(ErrlogSevEnum::Fatal);
+        tracing::subscriber::with_default(CapturingSubscriber(seen.clone()), || {
+            errlog_sev_printf(ErrlogSevEnum::Info, "creating new db state 'mystate'");
+            errlog_sev_printf(ErrlogSevEnum::Minor, "a minor complaint");
+            errlog_sev_printf(ErrlogSevEnum::Major, "a major complaint");
+        });
+        errlog_set_sev_to_log(ErrlogSevEnum::Info);
+
+        let lines = seen.lock().expect("sink").clone();
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.contains("sevr=info creating new db state 'mystate'")),
+            "sevToLog=fatal must not suppress an errlogInfo line: {lines:?}"
+        );
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.contains("sevr=minor a minor complaint")),
+            "sevToLog=fatal must not suppress an errlogMinor line: {lines:?}"
+        );
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.contains("sevr=major a major complaint")),
+            "sevToLog=fatal must not suppress an errlogMajor line: {lines:?}"
+        );
     }
     /// The distinction the whole hook exists for. A panic on a worker thread
     /// leaves an IOC that still listens and still answers searches, which is

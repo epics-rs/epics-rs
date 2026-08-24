@@ -11,7 +11,7 @@
 //! the target's own selection for no reason.
 #![cfg(feature = "qsrv-core")]
 
-// RTEMS-EXEC-MODEL-ALLOW(32): checked - these run and pass in the feature-ON suite.
+// RTEMS-EXEC-MODEL-ALLOW(34): checked - these run and pass in the feature-ON suite.
 
 use std::sync::Arc;
 
@@ -2170,4 +2170,108 @@ async fn group_flood_does_not_stall_scalar_monitor_delivery() {
 
     group_mon.stop().await;
     scalar_mon.stop().await;
+}
+
+/// pvxs pushes the built-in `record` Struct onto `groupMembersToAdd`
+/// BEFORE `addTemplatesForDefinedFields` and appends the vector in that
+/// order (`groupconfigprocessor.cpp:502-518`), so `record` is member 0 of
+/// every group: `record._options.queueSize` is bit 3, `atomic` is bit 4,
+/// and the user members follow. The port appended `record` after the
+/// member loop, which moved every user member's bit index and changed the
+/// FIELD_DESC bytes emitted for the same group definition.
+#[tokio::test]
+async fn group_carries_the_record_branch_as_member_zero() {
+    use epics_pva_rs::pvdata::FieldDesc;
+    use epics_pva_rs::pvdata::encode::marked_changed_bitset;
+
+    let db = make_db().await;
+    let provider = Arc::new(BridgeProvider::new(db.clone()));
+    provider.load_group_config(GROUP_JSON).expect("load");
+    let def = provider
+        .groups()
+        .get("TEST:grp")
+        .cloned()
+        .expect("registered");
+    let ch = GroupChannel::new(db, def);
+
+    let desc = ch.get_field().await.expect("get_field");
+    let root = match &desc {
+        FieldDesc::Structure { fields, .. } => fields,
+        other => panic!("group descriptor must be a structure, got {other:?}"),
+    };
+    assert_eq!(
+        root.iter().map(|(n, _)| n.as_str()).collect::<Vec<_>>(),
+        vec!["record", "level", "count"],
+        "pvxs orders the built-in `record` branch ahead of the members"
+    );
+
+    let bit = |path: &str| {
+        marked_changed_bitset(&desc, &[path.to_string()])
+            .iter()
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(bit("record._options.queueSize"), vec![3]);
+    assert_eq!(bit("record._options.atomic"), vec![4]);
+    assert_eq!(bit("level"), vec![5]);
+    assert_eq!(bit("count"), vec![6]);
+
+    // The GET value is composed by a different function; it must place the
+    // branch identically or the descriptor and the payload disagree.
+    let value = ch.get(&empty_request()).await.expect("get");
+    assert_eq!(
+        value
+            .fields
+            .iter()
+            .map(|(n, _)| n.as_str())
+            .collect::<Vec<_>>(),
+        vec!["record", "level", "count"],
+    );
+}
+
+/// A group MONITOR seed must MARK `record._options.queueSize`, not merely
+/// carry its value: pvxs assigns it into `currentValue` in `onSubscribe`
+/// (`groupsource.cpp:401-405`), and `subscriptionPost` posts the clone
+/// with the marks still set and only then `unmark()`s (`:279-281`), so the
+/// first update encodes the negotiated depth. `read_marks` builds its path
+/// list from the group's members, and `queueSize` is in none of them.
+#[tokio::test]
+async fn group_monitor_seed_marks_the_negotiated_queue_size() {
+    use epics_bridge_rs::qsrv::QsrvPvStore;
+    use epics_pva_rs::server_native::MonitorOptions;
+    use epics_pva_rs::server_native::source::{AccessGate, ChannelContext, ChannelSource};
+
+    let db = make_db().await;
+    let provider = Arc::new(BridgeProvider::new(db.clone()));
+    provider.load_group_config(GROUP_JSON).expect("load");
+    let store = QsrvPvStore::new(provider);
+    let checked = AccessGate::open()
+        .check("TEST:grp", "host1", "alice", "anonymous", "")
+        .await;
+    let ctx = ChannelContext {
+        peer: "127.0.0.1:5075".parse().unwrap(),
+        creds: std::sync::Arc::new(epics_pva_rs::server_native::config::ClientCredentials {
+            account: "alice".into(),
+            method: "anonymous".into(),
+            host: "host1".into(),
+            authority: String::new(),
+            roles: Vec::new(),
+        }),
+        pv_request: None,
+        log: Default::default(),
+    };
+    let seed = store
+        .subscribe_seeded(checked, ctx, MonitorOptions::default())
+        .await
+        .expect("group monitor subscribes");
+    let marked = seed
+        .initial
+        .expect("a group monitor seeds from its monitor-stamped value")
+        .marked
+        .expect("a group seed frames by what it assigned");
+    for path in ["record._options.queueSize", "record._options.atomic"] {
+        assert!(
+            marked.iter().any(|p| p == path),
+            "{path} must be marked on the seed, got {marked:?}"
+        );
+    }
 }

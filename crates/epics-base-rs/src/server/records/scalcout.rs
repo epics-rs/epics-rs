@@ -5,10 +5,13 @@ use crate::server::record::{
 };
 use crate::types::{DbFieldType, EpicsValue, PvString};
 
-use super::link_status::{LINK_CON, LINK_STATUS_CHOICES};
+use super::link_status::{
+    LINK_CON, LINK_STATUS_CHOICES, LinkRole, LinkStatusGen, post_link_status,
+};
 use crate::calc::StringInputs;
 use crate::calc::engine::value::{SCALC_STRING_SIZE, ScalcString};
 use crate::calc::{CompiledExpr, ExprKind, ScalcResult, scalc_perform};
+use crate::server::database::AsyncDbHandle;
 
 /// Code version reported by `VERS` (C `sCalcoutRecord.c:55 #define VERSION 4.1`).
 const VERSION: f64 = 4.1;
@@ -91,6 +94,13 @@ pub struct ScalcoutRecord {
     /// owner of the ten-field alarm surface this record shares with
     /// calc/calcout/ai/ao.
     pub lalm: f64,
+    /// MLST / ALST — C `sCalcoutRecord.dbd`, both `DBF_DOUBLE`
+    /// `special(SPC_NOMOD)`. `monitor()` deadbands VAL against them
+    /// (sCalcoutRecord.c:828,837). The record served neither, so the
+    /// framework had no cell to remember the last posted value in and
+    /// treated every cycle as the first one.
+    pub mlst: f64,
+    pub alst: f64,
     /// PSVL — C `sCalcoutRecord.dbd:63` `field(PSVL,DBF_STRING)`,
     /// `special(SPC_NOMOD)`.
     ///
@@ -135,6 +145,18 @@ pub struct ScalcoutRecord {
     /// the numeric software event (`post_event((int)oevt)`); see
     /// [`Record::output_event`].
     oevt: u16,
+    /// `INAV..INLV` / `IAAV..ILLV` / `OUTV` — the per-link connection status C
+    /// derives in `init_record` (`sCalcoutRecord.c:254-287`) and re-derives in
+    /// `special()` on any INPx/INxx/OUT put (`:495-569`). Written only by
+    /// [`Self::refresh_link_status`] (through `post_fields`), never by a
+    /// client: the fields are `special(SPC_NOMOD)`.
+    in_status: [i16; 12],
+    str_status: [i16; 12],
+    out_status: i16,
+    /// Async surface + generation gate for `refresh_link_status`, the shape
+    /// calcout/transform use (see `link_status::post_link_status`).
+    async_ctx: Option<(String, AsyncDbHandle)>,
+    link_gen: LinkStatusGen,
 }
 
 impl Default for ScalcoutRecord {
@@ -161,10 +183,19 @@ impl Default for ScalcoutRecord {
             adel: 0.0,
             inp_links: Default::default(),
             str_inp_links: Default::default(),
+            // C's post-`init_record` value for a default record: every link is
+            // CONSTANT, so every status is `scalcoutINAV_CON`.
+            in_status: [LINK_CON; 12],
+            str_status: [LINK_CON; 12],
+            out_status: LINK_CON,
+            async_ctx: None,
+            link_gen: LinkStatusGen::default(),
             num_vals: [0.0; 12],
             str_vals: Default::default(),
             pval: 0.0,
             lalm: 0.0,
+            mlst: 0.0,
+            alst: 0.0,
             psvl: PvString::new(),
             calc_alarm: false,
             fetch_gate_failed: false,
@@ -231,6 +262,59 @@ impl ScalcoutRecord {
     fn apply_result(&mut self, result: &ScalcResult) {
         self.val = result.val;
         self.sval = PvString::from_bytes(result.sval.as_bytes());
+    }
+
+    /// C `sCalcoutRecord.c::execOutput` (755-777), the "Determine output data"
+    /// half: the DOPT switch that fills OVAL/OSV.
+    ///
+    /// The single owner of that switch, called from the two places C calls
+    /// `execOutput`: the immediate output at `:410` and the delayed
+    /// continuation at `:429`. C's ODLY arm returns at `:407` with the switch
+    /// UNRUN, so on a delayed cycle OCAL runs against the A..L / AA..LL present
+    /// at EXPIRY. Evaluating it while scheduling made the delay a no-op for
+    /// every input that moved inside the window — and made an OCAL with stores
+    /// (`A:=A+1`) land at scheduling time.
+    ///
+    /// Runs on EVERY output cycle, before the IVOA decision (whose Don't_drive
+    /// `break` is at `:795`), so OVAL/OSV are recomputed even when the OUT
+    /// write is vetoed.
+    fn exec_output_data(&mut self) {
+        if self.dopt != 1 {
+            // Use CALC result.
+            self.oval = self.val;
+            self.osv = self.sval.clone();
+            return;
+        }
+        // Use OCAL. C `:768` calls sCalcPerform on ORPC unconditionally on this
+        // branch, so an empty, uncompilable or failing OCAL are one case — the
+        // empty program fails like any other broken one. `presult = &pcalc->oval,
+        // psresult = pcalc->osv`, so the VAL/SVAL tokens in OCAL read the
+        // previous OVAL/OSV, not the VAL/SVAL this cycle computed; only the
+        // RESULT cells differ between the passes, the arg set is the record's
+        // own A..L / AA..LL that CALC stored into.
+        let mut inputs = self.build_inputs(self.oval, &self.osv);
+        match scalc_perform(&self.compiled_ocal, &mut inputs, self.prec) {
+            // As on the CALC side: a non-finite OCAL result is C's -1 with the
+            // cells written, and `execOutput` reads only the status — so it
+            // takes the OVAL=-1 sentinel branch too.
+            Ok(result) if !result.non_finite => {
+                // The OCAL-side mirror of `apply_result`: C passes
+                // `&pcalc->oval, pcalc->osv` and the SAME `pcalc->prec` to the
+                // same sCalcPerform (`:768-770`), so the same epilogue fills
+                // both cells.
+                self.oval = result.val;
+                self.osv = PvString::from_bytes(result.sval.as_bytes());
+            }
+            _ => {
+                // C `:771-773`: a failed OCAL sCalcPerform forces OVAL=-1 and
+                // OSV="***ERROR***" — the OCAL-side mirror of the CALC-fail
+                // VAL=-1 sentinel.
+                self.oval = -1.0;
+                self.osv = PvString::from("***ERROR***");
+                self.calc_alarm = true;
+            }
+        }
+        self.apply_stores(&inputs);
     }
 
     /// C `sCalcoutRecord.c:374-395` — the OOPT switch. "On Change" is the
@@ -338,6 +422,27 @@ impl ScalcoutRecord {
     fn is_link_status_field(name: &str) -> bool {
         name == "OUTV" || SCALCOUT_INAV_NAMES.contains(&name) || SCALCOUT_IAAV_NAMES.contains(&name)
     }
+
+    /// Classify all 25 links and publish INAV..INLV / IAAV..ILLV / OUTV,
+    /// mirroring C `sCalcoutRecord.c::init_record` (254-287) and the
+    /// `special()` re-classification (495-569). No-op without an async context.
+    fn refresh_link_status(&self) {
+        let mut links: Vec<(&'static str, String, LinkRole)> = Vec::with_capacity(25);
+        for i in 0..12 {
+            links.push((
+                SCALCOUT_INAV_NAMES[i],
+                self.inp_links[i].clone(),
+                LinkRole::Input,
+            ));
+            links.push((
+                SCALCOUT_IAAV_NAMES[i],
+                self.str_inp_links[i].clone(),
+                LinkRole::Input,
+            ));
+        }
+        links.push(("OUTV", self.out.clone(), LinkRole::Output));
+        post_link_status(self.async_ctx.as_ref(), &self.link_gen, links);
+    }
 }
 
 /// INAV..INLV — numeric-input connection-status field names (channel A..L).
@@ -391,6 +496,10 @@ const SCALCOUT_DOPT_CHOICES: &[&str] = &["Use CALC", "Use OCAL"];
 const SCALCOUT_WAIT_CHOICES: &[&str] = &["NoWait", "Wait"];
 
 impl Record for ScalcoutRecord {
+    /// C `sCalcoutRecord.c::init_record` (:203-322) ends without touching
+    /// LALM; every write to it is in `checkAlarms` (:727-750).
+    fn seed_deadband_tracking(&mut self) {}
+
     fn record_type(&self) -> &'static str {
         "scalcout"
     }
@@ -436,7 +545,23 @@ impl Record for ScalcoutRecord {
             "OCAL" => self.recompile_ocal(),
             _ => {}
         }
+        // C `sCalcoutRecord.c:481-569` re-classifies the link a put just
+        // re-pointed — the INPA..INPL, INAA..INLL and OUT cases together.
+        if Self::inp_index(field).is_some()
+            || Self::str_inp_index(field).is_some()
+            || field == "OUT"
+        {
+            self.refresh_link_status();
+        }
         Ok(())
+    }
+
+    fn set_async_context(&mut self, name: String, db: AsyncDbHandle) {
+        self.async_ctx = Some((name, db));
+        // C `init_record` (sCalcoutRecord.c:254-287) classifies all 25 links
+        // before any process. Every one of them is a scalcout-owned field
+        // (OUT included), already applied when `add_record` runs.
+        self.refresh_link_status();
     }
 
     /// C posts the validity field explicitly from `special()`
@@ -492,14 +617,16 @@ impl Record for ScalcoutRecord {
     fn process(&mut self) -> CaResult<ProcessOutcome> {
         // ODLY continuation: this is the delayed re-process scheduled by a
         // previous cycle (C `sCalcoutRecord.c::process` `pact==TRUE` + `dlya`
-        // branch, lines 421-432). Do NOT re-evaluate CALC / OCAL / should_output
-        // — C clears DLYA and runs `execOutput` directly. Honour the output
-        // decision the original cycle captured, clear DLYA, and let the
-        // framework write the OUT link. Mirrors calcout.rs.
+        // branch, lines 421-432). No input fetch and no CALC pass — C's `pact`
+        // arm re-enters below them — but `execOutput` DOES run here (`:429`),
+        // and the DOPT switch is its first half (`:757-777`), so OVAL/OSV are
+        // computed now, from the A..L / AA..LL present at expiry. Mirrors
+        // calcout.rs.
         if self.dlya == 1 {
             self.dlya = 0;
             self.cached_should_output = self.pending_output;
             self.pending_output = false;
+            self.exec_output_data();
             self.sync_psvl();
             return Ok(ProcessOutcome::complete());
         }
@@ -591,58 +718,10 @@ impl Record for ScalcoutRecord {
         // happens on the ODLY-scheduling cycle, which returns at `:407` before
         // `monitor()`.
         self.pval = self.val;
-        // C `execOutput` (sCalcoutRecord.c:760-777) computes OVAL/OSV via the
-        // DOPT switch on EVERY output cycle, *before* the IVOA decision (the
-        // Don't_drive `break` is at :795). So OVAL is recomputed even when the
-        // OUT write is vetoed — gate this on `oopt_fires`, not `write_out`.
-        // (`write_out` still gates the OUT write below via cached_should_output;
-        // on every non-Don't_drive path the two are equal, so OVAL is unchanged
-        // there.)
-        if oopt_fires {
-            if self.dopt == 1 {
-                // Use OCAL. C `execOutput` (sCalcoutRecord.c:768) calls
-                // sCalcPerform on ORPC unconditionally on this branch, so an
-                // empty, uncompilable or failing OCAL are one case — the empty
-                // program fails like any other broken one.
-                //
-                // C `sCalcoutRecord.c:768-770` — presult = &pcalc->oval,
-                // psresult = pcalc->osv, so the VAL/SVAL tokens in OCAL
-                // read the previous OVAL/OSV, not the VAL/SVAL this
-                // cycle just computed. Only the RESULT cells change between the
-                // passes; the arg set is the same one CALC stored into.
-                inputs.prev_val = self.oval;
-                inputs.prev_sval = ScalcString::from_c(self.osv.as_bytes());
-                match scalc_perform(&self.compiled_ocal, &mut inputs, self.prec) {
-                    // As on the CALC side: a non-finite OCAL result is C's -1
-                    // with the cells written, and `execOutput` reads only the
-                    // status — so it takes the OVAL=-1 sentinel branch too.
-                    Ok(result) if !result.non_finite => {
-                        // The OCAL-side mirror of `apply_result`: C passes
-                        // `&pcalc->oval, pcalc->osv` and the SAME `pcalc->prec`
-                        // to the same sCalcPerform (`sCalcoutRecord.c:768-770`),
-                        // so the same epilogue fills both cells.
-                        self.oval = result.val;
-                        self.osv = PvString::from_bytes(result.sval.as_bytes());
-                    }
-                    _ => {
-                        // C execOutput Use_OVAL (sCalcoutRecord.c:771-773):
-                        // a failed OCAL sCalcPerform forces OVAL=-1 and
-                        // OSV="***ERROR***" — the OCAL-side mirror of the
-                        // CALC-fail VAL=-1 sentinel.
-                        self.oval = -1.0;
-                        self.osv = PvString::from("***ERROR***");
-                        self.calc_alarm = true;
-                    }
-                }
-            } else {
-                // Use CALC result
-                self.oval = self.val;
-                self.osv = self.sval.clone();
-            }
-        }
-        // Both passes' stores land here, before the ODLY early return — C wrote
-        // them into A..L / AA..LL through `&pcalc->a` / `pcalc->strs` as each
-        // pass ran, so a deferred output cycle carries them just the same.
+        // The CALC pass's stores. C wrote them into A..L / AA..LL through
+        // `&pcalc->a` / `pcalc->strs` as the pass ran, above the ODLY early
+        // return, so a deferred cycle carries them just the same;
+        // `exec_output_data` reads them back for the OCAL pass at expiry.
         self.apply_stores(&inputs);
 
         // ODLY (C `sCalcoutRecord.c::process` lines 399-408): when an output
@@ -658,7 +737,7 @@ impl Record for ScalcoutRecord {
             self.dlya = 1;
             self.pending_output = write_out;
             self.cached_should_output = false;
-            let delay = std::time::Duration::from_secs_f64(self.odly);
+            let delay = crate::runtime::time::duration_from_secs(self.odly);
             return Ok(ProcessOutcome {
                 result: RecordProcessResult::AsyncPendingNotify(vec![(
                     "DLYA".to_string(),
@@ -670,6 +749,12 @@ impl Record for ScalcoutRecord {
         }
 
         self.cached_should_output = write_out;
+        if oopt_fires {
+            // C `:410`, the immediate arm of `if (doOutput)`. Gated on
+            // `oopt_fires`, not `write_out`: the IVOA Don't_drive veto removes
+            // the write, not the DOPT switch that precedes it.
+            self.exec_output_data();
+        }
         self.sync_psvl();
         Ok(ProcessOutcome::complete())
     }
@@ -680,6 +765,8 @@ impl Record for ScalcoutRecord {
             "SVAL" => Some(EpicsValue::String(self.sval.clone())),
             "PVAL" => Some(EpicsValue::Double(self.pval)),
             "LALM" => Some(EpicsValue::Double(self.lalm)),
+            "MLST" => Some(EpicsValue::Double(self.mlst)),
+            "ALST" => Some(EpicsValue::Double(self.alst)),
             "PSVL" => Some(EpicsValue::String(self.psvl.clone())),
             "CALC" => Some(EpicsValue::String(self.calc.clone().into())),
             "CLCV" => Some(EpicsValue::Long(self.clcv)),
@@ -715,10 +802,14 @@ impl Record for ScalcoutRecord {
                 if let Some(idx) = Self::str_inp_index(name) {
                     return Some(EpicsValue::String(self.str_inp_links[idx].clone().into()));
                 }
-                if Self::is_link_status_field(name) {
-                    // Link-derived, `Constant` for the default record's constant
-                    // links (see [`Self::is_link_status_field`]).
-                    return Some(EpicsValue::Enum(LINK_CON as u16));
+                if name == "OUTV" {
+                    return Some(EpicsValue::Enum(self.out_status as u16));
+                }
+                if let Some(idx) = SCALCOUT_INAV_NAMES.iter().position(|&n| n == name) {
+                    return Some(EpicsValue::Enum(self.in_status[idx] as u16));
+                }
+                if let Some(idx) = SCALCOUT_IAAV_NAMES.iter().position(|&n| n == name) {
+                    return Some(EpicsValue::Enum(self.str_status[idx] as u16));
                 }
                 None
             }
@@ -755,6 +846,18 @@ impl Record for ScalcoutRecord {
                 self.lalm = value
                     .to_f64()
                     .ok_or_else(|| CaError::TypeMismatch("LALM".into()))?;
+                Ok(())
+            }
+            "MLST" => {
+                self.mlst = value
+                    .to_f64()
+                    .ok_or_else(|| CaError::TypeMismatch("MLST".into()))?;
+                Ok(())
+            }
+            "ALST" => {
+                self.alst = value
+                    .to_f64()
+                    .ok_or_else(|| CaError::TypeMismatch("ALST".into()))?;
                 Ok(())
             }
             // C `dbPut` stores the string; `special()` compiles it and records
@@ -909,6 +1012,23 @@ impl Record for ScalcoutRecord {
                         }
                         _ => return Err(CaError::TypeMismatch(name.into())),
                     }
+                }
+                // The link-status menus are `special(SPC_NOMOD)` to clients;
+                // this arm exists for the link-status refresh (`post_fields`
+                // -> `put_field_internal`), their only writer.
+                if Self::is_link_status_field(name) {
+                    let status = value
+                        .to_f64()
+                        .ok_or_else(|| CaError::TypeMismatch(name.into()))?
+                        as i16;
+                    if name == "OUTV" {
+                        self.out_status = status;
+                    } else if let Some(idx) = SCALCOUT_INAV_NAMES.iter().position(|&n| n == name) {
+                        self.in_status[idx] = status;
+                    } else if let Some(idx) = SCALCOUT_IAAV_NAMES.iter().position(|&n| n == name) {
+                        self.str_status[idx] = status;
+                    }
+                    return Ok(());
                 }
                 Err(CaError::FieldNotFound(name.to_string()))
             }

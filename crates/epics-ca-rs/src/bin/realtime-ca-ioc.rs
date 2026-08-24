@@ -61,9 +61,10 @@
 //! `exec_backend` derivation itself recognizes `target_os = "vxworks"`.
 //! Under the hosted default (tokio backend) this binary is
 //! still built — so it stays compiled and linted in the default test set — but
-//! refuses to run: with `runtime::task::spawn` routed to tokio, an
-//! asynchronous record tail would need a runtime that this entry point
-//! deliberately never starts, and `background_init` is not even compiled.
+//! refuses to run: `runtime::task::spawn` is routed to tokio there, and while
+//! record tails now go to the background executor through `spawn_background`,
+//! the CA/PVA network paths this binary would drive still need the runtime
+//! that this entry point deliberately never starts.
 //! Reporting that at startup is the honest behaviour; silently starting a
 //! runtime would defeat the purpose of the binary.
 

@@ -69,7 +69,7 @@ pub(crate) fn spawn_monitor_sender(
             if let Some(ref s) = stats {
                 s.subscription_events_posted.fetch_add(1, Ordering::Relaxed);
             }
-            // C `casAccessRightsCB` (`rsrv/camessage.c:1080-1095`)
+            // C `casAccessRightsCB` (`rsrv/camessage.c:1116-1124`)
             // suppresses event deliveries with `db_event_disable`
             // while read access is denied (without tearing the
             // subscription down). Producer keeps running so a

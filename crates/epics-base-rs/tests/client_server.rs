@@ -147,7 +147,7 @@ async fn test_get_with_metadata_time_double() {
     let snap = ch.get_with_metadata(DbrClass::Time).await.unwrap();
     assert_eq!(snap.value, EpicsValue::Double(25.0));
     // Timestamp should be non-zero (server sets current time)
-    assert!(snap.timestamp > std::time::SystemTime::UNIX_EPOCH);
+    assert!(snap.timestamp > std::time::SystemTime::UNIX_EPOCH.into());
 }
 
 #[tokio::test]
@@ -292,7 +292,7 @@ async fn test_get_with_metadata_all_native_types() {
         ("T:FLOAT", EpicsValue::Float(2.5)),
         ("T:LONG", EpicsValue::Long(42)),
         ("T:SHORT", EpicsValue::Short(-7)),
-        ("T:CHAR", EpicsValue::Char(0xAB)),
+        ("T:CHAR", EpicsValue::UChar(0xAB)),
         ("T:ENUM", EpicsValue::Enum(3)),
         ("T:STRING", EpicsValue::String("test".into())),
     ] {

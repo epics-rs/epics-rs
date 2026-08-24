@@ -1562,3 +1562,110 @@ fn test_autocount_timed_branch_does_not_touch_directions() {
         "the timed auto-count branch leaves D alone"
     );
 }
+
+// ── F5: the failing scaler read ────────────────────────────────────────────
+
+#[derive(Default)]
+struct FlakyScalerState {
+    fail_read: bool,
+    done: bool,
+    done_reads: usize,
+}
+
+/// A scaler whose count read can be made to fail while a completed count is
+/// still waiting in the read-and-clear `done()` latch.
+struct FlakyScalerDriver(std::sync::Arc<std::sync::Mutex<FlakyScalerState>>);
+
+impl ScalerDriver for FlakyScalerDriver {
+    fn reset(&mut self) -> epics_base_rs::error::CaResult<()> {
+        Ok(())
+    }
+    fn arm(&mut self, _start: bool) -> epics_base_rs::error::CaResult<()> {
+        Ok(())
+    }
+    fn write_preset(
+        &mut self,
+        _channel: usize,
+        preset: u32,
+    ) -> epics_base_rs::error::CaResult<u32> {
+        Ok(preset)
+    }
+    fn read(
+        &mut self,
+        counts: &mut [u32; MAX_SCALER_CHANNELS],
+    ) -> epics_base_rs::error::CaResult<()> {
+        if self.0.lock().unwrap().fail_read {
+            return Err(epics_base_rs::error::CaError::Timeout);
+        }
+        counts[0] = 4242;
+        Ok(())
+    }
+    fn done(&mut self) -> bool {
+        let mut st = self.0.lock().unwrap();
+        st.done_reads += 1;
+        std::mem::take(&mut st.done)
+    }
+    fn num_channels(&self) -> usize {
+        1
+    }
+}
+
+/// A scaler that has finished counting but whose count read fails.
+fn flaky_scaler() -> (
+    std::sync::Arc<std::sync::Mutex<FlakyScalerState>>,
+    scaler_rs::device_support::scaler_asyn::ScalerAsynDeviceSupport,
+) {
+    let state = std::sync::Arc::new(std::sync::Mutex::new(FlakyScalerState {
+        fail_read: true,
+        done: true,
+        done_reads: 0,
+    }));
+    let dev = scaler_rs::device_support::scaler_asyn::ScalerAsynDeviceSupport::new(Box::new(
+        FlakyScalerDriver(std::sync::Arc::clone(&state)),
+    ));
+    (state, dev)
+}
+
+/// F5: `processing` raises READ_ALARM/INVALID only on an `Err` from device
+/// support, so a swallowed driver read error left the record showing the
+/// previous scan's counts at NO_ALARM.
+#[test]
+fn test_asyn_device_support_read_error_reaches_the_record() {
+    use epics_base_rs::server::device_support::DeviceSupport;
+
+    let (_state, mut dev) = flaky_scaler();
+    let mut rec = ScalerRecord::default();
+    rec.s[0] = 7;
+
+    assert!(
+        dev.read(&mut rec).is_err(),
+        "a failed driver read must reach the record as an error"
+    );
+    assert_eq!(rec.s[0], 7, "a failed read must not publish counts");
+}
+
+/// F5: `done()` is read-and-clear — it reports a completed count exactly once —
+/// so the failing scan must not consume it, or the completion is lost and no
+/// later scan can re-deliver it.
+#[test]
+fn test_asyn_device_support_read_error_does_not_consume_the_done_latch() {
+    use epics_base_rs::server::device_support::DeviceSupport;
+
+    let (state, mut dev) = flaky_scaler();
+    let mut rec = ScalerRecord::default();
+
+    let _ = dev.read(&mut rec);
+    assert_eq!(
+        state.lock().unwrap().done_reads,
+        0,
+        "the read-and-clear done latch must survive the failed scan"
+    );
+
+    // Next scan, the link is back: the completion is still there to deliver.
+    state.lock().unwrap().fail_read = false;
+    assert!(dev.read(&mut rec).is_ok());
+    assert_eq!(rec.s[0], 4242);
+    let st = state.lock().unwrap();
+    assert_eq!(st.done_reads, 1);
+    assert!(!st.done, "the completion was delivered exactly once");
+}

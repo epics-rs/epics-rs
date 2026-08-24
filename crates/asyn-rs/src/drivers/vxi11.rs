@@ -21,14 +21,23 @@
 //!
 //! `vxiName` selects the VXI-11 link type — typically `"inst0"`
 //! (single instrument), `"gpib0"` (GPIB gateway), `"hpib0"` (HP-IB),
-//! `"com1"` (serial gateway). The C heuristic at `drvVxi11.c:1754-1757`:
+//! `"com1"` (serial gateway). The C heuristic at `drvVxi11.c:1754-1760`,
+//! quoted through the line that consumes it:
 //!
 //! ```c
-//!     if (strncmp("gpib", vxiName, 4) == 0) isGpibLink = 1;
-//!     if (strncmp("hpib", vxiName, 4) == 0) isGpibLink = 1;
-//!     if (strncmp("inst", vxiName, 4) == 0) isSingleLink = 1;
-//!     if (strncmp("com",  vxiName, 3) == 0) isSingleLink = 1;
+//!     if(epicsStrnCaseCmp("gpib", vxiName, 4) == 0) pvxiPort->isGpibLink = 1;
+//!     if(epicsStrnCaseCmp("hpib", vxiName, 4) == 0) pvxiPort->isGpibLink = 1;
+//!     if(epicsStrnCaseCmp("inst", vxiName, 4) == 0) pvxiPort->isSingleLink = 1;
+//!     if(epicsStrnCaseCmp("com",  vxiName, 3) == 0) pvxiPort->isSingleLink = 1;
+//!     attributes = ASYN_CANBLOCK;
+//!     if(!pvxiPort->isSingleLink) attributes |= ASYN_MULTIDEVICE;
 //! ```
+//!
+//! `isGpibLink` never reaches the attribute test: multi-device is the
+//! default and only `inst*` / `com*` opt out, so an unrecognised name
+//! (`hislip0`, `vxi0`, `TCPIP0`, or the empty string older st.cmd files
+//! pass) registers multi-device. Stopping the quote at the four setters is
+//! what made the port read the gate off the GPIB arm.
 //!
 //! ## VXI-11 RPC programs (`vxi11core.rpcl`)
 //!
@@ -50,6 +59,7 @@
 use crate::error::{AsynError, AsynResult, AsynStatus};
 use crate::port::{PortDriver, PortDriverBase, PortFlags};
 use crate::user::AsynUser;
+use std::collections::BTreeMap;
 use std::time::Duration;
 
 // --- iocshArg flags bitfield — `drvVxi11.c:56-58` ---
@@ -99,6 +109,12 @@ pub const PROC_DESTROY_LINK: u32 = 23;
 pub const PROC_CREATE_INTR_CHAN: u32 = 25;
 pub const PROC_DESTROY_INTR_CHAN: u32 = 26;
 
+/// `device_read` flag bit 7 — stop the transfer on the termination character
+/// carried in the request's `termChar` field (`vxi11.h:46`). C sets it, and
+/// `termChar`, only while the device link holds an EOS
+/// (`drvVxi11.c:1169-1173`).
+pub const VXI_TERMCHRSET: u32 = 128;
+
 /// VXI-11 connection topology, derived from the `vxiName` prefix
 /// (`drvVxi11.c:1754-1757`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -106,7 +122,8 @@ pub enum VxiLinkKind {
     /// `inst*` / `com*` — single-link (per-port) device. C `isSingleLink`.
     Single,
     /// `gpib*` / `hpib*` — gateway exposing multiple GPIB addresses.
-    /// C `isGpibLink`. Implies `ASYN_MULTIDEVICE`.
+    /// C `isGpibLink`, which selects the GPIB handling only; the
+    /// `ASYN_MULTIDEVICE` attribute comes from not being `Single`.
     Gpib,
     /// Anything else — fallback: treat as multi-device gateway with no
     /// special GPIB handling.
@@ -194,6 +211,17 @@ impl Vxi11Config {
 pub struct DrvVxi11Port {
     base: PortDriverBase,
     config: Vxi11Config,
+    /// C `pdevLink->eos` (`drvVxi11.c:65`), one terminator per device link
+    /// rather than per port — `:1737-1741` initialises the server link and
+    /// every primary and secondary address to -1 independently. An absent
+    /// entry is that -1.
+    ///
+    /// The port owns this instead of `PortDriverBase`'s EOS cache because a
+    /// VXI-11 port has no software EOS interpose to hand it to: `asynGpib`
+    /// registers the octet interface with `initialize(portName, &octet, 0, 0,
+    /// 0)` (`asynGpib.c:601`), and the terminator is instead stamped into the
+    /// `device_read` request (`drvVxi11.c:1169-1173`).
+    eos: BTreeMap<i32, u8>,
 }
 
 impl DrvVxi11Port {
@@ -203,9 +231,9 @@ impl DrvVxi11Port {
     ///
     /// `flags` bits: see [`FLAG_RECOVER_WITH_IFC`] (0x1),
     /// [`FLAG_LOCK_DEVICES`] (0x2), [`FLAG_NO_SRQ`] (0x4).
-    /// `vxiName` prefix maps to [`VxiLinkKind`].
-    /// Gateway-class links (`gpib*` / `hpib*`) enable
-    /// `ASYN_MULTIDEVICE` (C `drvVxi11.c:1759-1760`).
+    /// `vxiName` prefix maps to [`VxiLinkKind`]. `ASYN_MULTIDEVICE` is the
+    /// default: only a single-link `inst*` / `com*` name opts out
+    /// (C `drvVxi11.c:1756-1760`).
     #[allow(clippy::too_many_arguments)] // intentional 1:1 mirror of C iocshArg list
     pub fn configure(
         port_name: &str,
@@ -219,11 +247,27 @@ impl DrvVxi11Port {
         let config =
             Vxi11Config::from_positional(host_name, flags, def_timeout_string, vxi_name, priority);
 
-        // C `drvVxi11.c:1754-1760`: only `gpib*`/`hpib*` set `isGpibLink`
-        // and enable `ASYN_MULTIDEVICE`. An unrecognized prefix leaves
-        // both `isGpibLink` and `isSingleLink` clear — it must NOT be
-        // registered as a 31-address gateway.
-        let multi_device = matches!(config.link_kind, VxiLinkKind::Gpib);
+        // C `drvVxi11.c:1754-1760` classifies the prefix and then makes
+        // MULTIDEVICE the DEFAULT — only a single link opts out:
+        //
+        //     if(epicsStrnCaseCmp("gpib", vxiName, 4) == 0) isGpibLink   = 1;
+        //     if(epicsStrnCaseCmp("hpib", vxiName, 4) == 0) isGpibLink   = 1;
+        //     if(epicsStrnCaseCmp("inst", vxiName, 4) == 0) isSingleLink = 1;
+        //     if(epicsStrnCaseCmp("com",  vxiName, 3) == 0) isSingleLink = 1;
+        //     if(!pvxiPort->isSingleLink) attributes |= ASYN_MULTIDEVICE;
+        //
+        // `isGpibLink` never enters that test, so an unrecognized — or EMPTY —
+        // `vxiName` leaves `isSingleLink` clear and IS a 31-address gateway.
+        // The empty name is the common older-`st.cmd` form
+        // `vxi11Configure("L0","host",0,"1.0","",0,0)`; deriving the flag from
+        // the GPIB arm instead capped that port at address 0 and lost every
+        // device above it.
+        //
+        // Phrase it as the single-link test negated, not as a list of the
+        // multi-device kinds, so any link kind this port learns to recognise
+        // later is multi-device by construction, as it is in C.
+        let single_link = matches!(config.link_kind, VxiLinkKind::Single);
+        let multi_device = !single_link;
         // GPIB addresses 0..30 (NUM_GPIB_ADDRESSES = 31, drvVxi11.c).
         let max_addr = if multi_device { 31 } else { 1 };
 
@@ -238,11 +282,22 @@ impl DrvVxi11Port {
         );
         base.init_connected(false);
         base.auto_connect = !no_auto_connect;
-        Ok(Self { base, config })
+        Ok(Self {
+            base,
+            config,
+            eos: BTreeMap::new(),
+        })
     }
 
     pub fn config(&self) -> &Vxi11Config {
         &self.config
+    }
+
+    /// The terminator this address's `device_read` must carry, C
+    /// `pdevLink->eos != -1` at `drvVxi11.c:1170`. `None` is C's -1: the
+    /// request goes out with `flags = 0` and no `termChar`.
+    pub fn input_eos_for(&self, addr: i32) -> Option<u8> {
+        self.eos.get(&addr).copied()
     }
 
     /// Whether this build was compiled with VXI-11 hardware support.
@@ -328,6 +383,58 @@ impl PortDriver for DrvVxi11Port {
     // (`capabilities`): C registers asynGpib for this port, so its GPIBIV is 1,
     // and a UCMD/ACMD must reach the driver and report the driver's own failure
     // rather than take asynRecord's "No asynGpib interface" branch.
+
+    /// C `vxiSetEos` (`drvVxi11.c:1302-1329`), which resolves the address
+    /// through `vxiGetDevLink` and stores the terminator on that link. The
+    /// `PortDriver` default cannot stand in for it: it caches into
+    /// `base.eos_entry` and forwards to the interpose stack, and a GPIB port
+    /// has none — `asynGpib.c:601` registers the octet interface with
+    /// `processEosIn = 0` because the terminator belongs in the `device_read`
+    /// request. Its two-byte allowance is wrong here too; `vxiSetEos`'s
+    /// `default:` arm and `asynGpib::setInputEos` (`asynGpib.c:440-446`) both
+    /// refuse anything past one character.
+    fn set_input_eos(&mut self, user: &AsynUser, eos: &[u8]) -> AsynResult<()> {
+        match eos.len() {
+            0 => {
+                self.eos.remove(&user.addr);
+                Ok(())
+            }
+            1 => {
+                self.eos.insert(user.addr, eos[0]);
+                Ok(())
+            }
+            n => Err(AsynError::Status {
+                status: AsynStatus::Error,
+                message: format!("{} vxiSetEos illegal eoslen {n}", self.base.port_name),
+            }),
+        }
+    }
+
+    /// C `vxiGetEos` (`drvVxi11.c:1331-1358`): `eos == -1` reports length 0,
+    /// otherwise the one byte the link holds. Same field `set_input_eos`
+    /// writes and the `device_read` request will read.
+    fn get_input_eos(&self, user: &AsynUser) -> Vec<u8> {
+        match self.input_eos_for(user.addr) {
+            Some(c) => vec![c],
+            None => Vec::new(),
+        }
+    }
+
+    /// C parity: `asynGpib`'s octet vtable leaves `setOutputEos`/`getOutputEos`
+    /// NULL (`asynGpib.c:132` — `...setInputEos, getInputEos, 0, 0`), so a GPIB
+    /// port has no output terminator to set. Refuse rather than cache bytes
+    /// nothing will ever append, exactly as the sibling GPIB port does
+    /// (`super::prologix`).
+    fn set_output_eos(&mut self, _user: &AsynUser, _eos: &[u8]) -> AsynResult<()> {
+        Err(AsynError::Status {
+            status: AsynStatus::Error,
+            message: "output EOS not supported on a GPIB port".into(),
+        })
+    }
+
+    fn get_output_eos(&self, _user: &AsynUser) -> Vec<u8> {
+        Vec::new()
+    }
 
     fn gpib_universal_cmd(&mut self, _user: &mut AsynUser, _cmd: u8) -> AsynResult<()> {
         Err(Self::no_transport("vxiUniversalCmd"))
@@ -455,14 +562,39 @@ mod tests {
         assert_eq!(drv.base().max_addr, 1);
     }
 
+    /// One case per branch of C's rule (`drvVxi11.c:1754-1760`): the two
+    /// `isGpibLink` prefixes, the two `isSingleLink` prefixes, an unrecognized
+    /// name, and the empty name that older `st.cmd` files pass. MULTIDEVICE is
+    /// the default and only `inst*`/`com*` opt out, so four of the six are
+    /// 31-address gateways.
     #[test]
-    fn unrecognized_link_is_not_multi_device() {
-        // C `drvVxi11.c`: an unrecognized vxiName prefix sets neither
-        // isGpibLink nor isSingleLink and does NOT enable ASYN_MULTIDEVICE.
-        let drv = DrvVxi11Port::configure("vxi0", "10.0.0.1", 0, "", "foo0", 0, false).unwrap();
-        assert_eq!(VxiLinkKind::from_vxi_name("foo0"), VxiLinkKind::Other);
-        assert!(!drv.base().flags.multi_device);
-        assert_eq!(drv.base().max_addr, 1);
+    fn multi_device_is_the_default_and_only_a_single_link_opts_out() {
+        for (vxi_name, kind, multi) in [
+            ("gpib0", VxiLinkKind::Gpib, true),
+            ("hpib0", VxiLinkKind::Gpib, true),
+            ("inst0", VxiLinkKind::Single, false),
+            ("com1", VxiLinkKind::Single, false),
+            ("foo0", VxiLinkKind::Other, true),
+            ("", VxiLinkKind::Other, true),
+        ] {
+            assert_eq!(
+                VxiLinkKind::from_vxi_name(vxi_name),
+                kind,
+                "classification of {vxi_name:?}"
+            );
+            let drv =
+                DrvVxi11Port::configure("vxi0", "10.0.0.1", 0, "", vxi_name, 0, false).unwrap();
+            assert_eq!(
+                drv.base().flags.multi_device,
+                multi,
+                "ASYN_MULTIDEVICE for {vxi_name:?}"
+            );
+            assert_eq!(
+                drv.base().max_addr,
+                if multi { 31 } else { 1 },
+                "max_addr for {vxi_name:?}"
+            );
+        }
     }
 
     #[test]
@@ -512,5 +644,64 @@ mod tests {
     #[test]
     fn has_hw_support_matches_feature_flag() {
         assert_eq!(DrvVxi11Port::has_hw_support(), cfg!(feature = "vxi11"));
+    }
+
+    /// C keeps the terminator on the *device link*, not the port
+    /// (`drvVxi11.c:65`, initialised per address at `:1737-1741`), and stamps
+    /// it into that address's `device_read` at `:1169-1173`. The `PortDriver`
+    /// default kept one two-byte cache per address in `PortDriverBase` and
+    /// forwarded it to an interpose stack a GPIB port does not have, so the
+    /// terminator reached neither the request nor the readback.
+    #[test]
+    fn input_eos_is_per_device_link_and_capped_at_one_character() {
+        let mut drv =
+            DrvVxi11Port::configure("V0", "gw.example", 0, "1.0", "gpib0", 0, false).unwrap();
+
+        let a3 = AsynUser::default().with_addr(3);
+        let a7 = AsynUser::default().with_addr(7);
+        drv.set_input_eos(&a3, b"\n").unwrap();
+        drv.set_input_eos(&a7, b";").unwrap();
+
+        assert_eq!(drv.input_eos_for(3), Some(b'\n'));
+        assert_eq!(drv.input_eos_for(7), Some(b';'));
+        assert_eq!(drv.input_eos_for(11), None, "an untouched link stays at -1");
+        assert_eq!(drv.get_input_eos(&a3), b"\n".to_vec());
+        assert!(
+            drv.get_input_eos(&AsynUser::default().with_addr(11))
+                .is_empty()
+        );
+
+        // C `vxiSetEos`'s `default:` arm, and `asynGpib::setInputEos` above it,
+        // both refuse more than one character.
+        let err = drv
+            .set_input_eos(&a3, b"\r\n")
+            .expect_err("VXI-11 holds one terminating character per link");
+        assert!(
+            err.message().contains("illegal eoslen 2"),
+            "expected C's wording, got {}",
+            err.message()
+        );
+        assert_eq!(
+            drv.input_eos_for(3),
+            Some(b'\n'),
+            "a refusal must not clear it"
+        );
+
+        // eoslen 0 is C's `eos = -1`, and only for the address that asked.
+        drv.set_input_eos(&a3, b"").unwrap();
+        assert_eq!(drv.input_eos_for(3), None);
+        assert_eq!(drv.input_eos_for(7), Some(b';'));
+    }
+
+    /// `asynGpib`'s octet vtable leaves the output-EOS slots NULL
+    /// (`asynGpib.c:132`), so a GPIB port must refuse rather than cache bytes
+    /// nothing appends — the rule the sibling prologix port already holds.
+    #[test]
+    fn output_eos_is_refused_on_a_gpib_port() {
+        let mut drv =
+            DrvVxi11Port::configure("V1", "gw.example", 0, "1.0", "gpib0", 0, false).unwrap();
+        let user = AsynUser::default();
+        assert!(drv.set_output_eos(&user, b"\n").is_err());
+        assert!(drv.get_output_eos(&user).is_empty());
     }
 }

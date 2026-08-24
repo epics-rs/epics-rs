@@ -162,7 +162,7 @@ async fn r9_69_asub_failed_inpn_read_skips_the_subroutine() {
             .unwrap();
         r.put_field("VAL", EpicsValue::Double(-1.0)).unwrap();
         // Returns 7: had the subroutine run, the framework would publish the
-        // status as aSub's VAL (C `aSubRecord.c:223` `prec->val = status`).
+        // status as aSub's VAL (C `aSubRecord.c:224` `prec->val = status`).
         let sub_fn: SubroutineFn = Box::new(|_rec: &mut dyn Record| Ok(7));
         inst.subroutine = Some(Arc::new(sub_fn));
     }

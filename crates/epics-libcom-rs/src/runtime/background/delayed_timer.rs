@@ -91,7 +91,7 @@ impl Inner {
     /// (`callback.c:418`). Returns the key the entry is filed under, or `None`
     /// when the timer has already shut down and the callback was dropped.
     fn schedule(&self, delay: Duration, action: TimerAction, cb: Callback) -> Option<WakeKey> {
-        let deadline = Instant::now() + delay;
+        let deadline = crate::runtime::time::deadline_from_now(delay);
         let mut st = recover(FACILITY, self.state.lock());
         if st.shutdown {
             // Timer thread stopped: match C dropping late delayed requests
@@ -325,6 +325,19 @@ mod tests {
     use std::sync::mpsc;
 
     const T: Duration = Duration::from_secs(5);
+
+    /// `callbackRequestDelayed` with a delay past `Duration`'s range must
+    /// file a deadline that never arrives, not unwind the caller.
+    /// `duration_from_secs` maps `+inf`, `NaN` and `1e300` to
+    /// `Duration::MAX` because a record delay field is network-settable,
+    /// and `Instant + Duration::MAX` panics.
+    #[test]
+    fn an_unrepresentable_delay_schedules_instead_of_panicking() {
+        let pool = CallbackPool::new();
+        let timer = DelayedTimer::new(pool.handle());
+        timer.schedule(Duration::MAX, CallbackPriority::High, Box::new(|| {}));
+        assert_eq!(timer.handle().scheduled_count(), 1);
+    }
 
     #[test]
     fn delayed_callback_fires_no_earlier_than_delay() {

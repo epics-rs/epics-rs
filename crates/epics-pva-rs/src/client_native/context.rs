@@ -1430,6 +1430,31 @@ impl PvaClient {
         crate::client_native::ops_v2::op_put_raw(&ch, &bytes, value_str, self.inner.timeout).await
     }
 
+    /// PUT that writes no field — an empty changed bitset under
+    /// `request`'s `record._options`. The interoperable form of "make the
+    /// remote record process": pvxs implements no CMD_PROCESS handler
+    /// (`src/conn.cpp:249-275` drains the frame at `default:`), and its own
+    /// pvalink forward link is exactly this PUT
+    /// (`ioc/pvalink_lset.cpp:691` -> `ioc/pvalink_channel.cpp:225-263`).
+    /// Prefer it over [`Self::pvprocess`] wherever the peer may be a pvxs
+    /// server; `pvprocess` stays for peers that do implement cmd 16.
+    pub async fn pvput_empty_with_request(
+        &self,
+        pv_name: &str,
+        request: &crate::pv_request::PvRequestExpr,
+    ) -> PvaResult<()> {
+        let ch = self.channel(pv_name).await?;
+        let big_endian = matches!(
+            crate::client_native::ops_v2::ensure_active_with_op_timeout(&ch, self.inner.timeout)
+                .await?
+                .0
+                .byte_order(),
+            crate::proto::ByteOrder::Big
+        );
+        let bytes = request.encode(big_endian);
+        crate::client_native::ops_v2::op_put_empty(&ch, &bytes, self.inner.timeout).await
+    }
+
     /// PUT a dotted-path sub-field using a custom pvRequest. Combines
     /// the record-options of `pvput_with_request` with the field-targeting
     /// of `pvput_field`. `field_path` must be non-empty.

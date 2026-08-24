@@ -141,7 +141,7 @@ fn hash_hex_upper(v: i32) -> String {
 fn scan_int(s: &str) -> Option<i32> {
     let b = s.as_bytes();
     let mut i = 0;
-    while i < b.len() && b[i].is_ascii_whitespace() {
+    while i < b.len() && epics_libcom_rs::runtime::stdlib::c_isspace(b[i] as char) {
         i += 1;
     }
     let start = i;
@@ -166,7 +166,7 @@ fn scan_int(s: &str) -> Option<i32> {
 fn scan_uint(s: &str) -> Option<u32> {
     let b = s.as_bytes();
     let mut i = 0;
-    while i < b.len() && b[i].is_ascii_whitespace() {
+    while i < b.len() && epics_libcom_rs::runtime::stdlib::c_isspace(b[i] as char) {
         i += 1;
     }
     let start = i;
@@ -2166,6 +2166,14 @@ mod tests {
         com.set_option(&mut AsynUser::default(), &mut server, "baud", "9600 bps")
             .unwrap();
         assert_eq!(com.get_option("baud").unwrap(), "9600");
+    }
+
+    /// C `sscanf`'s leading skip is `isspace`, vertical tab included, so
+    /// `asynSetOption(port, "baud", "\vBAUD")` sets the baud rate on a C IOC.
+    #[test]
+    fn a_leading_vertical_tab_is_whitespace_as_it_is_to_c() {
+        assert_eq!(scan_int("\u{0b}9600"), Some(9600));
+        assert_eq!(scan_uint("\u{0b}250ms"), Some(250));
     }
 
     #[test]

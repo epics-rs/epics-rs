@@ -117,6 +117,36 @@ pub enum DbFieldType {
 }
 
 impl DbFieldType {
+    /// This type as the CA **wire** carries its value.
+    ///
+    /// The single owner of the one row where the wire and the database
+    /// disagree. `db_access.h:40` is `typedef epicsUInt8 dbr_char_t;`, so a
+    /// `DBR_CHAR` element off the network is UNSIGNED; the `DBF_CHAR` it
+    /// shares a name with is `epicsInt8` (`epicsTypes.h:44`). Every other
+    /// row names the same type twice, and `DBF_UCHAR` has no wire code of
+    /// its own — it promotes to `DBR_CHAR` (`db_convert.h`
+    /// `dbDBRnewToDBRold`), which is why one carrier serves both.
+    ///
+    /// [`Self::from_u16`] and [`crate::types::native_type_for_dbr`] answer
+    /// the DATABASE question: which field type does this code name. Neither
+    /// is the wire's answer, so every site that turns *received* CA bytes
+    /// into a value composes one of them with this. The naive answer costs
+    /// a sign: byte `0xC8` is 200 to C and -56 without this.
+    ///
+    /// The signed reading is not lost, it is just not the carrier's. C
+    /// re-creates it at the DISPLAY step — `val2str` assigns the
+    /// `dbr_char_t` into a plain `char` before `sprintf("%d")`
+    /// (`ca/src/tools/tool_lib.c:114`, `:160-161`) — which is why C's own
+    /// `caget` prints -56 for a byte the wire called 200.
+    pub fn wire_carrier(self) -> Self {
+        match self {
+            Self::Char => Self::UChar,
+            other => other,
+        }
+    }
+
+    /// The DATABASE field type a `DBF_` index names. **Not** the carrier of
+    /// a CA wire payload — compose with [`Self::wire_carrier`] for that.
     pub fn from_u16(v: u16) -> CaResult<Self> {
         match v {
             0 => Ok(Self::String),
@@ -336,10 +366,25 @@ pub fn dbf_link_class(record_type: &str, field: &str) -> Option<DbfLinkClass> {
 /// (the output records). Input records declare `SIOL` as `DBF_INLINK`.
 /// Same output-record set as the device-write records — compare
 /// `crate::server::record::Record::can_device_write`.
+///
+/// The population is every `field(SIOL,DBF_OUTLINK)` in the record types this
+/// workspace ports: the nine Base output records plus synApps `busy`
+/// (`busyRecord.dbd`), a `bo` derivative whose SIOL is an output like its
+/// parent's. Every other SIOL-bearing type — `ai` `bi` `mbbi` `mbbiDirect`
+/// `longin` `int64in` `stringin` `lsi` `event` `waveform` `aai` `histogram`,
+/// synApps `swait` and `mca` — declares `DBF_INLINK`.
 fn is_output_record_type(record_type: &str) -> bool {
     matches!(
         record_type,
-        "ao" | "bo" | "longout" | "int64out" | "mbbo" | "mbboDirect" | "stringout" | "lso" | "aao"
+        "ao" | "bo"
+            | "busy"
+            | "longout"
+            | "int64out"
+            | "mbbo"
+            | "mbboDirect"
+            | "stringout"
+            | "lso"
+            | "aao"
     )
 }
 
@@ -395,6 +440,12 @@ fn dbr_native_index(dbr_type: u16) -> Option<u16> {
     }
 }
 
+/// The DATABASE field type a CA DBR code is named after.
+///
+/// **Not** the carrier of a payload that arrived over the wire: compose
+/// with [`DbFieldType::wire_carrier`] for that. The two answers differ for
+/// the CHAR row only, and that one row is the whole of CA's signedness
+/// mismatch.
 pub fn native_type_for_dbr(dbr_type: u16) -> CaResult<DbFieldType> {
     match dbr_native_index(dbr_type) {
         Some(idx) => DbFieldType::from_u16(idx),
@@ -615,6 +666,78 @@ mod dbf_link_class_tests {
         // SIML is always DBF_INLINK regardless of direction.
         assert_eq!(dbf_link_class("bo", "SIML"), Some(DbfLinkClass::InLink));
         assert_eq!(dbf_link_class("ai", "SIML"), Some(DbfLinkClass::InLink));
+    }
+
+    /// Every `field(SIOL,DBF_*)` in the record types this workspace ports,
+    /// read out of the C dbds. synApps `busy` is the one non-Base output
+    /// record — it derives from `bo` and declares `field(SIOL,DBF_OUTLINK)`
+    /// (`busyRecord.dbd`) — while synApps `swait` (`swaitRecord.dbd`) and
+    /// `mca` (`mcaRecord.dbd`) declare `DBF_INLINK`. A missing output entry is
+    /// silent: the classifier defaults to `InLink`, and the CP/CPP mask C
+    /// applies to an output link (`dbStaticLib.c:2380-2391`) is then skipped.
+    #[test]
+    fn siol_direction_matches_every_c_dbd_this_workspace_ports() {
+        for rtype in [
+            "ao",
+            "bo",
+            "busy",
+            "longout",
+            "int64out",
+            "mbbo",
+            "mbboDirect",
+            "stringout",
+            "lso",
+            "aao",
+        ] {
+            assert_eq!(
+                dbf_link_class(rtype, "SIOL"),
+                Some(DbfLinkClass::OutLink),
+                "{rtype} declares field(SIOL,DBF_OUTLINK)"
+            );
+        }
+        for rtype in [
+            "ai",
+            "bi",
+            "mbbi",
+            "mbbiDirect",
+            "longin",
+            "int64in",
+            "stringin",
+            "lsi",
+            "event",
+            "waveform",
+            "aai",
+            "histogram",
+            "swait",
+            "mca",
+        ] {
+            assert_eq!(
+                dbf_link_class(rtype, "SIOL"),
+                Some(DbfLinkClass::InLink),
+                "{rtype} declares field(SIOL,DBF_INLINK)"
+            );
+        }
+    }
+
+    /// The consequence a misclassified SIOL actually has: `check_link_assignment`
+    /// turns the class into a [`LinkFieldType`], and only the `Out` arm applies
+    /// C's `modifiers &= ~(pvlOptCPP|pvlOptCP)`. Classified as an input, a
+    /// `busy` SIOL would keep a CPP that C strips.
+    #[test]
+    fn a_busy_siol_discards_cp_the_way_an_output_link_must() {
+        use crate::server::record::{
+            LinkFieldType, LinkProcessPolicy, ParsedLink, parse_link_field,
+        };
+
+        let ftype = match dbf_link_class("busy", "SIOL").unwrap() {
+            DbfLinkClass::InLink => LinkFieldType::In,
+            DbfLinkClass::OutLink => LinkFieldType::Out,
+            DbfLinkClass::FwdLink => LinkFieldType::Fwd,
+        };
+        match parse_link_field("TGT.VAL CPP", ftype) {
+            ParsedLink::Db(db) => assert_eq!(db.policy, LinkProcessPolicy::NoProcess),
+            other => panic!("expected a db link, got {other:?}"),
+        }
     }
 
     /// `LNK0..LNKF` shares

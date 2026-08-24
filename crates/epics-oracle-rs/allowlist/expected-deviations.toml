@@ -106,15 +106,28 @@ id = "CBUG-E2"
 bucket = "NOT-REPRODUCED"
 upstream = "epics-base / dbConvert"
 fields = []
-surface = ["value_string", "value_numeric"]
-classes = [
-    "over-max",
-    "under-min",
-    "over-double-max",
-    "over-float-max",
-    "nan",
-    "enum-negative-ordinal",
+# The row's scope is the DESTINATION type, not a place: dbConvert instantiates
+# the same PUT macro body for every integer destination and for epicsEnum16, on
+# every record type. A float/double destination takes no integer cast and is
+# deliberately absent -- ai.VAL is DBF_DOUBLE, so `inf` vs `0` there is not this
+# bug and stays a DEFECT until adjudicated on its own.
+dbf_types = [
+    "DBF_CHAR",
+    "DBF_UCHAR",
+    "DBF_SHORT",
+    "DBF_USHORT",
+    "DBF_LONG",
+    "DBF_ULONG",
+    "DBF_INT64",
+    "DBF_UINT64",
+    "DBF_ENUM",
+    "DBF_MENU",
 ]
+surface = ["value_string", "value_numeric"]
+# `over-double-max`, `over-float-max` and `nan` are NOT here: cases.rs generates
+# those three only for DBF_FLOAT/DBF_DOUBLE fields, which `dbf_types` excludes,
+# so listing them would restate a scope the row does not have.
+classes = ["over-max", "under-min", "enum-negative-ordinal"]
 why = """
 dbConvert's double->integer put is a bare C cast, which is UNDEFINED out of range
 (C17 6.3.1.4p1) -- so compiled C is not single-valued. The C softIoc this harness
@@ -141,6 +154,10 @@ cast -- it is exact -- and is adjudicated separately, not under E2.)
 
 Expect: on an out-of-range numeric put, the x86-64 C softIoc stores the indefinite
 value and the port stores the saturated one. In range, both agree exactly.
+
+Scope: the destination's declared DBF type (dbf_types above), because that is what
+selects dbConvert's routine. A DBF_FLOAT or DBF_DOUBLE destination takes no integer
+cast and nothing here justifies a difference on one.
 """
 
 [[deviation]]

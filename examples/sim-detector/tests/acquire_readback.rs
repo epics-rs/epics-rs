@@ -59,8 +59,8 @@ async fn acquire_bo_returns_to_zero_after_single() {
     ads.set_record_info("Acquire", ScanType::Passive);
     ads.set_asyn_readback(true);
     {
-        let rec = db.get_record("Acquire").await.unwrap();
-        let mut inst = rec.write().await;
+        let rec = db.get_record("Acquire").unwrap();
+        let mut inst = rec.write();
         inst.common.dtyp = "asynInt32".into();
         ads.init(&mut *inst.record).unwrap();
         inst.device = Some(Box::new(ads));
@@ -68,9 +68,9 @@ async fn acquire_bo_returns_to_zero_after_single() {
 
     // Replicate setup_io_intr: take the device, grab the receiver, put it
     // back, and spawn the consumer that drives process_record_readback.
-    let rec_arc = db.get_record("Acquire").await.unwrap();
+    let rec_arc = db.get_record("Acquire").unwrap();
     let intr_rx = {
-        let mut inst = rec_arc.write().await;
+        let mut inst = rec_arc.write();
         let mut dev = inst.device.take().unwrap();
         let r = dev.io_intr_receiver();
         inst.device = Some(dev);
@@ -90,8 +90,8 @@ async fn acquire_bo_returns_to_zero_after_single() {
     // caput Acquire=1 — a real bo PUT (OUT stage dev.write() starts the
     // acquisition; the in-actor ACQUIRE=1 callback fires the readback).
     {
-        let rec = db.get_record("Acquire").await.unwrap();
-        let mut inst = rec.write().await;
+        let rec = db.get_record("Acquire").unwrap();
+        let mut inst = rec.write();
         inst.record.set_val(EpicsValue::Enum(1)).unwrap();
     }
     {
@@ -106,7 +106,7 @@ async fn acquire_bo_returns_to_zero_after_single() {
     for _ in 0..1000 {
         tokio::time::sleep(Duration::from_millis(2)).await;
         {
-            let inst = rec_arc.read().await;
+            let inst = rec_arc.read();
             val = inst.record.get_field("VAL");
         }
         if val == Some(EpicsValue::Enum(0)) {

@@ -21,6 +21,17 @@
 //! whether it was inexact. Every row of the boundary table in this module's
 //! tests was probed against the compiled glibc `strtod` on this platform.
 
+/// C `isspace` in the "C" locale: space, `\t`, `\n`, `\v`, `\f`, `\r`.
+///
+/// Rust's `is_ascii_whitespace` is the WhatWG set, which **omits the vertical
+/// tab** — so every port of a C `strtol`/`strtod`/`sscanf`/`isspace` skip that
+/// reached for it stopped one codepoint short of the C it cites. This is that
+/// skip's one owner; a byte-oriented scanner passes `b as char`, which maps
+/// 0x80..0xFF to U+0080..U+00FF and so stays false there, as C does.
+pub const fn c_isspace(c: char) -> bool {
+    matches!(c, ' ' | '\t' | '\n' | '\u{0b}' | '\u{0c}' | '\r')
+}
+
 /// A C99 hex float's significand, accumulated exactly.
 ///
 /// The value is `m * 2^e2`, plus a non-zero tail below `m`'s window when
@@ -128,11 +139,6 @@ fn pow2(k: i32) -> f64 {
     }
 }
 
-/// C `isspace()` in the "C" locale — `strtod`'s leading/trailing skip set.
-fn is_c_space(c: u8) -> bool {
-    matches!(c, b' ' | b'\t' | b'\n' | 0x0b | 0x0c | b'\r')
-}
-
 /// The `epicsParseDouble` failure codes (`epicsStdlib.h`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ParseDoubleError {
@@ -193,7 +199,7 @@ fn classify(v: f64, mantissa_nonzero: bool) -> Erange {
 fn strtod(s: &str) -> (f64, usize, Erange) {
     let b = s.as_bytes();
     let mut i = 0;
-    while i < b.len() && is_c_space(b[i]) {
+    while i < b.len() && c_isspace(b[i] as char) {
         i += 1;
     }
     let sign_at = i;
@@ -373,7 +379,7 @@ pub fn epics_parse_double(s: &str) -> Result<f64, ParseDoubleError> {
         Erange::Under => return Err(ParseDoubleError::Underflow),
         Erange::No => {}
     }
-    if !s.as_bytes()[used..].iter().all(|&c| is_c_space(c)) {
+    if !s.as_bytes()[used..].iter().all(|&c| c_isspace(c as char)) {
         return Err(ParseDoubleError::Extraneous);
     }
     Ok(v)

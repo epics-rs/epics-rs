@@ -10,7 +10,13 @@
 //! calcoutRecord.c:425-444   ODLY       -> "s"    :446-465 -> calcoutODLYprecision (= 2, :89)
 //! histogramRecord.c:410-417 SDEL       -> "s"    :419-437 -> histogramSDELprecision (= 2, :88)
 //! boRecord.c:294-299        HIGH       -> "s"    :301-308 -> boHIGHprecision      (= 2, :85)
+//! busyRecord.c  (no units arm)         HIGH             :277-284 -> 2 (bare literal)
+//! swaitRecord.c (no units arm)         ODLY                      -> 3 (bare literal)
 //! ```
+//!
+//! The last two are precision-only: neither rset supplies `get_units`, and
+//! neither constant is exported as a settable variable the way
+//! `boHIGHprecision` is.
 //!
 //! Measured on `softIocPVX`: before these arms existed the oracle reported 37
 //! differing leaves over 19 cases — C served `"s"`/`2` where the port served
@@ -23,9 +29,11 @@
 
 use epics_base_rs::server::record::{Record, RecordInstance};
 use epics_base_rs::server::records::bo::BoRecord;
+use epics_base_rs::server::records::busy::BusyRecord;
 use epics_base_rs::server::records::calcout::CalcoutRecord;
 use epics_base_rs::server::records::histogram::HistogramRecord;
 use epics_base_rs::server::records::seq::SeqRecord;
+use epics_base_rs::server::records::swait::SwaitRecord;
 use epics_base_rs::server::snapshot::Snapshot;
 
 fn snap(inst: &RecordInstance, field: &str) -> Snapshot {
@@ -115,7 +123,7 @@ fn calcouts_val_still_takes_egu_and_prec() {
     );
 }
 
-/// `histogramRecord.c:419-437` is a switch: SDEL takes the literal while
+/// `histogramRecord.c:420-439` is a switch: SDEL takes the literal while
 /// ULIM/LLIM/SGNL/SVAL/WDTH take `prec->prec`. Pin that the literal is SDEL's
 /// alone and does not leak onto the switch's other cases.
 ///
@@ -181,5 +189,49 @@ fn bos_units_literal_is_highs_alone() {
     assert!(
         snap(&inst, "VAL").display.unwrap().units.is_empty(),
         "boRecord.c:294-299 answers only HIGH; VAL gets no units"
+    );
+}
+
+/// `busyRecord.c:277-284` is the bare form of bo's arm — `if(paddr->pfield ==
+/// (void *)&prec->high) *precision=2; else recGblGetPrec(paddr,precision);` —
+/// and busy's rset NULLs `get_units`, so HIGH carries the 2 with no units.
+#[test]
+fn busy_high_takes_the_precision_literal_with_no_units() {
+    let inst = inst("T:BUSY", BusyRecord::default());
+
+    assert_eq!(
+        display(&inst, "HIGH"),
+        (String::new(), 2),
+        "busyRecord.c:281 answers HIGH with a literal 2; :69 NULLs get_units"
+    );
+}
+
+/// The `else recGblGetPrec` arm: on a busy that is nothing but zeros, every
+/// other field must still read 0, so a passing HIGH proves the arm fired
+/// rather than a blanket default coinciding.
+#[test]
+fn busys_precision_literal_is_highs_alone() {
+    let inst = inst("T:BUSY", BusyRecord::default());
+
+    for sibling in ["VAL", "OVAL", "IVOV"] {
+        assert_eq!(
+            display(&inst, sibling).1,
+            0,
+            "busyRecord.c:281 hands {sibling} to recGblGetPrec, which leaves the              memset zero"
+        );
+    }
+}
+
+/// `swaitRecord.c`'s `get_precision` answers ODLY with 3 — the only value in
+/// this family that is not 2, so it cannot pass by coincidence with any other
+/// arm. ODLY is `DBF_FLOAT`, which clears `dbAccess.c:388-389`'s gate.
+#[test]
+fn swait_odly_takes_the_precision_literal() {
+    let inst = inst("T:SWAIT", SwaitRecord::default());
+
+    assert_eq!(
+        display(&inst, "ODLY").1,
+        3,
+        "swaitRecord.c answers ODLY with a literal 3, not with PREC"
     );
 }

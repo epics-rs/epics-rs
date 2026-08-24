@@ -41,9 +41,11 @@ pub struct LonginRecord {
     // Omitting the fields routes their get/put through the common-field path
     // (the single owner), exactly as `ai`/`int64in` do. LALM (last-alarmed
     // value) below IS record state — `evaluate_analog_alarm` reads it via
-    // `self.record.get_field("LALM")` — so it stays.
-    #[field(type = "Double")]
-    pub lalm: f64,
+    // `self.record.get_field("LALM")` — so it stays. It is C's
+    // `epicsInt32 lalm` (`longinRecord.c:269`), the type its `.dbd` declares
+    // and the type the ladder compares in.
+    #[field(type = "Long")]
+    pub lalm: i32,
     // Deadband. ADEL/MDEL are `DBF_LONG` (longinRecord.dbd.pod) — the archive
     // and monitor deadbands are integer counts, not doubles. Stored as `i32`
     // (not `f64`) so the client-put target resolves to `DBF_LONG` and a string
@@ -88,7 +90,8 @@ pub struct LonginRecord {
     // longinRecord.dbd.pod:497-503). A non-negative SDLY makes the simulated SIOL read asynchronous:
     // C's `readValue` arms `callbackRequestProcessCallbackDelayed(..., sdly)`
     // and holds PACT across the delay (longinRecord.c:405-412). The framework reads the delay
-    // via `get_field("SDLY")`, so the field must exist for a `.db` to set it.
+    // via `resolve_field("SDLY")`, which falls back to the dbd `initial`, so
+    // this field is the record's own store for it rather than a requirement.
     #[field(type = "Double")]
     pub sdly: f64,
 }
@@ -100,7 +103,7 @@ impl Default for LonginRecord {
             egu: PvString::new(),
             hopr: 0,
             lopr: 0,
-            lalm: 0.0,
+            lalm: 0,
             adel: 0,
             mdel: 0,
             aftc: 0.0,

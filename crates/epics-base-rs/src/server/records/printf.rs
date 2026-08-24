@@ -514,6 +514,81 @@ fn format_float_conv(conv: u8, val: f64, prec: usize, alt_form: bool) -> String 
     }
 }
 
+/// The exponent C `%g` uses to choose between `%e` and `%f` style: the
+/// exponent of the value AFTER rounding to `precision` significant
+/// digits, not of the raw value. C99 7.19.6.1p8 defines the decision
+/// value X as the exponent of the style-`e` conversion, and that
+/// conversion rounds first, so at a rounding boundary the rounded
+/// magnitude can carry into the next decade (999999.5 at precision 6
+/// rounds to 1000000, exponent 5 -> 6) and flip the style.
+pub fn g_decision_exponent(abs: f64, precision: usize) -> i32 {
+    let raw_exp = abs.log10().floor() as i32;
+    // Scale so the value has `precision` digits before the decimal
+    // point, round half-to-even, and read the magnitude back: a carry
+    // into a new decade shows up as an incremented exponent.
+    let scale = 10f64.powi(precision as i32 - 1 - raw_exp);
+    // For magnitudes near the f64 range limits the scale factor
+    // overflows to +/-inf (or underflows to 0) and the product's
+    // `log10` saturates to a garbage exponent. The rounded magnitude
+    // cannot meaningfully differ from the raw one at those scales, so
+    // fall back to `raw_exp`.
+    if !scale.is_finite() || scale == 0.0 {
+        return raw_exp;
+    }
+    let rounded_scaled = (abs * scale).round();
+    if !rounded_scaled.is_finite() || rounded_scaled <= 0.0 {
+        return raw_exp;
+    }
+    raw_exp + (rounded_scaled.log10().floor() as i32 - (precision as i32 - 1))
+}
+
+/// C `printf("%.*g", precision, x)`: `%f` or `%e` style per
+/// [`g_decision_exponent`], trailing zeros and a bare decimal point
+/// stripped, exponent signed and padded to two digits.
+///
+/// The one owner of `%g` for the command-line tools. `epics-ca-rs`
+/// (`caget`/`camonitor`) and `epics-pva-rs` (`pvget`/`pvinfo`/
+/// `pvmonitor`) each carried a transcription of this rule and only one
+/// of the two rounded before choosing the style, so the same value
+/// printed in two notations depending on which tool read the PV.
+pub fn format_g(x: f64, precision: usize) -> String {
+    if x == 0.0 {
+        // -0.0 == 0.0 in Rust and C alike, and C prints the sign:
+        // `printf("%g", -0.0)` is "-0".
+        return if x.is_sign_negative() { "-0" } else { "0" }.to_string();
+    }
+    if !x.is_finite() {
+        return format!("{x}");
+    }
+    let p = precision.max(1);
+    let exp = g_decision_exponent(x.abs(), p);
+    // C `%g` uses fixed-point when `precision > exp >= -4`. Compare as
+    // i32 so a negative exponent does not wrap through usize.
+    if exp >= -4 && exp < p as i32 {
+        let digits = (p as i32 - 1 - exp).max(0) as usize;
+        let s = format!("{x:.digits$}");
+        if !s.contains('.') {
+            return s;
+        }
+        s.trim_end_matches('0').trim_end_matches('.').to_string()
+    } else {
+        // Rust `{:e}` precision counts mantissa decimals, so N
+        // significant digits is precision N-1, and its exponent is bare
+        // (`1.5e6`) where C writes `e+06`.
+        let s = format!("{:.*e}", p - 1, x);
+        let (mantissa, exp_digits) = s.split_once('e').expect("{:e} always writes an exponent");
+        let mantissa = if mantissa.contains('.') {
+            mantissa.trim_end_matches('0').trim_end_matches('.')
+        } else {
+            mantissa
+        };
+        let e: i32 = exp_digits
+            .parse()
+            .expect("...followed by a decimal exponent");
+        format!("{mantissa}e{}{:02}", if e < 0 { '-' } else { '+' }, e.abs())
+    }
+}
+
 fn format_g_val(val: f64, prec: usize, upper: bool, alt_form: bool) -> String {
     if val == 0.0 {
         // libc `%g` of 0.0 is "0"; `%#g` keeps trailing zeros.
@@ -525,7 +600,9 @@ fn format_g_val(val: f64, prec: usize, upper: bool, alt_form: bool) -> String {
         return "0".to_string();
     }
     let p = if prec == 0 { 1 } else { prec };
-    let exp = val.abs().log10().floor() as i32;
+    // Same style decision as `format_g`; `%G`/`%#g` differ only in how
+    // the chosen style is emitted.
+    let exp = g_decision_exponent(val.abs(), p);
 
     if exp < -4 || exp >= p as i32 {
         let sig_prec = p.saturating_sub(1);
@@ -873,6 +950,20 @@ mod tests {
         rec.set_input(0, EpicsValue::Double(0.0));
         rec.process().unwrap();
         assert_eq!(rec.val, "0.00");
+    }
+
+    /// C `%g` chooses fixed vs scientific from the exponent of the
+    /// value AFTER rounding to the requested significant digits (C99
+    /// 7.19.6.1p8). At precision 6, 9.9999995e-05 rounds to 0.0001 and
+    /// the exponent carries -5 -> -4, which is no longer < -4, so the
+    /// style flips to fixed. Taking `log10` of the raw value emitted the
+    /// scientific form instead.
+    #[test]
+    fn g_style_comes_from_the_rounded_exponent() {
+        let mut rec = rec_with("%g");
+        rec.set_input(0, EpicsValue::Double(9.9999995e-05));
+        rec.process().unwrap();
+        assert_eq!(rec.val, "0.0001");
     }
 
     /// `%%` escapes a literal percent.

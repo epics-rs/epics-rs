@@ -23,7 +23,7 @@ pub mod uri;
 
 pub use attribute::NTAttribute;
 pub use enum_t::NTEnum;
-pub use qsrv_marks::{FORM_CHOICES, event_leaves, monitor_mask, property_leaves};
+pub use qsrv_marks::{FORM_CHOICES, event_leaves, property_leaves};
 pub use scalar::NTScalar;
 pub use table::NTTable;
 pub use typed::{Alarm, TimeStamp, TypedNT, TypedNTError};

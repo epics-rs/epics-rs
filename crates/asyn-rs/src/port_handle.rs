@@ -8,7 +8,7 @@ use std::future::Future;
 use std::pin::pin;
 use std::sync::Arc;
 use std::task::{Context, Poll, Wake, Waker};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use tokio::runtime::RuntimeFlavor;
 use tokio::sync::{mpsc, oneshot};
@@ -21,7 +21,15 @@ use crate::port_actor::{ActorId, ActorMessage};
 use crate::request::{CancelToken, RequestOp, RequestResult};
 use crate::user::AsynUser;
 
-/// Park the calling thread until `fut` resolves, from *any* context.
+/// Park the calling thread until `fut` resolves or `deadline` passes, from
+/// *any* context.
+///
+/// `deadline` is what makes a blocking wait bounded, and it is taken here
+/// rather than layered above because this parking executor drives no reactor:
+/// there is no timer to race the future against, so the bound has to live in
+/// the park itself (`park_timeout`). A `None` deadline parks until the future
+/// resolves and is only correct where something *else* already bounds it —
+/// [`PortHandle::blocking`] names the one such caller and why.
 ///
 /// Deliberately not one of tokio's blocking shims. Every one of them vetoes
 /// some context this framework actually runs in:
@@ -38,7 +46,7 @@ use crate::user::AsynUser;
 /// oneshot receive), which are documented as runtime-agnostic: polling them
 /// needs no reactor and no timer, so a bare parking executor is both sufficient
 /// and incapable of panicking on a runtime-flavour check.
-fn park_on<F: Future>(fut: F) -> F::Output {
+fn park_on<F: Future>(fut: F, deadline: Option<Instant>) -> Option<F::Output> {
     struct ParkWaker(std::thread::Thread);
     impl Wake for ParkWaker {
         fn wake(self: Arc<Self>) {
@@ -53,10 +61,21 @@ fn park_on<F: Future>(fut: F) -> F::Output {
     let waker = Waker::from(Arc::new(ParkWaker(std::thread::current())));
     let mut cx = Context::from_waker(&waker);
     loop {
+        // Polled before the deadline is consulted, so a reply that landed
+        // exactly at the deadline is delivered rather than discarded.
         match fut.as_mut().poll(&mut cx) {
-            Poll::Ready(value) => return value,
+            Poll::Ready(value) => return Some(value),
             // A spurious unpark just re-polls, which is always sound.
-            Poll::Pending => std::thread::park(),
+            Poll::Pending => match deadline {
+                None => std::thread::park(),
+                Some(deadline) => {
+                    let remaining = deadline.saturating_duration_since(Instant::now());
+                    if remaining.is_zero() {
+                        return None;
+                    }
+                    std::thread::park_timeout(remaining);
+                }
+            },
         }
     }
 }
@@ -68,16 +87,39 @@ fn park_on<F: Future>(fut: F) -> F::Output {
 /// runtime, but never the thread that owes us the answer. The one context where
 /// that reasoning fails (the caller *is* the actor) is refused up front by
 /// [`guard_reentrant`], never reached here.
-fn block_on_reply<F: Future>(fut: F) -> F::Output {
+fn block_on_reply<F: Future>(fut: F, deadline: Option<Instant>) -> Option<F::Output> {
     match tokio::runtime::Handle::try_current().map(|h| h.runtime_flavor()) {
         // A multi-threaded worker: hand this worker's other tasks to a sibling
         // before we park it. Purely a scheduling courtesy — correctness does
         // not depend on it.
-        Ok(RuntimeFlavor::MultiThread) => tokio::task::block_in_place(|| park_on(fut)),
+        Ok(RuntimeFlavor::MultiThread) => tokio::task::block_in_place(|| park_on(fut, deadline)),
         // A current-thread runtime, or no runtime at all. `block_in_place` is
         // unavailable here (it panics), and parking directly is correct.
-        _ => park_on(fut),
+        _ => park_on(fut, deadline),
     }
+}
+
+/// Block until `fut` resolves or `deadline` passes; `None` means it passed.
+///
+/// The bound is a parameter, not an option, so a caller cannot reach an
+/// unbounded wait by leaving something out — the only way to park without a
+/// deadline is to name [`block_on_prebounded_reply`] and satisfy its
+/// precondition.
+fn block_on_reply_until<F: Future>(fut: F, deadline: Instant) -> Option<F::Output> {
+    block_on_reply(fut, Some(deadline))
+}
+
+/// Block until `fut` resolves, with no deadline of our own.
+///
+/// Precondition, which the name exists to make the caller state out loud:
+/// `fut` must already resolve on its own bound. The single caller is
+/// [`PortHandle::blocking`], whose future is `submit_cancellable` — that one
+/// resolves at the request's `AsynUser::queue_timeout`, so a deadline here
+/// would be a second, competing bound on the same wait.
+fn block_on_prebounded_reply<F: Future>(fut: F) -> F::Output {
+    // Not a guard against an impossible state: `park_on` returns `None` only
+    // for a `Some` deadline, and this function is the sole `None` site.
+    block_on_reply(fut, None).expect("a park with no deadline cannot expire")
 }
 
 /// Refuse a blocking wait the calling thread could never be woken from.
@@ -121,13 +163,35 @@ pub struct AsyncCompletionHandle {
 }
 
 impl AsyncCompletionHandle {
-    /// Block the current thread until the result arrives.
+    /// Block the current thread until the result arrives or `timeout` expires.
+    ///
+    /// `timeout` bounds the wait, not the request: a request the actor has
+    /// already begun keeps running, exactly as C's `queueTimeoutCallback`
+    /// (`asynManager.c:649-703`) leaves a dequeued request alone — it returns
+    /// at once on `!puserPvt->isQueued` (`:657-663`). What expiry
+    /// buys the caller is the ability to report — `WriteCompletion::wait`
+    /// (`epics-base-rs/src/server/device_support.rs`) turns the `asynTimeout`
+    /// into the record's completion, where an unbounded park left the record
+    /// in `PACT` for good and never released the thread.
+    ///
+    /// Dropping the reply receiver on expiry is safe: the actor sends its
+    /// reply with `let _ = reply.send(..)` and does not care that nobody is
+    /// listening.
     ///
     /// Errors instead of deadlocking if called from the port's own actor
     /// thread — that actor is the thread that would have to produce the reply.
-    pub fn wait_blocking(self, _timeout: Duration) -> AsynResult<RequestResult> {
+    pub fn wait_blocking(self, timeout: Duration) -> AsynResult<RequestResult> {
         guard_reentrant(self.actor, &self.port_name, "wait_blocking")?;
-        block_on_reply(self)
+        let port_name = self.port_name.clone();
+        block_on_reply_until(self, Instant::now() + timeout).unwrap_or_else(|| {
+            Err(AsynError::Status {
+                status: AsynStatus::Timeout,
+                message: format!(
+                    "wait_blocking timed out after {timeout:?} waiting for port {port_name} \
+                     to complete the request"
+                ),
+            })
+        })
     }
 }
 
@@ -308,7 +372,11 @@ impl PortHandle {
     /// from a multi-threaded worker.
     fn blocking<T>(&self, what: &str, fut: impl Future<Output = AsynResult<T>>) -> AsynResult<T> {
         guard_reentrant(self.actor, &self.port_name, what)?;
-        block_on_reply(fut)
+        // `fut` is `submit_cancellable`, which already resolves at the
+        // request's own `AsynUser::queue_timeout` — `await_reply`'s timer
+        // where a reactor exists, the actor's dequeue re-check where it does
+        // not. That satisfies the precondition; see the function's doc.
+        block_on_prebounded_reply(fut)
     }
 
     /// Submit a request and block until completion (for sync callers).
@@ -346,7 +414,7 @@ impl PortHandle {
     ///
     /// C parity: `asynManager::queueRequest` (`asynManager.c:1514`) enqueues
     /// the request on the port thread and the caller's callback runs later;
-    /// `asynManager::cancelRequest` (`asynManager.c:1630`) removes a request
+    /// `asynManager::cancelRequest` (`asynManager.c:1632`) removes a request
     /// that is still queued. A caller that may need to abort the request
     /// (asynRecord `AQR`, `asynRecord.c:393-408`) keeps the token and calls
     /// [`CancelToken::cancel`]; the actor drops a still-queued message at its
@@ -482,6 +550,49 @@ impl PortHandle {
             status: AsynStatus::Error,
             message: "octet read returned no data".into(),
         })
+    }
+
+    /// One locked, flush-first write/read pair — C
+    /// `asynOctetSyncIO.c:231-276` `writeRead`.
+    ///
+    /// C brackets the whole exchange in `queueLockPort` (:246) …
+    /// `queueUnlockPort` (:271), flushes INSIDE that lock and BEFORE the
+    /// write (:250), and unlocks on every exit path via `goto bad`. All
+    /// three properties hold here by construction: the pair is a single
+    /// [`RequestOp::OctetWriteRead`], so the port actor — which owns the
+    /// driver and runs one op to completion — is the lock, the flush is
+    /// the op's own first step, and there is no exit path that can leave
+    /// the port half-owned because ownership ends when the op returns.
+    ///
+    /// This is the primitive a protocol driver must use for a
+    /// request/response transaction. Submitting `OctetWrite` and then
+    /// `OctetRead` separately is NOT equivalent: another client of the same
+    /// port can be served between the two, and a reply that arrived late
+    /// from the previous exchange is still in the buffer.
+    pub async fn write_read(
+        &self,
+        reason: usize,
+        addr: i32,
+        data: &[u8],
+        buf_size: usize,
+    ) -> AsynResult<(Vec<u8>, crate::interpose::EomReason)> {
+        let user = AsynUser::new(reason).with_addr(addr);
+        let result = self
+            .submit_async(
+                RequestOp::OctetWriteRead {
+                    data: data.to_vec(),
+                    buf_size,
+                    flush: true,
+                },
+                user,
+            )
+            .await?;
+        let data = result.data.ok_or_else(|| AsynError::Status {
+            status: AsynStatus::Error,
+            message: "octet write/read returned no data".into(),
+        })?;
+        let eom = crate::interpose::EomReason::from_bits_truncate(result.eom_reason);
+        Ok((data, eom))
     }
 
     /// Read variant that also surfaces the end-of-message reason
@@ -1857,5 +1968,94 @@ mod tests {
             ),
             "the failed update stored nothing: the Float64 param is still undefined"
         );
+    }
+
+    /// A handle whose actor never answers. `ActorId::new()` mints an id that
+    /// is published on no thread, so `guard_reentrant` treats this caller as
+    /// a foreign thread — exactly the shape of a record's device support
+    /// waiting on a port whose device has gone away.
+    fn stuck_handle(
+        port_name: &str,
+    ) -> (
+        oneshot::Sender<AsynResult<RequestResult>>,
+        AsyncCompletionHandle,
+    ) {
+        let (tx, rx) = oneshot::channel();
+        (
+            tx,
+            AsyncCompletionHandle {
+                rx,
+                actor: ActorId::new(),
+                port_name: port_name.into(),
+            },
+        )
+    }
+
+    /// F2 regression: `wait_blocking` used to underscore its `timeout` and
+    /// park forever, leaving the record in PACT and leaking the thread.
+    ///
+    /// The wait runs on its own thread and reports through a channel, so an
+    /// unbounded park fails this test in seconds instead of hanging it.
+    #[test]
+    fn wait_blocking_expires_when_the_actor_never_replies() {
+        // Held for the whole test: dropping it would close the oneshot and
+        // resolve the wait for the wrong reason.
+        let (_tx, handle) = stuck_handle("F2_STUCK");
+
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let started = Instant::now();
+            let result = handle.wait_blocking(Duration::from_millis(200));
+            let _ = done_tx.send((started.elapsed(), result));
+        });
+
+        let (elapsed, result) = done_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("wait_blocking never returned: its timeout argument is being discarded");
+
+        assert!(
+            elapsed >= Duration::from_millis(200),
+            "returned before the deadline it was given: {elapsed:?}"
+        );
+        match result {
+            Err(AsynError::Status {
+                status: AsynStatus::Timeout,
+                message,
+            }) => assert!(
+                message.contains("F2_STUCK"),
+                "the timeout must name the port that owes the reply, got {message:?}"
+            ),
+            other => panic!("expected an asynTimeout, got {other:?}"),
+        }
+    }
+
+    /// The other side of the same boundary: a reply that beats the deadline
+    /// is delivered, so the bound cannot be satisfied by simply timing out.
+    /// This is also what proves `park_timeout` still wakes on `unpark`.
+    #[test]
+    fn wait_blocking_returns_a_reply_that_beats_the_deadline() {
+        let (tx, handle) = stuck_handle("F2_PROMPT");
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(50));
+            let _ = tx.send(Ok(RequestResult::write_n(7)));
+        });
+
+        let result = handle
+            .wait_blocking(Duration::from_secs(30))
+            .expect("the reply arrived well inside the deadline");
+        assert_eq!(result.nbytes, 7);
+    }
+
+    /// An already-expired budget is still one honest attempt at the reply,
+    /// not an error the caller cannot distinguish from a real timeout.
+    #[test]
+    fn wait_blocking_with_a_zero_timeout_still_takes_a_reply_that_is_already_there() {
+        let (tx, handle) = stuck_handle("F2_ZERO");
+        tx.send(Ok(RequestResult::write_n(3))).unwrap();
+
+        let result = handle
+            .wait_blocking(Duration::ZERO)
+            .expect("the reply was already queued");
+        assert_eq!(result.nbytes, 3);
     }
 }

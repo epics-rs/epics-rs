@@ -123,6 +123,18 @@ impl CaTools {
     /// a rejected put or an unconnectable PV reports itself, and both are
     /// findings rather than absences.
     fn run(&self, tool: &str, args: &[String]) -> Result<String, ToolError> {
+        self.run_with_stderr(tool, args).map(|(stdout, _)| stdout)
+    }
+
+    /// [`Self::run`], keeping stderr on the **success** path too.
+    ///
+    /// Only [`Self::put`] needs it, and it needs it because `caput` can fail
+    /// while exiting 0: on a callback timeout `caput.c:567` prints "Write
+    /// callback operation timed out" but leaves `pvs[0].status` at its
+    /// `ECA_NORMAL` initialiser, falls through to the read-back `caget`, and
+    /// returns *that* status. Discarding stderr on success therefore turns a
+    /// put nobody ever confirmed into an accepted one.
+    fn run_with_stderr(&self, tool: &str, args: &[String]) -> Result<(String, String), ToolError> {
         let mut cmd = Command::new(self.bin.join(tool));
         cmd.args(args)
             .stdin(Stdio::null())
@@ -153,7 +165,10 @@ impl CaTools {
                 },
             ));
         }
-        Ok(stdout)
+        Ok((
+            stdout,
+            String::from_utf8_lossy(&out.stderr).trim().to_string(),
+        ))
     }
 
     /// `caget -t <pv>` — the value as a client sees it by default. For an
@@ -280,45 +295,86 @@ impl CaTools {
         Ok(infos)
     }
 
-    /// `caput` — returns whether the write was **accepted**, and the server's
-    /// complaint if it was not.
+    /// `caput` — whether the write was **accepted**, and the server's complaint
+    /// if it was not.
     ///
-    /// Put accept/reject is itself observable behavior (a `SPC_NOMOD` field
-    /// must refuse the write, an out-of-range enum must refuse it), so a
-    /// rejection is a *reading*, not a failure of the harness.
-    pub fn caput(&self, pv: &str, value: &str) -> PutOutcome {
+    /// `Ok` is a *reading*: put accept/reject is observable behavior (a
+    /// `SPC_NOMOD` field must refuse the write, an out-of-range enum must
+    /// refuse it), so a rejection is a finding, not a failure of the harness.
+    /// `Err` is the absence of a reading. See `Self::put` for why the two
+    /// cannot be one value.
+    pub fn caput(&self, pv: &str, value: &str) -> Result<PutOutcome, ToolError> {
         let mut args = put_args();
         args.push(pv.to_string());
         args.push(value.to_string());
-        match self.run("caput", &args) {
-            Ok(_) => PutOutcome {
-                accepted: true,
-                error: None,
-            },
-            Err(e) => PutOutcome {
-                accepted: false,
-                error: Some(normalize_ca_error(&e.message)),
-            },
-        }
+        self.put(&args)
     }
 
-    /// `caput -a` — array put (`-a` takes a count then the elements).
-    pub fn caput_array(&self, pv: &str, values: &[String]) -> PutOutcome {
+    /// `caput -a` — array put (`-a` takes a count then the elements). Same
+    /// reading-vs-absence contract as [`Self::caput`].
+    pub fn caput_array(&self, pv: &str, values: &[String]) -> Result<PutOutcome, ToolError> {
         let mut args = put_args();
         args.push("-a".into());
         args.push(pv.to_string());
         args.push(values.len().to_string());
         args.extend(values.iter().cloned());
-        match self.run("caput", &args) {
-            Ok(_) => PutOutcome {
+        self.put(&args)
+    }
+
+    /// The single classifier for every `caput` invocation: did the server
+    /// answer, or did the measurement not happen?
+    ///
+    /// Both spellings used to collapse every `Err` into
+    /// `PutOutcome { accepted: false, … }`, so a spawn failure, the 8 s
+    /// [`TOOL_TIMEOUT`] kill and the `-w` CA timeout were the same value as a
+    /// `SPC_NOMOD` refusal. Both sides then "agreed" that the write was refused
+    /// and the case scored AGREED on an experiment that never ran — which is
+    /// why the put phase could report `ERROR 0` across a whole sweep.
+    ///
+    /// The two meanings are now different types, so no caller can conflate
+    /// them by accident. Which failures are absences is decided by
+    /// [`is_measurement_failure`] against the C tools' own strings, because
+    /// `caput` exits 1 for a refusal and for a timeout alike.
+    fn put(&self, args: &[String]) -> Result<PutOutcome, ToolError> {
+        match self.run_with_stderr("caput", args) {
+            Ok((_, stderr)) if is_measurement_failure(&stderr) => {
+                Err(self.err("caput", normalize_ca_error(&stderr)))
+            }
+            Ok(_) => Ok(PutOutcome {
                 accepted: true,
                 error: None,
-            },
-            Err(e) => PutOutcome {
+            }),
+            Err(e) if is_measurement_failure(&e.message) => Err(e),
+            Err(e) => Ok(PutOutcome {
                 accepted: false,
                 error: Some(normalize_ca_error(&e.message)),
-            },
+            }),
         }
+    }
+
+    /// A put whose purpose is to **stimulate** a subscription: the write must
+    /// actually have happened.
+    ///
+    /// For the monitor phases, "the server refused" is not a reading to compare.
+    /// A refused put posts no event; a port that posts nothing then matches a
+    /// ground truth that also posted nothing, and the case scores AGREED on an
+    /// experiment that was never run. So a refusal is an absence here, exactly
+    /// like a timeout — the same rule [`crate::pvamonitor`] already states for
+    /// PVA. The put phase keeps the opposite rule, because there the refusal
+    /// *is* the observable.
+    pub fn caput_drive(&self, pv: &str, value: &str) -> Result<(), ToolError> {
+        let out = self.caput(pv, value)?;
+        if out.accepted {
+            return Ok(());
+        }
+        Err(self.err(
+            "caput",
+            format!(
+                "drive refused: {pv} <- {value}: {} — nothing was stimulated, \
+                 so the trace proves nothing",
+                out.error.unwrap_or_default()
+            ),
+        ))
     }
 
     /// `cainfo` — native DBF type, element count, and access rights.
@@ -375,7 +431,8 @@ impl CaTools {
     /// 5. kill the subscriber and parse.
     ///
     /// A PV that never produces an initial update inside `connect_timeout` is a
-    /// [`ToolError`] — the case then scores ERROR, not agreement.
+    /// [`ToolError`] — the case then scores ERROR, not agreement. So is a
+    /// `drive` that reports failure: see [`Self::caput_drive`].
     pub fn monitor<F>(
         &self,
         pvs: &[String],
@@ -384,7 +441,7 @@ impl CaTools {
         drive: F,
     ) -> Result<MonitorTrace, ToolError>
     where
-        F: FnOnce(&CaTools),
+        F: FnOnce(&CaTools) -> Result<(), ToolError>,
     {
         use std::io::{BufRead, BufReader};
         use std::sync::mpsc;
@@ -446,7 +503,16 @@ impl CaTools {
         }
 
         // (3) drive the operations, then (4) hold the window open.
-        drive(self);
+        //
+        // A drive that failed is not a quiet server: nothing was stimulated, so
+        // an empty trace says nothing about what the IOC would have posted.
+        // Returning it as a reading is how two sides come to "agree" about a
+        // subscription neither one was ever given anything to post on.
+        if let Err(e) = drive(self) {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(e);
+        }
         std::thread::sleep(settle);
 
         // (5) stop and collect everything the subscriber managed to print.
@@ -588,6 +654,36 @@ fn parse_cainfo(out: &str) -> Option<CaInfo> {
 /// This normalizes only provably-incidental text. The reason phrase itself is
 /// preserved, so a port that rejects with the wrong *reason* still shows up as
 /// a diff.
+/// Did this tool output mean **the measurement did not happen**, as opposed to
+/// the server answering "no"?
+///
+/// `caput` returns exit 1 for a refusal and for a timeout alike, so the exit
+/// status cannot separate them; the message can. Each marker is quoted from the
+/// C source that prints it, and the list is deliberately closed — anything not
+/// named here is treated as the server's answer, so a new C message becomes a
+/// visible odd reading rather than a silently swallowed ERROR.
+///
+/// - `Channel connect timed out` — `tool_lib.c:633,635`: the channel never
+///   connected, so nothing was ever written.
+/// - `Write operation timed out` — `caput.c:560`: `ca_pend_io` never completed.
+/// - `Write callback operation timed out` — `caput.c:567`: no completion status
+///   came back. This one is printed on a run that then **exits 0**, which is why
+///   [`CaTools::put`] inspects stderr on the success path too.
+/// - `spawn:` / `timed out after` / `wait:` — this harness's own failures from
+///   [`CaTools::run_with_stderr`] and [`wait_bounded`]: the child never ran, was
+///   killed at [`TOOL_TIMEOUT`], or could not be reaped.
+fn is_measurement_failure(msg: &str) -> bool {
+    const MARKERS: [&str; 6] = [
+        "Channel connect timed out",
+        "Write operation timed out",
+        "Write callback operation timed out",
+        "spawn:",
+        "timed out after",
+        "wait:",
+    ];
+    MARKERS.iter().any(|m| msg.contains(m))
+}
+
 fn normalize_ca_error(msg: &str) -> String {
     let mut out = String::new();
     for line in msg.lines() {
@@ -709,6 +805,34 @@ pub(crate) fn wait_bounded(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The classifier decides which side of "reading vs absence" each `caput`
+    /// failure lands on, and `caput` exits 1 for both — so these strings, quoted
+    /// from the C tools, are the whole discriminator. A refusal wrongly called a
+    /// measurement failure would bury a real finding under ERROR just as surely
+    /// as the reverse buries it under AGREED.
+    #[test]
+    fn the_c_tools_timeout_messages_are_absences_and_a_refusal_is_a_reading() {
+        // tool_lib.c:635, caput.c:560, caput.c:567 — nothing was written.
+        assert!(is_measurement_failure(
+            "Channel connect timed out: 'ORACLE:AI.VAL' not found."
+        ));
+        assert!(is_measurement_failure(
+            "Write operation timed out: Data was not written."
+        ));
+        assert!(is_measurement_failure("Write callback operation timed out"));
+        // This harness's own failures.
+        assert!(is_measurement_failure("spawn: No such file or directory"));
+        assert!(is_measurement_failure("timed out after 8s"));
+
+        // caput.c:573 — the server answered, and it said no. A reading.
+        assert!(!is_measurement_failure(
+            "ERROR occurred writing data: Write access denied"
+        ));
+        assert!(!is_measurement_failure(
+            "ERROR from put operation: Invalid record modification"
+        ));
+    }
 
     fn sh(script: &str) -> std::process::Child {
         Command::new("sh")

@@ -35,16 +35,18 @@ pub mod decimate;
 pub mod parser;
 pub mod sync;
 pub mod ts;
+pub mod utag;
 
 pub use arr::{ArrayFilter, ArrayFilterConfig};
 pub use dbnd::{DeadbandFilter, DeadbandMode};
 pub use decimate::DecimateFilter;
 pub use parser::{
-    FilterParseError, ParsedChannelName, parse_filter_chain, split_channel_name,
-    try_parse_filter_chain,
+    ChannelName, FilterParseError, ParsedChannelName, parse_channel_name, parse_filter_chain,
+    split_channel_name, try_parse_filter_chain,
 };
 pub use sync::{DbState, DbStateRegistry, SyncFilter, SyncMode, db_state_registry};
 pub use ts::TimestampFilter;
+pub use utag::UserTagFilter;
 
 /// One event passed through the filter chain. Wraps the standard
 /// [`MonitorEvent`] with the C field-log context flag. The originating
@@ -227,7 +229,7 @@ impl FilterChain {
     }
 
     /// epics-base parity for a CA monitor single-event post
-    /// (`db_post_single_event`, `rsrv/camessage.c:1085-1093`,
+    /// (`db_post_single_event`, `rsrv/camessage.c:1117-1122`,
     /// `1851-1853`): the initial monitor event and access-rights
     /// transition events are queued via `db_create_event_log`
     /// (`dbEvent.c:746-752`, `dbfl_context_event`) then run through
@@ -397,21 +399,28 @@ mod tests {
     fn apply_to_event_value_decimates_while_read_value_bypasses() {
         use super::parse_filter_chain;
         let value = EpicsValue::Double(7.0);
-        // Read context: `dec` short-circuits → value passes unchanged.
-        let read_chain = parse_filter_chain(r#"{"dec":{"n":2,"offset":1}}"#);
+        // Read context: `dec` short-circuits → value passes unchanged, and
+        // consumes no slot, so it can run any number of times.
+        let read_chain = parse_filter_chain(r#"{"dec":{"n":2}}"#);
+        for _ in 0..3 {
+            assert!(
+                matches!(
+                    read_chain.apply_to_read_value(value.clone()),
+                    Some(EpicsValue::Double(v)) if v == 7.0
+                ),
+                "read context bypasses the decimator"
+            );
+        }
+        // Event context: the counter runs, so the second post of each
+        // 2-window is dropped.
+        let event_chain = parse_filter_chain(r#"{"dec":{"n":2}}"#);
         assert!(
-            matches!(
-                read_chain.apply_to_read_value(value.clone()),
-                Some(EpicsValue::Double(v)) if v == 7.0
-            ),
-            "read context bypasses the decimator"
+            event_chain.apply_to_event_value(value.clone()).is_some(),
+            "first single-event post is the head of the window"
         );
-        // Event context: position 0 != offset 1 on the first (fresh)
-        // post → dropped, so the initial monitor event is suppressed.
-        let event_chain = parse_filter_chain(r#"{"dec":{"n":2,"offset":1}}"#);
         assert!(
             event_chain.apply_to_event_value(value).is_none(),
-            "event context decimates the first single-event post"
+            "event context decimates the second single-event post"
         );
     }
 
@@ -423,6 +432,9 @@ mod tests {
     fn apply_to_event_value_suppresses_sync_while_read_value_passes() {
         use super::parse_filter_chain;
         let value = EpicsValue::Double(1.0);
+        // `sync.c`'s `parse_ok` resolves the state with `dbStateFind`, so it
+        // has to exist before the channel names it.
+        super::db_state_registry().get_or_create("BFR7:GATE");
         let read_chain = parse_filter_chain(r#"{"sync":{"while":"BFR7:GATE"}}"#);
         assert!(
             read_chain.apply_to_read_value(value.clone()).is_some(),

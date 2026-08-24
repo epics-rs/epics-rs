@@ -3,7 +3,7 @@ use std::sync::Arc;
 use asyn_rs::error::AsynResult;
 use asyn_rs::port::{PortDriverBase, PortFlags};
 
-use crate::color::NDColorMode;
+use crate::driver::ndarray_driver::{init_read_only_params, refresh_pool_stats};
 use crate::ndarray::NDArray;
 use crate::ndarray_pool::NDArrayPool;
 use crate::params::ad_driver::ADDriverParams;
@@ -40,20 +40,14 @@ impl ADDriverBase {
         );
 
         let params = ADDriverParams::create(&mut port_base)?;
+        let pool = Arc::new(NDArrayPool::new(max_memory));
 
+        // C `ADDriver::ADDriver` (ADDriver.cpp:150) chains to
+        // `asynNDArrayDriver::asynNDArrayDriver`, so its whole read-only block
+        // runs for every AD driver before the detector seeds below.
+        init_read_only_params(&mut port_base, &params.base, port_name)?;
+        refresh_pool_stats(&mut port_base, &params.base, &pool)?;
         // Set initial values
-        // Identity strings
-        port_base.set_string_param(params.base.port_name_self, 0, port_name.into())?;
-        port_base.set_string_param(
-            params.base.ad_core_version,
-            0,
-            env!("CARGO_PKG_VERSION").into(),
-        )?;
-        port_base.set_string_param(
-            params.base.driver_version,
-            0,
-            env!("CARGO_PKG_VERSION").into(),
-        )?;
         port_base.set_string_param(params.base.codec, 0, String::new())?;
 
         // ADDriver.cpp:174-179 states the rule these seeds follow: "values set
@@ -79,21 +73,11 @@ impl ADDriverBase {
         port_base.set_string_param(params.string_to_server, 0, String::new())?;
         port_base.set_string_param(params.string_from_server, 0, String::new())?;
 
-        // asynNDArrayDriver.cpp:967-1005 — the NDArray base-class seeds.
+        // Not in C's block, which leaves both to the database: this port has
+        // no NDDataType_RBV default to fall back on, and a detector with no
+        // downstream plugins is still expected to publish arrays.
         port_base.set_int32_param(params.base.data_type, 0, 1)?; // UInt8
-        port_base.set_int32_param(params.base.color_mode, 0, NDColorMode::Mono as i32)?;
         port_base.set_int32_param(params.base.array_callbacks, 0, 1)?;
-        port_base.set_float64_param(
-            params.base.pool_max_memory,
-            0,
-            max_memory as f64 / 1_048_576.0,
-        )?;
-        port_base.set_int32_param(params.base.array_size_x, 0, 0)?;
-        port_base.set_int32_param(params.base.array_size_y, 0, 0)?;
-        port_base.set_int32_param(params.base.array_size_z, 0, 0)?;
-        port_base.set_int32_param(params.base.array_size, 0, 0)?;
-
-        let pool = Arc::new(NDArrayPool::new(max_memory));
 
         // Don't fire callbacks here — no record subscribers exist before
         // dbLoadRecords, so an early `call_param_callbacks(0)` only
@@ -225,7 +209,7 @@ impl ADDriverBase {
                 // C++: epicsThreadSleep(shutterOpenDelay - shutterCloseDelay).
                 let delay = open_delay - close_delay;
                 if delay > 0.0 {
-                    std::thread::sleep(std::time::Duration::from_secs_f64(delay));
+                    std::thread::sleep(epics_libcom_rs::runtime::time::duration_from_secs(delay));
                 }
             }
         }
@@ -311,6 +295,18 @@ pub trait ADDriver: asyn_rs::port::PortDriver {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::driver::ndarray_driver::tests::{assert_c_read_only_block, assert_fresh_pool_stats};
+
+    #[test]
+    fn test_constructor_seeds_the_c_read_only_block() {
+        // C++ `ADDriver::ADDriver` (ADDriver.cpp:150) chains to
+        // `asynNDArrayDriver::asynNDArrayDriver`, so the whole of
+        // asynNDArrayDriver.cpp:954-1005 must be readable on a detector port
+        // too, not just the six seeds this constructor used to repeat.
+        let ad = ADDriverBase::new("TEST", 1024, 768, 50_000_000).unwrap();
+        assert_c_read_only_block(&ad.port_base, &ad.params.base, "TEST");
+        assert_fresh_pool_stats(&ad.port_base, &ad.params.base, 50_000_000.0 / 1_048_576.0);
+    }
 
     #[test]
     fn test_new_sets_initial_params() {

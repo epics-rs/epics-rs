@@ -57,8 +57,7 @@ async fn test_periodic_save_set() {
             search_paths: Vec::new(),
         })
         .build()
-        .await
-        .unwrap();
+        .await;
 
     let mgr = Arc::new(mgr);
     let handle = mgr.clone().start(db.clone());
@@ -70,7 +69,7 @@ async fn test_periodic_save_set() {
 
     // Verify file was created
     assert!(sav_path.exists());
-    let entries = read_save_file(&sav_path).await.unwrap().unwrap();
+    let entries = read_save_file(&sav_path).await.unwrap().unwrap().entries;
     assert_eq!(entries.len(), 2);
 }
 
@@ -92,8 +91,7 @@ async fn test_manual_save() {
             search_paths: Vec::new(),
         })
         .build()
-        .await
-        .unwrap();
+        .await;
 
     let count = mgr.manual_save("test_manual", &db).await.unwrap();
     assert_eq!(count, 1);
@@ -127,8 +125,7 @@ async fn test_multiple_sets_independent() {
             search_paths: Vec::new(),
         })
         .build()
-        .await
-        .unwrap();
+        .await;
 
     mgr.manual_save("set_a", &db).await.unwrap();
     mgr.manual_save("set_b", &db).await.unwrap();
@@ -167,8 +164,7 @@ async fn test_restore_all() {
             search_paths: Vec::new(),
         })
         .build()
-        .await
-        .unwrap();
+        .await;
 
     let results = mgr.restore_all(&db).await;
     assert_eq!(results.len(), 1);
@@ -225,8 +221,7 @@ async fn test_one_set_failure_no_impact() {
             search_paths: Vec::new(),
         })
         .build()
-        .await
-        .unwrap();
+        .await;
 
     let results = mgr.restore_all(&db).await;
     assert!(results[0].1.is_err()); // set_bad fails
@@ -254,8 +249,7 @@ async fn test_concurrent_manual_periodic_serialized() {
             search_paths: Vec::new(),
         })
         .build()
-        .await
-        .unwrap();
+        .await;
 
     let mgr = Arc::new(mgr);
     let handle = mgr.clone().start(db.clone());
@@ -271,7 +265,7 @@ async fn test_concurrent_manual_periodic_serialized() {
 
     // Just verify no crash/corruption
     assert!(sav_path.exists());
-    let entries = read_save_file(&sav_path).await.unwrap().unwrap();
+    let entries = read_save_file(&sav_path).await.unwrap().unwrap().entries;
     assert_eq!(entries.len(), 1);
 }
 
@@ -294,8 +288,7 @@ async fn test_shutdown_cleanup() {
             search_paths: Vec::new(),
         })
         .build()
-        .await
-        .unwrap();
+        .await;
 
     let mgr = Arc::new(mgr);
     let handle = mgr.clone().start(db.clone());
@@ -328,8 +321,7 @@ async fn test_save_once_failure_updates_stats() {
             search_paths: Vec::new(),
         })
         .build()
-        .await
-        .unwrap();
+        .await;
 
     let result = mgr.manual_save("stats_test", &db).await;
     assert!(result.is_err());
@@ -339,7 +331,7 @@ async fn test_save_once_failure_updates_stats() {
 }
 
 #[epics_macros_rs::epics_test]
-async fn test_empty_pv_list_noop() {
+async fn test_empty_pv_list_is_refused() {
     let dir = tempfile::tempdir().unwrap();
     let sav_path = dir.path().join("empty.sav");
     let db = setup_db().await;
@@ -356,10 +348,15 @@ async fn test_empty_pv_list_noop() {
             search_paths: Vec::new(),
         })
         .build()
-        .await
-        .unwrap();
+        .await;
 
-    let count = mgr.manual_save("empty", &db).await.unwrap();
-    assert_eq!(count, 0);
-    assert!(sav_path.exists()); // File created (even if empty)
+    // A set with no members would rotate and rewrite the files it was
+    // meant to protect, so it is refused at construction and never
+    // reaches `save_once` at all.
+    assert!(mgr.set_names().is_empty());
+    assert!(mgr.manual_save("empty", &db).await.is_err());
+    assert!(
+        !sav_path.exists(),
+        "nothing may be written for an empty set"
+    );
 }

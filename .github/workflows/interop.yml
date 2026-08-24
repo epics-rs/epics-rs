@@ -24,7 +24,14 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
-  EPICS_BASE_VERSION: R7.0.8
+  # R7.0.9 is the floor, not a preference: before base 3d70e7064
+  # `dbAllocRecord()` reaches every field through `&ppvt->common`, so
+  # `__builtin_object_size()` bounds the write to `sizeof(dbCommon)` and
+  # `-D_FORTIFY_SOURCE=3` — the ubuntu-latest gcc default — aborts on any
+  # DBF_STRING field with an `initial` past that, e.g. `calcRecord.CALC`.
+  # Under R7.0.8 `softIocPVX` therefore died in `dbLoadRecords` for every
+  # db holding a calc record, which is what `pipeline_r1` loads.
+  EPICS_BASE_VERSION: R7.0.10
   PVXS_VERSION: 1.3.3
 
 jobs:
@@ -70,6 +77,25 @@ jobs:
     timeout-minutes: 60
 
     steps:
+    # ── Runner disk ────────────────────────────────────────────
+    # This is the only job that holds three large trees at once: the
+    # restored /opt/epics-base (~3 GB) and /opt/pvxs, plus a
+    # `cargo build --workspace --tests` target dir for 149 crates. That
+    # exceeded the ~14 GB an ubuntu-latest runner leaves free on `/`,
+    # and the runner died mid-suite writing its own diagnostic log
+    # ("System.IO.IOException: No space left on device") — which also
+    # loses the job log, so the failure arrives with no test output at
+    # all. Reclaim the preinstalled SDKs this job never uses; `df` is
+    # printed so a recurrence is diagnosable from the log instead of a
+    # runner crash annotation.
+    - name: Reclaim runner disk
+      run: |
+        df -h /
+        sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc \
+                    /usr/local/.ghcup /usr/share/swift \
+                    /usr/local/share/powershell /usr/local/share/chromium
+        df -h /
+
     - uses: actions/checkout@v4
 
     # ── Toolchain ──────────────────────────────────────────────
@@ -141,6 +167,18 @@ jobs:
     # ── PATH plumbing ──────────────────────────────────────────
     # Tests probe PATH for `softIoc`, `caget`, `pvget`, etc. Put
     # the EPICS host-arch bin dirs first so the tests find them.
+    #
+    # PVXS_HOME and EPICS_BASE are the other half. `interop_pvxs`
+    # resolves both *source* checkouts through `epics_base_rs::reference`
+    # (sentinels `src/clientreq.cpp` and
+    # `modules/database/src/ioc/db/dbAccess.c`, which `cp -r .` puts
+    # under /opt), and it is the only binary in `profile.interop` that
+    # reads a reference tree — the four dedicated reference suites are
+    # excluded from both `profile.ci` and `profile.interop`. Unset, the
+    # resolvers used to fall back to `$HOME/codes/pvxs` and
+    # `$HOME/epics/epics-base`, so the pvxs interop tests SKIPPED on CI
+    # and nextest reported the skips as passes; they now panic instead,
+    # which is what surfaced both gaps.
     - name: Add EPICS bin dirs to PATH
       run: |
         HOST_ARCH=$(ls /opt/epics-base/bin | head -n1)
@@ -148,6 +186,16 @@ jobs:
         echo "/opt/pvxs/bin/${HOST_ARCH}" >> "$GITHUB_PATH"
         echo "LD_LIBRARY_PATH=/opt/epics-base/lib/${HOST_ARCH}:/opt/pvxs/lib/${HOST_ARCH}" \
           >> "$GITHUB_ENV"
+        if [ ! -f /opt/pvxs/src/clientreq.cpp ]; then
+          echo "::error::/opt/pvxs is not a pvxs source checkout — the cache holds an install prefix, not the tree interop_pvxs reads"
+          exit 1
+        fi
+        echo "PVXS_HOME=/opt/pvxs" >> "$GITHUB_ENV"
+        if [ ! -f /opt/epics-base/modules/database/src/ioc/db/dbAccess.c ]; then
+          echo "::error::/opt/epics-base is not a base source checkout — the cache holds an install prefix, not the tree the C++ interop helpers build against"
+          exit 1
+        fi
+        echo "EPICS_BASE=/opt/epics-base" >> "$GITHUB_ENV"
 
     # ── Dynamic-linker registration ────────────────────────────
     # The reference binaries link libpvxs.so.1.3 / libca.so by SONAME.

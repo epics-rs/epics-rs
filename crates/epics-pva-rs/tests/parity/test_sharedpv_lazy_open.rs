@@ -18,7 +18,7 @@
 
 #![cfg(test)]
 
-// RTEMS-EXEC-MODEL-ALLOW(2): not run by the default nextest profile - this file is a module of the `parity_interop` binary, which `.config/nextest.toml`'s default-filter excludes.
+// RTEMS-EXEC-MODEL-ALLOW(4): not run by the default nextest profile - this file is a module of the `parity_interop` binary, which `.config/nextest.toml`'s default-filter excludes.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -136,6 +136,121 @@ async fn lazy_first_connect_pv_serves_monitor_on_creating_channel() {
             s.get_field("value"),
             Some(&PvField::Scalar(ScalarValue::Int(42))),
             "MONITOR seed must carry the on_first_connect-opened value"
+        ),
+        other => panic!("expected NTScalar structure, got {other:?}"),
+    }
+
+    server.stop();
+    let _ = tokio::time::timeout(Duration::from_secs(2), server.wait()).await;
+}
+
+/// A PV registered but not yet `open()`ed, opened ASYNCHRONOUSLY after the
+/// client's channel already exists.
+///
+/// pvxs does not answer such an operation: `SharedPV::onOp` inserts the
+/// `ConnectOp` into `pending` when `!self->current`
+/// (`sharedpv.cpp:239-249`) and `SharedPV::open` runs `connectOp` over the
+/// set (`:348-384`), so the client's GET completes the moment the PV
+/// opens. `sharedpv.cpp:478-488` claims the search regardless of open
+/// state, which is why the client has a channel to wait on at all.
+///
+/// The port refused instead, and the refusal was permanent:
+/// `ChannelState::introspection` is snapshotted at CREATE_CHANNEL and
+/// refreshed exactly once, immediately after the attach hook, to catch a
+/// SYNCHRONOUS `on_first_connect` open. A channel created before an
+/// asynchronous `open()` therefore carried `None` for its entire life and
+/// a long-lived client never recovered.
+fn async_open_source() -> (Arc<SharedSource>, SharedPV) {
+    let pv = SharedPV::new();
+    let src = SharedSource::new();
+    src.add("dut", pv.clone());
+    (Arc::new(src), pv)
+}
+
+#[tokio::test]
+async fn a_get_parked_before_open_completes_when_the_pv_opens() {
+    let (source, pv) = async_open_source();
+    let cfg = PvaServerConfig {
+        tcp_port: 0,
+        udp_port: 0,
+        ..Default::default()
+    };
+    let server = PvaServer::start(source, cfg).expect("test server must start");
+    let port = server.report().tcp_port;
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    // Open well after the client has its channel and its GET INIT is in.
+    tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        pv.open(nt_int_desc(), nt_int_value(7))
+            .expect("async open must succeed");
+    });
+
+    let client = client_to(port);
+    let v = tokio::time::timeout(Duration::from_secs(3), client.pvget("dut"))
+        .await
+        .expect("pvget timed out")
+        .expect("a GET parked on a closed SharedPV must complete at open(), not be refused");
+    match v {
+        PvField::Structure(s) => assert_eq!(
+            s.get_field("value"),
+            Some(&PvField::Scalar(ScalarValue::Int(7))),
+            "the parked GET must return the value open() published"
+        ),
+        other => panic!("expected NTScalar structure, got {other:?}"),
+    }
+
+    server.stop();
+    let _ = tokio::time::timeout(Duration::from_secs(2), server.wait()).await;
+}
+
+/// The `mpending` half: `SharedPV::onSubscribe` parks a `MonitorSetupOp`
+/// the same way (`sharedpv.cpp:259-275`) and `open()` runs `connectSub`
+/// over it (`:355-379`), so the monitor's INIT reply and its initial
+/// update both arrive at open time.
+#[tokio::test]
+async fn a_monitor_parked_before_open_completes_when_the_pv_opens() {
+    let (source, pv) = async_open_source();
+    let cfg = PvaServerConfig {
+        tcp_port: 0,
+        udp_port: 0,
+        ..Default::default()
+    };
+    let server = PvaServer::start(source, cfg).expect("test server must start");
+    let port = server.report().tcp_port;
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        pv.open(nt_int_desc(), nt_int_value(9))
+            .expect("async open must succeed");
+    });
+
+    let client = client_to(port);
+    let (tx, rx) = std::sync::mpsc::channel::<PvField>();
+    let _handle = tokio::time::timeout(
+        Duration::from_secs(3),
+        client.pvmonitor_handle(
+            "dut",
+            move |_: &FieldDesc, v: &PvField| {
+                let _ = tx.send(v.clone());
+            },
+            |_| {},
+        ),
+    )
+    .await
+    .expect("pvmonitor_handle timed out")
+    .expect("a MONITOR parked on a closed SharedPV must complete at open(), not be refused");
+
+    let got = tokio::task::spawn_blocking(move || rx.recv_timeout(Duration::from_secs(3)))
+        .await
+        .expect("join")
+        .expect("the parked monitor must deliver the value open() published");
+    match got {
+        PvField::Structure(s) => assert_eq!(
+            s.get_field("value"),
+            Some(&PvField::Scalar(ScalarValue::Int(9))),
+            "the parked MONITOR seed must carry the opened value"
         ),
         other => panic!("expected NTScalar structure, got {other:?}"),
     }

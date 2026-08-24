@@ -22,9 +22,9 @@
 //! every finite `delta` then satisfies `delta > hyst`, the deadband is
 //! effectively disabled, and the subscriber is flooded with events.
 //!
-//! This port intentionally treats the deadband as a magnitude —
-//! `threshold` is stored as `|threshold|` and the relative band is
-//! `|threshold| * |last|` — so a negative-valued channel is suppressed
+//! This port intentionally treats the deadband as a magnitude — `cval`
+//! is stored as `|cval|` and the refreshed band as `|val * cval/100|` —
+//! so a negative-valued channel is suppressed
 //! exactly like a positive-valued one. The cost is a deliberate parity
 //! deviation: under epics-rs a `{"rel":N}` filter on a negative-baseline
 //! PV emits *fewer* events than C (which emits all of them), and a
@@ -47,36 +47,64 @@ pub enum DeadbandMode {
     /// (default), the `abs` key, and `d` with `m:"abs"`. Comparison is
     /// strict — matches C `recGblCheckDeadband` (`if (delta > deadband)`).
     Absolute,
-    /// `|new - last| > threshold * |last|` passes. The mode for the `rel`
-    /// key and `d` with `m:"rel"`. `threshold` is the internal fraction
-    /// (e.g. `0.01` for 1%); the JSON wire form is a C-style percent
-    /// (`cval`) divided by 100 in the parser. When `last == 0.0` the band
-    /// is `0` so any non-zero delta passes — matching C
-    /// `hyst = val * cval/100` which is zero when `val == 0`.
+    /// The band is a percentage of the value at the last delivery, held
+    /// as its own state: after every delivered event C recomputes
+    /// `hyst = val * cval/100` (`dbnd.c:87`) and compares the NEXT delta
+    /// against that. The mode for the `rel` key and `d` with `m:"rel"`;
+    /// `cval` is C's percent, so `{"rel":50}` is 50%. When the delivered
+    /// value is 0 the band becomes 0 and any non-zero delta passes.
     Relative,
 }
 
+/// C `dbnd.c`'s `myStruct` state, behind one lock so `last` and `hyst`
+/// can never be read from different moments.
+struct DeadbandState {
+    /// C `myStruct::last` — the baseline `recGblCheckDeadband` compares
+    /// against and advances whenever `delta > deadband`. Seeded `NaN` by
+    /// `parse_ok` (`dbnd.c:61`) so the first finite event produces
+    /// `delta = INF` and always passes.
+    last: f64,
+    /// C `myStruct::hyst` — the band ITSELF, and its own state rather
+    /// than a function of `last`. `parse_ok` seeds it to `cval`
+    /// (`dbnd.c:60`) and the filter refreshes it to `val * cval/100`
+    /// after ANY event that was sent (`dbnd.c:86-88`), including one sent
+    /// only because it carried `DBE_ALARM` or `DBE_PROPERTY`. Deriving
+    /// the band from `last` instead misses exactly those refreshes,
+    /// because a bypassed event leaves `last` untouched.
+    hyst: f64,
+}
+
 /// `dbnd` filter.
-///
-/// State: `last_sent` records the value that was most recently
-/// forwarded to the subscriber. Initialised to `NaN` so the first
-/// finite event produces `delta = INF` (per C `recGblCheckDeadband`
-/// NaN-↔-finite rule) and always passes.
 pub struct DeadbandFilter {
-    threshold: f64,
+    /// C `myStruct::cval` — the deadband as the wire carries it: an
+    /// absolute magnitude in `abs` mode, a PERCENT in `rel` mode. Kept in
+    /// the wire form because C's `hyst` refresh is written in it
+    /// (`val * cval/100`).
+    cval: f64,
     mode: DeadbandMode,
-    last_sent: Mutex<f64>,
+    state: Mutex<DeadbandState>,
 }
 
 impl DeadbandFilter {
-    pub fn new(threshold: f64, mode: DeadbandMode) -> Self {
+    /// `cval` is C's wire value — an absolute magnitude for
+    /// [`DeadbandMode::Absolute`], a percent for
+    /// [`DeadbandMode::Relative`].
+    pub fn new(cval: f64, mode: DeadbandMode) -> Self {
+        // Magnitude deadband — intentional, signed-off deviation from
+        // C's signed `recGblCheckDeadband` comparison. See the module
+        // doc "Deviation from C" for the rationale.
+        let cval = cval.abs();
         Self {
-            // Magnitude deadband — intentional, signed-off deviation from
-            // C's signed `recGblCheckDeadband` comparison. See the module
-            // doc "Deviation from C" for the rationale.
-            threshold: threshold.abs(),
+            cval,
             mode,
-            last_sent: Mutex::new(f64::NAN),
+            state: Mutex::new(DeadbandState {
+                last: f64::NAN,
+                // C `parse_ok`: `my->hyst = my->cval` for both modes
+                // (`dbnd.c:60`). In `rel` mode that is the raw percent,
+                // which only ever gates the first event — and the first
+                // event's delta is INF against the NaN baseline anyway.
+                hyst: cval,
+            }),
         }
     }
 
@@ -85,21 +113,10 @@ impl DeadbandFilter {
         Self::new(threshold, DeadbandMode::Absolute)
     }
 
-    /// Parse the `m` mode-enum value of a `dbnd` filter — C `dbnd.c:35`
-    /// `modeEnum { {"abs",0}, {"rel",1} }`. Returns `None` for any other
-    /// string, matching C `chfEnum`'s rejection of an unknown enum value
-    /// (which fails the whole filter parse).
-    pub(crate) fn parse_mode(m: &str) -> Option<DeadbandMode> {
-        match m {
-            "abs" => Some(DeadbandMode::Absolute),
-            "rel" => Some(DeadbandMode::Relative),
-            _ => None,
-        }
-    }
-
-    /// Convenience: relative-deadband filter (fraction — 0.01 = 1%).
-    pub fn relative(fraction: f64) -> Self {
-        Self::new(fraction, DeadbandMode::Relative)
+    /// Convenience: relative-deadband filter, in C's percent units
+    /// (`1.0` = 1%).
+    pub fn relative(percent: f64) -> Self {
+        Self::new(percent, DeadbandMode::Relative)
     }
 }
 
@@ -127,44 +144,26 @@ impl SubscriptionFilter for DeadbandFilter {
 
     fn apply(&self, event: FilteredMonitorEvent) -> Option<FilteredMonitorEvent> {
         // Non-numeric values (strings, raw byte arrays, etc.) have no
-        // deadband semantic — pass unconditionally and don't touch
-        // `last_sent`.
+        // deadband semantic — pass unconditionally and don't touch the
+        // state. C reaches this by way of `pfl->type != dbfl_type_val`
+        // and its `send = 1` initialiser (`dbnd.c:69, 75`).
         let Some(cur) = event.event.snapshot.value.to_f64() else {
             return Some(event);
         };
 
-        let mut last = self.last_sent.lock();
-        let prev = *last;
-        let delta = c_delta(prev, cur);
-        let band = match self.mode {
-            DeadbandMode::Absolute => self.threshold,
-            DeadbandMode::Relative => {
-                // C: `hyst = val * cval/100.` is only refreshed after
-                // a successful send. We model the same end-state by
-                // computing `threshold * |prev|` per call. When `prev`
-                // is the initial NaN seed (no successful send yet),
-                // fall back to raw `threshold` — C's first call sees
-                // `hyst = cval` from `parse_ok` until the first
-                // refresh. The `|prev|` (vs C's signed `prev`) is the
-                // intentional magnitude deviation documented at module
-                // scope: it keeps the band non-negative for a negative
-                // baseline instead of disabling the deadband as C does.
-                if prev.is_finite() {
-                    self.threshold * prev.abs()
-                } else {
-                    self.threshold
-                }
-            }
-        };
-        // C `recGblCheckDeadband`: `if (delta > deadband)` — strict.
-        let supra = delta > band;
+        let mut state = self.state.lock();
+        let delta = c_delta(state.last, cur);
+        // C `recGblCheckDeadband`: `if (delta > deadband)` — strict, and
+        // against `my->hyst`, which in `rel` mode was last set from the
+        // value at the previous SEND, not from `last`.
+        let supra = delta > state.hyst;
         if supra {
             // C updates `*poldval = newval` whenever `delta > deadband`,
             // regardless of which mask bits are set. The same write must
             // happen here even when the event is delivered solely because
             // of an ALARM / PROPERTY bit (446e0d4a) so a subsequent
             // VALUE-only emission is compared against the right baseline.
-            *last = cur;
+            state.last = cur;
         }
 
         // C `dbnd.c:84`: `send = pfl->mask & ~(DBE_VALUE|DBE_LOG)` —
@@ -177,11 +176,16 @@ impl SubscriptionFilter for DeadbandFilter {
         let bypass = EventMask::from_bits(
             event.event.mask.bits() & !(EventMask::VALUE | EventMask::LOG).bits(),
         );
-        if supra || !bypass.is_empty() {
-            Some(event)
-        } else {
-            None
+        let send = supra || !bypass.is_empty();
+        if send && self.mode == DeadbandMode::Relative {
+            // C `dbnd.c:86-88`: `if (send && my->mode == 1) my->hyst =
+            // val * my->cval/100.` — keyed on `send`, so an event that
+            // only passed on its ALARM / PROPERTY bit still moves the
+            // band. `.abs()` is the module's signed-off magnitude
+            // deviation, applied here rather than to the comparison.
+            state.hyst = (cur * self.cval / 100.0).abs();
         }
+        if send { Some(event) } else { None }
     }
 }
 
@@ -253,23 +257,51 @@ mod tests {
         assert!(f.apply(ev(97.0, EventMask::VALUE)).is_some());
     }
 
-    /// Relative deadband: `delta > threshold * |last|`. With
-    /// `threshold = 0.01` (1%) and last = 100, the band is 1.0; a
-    /// 1.0-magnitude step is exactly at the band and DROPS (strict).
+    /// Relative deadband: the band is refreshed to `val * cval/100` after
+    /// each delivery. With `cval = 1` (1%) and a delivered 100, the band
+    /// is 1.0; a 1.0-magnitude step is exactly at the band and DROPS
+    /// (strict).
     #[test]
     fn relative_deadband_scales_with_last_value() {
-        let f = DeadbandFilter::relative(0.01); // 1%
+        let f = DeadbandFilter::relative(1.0); // 1%
         assert!(f.apply(ev(100.0, EventMask::VALUE)).is_some());
         assert!(f.apply(ev(100.5, EventMask::VALUE)).is_none()); // 0.5 ≤ 1.0 band
         assert!(f.apply(ev(101.0, EventMask::VALUE)).is_none()); // 1.0 == band, drop
         assert!(f.apply(ev(101.5, EventMask::VALUE)).is_some()); // 1.5 > 1.0
     }
 
+    /// C keys the band refresh on `send`, not on `delta > deadband`
+    /// (`dbnd.c:86-88`), so an event delivered ONLY because it carried
+    /// `DBE_ALARM` still moves the band to a percentage of ITS value
+    /// while leaving `last` where it was. Deriving the band from `last`
+    /// misses that refresh and delivers an update C suppresses.
+    #[test]
+    fn relative_band_is_refreshed_by_an_alarm_bypass_that_left_last_alone() {
+        let f = DeadbandFilter::relative(50.0); // 50%
+        // Delivered: last = 10, hyst = 10 * 50/100 = 5.
+        assert!(f.apply(ev(10.0, EventMask::VALUE)).is_some());
+        // delta = 2 <= 5, so `last` stays 10 — but the ALARM bit sends the
+        // event, and C therefore refreshes hyst to 12 * 50/100 = 6.
+        assert!(
+            f.apply(ev(12.0, EventMask::VALUE | EventMask::ALARM))
+                .is_some(),
+            "the alarm class bypasses the deadband (446e0d4a)"
+        );
+        // delta from last = 10 is 5.5: under the band C now holds (6), and
+        // over the 5 a `last`-derived band would still be using.
+        assert!(
+            f.apply(ev(15.5, EventMask::VALUE)).is_none(),
+            "5.5 <= the refreshed band of 6, so C sends nothing"
+        );
+        // 7.5 clears the refreshed band.
+        assert!(f.apply(ev(17.5, EventMask::VALUE)).is_some());
+    }
+
     /// When `last == 0` the relative band collapses to `0`, so any
     /// non-zero delta passes (C: `hyst = 0 * cval/100 = 0` → `delta > 0`).
     #[test]
     fn relative_deadband_zero_baseline_passes_any_nonzero() {
-        let f = DeadbandFilter::relative(0.5);
+        let f = DeadbandFilter::relative(50.0); // 50%
         assert!(f.apply(ev(0.0, EventMask::VALUE)).is_some());
         assert!(
             f.apply(ev(0.0, EventMask::VALUE)).is_none(),
@@ -401,23 +433,5 @@ mod tests {
             mask: EventMask::VALUE,
         });
         assert!(f.apply(event).is_some());
-    }
-
-    #[test]
-    fn parse_mode_recognises_abs_and_rel() {
-        // C `dbnd.c:35` modeEnum: {"abs",0},{"rel",1}.
-        assert_eq!(
-            DeadbandFilter::parse_mode("abs"),
-            Some(DeadbandMode::Absolute)
-        );
-        assert_eq!(
-            DeadbandFilter::parse_mode("rel"),
-            Some(DeadbandMode::Relative)
-        );
-        // `d` is a delta key, not a mode value; the fabricated `r` key is
-        // gone. Neither is a valid `m` enum value.
-        assert_eq!(DeadbandFilter::parse_mode("d"), None);
-        assert_eq!(DeadbandFilter::parse_mode("r"), None);
-        assert_eq!(DeadbandFilter::parse_mode("nope"), None);
     }
 }

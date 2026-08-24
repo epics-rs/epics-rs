@@ -329,7 +329,7 @@ pub(crate) struct SubscriptionRegistry {
 /// same) resolves to wire `count = 0`, the CA *autosize* request, NOT the
 /// native capacity. With a zero count the server reports the record's
 /// CURRENT element count in every event's response header and sends only
-/// that many elements: `rsrv/camessage.c:504-509` reads `m_count == 0` as
+/// that many elements: `rsrv/camessage.c:509-514` reads `m_count == 0` as
 /// "all available", then `:537-538` fetches the actual `item_count` and
 /// `:563-568` rewrites the response header count to it (non-autosize pads
 /// the tail instead). This is exactly what the standard CA tools request
@@ -411,7 +411,10 @@ impl SubscriptionRegistry {
             return MonitorDeliveryOutcome::NotFound;
         };
         let snapshot = if data_type <= 6 {
-            let dbr_type = match DbFieldType::from_u16(data_type) {
+            // Same wire carrier as the read path: an EVENT_ADD payload is
+            // `dbr_char_t` for the CHAR row, so a monitored CHAR waveform
+            // delivers unsigned bytes.
+            let dbr_type = match DbFieldType::from_u16(data_type).map(DbFieldType::wire_carrier) {
                 Ok(t) => t,
                 Err(e) => {
                     return try_deliver_err(rec, e);

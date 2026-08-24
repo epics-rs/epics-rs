@@ -34,6 +34,7 @@ use epics_base_rs::types::{DbFieldType, EpicsValue};
 
 const CALC_ALARM: u16 = 12;
 const READ_ALARM: u16 = 1;
+const LINK_ALARM: u16 = epics_base_rs::server::recgbl::alarm_status::LINK_ALARM;
 
 async fn process(db: &PvDatabase, rec: &str) {
     let mut visited = HashSet::new();
@@ -187,8 +188,18 @@ async fn r10_67_a_gated_cycle_does_not_inherit_the_previous_calc_alarm() {
 
 /// The same boundary in the widened family: `calc` (and calcout/scalcout) shared
 /// the sticky flag. C `calcRecord.c:120` runs no `calcPerform` on a failed fetch
-/// and — unlike swait — raises nothing at all, so the record must report
-/// NO_ALARM. Pre-fix the stale flag re-raised CALC_ALARM on every gated cycle.
+/// and — unlike swait — raises nothing of its own.
+///
+/// But the gate itself is not silent. calc's only route to a failed fetch is a
+/// failed link read (`fetch_values`, `calcRecord.c:439`, is a bare loop of
+/// `dbGetLink`), and `dbGetLink` raises `setLinkAlarm` — LINK/INVALID, AMSG
+/// `field INPA` — on every one of them (`dbLink.c:339`). So a gated calc cycle
+/// in C is LINK/INVALID, never NO_ALARM: the NO_ALARM this case used to assert
+/// is a state C cannot reach. Because that LINK alarm is raised during the
+/// fetch, before any CALC_ALARM would be, and `recGblSetSevr` is strict-greater,
+/// the STAT here no longer discriminates a stale CALC_ALARM flag — the swait
+/// case above, whose `recDynLinkGet` gate raises no LINK alarm, carries that
+/// boundary.
 #[epics_macros_rs::epics_test]
 async fn r10_67_calc_gated_cycle_clears_the_calc_alarm() {
     let db = PvDatabase::new();
@@ -210,9 +221,16 @@ async fn r10_67_calc_gated_cycle_clears_the_calc_alarm() {
     process(&db, "C").await;
     assert_eq!(
         alarm(&db, "C").await,
-        (AlarmSeverity::NoAlarm, 0),
+        (AlarmSeverity::Invalid, LINK_ALARM),
         "calcRecord.c:120 — the gate skips calcPerform and calc raises no \
-         READ_ALARM either"
+         READ_ALARM of its own, but the dbGetLink that failed the gate already \
+         raised LINK/INVALID"
+    );
+    let inst = db.get_record("C").unwrap();
+    assert_eq!(
+        inst.read().common.amsg,
+        "field INPA",
+        "setLinkAlarm names the link's own field (dbLink.c:318-322)"
     );
 }
 

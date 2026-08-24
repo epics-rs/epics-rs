@@ -12,7 +12,7 @@ use std::time::{Duration, Instant};
 
 use crate::datatype::ModbusDataType;
 use crate::error::{ExceptionCode, ModbusError, ModbusResult};
-use crate::interpose::{LinkType, ModbusFramer};
+use crate::interpose::{LinkType, ModbusFramer, TransactionIdCounter};
 use crate::protocol::{FunctionCode, RequestPdu, ResponsePdu};
 
 /// Modbus limit on the number of words read in one request.
@@ -69,6 +69,41 @@ pub enum ModbusFunctionCode {
 }
 
 impl ModbusFunctionCode {
+    /// The read function C uses to seed a write-function port's register
+    /// cache at construction (`drvModbusAsyn.cpp:248/253/257`). `None` for a
+    /// read function, which has a poller instead.
+    pub fn read_once_function(self) -> Option<Self> {
+        match self {
+            Self::WriteSingleCoil | Self::WriteMultipleCoils => Some(Self::ReadCoils),
+            Self::WriteSingleRegister | Self::WriteMultipleRegisters => {
+                Some(Self::ReadHoldingRegisters)
+            }
+            Self::WriteMultipleRegistersF23 => Some(Self::ReadInputRegistersF23),
+            _ => None,
+        }
+    }
+
+    /// The function code this port puts on the wire. The two driver
+    /// pseudo-codes 123 and 223 are not wire codes: both ride on FC 0x17, so
+    /// a slave's echo cannot distinguish them from each other.
+    pub fn wire_code(self) -> u8 {
+        let code = match self {
+            Self::ReadCoils => FunctionCode::ReadCoils,
+            Self::ReadDiscreteInputs => FunctionCode::ReadDiscreteInputs,
+            Self::ReadHoldingRegisters => FunctionCode::ReadHoldingRegisters,
+            Self::ReadInputRegisters => FunctionCode::ReadInputRegisters,
+            Self::WriteSingleCoil => FunctionCode::WriteSingleCoil,
+            Self::WriteSingleRegister => FunctionCode::WriteSingleRegister,
+            Self::WriteMultipleCoils => FunctionCode::WriteMultipleCoils,
+            Self::WriteMultipleRegisters => FunctionCode::WriteMultipleRegisters,
+            Self::ReportSlaveId => FunctionCode::ReportSlaveId,
+            Self::ReadInputRegistersF23 | Self::WriteMultipleRegistersF23 => {
+                FunctionCode::ReadWriteMultipleRegisters
+            }
+        };
+        code.as_u8()
+    }
+
     /// Decode the integer code accepted by `drvModbusAsynConfigure`, including
     /// the driver pseudo-codes 123 and 223.
     pub fn from_i32(v: i32) -> Option<Self> {
@@ -309,6 +344,34 @@ pub trait OctetTransport: Send + Sync {
     }
     /// Receive one framed response, waiting up to `timeout`.
     fn read_frame(&mut self, timeout: Duration) -> ModbusResult<Vec<u8>>;
+
+    /// Send a framed request and receive its response as ONE locked,
+    /// flush-first exchange — C `asynOctetSyncIO.c:231-276`, which every
+    /// `drvModbusAsyn` transaction goes through
+    /// (`drvModbusAsyn.cpp:2177-2182` calls `pasynOctetSyncIO->writeRead`).
+    ///
+    /// The flush is what makes a Modbus link resynchronise: a reply that
+    /// arrived after its own transaction timed out is discarded before the
+    /// next request goes out, instead of being handed to it. The lock is what
+    /// keeps two Modbus ports sharing one octet port from consuming each
+    /// other's replies.
+    ///
+    /// The default is the unlocked, unflushed pair, which is correct only for
+    /// a transport that owns its link outright — in-crate test doubles. Any
+    /// transport over a shared asyn port MUST override it.
+    fn write_read(&mut self, data: &[u8], timeout: Duration) -> ModbusResult<Vec<u8>> {
+        self.write_frame(data)?;
+        self.read_frame(timeout)
+    }
+    /// Discard any partially received frame.
+    ///
+    /// `ModbusEngine::transact` calls this whenever a transaction ends
+    /// without a matching reply. Modbus/TCP is strictly request/response, so
+    /// bytes still held at that point are the head of a reply nobody will
+    /// finish reading, and a stream transport that reassembles frames must
+    /// drop them or read the next reply at the wrong offset. The default is a
+    /// no-op for the message-oriented links that keep nothing between reads.
+    fn reset_stream(&mut self) {}
 }
 
 /// The Modbus driver engine: request construction, the write/read cycle,
@@ -339,13 +402,26 @@ pub struct ModbusEngine {
 }
 
 impl ModbusEngine {
-    /// Create an engine for `config` on the given physical link.
+    /// Create an engine for `config` on the given physical link, with a
+    /// transaction-ID counter of its own (see
+    /// [`ModbusFramer::new`](crate::interpose::ModbusFramer::new)).
     pub fn new(config: ModbusConfig, link_type: LinkType) -> ModbusResult<Self> {
+        Self::with_transaction_counter(config, link_type, TransactionIdCounter::default())
+    }
+
+    /// Create an engine drawing transaction IDs from the octet port's shared
+    /// counter — required whenever more than one Modbus port can sit on that
+    /// octet port.
+    pub fn with_transaction_counter(
+        config: ModbusConfig,
+        link_type: LinkType,
+        counter: TransactionIdCounter,
+    ) -> ModbusResult<Self> {
         config.validate()?;
         let len = config.length;
         Ok(Self {
             config,
-            framer: ModbusFramer::new(link_type),
+            framer: ModbusFramer::with_transaction_counter(link_type, counter),
             data: vec![0; len],
             prev_data: vec![0; len],
             stats: IoStatistics::default(),
@@ -456,6 +532,23 @@ impl ModbusEngine {
         resp: &ResponsePdu,
     ) -> ModbusResult<Vec<u16>> {
         use ModbusFunctionCode::*;
+        // The slave must echo the function code it was asked for. C leaves the
+        // intent as an unimplemented question — `drvModbusAsyn.cpp:2248-2249`
+        // reads `/* Make sure the function code in the response is the same as
+        // the one in the request? */` and `:2251` then switches on the
+        // REQUEST's code regardless — so this is a deliberate deviation, filed
+        // as CBUG-B28 in `doc/upstream-c-bugs.md`. Without it a reply
+        // belonging to a different exchange decodes under this request's
+        // function: a `WriteMultipleRegisters` acknowledgement read as a
+        // 2-register response passes the word-count check and yields two
+        // registers of garbage reported as good data.
+        let expected = function.wire_code();
+        if resp.function != expected {
+            return Err(ModbusError::FunctionMismatch {
+                requested: expected,
+                got: resp.function,
+            });
+        }
         match function {
             ReadCoils | ReadDiscreteInputs => {
                 let payload = resp.read_data()?;
@@ -528,8 +621,9 @@ impl ModbusEngine {
     ) -> ModbusResult<ModbusIoResponse> {
         let pdu = self.build_request(function, start, data, len)?;
         let framed = self.framer.frame_request(pdu.as_bytes())?;
-        let expected_txid = self.framer.last_transaction_id();
+        let expected_txid = framed.transaction_id;
         let is_udp = self.framer.link_type() == LinkType::Udp;
+        let framed = framed.bytes;
 
         let started = Instant::now();
         // The transport write/read cycle. C `doModbusIO` increments
@@ -589,18 +683,51 @@ impl ModbusEngine {
     /// Transmit `framed` and receive the matching response PDU. For TCP the
     /// read loops until the MBAP transaction ID matches; for UDP a read
     /// failure retransmits up to [`UDP_MAX_RETRIES`] times.
+    ///
+    /// A transaction that ends in error takes the transport's partial frame
+    /// with it. Doing it here rather than at each failing site is the point:
+    /// the inner loop has a write `?`, a resend `?`, a read error, a malformed
+    /// header and two stale-frame ceilings, and every one of them leaves the
+    /// same residue, so the single exit is what keeps the next fallible call
+    /// someone adds from re-opening it.
     fn transact(
         &mut self,
         transport: &mut dyn OctetTransport,
         framed: &[u8],
-        expected_txid: u16,
+        expected_txid: Option<u16>,
         is_udp: bool,
     ) -> ModbusResult<Vec<u8>> {
-        transport.write_frame(framed)?;
+        let result = self.transact_frame(transport, framed, expected_txid, is_udp);
+        if result.is_err() {
+            transport.reset_stream();
+        }
+        result
+    }
+
+    /// The body of [`Self::transact`] — every exit is routed through that
+    /// function so the partial-frame reset cannot be missed on a new one.
+    fn transact_frame(
+        &mut self,
+        transport: &mut dyn OctetTransport,
+        framed: &[u8],
+        expected_txid: Option<u16>,
+        is_udp: bool,
+    ) -> ModbusResult<Vec<u8>> {
+        // The request and its reply are ONE locked, flush-first exchange (C
+        // `asynOctetSyncIO.c:231-276`). Only the re-reads below — a stale TCP
+        // transaction ID, a short frame, a UDP retransmit — go back to the
+        // port separately, and each of those is entered only after this port's
+        // own reply failed to arrive, so there is nothing of ours left to
+        // steal.
+        let mut pending = Some(transport.write_read(framed, READ_TIMEOUT));
         let mut udp_retries = 0u32;
         let mut stale_frames = 0u32;
         loop {
-            match transport.read_frame(READ_TIMEOUT) {
+            let attempt = match pending.take() {
+                Some(first) => first,
+                None => transport.read_frame(READ_TIMEOUT),
+            };
+            match attempt {
                 Ok(raw) => {
                     match self.framer.unwrap_response(&raw) {
                         Ok(unwrapped) => match unwrapped.transaction_id {
@@ -610,7 +737,7 @@ impl ModbusEngine {
                             // mismatched-TXID frames cannot trap us in an
                             // unbounded loop (each `read_frame` succeeds, so the
                             // timeout never fires).
-                            Some(tid) if tid != expected_txid => {
+                            Some(tid) if Some(tid) != expected_txid => {
                                 stale_frames += 1;
                                 if stale_frames > MAX_STALE_FRAMES {
                                     return Err(ModbusError::Timeout);
@@ -671,7 +798,7 @@ impl ModbusEngine {
     ///
     /// Not valid in absolute-addressing mode: the C `readPoller` thread is
     /// never started for an absolute port (`if (absoluteAddressing_)
-    /// needReadThread = 0;`, drvModbusAsyn.cpp:1121). Use
+    /// needReadThread = 0;`, drvModbusAsyn.cpp:267). Use
     /// [`read_absolute`](Self::read_absolute) for per-record I/O instead.
     pub fn poll(&mut self, transport: &mut dyn OctetTransport) -> ModbusResult<bool> {
         if self.config.absolute_addressing() {
@@ -743,6 +870,30 @@ impl ModbusEngine {
             self.data[..len].copy_from_slice(&words);
         }
         Ok(self.data[..len].to_vec())
+    }
+
+    /// Seed the register cache with one read at the wire address `addr`, the
+    /// `readOnce` C performs in its constructor for a write-function port
+    /// (`drvModbusAsyn.cpp:311-317`).
+    ///
+    /// Unlike [`Self::read_absolute`] this does not bound `addr` against the
+    /// port's own length: C passes `modbusStartAddress_ + readbackOffset_`
+    /// straight to `doModbusIO`, and the Wago readback offset deliberately
+    /// lands outside the written block.
+    pub fn read_once(
+        &mut self,
+        transport: &mut dyn OctetTransport,
+        function: ModbusFunctionCode,
+        addr: u16,
+    ) -> ModbusResult<()> {
+        let len = self.config.length;
+        if let ModbusIoResponse::Data(words) =
+            self.do_modbus_io(transport, function, addr, &[], len)?
+        {
+            let n = words.len().min(self.data.len());
+            self.data[..n].copy_from_slice(&words[..n]);
+        }
+        Ok(())
     }
 
     /// Issue one individual Modbus write of `data` at the absolute wire
@@ -988,7 +1139,7 @@ mod tests {
     #[test]
     fn poll_rejected_in_absolute_mode() {
         // The C readPoller thread is never started for an absolute port
-        // (drvModbusAsyn.cpp:1121); `poll` must refuse rather than read a
+        // (drvModbusAsyn.cpp:267); `poll` must refuse rather than read a
         // block that has no meaning in absolute mode.
         let mut cfg = read_config(ModbusFunctionCode::ReadHoldingRegisters, 4);
         cfg.start_address = -1;
@@ -1521,6 +1672,84 @@ mod tests {
         // via `goto done` — with no IOErrors_ bump (that is transport-only).
         assert_eq!(engine.stats.read_ok, 1);
         assert_eq!(engine.stats.io_errors, 0);
+    }
+
+    /// Finding 1, second half: a reply must carry the function code it was
+    /// asked for. C intends this and never does it — `drvModbusAsyn.cpp`
+    /// carries the comment `/* Make sure the function code in the response is
+    /// the same as the one in the request? */` and then switches on the
+    /// request's code — so this is a deliberate deviation (CBUG-B28). A
+    /// `WriteMultipleRegisters` acknowledgement for address 0x0400 decodes
+    /// under a two-register read as byte count 4, passing the word-count
+    /// check and yielding two garbage registers reported as good data.
+    #[test]
+    fn a_reply_echoing_another_function_code_is_rejected() {
+        let mut engine = ModbusEngine::new(
+            read_config(ModbusFunctionCode::ReadHoldingRegisters, 2),
+            LinkType::Rtu,
+        )
+        .unwrap();
+        let mut transport = OneFrame {
+            frame: rtu_frame(&[0x01, 0x10, 0x04, 0x00, 0x00, 0x02]),
+        };
+        assert!(matches!(
+            engine.poll(&mut transport),
+            Err(ModbusError::FunctionMismatch {
+                requested: 0x03,
+                got: 0x10
+            })
+        ));
+
+        // The matching echo still decodes, including the F23 pseudo-code whose
+        // wire code is 0x17 rather than its own 123.
+        let mut engine = ModbusEngine::new(
+            read_config(ModbusFunctionCode::ReadHoldingRegisters, 1),
+            LinkType::Rtu,
+        )
+        .unwrap();
+        let mut transport = OneFrame {
+            frame: rtu_frame(&[0x01, 0x03, 0x02, 0x12, 0x34]),
+        };
+        engine
+            .poll(&mut transport)
+            .expect("a matching echo decodes");
+        assert_eq!(engine.data(), [0x1234]);
+
+        let mut engine = ModbusEngine::new(
+            read_config(ModbusFunctionCode::ReadInputRegistersF23, 1),
+            LinkType::Rtu,
+        )
+        .unwrap();
+        let mut transport = OneFrame {
+            frame: rtu_frame(&[0x01, 0x17, 0x02, 0x56, 0x78]),
+        };
+        engine
+            .poll(&mut transport)
+            .expect("FC 0x17 is the F23 pseudo-code's wire echo");
+        assert_eq!(engine.data(), [0x5678]);
+    }
+
+    /// A transport that answers every exchange with the same canned frame.
+    struct OneFrame {
+        frame: Vec<u8>,
+    }
+
+    impl OctetTransport for OneFrame {
+        fn write_frame(&mut self, _data: &[u8]) -> ModbusResult<()> {
+            Ok(())
+        }
+        fn read_frame(&mut self, _timeout: Duration) -> ModbusResult<Vec<u8>> {
+            Ok(self.frame.clone())
+        }
+    }
+
+    /// Append the RTU CRC-16 (low byte first) to a bare PDU.
+    fn rtu_frame(pdu: &[u8]) -> Vec<u8> {
+        let crc = crate::interpose::compute_crc(pdu);
+        let mut frame = pdu.to_vec();
+        frame.push((crc & 0xFF) as u8);
+        frame.push((crc >> 8) as u8);
+        frame
     }
 
     #[test]

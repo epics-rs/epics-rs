@@ -278,7 +278,7 @@ impl CaServerBuilder {
     /// [`CaServer::tcp_port`] for the port actually bound.
     pub async fn build(self) -> CaResult<CaServer> {
         let (db, autosave_config) = self.ioc.build().await?;
-        let acf = epics_base_rs::server::access_security::new_acf_cell(self.acf);
+        let acf = epics_base_rs::server::access_security::new_acf_cell_watching(self.acf, &db);
         #[cfg(feature = "experimental-rust-tls")]
         let tls = self.tls.and_then(|t| match t {
             crate::tls::TlsConfig::Server(arc) => Some(Arc::new(std::sync::RwLock::new(arc))),
@@ -947,17 +947,12 @@ impl CaServer {
             Some(mgr.start(db_save))
         } else if let Some(ref cfg) = self.autosave_config {
             let builder = autosave::AutosaveBuilder::new().add_set(cfg.clone());
-            match builder.build().await {
-                Ok(mgr) => {
-                    let mgr = Arc::new(mgr);
-                    let db_save = self.db.clone();
-                    Some(mgr.start(db_save))
-                }
-                Err(e) => {
-                    eprintln!("autosave: failed to start: {e}");
-                    None
-                }
-            }
+            // `build` cannot fail: a set it could not construct is reported
+            // on the error log and carried as that set's error status, so
+            // there is nothing left here to abandon the autosave task for.
+            let mgr = Arc::new(builder.build().await);
+            let db_save = self.db.clone();
+            Some(mgr.start(db_save))
         } else {
             None
         };

@@ -1522,6 +1522,26 @@ impl AsynDeviceSupport {
                 }
             }
         }
+        // asynOctet: C device support hands the reply BYTES straight to the
+        // record's own buffer — `readIt(pasynUser, pwf->bptr, pwf->nelm, ...)`
+        // for waveform (devAsynOctet.c:1054), `psi->val` for stringin,
+        // `plsi->val` for lsi — and never through `dbPutConvertRoutine`. So the
+        // delivered shape follows the destination buffer, not a conversion: an
+        // array-backed VAL takes the bytes as a `CharArray`, a DBF_STRING VAL
+        // keeps the `String`. Only CHAR/UCHAR waveforms can reach here — C
+        // `initCommon` sets `pact = 1` on any other FTVL at init
+        // (devAsynOctet.c:312-316) — so there is no element-type question.
+        // Delivering a `String` instead made the bytes arrive as a DBR_STRING
+        // put, which C's `putStringChar` parses with `epicsParseInt8` and
+        // refuses for any non-numeric reply.
+        if self.iface_type == "asynOctet" && record.val().is_some_and(|v| v.is_array()) {
+            let bytes = match val {
+                EpicsValue::String(s) => EpicsValue::CharArray(s.as_bytes().to_vec()),
+                other => other,
+            };
+            let _ = record.set_val(bytes);
+            return true;
+        }
         let _ = record.set_val(val);
         true
     }
@@ -7910,6 +7930,46 @@ mod tests {
             rec.get_field("VAL"),
             Some(EpicsValue::CharArray(b"STATUS=OK".to_vec())),
             "reply must populate the lsi VAL"
+        );
+    }
+
+    /// An octet reply longer than `MAX_STRING_SIZE` reaches the lsi VAL WHOLE.
+    /// C `callbackLsiCmdResponse` reads into `plsi->val` bounded by `plsi->sizv`
+    /// (devAsynOctet.c:1114-1119) — the 40-byte cap belongs to the DBR_STRING
+    /// conversion row, which this path never takes. Delivering the reply as an
+    /// `EpicsValue::String` put it through `LsiRecord::put_field`'s DBR_STRING
+    /// arm, which truncated at 39 bytes; the reply is bytes, so it is delivered
+    /// as bytes and only SIZV bounds it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cmd_response_long_reply_is_bounded_by_sizv_not_by_string_size() {
+        use epics_base_rs::server::records::lsi::LsiRecord;
+
+        // 50 bytes: over MAX_STRING_SIZE - 1 (39), well under the default SIZV.
+        let reply: Vec<u8> = (0..50u8).map(|i| b'a' + (i % 26)).collect();
+        let (handle, _) = spawn_cmd_response_port("cmdresp_lsi_long", &reply);
+        let link = AsynLink {
+            port_name: "cmdresp_lsi_long".into(),
+            addr: 0,
+            timeout: Duration::from_secs(1),
+            drv_info: "READ?\\n".to_string(),
+        };
+        let mut ads = AsynDeviceSupport::from_handle(handle, link, "asynOctet");
+        ads.octet_cmd = Some(crate::asyn_record::translate_escape("READ?\\n"));
+        ads.reason_set = true;
+        ads.set_record_info("TEST:LSI:LONG", ScanType::Passive);
+
+        let mut rec = LsiRecord::new("");
+        ads.read(&mut rec).unwrap();
+
+        assert_eq!(
+            rec.get_field("VAL"),
+            Some(EpicsValue::CharArray(reply.clone())),
+            "all 50 reply bytes must land — SIZV is the bound, not MAX_STRING_SIZE"
+        );
+        assert_eq!(
+            rec.get_field("LEN"),
+            Some(EpicsValue::ULong(reply.len() as u32 + 1)),
+            "LEN is nBytesRead + 1 (devAsynOctet.c:1125)"
         );
     }
 

@@ -54,6 +54,7 @@
 use std::collections::BTreeSet;
 use std::path::PathBuf;
 
+use epics_base_rs::reference::{ReferenceTree, reference_path};
 use epics_base_rs::server::builtin_devices::builtin_dynamic_factory;
 use epics_base_rs::server::db_loader::create_record;
 use epics_base_rs::server::device_support::is_soft_dtyp;
@@ -103,17 +104,13 @@ const ALLOWLIST: &[(&str, &str, &str)] = &[
     ),
 ];
 
-/// Locate `devSoft.dbd`, or `None` to skip the test.
-fn dbd_path() -> Option<PathBuf> {
-    if let Ok(base) = std::env::var("EPICS_BASE") {
-        let p = PathBuf::from(base).join("modules/database/src/std/dev/devSoft.dbd");
-        if p.is_file() {
-            return Some(p);
-        }
-    }
-    let reference =
-        PathBuf::from("/Users/stevek/codes/epics-base/modules/database/src/std/dev/devSoft.dbd");
-    reference.is_file().then_some(reference)
+/// Locate `devSoft.dbd`. Fails the test if the reference tree is absent —
+/// see [`epics_base_rs::reference`] for why this must not skip.
+fn dbd_path() -> PathBuf {
+    reference_path(
+        ReferenceTree::Base,
+        "modules/database/src/std/dev/devSoft.dbd",
+    )
 }
 
 /// Parse `device(recordType, linkType, dset, "DTYP")` rows → (recordType, DTYP).
@@ -158,14 +155,7 @@ fn served_by_base(dtyp: &str) -> bool {
 
 #[test]
 fn base_devsoft_device_rows_are_all_accounted_for() {
-    let Some(path) = dbd_path() else {
-        eprintln!(
-            "SKIP base_devsoft_device_rows_are_all_accounted_for: devSoft.dbd \
-             not found (set EPICS_BASE or place the reference checkout). No \
-             device rows verified."
-        );
-        return;
-    };
+    let path = dbd_path();
     let dbd = std::fs::read_to_string(&path).expect("read devSoft.dbd");
     let rows = parse_device_rows(&dbd);
     assert!(
@@ -256,14 +246,7 @@ const DEVICE_IO_DIRECTION: &[(&str, &str, bool)] = &[
 
 #[test]
 fn base_devsoft_device_routing_matches_c_dset_direction() {
-    let Some(path) = dbd_path() else {
-        eprintln!(
-            "SKIP base_devsoft_device_routing_matches_c_dset_direction: \
-             devSoft.dbd not found (set EPICS_BASE or place the reference \
-             checkout). No routing verified."
-        );
-        return;
-    };
+    let path = dbd_path();
     let dbd = std::fs::read_to_string(&path).expect("read devSoft.dbd");
     let rows = parse_device_rows(&dbd);
     assert!(

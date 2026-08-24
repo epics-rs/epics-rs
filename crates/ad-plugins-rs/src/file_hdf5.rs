@@ -3,6 +3,7 @@ use std::path::{Path, PathBuf};
 use ad_core_rs::attributes::{NDAttrDataType, NDAttrSource, NDAttrValue, NDAttribute};
 use ad_core_rs::codec::{Codec, CodecName};
 use ad_core_rs::error::{ADError, ADResult};
+use ad_core_rs::finalize::Finalize;
 use ad_core_rs::ndarray::{NDArray, NDDataBuffer, NDDataType, NDDimension};
 use ad_core_rs::ndarray_pool::NDArrayPool;
 use ad_core_rs::plugin::file_base::{NDFileMode, NDFileWriter};
@@ -3128,75 +3129,91 @@ impl NDFileWriter for Hdf5Writer {
         }
     }
 
+    /// Close the open file.
+    ///
+    /// Every step below is fallible and each one runs against the open handle,
+    /// so the release is owned by a finalizer rather than by the tail of the
+    /// function: dropping `handle` closes the H5 file id and its dataset ids on
+    /// every exit path, and HDF5 finalises the file on that drop. Without it a
+    /// failing flush leaked one file id per attempt and left the file
+    /// unfinalised under its `.tmp` name.
     fn close_file(&mut self) -> ADResult<()> {
-        match self.handle {
-            Some(Hdf5Handle::Standard { .. }) => {
-                // Flush each detector dataset's partial frame band and trim its
-                // extent, then emit the accumulated attribute and performance
-                // datasets before the file is finalised.
-                self.finalize_standard_datasets()?;
-                self.flush_attribute_datasets()?;
-                self.flush_performance_dataset()?;
-                // Materialise layout `<hardlink>` elements last, once every
-                // dataset a link may target exists on disk.
-                match self.handle {
-                    Some(Hdf5Handle::Standard {
-                        ref file,
-                        ref detectors,
-                    }) => {
-                        self.build_layout_hardlinks(file)?;
-                        // Every group and dataset now exists, so layout
-                        // `<attribute source="ndattribute">` element-attrs can
-                        // be attached with their open/close values (ADP-79).
-                        self.flush_ndattr_element_attrs(file, detectors)?;
+        let mut closing = Finalize::new(self, |w: &mut Self| {
+            w.handle = None;
+            w.current_path = None;
+        });
+        closing.run(|w| {
+            match w.handle {
+                Some(Hdf5Handle::Standard { .. }) => {
+                    // Flush each detector dataset's partial frame band and trim its
+                    // extent, then emit the accumulated attribute and performance
+                    // datasets before the file is finalised.
+                    w.finalize_standard_datasets()?;
+                    w.flush_attribute_datasets()?;
+                    w.flush_performance_dataset()?;
+                    // Materialise layout `<hardlink>` elements last, once every
+                    // dataset a link may target exists on disk.
+                    match w.handle {
+                        Some(Hdf5Handle::Standard {
+                            ref file,
+                            ref detectors,
+                        }) => {
+                            w.build_layout_hardlinks(file)?;
+                            // Every group and dataset now exists, so layout
+                            // `<attribute source="ndattribute">` element-attrs can
+                            // be attached with their open/close values (ADP-79).
+                            w.flush_ndattr_element_attrs(file, detectors)?;
+                        }
+                        _ => unreachable!("handle is Standard in this arm"),
                     }
-                    _ => unreachable!("handle is Standard in this arm"),
+                    // Finalize the file. Dropping the `H5File` finalizes durably
+                    // (with fsync); when `AD_HDF5_FSYNC_ON_CLOSE` opts out, use the
+                    // no-fsync fast close instead (rust-hdf5 0.3.2 `close_no_sync`).
+                    // Detector dataset handles are released only after finalize,
+                    // preserving the prior file-before-datasets drop order.
+                    if let Some(Hdf5Handle::Standard { file, detectors }) = w.handle.take() {
+                        if w.fsync_on_close {
+                            drop(file);
+                        } else {
+                            file.close_no_sync().map_err(|e| {
+                                ADError::UnsupportedConversion(format!(
+                                    "HDF5 close_no_sync error: {}",
+                                    e
+                                ))
+                            })?;
+                        }
+                        drop(detectors);
+                    }
                 }
-                // Finalize the file. Dropping the `H5File` finalizes durably
-                // (with fsync); when `AD_HDF5_FSYNC_ON_CLOSE` opts out, use the
-                // no-fsync fast close instead (rust-hdf5 0.3.2 `close_no_sync`).
-                // Detector dataset handles are released only after finalize,
-                // preserving the prior file-before-datasets drop order.
-                if let Some(Hdf5Handle::Standard { file, detectors }) = self.handle.take() {
-                    if self.fsync_on_close {
-                        drop(file);
-                    } else {
-                        file.close_no_sync().map_err(|e| {
+                Some(Hdf5Handle::Swmr { .. }) => {
+                    // The layout group tree, the nested dataset placement and the
+                    // layout `<hardlink>` elements were all materialised in
+                    // `open_swmr` before `start_swmr()` (C `NDFileHDF5.cpp:320`-
+                    // `326`: `createHardLinks` then `startSWMR`), so SWMR readers
+                    // see them for the whole streaming window. Closing the writer
+                    // only finalises the streamed frames.
+                    if let Some(Hdf5Handle::Swmr { mut writer, .. }) = w.handle.take() {
+                        // Commit any chunk writes made since the last periodic flush
+                        // before closing. `SwmrFileWriter::close` finalizes the
+                        // extensible-array index of the `append_frame` path but does
+                        // not flush the fixed-array index that the grid path's
+                        // `write_chunk_at` records, so a grid file's tail frames
+                        // would otherwise read back as fill.
+                        writer.flush().map_err(|e| {
                             ADError::UnsupportedConversion(format!(
-                                "HDF5 close_no_sync error: {}",
+                                "SWMR flush-on-close error: {}",
                                 e
                             ))
                         })?;
+                        writer.close().map_err(|e| {
+                            ADError::UnsupportedConversion(format!("SWMR close error: {}", e))
+                        })?;
                     }
-                    drop(detectors);
                 }
+                None => {}
             }
-            Some(Hdf5Handle::Swmr { .. }) => {
-                // The layout group tree, the nested dataset placement and the
-                // layout `<hardlink>` elements were all materialised in
-                // `open_swmr` before `start_swmr()` (C `NDFileHDF5.cpp:320`-
-                // `326`: `createHardLinks` then `startSWMR`), so SWMR readers
-                // see them for the whole streaming window. Closing the writer
-                // only finalises the streamed frames.
-                if let Some(Hdf5Handle::Swmr { mut writer, .. }) = self.handle.take() {
-                    // Commit any chunk writes made since the last periodic flush
-                    // before closing. `SwmrFileWriter::close` finalizes the
-                    // extensible-array index of the `append_frame` path but does
-                    // not flush the fixed-array index that the grid path's
-                    // `write_chunk_at` records, so a grid file's tail frames
-                    // would otherwise read back as fill.
-                    writer.flush().map_err(|e| {
-                        ADError::UnsupportedConversion(format!("SWMR flush-on-close error: {}", e))
-                    })?;
-                    writer.close().map_err(|e| {
-                        ADError::UnsupportedConversion(format!("SWMR close error: {}", e))
-                    })?;
-                }
-            }
-            None => {}
-        }
-        self.current_path = None;
-        Ok(())
+            Ok(())
+        })
     }
 
     fn supports_multiple_arrays(&self) -> bool {
@@ -5852,6 +5869,59 @@ mod tests {
         assert_eq!(alias.shape(), orig.shape());
 
         drop(h5);
+        std::fs::remove_file(&path).ok();
+        std::fs::remove_file(&layout).ok();
+    }
+
+    /// D2: a close whose finalisation fails partway must still release the H5
+    /// file id and its dataset ids. The broken `<hardlink>` stands in for the
+    /// ENOSPC flush failure: it fails `build_layout_hardlinks`, one of the five
+    /// fallible steps that used to sit ahead of `handle.take()`.
+    #[test]
+    fn close_file_releases_the_handle_when_finalisation_fails() {
+        let dir = std::env::temp_dir();
+        let layout = dir.join("adcore_layout_broken_hardlink.xml");
+        std::fs::write(
+            &layout,
+            r#"<hdf5_layout>
+              <group name="entry">
+                <group name="data">
+                  <dataset name="data" source="detector" det_default="true"/>
+                  <hardlink name="broken" target="/no_such_object"/>
+                </group>
+              </group>
+            </hdf5_layout>"#,
+        )
+        .unwrap();
+
+        let path = temp_path("hdf5_close_fail_releases_handle");
+        let mut writer = Hdf5Writer::new();
+        assert!(
+            writer.set_layout_filename(layout.to_str().unwrap()),
+            "layout XML must parse: {}",
+            writer.layout_error
+        );
+
+        let arr = NDArray::new(
+            vec![NDDimension::new(4), NDDimension::new(4)],
+            NDDataType::UInt16,
+        );
+        writer.open_file(&path, NDFileMode::Stream, &arr).unwrap();
+        writer.write_file(&arr).unwrap();
+
+        assert!(
+            writer.close_file().is_err(),
+            "a hardlink to a missing object must fail the close"
+        );
+        assert!(
+            writer.handle.is_none(),
+            "a failed close must still release the H5 file id and its dataset ids"
+        );
+        assert!(writer.current_path.is_none());
+        // The writer is reusable: a second close is a no-op rather than another
+        // run at the same failing finalisation.
+        writer.close_file().unwrap();
+
         std::fs::remove_file(&path).ok();
         std::fs::remove_file(&layout).ok();
     }

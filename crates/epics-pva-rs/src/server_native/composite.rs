@@ -2,8 +2,13 @@
 //! `Server::addSource(name, src, order)` model. Sources are kept in a
 //! priority-sorted list and dispatched in order on each PV-name lookup.
 //!
-//! Lower `order` values are tried first (`order=0` is the default). Ties
-//! are broken by insertion order. Source names beginning with "__" are
+//! Sources are keyed by `(order, name)` and consulted in ascending key
+//! order — the same key pvxs uses for its registry
+//! (`std::map<std::pair<int, std::string>, ...>`, `serverconn.h:267`,
+//! inserted at `server.cpp:91`, iterated at `server.cpp:696` and
+//! `serverchan.cpp:304`). Lower `order` is tried first (`order=0` is the
+//! default) and an equal-`order` tie is broken by byte-wise source NAME,
+//! never by registration order. Source names beginning with "__" are
 //! reserved for internal use (pvxs convention) — `__builtin` is a
 //! [`crate::server_native::SharedSource`] for
 //! [`add`](crate::server_native::SharedSource::add) /
@@ -14,6 +19,8 @@
 //! `rpc`, `is_writable`, `get_introspection`). `list_pvs()` is the
 //! union of every source's PV list.
 
+use std::collections::BTreeMap;
+use std::collections::btree_map::Entry;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -24,18 +31,14 @@ use super::source::{
     RawMonitorEvent,
 };
 
-/// One entry in the registry.
-#[derive(Clone)]
-pub struct SourceEntry {
-    pub name: String,
-    pub order: i32,
-    pub source: DynSource,
-}
-
 /// Multi-source registry. Wrap with `Arc` and feed to
 /// `PvaServer::start`.
 pub struct CompositeSource {
-    entries: Arc<parking_lot::RwLock<Vec<SourceEntry>>>,
+    /// `(order, name) -> source`, ordered by construction: a
+    /// `BTreeMap` iterates its keys ascending, so the consultation
+    /// order pvxs gets from `std::map<std::pair<int, std::string>, ...>`
+    /// cannot be lost by a caller forgetting to re-sort after an insert.
+    entries: Arc<parking_lot::RwLock<BTreeMap<(i32, String), DynSource>>>,
     /// The composite's gate is
     /// an aggregator whose `acl_version()` is the `wrapping_sum`
     /// of every inner gate's version (NOT `max(...)`: a
@@ -62,8 +65,8 @@ pub struct CompositeSource {
 impl Default for CompositeSource {
     fn default() -> Self {
         use epics_base_rs::server::access_security::AccessGate;
-        let entries: Arc<parking_lot::RwLock<Vec<SourceEntry>>> =
-            Arc::new(parking_lot::RwLock::new(Vec::new()));
+        let entries: Arc<parking_lot::RwLock<BTreeMap<(i32, String), DynSource>>> =
+            Arc::new(parking_lot::RwLock::new(BTreeMap::new()));
         let entries_for_version = entries.clone();
         // the composite's aggregate
         // version is the `wrapping_sum` of every inner gate's
@@ -83,8 +86,8 @@ impl Default for CompositeSource {
         // triggers a re-check on the next event.
         let access_gate = AccessGate::open_with_aggregator(Arc::new(move || {
             let mut sum: u64 = 0;
-            for entry in entries_for_version.read().iter() {
-                sum = sum.wrapping_add(entry.source.access_gate().acl_version());
+            for source in entries_for_version.read().values() {
+                sum = sum.wrapping_add(source.access_gate().acl_version());
             }
             sum
         }));
@@ -101,20 +104,24 @@ impl CompositeSource {
         Arc::new(Self::default())
     }
 
-    /// Add a source. Errors when (`name`, `order`) is already present —
-    /// pvxs convention so callers notice double-registration. Higher
-    /// priority = lower `order`. Default `order=0`.
+    /// Add a source under the key `(order, name)`. Errors when that key
+    /// is already present — pvxs convention so callers notice
+    /// double-registration (`server.cpp:91-93`). Higher priority = lower
+    /// `order`; two sources sharing an `order` are consulted in byte-wise
+    /// name order, exactly as pvxs's `std::map<std::pair<int,
+    /// std::string>, ...>` does (`serverconn.h:268`). pvxs keeps its own
+    /// internals at `order = -1` (`server.cpp:542-546`) and application
+    /// sources default to `order = 0` (`pvxs/server.h:116-118`).
     pub fn add_source(&self, name: &str, source: DynSource, order: i32) -> Result<(), String> {
         let mut e = self.entries.write();
-        if e.iter().any(|x| x.name == name && x.order == order) {
-            return Err(format!("source ({name}, {order}) already registered"));
+        match e.entry((order, name.to_string())) {
+            Entry::Occupied(_) => {
+                return Err(format!("source ({name}, {order}) already registered"));
+            }
+            Entry::Vacant(slot) => {
+                slot.insert(source);
+            }
         }
-        e.push(SourceEntry {
-            name: name.into(),
-            order,
-            source,
-        });
-        e.sort_by_key(|x| x.order);
         // pvxs `Server::addSource` bumps `beaconChange` unconditionally
         // (server.cpp:90-96) so the next BEACON signals the topology
         // change. Bump after the successful insert only.
@@ -126,8 +133,7 @@ impl CompositeSource {
     /// (`name`, `order`) tuple. Returns `None` when not found.
     pub fn remove_source(&self, name: &str, order: i32) -> Option<DynSource> {
         let mut e = self.entries.write();
-        let idx = e.iter().position(|x| x.name == name && x.order == order)?;
-        let removed = e.remove(idx).source;
+        let removed = e.remove(&(order, name.to_string()))?;
         // pvxs `Server::removeSource` bumps `beaconChange` on a real
         // erase (server.cpp:100-115). Bump only when something was
         // removed (the `?` above already returned on a miss).
@@ -157,36 +163,29 @@ impl CompositeSource {
     /// peak.
     pub fn beacon_change(&self) -> u64 {
         let mut sum = self.beacon_change.load(Ordering::Relaxed);
-        for entry in self.entries.read().iter() {
-            sum = sum.wrapping_add(entry.source.beacon_change());
+        for source in self.entries.read().values() {
+            sum = sum.wrapping_add(source.beacon_change());
         }
         sum
     }
 
     /// Look up a previously added source by (name, order).
     pub fn get_source(&self, name: &str, order: i32) -> Option<DynSource> {
-        self.entries
-            .read()
-            .iter()
-            .find(|x| x.name == name && x.order == order)
-            .map(|x| x.source.clone())
+        self.entries.read().get(&(order, name.to_string())).cloned()
     }
 
-    /// (name, order) for every registered source — debug helper.
+    /// (name, order) for every registered source, in consultation
+    /// order — debug helper.
     pub fn list_source(&self) -> Vec<(String, i32)> {
         self.entries
             .read()
-            .iter()
-            .map(|x| (x.name.clone(), x.order))
+            .keys()
+            .map(|(order, name)| (name.clone(), *order))
             .collect()
     }
 
     fn snapshot(&self) -> Vec<DynSource> {
-        self.entries
-            .read()
-            .iter()
-            .map(|x| x.source.clone())
-            .collect()
+        self.entries.read().values().cloned().collect()
     }
 
     /// single owner of credentialed inner-source selection
@@ -446,6 +445,27 @@ impl ChannelSource for CompositeSource {
             for src in this {
                 if src.has_pv_checked(&name, ctx.clone()).await {
                     return src.get_introspection_checked(&name, ctx).await;
+                }
+            }
+            None
+        }
+    }
+
+    /// Forward the parking wait to the SAME inner source
+    /// [`Self::get_introspection_checked`] would have asked, so a
+    /// composite in front of a `SharedSource` parks where the leaf parks
+    /// instead of collapsing "not open yet" into "no such PV".
+    fn await_introspection(
+        &self,
+        name: &str,
+        ctx: crate::server_native::source::ChannelContext,
+    ) -> impl std::future::Future<Output = Option<FieldDesc>> + Send {
+        let name = name.to_string();
+        let this = self.snapshot();
+        async move {
+            for src in this {
+                if src.has_pv_checked(&name, ctx.clone()).await {
+                    return src.await_introspection(&name, ctx).await;
                 }
             }
             None
@@ -1506,7 +1526,7 @@ mod tests {
 
         let comp = CompositeSource::new();
         let shared = Arc::new(SharedSource::new());
-        comp.add_source("__builtin", shared.clone() as DynSource, 0)
+        comp.add_source("__user", shared.clone() as DynSource, 0)
             .unwrap();
 
         // Snapshot AFTER registration: from here the composite's own
@@ -1555,6 +1575,43 @@ mod tests {
         comp.add_source("hi", hi, 0).unwrap();
 
         // Lower order wins → value=2.
+        let v = comp.get_value("shared").await.unwrap();
+        let PvField::Structure(s) = v else { panic!() };
+        let PvField::Scalar(ScalarValue::Int(n)) = &s.fields[0].1 else {
+            panic!()
+        };
+        assert_eq!(*n, 2);
+    }
+
+    /// pvxs keys its registry `std::map<std::pair<int, std::string>, ...>`
+    /// (`serverconn.h:267`), inserts at `std::make_pair(order, name)`
+    /// (`server.cpp:91`) and iterates it ascending (`server.cpp:696`,
+    /// `serverchan.cpp:304`), so two sources sharing an `order` are
+    /// consulted in byte-wise NAME order — that is what puts `__builtin`
+    /// ahead of `__server` at pvxs's internal order -1
+    /// (`server.cpp:542-546`). Registering the later-sorting name FIRST
+    /// must not give it priority.
+    #[epics_macros_rs::epics_test]
+    async fn equal_order_ties_break_by_source_name_not_by_insertion() {
+        let comp = CompositeSource::new();
+        let first: DynSource = Arc::new(PvSrc {
+            name: "shared",
+            value: 1,
+        });
+        let second: DynSource = Arc::new(PvSrc {
+            name: "shared",
+            value: 2,
+        });
+        comp.add_source("zzz", first, 0).unwrap();
+        comp.add_source("aaa", second, 0).unwrap();
+
+        assert_eq!(
+            comp.list_source(),
+            vec![("aaa".to_string(), 0), ("zzz".to_string(), 0)],
+            "consultation order must be (order, name) ascending"
+        );
+
+        // "aaa" < "zzz" → value=2, even though "zzz" was registered first.
         let v = comp.get_value("shared").await.unwrap();
         let PvField::Structure(s) = v else { panic!() };
         let PvField::Scalar(ScalarValue::Int(n)) = &s.fields[0].1 else {

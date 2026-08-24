@@ -2421,7 +2421,7 @@ mod tests {
     /// read-only-assigned `Const` node.
     /// R19-41: a property leaf the record type does not SUPPLY is never
     /// marked — on a read or on a property event alike. One case per gate
-    /// boundary of `dbChannelGet`'s option narrowing (`dbAccess.c:336-430`),
+    /// boundary of `dbChannelGet`'s option narrowing (`dbAccess.c:336-427`),
     /// which is what pvxs's `if(options & DBR_*)` reads
     /// (`iocsource.cpp:263-305`):
     ///

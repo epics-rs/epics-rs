@@ -12,7 +12,7 @@
 //!     ...
 //! ```
 //!
-//! The port keeps `MAX_LINK_DEPTH` / `MAX_LINK_OPS` because every link level is
+//! The port keeps `MAX_LINK_DEPTH` because every link level is
 //! a `Pin<Box<dyn Future>>` driven on the calling thread's stack, and an
 //! unbounded chain on an embedded target is a stack overflow rather than a slow
 //! IOC. Keeping the bound is a deliberate deviation; keeping it SILENT was the

@@ -87,6 +87,12 @@ impl Record for StringoutRecord {
         "stringout"
     }
 
+    /// C `stringoutRecord.c:135-146`: the scalar `dbGetLink(&prec->dol, ..., &prec->val, 0, 0)`
+    /// under `dol.type != CONSTANT && omsl == menuOmslclosed_loop`.
+    fn fetches_dol_closed_loop(&self) -> bool {
+        true
+    }
+
     /// C reads the closed-loop DOL with a plain `dbGetLink(..., DBR_STRING,
     /// ...)` (`stringoutRecord.c:141`): an ENUM/MENU source delivers its
     /// state label, never the index digits (epics-base#183).

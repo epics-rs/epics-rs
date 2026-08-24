@@ -4,12 +4,21 @@ use std::fmt;
 use super::DbFieldType;
 use super::PvString;
 use super::c_cast;
+use super::c_parse;
 
-/// `sizeof(union native_value)` (C `dbFldTypes.h`) — the widest member is
-/// `char [MAX_STRING_SIZE]`, so 40 bytes. The cut-off C uses to decide whether
-/// a monitor event queue may hold a value inline; see
-/// [`EpicsValue::queues_by_value`].
-pub const NATIVE_VALUE_BYTES: usize = 40;
+/// `sizeof(union native_value)` (C `db_field_log.h:41-56`) — 8 bytes.
+///
+/// The widest member of that union is `epicsFloat64` / `epicsInt64`. Its
+/// `char dbf_string[MAX_STRING_SIZE]` member sits behind
+/// `#ifdef DB_EVENT_LOG_STRINGS`, a macro epics-base mentions only in that
+/// header's own comment and `#ifdef` and defines in no makefile, header or
+/// source — so no stock build has it and the union is 8 bytes wide, not 40.
+/// That is what makes `dbEvent.c:493-500` compare a `DBF_STRING` field's 40
+/// against 8 and get FALSE.
+///
+/// The cut-off C uses to decide whether a monitor event queue may hold a
+/// value inline; see [`EpicsValue::queues_by_value`].
+pub const NATIVE_VALUE_BYTES: usize = 8;
 
 /// Runtime value from an EPICS PV
 #[derive(Debug, Clone, PartialEq)]
@@ -764,31 +773,35 @@ impl EpicsValue {
     /// }
     /// ```
     ///
-    /// C's `union native_value` (`dbFldTypes.h`) is at most one
-    /// `char[MAX_STRING_SIZE]`, so "queueable by value" means "fits in 40
-    /// bytes". Anything wider is stored by reference
-    /// (`db_create_field_log`'s `dbfl_type_ref` branch, which copies nothing
-    /// and points at the record's own field), and C then refuses to queue a
-    /// second one — `dbel` reports such a subscription as
+    /// C compares the CHANNEL's declared field size — never the bytes this
+    /// particular value happens to occupy. `dbChannelFieldSize` for a
+    /// `DBF_STRING` field is `MAX_STRING_SIZE` whatever the string in it
+    /// says, and [`NATIVE_VALUE_BYTES`] is 8, so every string channel is
+    /// by-reference in C exactly as every array field is.
+    ///
+    /// A by-reference log is `db_create_field_log`'s `dbfl_type_ref` branch,
+    /// which copies nothing and points at the record's own field; C then
+    /// refuses to queue a second one — `dbel` reports such a subscription as
     /// "queueing disabled".
     ///
     /// The port cannot store a reference (every event carries an owned
     /// [`crate::server::snapshot::Snapshot`]), so this predicate is what keeps
     /// its memory profile C's: see
-    /// [`crate::server::event_queue`]'s latest-only rule.
+    /// [`crate::server::event_queue`]'s latest-only rule. What C's surviving
+    /// reference would have read at delivery is answered there by keeping the
+    /// NEWEST snapshot rather than the queued one.
     pub fn queues_by_value(&self) -> bool {
         match self {
             // C: `dbChannelElements(chan) == 1` fails for every array field,
             // whatever its current element count.
             v if v.is_array() => false,
-            // The two scalar variants with heap-allocated payloads: a
-            // long-string `DBR_STRING` can exceed MAX_STRING_SIZE, and the
-            // transient NTEnum carrier holds a whole label vector.
-            Self::String(s) => s.len() <= NATIVE_VALUE_BYTES,
+            // Not a database field at all — a transient NTEnum link carrier
+            // holding a whole label vector, so it has no `dbChannelFieldSize`
+            // to compare and no bound but the labels' own size.
             Self::EnumWithChoices { .. } => false,
-            // Every remaining variant is a fixed-width scalar of at most 8
-            // bytes.
-            _ => true,
+            // C `dbChannelFieldSize(chan) <= sizeof(union native_value)`:
+            // `element_size` is that declared width for a scalar field.
+            v => v.db_field_type().element_size() <= NATIVE_VALUE_BYTES,
         }
     }
 
@@ -922,7 +935,7 @@ impl EpicsValue {
             // the epicsInt8 sign-reinterpret arm in `convert_to`.
             Self::UCharArray(a) => Some(a.iter().map(|&v| v as f64).collect()),
             // DBR_STRING → numeric IS an array conversion in C: the
-            // `putString*` family (`dbConvert.c:941-1148`) runs the SAME
+            // `putString*` family (`dbConvert.c:941-1147`) runs the SAME
             // per-element scalar parse (`epicsParseInt32`/`epicsParseFloat64`,
             // `dbConvertBase` = 0 so `"0x10"` is 16) over all `nRequest`
             // elements. Taking the numeric view here makes the array path
@@ -987,13 +1000,21 @@ impl EpicsValue {
         })
     }
 
-    /// Convert to a different native type.
+    /// Coerce to a different native type — the PUT direction, plus the
+    /// whole-value text projection.
     ///
-    /// Scalars convert element-wise via `to_f64`. Array variants
-    /// convert **element-by-element** to the target array variant
-    /// (C `dbConvert` runs the per-type GET routine over the whole
-    /// array). Without this an array requested as a different DBR
-    /// native type would collapse to a single zero scalar.
+    /// This is C's put table (`dbPutConvertRoutine` /
+    /// `dbFastPutConvertRoutine`) and nothing else: total, and free to collapse
+    /// an array into the one text slot a `DBF_STRING` field holds. Scalars
+    /// coerce through `to_f64`/`as_int_i64`; array variants coerce
+    /// element-by-element into the target array variant.
+    ///
+    /// The GET direction is [`Self::get_convert`] and is a different function
+    /// with a different contract — element-count-preserving and fallible. An
+    /// earlier revision of this doc claimed `convert_to` ran "the per-type GET
+    /// routine over the whole array", which is what let the two directions
+    /// share one body; they do not share one in C and the differences are
+    /// observable on the wire.
     pub fn convert_to(&self, target: DbFieldType) -> EpicsValue {
         // pvalink NTEnum carrier (pvxs `pvaGetValue` scalar switch,
         // `pvalink_lset.cpp:330-360`): a DBR_STRING target stores the
@@ -1038,7 +1059,7 @@ impl EpicsValue {
                     None => nums.iter().map(|&v| c_cast::f64_to_i16(v)).collect(),
                 }),
                 DbFieldType::Float => {
-                    EpicsValue::FloatArray(nums.iter().map(|&v| v as f32).collect())
+                    EpicsValue::FloatArray(nums.iter().map(|&v| c_cast::f64_to_f32(v)).collect())
                 }
                 DbFieldType::Enum => EpicsValue::EnumArray(match &ints {
                     Some(v) => v.iter().map(|&x| x as u16).collect(),
@@ -1088,8 +1109,15 @@ impl EpicsValue {
                 DbFieldType::Float => {
                     EpicsValue::FloatArray(bytes.iter().map(|&b| b as i8 as f32).collect())
                 }
+                // `getCharEnum` is `GET(char, epicsEnum16)` (`dbConvert.c:491`,
+                // macro body `*pdst = (typeb) *psrc` at `:63-80`) with `psrc` a
+                // SIGNED `char`, so 0xC8 lands as 65480, not 200 — the same
+                // promotion the eight sibling arms do. Dropping the `as i8`
+                // here also split the type against itself: the scalar row goes
+                // through `to_f64`, which reads `Char` signed, so one byte gave
+                // two answers depending on whether it arrived as an array.
                 DbFieldType::Enum => {
-                    EpicsValue::EnumArray(bytes.iter().map(|&b| b as u16).collect())
+                    EpicsValue::EnumArray(bytes.iter().map(|&b| b as i8 as u16).collect())
                 }
                 DbFieldType::Long => {
                     EpicsValue::LongArray(bytes.iter().map(|&b| b as i8 as i32).collect())
@@ -1152,7 +1180,9 @@ impl EpicsValue {
                 Some(i) => i as i16,
                 None => c_cast::f64_to_i16(self.to_f64().unwrap_or(0.0)),
             }),
-            DbFieldType::Float => EpicsValue::Float(self.to_f64().unwrap_or(0.0) as f32),
+            DbFieldType::Float => {
+                EpicsValue::Float(c_cast::f64_to_f32(self.to_f64().unwrap_or(0.0)))
+            }
             // C's numeric→`DBF_ENUM`/`DBF_MENU` put is `putDoubleEnum`
             // (`dbConvert.c`): `*pfield = (epicsEnum16)*psrc`, a WRAPPING cast of
             // the truncated value, not a saturating clamp. A float `-1.0` must
@@ -1229,6 +1259,105 @@ impl EpicsValue {
         }
     }
 
+    /// Render this field in `target`'s DBR type — the GET direction.
+    ///
+    /// C reaches this through two tables: `dbGetConvertRoutine`
+    /// (`dbConvert.c:1707`) for an array request, and
+    /// `dbFastGetConvertRoutine` (`dbFastLinkConv.c:1642`) for the scalar fast
+    /// path `dbAccess.c:967` takes when `offset == 0 && no_elements == 1`. Two
+    /// properties separate them from the put table in [`Self::convert_to`], and
+    /// both were lost while one function stood in for both directions:
+    ///
+    /// * **The element count is preserved.** `getCharString`
+    ///   (`dbConvert.c:417-437`) advances `pdst` by `MAX_STRING_SIZE` once per
+    ///   source byte, so a `DBF_CHAR` waveform read as `DBR_STRING` ships one
+    ///   40-byte slot per element. Collapsing the buffer into a single slot is
+    ///   the long-string *presentation*, which has its own owner
+    ///   (`epics_ca_rs::server::apply_native_long_string`), not a get.
+    /// * **It can fail.** The `DBF_STRING` row parses, and a non-zero status
+    ///   leaves `dbChannel_get` as -1 (`db_access.c:816`); rsrv then answers the
+    ///   read with a zeroed payload and `m_cid = ECA_GETFAIL`
+    ///   (`camessage.c:545-561`) instead of a value.
+    ///
+    /// Numeric-to-numeric rows are the same conversion in both directions in C,
+    /// so they delegate to `convert_to` rather than being written twice.
+    pub fn get_convert(&self, target: DbFieldType) -> CaResult<EpicsValue> {
+        // `getCharString` / `getUcharString` (`dbConvert.c:417-437`) advance
+        // `pdst` by MAX_STRING_SIZE per source byte, so a DBF_CHAR waveform
+        // read as DBR_STRING ships one 40-byte slot PER ELEMENT holding that
+        // byte's decimal text — `cvtCharToString` is `cvtInt32ToString` and its
+        // unsigned twin (`cvtFast.h:71-72`). The scalar rows `cvt_c_st` /
+        // `cvt_uc_st` render the same text, which `convert_to`'s `Display`
+        // already produces; only the arrays need their own arm, because
+        // projecting the whole buffer into one slot is the long-string
+        // presentation (`epics_ca_rs::server::apply_native_long_string`) and
+        // never a get.
+        if target == DbFieldType::String {
+            match self {
+                Self::CharArray(bytes) => {
+                    return Ok(Self::StringArray(
+                        bytes
+                            .iter()
+                            .map(|&b| PvString::from((b as i8).to_string()))
+                            .collect(),
+                    ));
+                }
+                Self::UCharArray(bytes) => {
+                    return Ok(Self::StringArray(
+                        bytes
+                            .iter()
+                            .map(|&b| PvString::from(b.to_string()))
+                            .collect(),
+                    ));
+                }
+                _ => {}
+            }
+        }
+        // The whole DBF_STRING row of C's GET tables parses, and returns a
+        // status when the text is not a number of the requested type: the
+        // scalar rows `cvt_st_c`..`cvt_st_d` (`dbFastLinkConv.c:91-244`, always
+        // selected for a string field because `dbAccess.c:967-977` sees
+        // `no_elements == 1`) and the array rows `getString*`
+        // (`dbConvert.c:392-414` and the identical body per width).
+        //
+        // `convert_to` has no failure channel, so it answered a
+        // `DBR_DOUBLE` read of VAL="hello" with `0.0` at NO_ALARM where C
+        // answers ECA_GETFAIL and a CA-linked calc goes LINK/INVALID; and for
+        // the CHAR widths it answered with the field's own text bytes, which is
+        // the put projection an `FTVL=CHAR` waveform needs and stays there.
+        if let Some(row) = c_parse::NumericField::of(target) {
+            match self {
+                Self::String(s) => return c_parse::get_string(row, &s.as_str_lossy()),
+                Self::StringArray(a) => return c_parse::get_string_array(row, a),
+                _ => {}
+            }
+        }
+        Ok(self.convert_to(target))
+    }
+
+    /// The `f64` a link read produces — the `DBR_DOUBLE` row of
+    /// [`Self::get_convert`], so a `DBF_STRING` source obeys C's one
+    /// string-to-numeric get rule at every read path: the empty string is a
+    /// successful zero (`dbConvert.c` `getStringDouble`'s `if (*psrc == 0)
+    /// *pdst++ = 0;`, and the identical carve-out in `dbFastLinkConv.c`
+    /// `cvt_st_d`), anything else unparseable is a failed read.
+    ///
+    /// [`Self::to_f64`] is the OTHER rule and must not be used here: its
+    /// stricter parse answers `None` for the empty string, which the link
+    /// machinery turns into `LinkFetch::Failed` and a LINK/INVALID alarm,
+    /// where C's status 0 means `dbGetLink` (`dbLink.c`) calls no
+    /// `setLinkAlarm` at all.
+    ///
+    /// `None` is C's non-zero `dbGetLink` status. Array variants answer
+    /// `None` exactly as `to_f64` does; callers take `first_element` first
+    /// where C's one-element destination does.
+    pub fn get_convert_f64(&self) -> Option<f64> {
+        match self.get_convert(DbFieldType::Double) {
+            Ok(Self::Double(v)) => Some(v),
+            _ => None,
+        }
+    }
+
     /// Return the internal DbFieldType that matches this value's variant.
     /// Unlike dbr_type(), this returns Int64 for Int64 variants (not Double).
     pub fn db_field_type(&self) -> DbFieldType {
@@ -1292,9 +1421,9 @@ impl EpicsValue {
             Self::Short(v) => Some(*v as f64),
             Self::Enum(v) => Some(*v as f64),
             // NTEnum carrier: numeric coercion takes the index (pvxs
-            // numeric branch), identical to `Enum`. Reached on the
-            // multi-input/DOL/SELN paths that pre-convert link values to
-            // f64 before applying them, bypassing `convert_to`.
+            // numeric branch), identical to `Enum`. Reached through
+            // [`Self::get_convert_f64`] on the multi-input/DOL/SELN paths,
+            // which pre-convert link values to f64 before applying them.
             Self::EnumWithChoices { index, .. } => Some(*index as f64),
             Self::Int64(v) => Some(*v as f64),
             Self::UInt64(v) => Some(*v as f64),
@@ -1450,8 +1579,14 @@ impl EpicsValue {
                             CaError::InvalidValue(format!("invalid short or menu string: {s}"))
                         })
                 }),
+            // `dbStaticLib.c:2797` parses a `DBF_FLOAT` field with
+            // `epicsParseFloat32`, the same routine `putStringFloat` uses, so
+            // the narrowing gate belongs on this path too: without it `1e300`
+            // loaded from a `.db` file stored `inf` while the identical
+            // `caput` was refused.
             DbFieldType::Float => parse_string_to_f64(s)
-                .map(|v| Self::Float(v as f32))
+                .and_then(super::c_parse::narrow_to_f32)
+                .map(Self::Float)
                 .ok_or_else(|| CaError::InvalidValue(format!("invalid float literal: {s}"))),
             DbFieldType::Enum => Self::parse_int(s)
                 .map(|v| Self::Enum(v as u16))
@@ -1969,22 +2104,24 @@ mod enum_with_choices_tests {
         assert_eq!(EpicsValue::enum_index_label(&choices, 9).as_bytes(), b"9");
     }
 
-    /// Boundaries of C's `useValque` test, one case per boundary: a fixed-width
-    /// scalar, a string exactly `sizeof(union native_value)`, one byte past it,
-    /// the heap-carrying enum variant, and an array at its smallest — a
-    /// one-element array is still an array field in C (`dbChannelElements`
-    /// reads the declared NELM, not the current NORD).
+    /// Boundaries of C's `useValque` test, one case per boundary: the widest
+    /// scalar that still fits, a `DBF_STRING` field at both ends of its
+    /// content range (the declared width is 40 either way, so the content
+    /// decides nothing), the heap-carrying enum variant, and an array at its
+    /// smallest — a one-element array is still an array field in C
+    /// (`dbChannelElements` reads the declared NELM, not the current NORD).
     #[test]
     fn queues_by_value_boundaries() {
+        // The union without `DB_EVENT_LOG_STRINGS` is its `epicsFloat64` /
+        // `epicsInt64` member, so the widest scalar field still fits exactly.
+        assert_eq!(NATIVE_VALUE_BYTES, 8);
         assert!(EpicsValue::Double(1.0).queues_by_value());
-        assert!(
-            EpicsValue::String(PvString::from_bytes(vec![b'x'; NATIVE_VALUE_BYTES]))
-                .queues_by_value()
-        );
-        assert!(
-            !EpicsValue::String(PvString::from_bytes(vec![b'x'; NATIVE_VALUE_BYTES + 1]))
-                .queues_by_value()
-        );
+        assert!(EpicsValue::Int64(1).queues_by_value());
+        assert!(EpicsValue::Char(1).queues_by_value());
+        // Both are `DBF_STRING`, whose field is 40 bytes wide however short
+        // its contents: C answers FALSE to both.
+        assert!(!EpicsValue::String(PvString::from_bytes(vec![b'x'; 1])).queues_by_value());
+        assert!(!EpicsValue::String(PvString::from_bytes(vec![b'x'; 41])).queues_by_value());
         assert!(
             !EpicsValue::EnumWithChoices {
                 index: 0,

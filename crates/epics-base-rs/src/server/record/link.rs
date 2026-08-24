@@ -101,9 +101,11 @@ pub enum ParsedLink {
     /// computes a result from one or more input PV values + a calc
     /// expression, optionally pulling its timestamp from one of the
     /// inputs. JSON form:
-    /// `{calc:{expr:"A+B*2", args:["pv1","pv2.VAL"], time:"A"}}`
-    /// — `time` is the input letter (A-L) whose timestamp the result
-    /// should carry. `time` may be omitted (no timestamp passthrough).
+    /// `{calc: {expr:"A*B", args:[{pva:"record"}, 1.5], time:"a"}}`
+    /// — `time` is the input letter whose timestamp the result should
+    /// carry, upper or lower case, `A` through the [`CALC_NARGS`](crate::calc::CALC_NARGS)th
+    /// letter (`lnkCalc.c:180-186`). `time` may be omitted (no timestamp
+    /// passthrough).
     Calc(CalcLink),
 }
 
@@ -228,20 +230,45 @@ pub fn pvajson_identity_key(pv: &str, options: &[(String, JlinkValue)]) -> Strin
     key
 }
 
+/// One element of a `lnkCalc` `args` array.
+///
+/// C gives each slot two producers and one index: `lnkCalc_integer` and
+/// `lnkCalc_double` write a bare number straight into `arg[nArgs++]`
+/// (`lnkCalc.c:141`, `:161`), while an embedded JSON link takes
+/// `inp[nArgs++]` (`lnkCalc.c:353`) and overwrites `arg[i]` from
+/// `dbGetLink` at read time (`lnkCalc.c:585`). A slot is a value or a
+/// link and never both, which is why this is a sum type rather than a
+/// name string that some parse steps happen to fill in.
+#[derive(Clone, Debug, PartialEq)]
+pub enum CalcArg {
+    /// A numeric literal, held for the life of the link. C leaves the
+    /// matching `inp[i]` zeroed, i.e. a CONSTANT link, and `dbGetLink` on
+    /// a constant delivers nothing (`dbConstLink.c:219-225`
+    /// `*pnRequest = 0`), so nothing ever overwrites `arg[i]`.
+    Literal(f64),
+    /// An embedded JSON link — `{pva:"record"}`, `{const:2}`, a nested
+    /// `{calc:…}`. Read once per evaluation, no processing.
+    Link(Box<ParsedLink>),
+}
+
 /// Configuration for a `lnkCalc` link.
 #[derive(Clone, Debug, PartialEq)]
 pub struct CalcLink {
     /// Calc expression in epics-base postfix syntax — e.g. `"A+B*2"`,
-    /// `"MAX(A,B,C)"`. Variables A..L bind to `args[0..12]`.
+    /// `"MAX(A,B,C)"`. Variables A.. bind to `args` by position, up to
+    /// [`CALC_NARGS`](crate::calc::CALC_NARGS).
     pub expr: String,
-    /// Input PV names. Each `args[i]` is fetched at link-read time and
-    /// bound to the calc engine's variable slot at index `i` (0→A,
-    /// 1→B, …). PV names may include a field suffix (`.VAL`, `.NORD`).
-    /// Up to 12 inputs (calc engine A-L slots).
-    pub args: Vec<String>,
-    /// Input letter ('A'..='L') whose timestamp should be used for
-    /// the result. `None` skips timestamp passthrough — the consumer
-    /// uses its own `apply_timestamp` time.
+    /// Input arguments. Each `args[i]` is resolved at link-read time and
+    /// bound to the calc engine's variable slot at index `i` (0→A, 1→B,
+    /// …). At most [`CALC_NARGS`](crate::calc::CALC_NARGS) of them — C stops the parse at the
+    /// limit rather than truncating (`lnkCalc.c:135-139`).
+    pub args: Vec<CalcArg>,
+    /// C `clink->tinp` (`lnkCalc.c:184`) as its letter: the input whose
+    /// timestamp and userTag the reading record adopts. Normalised to upper
+    /// case and bounded by [`CALC_NARGS`](crate::calc::CALC_NARGS) (`lnkCalc.c:180-186`), so it
+    /// indexes `args` directly. `None` is C's `tinp = -1` —
+    /// `lnkCalc_getTimestampTag` returns -1 and the consumer keeps its own
+    /// `apply_timestamp` time.
     pub time_source: Option<char>,
 }
 
@@ -490,6 +517,12 @@ pub fn check_link_assignment(
     let Some(class) = crate::types::dbf_link_class(record_type, upper_field) else {
         return Ok(());
     };
+    // C runs `dbParseLink` BEFORE `dbCanSetLink` (`dbStaticLib.c:2222` calls
+    // the parse first), so a brace-delimited link naming no registered type
+    // fails here whatever device support the field is bound to — including
+    // the very common case of no declaration at all, where the type check
+    // below returns early.
+    check_json_link_text(text)?;
     let Some(expected) = declared_link_type(record_type, dtyp, upper_field) else {
         return Ok(());
     };
@@ -835,7 +868,146 @@ fn json_string_value(value: &str) -> Option<String> {
     decode_json_string_token(first)
 }
 
-fn try_parse_json_link(s: &str) -> Option<ParsedLink> {
+/// The JSON link types this port serves. C looks the first map key up in the
+/// registry built from `link(<name>, <lsetIf>)` DBD lines (`dbFindLinkSup`,
+/// `dbJLink.c:262`): base registers `const`/`calc`/`state`/`debug`/`trace`
+/// (`links.dbd.pod:39,79,171,208,224`) and pvxs registers `pva`
+/// (`ioc/pvxs7x.dbd:2`). `ca` has no `link()` line anywhere — it is a port
+/// extension, kept because `.db` files in this workspace already use it.
+const PORTED_JSON_LINK_TYPES: &[&str] = &["const", "calc", "pva", "ca"];
+
+/// JSON link types epics-base registers that this port has not implemented.
+/// They are rejected like an unknown type — the point of rejecting at all is
+/// that a missing implementation must be visible rather than silently
+/// degrading into a PV-name link — but the diagnostic says which it is.
+const UNPORTED_C_JSON_LINK_TYPES: &[&str] = &["state", "debug", "trace"];
+
+/// What a link field's text is, read as a JSON link — the port's
+/// `dbJLinkParse` (`dbJLink.c:379-445`).
+///
+/// The three states exist because two of them used to be one. A single
+/// `Option` conflated "this text is not brace-delimited, try the other link
+/// syntaxes" with "this IS a JSON link and it is bad", so the second fell
+/// through `parse_link_field`'s remaining tests and came out as a PV link
+/// whose name was the JSON text — a channel that can never connect.
+pub enum JsonLinkParse {
+    /// Not brace-delimited: C's `dbParseLink` never calls `dbJLinkParse`
+    /// (`dbStaticLib.c:2280`), so the other link syntaxes still apply.
+    NotJson,
+    /// A JSON link this port serves.
+    Parsed(ParsedLink),
+    /// Brace-delimited and unusable. C stops the parse (`jlif_stop`), which
+    /// `dbJLinkParse` turns into `S_db_badField` and `dbParseLink` into
+    /// `S_dbLib_badField` — the field never loads. The string is the
+    /// diagnostic C's `dbJLinkInit` prints.
+    Rejected(String),
+}
+
+/// What the first map key of a brace-delimited link body is — C's `link_name`
+/// in `dbjl_map_key` (`dbJLink.c:260`), plus the two ways there isn't one.
+enum JsonLinkKey<'a> {
+    /// The link type name, unquoted and trimmed.
+    Named(&'a str),
+    /// An empty map. yajl parses `{}` without error, so `dbJLinkParse` returns
+    /// 0 with a NULL `product` and `dbParseLink` stores `JSON_LINK` with no
+    /// jlink (`dbStaticLib.c:2281-2285`) — a link that does nothing.
+    Empty,
+    /// Not JSON yajl would accept, so `dbJLinkParse` comes back
+    /// `yajl_status_error` → `S_db_badField` (`dbJLink.c:426-438`).
+    Malformed,
+}
+
+fn json_link_key(s: &str) -> JsonLinkKey<'_> {
+    let inner = s[1..s.len() - 1].trim();
+    if inner.is_empty() {
+        return JsonLinkKey::Empty;
+    }
+    let Some((key_raw, _)) = inner.split_once(':') else {
+        return JsonLinkKey::Malformed;
+    };
+    let key = key_raw.trim().trim_matches('"').trim_matches('\'');
+    if key.is_empty() {
+        JsonLinkKey::Malformed
+    } else {
+        JsonLinkKey::Named(key)
+    }
+}
+
+/// Read a link field's text as a JSON link — the single owner of "is this a
+/// JSON link, and is it usable".
+///
+/// C `dbParseLink` (`dbStaticLib.c:2280-2286`) treats ANY brace-delimited
+/// link text as JSON with no escape hatch, and hands it to `dbJLinkParse`;
+/// an unregistered first key is `errlogPrintf("dbJLinkInit: Link type '%s'
+/// not found")` plus `jlif_stop` (`dbJLink.c:262-268`), and a registered
+/// type whose own callbacks refuse the value stops the parse the same way.
+/// Both come back here as [`JsonLinkParse::Rejected`], so brace-delimited
+/// text never reaches PV-name parsing on any path.
+pub fn parse_json_link(s: &str) -> JsonLinkParse {
+    let s = s.trim();
+    if !s.starts_with('{') || !s.ends_with('}') || s.len() < 2 {
+        return JsonLinkParse::NotJson;
+    }
+    // Read the link type from the NORMALIZED text. A comment is whitespace in
+    // this dialect, so `{/*which*/calc:{…}}` names the type `calc`, but
+    // `json_link_key` splits on the first `:` and would take the comment as
+    // part of the key. Diagnostics below keep quoting the original `s`.
+    let normalized = match crate::json5::relaxed_to_strict(s) {
+        Ok(normalized) => normalized,
+        Err(e) => {
+            return JsonLinkParse::Rejected(format!("dbJLinkInit: {s} is not a JSON link — {e}"));
+        }
+    };
+    let key = match json_link_key(&normalized) {
+        JsonLinkKey::Named(key) => key,
+        JsonLinkKey::Empty => return JsonLinkParse::Parsed(ParsedLink::None),
+        JsonLinkKey::Malformed => {
+            return JsonLinkParse::Rejected(format!(
+                "dbJLinkInit: {s} is not a JSON link — no link type key"
+            ));
+        }
+    };
+    let lower = key.to_ascii_lowercase();
+    if UNPORTED_C_JSON_LINK_TYPES.contains(&lower.as_str()) {
+        return JsonLinkParse::Rejected(format!(
+            "dbJLinkInit: Link type '{key}' is registered by epics-base but not \
+             implemented by this port"
+        ));
+    }
+    if !PORTED_JSON_LINK_TYPES.contains(&lower.as_str()) {
+        return JsonLinkParse::Rejected(format!("dbJLinkInit: Link type '{key}' not found"));
+    }
+    // The body reader splits on `:` and matches barewords too, so it needs the
+    // same normalized text; `s` is kept only for the diagnostics below.
+    match try_parse_json_link_body(&normalized) {
+        Some(parsed) => JsonLinkParse::Parsed(parsed),
+        // DEVIATION, deliberate. A registered type whose jlif merely IGNORES a
+        // token it does not want (pvxs `pva_parse_integer` at
+        // `pvalink_jlif.cpp:123-141` logs and returns `jlif_continue`) loads in
+        // C as a link with no channel name. The port cannot build the link the
+        // text asked for, and the only other outcome reachable from here is the
+        // PV-name link this whole function exists to prevent, so it refuses and
+        // says which type refused.
+        None => JsonLinkParse::Rejected(format!(
+            "dbJLinkInit: Link type '{key}' rejected its value in {s}"
+        )),
+    }
+}
+
+/// C `dbParseLink`'s JSON arm as a validation gate: `Err` exactly when the
+/// text is a brace-delimited link C would refuse to load
+/// (`dbStaticLib.c:2281-2283` → `S_dbLib_badField`).
+pub fn check_json_link_text(text: &str) -> CaResult<()> {
+    match parse_json_link(text) {
+        JsonLinkParse::Rejected(msg) => Err(CaError::InvalidValue(msg)),
+        JsonLinkParse::NotJson | JsonLinkParse::Parsed(_) => Ok(()),
+    }
+}
+
+/// Read a link body that has ALREADY been through
+/// [`crate::json5::relaxed_to_strict`]. Every key here is quoted and every
+/// comment is gone, so the `:` split below is safe.
+fn try_parse_json_link_body(s: &str) -> Option<ParsedLink> {
     let s = s.trim();
     if !s.starts_with('{') || !s.ends_with('}') {
         return None;
@@ -936,49 +1108,87 @@ fn try_parse_json_link(s: &str) -> Option<ParsedLink> {
             }
         }
         "calc" => {
-            // Form: { calc: { expr: "...", args: ["pv1","pv2"], time: "A" } }
-            //   - expr (required, string)
-            //   - args (optional, JSON string array)
-            //   - time (optional, single uppercase letter A..L)
-            // We use serde_json for proper parsing — the previous
-            // permissive substring approach can't handle nested
-            // arrays / quoted commas reliably.
+            // C `lnkCalc_map_key` (`lnkCalc.c:247-296`) knows expr, args,
+            // prec, time, major, minor, units and out; this port reads expr,
+            // args and time.
             let body = rest.trim();
-            // Trim trailing brace-of-outer-object swallowed during the
-            // initial split. The body always starts with `{` and the
-            // outer brace was already stripped above.
-            let body_obj = if body.ends_with('}') {
-                body
-            } else {
-                return None;
-            };
-            let val: serde_json::Value = serde_json::from_str(body_obj).ok()?;
-            let obj = val.as_object()?;
-            let expr = obj.get("expr").and_then(|v| v.as_str())?.to_string();
-            let args: Vec<String> = obj
-                .get("args")
-                .and_then(|v| v.as_array())
-                .map(|a| {
-                    a.iter()
-                        .filter_map(|x| x.as_str().map(|s| s.to_string()))
-                        .collect()
-                })
-                .unwrap_or_default();
-            // 12 input cap — calc engine A..L map.
-            if args.len() > 12 {
+            if !body.ends_with('}') {
                 return None;
             }
-            let time_source = obj
-                .get("time")
-                .and_then(|v| v.as_str())
-                .and_then(|s| s.chars().next())
-                .filter(|c| ('A'..='L').contains(c));
+            // Already strict: `parse_json_link` normalized the whole text
+            // through `crate::json5` before dispatching here.
+            let val: serde_json::Value = serde_json::from_str(body).ok()?;
+            let obj = val.as_object()?;
+            // C `lnkCalc_end_map` (`lnkCalc.c:305-308`): an input link with
+            // no `expr` is `jlif_stop`.
+            let expr = obj.get("expr").and_then(|v| v.as_str())?.to_string();
+            let args = match obj.get("args") {
+                None => Vec::new(),
+                Some(v) => {
+                    let arr = v.as_array()?;
+                    // The limit is a refusal, not a truncation
+                    // (`lnkCalc.c:135-139`, `:155-159`, `:346-350` all
+                    // `jlif_stop`). C's own doc says "up to 24"
+                    // (`links.dbd.pod:131`) but A..U is 21 letters and
+                    // `postfix.h:29` defines 21, so the code wins.
+                    if arr.len() > crate::calc::CALC_NARGS {
+                        return None;
+                    }
+                    arr.iter().map(json_calc_arg).collect::<Option<Vec<_>>>()?
+                }
+            };
+            // C `lnkCalc_string` at `ps_time` (`lnkCalc.c:180-186`): exactly
+            // one character, `toupper`ed, in `'A' ..< 'A' + CALCPERFORM_NARGS`.
+            // Anything else is `jlif_stop` — an out-of-range letter refuses
+            // the link rather than silently dropping the timestamp source.
+            let time_source = match obj.get("time") {
+                None => None,
+                Some(v) => {
+                    let text = v.as_str()?;
+                    let mut chars = text.chars();
+                    let letter = chars.next()?.to_ascii_uppercase();
+                    if chars.next().is_some()
+                        || !letter.is_ascii_uppercase()
+                        || (letter as u8 - b'A') as usize >= crate::calc::CALC_NARGS
+                    {
+                        return None;
+                    }
+                    Some(letter)
+                }
+            };
             Some(ParsedLink::Calc(CalcLink {
                 expr,
                 args,
                 time_source,
             }))
         }
+        _ => None,
+    }
+}
+
+/// One `args` element: a numeric literal, or an embedded JSON link.
+///
+/// Embedded links go back through [`parse_json_link`], the single owner, so a
+/// nested unknown type is refused exactly as a top-level one is.
+fn json_calc_arg(v: &serde_json::Value) -> Option<CalcArg> {
+    match v {
+        serde_json::Value::Number(n) => Some(CalcArg::Literal(n.as_f64()?)),
+        serde_json::Value::Object(_) => match parse_json_link(&serde_json::to_string(v).ok()?) {
+            JsonLinkParse::Parsed(parsed) => Some(CalcArg::Link(Box::new(parsed))),
+            JsonLinkParse::NotJson | JsonLinkParse::Rejected(_) => None,
+        },
+        // DEVIATION, deliberate and pre-existing. C refuses a bare string
+        // here: `lnkCalc_string` reaches its `pstate < ps_expr || pstate >
+        // ps_minor` guard with `pstate == ps_args` and returns `jlif_stop`
+        // ("Unexpected string", `lnkCalc.c:187-190`), so `args:["pv1"]` does
+        // not load in a C IOC at all. This port has always documented and
+        // accepted it as shorthand for an embedded link, and in-tree
+        // databases use it; it is kept as a link slot like any other rather
+        // than as a third kind of argument.
+        serde_json::Value::String(name) => Some(CalcArg::Link(Box::new(parse_link_field(
+            name,
+            LinkFieldType::In,
+        )))),
         _ => None,
     }
 }
@@ -1322,8 +1532,15 @@ pub fn parse_link_field(s: &str, ftype: LinkFieldType) -> ParsedLink {
     let s = s.trim();
     // JSON-style links (epics-base PR #86) — try first so a leading
     // `{` is not mistaken for a leading-special record-name warning.
-    if let Some(parsed) = try_parse_json_link(s) {
-        return parsed;
+    match parse_json_link(s) {
+        JsonLinkParse::Parsed(parsed) => return parsed,
+        // C never builds a link out of JSON it could not resolve: the put
+        // fails and the field keeps its unset value. The load-time gate
+        // ([`check_json_link_text`]) is what reports it; leaving an unset
+        // link here is what keeps a dead PV-name link built from the raw JSON
+        // text out of every path that reaches this parser without the gate.
+        JsonLinkParse::Rejected(_) => return ParsedLink::None,
+        JsonLinkParse::NotJson => {}
     }
     // Hardware link (epics-base PR #213). `@` starts INST_IO; `#`
     // starts VME_IO. Everything else falls through to legacy parsing.
@@ -1702,8 +1919,11 @@ mod json_link_tests {
             ParsedLink::Pva("TARGET".to_string())
         );
 
-        // Rejected roots: a non-string, non-object value must never produce
-        // a PVA link (it falls through to legacy parsing instead).
+        // Rejected roots: a non-string, non-object value builds no link at
+        // all. It used to fall through to legacy parsing, which is how it
+        // came out as a PV-name link named after the JSON text; brace text
+        // no longer reaches that arm (`parse_json_link`), so the field is
+        // refused instead.
         for src in [
             r#"{pva: true}"#,
             r#"{pva: false}"#,
@@ -1711,12 +1931,10 @@ mod json_link_tests {
             r#"{pva: null}"#,
             r#"{pva: [1,2]}"#,
         ] {
-            assert!(
-                !matches!(
-                    parse_link_v2(src),
-                    ParsedLink::Pva(_) | ParsedLink::PvaJson(_)
-                ),
-                "non-string pva root must not become a PVA link: {src}"
+            assert_eq!(
+                parse_link_v2(src),
+                ParsedLink::None,
+                "non-string pva root must not become any link: {src}"
             );
         }
 
@@ -1728,9 +1946,10 @@ mod json_link_tests {
             r#"{ca: null}"#,
             r#"{ca: [1,2]}"#,
         ] {
-            assert!(
-                !matches!(parse_link_v2(src), ParsedLink::Ca(_)),
-                "non-string ca root must not become a CA link: {src}"
+            assert_eq!(
+                parse_link_v2(src),
+                ParsedLink::None,
+                "non-string ca root must not become any link: {src}"
             );
         }
     }
@@ -1830,11 +2049,50 @@ mod json_link_tests {
         assert_eq!(link_field_type(r#"{ca: { pv: "REMOTE" }}"#), LinkType::Ca);
     }
 
+    /// BOUNDARY: a comment inside a `.db` link body. `yajl_alloc` sets
+    /// `yajl_allow_comments` (`yajl.c:77`) and `dbJLinkParse` never clears it,
+    /// so a link body may carry one anywhere whitespace is legal. Measured
+    /// against base's own yajl compiled standalone: `{expr:"A*B" /* c */}`
+    /// parses.
+    #[test]
+    fn a_comment_inside_a_link_body_parses() {
+        let JsonLinkParse::Parsed(ParsedLink::Calc(link)) =
+            parse_json_link(r#"{calc: {expr:"A*B" /* the product */, args:[2, 3]}}"#)
+        else {
+            panic!("a comment in a link body must not stop the parse");
+        };
+        assert_eq!(link.expr, "A*B");
+        assert_eq!(link.args.len(), 2);
+    }
+
+    /// BOUNDARY: a comment BEFORE the link-type key. The key reader splits on
+    /// the first `:`, so an unstripped comment used to become part of the type
+    /// name and the link was refused as an unknown type.
+    #[test]
+    fn a_comment_before_the_link_type_key_parses() {
+        let JsonLinkParse::Parsed(ParsedLink::Calc(link)) =
+            parse_json_link(r#"{/* which */ calc: {expr:"A+1"}}"#)
+        else {
+            panic!("a comment before the link type must not stop the parse");
+        };
+        assert_eq!(link.expr, "A+1");
+    }
+
+    /// BOUNDARY: an unterminated `/*` in a link body is refused, not silently
+    /// stripped to EOF.
+    #[test]
+    fn an_unterminated_comment_in_a_link_body_is_rejected() {
+        assert!(matches!(
+            parse_json_link(r#"{calc: {expr:"A*B" /* never closed }}"#),
+            JsonLinkParse::Rejected(_)
+        ));
+    }
+
     #[test]
     fn link_type_hw_and_calc_are_other() {
         assert_eq!(link_field_type("@dev 0 IN"), LinkType::Other);
         assert_eq!(link_field_type("#C0 S2"), LinkType::Other);
-        // calc link uses strict JSON (quoted keys) — serde_json parse.
+        // Link bodies are JSON5; strict JSON is the subset that also parses.
         assert_eq!(
             link_field_type(r#"{calc: {"expr": "A+1", "args": ["pv1"]}}"#),
             LinkType::Other

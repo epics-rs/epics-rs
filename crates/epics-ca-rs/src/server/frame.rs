@@ -193,7 +193,7 @@ impl FrameBuf {
 
     /// Read-only view of the payload written so far — for callers that must
     /// inspect the encoded bytes (C `read_action`'s `epicsStrnLen` scan of a
-    /// scalar DBR_STRING slot, `camessage.c:666-680`).
+    /// scalar DBR_STRING slot, `camessage.c:674-687`).
     pub(crate) fn payload(&self) -> &[u8] {
         &self.buf[HDR_RESERVE..]
     }

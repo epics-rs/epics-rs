@@ -678,7 +678,9 @@ impl<'a> Tokenizer<'a> {
     }
 
     fn skip_whitespace(&mut self) {
-        while self.pos < self.input.len() && self.input[self.pos].is_ascii_whitespace() {
+        while self.pos < self.input.len()
+            && crate::runtime::stdlib::c_isspace(self.input[self.pos] as char)
+        {
             self.pos += 1;
         }
     }

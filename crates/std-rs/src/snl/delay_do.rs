@@ -104,7 +104,7 @@ impl Default for DelayDoController {
 impl DelayDoController {
     pub fn new(delay_secs: f64) -> Self {
         Self {
-            delay_period: Duration::from_secs_f64(delay_secs),
+            delay_period: epics_base_rs::runtime::time::duration_from_secs(delay_secs),
             ..Default::default()
         }
     }

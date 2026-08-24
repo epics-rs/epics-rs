@@ -101,6 +101,12 @@ impl Record for SubRecord {
         "sub"
     }
 
+    /// `subRecord.c:198-204` `get_linkNumber` — same shape as `calc`'s over
+    /// `INP_ARG_MAX` (`subRecord.c:89`), also 21.
+    fn link_backed_metadata_field(&self, field: &str) -> Option<String> {
+        crate::server::record::calc_class_link_backed_metadata_field(field)
+    }
+
     fn init_record(&mut self, pass: u8) -> CaResult<()> {
         if pass == 0 {
             // C `subRecord.c::init_record` (lines 130-132) seeds the
@@ -115,15 +121,27 @@ impl Record for SubRecord {
 
     /// C `subRecord.c:119-123`: an empty `SNAM` names no subroutine, so
     /// `init_record` prints `"%s.SNAM is empty"`, sets `prec->pact = TRUE` and
-    /// returns 0 — the record serves its fields forever and never processes
-    /// again. Measured: `caget -t P:SUB.PACT` on a bare `record(sub,"P:SUB"){}`
-    /// reads 1.
+    /// returns 0 — the record serves its fields but `dbProcess` takes the
+    /// PACT-active branch on every scan. Measured: `caget -t P:SUB.PACT` on a
+    /// bare `record(sub,"P:SUB"){}` reads 1.
+    ///
+    /// The park is NOT permanent, which is what `subRecord.c::special`
+    /// (`:180-200`) exists for: `caput P:SUB.SNAM mySub` releases it and the
+    /// record runs, `caput P:SUB.SNAM ""` parks a running one. Both directions
+    /// fall out of this predicate — the framework re-asks it either side of a
+    /// put to [`Record::pact_park_fields`].
     ///
     /// The non-empty-but-unregistered case is NOT this one: C returns
-    /// `S_db_BadSub` there (`:125-129`), which is an init FAILURE, not a PACT
-    /// park.
-    fn init_record_parks_pact(&self) -> bool {
+    /// `S_db_BadSub` there (`:125-129`, and again from `special`), which is a
+    /// refused put, not a PACT park.
+    fn parks_pact(&self) -> bool {
         self.snam.is_empty()
+    }
+
+    /// `subRecord.dbd.pod` marks `SNAM` `special(SPC_MOD)` and nothing else that
+    /// bears on the park, so SNAM is the whole set.
+    fn pact_park_fields(&self) -> &'static [&'static str] {
+        &["SNAM"]
     }
 
     fn process(&mut self) -> CaResult<ProcessOutcome> {
@@ -159,7 +177,7 @@ impl Record for SubRecord {
     /// via `registryFunctionFind` and returns `S_db_BadSub` for a non-empty
     /// unregistered name — sub has no LFLG, so every SNAM put is validated. The
     /// empty-name case is accepted (C parks PACT instead; see
-    /// [`Self::init_record_parks_pact`]). The registry lookup itself is
+    /// [`Self::parks_pact`]). The registry lookup itself is
     /// performed by the put owner; see [`Record::is_subroutine_name_field`].
     fn is_subroutine_name_field(&self, field: &str) -> bool {
         field == "SNAM"

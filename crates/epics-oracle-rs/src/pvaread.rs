@@ -90,6 +90,7 @@ use std::path::{Path, PathBuf};
 
 use crate::allowlist::{Allowlist, MatchContext};
 use crate::catool::ToolError;
+use crate::dbd::DbfType;
 use crate::diff::Verdict;
 use crate::ioc::{Ioc, PvaPair, PvxTools, Side};
 use crate::ntshape::NtShape;
@@ -467,6 +468,9 @@ pub(crate) fn first_differing_lines(c: &str, r: &str) -> Vec<String> {
 pub struct ChannelRef {
     pub record_type: String,
     pub field: String,
+    /// The field's declared `.dbd` type, carried so an allowlist row scoped by
+    /// destination type is enforced here exactly as on the CA path.
+    pub dbf: DbfType,
     pub pv: String,
     /// The shape the `.dbd` entails for this channel.
     pub expected_shape: Option<NtShape>,
@@ -566,6 +570,7 @@ fn probe_type(
         .map(|f| ChannelRef {
             record_type: record_type.to_string(),
             field: f.field.name.clone(),
+            dbf: f.field.dbf,
             pv: f.pv(&rec),
             expected_shape: NtShape::expected(&f.field),
             db: db_text.clone(),
@@ -695,6 +700,7 @@ pub fn adjudicate(
     let ctx = MatchContext {
         record_type: &ch.record_type,
         field: &ch.field,
+        dbf: ch.dbf,
         class: None,
     };
     // Tell the allowlist what this case looked at BEFORE the agreed early-out,
@@ -839,7 +845,7 @@ fn errored_cases(refs: &[ChannelRef], msg: &str) -> Vec<PvaCase> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::dbd::{DbfType, FieldDef};
+    use crate::dbd::FieldDef;
 
     fn terr(side: Side, tool: &str) -> ToolError {
         ToolError {
@@ -863,6 +869,7 @@ mod tests {
         ChannelRef {
             record_type: "ai".into(),
             field: val.name.clone(),
+            dbf: val.dbf,
             pv: "ORACLE:AI.VAL".into(),
             expected_shape: NtShape::expected(&val),
             db: "record(ai, \"ORACLE:AI\") {}".into(),
@@ -1152,6 +1159,7 @@ mod tests {
         ChannelRef {
             record_type: "bo".into(),
             field: "HIGH".into(),
+            dbf: DbfType::Double,
             pv: "ORACLE:BO.HIGH".into(),
             expected_shape: None,
             db: "record(bo, \"ORACLE:BO\") {}".into(),

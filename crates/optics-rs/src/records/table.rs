@@ -10,8 +10,10 @@ use std::f64::consts::PI;
 
 use super::dbd_generated;
 use epics_base_rs::error::{CaError, CaResult};
+use epics_base_rs::server::database::AsyncDbHandle;
 use epics_base_rs::server::record::{
-    FieldDeclaration, FieldDesc, FieldMetadataOverride, ProcessAction, ProcessOutcome, Record,
+    FieldDeclaration, FieldDesc, FieldMetadataOverride, OutTarget, ProcessAction, ProcessOutcome,
+    Record,
 };
 use epics_base_rs::types::{EpicsValue, PvString};
 
@@ -156,6 +158,105 @@ struct LinkStatus {
     can_read_position: bool,
     can_read_limits: bool,
     can_rw_speed: bool,
+}
+
+/// One link's resolved kind — C `plink->type` plus `dbCaIsLinkConnected`,
+/// the only two things `checkLinks` (tableRecord.c:2318-2352) ever asks a
+/// link. The link's TEXT answers neither: `dbLink.c:118-130` turns a name no
+/// record on this IOC carries into a permanently unconnected `CA_LINK`, and a
+/// `CONSTANT` link is a non-empty string.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+enum LinkKind {
+    /// C `CONSTANT`: no target to read or write. An empty link, a literal
+    /// value, and — because the record can do nothing with either — a link
+    /// this IOC cannot address at all.
+    #[default]
+    Constant,
+    /// C `DB_LINK`: a field of a record on this IOC.
+    Db,
+    /// C `CA_LINK` with `dbCaIsLinkConnected() == 1`.
+    CaConnected,
+    /// C `CA_LINK` with `dbCaIsLinkConnected() == 0`.
+    CaDisconnected,
+}
+
+impl LinkKind {
+    /// Read the kind out of the framework's own link resolution
+    /// (`PvDatabase::resolve_out_target`), which is the port's single owner of
+    /// this question. `is_ca_link` is C's `dbInitLink` locality test, and
+    /// `field_type` is `Some` only for a target the IOC can address right now
+    /// — so an external link with no cached value is exactly C's
+    /// `dbCaIsLinkConnected() == 0`.
+    fn from_target(target: &OutTarget) -> Self {
+        match (target.is_ca_link, target.field_type.is_some()) {
+            (true, true) => LinkKind::CaConnected,
+            (true, false) => LinkKind::CaDisconnected,
+            (false, true) => LinkKind::Db,
+            (false, false) => LinkKind::Constant,
+        }
+    }
+}
+
+/// Index of each link group in [`TableRecord::link_kinds`], in the order C
+/// `checkLinks` declares them (tableRecord.c:2306-2311).
+const LK_DRIVE: usize = 0;
+const LK_RBV: usize = 1;
+const LK_SPD_OUT: usize = 2;
+const LK_SPD_IN: usize = 3;
+const LK_ENC: usize = 4;
+const LK_HLM: usize = 5;
+const LK_LLM: usize = 6;
+
+/// The seven links per axis whose kind `check_links` reads, grouped by the
+/// `LK_*` indices. Also the list the record asks the framework to resolve
+/// before every `process()`.
+const CHECKED_LINKS: [[&str; 6]; 7] = [
+    MOTOR_DRIVE_LINK,
+    MOTOR_RBV_LINK,
+    SPEED_OUT_LINK,
+    SPEED_IN_LINK,
+    ENCODER_LINK,
+    HI_LIMIT_LINK,
+    LO_LIMIT_LINK,
+];
+
+/// Locate a link field in [`CHECKED_LINKS`].
+fn checked_link_slot(link_field: &str) -> Option<(usize, usize)> {
+    CHECKED_LINKS
+        .iter()
+        .enumerate()
+        .find_map(|(group, fields)| {
+            fields
+                .iter()
+                .position(|f| *f == link_field)
+                .map(|axis| (group, axis))
+        })
+}
+
+/// C `checkLinks`'s two-link test, statement for statement
+/// (tableRecord.c:2320-2325 and its two copies for `hl`/`ll` and `vl`/`vi`).
+///
+/// The middle statement ASSIGNS rather than clears, so a connected CA primary
+/// re-enables the pair even after a `CONSTANT` partner cleared it. That is C's
+/// ordering and it is reproduced deliberately: the port would otherwise report
+/// a five-motor table differently from the IOC it is replacing.
+fn pair_usable(primary: LinkKind, partner: LinkKind) -> bool {
+    let mut usable = true;
+    if primary == LinkKind::Constant || partner == LinkKind::Constant {
+        usable = false;
+    }
+    if matches!(primary, LinkKind::CaConnected | LinkKind::CaDisconnected) {
+        usable = primary == LinkKind::CaConnected;
+    }
+    if partner == LinkKind::CaDisconnected {
+        usable = false;
+    }
+    usable
+}
+
+/// C `checkLinks`'s one-link test for the encoder link (tableRecord.c:2338-2342).
+fn single_usable(link: LinkKind) -> bool {
+    matches!(link, LinkKind::Db | LinkKind::CaConnected)
 }
 
 // ---------------------------------------------------------------------------
@@ -420,6 +521,14 @@ pub struct TableRecord {
     // --- Internal: link status ---
     lnk_stat: [LinkStatus; 6],
 
+    // --- Internal: resolved kind of every link in `CHECKED_LINKS` ---
+    // Written only from a framework resolution (`set_resolved_out_target` per
+    // cycle, `seed_link_kinds` at init); `check_links` is its only reader.
+    link_kinds: [[LinkKind; 6]; 7],
+
+    // --- Internal: this record's name and database handle ---
+    async_ctx: Option<(String, AsyncDbHandle)>,
+
     // --- Internal: previous angle unit (for conversion) ---
     curr_aunit: AngleUnit,
 
@@ -609,6 +718,8 @@ impl Default for TableRecord {
             a: [[0.0; 3]; 3],
             b: [[0.0; 3]; 3],
             lnk_stat: [LinkStatus::default(); 6],
+            link_kinds: [[LinkKind::Constant; 6]; 7],
+            async_ctx: None,
             curr_aunit: AngleUnit::Degrees,
             curr_yang: 0.0,
         }
@@ -2111,35 +2222,51 @@ impl TableRecord {
         actions
     }
 
-    /// Determine link status by checking if link fields are non-empty.
+    /// C `checkLinks` (tableRecord.c:2306-2352) — which axes the table may
+    /// drive, read, limit-check and re-speed this cycle.
+    ///
+    /// Reads only [`Self::link_kinds`]: the answer is the link's KIND, and a
+    /// link's text cannot supply it. `table.db:145-156` declares a five-motor
+    /// table by leaving the sixth axis's macro empty, which still expands to
+    /// link TEXT, and `dbLink.c:118-130` makes a name no local record carries
+    /// a `CA_LINK` that never connects — so both of C's "this axis is not
+    /// there" cases are non-empty strings.
     fn check_links(&mut self) {
-        let drive_links = [
-            &self.m0xl, &self.m0yl, &self.m1yl, &self.m2xl, &self.m2yl, &self.m2zl,
-        ];
-        let rbv_links = [
-            &self.r0xi, &self.r0yi, &self.r1yi, &self.r2xi, &self.r2yi, &self.r2zi,
-        ];
-        let enc_links = [
-            &self.e0xi, &self.e0yi, &self.e1yi, &self.e2xi, &self.e2yi, &self.e2zi,
-        ];
-        let spd_out = [
-            &self.v0xl, &self.v0yl, &self.v1yl, &self.v2xl, &self.v2yl, &self.v2zl,
-        ];
-        let spd_in = [
-            &self.v0xi, &self.v0yi, &self.v1yi, &self.v2xi, &self.v2yi, &self.v2zi,
-        ];
-        let hlm_links = [
-            &self.h0xl, &self.h0yl, &self.h1yl, &self.h2xl, &self.h2yl, &self.h2zl,
-        ];
-        let llm_links = [
-            &self.l0xl, &self.l0yl, &self.l1yl, &self.l2xl, &self.l2yl, &self.l2zl,
-        ];
+        let k = self.link_kinds;
+        for (i, stat) in self.lnk_stat.iter_mut().enumerate() {
+            stat.can_rw_drive = pair_usable(k[LK_DRIVE][i], k[LK_RBV][i]);
+            stat.can_read_limits = pair_usable(k[LK_HLM][i], k[LK_LLM][i]);
+            stat.can_read_position = single_usable(k[LK_ENC][i]);
+            stat.can_rw_speed = pair_usable(k[LK_SPD_OUT][i], k[LK_SPD_IN][i]);
+        }
+    }
 
-        for i in 0..6 {
-            self.lnk_stat[i].can_rw_drive = !drive_links[i].is_empty() && !rbv_links[i].is_empty();
-            self.lnk_stat[i].can_read_limits = !hlm_links[i].is_empty() && !llm_links[i].is_empty();
-            self.lnk_stat[i].can_read_position = !enc_links[i].is_empty();
-            self.lnk_stat[i].can_rw_speed = !spd_out[i].is_empty() && !spd_in[i].is_empty();
+    /// Classify every checked link from the local database, for the one call
+    /// of `check_links` the framework cannot resolve links for: `init_record`.
+    ///
+    /// C runs its `init_record` `checkLinks` (tableRecord.c:383) at `iocInit`,
+    /// with `dbInitLink` done and no CA channel connected yet. The port runs
+    /// `init_record` at record CREATION instead, so only records already
+    /// loaded are addressable here; a motor loaded after the table classifies
+    /// `Constant` until the first `process()` resolves it properly. `Constant`
+    /// and `CaDisconnected` are indistinguishable in every arm of C's test, so
+    /// collapsing the unaddressable cases into `Constant` costs nothing.
+    fn seed_link_kinds(&mut self) {
+        let Some((_, handle)) = &self.async_ctx else {
+            return;
+        };
+        for (group, fields) in CHECKED_LINKS.iter().enumerate() {
+            for (axis, field) in fields.iter().enumerate() {
+                let link = match self.get_field(field) {
+                    Some(EpicsValue::String(s)) => s.as_str_lossy().into_owned(),
+                    _ => String::new(),
+                };
+                self.link_kinds[group][axis] = if handle.link_target_field_type(&link).is_some() {
+                    LinkKind::Db
+                } else {
+                    LinkKind::Constant
+                };
+            }
         }
     }
 
@@ -2236,6 +2363,16 @@ const TABLE_ANGULAR_UNIT_FIELDS: &[&str] = &[
 impl Record for TableRecord {
     fn record_type(&self) -> &'static str {
         "table"
+    }
+
+    fn set_async_context(&mut self, name: String, db: AsyncDbHandle) {
+        self.async_ctx = Some((name, db));
+    }
+
+    fn set_resolved_out_target(&mut self, link_field: &str, target: OutTarget) {
+        if let Some((group, axis)) = checked_link_slot(link_field) {
+            self.link_kinds[group][axis] = LinkKind::from_target(&target);
+        }
     }
 
     fn process(&mut self) -> CaResult<ProcessOutcome> {
@@ -2424,6 +2561,17 @@ impl Record for TableRecord {
         Ok(ProcessOutcome::complete_with(actions))
     }
 
+    /// Also where every link `check_links` classifies is resolved.
+    ///
+    /// C reads `plink->type` and `dbCaIsLinkConnected` inline at the top of
+    /// `process` (tableRecord.c:439) because the link struct carries both
+    /// already. The port has to ask the database for them, and resolving a
+    /// link takes the TARGET record's lock while `process()` runs under this
+    /// record's — so the question is asked here, where the framework answers
+    /// it with no lock held and hands the answers back through
+    /// `set_resolved_out_target`. The read actions below are still chosen from
+    /// the PREVIOUS cycle's `lnk_stat`, so a link that changes kind mid-run
+    /// starts or stops being read one cycle after C would.
     fn pre_process_actions(&mut self) -> Vec<ProcessAction> {
         // C GetMotorLimits zeroes h0x[i]/l0x[i] whenever the limit read fails
         // (tableRecord.c:1024-1031), so a stale prior value never survives a
@@ -2443,7 +2591,12 @@ impl Record for TableRecord {
         self.set_hi_motor_limit(&hm);
         self.set_lo_motor_limit(&lm);
 
-        let mut actions = Vec::new();
+        let mut actions: Vec<ProcessAction> = CHECKED_LINKS
+            .iter()
+            .flatten()
+            .copied()
+            .map(|link_field| ProcessAction::ResolveOutTarget { link_field })
+            .collect();
         actions.extend(self.build_read_rbv_actions());
         actions.extend(self.build_read_encoder_actions());
         actions.extend(self.build_read_limit_actions());
@@ -2623,6 +2776,23 @@ impl Record for TableRecord {
             "GEOM" => Some(EpicsValue::Enum(self.geom as u16)),
             "TORAD" => Some(EpicsValue::Double(self.torad)),
             "AUNIT" => Some(EpicsValue::Enum(self.aunit as u16)),
+            // The eight `special(SPC_DBADDR)` fields. `tableRecord.dbd`
+            // declares each `DBF_NOACCESS` and C's `cvt_dbaddr`
+            // (`tableRecord.c:727-745`) supplies the real channel: the two
+            // matrices flatten row-major to nine `DBF_DOUBLE` elements
+            // (`paddr->pfield = ptbl->a[0]`, `no_elements = 9`) and each
+            // pivot point serves three. Serving the array here IS the
+            // redirect — an array `EpicsValue` already carries the element
+            // type `cvt_dbaddr` sets and the count it reports, so no
+            // separate `Special::DbAddr` path is needed for the value.
+            "A" => Some(EpicsValue::DoubleArray(self.a.concat())),
+            "B" => Some(EpicsValue::DoubleArray(self.b.concat())),
+            "PP0" => Some(EpicsValue::DoubleArray(self.pp0.to_vec())),
+            "PP1" => Some(EpicsValue::DoubleArray(self.pp1.to_vec())),
+            "PP2" => Some(EpicsValue::DoubleArray(self.pp2.to_vec())),
+            "PPO0" => Some(EpicsValue::DoubleArray(self.ppo0.to_vec())),
+            "PPO1" => Some(EpicsValue::DoubleArray(self.ppo1.to_vec())),
+            "PPO2" => Some(EpicsValue::DoubleArray(self.ppo2.to_vec())),
             _ => None,
         }
     }
@@ -3106,6 +3276,7 @@ impl Record for TableRecord {
         }
 
         // Pass 1: check links, read initial motor values
+        self.seed_link_kinds();
         self.check_links();
 
         // Read motors and set initial user-coordinate values
@@ -5189,5 +5360,48 @@ mod menu_choice_tests {
         );
         assert_eq!(menu("AUNIT"), Some(&["degrees", "ur"][..]));
         assert_eq!(menu("VAL"), None);
+    }
+}
+
+#[cfg(test)]
+mod rset_routing_tests {
+    use super::TableRecord;
+    use epics_base_rs::server::record::RecordInstance;
+
+    /// `tableRecord.c:778-792` / `:795-810` list ONE window — the six user
+    /// coordinates `AX`..`Z`, answered from `hlax[i]`/`llax[i]` — and hand
+    /// every other field to `recGblGetGraphicDouble` /
+    /// `recGblGetControlDouble`. `VAL` is not in that window, so C serves it
+    /// the DBF_DOUBLE type range (`recGbl.c:55` `getMaxRangeValues`), and the
+    /// port served the record-level cache instead — which `table` never
+    /// populates, so the wire carried 0/0 on a channel that declares both
+    /// leaves.
+    #[test]
+    fn table_val_takes_the_recgbl_range_not_an_empty_cache() {
+        let inst = RecordInstance::new("TBL:LIM".into(), TableRecord::new());
+        let snap = inst.snapshot_for_field("VAL").unwrap();
+
+        assert!(
+            snap.properties.graphic_double && snap.properties.control_double,
+            "table declares both slots (tableRecord.c:175-182 NULLs only \
+             get_enum_str and get_alarm_double)"
+        );
+        assert_eq!(snap.display_limits(), Some((-1e300, 1e300)));
+        assert_eq!(snap.control_limits(), Some((-1e300, 1e300)));
+    }
+
+    /// The window itself keeps answering from the record, through
+    /// `field_metadata_override` — the routing change must not cost `AX` its
+    /// limits.
+    #[test]
+    fn table_coordinate_window_keeps_its_own_limits() {
+        let mut rec = TableRecord::new();
+        rec.set_calc_hi_limit(&[1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
+        rec.set_calc_lo_limit(&[-1.0, -2.0, -3.0, -4.0, -5.0, -6.0]);
+        let inst = RecordInstance::new("TBL:LIM".into(), rec);
+
+        let snap = inst.snapshot_for_field("AX").unwrap();
+        assert_eq!(snap.display_limits(), Some((-1.0, 1.0)));
+        assert_eq!(snap.control_limits(), Some((-1.0, 1.0)));
     }
 }

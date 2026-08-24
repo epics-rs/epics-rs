@@ -76,6 +76,13 @@ pub(crate) const BIT_NAMES: [&str; 32] = [
 ];
 
 impl Record for MbbiDirectRecord {
+    /// C `mbbiDirectRecord.c:128` — `prec->mlst = prec->val`, the whole of this
+    /// record's init tail. MLST is `special(SPC_NOMOD)` so it has no `put_field`
+    /// arm for the trait default to go through; the record seeds its own cell.
+    fn seed_deadband_tracking(&mut self) {
+        self.mlst = self.val;
+    }
+
     fn record_type(&self) -> &'static str {
         "mbbiDirect"
     }
@@ -125,6 +132,21 @@ impl Record for MbbiDirectRecord {
         Some(self.value_changed)
     }
 
+    /// C `mbbiDirectRecord.c:168-169` raises UDF with the literal `INVALID_ALARM`, not
+    /// `prec->udfs`:
+    ///
+    /// ```c
+    /// if (prec->udf)
+    ///     recGblSetSevr(prec, UDF_ALARM, INVALID_ALARM);
+    /// ```
+    ///
+    /// so `UDFS` cannot weaken or silence this record's UDF alarm. `mbboDirect`, the other half of the Direct pair, passes
+    /// `prec->udfs` (`mbboDirectRecord.c:191`), and so does `mbbi`
+    /// (`mbbiRecord.c:302`) — the split is per-record, not per-family.
+    fn udf_alarm_severity(&self) -> Option<crate::server::record::AlarmSeverity> {
+        Some(crate::server::record::AlarmSeverity::Invalid)
+    }
+
     fn init_record(&mut self, pass: u8) -> CaResult<()> {
         if pass == 0 {
             // C `mbbiDirectRecord.c::init_record` — MASK from NOBT,
@@ -141,10 +163,21 @@ impl Record for MbbiDirectRecord {
 
     fn process(&mut self) -> CaResult<ProcessOutcome> {
         if !self.skip_convert {
+            // C `mbbiDirectRecord.c:155-163` is the whole convert:
+            //
+            //     epicsUInt32 rval = prec->rval;
+            //     if (prec->shft > 0) rval >>= prec->shft;
+            //     prec->val = rval;
+            //
+            // MASK is not read. It belongs to device support, which positions
+            // it (`prec->mask <<= prec->shft`, devMbbiDirectSoftRaw.c:48) and
+            // applies it to RVAL before the record ever sees it (`:55`), or —
+            // under asyn — overwrites MASK with the driver's already-positioned
+            // hardware mask (devAsynUInt32Digital.c:1008-1009). Masking here
+            // with the record's own UNSHIFTED NOBT mask destroyed the value it
+            // was meant to protect: NOBT=4 SHFT=4 RVAL=240 gives `240 & 0x0F`
+            // = 0 instead of 15.
             let mut raw = self.rval;
-            if self.mask != 0 {
-                raw &= self.mask;
-            }
             if self.shft > 0 {
                 // Same defect family as mbbi/mbbo: a CA-written SHFT
                 // >= 32 panics a bare `>>` in debug builds. `checked_shr`

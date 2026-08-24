@@ -1,26 +1,21 @@
 //! `decimate` — N-to-1 event decimator (epics-base 3.15.7 channel filters).
 //!
-//! Passes every Nth value event; the rest are silently dropped. The
-//! offset (`offset`, default 0) controls which member of each `N`-sized
-//! window is forwarded:
+//! Passes the first value event of each `N`-sized window and silently
+//! drops the rest — C `decimate.c:58-77`, whose counter starts at 0 and
+//! forwards on `i++ == 0`.
 //!
-//! * `offset = 0` (default) — first event of each window.
-//! * `offset = N-1` — last event of each window (acts like an
-//!   "every-N" trigger).
-//!
-//! pvxs JSON syntax: `PV.{"dec":{"n":N,"offset":K}}`.
+//! JSON syntax: `PV.{"dec":{"n":N}}`. `n` is the only key `decimate.c`'s
+//! `chfPluginArgDef opts[]` defines, so any other key fails channel
+//! creation at the parser's `parse_map_key` stage.
 //!
 //! Per epics-base `decimate.c` only `DBE_PROPERTY` events bypass the
 //! decimator (`if (pfl->mask & DBE_PROPERTY) return pfl`). `DBE_ALARM`
 //! emissions DO consume a slot and may be dropped — the 446e0d4a
-//! "alarm always passes" rule is dbnd-specific. The Rust `offset`
-//! parameter is a Rust extension (C `decimate.c` only accepts `n`).
+//! "alarm always passes" rule is dbnd-specific.
 //!
-//! C `parse_ok` rejects `n < 1` outright; we clamp to 1 (no
-//! decimation) to keep client subscriptions alive rather than tearing
-//! them down on a bad config. The decimator stores its position
-//! counter inside a small `Mutex<u64>` so the same filter handle can
-//! be shared between subscribers without ABA hazards on the counter.
+//! The decimator stores its position counter inside a small `Mutex<u64>`
+//! so the same filter handle can be shared between subscribers without
+//! ABA hazards on the counter.
 
 use parking_lot::Mutex;
 
@@ -29,24 +24,20 @@ use crate::server::recgbl::EventMask;
 
 pub struct DecimateFilter {
     n: u64,
-    offset: u64,
     counter: Mutex<u64>,
 }
 
 impl DecimateFilter {
-    pub fn new(n: u64, offset: u64) -> Self {
-        let n = n.max(1);
-        let offset = offset % n;
-        Self {
+    /// `None` for `n < 1`: that is `decimate.c`'s own `parse_ok`
+    /// (`decimate.c:49-56`, `return -1`), which `chfPlugin` turns into
+    /// `parse_stop` and `dbChannelCreate` into a channel-creation
+    /// failure. Answering `None` from the constructor is what keeps a
+    /// caller from clamping the illegal value into a legal one instead.
+    pub fn new(n: u64) -> Option<Self> {
+        (n >= 1).then(|| Self {
             n,
-            offset,
             counter: Mutex::new(0),
-        }
-    }
-
-    /// Convenience: pass every Nth event starting from the first.
-    pub fn every(n: u64) -> Self {
-        Self::new(n, 0)
+        })
     }
 }
 
@@ -67,11 +58,7 @@ impl SubscriptionFilter for DecimateFilter {
         let mut counter = self.counter.lock();
         let position = *counter % self.n;
         *counter = counter.wrapping_add(1);
-        if position == self.offset {
-            Some(event)
-        } else {
-            None
-        }
+        if position == 0 { Some(event) } else { None }
     }
 }
 
@@ -96,10 +83,10 @@ mod tests {
         })
     }
 
-    /// `every(3)` passes the 1st, 4th, 7th, ...
+    /// `n=3` passes the 1st, 4th, 7th, ...
     #[test]
     fn every_n_passes_first_of_each_window() {
-        let f = DecimateFilter::every(3);
+        let f = DecimateFilter::new(3).unwrap();
         let kept: Vec<bool> = (0..7)
             .map(|i| f.apply(ev(i as f64, EventMask::VALUE)).is_some())
             .collect();
@@ -109,29 +96,17 @@ mod tests {
     /// `n=1` is a pass-through.
     #[test]
     fn n_of_one_passes_everything() {
-        let f = DecimateFilter::every(1);
+        let f = DecimateFilter::new(1).unwrap();
         for i in 0..5 {
             assert!(f.apply(ev(i as f64, EventMask::VALUE)).is_some());
         }
     }
 
-    /// `n=0` clamps to 1 (no decimation).
+    /// `n=0` is rejected, not clamped — C `decimate.c`'s `parse_ok`
+    /// returns -1 and the channel is never created.
     #[test]
-    fn n_of_zero_clamps_to_one() {
-        let f = DecimateFilter::new(0, 0);
-        for i in 0..3 {
-            assert!(f.apply(ev(i as f64, EventMask::VALUE)).is_some());
-        }
-    }
-
-    /// `offset = N-1` shifts the window so the LAST of each window passes.
-    #[test]
-    fn offset_picks_last_of_window() {
-        let f = DecimateFilter::new(3, 2);
-        let kept: Vec<bool> = (0..6)
-            .map(|i| f.apply(ev(i as f64, EventMask::VALUE)).is_some())
-            .collect();
-        assert_eq!(kept, vec![false, false, true, false, false, true]);
+    fn n_of_zero_is_rejected() {
+        assert!(DecimateFilter::new(0).is_none());
     }
 
     /// `DBE_PROPERTY` events bypass the decimator unconditionally
@@ -139,7 +114,7 @@ mod tests {
     /// return pfl` short-circuit.
     #[test]
     fn property_bypasses_decimator() {
-        let f = DecimateFilter::every(3);
+        let f = DecimateFilter::new(3).unwrap();
         assert!(f.apply(ev(0.0, EventMask::VALUE)).is_some()); // 1st VALUE: pass
         // PROPERTY events pass without consuming a slot.
         assert!(f.apply(ev(0.0, EventMask::PROPERTY)).is_some());
@@ -156,7 +131,7 @@ mod tests {
     /// position 1 of a `every(3)` window is dropped, not bypassed.
     #[test]
     fn alarm_consumes_a_slot() {
-        let f = DecimateFilter::every(3);
+        let f = DecimateFilter::new(3).unwrap();
         assert!(f.apply(ev(0.0, EventMask::VALUE)).is_some()); // pos 0 — pass
         // pos 1 — ALARM gets DROPPED (counter advances).
         assert!(f.apply(ev(0.0, EventMask::ALARM)).is_none());
@@ -164,15 +139,5 @@ mod tests {
         assert!(f.apply(ev(1.0, EventMask::VALUE)).is_none());
         // pos 3 ≡ 0 — pass.
         assert!(f.apply(ev(2.0, EventMask::VALUE)).is_some());
-    }
-
-    /// `offset >= n` is folded into the valid range modulo n.
-    #[test]
-    fn offset_modulo_n() {
-        let f = DecimateFilter::new(3, 5); // 5 % 3 = 2
-        let kept: Vec<bool> = (0..6)
-            .map(|i| f.apply(ev(i as f64, EventMask::VALUE)).is_some())
-            .collect();
-        assert_eq!(kept, vec![false, false, true, false, false, true]);
     }
 }

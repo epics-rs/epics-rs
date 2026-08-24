@@ -1,6 +1,6 @@
 //! `PvaLink` — a single live PVA link bound to a remote PV.
 
-// RTEMS-EXEC-MODEL-ALLOW(24): checked - these run and pass in the feature-ON suite.
+// RTEMS-EXEC-MODEL-ALLOW(27): checked - these run and pass in the feature-ON suite.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -908,19 +908,45 @@ impl PvaLink {
         if matches!(self.config.direction, LinkDirection::Inp) {
             return Err(PvaLinkError::NotWritable);
         }
+        self.issue_put(false).await
+    }
+
+    /// Single owner of "this channel issues one upstream PUT", the port
+    /// of pvxs `pvaLinkChannel::put(bool force)`
+    /// (`pvalink_channel.cpp:219-279`). `force` is the forward-link
+    /// entry: it makes the PUT happen even with nothing staged and
+    /// pins `record._options.process` to `"true"` (`:255-259`).
+    ///
+    /// No direction gate here — pvxs has none on the channel put, and
+    /// the scratch is the only way a value enters, so `stage_and_flush`
+    /// is where an INP link is refused.
+    async fn issue_put(&self, force: bool) -> PvaLinkResult<usize> {
         // Snapshot + clear (pvxs moves used_scratch into put_queue).
         let staged: Vec<(String, StagedPut)> = {
             let mut scratch = self.out_scratch.lock();
-            if scratch.is_empty() {
+            if scratch.is_empty() && !force {
                 return Ok(0);
             }
             scratch.drain().collect()
         };
-        let combined_proc = combine_proc(staged.iter().map(|(_, s)| s.proc));
+        // pvxs `if((reqProcess&2) || force) proc = "true"` — a forced put
+        // outranks even a staged NPP sibling (`pvalink_channel.cpp:255`).
+        let combined_proc = if force {
+            ProcMode::Pp
+        } else {
+            combine_proc(staged.iter().map(|(_, s)| s.proc))
+        };
         let block = staged.iter().any(|(_, s)| s.block);
         let req = build_put_request(combined_proc, block);
 
-        let put_result = if staged.len() == 1 {
+        let put_result = if staged.is_empty() {
+            // Forced with nothing staged: pvxs `linkBuildPut` returns the
+            // prototype untouched, so the DATA phase carries an empty
+            // changed bitset and no value (`pvalink_channel.cpp:127-159`).
+            self.client
+                .pvput_empty_with_request(&self.config.pv_name, &req)
+                .await
+        } else if staged.len() == 1 {
             let (field, sp) = &staged[0];
             self.put_single(field, &sp.value, &req).await
         } else {
@@ -954,6 +980,12 @@ impl PvaLink {
                 Ok(1)
             }
             Err(e) if is_disconnect(&e) => {
+                if staged.is_empty() {
+                    // A forced put stages nothing, so there is no
+                    // retry-eligible field to requeue and the caller owns
+                    // reporting the disconnect.
+                    return Err(PvaLinkError::Pva(e));
+                }
                 // Requeue retry-eligible fields for replay; drop the
                 // rest. Most-recent-wins: only restore a field a newer
                 // write has not already re-staged.
@@ -1047,31 +1079,28 @@ impl PvaLink {
 
     /// Fire this link's forward link (FLNK): trigger the remote target to
     /// process, transferring no value. Mirrors pvxs `pvaScanForward`
-    /// (`pvxs/ioc/pvalink_lset.cpp:672-688`).
+    /// (`pvxs/ioc/pvalink_lset.cpp:680-695`), which is `lchan->put(true)`
+    /// at `:691` — the forced arm of the same channel put every OUT write
+    /// takes, so it goes through `Self::issue_put` here too.
     ///
-    /// A forward link is never deferred ("FWD_LINK is never deferred, and
-    /// always results in a Put") and stages no value. pvxs realises it as
-    /// `lchan->put(true)` — a PUT that forces `record._options.process`
-    /// `= "true"` (`pvalink_channel.cpp:255-262`) with an empty value
-    /// bitset, reusing the channel's put machinery only because pvxs's
-    /// FWD link shares the value-link's put queue. Here the forward link
-    /// has nothing to stage and no queue to share, so it issues the
-    /// semantically identical PVA `PROCESS` (cmd 16) — "trigger record
-    /// processing without transferring a value", the wire `dbProcess`
-    /// that a DB FLNK's `scanOnce` also reaches.
+    /// It must NOT be a PVA `PROCESS` (cmd 16): pvxs implements no handler
+    /// for that command anywhere. `CMD_PROCESS` occurs once in its tree, as
+    /// the enum constant at `src/pvaproto.h:632`, and `ConnBase`'s command
+    /// switch (`src/conn.cpp:249-275`) drains an unrecognised command's body
+    /// at `default:` without replying, so a forward link spelled that way
+    /// leaves the remote record unprocessed and blocks to the op timeout.
     ///
-    /// Applies pvxs's non-retry validity gate (`pvalink_lset.cpp:677`): a
-    /// forward link is never a retry write, so a disconnected channel
-    /// yields `Disconnected` and the caller raises LINK/INVALID — no
-    /// trigger is sent (and no blocking connect is attempted).
+    /// Applies pvxs's non-retry validity gate (`pvalink_lset.cpp:685`): a
+    /// disconnected channel yields `Disconnected` and the caller raises
+    /// LINK/INVALID — no trigger is sent (and no blocking connect is
+    /// attempted).
     pub async fn scan_forward(&self) -> PvaLinkResult<()> {
         if !self.is_connected() {
             return Err(PvaLinkError::Disconnected(self.config.pv_name.clone()));
         }
-        self.client
-            .pvprocess(&self.config.pv_name)
-            .await
-            .map_err(PvaLinkError::Pva)
+        // "FWD_LINK is never deferred, and always results in a Put"
+        // (`pvalink_lset.cpp:690`).
+        self.issue_put(true).await.map(|_| ())
     }
 
     /// True when the link currently has a live upstream connection.
@@ -2791,6 +2820,377 @@ mod tests {
                 panic!("disconnected forward must be gated to Disconnected, got {other:?}")
             }
         }
+    }
+
+    // ---- R5-PVA-1: the forward link is a PUT, never cmd 16 ----
+
+    /// What the scripted pvxs-faithful server below observed.
+    #[derive(Default)]
+    struct ConnSwitchObs {
+        /// Application commands that fell to `default:` — pvxs drains and
+        /// never answers these (`conn.cpp:250-253`).
+        drained: Vec<u8>,
+        /// Raw PUT INIT pvRequest bytes, as they arrived.
+        put_init_req: Option<Vec<u8>>,
+        /// Raw PUT DATA payload, from the `changed` BitSet onwards.
+        put_data_body: Option<Vec<u8>>,
+    }
+
+    /// A scripted server that IS pvxs `ConnBase`'s command switch
+    /// (`pvxs/src/conn.cpp:249-275`): CREATE_CHANNEL and PUT are answered,
+    /// and every other application command falls to `default:`, which
+    /// debug-logs, `evbuffer_drain`s the body and replies nothing.
+    ///
+    /// CMD_PROCESS (16) is one of those. pvxs has no `CASE(PROCESS)`: the
+    /// constant occurs exactly once in its tree, as the enum member at
+    /// `src/pvaproto.h:632`.
+    async fn spawn_conn_switch_server(
+        obs: Arc<std::sync::Mutex<ConnSwitchObs>>,
+        refuse_put: bool,
+    ) -> std::net::SocketAddr {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind scripted server");
+        let addr = listener.local_addr().expect("scripted server addr");
+        tokio::spawn(async move {
+            while let Ok((sock, _)) = listener.accept().await {
+                tokio::spawn(serve_conn_switch(sock, obs.clone(), refuse_put));
+            }
+        });
+        addr
+    }
+
+    async fn serve_conn_switch(
+        mut sock: tokio::net::TcpStream,
+        obs: Arc<std::sync::Mutex<ConnSwitchObs>>,
+        refuse_put: bool,
+    ) {
+        use epics_pva_rs::proto::{
+            ByteOrder, Command, ControlCommand, PvaHeader, Status, WriteExt, encode_size_into,
+            encode_string_into,
+        };
+        use epics_pva_rs::pvdata::{FieldDesc, ScalarType};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        const ORDER: ByteOrder = ByteOrder::Little;
+        const SID: u32 = 7;
+
+        fn app_frame(cmd: u8, payload: Vec<u8>) -> Vec<u8> {
+            let mut out = Vec::new();
+            PvaHeader::application(true, ORDER, cmd, payload.len() as u32).write_into(&mut out);
+            out.extend_from_slice(&payload);
+            out
+        }
+
+        let mut hello = Vec::new();
+        PvaHeader::control(true, ORDER, ControlCommand::SetByteOrder.code(), 0)
+            .write_into(&mut hello);
+        let mut p = Vec::new();
+        p.put_u32(0x10000, ORDER);
+        p.put_u16(32_767, ORDER);
+        encode_size_into(1, ORDER, &mut p);
+        encode_string_into("anonymous", ORDER, &mut p);
+        hello.extend_from_slice(&app_frame(Command::ConnectionValidation.code(), p));
+        if sock.write_all(&hello).await.is_err() {
+            return;
+        }
+
+        let mut buf = Vec::new();
+        let mut chunk = [0u8; 4096];
+        loop {
+            let Ok(n) = sock.read(&mut chunk).await else {
+                return;
+            };
+            if n == 0 {
+                return;
+            }
+            buf.extend_from_slice(&chunk[..n]);
+
+            while buf.len() >= 8 {
+                let len = u32::from_le_bytes([buf[4], buf[5], buf[6], buf[7]]) as usize;
+                if buf.len() < 8 + len {
+                    break;
+                }
+                let cmd = buf[3];
+                let is_control = buf[2] & 0x01 != 0;
+                let payload = buf[8..8 + len].to_vec();
+                buf.drain(..8 + len);
+                if is_control {
+                    continue;
+                }
+
+                if cmd == Command::ConnectionValidation.code() {
+                    let out = app_frame(Command::ConnectionValidated.code(), vec![0xFF]);
+                    if sock.write_all(&out).await.is_err() {
+                        return;
+                    }
+                } else if cmd == Command::CreateChannel.code() {
+                    let cid = u32::from_le_bytes([payload[2], payload[3], payload[4], payload[5]]);
+                    let mut p = Vec::new();
+                    p.put_u32(cid, ORDER);
+                    p.put_u32(SID, ORDER);
+                    Status::ok().write_into(ORDER, &mut p);
+                    if sock
+                        .write_all(&app_frame(Command::CreateChannel.code(), p))
+                        .await
+                        .is_err()
+                    {
+                        return;
+                    }
+                } else if cmd == Command::Put.code() {
+                    // sid(u32) + ioid(u32) + subcmd(u8) + …
+                    let ioid = u32::from_le_bytes([payload[4], payload[5], payload[6], payload[7]]);
+                    let subcmd = payload[8];
+                    let mut p = Vec::new();
+                    p.put_u32(ioid, ORDER);
+                    if subcmd & 0x08 != 0 {
+                        obs.lock().unwrap().put_init_req = Some(payload[9..].to_vec());
+                        p.put_u8(0x08);
+                        if refuse_put {
+                            Status::error("PUT refused").write_into(ORDER, &mut p);
+                            if sock
+                                .write_all(&app_frame(Command::Put.code(), p))
+                                .await
+                                .is_err()
+                            {
+                                return;
+                            }
+                            continue;
+                        }
+                        Status::ok().write_into(ORDER, &mut p);
+                        let intro = FieldDesc::Structure {
+                            struct_id: "epics:nt/NTScalar:1.0".into(),
+                            fields: vec![("value".into(), FieldDesc::Scalar(ScalarType::Double))],
+                        };
+                        epics_pva_rs::pvdata::encode::encode_type_desc(&intro, ORDER, &mut p);
+                    } else {
+                        obs.lock().unwrap().put_data_body = Some(payload[9..].to_vec());
+                        p.put_u8(0x00);
+                        Status::ok().write_into(ORDER, &mut p);
+                    }
+                    if sock
+                        .write_all(&app_frame(Command::Put.code(), p))
+                        .await
+                        .is_err()
+                    {
+                        return;
+                    }
+                } else if cmd == Command::DestroyRequest.code()
+                    || cmd == Command::DestroyChannel.code()
+                {
+                    // pvxs answers these; nothing this test reads.
+                } else {
+                    // `default:` — log, drain, reply nothing.
+                    obs.lock().unwrap().drained.push(cmd);
+                }
+            }
+        }
+    }
+
+    /// A pvalink forward link must reach a pvxs server, so it may not be
+    /// spelled CMD_PROCESS: `pvaScanForward` is `lchan->put(true)`
+    /// (`pvalink_lset.cpp:691`), which `pvaLinkChannel::put` turns into a
+    /// PUT with `record._options.process = "true"`
+    /// (`pvalink_channel.cpp:255-263`) whose `linkBuildPut` marked no field
+    /// (`:127-159`), i.e. an EMPTY changed bitset.
+    ///
+    /// Pre-fix `scan_forward` sent cmd 16; the switch above drained it and
+    /// the op blocked to the client timeout, so the remote record never
+    /// processed and no in-tree epics-rs-to-epics-rs test could see it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn forward_link_puts_an_empty_bitset_with_process_true() {
+        use epics_pva_rs::proto::ByteOrder;
+        use epics_pva_rs::pvdata::{PvField, ScalarValue};
+
+        let obs = Arc::new(std::sync::Mutex::new(ConnSwitchObs::default()));
+        let addr = spawn_conn_switch_server(obs.clone(), false).await;
+        let client = PvaClient::builder()
+            .server_addr(addr)
+            .timeout(Duration::from_secs(3))
+            .build();
+        let link = PvaLink::for_test_with_client(
+            PvaLinkConfig::defaults_for("FWD:TGT", LinkDirection::Inp),
+            client,
+        );
+
+        link.scan_forward()
+            .await
+            .expect("the forward link must complete against a pvxs command switch");
+
+        let seen = obs.lock().unwrap();
+        assert!(
+            seen.drained.is_empty(),
+            "the forward link sent command(s) pvxs drains at `default:`: {:?}",
+            seen.drained
+        );
+
+        // The INIT pvRequest carries `record._options.process = "true"`.
+        let req_bytes = seen
+            .put_init_req
+            .as_ref()
+            .expect("the forward link must open a PUT");
+        let mut cur = std::io::Cursor::new(&req_bytes[..]);
+        let req_desc = epics_pva_rs::pvdata::encode::decode_type_desc(&mut cur, ByteOrder::Little)
+            .expect("pvRequest descriptor");
+        let req_val =
+            epics_pva_rs::pvdata::encode::decode_pv_field(&req_desc, &mut cur, ByteOrder::Little)
+                .expect("pvRequest value");
+        let process = match &req_val {
+            PvField::Structure(s) => {
+                extract_field(&PvField::Structure(s.clone()), "record._options.process")
+            }
+            other => panic!("pvRequest is not a structure: {other:?}"),
+        };
+        assert_eq!(
+            process,
+            PvField::Scalar(ScalarValue::String("true".into())),
+            "a forced put pins record._options.process to \"true\" \
+             (pvalink_channel.cpp:255-259)"
+        );
+
+        // The DATA phase marks nothing: an empty changed bitset, no value.
+        let data = seen
+            .put_data_body
+            .as_ref()
+            .expect("the forward link must send the PUT data phase");
+        let mut cur = std::io::Cursor::new(&data[..]);
+        let changed = epics_pva_rs::proto::BitSet::decode(&mut cur, ByteOrder::Little)
+            .expect("changed bitset");
+        assert_eq!(
+            changed.count(),
+            0,
+            "a forward link writes no field, so linkBuildPut leaves the \
+             prototype unmarked (pvalink_channel.cpp:127-159)"
+        );
+        assert_eq!(
+            cur.position() as usize,
+            data.len(),
+            "an unmarked bitset must be followed by no value bytes"
+        );
+    }
+
+    /// A forward link whose PUT the server refuses must surface as `Err`,
+    /// never as a silent `Ok`. pvxs raises no record alarm on this path —
+    /// `linkPutDone` reports the failed put with `errlogPrintf` and carries
+    /// an explicit `// TODO: signal INVALID_ALARM ?`
+    /// (`pvalink_channel.cpp:185-195`) — so the resolver's spawned task
+    /// logs it to the console and the record stays unalarmed. The `Err`
+    /// is what gives it something to log.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_refused_forward_link_put_is_not_reported_as_success() {
+        let obs = Arc::new(std::sync::Mutex::new(ConnSwitchObs::default()));
+        let addr = spawn_conn_switch_server(obs.clone(), true).await;
+        let client = PvaClient::builder()
+            .server_addr(addr)
+            .timeout(Duration::from_secs(3))
+            .build();
+        let link = PvaLink::for_test_with_client(
+            PvaLinkConfig::defaults_for("FWD:TGT", LinkDirection::Inp),
+            client,
+        );
+
+        match link.scan_forward().await {
+            Err(PvaLinkError::Pva(_)) => {}
+            other => panic!("a refused forward-link put must surface, got {other:?}"),
+        }
+    }
+
+    /// A record that counts its `process()` calls and holds a VAL, so a
+    /// test can see both halves of a forward link: the remote record ran,
+    /// and the value it held was not disturbed.
+    struct ProcCountRecord {
+        val: f64,
+        processed: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl epics_base_rs::server::record::Record for ProcCountRecord {
+        fn record_type(&self) -> &'static str {
+            "ai"
+        }
+        fn process(
+            &mut self,
+        ) -> epics_base_rs::error::CaResult<epics_base_rs::server::record::ProcessOutcome> {
+            self.processed
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(epics_base_rs::server::record::ProcessOutcome::complete())
+        }
+        fn get_field(&self, n: &str) -> Option<epics_base_rs::types::EpicsValue> {
+            // Only VAL: every other name must fall through to the common
+            // fields, or SIMM resolves to this value and the cycle bails
+            // as an illegal simulation mode before `process()` runs.
+            match n {
+                "" | "VAL" => Some(epics_base_rs::types::EpicsValue::Double(self.val)),
+                _ => None,
+            }
+        }
+        fn put_field(
+            &mut self,
+            _n: &str,
+            v: epics_base_rs::types::EpicsValue,
+        ) -> epics_base_rs::error::CaResult<()> {
+            if let epics_base_rs::types::EpicsValue::Double(d) = v {
+                self.val = d;
+            }
+            Ok(())
+        }
+        fn declared_fields(&self) -> &'static [epics_base_rs::server::record::FieldDesc] {
+            &[]
+        }
+    }
+
+    /// The same forward link end to end against an epics-rs PVA server
+    /// over a real record: the target must process, and its VAL must not
+    /// move — a forward link transfers no value
+    /// (`pvalink_lset.cpp:690`).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn forward_link_processes_a_native_record_without_moving_its_value() {
+        use epics_base_rs::server::database::PvDatabase;
+        use epics_pva_rs::server::PvDatabaseSource;
+        use epics_pva_rs::server_native::PvaServer;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let processed = Arc::new(AtomicUsize::new(0));
+        let db = Arc::new(PvDatabase::new());
+        db.add_record(
+            "FWD:REC",
+            Box::new(ProcCountRecord {
+                val: 5.0,
+                processed: processed.clone(),
+            }),
+        )
+        .await
+        .expect("record added");
+
+        let server = PvaServer::isolated(Arc::new(PvDatabaseSource::new(db.clone())))
+            .expect("test PVA server starts");
+        let addr = server.tcp_addr();
+
+        let client = PvaClient::builder()
+            .server_addr(addr)
+            .timeout(Duration::from_secs(3))
+            .build();
+        let link = PvaLink::for_test_with_client(
+            PvaLinkConfig::defaults_for("FWD:REC", LinkDirection::Inp),
+            client,
+        );
+
+        link.scan_forward().await.expect("forward link fires");
+
+        assert_eq!(
+            processed.load(Ordering::SeqCst),
+            1,
+            "record._options.process=\"true\" must process the target once"
+        );
+        let val = db
+            .get_record("FWD:REC")
+            .expect("record present")
+            .read()
+            .resolve_field("VAL");
+        assert_eq!(
+            val,
+            Some(epics_base_rs::types::EpicsValue::Double(5.0)),
+            "a forward link transfers no value, so VAL must be untouched"
+        );
     }
 
     // ---- B4: defer / retry Put queue ----

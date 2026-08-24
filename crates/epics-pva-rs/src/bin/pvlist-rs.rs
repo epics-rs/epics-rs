@@ -434,7 +434,7 @@ async fn discover_mode(args: &Args) {
 
 #[tokio::main]
 async fn main() {
-    let args = Args::parse();
+    let args: Args = epics_pva_rs::cli::parse_or_exit();
 
     // pvxs `-V` prints version_information and exits before discovery
     // (tools/list.cpp:75-82).

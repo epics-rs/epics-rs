@@ -27,7 +27,7 @@ use tokio::process::{Child, Command as TokioCommand};
 /// Find a pvxs binary by name. Returns `None` when the file isn't found.
 ///
 /// Lookup order:
-/// 1. `PVXS_HOME/bin/<host>/`, `bundle/usr/local/bin/`, `bin/`
+/// 1. the resolved pvxs tree's `bin/<host>/`, `bundle/usr/local/bin/`, `bin/`
 /// 2. `PATH` for the exact name
 /// 3. **pvAccessCPP fallback** (production-parity work, April 2026):
 ///    when pvxs isn't installed but the older pvAccessCPP toolchain
@@ -42,12 +42,20 @@ use tokio::process::{Child, Command as TokioCommand};
 ///    same interop assertions exercise our code identically. We log
 ///    which fallback was selected so test failures aren't ambiguous.
 fn find_pvxs_bin(name: &str) -> Option<PathBuf> {
-    if let Ok(home) = std::env::var("PVXS_HOME") {
-        let home = PathBuf::from(home);
+    // `try_reference_root`, not `reference_root`: this is the one interop
+    // file with a pvAccessCPP fallback, so a host with no pvxs checkout is a
+    // path we deliberately continue down. It still refuses a `PVXS_HOME` that
+    // points at something which is not a pvxs tree.
+    if let Some(home) =
+        epics_base_rs::reference::try_reference_root(epics_base_rs::reference::ReferenceTree::Pvxs)
+    {
         // Check standard EPICS layouts: O.<host>/, bin/<host>/, bin/, ...
-        let host = std::env::var("EPICS_HOST_ARCH").unwrap_or_else(|_| "darwin-aarch64".into());
+        // Arch is compile-time; the `EPICS_HOST_ARCH` read this replaced
+        // defaulted to `darwin-aarch64` and so missed on any Linux host that
+        // had not set it.
+        let host = crate::interop_helpers::pvxs_arch();
         for sub in &[
-            format!("bin/{}", host),
+            format!("bin/{host}"),
             "bundle/usr/local/bin".into(),
             "bin".into(),
         ] {

@@ -222,6 +222,7 @@ dependencies = [
  "epics-libcom-rs",
  "libc",
  "parking_lot",
+ "record-seam-gate",
  "serde",
  "serde_json",
  "socket2 0.5.10",
@@ -1010,6 +1011,7 @@ dependencies = [
  "if-addrs",
  "libc",
  "parking_lot",
+ "record-seam-gate",
  "rtems-exec-gate",
  "rustyline",
  "serde_json",
@@ -3170,6 +3172,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "record-seam-gate"
+version = "0.0.0"
+
+[[package]]
 name = "redox_syscall"
 version = "0.5.18"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3835,6 +3841,7 @@ dependencies = [
  "chrono",
  "epics-base-rs",
  "epics-ca-rs",
+ "record-seam-gate",
  "scaler-rs",
  "tempfile",
  "tokio",

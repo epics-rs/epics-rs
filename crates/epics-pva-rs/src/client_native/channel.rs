@@ -494,13 +494,28 @@ impl ConnectionPool {
     }
 }
 
-/// pvxs `Channel::disconnect` applies a fixed 10-bucket reconnect holdoff
-/// for a Connecting-stage TCP failure; with a 1 s bucket interval that is
-/// ~10 s (client.cpp:156-165, pushed onto the ring at :206-214). We reuse
-/// the same constant for the direct/forced-server refusal case, which pvxs
-/// resolves by waiting for reconnect rather than fast re-searching
-/// (clientconn.cpp:379-385).
-const RECONNECT_HOLDOFF: std::time::Duration = std::time::Duration::from_secs(10);
+/// A *searched* channel re-enters the search ring, and pvxs paces it by how
+/// far out it lands: a Connecting-stage TCP failure is pushed 10 buckets
+/// ahead, which at the 1 s tick is ~10 s (client.cpp:156-165, pushed onto
+/// the ring at :206-214).
+const SEARCH_RING_HOLDOFF: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// A *forced-server* channel has no search ring, so the bucket count above
+/// is a coordinate in a space that does not exist here. pvxs paces it in the
+/// connection instead: `Channel::disconnect` rebuilds the circuit at once
+/// (client.cpp:206-224, `Connection::build(context, forcedServer, true)`)
+/// and the `reconn` flag arms a flat 2 s timer before `startConnecting()`
+/// (clientconn.cpp:26-32).
+const DIRECT_RECONNECT_HOLDOFF: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Deliberate deviation, and the one holdoff with no pvxs duration behind
+/// it: pvxs drops a refused direct CREATE_CHANNEL on the floor and retries
+/// only when the circuit is next rebuilt (clientconn.cpp:386-392), which for
+/// our pooled, pull-driven reconnect may never come — `get_or_connect` keeps
+/// handing back the same live connection. A long fixed wait stands in for
+/// that unbounded one and keeps a refusing server from being re-asked at the
+/// circuit-rebuild cadence.
+const DIRECT_REFUSAL_HOLDOFF: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// How a single candidate attempt failed inside `ensure_active`. pvxs
 /// paces reconnect differently for a Connecting-stage TCP failure vs a
@@ -515,27 +530,33 @@ enum FailureClass {
     CreateRefusal,
 }
 
-/// Map a candidate-loop failure to the reconnect holdoff pvxs would apply,
-/// replacing the previous Rust-only `2^n` ladder armed on every failure:
+/// Map a candidate-loop failure to the reconnect holdoff pvxs would apply.
 ///
-/// - Connecting-stage TCP failure → fixed 10-bucket reconnect placement
+/// The resolver kind selects the *mechanism*, not just the duration: pvxs
+/// paces a searched channel by where it lands in the search ring and a
+/// forced-server channel by the circuit's own reconnect timer. Each arm
+/// therefore names its own constant — one shared value would again be a
+/// search-ring bucket count doing duty on a channel that has no ring.
+///
+/// - searched, Connecting-stage TCP failure → [`SEARCH_RING_HOLDOFF`]
 ///   (pvxs client.cpp:156-165 / :206-214).
-/// - searched-channel `CREATE_CHANNEL` refusal → no holdoff; pvxs sets the
-///   channel back to Searching in the current bucket and the ≤1 s ring tick
-///   paces the re-search (clientconn.cpp:368-378).
-/// - direct/forced-server `CREATE_CHANNEL` refusal → fixed holdoff; pvxs
-///   logs and waits for reconnect with no search ring (clientconn.cpp:379-385),
-///   so a fixed delay stands in for "wait for reconnect" and keeps the
-///   pull-driven reconnect caller from hot-spinning where no bucket tick
-///   exists to pace it.
+/// - searched, `CREATE_CHANNEL` refusal → no holdoff; pvxs sets the channel
+///   back to Searching in the current bucket and the ≤1 s ring tick paces
+///   the re-search (clientconn.cpp:368-378).
+/// - direct, TCP failure → [`DIRECT_RECONNECT_HOLDOFF`], pvxs's flat
+///   connection-layer 2 s (clientconn.cpp:26-32).
+/// - direct, `CREATE_CHANNEL` refusal → [`DIRECT_REFUSAL_HOLDOFF`], the one
+///   deviation (clientconn.cpp:386-392).
 fn reconnect_holdoff(class: Option<FailureClass>, is_direct: bool) -> Option<std::time::Duration> {
     match class {
-        Some(FailureClass::Connect) => Some(RECONNECT_HOLDOFF),
-        Some(FailureClass::CreateRefusal) if is_direct => Some(RECONNECT_HOLDOFF),
+        Some(FailureClass::Connect) if is_direct => Some(DIRECT_RECONNECT_HOLDOFF),
+        Some(FailureClass::Connect) => Some(SEARCH_RING_HOLDOFF),
+        Some(FailureClass::CreateRefusal) if is_direct => Some(DIRECT_REFUSAL_HOLDOFF),
         Some(FailureClass::CreateRefusal) => None,
-        // No classified failure (e.g. empty candidate set already returned
-        // earlier) — apply the conservative connect-stage holdoff.
-        None => Some(RECONNECT_HOLDOFF),
+        // No classified failure. Unreachable for a direct resolver, whose
+        // candidate list is never empty; an empty searched batch already
+        // returned earlier, so this is the conservative searched default.
+        None => Some(SEARCH_RING_HOLDOFF),
     }
 }
 
@@ -988,13 +1009,11 @@ impl Channel {
                 researched_after_refusal = true;
                 continue;
             }
-            // Otherwise pace the next attempt by the pvxs failure class (see
-            // `reconnect_holdoff`) and surface the error: a Connecting-stage TCP
-            // failure earns the fixed 10-bucket holdoff, and a direct-server
-            // refusal earns the fixed holdoff in lieu of pvxs "wait for reconnect"
-            // (clientconn.cpp:379-385) — a deliberate deviation, since a direct
-            // channel has no search ring to re-enter and a tight retry against the
-            // same refusing server must be avoided.
+            // Otherwise pace the next attempt by the pvxs failure class *and*
+            // the resolver kind (see `reconnect_holdoff`), then surface the
+            // error. The resolver kind matters because pvxs paces the two
+            // through different machinery — the search ring for a searched
+            // channel, the circuit's own reconnect timer for a forced one.
             *self.holdoff_until.lock() =
                 reconnect_holdoff(last_failure, is_direct).map(|d| std::time::Instant::now() + d);
             return Err(last_err.unwrap_or_else(|| PvaError::Protocol("connect failed".into())));
@@ -1125,37 +1144,42 @@ mod tests {
         )
     }
 
-    /// pvxs reconnect pacing by failure class (client.cpp:156-165,
-    /// clientconn.cpp:368-385): a Connecting-stage TCP failure earns the
-    /// fixed 10-bucket holdoff; a searched `CREATE_CHANNEL` refusal earns
-    /// none (the search ring tick paces it); a direct-server refusal earns
-    /// the fixed holdoff. No exponential ladder across these transitions.
+    /// One case per (failure class, resolver kind) boundary, because the
+    /// resolver kind picks which pvxs mechanism paces the retry — the search
+    /// ring (client.cpp:156-165) or the circuit's reconnect timer
+    /// (clientconn.cpp:26-32) — and the two carry different durations.
     #[test]
     fn reconnect_holdoff_matches_pvxs_failure_classes() {
-        // Connecting-stage TCP failure → fixed 10-bucket holdoff,
-        // independent of whether the resolver is searched or direct.
+        // Searched, Connecting-stage TCP failure → the 10-bucket ring
+        // placement.
         assert_eq!(
             reconnect_holdoff(Some(FailureClass::Connect), false),
-            Some(RECONNECT_HOLDOFF)
+            Some(SEARCH_RING_HOLDOFF)
         );
+        // Direct, same failure → the circuit's flat 2 s holdoff. Ten seconds
+        // here left a pinned client waiting out a search-ring bucket count on
+        // a channel with no ring, so it kept sleeping through a server that
+        // had already restarted.
         assert_eq!(
             reconnect_holdoff(Some(FailureClass::Connect), true),
-            Some(RECONNECT_HOLDOFF)
+            Some(DIRECT_RECONNECT_HOLDOFF)
         );
+        assert_eq!(DIRECT_RECONNECT_HOLDOFF, std::time::Duration::from_secs(2));
         // Searched CREATE_CHANNEL refusal → no holdoff (re-enter the
         // current search bucket; the ≤1 s ring tick paces the re-search).
         assert_eq!(
             reconnect_holdoff(Some(FailureClass::CreateRefusal), false),
             None
         );
-        // Direct/forced-server CREATE_CHANNEL refusal → fixed holdoff in
-        // lieu of pvxs "wait for reconnect" (no search ring to pace it).
+        // Direct CREATE_CHANNEL refusal → the long stand-in for pvxs's
+        // unbounded "retry on reconnect"; deliberately not the 2 s above,
+        // which would re-ask a refusing server at the circuit cadence.
         assert_eq!(
             reconnect_holdoff(Some(FailureClass::CreateRefusal), true),
-            Some(RECONNECT_HOLDOFF)
+            Some(DIRECT_REFUSAL_HOLDOFF)
         );
-        // No classified failure → conservative connect-stage holdoff.
-        assert_eq!(reconnect_holdoff(None, false), Some(RECONNECT_HOLDOFF));
+        // No classified failure → the conservative searched default.
+        assert_eq!(reconnect_holdoff(None, false), Some(SEARCH_RING_HOLDOFF));
     }
 
     #[test]

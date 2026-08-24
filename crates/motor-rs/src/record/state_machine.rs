@@ -441,7 +441,9 @@ impl MotorRecord {
         if self.timing.dly > 0.0 {
             self.set_phase(MotionPhase::DelayWait);
             self.stat.mip.insert(MipFlags::DELAY_REQ);
-            effects.schedule_delay = Some(std::time::Duration::from_secs_f64(self.timing.dly));
+            effects.schedule_delay = Some(epics_base_rs::runtime::time::duration_from_secs(
+                self.timing.dly,
+            ));
         } else {
             self.finalize_motion(effects);
         }
@@ -636,7 +638,9 @@ impl MotorRecord {
         if self.timing.dly > 0.0 {
             self.set_phase(MotionPhase::DelayWait);
             self.stat.mip.insert(MipFlags::DELAY_REQ);
-            effects.schedule_delay = Some(std::time::Duration::from_secs_f64(self.timing.dly));
+            effects.schedule_delay = Some(epics_base_rs::runtime::time::duration_from_secs(
+                self.timing.dly,
+            ));
         } else {
             self.evaluate_position_error(effects);
         }
@@ -704,8 +708,9 @@ impl MotorRecord {
                 self.retry.rcnt += 1;
                 self.stat.mip = MipFlags::RETRY | MipFlags::DELAY_REQ;
                 self.set_phase(MotionPhase::DelayWait);
-                effects.schedule_delay =
-                    Some(std::time::Duration::from_secs_f64(self.timing.dly.max(0.0)));
+                effects.schedule_delay = Some(epics_base_rs::runtime::time::duration_from_secs(
+                    self.timing.dly,
+                ));
                 return;
             }
 

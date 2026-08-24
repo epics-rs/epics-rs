@@ -1386,16 +1386,22 @@ mod tests {
     /// libCom `macParseDefns` (macUtil.c:74-196): a comma inside quotes or
     /// backslash-escaped is a literal, not a pair separator. A raw
     /// `split(',')` truncated `DESC="a,b"` to `DESC="a` and dropped `b"`;
-    /// the quote-aware splitter keeps `a,b` as one value.
+    /// the quote-aware splitter keeps `a,b` as one value. The quotes and
+    /// escapes themselves stay in the parsed value — macParseDefns removes
+    /// them from names only (macUtil.c:198-200) — and [`mac_trans`]'s
+    /// `discard` takes them off when the macro is substituted, so both
+    /// halves are asserted here.
     #[test]
     fn parse_macros_keeps_quoted_or_escaped_comma_in_one_value() {
         let m = parse_macros(r#"DESC="a,b",P=IOC:"#);
-        assert_eq!(m.get("DESC"), Some(&"a,b".to_string()));
+        assert_eq!(m.get("DESC"), Some(&r#""a,b""#.to_string()));
+        assert_eq!(expand_macros("$(DESC)", &m).as_deref(), Some("a,b"));
         assert_eq!(m.get("P"), Some(&"IOC:".to_string()));
         assert_eq!(m.len(), 2);
 
         let m = parse_macros(r#"DESC=a\,b,P=IOC:"#);
-        assert_eq!(m.get("DESC"), Some(&"a,b".to_string()));
+        assert_eq!(m.get("DESC"), Some(&r#"a\,b"#.to_string()));
+        assert_eq!(expand_macros("$(DESC)", &m).as_deref(), Some("a,b"));
         assert_eq!(m.get("P"), Some(&"IOC:".to_string()));
         assert_eq!(m.len(), 2);
     }

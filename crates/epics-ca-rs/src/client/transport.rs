@@ -4,7 +4,7 @@
 // runtime seam and `start_paused` cannot advance the seam's clock. Ratcheted
 // DOWN, never up, without running the survivors under the feature.
 
-// RTEMS-EXEC-MODEL-ALLOW(11): the flavored tests drive the TCP transport
+// RTEMS-EXEC-MODEL-ALLOW(14): the flavored tests drive the TCP transport
 // over tokio::net, which needs the reactor. These run and pass in the
 // feature-ON suite on the tokio driver.
 //
@@ -12,6 +12,13 @@
 // write exception to its request rather than to the channel. Both were run
 // under `--features rtems-exec-model` before this count moved, per the
 // ratchet rule above, and both pass.
+//
+// 11 -> 14 for the three the 2026-08-23 parity round added
+// (`an_error_body_too_short_for_the_echo_closes_the_circuit`,
+// `an_echo_promising_an_annex_it_omits_closes_the_circuit`,
+// `an_error_body_that_holds_the_echo_keeps_the_circuit`). The whole
+// crate was run under `--features rtems-exec-model` before this count moved,
+// per the ratchet rule above, and every one of the 14 passes.
 use std::collections::HashMap;
 use std::net::SocketAddr;
 #[cfg(feature = "experimental-rust-tls")]
@@ -80,7 +87,12 @@ fn make_read_reply(
     data: &[u8],
 ) -> epics_base_rs::error::CaResult<ReadReply> {
     if matches!(mode, ReadReplyMode::Plain) && count == 1 {
-        let dbr_type = DbFieldType::from_u16(data_type)?;
+        // `wire_carrier` because these bytes are a READ_NOTIFY payload off
+        // the network: `DBR_CHAR` is `dbr_char_t` (`db_access.h:40`,
+        // `epicsUInt8`), so the value it carries widens unsigned. Without it
+        // a re-`put` of a value this client just read sign-extends and 200
+        // lands as -56 in a wider field.
+        let dbr_type = DbFieldType::from_u16(data_type)?.wire_carrier();
         let value = EpicsValue::from_bytes_array(dbr_type, data, count as usize)?;
         Ok(ReadReply::Plain { dbr_type, value })
     } else {
@@ -635,6 +647,10 @@ pub(super) enum FrameError {
     /// payload; silently rounding up (an earlier `align8`) lets a hostile peer
     /// slide the framer into the middle of the next message.
     MisalignedPayload(usize),
+    /// A `CA_PROTO_ERROR` body too short to hold the request header it
+    /// claims to echo — C `cac::exceptionRespAction` (`cac.cpp:1087`,
+    /// `:1102`). See [`EchoedRequest::parse`].
+    ShortErrorEcho(usize),
 }
 
 impl std::fmt::Display for FrameError {
@@ -642,6 +658,12 @@ impl std::fmt::Display for FrameError {
         match self {
             Self::Header(e) => write!(f, "malformed TCP header ({e})"),
             Self::MisalignedPayload(n) => write!(f, "misaligned payload (postsize={n})"),
+            Self::ShortErrorEcho(n) => {
+                write!(
+                    f,
+                    "CA_PROTO_ERROR truncates its echoed request (postsize={n})"
+                )
+            }
         }
     }
 }
@@ -713,6 +735,60 @@ pub(super) fn next_frame(buf: &[u8]) -> Frame {
         hdr,
         hdr_size,
         body_len,
+    }
+}
+
+/// The request header a `CA_PROTO_ERROR` carries back, as C reads it in
+/// `cac::exceptionRespAction` (`cac.cpp:1082-1108`).
+///
+/// Existence is the guarantee. A value of this type can only come from a body
+/// long enough to hold every field it exposes, so the arm that consumes one
+/// has no "was there enough body" question left to ask — and cannot answer it
+/// the way the port did, by carrying on with `None` for each field and
+/// leaving the request that failed pending until its own timeout.
+pub(super) struct EchoedRequest {
+    /// The command that failed. C dispatches the exception on it through
+    /// `tcpExcepJumpTableCAC`.
+    pub(super) cmmd: u16,
+    pub(super) data_type: u16,
+    /// Element count, from the annex when the echo is in extended form.
+    pub(super) count: u32,
+    /// The echoed `m_available`: the ioid, subscription id, or cid the
+    /// request's issuer stamped, which is how the failing operation is found
+    /// again.
+    pub(super) available: u32,
+    /// Where the diagnostic string starts within the `CA_PROTO_ERROR` body.
+    pub(super) diagnostic_at: usize,
+}
+
+impl EchoedRequest {
+    /// `None` at exactly the two points C `return false`s: a body shorter
+    /// than the 16-byte header echo (`cac.cpp:1085-1089`), and a body whose
+    /// echo carries the extended marker without the 8-byte annex behind it
+    /// (`cac.cpp:1098-1104`). Both reach `initiateAbortShutdown` through
+    /// `processIncoming` (`tcpiiu.cpp:515-525`), so neither is survivable.
+    pub(super) fn parse(body: &[u8]) -> Option<Self> {
+        let head = body.get(..CaHeader::SIZE)?;
+        let cmmd = u16::from_be_bytes([head[0], head[1]]);
+        let data_type = u16::from_be_bytes([head[4], head[5]]);
+        let available = u32::from_be_bytes([head[12], head[13], head[14], head[15]]);
+        if u16::from_be_bytes([head[2], head[3]]) == 0xFFFF {
+            let annex = body.get(CaHeader::SIZE..CaHeader::SIZE + EXTENDED_EXTRA)?;
+            return Some(Self {
+                cmmd,
+                data_type,
+                count: u32::from_be_bytes([annex[4], annex[5], annex[6], annex[7]]),
+                available,
+                diagnostic_at: CaHeader::SIZE + EXTENDED_EXTRA,
+            });
+        }
+        Some(Self {
+            cmmd,
+            data_type,
+            count: u32::from(u16::from_be_bytes([head[6], head[7]])),
+            available,
+            diagnostic_at: CaHeader::SIZE,
+        })
     }
 }
 
@@ -2497,7 +2573,7 @@ async fn read_loop<R: AsyncRead + Unpin + Send + 'static>(
     let mut flow_control_active = false;
     let mut server_minor_version: u16 = 0;
     let mut beacon_rx_open = true;
-    // C `claim_ciu_reply` (`rsrv/camessage.c:1149-1175`) emits the
+    // C `claim_ciu_reply` (`rsrv/camessage.c:1180-1203`) emits the
     // CA_PROTO_ACCESS_RIGHTS frame BEFORE the CA_PROTO_CREATE_CHAN
     // reply on the same TCP stream. The coordinator's
     // `AccessRightsChanged` handler at `mod.rs:2531` looks up the
@@ -2701,6 +2777,19 @@ async fn read_loop<R: AsyncRead + Unpin + Send + 'static>(
             continue;
         }
 
+        // C `tcpiiu::processIncoming` answers every definitively malformed
+        // message with `false`, and its caller answers that with
+        // `initiateAbortShutdown` (`tcpiiu.cpp:515-525`). One exit here, so a
+        // malformed case cannot be added that logs the peer and keeps reading
+        // from it.
+        let close_circuit = |reason: &FrameError| {
+            eprintln!("CA: {server_addr}: {reason}, closing");
+            let _ = event_tx.send(TransportEvent::TcpClosed {
+                server_addr,
+                priority,
+            });
+        };
+
         let mut offset = 0;
         loop {
             // The shared framing step (`next_frame`) — "await more bytes" and
@@ -2716,11 +2805,7 @@ async fn read_loop<R: AsyncRead + Unpin + Send + 'static>(
                     // via `align8` (the prior behavior) lets a malicious
                     // server desync our framer; drop the circuit so the
                     // reconnect loop rebuilds from a clean state.
-                    eprintln!("CA: {server_addr}: {e}, closing");
-                    let _ = event_tx.send(TransportEvent::TcpClosed {
-                        server_addr,
-                        priority,
-                    });
+                    close_circuit(&e);
                     return;
                 }
                 Frame::Header {
@@ -3022,7 +3107,7 @@ async fn read_loop<R: AsyncRead + Unpin + Send + 'static>(
                 }
                 CA_PROTO_ERROR => {
                     // CA_PROTO_ERROR wire layout per C `vsend_err`
-                    // (`rsrv/camessage.c:139-224`):
+                    // (`rsrv/camessage.c:149-233`):
                     //   resp.m_cid       = channel cid (or
                     //                      0xFFFFFFFF for non-channel-
                     //                      scoped commands like SEARCH
@@ -3046,36 +3131,24 @@ async fn read_loop<R: AsyncRead + Unpin + Send + 'static>(
                     // was wrong. Symptom: clients can't distinguish
                     // ECA_BADTYPE from ECA_NORDACCESS etc.
                     let eca_status = hdr.available;
-                    let orig_cmd = if actual_post >= 16 {
-                        let orig_hdr_bytes = &accumulated[data_start..data_start + 16];
-                        Some(u16::from_be_bytes([orig_hdr_bytes[0], orig_hdr_bytes[1]]))
-                    } else {
-                        None
+                    // The echoed request, parsed once. A body too short for
+                    // it is C's `return false` and therefore this circuit's
+                    // end (`cac.cpp:1085-1104`); the port used to read each
+                    // field behind its own length test and carry on with
+                    // `None`, which left the operation that failed pending
+                    // until its own timeout and left the circuit up for the
+                    // next truncated frame.
+                    //
+                    // `diagnostic_at` also settles where the message text
+                    // begins: the extended echo's 8-byte annex sits between
+                    // the header copy and the string.
+                    let Some(echo) = EchoedRequest::parse(&accumulated[data_start..data_end])
+                    else {
+                        close_circuit(&FrameError::ShortErrorEcho(actual_post));
+                        return;
                     };
-                    // C `cac::exceptionRespAction` (`cac.cpp:1097-1107`):
-                    // when the echoed request used the extended layout
-                    // (`m_postsize == 0xffff`), the 8-byte annex carrying
-                    // the full 32-bit postsize and count sits between the
-                    // 16-byte header echo and the diagnostic string.
-                    // Pre-fix Rust unconditionally started the diag at
-                    // `data_start + 16`, so an extended READ/WRITE error
-                    // surfaced the annex bytes as the leading 8 bytes of
-                    // `msg` (mis-framed for the caller) and any actual
-                    // diag string was truncated by 8 bytes.
-                    let echo_hdr_size = if actual_post >= 16
-                        && u16::from_be_bytes([
-                            accumulated[data_start + 2],
-                            accumulated[data_start + 3],
-                        ]) == 0xFFFF
-                        && actual_post >= 24
-                    {
-                        24
-                    } else {
-                        16
-                    };
-                    let msg = if actual_post > echo_hdr_size {
-                        let msg_bytes =
-                            &accumulated[data_start + echo_hdr_size..data_start + actual_post];
+                    let msg = if actual_post > echo.diagnostic_at {
+                        let msg_bytes = &accumulated[data_start + echo.diagnostic_at..data_end];
                         let end = msg_bytes
                             .iter()
                             .position(|&b| b == 0)
@@ -3096,67 +3169,54 @@ async fn read_loop<R: AsyncRead + Unpin + Send + 'static>(
                     // out. Pre-fix Rust only fired the global
                     // exception hook here, leaving the per-op
                     // futures pending until their own timeout.
-                    // Extract `m_available` from the echoed 16-byte
-                    // header (offset 12) — the extended annex
-                    // (postsize/count fields) is appended AFTER the
-                    // 16-byte header, so `m_available` is always at
-                    // the same position regardless of extended form.
-                    let echo_available = if actual_post >= 16 {
-                        Some(u32::from_be_bytes([
-                            accumulated[data_start + 12],
-                            accumulated[data_start + 13],
-                            accumulated[data_start + 14],
-                            accumulated[data_start + 15],
-                        ]))
-                    } else {
-                        None
-                    };
-                    if let (Some(cmd), Some(ioid)) = (orig_cmd, echo_available) {
-                        match cmd {
-                            CA_PROTO_READ_NOTIFY => {
-                                dispatch_read_error(
-                                    &in_flight,
-                                    ioid,
-                                    epics_base_rs::error::CaError::ServerError(eca_status),
-                                );
-                            }
-                            CA_PROTO_WRITE_NOTIFY => {
-                                if let Some((_, (_, reply_tx))) = in_flight.writes.remove(&ioid) {
-                                    let _ = reply_tx.send(Err(
-                                        epics_base_rs::error::CaError::ServerError(eca_status),
-                                    ));
-                                }
-                            }
-                            CA_PROTO_EVENT_ADD => {
-                                // C `cac::eventAddExcep` (`cac.cpp:1030-1038`,
-                                // jump-table entry at `cac.cpp:97`) routes the
-                                // echoed EVENT_ADD's `m_available` (the
-                                // subscription id) through
-                                // `ioExceptionNotify` — the status reaches the
-                                // subscription's exception callback and the
-                                // subscription STAYS INSTALLED. Read/write use
-                                // `ioExceptionNotifyAndUninstall` instead; the
-                                // asymmetry is deliberate, because rsrv keeps
-                                // re-posting the monitor (`camessage.c:513-522`
-                                // emits this ERROR on every send-buffer-load
-                                // failure while the circuit stays up), so the
-                                // subscription must survive to receive the next
-                                // attempt.
-                                //
-                                // `on_monitor_error` (via MonitorStatusError)
-                                // is exactly that: delivers
-                                // `Err(ServerError(status))` to the subscriber
-                                // without removing the registry record.
-                                let _ = event_tx.send(TransportEvent::MonitorStatusError {
-                                    subid: ioid,
-                                    eca_status,
-                                });
-                            }
-                            // EVENT_CANCEL confirmations have no per-op waiter;
-                            // C maps them to `defaultExcep` (global exception
-                            // hook only) — the `ServerError` event below.
-                            _ => {}
+                    // `m_available` sits at offset 12 of the echoed header
+                    // whichever form it is in: the extended annex is
+                    // appended AFTER those 16 bytes.
+                    let ioid = echo.available;
+                    match echo.cmmd {
+                        CA_PROTO_READ_NOTIFY => {
+                            dispatch_read_error(
+                                &in_flight,
+                                ioid,
+                                epics_base_rs::error::CaError::ServerError(eca_status),
+                            );
                         }
+                        CA_PROTO_WRITE_NOTIFY => {
+                            if let Some((_, (_, reply_tx))) = in_flight.writes.remove(&ioid) {
+                                let _ = reply_tx.send(Err(
+                                    epics_base_rs::error::CaError::ServerError(eca_status),
+                                ));
+                            }
+                        }
+                        CA_PROTO_EVENT_ADD => {
+                            // C `cac::eventAddExcep` (`cac.cpp:1030-1038`,
+                            // jump-table entry at `cac.cpp:97`) routes the
+                            // echoed EVENT_ADD's `m_available` (the
+                            // subscription id) through
+                            // `ioExceptionNotify` — the status reaches the
+                            // subscription's exception callback and the
+                            // subscription STAYS INSTALLED. Read/write use
+                            // `ioExceptionNotifyAndUninstall` instead; the
+                            // asymmetry is deliberate, because rsrv keeps
+                            // re-posting the monitor (`camessage.c:513-522`
+                            // emits this ERROR on every send-buffer-load
+                            // failure while the circuit stays up), so the
+                            // subscription must survive to receive the next
+                            // attempt.
+                            //
+                            // `on_monitor_error` (via MonitorStatusError)
+                            // is exactly that: delivers
+                            // `Err(ServerError(status))` to the subscriber
+                            // without removing the registry record.
+                            let _ = event_tx.send(TransportEvent::MonitorStatusError {
+                                subid: ioid,
+                                eca_status,
+                            });
+                        }
+                        // EVENT_CANCEL confirmations have no per-op waiter;
+                        // C maps them to `defaultExcep` (global exception
+                        // hook only) — the `ServerError` event below.
+                        _ => {}
                     }
                     // C ref: modules/ca/src/client/udpiiu.cpp:exceptionRespAction —
                     // commit a352865 routes the error prefix through ERL_ERROR
@@ -3166,49 +3226,23 @@ async fn read_loop<R: AsyncRead + Unpin + Send + 'static>(
                     tracing::error!(
                         server = %server_addr,
                         eca = eca_status,
-                        cmd = ?orig_cmd,
+                        cmd = echo.cmmd,
                         msg = %msg,
                         "CA server error",
                     );
-                    // The echoed request's DBR type and element count —
-                    // libca's `caHdrLargeArray.m_dataType` / `m_count`, which
-                    // every exception stub forwards and the default handler
-                    // prints (`type=DBR_STRING, count=1`). The extended form
-                    // (`m_count == 0`, postsize `0xFFFF`) carries the real
-                    // count in the 8-byte annex, same place `echo_hdr_size`
-                    // already accounts for.
-                    let (echo_type, echo_count) = if actual_post >= 16 {
-                        let e = &accumulated[data_start..data_start + 16];
-                        let ty = u16::from_be_bytes([e[4], e[5]]);
-                        let short_count = u16::from_be_bytes([e[6], e[7]]);
-                        let count = if echo_hdr_size == 24 {
-                            let a = &accumulated[data_start + 16..data_start + 24];
-                            u32::from_be_bytes([a[4], a[5], a[6], a[7]])
-                        } else {
-                            u32::from(short_count)
-                        };
-                        (Some(ty), Some(count))
-                    } else {
-                        (None, None)
-                    };
-                    // rsrv stamps the outer `m_cid` with the client's cid for
-                    // channel-scoped commands and `0xFFFF_FFFF` otherwise
-                    // (`rsrv/camessage.c:155-182`).
-                    let err_cid = (hdr.cid != 0xFFFF_FFFF).then_some(hdr.cid);
                     // Identity of the failing request, from the record its
-                    // issuer left behind. `echo_available` is the ECHOED
-                    // request's `m_available` — on a plain `CA_PROTO_WRITE`
-                    // that is the cid the client stamped at issue time, and
-                    // it is the field libca looks the channel up by
+                    // issuer left behind. The echoed `m_available` on a plain
+                    // `CA_PROTO_WRITE` is the cid the client stamped at issue
+                    // time, and it is the field libca looks the channel up by
                     // (`cac::writeExcep`, `cac.cpp:1056`), so the request
-                    // names itself and the channel need not still exist.
-                    // `err_cid` is the same number by the other route (rsrv
-                    // stamps the outer header from `pciu->cid`,
-                    // `camessage.c:155-182`); it covers a peer that echoes a
-                    // truncated header.
-                    let pv_name = echo_available
-                        .or(err_cid)
-                        .and_then(|c| in_flight.write_identities.get(&c).map(|n| n.clone()));
+                    // names itself and the channel need not still exist. The
+                    // outer header's `m_cid` used to stand in for it when the
+                    // echo was too short to read; a short echo now ends the
+                    // circuit, so there is nothing left to stand in for.
+                    let pv_name = in_flight
+                        .write_identities
+                        .get(&echo.available)
+                        .map(|n| n.clone());
                     // Raise here, on the circuit's receive thread, in frame
                     // order — `cac::exceptionRespAction` (`cac.cpp:1082-1120`)
                     // runs inside `executeResponse`, so libca has already
@@ -3222,11 +3256,11 @@ async fn read_loop<R: AsyncRead + Unpin + Send + 'static>(
                         &exception_slot,
                         super::types::ServerErrorFrame {
                             eca_status,
-                            original_request: orig_cmd,
+                            original_request: echo.cmmd,
                             message: msg,
                             server_addr,
-                            data_type: echo_type,
-                            count: echo_count,
+                            data_type: echo.data_type,
+                            count: echo.count,
                             pv_name,
                         },
                     );
@@ -3272,7 +3306,7 @@ async fn read_loop<R: AsyncRead + Unpin + Send + 'static>(
                     if hdr.cmmd == CA_PROTO_CLEAR_CHANNEL {
                         // Not a no-op for the write identities: rsrv answers
                         // a CLEAR_CHANNEL by echoing `m_cid`/`m_available`
-                        // (`camessage.c:1944-1957`), and a circuit answers
+                        // (`camessage.c:1966-1968`), and a circuit answers
                         // its requests in order, so this frame arrives after
                         // every ERROR the cleared channel could still
                         // produce. That makes it the exact point at which the
@@ -3988,6 +4022,131 @@ mod error_echo_dispatch_tests {
         let mut frame = err.to_bytes().to_vec();
         frame.extend_from_slice(&echoed);
         frame
+    }
+
+    /// A `CA_PROTO_ERROR` carrying `body` verbatim. What that body can and
+    /// cannot hold is the whole question below.
+    fn error_frame_with_body(body: &[u8]) -> Vec<u8> {
+        let mut err = CaHeader::new(CA_PROTO_ERROR);
+        err.postsize = body.len() as u16;
+        err.cid = 0x2A;
+        err.available = 0xC8;
+        let mut frame = err.to_bytes().to_vec();
+        frame.extend_from_slice(body);
+        frame
+    }
+
+    /// What a `read_loop` did with one frame. `TransportEvent` carries no
+    /// `Debug`, and these cases only ever ask which of the three it was.
+    #[derive(Debug, PartialEq, Eq)]
+    enum Verdict {
+        /// The loop dropped the circuit — C's `initiateAbortShutdown`.
+        Closed,
+        /// The loop said nothing and went on reading.
+        Quiet,
+        Other,
+    }
+
+    /// Feed one such frame to a live `read_loop` and report what it did. The
+    /// write half is held open until after the wait, so a `Closed` can only
+    /// be the loop's own verdict on the frame and never an EOF.
+    async fn verdict_on_error_body(body: &[u8]) -> Verdict {
+        let server_addr: SocketAddr = "127.0.0.1:65001".parse().unwrap();
+        let (event_tx, mut event_rx) = mpsc::unbounded_channel::<TransportEvent>();
+        let (write_tx, _write_rx) = mpsc::unbounded_channel::<Vec<u8>>();
+        let (_ba_tx, ba_rx) = mpsc::unbounded_channel::<bool>();
+        let in_flight = super::super::types::InFlightOps::new();
+        let last_rx_at: super::super::types::ServerLastRxAt = Arc::new(DashMap::new());
+        let (client_io, server_io) = tokio::io::duplex(256);
+
+        let loop_handle = tokio::spawn(read_loop(
+            server_io,
+            server_addr,
+            0,
+            event_tx,
+            write_tx,
+            ba_rx,
+            in_flight,
+            crate::client::types::CaExceptionSlot::default(),
+            last_rx_at,
+            std::sync::Arc::new(UnresponsiveGate::new()),
+            drained_socket_probe(),
+            std::sync::Arc::new(std::sync::atomic::AtomicU16::new(0)),
+            CircuitWatchdog::new(),
+        ));
+
+        let mut client = client_io;
+        client
+            .write_all(&error_frame_with_body(body))
+            .await
+            .expect("write ERROR frame");
+        client.flush().await.expect("flush");
+
+        let evt = tokio::time::timeout(Duration::from_millis(800), event_rx.recv())
+            .await
+            .ok()
+            .flatten();
+        drop(client);
+        let _ = tokio::time::timeout(Duration::from_secs(2), loop_handle).await;
+        match evt {
+            Some(TransportEvent::TcpClosed { .. }) => Verdict::Closed,
+            None => Verdict::Quiet,
+            Some(_) => Verdict::Other,
+        }
+    }
+
+    /// C `cac::exceptionRespAction` (`cac.cpp:1085-1089`) refuses a
+    /// `CA_PROTO_ERROR` whose body cannot hold the 16-byte header it claims
+    /// to echo, and that `false` reaches `initiateAbortShutdown` through
+    /// `processIncoming` (`tcpiiu.cpp:515-525`): libca drops the circuit and
+    /// rebuilds every channel and subscription on it.
+    ///
+    /// The port read each echoed field behind its own `actual_post >= 16`
+    /// test and continued with `None`, so the `get()` or `put()` the error
+    /// was about was never completed — it sat in the in-flight registry until
+    /// its own timeout, on a circuit the client went on trusting.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_error_body_too_short_for_the_echo_closes_the_circuit() {
+        assert_eq!(
+            verdict_on_error_body(&[0u8; 8]).await,
+            Verdict::Closed,
+            "a CA_PROTO_ERROR with an 8-byte body must drop the circuit \
+             (C cac.cpp:1085-1089)"
+        );
+    }
+
+    /// C's second refusal, four lines later (`cac.cpp:1098-1104`): the echoed
+    /// header carries the extended marker, so the 8-byte annex must be behind
+    /// it, and a body that stops at 16 bytes is refused the same way.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_echo_promising_an_annex_it_omits_closes_the_circuit() {
+        let mut echoed = CaHeader::new(CA_PROTO_READ_NOTIFY);
+        echoed.postsize = 0xFFFF;
+        assert_eq!(
+            verdict_on_error_body(&echoed.to_bytes()).await,
+            Verdict::Closed,
+            "an extended-marker echo without its annex must drop the circuit \
+             (C cac.cpp:1098-1104)"
+        );
+    }
+
+    /// The boundary beside them: a body that DOES hold the echo is an
+    /// ordinary error report, and the circuit carries on. Without this case a
+    /// client that closed on every `CA_PROTO_ERROR` would pass both tests
+    /// above — and rsrv sends this frame on routine failures such as a write
+    /// to a read-only field.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_error_body_that_holds_the_echo_keeps_the_circuit() {
+        let mut echoed = CaHeader::new(CA_PROTO_WRITE);
+        echoed.postsize = 0;
+        echoed.data_type = 6;
+        echoed.count = 1;
+        echoed.available = 0x2A;
+        assert_eq!(
+            verdict_on_error_body(&echoed.to_bytes()).await,
+            Verdict::Quiet,
+            "a complete CA_PROTO_ERROR must not disturb the circuit"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

@@ -16,7 +16,7 @@
 //! read. A framing proxy in front of a real `CaServer` provides exactly that:
 //! it relays every frame untouched except the `CA_PROTO_READ_NOTIFY` REPLY,
 //! whose status word (`m_cid`) it stamps with `ECA_NORDACCESS` — the wire
-//! shape of rsrv's `no_read_access_event` (`camessage.c:450-480`), which the
+//! shape of rsrv's `no_read_access_event` (`camessage.c:455-485`), which the
 //! CA client surfaces as a failed get.
 
 // Host/tokio-only: drives the async `caget`/`caput` CLI binaries out of

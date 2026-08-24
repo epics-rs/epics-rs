@@ -25,8 +25,10 @@
 //!   buf[2]    ~bTag
 //!   buf[3]    reserved (0)
 //!   buf[4-7]  transferSize little-endian (u32)
-//!   buf[8]    transferAttributes (bit 0 = EOM for OUT)
-//!   buf[9-11] reserved (0)
+//!   buf[8]    bmTransferAttributes — bit 0 = EOM on DEV_DEP_MSG_OUT,
+//!             bit 1 = TermCharEnabled on REQUEST_DEV_DEP_MSG_IN
+//!   buf[9]    TermChar, when bit 1 of buf[8] is set (IN only)
+//!   buf[10-11] reserved (0)
 //! ```
 //!
 //! followed by `transferSize` payload bytes, padded to a 4-byte
@@ -63,6 +65,20 @@ pub const MESSAGE_ID_DEV_DEP_MSG_IN: u8 = 2;
 pub const BULK_IO_HEADER_SIZE: usize = 12;
 /// Maximum payload size per bulk transaction.
 pub const BULK_IO_PAYLOAD_CAPACITY: usize = 1024 * 1024;
+
+/// `bmTransferAttributes` bit 1 of a `REQUEST_DEV_DEP_MSG_IN` header — the
+/// device ends the transfer when it sends `TermChar` (`buf[9]`).
+/// C writes it as the literal `2` at `drvAsynUSBTMC.c:863-866`.
+pub const BULK_IN_TERM_CHAR_ENABLED: u8 = 0x02;
+
+/// Bit 0 of the USBTMC device-capabilities byte: the device supports a
+/// bulk-IN terminating character. C refuses an input EOS without it
+/// (`drvAsynUSBTMC.c:971-975`).
+pub const TMC_CAP_TERM_CHAR: u8 = 0x01;
+
+/// Offset of the device-capabilities byte in the 0x18-byte `GET_CAPABILITIES`
+/// control-transfer response (`drvAsynUSBTMC.c:544`, `pdpvt->buf[5]`).
+pub const GET_CAPABILITIES_DEVICE_CAP_OFFSET: usize = 5;
 
 // --- iocshArg flags bitfield — `drvAsynUSBTMC.c:1275` ---
 
@@ -101,10 +117,27 @@ pub fn build_bulk_out_header(
 }
 
 /// Build the 12-byte BULK-OUT header for a `REQUEST_DEV_DEP_MSG_IN`
-/// transaction. C parity: `drvAsynUSBTMC.c:855-863`.
+/// transaction. C parity: `drvAsynUSBTMC.c:855-871` —
+///
+/// ```text
+///   buf[0] = MESSAGE_ID_REQUEST_DEV_DEP_MSG_IN;
+///   buf[1] = bTag;   buf[2] = ~bTag;   buf[3] = 0;
+///   buf[4..8] = transferSize (LE u32);
+///   if (termChar >= 0) { buf[8] = 2; buf[9] = termChar; }
+///   else               { buf[8] = 0; buf[9] = 0; }
+///   buf[10..12] = 0;
+/// ```
+///
+/// `term_char` is the whole point of the request header: with the attribute
+/// bit clear the device returns the full `max_transfer_size` or times out, so
+/// a read that is supposed to stop on a terminator never does. The earlier
+/// version of this function had no such parameter and cited `:855-863` as
+/// authority for it — a range that stops one line before `:863`, the line that
+/// sets the bit.
 pub fn build_request_bulk_in_header(
     b_tag: u8,
     max_transfer_size: u32,
+    term_char: Option<u8>,
 ) -> [u8; BULK_IO_HEADER_SIZE] {
     let mut h = [0u8; BULK_IO_HEADER_SIZE];
     h[0] = MESSAGE_ID_REQUEST_DEV_DEP_MSG_IN;
@@ -112,7 +145,11 @@ pub fn build_request_bulk_in_header(
     h[2] = !b_tag;
     h[3] = 0;
     h[4..8].copy_from_slice(&max_transfer_size.to_le_bytes());
-    // h[8..12] reserved.
+    if let Some(c) = term_char {
+        h[8] = BULK_IN_TERM_CHAR_ENABLED;
+        h[9] = c;
+    }
+    // h[10..12] reserved.
     h
 }
 
@@ -180,6 +217,18 @@ pub struct DrvAsynUsbtmcPort {
     config: UsbtmcConfig,
     /// Current bTag value — advances per transaction.
     b_tag: u8,
+    /// C `pdpvt->termChar` (`drvAsynUSBTMC.c:85`, initialised to -1 at
+    /// `:1259`): the bulk-IN terminating character, or `None` for C's -1.
+    /// This is the port's only input-EOS state — C registers the octet
+    /// interface with `initialize(portName, &octet, 0, 0, 0)` (`:1297`), so a
+    /// USBTMC port has no software EOS interpose and the terminator has
+    /// nowhere else to live.
+    term_char: Option<u8>,
+    /// C `pdpvt->tmcDeviceCapabilities` (`:106`), byte 5 of the
+    /// `GET_CAPABILITIES` response (`:544`). Zero until a connect has read it,
+    /// which is also C's state on a port that has not connected — and an EOS
+    /// request in that state is refused, there as here.
+    tmc_device_capabilities: u8,
 }
 
 impl DrvAsynUsbtmcPort {
@@ -211,7 +260,9 @@ impl DrvAsynUsbtmcPort {
         Ok(Self {
             base,
             config,
-            b_tag: 1, // C initializes pdpvt->bTag = 1
+            b_tag: 1,                   // C initializes pdpvt->bTag = 1
+            term_char: None,            // C `pdpvt->termChar = -1` (:1259)
+            tmc_device_capabilities: 0, // C callocs pdpvt; connect fills it in
         })
     }
 
@@ -221,6 +272,26 @@ impl DrvAsynUsbtmcPort {
 
     pub fn current_b_tag(&self) -> u8 {
         self.b_tag
+    }
+
+    /// The bulk-IN terminating character to stamp into the next
+    /// `REQUEST_DEV_DEP_MSG_IN` header, C `pdpvt->termChar >= 0`.
+    pub fn term_char(&self) -> Option<u8> {
+        self.term_char
+    }
+
+    /// Record what `GET_CAPABILITIES` reported, C `:543-544`. The hardware
+    /// path calls this with the 0x18-byte control-transfer response; the
+    /// device-capabilities byte is what gates an input EOS.
+    pub fn apply_capabilities(&mut self, response: &[u8]) -> AsynResult<()> {
+        let byte = response
+            .get(GET_CAPABILITIES_DEVICE_CAP_OFFSET)
+            .ok_or_else(|| AsynError::Status {
+                status: AsynStatus::Error,
+                message: "GET_CAPABILITIES response too short".into(),
+            })?;
+        self.tmc_device_capabilities = *byte;
+        Ok(())
     }
 
     /// Whether this build was compiled with USBTMC hardware support.
@@ -248,6 +319,54 @@ impl PortDriver for DrvAsynUsbtmcPort {
         vec![
             OctetRead, OctetWrite, Int32Read, Int32Write, DrvUser, Flush, Connect,
         ]
+    }
+
+    /// C `asynOctetSetInputEos` (`drvAsynUSBTMC.c:963-985`). The terminator is
+    /// the device's, not a software scan: it rides in the `REQUEST_DEV_DEP_MSG_IN`
+    /// header and the device stops the transfer on it. So this overrides the
+    /// `PortDriver` default, which caches into `base.eos_entry` and forwards to
+    /// the interpose stack — a USBTMC port has no EOS interpose to forward to
+    /// (`:1297` registers the octet interface with `processEosIn = 0`), and the
+    /// cached bytes would terminate nothing.
+    ///
+    /// Both of C's refusals are here. An EOS longer than one character is not
+    /// representable in the header at all, and an EOS on a device whose
+    /// `GET_CAPABILITIES` did not advertise `TermChar` is refused rather than
+    /// silently ignored — a device that never honours the terminator would
+    /// otherwise turn every terminated read into a full-length read or a
+    /// timeout, which is the failure this rejection exists to make loud.
+    fn set_input_eos(&mut self, _user: &AsynUser, eos: &[u8]) -> AsynResult<()> {
+        match eos.len() {
+            0 => {
+                self.term_char = None;
+                Ok(())
+            }
+            1 => {
+                if self.tmc_device_capabilities & TMC_CAP_TERM_CHAR == 0 {
+                    return Err(AsynError::Status {
+                        status: AsynStatus::Error,
+                        message: "Device does not support bulk-IN terminating character".into(),
+                    });
+                }
+                self.term_char = Some(eos[0]);
+                Ok(())
+            }
+            _ => Err(AsynError::Status {
+                status: AsynStatus::Error,
+                message: "USBTMC does not support multiple input terminating characters".into(),
+            }),
+        }
+    }
+
+    /// C `asynOctetGetInputEos` (`drvAsynUSBTMC.c:987-1001`): `termChar < 0`
+    /// reports `eoslen` 0, otherwise the single byte. Reads the same field
+    /// `set_input_eos` writes, so the readback cannot disagree with what the
+    /// next request header will carry.
+    fn get_input_eos(&self, _user: &AsynUser) -> Vec<u8> {
+        match self.term_char {
+            Some(c) => vec![c],
+            None => Vec::new(),
+        }
     }
 
     fn connect(&mut self, _user: &AsynUser) -> AsynResult<()> {
@@ -304,9 +423,10 @@ mod tests {
 
     #[test]
     fn request_bulk_in_header_matches_c_layout() {
-        // drvAsynUSBTMC.c:855-863 — MESSAGE_ID=2, bTag/~bTag,
-        // transferSize bytes 4..8, attributes/reserved zero.
-        let h = build_request_bulk_in_header(0x10, BULK_IO_PAYLOAD_CAPACITY as u32);
+        // drvAsynUSBTMC.c:855-871 — MESSAGE_ID=2, bTag/~bTag, transferSize in
+        // bytes 4..8, and the `else` arm at :867-870 zeroing buf[8]/buf[9]
+        // when there is no terminator.
+        let h = build_request_bulk_in_header(0x10, BULK_IO_PAYLOAD_CAPACITY as u32, None);
         assert_eq!(h[0], MESSAGE_ID_REQUEST_DEV_DEP_MSG_IN);
         assert_eq!(h[1], 0x10);
         assert_eq!(h[2], !0x10);
@@ -314,6 +434,71 @@ mod tests {
         assert_eq!(&h[4..8], &cap.to_le_bytes());
         // attributes / reserved bytes are zero.
         assert!(h[8..12].iter().all(|&b| b == 0));
+    }
+
+    /// C `:863-866` sets `buf[8] = 2` (TermCharEnabled) and `buf[9] = termChar`
+    /// whenever an input EOS is in force. Without the bit the device returns the
+    /// full requested transfer size or times out, so a `camonitor` on a
+    /// terminator-delimited instrument reply either blocks for TMOT or reports
+    /// a megabyte-long read instead of the line.
+    #[test]
+    fn request_bulk_in_header_carries_the_terminator() {
+        let h = build_request_bulk_in_header(0x10, 512, Some(b'\n'));
+        assert_eq!(
+            h[8], BULK_IN_TERM_CHAR_ENABLED,
+            "bmTransferAttributes must set TermCharEnabled"
+        );
+        assert_eq!(h[9], b'\n');
+        assert_eq!(&h[10..12], &[0, 0]);
+    }
+
+    /// C `asynOctetSetInputEos` (`:963-985`) has two hard refusals and one
+    /// disable, and the port carries no other input-EOS state, so the readback
+    /// has to come from the same field.
+    #[test]
+    fn set_input_eos_ports_both_c_refusals() {
+        let mut drv = DrvAsynUsbtmcPort::configure("u_eos", 0x0699, 0x0401, "", 0, 0).unwrap();
+        let user = AsynUser::default();
+
+        // A device that has not advertised TermChar support is refused, which
+        // is also the state of a port that has not connected.
+        let err = drv
+            .set_input_eos(&user, b"\n")
+            .expect_err("no capabilities byte yet");
+        assert_eq!(
+            err.message(),
+            "Device does not support bulk-IN terminating character"
+        );
+        assert_eq!(drv.term_char(), None);
+
+        // GET_CAPABILITIES reports TermChar support in byte 5.
+        let mut caps = [0u8; 0x18];
+        caps[GET_CAPABILITIES_DEVICE_CAP_OFFSET] = TMC_CAP_TERM_CHAR;
+        drv.apply_capabilities(&caps).unwrap();
+
+        drv.set_input_eos(&user, b"\n").unwrap();
+        assert_eq!(drv.term_char(), Some(b'\n'));
+        assert_eq!(drv.get_input_eos(&user), b"\n".to_vec());
+        assert_eq!(
+            build_request_bulk_in_header(1, 512, drv.term_char())[8],
+            BULK_IN_TERM_CHAR_ENABLED,
+            "the stored terminator has to reach the request header"
+        );
+
+        // Two characters cannot be represented in the header at all.
+        let err = drv
+            .set_input_eos(&user, b"\r\n")
+            .expect_err("USBTMC holds one terminating character");
+        assert_eq!(
+            err.message(),
+            "USBTMC does not support multiple input terminating characters"
+        );
+        assert_eq!(drv.term_char(), Some(b'\n'), "a refusal must not clear it");
+
+        // eoslen 0 is C's `termChar = -1`.
+        drv.set_input_eos(&user, b"").unwrap();
+        assert_eq!(drv.term_char(), None);
+        assert!(drv.get_input_eos(&user).is_empty());
     }
 
     #[test]

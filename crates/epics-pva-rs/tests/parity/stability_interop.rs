@@ -30,28 +30,38 @@ use epics_pva_rs::client_native::context::PvaClient;
 use epics_pva_rs::pvdata::{FieldDesc, PvField, PvStructure, ScalarType, ScalarValue};
 use epics_pva_rs::server_native::{ChannelSource, OpError, PvaServerConfig, run_pva_server};
 
-fn pvxs_home() -> Option<PathBuf> {
-    std::env::var("PVXS_HOME").ok().map(PathBuf::from)
+/// The pvxs checkout, via the one resolver (`PVXS_HOME` overrides it).
+///
+/// This read `PVXS_HOME` directly and every lookup below was `?`-chained
+/// off it, so an unset variable turned the whole file into early returns
+/// that report green. Resolution is fatal now; a resolved tree whose
+/// binaries are simply not built still skips, which is an absent artifact
+/// rather than a misconfigured path.
+fn pvxs_home() -> PathBuf {
+    epics_base_rs::reference::reference_root(epics_base_rs::reference::ReferenceTree::Pvxs)
 }
 
-fn host_arch() -> String {
-    std::env::var("EPICS_HOST_ARCH").unwrap_or_else(|_| "darwin-aarch64".into())
+/// Compile-time, not `EPICS_HOST_ARCH` with a `darwin-aarch64` default —
+/// that default made every lookup miss on any Linux host that had not set
+/// the variable.
+fn host_arch() -> &'static str {
+    crate::interop_helpers::pvxs_arch()
 }
 
 fn softioc() -> Option<PathBuf> {
-    let home = pvxs_home()?;
+    let home = pvxs_home();
     let p = home.join("bin").join(host_arch()).join("softIocPVX");
     if p.is_file() { Some(p) } else { None }
 }
 
 fn pvxget() -> Option<PathBuf> {
-    let home = pvxs_home()?;
+    let home = pvxs_home();
     let p = home.join("bin").join(host_arch()).join("pvxget");
     if p.is_file() { Some(p) } else { None }
 }
 
 fn pvxput() -> Option<PathBuf> {
-    let home = pvxs_home()?;
+    let home = pvxs_home();
     let p = home.join("bin").join(host_arch()).join("pvxput");
     if p.is_file() { Some(p) } else { None }
 }

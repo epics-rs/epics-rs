@@ -20,6 +20,7 @@
 //! neither is present the test skips with a printed notice rather than failing,
 //! so CI without the C source is not blocked.
 
+use epics_base_rs::reference::{ReferenceTree, reference_path};
 use epics_base_rs::server::db_loader::{apply_fields, create_record};
 use epics_base_rs::server::record::FieldDeclaration;
 use epics_base_rs::types::EpicsValue;
@@ -216,35 +217,18 @@ fn compare_default_to_initial(default: &EpicsValue, initial: &str) -> ValueCmp {
     }
 }
 
-/// Locate the C dbd record directory, or `None` to skip the test.
-fn dbd_dir() -> Option<PathBuf> {
-    if let Ok(base) = std::env::var("EPICS_BASE") {
-        let p = PathBuf::from(base).join("modules/database/src/std/rec");
-        if p.is_dir() {
-            return Some(p);
-        }
-    }
-    // The machine-local reference checkouts, in the order they have existed.
-    // A stale single path is why this guard silently SKIPPED — and a guard that
-    // skips verifies nothing while still reporting green.
-    [
-        "/home/stevek/work/epics-base/modules/database/src/std/rec",
-        "/Users/stevek/codes/epics-base/modules/database/src/std/rec",
-    ]
-    .into_iter()
-    .map(PathBuf::from)
-    .find(|p| p.is_dir())
+/// Locate the C dbd record directory. A previous round wrote the lesson here
+/// — "a guard that skips verifies nothing while still reporting green" — and
+/// then fixed only the path list, leaving the skip in place, so the guard was
+/// still vacuous on any machine without the checkout. The resolver now fails
+/// instead; see [`epics_base_rs::reference`].
+fn dbd_dir() -> PathBuf {
+    reference_path(ReferenceTree::Base, "modules/database/src/std/rec")
 }
 
 #[test]
 fn rust_record_defaults_match_c_dbd_initials() {
-    let Some(dir) = dbd_dir() else {
-        eprintln!(
-            "SKIP rust_record_defaults_match_c_dbd_initials: C dbd not found \
-             (set EPICS_BASE or place the reference checkout). No defaults verified."
-        );
-        return;
-    };
+    let dir = dbd_dir();
 
     let mut checked = 0usize;
     let mut deviations: Vec<String> = Vec::new();

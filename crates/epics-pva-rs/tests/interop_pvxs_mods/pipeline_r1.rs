@@ -102,8 +102,13 @@ async fn interop_r1_pipeline_option_visible_to_pvxs_server() {
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
     if !bound {
-        eprintln!("SKIP: softIocPVX did not bind {server_addr} within 5s");
-        return;
+        let out = std::fs::read_to_string(&stdout_path).unwrap_or_default();
+        let err = std::fs::read_to_string(&stderr_path).unwrap_or_default();
+        panic!(
+            "softIocPVX did not bind {server_addr} within 5s. A spawned IOC that \
+             never comes up is a broken reference, not a missing one.\n\
+             pvxs stdout:\n{out}\npvxs stderr:\n{err}"
+        );
     }
 
     // Build a Rust client pinned to the IOC and ask for pipeline.

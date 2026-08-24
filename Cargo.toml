@@ -32,30 +32,30 @@ resolver = "3"
 
 [workspace.package]
 edition = "2024"
-version = "0.26.2"
+version = "0.27.0"
 authors = ["Sang Woo Kim <sngwkim915@gmail.com>"]
 license = "EPICS"
 repository = "https://github.com/epics-rs/epics-rs"
 
 [workspace.dependencies]
-ad-core-rs = { path = "crates/ad-core-rs", version = "0.26.1" }
-ad-plugins-rs = { path = "crates/ad-plugins-rs", version = "0.26.1" }
-asyn-rs = { path = "crates/asyn-rs", version = "0.26.1" }
-epics-base-rs = { path = "crates/epics-base-rs", version = "0.26.1" }
-epics-ca-rs = { path = "crates/epics-ca-rs", version = "0.26.1" }
-epics-macros-rs = { path = "crates/epics-macros-rs", version = "0.26.1" }
-epics-rtems-boot = { path = "crates/epics-rtems-boot", version = "0.26.1" }
-epics-libcom-rs = { path = "crates/epics-libcom-rs", version = "0.26.1" }
-epics-pva-rs = { path = "crates/epics-pva-rs", version = "0.26.1" }
-epics-bridge-rs = { path = "crates/epics-bridge-rs", version = "0.26.1" }
-motor-rs = { path = "crates/motor-rs", version = "0.26.1" }
-std-rs = { path = "crates/std-rs", version = "0.26.1" }
-scaler-rs = { path = "crates/scaler-rs", version = "0.26.1" }
-optics-rs = { path = "crates/optics-rs", version = "0.26.1" }
-mca-rs = { path = "crates/mca-rs", version = "0.26.1" }
-mqtt-rs = { path = "crates/mqtt-rs", version = "0.26.1" }
-modbus-rs = { path = "crates/modbus-rs", version = "0.26.1", package = "epics-modbus-rs" }
-epics-tools-rs = { path = "crates/epics-tools-rs", version = "0.26.1" }
+ad-core-rs = { path = "crates/ad-core-rs", version = "0.27.0" }
+ad-plugins-rs = { path = "crates/ad-plugins-rs", version = "0.27.0" }
+asyn-rs = { path = "crates/asyn-rs", version = "0.27.0" }
+epics-base-rs = { path = "crates/epics-base-rs", version = "0.27.0" }
+epics-ca-rs = { path = "crates/epics-ca-rs", version = "0.27.0" }
+epics-macros-rs = { path = "crates/epics-macros-rs", version = "0.27.0" }
+epics-rtems-boot = { path = "crates/epics-rtems-boot", version = "0.27.0" }
+epics-libcom-rs = { path = "crates/epics-libcom-rs", version = "0.27.0" }
+epics-pva-rs = { path = "crates/epics-pva-rs", version = "0.27.0" }
+epics-bridge-rs = { path = "crates/epics-bridge-rs", version = "0.27.0" }
+motor-rs = { path = "crates/motor-rs", version = "0.27.0" }
+std-rs = { path = "crates/std-rs", version = "0.27.0" }
+scaler-rs = { path = "crates/scaler-rs", version = "0.27.0" }
+optics-rs = { path = "crates/optics-rs", version = "0.27.0" }
+mca-rs = { path = "crates/mca-rs", version = "0.27.0" }
+mqtt-rs = { path = "crates/mqtt-rs", version = "0.27.0" }
+modbus-rs = { path = "crates/modbus-rs", version = "0.27.0", package = "epics-modbus-rs" }
+epics-tools-rs = { path = "crates/epics-tools-rs", version = "0.27.0" }
 
 # Deployable-image profile for the embedded targets (RTEMS / VxWorks), where
 # image size is a real resource: `cargo build --profile release-embedded ...`

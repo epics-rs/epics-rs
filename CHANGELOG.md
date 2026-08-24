@@ -1,5 +1,71 @@
 # Changelog
 
+## v0.27.0 — 2026-08-24
+
+Minor release. It lands the 2026-08-23 parallel C-parity round: fifteen
+agents ran interleaved review/fix rounds against the EPICS base, asyn,
+areaDetector, calc and pvxs originals, and the result is 314 one-per-finding
+fixes squashed into nine per-area commits. The public API moves with it — 18
+items removed and 24 signatures changed, measured item-by-item in
+`doc/breaking-2026-08-23.md`, which is why this is a minor and not a patch.
+`doc/c-parity-review-2026-08-23.md` records the four integration decisions
+worth auditing and the 160 root causes the round left open. Workspace version
+0.26.2 -> 0.27.0; the 18 `[workspace.dependencies]` pins and the hand-written
+`epics-pva-rs` pin in `epics-bridge-rs` move to 0.27.0 in lockstep.
+
+### One owner per state transition in the process cycle
+
+The round's largest cluster was state that several callers could move. A
+record's process cycle now leaves through `end_process_cycle` on every exit —
+early return, error, PACT — rather than each tail unwinding for itself; the
+put-notify restart is armed by the cycle a put owes rather than by the put,
+so a restart can no longer overtake the `PP` cycle that put still owed; and
+`special_after_put` is the single owner of the SNAM rebind. `PactExit`
+deliberately carries a hint bit and not a payload, which is what makes the
+async-output path safe.
+
+### Record and device support follow their C originals
+
+Link reads and alarm ladders are routed through the owners C gives them, so
+`rec_gbl_set_sevr` reports whether it raised and `rec_gbl_check_udf` takes
+the severity C passes. Every record delay field converts through
+`duration_from_secs`, the iocsh commands are transcribed from their C bodies
+rather than approximated, and `ad-core-rs` pairs every writer open with a
+close finalizer. asyn bounds every blocking wait by the caller's deadline —
+`port_handle::wait_blocking` had been ignoring its `timeout` argument.
+
+### CA and PVA wire paths
+
+Both CA receive loops grow through the one `RecvAccumulator` primitive
+instead of two hand-rolled accumulators. On the PVA side a request's
+`process` flag and DBE mask are honoured rather than defaulted, and a
+channel pinned with `server_addr` now reconnects on the circuit's flat 2 s
+timer: it had inherited the search ring's 10-bucket holdoff, which is a
+coordinate in a ring a forced-server channel does not have, so a pinned
+client slept ~10 s past a server that had already restarted.
+
+### The reference-tree suites stop reporting skips as passes
+
+Four parity suites resolved the C checkouts by reading an environment
+variable and returning early when it was unset — nextest reports that as a
+pass, so they had been green and vacuous. They now resolve through
+`epics_base_rs::reference` and fail loudly when the tree is absent, which
+means `EPICS_BASE`, `EPICS_MODULES` and `PVXS_HOME` must be exported to run
+them outside the main checkout. Un-silencing them is what exposed the PVA
+reconnect defect above. The interop job also builds its reference IOC on
+base R7.0.10: under R7.0.8 `dbAllocRecord()` reaches every field through
+`&ppvt->common`, so `-D_FORTIFY_SOURCE=3` aborts `dbLoadRecords` for any
+DBF_STRING field with an `initial` past `sizeof(dbCommon)` — `calcRecord.CALC`
+among them. Base `3d70e7064` (R7.0.9) is the floor.
+
+### Gates
+
+Every workflow's nextest invocation runs on `profile.ci`, the feature-gated
+test list is derived from the manifests instead of being hand-maintained, and
+the rustdoc gate's 47 broken and private intra-doc links are gone. The oracle
+run now fails on a dark type or a stale allowlist row rather than passing over
+it.
+
 ## v0.26.2 — 2026-08-20
 
 Patch release. aSub channel cells are now allocated and filled by their

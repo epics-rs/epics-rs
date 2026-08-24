@@ -43,7 +43,7 @@ The umbrella crate pulls in what you select by feature:
 
 ```toml
 [dependencies]
-epics-rs = { version = "0.26", features = ["ad"] }
+epics-rs = { version = "0.27", features = ["ad"] }
 ```
 
 ```rust
@@ -74,8 +74,8 @@ through the umbrella crate — depend on them directly when needed.
 You can also depend on sub-crates directly:
 
 ```toml
-epics-base-rs = "0.25"  # just the IOC runtime
-epics-ca-rs   = "0.25"  # just Channel Access
+epics-base-rs = "0.27"  # just the IOC runtime
+epics-ca-rs   = "0.27"  # just Channel Access
 ```
 
 ## Workspace
@@ -274,12 +274,28 @@ Per-crate design detail lives in each crate's README and on docs.rs.
 ## Testing
 
 ```bash
-# without a C EPICS tree (what CI runs)
+# what CI runs — `--profile ci` excludes the suites that need an upstream
+# C/C++ checkout, because no cross-platform runner provisions one
+cargo nextest run --profile ci --workspace --exclude epics-oracle-rs
+
+# the dev loop: same minus the oracle, but on `profile.default`, which
+# deliberately keeps the reference-tree suites in
+export EPICS_BASE=/path/to/epics-base
+export EPICS_MODULES=/path/to/epics-modules
+export PVXS_HOME=/path/to/pvxs
 cargo nextest run --workspace --exclude epics-oracle-rs
 
-# full suite, 10,000+ tests — includes the differential oracle
+# full suite, 11,000+ tests — adds the differential oracle
 cargo nextest run --workspace
 ```
+
+The four reference-tree suites (`reference_trees`, `dbd_initial_parity`,
+`base_device_parity`, `stdsupport_device_parity`) compare the port against
+the upstream C sources. They resolve the checkout from `EPICS_BASE` /
+`EPICS_MODULES` / `PVXS_HOME`, or from a sibling directory of this
+repository, and **panic when it is absent** rather than returning early —
+nextest reports an early return as a pass, so a skip there verifies nothing
+while looking green.
 
 Coverage includes wire-format golden packets (CA + PVA), pvxs interop
 fixtures, record processing and link chains, 46 golden tests against compiled
@@ -292,10 +308,10 @@ same test bodies on the reactor-free exec backend that RTEMS uses.
 
 `epics-oracle-rs` is the differential oracle: it boots a C `softIoc` and the
 Rust IOC on the same `.db` and diffs their observable CA/PVA behavior. It
-needs a built C EPICS tree (point `EPICS_BASE_BIN` / `EPICS_ORACLE_DBD` /
-`PVXS_BIN` at it — see
-[`crates/epics-oracle-rs/README.md`](crates/epics-oracle-rs/README.md)) and
-fails loudly rather than skipping when the tree is absent, so CI excludes it.
+needs a *built* C EPICS tree, not just the sources (point `EPICS_BASE_BIN` /
+`EPICS_ORACLE_DBD` / `PVXS_BIN` at it — see
+[`crates/epics-oracle-rs/README.md`](crates/epics-oracle-rs/README.md)), and
+takes the same fail-loudly rule as the suites above, so CI excludes it too.
 **Before contributing** changes that touch record, CA, or PVA behavior, run
 the full suite *including* the oracle against a local C tree — it is the gate
 CI cannot run for you.

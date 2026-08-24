@@ -12,7 +12,7 @@
 //! authoritative wire-level signal.
 //!
 //! Skip behaviour: if `softIocPVX` is not present under
-//! `~/codes/pvxs/bin/<arch>/`, the test prints a SKIP line and
+//! the resolved pvxs tree's `bin/<arch>/`, the test prints a SKIP line and
 //! returns OK so a CI host without pvxs built doesn't fail.
 
 // RTEMS-EXEC-MODEL-ALLOW(1): not run by the default nextest profile - this file is a module of the `interop_pvxs` binary, which `.config/nextest.toml`'s default-filter excludes.

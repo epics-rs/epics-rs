@@ -161,15 +161,17 @@ jobs:
     # Tests probe PATH for `softIoc`, `caget`, `pvget`, etc. Put
     # the EPICS host-arch bin dirs first so the tests find them.
     #
-    # PVXS_HOME is the other half. `interop_pvxs` resolves the pvxs
-    # *source* checkout through `epics_base_rs::reference` (sentinel
-    # `src/clientreq.cpp`, which `cp -r .` puts under /opt/pvxs), and it
-    # is the only binary in `profile.interop` that reads a reference
-    # tree — the four dedicated reference suites are excluded from both
-    # `profile.ci` and `profile.interop`. Unset, the resolver used to
-    # fall back to `$HOME/codes/pvxs`, so all 18 pvxs interop tests
-    # SKIPPED on CI and nextest reported the skips as passes; the
-    # resolver now panics instead, which is what surfaced this gap.
+    # PVXS_HOME and EPICS_BASE are the other half. `interop_pvxs`
+    # resolves both *source* checkouts through `epics_base_rs::reference`
+    # (sentinels `src/clientreq.cpp` and
+    # `modules/database/src/ioc/db/dbAccess.c`, which `cp -r .` puts
+    # under /opt), and it is the only binary in `profile.interop` that
+    # reads a reference tree — the four dedicated reference suites are
+    # excluded from both `profile.ci` and `profile.interop`. Unset, the
+    # resolvers used to fall back to `$HOME/codes/pvxs` and
+    # `$HOME/epics/epics-base`, so the pvxs interop tests SKIPPED on CI
+    # and nextest reported the skips as passes; they now panic instead,
+    # which is what surfaced both gaps.
     - name: Add EPICS bin dirs to PATH
       run: |
         HOST_ARCH=$(ls /opt/epics-base/bin | head -n1)
@@ -182,6 +184,11 @@ jobs:
           exit 1
         fi
         echo "PVXS_HOME=/opt/pvxs" >> "$GITHUB_ENV"
+        if [ ! -f /opt/epics-base/modules/database/src/ioc/db/dbAccess.c ]; then
+          echo "::error::/opt/epics-base is not a base source checkout — the cache holds an install prefix, not the tree the C++ interop helpers build against"
+          exit 1
+        fi
+        echo "EPICS_BASE=/opt/epics-base" >> "$GITHUB_ENV"
 
     # ── Dynamic-linker registration ────────────────────────────
     # The reference binaries link libpvxs.so.1.3 / libca.so by SONAME.

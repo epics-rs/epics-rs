@@ -27,6 +27,17 @@ fn pvxs_home() -> PathBuf {
     epics_base_rs::reference::reference_root(epics_base_rs::reference::ReferenceTree::Pvxs)
 }
 
+/// The EPICS base checkout, via the same resolver (`EPICS_BASE` overrides it).
+///
+/// Only the C++ helper builds below need it, and they used to resolve it
+/// themselves with a `$HOME/epics/epics-base` fallback — six copies of it.
+/// On any host where base lives elsewhere that fallback failed a path
+/// check and skipped, so `reverse_server`-backed interop ran nowhere but
+/// the author's laptop while reporting green everywhere else.
+fn epics_base_home() -> PathBuf {
+    epics_base_rs::reference::reference_root(epics_base_rs::reference::ReferenceTree::Base)
+}
+
 /// Host-arch name pvxs uses for its `bin/` and `lib/`
 /// subdirectories. Matches `EPICS_HOST_ARCH`. We only support
 /// the platforms the maintainer actually builds on.
@@ -154,3 +165,119 @@ pub const PVXPUT: &str = "pvxput";
 pub const PVXMONITOR: &str = "pvxmonitor";
 pub const PVXLIST: &str = "pvxlist";
 pub const SOFT_IOC_PVX: &str = "softIocPVX";
+
+// ─── C++ interop helpers ─────────────────────────────────────────────
+
+/// The C++ helpers under `cpp_helpers/`, with the extra flags each needs.
+///
+/// Table-driven so the owner below has no per-helper branch: a helper is
+/// its source stem plus its flags, and everything else about the build is
+/// the same for all of them.
+const CPP_HELPERS: &[(&str, &[&str])] = &[
+    ("reverse_server", &[]),
+    ("be_reverse_server", &["-DPVXS_ENABLE_EXPERT_API"]),
+    ("r20_typed_monitor", &[]),
+];
+
+/// Built helpers, keyed by name. Also the build lock: four test modules
+/// want `reverse_server`, and before this they each compiled it to the
+/// same path, concurrently, from their own copy of this function — one
+/// `c++` truncating the binary another was about to exec.
+static CPP_HELPER_CACHE: std::sync::OnceLock<
+    std::sync::Mutex<std::collections::HashMap<&'static str, Option<PathBuf>>>,
+> = std::sync::OnceLock::new();
+
+/// Compile `cpp_helpers/<name>.cpp` against the resolved pvxs and base
+/// trees and return the binary; `None` with a SKIP line when a build
+/// artifact the compile needs is absent (no `c++`, pvxs not built).
+///
+/// A tree that cannot be *resolved* is not a skip — `pvxs_home` /
+/// `epics_base_home` panic — because that is the case that used to report
+/// green while running nothing. `name` must be in [`CPP_HELPERS`]; an
+/// unknown one is a typo in a test, so it panics rather than skipping.
+pub fn cpp_helper(name: &'static str) -> Option<PathBuf> {
+    let (_, defines) = CPP_HELPERS
+        .iter()
+        .find(|(n, _)| *n == name)
+        .unwrap_or_else(|| panic!("unknown C++ interop helper {name:?}"));
+
+    let cache = CPP_HELPER_CACHE.get_or_init(Default::default);
+    let mut built = cache.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(cached) = built.get(name) {
+        return cached.clone();
+    }
+    let out = build_cpp_helper(name, defines);
+    built.insert(name, out.clone());
+    out
+}
+
+fn build_cpp_helper(name: &str, defines: &[&str]) -> Option<PathBuf> {
+    let src = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/interop_pvxs_mods/cpp_helpers")
+        .join(format!("{name}.cpp"));
+    if !src.is_file() {
+        eprintln!("SKIP: C++ interop helper source missing: {src:?}");
+        return None;
+    }
+    let out_dir = std::env::var("CARGO_TARGET_TMPDIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| std::env::temp_dir());
+    std::fs::create_dir_all(&out_dir).ok();
+    let out = out_dir.join(name);
+    let up_to_date = out.is_file()
+        && std::fs::metadata(&src).and_then(|m| m.modified()).ok()
+            <= std::fs::metadata(&out).and_then(|m| m.modified()).ok();
+    if up_to_date {
+        return Some(out);
+    }
+
+    let pvxs = pvxs_home();
+    let base = epics_base_home();
+    let arch = pvxs_arch();
+    let pvxs_lib = pvxs.join("lib").join(arch);
+    let base_lib = base.join("lib").join(arch);
+    if !pvxs_lib.is_dir() || !base_lib.is_dir() {
+        eprintln!(
+            "SKIP: {name} needs built libraries; {pvxs_lib:?} or {base_lib:?} is absent \
+             (the checkouts resolved, so build pvxs and base for {arch})."
+        );
+        return None;
+    }
+    let base_os_include = if cfg!(target_os = "macos") {
+        base.join("include/os/Darwin")
+    } else {
+        base.join("include/os/Linux")
+    };
+
+    let status = Command::new("c++")
+        .args(["-std=c++17", "-O0", "-g"])
+        .args(defines)
+        .arg(format!("-I{}", pvxs.join("include").display()))
+        .arg(format!("-I{}", base.join("include").display()))
+        .arg(format!(
+            "-I{}",
+            base.join("include/compiler/clang").display()
+        ))
+        .arg(format!("-I{}", base_os_include.display()))
+        .arg(&src)
+        .arg(format!("-L{}", pvxs_lib.display()))
+        .arg("-lpvxs")
+        .arg(format!("-L{}", base_lib.display()))
+        .arg("-lCom")
+        .arg(format!("-Wl,-rpath,{}", pvxs_lib.display()))
+        .arg(format!("-Wl,-rpath,{}", base_lib.display()))
+        .arg("-o")
+        .arg(&out)
+        .status();
+    match status {
+        Ok(s) if s.success() => Some(out),
+        Ok(s) => {
+            eprintln!("SKIP: c++ build of {name} failed (exit {s})");
+            None
+        }
+        Err(e) => {
+            eprintln!("SKIP: c++ compiler unavailable: {e}");
+            None
+        }
+    }
+}

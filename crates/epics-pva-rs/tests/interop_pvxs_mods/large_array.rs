@@ -130,7 +130,7 @@ async fn interop_large_array_a_pvxget_reads_huge_rust_array() {
 /// in `client_native/server_conn.rs`).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn interop_large_array_b_rust_client_reads_huge_pvxs_array() {
-    let Some(helper) = build_reverse_server_local() else {
+    let Some(helper) = super::interop_helpers::cpp_helper("reverse_server") else {
         return;
     };
 
@@ -227,69 +227,4 @@ async fn interop_large_array_b_rust_client_reads_huge_pvxs_array() {
         "xs[last] = {}",
         xs[N - 1]
     );
-}
-
-fn build_reverse_server_local() -> Option<std::path::PathBuf> {
-    use std::path::PathBuf;
-    let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("tests/interop_pvxs_mods/cpp_helpers/reverse_server.cpp");
-    if !src.is_file() {
-        return None;
-    }
-    let out_dir = std::env::var("CARGO_TARGET_TMPDIR")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| std::env::temp_dir());
-    std::fs::create_dir_all(&out_dir).ok();
-    let out = out_dir.join("reverse_server");
-    let need = !out.is_file()
-        || std::fs::metadata(&src).and_then(|m| m.modified()).ok()
-            > std::fs::metadata(&out).and_then(|m| m.modified()).ok();
-    if !need {
-        return Some(out);
-    }
-    let pvxs = std::env::var_os("PVXS_HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| {
-            let h = std::env::var("HOME").unwrap_or_default();
-            PathBuf::from(h).join("codes/pvxs")
-        });
-    let base = std::env::var_os("EPICS_BASE")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| {
-            let h = std::env::var("HOME").unwrap_or_default();
-            PathBuf::from(h).join("epics/epics-base")
-        });
-    let arch = super::interop_helpers::pvxs_arch();
-    let pvxs_lib = pvxs.join("lib").join(arch);
-    let base_lib = base.join("lib").join(arch);
-    if !pvxs_lib.exists() || !base_lib.exists() {
-        return None;
-    }
-    let base_os_include = if cfg!(target_os = "macos") {
-        base.join("include/os/Darwin")
-    } else {
-        base.join("include/os/Linux")
-    };
-    std::process::Command::new("c++")
-        .args(["-std=c++17", "-O0", "-g"])
-        .arg(format!("-I{}", pvxs.join("include").display()))
-        .arg(format!("-I{}", base.join("include").display()))
-        .arg(format!(
-            "-I{}",
-            base.join("include/compiler/clang").display()
-        ))
-        .arg(format!("-I{}", base_os_include.display()))
-        .arg(&src)
-        .arg(format!("-L{}", pvxs_lib.display()))
-        .arg("-lpvxs")
-        .arg(format!("-L{}", base_lib.display()))
-        .arg("-lCom")
-        .arg(format!("-Wl,-rpath,{}", pvxs_lib.display()))
-        .arg(format!("-Wl,-rpath,{}", base_lib.display()))
-        .arg("-o")
-        .arg(&out)
-        .status()
-        .ok()
-        .filter(|s| s.success())
-        .map(|_| out)
 }

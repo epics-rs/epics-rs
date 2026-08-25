@@ -263,9 +263,9 @@ INI
 (
     cd "$SRC/kernel"
     rm -rf build
-    ./waf configure --prefix="$PREFIX" --rtems-tools="$PREFIX" --rtems-config="$KERNEL_CFG"
-    ./waf -j"$JOBS"
-    ./waf install
+    python3 ./waf configure --prefix="$PREFIX" --rtems-tools="$PREFIX" --rtems-config="$KERNEL_CFG"
+    python3 ./waf -j"$JOBS"
+    python3 ./waf install
 ) >"$LOGS/kernel.log" 2>&1 || { tail -40 "$LOGS/kernel.log" >&2; echo "rtems-bsp: kernel build failed; log $LOGS/kernel.log" >&2; exit 1; }
 BSP_LIB="$PREFIX/$TOOL_TARGET/$BSP_NAME/lib"
 [[ -f "$BSP_LIB/librtemsbsp.a" && -f "$BSP_LIB/linkcmds" ]] || { echo "rtems-bsp: kernel installed nothing under $BSP_LIB" >&2; exit 1; }
@@ -279,10 +279,10 @@ step "libbsd: buildset/default.ini for $BSP (log $LOGS/libbsd.log)"
 (
     cd "$SRC/libbsd"
     rm -rf build
-    ./waf configure --prefix="$PREFIX" --rtems="$PREFIX" --rtems-tools="$PREFIX" \
+    python3 ./waf configure --prefix="$PREFIX" --rtems="$PREFIX" --rtems-tools="$PREFIX" \
         --rtems-bsps="$BSP" --buildset=buildset/default.ini
-    ./waf -j"$JOBS"
-    ./waf install -j1
+    python3 ./waf -j"$JOBS"
+    python3 ./waf install -j1
 ) >"$LOGS/libbsd.log" 2>&1 || { tail -40 "$LOGS/libbsd.log" >&2; echo "rtems-bsp: libbsd build failed; log $LOGS/libbsd.log" >&2; exit 1; }
 [[ -f "$BSP_LIB/libbsd.a" && -f "$BSP_LIB/include/machine/rtems-bsd-config.h" ]] \
     || { echo "rtems-bsp: libbsd installed nothing under $BSP_LIB" >&2; exit 1; }

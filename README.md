@@ -34,7 +34,7 @@ records with the full areaDetector plugin chain from a single `cargo build`.
 - **areaDetector** — NDArray, driver base, 26 plugins (Stats/ROI/FFT/file writers/PVA push/…)
 - **synApps modules** — std (epid/throttle/timestamp), scaler, optics, mca
 - **Drivers** — MQTT broker bridge, Modbus TCP/RTU/ASCII
-- **Targets** — Linux/macOS/Windows (x86_64 + arm64), RTEMS 6, VxWorks 7, Linux PREEMPT_RT
+- **Targets** — Linux/macOS/Windows (x86_64 + arm64), RTEMS 7 and 6, VxWorks 7, Linux PREEMPT_RT
 
 ## Installation
 

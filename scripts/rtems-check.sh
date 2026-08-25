@@ -108,7 +108,7 @@ else
     # host linker. Stem = basename without .json, upper-cased, non-alnum -> _.
     _stem="$(basename "$TARGET" .json)"
     _env="CARGO_TARGET_$(printf '%s' "$_stem" | tr '[:lower:]-' '[:upper:]_')_LINKER"
-    export "$_env=arm-rtems6-gcc"
+    export "$_env=$(./scripts/rtems-tool-target.sh)-gcc"
 fi
 # `-Zbuild-std` is required: there is no prebuilt std for this triple. Its
 # argument is QUOTED because the comma in `std,panic_abort` is cargo's crate

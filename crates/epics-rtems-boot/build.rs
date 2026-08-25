@@ -2,7 +2,7 @@
 //! contract.
 //!
 //! No-ops on every non-RTEMS target, so a host build — and `cargo package` on a
-//! machine with no cross toolchain — never needs `arm-rtems6-gcc`.
+//! machine with no cross toolchain — never needs the cross compiler.
 //!
 //! The flag definitions live in `src/contract.rs` and are `include!`d rather
 //! than duplicated: that same file is compiled into the library so a dependent
@@ -45,12 +45,12 @@ fn main() {
     // Unset prefix ⟹ the portability-check configuration: type-check only, no
     // toolchain required, and `lib.rs` leaves a self-naming undefined symbol so
     // the resulting objects cannot silently become a shimless image.
-    let Some((prefix, bsp)) = resolve_prefix() else {
+    let Some(prefix) = resolve_prefix() else {
         return;
     };
 
-    let lib_dir = bsp_lib_dir(&prefix, &bsp);
-    let include_dir = bsp_include_dir(&prefix, &bsp);
+    let lib_dir = bsp_lib_dir(&prefix);
+    let include_dir = bsp_include_dir(&prefix);
 
     let mut build = cc::Build::new();
     build
@@ -65,7 +65,7 @@ fn main() {
         // Base passes -DBSP_$(RTEMS_BSP) (modules/libcom/RTEMS/Makefile:41) so
         // configuration can be BSP-conditional; kept for parity even though our
         // shim has no BSP conditional today.
-        .define(&format!("BSP_{bsp}"), None)
+        .define(&format!("BSP_{}", prefix.bsp), None)
         .warnings(true);
 
     // `cc` cannot guess a cross compiler for a tier-3 triple. An explicit
@@ -74,7 +74,7 @@ fn main() {
     if std::env::var_os("CC_armv7_rtems_eabihf").is_none()
         && std::env::var_os("CC_armv7-rtems-eabihf").is_none()
     {
-        build.compiler(format!("{prefix}/bin/{CC_NAME}"));
+        build.compiler(prefix.cc_path());
     }
 
     // The C objects must land in the same multilib as the Rust objects and the

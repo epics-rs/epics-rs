@@ -75,11 +75,67 @@ pub const BSP_ENV: &str = "RTEMS_BSP";
 /// The BSP the acceptance ladder runs on.
 pub const DEFAULT_BSP: &str = "xilinx_zynq_a9_qemu";
 
-/// The toolchain target triple, as it appears in the install tree layout.
-pub const TOOL_TARGET: &str = "arm-rtems6";
+/// The toolchain targets a prefix can be laid out for — the directory under
+/// the prefix (`<prefix>/<tool target>/<bsp>/lib`) and the driver's name
+/// (`<prefix>/bin/<tool target>-gcc`). Both series install identically
+/// (measured on `arm-rtems6` 6.0.0 and `arm-rtems7` 7.0.0 installs,
+/// 2026-08-25), and both select the same `thumb/armv7-a+simd/hard` multilib
+/// with [`ABI_FLAGS`].
+///
+/// Which one a prefix is comes from the prefix itself ([`tool_target_in`]),
+/// never from configuration: the script produces one series per prefix, and a
+/// second knob that could disagree with the directory tree is one more way to
+/// link against the wrong `libbsd`.
+pub const TOOL_TARGETS: &[&str] = &["arm-rtems6", "arm-rtems7"];
 
-/// The cross compiler driver, which is also the linker (`.cargo/config.toml`).
-pub const CC_NAME: &str = "arm-rtems6-gcc";
+/// One resolved BSP prefix: its root, the BSP, and the toolchain target the
+/// tree is laid out for. Everything the link needs is derived from these three.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Prefix {
+    pub root: String,
+    pub bsp: String,
+    pub tool_target: &'static str,
+}
+
+impl Prefix {
+    /// `<prefix>/bin/<tool target>-gcc` — the cross compiler driver, which is
+    /// also the linker (`.cargo/config.toml`, or the `CARGO_TARGET_*_LINKER`
+    /// the prefix's `epics-rs-env.sh` exports).
+    pub fn cc_path(&self) -> String {
+        format!("{}/bin/{}-gcc", self.root, self.tool_target)
+    }
+}
+
+/// The toolchain target a prefix is laid out for: the one entry of
+/// [`TOOL_TARGETS`] whose `<root>/<target>/<bsp>/lib` `exists`.
+///
+/// None is a prefix with no BSP for this target in it; two is a prefix that
+/// two series were installed into, which nothing here can choose between and
+/// which `scripts/rtems-bsp.sh` never produces. `exists` is a parameter so the
+/// rule is testable on the host; `build.rs` passes `Path::is_dir`.
+pub fn tool_target_in(
+    root: &str,
+    bsp: &str,
+    exists: impl Fn(&str) -> bool,
+) -> Result<&'static str, String> {
+    let present: Vec<&'static str> = TOOL_TARGETS
+        .iter()
+        .copied()
+        .filter(|t| exists(&format!("{root}/{t}/{bsp}/lib")))
+        .collect();
+    match present.as_slice() {
+        [one] => Ok(one),
+        [] => Err(format!(
+            "{BSP_PREFIX_ENV}=\"{root}\" holds no <tool target>/{bsp}/lib for any of \
+             {TOOL_TARGETS:?}. It must be the RTEMS install prefix scripts/rtems-bsp.sh \
+             produces: tools, kernel and libbsd in one tree."
+        )),
+        many => Err(format!(
+            "{BSP_PREFIX_ENV}=\"{root}\" holds {bsp}/lib for {many:?}; keep one series \
+             per prefix (scripts/rtems-bsp.sh --prefix)."
+        )),
+    }
+}
 
 /// The RTEMS entry task. `POSIX_Init` because RTEMS >= 5 uses the POSIX API arm
 /// (EPICS base `configure/toolchain.c:31-35`), which is also what Rust's
@@ -112,17 +168,17 @@ pub const ABI_FLAGS: &[&str] = &[
 /// --end-group`. These three sit *outside* the group, ahead of it.
 pub const PRE_GROUP_LIBS: &[&str] = &["bsd", "m", "z"];
 
-/// `<prefix>/arm-rtems6/<bsp>/lib` — the BSP library directory.
+/// `<prefix>/<tool target>/<bsp>/lib` — the BSP library directory.
 ///
 /// This is the `-B` prefix, and passing it as `-B` is what supplies both the
 /// BSP's `-L` and its `-T linkcmds` (measured). The linker script is therefore
 /// never named explicitly; naming it ourselves would be a second, divergent
 /// source of truth for something the driver already knows.
-pub fn bsp_lib_dir(prefix: &str, bsp: &str) -> String {
-    format!("{prefix}/{TOOL_TARGET}/{bsp}/lib")
+pub fn bsp_lib_dir(prefix: &Prefix) -> String {
+    format!("{}/{}/{}/lib", prefix.root, prefix.tool_target, prefix.bsp)
 }
 
-/// `<prefix>/arm-rtems6/<bsp>/lib/include` — where the BSP and libbsd headers
+/// `<prefix>/<tool target>/<bsp>/lib/include` — where the BSP and libbsd headers
 /// the shim includes (`<rtems.h>`, `<machine/rtems-bsd-config.h>`,
 /// `<rtems/netcmds-config.h>`, `<rtems/shellconfig.h>`) are installed.
 ///
@@ -135,18 +191,18 @@ pub fn bsp_lib_dir(prefix: &str, bsp: &str) -> String {
 /// compiles out of its source tree, so a BSP sample's compile line shows
 /// in-tree `-I`s and is *not* evidence about the installed layout. libbsd is
 /// the right analogue, because it builds against the installed BSP as we do.
-pub fn bsp_include_dir(prefix: &str, bsp: &str) -> String {
-    format!("{}/include", bsp_lib_dir(prefix, bsp))
+pub fn bsp_include_dir(prefix: &Prefix) -> String {
+    format!("{}/include", bsp_lib_dir(prefix))
 }
 
 /// The full ordered list of link arguments for an RTEMS IOC binary.
 ///
 /// Each entry becomes one `cargo::rustc-link-arg`. `-u` and [`ENTRY_SYMBOL`]
 /// are two entries because the gcc driver takes them as two arguments.
-pub fn link_args(prefix: &str, bsp: &str) -> Vec<String> {
+pub fn link_args(prefix: &Prefix) -> Vec<String> {
     let mut args: Vec<String> = ABI_FLAGS.iter().map(|s| (*s).to_string()).collect();
     // Supplies the BSP `-L` *and* the `-T linkcmds`, so neither is named here.
-    args.push(format!("-B{}", bsp_lib_dir(prefix, bsp)));
+    args.push(format!("-B{}", bsp_lib_dir(prefix)));
     // Expands to the crt objects, the BSP search paths and the
     // `-lrtemsbsp -lrtemscpu -latomic -lc -lgcc` group.
     args.push("-qrtems".to_string());
@@ -205,36 +261,45 @@ pub fn emit_link_args() {
     if std::env::var("CARGO_CFG_TARGET_OS").as_deref() != Ok("rtems") {
         return;
     }
-    let Some((prefix, bsp)) = resolve_prefix() else {
+    let Some(prefix) = resolve_prefix() else {
         return;
     };
-    for arg in link_args(&prefix, &bsp) {
+    for arg in link_args(&prefix) {
         println!("cargo::rustc-link-arg={arg}");
     }
 }
 
-/// Reads [`BSP_PREFIX_ENV`]/[`BSP_ENV`], returning `None` in check-only mode.
+/// Reads [`BSP_PREFIX_ENV`]/[`BSP_ENV`] and discovers the toolchain target
+/// from the tree ([`tool_target_in`]), returning `None` in check-only mode.
 ///
 /// # Panics
 ///
-/// If the prefix is set but is not a directory — that is a misconfiguration
-/// with a fixable cause, and reporting it here is far cheaper than letting
-/// `cc` fail with a missing-compiler message or the linker with a missing
-/// `linkcmds`.
-pub fn resolve_prefix() -> Option<(String, String)> {
-    let prefix = std::env::var(BSP_PREFIX_ENV)
+/// If the prefix is set but is not a directory, or holds a BSP for no or for
+/// more than one of [`TOOL_TARGETS`] — misconfigurations with a fixable cause,
+/// and reporting them here is far cheaper than letting `cc` fail with a
+/// missing-compiler message or the linker with a missing `linkcmds`.
+pub fn resolve_prefix() -> Option<Prefix> {
+    let root = std::env::var(BSP_PREFIX_ENV)
         .ok()
         .filter(|p| !p.is_empty())?;
     assert!(
-        std::path::Path::new(&prefix).is_dir(),
-        "{BSP_PREFIX_ENV}=\"{prefix}\" is not a directory. It must point at the \
-         RTEMS install prefix that contains {TOOL_TARGET}/<bsp>/lib and bin/{CC_NAME}."
+        std::path::Path::new(&root).is_dir(),
+        "{BSP_PREFIX_ENV}=\"{root}\" is not a directory. It must point at the \
+         RTEMS install prefix scripts/rtems-bsp.sh produces."
     );
     let bsp = std::env::var(BSP_ENV)
         .ok()
         .filter(|b| !b.is_empty())
         .unwrap_or_else(|| DEFAULT_BSP.to_string());
-    Some((prefix, bsp))
+    let tool_target = match tool_target_in(&root, &bsp, |dir| std::path::Path::new(dir).is_dir()) {
+        Ok(target) => target,
+        Err(why) => panic!("{why}"),
+    };
+    Some(Prefix {
+        root,
+        bsp,
+        tool_target,
+    })
 }
 
 #[cfg(test)]
@@ -242,6 +307,56 @@ mod tests {
     use super::*;
 
     const PREFIX: &str = "/opt/rtems-probe";
+
+    fn probe(tool_target: &'static str) -> Prefix {
+        Prefix {
+            root: PREFIX.to_string(),
+            bsp: DEFAULT_BSP.to_string(),
+            tool_target,
+        }
+    }
+
+    /// The toolchain target is whichever series the tree holds, and only a
+    /// tree holding exactly one is a prefix.
+    #[test]
+    fn the_tool_target_is_read_off_the_tree() {
+        let holds = |dirs: &'static [&'static str]| {
+            move |dir: &str| {
+                dirs.iter()
+                    .any(|d| dir == format!("{PREFIX}/{d}/{DEFAULT_BSP}/lib"))
+            }
+        };
+        assert_eq!(
+            tool_target_in(PREFIX, DEFAULT_BSP, holds(&["arm-rtems6"])),
+            Ok("arm-rtems6")
+        );
+        assert_eq!(
+            tool_target_in(PREFIX, DEFAULT_BSP, holds(&["arm-rtems7"])),
+            Ok("arm-rtems7")
+        );
+        let none = tool_target_in(PREFIX, DEFAULT_BSP, holds(&[])).unwrap_err();
+        assert!(
+            none.contains("rtems-bsp.sh") && none.contains(PREFIX),
+            "{none}"
+        );
+        let both =
+            tool_target_in(PREFIX, DEFAULT_BSP, holds(&["arm-rtems6", "arm-rtems7"])).unwrap_err();
+        assert!(
+            both.contains("arm-rtems6") && both.contains("arm-rtems7"),
+            "{both}"
+        );
+    }
+
+    /// A different BSP under the same root is a different tree to look in.
+    #[test]
+    fn the_tool_target_lookup_names_the_bsp() {
+        let only_other_bsp = |dir: &str| dir == format!("{PREFIX}/arm-rtems7/beatnik/lib");
+        assert!(tool_target_in(PREFIX, DEFAULT_BSP, only_other_bsp).is_err());
+        assert_eq!(
+            tool_target_in(PREFIX, "beatnik", only_other_bsp),
+            Ok("arm-rtems7")
+        );
+    }
 
     /// The measured values of the real target spec
     /// (`rustc --print cfg --target armv7-rtems-eabihf`).
@@ -278,7 +393,7 @@ mod tests {
     /// selector that did not select anything.
     #[test]
     fn the_multilib_selectors_precede_the_rtems_group() {
-        let args = link_args(PREFIX, DEFAULT_BSP);
+        let args = link_args(&probe("arm-rtems6"));
         let qrtems = args.iter().position(|a| a == "-qrtems").expect("-qrtems");
         for flag in ABI_FLAGS {
             let at = args.iter().position(|a| a == flag).expect(flag);
@@ -291,14 +406,16 @@ mod tests {
     /// change would silently desynchronise.
     #[test]
     fn the_linker_script_is_never_named() {
-        let args = link_args(PREFIX, DEFAULT_BSP);
-        assert!(
-            args.iter()
-                .any(|a| a == &format!("-B{PREFIX}/arm-rtems6/{DEFAULT_BSP}/lib"))
-        );
-        for a in &args {
-            assert!(!a.contains("linkcmds"), "names the linker script: {a}");
-            assert!(a != "-T" && !a.starts_with("-T"), "passes -T: {a}");
+        for tool_target in TOOL_TARGETS {
+            let args = link_args(&probe(tool_target));
+            assert!(
+                args.iter()
+                    .any(|a| a == &format!("-B{PREFIX}/{tool_target}/{DEFAULT_BSP}/lib"))
+            );
+            for a in &args {
+                assert!(!a.contains("linkcmds"), "names the linker script: {a}");
+                assert!(a != "-T" && !a.starts_with("-T"), "passes -T: {a}");
+            }
         }
     }
 
@@ -306,7 +423,7 @@ mod tests {
     /// boots to silence; this is the belt half of the belt-and-braces.
     #[test]
     fn the_entry_symbol_is_forced_as_two_arguments() {
-        let args = link_args(PREFIX, DEFAULT_BSP);
+        let args = link_args(&probe("arm-rtems6"));
         let u = args.iter().position(|a| a == "-u").expect("-u");
         assert_eq!(args[u + 1], ENTRY_SYMBOL);
         assert!(args.iter().any(|a| a == "-Wl,--gc-sections"));
@@ -319,15 +436,23 @@ mod tests {
 
     #[test]
     fn every_path_is_derived_from_the_prefix() {
+        let six = probe("arm-rtems6");
         assert_eq!(
-            bsp_lib_dir(PREFIX, DEFAULT_BSP),
+            bsp_lib_dir(&six),
             "/opt/rtems-probe/arm-rtems6/xilinx_zynq_a9_qemu/lib"
         );
         assert_eq!(
-            bsp_include_dir(PREFIX, DEFAULT_BSP),
+            bsp_include_dir(&six),
             "/opt/rtems-probe/arm-rtems6/xilinx_zynq_a9_qemu/lib/include"
         );
-        for a in link_args(PREFIX, DEFAULT_BSP) {
+        assert_eq!(six.cc_path(), "/opt/rtems-probe/bin/arm-rtems6-gcc");
+        let seven = probe("arm-rtems7");
+        assert_eq!(
+            bsp_include_dir(&seven),
+            "/opt/rtems-probe/arm-rtems7/xilinx_zynq_a9_qemu/lib/include"
+        );
+        assert_eq!(seven.cc_path(), "/opt/rtems-probe/bin/arm-rtems7-gcc");
+        for a in link_args(&six).into_iter().chain(link_args(&seven)) {
             assert!(
                 !a.contains("/home/") && !a.contains("$HOME"),
                 "a machine-specific path leaked into the contract: {a}"

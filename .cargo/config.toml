@@ -25,7 +25,10 @@
 #
 # `arm-rtems6-gcc` is resolved from PATH: the toolchain prefix differs per
 # machine, so naming it absolutely here would commit one machine's layout.
-# Export `$RTEMS_BSP_PREFIX/bin` on PATH before building for RTEMS.
+# A series-7 prefix's driver is `arm-rtems7-gcc`; the prefix's
+# `epics-rs-env.sh` (written by `scripts/rtems-bsp.sh`) puts `bin` on PATH
+# and exports `CARGO_TARGET_ARMV7_RTEMS_EABIHF_LINKER`, which overrides the
+# name below. Source it before building for RTEMS.
 [build]
 rustc-wrapper = "scripts/rtems-rustc-wrapper.sh"
 

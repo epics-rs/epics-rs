@@ -668,7 +668,12 @@ mod tests {
             "#define CONFIGURE_POSIX_INIT_THREAD_ENTRY_POINT {ENTRY_SYMBOL}"
         )));
         assert!(init.contains(&format!("void *{ENTRY_SYMBOL}(void *argument)")));
-        assert!(link_args("/p", DEFAULT_BSP).contains(&ENTRY_SYMBOL.to_string()));
+        let prefix = Prefix {
+            root: "/p".to_string(),
+            bsp: DEFAULT_BSP.to_string(),
+            tool_target: TOOL_TARGETS[0],
+        };
+        assert!(link_args(&prefix).contains(&ENTRY_SYMBOL.to_string()));
     }
 
     /// Base #853's invariant: the PF_ROUTE socket must be open before

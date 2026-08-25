@@ -198,7 +198,7 @@ checkout() {
         want="$pin"
         # A pin that is not on the fetched branch is a typo or a rewritten
         # branch; either way it is not "the branch at this commit".
-        git -C "$dir" merge-base --is-ancestor "$pin" FETCH_HEAD \
+        git -C "$dir" merge-base --is-ancestor "$pin" FETCH_HEAD 2>/dev/null \
             || { echo "rtems-bsp: $repo pin $pin is not on origin/$branch" >&2; exit 1; }
     fi
     git -C "$dir" checkout --quiet --detach "$want"
@@ -209,7 +209,7 @@ checkout() {
 require() {
     local dir="$1" what="$2" sha; shift 2
     for sha in "$@"; do
-        git -C "$dir" merge-base --is-ancestor "$sha" HEAD || {
+        git -C "$dir" merge-base --is-ancestor "$sha" HEAD 2>/dev/null || {
             echo "rtems-bsp: $what at $(git -C "$dir" rev-parse --short HEAD) does not contain required fix $sha" >&2
             echo "  $(git -C "$dir" log -1 --format='%h %s' "$sha" 2>/dev/null || echo "(commit not in this clone)")" >&2
             exit 1

@@ -190,18 +190,33 @@ Driver authors use the runtime facade instead of tokio directly —
 
 ## Build for RTEMS (armv7-rtems-eabihf)
 
-The workspace cross-compiles to RTEMS 6 — a tier-3 target, so it needs a
+The workspace cross-compiles to RTEMS — a tier-3 target, so it needs a
 nightly toolchain with `rust-src` (plus `jq`), and `-Zbuild-std`:
 
 ```bash
 # type-check the whole RTEMS closure — no cross-toolchain or BSP needed
 ./scripts/rtems-check.sh
 
-# bootable CA IOC image (needs arm-rtems6-gcc on PATH and a libbsd BSP)
-RTEMS_BSP_PREFIX=/path/to/bsp cargo +nightly build --release --locked \
+# the BSP prefix an image links against — cross tools, kernel and libbsd from
+# pinned upstream revisions (RTEMS 7 by default, `--series 6` for the 6 branch)
+./scripts/rtems-bsp.sh
+source ~/rtems-bsp/7/epics-rs-env.sh
+
+# bootable CA IOC image
+cargo +nightly build --release --locked \
     -Zbuild-std=std,panic_abort --target armv7-rtems-eabihf \
     -p epics-ca-rs --bin realtime-ca-ioc --no-default-features --features client-core
 ```
+
+**The BSP prefix must be built with `scripts/rtems-bsp.sh`.** No RTEMS
+release carries the libbsd and kernel fixes an image relies on (rtems-libbsd
+!153/!154/!156/!159, kernel !1383/!1439 — the first release line to carry them
+is 6.3, which is not tagged), so the prefix is a source build, and the script
+is the one pinned, recorded way to make it: it asserts those fixes are in the
+tree it builds and writes the revisions into the prefix's `epics-rs-env.sh`.
+A prefix assembled any other way cannot be named in a bug report. Sourcing
+`epics-rs-env.sh` is the whole setup — `RTEMS_BSP_PREFIX`, `RTEMS_BSP`,
+`PATH` and the cargo linker override come from it.
 
 The custom target spec this workspace deviates on (`has-thread-local: true`,
 `doc/rtems-tls-spec-deviation.md`) is applied automatically by a rustc-wrapper

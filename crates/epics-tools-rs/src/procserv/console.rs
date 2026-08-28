@@ -168,9 +168,12 @@ impl ConsoleStream {
         // SAFETY: fd 0 is a valid fd for the lifetime of the process;
         // `try_clone_to_owned` dups it, so the threads keep working even
         // if something later replaces fd 0.
-        // NOT RTEMS-SAFE if this crate is ever built for RTEMS: `F_DUPFD`
-        // there calls the file's `open_h` (`libcsupport/src/fcntl.c:47-77`).
-        // A console fd survives that; a libbsd SOCKET does not — see
+        // On RTEMS this is `F_DUPFD`, which calls the file's `open_h`
+        // (`cpukit/libcsupport/src/fcntl.c:47-79` (`rtems_6`), the call at
+        // `:67`). A console fd survives that, and so does a libbsd socket at
+        // both declared libbsd pins — the "a SOCKET does not" half is
+        // withdrawn. What a socket still cannot take on RTEMS 6 is
+        // `F_DUPFD_CLOEXEC`, which that kernel has no case for; see
         // `epics-ca-rs/src/server/blocking.rs::handle_client_blocking`.
         let fd: Arc<OwnedFd> =
             Arc::new(unsafe { BorrowedFd::borrow_raw(CONSOLE_FD) }.try_clone_to_owned()?);
@@ -353,7 +356,7 @@ mod tests {
 
     /// `TtyGuard` on a non-tty (the test harness's stdin) must be inert:
     /// C's `ttySetCharNoEcho` returns early when `isatty(0) != 1`
-    /// (`procServ.cc:959`), and the console client still attaches.
+    /// (`procServ.cc:960`), and the console client still attaches.
     #[test]
     fn tty_guard_is_inert_without_a_terminal() {
         let guard = TtyGuard::set_char_no_echo();

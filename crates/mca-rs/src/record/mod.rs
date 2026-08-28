@@ -35,13 +35,15 @@ pub const VERSION: f64 = 6.01;
 /// `R{i}IP` a client sets, and the three the record computes (`R{i}`, `R{i}N`,
 /// `R{i}P`) plus its name (`R{i}NM`).
 ///
-/// C splits these across three C structs whose layout must "EXACTLY match the
-/// equivalent structures in the record" (`mcaRecord.c:181-195`) — the ROI
-/// controls, the ROI sums, and the names are three separate runs of `.dbd`
-/// fields, walked by pointer arithmetic. Nothing outside C's struct layout
-/// requires that split, and inside it, one mis-ordered `.dbd` field silently
-/// mis-reads every ROI. Here the ROI is ONE value; the `.dbd` order is a
-/// property of the generated field table alone.
+/// C splits these across two C structs whose layout must "EXACTLY match the
+/// equivalent structures in the record" (`mcaRecord.c:181-195`) — `struct roi`
+/// for the controls and `struct roiSum` for the sums, each reached by casting
+/// the first `.dbd` field and walking (`:1139-1140`, `:403-404`). The names are
+/// not among them: `R0NM` appears nowhere in `mcaRecord.c`, so they are a run
+/// of `.dbd` fields the record never walks at all. Nothing outside C's struct
+/// layout requires that split, and inside it, one mis-ordered `.dbd` field
+/// silently mis-reads every ROI. Here the ROI is ONE value; the `.dbd` order is
+/// a property of the generated field table alone.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Roi {
     /// `R{i}LO` — low channel. `.dbd` `initial("-1")`; a negative LO disables
@@ -569,7 +571,26 @@ impl Record for McaRecord {
         dbd_generated::MCA_NOACCESS
     }
 
-    /// C `cvt_dbaddr` (`mcaRecord.c:846-863`) ends with
+    /// `mca` raises `SIMM_ALARM` AFTER its SIOL read, not before it.
+    ///
+    /// `mcaRecord.c::readValue` reads the link first — `:1118`
+    /// `dbGetLink(&(pmca->siol), pmca->ftvl, pmca->bptr, NULL, &nRequest)` —
+    /// and runs `recGblSetSevr(pmca, SIMM_ALARM, pmca->sims)` at `:1129`, past
+    /// the `if/else` on SIMM. The base records do the opposite
+    /// (`longinRecord.c:414` then `:416`).
+    ///
+    /// It decides an equal-severity tie, because `recGblSetSevr` is
+    /// strict-greater and a failed `dbGetLink` raises LINK_ALARM/INVALID inside
+    /// itself (`dbLink.c:319-320`). With `SIMS = INVALID` and a broken SIOL, C's
+    /// mca therefore publishes `STAT = LINK_ALARM` / `AMSG = "field SIOL"`
+    /// where a longin publishes `STAT = SIMM_ALARM`.
+    ///
+    /// Read against `mca` at `687d563`.
+    fn raises_simm_after_read(&self) -> bool {
+        true
+    }
+
+    /// C `cvt_dbaddr` (`mcaRecord.c:847-863`) ends with
     /// `paddr->no_elements = pmca->nmax;` — outside the `fieldIndex` branch
     /// that picks `bptr` or `pbg`, so the channel capacity is `NMAX` for both
     /// `VAL` and `BG`. Those two are exactly the `special(SPC_DBADDR)` fields
@@ -844,7 +865,7 @@ impl Record for McaRecord {
         self.newv |= bit;
         // A channel-count change is the one setup change C forces a read after:
         // the spectrum a client is holding is now the wrong width. C's comment
-        // (`:1082-1089`) is explicit that SEQ and ERAS deliberately do NOT force
+        // (`:1079-1089`) is explicit that SEQ and ERAS deliberately do NOT force
         // one, because both are on the hot path of a scan.
         if bit == cycle::NEWV_NUSE {
             self.read = 1;
@@ -852,14 +873,14 @@ impl Record for McaRecord {
         Ok(())
     }
 
-    /// C `process` `:792-841` — the tail of the cycle, after device support has
+    /// C `process` `:793-841` — the tail of the cycle, after device support has
     /// sent the commands ([`McaRecord::take_device_requests`]), read the status
     /// ([`McaRecord::apply_status`]) and landed any new spectrum
     /// ([`McaRecord::land_spectrum_read`]).
     fn process(&mut self) -> CaResult<ProcessOutcome> {
         let mut actions = Vec::new();
 
-        // `NEWR` gates whether the regions are summed AT ALL (C `:792-794`), not
+        // `NEWR` gates whether the regions are summed AT ALL (C `:793-795`), not
         // which region is visited: `sum_ROIs` recomputes all 32 and clears the
         // whole map.
         if self.newr != 0 && self.sum_rois().preset_reached {
@@ -875,7 +896,7 @@ impl Record for McaRecord {
 
         // NOW the record admits acquisition has stopped: the final spectrum is
         // in, its ROI sums are computed, and both will be posted by this same
-        // cycle's monitor pass (C `:802-806` and the comment at `:736-738`).
+        // cycle's monitor pass (C `:803-806` and the comment at `:736-738`).
         self.acqg = u16::from(self.status.acquiring);
 
         if self.acqg == 0 {
@@ -892,7 +913,7 @@ impl Record for McaRecord {
     }
 
     /// C `recGblFwdLink` is called ONLY when acquisition has finished
-    /// (`mcaRecord.c:825-830`): an mca's forward link means "the spectrum is
+    /// (`mcaRecord.c:824-826`): an mca's forward link means "the spectrum is
     /// complete", not "the record was polled". A 10 Hz status poll during a
     /// 60-second acquisition would otherwise process the whole downstream chain
     /// 600 times.
@@ -906,7 +927,7 @@ impl Record for McaRecord {
     ///   framework's record-level metadata already does — no override needed.
     /// - `get_precision` (`:892-907`) serves 6 for the calibration fields
     ///   (`CALO`/`CALS`/`CALQ`/`TTH`) and `PREC` for everything else.
-    /// - `get_graphic_double` (`:909-928`) and `get_alarm_double` (`:948-960`)
+    /// - `get_graphic_double` (`:910-928`) and `get_alarm_double` (`:948-960`)
     ///   put `DTIM`/`IDTIM` on a 0..100 percent scale, with the record's alarm
     ///   limits — the two fields whose limits are meaningful, since `HIHI`..`LOLO`
     ///   alarm on `IDTIM`.
@@ -1042,9 +1063,10 @@ mod tests {
 
     // ---- the acquisition state machine (C `process`) ----
 
-    /// C `:640-644`. The start command and the status read happen in the SAME
-    /// cycle, and a device fast enough to have finished by the time the status is
-    /// read would report `acquiring = 0` on that first read. If `ACQG` were taken
+    /// C `:644`, and C's comment at `:640-643` says why. The start command and
+    /// the status read happen in the SAME cycle, and a device fast enough to
+    /// have finished by the time the status is read would report
+    /// `acquiring = 0` on that first read. If `ACQG` were taken
     /// from that status, the record would never see a 1 -> 0 edge and would never
     /// read the spectrum. So the start FORCES `ACQG` to 1, before any status.
     #[test]
@@ -1073,7 +1095,7 @@ mod tests {
         assert_eq!(rec.read, 0);
     }
 
-    /// C `:802-806` and its comment at `:736-738`: a client must not learn that
+    /// C `:803-806` and its comment at `:736-738`: a client must not learn that
     /// acquisition stopped before the last spectrum and its ROI sums are posted.
     /// So `ACQG` is committed by `process()`, never by the status read.
     #[test]
@@ -1094,7 +1116,7 @@ mod tests {
         assert_eq!(rec.acqg, 0, "and only now");
     }
 
-    /// C fires `recGblFwdLink` only when acquisition has finished (`:825-830`):
+    /// C fires `recGblFwdLink` only when acquisition has finished (`:824-826`):
     /// an mca's forward link means "the spectrum is complete".
     #[test]
     fn the_forward_link_fires_only_when_acquisition_is_over() {
@@ -1171,7 +1193,7 @@ mod tests {
 
     /// A channel-count change is the one setup change C forces a read after
     /// (`:1090-1093`): the spectrum the client holds is now the wrong width.
-    /// `SEQ` and `ERAS` deliberately do not (`:1082-1089`).
+    /// `SEQ` and `ERAS` deliberately do not — C's comment at `:1079-1089` says so.
     #[test]
     fn only_a_channel_count_change_forces_a_read() {
         let mut rec = loaded(8, &[0; 8]);

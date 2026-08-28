@@ -206,6 +206,116 @@ fn test_delay_do_action_fires() {
     assert_eq!(state, DelayDoState::Idle);
 }
 
+/// STD-12, boundary 1 — an `active` monitor event that only *falls* during
+/// standby must still reach `waiting`.
+///
+/// SNL's `active_mon` is raised by any monitor callback (`sync`,
+/// `seqPVmacros.h:131-134`), so `maybeWait`'s `efTest(active_mon)`
+/// (`delayDo.st:130`) is true after the fall and the sequence runs
+/// `waiting` → `action` → `PVPUT(doSeq,1)` (`:204`). Setting the flag only on
+/// a rising edge left it clear and sent `maybeWait` down its `! efTest` arm
+/// (`:138`) to `idle`, so the action never fired.
+#[test]
+fn delay_do_active_falling_during_standby_still_reaches_action() {
+    let mut ctrl = DelayDoController::new(0.0);
+    ctrl.step(&make_inputs(true, false, false, false, false, false)); // init → idle
+    ctrl.step(&make_inputs(true, false, false, false, true, true)); // idle → active
+    let (_, state) = ctrl.step(&make_inputs(true, false, true, true, true, false));
+    assert_eq!(state, DelayDoState::Standby, "active → standby");
+
+    // `active` falls while in standby: a monitor event with a value of 0.
+    ctrl.step(&make_inputs(true, false, true, false, false, true));
+    // standby drops.
+    let (_, state) = ctrl.step(&make_inputs(true, false, false, true, false, false));
+    assert_eq!(state, DelayDoState::MaybeWait);
+
+    let (_, state) = ctrl.step(&make_inputs(true, false, false, false, false, false));
+    assert_eq!(
+        state,
+        DelayDoState::Waiting,
+        "the latched fall must be seen"
+    );
+
+    std::thread::sleep(Duration::from_millis(5));
+    ctrl.step(&make_inputs(true, false, false, false, false, false)); // → action
+    let (action, state) = ctrl.step(&make_inputs(true, false, false, false, false, false));
+    assert_eq!(action, DelayDoAction::ProcessAction);
+    assert_eq!(state, DelayDoState::Idle);
+}
+
+/// STD-12, boundary 2 — the flag `active` (`delayDo.st:160`) consumes must not
+/// survive into the next standby cycle.
+///
+/// `active`'s third clause is `efTestAndClear(active_mon) && !active`, so the
+/// route standby → maybeWait → active → waiting → action leaves the flag
+/// clear. A flag that is never cleared there makes the *next* standby cycle
+/// reach `waiting` with no `active` traffic at all, an extra `doSeq` C never
+/// performs.
+#[test]
+fn delay_do_active_flag_does_not_survive_into_the_next_standby_cycle() {
+    let mut ctrl = DelayDoController::new(0.0);
+    ctrl.step(&make_inputs(true, false, false, false, false, false)); // init → idle
+    ctrl.step(&make_inputs(true, false, true, true, false, false)); // idle → standby
+
+    // First cycle: active rises during standby, standby drops while it is high.
+    ctrl.step(&make_inputs(true, false, true, false, true, true));
+    ctrl.step(&make_inputs(true, false, false, true, true, false)); // → maybeWait
+    let (_, state) = ctrl.step(&make_inputs(true, false, false, false, true, false));
+    assert_eq!(
+        state,
+        DelayDoState::Active,
+        "active is high, so maybeWait → active"
+    );
+
+    // active falls: `active` → `waiting`, consuming the flag.
+    ctrl.step(&make_inputs(true, false, false, false, false, true));
+    assert_eq!(ctrl.state, DelayDoState::Waiting);
+    std::thread::sleep(Duration::from_millis(5));
+    ctrl.step(&make_inputs(true, false, false, false, false, false)); // → action
+    let (action, state) = ctrl.step(&make_inputs(true, false, false, false, false, false));
+    assert_eq!(action, DelayDoAction::ProcessAction);
+    assert_eq!(state, DelayDoState::Idle);
+
+    // Second cycle, no `active` traffic whatsoever.
+    ctrl.step(&make_inputs(true, false, true, true, false, false)); // idle → standby
+    ctrl.step(&make_inputs(true, false, false, true, false, false)); // → maybeWait
+    let (action, state) = ctrl.step(&make_inputs(true, false, false, false, false, false));
+    assert_eq!(
+        state,
+        DelayDoState::Idle,
+        "no active event ⇒ maybeWait → idle"
+    );
+    assert_eq!(action, DelayDoAction::None);
+}
+
+/// STD-12, boundary 3 — an event arriving in a state that names no flag is
+/// latched, not dropped.
+///
+/// `action` (`delayDo.st:198-208`) has one unconditional `when ()`, so a
+/// `standby` callback landing on that step is tested by `idle` on the next
+/// one. Reading the per-step input directly consumed it in `action` and left
+/// `idle` with nothing to see. The same holds for `init`, `maybeStandby` and
+/// `maybeWait`, which name no `enable_mon`/`standby_mon` clause either.
+#[test]
+fn delay_do_event_arriving_in_a_transient_state_is_latched() {
+    let mut ctrl = DelayDoController::new(0.0);
+    ctrl.step(&make_inputs(true, false, false, false, false, false)); // init → idle
+    ctrl.step(&make_inputs(true, false, false, false, true, true)); // idle → active
+    ctrl.step(&make_inputs(true, false, false, false, false, true)); // active → waiting
+    std::thread::sleep(Duration::from_millis(5));
+    let (_, state) = ctrl.step(&make_inputs(true, false, false, false, false, false));
+    assert_eq!(state, DelayDoState::Action);
+
+    // The standby callback lands on the `action` step, which tests no flag.
+    let (action, state) = ctrl.step(&make_inputs(true, false, true, true, false, false));
+    assert_eq!(action, DelayDoAction::ProcessAction);
+    assert_eq!(state, DelayDoState::Idle);
+
+    // `idle` must still see it.
+    let (_, state) = ctrl.step(&make_inputs(true, false, true, false, false, false));
+    assert_eq!(state, DelayDoState::Standby, "the flag survived `action`");
+}
+
 #[test]
 fn test_delay_do_state_display() {
     assert_eq!(format!("{}", DelayDoState::Init), "init");

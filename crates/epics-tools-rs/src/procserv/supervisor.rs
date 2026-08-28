@@ -175,7 +175,7 @@ struct SupervisorState {
     pending_restart: Option<PendingRestart>,
     /// Wall-clock time the supervisor started, for the welcome banner's
     /// "@@@ procServ server started at:" line (C `procServStart`,
-    /// `clientFactory.cc:131-132`). Distinct from any monotonic
+    /// `clientFactory.cc:126-128`). Distinct from any monotonic
     /// `Instant`: this is for human display, not elapsed-time math.
     proc_started: DateTime<Local>,
     /// Directory the server was launched from, for infoMessage1's
@@ -204,7 +204,7 @@ struct ClientEntry {
     /// Mid-line state for `--logstamp` on this client's network stream:
     /// `true` ⟹ the last byte sent was not a newline, so the next chunk
     /// continues the line without a fresh timestamp. Per-client, mirroring
-    /// C's `_log_stamp_sent` member (`clientFactory.cc:138`). Only logger
+    /// C's `_log_stamp_sent` member (`procServ.h:138`). Only logger
     /// (readonly) clients are stamped, so it stays `false` for control
     /// clients.
     stamp_in_line: bool,
@@ -218,7 +218,7 @@ struct ChildSlot {
     /// time(0)` set at fork (`processFactory.cc:188`).
     started_at: tokio::time::Instant,
     /// Wall-clock spawn time for the welcome banner's "@@@ Child started
-    /// at:" line (C `IOCStart`, `clientFactory.cc:135-136`). Separate from
+    /// at:" line (C `IOCStart`, `clientFactory.cc:130-132`). Separate from
     /// the monotonic `started_at`, which can't render as a calendar time.
     started_wall: DateTime<Local>,
 }
@@ -307,7 +307,7 @@ impl SupervisorState {
         //
         // The addresses come from the *bound* listeners, not `config.listen`:
         // C's acceptItems refresh their address from the kernel right after
-        // binding (`getsockname`, acceptFactory.cc:184), so a `--port 0`
+        // binding (`getsockname`, acceptFactory.cc:222), so a `--port 0`
         // deployment publishes the real assigned port. A config-derived
         // render published the unusable `tcp:...:0` placeholder here.
         //
@@ -630,7 +630,7 @@ impl SupervisorState {
             ChildEvent::Output(bytes) => {
                 // PTY output is a process sender: it reaches every
                 // client and the log, never the child itself (C SendToAll
-                // with the process as sender, procServ.cc:730 → :759-763).
+                // with the process as sender, procServ.cc:725 → :759-763).
                 // The log write is folded into `send_to_all`, the single
                 // owner of the process/server fan-out.
                 self.send_to_all(&bytes, Origin::Child).await;
@@ -675,7 +675,7 @@ impl SupervisorState {
                     .format(&self.config.logging.time_format)
                     .to_string();
                 self.send_to_all(
-                    messages::child_shutting_down(&now, self.restart_mode, &info3).as_bytes(),
+                    &messages::child_shutting_down(&now, self.restart_mode, &info3),
                     Origin::Server,
                 )
                 .await;
@@ -804,7 +804,7 @@ impl SupervisorState {
         // LINEMODE]`, not the IAC bytes ahead of the greeting (PS-26). C
         // negotiates with every client, readonly included, so this is
         // unconditional.
-        handle.send(OutboundFrame::Bytes(banner.into_bytes())).await;
+        handle.send(OutboundFrame::Bytes(banner)).await;
         handle
             .send(OutboundFrame::RawIac(
                 crate::procserv::telnet::initial_negotiation(),
@@ -829,7 +829,7 @@ impl SupervisorState {
     /// gates the greeting + key hints and the connected-peer count on
     /// `!_readonly` (`clientFactory.cc:151-163`), handled inside
     /// `messages::welcome`.
-    fn welcome_banner(&self, readonly: bool) -> String {
+    fn welcome_banner(&self, readonly: bool) -> Vec<u8> {
         let tf = &self.config.logging.time_format;
         // C `command` is argv[optind] (procServ.cc:455) — the program path.
         let command = self.config.child.program.display().to_string();
@@ -1097,7 +1097,7 @@ fn exit_disposition(mode: RestartMode, first_run: bool) -> ExitDisposition {
 }
 
 /// Originator of a party-line message — the Rust model of C
-/// `SendToAll`'s `sender` argument (`procServ.cc:707`). C picks the
+/// `SendToAll`'s `sender` argument (`procServ.cc:711`). C picks the
 /// recipient set purely from the sender's class (`sender==NULL`,
 /// `sender->isProcess()`) and never compares identities, so this
 /// carries no `ClientId`.

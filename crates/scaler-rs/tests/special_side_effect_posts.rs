@@ -21,7 +21,7 @@
 //!
 //! These posts announce the OTHER fields a case changed; the WRITTEN field is
 //! posted by the put itself (C `dbPut` ends with `db_post_events(precord,
-//! pfieldsave, DBE_VALUE|DBE_LOG)`, dbAccess.c:1455-1459, after `special(TRUE)`
+//! pfieldsave, DBE_VALUE|DBE_LOG)`, dbAccess.c:1411-1413, after `special(TRUE)`
 //! — so it carries the clamped/derived value).
 //!
 //! DEVIATION from C, deliberate — CBUG-B18. The RATE case changes only RATE, so
@@ -34,6 +34,14 @@
 //! declared no `monitor_side_effect_fields`, so NONE of these posts fired:
 //! a `camonitor scaler.PR1` saw nothing when TP was written. That is R10-62, and
 //! the other cases below still pin it.)
+
+// RTEMS-EXEC-MODEL-ALLOW(6): checked, not waived — all 6 ran and passed
+// on the exec backend (measured on this tree:
+// `EPICS_RS_BUILD_EXEC_BACKEND=thread cargo nextest run -p scaler-rs
+// --all-features`, 112/112). scaler-rs became a census subject when its
+// `build.rs` began deriving `tokio_backend`; nothing here builds a CA
+// server, and the reactor these obtain comes from `#[tokio::test]`
+// itself, which the backend does not remove.
 
 use epics_base_rs::server::database::PvDatabase;
 use epics_base_rs::server::event_queue::EventReader;
@@ -81,7 +89,7 @@ async fn caput(db: &PvDatabase, field: &str, value: EpicsValue) {
 /// spurious event carried no LOG bit; both TP masks are checked here instead.
 ///
 /// The RATE write still reaches .RATE subscribers — through the put's own post
-/// (C `dbPut`, dbAccess.c:1455-1459), which runs after the clamp and so carries
+/// (C `dbPut`, dbAccess.c:1411-1413), which runs after the clamp and so carries
 /// the clamped value. That is C's behaviour too, and it is why the RATE case
 /// owes no side-effect post of its own.
 #[tokio::test]
@@ -140,8 +148,8 @@ async fn r10_62_a_preset_write_posts_that_channels_gate_and_direction() {
 
     caput(&db, "PR5", EpicsValue::Long(1000)).await;
 
-    assert!(d5_rx.try_recv().is_ok(), "C:704 posts D5");
-    let g5 = g5_rx.try_recv().expect("C:705 posts G5");
+    assert!(d5_rx.try_recv().is_ok(), "C:705 posts D5");
+    let g5 = g5_rx.try_recv().expect("C:706 posts G5");
     assert_eq!(
         g5.snapshot.value.to_f64(),
         Some(1.0),
@@ -149,7 +157,7 @@ async fn r10_62_a_preset_write_posts_that_channels_gate_and_direction() {
     );
 }
 
-/// Family: a Gn write that defaults an unset preset posts PRn (C:715-718).
+/// Family: a Gn write that defaults an unset preset posts PRn (C:717-719).
 #[tokio::test]
 async fn r10_62_a_gate_write_posts_the_preset_it_defaults() {
     let db = scaler_db().await;
@@ -157,11 +165,11 @@ async fn r10_62_a_gate_write_posts_the_preset_it_defaults() {
 
     caput(&db, "G3", EpicsValue::Short(1)).await;
 
-    let pr3 = pr3_rx.try_recv().expect("C:717 posts the defaulted PR3");
+    let pr3 = pr3_rx.try_recv().expect("C:719 posts the defaulted PR3");
     assert_eq!(
         pr3.snapshot.value.to_f64(),
         Some(1000.0),
-        "C:716 gives an unset preset the 1000-count default"
+        "C:718 gives an unset preset the 1000-count default"
     );
 }
 

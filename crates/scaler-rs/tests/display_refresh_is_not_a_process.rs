@@ -22,8 +22,17 @@
 //! with `ss == IDLE` — which must still start the count, so the gate cannot
 //! key on `ss` alone.
 
+#![cfg_attr(exec_backend, allow(unused_imports))]
+// This file's other cases are pure record-layer `#[test]`s; only the one
+// gated below builds a real CA server, which the reactor-free
+// `exec_backend` — selected on a host build by
+// `EPICS_RS_BUILD_EXEC_BACKEND=thread`, and unconditionally on RTEMS and
+// VxWorks — does not have. Gated per item rather than per file so the
+// record-layer cases keep compiling in that configuration.
+
 use epics_base_rs::server::record::{ProcessAction, Record};
 use epics_base_rs::types::EpicsValue;
+#[cfg(tokio_backend)]
 use epics_ca_rs::server::CaServerBuilder;
 use scaler_rs::ScalerRecord;
 use std::collections::HashMap;
@@ -139,6 +148,7 @@ fn a_delayed_start_landing_with_ss_idle_still_starts_the_count() {
 
 /// End to end, the finding's own trigger: RATE=10 arms a refresh at t=0, the
 /// operator stops at t=0.05, and the refresh must not fire FLNK at t=0.1.
+#[cfg(tokio_backend)]
 #[tokio::test]
 async fn a_refresh_after_a_stop_does_not_refire_flnk() {
     let db_str = r#"

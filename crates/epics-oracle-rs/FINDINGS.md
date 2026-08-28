@@ -15,6 +15,28 @@ links busy/transform/sseq/acalcout/scalcout/asyn on top of base; `CTools::bin`
 keeps the path above for the CA client tools only. Every figure below was
 produced by the stock binary, so a re-run is not diffing against the same C.
 
+**Booted and measured 2026-08-25.** The fat IOC runs, and the default
+configuration — fat `softIoc` + fat `dbd/softIoc.dbd` + the stock CA client
+tools — enumerates **40 record types, all 40 implemented by the port, 3388
+CA-observable fields, 736 `DBF_NOACCESS` excluded**, and its read phase is
+`ran 3388 = agreed 3388 + expected-deviation 0 + DEFECT 0 + ERROR 0`.
+
+The two C binaries are **not interchangeable**, and the difference is
+observable. The fat tree predates base `2ab1bb14c`, so its `calc` still carries
+`special(SPC_MOD)` on `INPM`..`INPU` (as do its `calcout` and `transform`);
+measured directly on `record(calc, "T:CALC") {}`:
+
+```sh
+caput -c -t -w 2 T:CALC.INPM 1
+# ~/work/epics-base/bin/linux-x86_64/softIoc   -> 1                       (accepted)
+# ~/work/oracle-ioc/bin/linux-x86_64/softIoc   -> Channel write request failed
+```
+
+So the default run diffs against **pre-`2ab1bb14c` C** and CBUG-F6 still fires,
+exactly as this document's put phase recorded. `EPICS_ORACLE_DBD` changes the
+denominator only; the IOC binary is `EPICS_ORACLE_IOC_BIN`, and a run that does
+not pin both has not pinned its ground truth.
+
 ## The denominator
 
 Enumerated from `/home/stevek/work/epics-base/dbd/softIoc.dbd` (the expanded
@@ -23,15 +45,16 @@ dbd — `dbCommon` inlined), not hand-listed.
 | | | status |
 |---|---|---|
 | record types in the dbd | 34 | recomputed 2026-08-23 from the file named above |
-| record types the port instantiates | **34** (measured by booting each; 0 unimplemented) | UNVERIFIED — `74096a5b` moved `probe_supported_record_types` from a bare `IocBuilder` onto `port_ioc_builder`, so this was measured against a different IOC configuration than the one under test |
-| CA-observable fields | **2551** | UNVERIFIED — the same path enumerates **2553** today. The run's copy of the file is gone, so the delta is attributed, not measured: `c9817fa59` (`bi.AFTC`, `bi.AFVL`) is base's only field-adding commit since 2025-10, and `dbd/softIoc.dbd` was rebuilt 2026-08-11 |
+| record types the port instantiates | **34** (measured by booting each; 0 unimplemented) | CONFIRMED 2026-08-25 — re-measured through `port_ioc_builder`, the configuration `74096a5b` moved the probe onto: still 34 of 34 on this dbd, and 40 of 40 on the fat one |
+| CA-observable fields | **2551** at the run; **2553** today | SUPERSEDED 2026-08-25 — 2553 re-measured, and every count below that says `ran 2551` should read 2553. The run's copy of the file is gone, so the +2 is attributed, not measured: `c9817fa59` (`bi.AFTC`, `bi.AFVL`) is base's only field-adding commit since 2025-10, and `dbd/softIoc.dbd` was rebuilt 2026-08-11 |
 | `DBF_NOACCESS` fields excluded | 594 (raw C pointers; no CA client can reach them) | recomputed 2026-08-23 |
 
 The harness no longer defaults to this file. `CTools::DEFAULT_DBD` is now the fat
 `/home/stevek/work/oracle-ioc/dbd/softIoc.dbd` (`e45a697f`), which enumerates 40
-record types and 3388 CA-observable fields (736 `DBF_NOACCESS` excluded). A
-re-run with defaults therefore measures a different surface than everything
-below; set `EPICS_ORACLE_DBD` back to the path above to reproduce this one.
+record types and 3388 CA-observable fields (736 `DBF_NOACCESS` excluded) —
+re-measured 2026-08-25, and reported above. A re-run with defaults therefore
+measures a different surface than everything below; set `EPICS_ORACLE_DBD` back
+to the path above to reproduce this one.
 
 ## Coverage
 
@@ -40,12 +63,13 @@ sides and was diffed. The remaining **89 fields (3.5 %) are ERRORED, not
 covered** — see below. Errors are never counted as coverage and never as
 agreement.
 
-UNVERIFIED. The denominator moved to 2553 (above), and `74096a5b` keeps a dark
-record type's fields in the denominator while `select_types` still drives only
-the implemented ones, so one unimplemented type now lowers this percent instead
-of leaving it unchanged. `d683e817` does **not** invalidate it: the filter it
-fixed counted any case carrying no boundary class as a read case, and the run
-below was `--phase read`, whose case list holds nothing else.
+SUPERSEDED — re-measured 2026-08-25 as **2553 / 2553 = 100 %**, no ERRORs. The
+`74096a5b` caveat (a dark record type's fields stay in the denominator while
+`select_types` drives only the implemented ones) cannot bite here because
+nothing is dark: the probe reports 0 unimplemented on both dbds. `d683e817`
+never invalidated the old figure either — the filter it fixed counted any case
+carrying no boundary class as a read case, and this is `--phase read`, whose
+case list holds nothing else.
 
 Coverage is claimed from the **read** phase only. The put and monitor phases do
 not visit every field, so quoting them as coverage would inflate the number.
@@ -56,18 +80,32 @@ not visit every field, so quoting them as coverage would inflate the number.
 ran 2551 = agreed 2149 + expected-deviation 0 + DEFECT 313 + ERROR 89
 ```
 
-UNVERIFIED. The read probe is untouched by the harness fixes on this branch, but
-`ran` is the denominator and that is now 2553, and the C side is no longer the
-binary that produced this split: base fixed `sel`, `seq`, `printf`, `histogram`
-and `calc` between 2026-07-19 and 2026-07-21. The 89-field list and the cluster
-table below are what a re-run must reproduce, not what it may assume.
+SUPERSEDED — re-measured 2026-08-25:
 
-### The 89 ERRORs are all one-sided: C serves the field, the port does not
+```
+ran 2553 = agreed 2553 + expected-deviation 0 + DEFECT 0 + ERROR 0
+```
 
-Not a harness failure — `caget`/`cainfo` connect on C and time out on the port.
-A C client can see these fields on the C IOC and cannot see them on the port, so
-each is also a Tier-1 divergence; the harness scores them ERROR because no
-reading was obtained, and names every one rather than rounding them into a pass.
+Every one of the 313 DEFECTs and 89 ERRORs below is closed. The 89 were the
+port not serving fields C serves; the 313 were the FieldDesc regeneration this
+document was written ahead of. The lists are kept as the record of what was
+fixed, not as an outstanding finding.
+
+The re-run is **chunked**, and that is not cosmetic: on a 40-type sweep at load
+100+ one record type's Rust IOC intermittently never answers a search, and the
+whole type comes back ERROR. It reproduces on no particular type — `stringin`
+(47 fields) on the fat sweep, `int64out` (66) on the stock one — and each
+re-runs clean on its own three times over. The cause is not the probe budget
+(`REACHABLE_ATTEMPTS` is 12 independent tries at C's own 1 s `-w`); it is
+unidentified, and it is the one instrument defect these figures rest on.
+
+### The 89 ERRORs were all one-sided: C served the field, the port did not
+
+Not a harness failure — `caget`/`cainfo` connected on C and timed out on the
+port. A C client could see these fields on the C IOC and not on the port, so
+each was also a Tier-1 divergence; the harness scored them ERROR because no
+reading was obtained, and named every one rather than rounding them into a pass.
+**All 89 now read on both sides** (2026-08-25).
 
 - `sel` — 21 fields missing (`PREC EGU HOPR LOPR ADEL MDEL LA..LL ALST MLST NLST`)
 - `sub` — 25 fields missing (`EGU HOPR LOPR PREC LA..LU`)
@@ -85,7 +123,7 @@ softIoc -S -d repro.db            # caget V:AI.LBRK -> 0
 oracle-ioc --db repro.db          # caget V:AI.LBRK -> not found
 ```
 
-### DEFECT clusters (313 cases, 559 differences)
+### DEFECT clusters (313 cases, 559 differences) — all closed 2026-08-25
 
 | n | surface | C | port | example |
 |---|---|---|---|---|
@@ -132,24 +170,34 @@ ran 842 = agreed 469 + expected-deviation 9 + DEFECT 364 + ERROR 0
 
 `ran 842` is recomputed: `is_put_candidate` over `calc`'s 119 CA-observable
 fields, expanded by `boundary_cases`, is exactly 842 cases on the dbd above as
-of 2026-08-23. The four-way split is UNVERIFIED. `27d9c135` read STAT and SEVR
+of 2026-08-23, and 842 again on 2026-08-25. The four-way split is SUPERSEDED —
+re-measured 2026-08-25, identically on both dbds and twice each:
+
+```
+ran 842 = agreed 833 + expected-deviation 9 + DEFECT 0 + ERROR 0
+```
+
+The nine are CBUG-F6 on `INPM`..`INPU`, unchanged. The reasons the old split was
+suspect are settled rather than merely noted: `27d9c135` read STAT and SEVR
 through `caget_batch(..).ok()`, so one unconnectable `.STAT` removed the alarm
 surface from every case of the record type while they all stayed AGREED, and
-`30f5b1b9` collapsed every `caput` failure into `accepted: false` on both sides,
-which reads as agreement about a write neither IOC saw. Both push AGREED up and
-DEFECT/ERROR down, so `ERROR 0` is the number most at risk.
+`30f5b1b9` collapsed every `caput` failure into `accepted: false` on both sides
+— both push AGREED up. The re-run has `ERROR 0` with those two fixed in place,
+so the zero is measured, not inherited.
 
 **CBUG-F6 fires as an EXPECTED DEVIATION on exactly the nine fields it names**
 (`calc.INPM`..`INPU`): C's `special()` rejects the `SPC_MOD` put, the port
 accepts it. That is the allowlist working as designed — the difference is
 justified by `doc/upstream-c-bugs.md` and is not counted as a defect.
 
-That can no longer happen. Base `2ab1bb14c` (2026-07-21) dropped
-`special(SPC_MOD)` from `calcRecord.dbd`'s `INPM`..`INPU`, so the C IOC now
-accepts those puts and there is no deviation left to justify. `calcoutRecord.dbd`
-still declares it, so the row's `calcout` half stands; on a `calc`-only re-run
-the row is exercised, never fires, and reports STALE — which since `35762dbe`
-fails the run on its own.
+It still does — but only against the ground truth the harness actually uses.
+Base `2ab1bb14c` (2026-07-21) dropped `special(SPC_MOD)` from `calcRecord.dbd`'s
+`INPM`..`INPU`, and a **stock** `softIoc` built from that tree accepts the nine
+puts, which would make the row STALE and fail the run. The default
+`EPICS_ORACLE_IOC_BIN` is the fat `softIoc`, built before that commit, and it
+still refuses them — measured 2026-08-25, see the ground-truth section above. So
+CBUG-F6 fires on 9 of 842, exactly as recorded here, and it will go STALE the
+moment the fat tree is rebuilt.
 
 ### The dominant put defect: an empty CALC expression alarms on the port
 
@@ -169,9 +217,10 @@ C's `postfix("")` is a valid empty program and `calcPerform` returns 0; the port
 raises `CALC_ALARM`. Every subsequent read of `STAT`/`SEVR` on that record then
 disagrees, which is why one bug produces hundreds of differences.
 
-The 537 (272 + 265) is UNVERIFIED for the same reason as the split above: under
-`27d9c135` a dropped STAT/SEVR batch could only lose differences, never invent
-them, so this is a floor rather than a count.
+The 537 (272 + 265) is CLOSED — the re-run of 2026-08-25 reports 0 DEFECT on
+`calc`, so the empty-CALC alarm no longer happens on either side. The figure was
+never more than a floor anyway: under `27d9c135` a dropped STAT/SEVR batch could
+only lose differences, never invent them.
 
 Other put clusters, after removing that one:
 
@@ -184,32 +233,59 @@ Other put clusters, after removing that one:
 | 8 | value | `0` | `-32768` / `32767` | `PHAS` over/under — port wraps, C rejects |
 | 5 | value | `4` | `INVALID` | `UDFS` past-the-end ordinal — port saturates, C stores 4 |
 
-Every `n` there is a measured outcome and UNVERIFIED, but three rows have a
-known direction. The **88 put accepted** cases are over-counted by however many
+Every `n` there is a measured outcome of the 2026-07-13 run and every one is now
+**0** — the 2026-08-25 re-run has no DEFECT cases on `calc` at all. What each row
+was, and why it moved, is below; three had a known direction even before the
+re-run. The **88 put accepted** cases are over-counted by however many
 had a C-side `caput` that timed out rather than being refused: `30f5b1b9` makes
 those ERROR. The **32 VAL over-double-max** is a difference count, not a case
 count — the plan drives 57 `over-double-max` cases on `calc`, one per DBF_FLOAT
 or DBF_DOUBLE put candidate — and `ae481936` bounds `CBUG-E2` by destination
 type, so a DBF_DOUBLE takes no integer cast and these stay DEFECT rather than
 being absorbed. The **12 SCAN negative ordinal** and **8 PHAS over/under** rows
-now fall inside that bounded `CBUG-E2` scope (`DBF_MENU`
-`enum-negative-ordinal`, `DBF_SHORT` `over-max`/`under-min`) and the row is
-enabled at HEAD, so up to 20 of these move from DEFECT to EXPECTED DEVIATION on
-a re-run; `calc`'s plan drives 34 cases in that scope in all.
+fall inside that bounded `CBUG-E2` scope (`DBF_MENU`
+`enum-negative-ordinal`, `DBF_SHORT` `over-max`/`under-min`), and the row is
+enabled at HEAD, so the prediction was that up to 20 would move from DEFECT to
+EXPECTED DEVIATION. **They did not.** The re-run absorbs nothing under CBUG-E2
+and reports it STALE — the port now agrees with the x86-64 C softIoc on all 34
+cases in that scope, so the row has no deviation left to justify and fails the
+run on its own.
 
 ## Monitor phase — event sequence and count
 
 Six cases, driven `1, 2, 2, 3` (the repeated `2` tests no-change suppression):
 **3 agreed, 3 DEFECT, 0 errors.**
 
-UNVERIFIED, and the case count does not reconcile with the probe.
+SUPERSEDED, and the published "six" was never reconcilable with the probe.
 `probe_monitor` emits one case per record type whose `VAL` is present, is a put
-candidate and is not a link; on the dbd above that gate admits **25** of the 34
-types, and the gate is byte-identical at the run commit, so six is unexplained
-rather than superseded. The verdicts are separately in question: `ba80e575` made
-the stimulus puts propagate their failure, where before a refused or timed-out
-drive left both traces empty and `compare` called that agreement — so `3 agreed`
-and `0 errors` are precisely the two numbers that fix moves.
+candidate and is not a link; that gate admits **25** of the stock dbd's 34 types
+and **30** of the fat dbd's 40, and it is byte-identical at the run commit, so
+six was not a smaller run — it was unexplained. Re-measured 2026-08-25 on the
+default (fat) configuration:
+
+```
+ran 30 = agreed 27 + expected-deviation 0 + DEFECT 0 + ERROR 3
+```
+
+(26 agreed in the sweep, plus `state.VAL` which agreed on its own re-run after a
+boot flake.) All three original DEFECTs — `bi.VAL` ordinals, `calc.VAL` missing
+alarm, `mbbi.VAL` event count — are closed.
+
+The **3 ERRORs are permanent, not flakes**: the stimulus put fails on both sides
+and there is nothing to compare. They reproduce on every run.
+
+| case | why it cannot run |
+|---|---|
+| `sel.VAL` | `caput` refused: `Write access denied` — `sel.VAL` is not writable with a default `SELM` |
+| `sub.VAL` | `Write callback operation timed out` on **both** sides |
+| `busy.VAL` | `Write callback operation timed out` on the C side |
+
+`ba80e575` is what makes them visible: before it, a refused or timed-out drive
+left both traces empty and `compare` called that agreement. Three cases the
+harness cannot drive is a coverage gap in the monitor probe, and it is named
+here rather than counted as a pass.
+
+The three original DEFECTs, kept as the record of what was fixed:
 
 1. **`bi.VAL` — enum ordinals instead of strings.** C posts
    `['Illegal_Value','Illegal_Value']`, the port posts `['2','3']`.
@@ -241,14 +317,21 @@ carries eight now, all of them enabled — `enabled` defaults true and neither
 commands under Reproducing are three processes with three separate ledgers, so
 the merged list above is not an artifact the harness emits.
 
-**now-stale — 2.** `CBUG-F6`: the deviation stopped existing, because base
-`2ab1bb14c` removed `special(SPC_MOD)` from `calcRecord.dbd` and C now accepts
-the nine puts the row says it refuses; on this document's `--record-types calc`
-run the row is exercised, never fires, and that is a run failure since
-`35762dbe`. `CBUG-E1`: the label is wrong rather than the row — `5e205087`
-(2026-07-14, the day after this run) split UNEXERCISED out of STALE, and
-`compress.VAL` is `DBF_NOACCESS`, so no phase ever enumerates it. It is
-UNEXERCISED, which is coverage; STALE would fail the run.
+**now-stale — 1, and it is not the one predicted.** Measured 2026-08-25 on
+`--phase put --record-types calc`, twice on each dbd:
+
+- `CBUG-F6` **FIRES**, 9 cases, `INPM`..`INPU`. The prediction that base
+  `2ab1bb14c` had killed it is right about a stock `softIoc` and wrong about
+  this harness, whose `EPICS_ORACLE_IOC_BIN` is the older fat binary — see the
+  ground-truth section.
+- `CBUG-E2` is **STALE**: bounded by destination type (`ae481936`) it should
+  have absorbed the `enum-negative-ordinal` and integer `over-max`/`under-min`
+  cases, and it absorbs none, because the port now agrees with C on all of them.
+  This is the one row that fails the run.
+- `CBUG-E1` is **UNEXERCISED**, not stale — the label was wrong rather than the
+  row. `5e205087` (2026-07-14, the day after this run) split UNEXERCISED out of
+  STALE, and `compress.VAL` is `DBF_NOACCESS`, so no phase ever enumerates it.
+  UNEXERCISED is coverage; STALE would fail the run.
 
 **newly-required — 6.** `CBUG-E2` is enabled and bounded by destination type
 (`ae481936`): it absorbs no `over-double-max` case and does absorb
@@ -269,6 +352,51 @@ a row count. What the window does expose is any run made inside it: the
 unbounded row would additionally have absorbed the `nan`, `over-float-max` and
 `over-double-max` classes on every float and double destination — 171 driven
 cases on `calc` alone, of which at least the 32 above actually differed.
+
+## Whole-surface run — 2026-08-25, re-measured
+
+The figures above are per-phase. `--phase all` on the fat default configuration,
+run twice back to back on the same binaries, gave the **same numbers both
+times**:
+
+```
+ran                : 23936
+agreed             : 23446
+expected deviation : 20   (CBUG-F6 x9, CBUG-E2 x1, CBUG-F12 x10)
+DEFECT             : 0
+ERROR              : 470
+```
+
+Identical case-for-case across the two runs (the 470 errored cases are the same
+470, by record type, field, phase and class), at 1-minute load averages of 10.20
+and 9.85 at the start and 11.75 and 541.23 at the end. So the 470 are not a load
+flake: they are deterministic, and 465 of them are one record type.
+
+**Why 465 `sub` cases cannot be measured, on either side.** The reproducer is
+`record(sub, "ORACLE:SUB:6") {}` — no `SNAM`. C `subRecord.c:119-122` prints
+`%s.SNAM is empty` and sets `prec->pact = TRUE`, permanently; `dbProcess`
+returns early for a record already in PACT (`dbAccess.c:537`), so the completion
+a `ca_put_callback` waits for never comes. Measured on a stock fat `softIoc`
+with `record(sub,"T:SUB"){}` beside `record(ai,"T:AI"){}`:
+
+```sh
+caget -t T:SUB.PACT T:AI.PACT        # -> 1   0
+caput -c -t -w 2 T:SUB.DESC hello    # -> Write callback operation timed out
+caput -c -t -w 2 T:AI.DESC  hello    # -> hello
+caput    -t -w 2 T:SUB.DESC bye      # -> bye   (a put with no callback lands)
+```
+
+The port reproduces this exactly — both sides time out on the identical set —
+so the two IOCs *agree*, and the harness still cannot say so: `caput -c` is the
+only mode in which "did the put succeed" is observable, and this record answers
+it to nobody. The 465 are charged as ERROR, which is honest but leaves 1.94% of
+the surface unadjudicated. Closing them needs a decision, not a patch: either
+the `sub` reproducer stops being the bare record (no `function()` is registered
+in a stock `softIoc`, so no `SNAM` resolves), or a case whose *both* sides time
+out the write callback on a PACT-latched record gets its own bucket with this
+citation attached. Neither is taken here.
+
+The remaining 5: 4 `busy` and 1 `sel`, also identical across both runs.
 
 ## Reproducing
 

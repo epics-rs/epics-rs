@@ -1231,7 +1231,7 @@ fn test_db_inp_does_not_raise_soft_alarm() {
 ///
 /// The trigger write must land BEFORE this cycle's `INP -> CVAL` fetch
 /// (C `dbPutLink` at `:121-127` precedes `dbGetLink(&pepid->inp)` at
-/// `:151`). The framework resolves input links before device-support
+/// `:149`). The framework resolves input links before device-support
 /// `read()` runs, so the TRIG write is NOT a device-support action —
 /// it is emitted by `EpidRecord::pre_input_link_actions`, which the
 /// framework executes strictly before the input-link fetch. The
@@ -1267,7 +1267,7 @@ fn test_db_trig_link_synchronous_fallthrough() {
     // DB link: PID ran synchronously this pass (did_compute is true),
     // and `read()` emits no actions and no ReprocessAfter — the TRIG
     // write already happened in the pre-input phase.
-    assert!(outcome.did_compute, "DB TRIG: PID runs this pass");
+    assert!(outcome.did_compute(), "DB TRIG: PID runs this pass");
     assert!(
         outcome.actions.is_empty(),
         "DB TRIG: read() emits no actions — TRIG write is pre-input"
@@ -1414,6 +1414,7 @@ fn ctx_with_udf(udf: bool) -> ProcessContext {
         time: std::time::SystemTime::UNIX_EPOCH,
         tsel: String::new(),
         dtyp: String::new(),
+        callback_priority: epics_base_rs::runtime::task::CallbackPriority::Low,
     }
 }
 
@@ -1427,6 +1428,7 @@ fn ctx_with_dtyp(dtyp: &str) -> ProcessContext {
         time: std::time::SystemTime::UNIX_EPOCH,
         tsel: String::new(),
         dtyp: dtyp.to_string(),
+        callback_priority: epics_base_rs::runtime::task::CallbackPriority::Low,
     }
 }
 
@@ -1793,7 +1795,7 @@ fn test_maxmin_bumpless_edge_no_readback_for_constant_outl() {
 /// BUG 2 — the MaxMin edge then uses the read-back OVAL. The
 /// framework's `ReadDbLink{OUTL->OVAL}` has already populated
 /// `epid.oval` by the time `do_pid` runs; `do_pid`'s MaxMin edge
-/// outputs that value (devEpidSoft.c:217 `dbGetLink(...&oval...)`
+/// outputs that value (devEpidSoft.c:181 `dbGetLink(...&oval...)`
 /// then the output is set to it).
 #[test]
 fn test_maxmin_bumpless_edge_output_uses_readback_oval() {

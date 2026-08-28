@@ -32,7 +32,7 @@
 //! dbChannel.c:579   probe.field_type = dbChannelExportType(chan);
 //! dbChannel.c:621   chan->final_type = probe.field_type;
 //! dbChannel.h:424   #define dbChannelExportType(pChan) ((pChan)->addr.dbr_field_type)
-//! dbAccess.c:640    paddr->dbr_field_type = mapDBFToDBR[dbfType];
+//! dbAccess.c:639    paddr->dbr_field_type = mapDBFToDBR[dbfType];
 //! ```
 //!
 //! and `mapDBFToDBR` (`dbAccess.c:76`) sends `DBF_MENU` and `DBF_DEVICE` to
@@ -48,8 +48,8 @@
 //! # Where the `.dbd` stops determining the shape
 //!
 //! `mapDBFToDBR` sets a **default** that the record type may then overwrite. The
-//! very next lines of `dbNameToAddr` hand the `DBADDR` to the record
-//! (`dbAccess.c:640-648`):
+//! very next lines of `dbEntryToAddr` — which `dbNameToAddr` reaches at
+//! `dbAccess.c:677` — hand the `DBADDR` to the record (`:639-648`):
 //!
 //! ```text
 //! paddr->dbr_field_type = mapDBFToDBR[dbfType];   /* the rule encoded below */
@@ -172,7 +172,7 @@ impl NtShape {
         Self::projected(field.dbf)
     }
 
-    /// `mapDBFToDBR` (`dbAccess.c:640`) composed with `fromDbrType`
+    /// `mapDBFToDBR` (`dbAccess.c:639`) composed with `fromDbrType`
     /// (`typeutils.cpp:30`) — the rule for a field whose `DBADDR` no record-type
     /// hook rewrites.
     ///

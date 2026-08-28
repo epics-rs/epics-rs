@@ -208,6 +208,122 @@ fn boolean_payload_to_int(s: &str) -> Option<i64> {
     }
 }
 
+/// Parse a whole payload element the way C's `strtod` does.
+///
+/// MQ37: C validates a scalar FLOAT with `strtof` (drvMqtt.cpp:399) and array
+/// elements go straight through `std::strtod` (drvMqtt.cpp:538). Both take the
+/// full C99 grammar, and two of its forms `f64::from_str` rejects outright: a
+/// hexadecimal significand (`0x1.8p3`, whose binary exponent `strtod` treats as
+/// optional) and a NaN carrying a character sequence (`nan(123)`). Everything
+/// else is delegated to `f64::from_str`, whose accept set already matches
+/// `strtod`'s decimal form.
+///
+/// `None` means "not consumed to the end", which is what `isFloat`'s
+/// `end == s.c_str() + s.size()` test (drvMqtt.cpp:400) rejects, and what the
+/// array walker sees as a separator that is not a separator.
+fn parse_c_float(s: &str) -> Option<f64> {
+    let (negative, body) = match s.strip_prefix('-') {
+        Some(rest) => (true, rest),
+        None => (false, s.strip_prefix('+').unwrap_or(s)),
+    };
+    let magnitude = if body.starts_with("0x") || body.starts_with("0X") {
+        parse_hex_float(body)?
+    } else if let Some(v) = parse_nan_sequence(body) {
+        v
+    } else {
+        // Decimal (and bare `inf` / `nan`): from_str already matches strtod,
+        // including its rejection of leading or trailing junk.
+        return s.parse::<f64>().ok();
+    };
+    Some(if negative { -magnitude } else { magnitude })
+}
+
+/// C99 hexadecimal floating form, unsigned: `0x` h+ [`.` h*] [(`p`|`P`) \[sign\]
+/// d+]. The exponent is optional here because `strtod` accepts `0x1.8`; when a
+/// `p` is present its digits are required, and anything left over makes the
+/// whole element unconsumed. An exponent large enough to overflow yields an
+/// infinity, which the scalar arm's finiteness guard then refuses exactly as
+/// `std::stod`'s `out_of_range` does.
+fn parse_hex_float(body: &str) -> Option<f64> {
+    let rest = body
+        .strip_prefix("0x")
+        .or_else(|| body.strip_prefix("0X"))?;
+    let (digits, exponent) = match rest.find(['p', 'P']) {
+        Some(i) => (&rest[..i], Some(&rest[i + 1..])),
+        None => (rest, None),
+    };
+    let (int_digits, frac_digits) = match digits.split_once('.') {
+        Some((a, b)) => (a, b),
+        None => (digits, ""),
+    };
+    if int_digits.is_empty() && frac_digits.is_empty() {
+        return None;
+    }
+
+    let mut mantissa = 0.0f64;
+    for c in int_digits.chars() {
+        mantissa = mantissa * 16.0 + f64::from(c.to_digit(16)?);
+    }
+    let mut place = 1.0f64 / 16.0;
+    for c in frac_digits.chars() {
+        mantissa += f64::from(c.to_digit(16)?) * place;
+        place /= 16.0;
+    }
+
+    let exponent = match exponent {
+        None => 0i32,
+        Some(e) => {
+            let (sign, digits) = match e.strip_prefix('-') {
+                Some(rest) => (-1i32, rest),
+                None => (1i32, e.strip_prefix('+').unwrap_or(e)),
+            };
+            if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
+                return None;
+            }
+            // A silly-large exponent saturates rather than wrapping; powi then
+            // gives 0 or inf, which is what strtod reports for it.
+            sign * digits.parse::<i32>().unwrap_or(i32::MAX / 2)
+        }
+    };
+
+    Some(mantissa * 2f64.powi(exponent))
+}
+
+/// C99 `nan(n-char-sequence)`, unsigned. The sequence is
+/// implementation-defined; glibc accepts alphanumerics and `_`, and an empty
+/// sequence is legal. A bare `nan` is *not* matched here — `f64::from_str`
+/// already takes it.
+fn parse_nan_sequence(body: &str) -> Option<f64> {
+    if !body.get(..3)?.eq_ignore_ascii_case("nan") {
+        return None;
+    }
+    let inner = body[3..].strip_prefix('(')?.strip_suffix(')')?;
+    if !inner
+        .bytes()
+        .all(|b| b.is_ascii_alphanumeric() || b == b'_')
+    {
+        return None;
+    }
+    Some(f64::NAN)
+}
+
+/// Does the payload text itself name an infinity or a NaN?
+///
+/// MQ36: C converts a scalar FLOAT with `std::stod` (drvMqtt.cpp:287), which
+/// throws `out_of_range` only when the *value* leaves the double range — a
+/// literal `inf` / `nan` is consumed by `strtod` with no range error, so
+/// `stod` returns it and C stores it. The finiteness guard must therefore let
+/// a payload that names a non-finite value through and reject only a
+/// finite-looking one that overflowed. The accept set is `f64::from_str`'s,
+/// since that is what produced the value.
+fn text_names_non_finite(s: &str) -> bool {
+    let body = s.strip_prefix(['+', '-']).unwrap_or(s);
+    body.eq_ignore_ascii_case("inf")
+        || body.eq_ignore_ascii_case("infinity")
+        || body.eq_ignore_ascii_case("nan")
+        || parse_nan_sequence(body).is_some()
+}
+
 fn decode_flat(raw: &str, value_type: ValueType) -> MqttResult<DecodedValue> {
     let trimmed = raw.trim();
     match value_type {
@@ -231,10 +347,25 @@ fn decode_flat(raw: &str, value_type: ValueType) -> MqttResult<DecodedValue> {
             // end-of-string (trailing whitespace/garbage rejected). So " 4.2"
             // is a valid 4.2 in C while "4.2 " is refused. trim_start() before
             // parse() mirrors that: accept leading ws, still reject trailing.
-            let v: f64 = raw
-                .trim_start()
-                .parse()
-                .map_err(|e| MqttError::ValueConversion(format!("FLOAT parse: {e}")))?;
+            let text = raw.trim_start();
+            let v: f64 = parse_c_float(text).ok_or_else(|| {
+                MqttError::ValueConversion(format!("FLOAT parse: {text:?} is not a C float"))
+            })?;
+            // MQ36: C's isFloat accepts "1e400" because strtof consumes the
+            // whole string (drvMqtt.cpp:393-401), and the conversion that
+            // follows is `std::stod`, which throws `out_of_range` for a
+            // magnitude no double can hold (drvMqtt.cpp:287). The throw is
+            // caught (drvMqtt.cpp:327-331) with no setParam, so the record
+            // keeps its prior value. `f64::from_str` returns +/-inf instead, so
+            // a client read `inf` where C read the previous number. Reject only
+            // when the text does not itself name the non-finite value -- see
+            // `text_names_non_finite`.
+            if !v.is_finite() && !text_names_non_finite(text) {
+                return Err(MqttError::ValueConversion(format!(
+                    "FLOAT parse: {text:?} is out of range for a double \
+                     (C std::stod throws out_of_range)"
+                )));
+            }
             Ok(DecodedValue::Float64(v))
         }
         ValueType::Digital => {
@@ -436,9 +567,13 @@ fn parse_float_array(s: &str) -> MqttResult<Vec<f64>> {
         // `parse_int_array` for the comma/double-comma/`"1 ,2"` rationale.
         s.split(',')
             .map(|part| {
-                part.trim()
-                    .parse::<f64>()
-                    .map_err(|e| MqttError::ValueConversion(format!("FLOATARRAY element: {e}")))
+                let part = part.trim();
+                // MQ37: C walks array elements with `std::strtod`
+                // (drvMqtt.cpp:538), so they take the same C99 grammar the
+                // scalar arm does -- hex significands included.
+                parse_c_float(part).ok_or_else(|| {
+                    MqttError::ValueConversion(format!("FLOATARRAY element: {part:?}"))
+                })
             })
             .collect()
     } else {
@@ -446,8 +581,9 @@ fn parse_float_array(s: &str) -> MqttResult<Vec<f64>> {
         // `parse_int_array`.
         s.split_whitespace()
             .map(|part| {
-                part.parse::<f64>()
-                    .map_err(|e| MqttError::ValueConversion(format!("FLOATARRAY element: {e}")))
+                parse_c_float(part).ok_or_else(|| {
+                    MqttError::ValueConversion(format!("FLOATARRAY element: {part:?}"))
+                })
             })
             .collect()
     };
@@ -571,6 +707,95 @@ mod tests {
         let addr = TopicAddress::parse("FLAT:INTARRAY test/t").unwrap();
         let val = decode_payload("1,2,3,4", &addr).unwrap();
         assert_eq!(val, DecodedValue::Int32Array(vec![1, 2, 3, 4]));
+    }
+
+    /// MQ36: a FLOAT payload that overflows the double range must leave the
+    /// record at its prior value, as C's `std::stod` out_of_range does
+    /// (drvMqtt.cpp:286-287,327-331) -- not store an infinity.
+    #[test]
+    fn decode_flat_float_rejects_overflow_but_keeps_a_named_infinity() {
+        let addr = TopicAddress::parse("FLAT:FLOAT t/f").unwrap();
+        assert!(
+            decode_payload("1e400", &addr).is_err(),
+            "overflow must fail"
+        );
+        assert!(
+            decode_payload("-1e400", &addr).is_err(),
+            "negative overflow must fail"
+        );
+
+        // C stores a payload that names the value: strtof consumes "inf" with
+        // no range error, so stod returns HUGE_VAL and never throws.
+        assert_eq!(
+            decode_payload("inf", &addr).unwrap(),
+            DecodedValue::Float64(f64::INFINITY)
+        );
+        assert_eq!(
+            decode_payload("-Infinity", &addr).unwrap(),
+            DecodedValue::Float64(f64::NEG_INFINITY)
+        );
+        match decode_payload("nan", &addr).unwrap() {
+            DecodedValue::Float64(v) => assert!(v.is_nan()),
+            other => panic!("expected Float64(NaN), got {other:?}"),
+        }
+
+        // The ARRAY path keeps C's range behaviour: it parses elements with
+        // bare `std::strtod` and ignores ERANGE (drvMqtt.cpp:538), so C stores
+        // an infinity there and so must this port.
+        let arr = TopicAddress::parse("FLAT:FLOATARRAY t/a").unwrap();
+        assert_eq!(
+            decode_payload("1e400 2", &arr).unwrap(),
+            DecodedValue::Float64Array(vec![f64::INFINITY, 2.0])
+        );
+    }
+
+    #[test]
+    fn decode_flat_float_accepts_the_c99_strtod_grammar() {
+        let addr = TopicAddress::parse("FLAT:FLOAT t/f").unwrap();
+
+        // MQ37: `strtof`/`std::stod` take a hexadecimal significand, and the
+        // binary exponent is optional. `f64::from_str` takes none of these.
+        assert_eq!(
+            decode_payload("0x1.8p3", &addr).unwrap(),
+            DecodedValue::Float64(12.0)
+        );
+        assert_eq!(
+            decode_payload("-0X1P-1", &addr).unwrap(),
+            DecodedValue::Float64(-0.5)
+        );
+        assert_eq!(
+            decode_payload("0x1.8", &addr).unwrap(),
+            DecodedValue::Float64(1.5)
+        );
+
+        // ... and a NaN carrying a character sequence, empty sequence included.
+        for text in ["nan(123)", "NAN(_ab9)", "nan()"] {
+            match decode_payload(text, &addr).unwrap() {
+                DecodedValue::Float64(v) => assert!(v.is_nan(), "{text} must be NaN"),
+                other => panic!("expected Float64(NaN) for {text}, got {other:?}"),
+            }
+        }
+
+        // Full consumption is still required: `isFloat` (drvMqtt.cpp:400)
+        // compares strtof's end pointer against the end of the payload.
+        for text in ["0x1.8p3junk", "0x1.8p", "0xg", "0x"] {
+            assert!(
+                decode_payload(text, &addr).is_err(),
+                "{text} is not consumed to the end and must be refused"
+            );
+        }
+
+        // The array walker uses `std::strtod` on each element (drvMqtt.cpp:538),
+        // so it takes the same grammar in both separator styles.
+        let arr = TopicAddress::parse("FLAT:FLOATARRAY t/a").unwrap();
+        assert_eq!(
+            decode_payload("0x1.8p3 2", &arr).unwrap(),
+            DecodedValue::Float64Array(vec![12.0, 2.0])
+        );
+        assert_eq!(
+            decode_payload("0x1p1, 0x1p2", &arr).unwrap(),
+            DecodedValue::Float64Array(vec![2.0, 4.0])
+        );
     }
 
     #[test]

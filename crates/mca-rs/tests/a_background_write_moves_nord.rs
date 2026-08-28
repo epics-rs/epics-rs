@@ -14,8 +14,10 @@
 //! ```
 //!
 //! and `dbPut` calls it for EVERY `special(SPC_DBADDR)` field it writes
-//! (`dbAccess.c:1370-1373`, with `nRequest` already cut to the `cvt_dbaddr`
-//! capacity at `:1364-1365`). `VAL` and `BG` are the two such fields
+//! (`dbAccess.c:1365-1368`, with `nRequest` already cut to the `cvt_dbaddr`
+//! capacity at `:1360-1361`; the local checkout `8f5015b66` sits five lines
+//! lower and reads `:1370-1373` and `:1365-1366`). `VAL` and `BG` are the
+//! two such fields
 //! (`mcaRecord.dbd:35`, `:49`), so a background write sets the record's one
 //! `NORD` — and `get_array_info` has no `fieldIndex` branch either, so it then
 //! governs what BOTH fields serve.
@@ -26,6 +28,14 @@
 //!
 //! Boundaries: a background shorter than the spectrum, one exactly as long,
 //! and one longer than the capacity.
+
+// RTEMS-EXEC-MODEL-ALLOW(4): checked, not waived — all 4 ran and passed
+// on the exec backend (measured on this tree:
+// `EPICS_RS_BUILD_EXEC_BACKEND=thread cargo nextest run -p mca-rs
+// --all-features`, 62/62). mca-rs became a census subject when its
+// `build.rs` began deriving `tokio_backend`; nothing here builds a CA
+// server, and the reactor these obtain comes from `#[tokio::test]`
+// itself, which the backend does not remove.
 
 use std::collections::HashMap;
 

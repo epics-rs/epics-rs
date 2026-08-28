@@ -4,7 +4,7 @@
 //! devMCA_soft, "Soft Channel")`.
 //!
 //! There is no hardware behind it. Every `send_msg` case is an empty `case` with
-//! a debug print (`:60-152`), `read_array` sets `pmca->nord = pmca->nuse` and
+//! a debug print (`:74-153`), `read_array` sets `pmca->nord = pmca->nuse` and
 //! returns without touching a single channel (`:155-161`), and the `mcaStatus`
 //! struct the record hands to `mcaReadStatus` is never written — so the record
 //! reads back a status of all zeroes. The spectrum a soft mca serves is whatever
@@ -15,7 +15,7 @@
 //! called out below.
 
 use epics_base_rs::error::CaResult;
-use epics_base_rs::server::device_support::{DeviceReadOutcome, DeviceSupport};
+use epics_base_rs::server::device_support::{DeviceInitOutcome, DeviceReadOutcome, DeviceSupport};
 use epics_base_rs::server::record::Record;
 
 use crate::record::{McaCommand, McaRecord, McaStatus};
@@ -42,10 +42,10 @@ impl DeviceSupport for SoftMca {
         "Soft Channel"
     }
 
-    /// C `init_record` (`devMCA_soft.c:47-56`): `pmca->nord = 0`.
-    fn init(&mut self, record: &mut dyn Record) -> CaResult<()> {
+    /// C `init_record` (`devMCA_soft.c:64-72`): `pmca->nord = 0`.
+    fn init(&mut self, record: &mut dyn Record) -> CaResult<DeviceInitOutcome> {
         Self::mca(record)?.nord = 0;
-        Ok(())
+        Ok(DeviceInitOutcome::Live)
     }
 
     /// The device half of one process cycle: send what the record asked to send,
@@ -85,7 +85,7 @@ impl DeviceSupport for SoftMca {
         });
 
         if landed {
-            // C `read_array` (`:155-161`): the buffer is left exactly as it is —
+            // C `read_array` (`devMCA_soft.c:155-161`): the buffer is left as it is —
             // the soft device produces no data — and only NORD moves.
             mca.land_channel_count(mca.nuse);
         }

@@ -242,7 +242,7 @@ mod tests {
 
     const ANGLE_EPS: f64 = 0.01; // degrees
 
-    /// Test data from ~/codes/optics/docs/orient_test.txt
+    /// Test data from $EPICS_MODULES/optics/docs/orient_test.txt
     /// Mode: TH=TTH/2 (OMEGA_ZERO), λ = 0.572495 Å
     const LAMBDA: f64 = 0.572495;
 

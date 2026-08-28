@@ -89,7 +89,7 @@
 use std::path::{Path, PathBuf};
 
 use crate::allowlist::{Allowlist, MatchContext};
-use crate::catool::ToolError;
+use crate::catool::{ToolError, unattributed};
 use crate::dbd::DbfType;
 use crate::diff::Verdict;
 use crate::ioc::{Ioc, PvaPair, PvxTools, Side};
@@ -303,7 +303,7 @@ impl PvaReport {
         let _ = writeln!(s, "  agreed             : {}", c.agreed);
         let _ = writeln!(
             s,
-            "  expected deviation : {}  (allowlisted against doc/upstream-c-bugs.md)",
+            "  expected deviation : {}  (allowlisted against expected-deviations.toml)",
             c.expected_deviation
         );
         let _ = writeln!(s, "  DEFECT             : {}", c.defect);
@@ -342,7 +342,7 @@ impl PvaReport {
             || !self.stale_allowlist_rows.is_empty()
             || !self.unexercised_allowlist_rows.is_empty()
         {
-            s.push_str("ALLOWLIST (doc/upstream-c-bugs.md, transcribed)\n");
+            s.push_str("ALLOWLIST (expected-deviations.toml)\n");
             if !self.fired_allowlist_rows.is_empty() {
                 let mut fired: Vec<&String> = self.fired_allowlist_rows.iter().collect();
                 fired.sort();
@@ -394,34 +394,14 @@ impl PvaReport {
             s.push('\n');
         }
 
-        let errs: Vec<_> = self
-            .cases
-            .iter()
-            .filter(|c| c.verdict == Verdict::Errored)
-            .collect();
-        if !errs.is_empty() {
-            let _ = writeln!(
-                s,
-                "ERRORS ({}) — channels that could NOT be measured",
-                errs.len()
-            );
-            // Grouped by cause: a record type the ground truth cannot load
-            // errors every one of its fields, and printing them all would bury
-            // the one fact that explains them.
-            let mut by_msg: std::collections::BTreeMap<String, usize> = Default::default();
-            for e in &errs {
-                let m = e
-                    .errors
-                    .first()
-                    .map(|x| x.to_string())
-                    .unwrap_or_else(|| "(unknown)".into());
-                *by_msg.entry(m).or_default() += 1;
-            }
-            for (msg, n) in by_msg.iter().take(20) {
-                let _ = writeln!(s, "  {n:>5}x  {}", truncate(msg, 110));
-            }
-            s.push('\n');
-        }
+        s.push_str(&crate::report::errors_section(
+            "channels",
+            self.cases
+                .iter()
+                .filter(|c| c.verdict == Verdict::Errored)
+                .map(|c| c.errors.as_slice())
+                .collect(),
+        ));
 
         s.push_str(
             "NOT MEASURED: QSRV2 group PVs (dbLoadGroup JSON) are a separately configured\n\
@@ -430,15 +410,6 @@ impl PvaReport {
         );
         s
     }
-}
-
-pub(crate) fn truncate(s: &str, n: usize) -> String {
-    let s = s.replace('\n', " ");
-    if s.chars().count() <= n {
-        return s;
-    }
-    let t: String = s.chars().take(n.saturating_sub(1)).collect();
-    format!("{t}…")
 }
 
 /// The first few differing lines, side by side. Enough to act on without
@@ -513,12 +484,7 @@ pub fn report(
         .filter(|c| c.verdict != Verdict::Errored)
         .count();
     let stale = |rows: Vec<&crate::allowlist::Deviation>| -> Vec<StaleRow> {
-        rows.into_iter()
-            .map(|d| StaleRow {
-                id: d.id.clone(),
-                why: d.why.clone(),
-            })
-            .collect()
+        rows.into_iter().map(StaleRow::of).collect()
     };
     PvaReport {
         denominator: Denominator {
@@ -583,7 +549,7 @@ fn probe_type(
 
     let db = match write_db(workdir, &format!("pva_read_{record_type}"), &db_text) {
         Ok(p) => p,
-        Err(e) => return errored_cases(&refs, &e),
+        Err(e) => return errored_cases(&refs, &unattributed("write-db", &e)),
     };
     // `PvaPair::boot` returns only once both sides are reachable AND each is
     // proven the sole server on its port, so a reading obtained below is
@@ -593,7 +559,7 @@ fn probe_type(
         // The pair would not boot: every channel of this type is an ERROR, and
         // not one of them is scored as agreement. The denominator does not
         // shrink just because we could not look.
-        Err(e) => return errored_cases(&refs, &e.to_string()),
+        Err(e) => return errored_cases(&refs, &e.tool_errors("boot")),
     };
 
     let c = PvaTools::new(tools, pair.c.port(), Side::C);
@@ -662,8 +628,8 @@ fn merge(types: Readings, values: Readings) -> Vec<PvaObservation> {
 /// 3. Anything left => DEFECT.
 ///
 /// A difference is EXPECTED DEVIATION only when a NOT-REPRODUCED row in
-/// `doc/upstream-c-bugs.md` (transcribed into `expected-deviations.toml`)
-/// justifies it — the same contract the CA phases hold. The first such PVA row
+/// `expected-deviations.toml` justifies it — the same contract the CA phases
+/// hold. The first such PVA row
 /// is CBUG-G1 (pvxs drops `display.precision` for a field that NULLs
 /// `get_graphic_double`; the port declines to reproduce it). A case is
 /// EXPECTED DEVIATION only if EVERY difference on it is justified — one
@@ -811,7 +777,7 @@ fn compare(ch: &ChannelRef, c: &PvaObservation, r: &PvaObservation) -> Vec<PvaDi
 
 /// A boot failure must produce one ERROR case per channel it prevented from
 /// being measured — not one aggregate error, and above all not silence.
-fn errored_cases(refs: &[ChannelRef], msg: &str) -> Vec<PvaCase> {
+fn errored_cases(refs: &[ChannelRef], errors: &[ToolError]) -> Vec<PvaCase> {
     refs.iter()
         .map(|ch| PvaCase {
             record_type: ch.record_type.clone(),
@@ -823,20 +789,9 @@ fn errored_cases(refs: &[ChannelRef], msg: &str) -> Vec<PvaCase> {
             rust_side: PvaObservation::default(),
             differences: Vec::new(),
             allowlisted: Vec::new(),
-            // A boot failure is not attributable to one side by construction,
-            // so it is recorded against both -- never dropped, never guessed.
-            errors: vec![
-                ToolError {
-                    side: Side::C,
-                    tool: "boot".into(),
-                    message: msg.to_string(),
-                },
-                ToolError {
-                    side: Side::Rust,
-                    tool: "boot".into(),
-                    message: msg.to_string(),
-                },
-            ],
+            // Attributed by whoever produced the failure; two entries only for
+            // a failure that belongs to neither side (`unattributed`).
+            errors: errors.to_vec(),
             db: ch.db.clone(),
         })
         .collect()
@@ -1038,17 +993,17 @@ mod tests {
     }
 
     /// A boot failure errors every channel of the type — the denominator does
-    /// not shrink because we could not look.
+    /// not shrink because we could not look — and names the side that failed.
     #[test]
-    fn a_boot_failure_errors_every_channel_it_prevented_and_names_both_sides() {
+    fn a_boot_failure_errors_every_channel_it_prevented_and_names_the_failed_side() {
         let refs = vec![chan(), chan()];
-        let cases = errored_cases(&refs, "softIocPVX exited during boot");
+        let boot = crate::ioc::BootError::new(Side::C, "softIocPVX exited during boot");
+        let cases = errored_cases(&refs, &boot.tool_errors("boot"));
         assert_eq!(cases.len(), 2);
         for c in &cases {
             assert_eq!(c.verdict, Verdict::Errored);
-            assert_eq!(c.errors.len(), 2, "attributed to neither side alone");
-            assert!(c.errors.iter().any(|e| e.side == Side::C));
-            assert!(c.errors.iter().any(|e| e.side == Side::Rust));
+            assert_eq!(c.errors.len(), 1, "only the side that failed");
+            assert_eq!(c.errors[0].side, Side::C);
         }
     }
 
@@ -1093,7 +1048,7 @@ mod tests {
         let surface = Surface::build(&dbd, &supported);
 
         let ok = adj(&chan(), &good("v"), &good("v"));
-        let bad = errored_cases(&[chan()], "boom");
+        let bad = errored_cases(&[chan()], &unattributed("boot", "boom"));
         let rep = report(
             "test.dbd",
             &surface,
@@ -1119,7 +1074,11 @@ mod tests {
         )
         .unwrap();
         let surface = Surface::build(&dbd, &["ai".to_string()].into_iter().collect());
-        let bad = errored_cases(&[chan()], "softIocPVX exited during boot");
+        let bad = errored_cases(
+            &[chan()],
+            &crate::ioc::BootError::new(Side::C, "softIocPVX exited during boot")
+                .tool_errors("boot"),
+        );
         let rep = report("softIoc.dbd", &surface, bad, &Allowlist::empty());
         let h = rep.human();
         assert!(h.contains("THE DENOMINATOR"), "states the denominator");

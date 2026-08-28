@@ -4,7 +4,7 @@
 //! on purpose:
 //!
 //! ```c
-//! /* cvt_dbaddr (mcaRecord.c:846-863) — the CHANNEL's capacity */
+//! /* cvt_dbaddr (mcaRecord.c:847-863) — the CHANNEL's capacity */
 //! paddr->no_elements = pmca->nmax;
 //!
 //! /* get_array_info (mcaRecord.c:865-873) — the CURRENT valid length */
@@ -21,10 +21,20 @@
 //! time, so a client that connected before the first acquisition fixed its
 //! buffer at the floored single channel and never saw the spectrum widen.
 
+#![cfg_attr(exec_backend, allow(unused_imports))]
+// This file's other cases are pure record-layer `#[test]`s; only the one
+// gated below builds a real CA server, which the reactor-free
+// `exec_backend` — selected on a host build by
+// `EPICS_RS_BUILD_EXEC_BACKEND=thread`, and unconditionally on RTEMS and
+// VxWorks — does not have. Gated per item rather than per file so the
+// record-layer cases keep compiling in that configuration.
+
 use std::time::Duration;
 
 use epics_base_rs::server::record::FieldDeclaration;
+#[cfg(tokio_backend)]
 use epics_ca_rs::client::CaClient;
+#[cfg(tokio_backend)]
 use epics_ca_rs::server::CaServer;
 use mca_rs::McaRecord;
 
@@ -56,6 +66,7 @@ fn only_val_and_bg_advertise_nmax_as_their_native_count() {
 /// The observable: connect before any acquisition, when `NORD` is 0 and the
 /// record therefore serves the single floored channel, and the channel must
 /// still advertise all 8.
+#[cfg(tokio_backend)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_client_connecting_before_acquisition_sees_the_full_nmax_capacity() {
     let server = CaServer::builder()

@@ -23,11 +23,13 @@
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
+use std::sync::Once;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use crate::allowlist::{Allowlist, MatchContext};
 use crate::cases::{BoundaryCase, boundary_cases};
-use crate::catool::{CaTools, PutOutcome, ToolError};
+use crate::catool::{CaTools, PutOutcome, ToolError, unattributed};
 use crate::dbd::{Dbd, DbfType};
 use crate::diff::{Comparison, Observation, Verdict, compare};
 use crate::ioc::{CTools, Ioc, Pair, Side};
@@ -53,11 +55,13 @@ const ARRAY_FTVL: &str = "DOUBLE";
 pub struct Runner {
     tools: CTools,
     dbd: Dbd,
-    workdir: PathBuf,
+    /// Owned, not borrowed: the generated `.db` files must outlive every boot
+    /// this runner drives and must not outlive the runner. See [`Workdir`].
+    workdir: Workdir,
 }
 
 impl Runner {
-    pub fn new(tools: CTools, dbd: Dbd, workdir: PathBuf) -> Self {
+    pub fn new(tools: CTools, dbd: Dbd, workdir: Workdir) -> Self {
         Self {
             tools,
             dbd,
@@ -94,7 +98,14 @@ impl Runner {
         let db = match self.write_db(&format!("read_{record_type}"), &db_text) {
             Ok(p) => p,
             Err(e) => {
-                return errored_cases(record_type, &names, CasePhase::Read, None, &db_text, &e);
+                return errored_cases(
+                    record_type,
+                    &names,
+                    CasePhase::Read,
+                    None,
+                    &db_text,
+                    &unattributed("write-db", &e),
+                );
             }
         };
         let pair = match Pair::boot(&self.tools, &db, &rec) {
@@ -108,7 +119,7 @@ impl Runner {
                     CasePhase::Read,
                     None,
                     &db_text,
-                    &e.to_string(),
+                    &e.tool_errors("boot"),
                 );
             }
         };
@@ -184,11 +195,13 @@ impl Runner {
 
         let db = match self.write_db(&format!("put_{record_type}"), &db_text) {
             Ok(p) => p,
-            Err(e) => return errored_puts(record_type, &plan, &db_text, &e),
+            Err(e) => {
+                return errored_puts(record_type, &plan, &db_text, &unattributed("write-db", &e));
+            }
         };
         let pair = match Pair::boot(&self.tools, &db, &rec_of(0)) {
             Ok(p) => p,
-            Err(e) => return errored_puts(record_type, &plan, &db_text, &e.to_string()),
+            Err(e) => return errored_puts(record_type, &plan, &db_text, &e.tool_errors("boot")),
         };
 
         let c = CaTools::new(&self.tools, pair.c.port(), Side::C);
@@ -298,7 +311,7 @@ impl Runner {
                     CasePhase::Monitor,
                     None,
                     repro,
-                    &e,
+                    unattributed("write-db", &e),
                 ));
             }
         };
@@ -311,7 +324,7 @@ impl Runner {
                     CasePhase::Monitor,
                     None,
                     repro,
-                    &e.to_string(),
+                    e.tool_errors("boot"),
                 ));
             }
         };
@@ -404,11 +417,13 @@ impl Runner {
 
         let db = match self.write_db(&format!("arr_{record_type}"), &db_text) {
             Ok(p) => p,
-            Err(e) => return errored_array(record_type, &plan, &db_text, &e),
+            Err(e) => {
+                return errored_array(record_type, &plan, &db_text, &unattributed("write-db", &e));
+            }
         };
         let pair = match Pair::boot(&self.tools, &db, &rec_of(0)) {
             Ok(p) => p,
-            Err(e) => return errored_array(record_type, &plan, &db_text, &e.to_string()),
+            Err(e) => return errored_array(record_type, &plan, &db_text, &e.tool_errors("boot")),
         };
 
         let c = CaTools::new(&self.tools, pair.c.port(), Side::C);
@@ -703,7 +718,7 @@ fn errored_array(
     record_type: &str,
     plan: &[(Vec<String>, &'static str)],
     db: &str,
-    msg: &str,
+    errors: &[ToolError],
 ) -> Vec<CaseResult> {
     plan.iter()
         .map(|(values, class)| {
@@ -720,7 +735,7 @@ fn errored_array(
                         values.join(" ")
                     )],
                 },
-                msg,
+                errors.to_vec(),
             )
         })
         .collect()
@@ -848,7 +863,28 @@ fn adjudicate(
         rust_side: r.clone(),
     };
 
-    if !errors.is_empty() {
+    // The one place a case may leave the ERROR bucket while carrying errors.
+    //
+    // A completion that never came from EITHER side is a reading: the two IOCs
+    // did the same observable thing, and the rest of the case — native type,
+    // element count, access, stored value, STAT, SEVR — was still read back
+    // from both and is compared below exactly as any other case is. So this
+    // does not suppress a difference; it only stops the shared non-answer from
+    // masking a case the harness fully measured.
+    //
+    // The discriminator, and the whole honesty of the bucket: BOTH sides must
+    // have produced an error, and EVERY error on the case must be the
+    // no-completion marker (`catool::is_no_completion`). A one-sided
+    // no-completion is a divergence between the two servers, which is the
+    // finding this harness exists to make, and it stays ERROR. So does any case
+    // that mixes in a connect failure or one of the harness's own — those say
+    // the measurement never happened, not that the server declined to finish.
+    let both_sides_declined = !c.errors.is_empty()
+        && !r.errors.is_empty()
+        && errors
+            .iter()
+            .all(|e| crate::catool::is_no_completion(&e.message));
+    if !errors.is_empty() && !both_sides_declined {
         return base;
     }
 
@@ -870,7 +906,11 @@ fn adjudicate(
 
     if differences.is_empty() {
         return CaseResult {
-            verdict: Verdict::Agreed,
+            verdict: if both_sides_declined {
+                Verdict::NeitherCompleted
+            } else {
+                Verdict::Agreed
+            },
             ..base
         };
     }
@@ -901,7 +941,7 @@ fn errored_case(
     phase: CasePhase,
     class: Option<&str>,
     repro: Reproducer,
-    msg: &str,
+    errors: Vec<ToolError>,
 ) -> CaseResult {
     CaseResult {
         record_type: record_type.to_string(),
@@ -911,20 +951,12 @@ fn errored_case(
         verdict: Verdict::Errored,
         differences: Vec::new(),
         allowlisted: Vec::new(),
-        // A boot failure is not attributable to one side by construction, so it
-        // is recorded against both -- never dropped, never guessed.
-        errors: vec![
-            ToolError {
-                side: Side::C,
-                tool: "boot".into(),
-                message: msg.to_string(),
-            },
-            ToolError {
-                side: Side::Rust,
-                tool: "boot".into(),
-                message: msg.to_string(),
-            },
-        ],
+        // Attributed by whoever produced the failure -- `BootError::tool_errors`
+        // for a boot, the tool's own `ToolError` otherwise. Recorded against
+        // both sides only for a failure that belongs to neither, because a
+        // failure recorded against a side that was fine is a wrong reading, not
+        // a cautious one.
+        errors,
         reproducer: repro,
         c_side: Observation::default(),
         rust_side: Observation::default(),
@@ -940,7 +972,7 @@ fn errored_cases(
     phase: CasePhase,
     class: Option<&str>,
     db: &str,
-    msg: &str,
+    errors: &[ToolError],
 ) -> Vec<CaseResult> {
     fields
         .iter()
@@ -954,7 +986,7 @@ fn errored_cases(
                     db: db.to_string(),
                     ops: vec![format!("caget ORACLE:*.{f}")],
                 },
-                msg,
+                errors.to_vec(),
             )
         })
         .collect()
@@ -964,7 +996,7 @@ fn errored_puts(
     record_type: &str,
     plan: &[(FieldRef, BoundaryCase)],
     db: &str,
-    msg: &str,
+    errors: &[ToolError],
 ) -> Vec<CaseResult> {
     plan.iter()
         .map(|(fr, bc)| {
@@ -978,7 +1010,7 @@ fn errored_puts(
                     db: db.to_string(),
                     ops: vec![format!("caput <rec>.{f} '{}'", bc.value)],
                 },
-                msg,
+                errors.to_vec(),
             )
         })
         .collect()
@@ -998,14 +1030,145 @@ pub fn select_types(surface: &Surface, only: &Option<Vec<String>>) -> Vec<String
         .collect()
 }
 
-/// The workdir for generated `.db` files.
-pub fn workdir(base: Option<&Path>) -> Result<PathBuf, String> {
-    let dir = match base {
-        Some(p) => p.to_path_buf(),
-        None => std::env::temp_dir().join("epics-oracle"),
+/// A harness workdir, and the right to it for exactly as long as this value
+/// lives.
+///
+/// # Invariant
+///
+/// **A directory under `<tmp>/epics-oracle/` exists only while a live process
+/// owns it.** [`workdir`] is the only mint, [`Workdir::drop`] the only removal
+/// on the ordinary path, and `reap_own_residue` the only removal of what a
+/// crash left behind. Nothing else creates or deletes under that root.
+///
+/// That invariant is what makes the pid a sound key rather than a
+/// probabilistic one. A pid is unique among the LIVING; keying a directory on
+/// it while never removing the directory keys it on the whole pid space
+/// instead, and that space wraps. Measured on this host on 2026-08-25:
+/// `/tmp/epics-oracle` held 3,916 leftovers spanning pids 19,083 to 4,137,878
+/// against a `pid_max` of 4,194,304, and a suite run failed `mkdir
+/// /tmp/epics-oracle/<pid>-0: File exists` against a leftover created 2h15m
+/// earlier. The "crashed run whose pid has since been reused" that this
+/// function used to call a residual case was the routine case, and its
+/// probability grew with every run of the suite on the box.
+#[derive(Debug)]
+pub struct Workdir {
+    path: PathBuf,
+    /// `true` when this handle minted the directory and therefore owes its
+    /// removal; `false` for a caller-supplied `base`, whose lifetime is the
+    /// caller's to decide.
+    minted: bool,
+}
+
+impl Workdir {
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
+impl std::ops::Deref for Workdir {
+    type Target = Path;
+    fn deref(&self) -> &Path {
+        &self.path
+    }
+}
+
+impl AsRef<Path> for Workdir {
+    fn as_ref(&self) -> &Path {
+        &self.path
+    }
+}
+
+impl Drop for Workdir {
+    /// Best-effort by necessity — `kill -9` runs no destructor, which is what
+    /// `reap_own_residue` exists for — but the ordinary exit is the one that
+    /// built the pile of 3,916, and for it this is not best-effort at all:
+    /// every `Runner`, every probe and every test ends here.
+    fn drop(&mut self) {
+        if self.minted {
+            let _ = std::fs::remove_dir_all(&self.path);
+        }
+    }
+}
+
+/// Remove every `<pid>-<n>` leaf under `parent` that carries THIS process's id.
+///
+/// Called once per process, before that process mints its first workdir, and
+/// that ordering is the whole proof: a leaf named for this pid that exists
+/// before this process has minted anything cannot have a live owner — no other
+/// living process has this pid, and this one has not used it yet. So it is
+/// residue from a run that died before its [`Workdir`] could drop.
+///
+/// It is also the only place the invariant can be restored after a crash, and
+/// the reason pid reuse is not simply an error: the process that would have
+/// collided is exactly the one that can prove the collision is a ghost.
+fn reap_own_residue(parent: &Path) {
+    // The trailing dash is load-bearing: pid 1234 must not reap 12345's leaves.
+    let mine = format!("{}-", std::process::id());
+    let Ok(entries) = std::fs::read_dir(parent) else {
+        return;
     };
-    std::fs::create_dir_all(&dir).map_err(|e| format!("mkdir {}: {e}", dir.display()))?;
-    Ok(dir)
+    for entry in entries.flatten() {
+        if entry.file_name().to_string_lossy().starts_with(&mine) {
+            let _ = std::fs::remove_dir_all(entry.path());
+        }
+    }
+}
+
+/// A directory for generated `.db` files, owned by the returned [`Workdir`].
+///
+/// The files inside are named after what they hold — `ai.db`, `pair_smoke.db`,
+/// `pva_test_ai.db` — never after who wrote them. That naming is fine, and the
+/// directory is what has to make it fine: two writers sharing one directory
+/// share those names, and `fs::write` truncates a file before it fills it. A
+/// `softIoc` that opens the `.db` inside that window loads an empty file,
+/// prints `iocRun: All initialization complete`, serves no record at all, and
+/// is caught only by [`crate::ioc::Pair::boot`]'s reachability probe — a
+/// connect failure whose cause is a file, not a socket, and which reads as a
+/// flaky test on a busy host.
+///
+/// So each call mints its own `<tmp>/epics-oracle/<pid>-<n>`: two live
+/// processes differ by pid, two calls inside one process differ by `n`. Neither
+/// nextest's process-per-test nor `cargo test`'s threads-in-one-process, nor
+/// two checkouts of this repo running the suite at once, can put two writers on
+/// one path — and the leaf is gone again when the returned handle drops, so the
+/// pid stays a key over the living rather than over all pids ever issued.
+///
+/// `base` overrides all of it, and then the caller owns both the exclusivity
+/// and the lifetime.
+pub fn workdir(base: Option<&Path>) -> Result<Workdir, String> {
+    static NEXT: AtomicUsize = AtomicUsize::new(0);
+    static REAP: Once = Once::new();
+    match base {
+        // The caller owns exclusivity here, so an existing directory is theirs
+        // — and so is deciding when it goes away.
+        Some(p) => {
+            std::fs::create_dir_all(p).map_err(|e| format!("mkdir {}: {e}", p.display()))?;
+            Ok(Workdir {
+                path: p.to_path_buf(),
+                minted: false,
+            })
+        }
+        None => {
+            let parent = std::env::temp_dir().join("epics-oracle");
+            std::fs::create_dir_all(&parent)
+                .map_err(|e| format!("mkdir {}: {e}", parent.display()))?;
+            REAP.call_once(|| reap_own_residue(&parent));
+            let dir = parent.join(format!(
+                "{}-{}",
+                std::process::id(),
+                NEXT.fetch_add(1, Ordering::Relaxed)
+            ));
+            // `create_dir`, not `create_dir_all`: after the reap above, a
+            // directory already standing on this path cannot be residue, so it
+            // is a writer racing us for the name, and adopting it would be the
+            // silent truncation this function exists to prevent.
+            std::fs::create_dir(&dir).map_err(|e| format!("mkdir {}: {e}", dir.display()))?;
+            Ok(Workdir {
+                path: dir,
+                minted: true,
+            })
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1155,6 +1318,10 @@ mod bisect_tests {
 /// code is computed from.
 #[cfg(test)]
 mod adjudicate_tests {
+    // The three cases driven against the real pair carry `#[cfg(tokio_backend)]`:
+    // they boot `oracle-ioc`, which refuses to start under the reactor-free
+    // `exec_backend`, so they cannot pass there under any treatment. The rest
+    // adjudicate against `FakeIoc` and stay selected on every backend.
     use super::*;
     use crate::dbd::DbfType;
     use crate::report::Counts;
@@ -1175,6 +1342,127 @@ mod adjudicate_tests {
             value_string: Some(s.to_string()),
             ..Default::default()
         }
+    }
+
+    /// An `Observation` that read back cleanly but carries one tool error.
+    fn value_with_error(v: &str, side: Side, msg: &str) -> Observation {
+        Observation {
+            value_string: Some(v.to_string()),
+            errors: vec![ToolError {
+                side,
+                tool: "caput".into(),
+                message: msg.into(),
+            }],
+            ..Default::default()
+        }
+    }
+
+    const NO_COMPLETION: &str = "Write callback operation timed out";
+
+    /// The bucket. Both IOCs took the write, neither ever said it finished, and
+    /// every other surface agreed — measured on `sub`, whose empty `SNAM`
+    /// latches `pact = TRUE` (`subRecord.c:119-122`) on the C side and whose
+    /// 464 put cases are all of this shape.
+    #[test]
+    fn a_no_completion_from_both_sides_is_a_reading_not_a_measurement_failure() {
+        let case = adjudicate(
+            CaseRef {
+                record_type: "sub",
+                phase: CasePhase::Put,
+                field: "VAL",
+                dbf: DbfType::Double,
+                class: Some("zero"),
+            },
+            repro(),
+            &value_with_error("0", Side::C, NO_COMPLETION),
+            &value_with_error("0", Side::Rust, NO_COMPLETION),
+            &mut shipped(),
+        );
+        assert_eq!(case.verdict, Verdict::NeitherCompleted);
+        assert_eq!(
+            case.errors.len(),
+            2,
+            "the bucket must keep both sides' evidence, not swallow it"
+        );
+    }
+
+    /// The discriminator. One side finishing and the other not is a difference
+    /// between the two servers — the finding this harness exists to make — so
+    /// it must not reach the bucket from either direction.
+    #[test]
+    fn a_one_sided_no_completion_stays_an_error() {
+        for (c, r) in [
+            (value_with_error("0", Side::C, NO_COMPLETION), value("0")),
+            (value("0"), value_with_error("0", Side::Rust, NO_COMPLETION)),
+        ] {
+            let case = adjudicate(
+                CaseRef {
+                    record_type: "sub",
+                    phase: CasePhase::Put,
+                    field: "VAL",
+                    dbf: DbfType::Double,
+                    class: Some("zero"),
+                },
+                repro(),
+                &c,
+                &r,
+                &mut shipped(),
+            );
+            assert_eq!(
+                case.verdict,
+                Verdict::Errored,
+                "a one-sided no-completion is a divergence, not a shared reading"
+            );
+        }
+    }
+
+    /// The other half of the discriminator: only the marker that describes the
+    /// SERVER declining to finish is admitted. A channel that never connected,
+    /// or one of the harness's own failures, means the measurement did not
+    /// happen — two of those are not a reading, however symmetric.
+    #[test]
+    fn a_symmetric_failure_that_is_not_a_no_completion_stays_an_error() {
+        for msg in ["Channel connect timed out", "spawn: no such file"] {
+            let case = adjudicate(
+                CaseRef {
+                    record_type: "sub",
+                    phase: CasePhase::Put,
+                    field: "VAL",
+                    dbf: DbfType::Double,
+                    class: Some("zero"),
+                },
+                repro(),
+                &value_with_error("0", Side::C, msg),
+                &value_with_error("0", Side::Rust, msg),
+                &mut shipped(),
+            );
+            assert_eq!(
+                case.verdict,
+                Verdict::Errored,
+                "{msg} says the measurement never happened"
+            );
+        }
+    }
+
+    /// The bucket compares the case like any other, so it cannot become a place
+    /// a difference hides: a shared no-completion with different readbacks is
+    /// still a DEFECT.
+    #[test]
+    fn a_difference_under_a_shared_no_completion_is_still_a_defect() {
+        let case = adjudicate(
+            CaseRef {
+                record_type: "sub",
+                phase: CasePhase::Put,
+                field: "VAL",
+                dbf: DbfType::Double,
+                class: Some("zero"),
+            },
+            repro(),
+            &value_with_error("0", Side::C, NO_COMPLETION),
+            &value_with_error("7", Side::Rust, NO_COMPLETION),
+            &mut shipped(),
+        );
+        assert_eq!(case.verdict, Verdict::Defect);
     }
 
     /// `ai.VAL` is `DBF_DOUBLE`. CBUG-E2 is `dbConvert`'s double->**integer**
@@ -1292,6 +1580,7 @@ mod adjudicate_tests {
     /// The plant is a record type that genuinely has no `NORD`: `ai`. The put
     /// and every other surface read fine, so only the missing discriminator is
     /// under test.
+    #[cfg(tokio_backend)]
     #[test]
     fn an_unreadable_nord_errors_the_array_case_instead_of_agreeing() {
         let tools = CTools::discover().expect(
@@ -1349,6 +1638,7 @@ mod adjudicate_tests {
     /// port that stopped serving STAT reported as an improvement. The other
     /// half is that the fix must not paint every case ERROR — the good PV in
     /// the same batch is still measured, via `probe_bisect`.
+    #[cfg(tokio_backend)]
     #[test]
     fn a_stat_pv_that_does_not_connect_errors_only_its_own_case() {
         let tools = CTools::discover().expect(
@@ -1446,6 +1736,7 @@ mod adjudicate_tests {
     /// between two empty traces, and the case was scored AGREED and counted as
     /// monitor coverage — a positive agreement claim about a subscription that
     /// was never given anything to post on.
+    #[cfg(tokio_backend)]
     #[test]
     fn a_monitor_whose_drive_was_refused_scores_error_not_agreement() {
         let tools = CTools::discover().expect(
@@ -1505,6 +1796,167 @@ mod adjudicate_tests {
         assert_eq!(
             crate::report::exit_status(&crate::report::run_failures(&counts, &[], &[])),
             1,
+        );
+    }
+}
+
+#[cfg(test)]
+mod workdir_tests {
+    use super::{reap_own_residue, workdir};
+
+    /// Two writers must not be able to name one file.
+    ///
+    /// The boundary this closes is *within* a process, which is the half a
+    /// per-pid directory would leave open: `cargo test` runs the tests of one
+    /// binary as threads, so two `Runner`s built a microsecond apart would both
+    /// write `ai.db`. The write below is the same shape the runner uses —
+    /// `fs::write` into a directory it was handed — and it must not be able to
+    /// reach the other one's file.
+    #[test]
+    fn two_workdirs_do_not_share_a_file_name() {
+        let a = workdir(None).expect("workdir a");
+        let b = workdir(None).expect("workdir b");
+        assert_ne!(a.path(), b.path(), "each call owns its own directory");
+
+        std::fs::write(a.join("ai.db"), "record(ai, \"A\") {}\n").expect("write a");
+        std::fs::write(b.join("ai.db"), "record(ai, \"B\") {}\n").expect("write b");
+
+        assert!(
+            std::fs::read_to_string(a.join("ai.db"))
+                .expect("read a")
+                .contains("\"A\""),
+            "the second writer truncated the first writer's db"
+        );
+    }
+
+    /// The owner path of the invariant: what a handle mints, its drop takes
+    /// away.
+    ///
+    /// This is the half that was missing, and its absence is what turned the
+    /// pid from a key over the living into a key over every pid ever issued:
+    /// 3,916 directories on this host, none of them owned by anything.
+    #[test]
+    fn a_dropped_workdir_leaves_nothing_behind() {
+        let path = {
+            let d = workdir(None).expect("workdir");
+            std::fs::write(d.join("ai.db"), "record(ai, \"A\") {}\n").expect("write");
+            d.to_path_buf()
+        };
+        assert!(
+            !path.exists(),
+            "a workdir outlived its handle: {}",
+            path.display()
+        );
+    }
+
+    /// The other arm of the same rule: a directory the caller supplied is the
+    /// caller's, so the handle must not take it away with it.
+    #[test]
+    fn a_caller_supplied_base_survives_the_handle() {
+        let base = workdir(None).expect("outer");
+        let inner = base.join("supplied");
+        {
+            let d = workdir(Some(&inner)).expect("workdir on a supplied base");
+            std::fs::write(d.join("ai.db"), "record(ai, \"A\") {}\n").expect("write");
+        }
+        assert!(
+            inner.join("ai.db").exists(),
+            "a caller-supplied base was removed by the handle that borrowed it"
+        );
+    }
+
+    /// The formerly-bypassing path, and the one the box actually hit: a run
+    /// that died left `<pid>-<n>` behind, a later process drew the same pid,
+    /// and `create_dir` refused. Refusing was right while nothing could tell a
+    /// ghost from an owner; now something can, because a leaf named for this
+    /// pid that predates this process's first mint has no live owner by
+    /// construction.
+    ///
+    /// Asserted on the reaper directly rather than through `workdir`, because
+    /// the reap runs once per process before the first mint and a test cannot
+    /// place itself before that point in a shared binary. The other pid's leaf
+    /// is here to pin the trailing dash: reaping by a bare numeric prefix would
+    /// make pid 1234 delete 12345's live directory.
+    #[test]
+    fn the_reaper_takes_this_process_s_residue_and_nothing_else() {
+        let root = workdir(None).expect("a root to work in");
+        let mine = root.join(format!("{}-99", std::process::id()));
+        let neighbour = root.join(format!("{}9-0", std::process::id()));
+        for d in [&mine, &neighbour] {
+            std::fs::create_dir(d).expect("stand up a leaf");
+            std::fs::write(d.join("ai.db"), "record(ai, \"DEAD\") {}\n").expect("leaf db");
+        }
+
+        reap_own_residue(&root);
+
+        assert!(
+            !mine.exists(),
+            "this process's own residue survived the reap: {}",
+            mine.display()
+        );
+        assert!(
+            neighbour.exists(),
+            "the reaper took a leaf belonging to another pid: {}",
+            neighbour.display()
+        );
+    }
+
+    /// After the reap, an occupied path is a racer and not a ghost, so the
+    /// exclusive create still has to refuse it — adopting it is the truncation
+    /// the whole function exists to prevent. Deterministic under nextest, which
+    /// gives each test its own process and so its own counter.
+    #[test]
+    fn a_racer_on_the_next_path_is_refused_not_adopted() {
+        // Learn where the counter is, then stand a directory on the very next
+        // path this process will ask for.
+        let first = workdir(None).expect("workdir");
+        let parent = first.parent().expect("a parent").to_path_buf();
+        let n: usize = first
+            .file_name()
+            .and_then(|f| f.to_str())
+            .and_then(|f| f.rsplit('-').next())
+            .and_then(|f| f.parse().ok())
+            .expect("a counted leaf");
+        let taken = parent.join(format!("{}-{}", std::process::id(), n + 1));
+        std::fs::create_dir(&taken).expect("stand up the racer's workdir");
+        std::fs::write(taken.join("ai.db"), "record(ai, \"RACER\") {}\n").expect("racer db");
+
+        let got = workdir(None);
+        assert!(
+            got.is_err(),
+            "an occupied workdir was adopted, not refused: {got:?}"
+        );
+        // The other writer's file must still be untouched underneath.
+        assert!(
+            std::fs::read_to_string(taken.join("ai.db"))
+                .expect("read racer")
+                .contains("RACER"),
+            "the refused call still wrote into the occupied directory"
+        );
+        std::fs::remove_dir_all(&taken).expect("clean up the racer's workdir");
+    }
+
+    /// The cross-process half: the path carries this process's id, so no other
+    /// live process can produce it. Asserted on the shape rather than by
+    /// spawning a second process, because a pid is unique among the living by
+    /// construction and there is nothing racy left to observe.
+    #[test]
+    fn a_workdir_is_named_for_the_process_that_owns_it() {
+        let d = workdir(None).expect("workdir");
+        let leaf = d
+            .file_name()
+            .expect("a leaf")
+            .to_str()
+            .expect("utf8")
+            .to_string();
+        assert!(
+            leaf.starts_with(&format!("{}-", std::process::id())),
+            "a workdir must be named for its owning process, got {leaf}"
+        );
+        assert_eq!(
+            d.parent().and_then(|p| p.file_name()),
+            Some(std::ffi::OsStr::new("epics-oracle")),
+            "and it must still live under the harness's own root"
         );
     }
 }

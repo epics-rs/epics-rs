@@ -54,27 +54,22 @@ pub fn mqtt_driver_configure_command(
             ArgDesc {
                 name: "portName",
                 arg_type: ArgType::String,
-                optional: false,
             },
             ArgDesc {
                 name: "brokerUrl",
                 arg_type: ArgType::String,
-                optional: false,
             },
             ArgDesc {
                 name: "clientId",
                 arg_type: ArgType::String,
-                optional: false,
             },
             ArgDesc {
                 name: "qos",
                 arg_type: ArgType::Int,
-                optional: true,
             },
             ArgDesc {
                 name: "connPvName",
                 arg_type: ArgType::String,
-                optional: true,
             },
         ],
         "mqttDriverConfigure portName brokerUrl clientId [qos] [connPvName] - Create MQTT driver",
@@ -144,9 +139,18 @@ impl CommandHandler for MqttConfigHandler {
         // disconnected, mqttClient.cpp:70-72). Starts down until the first
         // ConnAck.
         let connected = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let driver = MqttDriver::new(&port_name, &config, overlay, publish_tx, connected.clone());
+        let mut driver =
+            MqttDriver::new(&port_name, &config, overlay, publish_tx, connected.clone());
         let topic_map = driver.topic_map();
         let connected_param = driver.connected_param;
+        // MQ4: the event loop sends DISCONNECT when this fires. The port actor
+        // owns the driver from here on, so the signal must be taken before the
+        // move — the same shape as `topic_map()` above.
+        let shutdown = driver.shutdown_signal();
+        // The other end of that signal. Holding it is what makes the `Drop`
+        // wait rather than merely ask, so it must be taken here, before the
+        // port actor takes the driver, for the same reason `shutdown` is.
+        let teardown_done = driver.teardown_ack();
 
         // A port whose actor thread the OS refused is not a port: fail the
         // command before the registration below claims the name for it. Same
@@ -155,7 +159,7 @@ impl CommandHandler for MqttConfigHandler {
         // autoparamDriver.h:245) and `mqttDriverConfigure` builds it with a
         // bare `new` (drvMqtt.cpp:736-739), so a failed `registerPort` throws
         // out of its constructor (asynPortDriver.cpp:4036-4040), iocsh catches
-        // it (iocsh.cpp:1274-1284) and st.cmd continues with the port missing.
+        // it (iocsh.cpp:1269-1279) and st.cmd continues with the port missing.
         // The `?` is the same error channel the duplicate-name failure below
         // already uses.
         let (runtime_handle, _actor_jh) =
@@ -234,7 +238,11 @@ impl CommandHandler for MqttConfigHandler {
                 publish_rx,
                 connected_param,
                 connected,
-                start,
+                crate::event_loop::Lifecycle {
+                    start,
+                    shutdown,
+                    done: teardown_done,
+                },
             )
             .await;
         });

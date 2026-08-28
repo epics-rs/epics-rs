@@ -1,0 +1,12 @@
+[package]
+name = "source-guard"
+version.workspace = true
+edition.workspace = true
+description = "Test-only source slicing for the workspace's mechanical guards: production scope by cfg attribute, and derived file sets"
+license-file = "LICENSE"
+authors.workspace = true
+repository.workspace = true
+# Never published. Every consumer takes it as a `path`-only dev-dependency,
+# which `cargo package` drops from the uploaded manifest, so this crate's
+# absence from crates.io is not a hole in anyone's dependency graph.
+publish = false

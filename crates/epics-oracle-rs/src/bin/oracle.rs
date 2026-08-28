@@ -42,8 +42,8 @@ enum Phase {
     /// Deliberately outside `All`. It shares the CA phases' denominator (QSRV2
     /// serves base's dbChannel namespace) but nothing else: a different ground
     /// truth (`softIocPVX`, not base's `softIoc`), a different instrument
-    /// (`pvxget`, not `caget`), and no allowlist — `doc/upstream-c-bugs.md` is
-    /// about C's CA behaviour and justifies nothing about QSRV2. Folding it
+    /// (`pvxget`, not `caget`), and no allowlist — the expected-deviation rows
+    /// are about C's CA behaviour and justify nothing about QSRV2. Folding it
     /// into `All` would merge two populations of cases whose verdicts are not
     /// comparable, into one set of counts.
     PvaRead,
@@ -87,8 +87,7 @@ struct Args {
     #[arg(long)]
     json: Option<PathBuf>,
 
-    /// Expected-deviation allowlist (defaults to the shipped file, which
-    /// transcribes doc/upstream-c-bugs.md).
+    /// Expected-deviation allowlist (defaults to the shipped file).
     #[arg(long)]
     allowlist: Option<PathBuf>,
 }
@@ -182,12 +181,16 @@ async fn run() -> Result<ExitCode, String> {
     let counts = Counts::tally(&cases);
     counts.check()?;
 
-    let row = |r: &epics_oracle_rs::allowlist::Deviation| StaleRow {
-        id: r.id.clone(),
-        why: r.why.trim().to_string(),
-    };
-    let stale: Vec<StaleRow> = allowlist.stale_rows().into_iter().map(row).collect();
-    let unexercised: Vec<StaleRow> = allowlist.unexercised_rows().into_iter().map(row).collect();
+    let stale: Vec<StaleRow> = allowlist
+        .stale_rows()
+        .into_iter()
+        .map(StaleRow::of)
+        .collect();
+    let unexercised: Vec<StaleRow> = allowlist
+        .unexercised_rows()
+        .into_iter()
+        .map(StaleRow::of)
+        .collect();
     let fired: Vec<String> = allowlist.fired_rows().iter().cloned().collect();
 
     let report = Report {

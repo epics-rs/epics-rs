@@ -5,7 +5,7 @@
 //!   * the done-interrupt arm sets `ss = SCALER_STATE_IDLE` (`:367-368`);
 //!   * `updateCounts()` (`:453` → `:578-584`) posts every `Sn` whose count
 //!     moved with `DBE_VALUE`;
-//!   * `ss == IDLE` then admits the `monitor()` call at `:510-513`, and
+//!   * `ss == IDLE` then admits the `monitor()` call at `:471-474`, and
 //!     `monitor()` (`:757-773`) posts EVERY active `Sn` with a literal
 //!     `DBE_LOG` — unconditionally, change or no change.
 //!
@@ -14,6 +14,14 @@
 //! `DBE_LOG` sweep as the `else` arm of the change check, so a changed `Sn`
 //! could only ever emit the `DBE_VALUE` half — a `DBE_LOG`-only archiver never
 //! received the final counts, which is the only `Sn` sample it wants.
+
+// RTEMS-EXEC-MODEL-ALLOW(2): checked, not waived — all 2 ran and passed
+// on the exec backend (measured on this tree:
+// `EPICS_RS_BUILD_EXEC_BACKEND=thread cargo nextest run -p scaler-rs
+// --all-features`, 112/112). scaler-rs became a census subject when its
+// `build.rs` began deriving `tokio_backend`; nothing here builds a CA
+// server, and the reactor these obtain comes from `#[tokio::test]`
+// itself, which the backend does not remove.
 
 use epics_base_rs::server::database::PvDatabase;
 use epics_base_rs::server::event_queue::EventReader;

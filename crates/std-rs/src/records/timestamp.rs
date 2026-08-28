@@ -64,13 +64,6 @@ pub struct TimestampRecord {
     /// clock (`epicsTimeFromTime_t(&time, time(0))`, whole seconds, no
     /// fraction); any other value uses the EPICS time-stamp framework.
     tse: i16,
-    /// Whether the last `process()` rendered a VAL string different from the
-    /// previous one — C `monitor()`'s `strncmp(oval, val, sizeof(val))` gate
-    /// (`timestampRecord.c:158`), captured during `process()` because the
-    /// framework asks for the decision after `oval` has already been committed.
-    /// It is the ONLY gate on this record's monitors: VAL and RVAL both post
-    /// exactly when it is true (`:159-160`).
-    val_changed: bool,
 }
 
 impl Default for TimestampRecord {
@@ -81,7 +74,6 @@ impl Default for TimestampRecord {
             rval: 0,
             tst: 0,
             tse: 0,
-            val_changed: false,
         }
     }
 }
@@ -202,13 +194,11 @@ impl Record for TimestampRecord {
 
     fn process(&mut self) -> CaResult<ProcessOutcome> {
         let (formatted, sec_past_epoch) = self.format_timestamp();
-        // C `monitor()` compares the freshly rendered string against OVAL and
-        // posts VAL *and* RVAL only if they differ (timestampRecord.c:158-162),
-        // then copies VAL into OVAL. RVAL itself is refreshed on every process
-        // (`:94`) — a caget of RVAL between posts reads the current second — so
-        // only the *posting* is gated, never the value.
-        self.val_changed = formatted != self.val;
-        self.oval = std::mem::replace(&mut self.val, formatted);
+        // RVAL is refreshed on every process (`timestampRecord.c:94`) — a caget
+        // of RVAL between posts reads the current second — so only the
+        // *posting* is gated, never the value. The OVAL compare and copy are
+        // C's `monitor()`'s, and live in `monitor_value_changed`.
+        self.val = formatted;
         self.rval = sec_past_epoch;
         Ok(ProcessOutcome::complete())
     }
@@ -298,8 +288,15 @@ impl Record for TimestampRecord {
     /// mask is live only on a cycle that re-rendered a different string — which
     /// is also the gate `RVAL` hangs off (see
     /// [`Self::fields_posted_with_value_mask`]).
-    fn monitor_value_changed(&self) -> Option<bool> {
-        Some(self.val_changed)
+    /// C `timestampRecord.c:158-162` `monitor()`: the `strncmp(oval, val)`
+    /// mismatch posts VAL *and* RVAL and then copies VAL into OVAL. Compared
+    /// and committed HERE, at C's position, never captured during `process()`.
+    fn monitor_value_changed(&mut self) -> Option<bool> {
+        let changed = self.oval != self.val;
+        if changed {
+            self.oval = self.val.clone();
+        }
+        Some(changed)
     }
 
     /// C posts `RVAL` from *inside* the VAL-string-change guard, with VAL's own

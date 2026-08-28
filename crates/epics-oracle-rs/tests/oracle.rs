@@ -10,14 +10,40 @@
 //! Requires the built C EPICS tree (`EPICS_BASE_BIN`, or the default path). If
 //! it is absent the tests fail loudly rather than skipping — a silently skipped
 //! oracle is exactly the false-clean this project is trying to escape.
+//!
+//! # Four of these have no subject on the reactor-free backend
+//!
+//! The Rust side of the pair is the `oracle-ioc` binary, and it refuses to
+//! start under `exec_backend` — the reactor-free backend, selected on a host
+//! build by `EPICS_RS_BUILD_EXEC_BACKEND=thread` and unconditionally on RTEMS
+//! and VxWorks. The four that boot the pair therefore cannot pass there under
+//! any treatment, so they are gated rather than selected and failed. The rest
+//! stay selected: they assert bucket-accounting and reproducer rules that hold
+//! over an all-ERROR report, which is the harness behaving correctly when a
+//! side is unreachable. `[[test]] required-features` cannot name a
+//! build-script cfg, which is why the gates are on the items and not in
+//! `Cargo.toml`.
+
+// RTEMS-EXEC-MODEL-ALLOW(1): checked, not waived —
+// `the_denominator_probe_uses_the_configuration_under_test` ran and
+// passed on the exec backend (measured on this tree:
+// `EPICS_RS_BUILD_EXEC_BACKEND=thread cargo nextest run -p
+// epics-oracle-rs --all-features`). It reads the dbd, builds no server,
+// and the reactor it obtains comes from `#[tokio::test]` itself. The
+// twelve cases that used to fail in that run boot `oracle-ioc`, which
+// refuses on that backend; they are plain `#[test]`, so the census never
+// counted them, and they now carry `#[cfg(tokio_backend)]` instead.
 
 use std::collections::BTreeSet;
 
 use epics_oracle_rs::allowlist::Allowlist;
+#[cfg(tokio_backend)]
 use epics_oracle_rs::catool::CaTools;
 use epics_oracle_rs::dbd::Dbd;
 use epics_oracle_rs::diff::Verdict;
-use epics_oracle_rs::ioc::{CTools, Ioc, Pair, Side};
+use epics_oracle_rs::ioc::CTools;
+#[cfg(tokio_backend)]
+use epics_oracle_rs::ioc::{Ioc, Pair, Side};
 use epics_oracle_rs::report::{Counts, exit_status, field_coverage, run_failures};
 use epics_oracle_rs::runner::{Runner, workdir};
 use epics_oracle_rs::surface::{Surface, probe_supported_record_types};
@@ -64,6 +90,7 @@ fn the_dbd_yields_a_real_denominator() {
 /// Both IOCs boot on the same `.db`, on **different, exclusive** ports, and both
 /// serve the record. This is the load-bearing precondition for everything else:
 /// if the two ever shared a port, a reading could come from the wrong IOC.
+#[cfg(tokio_backend)]
 #[test]
 fn the_pair_boots_on_distinct_ports_and_both_serve_the_record() {
     let t = tools();
@@ -93,6 +120,7 @@ fn the_pair_boots_on_distinct_ports_and_both_serve_the_record() {
 
 /// A PV that does not exist must produce an ERROR on both sides — never an
 /// empty-but-successful reading that the diff would score as agreement.
+#[cfg(tokio_backend)]
 #[test]
 fn an_unconnectable_pv_errors_rather_than_silently_agreeing() {
     let t = tools();
@@ -252,6 +280,7 @@ async fn the_denominator_probe_uses_the_configuration_under_test() {
 /// measurement failure would bury that finding under ERROR instead of scoring
 /// it. Driven against the real pair, because the discriminator is the C tool's
 /// own message.
+#[cfg(tokio_backend)]
 #[test]
 fn a_server_issued_refusal_is_a_reading_not_a_measurement_failure() {
     let t = tools();
@@ -275,4 +304,68 @@ fn a_server_issued_refusal_is_a_reading_not_a_measurement_failure() {
             "{side}: a refusal must carry the server's complaint"
         );
     }
+}
+
+/// The outermost contract: the **binary's own exit code**.
+///
+/// Everything below it — `run_failures`, `exit_status`, `verdict_exit` — is
+/// covered by library tests, but nothing ran the command and looked at what the
+/// shell sees, so the one number CI actually branches on was untested. C's own
+/// tools do assert this contract (`caget.c:518-551` returns 1 on every failure
+/// path, `cainfo.c` main returns `connect_pvs`'s status), and the oracle's whole
+/// value is that a wrong or unmeasurable run cannot exit 0.
+///
+/// Both directions on one boot-shaped run, because an exit-0 assertion alone
+/// would still pass if the binary always exited 0.
+#[cfg(tokio_backend)]
+#[test]
+fn the_binary_exits_zero_on_a_clean_run_and_non_zero_on_a_stale_row() {
+    let dir = workdir(None).unwrap();
+
+    let clean = std::process::Command::new(env!("CARGO_BIN_EXE_oracle"))
+        .args(["--phase", "read", "--record-types", "ai"])
+        .output()
+        .expect("the oracle binary must run");
+    assert!(
+        clean.status.success(),
+        "a clean read run must exit 0, got {:?}\n{}",
+        clean.status.code(),
+        String::from_utf8_lossy(&clean.stderr)
+    );
+
+    // A row naming a field the run does look at, whose deviation does not
+    // happen, is STALE — one of the four reasons `run_failures` names.
+    let allowlist = dir.join("stale.toml");
+    std::fs::write(
+        &allowlist,
+        r#"
+schema = 1
+
+[[deviation]]
+id = "ORACLE-TEST-STALE"
+bucket = "DESIGN-DIVERGENCE"
+enabled = true
+upstream = "test fixture"
+record_types = ["ai"]
+fields = ["VAL"]
+surface = ["value_string"]
+why = "a deviation that does not happen, so the run must fail on it"
+"#,
+    )
+    .unwrap();
+    let stale = std::process::Command::new(env!("CARGO_BIN_EXE_oracle"))
+        .args(["--phase", "read", "--record-types", "ai", "--allowlist"])
+        .arg(&allowlist)
+        .output()
+        .expect("the oracle binary must run");
+    assert_eq!(
+        stale.status.code(),
+        Some(1),
+        "a STALE allowlist row must exit 1\n{}",
+        String::from_utf8_lossy(&stale.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&stale.stderr).contains("ORACLE-TEST-STALE"),
+        "the failing row must be named on stderr, not left to a bare exit code"
+    );
 }

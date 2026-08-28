@@ -1,6 +1,17 @@
 //! End-to-end integration tests for std-rs features that require
 //! actual framework link resolution, PV connections, and async PID.
 
+#![cfg(tokio_backend)]
+// Eight of the twelve cases here build a real CA server and drive epid,
+// throttle or autosave through it; the other four are `#[tokio::test]`
+// over the same record layer and go with the file rather than leaving it
+// half-gated. The reactor-free `exec_backend` — selected on a host build
+// by `EPICS_RS_BUILD_EXEC_BACKEND=thread`, and unconditionally on RTEMS
+// and VxWorks — has no `epics_ca_rs::server::CaServer` to build, so this
+// file has no subject there. `[[test]] required-features` cannot name a
+// build-script cfg, which is why the gate is here and not in
+// `Cargo.toml`.
+
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -555,7 +566,7 @@ async fn test_epid_sub_mdt_edge_cycle_does_not_seed_i() {
 //   1. `dbPutLink(ptriglink, DBR_DOUBLE, &pepid->tval, 1)`
 //      (`devEpidSoftCallback.c:121-127`) — synchronous trigger write;
 //   2. `dbGetLink(&pepid->inp, DBR_DOUBLE, &pepid->cval, ...)`
-//      (`devEpidSoftCallback.c:151`) — read CVAL from INP;
+//      (`devEpidSoftCallback.c:149`) — read CVAL from INP;
 //   3. run the PID.
 //
 // The trigger write must land BEFORE the INP read so the freshly-

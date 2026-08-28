@@ -1,7 +1,7 @@
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use epics_base_rs::error::CaResult;
-use epics_base_rs::server::device_support::{DeviceReadOutcome, DeviceSupport};
+use epics_base_rs::server::device_support::{DeviceReadOutcome, DeviceSupport, DeviceUdf};
 use epics_base_rs::server::recgbl::get_time_stamp;
 use epics_base_rs::server::record::{ProcessContext, Record};
 use epics_base_rs::types::EpicsValue;
@@ -11,18 +11,29 @@ use chrono::{DateTime, Local};
 /// EPICS epoch offset: seconds from Unix epoch (1970-01-01) to EPICS epoch (1990-01-01).
 const EPICS_EPOCH_OFFSET: u64 = 631152000;
 
-/// `(secPastEpoch, nsec)` of a resolved time stamp, counted from the
-/// EPICS epoch (1990-01-01) exactly as C `epicsTimeStamp`.
+/// `(secPastEpoch, nsec)` of a resolved time stamp, counted from the EPICS
+/// epoch (1990-01-01) exactly as C `epicsTimeStamp`.
 ///
-/// A time at or before the EPICS epoch (including the `UNIX_EPOCH`
-/// default of an unresolved stamp) saturates `secPastEpoch` to 0, so the
-/// `secPastEpoch == 0 && nsec == 0` test below matches C
-/// `epicsTimeToStrftime`'s "uninitialized time stamp" check
-/// (`epicsTime.cpp:176`).
-fn epics_time_parts(ts: SystemTime) -> (u64, u32) {
+/// Wrapping, not saturating. C reaches `secPastEpoch` through
+/// `epicsTimeFromTime_t` (`$EPICS_BASE/modules/libcom/src/osi/epicsTime.cpp:305-310`
+/// at `R7.0.10`), which assigns an `epicsInt64` difference into an
+/// `epicsUInt32`, so a clock before 1990 wraps to a 2106 stamp and formats as
+/// a date. Saturating pinned it to `0` — C's *uninitialized* value — so a
+/// running IOC whose RTC never started answered `<undefined>` where C answers
+/// a date, and the `ai` path read `0.0` where C reads ~4.29e9.
+fn epics_time_parts(ts: SystemTime) -> (u32, u32) {
+    // C's uninitialized `epicsTimeStamp` is the literal `{0, 0}`; this port
+    // carries it as `UNIX_EPOCH`, and the `secPastEpoch == 0 && nsec == 0`
+    // test below is C's own check for it (`epicsTime.cpp:176`). A sentinel,
+    // not a boundary of the conversion.
+    if ts == UNIX_EPOCH {
+        return (0, 0);
+    }
+    // `unwrap_or_default` collapses a pre-1970 stamp to the Unix epoch; that
+    // is this port's own limit and predates the wrap below.
     let dur = ts.duration_since(UNIX_EPOCH).unwrap_or_default();
     (
-        dur.as_secs().saturating_sub(EPICS_EPOCH_OFFSET),
+        dur.as_secs().wrapping_sub(EPICS_EPOCH_OFFSET) as u32,
         dur.subsec_nanos(),
     )
 }
@@ -112,7 +123,9 @@ impl DeviceSupport for TimeOfDayStringDeviceSupport {
         };
 
         record.put_field("VAL", EpicsValue::String(formatted.into()))?;
-        Ok(DeviceReadOutcome::computed())
+        // C `devTimeOfDay.c::stringinReadTs:135-137` — `psi->udf = 0;
+        // return(0)`. stringin has no RVAL, so 0 is a plain success.
+        Ok(DeviceReadOutcome::converted(DeviceUdf::Defined))
     }
 
     fn write(&mut self, _record: &mut dyn Record) -> CaResult<()> {
@@ -191,7 +204,9 @@ impl DeviceSupport for SecPastEpochDeviceSupport {
         };
 
         record.put_field("VAL", EpicsValue::Double(val))?;
-        Ok(DeviceReadOutcome::computed())
+        // C `devTimeOfDay.c::aiReadTs:150-152` — `pai->udf = 0; return(2)`:
+        // VAL written directly and the record declared defined.
+        Ok(DeviceReadOutcome::computed(DeviceUdf::Defined))
     }
 
     fn write(&mut self, _record: &mut dyn Record) -> CaResult<()> {
@@ -216,6 +231,7 @@ mod tests {
             time: SystemTime::UNIX_EPOCH,
             tsel: String::new(),
             dtyp: String::new(),
+            callback_priority: epics_base_rs::runtime::task::CallbackPriority::Low,
         }
     }
 
@@ -232,6 +248,7 @@ mod tests {
             time,
             tsel: String::new(),
             dtyp: String::new(),
+            callback_priority: epics_base_rs::runtime::task::CallbackPriority::Low,
         }
     }
 
@@ -336,6 +353,41 @@ mod tests {
             other => panic!("expected String VAL, got {other:?}"),
         };
         assert_eq!(val, "<undefined>", "EPICS-epoch stamp is also undefined");
+    }
+
+    /// One second BEFORE the EPICS epoch is a running clock, not an
+    /// uninitialized stamp. C's `epicsTimeFromTime_t` wraps it into
+    /// `epicsUInt32` (`epicsTime.cpp:305-310`), giving 0xFFFF_FFFF, which
+    /// `epicsTimeToStrftime` formats as a 2106 date. Saturating answered 0
+    /// and printed the "<undefined>" sentinel instead.
+    #[test]
+    fn time_of_day_pre_1990_clock_is_a_date_not_the_undefined_sentinel() {
+        let mut dev = TimeOfDayStringDeviceSupport::new();
+        let mut rec = StringinRecord::new("");
+        let before = SystemTime::UNIX_EPOCH + Duration::from_secs(EPICS_EPOCH_OFFSET - 1);
+        dev.set_process_context(&ctx_device_time(0, before));
+        dev.read(&mut rec).unwrap();
+        let val = match rec.get_field("VAL") {
+            Some(EpicsValue::String(s)) => s.as_str_lossy().into_owned(),
+            other => panic!("expected String VAL, got {other:?}"),
+        };
+        assert_ne!(val, "<undefined>", "a pre-1990 clock is not C's {{0, 0}}");
+    }
+
+    /// The wrap itself, read straight off the conversion.
+    #[test]
+    fn epics_time_parts_wraps_both_ends_and_keeps_the_unset_sentinel() {
+        assert_eq!(epics_time_parts(SystemTime::UNIX_EPOCH), (0, 0));
+        let at = SystemTime::UNIX_EPOCH + Duration::from_secs(EPICS_EPOCH_OFFSET);
+        assert_eq!(epics_time_parts(at).0, 0);
+        let before = SystemTime::UNIX_EPOCH + Duration::from_secs(EPICS_EPOCH_OFFSET - 1);
+        assert_eq!(epics_time_parts(before).0, u32::MAX);
+        let last =
+            SystemTime::UNIX_EPOCH + Duration::from_secs(EPICS_EPOCH_OFFSET + u32::MAX as u64);
+        assert_eq!(epics_time_parts(last).0, u32::MAX);
+        let past =
+            SystemTime::UNIX_EPOCH + Duration::from_secs(EPICS_EPOCH_OFFSET + u32::MAX as u64 + 1);
+        assert_eq!(epics_time_parts(past).0, 0);
     }
 
     /// C `createString` formats `psi->time` (resolved from TSE), NOT the

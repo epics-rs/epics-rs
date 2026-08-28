@@ -2,7 +2,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use epics_base_rs::error::CaResult;
-use epics_base_rs::server::device_support::{DeviceReadOutcome, DeviceSupport};
+use epics_base_rs::server::device_support::{DeviceReadOutcome, DeviceSupport, DeviceUdf};
 use epics_base_rs::server::record::Record;
 
 use crate::records::epid::EpidRecord;
@@ -551,7 +551,12 @@ impl DeviceSupport for EpidFastDeviceSupport {
         self.update_params_from_record(epid);
         // Copy latest results back to record (for display/alarm)
         self.update_record_from_params(epid);
-        Ok(DeviceReadOutcome::computed())
+        // C `devEpidFast.c::read_epid:352-353` — `pepid->udf=0; return(0)`.
+        // `computed` (not `converted`) because the port's status half also
+        // carries "the PID already ran", which is what stops `process()`
+        // running `do_pid` a second time; C expresses that by having no
+        // record-side compute to skip at all.
+        Ok(DeviceReadOutcome::computed(DeviceUdf::Defined))
     }
 
     fn write(&mut self, _record: &mut dyn Record) -> CaResult<()> {

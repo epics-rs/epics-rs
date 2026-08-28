@@ -162,6 +162,9 @@ pub struct Counts {
     pub agreed: usize,
     pub expected_deviation: usize,
     pub defect: usize,
+    /// Agreed on every surface, and neither side reported the put complete.
+    /// See [`Verdict::NeitherCompleted`].
+    pub neither_completed: usize,
     pub errored: usize,
 }
 
@@ -183,6 +186,7 @@ impl Counts {
                 Verdict::Agreed => c.agreed += 1,
                 Verdict::ExpectedDeviation => c.expected_deviation += 1,
                 Verdict::Defect => c.defect += 1,
+                Verdict::NeitherCompleted => c.neither_completed += 1,
                 Verdict::Errored => c.errored += 1,
             }
         }
@@ -192,7 +196,11 @@ impl Counts {
     /// Every case landed in exactly one bucket. If this ever fails, the harness
     /// has lost cases and no number it prints can be trusted.
     pub fn check(&self) -> Result<(), String> {
-        let sum = self.agreed + self.expected_deviation + self.defect + self.errored;
+        let sum = self.agreed
+            + self.expected_deviation
+            + self.defect
+            + self.neither_completed
+            + self.errored;
         if sum != self.ran {
             return Err(format!(
                 "counts do not reconcile: ran={} but buckets sum to {sum}",
@@ -278,6 +286,72 @@ pub fn exit_status(failures: &[String]) -> u8 {
 pub struct StaleRow {
     pub id: String,
     pub why: String,
+    /// The `--phase` values that can actually drive this row, derived from the
+    /// row's own `surface` list. See [`StaleRow::of`].
+    pub driven_by: Vec<&'static str>,
+}
+
+impl StaleRow {
+    /// The one mint for a [`StaleRow`], so `driven_by` cannot disagree with the
+    /// row it describes.
+    ///
+    /// The three surface vocabularies are disjoint and belong to different
+    /// lanes: [`crate::diff::Surface`] is CA, [`crate::pvaread::PvaSurface`] is
+    /// `--phase pvaread`, [`crate::pvamonitor::MonSurface`] is
+    /// `--phase pvamonitor`. `Phase::PvaRead` and `Phase::PvaMonitor` are
+    /// deliberately OUTSIDE `Phase::All` (different ground truth, different
+    /// instrument, no allowlist), so a row whose every surface is a PVA one is
+    /// unreachable from `--phase all` no matter how wide the record-type set
+    /// is. Telling its reader to widen the run is advice that cannot work,
+    /// which is why the phase is computed here and not written into the
+    /// message.
+    pub fn of(d: &crate::allowlist::Deviation) -> Self {
+        let mut driven_by: Vec<&'static str> = Vec::new();
+        let mut push = |p: &'static str| {
+            if !driven_by.contains(&p) {
+                driven_by.push(p);
+            }
+        };
+        for name in &d.surface {
+            let name = name.as_str();
+            if crate::diff::Surface::ALL.iter().any(|s| s.as_str() == name) {
+                push("--phase all");
+            } else if crate::pvaread::PvaSurface::ALL
+                .iter()
+                .any(|s| s.as_str() == name)
+            {
+                push("--phase pvaread");
+            } else if crate::pvamonitor::MonSurface::ALL
+                .iter()
+                .any(|s| s.as_str() == name)
+            {
+                push("--phase pvamonitor");
+            }
+        }
+        Self {
+            id: d.id.clone(),
+            why: d.why.trim().to_string(),
+            driven_by,
+        }
+    }
+
+    /// How to name the driving phase in a human line. A row whose surfaces
+    /// match no known vocabulary gets no invented advice.
+    pub fn driven_by_phrase(&self) -> String {
+        match self.driven_by.as_slice() {
+            [] => "No phase in this harness drives its surfaces — check the row's \
+                   `surface` list against the three surface vocabularies"
+                .to_string(),
+            [one] => format!("Drive it with `{one}`"),
+            many => format!(
+                "Drive it with {}",
+                many.iter()
+                    .map(|p| format!("`{p}`"))
+                    .collect::<Vec<_>>()
+                    .join(" and ")
+            ),
+        }
+    }
 }
 
 /// What the denominator actually was, so the coverage number can be audited.
@@ -383,10 +457,17 @@ impl Report {
         s.push_str(&format!("  ran                : {}\n", c.ran));
         s.push_str(&format!("  agreed             : {}\n", c.agreed));
         s.push_str(&format!(
-            "  expected deviation : {}  (allowlisted against doc/upstream-c-bugs.md)\n",
+            "  expected deviation : {}  (allowlisted against expected-deviations.toml)\n",
             c.expected_deviation
         ));
         s.push_str(&format!("  DEFECT             : {}\n", c.defect));
+        if c.neither_completed > 0 {
+            s.push_str(&format!(
+                "  no completion      : {}  (agreed on every surface; NEITHER side \
+                 reported the put complete)\n",
+                c.neither_completed
+            ));
+        }
         s.push_str(&format!(
             "  ERROR              : {}  (could not run — never counted as agreement)\n",
             c.errored
@@ -413,8 +494,9 @@ impl Report {
             for r in &self.unexercised_allowlist_rows {
                 s.push_str(&format!(
                     "  {} — no case in its scope ran, or none of its surfaces was compared.\n     \
-                     Its silence measures nothing. Widen the run (e.g. --phase all) to judge it.\n",
-                    r.id
+                     Its silence measures nothing. {} to judge it.\n",
+                    r.id,
+                    r.driven_by_phrase()
                 ));
             }
             s.push('\n');
@@ -457,28 +539,10 @@ impl Report {
             s.push('\n');
         }
 
-        let errs: Vec<_> = self.errors().collect();
-        if !errs.is_empty() {
-            s.push_str(&format!(
-                "ERRORS ({}) — cases that could NOT be measured\n",
-                errs.len()
-            ));
-            // Group by message: a boot failure produces one error per field and
-            // printing all of them would bury the cause.
-            let mut by_msg: std::collections::BTreeMap<String, usize> = Default::default();
-            for e in &errs {
-                let m = e
-                    .errors
-                    .first()
-                    .map(|x| x.to_string())
-                    .unwrap_or_else(|| "(unknown)".into());
-                *by_msg.entry(m).or_default() += 1;
-            }
-            for (msg, n) in by_msg.iter().take(20) {
-                s.push_str(&format!("  {n:>5}x  {}\n", truncate(msg, 110)));
-            }
-            s.push('\n');
-        }
+        s.push_str(&errors_section(
+            "cases",
+            self.errors().map(|e| e.errors.as_slice()).collect(),
+        ));
 
         // The printed verdict comes from the same owner as the exit code, so a
         // run cannot exit non-zero while its report says it was clean — or,
@@ -499,6 +563,74 @@ impl Report {
     }
 }
 
+/// How much of one ERROR cause a human report prints.
+///
+/// A cause is the only explanation the report offers for every channel it
+/// names — a boot failure stamps one onto every field of a record type — and
+/// at 110 it was cut exactly where the cause lives, at the end: a boot reason
+/// leads with the step that failed and closes with the IOC's own last words
+/// ([`crate::ioc::OutputTail`]), so 110 characters bought the step and lost
+/// the words.
+///
+/// Measured on this host, rendered as the section prints it: a
+/// `verify_sole_server` failure quoting a whole `softIocPVX` tail is 314
+/// characters (3 tail lines, 107 of them) and the `oracle-ioc --pva` side's is
+/// 232 (1 line, 25); five of the C-side shape, which is what a `retry_pair`
+/// exhaustion joins, is about 1,635. This holds all of them.
+///
+/// It stays a bound rather than becoming none, because a tool's stderr is not
+/// bounded by anything this crate owns.
+const CAUSE_CHARS: usize = 2000;
+
+/// The ERRORS section of a human report: the causes, grouped, with every side
+/// of a cause on its own line. Empty when nothing errored.
+///
+/// **The single owner of that rendering**, shared by the CA report and both
+/// PVA ones, because writing the rule down once per report is exactly how it
+/// drifted apart. Grouping is needed at all because a boot failure produces
+/// one error per field, and printing all of them would bury the cause.
+///
+/// The key is the case's WHOLE error list, not its first entry. Keying on
+/// `.first()` renders a two-sided failure as one-sided, which is how 464 `sub`
+/// cases that timed out on BOTH sides read as C-only until the JSON was
+/// opened — and the two PVA reports still keyed that way long after the CA one
+/// stopped. Sidedness is the one thing this section exists to show, so it
+/// cannot be a casualty of the key; each side is truncated on its own line,
+/// because truncating the joined string would drop the second side all over
+/// again.
+pub(crate) fn errors_section(noun: &str, causes: Vec<&[ToolError]>) -> String {
+    if causes.is_empty() {
+        return String::new();
+    }
+    let mut s = format!(
+        "ERRORS ({}) — {noun} that could NOT be measured\n",
+        causes.len()
+    );
+    let mut by_msg: std::collections::BTreeMap<Vec<String>, usize> = Default::default();
+    for errors in &causes {
+        let key: Vec<String> = if errors.is_empty() {
+            vec!["(unknown)".into()]
+        } else {
+            errors
+                .iter()
+                .map(|x| truncate(&x.to_string(), CAUSE_CHARS))
+                .collect()
+        };
+        *by_msg.entry(key).or_default() += 1;
+    }
+    for (msgs, n) in by_msg.iter().take(20) {
+        for (i, msg) in msgs.iter().enumerate() {
+            if i == 0 {
+                s.push_str(&format!("  {n:>5}x  {msg}\n"));
+            } else {
+                s.push_str(&format!("          {msg}\n"));
+            }
+        }
+    }
+    s.push('\n');
+    s
+}
+
 fn truncate(s: &str, n: usize) -> String {
     let s = s.replace('\n', " ");
     if s.chars().count() <= n {
@@ -512,6 +644,7 @@ fn truncate(s: &str, n: usize) -> String {
 mod tests {
     use super::*;
     use crate::diff::Surface;
+    use crate::ioc::Side;
 
     fn case(v: Verdict) -> CaseResult {
         CaseResult {
@@ -557,6 +690,54 @@ mod tests {
         c.check().expect("buckets must reconcile");
     }
 
+    /// A failure that hit BOTH sides must render as two-sided.
+    ///
+    /// Keying the ERRORS grouping on `errors.first()` printed only the C half of
+    /// 464 `sub` cases whose put callback never completed on either side, and a
+    /// reader of that report would have concluded the Rust IOC answered.
+    #[test]
+    fn a_two_sided_failure_renders_both_sides() {
+        let mut both = case(Verdict::Errored);
+        both.errors = vec![
+            ToolError {
+                side: crate::ioc::Side::C,
+                tool: "caput".into(),
+                message: "Write callback operation timed out".into(),
+            },
+            ToolError {
+                side: crate::ioc::Side::Rust,
+                tool: "caput".into(),
+                message: "Write callback operation timed out".into(),
+            },
+        ];
+        let cases = vec![both];
+        let rep = Report {
+            denominator: Denominator {
+                dbd: "softIoc.dbd".into(),
+                record_types_in_dbd: 1,
+                record_types_covered: vec!["ai".into()],
+                record_types_unimplemented: vec![],
+                observable_fields: 1,
+                excluded_noaccess_fields: 0,
+            },
+            field_coverage: field_coverage(&cases, 1),
+            counts: Counts::tally(&cases),
+            stale_allowlist_rows: vec![],
+            unexercised_allowlist_rows: vec![],
+            fired_allowlist_rows: vec![],
+            cases,
+        };
+        let h = rep.human();
+        assert!(
+            h.contains("[C] caput: Write callback operation timed out"),
+            "the C side must show. got:\n{h}"
+        );
+        assert!(
+            h.contains("[rust] caput: Write callback operation timed out"),
+            "the rust side must show too, or the failure reads as one-sided. got:\n{h}"
+        );
+    }
+
     /// The guard that catches a harness silently dropping cases.
     #[test]
     fn a_lost_case_makes_the_counts_fail_to_reconcile() {
@@ -565,6 +746,7 @@ mod tests {
             agreed: 4,
             expected_deviation: 1,
             defect: 1,
+            neither_completed: 0,
             errored: 1,
         };
         let err = bad.check().unwrap_err();
@@ -573,6 +755,54 @@ mod tests {
 
     /// An errored case must never be reported as agreement, and must not be
     /// counted as coverage.
+    /// A cause that belongs to NEITHER side names both sides.
+    ///
+    /// The formerly-bypassing path: both PVA reports keyed this grouping on
+    /// `errors.first()` long after the CA one stopped, so a pair that never
+    /// booted — one `ToolError` per side — printed as C-only, and a reader
+    /// would have hunted a C-side fault that did not exist.
+    #[test]
+    fn a_cause_belonging_to_neither_side_names_both() {
+        let errors =
+            crate::ioc::BootError::neither("both sides drew one number").tool_errors("boot");
+        let block = errors_section("channels", vec![errors.as_slice(); 56]);
+        assert!(
+            block.starts_with("ERRORS (56) — channels that could NOT be measured\n"),
+            "{block}"
+        );
+        assert!(
+            block.contains("[C] boot: both sides drew one number"),
+            "{block}"
+        );
+        assert!(
+            block.contains("[rust] boot: both sides drew one number"),
+            "{block}"
+        );
+        // One group, counted once, with the second side on its own line.
+        assert_eq!(block.matches("56x").count(), 1, "{block}");
+    }
+
+    /// Distinct causes stay distinct: grouping must not merge two faults.
+    #[test]
+    fn distinct_causes_are_counted_separately() {
+        let a = vec![terr(Side::C, "pvxget", "Timeout")];
+        let b = vec![terr(Side::Rust, "pvxinfo", "no such channel")];
+        let block = errors_section("cases", vec![a.as_slice(), a.as_slice(), b.as_slice()]);
+        assert!(block.contains("    2x  [C] pvxget: Timeout"), "{block}");
+        assert!(
+            block.contains("    1x  [rust] pvxinfo: no such channel"),
+            "{block}"
+        );
+    }
+
+    fn terr(side: Side, tool: &str, message: &str) -> ToolError {
+        ToolError {
+            side,
+            tool: tool.into(),
+            message: message.into(),
+        }
+    }
+
     #[test]
     fn errors_are_not_agreement_and_not_coverage() {
         let cases = vec![case(Verdict::Errored), case(Verdict::Agreed)];
@@ -735,6 +965,7 @@ mod tests {
             stale_allowlist_rows: vec![StaleRow {
                 id: "CBUG-E1".into(),
                 why: "compress FIFO".into(),
+                driven_by: vec!["--phase all"],
             }],
             unexercised_allowlist_rows: vec![],
             fired_allowlist_rows: vec![],
@@ -889,14 +1120,7 @@ why = "C's special() rejects SPC_MOD; port accepts."
         // The run drove the put and the two sides agreed: the deviation the row
         // documents did not happen where the row points.
         al.note_compared(&ctx, &[Surface::PutAccepted]);
-        let stale: Vec<StaleRow> = al
-            .stale_rows()
-            .into_iter()
-            .map(|r| StaleRow {
-                id: r.id.clone(),
-                why: r.why.trim().to_string(),
-            })
-            .collect();
+        let stale: Vec<StaleRow> = al.stale_rows().into_iter().map(StaleRow::of).collect();
         assert_eq!(stale.len(), 1, "the row must be stale, not unexercised");
 
         let counts = Counts::tally(&[case(Verdict::Agreed)]);
@@ -930,6 +1154,109 @@ why = "C's special() rejects SPC_MOD; port accepts."
         let h = rep.human();
         assert!(h.contains("RUN FAILED"), "{h}");
         assert!(!h.contains("Every case ran and was adjudicated"), "{h}");
+    }
+
+    /// An UNEXERCISED row must be told the phase that can actually drive it.
+    ///
+    /// `Phase::PvaRead` and `Phase::PvaMonitor` sit deliberately outside
+    /// `Phase::All`, so for a row whose only surfaces are PVA ones the old
+    /// advice — "widen the run (e.g. --phase all)" — named a phase that
+    /// structurally cannot reach it, no matter how wide the record-type set is.
+    /// Four of the five rows a `--phase all` run leaves unexercised on this
+    /// tree are exactly that shape (CBUG-G1, DESIGN-ASYN-BOUT,
+    /// INSTR-QSRV2-LONGIN-UTAG, INSTR-QSRV2-WAVEFORM-DEMO).
+    #[test]
+    fn an_unexercised_row_names_the_phase_that_can_drive_it() {
+        const ROWS: &str = r#"
+schema = 1
+[[deviation]]
+id = "CBUG-PVA1"
+bucket = "NOT-REPRODUCED"
+record_types = ["asyn"]
+fields = ["BOUT"]
+surface = ["value_marking"]
+why = "PVA read surface only."
+
+[[deviation]]
+id = "CBUG-MON1"
+bucket = "NOT-REPRODUCED"
+record_types = ["bo"]
+fields = []
+surface = ["seed_event"]
+why = "PVA monitor surface only."
+
+[[deviation]]
+id = "CBUG-CA1"
+bucket = "NOT-REPRODUCED"
+record_types = ["calc"]
+fields = ["INPM"]
+surface = ["put_accepted"]
+why = "CA surface."
+
+[[deviation]]
+id = "CBUG-BOTH1"
+bucket = "NOT-REPRODUCED"
+record_types = ["waveform"]
+fields = []
+surface = ["value_string", "value_marking"]
+why = "One row, both lanes."
+"#;
+        let al = crate::allowlist::Allowlist::parse(ROWS).expect("fixture parses");
+        let rows: Vec<StaleRow> = al
+            .unexercised_rows()
+            .into_iter()
+            .map(StaleRow::of)
+            .collect();
+        let by = |id: &str| {
+            rows.iter()
+                .find(|r| r.id == id)
+                .unwrap_or_else(|| panic!("{id} is unexercised"))
+                .clone()
+        };
+
+        assert_eq!(by("CBUG-PVA1").driven_by, ["--phase pvaread"]);
+        assert_eq!(by("CBUG-MON1").driven_by, ["--phase pvamonitor"]);
+        assert_eq!(by("CBUG-CA1").driven_by, ["--phase all"]);
+        assert_eq!(
+            by("CBUG-BOTH1").driven_by,
+            ["--phase all", "--phase pvaread"]
+        );
+
+        let rep = Report {
+            denominator: Denominator {
+                dbd: "softIoc.dbd".into(),
+                record_types_in_dbd: 1,
+                record_types_covered: vec!["calc".into()],
+                record_types_unimplemented: vec![],
+                observable_fields: 1,
+                excluded_noaccess_fields: 0,
+            },
+            field_coverage: Coverage {
+                enumerated: 1,
+                measured: 1,
+                errored: 0,
+            },
+            counts: Counts::tally(&[case(Verdict::Agreed)]),
+            stale_allowlist_rows: vec![],
+            unexercised_allowlist_rows: rows,
+            fired_allowlist_rows: vec![],
+            cases: vec![case(Verdict::Agreed)],
+        };
+        let h = rep.human();
+        let line = |id: &str| {
+            h.lines()
+                .skip_while(|l| !l.trim_start().starts_with(id))
+                .nth(1)
+                .unwrap_or_default()
+                .to_string()
+        };
+        assert!(line("CBUG-PVA1").contains("`--phase pvaread`"), "{h}");
+        assert!(
+            !line("CBUG-PVA1").contains("--phase all"),
+            "a PVA-only row must never be sent to --phase all: {h}"
+        );
+        assert!(line("CBUG-MON1").contains("`--phase pvamonitor`"), "{h}");
+        assert!(line("CBUG-CA1").contains("`--phase all`"), "{h}");
     }
 
     /// The pre-existing half of the rule, kept asserted at the new owner: an

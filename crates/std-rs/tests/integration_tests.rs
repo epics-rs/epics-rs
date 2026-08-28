@@ -1,3 +1,12 @@
+#![cfg(tokio_backend)]
+// Every case here drives a record through a real CA server's put gate.
+// The reactor-free `exec_backend` — selected on a host build by
+// `EPICS_RS_BUILD_EXEC_BACKEND=thread`, and unconditionally on RTEMS and
+// VxWorks — has no `epics_ca_rs::server::CaServer` to build, so this
+// file has no subject there. `[[test]] required-features` cannot name a
+// build-script cfg, which is why the gate is here and not in
+// `Cargo.toml`.
+
 use epics_base_rs::server::records::ao::AoRecord;
 use epics_base_rs::types::EpicsValue;
 use epics_ca_rs::server::CaServerBuilder;
@@ -340,14 +349,14 @@ record(epid, "TEST:PID2") {
 // `return(0)` skips `do_pid` on EVERY cycle.
 //
 // But the record is not the only udf owner: C `dbPut`'s tail clears
-// `udf` on ANY value-field put (`dbAccess.c:1414-1415`,
+// `udf` on ANY value-field put (`dbAccess.c:1409-1410`,
 // `if (isValueField) precord->udf = FALSE;`) — `special = NULL` is
 // irrelevant, the clear lives in dbAccess, not in `special()`. So an
 // operator setting the supervisory setpoint (any dbPut route to VAL)
 // DOES define the record, and the next cycle runs `do_pid` — that is
 // how a supervisory epid is used. (An earlier revision asserted the
 // put leaves `udf` set; that encoded the port's missing `dbPut` udf
-// clear, `doc/calink-rtems-design.md` §11.7 item 2, not C.)
+// clear, not C.)
 //
 // Phase 1 (no VAL write) exercises the framework auto-clear path
 // (`clears_udf()` / `value_is_undefined()` recomputed after
@@ -395,7 +404,7 @@ record(epid, "TEST:PIDSUP") {
         udf,
         EpicsValue::UChar(1),
         "UDF must stay set across 5 cycles when nothing writes VAL — \
-         only a value-field put (dbAccess.c:1414-1415) or the record's \
+         only a value-field put (dbPut, dbAccess.c:1409-1410) or the record's \
          own STPL conditions may clear it"
     );
     let p = server.get("TEST:PIDSUP.P").await.unwrap();
@@ -406,7 +415,7 @@ record(epid, "TEST:PIDSUP") {
     );
 
     // Phase 2 — the operator sets the supervisory setpoint. The dbPut
-    // analogue clears udf (VAL is the value field, dbAccess.c:1415;
+    // analogue clears udf (VAL is the value field, dbPut, dbAccess.c:1410;
     // `special = NULL` plays no part), so the next cycle runs do_pid:
     // P = KP * (VAL - CVAL) = 2.0 * (100 - 0) = 200.
     server
@@ -1101,7 +1110,7 @@ record(throttle, "TEST:THRERR") {
     assert_eq!(
         server.get("TEST:THRERR.SENT").await.unwrap(),
         EpicsValue::Double(0.0),
-        "SENT advances only on a successful put (C :568)"
+        "SENT advances only on a successful put (C :566)"
     );
 }
 
@@ -1110,7 +1119,7 @@ record(throttle, "TEST:THRERR") {
 //
 // C `valueSync` marks the request and returns while `wait_flag` is set
 // (throttleRecord.c:623-627); `valuePut` finishes it from its successful
-// `dbPutLink` arm (:571-572). So VAL takes a SINP value read AFTER the
+// `dbPutLink` arm (:569-570). So VAL takes a SINP value read AFTER the
 // queued value went out, and a failed put leaves the request standing.
 // Boundaries: {sync while idle, sync while waiting} x {put succeeds, fails}.
 // ============================================================
@@ -1235,7 +1244,7 @@ async fn test_throttle_deferred_sync_stays_pending_when_the_put_fails() {
     assert_eq!(
         server.get("TEST:THRSYNCE.SYNC").await.unwrap(),
         EpicsValue::Short(1),
-        "C fires the deferred sync only from valuePut's successful arm (:571)"
+        "C fires the deferred sync only from valuePut's successful arm (:569)"
     );
     assert_eq!(
         server.get("TEST:THRSYNCE.VAL").await.unwrap(),

@@ -33,6 +33,9 @@ pub enum ValueType {
 ///   spaces is not expressible in the C grammar; this port adds an explicit
 ///   quoted-topic extension `FORMAT:TYPE "topic with spaces" field` for that
 ///   case only, leaving the reference grammar for unquoted drvInfo intact.
+///   The extension is a strict fallback: it fires only when the quoted topic
+///   actually contains whitespace, so `JSON:INT "abc" def` reads C's way —
+///   topic `"abc"`, quotes included — rather than being hijacked (MQ18).
 ///
 /// Examples:
 /// - `"FLAT:INT test/temperature"`
@@ -81,23 +84,15 @@ impl TopicAddress {
                 (rest.to_string(), None)
             }
             PayloadFormat::Json => {
-                if let Some(after_open) = rest.strip_prefix('"') {
-                    // Quoted-topic extension: the topic is the text between the
-                    // quotes (spaces allowed), the field is the remainder.
-                    let close = after_open.find('"').ok_or_else(|| {
-                        MqttError::InvalidAddress("unterminated quoted JSON topic".into())
-                    })?;
-                    let topic = after_open[..close].to_string();
-                    if topic.is_empty() {
-                        return Err(MqttError::InvalidAddress("empty quoted JSON topic".into()));
-                    }
-                    let field = after_open[close + 1..].trim();
-                    if field.is_empty() {
-                        return Err(MqttError::InvalidAddress(
-                            "JSON format requires a field after the quoted topic".into(),
-                        ));
-                    }
-                    (topic, Some(field.to_string()))
+                // MQ18: the quoted form is a port-only extension and may claim
+                // ONLY the inputs the reference grammar cannot express. For
+                // everything else — a topic that legitimately begins with `"`
+                // included — C's rule stands and the quotes are part of the
+                // topic name. Taking the quoted branch first made the two sides
+                // SUBSCRIBE to different topics for `JSON:INT "abc" def` (`abc`
+                // here, `"abc"` in C), so the record never received C's data.
+                if let Some((topic, field)) = Self::parse_quoted_json_topic(rest) {
+                    (topic, Some(field))
                 } else {
                     // C grammar (drvMqtt.cpp:75,86,92): topic is the text before
                     // the first whitespace; the JSON field is the entire rest of
@@ -199,6 +194,30 @@ impl TopicAddress {
         };
 
         Ok((format, value_type))
+    }
+
+    /// The quoted-topic extension, or `None` when the reference grammar owns
+    /// this input.
+    ///
+    /// The extension exists for one thing C cannot express: a topic containing
+    /// whitespace, because `arguments.find(' ')` reserves the first space for
+    /// the topic/field boundary (drvMqtt.cpp:75,86,92). So the quoted reading
+    /// is taken only when it is well-formed in full — closing quote, non-empty
+    /// topic, non-empty field — *and* the topic actually contains whitespace.
+    /// Every other input falls through, which means the extension can neither
+    /// re-read a drvInfo C reads differently nor reject one C accepts.
+    fn parse_quoted_json_topic(rest: &str) -> Option<(String, String)> {
+        let after_open = rest.strip_prefix('"')?;
+        let close = after_open.find('"')?;
+        let topic = &after_open[..close];
+        if !topic.contains(char::is_whitespace) {
+            return None;
+        }
+        let field = after_open[close + 1..].trim();
+        if field.is_empty() {
+            return None;
+        }
+        Some((topic.to_string(), field.to_string()))
     }
 
     fn validate_topic(topic: &str) -> MqttResult<()> {
@@ -380,9 +399,39 @@ mod tests {
         assert_eq!(addr.json_field.as_deref(), Some("room plug power"));
     }
 
+    // MQ18: an unterminated quote is not an error — C has no quote handling at
+    // all, so `arguments.find(' ')` splits at the first space and the stray
+    // quote simply stays in the topic name (drvMqtt.cpp:75,86,92). This test
+    // used to pin the extension's rejection, which C never performs.
     #[test]
-    fn reject_json_unterminated_quoted_topic() {
-        assert!(TopicAddress::parse("JSON:FLOAT \"zigbee2mqtt/living room power").is_err());
+    fn json_unterminated_quote_falls_through_to_the_c_grammar() {
+        let addr = TopicAddress::parse("JSON:FLOAT \"zigbee2mqtt/living room power").unwrap();
+        assert_eq!(addr.topic, "\"zigbee2mqtt/living");
+        assert_eq!(addr.json_field.as_deref(), Some("room power"));
+    }
+
+    /// MQ18: for a drvInfo whose topic literally begins with `"`, the port used
+    /// to strip the quotes and SUBSCRIBE to a different topic than C, so the
+    /// record never received the data C delivers. C's grammar owns this input.
+    #[test]
+    fn json_quoted_extension_does_not_hijack_a_c_valid_quoted_topic() {
+        let addr = TopicAddress::parse("JSON:INT \"abc\" def").unwrap();
+        assert_eq!(
+            addr.topic, "\"abc\"",
+            "C keeps the quotes in the topic name"
+        );
+        assert_eq!(addr.json_field.as_deref(), Some("def"));
+
+        // The extension still owns the one case C cannot express.
+        let addr = TopicAddress::parse("JSON:INT \"a b\" def").unwrap();
+        assert_eq!(addr.topic, "a b");
+        assert_eq!(addr.json_field.as_deref(), Some("def"));
+
+        // A quoted topic with no field is C's "topic then field" split too, not
+        // the extension's error: topic `"a`, field `b"`.
+        let addr = TopicAddress::parse("JSON:INT \"a b\"").unwrap();
+        assert_eq!(addr.topic, "\"a");
+        assert_eq!(addr.json_field.as_deref(), Some("b\""));
     }
 
     #[test]

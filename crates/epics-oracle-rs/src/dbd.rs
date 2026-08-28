@@ -165,9 +165,9 @@ impl FieldDef {
     /// `special(SPC_DBADDR)` — **the `.dbd` does not determine this field's
     /// type or element count.**
     ///
-    /// `dbNameToAddr` fills the `DBADDR` from the `.dbd` and then hands it to
+    /// `dbEntryToAddr` fills the `DBADDR` from the `.dbd` and then hands it to
     /// the record type to rewrite, gated on exactly this token
-    /// (`dbAccess.c:640-648`):
+    /// (`dbAccess.c:639-648`; `dbNameToAddr` reaches it at `:677`):
     ///
     /// ```text
     /// paddr->dbr_field_type = mapDBFToDBR[dbfType];   /* what the dbd says */

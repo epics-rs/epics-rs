@@ -71,18 +71,21 @@ epics-rs = { version = "0.8", features = ["scaler"] }
 
 ```rust
 use epics_base_rs::server::ioc_app::IocApplication;
-use epics_ca_rs::server::run_ca_ioc;
+use epics_ca_rs::server::run_ca_ioc_app;
 use scaler_rs::scaler_record_factory;
 
 #[epics_base_rs::epics_main]
 async fn main() -> epics_base_rs::error::CaResult<()> {
     let (name, factory) = scaler_record_factory();
 
-    IocApplication::new()
-        .register_record_type(name, factory)
-        .db_file("db/scaler16.db", &macros)?
-        .run(run_ca_ioc)
-        .await
+    // `run_ca_ioc_app` runs C's `rsrvRegistrar` first, so `casr` and the
+    // `dbsr` server layer exist before `iocInit` rather than after it.
+    run_ca_ioc_app(
+        IocApplication::new()
+            .register_record_type(name, factory)
+            .db_file("db/scaler16.db", &macros)?,
+    )
+    .await
 }
 ```
 

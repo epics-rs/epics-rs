@@ -7,7 +7,7 @@
 //!
 //! - **AGREED** — both sides produced a reading and the readings match.
 //! - **EXPECTED DEVIATION** — they differ, and the difference is justified by a
-//!   NOT-REPRODUCED entry in `doc/upstream-c-bugs.md` (the port deliberately
+//!   NOT-REPRODUCED entry (the port deliberately
 //!   refuses to reproduce a C bug). Not a failure.
 //! - **DEFECT** — they differ and nothing justifies it.
 //! - **ERROR** — a reading could not be obtained at all (IOC would not boot, PV
@@ -81,6 +81,23 @@ impl Surface {
             Self::MonitorCount => "monitor_count",
         }
     }
+
+    /// Every CA surface, so a classifier over the three surface vocabularies
+    /// cannot silently omit one. The PVA lanes already keep the same list
+    /// (`PvaSurface::ALL`, `MonSurface::ALL`).
+    pub const ALL: [Surface; 11] = [
+        Self::NativeType,
+        Self::ElementCount,
+        Self::AccessRights,
+        Self::ValueString,
+        Self::ValueNumeric,
+        Self::Stat,
+        Self::Sevr,
+        Self::PutAccepted,
+        Self::PutError,
+        Self::MonitorEvents,
+        Self::MonitorCount,
+    ];
 }
 
 /// One concrete disagreement: what surface, what C said, what the port said.
@@ -201,6 +218,18 @@ pub enum Verdict {
     Agreed,
     ExpectedDeviation,
     Defect,
+    /// Both servers agreed on every surface AND neither reported the put
+    /// complete. Its own bucket rather than [`Self::Agreed`], because "they
+    /// behaved alike" and "the operation finished" are two different facts and
+    /// a run that folded them together would report a completion it never saw.
+    ///
+    /// Not [`Self::Errored`]: the crate already rules that a refusal issued by
+    /// the server is a reading and not a measurement failure
+    /// (`tests/oracle.rs:250-258`), and a completion that never comes from
+    /// EITHER side is the same kind of reading — the two IOCs did the same
+    /// observable thing. A one-sided no-completion is the opposite: it is the
+    /// difference this harness exists to find, so it stays `Errored`.
+    NeitherCompleted,
     Errored,
 }
 

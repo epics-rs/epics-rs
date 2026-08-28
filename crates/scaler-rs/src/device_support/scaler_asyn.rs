@@ -1,7 +1,7 @@
 use std::sync::{Arc, Mutex};
 
 use epics_base_rs::error::CaResult;
-use epics_base_rs::server::device_support::{DeviceReadOutcome, DeviceSupport};
+use epics_base_rs::server::device_support::{DeviceInitOutcome, DeviceReadOutcome, DeviceSupport};
 use epics_base_rs::server::record::Record;
 use epics_base_rs::types::EpicsValue;
 
@@ -84,7 +84,7 @@ impl DeviceSupport for ScalerAsynDeviceSupport {
         "Asyn Scaler"
     }
 
-    fn init(&mut self, record: &mut dyn Record) -> CaResult<()> {
+    fn init(&mut self, record: &mut dyn Record) -> CaResult<DeviceInitOutcome> {
         let scaler = record
             .as_any_mut()
             .and_then(|a| a.downcast_mut::<ScalerRecord>())
@@ -95,7 +95,7 @@ impl DeviceSupport for ScalerAsynDeviceSupport {
         // physical array bound so the record's fixed 64-element arrays are
         // never indexed out of range.
         scaler.nch = driver.num_channels().min(MAX_SCALER_CHANNELS) as i16;
-        Ok(())
+        Ok(DeviceInitOutcome::Live)
     }
 
     fn read(&mut self, record: &mut dyn Record) -> CaResult<DeviceReadOutcome> {
@@ -237,7 +237,7 @@ impl ScalerAsynDeviceSupport {
     /// - `:425/:427/:430` PR1/TP/FREQ monitor events are posted by the
     ///   framework's `DeviceCommand` dispatch from the field names this
     ///   function returns; C does this with `db_post_events`.
-    /// - `:431` arm.
+    /// - `:433` arm.
     ///
     /// Returns the record field names whose values changed so the
     /// framework can post `DBE_VALUE` monitor events for them.
@@ -305,7 +305,7 @@ impl ScalerAsynDeviceSupport {
             changed.push("FREQ");
         }
 
-        // C scalerRecord.c:431 — arm.
+        // C scalerRecord.c:433 — arm.
         driver.arm(true)?;
         Ok(changed)
     }

@@ -7,10 +7,9 @@
 //!
 //! ## Why this replaces reading C and Rust side by side
 //!
-//! Nineteen audit rounds never converged (`doc/strategy-2026-07-13.md`): the
-//! discovery rate never fell, there was no denominator, and "verified clean"
-//! verdicts kept turning out false. Two structural fixes follow, and this crate
-//! is the second:
+//! Nineteen audit rounds never converged: the discovery rate never fell, there
+//! was no denominator, and "verified clean" verdicts kept turning out false.
+//! Two structural fixes follow, and this crate is the second:
 //!
 //! - the surface is enumerated **from the `.dbd`**, so coverage is a percentage
 //!   of a stated denominator rather than a feeling ([`surface`], [`dbd`]);
@@ -21,8 +20,7 @@
 //!
 //! Under the product policy, a C-vs-port difference is *not* automatically a
 //! port bug — the port deliberately refuses to reproduce C's bugs. So the
-//! expected-deviation allowlist **is** `doc/upstream-c-bugs.md`, transcribed
-//! into [`allowlist`]:
+//! expected-deviation allowlist is transcribed into [`allowlist`]:
 //!
 //! | outcome | meaning |
 //! |---|---|
@@ -45,6 +43,50 @@
 //!
 //! From a test: see `tests/oracle.rs`, which boots the pair and asserts the
 //! counts reconcile.
+//!
+//! # C reference pins
+//!
+//! Every `file.c:NNN` citation in this crate resolves at the tree and revision
+//! below, not at whatever that tree's working copy holds today. These trees are
+//! checked out on local branches here and run ahead of their pins.
+//!
+//! | tree | pinned revision |
+//! | --- | --- |
+//! | `epics-base` | `R7.0.10` |
+//! | `pvxs` | `1.5.1-42-gb568e93` |
+//! | `asyn` | `R4-45-19-ge2a281e2` |
+//!
+//! **Resolve by symbol at the pin; the line is a hint.** Find the named
+//! function, struct, macro or field first, and treat the line number as a hint
+//! that has to land inside that construct. Three cases follow:
+//!
+//! 1. Construct at the pin, line lands in it — the citation is exact. A
+//!    reference checkout ahead of the pin will disagree; that disagreement is
+//!    the checkout's, not the citation's.
+//! 2. Construct at the pin, line lands outside it — line drift. Keep the
+//!    symbol and move the line to the pin's.
+//! 3. Construct absent at the pin — the citation means code added after it,
+//!    and is NOT moved onto the pin, where it would point at lines that do not
+//!    exist. It names the revision it means inline, beside the line span: the
+//!    upstream PR and commit, and that both are later than the pin this table
+//!    gives. `epics-libcom-rs` already carries that form.
+//!
+//! Every pin above passes `git merge-base --is-ancestor <pin> origin/<default>`
+//! in its own tree, which is the test a pin has to meet. A `git describe`
+//! string names an exact commit and is worth as much as a tag; what
+//! disqualifies a revision is being reachable only from a fork branch or an
+//! unmerged PR, because then it names nothing a reader outside this workspace
+//! can fetch.
+//!
+//! Resolve each citation on its own. One sentence can cite two lines that are
+//! right at different revisions, and a check run at either revision then
+//! reports a single tidy error while vouching for the very citation the other
+//! condemns.
+//!
+//! A row reading *no settled pin* means no revision has been agreed for that
+//! tree: say which revision you read, and do not take its `HEAD` for the pin.
+//! Citations into non-EPICS sources (libc, RTEMS, `rtems-libbsd`, VxWorks,
+//! vendored third-party) are outside this table and carry no pin.
 
 pub mod allowlist;
 pub mod cases;
@@ -188,14 +230,34 @@ pub fn register_port_ioc_devices() -> Result<PortIocDevices, String> {
     })
 }
 
-/// The per-builder half of the port IOC's configuration: route the `asyn`
-/// record type to asyn-rs's full `AsynRecord` rather than epics-base-rs's
-/// CNCT-only display stub. See [`register_port_ioc_devices`] for why the two
-/// halves must stay together.
+/// The per-builder half of the port IOC's configuration: the record types the
+/// C side we diff against gets from loading module `.dbd`s, and which
+/// `epics-base-rs` therefore does not register by default.
+///
+/// `asyn` is routed to asyn-rs's full `AsynRecord` rather than epics-base-rs's
+/// CNCT-only display stub; see [`register_port_ioc_devices`] for why that
+/// record type's two halves must stay together. The other six are synApps
+/// `calc`'s (`aCalcout`, `sCalcout`, `sseq`, `swait`, `transform`) and busy's,
+/// implemented in `epics-base-rs` but outside `stdRecords.dbd`, so base leaves
+/// them to the application. Registering them here is what keeps the oracle's
+/// denominator the fat IOC's record set instead of bare base's — the boot probe
+/// reports any type the port cannot build, so dropping one shows up as
+/// "unimplemented", not as silent agreement.
 pub fn port_ioc_builder() -> epics_base_rs::server::ioc_builder::IocBuilder {
+    use epics_base_rs::server::records::{
+        acalcout::AcalcoutRecord, busy::BusyRecord, scalcout::ScalcoutRecord, sseq::SseqRecord,
+        swait::SwaitRecord, transform::TransformRecord,
+    };
+
     let (asyn_type, asyn_factory) = asyn_rs::asyn_record::asyn_record_factory();
     epics_base_rs::server::ioc_builder::IocBuilder::new()
         .register_record_type(asyn_type, asyn_factory)
+        .register_record_type("acalcout", || Box::new(AcalcoutRecord::default()))
+        .register_record_type("busy", || Box::new(BusyRecord::default()))
+        .register_record_type("scalcout", || Box::new(ScalcoutRecord::default()))
+        .register_record_type("sseq", || Box::new(SseqRecord::default()))
+        .register_record_type("swait", || Box::new(SwaitRecord::default()))
+        .register_record_type("transform", || Box::new(TransformRecord::default()))
 }
 
 #[cfg(test)]

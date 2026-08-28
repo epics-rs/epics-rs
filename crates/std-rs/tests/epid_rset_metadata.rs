@@ -54,7 +54,7 @@ fn control(inst: &RecordInstance, field: &str) -> (f64, f64) {
 }
 
 /// The operator window. `CVAL` is the controlled-variable readback and sits in
-/// it in BOTH slots — `epidRecord.c:243` and `:268`.
+/// it in BOTH slots — `epidRecord.c:249` and `:275`.
 #[test]
 fn epid_operator_window_covers_val_and_cval() {
     let inst = epid();

@@ -23,6 +23,14 @@
 //! additionally went through `Record::get_field`, which answers `None` for a
 //! record that leaves its link fields to the framework, as `mca` does.
 
+// RTEMS-EXEC-MODEL-ALLOW(5): checked, not waived — all 5 ran and passed
+// on the exec backend (measured on this tree:
+// `EPICS_RS_BUILD_EXEC_BACKEND=thread cargo nextest run -p mca-rs
+// --all-features`, 62/62). mca-rs became a census subject when its
+// `build.rs` began deriving `tokio_backend`; nothing here builds a CA
+// server, and the reactor these obtain comes from `#[tokio::test]`
+// itself, which the backend does not remove.
+
 use std::collections::{HashMap, HashSet};
 
 use epics_base_rs::server::database::{PvDatabase, RecordLoad};

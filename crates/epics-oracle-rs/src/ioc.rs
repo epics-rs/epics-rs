@@ -19,9 +19,15 @@
 //! ...and the IOC *keeps running* and *serves values*. That is precisely the
 //! silent-wrong-answer this harness exists to not produce. Hence:
 //!
-//! - **Rust side:** true bind-`:0`-and-read-back. `CaServer::from_parts(db, 0)`
-//!   binds the sockets and reports the port it actually got, so no number is
-//!   ever guessed and nothing can take it in between.
+//! - **Rust side:** true bind-`:0`-and-read-back.
+//!   `CaServer::from_parts(db, 0, ..)` — the four trailing arguments are the
+//!   ACF cell and the optional TLS and cap-token seams — binds the sockets and
+//!   reports the port it actually got, so no number is ever guessed and
+//!   nothing can take it in between. Named with its real arity because the
+//!   `bin/oracle_ioc.rs` call is what a reader copies; and named in a code
+//!   span rather than linked because the constructor is `tokio_backend`-only,
+//!   so on the reactor-free backend this paragraph still renders while the
+//!   item it names is not there to link to.
 //! - **C side:** `softIoc` takes its port from the environment and cannot
 //!   inherit a pre-bound fd, so bind-read-back is *not available*. The honest
 //!   substitute is allocate-then-**verify**: [`alloc_free_port`] binds `:0` on
@@ -33,22 +39,23 @@
 //! Neither side ever hard-codes 5064, and neither ever probe-then-rebinds a
 //! port it has already decided to use.
 
-use std::io::{BufRead, BufReader, Read};
+use std::collections::VecDeque;
+use std::io::{BufRead, BufReader};
 use std::net::{TcpListener, UdpSocket};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
-use std::sync::mpsc;
+use std::sync::{Arc, Mutex, mpsc};
 use std::time::{Duration, Instant};
 
-use crate::catool::CaTools;
+use crate::catool::{CaTools, ToolError};
 
 /// How long to wait for an IOC to report itself up before calling the boot an
 /// ERROR. Generous: a slow boot must surface as an error, never as a case that
 /// quietly "agreed".
 const BOOT_TIMEOUT: Duration = Duration::from_secs(20);
 
-/// How long to keep re-probing a booted IOC for **observed** reachability
-/// before declaring it a genuine boot failure.
+/// How many times a booted IOC is re-probed for **observed** reachability
+/// before the boot is called a genuine failure.
 ///
 /// A process reporting itself "up" is not the same as its CA layer answering a
 /// search. The Rust `oracle-ioc` prints its port right after `from_parts` binds
@@ -58,8 +65,15 @@ const BOOT_TIMEOUT: Duration = Duration::from_secs(20);
 /// before `run()` starts answering, and every case of the type comes back
 /// "not found" — a whole record type turned `errored` by a boot race rather
 /// than by any real defect. So readiness is **observed**, not assumed: poll a
-/// known channel through the real C client until it connects.
-const REACHABLE_TIMEOUT: Duration = Duration::from_secs(15);
+/// known channel through the real client until it connects.
+///
+/// The budget is an ATTEMPT COUNT, not a wall clock. A wall-clock gate spends
+/// itself on the probes rather than on the wait, so it buys *fewer* attempts
+/// exactly when the box is loaded and the extra attempt is what was needed: one
+/// killed `cainfo` costs `catool::TOOL_TIMEOUT` (8 s), so the 15 s gate this
+/// replaces gave ~20 probes idle and as few as two under load. An attempt count
+/// is load-invariant.
+const REACHABLE_ATTEMPTS: usize = 12;
 /// First inter-probe pause; doubles up to [`REACHABLE_BACKOFF_MAX`]. Small so a
 /// server that is already up is measured as up almost immediately.
 const REACHABLE_BACKOFF_START: Duration = Duration::from_millis(50);
@@ -72,18 +86,106 @@ const BOOT_ATTEMPTS: usize = 5;
 
 /// Anything that went wrong booting an IOC. Never silently swallowed: a case
 /// that cannot run is reported ERROR.
+///
+/// The attribution travels WITH the failure. Every construction site knows
+/// which IOC it was talking to, and the case builders have no way to guess it
+/// back afterwards, so a failure that carried only a message got recorded
+/// against both sides — one ERROR became two, and one of the two named an IOC
+/// that had booted fine.
 #[derive(Debug)]
-pub struct BootError(pub String);
+pub struct BootError {
+    /// The side this failure belongs to, or `None` when it belongs to
+    /// **neither** — a workdir write, a port the host would not hand out, a
+    /// refusal to run because the two sides collided. `None` is the only
+    /// attribution that is legitimately recorded against both sides.
+    pub side: Option<Side>,
+    pub message: String,
+    /// Whether booting again **on a different port** could succeed.
+    ///
+    /// The one thing a retry varies is the port, so this says "the port was
+    /// the problem" and nothing else. It used to be inferred by the boot
+    /// loops from `message.contains("PORT_COLLISION")`, which made the
+    /// message text load-bearing and covered exactly one of the ways a port
+    /// can be lost: base prints that warning only when it *recovered* from
+    /// the collision by moving its TCP port. The fatal case — `rsrv`'s UDP
+    /// bind losing the port, which is silent (`caservertask.c:131-146`
+    /// prints nothing on `EADDRINUSE`) and ends in `cantProceed` — carried no
+    /// such text and was read as an ordinary boot timeout.
+    pub retryable: bool,
+}
+
+impl BootError {
+    pub fn new(side: Side, message: impl Into<String>) -> Self {
+        Self {
+            side: Some(side),
+            message: message.into(),
+            retryable: false,
+        }
+    }
+
+    /// A failure a fresh port could fix. See [`BootError::retryable`].
+    pub fn retryable(side: Side, message: impl Into<String>) -> Self {
+        Self {
+            retryable: true,
+            ..Self::new(side, message)
+        }
+    }
+
+    /// A failure that belongs to neither IOC.
+    pub fn neither(message: impl Into<String>) -> Self {
+        Self {
+            side: None,
+            message: message.into(),
+            retryable: false,
+        }
+    }
+
+    /// A failure a fresh port could fix that belongs to neither IOC — the two
+    /// sides drawing the same number is the only one. [`Self::retryable`] and
+    /// [`Self::neither`] in one; there is no third way to set the flag.
+    pub fn retryable_neither(message: impl Into<String>) -> Self {
+        Self {
+            retryable: true,
+            ..Self::neither(message)
+        }
+    }
+
+    /// The tool errors this failure is recorded as: one entry for the side that
+    /// produced it, and two only for a failure that belongs to neither.
+    pub fn tool_errors(&self, tool: &str) -> Vec<ToolError> {
+        let one = |side| ToolError {
+            side,
+            tool: tool.to_string(),
+            message: self.message.clone(),
+        };
+        match self.side {
+            Some(side) => vec![one(side)],
+            None => vec![one(Side::C), one(Side::Rust)],
+        }
+    }
+}
 
 impl std::fmt::Display for BootError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}", self.0)
+        write!(f, "{}", self.message)
     }
 }
 impl std::error::Error for BootError {}
 
-fn err<T>(msg: impl Into<String>) -> Result<T, BootError> {
-    Err(BootError(msg.into()))
+fn err<T>(side: Side, msg: impl Into<String>) -> Result<T, BootError> {
+    Err(BootError::new(side, msg))
+}
+
+fn err_neither<T>(msg: impl Into<String>) -> Result<T, BootError> {
+    Err(BootError::neither(msg))
+}
+
+fn err_retryable<T>(side: Side, msg: impl Into<String>) -> Result<T, BootError> {
+    Err(BootError::retryable(side, msg))
+}
+
+fn err_retryable_neither<T>(msg: impl Into<String>) -> Result<T, BootError> {
+    Err(BootError::retryable_neither(msg))
 }
 
 /// Find a port number that is free on **both** UDP and TCP, by binding it.
@@ -118,7 +220,7 @@ pub fn alloc_free_port() -> Result<u16, BootError> {
             Err(_) => continue,
         }
     }
-    err("could not find a port free on both UDP and TCP after 64 tries")
+    err_neither("could not find a port free on both UDP and TCP after 64 tries")
 }
 
 /// Tell a `softIoc`-family binary to serve `db`, by whichever route that `db`
@@ -153,7 +255,7 @@ pub fn alloc_free_port() -> Result<u16, BootError> {
 /// Every other record type keeps the plain `-d` path.
 fn load_db_into(cmd: &mut Command, db: &Path) -> Result<(), BootError> {
     let db_text = std::fs::read_to_string(db)
-        .map_err(|e| BootError(format!("read db {}: {e}", db.display())))?;
+        .map_err(|e| BootError::neither(format!("read db {}: {e}", db.display())))?;
     if !db_text.contains(crate::ORACLE_ASYN_PORT) {
         cmd.arg("-d").arg(db);
         return Ok(());
@@ -169,9 +271,52 @@ fn load_db_into(cmd: &mut Command, db: &Path) -> Result<(), BootError> {
         db = db_abs.display(),
     );
     std::fs::write(&st_cmd, script)
-        .map_err(|e| BootError(format!("write st.cmd {}: {e}", st_cmd.display())))?;
+        .map_err(|e| BootError::neither(format!("write st.cmd {}: {e}", st_cmd.display())))?;
     cmd.arg(&st_cmd);
     Ok(())
+}
+
+/// The last few lines an IOC printed, kept so a failure can quote the process
+/// it is about.
+///
+/// A reachability timeout on its own says only that a client gave up, and that
+/// is the shape of every unexplained boot failure this harness has produced: a
+/// budget expiring, with the one witness that could name the cause — the IOC's
+/// own output — read and discarded by the watcher thread a second earlier. A
+/// `cas WARNING`, a panic, a db that loaded no record, or nothing whatsoever
+/// are four different faults behind one message, and keeping twelve lines
+/// tells them apart for free.
+#[derive(Clone, Default)]
+pub struct OutputTail(Arc<Mutex<VecDeque<String>>>);
+
+impl OutputTail {
+    /// Enough to hold an IOC's startup banner and the line that went wrong,
+    /// bounded so a chatty IOC cannot grow it without limit.
+    const KEEP: usize = 12;
+
+    fn new() -> Self {
+        Self::default()
+    }
+
+    fn push(&self, line: &str) {
+        let mut q = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        if q.len() == Self::KEEP {
+            q.pop_front();
+        }
+        q.push_back(line.trim_end().to_string());
+    }
+
+    /// The kept lines, oldest first. Silence is a finding in its own right —
+    /// an IOC that printed nothing at all did not merely boot slowly — so it
+    /// is reported as such rather than as an empty string.
+    pub fn text(&self) -> String {
+        let q = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        if q.is_empty() {
+            "(the IOC printed nothing)".to_string()
+        } else {
+            q.iter().cloned().collect::<Vec<_>>().join(" | ")
+        }
+    }
 }
 
 /// A booted IOC serving a `.db` on a known-exclusive CA port.
@@ -181,6 +326,9 @@ pub trait Ioc {
     fn port(&self) -> u16;
     /// Which side of the differential pair this is — used to label diffs.
     fn side(&self) -> Side;
+    /// What this IOC last said about itself. Quoted by whoever declares it
+    /// unreachable, so the failure names a cause instead of a budget.
+    fn recent_output(&self) -> String;
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
@@ -247,26 +395,35 @@ impl CTools {
         let bin = std::env::var("EPICS_BASE_BIN").unwrap_or_else(|_| Self::DEFAULT_BIN.to_string());
         let bin = PathBuf::from(bin);
         if !bin.is_dir() {
-            return err(format!(
-                "C EPICS bin dir not found at {}. Set EPICS_BASE_BIN to the built \
-                 linux-x86_64 bin dir. The oracle cannot run without ground truth.",
-                bin.display()
-            ));
+            return err(
+                Side::C,
+                format!(
+                    "C EPICS bin dir not found at {}. Set EPICS_BASE_BIN to the built \
+                     linux-x86_64 bin dir. The oracle cannot run without ground truth.",
+                    bin.display()
+                ),
+            );
         }
         for tool in ["caget", "caput", "cainfo", "camonitor"] {
             if !bin.join(tool).is_file() {
-                return err(format!("missing C tool `{tool}` in {}", bin.display()));
+                return err(
+                    Side::C,
+                    format!("missing C tool `{tool}` in {}", bin.display()),
+                );
             }
         }
         let ioc_bin = std::env::var("EPICS_ORACLE_IOC_BIN")
             .unwrap_or_else(|_| Self::DEFAULT_IOC_BIN.to_string());
         let ioc_bin = PathBuf::from(ioc_bin);
         if !ioc_bin.is_file() {
-            return err(format!(
-                "fat C softIoc not found at {}. Build it under oracle-ioc/ (or set \
-                 EPICS_ORACLE_IOC_BIN). The oracle cannot run without ground truth.",
-                ioc_bin.display()
-            ));
+            return err(
+                Side::C,
+                format!(
+                    "fat C softIoc not found at {}. Build it under oracle-ioc/ (or set \
+                     EPICS_ORACLE_IOC_BIN). The oracle cannot run without ground truth.",
+                    ioc_bin.display()
+                ),
+            );
         }
         Ok(Self { bin, ioc_bin })
     }
@@ -280,28 +437,33 @@ impl CTools {
 pub struct CIoc {
     port: u16,
     child: Child,
+    tail: OutputTail,
 }
 
 impl CIoc {
     pub fn boot(tools: &CTools, db: &Path) -> Result<Self, BootError> {
-        let mut last = String::new();
-        for _ in 0..BOOT_ATTEMPTS {
+        let mut why = Vec::new();
+        for n in 1..=BOOT_ATTEMPTS {
             let port = alloc_free_port()?;
             match Self::try_boot(tools, db, port) {
                 Ok(ioc) => return Ok(ioc),
-                Err(BootError(e)) if e.contains("PORT_COLLISION") => {
+                Err(e) if e.retryable => {
                     // Racy by nature: someone took the port between our probe
                     // and softIoc's bind. Discard this port entirely and get a
                     // new one — never re-use or re-probe the losing number.
-                    last = e;
+                    why.push(format!("attempt {n} on port {port}: {}", e.message));
                     continue;
                 }
                 Err(e) => return Err(e),
             }
         }
-        err(format!(
-            "C softIoc could not get an exclusive port in {BOOT_ATTEMPTS} attempts: {last}"
-        ))
+        err(
+            Side::C,
+            format!(
+                "C softIoc could not get an exclusive port in {BOOT_ATTEMPTS} attempts: {}",
+                why.join("; ")
+            ),
+        )
     }
 
     fn try_boot(tools: &CTools, db: &Path, port: u16) -> Result<Self, BootError> {
@@ -317,7 +479,7 @@ impl CIoc {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()
-            .map_err(|e| BootError(format!("spawn softIoc: {e}")))?;
+            .map_err(|e| BootError::new(Side::C, format!("spawn softIoc: {e}")))?;
 
         // softIoc announces readiness with "iocRun: All initialization
         // complete". It announces a *port collision* with a `cas WARNING`
@@ -327,8 +489,9 @@ impl CIoc {
         let stdout = child.stdout.take().expect("piped");
         let stderr = child.stderr.take().expect("piped");
         let (tx, rx) = mpsc::channel::<BootSignal>();
-        spawn_watcher(stdout, tx.clone());
-        spawn_watcher(stderr, tx);
+        let tail = OutputTail::new();
+        spawn_watcher(stdout, tx.clone(), tail.clone());
+        spawn_watcher(stderr, tx, tail.clone());
 
         let deadline = Instant::now() + BOOT_TIMEOUT;
         let mut ready = false;
@@ -336,15 +499,36 @@ impl CIoc {
             let left = deadline.saturating_duration_since(Instant::now());
             if left.is_zero() {
                 let _ = child.kill();
-                return err(format!(
-                    "C softIoc did not report ready within {BOOT_TIMEOUT:?} on port {port}"
-                ));
+                return err(
+                    Side::C,
+                    format!(
+                        "C softIoc did not report ready within {BOOT_TIMEOUT:?} on port {port}; \
+                         it said: {}",
+                        tail.text()
+                    ),
+                );
             }
             match rx.recv_timeout(left) {
                 Ok(BootSignal::PortCollision(line)) => {
                     let _ = child.kill();
                     let _ = child.wait();
-                    return err(format!("PORT_COLLISION on {port}: {line}"));
+                    return err_retryable(Side::C, format!("PORT_COLLISION on {port}: {line}"));
+                }
+                // `rsrv` lost the CA port on the UDP bind, which base does not
+                // report (`caservertask.c:131-146` returns silently on
+                // EADDRINUSE) and then turns fatal at `cantProceed("CAS: No
+                // TCP server started")`. A different port is exactly the
+                // remedy, so it retries rather than waiting out the timeout.
+                Ok(BootSignal::Died(said)) => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return err_retryable(
+                        Side::C,
+                        format!(
+                            "C softIoc declared itself unable to proceed on port {port}; \
+                                 it said: {said}"
+                        ),
+                    );
                 }
                 Ok(BootSignal::Ready) => {
                     ready = true;
@@ -359,29 +543,47 @@ impl CIoc {
         if !ready {
             let status = child.try_wait().ok().flatten();
             let _ = child.kill();
-            return err(format!(
-                "C softIoc exited during boot (status {status:?}) — db rejected?"
-            ));
+            return err(
+                Side::C,
+                format!(
+                    "C softIoc exited during boot (status {status:?}) — db rejected? \
+                     it said: {}",
+                    tail.text()
+                ),
+            );
         }
-        Ok(Self { port, child })
+        Ok(Self { port, child, tail })
     }
 }
 
 enum BootSignal {
     Ready,
     PortCollision(String),
+    /// The IOC has declared itself unable to continue. `cantProceed`
+    /// (`libcom/src/misc/cantProceed.c:54-72`) prints this banner, dumps a
+    /// stack, then loops on `epicsThreadSuspendSelf()` — so the process never
+    /// exits, the pipes never close, and without this signal the boot can
+    /// only be discovered by waiting out the full timeout.
+    Died(String),
     /// Any other output line. Carries no payload we act on, but it must still
     /// be a distinct signal so the boot loop keeps waiting rather than treating
     /// a chatty startup as silence.
     Other,
 }
 
-fn spawn_watcher(stream: impl Read + Send + 'static, tx: mpsc::Sender<BootSignal>) {
+fn spawn_watcher(
+    stream: impl std::io::Read + Send + 'static,
+    tx: mpsc::Sender<BootSignal>,
+    tail: OutputTail,
+) {
     std::thread::spawn(move || {
         for line in BufReader::new(stream).lines().map_while(Result::ok) {
+            tail.push(&line);
             // Order matters: a collision line must not be mistaken for noise,
             // and it can appear *before* the ready line.
-            let sig = if line.contains("Configured TCP port was unavailable")
+            let sig = if line.contains("can't proceed, suspending") {
+                BootSignal::Died(tail.text())
+            } else if line.contains("Configured TCP port was unavailable")
                 || line.contains("two or more servers share the same UDP port")
                 || line.contains("Unable to bind")
             {
@@ -406,6 +608,9 @@ impl Ioc for CIoc {
     }
     fn side(&self) -> Side {
         Side::C
+    }
+    fn recent_output(&self) -> String {
+        self.tail.text()
     }
 }
 
@@ -453,6 +658,7 @@ impl RustMode {
 pub struct RustIoc {
     port: u16,
     child: Child,
+    tail: OutputTail,
 }
 
 impl RustIoc {
@@ -464,7 +670,7 @@ impl RustIoc {
             return Ok(PathBuf::from(p));
         }
         let exe = std::env::current_exe()
-            .map_err(|e| BootError(format!("current_exe: {e}")))?
+            .map_err(|e| BootError::new(Side::Rust, format!("current_exe: {e}")))?
             .parent()
             .and_then(|d| {
                 // tests live in target/<profile>/deps/, binaries one level up
@@ -476,10 +682,10 @@ impl RustIoc {
                 up.is_file().then_some(up)
             });
         exe.ok_or_else(|| {
-            BootError(
+            BootError::new(
+                Side::Rust,
                 "cannot find the `oracle-ioc` binary. Build it \
-                 (`cargo build -p epics-oracle-rs`) or set ORACLE_IOC_BIN."
-                    .into(),
+                 (`cargo build -p epics-oracle-rs`) or set ORACLE_IOC_BIN.",
             )
         })
     }
@@ -509,7 +715,7 @@ impl RustIoc {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()
-            .map_err(|e| BootError(format!("spawn {}: {e}", bin.display())))?;
+            .map_err(|e| BootError::new(Side::Rust, format!("spawn {}: {e}", bin.display())))?;
         let port_line = mode.port_line();
 
         let stdout = child.stdout.take().expect("piped");
@@ -520,15 +726,21 @@ impl RustIoc {
         let (tx, rx) = mpsc::channel::<Result<u16, String>>();
         let ttx = tx.clone();
         let prefix = format!("{port_line} ");
+        let tail = OutputTail::new();
+        let otail = tail.clone();
         std::thread::spawn(move || {
             for line in BufReader::new(stdout).lines().map_while(Result::ok) {
+                otail.push(&line);
                 if let Some(p) = line.strip_prefix(&prefix) {
                     let parsed = p
                         .trim()
                         .parse::<u16>()
                         .map_err(|e| format!("bad port line `{line}`: {e}"));
                     let _ = ttx.send(parsed);
-                    return;
+                    // Keep reading. The port line is the *start* of this IOC's
+                    // life, and everything worth quoting when it later fails to
+                    // answer is printed after it.
+                    continue;
                 }
             }
             let _ = ttx.send(Err(format!(
@@ -538,9 +750,14 @@ impl RustIoc {
         // Capture stderr so a panic/failure has a diagnosable message rather
         // than a bare timeout.
         let (etx, erx) = mpsc::channel::<String>();
+        let etail = tail.clone();
         std::thread::spawn(move || {
             let mut buf = String::new();
-            let _ = BufReader::new(stderr).read_to_string(&mut buf);
+            for line in BufReader::new(stderr).lines().map_while(Result::ok) {
+                etail.push(&line);
+                buf.push_str(&line);
+                buf.push('\n');
+            }
             let _ = etx.send(buf);
         });
 
@@ -549,7 +766,7 @@ impl RustIoc {
         // failure carries it rather than a bare "boot failed".
         let outcome = rx.recv_timeout(BOOT_TIMEOUT);
         let reason = match outcome {
-            Ok(Ok(port)) => return Ok(Self { port, child }),
+            Ok(Ok(port)) => return Ok(Self { port, child, tail }),
             Ok(Err(e)) => e,
             Err(mpsc::RecvTimeoutError::Disconnected) => {
                 "oracle-ioc exited without reporting a port".to_string()
@@ -561,10 +778,16 @@ impl RustIoc {
         let _ = child.kill();
         let _ = child.wait();
         let detail = erx.recv_timeout(Duration::from_secs(2)).unwrap_or_default();
-        err(format!(
-            "Rust IOC failed to boot: {reason}: {}",
-            first_useful_line(&detail)
-        ))
+        // `detail` needs the child's stderr to reach EOF; the tail does not, so
+        // a boot that fails while the process is still alive still says why.
+        err(
+            Side::Rust,
+            format!(
+                "Rust IOC failed to boot: {reason}: {} (it said: {})",
+                first_useful_line(&detail),
+                tail.text()
+            ),
+        )
     }
 }
 
@@ -588,6 +811,9 @@ impl Ioc for RustIoc {
     }
     fn side(&self) -> Side {
         Side::Rust
+    }
+    fn recent_output(&self) -> String {
+        self.tail.text()
     }
 }
 
@@ -614,10 +840,14 @@ impl Pair {
     /// layer is not yet answering searches, which is the race that used to turn
     /// a whole record type `errored`.
     pub fn boot(tools: &CTools, db: &Path, probe_pv: &str) -> Result<Self, BootError> {
+        retry_pair("CA", || Self::try_boot(tools, db, probe_pv))
+    }
+
+    fn try_boot(tools: &CTools, db: &Path, probe_pv: &str) -> Result<Self, BootError> {
         let c = CIoc::boot(tools, db)?;
         let rust = RustIoc::boot(db)?;
         if c.port() == rust.port() {
-            return err(
+            return err_retryable_neither(
                 "C and Rust IOC landed on the same CA port — refusing to run, \
                         answers would not be attributable",
             );
@@ -628,39 +858,123 @@ impl Pair {
         // probing both is symmetric and future-proofs the C side too. A side
         // that never answers within the budget is a real boot failure, named
         // as such — not a silent per-case `errored`.
-        wait_reachable(tools, c.port(), Side::C, probe_pv)?;
-        wait_reachable(tools, rust.port(), Side::Rust, probe_pv)?;
+        wait_reachable(tools, &c, probe_pv)?;
+        wait_reachable(tools, &rust, probe_pv)?;
         Ok(Self { c, rust })
     }
 }
 
-/// Poll a known channel through the real C client until it connects, with
-/// bounded retries and exponential backoff.
+/// Poll a known channel through the real C client until it connects.
 ///
 /// Uses `cainfo`, the same instrument the harness measures with, so "reachable"
 /// means exactly "a C client can create this channel" — the property the cases
-/// depend on. Returns `Ok` on the first successful connect; a
-/// [`REACHABLE_TIMEOUT`] with no connect is a genuine boot failure carrying the
-/// last probe error, never masked as a per-case timeout.
-fn wait_reachable(tools: &CTools, port: u16, side: Side, probe_pv: &str) -> Result<(), BootError> {
-    let t = CaTools::new(tools, port, side);
-    let deadline = Instant::now() + REACHABLE_TIMEOUT;
+/// depend on. The probe carries C's own `-w` default rather than the harness's
+/// measurement budget: a probe is retried, so it wants C's short wait and many
+/// attempts (`tool_lib.h:51` `#define DEFAULT_TIMEOUT 1.0`).
+fn wait_reachable(tools: &CTools, ioc: &dyn Ioc, probe_pv: &str) -> Result<(), BootError> {
+    let t = CaTools::new(tools, ioc.port(), ioc.side());
+    wait_probe("IOC", ioc, probe_pv, || {
+        t.cainfo_probe(probe_pv).map(|_| ())
+    })
+}
+
+/// The single owner of the reachability retry policy, shared by the CA and PVA
+/// probes so one cannot drift off the other.
+///
+/// Returns `Ok` on the first successful probe; exhausting
+/// [`REACHABLE_ATTEMPTS`] is a genuine boot failure carrying the attempt count,
+/// the last probe error and what the IOC itself printed, never masked as a
+/// per-case timeout. It takes the [`Ioc`] rather than a port and a [`Side`]
+/// because those three facts have one owner — the process — and a probe that
+/// reports the attempt count without the child's own words leaves the reader
+/// with a budget and no cause.
+fn wait_probe<E: std::fmt::Display>(
+    what: &str,
+    ioc: &dyn Ioc,
+    probe_pv: &str,
+    mut probe: impl FnMut() -> Result<(), E>,
+) -> Result<(), BootError> {
+    let side = ioc.side();
     let mut backoff = REACHABLE_BACKOFF_START;
-    loop {
-        let last = match t.cainfo(probe_pv) {
-            Ok(_) => return Ok(()),
-            Err(e) => e.message,
-        };
-        let left = deadline.saturating_duration_since(Instant::now());
-        if left.is_zero() {
-            return err(format!(
-                "{side} IOC did not become reachable within {REACHABLE_TIMEOUT:?} \
-                 (probe {probe_pv}: {last})"
-            ));
+    let mut last = String::new();
+    for attempt in 1..=REACHABLE_ATTEMPTS {
+        match probe() {
+            Ok(()) => return Ok(()),
+            Err(e) => last = e.to_string(),
         }
-        std::thread::sleep(backoff.min(left));
+        if attempt == REACHABLE_ATTEMPTS {
+            break;
+        }
+        std::thread::sleep(backoff);
         backoff = (backoff * 2).min(REACHABLE_BACKOFF_MAX);
     }
+    // Retryable for the same reason a lost port is: the one thing a fresh
+    // attempt varies is the port, and a server that never answered a SEARCH on
+    // the number it reported is a port that did not carry traffic. Charging it
+    // to the cases instead cost 1004 `acalcout` ERRORs, 43 % of a four-type
+    // run, from one boot a second draw survived.
+    err_retryable(
+        side,
+        format!(
+            "{side} {what} did not become reachable after {REACHABLE_ATTEMPTS} attempts \
+             on port {} (probe {probe_pv}: {last}); it said: {}",
+            ioc.port(),
+            ioc.recent_output()
+        ),
+    )
+}
+
+/// Boot a differential pair, retrying the WHOLE pair on a port-scoped failure.
+///
+/// One uniform rule for every way a pair can fail to come up on the numbers it
+/// drew: a port taken between the probe and the bind, `rsrv` losing its UDP
+/// bind and ending in `cantProceed`, the two sides landing on one number, a
+/// side that never answered a SEARCH on the port it reported, a second server
+/// silently sharing a PVA port. Each is a property of *these* numbers, so the
+/// answer to all five is the same — throw the pair away and draw fresh ones.
+///
+/// [`BootError::retryable`] already decided which failures qualify; before
+/// this, only the two single-IOC loops read it, so a pair that booted but
+/// never answered was terminal and the harness charged it to the *cases*: one
+/// unreachable Rust IOC turned an entire record type into ERRORs — measured at
+/// 1004 cases for `acalcout`, 43 % of a four-type run, from a single boot that
+/// a second attempt survived. An infrastructure flake published as 1004
+/// unmeasured cases is the reporting hole this closes.
+///
+/// Exhaustion still fails, and it names the attempt count and the last reason
+/// so the failure cannot be read as a case-level timeout.
+fn retry_pair<T>(
+    protocol: &str,
+    mut attempt: impl FnMut() -> Result<T, BootError>,
+) -> Result<T, BootError> {
+    let mut last = None;
+    let mut why = Vec::new();
+    for n in 1..=BOOT_ATTEMPTS {
+        match attempt() {
+            Ok(pair) => return Ok(pair),
+            Err(e) if e.retryable => {
+                // Say so on stderr: a silent retry would let a host that needs
+                // three tries every time look as healthy as one that needs none.
+                eprintln!(
+                    "  {protocol} pair boot attempt {n}/{BOOT_ATTEMPTS} failed, \
+                     retrying on fresh ports: {e}"
+                );
+                why.push(format!("attempt {n}: {}", e.message));
+                last = Some(e);
+            }
+            Err(e) => return Err(e),
+        }
+    }
+    let last = last.expect("a retryable failure is recorded before the loop can exhaust");
+    Err(BootError {
+        side: last.side,
+        message: format!(
+            "{protocol} pair did not come up in {BOOT_ATTEMPTS} attempts, \
+             each on fresh ports: {}",
+            why.join("; ")
+        ),
+        retryable: false,
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -720,15 +1034,21 @@ impl PvxTools {
         let bin = std::env::var("PVXS_BIN").unwrap_or_else(|_| Self::DEFAULT_BIN.to_string());
         let bin = PathBuf::from(bin);
         if !bin.is_dir() {
-            return err(format!(
-                "pvxs bin dir not found at {}. Set PVXS_BIN to the built \
-                 linux-x86_64 bin dir. The PVA oracle cannot run without ground truth.",
-                bin.display()
-            ));
+            return err(
+                Side::C,
+                format!(
+                    "pvxs bin dir not found at {}. Set PVXS_BIN to the built \
+                     linux-x86_64 bin dir. The PVA oracle cannot run without ground truth.",
+                    bin.display()
+                ),
+            );
         }
         for tool in Self::REQUIRED {
             if !bin.join(tool).is_file() {
-                return err(format!("missing pvxs tool `{tool}` in {}", bin.display()));
+                return err(
+                    Side::C,
+                    format!("missing pvxs tool `{tool}` in {}", bin.display()),
+                );
             }
         }
         // Same discipline as `CTools::discover`: the fat IOC is named, verified,
@@ -740,11 +1060,14 @@ impl PvxTools {
             .unwrap_or_else(|_| Self::DEFAULT_IOC_BIN.to_string());
         let ioc_bin = PathBuf::from(ioc_bin);
         if !ioc_bin.is_file() {
-            return err(format!(
-                "fat `softIocPVX` not found at {}. Build it under oracle-ioc/ (or set \
-                 EPICS_ORACLE_PVX_IOC_BIN). The PVA oracle cannot run without ground truth.",
-                ioc_bin.display()
-            ));
+            return err(
+                Side::C,
+                format!(
+                    "fat `softIocPVX` not found at {}. Build it under oracle-ioc/ (or set \
+                     EPICS_ORACLE_PVX_IOC_BIN). The PVA oracle cannot run without ground truth.",
+                    ioc_bin.display()
+                ),
+            );
         }
         Ok(Self { bin, ioc_bin })
     }
@@ -754,31 +1077,35 @@ impl PvxTools {
 pub struct PvxIoc {
     port: u16,
     child: Child,
+    tail: OutputTail,
 }
 
 impl PvxIoc {
     /// Boot `softIocPVX` serving `db`, loopback-isolated, on a UDP search port
     /// nothing else holds.
     pub fn boot(tools: &PvxTools, db: &Path) -> Result<Self, BootError> {
-        let mut last = String::new();
-        for _ in 0..BOOT_ATTEMPTS {
+        let mut why = Vec::new();
+        for n in 1..=BOOT_ATTEMPTS {
             let udp = alloc_free_port()?;
-            let ca = alloc_free_port()?;
-            match Self::try_boot(tools, db, udp, ca) {
+            match Self::try_boot(tools, db, udp) {
                 Ok(ioc) => return Ok(ioc),
-                Err(BootError(e)) if e.contains("PORT_COLLISION") => {
-                    last = e;
+                Err(e) if e.retryable => {
+                    why.push(format!("attempt {n} on UDP {udp}: {}", e.message));
                     continue;
                 }
                 Err(e) => return Err(e),
             }
         }
-        err(format!(
-            "softIocPVX could not get an exclusive port in {BOOT_ATTEMPTS} attempts: {last}"
-        ))
+        err(
+            Side::C,
+            format!(
+                "softIocPVX could not get an exclusive port in {BOOT_ATTEMPTS} attempts: {}",
+                why.join("; ")
+            ),
+        )
     }
 
-    fn try_boot(tools: &PvxTools, db: &Path, udp: u16, ca: u16) -> Result<Self, BootError> {
+    fn try_boot(tools: &PvxTools, db: &Path, udp: u16) -> Result<Self, BootError> {
         let mut cmd = Command::new(&tools.ioc_bin);
         cmd.arg("-S"); // no interactive shell
         // The same load route as the CA side, from the same owner: the fat
@@ -798,32 +1125,44 @@ impl PvxIoc {
             // and stamps the real port back (`server.cpp:484`), then
             // advertises it in the search reply. A number nobody chose cannot
             // be a number somebody else took.
-            .env("EPICS_PVAS_SERVER_PORT", "0")
-            // --- CA server. softIocPVX links base's rsrv, which binds CA
-            // 5064 by default: left alone it would fight the host's real IOCs
-            // and both sides of this pair would collide on it (measured — the
-            // `cas WARNING` in a two-IOC PVA run is CA's, not PVA's). No CA is
-            // measured in this phase; the ports exist only to keep it off
-            // 5064. ---
-            .env("EPICS_CAS_INTF_ADDR_LIST", "127.0.0.1")
-            .env("EPICS_CAS_BEACON_ADDR_LIST", "127.0.0.1")
-            .env("EPICS_CA_SERVER_PORT", ca.to_string())
-            .env("EPICS_CAS_SERVER_PORT", ca.to_string())
+            // --- CA server: not started at all. softIocPVX links base's
+            // rsrv, which binds CA 5064 by default and would fight the host's
+            // real IOCs and the pair's other side. No CA is measured in this
+            // phase, so the CA server is removed rather than moved: base
+            // skips any `dbServer` named in `EPICS_IOC_IGNORE_SERVERS`
+            // (`db/dbServer.c:32-56`), and rsrv registers itself as `rsrv`
+            // (`rsrv/caservertask.c:1561-1569`).
+            //
+            // Moving it was the earlier fix and it could not be made sound.
+            // A port has to be *named* in the environment, so it has to be
+            // allocated and released before the child binds it, and whoever
+            // takes it in that window kills the IOC outright: rsrv's UDP bind
+            // fails silently (`caservertask.c:131-146` prints nothing on
+            // EADDRINUSE), the interface is dropped, and `rsrv_init` ends at
+            // `cantProceed("CAS: No TCP server started")`. Nor can the number
+            // be delegated to the kernel — `envGetInetPortConfigParam`
+            // (`libcom/src/env/envSubr.c:409-416`) clips a port of 0 back to
+            // the 5064 default. Not registering the server has no window at
+            // all. ---
+            .env("EPICS_IOC_IGNORE_SERVERS", "rsrv")
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()
-            .map_err(|e| BootError(format!("spawn softIocPVX: {e}")))?;
+            .map_err(|e| BootError::new(Side::C, format!("spawn softIocPVX: {e}")))?;
 
-        // Same ready/collision watch as `CIoc`: softIocPVX prints base's
-        // `iocRun: All initialization complete`. Note what this does NOT buy
-        // us — a *PVA* search-port collision prints nothing at all (see
-        // `PvaPair::boot`), so this watch covers the CA side only.
+        // Same ready watch as `CIoc`: softIocPVX prints base's `iocRun: All
+        // initialization complete`. Note what this does NOT buy us — a *PVA*
+        // search-port collision prints nothing at all (see `PvaPair::boot`),
+        // and with rsrv unregistered there is no CA side left to warn either.
+        // What it still catches is a death: `cantProceed` suspends the thread
+        // instead of exiting, so nothing else would ever end the wait.
         let stdout = child.stdout.take().expect("piped");
         let stderr = child.stderr.take().expect("piped");
         let (tx, rx) = mpsc::channel::<BootSignal>();
-        spawn_watcher(stdout, tx.clone());
-        spawn_watcher(stderr, tx);
+        let tail = OutputTail::new();
+        spawn_watcher(stdout, tx.clone(), tail.clone());
+        spawn_watcher(stderr, tx, tail.clone());
 
         let deadline = Instant::now() + BOOT_TIMEOUT;
         let mut ready = false;
@@ -831,15 +1170,31 @@ impl PvxIoc {
             let left = deadline.saturating_duration_since(Instant::now());
             if left.is_zero() {
                 let _ = child.kill();
-                return err(format!(
-                    "softIocPVX did not report ready within {BOOT_TIMEOUT:?} on UDP {udp}"
-                ));
+                return err(
+                    Side::C,
+                    format!(
+                        "softIocPVX did not report ready within {BOOT_TIMEOUT:?} on UDP {udp}; \
+                         it said: {}",
+                        tail.text()
+                    ),
+                );
             }
             match rx.recv_timeout(left) {
                 Ok(BootSignal::PortCollision(line)) => {
                     let _ = child.kill();
                     let _ = child.wait();
-                    return err(format!("PORT_COLLISION on CA {ca}: {line}"));
+                    return err_retryable(Side::C, format!("PORT_COLLISION on UDP {udp}: {line}"));
+                }
+                Ok(BootSignal::Died(said)) => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return err_retryable(
+                        Side::C,
+                        format!(
+                            "softIocPVX declared itself unable to proceed on UDP {udp}; \
+                                 it said: {said}"
+                        ),
+                    );
                 }
                 Ok(BootSignal::Ready) => {
                     ready = true;
@@ -853,11 +1208,20 @@ impl PvxIoc {
         if !ready {
             let status = child.try_wait().ok().flatten();
             let _ = child.kill();
-            return err(format!(
-                "softIocPVX exited during boot (status {status:?}) — db rejected?"
-            ));
+            return err(
+                Side::C,
+                format!(
+                    "softIocPVX exited during boot (status {status:?}) — db rejected? \
+                     it said: {}",
+                    tail.text()
+                ),
+            );
         }
-        Ok(Self { port: udp, child })
+        Ok(Self {
+            port: udp,
+            child,
+            tail,
+        })
     }
 }
 
@@ -867,6 +1231,9 @@ impl Ioc for PvxIoc {
     }
     fn side(&self) -> Side {
         Side::C
+    }
+    fn recent_output(&self) -> String {
+        self.tail.text()
     }
 }
 
@@ -899,78 +1266,253 @@ impl PvaPair {
     ///
     /// There is no output to scan, so exclusivity is established the only way
     /// left: by measurement. `pvxlist` on each side's port must find exactly
-    /// one server ([`crate::pvatool::PvaTools::server_count`]).
+    /// one server ([`crate::pvatool::PvaTools::servers`]).
     pub fn boot(tools: &PvxTools, db: &Path, probe_pv: &str) -> Result<Self, BootError> {
+        retry_pair("PVA", || Self::try_boot(tools, db, probe_pv))
+    }
+
+    fn try_boot(tools: &PvxTools, db: &Path, probe_pv: &str) -> Result<Self, BootError> {
         let c = PvxIoc::boot(tools, db)?;
         let rust = RustIoc::boot_pva(db)?;
         if c.port() == rust.port() {
-            return err(
+            return err_retryable_neither(
                 "pvxs and Rust PVA servers landed on the same UDP search port — \
                  refusing to run, answers would not be attributable",
             );
         }
-        wait_pva_reachable(tools, c.port(), Side::C, probe_pv)?;
-        wait_pva_reachable(tools, rust.port(), Side::Rust, probe_pv)?;
-        verify_sole_server(tools, c.port(), Side::C)?;
-        verify_sole_server(tools, rust.port(), Side::Rust)?;
+        wait_pva_reachable(tools, &c, probe_pv)?;
+        wait_pva_reachable(tools, &rust, probe_pv)?;
+        verify_sole_server(tools, &c)?;
+        verify_sole_server(tools, &rust)?;
         Ok(Self { c, rust })
     }
 }
 
-/// Poll a known channel through the real pvxs client until it reads, with
-/// bounded retries and exponential backoff. The PVA sibling of
-/// [`wait_reachable`].
-fn wait_pva_reachable(
-    tools: &PvxTools,
-    port: u16,
-    side: Side,
-    probe_pv: &str,
-) -> Result<(), BootError> {
-    let t = crate::pvatool::PvaTools::new(tools, port, side);
-    let deadline = Instant::now() + REACHABLE_TIMEOUT;
-    let mut backoff = REACHABLE_BACKOFF_START;
-    loop {
-        let last = match t.pvxget(probe_pv) {
-            Ok(_) => return Ok(()),
-            Err(e) => e.message,
-        };
-        let left = deadline.saturating_duration_since(Instant::now());
-        if left.is_zero() {
-            return err(format!(
-                "{side} PVA server did not become reachable within {REACHABLE_TIMEOUT:?} \
-                 (probe {probe_pv}: {last})"
-            ));
-        }
-        std::thread::sleep(backoff.min(left));
-        backoff = (backoff * 2).min(REACHABLE_BACKOFF_MAX);
-    }
+/// Poll a known channel through the real pvxs client until it reads. The PVA
+/// sibling of [`wait_reachable`], sharing its [`wait_probe`] retry policy.
+///
+/// The probe keeps the harness's `-w`: unlike the CA tools, pvxs names no short
+/// default to fall back on — `pvxget`'s own is 5.0 s (`tools/get.cpp:49`),
+/// longer than what the harness already passes.
+fn wait_pva_reachable(tools: &PvxTools, ioc: &dyn Ioc, probe_pv: &str) -> Result<(), BootError> {
+    let t = crate::pvatool::PvaTools::new(tools, ioc.port(), ioc.side());
+    wait_probe("PVA server", ioc, probe_pv, || {
+        t.pvxget(probe_pv).map(|_| ())
+    })
 }
 
-/// Prove exactly one PVA server answers on `port`. See [`PvaPair::boot`] for
-/// why this is mandatory rather than defensive.
-fn verify_sole_server(tools: &PvxTools, port: u16, side: Side) -> Result<(), BootError> {
+/// Prove exactly one PVA server answers on this IOC's port. See
+/// [`PvaPair::boot`] for why this is mandatory rather than defensive.
+///
+/// Takes the [`Ioc`] rather than a port and a [`Side`] for the reason
+/// [`wait_probe`] does: this is the last step of a pair boot and the one whose
+/// failure ends the whole sweep, so its message is the only thing a reader
+/// gets — and a count without the IOC's own words leaves them a number and no
+/// cause ([`OutputTail`]). Both arms quote it, and the disagreeing arm also
+/// quotes the addresses that answered, which is the only place they exist.
+fn verify_sole_server(tools: &PvxTools, ioc: &dyn Ioc) -> Result<(), BootError> {
+    let (port, side) = (ioc.port(), ioc.side());
     let t = crate::pvatool::PvaTools::new(tools, port, side);
-    match t.server_count() {
-        Ok(1) => Ok(()),
-        Ok(n) => err(format!(
-            "{n} PVA servers answer on the {side} side's UDP port {port} — refusing to \
-             run. A PVA port collision binds silently (SO_REUSEPORT), and both sides \
-             serve the same PV names, so readings here would be misattributed rather \
-             than failed."
-        )),
+    match t.servers() {
+        Ok(s) if s.len() == 1 => Ok(()),
+        Ok(s) => err_retryable(
+            side,
+            format!(
+                "{} PVA servers answer on the {side} side's UDP port {port} — refusing to \
+                 run. A PVA port collision binds silently (SO_REUSEPORT), and both sides \
+                 serve the same PV names, so readings here would be misattributed rather \
+                 than failed. pvxlist named: {}; it said: {}",
+                s.len(),
+                s.join(" | "),
+                ioc.recent_output()
+            ),
+        ),
         // Not "assume one": the side was reachable a moment ago, so a
         // countless port is an unexplained change, and this harness does not
         // score what it could not measure.
-        Err(e) => err(format!(
-            "could not count the PVA servers on the {side} side's UDP port {port}, so \
-             exclusivity is unproven and no reading from it is attributable: {e}"
-        )),
+        Err(e) => err(
+            side,
+            format!(
+                "could not count the PVA servers on the {side} side's UDP port {port}, so \
+                 exclusivity is unproven and no reading from it is attributable: {e}; \
+                 it said: {}",
+                ioc.recent_output()
+            ),
+        ),
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Drive `spawn_watcher` over a canned stream and collect what it decided.
+    fn classify(output: &str) -> Vec<BootSignal> {
+        let (tx, rx) = mpsc::channel::<BootSignal>();
+        spawn_watcher(
+            std::io::Cursor::new(output.to_string().into_bytes()),
+            tx,
+            OutputTail::new(),
+        );
+        rx.iter().collect()
+    }
+
+    /// The formerly-invisible outcome. `rsrv` losing its UDP port is silent
+    /// (`caservertask.c:131-146` prints nothing on EADDRINUSE), so the only
+    /// thing on the wire is base's fatal banner — and `cantProceed` then
+    /// suspends the thread forever rather than exiting, so no stream ever
+    /// closes. Read as `Other`, this cost the full boot timeout and then
+    /// reported a *reachability* failure for a process that had already said
+    /// it was dead.
+    #[test]
+    fn a_cant_proceed_banner_is_a_death_not_noise() {
+        let signals = classify(concat!(
+            "CAS: No TCP server started\n",
+            "CRITICAL ERROR Thread _main_ (0x7f0e4c0010a0) can't proceed, suspending.\n",
+        ));
+        let died = signals
+            .iter()
+            .filter_map(|s| match s {
+                BootSignal::Died(said) => Some(said.clone()),
+                _ => None,
+            })
+            .next()
+            .expect("the fatal banner must be reported as a death");
+        assert!(
+            died.contains("CAS: No TCP server started"),
+            "the death must quote what led to it, got {died:?}"
+        );
+    }
+
+    /// Boundary — base's *recovered* collision. rsrv prints this when it
+    /// moved its TCP port and kept running, which is not a death but still
+    /// means the pair is no longer isolated.
+    #[test]
+    fn a_moved_tcp_port_is_a_collision_not_a_death() {
+        let signals = classify("cas WARNING: Configured TCP port was unavailable.\n");
+        assert!(
+            signals
+                .iter()
+                .any(|s| matches!(s, BootSignal::PortCollision(_))),
+            "the moved-port warning must stay a collision"
+        );
+        assert!(
+            !signals.iter().any(|s| matches!(s, BootSignal::Died(_))),
+            "a server that kept running has not died"
+        );
+    }
+
+    /// Boundary — a healthy boot, so neither of the above may fire.
+    #[test]
+    fn an_ordinary_boot_is_ready_and_nothing_else() {
+        let signals = classify(concat!(
+            "Starting iocInit\n",
+            "iocRun: All initialization complete\n",
+        ));
+        assert!(
+            signals.iter().any(|s| matches!(s, BootSignal::Ready)),
+            "the ready line must be recognised"
+        );
+        assert!(
+            !signals
+                .iter()
+                .any(|s| matches!(s, BootSignal::Died(_) | BootSignal::PortCollision(_))),
+            "a healthy boot is neither a death nor a collision"
+        );
+    }
+
+    /// A retryable failure is the only kind the boot loops may take another
+    /// port for; everything else must surface on the first attempt.
+    #[test]
+    fn only_a_port_failure_is_retryable() {
+        assert!(BootError::retryable(Side::C, "PORT_COLLISION on 5064").retryable);
+        assert!(BootError::retryable_neither("both sides drew one number").retryable);
+        assert!(!BootError::new(Side::C, "db rejected").retryable);
+        assert!(!BootError::neither("no workdir").retryable);
+    }
+
+    /// The reachability flake is inside the retry family — that membership is
+    /// the whole reason a lost SEARCH no longer costs a record type.
+    #[test]
+    fn exhausting_the_reachability_probe_is_retryable() {
+        let ioc = FakeIoc {
+            port: 5075,
+            side: Side::Rust,
+            said: "ORACLE_IOC_READY",
+        };
+        let e = wait_probe("IOC", &ioc, "ORACLE:AI", || Err::<(), _>("not found"))
+            .expect_err("must fail");
+        assert!(e.retryable, "{e:?}");
+    }
+
+    /// A pair that comes up on the second draw is a booted pair, not an ERROR.
+    #[test]
+    fn a_pair_that_needs_a_second_draw_still_boots() {
+        let mut n = 0;
+        let got = retry_pair("CA", || {
+            n += 1;
+            if n < 2 {
+                Err(BootError::retryable(Side::Rust, "unreachable"))
+            } else {
+                Ok(n)
+            }
+        });
+        assert_eq!(got.expect("boots on the retry"), 2);
+    }
+
+    /// Exhaustion names the attempt count and **every** attempt's reason, keeps
+    /// the failing side's attribution, and is itself terminal — a caller above
+    /// must not retry a pair that already spent its whole budget.
+    ///
+    /// Every reason, not the last one: five attempts that failed five
+    /// different ways used to be reported as the fifth, and which of them the
+    /// reader saw was decided by ordering.
+    #[test]
+    fn a_pair_that_never_comes_up_exhausts_and_stops_being_retryable() {
+        let mut n = 0;
+        let e = retry_pair("CA", || {
+            n += 1;
+            Err::<(), _>(BootError::retryable(
+                Side::Rust,
+                format!("draw {n} unreachable"),
+            ))
+        })
+        .expect_err("must fail");
+        assert_eq!(n, BOOT_ATTEMPTS);
+        assert_eq!(e.side, Some(Side::Rust));
+        assert!(!e.retryable, "{e:?}");
+        let each = (1..=BOOT_ATTEMPTS)
+            .map(|i| format!("attempt {i}: draw {i} unreachable"))
+            .collect::<Vec<_>>()
+            .join("; ");
+        assert_eq!(
+            e.message,
+            format!(
+                "CA pair did not come up in {BOOT_ATTEMPTS} attempts, \
+                 each on fresh ports: {each}"
+            )
+        );
+    }
+
+    /// A failure fresh ports cannot fix — a missing binary, a `.db` the IOC
+    /// will not load — is reported on the first attempt, not five times.
+    #[test]
+    fn a_failure_ports_cannot_fix_is_not_retried() {
+        let mut n = 0;
+        let e = retry_pair("PVA", || {
+            n += 1;
+            Err::<(), _>(BootError::new(
+                Side::Rust,
+                "cannot find the `oracle-ioc` binary",
+            ))
+        })
+        .expect_err("must fail");
+        assert_eq!(
+            n, 1,
+            "a non-retryable failure must cost exactly one attempt"
+        );
+        assert_eq!(e.message, "cannot find the `oracle-ioc` binary");
+    }
 
     fn args_of(cmd: &Command) -> Vec<String> {
         cmd.get_args()
@@ -987,8 +1529,7 @@ mod tests {
     /// report that as anything but a diff against the Rust side.
     #[test]
     fn only_an_asyn_db_is_staged_through_a_script() {
-        let dir = std::env::temp_dir().join(format!("oracle_load_route_{}", std::process::id()));
-        std::fs::create_dir_all(&dir).expect("workdir");
+        let dir = crate::runner::workdir(None).expect("workdir");
 
         let plain = dir.join("plain.db");
         std::fs::write(&plain, crate::record_stmt("ai", "ORACLE:AI")).expect("write");
@@ -1050,5 +1591,153 @@ mod tests {
         // Not a hard guarantee from the kernel, but a repeat would mean the
         // allocator is handing out a port it already gave away.
         assert_ne!(a, b);
+    }
+
+    /// A stand-in IOC: `wait_probe` reads a port, a side and the child's own
+    /// last words, and nothing else, so the retry policy is testable without a
+    /// process. `said` is what a real `OutputTail` would have collected.
+    struct FakeIoc {
+        port: u16,
+        side: Side,
+        said: &'static str,
+    }
+
+    impl Ioc for FakeIoc {
+        fn port(&self) -> u16 {
+            self.port
+        }
+        fn side(&self) -> Side {
+            self.side
+        }
+        fn recent_output(&self) -> String {
+            self.said.to_string()
+        }
+    }
+
+    /// The gate is an attempt count, so a probe that needs the LAST attempt
+    /// still succeeds — and it succeeds no matter how long the earlier probes
+    /// took. That is the whole point of replacing the wall clock: under load a
+    /// single killed `cainfo` used to eat the budget and the record type came
+    /// back `errored` for want of one more try.
+    #[test]
+    fn a_probe_that_succeeds_on_the_last_attempt_is_reachable() {
+        let mut n = 0;
+        let ioc = FakeIoc {
+            port: 5064,
+            side: Side::Rust,
+            said: "iocRun: All initialization complete",
+        };
+        let r = wait_probe("IOC", &ioc, "ORACLE:AI", || {
+            n += 1;
+            if n < REACHABLE_ATTEMPTS {
+                Err("not found")
+            } else {
+                Ok(())
+            }
+        });
+        assert!(r.is_ok(), "{r:?}");
+        assert_eq!(n, REACHABLE_ATTEMPTS);
+    }
+
+    /// Exhaustion is a named boot failure carrying the attempt count and the
+    /// last probe error — never a silent per-case timeout.
+    #[test]
+    fn exhausting_the_attempts_names_the_count_and_the_last_error() {
+        let mut n = 0;
+        let ioc = FakeIoc {
+            port: 34567,
+            side: Side::C,
+            said: "iocRun: All initialization complete",
+        };
+        let e = wait_probe("PVA server", &ioc, "ORACLE:AI", || {
+            n += 1;
+            Err::<(), _>(format!("probe {n} refused"))
+        })
+        .expect_err("must fail");
+        assert_eq!(n, REACHABLE_ATTEMPTS);
+        assert_eq!(
+            e.message,
+            format!(
+                "C PVA server did not become reachable after {REACHABLE_ATTEMPTS} attempts \
+                 on port 34567 (probe ORACLE:AI: probe {REACHABLE_ATTEMPTS} refused); \
+                 it said: iocRun: All initialization complete"
+            )
+        );
+        // The side the probe was aimed at rides WITH the failure: the case
+        // builders have no other way to know which IOC did not answer.
+        assert_eq!(e.side, Some(Side::C));
+        assert_eq!(
+            e.tool_errors("boot")
+                .iter()
+                .map(|t| t.side)
+                .collect::<Vec<_>>(),
+            vec![Side::C],
+            "one failed side, one error -- not one error per side"
+        );
+    }
+
+    /// The other boundary of the same message: an IOC that printed nothing at
+    /// all still produces a readable failure. Before `recent_output` existed
+    /// every exhaustion read as a bare budget, and a `softIoc` booting a
+    /// zero-byte `.db` — which prints `iocRun: All initialization complete`
+    /// and serves no records — was indistinguishable from one that never
+    /// started.
+    #[test]
+    fn a_silent_ioc_is_quoted_as_silent_not_omitted() {
+        let ioc = FakeIoc {
+            port: 5075,
+            side: Side::Rust,
+            said: "(the IOC printed nothing)",
+        };
+        let e = wait_probe("IOC", &ioc, "ORACLE:AI", || Err::<(), _>("refused"))
+            .expect_err("must fail");
+        assert!(
+            e.message.ends_with("it said: (the IOC printed nothing)"),
+            "{}",
+            e.message
+        );
+    }
+
+    /// The exclusivity proof quotes the IOC it is about.
+    ///
+    /// This is the arm that used to report a bare count. It is the LAST step
+    /// of a PVA pair boot, so its message is the whole of what a reader gets
+    /// when a sweep comes back 56/56 errored — and it could not reach the one
+    /// witness that names a cause, because it took a port and a [`Side`] and
+    /// never saw the [`Ioc`] that owns the words. Driven here against a port
+    /// nothing serves, so `pvxlist` finds nothing and the `Err` arm runs.
+    #[test]
+    fn an_unprovable_port_names_what_the_ioc_said() {
+        let tools = PvxTools::discover().expect(
+            "the pvxs tree must be built for the PVA oracle to have ground truth; \
+             set PVXS_BIN if it is not at the default path",
+        );
+        let dead = alloc_free_port().expect("a port to aim at");
+        let ioc = FakeIoc {
+            port: dead,
+            side: Side::Rust,
+            said: "ORACLE_IOC_PVA_PORT 1234",
+        };
+        let e = verify_sole_server(&tools, &ioc).expect_err("nothing serves that port");
+        assert_eq!(e.side, Some(Side::Rust));
+        assert!(
+            e.message.ends_with("it said: ORACLE_IOC_PVA_PORT 1234"),
+            "{}",
+            e.message
+        );
+    }
+
+    /// The only failure recorded against both sides is one that belongs to
+    /// neither.
+    #[test]
+    fn a_failure_belonging_to_neither_side_is_the_only_two_entry_one() {
+        let both = BootError::neither("no free port on this host");
+        assert_eq!(
+            both.tool_errors("boot")
+                .iter()
+                .map(|t| t.side)
+                .collect::<Vec<_>>(),
+            vec![Side::C, Side::Rust]
+        );
     }
 }

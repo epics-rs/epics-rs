@@ -96,6 +96,12 @@ pub struct CalcRecord {
     // freezes VAL and UDF and raises no CALC_ALARM — while everything after the
     // calc (LA..LU advance, alarms, monitors, forward link) still runs.
     fetch_gate_failed: bool,
+    // This cycle ran `calcPerform` and it SUCCEEDED — the one condition under
+    // which C writes `prec->udf` (`calcRecord.c:124`, the `else` of the
+    // `calcPerform` test, itself inside the `fetch_values` gate at `:120`).
+    // Consumed by `check_alarms`, which owns the write; a cycle that never sets
+    // it leaves UDF frozen, which is what the gated arms of C do.
+    value_computed: bool,
     // Alarm-range time-constant filter (epics-base calcRecord.c::checkAlarms).
     // AFTC > 0 enables an exponential smoothing of the integer alarmRange
     // (1=Lolo..5=Hihi) so transient excursions don't immediately alarm.
@@ -106,6 +112,10 @@ pub struct CalcRecord {
     // empty `END_EXPRESSION` postfix, which `calcPerform` refuses to run — the
     // record then alarms on every process. See [`calc_compile`].
     rpcl: crate::calc::CompiledExpr,
+    // C `prec->name`, handed over at creation by `set_async_context`. Only the
+    // record knows it, which is why C prints its bad-CALC report from
+    // `init_record`/`special` and not from `postfix()`.
+    name: Option<String>,
 }
 
 impl Default for CalcRecord {
@@ -187,9 +197,11 @@ impl Default for CalcRecord {
             lu: 0.0,
             calc_alarm: false,
             fetch_gate_failed: false,
+            value_computed: false,
             aftc: 0.0,
             afvl: 0.0,
             rpcl: crate::calc::CompiledExpr::empty(crate::calc::ExprKind::Numeric),
+            name: None,
         }
     }
 }
@@ -209,6 +221,27 @@ impl CalcRecord {
         rec
     }
 
+    /// The record's own report of a CALC it could not compile
+    /// (`calcRecord.c:105-110` from `init_record`, `:145-151` from `special`).
+    /// Two errlog records, differing only in the `pmessage` C passes.
+    ///
+    /// This is the counter-example to "a refused `dbpf` is silent": `dbpf`
+    /// prints nothing but its read-back, and the words the user sees come from
+    /// the record. They must carry `prec->name`, which is why C prints them
+    /// here rather than inside `postfix()` — and why `calc_compile` cannot.
+    fn report_bad_calc(&self, pmessage: &str, why: &str) {
+        // C `precord ? precord->name : "Unknown"`, reached here only if a
+        // record compiled before `set_async_context` ran.
+        let name = self.name.as_deref().unwrap_or("Unknown");
+        // `S_db_badField` is `M_dbAccess|15`, positive, so C's `errSymLookup`
+        // fills the slot (`dbAccessDefs.h:184`).
+        crate::server::recgbl::rec_gbl_record_error("Illegal field value", name, pmessage);
+        crate::runtime::log::errlog_printf(&format!(
+            "{name}.CALC: {why} in expression \"{}\"\n",
+            self.calc
+        ));
+    }
+
     /// C `calcRecord.c::monitor`: advance the `LX` previous-value field
     /// only when the input `X` actually changed since the last post.
     fn advance_prev(new: f64, prev: &mut f64) {
@@ -225,7 +258,7 @@ impl CalcRecord {
     ///
     /// `monitor()` runs on EVERY cycle, including one where `fetch_values()`
     /// failed and the calc was skipped (C gates only the `calcPerform` block,
-    /// calcRecord.c:119-126), so both paths through `process()` come through
+    /// calcRecord.c:119-125), so both paths through `process()` come through
     /// here.
     fn advance_prev_inputs(&mut self) {
         Self::advance_prev(self.a, &mut self.la);
@@ -368,7 +401,11 @@ impl Record for CalcRecord {
             // there, and the empty program it leaves in RPCL is what makes the
             // record alarm on every process. Skipping the compile for an empty
             // CALC left the port with no program and no alarm.
-            self.rpcl = calc_compile::postfix(self.record_type(), "CALC", &self.calc).program;
+            let compiled = calc_compile::postfix(self.record_type(), "CALC", &self.calc);
+            if let Some(why) = compiled.error_str() {
+                self.report_bad_calc("calc: init_record: Illegal CALC field", why);
+            }
+            self.rpcl = compiled.program;
             if !self.calc.is_empty() {
                 self.mlst = self.val;
                 self.alst = self.val;
@@ -389,17 +426,23 @@ impl Record for CalcRecord {
             return Ok(());
         }
         let compiled = calc_compile::postfix(self.record_type(), "CALC", &self.calc);
-        let failed = compiled.failed_to_compile();
+        let why = compiled.error_str();
         self.rpcl = compiled.program;
-        if failed {
-            // C `recGblRecordError(S_db_badField, prec, "calc: Illegal CALC field")`
+        if let Some(why) = why {
+            self.report_bad_calc("calc: Illegal CALC field", why);
             return Err(CaError::BadField("calc: Illegal CALC field".into()));
         }
         Ok(())
     }
 
+    /// C hands the record its own name at `dbDefineRecord`; the port hands it
+    /// over here. `special()` needs it to name the PV it is refusing.
+    fn set_async_context(&mut self, name: String, _db: crate::server::database::AsyncDbHandle) {
+        self.name = Some(name);
+    }
+
     fn process(&mut self) -> CaResult<ProcessOutcome> {
-        // C `calcRecord.c::process` (119-126):
+        // C `calcRecord.c::process` (119-125):
         //
         // ```c
         // if (fetch_values(prec) == 0) {
@@ -440,7 +483,12 @@ impl Record for CalcRecord {
         // input that changed.
         self.apply_stores(&inputs.vars);
         match outcome {
-            Ok(v) => self.val = v,
+            Ok(v) => {
+                self.val = v;
+                // C `:124` `else prec->udf = isnan(prec->val)` — this arm, and
+                // only this arm, defines the record.
+                self.value_computed = true;
+            }
             Err(_) => self.calc_alarm = true,
         }
         self.advance_prev_inputs();
@@ -1128,6 +1176,17 @@ impl Record for CalcRecord {
         self.fetch_gate_failed = failed;
     }
 
+    /// C `calcRecord.c::process` writes `prec->udf` only inside the
+    /// `fetch_values` gate AND only on the `calcPerform` success arm (`:120-124`),
+    /// so a cycle whose input link failed, or whose CALC errored, leaves UDF at
+    /// its previous value and keeps CALC_ALARM's INVALID standing alone. The
+    /// framework's per-cycle blanket re-derived it from VAL on those cycles and
+    /// reported a never-computed record as defined. The write lives on the
+    /// success arm now — see [`Self::check_alarms`].
+    fn clears_udf(&self) -> bool {
+        false
+    }
+
     /// C `calcRecord.c:121-123` — a failed `calcPerform` is
     /// `recGblSetSevr(prec, CALC_ALARM, INVALID_ALARM)`, raised in `process()`
     /// BEFORE `checkAlarms(prec)` runs its UDF guard (`:300-303`). So when a
@@ -1138,6 +1197,14 @@ impl Record for CalcRecord {
     /// failed runs no `calcPerform` (`:120`) and therefore raises nothing — the
     /// stale flag used to re-raise CALC_ALARM on every gated cycle.
     fn check_alarms(&mut self, common: &mut crate::server::record::CommonFields) {
+        // C `calcRecord.c:124` — `prec->udf = isnan(prec->val)`, written by the
+        // successful `calcPerform` and by nothing else. Applied here because
+        // `check_alarms` is the record's only hook holding `CommonFields`, and
+        // it runs before `recGblCheckUDF`, matching C's `process` → `checkAlarms`
+        // order.
+        if std::mem::take(&mut self.value_computed) {
+            common.udf = self.value_is_undefined() as u8;
+        }
         if std::mem::take(&mut self.calc_alarm) {
             // C `calcRecord.c:122` uses PLAIN `recGblSetSevr(prec, CALC_ALARM,
             // INVALID_ALARM)` — a NULL message (empty namsg). PVA then serves

@@ -1,6 +1,6 @@
 //! `LALM` is armed only when `recGblSetSevr` actually RAISED the severity.
 //!
-//! C `aiRecord.c:404-409`:
+//! C `aiRecord.c:403-410`:
 //!
 //! ```c
 //! if (asev) {
@@ -40,6 +40,7 @@ use epics_base_rs::server::database::PvDatabase;
 use epics_base_rs::server::ioc_builder::IocBuilder;
 use epics_base_rs::server::recgbl::{self, alarm_status};
 use epics_base_rs::server::record::AlarmSeverity;
+use epics_base_rs::server::records::acalcout::AcalcoutRecord;
 use epics_base_rs::types::EpicsValue;
 
 /// `SRC` alarms at MAJOR on its own HIHI; `T` inherits that MAJOR through
@@ -65,6 +66,7 @@ record(acalcout, "C:TIE") { field(HIHI, "10") field(HHSV, "MAJOR") field(HYST, "
 
 async fn build() -> std::sync::Arc<PvDatabase> {
     IocBuilder::new()
+        .register_record_type("acalcout", || Box::new(AcalcoutRecord::default()))
         .db_string(DB, &std::collections::HashMap::new())
         .unwrap()
         .build()
@@ -170,8 +172,15 @@ async fn no_alarm_condition_tracks_the_latch_to_val() {
 }
 
 /// The three records that own their ladder instead of using the shared one
-/// (`selRecord.c:265-300`, `dfanoutRecord.c:242-277`,
-/// `aCalcoutRecord.c:865-890`) obey the same rule. Raising an equal severity
+/// (`selRecord.c:261-302`, `dfanoutRecord.c:238-279`,
+/// `aCalcoutRecord.c:853-890`) obey the same rule — each span runs from the
+/// record's own operand load, through the four gated arms, to the ungated
+/// no-alarm `lalm = val` store, because it is the load and the store that make
+/// the gate observable. The loads are not the same shape, which is why each
+/// span is taken at its own boundary: sel and dfanout hoist `val`/`hyst`/`lalm`
+/// and read each level's severity and limit inside its own arm, while aCalcout
+/// hoists all nine operands first (`:853-863`) and its arms read none.
+/// Raising an equal severity
 /// through the public owner is exactly what an MS input link does one step
 /// earlier, and needs no link plumbing to express.
 #[epics_macros_rs::epics_test]

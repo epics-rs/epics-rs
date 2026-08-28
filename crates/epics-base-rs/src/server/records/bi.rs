@@ -25,7 +25,7 @@ pub struct BiRecord {
     /// held the new state for ~`AFTC` seconds. Added to `biRecord` by
     /// EPICS PR #817 (`c9817fa59`); 0 = disabled. See `BiRecord::afvl`.
     pub aftc: f64,
-    /// Alarm filter accumulator (`biRecord.c:270` `prec->afvl`), `DBF_DOUBLE`
+    /// Alarm filter accumulator (`biRecord.c:270` at `678092d03`, `prec->afvl`), `DBF_DOUBLE`
     /// `SPC_NOMOD` — read-only to clients. 0 = initial sample / filter
     /// inactive; the sign encodes the filter's rounding hysteresis.
     pub afvl: f64,
@@ -44,11 +44,6 @@ pub struct BiRecord {
     pub sdly: f64,
     // Internal: skip RVAL->VAL when soft INP set VAL directly
     skip_convert: bool,
-    // VAL change gate. C
-    // biRecord.c:250-255 monitor() raises DBE_VALUE|DBE_LOG for VAL only
-    // when `mlst != val`. Captured during process() because the framework
-    // reads monitor_value_changed() after process() has committed mlst.
-    value_changed: bool,
 }
 
 impl Default for BiRecord {
@@ -74,7 +69,6 @@ impl Default for BiRecord {
             sims: 0,
             sdly: -1.0,
             skip_convert: false,
-            value_changed: false,
         }
     }
 }
@@ -89,6 +83,18 @@ impl BiRecord {
 }
 
 impl Record for BiRecord {
+    /// UDF belongs to the dset here, not to `process()`. C
+    /// `biRecord.c:136-141` assigns `prec->udf = FALSE` at `:139`, INSIDE
+    /// `if (status == 0)`, and folds `2` into `0` only at `:141`, so a device
+    /// support that wrote VAL never reaches the assignment.
+    ///
+    /// That is not a hole: the C dsets that return 2 write `prec->udf`
+    /// themselves first — `devBiSoft.c:54-59` and `devBiDbState.c:67-70` —
+    /// which the port states as `DeviceUdf::Defined`.
+    fn rederives_udf_on_computed_read(&self) -> bool {
+        false
+    }
+
     fn record_type(&self) -> &'static str {
         "bi"
     }
@@ -115,13 +121,6 @@ impl Record for BiRecord {
         self.skip_convert = false; // reset for next cycle
 
         self.oraw = self.rval;
-        // Capture the VAL-change
-        // gate now (C biRecord.c:250-255 `mlst != val`); the framework reads
-        // monitor_value_changed() after process().
-        self.value_changed = self.mlst != self.val;
-        if self.value_changed {
-            self.mlst = self.val;
-        }
         Ok(ProcessOutcome::complete())
     }
 
@@ -163,8 +162,11 @@ impl Record for BiRecord {
         true
     }
 
-    /// C `biRecord.c::checkAlarms` (biRecord.c:232-280, as of EPICS PR #817
-    /// `c9817fa59` which added the AFTC/AFVL alarm filter to `bi`) — UDF
+    /// C `biRecord.c::checkAlarms` (biRecord.c:232-280 at `678092d03`; the
+    /// AFTC/AFVL alarm filter reached `bi` five lines earlier in EPICS PR
+    /// #817 `c9817fa59`, so it is `678092d03` that every `biRecord.c` number
+    /// in this method's body resolves at, not `c9817fa59` and not `R7.0.10`,
+    /// where checkAlarms is :220-243 and has no AFVL) — UDF
     /// alarm, STATE alarm (ZSV/OSV) through the AFTC alarm-range low-pass
     /// filter, and COS alarm (COSV). C `checkAlarms:237-240` raises
     /// `UDF_ALARM/udfs` and returns early when `udf` is set; we mirror that
@@ -217,7 +219,7 @@ impl Record for BiRecord {
         }
     }
 
-    /// C rset `get_enum_strs`/`put_enum_str` (biRecord.c:275-298) — ZNAM/ONAM.
+    /// C rset `get_enum_strs`/`put_enum_str` (biRecord.c:195-217) — ZNAM/ONAM.
     fn enum_state_strings(&self) -> Option<Vec<PvString>> {
         Some(crate::server::record::binary_enum_states(
             &self.znam, &self.onam,
@@ -289,7 +291,7 @@ impl Record for BiRecord {
                     self.val = v as u16;
                     Ok(())
                 }
-                // C rset `put_enum_str` (biRecord.c:290-298), reached from
+                // C rset `put_enum_str` (biRecord.c:208-217), reached from
                 // `dbConvert.c::putStringEnum`. The framework's put paths
                 // already resolve a DBR_STRING against `enum_state_strings`
                 // before they reach here; a direct caller takes the same
@@ -456,12 +458,15 @@ impl Record for BiRecord {
         }
     }
 
-    /// VAL posts DBE_VALUE|DBE_LOG
-    /// only when it changed (C biRecord.c:250-255 `mlst != val`), not every
-    /// process cycle. The comparison is captured in process(); see
-    /// `value_changed`.
-    fn monitor_value_changed(&self) -> Option<bool> {
-        Some(self.value_changed)
+    /// C `biRecord.c:251-256` `monitor()`: `if (prec->mlst != prec->val) { events |=
+    /// DBE_VALUE | DBE_LOG; prec->mlst = prec->val; }` — compared and
+    /// committed HERE, at C's position, never captured during `process()`.
+    fn monitor_value_changed(&mut self) -> Option<bool> {
+        let changed = self.mlst != self.val;
+        if changed {
+            self.mlst = self.val;
+        }
+        Some(changed)
     }
 
     fn uses_monitor_deadband(&self) -> bool {

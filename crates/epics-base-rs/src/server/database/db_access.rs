@@ -376,7 +376,7 @@ impl DbSubscription {
     /// A consumer that falls behind sees what a C monitor sees: its earlier
     /// distinct queued updates, then a tail entry carrying the latest value,
     /// because once the queue ran short of room further posts replaced that
-    /// entry in place instead of appending (`dbEvent.c:812-820`).
+    /// entry in place instead of appending (`dbEvent.c:812-827`).
     async fn next_event(&mut self) -> Option<MonitorEvent> {
         loop {
             let event = self.reader.recv().await?;
@@ -389,15 +389,15 @@ impl DbSubscription {
 
     /// Non-blocking [`Self::next_event`] — the same `ignore_origin` filter,
     /// no suspension. Delegates to [`EventReader::try_recv`]
-    /// (`event_queue.rs:570`), which this subscription's queue already
+    /// (`event_queue.rs:807`), which this subscription's queue already
     /// provides; nothing new is queued or gated here.
     ///
     /// Exists so a consumer that adapts this stream (PVA's monitor sources)
     /// can be polled from a blocking drain loop without a reactor — the RTEMS
-    /// backend, `doc/rtems-runtime-portability-design.md` §9 phase 6. A
-    /// skipped `ignore_origin` event does not end the poll: the loop keeps
-    /// taking until it finds a deliverable event or the queue reports empty,
-    /// so a self-origin post cannot be misread as "nothing available".
+    /// backend. A skipped `ignore_origin` event does not end the poll: the
+    /// loop keeps taking until it finds a deliverable event or the queue
+    /// reports empty, so a self-origin post cannot be misread as "nothing
+    /// available".
     fn try_next_event(&mut self) -> Result<MonitorEvent, TryRecvError> {
         loop {
             let event = self.reader.try_recv()?;
@@ -498,7 +498,7 @@ impl Drop for DbSubscription {
     /// contention on the record lock, and over time an O(N_dropped_subs)
     /// tax on every record process cycle.
     ///
-    /// CA TCP server-side cleanup at `server/tcp.rs:1649` already
+    /// CA TCP server-side cleanup at `server/tcp.rs:2214-2224` already
     /// calls `remove_subscriber` on disconnect; this Drop closes the
     /// gap for the in-process API.
     fn drop(&mut self) {
@@ -510,9 +510,15 @@ impl Drop for DbSubscription {
         // dropped on any thread — including a blocking CA connection thread
         // that has no runtime — and dropping the cleanup there would leak the
         // subscriber into the record for the life of the IOC.
-        crate::runtime::task::spawn_background(async move {
-            record.write().remove_subscriber(sid);
-        });
+        // Middle band: unsubscribing is CA/PVA server teardown, which C runs
+        // on the caller's thread through `db_cancel_event` — not record work
+        // deferred to a callback queue, so PRIO does not select it.
+        crate::runtime::task::spawn_background(
+            crate::runtime::task::CallbackPriority::Medium,
+            async move {
+                record.write().remove_subscriber(sid);
+            },
+        );
     }
 }
 

@@ -60,6 +60,29 @@ async fn poll_short(db: &PvDatabase, pv: &str, want: i16, label: &str) {
     );
 }
 
+/// Wait for a step's TARGET to hold the value the step put there.
+///
+/// `BUSY == 0` is not that fact and does not imply it. A no-wait step returns
+/// its write as a [`ProcessAction::WriteDbLink`] in the outcome's action list
+/// (`sseq.rs:772-780`) while `finish` clears `busy` inside the same `process()`
+/// call (`sseq.rs:937-940`), so `BUSY` reads 0 the instant `process()` returns
+/// and the framework executes the queued write only afterwards. Polling `BUSY`
+/// and then asserting on the target reads across that window.
+async fn poll_double(db: &PvDatabase, pv: &str, want: f64, label: &str) {
+    for _ in 0..400 {
+        if let Ok(EpicsValue::Double(v)) = db.get_pv(pv)
+            && (v - want).abs() < 1e-10
+        {
+            return;
+        }
+        epics_base_rs::runtime::task::sleep(Duration::from_millis(5)).await;
+    }
+    panic!(
+        "{label}: {pv} did not reach Double({want}) (last {:?})",
+        db.get_pv(pv)
+    );
+}
+
 /// Step 1 is a `WAITn` step into a CA link that resolves to nothing (no link
 /// set is registered, so the target has no DBF class — C's disconnected
 /// `CA_LINK`). C's `default:` arm makes no put and raises no `waiting`, so no
@@ -98,14 +121,20 @@ async fn r17_3_a_wait_step_with_an_unresolvable_lnk_never_raises_wtg() {
 
     kick(&db, "SS_NR").await;
 
-    // The sequence finishes: step 2 lands and BUSY clears.
+    // The sequence finishes: step 2 lands and BUSY clears. Two facts, so two
+    // waits — the write is the one the assertion below needs.
     poll_short(&db, "SS_NR.BUSY", 0, "the sequence must complete").await;
+    poll_double(&db, "SS_NR_TGT2.VAL", 22.0, "step 2's write must land").await;
     assert_eq!(
         db.get_pv("SS_NR_TGT2.VAL").unwrap(),
         EpicsValue::Double(22.0),
         "step 2 must still run — step 1 made no put, so it blocks nothing"
     );
 
+    // Settle before the negative: an erroneous WTG1 post rides the same tail
+    // the write does (`processing.rs:3474-3477` runs the link writes, THEN
+    // `notify_from_snapshot`), so "no event yet" is not "no event".
+    epics_base_rs::runtime::task::sleep(Duration::from_millis(40)).await;
     assert!(
         wtg_rx.try_recv().is_err(),
         "C's `default:` arm makes no put and never sets `waiting`: a WAIT step \
@@ -141,6 +170,7 @@ async fn r17_3_a_wait_step_with_a_resolvable_local_lnk_still_puts() {
 
     kick(&db, "SS_NR2").await;
     poll_short(&db, "SS_NR2.BUSY", 0, "the sequence must complete").await;
+    poll_double(&db, "SS_NR2_TGT.VAL", 33.0, "the step's write must land").await;
 
     assert_eq!(
         db.get_pv("SS_NR2_TGT.VAL").unwrap(),

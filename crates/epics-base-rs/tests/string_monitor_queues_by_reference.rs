@@ -10,13 +10,13 @@
 //!     pevent->useValque = TRUE;
 //! }
 //! ```
-//! (`dbEvent.c:492-500`). `union native_value` (`db_field_log.h:41-56`) lists
+//! (`dbEvent.c:493-500`). `union native_value` (`db_field_log.h:41-56`) lists
 //! its `char dbf_string[MAX_STRING_SIZE]` member behind
 //! `#ifdef DB_EVENT_LOG_STRINGS` — a macro epics-base names only in that
 //! header's own comment and `#ifdef` and defines nowhere — so the union is its
 //! `epicsFloat64` member, 8 bytes. A `DBF_STRING` field is 40. `40 <= 8` is
 //! FALSE, `useValque` is FALSE, and `db_queue_event_log`'s early-drop
-//! (`dbEvent.c:786-799`) then keeps ONE entry for that monitor however many
+//! (`dbEvent.c:794-800`) then keeps ONE entry for that monitor however many
 //! posts arrive.
 //!
 //! The port had `NATIVE_VALUE_BYTES = 40` and compared it against the CONTENT

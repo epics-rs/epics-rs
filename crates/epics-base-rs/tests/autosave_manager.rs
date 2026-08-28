@@ -60,7 +60,11 @@ async fn test_periodic_save_set() {
         .await;
 
     let mgr = Arc::new(mgr);
-    let handle = mgr.clone().start(db.clone());
+    let handle = mgr.clone().start(
+        &epics_base_rs::runtime::task::Reactor::current()
+            .expect("the test driver enters an executor"),
+        db.clone(),
+    );
 
     // Wait for at least one save cycle
     epics_base_rs::runtime::task::sleep(Duration::from_millis(150)).await;
@@ -252,7 +256,11 @@ async fn test_concurrent_manual_periodic_serialized() {
         .await;
 
     let mgr = Arc::new(mgr);
-    let handle = mgr.clone().start(db.clone());
+    let handle = mgr.clone().start(
+        &epics_base_rs::runtime::task::Reactor::current()
+            .expect("the test driver enters an executor"),
+        db.clone(),
+    );
 
     // Manual saves while periodic is running
     for _ in 0..5 {
@@ -291,7 +299,11 @@ async fn test_shutdown_cleanup() {
         .await;
 
     let mgr = Arc::new(mgr);
-    let handle = mgr.clone().start(db.clone());
+    let handle = mgr.clone().start(
+        &epics_base_rs::runtime::task::Reactor::current()
+            .expect("the test driver enters an executor"),
+        db.clone(),
+    );
 
     epics_base_rs::runtime::task::sleep(Duration::from_millis(50)).await;
     mgr.shutdown();

@@ -25,6 +25,7 @@
 //! `.VAL` and `.HIHI` are both listed in `calcRecord.c`'s switch, so both
 //! serve the record's unset `HOPR`/`LOPR` of 0/0.
 
+use epics_base_rs::server::database::LinkBacking;
 use epics_base_rs::server::record::{AlarmSeverity, RecordInstance};
 use epics_base_rs::server::records::acalcout::AcalcoutRecord;
 use epics_base_rs::server::records::asub_record::ASubRecord;
@@ -39,7 +40,7 @@ use epics_base_rs::server::snapshot::Snapshot;
 use epics_base_rs::types::EpicsValue;
 
 fn snap(inst: &RecordInstance, field: &str) -> Snapshot {
-    inst.snapshot_for_field(field)
+    inst.snapshot_for_field_with(field, LinkBacking::none())
         .unwrap_or_else(|| panic!("{field} has no snapshot"))
 }
 
@@ -48,20 +49,20 @@ fn calc() -> RecordInstance {
 }
 
 /// The `default:` arm, keyed on the field's own STATIC dbd type. `recGbl.c`
-/// reads `pdbFldDes->field_type` (`:121`, `:149`, `:167`) — the declared type,
+/// reads `pdbFldDes->field_type` (`:123`, `:151`, `:169`) — the declared type,
 /// not `dbAccess.c:345-348`'s runtime one.
 #[test]
 fn an_unlisted_field_serves_its_own_type_range_not_the_records_limits() {
     let inst = calc();
 
-    // DBF_SHORT -> getMaxRangeValues' SHRT case (recGbl.c:390-393).
+    // DBF_SHORT -> getMaxRangeValues' SHRT case (recGbl.c:384-387).
     assert_eq!(
         snap(&inst, "PHAS").control_limits(),
         Some((-32768.0, 32767.0)),
         "PHAS is DBF_SHORT: C serves the SHRT range, measured on softIocPVX"
     );
 
-    // DBF_DOUBLE -> recGbl.c:410-413.
+    // DBF_DOUBLE -> recGbl.c:413-416.
     assert_eq!(
         snap(&inst, "A").control_limits(),
         Some((-1e300, 1e300)),
@@ -94,7 +95,7 @@ fn a_listed_val_class_field_keeps_the_records_own_limits() {
 /// (`recGbl.c:155-162`). The port served the record's HIHI/HIGH/LOW/LOLO.
 ///
 /// The bands must be SET for this to measure anything: `alarm_limits()` is
-/// severity-gated (`x ? limit : epicsNAN`, `calcRecord.c:255-258`), so an
+/// severity-gated (`x ? limit : epicsNAN`, `calcRecord.c:264-267`), so an
 /// unconfigured record's cache already holds four NaN and an unlisted field
 /// would appear to route correctly while still reading the cache.
 #[test]
@@ -140,7 +141,7 @@ fn an_unlisted_field_serves_nan_alarm_limits_not_the_records_bands() {
 /// marking layer to suppress it (`codec.rs` `get_limits` reads these structs
 /// ungated).
 ///
-/// `biRecord.c:61-80` NULLs every numeric slot.
+/// `biRecord.c:57-76` NULLs every numeric slot.
 #[test]
 fn a_record_with_no_control_slot_mints_no_control_limits() {
     let inst = RecordInstance::new("T:BI".to_string(), BiRecord::new(0));
@@ -190,8 +191,8 @@ fn a_record_the_legacy_cache_never_covered_still_routes_its_type_range() {
 }
 
 /// The two rset arms do NOT share one field list, and `.HIHI` is where they
-/// provably disagree: `calcRecord.c:271-283` lists it in `get_control_double`
-/// (so it takes the record's HOPR/LOPR) while `calcRecord.c:258` lists only
+/// provably disagree: `calcRecord.c:240-250` lists it in `get_control_double`
+/// (so it takes the record's HOPR/LOPR) while `calcRecord.c:263` lists only
 /// VAL in `get_alarm_double` (so it takes `recGblGetAlarmDouble`'s four NaN).
 ///
 /// One shared VAL-class predicate cannot answer both: it either denies `.HIHI`
@@ -206,14 +207,14 @@ fn the_alarm_arm_lists_val_alone_where_the_control_arm_lists_the_bands() {
     assert_eq!(
         snap(&inst, "HIHI").control_limits(),
         Some((0.0, 0.0)),
-        "calcRecord.c:271-283 lists HIHI: control keeps the record's HOPR/LOPR"
+        "calcRecord.c:240-250 lists HIHI: control keeps the record's HOPR/LOPR"
     );
     let (hihi, high, low, lolo) = snap(&inst, "HIHI")
         .alarm_limits()
         .expect("calc supplies get_alarm_double, so the leaves are served");
     assert!(
         hihi.is_nan() && high.is_nan() && low.is_nan() && lolo.is_nan(),
-        "calcRecord.c:258 lists VAL ALONE, so HIHI takes recGblGetAlarmDouble's \
+        "calcRecord.c:263 lists VAL ALONE, so HIHI takes recGblGetAlarmDouble's \
          four NaN — not VAL's own alarm limits; got {hihi}/{high}/{low}/{lolo}"
     );
 
@@ -350,7 +351,7 @@ fn sels_args_are_explicit_limits_not_link_backed_like_calcs() {
 /// `0..10` (`seqRecord.c:322-338`) while the SAME record's control serves
 /// `0..seqDLYlimit` = 100000 (`:342-352`, `:81`) — reading one slot off the
 /// other would be wrong by 4 orders of magnitude. `calcout`'s ODLY calls
-/// recGbl and then overwrites the lower with 0 (`calcoutRecord.c:471-474`).
+/// recGbl and then overwrites the lower with 0 (`calcoutRecord.c:490-493`).
 #[test]
 fn the_graphic_literal_arms_are_not_the_control_ones() {
     let seq = RecordInstance::new("T:SEQ".to_string(), SeqRecord::default());
@@ -369,7 +370,7 @@ fn the_graphic_literal_arms_are_not_the_control_ones() {
     assert_eq!(
         snap(&co, "ODLY").display_limits(),
         Some((0.0, 1e300)),
-        "calcoutRecord.c:471-474 takes the recGbl DBF_DOUBLE upper and forces \
+        "calcoutRecord.c:490-493 takes the recGbl DBF_DOUBLE upper and forces \
          the lower to 0"
     );
 }

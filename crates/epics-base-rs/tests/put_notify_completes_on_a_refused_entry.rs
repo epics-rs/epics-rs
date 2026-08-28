@@ -17,7 +17,7 @@
 //! fired, and a CA `WRITE_NOTIFY` driving that chain got no reply at all.
 //!
 //! C decides this with one flag and one finalizer. `callNotifyCompletion`
-//! starts FALSE (`dbAccess.c:495`) and is raised on the exits where the record
+//! starts FALSE (`dbAccess.c:494`) and is raised on the exits where the record
 //! will not run its cycle — disabled (`:577`) and no RSET (`:599`) — while the
 //! already-active branch (`:552-556`) deliberately leaves it FALSE, because a
 //! record whose own cycle is running owns its completion:

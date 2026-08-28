@@ -4,7 +4,7 @@
 //! `scanAdd`, which decides membership:
 //!
 //! ```c
-//! /* dbScan.c:241-251 */
+//! /* dbScan.c:237-247 */
 //! scan = precord->scan;
 //! if (scan == menuScanPassive) return;
 //! if (scan < 0 || scan >= nPeriodic + SCAN_1ST_PERIODIC) {
@@ -50,7 +50,7 @@ async fn db_with_scanned_ai() -> PvDatabase {
     db.put_record_field_from_ca("REC", "SCAN", EpicsValue::Enum(6))
         .await
         .unwrap();
-    assert_eq!(db.records_for_scan(ScanType::Sec1).await, vec!["REC"]);
+    assert_eq!(db.records_for_scan(ScanType::SEC1).await, vec!["REC"]);
     db
 }
 
@@ -67,13 +67,13 @@ async fn scanned_anywhere(db: &PvDatabase, name: &str) -> bool {
     for scan in [
         ScanType::Event,
         ScanType::IoIntr,
-        ScanType::Sec10,
-        ScanType::Sec5,
-        ScanType::Sec2,
-        ScanType::Sec1,
-        ScanType::Sec05,
-        ScanType::Sec02,
-        ScanType::Sec01,
+        ScanType::SEC10,
+        ScanType::SEC5,
+        ScanType::SEC2,
+        ScanType::SEC1,
+        ScanType::SEC05,
+        ScanType::SEC02,
+        ScanType::SEC01,
     ] {
         if db.records_for_scan(scan).await.iter().any(|n| n == name) {
             return true;
@@ -91,7 +91,7 @@ async fn the_last_menu_choice_scans_and_the_first_illegal_index_does_not() {
         .await
         .unwrap();
     assert_eq!(scan_index(&db).await, 9);
-    assert_eq!(db.records_for_scan(ScanType::Sec01).await, vec!["REC"]);
+    assert_eq!(db.records_for_scan(ScanType::SEC01).await, vec!["REC"]);
 
     db.put_record_field_from_ca("REC", "SCAN", EpicsValue::Enum(10))
         .await
@@ -140,7 +140,7 @@ async fn an_illegal_index_is_left_behind_when_a_legal_one_is_written() {
         .await
         .unwrap();
     assert_eq!(scan_index(&db).await, 3);
-    assert_eq!(db.records_for_scan(ScanType::Sec10).await, vec!["REC"]);
+    assert_eq!(db.records_for_scan(ScanType::SEC10).await, vec!["REC"]);
 }
 
 /// SSCN is the same menu, so it carries an illegal index too — and 10 is NOT

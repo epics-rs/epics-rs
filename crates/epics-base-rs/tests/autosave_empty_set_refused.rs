@@ -79,7 +79,11 @@ async fn a_request_file_declaring_no_pvs_never_reaches_a_save_cycle() {
     // Run the periodic task for several intervals first: the data loss
     // is what this pins, so it is what has to be asserted before the
     // reason it cannot happen.
-    let handle = mgr.clone().start(db.clone());
+    let handle = mgr.clone().start(
+        &epics_base_rs::runtime::task::Reactor::current()
+            .expect("the test driver enters an executor"),
+        db.clone(),
+    );
     epics_base_rs::runtime::task::sleep(Duration::from_millis(120)).await;
     mgr.shutdown();
     let _ = handle.await;

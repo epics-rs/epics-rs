@@ -11,7 +11,8 @@ pub const SCALC_STRING_MAX: usize = SCALC_STRING_SIZE - 1;
 ///
 /// Every string on C's stack is `stackElement.local_string`, a
 /// `char[SCALC_STRING_SIZE]` (`sCalcPostfixPvt.h:22-25`), and every operator
-/// that writes one bounds the write to fit:
+/// that writes one bounds the write to fit — the line numbers in the block
+/// below are `sCalcPerform.c`, not the header this paragraph opened with:
 ///
 /// ```c
 /// strncat(ps->s, ps1->s, SCALC_STRING_SIZE-strlen(ps->s)-1);   /* ADD, :975 */

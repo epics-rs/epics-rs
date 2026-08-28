@@ -58,11 +58,6 @@ pub struct BusyRecord {
     pub siml: String,
     pub siol: String,
     pub sims: i16,
-    // VAL change gate. C
-    // busyRecord.c:365-369 monitor() raises DBE_VALUE|DBE_LOG for VAL only
-    // when `mlst != val`. Captured in the monitor() owner during process()
-    // because the framework reads monitor_value_changed() afterwards.
-    value_changed: bool,
     /// Set by `set_device_did_compute(true)` when a device readback has
     /// already produced both RVAL and VAL (`apply_raw_readback`). One-shot:
     /// `process()` then skips the forward `convert_val_to_rval()` that would
@@ -98,7 +93,6 @@ impl Default for BusyRecord {
             siml: String::new(),
             siol: String::new(),
             sims: 0,
-            value_changed: false,
             skip_convert: false,
         }
     }
@@ -120,14 +114,6 @@ impl BusyRecord {
 
     /// Update monitoring fields.
     fn monitor(&mut self) {
-        // Capture the VAL-change
-        // gate (C busyRecord.c:365-369 `mlst != val`) here, the single owner
-        // of the mlst update; the framework reads monitor_value_changed()
-        // after process() runs this.
-        self.value_changed = self.mlst != self.val;
-        if self.value_changed {
-            self.mlst = self.val;
-        }
         self.oraw = self.rval;
         self.orbv = self.rbv;
     }
@@ -143,7 +129,7 @@ impl Record for BusyRecord {
     /// `DBF_DOUBLE` field, so the only one past `dbAccess.c:388-389`'s
     /// float/double gate — takes 2, everything else `recGblGetPrec`'s
     /// memset zero. busy's rset NULLs `get_units` and `get_control_double`
-    /// (`:69-71`), which is the whole difference from the `bo`
+    /// (`:54`, `:60`), which is the whole difference from the `bo`
     /// [`FieldMetadataOverride`] this mirrors: no `"s"`, no `0 .. 100000`.
     fn field_metadata_override(&self, field: &str) -> Option<FieldMetadataOverride> {
         field
@@ -170,7 +156,7 @@ impl Record for BusyRecord {
         )]
     }
 
-    /// C `busyRecord.c:175-179`, the last statement of `init_record`: VAL is
+    /// C `busyRecord.c:176-179`, the last statement of `init_record`: VAL is
     /// converted to RVAL through MASK, with the `mask == 0` arm passing VAL
     /// through as `(epicsUInt32)prec->val` rather than zeroing RVAL. It runs
     /// after the constant DOL load two dozen lines above it, so a
@@ -180,14 +166,14 @@ impl Record for BusyRecord {
         self.convert_val_to_rval();
     }
 
-    /// C `busyRecord.c:140-181` assigns neither `mlst` nor `lalm`, unlike
+    /// C `busyRecord.c:127-181` assigns neither `mlst` nor `lalm`, unlike
     /// `boRecord.c:172-173` which seeds both from VAL — so busy's first
-    /// `monitor()` (`:365`, `mlst != prec->val`) must find them at 0 even when
-    /// a constant DOL has already driven VAL to 1, and post the change C
-    /// posts. busy serves both fields to clients, so the framework default
-    /// would try to seed them; that attempt is inert today only because busy's
-    /// `put_field` binds no MLST/LALM arm, and this override is what keeps it
-    /// inert if one is ever added.
+    /// `monitor()` (`busyRecord.c:365`, `mlst != prec->val`) must find them at
+    /// 0 even when a constant DOL has already driven VAL to 1, and post the
+    /// change C posts. busy serves both fields to clients, so the framework
+    /// default would try to seed them; that attempt is inert today only because
+    /// busy's `put_field` binds no MLST/LALM arm, and this override is what
+    /// keeps it inert if one is ever added.
     fn seed_deadband_tracking(&mut self) {}
 
     /// C `busyRecord.c:196-208`: the scalar `dbGetLink(&prec->dol, ..., &prec->val, 0, 0)`
@@ -216,7 +202,7 @@ impl Record for BusyRecord {
         true
     }
 
-    /// W10-E5. `busyRecord.c:397-400` — a failed SIML read returns from
+    /// W10-E5. `busyRecord.c:399-401` — a failed SIML read returns from
     /// `writeValue` BEFORE `write_busy` and before the SIOL `dbPutLink`:
     ///
     /// ```c
@@ -235,19 +221,29 @@ impl Record for BusyRecord {
     /// C `boRecord.c::process` IVOA=set_to_IVOV: `val = ivov` then
     /// `rval = (epicsUInt32)val` (busy shares boRecord's process).
     /// OVAL is the *saved previous* VAL and is NOT overwritten by the
-    /// IVOA policy — matches the `Record::apply_invalid_output_value`
-    /// trait contract (`bo`/`busy`/`mbbo`/`mbboDirect`: RVAL=IVOV,
-    /// VAL=IVOV).
+    /// C `busyRecord.c:235-243` (module `busy` at `R1-7-4-6-g2dfe92d`) is
+    /// `boRecord.c:230-238` transcribed: `prec->val = prec->ivov;` then the
+    /// record's OWN `/* convert val to rval */` block, so RVAL is IVOV run
+    /// through the MASK rule, never IVOV itself.
+    ///
+    /// The hand-rolled `RVAL = IVOV` this replaces made the arm a complete
+    /// no-op: `get_field("IVOV")` returns the native `UShort` (`:389`), which
+    /// fell to the `other => other.clone()` default and hit `put_field("RVAL",
+    /// UShort)`'s `TypeMismatch` (RVAL is DBF_ULONG), so the `?` aborted
+    /// before VAL was written and an INVALID `busy` at IVOA=Set_output_to_IVOV
+    /// drove its stale value instead of IVOV. The framework's IVOA owner
+    /// discarded that error until `c00e980e` gave it a `debug_assert`.
     fn apply_invalid_output_value(&mut self, ivov: EpicsValue) -> CaResult<()> {
-        // RVAL is DBF_ULONG (boRecord.dbd.pod:252) — carry IVOV as the unsigned
-        // type the field now advertises.
-        let rval = match &ivov {
-            EpicsValue::Enum(e) => EpicsValue::ULong(*e as u32),
-            EpicsValue::Short(s) => EpicsValue::ULong(*s as u32),
-            other => other.clone(),
+        // IVOV is DBF_USHORT (`busyRecord.dbd:154`); VAL is the binary enum.
+        let v: u16 = match &ivov {
+            EpicsValue::UShort(e) => *e,
+            EpicsValue::Enum(e) => *e,
+            EpicsValue::Short(s) => *s as u16,
+            other => return Err(CaError::TypeMismatch(format!("busy IVOV: {other:?}"))),
         };
-        self.put_field("RVAL", rval)?;
-        self.put_field("VAL", ivov)
+        self.put_field("VAL", EpicsValue::Enum(v))?;
+        self.convert_val_to_rval();
+        Ok(())
     }
 
     fn process(&mut self) -> CaResult<ProcessOutcome> {
@@ -386,7 +382,7 @@ impl Record for BusyRecord {
     // asynBusy hold, but this record's `process()` is synchronous (never returns
     // `AsyncPendingNotify`), so the phantom hold only wedged the put-notify:
     // once VAL was driven to 1 the callback never completed, and every following
-    // `ca_put_callback` was refused with `PutCallbackInProgress`, so the
+    // `ca_put_callback` was refused, so the
     // out-of-range VAL puts C posts (2, 3 → "Illegal_Value") never processed.
     fn get_field(&self, name: &str) -> Option<EpicsValue> {
         match name {
@@ -628,7 +624,7 @@ impl Record for BusyRecord {
         ))
     }
 
-    /// C `get_enum_str` (busyRecord.c:287-306): VAL 0 -> ZNAM, 1 -> ONAM, and any
+    /// C `get_enum_str` (busyRecord.c:286-306): VAL 0 -> ZNAM, 1 -> ONAM, and any
     /// other index -> `"Illegal_Value"`. Slot 1 is indexed even when ONAM is
     /// empty, so it renders empty — the `no_str` trim in `enum_state_strings`
     /// is the LABEL list's, not this read's.
@@ -638,12 +634,15 @@ impl Record for BusyRecord {
         ))
     }
 
-    /// VAL posts DBE_VALUE|DBE_LOG
-    /// only when it changed (C busyRecord.c:365-369 `mlst != val`), not every
-    /// process cycle. The comparison is captured in the monitor() owner; see
-    /// `value_changed`.
-    fn monitor_value_changed(&self) -> Option<bool> {
-        Some(self.value_changed)
+    /// C `busyRecord.c:365-369` `monitor()`: `if (prec->mlst != prec->val) { events |=
+    /// DBE_VALUE | DBE_LOG; prec->mlst = prec->val; }` — compared and
+    /// committed HERE, at C's position, never captured during `process()`.
+    fn monitor_value_changed(&mut self) -> Option<bool> {
+        let changed = self.mlst != self.val;
+        if changed {
+            self.mlst = self.val;
+        }
+        Some(changed)
     }
 
     fn uses_monitor_deadband(&self) -> bool {
@@ -1061,17 +1060,24 @@ mod tests {
 
     #[test]
     fn test_monitor_mlst() {
+        // `mlst` is committed by `monitor_value_changed`, which is C's
+        // `monitor()` — so a cycle here is `process()` then that hook.
+        let cycle = |rec: &mut BusyRecord| {
+            rec.process().unwrap();
+            rec.monitor_value_changed()
+        };
+
         let mut rec = BusyRecord::new();
         rec.val = 1;
-        rec.process().unwrap();
+        assert_eq!(cycle(&mut rec), Some(true));
         assert_eq!(rec.mlst, 1);
 
         // Same val — mlst stays
-        rec.process().unwrap();
+        assert_eq!(cycle(&mut rec), Some(false));
         assert_eq!(rec.mlst, 1);
 
         rec.val = 0;
-        rec.process().unwrap();
+        assert_eq!(cycle(&mut rec), Some(true));
         assert_eq!(rec.mlst, 0);
     }
 
@@ -1259,29 +1265,37 @@ mod tests {
 
     #[test]
     fn test_state_transition_cycle() {
+        // `mlst` is C `monitor()`'s tracker, committed by
+        // `monitor_value_changed`; `oval` is the record's own, committed by
+        // `process()`. A cycle runs both.
+        let cycle = |rec: &mut BusyRecord| {
+            rec.process().unwrap();
+            rec.monitor_value_changed();
+        };
+
         let mut rec = BusyRecord::new();
 
         // Start idle
         assert_eq!(rec.val, 0);
-        rec.process().unwrap();
+        cycle(&mut rec);
         assert_eq!(rec.oval, 0);
         assert_eq!(rec.mlst, 0);
 
         // Go busy
         rec.val = 1;
-        rec.process().unwrap();
+        cycle(&mut rec);
         assert_eq!(rec.oval, 1);
         assert_eq!(rec.mlst, 1);
         assert_eq!(rec.rval, 1);
 
         // Stay busy (re-process)
-        rec.process().unwrap();
+        cycle(&mut rec);
         assert_eq!(rec.oval, 1);
         assert!(!rec.should_fire_forward_link());
 
         // Go done
         rec.val = 0;
-        rec.process().unwrap();
+        cycle(&mut rec);
         assert_eq!(rec.oval, 0);
         assert_eq!(rec.mlst, 0);
         assert_eq!(rec.rval, 0);

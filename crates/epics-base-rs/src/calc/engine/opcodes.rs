@@ -192,17 +192,18 @@ pub enum ArrayOp {
     ArrayRandom,
     ArraySubrange,
     ArraySubrangeInPlace,
-    /// `FITPOLY(y)` (`aCalcPerform.c:1005-1012`) — fit `y = c + b*i + a*i*i` over
+    /// `FITPOLY(y)` (`aCalcPerform.c:999-1015`) — fit `y = c + b*i + a*i*i` over
     /// the operand's window and REPLACE it with the fitted curve.
     FitPoly,
-    /// `FITMPOLY(y, mask)` (`:1013-1036`) — the same, with the fit restricted to
+    /// `FITMPOLY(y, mask)` (`:1017-1036`) — the same, with the fit restricted to
     /// the points the mask admits and the window taken from the MASK operand.
     FitMPoly,
-    /// `FITQ(y [,c][,b][,a])` (`:1193-1231`) — VARARG (`aCalcPostfix.c:140`), and
+    /// `FITQ(y [,c][,b][,a])` (`:1193-1235`) — VARARG (`aCalcPostfix.c:140`), and
     /// the payload is the argument count, because the trailing arguments NAME the
     /// scalar arguments the coefficients are stored into.
     FitQ(u8),
-    /// `FITMQ(y, mask [,c][,b][,a])` (`:1234-1285`) — likewise (`aCalcPostfix.c:141`).
+    /// `FITMQ(y, mask [,c][,b][,a])` (`aCalcPerform.c:1237-1284`) — likewise
+    /// (`aCalcPostfix.c:141`).
     FitMQ(u8),
     /// `ANEG` (`aCalcPerform.c:772,1041`) — zero the NEGATIVE elements, keep the
     /// rest. (The name says which sign it removes, not which it keeps.)

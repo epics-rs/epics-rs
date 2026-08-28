@@ -30,7 +30,9 @@
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::error::{CaError, CaResult};
-use crate::server::device_support::{DeviceReadOutcome, DeviceSupport};
+use crate::server::device_support::{
+    DeviceInitOutcome, DeviceReadOutcome, DeviceSupport, DeviceUdf,
+};
 use crate::server::recgbl::get_time_stamp;
 use crate::server::record::{ProcessContext, Record};
 use crate::types::EpicsValue;
@@ -59,16 +61,29 @@ const STRINGIN_VAL_BYTES: usize = 40;
 /// in. A prefix segment that does not fit it formats to `<invalid format>`.
 const STRFTIME_PREFIX_BUF: usize = 256;
 
-/// `(secPastEpoch, nsec)` of a resolved time stamp counted from the EPICS
-/// epoch (1990-01-01), exactly as C `epicsTimeStamp`. A stamp at or before
-/// the EPICS epoch (including the `UNIX_EPOCH` default of an unresolved
-/// stamp) saturates `secPastEpoch` to 0, so the `secPastEpoch == 0 &&
-/// nsec == 0` test matches C `epicsTimeToStrftime`'s "uninitialized time
-/// stamp" check (`epicsTime.cpp:176`).
-fn epics_time_parts(ts: SystemTime) -> (u64, u32) {
+/// `(secPastEpoch, nsec)` of a resolved time stamp, counted from the EPICS
+/// epoch (1990-01-01) exactly as C `epicsTimeStamp`.
+///
+/// Wrapping, not saturating. C reaches `secPastEpoch` through
+/// `epicsTimeFromTime_t` (`$EPICS_BASE/modules/libcom/src/osi/epicsTime.cpp:305-310`
+/// at `R7.0.10`), which assigns an `epicsInt64` difference into an
+/// `epicsUInt32`, so a clock before 1990 wraps to a 2106 stamp and formats as
+/// a date. Saturating pinned it to `0` — C's *uninitialized* value — so a
+/// running IOC whose RTC never started answered `<undefined>` where C answers
+/// a date, and the `ai` path read `0.0` where C reads ~4.29e9.
+fn epics_time_parts(ts: SystemTime) -> (u32, u32) {
+    // C's uninitialized `epicsTimeStamp` is the literal `{0, 0}`; this port
+    // carries it as `UNIX_EPOCH`, and the `secPastEpoch == 0 && nsec == 0`
+    // test below is C's own check for it (`epicsTime.cpp:176`). A sentinel,
+    // not a boundary of the conversion.
+    if ts == UNIX_EPOCH {
+        return (0, 0);
+    }
+    // `unwrap_or_default` collapses a pre-1970 stamp to the Unix epoch; that
+    // is this port's own limit and predates the wrap below.
     let dur = ts.duration_since(UNIX_EPOCH).unwrap_or_default();
     (
-        dur.as_secs().saturating_sub(EPICS_EPOCH_OFFSET_SECS),
+        dur.as_secs().wrapping_sub(EPICS_EPOCH_OFFSET_SECS) as u32,
         dur.subsec_nanos(),
     )
 }
@@ -171,7 +186,12 @@ fn push_truncated(out: &mut String, s: &str, buf_len_left: usize) -> usize {
 /// reproduces that bounded accounting so the formatted string is ≤39 bytes
 /// and `read_stringin`'s `len >= 40` overflow branch stays unreachable — C
 /// never raises an alarm from it, and neither does this port.
-fn epics_time_to_strftime(format: &str, ts: SystemTime) -> String {
+///
+/// `dbpr`'s `TIME` row is the second C caller (`dbTest.c:1228-1231`), with the
+/// same 40-byte buffer, which is why this is `pub(crate)` rather than private
+/// to the soft timestamp device: two renderers of one C routine would be two
+/// answers to "what does an unset stamp look like".
+pub(crate) fn epics_time_to_strftime(format: &str, ts: SystemTime) -> String {
     let (sec_past_epoch, nsec) = epics_time_parts(ts);
     let mut out = String::new();
     // C `bufLength` = `sizeof prec->val` = STRINGIN_VAL_BYTES; `bufLenLeft`
@@ -308,14 +328,14 @@ impl DeviceSupport for SoftTimestampDeviceSupport {
         self.time = ctx.time;
     }
 
-    fn init(&mut self, record: &mut dyn Record) -> CaResult<()> {
+    fn init(&mut self, record: &mut dyn Record) -> CaResult<DeviceInitOutcome> {
         let rt = record.record_type();
         if !matches!(rt, "ai" | "stringin") {
             return Err(CaError::InvalidValue(format!(
                 "DTYP='Soft Timestamp': unsupported record type '{rt}' (use ai or stringin)"
             )));
         }
-        Ok(())
+        Ok(DeviceInitOutcome::Live)
     }
 
     fn read(&mut self, record: &mut dyn Record) -> CaResult<DeviceReadOutcome> {
@@ -326,19 +346,20 @@ impl DeviceSupport for SoftTimestampDeviceSupport {
         match record.record_type() {
             "ai" => {
                 // C `devTimestamp.c:38-41` `read_ai`: `prec->val =
-                // time.secPastEpoch + nsec * 1e-9`, return 2 (VAL written
-                // directly — skip the ai conversion).
+                // time.secPastEpoch + nsec * 1e-9; prec->udf = FALSE;
+                // return 2` — VAL written directly (skip the ai conversion)
+                // and the record declared defined.
                 let (sec, nsec) = epics_time_parts(ts);
                 let val = sec as f64 + nsec as f64 * 1e-9;
                 record.put_field("VAL", EpicsValue::Double(val))?;
-                Ok(DeviceReadOutcome::computed())
+                Ok(DeviceReadOutcome::computed(DeviceUdf::Defined))
             }
             "stringin" => {
                 // C `devTimestamp.c:57-66` `read_stringin`: format the
-                // resolved stamp with the INP instio string, then return 0
-                // (stringin has no RVAL→VAL conversion to skip, so unlike
-                // `read_ai`'s `return 2` this is a plain success — `computed()`
-                // is behaviorally inert here, just consistent with `read_ai`).
+                // resolved stamp with the INP instio string, then
+                // `prec->udf = FALSE; return 0` — a plain success, not
+                // `read_ai`'s 2, because stringin has no RVAL→VAL conversion
+                // to skip. `converted(Defined)` is that pair exactly.
                 // `epics_time_to_strftime` bounds the result to ≤39 bytes (C's
                 // `bufLenLeft` accounting), so C's `if (len >= sizeof
                 // prec->val)` overflow check is dead code — it never sets
@@ -346,7 +367,7 @@ impl DeviceSupport for SoftTimestampDeviceSupport {
                 // format silently truncates with no alarm.
                 let s = epics_time_to_strftime(&self.format, ts);
                 record.put_field("VAL", EpicsValue::String(s.into()))?;
-                Ok(DeviceReadOutcome::computed())
+                Ok(DeviceReadOutcome::converted(DeviceUdf::Defined))
             }
             // init() gated the record type to ai / stringin.
             other => Err(CaError::InvalidValue(format!(
@@ -383,7 +404,33 @@ mod tests {
             time,
             tsel: String::new(),
             dtyp: String::new(),
+            callback_priority: crate::runtime::task::CallbackPriority::Low,
         }
+    }
+
+    /// C reaches `secPastEpoch` through `epicsTimeFromTime_t`
+    /// (`epicsTime.cpp:305-310`), which wraps into `epicsUInt32`. Saturating
+    /// pinned a pre-1990 clock to `0`, which is C's *uninitialized* value, so
+    /// `epics_time_to_strftime` answered "<undefined>" for a running clock.
+    #[test]
+    fn epics_time_parts_wraps_both_ends_and_keeps_the_unset_sentinel() {
+        assert_eq!(epics_time_parts(SystemTime::UNIX_EPOCH), (0, 0));
+        let at = SystemTime::UNIX_EPOCH + Duration::from_secs(EPICS_EPOCH_OFFSET_SECS);
+        assert_eq!(epics_time_parts(at).0, 0);
+        let before = SystemTime::UNIX_EPOCH + Duration::from_secs(EPICS_EPOCH_OFFSET_SECS - 1);
+        assert_eq!(epics_time_parts(before).0, u32::MAX);
+        let last =
+            SystemTime::UNIX_EPOCH + Duration::from_secs(EPICS_EPOCH_OFFSET_SECS + u32::MAX as u64);
+        assert_eq!(epics_time_parts(last).0, u32::MAX);
+        let past = SystemTime::UNIX_EPOCH
+            + Duration::from_secs(EPICS_EPOCH_OFFSET_SECS + u32::MAX as u64 + 1);
+        assert_eq!(epics_time_parts(past).0, 0);
+    }
+
+    #[test]
+    fn a_pre_1990_clock_formats_as_a_date_not_the_undefined_sentinel() {
+        let before = SystemTime::UNIX_EPOCH + Duration::from_secs(EPICS_EPOCH_OFFSET_SECS - 1);
+        assert_ne!(epics_time_to_strftime("%Y-%m-%d", before), "<undefined>");
     }
 
     /// Unix 1_000_000_000 (2001-09-09 UTC) + 0.25 s.
@@ -528,7 +575,15 @@ mod tests {
         let mut rec = StringinRecord::new("");
         dev.set_process_context(&ctx_device_time(fixed_device_time()));
         let outcome = dev.read(&mut rec).expect("no alarm on a too-long format");
-        assert!(outcome.did_compute, "stringin read returns computed (C: 2)");
+        assert!(
+            !outcome.did_compute(),
+            "C `read_stringin` returns 0, not `read_ai`'s 2 (devTimestamp.c:66)"
+        );
+        assert_eq!(
+            outcome.udf(),
+            DeviceUdf::Defined,
+            "…and clears `prec->udf` itself first (devTimestamp.c:65)"
+        );
         match rec.get_field("VAL") {
             Some(EpicsValue::String(s)) => {
                 let s = s.as_str_lossy();

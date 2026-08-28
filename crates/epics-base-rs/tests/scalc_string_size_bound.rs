@@ -2,7 +2,7 @@
 //! (`sCalcPostfixPvt.h:22-25`), so no value the engine produces can exceed 39
 //! bytes, and none can contain a NUL: `strncat(..., SCALC_STRING_SIZE-strlen-1)`
 //! (`sCalcPerform.c:975`), `strNcpy(..., SCALC_STRING_SIZE-1)` (:1566, :1801,
-//! :1811, :1861) and the LITERAL_STRING copy loop (:1497) all bound the write,
+//! :1810, :1861) and the LITERAL_STRING copy loop (:1496) all bound the write,
 //! and `strNcpy` stops at the source's NUL as well.
 //!
 //! The bound is tested at its boundary — 39 in, 39 out; 40 in, 39 out — not by

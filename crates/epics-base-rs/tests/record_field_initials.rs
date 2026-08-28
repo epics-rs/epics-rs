@@ -18,10 +18,11 @@
 //! `INIT_COMPUTED` with the C line that writes it — and, for the record types the
 //! base softIoc has, the measurement off the compiled IOC.
 
-use epics_base_rs::server::db_loader::create_record;
 use epics_base_rs::server::record::RecordInstance;
 use epics_base_rs::server::record::dbd_generated::{RECORD_TYPES, record_fields};
 use epics_base_rs::types::EpicsValue;
+
+mod module_records;
 
 /// `(record, field)` pairs whose construction value is written by the record's
 /// `init_record`, not by the `.dbd`'s `initial()`. Anything NOT listed here must
@@ -33,8 +34,8 @@ const INIT_COMPUTED: &[(&str, &str)] = &[
     //   caget -t P:CO.INAV -> Constant
     //
     // C `init_record` classifies EVERY input/array/output link and stores
-    // `<rec>INAV_CON`(3) for a CONSTANT link (`aCalcoutRecord.c:208-242`,
-    // `sCalcoutRecord.c`, `transformRecord.c:430-471`), OVERWRITING the `.dbd`
+    // `<rec>INAV_CON`(3) for a CONSTANT link (`aCalcoutRecord.c:209-243`,
+    // `sCalcoutRecord.c`, `transformRecord.c:444-473`), OVERWRITING the `.dbd`
     // `initial("1")`. A default record's links are all constant, so every one of
     // these reads `Constant`(3) — not the declared 1. The acalcout/scalcout/
     // transform records serve the fields read-only, hold the init-derived value
@@ -146,7 +147,7 @@ const INIT_COMPUTED: &[(&str, &str)] = &[
     ("swait", "DOLV"),
     ("swait", "OUTV"),
     // sseq: `init_record` classifies each step's DOL/LNK link
-    // (`sseqRecord.c:203-235`), so DTn/LTn hold a DBF type code, not a zero.
+    // (`sseqRecord.c:203-239`), so DTn/LTn hold a DBF type code, not a zero.
     ("sseq", "DT1"),
     ("sseq", "DT2"),
     ("sseq", "DT3"),
@@ -207,7 +208,13 @@ fn is_init_computed(record_type: &str, field: &str) -> bool {
 }
 
 fn instance(record_type: &str) -> Option<RecordInstance> {
-    let rec = create_record(record_type).ok()?;
+    // Through the module-record fixture, so the seven types outside
+    // `stdRecords.dbd` are constructed rather than skipped. A type that still
+    // fails to construct is a broken factory, not an unmet prerequisite, so it
+    // panics: the `.ok()?` this replaces dropped seven record types from the
+    // sweep and still reported green.
+    let rec = module_records::create_any(record_type)
+        .unwrap_or_else(|e| panic!("{record_type}: create_record failed: {e}"));
     Some(RecordInstance::new_boxed(format!("T:{record_type}"), rec))
 }
 

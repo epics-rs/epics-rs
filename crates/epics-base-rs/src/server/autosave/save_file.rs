@@ -36,6 +36,17 @@ pub struct MalformedLine {
 pub struct SaveFileContents {
     pub entries: Vec<SaveEntry>,
     pub malformed: Vec<MalformedLine>,
+    /// How many PVs the file itself declares it could not save, from its
+    /// `!` line; 0 when it has none.
+    ///
+    /// C writes `! <n> channel(s) not connected - or not all gets were
+    /// successful` under the header whenever a set saved with unreachable
+    /// members (`save_restore.c` `write_it`), and its restore reads that
+    /// line back — `dbrestore.c:994-1010` logs it, sets the set's status
+    /// to WARN, and with `save_restoreIncompleteSetsOk` cleared refuses
+    /// the restore outright. A file that omits the line tells a C IOC the
+    /// save set was complete, so this is not decoration.
+    pub not_connected: usize,
 }
 
 /// Write a .sav file atomically (tmp -> fsync -> rename).
@@ -80,6 +91,18 @@ pub async fn write_save_file_with_mode(
         now.format("%Y-%m-%d %H:%M:%S")
     ));
 
+    // C's incomplete-set declaration, in C's exact wording because a C
+    // IOC parses it: `dbrestore.c` takes the count from the text after
+    // the `!` and refuses the whole restore when the site has cleared
+    // `save_restoreIncompleteSetsOk`. Written in both modes — this is
+    // the file format, not the value encoding that `CompatMode` selects.
+    let not_connected = entries.iter().filter(|e| !e.connected).count();
+    if not_connected > 0 {
+        content.push_str(&format!(
+            "! {not_connected} channel(s) not connected - or not all gets were successful\n"
+        ));
+    }
+
     for entry in entries {
         if entry.connected {
             content.push_str(&entry.pv_name);
@@ -106,7 +129,7 @@ pub async fn write_save_file_with_mode(
     // hop through the blocking pool instead of four. It also has to leave
     // `tokio::fs` behind — that is a blocking call dressed as an async one and
     // it panics on any thread that is not a tokio runtime thread, which is
-    // every callback thread under `rtems-exec-model`.
+    // every callback thread under `exec_backend`.
     let tmp_path = path.with_extension("tmp");
     let final_path = path.to_path_buf();
     let parent = path.parent().map(|p| p.to_path_buf());
@@ -138,6 +161,34 @@ pub async fn write_save_file_with_mode(
 /// Read a .sav file and validate `<END>` marker.
 /// Returns None for corrupt files (no END marker).
 pub async fn read_save_file(path: &Path) -> AutosaveResult<Option<SaveFileContents>> {
+    let read = read_partial_save_file(path).await?;
+    Ok(read.complete.then_some(read.contents))
+}
+
+/// A `.sav` body and whether the file that carried it was complete.
+#[derive(Debug, Clone, Default)]
+pub struct PartialSaveFile {
+    pub contents: SaveFileContents,
+    /// `false` when the file does not end in `<END>`, i.e. it was
+    /// truncated or is still being written.
+    pub complete: bool,
+}
+
+/// Parse a `.sav` body whether or not the file is complete, and say
+/// which it was.
+///
+/// [`read_save_file`] is this with the incomplete case turned into
+/// `None`, which is what restore needs: a truncated file must not be
+/// pushed into the database as if it were the whole save set. `asVerify`
+/// deliberately reads what restore refuses — C's `do_asVerify_fp`
+/// (`verify.c` at `R6-0-20-g186f467`) warns that it cannot find the
+/// `<END>` marker and then compares every PV line in the file anyway,
+/// because which PVs a truncated file does hold is exactly what the
+/// operator looking at it needs to know.
+///
+/// One parse and one marker test behind both, so the two views cannot
+/// disagree about what a file contains.
+pub async fn read_partial_save_file(path: &Path) -> AutosaveResult<PartialSaveFile> {
     let content = crate::runtime::fs::read_to_string(path)
         .await
         .map_err(|e| {
@@ -151,11 +202,10 @@ pub async fn read_save_file(path: &Path) -> AutosaveResult<Option<SaveFileConten
             }
         })?;
 
-    if !has_end_marker(&content) {
-        return Ok(None);
-    }
-
-    Ok(Some(parse_save_content(&content)))
+    Ok(PartialSaveFile {
+        complete: has_end_marker(&content),
+        contents: parse_save_content(&content),
+    })
 }
 
 /// Quick check if a .sav file has a valid `<END>` marker.
@@ -199,11 +249,35 @@ fn parse_save_content(content: &str) -> SaveFileContents {
             });
         };
 
+        // The file's own count of what it could not save. C emits it as
+        // `! <n> channel(s) not connected - ...` and reads the number
+        // back with `atol` on the text after the `!`, so a leading `!`
+        // never names a PV — parsing it as one produced an entry called
+        // `!` that the restore then looked for in the database.
+        if let Some(rest) = framing.strip_prefix('!') {
+            let digits: String = rest
+                .trim_start()
+                .chars()
+                .take_while(char::is_ascii_digit)
+                .collect();
+            out.not_connected = digits.parse().unwrap_or(0);
+            continue;
+        }
+
         // Header/comment lines
         if framing.starts_with('#') {
-            // Check for disconnected PV: #PVNAME\t(not connected)
+            // A PV that had no value to save. `(not connected)` is what
+            // this writer emits; `Search Issued` / `Search Failed` are
+            // what C's `write_it` leaves in `pchannel->value` for a
+            // channel that never connected, and C's own `asVerify` counts
+            // the first of them. Matching both is what lets a C-written
+            // file's unsaved PVs stay visible here instead of passing as
+            // ordinary comments.
             let inner = &framing[1..];
-            if inner.contains("(not connected)") {
+            if inner.contains("(not connected)")
+                || inner.contains("Search Issued")
+                || inner.contains("Search Failed")
+            {
                 let pv_name = inner.split(['\t', ' ']).next().unwrap_or("").trim();
                 if !pv_name.is_empty() {
                     out.entries.push(SaveEntry {

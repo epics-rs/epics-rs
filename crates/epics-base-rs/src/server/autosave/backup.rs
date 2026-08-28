@@ -4,7 +4,8 @@ use std::time::{Duration, SystemTime};
 use chrono::Local;
 
 use super::error::AutosaveResult;
-use super::save_file::validate_save_file;
+use super::format::CompatMode;
+use super::save_file::{SaveEntry, validate_save_file, write_save_file_with_mode};
 
 /// Backup policy configuration.
 #[derive(Debug, Clone)]
@@ -73,13 +74,13 @@ pub(super) async fn publish_copy(src: &Path, dst: &Path) -> AutosaveResult<()> {
     })
     .await;
     // Announced here rather than by the callers: this is the only place a
-    // backup artefact is written, and one caller (the first-cycle `.savB`
-    // seed) treats the failure as non-fatal and keeps no other trace of it,
-    // so a backup silently stopped being written while the set went on
-    // reporting successful saves.
+    // backup artefact is written, and one caller (the `_SBAD_` copy of a
+    // corrupt `.savB`) treats the failure as non-fatal and keeps no other
+    // trace of it, so a backup silently stopped being written while the
+    // set went on reporting successful saves.
     if let Err(ref e) = published {
         crate::runtime::log::errlog_printf(&format!(
-            "autosave: backup {} -> {} not written: {e}",
+            "autosave: backup {} -> {} not written: {e}\n",
             src.display(),
             dst.display()
         ));
@@ -142,35 +143,127 @@ impl BackupState {
     }
 }
 
-/// Rotate backups before writing a new .sav file.
-/// Order: validate existing .sav -> .sav → .savB copy -> seq rotation -> dated backup
+/// Whether the `.savB` backup still holds the *outgoing* generation and
+/// so has to be refreshed once the new `.sav` is on disk.
+///
+/// [`rotate_backups`] produces it before the `.sav` write and
+/// [`publish_savb`] consumes it after, which is how C splits the same
+/// rule across `write_save_file` (`save_restore.c` at `R6-0-20-g186f467`):
+/// the pre-write half guarantees a usable `.savB`, the post-write half
+/// advances it, and the post-write half is skipped exactly when the
+/// pre-write half already wrote this generation (C's `BS_NEW`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SavbState {
+    /// `.savB` backups are switched off for this set.
+    Disabled,
+    /// A valid `.savB` was already on disk, so it still holds the
+    /// generation about to be replaced.
+    Ok,
+    /// It was missing or corrupt and has just been written from the values
+    /// about to be saved, so it already holds the new generation.
+    Rewritten,
+}
+
+/// Make sure a valid `.savB` exists *before* the `.sav` is overwritten.
+///
+/// C pivots this decision on the `.savB` itself, not on the `.sav`
+/// ("Ensure that backup is ok before we overwrite .sav file."): a `.savB`
+/// that is missing or does not end in `<END>` is rewritten from the values
+/// about to be saved, and a corrupt one is kept aside as
+/// `<name>.savB_SBAD_<yymmdd-HHMMSS>` first. Pivoting on the `.sav`
+/// instead — which is what this module used to do — skips all of it
+/// whenever the `.sav` is the file that is missing or corrupt, so the one
+/// cycle that most needs a backup is the one that leaves a single usable
+/// file behind.
+///
+/// A `.savB` that cannot be written aborts the cycle with the `.sav`
+/// untouched, so a set never trades its last good generation for a
+/// backup it failed to make.
+async fn ensure_savb(
+    sav_path: &Path,
+    config: &BackupConfig,
+    entries: &[SaveEntry],
+    compat: CompatMode,
+) -> AutosaveResult<SavbState> {
+    if !config.enable_savb {
+        return Ok(SavbState::Disabled);
+    }
+    let savb = sav_path.with_extension("savB");
+    let state = validate_save_file(&savb).await;
+    if matches!(state, Ok(true)) {
+        return Ok(SavbState::Ok);
+    }
+
+    crate::runtime::log::errlog_printf(&format!(
+        "autosave: backup file ({}) bad or not found. Writing a new one.\n",
+        savb.display()
+    ));
+    // `validate_save_file` reports an unopenable file as an error and a
+    // file without the `<END>` marker as `Ok(false)`, which is C's
+    // `BS_NONE` / `BS_BAD` split. Only the second one has content worth
+    // keeping for diagnosis, and losing that copy is not worth failing
+    // the cycle over — `publish_copy` already reports it.
+    if matches!(state, Ok(false)) {
+        let mut aside = savb.as_os_str().to_os_string();
+        aside.push(format!("_SBAD_{}", Local::now().format("%y%m%d-%H%M%S")));
+        let _ = publish_copy(&savb, Path::new(&aside)).await;
+    }
+    if let Err(e) = write_save_file_with_mode(&savb, entries, compat).await {
+        // Announced here for the same reason `publish_copy` announces its
+        // own failures: this is the one backup write that does not go
+        // through it, and C prints the equivalent line before returning.
+        crate::runtime::log::errlog_printf(&format!(
+            "autosave: backup {} not written: {e}\n",
+            savb.display()
+        ));
+        return Err(e);
+    }
+    Ok(SavbState::Rewritten)
+}
+
+/// Rotate backups before writing a new `.sav` file.
+///
+/// Order: guarantee `.savB` -> sequence rotation -> dated backup.
 ///
 /// A failed rotation is reported rather than swallowed, and the caller
 /// must not overwrite the `.sav` it could not preserve: the whole point
 /// of the rotation is that the generation about to be replaced survives
 /// somewhere else first.
+///
+/// The returned [`SavbState`] must be handed to [`publish_savb`] after the
+/// `.sav` write; together they hold the invariant that a completed save
+/// cycle always ends with a valid `.savB` alongside the new `.sav`.
 pub async fn rotate_backups(
     sav_path: &Path,
     config: &BackupConfig,
     state: &mut BackupState,
-) -> AutosaveResult<()> {
-    // Only rotate if the current .sav exists and is valid
-    if !sav_path.exists() {
+    entries: &[SaveEntry],
+    compat: CompatMode,
+) -> AutosaveResult<SavbState> {
+    let savb_state = ensure_savb(sav_path, config, entries, compat).await?;
+
+    // The sequenced and dated copies are made from the generation about
+    // to be replaced, so unlike `.savB` they have nothing to copy when
+    // that generation is missing or corrupt.
+    if sav_path.exists() && validate_save_file(sav_path).await.unwrap_or(false) {
+        state.rotate_seq(sav_path, config).await?;
+        state.write_dated(sav_path, config).await?;
+    }
+
+    Ok(savb_state)
+}
+
+/// Advance `.savB` to the generation just written, which is the other
+/// half of the rule [`rotate_backups`] starts.
+///
+/// Skipped precisely when the pre-write half already wrote this
+/// generation into `.savB` (C's `backup_state != BS_NEW` guard), so the
+/// file is never written twice in one cycle.
+pub async fn publish_savb(sav_path: &Path, savb_state: SavbState) -> AutosaveResult<()> {
+    if savb_state != SavbState::Ok {
         return Ok(());
     }
-
-    let is_valid = validate_save_file(sav_path).await.unwrap_or(false);
-    if !is_valid {
-        return Ok(());
-    }
-
-    if config.enable_savb {
-        publish_copy(sav_path, &sav_path.with_extension("savB")).await?;
-    }
-    state.rotate_seq(sav_path, config).await?;
-    state.write_dated(sav_path, config).await?;
-
-    Ok(())
+    publish_copy(sav_path, &sav_path.with_extension("savB")).await
 }
 
 /// Modification time of `path`, or `None` when the filesystem will not

@@ -126,7 +126,7 @@ impl Record for SubRecord {
     /// bare `record(sub,"P:SUB"){}` reads 1.
     ///
     /// The park is NOT permanent, which is what `subRecord.c::special`
-    /// (`:180-200`) exists for: `caput P:SUB.SNAM mySub` releases it and the
+    /// (`:170-194`) exists for: `caput P:SUB.SNAM mySub` releases it and the
     /// record runs, `caput P:SUB.SNAM ""` parks a running one. Both directions
     /// fall out of this predicate — the framework re-asks it either side of a
     /// put to [`Record::pact_park_fields`].
@@ -149,6 +149,20 @@ impl Record for SubRecord {
         // `RecordInstance::subroutine` (it needs the registry of
         // named functions, which the record does not own).
         Ok(ProcessOutcome::complete())
+    }
+
+    /// C `subRecord.c::do_sub` writes `prec->udf` in exactly one place — the
+    /// `else` arm of `if (status < 0)`, i.e. only where the subroutine ran
+    /// (`:434`). An unresolved SNAM returns at `:427` after `BAD_SUB_ALARM`
+    /// with UDF untouched, and a failed `fetch_values` never calls `do_sub` at
+    /// all (`:146`), so C reports UDF 1 for a `sub` whose SNAM names no
+    /// registered function. The per-cycle blanket re-derive cleared it.
+    ///
+    /// The write lives with the compute, in
+    /// [`RecordInstance::do_sub`](crate::server::record::RecordInstance) — the
+    /// shared site both `sub` and `aSub` reach.
+    fn clears_udf(&self) -> bool {
+        false
     }
 
     fn get_field(&self, name: &str) -> Option<EpicsValue> {

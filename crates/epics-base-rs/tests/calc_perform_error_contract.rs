@@ -66,7 +66,7 @@ fn a_array(expr: &str, aa: &[f64], bb: &[f64]) -> Vec<f64> {
 // --- sCalc: `return(-1)` is the contract, not a value ---------------------
 
 /// C: `A/0` `1/0` `0/0` all print `st=-1 d=0` — `sCalcPerform.c:495-500`
-/// (no-string path) and `:1022-1030` (string path) return BEFORE the divide,
+/// (no-string path) and `:1021-1029` (string path) return BEFORE the divide,
 /// so `*presult` is never written. The port used to hand back base's bare
 /// IEEE `+Inf`/`NaN` with no error at all.
 #[test]
@@ -142,7 +142,7 @@ fn scalc_ordinary_divide_still_succeeds() {
 
 // --- base: bare IEEE, no failure -----------------------------------------
 
-/// base `calcPerform.c:156-159` has no zero test and no non-finite tail — the
+/// base `calcPerform.c:155-158` has no zero test and no non-finite tail — the
 /// numeric engine must NOT inherit sCalc's rule.
 #[test]
 fn base_divide_by_zero_is_still_bare_ieee() {

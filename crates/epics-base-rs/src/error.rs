@@ -34,7 +34,7 @@ pub enum CaError {
 
     /// C `S_db_badField` ("Illegal RECORD FIELD") — a record's `special()`
     /// refused the value that `dbPut` had already stored, e.g.
-    /// `calcRecord.c:146-151` returning it for an uncompilable `CALC`. The
+    /// `calcRecord.c:146-152` returning it for an uncompilable `CALC`. The
     /// value stays written, the field's monitor is not posted, the record is
     /// not processed, and the status propagates to the client (rsrv
     /// `write_action` → `ECA_PUTFAIL`).
@@ -57,8 +57,9 @@ pub enum CaError {
     /// `dbPut` reached from a record's OUT link (`dbPutLink` →
     /// `dbDbPutValue`) or from internal code refuses, so a DB link cannot
     /// silently rewire another record's link field. rsrv answers it with
-    /// ECA_PUTFAIL like every non-zero put status (`to_eca_status`'s
-    /// catch-all).
+    /// ECA_PUTFAIL like every non-zero put status — and with ECA_GETFAIL when
+    /// the same refusal comes back from a get, which is why
+    /// [`CaError::to_eca_status`] takes the direction.
     #[error("illegal database request type: {0}")]
     BadDbrType(String),
 
@@ -75,6 +76,13 @@ pub enum CaError {
         message: String,
     },
 
+    /// C `dbLoadRecords` returning non-zero after `yyerror(NULL)`
+    /// recovered from a bad item (`dbAccess.c:795-813`). The records
+    /// that parsed are still there; the load's *status* is the failure,
+    /// and `softMain` exits 2 on it (`softMain.cpp:198,274-278`).
+    #[error("Failed to load '{0}'")]
+    DbLoadFailed(String),
+
     #[error("calc error: {0}")]
     CalcError(String),
 
@@ -83,12 +91,6 @@ pub enum CaError {
 
     #[error("client shut down")]
     Shutdown,
-
-    /// CA WRITE_NOTIFY arrived while a previous async put on the same
-    /// record is still in flight. Mirrors C EPICS `S_db_Blocked`; the
-    /// CA server replies `ECA_PUTCBINPROG`.
-    #[error("put callback in progress for record {0}")]
-    PutCallbackInProgress(String),
 
     /// Server-emitted ECA status carried out-of-band on an otherwise
     /// data-shaped frame — used by libca `cac::eventAddRespAction`
@@ -139,45 +141,86 @@ const ECA_NOWTACCESS: u32 = 376; // defmsg(CA_K_WARNING, 47)
 const ECA_PUTFAIL: u32 = 160; // defmsg(CA_K_WARNING, 20)
 const ECA_BADTYPE: u32 = 114; // defmsg(CA_K_ERROR, 14)
 const ECA_DISCONN: u32 = 192; // defmsg(CA_K_WARNING, 24)
-const ECA_PUTCBINPROG: u32 = 362; // defmsg(CA_K_ERROR, 45) = (45 << 3) | 2
 const ECA_TOLARGE: u32 = 72; // defmsg(CA_K_WARNING, 9)
 const ECA_BADCOUNT: u32 = 176; // defmsg(CA_K_WARNING, 22)
 const ECA_GETFAIL: u32 = 152; // defmsg(CA_K_WARNING, 19)
 
-impl CaError {
-    pub fn to_eca_status(&self) -> u32 {
+/// Which CA operation failed — C's `read_action` or `write_action`
+/// (`rsrv/camessage.c`).
+///
+/// C never lets the error KIND choose the status once a request has reached
+/// the database: `read_action` answers a negative `dbChannel_get` with
+/// `ECA_GETFAIL` (`camessage.c:647-651`) and `write_action` answers a negative
+/// `dbChannel_put` with `ECA_PUTFAIL` (`camessage.c:781-789`), throwing the
+/// `dbStatus` away in both. The same underlying failure therefore has two
+/// correct answers, one per direction, and a mapping that sees only the error
+/// cannot pick between them. Naming the direction at the call is what makes a
+/// read unable to reach a put status: no arm reachable under
+/// [`CaOp::Read`] yields `ECA_PUTFAIL`.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum CaOp {
+    /// C `read_action` — `ca_get`, `ca_array_get_callback`, a monitor update.
+    Read,
+    /// C `write_action` / `write_notify_action` — `ca_put`, `ca_put_callback`.
+    Write,
+}
+
+impl CaOp {
+    /// The status C's action reports once the DATABASE has refused, whatever
+    /// the underlying `dbStatus` was.
+    const fn failed(self) -> u32 {
         match self {
+            CaOp::Read => ECA_GETFAIL,
+            CaOp::Write => ECA_PUTFAIL,
+        }
+    }
+}
+
+impl CaError {
+    /// The ECA status a CA CLIENT reports for this error on `op`.
+    ///
+    /// Layered as C's `read_action`/`write_action` are. A status the error
+    /// already carries, or that a gate ABOVE the database produced, is the
+    /// same word whichever way the request was going; everything the database
+    /// itself refused is decided by `op` alone, because that is the point at
+    /// which C stops looking at the status.
+    ///
+    /// This is the client-side table, which sees libca's local statuses too.
+    /// The server's reply table is `PutStatus::of_failure`
+    /// (`epics-ca-rs/src/server/tcp.rs`) and is deliberately narrower: by the
+    /// time rsrv reaches `dbChannel_put`, the gates above it have already
+    /// answered, so every error left there is a database refusal.
+    pub fn to_eca_status(&self, op: CaOp) -> u32 {
+        match self {
+            // Raised by libca locally, before any database is reached — the
+            // request never became a read or a write.
             CaError::Timeout => ECA_TIMEOUT,
-            CaError::ReadOnlyField(_) => ECA_NOWTACCESS,
-            CaError::PutDisabled(_) => ECA_PUTFAIL,
-            CaError::TypeMismatch(_) => ECA_BADTYPE,
-            CaError::UnsupportedType(_) => ECA_BADTYPE,
-            CaError::InvalidValue(_) => ECA_BADTYPE,
-            CaError::FieldNotFound(_) => ECA_PUTFAIL,
-            // C rsrv answers any non-zero `db_put_field` status — including
-            // `S_db_badField` — with ECA_PUTFAIL (`camessage.c::write_action`).
-            CaError::BadField(_) => ECA_PUTFAIL,
-            // Likewise `S_db_badChoice` from the string→menu converter: the
-            // put-notify path maps any non-`notifyOK` status to ECA_PUTFAIL
-            // (`db_access.c::db_put_process:1041`, `camessage.c:1417-1421`).
-            CaError::BadChoice(_) => ECA_PUTFAIL,
-            // Disconnection / shutdown are surfaced as ECA_DISCONN so a
-            // downstream client (e.g. caput on a CA gateway whose
-            // upstream just dropped) sees the actionable
-            // "CA channel disconnected" message rather than the
-            // catch-all "Put fail".
-            CaError::Disconnected | CaError::Shutdown => ECA_DISCONN,
-            // I/O errors usually mean the upstream connection is
-            // wedged; mapping to ECA_DISCONN matches operator
-            // expectations from C ca-gateway.
-            CaError::Io(_) => ECA_DISCONN,
-            CaError::WriteFailed(code) => *code,
-            CaError::PutCallbackInProgress(_) => ECA_PUTCBINPROG,
-            CaError::ServerError(code) => *code,
             CaError::TooLarge => ECA_TOLARGE,
             CaError::BadCount => ECA_BADCOUNT,
-            CaError::GetConvertFailed(_) => ECA_GETFAIL,
-            _ => ECA_PUTFAIL,
+            // C's DBR-type gates: `INVALID_DB_REQ` above the read
+            // (`camessage.c:616-620`) and `caNetConvert` on both sides. They
+            // run before the database is touched and answer ECA_BADTYPE
+            // either way.
+            CaError::TypeMismatch(_) | CaError::UnsupportedType(_) => ECA_BADTYPE,
+            // Disconnection / shutdown are surfaced as ECA_DISCONN so a
+            // downstream client (e.g. caput on a CA gateway whose upstream
+            // just dropped) sees the actionable "CA channel disconnected"
+            // message rather than a request-failed status. I/O errors usually
+            // mean the circuit is wedged and read the same way.
+            CaError::Disconnected | CaError::Shutdown | CaError::Io(_) => ECA_DISCONN,
+            // Already an ECA status, decided by the peer or by libca.
+            // Re-deriving it would discard what was actually said.
+            CaError::WriteFailed(code) | CaError::ServerError(code) => *code,
+            // C's `rsrvCheckPut` gate, above the put (`camessage.c:741-751`).
+            // Its read-side twin ECA_NORDACCESS has no variant of its own —
+            // that one arrives from the wire as `ServerError`.
+            CaError::ReadOnlyField(_) => ECA_NOWTACCESS,
+            // Everything else is the database refusing: a value the field's
+            // converter rejected, a menu string naming no choice, a link field
+            // a get cannot render, a record-side veto. C answers all of them
+            // by direction, so listing any of them here would only be a way to
+            // get one of the two directions wrong.
+            _ => op.failed(),
         }
     }
 }

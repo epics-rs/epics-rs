@@ -14,8 +14,9 @@
 //!     break;
 //! ```
 //!
-//! `sCalcoutRecord` passes `&pcalc->val, pcalc->sval` for CALC (`:357-359`)
-//! and `&pcalc->oval, pcalc->osv` for OCAL (`:768-770`), so SVAL reads the
+//! `sCalcoutRecord` passes `&pcalc->val, pcalc->sval` for CALC
+//! (`sCalcoutRecord.c:357-359`) and `&pcalc->oval, pcalc->osv` for OCAL
+//! (`sCalcoutRecord.c:768-770`), so SVAL reads the
 //! previous SVAL in CALC and the previous OSV in OCAL. The port had no such
 //! token at all: `SVAL+'x'` failed to compile.
 //!
@@ -211,7 +212,8 @@ async fn swait_calc_uses_the_numeric_engine_and_rejects_a_string_expression() {
 }
 
 /// scalcout CALC: SVAL is the record's previous SVAL, so a self-referential
-/// `SVAL+'x'` accumulates across process cycles (C `:357-359` passes
+/// `SVAL+'x'` accumulates across process cycles (C `sCalcoutRecord.c:357-359`
+/// passes
 /// `pcalc->sval` as `psresult`).
 #[epics_macros_rs::epics_test]
 async fn scalcout_calc_sval_reads_the_previous_sval() {
@@ -240,7 +242,8 @@ async fn scalcout_calc_sval_reads_the_previous_sval() {
 }
 
 /// scalcout OCAL (DOPT=Use_OVAL): C passes `pcalc->osv` as `psresult`
-/// (`:768-770`), so SVAL inside OCAL is the previous **OSV** — not the SVAL
+/// (`sCalcoutRecord.c:768-770`), so SVAL inside OCAL is the previous **OSV** —
+/// not the SVAL
 /// that CALC produced this very cycle.
 #[epics_macros_rs::epics_test]
 async fn scalcout_ocal_sval_reads_the_previous_osv_not_the_current_sval() {

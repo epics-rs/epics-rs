@@ -19,7 +19,7 @@
 //! ```
 //!
 //! and aCalc the same with `num_dArgs` / `num_aArgs` (`aCalcPerform.c:432`,
-//! `:446`, `:462`, `:471`, `:499`, `:510`, `:1469`, `:1485`). Out of range: a
+//! `:441`, `:457`, `:466`, `:494`, `:505`, `:1458`, `:1474`). Out of range: a
 //! fetch is 0 / "" / a zero array, a store is a SILENT no-op — no error either
 //! way.
 //!
@@ -62,6 +62,7 @@ use epics_base_rs::calc::{
     acalc, calc, scalc,
 };
 use epics_base_rs::server::ioc_builder::IocBuilder;
+use epics_base_rs::server::records::swait::SwaitRecord;
 
 /// scalcout's counts: `MAX_FIELDS` / `STRING_MAX_FIELDS`, both 12.
 fn scalcout_inputs() -> StringInputs {
@@ -107,7 +108,7 @@ fn scalc_dynamic_numeric_arg_past_the_count_stores_nothing_and_fetches_zero() {
 }
 
 /// The STATIC name obeys the same count — C guards `FETCH_A..P` / `STORE_A..P`
-/// with it too (`:858`, `:882`). `M` is index 12, one past scalcout's 12.
+/// with it too (`:858`, `:881`). `M` is index 12, one past scalcout's 12.
 #[test]
 fn scalc_static_numeric_name_past_the_count_stores_nothing_and_fetches_zero() {
     let mut inputs = scalcout_inputs();
@@ -210,7 +211,7 @@ fn acalc_array_store_past_the_count_stores_nothing_and_sets_no_amask_bit() {
 }
 
 /// The static name is the same store with a constant index (`STORE_AA..LL`,
-/// `:466-491`) — and aCalc names only AA..LL, so its bound is reached through the
+/// `:461-486`) — and aCalc names only AA..LL, so its bound is reached through the
 /// dynamic form. Here: the static one at the last supplied index still works.
 #[test]
 fn acalc_static_array_store_at_the_last_supplied_index_sets_its_amask_bit() {
@@ -222,7 +223,7 @@ fn acalc_static_array_store_at_the_last_supplied_index_sets_its_amask_bit() {
 
 /// An array arg past the count FETCHES as a zero buffer of `arraySize` — C's
 /// `toArray(ps,0)` runs before the `num_aArgs` test, so the cell is an ARRAY
-/// either way, never a scalar (`:443-454`).
+/// either way, never a scalar (`:438-449`).
 #[test]
 fn acalc_array_fetch_past_the_count_is_a_zero_array_not_a_scalar() {
     let mut inputs = acalcout_inputs();
@@ -335,6 +336,7 @@ fn a_count_above_the_array_clamps_to_it() {
 #[epics_macros_rs::epics_test]
 async fn a_swait_calc_cannot_reach_past_l() {
     let (db, _) = IocBuilder::new()
+        .register_record_type("swait", || Box::new(SwaitRecord::default()))
         .db_string(
             r#"
 record(swait, "W:M") {

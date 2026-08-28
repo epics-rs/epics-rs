@@ -10,7 +10,7 @@
 //! }
 //! ```
 //!
-//! `monitor()` (`transformRecord.c:797-804`) is their only writer — it posts
+//! `monitor()` (`transformRecord.c:797-806`) is their only writer — it posts
 //! each channel that differs from its `l*` cell and copies the posted value in:
 //!
 //! ```c

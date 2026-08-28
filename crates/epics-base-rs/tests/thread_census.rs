@@ -36,14 +36,7 @@
 //! `.expect`, killing one thread on a `panic = "unwind"` target and leaving the
 //! IOC serving without it.
 
-/// Everything before the first column-0 `#[cfg(test)]` — the code that
-/// actually ships.
-fn production_scope(src: &str) -> &str {
-    match src.find("\n#[cfg(test)]") {
-        Some(i) => &src[..i],
-        None => src,
-    }
-}
+use source_guard::{Comments, production};
 
 /// The two files this census covers, as (label, source) pairs.
 fn files() -> [(&'static str, &'static str); 2] {
@@ -56,13 +49,16 @@ fn files() -> [(&'static str, &'static str); 2] {
     ]
 }
 
-/// Source lines outside comments, with their 1-based numbers.
-fn code_lines(src: &str) -> impl Iterator<Item = (usize, &str)> {
-    production_scope(src)
+/// Source lines of the production slice, with their 1-based numbers.
+///
+/// The numbers name lines of the file a reader will open: `production` blanks
+/// what it excludes instead of deleting it, so removing a test item from the
+/// middle of a file does not shift everything after it.
+fn code_lines(src: &'static str) -> impl Iterator<Item = (usize, &'static str)> {
+    production(src, Comments::Strip)
         .lines()
         .enumerate()
         .map(|(n, l)| (n + 1, l.trim_start()))
-        .filter(|(_, l)| !l.starts_with("//"))
 }
 
 /// Every thread this crate creates states a stack size, a band and a name —
@@ -152,7 +148,7 @@ fn every_thread_in_this_crate_goes_through_mandatory_thread() {
 fn no_mandatory_spawn_failure_is_resolved_at_the_call_site() {
     let mut unwrapped = Vec::new();
     for (label, src) in files() {
-        let prod = production_scope(src);
+        let prod = production(src, Comments::Strip);
         for (n, after) in prod.split(".try_spawn(").skip(1).enumerate() {
             // The statement the `try_spawn` call belongs to: everything up to
             // the first `;` that follows it.

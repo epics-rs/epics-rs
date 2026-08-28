@@ -66,7 +66,7 @@ fn the_numeric_branch_is_untouched() {
     );
 }
 
-/// C `toString(ps)` on the subject (`:1874`): SUBRANGE of a double is the
+/// C `toString(ps)` on the subject (`:1873`): SUBRANGE of a double is the
 /// subrange of its text, not a type error.
 #[test]
 fn a_double_subject_is_converted_first() {

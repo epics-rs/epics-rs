@@ -77,6 +77,9 @@ fn r21_asub_ftype_label_put_resolves_against_the_dbd_menu() {
         EpicsValue::String(epics_base_rs::types::PvString::from("LONG")),
     )
     .expect("LONG is a menuFtype choice");
+    let epics_base_rs::types::c_parse::Converted::Stored(coerced) = coerced else {
+        panic!("a menu label resolves to a stored index");
+    };
     inst.record.put_field("FTA", coerced).unwrap();
     assert_eq!(dbr_string_of(&inst, "FTA"), "LONG");
 }

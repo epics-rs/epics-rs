@@ -4,7 +4,8 @@
 //! C hands `aCalcPerform` pointers to the record's own `a..p` and `aa..ll`
 //! (`aCalcoutRecord.c:1283-1285`), so a store opcode writes the record in place
 //! (`aCalcPerform.c:456-491`). Array stores additionally set `*amask |= 1<<i`
-//! (`:487`, `:524`), and `afterCalc` posts exactly the flagged fields (`:293-297`).
+//! (`:482`, `:519`), and `afterCalc` posts exactly the flagged fields
+//! (`aCalcoutRecord.c:294-298`).
 //!
 //! The port evaluated over a CLONE of the fields and kept only the stack top, so
 //! every store was discarded: `AA := BB*2; SUM(AA)` left AA untouched, AMASK 0 — and
@@ -170,7 +171,7 @@ async fn r11_9_scalar_store_writes_the_field_but_not_amask() {
 /// still leaves its stores in the record. Only VAL/AVAL are withheld.
 ///
 /// `AA:=BB*2;SQRT(CC-1)` — CC is all zeros, so every element of `CC-1` is negative
-/// and the ARRAY SQRT domain guard sets status -1 (`:775-812`), after AA is written.
+/// and the ARRAY SQRT domain guard sets status -1 (`:766-803`), after AA is written.
 #[epics_macros_rs::epics_test]
 async fn r11_9_stores_survive_a_failing_expression() {
     let db = PvDatabase::new();

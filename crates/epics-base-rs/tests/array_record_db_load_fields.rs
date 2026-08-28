@@ -76,14 +76,18 @@ async fn field(db: &PvDatabase, pv: &str) -> EpicsValue {
 }
 
 async fn assert_sim_block_loaded(db: &PvDatabase, rec: &str) {
+    // A link field READS as C `dbGetString` renders it, so the defaulted
+    // modifiers come back: measured on `softIoc` R7.0.10-146, `caget
+    // ARR:AAI.SIML` on this very database answers `SIM:SW NPP NMS` on all
+    // three record types and for both link classes.
     assert_eq!(
         field(db, &format!("{rec}.SIML")).await,
-        EpicsValue::String("SIM:SW".into()),
+        EpicsValue::String("SIM:SW NPP NMS".into()),
         "{rec}: field(SIML) dropped at load"
     );
     assert_eq!(
         field(db, &format!("{rec}.SIOL")).await,
-        EpicsValue::String("ARR:SRC".into()),
+        EpicsValue::String("ARR:SRC NPP NMS".into()),
         "{rec}: field(SIOL) dropped at load"
     );
     assert_eq!(
@@ -148,7 +152,7 @@ async fn waveform_db_load_carries_sim_and_post_fields() {
 
 /// The SDLY the `.db` loaded must reach the framework's async-simulation
 /// branch: with `SIMM=YES` and `SDLY >= 0`, C's `readValue` arms the delayed
-/// callback and holds PACT (`aaiRecord.c:365-374`), so the SIOL value lands
+/// callback and holds PACT (`aaiRecord.c:359-368`), so the SIOL value lands
 /// only AFTER the delay — not within the first process call.
 #[epics_macros_rs::epics_test]
 async fn loaded_sdly_defers_the_simulated_aai_read() {

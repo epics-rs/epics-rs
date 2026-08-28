@@ -58,6 +58,7 @@ const DB: &str = r#"
 record(calc,     "C")  { field(PREC,"3") field(VAL,"7") }
 record(longout,  "LO") { field(DRVH,"5") }
 record(waveform, "W")  { field(FTVL,"CHAR") field(NELM,"16") }
+record(mbbo,     "MB") { field(ZRVL,"1") }
 "#;
 
 async fn build() -> std::sync::Arc<PvDatabase> {
@@ -142,9 +143,19 @@ async fn long_field_at_limit_stores_and_one_past_it_is_refused() {
 async fn unparseable_text_is_refused_not_stored_as_zero() {
     let db = build().await;
     refused(&db, "C", "PREC", "notanumber", EpicsValue::Short(3)).await;
-    refused(&db, "C", "PREC", "", EpicsValue::Short(3)).await;
     refused(&db, "C", "VAL", "notanumber", EpicsValue::Double(7.0)).await;
-    refused(&db, "C", "VAL", "", EpicsValue::Double(7.0)).await;
+    // Whitespace only is unparseable: C tests `*from == 0` on the raw bytes,
+    // which a space fails, so `epicsParse*` runs and finds no digits.
+    refused(&db, "C", "PREC", "   ", EpicsValue::Short(3)).await;
+    refused(&db, "C", "VAL", "   ", EpicsValue::Double(7.0)).await;
+    // The EMPTY string is not unparseable — it never reaches the parse. Every
+    // `cvt_st_*` answers it with a successful zero before calling `epicsParse*`
+    // (`dbFastLinkConv.c:147`), and a scalar put takes that row
+    // (`dbAccess.c:1370`). Asserting a refusal here was the same mistake as the
+    // doc comment that claimed it; `empty_string_put_stores_zero.rs` owns the
+    // rule and its array-row boundary.
+    stored(&db, "C", "PREC", "", EpicsValue::Short(0)).await;
+    stored(&db, "C", "VAL", "", EpicsValue::Double(0.0)).await;
 }
 
 #[epics_macros_rs::epics_test]
@@ -182,6 +193,39 @@ async fn the_numeric_prefix_is_taken_and_the_rest_is_units() {
     stored(&db, "C", "PREC", "5volts", EpicsValue::Short(5)).await;
     stored(&db, "C", "PREC", "1e2", EpicsValue::Short(1)).await;
     stored(&db, "C", "PREC", "  42", EpicsValue::Short(42)).await;
+}
+
+/// The same rule for `strtod`: the mantissa ends at the SECOND `.`, and what
+/// follows is trailing text, not an error. The port scanned digits and `.`
+/// greedily instead, so the slice it handed to Rust's float parser was
+/// unparseable and the whole put was refused — for `DBF_DOUBLE` and
+/// `DBF_FLOAT` directly, and for `DBF_ULONG` through `cvt_st_ul`'s via-double
+/// fallback (`dbFastLinkConv.c:172-187`).
+///
+/// Measured against R7.0.10 libCom (`epicsParseFloat64` / `epicsParseUInt32`
+/// driven through the `cvt_st_*` bodies, `dbConvertBase == 0`):
+///
+/// ```text
+/// "12.34.56" -> Double 12.34   Short 12   ULong 12
+/// "1..5"     -> Double 1       Short 1    ULong 1
+/// ".5.5"     -> Double 0.5     Short REFUSED (no digits before the '.')
+/// "1.2.3e4"  -> Double 1.2                (the exponent is past the 2nd '.')
+/// ```
+#[epics_macros_rs::epics_test]
+async fn a_second_decimal_point_ends_the_mantissa_it_does_not_refuse_the_put() {
+    let db = build().await;
+    stored(&db, "C", "VAL", "12.34.56", EpicsValue::Double(12.34)).await;
+    stored(&db, "C", "VAL", "1..5", EpicsValue::Double(1.0)).await;
+    stored(&db, "C", "VAL", ".5.5", EpicsValue::Double(0.5)).await;
+    stored(&db, "C", "VAL", "1.2.3e4", EpicsValue::Double(1.2)).await;
+
+    // The signed integer widths never saw the bug — `strtol` stops at the FIRST
+    // `.` — but they pin the boundary from the other side.
+    stored(&db, "C", "PREC", "12.34.56", EpicsValue::Short(12)).await;
+
+    // DBF_ULONG is the row that reaches the double parse from an integer field.
+    stored(&db, "MB", "ZRVL", "12.34.56", EpicsValue::ULong(12)).await;
+    stored(&db, "MB", "ZRVL", "1..5", EpicsValue::ULong(1)).await;
 }
 
 /// Base 0: `0x` is hex, a leading `0` is octal. The range check then applies to

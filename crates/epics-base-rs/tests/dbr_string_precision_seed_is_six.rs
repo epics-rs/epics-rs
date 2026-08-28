@@ -10,7 +10,7 @@
 //! ```
 //!
 //! `getFloatString` is the twin. Seventeen types carry
-//! `#define get_precision NULL` (`biRecord.c:58` and its siblings), and every
+//! `#define get_precision NULL` (`biRecord.c:54` and its siblings), and every
 //! DBF_DOUBLE/DBF_FLOAT field on all of them renders at 6.
 //!
 //! The port could not reach the seed: `DisplayInfo` is minted for EVERY
@@ -22,12 +22,13 @@
 //! slot, a supplied slot answering a per-field literal, and a slot supplied by
 //! the type but narrowed away by C's DBF gate.
 
-use epics_base_rs::server::db_loader::create_record;
+mod module_records;
+
 use epics_base_rs::server::record::RecordInstance;
 use epics_base_rs::types::EpicsValue;
 
 fn instance(record_type: &str) -> RecordInstance {
-    let rec = create_record(record_type).expect("record type is registered");
+    let rec = module_records::create_any(record_type).expect("record type is registered");
     RecordInstance::new_boxed(format!("T:{record_type}"), rec)
 }
 
@@ -55,7 +56,7 @@ fn a_record_type_with_no_get_precision_renders_doubles_at_six() {
     assert_eq!(
         dbr_string_of(&bi, "AFTC"),
         "2.500000",
-        "biRecord.c:58 is `#define get_precision NULL`, so C keeps its seed"
+        "biRecord.c:54 is `#define get_precision NULL`, so C keeps its seed"
     );
 }
 

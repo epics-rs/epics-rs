@@ -6,11 +6,11 @@
 //! reaches only through the immediate arm at `:283` or the delayed continuation
 //! at `:296`. So `calcPerform(&prec->a, &prec->oval, prec->orpc)` runs against
 //! the A..U present at EXPIRY. The twin is `sCalcoutRecord.c:429` ->
-//! `execOutput:755-777`.
+//! `execOutput:751-773`.
 //!
 //! `aCalcout` is the asymmetry: its C really does evaluate OVAL early, in
 //! `call_aCalcPerform` (`aCalcoutRecord.c:1287-1291`), and its `execOutput`
-//! (`:895-935`) carries no DOPT switch at all — so a mid-window input change
+//! (`:891-931`) carries no DOPT switch at all — so a mid-window input change
 //! must NOT reach its output. The last case pins that difference so the three
 //! records are not "harmonised" into one shape.
 
@@ -158,7 +158,7 @@ async fn calcout_use_val_still_writes_at_expiry() {
 /// scalcout's own trigger, needing no second record: an OCAL that STORES
 /// (`A:=A+1`) must not touch A while the delay is pending. C runs
 /// `sCalcPerform` from `execOutput` (`sCalcoutRecord.c:768`), which the
-/// scheduling cycle returns before reaching (`:407`).
+/// scheduling cycle returns before reaching (`:403`).
 #[epics_macros_rs::epics_test]
 async fn scalcout_ocal_stores_land_at_expiry() {
     let db = PvDatabase::new();
@@ -199,7 +199,7 @@ async fn scalcout_ocal_stores_land_at_expiry() {
 
 /// The asymmetry, pinned: aCalcout's OVAL is computed with VAL in
 /// `call_aCalcPerform` (`aCalcoutRecord.c:1287-1291`), long before `afterCalc`
-/// decides to defer, and its `execOutput` (`:895-935`) has no DOPT switch — so
+/// decides to defer, and its `execOutput` (`:891-931`) has no DOPT switch — so
 /// OVAL is already final while the delay runs, and an input that moves inside
 /// the window does NOT reach it. Making this record late would be a
 /// regression, not a harmonisation.

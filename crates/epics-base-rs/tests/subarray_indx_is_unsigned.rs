@@ -6,7 +6,7 @@
 //! if (prec->indx >= prec->malm) prec->indx = prec->malm - 1;
 //! ```
 //!
-//! (`subArrayRecord.c:310-314`). `caput SA.INDX -1` is a legitimate way to
+//! (`subArrayRecord.c:306-310`). `caput SA.INDX -1` is a legitimate way to
 //! reach 0xFFFFFFFF — `epicsParseUInt32` goes through `strtoul`, which negates
 //! in unsigned arithmetic (`epicsStdlib.c:263-278`) — and C then clamps it to
 //! MALM-1, so `subset` gets `ecount = nRequest - (MALM-1) <= 0` and the record

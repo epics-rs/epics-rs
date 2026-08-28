@@ -1,4 +1,4 @@
-// RTEMS-EXEC-MODEL-ALLOW(1): block_on_sync's current-thread-runtime refusal needs an ambient tokio runtime; runs and passes in the feature-ON suite.
+// RTEMS-EXEC-MODEL-ALLOW(1): block_on_sync's current-thread-runtime refusal needs an ambient tokio runtime; runs and passes in the exec-backend suite.
 //! Status PVs — the few numbers an operator can read off a target that has no
 //! shell.
 //!
@@ -327,7 +327,7 @@ fn push_loop(published: &[Published], shutdown: &AtomicBool) {
             errlog_sev_printf(
                 ErrlogSevEnum::Major,
                 "status PVs: this thread cannot drive a value publish (current-thread \
-                 runtime); the status PVs are registered but will never update",
+                 runtime); the status PVs are registered but will never update\n",
             );
             return;
         }

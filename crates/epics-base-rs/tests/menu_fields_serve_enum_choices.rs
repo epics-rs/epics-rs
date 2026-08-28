@@ -19,6 +19,8 @@ use epics_base_rs::server::record::{FieldDeclaration, RecordInstance};
 use epics_base_rs::server::records::ai::AiRecord;
 use epics_base_rs::types::{DbFieldType, EpicsValue};
 
+mod module_records;
+
 /// What a CA client sees on create-channel. The CA server reads the native type
 /// off this value (`epics-ca-rs/src/server/tcp.rs`), and the value is the stored
 /// one projected onto the field's DECLARED type — so the type it reads is the
@@ -121,14 +123,14 @@ fn a_put_to_a_menu_field_still_lands_as_the_stored_index() {
 /// built.
 #[test]
 fn menu_choices_are_served_as_dbr_enum() {
-    use epics_base_rs::server::db_loader::create_record;
     use epics_base_rs::server::record::dbd_generated::RECORD_TYPES;
 
     let mut contradictory = Vec::new();
     for record_type in RECORD_TYPES {
-        let Ok(rec) = create_record(record_type) else {
-            continue;
-        };
+        // Through the module-record fixture: a `continue` here silently
+        // dropped the seven types outside `stdRecords.dbd` from the sweep.
+        let rec = module_records::create_any(record_type)
+            .unwrap_or_else(|e| panic!("{record_type}: create_record failed: {e}"));
         let inst = RecordInstance::new_boxed(format!("T:{record_type}"), rec);
         for desc in inst.record.field_list() {
             let has_choices =

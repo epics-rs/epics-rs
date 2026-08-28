@@ -7,13 +7,14 @@
 /// threshold.
 const SMALL: f64 = 1e-8;
 
-/// C `fitpoly(x, y, n, &c, &b, &a, mask)` (`calcUtil.c:263-303`): least-squares fit
+/// C `fitpoly(x, y, n, &c, &b, &a, mask)` (`calcUtil.c:263-307`): least-squares fit
 /// of `y = c + b*x + a*x*x`, answering `(c, b, a)` — constant first.
 ///
 /// `None` is C's `return(-1)`, and C has exactly two ways to reach it:
 ///
-/// * **fewer than 3 points** (`:270`) — three coefficients need three equations;
-/// * **a singular normal matrix** (`:296`, via `invert3x3`'s `fabs(det) < SMALL`) —
+/// * **fewer than 3 points** (`:271`) — three coefficients need three equations;
+/// * **a singular normal matrix** (`:295-297`, via `invert3x3`'s
+///   `fabs(det) < SMALL`) —
 ///   which is what a fully-masked-out window, or one with fewer than 3 unmasked
 ///   points, produces.
 ///

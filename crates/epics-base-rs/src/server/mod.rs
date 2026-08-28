@@ -3,8 +3,11 @@ pub mod autosave;
 pub mod builtin_devices;
 pub mod cvt_bpt;
 pub mod database;
+pub mod db_convert_json;
 pub mod db_loader;
+pub mod db_server;
 pub mod device_support;
+pub mod driver_support;
 pub mod event_queue;
 pub mod ioc_app;
 pub mod ioc_builder;
@@ -50,40 +53,41 @@ mod deferred_tail_owner_tests {
     //! The rule itself lives in `record-seam-gate`, not here: `include_str!`
     //! may not escape a published crate's package directory, so a census
     //! written inline stops at the crate boundary — and the defect crossed it,
-    //! into `std-rs` and `asyn-rs`. This module now supplies only the list
-    //! below, which is the part that is genuinely this crate's.
+    //! into `std-rs` and `asyn-rs`. This module now supplies only the root and
+    //! the exemptions, which are the part that is genuinely this crate's.
+    //!
+    //! It supplies a *root* and not a list because the list could only be as
+    //! complete as its author's memory, and it was not: it named nine of the
+    //! 115 sources under `server/`, so a deferred tail added to any of the
+    //! other 106 was invisible to the census whose whole purpose was to make
+    //! the rule impossible to break by eye. `record_trait.rs` was one of those
+    //! 106, and it spent that time telling the reader the framework used
+    //! `tokio::spawn` for `ReprocessAfter` — the exact opposite of the rule.
+    //! The walk covers a new file the moment it exists.
 
-    /// Every production source file that defers a record tail. Two files in
-    /// `server/` are deliberately absent, each for a reason the reader should
-    /// be able to check: `event_queue.rs`, whose only seam uses are inside its
-    /// test module, and `autosave/manager.rs`, whose tasks are not on the
-    /// record-processing chain and whose saves go through `runtime::fs` —
-    /// hosted `spawn_blocking`, which needs the runtime that
-    /// `IocApplication::run` already gives them. Adding a deferred tail to a
-    /// file outside this list is the gap this census cannot close on its own.
-    const SOURCES: &[(&str, &str)] = &[
-        (
-            "database/processing.rs",
-            include_str!("database/processing.rs"),
-        ),
-        ("database/links.rs", include_str!("database/links.rs")),
-        (
-            "database/link_put_queue.rs",
-            include_str!("database/link_put_queue.rs"),
-        ),
-        ("database/mod.rs", include_str!("database/mod.rs")),
-        (
-            "database/db_access.rs",
-            include_str!("database/db_access.rs"),
-        ),
-        ("records/sseq.rs", include_str!("records/sseq.rs")),
-        ("access_security.rs", include_str!("access_security.rs")),
-        ("ioc_app.rs", include_str!("ioc_app.rs")),
-        ("pv.rs", include_str!("pv.rs")),
-    ];
+    /// The one source under `server/` that may name the ambient seam.
+    ///
+    /// `autosave/manager.rs`'s tasks are not on the record-processing chain:
+    /// every save goes through `runtime::fs` — hosted `spawn_blocking`, which
+    /// needs the very runtime `IocApplication::run` already gives them — and
+    /// all four save strategies are pollers started from there, none of them
+    /// reached from a record callback.
+    ///
+    /// `event_queue.rs` used to need a line here too. It no longer does: its
+    /// seam uses are inside its test module, which the slicer drops, so the
+    /// walk clears it without a waiver. One fewer hand-written claim to trust.
+    const EXEMPT: &[(&str, &str)] = &[(
+        "src/server/autosave/manager.rs",
+        "off the record-processing chain; saves go through runtime::fs \
+         (hosted spawn_blocking), which needs IocApplication::run's runtime",
+    )];
 
     #[test]
     fn a_deferred_record_tail_never_uses_the_ambient_seam() {
-        record_seam_gate::assert_no_ambient_seam(SOURCES);
+        record_seam_gate::assert_no_ambient_seam_in_tree(
+            env!("CARGO_MANIFEST_DIR"),
+            &["src/server"],
+            EXEMPT,
+        );
     }
 }

@@ -2,7 +2,7 @@
 //!
 //! C `cvt_st_c` (`dbFastLinkConv.c:91-101`) is the `[DBF_STRING][DBR_CHAR]`
 //! row of `dbFastGetConvertRoutine` (`:1645`), and the scalar fast path
-//! (`dbAccess.c:967-977`) always selects it for a string field, whose
+//! (`dbAccess.c:964-974`) always selects it for a string field, whose
 //! `no_elements` is 1:
 //!
 //! ```c

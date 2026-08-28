@@ -77,16 +77,11 @@ pub struct MbbiRecord {
     pub siol: String,
     // SVAL is `DBF_ULONG` (mbbiRecord.dbd.pod:299-301) — the BUFFER C's
     // `readValue` reads SIOL into (`dbGetLink(&prec->siol, DBR_ULONG,
-    // &prec->sval)`, mbbiRecord.c:390) before publishing `val = sval`.
+    // &prec->sval)`, mbbiRecord.c:388) before publishing `val = sval`.
     pub sval: u32,
     pub sims: i16,
     pub sdly: f64,
     skip_convert: bool,
-    // VAL change gate. C
-    // mbbiRecord.c:355-358 monitor() raises DBE_VALUE|DBE_LOG for VAL only
-    // when `mlst != val`. Captured during process() because the framework
-    // reads monitor_value_changed() after process() has committed mlst.
-    value_changed: bool,
 }
 
 impl Default for MbbiRecord {
@@ -159,7 +154,6 @@ impl Default for MbbiRecord {
             sims: 0,
             sdly: -1.0,
             skip_convert: false,
-            value_changed: false,
         }
     }
 }
@@ -354,6 +348,18 @@ macro_rules! mbb_put_field {
 }
 
 impl Record for MbbiRecord {
+    /// UDF belongs to the dset here, not to `process()`. C
+    /// `mbbiRecord.c:168-193` assigns `prec->udf = FALSE` at `:174`, INSIDE
+    /// `if (status == 0)`, and folds `2` into `0` only at `:192-193`, so a
+    /// device support that wrote VAL never reaches the assignment.
+    ///
+    /// That is not a hole: the C dset that returns 2 writes `prec->udf`
+    /// itself first — `devMbbiSoft.c:55-60` — which the port states as
+    /// `DeviceUdf::Defined`.
+    fn rederives_udf_on_computed_read(&self) -> bool {
+        false
+    }
+
     fn record_type(&self) -> &'static str {
         "mbbi"
     }
@@ -398,9 +404,9 @@ impl Record for MbbiRecord {
 
     /// C `devMbbiSoftRaw` — `recGblInitConstantLink(&prec->inp, DBF_ULONG,
     /// &prec->rval)` at init (`devMbbiSoftRaw.c:42`, unmasked), and per read
-    /// `dbGetLink(pinp, DBR_LONG, &prec->rval, 0, 0)` followed by
-    /// `prec->rval &= prec->mask` (`:78-79`, UNCONDITIONAL — unlike `bi`, whose
-    /// dset masks only when MASK is non-zero). `read_mbbi` returns 0, so the
+    /// `dbGetLink(pinp, DBR_LONG, &prec->rval, 0, 0)` (`:55`) followed by
+    /// `prec->rval &= prec->mask` (`:74`, unconditional in MASK — unlike `bi`,
+    /// whose dset masks only when MASK is non-zero). `read_mbbi` returns 0, so the
     /// record's `RVAL >> SHFT` → state-index convert then runs.
     fn raw_soft_input(&mut self, entry: RawSoftEntry, value: EpicsValue) -> Option<CaResult<()>> {
         self.rval = match super::raw_soft_rval_u32("mbbi", &value) {
@@ -437,12 +443,15 @@ impl Record for MbbiRecord {
         ]))
     }
 
-    /// VAL posts DBE_VALUE|DBE_LOG
-    /// only when it changed (C mbbiRecord.c:355-358 `mlst != val`), not every
-    /// process cycle. The comparison is captured in process(); see
-    /// `value_changed`.
-    fn monitor_value_changed(&self) -> Option<bool> {
-        Some(self.value_changed)
+    /// C `mbbiRecord.c:355-358` `monitor()`: `if (prec->mlst != prec->val) { events |=
+    /// DBE_VALUE | DBE_LOG; prec->mlst = prec->val; }` — compared and
+    /// committed HERE, at C's position, never captured during `process()`.
+    fn monitor_value_changed(&mut self) -> Option<bool> {
+        let changed = self.mlst != self.val;
+        if changed {
+            self.mlst = self.val;
+        }
+        Some(changed)
     }
 
     fn uses_monitor_deadband(&self) -> bool {
@@ -476,13 +485,6 @@ impl Record for MbbiRecord {
         }
         self.skip_convert = false;
         self.oraw = self.rval;
-        // Capture the VAL-change
-        // gate now (C mbbiRecord.c:355-358 `mlst != val`); the framework reads
-        // monitor_value_changed() after process().
-        self.value_changed = self.mlst != self.val;
-        if self.value_changed {
-            self.mlst = self.val;
-        }
         Ok(ProcessOutcome::complete())
     }
 
@@ -550,10 +552,34 @@ impl Record for MbbiRecord {
     /// C `mbbiRecord.c::checkAlarms` — UDF alarm, STATE alarm from the
     /// per-state severity (ZRSV..FFSV, or UNSV for an unknown state)
     /// with the AFTC alarm-range low-pass filter (2009 Codeathon
-    /// `824d37811`; mbbiRecord.c:319-337), and COS alarm (COSV).
-    /// C `checkAlarms:300-305` raises `UDF_ALARM/udfs`, zeroes AFVL,
+    /// `824d37811`; mbbiRecord.c:319-338), and COS alarm (COSV).
+    /// C `checkAlarms:301-305` raises `UDF_ALARM/udfs`, zeroes AFVL,
     /// and returns early when `udf` is set; we mirror that (raising
     /// UDF is idempotent with the framework's `rec_gbl_check_udf`).
+    ///
+    /// **DEVIATION from the `R7.0.10` pin, twice, both to `c9817fa59`**
+    /// (EPICS PR #817, 2026-04-01, "fix broken AFTC handling for mbbi
+    /// record, also fix bug in COSV and LALM handling"; an ancestor of
+    /// `origin/7.0` and of no tag). The pin is the pre-fix C and this
+    /// port implements the post-fix C on both counts:
+    ///
+    /// 1. **AFVL writeback.** At the pin the filter computes `afvl` into
+    ///    a local and never stores it, so `:323`'s `afvl = prec->afvl`
+    ///    reads the 0 that only the UDF path ever writes and `:324-326`
+    ///    re-seeds every cycle — C's mbbi filter is inert. `c9817fa59`
+    ///    adds `prec->afvl = afvl;` at `:339`, which `self.afvl =
+    ///    new_afvl` below is.
+    /// 2. **LALM on a raised COS.** The pin reads `if (val ==
+    ///    prec->lalm || recGblSetSevr(prec, COS_ALARM, prec->cosv))
+    ///    return; prec->lalm = val;` (`:344-348`), so a COSV that
+    ///    actually raises the severity short-circuits past the `lalm`
+    ///    update and the NEXT transition re-fires COS against a stale
+    ///    LALM. `c9817fa59` splits the test from the call, so LALM
+    ///    always advances on a transition — which is what the
+    ///    `if val != self.lalm` block below does.
+    ///
+    /// Do not "restore" either to the pin: both pin behaviours are the
+    /// defects that PR fixed.
     fn check_alarms(&mut self, common: &mut crate::server::record::CommonFields) {
         use crate::server::recgbl::{self, alarm_status};
         use crate::server::record::AlarmSeverity;

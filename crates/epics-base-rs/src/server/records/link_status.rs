@@ -136,7 +136,7 @@ fn dbf_static_code(ft: DbFieldType) -> i16 {
 
 /// Classify one DOL/LNK/INP/OUT link string into its connection-status menu
 /// index and the target field type, mirroring C `checkLinks`/`init_record`
-/// (sseqRecord.c:862-941,202-250; calcoutRecord.c:160-189).
+/// (sseqRecord.c:863-950,203-240; calcoutRecord.c:160-189).
 ///
 /// Returns `(status, field_type)`. An external (CA/PVA) link is reported as
 /// not-connected: epics-base-rs has no client to confirm a remote field's
@@ -174,9 +174,9 @@ pub fn classify_link(handle: &AsyncDbHandle, link: &str, role: LinkRole) -> (i16
 
 /// Classify a record's links and publish the resulting connection-status menu
 /// fields — the shared body of C's `init_record` link loop and its `special()`
-/// re-classification (`calcoutRecord.c:160-189`, `transformRecord.c:443-472`
-/// and `:712-740`, `sCalcoutRecord.c:254-287` and `:513-569`,
-/// `aCalcoutRecord.c:209-242` and `:509-533`).
+/// re-classification (`calcoutRecord.c:160-189`, `transformRecord.c:444-473`
+/// and `:709-742`, `sCalcoutRecord.c:254-288` and `:508-569`,
+/// `aCalcoutRecord.c:209-243` and `:528-569`).
 ///
 /// `links` pairs each status FIELD with the link string it describes and that
 /// link's [`LinkRole`]. Every caller passes its complete set, so a refresh is
@@ -189,10 +189,24 @@ pub fn classify_link(handle: &AsyncDbHandle, link: &str, role: LinkRole) -> (i16
 /// forward-referenced target classifies LOCAL and the result is final when
 /// `iocInit` returns; spawned at once on a complete database. No-op for a
 /// record with no async context.
+/// `mask` is the record's own `db_post_events` mask, and it is a parameter
+/// because the four records that route through here do not agree. The three
+/// calcouts post a bare `DBE_VALUE` — `calcoutRecord.c:404`, `:752`, `:757`;
+/// `sCalcoutRecord.c:287`, `:569`, `:1015`, `:1045`; `aCalcoutRecord.c:242`,
+/// `:569`, `:1157` — while `transformRecord.c:741`, `:858`, `:863` post
+/// `DBE_VALUE|DBE_LOG`. Posting one mask for all four would have been correct
+/// for exactly one of them.
+///
+/// Six records own link-status fields, not four: `sseq` (DOLV/LNKV/DT/LT/WERR)
+/// and `swait` (PVxV) post theirs from their own `refresh_link_status`, because
+/// their field sets are not one status enum per link. Both post `DBE_VALUE`
+/// alone — `sseqRecord.c:221`, `:240`, `:910`; `swaitRecord.c:527`, `:550`,
+/// `:923` — so a mask change here is only half of that family.
 pub fn post_link_status(
     ctx: Option<&(String, AsyncDbHandle)>,
     generation: &LinkStatusGen,
     links: Vec<(&'static str, String, LinkRole)>,
+    mask: crate::server::recgbl::EventMask,
 ) {
     let Some((name, handle)) = ctx else {
         return;
@@ -216,7 +230,7 @@ pub fn post_link_status(
             })
             .collect();
         if generation.is_current(token) {
-            let _ = handle.post_fields(&name, fields);
+            let _ = handle.post_fields_with_mask(&name, fields, mask);
         }
     });
 }
@@ -237,10 +251,10 @@ pub const SWAIT_NO_PV: i16 = 2;
 /// Classify one swait PV name (`INAN`..`INLN`, `DOLN`, `OUTN`) into its
 /// `menu(swaitINAV)` status.
 ///
-/// C `swaitRecord.c::init_record` (338-373) and `::special` (507-553) drive
+/// C `swaitRecord.c::init_record` (338-373) and `::special` (507-559) drive
 /// this: a blank name is `NO_PV`, and any other name is set `PV_NC` and handed
 /// to `recDynLinkAddInput`/`AddOutput`, after which `pvSearchCallback`
-/// (900-928) flips it to `PV_OK` once the search connects and back to `PV_NC`
+/// (901-926) flips it to `PV_OK` once the search connects and back to `PV_NC`
 /// when it does not. epics-base-rs has no CA client, so "connected" is
 /// "resolves to a field on this IOC": a DB-syntax name that addresses a local
 /// record is `PV_OK`, and every name that cannot be resolved here — an unknown

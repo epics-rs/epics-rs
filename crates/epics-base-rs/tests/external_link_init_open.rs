@@ -1,9 +1,18 @@
 //! Open-at-init parity with C `dbInitLink` → `dbCaAddLink`.
 //!
-//! C reference. `dbInitLink` (`dbLink.c:95-143`) runs per record link at
-//! iocInit. Any `PV_LINK` that is not resolvable as a local DB link reaches
-//! `dbCaAddLinkCallbackOpt`, which stages `addAction(pca, CA_CONNECT)`
-//! (`dbCa.c:389-417`) on the `dbCaTask`. That call sits *above* the
+//! C reference, at the `R7.0.10` pin. `dbInitLink` (`dbLink.c:92-143`) runs
+//! per record link at iocInit. Any `PV_LINK` that is not resolvable as a
+//! local DB link reaches `dbCaAddLink` (`dbLink.c:128`), which stages
+//! `addAction(pca, CA_CONNECT)` (`dbCa.c:393`) inside `dbCaAddLinkCallback`
+//! (`dbCa.c:373-395`) on the `dbCaTask`.
+//!
+//! This machine's checkout `R7.0.10-146-g8f5015b66` carries the unreleased
+//! iocInit connection-wait (`717d69e1f`, in no tag), which interposes
+//! `dbCaAddLinkCallbackOpt`: there `dbInitLink` is `dbLink.c:92-145`, the
+//! call is `dbCaAddLinkCallbackOpt` at `dbLink.c:130`, and the staging is
+//! `dbCa.c:415` inside `dbCaAddLinkCallbackOpt` (`dbCa.c:389-417`). What
+//! this file asserts — that the open happens at init, for every direction
+//! and every modifier — is the same at both. That call sits *above* the
 //! `dbfType` switch, so `DBF_INLINK`, `DBF_OUTLINK` and `DBF_FWDLINK` are
 //! all opened, and it is independent of the `CP`/`CPP` modifier, so plain
 //! links are opened exactly like CP ones. A C IOC therefore reaches its
@@ -156,7 +165,7 @@ async fn non_cp_external_inp_link_is_opened_at_init_not_on_first_scan() {
 }
 
 /// Boundary — an OUT-only external link. `dbCaAddLink` is reached from
-/// `dbInitLink` above the `dbfType` switch (`dbLink.c:118-130`), so C opens
+/// `dbInitLink` above the `dbfType` switch (`dbLink.c:118-128`), so C opens
 /// `DBF_OUTLINK` channels at init too; only the `pvlOptInpNative` /
 /// `pvlOptFWD` flags below it are direction-specific.
 #[epics_macros_rs::epics_test]
@@ -214,7 +223,7 @@ async fn record_specific_input_link_fields_are_opened_at_init() {
 
 /// Boundary — a local link stages nothing. C's `dbInitLink` resolves it via
 /// `dbDbInitLink` and returns before `dbCaAddLink` (`dbLink.c:118-124`);
-/// a `CONSTANT` link returns even earlier (`dbLink.c:101-104`). Neither may
+/// a `CONSTANT` link returns even earlier (`dbLink.c:102-105`). Neither may
 /// consume the link queue's one-shot open.
 #[epics_macros_rs::epics_test]
 async fn local_and_constant_links_stage_nothing() {
@@ -242,9 +251,9 @@ async fn local_and_constant_links_stage_nothing() {
 
 /// Boundary — a PLAIN (no `CP`/`CPP`/`CA` modifier) `Db` link whose target is
 /// not a record in this IOC. C `dbInitLink` hands it to `dbDbInitLink`
-/// (`dbLink.c:117-120`), whose `dbChannelCreate` cannot find the record and
+/// (`dbLink.c:118-121`), whose `dbChannelCreate` cannot find the record and
 /// returns `S_db_notFound` (`dbDbLink.c:94-96`); execution falls through to
-/// `dbCaAddLinkCallbackOpt` (`dbLink.c:129`) and the link IS a CA link from
+/// `dbCaAddLink` (`dbLink.c:128`) and the link IS a CA link from
 /// then on. So both halves must hold: the holder's parse cache is rewritten to
 /// `Ca`, and the channel is opened at init like any other external link.
 #[epics_macros_rs::epics_test]
@@ -290,7 +299,7 @@ async fn plain_non_local_db_link_converts_and_opens_at_init() {
 }
 
 /// Boundary — a `.FIELD` target. The CA channel name C falls through with is
-/// `plink->value.pv_link.pvname` verbatim (`dbLink.c:129`), i.e. the same
+/// `plink->value.pv_link.pvname` verbatim (`dbLink.c:128`), i.e. the same
 /// `record.FIELD` string `dbChannelCreate` just failed on — not the bare
 /// record name.
 #[epics_macros_rs::epics_test]
@@ -348,7 +357,7 @@ async fn local_db_link_is_not_converted() {
 /// It was already converted (by `setup_cp_links`) and already registered as an
 /// external CP trigger; moving the rewrite to the `dbInitLink` pass must keep
 /// BOTH halves, because C reaches the identical `dbCaAddLink` call for a
-/// CP link — it just skips `dbDbInitLink` on the way (`dbLink.c:117`).
+/// CP link — it just skips `dbDbInitLink` on the way (`dbLink.c:118`).
 #[epics_macros_rs::epics_test]
 async fn non_local_cp_link_keeps_its_conversion_and_its_external_trigger() {
     let reads = Arc::new(AtomicUsize::new(0));
@@ -380,7 +389,7 @@ async fn non_local_cp_link_keeps_its_conversion_and_its_external_trigger() {
 }
 
 /// Boundary — the decision is made ONCE. C sets `DBLINK_FLAG_INITIALIZED` and
-/// returns early on any later `dbInitLink` (`dbLink.c:95-101`), so a record
+/// returns early on any later `dbInitLink` (`dbLink.c:96-100`), so a record
 /// that appears in the IOC *after* iocInit does NOT pull an already-converted
 /// link back to a local DB link. Our commit into the parse cache has the same
 /// shape: nothing re-derives it from locality afterwards.
@@ -411,7 +420,7 @@ async fn a_record_added_after_init_does_not_un_convert_the_link() {
 
 /// Boundary — a `Constant` link is not a `PV_LINK` and never reaches the
 /// locality test: `dbInitLink` returns at `dbConstInitLink`
-/// (`dbLink.c:101-104`). A numeric `INP` must not be turned into a CA channel
+/// (`dbLink.c:102-105`). A numeric `INP` must not be turned into a CA channel
 /// named `3.5`.
 #[epics_macros_rs::epics_test]
 async fn constant_link_is_not_converted() {
@@ -428,10 +437,12 @@ async fn constant_link_is_not_converted() {
     assert!(lset.opened_names().is_empty());
 }
 
-/// Boundary — an external `FLNK`. `dbInitLink` reaches
-/// `dbCaAddLinkCallbackOpt` for `DBF_FWDLINK` exactly as for the other two
-/// directions (`dbLink.c:118-136`; the `dbfType == DBF_FWDLINK` block *below*
-/// the call only sets `pvlOptFWD` / warns about a non-`.PROC` target). The
+/// Boundary — an external `FLNK`. `dbInitLink` reaches `dbCaAddLink` for
+/// `DBF_FWDLINK` exactly as for the other two directions
+/// (`dbLink.c:118-142` at the `R7.0.10` pin; `:118-144` in checkout
+/// `8f5015b66`, where the call is `dbCaAddLinkCallbackOpt`; either way the
+/// `dbfType == DBF_FWDLINK` block sits *below* the call and only sets
+/// `pvlOptFWD` / warns about a non-`.PROC` target). The
 /// port already forwards a live external `FLNK`
 /// (`processing.rs::dispatch_external_forward_link`), so the channel must be
 /// connecting before the first forward trigger rather than being staged by
@@ -464,7 +475,7 @@ async fn external_forward_link_is_opened_at_init() {
 }
 
 /// Boundary — a local `FLNK` stages nothing. C resolves it through
-/// `dbDbInitLink` and returns before `dbCaAddLink` (`dbLink.c:117-120`); the
+/// `dbDbInitLink` and returns before `dbCaAddLink` (`dbLink.c:118-121`); the
 /// forward trigger is the local `dbScanPassive` path, not a link set. Widening
 /// `record_link_fields` to carry `FLNK` must not turn every fanout chain in a
 /// database into an external open attempt.
@@ -533,7 +544,7 @@ async fn forward_link_never_registers_a_cp_holder() {
 /// Boundary — the CP path is not double-staged. `setup_cp_links` already
 /// warms external CP/CPP links, and this pass re-visits the same fields.
 /// Both derive the queue key from the same boundary name, and `stage_open`
-/// is once-per-key and terminal (`link_put_queue.rs:346-369`), so the link
+/// is once-per-key and terminal (`link_put_queue.rs:395-410`), so the link
 /// is connected exactly once: C stages one `CA_CONNECT` per link and libca
 /// owns every retry from then on.
 #[epics_macros_rs::epics_test]

@@ -2,7 +2,7 @@
 //!
 //! aCalc `[`/`{` (`aCalcPerform.c:1526-1534`), sCalc `[`
 //! (`sCalcPerform.c:1876-1886`) and NSMOOTH's pass count (`aCalcPerform.c:581`,
-//! `int j` declared at `:304`) all narrow a stack double with a bare C `(int)`.
+//! `int j` declared at `:299`) all narrow a stack double with a bare C `(int)`.
 //! Three sites open-coded that narrowing as a Rust `as` instead of asking
 //! `epics_base_rs::types::c_cast`, which is the single owner of what a
 //! double→int conversion means in this port.

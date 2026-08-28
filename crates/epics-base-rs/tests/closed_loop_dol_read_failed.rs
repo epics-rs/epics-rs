@@ -1,12 +1,12 @@
 //! R3-2 / R3-3: a FAILED `dbGetLink` is not "no value arrived".
 //!
-//! C's `dbGetLink` (`dbLink.c:324-340`) ends in
+//! C's `dbGetLink` (`dbLink.c:322-338`) ends in
 //!
 //! ```c
 //! if (status) setLinkAlarm(plink);
 //! ```
 //!
-//! and `setLinkAlarm` (`:318-322`) is
+//! and `setLinkAlarm` (`:316-320`) is
 //! `recGblSetSevrMsg(LINK_ALARM, INVALID_ALARM, "field %s", dbLinkFieldName(plink))`
 //! — unconditional on failure, independent of the link's `MS` class, and
 //! carrying the LINK FIELD's own name as the AMSG. It is an effect of the READ,
@@ -17,7 +17,8 @@
 //! `if (!status) convert(prec, value)` (`aoRecord.c:188`, `longoutRecord.c:155`,
 //! `int64outRecord.c:146`) or `goto CONTINUE` (`mbboRecord.c:206`,
 //! `mbboDirectRecord.c:186`); ao additionally writes `prec->val = prec->pval`
-//! BEFORE the read (`aoRecord.c:441-442`, "don't allow dbputs to val field").
+//! BEFORE the read (`aoRecord.c:442`, under the comment "don't allow dbputs
+//! to val field" at `:441`).
 //!
 //! Boundaries, one case each:
 //!   * DOL `Failed` vs `Value` vs constant (`NoData`), OIF Full vs Incremental
@@ -31,6 +32,7 @@ use std::collections::HashSet;
 use epics_base_rs::server::ioc_builder::IocBuilder;
 use epics_base_rs::server::recgbl::alarm_status;
 use epics_base_rs::server::record::AlarmSeverity;
+use epics_base_rs::server::records::scalcout::ScalcoutRecord;
 use epics_base_rs::types::EpicsValue;
 
 const DB: &str = r#"
@@ -107,6 +109,7 @@ record(scalcout, "SC:DEAD") {
 
 async fn build() -> std::sync::Arc<epics_base_rs::server::database::PvDatabase> {
     IocBuilder::new()
+        .register_record_type("scalcout", || Box::new(ScalcoutRecord::default()))
         .db_string(DB, &std::collections::HashMap::new())
         .unwrap()
         .build()
@@ -120,6 +123,19 @@ async fn process(db: &epics_base_rs::server::database::PvDatabase, rec: &str) {
     db.process_record_with_links(rec, &mut visited, 0)
         .await
         .unwrap();
+}
+
+/// seq hands its group chain to the callback task and returns with `pact` set
+/// (`seqRecord.c:143`, `:210-215`), so the DOLn read, its LINK alarm and
+/// `asyncFinish`'s commit (`:219-241`) all land after `process` returns.
+async fn settle(db: &epics_base_rs::server::database::PvDatabase, rec: &str) {
+    for _ in 0..400 {
+        if !db.get_record(rec).unwrap().read().is_processing() {
+            return;
+        }
+        epics_base_rs::runtime::task::sleep(std::time::Duration::from_millis(5)).await;
+    }
+    panic!("{rec} never left PACT");
 }
 
 fn field(
@@ -272,7 +288,7 @@ async fn dead_dol_holds_a_client_rval_on_mbbo() {
 
 // ------------------------------------------------- the rest of the family
 
-/// `dbAccess.c:566` reads SDIS with a plain `dbGetLink`.
+/// `dbAccess.c:565` reads SDIS with a plain `dbGetLink`.
 #[epics_macros_rs::epics_test]
 async fn dead_sdis_raises_link_invalid_named_sdis() {
     let db = build().await;
@@ -287,7 +303,7 @@ async fn dead_sdis_raises_link_invalid_named_sdis() {
     );
 }
 
-/// `recGbl.c:315` reads every non-`.TIME` TSEL with a plain `dbGetLink`.
+/// `recGbl.c:322` reads every non-`.TIME` TSEL with a plain `dbGetLink`.
 #[epics_macros_rs::epics_test]
 async fn dead_tsel_raises_link_invalid_named_tsel() {
     let db = build().await;
@@ -302,7 +318,7 @@ async fn dead_tsel_raises_link_invalid_named_tsel() {
     );
 }
 
-/// The one TSEL form that is NOT a `dbGetLink`: `recGbl.c:316-320` takes
+/// The one TSEL form that is NOT a `dbGetLink`: `recGbl.c:316-321` takes
 /// `dbGetTimeStampTag` and reports failure with an errlog only.
 #[epics_macros_rs::epics_test]
 async fn dead_tsel_dot_time_raises_no_link_alarm() {
@@ -353,6 +369,7 @@ async fn dead_seq_dol_raises_link_invalid_named_dol0() {
         .await
         .unwrap();
     process(&db, "SEQ:DEAD").await;
+    settle(&db, "SEQ:DEAD").await;
 
     assert_eq!(
         alarm(&db, "SEQ:DEAD"),
@@ -361,7 +378,7 @@ async fn dead_seq_dol_raises_link_invalid_named_dol0() {
             epics_base_rs::server::recgbl::alarm_status::LINK_ALARM,
             "field DOL0".to_string()
         ),
-        "seqRecord.c:259 is a dbGetLink, so dbLink.c:339 setLinkAlarm applies"
+        "seqRecord.c:259 is a dbGetLink, so dbLink.c:337 setLinkAlarm applies"
     );
     assert_eq!(
         field(&db, "SEQ:DEAD", "DO0"),
@@ -379,6 +396,7 @@ async fn live_seq_dol_raises_no_link_alarm() {
         .await
         .unwrap();
     process(&db, "SEQ:LIVE").await;
+    settle(&db, "SEQ:LIVE").await;
 
     let (sevr, stat, _) = alarm(&db, "SEQ:LIVE");
     assert_eq!(
@@ -391,7 +409,7 @@ async fn live_seq_dol_raises_no_link_alarm() {
 }
 
 /// sCalcout's string inputs are `dbGetLink` too (`sCalcoutRecord.c:916`,
-/// `:934`), so a dead INAA raises LINK/INVALID even though `fetch_values`
+/// `:930`), so a dead INAA raises LINK/INVALID even though `fetch_values`
 /// returns 0 (`:941`) and the cycle still runs `sCalcPerform`.
 #[epics_macros_rs::epics_test]
 async fn dead_scalcout_string_input_raises_link_invalid_named_inaa() {

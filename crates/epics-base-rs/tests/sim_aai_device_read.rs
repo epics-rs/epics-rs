@@ -1,7 +1,7 @@
 //! `aai` is a SIOL-reading input in simulation, but the SIOL read lives in
 //! its soft DEVICE support, not the record support. `aaiRecord.c::readValue`
-//! (:348) raises `recGblSetSevr(prec, SIMM_ALARM, prec->sims)` (:364) then
-//! calls `read_aai`, and `devAaiSoft.c::read_aai` (:88) reads
+//! (:342) raises `recGblSetSevr(prec, SIMM_ALARM, prec->sims)` (:358) then
+//! calls `read_aai`, and `devAaiSoft.c::read_aai` (:89) reads
 //! `prec->simm == menuYesNoYES ? &prec->siol : &prec->inp` — so SIMM=YES reads
 //! the SIOL array INTO VAL, observably identical to `waveform`. (Reading only
 //! the record support `readValue` misleads: it looks device-only, but the soft

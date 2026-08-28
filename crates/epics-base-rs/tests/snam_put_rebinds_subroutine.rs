@@ -15,11 +15,15 @@
 //! prec->sadr = pfunc;
 //! ```
 //!
-//! and `subRecord.c::special` (182-194) is the same rebind
-//! (`prec->sadr = registryFunctionFind(prec->snam)`).
+//! and `subRecord.c::special` (`:170-194`) is the same rebind for a NON-EMPTY
+//! name (`prec->sadr = registryFunctionFind(prec->snam)`, `:188`). The two
+//! diverge on the EMPTY name and only there: aSub resolves it to `pfunc = 0`
+//! (back in `aSubRecord.c`: `:561`) and assigns (`:575`), while sub returns
+//! at `:182-186` —
+//! `epicsPrintf`, `pact = TRUE` — without touching `sadr` at all.
 //!
-//! The assignment is UNCONDITIONAL: an empty name and an unregistered name
-//! both leave `sadr` NULL, and only the returned status differs. The port
+//! For aSub the assignment is UNCONDITIONAL: an empty name and an unregistered
+//! name both leave `sadr` NULL, and only the returned status differs. The port
 //! stored the name and never touched `RecordInstance::subroutine`, so
 //! `caput X.SNAM fnB` read back `fnB` while the record kept executing `fnA`
 //! forever, and `caput X.SNAM ""` was inert.
@@ -138,6 +142,65 @@ async fn asub_empty_snam_put_unbinds_the_subroutine() {
         field(&db, "X", "VALA").await,
         Some(EpicsValue::Double(0.0)),
         "C assigned sadr = 0, so do_sub calls nothing"
+    );
+}
+
+/// The one place sub does NOT follow aSub. `subRecord.c:182-186` prints,
+/// sets `pact = TRUE` and returns 0 WITHOUT reaching `prec->sadr = ...`, so an
+/// empty SNAM leaves the routine bound and the PACT park is what stops it
+/// running. Clearing `RecordInstance::subroutine` here as well would give one
+/// field two meanings for one empty SNAM — "nothing is bound" and "a parked
+/// record's retained routine" — which is the state the port has to be able to
+/// tell apart when a later put names a routine again and releases the park.
+#[epics_macros_rs::epics_test]
+async fn sub_empty_snam_put_parks_and_keeps_the_binding() {
+    let db = PvDatabase::new();
+    let mut registry: HashMap<String, Arc<SubroutineFn>> = HashMap::new();
+    registry.insert("fnA".into(), writes_val(1.0));
+    db.install_subroutine_registry(registry.clone()).await;
+
+    let mut seed = SubRecord::default();
+    seed.put_field("SNAM", EpicsValue::String("fnA".into()))
+        .unwrap();
+    db.add_record("Y", Box::new(seed)).await.unwrap();
+    db.get_record("Y").unwrap().write().subroutine = registry.get("fnA").cloned();
+
+    process(&db, "Y").await;
+    assert_eq!(field(&db, "Y", "VAL").await, Some(EpicsValue::Double(1.0)));
+
+    // No-notify, because this put is what parks the record and `dbNotify.c`
+    // defers a put-notify in front of a PACT-active one.
+    db.put_record_field_from_ca_no_notify("Y", "SNAM", EpicsValue::String("".into()))
+        .await
+        .expect("subRecord.c:185 returns 0 — an empty SNAM is not an error");
+
+    assert!(
+        db.get_record("Y").unwrap().read().subroutine.is_some(),
+        "subRecord.c:182-186 returns before the sadr assignment, so the \
+         routine stays bound"
+    );
+    assert_eq!(
+        db.get_record("Y")
+            .unwrap()
+            .read()
+            .client_field_value("PACT"),
+        Some(EpicsValue::UChar(1)),
+        "subRecord.c:184 sets pact = TRUE"
+    );
+
+    // The retained pointer is not observable: the park is what stops the run.
+    db.get_record("Y")
+        .unwrap()
+        .write()
+        .record
+        .put_field("VAL", EpicsValue::Double(0.0))
+        .unwrap();
+    let mut visited = HashSet::new();
+    let _ = db.process_record_with_links("Y", &mut visited, 0).await;
+    assert_eq!(
+        field(&db, "Y", "VAL").await,
+        Some(EpicsValue::Double(0.0)),
+        "a parked record does not process, so the bound routine cannot run"
     );
 }
 

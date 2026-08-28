@@ -33,7 +33,7 @@
 //!
 //! What is counted here is `db_post_events` CALLS, not monitor deliveries. VAL
 //! is an array field, so C queues it by reference and refuses a second entry for
-//! the same monitor (`dbEvent.c:786-799`) — an undrained C monitor sees one
+//! the same monitor (`dbEvent.c:794-800`) — an undrained C monitor sees one
 //! delivery however many times the record posts, and reads the current bins when
 //! it is finally delivered. The port's queue does the same, so a burst of posts
 //! shows up as one held entry plus `ncollapse`.

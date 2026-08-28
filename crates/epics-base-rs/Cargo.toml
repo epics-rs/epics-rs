@@ -99,11 +99,14 @@ libc = "0.2"
 # from the uploaded manifest. Lets `epics-base-rs` publish first in
 # the dependency chain without `epics-ca-rs` already being on crates.io.
 [dev-dependencies]
+# Dev-only and `path`-only, so `cargo package` drops it from the uploaded
+# manifest: the source guards in this crate share one production-slice rule.
+source-guard = { path = "../source-guard" }
 # Dev-only, path-only (no `version`, so `cargo publish` strips the entry
-# entirely): the shared `rtems-exec-model` test-gating census, called by
+# entirely): the shared exec-backend test-gating census, called by
 # `tests/rtems_exec_model_gate.rs`. Shared rather than copied because every
-# crate that declares the feature has the same hole, and three copies of a
-# 300-line audit is how three copies of a rule come to disagree.
+# crate that derives the backend has the same hole, and a 300-line audit
+# copied once per crate is how copies of a rule come to disagree.
 rtems-exec-gate = { path = "../../tools/rtems-exec-gate" }
 record-seam-gate = { path = "../../tools/record-seam-gate" }
 epics-ca-rs = { path = "../epics-ca-rs" }
@@ -115,29 +118,6 @@ criterion = { version = "0.5", features = ["html_reports"] }
 tracing-subscriber = "0.3"
 
 [features]
-# Host-selectable RTEMS execution model. Routes the `runtime::task`
-# spawn/sleep/interval seam to the std-thread background executor
-# (callback pool + delayed timer + scanOnce worker) on a HOSTED target,
-# instead of the tokio runtime — the same runtime-free backend the RTEMS
-# build uses unconditionally. Intended for a Linux (e.g. PREEMPT_RT)
-# blocking-front-end deployment that runs the `std::net` CA server driver
-# and wants async record-processing completion driven on dedicated OS
-# threads with no tokio reactor. Compile-time backend switch (see
-# `build.rs`, which turns this into the `exec_backend` cfg). OFF by
-# default: the hosted default is byte-identical without it.
-# Forwards to the dev-dependency `epics-ca-rs` because that crate compiles
-# into this crate's own test graph: without the forward, `cargo test -p
-# epics-base-rs --features rtems-exec-model` builds the split state the
-# `HAS_TOKIO_REACTOR` const guard exists to refuse (base on the exec
-# backend, the ca dev-dep still on tokio), and the guard fails the build.
-# Forwards to `epics-libcom-rs` because that is where the seam itself now
-# lives; this crate's own `build.rs` derives the same cfg for `server::scan`
-# above the seam, and `lib.rs` pins the two together so a dropped forward is a
-# compile error rather than a split backend.
-rtems-exec-model = [
-    "epics-libcom-rs/rtems-exec-model",
-    "epics-ca-rs/rtems-exec-model",
-]
 # Linux PREEMPT_RT real-time deployment opt-in. Wires `runtime::sync::
 # PriorityInheritanceMutex` to a `pthread_mutex_t` configured with
 # `PTHREAD_PRIO_INHERIT` (epics-base 7-E `5a8b6e41`). No-op on

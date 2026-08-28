@@ -1,4 +1,4 @@
-//! `transformRecord.c:754-766` `get_precision` is three-way and its first arm
+//! `transformRecord.c:752-767` `get_precision` is three-way and its first arm
 //! is a LITERAL:
 //!
 //! ```c
@@ -12,12 +12,13 @@
 //! `transform` arm reading PREC would still print `6` for `caget -s T.VERS`
 //! where C prints `5.80`.
 
-use epics_base_rs::server::db_loader::create_record;
+mod module_records;
+
 use epics_base_rs::server::record::RecordInstance;
 use epics_base_rs::types::EpicsValue;
 
 fn transform_with_prec(prec: i16) -> RecordInstance {
-    let rec = create_record("transform").expect("transform is registered");
+    let rec = module_records::create_any("transform").expect("the test registers transform");
     let mut inst = RecordInstance::new_boxed("T".to_string(), rec);
     inst.record
         .put_field("PREC", EpicsValue::Short(prec))
@@ -59,10 +60,16 @@ fn raising_prec_leaves_vers_alone_but_moves_the_others() {
     }
 }
 
-/// A dbCommon float field is C's third arm (`recGblGetPrec`), which only
-/// CLAMPS an out-of-range seed — so an in-range PREC reaches it unchanged.
+/// C's third arm (`recGblGetPrec`) takes the field indices BELOW VAL, which
+/// are the dbCommon fields — and `HYST` is not one of them. `transformRecord.dbd`
+/// declares no HYST at all, so C never reaches an address for it: measured on a
+/// softIoc built with the calc module, `dbgf T:ONE.HYST` answers
+/// `PV 'T:ONE.HYST' not found`. This case used to assert a precision for it,
+/// which the port could only answer by serving a field the record type does
+/// not have.
 #[test]
-fn a_dbcommon_double_field_keeps_the_prec_seed() {
+fn a_field_the_record_type_does_not_declare_has_no_channel() {
     let inst = transform_with_prec(3);
-    assert_eq!(precision_of(&inst, "HYST"), Some(3));
+    assert!(inst.resolve_field("HYST").is_none());
+    assert!(inst.snapshot_for_field("HYST").is_none());
 }

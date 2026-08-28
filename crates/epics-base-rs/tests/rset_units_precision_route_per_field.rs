@@ -8,8 +8,8 @@
 //! field, in a switch whose default writes nothing:
 //!
 //! ```text
-//! subArrayRecord.c:206-219 VAL/HOPR/LOPR -> EGU   :221-229 -> PREC
-//! selRecord.c:135-143      DBF_DOUBLE    -> EGU   :146-165 -> PREC
+//! subArrayRecord.c:202-215 VAL/HOPR/LOPR -> EGU   :217-225 -> PREC
+//! selRecord.c:136-144      DBF_DOUBLE    -> EGU   :146-165 -> PREC
 //! subRecord.c:206-219      DBF_DOUBLE    -> EGU   :221-240 -> PREC
 //! dfanoutRecord.c:170-179  DBF_DOUBLE    -> EGU   :181-188 -> PREC
 //! sCalcoutRecord.c:607     (no gate)     -> EGU   :616     -> PREC
@@ -21,7 +21,9 @@
 //! `subArray`'s FTVL escape, and a type whose precision switch never seeds
 //! from PREC at all.
 
-use epics_base_rs::server::db_loader::create_record;
+mod module_records;
+
+use epics_base_rs::server::database::LinkBacking;
 use epics_base_rs::server::record::RecordInstance;
 use epics_base_rs::types::EpicsValue;
 
@@ -48,13 +50,13 @@ fn put(inst: &mut RecordInstance, name: &str, value: EpicsValue) {
 }
 
 fn served_with(rtype: &str, field: &str, setup: impl FnOnce(&mut RecordInstance)) -> (String, i16) {
-    let rec = create_record(rtype).unwrap_or_else(|e| panic!("{rtype}: {e:?}"));
+    let rec = module_records::create_any(rtype).unwrap_or_else(|e| panic!("{rtype}: {e:?}"));
     let mut inst = RecordInstance::new_boxed(format!("T:{rtype}"), rec);
     put(&mut inst, "EGU", EpicsValue::String("mm".into()));
     put(&mut inst, "PREC", EpicsValue::Short(3));
     setup(&mut inst);
     let d = inst
-        .snapshot_for_field(field)
+        .snapshot_for_field_with(field, LinkBacking::none())
         .unwrap_or_else(|| panic!("{rtype}.{field}: no snapshot"))
         .display
         .unwrap_or_else(|| panic!("{rtype}.{field}: no display block"));
@@ -91,7 +93,7 @@ fn a_field_outside_the_types_dbf_gate_gets_no_units() {
             "{rtype}.SELN is not DBF_DOUBLE, so C writes nothing"
         );
     }
-    // sel.A IS DBF_DOUBLE and sel has no link arm — selRecord.c:135-143 is a
+    // sel.A IS DBF_DOUBLE and sel has no link arm — selRecord.c:136-144 is a
     // bare type test, so the argument fields DO take EGU.
     assert_eq!(
         served("sel", "A").0,
@@ -101,7 +103,7 @@ fn a_field_outside_the_types_dbf_gate_gets_no_units() {
 }
 
 /// `ai` was always in the cache, and therefore served VAL's EGU on every field.
-/// C excludes the raw-conversion coefficients by name (`aiRecord.c:229-242`).
+/// C excludes the raw-conversion coefficients by name (`aiRecord.c:217-232`).
 #[test]
 fn ais_conversion_coefficients_carry_no_units() {
     for field in ["ASLO", "AOFF", "SMOO"] {
@@ -130,7 +132,7 @@ fn calcs_link_backed_arguments_take_the_links_units_not_egu() {
 }
 
 /// `subArray`'s VAL case falls through to HOPR/LOPR only when FTVL is neither
-/// STRING nor ENUM (`subArrayRecord.c:209-212`).
+/// STRING nor ENUM (`subArrayRecord.c:208-212`).
 #[test]
 fn subarrays_val_units_follow_ftvl() {
     let string_ftvl = served_with("subArray", "VAL", |inst| {

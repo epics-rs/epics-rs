@@ -10,6 +10,26 @@ pub enum ArgType {
     String,
     Int,
     Double,
+    /// C `iocshArgStringPath` (`iocsh.h:105`): "Equivalent to
+    /// iocshArgString with a hint for tab completion that the argument
+    /// is a file system path". It converts exactly as
+    /// [`ArgType::String`] (`iocsh.cpp:852-855`); the hint is read only
+    /// by the interactive completer (`iocsh.cpp:582-584`).
+    Path,
+    /// C `iocshArgStringRecord` (`iocsh.h:99`): the same string, hinted
+    /// as a record name, which the completer routes to
+    /// `iocshCompleteRecord` (`iocsh.cpp:579-580`).
+    Record,
+    /// C `iocshArgArgv` (`iocsh.h:107`): not one token but every token from
+    /// this position to the end of the line (`iocsh.cpp:1282-1285`, which
+    /// sets `aval.ac = tokenize.size() - iarg` and `aval.av =
+    /// &tokenize.argv[iarg]`). The variadic tail behind `epicsThreadShow`,
+    /// `epicsThreadResume`, `help` and `on`.
+    ///
+    /// C's `av[0]` at `iarg == 0` is the command name, which every C callback
+    /// then skips by starting at `i = 1`; the vector here carries the
+    /// arguments alone, so a handler starts at 0.
+    Argv,
 }
 
 /// Description of a single command argument.
@@ -17,7 +37,6 @@ pub enum ArgType {
 pub struct ArgDesc {
     pub name: &'static str,
     pub arg_type: ArgType,
-    pub optional: bool,
 }
 
 /// A parsed argument value.
@@ -26,16 +45,37 @@ pub enum ArgValue {
     String(String),
     Int(i64),
     Double(f64),
+    /// Every remaining token, for an [`ArgType::Argv`] parameter. Empty when
+    /// the line ended at this position — C hands the callback `ac == 0` there
+    /// rather than treating the argument as absent, so there is no `Missing`
+    /// case for this type.
+    Argv(Vec<String>),
     Missing,
 }
 
 /// Result of executing a command.
 pub enum CommandOutcome {
     Continue,
+    /// The line FAILED and the command has already said everything it is
+    /// going to say — C `iocshSetError(-1)` with no diagnostic of its own,
+    /// the shape `dbStateSetCallFunc` and friends use
+    /// (`dbIocRegister.c:534-542`, `:548-556`, `:563-571`).
+    ///
+    /// `Err(String)` means "failed AND print this"; those are two separate
+    /// facts, and a command that must fail without printing had no way to
+    /// say so. Rather than let one variant carry both meanings by context,
+    /// each combination is its own named outcome: `Continue` is neither,
+    /// `Failed` is the failure alone, `Err` is both. Every loop consumer
+    /// therefore decides "print?" and "failed?" independently instead of
+    /// inferring one from the other.
+    Failed,
     Exit,
 }
 
 /// Command result type.
+///
+/// `Err(msg)` is C's "print `msg` AND mark the line errored"; the silent
+/// failure is [`CommandOutcome::Failed`] on the `Ok` side.
 pub type CommandResult = Result<CommandOutcome, String>;
 
 /// Trait for command handlers.
@@ -54,16 +94,27 @@ where
 
 /// A registered command definition.
 ///
-/// `handler` is `Arc`-backed so a `CommandDef` can be cloned and
-/// re-registered on a fresh `IocShell` (used by the
-/// `afterIocRunning` post-init shell — without Clone, custom
-/// site-specific commands registered via
-/// `IocApplication::register_shell_command` would be unavailable
-/// in the post-init queue).
+/// `handler` is `Arc`-backed because the clone is the dispatch lookup's
+/// result: the shell takes the registry's read guard, clones the entry,
+/// drops the guard, and only then calls — C's shape, where `registryFind`
+/// returns and `(*found->def.func)(&argBuf[0])` runs with nothing held
+/// (`iocsh.cpp:1258-1281`). With one process-wide table that is
+/// load-bearing rather than stylistic: a handler may register more
+/// commands while it runs, so holding the guard across the call
+/// deadlocks the script's `iocInit` line against its own registrations.
+/// A clone therefore duplicates the name, usage and arg descriptors and
+/// shares the one handler, never a second command.
 #[derive(Clone)]
 pub struct CommandDef {
     pub name: String,
     pub args: Vec<ArgDesc>,
+    /// C `iocshFuncDef.usage` (`iocsh.h:126`): the DESCRIPTION only.
+    ///
+    /// `help` renders the synopsis line itself from `name` and `args`
+    /// (`iocsh.cpp:956-969`), so repeating it here prints it twice. Most
+    /// of this port's commands were written before `help` had that
+    /// shape and still open with `"<name> <args> — "`; new ones should
+    /// not.
     pub usage: String,
     pub handler: Arc<dyn CommandHandler>,
 }
@@ -96,7 +147,45 @@ pub struct CommandContext {
     /// standalone shells that administer no server.
     acf: crate::server::access_security::AcfCell,
     /// Output writer — defaults to stdout, redirected to a file by `>` / `>>`.
+    ///
+    /// C's `epicsSetThreadStdout` (`iocsh.cpp:417`), which `startRedirect`
+    /// swaps for the duration of one command line.
     output: std::cell::RefCell<Box<dyn std::io::Write>>,
+    /// Diagnostic writer — defaults to stderr, redirected by `2>` / `2>>`.
+    ///
+    /// C's `epicsSetThreadStderr` (`iocsh.cpp:422`). It is a SEPARATE cell
+    /// from `output` for the same reason C keeps a separate FILE*: a `2>`
+    /// redirect must leave stdout alone, so `dbl 2>/dev/null` still prints its
+    /// listing. Every shell diagnostic goes through [`Self::eprintln`]; a bare
+    /// `eprintln!` would bypass the swap and is what made `2>` inert.
+    error: std::cell::RefCell<Box<dyn std::io::Write>>,
+    /// Input reader — defaults to stdin, redirected by `<`.
+    ///
+    /// C's `epicsSetThreadStdin` (`iocsh.cpp:412`). No built-in command reads
+    /// it today; it exists so the `<` redirect performs C's swap rather than
+    /// being silently dropped, and so a command that needs input has the same
+    /// seam its C counterpart reads.
+    input: std::cell::RefCell<Box<dyn std::io::BufRead>>,
+    /// The owning shell's live command table, weakly held.
+    ///
+    /// C needs no such field: its command table IS the registry every other
+    /// kind lives in — `iocshRegister` does `registryAdd(iocshCmdID, ...)`
+    /// (`iocsh.cpp:171`) and lookup is `registryFind(iocshCmdID, name)`
+    /// (`:200`) — so anything holding the process can walk it. This port
+    /// keeps the table on the shell instead, which leaves `registryDump`,
+    /// the one command that must read the whole of it, with nothing to read.
+    /// Weak so a context can never keep its shell alive, and empty for a
+    /// context built standalone: no shell owns it, so it has no commands.
+    ///
+    /// It cannot dangle either, and not by luck: the only context that ever
+    /// holds a live handle is [`IocShell::ctx`](crate::server::iocsh::IocShell),
+    /// owned by value inside the very shell whose `Arc` it points at, and
+    /// `CommandContext` is not `Clone`, so a handler cannot outlive the
+    /// registry it is reading. `upgrade()` returning `None` therefore means
+    /// "this context has no shell", never "the table was freed underneath
+    /// me" — and a handler that reaches it sees an empty command list rather
+    /// than a stale or resurrected one.
+    commands: std::cell::RefCell<std::sync::Weak<std::sync::RwLock<CommandRegistry>>>,
 }
 
 impl CommandContext {
@@ -121,7 +210,35 @@ impl CommandContext {
             bridge,
             acf,
             output: std::cell::RefCell::new(Box::new(std::io::stdout())),
+            error: std::cell::RefCell::new(Box::new(std::io::stderr())),
+            input: std::cell::RefCell::new(Box::new(std::io::BufReader::new(std::io::stdin()))),
+            commands: std::cell::RefCell::new(std::sync::Weak::new()),
         }
+    }
+
+    /// Attach the shell's live command table, so `registryDump` can print
+    /// C's `iocshCmd` registry. Called once by [`crate::server::iocsh::IocShell`].
+    pub(crate) fn set_command_registry(&self, reg: &Arc<std::sync::RwLock<CommandRegistry>>) {
+        *self.commands.borrow_mut() = Arc::downgrade(reg);
+    }
+
+    /// C's `iocshCmd` registry as `(name, entry address)`, sorted by name.
+    ///
+    /// Empty when no shell owns this context, which is the truth rather than
+    /// a gap: C's table is a process global that exists from the first
+    /// `iocshRegister`, and a port context with no shell has registered none.
+    pub(crate) fn command_entries(&self) -> Vec<(String, usize)> {
+        let Some(reg) = self.commands.borrow().upgrade() else {
+            return Vec::new();
+        };
+        let guard = reg.read().unwrap_or_else(|e| e.into_inner());
+        let mut entries: Vec<(String, usize)> = guard
+            .list()
+            .into_iter()
+            .map(|name| (name.to_string(), name.as_ptr() as usize))
+            .collect();
+        entries.sort_by(|a, b| a.0.cmp(&b.0));
+        entries
     }
 
     /// Access the PV database.
@@ -166,6 +283,50 @@ impl CommandContext {
         let _ = writeln!(out);
     }
 
+    /// Print a line to the current DIAGNOSTIC stream (stderr, or the file a
+    /// `2>` redirect installed) — C `fprintf(epicsGetThreadStderr(), ...)`.
+    pub fn eprintln(&self, msg: &str) {
+        let mut err = self.error.borrow_mut();
+        let _ = writeln!(err, "{msg}");
+    }
+
+    /// Read one line from the current INPUT stream (stdin, or the file a `<`
+    /// redirect installed) — C `fgets(..., epicsGetThreadStdin())`. `Ok(0)`
+    /// is end of input.
+    pub fn read_line(&self, buf: &mut String) -> std::io::Result<usize> {
+        let mut input = self.input.borrow_mut();
+        input.read_line(buf)
+    }
+
+    /// Temporarily redirect the DIAGNOSTIC stream, run a closure, then
+    /// restore — C `startRedirect`/`stopRedirect` for fd 2.
+    pub(crate) fn with_error<W: std::io::Write + 'static, R>(
+        &self,
+        writer: W,
+        f: impl FnOnce() -> R,
+    ) -> R {
+        let prev = self.error.replace(Box::new(writer));
+        let result = f();
+        let _ = self.error.borrow_mut().flush();
+        self.error.replace(prev);
+        result
+    }
+
+    /// Temporarily redirect the INPUT stream, run a closure, then restore —
+    /// C `startRedirect`/`stopRedirect` for fd 0.
+    pub(crate) fn with_input<R: std::io::Read + 'static, T>(
+        &self,
+        reader: R,
+        f: impl FnOnce() -> T,
+    ) -> T {
+        let prev = self
+            .input
+            .replace(Box::new(std::io::BufReader::new(reader)));
+        let result = f();
+        self.input.replace(prev);
+        result
+    }
+
     /// Temporarily redirect output to a writer, run a closure, then restore.
     pub(crate) fn with_output<W: std::io::Write + 'static, R>(
         &self,
@@ -191,17 +352,40 @@ impl CommandContext {
 /// Registry of all available commands.
 pub(crate) struct CommandRegistry {
     commands: HashMap<String, CommandDef>,
+    /// Every name a later [`CommandRegistry::register`] displaced.
+    ///
+    /// Replacement is C's behaviour — `iocshRegister` overwrites the
+    /// entry when the name is already in its list (`iocsh.cpp:684-700`),
+    /// which is how a support module legitimately takes a name over —
+    /// so this must not refuse. But the port's own built-in table is
+    /// assembled from one file per C registrar, and two of those
+    /// claiming one name is a build defect that `HashMap::insert`
+    /// swallows in silence: the merged tree registers one of them and
+    /// nothing fails. Recording the displacement is what lets
+    /// `register_builtins` assert the table is collision-free, so two
+    /// panels adding families in parallel cannot auto-merge into a tree
+    /// neither of them tested.
+    displaced: Vec<String>,
 }
 
 impl CommandRegistry {
     pub fn new() -> Self {
         Self {
             commands: HashMap::new(),
+            displaced: Vec::new(),
         }
     }
 
     pub fn register(&mut self, def: CommandDef) {
-        self.commands.insert(def.name.clone(), def);
+        let name = def.name.clone();
+        if self.commands.insert(name.clone(), def).is_some() {
+            self.displaced.push(name);
+        }
+    }
+
+    /// The names registered more than once, in the order they collided.
+    pub fn displaced(&self) -> &[String] {
+        &self.displaced
     }
 
     pub fn get(&self, name: &str) -> Option<&CommandDef> {
@@ -220,7 +404,7 @@ impl CommandRegistry {
 /// C++ syntax: `command("arg1", arg2, $(VAR))` — parens delimit args, commas separate.
 /// Legacy syntax: `command "arg1" arg2` — whitespace separates.
 ///
-/// C parity (`iocsh.cpp:1190` `macDefExpand` → `:1215` `tokenize.split`):
+/// C parity (`iocsh.cpp:1184` `macDefExpand` → `:1215` `tokenize.split`):
 /// macros are expanded across the WHOLE line *before* it is split into
 /// words, and `split` itself expands nothing. So a macro whose value
 /// contains a separator (`$(CMD)` with `CMD="dbpr REC 2"`) is
@@ -499,7 +683,7 @@ pub(crate) fn lint_line(line: &str) -> Option<&'static str> {
         scan.feed(b);
     }
     // C reports these after the same loop, from the same two pieces of
-    // state (`iocsh.cpp:349-360`).
+    // state (`iocsh.cpp:362-371`).
     if scan.unbalanced_quote() {
         return Some("Unbalanced quote.");
     }
@@ -515,8 +699,8 @@ pub(crate) fn lint_line(line: &str) -> Option<&'static str> {
 /// C keeps a single `quote` character — which remembers *which* quote
 /// opened, so only the matching one closes it — and a single
 /// `backslash` flag, and gates every syntactic decision it makes on
-/// `!quote && !backslash`: the separator test at `:272`, the whole
-/// redirect block at `:274-303`, and quote termination at `:306`. A
+/// `!quote && !backslash`: the separator test at `:271`, the whole
+/// redirect block at `:274-303`, and quote termination at `:307-308`. A
 /// scanner that tracks a subset of that state disagrees with the
 /// tokenizer about where a token ends, which is how a `>` inside a
 /// single-quoted argument became a redirect and truncated a file.
@@ -576,7 +760,7 @@ impl ShellScan {
 /// bit pattern reinterpreted into the signed `long`), and an empty arg
 /// defaults to 0. Trailing non-numeric characters are rejected, matching
 /// C's `if (*endp)` "Invalid integer" check.
-fn parse_iocsh_int(token: &str) -> Result<i64, ()> {
+pub(super) fn parse_iocsh_int(token: &str) -> Result<i64, ()> {
     // C `if (arg && *arg)` — an empty token defaults to 0.
     if token.is_empty() {
         return Ok(0);
@@ -625,26 +809,60 @@ pub(crate) fn parse_args(tokens: &[String], descs: &[ArgDesc]) -> Result<Vec<Arg
     let mut result = Vec::with_capacity(descs.len());
 
     for (i, desc) in descs.iter().enumerate() {
-        if i < tokens.len() {
-            let token = &tokens[i];
-            let val = match desc.arg_type {
-                ArgType::String => ArgValue::String(token.clone()),
-                ArgType::Int => parse_iocsh_int(token).map(ArgValue::Int).map_err(|_| {
-                    format!(
-                        "argument '{}': expected integer, got '{}'",
-                        desc.name, token
-                    )
-                })?,
-                ArgType::Double => token.parse::<f64>().map(ArgValue::Double).map_err(|_| {
-                    format!("argument '{}': expected number, got '{}'", desc.name, token)
-                })?,
-            };
-            result.push(val);
-        } else if desc.optional {
-            result.push(ArgValue::Missing);
-        } else {
-            return Err(format!("missing required argument '{}'", desc.name));
+        // `iocshArgArgv` is the rest of the line, not a token, so it is
+        // defined at every position — including one past the last token,
+        // where C builds an empty `ac`/`av` rather than reporting a missing
+        // argument.
+        if matches!(desc.arg_type, ArgType::Argv) {
+            result.push(ArgValue::Argv(tokens.get(i..).unwrap_or(&[]).to_vec()));
+            continue;
         }
+        // C hands `cvtArg` the token or NULL and never reports an absent
+        // one: `iocsh.cpp:1294-1296` passes NULL once the tokens run out,
+        // and every `cvtArg` arm defaults rather than failing — `ival = 0`,
+        // `dval = 0.0`, `sval = arg` (so NULL). Its own comment
+        // (`iocsh.cpp:809-812`) states the intent outright: "a double/int
+        // with no value will default to 0 which may allow you to add
+        // optional arguments to the end of your argument list."
+        //
+        // So arity is not the shell's rule to enforce. A command that needs
+        // an argument checks it itself and prints its own usage — measured,
+        // `dbLoadRecords` with no token answers `Usage: dbLoadRecords
+        // "file", "subs"` and fails the line from inside the command, not
+        // from here. Rejecting here instead made the port refuse lines C
+        // runs, and under `on error break` it stopped the script a line
+        // early (`libcom/test/iocshTestSuccess.cmd:8`, the argument-less
+        // `epicsThreadSleep`).
+        let Some(token) = tokens.get(i) else {
+            result.push(ArgValue::Missing);
+            continue;
+        };
+        let val = match desc.arg_type {
+            // `iocsh.cpp:852-855` converts all three string types
+            // through one `argBuf->sval = arg` arm — `Path` and
+            // `Record` differ from `String` only in completion. An empty
+            // token is a token: C stores `""`, not NULL, so it stays
+            // distinguishable from an absent one.
+            ArgType::String | ArgType::Path | ArgType::Record => ArgValue::String(token.clone()),
+            // The numeric arms guard on `if (arg && *arg)`
+            // (`iocsh.cpp:820`, `:843`), which collapses an EMPTY token
+            // into the same default as an absent one. Only a non-empty
+            // token that fails to parse is an error.
+            ArgType::Int | ArgType::Double if token.is_empty() => ArgValue::Missing,
+            ArgType::Int => parse_iocsh_int(token).map(ArgValue::Int).map_err(|_| {
+                format!(
+                    "argument '{}': expected integer, got '{}'",
+                    desc.name, token
+                )
+            })?,
+            ArgType::Double => token.parse::<f64>().map(ArgValue::Double).map_err(|_| {
+                format!("argument '{}': expected number, got '{}'", desc.name, token)
+            })?,
+            // Handled above: an `Argv` parameter never reaches the
+            // one-token path.
+            ArgType::Argv => unreachable!(),
+        };
+        result.push(val);
     }
 
     Ok(result)
@@ -782,7 +1000,6 @@ mod tests {
         let descs = vec![ArgDesc {
             name: "name",
             arg_type: ArgType::String,
-            optional: false,
         }];
         let tokens = vec!["TEMP".to_string()];
         let result = parse_args(&tokens, &descs).unwrap();
@@ -794,21 +1011,119 @@ mod tests {
         let descs = vec![ArgDesc {
             name: "type",
             arg_type: ArgType::String,
-            optional: true,
         }];
         let result = parse_args(&[], &descs).unwrap();
         assert!(matches!(&result[0], ArgValue::Missing));
     }
 
+    /// C's one uniform rule, by boundary rather than by story. `cvtArg`
+    /// (`iocsh.cpp:813-895`) is reached for every declared parameter with
+    /// either the token or NULL, so the boundaries are: token absent, token
+    /// present but empty, token present and well formed, token present and
+    /// malformed — crossed with the type, which is the only thing that
+    /// decides the default. A descriptor carries a name and a type and
+    /// nothing else, so there is nothing left for the rule to depend on.
     #[test]
-    fn test_parse_args_missing_required() {
+    fn a_parameter_with_no_token_takes_its_types_default() {
+        for (arg_type, what) in [
+            (ArgType::String, "string"),
+            (ArgType::Path, "path"),
+            (ArgType::Record, "record"),
+            (ArgType::Int, "int"),
+            (ArgType::Double, "double"),
+        ] {
+            let descs = vec![ArgDesc {
+                name: "only",
+                arg_type,
+            }];
+            let got = parse_args(&[], &descs)
+                .unwrap_or_else(|e| panic!("a missing {what} must not fail the line: {e}"));
+            assert!(
+                matches!(&got[0], ArgValue::Missing),
+                "a missing {what} must reach the command as Missing, got {:?}",
+                got[0]
+            );
+        }
+    }
+
+    /// `cvtArg`'s numeric arms guard on `if (arg && *arg)`, so an empty
+    /// token defaults exactly like an absent one — but the string arm is
+    /// `sval = arg`, which keeps `""` distinct from NULL.
+    #[test]
+    fn an_empty_token_defaults_for_numbers_and_stays_empty_for_strings() {
+        let empty = vec![String::new()];
+        for arg_type in [ArgType::Int, ArgType::Double] {
+            let descs = vec![ArgDesc {
+                name: "only",
+                arg_type,
+            }];
+            let got = parse_args(&empty, &descs).expect("an empty numeric token is C's 0");
+            assert!(matches!(&got[0], ArgValue::Missing), "got {:?}", got[0]);
+        }
         let descs = vec![ArgDesc {
-            name: "name",
+            name: "only",
             arg_type: ArgType::String,
-            optional: false,
         }];
-        let result = parse_args(&[], &descs);
-        assert!(result.is_err());
+        let got = parse_args(&empty, &descs).expect("an empty string token is C's \"\"");
+        assert!(
+            matches!(&got[0], ArgValue::String(s) if s.is_empty()),
+            "got {:?}",
+            got[0]
+        );
+    }
+
+    /// Only a NON-EMPTY token that does not parse is an error — that arm of
+    /// `cvtArg` is the one that returns 0 and stops the argument loop, so
+    /// the command is never called.
+    #[test]
+    fn a_malformed_non_empty_token_is_still_an_error() {
+        for (arg_type, token) in [(ArgType::Int, "xyz"), (ArgType::Double, "xyz")] {
+            let descs = vec![ArgDesc {
+                name: "only",
+                arg_type,
+            }];
+            assert!(parse_args(&[token.to_string()], &descs).is_err());
+        }
+    }
+
+    /// C stops converting at `nargs`; surplus tokens are simply not read
+    /// (`iocsh.cpp:1270-1300` iterates the DESCRIPTORS). Measured on C:
+    /// `epicsThreadSleep 0.0 extra` runs without complaint.
+    #[test]
+    fn a_surplus_token_is_ignored_not_rejected() {
+        let descs = vec![ArgDesc {
+            name: "seconds",
+            arg_type: ArgType::Double,
+        }];
+        let tokens = vec!["0.0".to_string(), "extra".to_string()];
+        let got = parse_args(&tokens, &descs).expect("a surplus token is not an error");
+        assert_eq!(got.len(), 1);
+        assert!(matches!(&got[0], ArgValue::Double(d) if *d == 0.0));
+    }
+
+    /// The shortfall may be several parameters deep, and each one takes its
+    /// own type's default rather than the first absence ending the line.
+    #[test]
+    fn every_parameter_past_the_last_token_defaults_independently() {
+        let descs = vec![
+            ArgDesc {
+                name: "file",
+                arg_type: ArgType::Path,
+            },
+            ArgDesc {
+                name: "level",
+                arg_type: ArgType::Int,
+            },
+            ArgDesc {
+                name: "subs",
+                arg_type: ArgType::String,
+            },
+        ];
+        let got = parse_args(&["only.db".to_string()], &descs).expect("a short line still runs");
+        assert_eq!(got.len(), 3);
+        assert!(matches!(&got[0], ArgValue::String(s) if s == "only.db"));
+        assert!(matches!(&got[1], ArgValue::Missing));
+        assert!(matches!(&got[2], ArgValue::Missing));
     }
 
     #[test]
@@ -816,7 +1131,6 @@ mod tests {
         let descs = vec![ArgDesc {
             name: "level",
             arg_type: ArgType::Int,
-            optional: false,
         }];
         let tokens = vec!["42".to_string()];
         let result = parse_args(&tokens, &descs).unwrap();
@@ -828,7 +1142,6 @@ mod tests {
         let descs = vec![ArgDesc {
             name: "level",
             arg_type: ArgType::Int,
-            optional: false,
         }];
         let tokens = vec!["abc".to_string()];
         assert!(parse_args(&tokens, &descs).is_err());
@@ -870,7 +1183,6 @@ mod tests {
         let descs = vec![ArgDesc {
             name: "mask",
             arg_type: ArgType::Int,
-            optional: false,
         }];
         let result = parse_args(&["0x10".to_string()], &descs).unwrap();
         assert!(matches!(&result[0], ArgValue::Int(16)));
@@ -881,7 +1193,6 @@ mod tests {
         let descs = vec![ArgDesc {
             name: "value",
             arg_type: ArgType::Double,
-            optional: false,
         }];
         let tokens = vec!["3.14".to_string()];
         let result = parse_args(&tokens, &descs).unwrap();

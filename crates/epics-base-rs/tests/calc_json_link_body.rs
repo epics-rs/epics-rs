@@ -122,6 +122,54 @@ fn one_arg_over_calc_nargs_refuses_the_link() {
     );
 }
 
+/// BOUNDARY: a single-quoted string. yajl lexes `'…'` and `"…"` with the same
+/// routine, so both are strings in this dialect, and base's own test database
+/// writes the calc expression that way: `linkRetargetLink.db:20-23` loads
+/// `rec:j1.INP` as `{calc:{expr:'A+5', args:5}}` with `PINI YES`.
+#[test]
+fn a_single_quoted_expression_parses() {
+    let calc = calc_of(r#"{calc:{expr:'A+5', args:[3]}}"#);
+    assert_eq!(calc.expr, "A+5");
+    assert_eq!(calc.args, vec![CalcArg::Literal(3.0)]);
+}
+
+/// BOUNDARY: a single-quoted string with a `"` inside it. The quote characters
+/// are the delimiter, not part of the value, so re-spelling the token must
+/// escape what the new delimiter would otherwise end.
+#[test]
+fn a_single_quoted_string_may_contain_a_double_quote() {
+    let calc = calc_of(r#"{calc:{expr:'A', args:[{const:'say "hi"'}]}}"#);
+    assert_eq!(calc.expr, "A");
+    assert_eq!(
+        calc.args,
+        vec![CalcArg::Link(Box::new(ParsedLink::Constant(
+            "say \"hi\"".to_string()
+        )))]
+    );
+}
+
+/// BOUNDARY: `args` as a bare scalar rather than an array. C reaches
+/// `lnkCalc_integer` (`lnkCalc.c:130-141`) / `lnkCalc_double` (`:150-161`) at
+/// `ps_args` and appends the number, and `lnkCalc_start_array` (`:319-329`)
+/// only makes the bracketed spelling legal at the same state — so both are
+/// accepted, and `linkRetargetLink.db:22` uses the scalar one.
+#[test]
+fn a_scalar_args_value_is_one_argument() {
+    let calc = calc_of(r#"{calc:{expr:'A+5', args:5}}"#);
+    assert_eq!(calc.expr, "A+5");
+    assert_eq!(calc.args, vec![CalcArg::Literal(5.0)]);
+}
+
+/// BOUNDARY: the exact text base loads in its own test suite
+/// (`linkRetargetLink.db:20-23`), whitespace and line breaks included.
+#[test]
+fn base_link_retarget_test_database_form_parses() {
+    let calc =
+        calc_of("{calc:{\n                expr:'A+5',\n                args:5\n             }}");
+    assert_eq!(calc.expr, "A+5");
+    assert_eq!(calc.args, vec![CalcArg::Literal(5.0)]);
+}
+
 /// BOUNDARY: `time` at the top of C's range. `'A' + CALCPERFORM_NARGS - 1`
 /// is `'U'`, the last letter `toupper`-folded validation accepts.
 #[test]
@@ -138,17 +186,95 @@ fn time_lowercase_u_is_accepted_and_folded() {
     assert_eq!(calc.time_source, Some('U'));
 }
 
-/// BOUNDARY: one past the top of the range. `'V'` is `'A' + 21`, which fails
-/// C's `tinp >= 'A' + CALCPERFORM_NARGS` test and stops the parse.
+/// BOUNDARY: the relaxed form must not DEGRADE. The failure this pins is not
+/// "refused" but "accepted as something else": a reader that demands strict
+/// JSON falls through the brace test and builds a `ParsedLink::Db` whose
+/// record name is the whole JSON blob — a channel that can never connect, and
+/// one that reports no error at load.
+///
+/// The three places base itself writes the relaxed form, at `R7.0.10`:
+/// `linkRetargetLink.db:20-23` (single-quoted `expr`, unbracketed `args`,
+/// across four lines), `lnkCalcTest.c:56-59`, and `linkRetargetLinkTest.c:81`
+/// (`{calc:{expr:'A+5',args:[7]}}`, put at run time; `:78` is the `args:5`
+/// spelling of the same link).
 #[test]
-fn time_v_refuses_the_link() {
-    assert!(
-        !matches!(
-            parse_link_v2(r#"{calc:{expr:"A", time:"V"}}"#),
-            ParsedLink::Calc(_)
+fn the_relaxed_form_does_not_degrade_to_a_db_link() {
+    for body in [
+        "{calc:{\n                expr:'A+5',\n                args:5\n             }}",
+        "{calc:{expr:'A+5',args:5}}",
+        "{calc:{expr:'A+5',args:[7]}}",
+        "{calc:{expr:'a',args:[{const:1}]}}",
+    ] {
+        let parsed = parse_link_v2(body);
+        assert!(
+            !matches!(parsed, ParsedLink::Db(_)),
+            "{body} must not degrade to a Db link whose record name is the \
+             JSON blob, got {parsed:?}"
+        );
+        assert!(
+            matches!(parsed, ParsedLink::Calc(_)),
+            "{body} is a calc link base loads, got {parsed:?}"
+        );
+    }
+}
+
+/// BOUNDARY: every arm of C's `time` guard refuses the WHOLE link.
+///
+/// `lnkCalc.c:180-182` is one test with three arms —
+/// `len != 1 || (tinp = toupper(val[0])) < 'A' || tinp >= 'A' + CALCPERFORM_NARGS`
+/// — and each returns `jlif_stop`, which `dbJLinkParse` turns into
+/// `S_db_badField` (`dbJLink.c:426-438`): the field never loads. A `time`
+/// value that is not a string at all reaches `lnkCalc_integer` (`:130-133`)
+/// or `lnkCalc_double` (`:150-153`) in `ps_time` and stops there.
+///
+/// The refusal is the point, and it is why this asserts `ParsedLink::None`
+/// rather than merely "not a Calc". The defect this pins had the port set
+/// `time_source: None` and CONTINUE, which builds a live calc link that
+/// silently takes the record's own stamp instead of the input's; the other
+/// reachable wrong answer is a `ParsedLink::Db` whose record name is the
+/// whole JSON blob. Both are excluded here by naming the outcome.
+#[test]
+fn every_bad_time_value_refuses_the_whole_link() {
+    for (body, why) in [
+        (
+            r#"{calc:{expr:"A", time:"V"}}"#,
+            "'V' is 'A' + 21, one past the top",
         ),
-        "'V' is out of the A..U range and must refuse the link"
+        (r#"{calc:{expr:"A", time:"Z"}}"#, "well past the top"),
+        (r#"{calc:{expr:"A", time:""}}"#, "len != 1 (empty)"),
+        (
+            r#"{calc:{expr:"A", time:"AB"}}"#,
+            "len != 1 (two characters)",
+        ),
+        (r#"{calc:{expr:"A", time:"1"}}"#, "toupper('1') < 'A'"),
+        (r#"{calc:{expr:"A", time:"@"}}"#, "'@' is 'A' - 1"),
+        (r#"{calc:{expr:"A", time:5}}"#, "not a string at all"),
+    ] {
+        assert_eq!(
+            parse_link_v2(body),
+            ParsedLink::None,
+            "{body} must refuse the link — {why}"
+        );
+    }
+}
+
+/// The counter-boundary, so the fix cannot be "refuse everything": the two
+/// ends of the accepted range and the case fold still build the link.
+#[test]
+fn the_accepted_time_range_still_builds_the_link() {
+    assert_eq!(
+        calc_of(r#"{calc:{expr:"A", time:"A"}}"#).time_source,
+        Some('A')
     );
+    assert_eq!(
+        calc_of(r#"{calc:{expr:"A", time:"U"}}"#).time_source,
+        Some('U')
+    );
+    assert_eq!(
+        calc_of(r#"{calc:{expr:"A", time:"a"}}"#).time_source,
+        Some('A')
+    );
+    assert_eq!(calc_of(r#"{calc:{expr:"A"}}"#).time_source, None);
 }
 
 /// The end-to-end trigger, in the shape a `.db` carries it: base's own

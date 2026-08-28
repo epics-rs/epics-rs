@@ -27,7 +27,10 @@ use epics_base_rs::server::record::{
 
 fn db_target(link: &str) -> String {
     match parse_link_v2(link) {
-        ParsedLink::Db(l) => format!("{}.{}", l.record, l.field),
+        ParsedLink::Db(l) => {
+            let t = l.target();
+            format!("{}.{}", t.record, t.field)
+        }
         ParsedLink::Ca(l) => l.pv,
         other => panic!("{link:?} classified as {other:?}, expected a PV link"),
     }
@@ -48,7 +51,7 @@ fn link_modifier_split_runs_after_the_constant_test() {
     // The modifiers still parse off the tail of such a link.
     match parse_link_v2("5 PP MS") {
         ParsedLink::Db(l) => {
-            assert_eq!(l.record, "5");
+            assert_eq!(l.pvname(), "5");
             assert_eq!(
                 l.policy,
                 LinkProcessPolicy::ProcessPassive,
@@ -76,9 +79,9 @@ fn link_modifier_split_runs_after_the_constant_test() {
 /// not silently drop the write into a constant.
 #[test]
 fn out_and_fwd_links_take_the_same_classification() {
-    assert!(matches!(parse_output_link_v2("5 PP"), ParsedLink::Db(l) if l.record == "5"));
+    assert!(matches!(parse_output_link_v2("5 PP"), ParsedLink::Db(l) if l.pvname() == "5"));
     assert!(matches!(parse_output_link_v2("5"), ParsedLink::Constant(_)));
-    assert!(matches!(parse_forward_link_v2("5 PP"), ParsedLink::Db(l) if l.record == "5"));
+    assert!(matches!(parse_forward_link_v2("5 PP"), ParsedLink::Db(l) if l.pvname() == "5"));
     assert!(matches!(
         parse_forward_link_v2("5"),
         ParsedLink::Constant(_)

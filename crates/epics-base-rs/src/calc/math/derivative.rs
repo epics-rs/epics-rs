@@ -1,7 +1,7 @@
-//! aCalc's DERIV and NDERIV (`calcUtil.c:27-74`).
+//! aCalc's DERIV and NDERIV (`calcUtil.c:27-75`).
 //!
 //! Both are the SAME kernel — `deriv()` is literally `nderiv(..., npts=2, ...)`
-//! (`:70-74`) — and that kernel is a **sliding QUADRATIC fit**, not a difference
+//! (`:71-75`) — and that kernel is a **sliding QUADRATIC fit**, not a difference
 //! formula and not a linear regression:
 //!
 //! ```c
@@ -17,7 +17,7 @@
 
 use crate::calc::math::fitting;
 
-/// C `deriv` (`calcUtil.c:70-74`) — `nderiv` with `npts = 2`, i.e. a five-point
+/// C `deriv` (`calcUtil.c:71-75`) — `nderiv` with `npts = 2`, i.e. a five-point
 /// sliding quadratic fit. Compiled C confirms the identity: for `AA=[0,1,10,3,4,5,6,7,20]`,
 /// `DERIV(AA)` and `NDERIV(AA,2)` are the same nine numbers.
 pub fn deriv(y: &[f64]) -> Option<Vec<f64>> {
@@ -40,7 +40,7 @@ pub fn deriv(y: &[f64]) -> Option<Vec<f64>> {
 /// again `0, 1, 2, ...`.
 ///
 /// `None` is C's `return(e)` — the fit failed, which for `m < 3` is `fitpoly`'s
-/// `n < 3` rejection (`calcUtil.c:270`). Compiled C: `NDERIV(AA,0)` is status -1.
+/// `n < 3` rejection (`calcUtil.c:271`). Compiled C: `NDERIV(AA,0)` is status -1.
 ///
 /// # The clamp, and the one deliberate deviation
 ///
@@ -63,7 +63,7 @@ pub fn nderiv(y: &[f64], npts: i64) -> Option<Vec<f64>> {
     let npts = npts.min((n as i64 - 1) / 2);
     let m = 2 * npts + 1;
     if m < 3 {
-        // `fitpoly` needs three points for three coefficients (`calcUtil.c:270`).
+        // `fitpoly` needs three points for three coefficients (`calcUtil.c:271`).
         return None;
     }
     let m = m as usize;

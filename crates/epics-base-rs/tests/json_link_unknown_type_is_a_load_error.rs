@@ -25,6 +25,30 @@ use epics_base_rs::server::ioc_builder::IocBuilder;
 use epics_base_rs::server::record::{LinkFieldType, ParsedLink, parse_link_field};
 use epics_base_rs::types::EpicsValue;
 
+/// Why the load refused `text`. C reports the refusal at the field
+/// (`dbJLinkInit: Link type '%s' not found`) and `dbLoadRecords` returns
+/// only a status, which is all [`load_out`] can hand back, so the reason
+/// is asked of `apply_fields` — the step the builder calls per record.
+fn reason(text: &str) -> String {
+    let db = format!("record(bo, \"TRIG\") {{\n    field(OUT, \"{text}\")\n}}\n");
+    let defs = epics_base_rs::server::db_loader::parse_db(&db, &HashMap::new())
+        .expect("parse is fine — the refusal happens at field application");
+    for def in defs {
+        let mut record = epics_base_rs::server::db_loader::create_record_with_factories(
+            &def.record_type,
+            &HashMap::new(),
+        )
+        .unwrap_or_else(|e| panic!("{}: create_record failed: {e}", def.record_type));
+        let mut common = Vec::new();
+        if let Err(e) =
+            epics_base_rs::server::db_loader::apply_fields(&mut record, &def.fields, &mut common)
+        {
+            return e.to_string();
+        }
+    }
+    panic!("no link was refused in: {db}");
+}
+
 /// Load one record whose OUT carries `text`, and return the load's verdict.
 async fn load_out(text: &str) -> Result<(), String> {
     let db = format!("record(bo, \"TRIG\") {{\n    field(OUT, \"{text}\")\n}}\n");
@@ -41,9 +65,10 @@ async fn load_out(text: &str) -> Result<(), String> {
 /// names the type; the port must too, and must build no link at all.
 #[epics_macros_rs::epics_test]
 async fn an_unknown_json_link_type_fails_the_load_naming_the_type() {
-    let err = load_out(r#"{'nosuch':1}"#)
+    load_out(r#"{'nosuch':1}"#)
         .await
         .expect_err("C `dbFindLinkSup` misses and `dbJLinkParse` returns S_db_badField");
+    let err = reason(r#"{'nosuch':1}"#);
 
     assert!(
         err.contains("nosuch"),
@@ -59,21 +84,36 @@ async fn an_unknown_json_link_type_fails_the_load_naming_the_type() {
     );
 }
 
-/// BOUNDARY: a key epics-base DOES register (`links.dbd.pod:171`, lset at
-/// `lnkState.c:213-224`) but this port has not implemented. It is rejected
-/// like an unknown type, because a missing implementation must be visible
-/// rather than degrade into a dead CA link — this is the brief's
-/// `field(OUT,{"state":"BUSY"})`.
+/// DEVIATION from C, deliberate and the same one the file's other tests
+/// state: a key epics-base DOES register (`links.dbd.pod:208`, jlif at
+/// `lnkDebug.c:1030`) but this port has not implemented is rejected like an
+/// unknown type, because a missing implementation must be visible rather
+/// than degrade into a dead link.
+///
+/// C loads it. Measured on softIoc R7.0.10 with
+/// `record(ai,"K1"){field(INP,"{debug:{const:1}}")}` and the `trace`
+/// equivalent: both records load, `dbl` lists them, and after `iocInit`
+/// `dbgf K1` is 1 and `dbgf K2` is 2 with the trace lines printed. So this
+/// assertion is the port refusing what C accepts, not a shared rule.
+///
+/// The example used to be `state`, which this port now implements. `debug`
+/// and `trace` are the two of C's five that remain, and they remain for a
+/// structural reason rather than for want of writing: both are lset
+/// *wrappers* — `lnkDebug.c:337-490` forwards every lset method to a child
+/// link's lset and prints around it — and this port dispatches a link by its
+/// `ParsedLink` variant, with no per-link vtable for them to wrap.
 #[epics_macros_rs::epics_test]
 async fn a_registered_but_unported_json_link_type_fails_the_load() {
-    let err = load_out(r#"{'state':'BUSY'}"#)
-        .await
-        .expect_err("the port has no state link support to build");
+    let db = "record(ai, \"K1\") {\n    field(INP, \"{debug:{const:1}}\")\n}\n";
+    let built = match IocBuilder::new().db_string(db, &HashMap::new()) {
+        Err(e) => Err(e.to_string()),
+        Ok(b) => b.build().await.map(|_| ()).map_err(|e| e.to_string()),
+    };
+    built.expect_err("the port has no debug link support to build");
 
-    assert!(
-        err.contains("state"),
-        "the diagnostic must name the type — got {err}"
-    );
+    let ParsedLink::None = parse_link_field(r#"{debug:{const:1}}"#, LinkFieldType::In) else {
+        panic!("an unported jlink must build no link at all");
+    };
 }
 
 /// BOUNDARY: a key the port DOES serve still loads. The gate rejects by

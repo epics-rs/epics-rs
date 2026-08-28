@@ -53,11 +53,11 @@ fn an_unset_array_var_fetches_as_an_array() {
 
 #[test]
 fn index_zero_crossing_of_an_unset_array_is_minus_one() {
-    // compiled C: `IXZ(AA)` with pp_aArg[0]=NULL -> -1. The ARRAY branch (`:879-892`)
+    // compiled C: `IXZ(AA)` with pp_aArg[0]=NULL -> -1. The ARRAY branch (`:870-883`)
     // looks for a sign CHANGE and finds none, so j stays -1.
     //
     // The port pushed the scalar 0 and took IXZ's SCALAR branch instead
-    // (`|d| if d.abs() < SMALL { 0.0 }`, C `:1090` — "a scalar IS its own element 0"),
+    // (`|d| if d.abs() < SMALL { 0.0 }`, C `:1079` — "a scalar IS its own element 0"),
     // which answers 0.
     assert_eq!(d("IXZ(AA)"), -1.0);
 }

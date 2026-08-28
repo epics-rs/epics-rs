@@ -1,16 +1,16 @@
 //! A3 — an unresolvable ASG `INP*` link disables the rules that READ it, not
 //! every CALC rule in the group.
 //!
-//! C `asComputePvt` (`asLibRoutines.c:1048-1049`):
+//! C `asComputePvt` (`asLibRoutines.c:1039-1040`):
 //!
 //! ```c
 //! if(!pasgrule->calc
 //! || (!(pasg->inpBad & pasgrule->inpUsed) && (pasgrule->result==1)))
 //! ```
 //!
-//! `inpBad` is per-INPUT — `asCa.c connectCallback:91-105` sets a bit for a
+//! `inpBad` is per-INPUT — `connectCallback` (`asCa.c:91-105`) sets a bit for a
 //! channel that is not connected. `inpUsed` is per-RULE — `calcArgUsage`
-//! computes it once at load (`asLibRoutines.c:1416`). The intersection is what
+//! computes it once at load (`asLibRoutines.c:1407`). The intersection is what
 //! disables a rule, so a typo in an `INPB` that no rule mentions costs
 //! nothing.
 //!

@@ -395,7 +395,7 @@ fn test_checksum_operand_is_translated_first() {
 /// emits the standard digest. This test previously pinned C's answers — the
 /// values it asserted are named below so the deviation is auditable.
 ///
-/// XOR8 masks its own sign-extension away (`:279`) and was never affected.
+/// XOR8 masks its own sign-extension away (`:278`) and was never affected.
 #[test]
 fn test_crc16_high_bytes_are_standard_not_c() {
     assert_eq!(
@@ -463,7 +463,7 @@ fn test_lrc() {
 ///
 ///   AMODBUS("010203")        :010203FA        (9 chars)
 ///   AMODBUS("F7031389000A")  :F7031389000A60  (15 chars — the example in C's own
-///                                              comment at `:1834`)
+///                                              comment at `:1833`)
 #[test]
 fn test_amodbus_prepends_the_start_delimiter() {
     assert_eq!(
@@ -550,7 +550,7 @@ fn test_subrange_inverted_is_empty() {
     assert_eq!(result, StackValue::Str("".into()));
 }
 
-/// A negative bound counts back from the end (C `:1878,1885`: `if (i < 0) i += k`).
+/// A negative bound counts back from the end (C `:1877,1884`: `if (i < 0) i += k`).
 /// Compiled sCalc: `"hello"[-2,-1]` = "lo", `"hello"[-3,10]` = "llo".
 #[test]
 fn test_subrange_negative_bounds_wrap() {
@@ -629,7 +629,7 @@ fn test_until_with_an_assignment_body() {
 }
 
 /// `UNTIL(body; ... ; condition)` — the form the record documentation uses
-/// (`aCalcoutRecord.md:405`, `:578`) and the only one that loops. C compiles
+/// (`aCalcoutRecord.md:372`, `:551`) and the only one that loops. C compiles
 /// `UNTIL_END` from the OPERATOR stack, so the `;` INSIDE the parentheses cannot
 /// close the loop: everything up to the `)` is the body and the last value is the
 /// condition.
@@ -741,7 +741,7 @@ fn test_until_count_ceiling_is_nine() {
 /// and st stays 0. This test pinned `Err(InvalidFormat)`, which no sCalc path
 /// produces.
 ///
-/// C's `hex()` (`:232`) reads a non-hex character as 0 and its loop ignores a
+/// C's `hex()` (`:231`) reads a non-hex character as 0 and its loop ignores a
 /// trailing odd one, so LRC has no failure mode at all. Compiled sCalc, and now
 /// the port (R12-9).
 #[test]

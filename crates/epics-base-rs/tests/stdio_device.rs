@@ -165,7 +165,7 @@ async fn stdio_lso_prints_char_array_val_to_errlog() {
 }
 
 /// `printf` formats FMT into VAL (a `CharArray`); its device write IS its only
-/// output mechanism (`printfRecord.c:388` calls `write_string` unconditionally).
+/// output mechanism (`printfRecord.c:386` calls `write_string` unconditionally).
 /// This fails on the regression where `printf` is absent from
 /// `can_device_write()` and so never reaches `dev.write()`.
 #[epics_macros_rs::epics_test]

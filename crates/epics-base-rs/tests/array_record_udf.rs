@@ -7,9 +7,9 @@
 //!     status = readValue(prec);
 //!     if (!pact && prec->pact) return 0;
 //!     prec->pact = TRUE;
-//!     prec->udf = FALSE;              /* waveformRecord.c:144, aaiRecord.c:174 */
+//!     prec->udf = FALSE;              /* waveformRecord.c:144, aaiRecord.c:173 */
 //!
-//! (aao: `if (!pact) { prec->udf = FALSE; ... }`, aaoRecord.c:164-165.) So a
+//! (aao: `if (!pact) { prec->udf = FALSE; ... }`, aaoRecord.c:163-164.) So a
 //! FAILED simulation read still leaves the record DEFINED — the framework's
 //! simulation tail was gating the clear on the SIOL fetch status, which is the
 //! rule for the scalar records (`longinRecord.c:418` `if (status == 0)
@@ -21,7 +21,7 @@
 //!
 //! subArray is the counter-case and keeps the defaults: `prec->udf = !!status;
 //! if (status) recGblSetSevr(prec, UDF_ALARM, prec->udfs);`
-//! (subArrayRecord.c:148-150).
+//! (subArrayRecord.c:147-149).
 //!
 //! Boundaries: SIOL read failed vs succeeded; UDF set vs UDF alarm raised; the
 //! three unconditional kinds vs subArray.
@@ -112,7 +112,7 @@ fn subarray_keeps_the_status_gated_udf_rules() {
         assert_eq!(
             rec.raises_udf_alarm(),
             raises,
-            "{kind:?}: only subArrayRecord.c:150 calls recGblSetSevr(UDF_ALARM)"
+            "{kind:?}: only subArrayRecord.c:149 calls recGblSetSevr(UDF_ALARM)"
         );
     }
 }
@@ -121,7 +121,7 @@ fn subarray_keeps_the_status_gated_udf_rules() {
 /// process-time UDF alarm.
 ///
 /// The two are different mechanisms and only the second is waveform-specific:
-/// `iocInit.c:521-523` gives EVERY record `SEVR = UDFS` while `udf && stat ==
+/// `iocInit.c:520-522` gives EVERY record `SEVR = UDFS` while `udf && stat ==
 /// UDF_ALARM` (and STAT is born `UDF`), whereas `recGblCheckUdf` — the
 /// process-time raise that `waveformRecord.c` never calls — is what this record
 /// type genuinely lacks. softIoc, `record(waveform,"UDFWF")` with no INP, never

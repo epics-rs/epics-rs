@@ -43,11 +43,6 @@ pub struct PermissiveRecord {
     pub oflg: u16,
     /// `LABL` — "Button Label" (`DBF_STRING`, `size(20)`, `pp(TRUE)`).
     pub labl: PvString,
-    /// Per-cycle scratch: did `VAL` change on the most recent `process()`?
-    /// Captured before `process()` commits `oval`, so the framework's
-    /// post-process monitor gate ([`Record::monitor_value_changed`]) sees
-    /// the C `oval != val` result.
-    value_changed: bool,
 }
 
 impl Default for PermissiveRecord {
@@ -58,7 +53,6 @@ impl Default for PermissiveRecord {
             wflg: 0,
             oflg: 0,
             labl: PvString::new(),
-            value_changed: false,
         }
     }
 }
@@ -74,8 +68,6 @@ impl Record for PermissiveRecord {
     /// `oval` copy) so the framework's VAL-post gate reads the C result;
     /// `WFLG` posts through the generic subscribed-field loop.
     fn process(&mut self) -> CaResult<ProcessOutcome> {
-        self.value_changed = self.oval != self.val;
-        self.oval = self.val;
         self.oflg = self.wflg;
         Ok(ProcessOutcome::complete())
     }
@@ -86,8 +78,16 @@ impl Record for PermissiveRecord {
         false
     }
 
-    fn monitor_value_changed(&self) -> Option<bool> {
-        Some(self.value_changed)
+    /// C `permissiveRecord.c:107-110` `monitor()` posts VAL on the `oval !=
+    /// val` it snapshotted at `:100-103`, and the copy `prec->oval = val`
+    /// at `:105` is UNCONDITIONAL. Compared and committed HERE, at C's
+    /// position. (`oflg` is copied in the same C function; the port still
+    /// rolls it in `process()`, because WFLG posts through the generic
+    /// subscribed-field loop rather than through this gate.)
+    fn monitor_value_changed(&mut self) -> Option<bool> {
+        let changed = self.oval != self.val;
+        self.oval = self.val;
+        Some(changed)
     }
 
     /// C `permissiveRecord.c::monitor` (lines 90-117) posts only `VAL` and
@@ -147,14 +147,18 @@ mod tests {
     use super::*;
     use crate::server::record::RecordInstance;
 
-    /// `process()` copies VAL into OVAL and WFLG into OFLG, mirroring C
-    /// `monitor()`'s tracker update.
+    /// A cycle copies VAL into OVAL and WFLG into OFLG, mirroring C
+    /// `monitor()`'s tracker update (`permissiveRecord.c:105-106`). OVAL is
+    /// committed by `monitor_value_changed`, which IS that function; OFLG
+    /// still rolls in `process()` because WFLG posts through the generic
+    /// subscribed-field loop.
     #[test]
     fn process_copies_trackers() {
         let mut rec = PermissiveRecord::default();
         rec.put_field("VAL", EpicsValue::UShort(1)).unwrap();
         rec.put_field("WFLG", EpicsValue::UShort(1)).unwrap();
         rec.process().unwrap();
+        rec.monitor_value_changed();
         assert_eq!(rec.get_field("OVAL"), Some(EpicsValue::UShort(1)));
         assert_eq!(rec.get_field("OFLG"), Some(EpicsValue::UShort(1)));
     }

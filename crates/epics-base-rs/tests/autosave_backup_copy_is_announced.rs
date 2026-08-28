@@ -1,18 +1,15 @@
-//! A backup copy that did not land must say so on the error log.
+//! Trouble with the `.savB` backup must say so on the error log.
 //!
-//! `publish_copy` is the only place a backup artefact is written, and its
-//! `io::Result` used to reach the console from nowhere: the rotation
-//! callers turned it into the save set's error status, and the
-//! first-cycle `.savB` seed dropped it entirely with `let _ =`. A save
-//! set could therefore stop producing backups for as long as the
-//! destination stayed unwritable while every visible sign said the set
-//! was saving normally.
+//! A backup artefact write is the one thing a save set does that nothing
+//! else looks at: its `io::Result` used to reach the console from
+//! nowhere, so a set could stop producing backups for as long as the
+//! destination stayed unwritable while every visible sign said it was
+//! saving normally.
 //!
 //! Both shapes are covered here: the failure that aborts the cycle, and
-//! the one the cycle deliberately survives.
-//!
-//! No C reference: synApps `save_restore.c` is not present on this
-//! machine, so these pin the port's own stated invariant.
+//! the bad backup the cycle deliberately survives after replacing it —
+//! C prints for both (`save_restore.c` `write_save_file` at
+//! `R6-0-20-g186f467`).
 
 use std::collections::HashMap;
 use std::io::Write;
@@ -130,35 +127,50 @@ async fn a_failed_rotation_copy_names_the_backup_it_could_not_write() {
     );
 }
 
-/// The first-cycle seed: the `.sav` is already on disk, so the cycle
-/// succeeds and the seed failure has no error status to be read from —
-/// the log line is the only trace there has ever been.
+/// A `.savB` that was bad: the cycle replaces it and succeeds, so the
+/// log line is the only trace there has ever been that a backup
+/// generation was lost.
 #[epics_macros_rs::epics_test]
-async fn a_failed_savb_seed_is_announced_even_though_the_save_succeeds() {
+async fn a_bad_backup_is_announced_even_though_the_save_succeeds() {
     let dir = tempfile::tempdir().unwrap();
-    // No prior `.sav`: `rotate_backups` returns early and the seed at the
-    // end of the cycle is the only backup write. The seed runs only when
-    // `.savB` is absent, so the copy is blocked at the temp file
-    // `publish_copy` stages it through instead of at the destination.
-    std::fs::create_dir(dir.path().join("set.savB.tmp")).unwrap();
+    let sav = dir.path().join("set.sav");
+    epics_base_rs::runtime::fs::write(&sav, "# autosave-rs V1.0\nTEMP 1.0\n<END>\n")
+        .await
+        .unwrap();
+    // Present but truncated: no `<END>`, which is what C's `check_file`
+    // calls `BS_BAD` and what `find_best_save_file` would refuse.
+    epics_base_rs::runtime::fs::write(dir.path().join("set.savB"), "TEMP 1.0\n")
+        .await
+        .unwrap();
 
     let db = one_pv_db().await;
-    let mgr = one_pv_manager(dir.path().join("set.sav"))
-        .await
-        .build()
-        .await;
+    let mgr = one_pv_manager(sav).await.build().await;
 
     let (_guard, log) = capture_errlog();
     assert_eq!(
         mgr.manual_save("set", &db)
             .await
-            .expect("the .sav write itself must still succeed"),
+            .expect("a bad backup is replaced, not a reason to fail the cycle"),
         1
     );
 
     let text = log.contents();
     assert!(
-        text.contains("set.savB") && text.contains("not written"),
-        "the seed failure must still reach the error log; got: {text:?}"
+        text.contains("set.savB") && text.contains("bad or not found"),
+        "the replaced backup must reach the error log; got: {text:?}"
+    );
+    let kept: Vec<_> = std::fs::read_dir(dir.path())
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .filter(|e| {
+            e.file_name()
+                .to_str()
+                .is_some_and(|n| n.starts_with("set.savB_SBAD_"))
+        })
+        .collect();
+    assert_eq!(
+        kept.len(),
+        1,
+        "the corrupt backup must be kept for diagnosis"
     );
 }

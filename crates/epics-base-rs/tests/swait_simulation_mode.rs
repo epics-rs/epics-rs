@@ -1,6 +1,7 @@
 //! R11-62 — swait's simulation mode (SIML / SIMM / SIOL / SIMS / SVAL).
 //!
-//! C `swaitRecord.c:401-421`:
+//! C `swaitRecord.c:402-422`, quoted below with the `:401` comment above it
+//! kept for context:
 //!
 //! ```c
 //! /* Check for simulation mode */
@@ -23,7 +24,7 @@
 //! The five fields (`swaitRecord.dbd:497-517`) did not exist in the port, so a
 //! swait could not be simulated at all. The shape matters as much as the fields:
 //! the simulation branch substitutes `fetch_values()` + `calcPerform()` and
-//! NOTHING else — the OOPT switch at `:424`, `execOutput`, the monitors and the
+//! NOTHING else — the OOPT switch at `:425`, `execOutput`, the monitors and the
 //! forward link all still run. It is not the whole-cycle `readValue` of ai/bi.
 
 //! Widened site — `busy`: `busyRecord.dbd:127-147` declares the same
@@ -153,12 +154,12 @@ async fn r11_62_a_simulated_cycle_still_drives_the_output_link() {
     assert_eq!(
         field(&db, "DEST", "VAL").await,
         42.0,
-        "C:424 — the OOPT switch is outside the simulation branch; execOutput \
+        "C:425 — the OOPT switch is outside the simulation branch; execOutput \
          writes the simulated VAL"
     );
 }
 
-/// SIML resolves SIMM on every process (C `:402`), so the mode can be driven
+/// SIML resolves SIMM on every process (C `:400`), so the mode can be driven
 /// from another PV — and driving it back to NO restores the real calc.
 #[epics_macros_rs::epics_test]
 async fn r11_62_siml_refreshes_simm_every_cycle() {
@@ -192,16 +193,17 @@ async fn r11_62_siml_refreshes_simm_every_cycle() {
     assert_eq!(stat, 0, "the SIMM alarm is per-cycle, not sticky");
 }
 
-/// W10-E4. A SIOL read that fails changes neither VAL nor UDF (C `:417` gates
+/// W10-E4. A SIOL read that fails changes neither VAL nor UDF (C `:415` gates
 /// both on `status == 0`) — but it is a plain `dbGetLink`, so its failure path
-/// runs `setLinkAlarm` (dbLink.c:322) and raises LINK_ALARM/INVALID with
+/// runs `setLinkAlarm` (dbLink.c:320) and raises LINK_ALARM/INVALID with
 /// AMSG "field SIOL".
 ///
-/// `recGblSetSevr(SIMM_ALARM, sims)` at `:420` then runs unconditionally, but it
+/// `recGblSetSevr(SIMM_ALARM, sims)` at `swaitRecord.c:421` then runs
+/// unconditionally, but it
 /// only ever RAISES (strict-greater): with `SIMS = MINOR` it cannot beat the
 /// INVALID already pending, so it is a no-op and the record publishes
 /// LINK_ALARM/INVALID. Compiled C (`recGblSetSevrVMsg` verbatim, swait's order —
-/// `dbGetLink` at :416 then `recGblSetSevr` at :420):
+/// `dbGetLink` at `swaitRecord.c:416` then `recGblSetSevr` at `:421`):
 ///
 /// ```text
 /// swait SIMS=MINOR, failed SIOL: nsev=3 nsta=14 namsg='field SIOL'
@@ -241,7 +243,7 @@ async fn w10_e4_a_failed_siol_read_raises_link_alarm() {
 
 /// The other side of W10-E4's ordering boundary on swait: with
 /// `SIMS = INVALID` the two alarms are EQUAL in severity, and swait raises
-/// LINK first (`dbGetLink` at `:416`) and SIMM second (`:420`) — so the
+/// LINK first (`dbGetLink` at `swaitRecord.c:416`) and SIMM second (`:421`) — so the
 /// strict-greater `recGblSetSevr` leaves LINK in place. (A base record reverses
 /// this: `longinRecord.c:414` raises SIMM BEFORE its read, so SIMM wins there.
 /// Same two alarms, opposite winner, decided purely by C's call order.)

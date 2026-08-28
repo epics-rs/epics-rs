@@ -1,5 +1,5 @@
 //! R11-10 — SMOOTH/NSMOOTH PRESERVE the border elements (`aCalcPerform.c:968-975`,
-//! `:583-591`); the port zeroed them.
+//! `:578-586`); the port zeroed them.
 //!
 //! C's loop covers `firstEl+2 ..= lastEl-2` and writes IN PLACE, so the first two and
 //! last two elements simply keep the values they had — and a window shorter than five

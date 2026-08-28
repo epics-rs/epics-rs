@@ -8,7 +8,7 @@
 //! ```text
 //! seqRecord.c:282-297       DLYn (x16) -> "s"    :299-319 -> seqDLYprecision      (= 2, :78)
 //! calcoutRecord.c:425-444   ODLY       -> "s"    :446-465 -> calcoutODLYprecision (= 2, :89)
-//! histogramRecord.c:410-417 SDEL       -> "s"    :419-437 -> histogramSDELprecision (= 2, :88)
+//! histogramRecord.c:409-416 SDEL       -> "s"    :418-436 -> histogramSDELprecision (= 2, :88)
 //! boRecord.c:294-299        HIGH       -> "s"    :301-308 -> boHIGHprecision      (= 2, :85)
 //! busyRecord.c  (no units arm)         HIGH             :277-284 -> 2 (bare literal)
 //! swaitRecord.c (no units arm)         ODLY                      -> 3 (bare literal)
@@ -27,6 +27,7 @@
 //! answer (`""` from EGU, `0` from PREC on an empty record), so a passing test
 //! proves the literal arm fired rather than two paths coinciding.
 
+use epics_base_rs::server::database::LinkBacking;
 use epics_base_rs::server::record::{Record, RecordInstance};
 use epics_base_rs::server::records::bo::BoRecord;
 use epics_base_rs::server::records::busy::BusyRecord;
@@ -37,7 +38,7 @@ use epics_base_rs::server::records::swait::SwaitRecord;
 use epics_base_rs::server::snapshot::Snapshot;
 
 fn snap(inst: &RecordInstance, field: &str) -> Snapshot {
-    inst.snapshot_for_field(field)
+    inst.snapshot_for_field_with(field, LinkBacking::none())
         .unwrap_or_else(|| panic!("{field} has no snapshot"))
 }
 
@@ -101,7 +102,7 @@ fn calcouts_odly_literal_beats_the_records_own_egu_and_prec() {
     assert_eq!(
         display(&inst, "ODLY"),
         ("s".to_string(), 2),
-        "calcoutRecord.c:429-432/:451-454 return early for ODLY, before the EGU/PREC arms"
+        "calcoutRecord.c:431-434/:452-455 return early for ODLY, before the EGU/PREC arms"
     );
 }
 
@@ -119,11 +120,11 @@ fn calcouts_val_still_takes_egu_and_prec() {
     assert_eq!(
         display(&inst, "VAL"),
         ("V".to_string(), 7),
-        "calcoutRecord.c:435-441/:455 serve VAL from the record's own EGU/PREC"
+        "calcoutRecord.c:436-442/:457-459 serve VAL from the record's own EGU/PREC"
     );
 }
 
-/// `histogramRecord.c:420-439` is a switch: SDEL takes the literal while
+/// `histogramRecord.c:419-438` is a switch: SDEL takes the literal while
 /// ULIM/LLIM/SGNL/SVAL/WDTH take `prec->prec`. Pin that the literal is SDEL's
 /// alone and does not leak onto the switch's other cases.
 ///
@@ -140,13 +141,13 @@ fn histograms_sdel_takes_the_literal_where_its_siblings_do_not() {
     assert_eq!(
         display(&inst, "SDEL"),
         ("s".to_string(), 2),
-        "histogramRecord.c:414/:431 answer SDEL with \"s\"/histogramSDELprecision"
+        "histogramRecord.c:413/:431 answer SDEL with \"s\"/histogramSDELprecision"
     );
     for sibling in ["ULIM", "LLIM", "SGNL", "SVAL", "WDTH"] {
         assert_eq!(
             display(&inst, sibling).0,
             "",
-            "histogramRecord.c:410-417 answers only SDEL: {sibling} gets no units"
+            "histogramRecord.c:409-416 answers only SDEL: {sibling} gets no units"
         );
     }
 }
@@ -224,7 +225,7 @@ fn busys_precision_literal_is_highs_alone() {
 
 /// `swaitRecord.c`'s `get_precision` answers ODLY with 3 — the only value in
 /// this family that is not 2, so it cannot pass by coincidence with any other
-/// arm. ODLY is `DBF_FLOAT`, which clears `dbAccess.c:388-389`'s gate.
+/// arm. ODLY is `DBF_FLOAT`, which clears `dbAccess.c:387-388`'s gate.
 #[test]
 fn swait_odly_takes_the_precision_literal() {
     let inst = inst("T:SWAIT", SwaitRecord::default());

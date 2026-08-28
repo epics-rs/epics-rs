@@ -1,5 +1,6 @@
 use crate::error::CaResult;
-use crate::types::{DbFieldType, EpicsValue, PvString, c_parse};
+use crate::types::c_parse::Converted;
+use crate::types::{DbFieldType, DbfCode, EpicsValue, PvString, c_parse};
 
 use super::scan::ScanType;
 
@@ -31,35 +32,46 @@ pub enum RawSoftEntry {
 /// write: `NoMod` refuses it (`S_db_noMod`), `DbAddr` means the field's type and
 /// element count come from the record's `cvt_dbaddr` rather than the `.dbd`, and
 /// `As` re-evaluates access security.
+///
+/// The discriminants ARE C's `SPC_*` numbers (`special.h:26-39` @R7.0.10),
+/// so `special as i16` is the integer C prints and stores. They are written
+/// out rather than left implicit because the table is not contiguous — C has
+/// no code 4, and the record-specific half starts at 100 — so the obvious
+/// cast on an implicitly-numbered enum would have answered 4 for
+/// [`Self::AlarmAck`] and 7 for [`Self::Mod`]. Carrying the number on the
+/// type is what makes every future cast right by construction.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(i16)]
 pub enum Special {
-    /// No `special()` declared.
-    None,
-    /// `SPC_NOMOD` (1) — the field must not be modified. Mirrored into
+    /// No `special()` declared — C leaves `pdbFldDes->special` 0.
+    None = 0,
+    /// `SPC_NOMOD` — the field must not be modified. Mirrored into
     /// [`FieldDesc::read_only`], which is the bit the put gate reads.
-    NoMod,
-    /// `SPC_DBADDR` (2) — the record's `cvt_dbaddr` supplies the field's type
+    NoMod = 1,
+    /// `SPC_DBADDR` — the record's `cvt_dbaddr` supplies the field's type
     /// and element count. [`FieldDesc::dbf_type`] carries the type C serves at
     /// the selector field's default; a record whose type is state-dependent
     /// (`waveform.VAL` on `FTVL`, `mbbo.VAL` on `SDEF`) overrides it at runtime.
-    DbAddr,
-    /// `SPC_SCAN` (3) — a scan-related field; C re-registers the scan.
-    Scan,
-    /// `SPC_ALARMACK` (5) — an alarm acknowledgement.
-    AlarmAck,
-    /// `SPC_AS` (6) — access security; C re-computes the record's ASG.
-    As,
-    /// `SPC_ATTRIBUTE` (7) — a pseudo (attribute) field.
-    Attribute,
-    /// `SPC_MOD` (100) — the record's own `special()` runs on the put.
-    Mod,
-    /// `SPC_RESET` (101) — the `RES` field is being modified.
-    Reset,
-    /// `SPC_LINCONV` (102) — a linear-conversion field changed; C calls the
+    DbAddr = 2,
+    /// `SPC_SCAN` — a scan-related field; C re-registers the scan.
+    Scan = 3,
+    /// `SPC_ALARMACK` — an alarm acknowledgement. C skips 4.
+    AlarmAck = 5,
+    /// `SPC_AS` — access security; C re-computes the record's ASG.
+    As = 6,
+    /// `SPC_ATTRIBUTE` — a pseudo (attribute) field. Set internally; it
+    /// is the one code `pamapspcType` omits, so no `.dbd` declares it.
+    Attribute = 7,
+    /// `SPC_MOD` — the record's own `special()` runs on the put. C's
+    /// record-specific range starts here.
+    Mod = 100,
+    /// `SPC_RESET` — the `RES` field is being modified.
+    Reset = 101,
+    /// `SPC_LINCONV` — a linear-conversion field changed; C calls the
     /// device support's `special_linconv`.
-    LinConv,
-    /// `SPC_CALC` (103) — the `CALC` expression changed; C recompiles it.
-    Calc,
+    LinConv = 102,
+    /// `SPC_CALC` — the `CALC` expression changed; C recompiles it.
+    Calc = 103,
 }
 
 /// A field's access-security level — C `.dbd` `asl(ASL0|ASL1)`.
@@ -70,6 +82,23 @@ pub enum Special {
 pub enum Asl {
     Asl0,
     Asl1,
+}
+
+/// The numeric base `dbGetString` renders an integer field in — C's
+/// `ctType` (`dbBase.h:63`), set by the `.dbd` `base(DECIMAL|HEX)` item
+/// (`dbLexRoutines.c:652-661`).
+///
+/// It selects the renderer inside `dbGetStringNum` (`dbStaticLib.c:2074-2124`),
+/// so it changes what `dbpr`, `dbDumpRecord` and the `.db` writer print and
+/// nothing else: `dbgf` reads through `dbConvert`, which has no base. In
+/// EPICS base the whole `HEX` population is `mbbi`/`mbbo`'s sixteen `*VL`
+/// fields, which C prints as `ZRVL: 0xa` where the port printed `ZRVL: 10`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Base {
+    /// `CT_DECIMAL` — the `.dbd` default.
+    Decimal,
+    /// `CT_HEX`.
+    Hex,
 }
 
 /// The `.dbd` declaration of a single record field.
@@ -87,17 +116,40 @@ pub enum Asl {
 pub struct FieldDesc {
     /// The field name, upper-case as declared.
     pub name: &'static str,
-    /// The `DBF_*` type. This is the *field* type; the CA wire type is derived
-    /// from it by [`DbFieldType::ca_wire_type`], which owns the promotions CA
-    /// has no type for (`ULong`/`Int64`/`UInt64` -> `DBR_DOUBLE`, `UShort` ->
-    /// `DBR_LONG`, `UChar` -> `DBR_CHAR`). Do not pre-promote here: PVA serves
-    /// the native width.
-    ///
-    /// This is what the field is SERVED as, on every delivery path — see
+    /// The type the field is **SERVED** as, on every delivery path — see
     /// [`RecordInstance::project_to_declared_type`](super::RecordInstance::project_to_declared_type),
     /// which projects the stored value onto it. The one exception is a
     /// [`Self::runtime_typed`] field, where C's `cvt_dbaddr` overrides.
+    ///
+    /// It is NOT the `DBF_*` token the `.dbd` declared — that is
+    /// [`Self::declared_dbf`], and the two differ for every link and menu
+    /// field. The CA wire type is derived from this one by
+    /// [`DbFieldType::ca_wire_type`], which owns the promotions CA has no type
+    /// for (`ULong`/`Int64`/`UInt64` -> `DBR_DOUBLE`, `UShort` -> `DBR_LONG`,
+    /// `UChar` -> `DBR_CHAR`). Do not pre-promote here: PVA serves the native
+    /// width.
     pub dbf_type: DbFieldType,
+    /// The `DBF_*` token the `.dbd` declared, carried verbatim from the
+    /// generator's input — C's `pdbFldDes->field_type`, which is what
+    /// `dbDumpField` prints and `dbGetFieldType`/`dbGetFieldTypeString`
+    /// (`dbStaticLib.c:964-977`) answer for a `DBENTRY`.
+    ///
+    /// C's `dba` prints `paddr->field_type` instead, which is this token for
+    /// every field EXCEPT the 83 `special(SPC_DBADDR)` rows, where
+    /// `dbNameToAddr` lets the record's `cvt_dbaddr` overwrite it; on those
+    /// rows [`Self::dbf_type`] carries the overwritten type. 80 of the 83
+    /// declare `DBF_NOACCESS` here, which is precisely why [`Self::no_access`]
+    /// reads this field and not `dbf_type`.
+    ///
+    /// A SECOND fact, not a spelling of [`Self::dbf_type`]. The generator maps
+    /// six C tokens onto two served types (`DBF_ENUM|DBF_MENU|DBF_DEVICE` all
+    /// serve as [`DbFieldType::Enum`], `DBF_INLINK|DBF_OUTLINK|DBF_FWDLINK` all
+    /// as [`DbFieldType::String`]), and that collapse is one-way: no mapping
+    /// out of `dbf_type` can recover the token, because `ai.INP` and
+    /// `dbCommon.FLNK` are the same served variant. Nor can the field NAME —
+    /// `LNK1` is `DBF_OUTLINK` on `sseq` and `DBF_FWDLINK` on `fanout`. So the
+    /// declaration is carried, not derived.
+    pub declared_dbf: DbfCode,
     /// C's `cvt_dbaddr` re-types this field at name-resolution time from the
     /// record's own state — `waveform.VAL` from `FTVL`, `aSub.A` from `FTA`,
     /// `mbbo.VAL` from `SDEF` — so the `.dbd` declaration is a placeholder
@@ -115,14 +167,61 @@ pub struct FieldDesc {
     /// static half of the no-modify declaration; see [`Record::field_no_mod`]
     /// for the half a record decides at runtime.
     pub read_only: bool,
-    /// The full `special()` code, of which [`Self::read_only`] is one case.
+    /// The full `special()` code AS RESOLVED, of which [`Self::read_only`] is
+    /// one case: the `.dbd` declaration for most fields, but for a
+    /// `special(SPC_DBADDR)` field the code its `cvt_dbaddr` raises instead —
+    /// `SPC_MOD` on `lsi.VAL`, `SPC_NOMOD` on `lsi.OVAL`
+    /// (`lsiRecord.c:127-134`). That is the code the put gate and the CA
+    /// write-access answer must read, because it is what C's `DBADDR` carries
+    /// after name resolution.
+    ///
+    /// It is NOT what the `.dbd` said — see [`Self::declared_special`], which
+    /// is. The pair splits the same way [`Self::dbf_type`] and
+    /// [`Self::declared_dbf`] do, and for the same reason: one cell holding
+    /// both answers is a cell that is wrong for one of its two readers.
     pub special: Special,
+    /// The `special()` code the `.dbd` DECLARED — C's `pdbFldDes->special`,
+    /// which `cvt_dbaddr` never touches because it writes the per-resolution
+    /// `DBADDR` and not the shared field descriptor.
+    ///
+    /// Every reader that asks about the DECLARATION rather than about a
+    /// resolved address wants this one. The db loader's field-name suggestion
+    /// is the case in hand: it skips `SPC_NOMOD` and `SPC_DBADDR` candidates
+    /// (`dbLexRoutines.c:1283-1285`), and reading [`Self::special`] there would
+    /// let `lsi.VAL` and `lso.VAL` — declared `SPC_DBADDR`, resolved `SPC_MOD`
+    /// — be proposed where C does not propose them.
+    pub declared_special: Special,
     /// `pp(TRUE)` — a put to this field processes the record.
     pub pp: bool,
     /// `asl(...)` — the access-security level.
     pub asl: Asl,
-    /// `size(N)` — the declared byte size of a `DBF_STRING` field, or 0.
+    /// The byte width C's `pdbFldDes->size` carries.
+    ///
+    /// Two sources, one meaning. A `DBF_STRING` field takes it from `size(N)`,
+    /// which C's loader REQUIRES on every such row
+    /// (`dbLexRoutines.c:755-758`). A `DBF_NOACCESS` internal takes it from
+    /// the width of the C struct member [`Self::extra`] declares, which is
+    /// what a C IOC's generated `<rec>RecordSizeOffset` writes into the same
+    /// cell — the `.dbd` never spells it.
+    ///
+    /// Not string-only, and not decoration on the second kind: `dbpr`'s
+    /// `DBF_NOACCESS` arm dispatches on it (`dbTest.c:1235`, `:1241`) and then
+    /// prints exactly this many bytes as hex (`:1249-1262`), so a width of 0
+    /// prints an empty row where C prints the field.
+    ///
+    /// 0 for every other declaration, where C carries `sizeof` the member and
+    /// no reader in this port asks.
     pub size: u16,
+    /// `extra("...")` — the C struct member a `DBF_NOACCESS` field stands for,
+    /// verbatim, and `None` for a field declaring none.
+    ///
+    /// C's loader requires it on exactly the rows [`Self::size`]'s second
+    /// source covers (`dbLexRoutines.c:759-762`), and it is not documentation:
+    /// `dbpr` reads the declaration TEXT to choose a renderer — a `*` in it
+    /// means print a pointer, a leading `ELLLIST` means print a list header
+    /// (`dbTest.c:1235-1247`). The type name is the only thing that says how
+    /// wide the member is, since no `.dbd` states it.
+    pub extra: Option<&'static str>,
     /// `menu(...)` choice strings, in index order, for a `DBF_MENU` field. The
     /// index is the stored value and the strings are what `get_enum_strs` serves,
     /// so a client sees `"NO CONVERSION"` rather than `0`.
@@ -134,6 +233,20 @@ pub struct FieldDesc {
     /// `prop(YES)` — the field is a property: a change to it posts a
     /// `DBE_PROPERTY` event.
     pub prop: bool,
+    /// `prompt("...")` — the operator-facing label. C prints it in the
+    /// parenthesised half of the db loader's field suggestion
+    /// (`dbLexRoutines.c:1380-1384`), which is the only reason it is carried;
+    /// a field that declares none makes C print the bare `Did you mean` line.
+    pub prompt: Option<&'static str>,
+    /// `promptgroup("...")` — the DCT group the field belongs to, or `None`
+    /// when the `.dbd` declares none. C stores it as a 1-based key into
+    /// `guiGroupList` (`findOrAddGuiGroup`, `dbLexRoutines.c:1176-1189`), so
+    /// zero means absent and this is `Option`, not the group's index. The
+    /// suggestion halves a groupless field's score (`:1288-1289`): a field no
+    /// DCT screen offers is an unlikely thing to have misspelled.
+    pub promptgroup: Option<&'static str>,
+    /// `base(DECIMAL|HEX)` — the base `db_get_string` renders this field in.
+    pub base: Base,
 }
 
 impl FieldDesc {
@@ -152,9 +265,15 @@ impl FieldDesc {
         Self {
             name,
             dbf_type,
-            // A hand-written table declares a plain field: the type it names is
-            // the type it is served as. The `cvt_dbaddr` records are all on the
-            // generated table, which sets this from `cvt_dbaddr.types`.
+            // A hand-written table names one type and means both facts by it:
+            // it has no `.dbd` behind it to disagree with, so the declaration
+            // is the served type's own code. That also makes `no_access()`
+            // false for every such row, which is right — a hand-written table
+            // never declares a C internal.
+            declared_dbf: dbf_type.dbf_code(),
+            // A plain field: the type it names is the type it is served as.
+            // The `cvt_dbaddr` records are all on the generated table, which
+            // sets this from `cvt_dbaddr.types`.
             runtime_typed: false,
             read_only,
             special: if read_only {
@@ -162,14 +281,59 @@ impl FieldDesc {
             } else {
                 Special::None
             },
+            // A hand-written row has no `.dbd` behind it to disagree with, so
+            // the declaration is the resolved code.
+            declared_special: if read_only {
+                Special::NoMod
+            } else {
+                Special::None
+            },
             pp: false,
             asl: Asl::Asl1,
             size: 0,
+            extra: None,
             menu: None,
             initial: None,
             interest: 0,
             prop: false,
+            prompt: None,
+            promptgroup: None,
+            base: Base::Decimal,
         }
+    }
+
+    /// The field is declared `DBF_NOACCESS` — a C internal with no dbStatic
+    /// representation. C's `dbPutString` switches on exactly this and answers
+    /// `S_dbLib_badField` with "Can't set array field before iocInit()"
+    /// (`dbStaticLib.c:2646-2650`), so a `.db` file cannot assign one.
+    ///
+    /// Derived rather than stored, so the two cannot disagree. It is NOT
+    /// implied by [`Self::special`] — `mbbo.VAL` is `DBF_ENUM` + `SPC_DBADDR`
+    /// and is perfectly settable, while `waveform.VAL` is `DBF_NOACCESS` +
+    /// `SPC_DBADDR` and is not — nor by [`Self::dbf_type`], which for these
+    /// rows carries the type C SERVES rather than the one declared.
+    pub const fn no_access(&self) -> bool {
+        matches!(self.declared_dbf, DbfCode::NoAccess)
+    }
+
+    /// The field resolves as a NAME but has no readable value — C `dbGet`'s
+    /// validity gate, `field_type > DBF_DEVICE` (`dbAccess.c:667-675`
+    /// @R7.0.10).
+    ///
+    /// Not the same question as [`Self::no_access`], and the difference is
+    /// the whole point. `dbEntryToAddr` seeds `paddr->field_type` from the
+    /// DECLARATION and then overwrites it from the record's `cvt_dbaddr` —
+    /// but only for a field whose `special` is `SPC_DBADDR`
+    /// (`dbAccess.c:640-647`). So a `DBF_NOACCESS` row carrying
+    /// `SPC_DBADDR` — `waveform.VAL` — arrives at the gate re-typed to what
+    /// it serves and PASSES, while one that does not — `dbCommon`'s `BKPT`
+    /// and `TIME` — arrives still holding 17 and FAILS. Both facts are
+    /// needed; neither alone answers it.
+    ///
+    /// Derived rather than stored, for the same reason `no_access` is: a
+    /// stored copy is a second answer that can drift from the declaration.
+    pub const fn unreadable(&self) -> bool {
+        self.no_access() && !matches!(self.declared_special, Special::DbAddr)
     }
 }
 
@@ -358,6 +522,24 @@ pub enum ValuePostGate {
     /// (timestampRecord.c:158-162). The VAL-string change is the *only* gate,
     /// so a cycle that re-renders the same seconds count still re-posts RVAL.
     WithValue,
+    /// [`Self::OnChange`]'s own-value test, but the guard is the record's
+    /// widened one ([`Record::take_secondary_value_mask`]) and the event
+    /// carries C's forced `monitor_mask | DBE_VALUE | DBE_LOG`: ao `RVAL` /
+    /// `RBV` — `if(prec->oraw != prec->rval) { db_post_events(&prec->rval,
+    /// monitor_mask|DBE_VALUE|DBE_LOG); prec->oraw = prec->rval; }`
+    /// (aoRecord.c:539-548), all inside `if(monitor_mask)` (`:536`).
+    ///
+    /// Distinct from [`Self::OnChange`] in BOTH halves, which is why it is a
+    /// third variant and not a flag: ai's RVAL rides VAL's own mask and VAL's
+    /// own guard, while ao's rides a forced mask and a guard `omod` can open
+    /// when VAL's is shut.
+    ///
+    /// The own-value test AND the advance of the record's "old" copy are one
+    /// step, [`Record::take_secondary_value_change`], never split across the
+    /// code that computed the new value — C assigns `oraw` INSIDE the post it
+    /// guards, so a cycle that changes RVAL without posting it must leave
+    /// `oraw` stale for the next cycle to find.
+    OnChangeForced,
 }
 
 /// The event mask ONE per-cycle mark posts with
@@ -547,7 +729,7 @@ pub enum RsetDefaultArm {
 /// differential oracle as 42 `acalcout`/`scalcout` fields.
 pub fn control_default_arm(rtype: &str) -> RsetDefaultArm {
     match rtype {
-        // aCalcoutRecord.c:793-822, sCalcoutRecord.c:653 — the switch lists
+        // aCalcoutRecord.c:793-822, sCalcoutRecord.c:653-682 — the switch lists
         // VAL/HIHI/HIGH/LOW/LOLO and the A-L / PA-PL ranges, then falls off
         // the end into `return(0)` with no recGbl delegation.
         "acalcout" | "scalcout" => RsetDefaultArm::Seed,
@@ -569,7 +751,7 @@ pub fn control_default_arm(rtype: &str) -> RsetDefaultArm {
 ///
 /// The synApps calc pair ends the same way — the listed cases return early and
 /// the function ends `return(0)` with no delegation
-/// (`aCalcoutRecord.c:1046-1068`, `sCalcoutRecord.c:906-928`).
+/// (`aCalcoutRecord.c:762-791`, `sCalcoutRecord.c:622-651`).
 ///
 /// Every other ported type that supplies the slot delegates
 /// (`aiRecord.c:244`, `aoRecord.c:316`, `calcRecord.c:187`,
@@ -645,6 +827,15 @@ pub fn alarm_val_arm(rtype: &str) -> AlarmValArm {
 /// `HOPR`/`LOPR` in every ported type but one: `motorRecord.cc:3221-3225`
 /// answers the soft travel limits `HLM`/`LLM` and never reads its own
 /// HOPR/LOPR.
+///
+/// The `"motor"` arm decides nothing today and is kept deliberately.
+/// `MotorRecord::field_metadata_override` (`motor-rs/src/record/mod.rs:201-205`)
+/// answers `Some(..)` for EVERY field, and the override layer runs after
+/// `route_field_metadata` (pinned by
+/// `epics-base-rs/tests/the_override_layer_runs_last.rs`), so every served
+/// motor field takes its window from `motor-rs` and never from this table.
+/// The arm states what C's rset does for the day a motor field reaches the
+/// routing layer without an override.
 pub fn graphic_limit_fields(rtype: &str) -> (&'static str, &'static str) {
     match rtype {
         "motor" => ("HLM", "LLM"),
@@ -670,6 +861,9 @@ pub enum ControlLimitSource {
 /// See [`ControlLimitSource`]. Read from each ported type's own rset; the
 /// three named types are the only ones in base or the ported modules whose
 /// control limits are not the operator range.
+///
+/// The `"motor"` arm is dead for the same reason, and kept for the same
+/// reason, as the `"motor"` arm of [`graphic_limit_fields`].
 pub fn control_limit_source(rtype: &str) -> ControlLimitSource {
     match rtype {
         "ao" => ControlLimitSource::Drive,
@@ -720,7 +914,7 @@ pub fn default_property_support(rtype: &str) -> crate::server::snapshot::Propert
 
         // Enum records. `biRecord.c:61-80` and `mbbiRecord.c:65-84` /
         // `mbboRecord.c:64-83` NULL every numeric slot and supply only
-        // `get_enum_strs`. `boRecord.c:59-61` keeps `get_units`,
+        // `get_enum_strs`. `boRecord.c:54-61` keeps `get_units`,
         // `get_precision` and `get_control_double` (they serve the
         // `HIGH` field) but NULLs `get_graphic_double` and
         // `get_alarm_double`.
@@ -887,10 +1081,16 @@ pub enum ProcessAction {
     },
 
     /// Schedule a re-process of this record after the given duration.
-    /// The framework spawns `tokio::spawn(sleep(d) + process_record(name))`.
-    /// The current cycle's OUT/FLNK/notify proceed normally.
+    /// The framework defers it through
+    /// `database/processing.rs` (`schedule_delayed_reprocess`), which uses
+    /// `spawn_background` + `sleep_background` — *not* the ambient
+    /// `tokio::spawn`/`tokio::time::sleep`, which a record-processing thread
+    /// has no runtime for. The current cycle's OUT/FLNK/notify proceed
+    /// normally.
     ///
-    /// Equivalent to C EPICS `callbackRequestDelayed()` + `scanOnce()`.
+    /// Equivalent to C EPICS `callbackRequestDelayed()` + `scanOnce()`
+    /// (`db/callback.c:410` (`callbackRequestDelayed`), `db/dbScan.c:660`
+    /// (`scanOnce`); epics-base R7.0.10).
     ReprocessAfter(std::time::Duration),
 
     /// C `callbackRequestDelayed()` armed with a handler that mutates the
@@ -1073,6 +1273,35 @@ pub struct ProcessOutcome {
     /// skip its built-in computation (e.g., PID). Replaces the `pid_done`
     /// flag pattern.
     pub device_did_compute: bool,
+    /// Field stores this cycle owes the framework, to be applied only AFTER
+    /// the cycle's queued [`ProcessAction::WriteDbLink`] have executed.
+    ///
+    /// C runs a record's `dbPutLink` calls and the completion-flag clear that
+    /// follows them inside ONE `dbScanLock` — `sseqRecord.c::processCallback`
+    /// puts `LNKn` (`:714-792`) and `asyncFinish` clears `busy` (`:498-505`)
+    /// with the lock held throughout, and `scalerRecord.c::process` clears
+    /// `cnt` (`:370`) and puts `COUT`/`COUTP` (`:457`, `:463`) in one cycle —
+    /// so `dbGetField`, which takes the same lock, can never observe the flag
+    /// clear ahead of the writes. The port cannot hold the record's data guard
+    /// across the writes (a self/cyclic OUT link would dead-lock the
+    /// non-reentrant guard), so a `process()` that both queues a write and
+    /// clears its flag exposes a state C cannot produce: `BUSY == 0` with
+    /// `LNKn` unwritten, `CNT == 0` with `COUT` unwritten.
+    ///
+    /// A record therefore does not store such a field in `process()`; it emits
+    /// it here, and the framework applies it — store plus a `DBE_VALUE` monitor
+    /// post — immediately after this cycle's link writes and before the
+    /// cycle's snapshot notification. One owner for one transition.
+    ///
+    /// Applied in order, so a cycle that raises and clears the same field
+    /// (`sseqRecord.c:302-305` `busy = 1` then an invalid `SELN` reaching
+    /// `asyncFinish`) publishes both transitions exactly as C does.
+    ///
+    /// Only the STORE moves. A flag whose value is an input to a later
+    /// decision in the same cycle keeps its `process()` store: motor's `DMOV`
+    /// gates `recGblFwdLink` at `motorRecord.cc:1509-1510`, so it is read after
+    /// it is set and does not belong here.
+    pub post_write_fields: Vec<(String, EpicsValue)>,
 }
 
 impl ProcessOutcome {
@@ -1082,6 +1311,7 @@ impl ProcessOutcome {
             result: RecordProcessResult::Complete,
             actions: Vec::new(),
             device_did_compute: false,
+            post_write_fields: Vec::new(),
         }
     }
 
@@ -1091,6 +1321,7 @@ impl ProcessOutcome {
             result: RecordProcessResult::Complete,
             actions,
             device_did_compute: false,
+            post_write_fields: Vec::new(),
         }
     }
 
@@ -1102,6 +1333,7 @@ impl ProcessOutcome {
             result: RecordProcessResult::CompleteNoEmit,
             actions: Vec::new(),
             device_did_compute: false,
+            post_write_fields: Vec::new(),
         }
     }
 
@@ -1112,6 +1344,7 @@ impl ProcessOutcome {
             result: RecordProcessResult::CompleteAlarmOnly,
             actions: Vec::new(),
             device_did_compute: false,
+            post_write_fields: Vec::new(),
         }
     }
 
@@ -1121,6 +1354,7 @@ impl ProcessOutcome {
             result: RecordProcessResult::AsyncPending,
             actions: Vec::new(),
             device_did_compute: false,
+            post_write_fields: Vec::new(),
         }
     }
 }
@@ -1205,6 +1439,14 @@ pub struct ProcessContext {
     /// record's `devEpidSoftCallback` callback DSET drives the TRIG
     /// readback link, whereas `devEpidSoft` does not).
     pub dtyp: String,
+    /// The callback band `dbCommon.prio` selects for work this cycle defers —
+    /// C `seqRecord.c:145-146`, which re-runs
+    /// `callbackSetPriority(prec->prio, &pcb->callback)` at the top of every
+    /// `process()` so a `PRIO` written between cycles takes effect on the next
+    /// one. Already converted: a record stashes this and hands it to
+    /// [`crate::runtime::task::spawn_background`] rather than re-deriving a
+    /// band from a raw menu index.
+    pub callback_priority: crate::runtime::task::CallbackPriority,
 }
 
 /// C `epicsTime.h`: `epicsTimeEventDeviceTime` — the `TSE` sentinel
@@ -1219,7 +1461,7 @@ pub struct ProcessSnapshot {
     /// `db_post_events(prec, &field, mask)`. One process cycle posts
     /// different classes per field: a deadband-gated readback narrows
     /// to the deadbands that actually crossed (MDEL → `DBE_VALUE`,
-    /// ADEL → `DBE_LOG`; motorRecord.cc `monitor()` 3477-3507,
+    /// ADEL → `DBE_LOG`; motorRecord.cc `monitor()` 3476-3507,
     /// aiRecord.c `monitor()`), while a change-detected auxiliary
     /// field posts `DBE_VALUE | DBE_LOG` (motorRecord.cc 3522-3645
     /// `DBE_VAL_LOG`; calcRecord.c:420). A single record-wide mask
@@ -1264,7 +1506,7 @@ impl ProcessSnapshot {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum InputFetchPolicy {
     /// Read every configured link; a failed read neither stops the loop nor
-    /// gates the record body. C `transformRecord.c::process` (531-545) reads
+    /// gates the record body. C `transformRecord.c::process` (534-547) reads
     /// on through a failed `dbGetLink` and computes anyway.
     ReadAll,
     /// Read every configured link — a failure does NOT stop the loop, so the
@@ -1282,20 +1524,20 @@ pub enum InputFetchPolicy {
     ///
     /// C `subRecord.c::fetch_values` (407-418) `return -1`s on the first
     /// failing `dbGetLink`, so the inputs behind it are never read and keep
-    /// their previous values; `subRecord.c::process` (145-146) then runs
-    /// `do_sub` only `if (status == 0)`, freezing VAL/UDF and raising none of
-    /// the subroutine's alarms. `aSubRecord.c` (277-289 fetch, 216-218
+    /// their previous values; `subRecord.c::process` (144 fetch, 147 gate)
+    /// then runs `do_sub` only `if (status == 0)`, freezing VAL/UDF and raising
+    /// none of the subroutine's alarms. `aSubRecord.c` (277-289 fetch, 216-218
     /// process), `sCalcoutRecord.c` (885-887 fetch, 356 gate),
     /// `aCalcoutRecord.c` (1068-1071 fetch, 399 gate) and
     /// `swaitRecord.c` (686-705 fetch, 408 gate) are the same shape.
     AbortOnFirstFailure,
     /// Read every configured link and gate the body on the LAST link's status.
     ///
-    /// C `selRecord.c::fetch_values` (433-436) assigns `status` unguarded on
+    /// C `selRecord.c::fetch_values` (434-437) assigns `status` unguarded on
     /// every pass of its all-inputs loop and returns it, so what
-    /// `selRecord.c::process` (113-115) gates `do_sel` on is INPL's status
+    /// `selRecord.c::process` (114-116) gates `do_sel` on is INPL's status
     /// alone — a failed INPA is read, posted, and then ignored. In
-    /// `Specified` mode the loop is one link (`:421-431`), so the same rule
+    /// `Specified` mode the loop is one link (`:421-432`), so the same rule
     /// reads as "the selected input's status". Faithful to C, quirk included:
     /// see `sel`'s doc for why the quirk is C's and not ours.
     ReadAllGateOnLastFailure,
@@ -1390,6 +1632,26 @@ pub trait FieldDeclaration {
     /// one declaration every consumer already goes through, and a record cannot
     /// advertise a capacity for a field C would never have handed one.
     fn field_native_count(&self, field: &str) -> Option<u32>;
+
+    /// C `paddr->pfldDes->special == SPC_DBADDR` — the field's STATIC `.dbd`
+    /// declaration, and the single owner of "is this an ARRAY destination".
+    ///
+    /// `dbPut` reads exactly this to pick its array arm
+    /// (`dbAccess.c:1350`, tag `R7.0.10`:
+    /// `if (nRequest>1 || paddr->pfldDes->special == SPC_DBADDR)`), and it is
+    /// `pfldDes` — the shared field descriptor — NOT the per-`DBADDR`
+    /// `paddr->special` that `cvt_dbaddr` is free to overwrite. The two differ:
+    /// `lsiRecord.c:127-134` raises `paddr->special` to `SPC_MOD` on VAL and
+    /// `SPC_NOMOD` on OVAL, and the branch still takes the array arm.
+    ///
+    /// That distinction is why this cannot be one lookup here either.
+    /// [`FieldDesc::special`] carries the `cvt_dbaddr` special for a DBADDR
+    /// field, not the declaration (`dbd/cvt_dbaddr.types` says so, and derives
+    /// `read_only` from it) — which preserves `SPC_DBADDR` for every such field
+    /// except the five long-string ones, whose `cvt_dbaddr` overwrites it. Those
+    /// five are exactly [`Record::long_string_fields`] (`lsi`/`lso` VAL+OVAL,
+    /// `printf` VAL), so the second half asks the record for them.
+    fn field_is_dbaddr(&self, field: &str) -> bool;
 }
 
 impl<R: Record + ?Sized> FieldDeclaration for R {
@@ -1404,11 +1666,20 @@ impl<R: Record + ?Sized> FieldDeclaration for R {
     }
 
     fn field_native_count(&self, field: &str) -> Option<u32> {
+        if !self.field_is_dbaddr(field) {
+            return None;
+        }
+        self.dbaddr_capacity(field)
+    }
+
+    fn field_is_dbaddr(&self, field: &str) -> bool {
         self.field_list()
             .iter()
-            .find(|d| d.name == field)
-            .filter(|d| d.special == Special::DbAddr)?;
-        self.dbaddr_capacity(field)
+            .any(|d| d.name.eq_ignore_ascii_case(field) && d.special == Special::DbAddr)
+            || self
+                .long_string_fields()
+                .iter()
+                .any(|f| f.eq_ignore_ascii_case(field))
     }
 }
 
@@ -1528,7 +1799,7 @@ pub trait Record: Send + Sync + 'static {
     /// dbAddr, keyed on the record's own fields, and one record does:
     ///
     /// ```c
-    /// /* compressRecord.c:398-407 */
+    /// /* compressRecord.c:395-407 */
     /// static long cvt_dbaddr(DBADDR *paddr) {
     ///     ...
     ///     if (prec->balg == bufferingALG_LIFO)
@@ -1798,7 +2069,7 @@ pub trait Record: Send + Sync + 'static {
 
     /// Whether a put to `field` directly defines the record — clears UDF
     /// exactly like a primary-value-field put. C `dbAccess.c::dbPut`
-    /// (`:1409-1411`) clears `udf` synchronously only when the put target is
+    /// (`:1409-1410`) clears `udf` synchronously only when the put target is
     /// `dbIsValueField` (i.e. `field == primary_field()`); this hook is where
     /// a record type says its own `special()` ALSO clears UDF for a
     /// non-value field, independent of `dbIsValueField`.
@@ -1880,7 +2151,7 @@ pub trait Record: Send + Sync + 'static {
     /// through `SMOO` and keep their own "a read has completed" state, which
     /// they clear on a failed read so the next good one is unsmoothed.
     ///
-    /// That filter belongs here and not in `process()`: `aiRecord.c:439-444`
+    /// That filter belongs here and not in `process()`: `aiRecord.c:440-444`
     /// is the copy the RAW dset needs (`devAiSoftRaw::read_ai` returns 0, so
     /// `convert()` runs), while both soft dsets return 2 and `convert()` never
     /// runs for them at all.
@@ -1961,7 +2232,7 @@ pub trait Record: Send + Sync + 'static {
     /// would otherwise write the raw device value straight into `VAL` and drop
     /// the scaling. Sets `VAL` only (a float64 `ao` carries no `RVAL`); the
     /// reverse scaling `(OVAL - AOFF) / ASLO` is applied on the device-write
-    /// side. Mirrors C `initAo`/`processAo` (devAsynFloat64.c:627-629/:646-649).
+    /// side. Mirrors C `initAo`/`processAo` (devAsynFloat64.c:628-630/:647-649).
     ///
     /// Returns `true` when the record produced `VAL` from the raw value (the
     /// asyn store path then reports `computed`, skipping the forward convert).
@@ -1984,19 +2255,39 @@ pub trait Record: Send + Sync + 'static {
     ) {
     }
 
-    /// Apply IVOA=2 ("set outputs to IVOV") semantics: copy the
-    /// IVOV value into whatever output staging field the OUT
-    /// writeback consumes for this record type. Mirrors the
-    /// per-record C `recXxx.c` behaviour:
+    /// Apply IVOA=2 ("set outputs to IVOV") semantics. C line numbers below
+    /// resolve at epics-base `R7.0.10`; `busy` is module `busy` at
+    /// `R1-7-4-6-g2dfe92d`.
     ///
-    /// - `ao`/`lso`: `OVAL = IVOV; VAL = OVAL`
-    /// - `bo`/`busy`/`mbbo`/`mbboDirect`: `RVAL = IVOV; VAL = IVOV`
-    /// - `calcout`/`scalcout`: `OVAL = IVOV` (VAL is calc input, not
-    ///   touched on invalid-output)
-    /// - `dfanout`: `VAL = IVOV` (the broadcast value)
+    /// **The rule for every record that has a raw/staged output word is
+    /// `VAL = IVOV`, then the record's OWN conversion — never `RVAL = IVOV`
+    /// or `OVAL = IVOV`.** IVOV is a value in VAL's engineering units, so it
+    /// has to travel the same VAL->raw path an ordinary cycle uses:
     ///
-    /// Default uses [`Record::set_val`] for records whose OUT path
-    /// reads VAL only.
+    /// - `ao` (`aoRecord.c:207-212`): `val = ivov; value = ivov;
+    ///   convert(prec, value);` — OROC, linearisation and raw rounding all
+    ///   run, so OVAL *and* RVAL are the converted IVOV.
+    /// - `bo` (`boRecord.c:230-238`), `busy` (`busyRecord.c:235-243`):
+    ///   `val = ivov;` then the inline `/* convert val to rval */` MASK rule.
+    /// - `mbbo` (`mbboRecord.c:232-236`), `mbboDirect`
+    ///   (`mbboDirectRecord.c:210-214`): `val = ivov; convert(prec);` — the
+    ///   ZRVL..FFVL state-value lookup (mbbo only) and the SHFT shift.
+    ///
+    /// Records with no raw word assign directly and there is nothing to
+    /// convert:
+    ///
+    /// - `calcout` (`calcoutRecord.c:646-647`), `scalcout`, `acalcout`:
+    ///   `oval = ivov` — and inside the `doOutput`-gated `execOutput`, so a
+    ///   non-output INVALID cycle must not touch OVAL at all. VAL is the calc
+    ///   result, not the output.
+    /// - `lso` (`lsoRecord.c:131-138`): `strncpy(val, ivov, sizv-1)` and
+    ///   `len = strlen(val)+1`. OVAL is `monitor()`'s tracker here, not
+    ///   output staging, and seeding it suppresses the write's own post.
+    /// - `dfanout` (`dfanoutRecord.c:137-139`): `val = ivov;` then
+    ///   `push_values(prec)`.
+    ///
+    /// Default uses [`Record::set_val`], which is the `dfanout` shape and is
+    /// correct for any record whose OUT path reads VAL only.
     fn apply_invalid_output_value(&mut self, ivov: EpicsValue) -> CaResult<()> {
         self.set_val(ivov)
     }
@@ -2120,12 +2411,30 @@ pub trait Record: Send + Sync + 'static {
     /// DBE_LOG` only when `len != olen || memcmp(oval, val, len)`. Those
     /// records return [`Self::uses_monitor_deadband`]`== false`, which
     /// otherwise routes them to the unconditional always-post path
-    /// (correct for binary records, wrong for lsi/lso). Because the
-    /// framework posts monitors *after* `process()` — by which point the
-    /// record has already committed `oval`/`olen` — the implementation
-    /// captures the comparison result during `process()` and returns the
-    /// captured flag here, not a live re-comparison.
-    fn monitor_value_changed(&self) -> Option<bool> {
+    /// (correct for binary records, wrong for lsi/lso).
+    ///
+    /// **THIS HOOK IS C's `monitor()`.** It takes `&mut self` because that is
+    /// where C both compares and commits: `if (prec->mlst != prec->val) {
+    /// events |= DBE_VALUE | DBE_LOG; prec->mlst = prec->val; }`
+    /// (`boRecord.c:395-400`) and its `oval`/`olen` twin
+    /// (`lsoRecord.c:248-252`). The implementation compares LIVE and commits
+    /// its own previous-value tracker here — it must NOT capture a flag during
+    /// `process()`.
+    ///
+    /// The distinction is not cosmetic. A record whose value can still change
+    /// between `process()` returning and the monitors being posted — every
+    /// record with an `IVOA = Set_output_to_IVOV` arm, since the port hoists
+    /// that decision into the framework's single IVOA owner where C keeps it
+    /// inside `process()` — reports a flag captured against the PRE-arm value
+    /// if it captures early, so the post for the IVOV write lands a cycle late
+    /// or, if the arm also seeds the tracker, never. Comparing here is the
+    /// uniform rule that removes the ordering from each record's concern.
+    ///
+    /// Called exactly once per completed cycle, from
+    /// `RecordInstance::value_include_classes`, which
+    /// the three cycle owners — the sync epilogue, the async completion, and
+    /// the SIMM tail — reach on mutually exclusive paths.
+    fn monitor_value_changed(&mut self) -> Option<bool> {
         None
     }
 
@@ -2190,7 +2499,7 @@ pub trait Record: Send + Sync + 'static {
     /// Fields the record's C `monitor()` posts on every cycle whose
     /// alarm transition fired, even when their value did not change.
     ///
-    /// C motorRecord.cc `monitor()` (3513-3645) computes
+    /// C motorRecord.cc `monitor()` (3456-3646) computes
     /// `local_mask = monitor_mask | (MARKED(x) ? DBE_VAL_LOG : 0)`
     /// for each field in its posting list — when the alarm moved
     /// (`monitor_mask != 0`), `local_mask` is non-zero for UNMARKED
@@ -2241,7 +2550,7 @@ pub trait Record: Send + Sync + 'static {
     /// rather than from a fixed list. aCalcout has two of them, and neither
     /// consults the value: `afterCalc` posts exactly the AMASK-flagged array
     /// fields — the ones the expression STORED into
-    /// (`aCalcoutRecord.c:293-297`) — and `monitor()` posts exactly the
+    /// (`aCalcoutRecord.c:294-298`) — and `monitor()` posts exactly the
     /// NEWM-flagged ones — the input arrays whose link delivered a CHANGED
     /// value (`:1031-1036`). `AA := AA` therefore still posts AA.
     ///
@@ -2291,10 +2600,10 @@ pub trait Record: Send + Sync + 'static {
     /// change-detects them, so a value change alone must post nothing.
     ///
     /// aCalcout's arrays AA..LL are the case. C's `monitor()` compares scalar
-    /// A..L against their PA..PL previous values (`aCalcoutRecord.c:1023-1029`)
+    /// A..L against their PA..PL previous values (`aCalcoutRecord.c:1024-1029`)
     /// and OVAL against POVL (`:1039`), but it keeps NO previous copy of an
     /// array and runs no array comparison anywhere: an array posts if and only
-    /// if the expression stored into it (AMASK, `afterCalc` `:293-297`) or its
+    /// if the expression stored into it (AMASK, `afterCalc` `:294-298`) or its
     /// input link delivered a changed value (NEWM, `:1031-1036`) — both reported
     /// by [`Self::take_cycle_posted_fields`].
     ///
@@ -2396,6 +2705,44 @@ pub trait Record: Send + Sync + 'static {
         &[]
     }
 
+    /// Per-cycle widening of the guard [`ValuePostGate::OnChangeForced`]
+    /// fields sit behind — C `if (prec->omod) monitor_mask |=
+    /// (DBE_VALUE|DBE_LOG);` (aoRecord.c:535), which opens the secondary block
+    /// on a cycle where VAL's own monitor mask is empty.
+    ///
+    /// ao needs it because `omod` tracks OVAL, not VAL: OROC can walk the
+    /// output one step per cycle toward a VAL that has not moved since MLST,
+    /// so C posts OVAL/RVAL on cycles that post no VAL at all.
+    ///
+    /// Clear-on-read, because C's is: `omod` can only ever be true on a cycle
+    /// whose guard therefore fires, and the guard's first act is
+    /// `prec->omod = FALSE` (`:537`).
+    ///
+    /// Default: empty — no widening, so the guard is VAL's own mask.
+    fn take_secondary_value_mask(&mut self) -> crate::server::recgbl::EventMask {
+        crate::server::recgbl::EventMask::NONE
+    }
+
+    /// C's whole `if (prec->oraw != prec->rval) { db_post_events(...);
+    /// prec->oraw = prec->rval; }` (aoRecord.c:541-543) minus the post: TEST
+    /// the [`ValuePostGate::OnChangeForced`] field against the record's own
+    /// "old" copy and, when it moved, ADVANCE that copy — one indivisible
+    /// step, because C's two statements are inseparable and splitting them is
+    /// what the port got wrong.
+    ///
+    /// Called once per cycle per declared field, by the framework, only when
+    /// the guard is open — and independently of whether anyone is subscribed,
+    /// since C's `db_post_events` runs whether or not anyone is listening. A
+    /// record must not advance the copy anywhere else: an eager `oraw = rval`
+    /// in the compute step makes the next guarded cycle see no change and
+    /// withhold an event C sends.
+    ///
+    /// Default: `false` — nothing declared, nothing to test.
+    fn take_secondary_value_change(&mut self, field: &str) -> bool {
+        let _ = field;
+        false
+    }
+
     /// Change-detected auxiliary fields this record posts with C's
     /// `monitor_mask | DBE_VALUE` — VAL's monitor mask ORed with `DBE_VALUE`,
     /// and NOT the framework default `monitor_mask | DBE_VALUE | DBE_LOG`.
@@ -2406,7 +2753,7 @@ pub trait Record: Send + Sync + 'static {
     /// subscriber (an archiver) receives the field exactly on the cycles C
     /// sends it, instead of on every change.
     ///
-    /// `swaitRecord.c::monitor` (646-653) is this shape for its A..L inputs:
+    /// `swaitRecord.c::monitor` (647-654) is this shape for its A..L inputs:
     ///
     /// ```c
     /// if (*pnew != *pprev)
@@ -2434,7 +2781,7 @@ pub trait Record: Send + Sync + 'static {
     ///
     /// C's fourth mask shape, and the only one that *drops* information the
     /// record already computed. `epidRecord.c::monitor` builds VAL's mask from
-    /// `recGblResetAlarms` (`:350`) and posts VAL with it, then REASSIGNS
+    /// `recGblResetAlarms` (`:351`) and posts VAL with it, then REASSIGNS
     /// (not `|=`) before the secondaries:
     ///
     /// ```c
@@ -2636,7 +2983,7 @@ pub trait Record: Send + Sync + 'static {
     /// The part of C's `init_record` tail that is NOT tracker seeding: an
     /// output record's closing VAL→RVAL conversion, run at the same point
     /// [`Self::seed_deadband_tracking`] is and immediately before it, which is
-    /// the order C writes the two in (`boRecord.c:166-175` converts, then
+    /// the order C writes the two in (`boRecord.c:167-175` converts, then
     /// seeds).
     ///
     /// It cannot live in [`Self::init_record`]: that runs before the
@@ -2645,11 +2992,24 @@ pub trait Record: Send + Sync + 'static {
     /// `busyRecord.c:151-179` is one function with the constant load at the
     /// top and the conversion at the bottom.
     ///
-    /// busy is the only implementor: `busyRecord.c:175-179` converts through
-    /// MASK and seeds no MLST/LALM, so it needs this half of the tail without
-    /// the other. Every other record whose init tail converts (bo, mbbo,
-    /// mbboDirect, ao) also seeds trackers and carries both together in
-    /// `seed_deadband_tracking`. Default: empty.
+    /// Every record whose C init tail does non-tracker work implements it here
+    /// — the conversion and the output-tracking stores C writes around the
+    /// `mlst`/`alst`/`lalm` lines:
+    ///
+    /// - busy `:176-179` — the convert alone; it seeds no tracker at all.
+    /// - bo `:166-170,174-175` — convert through MASK, then `oraw`/`orbv`.
+    /// - mbbo `:176-177,181-182` — `convert()`, then `oraw`/`orbv`.
+    /// - mbboDirect `:142-143,161-162` — `bitsFromVAL`, then `oraw`/`orbv`.
+    /// - ao `:156,160-161` — `oval`/`pval`, then `oraw`/`orbv`.
+    ///
+    /// The split is by MEANING, not by convenience: this hook is the tail's
+    /// derived state (RVAL and the bit cells from VAL, ORAW/ORBV from RVAL/RBV,
+    /// ao's OVAL/PVAL), and [`Self::seed_deadband_tracking`] is the tail's
+    /// deadband trackers and nothing else. Four records used to carry both
+    /// halves in `seed_deadband_tracking`, which made "the trackers are seeded"
+    /// and "the record is converted" the same call — so a caller that wanted
+    /// one got the other, and busy (which needs the convert without the
+    /// trackers) had to be the exception. Default: empty.
     fn init_record_tail(&mut self) {}
 
     /// Seed the monitor/archive/alarm deadband trackers (MLST/ALST/LALM)
@@ -2671,8 +3031,10 @@ pub trait Record: Send + Sync + 'static {
     /// `busyRecord.c` (:127-183) end `init_record` without touching the
     /// trackers, so those six leave them at 0 and DO post that first update.
     /// Each overrides this with an empty body. The output records override it
-    /// for the opposite reason — their C init tail seeds more than the
-    /// trackers (`aoRecord.c:156-161` also sets OVAL/PVAL/ORAW/ORBV).
+    /// only to name the subset their C tail actually writes (`mbboDirect`
+    /// seeds MLST and no LALM, `boRecord.c:172-173` seeds MLST and LALM but no
+    /// ALST); everything else their tail does is
+    /// [`Self::init_record_tail`]'s.
     fn seed_deadband_tracking(&mut self) {
         let seed = match self.monitor_deadband_value().and_then(|v| v.to_f64()) {
             Some(v) if v.is_finite() => v,
@@ -2744,11 +3106,40 @@ pub trait Record: Send + Sync + 'static {
     /// `transformRecord.c:537`). `false` only for swait, whose `fetch_values`
     /// (`swaitRecord.c:702`) reads INAA..INPL with `recDynLinkGet` and answers a
     /// failure with `recGblSetSevr(READ_ALARM, INVALID_ALARM)` at
-    /// `swaitRecord.c:412` instead. Both alarms are INVALID and
+    /// `swaitRecord.c:413` instead. Both alarms are INVALID and
     /// `rec_gbl_set_sevr*` is strict-greater, so raising the wrong one first
     /// wins the tie and publishes the wrong STAT.
     fn multi_input_fetch_is_db_get_link(&self) -> bool {
         true
+    }
+
+    /// Whether a FAILED read of this multi-input link leaves the cycle
+    /// untouched — no `setLinkAlarm`, no [`Self::input_fetch_policy`] gate,
+    /// no value stored.
+    ///
+    /// One record needs it: acalcout guards its ARRAY half with the link's own
+    /// connection status (`aCalcoutRecord.c:1078`)
+    ///
+    /// ```c
+    /// if ((*plinkValid==acalcoutINAV_EXT) || (*plinkValid==acalcoutINAV_LOC))
+    /// ```
+    ///
+    /// so an array link C believes cannot deliver is never read at all, and
+    /// `fetch_values` returns 0 with the calc still running. C moves a link
+    /// between `EXT_NC` and `EXT` from a `dbCaIsLinkConnected` watchdog
+    /// (`aCalcoutRecord.c:1155`, `:1187`); this port has no CA client, so it
+    /// publishes `EXT_NC` for EVERY external link
+    /// ([`crate::server::records::link_status::classify_link`]) and cannot make
+    /// that test at select time. Reading and then discarding the failure is the
+    /// same observable behaviour for every state the port can reach — a link
+    /// that delivers is C's `EXT`/`LOC`, a link that does not is C's `EXT_NC` —
+    /// and, unlike gating on the published `IAAV`, it does not stop reading the
+    /// external array links whose values the resolver really does serve.
+    ///
+    /// The SCALAR half is deliberately NOT inert: its loop (`:1068-1071`) has
+    /// no status test and `return`s at the first failing `dbGetLink`.
+    fn input_link_failure_is_inert(&self, _link_field: &str) -> bool {
+        false
     }
 
     /// Whether this record's C `process()` performs the SCALAR closed-loop DOL
@@ -2827,7 +3218,7 @@ pub trait Record: Send + Sync + 'static {
     /// status = fetch_values(prec);
     /// if (!status) { status = do_sub(prec); prec->val = status; }
     /// ...
-    /// if (!status)                      /* aSubRecord.c:232-239 */
+    /// if (!status)                      /* aSubRecord.c:234-240 */
     ///     for (i = 0; i < NUM_ARGS; i++)
     ///         dbPutLink(&(&prec->outa)[i], (&prec->ftva)[i], (&prec->vala)[i],
     ///             (&prec->neva)[i]);
@@ -2951,7 +3342,7 @@ pub trait Record: Send + Sync + 'static {
     /// it returns before performing any I/O, so the cycle does no device write,
     /// no SIOL redirect, and raises no SIMM_ALARM.
     ///
-    /// `busy` is the only record that does this (busyRecord.c:397-400):
+    /// `busy` is the only record that does this (busyRecord.c:399-401):
     ///
     /// ```c
     /// status = dbGetLink(&prec->siml, DBR_USHORT, &prec->simm, 0, 0);
@@ -3030,6 +3421,25 @@ pub trait Record: Send + Sync + 'static {
         Vec::new()
     }
 
+    /// A `special()`/`put_field` pass that ended on C's `prec->udf = FALSE`.
+    ///
+    /// UDF is a common field, so a record method cannot write it — the same
+    /// wall [`Self::post_init_finalize_undef`] exists for at init time. This is
+    /// the runtime half: `histogramRecord.c:354-364`'s `clear_histogram` ends
+    /// on `prec->udf = FALSE` and is reached from two puts (the `CMD <= 1`
+    /// SPC_CALC arm `:246-259` and the ULIM/LLIM SPC_RESET arm `:266-273`), so
+    /// latching inside the clear rather than at each caller is what makes the
+    /// two agree by construction.
+    ///
+    /// Drained unconditionally by the after-put owner, for
+    /// [`Self::take_special_actions`]'s reason: C performs this assignment
+    /// inside `special()`, before any status can divert the caller.
+    ///
+    /// Default: none (the record's puts never clear UDF).
+    fn take_udf_clear(&mut self) -> bool {
+        false
+    }
+
     /// Other fields whose monitors must be posted because a put to
     /// `put_field` changed them as a side effect, without driving a full
     /// process cycle.
@@ -3091,6 +3501,30 @@ pub trait Record: Send + Sync + 'static {
         true
     }
 
+    /// Does this record's C `process()` re-derive `udf` after a DEVICE read
+    /// that wrote VAL directly (C `return 2`)?
+    ///
+    /// True where the `else if (status == 2) status = 0;` fold happens BEFORE
+    /// the UDF assignment, so a `2` arrives at it as a `0` and the record
+    /// re-derives whatever the dset already wrote: `aiRecord.c:158-161` is the
+    /// shape, and it is the majority.
+    ///
+    /// False for the five records that keep the assignment INSIDE
+    /// `if (status == 0)` with the fold after it — `biRecord.c:55-60`,
+    /// `mbbiRecord.c:61-86`, `mbbiDirectRecord.c:58-69` — or that have no fold
+    /// at all — `longinRecord.c:58`, `int64inRecord.c:58`. There `udf` belongs
+    /// to the dset, which is exactly where C puts it: `devBiSoft.c::readLocked`
+    /// writes `prec->udf = FALSE` and returns 2, and `devBiDbState.c:67` does
+    /// the same. The port's equivalent is
+    /// [`DeviceUdf`](crate::server::device_support::DeviceUdf), applied before
+    /// this rule runs.
+    ///
+    /// Not consulted for a soft-channel INP read: there the framework IS the
+    /// dset, so it owns the clear the way `readLocked` does.
+    fn rederives_udf_on_computed_read(&self) -> bool {
+        true
+    }
+
     /// Whether this record's C `process()` clears UDF regardless of the read's
     /// status — i.e. even when `readValue` failed.
     ///
@@ -3115,7 +3549,7 @@ pub trait Record: Send + Sync + 'static {
     /// FAILED?
     ///
     /// The scalar input records do not — the assignment sits inside
-    /// `if (status == 0)`: `aiRecord.c:161`, `biRecord.c:144-148`,
+    /// `if (status == 0)`: `aiRecord.c:161`, `biRecord.c:136-140`,
     /// `mbbiRecord.c:168-174`, `mbbiDirectRecord.c:155-164`,
     /// `longinRecord.c:148`, `int64inRecord.c:144`. A broken link therefore
     /// leaves the record at whatever UDF it already had, and that is what makes
@@ -3124,7 +3558,7 @@ pub trait Record: Send + Sync + 'static {
     ///
     /// The array records and `compress` do — `prec->udf = FALSE` runs after
     /// `readValue` whatever it returned (`waveformRecord.c:144`,
-    /// `aaiRecord.c:174`, `aaoRecord.c:165`); `compressRecord.c:341-366` folds a
+    /// `aaiRecord.c:174`, `aaoRecord.c:165`); `compressRecord.c:342-366` folds a
     /// failed `dbGetLink` into `status = 0` and clears anyway; and subArray's
     /// `prec->udf = !!status` (`subArrayRecord.c:148`) IS the status.
     ///
@@ -3314,8 +3748,8 @@ pub trait Record: Send + Sync + 'static {
     /// C `special()` RE-SEEDS on a runtime put to the link field —
     /// `recGblInitConstantLink(plink, DBF_DOUBLE, pvalue)` +
     /// `db_post_events(prec, pvalue, DBE_VALUE)` + `INAV = CON`
-    /// (`calcoutRecord.c:367-378`, `sCalcoutRecord.c:512-517`,
-    /// `aCalcoutRecord.c:534-540`).
+    /// (`calcoutRecord.c:373-378`, `sCalcoutRecord.c:513-518`,
+    /// `aCalcoutRecord.c:533-538`).
     ///
     /// Without it a constant link is load-once dead state: `caput CO.INPB 7`
     /// stores the link text, the link layer then delivers nothing at process
@@ -3348,9 +3782,10 @@ pub trait Record: Send + Sync + 'static {
     /// The event mask of the `db_post_events` call in that record's `special()`
     /// re-seed arm — the C call sites do not agree:
     ///
-    ///  * calcout (`calcoutRecord.c:376`), sCalcout (`:516`), aCalcout (`:537`)
+    ///  * calcout (`calcoutRecord.c:377`), sCalcout (`sCalcoutRecord.c:516`),
+    ///    aCalcout (`aCalcoutRecord.c:536`)
     ///    post a literal `DBE_VALUE`.
-    ///  * transform (`transformRecord.c:718`) posts `DBE_VALUE | DBE_LOG`.
+    ///  * transform (`transformRecord.c:719`) posts `DBE_VALUE | DBE_LOG`.
     ///
     /// Default: `DBE_VALUE`, the majority shape. Only consulted for the fields
     /// named by [`Self::special_reseed_input_links`].
@@ -3414,7 +3849,7 @@ pub trait Record: Send + Sync + 'static {
     /// selector index (sel's NVL→SELN value, or `None` when no NVL link
     /// drove it). Default `None` = fetch every input link.
     ///
-    /// C `selRecord.c::fetch_values` (lines 421-431) fetches ONLY `INP[SELN]`
+    /// C `selRecord.c::fetch_values` (lines 421-432) fetches ONLY `INP[SELN]`
     /// in `Specified` mode and all inputs otherwise; sel returns
     /// `Some(vec![INP[SELN]])` so the non-selected inputs are never read and
     /// raise no monitors or link-alarm SEVR.
@@ -3436,7 +3871,7 @@ pub trait Record: Send + Sync + 'static {
     /// * `writeValue` (ao, bo, …): the simulated write replaces the device write
     ///   at the END of the body, so the body runs and only the output is
     ///   redirected to SIOL.
-    /// * swait (`swaitRecord.c:401-421`): the simulated read replaces
+    /// * swait (`swaitRecord.c:402-422`): the simulated read replaces
     ///   `fetch_values()` **and** `calcPerform()` and nothing else — VAL comes
     ///   from SIOL through SVAL, and the OOPT switch, `execOutput`, the monitors
     ///   and the forward link all still run from the record's own `process()`.
@@ -3482,7 +3917,7 @@ pub trait Record: Send + Sync + 'static {
     /// same arm as an `else if (prec->simm != menuYesNoNO)`) and `busy`
     /// (`busyRecord.c:409-413`, the `else` of its YES test).
     ///
-    /// `swait` is the sole exception: `swaitRecord.c:407-421` is a plain
+    /// `swait` is the sole exception: `swaitRecord.c:407-422` is a plain
     /// `if (pwait->simm == menuYesNoNO) { … } else { /* SIMULATION MODE */ … }`,
     /// so every non-NO value — legal or not — simulates. It overrides to
     /// `false`.
@@ -3491,6 +3926,37 @@ pub trait Record: Send + Sync + 'static {
     /// the single owner of the SIMM dispatch.
     fn rejects_illegal_sim_mode(&self) -> bool {
         true
+    }
+
+    /// Whether this record's `readValue` raises `SIMM_ALARM` AFTER its SIOL
+    /// read instead of before it.
+    ///
+    /// `recGblSetSevr` is strict-greater, so the ORDER of the SIMM raise
+    /// against the LINK_ALARM/INVALID that a failed `dbGetLink` raises inside
+    /// itself (`dbLink.c:319` `setLinkAlarm`, reached from `:336`) decides an
+    /// equal-severity tie. With `SIMS = INVALID` and a broken SIOL the record
+    /// publishes whichever of the two was raised FIRST.
+    ///
+    /// The base records raise it first, at the top of the `case menuYesNoYES:`
+    /// arm — `longinRecord.c:414` then `:416` — so they publish
+    /// `STAT = SIMM_ALARM`. That is the default, and it is what the generic
+    /// raise in `check_simulation_mode` performs.
+    ///
+    /// `mca` is the other order: `mcaRecord.c:1118` reads SIOL and only then
+    /// `:1129` runs `recGblSetSevr(pmca, SIMM_ALARM, pmca->sims)`, past the
+    /// `if/else` on SIMM, so the LINK_ALARM raised inside the read WINS the tie
+    /// and C publishes `STAT = LINK_ALARM` with `AMSG = "field SIOL"`.
+    /// (Read against `mca` at `687d563`; that tree records no pin.)
+    ///
+    /// `swait` is the same order but does not answer here — it has its own
+    /// `input_stage` path in `check_simulation_mode`, which already reads
+    /// before it raises (`swaitRecord.c:416` then `:421`).
+    ///
+    /// Declared per record rather than special-cased at the raise site so a
+    /// record type carries its own C ordering; overriding to `true` is the
+    /// whole opt-in.
+    fn raises_simm_after_read(&self) -> bool {
+        false
     }
 
     /// This cycle's simulation state, pushed by the framework before
@@ -3633,7 +4099,7 @@ pub trait Record: Send + Sync + 'static {
     /// the RESOLVED TARGET — the no-staged-value sibling of
     /// [`Self::multi_output_buffer`].
     ///
-    /// C `sseqRecord.c::processCallback` (706-793) is the case: the value a
+    /// C `sseqRecord.c::processCallback` (708-795) is the case: the value a
     /// step forwards is not one field but a *switch on the destination*
     /// (`dbGetLinkDBFtype(&lnk)` / `dbGetNelements(&lnk)`), taken at fire
     /// time — the string view `s` for a string-class target, the double view
@@ -3660,7 +4126,7 @@ pub trait Record: Send + Sync + 'static {
     /// ([`ProcessAction::ResolveOutTarget`]).
     ///
     /// C resolves an OUT link's DBF class OUTSIDE the put — `checkLinks` caches
-    /// it in the record (`sseqRecord.c:202-250`) — so `processCallback` can make
+    /// it in the record (`sseqRecord.c:203-240`) — so `processCallback` can make
     /// ONE decision from it: which view goes on the wire, AND whether a
     /// put-callback is issued (hence whether `waiting` is raised). Its
     /// `default:` arm (`:790`) does neither. A record that learns the class only
@@ -3727,7 +4193,7 @@ pub trait Record: Send + Sync + 'static {
     /// On the `ReadDbLink` path this is also where a pvalink NTEnum
     /// carrier ([`EpicsValue::EnumWithChoices`]) is resolved. The
     /// dbrType-blind link resolver produces it for an NTEnum source;
-    /// pvxs `pvaGetValue` (`pvalink_lset.cpp:330-360`) picks
+    /// pvxs `pvaGetValue` (`pvxs/ioc/pvalink_lset.cpp:330-360`) picks
     /// label-vs-index by the TARGET field's dbrType — only a DBR_STRING
     /// target gets the `choices[index]` label, every other type takes
     /// the numeric index. Route it through [`EpicsValue::convert_to`]
@@ -3800,7 +4266,7 @@ pub trait Record: Send + Sync + 'static {
     /// both events arriving at the same entry point, so a record whose C
     /// original keeps the two paths separate — throttle's `delayFuncCallback`
     /// -> `valuePut` versus `process()` -> `enterValue`
-    /// (`throttleRecord.c:517-600`) — cannot route the cycle without knowing
+    /// (`throttleRecord.c:518-613`) — cannot route the cycle without knowing
     /// which one it is. The framework already knows; this hook is what it
     /// tells the record, so the record never has to infer it from a clock
     /// reading (which a mid-flight interval change silently falsifies).
@@ -4049,7 +4515,12 @@ pub fn put_field_internal_default<R: Record + ?Sized>(
                 || ((value.db_field_type() != target || target == DbFieldType::String)
                     && !value.is_empty_array()) =>
         {
-            coerce_put_value(record, name, target, value)?
+            match coerce_put_value(record, name, target, value)? {
+                Converted::Stored(v) => v,
+                // C's converter returned success without storing: the field
+                // keeps its old value and the put still succeeds.
+                Converted::Unchanged => return Ok(()),
+            }
         }
         // Carrier with no known target field: collapse to a bare index (the prior
         // fallback) rather than letting it reach storage.
@@ -4096,7 +4567,7 @@ pub fn coerce_put_value<R: Record + ?Sized>(
     field: &str,
     target: DbFieldType,
     value: EpicsValue,
-) -> CaResult<EpicsValue> {
+) -> CaResult<Converted> {
     if let EpicsValue::String(s) = &value {
         // DTYP (DBF_DEVICE) validates against the record type's FULL device
         // menu — static `device()` lines PLUS runtime-contributed device
@@ -4114,19 +4585,22 @@ pub fn coerce_put_value<R: Record + ?Sized>(
                     &choices,
                     target,
                     &s.as_str_lossy(),
-                );
+                )
+                .map(Converted::Stored);
             }
             // No device menu declared or contributed for this record type: fall
             // through to the generic handling below (unchanged behavior).
         } else if let Some(choices) = super::record_instance::menu_choices_of(record, field) {
-            return super::resolve_menu_field_string(field, choices, target, &s.as_str_lossy());
+            return super::resolve_menu_field_string(field, choices, target, &s.as_str_lossy())
+                .map(Converted::Stored);
         }
         if target == DbFieldType::Enum {
             return super::resolve_enum_state_string(
                 field,
                 record.enum_state_strings().as_deref(),
                 s,
-            );
+            )
+            .map(Converted::Stored);
         }
         // An ARRAY destination runs the row ITSELF: C applies the same
         // `putString*` routine to each of the `nRequest` elements, and this
@@ -4135,7 +4609,7 @@ pub fn coerce_put_value<R: Record + ?Sized>(
         // and DIFFERENT rule ahead of theirs — `convert_to`'s string→`DBF_CHAR[]`
         // byte carry, which is the DBR_CHAR row (`caput -S`), not this one.
         if record.get_field(field).is_some_and(|v| v.is_array()) {
-            return Ok(value);
+            return Ok(Converted::Stored(value));
         }
         if let Some(numeric) = c_parse::NumericField::of(target) {
             return c_parse::put_string(field, numeric, &s.as_str_lossy());
@@ -4150,12 +4624,12 @@ pub fn coerce_put_value<R: Record + ?Sized>(
             // wire already caps a DBR_STRING at `MAX_STRING_SIZE - 1` (39), so
             // this only bites a field whose `.dbd` `size(N)` is under 40 —
             // dbCommon `ASG` `size(29)` → 28, and the like.
-            return Ok(EpicsValue::String(cap_string_to_field_size(
-                record, field, s,
+            return Ok(Converted::Stored(EpicsValue::String(
+                cap_string_to_field_size(record, field, s),
             )));
         }
     }
-    Ok(value.convert_to(target))
+    Ok(Converted::Stored(value.convert_to(target)))
 }
 
 /// C `putStringString`'s truncation: a `DBF_STRING` field stores at most
@@ -4187,3 +4661,152 @@ fn cap_string_to_field_size<R: Record + ?Sized>(record: &R, field: &str, s: &PvS
 /// failure inside the closure (e.g. a field write error), which aborts
 /// processing — it is distinct from a negative status.
 pub type SubroutineFn = Box<dyn Fn(&mut dyn Record) -> CaResult<i64> + Send + Sync>;
+
+#[cfg(test)]
+mod declaration_numbering_tests {
+    use super::*;
+    use crate::server::record::dbd_generated::{DB_COMMON_FIELDS, record_fields};
+
+    /// C's `special.h:26-39` @R7.0.10 in full, plus the 0 C leaves in
+    /// `pdbFldDes->special` for a field with no `special()`.
+    ///
+    /// The WHOLE table, not a sample, because the numbering is not
+    /// contiguous: C has no 4, and the record-specific half jumps to 100. A
+    /// twelfth variant inserted in the middle must fail on its own row here
+    /// rather than shift every code after it.
+    const C_SPECIAL: [(Special, i16, &str); 11] = [
+        (Special::None, 0, "(none)"),
+        (Special::NoMod, 1, "SPC_NOMOD"),
+        (Special::DbAddr, 2, "SPC_DBADDR"),
+        (Special::Scan, 3, "SPC_SCAN"),
+        (Special::AlarmAck, 5, "SPC_ALARMACK"),
+        (Special::As, 6, "SPC_AS"),
+        (Special::Attribute, 7, "SPC_ATTRIBUTE"),
+        (Special::Mod, 100, "SPC_MOD"),
+        (Special::Reset, 101, "SPC_RESET"),
+        (Special::LinConv, 102, "SPC_LINCONV"),
+        (Special::Calc, 103, "SPC_CALC"),
+    ];
+
+    /// Exhaustive by construction: a twelfth variant stops the build here, so
+    /// the distinctness check below turns 11 rows into a proof of coverage.
+    fn _the_enum_has_no_variant_outside_the_table(s: Special) {
+        match s {
+            Special::None
+            | Special::NoMod
+            | Special::DbAddr
+            | Special::Scan
+            | Special::AlarmAck
+            | Special::As
+            | Special::Attribute
+            | Special::Mod
+            | Special::Reset
+            | Special::LinConv
+            | Special::Calc => (),
+        }
+    }
+
+    #[test]
+    fn every_special_carries_cs_spc_number() {
+        for (spc, n, name) in C_SPECIAL {
+            assert_eq!(spc as i16, n, "{name}: wrong SPC_ number");
+        }
+        for (a, (x, ..)) in C_SPECIAL.iter().enumerate() {
+            for (y, ..) in C_SPECIAL.iter().skip(a + 1) {
+                assert_ne!(x, y, "{x:?} listed twice");
+            }
+        }
+        // The gap is the reason the discriminants are written out: an
+        // implicitly-numbered enum would have answered 4 here and 7 for
+        // `Mod`, and `special as i16` is the integer C prints.
+        assert!(!C_SPECIAL.iter().any(|(_, n, _)| *n == 4), "C has no SPC 4");
+        // `pamapspcType[SPC_NTYPES]` (`special.h:42,51-61`) is the `.dbd`
+        // parser's table: nine entries, omitting SPC_ATTRIBUTE — which C sets
+        // internally — and the 0 that means no `special()` at all.
+        assert_eq!(
+            C_SPECIAL
+                .iter()
+                .filter(|(s, ..)| !matches!(s, Special::None | Special::Attribute))
+                .count(),
+            9,
+        );
+    }
+
+    #[test]
+    fn the_declared_token_survives_the_generators_collapse() {
+        // `dbf_to_rust` maps DBF_INLINK|DBF_OUTLINK|DBF_FWDLINK onto one
+        // served type, so `dbf_type` cannot tell a forward link from an
+        // output link — and the field NAME cannot either: `LNK1` is
+        // DBF_OUTLINK on sseq and DBF_FWDLINK on fanout. Only the carried
+        // declaration separates them, which is what `dba` and `dbDumpField`
+        // have to print.
+        let field = |rec: &str, name: &str| {
+            record_fields(rec)
+                .unwrap_or_else(|| panic!("no field table for {rec}"))
+                .iter()
+                .find(|f| f.name == name)
+                .unwrap_or_else(|| panic!("{rec}.{name} not in the table"))
+        };
+        let sseq_lnk1 = field("sseq", "LNK1");
+        let fanout_lnk1 = field("fanout", "LNK1");
+        let ai_inp = field("ai", "INP");
+        let flnk = DB_COMMON_FIELDS
+            .iter()
+            .find(|f| f.name == "FLNK")
+            .expect("dbCommon.FLNK");
+
+        for f in [sseq_lnk1, fanout_lnk1, ai_inp, flnk] {
+            assert_eq!(f.dbf_type, DbFieldType::String, "{}: served type", f.name);
+        }
+        assert_eq!(sseq_lnk1.declared_dbf, DbfCode::Outlink);
+        assert_eq!(fanout_lnk1.declared_dbf, DbfCode::Fwdlink);
+        assert_eq!(ai_inp.declared_dbf, DbfCode::Inlink);
+        assert_eq!(flnk.declared_dbf, DbfCode::Fwdlink);
+
+        // The other half of the collapse: DBF_ENUM|DBF_MENU|DBF_DEVICE all
+        // serve as Enum. `DTYP` is the one DBF_DEVICE field in all of base.
+        let dtyp = DB_COMMON_FIELDS
+            .iter()
+            .find(|f| f.name == "DTYP")
+            .expect("dbCommon.DTYP");
+        let scan = DB_COMMON_FIELDS
+            .iter()
+            .find(|f| f.name == "SCAN")
+            .expect("dbCommon.SCAN");
+        assert_eq!(dtyp.dbf_type, DbFieldType::Enum);
+        assert_eq!(dtyp.declared_dbf, DbfCode::Device);
+        assert_eq!(scan.dbf_type, DbFieldType::Enum);
+        assert_eq!(scan.declared_dbf, DbfCode::Menu);
+    }
+
+    #[test]
+    fn no_access_reads_the_declaration_not_the_served_type() {
+        // `waveform.VAL` is declared DBF_NOACCESS and re-typed by
+        // `cvt_dbaddr`, so its served type says nothing; the declaration is
+        // what `dbPutString` refuses a `.db` assignment on.
+        let val = record_fields("waveform")
+            .expect("waveform")
+            .iter()
+            .find(|f| f.name == "VAL")
+            .expect("waveform.VAL");
+        assert_eq!(val.declared_dbf, DbfCode::NoAccess);
+        assert!(val.no_access());
+        assert_ne!(val.dbf_type, DbFieldType::String, "re-typed by cvt_dbaddr");
+
+        // `mbbo.VAL` is the counter-example the doc names: SPC_DBADDR too,
+        // but declared DBF_ENUM, so it is settable.
+        let mbbo_val = record_fields("mbbo")
+            .expect("mbbo")
+            .iter()
+            .find(|f| f.name == "VAL")
+            .expect("mbbo.VAL");
+        assert!(!mbbo_val.no_access());
+
+        // A hand-written descriptor has no `.dbd` behind it, so its
+        // declaration is its served type's own code and it is never a C
+        // internal.
+        let hand = FieldDesc::new("VAL", DbFieldType::Double, false);
+        assert_eq!(hand.declared_dbf, DbfCode::Double);
+        assert!(!hand.no_access());
+    }
+}

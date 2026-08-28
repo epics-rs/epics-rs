@@ -2,7 +2,7 @@
 //!
 //! C has no visited set. Its two re-entry guards are both properties of the
 //! CURRENT stack: `dbProcess` refuses a record whose `pact` is set
-//! (`dbAccess.c:537-557`), and `processTarget` claims `dbRec2Pvt(pdst)
+//! (`dbAccess.c:536-556`), and `processTarget` claims `dbRec2Pvt(pdst)
 //! ->procThread` immediately before `dbProcess(pdst)` and clears it
 //! immediately after (`dbDbLink.c:439-440`, `:502-526`). A record reached
 //! twice in one cascade — the second time after the first visit has already
@@ -41,7 +41,7 @@ fn val(db: &PvDatabase, name: &str) -> f64 {
 /// and the record already on the stack must run exactly once — C's
 /// `dbProcess` finds `L1->pact` still TRUE (the record sets it for the
 /// duration of its own `process`, and `recGblFwdLink` runs inside that) and
-/// returns above the record support (`dbAccess.c:537`).
+/// returns above the record support (`dbAccess.c:536`).
 ///
 /// This is the boundary the removal on unwind must not regress: it is the
 /// marker's presence WHILE the frame is live that bounds the loop.
@@ -96,7 +96,7 @@ record(calc, "C") { field(CALC, "VAL+1") field(VAL, "0") }
 /// BOUNDARY (c): re-entry into a record that is genuinely busy. `T` is held
 /// PACT (an async cycle in flight), so the forward link must be refused by the
 /// PACT gate — not by the marker, which is empty for `T` at that moment. C:
-/// `dbProcess` returns at `dbAccess.c:537` without running record support.
+/// `dbProcess` returns at `dbAccess.c:536` without running record support.
 #[epics_macros_rs::epics_test]
 async fn a_pact_target_is_refused_by_the_pact_gate() {
     let db = ioc(r#"

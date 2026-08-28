@@ -16,7 +16,7 @@
 //! ```
 //!
 //! `SIZE` exists precisely so a client can be told the smaller number
-//! (`:619-626`), and it defaults to `NELM` — the first menu choice. The port
+//! (the menu's own comment, `:619-626`), and it defaults to `NELM` — the first menu choice. The port
 //! modelled the branch in `dbaddr_no_elements` and used it to bound a client
 //! write, but never advertised it, so the channel was sized from the SERVED
 //! count. Under the default `SIZE=NELM` with `0 < NUSE < NELM` a client sized

@@ -1,7 +1,7 @@
 //! A put-callback (`caput -c`) to a DBF link field must land the value even
 //! when the record is PACT-parked.
 //!
-//! C `dbProcessNotify` (`dbNotify.c:337-353`) handles a put-notify to a DBF
+//! C `dbProcessNotify` (`dbNotify.c:337-354`) handles a put-notify to a DBF
 //! link field (`DBF_INLINK`/`DBF_OUTLINK`/`DBF_FWDLINK`) as a dedicated early
 //! case, ABOVE the PACT logic:
 //!
@@ -109,7 +109,7 @@ async fn constant_string_lands_on_every_parked_sub_link_field() {
         assert!(
             completed,
             "{field}: a put-notify to a DBF link field completes immediately in C \
-             (dbNotify.c:337-353), even on a PACT-parked record — it must not park"
+             (dbNotify.c:337-354), even on a PACT-parked record — it must not park"
         );
         assert_eq!(
             readback(&db, "W:SUB", field).await.as_str(),
@@ -128,9 +128,12 @@ async fn real_db_link_string_round_trips_on_parked_sub() {
     assert!(is_parked(&db, "W:SUB").await);
 
     assert!(put_notify(&db, "W:SUB", "INPB", "W:OTHER.VAL CP").await);
+    // The read-back is C `dbGetString`, not the text the put carried:
+    // measured on `softIoc` R7.0.10-146, `caget` of a `sub` INPA written
+    // `L:B.VAL CP` answers `L:B.VAL CP NMS`.
     assert_eq!(
         readback(&db, "W:SUB", "INPB").await.as_str(),
-        "W:OTHER.VAL CP"
+        "W:OTHER.VAL CP NMS"
     );
 }
 

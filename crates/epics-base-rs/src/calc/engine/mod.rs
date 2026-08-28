@@ -348,8 +348,8 @@ pub struct StringInputs {
     /// supplies 16 (`transformRecord.c:593`).
     num_args: usize,
     /// C's `numSArgs` — the same for the STRING args (`psarg`), guarding
-    /// `FETCH_AA..LL` (`:871`), `STORE_AA..LL` (`:891`) and `@@n` (`:914`,
-    /// `:1471`). scalcout supplies 12 (`STRING_MAX_FIELDS`); transform supplies
+    /// `FETCH_AA..LL` (`sCalcPerform.c:871`), `STORE_AA..LL` (`:891`) and `@@n`
+    /// (`:914`, `:1471`). scalcout supplies 12 (`STRING_MAX_FIELDS`); transform supplies
     /// **zero** and a NULL `psarg` (`transformRecord.c:593`) — under transform,
     /// no string arg exists at all, so `AA` reads empty and `AA:=` writes nowhere.
     num_sargs: usize,
@@ -424,10 +424,11 @@ pub struct ArrayInputs {
     ///
     /// C hands aCalcPerform a pointer to the record's own arrays, so a store lands
     /// in the record directly and this mask is how the caller learns WHICH ones
-    /// changed: `afterCalc` posts exactly the flagged fields (`aCalcoutRecord.c:293-297`).
+    /// changed: `afterCalc` posts exactly the flagged fields (`aCalcoutRecord.c:294-298`).
     ///
     /// The engine OWNS it. It is reset at the top of every run (`:326`, `*amask = 0`)
-    /// and set only by the array-store opcodes (`:487`, `:524`), so a caller cannot
+    /// and set only by the array-store opcodes (`aCalcPerform.c:487`, `:524`), so
+    /// a caller cannot
     /// see a stale bit and a store cannot land without its bit. Read it AFTER the
     /// run, never set it before.
     pub amask: u32,
@@ -438,7 +439,8 @@ pub struct ArrayInputs {
     /// `:1279-1281`). acalcout supplies 12 (`MAX_FIELDS`, `aCalcoutRecord.c:1283`).
     num_dargs: usize,
     /// C's `num_aArgs` — the same for the ARRAY args, guarding `FETCH_AA..LL`
-    /// (`:446`), `STORE_AA..LL` (`:471`) and `@@n` (`:510`, `:1485`). acalcout
+    /// (`aCalcPerform.c:446`), `STORE_AA..LL` (`:471`) and `@@n` (`:510`,
+    /// `:1485`). acalcout
     /// supplies 12 (`ARRAY_MAX_FIELDS`).
     num_aargs: usize,
 }

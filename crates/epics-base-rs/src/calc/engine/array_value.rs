@@ -15,7 +15,7 @@ use super::error::CalcError;
 ///
 /// # The window
 ///
-/// C derives it in `calcFirstLast` (`:289-296`):
+/// C derives it in `calcFirstLast` (`:289-295`):
 ///
 /// ```c
 /// if (ps->numEl != -1) { *firstEl = ps->firstEl; *lastEl = ps->firstEl + ps->numEl - 1; }
@@ -23,7 +23,7 @@ use super::error::CalcError;
 /// ```
 ///
 /// `firstEl` is **provably always 0**: the only assignments to it in the file are
-/// `ps->firstEl = 0` in SUBRANGE and SUBRANGE_IP (`:1538`, `:1544`), and the
+/// `ps->firstEl = 0` in SUBRANGE and SUBRANGE_IP (`:1537`, `:1543`), and the
 /// stack is zero-initialised. The window is therefore always a PREFIX of the
 /// buffer, `num_el` alone carries it, and `last_el()` is all the operators need.
 /// Modelling `firstEl` as well would be modelling a value that cannot vary.
@@ -35,8 +35,8 @@ use super::error::CalcError;
 /// compiled-C observables, so the sentinel is spelled `None` and the count stays
 /// signed.
 ///
-/// Only SUBRANGE, SUBRANGE_IP and CAT (`:1381-1391`, `:1530-1546`) set a window;
-/// `to_array` clears it (`:130`) and so does every fresh push (C's `INC`, `:88`).
+/// Only SUBRANGE, SUBRANGE_IP and CAT (`:1520-1548`, `:1384-1392`) set a window;
+/// `to_array` clears it (`:133`) and so does every fresh push (C's `INC`, `:108`).
 #[derive(Debug, Clone, PartialEq)]
 pub struct ArrayCell {
     /// C's `ps->array`/`ps->a` — exactly `array_size` doubles.

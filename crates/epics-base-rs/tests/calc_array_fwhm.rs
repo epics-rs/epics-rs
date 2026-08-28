@@ -47,7 +47,7 @@ fn r11_11_a_sample_exactly_at_half_max_is_not_a_crossing() {
 }
 
 /// A monotonic ramp peaks at its LAST element, so there is no forward crossing and C
-/// measures to the end of the window: `e = lastEl` (`:953`). Compiled C,
+/// measures to the end of the window: `e = lastEl` (`:944`). Compiled C,
 /// AA=[0,1,2,3,4]: 2 — the port answered ~0, because it left the forward crossing at
 /// the peak index.
 #[test]
@@ -56,7 +56,7 @@ fn r11_11_no_forward_crossing_measures_to_the_last_element() {
 }
 
 /// Mirror image: a descending ramp peaks at element 0, so there is no backward
-/// crossing and C measures from the START, `d = 0` (`:964`). Compiled C,
+/// crossing and C measures from the START, `d = 0` (`:955`). Compiled C,
 /// AA=[4,3,2,1,0]: 2.
 #[test]
 fn r11_11_no_backward_crossing_measures_from_the_first_element() {
@@ -99,7 +99,7 @@ fn r11_11_an_empty_window_is_minus_one() {
     assert_eq!(got, -1.0, "lastEl is -1 and neither crossing is found");
 }
 
-/// A scalar operand is C's `case FWHM: ps->d = 0;` (`:1097`), not an error.
+/// A scalar operand is C's `case FWHM: ps->d = 0;` (`:1086`), not an error.
 #[test]
 fn r11_11_fwhm_of_a_scalar_is_zero() {
     let mut i = ArrayInputs::new(5);

@@ -1,6 +1,6 @@
 //! R9-72 — swait posts a changed input A..L with `monitor_mask | DBE_VALUE`.
 //!
-//! C `swaitRecord.c::monitor` (646-653):
+//! C `swaitRecord.c::monitor` (647-654):
 //!
 //! ```c
 //! for (i=0, pnew=&pwait->a, pprev=&pwait->la; i<MAX_FIELDS; i++, pnew++, pprev++) {

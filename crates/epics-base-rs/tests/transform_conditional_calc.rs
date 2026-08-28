@@ -17,7 +17,7 @@
 //!   * `same` as "no put landed on this channel" — i.e. the `map` bit alone,
 //!     with the value-vs-LA comparison dropped. That misses every write that
 //!     does not come through `special()`, and R19-1 added one: the CONSTANT-INPx
-//!     re-seed (`:717`).
+//!     re-seed (`:718`).
 //!
 //! One case per boundary of the gate.
 
@@ -81,7 +81,7 @@ async fn a_constant_valued_inp_link_is_no_inlink_so_the_channel_still_calcs() {
 }
 
 /// `map` bit — a put to the VALUE field itself marks the channel new
-/// (`:698-704`), so the cycle that put drives (`A` is `pp(TRUE)`,
+/// (`:699-705`), so the cycle that put drives (`A` is `pp(TRUE)`,
 /// `transformRecord.dbd:409-414`, so `dbPutField` processes the record) leaves
 /// the value alone. `:600` clears the map, so the NEXT cycle calculates again:
 /// the put survives exactly one cycle.
@@ -100,7 +100,7 @@ async fn a_put_to_the_value_field_suppresses_one_cycle_then_calc_resumes() {
     assert_eq!(field(&db, "T", "A").await, 11.0, "map cleared at :600");
 }
 
-/// `same` — the CONSTANT-INPx re-seed (R19-1, `:717`) writes A without going
+/// `same` — the CONSTANT-INPx re-seed (R19-1, `:718`) writes A without going
 /// through the value field's `special()`, so NO map bit is set. It is `!same`
 /// (A != LA) that makes the channel new and stops CLCA from overwriting the
 /// value the operator just seeded. This is the case the port's `map`-only gate

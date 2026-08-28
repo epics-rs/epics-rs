@@ -2,7 +2,7 @@
 //!
 //! Two C sites, with different scopes:
 //!
-//! * `sseqRecord.c::init_record` (197-200) rounds EVERY `DLYn`:
+//! * `sseqRecord.c::init_record` (198-200) rounds EVERY `DLYn`:
 //!
 //!   ```c
 //!   for (index = 0; index < NUM_LINKS; index++, plinkGroup++) {

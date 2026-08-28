@@ -5,9 +5,9 @@
 //! `menu(acalcoutINAV)`).
 //!
 //! All three C records classify every link in `init_record`
-//! (`transformRecord.c:443-472`, `sCalcoutRecord.c:254-287`,
-//! `aCalcoutRecord.c:209-242`) and re-classify the one link a put re-points in
-//! `special()` (`:712-740`, `:495-569`, `:503-533`). The port served a literal
+//! (`transformRecord.c:444-473`, `sCalcoutRecord.c:254-288`,
+//! `aCalcoutRecord.c:209-243`) and re-classify the one link a put re-points in
+//! `special()` (`:709-742`, `:508-569`, `:528-569`). The port served a literal
 //! `Constant` from `get_field` for every one of those fields on every record,
 //! so a local DB link read `Constant` and an unresolvable name read `Constant`
 //! too — the field could not distinguish a wired link from an unwired one,
@@ -30,6 +30,9 @@ use std::time::Duration;
 
 use epics_base_rs::server::database::PvDatabase;
 use epics_base_rs::server::ioc_builder::IocBuilder;
+use epics_base_rs::server::records::acalcout::AcalcoutRecord;
+use epics_base_rs::server::records::scalcout::ScalcoutRecord;
+use epics_base_rs::server::records::transform::TransformRecord;
 use epics_base_rs::types::EpicsValue;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -44,6 +47,9 @@ type Db = Arc<PvDatabase>;
 
 async fn build(db_text: &str) -> Db {
     IocBuilder::new()
+        .register_record_type("acalcout", || Box::new(AcalcoutRecord::default()))
+        .register_record_type("scalcout", || Box::new(ScalcoutRecord::default()))
+        .register_record_type("transform", || Box::new(TransformRecord::default()))
         .db_string(db_text, &HashMap::new())
         .unwrap()
         .build()

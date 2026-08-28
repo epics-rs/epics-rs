@@ -12,7 +12,8 @@
 //! The table below is every record type this port serves MLST, ALST or LALM
 //! for, with the C `init_record` line range behind each verdict.
 
-use epics_base_rs::server::db_loader::create_record;
+mod module_records;
+
 use epics_base_rs::types::EpicsValue;
 
 /// `(record type, a nonzero VAL in the type's own representation, C seeds?)`
@@ -20,7 +21,7 @@ const CASES: &[(&str, EpicsValue, bool)] = &[
     // Seeds — std/rec
     ("ai", EpicsValue::Double(3.0), true), // aiRecord.c:129-131
     ("ao", EpicsValue::Double(3.0), true), // aoRecord.c:157-159
-    ("bi", EpicsValue::Enum(1), true),     // biRecord.c:114-115
+    ("bi", EpicsValue::Enum(1), true),     // biRecord.c:110-111
     ("bo", EpicsValue::Enum(1), true),     // boRecord.c:165-173
     ("calcout", EpicsValue::Double(3.0), true), // calcoutRecord.c:217-219
     ("int64in", EpicsValue::Int64(3), true), // int64inRecord.c:116-118
@@ -50,7 +51,8 @@ fn each_type_seeds_its_trackers_exactly_as_its_c_init_record_does() {
     let mut wrong = Vec::new();
 
     for (rtype, val, seeds) in CASES {
-        let mut rec = create_record(rtype).unwrap_or_else(|e| panic!("{rtype}: {e:?}"));
+        let mut rec =
+            module_records::create_any(rtype).unwrap_or_else(|e| panic!("{rtype}: {e:?}"));
         rec.put_field("VAL", val.clone())
             .unwrap_or_else(|e| panic!("{rtype}: VAL put rejected: {e:?}"));
         let val = val.to_f64().expect("test values are numeric");
@@ -93,7 +95,7 @@ fn each_type_seeds_its_trackers_exactly_as_its_c_init_record_does() {
 #[test]
 fn every_type_that_serves_a_tracker_is_in_the_table() {
     for rtype in epics_base_rs::server::record::dbd_generated::RECORD_TYPES {
-        let Ok(rec) = create_record(rtype) else {
+        let Ok(rec) = module_records::create_any(rtype) else {
             continue;
         };
         let serves = ["MLST", "ALST", "LALM"]

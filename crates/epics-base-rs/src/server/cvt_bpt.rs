@@ -274,8 +274,8 @@ fn standard_index_of(name: &str) -> Option<i16> {
 /// exactly like C `dbFindBrkTable` returning NULL.
 ///
 /// The four tables EPICS DOES ship data for (`typeJdegC`, `typeJdegF`,
-/// `typeKdegC`, `typeKdegF`) are compiled in and present in every registry from
-/// construction — see [`Self::new`].
+/// `typeKdegC`, `typeKdegF`) are no more present than the other eight until
+/// their `.dbd` is loaded — see [`Self::new`].
 #[derive(Debug, Clone)]
 pub struct BreakTableRegistry {
     tables: BTreeMap<String, Arc<BrkTable>>,
@@ -289,43 +289,33 @@ impl Default for BreakTableRegistry {
 }
 
 impl BreakTableRegistry {
-    /// A registry holding the vendored breakpoint tables, and nothing else.
+    /// An EMPTY registry — C `bptList` before anything is loaded into it.
     ///
-    /// The four thermocouple tables an EPICS install ships in `dbd/bpt*.dbd` are
-    /// compiled into
+    /// The four thermocouple curves EPICS ships data for live in one `.dbd`
+    /// file each (`dbd/bptTypeKdegC.dbd` and its three siblings, shipped by
+    /// this crate too), and an IOC opts in per curve with
+    /// `dbLoadDatabase("$(EPICS_BASE)/dbd/bptTypeKdegC.dbd")` — the packaging
+    /// decision that lets an IOC link only the curves it uses. Without that
+    /// line C leaves `VAL == RVAL` unconverted and raises `STAT=SOFT` /
+    /// `SEVR=MAJOR`: measured on the built `softIoc` 7.0.10.1-DEV,
+    /// `LINR=typeKdegC` with `RVAL=1702` gives `VAL=1702`/`STAT=SOFT`
+    /// unloaded and `VAL=417.918353467`/`STAT=NO_ALARM` loaded.
+    ///
+    /// Seeding
     /// [`bpt_generated::BREAK_TABLES`](crate::server::record::bpt_generated::BREAK_TABLES)
-    /// and seeded here, so a registry cannot exist without them and no load path
-    /// can forget to install them. A `.db` that says `field(LINR,"typeKdegC")`
-    /// converts.
+    /// here instead makes that unloaded arm unreachable, which is defensible
+    /// only while the port has no way to load a `.dbd` at all. It has one —
+    /// `dbLoadDatabase` — and the same file C names loads through it, so the
+    /// seeding is gone and both arms are reachable again.
     ///
-    /// DEVIATION FROM C, stated: C's `bptList` starts EMPTY. The tables live in
-    /// separate `.dbd` files and an IOC opts in with
-    /// `dbLoadDatabase("$(EPICS_BASE)/dbd/bptTypeKdegC.dbd")`; without that line
-    /// the C IOC leaves `VAL == RVAL` unconverted and raises `STAT=SOFT`
-    /// (measured on the built `softIoc`, 7.0.10.1-DEV: `LINR=typeKdegC`,
-    /// `RVAL=1702` gives `VAL=1702`/`STAT=SOFT` with the file unloaded and
-    /// `VAL=417.918353467`/`STAT=NO_ALARM` with it loaded). That opt-in is a
-    /// packaging decision of C's build — one `.dbd` per curve, so an IOC links
-    /// only the curves it uses — not a semantic one, and the port cannot mirror
-    /// it: it has no `dbLoadDatabase`, so the `SOFT` arm was the ONLY reachable
-    /// one. The bytes seeded here are exactly the bytes C would have loaded, so
-    /// the only behaviour that changes is the behaviour that was unreachable.
-    ///
-    /// First-wins still holds ([`Self::insert`]): a `.db` that defines its own
-    /// `breaktable(typeKdegC)` is ignored in favour of the vendored one — which
-    /// is what C does too, once the `.dbd` is loaded first.
+    /// `BREAK_TABLES` stays as the compiled form of those four files, which
+    /// `shipped_bpt_files_match_the_generated_tables` pins against the files
+    /// themselves.
     pub fn new() -> Self {
-        let mut registry = Self {
+        Self {
             tables: BTreeMap::new(),
             extra_menu: Vec::new(),
-        };
-        for (name, points) in crate::server::record::bpt_generated::BREAK_TABLES {
-            let table = BrkTable::build(*name, points).unwrap_or_else(|e| {
-                unreachable!("vendored breakpoint table {name} is malformed: {e}")
-            });
-            registry.insert(table);
         }
-        registry
     }
 
     /// Whether no table DATA has been loaded. The standard `menuConvert` names
@@ -361,6 +351,19 @@ impl BreakTableRegistry {
     /// Look up a table's DATA by name.
     pub fn get(&self, name: &str) -> Option<Arc<BrkTable>> {
         self.tables.get(name).cloned()
+    }
+
+    /// Every loaded table, for the one caller that enumerates them —
+    /// iocsh `dbDumpBreaktable`, which in C walks `pdbbase->bptList`
+    /// (`dbStaticLib.c:3543-3544`).
+    ///
+    /// DEVIATION FROM C, stated: that walk is LOAD order; the registry is a
+    /// `BTreeMap`, so this is NAME order. The registry has never recorded load
+    /// order for the tables themselves (only `extra_menu` does, because `LINR`
+    /// indices depend on it), and giving it one to reorder a dump would be
+    /// paying for the report rather than for the conversion.
+    pub fn tables(&self) -> impl Iterator<Item = &Arc<BrkTable>> {
+        self.tables.values()
     }
 
     /// The `LINR` index that selects the named table: a standard `menuConvert`

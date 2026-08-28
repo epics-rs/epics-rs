@@ -19,7 +19,6 @@ pub fn autosave_commands(manager: Arc<AutosaveManager>) -> Vec<CommandDef> {
             vec![ArgDesc {
                 name: "set_name",
                 arg_type: ArgType::String,
-                optional: false,
             }],
             "Restore PVs from a save set",
             move |args: &[ArgValue], ctx: &CommandContext| {
@@ -66,7 +65,6 @@ pub fn autosave_commands(manager: Arc<AutosaveManager>) -> Vec<CommandDef> {
             vec![ArgDesc {
                 name: "set_name",
                 arg_type: ArgType::String,
-                optional: false,
             }],
             "Save PVs for a save set",
             move |args: &[ArgValue], ctx: &CommandContext| {
@@ -120,7 +118,6 @@ pub fn autosave_commands(manager: Arc<AutosaveManager>) -> Vec<CommandDef> {
             vec![ArgDesc {
                 name: "set_name",
                 arg_type: ArgType::String,
-                optional: false,
             }],
             "Verify saved vs live values",
             move |args: &[ArgValue], ctx: &CommandContext| {
@@ -160,7 +157,6 @@ pub fn autosave_commands(manager: Arc<AutosaveManager>) -> Vec<CommandDef> {
             vec![ArgDesc {
                 name: "set_name",
                 arg_type: ArgType::String,
-                optional: false,
             }],
             "Show save set configuration",
             move |args: &[ArgValue], _ctx: &CommandContext| {

@@ -13,9 +13,12 @@
 //! below matches deterministically — under any workspace feature
 //! union (e.g. `epics-bridge-rs` pulling those `epics-ca-rs` features
 //! in independently).
-#![cfg(feature = "ca-server-tls-test")]
-
-// RTEMS-EXEC-MODEL-ALLOW(10): not built by default - this file is behind the `ca-server-tls-test` feature.
+#![cfg(all(feature = "ca-server-tls-test", tokio_backend))]
+// `tokio_backend` as well as the feature: `setup` builds an
+// `epics_ca_rs::server::CaServer` and calls `server::tcp::run_tcp_listener`,
+// both of which the reactor-free `exec_backend` does not have. That gate is
+// also what accounts for the ten `#[tokio::test]`s here, so the file no
+// longer needs its census marker.
 
 use std::f64::consts::PI;
 use std::sync::Arc;
@@ -77,7 +80,10 @@ async fn setup(pvs: Vec<(&str, EpicsValue)>) -> CaResult<epics_ca_rs::client::Ca
     let udp_port = responders.port();
     let db_udp = db.clone();
     tokio::spawn(async move {
+        let reactor = epics_base_rs::runtime::task::Reactor::current()
+            .expect("this task runs on the test's executor");
         let _ = epics_ca_rs::server::udp::run_udp_search_responder(
+            &reactor,
             db_udp,
             responders,
             tcp_port,

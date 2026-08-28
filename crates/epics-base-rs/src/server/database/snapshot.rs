@@ -2,9 +2,9 @@
 //! writers serialize on a small `std::sync::Mutex` and publish a rebuilt
 //! value.
 //!
-//! This is the shape `doc/rtems-priority-locks-design.md` §3 calls
-//! **ArcSwap** for the database index rows (L8c `load_order`, L8d `cp_links`,
-//! L8e `external_cp_links`, L8i `link_sets`, L8k `breaktable_registry`).
+//! This is the **ArcSwap** shape for the database index rows (L8c
+//! `load_order`, L8d `cp_links`, L8e `external_cp_links`, L8i `link_sets`,
+//! L8k `breaktable_registry`).
 //! Those five are read on banded threads — periodic scan (`scan-N`, EPICS
 //! 60–66), the CA/PVA connection threads (EPICS 20), record processing — and
 //! written rarely. Under a `tokio::sync::RwLock` a *low*-priority reader that

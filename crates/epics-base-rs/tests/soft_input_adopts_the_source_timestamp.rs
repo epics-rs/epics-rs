@@ -1,5 +1,5 @@
 //! TSE=-2 (`epicsTimeEventDeviceTime`) says "the device stamped this record",
-//! and `recGblGetTimeStampSimm` (`recGbl.c:322-341`) therefore leaves `time`
+//! and `recGblGetTimeStampSimm` (`recGbl.c:324-342`) therefore leaves `time`
 //! alone. For a `Soft Channel` input the device IS the INP link, so every one
 //! of the 23 soft input dsets in `std/dev` fills it from the source, in the
 //! same locked read that fetched the value — `devAiSoft.c:54-63`:
@@ -31,7 +31,7 @@
 //! The invariant, asserted here at each of its boundaries: a soft input's TIME
 //! is its INP source's TIME exactly when TSE is -2 and TSEL is constant, and
 //! is the cycle's own time otherwise. `dbGetTimeStamp` is the `ptag == NULL`
-//! spelling of `dbGetTimeStampTag` (`dbLink.c:415-418`), so the source's UTAG
+//! spelling of `dbGetTimeStampTag` (`dbLink.c:413-416`), so the source's UTAG
 //! is deliberately NOT adopted — only TSEL `.TIME` (`recGbl.c:317`) takes that.
 
 use epics_base_rs::server::ioc_builder::IocBuilder;
@@ -177,7 +177,7 @@ record(ai, "DST")   { field(INP, "SRC") field(TSEL, "TSESRC") }
 
 /// Boundary: no read happened. C's `if (!status && pvt->ptime)` skips the
 /// stamp, and `read_wf`/`read_sa` do not even call `readLocked` for a constant
-/// INP (`devWfSoft.c:80-81`, `devSASoft.c:104-110`).
+/// INP (`devWfSoft.c:81-82`, `devSASoft.c:105-111`).
 #[epics_macros_rs::epics_test]
 async fn a_constant_inp_adopts_nothing() {
     let db = build(

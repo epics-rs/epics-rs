@@ -2,7 +2,7 @@
 //! FTVL-typed buffer — it must not replace the buffer with a scalar variant.
 //!
 //! C hands every VAL write a pointer to the FTVL-typed `bptr` with
-//! `nRequest = NELM` (`aaoRecord.c:366` `dbGetLink(&prec->dol, prec->ftvl,
+//! `nRequest = NELM` (`aaoRecord.c:362` `dbGetLink(&prec->dol, prec->ftvl,
 //! prec->bptr, 0, &nReq)`), so a scalar source converts INTO `bptr[0]` and
 //! yields `nReq = 1` → `NORD = 1`. The pre-fix port's put_field fallback
 //! (`other => { nord = 1; val = other }`) stored the scalar variant instead,

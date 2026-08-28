@@ -1,7 +1,7 @@
 //! R8-8 — in aCalc, `<<` and `>>` are ONE C arm whose meaning is chosen by the
 //! LEFT operand's type (`aCalcPerform.c:1416-1459`):
 //!
-//! * scalar left  -> a bit shift by the `(int)` count (`:1421-1427`);
+//! * scalar left  -> a bit shift by the `(int)` count (`:1410-1416`);
 //! * array left   -> a POSITIONAL move of the elements by `myNINT(count)`
 //!   (`<<` negates the count), zero-filling the vacated end, and — because the
 //!   count is a double — a LINEAR INTERPOLATION of its fractional part
@@ -59,7 +59,7 @@ fn array_shift_past_the_end_zeroes_the_array() {
     assert_eq!(arr("AA>>8"), vec![0.0; 8]);
 }
 
-/// The fractional part of the count is LINEARLY INTERPOLATED (`:1440-1457`),
+/// The fractional part of the count is LINEARLY INTERPOLATED (`:1429-1446`),
 /// in place and in C's walk order — the extrapolated end point reads the
 /// neighbour the same pass has already overwritten.
 ///
@@ -82,14 +82,14 @@ fn array_shift_interpolates_the_fractional_count() {
     );
 }
 
-/// C `:1420` collapses an array count with `to_double` — its `a[0]`.
+/// C `:1409` collapses an array count with `to_double` — its `a[0]`.
 /// C: `AA>>BB` with BB=[2,0,...] -> the same as `AA>>2`.
 #[test]
 fn array_shift_count_is_the_first_element_of_an_array_count() {
     assert_eq!(arr("AA>>BB"), vec![0.0, 0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
 }
 
-/// A SCALAR left operand keeps the bit shift (`:1421-1427`), including when the
+/// A SCALAR left operand keeps the bit shift (`:1410-1416`), including when the
 /// count is an array (collapsed to `a[0]` = 1 here).
 /// C: `6>>1` -> 3, `6<<1` -> 12, `2<<AA` (AA[0]=1) -> 4.
 #[test]

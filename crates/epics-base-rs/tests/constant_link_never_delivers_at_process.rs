@@ -15,7 +15,7 @@
 //!
 //! — SUCCESS with nothing written, so the reader's field keeps what it holds.
 //! The constant reaches the record exactly once, at `init_record`, through
-//! `recGblInitConstantLink` (sseq's `SELL`: `sseqRecord.c:186-191`).
+//! `recGblInitConstantLink` (sseq's `SELL`: `sseqRecord.c:187-192`).
 //!
 //! The port had two readers and one classifier: `read_link_with_alarm`
 //! classified a constant as `LinkFetch::NoData`, but the `ReadDbLink` executor
@@ -28,6 +28,7 @@ use std::collections::HashSet;
 
 use epics_base_rs::server::database::PvDatabase;
 use epics_base_rs::server::ioc_builder::IocBuilder;
+use epics_base_rs::server::records::sseq::SseqRecord;
 use epics_base_rs::types::EpicsValue;
 
 const DB: &str = r#"
@@ -51,6 +52,7 @@ record(compress, "CMP:CONST") {
 
 async fn build() -> std::sync::Arc<PvDatabase> {
     IocBuilder::new()
+        .register_record_type("sseq", || Box::new(SseqRecord::default()))
         .db_string(DB, &std::collections::HashMap::new())
         .unwrap()
         .build()
@@ -66,7 +68,7 @@ async fn process(db: &PvDatabase, name: &str) {
         .unwrap();
 }
 
-/// C `sseqRecord.c:186-191`: a constant `SELL` is loaded into `SELN` once, at
+/// C `sseqRecord.c:187-192`: a constant `SELL` is loaded into `SELN` once, at
 /// init, by `recGblInitConstantLink(&pR->sell, DBF_USHORT, &pR->seln)`.
 #[epics_macros_rs::epics_test]
 async fn constant_sell_seeds_seln_at_init() {
@@ -101,7 +103,7 @@ async fn client_put_to_seln_survives_a_constant_sell() {
 }
 
 /// The owner path stays intact: a REAL `SELL` link is re-read every cycle and
-/// overwrites `SELN` (C `dbGetLink` on a DB link — `sseqRecord.c:314-317`).
+/// overwrites `SELN` (C `dbGetLink` on a DB link — `sseqRecord.c:315-317`).
 #[epics_macros_rs::epics_test]
 async fn a_real_sell_link_still_delivers_every_cycle() {
     let db = build().await;

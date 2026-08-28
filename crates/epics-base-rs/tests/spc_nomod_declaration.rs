@@ -3,7 +3,7 @@
 //!
 //! C reads that one declaration in two unrelated places — `dbPut`
 //! (`dbAccess.c:123-126`) refuses the write, and `rsrvCheckPut`
-//! (`rsrv/camessage.c:2608-2619`) clears the `CA_PROTO_ACCESS_RIGHTS` write bit
+//! (`rsrv/camessage.c:2540-2551`) clears the `CA_PROTO_ACCESS_RIGHTS` write bit
 //! so the client never sends the doomed put. The port routes both through
 //! `RecordInstance::is_no_mod`, so `is_no_mod` is the thing this file pins.
 //!
@@ -31,13 +31,14 @@
 //! says — `true` on the NOMOD side of the boundary and `false` on the writable
 //! side. A hand-written table that disagrees can no longer change the answer.
 
-use epics_base_rs::server::db_loader::create_record;
+mod module_records;
+
 use epics_base_rs::server::record::{RecordInstance, dbd_generated};
 
 /// Fields whose no-modify-ness is NOT a static `.dbd` fact and so are exempt
 /// from the equality: `Record::field_no_mod` raises SPC_NOMOD from record state
 /// the way C's `cvt_dbaddr` does (compress `VAL` under `BALG=LIFO`,
-/// `compressRecord.c:398-407`). Those are covered by
+/// `compressRecord.c:404-405`). Those are covered by
 /// `epics-ca-rs/tests/access_rights_spc_nomod.rs`.
 fn state_raised_nomod(record_type: &str, field: &str) -> bool {
     matches!((record_type, field), ("compress", "VAL"))
@@ -49,7 +50,7 @@ fn is_no_mod_answers_the_dbd_for_every_declared_field() {
     let mut nomod = 0usize;
 
     for &record_type in dbd_generated::RECORD_TYPES {
-        let Ok(record) = create_record(record_type) else {
+        let Ok(record) = module_records::create_any(record_type) else {
             panic!("{record_type}: the port declares a .dbd but cannot instantiate the record");
         };
         let instance = RecordInstance::new_boxed(format!("T:{record_type}"), record);
@@ -104,7 +105,7 @@ fn hand_written_field_tables_cannot_under_declare_no_modify() {
     ];
 
     for &(record_type, no_mod, writable) in BOUNDARY {
-        let record = create_record(record_type).expect("record type is implemented");
+        let record = module_records::create_any(record_type).expect("record type is implemented");
         let instance = RecordInstance::new_boxed(format!("T:{record_type}"), record);
         assert!(
             instance.is_no_mod(no_mod),

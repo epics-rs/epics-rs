@@ -1,14 +1,14 @@
 //! A Passive CP holder of an external link goes LINK/INVALID when the
 //! link loses READ access — C `dbCa.c`'s access-rights path, end to end.
 //!
-//! C reference. `accessRightsCallback` (`dbCa.c:1076-1102`) caches the new
+//! C reference. `accessRightsCallback` (`dbCa.c:1014-1040`) caches the new
 //! rights and, for a `pvlOptCP` link (or a `pvlOptCPP` link whose holder
 //! has `scan == 0`), adds `CA_DBPROCESS` whenever the rights are not fully
-//! held while connected (`dbCa.c:1091` skips only when
+//! held while connected (`dbCa.c:1029` skips only when
 //! `hasReadAccess && hasWriteAccess`). The `dbCaTask` worker then runs
-//! `db_process(prec)` (`dbCa.c:1314-1322`); that process calls `dbGetLink`
+//! `db_process(prec)` (`dbCa.c:1249-1257`); that process calls `dbGetLink`
 //! → `dbCaGetLink`, which returns `-1` with `pca->sevr = INVALID_ALARM;
-//! pca->stat = LINK_ALARM` because `!pca->hasReadAccess` (`dbCa.c:459-463`)
+//! pca->stat = LINK_ALARM` because `!pca->hasReadAccess` (`dbCa.c:430-434`)
 //! even though `pca->isConnected` is still TRUE, and the record commits
 //! LINK/INVALID.
 //!
@@ -17,7 +17,7 @@
 //! is denied actually lands the alarm on the holder. This is the boundary
 //! that distinguishes it from `external_cp_disconnect_alarm.rs`, where
 //! `is_connected` and the value gate close together — here `is_connected`
-//! stays `true` throughout (C's lset `isConnected`, `dbCa.c:633-641`, does
+//! stays `true` throughout (C's lset `isConnected`, `dbCa.c:604-612`, does
 //! not consult access rights) and only the value read fails.
 
 use std::sync::Arc;
@@ -56,7 +56,7 @@ impl ReadGateLset {
 
 #[async_trait::async_trait]
 impl LinkSet for ReadGateLset {
-    /// Always up: C's lset `isConnected` (`dbCa.c:633-641`) returns
+    /// Always up: C's lset `isConnected` (`dbCa.c:604-612`) returns
     /// `pca->isConnected` alone — READ-access loss does not disconnect.
     fn is_connected(&self, _: &str) -> bool {
         true
@@ -100,7 +100,7 @@ async fn holder_db(lset: Arc<ReadGateLset>) -> PvDatabase {
 /// value in with no alarm; with read access revoked — circuit still up —
 /// the very same dispatch commits LINK/INVALID and leaves VAL where it
 /// was. This is the dispatch C's `accessRightsCallback` adds
-/// (`dbCa.c:1094-1099`) and that calink did not: without it the holder is
+/// (`dbCa.c:1032-1037`) and that calink did not: without it the holder is
 /// Passive, is never processed again, and reports its last good value
 /// with SEVR=0 for as long as the server denies reads.
 #[epics_macros_rs::epics_test]
@@ -112,7 +112,7 @@ async fn a_dispatch_on_a_read_denied_link_commits_link_invalid() {
 
     // Rights fully held: the CP dispatch is the ordinary monitor-event
     // path. This is also the write-only-loss outcome — C dispatches on
-    // write loss too (`dbCa.c:1091`), but `dbCaGetLink` does not consult
+    // write loss too (`dbCa.c:1029`), but `dbCaGetLink` does not consult
     // `hasWriteAccess`, so the dispatched holder reads a good value and
     // lands no alarm.
     db.dispatch_external_cp_targets("UP:PV");
@@ -146,7 +146,7 @@ async fn a_dispatch_on_a_read_denied_link_commits_link_invalid() {
 }
 
 /// Recovery: C dispatches NOTHING on a full rights regain
-/// (`dbCa.c:1091` `goto done`), so the alarm clears on the next monitor
+/// (`dbCa.c:1029` `goto done`), so the alarm clears on the next monitor
 /// event — modelled here as the next dispatch after the gate reopens.
 #[epics_macros_rs::epics_test]
 async fn the_link_alarm_clears_on_the_next_event_after_read_access_returns() {

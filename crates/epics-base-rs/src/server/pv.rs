@@ -371,19 +371,22 @@ pub struct ProcessVariable {
     /// (`set` / `set_snapshot`) still `.await`s the monitor fan-out, but
     /// drops this guard first.
     pub value: parking_lot::RwLock<EpicsValue>,
-    /// Monitor fan-out list — **L7** of `doc/rtems-priority-locks-design.md`
-    /// §3.
+    /// Monitor fan-out list — **L7**.
     ///
     /// A BLOCKING mutex, not the async one: every emission path runs from a
     /// record-processing thread with the record's advisory gate (L1) held, and
-    /// C's `db_post_events` likewise takes `evUser->lock` from inside
-    /// `dbScanLock` (`dbEvent.c::db_post_events`). Holding an async mutex here
-    /// would put a suspension point inside that window. Every critical section
-    /// below is bounded list work (`retain` / `push` / `sub.post`), with no
-    /// I/O and no `.await` inside it.
+    /// C's `db_post_events` likewise takes `LOCKREC(prec)` — the record's own
+    /// `mlok`, which is what guards the `mlis` monitor list this field is the
+    /// counterpart of — from inside `dbScanLock` (`dbEvent.c:887`, macro at
+    /// `:123`), and its callee `db_queue_event_log` takes `LOCKEVQUE(ev_que)`,
+    /// the queue's `writelock` (`:788`, macro at `:121`). `evUser->lock` is NOT
+    /// on the post path at all. Holding an async mutex here would put a
+    /// suspension point inside that window. Every critical section below is
+    /// bounded list work (`retain` / `push` / `sub.post`), with no I/O and no
+    /// `.await` inside it.
     ///
     /// Specifically a [`PriorityInheritanceMutex`] rather than a plain
-    /// `parking_lot::Mutex`, because `evUser->lock` is an `epicsMutex` and on
+    /// `parking_lot::Mutex`, because both of those are `epicsMutex`es and on
     /// the RTEMS arm every `epicsMutex` is a `PTHREAD_PRIO_INHERIT` pthread
     /// mutex (`os/posix/osdMutex.c:71-88`, compiled for RTEMS via
     /// `os/RTEMS-posix/osdMutex.c:8`). It is taken from banded IOC threads on
@@ -435,6 +438,15 @@ pub struct ProcessVariable {
     /// the optional `Arc` without an `.await`, then awaits the hook
     /// outside any lock. See [`ReadHook`].
     read_hook: parking_lot::RwLock<Option<ReadHook>>,
+    /// Terminal destruction marker — the CAS `casPV` delete signal.
+    ///
+    /// Set once by [`Self::destroy`] and never cleared: a destroyed PV is
+    /// gone, not paused, so there is no state a later write could restore
+    /// and no second meaning the flag can carry. The database's removal
+    /// funnels are its only writers, which is what makes *removed from the
+    /// database* and *destroyed* the same event rather than two that a
+    /// caller has to remember to pair.
+    destroyed: std::sync::atomic::AtomicBool,
 }
 
 impl ProcessVariable {
@@ -448,6 +460,7 @@ impl ProcessVariable {
             write_hook: parking_lot::RwLock::new(None),
             access_hook: parking_lot::RwLock::new(None),
             read_hook: parking_lot::RwLock::new(None),
+            destroyed: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
@@ -699,7 +712,7 @@ impl ProcessVariable {
     /// Every emission path ([`Self::notify_subscribers`] value posts,
     /// [`Self::post_alarm`], [`Self::notify_subscribers_from_snapshot`]
     /// gateway posts, [`Self::post_property`]) routes through here so the
-    /// mask gate (`caEventMask & pevent->select`, `dbEvent.c:892-900`),
+    /// mask gate (`caEventMask & pevent->select`, `dbEvent.c:896-900`),
     /// the per-subscriber channel-filter chain, and the slow-consumer
     /// coalesce-overflow accounting are applied identically — one event
     /// class differs per caller, nothing else. The snapshot is built once
@@ -869,6 +882,13 @@ impl ProcessVariable {
     ) -> Option<EventReader> {
         let cap = max_subscribers_per_pv();
         let mut subs = self.subscribers.lock();
+        // A destroyed PV takes no new monitor. The flag is set under this
+        // same lock by `destroy`, so `destroyed => no subscribers` holds by
+        // construction and a CREATE_CHAN + EVENT_ADD racing the destruction
+        // cannot re-attach to a corpse.
+        if self.is_destroyed() {
+            return None;
+        }
         // Reap rows whose consumer is gone BEFORE counting
         // against the cap. `notify_subscribers` / `post_alarm`
         // already retain-filter on every emission, but a PV with
@@ -878,7 +898,7 @@ impl ProcessVariable {
         // pin the Vec at `cap` worth of dead rows and lock
         // out genuine new subscribers with a false-positive cap-
         // reached warning. Same defect class as the
-        // NDPluginPva subscribe reaper (qsrv/pva_adapter.rs:247).
+        // NDPluginPva subscribe reaper (qsrv/pva_adapter.rs:129).
         subs.retain(|s| !s.is_closed());
         if subs.len() >= cap {
             tracing::warn!(
@@ -936,6 +956,62 @@ impl ProcessVariable {
     pub fn remove_subscriber(&self, sid: u32) {
         let mut subs = self.subscribers.lock();
         subs.retain(|s| s.sid != sid);
+    }
+
+    /// Destroy this PV: drop every monitor and refuse every future one.
+    ///
+    /// The `casPV` destruction ca-gateway performs with `delete vc` when an
+    /// upstream channel dies (`gatePv.cc:601`) — the downstream monitors
+    /// stop rather than receive one more frame. Dropping the [`Subscriber`]
+    /// rows drops their producer halves, so each consumer observes
+    /// end-of-stream instead of silence.
+    ///
+    /// Reserved to the database's removal funnels ([`crate::server::database::PvDatabase::remove_simple_pv`]),
+    /// so *removed from the database* and *destroyed* cannot come apart.
+    /// Returns `true` for the call that performed the transition.
+    pub(crate) fn destroy(&self) -> bool {
+        // Marked and drained under ONE hold of the subscriber lock, which is
+        // the lock `add_subscriber_on` reads the flag under: an add either
+        // sees the mark and refuses, or completes wholly before the drain.
+        // No interleaving leaves a live row on a destroyed PV.
+        let mut subs = self.subscribers.lock();
+        let first = !self
+            .destroyed
+            .swap(true, std::sync::atomic::Ordering::AcqRel);
+        subs.clear();
+        first
+    }
+
+    /// Whether `Self::destroy` has run. A server holding an `Arc` to this
+    /// PV reads it to learn that the channel it serves has to be torn down.
+    pub fn is_destroyed(&self) -> bool {
+        self.destroyed.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    /// A fresh, LIVE PV carrying this one's identity: same name, same
+    /// write / access / read hooks, same shadow metadata, seeded with
+    /// `initial`.
+    ///
+    /// The replacement a proxy installs when what it fronts comes back —
+    /// ca-gateway builds a new `gateVcData` on the next exist-test after
+    /// `gatePvData::death` deleted the old one (`gatePv.cc:601`). The
+    /// destruction mark is deliberately NOT carried: the corpse stays a
+    /// corpse, and the replacement is a different object that the retired
+    /// channels never held, so no client can be handed the new PV without
+    /// a fresh `CREATE_CHANNEL`.
+    pub fn respawn(&self, initial: EpicsValue) -> Self {
+        let fresh = Self::new(self.name.clone(), initial);
+        if let Some(h) = self.write_hook() {
+            fresh.set_write_hook(h);
+        }
+        if let Some(h) = self.access_hook() {
+            fresh.set_access_hook(h);
+        }
+        if let Some(h) = self.read_hook() {
+            fresh.set_read_hook(h);
+        }
+        fresh.set_metadata(self.metadata());
+        fresh
     }
 }
 
@@ -998,7 +1074,7 @@ impl PvSubscription {
     /// behind sees the same thing a C monitor does: its earlier distinct queued
     /// updates, and then — once the queue ran short of room — a tail entry
     /// carrying the latest value, because further posts replaced that entry in
-    /// place rather than appending (`db_queue_event_log`, `dbEvent.c:812-820`).
+    /// place rather than appending (`db_queue_event_log`, `dbEvent.c:812-827`).
     pub async fn recv_snapshot(&mut self) -> Option<Snapshot> {
         // Free when this reader holds the last reference to the shared
         // snapshot, which is the single-subscriber case; a copy only when
@@ -1007,12 +1083,11 @@ impl PvSubscription {
     }
 
     /// Non-blocking [`Self::recv_snapshot`]. Delegates to
-    /// [`EventReader::try_recv`] (`event_queue.rs:570`) — same queue, same
+    /// [`EventReader::try_recv`] (`event_queue.rs:807`) — same queue, same
     /// EVENTS_OFF gate, no suspension.
     ///
     /// Lets a PVA monitor source that adapts this stream be polled from a
-    /// blocking drain loop with no reactor present
-    /// (`doc/rtems-runtime-portability-design.md` §9 phase 6).
+    /// blocking drain loop with no reactor present.
     pub fn try_recv_snapshot(&mut self) -> Result<Snapshot, TryRecvError> {
         self.reader
             .try_recv()
@@ -1035,17 +1110,25 @@ impl PvSubscription {
 }
 
 impl Drop for PvSubscription {
+    /// Remove this monitor's row from the PV, on the dropping thread.
+    ///
+    /// C cancels a monitor synchronously on the caller's thread
+    /// (`db_cancel_event`, dbEvent.c), and here that is reachable:
+    /// [`ProcessVariable::remove_subscriber`] takes
+    /// `ProcessVariable::subscribers`, an ordinary mutex, so the removal
+    /// needs no executor and is complete when `drop` returns.
+    ///
+    /// `DbSubscription::drop` defers the same work to the background
+    /// executor because *its* `remove_subscriber` is behind the record's
+    /// async `RwLock`, which sync `drop` cannot take. Copying the deferral
+    /// here also copied a `Handle::try_current()` test that decided whether
+    /// to do the removal at all, and that predicate answers a question
+    /// nobody asked: it is false on every callback-band worker and on every
+    /// blocking CA connection thread, so a monitor dropped there kept its
+    /// row for the life of the IOC and every later `notify_subscribers`
+    /// paid to build an event for a reader that was gone.
     fn drop(&mut self) {
-        let pv = self.pv.clone();
-        let sid = self.sid;
-        // Mirror `DbSubscription::drop`: `remove_subscriber` needs an async
-        // lock, so remove the slot off-thread. No current runtime means no
-        // live subscription to clean up.
-        if tokio::runtime::Handle::try_current().is_ok() {
-            crate::runtime::task::spawn_background(async move {
-                pv.remove_subscriber(sid);
-            });
-        }
+        self.pv.remove_subscriber(self.sid);
     }
 }
 
@@ -1375,7 +1458,7 @@ mod mask_gate_tests {
     /// R8-22 (simple-PV path): a monitor whose queue runs out of room during a
     /// burst must receive its EARLIER DISTINCT queued updates and then a tail
     /// entry carrying the latest value — C `db_queue_event_log` replaces only
-    /// `*pLastLog` (`dbEvent.c:812-820`) and leaves the earlier entries queued.
+    /// `*pLastLog` (`dbEvent.c:812-827`) and leaves the earlier entries queued.
     ///
     /// The old primitive parked the newest value in a side coalesce slot, and
     /// the consumer, finding it set, discarded the ENTIRE queued backlog and
@@ -1824,5 +1907,196 @@ mod read_hook_tests {
             read.timestamp, upstream_time,
             "upstream timestamp, not shadow's"
         );
+    }
+}
+
+/// BR-3 — removal from the database IS destruction, and destruction stops
+/// the monitors instead of handing them one more event.
+///
+/// C ca-gateway `gatePvData::death` deletes the downstream virtual channel
+/// when its upstream dies (`delete vc; vc = NULL;`, gatePv.cc:600-601). The
+/// tests below pin the two halves that make that expressible here: a
+/// destroyed PV has no subscribers and can gain none, and `respawn` is the
+/// only way back — onto a different object.
+#[cfg(test)]
+mod destruction_tests {
+    use super::*;
+    use crate::server::database::PvDatabase;
+    use crate::server::snapshot::DisplayInfo;
+    use crate::types::PvString;
+
+    #[epics_macros_rs::epics_test]
+    async fn removing_a_simple_pv_destroys_it_and_ends_its_monitors() {
+        let db = PvDatabase::new();
+        db.add_pv("D:pv", EpicsValue::Double(1.0))
+            .await
+            .expect("fresh name registers");
+        let pv = db.find_pv("D:pv").await.expect("just registered");
+        let mut reader = pv
+            .add_subscriber(7, DbFieldType::Double, u16::MAX)
+            .expect("first subscriber");
+
+        let removed = db.remove_simple_pv("D:pv").await.expect("was registered");
+        assert!(
+            removed.is_destroyed(),
+            "the removal funnel is `destroy`'s only caller, so removed => destroyed"
+        );
+        assert!(
+            removed.subscribers.lock().is_empty(),
+            "destruction drops the subscriber rows"
+        );
+        assert!(
+            matches!(reader.try_recv(), Err(TryRecvError::Disconnected)),
+            "the consumer must observe end-of-stream, not silence"
+        );
+    }
+
+    #[epics_macros_rs::epics_test]
+    async fn a_destroyed_pv_refuses_a_new_monitor() {
+        let db = PvDatabase::new();
+        db.add_pv("D:refuse", EpicsValue::Double(1.0))
+            .await
+            .expect("fresh name registers");
+        let removed = db
+            .remove_simple_pv("D:refuse")
+            .await
+            .expect("was registered");
+        assert!(
+            removed
+                .add_subscriber(1, DbFieldType::Double, u16::MAX)
+                .is_none(),
+            "a CREATE_CHAN + EVENT_ADD racing the removal must not re-attach"
+        );
+    }
+
+    #[epics_macros_rs::epics_test]
+    async fn respawn_carries_the_hooks_and_metadata_onto_a_live_pv() {
+        let pv = ProcessVariable::new("D:respawn".into(), EpicsValue::Double(1.0));
+        pv.set_write_hook(Arc::new(|_v, _ctx| Box::pin(async { Ok(()) })));
+        pv.set_access_hook(Arc::new(|_user, _host| AccessDecision {
+            read: true,
+            write: false,
+        }));
+        pv.set_read_hook(Arc::new(|| {
+            Box::pin(async {
+                Ok(Snapshot::new(
+                    EpicsValue::Double(9.0),
+                    0,
+                    0,
+                    std::time::SystemTime::UNIX_EPOCH,
+                ))
+            })
+        }));
+        let display = DisplayInfo {
+            units: "mA".into(),
+            ..Default::default()
+        };
+        pv.set_metadata(PvMetadata {
+            display: Some(display),
+            control: None,
+            enums: None,
+        });
+        pv.destroy();
+
+        let fresh = pv.respawn(EpicsValue::Double(5.0));
+        assert!(!fresh.is_destroyed(), "the replacement is live");
+        assert!(pv.is_destroyed(), "the corpse stays a corpse");
+        assert!(fresh.write_hook().is_some(), "write hook carried");
+        assert!(fresh.access_hook().is_some(), "access hook carried");
+        assert!(fresh.read_hook().is_some(), "read hook carried");
+        assert_eq!(
+            fresh.metadata().display.expect("display carried").units,
+            PvString::from("mA"),
+            "shadow DBR_CTRL metadata carried, not zeroed"
+        );
+        assert_eq!(*fresh.value.read(), EpicsValue::Double(5.0));
+    }
+
+    #[epics_macros_rs::epics_test]
+    async fn removing_a_record_destroys_it_too() {
+        let db = PvDatabase::new();
+        db.add_record(
+            "D:rec",
+            Box::new(crate::server::records::ai::AiRecord::default()),
+        )
+        .await
+        .expect("ai record");
+        let rec = db.get_record("D:rec").expect("just added");
+        assert!(!rec.read().is_destroyed());
+        assert!(db.remove_record("D:rec").await, "record was registered");
+        assert!(
+            rec.read().is_destroyed(),
+            "the record funnel marks the instance a CA channel still holds"
+        );
+    }
+}
+
+#[cfg(test)]
+mod subscription_drop_tests {
+    use super::*;
+
+    /// The thread a monitor is actually dropped on is not the thread it was
+    /// created on. A blocking CA connection thread and a callback-band worker
+    /// are both outside every tokio runtime, and that is where a circuit
+    /// teardown releases its `PvSubscription`.
+    #[epics_macros_rs::epics_test]
+    async fn a_subscription_dropped_on_a_bare_thread_removes_its_row() {
+        let pv = Arc::new(ProcessVariable::new(
+            "D:baredrop".into(),
+            EpicsValue::Double(0.0),
+        ));
+        let sub = PvSubscription::subscribe(pv.clone())
+            .await
+            .expect("first subscriber");
+        assert_eq!(pv.subscribers.lock().len(), 1, "the monitor registered");
+
+        let dropper = {
+            let pv = pv.clone();
+            std::thread::spawn(move || {
+                assert!(
+                    tokio::runtime::Handle::try_current().is_err(),
+                    "the case is only meaningful off a runtime"
+                );
+                drop(sub);
+                // Synchronous, so the row is gone before this thread joins —
+                // no polling, no executor to wait for.
+                assert!(
+                    pv.subscribers.lock().is_empty(),
+                    "removal completes inside `drop`"
+                );
+            })
+        };
+        dropper.join().expect("the dropping thread must not panic");
+
+        assert!(
+            pv.subscribers.lock().is_empty(),
+            "a monitor dropped off a runtime must not leave its row behind"
+        );
+    }
+
+    /// The other boundary: a drop removes one row, not the PV's whole
+    /// subscriber list.
+    #[epics_macros_rs::epics_test]
+    async fn dropping_one_subscription_leaves_its_sibling_registered() {
+        let pv = Arc::new(ProcessVariable::new(
+            "D:sibling".into(),
+            EpicsValue::Double(0.0),
+        ));
+        let first = PvSubscription::subscribe(pv.clone())
+            .await
+            .expect("first subscriber");
+        let second = PvSubscription::subscribe(pv.clone())
+            .await
+            .expect("second subscriber");
+        assert_eq!(pv.subscribers.lock().len(), 2, "both monitors registered");
+
+        drop(first);
+        assert_eq!(
+            pv.subscribers.lock().len(),
+            1,
+            "only the dropped monitor's row goes"
+        );
+        drop(second);
+        assert!(pv.subscribers.lock().is_empty(), "and then the other one");
     }
 }

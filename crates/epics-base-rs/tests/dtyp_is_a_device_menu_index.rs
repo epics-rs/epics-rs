@@ -22,6 +22,7 @@
 
 use epics_base_rs::server::db_loader::create_record;
 use epics_base_rs::server::record::{RecordInstance, coerce_put_value};
+use epics_base_rs::types::c_parse::Converted;
 use epics_base_rs::types::{DbFieldType, EpicsValue, PvString};
 
 fn instance(record_type: &str) -> RecordInstance {
@@ -100,7 +101,7 @@ fn r21_a_dtyp_put_resolves_against_the_device_menu() {
         EpicsValue::String(PvString::from("Raw Soft Channel")),
     )
     .expect("a declared device choice");
-    assert_eq!(ok, EpicsValue::Enum(1));
+    assert_eq!(ok, Converted::Stored(EpicsValue::Enum(1)));
 
     let bad = coerce_put_value(
         inst.record.as_ref(),

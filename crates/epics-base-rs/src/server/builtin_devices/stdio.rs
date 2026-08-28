@@ -14,7 +14,7 @@
 
 use crate::error::{CaError, CaResult};
 use crate::runtime::log::errlog_printf;
-use crate::server::device_support::DeviceSupport;
+use crate::server::device_support::{DeviceInitOutcome, DeviceSupport};
 use crate::server::record::Record;
 use crate::types::EpicsValue;
 
@@ -43,14 +43,14 @@ impl StdioStream {
     }
 
     /// Print `line` followed by a newline — C `pstream->print("%s\n", val)`.
-    /// stdout/stderr terminate the line themselves; the errlog stream routes
-    /// through `tracing`, which owns line termination, so the C format's
-    /// trailing `\n` is the line break here too.
+    /// All three streams carry C's `\n`: `println!`/`eprintln!` supply it, and
+    /// the errlog stream carries it in the message, because the errlog console
+    /// writes the caller's bytes and appends nothing (C `errlog.c:795`).
     fn print_line(self, line: &str) {
         match self {
             StdioStream::Stdout => println!("{line}"),
             StdioStream::Stderr => eprintln!("{line}"),
-            StdioStream::Errlog => errlog_printf(line),
+            StdioStream::Errlog => errlog_printf(&format!("{line}\n")),
         }
     }
 }
@@ -80,7 +80,7 @@ impl DeviceSupport for StdioDeviceSupport {
         "stdio"
     }
 
-    fn init(&mut self, record: &mut dyn Record) -> CaResult<()> {
+    fn init(&mut self, record: &mut dyn Record) -> CaResult<DeviceInitOutcome> {
         // C registers a SEPARATE dset per record type (devLsoStdio /
         // devPrintfStdio / devSoStdio), and "stdio" is not a valid DTYP menu
         // choice for any other record type — so C rejects a DTYP="stdio" on
@@ -101,7 +101,7 @@ impl DeviceSupport for StdioDeviceSupport {
         // returns -1 in that case, but iocInit's `doResolveLinks` discards the
         // return value (no `recGblRecordError`, no alarm) — so C is silent and
         // the record simply writes nothing. Match that: no diagnostic, no alarm.
-        Ok(())
+        Ok(DeviceInitOutcome::Live)
     }
 
     fn write(&mut self, record: &mut dyn Record) -> CaResult<()> {

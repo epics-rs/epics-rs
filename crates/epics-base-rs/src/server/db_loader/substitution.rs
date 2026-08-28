@@ -498,17 +498,22 @@ pub fn substitution_rows(
 /// `file` name is handed straight to `dbLoadRecords`
 /// (`dbLoadTemplate.y:51`) without any earlier expansion, so the
 /// environment is the only thing that can resolve it.
-pub(crate) fn resolve_template(filename: &str, include_paths: &[PathBuf]) -> CaResult<PathBuf> {
-    super::include::db_open_file(filename, include_paths).ok_or_else(|| CaError::DbParseError {
-        line: 0,
-        column: 0,
-        message: format!("template file not found: '{filename}'"),
+pub(crate) fn resolve_template(
+    filename: &str,
+    include_paths: &[PathBuf],
+) -> CaResult<super::include::DbOpenedFile> {
+    super::include::db_open_file_located(filename, include_paths).ok_or_else(|| {
+        CaError::DbParseError {
+            line: 0,
+            column: 0,
+            message: format!("template file not found: '{filename}'"),
+        }
     })
 }
 
 #[cfg(test)]
 mod tests {
-    use super::super::include::{DbLoadConfig, parse_db_file_with_breaktables};
+    use super::super::include::{DbLoadConfig, parse_db_opened_with_breaktables};
     use super::*;
 
     /// Drive a `.substitutions` file the way `dbLoadTemplate` does:
@@ -525,7 +530,7 @@ mod tests {
             .into_iter()
             .flat_map(|(file, merged)| {
                 let template = resolve_template(&file, &config.include_paths).unwrap();
-                parse_db_file_with_breaktables(&template, &merged, config)
+                parse_db_opened_with_breaktables(&template, &merged, config)
                     .unwrap()
                     .records
             })
@@ -826,9 +831,9 @@ file "b.db" { { Y=2 } }
         let recs = load_rows(&subs, &HashMap::new(), &config);
         assert_eq!(recs.len(), 2);
         assert_eq!(recs[0].name, "IOC:1");
-        assert_eq!(recs[0].fields[0].1, "1");
+        assert_eq!(recs[0].fields[0].value, "1");
         assert_eq!(recs[1].name, "IOC:2");
-        assert_eq!(recs[1].fields[0].1, "2");
+        assert_eq!(recs[1].fields[0].value, "2");
     }
 
     /// I-R3-3: a template that also exists next to the `.substitutions`

@@ -53,13 +53,16 @@ async fn add_source(db: &PvDatabase) {
     }
 }
 
+/// Through `PvDatabase`, which is the only entry point that can serve a
+/// link-backed field: it resolves the link with no record lock held, exactly
+/// where C takes the target's lock inside the rset (`dbDbLink.c:240-261`).
+/// `RecordInstance::snapshot_for_field` answers `None` for these fields by
+/// construction — see `the_record_alone_cannot_serve_a_link_backed_field`.
 fn snapshot_of(db: &PvDatabase, record: &str, field: &str) -> Snapshot {
     let rec = db
         .get_record(record)
         .unwrap_or_else(|| panic!("{record} not in the database"));
-    let guard = rec.read();
-    guard
-        .snapshot_for_field(field)
+    db.channel_snapshot_for_field(&rec, field, false)
         .unwrap_or_else(|| panic!("{record}.{field} served no snapshot"))
 }
 
@@ -124,7 +127,7 @@ async fn a_calc_arg_serves_its_links_target_not_the_calc_record() {
 
 /// A CONSTANT link has no metadata getters (`dbConstLink.c:234-248` NULLs all
 /// five slots), so every `dbGet*` writes nothing and `dbAccess.c`'s seeds
-/// stand: units the `:378` memset, display the `:216` 0/0, alarm the `:294`
+/// stand: units the `:377` memset, display the `:216` 0/0, alarm the `:294`
 /// four NaN — and precision the record's own PREC, which `get_precision`
 /// seeds before it consults the link.
 #[epics_macros_rs::epics_test]

@@ -1,6 +1,6 @@
 //! R18-95: a put-notify that lands on a PACT record defers the WHOLE put.
 //!
-//! C `processNotifyCommon` (dbNotify.c:225-231) tests PACT ABOVE the put:
+//! C `processNotifyCommon` (dbNotify.c:225-232) tests PACT ABOVE the put:
 //!
 //! ```c
 //! if (precord->ppn && pnotify->paddr->precord != precord) { ... }
@@ -77,6 +77,7 @@ impl Record for AsyncOnceRecord {
                 result: RecordProcessResult::AsyncPending,
                 actions: Vec::new(),
                 device_did_compute: false,
+                post_write_fields: Vec::new(),
             })
         } else {
             Ok(ProcessOutcome::complete())
@@ -240,7 +241,7 @@ async fn deferred_put_is_replayed_and_completes_after_it() {
     );
 }
 
-/// C `dbNotify.c:213-217`: a record that already owns a put-notify puts the
+/// C `dbNotify.c:213-220`: a record that already owns a put-notify puts the
 /// next one on `restartList` (`ellSafeAdd`) — it is neither refused nor
 /// written. Boundary: queue depth 1 → 2, the first depth the old single
 /// `Option` could not hold.
@@ -288,13 +289,14 @@ async fn a_second_put_notify_onto_a_deferred_record_queues_behind_it() {
 /// The OWNERSHIP arm, reached by a process-only notify (C `processGetRequest`,
 /// the port's `process_record_with_notify` — QSRV's `record[process=true]`).
 ///
-/// C `processNotifyCommon` (dbNotify.c:211-219) tests `precord->ppn` before it
+/// C `processNotifyCommon` (dbNotify.c:213-220) tests `precord->ppn` before it
 /// looks at the request type, so a process-only notify onto an owned record
 /// queues exactly like a put does. The port's restart list could hold only a
-/// field-and-value put, so this entry had nowhere to wait and refused with
-/// `PutCallbackInProgress` — an `ECA_PUTCBINPROG` whose only sender in C is
-/// `rsrv/camessage.c:1745`, a put-callback TIMEOUT, never a second-request
-/// refusal.
+/// field-and-value put, so this entry had nowhere to wait and refused with an
+/// `ECA_PUTCBINPROG` whose only sender in C is `write_notify_action`
+/// (`rsrv/camessage.c:1701` at R7.0.10), a put-callback TIMEOUT, never a
+/// second-request refusal. That refusal is now unreachable by construction:
+/// the `CaError` variant that carried it has been deleted.
 ///
 /// Boundary: `notify.is_some()` (owned), PACT held by that same notify.
 #[epics_macros_rs::epics_test]
@@ -325,7 +327,7 @@ async fn process_notify_onto_an_owned_record_queues_instead_of_refusing() {
     {
         let rec = db.get_record("ASY").unwrap();
         let inst = rec.read();
-        assert!(inst.notify.is_some(), "the first notify owns the record");
+        assert!(inst.has_notify(), "the first notify owns the record");
         assert!(inst.is_processing(), "and holds it PACT");
     }
 
@@ -365,7 +367,7 @@ async fn process_notify_onto_an_owned_record_queues_instead_of_refusing() {
 /// empty `SNAM` parks PACT=TRUE forever (subRecord.c:119-122) and a link put
 /// parked there would never be written. That exclusion used to cover the WHOLE
 /// decision, so an owned record's link put fell through to the wait-set install
-/// and got `PutCallbackInProgress`.
+/// and got refused.
 ///
 /// Boundary: owned (`notify.is_some()`) but NOT PACT — the arm the link-field
 /// exclusion must not skip.
@@ -382,7 +384,8 @@ async fn link_field_put_notify_onto_an_owned_idle_record_queues_instead_of_refus
     {
         let rec = db.get_record("AI1").unwrap();
         let mut inst = rec.write();
-        inst.notify = Some(NotifyWaitSet::new(owner_tx));
+        inst.install_or_queue_notify(owner_tx)
+            .expect("the record is free, so the wait-set installs");
         assert!(!inst.is_processing(), "owned, but idle");
     }
 
@@ -498,6 +501,7 @@ impl Record for OdlyRecord {
                     std::time::Duration::from_secs(100),
                 )],
                 device_did_compute: false,
+                post_write_fields: Vec::new(),
             })
         } else {
             Ok(ProcessOutcome::complete())
@@ -585,7 +589,7 @@ async fn deferred_put_is_replayed_when_the_odly_continuation_releases_pact() {
     );
 
     // And the record is not bricked: the parked slot was consumed, so the next
-    // put-callback is accepted rather than refused with PutCallbackInProgress.
+    // put-callback is accepted rather than refused.
     db.put_record_field_from_ca("ODL", "VAL", EpicsValue::Long(9))
         .await
         .expect("a later put-notify on the now-idle record must be accepted");
@@ -774,7 +778,7 @@ async fn deferred_put_is_replayed_when_the_illegal_simm_continuation_releases_pa
 }
 
 /// The fire-and-forget route is NOT deferred: C `dbPutField` on a PACT record
-/// writes the value and raises RPRO (dbAccess.c:1263-1277). Only `dbPutNotify`
+/// writes the value and raises RPRO (dbAccess.c:1260-1274). Only `dbPutNotify`
 /// waits — the gate must not swallow the ordinary put.
 #[epics_macros_rs::epics_test]
 async fn a_fire_and_forget_put_on_a_pact_record_still_writes_and_sets_rpro() {

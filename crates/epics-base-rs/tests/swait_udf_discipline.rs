@@ -4,13 +4,13 @@
 //! `swaitRecord.c` mentions `udf` on exactly two lines, and both CLEAR it:
 //!
 //! ```c
-//!   :409  if (calcPerform(&pwait->a,&pwait->val,pwait->rpcl)) {
-//!   :410      recGblSetSevr(pwait,CALC_ALARM,INVALID_ALARM);
-//!   :411  } else pwait->udf = FALSE;
+//!   :408  if (calcPerform(&pwait->a,&pwait->val,pwait->rpcl)) {
+//!   :409      recGblSetSevr(pwait,CALC_ALARM,INVALID_ALARM);
+//!   :410  } else pwait->udf = FALSE;
 //!   …
-//!   :417  status = dbGetLink(&(pwait->siol),DBR_DOUBLE,&(pwait->sval),0,0);
-//!   :418  if (status==0) {
-//!   :419      pwait->val=pwait->sval; pwait->udf=FALSE;
+//!   :416  status = dbGetLink(&(pwait->siol),DBR_DOUBLE,&(pwait->sval),0,0);
+//!   :417  if (status==0) {
+//!   :418      pwait->val=pwait->sval; pwait->udf=FALSE;
 //!   :420  }
 //! ```
 //!
@@ -100,7 +100,7 @@ async fn r11_c13_a_failing_calc_leaves_udf_set() {
         "the failure's only alarm is CALC_ALARM — never UDF_ALARM"
     );
 
-    // And a later success clears it (C `:411`), from the same record.
+    // And a later success clears it (C `:410`), from the same record.
     db.put_record_field_from_ca("W", "CALC", EpicsValue::String("7".into()))
         .await
         .unwrap();

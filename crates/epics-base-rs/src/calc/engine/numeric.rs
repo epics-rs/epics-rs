@@ -101,7 +101,7 @@ pub fn eval(expr: &CompiledExpr, inputs: &mut NumericInputs) -> Result<f64, Calc
                 }
                 CoreOp::Mod => {
                     let (a, b) = pop2(&mut stack)?;
-                    // C `calcPerform.c:176-190` (fixed, `669a25697`/PR #925):
+                    // C `calcPerform.c:176-190` (unmerged PR #925):
                     //   itop = d2i(top);
                     //   if (itop == 0)       *ptop = epicsNAN;
                     //   else if (itop == -1) *ptop = 0;
@@ -277,7 +277,7 @@ pub fn eval(expr: &CompiledExpr, inputs: &mut NumericInputs) -> Result<f64, Calc
                 }
                 CoreOp::Nint => {
                     let a = pop1(&mut stack)?;
-                    // C `calcPerform.c:313-317` (fixed, `669a25697`/PR #925):
+                    // C `calcPerform.c:313-317` (unmerged PR #925):
                     //   top = top >= 0 ? top+0.5 : top-0.5;
                     //   *ptop = d2i(top);
                     // base's dialect narrowing is `d2i`. See CBUG-A2.
@@ -454,7 +454,7 @@ fn cond_search(code: &[Opcode], start: usize, find_else: bool) -> Result<usize, 
 
 #[cfg(test)]
 mod parity_tests {
-    //! C-parity regression tests for calc engine fixes (doc/parity-review/01-calc.md).
+    //! C-parity regression tests for calc engine fixes.
     use crate::calc::engine::cast::{d2i, d2ui};
     use crate::calc::engine::error::calc_error_str;
     use crate::calc::{
@@ -620,8 +620,8 @@ mod parity_tests {
         assert!(run("MIN(5,0/0)").is_nan());
     }
 
-    /// CBUG-A2 — NINT rounds, then narrows through `d2i`, tracking base's fixed
-    /// `calcPerform.c:313-317` (`669a25697`/PR #925). This used to pin the clean
+    /// CBUG-A2 — NINT rounds, then narrows through `d2i`, tracking
+    /// `calcPerform.c:313-317` at unmerged PR #925. This used to pin the clean
     /// no-narrow deviation (`NINT(3e9) == 3e9`); before that it pinned C's
     /// `(epicsInt32)` cvttsd2si value (`i32::MIN`).
     #[test]
@@ -650,8 +650,8 @@ mod parity_tests {
         assert_eq!(run("NINT(-2147483648)"), -2_147_483_648.0);
     }
 
-    /// CBUG-A2 — MODULO narrows both operands through `d2i`, tracking base's
-    /// fixed `calcPerform.c:176-190` (`669a25697`/PR #925). These used to pin the
+    /// CBUG-A2 — MODULO narrows both operands through `d2i`, tracking
+    /// `calcPerform.c:176-190` at unmerged PR #925. These used to pin the
     /// clean no-narrow deviation.
     #[test]
     fn h4_mod_out_of_range_operands_are_d2i_narrowed() {

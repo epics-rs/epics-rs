@@ -1,18 +1,19 @@
 //! R10-11 — aCalc's `status` cell: who writes it, and what a write means.
 //!
 //! `status` (`aCalcPerform.c:422`) is read exactly once, at the end of the expression
-//! (`:1602-1605`), and a non-zero value suppresses the result write entirely — the
+//! (`:1591-1594`), and a non-zero value suppresses the result write entirely — the
 //! record keeps its previous VAL/AVAL and raises CALC_ALARM/INVALID.
 //!
 //! Two things the port had wrong:
 //!
-//! * **the FIT/DERIV family never wrote it.** C assigns `status = deriv(...)` (`:613`,
-//!   `:985`) and `status = fitpoly(...)` (`:1008`, `:1029`, `:1221`, `:1270`); a fit
+//! * **the FIT/DERIV family never wrote it.** C assigns `status = deriv(...)` (`:608`,
+//!   `:976`) and `status = fitpoly(...)` (`:999`, `:1020`, `:1210`, `:1259`); a fit
 //!   fails on fewer than three points or a singular normal matrix (`calcUtil.c:271`,
 //!   `:297`). The port silently substituted a zero curve and reported success, so a
 //!   record whose window had collapsed published zeros as if they were data.
 //! * **the cell was sticky.** Every C write is an ASSIGNMENT, including the `status =
-//!   0` that opens each array SQRT/LOG guard (`:776`, `:792`, `:804`), so the LAST
+//!   0` that opens each array SQRT/LOG guard (back in `aCalcPerform.c`: `:776`,
+//!   `:792`, `:804`), so the LAST
 //!   fallible operator decides and a clean one CLEARS an earlier failure. The port's
 //!   `Option` only ever went from None to Some.
 //!
@@ -121,7 +122,7 @@ fn r10_11_the_status_cell_is_shared_by_both_families() {
 }
 
 /// The SCALAR branch of the unary switch writes no status at all — not even to clear
-/// it (`:1044-1101` has no `status =` anywhere). So a scalar SQRT/DERIV/FITPOLY after
+/// it (`:1033-1090` has no `status =` anywhere). So a scalar SQRT/DERIV/FITPOLY after
 /// a failed array operator leaves the failure standing. Compiled C, all three:
 /// status=-1.
 #[test]

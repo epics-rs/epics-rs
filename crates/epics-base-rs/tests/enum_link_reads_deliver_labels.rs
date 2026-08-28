@@ -4,11 +4,11 @@
 //! C reads:
 //! - stringin INP  — `dbGetLink(..., DBR_STRING, ...)` (`devSiSoft.c:53`)
 //! - stringin SIOL — same request (`stringinRecord.c:208`)
-//! - lsi INP       — `dbGetLinkLS` (`devLsiSoft.c:32` → `dbLink.c:497-505`):
+//! - lsi INP       — `dbGetLinkLS` (`devLsiSoft.c:32` → `dbLink.c:495-503`):
 //!   CHAR/UCHAR source → the bytes it spells, else `DBR_STRING`
 //! - stringout DOL — `dbGetLink(..., DBR_STRING, ...)` (`stringoutRecord.c:141`)
 //! - lso DOL       — `dbGetLinkLS` (`lsoRecord.c:114`)
-//! - printf `%s`   — `dbGetLink(..., DBR_STRING, ...)` (`printfRecord.c:291`)
+//! - printf `%s`   — `dbGetLink(..., DBR_STRING, ...)` (`printfRecord.c:289`)
 //!
 //! The pre-fix port fetched every one of these natively and let the target
 //! field coerce blind, so a bi/mbbi/menu source stored `"1"` where fixed C
@@ -160,7 +160,7 @@ async fn lso_dol_at_enum_source_delivers_the_label() {
 }
 
 /// printf `%s` renders the label; `%d` on the SAME source keeps the index —
-/// the per-conversion request boundary (`printfRecord.c:291` vs `:129`).
+/// the per-conversion request boundary (`printfRecord.c:289` vs `:129`).
 #[epics_macros_rs::epics_test]
 async fn printf_string_conversion_gets_the_label_numeric_keeps_the_index() {
     let db = build(

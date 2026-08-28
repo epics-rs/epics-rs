@@ -166,7 +166,11 @@ fn get_and_monitor_serve_what_create_channel_announced() {
         let Some(stored) = inst.resolve_field(field) else {
             continue;
         };
-        let posted = inst.make_monitor_snapshot(field, stored);
+        let posted = inst.make_monitor_snapshot(
+            field,
+            stored,
+            epics_base_rs::server::database::LinkBacking::none(),
+        );
         if served_code(&posted.value) != announced {
             disagree.push(format!(
                 "{record}.{field}: create-channel says {announced}, MONITOR posts {} ({:?})",
@@ -281,7 +285,7 @@ fn sub_array_is_declared_by_the_dbd_not_by_its_hand_table() {
     );
 
     // VAL is the same `cvt_dbaddr` selector shape as waveform's: the element
-    // type IS FTVL (subArrayRecord.c:229-238), so the .dbd's DBF_NOACCESS
+    // type IS FTVL (subArrayRecord.c:225-234), so the .dbd's DBF_NOACCESS
     // placeholder must not be projected onto it.
     inst.record
         .put_field("FTVL", EpicsValue::Short(5))
@@ -301,7 +305,7 @@ fn sub_array_is_declared_by_the_dbd_not_by_its_hand_table() {
 
 /// The `SDEF` selector, both halves. `mbbo.VAL` is the one field whose runtime
 /// type is chosen by whether the record has any state table at all
-/// (`mbboRecord.c:300-312`: `if (!prec->sdef) paddr->field_type = DBF_USHORT`),
+/// (`mbboRecord.c:300-313`: `if (!prec->sdef) paddr->field_type = DBF_USHORT`),
 /// and `DBF_USHORT` has no CA wire type, so a stateless mbbo goes out
 /// `DBF_LONG`. Measured on the C softIoc, both records in one `.db`:
 ///

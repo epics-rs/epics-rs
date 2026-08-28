@@ -25,7 +25,7 @@
 //! (`dbNotify.c:528-530`), so `processNotifyCommon` (`:243-261`) still runs
 //! `dbProcess` on the put-notify (`ca_put_callback`) path — the record processes
 //! and the client is still told the put failed. Plain `dbPutField`
-//! (`dbAccess.c:1263-1264`) processes only when `dbPut` returned 0, so the
+//! (`dbAccess.c:1260-1261`) processes only when `dbPut` returned 0, so the
 //! fire-and-forget path does NOT process a rejected put. The port mirrors both.
 
 use std::sync::Arc;

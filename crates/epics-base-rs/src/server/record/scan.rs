@@ -1,6 +1,22 @@
+use super::menu_scan::{SCAN_1ST_PERIODIC, menu_scan};
+
 /// The value of a `menu(menuScan)` field — the SCAN field's domain.
 ///
-/// [`Self::Illegal`] is not a defensive variant, it is C's state. `dbPut`
+/// The domain is the *loaded* menu, not a fixed list of rates. C fixes exactly
+/// three choices — `dbScan.c` tests `menuScanPassive`, `menuScanEvent` and
+/// `menuScanI_O_Intr` by name — and reads everything from
+/// `SCAN_1ST_PERIODIC` up out of `menuScan` at run time (`initPeriodic`,
+/// `dbScan.c:856-918` at `R7.0.10`). A site that ships its own `menuScan.dbd`
+/// with `60 Hz` or `5 minutes` gets those rates, which is why the periodic
+/// choices are carried here as a menu INDEX and resolved through
+/// [`menu_scan`], instead of being enumerated as variants.
+///
+/// [`Self::Menu`] therefore covers three cases that only the loaded menu can
+/// tell apart — a working rate, a menu entry whose choice string did not parse
+/// (C's `papPeriodic[i] == NULL`), and an index outside the menu entirely. The
+/// gate that separates them is [`ScanList::of`], exactly as C's `scanAdd` is.
+///
+/// An out-of-menu index is not a defensive case, it is C's state. `dbPut`
 /// stores the `epicsEnum16` the client wrote and only THEN calls `scanAdd`,
 /// which tests the index against the menu and, when it is outside,
 ///
@@ -16,8 +32,8 @@
 /// written value: verified on the softIoc, `caput REC.SCAN 10` succeeds and
 /// `caget REC.SCAN` answers `10`.
 ///
-/// Modelling SCAN as the nine legal choices alone forced `from_u16` to *erase*
-/// an out-of-menu index to `Passive`, which is wrong twice over: the field then
+/// Modelling SCAN as the legal choices alone forced `from_u16` to *erase* an
+/// out-of-menu index to `Passive`, which is wrong twice over: the field then
 /// read back `0` instead of `10`, and the record became put-processable
 /// (C tests `precord->scan == 0` literally in `dbPutField`, dbAccess.c:1263, so
 /// an illegal SCAN does NOT process on a `pp(TRUE)` put — a `Passive` one does).
@@ -28,31 +44,35 @@ pub enum ScanType {
     Passive,
     Event,
     IoIntr,
-    Sec10,
-    Sec5,
-    Sec2,
-    Sec1,
-    Sec05,
-    Sec02,
-    Sec01,
-    /// An index outside `menuScan`. Stored, served, and scanned by nothing.
-    Illegal(u16),
+    /// A menu index at or above [`SCAN_1ST_PERIODIC`]. What it means — a rate,
+    /// a dead menu entry, or nothing at all — is a property of the loaded
+    /// `menuScan`, and [`ScanList::of`] is the single place that decides.
+    Menu(u16),
 }
 
 impl ScanType {
+    /// The stock `menuScan.dbd` rates, by the index each occupies in base's
+    /// own menu. These are the port's equivalent of the `menuScan10_second` …
+    /// `menuScan_1_second` constants `dbToMenuH` generates from a site's
+    /// `menuScan.dbd`, and they carry C's caveat with them: they name an
+    /// INDEX, so under a site menu that replaces the rates they name whatever
+    /// that menu put there. Nothing in the scan machinery uses them — it reads
+    /// [`menu_scan`] — they exist so a `.db` fixture or a caller that means
+    /// "base's 1 second rate" can say so.
+    pub const SEC10: Self = Self::Menu(3);
+    pub const SEC5: Self = Self::Menu(4);
+    pub const SEC2: Self = Self::Menu(5);
+    pub const SEC1: Self = Self::Menu(6);
+    pub const SEC05: Self = Self::Menu(7);
+    pub const SEC02: Self = Self::Menu(8);
+    pub const SEC01: Self = Self::Menu(9);
+
     pub fn from_u16(v: u16) -> Self {
         match v {
             0 => Self::Passive,
             1 => Self::Event,
             2 => Self::IoIntr,
-            3 => Self::Sec10,
-            4 => Self::Sec5,
-            5 => Self::Sec2,
-            6 => Self::Sec1,
-            7 => Self::Sec05,
-            8 => Self::Sec02,
-            9 => Self::Sec01,
-            other => Self::Illegal(other),
+            other => Self::Menu(other),
         }
     }
 
@@ -62,14 +82,7 @@ impl ScanType {
             Self::Passive => 0,
             Self::Event => 1,
             Self::IoIntr => 2,
-            Self::Sec10 => 3,
-            Self::Sec5 => 4,
-            Self::Sec2 => 5,
-            Self::Sec1 => 6,
-            Self::Sec05 => 7,
-            Self::Sec02 => 8,
-            Self::Sec01 => 9,
-            Self::Illegal(v) => v,
+            Self::Menu(v) => v,
         }
     }
 
@@ -78,16 +91,24 @@ impl ScanType {
         ScanList::of(self)
     }
 
-    /// Return the interval duration for periodic scan types.
+    /// This rate's period, from the loaded menu — C's `papPeriodic[scan -
+    /// SCAN_1ST_PERIODIC]->period`. `None` for the three fixed choices and for
+    /// any index the menu has no usable rate at.
     pub fn interval(&self) -> Option<std::time::Duration> {
         match self {
-            Self::Sec10 => Some(std::time::Duration::from_secs(10)),
-            Self::Sec5 => Some(std::time::Duration::from_secs(5)),
-            Self::Sec2 => Some(std::time::Duration::from_secs(2)),
-            Self::Sec1 => Some(std::time::Duration::from_secs(1)),
-            Self::Sec05 => Some(std::time::Duration::from_millis(500)),
-            Self::Sec02 => Some(std::time::Duration::from_millis(200)),
-            Self::Sec01 => Some(std::time::Duration::from_millis(100)),
+            Self::Menu(v) => menu_scan().period_at(*v),
+            _ => None,
+        }
+    }
+
+    /// C's `ind` — the offset into `papPeriodic`, which is also the offset in
+    /// the scan-thread priority ladder (`dbScan.c:945`). `None` unless this is
+    /// a periodic choice with a usable rate.
+    pub fn periodic_index(self) -> Option<usize> {
+        match self {
+            Self::Menu(v) if menu_scan().period_at(v).is_some() => {
+                Some((v - SCAN_1ST_PERIODIC) as usize)
+            }
             _ => None,
         }
     }
@@ -96,31 +117,39 @@ impl ScanType {
 /// The key of a scan list: a `SCAN` value that actually names one.
 ///
 /// C `scanAdd` (`dbScan.c:241-251`) is the sole gate on scan-list membership,
-/// and it admits neither of the two SCAN values that name no list:
+/// and it admits neither of the SCAN values that name no list:
 ///
 /// ```c
 /// if (scan == menuScanPassive) return;                       /* no list */
 /// if (scan < 0 || scan >= nPeriodic + SCAN_1ST_PERIODIC) {   /* no list */
 ///     recGblRecordError(-1, precord, "scanAdd detected illegal SCAN value");
 /// } else if (scan == menuScanEvent) { ... }
+/// ...
+/// } else if (scan >= SCAN_1ST_PERIODIC) {
+///     periodic_scan_list *ppsl = papPeriodic[scan - SCAN_1ST_PERIODIC];
+///     if (ppsl) addToList(precord, &ppsl->scan_list);        /* no list if NULL */
+/// }
 /// ```
 ///
 /// The scan index is keyed by this type rather than by [`ScanType`], so those
-/// two cases are refused by construction at every insert site — a `Passive` or
-/// [`ScanType::Illegal`] record cannot be put in a bucket, and no consumer of a
-/// bucket has to re-check. Before [`ScanType::Illegal`] existed the index was
-/// keyed by `ScanType` and each site spelled out `!= ScanType::Passive`, which
-/// admitted exactly the illegal index C refuses.
+/// cases are refused by construction at every insert site — a `Passive`
+/// record, an out-of-menu one, and one whose menu entry has no usable rate
+/// cannot be put in a bucket, and no consumer of a bucket has to re-check.
+/// Before this type existed the index was keyed by `ScanType` and each site
+/// spelled out `!= ScanType::Passive`, which admitted exactly the illegal
+/// index C refuses.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Hash)]
 pub struct ScanList(ScanType);
 
 impl ScanList {
-    /// `None` when this SCAN names no list — `Passive`, or an index outside
-    /// `menuScan`.
+    /// `None` when this SCAN names no list — `Passive`, an index outside the
+    /// loaded `menuScan`, or a menu entry C would leave `papPeriodic[i] ==
+    /// NULL` for.
     pub fn of(scan: ScanType) -> Option<Self> {
         match scan {
-            ScanType::Passive | ScanType::Illegal(_) => None,
-            scanned => Some(Self(scanned)),
+            ScanType::Passive => None,
+            ScanType::Event | ScanType::IoIntr => Some(Self(scan)),
+            ScanType::Menu(v) => menu_scan().period_at(v).is_some().then_some(Self(scan)),
         }
     }
 
@@ -129,35 +158,36 @@ impl ScanList {
         self.0
     }
 
-    /// How many scan lists exist: the `menuScan` choices minus `Passive`,
-    /// i.e. `Event`, `IoIntr` and the seven periodic rates. C sizes its own
-    /// list array the same way — `nPeriodic + SCAN_1ST_PERIODIC`
-    /// (`dbScan.c:250`) over `papPeriodic` plus the two special lists.
-    pub const COUNT: usize = 9;
+    /// How many scan lists exist: `Event`, `IoIntr` and one per periodic menu
+    /// entry. C sizes its own list array the same way — `nPeriodic +
+    /// SCAN_1ST_PERIODIC` (`dbScan.c:250`) over `papPeriodic` plus the two
+    /// special lists — and, like C, counts a menu entry whose choice string
+    /// did not parse: the slot exists and stays empty, so a bad entry does not
+    /// shift the index of the rates after it.
+    pub fn count() -> usize {
+        menu_scan().n_periodic() + (SCAN_1ST_PERIODIC as usize - 1)
+    }
 
-    /// Dense slot in `0..COUNT`, so a per-list table can be a fixed array
-    /// rather than a map behind its own lock.
+    /// Dense slot in `0..count()`, so a per-list table can be a fixed-length
+    /// allocation rather than a map behind its own lock.
     ///
     /// Total by construction: [`Self::of`] is the only constructor and it
-    /// refuses `Passive` (menu index 0) and every out-of-menu index, so the
-    /// wrapped [`ScanType`] is always one of the nine indices `1..=9`.
+    /// refuses `Passive` (menu index 0) and every index the loaded menu has no
+    /// rate at, so the wrapped [`ScanType`] is always an index in
+    /// `1..count()+1`.
     pub fn slot(self) -> usize {
         self.0.to_u16() as usize - 1
     }
 
     /// Every scan list, in menu order — the enumeration a per-list table is
-    /// built from.
-    pub const ALL: [Self; Self::COUNT] = [
-        Self(ScanType::Event),
-        Self(ScanType::IoIntr),
-        Self(ScanType::Sec10),
-        Self(ScanType::Sec5),
-        Self(ScanType::Sec2),
-        Self(ScanType::Sec1),
-        Self(ScanType::Sec05),
-        Self(ScanType::Sec02),
-        Self(ScanType::Sec01),
-    ];
+    /// built from. Menu entries with no usable rate are absent, so this is
+    /// shorter than [`Self::count`] exactly when the site menu carries a
+    /// choice string C would reject.
+    pub fn all() -> Vec<Self> {
+        (1..=menu_scan().n_periodic() as u16 + SCAN_1ST_PERIODIC - 1)
+            .filter_map(|v| Self::of(ScanType::from_u16(v)))
+            .collect()
+    }
 }
 
 /// `SSCN` — the simulation-mode scan field (`DBF_MENU`, `menu(menuScan)`).
@@ -185,7 +215,7 @@ pub struct SimModeScan(ScanType);
 
 impl Default for SimModeScan {
     fn default() -> Self {
-        Self(ScanType::Illegal(Self::DO_NOT_USE))
+        Self(ScanType::Menu(Self::DO_NOT_USE))
     }
 }
 
@@ -226,20 +256,11 @@ impl std::fmt::Display for SimModeScan {
 
 impl std::fmt::Display for ScanType {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Passive => write!(f, "Passive"),
-            Self::Event => write!(f, "Event"),
-            Self::IoIntr => write!(f, "I/O Intr"),
-            Self::Sec10 => write!(f, "10 second"),
-            Self::Sec5 => write!(f, "5 second"),
-            Self::Sec2 => write!(f, "2 second"),
-            Self::Sec1 => write!(f, "1 second"),
-            Self::Sec05 => write!(f, ".5 second"),
-            Self::Sec02 => write!(f, ".2 second"),
-            Self::Sec01 => write!(f, ".1 second"),
+        match menu_scan().label_at(self.to_u16()) {
+            Some(label) => write!(f, "{label}"),
             // C has no label for an out-of-menu index; `caget` renders the
             // number itself (measured: `caget REC.SCAN` -> `10`).
-            Self::Illegal(v) => write!(f, "{v}"),
+            None => write!(f, "{}", self.to_u16()),
         }
     }
 }
@@ -271,14 +292,14 @@ mod sim_mode_scan_tests {
         }
     }
 
-    /// The labels this type renders are `menuScan`'s, so the one menu
-    /// converter (which owns every string→menu-index put, see
+    /// The labels this type renders are the loaded `menuScan`'s, so the one
+    /// menu converter (which owns every string→menu-index put, see
     /// `tests/menu_common_field_scan_pini.rs`) and this type agree on every
     /// choice — including the `".5 second"` spellings that the deleted
     /// `ScanType::from_str` used to accept a `"0.5 second"` alias for.
     #[test]
-    fn labels_match_the_shared_menu_table() {
-        for (i, label) in super::super::menu_choices::MENU_SCAN.iter().enumerate() {
+    fn labels_match_the_loaded_menu() {
+        for (i, label) in menu_scan().choices().iter().enumerate() {
             assert_eq!(ScanType::from_u16(i as u16).to_string(), *label);
         }
     }
@@ -296,7 +317,7 @@ mod sim_mode_scan_tests {
             assert!(!s.is_unset(), "{v} is illegal, but it is not USHRT_MAX");
             assert_eq!(
                 s.scan(),
-                Some(ScanType::Illegal(v)),
+                Some(ScanType::Menu(v)),
                 "C swaps it into SCAN; scanAdd then scans nothing"
             );
         }
@@ -306,22 +327,22 @@ mod sim_mode_scan_tests {
     /// and the `-1` a client sends as `65535`.
     #[test]
     fn scan_carries_an_illegal_index_instead_of_erasing_it_to_passive() {
-        assert_eq!(ScanType::from_u16(9), ScanType::Sec01);
+        assert_eq!(ScanType::from_u16(9), ScanType::SEC01);
         assert_eq!(ScanType::from_u16(9).to_u16(), 9);
 
         // One past the last choice. Measured: `caput REC.SCAN 10` succeeds and
         // `caget REC.SCAN` answers 10 — it does NOT become Passive.
-        assert_eq!(ScanType::from_u16(10), ScanType::Illegal(10));
+        assert_eq!(ScanType::from_u16(10), ScanType::Menu(10));
         assert_eq!(ScanType::from_u16(10).to_u16(), 10);
         assert_ne!(ScanType::from_u16(10), ScanType::Passive);
 
         // `caput REC.SCAN -1` reaches the field as the epicsEnum16 65535.
-        assert_eq!(ScanType::from_u16(65535), ScanType::Illegal(65535));
+        assert_eq!(ScanType::from_u16(65535), ScanType::Menu(65535));
         assert_eq!(ScanType::from_u16(65535).to_u16(), 65535);
 
-        // An illegal index is in no scan list: not periodic, not I/O Intr.
-        assert_eq!(ScanType::Illegal(10).interval(), None);
-        assert_ne!(ScanType::Illegal(10), ScanType::IoIntr);
+        // An out-of-menu index is in no scan list: not periodic, not I/O Intr.
+        assert_eq!(ScanType::Menu(10).interval(), None);
+        assert_ne!(ScanType::Menu(10), ScanType::IoIntr);
     }
 
     /// `scanAdd`'s gate, at its boundaries: the last legal index names a list,
@@ -355,31 +376,52 @@ mod sim_mode_scan_tests {
         }
     }
 
-    /// `slot()` is a total, collision-free index into a `COUNT`-sized array —
+    /// `slot()` is a total, collision-free index into a `count()`-sized array —
     /// the property the per-list scan-index table indexes by, without a
     /// bounds check or a fallible lookup.
     ///
     /// Boundary cases, not a narrative: every `of`-admissible SCAN maps into
-    /// `0..COUNT`; `ALL` is exactly that set in slot order; and both values
+    /// `0..count()`; `all()` is exactly that set in slot order; and both values
     /// `of` refuses (`Passive`, out-of-menu) yield no slot at all.
     #[test]
     fn every_scan_list_has_a_distinct_slot() {
-        let mut seen = [false; ScanList::COUNT];
+        let mut seen = vec![false; ScanList::count()];
         for v in 0u16..=9 {
             let Some(list) = ScanType::from_u16(v).scan_list() else {
                 assert_eq!(v, 0, "only Passive names no list inside the menu");
                 continue;
             };
             let slot = list.slot();
-            assert!(slot < ScanList::COUNT, "slot {slot} out of the table");
+            assert!(slot < ScanList::count(), "slot {slot} out of the table");
             assert!(!seen[slot], "slot {slot} claimed twice");
             seen[slot] = true;
         }
         assert!(seen.iter().all(|s| *s), "every slot must be claimed");
 
-        for (i, list) in ScanList::ALL.iter().enumerate() {
-            assert_eq!(list.slot(), i, "ALL must be in slot order");
+        for (i, list) in ScanList::all().iter().enumerate() {
+            assert_eq!(list.slot(), i, "all() must be in slot order");
         }
-        assert_eq!(ScanType::Illegal(65535).scan_list(), None);
+        assert_eq!(ScanType::Menu(65535).scan_list(), None);
+    }
+
+    /// The stock menu's rates, read through the same path a site menu's would
+    /// be — the seven periods that used to be `interval()`'s match arms.
+    #[test]
+    fn the_stock_rates_come_back_through_the_loaded_menu() {
+        use std::time::Duration;
+        for (scan, period) in [
+            (ScanType::SEC10, Duration::from_secs(10)),
+            (ScanType::SEC5, Duration::from_secs(5)),
+            (ScanType::SEC2, Duration::from_secs(2)),
+            (ScanType::SEC1, Duration::from_secs(1)),
+            (ScanType::SEC05, Duration::from_millis(500)),
+            (ScanType::SEC02, Duration::from_millis(200)),
+            (ScanType::SEC01, Duration::from_millis(100)),
+        ] {
+            assert_eq!(scan.interval(), Some(period), "{scan}");
+        }
+        assert_eq!(ScanType::Passive.interval(), None);
+        assert_eq!(ScanType::Event.interval(), None);
+        assert_eq!(ScanType::IoIntr.interval(), None);
     }
 }

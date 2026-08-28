@@ -12,11 +12,11 @@
 //!
 //! ```text
 //! aiRecord.c:267-288        SVAL              -> HOPR/LOPR   (SVAL is DBF_DOUBLE: default would be +-1e300)
-//! longinRecord.c:206-224    SVAL              -> HOPR/LOPR   (DBF_LONG:   default would be +-2147483647)
+//! longinRecord.c:217-238    SVAL              -> HOPR/LOPR   (DBF_LONG:   default would be +-2147483647)
 //! aoRecord.c:341-363        OVAL, PVAL        -> DRVH/DRVL   (DBF_DOUBLE: default would be +-1e300)
 //! compressRecord.c:487-502  IHIL, ILIL        -> HOPR/LOPR   (DBF_DOUBLE: default would be +-1e300)
 //! histogramRecord.c:458-475 WDTH              -> ULIM - LLIM (DBF_DOUBLE: default would be +-1e300)
-//! subArrayRecord.c:262-291  INDX, NELM,       -> MALM bounds (DBF_ULONG/LONG/SHORT ranges)
+//! subArrayRecord.c:258-287  INDX, NELM,       -> MALM bounds (DBF_ULONG/LONG/SHORT ranges)
 //!                           NORD, BUSY
 //! ```
 //!
@@ -92,7 +92,7 @@ fn ai_sval_takes_the_records_hopr_lopr_not_the_double_range() {
     );
 }
 
-/// `longinRecord.c:220` lists `SVAL`. Unlike ai's, longin's `SVAL` is
+/// `longinRecord.c:230` lists `SVAL`. Unlike ai's, longin's `SVAL` is
 /// `DBF_LONG`, so the default arm it escapes is the LONG range — proof the
 /// answer comes from the record field, not from a type coincidence.
 #[test]
@@ -109,14 +109,14 @@ fn longin_sval_takes_the_records_hopr_lopr_not_the_long_range() {
     assert_eq!(
         limits(&inst, "SVAL"),
         (-4000.0, 4000.0),
-        "longinRecord.c:220 lists SVAL: C serves HOPR/LOPR, not the DBF_LONG \
+        "longinRecord.c:230 lists SVAL: C serves HOPR/LOPR, not the DBF_LONG \
          range of +-2147483647"
     );
 }
 
 /// The routing boundary that HOPR/LOPR-everywhere would hide: `ao`'s
-/// `get_control_double` (`:356`) answers **DRVH/DRVL** — the drive limits —
-/// while its `get_graphic_double` (`:332`) answers HOPR/LOPR for the same
+/// `get_control_double` (`aoRecord.c:356`) answers **DRVH/DRVL** — the drive
+/// limits — while its `get_graphic_double` (`:332`) answers HOPR/LOPR for the same
 /// field list. `OVAL` and `PVAL` are listed in both.
 #[test]
 fn ao_oval_and_pval_take_drvh_drvl_not_hopr_lopr() {
@@ -181,7 +181,7 @@ fn histogram_wdth_takes_the_ulim_minus_llim_span() {
 }
 
 /// `subArrayRecord.c:271-286` lists four index fields, each bounded by `MALM`.
-/// `NELM`'s lower is **1**, not 0 — C's control arm (`:277`) differs from its
+/// `NELM`'s lower is **1**, not 0 — C's control arm (`:273`) differs from its
 /// own graphic arm (`:246`) on exactly this one value, so the two lists cannot
 /// share a transcription.
 #[test]
@@ -196,7 +196,7 @@ fn subarray_index_fields_take_malm_bounds() {
     assert_eq!(
         limits(&inst, "INDX"),
         (0.0, 31.0),
-        "subArrayRecord.c:272 serves MALM - 1 up"
+        "subArrayRecord.c:268 serves MALM - 1 up"
     );
     // NELM is a length: MALM up, and 1 down.
     assert_eq!(
@@ -215,7 +215,7 @@ fn subarray_index_fields_take_malm_bounds() {
     assert_eq!(
         limits(&inst, "BUSY"),
         (0.0, 1.0),
-        "subArrayRecord.c:284-285 serves the literal 1/0"
+        "subArrayRecord.c:280-281 serves the literal 1/0"
     );
 }
 
@@ -239,7 +239,7 @@ fn waveform_does_not_borrow_subarrays_nelm_case() {
 }
 
 /// The third and last SVAL member. `int64inRecord.c:225` lists `SVAL` exactly
-/// as `aiRecord.c:280` and `longinRecord.c:220` do; this record type was the
+/// as `aiRecord.c:280` and `longinRecord.c:230` do; this record type was the
 /// one the earlier six-type transcription left out.
 ///
 /// `int64in`'s `SVAL` is `DBF_INT64`, so the `default:` arm it escapes is the
@@ -247,7 +247,7 @@ fn waveform_does_not_borrow_subarrays_nelm_case() {
 /// DBF_DOUBLE, longin's DBF_LONG), which is what proves each answer comes from
 /// the record's HOPR/LOPR and not from a type coincidence.
 ///
-/// `int64outRecord.c:294-312` does NOT list SVAL — an output record has no
+/// `int64outRecord.c:251-277` does NOT list SVAL — an output record has no
 /// simulation buffer to serve — so the family is exactly these three.
 #[test]
 fn int64in_sval_takes_the_records_hopr_lopr_not_the_int64_range() {

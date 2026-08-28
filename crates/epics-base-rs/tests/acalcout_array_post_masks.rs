@@ -3,7 +3,7 @@
 //!
 //! There are TWO call sites and they do not agree on the mask.
 //!
-//! `afterCalc` (`aCalcoutRecord.c:293-297`) posts the AMASK-flagged arrays — the
+//! `afterCalc` (`aCalcoutRecord.c:294-298`) posts the AMASK-flagged arrays — the
 //! ones the expression stored into — with a LITERAL mask; `monitor_mask` does not
 //! even exist in that function:
 //!
@@ -15,7 +15,7 @@
 //! }
 //! ```
 //!
-//! `monitor()` (`:1031-1036`) posts the NEWM-flagged arrays — the ones an input
+//! `monitor()` (`:1027-1032`) posts the NEWM-flagged arrays — the ones an input
 //! link changed — with the alarm bits folded in:
 //!
 //! ```c
@@ -36,7 +36,7 @@
 //! What a subscriber then RECEIVES is the event queue's business, and for an
 //! array field C's queue absorbs the second post: `db_create_field_log` stores
 //! an array by reference (`dbfl_type_ref`), and `db_queue_event_log`'s
-//! early-drop (`dbEvent.c:786-799`) refuses to queue a second by-reference log
+//! early-drop (`dbEvent.c:794-800`) refuses to queue a second by-reference log
 //! for one monitor. So an undrained C monitor sees ONE delivery here, not two,
 //! and it reads the record's current array when it is finally delivered. The
 //! port's queue does the same (`event_queue`'s latest-only rule), keeping the

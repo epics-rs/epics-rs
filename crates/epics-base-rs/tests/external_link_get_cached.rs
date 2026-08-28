@@ -2,13 +2,22 @@
 //! INP read serves the lset's monitor-fed cache and never opens a channel or
 //! waits on the wire from the record-processing thread.
 //!
-//! C reference. `dbCaGetLink` (`dbCa.c:448-535`) does two things: it refuses
-//! with -1 while `!pca->isConnected || !pca->hasReadAccess` (`:459-464`), and
+//! C reference, at the `R7.0.10` pin. `dbCaGetLink` (`dbCa.c:419-506`) does
+//! two things: it refuses with -1 while
+//! `!pca->isConnected || !pca->hasReadAccess` (`:430-435`), and
 //! otherwise copies out of `pca->pgetNative` — the buffer the CA monitor
-//! callback `eventCallback` (`dbCa.c:925`) keeps fresh on the `dbCaTask`. It
-//! never calls `ca_create_channel` and never calls `ca_get`. The channel was
+//! callback `eventCallback` (`dbCa.c:891-967`, the fill at `:941-944`)
+//! keeps fresh on the `dbCaTask`. It never calls `ca_create_channel` and
+//! never calls `ca_get`. The channel was
 //! opened earlier, by `dbCaAddLink` staging a `CA_CONNECT` action
-//! (`dbCa.c:735-800`) that the same task services.
+//! (`dbCa.c:393`) that the same task services.
+//!
+//! This machine's checkout `R7.0.10-146-g8f5015b66` carries the unreleased
+//! iocInit connection-wait (`717d69e1f`, in no tag), which interposes
+//! `dbCaAddLinkCallbackOpt` and splits the monitor callback — so there the
+//! `CA_CONNECT` staging is `:415`, `dbCaGetLink` is `:448-535` with its
+//! refuse guard at `:459-464`, and the callback is `eventCallbackComm`
+//! (`:940-1019`, the fill at `:991-994`).
 //!
 //! The port opens lazily rather than at record init, so the open is staged on
 //! the link work queue the first time a read misses. The parity property —
@@ -112,7 +121,7 @@ async fn val_of(db: &PvDatabase, name: &str) -> Option<f64> {
 /// Boundary — cache miss. The read must NOT open the channel on the record
 /// thread: it stages the open on the link work owner and returns nothing this
 /// cycle, which is C returning -1 for a link that is not connected
-/// (`dbCa.c:459-464`).
+/// (`dbCa.c:430-435`).
 #[epics_macros_rs::epics_test]
 async fn a_cache_miss_stages_the_open_instead_of_opening_inline() {
     let opens = Arc::new(AtomicUsize::new(0));
@@ -192,7 +201,7 @@ async fn a_warm_cache_is_read_without_opening_or_network() {
 }
 
 /// Boundary — a remote that never comes up. C stages ONE `CA_CONNECT` per
-/// link (`dbCaAddLink`, `dbCa.c:735-800`) and libca owns every retry from
+/// link (`dbCaAddLink`, `dbCa.c:393`) and libca owns every retry from
 /// then on. So a record scanning against a dead remote must produce one
 /// connect attempt, not one per scan.
 #[epics_macros_rs::epics_test]

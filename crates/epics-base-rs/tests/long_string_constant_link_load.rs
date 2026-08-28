@@ -1,5 +1,5 @@
 //! R17-65: a long-string record loads its constant link through C's
-//! `dbLoadLinkLS` (dbLink.c:244) — a lset entry of its own, not
+//! `dbLoadLinkLS` (dbLink.c:242) — a lset entry of its own, not
 //! `recGblInitConstantLink`.
 //!
 //! `lso` runs it on DOL (`lsoRecord.c:82`), `lsi`'s soft device support on INP

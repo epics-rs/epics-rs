@@ -14,7 +14,7 @@
 //! leaves the buffer and NORD at their pre-failure contents — which is exactly
 //! why the count has to be suppressed instead.
 //!
-//! `waveformRecord.c:196` and `aaiRecord.c:226` return NORD flat, so the rule
+//! `waveformRecord.c:196` and `aaiRecord.c:221` return NORD flat, so the rule
 //! is subArray's alone. Every case below asserts the ELEMENT COUNT: STAT/SEVR
 //! agree between C and the port either way (both land LINK/INVALID from
 //! `setLinkAlarm`), so the count is the only signal an operator gets.
@@ -121,7 +121,7 @@ async fn a_waveform_whose_inp_read_failed_still_serves_its_buffer() {
 
 /// Boundary: the failure is remembered, not latched. C's UDF has two clears —
 /// `process`'s re-derive and `dbPut`'s `if (isValueField) precord->udf = FALSE`
-/// (`dbAccess.c:1415`) — so a put that re-establishes VAL makes the record
+/// (`dbAccess.c:1410`) — so a put that re-establishes VAL makes the record
 /// defined again even while its INP stays broken.
 #[epics_macros_rs::epics_test]
 async fn a_put_to_val_re_establishes_a_failed_subarray() {

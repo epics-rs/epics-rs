@@ -1,3 +1,5 @@
+use std::sync::atomic::{AtomicI32, AtomicU64, Ordering};
+
 use epics_macros_rs::EpicsRecord;
 
 /// Choice labels for the `seq` select-mechanism menu, in index order.
@@ -9,6 +11,11 @@ const SEQ_SELM_CHOICES: &[&str] = &["All", "Specified", "Mask"];
 /// fields with a hard-coded `0.0 .. 10.0`, not with their DBF_DOUBLE range and
 /// not from any record field — so `DLYn` can take neither the routed
 /// `default:` arm nor the VAL cache.
+///
+/// The `10.0` is the UPPER only from `b03213ea7` on: through R7.0.10 the line
+/// assigns `lower_disp_limit` twice and the upper keeps `dbAccess.c`'s seed.
+/// This models the corrected form, so a reader resolving the citation against
+/// the R7.0.10 tag sees the typo, not this.
 ///
 /// The literal is graphic's alone: the same record's `get_control_double`
 /// (`:342-352`) serves `0.0 .. seqDLYlimit`, and `seqDLYlimit` is 100000
@@ -24,8 +31,8 @@ const SEQ_SELM_CHOICES: &[&str] = &["All", "Specified", "Mask"];
 /// (`S_db_noLSET`) into the same `prec->prec` fall-through every other field
 /// takes — which is
 /// [`route_field_metadata`](crate::server::record::RecordInstance)'s answer,
-/// not this override's. A CONNECTED DOLn is the one arm the port does not
-/// model: it serves seq's own PREC where C serves the upstream record's.
+/// not this override's. A CONNECTED DOLn is that same routing's LINK arm, fed
+/// by [`seq_link_metadata_field`] below.
 fn seq_metadata_override(
     _rec: &SeqRecord,
     field: &str,
@@ -36,16 +43,26 @@ fn seq_metadata_override(
         if c.is_ascii_digit() || (b'A'..=b'F').contains(c));
     is_dly.then(|| crate::server::record::FieldMetadataOverride {
         units: Some("s".into()),
-        precision: Some(SEQ_DLY_PRECISION),
+        precision: Some(seq_dly_precision() as i16),
         disp_limits: Some((10.0, 0.0)),
-        ctrl_limits: Some((SEQ_DLY_LIMIT, 0.0)),
+        ctrl_limits: Some((seq_dly_limit(), 0.0)),
         ..Default::default()
     })
 }
 
 /// C `seqRecord.c:78` `int seqDLYprecision = 2;` — the precision
 /// `get_precision` serves for every `DLYn`.
-const SEQ_DLY_PRECISION: i16 = 2;
+static SEQ_DLY_PRECISION: AtomicI32 = AtomicI32::new(2);
+
+/// The iocsh knob `seqDLYprecision`, read and written by `var`.
+pub(crate) fn seq_dly_precision() -> i32 {
+    SEQ_DLY_PRECISION.load(Ordering::Relaxed)
+}
+
+/// See [`seq_dly_precision`].
+pub(crate) fn set_seq_dly_precision(value: i32) {
+    SEQ_DLY_PRECISION.store(value, Ordering::Relaxed);
+}
 
 /// C `seqRecord.c:81` `double seqDLYlimit = 100000;` — the control upper
 /// `get_control_double` (`:342-353`) serves for every `DLYn`, over a literal
@@ -54,7 +71,17 @@ const SEQ_DLY_PRECISION: i16 = 2;
 /// Four orders of magnitude from the SAME field's graphic upper of `10.0`
 /// (`:321-338`): a `DLYn` is offered a 0..100000 s settable range while its
 /// display bar reads 0..10 s. Two slots, two literals, one field.
-const SEQ_DLY_LIMIT: f64 = 100000.0;
+static SEQ_DLY_LIMIT: AtomicU64 = AtomicU64::new(100000f64.to_bits());
+
+/// The iocsh knob `seqDLYlimit`, read and written by `var`.
+pub(crate) fn seq_dly_limit() -> f64 {
+    f64::from_bits(SEQ_DLY_LIMIT.load(Ordering::Relaxed))
+}
+
+/// See [`seq_dly_limit`].
+pub(crate) fn set_seq_dly_limit(value: f64) {
+    SEQ_DLY_LIMIT.store(value.to_bits(), Ordering::Relaxed);
+}
 
 /// `seq` record — sequenced multi-output writer.
 ///

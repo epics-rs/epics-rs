@@ -116,7 +116,142 @@ pub enum DbFieldType {
     UChar = 11,
 }
 
+/// C's dbStatic `dbfType` code — the `DBF_*` token a `.dbd` declares and
+/// the number `dbStaticLib` stores, exports and prints (`dbFldTypes.h:24-43`
+/// @R7.0.10).
+///
+/// A SECOND fact about a field, not a renumbering of [`DbFieldType`]:
+/// that enum's discriminants are the CA **wire** codes and are load-bearing
+/// on the protocol, whereas these are dbStatic's own indices, and the two
+/// orders disagree from the second entry on (`DBF_CHAR` is 1 here and
+/// `DBR_SHORT` is 1 there). Anything that prints C's `%d` type number —
+/// `dba`'s `Field Type` row, dbStatic's `dbDumpField` — needs this one.
+///
+/// It also has six codes [`DbFieldType`] cannot express at all: a served
+/// type is one of twelve scalars, while a *declaration* can additionally be
+/// `MENU`, `DEVICE`, the three link kinds, or `NOACCESS`. That is why
+/// [`super::super::server::record::FieldDesc::declared_dbf`] carries this
+/// type rather than deriving it — the collapse is one-way.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[repr(i16)]
+pub enum DbfCode {
+    /// `DBF_STRING` (0).
+    String = 0,
+    /// `DBF_CHAR` (1) — `epicsInt8`.
+    Char = 1,
+    /// `DBF_UCHAR` (2) — `epicsUInt8`.
+    UChar = 2,
+    /// `DBF_SHORT` (3).
+    Short = 3,
+    /// `DBF_USHORT` (4).
+    UShort = 4,
+    /// `DBF_LONG` (5).
+    Long = 5,
+    /// `DBF_ULONG` (6).
+    ULong = 6,
+    /// `DBF_INT64` (7).
+    Int64 = 7,
+    /// `DBF_UINT64` (8).
+    UInt64 = 8,
+    /// `DBF_FLOAT` (9).
+    Float = 9,
+    /// `DBF_DOUBLE` (10).
+    Double = 10,
+    /// `DBF_ENUM` (11).
+    Enum = 11,
+    /// `DBF_MENU` (12) — served as an enum, declared as a menu.
+    Menu = 12,
+    /// `DBF_DEVICE` (13) — the `DTYP` field, served as an enum.
+    Device = 13,
+    /// `DBF_INLINK` (14).
+    Inlink = 14,
+    /// `DBF_OUTLINK` (15).
+    Outlink = 15,
+    /// `DBF_FWDLINK` (16).
+    Fwdlink = 16,
+    /// `DBF_NOACCESS` (17) — a C-internal with no dbStatic representation.
+    NoAccess = 17,
+}
+
+impl DbfCode {
+    /// The token without its `DBF_` prefix — C's `dbf[]` (`dbTest.c:76-81`),
+    /// which is `pamapdbfType`'s `strvalue` (`dbFldTypes.h:51-70`) with that
+    /// prefix stripped. `dba` prints `DBF_%s` around it and dbStatic prints
+    /// the full name, so one table serves both.
+    pub const fn name(self) -> &'static str {
+        match self {
+            DbfCode::String => "STRING",
+            DbfCode::Char => "CHAR",
+            DbfCode::UChar => "UCHAR",
+            DbfCode::Short => "SHORT",
+            DbfCode::UShort => "USHORT",
+            DbfCode::Long => "LONG",
+            DbfCode::ULong => "ULONG",
+            DbfCode::Int64 => "INT64",
+            DbfCode::UInt64 => "UINT64",
+            DbfCode::Float => "FLOAT",
+            DbfCode::Double => "DOUBLE",
+            DbfCode::Enum => "ENUM",
+            DbfCode::Menu => "MENU",
+            DbfCode::Device => "DEVICE",
+            DbfCode::Inlink => "INLINK",
+            DbfCode::Outlink => "OUTLINK",
+            DbfCode::Fwdlink => "FWDLINK",
+            DbfCode::NoAccess => "NOACCESS",
+        }
+    }
+
+    /// C's `mapDBFToDBR` (`dbAccess.c:76-95`) — the DBR code `dbEntryToAddr`
+    /// stores in `paddr->dbr_field_type` (`:639`), which is what a client
+    /// asking for this field's *native* type is answered with.
+    ///
+    /// `DBR_*` here is `dbFldTypes.h:75-90`'s numbering, where every
+    /// `DBR_x` is `#define`d to its `DBF_x`, so the map is a projection of
+    /// this enum onto itself and needs no second type: it collapses `MENU`
+    /// and `DEVICE` onto `ENUM` and the three link types onto `STRING`, and
+    /// is the identity on the other thirteen.
+    ///
+    /// NOT the CA wire type. That numbering is the older, narrower
+    /// `db_access.h` one carried by [`DbFieldType`]'s own discriminants and
+    /// reached through [`DbFieldType::ca_wire_type`]; the two disagree on
+    /// every code above `DBR_SHORT`.
+    pub const fn dbr_code(self) -> DbfCode {
+        match self {
+            DbfCode::Menu | DbfCode::Device => DbfCode::Enum,
+            DbfCode::Inlink | DbfCode::Outlink | DbfCode::Fwdlink => DbfCode::String,
+            other => other,
+        }
+    }
+}
+
 impl DbFieldType {
+    /// The dbStatic code for the type this field is **served** as.
+    ///
+    /// The mapping only ever answers one of the twelve scalar codes,
+    /// because that is all a served type can be. It is therefore NOT a way
+    /// to recover a declaration: `ai.INP` and `dbCommon.FLNK` are both
+    /// served as [`DbFieldType::String`] and this returns
+    /// [`DbfCode::String`] for both, while their declarations are
+    /// `DBF_INLINK` and `DBF_FWDLINK`. Read
+    /// [`crate::server::record::FieldDesc::declared_dbf`] when the
+    /// question is what the `.dbd` said.
+    pub const fn dbf_code(self) -> DbfCode {
+        match self {
+            DbFieldType::String => DbfCode::String,
+            DbFieldType::Char => DbfCode::Char,
+            DbFieldType::UChar => DbfCode::UChar,
+            DbFieldType::Short => DbfCode::Short,
+            DbFieldType::UShort => DbfCode::UShort,
+            DbFieldType::Long => DbfCode::Long,
+            DbFieldType::ULong => DbfCode::ULong,
+            DbFieldType::Int64 => DbfCode::Int64,
+            DbFieldType::UInt64 => DbfCode::UInt64,
+            DbFieldType::Float => DbfCode::Float,
+            DbFieldType::Double => DbfCode::Double,
+            DbFieldType::Enum => DbfCode::Enum,
+        }
+    }
+
     /// This type as the CA **wire** carries its value.
     ///
     /// The single owner of the one row where the wire and the database
@@ -238,10 +373,9 @@ impl DbFieldType {
 ///
 /// pvxs rejects a QSRV group PUT to any field whose
 /// `dbChannelFinalFieldType` falls in `DBF_INLINK..=DBF_FWDLINK`
-/// (`ioc/groupsource.cpp:596-606`). The Rust port has no dbStatic field
-/// table, so [`dbf_link_class`] reconstructs the same classification from
-/// the EPICS Base / synApps `*.dbd(.pod)` link-field families and returns
-/// the matching class. Consumers gate "is this field a link" on
+/// (`ioc/groupsource.cpp:596-606`). [`dbf_link_class`] answers the same
+/// question from the port's dbStatic field table — the generated
+/// `FieldDesc::declared_dbf`. Consumers gate "is this field a link" on
 /// `dbf_link_class(..).is_some()` (or [`is_link_dbf_type`] when they
 /// already hold a dbStatic code), rather than maintaining their own
 /// partial spelling lists.
@@ -273,129 +407,46 @@ impl DbfLinkClass {
 /// True iff `dbf_type` is a link class — the exact
 /// `DBF_INLINK <= t <= DBF_FWDLINK` range check pvxs applies in
 /// `ioc/groupsource.cpp:596-606`. Use when a caller already holds a
-/// dbStatic field-type code; [`dbf_link_class`] is the name-keyed entry
-/// point for the Rust port, which carries no dbStatic table.
+/// dbStatic field-type code; [`dbf_link_class`] is the entry point that
+/// resolves the code from the record type and field name first.
 pub fn is_link_dbf_type(dbf_type: u8) -> bool {
     (DBF_INLINK..=DBF_FWDLINK).contains(&dbf_type)
 }
 
 /// Classify a record field by its dbStatic link class, or `None` when it
-/// is not a link field. This is the single canonical owner of the
-/// "is this field a link" rule for the Rust port — the structural
-/// replacement for the partial, per-consumer name lists that the
-/// `groupsource.cpp:596-606` review flagged (a record-type-blind
-/// spelling list re-opens the bypass for every record that names a link
-/// field outside the list).
+/// is not a link field. The single canonical owner of the "is this field a
+/// link" rule for the Rust port.
 ///
-/// `record_type` is the record's `recordType` (`ai`, `bo`, `seq`, …); it
-/// is consulted to resolve the two direction-ambiguous fields that share a
-/// spelling across record families:
-///   - `SIOL` is `DBF_OUTLINK` on output records and `DBF_INLINK` on input
-///     records (compare `boRecord.dbd.pod:318` `SIOL,DBF_OUTLINK` vs
-///     `aiRecord`/`biRecord` `SIOL,DBF_INLINK`).
-///   - `LNK0..LNKF` is `DBF_FWDLINK` on `fanoutRecord` (the multi-forward
-///     fan-out family) and `DBF_OUTLINK` on `seqRecord` / synApps
-///     `sseqRecord` (compare `fanoutRecord.dbd.pod` `field(LNK0,DBF_FWDLINK)`
-///     vs `seqRecord.dbd.pod` `field(LNK0,DBF_OUTLINK)`).
+/// The answer is the `.dbd` declaration, read through
+/// [`declared_field`](crate::server::record::declared_field) — the by-name
+/// half of the same lookup a caller holding a record does with
+/// `field_desc_of`. Nothing here reasons about the field's spelling.
 ///
-/// Every other family has a fixed class across all record types.
+/// It used to. `FieldDesc` carried only the type a field is SERVED as, which
+/// is `DBF_STRING` for all three link classes, so the class had to be
+/// reconstructed from the name: an exact list, plus `INP`/`DOL`/`OUT`/`LNK`
+/// followed by exactly one alphanumeric, plus per-record-type exceptions for
+/// `SIOL` and `LNK*`. Measured against the declarations `declared_dbf` now
+/// carries, that rule was wrong at 86 fields — 24 `INAA..INLL` inputs on
+/// `acalcout`/`scalcout` and 52 more on `motor`, `table`, `scaler`, `epid` and
+/// `throttle` that it called non-links, and 10 non-links (`*.OUTV`,
+/// `calcout.INPV`, `compress.INPN`, five `swait` fields) that it called links.
+/// A one-character-suffix rule cannot express a two-character suffix, and no
+/// exception list catches a family it has never been told about.
 ///
-/// Names and classes are taken verbatim from EPICS Base / synApps
-/// `*.dbd(.pod)`:
-///   - dbCommon: `FLNK`→Fwd, `SDIS`/`TSEL`→In.
-///   - `INP`/`DOL`/`SIML`/`NVL`/`SVL`/`SUBL`/`SELL`→In, `OUT`→Out.
-///   - `SIOL`→Out on output records, else In.
-///   - `INPA..INPU`/`INP0..INP9`→In; `OUTA..OUTU`→Out.
-///   - `DOL0..DOL9`/`DOLA..DOLF`→In.
-///   - `LNK0..LNK9`/`LNKA..LNKF`→Fwd on `fanout`, else Out.
+/// `record_type` no longer resolves ambiguity — it selects the declaration
+/// table. A type `dbd_generated` does not cover (`motor`, `table`, …) must
+/// have registered its factory for its own fields to resolve; until then only
+/// `dbCommon` answers. That is the same condition under which the record could
+/// be instantiated at all.
 pub fn dbf_link_class(record_type: &str, field: &str) -> Option<DbfLinkClass> {
-    use DbfLinkClass::*;
-    let f = field.trim().to_ascii_uppercase();
-
-    // Exact dbCommon + record-specific named link fields.
-    match f.as_str() {
-        "FLNK" => return Some(FwdLink),
-        "SDIS" | "TSEL" | "INP" | "DOL" | "SIML" | "NVL" | "SVL" | "SUBL" | "SELL" => {
-            return Some(InLink);
-        }
-        "OUT" => return Some(OutLink),
-        "SIOL" => {
-            return Some(if is_output_record_type(record_type) {
-                OutLink
-            } else {
-                InLink
-            });
-        }
-        _ => {}
+    let desc = crate::server::record::declared_field(record_type, field.trim())?;
+    match desc.declared_dbf {
+        DbfCode::Inlink => Some(DbfLinkClass::InLink),
+        DbfCode::Outlink => Some(DbfLinkClass::OutLink),
+        DbfCode::Fwdlink => Some(DbfLinkClass::FwdLink),
+        _ => None,
     }
-
-    // Indexed / lettered link families: a known prefix plus exactly one
-    // alphanumeric suffix character. The DBDs use `A..U` / `0..9` / `A..F`,
-    // but any single-alnum suffix on these prefixes is a link in every
-    // base record that defines the family, so a one-char-suffix rule is
-    // both complete and on the safe (reject) side for custom records.
-    let one_alnum = |rest: &str| rest.len() == 1 && rest.as_bytes()[0].is_ascii_alphanumeric();
-    // `LNK0..LNKF` is direction-ambiguous by record type the same way
-    // `SIOL` is: `fanoutRecord` declares the family as `DBF_FWDLINK`
-    // (multi-forward fan-out), every other family that uses the spelling
-    // (`seqRecord`, synApps `sseqRecord`) declares it `DBF_OUTLINK`.
-    // Resolve it once here so the prefix table below carries a single
-    // class per spelling rather than collapsing fanout's forward links to
-    // output links by prefix.
-    let lnk_class = if is_fanout_link_record(record_type) {
-        FwdLink
-    } else {
-        OutLink
-    };
-    for (prefix, class) in [
-        ("INP", InLink),
-        ("DOL", InLink),
-        ("OUT", OutLink),
-        ("LNK", lnk_class),
-    ] {
-        if let Some(rest) = f.strip_prefix(prefix) {
-            if one_alnum(rest) {
-                return Some(class);
-            }
-        }
-    }
-    None
-}
-
-/// Record types whose `SIOL` simulation-output link is `DBF_OUTLINK`
-/// (the output records). Input records declare `SIOL` as `DBF_INLINK`.
-/// Same output-record set as the device-write records — compare
-/// `crate::server::record::Record::can_device_write`.
-///
-/// The population is every `field(SIOL,DBF_OUTLINK)` in the record types this
-/// workspace ports: the nine Base output records plus synApps `busy`
-/// (`busyRecord.dbd`), a `bo` derivative whose SIOL is an output like its
-/// parent's. Every other SIOL-bearing type — `ai` `bi` `mbbi` `mbbiDirect`
-/// `longin` `int64in` `stringin` `lsi` `event` `waveform` `aai` `histogram`,
-/// synApps `swait` and `mca` — declares `DBF_INLINK`.
-fn is_output_record_type(record_type: &str) -> bool {
-    matches!(
-        record_type,
-        "ao" | "bo"
-            | "busy"
-            | "longout"
-            | "int64out"
-            | "mbbo"
-            | "mbboDirect"
-            | "stringout"
-            | "lso"
-            | "aao"
-    )
-}
-
-/// `fanoutRecord` is the one Base family whose `LNK0..LNKF` fields are
-/// `DBF_FWDLINK` (forward links fired in numerical order). Every other
-/// family that uses the same `LNK*` spelling — `seqRecord`, synApps
-/// `sseqRecord` — declares them `DBF_OUTLINK`. Compare
-/// `fanoutRecord.dbd.pod` `field(LNK0,DBF_FWDLINK)` vs `seqRecord.dbd.pod`
-/// `field(LNK0,DBF_OUTLINK)`.
-fn is_fanout_link_record(record_type: &str) -> bool {
-    record_type == "fanout"
 }
 
 /// Calculate buffer size for a DBR type including metadata, matching C
@@ -645,15 +696,128 @@ mod dbf_link_class_tests {
             dbf_link_class("histogram", "SVL"),
             Some(DbfLinkClass::InLink)
         );
-        //   calc/aSub INPA..INPU (INLINK); fanout/aSub OUTA (OUTLINK)
+        //   calc/aSub INPA..INPU (INLINK); dfanout/aSub OUTA (OUTLINK)
         assert_eq!(dbf_link_class("calc", "INPA"), Some(DbfLinkClass::InLink));
         assert_eq!(dbf_link_class("aSub", "INPU"), Some(DbfLinkClass::InLink));
         assert_eq!(
-            dbf_link_class("fanout", "OUTA"),
+            dbf_link_class("dfanout", "OUTA"),
             Some(DbfLinkClass::OutLink)
         );
+        // `fanout` declares LNK0..LNKF and no OUT family at all; the name
+        // rule this replaced answered `OutLink` for a field that does not
+        // exist on the type.
+        assert_eq!(dbf_link_class("fanout", "OUTA"), None);
         //   printf INP0..INP9 (INLINK)
         assert_eq!(dbf_link_class("printf", "INP0"), Some(DbfLinkClass::InLink));
+    }
+
+    /// **The invariant this function exists to hold**: for every record type
+    /// and every field, `dbf_link_class` agrees with the `.dbd` declaration.
+    ///
+    /// One case per declaration, not one per link family — a per-family test
+    /// is what let 86 fields drift, because a family nobody wrote a case for
+    /// is invisible to it. This walks the table instead, so a new record type
+    /// or a new link family is covered the day it is generated.
+    #[test]
+    fn every_declared_field_classifies_as_its_dbd_says() {
+        use crate::server::record::dbd_generated::{DB_COMMON_FIELDS, RECORD_TYPES, record_fields};
+        let mut wrong = Vec::new();
+        for rt in RECORD_TYPES {
+            let own = record_fields(rt).unwrap_or(&[]);
+            for d in DB_COMMON_FIELDS.iter().chain(own.iter()) {
+                let declared = match d.declared_dbf {
+                    DbfCode::Inlink => Some(DbfLinkClass::InLink),
+                    DbfCode::Outlink => Some(DbfLinkClass::OutLink),
+                    DbfCode::Fwdlink => Some(DbfLinkClass::FwdLink),
+                    _ => None,
+                };
+                let got = dbf_link_class(rt, d.name);
+                if got != declared {
+                    wrong.push(format!("{rt}.{} declared={declared:?} got={got:?}", d.name));
+                }
+            }
+        }
+        assert!(
+            wrong.is_empty(),
+            "{} fields disagree with their declaration:\n{}",
+            wrong.len(),
+            wrong.join("\n")
+        );
+    }
+
+    /// The two shapes the name rule could not express, pinned by name so a
+    /// regression names itself rather than appearing as a count.
+    #[test]
+    fn the_two_shapes_the_name_rule_could_not_express() {
+        // A two-character suffix. `INAA..INLL` are 12 declared `DBF_INLINK`
+        // inputs on each of `acalcout` and `scalcout`; the one-alphanumeric
+        // suffix rule called all 24 non-links.
+        for rt in ["acalcout", "scalcout"] {
+            for f in ["INAA", "INBB", "INLL"] {
+                assert_eq!(
+                    dbf_link_class(rt, f),
+                    Some(DbfLinkClass::InLink),
+                    "{rt}.{f}"
+                );
+            }
+        }
+        // A non-link that merely spells like one. `OUTV` is the output-value
+        // field, `INPV` the input-value one; neither is a link.
+        for (rt, f) in [
+            ("acalcout", "OUTV"),
+            ("calcout", "OUTV"),
+            ("scalcout", "OUTV"),
+            ("calcout", "INPV"),
+            ("compress", "INPN"),
+            ("swait", "DOLN"),
+            ("swait", "OUTN"),
+            ("swait", "DOLV"),
+            ("swait", "OUTV"),
+            ("swait", "DOLD"),
+        ] {
+            assert_eq!(dbf_link_class(rt, f), None, "{rt}.{f} is not a link field");
+        }
+    }
+
+    /// A record type outside `dbd_generated` resolves through the registry a
+    /// factory registration fills — the by-name mirror of `field_list`.
+    #[test]
+    fn a_registered_downstream_type_resolves_its_own_declarations() {
+        use crate::server::record::{FieldDesc, register_declared_fields};
+        static FIELDS: &[FieldDesc] = &[FieldDesc {
+            name: "RDBL",
+            dbf_type: DbFieldType::String,
+            declared_dbf: DbfCode::Inlink,
+            runtime_typed: false,
+            read_only: false,
+            special: crate::server::record::Special::None,
+            declared_special: crate::server::record::Special::None,
+            pp: false,
+            asl: crate::server::record::Asl::Asl1,
+            size: 0,
+            extra: None,
+            menu: None,
+            initial: None,
+            interest: 0,
+            prop: false,
+            prompt: None,
+            promptgroup: None,
+            base: crate::server::record::Base::Decimal,
+        }];
+
+        // Before registration only `dbCommon` answers for an unknown type.
+        assert_eq!(dbf_link_class("zzTestRec", "RDBL"), None);
+        assert_eq!(
+            dbf_link_class("zzTestRec", "FLNK"),
+            Some(DbfLinkClass::FwdLink)
+        );
+
+        register_declared_fields("zzTestRec", FIELDS);
+        assert_eq!(
+            dbf_link_class("zzTestRec", "RDBL"),
+            Some(DbfLinkClass::InLink),
+            "the name rule this replaced answered None for motor's RDBL"
+        );
     }
 
     #[test]
@@ -709,7 +873,10 @@ mod dbf_link_class_tests {
             "aai",
             "histogram",
             "swait",
-            "mca",
+            // `mca` declares `field(SIOL,DBF_INLINK)` too, but it lives in
+            // `mca-rs` and reaches the by-name lookup only once that crate
+            // registers its factory — which no `epics-base-rs` unit test
+            // does. Asserting it here only ever tested the name rule.
         ] {
             assert_eq!(
                 dbf_link_class(rtype, "SIOL"),
@@ -842,5 +1009,166 @@ mod dbr_text_tests {
         assert_eq!(dbr_text_to_type("DOUBLE"), None);
         assert_eq!(dbr_text_to_type("DBR_NONSENSE"), None);
         assert_eq!(dbr_text_to_type(""), None);
+    }
+}
+
+#[cfg(test)]
+mod dbf_code_tests {
+    use super::*;
+
+    /// C's `dbfType` in declaration order (`dbFldTypes.h:24-43` @R7.0.10),
+    /// paired with `pamapdbfType`'s strings (`:51-70`) as `dbTest.c:76-81`
+    /// carries them, prefix-stripped.
+    ///
+    /// The WHOLE table, not a sample. A nineteenth type inserted in the
+    /// middle has to fail on its own row here rather than silently shift
+    /// every code after it — the codes are what `dbDumpField` prints and
+    /// what a `.dbd` interchange file means by `DBF_MENU`.
+    const C_DBF_TYPE: [(DbfCode, i16, &str); 18] = [
+        (DbfCode::String, 0, "STRING"),
+        (DbfCode::Char, 1, "CHAR"),
+        (DbfCode::UChar, 2, "UCHAR"),
+        (DbfCode::Short, 3, "SHORT"),
+        (DbfCode::UShort, 4, "USHORT"),
+        (DbfCode::Long, 5, "LONG"),
+        (DbfCode::ULong, 6, "ULONG"),
+        (DbfCode::Int64, 7, "INT64"),
+        (DbfCode::UInt64, 8, "UINT64"),
+        (DbfCode::Float, 9, "FLOAT"),
+        (DbfCode::Double, 10, "DOUBLE"),
+        (DbfCode::Enum, 11, "ENUM"),
+        (DbfCode::Menu, 12, "MENU"),
+        (DbfCode::Device, 13, "DEVICE"),
+        (DbfCode::Inlink, 14, "INLINK"),
+        (DbfCode::Outlink, 15, "OUTLINK"),
+        (DbfCode::Fwdlink, 16, "FWDLINK"),
+        (DbfCode::NoAccess, 17, "NOACCESS"),
+    ];
+
+    /// The table above lists every variant: this match is exhaustive, so a
+    /// nineteenth variant stops the build, and the pairwise-distinct check
+    /// below then makes 18 rows a proof of coverage rather than of length.
+    fn _the_enum_has_no_variant_outside_the_table(c: DbfCode) {
+        match c {
+            DbfCode::String
+            | DbfCode::Char
+            | DbfCode::UChar
+            | DbfCode::Short
+            | DbfCode::UShort
+            | DbfCode::Long
+            | DbfCode::ULong
+            | DbfCode::Int64
+            | DbfCode::UInt64
+            | DbfCode::Float
+            | DbfCode::Double
+            | DbfCode::Enum
+            | DbfCode::Menu
+            | DbfCode::Device
+            | DbfCode::Inlink
+            | DbfCode::Outlink
+            | DbfCode::Fwdlink
+            | DbfCode::NoAccess => (),
+        }
+    }
+
+    #[test]
+    fn every_dbf_code_carries_cs_number_and_name() {
+        for (i, (code, n, name)) in C_DBF_TYPE.iter().enumerate() {
+            assert_eq!(*code as i16, *n, "DBF_{name}: wrong dbfType code");
+            assert_eq!(code.name(), *name, "DBF_{name}: wrong name");
+            // C's dbfType is dense 0..DBF_NTYPES-1 and `pamapdbfType` is
+            // indexed by it, so position and code are the same fact.
+            assert_eq!(i as i16, *n, "DBF_{name}: table position != code");
+        }
+        // DBF_NTYPES (`dbFldTypes.h:45`).
+        assert_eq!(C_DBF_TYPE.len(), 18);
+        for (a, (x, ..)) in C_DBF_TYPE.iter().enumerate() {
+            for (y, ..) in C_DBF_TYPE.iter().skip(a + 1) {
+                assert_ne!(x, y, "{x:?} listed twice");
+            }
+        }
+    }
+
+    #[test]
+    fn every_served_type_maps_to_its_dbstatic_code() {
+        // All twelve CA wire types, not a sample. The mapping only ever
+        // answers a scalar code, because that is all a SERVED type can be —
+        // `DbfCode::Menu`, `Device` and the three link codes are declarations
+        // and are unreachable from here by construction.
+        let table = [
+            (DbFieldType::String, DbfCode::String),
+            (DbFieldType::Short, DbfCode::Short),
+            (DbFieldType::Float, DbfCode::Float),
+            (DbFieldType::Enum, DbfCode::Enum),
+            (DbFieldType::Char, DbfCode::Char),
+            (DbFieldType::Long, DbfCode::Long),
+            (DbFieldType::Double, DbfCode::Double),
+            (DbFieldType::Int64, DbfCode::Int64),
+            (DbFieldType::UInt64, DbfCode::UInt64),
+            (DbFieldType::UShort, DbfCode::UShort),
+            (DbFieldType::ULong, DbfCode::ULong),
+            (DbFieldType::UChar, DbfCode::UChar),
+        ];
+        for (ft, code) in table {
+            assert_eq!(ft.dbf_code(), code, "{ft:?}");
+        }
+        assert_eq!(table.len(), 12);
+        // The CA wire codes are the OTHER numbering and must not have moved:
+        // they are `DbFieldType`'s discriminants and are load-bearing on the
+        // protocol, so the two tables disagreeing from the second entry on is
+        // the expected state, not a defect.
+        for (i, (ft, _)) in table.iter().enumerate() {
+            assert_eq!(*ft as u16, i as u16, "{ft:?}: CA wire code moved");
+        }
+    }
+
+    /// C's `mapDBFToDBR` (`dbAccess.c:76-95`), all eighteen rows in C's
+    /// order, written as the DBR *names* C's initialiser comments give so a
+    /// silent renumbering of either enum shows up as a name mismatch.
+    #[test]
+    fn the_dbr_map_is_cs_whole_table() {
+        const C_MAP: [(DbfCode, DbfCode); 18] = [
+            (DbfCode::String, DbfCode::String),
+            (DbfCode::Char, DbfCode::Char),
+            (DbfCode::UChar, DbfCode::UChar),
+            (DbfCode::Short, DbfCode::Short),
+            (DbfCode::UShort, DbfCode::UShort),
+            (DbfCode::Long, DbfCode::Long),
+            (DbfCode::ULong, DbfCode::ULong),
+            (DbfCode::Int64, DbfCode::Int64),
+            (DbfCode::UInt64, DbfCode::UInt64),
+            (DbfCode::Float, DbfCode::Float),
+            (DbfCode::Double, DbfCode::Double),
+            (DbfCode::Enum, DbfCode::Enum),
+            (DbfCode::Menu, DbfCode::Enum),
+            (DbfCode::Device, DbfCode::Enum),
+            (DbfCode::Inlink, DbfCode::String),
+            (DbfCode::Outlink, DbfCode::String),
+            (DbfCode::Fwdlink, DbfCode::String),
+            (DbfCode::NoAccess, DbfCode::NoAccess),
+        ];
+        for (dbf, dbr) in C_MAP {
+            assert_eq!(dbf.dbr_code(), dbr, "mapDBFToDBR[DBF_{}]", dbf.name());
+        }
+        assert_eq!(C_MAP.len(), 18);
+        // C indexes `mapDBFToDBR` by the dbfType, so the table's position
+        // and the code it maps are one fact — the same density check the
+        // name table gets.
+        for (i, (dbf, _)) in C_MAP.iter().enumerate() {
+            assert_eq!(
+                *dbf as i16,
+                i as i16,
+                "DBF_{}: row out of order",
+                dbf.name()
+            );
+        }
+        // `DBR_NOACCESS` is `DBF_NOACCESS` = 17 (`dbFldTypes.h:90`), NOT the
+        // 12 that `printDbAddr`'s `dbr[]` index suggests: C remaps the index
+        // to `DBR_ENUM+1` only to reach its shorter name array, and still
+        // prints the unremapped 17 as the number (`dbTest.c:812-817`). Both
+        // halves fall out of one code here, so the port cannot print the
+        // pair inconsistently.
+        assert_eq!(DbfCode::NoAccess.dbr_code() as i16, 17);
+        assert_eq!(DbfCode::NoAccess.dbr_code().name(), "NOACCESS");
     }
 }

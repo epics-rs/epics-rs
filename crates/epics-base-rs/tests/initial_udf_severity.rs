@@ -1,7 +1,7 @@
 //! R16-82: the initial UDF severity — a record that has never processed is
 //! INVALID, not NO_ALARM.
 //!
-//! C, `iocInit.c::doInitRecord0` (:508-536), run on EVERY record before
+//! C, `iocInit.c::doInitRecord0` (:507-535), run on EVERY record before
 //! `init_record` pass 0:
 //!
 //! ```c

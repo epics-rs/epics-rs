@@ -25,7 +25,7 @@ use std::path::PathBuf;
 use epics_base_rs::server::autosave::AutosaveStartupConfig;
 use epics_base_rs::server::autosave::manager::AutosaveManager;
 use epics_base_rs::server::autosave::save_set::SaveSetStatus;
-use epics_base_rs::server::autosave::startup::MonitorSetDef;
+use epics_base_rs::server::autosave::startup::{MonitorSetDef, TriggeredSetDef};
 
 /// A `.sav` from a previous run: real values, and a valid `<END>`.
 const GOOD_SAV: &str = "# autosave-rs V1.0\nIOC:setpoint 42.5\nIOC:enable 1\n<END>\n";
@@ -35,7 +35,6 @@ fn monitor_set(filename: &str) -> MonitorSetDef {
         filename: filename.to_string(),
         period: MonitorSetDef::poll_period(5),
         macros: String::new(),
-        trigger_pv: None,
     }
 }
 
@@ -89,9 +88,11 @@ async fn a_monitor_set_naming_a_missing_request_file_does_not_build() {
 async fn a_triggered_set_naming_a_missing_request_file_does_not_build() {
     let dir = tempfile::tempdir().unwrap();
     let (mut cfg, sav) = config_with_good_sav(dir.path(), "trig");
-    let mut def = monitor_set("trig.req");
-    def.trigger_pv = Some("IOC:saveTrigger".to_string());
-    cfg.triggered_sets.push(def);
+    cfg.triggered_sets.push(TriggeredSetDef {
+        filename: "trig.req".to_string(),
+        trigger_pv: "IOC:saveTrigger".to_string(),
+        macros: String::new(),
+    });
 
     let mgr = cfg.into_builder().build().await;
     assert!(

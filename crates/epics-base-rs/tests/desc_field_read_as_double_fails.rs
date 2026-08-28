@@ -9,7 +9,7 @@
 //! (`dbConvert.c:392-414`) / `cvt_st_d` (`dbFastLinkConv.c:233-244`) and
 //! `epicsParseFloat64` returns a status; `dbChannel_get` reports -1
 //! (`db_access.c:816`) and rsrv answers ECA_GETFAIL with a zeroed payload
-//! (`camessage.c:544-560`). Serving `A.DESC 0` at NO_ALARM instead is worse
+//! (`camessage.c:534-550`). Serving `A.DESC 0` at NO_ALARM instead is worse
 //! than a wrong number: it is indistinguishable from a real zero.
 //!
 //! A compound DBR type is used deliberately. The TIME metadata is written into

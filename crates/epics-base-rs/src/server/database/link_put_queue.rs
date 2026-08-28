@@ -4,46 +4,46 @@
 //! # The C model this mirrors
 //!
 //! C never performs a Channel Access network write inside `dbScanLock`.
-//! `dbCaPutLink` (`dbCa.c:627-631`) forwards to `dbCaPutLinkCallback`
-//! (`dbCa.c:544-625`), which — under the per-link `pca->lock`, *not* the
+//! `dbCaPutLink` (`dbCa.c:598-602`) forwards to `dbCaPutLinkCallback`
+//! (`dbCa.c:515-596`), which — under the per-link `pca->lock`, *not* the
 //! record lock —
 //!
 //! 1. refuses the put outright when the link is not connected or has no
-//!    write access, returning `-1` with nothing staged (`dbCa.c:558-561`);
+//!    write access, returning `-1` with nothing staged (`dbCa.c:529-532`);
 //! 2. converts the value into the link's single pending-value buffer
-//!    `pca->pputNative` / `pca->pputString` (`dbCa.c:562-613`);
+//!    `pca->pputNative` / `pca->pputString` (`dbCa.c:533-584`);
 //! 3. records the delivery flavour — `CA_PUT` for a plain put,
 //!    `CA_PUT_CALLBACK` plus the completion callback for
-//!    `dbCaPutLinkCallback` (`dbCa.c:614-621`);
-//! 4. calls `addAction(pca, CA_WRITE_NATIVE)` (`dbCa.c:132-161`), which ORs
+//!    `dbCaPutLinkCallback` (`dbCa.c:585-592`);
+//! 4. calls `addAction(pca, CA_WRITE_NATIVE)` (`dbCa.c:130-159`), which ORs
 //!    the action bit, appends the link to `workList` **once**
-//!    (`callAdd = (pca->link_action == 0)`, `dbCa.c:137`, `:155-157`) and
+//!    (`callAdd = (pca->link_action == 0)`, `dbCa.c:135`, `:153-155`) and
 //!    signals `workListEvent`;
 //! 5. **returns**.
 //!
 //! The network write happens later on the `dbCaTask` thread
-//! (`dbCa.c:1158-1333`): it pops one link, clears `link_action` *before*
-//! doing the work (`dbCa.c:1195`) so a put arriving mid-flight re-queues the
+//! (`dbCa.c:1093-1260`): it pops one link, clears `link_action` *before*
+//! doing the work (`dbCa.c:1130`) so a put arriving mid-flight re-queues the
 //! link, and issues `ca_array_put` (plain) or `ca_array_put_callback`
-//! (completion flavour) at `dbCa.c:1226-1248`.
+//! (completion flavour) at `dbCa.c:1161-1183`.
 //!
 //! Three consequences this module reproduces verbatim:
 //!
 //! * **Latest-wins per link, not a per-put queue.** `pputNative` is one
 //!   buffer. A second put staged before the task services the link
 //!   overwrites the first and only bumps a counter
-//!   (`if (pca->newOutNative) pca->nNoWrite++;`, `dbCa.c:611-612`; the
-//!   string twin at `:577-578`). There is therefore no "queue full" state
+//!   (`if (pca->newOutNative) pca->nNoWrite++;`, `dbCa.c:582-583`; the
+//!   string twin at `:548-549`). There is therefore no "queue full" state
 //!   in C to match — the bound is one pending value per link, times the
 //!   number of links, and that is the bound here too.
 //! * **The link is enqueued at most once.** `addAction`'s `callAdd` gate
-//!   (`dbCa.c:137`) appends the `caLink` to `workList` only when it carries
+//!   (`dbCa.c:135`) appends the `caLink` to `workList` only when it carries
 //!   no pending action; a put on an already-queued link just ORs the bit.
 //! * **The returned status is the *staging* status, never the network
 //!   status.** `dbCaPutLinkCallback` returns the conversion status (or the
 //!   `-1` refusal); the outcome of the wire write is reported only through
-//!   `errlogPrintf` on the task (`dbCa.c:1240-1244`) or, for the completion
-//!   flavour, through `putComplete` (`dbCa.c:1056-1074`). C's
+//!   `errlogPrintf` on the task (`dbCa.c:1175-1179`) or, for the completion
+//!   flavour, through `putComplete` (`dbCa.c:994-1012`). C's
 //!   `dbPutLink` → `setLinkAlarm` gate (`dbLink.c:434-448`) therefore alarms
 //!   on *refusal to stage*, not on a failed transmission.
 //!
@@ -91,12 +91,12 @@ pub(crate) struct LinkKey {
 }
 
 /// The completion half of a staged put — the `pca->putCallback` slot
-/// (`dbCa.c:83`, set at `:614-617`, consumed by `putComplete` at
-/// `:1066-1073`).
+/// (`dbCaPvt.h:83`, set at `dbCa.c:585-588`, consumed by `putComplete` at
+/// `:994-1011`).
 ///
 /// Unlike C, which simply overwrites `putCallback` when a second
 /// `dbCaPutLinkCallback` lands before the first completes — dropping the
-/// earlier callback with no notification (`dbCa.c:614-621`) — a
+/// earlier callback with no notification (`dbCa.c:585-592`) — a
 /// `PutCompletion` cannot be lost: `Drop` resolves it. That is strictly
 /// stronger than C and is what makes "no pending put loses its
 /// classification silently" hold by construction rather than by review.
@@ -122,7 +122,7 @@ impl Drop for PutCompletion {
 }
 
 /// One link's pending value — `pca->pputNative` plus the `putType` /
-/// `putCallback` pair that names its flavour (`dbCa.c:81-84`).
+/// `putCallback` pair that names its flavour (`dbCaPvt.h:81-84`).
 struct StagedPut {
     value: EpicsValue,
     op: LinkPutOp,
@@ -145,7 +145,7 @@ enum LinkState {
 }
 
 /// Per-link OPEN state — C's `CA_CONNECT` action, staged once per link by
-/// `dbCaAddLink` (`dbCa.c:735-800`) and serviced on the `dbCaTask`
+/// `dbCaAddLink` (`dbCa.c:397-401`) and serviced on the `dbCaTask`
 /// (`ca_create_channel` + `ca_add_array_event`).
 ///
 /// `Done` is terminal on purpose: C stages exactly one `CA_CONNECT` per link
@@ -165,9 +165,17 @@ struct QueueInner {
     ready: VecDeque<LinkKey>,
     opens: HashMap<LinkKey, OpenState>,
     ready_opens: VecDeque<LinkKey>,
-    /// Number of staged values a later put on the same link overwrote — the
-    /// counterpart of C's `pca->nNoWrite` (`dbCa.c:611-612`). Diagnostic.
-    coalesced: u64,
+    /// Per-link count of staged values a later put on the same link
+    /// overwrote — C's `pca->nNoWrite` (`dbCa.c:548`, `:582`), which lives on
+    /// the `caLink` and is therefore per link, not per IOC. Keyed rather than
+    /// summed because `dbcar` prints it beside each link's name
+    /// (`dbCaTest.c:111-116`) and a whole-queue total cannot be attributed
+    /// back to one of them.
+    ///
+    /// Never pruned: C's counter lives as long as the `caLink`, whereas an
+    /// entry in `links` exists only while a write is outstanding, so pruning
+    /// with the state would reset the count every time the link went idle.
+    coalesced: HashMap<LinkKey, u64>,
     /// Number of writes the owner has completed. Diagnostic.
     completed: u64,
     /// Number of link opens the owner has completed. Diagnostic.
@@ -192,7 +200,7 @@ pub(crate) struct LinkPutQueue {
     /// alive — the queue must be free to drop when the database does.
     work: Arc<tokio::sync::Notify>,
     /// Wakes [`LinkPutQueue::sync`] waiters when the queue goes idle — the
-    /// `dbCaSync` barrier (`dbCa.c:1191-1194`, `CA_SYNC`).
+    /// `dbCaSync` barrier (`dbCa.c:1126-1129`, `CA_SYNC`).
     idle: tokio::sync::Notify,
     /// Set once the owner task has been spawned.
     owner_started: std::sync::atomic::AtomicBool,
@@ -207,9 +215,10 @@ pub(crate) struct LinkPutQueue {
     /// thread processed the record — often a blocking connection thread with
     /// no runtime — so the capability has to be carried here rather than read
     /// off the staging thread. `None` means no runtime existed at all when the
-    /// database was built, and then an external link could not have worked
-    /// under any arrangement; the tail falls back to the background executor
-    /// so a purely local `LinkSet` still runs.
+    /// database was built, and then an external link cannot work under any
+    /// arrangement — so it is refused rather than dispatched somewhere that
+    /// would only move the panic; see [`LinkPutQueue::network`]. A purely
+    /// local `LinkSet` is unaffected: it never reaches this queue.
     reactor: Option<crate::runtime::task::BlockingBridge>,
 }
 
@@ -239,25 +248,24 @@ impl Drop for LinkPutQueue {
 }
 
 impl LinkPutQueue {
-    /// Dispatch one link's network work on the captured reactor — the single
-    /// owner of "this future may touch a socket", so no other site in the
-    /// queue has to know which executor it is on.
-    fn spawn_network<F>(&self, fut: F)
-    where
-        F: Future<Output = ()> + Send + 'static,
-    {
-        match &self.reactor {
-            Some(reactor) => {
-                reactor.spawn(fut);
-            }
-            None => {
-                crate::runtime::task::spawn_background(fut);
-            }
-        }
+    /// The reactor every network future dispatched by this queue runs on —
+    /// the single owner of "this future may touch a socket", so no other site
+    /// in the queue has to know which executor it is on.
+    ///
+    /// `None` is the no-runtime-anywhere state described on
+    /// [`Self::reactor`], and it is a *refusal*, never a fallback: there is no
+    /// second executor that could do the work. The process-global background
+    /// executor cannot — `runtime::task::spawn_background` documents that it
+    /// deliberately has no `tokio::net` reactor — so sending a `ca://` open or
+    /// put there only moves the panic onto a callback-pool worker. Callers
+    /// refuse instead; [`super::PvDatabase::external_put_gate`] turns that
+    /// into the record's LINK alarm before anything is staged.
+    pub(crate) fn network(&self) -> Option<&crate::runtime::task::BlockingBridge> {
+        self.reactor.as_ref()
     }
 
     /// Stage `value` on `key`, coalescing latest-wins onto any pending value
-    /// (C `dbCa.c:611-612`). Returns the completion receiver for an
+    /// (C `dbCa.c:582-583`). Returns the completion receiver for an
     /// [`LinkPutOp::Async`] put — the caller awaits it, which is the
     /// `dbCaPutLinkCallback` route; [`LinkPutOp::Plain`] gets `None` and the
     /// caller returns immediately, which is `dbCaPutLink`.
@@ -288,9 +296,9 @@ impl LinkPutQueue {
                     true
                 }
                 Some(LinkState::Queued(prev)) => {
-                    Self::supersede(&mut inner, prev);
+                    Self::supersede(&mut inner, &key, prev);
                     // Already in the ready deque — C's `callAdd` is false
-                    // here too (`dbCa.c:137`), so no second enqueue.
+                    // here too (`dbCa.c:135`), so no second enqueue.
                     inner.links.insert(key, LinkState::Queued(staged));
                     false
                 }
@@ -299,7 +307,7 @@ impl LinkPutQueue {
                     false
                 }
                 Some(LinkState::InFlightRestaged(prev)) => {
-                    Self::supersede(&mut inner, prev);
+                    Self::supersede(&mut inner, &key, prev);
                     inner.links.insert(key, LinkState::InFlightRestaged(staged));
                     false
                 }
@@ -313,8 +321,8 @@ impl LinkPutQueue {
 
     /// Resolve a displaced value's completion — the only place a staged put
     /// is superseded, so the `nNoWrite` accounting has one owner.
-    fn supersede(inner: &mut QueueInner, prev: StagedPut) {
-        inner.coalesced += 1;
+    fn supersede(inner: &mut QueueInner, key: &LinkKey, prev: StagedPut) {
+        *inner.coalesced.entry(key.clone()).or_default() += 1;
         if let Some(c) = prev.completion {
             c.resolve(Err(
                 "external link put superseded by a newer put on the same link".to_string(),
@@ -324,7 +332,7 @@ impl LinkPutQueue {
 
     /// Owner-only: take the next ready link, moving it `Queued` → `InFlight`.
     /// Mirrors `dbCaTask` popping `workList` and clearing `link_action`
-    /// before doing the work (`dbCa.c:1180-1197`).
+    /// before doing the work (`dbCa.c:1115-1132`).
     fn take_ready(&self) -> Option<(LinkKey, StagedPut)> {
         let mut inner = self.inner.lock();
         loop {
@@ -347,7 +355,7 @@ impl LinkPutQueue {
     /// Owner-only: the write for `key` finished. `InFlight` → idle;
     /// `InFlightRestaged` → `Queued` and back in the deque, which is how a
     /// put that landed mid-flight is not lost (C clears `link_action` before
-    /// the wire write for the same reason, `dbCa.c:1195`).
+    /// the wire write for the same reason, `dbCa.c:1130`).
     fn finish(&self, key: LinkKey) {
         let (wake_work, wake_idle) = {
             let mut inner = self.inner.lock();
@@ -376,8 +384,14 @@ impl LinkPutQueue {
         }
     }
 
-    /// Stage the OPEN of `key` — C `dbCaAddLink`'s
-    /// `addAction(pca, CA_CONNECT)` (`dbCa.c:735-800`). Idempotent and
+    /// Stage the OPEN of `key` — C `dbCaAddLink` (`dbCa.c:397-401`)
+    /// delegates to `dbCaAddLinkCallback` (`:373-395`), whose one
+    /// `addAction(pca, CA_CONNECT)` is `dbCa.c:393`. The checkout
+    /// `R7.0.10-146-g8f5015b66` routes this through
+    /// `dbCaAddLinkCallbackOpt` instead, which arrived with the iocInit
+    /// connection-wait (`717d69e1f`, post-`R7.0.10` and in no tag) and does
+    /// not exist at the pin. See `PvDatabase::external_link_targets`.
+    /// Idempotent and
     /// terminal: a link that has ever been staged is never staged again, so a
     /// record scanning at 10 Hz against a down remote produces one connect
     /// attempt, not ten per second. Reconnection is the lset's job, as it is
@@ -440,10 +454,18 @@ impl LinkPutQueue {
         self.inner.lock().opened
     }
 
-    /// Number of staged values a later put on the same link overwrote — C's
-    /// `pca->nNoWrite` (`dbCa.c:611-612`).
+    /// Number of staged values a later put on the same link overwrote,
+    /// summed over every link — C's `pca->nNoWrite` (`dbCa.c:548`, `:582`)
+    /// aggregated the way `dbcar`'s trailing `(%lu disconnects, %lu writes
+    /// prohibited)` total does (`dbCaTest.c:153-154`).
     pub(crate) fn coalesced_count(&self) -> u64 {
-        self.inner.lock().coalesced
+        self.inner.lock().coalesced.values().sum()
+    }
+
+    /// The same count for one link — the per-`caLink` `pca->nNoWrite`
+    /// `dbcar` prints beside the link's name.
+    pub(crate) fn coalesced_for(&self, key: &LinkKey) -> u64 {
+        self.inner.lock().coalesced.get(key).copied().unwrap_or(0)
     }
 
     /// Number of writes the owner has completed.
@@ -452,7 +474,7 @@ impl LinkPutQueue {
     }
 
     /// Block until the queue is idle — the `dbCaSync` barrier
-    /// (`dbCa.c:1191-1194`: a `CA_SYNC` action the task answers only once it
+    /// (`dbCa.c:1126-1129`: a `CA_SYNC` action the task answers only once it
     /// has drained everything ahead of it). Tests use it to make an enqueued
     /// put observable; `iocPause`-class callers use it to quiesce.
     pub(crate) async fn sync(&self) {
@@ -481,11 +503,16 @@ impl LinkPutQueue {
         }
         let queue = Arc::downgrade(self);
         let work = self.work.clone();
-        crate::runtime::task::spawn_background(owner_loop(queue, work, db));
+        // Middle band: one owner loop drains the queued link puts of every
+        // record, so there is no single record whose PRIO it could take.
+        crate::runtime::task::spawn_background(
+            crate::runtime::task::CallbackPriority::Medium,
+            owner_loop(queue, work, db),
+        );
     }
 }
 
-/// The single consumer — `dbCaTask`'s loop (`dbCa.c:1170-1333`).
+/// The single consumer — `dbCaTask`'s loop (`dbCa.c:1105-1260`).
 ///
 /// Per dequeued link it resolves the lset and spawns the network write,
 /// keeping at most one write in flight per link (so per-link write ordering
@@ -498,6 +525,15 @@ async fn owner_loop(
     work: Arc<tokio::sync::Notify>,
     db: Weak<super::PvDatabaseInner>,
 ) {
+    // C `dbCaTask` registers with the watchdog before its loop
+    // (`dbCa.c:1096`) and removes when told to exit (`:1262`). Unbounded: the
+    // loop parks on `work` whenever no link has anything staged, which is an
+    // IOC with quiet output links rather than a fault.
+    let _watched = crate::runtime::taskwd::taskwd_insert(
+        "dbCaLink",
+        crate::runtime::taskwd::CheckIn::Unbounded,
+        None,
+    );
     loop {
         // Register on the wake signal BEFORE draining, so a put staged
         // during the drain cannot be missed.
@@ -506,30 +542,51 @@ async fn owner_loop(
         notified.as_mut().enable();
         {
             let Some(q) = queue.upgrade() else { return };
-            // Opens first: a pending open is what a blocked cached read is
-            // waiting on, and C services `CA_CONNECT` on the same task ahead
-            // of that link's other actions (`dbCa.c:1198-1225`).
-            while let Some(key) = q.take_ready_open() {
-                let Some(inner) = db.upgrade() else { return };
-                let lsets = resolve_lsets(&inner, &key.target);
-                drop(inner);
-                let q2 = q.clone();
-                q.spawn_network(async move {
-                    for lset in &lsets {
-                        lset.connect_link(&key.name).await;
+            match q.network() {
+                Some(reactor) => {
+                    // Opens first: a pending open is what a blocked cached read
+                    // is waiting on, and C services `CA_CONNECT` on the same
+                    // task ahead of that link's other actions
+                    // (`dbCa.c:1133-1160`).
+                    while let Some(key) = q.take_ready_open() {
+                        let Some(inner) = db.upgrade() else { return };
+                        let lsets = resolve_lsets(&inner, &key.target);
+                        drop(inner);
+                        let q2 = q.clone();
+                        reactor.spawn(async move {
+                            for lset in &lsets {
+                                lset.connect_link(&key.name).await;
+                            }
+                            q2.finish_open(key);
+                        });
                     }
-                    q2.finish_open(key);
-                });
-            }
-            while let Some((key, staged)) = q.take_ready() {
-                let Some(inner) = db.upgrade() else { return };
-                let lsets = resolve_lsets(&inner, &key.target);
-                drop(inner);
-                let q2 = q.clone();
-                q.spawn_network(async move {
-                    run_put(&lsets, &key, staged).await;
-                    q2.finish(key);
-                });
+                    while let Some((key, staged)) = q.take_ready() {
+                        let Some(inner) = db.upgrade() else { return };
+                        let lsets = resolve_lsets(&inner, &key.target);
+                        drop(inner);
+                        let q2 = q.clone();
+                        reactor.spawn(async move {
+                            run_put(&lsets, &key, staged).await;
+                            q2.finish(key);
+                        });
+                    }
+                }
+                // No reactor anywhere. Refuse what is here rather than
+                // dispatch it — see [`LinkPutQueue::network`]. Reachable only
+                // through a direct `stage_put`/`stage_open`, because
+                // `external_put_gate` refuses this database's external puts
+                // before they are staged; draining here so a caller that
+                // bypassed the gate still gets its completion resolved rather
+                // than left pending until teardown.
+                None => {
+                    while let Some(key) = q.take_ready_open() {
+                        q.finish_open(key);
+                    }
+                    while let Some((key, staged)) = q.take_ready() {
+                        refuse_for_want_of_a_reactor(&key, staged);
+                        q.finish(key);
+                    }
+                }
             }
             // The strong reference must not survive the await below, or the
             // queue could never drop and its teardown would never run.
@@ -556,6 +613,26 @@ pub(super) fn resolve_lsets(
     }
 }
 
+/// Resolve a staged write that no owner can perform, because the database
+/// captured no reactor ([`LinkPutQueue::network`]).
+///
+/// The failure is reported the way C reports a put it could not deliver — on
+/// the task, through `errlogPrintf` (`db/dbCa.c:1111-1114`
+/// (`dbCaTask`); epics-base R7.0.10) — and the completion is resolved so the
+/// put-notify chain unblocks with an error instead of waiting for a wire write
+/// that will never be attempted.
+fn refuse_for_want_of_a_reactor(key: &LinkKey, staged: StagedPut) {
+    let msg = format!(
+        "external link put to '{}' refused: this database was built with no \
+         tokio runtime, so no link set can reach the network",
+        key.name
+    );
+    eprintln!("dbCa: {msg}");
+    if let Some(c) = staged.completion {
+        c.resolve(Err(msg));
+    }
+}
+
 /// Perform one dequeued write. The network suspension lives here — on the
 /// owner's spawned task, never on a record-processing thread.
 async fn run_put(lsets: &[DynLinkSet], key: &LinkKey, staged: StagedPut) {
@@ -571,10 +648,11 @@ async fn run_put(lsets: &[DynLinkSet], key: &LinkKey, staged: StagedPut) {
     for lset in lsets {
         match lset.put_value(&key.name, value.clone(), op).await {
             Ok(()) => {
-                // Production drain of any retry-queued OUT writes on this
-                // lset now that a write has reached it (the channel may have
-                // just reconnected). pvxs replays the queued put from record
-                // processing, not test code (`pvalink_channel.cpp:220-263`).
+                // Production drain of any retry-queued OUT writes
+                // on this lset now that a write has reached it (the
+                // channel may have just reconnected). pvxs replays
+                // the queued put from record processing, not
+                // test code (`ioc/pvalink_channel.cpp:220-280`).
                 lset.flush_puts().await;
                 result = Ok(());
                 break;
@@ -583,9 +661,9 @@ async fn run_put(lsets: &[DynLinkSet], key: &LinkKey, staged: StagedPut) {
         }
     }
     // C reports a failed wire write on the task, via `errlogPrintf`
-    // (`dbCa.c:1240-1244`) — for BOTH flavours: the `status != ECA_NORMAL`
+    // (`dbCa.c:1175-1179`) — for BOTH flavours: the `status != ECA_NORMAL`
     // arm sits below the `CA_PUT` / `CA_PUT_CALLBACK` fork and covers each
-    // (`dbCa.c:1226-1244`). The record has already returned; its alarm came
+    // (`dbCa.c:1161-1183`). The record has already returned; its alarm came
     // from the staging gate, exactly as `dbCaPutLink`'s `-1` does.
     if let Err(e) = &result {
         eprintln!("dbCa: external link put to '{}' failed: {e}", key.name);
@@ -617,8 +695,8 @@ mod tests {
     /// Polling by hand rather than `.await`ing says exactly that: `Pending`
     /// means the completion was left unresolved, which is the invariant
     /// under test, and it fails here instead of hanging. It also keeps both
-    /// tests running under `--features rtems-exec-model` and adds no site to
-    /// this file's RTEMS-EXEC-MODEL-ALLOW census.
+    /// tests running on the exec backend and adds no site to this file's
+    /// RTEMS-EXEC-MODEL-ALLOW census.
     fn resolved(rx: tokio::sync::oneshot::Receiver<Result<(), String>>) -> Result<(), String> {
         let mut rx = std::pin::pin!(rx);
         match rx.as_mut().poll(&mut Context::from_waker(Waker::noop())) {
@@ -629,9 +707,9 @@ mod tests {
 
     /// Boundary: two plain puts staged on ONE link before the owner picks it
     /// up. C keeps a single `pputNative` buffer, so the second overwrites the
-    /// first and only bumps `nNoWrite` (`dbCa.c:611-612`) — latest-wins, and
+    /// first and only bumps `nNoWrite` (`dbCa.c:582-583`) — latest-wins, and
     /// the link is enqueued once (`callAdd = (pca->link_action == 0)`,
-    /// `dbCa.c:137`). This is C's answer to "what happens when the queue is
+    /// `dbCa.c:135`). This is C's answer to "what happens when the queue is
     /// full": there is no queue to fill.
     #[test]
     fn second_put_on_same_link_coalesces_latest_wins() {
@@ -655,6 +733,40 @@ mod tests {
         );
     }
 
+    /// Boundary: the count is attributed to the LINK that lost the value,
+    /// not to the queue. C keeps `nNoWrite` on the `caLink` (`dbCa.c:548`,
+    /// `:582`) and `dbcar` prints it beside that link's name, so a second
+    /// link's supersessions must not show up against the first.
+    #[test]
+    fn the_coalesce_count_is_attributed_per_link() {
+        let q = LinkPutQueue::default();
+        for v in [1, 2, 3] {
+            q.stage_put(key("A"), EpicsValue::Long(v), LinkPutOp::Plain);
+        }
+        q.stage_put(key("B"), EpicsValue::Long(9), LinkPutOp::Plain);
+
+        assert_eq!(q.coalesced_for(&key("A")), 2);
+        assert_eq!(q.coalesced_for(&key("B")), 0);
+        // Never staged at all — C's `pca == NULL`, zero rather than absent.
+        assert_eq!(q.coalesced_for(&key("C")), 0);
+        assert_eq!(q.coalesced_count(), 2, "the total is still the sum");
+    }
+
+    /// Boundary: the per-link count SURVIVES the link going idle. C's counter
+    /// lives on the `caLink`, which outlives any one staged value, so a link
+    /// that drained and was written to again must not report a fresh zero.
+    #[test]
+    fn the_coalesce_count_outlives_the_links_pending_state() {
+        let q = LinkPutQueue::default();
+        q.stage_put(key("A"), EpicsValue::Long(1), LinkPutOp::Plain);
+        q.stage_put(key("A"), EpicsValue::Long(2), LinkPutOp::Plain);
+        assert_eq!(q.coalesced_for(&key("A")), 1);
+        let (k, _staged) = q.take_ready().expect("ready");
+        q.finish(k);
+        assert!(q.is_idle(), "nothing pending on any link");
+        assert_eq!(q.coalesced_for(&key("A")), 1);
+    }
+
     /// Boundary: distinct links do NOT coalesce — one ready entry each, in
     /// staging order (`workList` is a FIFO: `ellAdd` / `ellGet`).
     #[test]
@@ -671,7 +783,7 @@ mod tests {
     /// Boundary: a put staged while the link is IN FLIGHT is not lost — it
     /// becomes ready again when the in-flight write finishes, and never
     /// overtakes it. C gets this by clearing `link_action` before the wire
-    /// write (`dbCa.c:1195`), so a concurrent `addAction` re-appends the link.
+    /// write (`dbCa.c:1130`), so a concurrent `addAction` re-appends the link.
     #[test]
     fn put_staged_during_flight_is_requeued_on_finish() {
         let q = LinkPutQueue::default();
@@ -693,7 +805,7 @@ mod tests {
 
     /// Boundary: the completion flavour is resolved — never dropped — when a
     /// newer put supersedes it. C overwrites `pca->putCallback`
-    /// (`dbCa.c:614-621`) and the earlier callback never fires; we resolve it
+    /// (`dbCa.c:585-592`) and the earlier callback never fires; we resolve it
     /// with an error instead, so no pending put loses its classification.
     #[test]
     fn superseded_completion_is_resolved_not_dropped() {
@@ -728,7 +840,7 @@ mod tests {
     /// Boundary: a plain put yields no completion channel at all — it is
     /// fire-and-forget by type, so there is no receiver a caller could
     /// accidentally await. C's `dbCaPutLink` passes a null callback
-    /// (`dbCa.c:630`).
+    /// (`dbCa.c:601`).
     #[test]
     fn plain_put_has_no_completion() {
         let q = LinkPutQueue::default();

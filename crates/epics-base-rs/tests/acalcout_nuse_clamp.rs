@@ -7,12 +7,12 @@
 //! if (pcalc->nuse > pcalc->nelm) { pcalc->nuse = pcalc->nelm;
 //!     db_post_events(pcalc,&pcalc->nuse,DBE_VALUE|DBE_LOG); }
 //!
-//! /* process, :373-377 — "Make sure.  Autosave is capable of setting NUSE
+//! /* process, :374-377 — "Make sure.  Autosave is capable of setting NUSE
 //!    to an illegal value." */
 //! if (pcalc->nuse > pcalc->nelm) { pcalc->nuse = pcalc->nelm;
 //!     db_post_events(pcalc,&pcalc->nuse, DBE_VALUE|DBE_LOG); }
 //!
-//! /* special(NUSE), :494-501 — clamps, posts DBE_VALUE, and FAILS the put */
+//! /* special(NUSE), :495-499 — clamps, posts DBE_VALUE, and FAILS the put */
 //! if (pcalc->nuse > pcalc->nelm) { pcalc->nuse = pcalc->nelm;
 //!     db_post_events(pcalc,&pcalc->nuse,DBE_VALUE); return(-1); }
 //! ```

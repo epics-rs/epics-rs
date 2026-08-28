@@ -16,7 +16,7 @@
 //! record with `field(TSEL, "SEQ.TIME")` sees it move.
 //!
 //! `recGblGetTimeStamp` is one function in C: TSEL resolution
-//! (`recGbl.c:314-322`) THEN the TSE→TIME event lookup (`:323-343`). The port
+//! (`recGbl.c:315-323`) THEN the TSE→TIME event lookup (`:324-342`). The port
 //! splits the halves across the cycle, so the boundaries below pin both — the
 //! restamp must go through the TSE owner (TSE=-2 leaves TIME alone) and must
 //! re-resolve TSEL per group (a `.TIME` TSEL re-copies its source).
@@ -106,7 +106,7 @@ async fn a_delayed_group_drives_its_target_with_its_own_hop_time() {
 }
 
 /// TSE=-2 (`epicsTimeEventDeviceTime`) is the one value `recGblGetTimeStampSimm`
-/// leaves TIME alone for (`recGbl.c:327-343`). The per-group restamp goes
+/// leaves TIME alone for (`recGbl.c:324-342`). The per-group restamp goes
 /// through that owner, so a TSE=-2 `seq` publishes ONE time across the whole
 /// chain — a restamp that read the clock directly would fail here.
 #[epics_macros_rs::epics_test]
@@ -122,7 +122,7 @@ async fn tse_device_time_makes_the_per_group_restamp_a_no_op() {
     );
 }
 
-/// `recGblGetTimeStamp` re-reads TSEL on every call (`recGbl.c:314-322`), so a
+/// `recGblGetTimeStamp` re-reads TSEL on every call (`recGbl.c:315-323`), so a
 /// `seq` whose TSEL is a `.TIME` link re-copies its source per group. Group 0
 /// drives `SEQ:SRC` with `PP`, moving that source's timestamp; group 1's
 /// restamp must therefore hand `SEQ:U1` the NEW source time, not the one the

@@ -13,15 +13,19 @@
 //! cannot mount one; what they pin is the mechanism the full-filesystem
 //! case relies on — the destination is never opened for writing, and the
 //! watermark advances only after the rename. Correctness properties of
-//! this implementation; no synApps autosave source exists on this
-//! machine, so nothing here asserts C parity.
+//! this implementation rather than C parity: synApps `save_restore.c`
+//! copies backups with `myFileCopy` and has neither the staging file nor
+//! the watermarks.
 
 #![cfg(unix)]
 
 use std::os::unix::fs::PermissionsExt;
 use std::time::Duration;
 
-use epics_base_rs::server::autosave::backup::{BackupConfig, BackupState, rotate_backups};
+use epics_base_rs::server::autosave::backup::{
+    BackupConfig, BackupState, SavbState, publish_savb, rotate_backups,
+};
+use epics_base_rs::server::autosave::format::CompatMode;
 use epics_base_rs::server::autosave::save_file::{
     SaveEntry, read_save_file, validate_save_file, write_save_file,
 };
@@ -68,7 +72,7 @@ async fn a_failed_seq_publish_leaves_the_slot_for_the_next_cycle() {
 
     let config = seq_only();
     let mut state = BackupState::default();
-    let failed = rotate_backups(&sav, &config, &mut state).await;
+    let failed = rotate_backups(&sav, &config, &mut state, &[], CompatMode::Native).await;
     assert!(
         failed.is_err(),
         "a rotation that could not publish must say so"
@@ -81,7 +85,9 @@ async fn a_failed_seq_publish_leaves_the_slot_for_the_next_cycle() {
     // Clear the obstruction: the next cycle must retry slot 0, not skip
     // to slot 1 as if slot 0 already held this generation.
     std::fs::remove_dir(&slot0).unwrap();
-    rotate_backups(&sav, &config, &mut state).await.unwrap();
+    rotate_backups(&sav, &config, &mut state, &[], CompatMode::Native)
+        .await
+        .unwrap();
     assert!(
         validate_save_file(&slot0).await.unwrap_or(false),
         "slot 0 must be retried"
@@ -119,7 +125,15 @@ async fn a_backup_is_published_without_opening_the_destination() {
         dated_interval: Duration::from_secs(3600),
     };
     let mut state = BackupState::default();
-    rotate_backups(&sav, &config, &mut state).await.unwrap();
+    let savb_state = rotate_backups(&sav, &config, &mut state, &[], CompatMode::Native)
+        .await
+        .unwrap();
+    assert_eq!(
+        savb_state,
+        SavbState::Ok,
+        "a valid .savB is left alone until the new .sav is on disk"
+    );
+    publish_savb(&sav, savb_state).await.unwrap();
 
     assert_eq!(
         first_value(&savb).await,
@@ -148,7 +162,7 @@ async fn a_failed_dated_publish_leaves_its_watermark_alone() {
         dated_interval: Duration::from_secs(3600),
     };
     let mut state = BackupState::default();
-    let failed = rotate_backups(&sav, &config, &mut state).await;
+    let failed = rotate_backups(&sav, &config, &mut state, &[], CompatMode::Native).await;
     std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
     assert!(
         failed.is_err(),
@@ -158,7 +172,9 @@ async fn a_failed_dated_publish_leaves_its_watermark_alone() {
     // The interval is an hour, so a watermark that moved would suppress
     // the retry for an hour. It must not have moved: the very next
     // rotation, with the directory writable again, must produce the file.
-    rotate_backups(&sav, &config, &mut state).await.unwrap();
+    rotate_backups(&sav, &config, &mut state, &[], CompatMode::Native)
+        .await
+        .unwrap();
     let dated: Vec<_> = std::fs::read_dir(dir.path())
         .unwrap()
         .filter_map(|e| e.ok())

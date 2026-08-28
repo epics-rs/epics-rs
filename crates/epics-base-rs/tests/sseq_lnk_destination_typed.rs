@@ -2,18 +2,18 @@
 //! DESTINATION asks for — never the one its `DOLn` SOURCE happened to
 //! deliver.
 //!
-//! C `sseqRecord.c::processCallback` (706-793) resolves the destination at
+//! C `sseqRecord.c::processCallback` (708-795) resolves the destination at
 //! fire time (`dbGetLinkDBFtype(&lnk)` / `dbGetNelements(&lnk)`) and
 //! switches on it:
 //!
 //!   * `DBF_STRING`/`ENUM`/`MENU`/`DEVICE`/`INLINK`/`OUTLINK`/`FWDLINK`
-//!     (:714-736) → `DBR_STRING` from `s` (`STRn`), which for a numeric
+//!     (:715-736) → `DBR_STRING` from `s` (`STRn`), which for a numeric
 //!     source is `cvtDoubleToString(dov, s, pR->prec)` — the sseq's own PREC.
-//!   * `DBF_SHORT`..`DBF_DOUBLE` (:738-760) → `DBR_DOUBLE` from `dov`
+//!   * `DBF_SHORT`..`DBF_DOUBLE` (:737-758) → `DBR_DOUBLE` from `dov`
 //!     (`DOn`), which for a string source is `atof(s)`.
-//!   * `DBF_CHAR`/`DBF_UCHAR` with `n_elements > 1` (:762-790) → the 40-byte
+//!   * `DBF_CHAR`/`DBF_UCHAR` with `n_elements > 1` (:759-792) → the 40-byte
 //!     `s` as a char array (the long-string idiom).
-//!   * anything else, including an unresolvable target (:792 `default:`) →
+//!   * anything else, including an unresolvable target (:793 `default:`) →
 //!     NO put at all.
 //!
 //! One test per boundary of that switch.

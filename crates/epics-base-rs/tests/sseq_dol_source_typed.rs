@@ -274,7 +274,7 @@ async fn sseq_constant_dol_seeds_at_init_and_is_never_re_read() {
 
 /// The read owner's failed-store path: a value the target field REJECTS is a
 /// failed `dbGetLink` (a conversion error is a non-zero status → `setLinkAlarm`,
-/// `dbLink.c:316-323`), not a silent no-op. Pre-fix the store's `Err` went to
+/// `dbLink.c:314-321`), not a silent no-op. Pre-fix the store's `Err` went to
 /// `let _ =`, so the record kept its stale field with no alarm.
 struct PickyReader {
     val: f64,
@@ -294,6 +294,7 @@ impl Record for PickyReader {
             result: RecordProcessResult::Complete,
             actions: Vec::new(),
             device_did_compute: false,
+            post_write_fields: Vec::new(),
         })
     }
     fn pre_process_actions(&mut self) -> Vec<ProcessAction> {

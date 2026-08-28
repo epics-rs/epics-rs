@@ -3,8 +3,8 @@
 //!
 //! All four sit inside C's array dispatch: `>?`/`<?` are ordinary members of the
 //! two-arg switch (`aCalcPerform.c:1326-1327`, applied at `:1351-1352` array/array,
-//! `:1376-1377` array/scalar, `:1403-1404` scalar/scalar), and `MAX()`/`MIN()` have
-//! their own vararg arm (`:1155-1191`) that branches on whether ANY argument is an
+//! `:1365-1366` array/scalar, `:1392-1393` scalar/scalar), and `MAX()`/`MIN()` have
+//! their own vararg arm (`:1144-1180`) that branches on whether ANY argument is an
 //! array. So an array operand ANYWHERE yields an element-wise ARRAY result — never
 //! the scalar the port used to build from each operand's a[0].
 //!

@@ -1,10 +1,10 @@
 //! The creation sink owes every record the REST of C's `init_record` pass 1.
 //!
-//! C reaches `init_record` through `iterateRecords` (`iocInit.c:562-586`), so
+//! C reaches `init_record` through `iterateRecords` (`iocInit.c:561-585`), so
 //! there is no record in the database that pass 1 did not touch, whatever
 //! created it. Two pieces of that pass live outside the record itself:
 //! `recGblInitSimm` with its paired `recGblInitConstantLink(&siol, …, &sval)`
-//! (`recGbl.c:438-444`, called from e.g. `aiRecord.c:101` and
+//! (`recGbl.c:439-446`, called from e.g. `aiRecord.c:101` and
 //! `mbboDirectRecord.c:117`), and `wdogInit` (`histogramRecord.c:168`).
 //!
 //! The port had them on the loader CALLERS instead of in

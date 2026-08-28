@@ -44,13 +44,72 @@ pub fn serialize_dbr(
     }
 }
 
+/// `(secPastEpoch, nsec)` exactly as C computes them, wrap included.
+///
+/// C `epicsTimeFromTime_t`
+/// (`$EPICS_BASE/modules/libcom/src/osi/epicsTime.cpp:305-310` at `R7.0.10`)
+/// computes `epicsInt64(src) - POSIX_TIME_AT_EPICS_EPOCH` and assigns it into
+/// an `epicsUInt32`, so a pre-1990 or post-2106 clock WRAPS and the call still
+/// returns `epicsTimeOK`. This does the same arithmetic and yields the same
+/// bytes. What it replaces is a clamp — `saturating_sub(..).min(u32::MAX)` —
+/// which was a third answer, neither C's nor better than C's: it put every
+/// stamp from a dead-RTC board at exactly `0` or `0xFFFF_FFFF`, values a
+/// client cannot tell from a real reading at those instants.
+///
+/// The out-of-range clock is worth reporting, but not from here: this runs
+/// once per value per client, while the condition is constant for the life of
+/// the boot — on the RTEMS target it comes from the build-time
+/// `EPICS_RTEMS_BOOT_EPOCH` (`epics-rtems-boot/csrc/rtems_init.c`).
+/// [`wall_clock_range_warning`] is the report, and init is its caller.
+///
+/// [`WallTime::UNIX_EPOCH`] is exempt and encodes as `{0, 0}`. That is not a
+/// boundary special case: it is this port's *unset* stamp, and `{0, 0}` is
+/// exactly what C carries for a record that has not processed — the value C's
+/// own "uninitialized time stamp" test looks for (`epicsTime.cpp:176`).
 fn epics_timestamp_parts(timestamp: WallTime) -> (u32, u32) {
+    if timestamp == WallTime::UNIX_EPOCH {
+        return (0, 0);
+    }
     let unix = timestamp.since_unix_epoch();
-    let sec_past_epoch = unix
-        .as_secs()
-        .saturating_sub(EPICS_UNIX_EPOCH_OFFSET_SECS)
-        .min(u32::MAX as u64) as u32;
+    // Wrapping, not saturating: C's `epicsInt64` subtraction assigned into an
+    // `epicsUInt32` is modulo 2^32, and truncating the u64 difference gives
+    // the identical low 32 bits.
+    let sec_past_epoch = unix.as_secs().wrapping_sub(EPICS_UNIX_EPOCH_OFFSET_SECS) as u32;
     (sec_past_epoch, unix.subsec_nanos())
+}
+
+/// One line naming a wall clock the EPICS time stamp cannot hold, or `None`
+/// when the clock is in range.
+///
+/// Every stamp on the wire is an `epicsUInt32 secPastEpoch`, so a clock
+/// outside 1990-01-01 .. 2106-02-07 is encoded wrapped, and a client or an
+/// archiver takes the wrapped value for a real instant. C wraps identically
+/// and never says so. The whole of the difference this port makes is that it
+/// is said once, at the only moment an operator can act on it: the epoch is
+/// fixed for the life of the boot, so a per-read message would be noise and a
+/// per-read refusal would take the IOC off the air for a condition it cannot
+/// fix.
+pub fn wall_clock_range_warning(now: impl Into<WallTime>) -> Option<String> {
+    let now: WallTime = now.into();
+    if now == WallTime::UNIX_EPOCH {
+        return None;
+    }
+    let secs = now.since_unix_epoch().as_secs();
+    // Both ends, not just the far one: the board this exists for is the one
+    // whose clock reads BEFORE 1990, where `checked_sub` yields nothing.
+    let in_range = secs
+        .checked_sub(EPICS_UNIX_EPOCH_OFFSET_SECS)
+        .is_some_and(|past_epoch| past_epoch <= u32::MAX as u64);
+    if in_range {
+        return None;
+    }
+    Some(format!(
+        "wall clock reads {secs} s past the Unix epoch, which is outside the \
+         EPICS time stamp's range (1990-01-01 .. 2106-02-07); every time \
+         stamp this IOC serves will be wrapped modulo 2^32 seconds, as C's \
+         epicsTimeFromTime_t wraps it. Set the board's clock, or its \
+         build-time epoch, before trusting any archived time from it."
+    ))
 }
 
 /// Convert value to the target native type and serialize to bytes.
@@ -454,8 +513,15 @@ fn serialize_time(
     Ok(buf)
 }
 
-/// Serialize value with GR or CTRL metadata (zeroed) matching the C struct layout in db_access.h.
-/// GR types include display/alarm limits; CTRL types add control limits.
+/// Serialize value with GR or CTRL metadata for a channel that carries no
+/// record metadata at all.
+///
+/// Routed through the same [`write_gr_ctrl_meta`] the server path uses
+/// rather than a second hand-written zero layout. "No metadata" is not the
+/// same as "all bytes zero" — C's `get_alarm` seeds its four limits with
+/// `epicsNAN` and copies them into the reply even when the rset slot is
+/// missing (`dbAccess.c:294`, `:318-323`), so a duplicate layout here would
+/// disagree with `encode_dbr` on exactly the case it exists to mirror.
 fn serialize_gr_ctrl(
     native: DbFieldType,
     val_bytes: &[u8],
@@ -464,68 +530,15 @@ fn serialize_gr_ctrl(
     ctrl: bool,
 ) -> CaResult<Vec<u8>> {
     let mut buf = Vec::with_capacity(96 + val_bytes.len());
-    buf.extend_from_slice(&status.to_be_bytes());
-    buf.extend_from_slice(&severity.to_be_bytes());
-
-    match native {
-        DbFieldType::String => {
-            // GR/CTRL String: "not implemented; use struct_dbr_sts_string" per db_access.h
-            buf.extend_from_slice(sts_pad(native));
-        }
-        DbFieldType::Enum => {
-            // no_str: u16 + strs: char[16][26] — same for GR and CTRL
-            buf.extend_from_slice(&0u16.to_be_bytes());
-            buf.extend_from_slice(&[0u8; MAX_ENUM_STATES * MAX_ENUM_STRING_SIZE]);
-        }
-        DbFieldType::Float => {
-            // precision(2) + RISC_pad(2) + units[8] + 6 or 8 limits (f32)
-            buf.extend_from_slice(&[0u8; 4]); // precision + pad
-            buf.extend_from_slice(&[0u8; MAX_UNITS_SIZE]);
-            let n_limits = if ctrl { 8 } else { 6 };
-            buf.extend_from_slice(&vec![0u8; n_limits * 4]);
-        }
-        DbFieldType::Double => {
-            // precision(2) + RISC_pad(2) + units[8] + 6 or 8 limits (f64)
-            buf.extend_from_slice(&[0u8; 4]); // precision + pad
-            buf.extend_from_slice(&[0u8; MAX_UNITS_SIZE]);
-            let n_limits = if ctrl { 8 } else { 6 };
-            buf.extend_from_slice(&vec![0u8; n_limits * 8]);
-        }
-        DbFieldType::Short => {
-            // units[8] + 6 or 8 limits (i16)
-            buf.extend_from_slice(&[0u8; MAX_UNITS_SIZE]);
-            let n_limits = if ctrl { 8 } else { 6 };
-            buf.extend_from_slice(&vec![0u8; n_limits * 2]);
-        }
-        // DBF_USHORT promotes to DBR_LONG (db_convert.h dbDBRnewToDBRold), so
-        // it serializes with the Long GR/CTRL layout.
-        DbFieldType::Long | DbFieldType::UShort => {
-            // units[8] + 6 or 8 limits (i32)
-            buf.extend_from_slice(&[0u8; MAX_UNITS_SIZE]);
-            let n_limits = if ctrl { 8 } else { 6 };
-            buf.extend_from_slice(&vec![0u8; n_limits * 4]);
-        }
-        // DBF_UCHAR promotes to DBR_CHAR (db_convert.h dbDBRnewToDBRold), so
-        // it serializes with the Char GR/CTRL layout.
-        DbFieldType::Char | DbFieldType::UChar => {
-            // units[8] + 6 or 8 limits (u8) + RISC_pad(1)
-            buf.extend_from_slice(&[0u8; MAX_UNITS_SIZE]);
-            let n_limits = if ctrl { 8 } else { 6 };
-            buf.extend_from_slice(&vec![0u8; n_limits]);
-            buf.push(0); // RISC_pad
-        }
-        // Int64/UInt64/ULong have no CA GR/CTRL type — this arm is unreachable
-        // in normal CA paths. Use same layout as Double
-        // (precision(2)+pad(2)+units(8)+n*f64 limits); DBF_ULONG promotes to
-        // DBR_DOUBLE (db_convert.h dbDBRnewToDBRold).
-        DbFieldType::Int64 | DbFieldType::UInt64 | DbFieldType::ULong => {
-            buf.extend_from_slice(&[0u8; 4]); // precision + pad
-            buf.extend_from_slice(&[0u8; MAX_UNITS_SIZE]);
-            let n_limits = if ctrl { 8 } else { 6 };
-            buf.extend_from_slice(&vec![0u8; n_limits * 8]);
-        }
-    }
-
+    // A channel supplying nothing: `PropertySupport::default()` leaves every
+    // rset slot false, which is what makes every group take its seed.
+    let bare = crate::server::snapshot::Snapshot::new(
+        EpicsValue::Double(0.0),
+        status,
+        severity,
+        SystemTime::UNIX_EPOCH,
+    );
+    write_gr_ctrl_meta(&mut buf, native, &bare, if ctrl { 8 } else { 6 });
     buf.extend_from_slice(val_bytes);
     Ok(buf)
 }
@@ -703,15 +716,51 @@ fn encode_units(buf: &mut Vec<u8>, snapshot: &crate::server::snapshot::Snapshot)
     buf.extend_from_slice(&units_buf);
 }
 
+/// Index range of the four alarm limits inside a limit array, shared by the
+/// GR (6 limits) and CTRL (8 limits) layouts.
+const ALARM_LIMITS: std::ops::Range<usize> = 2..6;
+
+/// What a limit slot holds when the record type does not supply its group.
+///
+/// The three groups do NOT share a seed, and that is the whole of this
+/// defect. `dbAccess.c` fills the reply group by group and each filler
+/// brings its own initialiser: `get_graphics` starts from `0.0` and
+/// `memset`s the buffer when the slot is NULL (`:215`, `:231`, `:243`),
+/// `get_control` does the same (`:256`, `:270`, `:282`) — but `get_alarm`
+/// starts from `struct dbr_alDouble ald = {epicsNAN, epicsNAN, epicsNAN,
+/// epicsNAN}` (`:294`) and copies `ald` into the buffer whether or not the
+/// record supplied anything (`:318-323`). It clears the option bit for a
+/// missing slot exactly as the other two do, but it never `memset`s, so the
+/// four NaNs stay in the reply.
+///
+/// A CA client therefore reads four NaNs off any DBR_GR/CTRL_DOUBLE or
+/// _FLOAT reply whose record type has no `get_alarm_double` — `bo`, `bi`,
+/// `mbbi`, `stringin`, `waveform` and the rest — while the same reply's
+/// display and control limits read zero. Measured against C softIoc:
+/// `caget -d DBR_CTRL_DOUBLE <bo>.HIGH` prints `nan` for all four.
+const LIMIT_SEED: [f64; 8] = [
+    0.0,      // upper display limit   `get_graphics`
+    0.0,      // lower display limit
+    f64::NAN, // upper alarm limit     `get_alarm`
+    f64::NAN, // upper warning limit
+    f64::NAN, // lower warning limit
+    f64::NAN, // lower alarm limit
+    0.0,      // upper control limit   `get_control`
+    0.0,      // lower control limit
+];
+
 /// Get the 6 display limits + optional 2 control limits from snapshot.
 ///
 /// Each group comes from its own supply-gated accessor, because each is a
 /// SEPARATE rset slot: `dbAccess.c:336-427` clears the option bit of every
-/// NULL slot, and the reply buffer keeps the memset zero. One `Option` on
-/// `DisplayInfo` cannot say which of `get_graphic_double` and
-/// `get_alarm_double` the record type supplies.
-fn get_limits(snapshot: &crate::server::snapshot::Snapshot, n_limits: usize) -> [f64; 8] {
-    let mut limits = [0.0f64; 8];
+/// NULL slot. One `Option` on `DisplayInfo` cannot say which of
+/// `get_graphic_double` and `get_alarm_double` the record type supplies,
+/// and what an unsupplied slot leaves behind is [`LIMIT_SEED`], not zero.
+pub(crate) fn get_limits(
+    snapshot: &crate::server::snapshot::Snapshot,
+    n_limits: usize,
+) -> [f64; 8] {
+    let mut limits = LIMIT_SEED;
     if let Some((lower, upper)) = snapshot.graphic_limits() {
         limits[0] = upper;
         limits[1] = lower;
@@ -729,6 +778,43 @@ fn get_limits(snapshot: &crate::server::snapshot::Snapshot, n_limits: usize) -> 
         limits[7] = lower;
     }
     limits
+}
+
+/// The limit block as C's integral GR/CTRL options deliver it.
+///
+/// Every integral reply is built in two steps and only the first is a float
+/// conversion. `dbAccess.c` fills a block of `epicsInt32` for the
+/// `DBR_GR_LONG` / `DBR_CTRL_LONG` / `DBR_AL_LONG` options (`:222-223`,
+/// `:262-263`, `:305-312`), and `db_access.c` then assigns each field into
+/// the reply struct's own width — `dbr_short_t` for the SHORT family,
+/// `dbr_char_t` for CHAR (`:450-455`, `:509-514`). That second step is an
+/// ordinary C integer conversion, i.e. modular truncation, so the callers
+/// narrow this with a plain `as` and must not spend a second saturating
+/// float cast. Measured against C softIoc at the R7.0.10 pin, `ai` with
+/// `HOPR = 100000, LOW = -40000`:
+///
+/// ```text
+/// caget -d DBR_CTRL_SHORT : Hi disp limit -31072   Lo warn limit  25536
+/// caget -d DBR_CTRL_CHAR  : Hi disp limit    -96   Lo warn limit    -64
+/// ```
+///
+/// A direct `100000.0 as i16` gives 32767 and `as i8` gives 127, neither of
+/// which C can produce. Routing the float step through `c_cast` also keeps
+/// the port's one deviation from C's undefined out-of-range cast in the one
+/// place that owns it.
+///
+/// The alarm four are the only group C guards — `finite(x) ? (epicsInt32) x
+/// : 0` (`:305-312`) — because they are the only limits it seeds non-finite
+/// (see [`LIMIT_SEED`]). `get_graphics` and `get_control` cast unguarded, so
+/// an infinite HOPR saturates here exactly as it would in C's `(epicsInt32)`.
+pub(crate) fn limits_as_integers(limits: [f64; 8]) -> [i32; 8] {
+    let mut out = limits.map(c_cast::f64_to_i32);
+    for i in ALARM_LIMITS {
+        if !limits[i].is_finite() {
+            out[i] = 0;
+        }
+    }
+    out
 }
 
 /// precision(2) + pad(2) + units(8) + n limits as f64.
@@ -767,14 +853,18 @@ fn encode_prec_units_limits_f32(
     }
 }
 
-/// units(8) + n limits as i16
+/// units(8) + n limits as i16.
+///
+/// See [`limits_as_integers`] for why the narrowing to `dbr_short_t` is a
+/// truncation and not a second saturating cast: a `HOPR` of 100000 reaches
+/// a `DBR_CTRL_SHORT` client as -31072, measured against C softIoc.
 fn encode_units_limits_i16(
     buf: &mut Vec<u8>,
     snapshot: &crate::server::snapshot::Snapshot,
     n_limits: usize,
 ) {
     encode_units(buf, snapshot);
-    let limits = get_limits(snapshot, n_limits);
+    let limits = limits_as_integers(get_limits(snapshot, n_limits));
     for l in &limits[..n_limits] {
         buf.extend_from_slice(&(*l as i16).to_be_bytes());
     }
@@ -787,29 +877,27 @@ fn encode_units_limits_i32(
     n_limits: usize,
 ) {
     encode_units(buf, snapshot);
-    let limits = get_limits(snapshot, n_limits);
+    let limits = limits_as_integers(get_limits(snapshot, n_limits));
     for l in &limits[..n_limits] {
-        buf.extend_from_slice(&(*l as i32).to_be_bytes());
+        buf.extend_from_slice(&l.to_be_bytes());
     }
 }
 
-/// units(8) + n limits as u8 (DBF_CHAR limits, transmitted as
-/// SIGNED `epicsInt8` per the libca spec — `7cb80d5a1`). Encoding
-/// path: `f64 limit → i8 (saturating) → u8 bit-pattern → wire byte`.
-/// Without the i8 intermediate `(-10.0_f64) as u8` saturates to 0
-/// in Rust, silently destroying negative DRVL/LOPR/HOPR/HIHI on
-/// DBF_CHAR records. P-8 finding (BUG_ARCHAEOLOGY).
+/// units(8) + n limits as one byte each (`dbr_char_t`, `db_access.h:40`).
+///
+/// The narrowing is modular, per [`limits_as_integers`], so a negative limit
+/// reaches the wire as its two's-complement byte (-10 as 0xF6) rather than
+/// the 0 a direct `(-10.0_f64) as u8` would give, and an out-of-range one
+/// keeps C's low byte (100000 as 0xA0, which a client renders -96).
 fn encode_units_limits_u8(
     buf: &mut Vec<u8>,
     snapshot: &crate::server::snapshot::Snapshot,
     n_limits: usize,
 ) {
     encode_units(buf, snapshot);
-    let limits = get_limits(snapshot, n_limits);
+    let limits = limits_as_integers(get_limits(snapshot, n_limits));
     for l in &limits[..n_limits] {
-        // Saturating cast f64 → i8 → wire byte. `as i8` on f64 in
-        // Rust ≥1.45 saturates to [i8::MIN, i8::MAX] (no UB).
-        buf.push((*l as i8) as u8);
+        buf.push(*l as u8);
     }
 }
 
@@ -1774,5 +1862,309 @@ mod r17_1_negative_precision_tests {
             convert_value_to_dbr_string(&s.value, &s).unwrap(),
             EpicsValue::String("3.70".into())
         );
+    }
+}
+
+#[cfg(test)]
+mod alarm_limit_seed_tests {
+    //! What a DBR_GR/CTRL reply carries in its four alarm-limit slots when
+    //! the record type has NO `get_alarm_double` — the `bo`, `bi`, `mbbi`,
+    //! `stringin`, `waveform` case.
+    //!
+    //! C answers it in two different ways depending on the DBR class, and
+    //! neither is "zero for both": `get_alarm` seeds `ald` with four
+    //! `epicsNAN` (`dbAccess.c:294`) and copies them into the reply even
+    //! when the slot is missing, so the DOUBLE and FLOAT classes carry NaN;
+    //! the LONG arm converts each through `finite(x) ? (epicsInt32) x : 0`
+    //! (`:305-312`), so the SHORT, LONG and CHAR classes carry 0. The
+    //! display and control groups are zero on every class, because their
+    //! own fillers seed 0.0 and `memset` the missing case.
+    //!
+    //! Measured against C softIoc at the R7.0.10 pin:
+    //! `caget -d DBR_CTRL_DOUBLE <bo>.HIGH` reports all four as `nan`.
+    //!
+    //! One case per boundary: supplied vs unsupplied, float class vs
+    //! integer class, and the non-finite value an integer class must NOT
+    //! saturate.
+    use super::{decode_dbr, encode_dbr};
+    use crate::server::snapshot::{ControlInfo, DisplayInfo, PropertySupport, Snapshot};
+    use crate::types::EpicsValue;
+    use crate::types::dbr::{
+        DBR_CTRL_CHAR, DBR_CTRL_DOUBLE, DBR_CTRL_FLOAT, DBR_CTRL_LONG, DBR_CTRL_SHORT,
+        DBR_GR_DOUBLE,
+    };
+    use std::time::SystemTime;
+
+    /// A `bo`-shaped channel: units, precision, graphic and control limits,
+    /// but NO `get_alarm_double` (`record_trait.rs::default_property_support`
+    /// gives `bo` `alarm_double: false`). The `DisplayInfo` still carries
+    /// alarm-limit fields — every snapshot does — and the point of the gate
+    /// is that they must not reach the wire.
+    fn bo_shaped(value: EpicsValue) -> Snapshot {
+        let mut s = Snapshot::new(value, 0, 0, SystemTime::UNIX_EPOCH);
+        s.display = Some(DisplayInfo {
+            upper_disp_limit: 100.0,
+            lower_disp_limit: 0.0,
+            // Deliberately non-zero: if the encoder ever read these past
+            // the gate the assertions below would see 7.0, not NaN.
+            upper_alarm_limit: 7.0,
+            upper_warning_limit: 7.0,
+            lower_warning_limit: 7.0,
+            lower_alarm_limit: 7.0,
+            ..Default::default()
+        });
+        s.control = Some(ControlInfo {
+            upper_ctrl_limit: 100.0,
+            lower_ctrl_limit: 0.0,
+        });
+        s.properties = PropertySupport {
+            units: true,
+            precision: true,
+            graphic_double: true,
+            control_double: true,
+            alarm_double: false,
+            enum_strs: false,
+        };
+        s
+    }
+
+    /// The same channel with the slot supplied, and one alarm limit set to
+    /// `f64::INFINITY` — the value C's `finite` guard sends to 0 on an
+    /// integer class where a bare Rust `as i32` would saturate to `i32::MAX`.
+    fn alarm_supplied(hihi: f64) -> Snapshot {
+        let mut s = bo_shaped(EpicsValue::Double(1.0));
+        s.display = Some(DisplayInfo {
+            upper_disp_limit: 100.0,
+            lower_disp_limit: 0.0,
+            upper_alarm_limit: hihi,
+            upper_warning_limit: 80.0,
+            lower_warning_limit: 20.0,
+            lower_alarm_limit: 10.0,
+            ..Default::default()
+        });
+        s.properties.alarm_double = true;
+        s
+    }
+
+    /// `(hihi, high, low, lolo)` as a client reads them back off the wire.
+    fn wire_alarm_limits(dbr: u16, snap: &Snapshot) -> (f64, f64, f64, f64) {
+        let bytes = encode_dbr(dbr, snap).unwrap();
+        let d = decode_dbr(dbr, &bytes, 1)
+            .unwrap()
+            .display
+            .expect("a GR/CTRL reply always decodes a DisplayInfo");
+        (
+            d.upper_alarm_limit,
+            d.upper_warning_limit,
+            d.lower_warning_limit,
+            d.lower_alarm_limit,
+        )
+    }
+
+    #[test]
+    fn a_record_with_no_alarm_slot_sends_four_nans_on_the_double_classes() {
+        for dbr in [DBR_CTRL_DOUBLE, DBR_GR_DOUBLE] {
+            let (hihi, high, low, lolo) =
+                wire_alarm_limits(dbr, &bo_shaped(EpicsValue::Double(1.0)));
+            for (name, v) in [("hihi", hihi), ("high", high), ("low", low), ("lolo", lolo)] {
+                assert!(v.is_nan(), "dbr {dbr}: {name} is {v}, C sends nan");
+            }
+        }
+    }
+
+    #[test]
+    fn the_float_class_carries_the_nan_through_the_narrowing_convert() {
+        // `epicsConvertDoubleToFloat` returns `(float) value` unchanged for a
+        // non-finite input (`epicsConvert.c:22-23`), so the f32 slots are NaN
+        // too — not the 0 a saturating narrowing would give.
+        let (hihi, high, low, lolo) =
+            wire_alarm_limits(DBR_CTRL_FLOAT, &bo_shaped(EpicsValue::Float(1.0)));
+        for (name, v) in [("hihi", hihi), ("high", high), ("low", low), ("lolo", lolo)] {
+            assert!(v.is_nan(), "{name} is {v}, C sends nan");
+        }
+    }
+
+    #[test]
+    fn the_integer_classes_send_zero_for_the_same_record() {
+        // `db_access.c` asks the integer classes for `DBR_AL_LONG` (`:444`,
+        // `:502`, `:529`), whose filler converts each NaN to 0.
+        for (dbr, value) in [
+            (DBR_CTRL_LONG, EpicsValue::Long(1)),
+            (DBR_CTRL_SHORT, EpicsValue::Short(1)),
+            (DBR_CTRL_CHAR, EpicsValue::Char(1)),
+        ] {
+            let (hihi, high, low, lolo) = wire_alarm_limits(dbr, &bo_shaped(value));
+            assert_eq!(
+                (hihi, high, low, lolo),
+                (0.0, 0.0, 0.0, 0.0),
+                "dbr {dbr}: C's DBR_AL_LONG arm sends 0, not nan"
+            );
+        }
+    }
+
+    #[test]
+    fn the_display_and_control_groups_stay_zero_when_unsupplied() {
+        // Only the alarm group is seeded non-finite. A record type with no
+        // `get_graphic_double` / `get_control_double` still reads back 0,
+        // because C `memset`s those two groups (`dbAccess.c:231`, `:270`).
+        let mut s = bo_shaped(EpicsValue::Double(1.0));
+        s.properties.graphic_double = false;
+        s.properties.control_double = false;
+        let bytes = encode_dbr(DBR_CTRL_DOUBLE, &s).unwrap();
+        let back = decode_dbr(DBR_CTRL_DOUBLE, &bytes, 1).unwrap();
+        let d = back.display.unwrap();
+        let c = back.control.unwrap();
+        assert_eq!(d.upper_disp_limit, 0.0);
+        assert_eq!(d.lower_disp_limit, 0.0);
+        assert_eq!(c.upper_ctrl_limit, 0.0);
+        assert_eq!(c.lower_ctrl_limit, 0.0);
+    }
+
+    #[test]
+    fn a_supplied_slot_still_sends_the_records_own_limits() {
+        assert_eq!(
+            wire_alarm_limits(DBR_CTRL_DOUBLE, &alarm_supplied(90.0)),
+            (90.0, 80.0, 20.0, 10.0),
+            "the seed must not survive a record that supplies the slot"
+        );
+        assert_eq!(
+            wire_alarm_limits(DBR_CTRL_LONG, &alarm_supplied(90.0)),
+            (90.0, 80.0, 20.0, 10.0),
+            "the integer arm converts, it does not blank"
+        );
+    }
+
+    #[test]
+    fn an_infinite_supplied_limit_is_zero_on_an_integer_class() {
+        // C guards on `finite`, which is false for +/-inf as well as NaN, so
+        // both go to 0. A bare `as i32` would saturate to `i32::MAX` here.
+        let (hihi, ..) = wire_alarm_limits(DBR_CTRL_LONG, &alarm_supplied(f64::INFINITY));
+        assert_eq!(hihi, 0.0, "finite(inf) is false, so C writes 0");
+        // The double class has no such guard and carries the raw value.
+        let (hihi, ..) = wire_alarm_limits(DBR_CTRL_DOUBLE, &alarm_supplied(f64::INFINITY));
+        assert!(hihi.is_infinite(), "the DBR_AL_DOUBLE arm copies raw");
+    }
+
+    #[test]
+    fn the_ctrl_double_wire_bytes_are_the_ones_c_softioc_sends() {
+        // status(2) + severity(2) + precision(2) + RISC_pad(2) + units(8),
+        // then eight f64 limits: upper/lower display, hihi, high, low, lolo,
+        // upper/lower control. Asserted on the bytes rather than through the
+        // decoder so this case cannot pass on a symmetric encode/decode bug.
+        let bytes = encode_dbr(DBR_CTRL_DOUBLE, &bo_shaped(EpicsValue::Double(1.0))).unwrap();
+        let at = |i: usize| {
+            let off = 16 + i * 8;
+            f64::from_be_bytes(bytes[off..off + 8].try_into().unwrap())
+        };
+        assert_eq!(at(0), 100.0, "upper display");
+        assert_eq!(at(1), 0.0, "lower display");
+        for i in 2..6 {
+            assert!(at(i).is_nan(), "limit {i} must be nan on the wire");
+        }
+        assert_eq!(at(6), 100.0, "upper control");
+        assert_eq!(at(7), 0.0, "lower control");
+    }
+}
+
+#[cfg(test)]
+mod integer_limit_narrowing_tests {
+    //! An out-of-range limit on an integral DBR class TRUNCATES to the reply
+    //! struct's width, it does not saturate.
+    //!
+    //! C narrows in two steps and only the first is a float conversion:
+    //! `dbAccess.c` produces `epicsInt32` for the `*_LONG` options, then the
+    //! struct assignment in `db_access.c` converts that to `dbr_short_t` /
+    //! `dbr_char_t`. The port had a single saturating `f64 as i16` / `as i8`,
+    //! which can reach 32767 and 127 — values C cannot produce.
+    //!
+    //! Measured against C softIoc at the R7.0.10 pin, `ai` with
+    //! `HOPR = 100000, LOPR = -100000, HIGH = 40000, LOW = -40000` and every
+    //! `*SV` set so the alarm slot is supplied.
+    use super::{encode_dbr, limits_as_integers};
+    use crate::server::snapshot::{ControlInfo, DisplayInfo, PropertySupport, Snapshot};
+    use crate::types::EpicsValue;
+    use crate::types::dbr::{DBR_CTRL_CHAR, DBR_CTRL_LONG, DBR_CTRL_SHORT};
+    use std::time::SystemTime;
+
+    /// An `ai`-shaped channel supplying every numeric slot, with the limits
+    /// the A/B database used.
+    fn ai_big(value: EpicsValue) -> Snapshot {
+        let mut s = Snapshot::new(value, 0, 0, SystemTime::UNIX_EPOCH);
+        s.display = Some(DisplayInfo {
+            upper_disp_limit: 100000.0,
+            lower_disp_limit: -100000.0,
+            upper_alarm_limit: 100000.0,
+            upper_warning_limit: 40000.0,
+            lower_warning_limit: -40000.0,
+            lower_alarm_limit: -100000.0,
+            ..Default::default()
+        });
+        s.control = Some(ControlInfo {
+            upper_ctrl_limit: 100000.0,
+            lower_ctrl_limit: -100000.0,
+        });
+        s.properties = PropertySupport {
+            units: true,
+            precision: true,
+            graphic_double: true,
+            control_double: true,
+            alarm_double: true,
+            enum_strs: false,
+        };
+        s
+    }
+
+    #[test]
+    fn the_short_family_keeps_the_low_sixteen_bits() {
+        // status(2) + severity(2) + units[8], then eight i16 limits.
+        let bytes = encode_dbr(DBR_CTRL_SHORT, &ai_big(EpicsValue::Short(1))).unwrap();
+        let at = |i: usize| i16::from_be_bytes(bytes[12 + i * 2..14 + i * 2].try_into().unwrap());
+        assert_eq!(at(0), -31072, "100000 truncates, C prints -31072");
+        assert_eq!(at(1), 31072, "-100000 truncates");
+        assert_eq!(at(3), 40000_i32 as i16, "40000 already exceeds i16");
+        assert_eq!(at(4), 25536, "-40000 truncates, C prints 25536");
+    }
+
+    #[test]
+    fn the_char_family_keeps_the_low_byte() {
+        // status(2) + severity(2) + units[8], then eight raw bytes.
+        let bytes = encode_dbr(DBR_CTRL_CHAR, &ai_big(EpicsValue::Char(1))).unwrap();
+        assert_eq!(bytes[12], 0xA0, "100000 & 0xff; a client renders it -96");
+        assert_eq!(bytes[13], 0x60, "-100000 & 0xff, rendered 96");
+        assert_eq!(bytes[16], 0xC0, "-40000 & 0xff, rendered -64");
+    }
+
+    #[test]
+    fn a_negative_limit_inside_the_byte_is_its_twos_complement() {
+        // The case the old saturating path got right for the wrong reason:
+        // a direct `(-10.0_f64) as u8` is 0, `as i8 as u8` is 0xF6, and so is
+        // the two-step. Kept as a boundary so the modular rule cannot regress
+        // into a clamp that only looks right for small negatives.
+        let mut s = ai_big(EpicsValue::Char(1));
+        s.display.as_mut().unwrap().lower_disp_limit = -10.0;
+        let bytes = encode_dbr(DBR_CTRL_CHAR, &s).unwrap();
+        assert_eq!(bytes[13], 0xF6);
+    }
+
+    #[test]
+    fn the_long_family_is_the_intermediate_itself_and_does_not_truncate() {
+        let bytes = encode_dbr(DBR_CTRL_LONG, &ai_big(EpicsValue::Long(1))).unwrap();
+        let at = |i: usize| i32::from_be_bytes(bytes[12 + i * 4..16 + i * 4].try_into().unwrap());
+        assert_eq!(at(0), 100000);
+        assert_eq!(at(1), -100000);
+    }
+
+    #[test]
+    fn only_the_alarm_group_is_guarded_against_a_non_finite_limit() {
+        // C's `finite` guard is in the `DBR_AL_LONG` arm alone. An infinite
+        // display or control limit reaches the unguarded `(epicsInt32)` cast,
+        // which this port resolves by saturation rather than C's UB.
+        let mut limits = [f64::INFINITY; 8];
+        limits[1] = f64::NEG_INFINITY;
+        let out = limits_as_integers(limits);
+        assert_eq!(out[0], i32::MAX, "display limits are cast unguarded");
+        assert_eq!(out[1], i32::MIN);
+        assert_eq!(&out[2..6], &[0, 0, 0, 0], "the alarm four are guarded");
+        assert_eq!(out[6], i32::MAX, "control limits are cast unguarded");
     }
 }

@@ -1,3 +1,5 @@
+use std::sync::atomic::{AtomicI32, Ordering};
+
 use crate::error::{CaError, CaResult};
 use crate::server::record::{FieldMetadataOverride, MENU_YES_NO, ProcessOutcome, Record};
 use crate::types::EpicsValue;
@@ -74,6 +76,12 @@ pub struct HistogramRecord {
     /// [`crate::server::record::ProcessAction::ArmWatchdog`] — the same shape
     /// the scaler uses for the `dbPutLink` its `special()` performs.
     rearm_watchdog: bool,
+    /// `clear_histogram` ran and owes C's closing `prec->udf = FALSE`
+    /// (`histogramRecord.c:361`). Set inside the clear, not at its callers, so
+    /// the CMD arm and the ULIM/LLIM arm cannot drift apart; drained by
+    /// `take_udf_clear` at the after-put owner, which can reach the common
+    /// fields this record cannot.
+    cleared_udf: bool,
 }
 
 impl Default for HistogramRecord {
@@ -112,6 +120,7 @@ impl Default for HistogramRecord {
             sdly: -1.0,
             constant_svl_loaded: false,
             rearm_watchdog: false,
+            cleared_udf: false,
         }
     }
 }
@@ -181,12 +190,18 @@ impl HistogramRecord {
         self.add_count();
     }
 
-    /// C `clear_histogram` — zero every bucket and arm a monitor post.
+    /// C `clear_histogram` (`histogramRecord.c:354-364`) — zero every bucket,
+    /// arm a monitor post, and clear UDF. The third statement is the one the
+    /// port was missing: `caput HG.CMD 1` on a never-processed histogram left
+    /// `UDF=1` and its UDF_ALARM standing where C reports the record defined.
     fn clear_histogram(&mut self) {
         for v in &mut self.val {
             *v = 0;
         }
         self.mcnt = self.mdel + 1;
+        // `prec->udf = FALSE` (`:361`). UDF is common, so this is a latch the
+        // after-put owner drains — see `take_udf_clear`.
+        self.cleared_udf = true;
     }
 }
 
@@ -198,7 +213,17 @@ const HISTOGRAM_CMD_CHOICES: &[&str] = &["Read", "Clear", "Start", "Stop"];
 
 /// C `histogramRecord.c:88` `int histogramSDELprecision = 2;` — the precision
 /// `get_precision` serves for `SDEL`, the monitor deadband.
-const HISTOGRAM_SDEL_PRECISION: i16 = 2;
+static HISTOGRAM_SDEL_PRECISION: AtomicI32 = AtomicI32::new(2);
+
+/// The iocsh knob `histogramSDELprecision`, read and written by `var`.
+pub(crate) fn histogram_sdel_precision() -> i32 {
+    HISTOGRAM_SDEL_PRECISION.load(Ordering::Relaxed)
+}
+
+/// See [`histogram_sdel_precision`].
+pub(crate) fn set_histogram_sdel_precision(value: i32) {
+    HISTOGRAM_SDEL_PRECISION.store(value, Ordering::Relaxed);
+}
 
 impl Record for HistogramRecord {
     fn record_type(&self) -> &'static str {
@@ -231,7 +256,7 @@ impl Record for HistogramRecord {
         if field.eq_ignore_ascii_case("SDEL") {
             return Some(FieldMetadataOverride {
                 units: Some("s".into()),
-                precision: Some(HISTOGRAM_SDEL_PRECISION),
+                precision: Some(histogram_sdel_precision() as i16),
                 ..Default::default()
             });
         }
@@ -255,6 +280,14 @@ impl Record for HistogramRecord {
     /// → `H1.UDF` = 1, SEVR NO_ALARM, because histogram's `checkAlarms` has no
     /// UDF test either).
     fn clears_udf(&self) -> bool {
+        false
+    }
+
+    /// The same fact governs a DEVICE read that wrote VAL directly (C
+    /// `return 2`): neither `clear_histogram` (`:361`) nor the simulated SIOL
+    /// read (`:387`) is on the device path, so `histogramRecord.c::process`
+    /// leaves UDF exactly as `read_histogram` left it.
+    fn rederives_udf_on_computed_read(&self) -> bool {
         false
     }
 
@@ -289,14 +322,13 @@ impl Record for HistogramRecord {
     /// * SGNL SPC_MOD `special()` path: no monitor follows `add_count`, so the
     ///   direct write STICKS and a `caget` reports STAT=SOFT SEVR=INVALID.
     ///
-    /// Per `doc/strategy-2026-07-13.md` §2 — *C's bugs are not the contract;
-    /// clean is the goal* — the port raises the alarm through the single
-    /// `nsta`/`nsev` owner (`rec_gbl_set_sevr`), so a misconfigured histogram
-    /// reports SOFT/INVALID CONSISTENTLY: committed by `recGblResetAlarms` on
-    /// the process path, and committed by the SGNL special path's own
-    /// post-`check_alarms` `recGblResetAlarms` (see `field_io.rs`). This refuses
-    /// C's path-dependent dead-code/sticky behaviour and its direct-write
-    /// anti-pattern in one move. `rec_gbl_set_sevr`'s raise-only rule subsumes
+    /// *C's bugs are not the contract; clean is the goal* — the port raises the
+    /// alarm through the single `nsta`/`nsev` owner (`rec_gbl_set_sevr`), so a
+    /// misconfigured histogram reports SOFT/INVALID CONSISTENTLY: committed by
+    /// `recGblResetAlarms` on the process path, and committed by the SGNL
+    /// special path's own post-`check_alarms` `recGblResetAlarms` (see
+    /// `field_io.rs`). This refuses C's path-dependent dead-code/sticky
+    /// behaviour and its direct-write anti-pattern in one move. `rec_gbl_set_sevr`'s raise-only rule subsumes
     /// C's `nsev < INVALID_ALARM` guard (it only raises when strictly higher).
     /// Gated on `csta` because C's `add_count` returns before the limits test
     /// when counting is stopped.
@@ -426,6 +458,11 @@ impl Record for HistogramRecord {
     /// path-dependent).
     fn special_checks_alarms(&self, put_field: &str) -> bool {
         put_field.eq_ignore_ascii_case("SGNL")
+    }
+
+    /// `clear_histogram`'s closing `prec->udf = FALSE` (`histogramRecord.c:361`).
+    fn take_udf_clear(&mut self) -> bool {
+        std::mem::take(&mut self.cleared_udf)
     }
 
     fn take_special_actions(&mut self) -> Vec<crate::server::record::ProcessAction> {

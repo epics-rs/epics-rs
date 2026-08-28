@@ -2,9 +2,9 @@
 //!
 //! `sCalcoutRecord.dbd:479-531` declares HIHI/LOLO/HIGH/LOW, HHSV/LLSV/HSV/LSV
 //! and HYST; `:858` declares LALM (`special(SPC_NOMOD)`). `checkAlarms`
-//! (`sCalcoutRecord.c:699-751`) is the same per-level hysteresis ladder
-//! calc/calcout/ai/ao run, and `process` calls it BEFORE the OOPT switch
-//! (`:371`) precisely so a limit excursion can drive IVOA.
+//! (`sCalcoutRecord.c:699-752`) is the same per-level hysteresis ladder
+//! calc/calcout/ai/ao run, and `process` calls it (`:371`) BEFORE the OOPT
+//! switch (`:374`) precisely so a limit excursion can drive IVOA.
 //!
 //! The port had NONE of it: `rg 'HIHI|HHSV|HYST|LALM' scalcout.rs` was empty and
 //! the record was absent from the shared `AnalogAlarmConfig` slot, so
@@ -20,6 +20,7 @@ use std::collections::HashSet;
 use epics_base_rs::server::database::PvDatabase;
 use epics_base_rs::server::ioc_builder::IocBuilder;
 use epics_base_rs::server::record::AlarmSeverity;
+use epics_base_rs::server::records::scalcout::ScalcoutRecord;
 use epics_base_rs::types::EpicsValue;
 
 const DB: &str = r#"
@@ -48,6 +49,7 @@ record(scalcout, "S:IVOA") {
 
 async fn build() -> std::sync::Arc<PvDatabase> {
     IocBuilder::new()
+        .register_record_type("scalcout", || Box::new(ScalcoutRecord::default()))
         .db_string(DB, &std::collections::HashMap::new())
         .unwrap()
         .build()
@@ -91,7 +93,7 @@ async fn the_alarm_fields_exist_and_are_writable() {
     assert_eq!(db.get_pv("S:LIM.HIHI").unwrap().to_f64(), Some(42.0));
 }
 
-/// The C ladder, level by level (`sCalcoutRecord.c:727-748`): HIHI/LOLO are
+/// The C ladder, level by level (`sCalcoutRecord.c:726-747`): HIHI/LOLO are
 /// checked before HIGH/LOW, and a zero severity disables its level.
 #[epics_macros_rs::epics_test]
 async fn the_ladder_raises_each_level() {
@@ -156,7 +158,7 @@ async fn hysteresis_holds_the_level_through_lalm() {
     );
 }
 
-/// The reason C calls `checkAlarms` BEFORE the OOPT switch (`:371`): the
+/// The reason C calls `checkAlarms` (`:371`) BEFORE the OOPT switch (`:374`): the
 /// severity it raises is what the output stage reads. `execOutput` writes OUT
 /// only `if (pcalc->nsev < INVALID_ALARM)` (`sCalcoutRecord.c:780-786`) and
 /// otherwise takes the IVOA branch — so an INVALID limit excursion must reach

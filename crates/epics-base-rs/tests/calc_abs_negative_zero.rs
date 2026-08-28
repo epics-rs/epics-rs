@@ -4,7 +4,7 @@
 //! exactly one value: negative zero.
 //!
 //! ```c
-//! *ptop = fabs(*ptop);                          /* base   calcPerform.c:174-176 */
+//! *ptop = fabs(*ptop);                          /* base   calcPerform.c:173-175 */
 //! if (*pd < 0) *pd *= -1;                       /* sCalc  sCalcPerform.c:513-515 */
 //! if (ps->d < 0) ps->d *= -1;                   /* sCalc  sCalcPerform.c:1046-1049 */
 //! for (...) if (ps->a[i] < 0) ps->a[i] *= -1;   /* aCalc  aCalcPerform.c:771 */
@@ -36,7 +36,7 @@ fn base_abs_is_fabs_and_clears_the_sign_of_negative_zero() {
     assert_eq!(v, 0.0);
     assert!(
         v.is_sign_positive(),
-        "base calls fabs (calcPerform.c:175), so the sign bit is cleared"
+        "base calls fabs (calcPerform.c:174), so the sign bit is cleared"
     );
     assert_eq!(calc("ABS(0-3)", &mut NumericInputs::new()).unwrap(), 3.0);
 }

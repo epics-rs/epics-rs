@@ -48,11 +48,6 @@ pub struct LsoRecord {
     /// DBE_LOG (archive) mask (C `lsoRecord.dbd.pod` APST, monitor:
     /// `if (apst == menuPost_Always) events |= DBE_LOG;`).
     pub apst: i16,
-    /// Per-cycle scratch: did VAL change on the most recent `process()`?
-    /// Captured BEFORE `process()` commits `oval`/`olen` so the
-    /// framework's post-process monitor gate can see it. C
-    /// `lsoRecord.c::monitor`: `len != olen || memcmp(oval, val, len)`.
-    value_changed: bool,
 }
 
 impl Default for LsoRecord {
@@ -80,7 +75,6 @@ impl Default for LsoRecord {
             sdly: -1.0,
             mpst: 0,
             apst: 0,
-            value_changed: false,
         }
     }
 }
@@ -158,18 +152,58 @@ impl Record for LsoRecord {
         &["VAL", "OVAL"]
     }
 
-    // C recLso.c IVOA=set_to_IVOV: oval = ivov (string copy); val = oval.
+    /// C `lsoRecord.c::process:131-140` (`menuIvoaSet_output_to_IVOV`) writes
+    /// the record's OWN value and nothing else: `strncpy(prec->val,
+    /// prec->ivov, prec->sizv - 1)`, terminate, `prec->len = strlen(prec->val)
+    /// + 1`. `put_field("VAL", ..)` performs exactly that pair of steps.
+    ///
+    /// `oval` is deliberately NOT written here. C assigns it at two places in
+    /// the whole record — `:92` (`strcpy(prec->oval, prec->val)` in the init
+    /// tail) and `:251` (inside `monitor()`) — and both copy it FROM `val`: it
+    /// is `monitor()`'s previous-value tracker, and the comparison
+    /// `len != olen || memcmp(oval, val, len)` (`:248-249`) is what posts
+    /// DBE_VALUE|DBE_LOG for this write. Seeding `oval` with the value about
+    /// to be stored makes that comparison equal forever and suppresses the
+    /// post for the life of the record.
     fn apply_invalid_output_value(&mut self, ivov: EpicsValue) -> CaResult<()> {
-        self.put_field("OVAL", ivov.clone())?;
         self.put_field("VAL", ivov)
+    }
+
+    /// SINGLE source of the value both of lso's output paths carry: the real
+    /// write `devLsoSoft.c::write_string:21` (`dbPutLinkLS(&prec->out,
+    /// prec->val, prec->len)`) and the SIMM redirect `lsoRecord.c:288`
+    /// (`dbPutLinkLS(&prec->siol, prec->val, prec->len)`). Both put `val`.
+    ///
+    /// The trait default is `OVAL.or(VAL)` — the ao/calcout convention, where
+    /// OVAL is the record's computed output. lso has no computed-output field;
+    /// its OVAL is the monitor tracker above, holding the value published on
+    /// the PREVIOUS cycle. Naming VAL here is what lets the IVOA arm leave
+    /// OVAL to its one meaning.
+    fn output_link_value(&self) -> Option<EpicsValue> {
+        Some(EpicsValue::CharArray(self.clamped().into_bytes()))
     }
 
     fn uses_monitor_deadband(&self) -> bool {
         false
     }
 
-    fn monitor_value_changed(&self) -> Option<bool> {
-        Some(self.value_changed)
+    /// C `lsoRecord.c:248-252` `monitor()`: `if (prec->len != prec->olen ||
+    /// memcmp(prec->oval, prec->val, prec->len)) { events |= DBE_VALUE |
+    /// DBE_LOG; memcpy(prec->oval, prec->val, prec->len); }` — compared and
+    /// committed HERE, at C's position. (`olen` follows from the separate
+    /// `if (prec->len != prec->olen)` two lines down, which also posts LEN.)
+    ///
+    /// For `lso` this is what makes the IVOA = Set_output_to_IVOV write post
+    /// on its OWN cycle: the framework's IVOA owner runs after
+    /// `process()` returns, so a flag captured in `process()` would be the
+    /// verdict on the PRE-arm value.
+    fn monitor_value_changed(&mut self) -> Option<bool> {
+        let changed = self.len != self.olen || self.oval != self.val;
+        if changed {
+            self.oval = self.val.clone();
+            self.olen = self.len;
+        }
+        Some(changed)
     }
 
     /// C `lsoRecord.c:113-115`: `process()` clears `udf` to FALSE only on a
@@ -228,20 +262,6 @@ impl Record for LsoRecord {
     }
 
     fn process(&mut self) -> CaResult<ProcessOutcome> {
-        // C `lsoRecord.c::monitor` (lines 244-256): copy OVAL and bump
-        // OLEN only when the value actually changed, and raise
-        // `DBE_VALUE | DBE_LOG` on that same condition. LEN is set when
-        // VAL is written (C `special`, Rust `put_field`); `process()`
-        // must not recompute it.
-        //
-        // Capture the change BEFORE committing oval/olen, because the
-        // framework's monitor gate reads `monitor_value_changed()`
-        // *after* this returns — by then oval == val and olen == len.
-        self.value_changed = self.len != self.olen || self.oval != self.val;
-        if self.value_changed {
-            self.oval = self.val.clone();
-            self.olen = self.len;
-        }
         Ok(ProcessOutcome::complete())
     }
 
@@ -257,7 +277,13 @@ impl Record for LsoRecord {
             "LEN" => Some(EpicsValue::ULong(self.len)),
             "OLEN" => Some(EpicsValue::ULong(self.olen)),
             "IVOA" => Some(EpicsValue::Short(self.ivoa)),
-            "IVOV" => Some(EpicsValue::CharArray(self.ivov.clone().into_bytes())),
+            // `DBF_STRING size(40)` (`lsoRecord.dbd.pod:155-160`), the same
+            // plain 40-byte field `stringout` has — not a long string. VAL and
+            // OVAL above are the SIZV-sized buffers `lsoRecord.c:63` allocates;
+            // IVOV is `char ivov[40]` and must report the type it is declared,
+            // because `apply_fields` parses a `.db` value as the type the
+            // record stores.
+            "IVOV" => Some(EpicsValue::String(self.ivov.clone())),
             "OMSL" => Some(EpicsValue::Short(self.omsl)),
             "DOL" => Some(EpicsValue::String(self.dol.clone().into())),
             "SIMM" => Some(EpicsValue::Short(self.simm)),
@@ -309,14 +335,21 @@ impl Record for LsoRecord {
                     return Err(CaError::TypeMismatch("IVOA".into()));
                 }
             }
-            "IVOV" => match value {
-                EpicsValue::String(s) => self.ivov = s,
-                EpicsValue::CharArray(bytes) => {
-                    let end = bytes.iter().position(|&b| b == 0).unwrap_or(bytes.len());
-                    self.ivov = PvString::from_bytes(bytes[..end].to_vec());
-                }
-                _ => return Err(CaError::TypeMismatch("IVOV".into())),
-            },
+            // C `putStringString` (`dbConvert.c:923-926`) copies at most
+            // `field_size` bytes into a DBF_STRING and NUL-terminates the last
+            // one, so IVOV's 40-byte field holds 39 bytes of text however it is
+            // written.
+            "IVOV" => {
+                let s = match value {
+                    EpicsValue::String(s) => s,
+                    EpicsValue::CharArray(bytes) => {
+                        let end = bytes.iter().position(|&b| b == 0).unwrap_or(bytes.len());
+                        PvString::from_bytes(bytes[..end].to_vec())
+                    }
+                    _ => return Err(CaError::TypeMismatch("IVOV".into())),
+                };
+                self.ivov = truncate_bytes(s, MAX_STRING_SIZE - 1);
+            }
             "OMSL" => {
                 if let EpicsValue::Short(v) = value {
                     self.omsl = v;

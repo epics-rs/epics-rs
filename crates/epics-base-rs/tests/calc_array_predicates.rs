@@ -4,7 +4,7 @@
 //! - `ISINF` is an element-wise UNARY operator (`aCalcPerform.c:826`, :1085) —
 //!   an array operand yields an ARRAY result.
 //! - `FINITE` / `ISNAN` are VARARG reductions over EVERY element of EVERY
-//!   argument (`:1114-1120`, `:1138-1146`) — always a scalar result.
+//!   argument (`:1103-1109`, `:1127-1135`) — always a scalar result.
 //!
 //! Expectations are the compiled synApps `aCalcPerform` (arraySize 8).
 

@@ -31,16 +31,23 @@
 //! non-calc initial, to show the rule is the loader's and not a calc special
 //! case.
 
+mod module_records;
+
 use std::collections::HashMap;
 use std::collections::HashSet;
 
 use epics_base_rs::server::database::PvDatabase;
-use epics_base_rs::server::db_loader::create_record;
 use epics_base_rs::server::ioc_builder::IocBuilder;
+use epics_base_rs::server::records::acalcout::AcalcoutRecord;
+use epics_base_rs::server::records::scalcout::ScalcoutRecord;
+use epics_base_rs::server::records::swait::SwaitRecord;
 use epics_base_rs::types::EpicsValue;
 
 async fn build(db_text: &str) -> std::sync::Arc<PvDatabase> {
     IocBuilder::new()
+        .register_record_type("acalcout", || Box::new(AcalcoutRecord::default()))
+        .register_record_type("scalcout", || Box::new(ScalcoutRecord::default()))
+        .register_record_type("swait", || Box::new(SwaitRecord::default()))
         .db_string(db_text, &HashMap::new())
         .unwrap()
         .build()
@@ -195,7 +202,7 @@ fn the_record_factory_is_the_owner_of_the_dbd_initials() {
         ("scalcout", "CALC", ""), // no initial in the C dbd
         ("acalcout", "CALC", ""),
     ] {
-        let rec = create_record(record_type).unwrap();
+        let rec = module_records::create_any(record_type).unwrap();
         let got = match rec.get_field(field) {
             Some(EpicsValue::String(s)) => s.to_string(),
             other => panic!("{record_type}.{field} reads as {other:?}"),

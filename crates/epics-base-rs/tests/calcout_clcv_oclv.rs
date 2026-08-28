@@ -1,7 +1,7 @@
 //! R8-2 — calcout/scalcout/acalcout carry the CLCV/OCLV expression-validity
 //! fields, and they hold C's `postfix()` RETURN STATUS.
 //!
-//! C `calcoutRecord.c::special:326-345` (and sCalcoutRecord.c:462-482,
+//! C `calcoutRecord.c::special:326-345` (and sCalcoutRecord.c:462-481,
 //! aCalcoutRecord.c:469-491) does `prec->clcv = postfix(prec->calc, ...)`,
 //! posts DBE_VALUE for the field, and returns 0 — the put is ACCEPTED with a
 //! garbage expression, unlike calcRecord, which fails it (R8-1). The stored

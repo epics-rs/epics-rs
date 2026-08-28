@@ -5,7 +5,7 @@
 //! `aCalcPostfix.c:434,808`), and the empty expression IS that program in sCalc
 //! and aCalc (`sCalcPostfix.c:432-434`, `aCalcPostfix.c:439-441`). Every
 //! evaluator then refuses to run it: `calcPerform` leaves the stack empty and
-//! fails its closing `ptop != stack + 1` test (`calcPerform.c:419-420`), and the
+//! fails its closing `ptop != stack + 1` test (`calcPerform.c:418-419`), and the
 //! synApps two check `*post == END_EXPRESSION` up front (`sCalcPerform.c:396`,
 //! `aCalcPerform.c:312-314`).
 //!

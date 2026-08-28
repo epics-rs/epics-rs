@@ -1,10 +1,10 @@
 //! R14-62: a failed OUT/SIOL link put raises LINK_ALARM/INVALID on the WRITING
 //! record, in the SAME processing cycle.
 //!
-//! C `dbPutLink` (dbLink.c:434-448) — and its async twin `dbPutLinkAsync`
-//! (:459-471) — call `setLinkAlarm(plink)` on a nonzero `putValue` status;
+//! C `dbPutLink` (dbLink.c:432-446) — and its async twin `dbPutLinkAsync`
+//! (:457-469) — call `setLinkAlarm(plink)` on a nonzero `putValue` status;
 //! `setLinkAlarm` is `recGblSetSevrMsg(precord, LINK_ALARM, INVALID_ALARM,
-//! "field %s", dbLinkFieldName(plink))` (dbLink.c:318-323). The raise lands in
+//! "field %s", dbLinkFieldName(plink))` (dbLink.c:316-321). The raise lands in
 //! the record's PENDING alarm (`nsta`/`nsev`), and record `process()` runs
 //! `checkAlarms` → `writeValue` → `monitor()` (aoRecord.c:196-232), so the
 //! cycle's `recGblResetAlarms` inside `monitor()` commits it — the alarm is
@@ -102,7 +102,7 @@ async fn r14_62_failing_local_out_put_raises_link_invalid_same_cycle() {
         alarm_of(&db, "AO_BADOUT").await,
         (alarm_status::LINK_ALARM, AlarmSeverity::Invalid),
         "a failed OUT put must raise LINK/INVALID in the cycle that performed it \
-         (dbLink.c:434-448 setLinkAlarm inside dbPutLink)"
+         (dbLink.c:432-446 setLinkAlarm inside dbPutLink)"
     );
 }
 
@@ -159,7 +159,7 @@ async fn r14_62_failing_siol_sim_write_raises_link_invalid() {
 
 /// Boundary 4 — recovery. The alarm is PENDING state, re-raised per cycle by
 /// the put that fails; once the put succeeds, the next `recGblResetAlarms`
-/// commits NO_ALARM (recGbl.c:186-220: `nsta`/`nsev` are re-initialised to 0
+/// commits NO_ALARM (recGbl.c:197-200: `nsta`/`nsev` are re-initialised to 0
 /// at the end of every commit). A latched alarm would stay INVALID forever.
 #[epics_macros_rs::epics_test]
 async fn r14_62_successful_put_next_cycle_clears_the_link_alarm() {
@@ -194,8 +194,8 @@ async fn r14_62_successful_put_next_cycle_clears_the_link_alarm() {
         .unwrap();
 
     // A plain OUT put is staged on the link-put queue and the record returns
-    // — C `dbCaPutLink` does the same (`dbCa.c:622-624`), and the wire write
-    // happens on the `dbCaTask`. `dbCaSync` (`dbCa.c:1191-1194`) is the
+    // — C `dbCaPutLink` does the same (`dbCa.c:593-595`), and the wire write
+    // happens on the `dbCaTask`. `dbCaSync` (`dbCa.c:1126-1129`) is the
     // barrier that makes it observable.
     db.sync_external_link_puts().await;
 

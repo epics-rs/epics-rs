@@ -148,7 +148,7 @@ pub struct ASubRecord {
     pub onam: PvString,
     /// This cycle's C `process` status, delivered by the framework's single
     /// `do_sub` owner through [`Record::set_subroutine_status`]. C pushes every
-    /// OUT link only under `if (!status)` (aSubRecord.c:232-239), so this is the
+    /// OUT link only under `if (!status)` (aSubRecord.c:234-240), so this is the
     /// whole gate: `0` drives OUTA..OUTU, anything else drives nothing. A record
     /// that has never processed starts non-zero — no outputs before the first
     /// successful `do_sub`.
@@ -570,7 +570,7 @@ impl Record for ASubRecord {
             // writes INTO the FTVx-typed NOVx-element buffer, so no other
             // shape can leave `do_sub`, and the OUT push reads that buffer
             // (`dbPutLink(&(&prec->outa)[i], (&prec->ftva)[i], ...)`,
-            // aSubRecord.c:236-238). NEVx tracks the elements written.
+            // aSubRecord.c:237-239). NEVx tracks the elements written.
             "VAL" => match shape_channel_value(value, self.ftva[idx], self.nova[idx]) {
                 ChannelDelivery::Delivered { value, count } => {
                     self.neva[idx] = count;
@@ -757,7 +757,7 @@ impl Record for ASubRecord {
         self.sub_status = status;
     }
 
-    /// C `aSubRecord.c::process` (232-239) pushes EVERY output link once the
+    /// C `aSubRecord.c::process` (234-240) pushes EVERY output link once the
     /// cycle's status is 0:
     ///
     /// ```c
@@ -1085,10 +1085,10 @@ mod tests {
     /// EFLG loads from a `.db` menu label (C `field(EFLG,"ALWAYS")`).
     #[test]
     fn eflg_loads_from_menu_label() {
-        use crate::server::db_loader::{apply_fields, create_record};
+        use crate::server::db_loader::{DbFieldDef, apply_fields, create_record};
         let mut rec = create_record("aSub").unwrap();
         let mut common = Vec::new();
-        apply_fields(&mut rec, &[("EFLG".into(), "ALWAYS".into())], &mut common)
+        apply_fields(&mut rec, &[DbFieldDef::new("EFLG", "ALWAYS")], &mut common)
             .expect("EFLG menu label must load");
         assert_eq!(rec.get_field("EFLG"), Some(EpicsValue::Short(2)));
     }
@@ -1151,14 +1151,14 @@ mod tests {
     /// (the loader writes through `put_field`, bypassing the runtime gate).
     #[test]
     fn lflg_subl_load_from_db() {
-        use crate::server::db_loader::{apply_fields, create_record};
+        use crate::server::db_loader::{DbFieldDef, apply_fields, create_record};
         let mut rec = create_record("aSub").unwrap();
         let mut common = Vec::new();
         apply_fields(
             &mut rec,
             &[
-                ("LFLG".into(), "READ".into()),
-                ("SUBL".into(), "NAME_HOLDER".into()),
+                DbFieldDef::new("LFLG", "READ"),
+                DbFieldDef::new("SUBL", "NAME_HOLDER"),
             ],
             &mut common,
         )

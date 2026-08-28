@@ -70,7 +70,7 @@ fn check_put_disabled(
 /// The declaration itself lives in [`RecordInstance::is_no_mod`](crate::server::record::RecordInstance::is_no_mod), which C
 /// exposes as `dbChannelSpecial(...) == SPC_NOMOD` and reads from TWO places:
 /// this gate (`dbPut`, dbAccess.c:123-126) and `rsrvCheckPut`
-/// (camessage.c:2608-2619), which feeds the CA ACCESS_RIGHTS write bit. This
+/// (camessage.c:2540-2551), which feeds the CA ACCESS_RIGHTS write bit. This
 /// function is the first consumer; `epics-ca-rs`'s `compute_access` is the
 /// second.
 ///
@@ -112,6 +112,109 @@ fn check_not_link_field(
         )));
     }
     Ok(())
+}
+
+/// C `dbPutFieldLink`'s parse-and-type gate (`dbAccess.c:1098-1135`) — the
+/// half of `dbPutField` that only a link field reaches.
+///
+/// `dbPutField` routes on the DECLARED DBF class and on nothing else: `if
+/// (dbfType >= DBF_INLINK && dbfType <= DBF_FWDLINK) return
+/// dbPutFieldLink(...)` (`dbAccess.c:1259-1260`). `dbPutFieldLink` then parses
+/// the text (`dbParseLink`, `:1098`) and holds it to `dbCanSetLink` (`:1131`)
+/// against the device support the record's CURRENT `DTYP` binds — only `INP`
+/// and `OUT` have one, so every other link field is held to `CONSTANT`, which
+/// `dbCanSetLink` treats as interchangeable with `PV_LINK` and `JSON_LINK`
+/// (`dbStaticLib.c:2408-2416`). A mismatch is `S_dbLib_badField`: the field
+/// keeps the text it had, the record is not touched, and NOTHING is printed —
+/// the refusal reaches the caller only as the put's status.
+///
+/// The port ran this rule from `put_common_field`'s `INP` and `OUT` arms, and
+/// a pair of arms is a name list: `SDIS`, `TSEL`, `FLNK`, `SIML`, `SIOL`,
+/// `calc.INPA`, `ao.DOL` and `fanout.LNK1` all stored what C refuses, through
+/// `dbpf` and through CA alike. Keyed on the class here, beside
+/// [`check_not_link_field`], both `dbPutField`-analogue bodies take the rule
+/// from one owner and a link field the generator adds is covered the day it is
+/// declared rather than the day someone remembers it.
+///
+/// Runs ABOVE [`check_no_mod`], because C's link route leaves `dbPutField`
+/// before `dbPut` is called at all (`dbAccess.c:1259` vs `:1262`) and the
+/// `SPC_NOMOD` refusal a link field can still take arrives later, from
+/// `dbPutSpecial(paddr, 0)` at `dbAccess.c:1174`. `aSub.SUBL` is the one field
+/// in the vendored population where that order is visible — `DBF_INLINK` and
+/// `special(SPC_NOMOD)` both (`aSubRecord.dbd.pod:148-153`), pinned by
+/// `asub_subl_is_the_only_read_only_link_field` — and it is visible as the
+/// STATUS: C answers `S_dbLib_badField` to `dbpf ASUB.SUBL "@instio p"`, where
+/// a no-mod-first order would answer `S_db_noMod`. A type-valid text on the
+/// same field reaches the no-mod gate and is refused there, as in C.
+///
+/// Takes the record's DECLARATION pair rather than the instance, because that
+/// is the whole of C's input here — `dbPutFieldLink` reads `paddr->precord`
+/// only for its `DTYP`-bound `devSup` — and because a rule stated over
+/// `(record_type, dtyp)` can be swept over every type the generator emits
+/// without instantiating any of them, which is what
+/// `every_declared_link_class_field_is_gated_by_class` does.
+///
+/// Returns the value to STORE rather than a bare verdict, because in C the
+/// text the gate parses and the text the field ends up holding are the same
+/// buffer — `dbParseLink` and `dbSetLink` both read `pstring`
+/// (`dbAccess.c:1098`, `:1176`). Answering only "may this proceed?" and
+/// letting the store path re-derive its own text is what let a
+/// `DBR_CHAR` NUL — C's way of spelling "clear this link" — land as the
+/// literal `"0"`. `None` means `field` is not a link field and the caller's
+/// own value stands.
+///
+/// `dtyp` is the record's `DTYP` text, empty when the `.db` never spelled it;
+/// `field` must already be upper-cased.
+fn check_link_put(
+    record_type: &str,
+    dtyp: &str,
+    field: &str,
+    value: &EpicsValue,
+) -> CaResult<Option<EpicsValue>> {
+    if crate::types::dbf_link_class(record_type, field).is_none() {
+        return Ok(None);
+    }
+    // C's request-type switch (`dbAccess.c:1084-1096`), which is the whole of
+    // what a link field accepts: `DBR_STRING`, or a `DBR_CHAR`/`DBR_UCHAR`
+    // buffer whose LAST element is the NUL — `pstring[nRequest - 1] != '\0'`
+    // is `S_db_badDbrtype`, and so is every other request type. Measured
+    // against softIoc R7.0.10 on SDIS, INPA, OUT and LNK1: a `DBR_DOUBLE`,
+    // `DBR_LONG`, `DBR_SHORT` or `DBR_ENUM` put fails the channel write and
+    // leaves the link alone, where the same put to a plain `DBF_STRING` field
+    // (`DESC`) is converted and stored.
+    let bad_type = || {
+        CaError::BadDbrType(format!(
+            "dbPutFieldLink: {field} takes a string or a NUL-terminated char array"
+        ))
+    };
+    let text = match value {
+        EpicsValue::String(s) => s.as_str_lossy().into_owned(),
+        // `DBR_STRING` with `nRequest > 1`: C reads `pstring` and so takes the
+        // first string, without objecting to the count.
+        EpicsValue::StringArray(v) => v
+            .first()
+            .map(|s| s.as_str_lossy().into_owned())
+            .unwrap_or_default(),
+        // `nRequest == 1`, so the one byte IS `pstring[nRequest - 1]` and must
+        // be the terminator; the link text is then empty, which is how a CA
+        // client clears a link with a single NUL.
+        EpicsValue::Char(b) | EpicsValue::UChar(b) => {
+            if *b != 0 {
+                return Err(bad_type());
+            }
+            String::new()
+        }
+        EpicsValue::CharArray(b) | EpicsValue::UCharArray(b) => {
+            if b.last() != Some(&0) {
+                return Err(bad_type());
+            }
+            let end = b.iter().position(|&c| c == 0).unwrap_or(b.len());
+            String::from_utf8_lossy(&b[..end]).into_owned()
+        }
+        _ => return Err(bad_type()),
+    };
+    crate::server::record::check_link_assignment(record_type, Some(dtyp), field, &text)?;
+    Ok(Some(EpicsValue::String(text.into())))
 }
 
 /// Does an *external* put to `field` drive a processing cycle on this record?
@@ -158,7 +261,10 @@ pub(crate) fn put_drives_processing_of(
 ///
 /// One owner, so the two put-path drains (the normal tail, and the failing
 /// `special()` above) cannot disagree about the mask mapping.
-fn emit_cycle_posts(instance: &mut crate::server::record::RecordInstance) {
+fn emit_cycle_posts(
+    instance: &mut crate::server::record::RecordInstance,
+    backing: crate::server::database::LinkBacking<'_>,
+) {
     use crate::server::record::{CyclePostMask, EventMask};
     for (sf, cycle_mask) in instance.record.take_cycle_posted_fields() {
         let mask = match cycle_mask {
@@ -170,16 +276,16 @@ fn emit_cycle_posts(instance: &mut crate::server::record::RecordInstance) {
                 EventMask::VALUE | EventMask::LOG
             }
         };
-        instance.notify_field(sf, mask);
+        instance.notify_field_backed(sf, mask, backing);
     }
 }
 
 /// The registry half of a SNAM `special()` — C `subRecord.c::special`
-/// (`:170-195`) and `aSubRecord.c::special` (`:552-578`), which resolve
+/// (`:170-194`) and `aSubRecord.c::special` (`:552-578`), which resolve
 /// `prec->snam` through `registryFunctionFind` and assign `prec->sadr`.
 ///
 /// C runs it as `dbPutSpecial(paddr, 1)`, AFTER the field is stored
-/// (`dbAccess.c:1355-1404`), so the name resolved is the STORED one:
+/// (`dbAccess.c:1350-1403`), so the name resolved is the STORED one:
 /// `putStringString` truncates a DBF_STRING put to `field_size - 1` — 39 for
 /// sub's `size(40)`, 40 for aSub's `size(41)` — and C looks up whatever
 /// survived that. Resolving the value the caller handed in would bind a
@@ -206,9 +312,10 @@ fn emit_cycle_posts(instance: &mut crate::server::record::RecordInstance) {
 ///
 /// `RecordInstance::new` initialises the field to `None`, which is the initial
 /// state and not a transition. `put_pv_no_process` (the autosave-restore entry)
-/// writes SNAM while running NEITHER `special()` pass, so it leaves the binding
-/// stale — a whole missing `dbPutSpecial`, not this rule's half. The remaining
-/// writers are `#[test]` fixtures binding a routine without a registry.
+/// used to write SNAM while running NEITHER `special()` pass and so left the
+/// binding stale; it reaches this owner through [`special_after_put`] like
+/// every other put route. The remaining writers are `#[test]` fixtures binding
+/// a routine without a registry.
 fn snam_special_after_put(
     db: &PvDatabase,
     instance: &mut crate::server::record::RecordInstance,
@@ -223,12 +330,17 @@ fn snam_special_after_put(
     let name = stored.as_str_lossy();
     if name.is_empty() {
         // aSub: `pfunc = 0` with no error, so `caput X.SNAM ""` unbinds and
-        // succeeds (`aSubRecord.c:560-561`, stored at `:575`). sub's C leaves
-        // `sadr` alone and parks PACT instead (`subRecord.c:182-186`); this
-        // port clears, because
-        // the put-side park is not implemented here and a retained routine would
-        // keep RUNNING every scan where C's parked record does nothing at all.
-        instance.subroutine = None;
+        // succeeds (`aSubRecord.c:560-561`, stored at `:575`). sub's C returns
+        // at `subRecord.c:182-186` — `epicsPrintf`, `pact = TRUE` — WITHOUT
+        // reaching the `sadr` assignment, so the routine stays bound and the
+        // park is what stops it running. `parks_pact()` is that distinction:
+        // the record answering yes has just entered the parked state this put
+        // created. Clearing there too would make `RecordInstance::subroutine`
+        // mean either "nothing bound" or "a parked record's retained routine"
+        // depending on the record type.
+        if !instance.record.parks_pact() {
+            instance.subroutine = None;
+        }
         return Ok(());
     }
     let resolved = db.find_subroutine_named(name.as_ref());
@@ -253,6 +365,15 @@ fn snam_special_after_put(
 /// Every `dbPut` path in this module goes through here; nothing else may call
 /// `Record::special(field, true)`.
 ///
+/// It runs whether or not the store landed. C brackets it with
+/// `/* Always do special processing if needed */` (`dbAccess.c:1398`) and
+/// `if (status2) status = status2;` (`:1401-1402`), so on a refused store the
+/// pass still runs and its status REPLACES the store's; `if (status) goto done`
+/// (`:1404`) then skips the UDF clear and the field's monitor post. That is
+/// also what keeps the pair balanced: [`special_before_put`] has already
+/// latched OLDSIMM through `recGblSaveSimm`, and a store error returning
+/// between the two would leave the latch with nothing to consume it.
+///
 /// Returns the scan-index delta the after-put pass produced — non-`NoChange`
 /// only for the SIMM↔SSCN swap below, which the caller applies through
 /// `update_scan_index` once the record lock is down.
@@ -261,6 +382,7 @@ fn special_after_put(
     instance: &mut crate::server::record::RecordInstance,
     field: &str,
     out: &mut Vec<crate::server::record::ProcessAction>,
+    backing: crate::server::database::LinkBacking<'_>,
 ) -> CaResult<crate::server::record::CommonFieldPutResult> {
     let mut status = instance.record.special(field, true);
     // The record's half above and the registry half here are ONE C function,
@@ -271,6 +393,13 @@ fn special_after_put(
         status = snam_special_after_put(db, instance, field);
     }
     out.extend(instance.record.take_special_actions());
+    // C's `prec->udf = FALSE` written from inside `special()` — histogram's
+    // `clear_histogram` (`histogramRecord.c:361`) is the only one. Drained here
+    // and unconditionally for the same reason the actions above are: C performs
+    // the assignment before any status can divert `dbPut`.
+    if instance.record.take_udf_clear() {
+        instance.common.udf = 0;
+    }
     if status.is_err() {
         // The POSTS `special()` made are drained on the failing path for the same
         // reason its ACTIONS are: C's `special()` calls `db_post_events` BEFORE it
@@ -278,13 +407,13 @@ fn special_after_put(
         // `DBE_VALUE` and only then `return (-1)` (`aCalcoutRecord.c:495-499`) —
         // and `dbPut`'s `goto done` skips only dbPut's OWN post. A refused put
         // that repaired a field must still tell the subscribers what it repaired.
-        emit_cycle_posts(instance);
+        emit_cycle_posts(instance, backing);
     }
     status?;
 
-    // C `special()`'s CONSTANT-link re-seed (`calcoutRecord.c:367-378`,
-    // `sCalcoutRecord.c:512-517`, `aCalcoutRecord.c:534-540`,
-    // `transformRecord.c:714-719` — the four records whose C `special()` calls
+    // C `special()`'s CONSTANT-link re-seed (`calcoutRecord.c:373-378`,
+    // `sCalcoutRecord.c:513-518`, `aCalcoutRecord.c:533-538`,
+    // `transformRecord.c:715-723` — the four records whose C `special()` calls
     // `recGblInitConstantLink`): a put that leaves an input link constant
     // re-runs the load into that input's value field and posts it. Without it a
     // constant link is load-once dead state — the link layer delivers nothing
@@ -301,7 +430,9 @@ fn special_after_put(
         // The mask is the C call site's, and they disagree — calcout posts a
         // literal DBE_VALUE, transform DBE_VALUE|DBE_LOG. The record carries it.
         let mask = instance.record.special_reseed_post_mask();
-        instance.notify_field(value_field, mask);
+        // `value_field` is the calc-class value slot behind the link just
+        // written (`INPA` -> `A`), i.e. exactly a link-backed field.
+        instance.notify_field_backed(value_field, mask, backing);
     }
 
     // C `special(SPC_MOD)` pass 1 on SIMM (`longinRecord.c:171-177` and the
@@ -338,12 +469,31 @@ fn special_after_put(
 /// cannot process, so the store about to happen gets a clean slate and
 /// [`special_after_put`] re-takes the park if the NEW value still leaves the
 /// record unable to run. The record cannot reach PACT, so it answers
-/// [`Record::parks_pact`](crate::server::record::Record::parks_pact) and this performs the transition; the returned
-/// [`PactExit`](crate::server::record::PactExit) carries any put-notify the release freed.
-fn special_before_put(
-    instance: &mut crate::server::record::RecordInstance,
-    field: &str,
-) -> Option<crate::server::record::PactExit> {
+/// [`Record::parks_pact`](crate::server::record::Record::parks_pact) and this performs the transition.
+///
+/// The release returns NOTHING to the caller, deliberately. C's `special` here
+/// is the two stores and no more — it does not call `dbNotifyCompletion`, and
+/// nothing else on a `dbPut` path does either. `restartCheck` has six call sites
+/// in `dbNotify.c`, and none is reachable from a put body: `:461` and `:465` are
+/// `dbNotifyCompletion`, the cycle tail; `:430` and `:434` are `dbNotifyCancel`
+/// (the symbol is `dbNotifyCancel`, `:385` — there is no `dbProcessNotifyCancel`
+/// in base) and `:290` is `notifyCallback`'s `cancelWait` branch, so a cancel;
+/// `:266` is neither — it sits in `processNotifyCommon` on the
+/// `notifyRestartCallbackRequested` arm, which is entered only from the callback
+/// (`:298`, `first == 0`) or from `dbProcessNotify` (`:382`, `first == 1`) and
+/// never from a field store. A put-notify parked on this record therefore stays
+/// parked across the release and is replayed by the record's NEXT cycle tail,
+/// through `PvDatabase::end_process_cycle` → `apply_pact_exit`, the single drain
+/// of `RecordInstance::notify_restart_list`.
+///
+/// So the `PactExit` this mints is dropped on purpose and loses nothing: the
+/// queue is on the record, and `RecordInstance::pact_exit_without_release`
+/// re-derives the bit at that tail. Do not re-add a put-body consumer for it —
+/// arming here is what made a `caput SUB.SNAM` complete a put-callback C leaves
+/// outstanding, and the cycle-ordering patch that contained the damage
+/// (a caller-declared `RestartOwner`) promised a cycle two frames before
+/// `write_db_link_value` decides whether one runs.
+fn special_before_put(instance: &mut crate::server::record::RecordInstance, field: &str) {
     if field == "SIMM" {
         instance.rec_gbl_save_simm();
     }
@@ -352,93 +502,7 @@ fn special_before_put(
         && instance.is_processing()
     {
         instance.common.rpro = 0;
-        return Some(instance.leave_pact());
-    }
-    None
-}
-
-/// Who arms the queued put-notify restart that a PACT release owes.
-///
-/// C reaches `restartCheck` only from `dbNotifyCompletion` ← `recGblFwdLink`
-/// (`recGbl.c:295`) — the tail of a process CYCLE, never the `pact = FALSE`
-/// store itself. A put body that arms it directly is therefore only correct
-/// when no cycle follows the put; when one does, the replay races it.
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum RestartOwner {
-    /// The put is the whole transaction. Nothing else will reach the record,
-    /// so the put body is the only site that can arm the restart.
-    ThisPut,
-    /// The caller drives a process cycle on the SAME record the moment this
-    /// put returns — an OUT link's `processTarget`, QSRV's `Force` mode. That
-    /// cycle's tail is C's owner; arming here lets the replay take the
-    /// record's gate first and the record then processes the replayed put
-    /// BEFORE the put that released the park (measured: `bump` twice, VAL 5.0
-    /// where C gives 4.0).
-    TheCycleThisPutOwes,
-}
-
-/// The finalizer for the PACT release [`special_before_put`] performs.
-///
-/// Declared BEFORE the `rec.write()` guard at every put body, so Rust's
-/// reverse-declaration drop order puts the record's DATA lock down first and
-/// this second. `PvDatabase::apply_pact_exit` re-enters the record it is handed;
-/// `parking_lot::RwLock` is not reentrant, so arming the restart from inside the
-/// put's own write guard is a deadlock, not an error.
-///
-/// A guard and not a call because the release sits ABOVE the fallible tail of
-/// the put — `special_after_put`, `put_common_field`, the rejected-conversion
-/// `Err` — and C `dbNotifyCompletion` is reached from `recGblFwdLink` on EVERY
-/// path that ends the cycle. Nothing reports a token that never reaches the
-/// consumer: [`PactExit`](crate::server::record::PactExit) has no `Drop`, and
-/// its `#[must_use]` fires only on an unused *expression*, never on a
-/// `let`-bound token left behind by a `?`. The guard is the whole enforcement.
-///
-/// The cycle body has the same debt at a different scope; its owner is
-/// `processing::CycleEndGuard`, which pays the full `end_process_cycle` tail
-/// rather than the restart drain alone.
-struct PactExitGuard<'a> {
-    db: &'a PvDatabase,
-    name: &'a str,
-    rec: &'a std::sync::Arc<parking_lot::RwLock<crate::server::record::RecordInstance>>,
-    exit: Option<crate::server::record::PactExit>,
-    owner: RestartOwner,
-}
-
-impl<'a> PactExitGuard<'a> {
-    fn new(
-        db: &'a PvDatabase,
-        name: &'a str,
-        rec: &'a std::sync::Arc<parking_lot::RwLock<crate::server::record::RecordInstance>>,
-        owner: RestartOwner,
-    ) -> Self {
-        PactExitGuard {
-            db,
-            name,
-            rec,
-            exit: None,
-            owner,
-        }
-    }
-
-    /// Take the token [`special_before_put`] produced, if it released a park.
-    fn arm(&mut self, exit: Option<crate::server::record::PactExit>) {
-        self.exit = exit;
-    }
-}
-
-impl Drop for PactExitGuard<'_> {
-    fn drop(&mut self) {
-        let Some(exit) = self.exit.take() else {
-            return;
-        };
-        // `TheCycleThisPutOwes` drops the token on purpose and loses nothing:
-        // the tail re-derives it from the record
-        // (`RecordInstance::pact_exit_without_release` reads
-        // `notify_restart_pending()` at cycle end), so the restart is armed
-        // once, by C's owner, in C's order.
-        if self.owner == RestartOwner::ThisPut {
-            self.db.apply_pact_exit(self.name, self.rec, exit);
-        }
+        let _ = instance.leave_pact();
     }
 }
 
@@ -459,11 +523,12 @@ fn pact_park_field(record: &dyn crate::server::record::Record, field: &str) -> b
 /// Commits the alarm, posts any STAT/SEVR/AMSG/ACKS transition through the one
 /// owner ([`crate::server::database::processing::alarm_field_posts`]), and
 /// returns the `DBE_ALARM` mask C ORs into the value posts (`val_mask`,
-/// recGbl.c:213 — set iff any alarm-class field moved this cycle).
+/// recGbl.c:212 — set iff any alarm-class field moved this cycle).
 ///
 /// Shared by `dbPut`'s success tail and its rejected-conversion path: C runs
-/// `dbPutSpecial(paddr, 1)` on BOTH (dbAccess.c:83-88, "Always do special
-/// processing if needed", before the `goto done` that bails on a failed put).
+/// `dbPutSpecial(paddr, 1)` on BOTH (dbAccess.c:1398-1404, "Always do special
+/// processing if needed", before the `goto done` that bails on a failed put) —
+/// a conversion that sets `status` at :1362/:1386 does NOT jump over it.
 fn commit_special_reset_alarm(
     instance: &mut crate::server::record::RecordInstance,
 ) -> crate::server::recgbl::EventMask {
@@ -496,48 +561,76 @@ fn coerce_write_value(
     field: &str,
     target: crate::types::DbFieldType,
     value: EpicsValue,
-) -> CaResult<EpicsValue> {
+) -> CaResult<crate::types::c_parse::Converted> {
     crate::server::record::coerce_put_value(record, field, target, value)
 }
 
 /// What a `dbPut` of a given value means for a given field — the single owner
-/// of C `dbPut`'s value branch (`dbAccess.c:1345-1372`).
+/// of C `dbPut`'s value branch (`dbAccess.c:1350-1391`, tag `R7.0.10`).
 enum PutRequest {
     /// Write this value; already coerced to the field's native type.
     Write(EpicsValue),
-    /// A zero-element request (`nRequest < 1`) into a **scalar** destination.
+    /// C stored nothing and the put still returns **success** — `status` stays
+    /// 0 either way. Two converters reach it: the ZERO-element request below,
+    /// and `cvt_st_ul`'s skipped store
+    /// ([`crate::types::c_parse::Converted::Unchanged`]), where the double
+    /// fallback parsed but landed outside `0..=UINT_MAX`.
     ///
-    /// C writes nothing, raises `LINK_ALARM`/`INVALID_ALARM` on the record, and
-    /// returns **success** — `status` stays 0, so the put is accepted and the
-    /// record's next `recGblResetAlarms` publishes the new alarm
-    /// (`dbAccess.c:1370-1372`, commit `12cfd418d`, whose subject is "fix dbPut
-    /// to *set* the target to INVALID/LINK alarm when writing empty arrays into
-    /// scalars" — not to reject the put).
-    EmptyIntoScalar,
+    /// `alarm` is the SCALAR arm's `recGblSetSevr(precord, LINK_ALARM,
+    /// INVALID_ALARM)` (`dbAccess.c:1370-1371`, commit `12cfd418d`, whose
+    /// subject is "fix dbPut to *set* the target to INVALID/LINK alarm when
+    /// writing empty arrays into scalars" — not to reject the put). The ARRAY
+    /// arm never reaches that line, so a zero-length request into a
+    /// `special(SPC_DBADDR)` field raises nothing.
+    StoreNothing { alarm: bool },
 }
 
 /// Resolve a put into its C `dbPut` branch.
 ///
-/// C picks the branch from the **destination's** element count
-/// (`dbAccess.c:1345` `no_elements > 1`): an array field clamps `nRequest` and
-/// converts — a zero-length request copies nothing and succeeds silently — while
-/// a scalar field with `nRequest < 1` takes the alarm branch. The test is on the
-/// request count and the destination, never on whether a type conversion happens
-/// to be needed.
+/// C picks the arm at `dbAccess.c:1350`:
+/// `if (nRequest>1 || paddr->pfldDes->special == SPC_DBADDR)`. Two independent
+/// tests, and neither is `no_elements`, which appears only in the ARRAY arm's
+/// clamp at `:1360` (`if (no_elements < nRequest) nRequest = no_elements;`).
+/// The `SPC_DBADDR` disjunct is the half that matters here: it sends a
+/// ZERO-length request into the array arm, where `dbPutConvertRoutine`
+/// (`:1362`) copies nothing, `put_array_info(paddr, 0)` (`:1367`) drops the
+/// valid length, `status` stays 0 and the put falls through to the UDF clear.
+/// The scalar arm's `recGblSetSevr(LINK_ALARM, INVALID_ALARM)` at `:1371` is
+/// therefore unreachable for an `SPC_DBADDR` field.
 ///
-/// [`FieldDesc`](crate::server::record::FieldDesc) carries no element count, so
-/// the destination's current value is the probe: an array-valued field reads
-/// back as an array variant. A field the record does not own (a `dbCommon`
-/// field, reached via `put_common_field`) reads back as `None` and is scalar,
-/// which is also what its `DBF_*` descriptor says in C.
+/// So the branch asks [`crate::server::record::FieldDeclaration::field_is_dbaddr`], the port's owner of
+/// the `.dbd` declaration. Keying it on the destination's CURRENT VALUE SHAPE
+/// instead is what made `caput -a MBBO.VAL 0` — `mbbo.VAL` is
+/// `special(SPC_DBADDR)` (`mbboRecord.dbd.pod:194`) but stored as a scalar —
+/// take the scalar arm and come back LINK/INVALID where the C IOC returns
+/// NO_ALARM.
+///
+/// The clamp keeps the value-shape probe, because that is the question C asks
+/// there: `no_elements` is the destination's capacity, and a field this port
+/// stores as a scalar has capacity 1. C's array arm with `nRequest > 1` into
+/// such a field clamps to one element and writes element 0, which is what
+/// reducing the array to [`EpicsValue::first_element`] produces.
 fn dbput_request(
     record: &dyn crate::server::record::Record,
     field: &str,
     value: EpicsValue,
 ) -> CaResult<PutRequest> {
+    use crate::server::record::FieldDeclaration;
+    // C `no_elements` for this destination: the count the ARRAY arm clamps to.
     let dest_is_array = record.get_field(field).is_some_and(|v| v.is_array());
-    if value.is_empty_array() && !dest_is_array {
-        return Ok(PutRequest::EmptyIntoScalar);
+    if value.is_empty_array() {
+        if !record.field_is_dbaddr(field) {
+            return Ok(PutRequest::StoreNothing { alarm: true });
+        }
+        // Array arm, `nRequest == 0`. A field this port stores as a Vec models
+        // `put_array_info(paddr, 0)` by storing the empty array — its NORD
+        // follows the value — and falls through to the coercion below. A
+        // `special(SPC_DBADDR)` field stored as a SCALAR (`mbbo.VAL`, an `aSub`
+        // channel at `NOA == 1`) has no valid length to drop, so it keeps the
+        // value C's zero-element copy left untouched.
+        if !dest_is_array {
+            return Ok(PutRequest::StoreNothing { alarm: false });
+        }
     }
     // The coercion target is the type the record STORES, not the type it
     // SERVES — `put_field`'s arms match on what is stored. A `menu()` field is
@@ -552,7 +645,7 @@ fn dbput_request(
         .or_else(|| crate::server::record::record_instance::declared_field_type_of(record, field));
 
     // C `dbPut` clamps the request to the destination's element count —
-    // `if (no_elements < nRequest) nRequest = no_elements;` (dbAccess.c:1359),
+    // `if (no_elements < nRequest) nRequest = no_elements;` (dbAccess.c:1360),
     // then converts `nRequest` elements. A multi-element request into a
     // one-element destination therefore writes element 0 and SUCCEEDS; the
     // surplus elements are dropped, not an error. Reduce the array to its
@@ -582,15 +675,43 @@ fn dbput_request(
         Some(target)
             if value.db_field_type() != target || target == crate::types::DbFieldType::String =>
         {
-            Ok(PutRequest::Write(coerce_write_value(
-                record, field, target, value,
-            )?))
+            match coerce_write_value(record, field, target, value)? {
+                crate::types::c_parse::Converted::Stored(v) => Ok(PutRequest::Write(v)),
+                // C's `cvt_st_ul` returned success without storing: the same
+                // "nothing stored, status still 0" arm the zero-element
+                // request takes, and with no `recGblSetSevr` — the converter
+                // never reaches `dbAccess.c:1371`.
+                crate::types::c_parse::Converted::Unchanged => {
+                    Ok(PutRequest::StoreNothing { alarm: false })
+                }
+            }
         }
         _ => Ok(PutRequest::Write(value)),
     }
 }
 
-/// Apply C's [`PutRequest::EmptyIntoScalar`] effect: the field is left
+/// C `dbAccess.c:1409-1410` — `isValueField = dbIsValueField(pfldDes);
+/// if (isValueField) precord->udf = FALSE;`.
+///
+/// The single owner of `dbPut`'s UDF clear, because in C there is one: the two
+/// lines sit AFTER the value branch has joined, so the arm that converted zero
+/// elements reaches them exactly as the arm that stored a value does. The only
+/// thing that skips them is a non-zero `status` — the `goto done` at `:1404`,
+/// which in this port is the early return out of `put_field` /
+/// `special_after_put`.
+///
+/// It clears `udf` and NOTHING else: stat/sevr keep their old UDF_ALARM until
+/// the record's own process cycle recomputes them (`rec_gbl_check_udf` no
+/// longer raises it once udf is clear, `rec_gbl_reset_alarms` commits the new
+/// state). A value put that drives no process therefore leaves the stale UDF
+/// alarm standing, as C does.
+fn clear_udf_on_value_put(instance: &mut crate::server::record::RecordInstance, field: &str) {
+    if instance.record.is_udf_defining_put(field) {
+        instance.common.udf = 0;
+    }
+}
+
+/// Apply the SCALAR arm's [`PutRequest::StoreNothing`] alarm: the field is left
 /// untouched and the record is driven to `LINK_ALARM`/`INVALID_ALARM`
 /// (`dbAccess.c:1371` `recGblSetSevr(precord, LINK_ALARM, INVALID_ALARM)`).
 fn set_empty_request_alarm(instance: &mut crate::server::record::RecordInstance) {
@@ -613,7 +734,7 @@ enum NotifyRequest {
     None,
     /// C `dbPutNotify` arriving fresh from a client: mint the wait-set channel.
     New,
-    /// C `dbNotify.c:207-231` restart: the client's receiver already exists,
+    /// C `dbNotify.c:213-224` restart: the client's receiver already exists,
     /// this replay carries its sender.
     Deferred(crate::runtime::sync::oneshot::Sender<()>),
 }
@@ -631,7 +752,7 @@ enum NotifyArrival {
     Fresh,
     /// `notifyCallback` -> `processNotifyCommon(ppn, precord, 0)`: already
     /// popped off the restart list by `take_next_notify_restart`, C
-    /// `restartCheck` (dbNotify.c:158-168).
+    /// `restartCheck` (dbNotify.c:149-170).
     Replay,
 }
 
@@ -685,6 +806,67 @@ impl NotifyRequest {
     }
 }
 
+/// The one claim on a record's put-notify slot for the whole gate-held CA put
+/// body, and the single finalizer every exit path out of it passes through.
+///
+/// C takes the ownership test (`if (precord->ppn ...)`, dbNotify.c:213) and
+/// the install (`precord->ppn = ppn`, `:257`) inside one `dbScanLock` region
+/// held across `putCallback`, and a record's whole link chain is in that same
+/// lock set, so nothing can observe the interval between them. This port's L1
+/// gate is per-RECORD, so `join_put_notify` — reached from ANOTHER record's
+/// chain (`links.rs:1517`, C `dbNotifyAdd`) — does not take it and could slip
+/// into that interval and take the slot. Claiming in the same critical section
+/// as the test closes the window: the slot is occupied from the test onward,
+/// which is why the "somebody took it while we were writing" arm the two
+/// dispatched park sites used to carry is gone rather than tested.
+///
+/// **Release is the default.** The wait-set is on the record from the claim
+/// onward — ahead of the DISP gate, the SPC_NOMOD gate, the conversion,
+/// `special()`, and every `?` in them — so a path that abandons the put must
+/// clear it or the record stays owned with no owner. `Drop` does that, and
+/// [`NotifyClaim::commit`] is the only way to keep it: none of the early
+/// returns carries a line of cleanup, and a new one cannot forget to.
+#[must_use = "dropping the claim releases the record's put-notify slot"]
+struct NotifyClaim<'a> {
+    rec: &'a std::sync::Arc<parking_lot::RwLock<crate::server::record::RecordInstance>>,
+    /// `None` once committed — the record processes under the set and owns its
+    /// release from then on (`complete_put_notify`, C `dbNotifyCompletion`).
+    set: Option<std::sync::Arc<crate::server::record::NotifyWaitSet>>,
+}
+
+impl NotifyClaim<'_> {
+    /// The put reached its process cycle: hand the wait-set over and stop
+    /// releasing it. From here the record's completion owns it
+    /// (`complete_put_notify`, C `dbNotifyCompletion`).
+    fn commit(mut self) -> std::sync::Arc<crate::server::record::NotifyWaitSet> {
+        self.set
+            .take()
+            .expect("a claim is committed exactly once, by value")
+    }
+
+    /// Same commit, for the two paths that drive a process cycle and then hand
+    /// the client an `Err` instead of the completion: a rejected PROC
+    /// conversion and "Cause B", a rejected write on the notify route.
+    ///
+    /// Committing is not a courtesy here, it is C: `putCallback` returns
+    /// `didPut = 1` even when the write failed (`dbNotify.c:528-530`), so
+    /// `processNotifyCommon` reaches `doProcess`, assigns `precord->ppn = ppn`
+    /// and processes (`:243-256`). The record therefore owns the set and its
+    /// own completion releases it; releasing here as well would clear a slot
+    /// the cycle is using.
+    fn commit_without_waiting(self) {
+        let _ = self.commit();
+    }
+}
+
+impl Drop for NotifyClaim<'_> {
+    fn drop(&mut self) {
+        if let Some(set) = self.set.take() {
+            self.rec.write().abandon_put_notify(&set);
+        }
+    }
+}
+
 /// Snapshot NORD before a `dbPut` writes the value field — C `put_array_info`
 /// opens with `epicsUInt32 nord = prec->nord;` (`waveformRecord.c:202-216`).
 ///
@@ -723,6 +905,7 @@ fn post_array_info(
     instance: &mut crate::server::record::RecordInstance,
     old_nord: &Option<EpicsValue>,
     origin: u64,
+    backing: crate::server::database::LinkBacking<'_>,
 ) {
     let Some(old) = old_nord else { return };
     let moved = instance
@@ -734,6 +917,7 @@ fn post_array_info(
             "NORD",
             crate::server::recgbl::EventMask::VALUE | crate::server::recgbl::EventMask::LOG,
             origin,
+            backing,
         );
     }
 }
@@ -763,7 +947,11 @@ fn post_array_info(
 /// may) apply the identical rule, exactly as C's one `dbPut` serves both
 /// `dbPutLink` and `dbPutField`. `process_passive_fields()` is total and
 /// fail-safe: any field of an unmodeled type (`&[]`) posts.
-fn dbput_post_put_field(instance: &mut crate::server::record::RecordInstance, field: &str) {
+fn dbput_post_put_field(
+    instance: &mut crate::server::record::RecordInstance,
+    field: &str,
+    backing: crate::server::database::LinkBacking<'_>,
+) {
     let suppress = field == instance.record.primary_field()
         && instance
             .record
@@ -772,11 +960,24 @@ fn dbput_post_put_field(instance: &mut crate::server::record::RecordInstance, fi
             .any(|f| f.eq_ignore_ascii_case(field));
     if !suppress {
         instance.cleanup_subscribers();
-        instance.notify_field(
+        instance.notify_field_backed(
             field,
             crate::server::recgbl::EventMask::VALUE | crate::server::recgbl::EventMask::LOG,
+            backing,
         );
     }
+}
+
+/// Does `record_type` declare a field called `field`?
+///
+/// C's `dbFindFieldPart` searches `papFldDes`, which is every field the
+/// `.dbd` declared including the spliced-in dbCommon and the `DBF_NOACCESS`
+/// internals — exactly what `record_declaration_order` carries. A record type
+/// the generated table does not know declares nothing, which is what C's
+/// `!precordType` guard answers too.
+fn declares_field(record_type: &str, field: &str) -> bool {
+    crate::server::record::dbd_generated::record_declaration_order(record_type)
+        .is_some_and(|names| names.contains(&field))
 }
 
 impl PvDatabase {
@@ -810,9 +1011,48 @@ impl PvDatabase {
         // Records — alias-aware via `get_record` (epics-base PR #336).
         if let Some(rec) = self.get_record(base) {
             let instance = rec.read();
-            return instance
-                .resolve_field(&field)
-                .ok_or_else(|| CaError::ChannelNotFound(name.to_string()));
+            // C `pvNameLookup` (`dbChannel.c:311-329`) resolves a field name
+            // against the record type's DECLARED field list first and falls
+            // through to `dbGetAttributePart` only on
+            // `S_dbLib_fieldNotFound`. So a record type that declares a field
+            // of the attribute's name — `motor.VERS` — shadows the attribute,
+            // and `RTYP`, which no record type declares, never is shadowed.
+            //
+            // The two tests are in this order because the attribute map holds
+            // two entries per type and the declared list holds hundreds: the
+            // cheap lookup decides whether the expensive one is needed at all.
+            let record_type = instance.record.record_type();
+            if let Some(value) = self.record_type_attribute(record_type, &field)
+                && !declares_field(record_type, &field)
+            {
+                return Ok(EpicsValue::String(value.into()));
+            }
+            if let Some(value) = instance.resolve_field(&field) {
+                return Ok(value);
+            }
+            // Resolve-ok-but-read-fail is a state of its own, and one
+            // `ChannelNotFound` cannot hold it. C `dbNameToAddr` resolves any
+            // field the `.dbd` declares, `DBF_NOACCESS` ones included, so a
+            // declared field's read reaches `dbGet` and fails THERE — its
+            // validity gate refuses `field_type > DBF_DEVICE` with
+            // `S_db_badDbrtype` — while an undeclared name never resolves at
+            // all. `dbgf` shows the two apart: `dbgf REC.TIME` prints a type
+            // header and then `failed.` (`dbTest.c:994-997`, reached only
+            // because the address resolved), where `dbgf REC.NOSUCH` prints
+            // "not found".
+            //
+            // The rule is the declaration, not the `DBF_NOACCESS` class: a
+            // field this record type declares but does not serve is the same
+            // state — present, unreadable — and C would likewise resolve it
+            // and fail the get. Naming the class here instead would put a
+            // second rule at the boundary.
+            return Err(if declares_field(record_type, &field) {
+                CaError::BadDbrType(format!(
+                    "dbGet: {name} is declared but has no readable value"
+                ))
+            } else {
+                CaError::ChannelNotFound(name.to_string())
+            });
         }
 
         Err(CaError::ChannelNotFound(name.to_string()))
@@ -844,22 +1084,7 @@ impl PvDatabase {
     /// This is the whole `dbPut` body — the gate-held region, and it is a
     /// `fn`. See `acquire_put_gate`.
     pub fn put_pv_already_locked(&self, name: &str, value: EpicsValue) -> CaResult<()> {
-        self.put_pv_body(name, value, RestartOwner::ThisPut)
-    }
-
-    /// [`Self::put_pv_already_locked`] for a caller that drives a process
-    /// cycle on the SAME record the moment this returns — an OUT link's
-    /// `processTarget`, QSRV's `Force` mode.
-    ///
-    /// The only difference is who arms a queued put-notify restart when this
-    /// put releases a PACT park: that cycle's tail, as in C, rather than this
-    /// put body. See `RestartOwner`.
-    pub fn put_pv_already_locked_before_process(
-        &self,
-        name: &str,
-        value: EpicsValue,
-    ) -> CaResult<()> {
-        self.put_pv_body(name, value, RestartOwner::TheCycleThisPutOwes)
+        self.put_pv_body(name, value)
     }
 
     /// Take the L1 advisory write gate a put to `name` needs, if any.
@@ -949,7 +1174,7 @@ impl PvDatabase {
     /// ([`crate::types::dbf_link_class`] keyed by the record's type). C
     /// callers split on it before choosing a put entry: `dbPutField` sends
     /// link fields to `dbPutFieldLink` (`dbAccess.c:1261`), `dbProcessNotify`
-    /// short-circuits them past the notify machinery (`dbNotify.c:337-353`),
+    /// short-circuits them past the notify machinery (`dbNotify.c:337-354`),
     /// and pvxs QSRV picks `dbChannelPutField` over `dbChannelPut` for them
     /// (`iocsource.cpp:451-458`). Port callers with a dbPutField-shaped
     /// entry make the same split against the `dbPut`-analogue bodies' refusal
@@ -964,9 +1189,14 @@ impl PvDatabase {
         crate::types::dbf_link_class(guard.record.record_type(), &field_upper).is_some()
     }
 
-    fn put_pv_body(&self, name: &str, value: EpicsValue, owner: RestartOwner) -> CaResult<()> {
+    fn put_pv_body(&self, name: &str, value: EpicsValue) -> CaResult<()> {
         let (base, field) = super::parse_pv_name(name);
         let field = field.to_ascii_uppercase();
+        // C `dbPutFieldLink` (`dbAccess.c:1261`): a write to a DBF link field
+        // relinks the target's lock set. The obligation is taken out here, so
+        // that every exit path below discharges it; see
+        // `record_lock.rs`'s `LinkFieldWrite`.
+        let _relink = self.link_field_write(base, &field);
 
         // Check simple PVs first. The lookup is its own statement so the
         // `!Send` directory guard is down before `pv.set(…).await` — see the
@@ -991,15 +1221,23 @@ impl PvDatabase {
             // below are inside the exclusion window in C and must be inside it
             // here. Shrinking the window to end at the value write would
             // re-open exactly the interleaving `lock_records` exists to close
-            // (`record_lock.rs`, "Rust port"). See
-            // `doc/rtems-priority-locks-design.md` §2, "the semantic question".
+            // (`record_lock.rs`, "Rust port").
             // Scoped guard: everything the put commits happens under this
             // write guard, which ends (releasing the `!Send` parking_lot
             // guard) before the tails below, which re-enter the database.
             // Yields the owned outputs those tails consume. Note this is the
             // record's DATA lock coming down, not the advisory gate above.
             use crate::server::record::CommonFieldPutResult;
-            let mut pact_exit = PactExitGuard::new(self, base, &rec, owner);
+            // C reads a link-backed field's metadata live inside the rset,
+            // under the TARGET record's lock; every poster below holds THIS
+            // record's lock and cannot reach for a second one. Resolved here,
+            // where no record lock is held, and handed down as a borrowed
+            // value that dies with this body — so a `caput CALC.A` carries the
+            // metadata `INPA`'s target has NOW, not what it had when the
+            // source last processed. Empty after one read lock for every
+            // record type but calc, calcout, sub, aSub and seq.
+            let link_backing = self.resolve_link_backed_metadata(&rec);
+            let link_backing = crate::server::database::LinkBacking::resolved(&link_backing);
             let (common_result, special_actions) = {
                 let mut instance = rec.write();
 
@@ -1021,7 +1259,7 @@ impl PvDatabase {
                 // C `dbPut` runs it on EVERY entry path — dbPutField and
                 // dbPutLink alike (dbAccess.c) — so the OUT-link route
                 // through this body must call it too (motor's drive-field
-                // DMOV blink, motorRecord.cc:2582-2608, fires on put-links
+                // DMOV blink, motorRecord.cc:2591-2620, fires on put-links
                 // in C). A non-zero status aborts the put like C.
                 instance.record.special(&field, false)?;
 
@@ -1045,13 +1283,18 @@ impl PvDatabase {
                 // suppressed and its stale UDF *alarm* stands until a process
                 // cycle recomputes stat/sevr.
                 let common_result = match request {
-                    // C `dbAccess.c:1370-1372` — accept, write nothing, alarm.
-                    PutRequest::EmptyIntoScalar => {
-                        set_empty_request_alarm(&mut instance);
+                    // C `dbAccess.c:1362` converted zero elements — nothing is
+                    // stored and the put is accepted. `alarm` is the scalar arm's
+                    // `:1371` only.
+                    PutRequest::StoreNothing { alarm } => {
+                        if alarm {
+                            set_empty_request_alarm(&mut instance);
+                        }
+                        clear_udf_on_value_put(&mut instance, &field);
                         CommonFieldPutResult::NoChange
                     }
                     PutRequest::Write(value) => {
-                        pact_exit.arm(special_before_put(&mut instance, &field));
+                        special_before_put(&mut instance, &field);
                         match instance.record.put_field(&field, value.clone()) {
                             Ok(()) => {
                                 instance.record.on_put(&field);
@@ -1067,22 +1310,27 @@ impl PvDatabase {
                                     &mut instance,
                                     &field,
                                     &mut special_actions,
+                                    link_backing,
                                 )?;
-                                // C `dbAccess.c::dbPut:1410-1411` clears ONLY
-                                // `precord->udf = FALSE` on a value-field put —
-                                // the same clear (and the same
-                                // `is_udf_defining_put` predicate) as the CA
-                                // route and `put_pv_and_post`. stat/sevr are NOT
-                                // touched: see the comment block above.
-                                if instance.record.is_udf_defining_put(&field) {
-                                    instance.common.udf = 0;
-                                }
+                                clear_udf_on_value_put(&mut instance, &field);
                                 result
                             }
                             Err(CaError::FieldNotFound(_)) => {
                                 instance.put_common_field(&field, value)?
                             }
-                            Err(e) => return Err(e),
+                            // A refused store does NOT skip the pass above:
+                            // C runs it either way (`dbAccess.c:1398`) and lets
+                            // its status win, then `goto done` — the `return`.
+                            Err(e) => {
+                                special_after_put(
+                                    self,
+                                    &mut instance,
+                                    &field,
+                                    &mut special_actions,
+                                    link_backing,
+                                )?;
+                                return Err(e);
+                            }
                         }
                     }
                 };
@@ -1112,29 +1360,29 @@ impl PvDatabase {
 
                 // Invalidate metadata cache only if the metadata-class
                 // field's value actually changed (faac1df1).
-                instance.notify_field_written_if_changed(&field, prev_value.as_ref());
+                instance.notify_field_written_if_changed(&field, prev_value.as_ref(), link_backing);
 
-                // C `dbPut:1408-1414`'s field-monitor post, through the one owner
+                // C `dbPut:1408-1413`'s field-monitor post, through the one owner
                 // (`dbput_post_put_field`, shared with the CA route). `put_pv`
                 // is the `dbPutLink` route's `dbPut` and the internal driver-put
                 // entry, and C posts DBE_VALUE|DBE_LOG from *every* `dbPut` —
                 // an NPP OUT link writing a calc's A, an autosave restore, a
                 // status pusher, all post immediately. Pre-fix this body posted
                 // nothing at all, so camonitor on anything written via `put_pv`
-                // went silent forever (doc/calink-rtems-design.md §11.7 item 2).
-                dbput_post_put_field(&mut instance, &field);
+                // went silent forever.
+                dbput_post_put_field(&mut instance, &field, link_backing);
 
                 // C's `put_array_info` is likewise reached from every `dbPut` —
                 // an OUT link that shortens a waveform posts NORD in C even when
                 // the link is NPP and the target never processes, and the
                 // value-field post above is suppressed for a waveform (VAL is
                 // `pp(TRUE)`); NORD has no such second path.
-                post_array_info(&mut instance, &old_nord, 0);
+                post_array_info(&mut instance, &old_nord, 0, link_backing);
 
                 (common_result, special_actions)
             };
-            // Lock down: arm any put-notify the SNAM park release freed.
-            drop(pact_exit);
+            // No put-notify is armed here: C's restart owner is the cycle
+            // tail (`end_process_cycle`), never the `pact = FALSE` store.
             // The record DATA lock is now down (scope ended above) before the
             // scan-index update and the `special()` link writes below, which
             // re-enter the database (they can process their target). The
@@ -1288,6 +1536,11 @@ impl PvDatabase {
     ) -> CaResult<()> {
         let (base, field) = super::parse_pv_name(name);
         let field = field.to_ascii_uppercase();
+        // C `dbPutFieldLink` (`dbAccess.c:1261`): a write to a DBF link field
+        // relinks the target's lock set. The obligation is taken out here, so
+        // that every exit path below discharges it; see
+        // `record_lock.rs`'s `LinkFieldWrite`.
+        let _relink = self.link_field_write(base, &field);
 
         // Simple-PV path: PVs registered via `add_pv` (e.g. CA gateway
         // shadow PVs, IOCsh stats PVs) are stored in `simple_pvs`,
@@ -1315,8 +1568,7 @@ impl PvDatabase {
             // and its target share one gate. Held until return — same
             // reasoning as `put_pv_inner`'s gate: C's `dbScanLock` covers
             // `dbPut` including `dbPutSpecial(paddr, 1)` and the scan-list
-            // move, so both tails below stay inside the window
-            // (`doc/rtems-priority-locks-design.md` §2).
+            // move, so both tails below stay inside the window.
             let canonical_base: String =
                 self.resolve_alias(base).unwrap_or_else(|| base.to_string());
             let _record_gate = self.lock_record(&canonical_base);
@@ -1327,7 +1579,16 @@ impl PvDatabase {
             // advisory `_record_gate` still holds the processing-exclusion
             // window across the whole helper.
             use crate::server::record::CommonFieldPutResult;
-            let mut pact_exit = PactExitGuard::new(self, base, &rec, RestartOwner::ThisPut);
+            // C reads a link-backed field's metadata live inside the rset,
+            // under the TARGET record's lock; every poster below holds THIS
+            // record's lock and cannot reach for a second one. Resolved here,
+            // where no record lock is held, and handed down as a borrowed
+            // value that dies with this body — so a `caput CALC.A` carries the
+            // metadata `INPA`'s target has NOW, not what it had when the
+            // source last processed. Empty after one read lock for every
+            // record type but calc, calcout, sub, aSub and seq.
+            let link_backing = self.resolve_link_backed_metadata(&rec);
+            let link_backing = crate::server::database::LinkBacking::resolved(&link_backing);
             let (common_result, special_actions) = {
                 let mut instance = rec.write();
 
@@ -1354,15 +1615,18 @@ impl PvDatabase {
 
                 // Write value + special/on_put
                 let common_result = match request {
-                    // C `dbAccess.c:1370-1372` — accept, write nothing, alarm. UDF
-                    // is NOT cleared: C clears it at `:1409` only when the value
-                    // field was actually written, and this branch wrote nothing.
-                    PutRequest::EmptyIntoScalar => {
-                        set_empty_request_alarm(&mut instance);
+                    // C `dbAccess.c:1362` converted zero elements — nothing is
+                    // stored and the put is accepted. `alarm` is the scalar arm's
+                    // `:1371` only.
+                    PutRequest::StoreNothing { alarm } => {
+                        if alarm {
+                            set_empty_request_alarm(&mut instance);
+                        }
+                        clear_udf_on_value_put(&mut instance, &field);
                         CommonFieldPutResult::NoChange
                     }
                     PutRequest::Write(value) => {
-                        pact_exit.arm(special_before_put(&mut instance, &field));
+                        special_before_put(&mut instance, &field);
                         match instance.record.put_field(&field, value.clone()) {
                             Ok(()) => {
                                 instance.record.on_put(&field);
@@ -1375,26 +1639,27 @@ impl PvDatabase {
                                     &mut instance,
                                     &field,
                                     &mut special_actions,
+                                    link_backing,
                                 )?;
-                                // C `dbAccess.c::dbPut:1411` clears ONLY `precord->udf
-                                // = FALSE` on a value-field put, and nothing else. It
-                                // does NOT touch stat/sevr: the UDF_ALARM stays until
-                                // the record's own process cycle recomputes it
-                                // (`rec_gbl_check_udf` no longer raises it now udf is
-                                // clear, `rec_gbl_reset_alarms` commits the new state).
-                                // A value put that does not drive a process therefore
-                                // leaves the stale UDF alarm exactly as C does — the
-                                // earlier synchronous stat/sevr clear here diverged
-                                // from C and reported NO_ALARM where C keeps UDF/INVALID.
-                                if instance.record.is_udf_defining_put(&field) {
-                                    instance.common.udf = 0;
-                                }
+                                clear_udf_on_value_put(&mut instance, &field);
                                 result
                             }
                             Err(CaError::FieldNotFound(_)) => {
                                 instance.put_common_field(&field, value)?
                             }
-                            Err(e) => return Err(e),
+                            // A refused store does NOT skip the pass above:
+                            // C runs it either way (`dbAccess.c:1398`) and lets
+                            // its status win, then `goto done` — the `return`.
+                            Err(e) => {
+                                special_after_put(
+                                    self,
+                                    &mut instance,
+                                    &field,
+                                    &mut special_actions,
+                                    link_backing,
+                                )?;
+                                return Err(e);
+                            }
                         }
                     }
                 };
@@ -1402,7 +1667,7 @@ impl PvDatabase {
                 // Invalidate metadata cache only if a metadata-class
                 // field actually changed value (faac1df1 — DBE_PROPERTY
                 // fires on real changes, not no-op writes).
-                instance.notify_field_written_if_changed(&field, old_value.as_ref());
+                instance.notify_field_written_if_changed(&field, old_value.as_ref(), link_backing);
 
                 // Post monitor events if value or alarm changed
                 let new_value = instance.record.get_field(&field);
@@ -1422,6 +1687,7 @@ impl PvDatabase {
                                 | crate::server::recgbl::EventMask::LOG
                                 | crate::server::recgbl::EventMask::ALARM,
                             origin,
+                            link_backing,
                         );
                     }
                     // The NORD post, through the one owner. Without it a CA
@@ -1431,7 +1697,7 @@ impl PvDatabase {
                     // seen length — a frozen-element-count bug that surfaces
                     // in PyDM image views and similar consumers that compute
                     // height = element_count / width.
-                    post_array_info(&mut instance, &old_nord, origin);
+                    post_array_info(&mut instance, &old_nord, origin, link_backing);
                 }
 
                 // The `special()` link writes re-enter the database, so the record
@@ -1439,8 +1705,8 @@ impl PvDatabase {
                 // inside `dbPut`, before it returns to its caller.
                 (common_result, special_actions)
             };
-            // Lock down: arm any put-notify the SNAM park release freed.
-            drop(pact_exit);
+            // No put-notify is armed here: C's restart owner is the cycle
+            // tail (`end_process_cycle`), never the `pact = FALSE` store.
 
             // Same scan-index owner every other `dbPut` path routes through:
             // a SCAN put and the SIMM↔SSCN swap (`recGblCheckSimm`) both move
@@ -1498,22 +1764,22 @@ impl PvDatabase {
     /// blocking priority-inheritance mutex whose guard is `!Send`
     /// (`server::database::record_lock`). An `.await` anywhere reachable from
     /// here is therefore a compile error at the spawn sites, not a review
-    /// finding — see `doc/rtems-priority-locks-design.md` §5 steps 5–6.
+    /// finding.
     ///
     /// The one call that used to make it a genuine suspension is gone:
     /// `write_out_link_value` → `write_external_pv` does not call
     /// `LinkSet::put_value` from this thread. It stages the write on the
     /// database's link-put queue and returns, exactly as C `dbCaPutLink`
     /// stages into `pca->pputNative`, calls `addAction` and returns
-    /// (`dbCa.c:544-631`); the `ca://` / `pva://` round trip runs on the
-    /// queue's owner task, C's `dbCaTask` (`dbCa.c:1226-1248`). See
+    /// (`dbCa.c:515-602`); the `ca://` / `pva://` round trip runs on the
+    /// queue's owner task, C's `dbCaTask` (`dbCa.c:1161-1183`). See
     /// [`super::link_put_queue`]. What is left inside the window is the
     /// re-entrant database work C also does under `dbScanLock`:
     /// `execute_process_actions` → `write_out_link_value` →
     /// `write_db_link_value` re-entering `put_pv_already_locked` and
     /// `process_target`, plus the cached-state `LinkSet::put_admission` probe
     /// both production lsets answer from a map lookup and an atomic — C's
-    /// `if (!pca->isConnected …)` (`dbCa.c:558-561`).
+    /// `if (!pca->isConnected …)` (`dbCa.c:529-532`).
     fn run_special_actions(
         &self,
         record_name: &str,
@@ -1605,7 +1871,7 @@ impl PvDatabase {
     ///
     /// A DBF link field ignores the requested mode: pvxs sends it down
     /// `dbPutField` whatever the client asked (`iocsource.cpp:451-458`,
-    /// `dbNotify.c:337-353`), and the `dbPut`-analogue bodies refuse link
+    /// `dbNotify.c:337-354`), and the `dbPut`-analogue bodies refuse link
     /// fields outright, so the Passive route is the only one that can
     /// carry it.
     ///
@@ -1717,11 +1983,16 @@ impl PvDatabase {
             .unwrap_or_else(|| record_name.to_string());
         let _record_gate = self.lock_record(&canonical);
 
+        // Resolved before the record lock: the record-wide `DBE_ALARM` post
+        // below reaches every subscribed field, a link-backed one included.
+        let backing = self.resolve_link_backed_metadata(&rec);
+        let backing = crate::server::database::LinkBacking::resolved(&backing);
+
         let mut instance = rec.write();
         check_put_disabled(&instance, &field_upper)?;
         match ack {
-            crate::server::record::AlarmAck::Transient => instance.put_ackt(value),
-            crate::server::record::AlarmAck::Severity => instance.put_acks(value),
+            crate::server::record::AlarmAck::Transient => instance.put_ackt(value, backing),
+            crate::server::record::AlarmAck::Severity => instance.put_acks(value, backing),
         }
         Ok(())
     }
@@ -1813,8 +2084,8 @@ impl PvDatabase {
     /// intercept and the `pp`-field route in
     /// [`Self::put_record_field_from_ca`] both go through it, so neither can
     /// drift from C's rule or from each other. The DB-link propagation path
-    /// applies the same PACT→RPRO rule at its own targets (`processing.rs:3225`,
-    /// `:4220`, `links.rs:829`).
+    /// applies the same PACT→RPRO rule at its own targets
+    /// (`processing.rs:4781-4790`, `:5783-5792`, `links.rs:1519`).
     ///
     /// Two entries, one rule. `put_driven_process` acquires `record_name`'s
     /// advisory write gate (the `dbScanLock` analogue) itself;
@@ -1933,11 +2204,16 @@ impl PvDatabase {
     ) -> CaResult<Option<std::sync::Arc<crate::server::record::NotifyWaitSet>>> {
         // Collect-then-act: clone the handle under a brief map read, drop the
         // map lock before taking the per-record write lock.
-        let rec_arc = {
-            let recs = self.inner.records.read();
-            recs.get(record_name).cloned()
-        }
-        .ok_or_else(|| CaError::ChannelNotFound(record_name.to_string()))?;
+        //
+        // Resolved, not raw: C addresses a notify by `dbCommon *`, so an alias
+        // is the same record (`dbNotify.c:492-499` and the park test at
+        // `:225-232` compare record pointers). The map is keyed by the
+        // canonical name, and the caller's `acquire_put_gate` already locked
+        // THAT name -- a raw lookup here missed the record whose gate it was
+        // standing behind.
+        let rec_arc = self
+            .get_record(record_name)
+            .ok_or_else(|| CaError::ChannelNotFound(record_name.to_string()))?;
         let notify = {
             let mut guard = rec_arc.write();
             if arrival.defers(&guard) {
@@ -1959,6 +2235,30 @@ impl PvDatabase {
         Ok(Some(notify))
     }
 
+    /// Claim `record_name`'s put-notify slot for this put, in the SAME
+    /// critical section that just tested it.
+    ///
+    /// The caller has already established that the record is free — the whole
+    /// point is that the test and the claim are one critical section, so this
+    /// takes the guard it tested under rather than re-reading the record.
+    fn claim_put_notify<'a>(
+        rec: &'a std::sync::Arc<parking_lot::RwLock<crate::server::record::RecordInstance>>,
+        guard: &mut crate::server::record::RecordInstance,
+        completion: crate::runtime::sync::oneshot::Sender<()>,
+    ) -> NotifyClaim<'a> {
+        // Through the one install owner, which is also what makes the
+        // `expect` safe: it queues instead of installing only when the slot is
+        // occupied, and the caller's test — under this same guard — said it is
+        // not.
+        let set = guard
+            .install_or_queue_notify(completion)
+            .expect("the ownership test ran in this critical section, so the slot is free");
+        NotifyClaim {
+            rec,
+            set: Some(set),
+        }
+    }
+
     /// The gate-held body of the whole CA field-put family — a `fn`, so
     /// nothing in it can suspend while the L1 gate is held. The gate is the
     /// caller's; see `acquire_put_gate`.
@@ -1966,11 +2266,16 @@ impl PvDatabase {
         &self,
         record_name: &str,
         field: &str,
-        value: EpicsValue,
+        mut value: EpicsValue,
         notify_request: NotifyRequest,
     ) -> CaResult<crate::server::record::ProcessCompletion> {
         let field = field.to_ascii_uppercase();
         let want_notify = notify_request.wants_notify();
+        // C `dbPutFieldLink` (`dbAccess.c:1261`): a write to a DBF link field
+        // relinks the target's lock set. The obligation is taken out here, so
+        // that every exit path below discharges it; see
+        // `record_lock.rs`'s `LinkFieldWrite`.
+        let _relink = self.link_field_write(record_name, &field);
 
         // Get record Arc — alias-aware (epics-base PR #336) so a CA
         // client that connects via an alias name can put fields on
@@ -2010,13 +2315,29 @@ impl PvDatabase {
             // `S_db_putDisabled` and the record does not process.
             check_put_disabled(&instance, &field)?;
 
+            // C `dbPutField` hands a DBF link field to `dbPutFieldLink`
+            // instead of `dbPut` (`dbAccess.c:1259-1260`), which parses the
+            // text and holds it to `dbCanSetLink` — see [`check_link_put`].
+            // ABOVE the no-mod gate because that is where C puts it: the link
+            // route never enters `dbPut`, and the `SPC_NOMOD` refusal a link
+            // field can still take comes from `dbPutSpecial(paddr, 0)`
+            // (`dbAccess.c:1174` -> `:124`), which runs AFTER `dbCanSetLink`.
+            if let Some(text) = check_link_put(
+                instance.record.record_type(),
+                instance.common.dtyp.as_str(),
+                &field,
+                &value,
+            )? {
+                value = text;
+            }
+
             // SPC_NOMOD / read-only fields: rejected inside C's `dbPut`, i.e.
             // after the DISP gate above and before the PROC-driven process
             // below. One gate owner for every route ([`check_no_mod`]).
             check_no_mod(&instance, &field)?;
         }
 
-        // C `processNotifyCommon` (dbNotify.c:225-231) tests PACT ABOVE the
+        // C `processNotifyCommon` (dbNotify.c:225-232) tests PACT ABOVE the
         // put — `if (precord->pact) { ... pnotify->state =
         // notifyRestartCallbackRequested; ... return; }` — so a put-notify that
         // lands on a busy record writes NOTHING: no value, no RPRO, no join of
@@ -2033,7 +2354,7 @@ impl PvDatabase {
         // ordinary way.
         //
         // A second put-notify onto a record that already owns one is C's
-        // "another processNotify owns the record" (dbNotify.c:213-217): it joins
+        // "another processNotify owns the record" (dbNotify.c:213-220): it joins
         // the SAME queue, at the back (`ellSafeAdd`). Both tests are one arm
         // here because both have the same answer — the put waits, unwritten.
         // Refusing it instead (`S_db_Blocked` / `ECA_PUTCBINPROG`) drops the
@@ -2042,7 +2363,7 @@ impl PvDatabase {
         // A fire-and-forget `dbPutField` is NOT deferred: it writes and raises
         // RPRO (dbAccess.c:1263-1277). Only the notify route waits.
         //
-        // C `dbProcessNotify` (dbNotify.c:337-353) handles a put-notify to a
+        // C `dbProcessNotify` (dbNotify.c:337-354) handles a put-notify to a
         // DBF link field (INLINK/OUTLINK/FWDLINK) as a dedicated early case,
         // ABOVE the PACT logic and the whole `processNotifyCommon` machinery:
         // "Only dbPutField will change link fields. Also the record is not
@@ -2060,6 +2381,15 @@ impl PvDatabase {
         // only correction the special case needs is to keep a link field OUT
         // of the notify PACT-defer park.
         let is_dbf_link_field = self.is_dbf_link_field(record_name, &field);
+        // The claim on this record's put-notify slot, held for the rest of the
+        // body. `None` for a fire-and-forget put, which parks nothing — C
+        // builds a `putNotify` only in `dbPutNotify`. See [`NotifyClaim`] for
+        // why the claim is taken HERE, in the same critical section as the
+        // ownership test below, and not at the process cycle it arms.
+        let mut claim: Option<(
+            NotifyClaim<'_>,
+            Option<crate::runtime::sync::oneshot::Receiver<()>>,
+        )> = None;
         if want_notify {
             let is_restart = notify_request.is_restart();
             let mut guard = rec.write();
@@ -2072,7 +2402,7 @@ impl PvDatabase {
                 // fields out of the whole decision (not just the PACT arm) left
                 // an owned record's link put falling through to the wait-set
                 // install below, whose only answer to an occupied slot was
-                // `PutCallbackInProgress`.
+                // a refusal, deleted since along with its `CaError` variant.
                 guard.notify_put_has_owner()
             } else {
                 guard.notify_put_is_owned()
@@ -2097,11 +2427,21 @@ impl PvDatabase {
                 }
                 // A queued put-notify IS async: it replays and completes on the
                 // restart check that frees it (C `notifyRestartInProgress` /
-                // `notifyWaitForRestart`, dbNotify.c:213-231). `Deferred` replays
+                // `notifyWaitForRestart`, dbNotify.c:213-220, 225-232). `Deferred` replays
                 // carry only the sender, so `completion_rx` is `None` there and
                 // this maps to `Sync` — but that path is the internal restart,
                 // not a fresh client put.
                 return Ok(crate::server::record::ProcessCompletion::from_signal(
+                    completion_rx,
+                ));
+            }
+            // Not deferred, so this put owns the record — take the slot now,
+            // under the guard that just said it is free. Everything below runs
+            // with the wait-set installed, and every way out of this function
+            // that is not a process cycle drops the claim.
+            if let Some((completion, completion_rx)) = notify_request.into_completion() {
+                claim = Some((
+                    Self::claim_put_notify(&rec, &mut guard, completion),
                     completion_rx,
                 ));
             }
@@ -2127,13 +2467,13 @@ impl PvDatabase {
             // path DISP/RPRO use (coercion + signed readback: `caput PROC 255` →
             // `caget` = -1) in its own brief write lock so both the notify and
             // fire-and-forget paths take it, then fall through to force-process.
-            // C `dbPut:1408` posts DBE_VALUE|DBE_LOG for the put field (PROC is
+            // C `dbPut:1413` posts DBE_VALUE|DBE_LOG for the put field (PROC is
             // not the record's value field, so the pp-suppression never applies).
             // Store the raw PROC byte (C `dbChannelPut`). A bad conversion
             // (`caput REC.PROC 256` / non-numeric) refuses the store AND the
             // client's put — but, exactly as C's `putCallback` returns
             // `didPut = 1` while setting `notifyError` (`dbNotify.c:528-530`),
-            // the PROC `pp(TRUE)`-driven `dbProcess` (`dbNotify.c:243-261`) still
+            // the PROC `pp(TRUE)`-driven `dbProcess` (`dbNotify.c:243-264`) still
             // runs on the NOTIFY path. This is the SAME rule the general put path
             // applies for a rejected pp-field conversion (`field_io.rs:1748-1806`,
             // "Cause B"); mirror it here so PROC does not diverge from UDF: carry
@@ -2168,50 +2508,22 @@ impl PvDatabase {
                 // non-zero `dbPut` status (`dbAccess.c:1263-1264`), so it must NOT
                 // process. Either way the client is answered `ECA_PUTFAIL`.
                 if want_notify {
+                    // The cycle runs under this put's wait-set, so the claim is
+                    // committed before it starts — see `commit_without_waiting`.
+                    if let Some((c, _rx)) = claim.take() {
+                        c.commit_without_waiting();
+                    }
                     let _ = self.put_driven_process_already_locked(record_name);
                 }
                 return Err(e);
             }
             // A fire-and-forget caller parks nothing — C `dbPutField` on PROC
-            // processes the record with no putNotify.
-            let parked = if let Some((completion_tx, completion_rx)) =
-                notify_request.into_completion()
-            {
-                // Collect-then-act: clone the handle under a brief map
-                // read, drop the map lock before the per-record write.
-                let rec_arc = {
-                    let recs = self.inner.records.read();
-                    recs.get(record_name).cloned()
-                };
-                match rec_arc {
-                    Some(rec_arc) => {
-                        match rec_arc.write().install_or_queue_notify(completion_tx) {
-                            Some(notify) => Some((notify, completion_rx)),
-                            // Queued: the entry gate let this put through, then
-                            // another notify took the slot before the install
-                            // (`process_record_with_notify` does not hold the
-                            // put gate). C queues here rather than refusing, and
-                            // the replay is what processes — so return without
-                            // driving the record.
-                            None => {
-                                return Ok(crate::server::record::ProcessCompletion::from_signal(
-                                    completion_rx,
-                                ));
-                            }
-                        }
-                    }
-                    // Record gone between the put and the park: nothing to
-                    // install on. Dropping the wait-set releases the client,
-                    // which is the completion C gives a `dbNotifyCancel`.
-                    None => Some((
-                        crate::server::record::NotifyWaitSet::new(completion_tx),
-                        completion_rx,
-                    )),
-                }
-            } else {
-                None
-            };
-            // C `dbPutField:1265-1277`: PROC is one of the two fields that
+            // processes the record with no putNotify. A notify caller commits
+            // the claim it has held since the entry gate; there is no third
+            // answer to reach, because nothing could have taken the slot from
+            // under it.
+            let parked = claim.take().map(|(c, rx)| (c.commit(), rx));
+            // C `dbPutField:1264-1277`: PROC is one of the two fields that
             // selects the record for the put-driven process — with the same
             // PACT→RPRO deferral as a `pp` field. Both go through the single
             // owner (R19-43).
@@ -2256,7 +2568,16 @@ impl PvDatabase {
         // guard) before the notify-process / scan-index awaits below. Yields
         // either the success `CommonFieldPutResult`, or `(error, should_process)`
         // so the notify-driven process on a rejected put runs guard-free.
-        let mut pact_exit = PactExitGuard::new(self, record_name, &rec, RestartOwner::ThisPut);
+        // C reads a link-backed field's metadata live inside the rset,
+        // under the TARGET record's lock; every poster below holds THIS
+        // record's lock and cannot reach for a second one. Resolved here,
+        // where no record lock is held, and handed down as a borrowed
+        // value that dies with this body — so a `caput CALC.A` carries the
+        // metadata `INPA`'s target has NOW, not what it had when the
+        // source last processed. Empty after one read lock for every
+        // record type but calc, calcout, sub, aSub and seq.
+        let link_backing = self.resolve_link_backed_metadata(&rec);
+        let link_backing = crate::server::database::LinkBacking::resolved(&link_backing);
         let outcome: Result<crate::server::record::CommonFieldPutResult, (CaError, bool)> = {
             let mut instance = rec.write();
 
@@ -2284,7 +2605,7 @@ impl PvDatabase {
 
                 // Pre-write special hook (C EPICS dbPutSpecial pass=0)
                 instance.record.special(&field, false)?;
-                pact_exit.arm(special_before_put(&mut instance, &field));
+                special_before_put(&mut instance, &field);
 
                 // Capture pre-put value for faac1df1 idempotent-write suppression.
                 let prev_value = instance.record.get_field(&field);
@@ -2295,14 +2616,17 @@ impl PvDatabase {
                 // matching what put_common_field() does for common fields.
                 use crate::server::record::CommonFieldPutResult;
                 let common_result = match request {
-                    // C `dbAccess.c:1370-1372` — a zero-element request into a
-                    // scalar field: nothing is written, the record is driven to
-                    // LINK/INVALID, and `dbPut` returns 0. The client's put
-                    // SUCCEEDS; the record's process cycle below commits the alarm
-                    // and posts it, which is how a C IOC surfaces `caput -a`
-                    // of an empty array.
-                    PutRequest::EmptyIntoScalar => {
-                        set_empty_request_alarm(&mut instance);
+                    // C `dbAccess.c:1362` converted zero elements: nothing is
+                    // written and `dbPut` returns 0, so the client's put SUCCEEDS.
+                    // On the SCALAR arm it also drives the record to LINK/INVALID
+                    // (`:1371`) and the process cycle below commits and posts that
+                    // alarm — which is how a C IOC surfaces `caput -a` of an empty
+                    // array into a scalar. The ARRAY arm raises nothing.
+                    PutRequest::StoreNothing { alarm } => {
+                        if alarm {
+                            set_empty_request_alarm(&mut instance);
+                        }
+                        clear_udf_on_value_put(&mut instance, &field);
                         CommonFieldPutResult::NoChange
                     }
                     PutRequest::Write(value) => {
@@ -2320,31 +2644,30 @@ impl PvDatabase {
                                     &mut instance,
                                     &field,
                                     &mut special_actions,
+                                    link_backing,
                                 )?;
-                                // C `dbAccess.c::dbPut:1410-1411` clears
-                                // `precord->udf = FALSE` synchronously when the
-                                // put target is the record-type's primary value
-                                // field (`dbIsValueField`), and clears NOTHING
-                                // else. The clear happens BEFORE `dbProcess` runs,
-                                // so any reader between the put and the process
-                                // cycle sees the new value with a consistent
-                                // udf=false — but stat/sevr keep their old
-                                // UDF_ALARM until the process cycle recomputes
-                                // them. A value put that drives no process leaves
-                                // the stale UDF alarm, matching C; the process
-                                // path's own `rec_gbl_check_udf` (now a no-op with
-                                // udf clear) + `rec_gbl_reset_alarms` clears it
-                                // when the record does process. The earlier
-                                // synchronous stat/sevr clear here diverged from C.
-                                if instance.record.is_udf_defining_put(&field) {
-                                    instance.common.udf = 0;
-                                }
+                                // The clear happens BEFORE `dbProcess` runs, so
+                                // any reader between the put and the process cycle
+                                // sees the new value with a consistent udf=false.
+                                clear_udf_on_value_put(&mut instance, &field);
                                 result
                             }
                             Err(CaError::FieldNotFound(_)) => {
                                 instance.put_common_field(&field, value)?
                             }
-                            Err(e) => return Err(e),
+                            // A refused store does NOT skip the pass above:
+                            // C runs it either way (`dbAccess.c:1398`) and lets
+                            // its status win, then `goto done` — the `return`.
+                            Err(e) => {
+                                special_after_put(
+                                    self,
+                                    &mut instance,
+                                    &field,
+                                    &mut special_actions,
+                                    link_backing,
+                                )?;
+                                return Err(e);
+                            }
                         }
                     }
                 };
@@ -2365,17 +2688,17 @@ impl PvDatabase {
 
                 // Invalidate metadata cache only if the metadata-class
                 // field's value actually changed (faac1df1).
-                instance.notify_field_written_if_changed(&field, prev_value.as_ref());
+                instance.notify_field_written_if_changed(&field, prev_value.as_ref(), link_backing);
 
                 // `putf` is neither set nor cleared anywhere in this block: C's
                 // `dbPut` does not touch it. It is raised in `put_driven_process`
-                // (C `dbAccess.c:1274`) immediately before `dbProcess`, stays TRUE
+                // (C `dbAccess.c:1275`) immediately before `dbProcess`, stays TRUE
                 // for the whole process cycle — including an async device round
                 // trip — and is cleared by the `recGblFwdLink:302` analogue at the
-                // cycle's tail (`processing.rs:2997` / `complete_async_record_inner`)
-                // or by the disable-alarm bail (`dbAccess.c:576`).
+                // cycle's tail (`processing.rs:5346` / `complete_async_record_inner`)
+                // or by the disable-alarm bail (`dbAccess.c:575`).
 
-                // C `dbPut:1408-1414`'s field-monitor post, through the one
+                // C `dbPut:1408-1413`'s field-monitor post, through the one
                 // owner (`dbput_post_put_field`, shared with `put_pv`). On
                 // this route the pp-value-field suppression pairs with the
                 // `should_process` gate below: a suppressed field is exactly
@@ -2383,7 +2706,7 @@ impl PvDatabase {
                 // (ACKT/ACKS have no arm here: they are SPC_NOMOD, refused by
                 // the gate above. Alarm acknowledgement arrives as a DBR
                 // request type, through [`Self::put_alarm_ack_from_ca`].)
-                dbput_post_put_field(&mut instance, &field);
+                dbput_post_put_field(&mut instance, &field, link_backing);
 
                 // The NORD post, through the one owner — C reaches `put_array_info`
                 // from `dbPut`, so the CA route posts it exactly like the internal
@@ -2392,7 +2715,7 @@ impl PvDatabase {
                 // not covered by the process cycle either — a `caput -a` to a
                 // slow-scanned or passive-but-unprocessed waveform posts NORD now
                 // and VAL only at the next scan.
-                post_array_info(&mut instance, &old_nord, 0);
+                post_array_info(&mut instance, &old_nord, 0, link_backing);
 
                 // Fields a `special()` changed as a side effect of this put
                 // (e.g. compress RES reset zeroing NUSE/VAL) get their monitors
@@ -2441,7 +2764,7 @@ impl PvDatabase {
                 // put, `DBE_VALUE`, `only if (strcmp(str, plinkGroup->s))`,
                 // sseqRecord.c:1108-1116). A static field-name list cannot
                 // express "only if it changed", so it over-posts; the mark can.
-                emit_cycle_posts(&mut instance);
+                emit_cycle_posts(&mut instance, link_backing);
 
                 Ok(common_result)
             })(
@@ -2461,7 +2784,7 @@ impl PvDatabase {
             match block_result {
                 Ok(cr) => Ok(cr),
                 Err(e) => {
-                    // C `dbPut:83-88` runs `dbPutSpecial(paddr, 1)` UNCONDITIONALLY
+                    // C `dbAccess.c:1398-1403` runs `dbPutSpecial(paddr, 1)` UNCONDITIONALLY
                     // ("Always do special processing if needed") — even when the
                     // conversion above failed — before the `goto done` that skips
                     // the udf clear and the field's monitor post. For a compress
@@ -2502,7 +2825,7 @@ impl PvDatabase {
                     // The same `dbPutSpecial(paddr, 1)`-on-reject rule for a field
                     // whose special() clears UDF: C `mbboDirectRecord.c::special`
                     // (after==1, B0..B1F, line 290) sets `prec->udf = FALSE`, and
-                    // that special runs UNCONDITIONALLY in `dbPut` (dbAccess.c:1401,
+                    // that special runs UNCONDITIONALLY in `dbPut` (dbAccess.c:1398-1400,
                     // "Always do special processing") even when the value conversion
                     // failed — BEFORE the `if (status) goto done`. So a rejected
                     // `caput -c mbboDirect.Bn 256`/`notanumber` still clears UDF, and
@@ -2512,7 +2835,7 @@ impl PvDatabase {
                     // udf=0). The success path clears UDF for this same field set via
                     // `is_udf_defining_put` (the `udf = 0` at the tail of the put
                     // body). The primary VAL field is EXCLUDED here: its UDF clear is
-                    // `isValueField` (dbAccess.c:1408), which runs AFTER the status
+                    // `isValueField` (dbAccess.c:1409-1410), which runs AFTER the status
                     // check, so a rejected VAL put keeps UDF — matching C. Only
                     // mbboDirect overrides `is_udf_defining_put` to add non-primary
                     // fields, so this is a no-op for every other record type.
@@ -2526,21 +2849,26 @@ impl PvDatabase {
                 }
             }
         };
-        // Lock down: arm any put-notify the SNAM park release freed.
-        drop(pact_exit);
+        // No put-notify is armed here: C's restart owner is the cycle tail
+        // (`end_process_cycle`), never the `pact = FALSE` store.
 
         let common_result = match outcome {
             Ok(cr) => cr,
             Err((e, should_process)) => {
                 if should_process {
+                    // Same rule as the PROC refusal above: the cycle runs under
+                    // the wait-set, so commit before driving it.
+                    if let Some((c, _rx)) = claim.take() {
+                        c.commit_without_waiting();
+                    }
                     let _ = self.put_driven_process_already_locked(record_name);
                 }
                 return Err(e);
             }
         };
         // ASG-field change re-evaluation hook. C
-        // `asDbLib.c:107-110,144` `asSpcAsCallback` invokes
-        // `asChangeGroup` → `asAddMemberPvt` → `asComputePvt` for
+        // `asDbLib.c:107-110` `asSpcAsCallback` (registered at `:144`)
+        // invokes `asChangeGroup` → `asAddMemberPvt` → `asComputePvt` for
         // every `ASGCLIENT` on `dbPut record.ASG NEW_ASG`. Pre-fix
         // Rust mutated `common.asg` directly with no notification,
         // so the wire ACCESS_RIGHTS the client saw still reflected
@@ -2607,11 +2935,12 @@ impl PvDatabase {
         // completed — C `dbNotify.c` `processNotify`/`dbNotifyCompletion`.
         // An occupied slot is QUEUED, never refused. C
         // `processNotifyCommon` answers "another processNotify owns the
-        // record" with `ellSafeAdd` onto `restartList` (dbNotify.c:211-217)
+        // record" with `ellSafeAdd` onto `restartList` (dbNotify.c:213-220)
         // and carries no refusal arm: `S_db_Blocked` is raised by a test
         // record's own put hook (test/ioc/db/xRecord.c:89), never by the
         // notify machinery, and `ECA_PUTCBINPROG` has exactly one sender in
-        // all of base — the put-callback timeout at rsrv/camessage.c:1745.
+        // all of base — the put-callback timeout in `write_notify_action`
+        // (rsrv/camessage.c:1701 at R7.0.10).
         // Overwriting the slot instead would drop the prior Sender, waking
         // the prior caller's rx with RecvError that the CA dispatcher treats
         // as success, so the install goes through the one owner.
@@ -2620,34 +2949,7 @@ impl PvDatabase {
         // only in `dbPutNotify`; `dbPutField` processes the record with
         // no notify state at all. It therefore neither conflicts with
         // nor disturbs a WRITE_NOTIFY already parked on the record.
-        let parked = if let Some((completion_tx, completion_rx)) = notify_request.into_completion()
-        {
-            // Collect-then-act: clone the handle under a brief map read,
-            // drop the map lock before the per-record write.
-            let rec_arc = {
-                let recs = self.inner.records.read();
-                recs.get(record_name).cloned()
-            };
-            match rec_arc {
-                Some(rec_arc) => match rec_arc.write().install_or_queue_notify(completion_tx) {
-                    Some(notify) => Some((notify, completion_rx)),
-                    // Queued behind the slot's current owner — see the PROC
-                    // path above. The replay drives the record; returning here
-                    // is what keeps one client request to one process cycle.
-                    None => {
-                        return Ok(crate::server::record::ProcessCompletion::from_signal(
-                            completion_rx,
-                        ));
-                    }
-                },
-                None => Some((
-                    crate::server::record::NotifyWaitSet::new(completion_tx),
-                    completion_rx,
-                )),
-            }
-        } else {
-            None
-        };
+        let parked = claim.take().map(|(c, rx)| (c.commit(), rx));
 
         // When a CA put writes directly to VAL on an INPUT record whose
         // VAL is the engineering value, the built-in `RVAL → VAL`
@@ -2685,7 +2987,7 @@ impl PvDatabase {
         }
 
         // Process the record after field put — through the single owner of C's
-        // `dbPutField:1269-1277` decision, so an async-active record takes the
+        // `dbPutField:1268-1277` decision, so an async-active record takes the
         // RPRO deferral instead of a doomed re-entrant `dbProcess`.
         let _ = self.put_driven_process_already_locked(record_name);
 
@@ -2766,9 +3068,14 @@ impl PvDatabase {
     /// write that never processes. That is exactly this body's behavior
     /// (`put_common_field`'s INP/OUT/FLNK arms, no process), so the
     /// `check_not_link_field` refusal does not apply here.
-    pub async fn put_pv_no_process(&self, name: &str, value: EpicsValue) -> CaResult<()> {
+    pub async fn put_pv_no_process(&self, name: &str, mut value: EpicsValue) -> CaResult<()> {
         let (base, field) = super::parse_pv_name(name);
         let field = field.to_ascii_uppercase();
+        // C `dbPutFieldLink` (`dbAccess.c:1261`): a write to a DBF link field
+        // relinks the target's lock set. The obligation is taken out here, so
+        // that every exit path below discharges it; see
+        // `record_lock.rs`'s `LinkFieldWrite`.
+        let _relink = self.link_field_write(base, &field);
 
         let simple = self.inner.simple_pvs.lock().get(name).cloned();
         if let Some(pv) = simple {
@@ -2789,37 +3096,134 @@ impl PvDatabase {
                 self.resolve_alias(base).unwrap_or_else(|| base.to_string());
             let _record_gate = self.lock_record(&canonical_base);
 
-            let mut instance = rec.write();
+            // C reads a link-backed field's metadata live inside the rset,
+            // under the TARGET record's lock; every poster below holds THIS
+            // record's lock and cannot reach for a second one. Resolved here,
+            // where no record lock is held, and handed down as a borrowed
+            // value that dies with this body — so a `caput CALC.A` carries the
+            // metadata `INPA`'s target has NOW, not what it had when the
+            // source last processed. Empty after one read lock for every
+            // record type but calc, calcout, sub, aSub and seq.
+            let link_backing = self.resolve_link_backed_metadata(&rec);
+            let link_backing = crate::server::database::LinkBacking::resolved(&link_backing);
+            let mut special_actions = Vec::new();
 
-            // C `dbPutSpecial(paddr, 0)` — the pre-store pass, which
-            // `dbPut` runs on every entry path including the `dbPutField`
-            // this body models (autosave's `reboot_restore`). A non-zero
-            // status returns before the store (`dbAccess.c:1350-1352`), so a
-            // restore cannot write a field the record is currently refusing
-            // (mbboDirect B0..B1F while OMSL=closed_loop,
-            // `mbboDirectRecord.c:263-269`). The other two `dbPut` bodies in
-            // this module already ran it; this one did not.
-            instance.record.special(&field, false)?;
+            let common_result = {
+                let mut instance = rec.write();
 
-            let prev_value = instance.record.get_field(&field);
-            match instance.record.put_field(&field, value.clone()) {
-                Ok(()) => {}
-                Err(CaError::FieldNotFound(_)) => {
-                    instance.put_common_field(&field, value)?;
+                // The SPC_NOMOD half of that same pass-0 call, refused before
+                // the rset's `special()` is ever dispatched
+                // (`dbPutSpecial`, `dbAccess.c:122-127`). `dbPutField` — the
+                // call this body models — reaches it like every other entry,
+                // through `dbPut` (`dbAccess.c:1265`), so an autosave restore
+                // cannot write a field the `.dbd` declares immutable. This
+                // route was the one dbPut-analogue body that skipped the gate,
+                // which left asynRecord's twelve `special(SPC_NOMOD)` fields
+                // (OMAX, AINP, TINP, IMAX, NORD, EOMR, I32INP, UI32INP, F64INP,
+                // SPR, OPTR, IPTR) restorable, and dbCommon's with them.
+                // An autosave restore is a `dbPutField` (`reboot_restore`), so
+                // a saved link text is held to `dbCanSetLink` exactly as a
+                // `caput` is — that arm of `dbStaticLib.c:2634-2642` is the
+                // one autosave takes. Above the no-mod gate for the reason
+                // given at the other body: C's link route is above `dbPut`.
+                if let Some(text) = check_link_put(
+                    instance.record.record_type(),
+                    instance.common.dtyp.as_str(),
+                    &field,
+                    &value,
+                )? {
+                    value = text;
                 }
-                Err(e) => return Err(e),
+                check_no_mod(&instance, &field)?;
+                // C `dbPutSpecial(paddr, 0)` — the pre-store pass, which
+                // `dbPut` runs on every entry path including the `dbPutField`
+                // this body models (autosave's `reboot_restore`). A non-zero
+                // status returns before the store (`dbAccess.c:1345-1348`), so a
+                // restore cannot write a field the record is currently refusing
+                // (mbboDirect B0..B1F while OMSL=closed_loop,
+                // `mbboDirectRecord.c:263-269`).
+                instance.record.special(&field, false)?;
+                special_before_put(&mut instance, &field);
+
+                let prev_value = instance.record.get_field(&field);
+                // A refused store is HELD, not returned: C runs the pass below
+                // either way (`dbAccess.c:1398`) and lets its status win.
+                let refused = match instance.record.put_field(&field, value.clone()) {
+                    Ok(()) => None,
+                    Err(CaError::FieldNotFound(_)) => {
+                        instance.put_common_field(&field, value)?;
+                        None
+                    }
+                    Err(e) => Some(e),
+                };
+
+                // C `dbPutSpecial(paddr, 1)` — the after-store pass, which
+                // `dbPut` runs UNCONDITIONALLY ("Always do special processing
+                // if needed", `dbAccess.c:1398-1404`) and whose status it
+                // ADOPTS (`if (status2) status = status2;`). It is the pass
+                // that re-derives the field's DEPENDENT state: `calcRecord.c`
+                // recompiles RPCL from CALC, `subRecord.c:188` /
+                // `aSubRecord.c:563-575` re-resolve SNAM through the registry,
+                // SIMM runs `recGblCheckSimm`. Running only pass 0 left a
+                // restored CALC evaluating the old expression and a restored
+                // SNAM running the old routine, with the restore reporting
+                // success — the link route C takes for a DBF link field
+                // (`dbPutFieldLink`, `dbAccess.c:1174,1178`) runs the same pair.
+                let result = special_after_put(
+                    self,
+                    &mut instance,
+                    &field,
+                    &mut special_actions,
+                    link_backing,
+                )?;
+
+                // `if (status) goto done` (`dbAccess.c:1404`) — the refused
+                // store's status stands where the pass above did not replace
+                // it, and skips the UDF clear and the posts below.
+                if let Some(e) = refused {
+                    return Err(e);
+                }
+
+                // An autosave restore of VAL defines the record in C, and a
+                // record left UDF here reports the born UDF_ALARM on its first
+                // process cycle.
+                clear_udf_on_value_put(&mut instance, &field);
+                // Invalidate metadata cache only if the metadata-class
+                // field actually changed (faac1df1).
+                instance.notify_field_written_if_changed(&field, prev_value.as_ref(), link_backing);
+                // The drain of the posts the after pass queued — `special()`
+                // and its post are ONE step, so a mark cannot outlive the put
+                // that made it and be emitted by some later cycle.
+                emit_cycle_posts(&mut instance, link_backing);
+                result
+            };
+
+            // No put-notify is armed here: C's restart owner is the cycle
+            // tail (`end_process_cycle`), never the `pact = FALSE` store.
+
+            // A restored SCAN or PHAS moves the record between scan lists.
+            match common_result {
+                crate::server::record::CommonFieldPutResult::ScanChanged {
+                    old_scan,
+                    new_scan,
+                    phas,
+                } => {
+                    self.update_scan_index(&canonical_base, old_scan, new_scan, phas, phas);
+                }
+                crate::server::record::CommonFieldPutResult::PhasChanged {
+                    scan: s,
+                    old_phas,
+                    new_phas,
+                } => {
+                    self.update_scan_index(&canonical_base, s, s, old_phas, new_phas);
+                }
+                crate::server::record::CommonFieldPutResult::NoChange => {}
             }
-            // C `dbAccess.c::dbPut:1414` `if (isValueField) precord->udf =
-            // FALSE;` — the same clear, through the same predicate, as the
-            // three other put bodies. An autosave restore of VAL defines the
-            // record in C, and a record that is left UDF here reports the
-            // born UDF_ALARM on its first process cycle.
-            if instance.record.is_udf_defining_put(&field) {
-                instance.common.udf = 0;
-            }
-            // Invalidate metadata cache only if the metadata-class
-            // field actually changed (faac1df1).
-            instance.notify_field_written_if_changed(&field, prev_value.as_ref());
+
+            // The link writes the after pass queued, run once the record lock
+            // is down — C reaches them from inside `dbPut`.
+            self.run_special_actions(&canonical_base, &rec, special_actions);
+
             // same SPC_AS parity as `put_pv` / the CA-write
             // path — autosave-style restores writing `.ASG` at IOC
             // startup must still trigger per-client re-eval.
@@ -2853,6 +3257,70 @@ mod tests {
     use super::super::PvDatabase;
     use super::NotifyArrival;
     use crate::types::EpicsValue;
+
+    /// A read of a DECLARED field that has no value is a read FAILURE, not a
+    /// missing channel — and the two must leave `get_pv` by different doors.
+    ///
+    /// Measured against softIoc R7.0.10. `dbgf T:AI.TIME` and
+    /// `dbgf T:AI.BKPT` resolve and then fail: C prints
+    /// `recGblDbaddrError: … Illegal Database Request Type PV: T:AI.TIME` and
+    /// a `failed.` line, because `dbNameToAddr` resolves every declared field
+    /// — `dbCommon.dbd.pod:543-548` and `:564-569` declare `BKPT` and `TIME`
+    /// as `DBF_NOACCESS` — and `dbGet`'s validity gate then refuses
+    /// `field_type > DBF_DEVICE` with `S_db_badDbrtype`. `dbgf T:AI.NOSUCH`
+    /// prints `PV 'T:AI.NOSUCH' not found` instead: nothing resolved.
+    ///
+    /// The port answered `ChannelNotFound` to all three, so `dbgf REC.TIME`
+    /// was indistinguishable from a typo. Note this holds today WITHOUT a
+    /// `FieldDesc` for `TIME`/`BKPT` — `record_declaration_order` already
+    /// lists them, which is what `declares_field` reads.
+    #[epics_macros_rs::epics_test]
+    async fn a_declared_field_with_no_value_reads_as_a_failure_not_a_missing_channel() {
+        use crate::error::CaError;
+        use crate::server::records::ai::AiRecord;
+
+        let db = PvDatabase::new();
+        db.add_record("T:AI", Box::new(AiRecord::new(1.5)))
+            .await
+            .unwrap();
+
+        for field in ["TIME", "BKPT"] {
+            let name = format!("T:AI.{field}");
+            match db.get_pv(&name) {
+                Err(CaError::BadDbrType(msg)) => assert!(
+                    msg.contains(&name),
+                    "the status must name the field, got {msg:?}"
+                ),
+                other => panic!(
+                    "{name} is declared and unreadable, so it must fail the READ; got {other:?}"
+                ),
+            }
+        }
+
+        // Undeclared field, and a record that does not exist: both are
+        // genuinely absent and keep C's `dbNameToAddr` answer.
+        for name in ["T:AI.NOSUCH", "T:NOSUCHREC.VAL"] {
+            assert!(
+                matches!(db.get_pv(name), Err(CaError::ChannelNotFound(_))),
+                "{name} resolves to nothing and must stay not-found, got {:?}",
+                db.get_pv(name)
+            );
+        }
+
+        // The readable controls are untouched, including the `DBF_UINT64`
+        // `UTAG` that sits between `TIME` and `BKPT` in `dbCommon` and reads
+        // fine in both.
+        assert_eq!(db.get_pv("T:AI.VAL").unwrap(), EpicsValue::Double(1.5));
+        assert_eq!(db.get_pv("T:AI.UTAG").unwrap(), EpicsValue::UInt64(0));
+        assert_eq!(
+            db.get_pv("T:AI.NAME").unwrap(),
+            EpicsValue::String("T:AI".into())
+        );
+        assert_eq!(
+            db.get_pv("T:AI.RTYP").unwrap(),
+            EpicsValue::String("ai".into())
+        );
+    }
 
     /// Regression: prior to fixing B1, `put_pv_and_post` walked only
     /// `inner.records` and returned `ChannelNotFound` for everything
@@ -3194,14 +3662,17 @@ mod tests {
         );
     }
 
-    /// `post_property_fields` writes each field through the internal put and
-    /// posts a `DBE_PROPERTY` monitor — the C
+    /// `post_property` writes the `setEnums` block silently and posts a
+    /// single `DBE_PROPERTY` monitor on VAL — the C
     /// `db_post_events(precord, &precord->val, DBE_PROPERTY)` that asyn's
-    /// runtime enum re-propagation drives (devAsynInt32.c callbackEnum). A
-    /// `DBE_VALUE`-only subscriber on the same field must NOT receive it:
-    /// re-keying enum strings is a property change, not a value change.
+    /// runtime enum re-propagation drives (devAsynInt32.c callbackEnum). Two
+    /// halves, and only the pair pins the shape: a `DBE_VALUE`-only VAL
+    /// subscriber must NOT receive it (re-keying enum strings is a property
+    /// change, not a new reading), and a `DBE_PROPERTY` subscriber on the
+    /// written state field must not either (`setEnums` posts on nothing).
     #[epics_macros_rs::epics_test]
-    async fn post_property_fields_writes_and_posts_dbe_property_only() {
+    async fn post_property_writes_the_block_and_posts_dbe_property_on_val() {
+        use crate::server::device_support::PropertyPost;
         use crate::server::recgbl::EventMask;
         use crate::server::records::mbbi::MbbiRecord;
         use crate::types::DbFieldType;
@@ -3212,24 +3683,30 @@ mod tests {
             .unwrap();
         let rec = db.get_record("M:ENUM").expect("record exists");
 
-        let (mut prop_rx, mut val_rx) = {
+        let (mut val_prop_rx, mut val_value_rx, mut zrst_prop_rx) = {
             let mut inst = rec.write();
-            let p = inst
-                .add_subscriber("ZRST", 1, DbFieldType::String, EventMask::PROPERTY.bits())
-                .expect("property subscriber");
-            let v = inst
-                .add_subscriber("ZRST", 2, DbFieldType::String, EventMask::VALUE.bits())
-                .expect("value subscriber");
-            (p, v)
+            let vp = inst
+                .add_subscriber("VAL", 1, DbFieldType::Enum, EventMask::PROPERTY.bits())
+                .expect("VAL property subscriber");
+            let vv = inst
+                .add_subscriber("VAL", 2, DbFieldType::Enum, EventMask::VALUE.bits())
+                .expect("VAL value subscriber");
+            let zp = inst
+                .add_subscriber("ZRST", 3, DbFieldType::String, EventMask::PROPERTY.bits())
+                .expect("ZRST property subscriber");
+            (vp, vv, zp)
         };
 
-        let posted = db
-            .post_property_fields(
+        let written = db
+            .post_property(
                 "M:ENUM",
-                vec![("ZRST".to_string(), EpicsValue::String("LABEL".into()))],
+                PropertyPost {
+                    writes: vec![("ZRST".to_string(), EpicsValue::String("LABEL".into()))],
+                    post_field: "VAL".to_string(),
+                },
             )
-            .expect("post_property_fields succeeds");
-        assert_eq!(posted, vec!["ZRST".to_string()]);
+            .expect("post_property succeeds");
+        assert_eq!(written, vec!["ZRST".to_string()]);
 
         // The field landed on the record.
         assert_eq!(
@@ -3237,21 +3714,23 @@ mod tests {
             EpicsValue::String("LABEL".into())
         );
 
-        // The DBE_PROPERTY subscriber received the event; the DBE_VALUE-only
-        // subscriber did not (mask 0x08 vs 0x01, no intersection).
         assert!(
-            prop_rx.try_recv().is_ok(),
-            "DBE_PROPERTY subscriber must receive the property post"
+            val_prop_rx.try_recv().is_ok(),
+            "the DBE_PROPERTY VAL subscriber is the one C posts to"
         );
         assert!(
-            val_rx.try_recv().is_err(),
+            val_value_rx.try_recv().is_err(),
             "DBE_VALUE-only subscriber must not receive a property post"
+        );
+        assert!(
+            zrst_prop_rx.try_recv().is_err(),
+            "setEnums rewrites the state fields and posts on none of them"
         );
     }
 
     /// Regression: a direct CA put to a record whose value field VAL is NOT
     /// `pp(TRUE)` (calc / calcout / aSub) must still fire a DBE_VALUE monitor.
-    /// C `dbAccess.c::dbPut:1408-1414` posts the value field immediately
+    /// C `dbAccess.c::dbPut:1408-1413` posts the value field immediately
     /// unless it is `pp(TRUE)`. The port previously suppressed the immediate
     /// post for every `VAL` and — with the `should_process` gate — skipped
     /// the reprocess cycle for a non-`pp` VAL, so the operator's write fired
@@ -3284,7 +3763,7 @@ mod tests {
     /// R8-22 (record-field path): a record monitor whose event queue runs short
     /// of room during a burst must receive its EARLIER DISTINCT queued updates
     /// and then a tail entry carrying the latest value. C `db_queue_event_log`
-    /// replaces only `*pLastLog` (`dbEvent.c:812-820`); the earlier entries stay
+    /// replaces only `*pLastLog` (`dbEvent.c:812-827`); the earlier entries stay
     /// queued and each is delivered by `event_read`.
     ///
     /// Each non-pp `VAL` put posts exactly one DBE_VALUE monitor with the put
@@ -3340,7 +3819,7 @@ mod tests {
     /// The notify slot has exactly two states when a restart replay installs
     /// on it, and both must be handled by the one install owner.
     ///
-    /// C cannot reach the occupied one: `restartCheck` (dbNotify.c:149-168)
+    /// C cannot reach the occupied one: `restartCheck` (dbNotify.c:149-170)
     /// pops the head and assigns `precord->ppn = pfirst` under a single lock,
     /// so a restarted notify already owns the record before its callback runs.
     /// The port pops under the put gate and installs a moment later, both
@@ -3389,6 +3868,208 @@ mod tests {
         );
     }
 
+    /// The claim's owner path: a put-notify that reaches its process cycle
+    /// commits, so the wait-set on the record is the one the client waits on
+    /// and nothing releases it behind the cycle's back.
+    ///
+    /// This replaces the three `park_put_notify` boundary tests. Two of their
+    /// boundaries no longer exist to test: "the slot was taken while we were
+    /// writing" cannot happen now that the claim is taken in the same critical
+    /// section as the ownership test, and "the record vanished between the put
+    /// and the park" cannot happen now that the record handle is resolved once
+    /// at the top of the body and used throughout.
+    #[epics_macros_rs::epics_test]
+    async fn a_put_notify_that_processes_commits_its_claim() {
+        use crate::server::records::ai::AiRecord;
+
+        let db = PvDatabase::new();
+        db.add_record("CLAIM:PROC", Box::new(AiRecord::new(0.0)))
+            .await
+            .unwrap();
+        let rec = db.get_record("CLAIM:PROC").expect("record exists");
+
+        let done = db
+            .put_record_field_from_ca("CLAIM:PROC", "VAL", EpicsValue::Double(3.5))
+            .await
+            .expect("a VAL put is accepted");
+        // A passive ai with no chain settles inside the cycle, so the wait-set
+        // has already fired and the record no longer owns it — the completion
+        // path (C `dbNotifyCompletion`) took it, not the claim.
+        assert!(matches!(
+            done,
+            crate::server::record::ProcessCompletion::Sync
+        ));
+        assert!(
+            !rec.read().has_notify(),
+            "the completed cycle must leave the slot free"
+        );
+        assert_eq!(
+            rec.read().record.get_field("VAL"),
+            Some(EpicsValue::Double(3.5))
+        );
+    }
+
+    /// A formerly-bypassing early return: the put drives no process cycle, so
+    /// the claim is never committed and `Drop` has to put the slot back.
+    ///
+    /// `DESC` is not `pp(TRUE)`, so `put_drives_processing_of` is false and the
+    /// body returns `Ok(Sync)` at the last early return before the park. Before
+    /// the claim moved to the entry gate nothing was installed on this path, so
+    /// there was nothing to leak; now there is, and only the finalizer stops
+    /// the record from being owned by a put that has already returned.
+    #[epics_macros_rs::epics_test]
+    async fn a_put_notify_that_drives_no_process_leaves_no_owner() {
+        use crate::server::records::ai::AiRecord;
+
+        let db = PvDatabase::new();
+        db.add_record("CLAIM:NOPROC", Box::new(AiRecord::new(0.0)))
+            .await
+            .unwrap();
+        let rec = db.get_record("CLAIM:NOPROC").expect("record exists");
+
+        db.put_record_field_from_ca(
+            "CLAIM:NOPROC",
+            "DESC",
+            EpicsValue::String("a description".into()),
+        )
+        .await
+        .expect("a DESC put is accepted");
+        assert!(
+            !rec.read().has_notify(),
+            "a put that processed nothing must not leave the record owned"
+        );
+        assert!(
+            !rec.read().notify_restart_pending(),
+            "nothing was queued, so nothing may be left on the restart list"
+        );
+        // The record is free for the next put-notify, which is the property the
+        // leak would destroy: an owned record queues every later notify.
+        db.put_record_field_from_ca("CLAIM:NOPROC", "VAL", EpicsValue::Double(1.0))
+            .await
+            .expect("the next put-notify must not be queued behind a stale owner");
+        assert_eq!(
+            rec.read().record.get_field("VAL"),
+            Some(EpicsValue::Double(1.0))
+        );
+    }
+
+    /// The other formerly-bypassing early return: the write is refused, so the
+    /// body returns `Err` — and because C still processes on a refused notify
+    /// put (`didPut = 1`, dbNotify.c:528-530 → `:243-256`), the claim is
+    /// committed to that cycle rather than released under it.
+    ///
+    /// Either way the record must not stay owned once the call returns; the
+    /// two outcomes differ in WHO releases the set, not in whether it is
+    /// released.
+    #[epics_macros_rs::epics_test]
+    async fn a_refused_put_notify_leaves_no_owner() {
+        use crate::server::records::ai::AiRecord;
+
+        let db = PvDatabase::new();
+        db.add_record("CLAIM:REFUSED", Box::new(AiRecord::new(0.0)))
+            .await
+            .unwrap();
+        let rec = db.get_record("CLAIM:REFUSED").expect("record exists");
+
+        let refused = db
+            .put_record_field_from_ca(
+                "CLAIM:REFUSED",
+                "VAL",
+                EpicsValue::String("not a number".into()),
+            )
+            .await;
+        assert!(refused.is_err(), "a non-numeric VAL put must be refused");
+        assert!(
+            !rec.read().has_notify(),
+            "a refused put-notify must not leave the record owned"
+        );
+        assert!(
+            !rec.read().notify_restart_pending(),
+            "a refused put-notify must queue nothing"
+        );
+    }
+
+    /// The discriminator `a_refused_put_notify_leaves_no_owner` cannot supply.
+    /// Commit-then-cycle and release-then-cycle agree only once the cycle has
+    /// COMPLETED, so an end-state assertion cannot separate them. Give the
+    /// cycle somewhere to stop — a calcout with `ODLY > 0` returns
+    /// `AsyncPendingNotify` and finishes on the delayed callback — and they
+    /// disagree while it is in flight.
+    ///
+    /// C is unambiguous: `putCallback` returns `didPut = 1` on the refused
+    /// write (`dbNotify.c:528-530`), so `processNotifyCommon` assigns
+    /// `precord->ppn = ppn` and calls `dbProcess` (`:243-256`) — the record
+    /// processes UNDER the notify, and `dbNotifyCompletion` is what ends it.
+    /// Releasing the claim first runs the same cycle with no notifier attached.
+    #[epics_macros_rs::epics_test]
+    async fn a_refused_put_notify_stays_installed_while_its_cycle_is_async() {
+        use crate::server::records::calcout::CalcoutRecord;
+
+        let db = PvDatabase::new();
+        db.add_record("CLAIM:ODLY", Box::new(CalcoutRecord::default()))
+            .await
+            .unwrap();
+        let rec = db.get_record("CLAIM:ODLY").expect("record exists");
+        // Long enough that the delayed continuation cannot land mid-test.
+        db.put_record_field_from_ca("CLAIM:ODLY", "ODLY", EpicsValue::Double(3600.0))
+            .await
+            .expect("ODLY is settable");
+        assert!(
+            !rec.read().has_notify(),
+            "the ODLY put drives no cycle, so it owns nothing"
+        );
+
+        // C `caput REC.PROC <non-numeric>`: the store is refused and the
+        // `pp(TRUE)` process still runs.
+        let refused = db
+            .put_record_field_from_ca("CLAIM:ODLY", "PROC", EpicsValue::String("nope".into()))
+            .await;
+        assert!(refused.is_err(), "a non-numeric PROC put must be refused");
+        assert!(
+            rec.read().is_processing(),
+            "ODLY > 0 defers the calcout output, so the cycle is still in flight"
+        );
+        assert!(
+            rec.read().has_notify(),
+            "the async cycle runs under the refused put's wait-set: releasing \
+             the claim before driving it leaves that cycle with no notifier"
+        );
+    }
+
+    /// The same boundary for the OTHER commit-before-the-cycle site: "Cause B",
+    /// a refused conversion on a `pp` field that still drives the record. The
+    /// PROC intercept above has its own copy of this rule, so a discriminator
+    /// for one does not cover the other.
+    #[epics_macros_rs::epics_test]
+    async fn a_refused_pp_field_put_stays_installed_while_its_cycle_is_async() {
+        use crate::server::records::calcout::CalcoutRecord;
+
+        let db = PvDatabase::new();
+        db.add_record("CLAIM:ODLYB", Box::new(CalcoutRecord::default()))
+            .await
+            .unwrap();
+        let rec = db.get_record("CLAIM:ODLYB").expect("record exists");
+        db.put_record_field_from_ca("CLAIM:ODLYB", "ODLY", EpicsValue::Double(3600.0))
+            .await
+            .expect("ODLY is settable");
+
+        // `A` is `pp(TRUE)` for calcout (C `calcoutRecord.dbd`), so a refused
+        // conversion on it takes the Cause-B arm rather than returning early.
+        let refused = db
+            .put_record_field_from_ca("CLAIM:ODLYB", "A", EpicsValue::String("nope".into()))
+            .await;
+        assert!(refused.is_err(), "a non-numeric A put must be refused");
+        assert!(
+            rec.read().is_processing(),
+            "ODLY > 0 defers the calcout output, so the cycle is still in flight"
+        );
+        assert!(
+            rec.read().has_notify(),
+            "Cause B commits to its cycle for the same reason the PROC refusal \
+             does: C reaches doProcess with didPut = 1 and assigns precord->ppn"
+        );
+    }
+
     /// The other boundary value of the same slot: free, so the replay installs
     /// and drives the cycle.
     #[epics_macros_rs::epics_test]
@@ -3415,6 +4096,330 @@ mod tests {
         assert!(
             !rec.read().notify_restart_pending(),
             "nothing is queued when the replay took the slot"
+        );
+    }
+
+    /// The gate is keyed on the DECLARED DBF class, so the claim to prove is
+    /// over the CLASS and not over the ten fields the defect was found on.
+    ///
+    /// `#C0 S0 @p` parses to `VME_IO` (C `dbParseLink`'s `hwid == "CS"` arm,
+    /// `dbStaticLib.c:2315`, which does not consult the field type), and no
+    /// vendored `device()` line in this workspace declares a bus at all — the
+    /// generated tables carry `CONSTANT` and `INST_IO` and nothing else. So C
+    /// refuses that text on EVERY `DBF_INLINK`/`DBF_OUTLINK`/`DBF_FWDLINK`
+    /// field of every record type, and every one of them must be refused here.
+    ///
+    /// The exempt set is named rather than counted loosely: a record type whose
+    /// `.dbd` declares no `device()` has no `devSup` for `INP`/`OUT`, so
+    /// `declared_link_type` answers `None` — nothing to compare, and C would
+    /// have a device support there that this port does not (see
+    /// `declared_link_type`'s own note). Those are the ONLY fields the sweep
+    /// may skip, and they are all `INP`/`OUT`.
+    #[test]
+    fn every_declared_link_class_field_is_gated_by_class() {
+        use crate::server::record::dbd_generated::RECORD_TYPES;
+        use crate::server::record::{declared_fields, declared_link_type};
+
+        let hw = EpicsValue::String("#C0 S0 @p".into());
+        let mut gated = 0usize;
+        let mut exempt = Vec::new();
+        let mut accepted = Vec::new();
+        for record_type in RECORD_TYPES {
+            for desc in declared_fields(record_type) {
+                if crate::types::dbf_link_class(record_type, desc.name).is_none() {
+                    continue;
+                }
+                if declared_link_type(record_type, None, desc.name).is_none() {
+                    exempt.push(format!("{record_type}.{}", desc.name));
+                    continue;
+                }
+                if super::check_link_put(record_type, "", desc.name, &hw).is_err() {
+                    gated += 1;
+                } else {
+                    accepted.push(format!("{record_type}.{}", desc.name));
+                }
+            }
+        }
+        assert!(
+            accepted.is_empty(),
+            "a hardware link no vendored device() declares was accepted on {accepted:?}"
+        );
+        assert!(
+            exempt
+                .iter()
+                .all(|f| f.ends_with(".INP") || f.ends_with(".OUT")),
+            "only the device link of a type with no vendored device() may be exempt: {exempt:?}"
+        );
+        // The generator emits 265 DBF_INLINK, 103 DBF_OUTLINK and 17
+        // DBF_FWDLINK declarations across its record tables, plus dbCommon's
+        // TSEL/SDIS/FLNK once per type. A drop here means the sweep stopped
+        // seeing the population, not that the population shrank.
+        assert_eq!(
+            gated + exempt.len(),
+            LINK_CLASS_FIELD_COUNT,
+            "the sweep must reach every declared link-class field"
+        );
+        assert!(gated > 400, "only {gated} fields reached the gate");
+
+        // The ten fields the defect was cited on are inside what was just
+        // swept — the sample, shown to be part of the population.
+        for (record_type, field) in [
+            ("ai", "SDIS"),
+            ("ai", "TSEL"),
+            ("ai", "FLNK"),
+            ("ai", "SIML"),
+            ("ai", "SIOL"),
+            ("ai", "INP"),
+            ("calc", "INPA"),
+            ("ao", "DOL"),
+            ("ao", "OUT"),
+            ("fanout", "LNK1"),
+        ] {
+            assert!(
+                super::check_link_put(record_type, "", field, &hw).is_err(),
+                "{record_type}.{field} must refuse a VME_IO link"
+            );
+        }
+    }
+
+    /// The population the sweep above walks, counted once so a change in the
+    /// generator's output shows up as one failure rather than as a silently
+    /// smaller sweep.
+    const LINK_CLASS_FIELD_COUNT: usize = 505;
+
+    /// The gate order is observable exactly where a link-class field is also
+    /// `special(SPC_NOMOD)`: C runs `dbCanSetLink` first and reaches the
+    /// no-mod refusal only from `dbPutSpecial(paddr, 0)` afterwards, so on
+    /// such a field a type-invalid text answers `S_dbLib_badField` and a
+    /// type-valid one answers `S_db_noMod`. `aSub.SUBL` is the only field in
+    /// the vendored population that is both, and the count is pinned rather
+    /// than assumed: a second one appearing changes which orders are
+    /// equivalent, and this is the test that says so.
+    #[test]
+    fn asub_subl_is_the_only_read_only_link_field() {
+        use crate::server::record::dbd_generated::RECORD_TYPES;
+        use crate::server::record::{Special, declared_fields};
+
+        let mut offenders = Vec::new();
+        for record_type in RECORD_TYPES {
+            for desc in declared_fields(record_type) {
+                if crate::types::dbf_link_class(record_type, desc.name).is_none() {
+                    continue;
+                }
+                if desc.read_only
+                    || desc.special == Special::NoMod
+                    || desc.declared_special == Special::NoMod
+                {
+                    offenders.push(format!("{record_type}.{}", desc.name));
+                }
+            }
+        }
+        assert_eq!(
+            offenders,
+            ["aSub.SUBL"],
+            "the set of link fields where the gate order is observable has changed"
+        );
+    }
+
+    /// The wiring: both `dbPutField`-analogue bodies refuse the link C refuses,
+    /// across all three DBF classes and both storage kinds (a `dbCommon` link
+    /// held in `CommonFields`, and one declared by the record type itself), and
+    /// the refused field keeps the text it had.
+    ///
+    /// `@instio p` is the text to use because it is what a user actually types
+    /// — every asyn device support takes that form — and because it is refused
+    /// for the reason C gives: these fields have no `devSup`, so
+    /// `dbCanSetLink` holds them to `CONSTANT` (`dbStaticLib.c:2403`).
+    #[epics_macros_rs::epics_test]
+    async fn both_db_put_field_bodies_refuse_a_device_link_on_every_class() {
+        use crate::server::records::ao::AoRecord;
+        use crate::server::records::calc::CalcRecord;
+        use crate::server::records::fanout::FanoutRecord;
+
+        let db = PvDatabase::new();
+        db.add_record("LK:CALC", Box::new(CalcRecord::new("A")))
+            .await
+            .unwrap();
+        db.add_record("LK:AO", Box::new(AoRecord::new(0.0)))
+            .await
+            .unwrap();
+        db.add_record("LK:FO", Box::new(FanoutRecord::new()))
+            .await
+            .unwrap();
+
+        // (record, field, DBF class, storage) — INLINK/OUTLINK/FWDLINK each
+        // appear in both a `dbCommon` and a record-declared row.
+        let cases = [
+            ("LK:CALC", "SDIS"), // DBF_INLINK,   dbCommon
+            ("LK:CALC", "TSEL"), // DBF_INLINK,   dbCommon
+            ("LK:CALC", "INPA"), // DBF_INLINK,   record-declared
+            ("LK:AO", "DOL"),    // DBF_INLINK,   record-declared
+            ("LK:AO", "SIML"),   // DBF_INLINK,   record-declared
+            ("LK:AO", "SIOL"),   // DBF_OUTLINK,  record-declared
+            ("LK:AO", "OUT"),    // DBF_OUTLINK,  dbCommon
+            ("LK:CALC", "FLNK"), // DBF_FWDLINK,  dbCommon
+            ("LK:FO", "LNK1"),   // DBF_FWDLINK,  record-declared
+        ];
+
+        for (name, field) in cases {
+            let before = db
+                .get_pv(&format!("{name}.{field}"))
+                .unwrap_or_else(|e| panic!("{name}.{field} must be readable: {e}"));
+
+            let ca = db
+                .put_record_field_from_ca_no_notify(
+                    name,
+                    field,
+                    EpicsValue::String("@instio p".into()),
+                )
+                .await;
+            assert!(
+                ca.is_err(),
+                "{name}.{field}: a caput of an INST_IO link must be refused, as C's \
+                 dbPutFieldLink refuses it"
+            );
+
+            let restore = db
+                .put_pv_no_process(
+                    &format!("{name}.{field}"),
+                    EpicsValue::String("@instio p".into()),
+                )
+                .await;
+            assert!(
+                restore.is_err(),
+                "{name}.{field}: an autosave restore is a dbPutField too"
+            );
+
+            let after = db
+                .get_pv(&format!("{name}.{field}"))
+                .unwrap_or_else(|e| panic!("{name}.{field} must still be readable: {e}"));
+            assert_eq!(
+                format!("{before:?}"),
+                format!("{after:?}"),
+                "{name}.{field} must keep the text it had — C leaves the link untouched"
+            );
+        }
+
+        // The control: the same fields take a link of the type they DO expect,
+        // so the gate refuses by type and not by class membership.
+        db.put_record_field_from_ca_no_notify(
+            "LK:CALC",
+            "INPA",
+            EpicsValue::String("SRC.VAL".into()),
+        )
+        .await
+        .expect("a PV_LINK is what CONSTANT accepts (dbStaticLib.c:2408-2416)");
+        let stored = db.get_pv("LK:CALC.INPA").unwrap();
+        let EpicsValue::String(stored) = stored else {
+            panic!("a link field serves as DBF_STRING, got {stored:?}");
+        };
+        assert!(
+            stored.as_str_lossy().starts_with("SRC.VAL"),
+            "the accepted link is the one that was written, got {stored:?}"
+        );
+    }
+
+    /// C's request-type switch for a link field (`dbAccess.c:1084-1096`):
+    /// `DBR_STRING`, or `DBR_CHAR`/`DBR_UCHAR` whose last element is the NUL,
+    /// and `S_db_badDbrtype` for everything else. Measured against softIoc
+    /// R7.0.10 over CA on `SDIS`, `INPA`, `OUT` and `LNK1` — a `DBR_DOUBLE`,
+    /// `DBR_LONG`, `DBR_SHORT` or `DBR_ENUM` put fails the channel write and
+    /// leaves the link text alone, while a lone NUL byte succeeds and CLEARS
+    /// the link. The port used to convert every one of them to a string and
+    /// store it, so `caput` of a number turned a link into `"5"`.
+    ///
+    /// `DESC` is the control: it is `DBF_STRING` and not a link, so the same
+    /// requests are converted and stored there, in C and here alike. That is
+    /// what makes this a rule about the link route rather than about strings.
+    #[epics_macros_rs::epics_test]
+    async fn a_link_field_takes_only_a_string_or_a_nul_terminated_char_array() {
+        use crate::server::records::calc::CalcRecord;
+
+        let db = PvDatabase::new();
+        db.add_record("TY:CALC", Box::new(CalcRecord::new("A")))
+            .await
+            .unwrap();
+        db.put_record_field_from_ca_no_notify(
+            "TY:CALC",
+            "SDIS",
+            EpicsValue::String("SRC.VAL".into()),
+        )
+        .await
+        .expect("a DBR_STRING link put is what C accepts");
+
+        for bad in [
+            EpicsValue::Double(5.0),
+            EpicsValue::Long(5),
+            EpicsValue::Short(5),
+            EpicsValue::Enum(1),
+            EpicsValue::Float(5.0),
+            EpicsValue::Int64(5),
+            // `pstring[nRequest - 1] != '\0'` with `nRequest == 1`.
+            EpicsValue::Char(b'S'),
+            EpicsValue::UChar(b'S'),
+            // Same test with a longer buffer: the LAST element must be the NUL,
+            // an interior one does not save it.
+            EpicsValue::CharArray(b"SRC.VAL".to_vec()),
+            EpicsValue::CharArray(b"SRC\0VAL".to_vec()),
+        ] {
+            let ca = db
+                .put_record_field_from_ca_no_notify("TY:CALC", "SDIS", bad.clone())
+                .await;
+            assert!(
+                matches!(ca, Err(crate::server::database::CaError::BadDbrType(_))),
+                "a {bad:?} put to a link field is S_db_badDbrtype in C, got {ca:?}"
+            );
+            let restore = db.put_pv_no_process("TY:CALC.SDIS", bad.clone()).await;
+            assert!(
+                matches!(
+                    restore,
+                    Err(crate::server::database::CaError::BadDbrType(_))
+                ),
+                "the autosave body is a dbPutField too, got {restore:?} for {bad:?}"
+            );
+            let held = db.get_pv("TY:CALC.SDIS").unwrap();
+            assert!(
+                matches!(&held, EpicsValue::String(s) if s.as_str_lossy().starts_with("SRC.VAL")),
+                "a refused put must leave the link text alone, got {held:?}"
+            );
+        }
+
+        // The NUL-terminated char array is C's other accepted form, and the
+        // text is the C string it holds — not the byte values, and not the
+        // bytes past the terminator.
+        db.put_record_field_from_ca_no_notify(
+            "TY:CALC",
+            "SDIS",
+            EpicsValue::CharArray(b"OTHER.VAL\0".to_vec()),
+        )
+        .await
+        .expect("a NUL-terminated DBR_CHAR buffer is accepted");
+        let held = db.get_pv("TY:CALC.SDIS").unwrap();
+        assert!(
+            matches!(&held, EpicsValue::String(s) if s.as_str_lossy().starts_with("OTHER.VAL")),
+            "the stored text is the C string in the buffer, got {held:?}"
+        );
+
+        // A lone NUL is `nRequest == 1` with the terminator in place: accepted,
+        // and the link text is empty. Storing the byte's decimal spelling
+        // (`"0"`) is the bug this arm closes.
+        db.put_record_field_from_ca_no_notify("TY:CALC", "SDIS", EpicsValue::Char(0))
+            .await
+            .expect("a lone NUL clears the link, as in C");
+        assert_eq!(
+            db.get_pv("TY:CALC.SDIS").unwrap(),
+            EpicsValue::String("".into()),
+            "C stores the empty C string, not the byte's decimal spelling"
+        );
+
+        // Control: DESC is DBF_STRING and not a link, so C converts and stores.
+        db.put_record_field_from_ca_no_notify("TY:CALC", "DESC", EpicsValue::Double(5.0))
+            .await
+            .expect("a non-link string field converts, in C and here");
+        assert!(
+            matches!(db.get_pv("TY:CALC.DESC").unwrap(),
+                     EpicsValue::String(s) if s.as_str_lossy() == "5"),
+            "the control must show the refusal is the link route, not the string type"
         );
     }
 }

@@ -23,6 +23,7 @@
 //! and serving `EGU` for a field its rset skips is as much a wire divergence
 //! as serving `""` for one it fills.
 
+use epics_base_rs::server::database::LinkBacking;
 use epics_base_rs::server::record::{Record, RecordInstance};
 use epics_base_rs::server::records::ai::AiRecord;
 use epics_base_rs::server::records::busy::BusyRecord;
@@ -73,7 +74,7 @@ fn limit(v: f64) -> EpicsValue {
 }
 
 fn units(inst: &RecordInstance, field: &str) -> String {
-    inst.snapshot_for_field(field)
+    inst.snapshot_for_field_with(field, LinkBacking::none())
         .unwrap_or_else(|| panic!("{field} has no snapshot"))
         .units()
         .unwrap_or_else(|| panic!("{field} serves no units leaf"))
@@ -82,7 +83,7 @@ fn units(inst: &RecordInstance, field: &str) -> String {
 }
 
 fn precision(inst: &RecordInstance, field: &str) -> i16 {
-    inst.snapshot_for_field(field)
+    inst.snapshot_for_field_with(field, LinkBacking::none())
         .unwrap_or_else(|| panic!("{field} has no snapshot"))
         .precision()
         .unwrap_or_else(|| panic!("{field} serves no precision leaf"))
@@ -90,14 +91,14 @@ fn precision(inst: &RecordInstance, field: &str) -> i16 {
 
 /// `(lower, upper)`, as [`Snapshot::display_limits`] returns them.
 fn display(inst: &RecordInstance, field: &str) -> (f64, f64) {
-    inst.snapshot_for_field(field)
+    inst.snapshot_for_field_with(field, LinkBacking::none())
         .unwrap_or_else(|| panic!("{field} has no snapshot"))
         .display_limits()
         .unwrap_or_else(|| panic!("{field} serves no display limits"))
 }
 
 fn control(inst: &RecordInstance, field: &str) -> (f64, f64) {
-    inst.snapshot_for_field(field)
+    inst.snapshot_for_field_with(field, LinkBacking::none())
         .unwrap_or_else(|| panic!("{field} has no snapshot"))
         .control_limits()
         .unwrap_or_else(|| panic!("{field} serves no control limits"))
@@ -132,7 +133,7 @@ fn sel_val_serves_the_record_and_not_the_zero_seed() {
 }
 
 /// `selRecord.c:138` tests `field_type == DBF_DOUBLE` before copying `EGU`, so
-/// `SELN` (DBF_USHORT) keeps `dbAccess.c:378`'s zeroed buffer. Supplying the
+/// `SELN` (DBF_USHORT) keeps `dbAccess.c:377`'s zeroed buffer. Supplying the
 /// record-level cache without this test would put `mm` on a channel C leaves
 /// empty.
 #[test]
@@ -182,7 +183,7 @@ fn dfanout_val_serves_all_four_slots() {
 
 /// `subArray` is absent from every arm the `waveform` family had, and
 /// `waveform.rs`'s shared override answers `None` for `VAL`.
-/// `subArrayRecord.c:206-227` and `:231-291` all answer from the record.
+/// `subArrayRecord.c:202-223` and `:227-287` all answer from the record.
 #[test]
 fn subarray_val_serves_the_record_where_the_waveform_arm_skipped_it() {
     let fields = |ftvl: i16| {
@@ -200,11 +201,11 @@ fn subarray_val_serves_the_record_where_the_waveform_arm_skipped_it() {
     assert_eq!(units(&inst, "VAL"), "mm");
     assert_eq!(display(&inst, "VAL"), (-7.0, 7.0));
     assert_eq!(control(&inst, "VAL"), (-7.0, 7.0));
-    // `subArrayRecord.c:206-217` names three fields; `NELM` is not one of
+    // `subArrayRecord.c:202-213` names three fields; `NELM` is not one of
     // them, so C leaves its units empty.
     assert_eq!(units(&inst, "NELM"), "");
 
-    // `subArrayRecord.c:211-213` breaks out of the `VAL` case for a STRING or
+    // `subArrayRecord.c:208-209` breaks out of the `VAL` case for a STRING or
     // ENUM element type, so the same record with `FTVL` 0 serves no units on
     // VAL while `HOPR` keeps them.
     let strings = load(WaveformRecord::with_kind(ArrayKind::SubArray), &fields(0));
@@ -212,7 +213,7 @@ fn subarray_val_serves_the_record_where_the_waveform_arm_skipped_it() {
     assert_eq!(units(&strings, "HOPR"), "mm");
 }
 
-/// `histogramRecord.c:420-439` is a bare switch with NO `prec->prec` seed
+/// `histogramRecord.c:419-438` is a bare switch with NO `prec->prec` seed
 /// ahead of it, so its `default:` arm really does leave zero — `SDLY` is the
 /// one DBF_DOUBLE field outside the named set and must stay 0 while its five
 /// siblings take `PREC`.
@@ -231,7 +232,7 @@ fn histogram_names_five_precision_fields_and_sdly_is_not_one() {
         assert_eq!(precision(&inst, field), 3, "{field} takes prec->prec");
     }
     assert_eq!(precision(&inst, "SDLY"), 0);
-    // `histogramRecord.c:411-417` writes `"s"` for SDEL and nothing else;
+    // `histogramRecord.c:410-417` writes `"s"` for SDEL and nothing else;
     // histogram has no EGU field at all.
     assert_eq!(units(&inst, "SDEL"), "s");
     assert_eq!(units(&inst, "VAL"), "");

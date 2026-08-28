@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 
 use super::error::{AutosaveError, AutosaveResult};
+use crate::server::db_loader::MacroFault;
 
 /// Macro expansion context for `$(KEY)` and `${KEY}` patterns.
 #[derive(Debug, Clone, Default)]
@@ -55,9 +56,17 @@ impl MacroContext {
     /// suppression — not just the flat `$(KEY)` / `$(KEY=default)` subset.
     ///
     /// Autosave-specific options: `env_fallback` (C `macEnvExpand`) and
-    /// `dollar_escape` (`$$` → literal `$`, a `.req` convenience). An
-    /// undefined macro with no default is a hard error (the engine
-    /// records it; the placeholder text is discarded).
+    /// `dollar_escape` (`$$` → literal `$`, a `.req` convenience).
+    ///
+    /// Either fault the engine can record is a hard error here — an
+    /// undefined macro with no default, and a macro that resolves into
+    /// itself — because both leave a placeholder where the `.req` wanted
+    /// a PV name, and a `.req` line built from a placeholder names a PV
+    /// that does not exist. Which one it was is read from
+    /// [`MacroExpansion::fault`], never from one of its lists, so a new
+    /// fault arm cannot be silently accepted here.
+    ///
+    /// [`MacroExpansion::fault`]: crate::server::db_loader::MacroExpansion::fault
     pub fn expand(&self, input: &str, source: &str, line: usize) -> AutosaveResult<String> {
         let result = crate::server::db_loader::expand_macros(
             input,
@@ -65,16 +74,30 @@ impl MacroContext {
             crate::server::db_loader::MacroExpandOptions {
                 env_fallback: true,
                 dollar_escape: true,
+                // Not a base C path, and this caller turns the first
+                // fault into an error rather than accepting the
+                // placeholder — so macLib's own warning would be noise
+                // printed just before a hard failure that names the same
+                // macro.
+                suppress_warnings: true,
             },
         );
-        if let Some(key) = result.undefined.first() {
-            return Err(AutosaveError::UndefinedMacro {
-                key: key.clone(),
+        let fault = result.fault().map(|fault| match fault {
+            MacroFault::Undefined(key) => AutosaveError::UndefinedMacro {
+                key: key.to_string(),
                 source: source.to_string(),
                 line,
-            });
+            },
+            MacroFault::Recursive(key) => AutosaveError::RecursiveMacro {
+                key: key.to_string(),
+                source: source.to_string(),
+                line,
+            },
+        });
+        match fault {
+            Some(err) => Err(err),
+            None => Ok(result.text),
         }
-        Ok(result.text)
     }
 
     pub fn get(&self, key: &str) -> Option<&str> {
@@ -188,6 +211,26 @@ mod tests {
                 assert_eq!(line, 7);
             }
             other => panic!("expected UndefinedMacro, got {other:?}"),
+        }
+    }
+
+    /// A `.req` whose macros resolve into one another expanded to the
+    /// recursion placeholder and returned `Ok`, because `expand` read
+    /// the undefined list and a recursive name is never in it. The
+    /// caller then built a PV name out of the placeholder.
+    #[test]
+    fn recursive_macro_is_an_error_not_placeholder_text() {
+        let ctx = MacroContext::from_map(
+            [("A".into(), "$(B)".into()), ("B".into(), "$(A)".into())].into(),
+        );
+        let err = ctx.expand("$(A)", "cycle.req", 7).unwrap_err();
+        match err {
+            AutosaveError::RecursiveMacro { key, source, line } => {
+                assert_eq!(key, "A");
+                assert_eq!(source, "cycle.req");
+                assert_eq!(line, 7);
+            }
+            other => panic!("expected RecursiveMacro, got {other:?}"),
         }
     }
 }

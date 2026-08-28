@@ -1,10 +1,12 @@
-// RTEMS-EXEC-MODEL-ALLOW(1): CaServerBuilder::build binds a tokio::net listener (needs a reactor); runs and passes in the feature-ON suite.
 use epics_base_rs::server::record::Record;
 use epics_base_rs::server::records::busy::BusyRecord;
 use epics_base_rs::types::EpicsValue;
+#[cfg(tokio_backend)]
 use epics_ca_rs::server::CaServerBuilder;
+#[cfg(tokio_backend)]
 use std::collections::HashMap;
 
+#[cfg(tokio_backend)]
 #[test]
 fn test_register_record_type() {
     let builder = CaServerBuilder::new()
@@ -15,8 +17,11 @@ fn test_register_record_type() {
 }
 
 // `#[tokio::test]`, not `#[epics_test]`: `CaServerBuilder::build` binds a
-// `tokio::net` listener, which needs a real reactor on both backends. The
-// census marker accounts for it.
+// `tokio::net` listener, which needs a real reactor. That is why this test and
+// the `CaServerBuilder` one above are `tokio_backend`, and why the file
+// carries no census marker: on the reactor-free backend neither is compiled,
+// so there is nothing for a marker to vouch for.
+#[cfg(tokio_backend)]
 #[tokio::test]
 async fn test_db_file_load() {
     let db = r#"

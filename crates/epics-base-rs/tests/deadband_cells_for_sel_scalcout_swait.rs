@@ -2,8 +2,11 @@
 //! records have.
 //!
 //! All three deadband VAL in C — `selRecord.c:316,319`,
-//! `sCalcoutRecord.c:828,837`, `swaitRecord.c:630,639` — against `prec->mlst`
-//! and `prec->alst`, which their `init_record` leaves at 0. The port declared
+//! `sCalcoutRecord.c:822-828,831-837`, `swaitRecord.c:624-630,633-639` —
+//! against `prec->mlst` and `prec->alst`, which their `init_record` leaves at
+//! 0. One span per cell: `sel` reaches both through `recGblCheckDeadband`, so
+//! a statement each is the whole of it, while its two siblings open-code the
+//! same logic twice and the MLST and ALST groups are separate. The port declared
 //! both fields in the DBD but served neither, so the framework had nowhere to
 //! remember the last posted value: every cycle was the first one, and a record
 //! sitting at its initial 0.0 posted a change that C does not make.

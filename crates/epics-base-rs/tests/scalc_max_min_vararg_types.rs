@@ -42,7 +42,7 @@ fn ev(expr: &str) -> Result<StackValue, CalcError> {
 
 /// C `sCalcPerform`'s return code paired with the `*presult` it wrote: a
 /// non-finite result is `st=-1` WITH the value in hand (`sCalcPerform.c:2034-2056`
-/// writes the cell, then `:2056` returns -1).
+/// writes the cell, then `:2055` returns -1).
 fn perform(expr: &str) -> (f64, bool) {
     let mut inputs = StringInputs::new();
     let r = scalc_perform(&scalc_compile(expr).unwrap(), &mut inputs, 6).unwrap();

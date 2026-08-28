@@ -1,5 +1,7 @@
 use crate::error::{CaError, CaResult};
-use crate::server::record::{FieldMetadataOverride, MENU_SIMM, ProcessOutcome, Record};
+use crate::server::record::{
+    FieldMetadataOverride, MENU_SIMM, ProcessOutcome, Record, ValuePostGate,
+};
 use crate::server::records::convert_phase::ConvertPhase;
 use crate::types::{EpicsValue, PvString};
 
@@ -23,6 +25,12 @@ pub struct AoRecord {
     // Conversion
     pub rval: i32,
     pub oraw: i32, // old raw value for monitor
+    /// C `aoRecord.c:482` `prec->omod = (prec->oval != value);` — "the output
+    /// moved this cycle". It opens the OVAL/RVAL/RBV post block on a cycle
+    /// where VAL's own monitor mask is empty (`:535`), which is why it is a
+    /// field and not a local: OROC can walk OVAL one step per cycle toward a
+    /// VAL that has not moved since MLST.
+    pub omod: bool,
     pub rbv: i32,  // readback value
     pub orbv: i32, // old readback value
     pub oval: f64,
@@ -115,6 +123,7 @@ impl Default for AoRecord {
             drvl: 0.0,
             rval: 0,
             oraw: 0,
+            omod: false,
             rbv: 0,
             orbv: 0,
             oval: 0.0,
@@ -188,6 +197,9 @@ impl AoRecord {
             }
         }
 
+        // C `aoRecord.c:482-483`, in this order: the flag is the comparison
+        // against the PREVIOUS oval, then oval takes the new value.
+        self.omod = self.oval != value;
         self.oval = value; // oval = rate-limited output value
 
         // convert(): engineering units to raw value
@@ -262,8 +274,11 @@ impl AoRecord {
         } else {
             self.rval = i32::MIN;
         }
-
-        self.oraw = self.rval;
+        // NOT `self.oraw = self.rval` — C advances `oraw` only from inside the
+        // guarded post (`aoRecord.c:542`), so a cycle that moves RVAL without
+        // posting it (a caput to ASLO/AOFF/LINR, then a process with VAL
+        // unchanged) must leave ORAW stale for the next guarded cycle to find.
+        // `note_secondary_value_posted` is the owner.
     }
 
     /// C `processAo` readback `raw → eng` inverse convert (devAsynInt32.c:
@@ -380,17 +395,24 @@ impl Record for AoRecord {
         )]
     }
 
-    /// C `aoRecord.c:156-161` — the init tail, run right after the constant
-    /// load: `oval = pval = val; mlst = alst = lalm = val; oraw = rval;
-    /// orbv = rbv`. softIoc with `field(DOL,"5")` reports OVAL=5 at init.
-    fn seed_deadband_tracking(&mut self) {
+    /// C `aoRecord.c:156,160-161` — the derived half of the init tail, run
+    /// right after the constant load: `oval = pval = val`, then
+    /// `oraw = rval; orbv = rbv`. softIoc with `field(DOL,"5")` reports OVAL=5
+    /// at init.
+    fn init_record_tail(&mut self) {
         self.oval = self.val;
         self.pval = self.val;
+        self.oraw = self.rval;
+        self.orbv = self.rbv;
+    }
+
+    /// C `aoRecord.c:157-159` — `mlst = alst = lalm = val`, all three, which is
+    /// what the framework default would do anyway; spelled out because the
+    /// derived half above is this record's own.
+    fn seed_deadband_tracking(&mut self) {
         self.mlst = self.val;
         self.alst = self.val;
         self.lalm = self.val;
-        self.oraw = self.rval;
-        self.orbv = self.rbv;
     }
 
     // C `aoRecord.c::process` IVOA=Set_output_to_IVOV (lines 207-213):
@@ -429,6 +451,90 @@ impl Record for AoRecord {
             self.init = ConvertPhase::Initial;
         }
         Ok(())
+    }
+
+    /// C `aoRecord.c::monitor` (`:531-549`) posts OVAL from INSIDE
+    /// `if (monitor_mask)` with **no test of OVAL's own value**:
+    ///
+    /// ```c
+    /// if(prec->omod) monitor_mask |= (DBE_VALUE|DBE_LOG);
+    /// if(monitor_mask) {
+    ///     prec->omod = FALSE;
+    ///     db_post_events(prec,&prec->oval,monitor_mask);
+    /// ```
+    ///
+    /// On a cycle whose only event is an alarm transition, `monitor_mask` is
+    /// the alarm bits alone and `omod` is false (the output did not move), so
+    /// C still sends OVAL to a `DBE_ALARM` subscriber. The port's aux post is
+    /// change-detected, so an unchanged OVAL reached nobody — this hook is the
+    /// unchanged-field arm, and it posts with the alarm bits, which is exactly
+    /// `monitor_mask` on such a cycle.
+    ///
+    /// The CHANGED arm needs nothing: the framework's aux mask is
+    /// `alarm_bits | DBE_VALUE | DBE_LOG`, and C's is
+    /// `monitor_mask | DBE_VALUE | DBE_LOG` where the deadband bits it adds
+    /// (`DBE_VALUE` from MDEL, `DBE_ARCHIVE` from ADEL) are already in that
+    /// pair. RVAL/RBV are NOT named here: C gates each on its own
+    /// `oraw != rval` / `orbv != rbv` test, so an unchanged one posts on no
+    /// cycle at all.
+    fn alarm_cycle_monitored_fields(&self) -> &'static [&'static str] {
+        &["OVAL"]
+    }
+
+    /// C `aoRecord.c:539-548` posts RVAL and RBV from INSIDE
+    /// `if (monitor_mask)`, each behind its own `oraw != rval` /
+    /// `orbv != rbv` test, with the forced `monitor_mask|DBE_VALUE|DBE_LOG`.
+    /// The default change-detected path has neither guard, so a cycle whose
+    /// monitor mask is empty — VAL unchanged, no alarm move, `omod` false —
+    /// posted an RVAL that C withholds until the next cycle that does fire.
+    /// Reachable from a client with `caput AO.ASLO` (or AOFF/LINR) followed by
+    /// `caput AO.PROC 1`: measured on softIoc R7.0.10-146, C emits no event
+    /// there and leaves ORAW at its previous value.
+    fn fields_posted_with_value_mask(&self) -> &'static [(&'static str, ValuePostGate)] {
+        &[
+            ("RVAL", ValuePostGate::OnChangeForced),
+            ("RBV", ValuePostGate::OnChangeForced),
+        ]
+    }
+
+    /// C `aoRecord.c:535` — `omod` opens the block above without opening VAL's
+    /// own post, which is the case OROC creates: VAL sits at the target while
+    /// OVAL steps toward it, so VAL crosses no deadband and the output still
+    /// has to reach its monitors.
+    fn take_secondary_value_mask(&mut self) -> crate::server::recgbl::EventMask {
+        if std::mem::take(&mut self.omod) {
+            crate::server::recgbl::EventMask::VALUE | crate::server::recgbl::EventMask::LOG
+        } else {
+            crate::server::recgbl::EventMask::NONE
+        }
+    }
+
+    /// C `if(prec->oraw != prec->rval) { db_post_events(...); prec->oraw =
+    /// prec->rval; }` (`aoRecord.c:541-543`) and its RBV twin (`:545-548`),
+    /// minus the post. `oraw`/`orbv` are written NOWHERE else — `convert()`
+    /// used to assign `oraw = rval` eagerly, which made this comparison
+    /// unable to ever be true.
+    fn take_secondary_value_change(&mut self, field: &str) -> bool {
+        match field {
+            "RVAL" if self.oraw != self.rval => {
+                self.oraw = self.rval;
+                true
+            }
+            "RBV" if self.orbv != self.rbv => {
+                self.orbv = self.rbv;
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// C never calls `db_post_events` on `oraw`/`orbv` — they are bookkeeping
+    /// for the RVAL/RBV posts above, not fields any C `monitor()` emits. The
+    /// generic change-detection loop would post them, so they are excluded
+    /// from it here; a `caput` to either still posts through the put path, as
+    /// it does for every field.
+    fn event_posted_fields(&self) -> &'static [&'static str] {
+        &["ORAW", "ORBV"]
     }
 
     fn process(&mut self) -> CaResult<ProcessOutcome> {
@@ -506,8 +612,8 @@ impl Record for AoRecord {
 
     /// Apply an `asynFloat64` device readback: seed `VAL` with the forward
     /// `ASLO`/`AOFF` linear scaling (`VAL = value * ASLO + AOFF`). C `initAo`
-    /// (devAsynFloat64.c:627-629) seeds the init read and `processAo`
-    /// (:646-649) the output-callback read with the identical conversion;
+    /// (devAsynFloat64.c:628-630) seeds the init read and `processAo`
+    /// (:647-649) the output-callback read with the identical conversion;
     /// neither touches `RVAL` (float64 `ao` has no raw path). Returns `true` so
     /// the asyn store path skips the forward convert. The reverse scaling
     /// `(OVAL - AOFF) / ASLO` lives on the device-write side
@@ -635,18 +741,30 @@ impl Record for AoRecord {
                 }
                 _ => Err(CaError::TypeMismatch(name.into())),
             },
-            // SPC_LINCONV parity (aoRecord.c:242-267): LINR / EGUF / EGUL are
+            // SPC_LINCONV parity (aoRecord.c:249-267): LINR / EGUF / EGUL are
             // tagged `special(SPC_LINCONV)` in aoRecord.dbd. C's `special()`
             // rebases `eoff = egul` INSIDE `if ((linr == menuConvertLINEAR) &&
             // pdset->special_linconv)` — the rebase is the device support's,
             // and no soft dset supplies `special_linconv` (`devAoSoftRaw.c`,
-            // like `devAiSoftRaw.c:32-34`, leaves that dset slot NULL). On an
+            // like `devAiSoftRaw.c:32-35`, leaves that dset slot NULL). On an
             // ao the ungated rebase was worse than on an ai: EOFF feeds the
             // VAL→RVAL convert, so retuning the display range EGUL moved the
             // hardware output. See `ai.rs` for the full C excerpt.
             // `special(SPC_LINCONV)` in aoRecord.dbd — C `special()` sets
             // `prec->init = TRUE` for a put to any of LINR / EGUF / EGUL
             // (aoRecord.c:254), so the retuned conversion starts fresh.
+            //
+            // The arm C opens with — `if (pdset->common.number < 6) {
+            // recGblDbaddrError(S_db_noMod, paddr, "ao: special"); return
+            // S_db_noMod; }` (aoRecord.c:250-253), refusing a legacy 5-entry
+            // DSET table that has no `special_linconv` slot — is deliberately
+            // absent here: every base-supplied soft dset declares `{6, ...}`
+            // (devAoSoft.c:39, devAoSoftRaw.c:38) so the refusal is
+            // unreachable through base's own device support, and this port's
+            // device support is the `DeviceSupport` trait
+            // (`server/device_support.rs:96`), which has no `number` field and
+            // no function-pointer table, so a short dset is unrepresentable by
+            // type rather than rejected at run time.
             "LINR" => match value {
                 EpicsValue::Short(v) => {
                     self.linr = v;
@@ -879,11 +997,11 @@ impl Record for AoRecord {
 mod tests {
     use super::*;
 
-    /// SPC_LINCONV parity (aoRecord.c:242-267). This test previously asserted
+    /// SPC_LINCONV parity (aoRecord.c:255-265). This test previously asserted
     /// the OPPOSITE — that an EGUL put under LINR=LINEAR rebases `eoff = egul`
     /// — and so pinned the defect (R18-97). C's rebase lives INSIDE
     /// `if ((linr == menuConvertLINEAR) && pdset->special_linconv)`, and the
-    /// soft dsets supply no `special_linconv` (`devAiSoftRaw.c:32-34` leaves
+    /// soft dsets supply no `special_linconv` (`devAiSoftRaw.c:32-35` leaves
     /// that dset slot NULL), so on a soft record the rebase never runs.
     ///
     /// Oracle (softIoc 7.0.10.1-DEV, `DTYP="Raw Soft Channel"`, LINR=LINEAR,

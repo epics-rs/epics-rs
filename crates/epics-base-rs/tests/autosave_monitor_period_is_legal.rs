@@ -1,4 +1,4 @@
-// RTEMS-EXEC-MODEL-ALLOW(2): sync tests that hand-build their own tokio runtime; run and pass in the feature-ON suite.
+// RTEMS-EXEC-MODEL-ALLOW(2): sync tests that hand-build their own tokio runtime; run and pass in the exec-backend suite.
 //! `create_monitor_set`'s period argument has to survive both ends of
 //! the `i64` the shell hands it.
 //!
@@ -104,12 +104,13 @@ fn a_sane_period_monitor_set_is_left_alone() {
     assert_eq!(monitor_interval(30), Duration::from_secs(30));
 }
 
-/// The second consumer of the same field. `into_builder` has two loops,
-/// and the defect was that only one of them clamped; this pins that the
-/// triggered loop now reads the same already-legal value rather than
-/// carrying its own copy of the rule.
+/// The second loop no longer reads that field at all.
+/// `create_triggered_set` takes no period in C either — the trigger is a
+/// CA monitor — so the watcher interval is a constant and cannot be the
+/// monitor set's number under another meaning, which is what one shared
+/// `period` field made it.
 #[test]
-fn the_triggered_loop_reads_the_same_owner() {
+fn the_triggered_loop_takes_no_period() {
     let dir = tempfile::tempdir().unwrap();
     let rt = tokio::runtime::Runtime::new().unwrap();
     let holder = holder_with_req(&dir);
@@ -121,7 +122,7 @@ fn the_triggered_loop_reads_the_same_owner() {
         .call(
             &[
                 ArgValue::String("settings.req".to_string()),
-                ArgValue::Int(0),
+                ArgValue::Int(30),
             ],
             &ctx,
         )
@@ -150,8 +151,13 @@ fn the_triggered_loop_reads_the_same_owner() {
         other => panic!("expected the triggered set second, got {other:?}"),
     };
     assert_eq!(
-        periodic, debounce,
-        "both loops must land on the same interval for the same unset period"
+        periodic,
+        Duration::from_secs(30),
+        "the monitor set keeps the period the operator typed"
     );
-    assert_eq!(periodic, Duration::from_secs(1));
+    assert_eq!(
+        debounce,
+        Duration::from_secs(1),
+        "the trigger watcher's interval is its own, not the monitor period"
+    );
 }

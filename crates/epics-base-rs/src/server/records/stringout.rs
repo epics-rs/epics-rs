@@ -43,10 +43,6 @@ pub struct StringoutRecord {
     pub mpst: i16,
     /// `menu(stringoutPOST)` Post Archive Monitors (0=On Change, 1=Always).
     pub apst: i16,
-    /// C `monitor()`'s `strncmp(oval, val)` verdict for THIS cycle, captured
-    /// in `process()` before OVAL is committed — the framework reads it
-    /// afterwards, by which time `oval == val`.
-    value_changed: bool,
 }
 
 /// `menu(stringoutPOST)` — `stringoutRecord.dbd.pod`: 0 = On Change, 1 = Always.
@@ -68,7 +64,6 @@ impl Default for StringoutRecord {
             sdly: -1.0,
             mpst: 0,
             apst: 0,
-            value_changed: false,
         }
     }
 }
@@ -148,8 +143,31 @@ impl Record for StringoutRecord {
         false
     }
 
-    fn monitor_value_changed(&self) -> Option<bool> {
-        Some(self.value_changed)
+    /// C `stringoutRecord.c:215-218` `monitor()`: the `strncmp(oval, val)` mismatch both
+    /// raises `DBE_VALUE | DBE_LOG` and copies VAL into OVAL. Compared and
+    /// committed HERE, at C's position, never captured during `process()`.
+    fn monitor_value_changed(&mut self) -> Option<bool> {
+        let changed = self.oval != self.val;
+        if changed {
+            self.oval = self.val.clone();
+        }
+        Some(changed)
+    }
+
+    /// SINGLE source of the value both of stringout's output paths carry: the
+    /// real write `devSoSoft.c::write_stringout:41` (`dbPutLink(&prec->out,
+    /// DBR_STRING, prec->val, 1)`) and the SIMM redirect
+    /// `stringoutRecord.c:247` (`dbPutLink(&prec->siol, DBR_STRING,
+    /// &prec->val, 1)`). Both put `val`.
+    ///
+    /// The trait default is `OVAL.or(VAL)` — the ao/calcout convention, where
+    /// OVAL is the record's computed output. stringout's OVAL is
+    /// `monitor()`'s previous-value tracker, committed by
+    /// [`Self::monitor_value_changed`] AFTER the OUT stage has run, so the
+    /// default would put the value this record published on the PREVIOUS
+    /// cycle.
+    fn output_link_value(&self) -> Option<EpicsValue> {
+        Some(EpicsValue::String(self.val.clone()))
     }
 
     /// C `stringoutRecord.c:138-144`: `process()` clears `udf` to FALSE only
@@ -181,14 +199,6 @@ impl Record for StringoutRecord {
     }
 
     fn process(&mut self) -> CaResult<ProcessOutcome> {
-        // C `stringoutRecord.c::monitor` copies VAL into OVAL only on the
-        // `strncmp` mismatch that raises DBE_VALUE|DBE_LOG. Capture the verdict
-        // before the copy erases it — the framework reads
-        // `monitor_value_changed()` after `process()` returns.
-        self.value_changed = self.oval != self.val;
-        if self.value_changed {
-            self.oval = self.val.clone();
-        }
         Ok(ProcessOutcome::complete())
     }
 

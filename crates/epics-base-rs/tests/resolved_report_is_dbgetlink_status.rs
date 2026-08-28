@@ -6,7 +6,7 @@
 //! zero:
 //!
 //! ```c
-//! /* motorRecord.cc:3687-3697 */
+//! /* motorRecord.cc:3687-3698 */
 //! rtnstat = dbGetLink(&(pmr->rdbl), DBR_DOUBLE, &rdblvalue, 0, 0);
 //! if (!RTN_SUCCESS(rtnstat)) {
 //!     if (pmr->mip != MIP_DONE) { clear_buttons(pmr); pmr->stop = 1; MARK(M_STOP); }
@@ -75,10 +75,18 @@ impl Record for LinkProbe {
         }
         Ok(())
     }
+    /// A field is readable only where the record type declares it, so a
+    /// probe that serves `LNK`/`VAL` has to say so — the framework reads
+    /// the link through the same `resolve_field` a client would.
     fn declared_fields(&self) -> &'static [FieldDesc] {
-        &[]
+        LINK_PROBE_FIELDS
     }
 }
+
+static LINK_PROBE_FIELDS: &[FieldDesc] = &[
+    FieldDesc::new("LNK", epics_base_rs::types::DbFieldType::String, false),
+    FieldDesc::new("VAL", epics_base_rs::types::DbFieldType::Double, false),
+];
 
 /// Runs one cycle of a probe wired to `lnk` and returns
 /// `(was it reported resolved, VAL after, reader severity)`.
@@ -155,7 +163,7 @@ async fn a_live_db_link_reads_as_a_successful_dbgetlink() {
 }
 
 /// Dead DB link: the one non-zero status, and the only one that may report a
-/// failure. C `dbLink.c:316-323` attaches `setLinkAlarm` to exactly this case.
+/// failure. C `dbLink.c:314-321` attaches `setLinkAlarm` to exactly this case.
 #[epics_macros_rs::epics_test]
 async fn a_dead_db_link_is_the_only_failed_read() {
     let (resolved, val, sevr) = cycle("NOSUCHREC.VAL").await;

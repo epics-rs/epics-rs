@@ -9,8 +9,8 @@ use crate::types::PvString;
 /// the DBF_INT64 range of ±9223372036854775807.
 ///
 /// The third and last member of the SVAL family — `aiRecord.c:280` and
-/// `longinRecord.c:220` list it too, and this record type was the one left
-/// out. `int64outRecord.c:294-312` does NOT list SVAL (an output record has
+/// `longinRecord.c:230` list it too, and this record type was the one left
+/// out. `int64outRecord.c:251-277` does NOT list SVAL (an output record has
 /// no simulation buffer to serve), so the family ends here.
 fn int64in_metadata_override(
     rec: &Int64inRecord,
@@ -32,7 +32,15 @@ fn int64in_metadata_override(
 // from the field list so they route to RecordInstance::common.analog_alarm via
 // put_common_field, matching the path used by longin/ao/ai.
 #[derive(EpicsRecord)]
-#[record(type = "int64in", metadata_override = int64in_metadata_override)]
+// `dset_owns_udf_on_computed`: C `int64inRecord.c:144` is
+// `if (status==0) prec->udf = FALSE;` with no `status == 2` fold, the longin
+// twin. `devI64inSoft.c::readLocked` likewise returns the `dbGetLink` status,
+// never 2.
+#[record(
+    type = "int64in",
+    metadata_override = int64in_metadata_override,
+    dset_owns_udf_on_computed
+)]
 pub struct Int64inRecord {
     #[field(type = "Int64")]
     pub val: i64,

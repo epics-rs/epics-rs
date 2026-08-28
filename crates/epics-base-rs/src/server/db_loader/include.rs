@@ -1,7 +1,10 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 
 use crate::error::{CaError, CaResult};
+
+use crate::runtime::log::ERL_ERROR;
 
 use super::substitute_macros;
 use super::{DbFaults, DbRecordDef};
@@ -47,12 +50,101 @@ pub fn parse_db_file_with_breaktables(
     // The include layer and the record parser both report through the
     // same owner, so a recoverable failure in either reaches the caller
     // as one set — see [`DbFaults`].
+    parse_db_opened_with_breaktables(&DbOpenedFile::taken_outright(path), macros, config)
+}
+
+/// [`parse_db_file_with_breaktables`] for a file that came through
+/// [`db_open_file_located`], so its diagnostics name it the way the
+/// operator wrote it rather than by the path this process resolved.
+pub fn parse_db_opened_with_breaktables(
+    opened: &DbOpenedFile,
+    macros: &HashMap<String, String>,
+    config: &DbLoadConfig,
+) -> CaResult<super::ParsedDb> {
+    // The include layer and the record parser both report through the
+    // same owner, so a recoverable failure in either reaches the caller
+    // as one set — see [`DbFaults`].
     let mut faults = DbFaults::default();
-    let content = expand_includes(path, macros, config, &mut faults)?;
-    let mut parsed = super::parse_db_with_breaktables(&content, macros)?;
+    // The expansion stage reports its OWN abort, because the parser's
+    // funnel cannot: a text that never got built has no
+    // [`super::DbSource`] to locate a diagnostic in, and these failures
+    // carry `line: 0` for exactly that reason. Between this and
+    // [`super::parse_db_expanded`] every rejection a `.db` read produces
+    // is on the operator's stream before the error value leaves — which
+    // is why no caller of this function prints one.
+    let expanded = match expand_includes_mapped(opened, macros, config, &mut faults) {
+        Ok(expanded) => expanded,
+        Err(e) => {
+            faults.abort(&e);
+            return Err(e);
+        }
+    };
+    // Already through `db_read_lines` once, inside the expansion — see
+    // [`super::parse_db_expanded`].
+    //
+    // This is also why a load's read-time diagnostics (macLib's notices,
+    // the per-line `WARNING: … has undefined macros`) all come out
+    // before its first parse-time refusal, where C interleaves them per
+    // line: C's lexer reads one line and the parser consumes it, while
+    // the whole include tree is expanded here before the parser sees a
+    // character. Same lines, same bytes, different grouping — an
+    // intended consequence of flattening, not a defect to time away.
+    let mut parsed = super::parse_db_expanded(&expanded.text, expanded.source)?;
     faults.absorb(parsed.faults);
     parsed.faults = faults;
     Ok(parsed)
+}
+
+/// The flattened include tree: the text the parser reads, and the map
+/// that says which file and line each of its lines came from.
+pub struct DbExpandedText {
+    pub text: String,
+    pub source: super::DbSource,
+}
+
+/// [`expand_includes`] keeping the per-line origin, which is what lets a
+/// diagnostic name the file the operator actually wrote rather than an
+/// offset into a string that exists only inside this process.
+pub fn expand_includes_mapped(
+    opened: &DbOpenedFile,
+    macros: &HashMap<String, String>,
+    config: &DbLoadConfig,
+    faults: &mut DbFaults,
+) -> CaResult<DbExpandedText> {
+    let mut stack = Vec::new();
+    let mut out = Lines::default();
+    expand_includes_inner(opened, macros, config, &mut stack, faults, &mut out)?;
+    Ok(DbExpandedText {
+        text: out.text,
+        source: super::DbSource::new(out.lines, out.frames),
+    })
+}
+
+/// The accumulator `expand_includes_inner` writes into: one entry per
+/// line of the flattened text, so the text and its map cannot drift.
+#[derive(Default)]
+struct Lines {
+    text: String,
+    lines: Vec<String>,
+    frames: Vec<std::sync::Arc<[super::DbIncludeFrame]>>,
+    /// C's `inputFileList` while the read is running: the files open at
+    /// this point, outermost first, each parked at the line its reader
+    /// has reached.
+    open: Vec<super::DbIncludeFrame>,
+}
+
+impl Lines {
+    /// Append one expanded line, tagged with the include stack in force
+    /// at it. C prints that stack innermost-first (`dbIncludePrint`), so
+    /// it is reversed here — once, where the frame is built, rather than
+    /// at each of the places that read it.
+    fn push(&mut self, text: String) {
+        self.text.push_str(&text);
+        self.lines.push(text);
+        self.frames.push(std::sync::Arc::from(
+            self.open.iter().rev().cloned().collect::<Vec<_>>(),
+        ));
+    }
 }
 
 /// Expand `include "..."` directives recursively.
@@ -62,33 +154,44 @@ pub fn expand_includes(
     config: &DbLoadConfig,
     faults: &mut DbFaults,
 ) -> CaResult<String> {
-    let canonical = path.canonicalize().map_err(|e| CaError::DbParseError {
-        line: 0,
-        column: 0,
-        message: format!("cannot resolve '{}': {}", path.display(), e),
-    })?;
-    let mut stack = Vec::new();
-    expand_includes_inner(&canonical, macros, config, &mut stack, faults)
+    Ok(expand_includes_mapped(&DbOpenedFile::taken_outright(path), macros, config, faults)?.text)
+}
+
+/// One file on C's `inputFileList` while the read is running.
+///
+/// TWO names, because the file has two jobs and they need different
+/// spellings: `identity` is the canonicalised path, which is what
+/// decides whether two `include` directives name one file, and `named`
+/// is what the operator wrote, which is the only one a diagnostic may
+/// print. Keeping both on the stack is what stops the identity from
+/// being the nearest string to hand when a message needs a file name —
+/// the way `/tmp/…/a.db -> /tmp/…/b.db -> /tmp/…/a.db` used to reach an
+/// operator who wrote `include "b.db"`.
+struct OpenFile {
+    identity: PathBuf,
+    named: String,
 }
 
 fn expand_includes_inner(
-    path: &Path,
+    opened: &DbOpenedFile,
     macros: &HashMap<String, String>,
     config: &DbLoadConfig,
-    stack: &mut Vec<PathBuf>,
+    stack: &mut Vec<OpenFile>,
     faults: &mut DbFaults,
-) -> CaResult<String> {
+    out: &mut Lines,
+) -> CaResult<()> {
+    let identity = opened
+        .resolved
+        .canonicalize()
+        .unwrap_or_else(|_| opened.resolved.clone());
+    let named = &opened.named;
     // Circular include detection
-    if stack.iter().any(|p| p == path) {
-        let chain: Vec<String> = stack.iter().map(|p| p.display().to_string()).collect();
+    if stack.iter().any(|f| f.identity == identity) {
+        let chain: Vec<&str> = stack.iter().map(|f| f.named.as_str()).collect();
         return Err(CaError::DbParseError {
             line: 0,
             column: 0,
-            message: format!(
-                "circular include: {} -> {}",
-                chain.join(" -> "),
-                path.display()
-            ),
+            message: format!("circular include: {} -> {named}", chain.join(" -> ")),
         });
     }
 
@@ -98,20 +201,22 @@ fn expand_includes_inner(
             line: 0,
             column: 0,
             message: format!(
-                "include depth limit ({}) exceeded at '{}'",
+                "include depth limit ({}) exceeded at '{named}'",
                 config.max_include_depth,
-                path.display()
             ),
         });
     }
 
-    let content = std::fs::read_to_string(path).map_err(|e| CaError::DbParseError {
+    let content = std::fs::read_to_string(&identity).map_err(|e| CaError::DbParseError {
         line: 0,
         column: 0,
-        message: format!("cannot read '{}': {}", path.display(), e),
+        message: format!("cannot read '{named}': {e}"),
     })?;
 
-    stack.push(path.to_path_buf());
+    stack.push(OpenFile {
+        identity,
+        named: named.clone(),
+    });
 
     // Local macro overrides from `substitute` directives.
     // These override the caller-provided macros for subsequent includes.
@@ -123,8 +228,28 @@ fn expand_includes_inner(
     // appends to it (`dbLexRoutines.c:433-441`).
     let mut local_paths: Vec<PathBuf> = config.include_paths.clone();
 
-    let mut output = String::with_capacity(content.len());
-    for line in content.lines() {
+    // This file joins C's `inputFileList`; every line pushed while it is
+    // on top is attributed to it, at the line its own reader has reached.
+    let file_name = opened.named.clone();
+    out.open.push(super::DbIncludeFrame {
+        path: opened.found_under.clone(),
+        filename: Some(file_name.clone()),
+        line: 0,
+    });
+    // A directive line contributes no text but still costs a line number
+    // in the file the operator is reading, so it is replaced by an empty
+    // one. C never has to do this — its directives ARE grammar
+    // productions, so every source line reaches the lexer and its counter
+    // never skips.
+    let emit = |out: &mut Lines, n: u32, text: String| {
+        if let Some(frame) = out.open.last_mut() {
+            frame.line = n;
+        }
+        out.push(text);
+    };
+    for (i, raw) in content.split_inclusive('\n').enumerate() {
+        let line_num = i as u32 + 1;
+        let line = raw.strip_suffix('\n').unwrap_or(raw);
         if let Some(subst_str) = parse_substitute_directive(line) {
             // Apply substitute overrides to local macros. Quote- and
             // escape-aware splitting matches C `macParseDefns`
@@ -134,15 +259,18 @@ fn expand_includes_inner(
                 let expanded_v = substitute_macros(&v, &local_macros);
                 local_macros.insert(k, expanded_v);
             }
+            emit(out, line_num, String::from("\n"));
         } else if let Some(dirs) = parse_path_directive(line, "path") {
             // `path "a:b:c"` — replace the search path. C separates
             // entries with the OS path separator.
             let expanded = substitute_macros(&dirs, &local_macros);
             local_paths = db_path(&expanded);
+            emit(out, line_num, String::from("\n"));
         } else if let Some(dirs) = parse_path_directive(line, "addpath") {
             // `addpath "a:b"` — append to the search path.
             let expanded = substitute_macros(&dirs, &local_macros);
             local_paths.extend(db_add_path(&expanded));
+            emit(out, line_num, String::from("\n"));
         } else if let Some(filename) = parse_include_directive(line) {
             let expanded_filename = substitute_macros(&filename, &local_macros);
             // C `dbIncludeNew` (`dbLexRoutines.c:450-456`) prints this
@@ -151,27 +279,33 @@ fn expand_includes_inner(
             // the load's status goes non-zero at the end. The port used
             // to propagate the failure out of the whole expansion, which
             // discarded every record in the enclosing file.
-            let Some(canonical) =
-                db_open_file(&expanded_filename, &local_paths).and_then(|p| p.canonicalize().ok())
-            else {
+            // The directive's own line is where this file's reader is
+            // parked while the included one is read, which is what C's
+            // outer `dbIncludePrint` frame reports.
+            if let Some(frame) = out.open.last_mut() {
+                frame.line = line_num;
+            }
+            let Some(included) = db_open_file_located(&expanded_filename, &local_paths) else {
                 faults.recoverable(format!(
-                    "ERROR: Can't open include file '{expanded_filename}'"
+                    "{ERL_ERROR}: Can't open include file '{expanded_filename}'"
                 ));
                 continue;
             };
-            let included = expand_includes_inner(&canonical, &local_macros, config, stack, faults)?;
-            output.push_str(&included);
-            output.push('\n');
+            expand_includes_inner(&included, &local_macros, config, stack, faults, out)?;
         } else {
-            // Apply current macros (including substitute overrides) to content lines
-            let expanded_line = substitute_macros(line, &local_macros);
-            output.push_str(&expanded_line);
-            output.push('\n');
+            // C `db_yyinput`: the macros in force at this line, and the
+            // two diagnostics macLib and the loader raise for it.
+            emit(
+                out,
+                line_num,
+                super::db_expand_line(raw, &local_macros, Some(&file_name), line_num),
+            );
         }
     }
 
+    out.open.pop();
     stack.pop();
-    Ok(output)
+    Ok(())
 }
 
 /// Parse an include directive line. Returns the filename if the line is an include directive.
@@ -257,7 +391,7 @@ pub(crate) fn parse_path_directive(line: &str, keyword: &str) -> Option<String> 
 /// per platform, never both. On Unix a `;` is an ordinary character in
 /// a directory name and there is no `C:` drive prefix, so neither may
 /// be given a second meaning here.
-const PATH_LIST_SEPARATOR: char = if cfg!(windows) { ';' } else { ':' };
+pub const PATH_LIST_SEPARATOR: char = if cfg!(windows) { ';' } else { ':' };
 
 /// C `dbAddPath` (`dbStaticLib.c:663-735`) — the directories a path
 /// list contributes to the search path, in order.
@@ -313,6 +447,37 @@ pub fn db_path(list: &str) -> Vec<PathBuf> {
         return vec![PathBuf::from(".")];
     }
     db_add_path(list)
+}
+
+/// C `pdbbase->pathPvt` — the search path a load INSTALLED, which is what
+/// `dbDumpPath` (`dbStaticLib.c:3262-3283`) reports.
+///
+/// C sets it in `dbReadCOM` (`dbLexRoutines.c:244-253`), the routine every
+/// `dbLoadDatabase`/`dbLoadRecords` passes through, and reports `no path
+/// defined` until the first load has run. The port resolves the same list
+/// from the same environment variable, so the only thing it lacked was
+/// somewhere to keep it: without this, a report could only print the list
+/// the NEXT load would use, which is `.` on an IOC that has loaded nothing
+/// where C prints `no path defined`.
+///
+/// Single owner: `db_load_config` resolves the list for both
+/// `dbLoadRecords` and `dbLoadTemplate`, so it is the one caller of
+/// [`set_loaded_path`] and no other path can install one.
+static LOADED_PATH: Mutex<Option<Vec<PathBuf>>> = Mutex::new(None);
+
+/// Record the path list this load resolved. C `dbPath`, called once per
+/// `dbReadCOM`, REPLACES the list rather than adding to it.
+pub fn set_loaded_path(paths: &[PathBuf]) {
+    *LOADED_PATH.lock().unwrap_or_else(|e| e.into_inner()) = Some(paths.to_vec());
+}
+
+/// The path list the last load installed, or `None` when nothing has been
+/// loaded — C's empty `pathPvt`.
+pub fn loaded_path() -> Option<Vec<PathBuf>> {
+    LOADED_PATH
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone()
 }
 
 /// Parse a `name=value,name2=value2,...` macro-definition string into
@@ -421,16 +586,67 @@ pub(crate) fn parse_macro_defns(defns: &str) -> Vec<(String, String)> {
 /// (`:276`) and `dbIncludeNew` (`:449`) — so the expansion is done
 /// here, once, rather than at each caller.
 pub fn db_open_file(filename: &str, path_list: &[PathBuf]) -> Option<PathBuf> {
-    let filename = db_expand_file_name(filename)?;
-    let filename = filename.as_str();
+    db_open_file_located(filename, path_list).map(|opened| opened.resolved)
+}
+
+/// A `.db` file the loader has opened, in the three parts C keeps
+/// separate: what to read, what to CALL it, and the search-path entry it
+/// was found under.
+///
+/// C never conflates them. `dbOpenFile` returns the directory it matched
+/// and joins nothing into the caller's name; `dbReadCOM` stores that
+/// directory as `inputFile.path` and the operator's own spelling as
+/// `inputFile.filename` (`dbLexRoutines.c:274-283`), and every loader
+/// diagnostic afterwards prints those two — `dbIncludePrint` writes
+/// `path "." file "compressTest.db"`, never the joined path and never a
+/// canonical one. A port that carries only the resolved `PathBuf` cannot
+/// say what C says: it has already lost the operator's spelling, so it
+/// would name a file in words the `st.cmd` does not contain.
+#[derive(Clone, Debug)]
+pub struct DbOpenedFile {
+    /// The path to actually read. Nothing prints this.
+    pub resolved: PathBuf,
+    /// C `inputFile.filename` — the name as written, after
+    /// `macEnvExpand`. Every diagnostic names the file with this.
+    pub named: String,
+    /// C `inputFile.path` — the search-path entry that matched, `None`
+    /// when the name was taken outright (C's NULL `dbOpenFile` return).
+    pub found_under: Option<String>,
+}
+
+impl DbOpenedFile {
+    /// A path the caller resolved for itself, with no search-path entry
+    /// behind it — C's `dbReadCOM` arm that is handed an open `FILE *`.
+    pub fn taken_outright(path: &Path) -> Self {
+        Self {
+            resolved: path.to_path_buf(),
+            named: path.display().to_string(),
+            found_under: None,
+        }
+    }
+}
+
+/// [`db_open_file`] keeping everything C's caller keeps — see
+/// [`DbOpenedFile`].
+pub fn db_open_file_located(filename: &str, path_list: &[PathBuf]) -> Option<DbOpenedFile> {
+    let named = db_expand_file_name(filename)?;
+    let filename = named.as_str();
     if path_list.is_empty() || filename.contains('/') || filename.contains('\\') {
         let direct = PathBuf::from(filename);
-        return direct.exists().then_some(direct);
+        return direct.exists().then(|| DbOpenedFile {
+            resolved: direct,
+            named: named.clone(),
+            found_under: None,
+        });
     }
-    path_list
-        .iter()
-        .map(|dir| dir.join(filename))
-        .find(|candidate| candidate.exists())
+    path_list.iter().find_map(|dir| {
+        let candidate = dir.join(filename);
+        candidate.exists().then(|| DbOpenedFile {
+            resolved: candidate,
+            named: named.clone(),
+            found_under: Some(dir.display().to_string()),
+        })
+    })
 }
 
 /// C `macEnvExpand` (`macEnv.c:21-30`) — `macDefExpand(str, NULL)`, i.e.
@@ -454,7 +670,7 @@ pub fn db_expand_file_name(filename: &str) -> Option<String> {
             ..Default::default()
         },
     );
-    expanded.undefined.is_empty().then_some(expanded.text)
+    (!expanded.errored()).then_some(expanded.text)
 }
 
 #[cfg(test)]

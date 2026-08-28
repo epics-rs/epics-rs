@@ -101,7 +101,7 @@ fn r21_every_common_field_starts_at_its_declared_initial() {
 }
 
 /// The other half of the ASG rule: the FIELD is empty, but the record is still a
-/// member of the DEFAULT group — C `asAddMemberPvt` (asLibRoutines.c:893-928)
+/// member of the DEFAULT group — C `asAddMemberPvt` (asLibRoutines.c:884-919)
 /// resolves an empty or unknown group name to the always-present DEFAULT. The
 /// port must not read the raw field at an access-security call site, which is
 /// why [`CommonFields::access_group`] exists.

@@ -55,6 +55,13 @@ pub(crate) struct CalcCompile {
     pub program: CompiledExpr,
     /// C `postfix()`'s return value: [`POSTFIX_OK`] or [`POSTFIX_ERR`].
     pub status: i32,
+    /// The `CALC_ERR_*` condition `postfix()` reports through its
+    /// `short *perror` out-parameter. Distinct from `status`, which is only
+    /// 0/-1: this is what `calcErrorStr` turns into the record's own errlog
+    /// line, and it never reaches `CLCV`. Private, and read only through
+    /// [`CalcCompile::error_str`], so no caller can pair it with the wrong
+    /// `status`.
+    error: Option<CalcError>,
 }
 
 impl CalcCompile {
@@ -62,6 +69,7 @@ impl CalcCompile {
         Self {
             program,
             status: POSTFIX_OK,
+            error: None,
         }
     }
 
@@ -78,12 +86,17 @@ impl CalcCompile {
         Self {
             program: CompiledExpr::empty(kind),
             status: POSTFIX_ERR,
+            error: Some(err.clone()),
         }
     }
 
-    /// True when the compile failed — C `if (prec->clcv)`.
-    pub fn failed_to_compile(&self) -> bool {
-        self.status != POSTFIX_OK
+    /// C `calcErrorStr(error_number)` for a failed compile, `None` for one that
+    /// succeeded — C `if (prec->clcv)` and the errlog line's `%s` in one ask,
+    /// so a caller cannot test one and render the other.
+    pub fn error_str(&self) -> Option<&'static str> {
+        self.error
+            .as_ref()
+            .map(|e| calc_error_str(e.code()).unwrap_or("Unknown error"))
     }
 }
 

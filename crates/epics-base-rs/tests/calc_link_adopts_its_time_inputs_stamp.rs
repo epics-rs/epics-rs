@@ -18,11 +18,12 @@
 //! That is the SAME gate `devAiSoft.c:73-74` uses to decide whether the dset
 //! fills `prec->time` at all, which is why the two never fight: on a soft
 //! channel with a calc INP both fire and agree, and `lnkCalc_getTimestampTag`
-//! (`:749-762`) serves the cached pair to anyone who asks the link later.
+//! (`lnkCalc.c:749-762`) serves the cached pair to anyone who asks the link
+//! later.
 //!
 //! The utag is the part that separates this from every other input link. A
 //! plain DB/CA source reaches the record through `dbGetTimeStamp`, the
-//! `ptag == NULL` spelling of `dbGetTimeStampTag` (`dbLink.c:415-418`), so
+//! `ptag == NULL` spelling of `dbGetTimeStampTag` (`dbLink.c:413-416`), so
 //! its UTAG is deliberately dropped — see the sibling file
 //! `soft_input_adopts_the_source_timestamp.rs`. A calc source is the one
 //! class whose tag arrives, because the copy at `lnkCalc.c:581` is the link's

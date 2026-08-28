@@ -23,7 +23,7 @@
 //!   of queues.
 //! * [`EvQue`] == C `event_que`: a ring of `EVENTQUESIZE` entries shared by up
 //!   to `EVENTQUESIZE/EVENTENTRIES - 1` subscriptions (the `quota` rule,
-//!   `dbEvent.c:446-469`), carrying the queue-level `nDuplicates`.
+//!   `dbEvent.c:450-469`), carrying the queue-level `nDuplicates`.
 //! * `SubQ` == C `evSubscrip`: `npend` (queued entry count), `nreplace`, and
 //!   `pLastLog` — the entry a post *replaces* rather than appending.
 //!
@@ -32,7 +32,7 @@
 //! * MUST: `n_duplicates == Σ over subscriptions of max(0, npend - 1)`. Only
 //!   the append branch of [`EventSink::post`] raises it and only
 //!   `QueInner::remove_front` lowers it — C `db_queue_event_log`
-//!   (`dbEvent.c:836-840`) and `event_remove` (`dbEvent.c:542-558`).
+//!   (`dbEvent.c:837-839`) and `event_remove` (`dbEvent.c:542-558`).
 //! * MUST: `total_pending == Σ npend`, and `total_pending < size` — the `quota`
 //!   reservation is what guarantees the ring can never fill: past the replace
 //!   threshold each attached subscription can add at most one more entry, and
@@ -52,7 +52,7 @@
 //! per monitor. It gets away with that because an entry is a fixed-size
 //! `db_field_log`. For anything wider than `union native_value` — every array
 //! field, and every `DBF_STRING` field, whose declared 40 bytes exceed the
-//! union's 8 — `db_create_field_log` (`dbEvent.c:726-732`) takes the
+//! union's 8 — `db_create_field_log` (`dbEvent.c:726-735`) takes the
 //! `dbfl_type_ref` branch and copies **nothing**:
 //!
 //! ```c
@@ -64,7 +64,7 @@
 //! ```
 //!
 //! and `db_queue_event_log` then refuses to queue a second one
-//! (`dbEvent.c:786-799`), because a reference already queued will read the
+//! (`dbEvent.c:794-800`), because a reference already queued will read the
 //! record's current value when it is finally delivered:
 //!
 //! ```c
@@ -109,11 +109,11 @@
 //! # The two decisions, each in exactly one place
 //!
 //! * **Append or replace** — [`EventSink::post`], C `db_queue_event_log`
-//!   (`dbEvent.c:806-852`): with an entry already queued for this monitor AND
+//!   (`dbEvent.c:812-852`): with an entry already queued for this monitor AND
 //!   (`flowCtrlMode` OR the ring within `EVENTSPERQUE` of full), overwrite
 //!   `*pLastLog` in place; otherwise append and grow the ring.
 //! * **Drain or suspend** — [`EventReader::recv`] / [`EventReader::try_recv`],
-//!   C `event_read` (`dbEvent.c:940-952`): suspend only while `flowCtrlMode &&
+//!   C `event_read` (`dbEvent.c:932-1014`): suspend only while `flowCtrlMode &&
 //!   nDuplicates == 0`; otherwise drain the queue to empty. Once a drain pass
 //!   starts it runs to `EVENTQEMPTY` without re-checking the gate (C's `while
 //!   (evque[getix] != EVENTQEMPTY)` loop), which is what `draining` tracks.
@@ -131,7 +131,7 @@
 //!   one circuit is not fixed. Every quantity C's queue behaviour depends on —
 //!   ring occupancy, `nDuplicates`, `quota`, per-monitor `npend`/`pLastLog` —
 //!   is shared and accounted exactly as in C.
-//! * C's early-drop (`dbEvent.c:786-799`) keeps the entry already queued and
+//! * C's early-drop (`dbEvent.c:794-800`) keeps the entry already queued and
 //!   discards the incoming one, because the queued one is a live reference.
 //!   The port's entries are owned copies, so keeping the older one would
 //!   deliver a stale value; the latest-only branch keeps the INCOMING event
@@ -203,7 +203,7 @@ pub enum PostOutcome {
     /// so `*pLastLog` was overwritten. The displaced value is never delivered —
     /// one lost monitor event (C `nreplace`).
     Replaced,
-    /// C early-drop branch (`dbEvent.c:786-799`): this subscription keeps only
+    /// C early-drop branch (`dbEvent.c:794-800`): this subscription keeps only
     /// its latest entry because it carries values too wide for C's
     /// `union native_value`, and one was already pending. Depth did not grow.
     /// Not counted in `nreplace` — C does not count it either.
@@ -220,7 +220,7 @@ struct SubQ {
     events: VecDeque<MonitorEvent>,
     /// C `nreplace` — posts that overwrote `*pLastLog`.
     nreplace: u64,
-    /// C `useValque == FALSE` (`dbEvent.c:492-500`), latched from the first
+    /// C `useValque == FALSE` (`dbEvent.c:493-500`), latched from the first
     /// value this subscription carried that does not fit `union native_value`.
     /// While set, the subscription holds at most one pending entry — the rule
     /// that bounds the queue in bytes (see the module header).
@@ -431,7 +431,7 @@ impl EvQue {
                 return PostOutcome::Closed;
             }
             let npend = sub.events.len();
-            // C `db_add_event`'s `useValque` decision (`dbEvent.c:492-500`),
+            // C `db_add_event`'s `useValque` decision (`dbEvent.c:493-500`),
             // taken from the value because the port has no channel here. It is
             // a latch, not a per-post test: C decides once per subscription and
             // never revisits it.
@@ -439,7 +439,7 @@ impl EvQue {
                 sub.latest_only = true;
             }
             if sub.latest_only && npend > 0 {
-                // C `db_queue_event_log`'s early-drop (`dbEvent.c:786-799`).
+                // C `db_queue_event_log`'s early-drop (`dbEvent.c:794-800`).
                 // C keeps the queued reference and frees the incoming log; the
                 // port keeps the incoming snapshot, because its queued one is a
                 // copy that would deliver a stale value where C's reference
@@ -627,7 +627,7 @@ impl EvQue {
     }
 
     /// Posts this monitor absorbed under the latest-only rule — the port's
-    /// counter for C's uncounted early-drop (`dbEvent.c:786-799`).
+    /// counter for C's uncounted early-drop (`dbEvent.c:794-800`).
     pub fn ncollapse(&self, sid: u32) -> u64 {
         self.lock().subs.get(&sid).map_or(0, |s| s.ncollapse)
     }
@@ -643,6 +643,45 @@ impl EvQue {
     pub fn quota(&self) -> usize {
         self.lock().quota
     }
+
+    /// Everything `dbel` prints about one monitor's queue, read under a
+    /// single `LOCKEVQUE`.
+    ///
+    /// C takes that lock twice — once in its `level > 1` block for
+    /// `ringSpace`, again in its `level > 2` block for `nDuplicates`
+    /// (`dbEvent.c:198-233`) — so its two halves can disagree about a queue
+    /// a producer is filling between them. One snapshot cannot.
+    pub fn report(&self, sid: u32) -> QueReport {
+        let q = self.lock();
+        let sub = q.subs.get(&sid);
+        QueReport {
+            npend: sub.map_or(0, |s| s.events.len()),
+            ring_space: q.ring_space(),
+            ring_size: q.size,
+            nreplace: sub.map_or(0, |s| s.nreplace),
+            latest_only: sub.is_some_and(|s| s.latest_only),
+            n_duplicates: q.n_duplicates,
+        }
+    }
+}
+
+/// One consistent read of a monitor's queue state — the fields C's `dbel`
+/// reaches for through `pevent` and `pevent->ev_que` (`dbEvent.c:181-246`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct QueReport {
+    /// C `pevent->npend` — entries queued for this monitor, undelivered.
+    pub npend: usize,
+    /// C `ringSpace(pevent->ev_que)` — unused entries in the shared ring.
+    pub ring_space: usize,
+    /// C `EVENTQUESIZE`, the constant `ringSpace` is compared against to
+    /// decide "queue empty".
+    pub ring_size: usize,
+    /// C `pevent->nreplace` — posts that overwrote this monitor's last entry.
+    pub nreplace: u64,
+    /// C `! pevent->useValque`, which `dbel` reports as "queueing disabled".
+    pub latest_only: bool,
+    /// C `pevent->ev_que->nDuplicates`, shared by every monitor on the queue.
+    pub n_duplicates: usize,
 }
 
 /// C `event_user` (`dbEvent.c:84-105`) — one per CA circuit. Owns the EVENTS_OFF
@@ -651,7 +690,7 @@ pub struct EventUser {
     flow: Arc<FlowCtrl>,
     /// C `firstque` + `nextque`: a subscription attaches to the first queue with
     /// spare quota, and a new queue is chained when none has
-    /// (`dbEvent.c:446-469`). This — not the client — is the sharing granularity
+    /// (`dbEvent.c:450-469`). This — not the client — is the sharing granularity
     /// of `nDuplicates`.
     ques: Mutex<Vec<Arc<EvQue>>>,
 }
@@ -672,7 +711,7 @@ impl EventUser {
         }
     }
 
-    /// C `db_add_event`'s queue-selection loop (`dbEvent.c:446-469`): walk the
+    /// C `db_add_event`'s queue-selection loop (`dbEvent.c:450-469`): walk the
     /// chain for the first queue whose `quota` still admits a monitor, and chain
     /// a fresh one only when none does.
     ///
@@ -821,6 +860,11 @@ impl EventSink {
     pub fn is_closed(&self) -> bool {
         self.que.reader_gone(self.sid)
     }
+
+    /// This monitor's queue state, for `dbel`.
+    pub fn report(&self) -> QueReport {
+        self.que.report(self.sid)
+    }
 }
 
 impl Drop for EventSink {
@@ -890,7 +934,7 @@ mod tests {
     }
 
     /// Boundary `npend > 0` with flow control ON: C replaces `*pLastLog` in
-    /// place (`dbEvent.c:812-820`). The queue does not grow and no duplicate is
+    /// place (`dbEvent.c:812-827`). The queue does not grow and no duplicate is
     /// created — which is exactly why the reader stays suspended.
     #[epics_macros_rs::epics_test]
     async fn npend_positive_under_flow_control_replaces_in_place() {
@@ -930,7 +974,7 @@ mod tests {
     }
 
     /// R8-22 boundary — `npend > 0`, flow control OFF, ring space AT/BELOW the
-    /// threshold: C replaces ONLY the monitor's last entry (`dbEvent.c:812-820`)
+    /// threshold: C replaces ONLY the monitor's last entry (`dbEvent.c:812-827`)
     /// and keeps every earlier distinct entry, so burst delivery is
     /// {earlier distinct backlog…, coalesced tail}. The old primitive parked the
     /// newest event in a side slot and the consumer then discarded the whole
@@ -1015,10 +1059,12 @@ mod tests {
         sink.post(ev(1));
         sink.post(ev(2)); // replaces in place: still one entry, no duplicate
         let u2 = user.clone();
-        let waker = crate::runtime::task::spawn(async move {
-            crate::runtime::task::yield_now().await;
-            u2.flow_ctrl_off();
-        });
+        let waker = crate::runtime::task::Reactor::current()
+            .expect("the test driver enters an executor")
+            .spawn(async move {
+                crate::runtime::task::yield_now().await;
+                u2.flow_ctrl_off();
+            });
         let got = crate::runtime::task::timeout(std::time::Duration::from_secs(2), reader.recv())
             .await
             .expect("EVENTS_ON must wake the suspended reader")
@@ -1078,7 +1124,7 @@ mod tests {
     }
 
     /// Boundary `quota == size - EVENT_ENTRIES`: C chains a new queue rather than
-    /// overbooking the ring (`dbEvent.c:446-469`), so a circuit's monitors past
+    /// overbooking the ring (`dbEvent.c:450-469`), so a circuit's monitors past
     /// the cap share a *different* `nDuplicates`.
     #[epics_macros_rs::epics_test]
     async fn quota_exhaustion_chains_a_second_queue() {
@@ -1287,7 +1333,7 @@ mod tests {
     /// ABOVE the replace threshold, which is precisely where a narrow monitor
     /// appends (see `ring_space_above_threshold_appends_distinct_entries`).
     /// A wide-value monitor must NOT append there — C's early-drop
-    /// (`dbEvent.c:786-799`) caps it at one entry regardless of ring space,
+    /// (`dbEvent.c:794-800`) caps it at one entry regardless of ring space,
     /// and that cap is what keeps 108 whole array copies from accumulating.
     #[epics_macros_rs::epics_test]
     async fn wide_value_holds_one_entry_however_much_ring_space_is_free() {

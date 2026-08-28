@@ -147,9 +147,9 @@ async fn sim_output_runs_bo_high_momentary_reset_in_sim_mode() {
 
 /// IVOA is decided from the record's OWN alarm severity, NOT from a
 /// `SIMS=INVALID` simulation severity. C `aoRecord.c::process` evaluates the
-/// IVOA gate `if (prec->nsev < INVALID_ALARM)` (:197) using the severity
+/// IVOA gate `if (prec->nsev < INVALID_ALARM)` (:198) using the severity
 /// `checkAlarms` produced, and only THEN does `writeValue` raise
-/// `recGblSetSevr(SIMM_ALARM, sims)` (:582). So a SIMM=YES `ao` with a finite,
+/// `recGblSetSevr(SIMM_ALARM, sims)` (:570). So a SIMM=YES `ao` with a finite,
 /// in-range VAL (`nsev < INVALID` at the gate) takes the normal `writeValue`
 /// branch and DOES write OVAL to SIOL, even though SIMS=INVALID makes the
 /// final SEVR=INVALID. The IVOA Don't_drive veto is never consulted.
@@ -218,7 +218,7 @@ async fn sim_output_real_invalid_alarm_ivoa_dont_drive_suppresses() {
     db.add_record("BOIV", Box::new(bo)).await.unwrap();
 
     // Define VAL so the record is not UDF: a bare bo stays UDF=1 and
-    // `boRecord.c:371` raises UDF_ALARM/INVALID first, which (severity INVALID)
+    // `boRecord.c:366` raises UDF_ALARM/INVALID first, which (severity INVALID)
     // would dominate the record's own INVALID STATE alarm this test is about.
     // A full CA put clears UDF, as `caput BOIV 1` would — same pattern as
     // `sim_output_simm_alarm_loses_stat_on_severity_tie`.
@@ -274,7 +274,7 @@ async fn sim_output_simm_alarm_loses_stat_on_severity_tie() {
     bo.sims = 1; // SIMM severity = MINOR -> ties; must NOT override STAT
     db.add_record("BOTIE", Box::new(bo)).await.unwrap();
 
-    // A bare bo stays UDF=1 until a value SOURCE defines it — `boRecord.c:371`
+    // A bare bo stays UDF=1 until a value SOURCE defines it — `boRecord.c:366`
     // raises UDF_ALARM/INVALID on every process otherwise, which (severity
     // INVALID) would dominate the MINOR state/SIMM tie this test is about. Model
     // the client setpoint that defines VAL: a full CA put clears UDF in `dbPut`

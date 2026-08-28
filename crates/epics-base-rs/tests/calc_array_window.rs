@@ -163,7 +163,7 @@ fn r10_6_cat_appends_inside_the_buffer_and_grows_the_window() {
     );
 }
 
-/// R11-7 — and CAT of two SCALARS is a no-op: `case CAT: break;` (`:1411`). With
+/// R11-7 — and CAT of two SCALARS is a no-op: `case CAT: break;` (`:1400`). With
 /// neither operand an array the two-arg dispatch takes the scalar branch, and the left
 /// operand's cell IS the result cell, so the answer is the LEFT scalar — still a
 /// scalar. Compiled C, A=5, B=7: `CAT(A,B)` is 5, and `AVG(CAT(A,B))` is 5.

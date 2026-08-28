@@ -146,8 +146,9 @@ async fn swait_odly_defers_out_write_and_oevt_to_continuation() {
 
 /// PACT is held during the ODLY delay (`CompleteDeferOutput` holds PACT via its
 /// `ReprocessAfter` continuation): a foreign `dbProcess` inside the delay window
-/// BAILS at the PACT entry guard (C `swaitRecord.c:716` "THE RECORD REMAINS
-/// ACTIVE WHILE WAITING ON THE WATCHDOG") instead of re-entering the
+/// BAILS at the PACT entry guard (the cited construct is a comment, not a
+/// statement: `swaitRecord.c:716` "THE RECORD REMAINS ACTIVE WHILE WAITING ON
+/// THE WATCHDOG") instead of re-entering the
 /// `output_wait` continuation and firing the deferred OUT / OEVT early. Without
 /// the PACT hold the foreign process drives the target to OVAL before the delay
 /// elapses.

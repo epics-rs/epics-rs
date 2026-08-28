@@ -250,7 +250,19 @@ fn test_golden_gr_matches_time() {
     assert_eq!(gr.len(), 72);
     assert_eq!(time.len(), 24);
     assert_ne!(gr, time);
-    assert_eq!(&gr[4..64], &[0u8; 60]);
+    // precision(2) + RISC_pad(2) + units[8] + the two display limits are
+    // zero — but the four alarm limits are NOT. C's `get_alarm` seeds them
+    // `epicsNAN` and copies them into the reply whether or not the record
+    // supplied any (`dbAccess.c:294`, `:318-323`), where `get_graphics`
+    // `memset`s its group for a missing slot (`:231`).
+    assert_eq!(&gr[4..32], &[0u8; 28]);
+    for i in 0..4 {
+        let off = 32 + i * 8;
+        assert!(
+            f64::from_be_bytes(gr[off..off + 8].try_into().unwrap()).is_nan(),
+            "alarm limit {i} of a metadata-less GR_DOUBLE must be nan"
+        );
+    }
 }
 
 #[test]
@@ -261,7 +273,17 @@ fn test_golden_ctrl_matches_gr_pattern() {
     let gr = serialize_dbr(27, &val, 0, 0, ts).unwrap();
     assert_eq!(ctrl.len(), gr.len() + 16);
     assert_eq!(&ctrl[0..4], &gr[0..4]);
-    assert_eq!(&ctrl[4..64], &[0u8; 60]);
+    assert_eq!(&ctrl[4..32], &[0u8; 28]);
+    for i in 0..4 {
+        let off = 32 + i * 8;
+        assert!(
+            f64::from_be_bytes(ctrl[off..off + 8].try_into().unwrap()).is_nan(),
+            "alarm limit {i} of a metadata-less CTRL_DOUBLE must be nan"
+        );
+    }
+    // The control group takes the same memset-zero seed as the display one
+    // (`dbAccess.c:270`).
+    assert_eq!(&ctrl[64..80], &[0u8; 16]);
 }
 
 #[test]
@@ -477,9 +499,11 @@ fn test_encode_gr_char_with_metadata() {
 }
 
 #[test]
-fn test_encode_gr_char_saturates_out_of_range() {
-    // 255.0 is out of i8 range — saturates to i8::MAX (127).
-    // Before P-8 fix this passed unchecked as u8(255).
+fn test_encode_gr_char_truncates_out_of_range() {
+    // C reaches a `dbr_char_t` limit through `epicsInt32`, and the second
+    // step is an ordinary integer conversion: 255 keeps its byte, -200
+    // keeps 0x38. Saturating straight from f64 would give 127 and 0x80,
+    // neither of which C can put on the wire.
     let mut snap = Snapshot::new(EpicsValue::Char(0), 0, 0, SystemTime::UNIX_EPOCH);
     snap.display = Some(DisplayInfo {
         upper_disp_limit: 255.0,
@@ -488,8 +512,8 @@ fn test_encode_gr_char_saturates_out_of_range() {
     });
     supplies_every_slot(&mut snap);
     let data = encode_dbr(25, &snap).unwrap();
-    assert_eq!(data[12], 127u8); // saturated i8::MAX
-    assert_eq!(data[13], 0x80u8); // saturated i8::MIN bit-pattern
+    assert_eq!(data[12], 0xFFu8); // 255 & 0xff
+    assert_eq!(data[13], 0x38u8); // -200 & 0xff
 }
 
 #[test]
@@ -585,47 +609,57 @@ fn test_encode_stsack_string_default_ackt_acks() {
     assert_eq!(&data[6..8], &0u16.to_be_bytes());
 }
 
+/// A menu label does NOT resolve through the field-blind
+/// `EpicsValue::parse`, and must not: the same label names different
+/// indices in different menus, so a table keyed on the label alone can
+/// only guess which menu was meant.
+///
+/// This replaces three tests (`..._alarm_sevr`, `..._omsl`,
+/// `..._enum_type`) that pinned that guess. They asserted
+/// `parse(Short, "MINOR") == Short(1)` with no field in sight, which is
+/// the defect 03 L-7 records, not a behaviour C has: C reaches every menu
+/// label through `dbPutStringNum` with that field's own `pamenu`.
 #[test]
-fn test_parse_menu_string_alarm_sevr() {
-    assert_eq!(
-        EpicsValue::parse(DbFieldType::Short, "NO_ALARM").unwrap(),
-        EpicsValue::Short(0)
-    );
-    assert_eq!(
-        EpicsValue::parse(DbFieldType::Short, "MINOR").unwrap(),
-        EpicsValue::Short(1)
-    );
-    assert_eq!(
-        EpicsValue::parse(DbFieldType::Short, "MAJOR").unwrap(),
-        EpicsValue::Short(2)
-    );
-    assert_eq!(
-        EpicsValue::parse(DbFieldType::Short, "INVALID").unwrap(),
-        EpicsValue::Short(3)
-    );
-}
+fn parse_does_not_resolve_menu_labels_without_a_field() {
+    for label in [
+        "NO_ALARM",
+        "MINOR",
+        "MAJOR",
+        "INVALID",
+        "supervisory",
+        "closed_loop",
+    ] {
+        assert!(
+            EpicsValue::parse(DbFieldType::Short, label).is_err(),
+            "{label} must not resolve to a DBF_SHORT index without its field"
+        );
+        assert!(
+            EpicsValue::parse(DbFieldType::Enum, label).is_err(),
+            "{label} must not resolve to a DBF_ENUM index without its field"
+        );
+    }
 
-#[test]
-fn test_parse_menu_string_omsl() {
-    assert_eq!(
-        EpicsValue::parse(DbFieldType::Short, "supervisory").unwrap(),
-        EpicsValue::Short(0)
-    );
-    assert_eq!(
-        EpicsValue::parse(DbFieldType::Short, "closed_loop").unwrap(),
-        EpicsValue::Short(1)
-    );
-}
+    // The sharp case: "Specified" is index 1 of `menuFanout` but index 0 of
+    // `selSELM`. The old table answered 1 for both, so a `sel` record's
+    // SELM took the wrong choice. No index at all is the correct answer
+    // here — the field's own menu decides, elsewhere.
+    assert!(EpicsValue::parse(DbFieldType::Enum, "Specified").is_err());
 
-#[test]
-fn test_parse_menu_string_enum_type() {
-    assert_eq!(
-        EpicsValue::parse(DbFieldType::Enum, "NO_ALARM").unwrap(),
-        EpicsValue::Enum(0)
+    // The error names the owner rather than just "invalid enum".
+    let msg = format!(
+        "{}",
+        EpicsValue::parse(DbFieldType::Enum, "MINOR").unwrap_err()
     );
+    assert!(msg.contains("menu label"), "unhelpful error: {msg}");
+
+    // A numeric token is unaffected — this path still parses indices.
     assert_eq!(
-        EpicsValue::parse(DbFieldType::Enum, "MAJOR").unwrap(),
+        EpicsValue::parse(DbFieldType::Enum, "2").unwrap(),
         EpicsValue::Enum(2)
+    );
+    assert_eq!(
+        EpicsValue::parse(DbFieldType::Short, "1").unwrap(),
+        EpicsValue::Short(1)
     );
 }
 
@@ -953,7 +987,7 @@ fn test_dbr_class_name_empty_when_unpopulated() {
     assert!(data.iter().all(|&b| b == 0));
 }
 
-// ── P-1 (BUG_ARCHAEOLOGY libca 8cc20393f / a7bf59079): empty-array
+// ── P-1 (libca 8cc20393f / a7bf59079): empty-array
 // COUNT=0 round-trip. Pre-fix the `count <= 1` short-circuit raised
 // CaError::Protocol("...too small") on GET and silently degraded
 // array WRITE to a scalar PUT.
@@ -1049,5 +1083,97 @@ fn r6_74_server_string_reply_truncates_to_39_bytes_and_nul_like_c_getstringstrin
             EpicsValue::String(s) => assert_eq!(s.as_bytes(), &long.as_bytes()[..39]),
             other => panic!("expected String, got {other:?}"),
         }
+    }
+}
+
+/// A2-edge: the DBR_TIME encoder refuses a clock it cannot represent instead
+/// of putting a fabricated instant on the wire.
+///
+/// One case per boundary of `epicsUInt32 secPastEpoch`, not one per story:
+/// the unset sentinel, the epoch itself, one second below it, the last
+/// representable second, and one past it. C wraps at both ends and returns
+/// `epicsTimeOK` (`epicsTime.cpp:305-310` at `R7.0.10`); this port refuses,
+/// which is the deliberate deviation the row asked for — a gap an archiver
+/// records as a gap, rather than a wrong time it records as fact.
+mod timestamp_range {
+    use super::*;
+    use epics_base_rs::types::wall_clock_range_warning;
+
+    fn secs_field(at: SystemTime) -> u32 {
+        let data = serialize_dbr(20, &EpicsValue::Double(1.0), 0, 0, at).unwrap();
+        u32::from_be_bytes(data[4..8].try_into().unwrap())
+    }
+
+    #[test]
+    fn the_unset_stamp_still_encodes_as_the_uninitialized_zero() {
+        // C's uninitialized `epicsTimeStamp` is `{0, 0}` and every consumer —
+        // including C's own `epicsTimeToStrftime` test at `epicsTime.cpp:176`
+        // — looks for exactly that. A record that has not processed must not
+        // become a stamp in 2086.
+        assert_eq!(secs_field(SystemTime::UNIX_EPOCH), 0);
+    }
+
+    #[test]
+    fn the_epics_epoch_itself_encodes_as_zero() {
+        let at = SystemTime::UNIX_EPOCH + Duration::from_secs(EPICS_UNIX_EPOCH_OFFSET_SECS);
+        assert_eq!(secs_field(at), 0);
+    }
+
+    #[test]
+    fn one_second_before_the_epics_epoch_wraps_exactly_as_c_wraps_it() {
+        // C: `epicsInt64(src) - POSIX_TIME_AT_EPICS_EPOCH` = -1, assigned into
+        // an `epicsUInt32` = 0xFFFF_FFFF (`epicsTime.cpp:305-310`). The clamp
+        // this replaced answered 0 here, which C never answers.
+        let at = SystemTime::UNIX_EPOCH + Duration::from_secs(EPICS_UNIX_EPOCH_OFFSET_SECS - 1);
+        assert_eq!(secs_field(at), u32::MAX);
+    }
+
+    #[test]
+    fn the_last_representable_second_still_encodes() {
+        let at = SystemTime::UNIX_EPOCH
+            + Duration::from_secs(EPICS_UNIX_EPOCH_OFFSET_SECS + u32::MAX as u64);
+        assert_eq!(secs_field(at), u32::MAX);
+    }
+
+    #[test]
+    fn one_second_past_the_last_representable_second_wraps_to_zero() {
+        // 2^32 mod 2^32 == 0 — again what C's assignment does, and again not
+        // what the clamp did (it answered 0xFFFF_FFFF).
+        let at = SystemTime::UNIX_EPOCH
+            + Duration::from_secs(EPICS_UNIX_EPOCH_OFFSET_SECS + u32::MAX as u64 + 1);
+        assert_eq!(secs_field(at), 0);
+    }
+
+    // The wrap is C's, so it is not reportable per read. These four fix where
+    // it IS reported: once, from init, at both ends of the range.
+
+    #[test]
+    fn a_clock_inside_the_range_warns_about_nothing() {
+        let at = SystemTime::UNIX_EPOCH + Duration::from_secs(EPICS_UNIX_EPOCH_OFFSET_SECS);
+        assert!(wall_clock_range_warning(at).is_none());
+        let last = SystemTime::UNIX_EPOCH
+            + Duration::from_secs(EPICS_UNIX_EPOCH_OFFSET_SECS + u32::MAX as u64);
+        assert!(wall_clock_range_warning(last).is_none());
+    }
+
+    #[test]
+    fn the_unset_stamp_is_not_a_clock_reading_and_warns_about_nothing() {
+        assert!(wall_clock_range_warning(SystemTime::UNIX_EPOCH).is_none());
+    }
+
+    #[test]
+    fn a_pre_1990_clock_warns() {
+        // The RTEMS row's actual case: `EPICS_RTEMS_BOOT_EPOCH` below 1990.
+        let at = SystemTime::UNIX_EPOCH + Duration::from_secs(EPICS_UNIX_EPOCH_OFFSET_SECS - 1);
+        let msg = wall_clock_range_warning(at).expect("a pre-1990 clock must be named");
+        assert!(msg.contains("wall clock"), "{msg}");
+        assert!(msg.contains("wrapped"), "{msg}");
+    }
+
+    #[test]
+    fn a_post_2106_clock_warns() {
+        let at = SystemTime::UNIX_EPOCH
+            + Duration::from_secs(EPICS_UNIX_EPOCH_OFFSET_SECS + u32::MAX as u64 + 1);
+        assert!(wall_clock_range_warning(at).is_some());
     }
 }

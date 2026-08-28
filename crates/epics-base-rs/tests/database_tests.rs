@@ -1,11 +1,11 @@
-// RTEMS-EXEC-MODEL-ALLOW(4): three multi-thread-flavored tokio tests plus one hand-built runtime; run and pass in the feature-ON suite.
+// RTEMS-EXEC-MODEL-ALLOW(4): three multi-thread-flavored tokio tests plus one hand-built runtime; run and pass in the exec-backend suite.
 #![allow(unused_imports, clippy::all)]
 use std::collections::HashSet;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
 
 use epics_base_rs::error::CaError;
-use epics_base_rs::server::database::PvDatabase;
+use epics_base_rs::server::database::{LinkBacking, PvDatabase};
 use epics_base_rs::server::record::*;
 use epics_base_rs::server::records::ai::AiRecord;
 use epics_base_rs::server::records::ao::AoRecord;
@@ -134,7 +134,7 @@ async fn test_soft_inp_read_failure_sets_link_alarm() {
 /// silently dropped them even though the link parser recorded the
 /// modifier.
 ///
-/// C `recGblInheritSevrMsg` (recGbl.c:260) per-flavour semantics:
+/// C `recGblInheritSevrMsg` (recGbl.c:263-281) per-flavour semantics:
 /// * **MS**  — DEST gets `LINK_ALARM` (NOT source stat), max-raised
 ///             sevr, no amsg propagation.
 /// * **MSS** — DEST gets source stat + sevr + amsg.
@@ -526,7 +526,7 @@ impl epics_base_rs::server::database::LinkSet for CapturingLset {
 /// OUT link processed normally but the value went nowhere. The
 /// OUTPUT side now mirrors the INPUT side: it dispatches the write
 /// through the registered lset, matching C `dbLink.c::dbPutLink`
-/// (dbLink.c:434-448), which routes every link write through
+/// (dbLink.c:432-446), which routes every link write through
 /// `plink->lset->putValue` regardless of DB vs CA link.
 #[epics_macros_rs::epics_test]
 async fn test_pva_out_link_writes_value_through_link_set() {
@@ -565,7 +565,7 @@ async fn test_pva_out_link_writes_value_through_link_set() {
         .await
         .unwrap();
     // Staged on the link-put queue and returned, as C `dbCaPutLink` does
-    // (`dbCa.c:622-624`); `dbCaSync` (`dbCa.c:1191-1194`) is the barrier
+    // (`dbCa.c:593-595`); `dbCaSync` (`dbCa.c:1126-1129`) is the barrier
     // that makes the wire write observable. The `Async` twin below needs
     // no barrier: a put-notify put still awaits its completion.
     db.sync_external_link_puts().await;
@@ -669,7 +669,8 @@ async fn test_pva_out_link_put_notify_chain_uses_async_op() {
             .unwrap();
         // Arm a put-notify wait-set: the source record is now in a
         // blocking-put chain, so its OUT-link write must use Async.
-        inst.notify = Some(NotifyWaitSet::new(tx));
+        inst.install_or_queue_notify(tx)
+            .expect("the record is free, so the wait-set installs");
     }
 
     let mut visited = HashSet::new();
@@ -677,7 +678,7 @@ async fn test_pva_out_link_put_notify_chain_uses_async_op() {
         .await
         .unwrap();
     // The completion flavour stages and returns like the plain one (C
-    // `dbCaPutLinkCallback`, `dbCa.c:614-624`), so the wire write is observed
+    // `dbCaPutLinkCallback`, `dbCa.c:585-595`), so the wire write is observed
     // through the `dbCaSync` barrier. This test asserts the OP FLAVOUR, not
     // the timing — the timing boundary is
     // `external_link_put_enqueue::async_put_completion_is_reported_through_the_notify_chain`.
@@ -895,7 +896,7 @@ async fn test_record_posts_carry_per_event_dbe_mask() {
 }
 
 // R14-63 — C posts `.UDF` from NO processing cycle. `recGblResetAlarms`
-// (recGbl.c:204-216) posts SEVR/STAT/AMSG/ACKS and nothing else, no record's
+// (recGbl.c:202-222) posts SEVR/STAT/AMSG/ACKS and nothing else, no record's
 // `monitor()` calls `db_post_events(..., &prec->udf, ...)` — the call appears
 // nowhere in EPICS base or the modules — and the `recGblCheckUDF` that the
 // port's justifying comment cited does not exist in C at all.
@@ -1018,7 +1019,7 @@ async fn test_caput_to_udf_field_posts_udf_event() {
 /// trip; it clears only when the completion path runs FLNK.
 ///
 /// Pre-fix the Rust port cleared PUTF in `put_record_field_from_ca`
-/// BEFORE the `process_record_with_links` call (field_io.rs:497),
+/// BEFORE the `process_record_with_links` call (field_io.rs:1589),
 /// so any consumer reading PUTF during the process cycle (TPRO
 /// trace, monitor on .PUTF, async-completion path's
 /// "put-driven vs scan-driven" classifier) always saw PUTF=0.
@@ -1094,12 +1095,12 @@ async fn test_putf_survives_async_round_trip_and_clears_on_completion() {
     }
 }
 
-/// C `dbAccess.c::dbPut:1410-1411` clears `precord->udf = FALSE`
+/// C `dbAccess.c::dbPut:1405-1406` clears `precord->udf = FALSE`
 /// synchronously when the put target is the record-type's primary
 /// value field (`dbIsValueField`). The clear runs INSIDE dbPut —
 /// BEFORE dbProcess. Pre-fix the Rust port deferred UDF clearing
 /// to the process-cycle's own `if instance.record.clears_udf()`
-/// branch (processing.rs:839). The processing path drops the put's
+/// branch (processing.rs:3687). The processing path drops the put's
 /// write lock and re-acquires inside `process_record_with_links`,
 /// so a second reader between the put and the process could
 /// observe `(VAL=new, udf=true)` — a C-illegal pair. For async
@@ -1507,35 +1508,34 @@ async fn test_ao_ivoa_dont_drive() {
 /// back to `set_val` (VAL) — every other output record left OVAL/RVAL
 /// stale, so the soft-channel OUT writeback (which reads `OVAL.or(VAL)`)
 /// shipped the pre-IVOA value instead of IVOV.
-/// A `.db` file's `field(ASL, "1")` directive must
-/// land in `common.asl`. `db_loader::apply_fields` feeds every common
-/// field as `EpicsValue::String`; the ASL handler must parse string
-/// numerics or the directive is silently dropped at IOC load.
+/// An `ASL` field value must land in `common.asl`. `db_loader::apply_fields`
+/// feeds every common field as `EpicsValue::String`; the ASL handler must
+/// parse string numerics or the directive is silently dropped at load.
+///
+/// NOT through `parse_db`: `ASL` is a per-FIELD `.dbd` attribute in C
+/// (`asl(ASL0)`), never a record field, so `field(ASL,"1")` in a `.db` is
+/// `ERROR: ai record 'ASLT:HIGH' doesn't have a field 'ASL'` on softIoc
+/// @`R7.0.10` — measured, and the port's loader now refuses it identically.
+/// The record-level `common.asl` the CA server and QSRV read is still real and
+/// still set programmatically, which is what this exercises.
 #[epics_macros_rs::epics_test]
 async fn test_db_load_records_asl_field() {
     use epics_base_rs::server::db_loader;
     use epics_base_rs::server::records::ai::AiRecord;
 
-    let defs = db_loader::parse_db(
-        r#"
-record(ai, "ASLT:HIGH") {
-    field(ASL, "1")
-}
-record(ai, "ASLT:LOW") {
-}
-"#,
-        &std::collections::HashMap::new(),
-    )
-    .unwrap();
+    let defs: Vec<(&str, Vec<db_loader::DbFieldDef>)> = vec![
+        ("ASLT:HIGH", vec![db_loader::DbFieldDef::new("ASL", "1")]),
+        ("ASLT:LOW", Vec::new()),
+    ];
 
     let db = PvDatabase::new();
-    for def in defs {
+    for (name, fields) in defs {
         let mut record: Box<dyn epics_base_rs::server::record::Record> =
             Box::new(AiRecord::new(0.0));
         let mut common_fields = Vec::new();
-        db_loader::apply_fields(&mut record, &def.fields, &mut common_fields).unwrap();
-        db.add_record(&def.name, record).await.unwrap();
-        if let Some(rec) = db.get_record(&def.name) {
+        db_loader::apply_fields(&mut record, &fields, &mut common_fields).unwrap();
+        db.add_record(name, record).await.unwrap();
+        if let Some(rec) = db.get_record(name) {
             let mut inst = rec.write();
             for (n, v) in common_fields {
                 let _ = inst.put_common_field(&n, v);
@@ -1754,7 +1754,7 @@ async fn test_sim_value_trips_own_limit_and_maximizes_over_simm() {
     );
 }
 
-/// C `recGblResetAlarms` (recGbl.c:201-220) posts the alarm fields only
+/// C `recGblResetAlarms` (recGbl.c:202-222) posts the alarm fields only
 /// when the alarm state moved this cycle. The pre-fix SIMM tail pushed
 /// SEVR/STAT into every simulated snapshot with one shared
 /// `DBE_VALUE|DBE_ALARM` mask and bypassed the MDEL deadband, so a
@@ -1832,7 +1832,7 @@ async fn test_sim_steady_cycle_does_not_repost_unchanged_fields() {
 }
 
 /// The simulated alarm transition posts each alarm field with its OWN C
-/// mask (recGbl.c:201-220): SEVR is `DBE_VALUE` only — a
+/// mask (recGbl.c:202-222): SEVR is `DBE_VALUE` only — a
 /// `DBE_ALARM`-only `.SEVR` subscriber must NOT be notified — while
 /// STAT's mask carries `DBE_ALARM` when the severity moved. The pre-fix
 /// SIMM tail collapsed both onto a shared `DBE_VALUE|DBE_ALARM` mask.
@@ -2118,7 +2118,7 @@ async fn test_sim_mode_output_nonlocal_db_siol() {
         .unwrap();
 
     // Staged on the link-put queue and returned, as C `dbCaPutLink` does
-    // (`dbCa.c:622-624`); `dbCaSync` (`dbCa.c:1191-1194`) is the barrier
+    // (`dbCa.c:593-595`); `dbCaSync` (`dbCa.c:1126-1129`) is the barrier
     // that makes the wire write observable.
     db.sync_external_link_puts().await;
 
@@ -2192,7 +2192,7 @@ async fn test_sdis_disable_skips_process() {
     );
 }
 
-/// C `dbProcess` (`dbAccess.c:566`) reads SDIS with
+/// C `dbProcess` (`dbAccess.c:565`) reads SDIS with
 /// `dbGetLink(&precord->sdis, DBR_SHORT, &precord->disa, 0, 0)` — for ANY link
 /// type, through the lset. For a CONSTANT SDIS that lset is `dbConst_lset`,
 /// whose `dbConstGetValue` (`dbConstLink.c:219-225`) writes NOTHING and returns
@@ -2299,7 +2299,7 @@ async fn test_phas_scan_order() {
         }
     }
 
-    let names = db.records_for_scan(ScanType::Sec1).await;
+    let names = db.records_for_scan(ScanType::SEC1).await;
     assert_eq!(names, vec!["REC_A", "REC_B", "REC_C"]);
 }
 
@@ -2466,7 +2466,7 @@ async fn test_proc_works_any_scan() {
 
 /// C `dbAccess.c::dbPutField:1255-1257` returns `S_db_putDisabled` for a
 /// put to ANY field but DISP while `DISP=1` — the gate sits before `dbPut`
-/// AND before the PROC-driven `dbProcess` (`:1265-1277`). `PROC`'s pfield is
+/// AND before the PROC-driven `dbProcess` (`:1262-1274`). `PROC`'s pfield is
 /// not `&precord->disp`, so `caput REC.PROC 1` on a disabled record is
 /// refused and the record does NOT process.
 #[epics_macros_rs::epics_test]
@@ -2556,7 +2556,7 @@ async fn test_ca_put_scan_index_update() {
     db.put_record_field_from_ca("REC", "SCAN", EpicsValue::String("1 second".into()))
         .await
         .unwrap();
-    let names = db.records_for_scan(ScanType::Sec1).await;
+    let names = db.records_for_scan(ScanType::SEC1).await;
     assert!(names.contains(&"REC".to_string()));
 }
 
@@ -2838,7 +2838,7 @@ async fn test_non_passive_output_ca_put_defers_write_until_scan() {
     if let Some(rec) = db.get_record("AO_NP") {
         let mut inst = rec.write();
         inst.common.dtyp = "MockDev".to_string();
-        inst.common.scan = ScanType::Sec1;
+        inst.common.scan = ScanType::SEC1;
         inst.device = Some(Box::new(mock));
     }
     db.put_record_field_from_ca("AO_NP", "VAL", EpicsValue::Double(42.0))
@@ -2912,7 +2912,7 @@ async fn test_phas_change_updates_scan_index() {
             }
         }
     }
-    let names = db.records_for_scan(ScanType::Sec1).await;
+    let names = db.records_for_scan(ScanType::SEC1).await;
     assert_eq!(names, vec!["REC_B", "REC_A"]);
 
     if let Some(rec) = db.get_record("REC_A") {
@@ -2928,7 +2928,7 @@ async fn test_phas_change_updates_scan_index() {
             db.update_scan_index("REC_A", scan, scan, old_phas, new_phas);
         }
     }
-    let names = db.records_for_scan(ScanType::Sec1).await;
+    let names = db.records_for_scan(ScanType::SEC1).await;
     assert_eq!(names, vec!["REC_A", "REC_B"]);
 }
 
@@ -3047,11 +3047,24 @@ impl Record for AsyncOutRecord {
         }
     }
     fn declared_fields(&self) -> &'static [FieldDesc] {
-        &[]
+        ASYNC_OUT_FIELDS
     }
 }
 
-/// C `dbAccess.c::dbPutField:1269-1273` — a client put to a `pp` field of an
+/// The fake's `.dbd`. A synthetic type still has to DECLARE its `INP`: which
+/// fields on a record are links is answered from the declaration and nowhere
+/// else, and `FieldDesc::new` cannot spell a link because it derives
+/// `declared_dbf` from the SERVED type, which is `DBF_STRING` for all three
+/// classes.
+static ASYNC_OUT_FIELDS: &[FieldDesc] = &[
+    FieldDesc {
+        declared_dbf: epics_base_rs::types::DbfCode::Inlink,
+        ..FieldDesc::new("INP", epics_base_rs::types::DbFieldType::String, false)
+    },
+    FieldDesc::new("VAL", epics_base_rs::types::DbFieldType::Double, false),
+];
+
+/// C `dbAccess.c::dbPutField:1266-1270` — a client put to a `pp` field of an
 /// async-active (PACT) record sets `rpro = TRUE` and does NOT call
 /// `dbProcess`. `recGblFwdLink` (`recGbl.c:296-300`) consumes RPRO when the
 /// device round trip completes and queues `scanOnce`, so the second value
@@ -3095,7 +3108,7 @@ async fn test_put_to_pact_record_sets_rpro_and_second_value_reaches_device() {
         assert!(inst.is_processing(), "still PACT from put 1");
         assert!(
             inst.common.rpro != 0,
-            "put to a PACT record must set RPRO (C dbAccess.c:1272)"
+            "put to a PACT record must set RPRO (C dbAccess.c:1269)"
         );
         assert_eq!(
             inst.common.lcnt, 0,
@@ -3308,7 +3321,7 @@ async fn test_complete_async_posts_sevr_with_per_field_mask() {
     );
 }
 
-// C parity (dbAccess.c::dbProcess:537-559): a second
+// C parity (dbAccess.c::dbProcess:536-558): a second
 // `process_record_with_links` against a PACT-active record must NOT
 // re-enter `record.process()`. The first attempt must bail silently
 // (lcnt counting up); after MAX_LOCK=10 consecutive bails, SCAN_ALARM /
@@ -3324,7 +3337,7 @@ async fn test_pact_entry_guard_silent_bail_until_max_lock() {
         .unwrap();
     // C's guard is `if ((precord->stat == SCAN_ALARM) || (precord->lcnt++ <
     // MAX_LOCK) || (precord->sevr >= INVALID_ALARM)) goto all_done`
-    // (dbAccess.c:544-547): the SCAN alarm is for a record that HAS completed a
+    // (dbAccess.c:543-546): the SCAN alarm is for a record that HAS completed a
     // process (SEVR below INVALID) and then hangs mid-async. A never-processed
     // record still carries the init UDF severity (SEVR=INVALID, softIoc reads
     // that on every record right after `iocInit`) and C never alarms it. This
@@ -3484,8 +3497,8 @@ async fn test_pact_entry_guard_resets_lcnt_after_completion() {
 }
 
 // D-A: a CP/CPP burst onto a PACT target. C's `CA_DBPROCESS` worker is bare
-// `dbScanLock`/`db_process`/`dbScanUnlock` (`dbCa.c:1314-1320`), so an active
-// target lands in `dbProcess`'s own PACT branch (`dbAccess.c:537-557`): count
+// `dbScanLock`/`db_process`/`dbScanUnlock` (`dbCa.c:1249-1257`), so an active
+// target lands in `dbProcess`'s own PACT branch (`dbAccess.c:536-556`): count
 // `lcnt`, and after `MAX_LOCK` raise SCAN_ALARM/INVALID with AMSG "Async in
 // progress". That branch never writes `precord->rpro`.
 //
@@ -3504,6 +3517,10 @@ async fn test_cp_burst_on_a_pact_target_alarms_instead_of_setting_rpro() {
     db.add_record("CPB_SRC", Box::new(AoRecord::new(0.0)))
         .await
         .unwrap();
+    // What `register_record_type` does for a real type: publish the table to
+    // the by-name registry `dbf_link_class` reads. `add_record` takes an
+    // instance and no factory, so nothing else does it here.
+    epics_base_rs::server::record::register_declared_fields("async_out_test", ASYNC_OUT_FIELDS);
     db.add_record(
         "CPB_TGT",
         Box::new(AsyncOutRecord {
@@ -3532,7 +3549,7 @@ async fn test_cp_burst_on_a_pact_target_alarms_instead_of_setting_rpro() {
 
     // Every burst moves CPB_SRC's value, because the CP trigger is the
     // source's `DBE_VALUE|DBE_ALARM` POST, not the fact that it processed
-    // (`CyclePosts` / C `dbCa.c:1290-1294`). A repeated identical value posts
+    // (`CyclePosts` / C `dbCa.c:1225-1229`). A repeated identical value posts
     // nothing past `MDEL = 0` and would dispatch nothing at all, leaving every
     // assertion below vacuous.
     let burst = |db: PvDatabase, v: f64| async move {
@@ -3661,6 +3678,7 @@ async fn test_reprocess_after_continuation_bypasses_pact_guard() {
                         std::time::Duration::from_millis(20),
                     )],
                     device_did_compute: false,
+                    post_write_fields: Vec::new(),
                 })
             } else {
                 // Continuation reached: complete cleanly, clear PACT.
@@ -3937,7 +3955,7 @@ async fn test_notify_field_respects_mask() {
     assert!(alarm_rx.try_recv().is_err());
 }
 
-/// C `dbAccess.c:575-577` clears `precord->rpro = FALSE; precord->putf =
+/// C `dbAccess.c:574-576` clears `precord->rpro = FALSE; precord->putf =
 /// FALSE` and arms `callNotifyCompletion = TRUE` BEFORE the alarm
 /// check whenever SDIS evaluates to DISV. Pre-fix Rust only
 /// reset nsta/nsev and updated the alarm — rpro/putf leaked into the
@@ -3970,15 +3988,15 @@ async fn test_sdis_disable_clears_rpro_and_putf() {
     let inst = rec.read();
     assert!(
         inst.common.rpro == 0,
-        "SDIS disable must clear rpro (C dbAccess.c:575). Pre-fix this leaked."
+        "SDIS disable must clear rpro (C dbAccess.c:574). Pre-fix this leaked."
     );
     assert!(
         !inst.common.putf,
-        "SDIS disable must clear putf (C dbAccess.c:576). Pre-fix this leaked."
+        "SDIS disable must clear putf (C dbAccess.c:575). Pre-fix this leaked."
     );
 }
 
-/// C `dbAccess.c:622-623` runs `dbNotifyCompletion(precord)` at
+/// C `dbAccess.c:621-622` runs `dbNotifyCompletion(precord)` at
 /// `all_done` for the disable bail path because `callNotifyCompletion
 /// = TRUE` was set at line 577. A CA WRITE_NOTIFY landing on a
 /// disabled record must release its caller. Pre-fix the
@@ -4006,7 +4024,8 @@ async fn test_sdis_disable_fires_put_notify_completion() {
     {
         let rec = db.get_record("DIS_NOT_TGT").unwrap();
         let mut inst = rec.write();
-        inst.notify = Some(NotifyWaitSet::new(tx));
+        inst.install_or_queue_notify(tx)
+            .expect("the record is free, so the wait-set installs");
     }
 
     let mut visited = HashSet::new();
@@ -4016,11 +4035,11 @@ async fn test_sdis_disable_fires_put_notify_completion() {
 
     // rx should be ready — completion was sent via the disable bail.
     rx.await
-        .expect("disable bail must fire put-notify completion (C dbAccess.c:622)");
+        .expect("disable bail must fire put-notify completion (C dbAccess.c:621)");
     // membership must be taken (not left dangling for the next cycle).
     let rec = db.get_record("DIS_NOT_TGT").unwrap();
     assert!(
-        rec.read().notify.is_none(),
+        !rec.read().has_notify(),
         "put-notify wait-set membership must be cleared after firing"
     );
 }
@@ -4154,7 +4173,7 @@ async fn test_put_notify_defers_for_async_out_pp_target() {
 }
 
 /// Boundary: a second WRITE_NOTIFY on a record whose put-notify is still in
-/// flight joins C's `restartList` (`dbNotify.c:213-217`) rather than being
+/// flight joins C's `restartList` (`dbNotify.c:213-220`) rather than being
 /// refused — `S_db_Blocked` / ECA_PUTCBINPROG is not a status C sends from
 /// this path, and returning it drops the client's value. It must also not
 /// overwrite the wait-set, which would drop the prior `Sender` and wake the
@@ -4208,7 +4227,7 @@ async fn test_put_notify_queues_second_in_flight() {
 /// parked one; a caller that dropped the receiver left the record's
 /// notify slot occupied for the whole async round trip (a motor's
 /// whole motion), refusing every legitimate WRITE_NOTIFY on the record
-/// with PutCallbackInProgress in the meantime.
+/// in the meantime.
 #[epics_macros_rs::epics_test]
 async fn test_fire_and_forget_put_parks_no_notify_write_notify_stays_legal() {
     let db = PvDatabase::new();
@@ -4224,7 +4243,7 @@ async fn test_fire_and_forget_put_parks_no_notify_write_notify_stays_legal() {
         let inst = rec.read();
         assert!(inst.is_processing(), "async pending → PACT=true");
         assert!(
-            inst.notify.is_none(),
+            !inst.has_notify(),
             "a fire-and-forget put must not park a put-notify wait-set \
              (C builds a putNotify only in dbPutNotify, never dbPutField)"
         );
@@ -4237,7 +4256,7 @@ async fn test_fire_and_forget_put_parks_no_notify_write_notify_stays_legal() {
     }
 
     // A WRITE_NOTIFY arriving mid-flight must be accepted — pre-fix it
-    // was refused with PutCallbackInProgress because the fire-and-forget
+    // was refused because the fire-and-forget
     // put's orphaned wait-set occupied the slot.
     let rx = db
         .put_record_field_from_ca("PN_FF", "VAL", EpicsValue::Double(2.0))
@@ -4246,7 +4265,7 @@ async fn test_fire_and_forget_put_parks_no_notify_write_notify_stays_legal() {
         .into_handle()
         .expect("record is still async-pending → completion is deferred");
 
-    // The record is PACT, so C `processNotifyCommon` (dbNotify.c:225-231) writes
+    // The record is PACT, so C `processNotifyCommon` (dbNotify.c:225-232) writes
     // nothing and puts the whole put on the restart list; the first completion
     // replays it. `AsyncRecord` goes async on EVERY process, so the replayed put
     // makes the record PACT again — and the callback belongs to THAT cycle, the
@@ -4350,7 +4369,7 @@ impl Record for ScanOnceEmitter {
 /// Boundary (Increment ② completion contract): a put whose process only queues
 /// an independent `scanOnce` completes **synchronously** — the scanOnce is a
 /// separate cycle, NOT joined into this put-notify's wait-set. C `dbNotifyAdd`
-/// (`dbNotify.c:477-499`, sole caller `dbDbLink.c:460`) joins only the
+/// (`dbNotify.c:477-501`, sole caller `dbDbLink.c:460`) joins only the
 /// process-passive OUT/FLNK link chain; a `scanOnce`'d record is never added,
 /// so `dbNotifyCompletion` does not wait on it. The RTEMS CA driver must
 /// therefore see `ProcessCompletion::Sync` here and reply inline — waiting on
@@ -4374,7 +4393,7 @@ async fn scan_once_is_not_joined_to_put_notify_completion() {
     // Force/`process_record_with_notify` entry (rsrv `write_notify` with the
     // process bit) is the unconditional-process WRITE_NOTIFY boundary.
     {
-        db.get_record("SO").unwrap().write().common.scan = ScanType::Sec1;
+        db.get_record("SO").unwrap().write().common.scan = ScanType::SEC1;
     }
 
     let completion = db
@@ -4438,7 +4457,7 @@ async fn test_fire_and_forget_put_clears_putf_on_sync_completion() {
 
 #[epics_macros_rs::epics_test]
 async fn test_sdis_disable_notifies_alarm() {
-    // C `dbAccess.c:587-592` — the disable branch of `dbProcess` posts:
+    // C `dbAccess.c:586-591` — the disable branch of `dbProcess` posts:
     //   db_post_events(&precord->stat, DBE_VALUE);            // STAT
     //   db_post_events(&precord->sevr, DBE_VALUE);            // SEVR
     //   db_post_events(&precord->VAL,  DBE_VALUE|DBE_ALARM);  // value field
@@ -4573,7 +4592,7 @@ async fn test_pini_passes_select_disjoint_menu_choices() {
 }
 
 /// R6-7 — `caput -a REC.VAL 0` (a zero-element array into a scalar field). C
-/// `dbPut` (`dbAccess.c:1370-1372`, commit `12cfd418d`) **accepts** the put,
+/// `dbPut` (`dbAccess.c:1365-1367`, commit `12cfd418d`) **accepts** the put,
 /// leaves the field unchanged and raises `LINK_ALARM`/`INVALID_ALARM` on the
 /// record; `status` stays 0, so `dbPut` returns success. The port rejected the
 /// put with an error, so the client saw a write failure and the record's alarm
@@ -4658,7 +4677,7 @@ async fn test_empty_array_into_array_field_is_a_silent_no_op() {
 /// R6-10 — `caput -a REC.VAL 3 1 2 3` (a multi-element array into a scalar
 /// field). C `dbPut` takes the `nRequest > 1` branch, clamps the request to the
 /// destination's element count (`if (no_elements < nRequest) nRequest =
-/// no_elements;`, `dbAccess.c:1359`) and converts that one element: element 0
+/// no_elements;`, `dbAccess.c:1354`) and converts that one element: element 0
 /// is written and the put SUCCEEDS. The port passed the array straight to the
 /// record's typed `put_field` arm, which rejected it with `TypeMismatch`, so
 /// the client saw a write failure.
@@ -4777,11 +4796,11 @@ async fn r6_10_array_source_link_into_scalar_val_delivers_element_zero() {
 }
 
 /// R6-9 — a put to a field name no record type owns. C `dbNameToAddr`
-/// (`dbAccess.c:660-676`) resolves the field part with `dbFindFieldPart`, then
+/// (`dbAccess.c:659-675`) resolves the field part with `dbFindFieldPart`, then
 /// falls back to `dbGetAttributePart`; a name that matches neither returns
 /// `S_dbLib_fieldNotFound`, so `dbPutField` never runs and every caller reports
 /// the failure (`dbpf` prints "PV '%s' not found" and returns -1,
-/// `dbTest.c:787-795`). The port's `put_common_field` fell through to
+/// `dbTest.c:785-793`). The port's `put_common_field` fell through to
 /// `Ok(NoChange)`, so a misspelled field was a silent success.
 #[epics_macros_rs::epics_test]
 async fn r6_9_put_to_unknown_field_is_an_error_on_every_entry_point() {
@@ -4832,7 +4851,7 @@ async fn r6_9_put_to_unknown_field_is_an_error_on_every_entry_point() {
 /// `special(SPC_NOMOD)` (`dbCommon.dbd:13-17`) → `dbPutSpecial` pass 0 returns
 /// `S_db_noMod` (`dbAccess.c:123-124`); `RTYP` is an attribute, whose address
 /// carries `special == SPC_ATTRIBUTE` → `dbPutField` returns the same
-/// `S_db_noMod` (`dbAccess.c:1252-1253`). Neither may silently succeed, and
+/// `S_db_noMod` (`dbAccess.c:1249-1250`). Neither may silently succeed, and
 /// neither may be reported as "field not found".
 #[epics_macros_rs::epics_test]
 async fn r6_9_put_to_a_record_attribute_is_read_only_not_not_found() {
@@ -4885,7 +4904,7 @@ async fn r6_9_outn_is_swait_only() {
     assert_eq!(sw.common.out, "TGT");
 }
 
-/// R6-6 — C `piniProcess` (`iocInit.c:608-627`) sweeps the database once per
+/// R6-6 — C `piniProcess` (`iocInit.c:607-626`) sweeps the database once per
 /// distinct `PHAS`, ascending, so PINI records process in phase order; within a
 /// phase the order is database load order (`doRecordPini` under
 /// `iterateRecords`). The port processed them in `HashMap` iteration order and
@@ -4936,7 +4955,7 @@ async fn test_pini_records_process_in_ascending_phas_order() {
 
 /// R6-6 — the sweep re-reads `PHAS` on every pass, which is why C re-scans
 /// rather than sorting once: "PHAS fields can be changed at runtime, so we have
-/// to look for the lowest value of PHAS each time" (`iocInit.c:614-619`). A
+/// to look for the lowest value of PHAS each time" (`iocInit.c:613-618`). A
 /// record moved out of the phase currently being processed must still be picked
 /// up by the pass for its new phase, not dropped.
 #[epics_macros_rs::epics_test]
@@ -5308,7 +5327,7 @@ async fn test_calc_multi_input_npp_does_not_process_source() {
 }
 
 /// R6-2 — a link whose target field name carries a digit (`B0`, `DO1`,
-/// `LNK1`) is a plain local DB link. C `dbNameToAddr` (`dbAccess.c:667-671`)
+/// `LNK1`) is a plain local DB link. C `dbNameToAddr` (`dbAccess.c:666-670`)
 /// terminates the record name at the first `.` and matches the remainder
 /// against the record type's field table — no character-class restriction.
 /// Pre-fix the port required the field part to be all-`is_ascii_uppercase`, so
@@ -5324,12 +5343,11 @@ async fn test_link_to_digit_bearing_field_is_a_local_db_link() {
     // legal and the old 4-character cap is gone (dbCommon has `OLDSIMM`).
     assert_eq!(
         epics_base_rs::server::record::parse_link_v2("DIRECT.B0 NPP MS"),
-        ParsedLink::Db(DbLink {
-            record: "DIRECT".to_string(),
-            field: "B0".to_string(),
-            policy: LinkProcessPolicy::NoProcess,
-            monitor_switch: MonitorSwitch::Maximize,
-        })
+        ParsedLink::Db(DbLink::new(
+            "DIRECT.B0",
+            LinkProcessPolicy::NoProcess,
+            MonitorSwitch::Maximize,
+        ))
     );
     for (link, field) in [
         ("SEQ.DO1", "DO1"),
@@ -5339,7 +5357,7 @@ async fn test_link_to_digit_bearing_field_is_a_local_db_link() {
         ("REC._X1", "_X1"),
     ] {
         match epics_base_rs::server::record::parse_link_v2(link) {
-            ParsedLink::Db(db) => assert_eq!(db.field, field, "link {link}"),
+            ParsedLink::Db(db) => assert_eq!(db.target().field, field, "link {link}"),
             other => panic!("link {link} must be a Db link, got {other:?}"),
         }
     }
@@ -5347,18 +5365,14 @@ async fn test_link_to_digit_bearing_field_is_a_local_db_link() {
     // field name" case: the whole string stays the record/PV name, which is
     // what preserves a dotted remote PV for the CA fallback.
     match epics_base_rs::server::record::parse_link_v2("OTHER:PV.1:X") {
-        ParsedLink::Db(db) => {
-            assert_eq!(db.record, "OTHER:PV.1:X");
-            assert_eq!(db.field, "VAL");
-        }
+        // `pvname` is the whole string exactly when the split left the field
+        // at its `VAL` default; a `1:X` field half would print here.
+        ParsedLink::Db(db) => assert_eq!(db.pvname(), "OTHER:PV.1:X"),
         other => panic!("expected a whole-name Db link, got {other:?}"),
     }
     // The record name terminates at the FIRST `.`, not the last.
     match epics_base_rs::server::record::parse_link_v2("A.B.C") {
-        ParsedLink::Db(db) => {
-            assert_eq!(db.record, "A.B.C", "'B.C' is not a field name");
-            assert_eq!(db.field, "VAL");
-        }
+        ParsedLink::Db(db) => assert_eq!(db.pvname(), "A.B.C", "'B.C' is not a field name"),
         other => panic!("expected a whole-name Db link, got {other:?}"),
     }
 
@@ -5456,7 +5470,7 @@ async fn test_calc_multi_input_bare_does_not_process_source() {
 /// C terminates this cycle because `calcRecord.c::process` sets
 /// `prec->pact = TRUE` *before* `fetch_values()` (calcRecord.c:119),
 /// so the re-entrant `dbProcess` hits `if (precord->pact) goto
-/// all_done;` (dbAccess.c:537) and bails after one bounce. The Rust
+/// all_done;` (dbAccess.c:536) and bails after one bounce. The Rust
 /// fix threads the caller's `visited` set / `depth` through the PP
 /// hop so the existing `visited.insert` guard
 /// (`process_record_with_links_inner`) fires instead.
@@ -5814,7 +5828,7 @@ async fn define_val(db: &PvDatabase, name: &str) {
 /// stronger one wins:
 ///
 /// * `dbPutLink` itself calls `setLinkAlarm` on a nonzero putValue status —
-///   `recGblSetSevrMsg(LINK_ALARM, INVALID_ALARM)` (dbLink.c:318-323,
+///   `recGblSetSevrMsg(LINK_ALARM, INVALID_ALARM)` (dbLink.c:316-321,
 ///   434-448); an OUT link naming no local record is a (never-connected) CA
 ///   link, whose put fails exactly this way;
 /// * `push_values` then adds its own `recGblSetSevr(LINK_ALARM, MAJOR_ALARM)`
@@ -5913,6 +5927,20 @@ async fn test_dfanout_out_link_write_success_no_link_alarm() {
     );
 }
 
+/// seq is async in C: `process` sets `pact` and arms the group chain on the
+/// callback task whatever the DLYn ("Always use the callback task to avoid
+/// recursion", `seqRecord.c:210-215`), so the group work and `asyncFinish`
+/// (`:219-241`) run after `process_record_with_links` returns.
+async fn settle_seq(db: &PvDatabase, rec: &str) {
+    for _ in 0..400 {
+        if !db.get_record(rec).unwrap().read().is_processing() {
+            return;
+        }
+        epics_base_rs::runtime::task::sleep(std::time::Duration::from_millis(5)).await;
+    }
+    panic!("{rec} never left PACT");
+}
+
 #[epics_macros_rs::epics_test]
 async fn test_seq_dol_lnk_dispatch() {
     use epics_base_rs::server::records::seq::SeqRecord;
@@ -5940,6 +5968,7 @@ async fn test_seq_dol_lnk_dispatch() {
     db.process_record_with_links("SEQ_REC", &mut visited, 0)
         .await
         .unwrap();
+    settle_seq(&db, "SEQ_REC").await;
     let val1 = db.get_pv("SEQ_DEST1").unwrap();
     match val1 {
         EpicsValue::Double(v) => assert!((v - 100.0).abs() < 1e-10),
@@ -5977,6 +6006,7 @@ async fn test_seq_writes_dol_readback_into_don() {
     db.process_record_with_links("SEQ9_REC", &mut visited, 0)
         .await
         .unwrap();
+    settle_seq(&db, "SEQ9_REC").await;
 
     // LNK0 driven (existing behaviour).
     let dest = db.get_pv("SEQ9_DEST").unwrap();
@@ -6016,6 +6046,7 @@ async fn test_seq_dol_only_group_updates_don_with_empty_lnk() {
     db.process_record_with_links("SEQ9B_REC", &mut visited, 0)
         .await
         .unwrap();
+    settle_seq(&db, "SEQ9B_REC").await;
 
     let do0 = db.get_pv("SEQ9B_REC.DO0").unwrap();
     match do0 {
@@ -6109,6 +6140,7 @@ async fn test_seq_bare_lnk_does_not_process_passive_target() {
     db.process_record_with_links("SEQ_NPP_REC", &mut visited, 0)
         .await
         .unwrap();
+    settle_seq(&db, "SEQ_NPP_REC").await;
 
     assert_eq!(
         bare_count.load(Ordering::SeqCst),
@@ -6125,7 +6157,7 @@ async fn test_seq_bare_lnk_does_not_process_passive_target() {
 // R0604 regression — a record's `WriteDbLink` OUT write must land BEFORE
 // the producing record's FLNK fires. C record support performs
 // `dbPutLink()` for OUT links before `recGblFwdLink()`
-// (transformRecord.c:608-619, scalerRecord.c:457-480), so a downstream
+// (transformRecord.c:605-621, scalerRecord.c:457-480), so a downstream
 // FLNK target that reads the written PV observes the new value. Pre-fix
 // the framework ran the FLNK tail first, leaving the target stale.
 struct WriteThenFlnkProducer;
@@ -6150,10 +6182,18 @@ impl Record for WriteThenFlnkProducer {
     fn put_field(&mut self, _name: &str, _value: EpicsValue) -> epics_base_rs::error::CaResult<()> {
         Ok(())
     }
+    /// `OUT` is read back through `resolve_field`, which serves only what
+    /// the record type declares.
     fn declared_fields(&self) -> &'static [FieldDesc] {
-        &[]
+        WRITE_FLNK_PRODUCER_FIELDS
     }
 }
+
+static WRITE_FLNK_PRODUCER_FIELDS: &[FieldDesc] = &[FieldDesc::new(
+    "OUT",
+    epics_base_rs::types::DbFieldType::String,
+    false,
+)];
 
 #[epics_macros_rs::epics_test]
 async fn test_write_db_link_runs_before_flnk_target_reads_fresh() {
@@ -6503,7 +6543,7 @@ async fn test_out_link_cp_modifier_is_not_registered_as_a_cp_holder() {
 }
 
 /// A CPP link registers as `passive_only` (distinct from CP). Collapsing
-/// CPP into CP loses C's `precord->scan == 0` gate (`dbCa.c:994`).
+/// CPP into CP loses C's `precord->scan == 0` gate (`dbCa.c:959`).
 #[epics_macros_rs::epics_test]
 async fn test_cpp_link_registration_is_passive_only() {
     let db = PvDatabase::new();
@@ -6524,7 +6564,7 @@ async fn test_cpp_link_registration_is_passive_only() {
     );
 }
 
-/// CPP gate (`dbCa.c:854,994,1072`): on a source change, a CPP link
+/// CPP gate (`dbCa.c:825,959,1034`): on a source change, a CPP link
 /// processes the link-holder only when its SCAN is Passive. A non-Passive
 /// CPP target must NOT be processed by the dispatch — its own periodic scan
 /// owns it. Boundary: target SCAN != Passive.
@@ -6539,7 +6579,7 @@ async fn test_cpp_link_skips_nonpassive_target() {
     ao.dol = "SRC CPP".to_string();
     db.add_record("DST", Box::new(ao)).await.unwrap();
     if let Some(rec_arc) = db.get_record("DST") {
-        rec_arc.write().common.scan = ScanType::Sec1;
+        rec_arc.write().common.scan = ScanType::SEC1;
     }
     db.setup_cp_links().await;
     let mut visited = HashSet::new();
@@ -6585,7 +6625,7 @@ async fn test_cpp_link_processes_passive_target() {
 }
 
 /// CP (not CPP) processes the link-holder regardless of its SCAN
-/// (`dbCa.c:993` adds CA_DBPROCESS unconditionally). A non-Passive CP target
+/// (`dbCa.c:958-962` adds CA_DBPROCESS unconditionally). A non-Passive CP target
 /// IS processed — the boundary that distinguishes CP from CPP.
 #[epics_macros_rs::epics_test]
 async fn test_cp_link_processes_nonpassive_target() {
@@ -6598,7 +6638,7 @@ async fn test_cp_link_processes_nonpassive_target() {
     ao.dol = "SRC CP".to_string();
     db.add_record("DST", Box::new(ao)).await.unwrap();
     if let Some(rec_arc) = db.get_record("DST") {
-        rec_arc.write().common.scan = ScanType::Sec1;
+        rec_arc.write().common.scan = ScanType::SEC1;
     }
     db.setup_cp_links().await;
     let mut visited = HashSet::new();
@@ -6617,7 +6657,7 @@ async fn test_cp_link_processes_nonpassive_target() {
 
 /// When the same source→target edge is registered from both a CP and a CPP
 /// link, CP dominates: the merged edge is NOT passive_only — an
-/// unconditional CP CA_DBPROCESS overrides the CPP scan gate (`dbCa.c:993`).
+/// unconditional CP CA_DBPROCESS overrides the CPP scan gate (`dbCa.c:958-962`).
 #[epics_macros_rs::epics_test]
 async fn test_cp_overrides_cpp_for_same_edge() {
     let db = PvDatabase::new();
@@ -6882,8 +6922,8 @@ async fn test_tsel_time_link_copies_source_time_and_utag() {
         "TSEL .TIME link must also adopt the source's utag (recGbl.c:317)"
     );
     assert_eq!(
-        inst.common.tse, -2,
-        "adopting device/link time marks TSE=-2"
+        inst.common.tse, 0,
+        "C returns before the TSE half (recGbl.c:321): TSE keeps its declared 0"
     );
 }
 
@@ -6952,7 +6992,10 @@ async fn test_tsel_ca_time_link_copies_source_time() {
         "CA TSEL .TIME link must adopt the CA link's cached timestamp"
     );
     assert_eq!(inst.common.utag, 0, "CA wire carries no userTag");
-    assert_eq!(inst.common.tse, -2, "adopting link time marks TSE=-2");
+    assert_eq!(
+        inst.common.tse, 0,
+        "C returns before the TSE half (recGbl.c:321): TSE keeps its declared 0"
+    );
 }
 
 #[epics_macros_rs::epics_test]
@@ -7024,7 +7067,10 @@ async fn test_tsel_nonlocal_db_time_link_copies_remote_time() {
         inst.common.time, expected,
         "non-local Db TSEL .TIME link must adopt the remote .TIME via the CA path"
     );
-    assert_eq!(inst.common.tse, -2, "adopting link time marks TSE=-2");
+    assert_eq!(
+        inst.common.tse, 0,
+        "C returns before the TSE half (recGbl.c:321): TSE keeps its declared 0"
+    );
 }
 
 #[epics_macros_rs::epics_test]
@@ -7789,7 +7835,7 @@ async fn test_self_link_out_does_not_loop() {
 ///
 /// Rust impl: `CompressRecord::put_field("RES", _)` clears
 /// nuse/off/val in place and zeros res back to 0
-/// (records/compress.rs:260). The framework then runs
+/// (records/compress.rs:794). The framework then runs
 /// `process_record_with_links_inner`, whose snapshot path includes
 /// VAL via the always-on `include_val` branch for non-deadband
 /// records, so the VAL subscriber sees the post-reset empty array.
@@ -7938,7 +7984,7 @@ async fn test_compress_every_spc_reset_field_resets_the_buffer() {
     }
 }
 
-/// C `compressRecord.c::cvt_dbaddr` (:398-407) raises `SPC_NOMOD` on VAL when
+/// C `compressRecord.c::cvt_dbaddr` (:395-407) raises `SPC_NOMOD` on VAL when
 /// BALG is LIFO, so `dbPut` refuses the write on every route. softIoc, after
 /// `dbpf CMP.BALG "LIFO Buffer"`:
 ///
@@ -8536,7 +8582,7 @@ async fn test_ca_put_mbbo_val_recomputes_rval() {
     let rec = db.get_record("MBBO_CA").unwrap();
     let inst = rec.read();
     // `UShort`, not `Enum`: this record defines no state table, and C's
-    // `cvt_dbaddr` (mbboRecord.c:300-312) degenerates a stateless mbbo's VAL to
+    // `cvt_dbaddr` (mbboRecord.c:300-313) degenerates a stateless mbbo's VAL to
     // DBF_USHORT — there are no labels to serve behind an enum index. The put
     // still arrives as `Enum(3)` (a CA client that asked for DBR_ENUM), which
     // is the point: the WRITE accepts the enum, the READ answers at the type C
@@ -8870,15 +8916,16 @@ async fn test_fanout_dfanout_seq_seln_default_is_one() {
     );
 }
 
-/// BUG 5 — `putAcks` (C `dbAccess.c:1303-1315`) compares the written
+/// BUG 5 — `putAcks` (C `dbAccess.c:1300-1312`) compares the written
 /// severity against the STORED unacknowledged severity `acks`, not
-/// against the current `sevr`; `putAckt` (C `dbAccess.c:1285-1301`)
+/// against the current `sevr`; `putAckt` (C `dbAccess.c:1282-1298`)
 /// lowers `acks` down to `sevr` when ACKT is set false and
 /// `acks > sevr`.
 ///
 /// R17-62 corrected the ROUTE this test drives: acknowledgement is a DBR
-/// request type (`DBR_PUT_ACKS`/`ACKT`) that `dbPut` intercepts above the
-/// `SPC_NOMOD` gate (`dbAccess.c:1331-1335`), not a put to the ACKS/ACKT
+/// request type (`DBR_PUT_ACKS`/`ACKT`) that `dbPut` intercepts
+/// (`dbAccess.c:1333-1336`) above the `SPC_NOMOD` gate `dbPutSpecial` applies
+/// (`:123`, called at `:1345-1348`), not a put to the ACKS/ACKT
 /// fields — softIoc refuses `caput N1.ACKS 2` with "Write access denied".
 /// The handlers moved to `RecordInstance::put_acks` / `put_ackt`; the
 /// semantics asserted here are unchanged.
@@ -8894,12 +8941,12 @@ async fn test_acks_put_compares_against_acks_and_ackt_lowers() {
         inst.common.acks = AlarmSeverity::Major;
         inst.common.sevr = AlarmSeverity::Minor;
         // Acknowledge at MAJOR — written sev (2) >= acks (2) -> clear.
-        inst.put_acks(2);
+        inst.put_acks(2, LinkBacking::none());
         assert_eq!(
             inst.common.acks,
             AlarmSeverity::NoAlarm,
             "ACKS write at sev>=stored acks must clear acks \
-             (C dbAccess.c:1309 compares *psev >= precord->acks)"
+             (C dbAccess.c:1306 compares *psev >= precord->acks)"
         );
 
         // A second case: written sev BELOW the stored acks must NOT
@@ -8910,7 +8957,7 @@ async fn test_acks_put_compares_against_acks_and_ackt_lowers() {
         let mut inst2 = RecordInstance::new("ACKTEST2".into(), rec2);
         inst2.common.acks = AlarmSeverity::Major;
         inst2.common.sevr = AlarmSeverity::Minor;
-        inst2.put_acks(1);
+        inst2.put_acks(1, LinkBacking::none());
         assert_eq!(
             inst2.common.acks,
             AlarmSeverity::Major,
@@ -8926,13 +8973,13 @@ async fn test_acks_put_compares_against_acks_and_ackt_lowers() {
         inst.common.ackt = true;
         inst.common.acks = AlarmSeverity::Major;
         inst.common.sevr = AlarmSeverity::Minor;
-        inst.put_ackt(0);
+        inst.put_ackt(0, LinkBacking::none());
         assert!(!inst.common.ackt, "ACKT must be cleared");
         assert_eq!(
             inst.common.acks,
             AlarmSeverity::Minor,
             "ACKT=false with acks>sevr must lower acks down to sevr \
-             (C dbAccess.c:1294-1297)"
+             (C dbAccess.c:1291-1294)"
         );
     }
 }
@@ -9027,15 +9074,17 @@ async fn mr_r5_foreign_process_blocks_on_held_epoch() {
     let db2 = db.clone();
     let processed = Arc::new(AtomicU32::new(0));
     let processed2 = processed.clone();
-    let h = epics_base_rs::runtime::task::spawn(async move {
-        // Foreign full-processing entry — must block on the gate the
-        // epoch holds.
-        let mut visited = HashSet::new();
-        let _ = db2
-            .process_record_with_links("MR_R5_MEMBER", &mut visited, 0)
-            .await;
-        processed2.store(1, Ordering::SeqCst);
-    });
+    let h = epics_base_rs::runtime::task::Reactor::current()
+        .expect("the test driver enters an executor")
+        .spawn(async move {
+            // Foreign full-processing entry — must block on the gate the
+            // epoch holds.
+            let mut visited = HashSet::new();
+            let _ = db2
+                .process_record_with_links("MR_R5_MEMBER", &mut visited, 0)
+                .await;
+            processed2.store(1, Ordering::SeqCst);
+        });
 
     // Give the spawned task time to reach (and block on) the gate.
     epics_base_rs::runtime::task::sleep(std::time::Duration::from_millis(50)).await;
@@ -9084,8 +9133,7 @@ async fn mr_r5_already_locked_process_does_not_self_deadlock() {
 }
 
 // ---------------------------------------------------------------------
-// The scan-index tail is INSIDE the advisory-gate window
-// (`doc/rtems-priority-locks-design.md` §2 / §5 step 4).
+// The scan-index tail is INSIDE the advisory-gate window.
 //
 // `update_scan_index` is synchronous as of step 4, which is what lets the
 // scan-list move stay inside the exclusion window C's `dbScanLock` has it
@@ -9111,7 +9159,7 @@ async fn scan_move_is_committed_when_put_pv_returns() {
         .await
         .unwrap();
     assert!(
-        db.records_for_scan(ScanType::Sec1)
+        db.records_for_scan(ScanType::SEC1)
             .await
             .contains(&"SIW_SCAN".to_string()),
         "the record must be in the 1-second list the moment put_pv returns"
@@ -9121,13 +9169,13 @@ async fn scan_move_is_committed_when_put_pv_returns() {
         .await
         .unwrap();
     assert!(
-        !db.records_for_scan(ScanType::Sec1)
+        !db.records_for_scan(ScanType::SEC1)
             .await
             .contains(&"SIW_SCAN".to_string()),
         "the old bucket must be swept in the same window, not later"
     );
     assert!(
-        db.records_for_scan(ScanType::Sec2)
+        db.records_for_scan(ScanType::SEC2)
             .await
             .contains(&"SIW_SCAN".to_string()),
         "the record must be in the 2-second list the moment put_pv returns"
@@ -9153,7 +9201,7 @@ async fn phas_reorder_is_committed_when_put_pv_returns() {
     }
     // Equal PHAS: load order decides, so A precedes B.
     assert_eq!(
-        db.records_for_scan(ScanType::Sec1).await,
+        db.records_for_scan(ScanType::SEC1).await,
         vec!["SIW_PHAS_A".to_string(), "SIW_PHAS_B".to_string()]
     );
 
@@ -9163,7 +9211,7 @@ async fn phas_reorder_is_committed_when_put_pv_returns() {
         .await
         .unwrap();
     assert_eq!(
-        db.records_for_scan(ScanType::Sec1).await,
+        db.records_for_scan(ScanType::SEC1).await,
         vec!["SIW_PHAS_B".to_string(), "SIW_PHAS_A".to_string()],
         "the PHAS reorder must be visible the moment put_pv returns"
     );
@@ -9192,12 +9240,14 @@ async fn scan_move_cannot_land_inside_a_held_epoch() {
     let db2 = db.clone();
     let done = Arc::new(AtomicU32::new(0));
     let done2 = done.clone();
-    let h = epics_base_rs::runtime::task::spawn(async move {
-        db2.put_pv("SIW_EPOCH.SCAN", EpicsValue::String("1 second".into()))
-            .await
-            .unwrap();
-        done2.store(1, Ordering::SeqCst);
-    });
+    let h = epics_base_rs::runtime::task::Reactor::current()
+        .expect("the test driver enters an executor")
+        .spawn(async move {
+            db2.put_pv("SIW_EPOCH.SCAN", EpicsValue::String("1 second".into()))
+                .await
+                .unwrap();
+            done2.store(1, Ordering::SeqCst);
+        });
 
     epics_base_rs::runtime::task::sleep(std::time::Duration::from_millis(50)).await;
     assert_eq!(
@@ -9206,7 +9256,7 @@ async fn scan_move_cannot_land_inside_a_held_epoch() {
         "put_pv must block on the gate the epoch holds"
     );
     assert!(
-        db.records_for_scan(ScanType::Sec1).await.is_empty(),
+        db.records_for_scan(ScanType::SEC1).await.is_empty(),
         "no scan-list move may be observable while the epoch owns the record"
     );
 
@@ -9214,7 +9264,7 @@ async fn scan_move_cannot_land_inside_a_held_epoch() {
     h.await.unwrap();
     assert_eq!(done.load(Ordering::SeqCst), 1);
     assert!(
-        db.records_for_scan(ScanType::Sec1)
+        db.records_for_scan(ScanType::SEC1)
             .await
             .contains(&"SIW_EPOCH".to_string()),
         "the move must be complete as soon as the put returns"
@@ -9596,10 +9646,22 @@ async fn sub_record_mdel_gates_val_monitor() {
 /// recGblSetSevr(SOFT_ALARM, prec->brsv)`). The earlier `SubroutineFn`
 /// returned `CaResult<()>`, so a subroutine could not signal an error and
 /// no SOFT_ALARM was ever raised.
+///
+/// Each record is driven TWICE, with the subroutine returning 0 on the first
+/// call, because C reaches SOFT_ALARM's severity only on a record that is
+/// already DEFINED. `do_sub` writes `prec->udf` in its `else` arm alone
+/// (`subRecord.c:434`), so on a first cycle the negative-status arm leaves UDF
+/// at its loaded 1 and `checkAlarms` takes `if (prec->udf) { recGblSetSevr(
+/// UDF_ALARM, prec->udfs); return; }` (`:323-326`) — UDFS is INVALID, which
+/// maximizes over SOFT/MAJOR. The successful first call is what C's own
+/// scanning record would have had before the failure. (This test asserted the
+/// single-cycle case while the port re-derived UDF from VAL on every cycle and
+/// so never had a UDF to trip over.)
 #[epics_macros_rs::epics_test]
 async fn sub_record_negative_status_raises_soft_alarm_at_brsv() {
     use epics_base_rs::server::recgbl::alarm_status;
     use epics_base_rs::server::records::sub_record::SubRecord;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     let db = PvDatabase::new();
 
@@ -9618,15 +9680,26 @@ async fn sub_record_negative_status_raises_soft_alarm_at_brsv() {
         inst.record
             .put_field("BRSV", EpicsValue::Short(AlarmSeverity::Major as i16))
             .unwrap();
-        let sub_fn: SubroutineFn = Box::new(move |_record: &mut dyn Record| Ok(status));
+        let calls = Arc::new(AtomicUsize::new(0));
+        let sub_fn: SubroutineFn = Box::new(move |_record: &mut dyn Record| {
+            // First call succeeds (VAL 0, so `udf = isnan(0)` clears); later
+            // calls return the status under test.
+            Ok(if calls.fetch_add(1, Ordering::Relaxed) == 0 {
+                0
+            } else {
+                status
+            })
+        });
         inst.subroutine = Some(Arc::new(sub_fn));
     }
 
     for name in ["SUB_SOFT", "SUB_OK0"] {
-        let mut visited = HashSet::new();
-        db.process_record_with_links(name, &mut visited, 0)
-            .await
-            .unwrap();
+        for _ in 0..2 {
+            let mut visited = HashSet::new();
+            db.process_record_with_links(name, &mut visited, 0)
+                .await
+                .unwrap();
+        }
     }
 
     {
@@ -10432,7 +10505,7 @@ async fn init_applies_constant_dol_across_record_types() {
         let inst = rec.read();
         // `UShort`, not `Enum`, for the same reason the comment above gives:
         // with no state table there is nothing to label the index with, so C's
-        // `cvt_dbaddr` serves VAL as DBF_USHORT (mbboRecord.c:300-312).
+        // `cvt_dbaddr` serves VAL as DBF_USHORT (mbboRecord.c:300-313).
         assert_eq!(
             inst.record.get_field("VAL"),
             Some(EpicsValue::UShort(2)),
@@ -10769,13 +10842,13 @@ async fn sel_specified_mode_empty_selected_link_computes_nan_not_frozen() {
 ///   - `subArray.INDX`   — `pp(TRUE)`: load AND runtime set.
 #[epics_macros_rs::epics_test]
 async fn promptgroup_config_fields_load_settable_runtime_immutable() {
-    use epics_base_rs::server::db_loader::{apply_fields, create_record};
+    use epics_base_rs::server::db_loader::{DbFieldDef, apply_fields, create_record};
 
     // --- LOAD half: apply_fields (the `.db` load coercion) must store these
     //     fields, resizing the backing array where one exists. ---
     let mut hist = create_record("histogram").expect("create histogram");
     let mut common: Vec<(String, EpicsValue)> = Vec::new();
-    apply_fields(&mut hist, &[("NELM".into(), "5".into())], &mut common)
+    apply_fields(&mut hist, &[DbFieldDef::new("NELM", "5")], &mut common)
         .expect("histogram NELM is .db-settable (promptgroup)");
     assert_eq!(hist.get_field("NELM"), Some(EpicsValue::UShort(5)));
     match hist.get_field("VAL") {
@@ -10787,7 +10860,7 @@ async fn promptgroup_config_fields_load_settable_runtime_immutable() {
 
     let mut comp = create_record("compress").expect("create compress");
     let mut common = Vec::new();
-    apply_fields(&mut comp, &[("NSAM".into(), "7".into())], &mut common)
+    apply_fields(&mut comp, &[DbFieldDef::new("NSAM", "7")], &mut common)
         .expect("compress NSAM is .db-settable (promptgroup)");
     assert_eq!(comp.get_field("NSAM"), Some(EpicsValue::ULong(7)));
 
@@ -10795,7 +10868,7 @@ async fn promptgroup_config_fields_load_settable_runtime_immutable() {
     let mut common = Vec::new();
     apply_fields(
         &mut sarr,
-        &[("MALM".into(), "8".into()), ("INDX".into(), "3".into())],
+        &[DbFieldDef::new("MALM", "8"), DbFieldDef::new("INDX", "3")],
         &mut common,
     )
     .expect("subArray MALM/INDX are .db-settable (in field_list)");
@@ -10846,7 +10919,7 @@ async fn promptgroup_config_fields_load_settable_runtime_immutable() {
     let rec = db.get_record("SARR").expect("SARR exists");
     let indx = rec.read().record.get_field("INDX");
     // INDX is pp(TRUE): the put PROCESSES the record, and `readValue` clamps
-    // `if (indx >= malm) indx = malm - 1` (subArrayRecord.c:313-314). This SARR
+    // `if (indx >= malm) indx = malm - 1` (subArrayRecord.c:309-310). This SARR
     // is the bare `create_record` default — MALM=1 — so C reads INDX back as 0,
     // not 2. Verified on a built softIoc: `caput SA:D.INDX 2` on a MALM=1
     // subArray reads back `SA:D.INDX 0` (NORD 0, SEVR INVALID). The put landing
@@ -10868,12 +10941,12 @@ async fn promptgroup_config_fields_load_settable_runtime_immutable() {
 /// runtime dbPutField).
 #[epics_macros_rs::epics_test]
 async fn waveform_nelm_ftvl_runtime_immutable_subarray_nelm_writable() {
-    use epics_base_rs::server::db_loader::{apply_fields, create_record};
+    use epics_base_rs::server::db_loader::{DbFieldDef, apply_fields, create_record};
 
     // Load still sets NELM/FTVL on a waveform (SPC_NOMOD is runtime-only).
     let mut wf = create_record("waveform").expect("create waveform");
     let mut common: Vec<(String, EpicsValue)> = Vec::new();
-    apply_fields(&mut wf, &[("NELM".into(), "4".into())], &mut common)
+    apply_fields(&mut wf, &[DbFieldDef::new("NELM", "4")], &mut common)
         .expect("waveform NELM is .db-settable at load");
     assert_eq!(wf.get_field("NELM"), Some(EpicsValue::ULong(4)));
 
@@ -10927,17 +11000,17 @@ async fn waveform_nelm_ftvl_runtime_immutable_subarray_nelm_writable() {
 /// numeric per-argument fields (`NOx`/`NOVx`) keep loading.
 #[test]
 fn asub_ftype_menu_fields_load_by_label() {
-    use epics_base_rs::server::db_loader::{apply_fields, create_record};
+    use epics_base_rs::server::db_loader::{DbFieldDef, apply_fields, create_record};
 
     let mut rec = create_record("aSub").expect("create aSub");
     let mut common = Vec::new();
     apply_fields(
         &mut rec,
         &[
-            ("FTA".into(), "LONG".into()), // input A element type, menuFtype label
-            ("FTVB".into(), "STRING".into()), // output B element type, menuFtype label
-            ("NOA".into(), "5".into()),    // input A max elements, numeric
-            ("NOVB".into(), "3".into()),   // output B max elements, numeric
+            DbFieldDef::new("FTA", "LONG"), // input A element type, menuFtype label
+            DbFieldDef::new("FTVB", "STRING"), // output B element type, menuFtype label
+            DbFieldDef::new("NOA", "5"),    // input A max elements, numeric
+            DbFieldDef::new("NOVB", "3"),   // output B max elements, numeric
         ],
         &mut common,
     )

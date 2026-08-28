@@ -158,7 +158,7 @@ impl Record for AiRecord {
         "ai"
     }
 
-    /// `aiRecord.c:244-266` `get_control_double` lists one field the shared
+    /// `aiRecord.c:267-288` `get_control_double` lists one field the shared
     /// VAL-class set does not: `SVAL`, which takes the record's own
     /// `HOPR`/`LOPR` like `VAL` does. Without this it falls to the `default:`
     /// arm and reports the DBF_DOUBLE range of ±1e300.
@@ -256,7 +256,7 @@ impl Record for AiRecord {
                 }
             }
 
-            // Step 3: Smoothing filter (aiRecord.c:439-444). On the initial
+            // Step 3: Smoothing filter (aiRecord.c:440-444). On the initial
             // conversion there is no history to blend against, so C seeds VAL
             // with the new value first — `if (prec->init) prec->val = val;` —
             // and only then runs the filter.
@@ -362,7 +362,7 @@ impl Record for AiRecord {
                 }
                 _ => Err(CaError::TypeMismatch(name.into())),
             },
-            // SPC_LINCONV parity (aiRecord.c:181-200): LINR / EGUF / EGUL
+            // SPC_LINCONV parity (aiRecord.c:182-200): LINR / EGUF / EGUL
             // are tagged `special(SPC_LINCONV)` in aiRecord.dbd, and C's
             // `special()` does exactly two things for them:
             //
@@ -378,11 +378,23 @@ impl Record for AiRecord {
             //
             // The `eoff = egul` rebase belongs to the device support's
             // `special_linconv` callback, and NO soft dset provides one:
-            // `devAiSoftRaw.c:32-34` is `{{6, NULL, NULL, init_record, NULL},
+            // `devAiSoftRaw.c:32-35` is `{{6, NULL, NULL, init_record, NULL},
             // read_ai, NULL}` — that trailing NULL *is* `special_linconv`. So
             // on a soft record a put to LINR/EGUF/EGUL sets `init` and touches
             // nothing else, and an operator retuning the display range EGUL
             // does not silently re-scale the conversion.
+            //
+            // The arm C opens with — `if (pdset->common.number < 6) {
+            // recGblDbaddrError(S_db_noMod, paddr, "ai: special"); return
+            // S_db_noMod; }` (aiRecord.c:183-186), refusing a legacy 5-entry
+            // DSET table that has no `special_linconv` slot — is deliberately
+            // absent here: every base-supplied soft dset declares `{6, ...}`
+            // (devAiSoft.c:34, devAiSoftRaw.c:33) so the refusal is
+            // unreachable through base's own device support, and this port's
+            // device support is the `DeviceSupport` trait
+            // (`server/device_support.rs:96`), which has no `number` field and
+            // no function-pointer table, so a short dset is unrepresentable by
+            // type rather than rejected at run time.
             //
             "LINR" => match value {
                 EpicsValue::Short(v) => {
@@ -613,7 +625,7 @@ impl Record for AiRecord {
 
     /// C `devAiSoft.c::read_ai` (:81-93) and `devAiSoftCallback.c::read_ai`
     /// (:180-194): both soft `ai` dsets apply `SMOO` themselves, before the
-    /// record body ever runs. `aiRecord.c:439-444` — the copy `process()`
+    /// record body ever runs. `aiRecord.c:440-444` — the copy `process()`
     /// runs — is reached only when `convert()` does, i.e. only under
     /// `devAiSoftRaw`, so with the filter written there alone `SMOO` had no
     /// effect at any value on the default `ai` DTYP.
@@ -712,7 +724,7 @@ mod tests {
     /// the OPPOSITE — that an EGUL put under LINEAR rebases `eoff = egul` — and
     /// so pinned the defect (R18-97). C's `prec->eoff = prec->egul;` sits INSIDE
     /// `if ((prec->linr == menuConvertLINEAR) && pdset->special_linconv)`: the
-    /// rebase is the device support's, and `devAiSoftRaw.c:32-34` supplies no
+    /// rebase is the device support's, and `devAiSoftRaw.c:32-35` supplies no
     /// `special_linconv` (the trailing NULL of `{{6, NULL, NULL, init_record,
     /// NULL}, read_ai, NULL}`).
     ///
@@ -828,7 +840,7 @@ mod tests {
     }
 
     /// Out of range: ai still applies the extrapolated value (C does NOT
-    /// early-return, aiRecord.c:432-437) but raises SOFT_ALARM/MAJOR via
+    /// early-return, aiRecord.c:433-436) but raises SOFT_ALARM/MAJOR via
     /// `bpt_error`.
     #[test]
     fn linr_breaktable_out_of_range_extrapolates_and_flags() {

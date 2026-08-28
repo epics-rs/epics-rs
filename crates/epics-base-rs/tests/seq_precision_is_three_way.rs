@@ -16,6 +16,7 @@
 //! `route_field_metadata` took the slot over. The `DOn` arm's `dbGetPrecision`
 //! fails on a CONSTANT link (`S_db_noLSET`) and falls through with it.
 
+use epics_base_rs::server::database::LinkBacking;
 use epics_base_rs::server::db_loader::create_record;
 use epics_base_rs::server::record::RecordInstance;
 use epics_base_rs::types::EpicsValue;
@@ -30,14 +31,16 @@ fn seq_with_prec(prec: i16) -> RecordInstance {
 
 /// `caget -s` — the DBR_STRING form, which is where a precision shows.
 fn dbr_string_of(inst: &RecordInstance, field: &str) -> String {
-    let snap = inst.snapshot_for_field(field).expect("field exists");
+    let snap = inst
+        .snapshot_for_field_with(field, LinkBacking::none())
+        .expect("field exists");
     let bytes = epics_base_rs::types::encode_dbr(0, &snap).expect("DBR_STRING encodes");
     let end = bytes.iter().position(|b| *b == 0).unwrap_or(bytes.len());
     String::from_utf8_lossy(&bytes[..end]).into_owned()
 }
 
 fn precision_of(inst: &RecordInstance, field: &str) -> Option<i16> {
-    inst.snapshot_for_field(field)
+    inst.snapshot_for_field_with(field, LinkBacking::none())
         .expect("field exists")
         .precision()
 }
@@ -76,7 +79,7 @@ fn the_fall_through_arm_covers_every_other_double_field() {
     }
 }
 
-/// C's DBF gate (`dbAccess.c:388-395`) drops DBR_PRECISION for a field that is
+/// C's DBF gate (`dbAccess.c:387-394`) drops DBR_PRECISION for a field that is
 /// neither float nor double — `seq.VAL` is DBF_LONG and `SELN` DBF_USHORT.
 #[test]
 fn an_integer_field_of_the_same_record_supplies_no_precision() {

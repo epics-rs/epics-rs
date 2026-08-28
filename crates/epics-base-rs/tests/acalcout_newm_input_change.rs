@@ -1,6 +1,6 @@
 //! R11-C4 — NEWM: the arrays whose INAA..INLL LINK delivered a changed value.
 //!
-//! C `fetch_values` (`aCalcoutRecord.c:1088-1106`) saves the field, fetches the
+//! C `fetch_values` (`aCalcoutRecord.c:1089-1106`) saves the field, fetches the
 //! link into it, and compares over `acalcGetNumElements` elements:
 //!
 //! ```c
@@ -11,7 +11,7 @@
 //! }
 //! ```
 //!
-//! `monitor()` (`:1031-1036`) posts exactly those arrays and clears the mask.
+//! `monitor()` (`:1027-1032`) posts exactly those arrays and clears the mask.
 //! The port never computed NEWM, so a changed input array was posted only by the
 //! framework's change detection — which compares against the LAST POSTED value,
 //! not against the value the field held before the fetch. Those two disagree the

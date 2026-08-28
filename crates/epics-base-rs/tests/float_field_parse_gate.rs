@@ -22,7 +22,8 @@
 //! non-finite LITERAL is exempt from both.
 
 use epics_base_rs::server::ioc_builder::IocBuilder;
-use epics_base_rs::types::c_parse::{NumericField, put_string};
+use epics_base_rs::server::records::swait::SwaitRecord;
+use epics_base_rs::types::c_parse::{Converted, NumericField, put_string};
 use epics_base_rs::types::{DbFieldType, EpicsValue};
 use std::collections::HashMap;
 
@@ -38,7 +39,7 @@ fn parsed(s: &str) -> Option<f32> {
 /// The record-put route's verdict on the same text, through `c_parse`.
 fn put(s: &str) -> Option<f32> {
     match put_string("F", NumericField::Float, s) {
-        Ok(EpicsValue::Float(v)) => Some(v),
+        Ok(Converted::Stored(EpicsValue::Float(v))) => Some(v),
         Ok(other) => panic!("Float put produced {other:?}"),
         Err(_) => None,
     }
@@ -114,6 +115,7 @@ async fn a_db_file_cannot_load_an_out_of_range_float_field() {
     assert!(refused, "a .db field C refuses must not load as `inf`");
 
     let (db, _) = IocBuilder::new()
+        .register_record_type("swait", || Box::new(SwaitRecord::default()))
         .db_string(
             r#"record(swait,"W:OK"){ field(ODLY,"1.5") }"#,
             &HashMap::new(),

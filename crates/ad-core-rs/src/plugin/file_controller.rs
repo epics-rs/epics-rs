@@ -327,7 +327,8 @@ impl<W: NDFileWriter> FilePluginController<W> {
             .unwrap_or(false);
         if force_close {
             if let Err(e) = self.file_base.force_close(&mut self.writer) {
-                return ProcessResult::sink(self.error_updates(false, false, e.to_string()));
+                self.fail_cycle(&mut proc_result, e.to_string());
+                return proc_result;
             }
             let _ = self.stop_capture(&mut proc_result.param_updates);
             return proc_result;
@@ -388,11 +389,8 @@ impl<W: NDFileWriter> FilePluginController<W> {
                         self.apply_filename_attributes(&array, &mut proc_result.param_updates);
                     if reopen && self.file_base.is_open() {
                         if let Err(e) = self.file_base.force_close(&mut self.writer) {
-                            return ProcessResult::sink(self.error_updates(
-                                false,
-                                false,
-                                e.to_string(),
-                            ));
+                            self.fail_cycle(&mut proc_result, e.to_string());
+                            return proc_result;
                         }
                     }
                     let r = self.file_base.process_array(array, &mut self.writer);
@@ -407,11 +405,8 @@ impl<W: NDFileWriter> FilePluginController<W> {
                     let target = self.file_base.num_capture_target();
                     if r.is_ok() && target > 0 && self.file_base.num_captured() >= target {
                         if let Err(e) = self.file_base.close_stream(&mut self.writer) {
-                            return ProcessResult::sink(self.error_updates(
-                                false,
-                                false,
-                                e.to_string(),
-                            ));
+                            self.fail_cycle(&mut proc_result, e.to_string());
+                            return proc_result;
                         }
                         self.stop_capture(&mut proc_result.param_updates).ok();
                         self.push_full_file_name_update(&mut proc_result.param_updates);
@@ -442,7 +437,7 @@ impl<W: NDFileWriter> FilePluginController<W> {
                 });
             }
         } else if let Err(err) = result {
-            proc_result.param_updates = self.error_updates(false, false, err.to_string());
+            self.fail_cycle(&mut proc_result, err.to_string());
         }
         proc_result
     }
@@ -487,11 +482,8 @@ impl<W: NDFileWriter> FilePluginController<W> {
             let new_mode = NDFileMode::from_i32(params.value.as_i32());
             if self.capture_active && new_mode != self.file_base.mode() {
                 if let Err(e) = self.stop_capture(&mut updates) {
-                    return ParamChangeResult::updates(self.error_updates(
-                        false,
-                        false,
-                        e.to_string(),
-                    ));
+                    self.push_error_updates(&mut updates, false, false, e.to_string());
+                    return ParamChangeResult::updates(updates);
                 }
             }
             self.file_base.set_mode(new_mode);
@@ -536,11 +528,12 @@ impl<W: NDFileWriter> FilePluginController<W> {
                         self.push_full_file_name_update(&mut updates);
                     }
                     Err(err) => {
-                        return ParamChangeResult::updates(self.error_updates(
-                            false,
-                            true,
-                            err.to_string(),
-                        ));
+                        // The write that failed is `flush_capture` in Capture
+                        // mode, which lands frames one at a time, so the
+                        // readbacks have to come back off `file_base`.
+                        self.push_error_updates(&mut updates, false, true, err.to_string());
+                        self.push_file_base_readbacks(&mut updates);
+                        return ParamChangeResult::updates(updates);
                     }
                 }
             }
@@ -566,11 +559,8 @@ impl<W: NDFileWriter> FilePluginController<W> {
                         return ParamChangeResult::combined(vec![array], updates);
                     }
                     Err(err) => {
-                        return ParamChangeResult::updates(self.error_updates(
-                            true,
-                            false,
-                            err.to_string(),
-                        ));
+                        self.push_error_updates(&mut updates, true, false, err.to_string());
+                        return ParamChangeResult::updates(updates);
                     }
                 }
             }
@@ -589,21 +579,21 @@ impl<W: NDFileWriter> FilePluginController<W> {
                 if self.file_base.mode() == NDFileMode::Single {
                     // Capture is invalid in Single mode — leave it stopped.
                     let _ = self.stop_capture(&mut updates);
-                    return ParamChangeResult::updates(self.error_updates(
+                    self.push_error_updates(
+                        &mut updates,
                         false,
                         false,
                         "ERROR: capture not supported in Single mode".into(),
-                    ));
+                    );
+                    return ParamChangeResult::updates(updates);
                 }
                 if let Err(e) = self.start_capture(&mut updates) {
-                    return ParamChangeResult::updates(self.error_updates(
-                        false,
-                        false,
-                        e.to_string(),
-                    ));
+                    self.push_error_updates(&mut updates, false, false, e.to_string());
+                    return ParamChangeResult::updates(updates);
                 }
             } else if let Err(e) = self.stop_capture(&mut updates) {
-                return ParamChangeResult::updates(self.error_updates(false, false, e.to_string()));
+                self.push_error_updates(&mut updates, false, false, e.to_string());
+                return ParamChangeResult::updates(updates);
             }
         }
 
@@ -619,13 +609,7 @@ impl<W: NDFileWriter> FilePluginController<W> {
 
     fn success_updates(&self) -> Vec<ParamUpdate> {
         let mut updates = Vec::new();
-        if let Some(idx) = self.params.file_number {
-            updates.push(ParamUpdate::Int32 {
-                reason: idx,
-                addr: 0,
-                value: self.file_base.file_number,
-            });
-        }
+        self.push_file_number_update(&mut updates);
         if let Some(idx) = self.params.write_status {
             updates.push(ParamUpdate::Int32 {
                 reason: idx,
@@ -680,6 +664,42 @@ impl<W: NDFileWriter> FilePluginController<W> {
         }
     }
 
+    fn push_file_number_update(&self, updates: &mut Vec<ParamUpdate>) {
+        if let Some(idx) = self.params.file_number {
+            updates.push(ParamUpdate::Int32 {
+                reason: idx,
+                addr: 0,
+                value: self.file_base.file_number,
+            });
+        }
+    }
+
+    /// Re-publish every readback `NDFileBase` owns, read back out of it.
+    ///
+    /// A file operation can fail part-way through and leave that state moved.
+    /// `flush_capture`'s single-image arm walks the capture buffer frame by
+    /// frame (`file_base.rs:419-436`), dropping each landed frame through
+    /// `take_landed` — which is what sets `num_captured` — and bumping
+    /// `file_number` per frame, so a `?` on frame 5 of a 10-frame flush leaves
+    /// `num_captured` at 5 and `file_number` five higher than the cycle began
+    /// with, while the value the controller pushed before the flush still says
+    /// 10. Re-reading is the only way the readbacks can name what is actually
+    /// on disk, so every exit that follows a file operation does it rather than
+    /// trusting what an earlier line in the same cycle pushed.
+    fn push_file_base_readbacks(&self, updates: &mut Vec<ParamUpdate>) {
+        self.push_num_captured_update(updates);
+        self.push_file_number_update(updates);
+        self.push_full_file_name_update(updates);
+    }
+
+    /// The failure exit of one `process_array` cycle: keep everything the cycle
+    /// accumulated, add the error surface, and re-derive the `file_base`
+    /// readbacks over the top of whatever the cycle published before it failed.
+    fn fail_cycle(&mut self, proc_result: &mut ProcessResult, message: String) {
+        self.push_error_updates(&mut proc_result.param_updates, false, false, message);
+        self.push_file_base_readbacks(&mut proc_result.param_updates);
+    }
+
     fn push_full_file_name_update(&self, updates: &mut Vec<ParamUpdate>) {
         if let Some(idx) = self.params.full_file_name {
             updates.push(ParamUpdate::Octet {
@@ -690,13 +710,30 @@ impl<W: NDFileWriter> FilePluginController<W> {
         }
     }
 
-    fn error_updates(
+    /// Append the error surface for a failed file operation onto the updates
+    /// the caller has already accumulated.
+    ///
+    /// Takes the accumulator rather than returning a fresh `Vec`, so an error
+    /// exit **cannot** replace what the same cycle published before it failed:
+    /// there is no return value to assign over one. Every site here used to
+    /// build a fresh vector and then either assign it (`process_array`) or
+    /// return it in place of the accumulator (`on_param_change`), which threw
+    /// away the `NDFileNumCaptured`, `FilePathExists` and `Capture_RBV` updates
+    /// that same cycle had already produced.
+    ///
+    /// C++ has no equivalent move. `NDPluginFile::processCallbacks` writes into
+    /// the asyn parameter library as it goes and flushes once at its single
+    /// exit, `callParamCallbacks()` (`NDPluginFile.cpp:789`), and
+    /// `writeFileBase` sets `NDFileWriteStatus`/`NDFileWriteMessage` clean at
+    /// `:231-232` then overwrites them with the error at `:259-260`. No line in
+    /// it discards a parameter another line already set.
+    fn push_error_updates(
         &self,
+        updates: &mut Vec<ParamUpdate>,
         read_reason: bool,
         write_reason: bool,
         message: String,
-    ) -> Vec<ParamUpdate> {
-        let mut updates = Vec::new();
+    ) {
         if write_reason {
             if let Some(idx) = self.params.write_file {
                 updates.push(ParamUpdate::Int32 {
@@ -729,11 +766,10 @@ impl<W: NDFileWriter> FilePluginController<W> {
                 value: message,
             });
         }
-        // B8: an error return replaces whatever updates the caller accumulated,
-        // so the capture state has to be re-derived here or a `stop_capture`
-        // that failed would report its error with `Capture_RBV` still reading 1.
-        self.push_capture_update(&mut updates);
-        updates
+        // The capture state belongs on the error surface in its own right: a
+        // `stop_capture` that failed must not report the error with
+        // `Capture_RBV` still reading 1.
+        self.push_capture_update(updates);
     }
 }
 
@@ -762,6 +798,9 @@ mod tests {
         /// Make `close_file` fail, standing in for the ENOSPC / read-only-mount
         /// close that a real writer cannot complete.
         fail_close: bool,
+        /// Fail every `write_file` past this many successful ones, standing in
+        /// for a volume that fills part way through a multi-frame flush.
+        fail_write_after: Option<usize>,
     }
     impl MockWriter {
         fn new(multi: bool) -> Self {
@@ -771,6 +810,7 @@ mod tests {
                 closes: 0,
                 multi,
                 fail_close: false,
+                fail_write_after: None,
             }
         }
     }
@@ -781,6 +821,11 @@ mod tests {
         }
         fn write_file(&mut self, _a: &NDArray) -> ADResult<()> {
             self.writes += 1;
+            if let Some(n) = self.fail_write_after {
+                if self.writes > n {
+                    return Err(ADError::UnsupportedConversion("disk full".into()));
+                }
+            }
             Ok(())
         }
         fn read_file(&mut self) -> ADResult<NDArray> {
@@ -1228,5 +1273,176 @@ mod tests {
             _ => None,
         });
         assert_eq!(counter2, Some(2));
+    }
+
+    /// The value the parameter library would end up holding for `reason`:
+    /// the LAST update in the cycle wins, exactly as repeated
+    /// `setIntegerParam` calls do before a single `callParamCallbacks`.
+    fn int_update(updates: &[ParamUpdate], reason: usize) -> Option<i32> {
+        updates.iter().rev().find_map(|u| match u {
+            ParamUpdate::Int32 {
+                reason: r, value, ..
+            } if *r == reason => Some(*value),
+            _ => None,
+        })
+    }
+
+    const NUM_CAPTURED: usize = 61;
+    const WRITE_STATUS: usize = 62;
+    const FILE_NUMBER: usize = 63;
+    const PATH_EXISTS: usize = 64;
+    const WRITE_FILE: usize = 65;
+
+    fn capture_controller(multi: bool) -> FilePluginController<MockWriter> {
+        let mut c = FilePluginController::new(MockWriter::new(multi));
+        c.set_port_name("F");
+        c.params.num_captured = Some(NUM_CAPTURED);
+        c.params.write_status = Some(WRITE_STATUS);
+        c.params.file_number = Some(FILE_NUMBER);
+        c.params.file_path_exists = Some(PATH_EXISTS);
+        c.params.write_file = Some(WRITE_FILE);
+        c.file_base.set_mode(NDFileMode::Capture);
+        // The single-image arm burns a file number per frame that lands, which
+        // is what makes NDFileNumber_RBV stale after a partial flush.
+        c.file_base.auto_increment = true;
+        c.auto_save = true;
+        c.capture_active = true;
+        c
+    }
+
+    /// The headline case. A single-image flush lands frames one at a time, so a
+    /// writer that fills the volume on frame 3 of 4 leaves two frames queued
+    /// and `file_number` two higher. `NDFileNumCaptured_RBV` has to name the
+    /// two that are still owed — before this it kept the 4 the controller
+    /// pushed BEFORE the flush, because the error exit assigned over it.
+    #[test]
+    fn a_partial_capture_flush_republishes_the_frames_still_queued() {
+        let mut c = capture_controller(false);
+        c.file_base.set_num_capture(4);
+        c.writer.fail_write_after = Some(2);
+        let first_number = c.file_base.file_number;
+
+        let mut last = ProcessResult::empty();
+        for id in 1..=4 {
+            last = c.process_array(&array(id));
+        }
+
+        assert_eq!(
+            c.file_base.num_captured(),
+            2,
+            "two frames never reached disk and stay queued"
+        );
+        assert_eq!(
+            int_update(&last.param_updates, NUM_CAPTURED),
+            Some(2),
+            "the readback must name the frames still owed, not the 4 pushed \
+             before the flush was attempted"
+        );
+        assert_eq!(
+            int_update(&last.param_updates, FILE_NUMBER),
+            Some(first_number + 2),
+            "the two frames that DID land burned two file numbers"
+        );
+        assert_eq!(
+            int_update(&last.param_updates, WRITE_STATUS),
+            Some(1),
+            "the failure is still reported"
+        );
+    }
+
+    /// The same failing cycle also ran `refresh_file_path_exists` before it
+    /// touched the writer. That update belongs to the cycle and the error exit
+    /// must not drop it — C++ accumulates into the parameter library and
+    /// flushes once at `NDPluginFile.cpp:789`.
+    #[test]
+    fn a_partial_capture_flush_keeps_the_path_check_of_the_same_cycle() {
+        let mut c = capture_controller(false);
+        c.file_base.set_num_capture(4);
+        c.writer.fail_write_after = Some(2);
+
+        let mut last = ProcessResult::empty();
+        for id in 1..=4 {
+            last = c.process_array(&array(id));
+        }
+
+        assert!(
+            int_update(&last.param_updates, PATH_EXISTS).is_some(),
+            "FilePathExists was checked this cycle; the error exit dropped it"
+        );
+    }
+
+    /// A formerly-bypassing exit: the Stream close ran its own
+    /// `return ProcessResult::sink(..)` past the tail, so the
+    /// `NDFileNumCaptured` this cycle had already published for the frame that
+    /// DID reach disk went with it.
+    #[test]
+    fn a_failed_stream_close_keeps_the_count_the_same_cycle_published() {
+        let mut c = FilePluginController::new(MockWriter::new(true));
+        c.set_port_name("F");
+        c.params.num_captured = Some(NUM_CAPTURED);
+        c.params.write_status = Some(WRITE_STATUS);
+        c.file_base.set_mode(NDFileMode::Stream);
+        c.file_base.set_num_capture(1);
+        c.capture_active = true;
+        c.writer.fail_close = true;
+
+        let r = c.process_array(&array(1));
+
+        assert_eq!(
+            int_update(&r.param_updates, NUM_CAPTURED),
+            Some(1),
+            "the frame reached disk before the close failed"
+        );
+        assert_eq!(
+            int_update(&r.param_updates, WRITE_STATUS),
+            Some(1),
+            "the close failure is still reported"
+        );
+    }
+
+    /// The control-plane twin of the headline case: a manual `WriteFile` on a
+    /// buffered capture flushes through the same partial path, and its error
+    /// exit published no count at all.
+    #[test]
+    fn a_failed_manual_write_republishes_the_capture_count() {
+        let mut c = capture_controller(false);
+        c.file_base.set_num_capture(0); // buffer forever, never auto-flush
+        for id in 1..=4 {
+            c.process_array(&array(id));
+        }
+        assert_eq!(c.file_base.num_captured(), 4, "all four are buffered");
+
+        c.writer.fail_write_after = Some(2);
+        let snap = PluginParamSnapshot {
+            enable_callbacks: true,
+            reason: WRITE_FILE,
+            addr: 0,
+            value: ParamChangeValue::Int32(1),
+        };
+        let r = c.on_param_change(WRITE_FILE, &snap);
+
+        assert_eq!(
+            int_update(&r.param_updates, NUM_CAPTURED),
+            Some(2),
+            "a failed manual flush must still say how many frames are owed"
+        );
+        assert_eq!(int_update(&r.param_updates, WRITE_STATUS), Some(1));
+    }
+
+    /// The success boundary: nothing above may turn a clean flush into an
+    /// error surface or leave a stale count behind.
+    #[test]
+    fn a_clean_capture_flush_reports_no_frames_left_and_no_error() {
+        let mut c = capture_controller(false);
+        c.file_base.set_num_capture(4);
+
+        let mut last = ProcessResult::empty();
+        for id in 1..=4 {
+            last = c.process_array(&array(id));
+        }
+
+        assert_eq!(c.file_base.num_captured(), 0);
+        assert_eq!(int_update(&last.param_updates, NUM_CAPTURED), Some(0));
+        assert_eq!(int_update(&last.param_updates, WRITE_STATUS), Some(0));
     }
 }

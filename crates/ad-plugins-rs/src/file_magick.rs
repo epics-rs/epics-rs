@@ -12,6 +12,7 @@ use ad_core_rs::plugin::runtime::{
 
 use image::codecs::png::{CompressionType as PngCompression, FilterType as PngFilter};
 use image::{DynamicImage, ImageEncoder, ImageFormat};
+use parking_lot::Mutex;
 
 /// GraphicsMagick `CompressionType` ordinals as used by C++ NDFileMagick.cpp:20
 /// (`compressionTypes[]`). The `MAGICK_COMPRESS_TYPE` param indexes this list.
@@ -90,7 +91,7 @@ impl MagickWriter {
     ///
     /// C takes the mode from the branch it took, not from the attribute: the 2-D
     /// branch is grayscale whatever the attribute says (:71-75). And unlike
-    /// NDFileTIFF (:180) there is no ndims == 1 branch — a 1-D array is an error.
+    /// NDFileTIFF.cpp:180 there is no ndims == 1 branch — a 1-D array is an error.
     fn color_mode(array: &NDArray) -> ADResult<NDColorMode> {
         let attr_mode = array.info().color_mode;
         Ok(match array.dims.as_slice() {
@@ -431,7 +432,7 @@ impl NDFileWriter for MagickWriter {
 
 /// Magick file processor wrapping `FilePluginController<MagickWriter>`.
 pub struct MagickFileProcessor {
-    ctrl: FilePluginController<MagickWriter>,
+    ctrl: Mutex<FilePluginController<MagickWriter>>,
     quality_idx: Option<usize>,
     bit_depth_idx: Option<usize>,
     compress_type_idx: Option<usize>,
@@ -440,7 +441,7 @@ pub struct MagickFileProcessor {
 impl MagickFileProcessor {
     pub fn new() -> Self {
         Self {
-            ctrl: FilePluginController::new(MagickWriter::new()),
+            ctrl: Mutex::new(FilePluginController::new(MagickWriter::new())),
             quality_idx: None,
             bit_depth_idx: None,
             compress_type_idx: None,
@@ -449,8 +450,8 @@ impl MagickFileProcessor {
 }
 
 impl NDPluginProcess for MagickFileProcessor {
-    fn process_array(&mut self, array: &NDArray, _pool: &NDArrayPool) -> ProcessResult {
-        self.ctrl.process_array(array)
+    fn process_array(&self, array: &NDArray, _pool: &NDArrayPool) -> ProcessResult {
+        self.ctrl.lock().process_array(array)
     }
 
     fn plugin_type(&self) -> &str {
@@ -467,7 +468,7 @@ impl NDPluginProcess for MagickFileProcessor {
         &mut self,
         base: &mut asyn_rs::port::PortDriverBase,
     ) -> asyn_rs::error::AsynResult<()> {
-        self.ctrl.register_params(base)?;
+        self.ctrl.lock().register_params(base)?;
         use asyn_rs::param::ParamType;
         self.quality_idx = Some(base.create_param("MAGICK_QUALITY", ParamType::Int32)?);
         self.bit_depth_idx = Some(base.create_param("MAGICK_BIT_DEPTH", ParamType::Int32)?);
@@ -479,26 +480,25 @@ impl NDPluginProcess for MagickFileProcessor {
         Ok(())
     }
 
-    fn on_param_change(
-        &mut self,
-        reason: usize,
-        params: &PluginParamSnapshot,
-    ) -> ParamChangeResult {
+    fn on_param_change(&self, reason: usize, params: &PluginParamSnapshot) -> ParamChangeResult {
         if Some(reason) == self.quality_idx {
             let q = params.value.as_i32().clamp(1, 100) as u8;
-            self.ctrl.writer.set_quality(q);
+            self.ctrl.lock().writer.set_quality(q);
             return ParamChangeResult::empty();
         }
         if Some(reason) == self.bit_depth_idx {
             let d = params.value.as_i32() as u32;
-            self.ctrl.writer.set_bit_depth(d);
+            self.ctrl.lock().writer.set_bit_depth(d);
             return ParamChangeResult::empty();
         }
         if Some(reason) == self.compress_type_idx {
-            self.ctrl.writer.set_compress_type(params.value.as_i32());
+            self.ctrl
+                .lock()
+                .writer
+                .set_compress_type(params.value.as_i32());
             return ParamChangeResult::empty();
         }
-        self.ctrl.on_param_change(reason, params)
+        self.ctrl.lock().on_param_change(reason, params)
     }
 }
 
@@ -511,7 +511,10 @@ mod tests {
 
     fn temp_path(ext: &str) -> PathBuf {
         let n = TEST_COUNTER.fetch_add(1, Ordering::Relaxed);
-        std::env::temp_dir().join(format!("adcore_test_magick_{n}.{ext}"))
+        std::env::temp_dir().join(format!(
+            "adcore_test_magick_{}_{n}.{ext}",
+            std::process::id()
+        ))
     }
 
     /// R8-75, Magick writer: same defect as the cited TIFF site. C sets
@@ -541,6 +544,16 @@ mod tests {
         assert!(
             matches!(err, ADError::InvalidDimensions(_)),
             "3-D without ColorMode must be rejected, got {err:?}"
+        );
+        // ADP-95(b): C fails this array in `openFile` (NDFileMagick.cpp:90-95),
+        // before `image.write()` ever runs, so no file exists on disk. The port
+        // reaches the same decision one call later, in `write_file`, but must
+        // leave the same absence — a caller that branches on the error code
+        // must not then find a file the error says was not written.
+        assert!(
+            !path.exists(),
+            "a rejected array must leave no file: {}",
+            path.display()
         );
         std::fs::remove_file(&path).ok();
 

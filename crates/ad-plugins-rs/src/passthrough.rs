@@ -25,7 +25,7 @@ impl NDPluginProcess for PassthroughProcessor {
         &self.plugin_type
     }
 
-    fn process_array(&mut self, _array: &NDArray, _pool: &NDArrayPool) -> ProcessResult {
+    fn process_array(&self, _array: &NDArray, _pool: &NDArrayPool) -> ProcessResult {
         ProcessResult::empty()
     }
 

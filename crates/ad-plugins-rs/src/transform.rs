@@ -4,6 +4,7 @@ use ad_core_rs::color::NDColorMode;
 use ad_core_rs::ndarray::{NDArray, NDDataBuffer, NDDimension};
 use ad_core_rs::ndarray_pool::NDArrayPool;
 use ad_core_rs::plugin::runtime::{NDPluginProcess, ProcessResult};
+use parking_lot::Mutex;
 
 /// Transform types matching C++ `NDPluginTransformType_t`.
 ///
@@ -196,22 +197,27 @@ pub fn apply_transform(src: &NDArray, transform: TransformType) -> NDArray {
 
 /// Pure transform processing logic.
 pub struct TransformProcessor {
-    transform: TransformType,
+    transform: Mutex<TransformType>,
     transform_type_idx: Option<usize>,
 }
 
 impl TransformProcessor {
     pub fn new(transform: TransformType) -> Self {
         Self {
-            transform,
+            transform: Mutex::new(transform),
             transform_type_idx: None,
         }
     }
 }
 
 impl NDPluginProcess for TransformProcessor {
-    fn process_array(&mut self, array: &NDArray, _pool: &NDArrayPool) -> ProcessResult {
-        let out = apply_transform(array, self.transform);
+    fn process_array(&self, array: &NDArray, _pool: &NDArrayPool) -> ProcessResult {
+        // C reads the transform type under the port lock and releases it
+        // before `transformImage` (NDPluginTransform.cpp:500). A guard passed
+        // straight into the call would live to the end of the statement and
+        // hold across the whole rotation.
+        let transform = *self.transform.lock();
+        let out = apply_transform(array, transform);
         ProcessResult::arrays(vec![Arc::new(out)])
     }
 
@@ -230,12 +236,12 @@ impl NDPluginProcess for TransformProcessor {
     }
 
     fn on_param_change(
-        &mut self,
+        &self,
         reason: usize,
         params: &ad_core_rs::plugin::runtime::PluginParamSnapshot,
     ) -> ad_core_rs::plugin::runtime::ParamChangeResult {
         if Some(reason) == self.transform_type_idx {
-            self.transform = TransformType::from_u8(params.value.as_i32() as u8);
+            *self.transform.lock() = TransformType::from_u8(params.value.as_i32() as u8);
         }
         ad_core_rs::plugin::runtime::ParamChangeResult::updates(vec![])
     }
@@ -470,7 +476,7 @@ mod tests {
 
     #[test]
     fn test_transform_processor() {
-        let mut proc = TransformProcessor::new(TransformType::Rot90CW);
+        let proc = TransformProcessor::new(TransformType::Rot90CW);
         let pool = NDArrayPool::new(1_000_000);
 
         let arr = make_3x2();

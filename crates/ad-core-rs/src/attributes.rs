@@ -428,7 +428,7 @@ impl PvAttrDbrType {
     /// Publish a monitored value as the type this `dbrtype` asked for.
     ///
     /// C requests the type on the wire (`ca_add_masked_array_event(dbrType, …)`,
-    /// PVAttribute.cpp:293) and stores whatever arrives into the matching union
+    /// PVAttribute.cpp:294) and stores whatever arrives into the matching union
     /// member, so the attribute's `NDAttrDataType` is the REQUESTED type, not
     /// the PV's. `CaClient::camonitor` subscribes with the channel's native
     /// type and takes no type argument, so the port converts on arrival

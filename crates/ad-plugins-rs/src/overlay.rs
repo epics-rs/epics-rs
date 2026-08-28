@@ -3,6 +3,7 @@ use std::sync::Arc;
 use ad_core_rs::ndarray::{NDArray, NDDataBuffer};
 use ad_core_rs::ndarray_pool::NDArrayPool;
 use ad_core_rs::plugin::runtime::{NDPluginProcess, ProcessResult};
+use parking_lot::Mutex;
 
 /// Shape to draw.
 #[derive(Debug, Clone)]
@@ -592,7 +593,9 @@ struct OverlayParamIndices {
 
 /// Pure overlay processing logic with runtime-configurable overlays.
 pub struct OverlayProcessor {
-    slots: [OverlaySlot; MAX_OVERLAYS],
+    /// The overlay slots, rewritten by an addressed param write while the
+    /// frame path may be drawing from them.
+    slots: Mutex<[OverlaySlot; MAX_OVERLAYS]>,
     params: OverlayParamIndices,
 }
 
@@ -666,13 +669,14 @@ impl OverlayProcessor {
             }
         }
         Self {
-            slots,
+            slots: Mutex::new(slots),
             params: OverlayParamIndices::default(),
         }
     }
 
     fn build_active_overlays(&self) -> Vec<OverlayDef> {
         self.slots
+            .lock()
             .iter()
             .filter_map(|s| s.to_overlay_def())
             .collect()
@@ -680,7 +684,7 @@ impl OverlayProcessor {
 }
 
 impl NDPluginProcess for OverlayProcessor {
-    fn process_array(&mut self, array: &NDArray, _pool: &NDArrayPool) -> ProcessResult {
+    fn process_array(&self, array: &NDArray, _pool: &NDArrayPool) -> ProcessResult {
         let active = self.build_active_overlays();
         let out = draw_overlays(array, &active);
         ProcessResult::arrays(vec![Arc::new(out)])
@@ -737,7 +741,7 @@ impl NDPluginProcess for OverlayProcessor {
     }
 
     fn on_param_change(
-        &mut self,
+        &self,
         reason: usize,
         params: &ad_core_rs::plugin::runtime::PluginParamSnapshot,
     ) -> ad_core_rs::plugin::runtime::ParamChangeResult {
@@ -747,7 +751,8 @@ impl NDPluginProcess for OverlayProcessor {
         if idx >= MAX_OVERLAYS {
             return ParamChangeResult::updates(vec![]);
         }
-        let slot = &mut self.slots[idx];
+        let mut slots = self.slots.lock();
+        let slot = &mut slots[idx];
         let mut updates = Vec::new();
 
         // C++ NDPluginOverlay::writeInt32 freeze semantics. Position/Center/
@@ -920,7 +925,7 @@ mod tests {
                 height: 3,
             },
             draw_mode: DrawMode::Set,
-            // Mono takes the green channel (C setPixel:57).
+            // Mono takes the green channel (C `NDPluginOverlay.cpp:58`).
             color: [0, 65535, 0],
             width_x: 1,
             width_y: 1,
@@ -968,7 +973,9 @@ mod tests {
             },
         );
 
-        let def = proc.slots[0].to_overlay_def().expect("overlay in use");
+        let def = proc.slots.lock()[0]
+            .to_overlay_def()
+            .expect("overlay in use");
         assert_eq!(
             def.color,
             [256, 65535, 4095],
@@ -1357,7 +1364,7 @@ mod tests {
 
     #[test]
     fn test_r6_61_rgb1_uses_color_strides_and_writes_three_planes() {
-        // R6-61 / NDPluginOverlay.cpp:29-53 — for an RGB1 array getInfo gives
+        // R6-61 / NDPluginOverlay.cpp:39-55 — for an RGB1 array getInfo gives
         // xStride=3, yStride=3*xSize, colorStride=1, so pixel (x,y) lives at
         // 3*(y*xSize + x) and setPixel writes red/green/blue into the three
         // consecutive samples. The old code treated dims as [w=3, h=x] mono.
@@ -1646,13 +1653,13 @@ mod tests {
         let (mut p, idx) = setup_processor();
         drive(&mut p, idx.size_x.unwrap(), 20);
         drive(&mut p, idx.position_x.unwrap(), 100);
-        assert_eq!(p.slots[0].position_x, 100);
-        assert_eq!(p.slots[0].center_x, 110); // 100 + 20/2
+        assert_eq!(p.slots.lock()[0].position_x, 100);
+        assert_eq!(p.slots.lock()[0].center_x, 110); // 100 + 20/2
 
         let updates = drive(&mut p, idx.size_x.unwrap(), 40);
         // PositionX stays 100; CenterX moves to 100 + 40/2 = 120.
-        assert_eq!(p.slots[0].position_x, 100);
-        assert_eq!(p.slots[0].center_x, 120);
+        assert_eq!(p.slots.lock()[0].position_x, 100);
+        assert_eq!(p.slots.lock()[0].center_x, 120);
         assert_eq!(find_int_update(&updates, idx.center_x.unwrap()), Some(120));
     }
 
@@ -1663,13 +1670,13 @@ mod tests {
         let (mut p, idx) = setup_processor();
         drive(&mut p, idx.size_x.unwrap(), 20);
         drive(&mut p, idx.center_x.unwrap(), 200);
-        assert_eq!(p.slots[0].center_x, 200);
-        assert_eq!(p.slots[0].position_x, 190); // 200 - 20/2
+        assert_eq!(p.slots.lock()[0].center_x, 200);
+        assert_eq!(p.slots.lock()[0].position_x, 190); // 200 - 20/2
 
         let updates = drive(&mut p, idx.size_x.unwrap(), 60);
         // CenterX stays 200; PositionX moves to 200 - 60/2 = 170.
-        assert_eq!(p.slots[0].center_x, 200);
-        assert_eq!(p.slots[0].position_x, 170);
+        assert_eq!(p.slots.lock()[0].center_x, 200);
+        assert_eq!(p.slots.lock()[0].position_x, 170);
         assert_eq!(
             find_int_update(&updates, idx.position_x.unwrap()),
             Some(170)
@@ -1684,8 +1691,8 @@ mod tests {
         drive(&mut p, idx.center_y.unwrap(), 50); // freeze_y OFF
         drive(&mut p, idx.size_x.unwrap(), 10);
         drive(&mut p, idx.position_x.unwrap(), 5); // freeze_x ON
-        assert!(p.slots[0].freeze_position_x);
-        assert!(!p.slots[0].freeze_position_y);
+        assert!(p.slots.lock()[0].freeze_position_x);
+        assert!(!p.slots.lock()[0].freeze_position_y);
     }
 
     #[test]

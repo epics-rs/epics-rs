@@ -12,8 +12,14 @@ pub const PAR_THRESHOLD: usize = 4096;
 const RESERVED_CORES: usize = 2;
 
 /// Returns true if the data size warrants parallel processing.
+///
+/// The whole question, not the size half of it. Without the `parallel` feature
+/// there is no pool to run on, so the answer is no whatever the size — and a
+/// caller that had to pair this with its own `#[cfg]` fallback was carrying
+/// the other half itself. One of them (`process::apply_element_ops`) then left
+/// its element count with no reader at all in a serial build.
 pub fn should_parallelize(num_elements: usize) -> bool {
-    num_elements >= PAR_THRESHOLD
+    cfg!(feature = "parallel") && num_elements >= PAR_THRESHOLD
 }
 
 /// Shared rayon ThreadPool.

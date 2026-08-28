@@ -1,3 +1,10 @@
+// RTEMS-EXEC-MODEL-ALLOW(1): checked, not waived — all 1 ran and passed
+// on the exec backend (measured on this tree:
+// `EPICS_RS_BUILD_EXEC_BACKEND=thread cargo nextest run -p ad-core-rs
+// --all-features`, 345/345). ad-core-rs became a census subject when its
+// `build.rs` began deriving `tokio_backend`; nothing here builds a CA
+// server, and the reactor these obtain comes from `#[tokio::test]`
+// itself, which the backend does not remove.
 use std::sync::Arc;
 
 use asyn_rs::error::AsynResult;
@@ -403,20 +410,20 @@ mod tests {
             ad.port_base
                 .get_string_param(ad.params.status_message, 0)
                 .unwrap(),
-            "",
+            b"",
             "ADStatusMessage is seeded to the empty string (ADDriver.cpp:189)"
         );
         assert_eq!(
             ad.port_base
                 .get_string_param(ad.params.string_to_server, 0)
                 .unwrap(),
-            ""
+            b""
         );
         assert_eq!(
             ad.port_base
                 .get_string_param(ad.params.string_from_server, 0)
                 .unwrap(),
-            ""
+            b""
         );
     }
 

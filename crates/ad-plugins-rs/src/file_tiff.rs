@@ -12,10 +12,11 @@ use ad_core_rs::plugin::file_controller::FilePluginController;
 use ad_core_rs::plugin::runtime::{
     NDPluginProcess, ParamChangeResult, PluginParamSnapshot, ProcessResult,
 };
+use parking_lot::Mutex;
 
 // TIFF tag numbers. 256-339 are the baseline tags C sets through TIFFSetField
-// (NDFileTIFF.cpp:225-237, :243-271); 65000-65003 and 65010+ are the custom
-// EPICS tags (:37-42).
+// (NDFileTIFF.cpp:231-238, :244-267); 65000-65003 and 65010+ are the custom
+// EPICS tags (:38-42).
 const TAG_IMAGE_WIDTH: u16 = 256;
 const TAG_IMAGE_LENGTH: u16 = 257;
 const TAG_BITS_PER_SAMPLE: u16 = 258;
@@ -336,7 +337,7 @@ impl TiffWriter {
             IfdEntry::short(TAG_SAMPLE_FORMAT, &vec![sample_format; samples]),
         ];
 
-        // Standard tags derived from well-known attributes (NDFileTIFF.cpp:243-271).
+        // Standard tags derived from well-known attributes (NDFileTIFF.cpp:244-267).
         let model = array
             .attributes
             .get("Model")
@@ -595,13 +596,13 @@ fn decode(bytes: &[u8]) -> ADResult<NDArray> {
 
 /// TIFF file processor wrapping `FilePluginController<TiffWriter>`.
 pub struct TiffFileProcessor {
-    pub ctrl: FilePluginController<TiffWriter>,
+    pub ctrl: Mutex<FilePluginController<TiffWriter>>,
 }
 
 impl TiffFileProcessor {
     pub fn new() -> Self {
         Self {
-            ctrl: FilePluginController::new(TiffWriter::new()),
+            ctrl: Mutex::new(FilePluginController::new(TiffWriter::new())),
         }
     }
 }
@@ -613,8 +614,8 @@ impl Default for TiffFileProcessor {
 }
 
 impl NDPluginProcess for TiffFileProcessor {
-    fn process_array(&mut self, array: &NDArray, _pool: &NDArrayPool) -> ProcessResult {
-        self.ctrl.process_array(array)
+    fn process_array(&self, array: &NDArray, _pool: &NDArrayPool) -> ProcessResult {
+        self.ctrl.lock().process_array(array)
     }
 
     fn plugin_type(&self) -> &str {
@@ -631,15 +632,11 @@ impl NDPluginProcess for TiffFileProcessor {
         &mut self,
         base: &mut asyn_rs::port::PortDriverBase,
     ) -> asyn_rs::error::AsynResult<()> {
-        self.ctrl.register_params(base)
+        self.ctrl.lock().register_params(base)
     }
 
-    fn on_param_change(
-        &mut self,
-        reason: usize,
-        params: &PluginParamSnapshot,
-    ) -> ParamChangeResult {
-        self.ctrl.on_param_change(reason, params)
+    fn on_param_change(&self, reason: usize, params: &PluginParamSnapshot) -> ParamChangeResult {
+        self.ctrl.lock().on_param_change(reason, params)
     }
 }
 
@@ -660,7 +657,12 @@ mod tests {
 
     fn temp_path(prefix: &str) -> PathBuf {
         let n = TEST_COUNTER.fetch_add(1, Ordering::Relaxed);
-        std::env::temp_dir().join(format!("adcore_test_{}_{}.tif", prefix, n))
+        std::env::temp_dir().join(format!(
+            "adcore_test_{}_{}_{}.tif",
+            std::process::id(),
+            prefix,
+            n
+        ))
     }
 
     /// R8-75: a 3-D array whose ColorMode attribute is absent is an error in C.
@@ -694,6 +696,14 @@ mod tests {
         assert!(
             matches!(err, ADError::InvalidDimensions(_)),
             "3-D without ColorMode must be rejected, got {err:?}"
+        );
+        // ADP-95(b): C rejects in `openFile` (NDFileTIFF.cpp:220-224), before any write, so no file
+        // exists. The port decides one call later but must leave the same
+        // absence — a caller branching on the error must not find a file.
+        assert!(
+            !path.exists(),
+            "a rejected array must leave no file: {}",
+            path.display()
         );
         std::fs::remove_file(&path).ok();
 
@@ -1313,11 +1323,11 @@ mod tests {
         let file_path = path.parent().unwrap().to_str().unwrap().to_string();
         let file_name = path.file_name().unwrap().to_str().unwrap().to_string();
 
-        let mut proc = TiffFileProcessor::new();
-        proc.ctrl.file_base.file_path = file_path.clone() + "/";
-        proc.ctrl.file_base.file_name = file_name;
-        proc.ctrl.file_base.file_template = "%s%s".into();
-        proc.ctrl.file_base.set_mode(NDFileMode::Single);
+        let proc = TiffFileProcessor::new();
+        proc.ctrl.lock().file_base.file_path = file_path.clone() + "/";
+        proc.ctrl.lock().file_base.file_name = file_name;
+        proc.ctrl.lock().file_base.file_template = "%s%s".into();
+        proc.ctrl.lock().file_base.set_mode(NDFileMode::Single);
 
         let mut arr = NDArray::new(
             vec![NDDimension::new(4), NDDimension::new(4)],
@@ -1329,11 +1339,11 @@ mod tests {
             }
         }
 
-        proc.ctrl.auto_save = false;
+        proc.ctrl.lock().auto_save = false;
         let _ = proc.process_array(&arr, &NDArrayPool::new(1024));
         assert!(!std::path::Path::new(&full_name).exists());
 
-        proc.ctrl.auto_save = true;
+        proc.ctrl.lock().auto_save = true;
         let _ = proc.process_array(&arr, &NDArrayPool::new(1024));
         assert!(std::path::Path::new(&full_name).exists());
 

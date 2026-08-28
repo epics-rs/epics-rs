@@ -7,6 +7,7 @@ use ad_core_rs::plugin::runtime::{
 };
 use asyn_rs::param::ParamType;
 use asyn_rs::port::PortDriverBase;
+use parking_lot::Mutex;
 
 /// Per-dimension ROI configuration.
 #[derive(Debug, Clone)]
@@ -404,14 +405,14 @@ pub struct ROIParams {
 
 /// Pure ROI processing logic.
 pub struct ROIProcessor {
-    config: ROIConfig,
+    config: Mutex<ROIConfig>,
     params: ROIParams,
 }
 
 impl ROIProcessor {
     pub fn new(config: ROIConfig) -> Self {
         Self {
-            config,
+            config: Mutex::new(config),
             params: ROIParams::default(),
         }
     }
@@ -423,12 +424,12 @@ impl ROIProcessor {
 }
 
 impl NDPluginProcess for ROIProcessor {
-    fn process_array(&mut self, array: &NDArray, _pool: &NDArrayPool) -> ProcessResult {
+    fn process_array(&self, array: &NDArray, _pool: &NDArrayPool) -> ProcessResult {
         // C `NDPluginROI.cpp:105-131`: DimNMaxSize is the size of the axis ROI
         // dim N *controls*, i.e. `pArray->dims[userDims[N]].size` with
         // `userDims = {xDim, yDim, colorDim}` (`:80-82`) — the same logical
         // mapping the ROI geometry itself uses. It is 0 for a dim beyond
-        // `pArray->ndims` (`:105-107` zero all three first, `:108/:117/:126`
+        // `pArray->ndims` (`:106-108` zero all three first, `:111/:120/:129`
         // only override within ndims).
         let user_dims = array.info().user_dims();
         let mut updates = Vec::new();
@@ -441,7 +442,11 @@ impl NDPluginProcess for ROIProcessor {
             updates.push(ParamUpdate::int32(dim_params.max_size, dim_size));
         }
 
-        match extract_roi(array, &self.config) {
+        // C reads the ROI geometry under the port lock and releases it before
+        // extracting (NDPluginROI.cpp:140). A guard in the match scrutinee
+        // would live to the end of the match, i.e. across the whole copy.
+        let config = self.config.lock().clone();
+        match extract_roi(array, &config) {
             Some(roi_arr) => ProcessResult {
                 output_arrays: vec![Arc::new(roi_arr)],
                 param_updates: updates,
@@ -477,23 +482,20 @@ impl NDPluginProcess for ROIProcessor {
                 base.create_param(&format!("{prefix}_MAX_SIZE"), ParamType::Int32)?;
 
             // Set initial values from config
-            base.set_int32_param(self.params.dims[i].min, 0, self.config.dims[i].min as i32)?;
-            base.set_int32_param(self.params.dims[i].size, 0, self.config.dims[i].size as i32)?;
-            base.set_int32_param(self.params.dims[i].bin, 0, self.config.dims[i].bin as i32)?;
+            let config = self.config.lock();
+            base.set_int32_param(self.params.dims[i].min, 0, config.dims[i].min as i32)?;
+            base.set_int32_param(self.params.dims[i].size, 0, config.dims[i].size as i32)?;
+            base.set_int32_param(self.params.dims[i].bin, 0, config.dims[i].bin as i32)?;
             base.set_int32_param(
                 self.params.dims[i].reverse,
                 0,
-                self.config.dims[i].reverse as i32,
+                config.dims[i].reverse as i32,
             )?;
-            base.set_int32_param(
-                self.params.dims[i].enable,
-                0,
-                self.config.dims[i].enable as i32,
-            )?;
+            base.set_int32_param(self.params.dims[i].enable, 0, config.dims[i].enable as i32)?;
             base.set_int32_param(
                 self.params.dims[i].auto_size,
                 0,
-                self.config.dims[i].auto_size as i32,
+                config.dims[i].auto_size as i32,
             )?;
         }
         self.params.enable_scale = base.create_param("ENABLE_SCALE", ParamType::Int32)?;
@@ -502,63 +504,61 @@ impl NDPluginProcess for ROIProcessor {
         self.params.collapse_dims = base.create_param("COLLAPSE_DIMS", ParamType::Int32)?;
         self.params.name = base.create_param("NAME", ParamType::Octet)?;
 
-        base.set_int32_param(self.params.enable_scale, 0, self.config.enable_scale as i32)?;
-        base.set_float64_param(self.params.scale, 0, self.config.scale)?;
+        let config = self.config.lock();
+        base.set_int32_param(self.params.enable_scale, 0, config.enable_scale as i32)?;
+        base.set_float64_param(self.params.scale, 0, config.scale)?;
         base.set_int32_param(self.params.data_type, 0, -1)?; // -1 = Automatic
-        base.set_int32_param(
-            self.params.collapse_dims,
-            0,
-            self.config.collapse_dims as i32,
-        )?;
+        base.set_int32_param(self.params.collapse_dims, 0, config.collapse_dims as i32)?;
 
         Ok(())
     }
 
     fn on_param_change(
-        &mut self,
+        &self,
         reason: usize,
         snapshot: &PluginParamSnapshot,
     ) -> ad_core_rs::plugin::runtime::ParamChangeResult {
         let p = &self.params;
+        let mut config = self.config.lock();
         for i in 0..3 {
             if reason == p.dims[i].min {
-                self.config.dims[i].min = snapshot.value.as_i32().max(0) as usize;
+                config.dims[i].min = snapshot.value.as_i32().max(0) as usize;
                 return ad_core_rs::plugin::runtime::ParamChangeResult::empty();
             }
             if reason == p.dims[i].size {
-                self.config.dims[i].size = snapshot.value.as_i32().max(0) as usize;
+                config.dims[i].size = snapshot.value.as_i32().max(0) as usize;
                 return ad_core_rs::plugin::runtime::ParamChangeResult::empty();
             }
             if reason == p.dims[i].bin {
-                self.config.dims[i].bin = snapshot.value.as_i32().max(1) as usize;
+                config.dims[i].bin = snapshot.value.as_i32().max(1) as usize;
                 return ad_core_rs::plugin::runtime::ParamChangeResult::empty();
             }
             if reason == p.dims[i].reverse {
-                self.config.dims[i].reverse = snapshot.value.as_i32() != 0;
+                config.dims[i].reverse = snapshot.value.as_i32() != 0;
                 return ad_core_rs::plugin::runtime::ParamChangeResult::empty();
             }
             if reason == p.dims[i].enable {
-                self.config.dims[i].enable = snapshot.value.as_i32() != 0;
+                config.dims[i].enable = snapshot.value.as_i32() != 0;
                 return ad_core_rs::plugin::runtime::ParamChangeResult::empty();
             }
             if reason == p.dims[i].auto_size {
-                self.config.dims[i].auto_size = snapshot.value.as_i32() != 0;
+                config.dims[i].auto_size = snapshot.value.as_i32() != 0;
                 return ad_core_rs::plugin::runtime::ParamChangeResult::empty();
             }
         }
         if reason == p.enable_scale {
-            self.config.enable_scale = snapshot.value.as_i32() != 0;
+            config.enable_scale = snapshot.value.as_i32() != 0;
         } else if reason == p.scale {
-            self.config.scale = snapshot.value.as_f64();
+            config.scale = snapshot.value.as_f64();
         } else if reason == p.data_type {
             let v = snapshot.value.as_i32();
-            self.config.data_type = if v < 0 {
+            config.data_type = if v < 0 {
                 None
             } else {
                 NDDataType::from_ordinal(v as u8)
             };
         } else if reason == p.collapse_dims {
-            self.config.collapse_dims = snapshot.value.as_i32() != 0;
+            config.collapse_dims = snapshot.value.as_i32() != 0;
         }
         ad_core_rs::plugin::runtime::ParamChangeResult::empty()
     }
@@ -976,7 +976,7 @@ mod tests {
             auto_size: false,
         };
 
-        let mut proc = ROIProcessor::new(config);
+        let proc = ROIProcessor::new(config);
         let pool = NDArrayPool::new(1_000_000);
 
         let arr = make_4x4_u8();
@@ -1056,7 +1056,7 @@ mod tests {
 
         // Control: on a mono 2-D array userDims = {0, 1, 0} and the logical and
         // physical indices coincide, so the readback is unchanged — and Dim2, past
-        // ndims, stays 0 (C zeroes all three at :105-107 and only overrides within
+        // ndims, stays 0 (C zeroes all three at :106-108 and only overrides within
         // ndims).
         let arr2d = NDArray::new(
             vec![NDDimension::new(6), NDDimension::new(4)],

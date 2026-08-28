@@ -685,14 +685,14 @@ pub fn create_ts_port_runtime(
     // function returns the built port and has no error channel to its
     // `*Configure` caller, so the only alternative is a handle to a port that
     // does not exist. C prints and throws here (asynPortDriver.cpp:4036-4040)
-    // and iocsh catches it (iocsh.cpp:1274-1284), leaving the C IOC serving
+    // and iocsh catches it (iocsh.cpp:1269-1279), leaving the C IOC serving
     // without the port; we deviate on purpose — see `port_runtime_unavailable`.
     let (runtime_handle, actor_jh) = create_port_runtime(driver, RuntimeConfig::default())
         .unwrap_or_else(|e| port_runtime_unavailable(port_name, &e));
 
     // Spawn data ingestion thread. `NDPluginTimeSeries` derives from
     // `NDPluginDriver`, so in C this loop runs on the plugin callback threads
-    // built at `NDPluginDriver.cpp:1016` — band and stack from
+    // built at `NDPluginDriver.cpp:1000` — band and stack from
     // `asynNDArrayDriver.cpp:876-879`, and a creation failure throws
     // `epicsThread::unableToCreateThread` (`epicsThread.cpp:214-220`) rather
     // than returning a status the plugin carries on from.
@@ -711,33 +711,30 @@ pub fn create_ts_port_runtime(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use source_guard::{Comments, production};
 
     /// # Invariant
     ///
     /// MUST: the `ts-data-*` thread be created through [`MandatoryThread`].
     ///
     /// `NDPluginTimeSeries` derives from `NDPluginDriver`, so in C this loop
-    /// runs on the callback threads built at `NDPluginDriver.cpp:1016`, and a
+    /// runs on the callback threads built at `NDPluginDriver.cpp:1000`, and a
     /// creation failure there throws `epicsThread::unableToCreateThread`
     /// (`epicsThread.cpp:214-220`) rather than returning a status. Where C ends
     /// up is not where we do, deliberately: iocsh catches what a command throws
-    /// (`iocsh.cpp:1274-1284`) and st.cmd continues by default
-    /// (`iocsh.cpp:1001`, `:1129`), so the C IOC keeps the plugin's port
+    /// (`iocsh.cpp:1269-1279`) and st.cmd continues by default
+    /// (`iocsh.cpp:995`, `:1123`), so the C IOC keeps the plugin's port
     /// registered with nothing ingesting behind it. The `.expect` this replaced
     /// produced that same zombie by unwinding one thread on a
     /// `panic = "unwind"` target.
     #[test]
     fn the_ts_data_thread_is_mandatory() {
         let src = include_str!("time_series.rs");
-        let prod = match src.find("\n#[cfg(test)]") {
-            Some(i) => &src[..i],
-            None => src,
-        };
+        let prod = production(src, Comments::Strip);
         assert_eq!(prod.matches("MandatoryThread::new(").count(), 1);
         let strays: Vec<&str> = prod
             .lines()
             .map(str::trim)
-            .filter(|l| !l.starts_with("//"))
             .filter(|l| {
                 l.contains(concat!("thread", "::Builder::new()"))
                     || l.contains(concat!("thread", "::spawn("))
@@ -870,12 +867,12 @@ mod tests {
         let template = base.find_param("FILE_TEMPLATE").unwrap();
         assert_eq!(
             base.get_string_param_strict(template, 0).unwrap(),
-            "%s%s_%3.3d.dat"
+            b"%s%s_%3.3d.dat"
         );
         let self_name = base.find_param("PORT_NAME_SELF").unwrap();
         assert_eq!(
             base.get_string_param_strict(self_name, 0).unwrap(),
-            "TEST_TS"
+            b"TEST_TS"
         );
     }
 

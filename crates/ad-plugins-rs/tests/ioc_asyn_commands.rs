@@ -1,6 +1,9 @@
 //! An `AdIoc` startup script must be able to create an asyn port and configure
 //! it — the sequence every socket detector (Pilatus, marCCD, mar345 camserver)
 //! opens its st.cmd with.
+// `ad_plugins_rs::ioc` mounts on the tokio-backend-only IOC runners, so
+// this file is gated with the module it exercises.
+#![cfg(tokio_backend)]
 #![cfg(feature = "ioc")]
 
 use std::sync::Arc;
@@ -8,6 +11,7 @@ use std::sync::Arc;
 use ad_plugins_rs::ioc::AdIoc;
 use epics_base_rs::server::database::PvDatabase;
 use epics_base_rs::server::iocsh::IocShell;
+use epics_base_rs::server::iocsh::registry::CommandOutcome;
 
 /// Build a shell carrying exactly the commands `AdIoc` puts on its startup
 /// shell, which is the surface `st.cmd` is executed against.
@@ -88,9 +92,19 @@ fn ad_ioc_st_cmd_can_create_a_port_and_configure_it() {
         "asynReport(1)",
     ];
     for line in prologue {
-        shell
-            .execute_line(line)
-            .unwrap_or_else(|e| panic!("st.cmd line `{line}` failed: {e}"));
+        // An unregistered command no longer comes back as `Err`: C
+        // reports the miss itself (`iocsh.cpp:1301-1304`) and the line is
+        // a bare `CommandOutcome::Failed`. Both halves have to be
+        // rejected here or the registry-split this test exists to catch
+        // walks through the `Ok` arm.
+        match shell.execute_line(line) {
+            Ok(CommandOutcome::Continue) => {}
+            Ok(CommandOutcome::Failed) => {
+                panic!("st.cmd line `{line}` failed without a diagnostic of its own")
+            }
+            Ok(CommandOutcome::Exit) => panic!("st.cmd line `{line}` ended the shell"),
+            Err(e) => panic!("st.cmd line `{line}` failed: {e}"),
+        }
     }
 
     assert!(

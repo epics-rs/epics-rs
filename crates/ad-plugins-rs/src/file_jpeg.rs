@@ -11,6 +11,7 @@ use ad_core_rs::plugin::runtime::{
 };
 
 use jpeg_encoder::{ColorType as JpegColorType, Encoder as JpegEncoder};
+use parking_lot::Mutex;
 
 /// JPEG file writer using `jpeg-encoder` for encoding and `jpeg-decoder` for decoding.
 pub struct JpegWriter {
@@ -62,8 +63,8 @@ impl NDFileWriter for JpegWriter {
         // made such an array look like RGB1 and write a file.
         //
         // C also takes `this->colorMode` from the branch it took, not from the
-        // attribute: the 2-D branch forces Mono (:60). And unlike NDFileTIFF
-        // (:180) there is no ndims == 1 branch here — a 1-D array is an error.
+        // attribute: the 2-D branch forces Mono (:60). And unlike
+        // NDFileTIFF.cpp:180 there is no ndims == 1 branch here — a 1-D array is an error.
         let color_mode = match array.dims.as_slice() {
             [_, _] => NDColorMode::Mono,
             [c, _, _] if c.size == 3 && color_mode == NDColorMode::RGB1 => NDColorMode::RGB1,
@@ -166,14 +167,14 @@ impl NDFileWriter for JpegWriter {
 
 /// JPEG file processor wrapping `FilePluginController<JpegWriter>`.
 pub struct JpegFileProcessor {
-    ctrl: FilePluginController<JpegWriter>,
+    ctrl: Mutex<FilePluginController<JpegWriter>>,
     jpeg_quality_idx: Option<usize>,
 }
 
 impl JpegFileProcessor {
     pub fn new(quality: u8) -> Self {
         Self {
-            ctrl: FilePluginController::new(JpegWriter::new(quality)),
+            ctrl: Mutex::new(FilePluginController::new(JpegWriter::new(quality))),
             jpeg_quality_idx: None,
         }
     }
@@ -186,8 +187,8 @@ impl Default for JpegFileProcessor {
 }
 
 impl NDPluginProcess for JpegFileProcessor {
-    fn process_array(&mut self, array: &NDArray, _pool: &NDArrayPool) -> ProcessResult {
-        self.ctrl.process_array(array)
+    fn process_array(&self, array: &NDArray, _pool: &NDArrayPool) -> ProcessResult {
+        self.ctrl.lock().process_array(array)
     }
 
     fn plugin_type(&self) -> &str {
@@ -204,29 +205,25 @@ impl NDPluginProcess for JpegFileProcessor {
         &mut self,
         base: &mut asyn_rs::port::PortDriverBase,
     ) -> asyn_rs::error::AsynResult<()> {
-        self.ctrl.register_params(base)?;
+        self.ctrl.lock().register_params(base)?;
         use asyn_rs::param::ParamType;
         let idx = base.create_param("JPEG_QUALITY", ParamType::Int32)?;
         // Seed the readback PV with the actual encoder default (C++ NDFileJPEG.cpp:327
         // sets NDFileJPEGQuality default to 50). Without this the PV reads 0 while the
         // encoder uses its constructed default, so PV and effective quality disagree.
-        base.set_int32_param(idx, 0, i32::from(self.ctrl.writer.quality))?;
+        base.set_int32_param(idx, 0, i32::from(self.ctrl.lock().writer.quality))?;
         self.jpeg_quality_idx = Some(idx);
         Ok(())
     }
 
-    fn on_param_change(
-        &mut self,
-        reason: usize,
-        params: &PluginParamSnapshot,
-    ) -> ParamChangeResult {
+    fn on_param_change(&self, reason: usize, params: &PluginParamSnapshot) -> ParamChangeResult {
         // JPEG-specific: quality change
         if Some(reason) == self.jpeg_quality_idx {
             let q = params.value.as_i32().clamp(1, 100) as u8;
-            self.ctrl.writer.set_quality(q);
+            self.ctrl.lock().writer.set_quality(q);
             return ParamChangeResult::empty();
         }
-        self.ctrl.on_param_change(reason, params)
+        self.ctrl.lock().on_param_change(reason, params)
     }
 }
 
@@ -240,7 +237,12 @@ mod tests {
 
     fn temp_path(prefix: &str) -> PathBuf {
         let n = TEST_COUNTER.fetch_add(1, Ordering::Relaxed);
-        std::env::temp_dir().join(format!("adcore_test_{}_{}.jpg", prefix, n))
+        std::env::temp_dir().join(format!(
+            "adcore_test_{}_{}_{}.jpg",
+            std::process::id(),
+            prefix,
+            n
+        ))
     }
 
     /// R8-75, JPEG writer: same defect as the cited TIFF site. C defaults
@@ -272,6 +274,14 @@ mod tests {
         assert!(
             matches!(err, ADError::InvalidDimensions(_)),
             "3-D without ColorMode must be rejected, got {err:?}"
+        );
+        // ADP-95(b): C rejects in `openFile` (NDFileJPEG.cpp:79-84), before any write, so no file
+        // exists. The port decides one call later but must leave the same
+        // absence — a caller branching on the error must not find a file.
+        assert!(
+            !path.exists(),
+            "a rejected array must leave no file: {}",
+            path.display()
         );
         std::fs::remove_file(&path).ok();
 
@@ -395,7 +405,7 @@ mod tests {
     #[test]
     fn test_default_quality_is_50() {
         // C++ NDFileJPEG.cpp:327 default quality is 50.
-        assert_eq!(JpegFileProcessor::default().ctrl.writer.quality, 50);
+        assert_eq!(JpegFileProcessor::default().ctrl.lock().writer.quality, 50);
         assert_eq!(JpegWriter::new(50).quality, 50);
     }
 

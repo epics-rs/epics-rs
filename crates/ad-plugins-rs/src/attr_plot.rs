@@ -16,14 +16,28 @@
 //! to; `NPts` is the current number of cached points. The waveform emitted
 //! for a block is padded out to `cache_size` with the last valid point to
 //! avoid plot artifacts (C++ `callback_data`).
+//!
+//! The two callback paths are separate in C and separate here. `AP_NPts` and
+//! the attribute/label/selection metadata are posted from the frame path
+//! (C++ `processCallbacks`, `NDPluginAttrPlot.cpp:126-146`); `AP_Data` is
+//! posted only from `callback_data` (`:96-124`), which C++ drives from
+//! `ExposeDataTask::run` once per `ND_ATTRPLOT_DATA_EXPOSURE_PERIOD` (1 s,
+//! `NDPluginAttrPlot.h:39`) and once per `DataSelect` write (`:283-289`).
+//! Posting the waveform per frame would make a `camonitor` on `AP_Data` fire
+//! at the detector frame rate.
 
 use std::collections::VecDeque;
+
+/// C++ `ND_ATTRPLOT_DATA_EXPOSURE_PERIOD` (`NDPluginAttrPlot.h:39`) — the
+/// period of `ExposeDataTask::run`'s `AP_Data` post.
+const ATTRPLOT_DATA_EXPOSURE_PERIOD: std::time::Duration = std::time::Duration::from_secs(1);
 
 use ad_core_rs::ndarray::NDArray;
 use ad_core_rs::ndarray_pool::NDArrayPool;
 use ad_core_rs::plugin::runtime::{
     NDPluginProcess, ParamChangeResult, ParamUpdate, PluginParamSnapshot, ProcessResult,
 };
+use parking_lot::Mutex;
 
 /// `DataSelect` value meaning "this block plots the UID buffer".
 pub const ATTRPLOT_UID_INDEX: i32 = -1;
@@ -36,6 +50,12 @@ pub const ATTRPLOT_NONE_LABEL: &str = "None";
 
 /// Processor that tracks attribute values over time in circular buffers.
 pub struct AttrPlotProcessor {
+    state: Mutex<AttrPlotState>,
+}
+
+/// Everything one frame mutates. A frame resets, rebuilds, pushes and posts in
+/// one pass, so the whole set moves under a single lock.
+struct AttrPlotState {
     /// Maximum number of tracked attributes (C++ `n_attributes_`).
     n_attributes: usize,
     /// Number of waveform output blocks (C++ `n_data_blocks_`).
@@ -55,6 +75,9 @@ pub struct AttrPlotProcessor {
     initialized: bool,
     /// The unique_id from the last processed frame.
     last_uid: i32,
+    /// When `AP_Data` was last posted. `None` until the first exposure, which
+    /// is why the first frame of an acquisition always exposes.
+    last_expose: Option<std::time::Instant>,
     /// Param indices (set after registration).
     params: AttrPlotParams,
 }
@@ -84,6 +107,64 @@ impl AttrPlotProcessor {
     /// * `n_data_blocks` — number of waveform output blocks.
     pub fn new(n_attributes: usize, cache_size: usize, n_data_blocks: usize) -> Self {
         Self {
+            state: Mutex::new(AttrPlotState::new(n_attributes, cache_size, n_data_blocks)),
+        }
+    }
+
+    /// Get the list of tracked attribute names.
+    pub fn attributes(&self) -> Vec<String> {
+        self.state.lock().attributes.clone()
+    }
+
+    /// Get the circular buffer for a specific attribute index.
+    pub fn buffer(&self, index: usize) -> Option<VecDeque<f64>> {
+        self.state.lock().buffers.get(index).cloned()
+    }
+
+    /// Get the unique_id buffer.
+    pub fn uid_buffer(&self) -> VecDeque<f64> {
+        self.state.lock().uid_buffer.clone()
+    }
+
+    /// Get the number of tracked attributes.
+    pub fn num_attributes(&self) -> usize {
+        self.state.lock().attributes.len()
+    }
+
+    /// Get the number of waveform output blocks.
+    pub fn num_data_blocks(&self) -> usize {
+        self.state.lock().n_data_blocks
+    }
+
+    /// Find the index of a named attribute. Returns `None` if not tracked.
+    pub fn find_attribute(&self, name: &str) -> Option<usize> {
+        self.state.lock().find_attribute(name)
+    }
+
+    /// Current `DataSelect` value for a block.
+    pub fn data_select(&self, block: usize) -> Option<i32> {
+        self.state.lock().data_select(block)
+    }
+
+    /// Bind a data block to an attribute index (or a UID/NONE sentinel).
+    pub fn set_data_select(&self, block: usize, value: i32) -> Result<(), &'static str> {
+        self.state.lock().set_data_select(block, value)
+    }
+
+    /// The `DataLabel` text for a block, derived from its `DataSelect`.
+    pub fn data_label(&self, block: usize) -> String {
+        self.state.lock().data_label(block)
+    }
+
+    /// Reset all buffers; the next frame re-discovers attributes.
+    pub fn reset(&self) {
+        self.state.lock().reset();
+    }
+}
+
+impl AttrPlotState {
+    fn new(n_attributes: usize, cache_size: usize, n_data_blocks: usize) -> Self {
+        Self {
             n_attributes,
             n_data_blocks,
             cache_size,
@@ -93,42 +174,18 @@ impl AttrPlotProcessor {
             data_selections: vec![ATTRPLOT_NONE_INDEX; n_data_blocks],
             initialized: false,
             last_uid: -1,
+            last_expose: None,
             params: AttrPlotParams::default(),
         }
     }
 
-    /// Get the list of tracked attribute names.
-    pub fn attributes(&self) -> &[String] {
-        &self.attributes
-    }
-
-    /// Get the circular buffer for a specific attribute index.
-    pub fn buffer(&self, index: usize) -> Option<&VecDeque<f64>> {
-        self.buffers.get(index)
-    }
-
-    /// Get the unique_id buffer.
-    pub fn uid_buffer(&self) -> &VecDeque<f64> {
-        &self.uid_buffer
-    }
-
-    /// Get the number of tracked attributes.
-    pub fn num_attributes(&self) -> usize {
-        self.attributes.len()
-    }
-
-    /// Get the number of waveform output blocks.
-    pub fn num_data_blocks(&self) -> usize {
-        self.n_data_blocks
-    }
-
     /// Find the index of a named attribute. Returns `None` if not tracked.
-    pub fn find_attribute(&self, name: &str) -> Option<usize> {
+    fn find_attribute(&self, name: &str) -> Option<usize> {
         self.attributes.iter().position(|n| n == name)
     }
 
     /// Current `DataSelect` value for a block.
-    pub fn data_select(&self, block: usize) -> Option<i32> {
+    fn data_select(&self, block: usize) -> Option<i32> {
         self.data_selections.get(block).copied()
     }
 
@@ -136,7 +193,7 @@ impl AttrPlotProcessor {
     ///
     /// Mirrors C++ `writeInt32(NDAttrPlotDataSelect)`: rejects out-of-range
     /// blocks and selections that point past the tracked attributes.
-    pub fn set_data_select(&mut self, block: usize, value: i32) -> Result<(), &'static str> {
+    fn set_data_select(&mut self, block: usize, value: i32) -> Result<(), &'static str> {
         if block >= self.n_data_blocks {
             return Err("data block index out of range");
         }
@@ -150,7 +207,7 @@ impl AttrPlotProcessor {
     }
 
     /// The `DataLabel` text for a block, derived from its `DataSelect`.
-    pub fn data_label(&self, block: usize) -> String {
+    fn data_label(&self, block: usize) -> String {
         match self.data_selections.get(block).copied() {
             Some(ATTRPLOT_UID_INDEX) => ATTRPLOT_UID_LABEL.to_string(),
             Some(sel) if sel >= 0 && (sel as usize) < self.attributes.len() => {
@@ -161,7 +218,7 @@ impl AttrPlotProcessor {
     }
 
     /// Reset all buffers; the next frame re-discovers attributes.
-    pub fn reset(&mut self) {
+    fn reset(&mut self) {
         self.initialized = false;
         self.uid_buffer.clear();
         for buf in &mut self.buffers {
@@ -278,10 +335,11 @@ impl AttrPlotProcessor {
         out
     }
 
-    /// Build all param updates emitted after a frame.
-    fn build_updates(&self) -> Vec<ParamUpdate> {
+    /// The `AP_Data` waveforms — C++ `callback_data`
+    /// (`NDPluginAttrPlot.cpp:96-124`). Posted on the exposure period and on a
+    /// `DataSelect` write, never per frame.
+    fn data_updates(&self) -> Vec<ParamUpdate> {
         let mut updates = Vec::new();
-        // Per-block waveform + label.
         if let Some(data) = self.params.data {
             for block in 0..self.n_data_blocks {
                 updates.push(ParamUpdate::float64_array_addr(
@@ -291,6 +349,31 @@ impl AttrPlotProcessor {
                 ));
             }
         }
+        updates
+    }
+
+    /// Whether the exposure period has elapsed, arming the next one when it
+    /// has. C++ posts from a 1 Hz thread; without a periodic hook in the
+    /// plugin runtime the frame path carries the clock, so the cadence is
+    /// "at most once per period" rather than "once per period even with no
+    /// frames".
+    fn expose_due(&mut self) -> bool {
+        let now = std::time::Instant::now();
+        let due = match self.last_expose {
+            None => true,
+            Some(prev) => now.duration_since(prev) >= ATTRPLOT_DATA_EXPOSURE_PERIOD,
+        };
+        if due {
+            self.last_expose = Some(now);
+        }
+        due
+    }
+
+    /// The metadata + point-count updates — C++ `callback_attributes`,
+    /// `callback_selected` and the `NDAttrPlotNPts` write in
+    /// `processCallbacks`.
+    fn meta_updates(&self) -> Vec<ParamUpdate> {
+        let mut updates = Vec::new();
         if let Some(label) = self.params.data_label {
             for block in 0..self.n_data_blocks {
                 updates.push(ParamUpdate::octet_addr(
@@ -321,22 +404,41 @@ impl AttrPlotProcessor {
         }
         updates
     }
+
+    /// Metadata plus an unconditional `AP_Data` post — the shape C++ produces
+    /// for a `DataSelect` write (`callback_selected` then `callback_data`,
+    /// `NDPluginAttrPlot.cpp:286-287`). Re-arms the exposure clock so the
+    /// forced post also counts as this period's exposure.
+    fn build_updates(&mut self) -> Vec<ParamUpdate> {
+        self.last_expose = Some(std::time::Instant::now());
+        let mut updates = self.data_updates();
+        updates.extend(self.meta_updates());
+        updates
+    }
 }
 
 impl NDPluginProcess for AttrPlotProcessor {
-    fn process_array(&mut self, array: &NDArray, _pool: &NDArrayPool) -> ProcessResult {
+    fn process_array(&self, array: &NDArray, _pool: &NDArrayPool) -> ProcessResult {
+        let mut state = self.state.lock();
+
         // Re-acquisition: a UID at or below the last cached one resets.
-        if !self.uid_buffer.is_empty() && array.unique_id <= self.last_uid {
-            self.reset();
+        if !state.uid_buffer.is_empty() && array.unique_id <= state.last_uid {
+            state.reset();
         }
-        self.last_uid = array.unique_id;
+        state.last_uid = array.unique_id;
 
-        if !self.initialized {
-            self.rebuild_attributes(array);
+        if !state.initialized {
+            state.rebuild_attributes(array);
         }
-        self.push_data(array);
+        state.push_data(array);
 
-        ProcessResult::sink(self.build_updates())
+        // C++ `processCallbacks` posts NPts and the metadata; `AP_Data` comes
+        // from the exposure path only (ADP-53).
+        let mut updates = state.meta_updates();
+        if state.expose_due() {
+            updates.extend(state.data_updates());
+        }
+        ProcessResult::sink(updates)
     }
 
     fn plugin_type(&self) -> &str {
@@ -350,6 +452,7 @@ impl NDPluginProcess for AttrPlotProcessor {
         base: &mut asyn_rs::port::PortDriverBase,
     ) -> asyn_rs::error::AsynResult<()> {
         use asyn_rs::param::ParamType;
+        let state = self.state.get_mut();
         base.create_param("AP_Data", ParamType::Float64Array)?;
         base.create_param("AP_DataLabel", ParamType::Octet)?;
         base.create_param("AP_DataSelect", ParamType::Int32)?;
@@ -357,32 +460,29 @@ impl NDPluginProcess for AttrPlotProcessor {
         base.create_param("AP_Reset", ParamType::Int32)?;
         base.create_param("AP_NPts", ParamType::Int32)?;
 
-        self.params.data = base.find_param("AP_Data");
-        self.params.data_label = base.find_param("AP_DataLabel");
-        self.params.data_select = base.find_param("AP_DataSelect");
-        self.params.attribute = base.find_param("AP_Attribute");
-        self.params.reset = base.find_param("AP_Reset");
-        self.params.npts = base.find_param("AP_NPts");
+        state.params.data = base.find_param("AP_Data");
+        state.params.data_label = base.find_param("AP_DataLabel");
+        state.params.data_select = base.find_param("AP_DataSelect");
+        state.params.attribute = base.find_param("AP_Attribute");
+        state.params.reset = base.find_param("AP_Reset");
+        state.params.npts = base.find_param("AP_NPts");
         Ok(())
     }
 
-    fn on_param_change(
-        &mut self,
-        reason: usize,
-        params: &PluginParamSnapshot,
-    ) -> ParamChangeResult {
-        if Some(reason) == self.params.data_select {
+    fn on_param_change(&self, reason: usize, params: &PluginParamSnapshot) -> ParamChangeResult {
+        let mut state = self.state.lock();
+        if Some(reason) == state.params.data_select {
             let block = params.addr as usize;
             let value = params.value.as_i32();
-            if self.set_data_select(block, value).is_ok() {
+            if state.set_data_select(block, value).is_ok() {
                 // Re-emit label + waveform for the rebound block.
-                return ParamChangeResult::updates(self.build_updates());
+                return ParamChangeResult::updates(state.build_updates());
             }
-        } else if Some(reason) == self.params.reset {
+        } else if Some(reason) == state.params.reset {
             // C calls reset_data() on ANY write to the reset param — there is no
             // value test (NDPluginAttrPlot.cpp:290-292).
-            self.reset();
-            return ParamChangeResult::updates(self.build_updates());
+            state.reset();
+            return ParamChangeResult::updates(state.build_updates());
         }
         ParamChangeResult::updates(vec![])
     }
@@ -408,9 +508,98 @@ mod tests {
         arr
     }
 
+    /// Register the AttrPlot params on a scratch port so `params.data` is
+    /// resolved and `AP_Data` updates are actually built.
+    fn proc_with_params(n_attributes: usize, cache: usize, blocks: usize) -> AttrPlotProcessor {
+        let mut proc = AttrPlotProcessor::new(n_attributes, cache, blocks);
+        let mut base = asyn_rs::port::PortDriverBase::new(
+            "ATTRPLOT_ADP53",
+            blocks.max(n_attributes),
+            asyn_rs::port::PortFlags::default(),
+        );
+        proc.register_params(&mut base).unwrap();
+        proc
+    }
+
+    fn has_data_update(result: &ProcessResult, reason: usize) -> bool {
+        result
+            .param_updates
+            .iter()
+            .any(|u| matches!(u, ParamUpdate::Float64Array { reason: r, .. } if *r == reason))
+    }
+
+    /// ADP-53: `AP_Data` is posted on the exposure period, not per frame.
+    /// C++ drives `callback_data` from `ExposeDataTask::run` every
+    /// `ND_ATTRPLOT_DATA_EXPOSURE_PERIOD`; `processCallbacks` posts only
+    /// `NDAttrPlotNPts` (`NDPluginAttrPlot.cpp:126-146`). Three frames
+    /// processed back to back fall inside one period, so exactly one of them
+    /// may carry the waveform.
+    #[test]
+    fn test_adp53_ap_data_is_rate_limited_to_the_exposure_period() {
+        let proc = proc_with_params(8, 100, 4);
+        let data_reason = proc.state.lock().params.data.expect("AP_Data registered");
+        let npts_reason = proc.state.lock().params.npts.expect("AP_NPts registered");
+        let pool = NDArrayPool::new(1_000_000);
+
+        let mut exposures = 0;
+        for uid in 1..=3 {
+            let arr = make_array_with_attrs(uid, &[("Temp", 25.0 + uid as f64)]);
+            let result = proc.process_array(&arr, &pool);
+            if has_data_update(&result, data_reason) {
+                exposures += 1;
+            }
+            // NPts is the frame-path post and must be on every frame, as
+            // C++ `processCallbacks` writes it every call.
+            assert!(
+                result.param_updates.iter().any(|u| matches!(
+                    u,
+                    ParamUpdate::Int32 { reason: r, .. } if *r == npts_reason
+                )),
+                "frame {uid} must still post AP_NPts",
+            );
+        }
+        assert_eq!(
+            exposures, 1,
+            "three frames inside one exposure period must post AP_Data once",
+        );
+    }
+
+    /// ADP-53: a `DataSelect` write posts `AP_Data` regardless of the clock —
+    /// C++ `writeInt32` calls `callback_selected()` then `callback_data()`
+    /// (`NDPluginAttrPlot.cpp:283-289`).
+    #[test]
+    fn test_adp53_data_select_write_exposes_immediately() {
+        let proc = proc_with_params(8, 100, 4);
+        let data_reason = proc.state.lock().params.data.expect("AP_Data registered");
+        let select_reason = proc
+            .state
+            .lock()
+            .params
+            .data_select
+            .expect("AP_DataSelect registered");
+        let pool = NDArrayPool::new(1_000_000);
+
+        let arr = make_array_with_attrs(1, &[("Temp", 25.0)]);
+        proc.process_array(&arr, &pool); // consumes this period's exposure
+
+        let snapshot = PluginParamSnapshot {
+            enable_callbacks: true,
+            reason: select_reason,
+            addr: 0,
+            value: ad_core_rs::plugin::runtime::ParamChangeValue::Int32(0),
+        };
+        let result = proc.on_param_change(select_reason, &snapshot);
+        assert!(
+            result.param_updates.iter().any(|u| {
+                matches!(u, ParamUpdate::Float64Array { reason: r, .. } if *r == data_reason)
+            }),
+            "a DataSelect write must post AP_Data even inside the period",
+        );
+    }
+
     #[test]
     fn test_attribute_auto_detection() {
-        let mut proc = AttrPlotProcessor::new(8, 100, 4);
+        let proc = AttrPlotProcessor::new(8, 100, 4);
         let pool = NDArrayPool::new(1_000_000);
 
         let mut arr = make_array_with_attrs(1, &[("Temp", 25.0), ("Gain", 1.5)]);
@@ -430,18 +619,18 @@ mod tests {
     #[test]
     fn test_n_attributes_caps_tracked_count() {
         // n_attributes = 2: only the first 2 (sorted) attributes are tracked.
-        let mut proc = AttrPlotProcessor::new(2, 100, 1);
+        let proc = AttrPlotProcessor::new(2, 100, 1);
         let pool = NDArrayPool::new(1_000_000);
         let arr = make_array_with_attrs(1, &[("D", 4.0), ("A", 1.0), ("C", 3.0), ("B", 2.0)]);
         proc.process_array(&arr, &pool);
         assert_eq!(proc.num_attributes(), 2);
-        assert_eq!(proc.attributes(), &["A", "B"]);
+        assert_eq!(proc.attributes(), vec!["A", "B"]);
     }
 
     #[test]
     fn test_data_select_maps_block_to_attribute() {
         // 3 attributes, 2 data blocks. Block 0 -> "B" (idx 1), block 1 -> UID.
-        let mut proc = AttrPlotProcessor::new(8, 100, 2);
+        let proc = AttrPlotProcessor::new(8, 100, 2);
         let pool = NDArrayPool::new(1_000_000);
         let arr = make_array_with_attrs(1, &[("A", 10.0), ("B", 20.0), ("C", 30.0)]);
         proc.process_array(&arr, &pool);
@@ -452,15 +641,15 @@ mod tests {
         assert_eq!(proc.data_label(0), "B");
         assert_eq!(proc.data_label(1), ATTRPLOT_UID_LABEL);
 
-        let wf0 = proc.block_waveform(0);
+        let wf0 = proc.state.lock().block_waveform(0);
         assert!((wf0[0] - 20.0).abs() < 1e-10, "block 0 plots attribute B");
-        let wf1 = proc.block_waveform(1);
+        let wf1 = proc.state.lock().block_waveform(1);
         assert!((wf1[0] - 1.0).abs() < 1e-10, "block 1 plots UID");
     }
 
     #[test]
     fn test_data_select_rejects_out_of_range() {
-        let mut proc = AttrPlotProcessor::new(8, 100, 2);
+        let proc = AttrPlotProcessor::new(8, 100, 2);
         let pool = NDArrayPool::new(1_000_000);
         let arr = make_array_with_attrs(1, &[("A", 1.0)]);
         proc.process_array(&arr, &pool);
@@ -478,15 +667,15 @@ mod tests {
     fn test_data_select_zero_accepted_with_no_attributes() {
         // C accepts DataSelect 0 before any frame, even with no tracked
         // attributes (the reject is `value > 0`, NDPluginAttrPlot.cpp:283).
-        let mut proc = AttrPlotProcessor::new(8, 100, 2);
-        assert!(proc.attributes.is_empty());
+        let proc = AttrPlotProcessor::new(8, 100, 2);
+        assert!(proc.attributes().is_empty());
         assert!(proc.set_data_select(0, 0).is_ok());
-        assert_eq!(proc.data_selections[0], 0);
+        assert_eq!(proc.state.lock().data_selections[0], 0);
     }
 
     #[test]
     fn test_unbound_block_label_is_none() {
-        let mut proc = AttrPlotProcessor::new(8, 100, 3);
+        let proc = AttrPlotProcessor::new(8, 100, 3);
         let pool = NDArrayPool::new(1_000_000);
         let arr = make_array_with_attrs(1, &[("A", 1.0)]);
         proc.process_array(&arr, &pool);
@@ -497,7 +686,7 @@ mod tests {
 
     #[test]
     fn test_npts_tracks_point_count() {
-        let mut proc = AttrPlotProcessor::new(8, 100, 1);
+        let proc = AttrPlotProcessor::new(8, 100, 1);
         let pool = NDArrayPool::new(1_000_000);
         for i in 1..=4 {
             let arr = make_array_with_attrs(i, &[("X", i as f64)]);
@@ -510,14 +699,14 @@ mod tests {
     fn test_waveform_padded_to_cache_size() {
         // cache_size = 6, only 3 points pushed -> waveform padded to 6 with
         // the last point.
-        let mut proc = AttrPlotProcessor::new(8, 6, 1);
+        let proc = AttrPlotProcessor::new(8, 6, 1);
         let pool = NDArrayPool::new(1_000_000);
         for i in 1..=3 {
             let arr = make_array_with_attrs(i, &[("X", i as f64 * 10.0)]);
             proc.process_array(&arr, &pool);
         }
         proc.set_data_select(0, 0).unwrap();
-        let wf = proc.block_waveform(0);
+        let wf = proc.state.lock().block_waveform(0);
         assert_eq!(wf.len(), 6);
         assert!((wf[0] - 10.0).abs() < 1e-10);
         assert!((wf[2] - 30.0).abs() < 1e-10);
@@ -530,7 +719,7 @@ mod tests {
     fn test_data_select_preserved_across_rebuild() {
         // Bind block 0 to "Temp", then re-acquire (UID resets). After the
         // rebuild block 0 must still point at "Temp".
-        let mut proc = AttrPlotProcessor::new(8, 100, 1);
+        let proc = AttrPlotProcessor::new(8, 100, 1);
         let pool = NDArrayPool::new(1_000_000);
         let arr = make_array_with_attrs(5, &[("Gain", 1.0), ("Temp", 25.0)]);
         proc.process_array(&arr, &pool);
@@ -541,13 +730,13 @@ mod tests {
         let arr2 = make_array_with_attrs(1, &[("Gain", 2.0), ("Temp", 99.0)]);
         proc.process_array(&arr2, &pool);
         assert_eq!(proc.data_label(0), "Temp");
-        let wf = proc.block_waveform(0);
+        let wf = proc.state.lock().block_waveform(0);
         assert!((wf[0] - 99.0).abs() < 1e-10);
     }
 
     #[test]
     fn test_value_tracking() {
-        let mut proc = AttrPlotProcessor::new(8, 100, 1);
+        let proc = AttrPlotProcessor::new(8, 100, 1);
         let pool = NDArrayPool::new(1_000_000);
         for i in 1..=5 {
             let arr = make_array_with_attrs(i, &[("Value", i as f64 * 10.0)]);
@@ -562,7 +751,7 @@ mod tests {
 
     #[test]
     fn test_circular_buffer_cache_size() {
-        let mut proc = AttrPlotProcessor::new(8, 3, 1);
+        let proc = AttrPlotProcessor::new(8, 3, 1);
         let pool = NDArrayPool::new(1_000_000);
         for i in 1..=5 {
             let arr = make_array_with_attrs(i, &[("Val", i as f64)]);
@@ -577,7 +766,7 @@ mod tests {
 
     #[test]
     fn test_uid_decrease_resets_buffers() {
-        let mut proc = AttrPlotProcessor::new(8, 100, 1);
+        let proc = AttrPlotProcessor::new(8, 100, 1);
         let pool = NDArrayPool::new(1_000_000);
         for i in 1..=5 {
             let arr = make_array_with_attrs(i, &[("X", i as f64)]);
@@ -595,7 +784,7 @@ mod tests {
 
     #[test]
     fn test_missing_attribute_uses_nan() {
-        let mut proc = AttrPlotProcessor::new(8, 100, 1);
+        let proc = AttrPlotProcessor::new(8, 100, 1);
         let pool = NDArrayPool::new(1_000_000);
         let arr1 = make_array_with_attrs(1, &[("Temp", 25.0)]);
         proc.process_array(&arr1, &pool);
@@ -613,7 +802,7 @@ mod tests {
 
     #[test]
     fn test_manual_reset() {
-        let mut proc = AttrPlotProcessor::new(8, 100, 1);
+        let proc = AttrPlotProcessor::new(8, 100, 1);
         let pool = NDArrayPool::new(1_000_000);
         let arr = make_array_with_attrs(5, &[("A", 1.0), ("B", 2.0)]);
         proc.process_array(&arr, &pool);
@@ -629,7 +818,7 @@ mod tests {
 
     #[test]
     fn test_unlimited_buffer() {
-        let mut proc = AttrPlotProcessor::new(8, 0, 1);
+        let proc = AttrPlotProcessor::new(8, 0, 1);
         let pool = NDArrayPool::new(1_000_000);
         for i in 1..=100 {
             let arr = make_array_with_attrs(i, &[("X", i as f64)]);

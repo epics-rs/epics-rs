@@ -18,8 +18,8 @@
 //! So while `NDCircBuffControl` is 0 an arriving frame is not triggered on, not
 //! copied, not buffered, and does not advance the completion test — and Control
 //! is 0 in three distinct situations: before the first `Control = 1` write (the
-//! param's default), after a user stop (`writeInt32(Control, 0)`, :255-260), and
-//! after the preset trigger count completes the last sequence (:197).
+//! param's default), after a user stop (`writeInt32(Control, 0)`, :257-260), and
+//! after the preset trigger count completes the last sequence (:194).
 //!
 //! The port had no Control state at all. `push()` recorded every frame it was
 //! handed and inferred "not running" from the status string, which only covered
@@ -99,7 +99,7 @@ fn r9_79_trigger_while_stopped_does_not_arm_a_flush() {
     );
 }
 
-/// The preset-trigger-count completion turns Control off (C `:197`), and that IS
+/// The preset-trigger-count completion turns Control off (C `:194`), and that IS
 /// what stops the following frames — the same gate, not a separate "completed"
 /// special case.
 #[test]

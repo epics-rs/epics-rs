@@ -59,7 +59,7 @@ impl Default for PvaProcessor {
 }
 
 impl NDPluginProcess for PvaProcessor {
-    fn process_array(&mut self, array: &NDArray, _pool: &NDArrayPool) -> ProcessResult {
+    fn process_array(&self, array: &NDArray, _pool: &NDArrayPool) -> ProcessResult {
         let payload = ndarray_to_pv_field(array);
 
         // Regression.
@@ -112,7 +112,9 @@ fn ndarray_to_pv_field(array: &NDArray) -> PvField {
     // compressed array publishes its raw byte stream under `ubyteValue` with the
     // codec's own `compressedSize`; an uncompressed array uses its type-specific
     // arm, has an empty `codec.name`, and `compressedSize == dataSize`
-    // (NDArray.h:136).
+    // (NDArray.h:136) — which is the pool's requested allocation size, NOT the
+    // recomputed `totalBytes`, and is larger whenever a driver over-allocates
+    // (`NDArrayPool.cpp:238` sets `compressedSize = dataSize`).
     let original_type = crate::codec::original_data_type(array);
     let num_elements: i64 = if array.dims.is_empty() {
         0
@@ -132,7 +134,13 @@ fn ndarray_to_pv_field(array: &NDArray) -> PvField {
         ),
         None => (
             ndbuffer_to_buffer(&array.data),
-            uncompressed_size,
+            // C reads `src->compressedSize` on both branches — there is no
+            // uncompressed special case (`ntndArrayConverter.cpp:407,410`).
+            // `data_size` is the port's `NDArray::dataSize`, which the pool
+            // keeps at the larger of the requested and the reused buffer's
+            // size, so an over-allocating driver publishes a `compressedSize`
+            // above `uncompressedSize` exactly as C does.
+            array.data_size as i64,
             String::new(),
         ),
     };
@@ -155,7 +163,7 @@ fn ndarray_to_pv_field(array: &NDArray) -> PvField {
         .collect();
 
     // C ADCore fills the two NTNDArray time fields from two distinct sources
-    // (ntndArrayConverter.cpp:477-501): `dataTimeStamp` from the floating-point
+    // (ntndArrayConverter.cpp:477-503): `dataTimeStamp` from the floating-point
     // `NDArray::timeStamp` (fromDataTimeStamp), `timeStamp` from the integer
     // `NDArray::epicsTS` (fromTimeStamp). Both add POSIX_TIME_AT_EPICS_EPOCH.
     let data_time_stamp = double_ts_to_nt(array.time_stamp);
@@ -314,6 +322,7 @@ fn attribute_value_to_variant(val: &ad_core_rs::attributes::NDAttrValue) -> Vari
 mod tests {
     use super::*;
     use ad_core_rs::ndarray::{NDDataType, NDDimension};
+    use epics_pva_rs::pvdata::ScalarType;
 
     #[test]
     fn convert_simple_array() {
@@ -407,10 +416,15 @@ mod tests {
             panic!("expected value union");
         };
         assert_eq!(variant_name, "ubyteValue");
+        // pvxs declares this union arm `UInt8A("ubyteValue")` (nt.cpp:214), a
+        // concrete uint8 array — pvxs has no untyped-array type at all — so the
+        // emitter's `ScalarArrayTyped` is the wire shape and the element type
+        // is part of the contract being asserted, not an incidental
+        // representation.
         match value.as_ref() {
-            PvField::ScalarArray(items) => {
+            PvField::ScalarArrayTyped(items) => {
                 assert_eq!(items.len() as i64, comp_size);
-                assert!(matches!(items.first(), Some(ScalarValue::UByte(_))));
+                assert_eq!(items.scalar_type(), ScalarType::UByte);
             }
             other => panic!("expected ubyte scalar array, got {other:?}"),
         }
@@ -440,6 +454,48 @@ mod tests {
         assert!(
             params.desc.is_some(),
             "codec.parameters must carry a descriptor (non-null variant)"
+        );
+    }
+
+    /// ADP-85. C reads `src->compressedSize` for BOTH branches — there is no
+    /// uncompressed special case (`ntndArrayConverter.cpp:407,410`) — and the
+    /// pool sets `compressedSize = dataSize`, the requested allocation size
+    /// (`NDArrayPool.cpp:238`, contract at `NDArray.h:136`). When a driver
+    /// over-allocates, that exceeds the recomputed `totalBytes` and C publishes
+    /// a wire `compressedSize` LARGER than `uncompressedSize`. The port used to
+    /// emit `uncompressedSize` on the uncompressed branch, so the two were
+    /// always equal and the over-allocation was invisible to a client.
+    #[test]
+    fn uncompressed_compressed_size_is_the_arrays_data_size() {
+        use ad_core_rs::ndarray_pool::NDArrayPool;
+
+        let pool = NDArrayPool::new(0);
+        // Allocate 100 bytes, hand it back, then ask for 80. The pool reuses
+        // the 100-byte buffer and keeps the larger tracked `data_size`, which
+        // is the port's `NDArray::dataSize` — the over-allocating-driver case.
+        let big = pool
+            .alloc(vec![NDDimension::new(100)], NDDataType::UInt8)
+            .unwrap();
+        pool.release(big);
+        let arr = pool
+            .alloc(vec![NDDimension::new(80)], NDDataType::UInt8)
+            .unwrap();
+        assert_eq!(arr.data_size, 100, "pool must keep the reused buffer size");
+        assert!(arr.codec.is_none());
+
+        let payload = ndarray_to_pv_field(&arr);
+        let PvField::Structure(s) = &payload else {
+            panic!("expected structure, got {payload:?}");
+        };
+        // uncompressedSize is the recomputed original byte count: 80 * 1.
+        assert_eq!(
+            s.get_field("uncompressedSize"),
+            Some(&PvField::Scalar(ScalarValue::Long(80)))
+        );
+        // compressedSize is the NDArray's own dataSize, which is larger.
+        assert_eq!(
+            s.get_field("compressedSize"),
+            Some(&PvField::Scalar(ScalarValue::Long(100)))
         );
     }
 
@@ -520,7 +576,7 @@ mod tests {
     /// producer output and the advertised descriptor agree.
     #[test]
     fn processor_stores_latest() {
-        let mut proc = PvaProcessor::new("TEST:Pva1:Image".into());
+        let proc = PvaProcessor::new("TEST:Pva1:Image".into());
         let pool = NDArrayPool::new(1_000_000);
         let arr = NDArray::new(vec![NDDimension::new(8)], NDDataType::Float64);
         proc.process_array(&arr, &pool);
@@ -741,7 +797,7 @@ mod tests {
     /// Regression.
     ///
     /// C ADCore fills the two NTNDArray time fields from two distinct sources
-    /// (ntndArrayConverter.cpp:477-501): `dataTimeStamp` from the floating-point
+    /// (ntndArrayConverter.cpp:477-503): `dataTimeStamp` from the floating-point
     /// `NDArray::timeStamp` (floor the seconds, scale the fraction to ns), and
     /// `timeStamp` from the integer `NDArray::epicsTS`. Both add
     /// POSIX_TIME_AT_EPICS_EPOCH to convert the EPICS epoch to POSIX. Pre-fix

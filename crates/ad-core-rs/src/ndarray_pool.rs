@@ -208,7 +208,7 @@ impl NDArrayPool {
 
         arr.unique_id = self.next_unique_id.fetch_add(1, Ordering::Relaxed);
         // The "Initialize fields" block of C++ NDArrayPool::alloc
-        // (NDArrayPool.cpp:187-204) sets neither `epicsTS` nor `timeStamp`: the
+        // (NDArrayPool.cpp:187-199) sets neither `epicsTS` nor `timeStamp`: the
         // driver owns both and stamps them together via
         // asynNDArrayDriver::updateTimeStamps (asynNDArrayDriver.cpp:832-836).
         // Stamping only `epicsTS` here left `timeStamp` at 0.0 (fresh buffer) or
@@ -494,7 +494,7 @@ mod tests {
 
     #[test]
     fn test_r6_65_alloc_stamps_neither_timestamp() {
-        // R6-65 / NDArrayPool.cpp:187-204 — alloc's "Initialize fields" block
+        // R6-65 / NDArrayPool.cpp:187-199 — alloc's "Initialize fields" block
         // sets neither epicsTS nor timeStamp. Stamping only epicsTS left the two
         // published timestamps disagreeing on every array.
         let pool = NDArrayPool::new(1_000_000);

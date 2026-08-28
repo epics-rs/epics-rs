@@ -13,6 +13,7 @@ use ad_core_rs::plugin::runtime::{
 use asyn_rs::error::AsynError;
 use asyn_rs::param::ParamType;
 use asyn_rs::port::PortDriverBase;
+use parking_lot::Mutex;
 
 use crate::time_series::{TimeSeriesData, TimeSeriesSender};
 
@@ -68,7 +69,7 @@ impl AttrChannel {
 
 /// Processor that extracts multiple attribute values from each array.
 pub struct AttributeProcessor {
-    channels: Vec<AttrChannel>,
+    channels: Mutex<Vec<AttrChannel>>,
     params: AttributeParams,
     ts_sender: Option<TimeSeriesSender>,
 }
@@ -80,7 +81,7 @@ impl AttributeProcessor {
         let mut channels = vec![AttrChannel::default(); num_channels.max(1)];
         channels[0].name = attr_name.to_string();
         Self {
-            channels,
+            channels: Mutex::new(channels),
             params: AttributeParams::default(),
             ts_sender: None,
         }
@@ -96,8 +97,8 @@ impl AttributeProcessor {
     }
 
     /// Reset value and value_sum for all channels (C parity: resets all, not just one).
-    pub fn reset(&mut self) {
-        for ch in self.channels.iter_mut() {
+    pub fn reset(&self) {
+        for ch in self.channels.lock().iter_mut() {
             ch.value = 0.0;
             ch.value_sum = 0.0;
         }
@@ -105,30 +106,31 @@ impl AttributeProcessor {
 
     /// Current extracted value for channel 0.
     pub fn value(&self) -> f64 {
-        self.channels[0].value
+        self.channels.lock()[0].value
     }
 
     /// Current accumulated sum for channel 0.
     pub fn value_sum(&self) -> f64 {
-        self.channels[0].value_sum
+        self.channels.lock()[0].value_sum
     }
 
     /// The attribute name being tracked by channel 0.
-    pub fn attr_name(&self) -> &str {
-        &self.channels[0].name
+    pub fn attr_name(&self) -> String {
+        self.channels.lock()[0].name.clone()
     }
 
     /// Set the attribute name for channel 0.
-    pub fn set_attr_name(&mut self, name: &str) {
-        self.channels[0].name = name.to_string();
+    pub fn set_attr_name(&self, name: &str) {
+        self.channels.lock()[0].name = name.to_string();
     }
 }
 
 impl NDPluginProcess for AttributeProcessor {
-    fn process_array(&mut self, array: &NDArray, _pool: &NDArrayPool) -> ProcessResult {
+    fn process_array(&self, array: &NDArray, _pool: &NDArrayPool) -> ProcessResult {
         let mut updates = Vec::new();
+        let mut channels = self.channels.lock();
 
-        for (i, ch) in self.channels.iter_mut().enumerate() {
+        for (i, ch) in channels.iter_mut().enumerate() {
             if ch.name.is_empty() {
                 continue;
             }
@@ -151,7 +153,7 @@ impl NDPluginProcess for AttributeProcessor {
 
         // Send to time series
         if let Some(ref sender) = self.ts_sender {
-            let values: Vec<f64> = self.channels.iter().map(|ch| ch.value).collect();
+            let values: Vec<f64> = channels.iter().map(|ch| ch.value).collect();
             let _ = sender.try_send(TimeSeriesData { values });
         }
 
@@ -176,24 +178,21 @@ impl NDPluginProcess for AttributeProcessor {
         Ok(())
     }
 
-    fn on_param_change(
-        &mut self,
-        reason: usize,
-        params: &PluginParamSnapshot,
-    ) -> ParamChangeResult {
+    fn on_param_change(&self, reason: usize, params: &PluginParamSnapshot) -> ParamChangeResult {
         let addr = params.addr as usize;
 
         if reason == self.params.attr_name {
-            if addr < self.channels.len() {
+            let mut channels = self.channels.lock();
+            if addr < channels.len() {
                 if let ParamChangeValue::Octet(s) = &params.value {
-                    self.channels[addr].name = s.clone();
+                    channels[addr].name = s.clone();
                 }
             }
         } else if reason == self.params.reset {
             // C zeros Val/ValSum for all channels on ANY write to the reset
             // param — there is no value test (NDPluginAttribute.cpp:123-128).
             let mut updates = Vec::new();
-            for (i, ch) in self.channels.iter_mut().enumerate() {
+            for (i, ch) in self.channels.lock().iter_mut().enumerate() {
                 ch.value = 0.0;
                 ch.value_sum = 0.0;
                 let a = i as i32;
@@ -282,7 +281,7 @@ mod tests {
 
     #[test]
     fn test_extract_named_attribute() {
-        let mut proc = AttributeProcessor::new("Temperature", 8);
+        let proc = AttributeProcessor::new("Temperature", 8);
         let pool = NDArrayPool::new(1_000_000);
 
         let arr = make_array_with_attr("Temperature", 25.5, 1);
@@ -298,7 +297,7 @@ mod tests {
 
     #[test]
     fn test_sum_accumulation() {
-        let mut proc = AttributeProcessor::new("Intensity", 8);
+        let proc = AttributeProcessor::new("Intensity", 8);
         let pool = NDArrayPool::new(1_000_000);
 
         let arr1 = make_array_with_attr("Intensity", 10.0, 1);
@@ -313,7 +312,7 @@ mod tests {
 
     #[test]
     fn test_reset() {
-        let mut proc = AttributeProcessor::new("Count", 8);
+        let proc = AttributeProcessor::new("Count", 8);
         let pool = NDArrayPool::new(1_000_000);
 
         let arr1 = make_array_with_attr("Count", 100.0, 1);
@@ -327,7 +326,7 @@ mod tests {
 
     #[test]
     fn test_special_attr_unique_id() {
-        let mut proc = AttributeProcessor::new("NDArrayUniqueId", 8);
+        let proc = AttributeProcessor::new("NDArrayUniqueId", 8);
         let pool = NDArrayPool::new(1_000_000);
 
         let mut arr = NDArray::new(vec![NDDimension::new(4)], NDDataType::UInt8);
@@ -342,7 +341,7 @@ mod tests {
         // C `NDPluginAttribute.cpp:63`: the NDArrayTimeStamp channel reads
         // `pArray->timeStamp`. A driver that derives it from epicsTS (the
         // `updateTimeStamps` path) sees the two agree.
-        let mut proc = AttributeProcessor::new("NDArrayTimeStamp", 8);
+        let proc = AttributeProcessor::new("NDArrayTimeStamp", 8);
         let pool = NDArrayPool::new(1_000_000);
 
         let mut arr = NDArray::new(vec![NDDimension::new(4)], NDDataType::UInt8);
@@ -371,7 +370,7 @@ mod tests {
         // Hardware time base, deliberately unrelated to epicsTS.
         arr.time_stamp = 7.25;
 
-        let mut ts = AttributeProcessor::new("NDArrayTimeStamp", 8);
+        let ts = AttributeProcessor::new("NDArrayTimeStamp", 8);
         ts.process_array(&arr, &pool);
         assert!(
             (ts.value() - 7.25).abs() < 1e-9,
@@ -379,18 +378,18 @@ mod tests {
             ts.value()
         );
 
-        let mut sec = AttributeProcessor::new("NDArrayEpicsTSSec", 8);
+        let sec = AttributeProcessor::new("NDArrayEpicsTSSec", 8);
         sec.process_array(&arr, &pool);
         assert!((sec.value() - 100.0).abs() < 1e-9);
 
-        let mut nsec = AttributeProcessor::new("NDArrayEpicsTSnSec", 8);
+        let nsec = AttributeProcessor::new("NDArrayEpicsTSnSec", 8);
         nsec.process_array(&arr, &pool);
         assert!((nsec.value() - 500_000_000.0).abs() < 1e-9);
     }
 
     #[test]
     fn test_missing_attribute() {
-        let mut proc = AttributeProcessor::new("NonExistent", 8);
+        let proc = AttributeProcessor::new("NonExistent", 8);
         let pool = NDArrayPool::new(1_000_000);
 
         let arr = NDArray::new(vec![NDDimension::new(4)], NDDataType::UInt8);
@@ -402,7 +401,7 @@ mod tests {
 
     #[test]
     fn test_string_attribute_ignored() {
-        let mut proc = AttributeProcessor::new("Label", 8);
+        let proc = AttributeProcessor::new("Label", 8);
         let pool = NDArrayPool::new(1_000_000);
 
         let mut arr = NDArray::new(vec![NDDimension::new(4)], NDDataType::UInt8);
@@ -419,7 +418,7 @@ mod tests {
 
     #[test]
     fn test_int32_attribute() {
-        let mut proc = AttributeProcessor::new("Counter", 8);
+        let proc = AttributeProcessor::new("Counter", 8);
         let pool = NDArrayPool::new(1_000_000);
 
         let mut arr = NDArray::new(vec![NDDimension::new(4)], NDDataType::UInt8);
@@ -445,7 +444,7 @@ mod tests {
         let mut proc = AttributeProcessor::new("Temp", 16);
         proc.params.value = 2;
         proc.params.value_sum = 3;
-        proc.channels[15].name = "High".to_string();
+        proc.channels.lock()[15].name = "High".to_string();
 
         let mut arr = NDArray::new(vec![NDDimension::new(4)], NDDataType::UInt8);
         arr.attributes.add(NDAttribute::new_static(
@@ -539,7 +538,7 @@ mod tests {
 
     #[test]
     fn test_set_attr_name() {
-        let mut proc = AttributeProcessor::new("A", 8);
+        let proc = AttributeProcessor::new("A", 8);
         assert_eq!(proc.attr_name(), "A");
 
         proc.set_attr_name("B");

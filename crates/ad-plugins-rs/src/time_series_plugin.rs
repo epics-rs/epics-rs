@@ -41,6 +41,7 @@ use ad_core_rs::plugin::runtime::{
 };
 use asyn_rs::param::ParamType;
 use asyn_rs::port::PortDriverBase;
+use parking_lot::Mutex;
 
 /// C `DEFAULT_NUM_TSPOINTS` (NDPluginTimeSeries.cpp:19).
 const DEFAULT_NUM_TSPOINTS: usize = 2048;
@@ -179,6 +180,13 @@ fn coalesce_updates(updates: Vec<ParamUpdate>) -> Vec<ParamUpdate> {
 
 /// Standalone `NDPluginTimeSeries` processor.
 pub struct TimeSeriesProcessor {
+    state: Mutex<TimeSeriesState>,
+}
+
+/// Every field C's `NDPluginTimeSeries` mutates from a frame or a param write.
+/// One frame reallocates, accumulates and posts in a single pass, so the whole
+/// set moves under one lock.
+struct TimeSeriesState {
     /// C `maxSignals_` (>= 1): the per-address fan-out and `averageStore_` size.
     max_signals: usize,
     /// C `numSignalsIn_`: `dims[0]` of the most recent input. `-1` until the first
@@ -222,6 +230,14 @@ impl TimeSeriesProcessor {
     /// Create a processor for `max_signals` signals (clamped to at least 1, per C
     /// `if (maxSignals < 1) maxSignals = 1`).
     pub fn new(max_signals: usize) -> Self {
+        Self {
+            state: Mutex::new(TimeSeriesState::new(max_signals)),
+        }
+    }
+}
+
+impl TimeSeriesState {
+    fn new(max_signals: usize) -> Self {
         let max_signals = max_signals.max(1);
         let num_time_points = DEFAULT_NUM_TSPOINTS;
         Self {
@@ -421,28 +437,30 @@ impl TimeSeriesProcessor {
 }
 
 impl NDPluginProcess for TimeSeriesProcessor {
-    fn process_array(&mut self, array: &NDArray, _pool: &NDArrayPool) -> ProcessResult {
+    fn process_array(&self, array: &NDArray, _pool: &NDArrayPool) -> ProcessResult {
         // C processCallbacks: this plugin only handles 1-D or 2-D arrays.
         let ndims = array.dims.len();
         if !(1..=2).contains(&ndims) {
             return ProcessResult::empty();
         }
 
+        let mut state = self.state.lock();
+
         let mut updates: Vec<ParamUpdate> = Vec::new();
 
         // C: reallocate when the data type or the input signal count changes.
         let num_signals_in = array.dims[0].size;
         let dtype = array.data.data_type();
-        if dtype != self.data_type || (num_signals_in as i64) != self.num_signals_in {
-            self.data_type = dtype;
-            self.num_signals_in = num_signals_in as i64;
-            self.num_signals = num_signals_in.min(self.max_signals);
-            updates.extend(self.allocate_arrays());
+        if dtype != state.data_type || (num_signals_in as i64) != state.num_signals_in {
+            state.data_type = dtype;
+            state.num_signals_in = num_signals_in as i64;
+            state.num_signals = num_signals_in.min(state.max_signals);
+            updates.extend(state.allocate_arrays());
         }
 
         // C: only accumulate while P_TSAcquire is set.
-        if self.acquiring {
-            updates.extend(self.add_to_time_series(array));
+        if state.acquiring {
+            updates.extend(state.add_to_time_series(array));
         }
 
         ProcessResult::sink(coalesce_updates(updates))
@@ -453,79 +471,77 @@ impl NDPluginProcess for TimeSeriesProcessor {
     }
 
     fn register_params(&mut self, base: &mut PortDriverBase) -> asyn_rs::error::AsynResult<()> {
+        let state = self.state.get_mut();
         // Per-plugin parameters (NDPluginTimeSeries.cpp:69-79).
-        self.p.ts_acquire = base.create_param("TS_ACQUIRE", ParamType::Int32)?;
-        self.p.ts_read = base.create_param("TS_READ", ParamType::Int32)?;
-        self.p.ts_num_points = base.create_param("TS_NUM_POINTS", ParamType::Int32)?;
-        self.p.ts_current_point = base.create_param("TS_CURRENT_POINT", ParamType::Int32)?;
-        self.p.ts_time_per_point = base.create_param("TS_TIME_PER_POINT", ParamType::Float64)?;
-        self.p.ts_averaging_time = base.create_param("TS_AVERAGING_TIME", ParamType::Float64)?;
-        self.p.ts_num_average = base.create_param("TS_NUM_AVERAGE", ParamType::Int32)?;
-        self.p.ts_elapsed_time = base.create_param("TS_ELAPSED_TIME", ParamType::Float64)?;
-        self.p.ts_acquire_mode = base.create_param("TS_ACQUIRE_MODE", ParamType::Int32)?;
-        self.p.ts_time_axis = base.create_param("TS_TIME_AXIS", ParamType::Float64Array)?;
-        self.p.ts_timestamp = base.create_param("TS_TIMESTAMP", ParamType::Float64Array)?;
+        state.p.ts_acquire = base.create_param("TS_ACQUIRE", ParamType::Int32)?;
+        state.p.ts_read = base.create_param("TS_READ", ParamType::Int32)?;
+        state.p.ts_num_points = base.create_param("TS_NUM_POINTS", ParamType::Int32)?;
+        state.p.ts_current_point = base.create_param("TS_CURRENT_POINT", ParamType::Int32)?;
+        state.p.ts_time_per_point = base.create_param("TS_TIME_PER_POINT", ParamType::Float64)?;
+        state.p.ts_averaging_time = base.create_param("TS_AVERAGING_TIME", ParamType::Float64)?;
+        state.p.ts_num_average = base.create_param("TS_NUM_AVERAGE", ParamType::Int32)?;
+        state.p.ts_elapsed_time = base.create_param("TS_ELAPSED_TIME", ParamType::Float64)?;
+        state.p.ts_acquire_mode = base.create_param("TS_ACQUIRE_MODE", ParamType::Int32)?;
+        state.p.ts_time_axis = base.create_param("TS_TIME_AXIS", ParamType::Float64Array)?;
+        state.p.ts_timestamp = base.create_param("TS_TIMESTAMP", ParamType::Float64Array)?;
         // Per-signal parameter (NDPluginTimeSeries.cpp:82); read at addr == signal.
-        self.p.ts_time_series = base.create_param("TS_TIME_SERIES", ParamType::Float64Array)?;
+        state.p.ts_time_series = base.create_param("TS_TIME_SERIES", ParamType::Float64Array)?;
 
         // Initial values (C constructor: setIntegerParam(P_TSNumPoints, 2048),
         // numAverage_ == 1, acquireMode_ == Fixed, etc.).
-        base.set_int32_param(self.p.ts_num_points, 0, self.num_time_points as i32)?;
-        base.set_int32_param(self.p.ts_num_average, 0, self.num_average as i32)?;
-        base.set_int32_param(self.p.ts_acquire, 0, 0)?;
-        base.set_int32_param(self.p.ts_acquire_mode, 0, 0)?;
-        base.set_int32_param(self.p.ts_current_point, 0, 0)?;
-        base.set_float64_param(self.p.ts_averaging_time, 0, self.averaging_time_actual)?;
-        base.set_float64_param(self.p.ts_time_per_point, 0, self.time_per_point)?;
+        base.set_int32_param(state.p.ts_num_points, 0, state.num_time_points as i32)?;
+        base.set_int32_param(state.p.ts_num_average, 0, state.num_average as i32)?;
+        base.set_int32_param(state.p.ts_acquire, 0, 0)?;
+        base.set_int32_param(state.p.ts_acquire_mode, 0, 0)?;
+        base.set_int32_param(state.p.ts_current_point, 0, 0)?;
+        base.set_float64_param(state.p.ts_averaging_time, 0, state.averaging_time_actual)?;
+        base.set_float64_param(state.p.ts_time_per_point, 0, state.time_per_point)?;
 
         // Initial Fixed-mode time axis (C constructor allocateArrays -> createAxisArray).
-        let axis: Vec<f64> = (0..self.num_time_points)
-            .map(|i| i as f64 * self.averaging_time_actual)
+        let axis: Vec<f64> = (0..state.num_time_points)
+            .map(|i| i as f64 * state.averaging_time_actual)
             .collect();
         base.params
-            .set_float64_array(self.p.ts_time_axis, 0, axis)?;
+            .set_float64_array(state.p.ts_time_axis, 0, axis)?;
         Ok(())
     }
 
-    fn on_param_change(
-        &mut self,
-        reason: usize,
-        params: &PluginParamSnapshot,
-    ) -> ParamChangeResult {
+    fn on_param_change(&self, reason: usize, params: &PluginParamSnapshot) -> ParamChangeResult {
+        let mut state = self.state.lock();
         let mut updates = Vec::new();
-        if reason == self.p.ts_num_points {
+        if reason == state.p.ts_num_points {
             // C writeInt32 P_TSNumPoints -> allocateArrays().
-            self.num_time_points = params.value.as_i32().max(1) as usize;
-            updates.extend(self.allocate_arrays());
-        } else if reason == self.p.ts_acquire_mode {
+            state.num_time_points = params.value.as_i32().max(1) as usize;
+            updates.extend(state.allocate_arrays());
+        } else if reason == state.p.ts_acquire_mode {
             // C writeInt32 P_TSAcquireMode -> acquireReset(); createAxisArray().
-            self.acquire_mode = if params.value.as_i32() == 0 {
+            state.acquire_mode = if params.value.as_i32() == 0 {
                 AcquireMode::Fixed
             } else {
                 AcquireMode::Circular
             };
-            updates.extend(self.acquire_reset());
-            updates.extend(self.create_axis_array());
-        } else if reason == self.p.ts_acquire {
+            updates.extend(state.acquire_reset());
+            updates.extend(state.create_axis_array());
+        } else if reason == state.p.ts_acquire {
             // C writeInt32 P_TSAcquire -> if value acquireReset() else doTimeSeriesCallbacks().
             if params.value.as_i32() != 0 {
-                self.acquiring = true;
-                updates.extend(self.acquire_reset());
+                state.acquiring = true;
+                updates.extend(state.acquire_reset());
             } else {
-                self.acquiring = false;
-                updates.extend(self.do_time_series_callbacks());
+                state.acquiring = false;
+                updates.extend(state.do_time_series_callbacks());
             }
-        } else if reason == self.p.ts_read {
+        } else if reason == state.p.ts_read {
             // C writeInt32 P_TSRead -> doTimeSeriesCallbacks().
-            updates.extend(self.do_time_series_callbacks());
-        } else if reason == self.p.ts_time_per_point {
+            updates.extend(state.do_time_series_callbacks());
+        } else if reason == state.p.ts_time_per_point {
             // C writeFloat64 P_TSTimePerPoint -> computeNumAverage().
-            self.time_per_point = params.value.as_f64();
-            updates.extend(self.compute_num_average());
-        } else if reason == self.p.ts_averaging_time {
+            state.time_per_point = params.value.as_f64();
+            updates.extend(state.compute_num_average());
+        } else if reason == state.p.ts_averaging_time {
             // C writeFloat64 P_TSAveragingTime -> computeNumAverage().
-            self.averaging_time_requested = params.value.as_f64();
-            updates.extend(self.compute_num_average());
+            state.averaging_time_requested = params.value.as_f64();
+            updates.extend(state.compute_num_average());
         }
         ParamChangeResult::updates(updates)
     }
@@ -631,13 +647,13 @@ mod tests {
     /// dividing by 3. The average of three 200s is 200.
     #[test]
     fn test_process_array_uint8_average_per_signal() {
-        let mut proc = make_proc(2, "TST_TS_U8");
+        let proc = make_proc(2, "TST_TS_U8");
         // numAverage = 3 via timePerPoint=1, averagingTime=3.
-        proc.time_per_point = 1.0;
-        proc.averaging_time_requested = 3.0;
-        let _ = proc.compute_num_average();
-        assert_eq!(proc.num_average, 3);
-        proc.acquiring = true;
+        proc.state.lock().time_per_point = 1.0;
+        proc.state.lock().averaging_time_requested = 3.0;
+        let _ = proc.state.lock().compute_num_average();
+        assert_eq!(proc.state.lock().num_average, 3);
+        proc.state.lock().acquiring = true;
 
         let pool = NDArrayPool::new(1_000_000);
         // 2 signals, 3 time points, every sample 200. Layout signal-fastest.
@@ -648,19 +664,23 @@ mod tests {
         let res = proc.process_array(&arr, &pool);
 
         // One averaged output point per signal: 600 / 3 = 200 (C: 29).
-        assert_eq!(proc.current_time_point, 1);
-        assert_eq!(proc.circular[0 * proc.num_time_points], 200.0);
-        assert_eq!(proc.circular[proc.num_time_points], 200.0); // signal 1, t0
+        assert_eq!(proc.state.lock().current_time_point, 1);
+        let ntp = proc.state.lock().num_time_points;
+        assert_eq!(proc.state.lock().circular[0], 200.0);
+        assert_eq!(proc.state.lock().circular[ntp], 200.0); // signal 1, t0
         // Current point posted; Fixed mode not full yet, so no waveform callback.
-        assert_eq!(find_int(&res, proc.p.ts_current_point), Some(1));
-        assert!(find_array(&res, proc.p.ts_time_series, 0).is_none());
+        assert_eq!(
+            find_int(&res, proc.state.lock().p.ts_current_point),
+            Some(1)
+        );
+        assert!(find_array(&res, proc.state.lock().p.ts_time_series, 0).is_none());
     }
 
     #[test]
     fn test_fixed_mode_fills_stops_and_emits_waveforms() {
-        let mut proc = make_proc(1, "TST_TS_FIX");
-        proc.num_time_points = 2; // small buffer; realloc on first frame
-        proc.acquiring = true; // num_average stays 1
+        let proc = make_proc(1, "TST_TS_FIX");
+        proc.state.lock().num_time_points = 2; // small buffer; realloc on first frame
+        proc.state.lock().acquiring = true; // num_average stays 1
 
         let pool = NDArrayPool::new(1_000_000);
         // 1 signal, 3 time points: 10, 20, 30.
@@ -671,19 +691,19 @@ mod tests {
         let res = proc.process_array(&arr, &pool);
 
         // Buffer of 2 fills at the 2nd point: acquisition stops, 3rd point dropped.
-        assert!(!proc.acquiring);
-        assert_eq!(proc.current_time_point, 2);
-        assert_eq!(find_int(&res, proc.p.ts_acquire), Some(0));
-        let wf = find_array(&res, proc.p.ts_time_series, 0).expect("waveform emitted");
+        assert!(!proc.state.lock().acquiring);
+        assert_eq!(proc.state.lock().current_time_point, 2);
+        assert_eq!(find_int(&res, proc.state.lock().p.ts_acquire), Some(0));
+        let wf = find_array(&res, proc.state.lock().p.ts_time_series, 0).expect("waveform emitted");
         assert_eq!(wf, vec![10.0, 20.0]);
     }
 
     #[test]
     fn test_circular_mode_wraps_and_rotates_oldest_first() {
-        let mut proc = make_proc(1, "TST_TS_CIRC");
-        proc.num_time_points = 3;
-        proc.acquire_mode = AcquireMode::Circular;
-        proc.acquiring = true;
+        let proc = make_proc(1, "TST_TS_CIRC");
+        proc.state.lock().num_time_points = 3;
+        proc.state.lock().acquire_mode = AcquireMode::Circular;
+        proc.state.lock().acquiring = true;
 
         let pool = NDArrayPool::new(1_000_000);
         // 1 signal, 5 time points: 1..=5 into a 3-slot ring.
@@ -694,10 +714,10 @@ mod tests {
         proc.process_array(&arr, &pool);
 
         // Ring holds [4,5,3] with write position at 2; Circular never stops.
-        assert!(proc.acquiring);
-        assert_eq!(proc.current_time_point, 2);
+        assert!(proc.state.lock().acquiring);
+        assert_eq!(proc.state.lock().current_time_point, 2);
         // Reading rotates so the oldest point is first: [3,4,5].
-        let updates = proc.do_time_series_callbacks();
+        let updates = proc.state.lock().do_time_series_callbacks();
         let wf = updates
             .iter()
             .find_map(|u| match u {
@@ -705,7 +725,9 @@ mod tests {
                     reason,
                     addr,
                     value,
-                } if *reason == proc.p.ts_time_series && *addr == 0 => Some(value.clone()),
+                } if *reason == proc.state.lock().p.ts_time_series && *addr == 0 => {
+                    Some(value.clone())
+                }
                 _ => None,
             })
             .unwrap();
@@ -714,8 +736,8 @@ mod tests {
 
     #[test]
     fn test_one_d_array_is_single_time_point_across_signals() {
-        let mut proc = make_proc(3, "TST_TS_1D");
-        proc.acquiring = true; // num_average == 1
+        let proc = make_proc(3, "TST_TS_1D");
+        proc.state.lock().acquiring = true; // num_average == 1
 
         let pool = NDArrayPool::new(1_000_000);
         // 1-D array of 3 elements => 3 signals, 1 time point.
@@ -725,18 +747,18 @@ mod tests {
         );
         proc.process_array(&arr, &pool);
 
-        assert_eq!(proc.num_signals, 3);
-        assert_eq!(proc.current_time_point, 1);
-        let ntp = proc.num_time_points;
-        assert_eq!(proc.circular[0], 11.0);
-        assert_eq!(proc.circular[ntp], 22.0);
-        assert_eq!(proc.circular[2 * ntp], 33.0);
+        assert_eq!(proc.state.lock().num_signals, 3);
+        assert_eq!(proc.state.lock().current_time_point, 1);
+        let ntp = proc.state.lock().num_time_points;
+        assert_eq!(proc.state.lock().circular[0], 11.0);
+        assert_eq!(proc.state.lock().circular[ntp], 22.0);
+        assert_eq!(proc.state.lock().circular[2 * ntp], 33.0);
     }
 
     #[test]
     fn test_num_signals_capped_at_max_signals() {
-        let mut proc = make_proc(2, "TST_TS_CAP");
-        proc.acquiring = true;
+        let proc = make_proc(2, "TST_TS_CAP");
+        proc.state.lock().acquiring = true;
 
         let pool = NDArrayPool::new(1_000_000);
         // 4 input signals but max_signals == 2: only the first 2 are kept.
@@ -746,15 +768,16 @@ mod tests {
         );
         proc.process_array(&arr, &pool);
 
-        assert_eq!(proc.num_signals, 2);
-        assert_eq!(proc.circular[0], 1.0);
-        assert_eq!(proc.circular[proc.num_time_points], 2.0);
+        assert_eq!(proc.state.lock().num_signals, 2);
+        assert_eq!(proc.state.lock().circular[0], 1.0);
+        let ntp = proc.state.lock().num_time_points;
+        assert_eq!(proc.state.lock().circular[ntp], 2.0);
     }
 
     #[test]
     fn test_invalid_ndims_is_ignored() {
-        let mut proc = make_proc(1, "TST_TS_BAD");
-        proc.acquiring = true;
+        let proc = make_proc(1, "TST_TS_BAD");
+        proc.state.lock().acquiring = true;
         let pool = NDArrayPool::new(1_000_000);
         // 3-D array: C rejects (ndims must be 1 or 2).
         let arr = NDArray::with_data(
@@ -767,18 +790,18 @@ mod tests {
         );
         let res = proc.process_array(&arr, &pool);
         assert!(res.param_updates.is_empty());
-        assert_eq!(proc.current_time_point, 0);
+        assert_eq!(proc.state.lock().current_time_point, 0);
     }
 
     #[test]
     fn test_acquire_mode_flips_time_axis() {
-        let mut proc = make_proc(1, "TST_TS_AXIS");
-        proc.num_time_points = 4;
+        let proc = make_proc(1, "TST_TS_AXIS");
+        proc.state.lock().num_time_points = 4;
         // Realloc to size the axis (first frame would also do this).
-        let _ = proc.allocate_arrays();
+        let _ = proc.state.lock().allocate_arrays();
 
         // Fixed axis: 0, 1, 2, 3 (averagingTimeActual == 1).
-        let fixed = proc.create_axis_array();
+        let fixed = proc.state.lock().create_axis_array();
         let fixed_axis = match &fixed[0] {
             ParamUpdate::Float64Array { value, .. } => value.clone(),
             _ => panic!("expected axis"),
@@ -786,8 +809,8 @@ mod tests {
         assert_eq!(fixed_axis, vec![0.0, 1.0, 2.0, 3.0]);
 
         // Circular axis ends at 0: -3, -2, -1, 0.
-        proc.acquire_mode = AcquireMode::Circular;
-        let circ = proc.create_axis_array();
+        proc.state.lock().acquire_mode = AcquireMode::Circular;
+        let circ = proc.state.lock().create_axis_array();
         let circ_axis = match &circ[0] {
             ParamUpdate::Float64Array { value, .. } => value.clone(),
             _ => panic!("expected axis"),
@@ -797,19 +820,19 @@ mod tests {
 
     #[test]
     fn test_compute_num_average_from_averaging_time() {
-        let mut proc = make_proc(1, "TST_TS_NAVG");
-        proc.time_per_point = 0.5;
-        proc.averaging_time_requested = 2.0;
-        proc.compute_num_average();
+        let proc = make_proc(1, "TST_TS_NAVG");
+        proc.state.lock().time_per_point = 0.5;
+        proc.state.lock().averaging_time_requested = 2.0;
+        proc.state.lock().compute_num_average();
         // (int)(2.0/0.5 + 0.5) = (int)4.5 = 4; actual = 0.5 * 4 = 2.0.
-        assert_eq!(proc.num_average, 4);
-        assert_eq!(proc.averaging_time_actual, 2.0);
+        assert_eq!(proc.state.lock().num_average, 4);
+        assert_eq!(proc.state.lock().averaging_time_actual, 2.0);
 
         // timePerPoint == 0 => numAverage 1, actual == requested.
-        proc.time_per_point = 0.0;
-        proc.averaging_time_requested = 7.0;
-        proc.compute_num_average();
-        assert_eq!(proc.num_average, 1);
-        assert_eq!(proc.averaging_time_actual, 7.0);
+        proc.state.lock().time_per_point = 0.0;
+        proc.state.lock().averaging_time_requested = 7.0;
+        proc.state.lock().compute_num_average();
+        assert_eq!(proc.state.lock().num_average, 1);
+        assert_eq!(proc.state.lock().averaging_time_actual, 7.0);
     }
 }

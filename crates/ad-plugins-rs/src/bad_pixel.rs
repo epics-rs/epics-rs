@@ -23,6 +23,7 @@ use std::sync::Arc;
 use ad_core_rs::ndarray::{NDArray, NDDataBuffer};
 use ad_core_rs::ndarray_pool::NDArrayPool;
 use ad_core_rs::plugin::runtime::{NDPluginProcess, ProcessResult};
+use parking_lot::Mutex;
 use serde::Deserialize;
 
 /// The correction mode for a bad pixel.
@@ -68,25 +69,43 @@ struct BadPixelFileJson {
     bad_pixels: Vec<BadPixelJson>,
 }
 
-/// Processor that corrects bad pixels in incoming arrays.
-pub struct BadPixelProcessor {
+/// The bad pixel list and its sensor-space lookup set, which are only ever
+/// replaced together.
+struct BadPixelList {
     pixels: Vec<BadPixel>,
     /// Set of sensor-space (x, y) for fast bad-pixel lookup, matching the C++
     /// `badPixelList` which is keyed on the sensor `coordinate`.
     bad_set: HashSet<(i64, i64)>,
-    /// Cached image width from the last array.
-    width: usize,
+}
+
+impl BadPixelList {
+    fn new(pixels: Vec<BadPixel>) -> Self {
+        let bad_set: HashSet<(i64, i64)> = pixels.iter().map(|p| (p.x, p.y)).collect();
+        Self { pixels, bad_set }
+    }
+
+    /// Check if a sensor-space coordinate is a registered bad pixel.
+    fn is_bad(&self, x: i64, y: i64) -> bool {
+        self.bad_set.contains(&(x, y))
+    }
+}
+
+/// Processor that corrects bad pixels in incoming arrays.
+pub struct BadPixelProcessor {
+    /// Behind an `Arc` so a frame can take the list out of the lock in O(1)
+    /// and correct with the lock released, as C does at
+    /// `NDPluginBadPixel.cpp:233`. The list is replaced wholesale, never
+    /// mutated in place, so a frame that started with the previous list keeps
+    /// a consistent one.
+    list: Mutex<Arc<BadPixelList>>,
     file_name_idx: Option<usize>,
 }
 
 impl BadPixelProcessor {
     /// Create a new processor from a list of bad pixels.
     pub fn new(pixels: Vec<BadPixel>) -> Self {
-        let bad_set: HashSet<(i64, i64)> = pixels.iter().map(|p| (p.x, p.y)).collect();
         Self {
-            pixels,
-            bad_set,
-            width: 0,
+            list: Mutex::new(Arc::new(BadPixelList::new(pixels))),
             file_name_idx: None,
         }
     }
@@ -131,19 +150,13 @@ impl BadPixelProcessor {
     }
 
     /// Replace the bad pixel list.
-    pub fn set_pixels(&mut self, pixels: Vec<BadPixel>) {
-        self.bad_set = pixels.iter().map(|p| (p.x, p.y)).collect();
-        self.pixels = pixels;
+    pub fn set_pixels(&self, pixels: Vec<BadPixel>) {
+        *self.list.lock() = Arc::new(BadPixelList::new(pixels));
     }
 
     /// Get the current bad pixel list.
-    pub fn pixels(&self) -> &[BadPixel] {
-        &self.pixels
-    }
-
-    /// Check if a sensor-space coordinate is a registered bad pixel.
-    fn is_bad(&self, x: i64, y: i64) -> bool {
-        self.bad_set.contains(&(x, y))
+    pub fn pixels(&self) -> Vec<BadPixel> {
+        self.list.lock().pixels.clone()
     }
 
     /// Apply corrections to a mutable data buffer.
@@ -156,7 +169,7 @@ impl BadPixelProcessor {
     /// in sensor space.
     #[allow(clippy::too_many_arguments)]
     fn apply_corrections(
-        &self,
+        list: &BadPixelList,
         data: &mut NDDataBuffer,
         width: usize,
         height: usize,
@@ -188,9 +201,9 @@ impl BadPixelProcessor {
         };
 
         // Collect corrections, then apply (Replace reads the original buffer).
-        let mut corrections: Vec<(usize, f64)> = Vec::with_capacity(self.pixels.len());
+        let mut corrections: Vec<(usize, f64)> = Vec::with_capacity(list.pixels.len());
 
-        for bp in &self.pixels {
+        for bp in &list.pixels {
             let Some(offset) = pixel_offset(bp.x, bp.y) else {
                 continue;
             };
@@ -203,7 +216,7 @@ impl BadPixelProcessor {
                     let nx = bp.x + (*dx as i64) * scale_x;
                     let ny = bp.y + (*dy as i64) * scale_y;
                     // Skip if the replacement pixel is also a bad pixel.
-                    if self.is_bad(nx, ny) {
+                    if list.is_bad(nx, ny) {
                         continue;
                     }
                     let Some(replace_offset) = pixel_offset(nx, ny) else {
@@ -226,7 +239,7 @@ impl BadPixelProcessor {
                             }
                             let cx = bp.x + j * scale_x;
                             // Skip other bad pixels (sensor-space lookup).
-                            if self.is_bad(cx, cy) {
+                            if list.is_bad(cx, cy) {
                                 continue;
                             }
                             let Some(idx) = pixel_offset(cx, cy) else {
@@ -263,12 +276,13 @@ impl BadPixelProcessor {
 }
 
 impl NDPluginProcess for BadPixelProcessor {
-    fn process_array(&mut self, array: &NDArray, _pool: &NDArrayPool) -> ProcessResult {
+    fn process_array(&self, array: &NDArray, _pool: &NDArrayPool) -> ProcessResult {
         let info = array.info();
-        self.width = info.x_size;
+        let width = info.x_size;
         let height = info.y_size;
 
-        if self.pixels.is_empty() {
+        let list = Arc::clone(&self.list.lock());
+        if list.pixels.is_empty() {
             // No corrections needed, pass through
             return ProcessResult::arrays(vec![Arc::new(array.clone())]);
         }
@@ -289,9 +303,10 @@ impl NDPluginProcess for BadPixelProcessor {
         };
 
         let mut out = array.clone();
-        self.apply_corrections(
+        Self::apply_corrections(
+            &list,
             &mut out.data,
-            self.width,
+            width,
             height,
             offset_x,
             offset_y,
@@ -316,7 +331,7 @@ impl NDPluginProcess for BadPixelProcessor {
     }
 
     fn on_param_change(
-        &mut self,
+        &self,
         reason: usize,
         params: &ad_core_rs::plugin::runtime::PluginParamSnapshot,
     ) -> ad_core_rs::plugin::runtime::ParamChangeResult {
@@ -328,12 +343,9 @@ impl NDPluginProcess for BadPixelProcessor {
                     match std::fs::read_to_string(path) {
                         Ok(json_str) => match Self::load_from_json(&json_str) {
                             Ok(pixels) => {
+                                let n = pixels.len();
                                 self.set_pixels(pixels);
-                                tracing::info!(
-                                    "BadPixel: loaded {} pixels from {}",
-                                    self.pixels.len(),
-                                    path
-                                );
+                                tracing::info!("BadPixel: loaded {} pixels from {}", n, path);
                             }
                             Err(e) => {
                                 tracing::warn!("BadPixel: failed to parse {}: {}", path, e);
@@ -388,7 +400,7 @@ mod tests {
         let arr = make_2d_array(4, 4, |_, _| 100.0);
         let pixels = vec![set(1, 1, 0.0), set(3, 2, 42.0)];
 
-        let mut proc = BadPixelProcessor::new(pixels);
+        let proc = BadPixelProcessor::new(pixels);
         let pool = NDArrayPool::new(1_000_000);
         let result = proc.process_array(&arr, &pool);
 
@@ -435,7 +447,7 @@ mod tests {
         //   → buffer offset y * xSize + x = 1.
         // Pre-fix the port took offsetX from dims[0] (the colour axis, offset 0)
         //   → x = 3, buffer offset 3.
-        let mut proc = BadPixelProcessor::new(vec![set(3, 0, 7.0)]);
+        let proc = BadPixelProcessor::new(vec![set(3, 0, 7.0)]);
         let pool = NDArrayPool::new(1_000_000);
         let result = proc.process_array(&arr, &pool);
         let out = &result.output_arrays[0];
@@ -458,7 +470,7 @@ mod tests {
             mode: BadPixelMode::Replace { dx: 1, dy: 0 },
         }];
 
-        let mut proc = BadPixelProcessor::new(pixels);
+        let proc = BadPixelProcessor::new(pixels);
         let pool = NDArrayPool::new(1_000_000);
         let result = proc.process_array(&arr, &pool);
 
@@ -480,7 +492,7 @@ mod tests {
             set(2, 1, 0.0),
         ];
 
-        let mut proc = BadPixelProcessor::new(pixels);
+        let proc = BadPixelProcessor::new(pixels);
         let pool = NDArrayPool::new(1_000_000);
         let result = proc.process_array(&arr, &pool);
 
@@ -505,7 +517,7 @@ mod tests {
             },
         }];
 
-        let mut proc = BadPixelProcessor::new(pixels);
+        let proc = BadPixelProcessor::new(pixels);
         let pool = NDArrayPool::new(1_000_000);
         let result = proc.process_array(&arr, &pool);
 
@@ -539,7 +551,7 @@ mod tests {
                 half_y: 3,
             },
         }];
-        let mut proc = BadPixelProcessor::new(pixels);
+        let proc = BadPixelProcessor::new(pixels);
         let pool = NDArrayPool::new(1_000_000);
         let result = proc.process_array(&arr, &pool);
         let out = &result.output_arrays[0];
@@ -559,7 +571,7 @@ mod tests {
                 half_y: 1,
             },
         }];
-        let mut proc = BadPixelProcessor::new(pixels);
+        let proc = BadPixelProcessor::new(pixels);
         let result = proc.process_array(&arr, &pool);
         let out = &result.output_arrays[0];
         assert!((get_pixel(out, 4, 4, 9) - 10.0).abs() < 1e-10);
@@ -581,7 +593,7 @@ mod tests {
             set(2, 3, 999.0),
         ];
 
-        let mut proc = BadPixelProcessor::new(pixels);
+        let proc = BadPixelProcessor::new(pixels);
         let pool = NDArrayPool::new(1_000_000);
         let result = proc.process_array(&arr, &pool);
 
@@ -602,7 +614,7 @@ mod tests {
             },
         }];
 
-        let mut proc = BadPixelProcessor::new(pixels);
+        let proc = BadPixelProcessor::new(pixels);
         let pool = NDArrayPool::new(1_000_000);
         let result = proc.process_array(&arr, &pool);
 
@@ -621,7 +633,7 @@ mod tests {
             mode: BadPixelMode::Replace { dx: -1, dy: 0 },
         }];
 
-        let mut proc = BadPixelProcessor::new(pixels);
+        let proc = BadPixelProcessor::new(pixels);
         let pool = NDArrayPool::new(1_000_000);
         let result = proc.process_array(&arr, &pool);
 
@@ -666,7 +678,7 @@ mod tests {
     #[test]
     fn test_no_bad_pixels_passthrough() {
         let arr = make_2d_array(4, 4, |x, y| (x + y * 4) as f64);
-        let mut proc = BadPixelProcessor::new(vec![]);
+        let proc = BadPixelProcessor::new(vec![]);
         let pool = NDArrayPool::new(1_000_000);
         let result = proc.process_array(&arr, &pool);
 
@@ -685,7 +697,7 @@ mod tests {
         let arr = make_2d_array(4, 4, |_, _| 10.0);
         let pixels = vec![set(100, 100, 999.0)];
 
-        let mut proc = BadPixelProcessor::new(pixels);
+        let proc = BadPixelProcessor::new(pixels);
         let pool = NDArrayPool::new(1_000_000);
         let result = proc.process_array(&arr, &pool);
 
@@ -707,7 +719,7 @@ mod tests {
 
         let pixels = vec![set(1, 1, 0.0)];
 
-        let mut proc = BadPixelProcessor::new(pixels);
+        let proc = BadPixelProcessor::new(pixels);
         let pool = NDArrayPool::new(1_000_000);
         let result = proc.process_array(&arr, &pool);
 
@@ -718,7 +730,7 @@ mod tests {
 
     #[test]
     fn test_set_pixels() {
-        let mut proc = BadPixelProcessor::new(vec![]);
+        let proc = BadPixelProcessor::new(vec![]);
         assert!(proc.pixels().is_empty());
 
         proc.set_pixels(vec![set(0, 0, 0.0)]);

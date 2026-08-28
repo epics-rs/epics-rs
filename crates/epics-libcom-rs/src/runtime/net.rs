@@ -32,7 +32,7 @@ pub fn ca_server_port() -> u16 {
 
 /// Server-side CA bind-port reader — where the server **binds** the
 /// UDP discovery socket and the TCP listener (same value for both,
-/// matching `caservertask.c:491-499` —
+/// matching `caservertask.c:492-500` —
 /// `ca_udp_port = ca_server_port`).
 ///
 /// Precedence: `EPICS_CAS_SERVER_PORT` > `EPICS_CA_SERVER_PORT` >
@@ -67,7 +67,7 @@ pub fn ca_repeater_port() -> u16 {
     EPICS_CA_REPEATER_PORT.inet_port(CA_REPEATER_PORT)
 }
 
-/// Server-side beacon port — C `caservertask.c:501-508`.
+/// Server-side beacon port — C `caservertask.c:502-509`.
 ///
 /// Presence-gated exactly like [`cas_server_port`]: `EPICS_CAS_BEACON_PORT`
 /// when it is configured, else `EPICS_CA_REPEATER_PORT`, each resolved
@@ -169,7 +169,7 @@ mod tests {
     }
 
     /// The CAS/CA selection is a *presence* test against the compiled
-    /// default (`caservertask.c:491-508`): a configured-but-rejected
+    /// default (`caservertask.c:492-509`): a configured-but-rejected
     /// `EPICS_CAS_SERVER_PORT` lands on 5064, it does NOT fall through to
     /// `EPICS_CA_SERVER_PORT`. Same rule for the beacon port.
     #[test]
@@ -241,7 +241,7 @@ mod tests {
     #[test]
     #[serial(epics_env)]
     fn test_cas_server_port_overrides_ca_server_port() {
-        // C parity regression (caservertask.c:491-499):
+        // C parity regression (caservertask.c:492-500):
         //   ca_server_port = EPICS_CAS_SERVER_PORT (if set) else
         //                    EPICS_CA_SERVER_PORT else default 5064
         //   ca_udp_port = ca_server_port    <-- UDP follows the same value
@@ -262,7 +262,7 @@ mod tests {
             "client semantic ignores EPICS_CAS_SERVER_PORT"
         );
         // C parity: server-side bind port honours EPICS_CAS_SERVER_PORT
-        // first (caservertask.c:491). Both UDP and TCP follow this
+        // first (caservertask.c:492-495). Both UDP and TCP follow this
         // value unless the caller splits via `.tcp_port(...)`.
         assert_eq!(
             cas_server_port(),

@@ -84,11 +84,14 @@ libc = "0.2"
 epics-rtems-boot = { workspace = true }
 
 [dev-dependencies]
+# Dev-only and `path`-only, so `cargo package` drops it from the uploaded
+# manifest: the source guards in this crate share one production-slice rule.
+source-guard = { path = "../source-guard" }
 # Dev-only, path-only (no `version`, so `cargo publish` strips the entry
-# entirely): the shared `rtems-exec-model` test-gating census, called by
+# entirely): the shared exec-backend test-gating census, called by
 # `tests/rtems_exec_model_gate.rs`. Shared rather than copied because every
-# crate that declares the feature has the same hole, and copies of a 300-line
-# audit is how copies of a rule come to disagree.
+# crate that derives the backend has the same hole, and a 300-line audit
+# copied once per crate is how copies of a rule come to disagree.
 rtems-exec-gate = { path = "../../tools/rtems-exec-gate" }
 # Dev-only: `#[epics_test]` for this crate's own suite. The macro resolves the
 # runtime path through `epics-libcom-rs` itself (its last fallback), so the
@@ -102,17 +105,6 @@ serial_test = "3"
 tracing-subscriber = "0.3"
 
 [features]
-# Host-selectable RTEMS execution model. Routes the `runtime::task`
-# spawn/sleep/interval seam to the std-thread background executor (callback
-# pool + delayed timer + scanOnce worker) on a HOSTED target, instead of the
-# tokio runtime — the same
-# runtime-free backend the RTEMS build uses unconditionally. Intended for a
-# Linux (e.g. PREEMPT_RT) blocking-front-end deployment that runs the
-# `std::net` CA server driver and wants async record-processing completion
-# driven on dedicated OS threads with no tokio reactor. Compile-time backend
-# switch (see `build.rs`, which turns this into the `exec_backend` cfg). OFF by
-# default: the hosted default is byte-identical without it.
-rtems-exec-model = []
 # Linux PREEMPT_RT real-time deployment opt-in. Wires
 # `runtime::sync::PriorityInheritanceMutex` to a `pthread_mutex_t` configured
 # with `PTHREAD_PRIO_INHERIT` (epics-base 7-E `5a8b6e41`). No-op on non-Linux.

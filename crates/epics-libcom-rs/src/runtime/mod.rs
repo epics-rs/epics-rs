@@ -10,8 +10,9 @@
 //! * `tokio_backend` — the tokio runtime. The hosted default.
 //! * `exec_backend` — the std-thread [`background`] executor (callback pool +
 //!   delayed timer + scanOnce worker). Unconditional on RTEMS, which has no
-//!   tokio reactor, and host-selectable through the `rtems-exec-model` feature
-//!   for a Linux blocking-front-end deployment that wants the same
+//!   tokio reactor, and host-selectable through
+//!   `EPICS_RS_BUILD_EXEC_BACKEND=thread` for a Linux blocking-front-end
+//!   deployment that wants the same
 //!   runtime-free backend.
 //!
 //! [`crate::EXEC_BACKEND`] states which one this build got, so a crate above
@@ -24,17 +25,20 @@ pub mod build_info;
 pub mod env;
 pub mod env_table;
 pub mod epics_string;
+pub mod exit;
 pub mod fs;
 pub mod general_time;
 pub mod ioc_role;
 pub mod json_string;
 pub mod log;
+pub mod log_client;
 pub mod net;
 pub mod socket;
 pub mod stdlib;
 pub mod supervise;
 pub mod sync;
 pub mod task;
+pub mod taskwd;
 pub mod time;
 pub mod version;
 pub mod worker_pool;

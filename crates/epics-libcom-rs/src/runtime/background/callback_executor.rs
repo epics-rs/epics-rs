@@ -29,7 +29,8 @@
 //! entry.
 
 use std::collections::VecDeque;
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::atomic::{AtomicI32, AtomicUsize, Ordering};
+use std::sync::{Arc, Condvar, LazyLock, Mutex};
 use std::thread::JoinHandle;
 
 use super::facility::{recover, run_facility_loop, run_isolated};
@@ -50,6 +51,109 @@ pub const DEFAULT_QUEUE_SIZE: usize = 2000;
 /// Default worker threads per band — C `callbackThreadsDefault`
 /// (`callback.c:66`).
 pub const DEFAULT_THREADS_PER_PRIORITY: usize = 1;
+
+/// The sizing [`CallbackPool::new`] will use — C's `callbackQueueSize`
+/// and `callbackQueue[i].threadsConfigured` file-statics
+/// (`callback.c:51`, `:60`), which `callbackSetQueueSize` and
+/// `callbackParallelThreads` write before `callbackInit` reads them.
+///
+/// They are module state for the same reason C's are: the pool is built
+/// once, from a `OnceLock` initialiser that takes no arguments, and the
+/// iocsh commands that size it run long before anything touches it.
+/// Writing one after the pool exists changes nothing, which is why both
+/// commands refuse once the pool is up.
+static CONFIGURED_QUEUE_SIZE: AtomicUsize = AtomicUsize::new(DEFAULT_QUEUE_SIZE);
+static CONFIGURED_THREADS: [AtomicUsize; NUM_CALLBACK_PRIORITIES] = [
+    AtomicUsize::new(DEFAULT_THREADS_PER_PRIORITY),
+    AtomicUsize::new(DEFAULT_THREADS_PER_PRIORITY),
+    AtomicUsize::new(DEFAULT_THREADS_PER_PRIORITY),
+];
+
+/// C `callbackSetQueueSize` (`callback.c:101-113`) minus its two
+/// diagnostics: the caller owns those, because C prints them from the
+/// same function only because C has nowhere else to put them.
+///
+/// A size of zero or less is the caller's error to report; this clamps
+/// to at least 1 so the pool can never be built with an unusable ring.
+pub fn set_queue_size(size: usize) {
+    CONFIGURED_QUEUE_SIZE.store(size.max(1), Ordering::Relaxed);
+}
+
+/// C `callbackParallelThreads(count, prio)` (`callback.c:160-208`) for
+/// one band, or for all three when `priority` is `None` — C's
+/// `NULL`/`""`/`"*"` case. `count` is clamped to at least 1 exactly as
+/// `callback.c:171` does.
+pub fn set_parallel_threads(count: usize, priority: Option<CallbackPriority>) {
+    let count = count.max(1);
+    match priority {
+        Some(p) => CONFIGURED_THREADS[p.index()].store(count, Ordering::Relaxed),
+        None => {
+            for slot in &CONFIGURED_THREADS {
+                slot.store(count, Ordering::Relaxed);
+            }
+        }
+    }
+}
+
+/// C `epicsThreadGetCPUs()` (`osdThread.c`), the live processor count.
+///
+/// **Post-pin forward-port: this tracks epics-base HEAD, not R7.0.10.** At
+/// the pin (`osdThread.c:1123-1137`) the function is `sysconf` of
+/// `_SC_NPROCESSORS_ONLN`, then `_SC_NPROCESSORS_CONF`, then a hardcoded 1
+/// — none of which consults the calling thread's CPU affinity mask, so a C
+/// IOC pinned to 2 of 64 processors still sizes its callback pool for 64.
+/// `556de06ff` ("avoid overreporting available CPUs", 2026-02-06, branch
+/// 7.0, in no tag) puts a `sched_getaffinity` + `CPU_COUNT` arm ahead of
+/// both `sysconf` calls. `std::thread::available_parallelism` is that
+/// behaviour, so this has been carrying the fix rather than the pin.
+/// Deliberately kept — reverting onto a number upstream itself calls
+/// overreporting buys no parity worth having — and named here because
+/// until now it was silent.
+///
+/// One divergence beyond that forward-port, stated rather than folded into
+/// it: `available_parallelism` also clamps to the cgroup CPU quota, which
+/// `556de06ff` does not. In a container limited to 2 CPUs with no affinity
+/// mask set this returns 2 where even post-`556de06ff` C returns the host
+/// count. Same direction as the upstream fix, so it stays.
+///
+/// Distinct from [`parallel_threads_default`], which is a settable knob
+/// merely SEEDED from this. `callbackParallelThreads` reads the two on
+/// different arms — a negative count is relative to the processor count,
+/// a zero count means the knob (`callback.c:167-170`) — so collapsing
+/// them into one accessor makes `var callbackParallelThreadsDefault N`
+/// silently move the negative arm too.
+pub fn cpu_count() -> i32 {
+    std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1) as i32
+}
+
+/// C `callbackParallelThreadsDefault` (`callback.c:69`) — the value
+/// `callbackParallelThreads(0, ...)` resolves to (`callback.c:170`).
+///
+/// C declares it `2` and then overwrites it with `epicsThreadGetCPUs()`
+/// in `dbIocRegister` (`dbIocRegister.c:638-639`), commented there
+/// "Needed before callback system is initialized". That assignment runs
+/// during registration, so `2` is never a value an IOC can observe and
+/// this seeds the processor count directly rather than reproducing a
+/// registration phase that has no counterpart here.
+///
+/// It is an `iocshVar` (`dbCore.dbd:32`, `variable(...,int)`), so a
+/// startup script may write it, and C reads it at the point of use, not
+/// at init. `i32` because C's is an `int`: a negative value is writable
+/// and reaches `callback.c:171`'s floor, which `usize` could not carry.
+static PARALLEL_THREADS_DEFAULT: LazyLock<AtomicI32> =
+    LazyLock::new(|| AtomicI32::new(cpu_count()));
+
+/// Read C `callbackParallelThreadsDefault`.
+pub fn parallel_threads_default() -> i32 {
+    PARALLEL_THREADS_DEFAULT.load(Ordering::Relaxed)
+}
+
+/// Write C `callbackParallelThreadsDefault` — the `var` command's setter.
+pub fn set_parallel_threads_default(value: i32) {
+    PARALLEL_THREADS_DEFAULT.store(value, Ordering::Relaxed);
+}
 
 /// Callback priority band — C `priorityLow`/`priorityMedium`/`priorityHigh`
 /// (`callback.h:41-43`).
@@ -78,6 +182,26 @@ impl CallbackPriority {
             CallbackPriority::Low => 0,
             CallbackPriority::Medium => 1,
             CallbackPriority::High => 2,
+        }
+    }
+
+    /// The band a record's `PRIO` field selects — C `callbackSetPriority`
+    /// (`callback.h:91-92`), which copies the record's `menuPriority` index
+    /// (`menuPriority.dbd.pod:24-28` — `LOW`/`MEDIUM`/`HIGH` = 0/1/2, the same
+    /// three values as `priorityLow`/`priorityMedium`/`priorityHigh`,
+    /// `callback.h:41-43`) straight into `CALLBACK.priority`.
+    ///
+    /// C validates the copied value only when the callback is queued:
+    /// `callbackRequest` drops it with "Bad priority" (`callback.c:355-357`)
+    /// when it is outside `0..NUM_CALLBACK_PRIORITIES`. Dropping a record's
+    /// deferred work loses that cycle outright, so an out-of-range `PRIO`
+    /// lands on `Low` here instead — the band a record whose `PRIO` was never
+    /// written already has.
+    pub fn from_record_prio(prio: i16) -> CallbackPriority {
+        match prio {
+            1 => CallbackPriority::Medium,
+            2 => CallbackPriority::High,
+            _ => CallbackPriority::Low,
         }
     }
 
@@ -123,6 +247,12 @@ pub enum CallbackError {
 /// Mutable, lock-guarded state of one priority band's ring.
 struct QueueState {
     queue: VecDeque<Callback>,
+    /// C `epicsRingPointerGetHighWaterMark` on the band's ring — the
+    /// deepest the queue has ever been. `callbackQueueShow` reports it
+    /// and `callbackQueueStatus(reset=1)` clears it
+    /// (`callback.c:115-139`), so it is not derivable from `queue.len()`
+    /// after the fact and has to be latched on every push.
+    high_water: usize,
     /// C `cbQueueSet.queueOverflow` — latched full flag (`callback.c:56`).
     overflow: bool,
     /// C `cbQueueSet.queueOverflows` — lifetime overflow count
@@ -146,6 +276,7 @@ impl PriorityQueue {
             capacity,
             state: Mutex::new(QueueState {
                 queue: VecDeque::with_capacity(capacity.min(1024)),
+                high_water: 0,
                 overflow: false,
                 overflows: 0,
                 shutdown: false,
@@ -190,11 +321,45 @@ impl PriorityQueue {
             return Err(CallbackError::QueueFull);
         }
         st.queue.push_back(cb);
+        // The ring's high-water mark moves on the push that made it
+        // deepest, exactly where `epicsRingPointer` moves its own.
+        st.high_water = st.high_water.max(st.queue.len());
         drop(st);
         // callback.c:375 — signal the band's wake-up event.
         self.wake.notify_one();
         Ok(())
     }
+
+    /// C `callbackQueueStatus` for one band (`callback.c:115-139`):
+    /// sample size/used/high-water/overflows, and clear the high-water
+    /// mark when `reset` is set.
+    fn stats(&self, reset: bool) -> CallbackQueueStats {
+        let mut st = recover(FACILITY, self.state.lock());
+        let out = CallbackQueueStats {
+            size: self.capacity,
+            num_used: st.queue.len(),
+            max_used: st.high_water,
+            num_overflow: st.overflows,
+        };
+        if reset {
+            st.high_water = 0;
+        }
+        out
+    }
+}
+
+/// One band's row of C's `callbackQueueStats` (`callback.h`), as
+/// `callbackQueueShow` prints it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CallbackQueueStats {
+    /// Ring capacity — C `stats.size`.
+    pub size: usize,
+    /// Entries queued right now — C `stats.numUsed`.
+    pub num_used: usize,
+    /// Deepest the ring has been since the last reset — C `stats.maxUsed`.
+    pub max_used: usize,
+    /// Lifetime overflow count — C `stats.numOverflow`.
+    pub num_overflow: u64,
 }
 
 /// What this facility is called when it has to report something about itself.
@@ -245,6 +410,12 @@ impl CallbackHandle {
     pub fn overflow_count(&self, priority: CallbackPriority) -> u64 {
         recover(FACILITY, self.queues[priority.index()].state.lock()).overflows
     }
+
+    /// One band's `callbackQueueStatus` row (`callback.c:115-139`);
+    /// `reset` clears the high-water mark, as C's does.
+    pub fn stats(&self, priority: CallbackPriority, reset: bool) -> CallbackQueueStats {
+        self.queues[priority.index()].stats(reset)
+    }
 }
 
 /// The callback executor pool: three independent priority bands, each with its
@@ -263,24 +434,39 @@ impl CallbackPool {
     /// (`callback.c:51`) and `callbackThreadsDefault` worker(s) per band
     /// (`callback.c:66`).
     pub fn new() -> Self {
-        Self::with_config(DEFAULT_QUEUE_SIZE, DEFAULT_THREADS_PER_PRIORITY)
+        Self::with_per_priority_config(
+            CONFIGURED_QUEUE_SIZE.load(Ordering::Relaxed),
+            CallbackPriority::ALL.map(|p| CONFIGURED_THREADS[p.index()].load(Ordering::Relaxed)),
+        )
     }
 
     /// Build a pool with an explicit ring capacity and worker count per band.
     /// `threads_per_priority` is clamped to at least 1 (C `callbackParallelThreads`
     /// forces `count >= 1`, `callback.c:171`).
     pub fn with_config(queue_size: usize, threads_per_priority: usize) -> Self {
+        Self::with_per_priority_config(queue_size, [threads_per_priority; NUM_CALLBACK_PRIORITIES])
+    }
+
+    /// Build a pool whose bands may carry DIFFERENT worker counts — C
+    /// `callbackQueue[i].threadsConfigured` is per band
+    /// (`callback.c:60`, `:177`, `:205`), so
+    /// `callbackParallelThreads(4, "HIGH")` widens one band only.
+    pub fn with_per_priority_config(
+        queue_size: usize,
+        threads_per_priority: [usize; NUM_CALLBACK_PRIORITIES],
+    ) -> Self {
         let capacity = queue_size.max(1);
-        let threads = threads_per_priority.max(1);
+        let threads_per_priority = threads_per_priority.map(|n| n.max(1));
         let queues: [Arc<PriorityQueue>; NUM_CALLBACK_PRIORITIES] = [
             Arc::new(PriorityQueue::new(capacity)),
             Arc::new(PriorityQueue::new(capacity)),
             Arc::new(PriorityQueue::new(capacity)),
         ];
 
-        let mut workers = Vec::with_capacity(NUM_CALLBACK_PRIORITIES * threads);
+        let mut workers = Vec::with_capacity(threads_per_priority.iter().sum::<usize>());
         for prio in CallbackPriority::ALL {
             let pq = &queues[prio.index()];
+            let threads = threads_per_priority[prio.index()];
             for j in 0..threads {
                 // callback.c:324-327 — `cbLow` when single, `cbLow-<n>` when
                 // parallel.
@@ -290,6 +476,7 @@ impl CallbackPool {
                     prio.name_prefix().to_string()
                 };
                 let pq = Arc::clone(pq);
+                let watched_name = name.clone();
                 // A band with no worker is a band whose queued callbacks never
                 // run again — deferred record processing, delayed callbacks,
                 // monitor tails. There is no error path out of a constructor
@@ -305,6 +492,15 @@ impl CallbackPool {
                     StackSizeClass::Big,
                 )
                 .spawn(move || {
+                    // C `callbackTask` registers itself and removes on the way
+                    // out (`callback.c:215`, `:234`). Unbounded: a callback
+                    // band with an empty queue is parked on its semaphore, and
+                    // an idle IOC is not a fault.
+                    let _watched = crate::runtime::taskwd::taskwd_insert(
+                        watched_name,
+                        crate::runtime::taskwd::CheckIn::Unbounded,
+                        None,
+                    );
                     run_facility_loop(
                         FACILITY,
                         || worker_loop(&pq),
@@ -335,6 +531,12 @@ impl CallbackPool {
     /// (`callback.c:57`).
     pub fn overflow_count(&self, priority: CallbackPriority) -> u64 {
         recover(FACILITY, self.queues[priority.index()].state.lock()).overflows
+    }
+
+    /// One band's `callbackQueueStatus` row (`callback.c:115-139`);
+    /// `reset` clears the high-water mark, as C's does.
+    pub fn stats(&self, priority: CallbackPriority, reset: bool) -> CallbackQueueStats {
+        self.queues[priority.index()].stats(reset)
     }
 
     /// Stop every band and join its workers — port of the shutdown half of
@@ -497,6 +699,59 @@ mod tests {
         assert!(
             !ran.load(Ordering::SeqCst),
             "callback ran after shutdown; it must be dropped, not invoked"
+        );
+    }
+
+    /// `cpu_count()` must report the processors the calling thread may
+    /// actually run on, not the host's — epics-base `556de06ff`, which the
+    /// reference pin R7.0.10 does not carry (see [`cpu_count`]). At the pin
+    /// this returns the host count for a pinned thread, which is exactly the
+    /// overreporting that commit removed.
+    ///
+    /// The mask is set on a thread of this test's own: on Linux affinity is
+    /// per-thread and `sched_getaffinity(0, ..)` — what
+    /// `available_parallelism` calls — reads the caller's, so no other
+    /// test's thread is disturbed.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn cpu_count_respects_the_threads_affinity_mask() {
+        let host = cpu_count();
+        if host < 2 {
+            // Already pinned to one processor: nothing left to restrict, and
+            // the assertion below would hold for the pin's behaviour too.
+            return;
+        }
+        let pinned = std::thread::spawn(|| {
+            // SAFETY: both calls address pid 0 (this thread) and a
+            // `cpu_set_t` owned by this frame; nothing else is observed or
+            // mutated.
+            unsafe {
+                let mut have: libc::cpu_set_t = std::mem::zeroed();
+                if libc::sched_getaffinity(0, size_of::<libc::cpu_set_t>(), &mut have) != 0 {
+                    return None;
+                }
+                // Keep the lowest processor already permitted — CPU 0 need
+                // not be in the mask this process inherited.
+                let first = (0..libc::CPU_SETSIZE as usize).find(|&c| libc::CPU_ISSET(c, &have))?;
+                let mut one: libc::cpu_set_t = std::mem::zeroed();
+                libc::CPU_ZERO(&mut one);
+                libc::CPU_SET(first, &mut one);
+                if libc::sched_setaffinity(0, size_of::<libc::cpu_set_t>(), &one) != 0 {
+                    return None;
+                }
+            }
+            Some(cpu_count())
+        })
+        .join()
+        .expect("the pinned thread must not panic");
+        let Some(pinned) = pinned else {
+            // The sandbox forbids setting affinity; nothing measurable here.
+            return;
+        };
+        assert_eq!(
+            pinned, 1,
+            "cpu_count() reported {host} for a thread pinned to one \
+             processor — that is the pre-556de06ff sysconf behaviour"
         );
     }
 }

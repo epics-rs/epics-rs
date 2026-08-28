@@ -1,5 +1,5 @@
 //! Runtime-free future executor over the callback pool — the RTEMS backend for
-//! [`crate::runtime::task::spawn`] / [`crate::runtime::task::spawn_blocking`]
+//! [`crate::runtime::task::Reactor::spawn`] / [`crate::runtime::task::spawn_blocking`]
 //! (decision A2, increment W3b).
 //!
 //! # Model — cooperative, not worker-per-future

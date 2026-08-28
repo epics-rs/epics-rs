@@ -119,7 +119,7 @@ impl AcceptBackoff {
                 crate::runtime::log::ErrlogSevEnum::Major,
                 &format!(
                     "accept failed {} time(s) in a row; the server is not taking \
-                     connections and keeps retrying",
+                     connections and keeps retrying\n",
                     self.consecutive
                 ),
             );

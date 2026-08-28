@@ -52,13 +52,13 @@
 //!
 //! | target | connect | timeout honoured | C authority |
 //! |---|---|---|---|
-//! | hosted | non-blocking, then `poll(POLLOUT)` | yes | `:511`, `:523`, `:544` under `USE_POLL` |
+//! | hosted | blocking connect, then non-blocking | connect: no, write: yes | `:535-536` (`setNonBlock` under `USE_POLL`), `:633-651` (`poll(POLLOUT)`, the WRITE deadline) |
 //! | VxWorks | non-blocking, then `select()` via `FAKE_POLL` | yes | `:76`, `:139-164`, `:178` |
 //! | RTEMS | **blocking** | **no** | `:71-72` — `__rtems__` takes `USE_SOCKTIMEOUT`, and both `setNonBlock` and the poll block sit inside `#ifdef USE_POLL` |
 //!
 //! The RTEMS row is not an omission. C genuinely has no connect timeout there;
 //! it bounds the *transfer* instead, with `SO_RCVTIMEO`/`SO_SNDTIMEO`
-//! (`:652-664`, `:778-790`). Honouring the deadline there anyway would be a
+//! (`:618-623`, `:744-749`). Honouring the deadline there anyway would be a
 //! deviation invented by the port, so [`tcp_connect`] documents the difference
 //! rather than papering over it.
 
@@ -144,8 +144,9 @@ pub fn tcp_connect(
 /// second).
 ///
 /// The error is returned, not swallowed. C treats this option as required —
-/// `create_client` calls `destroy_client` and refuses the connection when it
-/// fails (`caservertask.c:1456`) — so the caller gets to make C's decision.
+/// `create_tcp_client` calls `destroy_client` and refuses the connection when
+/// it fails (`caservertask.c:1457-1463`) — so the caller gets to make C's
+/// decision.
 ///
 /// Only the flag is set, which is all C sets. The idle/probe tuning the hosted
 /// CA driver adds through `socket2` (`epics-ca-rs::server::tcp`, 15 s + 5 s) is
@@ -191,7 +192,7 @@ mod sys {
             // Where the platform has no SO_REUSEPORT the request degrades to
             // SO_REUSEADDR rather than silently doing nothing — C's
             // `#ifndef SO_REUSEPORT / # define USE_SO_REUSEADDR`
-            // (`drvAsynIPPort.c:88-92`). Windows is the case that reaches
+            // (`drvAsynIPPort.c:90-92`). Windows is the case that reaches
             // this; both embedded triples define the option and take the arm
             // above.
             #[cfg(not(unix))]
@@ -251,7 +252,9 @@ mod sys {
             // POLLHUP even when SO_ERROR is clear. macOS raises that when the
             // peer FINs immediately after accepting; Linux does not. The
             // handshake did complete, and C — which only inspects SO_ERROR
-            // (`drvAsynIPPort.c:545-560`) — treats the link as connected and
+            // (`drvAsynIPPort.c:544-554`, asyn PR #211 `e1987063`, later than
+            // the `e2a281e2` these citations otherwise resolve against) —
+            // treats the link as connected and
             // lets the later read surface the EOF. So if the socket is in fact
             // connected, the connect succeeded whatever POLLHUP was flagged.
             Err(e) => match socket.peer_addr() {
@@ -471,8 +474,10 @@ mod sys {
     /// RTEMS: plain blocking connect, no deadline.
     ///
     /// C parity, not a shortcut: `__rtems__` selects `USE_SOCKTIMEOUT`
-    /// (`drvAsynIPPort.c:71-72`), which compiles out both the pre-connect
-    /// `setNonBlock` (`:511`) and the `poll(POLLOUT)` deadline (`:544`). The
+    /// (`drvAsynIPPort.c:71-72`), which compiles out both the `setNonBlock`
+    /// under `USE_POLL` (`:536` at the `e2a281e2` pin) and the `poll(POLLOUT)`
+    /// connect deadline (`:544` as of asyn PR #211 `e1987063`, which is also
+    /// what moved `setNonBlock` ahead of the connect). The
     /// transfer bound C keeps there is `SO_RCVTIMEO`/`SO_SNDTIMEO`, applied by
     /// the read/write path rather than here.
     #[cfg(target_os = "rtems")]
@@ -495,8 +500,10 @@ mod sys {
     /// VxWorks: non-blocking connect bounded by `poll(POLLOUT)`, then
     /// `SO_ERROR`.
     ///
-    /// This is C's `USE_POLL` path (`drvAsynIPPort.c:511`, `:523`, `:544-560`),
-    /// which VxWorks takes via `FAKE_POLL`. C fakes `poll` with `select()`
+    /// This is C's `USE_POLL` path (`drvAsynIPPort.c:529-556`) as of asyn
+    /// PR #211 `e1987063` — later than the `e2a281e2` pin, whose `connectIt`
+    /// still connects blocking and only goes non-blocking afterwards, at
+    /// `:536`. VxWorks takes it via `FAKE_POLL`. C fakes `poll` with `select()`
     /// because its VxWorks headers lack `poll`; the Rust `libc` binding for the
     /// triple exposes `poll` directly, so the fake is unnecessary and the
     /// observable behaviour is the same.

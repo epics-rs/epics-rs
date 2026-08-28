@@ -1,7 +1,7 @@
 // RTEMS-EXEC-MODEL-ALLOW(2): the two multi-thread-flavored tests prove a
 // dedicated thread carries the ambient tokio runtime / requested stack; the
 // tokio flavor is the property under test. Both run and pass in the
-// feature-ON suite.
+// exec-backend suite.
 
 use std::future::Future;
 use std::sync::Arc;
@@ -10,6 +10,8 @@ use std::time::Duration;
 use tokio::runtime::RuntimeFlavor;
 
 pub use tokio::runtime::Handle as RuntimeHandle;
+
+pub use crate::runtime::background::CallbackPriority;
 
 /// A synchronous caller asked to block on an async operation from a thread
 /// where blocking cannot be made sound.
@@ -29,8 +31,8 @@ pub enum NotBlockable {
     /// ([`crate::runtime::background`]). Each facility has a bounded worker set
     /// and every unit of work it carries is enqueued for those workers, so a
     /// parked worker is waiting for work only it could have run. On RTEMS
-    /// [`spawn`] routes here, which makes the callback bands the one other
-    /// place where parking is unsound.
+    /// [`Reactor::spawn`] routes here, which makes the callback bands the one
+    /// other place where parking is unsound.
     BackgroundWorker,
 }
 
@@ -219,14 +221,25 @@ impl BlockingBridge {
         self.handle.block_on(fut)
     }
 
-    /// Spawn `future` onto the captured runtime — [`spawn`] for a thread the
-    /// runtime is not entered on.
+    /// Spawn `future` onto the captured runtime — [`Reactor::spawn`] for a
+    /// thread the runtime is not entered on.
     pub fn spawn<F>(&self, future: F) -> TaskHandle<F::Output>
     where
         F: Future + Send + 'static,
         F::Output: Send + 'static,
     {
         self.handle.spawn(future)
+    }
+
+    /// The captured runtime as a [`Reactor`], for handing to a reactor-bound
+    /// task the bridge starts.
+    ///
+    /// The bridge already answered "is the executor reachable from here?" at
+    /// capture time; this is the same answer in the shape a spawn site takes.
+    pub fn reactor(&self) -> Reactor {
+        Reactor {
+            handle: self.handle.clone(),
+        }
     }
 }
 
@@ -249,13 +262,23 @@ impl BlockingBridge {
         park_on(fut)
     }
 
-    /// [`spawn`] — the global executor needs no captured state.
+    /// [`Reactor::spawn`] — the global executor needs no captured state.
+    ///
+    /// The reactor seam mirrors `tokio::spawn`, whose callers are servers,
+    /// clients and iocsh, never record support: there is no record here and so
+    /// no `PRIO` to read. It takes the middle band, C's `callbackRequest`
+    /// default for general deferred work (`callback.h:42`).
     pub fn spawn<F>(&self, future: F) -> TaskHandle<F::Output>
     where
         F: Future + Send + 'static,
         F::Output: Send + 'static,
     {
-        spawn(future)
+        spawn_background(CallbackPriority::Medium, future)
+    }
+
+    /// See the `tokio_backend` definition; there is no state to carry here.
+    pub fn reactor(&self) -> Reactor {
+        Reactor
     }
 }
 
@@ -266,7 +289,8 @@ impl BlockingBridge {
 /// the test. On `tokio_backend` this builds exactly what `#[tokio::test]`
 /// builds: a fresh current-thread runtime with IO and time enabled. On
 /// `exec_backend` (the RTEMS target, or a host run with
-/// `--features rtems-exec-model`) no tokio runtime exists to build, so the
+/// `EPICS_RS_BUILD_EXEC_BACKEND=thread`) no tokio runtime exists to build, so
+/// the
 /// test thread itself drives the future via `park_on`, and everything the
 /// body spawns or sleeps on lands on the process-global background executor
 /// (lazily initialised on first use) — the same seam the RTEMS boot path
@@ -301,27 +325,29 @@ pub fn test_block_on<F: Future>(fut: F) -> F::Output {
 // reproduce exactly the subset of the tokio surface the call sites use.
 // ---------------------------------------------------------------------------
 
-/// `true` when [`spawn`] lands the future on the tokio runtime, `false` when it
-/// lands on the reactor-free background executor (`exec_backend` — the RTEMS
-/// target, or a host build with `--features rtems-exec-model`).
+/// `true` when [`Reactor::spawn`] lands the future on the tokio runtime,
+/// `false` when it lands on the reactor-free background executor
+/// (`exec_backend` — the RTEMS target, or a host build with
+/// `EPICS_RS_BUILD_EXEC_BACKEND=thread`).
 ///
 /// # What this is for
 ///
 /// It is the *exported* form of `build.rs`'s backend decision, and the reason
 /// it is exported is that a spawned future's access to a tokio **reactor** is
-/// decided here and consumed in other crates. A future handed to [`spawn`] on
-/// `exec_backend` runs on a callback-pool worker with no reactor entered, so
+/// decided here and consumed in other crates. A future handed to
+/// [`Reactor::spawn`] on `exec_backend` runs on a callback-pool worker with no
+/// reactor entered, so
 /// every `tokio::net` socket it opens panics — *even in a process that has a
 /// tokio runtime somewhere else*, because the runtime is not entered on that
 /// worker.
 ///
 /// `epics-ca-rs` and `epics-pva-rs` therefore have to make the same decision
 /// this crate makes, for their own compilation, and they make it in their own
-/// `build.rs` from the same two inputs (target OS, `rtems-exec-model` feature).
+/// `build.rs` from the same two inputs (target OS, `EPICS_RS_BUILD_EXEC_BACKEND`).
 /// That is three copies of one rule, so each of them pins the copy against this
-/// constant with a `const` assertion — a build where the two disagree (say,
-/// `epics-base-rs/rtems-exec-model` enabled without `epics-ca-rs`'s) fails to
-/// compile instead of panicking at boot.
+/// constant with a `const` assertion — a build where the two disagree, which
+/// now means one of the scripts did not see the variable, fails to compile
+/// instead of panicking at boot.
 pub const HAS_TOKIO_REACTOR: bool = cfg!(tokio_backend);
 
 /// Handle to a spawned task — `await` for its result, `abort()` to cancel.
@@ -376,6 +402,54 @@ pub fn background_init() {
     let _ = background();
 }
 
+/// Has the process-global background executor been built yet?
+///
+/// C's twin is `epicsAtomicGetIntT(&cbState) != cbInit` — the guard
+/// `callbackSetQueueSize` and `callbackParallelThreads` refuse on
+/// (`callback.c:107`, `:162`). Sizing knobs are read once, when the pool
+/// is constructed, so a write after this returns `true` changes nothing
+/// and has to be reported rather than silently accepted.
+pub fn background_started() -> bool {
+    BACKGROUND.get().is_some()
+}
+
+/// Queue statistics for all three callback bands, or `None` when the
+/// background executor has not been built yet — C `callbackQueueStatus`
+/// (`callback.c:115-141`), whose `-1` return is exactly this `None` and
+/// is what `callbackQueueShow` turns into its "not initialized, yet"
+/// diagnostic. `reset` clears every band's high-water mark, as C's does
+/// for the whole array regardless of which band is being read.
+///
+/// Reads `BACKGROUND` rather than calling `background()`, because a
+/// report must not be the thing that starts the facility it reports on.
+pub fn background_callback_stats(
+    reset: bool,
+) -> Option<
+    [crate::runtime::background::CallbackQueueStats;
+        crate::runtime::background::NUM_CALLBACK_PRIORITIES],
+> {
+    let exec = BACKGROUND.get()?;
+    Some(
+        crate::runtime::background::CallbackPriority::ALL.map(|p| exec.callbacks().stats(p, reset)),
+    )
+}
+
+/// Create the process-global `scanOnce` worker thread now — C `initOnce`
+/// (`dbScan.c:768-780`), called from the port's `scanInit` equivalent so the
+/// thread exists from IOC init rather than from the first one-shot. Idempotent.
+pub fn background_scan_once_start() {
+    background().scan_once().start();
+}
+
+/// Ring statistics for the `scanOnce` facility, or `None` before the
+/// background executor exists — C `scanOnceQueueStatus` (`dbScan.c:734-757`)
+/// and its `if (!onceQ) return -1` guard.
+pub fn background_scan_once_stats(
+    reset: bool,
+) -> Option<crate::runtime::background::ScanOnceQueueStats> {
+    Some(BACKGROUND.get()?.scan_once().stats(reset))
+}
+
 /// Handle to a task spawned on the process-global background executor —
 /// `await` for its result, `abort()` to cancel. Distinct from [`TaskHandle`]
 /// because that one is the *ambient* executor's handle and is
@@ -384,44 +458,50 @@ pub type BackgroundTaskHandle<T> = crate::runtime::background::JoinFuture<T>;
 
 /// Spawn a deferred tail on the process-global background executor.
 ///
-/// The counterpart to [`spawn`], and the difference is the whole point of
-/// having both: [`spawn`] follows the *ambient* execution model, so on a
-/// hosted build it needs a tokio runtime entered on the calling thread, while
-/// this one always lands on the same executor no matter who calls it. Record
-/// processing is reached from a plain `std::thread` — every blocking CA/PVA
-/// connection thread drives it through [`block_on_sync`] → `park_on` — so a
-/// tail it defers must not depend on the caller's thread having a runtime.
+/// The counterpart to [`Reactor::spawn`], and the difference is the whole
+/// point of having both: that one needs a [`Reactor`], which on a hosted build
+/// is the tokio runtime with its I/O and time drivers, while this one always
+/// lands on the same executor no matter who calls it and needs no capability
+/// at all. Record processing is reached from a plain `std::thread` — every
+/// blocking CA/PVA connection thread drives it through [`block_on_sync`] →
+/// `park_on` — so a tail it defers must not depend on the caller's thread
+/// having a runtime, and must not be handed a `Reactor` either.
 ///
 /// Anything awaited inside `future` is subject to the same rule: use
 /// [`sleep_background`], [`interval_background`] and [`spawn_blocking_background`]
 /// rather than their ambient counterparts, and no `tokio::net` socket, whose
 /// reactor this executor deliberately does not have.
-pub fn spawn_background<F>(future: F) -> BackgroundTaskHandle<F::Output>
+///
+/// # The band is the caller's to name
+///
+/// `priority` picks which of the three callback queues runs the tail — C
+/// `callbackRequest` dispatches on `CALLBACK.priority` (`callback.c:355-365`)
+/// and record support sets that from the record it is deferring:
+/// `callbackSetPriority(prec->prio, &pcb->callback)` at the top of
+/// `seqRecord.c:146` `process()`, re-read every cycle. There is deliberately
+/// no defaulted spelling of this function: a record tail that silently took
+/// one fixed band would make every record's `PRIO` field select nothing, so
+/// the band is a parameter and a site with no record to name must say which
+/// band it means and why. Use
+/// [`CallbackPriority::from_record_prio`] wherever a `PRIO` is in hand.
+pub fn spawn_background<F>(priority: CallbackPriority, future: F) -> BackgroundTaskHandle<F::Output>
 where
     F: Future + Send + 'static,
     F::Output: Send + 'static,
 {
-    use crate::runtime::background::{DEFAULT_SPAWN_PRIORITY, spawn_future};
-    spawn_future(
-        &background().callbacks().handle(),
-        DEFAULT_SPAWN_PRIORITY,
-        future,
-    )
+    use crate::runtime::background::spawn_future;
+    spawn_future(&background().callbacks().handle(), priority, future)
 }
 
 /// [`spawn_background`] for a blocking closure — runs it on a callback-pool
-/// worker at the default Medium band.
-pub fn spawn_blocking_background<F, R>(f: F) -> BackgroundTaskHandle<R>
+/// worker of the named band.
+pub fn spawn_blocking_background<F, R>(priority: CallbackPriority, f: F) -> BackgroundTaskHandle<R>
 where
     F: FnOnce() -> R + Send + 'static,
     R: Send + 'static,
 {
-    use crate::runtime::background::{DEFAULT_SPAWN_PRIORITY, spawn_blocking_on};
-    spawn_blocking_on(
-        &background().callbacks().handle(),
-        DEFAULT_SPAWN_PRIORITY,
-        f,
-    )
+    use crate::runtime::background::spawn_blocking_on;
+    spawn_blocking_on(&background().callbacks().handle(), priority, f)
 }
 
 /// Sleep on the process-global delayed-callback timer — C
@@ -439,24 +519,132 @@ pub fn interval_background(period: Duration) -> crate::runtime::background::Time
     crate::runtime::background::timer_sleep::interval(&background().timer().handle(), period)
 }
 
+// ---------------------------------------------------------------------------
+// The reactor capability
+//
+// Spawning used to go through an *ambient* free function. On a hosted build
+// `spawn` was `tokio::spawn`, which reads a thread-local and panics with
+// "there is no reactor running" on any thread that is not inside a runtime; on
+// `exec_backend` it was `spawn_background`, which lands on the process-global
+// background executor and has no reactor at all. One name, two executors with
+// opposite capabilities, and which one you got was decided by a thread-local
+// the call site could not see. Nothing but a comment and a textual census kept
+// a reactor-bound future off the reactor-free executor, or the reverse.
+//
+// [`Reactor`] replaces that thread-local with a value. A site that needs the
+// I/O and time drivers takes one, so the requirement is in the signature of
+// whatever owns the site instead of in a comment beside it, and a record
+// callback — which is handed no `Reactor` — cannot reach the reactor-bound
+// spawn at all without [`Reactor::current`], which is one named call a census
+// can ban outright in the scopes where it must never appear.
+// ---------------------------------------------------------------------------
+
+/// The executor that owns the reactor — the capability a reactor-bound task is
+/// spawned through.
+///
+/// Hold one and you may spawn a future that opens a `tokio::net` socket, waits
+/// on `tokio::time`, or installs a signal handler. The counterpart is
+/// [`spawn_background`], which needs no capability because the executor it
+/// lands on is process-global — and, for the same reason, has no reactor.
+///
+/// # Where one comes from
+///
+/// [`Reactor::current`] mints one from the runtime entered on the calling
+/// thread, and returns `None` rather than panicking when there is none.
+/// Everything else receives one: the IOC and the CA/PVA servers and clients
+/// capture it once on their own setup path and hand `&Reactor` down to the
+/// tasks they start. [`BlockingBridge::reactor`] is the third source, for a
+/// blocking thread the runtime is not entered on.
 #[cfg(tokio_backend)]
-pub fn spawn<F>(future: F) -> TaskHandle<F::Output>
-where
-    F: Future + Send + 'static,
-    F::Output: Send + 'static,
-{
-    tokio::spawn(future)
+#[derive(Clone, Debug)]
+pub struct Reactor {
+    handle: tokio::runtime::Handle,
 }
 
-/// RTEMS: there is no ambient runtime to follow, so the ambient seam *is* the
-/// background executor — [`spawn_background`] verbatim.
+/// See the `tokio_backend` definition.
+///
+/// **There is no tokio reactor on this backend.** A `Reactor` here is the
+/// process-global background executor, so it is a ZST and
+/// [`Reactor::current`] always succeeds — which is what lets one signature
+/// compile on both backends. What it does *not* do is make `tokio::net` work
+/// on RTEMS: that build reaches the network through the blocking drivers, and
+/// [`HAS_TOKIO_REACTOR`] is the constant that says which world a call site is
+/// compiled into.
+///
+/// Deliberately **not** `Copy`, though a ZST could be: a capability that moves
+/// on one backend and copies on the other makes every call site's `clone()`
+/// correct under `tokio_backend` and a `clippy::clone_on_copy` error here. One
+/// shape on both backends is what lets the same source compile clean under
+/// either.
 #[cfg(exec_backend)]
-pub fn spawn<F>(future: F) -> TaskHandle<F::Output>
-where
-    F: Future + Send + 'static,
-    F::Output: Send + 'static,
-{
-    spawn_background(future)
+#[derive(Clone, Debug)]
+pub struct Reactor;
+
+#[cfg(tokio_backend)]
+impl Reactor {
+    /// The runtime entered on this thread, or `None` when there is none.
+    ///
+    /// Deliberately not a panicking constructor: the ambient `spawn` this
+    /// replaces panicked from inside itself, which is exactly the failure the
+    /// capability exists to move into the type. A caller that genuinely cannot
+    /// continue without one writes its own `expect`, which names the reason and
+    /// can be found by a census.
+    pub fn current() -> Option<Self> {
+        RuntimeHandle::try_current()
+            .ok()
+            .map(|handle| Self { handle })
+    }
+
+    /// Spawn a reactor-bound future.
+    ///
+    /// Works from any thread, including one the runtime is not entered on —
+    /// the handle carries the runtime, where `tokio::spawn` read a
+    /// thread-local.
+    pub fn spawn<F>(&self, future: F) -> TaskHandle<F::Output>
+    where
+        F: Future + Send + 'static,
+        F::Output: Send + 'static,
+    {
+        self.handle.spawn(future)
+    }
+
+    /// Run a blocking closure on the runtime's blocking pool.
+    pub fn spawn_blocking<F, R>(&self, f: F) -> TaskHandle<R>
+    where
+        F: FnOnce() -> R + Send + 'static,
+        R: Send + 'static,
+    {
+        self.handle.spawn_blocking(f)
+    }
+}
+
+#[cfg(exec_backend)]
+impl Reactor {
+    /// The background executor is process-global, so this never fails — see
+    /// the type's own docs for what that does and does not promise.
+    pub fn current() -> Option<Self> {
+        Some(Self)
+    }
+
+    /// [`spawn_background`] verbatim: on this backend there is nothing else to
+    /// spawn onto. Middle band for the same reason as the `tokio_backend`
+    /// copy — the reactor seam carries no record.
+    pub fn spawn<F>(&self, future: F) -> TaskHandle<F::Output>
+    where
+        F: Future + Send + 'static,
+        F::Output: Send + 'static,
+    {
+        spawn_background(CallbackPriority::Medium, future)
+    }
+
+    /// [`spawn_blocking_background`] verbatim, middle band.
+    pub fn spawn_blocking<F, R>(&self, f: F) -> TaskHandle<R>
+    where
+        F: FnOnce() -> R + Send + 'static,
+        R: Send + 'static,
+    {
+        spawn_blocking_background(CallbackPriority::Medium, f)
+    }
 }
 
 /// Yield the current task once — the seam replacement for
@@ -489,6 +677,20 @@ pub async fn yield_now() {
     YieldNow(false).await;
 }
 
+/// Run a blocking closure on a worker thread.
+///
+/// **Not the reactor capability.** What this needs is a pool of threads that
+/// may block, not the I/O and time drivers, and the two are different
+/// requirements even though tokio happens to hang both off one runtime: on a
+/// hosted build this is `tokio::task::spawn_blocking`, which does require a
+/// runtime entered on the calling thread, and on `exec_backend` it is the
+/// callback pool, which requires nothing. That residual dual meaning is why
+/// [`Reactor::spawn_blocking`] exists beside it — a site that already holds a
+/// [`Reactor`] should use that one and say so in its signature. This free
+/// function stays for the callers whose work is reactor-free by nature
+/// (`runtime::fs`, `waitpid`, a name lookup) and for whom a process-global
+/// blocking pool, which this crate does not yet have, would be the right
+/// destination.
 #[cfg(tokio_backend)]
 pub fn spawn_blocking<F, R>(f: F) -> TaskHandle<R>
 where
@@ -498,14 +700,16 @@ where
     tokio::task::spawn_blocking(f)
 }
 
-/// RTEMS: see [`spawn`] — the ambient seam is the background executor.
+/// RTEMS: the callback pool, which needs no runtime — see the `tokio_backend`
+/// copy for why this one is not the reactor capability. Middle band: this is
+/// the ambient `spawn_blocking`, which no record reaches.
 #[cfg(exec_backend)]
 pub fn spawn_blocking<F, R>(f: F) -> TaskHandle<R>
 where
     F: FnOnce() -> R + Send + 'static,
     R: Send + 'static,
 {
-    spawn_blocking_background(f)
+    spawn_blocking_background(CallbackPriority::Medium, f)
 }
 
 /// A set of spawned tasks, joined as they complete — the seam replacement for
@@ -516,9 +720,8 @@ where
 /// with *"there is no reactor running"* on any thread that is not inside a
 /// tokio runtime — which on RTEMS is every callback-band worker. Measured on
 /// target: the CA client's transport manager died on `cbMedium` at its first
-/// connect (`doc/calink-rtems-design.md` §11.1). Naming it here means a call
-/// site can express "spawn a set of tasks and reap them as they finish"
-/// without reaching past the seam.
+/// connect. Naming it here means a call site can express "spawn a set of tasks
+/// and reap them as they finish" without reaching past the seam.
 ///
 /// The three properties call sites depend on, all preserved:
 ///
@@ -557,13 +760,13 @@ impl<T> TaskSet<T> {
 }
 
 impl<T: Send + 'static> TaskSet<T> {
-    /// Spawn `future` into the set — through [`spawn`], so the RTEMS build
-    /// lands it on a callback band instead of demanding a tokio runtime.
-    pub fn spawn<F>(&mut self, future: F)
+    /// Spawn `future` into the set — through [`Reactor::spawn`], so the set is
+    /// as reactor-bound as its members and says so in this signature.
+    pub fn spawn<F>(&mut self, reactor: &Reactor, future: F)
     where
         F: Future<Output = T> + Send + 'static,
     {
-        self.tasks.push(spawn(future));
+        self.tasks.push(reactor.spawn(future));
     }
 
     /// Wait for the next member to finish and return its result, removing it
@@ -607,12 +810,37 @@ impl<T> Drop for TaskSet<T> {
     }
 }
 
+/// The timer the *calling thread* can actually reach.
+///
+/// `tokio::time` reads a thread-local time driver and panics when there is
+/// none, but this process always has a second timer that needs no runtime at
+/// all: the delayed-callback timer [`sleep_background`] waits on (C
+/// `callbackRequestDelayed`). Which of the two to use is a property of the
+/// calling thread, not of the build, so it cannot be a `cfg`.
+///
+/// It is deliberately not "always the background timer". Under
+/// `#[tokio::test(start_paused = true)]` tokio's clock is virtual and only
+/// tokio's own timer advances with it, so a wall-clock sleep on a runtime
+/// thread would wait out a deadline the test means to skip. A thread with no
+/// runtime has no virtual clock to honour, so there the wall-clock timer is
+/// both the correct one and the only one — which is why this arms a timer
+/// where the seam used to panic instead.
 #[cfg(tokio_backend)]
-pub async fn sleep(duration: Duration) {
-    tokio::time::sleep(duration).await;
+async fn sleep_on_reachable_timer(duration: Duration) {
+    if tokio::runtime::Handle::try_current().is_ok() {
+        tokio::time::sleep(duration).await;
+    } else {
+        sleep_background(duration).await;
+    }
 }
 
-/// RTEMS: see [`spawn`] — the ambient seam is the background executor.
+#[cfg(tokio_backend)]
+pub async fn sleep(duration: Duration) {
+    sleep_on_reachable_timer(duration).await;
+}
+
+/// RTEMS: see [`Reactor::spawn`] — this backend's only executor is the
+/// background one.
 #[cfg(exec_backend)]
 pub async fn sleep(duration: Duration) {
     sleep_background(duration).await;
@@ -627,7 +855,7 @@ pub async fn sleep(duration: Duration) {
 /// — so a `std::time::Instant` deadline handed to a tokio timer is a deadline
 /// in a *different* timeline, and the wait is wrong by however far the two have
 /// diverged. The RTEMS timer runs on `std::time::Instant` (1-second-quantized
-/// on target, `doc/calink-rtems-design.md` §5.5).
+/// on target).
 ///
 /// Taking the alias rather than a concrete instant type is what keeps a caller
 /// from mixing them: `Instant::now() + timeout` is the deadline `sleep_until`
@@ -638,9 +866,37 @@ pub type Instant = tokio::time::Instant;
 #[cfg(exec_backend)]
 pub type Instant = std::time::Instant;
 
+/// `base + d` on the runtime's own [`Instant`], saturating where the bare
+/// `+` would panic — [`crate::runtime::time::deadline_after`]'s rule for
+/// the alias above.
+///
+/// The alias exists so a deadline cannot be built in the wrong timeline;
+/// this exists so it cannot be built by a panicking add. Any `Duration`
+/// that came from a `double` — a record field, an `EPICS_*` env var, a
+/// caller-supplied timeout — can be [`Duration::MAX`] by the rule in
+/// [`crate::runtime::time::duration_from_secs`], and `Instant + MAX`
+/// aborts the task rather than never firing. Both concrete `Instant`
+/// types offer `checked_add`, so one body covers both backends.
+pub fn deadline_after(base: Instant, d: Duration) -> Instant {
+    base.checked_add(d)
+        .unwrap_or_else(|| Instant::now() + crate::runtime::time::FAR_FUTURE)
+}
+
+/// `base` = now. See [`deadline_after`].
+pub fn deadline_from_now(d: Duration) -> Instant {
+    deadline_after(Instant::now(), d)
+}
+
 #[cfg(tokio_backend)]
 pub async fn sleep_until(deadline: Instant) {
-    tokio::time::sleep_until(deadline).await;
+    if tokio::runtime::Handle::try_current().is_ok() {
+        tokio::time::sleep_until(deadline).await;
+    } else {
+        // No runtime means no virtual clock, so `Instant::now()` here reads the
+        // same wall clock the background timer runs on and the subtraction
+        // loses nothing. See [`sleep_on_reachable_timer`].
+        sleep_on_reachable_timer(deadline.saturating_duration_since(Instant::now())).await;
+    }
 }
 
 /// RTEMS: sleep-until on the delayed-callback timer via the host-tested `Sleep`.
@@ -692,43 +948,79 @@ pub fn interval(period: Duration) -> Interval {
 }
 
 /// The timeout's error — "the deadline elapsed before the future completed".
-/// Hosted this is tokio's own type so `timeout` composes with tokio-aware
-/// callers; the exec backend substitutes a mirror (same Decision-B alias
-/// pattern as `TaskJoinError` — the consumed surface is Debug/Display only).
-#[cfg(tokio_backend)]
-pub use tokio::time::error::Elapsed;
-
-/// Exec-backend mirror of [`tokio::time::error::Elapsed`] (that type has no
-/// public constructor, so the runtime-free `timeout` below cannot return it).
-#[cfg(exec_backend)]
-#[derive(Debug)]
+///
+/// The seam's own type on **both** backends, where the hosted half used to
+/// re-export `tokio::time::error::Elapsed`. It has to be: [`timeout`] returns
+/// this error without arming a timer when the budget is already spent, and
+/// tokio's `Elapsed` has no public constructor (`pub(crate) fn new`), so an
+/// alias makes the expired branch unwritable. No call site in this workspace
+/// names the type — every one of the 81 discards or maps it — so the change is
+/// invisible above the seam.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Elapsed(());
 
-#[cfg(exec_backend)]
 impl std::fmt::Display for Elapsed {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "deadline has elapsed")
     }
 }
 
-#[cfg(exec_backend)]
 impl std::error::Error for Elapsed {}
+
+/// C's floor for "the remaining budget is worth blocking on":
+/// `CAC_SIGNIFICANT_DELAY`, 1 µs
+/// (`epics-base/modules/ca/src/client/iocinf.h:37`; the `1.0/CLOCKS_PER_SEC`
+/// spelling at `:35` is the other platform's arm of the same `#if`).
+pub const SIGNIFICANT_DELAY: Duration = Duration::from_micros(1);
+
+/// Poll `fut` once and give up — the shape C's `pendIO` has when the budget is
+/// already spent.
+///
+/// `ca_client_context::pendIO` (`ca_client_context.cpp:490-499`) tests the
+/// outstanding-work counter first and *then* compares `remaining <
+/// CAC_SIGNIFICANT_DELAY`, returning `ECA_TIMEOUT` before it ever blocks. So an
+/// expired budget in C decides on state alone; nothing races it. One poll of
+/// `fut` is that same "is the work already done" test, and the `Pending` arm is
+/// C's immediate `ECA_TIMEOUT`.
+async fn poll_once_then_expire<F: Future>(fut: F) -> Result<F::Output, Elapsed> {
+    let mut fut = std::pin::pin!(fut);
+    std::future::poll_fn(move |cx| {
+        Poll::Ready(match fut.as_mut().poll(cx) {
+            Poll::Ready(v) => Ok(v),
+            Poll::Pending => Err(Elapsed(())),
+        })
+    })
+    .await
+}
 
 /// Await `fut`, giving up after `duration` — the seam's only bounded wait.
 ///
 /// It belongs here rather than at the call sites for the same reason [`sleep`]
 /// does: a deadline needs a timer, and which timer that is depends on the
-/// backend. Call sites that reach for `tokio::time::timeout` directly pin
-/// themselves to the tokio timer wheel.
-#[cfg(tokio_backend)]
+/// backend and on the calling thread. Call sites that reach for
+/// `tokio::time::timeout` directly pin themselves to the tokio timer wheel,
+/// which exists on one backend and only inside a runtime.
+///
+/// A budget under [`SIGNIFICANT_DELAY`] never reaches a timer at all. It cannot:
+/// a timeout polls the inner future first and only then arms its sleep, and a
+/// zero-length sleep is not reported elapsed until the time driver next runs — so on a loaded machine the inner future wins a race that
+/// C does not have, and an already-expired `-w` returns success. Measured as
+/// `caget -w -1` exiting 0 where C exits 1
+/// (`tool_lib.c:628-638` via `ca_client_context.cpp:490-499`).
+///
+/// One body for both backends, raced against [`sleep`], because the backend was
+/// never the question a bounded wait had to ask. The hosted half called
+/// `tokio::time::timeout`, which panics on a thread with no runtime, so the
+/// seam had a deadline the exec backend honoured for every caller and the
+/// hosted one honoured only inside a runtime. Callers had no way to express
+/// that difference and did not try to: `asyn-rs`'s `PortHandle::await_reply`
+/// simply lost its `queue_timeout` on every plain-thread `submit_blocking`.
+/// [`sleep`] now picks a timer the calling thread can reach, so the race below
+/// fires wherever it is polled.
 pub async fn timeout<F: Future>(duration: Duration, fut: F) -> Result<F::Output, Elapsed> {
-    tokio::time::timeout(duration, fut).await
-}
-
-/// RTEMS/exec: the same bounded wait raced against the delayed-callback
-/// timer's [`sleep`] — no tokio timer wheel, no runtime.
-#[cfg(exec_backend)]
-pub async fn timeout<F: Future>(duration: Duration, fut: F) -> Result<F::Output, Elapsed> {
+    if duration < SIGNIFICANT_DELAY {
+        return poll_once_then_expire(fut).await;
+    }
     let mut sleep = std::pin::pin!(sleep(duration));
     let mut fut = std::pin::pin!(fut);
     std::future::poll_fn(move |cx| {
@@ -751,15 +1043,13 @@ pub async fn timeout<F: Future>(duration: Duration, fut: F) -> Result<F::Output,
 /// whole batch one deadline, so a slow first PV eats the budget the rest would
 /// otherwise each get in full. Expressing that with `timeout` would need the
 /// caller to do the subtraction, which is the arithmetic that drifts.
-#[cfg(tokio_backend)]
+///
+/// Raced against [`sleep_until`], the absolute-deadline twin of what
+/// [`timeout`] races against, and one body for the same reason.
 pub async fn timeout_at<F: Future>(deadline: Instant, fut: F) -> Result<F::Output, Elapsed> {
-    tokio::time::timeout_at(deadline, fut).await
-}
-
-/// RTEMS/exec: raced against [`sleep_until`], the absolute-deadline twin of
-/// what [`timeout`] races against.
-#[cfg(exec_backend)]
-pub async fn timeout_at<F: Future>(deadline: Instant, fut: F) -> Result<F::Output, Elapsed> {
+    if deadline.saturating_duration_since(Instant::now()) < SIGNIFICANT_DELAY {
+        return poll_once_then_expire(fut).await;
+    }
     let mut sleep = std::pin::pin!(sleep_until(deadline));
     let mut fut = std::pin::pin!(fut);
     std::future::poll_fn(move |cx| {
@@ -843,7 +1133,7 @@ impl ThreadPriority {
     /// `const` so a server can *derive* its band from the named one C derives
     /// it from — `CaServerLow - 2` rather than a bare `18` with a comment
     /// asserting the two are the same number. C builds exactly that ladder at
-    /// `caservertask.c:562-575`; restating its output as a literal is how the
+    /// `caservertask.c:563-575`; restating its output as a literal is how the
     /// ladder and its constants come to disagree.
     pub const fn value(self) -> u8 {
         let v = match self {
@@ -1084,8 +1374,8 @@ impl RtPolicy {
 /// callers running in environments without RT permission still get a
 /// running thread, just at the default policy, exactly as a C IOC does.
 ///
-/// Note: tokio tasks spawned via [`spawn`] share worker threads, so
-/// this is meaningful for [`spawn_blocking`] closures and for tuning
+/// Note: tokio tasks spawned via [`Reactor::spawn`] share worker threads, so
+/// this is meaningful for [`Reactor::spawn_blocking`] closures and for tuning
 /// the runtime's worker threads at startup — not for individual async
 /// tasks.
 ///
@@ -1156,7 +1446,30 @@ pub fn enter_ioc_thread(priority: ThreadPriority) -> PriorityApplied {
     name_current_thread();
     #[cfg(target_os = "vxworks")]
     epics_rtems_boot::stats::register_task();
-    apply_to_current_thread(priority)
+    let applied = apply_to_current_thread(priority);
+    thread_registry::register_current(priority, applied);
+    applied
+}
+
+/// Put the calling thread on the thread list as C's `_main_`.
+///
+/// C's `epicsThreadInit` runs `once()` under a `pthread_once`
+/// (`osdThread.c:406-412`): it builds a `threadInfo` for the first thread to
+/// touch the epicsThread API, names it `_main_`, gives it EPICS priority 0 and
+/// `ellAdd`s it to `pthreadList` — without touching that thread's scheduling.
+/// In a C IOC that thread is the one running `iocsh()`, which is why
+/// `epicsThreadShowAll` there always lists the shell's own thread.
+///
+/// [`enter_ioc_thread`] cannot stand in for this. It bands the thread to the
+/// priority it is handed, which C never does to `_main_`, and it takes the
+/// row's name from `std::thread::current().name()` — `None`, and so `noname`,
+/// for a shell started with a bare `std::thread::spawn`.
+///
+/// Idempotent for the reason C's guard is a `pthread_once`: a process has one
+/// `_main_`. The row leaves the list when the registering thread ends, which
+/// is where C's thread-specific-data destructor removes it.
+pub fn register_main_thread() {
+    thread_registry::register_main();
 }
 
 /// Push `std::thread::current().name()` down to the OS thread object.
@@ -1173,8 +1486,8 @@ pub fn name_current_thread() {}
 /// `_Thread_Set_name`, which `strlcpy`s into `_Thread_Maximum_name_size`.
 ///
 /// That size is `CONFIGURE_MAXIMUM_THREAD_NAME_SIZE`, default **16**
-/// including the NUL (`rtems/score/thread.h:1079`,
-/// `rtems/confdefs/threads.h:92-93`), and the boot shim does not override
+/// including the NUL (`rtems/score/thread.h:1079` (`rtems_6`),
+/// `rtems/confdefs/threads.h:92-93` (`rtems_6`)), and the boot shim does not override
 /// it — so 15 usable bytes, the same budget `std` truncates to on Linux
 /// (`TASK_COMM_LEN`). Truncating here rather than letting the kernel do it
 /// keeps that existing rule and keeps the call's success unambiguous:
@@ -1226,6 +1539,532 @@ fn truncate_thread_name(name: &str) -> &str {
     &name[..end]
 }
 
+/// The process's list of live EPICS threads — C's `pthreadList`
+/// (`os/posix/osdThread.c:94`).
+///
+/// C keeps a list because no OS gives a process a portable thread
+/// enumerator, and `epicsThreadShowAll` has to print one. Entries go on in
+/// `start_routine` (`:436-440`), executed by the new thread itself, and come
+/// off in `free_threadInfo` (`:232`), which is the thread-specific-data
+/// destructor `epicsThreadInit` registered — so a dead thread leaves the list
+/// at the moment it dies, not when somebody next reads it.
+///
+/// Both moments are the same here. [`enter_ioc_thread`] inserts, and the
+/// `Registration` it parks in thread-local storage removes on the way out.
+/// That makes the prologue the single owner of membership: a thread cannot be
+/// listed without having been named and banded, and cannot stay listed once
+/// its stack is gone. It also makes a second [`enter_ioc_thread`] on one
+/// thread — a re-band — replace that thread's row rather than add a second
+/// one, because storing the new `Registration` drops the old.
+///
+/// One row C has that this cannot: C's `_main_` (`osdThread.c:406-412`),
+/// added by `epicsThreadInit`'s `pthread_once` for whichever thread first
+/// called into `epicsThread`. This port has no process-init hook that runs on
+/// the main thread, so the main thread is listed only if it runs the prologue
+/// itself.
+/// C `epicsThreadOSD`'s `isSuspended` flag and its `suspendEvent`
+/// (`osdThread.c:179`, `:793-801`), as one cell instead of two.
+///
+/// A thread is suspended *exactly while* it is blocked in
+/// [`suspend_self`]. The bit the `STATE` column prints, the bit
+/// `epicsThreadResume` tests, and the condition the parked thread waits on
+/// are one `bool` under one mutex, so a `SUSPEND` row and a resume that
+/// refuses cannot disagree: there is no second flag to fall out of step.
+///
+/// One `Suspension` exists per thread, owned by that thread's
+/// thread-local; its registry row holds a clone of the same `Arc`, which
+/// is why reading a [`ThreadInfo`] out of a snapshot still sees the live
+/// state — as C's listing walk reads `pthreadInfo->isSuspended` live.
+#[derive(Debug, Default)]
+struct Suspension {
+    suspended: std::sync::Mutex<bool>,
+    cv: std::sync::Condvar,
+}
+
+impl Suspension {
+    /// A poisoned cell is still readable: a panic elsewhere must not make a
+    /// thread permanently unresumable, nor wedge the listing.
+    fn lock(&self) -> std::sync::MutexGuard<'_, bool> {
+        self.suspended.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// C `epicsThreadSuspendSelf` (`osdThread.c:785-795`): raise the flag,
+    /// then wait. C does the two under no lock and relies on its event
+    /// latching if a resume lands between them; holding the mutex across
+    /// both closes that window instead of depending on the latch.
+    fn suspend(&self) {
+        let mut suspended = self.lock();
+        *suspended = true;
+        while *suspended {
+            suspended = self.cv.wait(suspended).unwrap_or_else(|e| e.into_inner());
+        }
+    }
+
+    /// C `epicsThreadResume` (`osdThread.c:797-802`) with C's iocsh
+    /// `if (!epicsThreadIsSuspended(tid))` arm (`libComRegister.c:445-449`)
+    /// folded into it, so the test and the act cannot race apart.
+    ///
+    /// `false` means the thread was not suspended and nothing was done —
+    /// C's event would have latched a token there, and deliberately does
+    /// not here: a `dbc` issued while a lock set is running must not bank a
+    /// resume that skips the next breakpoint.
+    fn resume(&self) -> bool {
+        let mut suspended = self.lock();
+        if !*suspended {
+            return false;
+        }
+        *suspended = false;
+        self.cv.notify_all();
+        true
+    }
+
+    fn is_suspended(&self) -> bool {
+        *self.lock()
+    }
+}
+
+thread_local! {
+    /// The calling thread's cell, made on first use so a thread that never
+    /// registered can still park itself and be seen once it does.
+    static SUSPENSION: Arc<Suspension> = Arc::new(Suspension::default());
+}
+
+fn current_suspension() -> Arc<Suspension> {
+    SUSPENSION.with(Arc::clone)
+}
+
+/// C `epicsThreadSuspendSelf` (`osdThread.c:785-795`) — park the calling
+/// thread until something resumes it.
+///
+/// Only the calling thread can put itself here, which is C's rule and the
+/// reason the state has a single writer: `epicsThreadShowAll` reports what
+/// this call is doing, it does not learn it from a flag someone else set.
+pub fn suspend_self() {
+    // C `epicsThreadSuspendSelf` reaches `createImplicit` for a thread with no
+    // row (`osdThread.c:790-793`), so parking always leaves something for
+    // `epicsThreadShowAll` to mark `SUSPEND` and for `epicsThreadResume` to
+    // name. Without it a thread could be suspended and unreachable.
+    thread_registry::register_current_implicit();
+    current_suspension().suspend();
+}
+
+/// C `epicsThreadResume(id)` (`osdThread.c:797-802`) on a handle a
+/// subsystem stored for itself — `dbBkpt.c`'s `pnode->taskid`, resumed by
+/// `dbc`/`dbs` (`dbBkpt.c:518`, `:547`).
+///
+/// Matches the `EPICS ID` only, never the OS id that [`thread_by_id`] also
+/// accepts: this is a handle the port issued to itself, not a token a
+/// shell user typed, and the two number spaces can collide.
+///
+/// `false` means no such thread, or it was not suspended.
+pub fn resume_thread(id: u64) -> bool {
+    thread_report()
+        .into_iter()
+        .find(|t| t.id == id)
+        .is_some_and(|t| t.resume())
+}
+
+mod thread_registry {
+    use super::{PriorityApplied, ThreadPriority};
+    use std::sync::Mutex;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    /// Creation order, as C's `ellAdd` appends.
+    static THREADS: Mutex<Vec<super::ThreadInfo>> = Mutex::new(Vec::new());
+
+    /// C hands out the address of the thread's `epicsThreadOSD` as the
+    /// `EPICS ID`; a counter serves the same purpose — an opaque handle
+    /// `epicsThreadShow` can be given back — without publishing an address.
+    static NEXT_ID: AtomicU64 = AtomicU64::new(1);
+
+    /// Removes this thread's row when the thread ends. Held in thread-local
+    /// storage because that is the only destructor Rust runs at exactly the
+    /// point C's TSD destructor runs, and because [`super::enter_ioc_thread`]
+    /// returns [`PriorityApplied`] to callers that discard it — a guard
+    /// handed back there would be dropped immediately.
+    struct Registration(u64);
+
+    impl Drop for Registration {
+        fn drop(&mut self) {
+            let id = self.0;
+            lock().retain(|t| t.id != id);
+        }
+    }
+
+    thread_local! {
+        static REGISTRATION: std::cell::RefCell<Option<Registration>> =
+            const { std::cell::RefCell::new(None) };
+    }
+
+    /// A poisoned list is still a readable list: a panic while formatting one
+    /// row must not make the IOC's thread listing permanently unavailable.
+    fn lock() -> std::sync::MutexGuard<'static, Vec<super::ThreadInfo>> {
+        THREADS.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Add the calling thread. Called only from [`super::enter_ioc_thread`].
+    pub(super) fn register_current(priority: ThreadPriority, applied: PriorityApplied) {
+        push(
+            std::thread::current()
+                .name()
+                .unwrap_or("noname")
+                .to_string(),
+            priority,
+            applied,
+        );
+    }
+
+    /// C's `once()` row (`osdThread.c:406-412`): `_main_`, EPICS priority 0,
+    /// on the list without a scheduling change. Guarded like C's
+    /// `pthread_once` because a process has one `_main_`.
+    pub(super) fn register_main() {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(|| {
+            push(
+                "_main_".to_string(),
+                ThreadPriority::Custom(0),
+                PriorityApplied::Disabled,
+            );
+        });
+    }
+
+    /// The one place a row is built, so which entry point made a row cannot
+    /// change the row's shape or how it is reaped.
+    fn push(name: String, priority: ThreadPriority, applied: PriorityApplied) {
+        let info = super::ThreadInfo {
+            id: NEXT_ID.fetch_add(1, Ordering::Relaxed),
+            name,
+            os_id: os_thread_id(),
+            priority,
+            applied,
+            // The same cell the thread's own `suspend_self` blocks on, so
+            // the row cannot report a state the thread is not in.
+            suspension: super::current_suspension(),
+        };
+        let id = info.id;
+        lock().push(info);
+        // Drop the previous guard outside the `RefCell` borrow: its `Drop`
+        // takes the list lock, and a re-band would otherwise re-enter the
+        // borrow through a path that is easy to add later and hard to see.
+        let previous = REGISTRATION.with(|r| r.borrow_mut().replace(Registration(id)));
+        drop(previous);
+    }
+
+    /// The calling thread's row id, from the guard the prologue parked in
+    /// thread-local storage — no list walk, and no dependence on the row
+    /// still being there.
+    pub(super) fn current_id() -> Option<u64> {
+        REGISTRATION.with(|r| r.borrow().as_ref().map(|reg| reg.0))
+    }
+
+    /// C `createImplicit` (`osdThread.c:697-735`): the row a thread that never
+    /// went through `epicsThreadCreate` gets the first time libCom needs one
+    /// for it. C makes one rather than answering NULL in both
+    /// `epicsThreadGetIdSelf` (`:942`) and `epicsThreadSuspendSelf` (`:792`),
+    /// which is why a thread can park itself and still be listed and resumed.
+    ///
+    /// C names it `non-EPICS_%ld` of the `pthread_t` and gives it EPICS
+    /// priority 0 without touching its scheduling. The number here is the
+    /// row's own OS id — the one its `LWP ID`/`PTHREAD ID` column prints — so
+    /// the name and the column agree, which on Linux C's do not.
+    pub(super) fn register_current_implicit() {
+        if REGISTRATION.with(|r| r.borrow().is_some()) {
+            return;
+        }
+        push(
+            format!("non-EPICS_{}", os_thread_id()),
+            ThreadPriority::Custom(0),
+            PriorityApplied::Disabled,
+        );
+    }
+
+    /// A snapshot of the list, in creation order.
+    ///
+    /// A copy rather than a borrow because C walks the live list under
+    /// `listLock` while calling `epicsThreadShowInfo`, which does I/O; taking
+    /// the rows out first keeps the lock off the write path of whatever
+    /// stream the shell is printing to.
+    pub(super) fn snapshot() -> Vec<super::ThreadInfo> {
+        lock().clone()
+    }
+
+    /// Linux prints `LWP ID` because that is the number `top`, `ps -L` and
+    /// `/proc` show; every other target prints the `pthread_t`, which is all
+    /// POSIX defines. C makes the same split, in two `osdThreadExtra.c`
+    /// files.
+    #[cfg(target_os = "linux")]
+    fn os_thread_id() -> u64 {
+        // SAFETY: `gettid` takes no arguments and cannot fail.
+        unsafe { libc::syscall(libc::SYS_gettid) as u64 }
+    }
+
+    #[cfg(target_os = "rtems")]
+    fn os_thread_id() -> u64 {
+        // SAFETY: `pthread_self` takes no arguments and cannot fail.
+        unsafe { super::rtems_sched::pthread_self() as u64 }
+    }
+
+    #[cfg(all(unix, not(any(target_os = "linux", target_os = "rtems"))))]
+    fn os_thread_id() -> u64 {
+        // SAFETY: `pthread_self` takes no arguments and cannot fail.
+        unsafe { libc::pthread_self() as u64 }
+    }
+
+    #[cfg(not(unix))]
+    fn os_thread_id() -> u64 {
+        0
+    }
+}
+
+/// One row of [`thread_report`] — what C's `epicsThreadShowInfo` prints about
+/// one thread (`os/Linux/osdThreadExtra.c:31-55`).
+#[derive(Clone, Debug)]
+pub struct ThreadInfo {
+    id: u64,
+    name: String,
+    os_id: u64,
+    priority: ThreadPriority,
+    applied: PriorityApplied,
+    suspension: Arc<Suspension>,
+}
+
+impl ThreadInfo {
+    /// The `EPICS ID` column, and the handle `epicsThreadShow <id>` accepts.
+    pub fn id(&self) -> u64 {
+        self.id
+    }
+
+    /// The `NAME` column: `std::thread::current().name()`, or `noname` for a
+    /// thread spawned without one — C's own placeholder for the same case
+    /// (`osdThread.c:601`).
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    /// The `LWP ID` column on Linux, `PTHREAD ID` elsewhere.
+    pub fn os_id(&self) -> u64 {
+        self.os_id
+    }
+
+    /// The `OSIPRI` column: the EPICS priority, 0..=99.
+    pub fn epics_priority(&self) -> u8 {
+        self.priority.value()
+    }
+
+    /// The `OSSPRI` column: the OS scheduling priority the thread runs at.
+    ///
+    /// C reads this live with `pthread_getschedparam` (`osdThreadExtra.c:39`).
+    /// This recomputes it from the outcome the prologue recorded, through the
+    /// same map that produced it, which is the same number: nothing in this
+    /// workspace re-bands a thread after the prologue
+    /// (`only_the_prologue_reaches_the_banding_call`), and the map's other
+    /// input — the probed range — is fixed for the life of the process.
+    ///
+    /// Any outcome but [`PriorityApplied::Realtime`] left the thread on the
+    /// default policy, whose `sched_priority` is 0 by POSIX. That is what C's
+    /// live read returns for those threads too, and what a non-privileged
+    /// Linux IOC shows in this column for every row.
+    pub fn os_priority(&self) -> i32 {
+        if self.applied != PriorityApplied::Realtime {
+            return 0;
+        }
+        self.mapped_os_priority()
+    }
+
+    #[cfg(target_os = "linux")]
+    fn mapped_os_priority(&self) -> i32 {
+        match permitted_fifo_range() {
+            RtRange::Available { min, max } => map_epics_priority(self.priority.value(), min, max),
+            // Not reachable while the recorded outcome is `Realtime`: the
+            // other two range states return before the map.
+            RtRange::Unsupported | RtRange::Denied => 0,
+        }
+    }
+
+    #[cfg(target_os = "rtems")]
+    fn mapped_os_priority(&self) -> i32 {
+        map_epics_priority_rtems(self.priority.value())
+    }
+
+    #[cfg(target_os = "vxworks")]
+    fn mapped_os_priority(&self) -> i32 {
+        map_epics_priority_vxworks(self.priority.value())
+    }
+
+    #[cfg(not(any(target_os = "linux", epics_embedded_target)))]
+    fn mapped_os_priority(&self) -> i32 {
+        // No band is applied on these targets, so `Realtime` never occurs.
+        0
+    }
+
+    /// C `epicsThreadIsSuspended` (`osdThread.c:910-914`) — the `STATE`
+    /// column's source, and what C's iocsh `epicsThreadResume` tests before
+    /// it acts (`libComRegister.c:445`).
+    pub fn is_suspended(&self) -> bool {
+        self.suspension.is_suspended()
+    }
+
+    /// C `epicsThreadResume` (`osdThread.c:797-802`) on this thread.
+    ///
+    /// `false` means it was not suspended, which is the arm C's iocsh
+    /// wrapper reports as `Thread %s is not suspended`
+    /// (`libComRegister.c:445-449`).
+    pub fn resume(&self) -> bool {
+        self.suspension.resume()
+    }
+
+    /// The row `epicsThreadShowInfo` prints, without its newline.
+    ///
+    /// `%16.16s %14p %8lu    %3d%8d %8.8s%s` on Linux, `%12lu` for the OS id
+    /// elsewhere. The trailing `%s` is C's ` ZOMBIE` marker, for a thread
+    /// whose function has returned but whose `epicsThreadOSD` is still
+    /// referenced; it is always empty here because the row and the thread end
+    /// together.
+    ///
+    /// The `%8.8s` state column is C's `isSuspended ? "SUSPEND" : "OK"`
+    /// (`os/Linux/osdThreadExtra.c:48-52`), read live from the cell the
+    /// thread's own [`suspend_self`] blocks on.
+    pub fn show_line(&self) -> String {
+        format!(
+            "{:>16.16} {:>14} {:>os_id_width$}    {:3}{:8} {:>8.8}",
+            self.name,
+            format!("{:#x}", self.id),
+            self.os_id,
+            self.epics_priority(),
+            self.os_priority(),
+            if self.is_suspended() { "SUSPEND" } else { "OK" },
+            os_id_width = OS_ID_WIDTH,
+        )
+    }
+}
+
+/// The header `epicsThreadShowInfo(0, level)` prints
+/// (`os/Linux/osdThreadExtra.c:34-35`).
+#[cfg(target_os = "linux")]
+pub const THREAD_SHOW_HEADER: &str =
+    "            NAME       EPICS ID   LWP ID   OSIPRI  OSSPRI  STATE";
+
+/// `os/posix/osdThreadExtra.c:27-28` — the generic POSIX header, which names
+/// and widens the OS id column differently.
+#[cfg(not(target_os = "linux"))]
+pub const THREAD_SHOW_HEADER: &str =
+    "            NAME       EPICS ID   PTHREAD ID   OSIPRI  OSSPRI  STATE";
+
+/// Field width of the OS id column, matching the header above.
+#[cfg(target_os = "linux")]
+const OS_ID_WIDTH: usize = 8;
+
+#[cfg(not(target_os = "linux"))]
+const OS_ID_WIDTH: usize = 12;
+
+/// Every live EPICS thread, in creation order — C's `epicsThreadMap` /
+/// `ellFirst(&pthreadList)` walk (`osdThread.c:1000-1004`).
+pub fn thread_report() -> Vec<ThreadInfo> {
+    thread_registry::snapshot()
+}
+
+/// The calling thread's `EPICS ID` — C `epicsThreadGetIdSelf`
+/// (`osdThread.c:936-945`).
+///
+/// A thread that never ran the prologue is given a row here, as C's own
+/// `createImplicit` does at `:942`, so this cannot answer "no id": a thread
+/// that can be asked for its handle is a thread the listing can show and
+/// `epicsThreadResume` can name.
+///
+/// This is the id a subsystem stores when C stores an `epicsThreadId` of its
+/// own — `dbBkpt.c`'s `pnode->taskid`, printed by `dbstat` as `T:` — so the
+/// handle in that column and the `EPICS ID` column of `epicsThreadShowAll` are
+/// one value rather than two namings of one thread.
+pub fn current_thread_id() -> u64 {
+    thread_registry::register_current_implicit();
+    thread_registry::current_id().expect("register_current_implicit installed a row")
+}
+
+/// The thread whose `EPICS ID` or OS id is `id` — C's match in
+/// `epicsThreadShow` (`osdThread.c:1051-1053`).
+///
+/// C compares against the `epicsThreadOSD *` and the `pthread_t`. The second
+/// is deliberately the *printed* OS id here instead: on Linux C prints
+/// `lwpId` and matches `tid`, so the number on screen is not one C accepts —
+/// a shell user can only ever act on what the listing showed them.
+pub fn thread_by_id(id: u64) -> Option<ThreadInfo> {
+    thread_report()
+        .into_iter()
+        .find(|t| t.id == id || t.os_id == id)
+}
+
+/// The first live thread named `name` — C's `epicsThreadGetId`
+/// (`osdThread.c:1039-1060`), which `epicsThreadShow`'s iocsh wrapper falls
+/// back to when the argument does not parse as a number.
+pub fn thread_by_name(name: &str) -> Option<ThreadInfo> {
+    thread_report().into_iter().find(|t| t.name == name)
+}
+
+/// C's `epicsThreadShowAll` trailer, printed to stderr
+/// (`osdThread.c:1027-1031`).
+///
+/// The range is the one this process may actually enter, not the policy's
+/// nominal range — the distinction `find_pri_range` exists for. With the
+/// real-time switch off there is no range to report and no probe may be run
+/// to find one (that probe is itself a scheduler call, and the switch's
+/// guarantee is that none happens); `0 0` is then the literal truth, the
+/// SCHED_OTHER priority every thread in the process holds.
+///
+/// Memory is never locked: nothing in this workspace calls `mlockall`, so
+/// C's `epicsThreadRealtimeLock` has no counterpart to report.
+pub fn osd_priority_range_line() -> String {
+    let (min, max) = osd_priority_range();
+    format!("OSD priority range min: {min} max {max}, memory not locked")
+}
+
+#[cfg(target_os = "linux")]
+fn osd_priority_range() -> (i32, i32) {
+    match RtPolicy::current() {
+        RtPolicy::Disabled => (0, 0),
+        RtPolicy::AllowRealtime => match permitted_fifo_range() {
+            RtRange::Available { min, max } => (min, max),
+            // C's `find_pri_range` reports the failed probe the same way:
+            // `min_pri = max_pri = min` when the policy is refused, `-1` when
+            // the kernel has no range at all (`osdThread.c:275-289`).
+            RtRange::Denied => {
+                // SAFETY: `sched_get_priority_min` takes only a policy
+                // constant and has no preconditions.
+                let min = unsafe { libc::sched_get_priority_min(libc::SCHED_FIFO) };
+                (min, min)
+            }
+            RtRange::Unsupported => (-1, -1),
+        },
+    }
+}
+
+#[cfg(target_os = "rtems")]
+fn osd_priority_range() -> (i32, i32) {
+    match RtPolicy::current() {
+        RtPolicy::Disabled => (0, 0),
+        // No probe on this target, by construction: the map's image is fixed
+        // and inside the settable range. Report that image.
+        RtPolicy::AllowRealtime => (map_epics_priority_rtems(0), map_epics_priority_rtems(99)),
+    }
+}
+
+#[cfg(target_os = "vxworks")]
+fn osd_priority_range() -> (i32, i32) {
+    match RtPolicy::current() {
+        RtPolicy::Disabled => (0, 0),
+        RtPolicy::AllowRealtime => (
+            map_epics_priority_vxworks(0),
+            map_epics_priority_vxworks(99),
+        ),
+    }
+}
+
+#[cfg(not(any(target_os = "linux", epics_embedded_target)))]
+fn osd_priority_range() -> (i32, i32) {
+    // No OS-scheduler priority API is wired here, so there is no band and no
+    // range — the same `Unsupported` this target reports from `apply`.
+    (0, 0)
+}
+
 /// The SCHED_FIFO priority range this process may actually enter.
 ///
 /// C parity: `find_pri_range` (`osdThread.c:259-314`). The kernel's
@@ -1240,7 +2079,7 @@ enum RtRange {
     Unsupported,
     /// The range exists but this process may not enter it — no
     /// `CAP_SYS_NICE` and `RLIMIT_RTPRIO` is 0. C's equivalent is
-    /// `usePolicy == 0` (`osdThread.c:279-285`, `:331`), which makes it
+    /// `usePolicy == 0` (`osdThread.c:279-285`, `:334`), which makes it
     /// stop asking for SCHED_FIFO for the life of the process.
     Denied,
     /// Priorities `min..=max` are settable.
@@ -1646,7 +2485,7 @@ fn apply_priority_impl(epics_priority: u8) -> PriorityApplied {
 #[cfg(target_os = "rtems")]
 fn apply_priority_impl(epics_priority: u8) -> PriorityApplied {
     // Without this, every IOC thread runs at one level just above idle:
-    // `cpukit/posix/src/pthreadattrdefault.c:49-58` sets
+    // `cpukit/posix/src/pthreadattrdefault.c:49-58` (both `rtems` pins) sets
     // `inheritsched = PTHREAD_INHERIT_SCHED` in the default attribute set and
     // `std` never calls `pthread_attr_setinheritsched`, so a thread inherits
     // its creator's parameters — and every IOC thread descends from
@@ -1754,7 +2593,7 @@ static DENIED_WARNINGS: std::sync::atomic::AtomicUsize = std::sync::atomic::Atom
 /// The priority application is best effort (see
 /// [`apply_to_current_thread`]); `f` runs regardless of whether the OS
 /// honoured the request. This is the priority-aware counterpart of
-/// [`spawn_blocking`] for IOC threads (CA server, scan) that a C IOC
+/// [`Reactor::spawn_blocking`] for IOC threads (CA server, scan) that a C IOC
 /// would run in a distinct SCHED band.
 #[cfg(tokio_backend)]
 pub fn spawn_blocking_with_priority<F, R>(priority: ThreadPriority, f: F) -> TaskHandle<R>
@@ -1981,7 +2820,7 @@ where
 /// process went on answering CA with zero periodic scanning — a half-IOC whose
 /// records simply never process.
 ///
-/// C has no such state. `spawnPeriodic` (`dbScan.c:943-959`) calls
+/// C has no such state. `spawnPeriodic` (`dbScan.c:939-955`) calls
 /// `epicsThreadCreateOpt` and then `epicsEventWait(startStopEvent)`; the event
 /// is posted by `periodicTask` itself, so when the thread was never created
 /// nobody posts it and `iocInit` wedges. C never reaches "serving".
@@ -2067,7 +2906,7 @@ fn mandatory_thread_failure_message(name: &str, err: &std::io::Error) -> String 
         "FATAL: the IOC could not create its mandatory `{name}` thread: {err}. \
          Continuing would leave this IOC answering clients while the work that \
          thread owns never runs, so the process is aborting instead \
-         (C dbScan.c:943-959 wedges iocInit for the same reason)."
+         (C dbScan.c:939-955 wedges iocInit for the same reason)."
     )
 }
 
@@ -2090,40 +2929,68 @@ fn mandatory_thread_unavailable(name: &str, err: &std::io::Error) -> ! {
 mod tests {
     use super::*;
 
-    /// Everything before the first column-0 `#[cfg(test)]` — the code that
-    /// actually ships.
-    fn production_scope(src: &str) -> &str {
-        match src.find("\n#[cfg(test)]") {
-            Some(i) => &src[..i],
-            None => src,
-        }
+    /// The workspace's one production-slice rule, under this file's old name.
+    ///
+    /// `Keep` because the guards below strip comments themselves. What they
+    /// gain from the shared rule is the two properties the truncating one did
+    /// not hold: the seven `#[cfg(any(target_os = "rtems", test))]` items here
+    /// ship on RTEMS and stay in the slice, and the line numbers two of these
+    /// guards report still name lines of the file a reader will open.
+    fn production_scope(src: &'static str) -> &'static str {
+        source_guard::production(src, source_guard::Comments::Keep)
     }
 
-    /// Every file in this crate that creates an OS thread, as (label, source).
+    /// Every source in this crate, labelled the way the messages below name
+    /// files.
     ///
-    /// This crate's files only. `epics-base-rs`'s two thread-creating files
-    /// (`server/ioc_app.rs`, `server/scan.rs`) are swept by the same assertions
-    /// in that crate's own `tests/thread_census.rs`: `include_str!` must not
-    /// cross a crate boundary — a path outside the package directory does not
-    /// survive `cargo publish` — so the guard was split by subject, not
-    /// weakened.
-    fn censused_files() -> [(&'static str, &'static str); 5] {
-        [
-            ("runtime/task.rs", include_str!("task.rs")),
-            (
-                "runtime/background/delayed_timer.rs",
-                include_str!("background/delayed_timer.rs"),
-            ),
-            (
-                "runtime/background/scan_once.rs",
-                include_str!("background/scan_once.rs"),
-            ),
-            (
-                "runtime/background/callback_executor.rs",
-                include_str!("background/callback_executor.rs"),
-            ),
-            ("runtime/worker_pool.rs", include_str!("worker_pool.rs")),
-        ]
+    /// Read from the crate directory rather than listed. The list was written
+    /// out three times here and two copies had drifted: both
+    /// `every_thread_in_this_crate_publishes_its_name` and
+    /// `only_the_prologue_reaches_the_banding_call` named four files and
+    /// omitted `runtime/worker_pool.rs`, which spawns a named, banded,
+    /// stack-classed thread — so neither guard had ever looked at it, while
+    /// the stack-size guard had. A duplicated covered set is not a covered
+    /// set; it is three answers to one question.
+    ///
+    /// Rooted at `src`, not at `src/runtime`, because the claim these guards
+    /// make is about this crate. `epics-base-rs`'s two thread-creating files
+    /// (`server/ioc_app.rs`, `server/scan.rs`) are swept by the same
+    /// assertions in that crate's own `tests/thread_census.rs`:
+    /// `include_str!` must not cross a crate boundary — a path outside the
+    /// package directory does not survive `cargo publish` — so the guard is
+    /// split by subject, not weakened.
+    fn crate_sources() -> Vec<(String, &'static str)> {
+        let files = source_guard::sweep(source_guard::module_dir!("src"), &[]);
+        assert!(
+            files.iter().any(|(label, _)| *label == "runtime/task.rs"),
+            "the crate sweep did not find runtime/task.rs, so it is reading \
+             the wrong directory and every guard below would pass vacuously"
+        );
+        files.into_iter().map(|(l, s)| (l.to_string(), s)).collect()
+    }
+
+    /// The subset that creates an OS thread.
+    ///
+    /// Derived from the source rather than declared, so a file joins the
+    /// census the day it spawns — which is the one property a hand-written
+    /// list cannot have. `Strip` so that prose naming a thread API does not
+    /// enrol a file that creates no thread.
+    fn censused_files() -> Vec<(String, &'static str)> {
+        let bare = concat!("thread", "::spawn(");
+        let files: Vec<(String, &'static str)> = crate_sources()
+            .into_iter()
+            .filter(|(_, src)| {
+                let code = source_guard::production(src, source_guard::Comments::Strip);
+                code.contains("thread::Builder::new()") || code.contains(bare)
+            })
+            .collect();
+        assert!(
+            files.len() >= 2,
+            "expected at least `runtime/task.rs` and `runtime/worker_pool.rs` \
+             to create threads, found {files:?} — the derivation broke, and \
+             every guard over it would pass vacuously"
+        );
+        files
     }
 
     /// Every thread this crate creates states a stack size.
@@ -2217,10 +3084,12 @@ mod tests {
         let bare = concat!("thread", "::spawn(");
         let mut strays = Vec::new();
         let mut owned = 0usize;
-        for (label, src) in censused_files() {
-            if !label.contains("/background/") {
-                continue;
-            }
+        // The background module, swept whole. Not `censused_files()`: these
+        // files hold no `Builder` of their own precisely because they went
+        // through `MandatoryThread`, so deriving their set from thread
+        // creation would empty it and pass.
+        let files = source_guard::sweep(source_guard::module_dir!("src/runtime/background"), &[]);
+        for (label, src) in files {
             for (n, line) in production_scope(src).lines().enumerate() {
                 let t = line.trim_start();
                 if t.starts_with("//") {
@@ -2246,13 +3115,14 @@ mod tests {
         assert!(
             owned >= 3,
             "expected the callback pool, `cbTimer` and `scanOnce`, found {owned} \
-             `MandatoryThread` sites — did a file move? update the census list"
+             `MandatoryThread` sites — a facility moved out of this module"
         );
     }
 
     #[epics_macros_rs::epics_test]
     async fn test_spawn() {
-        let handle = spawn(async { 42 });
+        let reactor = Reactor::current().expect("the test driver enters an executor");
+        let handle = reactor.spawn(async { 42 });
         assert_eq!(handle.await.unwrap(), 42);
     }
 
@@ -2276,7 +3146,9 @@ mod tests {
             StackSizeClass::Small,
             move || {
                 let outcome = block_on_sync(async {
-                    let inner = spawn(async { 7u32 }).await.expect("inner task");
+                    let reactor = Reactor::current()
+                        .expect("the dedicated thread carries the ambient runtime");
+                    let inner = reactor.spawn(async { 7u32 }).await.expect("inner task");
                     sleep(Duration::from_millis(1)).await;
                     inner
                 });
@@ -2373,7 +3245,7 @@ mod tests {
         joined.join().expect("dedicated thread joined");
     }
 
-    // --- The band-blocking invariant (doc/pvalink-rtems-design.md §2.3) ------
+    // --- The band-blocking invariant -----------------------------------------
     //
     // MUST NOT: work running on a background-facility worker thread — a
     // callback band, the delayed timer, the scanOnce worker — block that
@@ -2387,7 +3259,8 @@ mod tests {
     // the assertion runs and the pool's `Drop` can still join it.
 
     /// The case the invariant exists for: a future spawned onto a callback
-    /// band. On RTEMS this is exactly what [`spawn`] produces, and the band has
+    /// band. On RTEMS this is exactly what [`Reactor::spawn`] produces, and the
+    /// band has
     /// one worker — parking it stops every deferred callback, every FLNK tail
     /// and every other monitor on that band.
     #[test]
@@ -2498,6 +3371,75 @@ mod tests {
     async fn timeout_elapses_on_a_future_that_never_finishes() {
         let r = timeout(Duration::from_millis(10), std::future::pending::<()>()).await;
         assert!(r.is_err());
+    }
+
+    // The boundary the two tests above cannot reach, because
+    // `#[epics_test]` always gives them a driver: a thread with no runtime
+    // at all. `tokio::time` panics there, so the hosted half of this seam
+    // used to as well, and every caller that could not prove a runtime
+    // simply stopped passing a deadline — see `asyn-rs`'s
+    // `PortHandle::await_reply`. `park_on` is the driver a blocking bridge
+    // really uses, and the background timer thread is what wakes it.
+    #[test]
+    fn a_bounded_wait_fires_on_a_thread_with_no_runtime() {
+        assert!(
+            tokio::runtime::Handle::try_current().is_err(),
+            "the premise of this test"
+        );
+        let started = std::time::Instant::now();
+        let r = park_on(timeout(
+            Duration::from_millis(30),
+            std::future::pending::<()>(),
+        ));
+        assert!(r.is_err(), "the deadline is the only thing that can end it");
+        let waited = started.elapsed();
+        assert!(
+            waited >= Duration::from_millis(30) && waited < Duration::from_secs(2),
+            "woke at its own deadline (waited {waited:?})"
+        );
+    }
+
+    #[test]
+    fn a_deadline_wait_fires_on_a_thread_with_no_runtime() {
+        let started = std::time::Instant::now();
+        let r = park_on(timeout_at(
+            deadline_from_now(Duration::from_millis(30)),
+            std::future::pending::<()>(),
+        ));
+        assert!(r.is_err());
+        let waited = started.elapsed();
+        assert!(
+            waited >= Duration::from_millis(30) && waited < Duration::from_secs(2),
+            "woke at its own deadline (waited {waited:?})"
+        );
+    }
+
+    #[test]
+    fn a_sleep_on_a_thread_with_no_runtime_returns() {
+        let started = std::time::Instant::now();
+        park_on(sleep(Duration::from_millis(10)));
+        assert!(started.elapsed() >= Duration::from_millis(10));
+    }
+
+    /// The other half of the same boundary: a runtime thread must still take
+    /// tokio's timer, because that is the only one that moves with tokio's
+    /// clock — which `#[tokio::test(start_paused = true)]` makes virtual. The
+    /// discriminator is the background executor's `OnceLock`: it is untouched
+    /// unless something reached for the wall-clock timer. Relies on nextest's
+    /// process-per-test isolation for the "untouched" half.
+    #[cfg(tokio_backend)]
+    #[tokio::test]
+    async fn a_bounded_wait_on_a_runtime_thread_keeps_the_runtime_s_timer() {
+        assert!(
+            BACKGROUND.get().is_none(),
+            "the premise: nothing has started the background facility yet"
+        );
+        let r = timeout(Duration::from_millis(10), std::future::pending::<()>()).await;
+        assert!(r.is_err());
+        assert!(
+            BACKGROUND.get().is_none(),
+            "a runtime thread armed tokio's timer, not the background one"
+        );
     }
 
     #[test]
@@ -3026,7 +3968,7 @@ mod tests {
 
     /// The name budget an RTEMS thread object actually has:
     /// `CONFIGURE_MAXIMUM_THREAD_NAME_SIZE` defaults to 16 *including* the
-    /// NUL (`rtems/score/thread.h:1079`, `rtems/confdefs/threads.h:92-93`)
+    /// NUL (`rtems/score/thread.h:1079` (`rtems_6`), `rtems/confdefs/threads.h:92-93` (`rtems_6`))
     /// and the boot shim does not override it, so 15 bytes — the same budget
     /// `std` truncates to on Linux.
     ///
@@ -3074,22 +4016,6 @@ mod tests {
     /// `name_current_thread` for one that deliberately has none.
     #[test]
     fn every_thread_in_this_crate_publishes_its_name() {
-        // This crate's files only — see the note on the sweep above.
-        let files = [
-            ("runtime/task.rs", include_str!("task.rs")),
-            (
-                "runtime/background/delayed_timer.rs",
-                include_str!("background/delayed_timer.rs"),
-            ),
-            (
-                "runtime/background/scan_once.rs",
-                include_str!("background/scan_once.rs"),
-            ),
-            (
-                "runtime/background/callback_executor.rs",
-                include_str!("background/callback_executor.rs"),
-            ),
-        ];
         // The one exemption, named rather than pattern-matched: the
         // SCHED_FIFO range probe is `#[cfg(target_os = "linux")]`, exists for
         // two `sched_*` calls and a join, and never runs on the target whose
@@ -3098,7 +4024,7 @@ mod tests {
 
         let mut anonymous = Vec::new();
         let mut checked = 0usize;
-        for (label, src) in files {
+        for (label, src) in censused_files() {
             for (n, after) in production_scope(src)
                 .split("thread::Builder::new()")
                 .skip(1)
@@ -3143,30 +4069,17 @@ mod tests {
     /// somewhere else in the file.
     #[test]
     fn only_the_prologue_reaches_the_banding_call() {
-        // This crate's files only — see the note on the sweep above.
-        let files = [
-            ("runtime/task.rs", include_str!("task.rs")),
-            (
-                "runtime/background/delayed_timer.rs",
-                include_str!("background/delayed_timer.rs"),
-            ),
-            (
-                "runtime/background/scan_once.rs",
-                include_str!("background/scan_once.rs"),
-            ),
-            (
-                "runtime/background/callback_executor.rs",
-                include_str!("background/callback_executor.rs"),
-            ),
-        ];
         // Only the definition and the prologue's own delegation, both in
         // task.rs. Anywhere else is a thread banded without being named.
         let allowed = [
             "pub fn apply_to_current_thread(priority: ThreadPriority) -> PriorityApplied {",
-            "apply_to_current_thread(priority)",
+            "let applied = apply_to_current_thread(priority);",
         ];
         let mut seen_definition = false;
-        for (label, src) in files {
+        // Every file in the crate, not the thread-creating ones: a call that
+        // bands a thread is a defect wherever it is written, and this guard's
+        // subject is the absence of such a call.
+        for (label, src) in crate_sources() {
             let callers: Vec<&str> = production_scope(src)
                 .lines()
                 .map(str::trim)
@@ -3218,6 +4131,371 @@ mod tests {
             "VxWorks gives an RTP no task enumerator, so `dump_tasks` and \
              `stack_report` list exactly what announced itself here"
         );
+        assert!(
+            body.contains("thread_registry::register_current(priority, applied);"),
+            "`epicsThreadShowAll` prints exactly what the prologue registered; \
+             a registration outside the prologue is a thread that can start \
+             without one"
+        );
+    }
+
+    /// The list holds a thread for exactly as long as the thread exists: C's
+    /// `ellAdd` in `start_routine` and `ellDelete` in the thread-specific-data
+    /// destructor. A row that outlived its thread would be a `epicsThreadShow`
+    /// listing of stacks that are gone.
+    #[test]
+    fn a_row_lasts_exactly_as_long_as_its_thread() {
+        let name = "cbRegLife";
+        assert!(thread_by_name(name).is_none(), "name must start unused");
+
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (finish_tx, finish_rx) = std::sync::mpsc::channel();
+        let join = std::thread::Builder::new()
+            .name(name.to_string())
+            .spawn(move || {
+                let _ = enter_ioc_thread(ThreadPriority::ScanLow);
+                started_tx.send(()).unwrap();
+                finish_rx.recv().unwrap();
+            })
+            .unwrap();
+
+        started_rx.recv().unwrap();
+        let listed = thread_by_name(name).expect("listed while running");
+        assert_eq!(listed.epics_priority(), ThreadPriority::ScanLow.value());
+        assert_eq!(listed.name(), name);
+        assert_ne!(listed.id(), 0, "every row carries a usable EPICS ID");
+
+        finish_tx.send(()).unwrap();
+        join.join().unwrap();
+        assert!(
+            thread_by_name(name).is_none(),
+            "the row must be reaped with the thread, not left for the next reader"
+        );
+    }
+
+    /// C's `once()` row, all four of its boundaries in one test because they
+    /// share one process-wide guard: `pthread_once` fires for the first caller
+    /// only, so a second test calling [`register_main_thread`] would be
+    /// asserting against the first test's row rather than its own.
+    ///
+    /// Run on a bare `std::thread::spawn` because that is the shape the shell
+    /// threads have — no `Builder::name`, so `std::thread::current().name()`
+    /// is `None` and the row's name can only come from this call.
+    #[test]
+    fn the_main_row_is_cs_once_row() {
+        let main_rows = || {
+            thread_report()
+                .into_iter()
+                .filter(|t| t.name() == "_main_")
+                .count()
+        };
+        assert_eq!(main_rows(), 0, "nothing registers `_main_` on its own");
+
+        let before = sched_calls_made();
+        let (registered_tx, registered_rx) = std::sync::mpsc::channel();
+        let (finish_tx, finish_rx) = std::sync::mpsc::channel();
+        let join = std::thread::spawn(move || {
+            register_main_thread();
+            registered_tx.send(()).unwrap();
+            finish_rx.recv().unwrap();
+            // C's guard is per process, not per thread: the second call adds
+            // nothing.
+            register_main_thread();
+            registered_tx.send(()).unwrap();
+            finish_rx.recv().unwrap();
+        });
+
+        registered_rx.recv().unwrap();
+        let row = thread_by_name("_main_").expect("listed while the shell runs");
+        assert_eq!(row.epics_priority(), 0, "C's `_main_` is EPICS priority 0");
+        assert_eq!(row.os_priority(), 0, "C changes no scheduling for `_main_`");
+        assert_eq!(
+            sched_calls_made(),
+            before,
+            "registering `_main_` must ask the scheduler for nothing"
+        );
+        assert_eq!(main_rows(), 1);
+
+        finish_tx.send(()).unwrap();
+        registered_rx.recv().unwrap();
+        assert_eq!(main_rows(), 1, "one process, one `_main_`");
+
+        finish_tx.send(()).unwrap();
+        join.join().unwrap();
+        assert_eq!(
+            main_rows(),
+            0,
+            "the row is reaped where C's thread-specific-data destructor \
+             removes it — when the thread holding it ends"
+        );
+    }
+
+    /// Re-banding a thread is one thread, so it is one row. The boundary the
+    /// `thread_local` guard exists for: storing the new registration drops the
+    /// old one, which is what removes the superseded row.
+    #[test]
+    fn re_entering_the_prologue_replaces_the_row_rather_than_adding_one() {
+        let name = "cbRegReband";
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (finish_tx, finish_rx) = std::sync::mpsc::channel();
+        let join = std::thread::Builder::new()
+            .name(name.to_string())
+            .spawn(move || {
+                let _ = enter_ioc_thread(ThreadPriority::Low);
+                let _ = enter_ioc_thread(ThreadPriority::ScanHigh);
+                started_tx.send(()).unwrap();
+                finish_rx.recv().unwrap();
+            })
+            .unwrap();
+
+        started_rx.recv().unwrap();
+        let rows: Vec<ThreadInfo> = thread_report()
+            .into_iter()
+            .filter(|t| t.name() == name)
+            .collect();
+        assert_eq!(rows.len(), 1, "one thread is one row: {rows:?}");
+        assert_eq!(rows[0].epics_priority(), ThreadPriority::ScanHigh.value());
+
+        finish_tx.send(()).unwrap();
+        join.join().unwrap();
+    }
+
+    /// Both handles a shell user can read off the listing resolve, and a
+    /// number that is neither resolves to nothing rather than to the first row.
+    #[test]
+    fn a_row_resolves_by_epics_id_and_by_os_id() {
+        let name = "cbRegLookup";
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (finish_tx, finish_rx) = std::sync::mpsc::channel();
+        let join = std::thread::Builder::new()
+            .name(name.to_string())
+            .spawn(move || {
+                let _ = enter_ioc_thread(ThreadPriority::Medium);
+                started_tx.send(()).unwrap();
+                finish_rx.recv().unwrap();
+            })
+            .unwrap();
+
+        started_rx.recv().unwrap();
+        let listed = thread_by_name(name).expect("listed while running");
+        assert_eq!(thread_by_id(listed.id()).map(|t| t.id()), Some(listed.id()));
+        assert_eq!(
+            thread_by_id(listed.os_id()).map(|t| t.id()),
+            Some(listed.id())
+        );
+        assert!(thread_by_id(u64::MAX).is_none());
+
+        finish_tx.send(()).unwrap();
+        join.join().unwrap();
+    }
+
+    /// The `OSSPRI` boundary: a thread that never entered the real-time band
+    /// reads 0, which is the `sched_priority` a SCHED_OTHER thread has and
+    /// what C's live `pthread_getschedparam` returns for it. Every row on a
+    /// default hosted IOC is this case.
+    #[test]
+    fn os_priority_is_zero_for_every_outcome_but_realtime() {
+        for applied in [
+            PriorityApplied::Disabled,
+            PriorityApplied::Unsupported,
+            PriorityApplied::BestEffortFailed,
+        ] {
+            let row = ThreadInfo {
+                id: 1,
+                name: "cbOss".to_string(),
+                os_id: 7,
+                priority: ThreadPriority::High,
+                applied,
+                suspension: Arc::default(),
+            };
+            assert_eq!(row.os_priority(), 0, "{applied:?}");
+            assert_eq!(row.epics_priority(), ThreadPriority::High.value());
+        }
+    }
+
+    /// C's `%16.16s %14p %8lu    %3d%8d %8.8s%s`, against two rows copied from
+    /// a running `softIoc` built from the pinned C tree. The EPICS ID column
+    /// holds C's `epicsThreadOSD` addresses so the widths are the ones C
+    /// actually produced, not ones chosen to fit.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn show_line_matches_c_s_columns_byte_for_byte() {
+        let main = ThreadInfo {
+            id: 0x604f_304e_f4f0,
+            name: "_main_".to_string(),
+            os_id: 3_650_070,
+            priority: ThreadPriority::Custom(0),
+            applied: PriorityApplied::Disabled,
+            suspension: Arc::default(),
+        };
+        assert_eq!(
+            main.show_line(),
+            "          _main_ 0x604f304ef4f0  3650070      0       0       OK"
+        );
+
+        let errlog = ThreadInfo {
+            id: 0x604f_304f_8a90,
+            name: "errlog".to_string(),
+            os_id: 3_650_072,
+            priority: ThreadPriority::Low,
+            applied: PriorityApplied::Disabled,
+            suspension: Arc::default(),
+        };
+        assert_eq!(
+            errlog.show_line(),
+            "          errlog 0x604f304f8a90  3650072     10       0       OK"
+        );
+
+        assert_eq!(
+            THREAD_SHOW_HEADER,
+            "            NAME       EPICS ID   LWP ID   OSIPRI  OSSPRI  STATE"
+        );
+    }
+
+    /// The other `osdThreadExtra.c`: a wider OS id column under a different
+    /// name. Written out rather than derived so the two layouts cannot drift
+    /// into each other.
+    #[cfg(not(target_os = "linux"))]
+    #[test]
+    fn show_line_matches_c_s_generic_posix_columns() {
+        let row = ThreadInfo {
+            id: 0x604f_304e_f4f0,
+            name: "_main_".to_string(),
+            os_id: 3_650_070,
+            priority: ThreadPriority::Custom(0),
+            applied: PriorityApplied::Disabled,
+            suspension: Arc::default(),
+        };
+        assert_eq!(
+            row.show_line(),
+            "          _main_ 0x604f304ef4f0      3650070      0       0       OK"
+        );
+        assert_eq!(
+            THREAD_SHOW_HEADER,
+            "            NAME       EPICS ID   PTHREAD ID   OSIPRI  OSSPRI  STATE"
+        );
+    }
+
+    /// The suspended state end to end, and the boundary a naive latch gets
+    /// wrong.
+    ///
+    /// C's `epicsThreadResume` signals a latching event, so a resume with
+    /// nobody suspended banks a token that would skip the next park. C's own
+    /// iocsh refuses before it can (`libComRegister.c:445-449`) and `dbc`
+    /// only reaches it for a lock set that is stopped; this port makes the
+    /// refusal the primitive, so the two resumes below must leave nothing
+    /// behind and the park after them must still hold.
+    #[test]
+    fn a_suspended_thread_reads_suspend_and_only_a_resume_wakes_it() {
+        let (id_tx, id_rx) = std::sync::mpsc::channel();
+        let (go_tx, go_rx) = std::sync::mpsc::channel::<()>();
+        let (woke_tx, woke_rx) = std::sync::mpsc::channel();
+        let thread = std::thread::Builder::new()
+            .name("suspendTarget".to_string())
+            .spawn(move || {
+                let _ = enter_ioc_thread(ThreadPriority::ScanLow);
+                id_tx.send(current_thread_id()).unwrap();
+                go_rx.recv().unwrap();
+                suspend_self();
+                woke_tx.send(()).unwrap();
+            })
+            .unwrap();
+        let id = id_rx.recv().unwrap();
+
+        // Nothing is suspended yet: both resumes report the refusal and,
+        // crucially, bank nothing.
+        assert!(!resume_thread(id));
+        assert!(!resume_thread(id));
+        assert!(!thread_by_id(id).unwrap().is_suspended());
+        assert!(thread_by_id(id).unwrap().show_line().ends_with("      OK"));
+
+        go_tx.send(()).unwrap();
+        let row = (0..500)
+            .find_map(|_| {
+                let row = thread_by_id(id).expect("row");
+                row.is_suspended().then_some(row).or_else(|| {
+                    std::thread::sleep(Duration::from_millis(10));
+                    None
+                })
+            })
+            .expect("the thread must reach suspend_self");
+        assert!(
+            row.show_line().ends_with(" SUSPEND"),
+            "C prints SUSPEND for isSuspended (osdThreadExtra.c:53), got {:?}",
+            row.show_line()
+        );
+        assert_eq!(
+            woke_rx.recv_timeout(Duration::from_millis(250)),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout),
+            "the two earlier resumes must not have banked a wake-up"
+        );
+
+        assert!(
+            resume_thread(id),
+            "C epicsThreadResume on a suspended thread"
+        );
+        woke_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("resumed");
+        thread.join().unwrap();
+    }
+
+    /// C `createImplicit` (`osdThread.c:697-735`): a thread that never went
+    /// through `epicsThreadCreate` is given a `non-EPICS_` row the first time
+    /// its handle is asked for, so it can be listed and resumed rather than
+    /// being suspended somewhere nothing can name.
+    #[test]
+    fn a_thread_that_never_registered_gets_c_s_implicit_row() {
+        let (id, name, listed) = std::thread::spawn(|| {
+            let id = current_thread_id();
+            let row = thread_by_id(id).expect("createImplicit must put it on the list");
+            (id, row.name().to_string(), row.epics_priority())
+        })
+        .join()
+        .unwrap();
+        assert!(name.starts_with("non-EPICS_"), "C's name, got {name:?}");
+        assert_eq!(listed, 0, "C gives the implicit row osiPriority 0");
+        assert!(
+            thread_by_id(id).is_none(),
+            "the implicit row is reaped with the thread, as C frees it"
+        );
+    }
+
+    /// A name longer than the column is cut, not allowed to shift every field
+    /// after it — C's `%16.16s` precision, which a plain width would lose.
+    #[test]
+    fn a_long_name_is_truncated_rather_than_widening_the_row() {
+        let row = ThreadInfo {
+            id: 1,
+            name: "aVeryLongThreadNameIndeed".to_string(),
+            os_id: 7,
+            priority: ThreadPriority::Low,
+            applied: PriorityApplied::Disabled,
+            suspension: Arc::default(),
+        };
+        let short = ThreadInfo {
+            name: "s".to_string(),
+            ..row.clone()
+        };
+        let line = row.show_line();
+        assert!(line.starts_with("aVeryLongThreadN "), "{line}");
+        assert_eq!(
+            line.len(),
+            short.show_line().len(),
+            "a row's width must not depend on its name"
+        );
+    }
+
+    /// The stderr trailer C prints after the listing. With the real-time
+    /// switch off the range is genuinely a single point, and no probe may run
+    /// to discover a wider one.
+    #[test]
+    fn the_show_all_trailer_reports_the_range_this_process_may_enter() {
+        let line = osd_priority_range_line();
+        assert!(line.ends_with(", memory not locked"), "{line}");
+        if RtPolicy::current() == RtPolicy::Disabled {
+            assert_eq!(line, "OSD priority range min: 0 max 0, memory not locked");
+        }
     }
 
     /// The owner path: a mandatory thread that *can* be created runs its body
@@ -3329,6 +4607,53 @@ mod tests {
     async fn spawn_blocking_with_priority_runs_closure() {
         let handle = spawn_blocking_with_priority(ThreadPriority::CaServerHigh, || 7);
         assert_eq!(handle.await.unwrap(), 7);
+    }
+
+    /// C `ca_client_context::pendIO` compares the remaining budget *before* it
+    /// blocks (`ca_client_context.cpp:490-499`: `remaining <
+    /// CAC_SIGNIFICANT_DELAY` → `ECA_TIMEOUT`, `break`), so an already-spent
+    /// budget cannot be beaten by work that lands a moment later.
+    /// `tokio::time::timeout` could: it polls the inner future, arms a
+    /// zero-length `Sleep`, and that `Sleep` is not reported elapsed until the
+    /// time driver next runs — one `yield_now` is enough for the inner future
+    /// to win, which is how `caget -w -1` exited 0 where C exits 1.
+    ///
+    /// A future that is `Pending` on its first poll and `Ready` on its second
+    /// is the whole race in one value, and it needs no load to show it.
+    #[epics_macros_rs::epics_test]
+    async fn an_expired_budget_is_not_beaten_by_work_that_needs_a_second_poll() {
+        let r = timeout(Duration::ZERO, async {
+            yield_now().await;
+            7u8
+        })
+        .await;
+        assert!(
+            r.is_err(),
+            "a spent budget must expire before work that was not already done"
+        );
+    }
+
+    /// The other half of C's order: `pendIO` tests `pndRecvCnt > 0` first, so a
+    /// request with nothing outstanding returns `ECA_NORMAL` even on an expired
+    /// budget. One poll of the future is that same test.
+    #[epics_macros_rs::epics_test]
+    async fn an_expired_budget_still_takes_work_that_is_already_done() {
+        let r = timeout(Duration::ZERO, std::future::ready(7u8)).await;
+        assert_eq!(r.ok(), Some(7));
+    }
+
+    /// [`timeout_at`] carries the same rule against an absolute deadline: a
+    /// loop that re-uses one deadline reaches it already past, which is the
+    /// `pvlist-rs` receive loop's shape.
+    #[epics_macros_rs::epics_test]
+    async fn a_deadline_already_in_the_past_expires_without_racing_the_work() {
+        let past = Instant::now() - Duration::from_secs(1);
+        let r = timeout_at(past, async {
+            yield_now().await;
+            7u8
+        })
+        .await;
+        assert!(r.is_err(), "a past deadline must not be raced either");
     }
 
     #[test]

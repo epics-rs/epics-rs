@@ -29,7 +29,7 @@
 //! **A thread whose output is how the IOC is observed must be schedulable
 //! while the IOC is at its wall — if its per-tick work is bounded.** The
 //! operator surface sits strictly above `epicsThreadPriorityCAServerHigh`
-//! (40), the ceiling of the band C gives `rsrv` (`caservertask.c:562-575`
+//! (40), the ceiling of the band C gives `rsrv` (`caservertask.c:563-575`
 //! builds its ladder down from `CAServerLow`), and at or below
 //! `epicsThreadPriorityScanHigh` (70), so it can never delay record
 //! processing more urgent than the slowest periodic scan.
@@ -37,7 +37,7 @@
 //! C reaches the same ordering by a different route, which is why the rule is
 //! stated against C's constants rather than invented here: its status numbers
 //! are *records*, processed by the periodic scan threads at
-//! `epicsThreadPriorityScanLow + ind` (`dbScan.c:949`) — 60 and up, i.e. 40
+//! `epicsThreadPriorityScanLow + ind` (`dbScan.c:945`) — 60 and up, i.e. 40
 //! levels above the CA server that would otherwise starve them. Ours was
 //! inverted. The operator-facing report path C does have as a thread, `iocsh`,
 //! sits higher still at 91 (`epicsThread.h:86`), so this table is conservative
@@ -109,7 +109,7 @@ impl IocRole {
     ///
     /// `ScanLow` (60) is `epicsThreadPriorityScanLow` exactly — the band of
     /// C's *slowest* periodic scan thread, `spawnPeriodic`'s `ind == 0`
-    /// (`dbScan.c:949`). It is the lowest band that still outranks every CA
+    /// (`dbScan.c:945`). It is the lowest band that still outranks every CA
     /// and PVA server thread in this workspace, all of which sit at or below
     /// `CaServerLow` (20). Choosing the bottom of the scan ladder rather than
     /// a point inside it means the operator surface preempts nothing that
@@ -203,7 +203,7 @@ mod tests {
     /// The bands are C's, by value and not by resemblance.
     #[test]
     fn the_bands_are_the_epics_thread_priority_constants() {
-        // dbScan.c:949 spawns `scan-%g` at ScanLow + ind, so ind == 0 — the
+        // dbScan.c:945 spawns `scan-%g` at ScanLow + ind, so ind == 0 — the
         // slowest periodic list — is this same number.
         assert_eq!(IocRole::StatusPublisher.band().value(), 60);
         assert_eq!(ThreadPriority::ScanLow.value(), 60);

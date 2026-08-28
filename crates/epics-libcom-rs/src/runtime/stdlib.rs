@@ -366,10 +366,13 @@ fn starts_ci(s: &str, word: &str) -> bool {
     s.len() >= word.len() && s.as_bytes()[..word.len()].eq_ignore_ascii_case(word.as_bytes())
 }
 
-/// C `epicsParseDouble(str, to, NULL)` (`epicsStdlib.c:149-176`): skip
-/// leading whitespace, run `strtod`, reject `ERANGE`, skip trailing
-/// whitespace, reject anything left over.
-pub fn epics_parse_double(s: &str) -> Result<f64, ParseDoubleError> {
+/// C `epicsParseDouble(str, to, units)` with a NON-NULL `units`
+/// (`epicsStdlib.c:149-176`): skip leading whitespace, run `strtod`, reject
+/// `ERANGE`, skip trailing whitespace, and hand back whatever remains
+/// instead of refusing it. This is the form `store_double_value` uses for
+/// filter options (`chfPlugin.c:273`), which is why `{"dbnd":{"d":"0.5 V"}}`
+/// stores 0.5 rather than failing the parse.
+pub fn epics_parse_double_units(s: &str) -> Result<(f64, &str), ParseDoubleError> {
     let (v, used, erange) = strtod(s);
     if used == 0 {
         return Err(ParseDoubleError::NoConversion);
@@ -379,10 +382,17 @@ pub fn epics_parse_double(s: &str) -> Result<f64, ParseDoubleError> {
         Erange::Under => return Err(ParseDoubleError::Underflow),
         Erange::No => {}
     }
-    if !s.as_bytes()[used..].iter().all(|&c| c_isspace(c as char)) {
-        return Err(ParseDoubleError::Extraneous);
+    Ok((v, s[used..].trim_start_matches(c_isspace)))
+}
+
+/// C `epicsParseDouble(str, to, NULL)` — the same function with the
+/// remainder refused as `S_stdlib_extraneous` (`epicsStdlib.c:169-170`)
+/// rather than returned.
+pub fn epics_parse_double(s: &str) -> Result<f64, ParseDoubleError> {
+    match epics_parse_double_units(s)? {
+        (v, "") => Ok(v),
+        _ => Err(ParseDoubleError::Extraneous),
     }
-    Ok(v)
 }
 
 /// C `epicsScanDouble` (`epicsStdlib.h:203`) — `epicsParseDouble` with the
@@ -391,9 +401,78 @@ pub fn epics_scan_double(s: &str) -> Option<f64> {
     epics_parse_double(s).ok()
 }
 
+/// C `epicsStrHash` (`libcom/src/misc/epicsString.c:365-376` at `R7.0.10`) —
+/// the string hash every general-purpose hash table in base keys on
+/// (`gpHashLib.c:107`, the registry, the record-name directory).
+///
+/// ```c
+/// unsigned int hash = seed;
+/// while ((c = *str++)) {
+///     hash ^= ~((hash << 11) ^ c ^ (hash >> 5));
+///     if (!(c = *str++)) break;
+///     hash ^= (hash << 7) ^ c ^ (hash >> 3);
+/// }
+/// ```
+///
+/// C's `char c` is signed on every platform base builds for, and it widens to
+/// `int` before the XOR, so a byte at or above `0x80` contributes its
+/// SIGN-EXTENDED value. `i8 as i32 as u32` is that widening; taking the byte
+/// as `u32` directly would diverge on any non-ASCII name. The shifts are
+/// C's on a 32-bit `unsigned int`, so they wrap rather than overflow.
+#[must_use]
+pub fn epics_str_hash(s: &str, seed: u32) -> u32 {
+    let mut hash = seed;
+    let bytes = s.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        let c = i32::from(bytes[i] as i8) as u32;
+        hash ^= !((hash << 11) ^ c ^ (hash >> 5));
+        i += 1;
+        if i >= bytes.len() {
+            break;
+        }
+        let c = i32::from(bytes[i] as i8) as u32;
+        hash ^= (hash << 7) ^ c ^ (hash >> 3);
+        i += 1;
+    }
+    hash
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Boundary: the empty string is the seed untouched — C's `while` never
+    /// runs — and an odd length exits through the mid-loop `break` while an
+    /// even one exits through the `while` test, so both arms are covered.
+    #[test]
+    fn epics_str_hash_matches_the_c_reference() {
+        for &(s, seed, want) in &[
+            ("", 0u32, 0u32),
+            ("", 0x1234_5678, 0x1234_5678),
+            ("a", 0, 0xffff_ff9e),
+            ("ab", 0, 0x1fff_cf0f),
+            ("abc", 0, 0x1e87_b6eb),
+            ("operator", 0, 0xe15e_03c1),
+            ("host.example.org", 0, 0x5134_8623),
+            ("abc", 0x1234_5678, 0xc25f_c587),
+            ("host.example.org", 0x1234_5678, 0xd9df_e17d),
+        ] {
+            assert_eq!(
+                epics_str_hash(s, seed),
+                want,
+                "epicsStrHash({s:?}, {seed:#x})"
+            );
+        }
+    }
+
+    /// Boundary: a byte at or above `0x80`. C's `char` is signed, so the
+    /// byte enters the XOR sign-extended; reading it as `u32` would give
+    /// `0x1fff_9e72` here instead.
+    #[test]
+    fn epics_str_hash_sign_extends_a_high_byte() {
+        assert_eq!(epics_str_hash("\u{e9}", 0), 0xffff_e192);
+    }
 
     /// Parse a `0x…` hex float through the accumulator, the way both callers
     /// drive it.

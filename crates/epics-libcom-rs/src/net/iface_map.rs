@@ -8,6 +8,7 @@
 //!
 //! Mirrors the data carried by pvxs `IfaceMap::Current` (src/iface.cpp).
 
+use std::io;
 use std::net::Ipv4Addr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -58,7 +59,12 @@ struct Inner {
 
 impl IfaceMap {
     /// Build a fresh map by enumerating interfaces now.
-    pub fn new() -> Self {
+    ///
+    /// Fails when the OS enumeration fails, so an empty map means exactly
+    /// one thing — the host reported no IPv4 interfaces. It used to mean
+    /// that *or* that `getifaddrs` had errored, and every caller that asks
+    /// "is there an external NIC here?" read the two as the same answer.
+    pub fn new() -> io::Result<Self> {
         let me = Self {
             inner: Arc::new(Mutex::new(Inner {
                 ifaces: Vec::new(),
@@ -69,26 +75,33 @@ impl IfaceMap {
                 last_refresh: Instant::now(),
             })),
         };
-        me.refresh();
-        me
+        me.refresh()?;
+        Ok(me)
     }
 
     /// Force-refresh the snapshot.
-    pub fn refresh(&self) {
-        let new = enumerate_v4();
+    ///
+    /// The single writer of `Inner.ifaces`, and it writes only what a
+    /// successful enumeration returned: on failure the previous snapshot
+    /// stands rather than being replaced by an empty one, so a transient
+    /// `getifaddrs` error cannot blank the fanout list under a running
+    /// sender.
+    pub fn refresh(&self) -> io::Result<()> {
+        let new = enumerate_v4()?;
         let mut g = self.inner.lock();
         g.ifaces = new;
         g.last_refresh = Instant::now();
+        Ok(())
     }
 
     /// Refresh if the snapshot is older than `max_age`. Returns the
     /// snapshot age before any refresh.
-    pub fn refresh_if_stale(&self, max_age: Duration) -> Duration {
+    pub fn refresh_if_stale(&self, max_age: Duration) -> io::Result<Duration> {
         let age = self.inner.lock().last_refresh.elapsed();
         if age > max_age {
-            self.refresh();
+            self.refresh()?;
         }
-        age
+        Ok(age)
     }
 
     /// Spawn a background tokio task that refreshes the snapshot
@@ -106,9 +119,13 @@ impl IfaceMap {
     /// migration; cable hot-plug) leaves the snapshot stale, and
     /// any sender that derives a broadcast destination from the
     /// snapshot ends up sending to the wrong subnet.
-    pub fn spawn_refresh(&self, period: Duration) -> crate::runtime::task::TaskHandle<()> {
+    pub fn spawn_refresh(
+        &self,
+        reactor: &crate::runtime::task::Reactor,
+        period: Duration,
+    ) -> crate::runtime::task::TaskHandle<()> {
         let me = self.clone();
-        crate::runtime::task::spawn(async move {
+        reactor.spawn(async move {
             let mut tick = crate::runtime::task::interval(period);
             // First tick fires immediately — skip it so we don't
             // refresh twice in a row right after `IfaceMap::new()`
@@ -116,7 +133,13 @@ impl IfaceMap {
             tick.tick().await;
             loop {
                 tick.tick().await;
-                me.refresh();
+                // Keep the previous snapshot when enumeration fails and let
+                // the next tick retry — a periodic refresher must not be
+                // able to turn a momentary OS error into "this host has no
+                // interfaces" for everyone reading the map.
+                if let Err(e) = me.refresh() {
+                    tracing::debug!("iface map refresh failed, keeping previous snapshot: {e}");
+                }
             }
         })
     }
@@ -199,12 +222,6 @@ impl IfaceMap {
     }
 }
 
-impl Default for IfaceMap {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 fn subnet_contains(ip: Ipv4Addr, mask: Ipv4Addr, candidate: Ipv4Addr) -> bool {
     let net = u32::from(ip) & u32::from(mask);
     let cnet = u32::from(candidate) & u32::from(mask);
@@ -251,10 +268,8 @@ fn interface_up_flags() -> std::collections::HashMap<String, bool> {
     map
 }
 
-fn enumerate_v4() -> Vec<IfaceInfo> {
-    let Ok(list) = if_addrs::get_if_addrs() else {
-        return Vec::new();
-    };
+fn enumerate_v4() -> io::Result<Vec<IfaceInfo>> {
+    let list = if_addrs::get_if_addrs()?;
     // C parity: on Linux consult the live kernel `IFF_UP`/`IFF_LOOPBACK`
     // flags via `getifaddrs` so an administratively-down interface that
     // still has an IPv4 address configured is not reported as a fanout
@@ -304,7 +319,7 @@ fn enumerate_v4() -> Vec<IfaceInfo> {
             up_non_loopback,
         });
     }
-    out
+    Ok(out)
 }
 
 #[cfg(test)]
@@ -313,7 +328,7 @@ mod tests {
 
     #[test]
     fn enumerate_returns_loopback_at_minimum() {
-        let map = IfaceMap::new();
+        let map = IfaceMap::new().expect("getifaddrs must succeed on the host");
         let all = map.all();
         // Every machine has at least one loopback v4 (127.0.0.1).
         assert!(
@@ -324,7 +339,7 @@ mod tests {
 
     #[test]
     fn loopback_routing_lands_on_loopback() {
-        let map = IfaceMap::new();
+        let map = IfaceMap::new().expect("getifaddrs must succeed on the host");
         let r = map.route_to(Ipv4Addr::LOCALHOST);
         assert!(r.is_some(), "127.0.0.1 must route to a known interface");
         assert!(r.unwrap().ip.is_loopback());
@@ -332,9 +347,11 @@ mod tests {
 
     #[test]
     fn refresh_updates_timestamp() {
-        let map = IfaceMap::new();
+        let map = IfaceMap::new().expect("getifaddrs must succeed on the host");
         std::thread::sleep(Duration::from_millis(20));
-        let age = map.refresh_if_stale(Duration::from_millis(10));
+        let age = map
+            .refresh_if_stale(Duration::from_millis(10))
+            .expect("getifaddrs must succeed on the host");
         assert!(
             age >= Duration::from_millis(20),
             "refresh_if_stale should report the pre-refresh age (got {age:?})"
@@ -347,7 +364,7 @@ mod tests {
     /// `IFF_LOOPBACK`).
     #[test]
     fn up_non_loopback_excludes_loopback() {
-        let map = IfaceMap::new();
+        let map = IfaceMap::new().expect("getifaddrs must succeed on the host");
         for iface in map.all() {
             if iface.ip.is_loopback() {
                 assert!(
@@ -409,9 +426,11 @@ mod tests {
     /// short test cadence (50 ms × ~3 ticks ≈ 150 ms total).
     #[epics_macros_rs::epics_test]
     async fn spawn_refresh_advances_last_refresh() {
-        let map = IfaceMap::new();
+        let map = IfaceMap::new().expect("getifaddrs must succeed on the host");
         let initial = map.inner.lock().last_refresh;
-        let handle = map.spawn_refresh(Duration::from_millis(50));
+        let reactor =
+            crate::runtime::task::Reactor::current().expect("the test driver enters an executor");
+        let handle = map.spawn_refresh(&reactor, Duration::from_millis(50));
         crate::runtime::task::sleep(Duration::from_millis(200)).await;
         let after = map.inner.lock().last_refresh;
         assert!(

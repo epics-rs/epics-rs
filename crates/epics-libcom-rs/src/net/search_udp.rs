@@ -989,8 +989,8 @@ mod sys {
         Ok(())
     }
 
-    // A non-Unix exec backend is a host `--features rtems-exec-model` build on
-    // Windows: it exists to run the target's *scheduling* shape on a
+    // A non-Unix exec backend is a host `EPICS_RS_BUILD_EXEC_BACKEND=thread`
+    // build on Windows: it exists to run the target's *scheduling* shape on a
     // developer's machine, not its socket options. Both options this arm sets
     // are performance/reach tuning that the SEARCH protocol does not depend
     // on, so they report unsupported rather than pulling in a second
@@ -1162,15 +1162,33 @@ mod tests {
     /// loopback NIC, so nothing sent to `127.0.0.1` can reach it.
     #[epics_macros_rs::epics_test]
     async fn v6_socket_does_not_take_v4_mapped_traffic() {
-        let Some(v6) = bind_v6_or_skip() else {
-            return;
-        };
-        let port = v6.local_addrs()[0].port();
-
-        let v4 = std::net::UdpSocket::bind((std::net::Ipv4Addr::LOCALHOST, port)).expect(
-            "IPV6_V6ONLY leaves the v4 half of the port free; EADDRINUSE here means the v6 \
-             SEARCH socket bound dual-stack",
-        );
+        // The v4 bind below can fail for two unrelated reasons: the v6 socket
+        // reserved both halves (the defect under test), or some unrelated
+        // process already holds that number in the v4 space — the kernel
+        // picks the v6 ephemeral port from the v6 space and does not consult
+        // the v4 one. Only the first reproduces on every port, so try several
+        // and let the assertion speak for the cause that survives them all.
+        const PORTS: usize = 8;
+        let mut held = None;
+        for attempt in 1..=PORTS {
+            let Some(v6) = bind_v6_or_skip() else {
+                return;
+            };
+            let port = v6.local_addrs()[0].port();
+            match std::net::UdpSocket::bind((std::net::Ipv4Addr::LOCALHOST, port)) {
+                Ok(v4) => {
+                    held = Some((v6, v4, port));
+                    break;
+                }
+                Err(e) => assert!(
+                    attempt < PORTS,
+                    "the v4 half of the port was unavailable on all {PORTS} ports tried, so \
+                     this is not an unrelated v4 socket: the v6 SEARCH socket bound \
+                     dual-stack and IPV6_V6ONLY was lost ({e})"
+                ),
+            }
+        }
+        let (v6, v4, port) = held.expect("the loop either bound or asserted");
         v4.set_read_timeout(Some(std::time::Duration::from_secs(5)))
             .expect("read timeout");
 

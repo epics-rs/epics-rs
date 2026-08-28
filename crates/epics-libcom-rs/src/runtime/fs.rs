@@ -16,8 +16,8 @@
 //! Tokio 1.x runtime
 //! ```
 //!
-//! Under `rtems-exec-model` the background executor runs callbacks on its own
-//! std threads, which are not tokio runtime threads, so every `tokio::fs` call
+//! Under `exec_backend` the background executor runs callbacks on its own std
+//! threads, which are not tokio runtime threads, so every `tokio::fs` call
 //! reached from a callback took the IOC's autosave writer down with it — and
 //! because the RTEMS build unwinds rather than aborts, it took *only* that
 //! thread down, leaving an IOC that looked healthy and had silently stopped

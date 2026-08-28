@@ -30,7 +30,7 @@ pub mod ioc_support {
 
     use epics_base_rs::error::CaResult;
     use epics_base_rs::server::device_support::{
-        DeviceReadOutcome, DeviceSupport, WriteCompletion,
+        DeviceInitOutcome, DeviceReadOutcome, DeviceSupport, DeviceUdf, WriteCompletion,
     };
     use epics_base_rs::server::record::{Record, ScanType};
     use epics_base_rs::types::EpicsValue;
@@ -253,9 +253,9 @@ pub mod ioc_support {
             }
         }
 
-        fn init(&mut self, record: &mut dyn Record) -> CaResult<()> {
+        fn init(&mut self, record: &mut dyn Record) -> CaResult<DeviceInitOutcome> {
             record.put_field("VAL", EpicsValue::DoubleArray(self.current_data().to_vec()))?;
-            Ok(())
+            Ok(DeviceInitOutcome::Live)
         }
 
         fn read(&mut self, record: &mut dyn Record) -> CaResult<DeviceReadOutcome> {
@@ -264,7 +264,7 @@ pub mod ioc_support {
             if let Some(index) = self.index {
                 self.shared.mark_processed(index);
             }
-            Ok(DeviceReadOutcome::computed())
+            Ok(DeviceReadOutcome::computed(DeviceUdf::Defined))
         }
 
         fn write(&mut self, _record: &mut dyn Record) -> CaResult<()> {

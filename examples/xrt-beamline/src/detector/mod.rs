@@ -48,8 +48,8 @@ impl XrtDetector {
         let motor_param_set = xrt_params.motor_params();
 
         let base = &mut ad.port_base;
-        base.set_string_param(ad.params.base.manufacturer, 0, "XRT Beamline".into())?;
-        base.set_string_param(ad.params.base.model, 0, "Ray Tracing Simulator".into())?;
+        base.set_string_param(ad.params.base.manufacturer, 0, "XRT Beamline")?;
+        base.set_string_param(ad.params.base.model, 0, "Ray Tracing Simulator")?;
 
         base.set_float64_param(ad.params.acquire_time, 0, 0.1)?;
         base.set_float64_param(ad.params.acquire_period, 0, 0.1)?;

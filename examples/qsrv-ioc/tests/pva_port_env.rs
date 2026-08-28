@@ -8,6 +8,13 @@
 //! server-specific variable, so a pvxs-style deployment that configured only
 //! `EPICS_PVAS_SERVER_PORT` silently got 5075.
 
+// Every case spawns `qsrv-ioc`, whose `main` on the exec backend prints a
+// refusal and returns: the demo stands `CaServer` and `PvaServer` up itself and
+// the reactor-free backend compiles neither. Without this gate the child exits
+// before printing a port and the assertion reads as "IOC died", which is what
+// `--all-features` did while it still resolved the backend.
+#![cfg(tokio_backend)]
+
 use std::io::{BufRead, BufReader};
 use std::net::TcpListener;
 use std::process::{Child, Command, Stdio};

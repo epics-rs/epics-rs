@@ -43,8 +43,8 @@ impl MovingDotDetector {
 
         // Set defaults
         let base = &mut ad.port_base;
-        base.set_string_param(ad.params.base.manufacturer, 0, "Mini Beamline".into())?;
-        base.set_string_param(ad.params.base.model, 0, "Moving Dot".into())?;
+        base.set_string_param(ad.params.base.manufacturer, 0, "Mini Beamline")?;
+        base.set_string_param(ad.params.base.model, 0, "Moving Dot")?;
 
         base.set_float64_param(ad.params.acquire_time, 0, 0.1)?;
         base.set_float64_param(ad.params.acquire_period, 0, 0.5)?;

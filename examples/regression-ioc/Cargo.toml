@@ -5,6 +5,8 @@ edition.workspace = true
 description = "In-process regression IOC: pins recurring bug-fix behaviors (v0.15.x–v0.20.x) under real CA+PVA servers"
 publish = false
 
+[features]
+
 [dependencies]
 epics-base-rs = { workspace = true }
 epics-ca-rs = { workspace = true }

@@ -24,10 +24,10 @@ pub fn register(ioc: &mut ad_plugins_rs::ioc::AdIoc) {
         ioc.register_startup_command(CommandDef::new(
             "simDetectorConfig",
             vec![
-                ArgDesc { name: "portName", arg_type: ArgType::String, optional: false },
-                ArgDesc { name: "sizeX", arg_type: ArgType::Int, optional: true },
-                ArgDesc { name: "sizeY", arg_type: ArgType::Int, optional: true },
-                ArgDesc { name: "maxMemory", arg_type: ArgType::Int, optional: true },
+                ArgDesc { name: "portName", arg_type: ArgType::String },
+                ArgDesc { name: "sizeX", arg_type: ArgType::Int },
+                ArgDesc { name: "sizeY", arg_type: ArgType::Int },
+                ArgDesc { name: "maxMemory", arg_type: ArgType::Int },
             ],
             "simDetectorConfig portName [sizeX] [sizeY] [maxMemory]",
             move |args: &[ArgValue], _ctx: &CommandContext| {

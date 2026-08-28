@@ -54,7 +54,7 @@ pub mod ioc_support {
     use super::*;
     use epics_base_rs::error::CaResult;
     use epics_base_rs::server::device_support::{
-        DeviceReadOutcome, DeviceSupport, WriteCompletion,
+        DeviceInitOutcome, DeviceReadOutcome, DeviceSupport, DeviceUdf, WriteCompletion,
     };
     use epics_base_rs::server::record::{Record, ScanType};
 
@@ -96,17 +96,18 @@ pub mod ioc_support {
 
         fn set_record_info(&mut self, _name: &str, _scan: ScanType) {}
 
-        fn init(&mut self, record: &mut dyn Record) -> CaResult<()> {
+        fn init(&mut self, record: &mut dyn Record) -> CaResult<DeviceInitOutcome> {
             let val = self.value.get();
             record.put_field("VAL", epics_base_rs::types::EpicsValue::Double(val))?;
-            Ok(())
+            Ok(DeviceInitOutcome::Live)
         }
 
         fn read(&mut self, record: &mut dyn Record) -> CaResult<DeviceReadOutcome> {
             let val = self.value.get();
             record.put_field("VAL", epics_base_rs::types::EpicsValue::Double(val))?;
-            // Return computed() to skip ai's RVAL->VAL conversion
-            Ok(DeviceReadOutcome::computed())
+            // computed() skips ai's RVAL->VAL conversion; Defined is the
+            // simulator's "this reading is real", C's `prec->udf = FALSE`.
+            Ok(DeviceReadOutcome::computed(DeviceUdf::Defined))
         }
 
         fn write(&mut self, _record: &mut dyn Record) -> CaResult<()> {

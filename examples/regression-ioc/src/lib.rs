@@ -1,14 +1,24 @@
 //! Regression IOC harness.
 //!
-//! Boots the [`REGRESSION_DB`] record set under real in-process servers — CA
+//! Boots the `REGRESSION_DB` record set under real in-process servers — CA
 //! (high-level, which spawns the periodic SCAN scheduler) and PVA (native,
-//! ephemeral) — over one shared [`PvDatabase`]. Because both servers serve the
+//! ephemeral) — over one shared `PvDatabase`. Because both servers serve the
 //! same `Arc<PvDatabase>`, a value driven through one protocol is visible
 //! through the other, and the single CA-spawned scheduler drives periodic-SCAN
 //! processing for both.
 //!
 //! The companion `tests/` pin recurring bug-fix behaviors (v0.15.x-v0.20.x)
 //! against this IOC over the wire.
+//!
+//! Both names above are code spans rather than intra-doc links: the crate
+//! body is `tokio_backend`-only (below), while this doc block is rendered in
+//! every configuration, so a link out of it resolves in none of them.
+//!
+//! The whole crate is `tokio_backend`: both servers it boots are compiled out
+//! on the reactor-free backend, and a harness that cannot boot its IOC has
+//! nothing left to expose. The runnable binary and the three test files carry
+//! the same gate.
+#![cfg(tokio_backend)]
 
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};

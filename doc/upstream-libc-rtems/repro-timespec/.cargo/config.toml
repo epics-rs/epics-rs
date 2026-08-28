@@ -1,3 +1,0 @@
-[target.armv7-rtems-eabihf]
-# Requires $RTEMS_BSP_PREFIX/bin on PATH (see README).
-linker = "arm-rtems6-gcc"

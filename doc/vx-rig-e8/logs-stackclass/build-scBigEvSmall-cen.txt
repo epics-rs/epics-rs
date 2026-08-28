@@ -1,8 +1,0 @@
-275:            suffix: "client",
-276-            stack: StackSizeClass::Big,
-277-            priority: ThreadPriority::CaServerLow,
---
-280:            suffix: "event",
-281-            stack: StackSizeClass::Small,
-282-            priority: ThreadPriority::Custom(ThreadPriority::CaServerLow.value() - 1),
-8e7be4eab09918cba5b645551a63067e694ddd3125629fee1a4799f36875152c  /home/coding-agent/vx-rig-e8/ftp/root/realtime-ca-ioc.vxe

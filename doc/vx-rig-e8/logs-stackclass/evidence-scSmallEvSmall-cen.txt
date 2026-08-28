@@ -1,2 +1,0 @@
-STACKUSE tag=c6-6 id=0x000100b8 name=CAS-client 0 size=524288 current=6096 high=12160 margin=512128
-STACKUSE tag=c6-6 id=0x000100bc name=CAS-event 0 size=524288 current=2736 high=5456 margin=518832

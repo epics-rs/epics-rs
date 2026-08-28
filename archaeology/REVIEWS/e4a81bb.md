@@ -1,6 +1,0 @@
----
-short_sha: e4a81bb
-status: not-applicable
-files_changed: []
----
-C commit documents that `ca_pend_io` / `ca_pend_event` accept `double timeout` where `0.0` means non-blocking poll and NaN/overflow means infinite wait. ca-rs has no `pend_io` / `pend_event` API — the async model is `tokio` futures awaited directly, with timeouts expressed as `std::time::Duration` (the underlying type is `u64`+`u32` nanoseconds, so NaN cannot be represented and `0.0` ambiguity does not exist). The closest analogues are `CaChannel::wait_connected(timeout: Duration)` at `crates/epics-ca-rs/src/client/mod.rs:743` and `get_with_timeout(timeout: Duration)` at `mod.rs:783`, both of which delegate to `tokio::time::timeout(duration, fut)`. `tokio::time::timeout` with `Duration::ZERO` is documented to immediately produce `Err(Elapsed)` if the inner future is not ready (i.e. it is a non-blocking poll, matching the C semantic). `Duration::MAX` is roughly 584 years, which functions as "infinite wait". The `f64`→`Duration` conversion sites (`Duration::from_secs_f64(args.timeout)` in `caget-rs.rs`, `caput-rs.rs`, `cainfo-rs.rs`, `camonitor-rs.rs`) inherit the panic behaviour of `from_secs_f64` on NaN, which is a documentation issue at the CLI shell level, not a CA-API contract issue addressed by this commit. No structural change in scope.

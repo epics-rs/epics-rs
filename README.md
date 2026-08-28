@@ -169,13 +169,17 @@ the script), and the protocol runner is pluggable:
 
 ```rust
 use epics_rs::base::server::ioc_app::IocApplication;
-use epics_bridge_rs::qsrv::run_ca_pva_qsrv_ioc;   // or epics_rs::ca::server::run_ca_ioc
+use epics_bridge_rs::qsrv::run_ca_pva_qsrv_ioc_app;   // or epics_rs::ca::server::run_ca_ioc_app
 
-IocApplication::new()
-    .register_device_support("myDriver", || Box::new(MyDeviceSupport::new()))
-    .startup_script("ioc/st.cmd")
-    .run(run_ca_pva_qsrv_ioc)                     // CA + PVA with QSRV bridge
-    .await?;
+// The `_app` entry point, not `IocApplication::run(runner)`: it runs the
+// protocol registrar before the startup script, so `casr`/`pvxsr` and the
+// `dbsr` server layer are there from the script's first line, as in C.
+run_ca_pva_qsrv_ioc_app(                          // CA + PVA with QSRV bridge
+    IocApplication::new()
+        .register_device_support("myDriver", || Box::new(MyDeviceSupport::new()))
+        .startup_script("ioc/st.cmd"),
+)
+.await?;
 ```
 
 Driver authors use the runtime facade instead of tokio directly —
@@ -270,6 +274,8 @@ transliteration:
 | IOC configuration | `st.cmd` | Same `st.cmd` syntax, or a Rust builder API |
 
 Per-crate design detail lives in each crate's README and on docs.rs.
+For the stack as a whole: [`docs/compatibility.md`](docs/compatibility.md)
+and [`docs/differences.md`](docs/differences.md).
 
 ## Testing
 
@@ -289,13 +295,12 @@ cargo nextest run --workspace --exclude epics-oracle-rs
 cargo nextest run --workspace
 ```
 
-The four reference-tree suites (`reference_trees`, `dbd_initial_parity`,
-`base_device_parity`, `stdsupport_device_parity`) compare the port against
-the upstream C sources. They resolve the checkout from `EPICS_BASE` /
-`EPICS_MODULES` / `PVXS_HOME`, or from a sibling directory of this
-repository, and **panic when it is absent** rather than returning early —
+The `reference_trees` suite compares the port against the upstream C
+sources. It resolves the checkout from `EPICS_BASE` / `EPICS_MODULES` /
+`PVXS_HOME`, or from a sibling directory of this repository, and
+**panics when it is absent** rather than returning early —
 nextest reports an early return as a pass, so a skip there verifies nothing
-while looking green.
+while looking clean.
 
 Coverage includes wire-format golden packets (CA + PVA), pvxs interop
 fixtures, record processing and link chains, 46 golden tests against compiled
@@ -303,8 +308,9 @@ C `tableRecord.c` output, and `examples/regression-ioc` — an end-to-end IOC
 that pins fixed wire behavior across releases.
 
 Async tests use `#[epics_test]`, whose driver follows the build's backend:
-re-running a crate's suite with `--features rtems-exec-model` exercises the
-same test bodies on the reactor-free exec backend that RTEMS uses.
+re-running a crate's suite with `EPICS_RS_BUILD_EXEC_BACKEND=thread`
+exercises the same test bodies on the reactor-free exec backend that RTEMS
+uses.
 
 `epics-oracle-rs` is the differential oracle: it boots a C `softIoc` and the
 Rust IOC on the same `.db` and diffs their observable CA/PVA behavior. It

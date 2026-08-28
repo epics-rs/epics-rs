@@ -1634,7 +1634,7 @@ is the ledger). Highlights:
 - Retry / MIP timing: `RMOD_I` re-arms the settle watchdog
   unconditionally (C `1432-1438`); post-delay retry evaluation gates on
   MIP motion bits (C `1427`).
-- The move-block entry gate (`dval != ldvl || !dmov`, C `2240`) now
+- The move-block entry gate (`dval != ldvl || !dmov`, C `2241`) now
   refuses an exact same-target re-put after a MISS give-up, falling to
   the chain-end implicit `GET_INFO` (C `2540-2557`) instead of
   re-dispatching. A consequence: an exact same-target re-put no longer
@@ -2284,7 +2284,7 @@ the libca-client perspective, not protocol breaks.
   macros — match C `tracePrint` device → port → global hierarchy
   (`242a4ce`).
 - **fix(asyn-rs)** `InterruptValue` carries `aux_status` +
-  `alarmStatus/Severity` — C `asynPortDriver.cpp:631-642` parity
+  `alarmStatus/Severity` — C `asynPortDriver.cpp:633-637` parity
   for callback plumbing (`0b9e8d5`).
 - **feat(asyn-rs)** paramList strict `create_param` +
   UInt32Digital rising/falling masks + interrupt config helpers
@@ -2447,7 +2447,7 @@ attached via `caget` / `pvget` will see the C-correct values.
 
 ### asyn-rs — C source audit closure
 
-Full audit of `~/codes/epics-modules/asyn` against `crates/asyn-rs`.
+Full audit of `$EPICS_MODULES/asyn` against `crates/asyn-rs`.
 Every item in `docs/asyn-rs-c-audit.md` is now verified, ported, or
 explicitly skipped with a one-line rationale.
 

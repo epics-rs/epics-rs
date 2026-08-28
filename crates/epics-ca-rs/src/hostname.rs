@@ -10,7 +10,7 @@
 //!
 //! Two entry points, because libca has two:
 //!
-//! * [`ip_addr_to_a`] is libcom's `ipAddrToA` (`osiSock.c:92-114`) — a
+//! * [`ip_addr_to_a`] is libcom's `ipAddrToA` (`osiSock.c:92-113`) — a
 //!   synchronous `getnameinfo` that BLOCKS on the resolver. Correct for a
 //!   one-shot tool, which is exactly what C's `ca_host_name` gives a
 //!   connected `cainfo`; must never run on a task that other channels'
@@ -25,14 +25,14 @@
 //!   the dotted IP until the engine has answered, the name afterwards.
 
 // RTEMS-EXEC-MODEL-ALLOW(1): the flavored test asserts resolution inside a
-// multi-thread tokio runtime. These run and pass in the
-// feature-ON suite on the tokio driver.
+// multi-thread tokio runtime. These run and pass in the exec-backend suite
+// on the tokio driver.
 use std::net::SocketAddr;
 use std::sync::OnceLock;
 
 use dashmap::DashMap;
 
-/// libcom `ipAddrToA` (`osiSock.c:92-114`): reverse-resolve the address and
+/// libcom `ipAddrToA` (`osiSock.c:92-113`): reverse-resolve the address and
 /// return `<name>:<port>`; on ANY resolver failure fall back to
 /// `ipAddrToDottedIP`'s `<a.b.c.d>:<port>`, which is what `SocketAddr`'s
 /// `Display` already writes.
@@ -139,9 +139,9 @@ fn cache() -> &'static DashMap<SocketAddr, String> {
 /// channel, and a `getnameinfo` on an address with no PTR record parks that
 /// task for the resolver's full timeout.
 ///
-/// Outside a Tokio runtime there is nothing to schedule the lookup on, so the
-/// answer stays the dotted IP — the same degradation libca shows before its
-/// engine has run.
+/// With no executor to schedule the lookup on there is nothing to resolve it,
+/// so the answer stays the dotted IP — the same degradation libca shows before
+/// its engine has run.
 pub(crate) fn cached_name(addr: SocketAddr) -> String {
     if let Some(name) = cache().get(&addr) {
         return name.clone();
@@ -166,17 +166,25 @@ pub(crate) fn warm(addr: SocketAddr) {
     schedule(addr);
 }
 
-/// Off-task reverse lookup, cached on completion. Outside a Tokio runtime
-/// there is nothing to schedule on, so the name stays unresolved — the same
-/// degradation libca shows before its engine has run.
+/// Off-task reverse lookup, cached on completion.
+///
+/// `getnameinfo` blocks, so this wants a thread that may block — not the I/O
+/// and time drivers. That is `Reactor::spawn_blocking`, and reading the
+/// executor through `Reactor::current` rather than `Handle::try_current` is
+/// what makes the lookup happen on both backends: the CA client's tasks run on
+/// the callback band under `exec_backend`, where an ambient tokio handle does
+/// not exist and every ask silently answered with the dotted IP.
+///
+/// With no executor at all — a sync caller on its own thread under
+/// `tokio_backend` — the name stays unresolved, the same degradation libca
+/// shows before its engine has run.
 fn schedule(addr: SocketAddr) {
-    if let Ok(rt) = tokio::runtime::Handle::try_current() {
-        rt.spawn(async move {
-            if let Ok(name) = tokio::task::spawn_blocking(move || ip_addr_to_a(addr)).await {
-                cache().insert(addr, name);
-            }
-        });
-    }
+    let Some(reactor) = epics_base_rs::runtime::task::Reactor::current() else {
+        return;
+    };
+    reactor.spawn_blocking(move || {
+        cache().insert(addr, ip_addr_to_a(addr));
+    });
 }
 
 #[cfg(test)]
@@ -257,5 +265,38 @@ mod tests {
     async fn the_cache_answers_without_blocking_on_a_miss() {
         let a: SocketAddr = "192.0.2.2:5064".parse().unwrap();
         assert_eq!(cached_name(a), "192.0.2.2:5064");
+    }
+
+    /// The position the CA client actually asks from on the exec backend: a
+    /// thread with no ambient tokio runtime. [`warming_at_connect_makes_the_first_ask_see_the_name`]
+    /// could not see this — `#[tokio::test]` supplies the very handle the
+    /// pre-fix `schedule` was reading, so it passed on both backends while
+    /// every real `CA.Client.Exception` on the exec backend printed the
+    /// dotted IP.
+    ///
+    /// Unix-only for the same `/etc/hosts` loopback-PTR reason as its
+    /// siblings above.
+    // RTEMS-EXEC-MODEL-ALLOW(0): no reactor-dependent site — the point of the
+    // case is that it runs on a bare thread, off every runtime.
+    #[cfg(all(unix, exec_backend))]
+    #[test]
+    fn a_bare_thread_still_resolves_on_the_callback_band() {
+        assert!(
+            tokio::runtime::Handle::try_current().is_err(),
+            "the case is only meaningful with no ambient runtime to read"
+        );
+        // A port no other case in this module warms, so this is a real miss.
+        let a: SocketAddr = "127.0.0.1:5197".parse().unwrap();
+        warm(a);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while cache().get(&a).is_none() && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert_ne!(
+            cached_name(a),
+            "127.0.0.1:5197",
+            "the callback band is always there on this backend, so a warmed \
+             address must answer with the resolved name"
+        );
     }
 }

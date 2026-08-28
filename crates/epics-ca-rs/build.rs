@@ -42,7 +42,7 @@
 //!
 //! ```text
 //! exec_backend  ⟺  epics_embedded_target (target_os in {"rtems", "vxworks"})
-//!               ||  feature "rtems-exec-model"
+//!               ||  EPICS_RS_BUILD_EXEC_BACKEND=thread
 //! tokio_backend ⟺  otherwise
 //! ```
 //!
@@ -53,11 +53,11 @@
 //! elsewhere, because the runtime is not entered on that worker. The client's
 //! UDP SEARCH transport was gated on `not(target_os = "rtems")`, which names
 //! the target when the fact it needs is the *backend*; a host build with
-//! `--features rtems-exec-model` compiled the UDP transport in and panicked on
-//! it at `realtime-ca-ioc`'s first search (measured, `doc/calink-rtems-design.md`
-//! §10.10 item 2). `tokio_backend` is the predicate that means "a reactor
-//! exists", so every arm that needs one takes that predicate — the target's
-//! shape, now reached by the host build that models the target.
+//! `EPICS_RS_BUILD_EXEC_BACKEND=thread` compiled the UDP transport in and
+//! panicked on it at `realtime-ca-ioc`'s first search (measured).
+//! `tokio_backend` is the predicate that means "a reactor exists", so every
+//! arm that needs one takes that predicate — the target's shape, now reached
+//! by the host build that models the target.
 //!
 //! The SEARCH socket is no longer one of those arms. It binds on both backends
 //! through `epics_base_rs::net::search_udp::SearchUdpSocket`, whose
@@ -69,8 +69,8 @@
 //! This is a third copy of a four-line rule, so it is pinned rather than
 //! trusted: a `const` assertion in `src/lib.rs` checks it against
 //! `epics_base_rs::runtime::task::HAS_TOKIO_REACTOR` at compile time. A build
-//! that enables `epics-base-rs/rtems-exec-model` without this crate's own
-//! `rtems-exec-model` fails to compile instead of panicking at boot.
+//! in which one of the two scripts missed `EPICS_RS_BUILD_EXEC_BACKEND` fails
+//! to compile instead of panicking at boot.
 
 fn main() {
     // Declared, never emitted here. See the note above.
@@ -92,28 +92,47 @@ fn main() {
         println!("cargo::rustc-cfg=epics_embedded_target");
     }
 
-    let host_exec_model = std::env::var_os("CARGO_FEATURE_RTEMS_EXEC_MODEL").is_some();
-    let tokio_backend = !(embedded_target || host_exec_model);
-    if tokio_backend {
-        println!("cargo::rustc-cfg=tokio_backend");
-    } else {
+    // Build-time backend selection, from the environment rather than from a
+    // cargo feature: a feature that flips a backend is not additive, so
+    // `--all-features` turned the reactor off and no single invocation meant
+    // "everything on". `epics-libcom-rs`'s module docs carry the reasoning;
+    // `tools/rtems-exec-gate` holds every copy of this block against that
+    // crate's, so 23 derivations of one rule cannot drift apart.
+    println!("cargo::rerun-if-env-changed=EPICS_RS_BUILD_EXEC_BACKEND");
+    let requested = std::env::var_os("EPICS_RS_BUILD_EXEC_BACKEND").unwrap_or_default();
+    let host_exec_backend = match requested.to_string_lossy().as_ref() {
+        "thread" => true,
+        "" | "tokio" => false,
+        bad => panic!(
+            "EPICS_RS_BUILD_EXEC_BACKEND={bad}: the exec backend is `thread` \
+             (reactor-free std threads) or `tokio` (the host default, which an \
+             unset or empty variable also selects)"
+        ),
+    };
+    if embedded_target || host_exec_backend {
         println!("cargo::rustc-cfg=exec_backend");
+    } else {
+        println!("cargo::rustc-cfg=tokio_backend");
     }
+    let tokio_backend = !(embedded_target || host_exec_backend);
 
     // `ca_beacon_monitor` — this build has a UDP beacon listener.
     //
-    // One name for one fact, because it is consumed at fifteen sites in
-    // `client/mod.rs` (the task handle, the coordinator's anomaly message, the
-    // control channel, the abort on shutdown) and a two-term conjunction
-    // restated fifteen times is fifteen chances to restate it differently.
+    // One name for one fact, because `client/mod.rs` gates on it at every site
+    // that touches the monitor — the task handle, the coordinator's anomaly
+    // message, the control channel, the abort on shutdown — and a two-term
+    // conjunction restated at each of them is one chance per site to restate it
+    // differently. Deliberately no count: this sentence used to carry one, it
+    // was wrong by four the first time anyone checked it against the file, and
+    // the argument was never about how many.
     //
     // Both terms are load-bearing. `feature = "client"` because the beacon
     // monitor is an optimisation over the UDP discovery stack that the
-    // `client-core` split leaves out (`doc/calink-rtems-design.md` §2.1).
-    // `tokio_backend` because the monitor's own socket and its repeater
-    // registration are `tokio::net` UDP sockets opened inside a future started
-    // through `runtime::task::spawn` — on `exec_backend` that future runs on a
-    // callback-pool worker with no reactor entered and both sockets panic.
+    // `client-core` split leaves out. `tokio_backend` because the monitor's
+    // own socket and its repeater registration are `tokio::net` UDP sockets
+    // opened inside a future started through `runtime::task::spawn` — on
+    // `exec_backend` that future runs on a callback-pool worker with no
+    // reactor entered and both sockets panic.
     if tokio_backend && std::env::var_os("CARGO_FEATURE_CLIENT").is_some() {
         println!("cargo::rustc-cfg=ca_beacon_monitor");
     }

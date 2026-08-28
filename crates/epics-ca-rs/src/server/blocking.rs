@@ -17,8 +17,7 @@
 //!   `armv7-rtems-eabihf`: `mio` has epoll/kqueue/IOCP selectors only, and
 //!   rust-lang/libc's newlib/RTEMS bindings declare neither. That is a
 //!   Rust-bindings gap, **not** evidence that a reactor cannot run on RTEMS —
-//!   the BSP's own `kqueue` is measured serving a libevent reactor on RTEMS 6
-//!   (`doc/rtems-scope-b-session-handoff.md` §5.3).
+//!   the BSP's own `kqueue` is measured serving a libevent reactor on RTEMS 6.
 //!
 //! Plain `std::net` blocking BSD sockets DO build for `armv7-rtems-eabihf`,
 //! and work on hosted Unix too — so this whole driver is host-compiled and
@@ -31,12 +30,12 @@
 //! sender — but it **borrows** them, as one set, from `CAS_CLIENT_POOL`; it
 //! creates neither. Every `std::thread` *creation* leaves 176–179 B behind
 //! permanently on RTEMS 6, so a driver that created two per accept leaked
-//! without a ceiling (`doc/rtems-connection-worker-pool-design.md`). Borrowing
+//! without a ceiling. Borrowing
 //! is also the single admission point: the accept loop's one
 //! [`WorkerPool::acquire`] is the only fallible step before a client is served,
 //! and its failure — a full process or a target out of thread resources — is
 //! the one refusal, taken after `accept` with the socket still open, where C
-//! `rsrv` takes its own (`caservertask.c:1240-1250`). The pool's capacity is
+//! `rsrv` takes its own (`caservertask.c:1241-1251`). The pool's capacity is
 //! deliberately **one below** the target's descriptor wall so that refusal has
 //! a descriptor to happen on; see `CAS_CLIENT_POOL_CAPACITY`, where the
 //! measurement that forced the "one below" is cited.
@@ -68,7 +67,7 @@
 //! # The send lock
 //!
 //! C serializes every write to one client's socket with `client->lock`
-//! (`SEND_LOCK`, `server.h:221`), because two threads write it — the
+//! (`SEND_LOCK`, `server.h:212`), because two threads write it — the
 //! `camsgtask` command thread and the `CAS-event` monitor thread
 //! (`dbEvent.c:1016`). We model that with an `Arc<Mutex<Arc<TcpStream>>>` write
 //! handle. Both writers now exist (S1c): the client thread draining command
@@ -106,10 +105,10 @@
 //! `serve_write_head` registers and consults it (`PutNotifySlot`), so both loops
 //! answer a concurrent WRITE_NOTIFY the same way — the arriving request is never
 //! refused here, and ECA_PUTCBINPROG goes to a predecessor only once it has
-//! outstayed C's 60 s `blockSem` wait (`camessage.c:1745`). Whether the database
+//! outstayed C's 60 s `blockSem` wait (`camessage.c:1701`). Whether the database
 //! below queues a second put-callback on the record's restart list or refuses
-//! it is the database's decision, and a `PutCallbackInProgress` raised there
-//! reaches the client through the ordinary put-failure mapping on both loops.
+//! it is not an open question: it queues, so neither loop has a database-level
+//! refusal to relay.
 //!
 //! The gateway `-no_cache` read-hook GET (`tcp.rs:3111`) is the one genuinely
 //! async branch a READ can reach; it is unreachable for a local record
@@ -164,14 +163,13 @@ use crate::server::udp::{self, SearchReplyBatch};
 /// The ACF handle type [`ClientState::new`] expects. Lock-free: a check takes
 /// an `Arc` snapshot of the policy and never blocks, so a `CAS-client` thread
 /// at EPICS 20 cannot hold an operator reload — or any higher-priority
-/// checker — off while it is preempted. See
-/// `doc/rtems-priority-locks-design.md` §3 row L9.
+/// checker — off while it is preempted.
 type SharedAcf = epics_base_rs::server::access_security::AcfCell;
 
 /// The EPICS priority the TCP accept loop runs at.
 ///
 /// C parity: `rsrv` builds a descending ladder from
-/// `epicsThreadPriorityCAServerLow` (`caservertask.c:562-575`) and creates
+/// `epicsThreadPriorityCAServerLow` (`caservertask.c:563-575`) and creates
 /// `CAS-TCP` with `threadPrios[2]` (`:716`). On RTEMS
 /// `epicsThreadHighestPriorityLevelBelow` is exactly `p - 1`
 /// (`libcom/src/osi/os/RTEMS-score/osdThread.c:120-131`), so the ladder is
@@ -186,7 +184,7 @@ const CAS_TCP_PRIORITY: ThreadPriority =
 
 /// The EPICS priority the UDP name-search responder runs at.
 ///
-/// C parity: `threadPrios[4]` (`caservertask.c:722`), which on RTEMS is
+/// C parity: `threadPrios[4]` (`caservertask.c:723`), which on RTEMS is
 /// `CAServerLow - 4` = **16** — again the number the PVA side already uses
 /// for the same role (`PVA_UDP_PRIORITY`, `pvxs/src/udp_collector.cpp:93`).
 ///
@@ -201,12 +199,10 @@ const CAS_UDP_PRIORITY: ThreadPriority =
 /// most two-thread sets [`CAS_CLIENT_POOL`] may ever create.
 ///
 /// **One below the target's fd wall, and the "one below" is the whole point.**
-/// Every term is read out of a source file or out of a measurement:
-/// `doc/rtems-fd-ceiling-deviation.md` for the wall, and
-/// `doc/rtems-ca-worker-pool-on-target-measurement.md` for this driver's own
-/// ramp to it (142 established and held 140 s at the wall, the 143rd's `accept`
-/// failing with nothing said to the peer — which is what forced the "one
-/// below").
+/// Every term is read out of a source file or out of a measurement: the fd
+/// wall, and this driver's own ramp to it (142 established and held 140 s at
+/// the wall, the 143rd's `accept` failing with nothing said to the peer —
+/// which is what forced the "one below").
 ///
 /// * **fd wall = 142.** `CONFIGURE_MAXIMUM_FILE_DESCRIPTORS` is 150
 ///   (`crates/epics-rtems-boot/csrc/rtems_config.c` §F) and the IOC holds 8
@@ -276,11 +272,10 @@ const CAS_CLIENT_POOL_CAPACITY: usize = 141;
 ///   on `x86_64-wrs-vxworks` is **65,912 B**, three times C's whole `Big`
 ///   allowance. That is the port's own cost — `park_on` pins each connection's
 ///   async state machine onto this stack — and it is what the class table, not
-///   the class name, has to cover. See §15 of
-///   `doc/vxworks-ca-worker-pool-on-target-measurement.md`: 65,912 B proved
-///   invariant across payloads from 8 B to 1,048,576 B, the
-///   `DBR_DOUBLE`/`TIME`/`CTRL` reply shapes, `subArray`, `compress`, the FLNK
-///   recursion at its `MAX_LINK_DEPTH` cap, and six monitors per connection.
+///   the class name, has to cover: 65,912 B proved invariant across payloads
+///   from 8 B to 1,048,576 B, the `DBR_DOUBLE`/`TIME`/`CTRL` reply shapes,
+///   `subArray`, `compress`, the FLNK recursion at its `MAX_LINK_DEPTH` cap,
+///   and six monitors per connection.
 ///
 ///   **The class is `Medium`, decided from a measurement on BOTH targets this
 ///   roster serves.** The second one closed the gap that used to hold this at
@@ -345,8 +340,7 @@ fn client_roster() -> [WorkerRole; 2] {
 /// that creates two threads per accepted client leaks without a ceiling — a
 /// client that connects and disconnects in a loop drains the target's heap for
 /// as long as the IOC runs. Borrowing bounds the creations at
-/// `CAS_CLIENT_POOL_CAPACITY × 2` for the life of the process
-/// (`doc/rtems-connection-worker-pool-design.md`).
+/// `CAS_CLIENT_POOL_CAPACITY × 2` for the life of the process.
 ///
 /// **Process-wide, not per-server**, and that is the same argument
 /// [`refused_clients`] already makes: the resource that runs out — descriptors,
@@ -458,7 +452,7 @@ impl BlockingCaServer {
     /// Clients currently being served.
     ///
     /// A count, not a limit. C rsrv has no connection limit at either of its
-    /// refusal sites (`caservertask.c:1234-1250` and `:110-118` both refuse on
+    /// refusal sites (`caservertask.c:1235-1250` and `:110-118` both refuse on
     /// a resource failure, never on a count), and neither do we — this exists
     /// so the number can be *reported*. It is the number the bring-up box
     /// measured the ceiling in: 142 concurrent, connection 143 refused by the
@@ -487,13 +481,22 @@ impl BlockingCaServer {
         // to `RTEMS_MAXIMUM_PRIORITY - 1` (`epics-rtems-boot`'s
         // `rtems_init.c`, matching base's `libcom/RTEMS/posix/rtems_init.c`)
         // and RTEMS pthreads inherit their creator's parameters
-        // (`cpukit/posix/src/pthreadattrdefault.c:49-58`), so a thread that
+        // (`cpukit/posix/src/pthreadattrdefault.c:49-58` (both `rtems` pins)), so a thread that
         // does not take a band of its own runs one level above idle. Base
         // escapes that by setting `PTHREAD_EXPLICIT_SCHED` at creation
         // (`osdThread.c:158-166`); `std::thread::Builder` cannot, so taking
         // the band at the top of the thread body is our equivalent — and a
         // loop that skipped it would be preempted by every client it accepts.
         let _ = enter_ioc_thread(CAS_TCP_PRIORITY);
+        // C `req_server` registers with the watchdog before it signals
+        // `castcp_startStopEvent` (`caservertask.c:67`, removed at `:127`).
+        // Unbounded: this loop's normal state is parked in `accept`, which has
+        // no deadline of its own.
+        let _watched = epics_base_rs::runtime::taskwd::taskwd_insert(
+            "CAS-TCP",
+            epics_base_rs::runtime::taskwd::CheckIn::Unbounded,
+            None,
+        );
         let mut backoff = AcceptBackoff::new();
         for stream in self.listener.incoming() {
             match stream {
@@ -664,9 +667,8 @@ static REFUSED_CLIENTS: std::sync::atomic::AtomicU64 = std::sync::atomic::Atomic
 ///   nothing to do with the bound (it was never reached).
 ///
 /// `worker pool at capacity` is kept verbatim from the pre-fix wording: it is
-/// the string in the on-target consoles quoted in
-/// `doc/vxworks-ca-refusal-fidelity.md` §2, so an operator's existing grep
-/// still finds a refusal.
+/// the string in the on-target consoles, so an operator's existing grep still
+/// finds a refusal.
 fn refusal_reason(cause: &AcquireError) -> String {
     let gate = match cause {
         AcquireError::AtCapacity { capacity } => {
@@ -703,7 +705,7 @@ fn refusal_reason(cause: &AcquireError) -> String {
 ///
 /// # Parity
 ///
-/// C refuses in `create_client` (`rsrv/caservertask.c:1240-1250`): it
+/// C refuses in `create_client` (`rsrv/caservertask.c:1241-1251`): it
 /// pre-checks `osiSufficentSpaceInPool(sizeof(struct client) + MAX_TCP)`,
 /// and on failure calls `epicsSocketDestroy(sock)` **plus**
 /// `epicsPrintf("CAS: no space in pool for a new client ...")`. The message is
@@ -725,9 +727,9 @@ fn refusal_reason(cause: &AcquireError) -> String {
 /// * We also tell the *peer*. C does not, but the protocol allows it and a
 ///   silent close is what made this invisible: `CA_PROTO_ERROR` carrying
 ///   `ECA_ALLOCMEM` reaches libca's `exceptionRespAction` →`defaultExcep`
-///   (`cac.cpp:1081-1118`, `1006-1017`), which raises the status with our
+///   (`cac.cpp:1079-1117`, `1004-1015`), which raises the status with our
 ///   context string on the client. The dispatch is by command code alone
-///   (`cac::executeResponse`, `cac.cpp:1208-1220`) — there is no
+///   (`cac::executeResponse`, `cac.cpp:1206-1218`) — there is no
 ///   version-verified gate — so this is legible from either site, including
 ///   the accept-loop one where the circuit never got its VERSION reply.
 ///
@@ -754,7 +756,7 @@ fn refusal_reason(cause: &AcquireError) -> String {
 ///
 /// What carries the gate is the diagnostic string, and it reaches the client:
 /// `defaultExcep` passes it as the exception's `Context:` line
-/// (`cac.cpp:1013-1016`, `%.400s`). So the distinction is on the wire, in the
+/// (`cac.cpp:1010-1013`, `%.400s`). So the distinction is on the wire, in the
 /// only field that can hold it — see [`refusal_reason`].
 fn refuse_client(peer: SocketAddr, cause: &AcquireError, send: impl FnOnce(&[u8])) {
     let nth = REFUSED_CLIENTS.fetch_add(1, Ordering::Relaxed) + 1;
@@ -781,8 +783,7 @@ fn refuse_client(peer: SocketAddr, cause: &AcquireError, send: impl FnOnce(&[u8]
     // ordinal. MUST NOT: any refusal be sampled away, and MUST NOT: one
     // refusal produce two records that a reader has to reconcile.
     //
-    // Both halves were broken and the E8 target run measured both
-    // (`doc/vxworks-ca-refusal-fidelity.md` §2). This used to
+    // Both halves were broken and the E8 target run measured both. This used to
     // announce on `errlog` only when the ordinal was a power of two, *and* emit
     // an ungated `tracing::warn!` beside it. On the 1024M guest that put 8 WARN
     // lines and 4 `errlog` lines on the console for 8 refusals; on the 2048M
@@ -809,7 +810,7 @@ fn refuse_client(peer: SocketAddr, cause: &AcquireError, send: impl FnOnce(&[u8]
     // `error` is `reason`'s parenthesised tail.
     epics_base_rs::runtime::log::errlog_sev_printf(
         epics_base_rs::runtime::log::ErrlogSevEnum::Major,
-        &format!("{reason} — refused {peer} (refusal #{nth})"),
+        &format!("{reason} — refused {peer} (refusal #{nth})\n"),
     );
 }
 
@@ -817,7 +818,7 @@ fn refuse_client(peer: SocketAddr, cause: &AcquireError, send: impl FnOnce(&[u8]
 /// (no `socket2`), so the socket-option path builds for RTEMS. For a
 /// well-known port, enables SO_REUSEADDR + SO_REUSEPORT *before* bind so
 /// several IOCs can share the CA search port — C
-/// `epicsSocketEnableAddressUseForDatagramFanout` (`caservertask.c:628`).
+/// `epicsSocketEnableAddressUseForDatagramFanout` (`caservertask.c:629`).
 /// An ephemeral (`0`) port is left bare: the flags would let the kernel
 /// join this socket to an unrelated reuse group and load-balance SEARCHes
 /// away from it, so the async responder (`udp::bind_responder_socket`) and
@@ -939,6 +940,19 @@ fn handle_udp_search_blocking(
     tcp_port: u16,
     shutdown: &AtomicBool,
 ) -> CaResult<()> {
+    // C `cast_server` reaches the watchdog through `casAttachThreadToClient`
+    // (`cast_server.c:151`), the same call its TCP siblings make — the UDP
+    // name-search thread is a registered task there too. This driver serves
+    // one socket per call, so one entry per call is C's one entry per
+    // `CAS-UDP` thread. Unbounded: the loop parks in `recv_from`.
+    let _watched = epics_base_rs::runtime::taskwd::taskwd_insert(
+        match socket.local_addr() {
+            Ok(a) => format!("CAS-UDP {}", a.ip()),
+            Err(_) => "CAS-UDP".to_string(),
+        },
+        epics_base_rs::runtime::taskwd::CheckIn::Unbounded,
+        None,
+    );
     // Cap each blocking `recv_from` so the loop can observe `shutdown` between
     // datagrams. C `cast_server` blocks in `recvfrom` forever; this timeout is
     // only a clean-stop seam and is otherwise transparent to the protocol.
@@ -1083,7 +1097,7 @@ fn write_frame_locked(send_lock: &Mutex<Arc<TcpStream>>, frame: &[u8]) -> std::i
 /// Drain every queued frame into the socket in arrival order, then flush
 /// once. Single owner of "server bytes reach the socket" for the command
 /// path — the blocking analogue of `drain_and_flush` (`tcp.rs:1627`), held
-/// under the `client->lock` send-lock (`server.h:221`).
+/// under the `client->lock` send-lock (`server.h:74`).
 fn drain_outbox_locked(
     send_lock: &Mutex<Arc<TcpStream>>,
     drain: &mut OutboxDrain,
@@ -1110,6 +1124,11 @@ struct BlockingSub {
     data_type: u16,
     data_count: u32,
     target: ChannelTarget,
+    /// This driver's copy of the subscription's delivery gate. The event
+    /// thread holds the other one; revoking here is what stops it before the
+    /// dispatch thread queues a cancel confirmation. See
+    /// [`MonitorGate`](crate::server::outbox::MonitorGate).
+    gate: crate::server::outbox::MonitorGate,
 }
 
 /// Serve one CA client over a blocking `TcpStream`. C `camsgtask`
@@ -1129,7 +1148,7 @@ fn handle_client_blocking(
 ) -> CaResult<()> {
     // C `create_client` sets both of these and refuses the client —
     // `destroy_client`, `return NULL` — when either `setsockopt` fails
-    // (`caservertask.c:1444`, `:1456`), so neither is best-effort here. The
+    // (`caservertask.c:1445`, `:1456`), so neither is best-effort here. The
     // hosted driver sets KEEPALIVE in `tcp::accept_loop` through `socket2`,
     // which does not build for the embedded triples, so on this path the
     // option comes from `runtime::socket` instead.
@@ -1137,19 +1156,24 @@ fn handle_client_blocking(
     // # What KEEPALIVE does NOT do
     //
     // It does not bound a client that stops reading. That claim used to stand
-    // here and it is false on rtems-libbsd, read at `freebsd/sys/netinet/`:
+    // here and it is false on rtems-libbsd, read at its declared pin under
+    // `freebsd/sys/netinet/` (these lines are the same at both series):
     //
     // * A peer that stops reading advertises a zero window, which runs the
-    //   PERSIST timer, not the keepalive one. Keepalive is rearmed by inbound
-    //   traffic (`tcp_input.c:2061`, `:2460`), and a zero-window peer keeps
-    //   ACKing our window probes, so it never expires.
-    // * The persist timer's own drop needs
-    //   `t_rxtshift == TCP_MAXRXTSHIFT && ticks - t_rcvtime >=
-    //   tcp_maxpersistidle` (`tcp_timer.c:540-541`) — but `t_rcvtime = ticks`
-    //   is refreshed by EVERY inbound segment (`tcp_input.c:1596`), and those
-    //   probe ACKs are inbound segments. A peer that answers and never reads
-    //   refreshes it forever.
-    // * `tcp_maxpersistidle = TCPTV_KEEP_IDLE` (`tcp_subr.c:1098`), which is
+    //   PERSIST timer, not the keepalive one. And the keepalive timer defers
+    //   ITSELF while traffic arrives: `tcp_timer_keep` recomputes
+    //   `idletime = ticks - t_rcvtime` and, below `TP_KEEPIDLE`, re-arms for
+    //   the remainder instead of probing (`tcp_timer.c:400-410` (both `rtems-libbsd` pins)). A
+    //   zero-window peer keeps ACKing our window probes, so it never expires.
+    // * The persist timer's own drop needs `t_rxtshift >= V_tcp_retries &&
+    //   ticks - t_rcvtime >= tcp_maxpersistidle` (`tcp_timer.c:516-524` (both `rtems-libbsd` pins);
+    //   `V_tcp_retries` defaults to `TCP_MAXRXTSHIFT`, `:220`) — but
+    //   `t_rcvtime = ticks` is refreshed by EVERY inbound segment
+    //   (`tcp_input.c:1597` (both `rtems-libbsd` pins)), and those probe ACKs are inbound segments. A
+    //   peer that answers and never reads refreshes it forever. The keepalive
+    //   drop test reads the same field (`tcp_timer.c:422-423` (both `rtems-libbsd` pins)), so neither
+    //   timer can reap it.
+    // * `tcp_maxpersistidle = TCPTV_KEEP_IDLE` (`tcp_subr.c:1534` (both `rtems-libbsd` pins)), which is
     //   why the two are easy to mistake for one another.
     //
     // So nothing in the stack reaps this client: `write_frame_locked` parks in
@@ -1176,16 +1200,50 @@ fn handle_client_blocking(
     //
     // The split is made by SHARING one `TcpStream` through an `Arc`, not by
     // duplicating the descriptor. `try_clone` is `fcntl(F_DUPFD_CLOEXEC)`, and
-    // on RTEMS 6 that cannot work for a socket: RTEMS's `fcntl` has no
-    // `F_DUPFD_CLOEXEC` case at all (`cpukit/libcsupport/src/fcntl.c:146-220`
-    // falls to `default: errno = EINVAL`), and even plain `F_DUPFD` fails
-    // because `duplicate_iop` (`fcntl.c:47-77`) calls the file's `open_h`
-    // while rtems-libbsd installs `rtems_bsd_sysgen_nodeops` on every socket
-    // (`rtems-bsd-syscall-api.c:204-205`), whose `.open_h` is
-    // `rtems_bsd_sysgen_open_error`. Measured on the target: `dup`,
-    // `F_DUPFD` and `F_DUPFD_CLOEXEC` all fail on an accepted socket while
-    // `F_DUPFD` on `/dev/console` succeeds. `impl Read/Write for &TcpStream`
-    // gives the same two roles with one descriptor, on every target.
+    // on RTEMS 6 that cannot work for a socket: the RTEMS 6 kernel's `fcntl`
+    // has no `F_DUPFD_CLOEXEC` case at all, so it falls to
+    // `default: errno = EINVAL` (`cpukit/libcsupport/src/fcntl.c:146-220` at
+    // the `rtems_6` pin -- the RTEMS 7 kernel DOES handle it, at `:173-175`,
+    // so this ban rests on the series we ship, not on RTEMS in general).
+    //
+    // That 7-vs-6 split is this project's own, and it has a reachable end.
+    // RTEMS 7's `fcntl` handles `F_DUPFD_CLOEXEC` because of four commits we
+    // authored on the kernel's `main` -- `7043f23ba0` (add
+    // `fcntl(F_DUPFD_CLOEXEC)`), `1e5da72852` (honour the descriptor minimum
+    // of `F_DUPFD`), `4bb46046ad` (`F_DUP2FD` onto a free descriptor) and
+    // `6b52a0c22d` (`dup2()` onto a descriptor that is not open). All four
+    // are ancestors of the `rtems` pin; none is an ancestor of `rtems_6`. So
+    // the kernel half of the ban is not a permanent property of RTEMS 6 --
+    // it is a backport nobody has done, and it lapses the day those four
+    // land on `6`, exactly as the libbsd half already lapsed.
+    //
+    // The second half of the old rationale here -- that plain `F_DUPFD` also
+    // fails, because `duplicate_iop` calls the file's `open_h`
+    // (`cpukit/libcsupport/src/fcntl.c:47-79` at the `rtems_6` pin, the call
+    // at `:67`) and libbsd's
+    // socket `open_h` is `rtems_bsd_sysgen_open_error` -- is NO LONGER TRUE
+    // at either declared libbsd pin: `nodeops.open_h` is `rtems_bsd_sysgen_dup`
+    // (`rtems-bsd-syscall-api.c:139-140` (both `rtems-libbsd` pins)), a real dup through
+    // `fget`/`finstall`, installed on an accepted socket at `:299-301`.
+    // `rtems_bsd_sysgen_open_error` is still defined but no handler table
+    // names it. The measured ENXIO below predates that change
+    // (libbsd `c86cbc57` / `08d8e275`, 2026-07-28, ancestors of both pins).
+    //
+    // Measured on the target BEFORE that libbsd change: `dup`, `F_DUPFD` and
+    // `F_DUPFD_CLOEXEC` all fail on an accepted socket while `F_DUPFD` on
+    // `/dev/console` succeeds. `impl Read/Write for &TcpStream` gives the same
+    // two roles with one descriptor, on every target and every series, which
+    // is why the sharing stands whatever the stack does about dup.
+    // C `casAttachThreadToClient` registers the thread that is about to run
+    // this client's message loop (`caservertask.c:1323`), and `destroy_client`
+    // removes it (`:1064`). Unbounded: the loop is parked in `read` between
+    // frames, and a quiet client is not a fault.
+    let _watched = epics_base_rs::runtime::taskwd::taskwd_insert(
+        format!("CAS-client {peer}"),
+        epics_base_rs::runtime::taskwd::CheckIn::Unbounded,
+        None,
+    );
+
     let stream = Arc::new(stream);
     let mut reader: &TcpStream = &stream;
     let send_lock = Arc::new(Mutex::new(stream.clone()));
@@ -1194,7 +1252,7 @@ fn handle_client_blocking(
     let mut state = ClientState::new(acf, tcp_port, db.clone());
     state.apply_connection_identity(peer, None, None);
 
-    // C `create_tcp_client` (`caservertask.c:1525`) sends an unsolicited
+    // C `create_tcp_client` (`caservertask.c:1526`) sends an unsolicited
     // CA_PROTO_VERSION as the first server frame; libca treats every received
     // frame as a liveness beat, so send it before the read loop.
     {
@@ -1203,14 +1261,15 @@ fn handle_client_blocking(
         write_frame_locked(&send_lock, &hdr.to_bytes()).map_err(CaError::Io)?;
     }
 
-    // The CAS-event monitor thread — the analogue of C `dbEvent.c` `event_task`
-    // (`~876`): a SECOND thread per client that blocks on this client's monitor
-    // queues and, when `db_post_events` posts an update, writes it to the socket
-    // under the SAME `send_lock` this read/dispatch thread drains its command
-    // replies under (C `client->lock` serializes `camsgtask` + `event_task`,
-    // `server.h:221`). It has no async runtime either: `run_event_task` is an
-    // async fn driven by `park_on`; its readers suspend on the runtime-agnostic
-    // `EvQue` wake (a `Notify`) and are woken cross-thread by `db_post_events`.
+    // The CAS-event monitor thread — the analogue of C `event_task`
+    // (`dbEvent.c:1016`): a SECOND thread per client that blocks on this
+    // client's monitor queues and, when `db_post_events` posts an update, writes
+    // it to the socket under the SAME `send_lock` this read/dispatch thread
+    // drains its command replies under (C `client->lock` serializes `camsgtask`
+    // + `event_task`, `server.h:74`). It has no async runtime either:
+    // `run_event_task` is an async fn driven by `park_on`; its readers suspend
+    // on the runtime-agnostic `EvQue` wake (a `Notify`) and are woken
+    // cross-thread by `db_post_events`.
     //
     // It runs on the `event` worker of this client's leased set, whose stack
     // class and band are the role's (`client_roster`). Pooled, so this dispatch
@@ -1223,6 +1282,14 @@ fn handle_client_blocking(
     let (ev_tx, ev_rx) = mpsc::unbounded_channel::<EventTaskControl>();
     let event_send_lock = send_lock.clone();
     let event_job = event_worker.run(move || {
+        // C `event_task` registers itself (`dbEvent.c:1027`) and removes on the
+        // way out (`:1093`). Unbounded: it parks on this client's monitor
+        // queues, and a client whose PVs are quiet posts nothing.
+        let _watched = epics_base_rs::runtime::taskwd::taskwd_insert(
+            format!("CAS-event {peer}"),
+            epics_base_rs::runtime::taskwd::CheckIn::Unbounded,
+            None,
+        );
         let mut write = |frame: &[u8]| write_frame_locked(&event_send_lock, frame);
         if block_on_sync(run_event_task(ev_rx, &mut write)).is_err() {
             tracing::error!(
@@ -1353,6 +1420,20 @@ fn handle_client_blocking(
                         let _ = drain_outbox_locked(&send_lock, &mut drain);
                         return Err(reason);
                     }
+                    Gate::Discard => {
+                        // The rate policy dropped it. The cursor is already
+                        // past the message, so this is just the next one.
+                        continue;
+                    }
+                    Gate::RateLimited { strikes } => {
+                        tracing::warn!(
+                            target: "epics_ca_rs::server::blocking",
+                            %peer,
+                            strikes,
+                            "rate limit exceeded; closing connection"
+                        );
+                        return Ok(());
+                    }
                 };
 
                 if hdr.cmmd == CA_PROTO_EVENT_ADD {
@@ -1395,8 +1476,13 @@ fn handle_client_blocking(
                                     data_type: r.data_type,
                                     data_count: r.data_count,
                                     target: r.target.clone(),
+                                    gate: r.gate.clone(),
                                 },
                             );
+                            // C `event_add_action` links the new `event_ext` onto
+                            // `pciu->eventq`; that link is what lets CLEAR_CHANNEL
+                            // cancel this monitor.
+                            state.link_subscription(r.channel_sid, r.sub_id, r.gate.clone());
                             // Hand the live reader to the event thread; it frames
                             // every later update with the same `send_event` builder
                             // the async producer uses (byte-identical). If the event
@@ -1404,10 +1490,12 @@ fn handle_client_blocking(
                             let _ = ev_tx.send(EventTaskControl::Add(Box::new(MonitorDelivery {
                                 reader: r.reader,
                                 target: r.target,
+                                cid: r.cid,
                                 sub_id: r.sub_id,
                                 data_type: r.data_type,
                                 data_count: r.data_count,
                                 denied: r.denied,
+                                gate: r.gate,
                                 long_string_mode: r.long_string_mode,
                                 req_hdr: hdr,
                                 client_minor: r.client_minor,
@@ -1439,9 +1527,11 @@ fn handle_client_blocking(
                         channel_sid: s.channel_sid,
                         data_type: s.data_type,
                         data_count: s.data_count,
+                        gate: s.gate.clone(),
                     });
                     match cancel_subscription_reply(&hdr, &state, &outbox, sub_info) {
                         Ok(true) => {
+                            state.unlink_subscription(hdr.cid, sub_id);
                             if let Some(sub) = blk_subs.remove(&sub_id) {
                                 // Stop the producer: drop the reader on the event
                                 // thread, then remove the subscriber from record/PV.
@@ -1515,9 +1605,38 @@ fn handle_client_blocking(
                     // the first poll. Spawning commands are gated out above; the
                     // gateway read-hook GET is unreachable for a local record.
                     match block_on_sync(dispatch_message(
-                        &hdr, &payload, &mut state, &db, &outbox, peer, None,
+                        &hdr,
+                        &payload,
+                        &mut state,
+                        &db,
+                        &outbox,
+                        peer,
+                        None,
+                        SubscriptionDelivery::HandOff,
                     )) {
-                        Ok(Ok(())) => {}
+                        Ok(Ok(())) => {
+                            // CLEAR_CHANNEL retires a channel's monitors in the
+                            // shared handler, which revoked their gates before it
+                            // queued the delete-confirmed echo but cannot reach
+                            // this driver's producers. Finish that teardown here,
+                            // BEFORE the echo is drained to the socket, so the
+                            // whole `db_cancel_event`-then-confirm order of C
+                            // `clear_channel_reply` (`camessage.c:1890-1912`)
+                            // holds on this driver too.
+                            for sub_id in state.take_retired_subscriptions() {
+                                if let Some(sub) = blk_subs.remove(&sub_id) {
+                                    let _ = ev_tx.send(EventTaskControl::Cancel(sub.sub_id));
+                                    match &sub.target {
+                                        ChannelTarget::SimplePv(pv) => {
+                                            pv.remove_subscriber(sub.sub_id);
+                                        }
+                                        ChannelTarget::RecordField { record, .. } => {
+                                            record.write().remove_subscriber(sub.sub_id);
+                                        }
+                                    }
+                                }
+                            }
+                        }
                         Ok(Err(e)) => {
                             // Ship anything an earlier handler in this burst (or
                             // this handler's own error frame) queued, then end.
@@ -1591,14 +1710,7 @@ fn handle_client_blocking(
 mod tests {
     use super::*;
     use crate::protocol::ECA_TOLARGE;
-    /// Everything before the first column-0 `#[cfg(test)]`.
-    fn production_scope(src: &str) -> &str {
-        match src.find("\n#[cfg(test)]") {
-            Some(i) => &src[..i],
-            None => src,
-        }
-    }
-
+    use source_guard::{Comments, production};
     /// The refusal must reach the peer as a protocol message, not as a bare
     /// close. Measured on target, a client past the ceiling completed its
     /// VERSION send and then saw the socket go away with nothing on it.
@@ -1699,8 +1811,7 @@ mod tests {
     /// The two need opposite remedies — raise the bound versus give the target
     /// memory — and on VxWorks 7 both walls were reached on the same image,
     /// 96 concurrent with `EAGAIN` on a 1280M guest and 141 with the pool's own
-    /// capacity on a 2048M one, with `available=48` on both
-    /// (`doc/vxworks-ca-refusal-fidelity.md` §6). The status
+    /// capacity on a 2048M one, with `available=48` on both. The status
     /// code cannot separate them (see [`refuse_client`]), so the diagnostic
     /// must, and it must carry the *bound* — a capacity refusal that does not
     /// say what the capacity is tells an operator nothing they can act on.
@@ -1777,8 +1888,7 @@ mod tests {
     ///
     /// Both halves failed on target and both are asserted here, because either
     /// one alone makes the console's refusal count a number an operator cannot
-    /// read. Measured on VxWorks 7 at the connection wall
-    /// (`doc/vxworks-ca-refusal-fidelity.md` §2): 8 refusals
+    /// read. Measured on VxWorks 7 at the connection wall: 8 refusals
     /// produced 4 `errlog` records and 8 `warn` records, and 4 refusals
     /// produced 3 and 4 — so neither sink's line count was the refusal count,
     /// and the `errlog` stream, which is the one an EPICS operator reads,
@@ -1901,7 +2011,7 @@ mod tests {
         let mut unclassified = Vec::new();
         let mut checked = 0usize;
         for (label, src) in files {
-            let prod = production_scope(src);
+            let prod = production(src, Comments::Strip);
             for (n, after) in prod.split("thread::Builder::new()").skip(1).enumerate() {
                 checked += 1;
                 let chain = after.split(".spawn(").next().unwrap_or("");
@@ -1937,7 +2047,7 @@ mod tests {
         // classes are stated once, in the roster the pool creates its workers
         // from. A role added or a class dropped there is two threads per client
         // at std's 2 MiB RTEMS default, which is the ceiling this guard is about.
-        let prod = production_scope(include_str!("blocking.rs"));
+        let prod = production(include_str!("blocking.rs"), Comments::Strip);
         let roster = {
             let at = prod
                 .find("fn client_roster()")
@@ -1976,7 +2086,7 @@ mod tests {
     /// edit to the entry point cannot quietly restore that.
     #[test]
     fn the_rtems_ioc_is_not_mute() {
-        let prod = production_scope(include_str!("../bin/realtime-ca-ioc.rs"));
+        let prod = production(include_str!("../bin/realtime-ca-ioc.rs"), Comments::Strip);
         assert!(
             prod.contains("install_console_subscriber("),
             "realtime-ca-ioc installs no tracing subscriber: every diagnostic it \
@@ -2001,7 +2111,7 @@ mod tests {
     /// would be the per-accept creation the pool exists to remove.
     #[test]
     fn client_admission_is_one_acquire_with_one_refusal_behind_it() {
-        let prod = production_scope(include_str!("blocking.rs"));
+        let prod = production(include_str!("blocking.rs"), Comments::Strip);
 
         assert_eq!(
             prod.matches("thread::Builder::new()").count(),
@@ -2045,7 +2155,7 @@ mod tests {
     /// halves are load-bearing on the target and unobservable off it:
     ///
     /// * **Band.** RTEMS pthreads inherit their creator's scheduling
-    ///   parameters (`cpukit/posix/src/pthreadattrdefault.c:49-58`, and `std`
+    ///   parameters (`cpukit/posix/src/pthreadattrdefault.c:49-58` (both `rtems` pins), and `std`
     ///   never calls `pthread_attr_setinheritsched`), and the boot shim runs
     ///   `POSIX_Init` at `RTEMS_MAXIMUM_PRIORITY - 1`. A thread that skips the
     ///   prologue therefore does not run "at the default" — it runs one level
@@ -2069,7 +2179,7 @@ mod tests {
     /// Fails today, on Linux, with no cross toolchain.
     #[test]
     fn every_ca_server_thread_takes_its_band_and_its_name() {
-        let prod = production_scope(include_str!("blocking.rs"));
+        let prod = production(include_str!("blocking.rs"), Comments::Strip);
 
         assert_eq!(
             prod.matches("enter_ioc_thread(").count(),
@@ -2231,10 +2341,7 @@ mod tests {
     /// The pool's capacity leaves exactly one descriptor for the refusal.
     ///
     /// The number is a decision, so it is pinned here with its derivation rather
-    /// than left as a literal somebody rounds later
-    /// (`doc/rtems-connection-worker-pool-design.md` §9,
-    /// `doc/rtems-fd-ceiling-deviation.md` §3,
-    /// `doc/rtems-ca-worker-pool-on-target-measurement.md` §3):
+    /// than left as a literal somebody rounds later:
     ///
     /// * 150 descriptors configured minus the 8 the IOC holds at idle = **142**
     ///   client sockets; measured on this driver as `FD_CNT = FD_MAX = 150`
@@ -2424,7 +2531,14 @@ mod tests {
                 CaHeader::from_bytes_for_peer(&frame, state.client_minor_version()).unwrap();
             let payload = frame[hdr_size..].to_vec();
             block_on_sync(dispatch_message(
-                &hdr, &payload, state, db, &outbox, peer, None,
+                &hdr,
+                &payload,
+                state,
+                db,
+                &outbox,
+                peer,
+                None,
+                SubscriptionDelivery::HandOff,
             ))
             .unwrap()
             .unwrap();
@@ -2671,7 +2785,7 @@ mod tests {
     /// immediately — before any body byte is sent — and must NOT close the
     /// circuit.
     ///
-    /// C `camessage.c:2538-2555` is the reference: over-large earns
+    /// C `camessage.c:2471-2487` is the reference: over-large earns
     /// `ECA_TOLARGE` naming `rsrvSizeofLargeBufTCP`, sets
     /// `client->recvBytesToDrain`, and returns `RSRV_OK` — the client keeps
     /// every channel it holds. Before this gate the blocking driver simply
@@ -2679,7 +2793,7 @@ mod tests {
     /// buffering the dribble the whole time.
     ///
     /// The step is 8 and not 1 because C tests alignment first
-    /// (`camessage.c:2519-2530`): `ceiling + 1` is a misaligned message and
+    /// (`camessage.c:2452-2462`): `ceiling + 1` is a misaligned message and
     /// earns `ECA_INTERNAL` and a close, which is a different gate.
     #[test]
     fn an_extended_body_over_the_ceiling_earns_eca_tolarge_without_closing() {
@@ -2725,7 +2839,7 @@ mod tests {
         let mut probe = [0u8; 1];
         match c.read(&mut probe) {
             Err(e) if is_read_timeout(e.kind()) => { /* open and idle */ }
-            Ok(0) => panic!("server closed the circuit; C keeps it (RSRV_OK at camessage.c:2489)"),
+            Ok(0) => panic!("server closed the circuit; C keeps it (RSRV_OK at camessage.c:2487)"),
             Ok(_) => panic!("unexpected extra frame bytes after the ECA_TOLARGE reply"),
             Err(e) => panic!("server dropped the connection: {e}"),
         }
@@ -2830,15 +2944,33 @@ mod tests {
     /// The RTEMS driver's socket handles must be SHARED, never duplicated.
     ///
     /// The banned call is `std`'s clone-the-descriptor method, i.e.
-    /// `fcntl(F_DUPFD*)`. RTEMS 6 has no `F_DUPFD_CLOEXEC` case at all
-    /// (`cpukit/libcsupport/src/fcntl.c` falls to `default: EINVAL`), and
-    /// plain `F_DUPFD` goes through `duplicate_iop` (`fcntl.c:47-77`), which
-    /// calls the file's `open_h` — and rtems-libbsd installs
-    /// `rtems_bsd_sysgen_nodeops` on every socket
-    /// (`rtems-bsd-syscall-api.c:205`) whose `.open_h` is
-    /// `rtems_bsd_sysgen_open_error`. Measured on target: `dup`, `F_DUPFD`
-    /// and `F_DUPFD_CLOEXEC` all fail on an accepted socket with ENXIO, while
-    /// `F_DUPFD` on `/dev/console` succeeds.
+    /// `fcntl(F_DUPFD*)`. The RTEMS 6 kernel has no `F_DUPFD_CLOEXEC` case at
+    /// all, so it falls to `default: EINVAL`
+    /// (`cpukit/libcsupport/src/fcntl.c:146-220` at the `rtems_6` pin; the
+    /// RTEMS 7 kernel handles it at `:173-175`).
+    ///
+    /// That split is this project's own: `F_DUPFD_CLOEXEC` reached the
+    /// kernel's `main` in four commits we authored -- `7043f23ba0`,
+    /// `1e5da72852`, `4bb46046ad`, `6b52a0c22d` -- every one an ancestor of
+    /// the `rtems` pin and none an ancestor of `rtems_6`. The kernel half of
+    /// the ban therefore ends when those are backported to `6`. What keeps
+    /// this guard is the sharing argument below, NOT the EINVAL.
+    ///
+    /// Plain `F_DUPFD` goes through `duplicate_iop`
+    /// (`cpukit/libcsupport/src/fcntl.c:47-79` at the `rtems_6` pin), which
+    /// calls the file's `open_h` at `:67`. That used to
+    /// be `rtems_bsd_sysgen_open_error` for a socket, which is where the
+    /// measured ENXIO came from; at both declared libbsd pins it is
+    /// `rtems_bsd_sysgen_dup` (`rtems-bsd-syscall-api.c:139-140` (both `rtems-libbsd` pins), installed
+    /// on an accepted socket at `:299-301`), a real dup. So the libbsd half
+    /// of the ban has lapsed and only the RTEMS 6 kernel half still bites.
+    /// The ban stays because sharing is what works on EVERY target, and a
+    /// duplicate that succeeds on one series and returns EINVAL on the other
+    /// is worse than one that never appears.
+    ///
+    /// Measured on target before libbsd `c86cbc57`/`08d8e275` (2026-07-28):
+    /// `dup`, `F_DUPFD` and `F_DUPFD_CLOEXEC` all fail on an accepted socket
+    /// with ENXIO, while `F_DUPFD` on `/dev/console` succeeds.
     ///
     /// Host CI cannot catch a reintroduced duplicate here — it works
     /// perfectly on Linux and fails only after a target boot. This guard is
@@ -2886,12 +3018,12 @@ mod tests {
     /// this guard lives in one of the files it reads.)
     #[test]
     fn both_ca_drivers_receive_only_through_the_shared_primitive() {
-        // Whole-file scope deliberately, NOT `production_scope`: tcp.rs's
-        // first column-0 `#[cfg(test)]` is a helper near the top of the file,
-        // so `production_scope` would hand back a 95-line prefix and the
-        // guard would pass while proving nothing. Whole-file is also the
-        // stricter reading of the rule being guarded — there is no legitimate
-        // raw growth point on a receive buffer anywhere in these files.
+        // Whole-file scope deliberately: there is no legitimate raw growth
+        // point on a receive buffer anywhere in these files, tests included.
+        // (It used to be forced as well — tcp.rs's first column-0
+        // `#[cfg(test)]` is a helper near the top, so the truncating slicer
+        // this guard predates handed back a 95-line prefix. `source_guard`
+        // covers all 3,909 lines now; the choice below is the strictness.)
         for (file, src) in [
             ("server/blocking.rs", include_str!("blocking.rs")),
             ("server/tcp.rs", include_str!("tcp.rs")),
@@ -2931,9 +3063,9 @@ mod tests {
     /// queued), and the async loop did `res?`, so one routine
     /// `ECONNABORTED` stopped the interface accepting for good.
     ///
-    /// Whole-file scope and `concat!`-split needles for the same two reasons
-    /// the guard below documents: `production_scope` returns a 95-line prefix
-    /// on tcp.rs, and this test lives in one of the files it reads.
+    /// Whole-file scope and `concat!`-split needles for the same reasons the
+    /// guard below documents: an accept loop in a test is still an accept
+    /// loop, and this test lives in one of the files it reads.
     #[test]
     fn every_ca_accept_loop_backs_off_through_the_primitive() {
         for (file, src) in [
@@ -3195,6 +3327,40 @@ mod tests {
         udp_thread.join().unwrap().unwrap();
     }
 
+    /// The SEARCH-reply cids a reply datagram carries. One datagram can hold
+    /// several — that is what the FIONREAD batch-up coalescing does — so this
+    /// walks the whole datagram rather than reading a single header.
+    fn search_reply_cids(dg: &[u8]) -> Vec<u32> {
+        let mut cids = Vec::new();
+        let mut off = 0usize;
+        while off + CaHeader::SIZE <= dg.len() {
+            let cmmd = u16::from_be_bytes([dg[off], dg[off + 1]]);
+            let postsize = u16::from_be_bytes([dg[off + 2], dg[off + 3]]) as usize;
+            if cmmd == CA_PROTO_SEARCH {
+                cids.push(u32::from_be_bytes([
+                    dg[off + 12],
+                    dg[off + 13],
+                    dg[off + 14],
+                    dg[off + 15],
+                ]));
+            }
+            off += CaHeader::SIZE + postsize;
+        }
+        cids
+    }
+
+    /// One datagram, or `None` once `remaining` elapses — the reader shape
+    /// `crate::test_budget::barrier` drives.
+    fn recv_datagram(sock: &UdpSocket, remaining: Duration) -> Option<Vec<u8>> {
+        sock.set_read_timeout(Some(remaining)).ok()?;
+        let mut buf = vec![0u8; 64 * 1024];
+        match sock.recv_from(&mut buf) {
+            Ok((n, _)) => Some(buf[..n].to_vec()),
+            Err(e) if is_read_timeout(e.kind()) => None,
+            Err(e) => panic!("recv_from: {e}"),
+        }
+    }
+
     /// (S1b-i) An unknown PV draws NO UDP reply. C `search_reply_udp` has no
     /// DO_REPLY branch on the UDP path (only `search_reply_tcp` emits
     /// NOT_FOUND), so the responder is silent and the client recv times out.
@@ -3208,18 +3374,22 @@ mod tests {
         let udp_thread = thread::spawn(move || srv.serve_udp_search(resp));
 
         let client = UdpSocket::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)).unwrap();
-        client
-            .set_read_timeout(Some(Duration::from_millis(400)))
-            .unwrap();
         let mut dg = udp_version_prelude(1);
         dg.extend_from_slice(&udp_search_frame(9, "BLK:DOES_NOT_EXIST"));
         client.send_to(&dg, resp_addr).unwrap();
+        // The barrier is a name the responder MUST answer, sent after the one
+        // it must not. One responder thread reads both from one socket in
+        // arrival order, so a reply for cid 9 cannot overtake this one — which
+        // is what a read window could never establish.
+        let mut probe = udp_version_prelude(1);
+        probe.extend_from_slice(&udp_search_frame(10, "BLK:EXISTS"));
+        client.send_to(&probe, resp_addr).unwrap();
 
-        let mut rbuf = [0u8; 1024];
-        let got = client.recv_from(&mut rbuf);
-        assert!(
-            got.as_ref().is_err_and(|e| is_read_timeout(e.kind())),
-            "an unknown PV must draw NO UDP reply, got {got:?}"
+        crate::test_budget::barrier::until(
+            "an unknown PV must draw NO UDP reply",
+            |dg: &Vec<u8>| search_reply_cids(dg).contains(&9),
+            |dg: &Vec<u8>| search_reply_cids(dg).contains(&10),
+            |remaining| recv_datagram(&client, remaining),
         );
 
         server.shutdown();
@@ -3281,13 +3451,20 @@ mod tests {
         let reply = rbuf[..n].to_vec();
 
         // No SECOND reply datagram: the same-source burst coalesced into one.
-        client
-            .set_read_timeout(Some(Duration::from_millis(400)))
-            .unwrap();
-        let second = client.recv_from(&mut rbuf);
-        assert!(
-            second.as_ref().is_err_and(|e| is_read_timeout(e.kind())),
-            "same-source burst must coalesce into ONE reply datagram, got another: {second:?}"
+        // A third search is the barrier — the responder reads it after both
+        // burst datagrams off the one socket it serves, so a split reply
+        // carrying cid 0x01 or 0x02 cannot overtake the reply for cid 0x03.
+        let mut probe = udp_version_prelude(0x3333);
+        probe.extend_from_slice(&udp_search_frame(0x03, "BLK:BURST"));
+        client.send_to(&probe, resp_addr).unwrap();
+        crate::test_budget::barrier::until(
+            "same-source burst must coalesce into ONE reply datagram",
+            |dg: &Vec<u8>| {
+                let cids = search_reply_cids(dg);
+                cids.contains(&0x01) || cids.contains(&0x02)
+            },
+            |dg: &Vec<u8>| search_reply_cids(dg).contains(&0x03),
+            |remaining| recv_datagram(&client, remaining),
         );
 
         // Byte-parity: drive BOTH datagrams through the shared decode into ONE
@@ -3409,15 +3586,34 @@ mod tests {
         assert_eq!(a_reply, expect_a[0], "peer A receives A's reply bytes");
         assert_eq!(b_reply, expect_b[0], "peer B receives B's reply bytes");
 
-        // Neither peer receives a second datagram.
-        client_a
-            .set_read_timeout(Some(Duration::from_millis(300)))
-            .unwrap();
-        assert!(
-            client_a
-                .recv_from(&mut abuf)
-                .is_err_and(|e| is_read_timeout(e.kind())),
-            "peer A must receive exactly one reply"
+        // Neither peer receives a second datagram — and this now checks both,
+        // where the window it replaces only ever checked A. Each peer sends one
+        // more search with a fresh cid; that reply must be the next datagram it
+        // sees, so a duplicate of the first exchange cannot hide behind it.
+        let mut probe_a = udp_version_prelude(0xCCCC);
+        probe_a.extend_from_slice(&udp_search_frame(0x0C, "BLK:SRC"));
+        client_a.send_to(&probe_a, resp_addr).unwrap();
+        crate::test_budget::barrier::until(
+            "peer A must receive exactly one reply",
+            |dg: &Vec<u8>| {
+                let cids = search_reply_cids(dg);
+                cids.contains(&0x0A) || cids.contains(&0x0B)
+            },
+            |dg: &Vec<u8>| search_reply_cids(dg).contains(&0x0C),
+            |remaining| recv_datagram(&client_a, remaining),
+        );
+
+        let mut probe_b = udp_version_prelude(0xDDDD);
+        probe_b.extend_from_slice(&udp_search_frame(0x0D, "BLK:SRC"));
+        client_b.send_to(&probe_b, resp_addr).unwrap();
+        crate::test_budget::barrier::until(
+            "peer B must receive exactly one reply",
+            |dg: &Vec<u8>| {
+                let cids = search_reply_cids(dg);
+                cids.contains(&0x0A) || cids.contains(&0x0B)
+            },
+            |dg: &Vec<u8>| search_reply_cids(dg).contains(&0x0D),
+            |remaining| recv_datagram(&client_b, remaining),
         );
 
         server.shutdown();
@@ -3508,6 +3704,13 @@ mod tests {
     /// with mask DBE_VALUE|DBE_ALARM — the 16-byte extended monitor request the
     /// async server also parses (cf. `event_add_frame` in the tcp.rs tests).
     fn event_add_double_frame(sid: u32, sub_id: u32) -> Vec<u8> {
+        event_add_double_frame_masked(sid, sub_id, 3)
+    }
+
+    /// [`event_add_double_frame`] with the `DBE_*` select spelled out, so a
+    /// test about what a *narrow* mask still receives states its mask instead
+    /// of inheriting the wide default.
+    fn event_add_double_frame_masked(sid: u32, sub_id: u32, mask: u16) -> Vec<u8> {
         let mut h = CaHeader::new(CA_PROTO_EVENT_ADD);
         h.data_type = DBR_DOUBLE_MON;
         h.count = 1;
@@ -3519,9 +3722,165 @@ mod tests {
         f.extend_from_slice(&0f32.to_be_bytes()); // low
         f.extend_from_slice(&0f32.to_be_bytes()); // high
         f.extend_from_slice(&0f32.to_be_bytes()); // to
-        f.extend_from_slice(&3u16.to_be_bytes()); // mask: DBE_VALUE|DBE_ALARM
+        f.extend_from_slice(&mask.to_be_bytes()); // mask: the caller's select
         f.extend_from_slice(&0u16.to_be_bytes()); // pad
         f
+    }
+
+    /// BR-3, the blocking driver's half: when the database destroys what a
+    /// channel serves, that channel is retired with
+    /// `CA_PROTO_SERVER_DISCONN` here too, not only on the async driver.
+    ///
+    /// The subscription asks for `DBE_VALUE` alone, which is the whole point:
+    /// C delivers a disconnect through NO event mask — `cac::disconnectAllIO`
+    /// (`modules/ca/src/client/cac.cpp:676-694` at R7.0.10, reached from
+    /// `cac::verifyAndDisconnectChan` at `:1168-1181`) walks the channel's IO
+    /// list and raises `ECA_DISCONN` on every entry with no `select` test —
+    /// so a value-only monitor learns its channel died exactly as an alarm
+    /// subscriber does. Without the retirement this driver ended the
+    /// subscription in silence and the client kept the last value, believing
+    /// it live.
+    ///
+    /// This driver is the ONLY receive loop on RTEMS and VxWorks
+    /// (`epics_embedded_target` compiles `server::tcp::handle_client` out), so
+    /// a disconnect that leaks through the async sweep alone reaches no
+    /// embedded client at all.
+    #[test]
+    fn destroying_a_pv_retires_the_blocking_drivers_channel() {
+        const CID: u32 = 0x0BAD_C0DE;
+        let db = Arc::new(PvDatabase::new());
+        block_on_sync(db.add_pv("BLK:BR3", EpicsValue::Double(1.0)))
+            .expect("no async runtime on this thread")
+            .expect("add_pv");
+
+        let server =
+            Arc::new(BlockingCaServer::bind("127.0.0.1:0", db.clone(), new_acf()).unwrap());
+        let addr = server.local_addr().unwrap();
+        let srv = server.clone();
+        let accept = thread::spawn(move || srv.serve());
+
+        let mut c = TcpStream::connect(addr).unwrap();
+        c.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        let _ = read_until_cmmd(&mut c, CA_PROTO_VERSION);
+        c.write_all(&version_frame()).unwrap();
+        c.write_all(&create_chan_frame(CID, "BLK:BR3")).unwrap();
+        let cc = read_until_cmmd(&mut c, CA_PROTO_CREATE_CHAN);
+        let sid = u32::from_be_bytes([cc[12], cc[13], cc[14], cc[15]]);
+
+        // DBE_VALUE only (select == 1).
+        c.write_all(&event_add_double_frame_masked(sid, 1, 1))
+            .unwrap();
+        // The initial monitor reply proves the subscription is live before the
+        // destruction, so the disconnect below cannot be mistaken for a
+        // subscription that never started.
+        let _ = read_until_cmmd(&mut c, CA_PROTO_EVENT_ADD);
+
+        block_on_sync(db.remove_simple_pv("BLK:BR3"))
+            .expect("no async runtime on this thread")
+            .expect("was registered");
+
+        let frame = read_until_cmmd(&mut c, crate::protocol::CA_PROTO_SERVER_DISCONN);
+        assert_eq!(
+            u32::from_be_bytes([frame[8], frame[9], frame[10], frame[11]]),
+            CID,
+            "SERVER_DISCONN carries the CLIENT's cid, which is what libca \
+             demultiplexes on (`cac::verifyAndDisconnectChan` looks the cid up \
+             in `chanTable`) — not the server's sid"
+        );
+
+        server.shutdown();
+        accept.join().unwrap();
+    }
+
+    /// Two monitors on ONE channel produce ONE retirement frame.
+    ///
+    /// The boundary the once-per-channel rule exists for. libca resolves
+    /// `CA_PROTO_SERVER_DISCONN` against its client-wide `chanTable`
+    /// (`cac::verifyAndDisconnectChan`, `modules/ca/src/client/cac.cpp:1168-1181`
+    /// at R7.0.10), which a disconnected channel stays in, so a per-subscription
+    /// frame would re-run `cac::disconnectChannel` on a channel already moved to
+    /// the search list — wrong on the wire, not merely noisy.
+    #[test]
+    fn two_monitors_on_one_channel_retire_it_once() {
+        const CID: u32 = 0x0BAD_F00D;
+        let db = Arc::new(PvDatabase::new());
+        block_on_sync(db.add_pv("BLK:BR3ONCE", EpicsValue::Double(1.0)))
+            .expect("no async runtime on this thread")
+            .expect("add_pv");
+
+        let server =
+            Arc::new(BlockingCaServer::bind("127.0.0.1:0", db.clone(), new_acf()).unwrap());
+        let addr = server.local_addr().unwrap();
+        let srv = server.clone();
+        let accept = thread::spawn(move || srv.serve());
+
+        let mut c = TcpStream::connect(addr).unwrap();
+        // A liveness bound only. Nothing in this test concludes anything from
+        // a read that times out: every assertion below is over the bytes the
+        // server actually wrote, so a timeout is a hang and is reported as
+        // one.
+        c.set_read_timeout(Some(Duration::from_secs(30))).unwrap();
+        let _ = read_until_cmmd(&mut c, CA_PROTO_VERSION);
+        c.write_all(&version_frame()).unwrap();
+        c.write_all(&create_chan_frame(CID, "BLK:BR3ONCE")).unwrap();
+        let cc = read_until_cmmd(&mut c, CA_PROTO_CREATE_CHAN);
+        let sid = u32::from_be_bytes([cc[12], cc[13], cc[14], cc[15]]);
+
+        for sub_id in [1u32, 2] {
+            c.write_all(&event_add_double_frame_masked(sid, sub_id, 1))
+                .unwrap();
+            let _ = read_until_cmmd(&mut c, CA_PROTO_EVENT_ADD);
+        }
+
+        block_on_sync(db.remove_simple_pv("BLK:BR3ONCE"))
+            .expect("no async runtime on this thread")
+            .expect("was registered");
+
+        // Count over the WHOLE stream this circuit will ever carry, rather
+        // than over a silence interval: half-closing our write side is an EOF
+        // to the server's read loop, and its teardown is `drop(ev_tx)` then
+        // `event_job.join()`, so the event task first drains every control
+        // message still queued — a second retirement among them, if this
+        // driver still emitted one — and writes it under the same send lock
+        // before the socket is closed. TCP then delivers all of it ahead of
+        // the FIN. A loaded host makes this slower, never different; the
+        // quiet window it replaces was decided by whichever of the two the
+        // scheduler got to first.
+        c.shutdown(std::net::Shutdown::Write).unwrap();
+        let mut acc: Vec<u8> = Vec::new();
+        let mut buf = [0u8; 4096];
+        loop {
+            match c.read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => acc.extend_from_slice(&buf[..n]),
+                Err(e) => panic!("the circuit never reached EOF: {e}"),
+            }
+        }
+
+        let mut disconns: Vec<u32> = Vec::new();
+        let mut i = 0;
+        while i + CaHeader::SIZE <= acc.len() {
+            let cmmd = u16::from_be_bytes([acc[i], acc[i + 1]]);
+            let postsize = u16::from_be_bytes([acc[i + 2], acc[i + 3]]) as usize;
+            if cmmd == crate::protocol::CA_PROTO_SERVER_DISCONN {
+                disconns.push(u32::from_be_bytes([
+                    acc[i + 8],
+                    acc[i + 9],
+                    acc[i + 10],
+                    acc[i + 11],
+                ]));
+            }
+            i += CaHeader::SIZE + postsize;
+        }
+        assert_eq!(
+            disconns,
+            vec![CID],
+            "the channel is retired exactly once however many monitors were \
+             on it, and the frame carries the CLIENT's cid"
+        );
+
+        server.shutdown();
+        accept.join().unwrap();
     }
 
     /// epics-base #934 (4128a7c07): `event_add_action` refuses a truncated
@@ -3543,7 +3902,14 @@ mod tests {
                 CaHeader::from_bytes_for_peer(&frame, state.client_minor_version()).unwrap();
             let payload = frame[hdr_size..].to_vec();
             block_on_sync(dispatch_message(
-                &hdr, &payload, state, &db, &outbox, peer, None,
+                &hdr,
+                &payload,
+                state,
+                &db,
+                &outbox,
+                peer,
+                None,
+                SubscriptionDelivery::HandOff,
             ))
             .unwrap()
             .unwrap();
@@ -3625,7 +3991,14 @@ mod tests {
                 CaHeader::from_bytes_for_peer(&frame, state.client_minor_version()).unwrap();
             let payload = frame[hdr_size..].to_vec();
             block_on_sync(dispatch_message(
-                &hdr, &payload, &mut state, &db, &outbox, peer, None,
+                &hdr,
+                &payload,
+                &mut state,
+                &db,
+                &outbox,
+                peer,
+                None,
+                SubscriptionDelivery::HandOff,
             ))
             .unwrap()
             .unwrap();
@@ -3658,7 +4031,14 @@ mod tests {
             CaHeader::from_bytes_for_peer(&f, state.client_minor_version()).unwrap();
         let payload = f[hdr_size..].to_vec();
         let res = block_on_sync(dispatch_message(
-            &hdr, &payload, &mut state, &db, &outbox, peer, None,
+            &hdr,
+            &payload,
+            &mut state,
+            &db,
+            &outbox,
+            peer,
+            None,
+            SubscriptionDelivery::HandOff,
         ))
         .unwrap();
         assert!(
@@ -3697,7 +4077,14 @@ mod tests {
             CaHeader::from_bytes_for_peer(&f, state.client_minor_version()).unwrap();
         let payload = f[hdr_size..].to_vec();
         block_on_sync(dispatch_message(
-            &hdr, &payload, &mut state, &db, &outbox, peer, None,
+            &hdr,
+            &payload,
+            &mut state,
+            &db,
+            &outbox,
+            peer,
+            None,
+            SubscriptionDelivery::HandOff,
         ))
         .unwrap()
         .unwrap();
@@ -3740,7 +4127,14 @@ mod tests {
             CaHeader::from_bytes_for_peer(&f, state.client_minor_version()).unwrap();
         let payload = f[hdr_size..].to_vec();
         let res = block_on_sync(dispatch_message(
-            &hdr, &payload, &mut state, &db, &outbox, peer, None,
+            &hdr,
+            &payload,
+            &mut state,
+            &db,
+            &outbox,
+            peer,
+            None,
+            SubscriptionDelivery::HandOff,
         ))
         .unwrap();
         assert!(
@@ -3777,7 +4171,14 @@ mod tests {
             CaHeader::from_bytes_for_peer(&f, state.client_minor_version()).unwrap();
         let payload = f[hdr_size..].to_vec();
         let res = block_on_sync(dispatch_message(
-            &hdr, &payload, &mut state, &db, &outbox, peer, None,
+            &hdr,
+            &payload,
+            &mut state,
+            &db,
+            &outbox,
+            peer,
+            None,
+            SubscriptionDelivery::HandOff,
         ))
         .unwrap();
         assert!(
@@ -3852,7 +4253,14 @@ mod tests {
                 CaHeader::from_bytes_for_peer(&frame, state.client_minor_version()).unwrap();
             let payload = frame[hdr_size..].to_vec();
             block_on_sync(dispatch_message(
-                &hdr, &payload, state, &db, &outbox, peer, None,
+                &hdr,
+                &payload,
+                state,
+                &db,
+                &outbox,
+                peer,
+                None,
+                SubscriptionDelivery::HandOff,
             ))
             .unwrap()
             .unwrap();
@@ -4134,6 +4542,7 @@ mod tests {
                     result: RecordProcessResult::AsyncPending,
                     actions: Vec::new(),
                     device_did_compute: false,
+                    post_write_fields: Vec::new(),
                 })
             } else {
                 Ok(ProcessOutcome::complete())
@@ -4289,7 +4698,14 @@ mod tests {
                 CaHeader::from_bytes_for_peer(&frame, state.client_minor_version()).unwrap();
             let payload = frame[hdr_size..].to_vec();
             block_on_sync(dispatch_message(
-                &hdr, &payload, state, &db, &outbox, peer, None,
+                &hdr,
+                &payload,
+                state,
+                &db,
+                &outbox,
+                peer,
+                None,
+                SubscriptionDelivery::HandOff,
             ))
             .unwrap()
             .unwrap();
@@ -4440,7 +4856,7 @@ mod tests {
     /// protocol violation. C `write_notify_action` lets every type at or below
     /// `LAST_BUFFER_TYPE` past `INVALID_DB_REQ` (`camessage.c:1678`) and only
     /// `db_put_process` then fails it (`mapOldType` returns -1 for compound
-    /// types), so the client gets ECA_PUTFAIL (`camessage.c:1417-1419`) on a
+    /// types), so the client gets ECA_PUTFAIL (`camessage.c:1386-1388`) on a
     /// circuit that stays up.
     #[test]
     fn compound_dbr_write_notify_is_putfail_and_keeps_the_circuit() {
@@ -4603,7 +5019,7 @@ mod tests {
 
     /// C arms the put-log bracket before it can know whether the put will
     /// succeed: `asTrapWriteWithData` runs unconditionally ahead of
-    /// `dbChannel_put` (`camessage.c:799-804`) and ahead of `dbProcessNotify`
+    /// `dbChannel_put` (`camessage.c:768-773`) and ahead of `dbProcessNotify`
     /// (`:1795-1802`), with the matching `asTrapWriteAfter` right behind. So a
     /// put-log listener sees even the buffer types `dbChannel_put` refuses —
     /// which is the whole point of a put-log: the attempt is the record, not
@@ -4789,6 +5205,71 @@ mod tests {
             u32::from_be_bytes([wn[12], wn[13], wn[14], wn[15]]),
             wn_ioid,
             "the deferred WRITE_NOTIFY completion echoes its request ioid"
+        );
+
+        server.shutdown();
+        accept.join().unwrap();
+    }
+    /// C `clear_channel_reply` (`rsrv/camessage.c:1890-1903`) drains the
+    /// channel's `eventq` and calls `db_cancel_event` on every subscription
+    /// before it sends the delete-confirmed echo, so a cleared channel stops
+    /// producing monitor updates. This driver keeps its subscriptions in its
+    /// own map and the shared `destroy_channel` walks the async one, so
+    /// CLEAR_CHANNEL retired the channel and left its monitors running: the
+    /// client kept receiving EVENT_ADD frames for a channel it had closed.
+    #[test]
+    fn clear_channel_stops_the_channels_monitors() {
+        let db = seed_db(&[("BLK:CLR", EpicsValue::Double(1.0))]);
+        let server =
+            Arc::new(BlockingCaServer::bind("127.0.0.1:0", db.clone(), new_acf()).unwrap());
+        let addr = server.local_addr().unwrap();
+        let srv = server.clone();
+        let accept = thread::spawn(move || srv.serve());
+
+        let mut c = TcpStream::connect(addr).unwrap();
+        c.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        let _ = read_until_cmmd(&mut c, CA_PROTO_VERSION);
+        c.write_all(&version_frame()).unwrap();
+        c.write_all(&create_chan_frame(0x1234, "BLK:CLR")).unwrap();
+        let cc = read_until_cmmd(&mut c, CA_PROTO_CREATE_CHAN);
+        let sid = u32::from_be_bytes([cc[12], cc[13], cc[14], cc[15]]);
+
+        let sub_id = 0xD1;
+        c.write_all(&event_add_double_frame(sid, sub_id)).unwrap();
+        let initial = read_until_cmmd(&mut c, CA_PROTO_EVENT_ADD);
+        assert_eq!(monitor_reply_value(&initial), 1.0, "initial monitor value");
+
+        // Clear the channel and read its echo.
+        let mut clear = CaHeader::new(CA_PROTO_CLEAR_CHANNEL);
+        clear.cid = sid;
+        clear.available = 0x1234;
+        c.write_all(&clear.to_bytes()).unwrap();
+        let echo = read_until_cmmd(&mut c, CA_PROTO_CLEAR_CHANNEL);
+        assert_eq!(
+            u32::from_be_bytes([echo[8], echo[9], echo[10], echo[11]]),
+            sid,
+            "the delete-confirmed echo names the cleared channel"
+        );
+
+        // The subscriber must be gone from the PV: C cancels every event on
+        // the channel, so nothing is left to post to.
+        let pv = simple_pv(&db, "BLK:CLR");
+        assert_eq!(
+            pv.subscribers.lock().len(),
+            0,
+            "CLEAR_CHANNEL must cancel the channel's monitors (C `db_cancel_event` \
+             per pevext, `camessage.c:1899`)"
+        );
+
+        // And no update may reach the wire for the cleared channel.
+        pv.set(EpicsValue::Double(2.0));
+        c.set_read_timeout(Some(Duration::from_millis(400)))
+            .unwrap();
+        let mut probe = [0u8; 1];
+        let peeked = c.peek(&mut probe);
+        assert!(
+            peeked.as_ref().is_err_and(|e| is_read_timeout(e.kind())),
+            "a cleared channel must deliver no further monitor update, got {peeked:?}"
         );
 
         server.shutdown();

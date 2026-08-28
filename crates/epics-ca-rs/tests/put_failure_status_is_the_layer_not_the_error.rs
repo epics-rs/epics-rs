@@ -1,12 +1,12 @@
 //! The CA status of a refused put is decided by the LAYER that refused it,
 //! never by which database error came back.
 //!
-//! C `write_action` (`rsrv/camessage.c:804-820`) answers a failed
+//! C `write_action` (`rsrv/camessage.c:773-789`) answers a failed
 //! `dbChannel_put` with `ECA_PUTFAIL` whatever `dbStatus` was, and
-//! `write_notify_reply` (`camessage.c:1417-1421`) maps every
+//! `write_notify_reply` (`camessage.c:1386-1390`) maps every
 //! `status != notifyOK` to that same `ECA_PUTFAIL`. `ECA_BADTYPE` is
 //! produced only by the gates ABOVE the put — the DBR-type check and
-//! `caNetConvert` (`camessage.c:784-790`) — which run before the database is
+//! `caNetConvert` (`camessage.c:753-759`) — which run before the database is
 //! touched and tear the connection down.
 //!
 //! Measured on the C softIoc (`softIoc -S -d`, `record(ai,"MEAS:A") {}`):
@@ -23,14 +23,8 @@
 //! These cases are the boundary between the two layers: same channel, same
 //! wire type, only the reason for the refusal differs.
 
-// Host/tokio-only: builds the async `CaClient`/`CaServer` stack in process.
-// Under `rtems-exec-model` the `runtime::task` seam routes their `spawn`
-// to the background executor, whose worker has no tokio reactor, so the
-// listener/transport tasks panic. The RTEMS model serves from
-// `BlockingCaServer` instead, so this path is inapplicable there.
-#![cfg(not(feature = "rtems-exec-model"))]
-
-use std::time::Duration;
+#![cfg(tokio_backend)]
+#![cfg(feature = "client-core")]
 
 use epics_base_rs::error::CaError;
 use epics_ca_rs::client::{CaClient, CaClientConfig};
@@ -92,7 +86,7 @@ async fn a_value_the_field_refuses_is_putfail_not_badtype() {
 
     for (field, value) in [("PHAS", "32768"), ("RVAL", "notanumber")] {
         let chan = client.create_channel(&format!("PUTSTAT:A.{field}"));
-        chan.wait_connected(Duration::from_secs(5))
+        chan.wait_connected(budget::FACT_BUDGET)
             .await
             .expect("connect");
 
@@ -109,7 +103,7 @@ async fn a_value_the_field_refuses_is_putfail_not_badtype() {
         assert_eq!(
             eca, ECA_PUTFAIL,
             ".{field} <- {value:?}: C `write_action` answers every failed \
-             dbChannel_put with ECA_PUTFAIL (camessage.c:804-820)"
+             dbChannel_put with ECA_PUTFAIL (camessage.c:773-789)"
         );
     }
 
@@ -133,7 +127,7 @@ async fn a_field_the_channel_cannot_write_is_refused_before_the_put() {
     let (client, server) = serve_one_ai().await;
 
     let chan = client.create_channel("PUTSTAT:A.STAT");
-    chan.wait_connected(Duration::from_secs(5))
+    chan.wait_connected(budget::FACT_BUDGET)
         .await
         .expect("connect");
 
@@ -160,7 +154,7 @@ async fn a_value_the_field_accepts_still_succeeds() {
     let (client, server) = serve_one_ai().await;
 
     let chan = client.create_channel("PUTSTAT:A.PHAS");
-    chan.wait_connected(Duration::from_secs(5))
+    chan.wait_connected(budget::FACT_BUDGET)
         .await
         .expect("connect");
 
@@ -172,3 +166,6 @@ async fn a_value_the_field_accepts_still_succeeds() {
 
     server.abort();
 }
+
+#[path = "common/budget.rs"]
+mod budget;

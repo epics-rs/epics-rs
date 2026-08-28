@@ -22,7 +22,7 @@
 
 // RTEMS-EXEC-MODEL-ALLOW(1): end_to_end_healthz binds a tokio::net TCP
 // listener for a real GET, which needs the reactor. These run and pass in the
-// feature-ON suite on the tokio driver.
+// exec-backend suite on the tokio driver.
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -173,6 +173,16 @@ impl IntrospectionState {
 /// Bind the HTTP introspection listener and serve until the listener
 /// is dropped. Spawn this on a tokio task; cancellation is by
 /// dropping the JoinHandle.
+///
+/// This one path is deliberately outside the "spawn through a held `Reactor`"
+/// rule the rest of `server` follows (`server::spawn_capability_guard`).
+/// `handle_request` reads and writes a `tokio::net::TcpStream`, so its task
+/// belongs on the tokio runtime and nowhere else; handing it the seam
+/// `Reactor` puts it on a background-executor worker under `exec_backend` and
+/// it panics on the first poll. The ambient read is safe here because the
+/// `TcpListener::bind` below has already succeeded on this task, which is only
+/// possible inside a tokio runtime — reaching the spawn proves the context the
+/// spawn needs.
 pub async fn run_introspection(
     addr: SocketAddr,
     state: Arc<IntrospectionState>,
@@ -207,13 +217,40 @@ pub async fn run_introspection(
             }
         };
         let state = state.clone();
-        tokio::spawn(async move {
+        spawn_on_the_listeners_runtime(async move {
             let _permit = permit; // released on task drop
             if let Err(e) = handle_request(stream, state).await {
                 tracing::debug!(peer = %peer, error = %e, "introspection request error");
             }
         });
     }
+}
+
+/// The one place under `crate::server` that starts a task on the ambient tokio
+/// runtime instead of a [`Reactor`](epics_base_rs::runtime::task::Reactor)
+/// handed down from the driver entry point, which is why
+/// `crate::server::spawn_capability_guard` leaves this file off its list.
+///
+/// The exemption is not a preference. [`handle_request`] reads and writes a
+/// `tokio::net::TcpStream`, so its task belongs on the tokio runtime and
+/// nowhere else. Handing it the seam `Reactor` compiles and looks tidier, and
+/// under `exec_backend` it puts the handler on a `cbMedium` callback worker
+/// where the first read panics — *"there is no reactor running, must be called
+/// from the context of a Tokio 1.x runtime"*, raised inside [`handle_request`]
+/// and measured there by `end_to_end_healthz`. The conversion is silent under
+/// the default backend, so only the exec-backend suite catches it.
+///
+/// The ambient read is sound here, and only here, because
+/// [`run_introspection`]'s `TcpListener::bind` has already succeeded on this
+/// same task: that is possible only inside a tokio runtime, so reaching this
+/// call proves the context the call needs. Nothing else in this file has that
+/// proof, and `ambient_spawn_is_confined_to_one_documented_site` fails if a
+/// second site appears or if this one is converted away.
+fn spawn_on_the_listeners_runtime<F>(future: F)
+where
+    F: std::future::Future<Output = ()> + Send + 'static,
+{
+    tokio::spawn(future);
 }
 
 async fn write_response_raw(
@@ -311,10 +348,12 @@ async fn handle_request(stream: TcpStream, state: Arc<IntrospectionState>) -> st
                     }
                     "/reload-acf" => match state.reload_acf.clone() {
                         Some(f) => {
-                            // closure does blocking std::fs reads;
-                            // run on the blocking pool so a slow NFS
-                            // mount doesn't freeze the worker.
-                            match tokio::task::spawn_blocking(move || f()).await {
+                            // closure does blocking std::fs reads; run on the
+                            // pool so a slow NFS mount doesn't freeze the
+                            // worker. Through the seam because the work is
+                            // reactor-free — see `blocking_work_goes_through_
+                            // the_seam`.
+                            match epics_base_rs::runtime::task::spawn_blocking(move || f()).await {
                                 Ok(Ok(())) => (200, "{\"reload_acf\":\"ok\"}".to_string()),
                                 Ok(Err(e)) => {
                                     (500, format!("{{\"error\":\"{}\"}}", escape_json(&e)))
@@ -328,7 +367,9 @@ async fn handle_request(stream: TcpStream, state: Arc<IntrospectionState>) -> st
                         None => (501, "{\"error\":\"reload_acf not configured\"}".to_string()),
                     },
                     "/reload-tls" => match state.reload_tls.clone() {
-                        Some(f) => match tokio::task::spawn_blocking(move || f()).await {
+                        Some(f) => match epics_base_rs::runtime::task::spawn_blocking(move || f())
+                            .await
+                        {
                             Ok(Ok(())) => (200, "{\"reload_tls\":\"ok\"}".to_string()),
                             Ok(Err(e)) => (500, format!("{{\"error\":\"{}\"}}", escape_json(&e))),
                             Err(e) => (
@@ -498,5 +539,73 @@ mod tests {
         assert!(s.contains("200 OK"));
         assert!(s.contains("\"status\":\"ok\""));
         server.abort();
+    }
+}
+
+#[cfg(test)]
+mod ambient_spawn_exemption {
+    //! Keeps [`super::spawn_on_the_listeners_runtime`] the single ambient
+    //! spawn in this file. `crate::server::spawn_capability_guard` cannot do
+    //! it: that guard works by excluding this file wholesale, so without a
+    //! local counter the exemption is an unbounded licence rather than one
+    //! documented site.
+    //!
+    //! Needles are built with `concat!` so this module's own text cannot
+    //! satisfy the check.
+
+    use source_guard::{Comments, production};
+
+    #[test]
+    fn ambient_spawn_is_confined_to_one_documented_site() {
+        let prod = production(include_str!("introspection.rs"), Comments::Strip);
+        assert!(
+            prod.contains("pub async fn run_introspection("),
+            "production slice no longer covers the accept loop"
+        );
+
+        let needle = concat!("tokio", "::spawn(");
+        assert_eq!(
+            prod.matches(needle).count(),
+            1,
+            "this file is exempt from the held-Reactor rule for exactly one \
+             call, in `spawn_on_the_listeners_runtime`. A second `{needle}` \
+             has no `TcpListener::bind` above it to prove the runtime it \
+             reads; give it the reactor its caller holds, or extend the \
+             exemption here with the proof that makes it sound."
+        );
+
+        let helper = prod
+            .find("fn spawn_on_the_listeners_runtime")
+            .expect("the documented exemption site still exists");
+        let body_end = helper
+            + prod[helper..]
+                .find("\n}\n")
+                .expect("the exemption helper still has a body");
+        let call = prod.find(needle).unwrap();
+        assert!(
+            helper < call && call < body_end,
+            "the ambient spawn moved out of `spawn_on_the_listeners_runtime`, \
+             where the reason for it is written"
+        );
+    }
+
+    /// The blocking pool is a different requirement from the reactor, and the
+    /// seam says so: a caller whose work is reactor-free by nature takes
+    /// `runtime::task::spawn_blocking`, which needs no runtime at all under
+    /// `exec_backend`. The reload hooks do `std::fs` reads, so they qualify;
+    /// naming tokio's directly re-introduces the ambient read this file is
+    /// only narrowly exempt from, in a spelling the exemption's own counter
+    /// does not see.
+    #[test]
+    fn blocking_work_goes_through_the_seam() {
+        let needle = concat!("tokio::task", "::spawn_blocking(");
+        assert_eq!(
+            production(include_str!("introspection.rs"), Comments::Strip)
+                .matches(needle)
+                .count(),
+            0,
+            "the reload hooks are reactor-free `std::fs` work — spawn them \
+             with `epics_base_rs::runtime::task::spawn_blocking`"
+        );
     }
 }

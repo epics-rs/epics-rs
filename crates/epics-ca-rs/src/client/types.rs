@@ -251,7 +251,7 @@ pub struct CaException {
 ///
 /// libca's `genLocalExcep` macro (`iocinf.h:67`) *always* passes
 /// `__FILE__`/`__LINE__`, and `ca_client_context::vSignal`
-/// (`ca_client_context.cpp:388-391`) prints the line whenever the file is
+/// (`ca_client_context.cpp:389-391`) prints the line whenever the file is
 /// non-null — so carrying the site is the rule and omitting it is the
 /// exception. Modelling that as `Option<…>` made omission the cheap default:
 /// the ECA_UNRESPTMO, ECA_DBLCHNL and circuit-disconnect blocks all shipped
@@ -278,7 +278,7 @@ pub enum ExceptionSite {
 /// reverse-DNS cache absent (`client-core`, where `hostname` is not built —
 /// `getnameinfo` has no newlib backing) this returns exactly what C returns
 /// for an address with no PTR record: the dotted address with its port
-/// (`ipAddrToA`, `osiSock.c:129`). A caller can therefore never tell the two
+/// (`ipAddrToA`, `osiSock.c:97-99`). A caller can therefore never tell the two
 /// configurations apart by the *shape* of what it gets back.
 pub(crate) fn peer_display_name(addr: SocketAddr) -> String {
     #[cfg(feature = "client")]
@@ -295,14 +295,14 @@ pub(crate) fn peer_display_name(addr: SocketAddr) -> String {
 /// waits for the resolver instead of reading the cache
 /// (`CaChannel::host_name`, libca `ca_host_name`).
 ///
-/// Also the one place `tokio::task::spawn_blocking` is reached from the
-/// client, which is why the `client-core` arm is not merely "no DNS": there
-/// is no tokio runtime on the RTEMS target to hand a blocking pool task to,
-/// so that call must not exist there at all.
+/// The blocking pool comes from the seam, not from `tokio::task`: this future
+/// is polled by whichever executor the client runs on, and under
+/// `exec_backend` that is a callback-band worker with no ambient tokio
+/// runtime, where `tokio::task::spawn_blocking` panics from inside itself.
 pub(crate) async fn peer_resolved_name(addr: SocketAddr) -> String {
     #[cfg(feature = "client")]
     {
-        tokio::task::spawn_blocking(move || crate::hostname::ip_addr_to_a(addr))
+        epics_base_rs::runtime::task::spawn_blocking(move || crate::hostname::ip_addr_to_a(addr))
             .await
             // A join failure is a runtime shutdown, not a channel error, and
             // C's `ipAddrToA` has a well-defined answer for "no name": the
@@ -317,14 +317,22 @@ pub(crate) async fn peer_resolved_name(addr: SocketAddr) -> String {
 
 /// libca `oldChannelNotify::writeException` (`oldChannelNotify.cpp:158-159`) —
 /// the site a server-rejected **plain** `CA_PROTO_WRITE` reaches, since
-/// `cac::writeExcep` (`cac.cpp:1049-1061`) looks the channel up and there is no
+/// `cac::writeExcep` (`cac.cpp:1046-1058`) looks the channel up and there is no
 /// per-op callback to complete. This is what a C `caput` prints under
 /// `Source File:`.
 pub(crate) const LIBCA_WRITE_EXCEPTION_SITE: ExceptionSite =
     ExceptionSite::At("../oldChannelNotify.cpp", 159);
 
-/// libca `cac::destroyIIU` (`cac.cpp:1236-1240`) — the `genLocalExcep` a
+/// libca `cac::destroyIIU` (`cac.cpp:1229-1273`) — the `genLocalExcep` a
 /// virtual circuit raises when it dies with channels still on it.
+///
+/// The 1240 below is NOT a citation: it is the `__LINE__` the compiled
+/// libca stamped into the block quoted on [`circuit_disconnect_exception`],
+/// and the tests match that output byte for byte. It belongs to the
+/// 7.0.10.1-DEV build that block was captured from. The invocation is
+/// `cac.cpp:1238` at `R7.0.10` and `:1241` on today's checkout, so no
+/// declared revision yields 1240 — see [`LIBCA_MULTIPLY_DEFINED_SITE`],
+/// which is off by the same one line.
 pub(crate) const LIBCA_CIRCUIT_DISCONNECT_SITE: ExceptionSite =
     ExceptionSite::At("../cac.cpp", 1240);
 
@@ -334,8 +342,11 @@ pub(crate) const LIBCA_CIRCUIT_DISCONNECT_SITE: ExceptionSite =
 /// yields for a macro spanning `tcpiiu.cpp:925-926` (verified against gcc).
 pub(crate) const LIBCA_UNRESPONSIVE_SITE: ExceptionSite = ExceptionSite::At("../tcpiiu.cpp", 925);
 
-/// libca `cac::pvMultiplyDefinedNotify` (`cac.cpp:1323`) — a direct
+/// libca `cac::pvMultiplyDefinedNotify` (`cac.cpp:1312-1329`) — a direct
 /// `this->exception(…, __FILE__, __LINE__)` call, so the line is its own.
+/// Like [`LIBCA_CIRCUIT_DISCONNECT_SITE`], 1323 is the compiled build's
+/// `__LINE__`, not a citation: the call is `cac.cpp:1321` at `R7.0.10`
+/// and `:1324` on the checkout.
 pub(crate) const LIBCA_MULTIPLY_DEFINED_SITE: ExceptionSite = ExceptionSite::At("../cac.cpp", 1323);
 
 /// The ECA_DISCONN block C prints when a circuit carrying channels dies.
@@ -449,7 +460,7 @@ pub(crate) fn dispatch_exception(slot: &CaExceptionSlot, exc: CaException) {
 }
 
 /// libca's default exception handler: `ca_client_context::vSignal`
-/// (`ca_client_context.cpp:361-417`). Writes to stderr, in one `write` so two
+/// (`ca_client_context.cpp:361-416`). Writes to stderr, in one `write` so two
 /// concurrent exceptions cannot interleave mid-block:
 ///
 /// ```text
@@ -516,7 +527,7 @@ pub(crate) fn render_default_exception(exc: &CaException, now: &str) -> Option<S
 /// The `Context:` payload. libca has exactly two shapes, one per
 /// `ca_client_context::exception` overload:
 ///
-/// * channel-scoped (`ca_client_context.cpp:317-349`) — the args carry a
+/// * channel-scoped (`ca_client_context.cpp:318-349`) — the args carry a
 ///   chid/type/count, and `signal` renders
 ///   `op=%u, channel=%s, type=%s, count=%lu, ctx="%s"`;
 /// * plain (`ca_client_context.cpp:289-315`) — the ctx text is printed as-is.
@@ -709,12 +720,12 @@ pub(crate) struct InFlightOps {
     /// channel's own `DropChannel` therefore printed a context with no
     /// channel in it. libca has the record because the name lives on the
     /// `nciu` the write was issued through (`cac::writeExcep` →
-    /// `chanTable.lookup(hdr.m_available)`, `cac.cpp:1050-1061`, the
+    /// `chanTable.lookup(hdr.m_available)`, `cac.cpp:1047-1058`, the
     /// ECHOED request's cid); this map is that record.
     ///
     /// Entries outlive the channel on purpose. They are removed when the
     /// server can no longer answer for the cid: the `CA_PROTO_CLEAR_CHANNEL`
-    /// confirmation (`rsrv/camessage.c:1966-1968` echoes `m_cid`/
+    /// confirmation (`rsrv/camessage.c:1912-1914` echoes `m_cid`/
     /// `m_available`, and a circuit answers in order, so it is a fence and
     /// not a delay), `CA_PROTO_SERVER_DISCONN`, or a `DropChannel` that
     /// sent no CLEAR_CHANNEL because the channel was not operational.
@@ -906,7 +917,7 @@ mod default_exception_tests {
     }
 
     /// R18-20: the ECA_DBLCHNL block. The context is C's `epicsSnprintf` text
-    /// (`cac.cpp:1317-1318`) — the port already matched that — but the raise is
+    /// (`cac.cpp:1316-1317`) — the port already matched that — but the raise is
     /// `exception(…, __FILE__, __LINE__)` at `cac.cpp:1323`, so the block has a
     /// `Source File:` line the port was dropping.
     #[test]
@@ -1158,7 +1169,16 @@ pub(crate) enum SearchRequest {
     /// there is no `CaClient::remove_address` counterpart to
     /// [`super::CaClient::add_address`], because libca has no
     /// `removeAddrFromChannelAccessAddressList` either.
+    ///
+    /// That sole producer is `tokio_backend`-only (discovery awaits on
+    /// `mdns-sd`/`hickory` sockets), so on the reactor-free backend nothing
+    /// can construct this variant. The variant itself does NOT follow it: its
+    /// consumer — `SearchTransport::remove_address`, the UDP destination-list
+    /// mutation — is live on both backends and is covered on both by
+    /// `search::tests::add_then_remove_address_round_trip`. The `allow` is
+    /// scoped to the producer's absence, not to the code below it.
     #[cfg(feature = "client")]
+    #[cfg_attr(exec_backend, allow(dead_code))]
     RemoveAddress(SocketAddr),
     /// Replace the entire working address list. Mirrors libca
     /// `configureChannelAccessAddressList` (iocinf.cpp:166). Use
@@ -1299,7 +1319,7 @@ pub(crate) enum TransportEvent {
     /// Server emitted a monitor frame with a non-NORMAL `m_cid` (ECA
     /// status), e.g. `no_read_access_event` after an ACF reload
     /// revoked read access on an active subscription. libca
-    /// `cac::eventAddRespAction` (`cac.cpp:973-977`) routes this to
+    /// `cac::eventAddRespAction` (`cac.cpp:971-975`) routes this to
     /// the per-subscription `pmiu->exception` callback with the
     /// reported status — the user's monitor callback receives an
     /// Err result. Pre-fix Rust warn+dropped the frame, so an
@@ -1339,7 +1359,7 @@ pub(crate) enum TransportEvent {
     },
     /// Server's CA minor protocol version, parsed from CA_PROTO_VERSION
     /// during TCP handshake. Mirrors libca `tcpiiu::minorProtocolVersion`
-    /// (BUG_ARCHAEOLOGY d763541 / `ca_host_minor_protocol`).
+    /// (d763541 / `ca_host_minor_protocol`).
     ServerVersion {
         server_addr: SocketAddr,
         priority: u8,
@@ -1364,7 +1384,7 @@ pub(crate) enum TransportEvent {
 /// Raise the exception a `CA_PROTO_ERROR` frame calls for, on the task that
 /// decoded it.
 ///
-/// libca does this in `cac::exceptionRespAction` (`cac.cpp:1082-1120`), which
+/// libca does this in `cac::exceptionRespAction` (`cac.cpp:1079-1117`), which
 /// runs on the circuit's receive thread inside `executeResponse` — the
 /// exception is raised in frame order, before the responses that follow it on
 /// the same circuit are dispatched. That ordering is load-bearing for a tool
@@ -1398,7 +1418,7 @@ pub(crate) struct ServerErrorFrame {
     /// payload's copy of the original header. Diagnostic only — distinct from
     /// `eca_status`. Not optional: a `CA_PROTO_ERROR` whose body is too short
     /// to carry the echo ends the circuit at the decoder
-    /// (`transport::EchoedRequest::parse`, C `cac.cpp:1085-1104`).
+    /// (`transport::EchoedRequest::parse`, C `cac.cpp:1082-1101`).
     pub(crate) original_request: u16,
     pub(crate) message: String,
     pub(crate) server_addr: SocketAddr,
@@ -1441,7 +1461,7 @@ pub(crate) fn raise_server_exception(slot: &CaExceptionSlot, err: ServerErrorFra
     }
     // What is left is `cac::writeExcep` (a plain CA_PROTO_WRITE has no
     // callback to complete, so libca takes it to
-    // `oldChannelNotify::writeException`, `cac.cpp:1049-1061`) and
+    // `oldChannelNotify::writeException`, `cac.cpp:1046-1058`) and
     // `cac::defaultExcep` for every other command.
     let op = if original_request == crate::protocol::CA_PROTO_WRITE {
         CaOp::Put

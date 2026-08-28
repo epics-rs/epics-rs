@@ -5,10 +5,10 @@
 //! `addAddrToChannelAccessAddressList` to tokenize, then
 //! `removeDuplicateAddresses(…, silent=0)` to dedup and report what it dropped.
 //! `EPICS_CA_ADDR_LIST` (`iocinf.cpp:225-227`), `EPICS_CA_NAME_SERVERS`
-//! (`cac.cpp:259-260`), `EPICS_CAS_INTF_ADDR_LIST` (`caservertask.c:341-343`),
-//! `EPICS_CAS_BEACON_ADDR_LIST` (`caservertask.c:413-438`),
-//! `EPICS_CAS_IGNORE_ADDR_LIST` (`caservertask.c:450-451`) and the repeater's
-//! merged beacon list (`repeater.cpp:545-550`) are the same code path with a
+//! (`cac.cpp:259-260`), `EPICS_CAS_INTF_ADDR_LIST` (`caservertask.c:342-344`),
+//! `EPICS_CAS_BEACON_ADDR_LIST` (`caservertask.c:414-439`),
+//! `EPICS_CAS_IGNORE_ADDR_LIST` (`caservertask.c:451-452`) and the repeater's
+//! merged beacon list (`repeater.cpp:533-538`) are the same code path with a
 //! different `envDefs` entry passed in — so neither the dedup nor its warning
 //! is a property of any one variable.
 //!
@@ -60,7 +60,7 @@ pub(crate) fn add_addr_to_channel_access_address_list(
     out
 }
 
-/// `iocinf.cpp:70-74`, byte for byte — `__FILE__` is the C source path as the
+/// `iocinf.cpp:71-74`, byte for byte — `__FILE__` is the C source path as the
 /// build compiled it, `../iocinf.cpp`, and the second line is TAB-indented.
 /// Captured from the compiled `caget`:
 ///
@@ -76,7 +76,7 @@ fn bad_address(env_name: &str, token: &str) {
     eprintln!("\tBad internet address or host name: '{token}'");
 }
 
-/// libcom `aToIPAddr` (`osiSock.c:178-241`): `<host>` or `<host>:<port>`, where
+/// libcom `aToIPAddr` (`aToIPAddr.c:75-194`): `<host>` or `<host>:<port>`, where
 /// `<host>` is a dotted IPv4 literal or a name the resolver knows. Anything else
 /// — an unresolvable name, a non-numeric or out-of-range port, an empty host —
 /// is a failure, and C's caller reports it.
@@ -130,7 +130,7 @@ fn a_to_ip_addr(token: &str, default_port: u16) -> Option<AddrToken> {
 /// not at all; `softIoc` with `EPICS_CAS_INTF_ADDR_LIST="127.0.0.1 127.0.0.1"`
 /// warns `"127.0.0.1:5064"`, and with `EPICS_CAS_IGNORE_ADDR_LIST="10.1.2.3
 /// 10.1.2.3"` warns `"10.1.2.3:0"` — the ignore list is built with `port = 0`
-/// (`caservertask.c:450`).
+/// (`caservertask.c:451`).
 pub(crate) fn remove_duplicate_addresses<T>(
     entries: Vec<T>,
     addr_of: impl Fn(&T) -> SocketAddr,

@@ -1,6 +1,6 @@
 // RTEMS-EXEC-MODEL-ALLOW(4): the four flavored tests drive tokio::net
 // UDP beacon traffic, which needs the reactor. These run and pass in the
-// feature-ON suite on the tokio driver.
+// exec-backend suite on the tokio driver.
 use std::collections::HashMap;
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
 use std::time::{Duration, Instant};
@@ -82,11 +82,11 @@ const BEACON_NET_CHANGE_FACTOR: f64 = 3.25;
 const BEACON_SHORT_PERIOD_FACTOR: f64 = 0.80;
 
 /// What one beacon must trigger, mirroring libca's two independent
-/// notifications in `bhe::updatePeriod` (`bhe.cpp:186-266`).
+/// notifications in `bhe::updatePeriod` (`bhe.cpp:186-265`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct BeaconAction {
     /// `Some(kind)` ⇔ `updatePeriod` returned `netChange`, so
-    /// `cac::beaconNotify` (`cac.cpp:500`) calls
+    /// `cac::beaconNotify` (`cac.cpp:499`) calls
     /// `udpiiu::beaconAnomalyNotify` and the search timer restarts for
     /// unresolved channels. `kind` only labels the log line.
     rescan: Option<BeaconAnomalyKind>,
@@ -242,7 +242,8 @@ pub(crate) async fn run_beacon_monitor(
     .await;
 }
 
-/// Variant that gates beacon acceptance on a [`SignedBeaconVerifier`].
+/// Variant that gates beacon acceptance on a
+/// [`crate::server::signed_beacon::SignedBeaconVerifier`].
 /// When `verifier` is `Some(...)`, the monitor only forwards beacons
 /// to the search engine after a valid companion datagram (cmmd=0xCAFE,
 /// see [`crate::server::signed_beacon`]) has been received and
@@ -280,7 +281,7 @@ async fn run_beacon_monitor_inner(
     // the AsyncUdpV4 analogue of INADDR_ANY — so BOTH destinations are
     // reachable and, because all NIC sockets share ONE ephemeral port, the
     // repeater keys the alternating datagrams to a single client by port
-    // (C `identicalPort`, `repeater.cpp:428`) exactly as C's single
+    // (C `identicalPort`, `repeater.cpp:418`) exactly as C's single
     // INADDR_ANY socket does.
     let socket = match AsyncUdpV4::bind_ephemeral_same_port(false) {
         Ok(s) => s,
@@ -435,7 +436,7 @@ async fn run_beacon_monitor_inner(
             let Ok(hdr) = CaHeader::from_bytes(&buf[offset..len]) else {
                 break;
             };
-            // C `rsrv/camessage.c:2520` rejects misaligned m_postsize.
+            // C `rsrv/camessage.c:2452` rejects misaligned m_postsize.
             // UDP path drops silently. Without this check, the
             // round-up below would advance into the next message's
             // header bytes.
@@ -469,7 +470,7 @@ async fn run_beacon_monitor_inner(
                     // G3: bind the signed payload's announced server_ip
                     // to the UDP source IP — but only when the datagram
                     // didn't transit a repeater. The CA repeater
-                    // (`repeater.cpp:626-630`, our `repeater.rs:224-228`)
+                    // (`repeater.cpp:614-618`, our `repeater.rs:224-228`)
                     // forwards the companion verbatim while the kernel
                     // rewrites the L3 source to the repeater's local
                     // socket address (typically 127.0.0.1). Under the
@@ -580,7 +581,7 @@ async fn run_beacon_monitor_inner(
                 // `m_available = 0` per C `online_notify.c:69`, and
                 // the repeater rewrites the field to the original
                 // server's source IP before forwarding (C
-                // `repeater.cpp:626-630`; our `repeater.rs:224-228`).
+                // `repeater.cpp:614-618`; our `repeater.rs:224-228`).
                 // The companion datagram carries `server_ip` in its
                 // signed payload (`signed_beacon.rs::build_packet`
                 // bytes 12..16), which `verify()` returns as the same
@@ -846,7 +847,7 @@ fn handle_beacon(
     // which reported nothing to either consumer.
     //
     // A false trigger on a live server is *not* damaging, and libca
-    // says so explicitly at `bhe.cpp:216-221` / `bhe.cpp:248-253`:
+    // says so explicitly at `bhe.cpp:217-221` / `bhe.cpp:248-253`:
     // "It may be possible to get false triggers here if the client is
     // busy, but this does not cause problems because the echo response
     // will tell us that the server is available". Our receive watchdog
@@ -904,7 +905,7 @@ fn handle_beacon(
         ));
     }
 
-    // Search-engine wake-up: libca `cac::beaconNotify` (`cac.cpp:500`)
+    // Search-engine wake-up: libca `cac::beaconNotify` (`cac.cpp:499`)
     // calls `udpiiu::beaconAnomalyNotify` exactly when
     // `bhe::updatePeriod` returned `netChange`. The earlier "soft poke
     // on every beacon" code amplified normal beacon traffic into a
@@ -954,7 +955,7 @@ fn handle_beacon(
 /// registrations to accept and rejected everything from a different address,
 /// and which of the two addresses that was depended on the release. Alternating
 /// means one of every two attempts is always acceptable to any repeater vintage
-/// (`udpiiu.cpp:476-493`). Both the C repeater (`repeater.cpp:115-117`) and this
+/// (`udpiiu.cpp:476-493`). Both the C repeater (`repeater.cpp:112-114`) and this
 /// port's (`repeater.rs:103`) bind `INADDR_ANY`, so both destinations reach it.
 ///
 /// `repeater_port` is the value the caller resolved once via
@@ -1022,7 +1023,7 @@ mod repeater_registration_tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     #[serial_test::serial]
     async fn registration_retries_every_second_until_confirm_then_stops() {
-        // `INADDR_ANY`, like the real repeater (C `repeater.cpp:115-117`,
+        // `INADDR_ANY`, like the real repeater (C `repeater.cpp:112-114`,
         // `repeater.rs:103`). A loopback-only bind would miss the odd-numbered
         // attempts, which C addresses to `osiLocalAddr()` — see
         // `registration_alternates_loopback_and_local_addr_across_attempts`.
@@ -1061,17 +1062,59 @@ mod repeater_registration_tests {
             .await
             .expect("send CONFIRM");
 
-        // One registration may already be in flight from a tick that fired
-        // before the CONFIRM landed; give it 400 ms to settle, then require
-        // silence for 2.2 s (C returns `noRestart` once registered).
-        tokio::time::sleep(Duration::from_millis(400)).await;
-        let (after, _) = drain_registers(&repeater, Duration::from_millis(2200)).await;
-        assert_eq!(
-            after, 0,
-            "registration must stop on CONFIRM (C `expire` returns noRestart \
-             once `registered`); saw {after} more"
-        );
+        // The denied event here is a timer tick, so no frame the confirmed
+        // monitor sends can order it — and a silence window would only be
+        // evidence that this machine was fast enough. A SECOND, unconfirmed
+        // monitor supplies the order instead: it runs the same
+        // `REPEATER_SUBSCRIBE_PERIOD` ticker under the same scheduler, so its
+        // n-th registration proves n-1 periods have passed for the confirmed
+        // one too, and starvation slows the barrier rather than defeating it.
+        // Sources are told apart by port, which is what the repeater itself
+        // keys on (C `identicalPort`, `repeater.cpp:418`).
+        let (pacer_coord_tx, _pacer_coord_rx) = mpsc::unbounded_channel();
+        let (_pacer_ctrl_tx, pacer_ctrl_rx) = mpsc::unbounded_channel();
+        let pacer = tokio::spawn(run_beacon_monitor(
+            pacer_coord_tx,
+            pacer_ctrl_rx,
+            crate::protocol::repeater_port(),
+        ));
 
+        // One registration may still be in flight from a tick that fired
+        // before the CONFIRM was processed, so the confirmed port is denied
+        // only from the pacer's second registration on — a whole period of
+        // slack, counted in ticks rather than in milliseconds.
+        let pacer_ticks = std::cell::Cell::new(0usize);
+        crate::test_budget::barrier::until_async(
+            "registration must stop on CONFIRM (C `expire` returns noRestart \
+             once `registered`)",
+            |(src, _): &(SocketAddr, usize)| src.port() == client.port() && pacer_ticks.get() >= 2,
+            |(src, _): &(SocketAddr, usize)| src.port() != client.port() && pacer_ticks.get() >= 4,
+            async |remaining| {
+                let deadline = tokio::time::Instant::now() + remaining;
+                let mut buf = [0u8; 64];
+                loop {
+                    let (n, src) = tokio::time::timeout_at(deadline, repeater.recv_from(&mut buf))
+                        .await
+                        .ok()?
+                        .ok()?;
+                    if n < CaHeader::SIZE {
+                        continue;
+                    }
+                    match CaHeader::from_bytes(&buf[..n]) {
+                        Ok(h) if h.cmmd == CA_PROTO_REPEATER_REGISTER => {
+                            if src.port() != client.port() {
+                                pacer_ticks.set(pacer_ticks.get() + 1);
+                            }
+                            return Some((src, pacer_ticks.get()));
+                        }
+                        _ => continue,
+                    }
+                }
+            },
+        )
+        .await;
+
+        pacer.abort();
         monitor.abort();
         // SAFETY: see above.
         unsafe {
@@ -1094,7 +1137,7 @@ mod repeater_registration_tests {
     /// vintage. The port always announced (and always sent to) loopback.
     ///
     /// The fake repeater binds `INADDR_ANY` like the real one
-    /// (`repeater.cpp:115-117`, `repeater.rs:103`), so it receives BOTH
+    /// (`repeater.cpp:112-114`, `repeater.rs:103`), so it receives BOTH
     /// destination forms — asserting on the 4 datagrams' `m_available` pins
     /// the alternation and proves the odd-attempt datagram is still delivered.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -2273,7 +2316,7 @@ mod tests {
     /// `run_beacon_monitor_inner` bind at line 160). The repeater
     /// rewrites `m_available` on the regular `CA_PROTO_RSRV_IS_UP`
     /// beacon to the original sender's source IP (`repeater.cpp:
-    /// 626-630`, our `repeater.rs:224-228`); the 0xCAFE companion is
+    /// 614-618`, our `repeater.rs:224-228`); the 0xCAFE companion is
     /// forwarded verbatim and the kernel rewrites the L3 source IP
     /// to the repeater's loopback. The verified-tuple lookup key
     /// (post-fix: `(hdr.available, hdr.count, hdr.cid)`) therefore

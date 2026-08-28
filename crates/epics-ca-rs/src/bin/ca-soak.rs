@@ -148,7 +148,7 @@ async fn main() {
     // of spawning a separate task so we can keep client.diagnostics()
     // accessible without restructuring ownership.
     let report_interval = Duration::from_secs(args.report_interval);
-    let mut next = Instant::now() + report_interval;
+    let mut next = epics_base_rs::runtime::time::deadline_from_now(report_interval);
     let interrupted = tokio::signal::ctrl_c();
     tokio::pin!(interrupted);
     loop {

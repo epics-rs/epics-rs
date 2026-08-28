@@ -6,9 +6,16 @@
 //!
 //! Built only with the `discovery` feature.
 
-#![cfg(feature = "discovery")]
+//!
+//! `tokio_backend` as well as `discovery`: the case drives an
+//! `epics_ca_rs::server::CaServer`, which is the async front-end, and a
+//! `discovery::DiscoveryConfig`, whose backends await on `mdns-sd`'s sockets.
+//! Under the `discovery` gate alone, an `EPICS_RS_BUILD_EXEC_BACKEND=thread
+//! --features discovery` build did not compile this file — `CaServer` was
+//! configured out from under it.
 
-// RTEMS-EXEC-MODEL-ALLOW(1): not built by default - this file is behind the `discovery` feature.
+#![cfg(all(feature = "discovery", tokio_backend))]
+#![cfg(feature = "client-core")]
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -67,15 +74,18 @@ async fn mdns_server_announce_to_client_discover() {
     .expect("client");
 
     let ch = client.create_channel("MDNS:VAL");
-    ch.wait_connected(Duration::from_secs(8))
+    ch.wait_connected(budget::FACT_BUDGET)
         .await
         .expect("connect via mDNS-discovered IOC");
 
     let (_, value) = ch
-        .get_with_timeout(Duration::from_secs(3))
+        .get_with_timeout(budget::FACT_BUDGET)
         .await
         .expect("read");
     assert_eq!(value.to_f64().unwrap_or(0.0) as i64, 7777);
 
     server_task.abort();
 }
+
+#[path = "common/budget.rs"]
+mod budget;

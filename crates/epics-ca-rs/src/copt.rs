@@ -90,6 +90,126 @@ pub fn last(occurrences: &[String]) -> Option<&str> {
     occurrences.last().map(String::as_str)
 }
 
+/// Does the spec say this option swallows the next argv element, the way a
+/// `:` after the letter in C's optstring does?
+///
+/// The one owner of that question: [`getopt_cut`] needs it to know where an
+/// option's value is, `assert_repeatable` needs it to know which options must
+/// tolerate a `-`, and a binary needs it to tell clap the same thing. Two
+/// answers to it put the argv walk and clap in disagreement about which
+/// tokens are even options.
+pub fn takes_a_value(arg: &clap::Arg) -> bool {
+    matches!(
+        arg.get_action(),
+        clap::ArgAction::Set | clap::ArgAction::Append
+    )
+}
+
+/// The prefix of `argv` that C's getopt loop read before it stopped, or
+/// `None` when it never stopped and read all of it.
+///
+/// C acts on each option as `getopt` hands it back, so an option that ends
+/// the loop ends it at the position it appears and nothing after it is ever
+/// looked at: `caget -w abc -X PV` warns about `abc` and then refuses `-X`,
+/// while `caget -X -w abc PV` refuses without warning first. clap judges the
+/// whole command line before it returns anything, so this walk is what puts
+/// the two in the same order.
+///
+/// Only the ORDER is decided here. Which options exist and which take values
+/// comes from `spec`, so the long forms the Rust binaries add — which C's
+/// short-only getopt refuses outright — need no second table. `terminals`
+/// names the letters whose `case` arm returns from `main` before the loop can
+/// go on; the four CA tools name none, because [`Scan::finish`] performs
+/// their `-h`/`-V` at their place in the order instead, and softIoc names `h`
+/// (`softMain.cpp:165-168`).
+///
+/// The cut can fall INSIDE a token, because a cluster is several options:
+/// `-hq` is `h` then `q`, so a tool that stops on `h` is handed `-h`.
+pub fn getopt_cut(
+    spec: &clap::Command,
+    argv: &[std::ffi::OsString],
+    terminals: &[char],
+) -> Option<Vec<std::ffi::OsString>> {
+    /// getopt reads a cluster letter by letter, so a loop that stops in the
+    /// middle of one has PROCESSED the letters before it. `text` is the
+    /// token, `offset` the byte where the stopping letter starts and `taken`
+    /// the byte after it; the token is replaced by the letters getopt got
+    /// through and then the one it stopped on, each on its own. That is what
+    /// lets a caller drop the offending option by dropping the last element,
+    /// with no notion of a cut inside a token at all.
+    fn split_cluster(read: &mut Vec<std::ffi::OsString>, text: &str, offset: usize, taken: usize) {
+        read.pop();
+        if offset > 0 {
+            read.push(std::ffi::OsString::from(&text[..1 + offset]));
+        }
+        read.push(std::ffi::OsString::from(format!(
+            "-{}",
+            &text[1 + offset..1 + taken]
+        )));
+    }
+
+    let mut read: Vec<std::ffi::OsString> = Vec::with_capacity(argv.len());
+    let mut rest = argv.iter();
+    let arg0 = rest.next()?;
+    read.push(arg0.clone());
+
+    while let Some(token) = rest.next() {
+        read.push(token.clone());
+        let text = token.to_string_lossy();
+        if text == "--" {
+            // Nothing after this is an option, so nothing after this can stop
+            // the loop.
+            return None;
+        }
+        let Some(body) = text.strip_prefix('-').filter(|body| !body.is_empty()) else {
+            // A non-option. GNU getopt permutes it to the end and reads on,
+            // which is why `caget PV -X` still refuses `-X`.
+            continue;
+        };
+
+        if let Some(long) = body.strip_prefix('-') {
+            let name = long.split('=').next().unwrap_or(long);
+            let Some(arg) = spec.get_arguments().find(|a| a.get_long() == Some(name)) else {
+                return Some(read); // Refused, as C refuses every long option.
+            };
+            if matches!(arg.get_action(), clap::ArgAction::Help) {
+                // It displays and leaves, so it leaves from where it stands.
+                return Some(read);
+            }
+            if !long.contains('=') && takes_a_value(arg) {
+                let Some(value) = rest.next() else {
+                    return Some(read); // getopt `':'`, the value is missing.
+                };
+                read.push(value.clone());
+            }
+            continue;
+        }
+
+        for (offset, letter) in body.char_indices() {
+            let taken = offset + letter.len_utf8();
+            let arg = spec.get_arguments().find(|a| a.get_short() == Some(letter));
+            if terminals.contains(&letter) || arg.is_none() {
+                split_cluster(&mut read, &text, offset, taken);
+                return Some(read);
+            }
+            if arg.is_some_and(takes_a_value) {
+                if taken == body.len() {
+                    // getopt takes the next argv element whatever it looks
+                    // like, so `softIoc -d -h` loads a file called `-h`.
+                    let Some(value) = rest.next() else {
+                        // getopt `':'`, the value is missing.
+                        split_cluster(&mut read, &text, offset, taken);
+                        return Some(read);
+                    };
+                    read.push(value.clone());
+                }
+                break;
+            }
+        }
+    }
+    None
+}
+
 /// Every option a C tool declares must survive two things `getopt(3)` cannot
 /// fail: a repeat, and an option-argument that begins with `-`. This walks the
 /// clap spec and rejects any option that would.
@@ -113,8 +233,7 @@ fn assert_repeatable(cmd: &clap::Command) {
         if a.is_positional() {
             continue;
         }
-        let takes_value = matches!(a.get_action(), ArgAction::Set | ArgAction::Append);
-        if takes_value && !a.is_allow_hyphen_values_set() {
+        if takes_a_value(a) && !a.is_allow_hyphen_values_set() {
             panic!(
                 "option '{id}' takes a value but is not declared \
                  `allow_hyphen_values = true`, so clap would reject an argument that begins \
@@ -150,19 +269,19 @@ fn assert_repeatable(cmd: &clap::Command) {
 /// stands: `case 'h'`, `case 'V'`, and `cainfo`'s `default:` (`cainfo.c:196-198`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Terminal {
-    /// C `usage()` then `return <status>`. `caget.c:399-401` returns 0; the
+    /// C `usage()` then `return <status>`. `caget.c:400-402` returns 0; the
     /// `default:` arm that a declared-but-unhandled option letter falls into
     /// returns 1.
     ///
     /// The block goes to STDERR at either status, because that is the only
     /// stream C's `usage()` ever writes: all four tools open it with
-    /// `fprintf (stderr, "\nUsage: ...")` (`caget.c:55-58`, `camonitor.c:45-47`,
+    /// `fprintf (stderr, "\nUsage: ...")` (`caget.c:56-58`, `camonitor.c:45-47`,
     /// `caput.c:60-62`, `cainfo.c:37-39`), and the `-h` case just calls that
     /// same function. One block, one stream, both statuses — the port used to
     /// split it, sending the exit-0 half to stdout because that is where clap
     /// puts help. The block's WORDING is still clap's, not C's — a standing,
     /// separate divergence. `-V` keeps stdout: C prints the version banner with
-    /// `printf` (`caget.c:403`).
+    /// `printf` (`caget.c:404`).
     Usage(i32),
     /// C `case 'V'`: the version banner on stdout, `return 0`.
     Version,
@@ -379,7 +498,7 @@ pub fn scan_i32(s: &str) -> Option<i32> {
     scan_u32(s).map(|v| v as i32)
 }
 
-/// C `sscanf("%lu")` (`camonitor.c:447`, into an `unsigned long reqElems`):
+/// C `sscanf("%lu")` (`camonitor.c:269`, into an `unsigned long reqElems`):
 /// 64-bit, so — unlike [`scan_u32`] — a large magnitude is NOT truncated.
 /// Probed: `"-3" → 18446744073709551613`, `"99999999999" → 99999999999`.
 pub fn scan_u64(s: &str) -> Option<u64> {
@@ -564,7 +683,7 @@ impl Scan<'_> {
     }
 
     /// C `-#` in `camonitor`: `sscanf("%lu")` STRAIGHT into the `unsigned
-    /// long reqElems` (`camonitor.c:445-452`) — no 32-bit hop, so a big
+    /// long reqElems` (`camonitor.c:269-274`) — no 32-bit hop, so a big
     /// count survives where `caget`'s `%d` would truncate it. Same `0` =
     /// "not specified" contract, and the same reset-on-bad-repeat rule, as
     /// [`Scan::req_elems_int`].
@@ -714,7 +833,7 @@ impl Scan<'_> {
         chosen
     }
 
-    /// C `-F`: `fieldSeparator = (char) *optarg` (`caget.c:505`) — the FIRST
+    /// C `-F`: `fieldSeparator = (char) *optarg` (`caget.c:507`) — the FIRST
     /// character of the argument, the rest discarded. Observed:
     /// `caget -F abc TST:LO` → `TST:LOa200`. An empty argument yields
     /// `'\0'`, which C then dutifully prints between elements. The assignment
@@ -773,7 +892,7 @@ impl Scan<'_> {
 impl CTool {
     /// C's usage-error contract, shared by all four tools: ONE line on
     /// stderr, `<what>. ('<tool> -h' for help.)`, and `return 1` from
-    /// `main` (`caget.c:527-531`, `camonitor.c:604-608`, `caput.c:457-465`,
+    /// `main` (`caget.c:527-531`, `camonitor.c:363-367`, `caput.c:374-377`,
     /// `cainfo.c:202-205`, plus the getopt `'?'`/`':'` cases). No C CA tool
     /// exits 2, and none dumps its usage block on an error.
     pub fn usage_error(self, what: &str) -> ! {
@@ -836,17 +955,18 @@ impl CTool {
         };
 
         // getopt stops AT the offending token: the options before it were all
-        // processed, the ones after it never are. The longest argv prefix clap
-        // accepts is exactly that "before" — parse it on its own, and take the
-        // error from the shortest prefix that FAILS, so the diagnostic names
-        // the FIRST offending token even when the command line has several.
-        for k in (1..argv.len()).rev() {
-            let Ok(matches) = cmd.clone().try_get_matches_from(&argv[..k]) else {
-                continue;
-            };
+        // processed, the ones after it never are. [`getopt_cut`] is where that
+        // stop is worked out, and the token it ends on is the offending one,
+        // so the options C processed are the cut without it. The diagnostic
+        // comes from re-parsing the cut, which names that token and no later
+        // one even when the command line has several.
+        if let Some(cut) = getopt_cut(&cmd, &argv, &[])
+            && let Some((_, processed)) = cut.split_last()
+            && let Ok(matches) = cmd.clone().try_get_matches_from(processed)
+        {
             let error = cmd
                 .clone()
-                .try_get_matches_from(&argv[..=k])
+                .try_get_matches_from(&cut)
                 .err()
                 .unwrap_or(error);
             return Parsed {
@@ -855,8 +975,10 @@ impl CTool {
                 error: Some(self.usage_diagnostic(&cmd, error)),
             };
         }
-        // No prefix parses, so no option preceded the offending token and there
-        // is nothing to warn about first.
+        // Either no option preceded the offending token, or clap refused
+        // something the walk cannot see standing at an option's position —
+        // a positional it will not take, say. Neither has anything to warn
+        // about first.
         let _ = std::io::stderr().write_all(self.usage_diagnostic(&cmd, error).as_bytes());
         std::process::exit(1)
     }
@@ -956,6 +1078,69 @@ mod tests {
             .arg(flag("help", 'h'))
             .arg(flag("version", 'V'))
             .arg(clap::Arg::new("pv").num_args(0..))
+    }
+
+    /// The walk is C's loop, so the boundaries are the ones the loop has: a
+    /// letter the optstring does not carry, a letter that carries one INSIDE
+    /// a cluster (which whole-token bisection cannot reach), a value that is
+    /// missing, a value that looks like an option, a permuted non-option, and
+    /// `--`, after which nothing is an option at all.
+    #[test]
+    fn the_walk_cuts_argv_where_getopt_stops() {
+        let spec = caget_spec();
+        let cut = |argv: &[&str]| -> Option<Vec<String>> {
+            let owned: Vec<std::ffi::OsString> =
+                argv.iter().map(std::ffi::OsString::from).collect();
+            getopt_cut(&spec, &owned, &[]).map(|read| {
+                read.iter()
+                    .map(|a| a.to_string_lossy().into_owned())
+                    .collect()
+            })
+        };
+        // An option `caget` does not have ends the loop where it stands.
+        assert_eq!(
+            cut(&["caget", "-w", "5", "-X", "PV"]).unwrap(),
+            ["caget", "-w", "5", "-X"]
+        );
+        // ... including from inside a cluster, where the letters before it
+        // were real options C had already processed.
+        assert_eq!(cut(&["caget", "-VX", "PV"]).unwrap(), ["caget", "-V", "-X"]);
+        assert_eq!(cut(&["caget", "-hX"]).unwrap(), ["caget", "-h", "-X"]);
+        assert_eq!(cut(&["caget", "-Vw"]).unwrap(), ["caget", "-V", "-w"]);
+        // A long option: C's short-only getopt has none, and neither has this
+        // spec, so it is refused the same way.
+        assert_eq!(
+            cut(&["caget", "--nosuch", "PV"]).unwrap(),
+            ["caget", "--nosuch"]
+        );
+        // getopt `':'` — the value is off the end of argv.
+        assert_eq!(cut(&["caget", "-w"]).unwrap(), ["caget", "-w"]);
+        // A value is text: `-w -1` is a timeout of `-1`, not an option `-1`.
+        assert_eq!(cut(&["caget", "-w", "-1", "PV"]), None);
+        assert_eq!(cut(&["caget", "-w5", "PV"]), None);
+        // A non-option is permuted past, so a bad option after it still ends
+        // the loop.
+        assert_eq!(cut(&["caget", "PV", "-X"]).unwrap(), ["caget", "PV", "-X"]);
+        // `--` ends option scanning: `-X` after it is a PV name.
+        assert_eq!(cut(&["caget", "--", "-X"]), None);
+        // Nothing wrong: the loop runs off the end.
+        assert_eq!(cut(&["caget", "-V", "-w", "5", "PV"]), None);
+    }
+
+    /// `-h` and `-V` are ordinary options to the four CA tools — the walk
+    /// must not cut at them, or the warnings C prints BEFORE the usage block
+    /// would be lost with the rest of the line (R13-26).
+    #[test]
+    fn the_walk_does_not_cut_at_help_when_no_terminal_is_named() {
+        let spec = caget_spec();
+        let owned: Vec<std::ffi::OsString> = ["caget", "-h", "-w", "abc", "PV"]
+            .iter()
+            .map(std::ffi::OsString::from)
+            .collect();
+        assert_eq!(getopt_cut(&spec, &owned, &[]), None);
+        // Naming `h` terminal is what softIoc does, and then it does cut.
+        let read = getopt_cut(&spec, &owned, &['h']).expect("`-h` is terminal here");
+        assert_eq!(read.len(), 2);
     }
 
     fn matches_of(argv: &[&str]) -> clap::ArgMatches {
@@ -1260,7 +1445,7 @@ mod tests {
     ///   documented default (`0` / `DEFAULT_CA_PRIORITY`).
     /// * `-e`/`-f`/`-g` (`:470-484`): only the valid branch rewrites
     ///   `dblFormatStr`, so the last VALID occurrence wins.
-    /// * `-F` (`:505`): a bare assignment — plain last-wins.
+    /// * `-F` (`:506`): a bare assignment — plain last-wins.
     #[test]
     fn a_repeated_option_folds_the_way_its_c_case_does() {
         let t = |argv: &[&str]| {

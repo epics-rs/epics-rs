@@ -1,6 +1,6 @@
 //! Regression test (R9-21): the pre-put `Old :` read can NEVER abort `caput`.
 //!
-//! C `caput.c:531-535` calls `caget()` for the `Old :` display and DISCARDS
+//! C `caput.c:532-535` calls `caget()` for the `Old :` display and DISCARDS
 //! its return value — `result` is overwritten by the put that follows
 //! (`caput.c:539-548`). Inside that `caget()`, a channel whose GET fails
 //! (`ca_array_get` / the server's error reply) takes the `*** ...` marker path
@@ -16,15 +16,10 @@
 //! read. A framing proxy in front of a real `CaServer` provides exactly that:
 //! it relays every frame untouched except the `CA_PROTO_READ_NOTIFY` REPLY,
 //! whose status word (`m_cid`) it stamps with `ECA_NORDACCESS` — the wire
-//! shape of rsrv's `no_read_access_event` (`camessage.c:455-485`), which the
+//! shape of rsrv's `no_read_access_event` (`camessage.c:450-480`), which the
 //! CA client surfaces as a failed get.
 
-// Host/tokio-only: drives the async `caget`/`caput` CLI binaries out of
-// process. Those binaries are built with this feature too, so their
-// `CaClient` stack routes `spawn` to the background executor and then
-// reaches tokio I/O with no reactor. Inapplicable under the executor
-// backend; the RTEMS model has no async CLI client.
-#![cfg(not(feature = "rtems-exec-model"))]
+#![cfg(tokio_backend)]
 
 use std::net::SocketAddr;
 use std::time::Duration;

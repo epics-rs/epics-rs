@@ -30,45 +30,45 @@
 //! search, tokio `TcpStream` for the circuit). It is the *test driver*, not the
 //! artifact under test — the RTEMS deployment ships the server, not this client.
 //!
-//! ## The background-executor gap (closed by the follow-up commit)
+//! ## What the background executor does here
 //!
-//! The RTEMS **background executor** (callback pool + delayed timer + scanOnce
+//! The **background executor** (callback pool + delayed timer + scanOnce
 //! worker — `epics_base_rs::runtime::background`) is a *separate* facility from
-//! the blocking front-end. On RTEMS it drives **asynchronous** record-processing
+//! the blocking front-end. It drives **asynchronous** record-processing
 //! completion — the deferred half of a `WRITE_NOTIFY` on an async record, SDLY
-//! re-processing, put-callback completion — because `runtime::task::spawn` /
-//! `sleep` / `interval` route there on that target. On a host build those seam
-//! functions route to **tokio** instead (`task.rs`: the executor-backed impls
-//! are `#[cfg(target_os = "rtems")]`; the tokio impls are
-//! `#[cfg(not(target_os = "rtems"))]`), and `background_init()` itself is
-//! `#[cfg(any(target_os = "rtems", test))]` with its sole call site
-//! (`ioc_app.rs`) gated `#[cfg(target_os = "rtems")]` — so it is **not reachable
-//! from any host build of this crate** and cannot be called here.
+//! re-processing, put-callback completion.
 //!
-//! This test therefore uses **synchronous** records (`ao` / `longout`, Soft
-//! Channel, passive scan). Their `WRITE_NOTIFY` completes *synchronously on the
-//! client thread via `park_on`* — no async re-entry, no `task::spawn`, and so
-//! **nothing on the CA path routes through the background executor** (neither
-//! tokio nor the executor: there is simply no async completion to drive). That
-//! is an honest limit of this commit, not a tokio fallback: the async-completion
-//! path that *does* exercise the std-thread background executor on the host is
-//! added in the next commit, behind the host-selectable `rtems-exec-model`
-//! feature that routes the `task::spawn`/`sleep`/`interval` seam to the executor
-//! on a hosted target.
+//! Which executor the `runtime::task::spawn` / `sleep` / `interval` seam
+//! routes to is chosen by **`EPICS_RS_BUILD_EXEC_BACKEND=thread`**, not by the
+//! target: `epics-libcom-rs/build.rs` emits `cfg(exec_backend)` when it is set
+//! and `cfg(tokio_backend)` when it is not, and `task.rs` carries one impl per
+//! cfg. A hosted `EPICS_RS_BUILD_EXEC_BACKEND=thread` build therefore runs the
+//! same executor RTEMS does, which is why this file is in the exec-backend
+//! suite (see the census marker below) rather than gated out of it.
+//! `background_init()` is an ordinary ungated `pub fn` and
+//! `IocApplication::run` calls it on every backend (`ioc_app.rs`, C
+//! `callbackInit` parity), so the executor exists here on both.
+//!
+//! What this test does *not* reach is the asynchronous completion path, and
+//! that is a property of the records it loads rather than of any cfg: `ao` and
+//! `longout` on Soft Channel with a passive scan complete their `WRITE_NOTIFY`
+//! *synchronously on the client thread via `park_on`*, so there is no deferred
+//! tail for either executor to drive. The async half is covered by
+//! `async_write_notify_rtems_exec.rs` — `#![cfg(exec_backend)]`,
+//! a `calcout` with `ODLY` that really does defer, and its own
+//! `background_init()` call.
 
-// Host/tokio-only despite exercising the blocking server: the *client*
-// side of this e2e is the ordinary async `CaClient` (tokio `UdpSocket`),
-// which under `rtems-exec-model` has no reactor on the executor worker.
-// The blocking server itself is fine under the feature — it is the async
-// client harness that cannot run, so this file cannot be the feature's
-// e2e proof; `async_write_notify_rtems_exec` is.
-#![cfg(not(feature = "rtems-exec-model"))]
+#![cfg(feature = "client-core")]
+
+// RTEMS-EXEC-MODEL-ALLOW(1): measured, not argued — all 1 case(s) here run and
+// pass under `EPICS_RS_BUILD_EXEC_BACKEND=thread`. The file-level gate removed
+// with this marker asserted a reactor panic the exec backend does not produce,
+// and while it stood the exec-backend suite could not see this file at all.
 
 use std::collections::HashMap;
 use std::net::{Ipv4Addr, SocketAddrV4};
 use std::sync::Arc;
 use std::thread;
-use std::time::Duration;
 
 use epics_base_rs::server::database::PvDatabase;
 use epics_base_rs::server::ioc_builder::IocBuilder;
@@ -159,7 +159,7 @@ async fn blocking_rtems_server_serves_real_ca_client_end_to_end() {
     //     subscription circuit's event-task thread delivers it → the client
     //     monitor receives it. All server-side steps run on park_on std::threads.
     let ch = client.create_channel("E2E:AO");
-    ch.wait_connected(Duration::from_secs(5))
+    ch.wait_connected(budget::FACT_BUDGET)
         .await
         .expect("channel connects to the blocking server");
     let mut monitor = ch.subscribe().await.expect("subscribe");
@@ -218,3 +218,6 @@ async fn blocking_rtems_server_serves_real_ca_client_end_to_end() {
         .expect("udp thread joins")
         .expect("udp responder exits cleanly");
 }
+
+#[path = "common/budget.rs"]
+mod budget;

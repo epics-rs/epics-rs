@@ -10,6 +10,8 @@
 //!
 //! Skipped when softIoc is unavailable.
 
+#![cfg(feature = "client-core")]
+
 // RTEMS-EXEC-MODEL-ALLOW(4): not run by the default nextest profile (default-filter excludes it).
 
 mod common;
@@ -49,9 +51,7 @@ async fn many_concurrent_channels_connect() {
     if !require_tool("softIoc") {
         return;
     }
-    let Some(ioc) = spawn_softioc(STRESS_DB) else {
-        return;
-    };
+    let ioc = spawn_softioc(STRESS_DB);
     set_client_env(&ioc.ca_addr_list(), ioc.udp_port);
 
     let client = epics_ca_rs::client::CaClient::new()
@@ -66,7 +66,7 @@ async fn many_concurrent_channels_connect() {
     // Wait for every one to connect.
     let mut connected = 0;
     for ch in &channels {
-        if ch.wait_connected(Duration::from_secs(5)).await.is_ok() {
+        if ch.wait_connected(budget::FACT_BUDGET).await.is_ok() {
             connected += 1;
         }
     }
@@ -80,9 +80,7 @@ async fn rapid_create_drop_cycles() {
     if !require_tool("softIoc") {
         return;
     }
-    let Some(ioc) = spawn_softioc(STRESS_DB) else {
-        return;
-    };
+    let ioc = spawn_softioc(STRESS_DB);
     set_client_env(&ioc.ca_addr_list(), ioc.udp_port);
 
     let client = epics_ca_rs::client::CaClient::new()
@@ -95,7 +93,7 @@ async fn rapid_create_drop_cycles() {
     for round in 0..50 {
         let pv = format!("S:{}", round % 10);
         let ch = client.create_channel(&pv);
-        ch.wait_connected(Duration::from_secs(3))
+        ch.wait_connected(budget::FACT_BUDGET)
             .await
             .unwrap_or_else(|e| panic!("round {round}: {e:?}"));
         drop(ch);
@@ -109,16 +107,14 @@ async fn burst_of_writes_completes() {
     if !require_tool("softIoc") {
         return;
     }
-    let Some(ioc) = spawn_softioc(STRESS_DB) else {
-        return;
-    };
+    let ioc = spawn_softioc(STRESS_DB);
     set_client_env(&ioc.ca_addr_list(), ioc.udp_port);
 
     let client = epics_ca_rs::client::CaClient::new()
         .await
         .expect("CaClient");
     let ch = client.create_channel("S:0");
-    ch.wait_connected(Duration::from_secs(5))
+    ch.wait_connected(budget::FACT_BUDGET)
         .await
         .expect("connect");
 
@@ -129,7 +125,7 @@ async fn burst_of_writes_completes() {
 
     // Final readback should match the last written value.
     let (_, value) = ch
-        .get_with_timeout(Duration::from_secs(3))
+        .get_with_timeout(budget::FACT_BUDGET)
         .await
         .expect("readback");
     assert_eq!(value.to_f64().unwrap_or(0.0) as i64, 99);
@@ -142,16 +138,14 @@ async fn monitor_keeps_up_with_high_update_rate() {
     if !require_tool("softIoc") {
         return;
     }
-    let Some(ioc) = spawn_softioc(STRESS_DB) else {
-        return;
-    };
+    let ioc = spawn_softioc(STRESS_DB);
     set_client_env(&ioc.ca_addr_list(), ioc.udp_port);
 
     let client = epics_ca_rs::client::CaClient::new()
         .await
         .expect("CaClient");
     let ch = client.create_channel("S:0");
-    ch.wait_connected(Duration::from_secs(5))
+    ch.wait_connected(budget::FACT_BUDGET)
         .await
         .expect("connect");
 
@@ -160,7 +154,7 @@ async fn monitor_keeps_up_with_high_update_rate() {
     // Drive 200 updates as fast as the IOC will accept.
     let writer_ch = client.create_channel("S:0");
     writer_ch
-        .wait_connected(Duration::from_secs(5))
+        .wait_connected(budget::FACT_BUDGET)
         .await
         .expect("writer connect");
 
@@ -172,7 +166,7 @@ async fn monitor_keeps_up_with_high_update_rate() {
 
     // Drain monitor until we see the final value or timeout.
     let mut last: i64 = -1;
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+    let deadline = tokio::time::Instant::now() + budget::FACT_BUDGET;
     while tokio::time::Instant::now() < deadline {
         match tokio::time::timeout(Duration::from_millis(500), monitor.recv()).await {
             Ok(Some(Ok(snap))) => {
@@ -191,3 +185,5 @@ async fn monitor_keeps_up_with_high_update_rate() {
         "monitor did not converge on final value (last={last})"
     );
 }
+
+use common::budget;

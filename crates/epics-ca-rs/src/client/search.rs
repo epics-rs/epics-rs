@@ -1,6 +1,6 @@
 // The remaining #[tokio::test]s here are mod-gated to `tokio_backend`: they
 // drive the UDP SEARCH transport, which only exists there. The one per-test
-// #[cfg(not(feature = "rtems-exec-model"))] site
+// #[cfg(tokio_backend)] site
 // (stage_c1_name_servers_only_resolves_without_binding_udp) cannot run on the
 // exec backend until Stage C2/C3.
 
@@ -21,18 +21,18 @@ use std::time::{Duration, Instant};
 //     is no reactor running" — even when the process has a runtime somewhere
 //     else, because it is not entered on that worker. Gating on
 //     `not(target_os = "rtems")` named only the first reason, so a hosted
-//     `--features rtems-exec-model` build compiled the UDP transport in,
-//     selected it, and panicked at the first search
-//     (`doc/calink-rtems-design.md` §10.10 item 2, measured).
+//     `EPICS_RS_BUILD_EXEC_BACKEND=thread` build compiled the UDP transport in,
+//     selected it, and panicked at the first search (measured).
 //
 // `SearchUdpSocket` answers both: on `exec_backend` it is one wildcard socket
-// with a blocking receive pump — libca's own model (`udpiiu.cpp:174`) — so
+// with a blocking receive pump — libca's own model (one `epicsSocketCreate` at
+// `udpiiu.cpp:171`, one blocking `recvfrom` at `:409`) — so
 // nothing here needs a reactor and nothing here needs a gate.
 // `SearchTransport::NameServersOnly` remains for C's documented UDP-free mode
 // (design §4.2, §4.5); it is no longer the only mode the target has.
 use epics_base_rs::net::search_udp::{SearchDatagram, SearchUdpSocket};
 use epics_base_rs::runtime::sync::mpsc;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::AsyncReadExt;
 // The `runtime::task` seam, not `tokio::time::interval`: this engine is
 // compiled for the RTEMS target, where the periodic ticker is the delayed
 // callback timer and there is no tokio timer to drive tokio's own.
@@ -556,9 +556,8 @@ struct UdpTransport {
 /// UDP operation is a method on this type — so "a UDP socket is bound" and
 /// "the arm that reads it is armed" are the same match rather than two facts
 /// that can disagree. An `Option<SearchUdpSocket>` plus an `if let` at each of
-/// the fanout sites is the patch; this is the fix
-/// (`doc/calink-rtems-design.md` §4.3, mirroring the PVA client's
-/// `SearchTransport` — `doc/pvalink-rtems-design.md` §8).
+/// the fanout sites is the patch; this is the fix, mirroring the PVA client's
+/// `SearchTransport`.
 ///
 /// The configuration that needs the second variant is C's documented
 /// TCP-only name resolution mode (`modules/ca/src/client/CAref.html:515-520`):
@@ -597,7 +596,7 @@ fn log_dropped_udp_mutation(site: &'static str) {
 /// `lowestPriorityLevelAbove(lowestPriorityLevelAbove(initializing thread))`
 /// (`udpiiu.cpp:128-132`), and the thread that initializes the CA context for
 /// record links is C's `dbCaLink` worker at `epicsThreadPriorityMedium`
-/// (`dbCa.c:340`). `epicsThreadLowestPriorityLevelAbove` is `p + 1`
+/// (`dbCa.c:327`). `epicsThreadLowestPriorityLevelAbove` is `p + 1`
 /// (`os/posix/osdThread.c:883-899`, the file an RTEMS 6 build compiles — its
 /// one adjustment applies only when the scheduler's priority span is under
 /// 100, and SCHED_FIFO's is 1..254), so this is **52**: two bands above the
@@ -857,8 +856,8 @@ impl SearchTransport {
     /// (`stage_c1_name_servers_only_resolves_without_binding_udp`) rather
     /// than being production surface that happens to be tested. Scoped to the
     /// configuration that actually runs that gate — it is per-test gated off
-    /// under `rtems-exec-model`, so the method would be dead there.
-    #[cfg(all(test, not(feature = "rtems-exec-model")))]
+    /// under `exec_backend`, so the method would be dead there.
+    #[cfg(all(test, tokio_backend))]
     fn bound_udp_addrs(&self) -> Vec<SocketAddr> {
         match self {
             Self::NameServersOnly => Vec::new(),
@@ -908,6 +907,7 @@ impl SearchTransport {
 /// if an operator had named its server in `EPICS_CA_NAME_SERVERS`, and
 /// silently never resolved one reachable by broadcast alone.
 pub(crate) async fn run_search_engine(
+    reactor: epics_base_rs::runtime::task::Reactor,
     addr_list: Vec<super::AddrEntry>,
     nameserver_entries: Vec<super::AddrEntry>,
     request_rx: mpsc::UnboundedReceiver<SearchRequest>,
@@ -918,6 +918,7 @@ pub(crate) async fn run_search_engine(
         return;
     };
     run_engine(
+        reactor,
         transport,
         nameserver_entries,
         request_rx,
@@ -942,8 +943,7 @@ pub(crate) async fn run_search_engine(
 /// host client that already runs with an empty `EPICS_CA_ADDR_LIST` and
 /// `AUTO_ADDR_LIST=NO` but still expects a later `AddAddress` / discovery
 /// event to work. Same reasoning as the PVA client's
-/// `SearchEngine::spawn_name_servers_only` (`doc/pvalink-rtems-design.md`
-/// §8.2).
+/// `SearchEngine::spawn_name_servers_only`.
 ///
 /// The cost, stated plainly: no UDP SEARCH at all, so no reply can arrive
 /// from a server that is not behind one of the configured name servers, and
@@ -957,7 +957,7 @@ pub(crate) async fn run_search_engine(
 /// crate calls it outside the gate tests. It was the sole engine on
 /// `exec_backend` while `SearchTransport` had no UDP variant there.
 #[cfg_attr(
-    any(not(test), feature = "rtems-exec-model"),
+    any(not(test), exec_backend),
     expect(
         dead_code,
         reason = "\
@@ -967,6 +967,7 @@ pub(crate) async fn run_search_engine(
     )
 )]
 pub(crate) fn name_servers_only_search_engine(
+    reactor: epics_base_rs::runtime::task::Reactor,
     nameserver_entries: Vec<super::AddrEntry>,
     request_rx: mpsc::UnboundedReceiver<SearchRequest>,
     response_tx: mpsc::UnboundedSender<SearchResponse>,
@@ -974,6 +975,7 @@ pub(crate) fn name_servers_only_search_engine(
 ) -> epics_base_rs::error::CaResult<impl std::future::Future<Output = ()> + Send + 'static> {
     let transport = SearchTransport::name_servers_only(&nameserver_entries)?;
     Ok(run_engine(
+        reactor,
         transport,
         nameserver_entries,
         request_rx,
@@ -983,6 +985,7 @@ pub(crate) fn name_servers_only_search_engine(
 }
 
 async fn run_engine(
+    reactor: epics_base_rs::runtime::task::Reactor,
     mut transport: SearchTransport,
     nameserver_entries: Vec<super::AddrEntry>,
     mut request_rx: mpsc::UnboundedReceiver<SearchRequest>,
@@ -1013,8 +1016,9 @@ async fn run_engine(
         let (tx, rx) = mpsc::channel::<Vec<u8>>(ns_queue_cap);
         nameserver_send_txs.push(tx);
         let resp_tx = tcp_response_tx.clone();
-        epics_base_rs::runtime::task::spawn(async move {
-            run_nameserver_connection(entry, rx, resp_tx).await;
+        let conn_reactor = reactor.clone();
+        reactor.spawn(async move {
+            run_nameserver_connection(conn_reactor, entry, rx, resp_tx).await;
         });
     }
 
@@ -1076,7 +1080,7 @@ async fn run_engine(
                 // stale `resolved` entry still names the old server,
                 // emitting a false `ECA_DBLCHNL`. libca processes the
                 // circuit teardown and the SEARCH reply on one thread
-                // under one mutex (`cac.cpp:591-661`), so the disconnect
+                // under one mutex (`cac.cpp:589-659`), so the disconnect
                 // is always observed first; this drain restores that
                 // ordering for the decoupled search-engine task.
                 let mut immediate: Vec<u32> = Vec::new();
@@ -1158,6 +1162,7 @@ async fn run_engine(
 /// themselves; the extra lookup per redial is bounded by the CONN_TMO
 /// cadence.
 async fn run_nameserver_connection(
+    reactor: epics_base_rs::runtime::task::Reactor,
     mut entry: super::AddrEntry,
     mut outgoing_rx: mpsc::Receiver<Vec<u8>>,
     response_tx: mpsc::UnboundedSender<ParsedDatagram>,
@@ -1205,7 +1210,8 @@ async fn run_nameserver_connection(
             continue;
         };
 
-        match serve_nameserver_circuit(addr, stream, &mut outgoing_rx, &response_tx).await {
+        match serve_nameserver_circuit(&reactor, addr, stream, &mut outgoing_rx, &response_tx).await
+        {
             // Outgoing channel closed → no more senders ever → don't
             // reconnect; exit the per-nameserver task.
             NameserverCircuitEnd::Shutdown => return,
@@ -1255,6 +1261,7 @@ enum NameserverCircuitEnd {
 /// to exit, and the transport manager drops the whole `ServerConnection`, which
 /// aborts the other half.
 async fn serve_nameserver_circuit(
+    reactor: &epics_base_rs::runtime::task::Reactor,
     addr: SocketAddr,
     stream: super::transport::CaCircuit,
     outgoing_rx: &mut mpsc::Receiver<Vec<u8>>,
@@ -1289,7 +1296,17 @@ async fn serve_nameserver_circuit(
         CA_PROTO_HOST_NAME,
         &epics_base_rs::runtime::env::hostname(),
     ));
-    if writer.write_all(&handshake).await.is_err() {
+    // `OnStall::Stop`, and only here: the read task below does not exist yet,
+    // so this circuit has no receive watchdog to own the "keep the socket"
+    // verdict that C's send watchdog defers to. A peer that will not take the
+    // handshake inside `EPICS_CA_CONN_TMO` is retired, and the caller redials.
+    if !matches!(
+        super::transport::send_on_circuit(&mut writer, &handshake, || {
+            super::transport::OnStall::Stop
+        })
+        .await,
+        super::transport::SendEnd::OnWire
+    ) {
         return NameserverCircuitEnd::Retired;
     }
 
@@ -1300,7 +1317,7 @@ async fn serve_nameserver_circuit(
     // bytes out through `write_tx` — and it is why the reader can own the
     // liveness rule without owning the socket's send half.
     let (echo_tx, mut echo_rx) = mpsc::unbounded_channel::<()>();
-    let read_task = epics_base_rs::runtime::task::spawn(async move {
+    let read_task = reactor.spawn(async move {
         let mut buf = vec![0u8; 8192];
         let mut accumulated: Vec<u8> = Vec::new();
         // The client's one receive-side body limit
@@ -1358,6 +1375,11 @@ async fn serve_nameserver_circuit(
                         }
                     }
                 }
+                // Rebuilt each iteration like the data circuit's, and safe
+                // for the same reason: nothing lives in the read future
+                // between polls, and rustls hands back buffered plaintext
+                // even when the socket poll is `Pending`. See the matching
+                // note in `transport.rs::read_loop` for the two sources.
                 read_result = reader.read(&mut buf) => match read_result {
                     Ok(0) | Err(_) => break,
                     Ok(n) => n,
@@ -1379,9 +1401,8 @@ async fn serve_nameserver_circuit(
             //
             // Where the message boundaries are is NOT decided here —
             // `transport::next_frame` is the client's one framing step,
-            // shared with the upstream circuit's `read_loop`
-            // (`doc/calink-rtems-design.md` §6 C2: "one seam, two
-            // callers"). This loop only measures how long a prefix of
+            // shared with the upstream circuit's `read_loop`. This loop
+            // only measures how long a prefix of
             // whole messages it can hand on.
             let mut consumed = 0usize;
             // Distinguishes "wait for more bytes" from "the bytes we
@@ -1461,6 +1482,30 @@ async fn serve_nameserver_circuit(
     // skipped the cleanup and leaked the read task per
     // nameserver on every shutdown.
     let mut shutdown = false;
+    // The pump's stall policy, shared by both send sites below. A name server
+    // has no `connectedList` to move, so C falls through the marking block in
+    // `unresponsiveCircuitNotify` (`tcpiiu.cpp:922-940`) and there is nothing
+    // to record here beyond one warning. What the policy is really for is
+    // regaining control: before it, a send to a peer that had stopped reading
+    // parked inside `write_all` with no deadline, so the pump never came back
+    // to look at `read_task`, and the reader's echo-watchdog verdict — the
+    // one thing entitled to retire this circuit — could not end the pump.
+    let mut stall_warned = false;
+    let mut on_stall = || {
+        if read_task.is_finished() {
+            return super::transport::OnStall::Stop;
+        }
+        if !stall_warned {
+            stall_warned = true;
+            tracing::warn!(
+                nameserver = %addr,
+                "EPICS_CA_NAME_SERVERS peer did not drain our send within \
+                 EPICS_CA_CONN_TMO; keeping the circuit while the receive \
+                 watchdog decides"
+            );
+        }
+        super::transport::OnStall::Resume
+    };
     'pump: loop {
         tokio::select! {
             msg = outgoing_rx.recv() => {
@@ -1468,7 +1513,10 @@ async fn serve_nameserver_circuit(
                     shutdown = true;
                     break 'pump;
                 };
-                if writer.write_all(&bytes).await.is_err() {
+                if !matches!(
+                    super::transport::send_on_circuit(&mut writer, &bytes, &mut on_stall).await,
+                    super::transport::SendEnd::OnWire
+                ) {
                     break 'pump;
                 }
             }
@@ -1483,7 +1531,15 @@ async fn serve_nameserver_circuit(
                     break 'pump;
                 }
                 let echo = CaHeader::new(CA_PROTO_ECHO);
-                if writer.write_all(&echo.to_bytes()).await.is_err() {
+                if !matches!(
+                    super::transport::send_on_circuit(
+                        &mut writer,
+                        &echo.to_bytes(),
+                        &mut on_stall
+                    )
+                    .await,
+                    super::transport::SendEnd::OnWire
+                ) {
                     break 'pump;
                 }
             }
@@ -1549,7 +1605,7 @@ fn handle_request_or_addr(
 /// `resolved` multiply-defined tracker through `remove_channel` — is
 /// applied before a SEARCH reply for the same cid is parsed, so a
 /// legitimate server migration cannot surface as a false `ECA_DBLCHNL`.
-/// This restores libca's single-threaded ordering (`cac.cpp:591-661`),
+/// This restores libca's single-threaded ordering (`cac.cpp:589-659`),
 /// where circuit teardown and SEARCH-reply handling share one mutex.
 fn drain_pending_requests(
     state: &mut SearchEngineState,
@@ -1739,7 +1795,7 @@ fn handle_search_response(
     }
 
     // C `udpiiu.cpp::searchRespAction` transfers the channel to its
-    // virtual circuit on EVERY SEARCH reply, and `cac.cpp:651` /
+    // virtual circuit on EVERY SEARCH reply, and `cac.cpp:649-650` /
     // `searchTimer.cpp:323` uninstall the channel from the search list
     // unconditionally — the per-datagram sequence number
     // (`lastReceivedSeqNo`, recorded by `versionAction`) gates only
@@ -1761,7 +1817,7 @@ fn handle_search_response(
             break;
         };
 
-        // C `rsrv/camessage.c:2520` rejects misaligned `m_postsize`.
+        // C `rsrv/camessage.c:2452` rejects misaligned `m_postsize`.
         // For UDP (where this loop runs), C silently drops the
         // datagram without emitting an error — we do the same by
         // breaking out of the chained-message parse. Without this
@@ -1823,7 +1879,7 @@ fn handle_search_response(
 
                 // multiply-defined-PV detection runs
                 // BEFORE the penalty / breaker gates. libca
-                // `cac.cpp:591-661` runs this check on
+                // `cac.cpp:589-659` runs this check on
                 // every SEARCH reply for a known cid with no per-
                 // server filtering and no seq-number gating between.
                 // Pre-fix Rust put the duplicate-detect after those
@@ -2457,7 +2513,7 @@ mod tests {
     /// A name-servers-only engine with an empty `EPICS_CA_NAME_SERVERS` can
     /// reach nothing at all — no UDP socket and no TCP circuit. Refuse it at
     /// construction rather than spawning a task that resolves nothing
-    /// forever (`doc/calink-rtems-design.md` §6 stage C1).
+    /// forever.
     #[test]
     fn name_servers_only_refuses_empty_name_server_list() {
         let err = SearchTransport::name_servers_only(&[])
@@ -2939,6 +2995,8 @@ mod tests {
         let (req_tx, req_rx) = mpsc::unbounded_channel();
         let (resp_tx, _resp_rx) = mpsc::unbounded_channel();
         let engine_handle = tokio::spawn(run_search_engine(
+            epics_base_rs::runtime::task::Reactor::current()
+                .expect("the test driver enters an executor"),
             vec![crate::client::AddrEntry::new(
                 sniffer_addr,
                 None,
@@ -3046,6 +3104,8 @@ mod tests {
         let (req_tx, req_rx) = mpsc::unbounded_channel();
         let (resp_tx, _resp_rx) = mpsc::unbounded_channel();
         let engine_handle = tokio::spawn(run_search_engine(
+            epics_base_rs::runtime::task::Reactor::current()
+                .expect("the test driver enters an executor"),
             vec![crate::client::AddrEntry::new(
                 sniffer_addr,
                 None,
@@ -3112,12 +3172,12 @@ mod tests {
         );
     }
 
-    /// `doc/calink-rtems-design.md` §6 stage C1 gate: the client must resolve a
-    /// PV with `EPICS_CA_ADDR_LIST` empty and `EPICS_CA_AUTO_ADDR_LIST=NO`,
-    /// reaching the server **only** through `EPICS_CA_NAME_SERVERS`, having
-    /// bound **no UDP socket at all**. That is C's documented TCP-only name
-    /// resolution mode (`modules/ca/src/client/CAref.html:515-520`, §4.1) and
-    /// we had no test for it.
+    /// The client must resolve a PV with `EPICS_CA_ADDR_LIST` empty and
+    /// `EPICS_CA_AUTO_ADDR_LIST=NO`, reaching the server **only** through
+    /// `EPICS_CA_NAME_SERVERS`, having bound **no UDP socket at all**. That is
+    /// C's documented TCP-only name resolution mode
+    /// (`modules/ca/src/client/CAref.html:515-520`, §4.1) and we had no test
+    /// for it.
     ///
     /// The "no UDP socket" half is asserted twice, deliberately:
     ///
@@ -3140,24 +3200,22 @@ mod tests {
     /// The resolution half is what proves the degradation is not merely inert:
     /// a SEARCH still goes out (over TCP) and the reply still resolves the cid.
     ///
-    /// Gated off under `rtems-exec-model`: the resolution half dials the TCP
-    /// name server through `run_nameserver_connection`, which is spawned on
-    /// the exec backend's callback band (`runtime::task::spawn`) — a band
-    /// worker with no tokio I/O reactor, so `TcpStream::connect` panics there.
-    /// Making that path drive real sockets under the exec backend is Stage C2
-    /// (the blocking byte source) / C3 (the spawn seam), not this stage
-    /// (`doc/calink-rtems-design.md` §6). The structural half of the claim —
-    /// that `NameServersOnly` can hold no UDP socket — is a property of the
-    /// type and is additionally covered by
+    /// Gated off under `exec_backend`: the resolution half dials the TCP name
+    /// server through `run_nameserver_connection`, which is spawned on the
+    /// exec backend's callback band (`runtime::task::spawn`) — a band worker
+    /// with no tokio I/O reactor, so `TcpStream::connect` panics there. Making
+    /// that path drive real sockets under the exec backend is Stage C2 (the
+    /// blocking byte source) / C3 (the spawn seam), not this stage. The
+    /// structural half of the claim — that `NameServersOnly` can hold no UDP
+    /// socket — is a property of the type and is additionally covered by
     /// `name_servers_only_drops_address_list_mutations`, which runs in both
-    /// configurations.
-    /// epics-base#488 for `EPICS_CA_NAME_SERVERS`: the dial must use the
-    /// entry's *current* DNS resolution, not the one cached at startup.
-    /// The entry's cached sock points at TEST-NET-1 (unroutable), the
-    /// hostname still names this host — only a redial that re-resolves
-    /// can reach the listener. Pre-fix, the circuit redialled the cached
+    /// configurations. epics-base#488 for `EPICS_CA_NAME_SERVERS`: the dial
+    /// must use the entry's *current* DNS resolution, not the one cached at
+    /// startup. The entry's cached sock points at TEST-NET-1 (unroutable), the
+    /// hostname still names this host — only a redial that re-resolves can
+    /// reach the listener. Pre-fix, the circuit redialled the cached
     /// `SocketAddr` forever and this accept times out.
-    #[cfg(not(feature = "rtems-exec-model"))]
+    #[cfg(tokio_backend)]
     #[tokio::test(flavor = "current_thread")]
     async fn a_nameserver_dial_uses_the_fresh_dns_resolution() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
@@ -3171,7 +3229,13 @@ mod tests {
         );
         let (_out_tx, out_rx) = mpsc::channel::<Vec<u8>>(8);
         let (resp_tx, _resp_rx) = mpsc::unbounded_channel();
-        let circuit = tokio::spawn(run_nameserver_connection(stale, out_rx, resp_tx));
+        let circuit = tokio::spawn(run_nameserver_connection(
+            epics_base_rs::runtime::task::Reactor::current()
+                .expect("the test driver enters an executor"),
+            stale,
+            out_rx,
+            resp_tx,
+        ));
         let accepted =
             tokio::time::timeout(std::time::Duration::from_secs(10), listener.accept()).await;
         circuit.abort();
@@ -3182,7 +3246,7 @@ mod tests {
         );
     }
 
-    #[cfg(not(feature = "rtems-exec-model"))]
+    #[cfg(tokio_backend)]
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     #[serial_test::serial]
     async fn stage_c1_name_servers_only_resolves_without_binding_udp() {
@@ -3260,6 +3324,8 @@ mod tests {
         let (req_tx, req_rx) = mpsc::unbounded_channel();
         let (resp_tx, mut resp_rx) = mpsc::unbounded_channel();
         let engine = name_servers_only_search_engine(
+            epics_base_rs::runtime::task::Reactor::current()
+                .expect("the test driver enters an executor"),
             vec![ns_entry(ns_addr)],
             req_rx,
             resp_tx,
@@ -3343,9 +3409,9 @@ mod tests {
     /// is `#[serial_test::serial]`, the same key `conn_tmo_env_tests` uses.
     ///
     /// Carries the callers' own gate: both tests that shrink the timers dial
-    /// a TCP circuit, so they are compiled out under `rtems-exec-model` and
-    /// this helper would be dead code there.
-    #[cfg(not(feature = "rtems-exec-model"))]
+    /// a TCP circuit, so they are compiled out under `exec_backend` and this
+    /// helper would be dead code there.
+    #[cfg(tokio_backend)]
     fn shrink_circuit_timers(secs: u64) -> Duration {
         // SAFETY: as above — every caller is `#[serial_test::serial]`.
         unsafe { std::env::set_var("EPICS_CA_CONN_TMO", secs.to_string()) };
@@ -3366,8 +3432,7 @@ mod tests {
     ///
     /// Measured before this rule existed, on a VxWorks target against exactly
     /// this peer: ten consecutive descriptor censuses on one local port over
-    /// ≈600 s, one accept, dial-pool `attempts=1`
-    /// (`doc/vxworks-circuit-wedge-on-target-measurement.md` §3.5). The reader
+    /// ≈600 s, one accept, dial-pool `attempts=1`. The reader
     /// wrote `CA_PROTO_ECHO` on a hardcoded 60 s tick and never looked for the
     /// reply, so nothing could ever end the circuit short of TCP itself giving
     /// up — which a *silent but reachable* peer never makes happen.
@@ -3381,7 +3446,7 @@ mod tests {
     /// clock: the bound is built from `EPICS_CA_CONN_TMO`, and a peer that is
     /// real enough to accept a connection is real enough that its `accept`
     /// cannot be measured on tokio's virtual clock.
-    #[cfg(not(feature = "rtems-exec-model"))]
+    #[cfg(tokio_backend)]
     #[tokio::test]
     #[serial_test::serial]
     async fn a_silent_name_server_is_retired_on_the_circuit_bound() {
@@ -3426,6 +3491,8 @@ mod tests {
         let (_req_tx, req_rx) = mpsc::unbounded_channel();
         let (resp_tx, _resp_rx) = mpsc::unbounded_channel();
         let engine = name_servers_only_search_engine(
+            epics_base_rs::runtime::task::Reactor::current()
+                .expect("the test driver enters an executor"),
             vec![ns_entry(ns_addr)],
             req_rx,
             resp_tx,
@@ -3485,7 +3552,7 @@ mod tests {
     /// Real time on shrunk timers, for the reason [`shrink_circuit_timers`]
     /// gives — and here the peer's `accept` and its EOF are both real events,
     /// so a virtual clock would have measured neither.
-    #[cfg(not(feature = "rtems-exec-model"))]
+    #[cfg(tokio_backend)]
     #[tokio::test]
     #[serial_test::serial]
     async fn retiring_a_name_service_circuit_closes_it_before_the_backoff() {
@@ -3523,6 +3590,8 @@ mod tests {
         let (_req_tx, req_rx) = mpsc::unbounded_channel();
         let (resp_tx, _resp_rx) = mpsc::unbounded_channel();
         let engine = name_servers_only_search_engine(
+            epics_base_rs::runtime::task::Reactor::current()
+                .expect("the test driver enters an executor"),
             vec![ns_entry(ns_addr)],
             req_rx,
             resp_tx,
@@ -3566,7 +3635,7 @@ mod tests {
     /// the dispatcher a truncated frame and the cid never resolves; a reader
     /// that mis-measured the message length desyncs and never resolves the
     /// *second* message, which is why two are sent.
-    #[cfg(not(feature = "rtems-exec-model"))]
+    #[cfg(tokio_backend)]
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn nameserver_reply_torn_across_reads_still_resolves() {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -3621,6 +3690,8 @@ mod tests {
         let (req_tx, req_rx) = mpsc::unbounded_channel();
         let (resp_tx, mut resp_rx) = mpsc::unbounded_channel();
         let engine = name_servers_only_search_engine(
+            epics_base_rs::runtime::task::Reactor::current()
+                .expect("the test driver enters an executor"),
             vec![ns_entry(ns_addr)],
             req_rx,
             resp_tx,
@@ -3710,7 +3781,7 @@ mod tests {
     /// `Schedule{Reconnect}` — which invalidates `resolved` through
     /// `remove_channel` — is always applied before the reply is
     /// parsed, matching libca's single-thread ordering
-    /// (`cac.cpp:591-661`).
+    /// (`cac.cpp:589-659`).
     ///
     /// Pre-fix (reply parsed before the drain), the stale `resolved`
     /// entry for server A is still present, so the server-B reply
@@ -3809,7 +3880,7 @@ mod tests {
     /// R2-26 regression: a UDP SEARCH reply that arrives WITHOUT a
     /// leading `CA_PROTO_VERSION` in its datagram must still resolve the
     /// channel. C `udpiiu.cpp::searchRespAction` transfers the channel
-    /// to its virtual circuit on every reply, and `cac.cpp:651` /
+    /// to its virtual circuit on every reply, and `cac.cpp:649-650` /
     /// `searchTimer.cpp:323` uninstall it from the search list
     /// unconditionally — the per-datagram sequence marker gates only
     /// libca's RTT/timer tuning, never resolution. Pre-fix Rust gated

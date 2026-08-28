@@ -51,32 +51,36 @@ layer 2 below) is entirely separate and never reaches the wire.
 
 ### Server side: how do we honour it?
 
-`server/monitor.rs::FlowControlGate`:
+There is no gate object of its own. The flag lives on the circuit's
+event user — `ClientState::event_user` (`server/tcp.rs:721`), C's
+`client->evuser` — and the `EVENTS_OFF` / `EVENTS_ON` dispatch arm
+(`server/tcp.rs:3478-3483`) does nothing but call `flow_ctrl_on()` /
+`flow_ctrl_off()` on it
+(`crates/epics-base-rs/src/server/event_queue.rs:742-744`,
+`:748-757`).
 
-```rust
-pub struct FlowControlGate {
-    paused:  AtomicBool,
-    resumed: Notify,
-}
-```
+The event queue owns both rules that follow from the flag, so no
+monitor task has to test it:
 
-One instance per `ClientState` (i.e. per TCP circuit), held in an
-`Arc` and shared by every monitor sender task on that circuit.
+1. **Suspend.** `EventReader::recv`
+   (`crates/epics-base-rs/src/server/event_queue.rs:802-804`) suspends
+   on exactly C's `event_read` condition — `flowCtrlMode &&
+   nDuplicates == 0`, no drain pass in flight (`may_drain`,
+   `event_queue.rs:355-357`). `spawn_monitor_sender`
+   (`server/monitor.rs:32`) simply awaits `recv` and has no pause
+   branch of its own; `flow_ctrl_off` wakes every suspended reader on
+   the circuit.
+2. **Coalesce.** A post arriving while the ring is short of room
+   replaces that monitor's *last* queued entry in place
+   (`overwrite_last`, `event_queue.rs:258-268`), leaving ring
+   occupancy and `nDuplicates` untouched.
 
-The TCP dispatch handler for `EVENTS_OFF` / `EVENTS_ON` calls
-`pause()` / `resume()` (`tcp.rs:835`).
-
-Each `spawn_monitor_sender` task checks `is_paused()` after every
-recv. If paused, it enters a coalescing helper that keeps the most
-recent event arriving on the mpsc and waits for either:
-
-1. The mpsc to deliver a newer event (overwrites the saved one)
-2. `resumed.notify_waiters()` → exit coalesce, send the saved event,
-   continue the normal loop
-
-This means under EVENTS_OFF the server stops writing to the TCP
-socket but does not lose state — the client sees the **latest** value
-when it resumes, not a backlog.
+So EVENTS_OFF stops writes to the TCP socket without losing state, and
+on EVENTS_ON the client receives the queued **backlog** — each earlier
+distinct entry as its own frame — with only the newest entry per
+monitor collapsed to the latest value. It is not a latest-value-only
+resume; that was the pre-R8-21 / R8-22 behaviour, replaced by
+`f057dc49` and `c45e60a8`.
 
 ## Layer 2 — Per-subscription queue + coalesce slot
 
@@ -191,20 +195,28 @@ The write loop also wraps `writer.write_all` in a 10-second timeout
 (`SEND_TIMEOUT = 2 × ECHO_TIMEOUT_SECS`). If a TCP write hangs that
 long, the connection is declared dead.
 
-## Producer rate limiting (search engine AIMD)
+## Producer rate limiting (search engine bucket ring)
 
-A separate kind of "flow control" applies to UDP search:
+A separate kind of "flow control" applies to UDP search. It is not
+rate-adaptive: a fixed `N_SEARCH_BUCKETS = 30` ring
+(`client/search.rs:112`) advances one bucket per tick, and each pending
+cid sits in exactly one bucket, so the per-tick datagram count is
+O(N / 30) rather than O(N) — the load shaping is structural rather
+than a response-rate feedback loop (`process_bucket`,
+`client/search.rs:1990`).
 
-```
-state.budget.frames_per_try
-    starts at MAX_FRAMES_PER_TRY (50)
-    +1 on >50% response rate in a 1-second window  (additive increase)
-    →1 on <10% response rate                        (multiplicative decrease)
-```
+The tick is derived so one full revolution equals the resolved
+`EPICS_CA_MAX_SEARCH_PERIOD`: `tick = period / N_SEARCH_BUCKETS`
+(`normal_tick_for`, `client/search.rs:333-335`), which is 10 s at the
+300 s default and never below 2 s. A beacon poke switches the ring to
+`FAST_TICK = 200 ms` (`client/search.rs:339`), fitting a whole
+revolution in 6 s.
 
-This caps the number of UDP datagrams the engine sends per second
-when many channels are searching simultaneously, avoiding overwhelming
-intermediate switches. Source: `client/search.rs::SendBudget::evaluate`.
+An earlier lane-based scheduler did use AIMD (`frames_per_try` starting
+at 50, additive increase on a good response rate, collapse to 1 on a
+bad one) to dampen storms after the fact; the bucket ring replaced it
+and prevents them by construction — see the note at
+`client/search.rs:1985-1989`.
 
 ## Inactivity / liveness watchdogs
 

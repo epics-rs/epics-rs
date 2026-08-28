@@ -6,7 +6,7 @@
 //! C reference:
 //! - `libca/comQueSend.cpp:285` (`insertRequestHeader`): switches to
 //!   the extended form when `nElem >= 0xFFFF` *or* `pBSize >= 0xFFFF`.
-//! - `rsrv/camessage.c:2520` validates the 8-byte alignment of
+//! - `rsrv/camessage.c:2452` validates the 8-byte alignment of
 //!   `m_postsize` *after* the extended form is unfolded.
 //!
 //! Several findings cited shape variants of this

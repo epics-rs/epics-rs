@@ -7,7 +7,7 @@
 
 // RTEMS-EXEC-MODEL-ALLOW(1): the flavored test drives the CA client stack,
 // which needs a multi-thread tokio runtime. These run and pass in the
-// feature-ON suite on the tokio driver.
+// exec-backend suite on the tokio driver.
 use epics_base_rs::server::database::LinkSet;
 use epics_base_rs::server::iocsh::registry::{
     ArgDesc, ArgType, ArgValue, CommandContext, CommandDef, CommandOutcome,
@@ -25,7 +25,6 @@ pub fn ca_caxr_command(resolver: CaLinkResolver) -> CommandDef {
         vec![ArgDesc {
             name: "pv_name",
             arg_type: ArgType::String,
-            optional: false,
         }],
         "caxr <pv_name>",
         move |args: &[ArgValue], ctx: &CommandContext| {
@@ -72,7 +71,6 @@ pub fn db_dbcaxr_command(resolver: CaLinkResolver) -> CommandDef {
         vec![ArgDesc {
             name: "record",
             arg_type: ArgType::String,
-            optional: true,
         }],
         "dbcaxr [<recordName>]",
         move |args: &[ArgValue], ctx: &CommandContext| {

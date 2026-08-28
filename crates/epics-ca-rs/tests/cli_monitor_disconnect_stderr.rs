@@ -13,17 +13,18 @@
 //! block (`cac.cpp:1240`, R18-19). What C never writes is a per-PV line from
 //! the event handler — that is the byte this test pins.
 
-// Host/tokio-only: drives the async `caget`/`caput` CLI binaries out of
-// process. Those binaries are built with this feature too, so their
-// `CaClient` stack routes `spawn` to the background executor and then
-// reaches tokio I/O with no reactor. Inapplicable under the executor
-// backend; the RTEMS model has no async CLI client.
-#![cfg(not(feature = "rtems-exec-model"))]
 // …and `client`, because the contract asserted here includes the *resolved
 // peer name* in the exception context, which comes from `hostname::warm`
 // (`lib.rs`, `#[cfg(feature = "client")]`). Under `client-core` the context
 // carries the dotted address by design.
 #![cfg(feature = "client")]
+// Every case here drives the `softioc-rs` binary as a subprocess, and that
+// binary serves through the async CA front-end, so on `exec_backend` it
+// refuses at startup instead of running. `realtime-ca-ioc` is the entry
+// point that brings a CA IOC up on that backend, through the blocking
+// thread-per-client driver; it is a different binary with a different
+// command line, so these cases follow `softioc-rs` rather than move.
+#![cfg(tokio_backend)]
 
 mod common;
 
@@ -53,7 +54,7 @@ impl Drop for Reaped {
 fn start_ioc() -> (Reaped, u16) {
     let mut ioc = Reaped(
         Command::new(env!("CARGO_BIN_EXE_softioc-rs"))
-            .args(["--port", "0", "--pv", "TST:AI:double:1.0"])
+            .args(["-S", "--port", "0", "--pv", "TST:AI:double:1.0"])
             .env("EPICS_CAS_BEACON_ADDR_LIST", "127.0.0.1:1")
             .stdout(Stdio::null())
             .stderr(Stdio::piped())
@@ -64,7 +65,7 @@ fn start_ioc() -> (Reaped, u16) {
     // "CA server: UDP search on port 41234, TCP on port 41235, beacons → …"
     let stderr = ioc.0.stderr.take().expect("piped stderr");
     let mut reader = BufReader::new(stderr);
-    let deadline = Instant::now() + Duration::from_secs(10);
+    let deadline = Instant::now() + budget::FACT_BUDGET;
     let mut line = String::new();
     loop {
         assert!(
@@ -118,7 +119,7 @@ fn run_disconnect_scenario(resolver_grace: Duration) -> (String, String) {
     // Wait for the first monitor event itself, then take the IOC away
     // under it.
     assert!(
-        out_lines.wait_for(Duration::from_secs(10), |t| t.contains("TST:AI")),
+        out_lines.wait_for(budget::FACT_BUDGET, |t| t.contains("TST:AI")),
         "no first monitor line within 10s; stdout: {:?}",
         out_lines.text()
     );
@@ -129,12 +130,12 @@ fn run_disconnect_scenario(resolver_grace: Duration) -> (String, String) {
     // The disconnect must surface on both streams; each stream is gated on
     // its own marker so the kill below cannot race either write.
     assert!(
-        out_lines.wait_for(Duration::from_secs(10), |t| t.contains("*** disconnected")),
+        out_lines.wait_for(budget::FACT_BUDGET, |t| t.contains("*** disconnected")),
         "no `*** disconnected` on stdout within 10s; stdout: {:?}",
         out_lines.text()
     );
     assert!(
-        err_lines.wait_for(Duration::from_secs(10), |t| t.contains("Source File:")),
+        err_lines.wait_for(budget::FACT_BUDGET, |t| t.contains("Source File:")),
         "no CA.Client.Exception block on stderr within 10s; stderr: {:?}",
         err_lines.text()
     );
@@ -239,3 +240,5 @@ fn a_disconnect_under_camonitor_writes_no_per_pv_stderr_line() {
          resolve within the attempt budget; last stderr: {last_stderr:?}"
     );
 }
+
+use common::budget;

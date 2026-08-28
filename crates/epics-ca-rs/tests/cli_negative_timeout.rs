@@ -17,19 +17,18 @@
 //! DEVIATION, deliberate: C's `-w nan` reaches `ca_pend_io(nan)`, where every
 //! deadline comparison is false and the tool hangs forever. We keep treating
 //! NaN (and +inf) as the default rather than reproducing that.
-
-// Host/tokio-only: drives the async `caget`/`caput` CLI binaries out of
-// process. Those binaries are built with this feature too, so their
-// `CaClient` stack routes `spawn` to the background executor and then
-// reaches tokio I/O with no reactor. Inapplicable under the executor
-// backend; the RTEMS model has no async CLI client.
-#![cfg(not(feature = "rtems-exec-model"))]
+// The tests that drive a live server are `tokio_backend`-only, so on
+// `exec_backend` the fixtures and imports they share go unreferenced while the
+// rest of this file still runs. The default build lints it in full.
+#![cfg_attr(exec_backend, allow(dead_code, unused_imports))]
+#![cfg(all(feature = "client-core", not(epics_embedded_target)))]
 
 use std::process::Command;
 use std::time::Duration;
 
 use epics_base_rs::server::records::ao::AoRecord;
 use epics_ca_rs::cli::{INDEFINITE_TIMEOUT, timeout_duration};
+#[cfg(tokio_backend)]
 use epics_ca_rs::server::CaServer;
 use serial_test::serial;
 
@@ -54,6 +53,7 @@ async fn caget(port: u16, args: &[&str]) -> (String, String, i32) {
     )
 }
 
+#[cfg(tokio_backend)]
 /// The server TAKES its port by binding it (`.port(0)` → read back
 /// `udp_port()`); nothing probes a port and hands the number on.
 async fn server_with_ao(pv: &'static str, val: f64) -> u16 {
@@ -68,6 +68,7 @@ async fn server_with_ao(pv: &'static str, val: f64) -> u16 {
     port
 }
 
+#[cfg(tokio_backend)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[serial]
 async fn a_negative_wait_fails_the_connect_even_when_the_pv_is_there() {

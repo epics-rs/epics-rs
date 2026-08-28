@@ -38,7 +38,7 @@ pub enum AuditSink {
 ///
 /// Opaque on purpose. It used to be a bare `Mutex<tokio::fs::File>` in the
 /// variant, and that spelling does not build a working audit log under
-/// `rtems-exec-model`: `tokio::fs` is a blocking `std::fs` call handed to
+/// `exec_backend`: `tokio::fs` is a blocking `std::fs` call handed to
 /// tokio's `spawn_blocking` pool, so it requires an entered tokio runtime,
 /// and the writer task this sink is drained by runs on the background
 /// executor there, not on a tokio worker. The write now goes through
@@ -284,21 +284,26 @@ impl AuditLogger {
     /// the queue and serializes writes; if the queue fills, new
     /// events are dropped at `log()` time so the CA hot path never
     /// stalls on disk I/O. Defaults to [`AuditFormat::Json`].
-    pub fn new(sink: AuditSink) -> Self {
-        Self::new_with_format(sink, AuditFormat::Json)
+    pub fn new(reactor: &epics_base_rs::runtime::task::Reactor, sink: AuditSink) -> Self {
+        Self::new_with_format(reactor, sink, AuditFormat::Json)
     }
 
     /// Like [`Self::new`] but emits in the chosen format —
     /// pass [`AuditFormat::LegacyAslog`] to feed an existing
     /// libca-asLib-compatible audit pipeline.
-    pub fn new_with_format(sink: AuditSink, format: AuditFormat) -> Self {
+    pub fn new_with_format(
+        reactor: &epics_base_rs::runtime::task::Reactor,
+        sink: AuditSink,
+        format: AuditFormat,
+    ) -> Self {
         let (tx, mut rx) = tokio::sync::mpsc::channel::<String>(AUDIT_QUEUE_CAPACITY);
         let sink = Arc::new(sink);
-        // `runtime::task::spawn`, not `tokio::spawn`: this is the one task that
-        // ever touches the sink, so if it cannot be created on a backend then
-        // nothing the sink does matters. `tokio::sync::mpsc` stays — it
-        // suspends on a runtime-agnostic primitive and needs no reactor.
-        epics_base_rs::runtime::task::spawn(async move {
+        // Takes the reactor rather than reading one off the calling thread:
+        // this is the one task that ever touches the sink, so a logger built
+        // where no reactor is reachable is a logger that silently writes
+        // nothing. `tokio::sync::mpsc` stays — it suspends on a
+        // runtime-agnostic primitive and needs no reactor.
+        reactor.spawn(async move {
             while let Some(line) = rx.recv().await {
                 sink.write(&line).await;
             }
@@ -334,7 +339,7 @@ mod tests {
     /// spawn_blocking`, which needs an entered runtime exactly as `tokio::fs`
     /// did — the seam does not invent a blocking pool where there is none, it
     /// routes to whichever one the backend has.
-    #[cfg(feature = "rtems-exec-model")]
+    #[cfg(exec_backend)]
     #[test]
     fn a_file_sink_writes_with_no_runtime_entered() {
         let dir = tempfile::tempdir().unwrap();

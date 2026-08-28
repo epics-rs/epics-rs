@@ -19,17 +19,11 @@
 //! The port attached the separator to the timestamp and dropped it with the
 //! timestamp — a dual meaning C's line shape does not have.
 
-// Host/tokio-only: drives the async `caget`/`caput` CLI binaries out of
-// process. Those binaries are built with this feature too, so their
-// `CaClient` stack routes `spawn` to the background executor and then
-// reaches tokio I/O with no reactor. Inapplicable under the executor
-// backend; the RTEMS model has no async CLI client.
-#![cfg(not(feature = "rtems-exec-model"))]
+#![cfg(tokio_backend)]
 
 mod common;
 
 use std::process::{Command, Stdio};
-use std::time::Duration;
 
 use common::LineCollector;
 use epics_base_rs::server::records::ao::AoRecord;
@@ -57,7 +51,7 @@ async fn first_line(port: u16, args: &[&str]) -> String {
             .spawn()
             .expect("spawn camonitor-rs");
         let collector = LineCollector::spawn(child.stdout.take().expect("piped stdout"));
-        let got = collector.wait_for(Duration::from_secs(10), |text| text.contains('\n'));
+        let got = collector.wait_for(budget::FACT_BUDGET, |text| text.contains('\n'));
         child.kill().expect("kill camonitor-rs");
         let _ = child.wait();
         let text = collector.into_text();
@@ -79,7 +73,7 @@ async fn server_with_ao(pv: &'static str, val: f64) -> u16 {
         .expect("build CA server");
     let port = server.udp_port();
     // Process once so the record is DEFINED: a never-processed record carries
-    // the initial UDF severity (C `iocInit.c:521-523` — STAT=UDF SEVR=INVALID),
+    // the initial UDF severity (C `iocInit.c:523-524` — STAT=UDF SEVR=INVALID),
     // which would fill the two alarm columns this test wants empty.
     let mut visited = std::collections::HashSet::new();
     server
@@ -119,3 +113,5 @@ async fn a_missing_timestamp_does_not_swallow_the_value_separator() {
         "NO_ALARM prints two empties"
     );
 }
+
+use common::budget;

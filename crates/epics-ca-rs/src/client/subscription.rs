@@ -329,7 +329,7 @@ pub(crate) struct SubscriptionRegistry {
 /// same) resolves to wire `count = 0`, the CA *autosize* request, NOT the
 /// native capacity. With a zero count the server reports the record's
 /// CURRENT element count in every event's response header and sends only
-/// that many elements: `rsrv/camessage.c:509-514` reads `m_count == 0` as
+/// that many elements: `rsrv/camessage.c:504-509` reads `m_count == 0` as
 /// "all available", then `:537-538` fetches the actual `item_count` and
 /// `:563-568` rewrites the response header count to it (non-autosize pads
 /// the tail instead). This is exactly what the standard CA tools request
@@ -389,7 +389,7 @@ impl SubscriptionRegistry {
     }
 
     /// Deliver a non-NORMAL monitor status (libca `pmiu->exception`
-    /// path, `cac.cpp:973-977`) to the per-subscription callback as
+    /// path, `cac.cpp:971-975`) to the per-subscription callback as
     /// an `Err(CaError::ServerError(eca_status))`. Best-effort: the
     /// existing `try_deliver_err` helper silently drops the error
     /// if the receiver queue is full or closed.
@@ -463,7 +463,9 @@ impl SubscriptionRegistry {
                     // Bounded channel full — coalesce into the slot
                     // instead of the pre-fix silent drop (which lost
                     // terminal transitions like DMOV 1→0 under load).
-                    // Mirrors C `dbEvent.c::db_post_events` replace-last.
+                    // Mirrors C `db_queue_event_log`'s replace-last
+                    // (`dbEvent.c:812-827`), not `db_post_events`,
+                    // which only gates on the mask and calls out.
                     // The slot is out of flow control (I1); EVENTS_OFF
                     // already fired long ago (channel is full ≫ the
                     // threshold), so no flow-control bump here.
@@ -482,7 +484,7 @@ impl SubscriptionRegistry {
     ///
     /// also deliver one `Err(CaError::ServerError(ECA_DISCONN))`
     /// per affected subscription's callback channel — libca
-    /// `cac::disconnectAllIO()` (`modules/ca/src/client/cac.cpp:678-698`)
+    /// `cac::disconnectAllIO()` (`modules/ca/src/client/cac.cpp:676-696`)
     /// iterates every in-flight IO on the channel (including
     /// subscriptions) and fires `pNetIO->exception(... ECA_DISCONN ...)`.
     /// Pre-fix Rust silently flipped `needs_restore = true` and waited

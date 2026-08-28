@@ -5,8 +5,6 @@
 //!
 //! Then in another shell:
 //!   curl http://127.0.0.1:9090/metrics
-//!
-//! See doc/10-observability.md for the metric schema.
 
 #[cfg(not(feature = "observability"))]
 fn main() {
@@ -61,7 +59,9 @@ mod inner {
         let stop_at = if args.duration == 0 {
             None
         } else {
-            Some(Instant::now() + Duration::from_secs(args.duration))
+            Some(epics_base_rs::runtime::time::deadline_from_now(
+                Duration::from_secs(args.duration),
+            ))
         };
 
         let mut tasks = Vec::new();

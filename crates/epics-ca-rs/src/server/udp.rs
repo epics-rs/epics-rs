@@ -1,36 +1,33 @@
 // The bound-socket UDP responder stack (`socket2` shared-port setup, the
 // `tokio::net::UdpSocket` recv loops, the `epics_base_rs::net` RX-overflow
-// helpers) is the async host-only front-end. The embedded build (RTEMS or
-// VxWorks) answers SEARCH through `server::blocking`'s `std::net` responder,
-// reusing only the shared decode/shape logic (`SearchReplyBatch`,
-// `parse_search_datagram`, `shape_search_reply_dg`) below. Those imports are
-// gated out for `epics_embedded_target`.
-// RTEMS-EXEC-MODEL-ALLOW(2): both sites hand-build a tokio runtime to drive the
-// tokio::net UDP name-server socket. These run and pass in the
-// feature-ON suite on the tokio driver.
-#[cfg(not(epics_embedded_target))]
+// helpers) is the async reactor-borne front-end. Every reactor-free build
+// (RTEMS, VxWorks, or a host `exec_backend` build) answers SEARCH through
+// `server::blocking`'s `std::net` responder, reusing only the shared
+// decode/shape logic (`SearchReplyBatch`, `parse_search_datagram`,
+// `shape_search_reply_dg`) below. Those imports are gated to `tokio_backend`.
+#[cfg(tokio_backend)]
 use socket2::{Domain, Protocol, Socket, Type};
 use std::net::SocketAddr;
 // `Ipv4Addr`, `Arc`, and `CaResult` are used only by the bound-socket responder
-// stack, which is host-only; the shared decode path uses `SocketAddr` only.
-#[cfg(not(epics_embedded_target))]
+// stack, which is `tokio_backend`; the shared decode path uses `SocketAddr` only.
+#[cfg(tokio_backend)]
 use std::net::Ipv4Addr;
-#[cfg(not(epics_embedded_target))]
+#[cfg(tokio_backend)]
 use std::sync::Arc;
-#[cfg(not(epics_embedded_target))]
+#[cfg(tokio_backend)]
 use tokio::net::UdpSocket;
 
 use crate::protocol::*;
-#[cfg(not(epics_embedded_target))]
+#[cfg(tokio_backend)]
 use epics_base_rs::error::CaResult;
-#[cfg(not(epics_embedded_target))]
+#[cfg(tokio_backend)]
 use epics_base_rs::net::{enable_so_rxq_ovfl_for_socket, recv_from_with_drop_count_socket};
 use epics_base_rs::server::database::PvDatabase;
 
 /// Decide the UDP responder sockets to open: one `(bind_ip,
 /// mcast_groups)` spec per CA `casIntfAddrList` interface entry.
 ///
-/// **Invariant.** C `caservertask.c:621-668` opens exactly
+/// **Invariant.** C `caservertask.c:622-669` opens exactly
 /// ONE UDP socket per `casIntfAddrList` entry — `conf->udp`, bound
 /// to that entry's address (a specific IP *or* `INADDR_ANY`) — and
 /// joins every `casMCastAddrList` group on THAT SAME socket via
@@ -54,7 +51,7 @@ use epics_base_rs::server::database::PvDatabase;
 /// that produces an extra group-only responder. A wildcard
 /// interface is therefore the single owner of ordinary
 /// unicast/broadcast SEARCH traffic, matching C's `conf->udp`.
-#[cfg(not(epics_embedded_target))]
+#[cfg(tokio_backend)]
 fn plan_responder_specs(
     intf_addrs: Vec<Ipv4Addr>,
     mcast_addrs: &[Ipv4Addr],
@@ -79,7 +76,7 @@ fn plan_responder_specs(
 /// datagrams in the kernel, so a SEARCH that arrives before
 /// `CaServer::run()` is polled is answered once the recv loop starts
 /// rather than dropped.
-#[cfg(not(epics_embedded_target))]
+#[cfg(tokio_backend)]
 #[derive(Clone)]
 pub struct BoundResponder {
     bind_ip: Ipv4Addr,
@@ -92,14 +89,14 @@ pub struct BoundResponder {
 }
 
 /// The UDP search responders of one server, all bound to one port.
-#[cfg(not(epics_embedded_target))]
+#[cfg(tokio_backend)]
 #[derive(Clone)]
 pub struct BoundUdp {
     responders: Vec<BoundResponder>,
     port: u16,
 }
 
-#[cfg(not(epics_embedded_target))]
+#[cfg(tokio_backend)]
 impl BoundUdp {
     /// The UDP port every responder is bound to. With a requested port
     /// of 0 this is the ephemeral port the kernel chose — the value a
@@ -122,7 +119,7 @@ impl BoundUdp {
 /// clients are pointed at exactly one. This is the race-free way to
 /// take a port — a caller that probes for a free port first and passes
 /// the number can still lose it to another socket in between.
-#[cfg(not(epics_embedded_target))]
+#[cfg(tokio_backend)]
 pub fn bind_udp_responders(
     port: u16,
     intf_addrs: Vec<Ipv4Addr>,
@@ -130,8 +127,17 @@ pub fn bind_udp_responders(
 ) -> CaResult<BoundUdp> {
     let mut responders = Vec::new();
     let mut actual_port = if port == 0 { None } else { Some(port) };
+    // Decided once, from the *request*, and then carried: after the first
+    // NIC answers, `actual_port` is a plain non-zero number whichever way it
+    // was obtained, and nothing downstream could tell the two apart.
+    let port_use = if port == 0 {
+        PortUse::Exclusive
+    } else {
+        PortUse::Shared
+    };
     for (bind_ip, mcast_groups) in plan_responder_specs(intf_addrs, mcast_addrs) {
-        let responder = bind_single_responder(bind_ip, actual_port.unwrap_or(0), &mcast_groups)?;
+        let responder =
+            bind_single_responder(bind_ip, actual_port.unwrap_or(0), port_use, &mcast_groups)?;
         if actual_port.is_none() {
             actual_port = Some(responder.socket.local_addr()?.port());
         }
@@ -153,28 +159,48 @@ pub fn bind_udp_responders(
 ///
 /// `ignore_addrs` filters out source addresses that should never receive
 /// search replies (EPICS_CAS_IGNORE_ADDR_LIST).
-#[cfg(not(epics_embedded_target))]
+#[cfg(tokio_backend)]
 pub async fn run_udp_search_responder(
+    reactor: &epics_base_rs::runtime::task::Reactor,
     db: Arc<PvDatabase>,
     bound: BoundUdp,
     tcp_port: u16,
     ignore_addrs: Vec<Ipv4Addr>,
 ) -> CaResult<()> {
+    /// Every per-socket responder this call spawned, aborted when the call's
+    /// future goes away. The bare handles this replaces were dropped on
+    /// cancellation, and a dropped handle DETACHES its task, so a cancelled
+    /// `run_udp_search_responder` left its `recv_loop`s holding the search
+    /// sockets — and, since a task that never ends never runs its
+    /// `taskwd_insert` guard's drop, holding their watchdog rows too. C ends
+    /// `cast_server` with the thread.
+    struct RespondersOnDrop(Vec<epics_base_rs::runtime::task::TaskAbortHandle>);
+    impl Drop for RespondersOnDrop {
+        fn drop(&mut self) {
+            for h in &self.0 {
+                h.abort();
+            }
+        }
+    }
+
     let responders = bound.responders;
     let mut handles = Vec::with_capacity(responders.len());
+    let mut aborts = Vec::with_capacity(responders.len());
 
     for responder in responders {
         let db_t = db.clone();
         let ignore_t = ignore_addrs.clone();
-        let handle = epics_base_rs::runtime::task::spawn(async move {
-            run_single_responder(db_t, responder, tcp_port, ignore_t).await
-        });
+        let handle = reactor
+            .spawn(async move { run_single_responder(db_t, responder, tcp_port, ignore_t).await });
+        aborts.push(handle.abort_handle());
         handles.push(handle);
     }
+    let _abort_siblings = RespondersOnDrop(aborts);
 
-    // Propagate the first error, abort the rest.
+    // Propagate the first error; the guard above stops the rest, whether this
+    // returns or is cancelled.
     let mut handles_iter = handles.into_iter();
-    let result = if let Some(first) = handles_iter.next() {
+    if let Some(first) = handles_iter.next() {
         match first.await {
             Ok(inner) => inner,
             Err(e) => Err(epics_base_rs::error::CaError::Io(std::io::Error::new(
@@ -184,20 +210,17 @@ pub async fn run_udp_search_responder(
         }
     } else {
         Ok(())
-    };
-    for h in handles_iter {
-        h.abort();
     }
-    result
 }
 
-#[cfg(not(epics_embedded_target))]
+#[cfg(tokio_backend)]
 fn bind_single_responder(
     bind_ip: Ipv4Addr,
     port: u16,
+    port_use: PortUse,
     mcast_groups: &[Ipv4Addr],
 ) -> CaResult<BoundResponder> {
-    let socket = bind_responder_socket(bind_ip, port)?;
+    let socket = bind_responder_socket(bind_ip, port, port_use)?;
     // The port the primary actually took — identical to `port`, except
     // for an ephemeral (0) request, where the kernel chose it. The only
     // consumer of the resolved port is the broadcast secondary responder
@@ -208,7 +231,7 @@ fn bind_single_responder(
     let port = socket.local_addr()?.port();
     // Join each multicast group on this
     // responder's own socket via `IP_ADD_MEMBERSHIP` with
-    // `imr_interface = bind_ip`. C `caservertask.c:633-665` joins
+    // `imr_interface = bind_ip`. C `caservertask.c:634-666` joins
     // every `casMCastAddrList` group on the single `conf->udp`
     // socket of each `casIntfAddrList` entry, regardless of whether
     // that entry is a specific IP or `INADDR_ANY` — there is no
@@ -255,7 +278,7 @@ fn bind_single_responder(
     // running and accepting unicast searches.
     //
     // On Windows the kernel behaviour differs (a specific-IP-bound
-    // socket receives broadcasts), so C `caservertask.c:670, 728`
+    // socket receives broadcasts), so C `caservertask.c:671, 728`
     // guards the secondary socket with `#if !(_WIN32 || __CYGWIN__)`.
     // Mirror that gate.
     let bcast: Option<Arc<UdpSocket>> = {
@@ -266,7 +289,7 @@ fn bind_single_responder(
         #[cfg(not(any(windows, target_os = "windows")))]
         {
             super::addr_list::broadcast_for_ip(bind_ip).and_then(|bcast_ip| {
-                match bind_responder_socket(bcast_ip, port) {
+                match bind_responder_socket(bcast_ip, port, port_use) {
                     Ok(s) => Some(Arc::new(s)),
                     Err(e) => {
                         tracing::warn!(
@@ -291,7 +314,7 @@ fn bind_single_responder(
     })
 }
 
-#[cfg(not(epics_embedded_target))]
+#[cfg(tokio_backend)]
 async fn run_single_responder(
     db: Arc<PvDatabase>,
     responder: BoundResponder,
@@ -311,11 +334,20 @@ async fn run_single_responder(
         tcp_port,
         ignore_addrs.clone(),
         udp_rl.clone(),
+        "CAS-UDP",
     );
 
     match bcast {
         Some(bsock) => {
-            let secondary = recv_loop(bsock, db, bind_ip, tcp_port, ignore_addrs, udp_rl);
+            let secondary = recv_loop(
+                bsock,
+                db,
+                bind_ip,
+                tcp_port,
+                ignore_addrs,
+                udp_rl,
+                "CAS-UDP2",
+            );
             // First task to error wins; the other is dropped when this
             // future returns. tokio::try_join is `Drop` on cancel, so the
             // surviving loop's recv() future cancels cleanly.
@@ -325,17 +357,36 @@ async fn run_single_responder(
     }
 }
 
+/// Whether a responder socket may share its port with other sockets.
+///
+/// The distinction cannot be recovered from the port number. `bind(0)`
+/// answers with an ordinary non-zero port, and
+/// [`bind_udp_responders`] then imposes that number on every remaining
+/// NIC — so a `port != 0` test reads the kernel's own answer as if the
+/// operator had configured it, and hands NICs 2..N the fanout flags on a
+/// port nobody asked to share. The caller states the intent instead.
+#[cfg(tokio_backend)]
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PortUse {
+    /// A well-known number: C's datagram fanout, so several IOCs can
+    /// answer SEARCHes on the same CA port.
+    Shared,
+    /// A number the kernel chose. Nothing may join it — see
+    /// [`bind_responder_socket`].
+    Exclusive,
+}
+
 /// Build and configure the per-bind UDP socket. Centralised so the
 /// primary (interface IP) and secondary (interface broadcast addr)
 /// sockets share identical socket-option setup.
-#[cfg(not(epics_embedded_target))]
-fn bind_responder_socket(bind_ip: Ipv4Addr, port: u16) -> CaResult<UdpSocket> {
+#[cfg(tokio_backend)]
+fn bind_responder_socket(bind_ip: Ipv4Addr, port: u16, port_use: PortUse) -> CaResult<UdpSocket> {
     let sock = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP))?;
     // This is a *datagram fanout* socket, so it mirrors libcom's
     // `epicsSocketEnableAddressUseForDatagramFanout`
     // (osdSockAddrReuse.cpp), which the C CA server applies to exactly
     // these sockets — the UDP name receiver and its broadcast companion
-    // (caservertask.c:628, :698). That helper sets SO_REUSEPORT (where
+    // (caservertask.c:629, :698). That helper sets SO_REUSEPORT (where
     // it exists) followed by SO_REUSEADDR on *every* platform: it has no
     // `#ifdef _WIN32`. Windows must set SO_REUSEADDR too, or a second IOC
     // on the host cannot bind the CA port and never receives a broadcast
@@ -357,7 +408,7 @@ fn bind_responder_socket(bind_ip: Ipv4Addr, port: u16) -> CaResult<UdpSocket> {
     // this server land on an unrelated socket and go unanswered. Leaving
     // the flags off makes the kernel pick a port this socket exclusively
     // owns.
-    if port != 0 {
+    if port_use == PortUse::Shared {
         sock.set_reuse_address(true)?;
         #[cfg(unix)]
         sock.set_reuse_port(true)?;
@@ -406,7 +457,7 @@ fn bind_responder_socket(bind_ip: Ipv4Addr, port: u16) -> CaResult<UdpSocket> {
 // removed. It bound a *second* `0.0.0.0:port` socket per multicast
 // group; with `SO_REUSEADDR`/`SO_REUSEPORT` datagram fanout that
 // extra socket also caught ordinary unicast/broadcast CA SEARCH
-// traffic and emitted duplicate replies. C `caservertask.c:633-665`
+// traffic and emitted duplicate replies. C `caservertask.c:634-666`
 // has no such per-group socket — it joins every `casMCastAddrList`
 // group on the single `conf->udp` socket of each interface entry.
 // `run_single_responder` now owns the joins for both specific and
@@ -511,7 +562,7 @@ pub(crate) async fn parse_search_datagram(
             Ok(h) => h,
             Err(_) => break,
         };
-        // C `rsrv/camessage.c:2520` rejects misaligned `m_postsize`.
+        // C `rsrv/camessage.c:2452` rejects misaligned `m_postsize`.
         // UDP path drops silently (no error response). Without this
         // check, the `align8(postsize)` advancement would jump
         // into the next message's body, mis-parsing chained
@@ -547,7 +598,7 @@ pub(crate) async fn parse_search_datagram(
             break;
         }
         if hdr.cmmd == CA_PROTO_VERSION {
-            // C `udp_version_action` (rsrv/camessage.c:2148-2164)
+            // C `udp_version_action` (rsrv/camessage.c:2094-2110)
             // stores `pclient->seqNoOfReq = m_cid` and the version
             // when the leading VERSION header marks the seq valid
             // (`m_dataType == sequenceNoIsValid`, caProto.h:128).
@@ -578,7 +629,7 @@ pub(crate) async fn parse_search_datagram(
             }
         }
         if hdr.cmmd == CA_PROTO_SEARCH {
-            // C `search_reply_udp` (rsrv/camessage.c:2205-2207)
+            // C `search_reply_udp` (rsrv/camessage.c:2151-2153)
             // rejects unsupported minor versions BEFORE the
             // empty-name check. `CA_VSUPPORTED(minor) = minor >= 4`
             // (CA_MINIMUM_SUPPORTED_VERSION in caProto.h:34). C
@@ -587,7 +638,7 @@ pub(crate) async fn parse_search_datagram(
             // different layout; emitting our V4.13 reply confuses
             // them or worse, fabricates a usable channel they
             // can't actually open.
-            // C `search_reply_udp` (camessage.c:2205-2207)
+            // C `search_reply_udp` (camessage.c:2151-2153)
             // returns RSRV_ERROR on unsupported minor version and
             // the UDP dispatcher breaks out of the datagram. Pre-
             // fix Rust skipped only the offending SEARCH and kept
@@ -599,7 +650,7 @@ pub(crate) async fn parse_search_datagram(
             if !crate::protocol::declares_supported_version(&hdr) {
                 break;
             }
-            // C `search_reply_udp` (rsrv/camessage.c:2213-2217) rejects
+            // C `search_reply_udp` (rsrv/camessage.c:2159-2163) rejects
             // SEARCH whose `m_postsize <= 1` ("empty PV name in UDP
             // search request") and silently returns RSRV_OK. The
             // null-terminator alone is 1 byte; a usable PV name
@@ -640,7 +691,7 @@ pub(crate) async fn parse_search_datagram(
                 // `gateAs::findEntry`).
                 if db.has_name_from(pv_name, Some(lookup_src)).await {
                     // C parity: `search_reply_udp`
-                    // (`rsrv/camessage.c:2247-2251`) sets
+                    // (`rsrv/camessage.c:2193-2197`) sets
                     // `sid = ~0U` (INADDR_BROADCAST), telling
                     // the client to use the UDP packet's source
                     // address as the server IP. The previous
@@ -710,7 +761,7 @@ pub(crate) async fn parse_search_datagram(
                     send_buf.extend_from_slice(&resp_bytes);
                     send_buf.extend_from_slice(&search_payload);
                 }
-                // C parity: `search_reply_udp` (rsrv/camessage.c:2221-2224)
+                // C parity: `search_reply_udp` (rsrv/camessage.c:2167-2170)
                 // silently returns on `dbChannelTest` failure for ALL
                 // UDP searches — there is no DO_REPLY branch on the
                 // UDP path. Only `search_reply_tcp` honours the flag
@@ -726,7 +777,7 @@ pub(crate) async fn parse_search_datagram(
     }
 }
 
-#[cfg(not(epics_embedded_target))]
+#[cfg(tokio_backend)]
 async fn recv_loop(
     socket: Arc<UdpSocket>,
     db: Arc<PvDatabase>,
@@ -734,7 +785,22 @@ async fn recv_loop(
     tcp_port: u16,
     ignore_addrs: Vec<Ipv4Addr>,
     udp_rl: Arc<UdpRateLimiter>,
+    // C's own name for the thread this loop replaces: `CAS-UDP` for an
+    // interface's primary socket, `CAS-UDP2` for its broadcast secondary
+    // (`caservertask.c:723`, `:733`). It is the watchdog row's name, so the
+    // two sockets of one interface are told apart in the report.
+    role: &'static str,
 ) -> CaResult<()> {
+    // C's UDP name-search thread registers with the watchdog through the same
+    // `casAttachThreadToClient` its TCP siblings use — `cast_server.c:151`
+    // builds a `client` for the datagram socket and attaches this thread to
+    // it. Unbounded: the loop parks in `recv_from`, and an IOC nobody is
+    // searching for is quiet rather than wedged.
+    let _watched = epics_base_rs::runtime::taskwd::taskwd_insert(
+        format!("{role} {bind_ip}"),
+        epics_base_rs::runtime::taskwd::CheckIn::Unbounded,
+        None,
+    );
     // 64 KB receive buffer — IPv4 maximum datagram size. The previous
     // 4 KB cap silently truncated bursts of multi-PV searches in
     // active facilities (each search message is ~24 bytes inc. PV
@@ -957,7 +1023,7 @@ pub(crate) fn shape_search_reply_dg(
 /// Send one already-shaped reply datagram to `src`. On failure, log at warn
 /// level instead of silently discarding (`caserverio.c:214-222`
 /// `errlogPrintf` parity).
-#[cfg(not(epics_embedded_target))]
+#[cfg(tokio_backend)]
 async fn send_reply_dg(socket: &UdpSocket, src: SocketAddr, payload: &[u8], bind_ip: &Ipv4Addr) {
     if let Err(e) = socket.send_to(payload, src).await {
         tracing::warn!(
@@ -974,7 +1040,7 @@ async fn send_reply_dg(socket: &UdpSocket, src: SocketAddr, payload: &[u8], bind
 
 /// Shape the batch's trailing `send_buf` and send it as one datagram, then
 /// clear the batch buffer. The async responder's flush path.
-#[cfg(not(epics_embedded_target))]
+#[cfg(tokio_backend)]
 async fn flush_send_buf(
     socket: &UdpSocket,
     src: SocketAddr,
@@ -997,7 +1063,7 @@ async fn flush_send_buf(
 /// comparison per packet otherwise. The implementation is a fixed
 /// 1-second sliding window — coarse but cheap; replace with
 /// per-IP token buckets if a finer policy is ever needed.
-#[cfg(not(epics_embedded_target))]
+#[cfg(tokio_backend)]
 struct UdpRateLimiter {
     enabled: bool,
     cap_per_sec: u32,
@@ -1005,7 +1071,7 @@ struct UdpRateLimiter {
         std::sync::Mutex<std::collections::HashMap<std::net::IpAddr, (std::time::Instant, u32)>>,
 }
 
-#[cfg(not(epics_embedded_target))]
+#[cfg(tokio_backend)]
 impl UdpRateLimiter {
     fn from_env() -> Self {
         let cap = epics_base_rs::runtime::env::get("EPICS_CAS_UDP_SEARCH_RATE_LIMIT")
@@ -1048,6 +1114,7 @@ impl UdpRateLimiter {
     }
 }
 
+#[cfg(tokio_backend)]
 #[cfg(test)]
 mod mr_r8_responder_plan_tests {
     //! a wildcard interface configuration must produce exactly
@@ -1116,6 +1183,7 @@ mod mr_r8_responder_plan_tests {
     }
 }
 
+#[cfg(tokio_backend)]
 #[cfg(test)]
 mod responder_bind_tests {
     use super::*;
@@ -1151,6 +1219,109 @@ mod responder_bind_tests {
             "the responder's ephemeral port must be exclusively owned; a \
              second socket co-binding it would steal half its SEARCHes"
         );
+    }
+
+    /// C reaches the watchdog for its UDP name-search thread through the same
+    /// `casAttachThreadToClient` the TCP side uses (`cast_server.c:151`), so a
+    /// `taskwdShow` on a C IOC lists `CAS-UDP` beside `CAS-TCP`. This port
+    /// wired only the TCP caller and the name server ran unwatched.
+    ///
+    /// Asserted through `taskwd_show`'s own output, because that report is
+    /// what an operator compares against C, and it is the thing that was
+    /// missing a row.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_udp_name_server_is_listed_by_the_task_watchdog() {
+        fn table() -> String {
+            let out = std::cell::RefCell::new(String::new());
+            epics_base_rs::runtime::taskwd::taskwd_show(1, &|line| {
+                out.borrow_mut().push_str(line);
+                out.borrow_mut().push('\n');
+            });
+            out.into_inner()
+        }
+
+        assert!(
+            !table().contains("CAS-UDP"),
+            "a name server was registered before this test started one"
+        );
+
+        let bound = bind_udp_responders(0, vec![Ipv4Addr::LOCALHOST], &[]).expect("bind ephemeral");
+        let reactor = epics_base_rs::runtime::task::Reactor::current()
+            .expect("a tokio test always has a reactor");
+        let db = Arc::new(PvDatabase::new());
+        let task = reactor.spawn({
+            let reactor = reactor.clone();
+            async move { run_udp_search_responder(&reactor, db, bound, 5064, Vec::new()).await }
+        });
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !table().contains("CAS-UDP") {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the name server never reached the watchdog table:\n{}",
+                table()
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+
+        task.abort();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while table().contains("CAS-UDP") {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "an aborted name server stayed registered:\n{}",
+                table()
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    }
+
+    /// Boundary — the *second and later* NICs of an ephemeral bundle, which
+    /// are handed the first NIC's kernel-assigned number rather than a
+    /// literal 0. That number is an ordinary non-zero `u16`, so the old
+    /// `port != 0` reading called it well-known and gave those sockets the
+    /// fanout flags; a stranger's reuse group could then take the port on
+    /// every NIC but the first, and half this server's SEARCHes with it.
+    ///
+    /// The bundle is bound over loopback plus the first up non-loopback
+    /// interface. With no such interface the check reduces to the
+    /// single-NIC case above — it cannot manufacture a second NIC.
+    #[test]
+    fn every_nic_of_an_ephemeral_bundle_owns_the_port() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        let _g = rt.enter();
+
+        let mut intf = vec![Ipv4Addr::LOCALHOST];
+        if let Ok(ifaces) = epics_base_rs::net::iface_v4::enumerate() {
+            if let Some(i) = ifaces
+                .iter()
+                .find(|i| i.is_up() && !i.is_loopback() && !i.ip.is_unspecified())
+            {
+                intf.push(i.ip);
+            }
+        }
+
+        let bound = bind_udp_responders(0, intf, &[]).expect("bind ephemeral bundle");
+        assert_ne!(bound.port(), 0, "an ephemeral bind reports its real port");
+
+        for responder in &bound.responders {
+            let intruder =
+                Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP)).expect("socket");
+            intruder.set_reuse_address(true).expect("reuse addr");
+            #[cfg(unix)]
+            intruder.set_reuse_port(true).expect("reuse port");
+            let addr = std::net::SocketAddrV4::new(responder.bind_ip, bound.port());
+            assert!(
+                intruder.bind(&addr.into()).is_err(),
+                "NIC {} of the ephemeral bundle does not own port {}: a reuse-enabled \
+                 socket joined it, and the kernel will split this server's SEARCHes",
+                responder.bind_ip,
+                bound.port()
+            );
+        }
     }
 
     /// Boundary — a fixed port keeps the datagram-fanout reuse flags, so

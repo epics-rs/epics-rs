@@ -2,7 +2,7 @@
 //!
 //! `epics-ca-rs` extends CA with optional TLS-encrypted TCP virtual
 //! circuits — UDP search remains plaintext (PV names are not secret).
-//! Enable with the `tls` cargo feature.
+//! Enable with the `experimental-rust-tls` cargo feature.
 //!
 //! Two modes:
 //!
@@ -18,9 +18,6 @@
 //! - Authenticate operators/services without trusting hostnames
 //! - Comply with site policies (medical, nuclear, multi-tenant
 //!   facilities) that mandate transport encryption
-//!
-//! See `doc/11-tls-design.md` for the wire-level negotiation,
-//! coexistence with plaintext peers, and migration guidance.
 
 #[cfg(feature = "experimental-rust-tls")]
 use std::io;

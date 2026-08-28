@@ -2,14 +2,18 @@
 //! native type — not a CTRL get at whatever the native type happens to be.
 //!
 //! C `dbCa.c` decides both halves from `pca->dbrType`, which is
-//! `ca_field_type(chid)` (`:908`). At `:926-928` it sets
+//! `ca_field_type(chid)` (`:864`). At `:878-880` it sets
 //! `CA_GET_ATTRIBUTES` for every channel whose native type is not
-//! `DBR_STRING`, and at `:1275` it issues that request as
+//! `DBR_STRING`, and at `:1210` it issues that request as
 //! `ca_get_callback(DBR_CTRL_DOUBLE, ...)` — a fixed type, whatever the
 //! channel's native type is. So for an ENUM target the server converts,
-//! `getAttribEventCallback` (`:1104-1155`) sets `gotAttributes = TRUE`, and
-//! `dbCaGetPrecision` (`:776-786`) then SUCCEEDS with precision 0, empty
-//! units and zeroed limits.
+//! `getAttribEventCallback` (`:1042-1091`) sets `gotAttributes = TRUE`, and
+//! `dbCaGetPrecision` (`:747-757`) then SUCCEEDS with precision 0, empty
+//! units, zeroed display and control limits, and four NaN alarm limits —
+//! `mbbiRecord.c:63` leaves `get_alarm_double` NULL, and C's `get_alarm`
+//! seeds that group `epicsNAN` rather than memsetting it
+//! (`dbAccess.c:294`). Measured on C softIoc R7.0.10:
+//! `caget -d DBR_CTRL_DOUBLE <mbbi>` prints `nan` for all four.
 //!
 //! Requesting CTRL at the native type instead puts `DBR_CTRL_ENUM` on the
 //! wire for an enum channel, and `struct dbr_ctrl_enum` (`db_access.h`) has
@@ -18,10 +22,8 @@
 //! type: DBR_STRING is parity because C skips the fetch entirely, and every
 //! numeric native type already converts to the same DOUBLE attributes.
 
-// Host/tokio-only, for the reason given in `calink.rs`: under
-// `rtems-exec-model` the `runtime::task` seam routes the server's spawns to
-// a worker with no tokio reactor.
-#![cfg(not(feature = "rtems-exec-model"))]
+#![cfg(tokio_backend)]
+#![cfg(feature = "client-core")]
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -56,11 +58,11 @@ async fn metadata_when(
 ) -> LinkMetadata {
     assert!(
         resolver
-            .wait_for_link_connected(pv, Duration::from_secs(5))
+            .wait_for_link_connected(pv, budget::FACT_BUDGET)
             .await,
         "CA link must connect to the upstream CA server"
     );
-    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    let deadline = std::time::Instant::now() + budget::FACT_BUDGET;
     loop {
         if let Some(md) = LinkSet::link_metadata(resolver, pv)
             && ready(&md)
@@ -112,7 +114,7 @@ async fn an_enum_target_serves_the_converted_double_attributes() {
     assert_eq!(
         md.precision,
         Some(0),
-        "C's fixed DBR_CTRL_DOUBLE makes dbCaGetPrecision succeed with 0 (dbCa.c:776-786)"
+        "C's fixed DBR_CTRL_DOUBLE makes dbCaGetPrecision succeed with 0 (dbCa.c:747-757)"
     );
     assert_eq!(
         md.graphic_limits,
@@ -120,7 +122,14 @@ async fn an_enum_target_serves_the_converted_double_attributes() {
         "the converted reply carries zeroed display limits, not no limits"
     );
     assert_eq!(md.control_limits, Some((0.0, 0.0)));
-    assert_eq!(md.alarm_limits, Some((0.0, 0.0, 0.0, 0.0)));
+    // Not zero, and not absent: the alarm group is the one C seeds NaN, so
+    // the link stores four NaNs. `assert_eq!` cannot express this.
+    let (lolo, low, high, hihi) = md
+        .alarm_limits
+        .expect("the group is present, just not finite");
+    for (name, v) in [("lolo", lolo), ("low", low), ("high", high), ("hihi", hihi)] {
+        assert!(v.is_nan(), "{name} is {v}, C serves nan");
+    }
     assert_eq!(
         md.units, None,
         "an empty units string stays None; C copies a zero-length string"
@@ -204,10 +213,13 @@ async fn a_string_target_fetches_no_attributes() {
     assert_eq!(md.element_count, Some(1));
     assert_eq!(
         md.precision, None,
-        "C never issues the get (dbCa.c:926-928)"
+        "C never issues the get (dbCa.c:878-880)"
     );
     assert_eq!(md.graphic_limits, None);
     assert_eq!(md.control_limits, None);
     assert_eq!(md.alarm_limits, None);
     assert_eq!(md.units, None);
 }
+
+#[path = "common/budget.rs"]
+mod budget;

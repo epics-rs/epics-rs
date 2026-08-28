@@ -21,10 +21,11 @@
 //! # What C does
 //!
 //! C never has two buffers. `read_reply` calls `cas_copy_in_header`
-//! (`rsrv/camessage.c:516`), which reserves the header *and* the payload
+//! (`rsrv/camessage.c:511`), which reserves the header *and* the payload
 //! inside the client's already-allocated send buffer and returns `pPayload`
 //! pointing just past the header; `dbChannel_get_count` → `dbGet` then converts
-//! the record's live field straight into that space (`dbAccess.c:1020`). One
+//! the record's live field straight into that space (`dbAccess.c:1017-1018`,
+//! the `!dbfl_has_copy(pfl)` arm). One
 //! buffer, reused per client, no payload copy at all.
 //!
 //! # This module
@@ -193,7 +194,7 @@ impl FrameBuf {
 
     /// Read-only view of the payload written so far — for callers that must
     /// inspect the encoded bytes (C `read_action`'s `epicsStrnLen` scan of a
-    /// scalar DBR_STRING slot, `camessage.c:674-687`).
+    /// scalar DBR_STRING slot, `camessage.c:666-679`).
     pub(crate) fn payload(&self) -> &[u8] {
         &self.buf[HDR_RESERVE..]
     }

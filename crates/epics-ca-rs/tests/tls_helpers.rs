@@ -6,6 +6,7 @@
 //! into the repo.
 
 #![cfg(feature = "experimental-rust-tls")]
+#![cfg(feature = "client-core")]
 
 use epics_ca_rs::tls;
 use std::io::Write;

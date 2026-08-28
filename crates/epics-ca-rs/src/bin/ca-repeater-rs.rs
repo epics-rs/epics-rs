@@ -1,4 +1,15 @@
+// This daemon is `tokio_backend`-only, because `epics_ca_rs::repeater` is:
+// both of its loops await `recv_from_with_drop_count_socket` on a
+// `tokio::net::UdpSocket`, which needs a reactor, and `exec_backend` — the
+// reactor-free backend, selected on a *host* build by
+// `EPICS_RS_BUILD_EXEC_BACKEND=thread` — has none. Cargo's
+// `required-features` cannot name a build-script cfg, so the gate is in this
+// file. The binary is still built and linted in that configuration and says
+// why it will not serve, the same shape `realtime-ca-ioc` uses for its own
+// wrong-backend arm.
+#[cfg(tokio_backend)]
 use clap::Parser;
+#[cfg(tokio_backend)]
 use epics_ca_rs::repeater::run_repeater_with_debug;
 
 /// CA Repeater. Forwards UDP repeater traffic between local CA clients
@@ -11,6 +22,7 @@ use epics_ca_rs::repeater::run_repeater_with_debug;
 /// `-v` to keep the original stdio for debugging. Pass `-d` (or `-dd`)
 /// to enable debug-level client lifecycle / forwarding messages
 /// (epics-base PR #831).
+#[cfg(tokio_backend)]
 #[derive(Parser)]
 #[command(name = "ca-repeater-rs", about = "EPICS CA Repeater")]
 struct Args {
@@ -27,7 +39,7 @@ struct Args {
     debug: u8,
 }
 
-#[cfg(unix)]
+#[cfg(all(unix, tokio_backend))]
 fn detach_stdio() {
     // Open /dev/null O_RDWR, then `dup2` it onto fds 0/1/2. The
     // pattern matches the C `caRepeater.cpp` block: any open failure
@@ -50,12 +62,13 @@ fn detach_stdio() {
     }
 }
 
-#[cfg(not(unix))]
+#[cfg(all(not(unix), tokio_backend))]
 fn detach_stdio() {
     // C `caRepeater` skips detach on Windows / RTEMS / VxWorks via
     // `CAN_DETACH_STDINOUT`. Match that — leave stdio inherited.
 }
 
+#[cfg(tokio_backend)]
 fn main() {
     let args = Args::parse();
     // `-d` implies keeping stderr open so the operator actually sees
@@ -68,14 +81,32 @@ fn main() {
     let debug = args.debug;
     rt.block_on(async move {
         if let Err(e) = run_repeater_with_debug(debug).await {
-            // Port already in use means another repeater is running — that's fine
-            if e.kind() == std::io::ErrorKind::AddrInUse {
-                return;
-            }
+            // A socket the daemon could not make or bind never reaches here:
+            // C `ca_repeater` names both outcomes at the bind and returns
+            // from its void function either way (`repeater.cpp:513-531`), and
+            // `run_repeater_with_debug` does the same, printing "CA Repeater:
+            // Exiting, a repeater is already running" or the fatal stderr
+            // line and answering `Ok(())`. Anything left is a failure C's
+            // `ca_repeater` cannot produce, so it is not one this binary can
+            // classify — say it and exit.
+            //
             // After detach, stderr goes to /dev/null. The eprintln! is
             // still useful when `-v` or `-d` was passed.
             eprintln!("ca-repeater: {e}");
             std::process::exit(1);
         }
     });
+}
+
+/// The `exec_backend` arm. It refuses instead of starting, and it refuses
+/// before detaching stdio so the reason reaches the operator's terminal
+/// rather than `/dev/null`.
+#[cfg(exec_backend)]
+fn main() -> std::process::ExitCode {
+    eprintln!(
+        "ca-repeater-rs: this build selects the reactor-free execution backend \
+         (EPICS_RS_BUILD_EXEC_BACKEND=thread), and the repeater's UDP loops need \
+         a tokio reactor. Unset that variable and rebuild to run the repeater."
+    );
+    std::process::ExitCode::FAILURE
 }

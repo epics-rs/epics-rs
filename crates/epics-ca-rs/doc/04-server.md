@@ -116,13 +116,13 @@ struct ClientState {
 
 `hostname` is the circuit's access-security identity, and its *source* is
 decided once, at the start of the handler — exactly where C decides it, in
-`create_tcp_client` (`caservertask.c:1425-1437`). The two variants encode
+`create_tcp_client` (`caservertask.c:1425-1439`). The two variants encode
 whether the client may still set it, so the illegal transition is not
 representable rather than guarded at the write site:
 
 * `Claimed(name)` — C's default (`asCheckClientIP == 0`): empty until the
   client sends `CA_PROTO_HOST_NAME`, then whatever it claimed, stored
-  unconditionally (`camessage.c:845-875`). `HAG` entries are host names in
+  unconditionally (`camessage.c:797-878`). `HAG` entries are host names in
   this mode, so this is what a `HOST(node)` rule matches.
 * `Pinned(value)` — the peer's dotted-quad IP under `asCheckClientIP = 1`
   (`CA_PROTO_HOST_NAME` is then ignored, `camessage.c:839-843`), or an

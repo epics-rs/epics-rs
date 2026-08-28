@@ -4,7 +4,7 @@
 //! `caput` without `-c` sends a plain `CA_PROTO_WRITE`, which carries no
 //! completion callback. When the server refuses it, rsrv answers with a
 //! `CA_PROTO_ERROR`; libca's exception table routes that to `cac::writeExcep`
-//! → `oldChannelNotify::writeException` (`cac.cpp:1049-1061`), and with no user
+//! → `oldChannelNotify::writeException` (`cac.cpp:1046-1058`), and with no user
 //! handler installed the DEFAULT handler
 //! (`ca_client_context.cpp:289-349` → `vSignal`) prints the block on stderr.
 //! The tool's exit status is untouched — `ca_pend_io` saw nothing wrong.
@@ -36,12 +36,7 @@
 //! reported separately; the block's shape and routing are what this test is
 //! about.)
 
-// Host/tokio-only: drives the async `caget`/`caput` CLI binaries out of
-// process. Those binaries are built with this feature too, so their
-// `CaClient` stack routes `spawn` to the background executor and then
-// reaches tokio I/O with no reactor. Inapplicable under the executor
-// backend; the RTEMS model has no async CLI client.
-#![cfg(not(feature = "rtems-exec-model"))]
+#![cfg(tokio_backend)]
 
 use std::process::Command;
 

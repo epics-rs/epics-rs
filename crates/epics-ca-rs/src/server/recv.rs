@@ -41,7 +41,7 @@
 //! ```
 //!
 //! The ceiling is `rsrvSizeofLargeBufTCP`, derived from
-//! `EPICS_CA_MAX_ARRAY_BYTES` at `caservertask.c:510-532`. The refusal is
+//! `EPICS_CA_MAX_ARRAY_BYTES` at `caservertask.c:511-533`. The refusal is
 //! "reply, remember how much of the body has not landed yet, throw those
 //! bytes away as they arrive, keep every channel and subscription" — so a
 //! single oversize `caput` costs the client one message, not its circuit.
@@ -66,11 +66,17 @@
 //!
 //! | gate | C site | reply | outcome |
 //! |---|---|---|---|
-//! | `msgsize` not representable | `:2471-2478` | none | `RSRV_ERROR` — circuit torn down |
-//! | peer version too old | `:2489-2513` | `ECA_DEFUNCT` | `RSRV_OK` + drain — circuit kept |
-//! | misaligned `msgsize` | `:2519-2530` | `ECA_INTERNAL` | `RSRV_ERROR` — circuit torn down |
-//! | declared body over the ceiling | `:2538-2555` | `ECA_TOLARGE` | `RSRV_OK` + drain — circuit kept |
-//! | opcode outside `tcpJumpTable` | `:341-357` | `ECA_INTERNAL` | `RSRV_ERROR` — circuit torn down |
+//! | `msgsize` not representable | `4128a7c07:2459-2466` | none | `RSRV_ERROR` — circuit torn down |
+//! | peer version too old | `:2427-2446` | `ECA_DEFUNCT` | `RSRV_OK` + drain — circuit kept |
+//! | misaligned `msgsize` | `:2452-2463` | `ECA_INTERNAL` | `RSRV_ERROR` — circuit torn down |
+//! | declared body over the ceiling | `:2471-2489` | `ECA_TOLARGE` | `RSRV_OK` + drain — circuit kept |
+//! | opcode outside `tcpJumpTable` | `:337-352` | `ECA_INTERNAL` | `RSRV_ERROR` — circuit torn down |
+//!
+//! Every unqualified `:N` above is `camessage.c` at the `R7.0.10` pin. The
+//! first row is the exception: that guard is not in `R7.0.10` at all — it
+//! arrives 141 commits later in `4128a7c07`, which is why that row alone
+//! names a commit. Its position in C's order is that commit's, inside the
+//! extended-header branch and therefore ahead of every row below it.
 //!
 //! The rows are in C's order, and that order is part of the wire contract,
 //! not an implementation detail: a frame that is *both* misaligned and
@@ -82,6 +88,15 @@
 //! gets back is [`Gate`], whose variants *are* the two outcomes: a
 //! [`Gate::Refuse`] cannot be mistaken for a [`Gate::TearDown`] the way two
 //! hand-copied `if` blocks could.
+//!
+//! One gate here is ours and not C's: the per-client message-rate policy
+//! (`EPICS_CAS_RATE_LIMIT_*`, `server::rate_limit`). It runs *after* every
+//! row above, on a message C would have dispatched, so the C order is
+//! untouched — what it decides is whether this server hands that message on.
+//! It lives here for the same reason the rest do: it was written in the async
+//! loop alone, and the blocking driver RTEMS runs — the target with the least
+//! memory and no other defence — silently ignored the three documented
+//! variables for as long as the check had two possible homes.
 
 use epics_base_rs::error::CaError;
 
@@ -89,6 +104,7 @@ use crate::protocol::{
     BAD_TCP_COMMAND_DIAGNOSTIC, CA_MINIMUM_SUPPORTED_VERSION, CA_PROTO_VERSION, CaHeader,
     ECA_DEFUNCT, ECA_INTERNAL, ECA_TOLARGE, EXTENDED_EXTRA, ca_v49, is_legal_tcp_command,
 };
+use crate::server::rate_limit::{RateLimitConfig, RateLimiter};
 
 /// What [`RecvAccumulator::accept`] left for the caller to do.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -143,6 +159,7 @@ pub(crate) struct GateError {
 /// caller that has to read a `bool` to tell them apart is a caller that can
 /// read it wrong. Both receive loops match on this enum, so both answer every
 /// gate the same way or neither compiles.
+#[derive(Debug)]
 pub(crate) enum Gate {
     /// Nothing further can be decided from what is buffered. The parsed
     /// prefix has already been discarded; read more bytes from the socket.
@@ -161,6 +178,17 @@ pub(crate) enum Gate {
         error: Option<GateError>,
         reason: CaError,
     },
+    /// Ours, not C's: the per-client rate policy had no token for this
+    /// message. The cursor is past it exactly as for [`Gate::Deliver`], so
+    /// the caller simply asks for the next one; the peer keeps every channel
+    /// and subscription and is told nothing, because C has no reply for
+    /// "slow down" and libca has no status to carry one.
+    Discard,
+    /// Ours, not C's: consecutive [`Gate::Discard`]s reached
+    /// `EPICS_CAS_RATE_LIMIT_STRIKES`. End the circuit — as a policy
+    /// disconnect, not an error, which is why this is not a
+    /// [`Gate::TearDown`] with a `reason`.
+    RateLimited { strikes: u32 },
 }
 
 /// A per-client receive buffer that cannot be grown by a peer, and cannot be
@@ -178,27 +206,70 @@ pub(crate) struct RecvAccumulator {
     /// why a refused or misframed message cannot leave the cursor off an
     /// 8-byte boundary and de-sync every later frame on the circuit.
     offset: usize,
+    /// This circuit's token bucket, or `None` when the policy is disabled
+    /// (the default). Per-connection, like the buffer around it.
+    rate: Option<RateLimiter>,
+    /// Consecutive messages the bucket had no token for. Reset by the first
+    /// message that does get one, so a peer that is merely bursty never
+    /// reaches the threshold.
+    rate_strikes: u32,
+    /// `EPICS_CAS_RATE_LIMIT_STRIKES`; zero never disconnects.
+    rate_strike_threshold: u32,
 }
 
 impl RecvAccumulator {
+    /// A receive buffer carrying this server's configured rate policy. Every
+    /// receive loop builds its buffer through here, so no loop can be written
+    /// that reads a socket without the policy attached.
     pub(crate) fn new() -> Self {
-        Self::default()
+        Self::with_rate_limit(&RateLimitConfig::from_env())
+    }
+
+    /// [`Self::new`] with the policy passed in rather than read from the
+    /// environment — for tests, which must not depend on process-wide state.
+    pub(crate) fn with_rate_limit(cfg: &RateLimitConfig) -> Self {
+        Self {
+            rate: cfg.build(),
+            rate_strike_threshold: cfg.strike_threshold,
+            ..Self::default()
+        }
+    }
+
+    /// Gate 10, and the only one that is not C's: draw this message's token.
+    ///
+    /// Called with the cursor already past the message, so both outcomes
+    /// leave the buffer where [`Gate::Deliver`] would have.
+    fn admit_rate(&mut self) -> Option<Gate> {
+        let limiter = self.rate.as_ref()?;
+        if limiter.try_acquire().is_ok() {
+            self.rate_strikes = 0;
+            return None;
+        }
+        metrics::counter!("ca_server_rate_limit_drops_total").increment(1);
+        self.rate_strikes = self.rate_strikes.saturating_add(1);
+        if self.rate_strike_threshold > 0 && self.rate_strikes >= self.rate_strike_threshold {
+            metrics::counter!("ca_server_rate_limit_disconnects_total").increment(1);
+            return Some(Gate::RateLimited {
+                strikes: self.rate_strikes,
+            });
+        }
+        Some(Gate::Discard)
     }
 
     /// The largest message **body** this server will hold for one message.
     ///
-    /// C `rsrvSizeofLargeBufTCP` (`caservertask.c:510-532`), which is
+    /// C `rsrvSizeofLargeBufTCP` (`caservertask.c:511-533`), which is
     /// `EPICS_CA_MAX_ARRAY_BYTES` plus the header allowance — so comparing
     /// bodies here is the same comparison C makes on whole messages.
     pub(crate) fn body_ceiling() -> usize {
         crate::protocol::max_frame_body_bytes()
     }
 
-    /// C `camessage.c:2538-2540`: can the receive buffer ever hold a message
+    /// C `camessage.c:2471-2473`: can the receive buffer ever hold a message
     /// whose declared body is this long?
     ///
     /// `Err(ceiling)` means no, and the caller owes the peer exactly what C
-    /// sends at `:2541-2555` — `ECA_TOLARGE` naming the ceiling, then
+    /// sends at `:2473-2487` — `ECA_TOLARGE` naming the ceiling, then
     /// [`Self::refuse`] — rather than a disconnect.
     ///
     /// Applied to the declared body of **every** message, normal form and
@@ -284,7 +355,7 @@ impl RecvAccumulator {
     ///
     /// The single owner of the drain counter. C refuses the same way at both
     /// of its refuse-but-keep-serving sites — `ECA_DEFUNCT`
-    /// (`camessage.c:2494-2504`) and `ECA_TOLARGE` (`:2544-2553`): the error
+    /// (`camessage.c:2432-2440`) and `ECA_TOLARGE` (`:2475-2487`): the error
     /// goes out, `recvBytesToDrain` remembers the part of the body that has
     /// not arrived, and the drain preamble throws those bytes away as they
     /// land. Neither closes the connection.
@@ -319,9 +390,9 @@ impl RecvAccumulator {
     /// The sequence, with C's site and outcome for each step:
     ///
     /// 1. fewer than 16 bytes buffered → `RSRV_OK` break, wait
-    ///    (`camessage.c:2448-2452`)
+    ///    (`camessage.c:2397-2400`)
     /// 2. V49 peer, `m_postsize == 0xffff`, fewer than 24 bytes → wait for
-    ///    the annex (`camessage.c:2463-2467`). Gated on V49 exactly as C
+    ///    the annex (`camessage.c:2410-2415`). Gated on V49 exactly as C
     ///    gates the whole branch, so a pre-V49 peer's `0xffff` stays a
     ///    normal-form postsize and falls through to the alignment test.
     /// 3. the header parser rejects 16 present bytes → tear down. C's parser
@@ -332,16 +403,16 @@ impl RecvAccumulator {
     /// 4. non-VERSION message from a peer below
     ///    `CA_MINIMUM_SUPPORTED_VERSION` → `ECA_DEFUNCT` "CAS: Client
     ///    version %u too old", `RSRV_OK` + `recvBytesToDrain`
-    ///    (`camessage.c:2489-2513`)
+    ///    (`camessage.c:2427-2446`)
     /// 5. declared body over [`Self::body_ceiling`] → `ECA_TOLARGE`,
-    ///    `RSRV_OK` + `recvBytesToDrain` (`camessage.c:2538-2555`)
+    ///    `RSRV_OK` + `recvBytesToDrain` (`camessage.c:2471-2489`)
     /// 6. `msgsize & 0x7` → `ECA_INTERNAL` "CAS: Missaligned protocol
-    ///    rejected", `RSRV_ERROR` (`camessage.c:2520-2530`)
+    ///    rejected", `RSRV_ERROR` (`camessage.c:2452-2463`)
     /// 7. body not fully arrived → `RSRV_OK` break, wait
-    ///    (`camessage.c:2563-2566`)
+    ///    (`camessage.c:2495-2498`)
     /// 8. opcode outside `tcpJumpTable`'s legal slots → `ECA_INTERNAL`
     ///    "invalid (damaged?) request code from TCP", `RSRV_ERROR`
-    ///    (`camessage.c:341-357`, dispatched at `:2587-2594`)
+    ///    (`camessage.c:337-352`, dispatched at `:2519-2529`)
     ///
     /// Step 5 is tested on `actual_postsize()` before `hdr_size + body` is
     /// formed anywhere, because `usize` is 32-bit on RTEMS and a V49 peer can
@@ -437,7 +508,7 @@ impl RecvAccumulator {
             return Gate::NeedMore;
         }
 
-        // 9. C dispatches through `tcpJumpTable` (`camessage.c:2587-2594`)
+        // 9. C dispatches through `tcpJumpTable` (`camessage.c:2519-2525`)
         //    only now, with a whole message in hand. Every illegal index
         //    lands on `bad_tcp_cmd_action`: `ECA_INTERNAL` and `RSRV_ERROR`,
         //    with C's own comment saying clients are not expected to
@@ -458,13 +529,27 @@ impl RecvAccumulator {
             };
         }
 
+        // 10. Ours, not C's, and last for that reason: C would dispatch this
+        //     message, so anything this gate does is this server's own policy
+        //     rather than a difference in how the protocol is read.
+        if let Some(gate) = self.admit_rate() {
+            return gate;
+        }
+
         let payload = self.buf[self.offset - msg_len + hdr_size..self.offset].to_vec();
         Gate::Deliver { hdr, payload }
     }
 
-    /// C's `msgsize` (`camessage.c:2467-2482`) — header plus declared body —
-    /// or `None` where C breaks with `RSRV_ERROR` because the sum does not
-    /// fit the `ca_uint32_t` it is formed in.
+    /// C's `msgsize` — header plus declared body — formed at
+    /// `camessage.c:2418` for the extended header and `:2422` for the normal
+    /// one, or `None` where C breaks with `RSRV_ERROR` because the sum does
+    /// not fit the `ca_uint32_t` it is formed in.
+    ///
+    /// That refusal is not at the `R7.0.10` pin: upstream added the
+    /// `ca_uint32_max` guard in `4128a7c07` ("rsrv: cross-check m_count
+    /// message field with payload buffer length", 141 commits past the tag,
+    /// on `7.0`). This port carries it, so the citation names the commit
+    /// rather than a line the pinned revision does not have.
     ///
     /// Every gate below the parse reads this one number, so it has to mean
     /// the message's real length on all of them; a clamped stand-in would
@@ -511,10 +596,10 @@ impl RecvAccumulator {
     }
 }
 
-/// C's text at `camessage.c:2523`.
+/// C's text at `camessage.c:2456`.
 pub(crate) const MISALIGNED_DIAGNOSTIC: &str = "CAS: Missaligned protocol rejected";
 
-/// C's text at `camessage.c:2545`, with the ceiling it names.
+/// C's text at `camessage.c:2477`, with the ceiling it names.
 ///
 /// `pub(crate)` only so the driver parity tests can state the expected wire
 /// text once; the gate is the sole production caller.
@@ -668,5 +753,110 @@ mod tests {
         acc.accept(&vec![0u8; 4127]);
         assert_eq!(acc.refuse(0, 4128), Refused::DrainPending);
         assert_eq!(acc.drain_pending(), 1);
+    }
+
+    /// `n` back-to-back bodiless `CA_PROTO_VERSION` frames — the smallest
+    /// message that passes every C gate, so what the rate gate does to it is
+    /// all that is under test.
+    fn frames(n: usize) -> Vec<u8> {
+        let mut buf = Vec::new();
+        for _ in 0..n {
+            buf.extend_from_slice(&CaHeader::new(CA_PROTO_VERSION).to_bytes());
+        }
+        buf
+    }
+
+    /// A bucket of exactly `burst` tokens. `msgs_per_sec` is the slowest
+    /// non-zero refill the config admits — one token per second — so no
+    /// token can return during a test that runs in microseconds.
+    fn policy(burst: u64, strike_threshold: u32) -> RateLimitConfig {
+        RateLimitConfig {
+            msgs_per_sec: 1,
+            burst,
+            strike_threshold,
+        }
+    }
+
+    fn drain_gates(acc: &mut RecvAccumulator, n: usize) -> Vec<Gate> {
+        (0..n)
+            .map(|_| acc.next_message(CA_MINIMUM_SUPPORTED_VERSION))
+            .collect()
+    }
+
+    /// The default: no policy, so the gate is not in the path at all.
+    #[test]
+    fn a_disabled_policy_delivers_every_message() {
+        let mut acc = RecvAccumulator::with_rate_limit(&RateLimitConfig::default());
+        assert_eq!(acc.accept(&frames(8)), Admit::Parse);
+        for gate in drain_gates(&mut acc, 8) {
+            assert!(matches!(gate, Gate::Deliver { .. }), "{gate:?}");
+        }
+        assert!(matches!(
+            acc.next_message(CA_MINIMUM_SUPPORTED_VERSION),
+            Gate::NeedMore
+        ));
+    }
+
+    /// An empty bucket costs the peer the message and nothing else — and the
+    /// cursor is past it, so the same bytes cannot come back as the next
+    /// message. That is the boundary a caller could get wrong if the gate
+    /// lived in the receive loop.
+    #[test]
+    fn an_empty_bucket_discards_the_message_and_advances_the_cursor() {
+        let mut acc = RecvAccumulator::with_rate_limit(&policy(1, 0));
+        assert_eq!(acc.accept(&frames(2)), Admit::Parse);
+        let gates = drain_gates(&mut acc, 2);
+        assert!(matches!(gates[0], Gate::Deliver { .. }), "{:?}", gates[0]);
+        assert!(matches!(gates[1], Gate::Discard), "{:?}", gates[1]);
+        assert!(
+            matches!(
+                acc.next_message(CA_MINIMUM_SUPPORTED_VERSION),
+                Gate::NeedMore
+            ),
+            "a discarded message must not be re-parsed"
+        );
+    }
+
+    /// Strike boundary: the run reaches the threshold on the `n`th
+    /// consecutive discard, not the one before or after.
+    #[test]
+    fn consecutive_discards_end_the_circuit_at_the_threshold() {
+        let mut acc = RecvAccumulator::with_rate_limit(&policy(1, 3));
+        assert_eq!(acc.accept(&frames(5)), Admit::Parse);
+        let gates = drain_gates(&mut acc, 4);
+        assert!(matches!(gates[0], Gate::Deliver { .. }), "{:?}", gates[0]);
+        assert!(matches!(gates[1], Gate::Discard), "{:?}", gates[1]);
+        assert!(matches!(gates[2], Gate::Discard), "{:?}", gates[2]);
+        assert!(
+            matches!(gates[3], Gate::RateLimited { strikes: 3 }),
+            "{:?}",
+            gates[3]
+        );
+    }
+
+    /// Zero is the documented "drop, never disconnect" setting
+    /// (`EPICS_CAS_RATE_LIMIT_STRIKES`), so the run may grow without bound.
+    #[test]
+    fn a_zero_threshold_never_ends_the_circuit() {
+        let mut acc = RecvAccumulator::with_rate_limit(&policy(1, 0));
+        assert_eq!(acc.accept(&frames(64)), Admit::Parse);
+        for gate in drain_gates(&mut acc, 64).into_iter().skip(1) {
+            assert!(matches!(gate, Gate::Discard), "{gate:?}");
+        }
+        assert_eq!(acc.rate_strikes, 63);
+    }
+
+    /// Only *consecutive* discards count: one message that draws a token
+    /// puts the run back to zero, so a bursty peer never disconnects.
+    #[test]
+    fn a_delivered_message_resets_the_strike_run() {
+        let mut acc = RecvAccumulator::with_rate_limit(&policy(1, 3));
+        acc.rate_strikes = 2;
+        assert_eq!(acc.accept(&frames(1)), Admit::Parse);
+        assert!(matches!(
+            acc.next_message(CA_MINIMUM_SUPPORTED_VERSION),
+            Gate::Deliver { .. }
+        ));
+        assert_eq!(acc.rate_strikes, 0);
     }
 }

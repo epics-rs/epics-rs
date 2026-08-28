@@ -4,11 +4,11 @@
 //! `realtime_ca_ioc_boots.rs` proves the whole init path runs and the
 //! name-server dial is *attempted* (it points the client at a closed port
 //! and waits for the refusal). Nothing proved the other half: that under
-//! `--features rtems-exec-model` a `ca://UPSTREAM CP` input link actually
-//! reaches a live upstream, resolves through `EPICS_CA_NAME_SERVERS`, opens
-//! a monitor, and lands the upstream value in the downstream record. That
-//! is the difference between "the seam does not panic" and "the resolver
-//! resolves".
+//! `EPICS_RS_BUILD_EXEC_BACKEND=thread` a `ca://UPSTREAM CP` input link
+//! actually reaches a live upstream, resolves through
+//! `EPICS_CA_NAME_SERVERS`, opens a monitor, and lands the upstream value
+//! in the downstream record. That is the difference between "the seam does
+//! not panic" and "the resolver resolves".
 //!
 //! # Topology — two IOC halves in one process
 //!
@@ -29,11 +29,11 @@
 //! use-the-peer-address reply, the data-circuit dial, CREATE_CHAN,
 //! EVENT_ADD, and the CP monitor processing the downstream record.
 //!
-//! # Why this must be feature-ON only
+//! # Why this must be exec-backend only
 //!
-//! With `rtems-exec-model` off, the `runtime::task` seam routes the
-//! resolver's spawns to tokio and every one of them needs a reactor this
-//! plain `#[test]` thread does not have. With it on, they land on the
+//! On `tokio_backend`, the `runtime::task` seam routes the resolver's
+//! spawns to tokio and every one of them needs a reactor this plain
+//! `#[test]` thread does not have. With it on, they land on the
 //! background executor `background_init()` starts, and the client's
 //! circuits run on `runtime::blocking_io`'s pump threads — the exact
 //! configuration the RTEMS target has, which is the configuration under
@@ -56,7 +56,8 @@
 //! is no intra-binary concurrency under `cargo test`, and nextest runs one
 //! process per test.
 
-#![cfg(feature = "rtems-exec-model")]
+#![cfg(exec_backend)]
+#![cfg(feature = "client-core")]
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -86,7 +87,7 @@ const DOWNSTREAM_DB: &str = concat!(
 
 /// One budget for the whole resolution: search, dial, subscribe, first
 /// monitor, record processing. Generous for a loaded CI box.
-const RESOLVE_BUDGET: Duration = Duration::from_secs(30);
+const RESOLVE_BUDGET: Duration = budget::FACT_BUDGET;
 const POLL: Duration = Duration::from_millis(50);
 
 /// Load a database exactly as `realtime-ca-ioc::load_database` does — driven by
@@ -192,3 +193,6 @@ fn a_ca_link_resolves_end_to_end_on_the_exec_backend() {
     server.shutdown();
     accept.join().expect("the accept thread exits on shutdown");
 }
+
+#[path = "common/budget.rs"]
+mod budget;

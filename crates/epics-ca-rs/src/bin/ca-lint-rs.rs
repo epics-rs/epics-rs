@@ -55,9 +55,8 @@ impl Issue {
     }
 }
 
-/// Whitelist of recognized EPICS_CA* / EPICS_CAS* env vars. Matches
-/// the documented set in `doc/08-environment.md`. Anything outside
-/// this set in the user's environment is flagged as a likely typo.
+/// Whitelist of recognized EPICS_CA* / EPICS_CAS* env vars. Anything
+/// outside this set in the user's environment is flagged as a likely typo.
 const KNOWN_ENV: &[&str] = &[
     "EPICS_CA_ADDR_LIST",
     "EPICS_CA_AUTO_ADDR_LIST",

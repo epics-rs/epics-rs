@@ -21,6 +21,7 @@ use std::time::Instant;
 /// Token bucket. `capacity` is the max burst; `refill_per_sec` is the
 /// long-term sustainable rate. Both are configured at construction
 /// time and immutable afterwards.
+#[derive(Debug)]
 pub struct RateLimiter {
     capacity: u64,
     refill_per_sec: u64,

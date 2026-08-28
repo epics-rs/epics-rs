@@ -28,7 +28,7 @@ use epics_base_rs::error::CaResult;
 /// which the bridge ca_gateway pulses when it registers a new upstream PV —
 /// the `generateBeaconAnomaly` analogue. The TCP path does NOT pulse it: C
 /// `rsrv_online_notify_task` sets the ramp's initial period once at task start
-/// (`online_notify.c:68` `delay = 0.02`) and restarts it in exactly one other
+/// (`online_notify.c:66` `delay = 0.02`) and restarts it in exactly one other
 /// place, the `beacon_ctl == ctlPause` wait loop (`online_notify.c:126-129`);
 /// a client connect or disconnect never touches it. The port used to pulse on
 /// every accept and every disconnect, which restarted the 20 ms ramp and made
@@ -121,7 +121,7 @@ pub async fn run_beacon_emitter(
     };
 
     // `beacon_id` is what each beacon carries on the wire; `beacon_counter`
-    // is the source counter. C `online_notify.c:118` sets
+    // is the source counter. C `online_notify.c:124` sets
     // `msg.m_cid = htonl(beaconCounter++)` AFTER the send + sleep, so the
     // value placed on the wire lags the counter by one cycle: the first
     // two beacons both carry 0 (the initial m_cid 0, then beaconCounter's
@@ -142,6 +142,25 @@ pub async fn run_beacon_emitter(
     // recovery — repeats are silent.
     let mut send_errors: HashMap<SocketAddr, std::io::ErrorKind> = HashMap::new();
 
+    // C `rsrv_online_notify_task` registers with the watchdog as its first act
+    // (`online_notify.c:50`) and removes on the way out (`:136`). This is the
+    // one CA server task with a period of its own, so it promises one: two of
+    // its steady-state intervals plus the watchdog's granularity, which the
+    // ramp-up cannot trip because that only sends faster. With nowhere to send
+    // there is no period to promise, so the same registration carries no
+    // deadline instead of a second one being made below.
+    let watched = epics_base_rs::runtime::taskwd::taskwd_insert(
+        "CAS-beacon",
+        if beacon_addrs.is_empty() {
+            epics_base_rs::runtime::taskwd::CheckIn::Unbounded
+        } else {
+            epics_base_rs::runtime::taskwd::CheckIn::Every(
+                max_interval * 2 + epics_base_rs::runtime::taskwd::TASKWD_DELAY,
+            )
+        },
+        None,
+    );
+
     if beacon_addrs.is_empty() {
         // Nothing to send to — quietly idle but still consume reset
         // notifications so the channel doesn't fill up.
@@ -151,6 +170,7 @@ pub async fn run_beacon_emitter(
     }
 
     loop {
+        watched.check_in();
         // Build beacon message: CA_PROTO_RSRV_IS_UP.
         //
         // m_available stays 0 (INADDR_ANY) per C `online_notify.c:69`
@@ -204,7 +224,7 @@ pub async fn run_beacon_emitter(
                 interval = initial_interval;
             }
         }
-        // C `online_notify.c:118`: `msg.m_cid = htonl(beaconCounter++)`
+        // C `online_notify.c:124`: `msg.m_cid = htonl(beaconCounter++)`
         // runs here, after the send + sleep. Latch the wire id from the
         // counter, then post-increment the counter (wrapping).
         beacon_id = beacon_counter;

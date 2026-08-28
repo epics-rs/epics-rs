@@ -1,13 +1,13 @@
 //! **A CA `DBR_CHAR` write widens UNSIGNED; a `DBR_CHAR` read stays signed.**
 //!
 //! C keeps two type maps and they disagree on exactly one row. The put map,
-//! `dbChannel_put` (`db/db_access.c:820-...`), sends `oldDBR_CHAR` — and
+//! `dbChannel_put` (`db/db_access.c:820-983`), sends `oldDBR_CHAR` — and
 //! `oldDBR_STS_CHAR`, `oldDBR_TIME_CHAR`, `oldDBR_GR_CHAR`,
-//! `oldDBR_CTRL_CHAR`, and `mapOldType` (`:988`) on the WRITE_NOTIFY path —
+//! `oldDBR_CTRL_CHAR`, and `mapOldType` (`:986-1023`) on the WRITE_NOTIFY path —
 //! to `DBR_UCHAR`, so the widening row it reaches is `putUcharLong`
 //! (`dbConvert.c`, `PUT` body `*pdst = (typeb) *psrc`) and byte 0xC8 becomes
 //! 200. The signed `putCharLong` is unreachable from CA. The get map keeps
-//! `oldDBR_CHAR` as `DBR_CHAR` (`db_access.c:816`), so reading a `DBF_CHAR`
+//! `oldDBR_CHAR` as `DBR_CHAR` (`db_access.c:184-186`), so reading a `DBF_CHAR`
 //! field as `DBR_LONG` still sign-extends and 0xC8 reads back as −56.
 //!
 //! The port had flattened that asymmetry to signed in both directions, so
@@ -23,10 +23,7 @@
 //! Ports are always ephemeral (`:0`) — never the real 5064, per the
 //! `build() ⟹ listening` port-ownership rule.
 
-// Host/tokio-only: the async server's listener stack needs a tokio reactor,
-// which the `rtems-exec-model` background executor does not start. The
-// comparison between the two loops is only meaningful where both can run.
-#![cfg(not(feature = "rtems-exec-model"))]
+#![cfg(tokio_backend)]
 
 use std::collections::HashMap;
 use std::io::{Read, Write};
@@ -357,7 +354,7 @@ fn a_compound_char_write_widens_unsigned_on_both_loops() {
 // ---------------------------------------------------------------------------
 
 /// C is asymmetric on purpose: the read keeps `oldDBR_CHAR` → `DBR_CHAR`
-/// (`db_access.c:816`), so a `DBF_CHAR` field holding 0xC8 reads back as −56
+/// (`db_access.c:184-186`), so a `DBF_CHAR` field holding 0xC8 reads back as −56
 /// through `getCharLong`. The bytes that went in are unchanged; only the
 /// widening the reader asks for is signed. Pins the half that must NOT move.
 #[test]

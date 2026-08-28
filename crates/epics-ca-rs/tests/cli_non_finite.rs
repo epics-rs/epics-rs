@@ -16,6 +16,8 @@
 //! This drives the library's public value formatter, which is what every tool
 //! prints through — value, array element, and each graphic / control limit.
 
+#![cfg(all(feature = "client-core", not(epics_embedded_target)))]
+
 use epics_ca_rs::EpicsValue;
 use epics_ca_rs::cli::{CountPrefix, ValueFormat, format_c_g, format_value};
 

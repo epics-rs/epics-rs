@@ -75,25 +75,16 @@ pub fn env_double(name: &str) -> Result<f64, EnvDoubleError> {
     })
 }
 
-/// Panic-free `f64` seconds → [`Duration`].
+/// Panic-free `f64` seconds → [`Duration`]: the workspace owner,
+/// [`epics_base_rs::runtime::time::duration_from_secs`], reached under the
+/// name CA code already calls.
 ///
-/// `Duration::from_secs_f64` panics on NaN, on negatives, and beyond
-/// `u64::MAX` seconds; C just stores the `double` and compares against it.
-/// Mirror the C outcome instead of aborting:
-///
-/// * `+inf`, or a magnitude past `Duration`'s range → [`Duration::MAX`];
-///   in C every `now < expire` test against such a deadline is true, i.e.
-///   the timer never fires.
-/// * `NaN` → [`Duration::MAX`] as well: in C every comparison against NaN
-///   is false, so the deadline likewise never trips.
-/// * negative (including `-inf`) → [`Duration::ZERO`], C's already-expired
-///   deadline.
+/// This used to restate the owner's body — same three arms, same
+/// constants, a second place for the rule to drift. It delegates instead,
+/// so `EPICS_CA_*` doubles and record delay fields cannot disagree about
+/// what `1e300` means.
 pub fn duration_from_secs(secs: f64) -> Duration {
-    Duration::try_from_secs_f64(secs).unwrap_or(if secs < 0.0 {
-        Duration::ZERO
-    } else {
-        Duration::MAX
-    })
+    epics_base_rs::runtime::time::duration_from_secs(secs)
 }
 
 #[cfg(test)]

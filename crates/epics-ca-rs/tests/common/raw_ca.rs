@@ -1,9 +1,11 @@
+#![allow(dead_code)] // Included by `#[path]` into two suites that use overlapping subsets.
+
 //! Shared raw-socket CA client for the blocking-front-end e2e suites.
 //!
 //! Hand-rolled CA wire frames over `std::net::TcpStream` — no `CaClient`, no
 //! tokio runtime, no `.await`. Used by `blocking_raw_client_e2e.rs` (SimplePv
 //! fixtures, feature-neutral) and `blocking_real_record_e2e.rs` (IocBuilder
-//! records, feature-ON only), so the wire logic is written once.
+//! records, exec-backend only), so the wire logic is written once.
 //!
 //! # Frames are never discarded
 //!
@@ -26,9 +28,28 @@
 //! primitive left in this module for a caller to reach for.
 //!
 //! One consequence is worth stating, because it is a feature: since nothing is
-//! dropped, [`Circuit::expect_silence`] fails on a frame that arrived earlier
-//! and was never claimed. A test must account for every frame the server sent
-//! it, not merely for the ones it thought to look at.
+//! dropped, [`Circuit::expect_absent_before`] fails on a frame that arrived
+//! earlier and was never claimed. A test must account for every frame the
+//! server sent it, not merely for the ones it thought to look at.
+//!
+//! # Absence is a claim about order, not about elapsed time
+//!
+//! The predecessor of [`Circuit::expect_absent_before`] took a window — "read
+//! for 250 ms and fail if anything arrives". That asserts nothing about the
+//! server: reintroduce the frame it denies and the assertion still passes on
+//! any run where the server is slower than the number, so it fails flakily and
+//! never for its own reason. Every absence claim here now names a probe whose
+//! reply the server can only produce *after* the frame being denied, and the
+//! only duration left is `budget::FACT_BUDGET` bounding the wait for that
+//! reply — a presence wait, which a broken server fails outright.
+//!
+//! The barrier has to be produced by the same writer as the denied frame. This
+//! server writes replies from two threads under one lock (`blocking.rs:1206`
+//! `run_event_task` beside the message loop's `drain_outbox_locked`), so a
+//! message reply is **not** a barrier for a monitor update: an absence claim
+//! about the event path closes on a later monitor update from a live
+//! subscription, one whose put was issued after the put whose fan-out is being
+//! denied.
 //!
 //! Every reader fails the test on a `CA_PROTO_ERROR` frame and names the ECA
 //! status, which is what makes "no command falls back to ECA_UNAVAILINSERV" a
@@ -53,7 +74,7 @@ use epics_ca_rs::server::blocking::BlockingCaServer;
 pub const DBR_DOUBLE: u16 = 6;
 
 /// How long a read waits before the test is declared hung.
-const READ_TIMEOUT: Duration = Duration::from_secs(5);
+const READ_TIMEOUT: Duration = budget::FACT_BUDGET;
 
 /// Frames one expectation will look at before giving up. Bounds a hang in
 /// company with the socket read timeout.
@@ -130,7 +151,7 @@ impl Circuit {
 
     /// Wait for the EVENT_CANCEL acknowledgement.
     ///
-    /// C `event_cancel_reply` (`camessage.c:2089-2091`) echoes the stored
+    /// C `event_cancel_reply` (`camessage.c:2035-2037`) echoes the stored
     /// EVENT_ADD request — same data_type / count / sid / sub-id — with a
     /// **zero payload**, rather than echoing the EVENT_CANCEL opcode. The zero
     /// postsize is what distinguishes the ack from a genuine monitor update
@@ -148,34 +169,55 @@ impl Circuit {
         frame
     }
 
-    /// Assert that the circuit is quiet: nothing is queued from earlier, and
-    /// nothing new arrives within `dur`.
+    /// Require the `barrier` frame to arrive with nothing matching `denied`
+    /// before it — including anything left unclaimed by an earlier exchange —
+    /// and return the barrier frame.
     ///
-    /// The queue check is the half that a discarding reader could not perform.
-    /// It means a test cannot leave an unclaimed reply behind and still call
-    /// the circuit silent.
-    pub fn expect_silence(&mut self, dur: Duration, what: &str) {
-        if let Some(stale) = self.pending.pop_front() {
-            panic!(
-                "{what}: expected silence, but an unclaimed cmmd={} frame was \
-                 already queued from an earlier exchange",
-                cmmd_of(&stale)
-            );
+    /// The caller sends the probe; this reads. Everything seen on the way that
+    /// is neither denied nor the barrier stays claimable, so this composes with
+    /// the rest of the module rather than competing with it. See the module
+    /// docs for why the barrier and the denied frame must share a writer.
+    pub fn expect_absent_before(
+        &mut self,
+        denied: impl Fn(&[u8]) -> bool,
+        barrier: impl Fn(&[u8]) -> bool,
+        what: &str,
+    ) -> Vec<u8> {
+        let mut seen = {
+            let sock = &mut self.sock;
+            let pending = &mut self.pending;
+            budget::barrier::until(
+                what,
+                |f: &Vec<u8>| denied(f),
+                |f: &Vec<u8>| barrier(f),
+                |remaining| {
+                    if let Some(f) = pending.pop_front() {
+                        return Some(f);
+                    }
+                    sock.set_read_timeout(Some(remaining)).ok()?;
+                    read_one_frame_from(sock)
+                },
+            )
+        };
+        self.sock
+            .set_read_timeout(Some(READ_TIMEOUT))
+            .expect("restore read timeout");
+        let barrier_frame = seen.pop().expect("`until` returns the barrier last");
+        for frame in seen.into_iter().rev() {
+            self.pending.push_front(frame);
         }
-        self.sock.set_read_timeout(Some(dur)).unwrap();
-        let mut hdr = [0u8; CaHeader::SIZE];
-        let outcome = self.sock.read_exact(&mut hdr);
-        self.sock.set_read_timeout(Some(READ_TIMEOUT)).unwrap();
-        match outcome {
-            Err(e)
-                if e.kind() == std::io::ErrorKind::WouldBlock
-                    || e.kind() == std::io::ErrorKind::TimedOut =>
-            {
-                // expected: nothing on the wire
-            }
-            Ok(()) => panic!("{what}: expected silence, got cmmd={}", cmmd_of(&hdr)),
-            Err(e) => panic!("{what}: unexpected socket error {e}"),
+        if cmmd_of(&barrier_frame) == CA_PROTO_ERROR {
+            let f = &barrier_frame;
+            let status = u32::from_be_bytes([f[12], f[13], f[14], f[15]]);
+            panic!("{what}: server answered CA_PROTO_ERROR (ECA status {status:#x})");
         }
+        barrier_frame
+    }
+
+    /// The barrier reply must be the **next** frame on the circuit: nothing at
+    /// all may precede it. The shape for "that request draws no reply".
+    pub fn expect_only(&mut self, barrier: u16, what: &str) -> Vec<u8> {
+        self.expect_absent_before(|f| cmmd_of(f) != barrier, |f| cmmd_of(f) == barrier, what)
     }
 
     /// The one place frames are matched. Scans what is already queued, then
@@ -202,17 +244,33 @@ impl Circuit {
     /// Read exactly one whole CA frame (header + declared payload), leaving the
     /// socket on a frame boundary.
     fn read_one_frame(&mut self) -> Vec<u8> {
-        let mut hdr = [0u8; CaHeader::SIZE];
-        self.sock.read_exact(&mut hdr).expect("read frame header");
-        let postsize = postsize_of(&hdr);
-        let mut frame = hdr.to_vec();
-        if postsize > 0 {
-            let mut body = vec![0u8; postsize];
-            self.sock.read_exact(&mut body).expect("read frame body");
-            frame.extend_from_slice(&body);
-        }
-        frame
+        read_one_frame_from(&mut self.sock).expect("read frame within the budget")
     }
+}
+
+/// [`Circuit::read_one_frame`] as a free function, so the barrier reader can
+/// hold the socket while the queue is borrowed too. `None` once the socket's
+/// current read timeout expires with no header.
+fn read_one_frame_from(sock: &mut TcpStream) -> Option<Vec<u8>> {
+    let mut hdr = [0u8; CaHeader::SIZE];
+    match sock.read_exact(&mut hdr) {
+        Ok(()) => {}
+        Err(e)
+            if e.kind() == std::io::ErrorKind::WouldBlock
+                || e.kind() == std::io::ErrorKind::TimedOut =>
+        {
+            return None;
+        }
+        Err(e) => panic!("read frame header: {e}"),
+    }
+    let postsize = postsize_of(&hdr);
+    let mut frame = hdr.to_vec();
+    if postsize > 0 {
+        let mut body = vec![0u8; postsize];
+        sock.read_exact(&mut body).expect("read frame body");
+        frame.extend_from_slice(&body);
+    }
+    Some(frame)
 }
 
 pub fn cmmd_of(frame: &[u8]) -> u16 {
@@ -321,7 +379,7 @@ pub fn clear_channel_frame(sid: u32, cid: u32) -> Vec<u8> {
 /// HOST_NAME out, and **both** of the server's VERSION frames in.
 ///
 /// Two are due, and claiming only one is what a discarding reader let pass: C
-/// `create_tcp_client` (`caservertask.c:1525`, mirrored at `blocking.rs:637`)
+/// `create_tcp_client` (`caservertask.c:1526`, mirrored at `blocking.rs:637`)
 /// sends an unsolicited greeting as the server's very first frame, and the
 /// dispatch handler then answers our own VERSION request. Leaving the second
 /// queued would surface much later as an unexplained frame under some
@@ -360,3 +418,6 @@ pub fn create_channel(c: &mut Circuit, cid: u32, pv: &str) -> u32 {
     );
     u32::from_be_bytes([cc[12], cc[13], cc[14], cc[15]])
 }
+
+#[path = "budget.rs"]
+pub mod budget;

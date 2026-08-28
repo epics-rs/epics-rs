@@ -11,7 +11,7 @@ use epics_ca_rs::client::{
 };
 use epics_ca_rs::copt::{self, CTool, scan_i32};
 use epics_ca_rs::protocol::ECA_DISCONN;
-use epics_ca_rs::{CaError, DbFieldType, EpicsValue};
+use epics_ca_rs::{CaError, CaOp, DbFieldType, EpicsValue};
 use std::time::SystemTime;
 
 /// Owner of every C-scanned option argument in this binary (see
@@ -301,7 +301,7 @@ struct Args {
     float_base: Vec<String>,
 
     /// Alternate output field separator: C takes `(char) *optarg`, the FIRST
-    /// character, and discards the rest (`caget.c:505`).
+    /// character, and discards the rest (`caget.c:507`).
     #[arg(
         short = 'F',
         long = "field-separator",
@@ -344,7 +344,7 @@ impl Args {
                 precision,
             };
         }
-        // C `caget.c:485-499` writes exactly ONE of the two base globals per
+        // C `caget.c:497-504` writes exactly ONE of the two base globals per
         // occurrence: `-0<base>` sets `outTypeI` (integers), `-l<base>` sets
         // `outTypeF` (floats, via round-to-long). They never cross.
         fmt.int_style = int_base.style;
@@ -572,11 +572,11 @@ fn specified_dbr_report(
         let _ = writeln!(out, "    Class Name:       {cn}");
     } else {
         let enum_strings = snap.enums.as_ref().map(|e| e.strings.as_slice());
-        // C `caget.c:328-334`: this block already printed `Element count:` on
+        // C `caget.c:332-335`: this block already printed `Element count:` on
         // its own line, so its Value loop joins the elements BARE — there is
         // no `printf("%lu%c", nElems, ...)` here, unlike the plain/terse loop
         // at `:286`. `reqElems` still reaches the `-S` long-string gate
-        // (`caget.c:318`), so it is passed through unchanged.
+        // (`caget.c:320`), so it is passed through unchanged.
         let rendered = format_value(&snap.value, fmt, enum_strings, CountPrefix::Never);
         let _ = writeln!(out, "    Element count:    {}", snap.value.count());
         let _ = writeln!(out, "    Value:            {rendered}");
@@ -618,8 +618,8 @@ fn caget_req_count(callback: bool, req_elems: u64, native: u32) -> ReqCount {
 }
 
 /// One PV's read outcome, plus whether its read timed out. C warns ONCE on
-/// stderr for a timed-out read phase (`caget.c:224-226` for `ca_pend_io`,
-/// `:238-239` for the callback wait) and then still runs the print loop, so
+/// stderr for a timed-out read phase (`caget.c:229-231` for `ca_pend_io`,
+/// `:243-244` for the callback wait) and then still runs the print loop, so
 /// the flag has to survive alongside the (possibly successful-looking)
 /// outcome.
 struct PvRead {
@@ -633,7 +633,7 @@ struct PvRead {
 ///
 /// Exactly ONE of these is fatal, and only collectively: C counts the PVs
 /// that were still connected when it issued the read (`nConn`) and returns 1
-/// only when that count is zero (`caget.c:227`). Past that gate the read
+/// only when that count is zero (`caget.c:224`). Past that gate the read
 /// function returns 0 unconditionally (`caget.c:348`), so a read-access
 /// denial, a CA error, or a read timeout on SOME PV prints its marker and
 /// leaves the exit status at 0.
@@ -670,7 +670,7 @@ impl ReadError {
 fn read_error(e: &CaError) -> ReadError {
     match e {
         CaError::Disconnected | CaError::Shutdown => ReadError::Disconnected,
-        other => ReadError::Ca(other.to_eca_status()),
+        other => ReadError::Ca(other.to_eca_status(CaOp::Read)),
     }
 }
 
@@ -723,7 +723,7 @@ fn print_read_error(mode: OutputMode, name_col: &str, pv_name: &str, sep: char, 
 /// ONLY the callback get (`-c`, `ca_array_get_callback`) allocates lazily,
 /// inside its event handler (`caget.c:130`): a callback that never arrives
 /// leaves `value == NULL`, which is the sole way to reach C's
-/// `*** no data available (timeout)` branch (`caget.c:268`).
+/// `*** no data available (timeout)` branch (`caget.c:270-271`).
 ///
 /// `base` is the value carrier of the DBR type actually requested; `None`
 /// means `ca_field_type` failed, i.e. the channel dropped after the connect
@@ -882,7 +882,9 @@ async fn main() {
                         snap: Box::new(zero_dbr_snapshot(b, n)),
                     })
                 };
-                match tokio::time::timeout(t, ch.get_with_dbr_type(rt, req_count)).await {
+                match epics_base_rs::runtime::task::timeout(t, ch.get_with_dbr_type(rt, req_count))
+                    .await
+                {
                     Ok(Ok(snap)) => Ok(GetResult::Specified {
                         native,
                         req_type: rt,
@@ -930,7 +932,12 @@ async fn main() {
                             }
                         })
                     };
-                    match tokio::time::timeout(t, ch.get_with_dbr_type(rt, req_count)).await {
+                    match epics_base_rs::runtime::task::timeout(
+                        t,
+                        ch.get_with_dbr_type(rt, req_count),
+                    )
+                    .await
+                    {
                         Ok(Ok(snap)) => Ok(if want_time {
                             GetResult::Time(Box::new(snap))
                         } else {
@@ -948,7 +955,7 @@ async fn main() {
                             GetResult::Time(Box::new(zero_dbr_snapshot(b, n)))
                         })
                     };
-                    match tokio::time::timeout(
+                    match epics_base_rs::runtime::task::timeout(
                         t,
                         ch.get_with_metadata_count(DbrClass::Time, req_count),
                     )
@@ -988,8 +995,8 @@ async fn main() {
     for h in handles {
         results.push(h.await.unwrap());
     }
-    // C's ONE stderr warning for a timed-out read phase (`caget.c:224-226`,
-    // `:238-239`) — it does not name the PV and does not stop the print loop.
+    // C's ONE stderr warning for a timed-out read phase (`caget.c:229-231`,
+    // `:243-244`) — it does not name the PV and does not stop the print loop.
     if results.iter().any(|r| r.timed_out) {
         eprintln!("Read operation timed out: some PV data was not read.");
     }
@@ -997,7 +1004,7 @@ async fn main() {
     let sep = fmt.field_separator;
     // C's `reqElems` feeds BOTH the plain/terse count-prefix gate
     // (`caget.c:286`) and the `-S` long-string gate on every block
-    // (`caget.c:273,318`); the specifiedDbr Value loop takes the second but
+    // (`caget.c:274,320`); the specifiedDbr Value loop takes the second but
     // not the first (`CountPrefix::Never`). Both read it off `fmt`, which is
     // now its only carrier.
     // Mirror C `caget.c::main` (line 260): pad the PV name column to
@@ -1080,7 +1087,7 @@ async fn main() {
             }
         }
     }
-    // C `caget.c:227`: `if (!nConn) return 1` — `nConn` counts the PVs that
+    // C `caget.c:224`: `if (!nConn) return 1` — `nConn` counts the PVs that
     // were still connected when the read was issued, and it is the ONLY thing
     // that can make the read phase fail. Past that gate `caget()` returns 0
     // unconditionally (`caget.c:348`), so a read-access denial, a CA error, or
@@ -1148,8 +1155,8 @@ mod tests {
         zero_dbr_value,
     };
     use epics_ca_rs::copt::scan_i32;
-    use epics_ca_rs::protocol::{ECA_NORDACCESS, eca_message};
-    use epics_ca_rs::{CaError, DbFieldType, EpicsValue};
+    use epics_ca_rs::protocol::{ECA_BADTYPE, ECA_GETFAIL, ECA_NORDACCESS, eca_message};
+    use epics_ca_rs::{CaError, CaOp, DbFieldType, EpicsValue};
     use std::time::SystemTime;
 
     fn mode_of(argv: &[&str]) -> OutputMode {
@@ -1366,6 +1373,64 @@ mod tests {
         }
     }
 
+    /// A failed READ names the read: `*** CA error Channel read request
+    /// failed`, never the write.
+    ///
+    /// C decides this by DIRECTION, not by which database error came back.
+    /// `read_action` answers any negative `dbChannel_get` with `ECA_GETFAIL`
+    /// (`camessage.c:647-651` @R7.0.10) and `write_action` answers any
+    /// negative `dbChannel_put` with `ECA_PUTFAIL` (`:781-789`), each
+    /// discarding the `dbStatus`, so the SAME refusal has two right answers
+    /// and only the direction picks between them.
+    ///
+    /// `CaError::to_eca_status` used to take no direction and default to
+    /// `ECA_PUTFAIL`, which is a put default: every database refusal that
+    /// reached `caget` — and that is every one of them, since `read_error` is
+    /// only ever called on a get — printed "Channel write request failed"
+    /// (`access.cpp:76`) for a request that wrote nothing.
+    #[test]
+    fn a_failed_read_reports_the_read_not_the_write() {
+        // One from each shape the old table answered PUTFAIL: the explicit
+        // put arms, and the variants that reached the catch-all.
+        for e in [
+            CaError::BadDbrType("REC.TIME".into()),
+            CaError::FieldNotFound("REC.NOSUCH".into()),
+            CaError::BadField("REC.CALC".into()),
+            CaError::ChannelNotFound("REC".into()),
+            CaError::Protocol("bad frame".into()),
+            // ECA_BADTYPE was hand-carried for this one, so it did not even
+            // reach the put default — it named the wire type for a value the
+            // database refused.
+            CaError::InvalidValue("32768 overflows DBF_SHORT".into()),
+        ] {
+            assert_eq!(
+                read_error(&e).marker(),
+                format!("*** CA error {}", eca_message(ECA_GETFAIL)),
+                "a get that failed must report the get: {e:?}"
+            );
+        }
+
+        // A get conversion the database refused already answered GETFAIL by a
+        // hand-carried arm; it must keep doing so now that the direction
+        // decides.
+        assert_eq!(
+            read_error(&CaError::GetConvertFailed("cvt_st_d".into())).marker(),
+            format!("*** CA error {}", eca_message(ECA_GETFAIL))
+        );
+
+        // Above the database, the word does not change with direction: the
+        // peer's own status still round-trips, and libca's local type gate
+        // still says ECA_BADTYPE.
+        assert_eq!(
+            read_error(&CaError::ServerError(ECA_NORDACCESS)).marker(),
+            "*** no read access"
+        );
+        assert_eq!(
+            read_error(&CaError::TypeMismatch("VAL".into())).marker(),
+            format!("*** CA error {}", eca_message(ECA_BADTYPE))
+        );
+    }
+
     /// C `caget.c:262-268`: a post-gate read failure prints a `*** ...`
     /// marker whose text comes straight from the PV's ECA status —
     /// `ECA_NORDACCESS` is spelled out, every other status goes through
@@ -1388,7 +1453,7 @@ mod tests {
         );
         // Any other ECA status renders C's `ca_message` text.
         let e = CaError::Protocol("bad frame".into());
-        let status = e.to_eca_status();
+        let status = e.to_eca_status(CaOp::Read);
         assert_eq!(
             read_error(&e).marker(),
             format!("*** CA error {}", eca_message(status)),
@@ -1396,7 +1461,7 @@ mod tests {
         );
     }
 
-    /// C `caget.c:227,348`: `if (!nConn) return 1` is the ONLY non-zero
+    /// C `caget.c:224,348`: `if (!nConn) return 1` is the ONLY non-zero
     /// return of the read phase — `nConn` counts the PVs still connected when
     /// the read was issued. A read-access denial, a CA error or a read timeout
     /// on a CONNECTED PV therefore exits 0, and so does a disconnect as long
@@ -1779,7 +1844,7 @@ mod tests {
     }
 
     // `-d` takes a numeric DBR code or a mnemonic; the numeric branch is
-    // C `sscanf(optarg, "%d", &type)` (caget.c:454), which is now the shared
+    // C `sscanf(optarg, "%d", &type)` (caget.c:418), which is now the shared
     // owner `copt::scan_i32`.
     #[test]
     fn dbr_type_number_scan_matches_sscanf_d() {

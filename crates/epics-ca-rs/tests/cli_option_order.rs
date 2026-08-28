@@ -3,7 +3,7 @@
 //!
 //! C processes options STRICTLY in argv order (`caget.c:398`, and the identical
 //! loops in the other three tools), and `case 'h'` / `case 'V'` `return` from
-//! `main` the moment the loop reaches them (`caget.c:399-404`). Two consequences
+//! `main` the moment the loop reaches them (`caget.c:399-405`). Two consequences
 //! fall straight out of that single loop:
 //!
 //! ```text
@@ -73,7 +73,7 @@ fn an_option_after_help_is_never_scanned() {
     }
 }
 
-/// `case 'V'` returns from `main` exactly as `case 'h'` does (`caget.c:402-404`).
+/// `case 'V'` returns from `main` exactly as `case 'h'` does (`caget.c:403-405`).
 #[test]
 fn version_ends_the_loop_where_it_stands() {
     for (bin, tool) in tools() {

@@ -6,7 +6,7 @@ use epics_ca_rs::cli::{
 };
 use epics_ca_rs::client::{CaChannel, CaClient, enum_string_readback_dbr};
 use epics_ca_rs::copt::{self, CTool};
-use epics_ca_rs::{CaError, DbFieldType, EpicsValue};
+use epics_ca_rs::{CaError, CaOp, DbFieldType, EpicsValue};
 use std::time::SystemTime;
 
 /// One `Old : ...` / `New : ...` line in long-mode shape:
@@ -18,7 +18,7 @@ fn long_line(name_col: &str, sep: char, snap: &Snapshot, fmt: &ValueFormat) -> S
     // C `caput.c:535,583` calls its `caget()` with `reqElems = 0`, so the
     // count prefix reduces to `nElems > 1` and the `-S` long-string gate to
     // `reqElems(0) || reqElems_pv > 1`. C's readback call is literally
-    // `caget(pvs, nPvs, format, 0, 0)` (`caput.c:537`) — `reqElems` is a
+    // `caget(pvs, nPvs, format, 0, 0)` (`caput.c:535`) — `reqElems` is a
     // hardcoded 0 — which is why `caput` never sets `ValueFormat::req_elems`
     // even though `-#` is accepted on the command line (its value is
     // overwritten before the put, `caput.c:418,441`).
@@ -108,7 +108,7 @@ fn readback_line(
         }
         Readback::Disconnected => None,
         Readback::Other(e) => {
-            let marker = ca_error_marker(e.to_eca_status());
+            let marker = ca_error_marker(e.to_eca_status(CaOp::Read));
             Some(if terse {
                 marker
             } else if long_mode {
@@ -318,7 +318,7 @@ async fn main() {
     let callback = args.callback > 0;
 
     // C's ENTIRE getopt loop runs before the `nPvs < 1` / `nPvs < 2` checks
-    // (`caput.c:290-455`, then `:457`), so every option argument is scanned —
+    // (`caput.c:290-370`, then `:374`), so every option argument is scanned —
     // and every warning raised — even when no PV name or value follows.
     let mut scan = parsed.scan();
     Args::scan_dead_element_count(&mut scan);
@@ -335,7 +335,7 @@ async fn main() {
     // no effect — matching C `caput`, where enumAsNr / enumAsString
     // only gate the DBR_ENUM branch.
 
-    // C `caput.c:457-465`: PV name first, then value — both are post-getopt
+    // C `caput.c:374-381`: PV name first, then value — both are post-getopt
     // checks with C's own one-line diagnostic and status 1.
     let Some(pv_name) = args.pv_name else {
         TOOL.no_pv_name();
@@ -450,7 +450,7 @@ async fn main() {
         pv_name.clone()
     };
 
-    // C caput.c:531-535 gates the pre-put "Old :" read+print on
+    // C caput.c:532-535 gates the pre-put "Old :" read+print on
     // `if (format != terse)`. Terse mode prints only the new value, so the
     // pre-put GET must NOT be issued: C never issues it, and a PV that is slow
     // to read, read-denied before a write-side access transition, or backed by
@@ -466,7 +466,7 @@ async fn main() {
     // the PUT report the disconnect.
     // Build (and VALIDATE) the value to write BEFORE the `Old :` read+print.
     // C's order is not incidental: the enum/number parse sits at
-    // `caput.c:466-530` and every failure in it `return 1`s on the spot, so
+    // `caput.c:467-530` and every failure in it `return 1`s on the spot, so
     // the `Old : ` block at `:531-535` is never reached (R13-22):
     //
     //     caput TST:MBBO Bogus
@@ -608,7 +608,7 @@ enum WriteValue {
     /// An explicit-wire-type write: the tool picks the DBR wire type and
     /// the server converts to the native field type. C `caput` sends a
     /// non-ENUM value as `DBR_STRING` (`caput.c:540-552`) and an `-S`
-    /// long string as `DBR_CHAR` (`caput.c:531-538`), never the native
+    /// long string as `DBR_CHAR` (`caput.c:532-538`), never the native
     /// binary type. Routed through `CaChannel::put_as_dbr_*`.
     Wire {
         dbr_type: u16,
@@ -809,7 +809,7 @@ fn raw_from_escaped_string(s: &str) -> epics_ca_rs::PvString {
 }
 
 /// Build the value to write, in C `caput`'s precedence order
-/// (`caput.c:454-530`): the ENUM field type is handled FIRST, then `-S`
+/// (`caput.c:455-530`): the ENUM field type is handled FIRST, then `-S`
 /// (charArrAsStr → DBR_CHAR) for a NON-ENUM PV, then the DBR_STRING /
 /// numeric paths. `-a` (array) resets charArrAsStr in C (`caput.c:318`),
 /// so the array path takes precedence over `-S`. String- and char-array-
@@ -886,7 +886,7 @@ fn build_write_value(
 
     // (2) `-S` (charArrAsStr) on a NON-ENUM PV → NUL-terminated DBR_CHAR
     // array built from the escape-decoded bytes, sent with the explicit
-    // DBR_CHAR wire type and count = nbytes + NUL (caput.c:531-538:
+    // DBR_CHAR wire type and count = nbytes + NUL (caput.c:532-538:
     // `dbrType = DBR_CHAR; count = epicsStrnRawFromEscaped(...) + 1`).
     // The wire type must be DBR_CHAR regardless of the channel native
     // type — sending these char bytes under the native header

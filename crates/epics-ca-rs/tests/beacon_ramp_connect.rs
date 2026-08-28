@@ -1,7 +1,7 @@
 //! R6-30 — a TCP connect/disconnect must not restart the beacon ramp.
 //!
 //! C `rsrv_online_notify_task` sets the ramp's initial period exactly once, at
-//! task start (`online_notify.c:68` `delay = 0.02`), and restarts it in exactly
+//! task start (`online_notify.c:66` `delay = 0.02`), and restarts it in exactly
 //! one other place: the `beacon_ctl == ctlPause` wait loop
 //! (`online_notify.c:126-129`). Accepting or losing a client connection never
 //! touches it. The port pulsed `beacon_reset` on every accept and every
@@ -9,12 +9,7 @@
 //! 20 ms ramp and, with R6-23's libca anomaly bands installed, makes every
 //! other client of that server flag ShortPeriod beacon anomalies.
 
-// Host/tokio-only: builds the async `CaClient`/`CaServer` stack in process.
-// Under `rtems-exec-model` the `runtime::task` seam routes their `spawn`
-// to the background executor, whose worker has no tokio reactor, so the
-// listener/transport tasks panic. The RTEMS model serves from
-// `BlockingCaServer` instead, so this path is inapplicable there.
-#![cfg(not(feature = "rtems-exec-model"))]
+#![cfg(tokio_backend)]
 
 use std::net::TcpStream;
 use std::time::{Duration, Instant};

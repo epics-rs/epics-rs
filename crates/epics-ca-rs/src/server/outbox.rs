@@ -55,14 +55,14 @@
 //!
 //! Monitor producers are not. They pull from their own `EvQue` on their own
 //! task, so with an unbounded queue a client that stops reading grows the
-//! server without limit — measured at 9.34 kB/s for one 100 Hz subscription
-//! (`doc/ca-stuck-reader-measurement.md`). Credit is what puts the socket back
-//! in that loop: with none available the producer stops taking events out of
-//! its ring, and the ring — which is bounded and coalesces, replacing a
-//! monitor's last entry in place — absorbs the backlog. That is C's shape,
-//! where `event_task` blocks on `SEND_LOCK` in front of a bounded `dbEvent`
-//! ring, and it is what the blocking driver gets for free by writing the
-//! socket directly under `send_lock` (`server::blocking`).
+//! server without limit — measured at 9.34 kB/s for one 100 Hz subscription.
+//! Credit is what puts the socket back in that loop: with none available the
+//! producer stops taking events out of its ring, and the ring — which is
+//! bounded and coalesces, replacing a monitor's last entry in place — absorbs
+//! the backlog. That is C's shape, where `event_task` blocks on `SEND_LOCK` in
+//! front of a bounded `dbEvent` ring, and it is what the blocking driver gets
+//! for free by writing the socket directly under `send_lock`
+//! (`server::blocking`).
 //!
 //! Credit is taken *after* an event leaves the ring, never before: a producer
 //! waiting for its next event must hold nothing, or a connection with more
@@ -98,6 +98,74 @@ impl Credit {
     /// already bounded by it. See the module invariant.
     pub(crate) fn none() -> Self {
         Credit { _permit: None }
+    }
+}
+
+/// Delivery capability for ONE subscription, revoked when it is cancelled.
+///
+/// C `db_cancel_event` (`dbEvent.c:706-742`) nulls `pevent->user_sub` under
+/// LOCKEVQUE and, when a callback for that subscription is already running,
+/// blocks in `db_sync_event` until the event task has passed it; only then
+/// does `event_cancel_reply` (`camessage.c:2022-2040`) take SEND_LOCK and
+/// write the delete-confirmed echo. So in C no monitor frame for a
+/// subscription can reach the socket after its cancel confirmation, and every
+/// update still queued for it is discarded rather than delivered — the
+/// `user_sub` test runs under LOCKEVQUE on each drained log.
+///
+/// The port cannot reproduce the *waiting* half: the connection loop is the
+/// sole [`OutboxDrain`] owner, so blocking it until an in-flight monitor task
+/// finishes would deadlock against [`Outbox::reserve`] — the producer is
+/// waiting for credit only that loop releases. This gate keeps the half a
+/// client can observe. Revocation and the delivery decision share one
+/// critical section, so a producer that has not yet enqueued its frame when
+/// the confirmation is queued drops it instead of emitting it late.
+///
+/// The deviation this leaves is one direction only: a frame C would have
+/// completed (because it waited for the in-progress callback) is dropped
+/// here. C already discards every *queued* update at cancel, so a client
+/// loses at most the one delivery that was mid-flight on a monitor it just
+/// asked to stop.
+///
+/// # Invariant
+///
+/// - MUST: [`revoke`](MonitorGate::revoke) happens-before the subscription's
+///   confirmation frame is queued, and every monitor frame is enqueued inside
+///   [`deliver`](MonitorGate::deliver). Nothing else may write a monitor frame
+///   for a gated subscription.
+#[derive(Clone)]
+pub(crate) struct MonitorGate {
+    /// `true` until the subscription is cancelled. A mutex and not an
+    /// `AtomicBool` because the flag alone cannot order anything: a producer
+    /// that loaded `true` and was then descheduled would still enqueue after
+    /// the confirmation. Held across the enqueue (async) or the socket write
+    /// (blocking driver) so the decision and the byte hand-off are one step.
+    live: Arc<parking_lot::Mutex<bool>>,
+}
+
+impl MonitorGate {
+    /// A live gate for a newly registered subscription.
+    pub(crate) fn open() -> Self {
+        MonitorGate {
+            live: Arc::new(parking_lot::Mutex::new(true)),
+        }
+    }
+
+    /// Run `deliver` — which MUST be the whole build-and-enqueue (or
+    /// build-and-write) of one monitor frame — unless the subscription has
+    /// been cancelled. `None` means it had been, and the frame was dropped.
+    pub(crate) fn deliver<R>(&self, deliver: impl FnOnce() -> R) -> Option<R> {
+        let live = self.live.lock();
+        if !*live {
+            return None;
+        }
+        Some(deliver())
+    }
+
+    /// Retire this subscription. After this returns, no further
+    /// [`deliver`](MonitorGate::deliver) can emit — so the caller may queue
+    /// the cancel confirmation knowing nothing can follow it.
+    pub(crate) fn revoke(&self) {
+        *self.live.lock() = false;
     }
 }
 
@@ -227,8 +295,8 @@ impl OutboxDrain {
     ///
     /// Used only by the async connection loop (`tcp::handle_client`); the
     /// blocking driver drains synchronously via [`OutboxDrain::try_next`].
-    /// Host-only (not `epics_embedded_target`).
-    #[cfg(not(epics_embedded_target))]
+    /// Reactor-only (`tokio_backend`).
+    #[cfg(tokio_backend)]
     pub(crate) async fn recv(&mut self) -> Option<QueuedFrame> {
         self.rx.recv().await
     }

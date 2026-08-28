@@ -2,7 +2,7 @@
 //! host name, not the dotted IP.
 //!
 //! C prints `ca_host_name(chid)` (`cainfo.c:101`), which reads the circuit's
-//! `hostNameCache` — libcom's `ipAddrToA` (`osiSock.c:92-114`): `getnameinfo`
+//! `hostNameCache` — libcom's `ipAddrToA` (`osiSock.c:92-113`): `getnameinfo`
 //! with `NI_NAMEREQD`, then `:<port>` appended, and the dotted IP only when the
 //! address has no PTR record. Head-to-head against a softIoc on the loopback:
 //!
@@ -14,12 +14,7 @@
 //! The port was printing the raw peer `SocketAddr`, so every `cainfo` on a
 //! resolvable IOC differed from C on the field operators grep most.
 
-// Host/tokio-only: drives the async `caget`/`caput` CLI binaries out of
-// process. Those binaries are built with this feature too, so their
-// `CaClient` stack routes `spawn` to the background executor and then
-// reaches tokio I/O with no reactor. Inapplicable under the executor
-// backend; the RTEMS model has no async CLI client.
-#![cfg(not(feature = "rtems-exec-model"))]
+#![cfg(tokio_backend)]
 // …and `client`, because the reverse-resolved name IS the `hostname` module
 // (`lib.rs`, `#[cfg(feature = "client")]`). `client-core` naming a peer by its
 // dotted address is that feature's stated behaviour, not a regression, so this

@@ -134,14 +134,6 @@ client-core = []
 # a dependency that does not build for `armv7-rtems-eabihf`; none of them is
 # reachable from a record link.
 client = ["client-core"]
-# Host-selectable RTEMS execution model — passthrough to
-# `epics-base-rs/rtems-exec-model`. Routes the `runtime::task` seam to the
-# std-thread background executor on a hosted target, so the blocking CA
-# server driver's async record-processing completion runs on the executor
-# (callback pool + delayed timer + scanOnce) instead of a tokio runtime —
-# the same backend the RTEMS build uses. OFF by default; the hosted default
-# is byte-identical without it. See `crates/epics-base-rs/build.rs`.
-rtems-exec-model = ["epics-base-rs/rtems-exec-model"]
 # The RTEMS bring-up measurement rig (doc/calink-rtems-design.md §6 stage C6,
 # gated by §11.7 item 3): the 14 C6 probe records in `realtime-ca-ioc`'s built-in
 # database, its two probe threads (the tick task and the `c6-probe` reporter),
@@ -220,11 +212,20 @@ cap-tokens = [
 epics-rtems-boot = { workspace = true }
 
 [dev-dependencies]
+# Dev-only and `path`-only, so `cargo package` drops it from the uploaded
+# manifest: the source guards in this crate share one production-slice rule.
+source-guard = { path = "../source-guard" }
+# Dev-only and `path`-only: the shared rule for a test that must NAME the port
+# its subject binds, so a number lost between the probe and the bind is a retry
+# and not a red test. Shared rather than copied because asyn-rs and epics-ca-rs
+# cannot see each other's `tests/`, and two copies of a retry rule are two
+# chances to retry on the wrong evidence.
+named-port = { path = "../named-port" }
 # Dev-only, path-only (no `version`, so `cargo publish` strips the entry
-# entirely): the shared `rtems-exec-model` test-gating census, called by
+# entirely): the shared exec-backend test-gating census, called by
 # `tests/rtems_exec_model_gate.rs`. Shared rather than copied because every
-# crate that declares the feature has the same hole, and three copies of a
-# 300-line audit is how three copies of a rule come to disagree.
+# crate that derives the backend has the same hole, and a 300-line audit
+# copied once per crate is how copies of a rule come to disagree.
 rtems-exec-gate = { path = "../../tools/rtems-exec-gate" }
 # Dev-only: `#[epics_test]` — the backend-selected test driver — for this
 # crate's own suite.
@@ -244,9 +245,13 @@ tokio = { version = "1", features = ["test-util"] }
 name = "protocol_bench"
 harness = false
 
+# `required-features` rather than a file-level `#![cfg]`: a `harness = false`
+# bench must define `main`, so cfg-ing the file away leaves an empty crate and
+# E0601 instead of a skipped target.
 [[bench]]
 name = "end_to_end_bench"
 harness = false
+required-features = ["client-core"]
 
 # The only example, and it plugs a custom `discovery::Backend` into
 # `CaClientConfig` — both of which the full `client` feature owns.
@@ -282,6 +287,7 @@ path = "src/bin/ca-repeater-rs.rs"
 [[bin]]
 name = "softioc-rs"
 path = "src/bin/softioc-rs.rs"
+required-features = ["client-core"]
 
 [[bin]]
 name = "ca-replay-rs"
@@ -295,15 +301,18 @@ path = "src/bin/ca-lint-rs.rs"
 name = "ca-admin-rs"
 path = "src/bin/ca-admin-rs.rs"
 
-# The RTEMS CA IOC entry point (design doc §9.5). Deliberately NOT given
-# `required-features`: it must be built by a bare `cargo check --bin
-# realtime-ca-ioc --target armv7-rtems-eabihf`, and a `required-features` gate
-# would make cargo silently *skip* the target instead, turning the RTEMS
-# gate into a vacuous pass. Under the hosted default backend it compiles and
-# is linted, but refuses to run (see the module docs).
+# The RTEMS CA IOC entry point (design doc §9.5). It mounts the `ca://` link
+# resolver, so it needs `client-core` like every other binary that names
+# `epics_ca_rs::calink`. The gate does not make the RTEMS row vacuous: that row
+# issues an explicit `--bin realtime-ca-ioc`, where an unmet `required-features`
+# is a hard error rather than a silent skip (silent skip is the plural forms
+# only), and `scripts/rtems-check.sh` supplies the feature from
+# `CRATE_FEATURES[epics-ca-rs]`. `realtime-pva-ioc` already carries its own
+# `required-features` on exactly that reasoning.
 [[bin]]
 name = "realtime-ca-ioc"
 path = "src/bin/realtime-ca-ioc.rs"
+required-features = ["client-core"]
 
 [[bin]]
 name = "ca-soak"

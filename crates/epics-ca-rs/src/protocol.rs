@@ -28,21 +28,21 @@ pub const CA_PROTO_CREATE_CH_FAIL: u16 = 26;
 
 /// C `caProto.h:34` `CA_MINIMUM_SUPPORTED_VERSION`. A non-VERSION message
 /// from a peer below this minor version is answered with ECA_DEFUNCT and
-/// drained (`camessage.c:2489-2513`); a TCP VERSION below it is dropped
+/// drained (`camessage.c:2427-2445`); a TCP VERSION below it is dropped
 /// (`tcp_version_action`, `camessage.c:366-369`).
 pub const CA_MINIMUM_SUPPORTED_VERSION: u16 = 4;
 
 /// **The one owner of "does this message declare a version we still serve?"**
 ///
 /// C `CA_VSUPPORTED` (`caProto.h:35`), and it gates four handlers:
-/// `tcp_version_action` (`camessage.c:371`), `udp_version_action` (`:2152`),
-/// `search_reply_udp` (`:2205`) and `search_reply_tcp` (`:2292`). All four
+/// `tcp_version_action` (`camessage.c:366`), `udp_version_action` (`:2098`),
+/// `search_reply_udp` (`:2151`) and `search_reply_tcp` (`:2238`). All four
 /// read `mp->m_count` — the version the message in hand declares — and all
 /// four answer `RSRV_ERROR`, which stops the server reading from that peer.
 ///
 /// It takes the header rather than a number on purpose. The other version a
 /// CA server holds is the one its circuit negotiated
-/// (`client->minor_version_number`, the framing gate at `camessage.c:2489`),
+/// (`client->minor_version_number`, the framing gate at `camessage.c:2427`),
 /// they are both `u16`, and reading that one here is exactly the defect this
 /// signature makes unwritable: a SEARCH may arrive on a circuit whose
 /// handshake said something else entirely, and C answers the frame.
@@ -54,10 +54,10 @@ pub fn declares_supported_version(hdr: &CaHeader) -> bool {
 ///
 /// C has no third category: every one of `tcpJumpTable`'s 28 slots is either
 /// a real handler or `bad_tcp_cmd_action`, and any index at or past its end
-/// is `bad_tcp_cmd_action` too (`rsrv/camessage.c:2348-2377`, dispatched at
-/// `:2587-2594`). An illegal opcode is answered `ECA_INTERNAL` "invalid
+/// is `bad_tcp_cmd_action` too (`rsrv/camessage.c:2294-2323`, dispatched at
+/// `:2519-2526`). An illegal opcode is answered `ECA_INTERNAL` "invalid
 /// (damaged?) request code from TCP" and the circuit is torn down
-/// (`camessage.c:342-357`).
+/// (`camessage.c:337-352`).
 ///
 /// This exists because "not a legal CA opcode" and "legal, but this driver
 /// does not route it" are different facts that had been conflated into one
@@ -87,7 +87,7 @@ pub fn is_legal_tcp_command(cmmd: u16) -> bool {
     )
 }
 
-/// C's text at `camessage.c:344`.
+/// C's text at `camessage.c:340`.
 pub(crate) const BAD_TCP_COMMAND_DIAGNOSTIC: &str = "invalid (damaged?) request code from TCP";
 
 // Ports — re-exported from the one owner, `epics-base-rs`, which const-derives
@@ -96,7 +96,7 @@ pub use epics_base_rs::runtime::net::{CA_REPEATER_PORT, CA_SERVER_PORT};
 
 /// Resolved CA repeater UDP port. Mirrors libca
 /// `envGetInetPortConfigParam(&EPICS_CA_REPEATER_PORT, …)` (e.g.
-/// `repeater.cpp:511`, `udpiiu.cpp:168`, `casw.cpp:103`) by delegating to
+/// `repeater.cpp:499`, `udpiiu.cpp:168`, `casw.cpp:103`) by delegating to
 /// the one owner of that C function,
 /// [`epics_base_rs::runtime::net::ca_repeater_port`]: the env var takes
 /// precedence, a value that fails to parse or falls outside
@@ -352,7 +352,7 @@ pub const CONTIGUOUS_FRAMES_TRIGGERING_FLOW_CONTROL: usize = 10;
 ///
 /// C computes the identical value twice under two names, from the same
 /// parameter: `cac::maxRecvBytesTCP` (`cac.cpp:196-217`) and
-/// `rsrvSizeofLargeBufTCP` (`caservertask.c:510-531`). Room for the extended
+/// `rsrvSizeofLargeBufTCP` (`caservertask.c:511-532`). Room for the extended
 /// header (`sizeof(caHdr) + 2 * sizeof(ca_uint32_t)` = 24) is added so the
 /// operator gets the array size they asked for, and the result is floored at
 /// [`MAX_TCP`] (C errlogs "was rounded up to %u"). A rejected value leaves the
@@ -377,7 +377,7 @@ pub fn max_array_bytes_buffer() -> usize {
 /// literally `epicsStrCaseCmp(text, "yes") == 0` — so ONLY the word "yes"
 /// (any case) enables it. `EPICS_CA_AUTO_ARRAY_BYTES=1` disables it, quirk
 /// included. `unwrap_or(true)` is C's own `if (envGetBoolConfigParam(...))
-/// autoMaxBytes = 1;` (`caservertask.c:534-535`), not a second copy of the
+/// autoMaxBytes = 1;` (`caservertask.c:535-536`), not a second copy of the
 /// table default.
 pub fn auto_array_bytes() -> bool {
     epics_base_rs::runtime::env_table::EPICS_CA_AUTO_ARRAY_BYTES
@@ -417,7 +417,7 @@ pub fn max_frame_body_bytes() -> usize {
 }
 
 /// C `cac::maxContiguousFrames` (`modules/ca/src/client/cac.cpp:233-237`,
-/// read back at `cac.h:419`).
+/// read back at `cac.h:418`).
 ///
 /// The number of consecutive receive frames that must each leave bytes
 /// still pending in the OS socket buffer before libca declares the circuit
@@ -509,7 +509,7 @@ fn max_read_elements(dbr_size: u64, value_size: u64, peer_minor: u16) -> u64 {
 /// Wire element count for a `CA_PROTO_READ_NOTIFY` framed for `peer_minor`,
 /// or `ECA_TOLARGE` when the request exceeds what the circuit can carry.
 ///
-/// Mirrors C `tcpiiu::readNotifyRequest` (`tcpiiu.cpp:1455-1484`) in its
+/// Mirrors C `tcpiiu::readNotifyRequest` (`tcpiiu.cpp:1456-1484`) in its
 /// order: the element bound is checked against the count the CALLER asked
 /// for, and only then is a zero substituted for a pre-V413 peer —
 /// `if (nElem == 0 && !CA_V413(minor)) nElem = chan.getcount();`
@@ -731,8 +731,8 @@ impl CaHeader {
     /// Whether this header uses extended form.
     ///
     /// Wire detection is by `postsize == 0xFFFF` alone, matching C
-    /// `tcpiiu.cpp::processIncoming` (line 1168), `cac.cpp:1097`, and
-    /// `rsrv/camessage.c:2464`. The `count == 0` field is set by the
+    /// `tcpiiu.cpp::processIncoming` (line 1168), `cac.cpp:1095`, and
+    /// `rsrv/camessage.c:2410`. The `count == 0` field is set by the
     /// emit-side per the spec but is NOT checked on receive — a peer
     /// sending garbage in `m_count` of an extended header is still
     /// correctly parsed by C. We mirror C's lenient receive behavior.
@@ -859,7 +859,7 @@ impl CaHeader {
         let mut consumed = 16;
 
         // C parity: extended-form detection is `m_postsize == 0xffff`
-        // alone — see `tcpiiu.cpp:1168`, `cac.cpp:1097`, and
+        // alone — see `tcpiiu.cpp:1168`, `cac.cpp:1095`, and
         // `rsrv/camessage.c:2410`. The `m_count == 0` half was an
         // overly-strict Rust addition that rejected legal extended
         // headers if a peer left non-zero garbage in `m_count`.
@@ -876,7 +876,7 @@ impl CaHeader {
             // — and what to do at it — belongs to whichever loop owns the
             // receive buffer: the client applies [`max_recv_body_bytes`] and
             // drains, the server applies its own `maxstk` check and replies
-            // ECA_TOLARGE (`camessage.c:2539-2556`, `server/tcp.rs`).
+            // ECA_TOLARGE (`camessage.c:2471-2488`, `server/tcp.rs`).
             hdr.extended_postsize = Some(ext_post);
             hdr.extended_count = Some(ext_count);
             consumed = 24;
@@ -892,7 +892,7 @@ impl CaHeader {
     /// `CA_V49(client->minor_version_number) && msg.m_postsize ==
     /// 0xffff`. A pre-V49 peer that sends `m_postsize == 0xffff` takes
     /// the else branch, so `msgsize = 0xffff + 16 = 65551`, which fails
-    /// the `msgsize & 0x7` alignment test at `camessage.c:2520` and gets
+    /// the `msgsize & 0x7` alignment test at `camessage.c:2452` and gets
     /// "CAS: Missaligned protocol rejected" (ECA_INTERNAL) + disconnect.
     /// Reproduce that by keeping `postsize = 0xFFFF` on the plain header
     /// and letting the caller's alignment check reject it — never by
@@ -926,9 +926,9 @@ mod tests {
     use super::*;
 
     /// [`is_legal_tcp_command`] is a transcription of C's `tcpJumpTable`
-    /// (`rsrv/camessage.c:2348-2377`). Pinned against the table's own shape:
+    /// (`rsrv/camessage.c:2294-2323`). Pinned against the table's own shape:
     /// 28 slots, of which these indices are `bad_tcp_cmd_action`, and every
-    /// index at or past the end is too (`camessage.c:2594-2596`).
+    /// index at or past the end is too (`camessage.c:2526-2528`).
     #[test]
     fn legal_tcp_commands_are_c_s_jump_table() {
         const BAD_SLOTS: [u16; 12] = [5, 7, 11, 13, 14, 16, 17, 22, 24, 25, 26, 27];

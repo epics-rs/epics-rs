@@ -175,7 +175,7 @@ struct Args {
     field_separator: Vec<String>,
 
     /// PV names to monitor. NOT clap-`required` — see `caget-rs`; C checks
-    /// `nPvs < 1` after the getopt loop (`camonitor.c:604-608`).
+    /// `nPvs < 1` after the getopt loop (`camonitor.c:363-367`).
     pv_names: Vec<String>,
 }
 
@@ -226,7 +226,7 @@ async fn main() {
     let args = Args::from_arg_matches(matches).expect("clap validated the arguments");
 
     // C's ENTIRE getopt loop runs before the `nPvs < 1` check
-    // (`camonitor.c:224-600`, then `:604`), so every option argument is
+    // (`camonitor.c:224-359`, then `:363`), so every option argument is
     // scanned — and every warning raised — even when no PV name follows.
     // `value_format` scans `-#`, `-e`/`-f`/`-g`, `-0`/`-l` and `-F`; the four
     // below cover the rest. `-m` and `-t` are bare re-scans: every occurrence

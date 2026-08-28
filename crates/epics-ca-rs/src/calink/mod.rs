@@ -8,9 +8,9 @@
 //!
 //! This is the CA-side counterpart of the bridge `pvalink` module. It
 //! mirrors C `dbCa.c` / `dbCaLink`: each CA link attaches one CA channel
-//! and one subscription; `dbCaGetLink` (`dbCa.c:448`) is served from the
+//! and one subscription; `dbCaGetLink` (`dbCa.c:419`) is served from the
 //! cached value populated by the monitor `eventCallback`
-//! (`dbCa.c:925`) — a CA link is **monitor-backed**, served from
+//! (`dbCa.c:891`) — a CA link is **monitor-backed**, served from
 //! cache, never a synchronous per-read fetch.
 //!
 //! ## Why this lives in `epics-ca-rs`
@@ -38,11 +38,14 @@
 //! ```ignore
 //! use epics_ca_rs::calink::calink_link_set_install;
 //!
-//! IocApplication::new()
-//!     .startup_script("st.cmd")
-//!     .register_link_set_installer(calink_link_set_install)
-//!     .run(epics_ca_rs::server::run_ca_ioc)
-//!     .await
+//! // `run_ca_ioc_app`, not `IocApplication::run(run_ca_ioc)`: it runs C's
+//! // `rsrvRegistrar` before the startup script, which the runner cannot.
+//! epics_ca_rs::server::run_ca_ioc_app(
+//!     IocApplication::new()
+//!         .startup_script("st.cmd")
+//!         .register_link_set_installer(calink_link_set_install),
+//! )
+//! .await
 //! ```
 //!
 //! The lower-level [`crate::calink::install_calink_resolver`] is also available for

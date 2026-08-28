@@ -71,7 +71,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     let timeout = Duration::from_secs(args.timeout);
-    let (status, body) = tokio::time::timeout(timeout, do_request(&host, method, path)).await??;
+    let (status, body) =
+        epics_base_rs::runtime::task::timeout(timeout, do_request(&host, method, path)).await??;
     println!("{body}");
     if !(200..300).contains(&status) {
         std::process::exit(1);

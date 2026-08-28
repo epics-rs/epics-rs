@@ -22,7 +22,7 @@
 //! 3. **`ca://` record links** —
 //!    [`install_calink_resolver`](epics_ca_rs::calink::install_calink_resolver)
 //!    mounts the CA external record-link resolver on the database (C
-//!    `dbCaLinkInit`, `dbCa.c:1071`), so a ` CA`-modified or `ca://...`
+//!    `dbCaLinkInit`, `dbCa.c:352-355`), so a ` CA`-modified or `ca://...`
 //!    INP/OUT field resolves through a live `CaClient`. The client binds the
 //!    UDP SEARCH socket and additionally dials `EPICS_CA_NAME_SERVERS` over
 //!    TCP, as it does on a host — see `epics_base_rs::net::search_udp`.
@@ -37,12 +37,20 @@
 //! server-side reader
 //! [`cas_server_port`](epics_base_rs::runtime::net::cas_server_port)
 //! (`EPICS_CAS_SERVER_PORT` > `EPICS_CA_SERVER_PORT` > 5064). UDP and TCP land
-//! on the same port, as they do under a C IOC (`caservertask.c:491-499`).
+//! on the same port, as they do under a C IOC (`caservertask.c:492-500`).
 //!
-//! Any command-line arguments are taken as `.db` file paths and loaded in
-//! order (the `dbLoadRecords` equivalent for a target with no iocsh). With no
-//! arguments a small built-in database is loaded, so the binary is runnable
-//! standalone on a bare target.
+//! Command-line arguments are this target's st.cmd, because it has no iocsh: a
+//! `NAME=VALUE` argument is `epicsEnvSet` and anything else is a `.db` file
+//! path, loaded in order (the `dbLoadRecords` equivalent). Every assignment is
+//! applied before the first file is read, so the environment above is complete
+//! before any of it is consumed — see
+//! [`epics_rtems_boot::boot_args`], which owns
+//! that rule for both target IOCs. With no arguments a small built-in database
+//! is loaded, so the binary is runnable standalone on a bare target.
+//!
+//! On the RTEMS target the line comes from `EPICS_RTEMS_CMDLINE` at build time
+//! or the DHCP option `rtems_cmdline` at boot, whichever the board got last;
+//! `csrc/rtems_init.c` splits it into argv.
 //!
 //! There is no shutdown command: like a C IOC on RTEMS this runs until the
 //! board is reset (on a host, until the process is signalled). The interactive
@@ -52,21 +60,43 @@
 //! # Build configurations
 //!
 //! The real entry point is compiled for `target_os = "rtems"`, `target_os =
-//! "vxworks"`, or the host-selectable `rtems-exec-model` feature. RTEMS has
-//! no other option; on VxWorks this binary-level gate is necessary but not
-//! sufficient — `epics-base-rs/build.rs` still only sets the `exec_backend`
-//! cfg (the `runtime::task` seam's executor backend) for `target_os =
-//! "rtems"` or the `rtems-exec-model` feature, so a VxWorks build also needs
-//! that feature, or the lib-side predicate this gate anticipates, until the
-//! `exec_backend` derivation itself recognizes `target_os = "vxworks"`.
-//! Under the hosted default (tokio backend) this binary is
-//! still built — so it stays compiled and linted in the default test set — but
-//! refuses to run: `runtime::task::spawn` is routed to tokio there, and while
-//! record tails now go to the background executor through `spawn_background`,
-//! the CA/PVA network paths this binary would drive still need the runtime
-//! that this entry point deliberately never starts.
-//! Reporting that at startup is the honest behaviour; silently starting a
-//! runtime would defeat the purpose of the binary.
+//! "vxworks"`, or the host-selectable `EPICS_RS_BUILD_EXEC_BACKEND=thread`.
+//! RTEMS has no other option; on VxWorks this binary-level gate is necessary
+//! but not sufficient — `epics-base-rs/build.rs` still only sets the
+//! `exec_backend` cfg (the `runtime::task` seam's executor backend) for
+//! `target_os = "rtems"` or `EPICS_RS_BUILD_EXEC_BACKEND=thread`, so a VxWorks
+//! build also needs that variable, or the lib-side predicate this gate
+//! anticipates, until the `exec_backend` derivation itself recognizes
+//! `target_os = "vxworks"`. Under the hosted default (tokio backend) this
+//! binary is still built — so it stays compiled and linted in the default test
+//! set — but refuses to run. The reason is narrower than it once read here,
+//! and worth stating exactly, because two of the three parts it used to name
+//! no longer hold: record tails go to the background executor through
+//! `spawn_background`, and this binary has no PVA in it at all. The CA
+//! *server* half does not need a runtime either — `BlockingCaServer` suspends
+//! only on runtime-agnostic `tokio::sync` primitives, and a static source
+//! guard in that file holds it to that (`server/blocking.rs`,
+//! `blocking_driver_has_no_async_runtime_symbols`).
+//!
+//! What remains is the CA *client* half that facility 3 mounts. Every task it
+//! starts — the `EPICS_CA_NAME_SERVERS` circuits in `search::run_engine`, that
+//! circuit's reader in `search::serve_nameserver_circuit`, the transport
+//! managers, the coordinator, the beacon monitor — is spawned through the
+//! `Reactor` capability, and `CaClient::new_with_config` mints the one instance
+//! of it with `Reactor::current().expect(..)`. On the tokio backend
+//! `Reactor::current` is `Handle::try_current().ok()`, so it is `None` on a
+//! thread that has not entered a runtime — and `mod ioc` runs on the process
+//! main thread, which deliberately never enters one. A hosted build that
+//! reached `ioc::main` therefore fails when it builds the client, at an
+//! `expect` that names the contract, rather than surviving to the first
+//! `ca://` link and dying inside a spawn on tokio's "there is no reactor
+//! running". Reporting that at startup is the honest behaviour; silently
+//! starting a runtime would defeat the purpose of the binary.
+//!
+//! Symbols, not line numbers, on purpose: the three anchors this paragraph
+//! used to carry (`server/blocking.rs:2294`, `client/search.rs:1016` and
+//! `:1303`) were all stale within one commit of being written, because
+//! `8d583a91` moved the very code they named.
 
 use std::process::ExitCode;
 
@@ -76,13 +106,8 @@ use std::process::ExitCode;
 /// no feature flag, so a typo below cannot reach a reader as a silent "no
 /// such PV" on a serial console with no shell to ask. The `test` arm is what
 /// lets the guards at the bottom of this file parse it; the `rtems` and
-/// `rtems-exec-model` arms are the production use.
-#[cfg(any(
-    target_os = "rtems",
-    target_os = "vxworks",
-    feature = "rtems-exec-model",
-    test
-))]
+/// `exec_backend` arms are the production use.
+#[cfg(any(exec_backend, test))]
 mod demo_db {
     /// The database loaded when no `.db` file is given on the command line —
     /// small enough to run on a bare target, wide enough to exercise the
@@ -90,25 +115,31 @@ mod demo_db {
     ///
     /// IOC content only, and **link-free** by construction: no record here
     /// carries an INP/OUT field, so a default build is the no-`ca://`-link
-    /// image `doc/calink-rtems-design.md` §11.7 item 4 asks for. The C6
-    /// measurement rig — every probe record and both probe threads — is
-    /// behind the `bringup-probes` feature ([`C6_PROBE_DB`]).
+    /// image. The C6 measurement rig — every probe record and both probe
+    /// threads — is behind the `bringup-probes` feature (`C6_PROBE_DB`).
     pub const DEMO_DB: &str = concat!(
         "record(ao, \"RTEMS:AO\") { field(VAL, \"1.5\") field(PREC, \"3\") field(EGU, \"V\") }\n",
         "record(longout, \"RTEMS:LO\") { field(VAL, \"7\") field(EGU, \"counts\") }\n",
         "record(stringout, \"RTEMS:MSG\") { field(VAL, \"realtime-ca-ioc\") }\n",
+        // The binary-output path, and with it the only field in the demo
+        // database that arms a delayed callback: `bo` `HIGH` is the
+        // momentary one-shot (`boRecord.c:257-262`). A `caput RTEMS:BO.HIGH
+        // 1e300` followed by `caput RTEMS:BO 1` is the repro
+        // `runtime::time::deadline_after` was filed against — it is the only
+        // way to make the exec backend's timer take a `Duration::MAX`
+        // deadline from a target CA client, and the panic it closes was
+        // never reachable from `DEMO_DB` before.
+        "record(bo, \"RTEMS:BO\") { field(ZNAM, \"Off\") field(ONAM, \"On\") }\n",
     );
 
-    /// C6 PROBE (doc/calink-rtems-design.md §6 stage C6, topology A): the 14
-    /// measurement-rig records, loaded on top of [`DEMO_DB`] only under the
-    /// `bringup-probes` feature (§11.7 item 3 — they are the measurement rig,
-    /// not IOC content).
+    /// C6 PROBE (topology A): the 14 measurement-rig records, loaded on top of
+    /// [`DEMO_DB`] only under the `bringup-probes` feature (§11.7 item 3 —
+    /// they are the measurement rig, not IOC content).
     ///
     /// They live in a compiled-in constant rather than in a `.db` file
     /// because a `-kernel` boot has no filesystem to name one on and
-    /// `rtems_init.c:195` hands `main` a fixed one-element argv — the same
-    /// forcing the pvalink probe recorded (`doc/pvalink-rtems-design.md`
-    /// §12.3).
+    /// `csrc/rtems_init.c:331` hands `main` a fixed one-element argv — the same
+    /// forcing the pvalink probe recorded.
     #[cfg(feature = "bringup-probes")]
     pub const C6_PROBE_DB: &str = concat!(
         //
@@ -186,9 +217,8 @@ mod demo_db {
 
     /// E8 STACK PROBE: a record set whose CA traffic is *not* a single scalar.
     ///
-    /// `doc/vxworks-ca-worker-pool-on-target-measurement.md` §10.2 could only
-    /// measure a 13,240 B `CAS-client` high-water, because every driver in that
-    /// round did `READ_NOTIFY` against one `ao`. That number cannot decide
+    /// A 13,240 B `CAS-client` high-water was all that could be measured,
+    /// because every driver in that round did `READ_NOTIFY` against one `ao`. That number cannot decide
     /// `StackSizeClass`: it is the depth of the shallowest possible CA request.
     /// These records are chosen so each one drives a different part of the
     /// server thread's stack, and the census then says which of them, if any,
@@ -453,11 +483,7 @@ mod mutex_alloc_probe {
     }
 }
 
-#[cfg(any(
-    target_os = "rtems",
-    target_os = "vxworks",
-    feature = "rtems-exec-model"
-))]
+#[cfg(exec_backend)]
 mod ioc {
     use std::collections::HashMap;
     use std::net::{Ipv4Addr, SocketAddrV4};
@@ -485,12 +511,13 @@ mod ioc {
     /// name is `<prefix>:<upstream leaf>`, one colon, upstream's spelling on
     /// the right.
     ///
-    /// A constant because this binary has no configuration surface — there is
-    /// no iocsh and no `.cmd` on the target. It follows that two of these IOCs
-    /// on one subnet publish the same names and a client's SEARCH would be
-    /// answered by both; the fix when that day comes is to take the prefix
-    /// from the environment the way `cas_server_port` takes the port, and this
-    /// note is here so the next reader does not have to rediscover why.
+    /// A constant: two of these IOCs on one subnet publish the same names and
+    /// a client's SEARCH would be answered by both. The fix when that day
+    /// comes is to take the prefix from the environment the way
+    /// `cas_server_port` takes the port — which the boot command line can now
+    /// actually set, so it is a change to this line rather than to the boot
+    /// contract. Left as it is because nothing has asked for it; the note is
+    /// here so the next reader does not have to rediscover why.
     const STATUS_PREFIX: &str = "RTEMS";
 
     /// C6 PROBE: the upstream CA name server the guest's `ca://` links
@@ -763,7 +790,7 @@ mod ioc {
         // The monitor queue's collapse counter, beside MEM_USED because the two
         // answer one question together: whether a wide-value monitor is being
         // held to one queued entry (C's `db_queue_event_log` early-drop for a
-        // second by-reference log, `dbEvent.c:786-799`) or is accumulating whole
+        // second by-reference log, `dbEvent.c:794-800`) or is accumulating whole
         // owned array copies. A rising count with a flat MEM_USED is the bound
         // working; a flat count with a climbing MEM_USED is not.
         println!(
@@ -800,8 +827,7 @@ mod ioc {
     /// * **fixed** — `write_frame_deadline`, which owns the socket's blocking
     ///   mode and polls `POLLOUT` for what the deadline has left, so it cannot
     ///   be disarmed by the option being absent — nor by a send flag the target
-    ///   ignores, which is what `MSG_DONTWAIT` turned out to be on Darwin
-    ///   (`doc/darwin-send-dontwait-gap.md`).
+    ///   ignores, which is what `MSG_DONTWAIT` turned out to be on Darwin.
     ///
     /// Both legs print their elapsed time and their outcome. A leg that
     /// *completes* says so: silence is never read as a bound here, and a frame
@@ -913,6 +939,17 @@ mod ioc {
     /// (loaded in order, C `dbLoadRecords`), or the built-in demo database
     /// when there are none.
     ///
+    /// Which of the two it was is printed, and that is the point of the print
+    /// rather than a courtesy. A boot whose database argument never arrived —
+    /// a DHCP command line the shim refused as oversized, a token past
+    /// `EPICS_RTEMS_MAX_BOOT_ARGS`, a path spelled so it parsed as an
+    /// assignment — serves the demo PVs instead of the site's, and from
+    /// outside that is indistinguishable from a healthy IOC serving the wrong
+    /// records. The console is this target's only report, so the substitution
+    /// has to name itself there. A named file that fails to load is already an
+    /// error and stays one: falling back to the demo database on a load
+    /// failure would be the same defect with a louder cause.
+    ///
     /// Driven by `block_on_sync`, which parks this thread between polls of the
     /// build future — `IocBuilder::build` awaits only in-process locks, so no
     /// reactor is involved.
@@ -920,6 +957,11 @@ mod ioc {
         let macros = HashMap::new();
         let mut builder = IocBuilder::new();
         if db_files.is_empty() {
+            println!(
+                "realtime-ca-ioc: no database named on the boot command line; \
+                 loading the BUILT-IN DEMO database. A site database is named \
+                 by putting its path on that line."
+            );
             builder = builder.db_string(DEMO_DB, &macros)?;
             // C6 PROBE records ride along whenever the built-in database is
             // the source — a bare `-kernel` boot cannot choose — but only on
@@ -930,6 +972,12 @@ mod ioc {
                 builder = builder.db_string(crate::demo_db::E8_STACK_DB, &macros)?;
             }
         } else {
+            println!(
+                "realtime-ca-ioc: loading {} database file(s) from the boot \
+                 command line: {}",
+                db_files.len(),
+                db_files.join(" ")
+            );
             for path in db_files {
                 builder = builder.db_file(path, &macros)?;
             }
@@ -950,6 +998,27 @@ mod ioc {
         //     console, the clock, libbsd and DHCP, and called us.
         epics_rtems_boot::link_anchor();
 
+        // (0-env) The boot command line — this target's st.cmd. Its
+        //     `NAME=VALUE` tokens are `epicsEnvSet`, and they are applied here,
+        //     first, before anything in this image reads the environment: the
+        //     console subscriber, the CA server's port and interface selection
+        //     and the calink resolver all read theirs once, and a variable that
+        //     arrived after its reader is a variable the site did not set.
+        //
+        //     C reaches the same state through iocsh running the startup script
+        //     the BOOTP command line names
+        //     ($EPICS_BASE/modules/libcom/RTEMS/posix/rtems_init.c:103,256,1184
+        //     at R7.0.10); we have no script and no filesystem to hold one, so
+        //     the line itself carries the assignments. `epics-rtems-boot` owns
+        //     the rule so this binary and `realtime-pva-ioc` cannot come to
+        //     disagree about it.
+        //
+        //     SAFETY (edition 2024): the entry thread, before `background_init`
+        //     or any server has started anything, so no concurrent reader or
+        //     writer of the environment exists.
+        let boot_args: Vec<String> =
+            unsafe { epics_rtems_boot::boot_args::apply_boot_env(std::env::args().skip(1)) };
+
         // (0-reg) Announce this thread to the statistics funnel's thread
         //     census. Every other IOC thread does this from
         //     `runtime::task::enter_ioc_thread`, which `main` deliberately does
@@ -967,18 +1036,17 @@ mod ioc {
         #[cfg(feature = "bringup-probes")]
         iface_report();
 
-        // (0-probe) C6 PROBE: the target's CA search configuration.
-        // `rtems_init.c:195` hands `main` a fixed one-element argv and
-        // `POSIX_Init` calls `setenv` zero times, so on the target nothing
-        // outside the image can configure it — the values compiled in here
-        // are the ones that take effect. §4.5's three variables, together:
-        // the name server to dial, and the two that shut the broadcast path
-        // off so a resolution can only have come over TCP.
+        // (0-probe) C6 PROBE: the target's CA search configuration. §4.5's
+        // three variables, together: the name server to dial, and the two that
+        // shut the broadcast path off so a resolution can only have come over
+        // TCP.
         //
         // Defaults, not overrides: a variable that is already set stays as
-        // set. On the target that is the same thing (nothing can set one);
-        // on a host it is what lets `tests/realtime_ca_ioc_boots.rs` point the
-        // dial at its own closed port instead of the image's SLIRP address.
+        // set. That now means the same thing on the target as on a host —
+        // step (0-env) above has already applied the boot command line, so an
+        // `EPICS_CA_NAME_SERVERS=...` boot argument wins over the value
+        // compiled in here, and `tests/realtime_ca_ioc_boots.rs` points the
+        // dial at its own closed port the same way.
         //
         // Set before `install_calink_resolver`, because the client the
         // resolver lazily builds reads them once at construction.
@@ -1021,15 +1089,25 @@ mod ioc {
         //      take a record gate exists, so the line cannot be read as a
         //      report about a process that already ran without it.
         epics_base_rs::runtime::sync::report_lock_protocol();
+        // The board's epoch is fixed for the life of the boot, so this is the
+        // one moment the message can be acted on. Every stamp served past the
+        // EPICS time stamp's range wraps exactly as C's `epicsTimeFromTime_t`
+        // wraps it; saying so per read would be noise and refusing per read
+        // would take the IOC off the air for a condition it cannot fix.
+        if let Some(why) =
+            epics_base_rs::types::wall_clock_range_warning(std::time::SystemTime::now())
+        {
+            eprintln!("epics-rs: {why}");
+        }
 
         // (1) C `callbackInit` (callback.c:286) — the callback pool, delayed
         //     timer and scanOnce worker exist before any record can defer a
         //     tail into them. Idempotent.
         background_init();
 
-        // (2) The database.
-        let db_files: Vec<String> = std::env::args().skip(1).collect();
-        let db = match load_database(&db_files) {
+        // (2) The database — every boot argument that was not an
+        //     `epicsEnvSet` is a `.db` to load, in order (C `dbLoadRecords`).
+        let db = match load_database(&boot_args) {
             Ok(db) => db,
             Err(e) => {
                 eprintln!("realtime-ca-ioc: iocInit failed: {e}");
@@ -1040,7 +1118,7 @@ mod ioc {
         // (2b) The calink resolver: install the `ca://` record-link resolver on
         //      the database so ` CA`-modified / `ca://...` INP/OUT fields
         //      resolve. C reaches the same state through `dbCaLinkInit`
-        //      (`dbCa.c:1071`) during iocInit, after the database exists.
+        //      (`dbCa.c:352-355`) during iocInit, after the database exists.
         //      Installed here — after the database, before the CA front-end —
         //      so every record's link fields route through it before the
         //      server answers its first client.
@@ -1058,7 +1136,7 @@ mod ioc {
         //      resolver above is mounted and unreachable:
         //
         //      * `initialize_link_locality` commits C `dbInitLink`'s locality
-        //        decision (`dbLink.c:117-129` falling through
+        //        decision (`dbLink.c:118-129` falling through
         //        `dbDbInitLink`'s `S_db_notFound`, `dbDbLink.c:94-96`) — a
         //        `Db` link naming a record this IOC does not have becomes a
         //        `Ca` link. `INP=UPSTREAM:AI CP`, the bare ` CA`-modifier
@@ -1105,7 +1183,7 @@ mod ioc {
         let _scan_owner = epics_base_rs::server::scan::ScanOwner::start(db.clone());
 
         // (3) The CA front-end. UDP search port and TCP port are the same
-        //     value, as under a C IOC (caservertask.c:491-499). No ACF is
+        //     value, as under a C IOC (caservertask.c:492-500). No ACF is
         //     configured, so access control is the permissive default.
         let port = cas_server_port();
         let acf = epics_base_rs::server::access_security::new_acf_cell(None);
@@ -1188,7 +1266,7 @@ mod ioc {
         let charge = ThreadCharge::fixed(StackSizeClass::Medium);
         let tcp_thread = match thread::Builder::new()
             .name("CAS-TCP".to_string())
-            // caservertask.c:716-718 — `epicsThreadStackMedium`. It accepts and
+            // caservertask.c:717-719 — `epicsThreadStackMedium`. It accepts and
             // hands off; the per-client thread is where the depth is.
             .stack_size(StackSizeClass::Medium.bytes())
             .spawn(move || {
@@ -1205,7 +1283,7 @@ mod ioc {
         let charge = ThreadCharge::fixed(StackSizeClass::Medium);
         let udp_thread = match thread::Builder::new()
             .name("CAS-UDP".to_string())
-            // caservertask.c:722-724 — `epicsThreadStackMedium`, same as TCP.
+            // caservertask.c:723-725 — `epicsThreadStackMedium`, same as TCP.
             .stack_size(StackSizeClass::Medium.bytes())
             .spawn(move || {
                 let _charge = charge;
@@ -1301,7 +1379,9 @@ mod ioc {
                 "C6 probe: tick task on the callback band writing {C6_TICK_RECORD} \
                  every {C6_TICK_PERIOD_MS} ms",
             );
-            epics_base_rs::runtime::task::spawn(async move {
+            let tick_reactor = epics_base_rs::runtime::task::Reactor::current()
+                .expect("the exec backend's executor is process-global");
+            tick_reactor.spawn(async move {
                 let mut n = 0i64;
                 loop {
                     epics_base_rs::runtime::task::sleep(std::time::Duration::from_millis(
@@ -1311,10 +1391,9 @@ mod ioc {
                     n += 1;
                     // The `dbPutField` shape (fire-and-forget), not `put_pv`:
                     // an ai's VAL is `pp(TRUE)`, so a bare `dbPut` suppresses
-                    // its immediate monitor post (dbAccess.c:1414-1418) and
+                    // its immediate monitor post (dbAccess.c:1411-1413) and
                     // leaves the record's UDF *alarm* standing — a host
-                    // `camonitor` on the tick saw one line, forever
-                    // (doc/calink-rtems-design.md §11.7 item 2). C driver
+                    // `camonitor` on the tick saw one line, forever. C driver
                     // code writing its own record does `dbPutField`, whose pp
                     // gate processes the passive record: the cycle posts the
                     // monitor with a fresh timestamp and clears the UDF
@@ -1332,7 +1411,7 @@ mod ioc {
         }
 
         // (b) The console reporter, in the shape the pvalink stage-5 probe
-        //     used (`doc/pvalink-rtems-design.md` §12.4): one line group
+        //     used: one line group
         //     every 10 s, and the task census + stack-usage report every
         //     6th pass (~1 min), which is the `rt top` / `rt stackuse`
         //     reading criterion 6 asks for on a target that starts no
@@ -1420,32 +1499,26 @@ mod ioc {
     }
 }
 
-#[cfg(any(
-    target_os = "rtems",
-    target_os = "vxworks",
-    feature = "rtems-exec-model"
-))]
+#[cfg(exec_backend)]
 fn main() -> ExitCode {
     ioc::main()
 }
 
-#[cfg(not(any(
-    target_os = "rtems",
-    target_os = "vxworks",
-    feature = "rtems-exec-model"
-)))]
+#[cfg(tokio_backend)]
 fn main() -> ExitCode {
     eprintln!(
         "realtime-ca-ioc: built with the tokio task backend, which this entry point \
          does not start a runtime for.\n\
-         Build it for `armv7-rtems-eabihf` or a VxWorks target, or on a host with \
-         `--features rtems-exec-model`."
+         Build it for `armv7-rtems-eabihf` or a VxWorks target, or on a host \
+         rebuild with EPICS_RS_BUILD_EXEC_BACKEND=thread."
     );
     ExitCode::FAILURE
 }
 
 #[cfg(test)]
 mod tests {
+    use source_guard::{Comments, production};
+
     /// The RTEMS constraint for the entry point: it must never construct or
     /// enter a tokio runtime, and must never reach for tokio's async
     /// net/timer/spawn machinery — none of which the RTEMS build can drive.
@@ -1500,10 +1573,7 @@ mod tests {
     #[test]
     fn every_thread_here_is_charged_to_the_process_account() {
         let src = include_str!("realtime-ca-ioc.rs");
-        let prod = match src.find("\n#[cfg(test)]") {
-            Some(i) => &src[..i],
-            None => src,
-        };
+        let prod = production(src, Comments::Keep);
         // Needle assembled with `concat!` so this guard does not match itself
         // in the file it is written in.
         let mut sites = 0usize;
@@ -1549,10 +1619,7 @@ mod tests {
     #[test]
     fn this_entry_point_names_no_scheduling_band() {
         let src = include_str!("realtime-ca-ioc.rs");
-        let prod = match src.find("\n#[cfg(test)]") {
-            Some(i) => &src[..i],
-            None => src,
-        };
+        let prod = production(src, Comments::Keep);
         assert!(
             !prod.contains(concat!("Thread", "Priority")),
             "this file must not name a scheduling band — ask \
@@ -1577,10 +1644,7 @@ mod tests {
     #[test]
     fn the_entry_point_publishes_its_status() {
         let src = include_str!("realtime-ca-ioc.rs");
-        let prod = match src.find("\n#[cfg(test)]") {
-            Some(i) => &src[..i],
-            None => src,
-        };
+        let prod = production(src, Comments::Keep);
         assert!(
             prod.contains(concat!("serve_status_", "pvs(")),
             "the entry point registers no status PVs; on a target with no iocsh \
@@ -1623,10 +1687,7 @@ mod tests {
     #[test]
     fn the_calink_resolver_is_mounted_and_the_banner_reports_it() {
         let src = include_str!("realtime-ca-ioc.rs");
-        let prod = match src.find("\n#[cfg(test)]") {
-            Some(i) => &src[..i],
-            None => src,
-        };
+        let prod = production(src, Comments::Keep);
         // `concat!` so these assertions cannot match their own source text.
         assert!(
             prod.contains(concat!("install_calink_", "resolver(&db)")),
@@ -1661,10 +1722,7 @@ mod tests {
     #[test]
     fn iocinit_link_phases_run_after_the_mount() {
         let src = include_str!("realtime-ca-ioc.rs");
-        let prod = match src.find("\n#[cfg(test)]") {
-            Some(i) => &src[..i],
-            None => src,
-        };
+        let prod = production(src, Comments::Keep);
         // `concat!` so these assertions cannot match their own source text.
         let mount = concat!("install_calink_", "resolver(&db)");
         let phases = [
@@ -1701,10 +1759,7 @@ mod tests {
     #[test]
     fn a_panic_reaches_the_errlog_and_says_what_it_costs() {
         let src = include_str!("realtime-ca-ioc.rs");
-        let prod = match src.find("\n#[cfg(test)]") {
-            Some(i) => &src[..i],
-            None => src,
-        };
+        let prod = production(src, Comments::Keep);
         assert!(
             prod.contains(concat!("install_panic_", "hook()")),
             "this entry point installs no panic hook, so a panicking worker \
@@ -1713,8 +1768,8 @@ mod tests {
     }
 
     /// The default binary is IOC content only: no C6 measurement-rig records,
-    /// and — `doc/calink-rtems-design.md` §11.7 item 4's enabler — no link
-    /// fields at all, so a default image holds zero client-side descriptors
+    /// and no link fields at all, so a default image holds zero client-side
+    /// descriptors
     /// and the per-circuit fd cost can be isolated against it.
     ///
     /// Runs in every host test pass (the probe rig moved to `C6_PROBE_DB`,
@@ -1731,8 +1786,8 @@ mod tests {
         let names: Vec<&str> = recs.iter().map(|r| r.name.as_str()).collect();
         assert_eq!(
             names,
-            vec!["RTEMS:AO", "RTEMS:LO", "RTEMS:MSG"],
-            "the default database is the three demo records and nothing else"
+            vec!["RTEMS:AO", "RTEMS:LO", "RTEMS:MSG", "RTEMS:BO"],
+            "the default database is the four demo records and nothing else"
         );
         for rec in &recs {
             assert!(
@@ -1741,7 +1796,7 @@ mod tests {
                  `bringup-probes`, not in the default image",
                 rec.name
             );
-            for (field, _) in &rec.fields {
+            for field in rec.fields.iter().map(|f| &f.name) {
                 assert!(
                     !matches!(field.as_str(), "INP" | "OUT" | "INPA" | "FLNK"),
                     "{}.{field} is a link field: the default image must be \
@@ -1761,10 +1816,7 @@ mod tests {
     #[test]
     fn the_probe_db_loads_only_behind_the_feature() {
         let src = include_str!("realtime-ca-ioc.rs");
-        let prod = match src.find("\n#[cfg(test)]") {
-            Some(i) => &src[..i],
-            None => src,
-        };
+        let prod = production(src, Comments::Keep);
         let load_at = prod
             .find(concat!("crate::demo_db::C6_PROBE_", "DB, &macros"))
             .expect("the probe database is loaded somewhere in load_database");
@@ -1781,10 +1833,7 @@ mod tests {
     #[test]
     fn the_e8_stack_db_loads_only_behind_the_feature() {
         let src = include_str!("realtime-ca-ioc.rs");
-        let prod = match src.find("\n#[cfg(test)]") {
-            Some(i) => &src[..i],
-            None => src,
-        };
+        let prod = production(src, Comments::Keep);
         let load_at = prod
             .find(concat!("crate::demo_db::E8_STACK_", "DB, &macros"))
             .expect("the E8 stack database is loaded somewhere in load_database");
@@ -1859,15 +1908,15 @@ mod tests {
             let nelm = rec
                 .fields
                 .iter()
-                .find(|(k, _)| k == "NELM")
-                .map(|(_, v)| v.to_string());
+                .find(|f| f.name == "NELM")
+                .map(|f| f.value.to_string());
             assert_eq!(nelm.as_deref(), Some(want), "{why}");
         }
     }
 
     /// With the feature on, the rig is exactly the 14 records the C6
-    /// measurement was built from (`doc/calink-rtems-design.md` §11.7 item
-    /// 3), on top of the same clean demo set — so the bring-up image is one
+    /// measurement was built from, on top of the same clean demo set — so the
+    /// bring-up image is one
     /// cargo flag away, not a code edit away.
     #[cfg(feature = "bringup-probes")]
     #[test]
@@ -1877,7 +1926,18 @@ mod tests {
         let full = format!("{}{}", crate::demo_db::DEMO_DB, crate::demo_db::C6_PROBE_DB);
         let recs = epics_base_rs::server::db_loader::parse_db(&full, &HashMap::new())
             .expect("the demo + probe database must parse");
-        assert_eq!(recs.len(), 17, "3 demo records plus the 14-record rig");
+        // The demo half of this total has an owner already
+        // (`the_default_database_is_clean_and_link_free`), so read it rather
+        // than restate it: this test is about the rig's own 14, and hard-coding
+        // the sum is what made adding `RTEMS:BO` to `DEMO_DB` fail here.
+        let demo =
+            epics_base_rs::server::db_loader::parse_db(crate::demo_db::DEMO_DB, &HashMap::new())
+                .expect("the demo database must parse");
+        assert_eq!(
+            recs.len(),
+            demo.len() + 14,
+            "the demo records plus the 14-record rig"
+        );
         for name in [
             "RTEMS:CA:DOWN",
             "RTEMS:CA:DOWN2",
@@ -1904,8 +1964,8 @@ mod tests {
         let inp = |name: &str| {
             recs.iter()
                 .find(|r| r.name == name)
-                .and_then(|r| r.fields.iter().find(|(f, _)| f == "INP"))
-                .map(|(_, v)| v.to_string())
+                .and_then(|r| r.fields.iter().find(|f| f.name == "INP"))
+                .map(|f| f.value.to_string())
         };
         assert_eq!(inp("RTEMS:CA:DOWN").as_deref(), Some("UPSTREAM:AI CP"));
         assert_eq!(

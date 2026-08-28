@@ -44,10 +44,12 @@ and add the fixture only once the encoder agrees with pvxs.
 - `capture.cpp` — single-binary harness; one `emit(...)` call per
   fixture, each running pvxs's `to_wire` (or `to_wire_valid` with a
   leading-`BitSet` strip for compound fixtures).
-- `build.sh` — `clang++` invocation with the right `-I`/`-L` for a
-  macOS box where pvxs lives at `~/codes/pvxs` and EPICS base at
-  `~/epics/epics-base`. Override with `PVXS_TOP`, `EPICS_BASE`,
-  `EPICS_HOST_ARCH` env vars.
+- `build.sh` — compiles it. The trees come from `PVXS_HOME` and
+  `EPICS_BASE`; host arch and compiler default off `uname`
+  (`linux-<machine>` + `g++`, `darwin-<machine>` + `clang++`) and are
+  overridable with `EPICS_HOST_ARCH` and `CXX`. A missing tree ends the
+  build and removes `./capture`, so a stale binary cannot republish an
+  older tree's bytes as the goldens.
 - `fixtures.txt` — captured output, **the** source of truth for the
   Rust tests. `key=hex` per line, one fixture per line.
 

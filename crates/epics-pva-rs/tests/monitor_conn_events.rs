@@ -8,8 +8,7 @@
 //! re-subscribe INTERNALLY on `MonitorEnd::ConnectionLost`: announce, sleep
 //! 200 ms, loop. So a dead upstream never makes the handle's task return, and
 //! a consumer watching only the task reports a dead upstream as connected and
-//! keeps serving its last value — measured on the RTEMS stage-5 target and
-//! recorded in doc/pvalink-rtems-design.md §12.8 / §12.10.
+//! keeps serving its last value — measured on the RTEMS stage-5 target.
 //!
 //! These are the OWNER-path tests: with a real server dropped underneath a
 //! real subscription, `MonitorConnEvent::Disconnected` must reach the
@@ -17,11 +16,12 @@
 //! the case termination-based inference cannot see.
 //!
 //! Reactor-dependent, and it is the RE-dial that needs the reactor: losing
-//! the peer makes the client re-dial, and feature-ON that runs on a
+//! the peer makes the client re-dial, and on the exec backend that runs on a
 //! background-executor thread with no tokio reactor while `dial_pva`'s hosted
-//! arm is still `tokio::net`. Gated out feature-ON, same as
+//! arm is still `tokio::net`. Gated out on the exec backend, same as
 //! `upstream_death_disconnects_the_inp_monitor_link` in epics-bridge-rs.
-#![cfg(not(feature = "rtems-exec-model"))]
+#![cfg(tokio_backend)]
+#![cfg(feature = "client")]
 
 use std::sync::Arc;
 use std::time::Duration;

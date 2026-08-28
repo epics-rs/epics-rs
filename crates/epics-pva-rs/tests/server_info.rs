@@ -11,7 +11,9 @@
 //! PVA server + client, hosting a couple of user PVs and asserting the
 //! built-in source reports them.
 
-// RTEMS-EXEC-MODEL-ALLOW(5): checked - these run and pass in the feature-ON suite.
+#![cfg(tokio_backend)]
+#![cfg(feature = "client")]
+
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -19,7 +21,8 @@ use epics_pva_rs::nt::typed::TypedNT;
 use epics_pva_rs::pvdata::{
     FieldDesc, PvField, PvStructure, ScalarType, ScalarValue, TypedScalarArray,
 };
-use epics_pva_rs::server_native::{PvaServer, SharedPV, SharedSource};
+use epics_pva_rs::server_native::PvaServer;
+use epics_pva_rs::server_native::{SharedPV, SharedSource};
 
 /// Build an NTURI RPC request with a single `query.op` string arg —
 /// exactly what `pvxlist` / a `pvlist`-style client sends.
@@ -253,7 +256,7 @@ async fn rpc_op_errors_carry_pvxs_contract_text() {
 ///
 /// `record(ai,"server"){}` is legal, so the reserved diagnostic channel and
 /// a user PV can want the same name. pvxs settles it by priority band, not
-/// by name: its internals sit at `order = -1` (`server.cpp:542-546`) and an
+/// by name: its internals sit at `order = -1` (`src/server.cpp:542-546`) and an
 /// application source added through `Server::addSource` defaults to
 /// `order = 0` (`pvxs/server.h:116-118`), which is where QSRV's own sources
 /// go (`ioc/singlesourcehooks.cpp:158`, `ioc/groupsourcehooks.cpp:219`).
@@ -264,7 +267,7 @@ async fn rpc_op_errors_carry_pvxs_contract_text() {
 /// server by RPC-ing that same channel name (`tools/list.cpp:159-161`), so
 /// a user PV winning the name is exactly what takes `pvxlist` / `pvxinfo`
 /// off the air. Only pvxs's `addPV`-backed `builtinsrc` outranks the
-/// diagnostic (`server.cpp:174-181`), and a hand-in source is not that.
+/// diagnostic (`src/server.cpp:174-181`), and a hand-in source is not that.
 ///
 /// Asserted as observable behaviour, not as a priority number, so a future
 /// re-numbering that preserves the outcome keeps the test green.

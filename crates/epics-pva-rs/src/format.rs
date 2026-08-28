@@ -448,7 +448,9 @@ fn write_raw_union_member(
 /// The `any` counterpart of [`write_raw_union_member`]: a variant union
 /// stores its member with no field name, so the member line carries the
 /// type and the value with an empty name between them, exactly as Base
-/// streams `getID() << ' ' << getFieldName() << ' ' << value`.
+/// streams `getID() << ' ' << getFieldName() << ' ' << value`
+/// (PVUnion.cpp:191). The empty name collapses the two separators onto
+/// nothing, which is where the doubled space in `int  5` comes from.
 fn write_raw_variant_member(out: &mut String, v: &VariantValue, depth: usize) {
     let desc = match v.value {
         PvField::Null => None,
@@ -1004,6 +1006,20 @@ fn scalar_to_json(v: &ScalarValue) -> String {
         // significant digits of its widened value.
         ScalarValue::Float(f) => json_double(*f as f64),
         ScalarValue::Double(f) => json_double(*f),
+        // **Deliberate deviation**:
+        // `pvULong` prints its true unsigned value here, where C prints
+        // a negative number. C's `show_field` has the `pvULong` case
+        // COMMENTED OUT with its own note — `// case pvd::pvULong: //
+        // can't always be exactly represented...` (`jprint.cpp:144`) —
+        // so every non-double scalar falls into `default:`
+        // `yajl_gen_integer(A.handle, scalar->getAs<pvd::int64>())`
+        // (`:145-146`), and `yajl_gen_integer` renders through
+        // `sprintf(i, "%lld", number)` on a signed `long long`
+        // (`yajl_gen.c:211-215`). A `pvULong` above `i64::MAX`
+        // therefore reaches a C reader as a negative integer that no
+        // longer round-trips into the field it came from. Reproducing
+        // that would corrupt correct data to match a comment upstream
+        // already wrote against itself.
         other => format!("{other}"),
     }
 }
@@ -1126,6 +1142,14 @@ const POSIX_TIME_AT_EPICS_EPOCH: i64 = 631_152_000;
 /// AND the nanoseconds are both zero. EPICS Base does emit it — pvData's
 /// own `testprinter.cpp:139` pins `"<undefined>              -42 "` — so
 /// it belongs in the same 24-column field as a real time text.
+///
+/// Measured live, not only read: a `softIocPVA` R7.0.10-146 serving an `ai`
+/// that had never processed answered `pvget` with
+/// `TS:UNSET <undefined>              0 INVALID DRIVER UDF `, i.e. the
+/// sentinel's 11 bytes followed by 14 spaces. That is 25 columns before the
+/// value, which is what `printer.cpp:134` writes — `std::setw(24)` on the
+/// time text plus its own trailing `' '` — so the field is 24 wide and the
+/// 25th byte is the separator, not padding.
 const UNDEFINED_TS: &str = "<undefined>";
 
 /// The timestamp text EPICS Base formats from a `time_t` structure — a
@@ -1433,8 +1457,7 @@ fn escape_bytes(s: &[u8], hex_upper: bool) -> String {
 /// EPICS Base's default `escape` style (`style_t::C`, pvData
 /// printer.cpp:485-516), whose `hexdigit` (printer.cpp:467-473) is
 /// uppercase. That `hexdigit` also carries an off-by-one mapping a nibble
-/// of 9 to `@` (CBUG-I2 in doc/upstream-c-bugs.md); this does not
-/// reproduce it and emits correct hex.
+/// of 9 to `@`; this does not reproduce it and emits correct hex.
 fn escape_display(s: &[u8]) -> String {
     escape_bytes(s, true)
 }
@@ -2213,6 +2236,30 @@ fn array_elements(desc: &FieldDesc, value: Option<&PvField>) -> Vec<(FieldDesc, 
 mod tests {
     use super::*;
     use crate::pvdata::VariantValue;
+
+    /// A `pvULong` above `i64::MAX` keeps its true value in our JSON,
+    /// where C emits a negative integer — `jprint.cpp:144` has the
+    /// `pvULong` case commented out, so `default:` narrows it through
+    /// `getAs<pvd::int64>()` into `yajl_gen_integer`'s signed
+    /// `long long` and `sprintf("%lld")` (`yajl_gen.c:211-215`).
+    /// Deliberate deviation.
+    #[test]
+    fn a_ulong_past_i64_max_keeps_its_value_in_json() {
+        // What C would print for these: -1 and i64::MIN.
+        assert_eq!(
+            scalar_to_json(&ScalarValue::ULong(u64::MAX)),
+            "18446744073709551615"
+        );
+        assert_eq!(
+            scalar_to_json(&ScalarValue::ULong(1u64 << 63)),
+            "9223372036854775808"
+        );
+        // Below the boundary the two agree, so nothing else moves.
+        assert_eq!(
+            scalar_to_json(&ScalarValue::ULong(i64::MAX as u64)),
+            "9223372036854775807"
+        );
+    }
 
     /// C `%g` rounds to `precision` significant digits BEFORE deciding
     /// between fixed and scientific notation (C99 7.19.6.1p8 takes the

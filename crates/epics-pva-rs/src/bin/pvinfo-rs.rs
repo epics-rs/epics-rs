@@ -36,9 +36,10 @@ struct Args {
 
     /// Verbose: print the effective PVA client configuration before the
     /// type output, then the server's peer credentials before each PV.
-    /// pvxs-TLS `tools/info.cpp:76-79` prints the `Effective config` under
-    /// `-v`, and `:88-90` prints the `# <PeerCredentials>` line under the
-    /// same `-v`, so verbose couples both.
+    /// pvxs `tools/info.cpp:78-79` prints the `Effective config` under
+    /// `-v`; the `# <PeerCredentials>` line under that same `-v` exists only
+    /// on the unmerged `tls` branch (`info.cpp:88-90` at `b3a10bf0`), so
+    /// verbose couples both here.
     #[arg(short = 'v')]
     verbose: bool,
 
@@ -176,7 +177,7 @@ async fn main() {
     }
 
     // pvxs `pvxinfo -v` prints the effective client config once, before
-    // the per-PV type output (`tools/info.cpp:76-79`), not per channel.
+    // the per-PV type output (`tools/info.cpp:78-79`), not per channel.
     if args.verbose {
         cli::print_effective_config();
     }
@@ -195,7 +196,7 @@ async fn main() {
     // Start a describe op for every PV before awaiting any, then print
     // each PV's result the instant its task completes — completion order,
     // not input order — so a fast PV is visible before a slow or missing
-    // sibling's timeout expires. pvxs `pvxinfo` (tools/info.cpp:81-112)
+    // sibling's timeout expires. pvxs `pvxinfo` (tools/info.cpp:78-112)
     // exec()s all ops, installs a per-op `.result()` callback that prints
     // the PV when its op finishes, hurryUp()s, and waits once. The serial
     // await-per-PV loop this replaces spent one timeout per PV; the prior

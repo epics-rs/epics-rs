@@ -205,7 +205,7 @@ impl PvField {
     /// value.lookup("->")` before the array/scalar conversion
     /// (`pvxs/ioc/pvalink_lset.cpp:278-279`). The standard EPICS
     /// `NTNDArray` carries its image data as a discriminated `Union`
-    /// `value` member (`pvxs/src/nt.cpp:196-220`), so a consumer that
+    /// `value` member (`pvxs/src/nt.cpp:208-220`), so a consumer that
     /// stops at the union sees no usable value.
     ///
     /// * [`PvField::Union`] with a selected variant (`selector >= 0`)

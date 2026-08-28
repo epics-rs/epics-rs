@@ -8,7 +8,7 @@
 //!
 //! SKIPs if the TLS-enabled pvxs build is not present.
 
-// RTEMS-EXEC-MODEL-ALLOW(1): not run by the default nextest profile - this file is a module of the `interop_pvxs` binary, which `.config/nextest.toml`'s default-filter excludes.
+#![cfg(tokio_backend)]
 
 use std::path::PathBuf;
 use std::process::Stdio;
@@ -73,13 +73,9 @@ async fn interop_tls_mtls_pvxget_with_client_cert_to_rust_server() {
     let key_der_vec = leaf_key.serialize_der();
     let ca_der_vec = ca_cert.der().to_vec();
 
-    let dir = match tempfile::tempdir() {
-        Ok(d) => d,
-        Err(e) => {
-            eprintln!("SKIP: tempdir: {e}");
-            return;
-        }
-    };
+    // Not a skip: a scratch directory is this test's own artefact, not an
+    // absent prerequisite, so failing to make one is a failure.
+    let dir = tempfile::tempdir().expect("tempdir");
     let leaf_pem = format!("{}\n{}\n", leaf_cert.pem(), leaf_key.serialize_pem());
     let leaf_pem_path = dir.path().join("leaf.pem");
     std::fs::write(&leaf_pem_path, &leaf_pem).expect("write leaf pem");
@@ -97,15 +93,16 @@ async fn interop_tls_mtls_pvxget_with_client_cert_to_rust_server() {
         .arg(&ca_pem_path)
         .args(["-passout", "pass:"])
         .output();
+    // `Err` is the openssl CLI being absent -- a missing prerequisite, so a
+    // skip. `Ok(!success)` is the CLI running and refusing our own PEM: that
+    // is this test's artefact failing to build, and a skip would report it
+    // as a pass.
     match p12_out {
         Ok(o) if o.status.success() => {}
-        Ok(o) => {
-            eprintln!(
-                "SKIP: openssl pkcs12: {}",
-                String::from_utf8_lossy(&o.stderr)
-            );
-            return;
-        }
+        Ok(o) => panic!(
+            "openssl pkcs12 -export failed: {}",
+            String::from_utf8_lossy(&o.stderr)
+        ),
         Err(e) => {
             eprintln!("SKIP: openssl cli: {e}");
             return;
@@ -139,7 +136,8 @@ async fn interop_tls_mtls_pvxget_with_client_cert_to_rust_server() {
     };
 
     use epics_pva_rs::pvdata::{FieldDesc, PvField, PvStructure, ScalarType, ScalarValue};
-    use epics_pva_rs::server_native::{PvaServer, PvaServerConfig, SharedPV, SharedSource};
+    use epics_pva_rs::server_native::PvaServer;
+    use epics_pva_rs::server_native::{PvaServerConfig, SharedPV, SharedSource};
 
     let pv = SharedPV::new();
     pv.open(

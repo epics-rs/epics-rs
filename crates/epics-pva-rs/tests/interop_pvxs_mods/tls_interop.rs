@@ -18,7 +18,7 @@
 //!
 //! The Rust↔Rust handshake is already covered by `tests/tls.rs`.
 
-// RTEMS-EXEC-MODEL-ALLOW(1): not run by the default nextest profile - this file is a module of the `interop_pvxs` binary, which `.config/nextest.toml`'s default-filter excludes.
+#![cfg(tokio_backend)]
 
 use std::path::PathBuf;
 use std::process::Stdio;
@@ -59,8 +59,14 @@ fn effective_lib_dir() -> PathBuf {
 /// a TLS-enabled build shows `EPICS_PVA_TLS_KEYCHAIN=` (env var
 /// printed even when empty); the non-TLS build has neither the
 /// env var nor any TLS markers in its config dump.
+///
+/// `false` means ONE thing: there is no TLS-enabled pvxs to test against.
+/// It used to mean that OR "the binary is there and will not run", and the
+/// second reading turned a broken tree into a skip, which reports as a pass
+/// and verifies nothing.
 fn pvxs_has_tls() -> bool {
     let Some(pvxinfo) = locate_tls_binary("pvxinfo") else {
+        // Absent prerequisite: no pvxs to probe.
         return false;
     };
     let mut cmd = std::process::Command::new(&pvxinfo);
@@ -68,7 +74,10 @@ fn pvxs_has_tls() -> bool {
         .env(env_key(), effective_lib_dir())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    let Ok(out) = cmd.output() else { return false };
+    // Located, so a refusal to run is a broken checkout, not a missing one.
+    let out = cmd
+        .output()
+        .unwrap_or_else(|e| panic!("{} was located but would not run: {e}", pvxinfo.display()));
     let s =
         String::from_utf8_lossy(&out.stdout).to_string() + &String::from_utf8_lossy(&out.stderr);
     s.contains("EPICS_PVA_TLS_KEYCHAIN")
@@ -115,16 +124,12 @@ async fn interop_tls_a_pvxget_over_tls_to_rust_server() {
     let cert_der_vec = leaf_cert.der().to_vec();
     let key_der_vec = leaf_key.serialize_der();
 
-    let dir = match tempfile::tempdir() {
-        Ok(d) => d,
-        Err(e) => {
-            eprintln!("SKIP: tempdir failed: {e}");
-            return;
-        }
-    };
+    // Not a skip: a scratch directory is this test's own artefact, not an
+    // absent prerequisite, so failing to make one is a failure.
+    let dir = tempfile::tempdir().expect("tempdir");
 
     // pvxs's keychain loader expects PKCS#12 — its OpenSSL backend
-    // calls `d2i_PKCS12_bio` (see ossl.cpp), which rejects PEM
+    // calls `d2i_PKCS12_bio` (`ossl.cpp:241`, pvxs `tls` `b3a10bf0`), which rejects PEM
     // input with `wrong tag`. Write the leaf PEM (cert + key) and
     // the CA cert PEM, then bundle into PKCS#12 via openssl CLI.
     let leaf_pem_path = dir.path().join("leaf.pem");
@@ -144,15 +149,16 @@ async fn interop_tls_a_pvxget_over_tls_to_rust_server() {
         .arg(&ca_pem_path)
         .args(["-passout", "pass:"])
         .output();
+    // `Err` is the openssl CLI being absent -- a missing prerequisite, so a
+    // skip. `Ok(!success)` is the CLI running and refusing our own PEM: that
+    // is this test's artefact failing to build, and a skip would report it
+    // as a pass.
     match p12_out {
         Ok(o) if o.status.success() => {}
-        Ok(o) => {
-            eprintln!(
-                "SKIP: openssl pkcs12 conversion failed: {}",
-                String::from_utf8_lossy(&o.stderr)
-            );
-            return;
-        }
+        Ok(o) => panic!(
+            "openssl pkcs12 -export failed: {}",
+            String::from_utf8_lossy(&o.stderr)
+        ),
         Err(e) => {
             eprintln!("SKIP: openssl CLI not available: {e}");
             return;
@@ -175,7 +181,8 @@ async fn interop_tls_a_pvxget_over_tls_to_rust_server() {
     };
 
     use epics_pva_rs::pvdata::{FieldDesc, PvField, PvStructure, ScalarType, ScalarValue};
-    use epics_pva_rs::server_native::{PvaServer, PvaServerConfig, SharedPV, SharedSource};
+    use epics_pva_rs::server_native::PvaServer;
+    use epics_pva_rs::server_native::{PvaServerConfig, SharedPV, SharedSource};
 
     let pv = SharedPV::new();
     pv.open(

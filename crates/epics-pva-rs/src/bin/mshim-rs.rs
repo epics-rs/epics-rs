@@ -23,6 +23,11 @@
 //! multicast group join, on the forward side it selects the outbound
 //! multicast interface. `,ttl#` sets `IP_MULTICAST_TTL` on forwarded
 //! multicast packets.
+// On `exec_backend` this program's `main` refuses instead of running, so
+// everything below it is unreachable in that configuration by construction.
+// The lint is reporting the intent, not dead code: the default build still
+// lints this file in full.
+#![cfg_attr(exec_backend, allow(dead_code, unused_imports))]
 
 use std::collections::HashSet;
 use std::io::ErrorKind;
@@ -32,6 +37,7 @@ use std::sync::Arc;
 use clap::Parser;
 use epics_base_rs::net::IfaceMap;
 use epics_pva_rs::cli;
+#[cfg(tokio_backend)]
 use epics_pva_rs::server_native::udp::ForwardableDatagram;
 use socket2::{Domain, Protocol, SockRef, Socket, Type};
 use tokio::net::UdpSocket;
@@ -222,17 +228,21 @@ fn dest_is_unicast(dest: SocketAddr, host_broadcasts: &HashSet<Ipv4Addr>) -> boo
 
 /// Snapshot the host's interface subnet-broadcast addresses once at
 /// startup (pvxs `IfaceMap::instance()`). Used by [`dest_is_unicast`].
-fn host_broadcast_addrs() -> HashSet<Ipv4Addr> {
-    IfaceMap::new()
+fn host_broadcast_addrs() -> std::io::Result<HashSet<Ipv4Addr>> {
+    Ok(IfaceMap::new()?
         .all()
         .into_iter()
         .filter_map(|i| i.broadcast)
-        .collect()
+        .collect())
 }
 
+#[cfg(tokio_backend)]
 #[tokio::main]
 async fn main() {
-    let args = Args::parse();
+    // pvxs's mshim returns 1 from its bad-option arm (`tools/mshim.cpp`);
+    // `Args::parse()` would exit with clap's 2.
+    let args: Args =
+        epics_pva_rs::cli::parse_or_exit_styled(epics_pva_rs::cli::UsageErrorStyle::Pvxs);
 
     // pvxs `-V` prints version_information and exits before binding any
     // socket (mshim `case 'V'`).
@@ -349,7 +359,16 @@ async fn main() {
     // Snapshot the host's interface subnet-broadcast addresses once so a
     // SEARCH forwarded to e.g. `192.168.1.255` is classified broadcast,
     // not unicast — pvxs `IfaceMap::is_broadcast` parity (mshim.cpp:141).
-    let host_broadcasts = Arc::new(host_broadcast_addrs());
+    let host_broadcasts = match host_broadcast_addrs() {
+        Ok(a) => Arc::new(a),
+        Err(e) => {
+            // Without the snapshot every forwarded broadcast would be
+            // misclassified as unicast, so this is fatal rather than an
+            // empty set that silently changes the forwarding decision.
+            eprintln!("mshim-rs: interface enumeration: {e}");
+            std::process::exit(1);
+        }
+    };
 
     eprintln!(
         "mshim-rs: listening on {} endpoint(s), forwarding to {} target(s)",
@@ -485,6 +504,20 @@ async fn futures_join_all(handles: Vec<tokio::task::JoinHandle<()>>) {
     for h in handles {
         let _ = h.await;
     }
+}
+
+/// The `exec_backend` arm. The shim's whole job is forwarding UDP between
+/// interfaces and every collector waits on `server_native::udp`, which is
+/// `tokio_backend`-only. Nothing replaces it here: an RTEMS image does not run
+/// mshim.
+#[cfg(exec_backend)]
+fn main() -> std::process::ExitCode {
+    eprintln!(
+        "mshim-rs: this build selects the reactor-free execution backend \
+         (EPICS_RS_BUILD_EXEC_BACKEND=thread), and the UDP forwarder needs a \
+         tokio reactor. Unset that variable and rebuild."
+    );
+    std::process::ExitCode::FAILURE
 }
 
 #[cfg(test)]
@@ -715,6 +748,7 @@ mod tests {
         ));
     }
 
+    #[cfg(tokio_backend)]
     /// End-to-end wire.
     ///
     /// A real SEARCH datagram forwarded to a `-F <subnet-broadcast>`

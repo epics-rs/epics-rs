@@ -11,13 +11,19 @@
 //!   - The PUT wire path itself across implementations. A bug in
 //!     either side's PUT request encoder / response decoder would
 //!     silently desync without this check.
+// The tests that drive a live server are `tokio_backend`-only, so on
+// `exec_backend` the fixtures and imports they share go unreferenced while the
+// rest of this file still runs. The default build lints it in full.
+#![cfg_attr(exec_backend, allow(dead_code, unused_imports))]
 
-// RTEMS-EXEC-MODEL-ALLOW(2): not run by the default nextest profile - this file is a module of the `interop_pvxs` binary, which `.config/nextest.toml`'s default-filter excludes.
+// RTEMS-EXEC-MODEL-ALLOW(1): not run by the default nextest profile - this file is a module of the `interop_pvxs` binary, which `.config/nextest.toml`'s default-filter excludes.
 
-use super::interop_helpers::{PVXGET, PVXPUT, pvxs_command, require_pvxs};
+use super::interop_helpers::{LogCapture, PVXGET, PVXPUT, pvxs_command, require_pvxs};
 
 use epics_pva_rs::pvdata::{FieldDesc, PvField, PvStructure, ScalarType, ScalarValue};
-use epics_pva_rs::server_native::{PvaServer, SharedPV, SharedSource};
+#[cfg(tokio_backend)]
+use epics_pva_rs::server_native::PvaServer;
+use epics_pva_rs::server_native::{SharedPV, SharedSource};
 
 use std::process::Stdio;
 use std::sync::Arc;
@@ -27,51 +33,19 @@ fn pvxs_lib_dir_str() -> std::ffi::OsString {
     super::interop_helpers::pvxs_lib_dir().into_os_string()
 }
 
+#[cfg(tokio_backend)]
 /// Direction A: pvxput → Rust SharedPV → readback via Rust SharedPV::current().
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn interop_put_a_pvxput_writes_into_rust_server() {
-    use std::sync::{Mutex, OnceLock};
-
     let Some(pvxput) = require_pvxs(PVXPUT) else {
         return;
     };
 
-    // One-shot tracing subscriber: captures the Rust server's
-    // debug output for the failure message.
-    static BUF: OnceLock<std::sync::Arc<Mutex<Vec<u8>>>> = OnceLock::new();
-    let buf = BUF
-        .get_or_init(|| std::sync::Arc::new(Mutex::new(Vec::new())))
-        .clone();
-    static INSTALL: OnceLock<()> = OnceLock::new();
-    INSTALL.get_or_init(|| {
-        use tracing_subscriber::fmt::MakeWriter;
-        #[derive(Clone)]
-        struct W(std::sync::Arc<Mutex<Vec<u8>>>);
-        impl<'a> MakeWriter<'a> for W {
-            type Writer = W;
-            fn make_writer(&'a self) -> Self::Writer {
-                self.clone()
-            }
-        }
-        impl std::io::Write for W {
-            fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
-                self.0.lock().unwrap().extend_from_slice(b);
-                Ok(b.len())
-            }
-            fn flush(&mut self) -> std::io::Result<()> {
-                Ok(())
-            }
-        }
-        let _ = tracing_subscriber::fmt()
-            .with_env_filter(
-                tracing_subscriber::EnvFilter::try_new("epics_pva_rs=debug")
-                    .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("debug")),
-            )
-            .with_writer(W(buf.clone()))
-            .with_ansi(false)
-            .try_init();
-    });
-    let start_len = buf.lock().unwrap().len();
+    // Captures the Rust server's debug output for the failure message
+    // below. This test only decorates a panic with it, so losing the
+    // capture cost it nothing — but the install it used to do was the one
+    // that blinded `pipeline_r20`, whose assertion is ON the output.
+    let log = LogCapture::start();
 
     // Rust server hosting two writable PVs. pvxs has no implicit-writable
     // SharedPV, and neither does the Rust port: a plain SharedPV::new()
@@ -145,10 +119,7 @@ async fn interop_put_a_pvxput_writes_into_rust_server() {
         .await
         .expect("join");
         if !out.status.success() {
-            let server_log = {
-                let g = buf.lock().unwrap();
-                String::from_utf8_lossy(&g[start_len..]).to_string()
-            };
+            let server_log = log.text();
             panic!(
                 "pvxput {pv} {val} exit={:?}\npvxput stderr: {}\n--- Rust server log ---\n{server_log}",
                 out.status,
@@ -196,16 +167,18 @@ async fn interop_put_b_rust_client_writes_into_pvxs_server() {
         return;
     };
     // Build reverse_server (re-uses batch-1 helper compile pipeline).
-    let Some(helper) = super::interop_helpers::cpp_helper("reverse_server") else {
+    // The only absent-prerequisite skip on this path; everything past it
+    // is our own helper, so it panics rather than skipping.
+    if super::interop_helpers::require_cxx().is_none() {
         return;
-    };
+    }
+    let helper = super::interop_helpers::cpp_helper("reverse_server");
 
     let port = {
         let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         l.local_addr().unwrap().port()
     };
-    let ready = std::env::temp_dir().join(format!("rev_ready_w.{port}"));
-    let _ = std::fs::remove_file(&ready);
+    let ready = super::interop_helpers::ReadyFile::new("rev_ready_w");
 
     let env_key = if cfg!(target_os = "macos") {
         "DYLD_LIBRARY_PATH"
@@ -217,7 +190,7 @@ async fn interop_put_b_rust_client_writes_into_pvxs_server() {
         .arg("--port")
         .arg(port.to_string())
         .arg("--ready")
-        .arg(&ready)
+        .arg(ready.path())
         .arg("--writable")
         .env(env_key, pvxs_lib_dir_str())
         .stdout(Stdio::piped())
@@ -225,15 +198,12 @@ async fn interop_put_b_rust_client_writes_into_pvxs_server() {
         .spawn()
     {
         Ok(c) => c,
-        Err(e) => {
-            eprintln!("SKIP: failed to spawn reverse_server: {e}");
-            return;
-        }
+        Err(e) => panic!("failed to spawn reverse_server: {e}"),
     };
 
     let mut up = false;
     for _ in 0..50 {
-        if ready.exists() {
+        if ready.is_up() {
             up = true;
             break;
         }
@@ -242,10 +212,8 @@ async fn interop_put_b_rust_client_writes_into_pvxs_server() {
     if !up {
         let _ = child.kill();
         let _ = child.wait();
-        eprintln!("SKIP: reverse_server did not become ready");
-        return;
+        panic!("reverse_server did not become ready");
     }
-    let _ = std::fs::remove_file(&ready);
 
     let addr: std::net::SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
     let client = epics_pva_rs::client_native::PvaClient::builder()

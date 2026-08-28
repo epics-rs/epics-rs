@@ -98,12 +98,6 @@ default = ["tls", "pkcs12", "client"]
 # gate-out territory). The wire decoder the server needs is NOT part of this
 # feature — it is the always-compiled `crate::decode`.
 client = []
-# Host-selectable RTEMS execution model — passthrough to
-# `epics-base-rs/rtems-exec-model`, exactly as `epics-ca-rs` declares it.
-# Routes the `runtime::task` seam to the std-thread background executor on a
-# hosted target, which is what compiles `realtime-pva-ioc`'s real entry point
-# off RTEMS so it can be linted and tested here. OFF by default.
-rtems-exec-model = ["epics-base-rs/rtems-exec-model"]
 # The RTEMS bring-up measurement rig's client-side instrumentation — the twin
 # of `epics-ca-rs/bringup-probes`, and forwarded from
 # `epics-bridge-rs/bringup-probes` so `realtime-pva-ioc`'s probe image can read
@@ -209,11 +203,14 @@ windows-sys = { version = "0.59", features = [
 ] }
 
 [dev-dependencies]
+# Dev-only and `path`-only, so `cargo package` drops it from the uploaded
+# manifest: the source guards in this crate share one production-slice rule.
+source-guard = { path = "../source-guard" }
 # Dev-only, path-only (no `version`, so `cargo publish` strips the entry
-# entirely): the shared `rtems-exec-model` test-gating census, called by
+# entirely): the shared exec-backend test-gating census, called by
 # `tests/rtems_exec_model_gate.rs`. Shared rather than copied because every
-# crate that declares the feature has the same hole, and three copies of a
-# 300-line audit is how three copies of a rule come to disagree.
+# crate that derives the backend has the same hole, and a 300-line audit
+# copied once per crate is how copies of a rule come to disagree.
 rtems-exec-gate = { path = "../../tools/rtems-exec-gate" }
 rcgen = "0.13"
 tempfile = "3"

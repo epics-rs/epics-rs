@@ -10,16 +10,17 @@
 //!   Owning a single writer task lets every channel/op share the connection
 //!   safely without holding an `AsyncMutex` across awaits.
 //! - **Heartbeat**: sends an application `CMD_ECHO` every
-//!   `max(1, min(15, tcp_timeout×3/8))` s (pvxs clientconn.cpp:163-165,496);
+//!   `max(1, min(15, tcp_timeout×3/8))` s (pvxs clientconn.cpp:163-165,494);
 //!   if no `last_rx` update has happened for `tcp_timeout`, declares the
-//!   connection dead (pvxs clientconn.cpp:73-74).
+//!   connection dead (pvxs clientconn.cpp:71-72).
 //!
 //! When any task exits (read EOF, write error, or heartbeat timeout) the
 //! cancellation token fires and the connection is torn down. Channels
 //! holding an `Arc<ServerConn>` observe the closed state via [`ServerConn::is_alive`]
 //! and transition to "Reconnecting".
 
-// RTEMS-EXEC-MODEL-ALLOW(3): checked - these run and pass in the feature-ON suite.
+// RTEMS-EXEC-MODEL-ALLOW(3): checked - these run and pass in the exec-backend
+// suite.
 use std::collections::VecDeque;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -34,9 +35,9 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 // `tokio::net` does not exist — one import line was an E0432 that poisoned this
 // whole module, and rustc then suppressed every downstream error in code naming
 // its items. That is what made `ops_v2.rs` report zero errors for the target
-// without that zero meaning anything (`doc/pvalink-rtems-design.md` §1.2, §6
-// item 1). Both remaining uses sit inside `cfg` blocks that the target does not
-// compile, so they name the type by full path and the module resolves cleanly.
+// without that zero meaning anything. Both remaining uses sit inside `cfg`
+// blocks that the target does not compile, so they name the type by full path
+// and the module resolves cleanly.
 use epics_base_rs::runtime::task::{interval, timeout};
 use tokio::sync::{mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
@@ -89,7 +90,7 @@ pub struct ConnConfig {
     /// `Config::operationTimeout`).
     pub op_timeout: Duration,
     /// TCP idle timeout governing the heartbeat task (pvxs
-    /// `effective.tcpTimeout`, clientconn.cpp:73-74).
+    /// `effective.tcpTimeout`, clientconn.cpp:71-72).
     pub tcp_timeout: Duration,
     /// optional opt-in cap on a single inbound message's
     /// payload length. `None` = **unbounded**, matching pvxs, which
@@ -105,12 +106,23 @@ pub struct ConnConfig {
 /// Routing slot for a registered IOID.
 ///
 /// GET/PUT register a `TwoShot` (2 oneshots for INIT + DATA).
-/// MONITOR registers a `Stream` (unbounded mpsc).
+/// MONITOR registers a `Monitor` — a BOUNDED, tail-squashing backlog.
+///
+/// The bound belongs to MONITOR alone. Every other slot answers a request
+/// the client itself sent, so its frame count is fixed by the op; a
+/// MONITOR is the one slot the *server* drives, and an unbounded channel
+/// exerts no back-pressure on it. pvxs bounds exactly the same thing and
+/// nothing else (`MonitorOp::queueSize`, `clientmon.cpp:52,683-699`).
 pub(crate) enum IoidSlot {
     /// Pipelined two-frame ops (GET, PUT, RPC): FIFO queue of oneshots.
     TwoShot(VecDeque<oneshot::Sender<Frame>>),
-    /// Streaming ops (MONITOR): unbounded channel.
+    /// Multi-frame ops whose frame count the op itself bounds (GetField,
+    /// PUT sequences, RPC, PUT_GET, ARRAY, PROCESS): unbounded channel.
     Stream(mpsc::UnboundedSender<Frame>),
+    /// MONITOR: the server-driven stream, bounded at the subscription's
+    /// `queueSize` with pvxs's tail squash
+    /// ([`crate::client_native::monitor_queue`]).
+    Monitor(crate::client_native::monitor_queue::MonitorSink),
     /// Long-lived warm-GET op: a single mutex-guarded oneshot slot
     /// that the caller refills before each new GET frame send. Lets
     /// the channel skip INIT for subsequent GETs against the same
@@ -176,7 +188,7 @@ pub struct ServerConn {
     op_introspection: Arc<DashMap<u32, crate::pvdata::FieldDesc>>,
     /// Per-channel (by server-assigned SID) byte counters + PV name, for
     /// pvxs `Context::report` per-channel `Report::Channel` parity
-    /// (client.cpp:464-501). pvxs bumps `chan->statTx` on each op-body send
+    /// (src/client.cpp:464-501). pvxs bumps `chan->statTx` on each op-body send
     /// (clientget.cpp:321, clientmon.cpp:143, …) and `chan->statRx` on each
     /// op reply decode (clientget.cpp:496, clientmon.cpp:608); we mirror that
     /// via [`Self::send_for_channel`] and the IOID→SID attribution in
@@ -189,7 +201,7 @@ pub struct ServerConn {
 /// Per-channel byte counters tracked on a [`ServerConn`], keyed by the
 /// server-assigned SID. Mirrors pvxs `Channel::statTx` / `statRx` +
 /// `Channel::name` (the fields `Context::report` copies into each
-/// `Report::Channel`, client.cpp:495-496).
+/// `Report::Channel`, src/client.cpp:495-496).
 #[derive(Debug)]
 struct ChanStat {
     name: String,
@@ -286,9 +298,8 @@ static PVA_DIAL_ATTEMPTS: std::sync::atomic::AtomicUsize = std::sync::atomic::At
 /// BRING-UP PROBE: `(workers created, dial attempts submitted)` for the PVA
 /// client's dial pool.
 ///
-/// Behind `bringup-probes` with the rest of the measurement rig
-/// (`doc/pvalink-rtems-design.md` §12): a default image compiles neither the
-/// counter nor this accessor.
+/// Behind `bringup-probes` with the rest of the measurement rig: a default
+/// image compiles neither the counter nor this accessor.
 #[cfg(feature = "bringup-probes")]
 pub fn dial_pool_probe() -> (usize, usize) {
     (
@@ -319,7 +330,7 @@ pub fn dial_pool_probe() -> (usize, usize) {
 /// `realtime-pva-ioc`): the single `cbMedium` worker sat in `poll(timeout=39999)`
 /// under `TcpStream::connect_timeout` ← `dial_blocking` ← `ns_task` — a name
 /// server that did not answer starved every future on Medium for ~40 s per
-/// attempt (the executor failure class of `doc/qsrv-rtems-design.md` §9.15.1).
+/// attempt.
 ///
 /// So the connect takes a dial thread — the CA client's `dial_blocking` shape
 /// (`epics-ca-rs/src/client/transport.rs`) — at the same band as the two pumps
@@ -352,8 +363,7 @@ pub fn dial_pool_probe() -> (usize, usize) {
 /// blocking needs no poll machinery. (An earlier measurement blamed
 /// `connect_timeout` for aborting on the RTEMS target; that RST was forged
 /// by the QEMU rig's SLIRP hub port, not sent by the guest, and the claim is
-/// withdrawn — `doc/pvalink-rtems-design.md` §6 item 4. The same target
-/// dials out and connects once the rig is fixed.)
+/// withdrawn. The same target dials out and connects once the rig is fixed.)
 ///
 /// The application-level bound (`connect_timeout`, pvxs `operationTimeout`)
 /// therefore moves to the awaiting side: `runtime::task::timeout` around the
@@ -440,17 +450,16 @@ async fn dial_blocking(
 ///
 /// The arm is chosen by the *backend*, not by the target. `exec_backend` is
 /// `epics_embedded_target` (`target_os` in `{"rtems", "vxworks"}`) **or**
-/// `--features rtems-exec-model` (`build.rs`), and what both share is that a
-/// future started through `runtime::task::spawn` runs with no tokio reactor
-/// entered — on RTEMS or VxWorks because there is none and `tokio::net` does
-/// not compile for either triple, on a host exec-model build because the
-/// future lands on a callback-pool worker the runtime was never entered on.
-/// A `tokio::net::TcpStream::connect` there panics ("there is no reactor
-/// running") even though the process has a runtime elsewhere. Gating
+/// `EPICS_RS_BUILD_EXEC_BACKEND=thread` (`build.rs`), and what both share is
+/// that a future started through `runtime::task::spawn` runs with no tokio
+/// reactor entered — on RTEMS or VxWorks because there is none and
+/// `tokio::net` does not compile for either triple, on a host exec-model build
+/// because the future lands on a callback-pool worker the runtime was never
+/// entered on. A `tokio::net::TcpStream::connect` there panics ("there is no
+/// reactor running") even though the process has a runtime elsewhere. Gating
 /// this seam on `target_os = "rtems"` named the target where the fact it needs
 /// is the backend, which is why `realtime-pva-ioc` still panicked on its first
-/// dial after the UDP seam was fixed (`doc/calink-rtems-design.md` §10.10
-/// item 2).
+/// dial after the UDP seam was fixed.
 ///
 /// The returned halves are the same `DynRead`/`DynWrite` the TLS path produces,
 /// which is the whole reason the client needed no protocol change to gain a
@@ -468,8 +477,7 @@ async fn dial_blocking(
 ///   (`blocking_io::write_frame_deadline`); the hosted writer task has no such
 ///   bound and needs none. Callers pass the connection's own liveness bound —
 ///   `ConnConfig::tcp_timeout` — so the pump can never end a circuit the
-///   protocol would still consider alive. Recorded as a deviation in
-///   `doc/pvalink-rtems-design.md` §9.
+///   protocol would still consider alive.
 pub(crate) async fn dial_pva(
     target: SocketAddr,
     connect_timeout: Duration,
@@ -499,8 +507,9 @@ impl ServerConn {
     ///
     /// `op_timeout` guards the handshake I/O; `tcp_timeout` is stored and
     /// used by the spawned heartbeat task as the connection idle timeout
-    /// (pvxs `effective.tcpTimeout`, clientconn.cpp:73-74).
+    /// (pvxs `effective.tcpTimeout`, clientconn.cpp:71-72).
     pub async fn connect(
+        reactor: &epics_base_rs::runtime::task::Reactor,
         target: SocketAddr,
         user: &str,
         host: &str,
@@ -508,7 +517,7 @@ impl ServerConn {
     ) -> PvaResult<Arc<Self>> {
         let (reader, writer) = dial_pva(target, conn.op_timeout, conn.tcp_timeout).await?;
         // Plain `pva://` TCP — no TLS, so no server X.509 identity.
-        Self::run_handshake_and_spawn(target, reader, writer, None, user, host, conn).await
+        Self::run_handshake_and_spawn(reactor, target, reader, writer, None, user, host, conn).await
     }
 
     /// Open a plain TCP connection driven by **two blocking threads** instead of
@@ -533,13 +542,14 @@ impl ServerConn {
     /// that wants it explicitly, and for tests that want both transports in one
     /// binary.
     pub async fn connect_blocking(
+        reactor: &epics_base_rs::runtime::task::Reactor,
         target: SocketAddr,
         user: &str,
         host: &str,
         conn: ConnConfig,
     ) -> PvaResult<Arc<Self>> {
         let (reader, writer) = dial_blocking(target, conn.op_timeout, conn.tcp_timeout).await?;
-        Self::run_handshake_and_spawn(target, reader, writer, None, user, host, conn).await
+        Self::run_handshake_and_spawn(reactor, target, reader, writer, None, user, host, conn).await
     }
 
     /// Open a TLS-wrapped connection (`pvas://`).
@@ -549,6 +559,7 @@ impl ServerConn {
     /// plumbing that reaches it compiles either way (see [`crate::auth`]).
     #[cfg(feature = "tls")]
     pub async fn connect_tls(
+        reactor: &epics_base_rs::runtime::task::Reactor,
         target: SocketAddr,
         server_name: &str,
         tls: Arc<crate::auth::TlsClientConfig>,
@@ -586,14 +597,25 @@ impl ServerConn {
         let (reader, writer) = tokio::io::split(tls_stream);
         let reader: DynRead = Box::new(reader);
         let writer: DynWrite = Box::new(writer);
-        Self::run_handshake_and_spawn(target, reader, writer, server_identity, user, host, conn)
-            .await
+        Self::run_handshake_and_spawn(
+            reactor,
+            target,
+            reader,
+            writer,
+            server_identity,
+            user,
+            host,
+            conn,
+        )
+        .await
     }
 
     /// Internal: takes already-split read/write halves, runs the handshake,
     /// then spawns the reader/writer/heartbeat tasks. Used by both
     /// [`Self::connect`] and [`Self::connect_tls`].
+    #[allow(clippy::too_many_arguments)] // the `reactor` capability is the 8th
     async fn run_handshake_and_spawn(
+        reactor: &epics_base_rs::runtime::task::Reactor,
         target: SocketAddr,
         mut reader: DynRead,
         writer: DynWrite,
@@ -662,7 +684,7 @@ impl ServerConn {
         let cancel_writer = cancel.clone();
         let alive_writer = alive.clone();
         let bytes_tx_writer = bytes_tx.clone();
-        epics_base_rs::runtime::task::spawn(async move {
+        reactor.spawn(async move {
             let mut batch = Vec::with_capacity(8192);
             loop {
                 tokio::select! {
@@ -703,7 +725,7 @@ impl ServerConn {
         let chan_stats_reader = chan_stats.clone();
         let writer_tx_reader = writer_tx.clone();
         let out_order_reader = out_order.clone();
-        epics_base_rs::runtime::task::spawn(async move {
+        reactor.spawn(async move {
             let mut buf = rx_buf;
             let mut chunk = vec![0u8; 4096];
             // client-side segmented-message reassembly. Mirror
@@ -963,9 +985,9 @@ impl ServerConn {
         let last_rx_hb = last_rx_nanos.clone();
         let writer_tx_hb = writer_tx.clone();
         let out_order_hb = out_order.clone();
-        epics_base_rs::runtime::task::spawn(async move {
+        reactor.spawn(async move {
             // pvxs clientconn.cpp:163-165: echo interval = max(1, min(15, tcpTimeout * 3/8))
-            // pvxs clientconn.cpp:73-74: socket inactivity timeout = tcpTimeout
+            // pvxs clientconn.cpp:71-72: socket inactivity timeout = tcpTimeout
             let hb_interval = Duration::from_secs_f64(crate::config::env::echo_period_secs(
                 tcp_timeout.as_secs_f64(),
             ));
@@ -984,7 +1006,7 @@ impl ServerConn {
                             break;
                         }
                         // Heartbeat probe = application CMD_ECHO with an
-                        // empty payload, matching pvxs clientconn.cpp:496
+                        // empty payload, matching pvxs clientconn.cpp:494
                         // (`Header{CMD_ECHO, 0, 0}`); the server echoes it
                         // back (serverconn.cpp:166-178). A *control*
                         // EchoRequest is drained and ignored by pvxs
@@ -1077,7 +1099,7 @@ impl ServerConn {
     /// Register a channel's PV name under its server-assigned SID so this
     /// connection can attribute per-channel byte traffic for
     /// `PvaClient::report` (pvxs adds the channel to `conn->chanBySID`,
-    /// client.cpp:495). Idempotent: re-registering the same SID refreshes
+    /// src/client.cpp:495). Idempotent: re-registering the same SID refreshes
     /// the name and keeps existing counters.
     pub fn register_channel(&self, sid: u32, name: &str) {
         self.chan_stats.entry(sid).or_insert_with(|| ChanStat {
@@ -1099,7 +1121,7 @@ impl ServerConn {
     /// `PvaClient::report`. When `zero` is true each channel's counters are
     /// reset after the read, matching the connection-level
     /// [`Self::byte_counters`] delta semantics and pvxs
-    /// `Context::report(zero)` (client.cpp:499).
+    /// `Context::report(zero)` (src/client.cpp:499).
     pub fn channel_reports(&self, zero: bool) -> Vec<(String, u32, u64, u64)> {
         self.chan_stats
             .iter()
@@ -1147,7 +1169,7 @@ impl ServerConn {
     /// A dead circuit or a gone writer task is [`PvaError::Disconnected`],
     /// the same condition a dropped IOID slot reports on the receive side:
     /// the op lost its transport, which pvxs answers by re-queueing the op
-    /// (`client.cpp:198-204` → `clientget.cpp:380-404`), not by handing the
+    /// (`src/client.cpp:198-204` → `clientget.cpp:380-404`), not by handing the
     /// caller a protocol error. `requeue_on_disconnect` acts on the variant,
     /// so a send that races the circuit's death re-searches like a lost
     /// reply does instead of ending the operation.
@@ -1225,7 +1247,11 @@ impl ServerConn {
         (rx1, rx2)
     }
 
-    /// Register a stream of frames matching a particular ioid (MONITOR).
+    /// Register a stream of frames matching a particular ioid, for an op
+    /// whose reply count the op itself bounds (GetField, the PUT
+    /// sequences, RPC, PUT_GET, ARRAY, PROCESS).
+    ///
+    /// NOT for MONITOR — see `Self::register_ioid_monitor`.
     pub fn register_ioid_stream(
         &self,
         sid: u32,
@@ -1237,6 +1263,34 @@ impl ServerConn {
         self.ioid_to_sid.insert(ioid, sid);
         self.ioid_to_cmd.insert(ioid, expected_cmd);
         rx
+    }
+
+    /// Register the bounded backlog for one MONITOR ioid.
+    ///
+    /// `limit` is the subscription's negotiated `queueSize` (pvxs's
+    /// builder default 4) and `pipeline` its credit-window flag; together
+    /// they are pvxs's squash predicate
+    /// (`queue.size() >= queueSize && !pipeline`, `clientmon.cpp:684-686`).
+    /// The caller must [`MonitorBacklog::arm`] the returned handle with
+    /// the INIT reply's introspection before sending START, because a
+    /// squash is a changed-bitset merge and cannot be done without the
+    /// descriptor.
+    ///
+    /// [`MonitorBacklog::arm`]: crate::client_native::monitor_queue::MonitorBacklog::arm
+    pub(crate) fn register_ioid_monitor(
+        &self,
+        sid: u32,
+        ioid: u32,
+        expected_cmd: u8,
+        limit: usize,
+        pipeline: bool,
+    ) -> Arc<crate::client_native::monitor_queue::MonitorBacklog> {
+        let (sink, backlog) =
+            crate::client_native::monitor_queue::MonitorSink::new(limit, pipeline);
+        self.by_ioid.insert(ioid, IoidSlot::Monitor(sink));
+        self.ioid_to_sid.insert(ioid, sid);
+        self.ioid_to_cmd.insert(ioid, expected_cmd);
+        backlog
     }
 
     /// Register a reusable single-frame slot for warm-GET reuse.
@@ -1597,7 +1651,7 @@ fn route_frame_checked(
             // teardown: drop this SID's `ClientReport` counters too, matching
             // pvxs `Channel::disconnect()` (called on disconnect OR
             // CMD_DESTROY_CHANNEL) which does `current->chanBySID.erase(sid)`
-            // in the Active case (client.cpp:149,170). Without this the report
+            // in the Active case (src/client.cpp:149,170). Without this the report
             // still lists the destroyed channel until the next ChannelState
             // transition, and a same-connection SID reuse keeps the stale
             // name/counters because `register_channel` is `or_insert_with`.
@@ -1699,6 +1753,9 @@ fn route_frame_checked(
                 }
                 IoidSlot::Stream(tx) => {
                     let _ = tx.send(frame);
+                }
+                IoidSlot::Monitor(sink) => {
+                    sink.push(frame);
                 }
                 IoidSlot::Reusable(slot) => {
                     // Take the current sender (if any) and fulfil it.
@@ -2335,7 +2392,7 @@ mod tests {
     /// A
     /// server-initiated `CMD_DESTROY_CHANNEL` must also drop the destroyed
     /// SID's `ClientReport` (`chan_stats`) entry, matching pvxs
-    /// `Channel::disconnect()` doing `chanBySID.erase(sid)` (client.cpp:170).
+    /// `Channel::disconnect()` doing `chanBySID.erase(sid)` (src/client.cpp:170).
     /// Before the fix the branch removed the IOID maps and close signal but
     /// left `chan_stats` populated, so a report taken before the next state
     /// transition still listed the destroyed channel, and a same-connection
@@ -2632,11 +2689,11 @@ mod tests {
     /// pvxs tears the circuit down for every server frame it cannot decode:
     /// `handle_MESSAGE` throws on `!M.good()` (clientconn.cpp:454-455) and the
     /// dispatch catch calls `bev.reset()` (conn.cpp:277-281); CREATE_CHANNEL
-    /// (:334-338), DESTROY_CHANNEL (:417-421) and the op handlers
-    /// (clientget.cpp:490-494) call `bev.reset()` directly. The port used to
-    /// swallow all of them and keep serving a peer that had already corrupted
-    /// the stream. An *unknown* command stays ignorable — pvxs drains its body
-    /// for forward compatibility (conn.cpp:250-252).
+    /// (clientconn.cpp:334-338), DESTROY_CHANNEL (clientconn.cpp:417-421) and
+    /// the op handlers (clientget.cpp:489-492) call `bev.reset()` directly.
+    /// The port used to swallow all of them and keep serving a peer that had
+    /// already corrupted the stream. An *unknown* command stays ignorable —
+    /// pvxs drains its body for forward compatibility (conn.cpp:250-252).
     #[test]
     fn malformed_server_frames_are_circuit_fatal() {
         let order = ByteOrder::Little;
@@ -2842,7 +2899,7 @@ mod tests {
     /// be alive at the 4 s deadline.
     ///
     /// pvxs upstream:
-    ///   - inactivity timeout = `tcpTimeout`     (clientconn.cpp:73-74)
+    ///   - inactivity timeout = `tcpTimeout`     (clientconn.cpp:71-72)
     ///   - echo interval = max(1, min(15, tcpTimeout × 3/8)) (clientconn.cpp:163-165)
     #[tokio::test]
     async fn pva_r2_tcp_timeout_applied() {
@@ -2926,6 +2983,7 @@ mod tests {
         let op_timeout = Duration::from_secs(2);
 
         let conn = ServerConn::connect(
+            &crate::test_reactor(),
             addr,
             "testuser",
             "testhost",
@@ -3052,6 +3110,7 @@ mod tests {
         // the fix (control probe, no reply) `last_rx` would go stale and
         // the heartbeat declares the connection dead at ~3 s.
         let conn = ServerConn::connect(
+            &crate::test_reactor(),
             addr,
             "testuser",
             "testhost",
@@ -3143,6 +3202,7 @@ mod tests {
         });
 
         let conn = ServerConn::connect_blocking(
+            &crate::test_reactor(),
             addr,
             "testuser",
             "testhost",
@@ -3179,8 +3239,7 @@ mod tests {
     /// single `cbMedium` worker sat in `poll(timeout=39999)` under
     /// `TcpStream::connect_timeout` ← `dial_blocking` ← `ns_task` — a
     /// synchronous dial to a SYN-blackholed name server held the band for
-    /// ~40 s per attempt, starving everything scheduled on Medium (the same
-    /// executor failure class as `doc/qsrv-rtems-design.md` §9.15.1: one
+    /// ~40 s per attempt, starving everything scheduled on Medium (one
     /// occupant on a band = broad delivery starvation).
     ///
     /// Exec-backend-only: the callback band being pinned is the exec
@@ -3265,7 +3324,7 @@ mod tests {
             // The dial, spawned exactly as `ns_task` is: `runtime::task::spawn`
             // → the default (Medium) callback band and its single worker.
             let (dial_tx, _dial_rx) = std::sync::mpsc::channel();
-            epics_base_rs::runtime::task::spawn(async move {
+            crate::test_reactor().spawn(async move {
                 let _ = dial_tx.send(
                     dial_pva(addr, Duration::from_secs(10), Duration::from_secs(10))
                         .await
@@ -3277,7 +3336,7 @@ mod tests {
 
             // Canary on the same band, behind the stalled dial.
             let (tx, rx) = std::sync::mpsc::channel();
-            epics_base_rs::runtime::task::spawn(async move {
+            crate::test_reactor().spawn(async move {
                 let _ = tx.send(());
             });
             assert!(
@@ -3321,7 +3380,7 @@ mod tests {
             // test: dropping the reader adapter shuts the socket down, so
             // the halves must outlive the acceptor's read.
             let (dial_tx, dial_rx) = std::sync::mpsc::channel();
-            epics_base_rs::runtime::task::spawn(async move {
+            crate::test_reactor().spawn(async move {
                 let res =
                     match dial_pva(addr, Duration::from_secs(15), Duration::from_secs(15)).await {
                         Ok((reader, mut writer)) => writer
@@ -3364,7 +3423,7 @@ mod tests {
 
             let started = std::time::Instant::now();
             let (tx, rx) = std::sync::mpsc::channel();
-            epics_base_rs::runtime::task::spawn(async move {
+            crate::test_reactor().spawn(async move {
                 let _ = tx.send(
                     dial_pva(addr, Duration::from_secs(10), Duration::from_secs(10))
                         .await
@@ -3436,7 +3495,7 @@ mod tests {
 
             for i in 0..DIALS {
                 let (tx, rx) = std::sync::mpsc::channel();
-                epics_base_rs::runtime::task::spawn(async move {
+                crate::test_reactor().spawn(async move {
                     let _ = tx.send(
                         dial_pva(addr, Duration::from_millis(200), Duration::from_secs(10))
                             .await
@@ -3563,7 +3622,7 @@ mod tests {
             let live_addr = live.local_addr().expect("addr");
             let acceptor = std::thread::spawn(move || live.accept().expect("accept").0);
             let (tx, rx) = std::sync::mpsc::channel();
-            epics_base_rs::runtime::task::spawn(async move {
+            crate::test_reactor().spawn(async move {
                 let _ = tx.send(
                     dial_pva(live_addr, Duration::from_secs(5), Duration::from_secs(10))
                         .await
@@ -3594,7 +3653,7 @@ mod tests {
 
             let started = std::time::Instant::now();
             let (tx, rx) = std::sync::mpsc::channel();
-            epics_base_rs::runtime::task::spawn(async move {
+            crate::test_reactor().spawn(async move {
                 let _ = tx.send(
                     dial_pva(addr, Duration::from_millis(500), Duration::from_secs(10))
                         .await
@@ -3639,7 +3698,7 @@ mod tests {
             });
 
             let (dial_tx, dial_rx) = std::sync::mpsc::channel();
-            epics_base_rs::runtime::task::spawn(async move {
+            crate::test_reactor().spawn(async move {
                 let res =
                     match dial_pva(addr, Duration::from_secs(10), Duration::from_secs(10)).await {
                         Ok((reader, mut writer)) => writer

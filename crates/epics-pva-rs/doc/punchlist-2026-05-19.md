@@ -6,8 +6,8 @@ Driver-managed punchlist. **Worker contract:**
 2. Before editing the cited line, run the **Anchor / Sites / Same defect / Distinct** audit per the global rule (see ~/.claude/CLAUDE.md "Fixes from reported defects"). Mandatory report header before edits.
 3. NEVER emit: `TODO`, `FIXME`, `unimplemented!()`, `#[allow(...)]` (to silence), `// later`, "next session", "out of scope" (unless user-scoped this round), "scope이 크다", "위험합니다", "다음에", "defer".
 4. **Upstream parity is the bar — no inventing semantics.** Every design decision (values, edge cases, where behaviour applies, defaults) MUST be grounded in the upstream C++ reference:
-   - pvxs:       `/Users/stevek/codes/pvxs`
-   - epics-base: `/Users/stevek/codes/epics-base`
+   - pvxs:       `$PVXS_HOME`
+   - epics-base: `$EPICS_BASE`
    Use `rg` in those trees BEFORE making decisions. Commit message and end-of-task report MUST include an **Upstream parity** section listing `pvxs:file:line` and/or `epics-base:file:line` your implementation mirrors for each behaviour. If you cannot find the upstream reference for a sub-behaviour, STOP and report — do NOT invent.
 5. Root cause fix at source. Comment-only "fix" = rejected. Type/API closure preferred over local patches when the global rule's "Invariant-driven fixes" section applies.
 5. After edits: `cargo fmt --all` → `cargo clippy -p epics-pva-rs --all-targets -- -D warnings` → `cargo nextest run -p epics-pva-rs`. If your change crosses crate boundaries, escalate to `--workspace`. Doctest changes → `cargo test --doc -p epics-pva-rs`.
@@ -40,7 +40,7 @@ When all items checked, run full-workspace `cargo clippy --workspace --all-targe
 - [x] **PVA-R4** (MEDIUM, architectural) — TCP name servers as persistent search peers (not direct-connect fallbacks). Client-side persistent name-server connection in `SearchEngine`. Server-side TCP SEARCH already cleared via R11.
   - Spec: `crates/epics-pva-rs/doc/critical-review-2026-05-18.md:148-183`
   - Deferral note: `crates/epics-pva-rs/doc/critical-review-2026-05-18.md:1261-1267`
-  - Done: worker A, commit `7dfe5de6` on `caucus/HJB9ABPH/worker` (commit subject typo says `BR-R4`, content is PVA-R4); regression `pva_r4_tcp_nameserver_persistent_peer`. `SearchEngine::spawn` now takes `name_servers: Vec<SocketAddr>`, spawns persistent `ns_task` per entry with full PVA TCP handshake + bidirectional SEARCH relay, reconnects every 10s; `Channel` NS fallback path removed. Upstream parity: pvxs `tcpNSCheckInterval`; client.cpp:828-846 (port-0 fixup).
+  - Done: worker A, commit `7dfe5de6` on `caucus/HJB9ABPH/worker` (commit subject typo says `BR-R4`, content is PVA-R4); regression `pva_r4_tcp_nameserver_persistent_peer`. `SearchEngine::spawn` now takes `name_servers: Vec<SocketAddr>`, spawns persistent `ns_task` per entry with full PVA TCP handshake + bidirectional SEARCH relay, reconnects every 10s; `Channel` NS fallback path removed. Upstream parity: pvxs `tcpNSCheckInterval`; src/client.cpp:828-846 (port-0 fixup).
 
 - [x] **PVA-R6** (MEDIUM, architectural) — `SharedPV` drops the newest update when a subscriber queue is full. Implement squash-to-tail semantics via `Mutex<VecDeque>+Notify` or `tokio::sync::watch` (tokio::mpsc has no sender-side drop-oldest).
   - Spec: `crates/epics-pva-rs/doc/critical-review-2026-05-18.md:259-294`

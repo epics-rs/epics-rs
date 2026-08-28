@@ -19,9 +19,12 @@
 //! [`crate::client_native::ops_v2::op_monitor_handle`] for the loop that
 //! re-issues INIT/START on each new server conn.
 
-// (1 search-timeout test gated out feature-ON below; §4.2 UDP search, stage 3.)
+// (1 search-timeout test gated out on the exec backend below; §4.2 UDP search,
+// stage 3.)
 
-// RTEMS-EXEC-MODEL-ALLOW(3): checked - these run and pass in the feature-ON suite.
+// RTEMS-EXEC-MODEL-ALLOW(2): checked - these run and pass in the exec-backend
+// suite.
+use epics_base_rs::runtime::task::Reactor;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -77,6 +80,12 @@ struct Candidate {
 pub struct Channel {
     pub pv_name: String,
     pub cid: u32,
+    /// The executor a channel's own tasks are spawned through. A `Channel`
+    /// is built inside the client's async context and every task it owns
+    /// (monitor loops, operation drivers, the connection handshake) belongs
+    /// to that same reactor, so the capability rides with the channel rather
+    /// than being re-derived from whatever thread happens to call a method.
+    reactor: Reactor,
     state: RwLock<ChannelState>,
     /// Serializes state transitions so concurrent ops don't open multiple
     /// connections.
@@ -89,7 +98,7 @@ pub struct Channel {
     op_timeout: std::time::Duration,
     /// TCP idle timeout threaded through to `ConnectionPool::get_or_connect`
     /// and ultimately into the per-connection heartbeat task.
-    /// pvxs `effective.tcpTimeout` (clientconn.cpp:73-74).
+    /// pvxs `effective.tcpTimeout` (clientconn.cpp:71-72).
     tcp_timeout: std::time::Duration,
     /// Shared connection pool (so multiple channels to the same server
     /// share a single TCP virtual circuit).
@@ -105,7 +114,7 @@ pub struct Channel {
     /// fresh connect, or `None` when reconnect may proceed immediately.
     /// Set per pvxs failure class (see `reconnect_holdoff`): a
     /// Connecting-stage TCP failure arms the fixed 10-bucket reconnect
-    /// holdoff (pvxs `Channel::disconnect`, client.cpp:156-165, pushed via
+    /// holdoff (pvxs `Channel::disconnect`, src/client.cpp:156-165, pushed via
     /// :206-214), a searched `CREATE_CHANNEL` refusal arms nothing (pvxs
     /// sets the channel back to Searching in the current bucket,
     /// clientconn.cpp:368-378), and a direct/forced-server refusal arms the
@@ -261,7 +270,7 @@ impl ConnectionPool {
     /// per-connection `(peer, bytes_rx, bytes_tx, alive, channels)`
     /// snapshot for `PvaClient::report`, where `channels` is the
     /// per-channel `(name, sid, bytes_rx, bytes_tx)` list pvxs copies into
-    /// each `Report::Connection::channels` (client.cpp:495-496). When `zero`
+    /// each `Report::Connection::channels` (src/client.cpp:495-496). When `zero`
     /// is true both the connection and the per-channel counters are reset
     /// after the read (pvxs `report(bool zero)` delta semantics).
     #[allow(clippy::type_complexity)]
@@ -295,6 +304,7 @@ impl ConnectionPool {
 
     pub async fn get_or_connect(
         self: &Arc<Self>,
+        reactor: &epics_base_rs::runtime::task::Reactor,
         addr: std::net::SocketAddr,
         user: &str,
         host: &str,
@@ -415,6 +425,7 @@ impl ConnectionPool {
                 #[cfg(feature = "tls")]
                 Some(cfg) => {
                     ServerConn::connect_tls(
+                        reactor,
                         addr,
                         &addr.ip().to_string(),
                         cfg,
@@ -426,7 +437,7 @@ impl ConnectionPool {
                 }
                 #[cfg(not(feature = "tls"))]
                 Some(cfg) => match *cfg {},
-                None => ServerConn::connect(addr, user, host, conn_config).await,
+                None => ServerConn::connect(reactor, addr, user, host, conn_config).await,
             };
             let fresh = connect_result?;
             let mut map = self.inner.lock();
@@ -496,14 +507,14 @@ impl ConnectionPool {
 
 /// A *searched* channel re-enters the search ring, and pvxs paces it by how
 /// far out it lands: a Connecting-stage TCP failure is pushed 10 buckets
-/// ahead, which at the 1 s tick is ~10 s (client.cpp:156-165, pushed onto
+/// ahead, which at the 1 s tick is ~10 s (src/client.cpp:156-165, pushed onto
 /// the ring at :206-214).
 const SEARCH_RING_HOLDOFF: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// A *forced-server* channel has no search ring, so the bucket count above
 /// is a coordinate in a space that does not exist here. pvxs paces it in the
 /// connection instead: `Channel::disconnect` rebuilds the circuit at once
-/// (client.cpp:206-224, `Connection::build(context, forcedServer, true)`)
+/// (src/client.cpp:206-224, `Connection::build(context, forcedServer, true)`)
 /// and the `reconn` flag arms a flat 2 s timer before `startConnecting()`
 /// (clientconn.cpp:26-32).
 const DIRECT_RECONNECT_HOLDOFF: std::time::Duration = std::time::Duration::from_secs(2);
@@ -539,7 +550,7 @@ enum FailureClass {
 /// search-ring bucket count doing duty on a channel that has no ring.
 ///
 /// - searched, Connecting-stage TCP failure → [`SEARCH_RING_HOLDOFF`]
-///   (pvxs client.cpp:156-165 / :206-214).
+///   (pvxs src/client.cpp:156-165 / :206-213).
 /// - searched, `CREATE_CHANNEL` refusal → no holdoff; pvxs sets the channel
 ///   back to Searching in the current bucket and the ≤1 s ring tick paces
 ///   the re-search (clientconn.cpp:368-378).
@@ -581,7 +592,9 @@ fn refusal_reenters_search(
 }
 
 impl Channel {
+    #[allow(clippy::too_many_arguments)] // the `reactor` capability is the 8th
     pub fn new(
+        reactor: Reactor,
         pv_name: String,
         user: String,
         host: String,
@@ -591,6 +604,7 @@ impl Channel {
         search: SearchEngine,
     ) -> Self {
         Self {
+            reactor,
             pv_name,
             cid: NEXT_CID.fetch_add(1, Ordering::Relaxed),
             state: RwLock::new(ChannelState::Idle),
@@ -613,7 +627,9 @@ impl Channel {
     }
 
     /// Construct a channel that targets a fixed server address (no UDP search).
+    #[allow(clippy::too_many_arguments)] // the `reactor` capability is the 8th
     pub fn new_direct(
+        reactor: Reactor,
         pv_name: String,
         user: String,
         host: String,
@@ -623,6 +639,7 @@ impl Channel {
         addr: std::net::SocketAddr,
     ) -> Self {
         Self {
+            reactor,
             pv_name,
             cid: NEXT_CID.fetch_add(1, Ordering::Relaxed),
             state: RwLock::new(ChannelState::Idle),
@@ -642,6 +659,11 @@ impl Channel {
             has_been_active: std::sync::atomic::AtomicBool::new(false),
             cached_get: parking_lot::Mutex::new(None),
         }
+    }
+
+    /// The reactor this channel's tasks are spawned through.
+    pub fn reactor(&self) -> &Reactor {
+        &self.reactor
     }
 
     pub fn current_state(&self) -> ChannelState {
@@ -767,7 +789,7 @@ impl Channel {
         // Connect-fail holdoff. After a recent connect/CreateChannel
         // failure we sleep for the remainder of the holdoff window
         // before re-issuing the search. pvxs Channel::disconnect
-        // (client.cpp:155-163) implements the same idea with a
+        // (src/client.cpp:155-163) implements the same idea with a
         // 10-bucket future-push on the search ring; here we
         // accumulate `2^min(fails-1, 4)` seconds (cap 16s) per
         // consecutive failure. Reset to zero on the next successful
@@ -946,6 +968,7 @@ impl Channel {
                 match self
                     .pool
                     .get_or_connect(
+                        self.reactor(),
                         cand.addr,
                         &self.user,
                         &self.host,
@@ -1052,7 +1075,7 @@ impl Channel {
             );
             // Register the PV name under this SID so the connection can
             // attribute per-channel byte traffic for `PvaClient::report`
-            // (pvxs `conn->chanBySID`, client.cpp:495).
+            // (pvxs `conn->chanBySID`, src/client.cpp:495).
             server.register_channel(sid, &self.pv_name);
             *self.last_close_registration.lock() = Some((sid, server.clone()));
             self.has_been_active
@@ -1130,10 +1153,14 @@ impl Channel {
 mod tests {
     use super::*;
 
+    /// Must be called from an async test body: a `Channel` holds the executor
+    /// its search and operation tasks are spawned on, so one built off an
+    /// executor is a shape `PvaClient` cannot produce.
     fn make_channel() -> Channel {
         let pool = ConnectionPool::new();
         let addr: std::net::SocketAddr = "127.0.0.1:5075".parse().unwrap();
         Channel::new_direct(
+            crate::test_reactor(),
             "TEST:PV".into(),
             "u".into(),
             "h".into(),
@@ -1146,7 +1173,7 @@ mod tests {
 
     /// One case per (failure class, resolver kind) boundary, because the
     /// resolver kind picks which pvxs mechanism paces the retry — the search
-    /// ring (client.cpp:156-165) or the circuit's reconnect timer
+    /// ring (src/client.cpp:156-165) or the circuit's reconnect timer
     /// (clientconn.cpp:26-32) — and the two carry different durations.
     #[test]
     fn reconnect_holdoff_matches_pvxs_failure_classes() {
@@ -1218,18 +1245,17 @@ mod tests {
     /// hook (`ServerConn::router.by_sid_close`) is unregistered when
     /// leaving Active. A direct `state.write()` would leak the entry
     /// until the connection itself dies (review finding #5).
-    #[test]
-    fn close_transitions_to_closed_via_set_state() {
+    // `async` because `make_channel` reads the executor a `Channel` spawns
+    // its ops on; that also retires the nested runtime this body used to
+    // build for the one `ensure_active().await`.
+    #[epics_macros_rs::epics_test]
+    async fn close_transitions_to_closed_via_set_state() {
         let ch = make_channel();
         assert!(matches!(*ch.state.read(), ChannelState::Idle));
         ch.close();
         assert!(matches!(*ch.state.read(), ChannelState::Closed));
         // ensure_active should now error.
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .unwrap();
-        let res = rt.block_on(ch.ensure_active());
+        let res = ch.ensure_active().await;
         assert!(matches!(
             res,
             Err(PvaError::Protocol(ref m)) if m.contains("closed")
@@ -1260,8 +1286,9 @@ mod tests {
     /// is set, regardless of the cached `ChannelState::Active` —
     /// otherwise the quick path in `ensure_active` hands stale
     /// (server, sid) pairs back to the next op (review finding #1).
-    #[test]
-    fn is_active_observes_server_destroyed_flag() {
+    // `async` only for `make_channel`'s executor; the flag itself is sync.
+    #[epics_macros_rs::epics_test]
+    async fn is_active_observes_server_destroyed_flag() {
         let ch = make_channel();
         // Idle → not active regardless of flag.
         assert!(!ch.is_active());
@@ -1286,9 +1313,10 @@ mod tests {
     /// `ensure_active` layer where the cap actually lived.
     // Drives a search that never resolves and asserts the op-timeout owner
     // fires; the search engine's spawned tick `interval` now runs on the
-    // reactor-less callback pool under `rtems-exec-model` (§4.2 UDP search is
-    // deferred). Reactor-dependent — gated out feature-ON (stage 3).
-    #[cfg(not(feature = "rtems-exec-model"))]
+    // reactor-less callback pool under `exec_backend` (§4.2 UDP search is
+    // deferred). Reactor-dependent — gated out on the exec backend (stage
+    // 3).
+    #[cfg(tokio_backend)]
     #[tokio::test(flavor = "current_thread")]
     #[serial_test::serial(epics_env)]
     async fn initial_search_failure_is_owned_by_op_timeout_not_200ms() {
@@ -1306,13 +1334,17 @@ mod tests {
             std::env::set_var("EPICS_PVA_AUTO_ADDR_LIST", "NO");
             std::env::set_var("EPICS_PVA_ADDR_LIST", "");
         }
-        let engine =
-            crate::client_native::search_engine::SearchEngine::spawn(Vec::new(), Vec::new())
-                .await
-                .expect("spawn engine");
+        let engine = crate::client_native::search_engine::SearchEngine::spawn(
+            &crate::test_reactor(),
+            Vec::new(),
+            Vec::new(),
+        )
+        .await
+        .expect("spawn engine");
 
         let op_timeout = Duration::from_millis(600);
         let ch = Channel::new(
+            crate::test_reactor(),
             "PVAFR12:MISSING:PV".into(),
             "u".into(),
             "h".into(),
@@ -1395,13 +1427,27 @@ mod tests {
         // Two concurrent callers for the SAME addr.
         let p1 = pool.clone();
         let c1 = tokio::spawn(async move {
-            p1.get_or_connect(addr, "u", "h", op_timeout, tcp_timeout)
-                .await
+            p1.get_or_connect(
+                &crate::test_reactor(),
+                addr,
+                "u",
+                "h",
+                op_timeout,
+                tcp_timeout,
+            )
+            .await
         });
         let p2 = pool.clone();
         let c2 = tokio::spawn(async move {
-            p2.get_or_connect(addr, "u", "h", op_timeout, tcp_timeout)
-                .await
+            p2.get_or_connect(
+                &crate::test_reactor(),
+                addr,
+                "u",
+                "h",
+                op_timeout,
+                tcp_timeout,
+            )
+            .await
         });
 
         // Mid-first-dial: the gate must have blocked the second caller,
@@ -1498,6 +1544,7 @@ mod tests {
 
         let res = pool
             .get_or_connect(
+                &crate::test_reactor(),
                 probe_addr,
                 "u",
                 "h",

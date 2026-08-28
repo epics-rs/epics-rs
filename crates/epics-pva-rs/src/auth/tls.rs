@@ -17,7 +17,12 @@
 //!
 //! ## PKCS#12 parity with pvxs
 //!
-//! pvxs (`src/ossl.cpp`) calls OpenSSL `PKCS12_parse`, which splits a
+//! Every `ossl.cpp` citation in this module names pvxs `tls` `b3a10bf0` beside
+//! its line span: `src/ossl.cpp` is on no default-branch revision of pvxs, so
+//! the crate's pin table — *no settled pin* for `pvxs` — cannot resolve them.
+//! `tls` is the unmerged upstream x509 branch on `epics-base/pvxs`.
+//!
+//! pvxs (`src/ossl.cpp:252`) calls OpenSSL `PKCS12_parse`, which splits a
 //! keychain into a leaf certificate, its private key, and a stack of CA
 //! certificates. We reproduce that split with the pure-Rust `p12` crate
 //! (gated behind the `pkcs12` feature, on by default):
@@ -105,12 +110,12 @@ pub enum TlsConfigError {
     Pkcs12Disabled(PathBuf),
     /// The loaded keychain leaf is a CA certificate, but an end-entity
     /// certificate is required for the local TLS identity. Mirrors pvxs
-    /// `ossl.cpp:269` (`flags & EXFLAG_CA` → "Found CA Certificate when
-    /// End Entity expected").
+    /// `ossl.cpp:260` (`tls` `b3a10bf0`): `flags & EXFLAG_CA` → "Found CA
+    /// Certificate when End Entity expected".
     #[error("keychain {0:?} leaf is a CA certificate; an end-entity certificate is required")]
     LeafIsCa(PathBuf),
     /// The loaded keychain leaf's `extendedKeyUsage` does not permit the
-    /// required SSL role. Mirrors pvxs `ossl.cpp:272-275`
+    /// required SSL role. Mirrors pvxs `ossl.cpp:263-266` (`tls` `b3a10bf0`)
     /// ("extendedKeyUsage does not permit usage by SSL Client/Server").
     #[error("keychain {path:?} leaf extendedKeyUsage does not permit usage by {role}")]
     LeafEkuForbidsRole { path: PathBuf, role: &'static str },
@@ -148,10 +153,10 @@ pub fn tls_disabled() -> bool {
 
 /// Resolve the shared TLS key-logger from `$SSLKEYLOGFILE`.
 ///
-/// pvxs honours `$SSLKEYLOGFILE` (`ossl.cpp:148-160`, `:221-223`): when the env
-/// var names a writable file, it installs an OpenSSL keylog callback on the
-/// shared `SSL_CTX` so the per-session pre-master secrets are appended there for
-/// Wireshark / `tshark` decryption. rustls exposes the identical hook via
+/// pvxs honours `$SSLKEYLOGFILE` (`ossl.cpp:139-151`, `:212-214`; `tls`
+/// `b3a10bf0`): when the env var names a writable file, it installs an
+/// OpenSSL keylog callback on the shared `SSL_CTX` so the per-session
+/// pre-master secrets are appended there for Wireshark / `tshark` decryption. rustls exposes the identical hook via
 /// `Config::key_log`, and `rustls::KeyLogFile` reads the same `SSLKEYLOGFILE`
 /// env var. Resolved once so the security-sensitive NOTICE is emitted a single
 /// time, mirroring pvxs's one-shot `commonSetup` message; `None` when unset so
@@ -180,16 +185,16 @@ pub fn load_server_config() -> Result<Option<TlsServerConfig>, TlsConfigError> {
     if tls_disabled() {
         return Ok(None);
     }
-    // PVAS-priority fallback (pvxs `config.cpp:497`): server reads
-    // `EPICS_PVAS_TLS_KEYCHAIN` first, then shared `EPICS_PVA_TLS_KEYCHAIN`.
-    // Reading only the server-specific form left a server configured with
-    // the shared keychain with TLS silently disabled. `$(VAR)` is expanded
-    // inside the helper (PVA-466 parity).
+    // PVAS-priority fallback (pvxs `config.cpp:479`, `tls` `b3a10bf0`):
+    // server reads `EPICS_PVAS_TLS_KEYCHAIN` first, then shared
+    // `EPICS_PVA_TLS_KEYCHAIN`. Reading only the server-specific form left a
+    // server configured with the shared keychain with TLS silently disabled.
+    // `$(VAR)` is expanded inside the helper (PVA-466 parity).
     let Some(keychain) = crate::config::env::server_tls_keychain() else {
         return Ok(None);
     };
-    // pvxs (`ossl.cpp:232-238`) splits the keychain spec at the first
-    // `;`: the path precedes it, the PKCS#12 password follows. The
+    // pvxs (`ossl.cpp:223-229`, `tls` `b3a10bf0`) splits the keychain spec
+    // at the first `;`: the path precedes it, the PKCS#12 password follows. The
     // inline suffix is the pvxs source of truth and takes precedence;
     // the non-pvxs EPICS_PVAS/PVA_TLS_KEYCHAIN_PASSWORD env var is a
     // Rust-only fallback consulted only when the spec carries no `;`.
@@ -205,17 +210,18 @@ pub fn load_server_config() -> Result<Option<TlsServerConfig>, TlsConfigError> {
     } = load_keychain(&path, password.as_deref())?;
     let key = key.ok_or_else(|| TlsConfigError::NoKey(path.to_path_buf()))?;
 
-    // pvxs ossl.cpp:264-275 — config-time sanity check on the loaded
-    // server identity leaf: reject a CA cert (EXFLAG_CA) or a cert whose
-    // extendedKeyUsage forbids the SSL Server role.
+    // pvxs `ossl.cpp:255-266` (`tls` `b3a10bf0`) — config-time sanity check
+    // on the loaded server identity leaf: reject a CA cert (EXFLAG_CA) or a
+    // cert whose extendedKeyUsage forbids the SSL Server role.
     if let Some(leaf) = certs.first() {
         validate_leaf_cert(leaf, &path, false)?;
     }
 
-    // PVAS-priority fallback (pvxs `config.cpp:501`): server reads
-    // `EPICS_PVAS_TLS_OPTIONS` first, then shared `EPICS_PVA_TLS_OPTIONS`.
-    // Reading only the shared form silently dropped a server-only
-    // `client_cert=require`, accepting certless clients (fail-open).
+    // PVAS-priority fallback (pvxs `config.cpp:483`, `tls` `b3a10bf0`):
+    // server reads `EPICS_PVAS_TLS_OPTIONS` first, then shared
+    // `EPICS_PVA_TLS_OPTIONS`. Reading only the shared form silently dropped
+    // a server-only `client_cert=require`, accepting certless clients
+    // (fail-open).
     let options = crate::config::env::server_tls_options();
     let require_client_cert = options.contains("client_cert=require");
 
@@ -237,11 +243,12 @@ pub fn load_server_config() -> Result<Option<TlsServerConfig>, TlsConfigError> {
         Arc::new(roots)
     };
 
-    // pvxs `ossl.cpp:355` sets `SSL_VERIFY_PEER | SSL_VERIFY_CLIENT_ONCE`
-    // on the server unconditionally — for `Default`, `Optional`, AND
-    // `Require` alike — so the server always sends a CertificateRequest
-    // and verifies a presented client cert; only `Require` additionally
-    // sets `SSL_VERIFY_FAIL_IF_NO_PEER_CERT` to reject certless clients.
+    // pvxs `ossl.cpp:346` (`tls` `b3a10bf0`) sets
+    // `SSL_VERIFY_PEER | SSL_VERIFY_CLIENT_ONCE` on the server
+    // unconditionally — for `Default`, `Optional`, AND `Require` alike — so
+    // the server always sends a CertificateRequest and verifies a presented
+    // client cert; only `Require` additionally sets
+    // `SSL_VERIFY_FAIL_IF_NO_PEER_CERT` to reject certless clients.
     // There is no pvxs mode that skips the client-cert request.
     //
     // The pre-fix port took `with_no_client_auth()` whenever neither
@@ -287,7 +294,8 @@ pub fn load_client_config() -> Result<Option<TlsClientConfig>, TlsConfigError> {
     if let Ok(ca_path) = std::env::var("EPICS_PVA_TLS_CA_KEYCHAIN") {
         // PVA-466: expand $(VAR) / ${VAR} in path env.
         let ca_path = crate::config::env::expand_dollar_vars(&ca_path);
-        // pvxs splits the keychain spec at the first `;` (`ossl.cpp:232-238`):
+        // pvxs splits the keychain spec at the first `;`
+        // (`ossl.cpp:223-229`, `tls` `b3a10bf0`):
         // inline password wins; the env var is the non-pvxs fallback.
         let (ca_keychain_path, inline_password) = crate::config::env::split_keychain_spec(&ca_path);
         let path = PathBuf::from(&ca_keychain_path);
@@ -305,7 +313,8 @@ pub fn load_client_config() -> Result<Option<TlsClientConfig>, TlsConfigError> {
     let mut config = if let Ok(keychain) = std::env::var("EPICS_PVA_TLS_KEYCHAIN") {
         // PVA-466: expand $(VAR) / ${VAR} in path env.
         let keychain = crate::config::env::expand_dollar_vars(&keychain);
-        // pvxs splits the keychain spec at the first `;` (`ossl.cpp:232-238`):
+        // pvxs splits the keychain spec at the first `;`
+        // (`ossl.cpp:223-229`, `tls` `b3a10bf0`):
         // inline password wins; the env var is the non-pvxs fallback.
         let (keychain_path, inline_password) = crate::config::env::split_keychain_spec(&keychain);
         let path = PathBuf::from(keychain_path);
@@ -316,9 +325,10 @@ pub fn load_client_config() -> Result<Option<TlsClientConfig>, TlsConfigError> {
             ca_certs,
         } = load_keychain(&path, password.as_deref())?;
         let key = key.ok_or_else(|| TlsConfigError::NoKey(path.to_path_buf()))?;
-        // pvxs ossl.cpp:264-275 — config-time sanity check on the loaded
-        // client identity leaf: reject a CA cert (EXFLAG_CA) or a cert
-        // whose extendedKeyUsage forbids the SSL Client role.
+        // pvxs `ossl.cpp:255-266` (`tls` `b3a10bf0`) — config-time sanity
+        // check on the loaded client identity leaf: reject a CA cert
+        // (EXFLAG_CA) or a cert whose extendedKeyUsage forbids the SSL Client
+        // role.
         if let Some(leaf) = certs.first() {
             validate_leaf_cert(leaf, &path, true)?;
         }
@@ -1236,8 +1246,8 @@ fn is_self_signed_ca(der: &[u8]) -> bool {
 }
 
 /// Validate a freshly-loaded keychain leaf certificate the way pvxs
-/// `ossl.cpp:264-275` does before installing it as the local TLS
-/// identity, a config-time fail-fast sanity check:
+/// `ossl.cpp:255-266` (`tls` `b3a10bf0`) does before installing it as the
+/// local TLS identity, a config-time fail-fast sanity check:
 ///
 /// - **Reject a CA certificate** presented as the end-entity (pvxs
 ///   `flags & EXFLAG_CA` → "Found CA Certificate when End Entity
@@ -1273,8 +1283,8 @@ fn validate_leaf_cert(
         }
     })?;
 
-    // pvxs ossl.cpp:269 — EXFLAG_CA: a CA cert is not a valid end-entity
-    // identity. Absent basicConstraints ⇒ not a CA.
+    // pvxs `ossl.cpp:260` (`tls` `b3a10bf0`) — EXFLAG_CA: a CA cert is not a
+    // valid end-entity identity. Absent basicConstraints ⇒ not a CA.
     let is_ca = cert
         .basic_constraints()
         .ok()
@@ -1285,7 +1295,8 @@ fn validate_leaf_cert(
         return Err(TlsConfigError::LeafIsCa(path.to_path_buf()));
     }
 
-    // pvxs ossl.cpp:272-275 — extendedKeyUsage must permit the SSL role.
+    // pvxs `ossl.cpp:263-266` (`tls` `b3a10bf0`) — extendedKeyUsage must
+    // permit the SSL role.
     // Absent EKU (`Ok(None)`) ⇒ accept (OpenSSL UINT32_MAX). A present
     // EKU must carry the specific role bit; anyExtendedKeyUsage alone
     // does not count (matches pvxs's literal XKU_SSL_* check).
@@ -1332,7 +1343,8 @@ pub fn x509_credentials_from_chain(chain: &[CertificateDer<'_>]) -> Option<X509C
     let account = subject_common_name(leaf)?;
 
     // Root CA = last cert in the chain, but only honoured as the
-    // `authority` when it is a self-signed CA (pvxs ossl.cpp:410).
+    // `authority` when it is a self-signed CA (pvxs `ossl.cpp:403-404`,
+    // `tls` `b3a10bf0`).
     let authority = chain
         .last()
         .filter(|root| is_self_signed_ca(root))
@@ -1345,10 +1357,10 @@ pub fn x509_credentials_from_chain(chain: &[CertificateDer<'_>]) -> Option<X509C
 /// Like [`x509_credentials_from_chain`] but also resolves the `authority`
 /// from the server trust store when the peer sends a partial chain.
 ///
-/// pvxs uses `SSL_get0_verified_chain` (`ossl.cpp:423`) which appends the
-/// root CA from the trust store even when the peer omits it; this function
-/// reproduces that by walking `trust_roots` to find the anchor whose
-/// subject DN matches the issuer of the last peer-provided cert.
+/// pvxs uses `SSL_get0_verified_chain` (`ossl.cpp:394`, `tls` `b3a10bf0`)
+/// which appends the root CA from the trust store even when the peer omits
+/// it; this function reproduces that by walking `trust_roots` to find the
+/// anchor whose subject DN matches the issuer of the last peer-provided cert.
 pub fn x509_credentials_from_chain_with_roots(
     chain: &[CertificateDer<'_>],
     trust_roots: &RootCertStore,
@@ -1467,9 +1479,10 @@ mod tests {
     fn unset_env_yields_none() {
         let prev_keychain = std::env::var("EPICS_PVAS_TLS_KEYCHAIN").ok();
         // The server keychain now falls back to the shared
-        // EPICS_PVA_TLS_KEYCHAIN (pvxs config.cpp:497), so this test must
-        // also clear it — otherwise a shared client keychain in the
-        // ambient env would enable server TLS and defeat the assertion.
+        // EPICS_PVA_TLS_KEYCHAIN (pvxs config.cpp:479, `tls` `b3a10bf0`), so
+        // this test must also clear it — otherwise a shared client keychain
+        // in the ambient env would enable server TLS and defeat the
+        // assertion.
         let prev_pva_keychain = std::env::var("EPICS_PVA_TLS_KEYCHAIN").ok();
         let prev_disable = std::env::var("EPICS_PVA_TLS_DISABLE").ok();
         unsafe {
@@ -1541,22 +1554,32 @@ mod tests {
     }
 
     /// Build a legacy-PBE PKCS#12 from PEM cert+key using `openssl`.
-    /// Returns the `.p12` bytes, or `None` if `openssl` is unavailable.
+    ///
+    /// `None` means one thing only: this host cannot produce the fixture,
+    /// because `openssl` is absent or its build refuses the classic
+    /// algorithms. Every other way the generation can fail — no temp dir,
+    /// an unwritable PEM, an unreadable `.p12`, an `openssl` that is on
+    /// PATH but will not execute — is our own fixture breaking, and
+    /// panics. Folding those into the same `None` made a broken fixture
+    /// indistinguishable from an absent tool, and each caller spelled the
+    /// `None` arm as an early return, which nextest scores as a pass.
+    /// This helper is also the sole owner of the skip message, so callers
+    /// return without printing one.
     #[cfg(feature = "pkcs12")]
     fn make_p12(pem: &Pem, ca_pem: Option<&str>, password: &str) -> Option<Vec<u8>> {
         use std::io::Write;
-        let dir = tempfile::tempdir().ok()?;
+        let dir = tempfile::tempdir().expect("temp dir for the PKCS#12 fixture");
         let cert_path = dir.path().join("cert.pem");
         let key_path = dir.path().join("key.pem");
         let p12_path = dir.path().join("out.p12");
         std::fs::File::create(&cert_path)
-            .ok()?
+            .expect("create the fixture certificate")
             .write_all(pem.cert.as_bytes())
-            .ok()?;
+            .expect("write the fixture certificate");
         std::fs::File::create(&key_path)
-            .ok()?
+            .expect("create the fixture key")
             .write_all(pem.key.as_bytes())
-            .ok()?;
+            .expect("write the fixture key");
 
         let mut cmd = std::process::Command::new("openssl");
         cmd.arg("pkcs12")
@@ -1579,16 +1602,31 @@ mod tests {
         if let Some(ca) = ca_pem {
             let ca_path = dir.path().join("ca.pem");
             std::fs::File::create(&ca_path)
-                .ok()?
+                .expect("create the fixture CA chain")
                 .write_all(ca.as_bytes())
-                .ok()?;
+                .expect("write the fixture CA chain");
             cmd.arg("-certfile").arg(&ca_path);
         }
-        let status = cmd.status().ok()?;
+        let status = match cmd.status() {
+            Ok(s) => s,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                eprintln!(
+                    "SKIP: `openssl` is not on PATH, so the PKCS#12 fixture \
+                     cannot be generated; install it to run this test."
+                );
+                return None;
+            }
+            Err(e) => panic!("`openssl` was found on PATH but would not run: {e}"),
+        };
         if !status.success() {
+            eprintln!(
+                "SKIP: `openssl pkcs12 -export -legacy` exited {status}; this \
+                 build has no legacy provider, so the classic fixture cannot \
+                 be generated here."
+            );
             return None;
         }
-        std::fs::read(&p12_path).ok()
+        Some(std::fs::read(&p12_path).expect("read the generated PKCS#12"))
     }
 
     #[cfg(feature = "pkcs12")]
@@ -1607,23 +1645,27 @@ mod tests {
     /// `-legacy` flag — exactly what OpenSSL 3.x emits by default
     /// (PBKDF2 + AES-256-CBC bags, HMAC-SHA256 MAC). The classic `p12`
     /// crate cannot decrypt this; the loader must fall through to the
-    /// RustCrypto PBES2 path. Returns `None` if `openssl` is absent or
-    /// is an OpenSSL 1.x build (which does not default to PBES2).
+    /// RustCrypto PBES2 path.
+    ///
+    /// `None` carries the same single meaning as [`make_p12`]: `openssl`
+    /// is absent, or the build cannot emit a PBES2 keychain (an OpenSSL
+    /// 1.x build, detected by the classic SHA-1 MAC it writes instead).
+    /// Fixture breakage panics, and the skip message is printed here.
     #[cfg(feature = "pkcs12")]
     fn make_p12_pbes2(pem: &Pem, ca_pem: Option<&str>, password: &str) -> Option<Vec<u8>> {
         use std::io::Write;
-        let dir = tempfile::tempdir().ok()?;
+        let dir = tempfile::tempdir().expect("temp dir for the PBES2 fixture");
         let cert_path = dir.path().join("cert.pem");
         let key_path = dir.path().join("key.pem");
         let p12_path = dir.path().join("out.p12");
         std::fs::File::create(&cert_path)
-            .ok()?
+            .expect("create the fixture certificate")
             .write_all(pem.cert.as_bytes())
-            .ok()?;
+            .expect("write the fixture certificate");
         std::fs::File::create(&key_path)
-            .ok()?
+            .expect("create the fixture key")
             .write_all(pem.key.as_bytes())
-            .ok()?;
+            .expect("write the fixture key");
 
         let mut cmd = std::process::Command::new("openssl");
         // No `-legacy`: OpenSSL 3.x then uses PBES2 (PBKDF2 + AES) for
@@ -1641,22 +1683,41 @@ mod tests {
         if let Some(ca) = ca_pem {
             let ca_path = dir.path().join("ca.pem");
             std::fs::File::create(&ca_path)
-                .ok()?
+                .expect("create the fixture CA chain")
                 .write_all(ca.as_bytes())
-                .ok()?;
+                .expect("write the fixture CA chain");
             cmd.arg("-certfile").arg(&ca_path);
         }
-        let status = cmd.status().ok()?;
+        let status = match cmd.status() {
+            Ok(s) => s,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                eprintln!(
+                    "SKIP: `openssl` is not on PATH, so the PBES2 PKCS#12 \
+                     fixture cannot be generated; install it to run this test."
+                );
+                return None;
+            }
+            Err(e) => panic!("`openssl` was found on PATH but would not run: {e}"),
+        };
         if !status.success() {
+            eprintln!(
+                "SKIP: `openssl pkcs12 -export` exited {status}; this build \
+                 cannot generate the PBES2 fixture."
+            );
             return None;
         }
-        let bytes = std::fs::read(&p12_path).ok()?;
+        let bytes = std::fs::read(&p12_path).expect("read the generated PKCS#12");
         // Guard: an OpenSSL 1.x build writes a classic SHA-1-MAC
         // keychain here, which the `p12` path already covers and does
         // not exercise the PBES2 loader. Skip the fixture in that case.
         // (`has_classic_sha1_mac` is a pure `der` parse — it never
         // touches the panic-prone `p12` MAC check.)
         if load_pkcs12_pbes2::has_classic_sha1_mac(&bytes) {
+            eprintln!(
+                "SKIP: this `openssl` wrote a classic SHA-1-MAC keychain, so \
+                 it is an OpenSSL 1.x build and does not exercise the PBES2 \
+                 loader."
+            );
             return None;
         }
         Some(bytes)
@@ -1667,7 +1728,6 @@ mod tests {
     fn pkcs12_loads_leaf_and_key_with_password() {
         let pem = gen_self_signed("epics-pkcs12-leaf");
         let Some(p12) = make_p12(&pem, None, "secret123") else {
-            eprintln!("skipping: `openssl` not available for fixture generation");
             return;
         };
         let (_dir, path) = write_temp(&p12);
@@ -1686,7 +1746,6 @@ mod tests {
     fn pkcs12_wrong_password_is_rejected() {
         let pem = gen_self_signed("epics-pkcs12-leaf");
         let Some(p12) = make_p12(&pem, None, "secret123") else {
-            eprintln!("skipping: `openssl` not available");
             return;
         };
         let (_dir, path) = write_temp(&p12);
@@ -1727,7 +1786,6 @@ mod tests {
             key: leaf_key.serialize_pem(),
         };
         let Some(p12) = make_p12(&pem, Some(&ca_cert.pem()), "pw") else {
-            eprintln!("skipping: `openssl` not available");
             return;
         };
         let (_dir, path) = write_temp(&p12);
@@ -1749,10 +1807,6 @@ mod tests {
     fn pkcs12_pbes2_openssl3_default_loads_leaf_and_key() {
         let pem = gen_self_signed("epics-pbes2-leaf");
         let Some(p12) = make_p12_pbes2(&pem, None, "pbes2-pw") else {
-            eprintln!(
-                "skipping: `openssl` unavailable or not an OpenSSL-3 \
-                 (PBES2-default) build"
-            );
             return;
         };
         let (_dir, path) = write_temp(&p12);
@@ -1790,7 +1844,6 @@ mod tests {
             key: leaf_key.serialize_pem(),
         };
         let Some(p12) = make_p12_pbes2(&pem, Some(&ca_cert.pem()), "pw") else {
-            eprintln!("skipping: `openssl` unavailable or not OpenSSL-3");
             return;
         };
         let (_dir, path) = write_temp(&p12);
@@ -1810,7 +1863,6 @@ mod tests {
     fn pkcs12_pbes2_wrong_password_is_rejected() {
         let pem = gen_self_signed("epics-pbes2-leaf");
         let Some(p12) = make_p12_pbes2(&pem, None, "right-pw") else {
-            eprintln!("skipping: `openssl` unavailable or not OpenSSL-3");
             return;
         };
         let (_dir, path) = write_temp(&p12);
@@ -1876,7 +1928,6 @@ mod tests {
     fn server_config_loads_from_pkcs12_env() {
         let pem = gen_self_signed("epics-pkcs12-server");
         let Some(p12) = make_p12(&pem, None, "kc-pw") else {
-            eprintln!("skipping: `openssl` not available");
             return;
         };
         let (_dir, path) = write_temp(&p12);
@@ -1896,8 +1947,8 @@ mod tests {
         assert!(!cfg.require_client_cert);
     }
 
-    /// pvxs `ossl.cpp:355` sets `SSL_VERIFY_PEER` on the server for
-    /// `Default`/`Optional`/`Require` alike, so even the default TLS
+    /// pvxs `ossl.cpp:346` (`tls` `b3a10bf0`) sets `SSL_VERIFY_PEER` on the
+    /// server for `Default`/`Optional`/`Require` alike, so even the default TLS
     /// server requests a client cert and verifies it if presented. The
     /// pre-fix port took `with_no_client_auth()` for the default (no
     /// `client_cert=` option), never sending a CertificateRequest — every
@@ -1911,7 +1962,6 @@ mod tests {
     fn server_default_requests_client_cert() {
         let pem = gen_self_signed("epics-pkcs12-server");
         let Some(p12) = make_p12(&pem, None, "kc-pw") else {
-            eprintln!("skipping: `openssl` not available");
             return;
         };
         let (_dir, path) = write_temp(&p12);
@@ -1939,10 +1989,10 @@ mod tests {
         );
     }
 
-    /// Regression: pvxs (`ossl.cpp:232-238`) sources the PKCS#12 password
-    /// from the `;password` suffix of the keychain spec. A pvxs-style
-    /// `EPICS_PVAS_TLS_KEYCHAIN=<path>;<password>` with NO separate
-    /// `_PASSWORD` env var must open. Pre-fix the whole `<path>;<password>`
+    /// Regression: pvxs (`ossl.cpp:223-229`, `tls` `b3a10bf0`) sources the
+    /// PKCS#12 password from the `;password` suffix of the keychain spec. A
+    /// pvxs-style `EPICS_PVAS_TLS_KEYCHAIN=<path>;<password>` with NO
+    /// separate `_PASSWORD` env var must open. Pre-fix the whole `<path>;<password>`
     /// string was fed to `PathBuf::from`, so the file never opened.
     #[test]
     #[cfg(feature = "pkcs12")]
@@ -1950,7 +2000,6 @@ mod tests {
     fn server_config_inline_keychain_password_splits_at_semicolon() {
         let pem = gen_self_signed("epics-pkcs12-server");
         let Some(p12) = make_p12(&pem, None, "kc-pw") else {
-            eprintln!("skipping: `openssl` not available");
             return;
         };
         let (_dir, path) = write_temp(&p12);
@@ -1966,7 +2015,10 @@ mod tests {
             ("EPICS_PVA_TLS_OPTIONS", None),
         ]);
         let cfg = load_server_config()
-            .expect("inline `;password` keychain spec must open (pvxs ossl.cpp:232-238)")
+            .expect(
+                "inline `;password` keychain spec must open \
+                 (pvxs ossl.cpp:223-229, tls b3a10bf0)",
+            )
             .expect("Some(config)");
         assert!(!cfg.require_client_cert);
     }
@@ -1980,7 +2032,6 @@ mod tests {
     fn server_config_inline_keychain_password_beats_env_fallback() {
         let pem = gen_self_signed("epics-pkcs12-server");
         let Some(p12) = make_p12(&pem, None, "kc-pw") else {
-            eprintln!("skipping: `openssl` not available");
             return;
         };
         let (_dir, path) = write_temp(&p12);
@@ -2007,7 +2058,6 @@ mod tests {
     fn server_config_pkcs12_wrong_password_env_errors() {
         let pem = gen_self_signed("epics-pkcs12-server");
         let Some(p12) = make_p12(&pem, None, "kc-pw") else {
-            eprintln!("skipping: `openssl` not available");
             return;
         };
         let (_dir, path) = write_temp(&p12);
@@ -2029,15 +2079,15 @@ mod tests {
     /// Fail-open regression: a server-only
     /// `EPICS_PVAS_TLS_OPTIONS=client_cert=require` must be honoured even
     /// when the shared `EPICS_PVA_TLS_OPTIONS` is unset (pvxs PVAS-first
-    /// `pickone`, config.cpp:501). Reading only the shared form dropped the
-    /// requirement and let the server accept certless clients.
+    /// `pickone`, config.cpp:483, `tls` `b3a10bf0`). Reading only the shared
+    /// form dropped the requirement and let the server accept certless
+    /// clients.
     #[test]
     #[cfg(feature = "pkcs12")]
     #[serial(epics_env)]
     fn server_honors_pvas_only_tls_options_require() {
         let pem = gen_self_signed("epics-pkcs12-server");
         let Some(p12) = make_p12(&pem, None, "kc-pw") else {
-            eprintln!("skipping: `openssl` not available");
             return;
         };
         let (_dir, path) = write_temp(&p12);
@@ -2058,8 +2108,8 @@ mod tests {
         );
     }
 
-    /// pvxs `Config::server()` resolves the keychain via
-    /// `pickone({PVAS, PVA})` (config.cpp:497), so a server configured with
+    /// pvxs `Config::server()` resolves the keychain via `pickone({PVAS,
+    /// PVA})` (config.cpp:479, `tls` `b3a10bf0`), so a server configured with
     /// only the shared `EPICS_PVA_TLS_KEYCHAIN` must still enable TLS.
     /// Reading the server-specific form alone left it silently disabled.
     #[test]
@@ -2068,7 +2118,6 @@ mod tests {
     fn server_falls_back_to_shared_pva_keychain() {
         let pem = gen_self_signed("epics-pkcs12-server");
         let Some(p12) = make_p12(&pem, None, "kc-pw") else {
-            eprintln!("skipping: `openssl` not available");
             return;
         };
         let (_dir, path) = write_temp(&p12);
@@ -2225,8 +2274,8 @@ mod tests {
         CertificateDer::from(cert.der().to_vec())
     }
 
-    /// pvxs ossl.cpp:269 — a CA certificate is rejected as the local
-    /// end-entity identity (EXFLAG_CA), regardless of role.
+    /// pvxs `ossl.cpp:260` (`tls` `b3a10bf0`) — a CA certificate is rejected
+    /// as the local end-entity identity (EXFLAG_CA), regardless of role.
     #[test]
     fn validate_leaf_rejects_ca_certificate() {
         let leaf = leaf_with("ca-as-identity", true, &[]);
@@ -2257,8 +2306,9 @@ mod tests {
         assert!(validate_leaf_cert(&leaf, p, true).is_ok(), "client");
     }
 
-    /// pvxs ossl.cpp:272-275 — a present EKU must carry the role bit:
-    /// serverAuth-only is valid as a server identity, rejected as client.
+    /// pvxs `ossl.cpp:263-266` (`tls` `b3a10bf0`) — a present EKU must carry
+    /// the role bit: serverAuth-only is valid as a server identity, rejected
+    /// as client.
     #[test]
     fn validate_leaf_server_auth_eku_role_gated() {
         let leaf = leaf_with(

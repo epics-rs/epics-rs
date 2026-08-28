@@ -24,8 +24,14 @@
 //! immediately (search_engine.rs `SearchReason::Initial`), so on
 //! localhost that phase is RTT-bound and small. The CREATE_CHANNEL cost
 //! IS measured (it is the per-channel connect work).
+// The tests that drive a live server are `tokio_backend`-only, so on
+// `exec_backend` the fixtures and imports they share go unreferenced while the
+// rest of this file still runs. The default build lints it in full.
+#![cfg_attr(exec_backend, allow(dead_code, unused_imports))]
+#![cfg(feature = "client")]
 
-// RTEMS-EXEC-MODEL-ALLOW(2): checked - these run and pass in the feature-ON suite.
+// RTEMS-EXEC-MODEL-ALLOW(1): checked - these run and pass in the exec-backend
+// suite.
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -34,7 +40,9 @@ use tokio::sync::Mutex;
 
 use epics_pva_rs::client_native::context::PvaClient;
 use epics_pva_rs::pvdata::{FieldDesc, PvField, PvStructure, ScalarType, ScalarValue};
-use epics_pva_rs::server_native::{ChannelSource, OpError, PvaServer, PvaServerConfig};
+#[cfg(tokio_backend)]
+use epics_pva_rs::server_native::PvaServer;
+use epics_pva_rs::server_native::{ChannelSource, OpError, PvaServerConfig};
 
 // ── A minimal put-capable in-memory source ───────────────────────────
 
@@ -211,6 +219,7 @@ async fn cold_warm_report(
     (cold_ok, warm_ok, cold_tput, warm_tput)
 }
 
+#[cfg(tokio_backend)]
 /// In-process server + in-memory source: measures the client + protocol
 /// pipeline ceiling (no record processing, loopback, direct connect).
 #[tokio::test(flavor = "multi_thread")]

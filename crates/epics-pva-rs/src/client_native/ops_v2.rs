@@ -132,7 +132,7 @@ pub struct MonitorFlow {
     ///
     /// This is resolved whether or not pipelining is on, exactly as pvxs
     /// resolves it — the `queueSize` block sits outside any `if(pipeline)`
-    /// (`clientmon.cpp:763-773`). It used to collapse to `0` for a
+    /// (`clientmon.cpp:761-773`). It used to collapse to `0` for a
     /// non-pipelined monitor, which gave the field two meanings ("no pipeline"
     /// vs. a real depth) and made a `record[queueSize=16]` monitor report
     /// `limit_queue = 0` (R10-35). `pipeline` alone gates the wire.
@@ -224,7 +224,7 @@ impl MonitorFlow {
                 .map(|(_, v)| PvField::Scalar(v.clone()))
         };
 
-        // `clientmon.cpp:763-773` — `if(queueSize.as(Q) && Q>1) op->queueSize = Q;`
+        // `clientmon.cpp:761-773` — `if(queueSize.as(Q) && Q>1) op->queueSize = Q;`
         // else keep the default. Resolved OUTSIDE any pipeline gate, exactly
         // where pvxs resolves it. A pipeline window must be >= 2, so a 0/1
         // configured default falls back to pvxs's 4.
@@ -521,14 +521,14 @@ pub(crate) async fn ensure_active_with_op_timeout(
 
 /// The single re-queue owner: pvxs `OperationBase::disconnected`
 /// (`clientimpl.h:62`), reached from `Channel::disconnect`
-/// (`client.cpp:198-204`) on a circuit drop AND on a server-initiated
+/// (`src/client.cpp:198-204`) on a circuit drop AND on a server-initiated
 /// `CMD_DESTROY_CHANNEL`.
 ///
 /// pvxs does not fail an in-flight one-shot when its channel goes away.
 /// `GPROp::disconnected` (`clientget.cpp:380-404`) pushes the op back into
 /// `chan->pending` and returns it to `Connecting`, the channel re-enters a
-/// search bucket (`client.cpp:209-213`), and `Channel::createOperations`
-/// (`client.cpp:120-146`) re-issues every pending op once the channel is
+/// search bucket (`src/client.cpp:209-213`), and `Channel::createOperations`
+/// (`src/client.cpp:120-146`) re-issues every pending op once the channel is
 /// Active again; the caller's future stays pending across all of it. The
 /// single exception is `state==Exec && op!=Get && !autoExec` ("can't
 /// restart as server side-effects may occur"), which is the two-phase
@@ -901,14 +901,14 @@ pub async fn op_put_raw(
 /// This is the interoperable spelling of "make the remote record
 /// process". pvxs implements no CMD_PROCESS handler at all — the
 /// constant exists once, in `src/pvaproto.h:632`, and `ConnBase`'s
-/// command switch (`src/conn.cpp:249-275`) drops an unrecognised command
+/// command switch (`src/conn.cpp:249-276`) drops an unrecognised command
 /// to `default:`, which debug-logs and `evbuffer_drain`s the body
 /// without replying. pvxs's own pvalink forward link is this PUT:
-/// `pvaScanForward` calls `lchan->put(true)` (`ioc/pvalink_lset.cpp:691`)
+/// `pvaScanForward` calls `lchan->put(true)` (`pvxs/ioc/pvalink_lset.cpp:683`)
 /// and `linkBuildPut` returns the prototype untouched when no link
-/// staged a value (`ioc/pvalink_channel.cpp:127-159`), under a pvRequest
+/// staged a value (`ioc/pvalink_channel.cpp:127-184`), under a pvRequest
 /// carrying `record._options.process = "true"`
-/// (`ioc/pvalink_channel.cpp:255-263`).
+/// (`ioc/pvalink_channel.cpp:257-263`).
 ///
 /// Use this, not [`op_process`], on any path whose peer may be a pvxs
 /// server.
@@ -1163,7 +1163,7 @@ pub async fn op_put_fields(
 /// leaf is placed into the selected descriptor without serializing
 /// through `Display`/`ScalarValue::parse`, so a scalar array keeps its
 /// element type and byte content. pvxs `linkBuildPut` combined
-/// sibling-field PUT parity (`pvalink_channel.cpp:127-159`).
+/// sibling-field PUT parity (`pvxs/ioc/pvalink_channel.cpp:127-184`).
 pub async fn op_put_fields_typed(
     channel: &Arc<Channel>,
     assignments: &[(String, PutLeaf)],
@@ -1294,7 +1294,7 @@ async fn op_put_fields_inner_attempt(
 /// a derived `field(<path>)` selector. The DATA phase still targets
 /// `field_path` exclusively. `field_path` must be non-empty.
 ///
-/// pvxs parity: `pvalink_channel.cpp:31-38` (putReq template carries
+/// pvxs parity: `pvxs/ioc/pvalink_channel.cpp:31-38` (putReq template carries
 /// record options) + `linkBuildPut:138` (field targeting via
 /// `top[fieldName]`).
 pub async fn op_put_field_with_request(
@@ -1408,10 +1408,10 @@ async fn op_put_field_with_request_attempt(
 /// `field_path` must be non-empty. If the introspected leaf at
 /// `field_path` is itself an NT-style structure with a `value`
 /// sub-field, the typed `value` is placed at `<field_path>.value` —
-/// mirroring pvxs `linkBuildPut` (`pvalink_channel.cpp:138-143`):
+/// mirroring pvxs `linkBuildPut` (`pvxs/ioc/pvalink_channel.cpp:138-143`):
 /// `auto value(top[fieldName]); if(struct) value = value["value"]`.
 ///
-/// pvxs parity: `pvalink_channel.cpp:127-180` typed array/scalar PUT
+/// pvxs parity: `pvxs/ioc/pvalink_channel.cpp:127-180` typed array/scalar PUT
 /// into the link's `fieldName` target.
 pub async fn op_put_value_field_with_request(
     channel: &Arc<Channel>,
@@ -1733,7 +1733,7 @@ async fn op_put_value_attempt(
 /// Like [`op_put_value`] but INIT uses the caller's `pv_req` bytes
 /// (for `record._options` like `process` / `block`) instead of the
 /// default `field(value)` selector. DATA still targets the `"value"`
-/// bit. pvxs `pvalink_channel.cpp:268` parity for typed OUT arrays.
+/// bit. pvxs `pvxs/ioc/pvalink_channel.cpp:268` parity for typed OUT arrays.
 pub async fn op_put_value_raw(
     channel: &Arc<Channel>,
     pv_req: &[u8],
@@ -2088,14 +2088,13 @@ impl Default for MonitorEventMask {
 /// `MonitorEnd::ConnectionLost` (deliver the transition, sleep 200 ms,
 /// loop), so a dead upstream never makes the handle's task return — a
 /// consumer that watches only the task reports a dead upstream as connected
-/// and keeps serving its last value. That was the defect family closed here
-/// (doc/pvalink-rtems-design.md §12.8, §12.10); [`SubscriptionHandle::
-/// wait_terminal`] returns a [`MonitorTermination`], which by type is not a
-/// connection state.
+/// and keeps serving its last value. That was the defect family closed
+/// here; [`SubscriptionHandle::wait_terminal`] returns a
+/// [`MonitorTermination`], which by type is not a connection state.
 ///
 /// pvxs shape: `pvaLinkChannel` drives its connected/disconnected state from
 /// the monitor's event stream and its `catch(client::Disconnect&)` branch
-/// (`pvalink_channel.cpp:335-373`), never from a subscription call returning.
+/// (`pvxs/ioc/pvalink_channel.cpp:335-373`), never from a subscription call returning.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MonitorConnEvent {
     /// The subscription's channel reached Active and INIT/START were
@@ -2201,21 +2200,28 @@ impl<C: FnMut(MonitorConnEvent)> ConnEventOwner<C> {
 /// Per-subscription metrics, mirroring pvxs `SubscriptionStat`
 /// (client.h:165-178).
 ///
-/// pvxs's queue fields describe a client-side monitor queue the consumer
-/// pops from (`Subscription::pop()`). This client instead delivers every
-/// update synchronously through the user callback inside the monitor loop,
-/// so there is no pop()-able queue — the pvxs queue fields (`n_queue`,
-/// `n_cli_squash`, `max_queue`) are therefore 0 *by construction*, not
-/// merely unimplemented. The remaining counters are Rust-specific delivery
-/// / ACK telemetry pvxs does not define and are named distinctly so they
-/// are not mistaken for the pvxs queue surface — in particular
-/// `max_events_per_ack` is the ACK-window high-water mark that the previous
-/// `max_queue` field conflated with pvxs `maxQueue`.
+/// pvxs's queue fields describe the client-side monitor queue a consumer
+/// pops from (`Subscription::pop()`). This client delivers each update
+/// through the user callback instead of a `pop()`, but the queue is the
+/// same object: the per-IOID backlog
+/// (`MonitorBacklog`) the connection
+/// reader fills and the monitor loop drains, bounded at `queueSize` and
+/// squashed at the tail exactly as pvxs's `std::deque<Entry>` is. So
+/// `n_queue`, `n_cli_squash` and `max_queue` carry pvxs's `nQueue`,
+/// `nCliSquash` and `queueMax` — they were hardwired 0 while the backlog
+/// was an unbounded channel that could neither overflow nor squash.
+///
+/// The remaining counters are Rust-specific delivery / ACK telemetry pvxs
+/// does not define and are named distinctly so they are not mistaken for
+/// the pvxs queue surface — in particular `max_events_per_ack` is the
+/// ACK-window high-water mark that the previous `max_queue` field
+/// conflated with pvxs `maxQueue`.
 #[derive(Debug, Clone, Default)]
 pub struct SubscriptionStat {
     // ── pvxs `SubscriptionStat` surface ──
-    /// pvxs `nQueue`: updates currently queued awaiting consumer pop().
-    /// Always 0 — this client has no pop()-able queue (callback delivery).
+    /// pvxs `nQueue`: updates currently queued awaiting delivery — the
+    /// depth of this subscription's bounded backlog, sampled as each
+    /// update is handed to the callback.
     pub n_queue: u32,
     /// pvxs `nSrvSquash`: count of value updates where the server reported
     /// at least one update dropped/squashed (overrun bitset non-empty).
@@ -2224,12 +2230,11 @@ pub struct SubscriptionStat {
     /// stats leave this 0 (the raw stream still carries the overrun bits to
     /// the consumer; see `op_monitor_raw*`).
     pub n_srv_squash: u64,
-    /// pvxs `nCliSquash`: updates dropped due to client queue overflow.
-    /// Always 0 — there is no client queue to overflow.
+    /// pvxs `nCliSquash`: updates merged into the queue tail because the
+    /// backlog was full — a consumer slower than the update rate.
     pub n_cli_squash: u64,
-    /// pvxs `maxQueue`: max client queue depth observed. Always 0 (no
-    /// client queue). For the ACK-window high-water mark see
-    /// `max_events_per_ack`.
+    /// pvxs `maxQueue`: max client backlog depth observed. For the
+    /// ACK-window high-water mark see `max_events_per_ack`.
     pub max_queue: u32,
     /// pvxs `limitQueue`: the configured pipeline/queue limit
     /// (`pipeline_size`). Preserved across `stats(reset)`.
@@ -2312,7 +2317,7 @@ pub struct SubscriptionHandle {
 impl SubscriptionHandle {
     /// Pause server emissions on this subscription. Safe to call
     /// multiple times; second call is a no-op when already paused.
-    /// Mirrors pvxs `Subscription::pause(true)` (clientmon.cpp:115).
+    /// Mirrors pvxs `Subscription::pause(true)` (clientmon.cpp:121).
     /// Best-effort — if the underlying connection is gone we set the
     /// flag and the loop applies it on next reconnect.
     pub async fn pause(&self) {
@@ -2401,12 +2406,11 @@ impl SubscriptionHandle {
     /// **Not a disconnect signal.** The loop re-subscribes internally on
     /// `MonitorEnd::ConnectionLost`, so this does NOT return when the
     /// upstream goes away — a consumer that infers "the upstream is gone"
-    /// from this returning learns nothing and serves a stale value as good
-    /// (doc/pvalink-rtems-design.md §12.8, §12.10). Connection transitions
-    /// come from the handle's [`MonitorConnEvent`] callback, and
-    /// [`MonitorTermination`] carries no variant that could stand in for
-    /// one. Named `wait_terminal` (and not `wait`) so the distinction is at
-    /// the call site, not only in this doc comment.
+    /// from this returning learns nothing and serves a stale value as good.
+    /// Connection transitions come from the handle's [`MonitorConnEvent`]
+    /// callback, and [`MonitorTermination`] carries no variant that could
+    /// stand in for one. Named `wait_terminal` (and not `wait`) so the
+    /// distinction is at the call site, not only in this doc comment.
     pub async fn wait_terminal(mut self) -> MonitorTermination {
         if let Some(t) = self.task.take() {
             match t.await {
@@ -2609,9 +2613,9 @@ fn classify_raw_monitor_frame(payload: &[u8], order: ByteOrder) -> RawMonitorFra
 
 /// Serialize a pvRequest VALUE to its on-wire `descriptor + value`
 /// form in `order`. This is the byte shape a MONITOR INIT pvRequest
-/// takes (pvxs `clientget.cpp:351-352` writes
-/// `to_wire_type_value(M, pvRequest)`), so the result is suitable both
-/// as a [`crate::codec::PvaCodec::build_monitor_init`] argument and as
+/// takes (pvxs `clientmon.cpp:345-346` writes `desc(pvRequest)` then
+/// `to_wire_full(R, pvRequest)`), so the result is suitable both as a
+/// [`crate::codec::PvaCodec::build_monitor_init`] argument and as
 /// a stable cache key for "same pvRequest" deduplication. Two equal
 /// pvRequest values produce identical bytes for a fixed `order`.
 pub fn encode_pv_request_value(req: &PvField, order: ByteOrder) -> Vec<u8> {
@@ -2833,7 +2837,7 @@ where
     });
     let state_for_task = state.clone();
 
-    let task = epics_base_rs::runtime::task::spawn(async move {
+    let task = channel.reactor().clone().spawn(async move {
         // Single owner of this subscription's connection-state transitions.
         let mut conn = ConnEventOwner::new(on_conn);
         loop {
@@ -2969,7 +2973,18 @@ where
         None if fields.is_empty() => std::borrow::Cow::Borrowed(sentinel_all_fields()),
         None => std::borrow::Cow::Owned(build_pv_request_fields(&refs, big_endian)),
     };
-    let mut stream = server.register_ioid_stream(sid, ioid, Command::Monitor.code());
+    // MONITOR is the one server-driven slot, so it is the one slot that
+    // needs a bound: `queueSize` deep, squashing the tail on overflow
+    // (pvxs `clientmon.cpp:52,683-699`). Armed with the INIT
+    // introspection below, before START — a squash is a changed-bitset
+    // merge and needs the descriptor.
+    let stream = server.register_ioid_monitor(
+        sid,
+        ioid,
+        Command::Monitor.code(),
+        flow.queue_size as usize,
+        flow.pipeline,
+    );
     // Single teardown owner for every exit below (see `MonitorTeardown`).
     let td = MonitorTeardown {
         server: &server,
@@ -2986,7 +3001,7 @@ where
     // yet published, so a teardown here only unregisters the local IOID
     // and ends ChannelClosed — no DESTROY, matching pvxs `_cancel()` in
     // the Creating phase (clientmon.cpp:810-824).
-    let init_frame = match recv_monitor_init(&state, &mut stream).await {
+    let init_frame = match recv_monitor_init(&state, &stream).await {
         MonitorInit::Reply(f) => f,
         MonitorInit::Cancelled => return Err(td.cancelled()),
         MonitorInit::Lost => return Err(td.lost()),
@@ -3012,6 +3027,12 @@ where
         return Err(td.remote(PvaError::RemoteError(init.status)));
     }
     let intro = init.introspection;
+    // The backlog can merge only once it knows the descriptor. Armed
+    // HERE — after the INIT reply, before START — so the invariant
+    // "a squashable DATA frame implies an armed backlog" holds by the
+    // protocol handshake, not by timing: the server may not send DATA
+    // before it receives the START below.
+    stream.arm(Arc::new(intro.clone()));
     // raw-path Pauser support: honour the handle's prior
     // pause state so a SubscriptionHandle::pause() called before
     // reconnect stays paused after the resubscribe. Mirrors the
@@ -3110,6 +3131,7 @@ where
             return td.finished();
         }
         if let Some(s) = &state {
+            let (n_cli_squash, max_queue, n_queue) = stream.counters();
             let mut st = s.stats.lock();
             st.n_delivered += 1;
             // this raw forwarding path's contract is to relay
@@ -3120,6 +3142,9 @@ where
             // downstream consumer; the typed `run_monitor_loop` path
             // populates `n_srv_squash`. Adding a full value decode purely
             // to read the overrun would defeat this path's purpose.
+            st.n_cli_squash = n_cli_squash;
+            st.max_queue = max_queue;
+            st.n_queue = n_queue;
             if events_since_ack > st.max_events_per_ack {
                 st.max_events_per_ack = events_since_ack;
             }
@@ -3274,7 +3299,7 @@ where
     });
     let state_for_task = state.clone();
 
-    let task = epics_base_rs::runtime::task::spawn(async move {
+    let task = channel.reactor().clone().spawn(async move {
         // Single owner of this subscription's connection-state transitions.
         let mut conn = ConnEventOwner::new(on_conn);
         loop {
@@ -3654,7 +3679,18 @@ where
         }
     };
 
-    let mut stream = server.register_ioid_stream(sid, ioid, Command::Monitor.code());
+    // MONITOR is the one server-driven slot, so it is the one slot that
+    // needs a bound: `queueSize` deep, squashing the tail on overflow
+    // (pvxs `clientmon.cpp:52,683-699`). Armed with the INIT
+    // introspection below, before START — a squash is a changed-bitset
+    // merge and needs the descriptor.
+    let stream = server.register_ioid_monitor(
+        sid,
+        ioid,
+        Command::Monitor.code(),
+        flow.queue_size as usize,
+        flow.pipeline,
+    );
     // Single teardown owner for every exit below (see `MonitorTeardown`).
     let td = MonitorTeardown {
         server: &server,
@@ -3676,7 +3712,7 @@ where
     // yet published, so a teardown here only unregisters the local IOID
     // and ends ChannelClosed — no DESTROY, matching pvxs `_cancel()` in
     // the Creating phase (clientmon.cpp:810-824).
-    let init_frame = match recv_monitor_init(&state, &mut stream).await {
+    let init_frame = match recv_monitor_init(&state, &stream).await {
         MonitorInit::Reply(f) => f,
         MonitorInit::Cancelled => return Err(td.cancelled()),
         MonitorInit::Lost => return Err(td.lost()),
@@ -3702,6 +3738,9 @@ where
         return Err(td.remote(PvaError::RemoteError(init.status)));
     }
     let intro = init.introspection;
+    // Same arming point as the raw loop: after the INIT reply, before
+    // START, so a squashable DATA frame always finds the descriptor.
+    stream.arm(Arc::new(intro.clone()));
 
     // START with pipeline ack window — unless the handle was paused
     // before this reconnect cycle, in which case start in STOP state
@@ -3804,11 +3843,15 @@ where
                 callback(&intro, &value, marked.as_ref());
                 events_since_ack += 1;
                 if let Some(s) = &state {
+                    let (n_cli_squash, max_queue, n_queue) = stream.counters();
                     let mut st = s.stats.lock();
                     st.n_delivered += 1;
                     if srv_squash {
                         st.n_srv_squash += 1;
                     }
+                    st.n_cli_squash = n_cli_squash;
+                    st.max_queue = max_queue;
+                    st.n_queue = n_queue;
                     if events_since_ack > st.max_events_per_ack {
                         st.max_events_per_ack = events_since_ack;
                     }
@@ -3883,7 +3926,7 @@ where
 /// (`Context::rpc(name, Value())`) from a present value whose type is
 /// `any`. The null argument serializes as the single `0xff` "null
 /// type" descriptor tag with no value body
-/// (`dataencode.cpp:30-35` + `clientget.cpp:302-311` — the value body
+/// (`dataencode.cpp:30-35` + `clientget.cpp:307-311` — the value body
 /// is written only when the arg is valid); a present argument
 /// serializes as `type(arg) + full_value(arg)`. This is distinct from
 /// `FieldDesc::Variant` plus an empty `PvField::Variant`, which is the
@@ -3902,7 +3945,7 @@ pub enum RpcArg<'a> {
 
 /// Serialize the RPC DATA-phase argument — the single owner of the
 /// RPC-argument wire shape, so the null/typed distinction lives in
-/// exactly one place. pvxs `clientget.cpp:302-311`.
+/// exactly one place. pvxs `clientget.cpp:307-311`.
 fn encode_rpc_exec_arg(arg: &RpcArg<'_>, order: ByteOrder, out: &mut Vec<u8>) {
     match arg {
         // pvxs `dataencode.cpp:30-35` — a null `FieldDesc*` is the
@@ -3983,7 +4026,7 @@ async fn op_rpc_attempt(
     ioid_guard.arm_destroy(sid);
     let response_intro = init_resp.introspection;
 
-    // DATA — RPC argument. pvxs clientget.cpp:302-311 writes the
+    // DATA — RPC argument. pvxs clientget.cpp:307-311 writes the
     // argument descriptor then the value body *only when the arg is
     // valid*; a top-level null arg is the single 0xff null-type tag
     // with no body. `encode_rpc_exec_arg` owns that distinction.
@@ -4094,7 +4137,7 @@ pub async fn op_put_get_value_marked(
 /// `field(value)` selector; the put leg encodes the typed `value`.
 /// Returns the get-leg `(FieldDesc, PvField)` readback.
 ///
-/// pvxs `p2pApp/channel.cpp:129-137`: `GWChannel::createChannelPutGet`
+/// pva2pva `p2pApp/channel.cpp:129-138`: `GWChannel::createChannelPutGet`
 /// forwards the original pvRequest verbatim to the upstream channel and
 /// returns its readback — one upstream operation, not a local put plus a
 /// separately-read cached get.
@@ -5223,7 +5266,7 @@ fn decode_process_status(
 /// A closed router slot means this op lost its transport, and that is
 /// [`PvaError::Disconnected`] — pvxs's `Disconnect` exception — not a
 /// protocol error. The two producers are `Channel::disconnect`
-/// (`client.cpp:198-204`), which drops the IOID maps on a server-initiated
+/// (`src/client.cpp:198-204`), which drops the IOID maps on a server-initiated
 /// `CMD_DESTROY_CHANNEL`, and the reader task's exit. The DESTROY case
 /// leaves the TCP circuit up and still serving this connection's other
 /// channels, so the old "connection closed" text was wrong on its face.
@@ -5252,7 +5295,7 @@ enum MonitorInit {
 
 /// Race a monitor's INIT reply against the subscription's cancel signal.
 ///
-/// This is the await that sits after `register_ioid_stream` but before
+/// This is the await that sits after `register_ioid_monitor` but before
 /// `active` is published. A stop()/teardown issued in that window must
 /// complete the caller's cancel promptly instead of parking forever on a
 /// silent or withholding server — the same hazard the data loops guard.
@@ -5264,7 +5307,7 @@ enum MonitorInit {
 /// and `run_raw_monitor_loop` so both honour the same rule.
 async fn recv_monitor_init(
     state: &Option<Arc<SubscriptionState>>,
-    stream: &mut mpsc::UnboundedReceiver<super::decode::Frame>,
+    stream: &super::monitor_queue::MonitorBacklog,
 ) -> MonitorInit {
     match state {
         Some(s) => {
@@ -5556,7 +5599,7 @@ fn build_put_value_mode(
 /// array travels as its original payload instead of a bracketed string.
 ///
 /// pvxs `linkBuildPut` stages each OUT link's DBR payload typed and
-/// moves it into the selected field directly (`pvalink_channel.cpp:127`);
+/// moves it into the selected field directly (`pvxs/ioc/pvalink_channel.cpp:127`);
 /// [`PutLeaf::Typed`] is the client-side primitive for that combined
 /// sibling-field PUT path.
 pub enum PutLeaf {
@@ -5601,7 +5644,7 @@ fn build_field_delta(
             // Typed leaf: assign the original pvData payload directly,
             // bypassing `Display`/`ScalarValue::parse` so a typed array
             // keeps its element type and byte content (pvxs `linkBuildPut`
-            // `value = tosend`, pvalink_channel.cpp:147-159).
+            // `value = tosend`, pvxs/ioc/pvalink_channel.cpp:147-159).
             PutLeaf::Typed(pv) => {
                 assign_at_path(&mut value, &parts, pv.clone());
             }
@@ -5849,6 +5892,24 @@ fn parse_json_into_field(
 /// distinct from the programmatic [`build_field_delta`] (pvxs
 /// `PutBuilder::set`) so the pvput-only JSON lowering does not leak into
 /// the typed-setter path.
+/// Parse one piece of `pvput` JSON input the way C parses it: in yajl's
+/// JSON5 dialect, not in strict JSON.
+///
+/// `pvput` hands its input to `parseJSON` (`pvAccess/pvtoolsSrc/pvput.cpp:150-153`),
+/// which drives a handle from `yajl_alloc`, and that handle's flags are
+/// already `yajl_allow_json5 | yajl_allow_comments`
+/// (`libcom/src/yajl/yajl.c:77`). Nothing on the path clears them —
+/// `pvData/src/json/parseinto.cpp:315-345` only re-enables comments. So
+/// `{value:1}`, a `// comment` or a single-quoted string are input C
+/// accepts, and `serde_json` alone rejected every one of them. The
+/// conversion is `epics_base_rs::json5`, the workspace's single reader of
+/// that dialect.
+fn parse_pvput_json(raw: &str) -> Result<serde_json::Value, String> {
+    let strict = epics_base_rs::json5::relaxed_to_strict(raw)
+        .map_err(|e| format!("invalid JSON value: {e}"))?;
+    serde_json::from_str(&strict).map_err(|e| format!("invalid JSON value: {e}"))
+}
+
 fn build_put_field_pairs(
     intro: &FieldDesc,
     pairs: &[(String, String)],
@@ -5865,9 +5926,8 @@ fn build_put_field_pairs(
             let field_desc = field_desc_at_path(intro, &parts).ok_or_else(|| {
                 PvaError::InvalidValue(format!("field path '{fname}' not present in introspection"))
             })?;
-            let json: serde_json::Value = serde_json::from_str(raw.trim()).map_err(|e| {
-                PvaError::InvalidValue(format!("{fname} : invalid JSON value: {e}"))
-            })?;
+            let json = parse_pvput_json(raw.trim())
+                .map_err(|e| PvaError::InvalidValue(format!("{fname} : {e}")))?;
             // `parse_json_into_field` marks the assigned leaves (or the
             // array/leaf bit) — do not also blanket-mark the field bit.
             let fv = parse_json_into_field(field_desc, &json, bit, &mut changed)?;
@@ -5973,8 +6033,7 @@ fn build_put_from_args(
         && bare[0].trim_start().starts_with('{')
         && matches!(intro, FieldDesc::Structure { .. })
     {
-        let json: serde_json::Value = serde_json::from_str(bare[0].trim())
-            .map_err(|e| PvaError::InvalidValue(format!("invalid JSON value: {e}")))?;
+        let json = parse_pvput_json(bare[0].trim()).map_err(PvaError::InvalidValue)?;
         let mut changed = BitSet::new();
         let value = parse_json_into_field(intro, &json, 0, &mut changed)?;
         return Ok((value, changed));
@@ -6405,6 +6464,75 @@ mod tests {
                 !out.contains("secondsPastEpoch"),
                 "unmarked timeStamp leaf must not print: {out:?}"
             );
+        }
+    }
+
+    /// `pvput`'s JSON input is yajl's JSON5 dialect, not strict JSON:
+    /// `parseJSON` (`pvput.cpp:150-153`) drives a `yajl_alloc` handle whose
+    /// flags are `yajl_allow_json5 | yajl_allow_comments`
+    /// (`yajl.c:77`), and `parseinto.cpp:315-345` never clears them.
+    ///
+    /// By dialect feature, not by scenario, on BOTH input routes — the
+    /// lone-`{...}` JSON-top mode and the `field=<json>` pairs mode.
+    mod put_json5_input {
+        use super::*;
+        use crate::pvdata::ScalarType;
+
+        fn proto() -> FieldDesc {
+            FieldDesc::Structure {
+                struct_id: "epics:nt/NTScalarArray:1.0".to_string(),
+                fields: vec![(
+                    "value".to_string(),
+                    FieldDesc::ScalarArray(ScalarType::Double),
+                )],
+            }
+        }
+        fn tok(args: &[&str]) -> Vec<String> {
+            args.iter().map(|s| s.to_string()).collect()
+        }
+        fn elems(v: &PvField) -> Vec<f64> {
+            match v {
+                PvField::Structure(s) => {
+                    match &s.fields.iter().find(|(n, _)| n == "value").unwrap().1 {
+                        PvField::ScalarArray(items) => items
+                            .iter()
+                            .map(|sv| match sv {
+                                ScalarValue::Double(d) => *d,
+                                other => panic!("expected Double, got {other:?}"),
+                            })
+                            .collect(),
+                        other => panic!("expected ScalarArray, got {other:?}"),
+                    }
+                }
+                other => panic!("expected Structure, got {other:?}"),
+            }
+        }
+
+        #[test]
+        fn json_top_mode_takes_bare_keys_and_comments() {
+            for input in [
+                r#"{"value":[1.0,2.0]}"#,       // strict JSON still works
+                r#"{value:[1.0,2.0]}"#,         // unquoted identifier key
+                "{value:[1.0,2.0]} // two",     // line comment
+                "{/* lead */ value:[1.0,2.0]}", // block comment
+            ] {
+                let (v, _) = build_put_from_args(&proto(), &tok(&[input]), None)
+                    .unwrap_or_else(|e| panic!("pvput accepts {input:?}, we must too: {e}"));
+                assert_eq!(elems(&v), vec![1.0, 2.0], "input {input:?}");
+            }
+        }
+
+        #[test]
+        fn field_pairs_mode_takes_the_same_dialect() {
+            for input in [
+                "value=[1.0,2.0]",
+                "value=[1.0,2.0] // two",
+                "value=[/* lead */1.0,2.0]",
+            ] {
+                let (v, _) = build_put_from_args(&proto(), &tok(&[input]), None)
+                    .unwrap_or_else(|e| panic!("pvput accepts {input:?}, we must too: {e}"));
+                assert_eq!(elems(&v), vec![1.0, 2.0], "input {input:?}");
+            }
         }
     }
 
@@ -7698,8 +7826,8 @@ mod tests {
 
         // pipeline=false → no trailer and no ACK, but the queue depth is
         // still resolved: pvxs's `queueSize` block sits outside any pipeline
-        // gate (clientmon.cpp:763-773) and its value is what `stats()` reports
-        // as `limitQueue` (:152). R10-35 — this used to answer 0.
+        // gate (clientmon.cpp:761-773) and its value is what `stats()` reports
+        // as `limitQueue` (:156). R10-35 — this used to answer 0.
         let f = MonitorFlow::from_record_options(&opts(&[("pipeline", "false")]), 4);
         assert!(!f.pipeline);
         assert_eq!(f.queue_size, 4, "the builder default depth still stands");
@@ -7820,7 +7948,7 @@ mod tests {
     /// forwarding such a request opens a plain upstream monitor, not a
     /// pipelined one driven by the client's builder default. The depth it
     /// asks for is still honored — `queueSize` is parsed outside the
-    /// `pipeline` gate in pvxs (clientmon.cpp:763-773).
+    /// `pipeline` gate in pvxs (clientmon.cpp:761-773).
     #[test]
     fn record_options_queue_size_without_pipeline_stays_plain() {
         let req = pv_request_with_options(&[("queueSize", PvField::Scalar(ScalarValue::UInt(16)))]);
@@ -7930,7 +8058,7 @@ mod tests {
     async fn teardown_wakes_a_parked_monitor_loop() {
         let state = idle_sub_state();
         let task_state = state.clone();
-        let task = epics_base_rs::runtime::task::spawn(async move {
+        let task = crate::test_reactor().spawn(async move {
             task_state.cancel.notified().await;
         });
         // Give the task a chance to reach `.notified().await`.
@@ -7985,7 +8113,7 @@ mod tests {
         Frame { header, payload }
     }
 
-    /// The MONITOR INIT receive is the await between `register_ioid_stream`
+    /// The MONITOR INIT receive is the await between `register_ioid_monitor`
     /// and publishing `active`. A `stop_sync()`/teardown issued while the
     /// server withholds the INIT reply must complete the cancel promptly
     /// (return `Cancelled`) rather than hang the spawned monitor task
@@ -7994,10 +8122,9 @@ mod tests {
     async fn recv_monitor_init_cancels_on_teardown_during_wait() {
         let state = idle_sub_state();
         let task_state = Some(state.clone());
-        let (tx, mut rx) = mpsc::unbounded_channel::<Frame>();
-        let task = epics_base_rs::runtime::task::spawn(async move {
-            recv_monitor_init(&task_state, &mut rx).await
-        });
+        let (tx, rx) = super::super::monitor_queue::MonitorSink::new(4, false);
+        let task =
+            crate::test_reactor().spawn(async move { recv_monitor_init(&task_state, &rx).await });
         // Let the task reach its `select!` (silent-but-open server).
         epics_base_rs::runtime::task::yield_now().await;
         state.teardown();
@@ -8022,14 +8149,15 @@ mod tests {
         let state = idle_sub_state();
         state.stop.store(true, Ordering::Relaxed);
         let opt = Some(state.clone());
-        let (tx, mut rx) = mpsc::unbounded_channel::<Frame>();
-        tx.send(dummy_monitor_frame()).unwrap(); // a reply is even available
-        match recv_monitor_init(&opt, &mut rx).await {
+        let (tx, rx) = super::super::monitor_queue::MonitorSink::new(4, false);
+        tx.push(dummy_monitor_frame()); // a reply is even available
+        match recv_monitor_init(&opt, &rx).await {
             MonitorInit::Cancelled => {}
             _ => panic!("a preset stop must short-circuit to Cancelled"),
         }
-        assert!(
-            rx.try_recv().is_ok(),
+        assert_eq!(
+            rx.counters().2,
+            1,
             "preset stop must not consume the queued INIT reply"
         );
     }
@@ -8038,9 +8166,9 @@ mod tests {
     #[epics_macros_rs::epics_test]
     async fn recv_monitor_init_returns_reply_when_frame_arrives() {
         let state = Some(idle_sub_state());
-        let (tx, mut rx) = mpsc::unbounded_channel::<Frame>();
-        tx.send(dummy_monitor_frame()).unwrap();
-        match recv_monitor_init(&state, &mut rx).await {
+        let (tx, rx) = super::super::monitor_queue::MonitorSink::new(4, false);
+        tx.push(dummy_monitor_frame());
+        match recv_monitor_init(&state, &rx).await {
             MonitorInit::Reply(_) => {}
             _ => panic!("a queued INIT reply must yield Reply"),
         }
@@ -8052,9 +8180,9 @@ mod tests {
     #[epics_macros_rs::epics_test]
     async fn recv_monitor_init_lost_when_stream_closed() {
         let state = Some(idle_sub_state());
-        let (tx, mut rx) = mpsc::unbounded_channel::<Frame>();
+        let (tx, rx) = super::super::monitor_queue::MonitorSink::new(4, false);
         drop(tx); // server connection gone, no reply will arrive
-        match recv_monitor_init(&state, &mut rx).await {
+        match recv_monitor_init(&state, &rx).await {
             MonitorInit::Lost => {}
             _ => panic!("a closed stream before the reply must yield Lost"),
         }
@@ -8065,9 +8193,9 @@ mod tests {
     #[epics_macros_rs::epics_test]
     async fn recv_monitor_init_no_handle_awaits_reply() {
         let state: Option<Arc<SubscriptionState>> = None;
-        let (tx, mut rx) = mpsc::unbounded_channel::<Frame>();
-        tx.send(dummy_monitor_frame()).unwrap();
-        match recv_monitor_init(&state, &mut rx).await {
+        let (tx, rx) = super::super::monitor_queue::MonitorSink::new(4, false);
+        tx.push(dummy_monitor_frame());
+        match recv_monitor_init(&state, &rx).await {
             MonitorInit::Reply(_) => {}
             _ => panic!("the no-handle path must still deliver the reply"),
         }
@@ -8379,7 +8507,7 @@ mod tests {
     #[test]
     fn rpc_arg_null_encodes_single_null_type_tag() {
         // pvxs dataencode.cpp:30-35 — a null FieldDesc* is the single
-        // 0xff byte; clientget.cpp:302-311 omits the value body. The
+        // 0xff byte; clientget.cpp:307-311 omits the value body. The
         // server's decode_rpc_exec_arg reads exactly this as a
         // top-level null argument.
         let mut out = Vec::new();

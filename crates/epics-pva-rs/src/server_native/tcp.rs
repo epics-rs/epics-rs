@@ -20,7 +20,8 @@
 //! No socket type is named anywhere in this file's production scope, and
 //! `accept::tests::the_protocol_scope_owns_no_socket` keeps it that way.
 
-// RTEMS-EXEC-MODEL-ALLOW(8): checked - these run and pass in the feature-ON suite.
+// RTEMS-EXEC-MODEL-ALLOW(1): checked - these run and pass in the exec-backend
+// suite.
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -50,10 +51,11 @@ use super::source::{ChannelInvalidator, DynSource, OpError};
 // The accept loop moved to `super::accept` (RTEMS phase 6 item 7 stage A);
 // these re-exports keep `server_native::tcp::run_tcp_server*` resolving for
 // every existing caller and doc link. `accept` owns the listener socket and is
-// host-only, so the re-exports carry its gate — this is the shim, not the
-// protocol, and gating it is what the comment written here at the split
-// already prescribed for the merge with `phase6/pva-rtems-dep-gate`.
-#[cfg(not(epics_embedded_target))]
+// `tokio_backend` — a reactor-free build has no listener to own, a host
+// `exec_backend` one included — so the re-exports carry its gate. This is the
+// shim, not the protocol, and gating it is what the comment written here at
+// the split already prescribed for the merge with `phase6/pva-rtems-dep-gate`.
+#[cfg(tokio_backend)]
 pub use super::accept::{run_tcp_server, run_tcp_server_on_listener, run_tcp_server_with_peers};
 
 // pvxs seeds each ID namespace from a distinct non-zero base (commit
@@ -181,10 +183,11 @@ enum MonitorPipelineRequest {
 /// `handle_MONITOR` — nothing catches between there and the command-dispatch
 /// `catch` in `conn.cpp:277-282`, which logs and does `bev.reset()`. pvxs
 /// DROPS the circuit; it does not reply, and it does not serve the monitor.
-/// (`:570-573`'s "Unable to parse …" Crit is therefore dead code: it needs
-/// both conversions to fail, and any storage that fails the string one has
-/// already thrown at `:556`.) The caller turns this `Err` into the port's
-/// equivalent of `bev.reset()` — a fatal `PvaError` out of the TCP read loop.
+/// (`servermon.cpp:570-573`'s "Unable to parse …" Crit is therefore dead
+/// code: it needs both conversions to fail, and any storage that fails the
+/// string one has already thrown at `servermon.cpp:556`.) The caller turns
+/// this `Err` into the port's equivalent of `bev.reset()` — a fatal
+/// `PvaError` out of the TCP read loop.
 fn ack_at_from(
     ack_any: Option<&PvField>,
     queue_size: u32,
@@ -208,9 +211,9 @@ fn ack_at_from(
         if let Ok(n) = crate::pvdata::convert::as_u32(f) {
             ack_at = n;
         } else if let Some(pct) = sval.strip_suffix('%').filter(|p| !p.is_empty()) {
-            // pvxs `else if(ackAny.as(sval))` (`:560`) — the same string the
-            // throwing `as<std::string>()` above already produced. Only a `"N%"`
-            // percentage does anything here.
+            // pvxs `else if(ackAny.as(sval))` (`servermon.cpp:560`) — the
+            // same string the throwing `as<std::string>()` above already
+            // produced. Only a `"N%"` percentage does anything here.
             match pct.trim().parse::<f64>() {
                 Ok(percent) => {
                     // pvxs `servermon.cpp:563` historically computed
@@ -620,8 +623,9 @@ fn monitor_pipeline_options(
     // `bool(src)` non-zero rule (`data.cpp:405`); a string converts only as
     // the exact tokens `"true"`/`"false"` (`data.cpp:466-469`). Anything the
     // conversion refuses — an unrecognized string, an array, a struct — is
-    // `NoConvert` → `as(v)` answers false → pvxs leaves `op->pipeline` at its
-    // `false` default and emits a `Level::Warn` logRemote (`:529`).
+    // `NoConvert` → `as(v)` answers false → pvxs leaves `op->pipeline` at
+    // its `false` default and emits a `Level::Warn` logRemote
+    // (`servermon.cpp:529`).
     //
     // The hand-rolled per-variant match this replaces diverged twice: it
     // hardcoded Float/Double to `false` (a pvxs client sending
@@ -761,14 +765,14 @@ struct ChannelState {
     /// owner when a source is added or removed. pvxs binds the accepting
     /// source's callbacks into the `ServerChan` at CREATE_CHANNEL
     /// (`serverchan.cpp:70-112`); a later `removeSource` does not rewrite
-    /// them (`server.cpp:100-112`).
+    /// them (`src/server.cpp:100-112`).
     source: DynSource,
     /// Shared per-channel report counters (name + tx/rx + ReportInfo),
     /// the SAME `Arc` registered in this connection's `PeerEntry` under
     /// the channel's SID. Handlers attribute per-PV traffic through this
     /// (`stat.add_tx`/`add_rx`) so `PvaServer::report`
     /// can show per-channel byte counters (pvxs `chan->statTx/statRx`,
-    /// server.cpp:260-268).
+    /// src/server.cpp:260-268).
     stat: Arc<crate::server_native::peers::ChannelStat>,
     /// Credential snapshot taken when this channel was CREATED, used for
     /// the channel *lifecycle* callbacks (`notify_channel_open` /
@@ -899,7 +903,10 @@ impl Drop for AbortOnDrop {
 /// the read loop drains that queue only after the caller's
 /// [`finish_exec_data_task`] bookkeeping ran, so the `last_request`
 /// disposition in [`apply_exec_finish`] is unchanged.
-fn poll_inline_or_spawn<F>(fut: F) -> Option<epics_base_rs::runtime::task::TaskAbortHandle>
+fn poll_inline_or_spawn<F>(
+    reactor: &epics_base_rs::runtime::task::Reactor,
+    fut: F,
+) -> Option<epics_base_rs::runtime::task::TaskAbortHandle>
 where
     F: std::future::Future<Output = ()> + Send + 'static,
 {
@@ -907,7 +914,7 @@ where
     let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
     match std::future::Future::poll(fut.as_mut(), &mut cx) {
         std::task::Poll::Ready(()) => None,
-        std::task::Poll::Pending => Some(epics_base_rs::runtime::task::spawn(fut).abort_handle()),
+        std::task::Poll::Pending => Some(reactor.spawn(fut).abort_handle()),
     }
 }
 
@@ -933,7 +940,9 @@ struct ParkCtx<'a> {
 /// refused from the read loop, so "no such field" still fails fast; only
 /// a source that CAN publish later suspends. Dropping the returned entry
 /// cancels the wait, which is the whole of pvxs's `conn->onClose` erase.
+#[allow(clippy::too_many_arguments)] // the `reactor` capability is the 8th
 fn park_op_for_intro(
+    reactor: &epics_base_rs::runtime::task::Reactor,
     ch: &mut ChannelState,
     frame: &Frame,
     kind: OpKind,
@@ -954,7 +963,7 @@ fn park_op_for_intro(
         log: Default::default(),
     };
     let ready_tx = ctx.ready_tx.clone();
-    let wait = poll_inline_or_spawn(async move {
+    let wait = poll_inline_or_spawn(reactor, async move {
         let desc = source.await_introspection(&name, wait_ctx).await;
         let _ = ready_tx.send(IntroReady {
             sid,
@@ -1051,7 +1060,32 @@ struct MonitorFinished {
 /// (see CLAUDE.md "Strong state transitions").
 struct MonitorFinishGuard {
     tx: mpsc::UnboundedSender<MonitorFinished>,
-    fin: MonitorFinished,
+    /// `None` once the signal has been queued — by [`Self::reply`] ahead of the
+    /// monitor's terminal frame, or by `Drop` on a path that emits none.
+    fin: Option<MonitorFinished>,
+}
+
+impl MonitorFinishGuard {
+    fn new(tx: mpsc::UnboundedSender<MonitorFinished>, fin: MonitorFinished) -> Self {
+        Self { tx, fin: Some(fin) }
+    }
+
+    /// Queue this subscriber's removal signal, then hand its terminal frame to
+    /// the writer — the [`ExecFinishGuard::reply`] rule, for the same reason.
+    ///
+    /// A client may re-INIT the ioid the instant it sees MONITOR FINISH, and
+    /// `handle_op`'s duplicate-INIT check is connection-FATAL, so the op has to
+    /// be gone from `channels` before that INIT is dispatched. Signalling from
+    /// `Drop` instead — after the frame is already with the writer — leaves the
+    /// client's re-INIT racing the OS scheduler for the few instructions
+    /// between the two; `biased` in [`handle_connection_io`] orders the two
+    /// queues but cannot order a signal that has not been queued yet.
+    async fn reply(mut self, tx: &ChannelTx, buf: Vec<u8>) {
+        if let Some(fin) = self.fin.take() {
+            let _ = self.tx.send(fin);
+        }
+        let _ = tx.send(buf).await;
+    }
 }
 
 impl Drop for MonitorFinishGuard {
@@ -1059,7 +1093,9 @@ impl Drop for MonitorFinishGuard {
         // Unbounded so this sync Drop never loses the signal to a full
         // channel; the only `send` failure is a closed receiver, which
         // means the read loop already ended and dropped every op.
-        let _ = self.tx.send(self.fin);
+        if let Some(fin) = self.fin.take() {
+            let _ = self.tx.send(fin);
+        }
     }
 }
 
@@ -1141,8 +1177,8 @@ struct ExecFinished {
     ///
     /// Defaulting to `false` makes the safe disposition (return to Idle for a
     /// GPR op, never an erroneous destroy) hold by construction for any task
-    /// exit that does not explicitly [`ExecFinishGuard::mark_success`] — error
-    /// returns, panics, and aborts all skip the marking.
+    /// exit that does not go through [`ExecFinishGuard::reply`] with `true` —
+    /// error replies, panics, and aborts all leave it as built.
     success: bool,
     /// PUT/PUT_GET decode scratch travelling back to its channel
     /// ([`ChannelState::put_scratch`]) once the source call released its
@@ -1154,25 +1190,78 @@ struct ExecFinished {
 }
 
 /// RAII finalizer held as a single local at the top of a data-phase
-/// task body. Its `Drop` reports completion to the read-loop owner on EVERY
-/// task exit — the normal reply-then-return, an early `return` on an error
-/// reply, a panic, or an `AbortOnDrop`-driven cancellation (DESTROY / channel
-/// teardown / disconnect). Because it is one local that no path can step
-/// around, the "executing op returns to idle when its task ends" invariant
-/// holds by construction (see CLAUDE.md "Strong state transitions").
+/// task body, and the task's only route to the writer.
+///
+/// [`Self::reply`] queues the completion signal ahead of the terminal frame;
+/// `Drop` covers every exit that emits none — a panic, or an
+/// `AbortOnDrop`-driven cancellation (DESTROY / channel teardown /
+/// disconnect). Because it is one local that no path can step around, both
+/// "an executing op returns to idle when its task ends" and "no reply reaches
+/// the client while its op is still marked `Executing`" hold by construction
+/// (see CLAUDE.md "Strong state transitions").
 struct ExecFinishGuard {
     tx: mpsc::UnboundedSender<ExecFinished>,
-    fin: ExecFinished,
+    /// `None` once the signal has been queued — by [`Self::reply`] ahead of a
+    /// terminal frame, or by `Drop` on a path that emits none.
+    fin: Option<ExecFinished>,
 }
 
 impl ExecFinishGuard {
-    /// Record that this task emitted a successful terminal reply
-    /// (`Status::ok`). The `Drop` finalizer then tells the owner to clean up a
-    /// `last_request` GPR op; without this call (error reply, panic, abort) the
-    /// owner returns the op to `Idle` with the marker preserved, mirroring pvxs
-    /// `ServerGPR::doReply` (`serverget.cpp:86-116`).
-    fn mark_success(&mut self) {
-        self.fin.success = true;
+    fn new(tx: mpsc::UnboundedSender<ExecFinished>, fin: ExecFinished) -> Self {
+        Self { tx, fin: Some(fin) }
+    }
+
+    /// Send the PUT decode scratch tree home with the completion signal, so the
+    /// channel can lend it to the next EXEC ([`apply_exec_finish`]).
+    fn set_scratch(&mut self, scratch: (Arc<FieldDesc>, PvField)) {
+        if let Some(fin) = self.fin.as_mut() {
+            fin.scratch = Some(scratch);
+        }
+    }
+
+    /// Queue this task's completion signal, then hand its terminal frame to
+    /// the writer — in that order, and only in that order.
+    ///
+    /// pvxs commits the op transition inside `ServerGPR::doReply` —
+    /// `state = Idle` / `cleanup()` at `serverget.cpp:112-115` — and enqueues
+    /// the body afterwards at `:124`, both on the acceptor loop that also
+    /// reads frames (`:215`, `:291`, `:306` dispatch the reply onto it). The
+    /// client answers a reply the instant it arrives, so a frame it sends in
+    /// response can never be dispatched against a still-`Executing` op.
+    ///
+    /// Here the body travels on the writer mpsc while the transition travels
+    /// on `exec_fin_tx`, so the same order has to be built rather than
+    /// inherited: queue the transition first, and let the read loop drain that
+    /// queue ahead of the socket (`biased` in [`handle_connection_io`]).
+    /// Signalling from `Drop` instead — after the body is already with the
+    /// writer — leaves the client's answer racing the OS scheduler for the few
+    /// instructions between the two.
+    ///
+    /// Taking `self` by value is what closes the family: a data-phase task
+    /// reaches the writer through this method or not at all, so no site can
+    /// enqueue a body while its own op is still marked `Executing`.
+    async fn reply(mut self, tx: &ChannelTx, buf: Vec<u8>, success: bool) {
+        if let Some(mut fin) = self.fin.take() {
+            fin.success = success;
+            let _ = self.tx.send(fin);
+        }
+        let _ = tx.send(buf).await;
+    }
+
+    /// [`Self::reply`] for the error frames a data-phase task emits instead of
+    /// its data reply. `success = false` keeps a `last_request` GPR op `Idle`
+    /// with the marker preserved for a later EXEC (pvxs `serverget.cpp:89-90`).
+    async fn reply_error(
+        self,
+        tx: &ChannelTx,
+        kind: OpKind,
+        ioid: u32,
+        subcmd: u8,
+        status: Status,
+        order: ByteOrder,
+    ) {
+        let buf = build_op_error_frame(kind, ioid, subcmd, status, order);
+        self.reply(tx, buf, false).await;
     }
 }
 
@@ -1181,13 +1270,9 @@ impl Drop for ExecFinishGuard {
         // Unbounded so this sync Drop never loses the signal to a full
         // channel; the only `send` failure is a closed receiver (the read
         // loop already ended and dropped every op).
-        let _ = self.tx.send(ExecFinished {
-            sid: self.fin.sid,
-            ioid: self.fin.ioid,
-            op_id: self.fin.op_id,
-            success: self.fin.success,
-            scratch: self.fin.scratch.take(),
-        });
+        if let Some(fin) = self.fin.take() {
+            let _ = self.tx.send(fin);
+        }
     }
 }
 
@@ -1849,6 +1934,7 @@ impl MonitorStartControl {
         }
     }
 
+    #[cfg(tokio_backend)]
     /// True iff the most recent edge set this monitor Executing — a real
     /// MONITOR START not yet followed by STOP/PAUSE/CANCEL. The subscriber's
     /// emit gate follows this same state via the `monitor_exec` watch; this
@@ -1910,9 +1996,11 @@ impl MonitorPost for crate::server_native::RawMonitorEvent {
 ///   and *then* the FINISH, so the terminal must never destroy a real one;
 /// * otherwise a post is appended as a DISTINCT queue entry while the queue
 ///   holds fewer than `limit` entries;
-/// * once full, a non-terminal post is coalesced into the queue tail
-///   (unioning marked-leaf sets via [`coalesce_monitor_update`] on the
-///   decoded path).
+/// * once full, a non-terminal post is coalesced into the queue tail,
+///   unioning marked-leaf sets — [`coalesce_monitor_update`] on the
+///   decoded path, [`coalesce_raw_monitor_event`] on the raw-forward one.
+///   Both are pvxs's `queue.back().assign(val)`; neither may degrade to
+///   last-wins, which discards the leaves only the older post changed.
 ///
 /// `limit` must be >= 1 so a tail always exists to squash into. Returns
 /// whether an overflow squash happened (diagnostic only).
@@ -2107,6 +2195,7 @@ struct MonitorSubscriberArgs {
 /// source subscription handle, releasing the upstream. The `MonitorFinishGuard`
 /// installed as the first task statement reports terminal removal on every exit.
 fn spawn_monitor_subscriber(
+    reactor: &epics_base_rs::runtime::task::Reactor,
     args: MonitorSubscriberArgs,
 ) -> (
     epics_base_rs::runtime::task::TaskHandle<()>,
@@ -2173,11 +2262,8 @@ fn spawn_monitor_subscriber(
     // loop now owns directly.
     let loop_exec_rx = monitor_exec_rx;
 
-    let join = epics_base_rs::runtime::task::spawn(async move {
-        let _fin_guard = MonitorFinishGuard {
-            tx: mon_fin_tx,
-            fin: mon_fin,
-        };
+    let join = reactor.spawn(async move {
+        let fin_guard = MonitorFinishGuard::new(mon_fin_tx, mon_fin);
         let order_now = || {
             if out_order_mon.load(std::sync::atomic::Ordering::Relaxed) {
                 ByteOrder::Big
@@ -2250,7 +2336,7 @@ fn spawn_monitor_subscriber(
                     .is_none()
                 {
                     let finish = build_monitor_finish(ioid, order_now());
-                    let _ = tx_clone.send(finish).await;
+                    fin_guard.reply(&tx_clone, finish).await;
                     return;
                 }
                 mon_acl_version_at_subscribe_cell
@@ -2300,9 +2386,12 @@ fn spawn_monitor_subscriber(
                                 let raw_cap = queue_limit
                                     .saturating_sub(seed_cooked.is_some() as usize)
                                     .max(1);
-                                push_squash_monitor(&mut pending, ev, raw_cap, |_old, new| new);
+                                let squash = |old, new| {
+                                    coalesce_raw_monitor_event(&intro_clone, old, new)
+                                };
+                                push_squash_monitor(&mut pending, ev, raw_cap, squash);
                                 while let Ok(e) = rx_raw.try_recv() {
-                                    push_squash_monitor(&mut pending, e, raw_cap, |_old, new| new);
+                                    push_squash_monitor(&mut pending, e, raw_cap, squash);
                                 }
                             }
                             None => source_open = false,
@@ -2324,7 +2413,7 @@ fn spawn_monitor_subscriber(
                             {
                                 if src.revalidate_read(&pv_name, mon_ctx.clone()).await.is_none() {
                                     let finish = build_monitor_finish(ioid, order_now());
-                                    let _ = tx_clone.send(finish).await;
+                                    fin_guard.reply(&tx_clone, finish).await;
                                     return;
                                 }
                                 mon_acl_version_at_subscribe_cell
@@ -2346,7 +2435,7 @@ fn spawn_monitor_subscriber(
                         let ev = pending.pop_front().expect("has_work && no seed => pending non-empty");
                         if ev.type_changed {
                             let finish = build_monitor_finish(ioid, order_now());
-                            let _ = tx_clone.send(finish).await;
+                            fin_guard.reply(&tx_clone, finish).await;
                             return;
                         }
                         let live_v = src.access_gate().acl_version();
@@ -2356,7 +2445,7 @@ fn spawn_monitor_subscriber(
                         {
                             if src.revalidate_read(&pv_name, mon_ctx.clone()).await.is_none() {
                                 let finish = build_monitor_finish(ioid, order_now());
-                                let _ = tx_clone.send(finish).await;
+                                fin_guard.reply(&tx_clone, finish).await;
                                 return;
                             }
                             mon_acl_version_at_subscribe_cell
@@ -2381,7 +2470,7 @@ fn spawn_monitor_subscriber(
                 }
             }
             let finish = build_monitor_finish(ioid, order_now());
-            let _ = tx_clone.send(finish).await;
+            fin_guard.reply(&tx_clone, finish).await;
             return;
         }
 
@@ -2454,7 +2543,7 @@ fn spawn_monitor_subscriber(
                     .is_none()
                 {
                     let finish = build_monitor_finish(ioid, order_now());
-                    let _ = tx_clone.send(finish).await;
+                    fin_guard.reply(&tx_clone, finish).await;
                     return;
                 }
                 mon_acl_version_at_subscribe_cell
@@ -2531,7 +2620,7 @@ fn spawn_monitor_subscriber(
                     // path's `type_changed` branch.
                     if value.type_changed {
                         let finish = build_monitor_finish(ioid, order_now());
-                        let _ = tx_clone.send(finish).await;
+                        fin_guard.reply(&tx_clone, finish).await;
                         return;
                     }
                     // Per-event ACL recheck on policy reload, routed through
@@ -2543,7 +2632,7 @@ fn spawn_monitor_subscriber(
                     {
                         if src.revalidate_read(&pv_name, mon_ctx.clone()).await.is_none() {
                             let finish = build_monitor_finish(ioid, order_now());
-                            let _ = tx_clone.send(finish).await;
+                            fin_guard.reply(&tx_clone, finish).await;
                             return;
                         }
                         mon_acl_version_at_subscribe_cell
@@ -2577,7 +2666,7 @@ fn spawn_monitor_subscriber(
                                 "server-side filter transform does not fit the monitor descriptor",
                                 order_now(),
                             );
-                            let _ = tx_clone.send(err).await;
+                            fin_guard.reply(&tx_clone, err).await;
                             return;
                         }
                     };
@@ -2610,7 +2699,7 @@ fn spawn_monitor_subscriber(
         }
         // Source closed — emit MONITOR FINISH (pvxs servermon.cpp:148-178).
         let finish = build_monitor_finish(ioid, order_now());
-        let _ = tx_clone.send(finish).await;
+        fin_guard.reply(&tx_clone, finish).await;
     });
 
     (join, start_ctl)
@@ -2758,24 +2847,6 @@ impl ClientCredentials {
     }
 }
 
-/// Parse `CONNECTION_VALIDATION` reply payload (pvxs serverconn.cpp:200).
-/// Layout: `buffer_size:u32 + intro_size:u16 + qos:u16 + method:String +
-/// auth_type + auth_value`.
-///
-/// pvxs `serverconn.cpp:204-216` always decodes the auth
-/// Value via `from_wire_type_value`, then `if(!M.good()) bev.reset()`
-/// — a truncated/invalid auth body is connection-fatal. Pre-fix Rust
-/// wrapped the decode in `if let Ok` and still returned
-/// `Some(ClientCredentials)` on failure, filling `account` with the
-/// method name. A truncated `method="ca"` handshake became
-/// `method="ca", account="ca"` — every ACF rule keying on
-/// method/account/host was then evaluating a credential tuple pvxs
-/// would never have produced.
-///
-/// Now: `Ok(None)` for the empty-method / anonymous case;
-/// `Ok(Some(creds))` only when the auth Value decoded successfully;
-/// `Err(...)` on any decode fault past the method string (so the
-/// caller can disconnect, mirroring pvxs `bev.reset()`).
 /// Auth methods this server advertises in CONNECTION_VALIDATION
 /// (pvxs serverconn.cpp:103-114 — exactly "anonymous"/"ca"). Any other
 /// spelling, including case variants like "CA", is treated as an
@@ -2826,7 +2897,7 @@ async fn process_connection_validation(
     if x509_locked {
         // a decode fault here is still fatal —
         // log + propagate. Pre-fix swallowed; pvxs
-        // `serverconn.cpp:211-216` calls `bev.reset()`.
+        // `serverconn.cpp:211-214` calls `bev.reset()`.
         match parse_client_credentials(frame, decode_cache, peer)? {
             Some(claimed) => debug!(
                 ?peer,
@@ -2852,7 +2923,7 @@ async fn process_connection_validation(
         // unadvertised re-auth leaves the previous identity in force. Mirror
         // that: decode into `candidate`, decide whether the effective method is
         // advertised, and write `*cred` ONLY on the advertised path. A decode
-        // fault is connection-fatal (pvxs serverconn.cpp:211-216 bev.reset). An
+        // fault is connection-fatal (pvxs serverconn.cpp:211-214 bev.reset). An
         // anonymous handshake (empty/"anonymous" method) returns Ok(None) and
         // keeps whatever credential is already in force — anonymous on a fresh
         // connection, the committed identity on a re-auth.
@@ -2939,6 +3010,25 @@ async fn process_connection_validation(
     Ok(())
 }
 
+/// Parse `CONNECTION_VALIDATION` reply payload (pvxs serverconn.cpp:200).
+/// Layout: `buffer_size:u32 + intro_size:u16 + qos:u16 + method:String +
+/// auth_type + auth_value`.
+///
+/// pvxs `serverconn.cpp:204-214` always decodes the auth
+/// Value via `from_wire_type_value`, then `if(!M.good()) bev.reset()`
+/// — a truncated/invalid auth body is connection-fatal. Pre-fix Rust
+/// wrapped the decode in `if let Ok` and still returned
+/// `Some(ClientCredentials)` on failure, filling `account` with the
+/// method name. A truncated `method="ca"` handshake became
+/// `method="ca", account="ca"` — every ACF rule keying on
+/// method/account/host was then evaluating a credential tuple pvxs
+/// would never have produced.
+///
+/// Now: `Ok(None)` for the empty-method / anonymous case;
+/// `Ok(Some(creds))` only when the auth Value decoded successfully;
+/// `Err(...)` on any decode fault past the method string (so the
+/// caller can disconnect, mirroring pvxs `bev.reset()`).
+///
 /// `peer` is taken because the ACF host identity is derived from it, never
 /// from the body being parsed — see `with_server_derived`.
 fn parse_client_credentials(
@@ -3335,6 +3425,7 @@ pub(super) struct ConnInit {
 }
 
 pub(super) async fn handle_connection_io(
+    reactor: epics_base_rs::runtime::task::Reactor,
     source: DynSource,
     mut reader: SrvRead,
     mut writer_raw: SrvWrite,
@@ -3370,7 +3461,7 @@ pub(super) async fn handle_connection_io(
     let (tx, mut rx, writer_budget) = SrvTx::channel(config.write_queue_depth, tx_limit_bytes);
     let writer_peer = peer;
     let peer_entry_writer = peer_entry.clone();
-    let writer_task = epics_base_rs::runtime::task::spawn(async move {
+    let writer_task = reactor.spawn(async move {
         // Dropping this guard — loop break OR abort at the `recv` await —
         // closes the byte budget so producers parked in `TxBudget::acquire`
         // fail instead of waiting on a writer that no longer exists.
@@ -3622,7 +3713,19 @@ pub(super) async fn handle_connection_io(
         // Servicing completions here rather than inline in the
         // CREATE_CHANNEL handler lets the read loop stay unblocked
         // while has_pv() / get_introspection() run in the background.
+        //
+        // `biased`, completions ahead of the socket: a signal a task has
+        // already queued is APPLIED before the next frame is dispatched. It is
+        // the read-loop half of the ordering [`ExecFinishGuard::reply`] builds
+        // — the guard queues the transition before the reply that provokes the
+        // client's next frame, and this keeps a frame that is readable in the
+        // same poll from overtaking it. Without the pair, `begin_exec` sees an
+        // op still marked `Executing` and drops the frame with no reply at all
+        // (pvxs cannot: `doReply` transitions at `serverget.cpp:112-115` and
+        // enqueues at `:124`, on the loop that reads frames). Every completion
+        // source is finite per in-flight op, so the socket arm cannot starve.
         let frame = tokio::select! {
+            biased;
             cc_opt = cc_rx.recv() => {
                 // A spawned CREATE_CHANNEL resolver finished.
                 if let Some(cc) = cc_opt {
@@ -3812,6 +3915,7 @@ pub(super) async fn handle_connection_io(
                 match parked.kind {
                     OpKind::PutGet => {
                         handle_put_get(
+                            &reactor,
                             &frame,
                             &tx,
                             &mut channels,
@@ -3828,6 +3932,7 @@ pub(super) async fn handle_connection_io(
                     }
                     OpKind::Process => {
                         handle_process(
+                            &reactor,
                             &frame,
                             &tx,
                             &mut channels,
@@ -3843,6 +3948,7 @@ pub(super) async fn handle_connection_io(
                     }
                     kind => {
                         handle_op(
+                            &reactor,
                             &frame,
                             &tx,
                             &mut channels,
@@ -3871,7 +3977,7 @@ pub(super) async fn handle_connection_io(
                 // the downstream effect of pva2pva dropping a
                 // `ChannelCacheEntry`: `channel->destroy()` →
                 // `channelStateChange(DESTROYED)` fanout to every interested
-                // `GWChannel` (chancache.cpp:34-99, server.cpp:130-135).
+                // `GWChannel` (chancache.cpp:34-99, src/server.cpp:130-135).
                 match inv_res {
                     Some(batch) => {
                         // One removal command publishes its whole removed set
@@ -4086,6 +4192,7 @@ pub(super) async fn handle_connection_io(
                 // channel (and its report stat) there, so we do not track
                 // it here.
                 handle_create_channel(
+                    &reactor,
                     &source,
                     &frame,
                     &tx,
@@ -4114,6 +4221,7 @@ pub(super) async fn handle_connection_io(
             Some(Command::Get) => {
                 peer_entry.op_init();
                 handle_op(
+                    &reactor,
                     &frame,
                     &tx,
                     &mut channels,
@@ -4134,6 +4242,7 @@ pub(super) async fn handle_connection_io(
             Some(Command::Put) => {
                 peer_entry.op_init();
                 handle_op(
+                    &reactor,
                     &frame,
                     &tx,
                     &mut channels,
@@ -4154,6 +4263,7 @@ pub(super) async fn handle_connection_io(
             Some(Command::Monitor) => {
                 peer_entry.op_init();
                 handle_op(
+                    &reactor,
                     &frame,
                     &tx,
                     &mut channels,
@@ -4174,6 +4284,7 @@ pub(super) async fn handle_connection_io(
             Some(Command::Rpc) => {
                 peer_entry.op_init();
                 handle_op(
+                    &reactor,
                     &frame,
                     &tx,
                     &mut channels,
@@ -4198,7 +4309,7 @@ pub(super) async fn handle_connection_io(
                 // the introspection task and releases it through the same
                 // `ExecFinished` completion owner GET/PUT/RPC use, so duplicate
                 // IOIDs, DESTROY_REQUEST, and teardown are handled uniformly.
-                handle_get_field(&frame, &tx, &mut channels, order, peer, &cred, &exec_fin_tx)
+                handle_get_field(&reactor, &frame, &tx, &mut channels, order, peer, &cred, &exec_fin_tx)
                     .await?;
             }
             Some(Command::Search) => {
@@ -4229,6 +4340,7 @@ pub(super) async fn handle_connection_io(
                 // a PUT_GET-capable client gets a real round trip.
                 peer_entry.op_init();
                 handle_put_get(
+                    &reactor,
                     &frame,
                     &tx,
                     &mut channels,
@@ -4250,6 +4362,7 @@ pub(super) async fn handle_connection_io(
                 // `process_checked` (WRITE-class ACF gate).
                 peer_entry.op_init();
                 handle_process(
+                    &reactor,
                     &frame,
                     &tx,
                     &mut channels,
@@ -4275,6 +4388,7 @@ pub(super) async fn handle_connection_io(
                 // client always gets an answer.
                 peer_entry.op_init();
                 handle_channel_array(
+                    &reactor,
                     &frame,
                     &tx,
                     &mut channels,
@@ -4561,7 +4675,7 @@ fn non_monitor_op_state(intro: Arc<FieldDesc>, kind: OpKind, mask: BitSet) -> Op
 ///   are identical).
 /// - PUT-GET (`subcmd & 0x08 == 0`): decode `changed bitset + put
 ///   value`, run the WRITE-gated `put_value_checked`, then the
-///   READ-gated `get_value_checked`, and reply
+///   READ-gated `read_checked`, and reply
 ///   `ioid + subcmd + status + getBitset + getValue`.
 ///   The command-local last-request bit (`subcmd & 0x10`, `QOS_DESTROY`)
 ///   is the EPICS `lastRequest()` rider — the ChannelPutGet client sends
@@ -4575,6 +4689,7 @@ fn non_monitor_op_state(intro: Arc<FieldDesc>, kind: OpKind, mask: BitSet) -> Op
 /// properly per the wire spec so a PUT_GET-capable client works.
 #[allow(clippy::too_many_arguments)]
 async fn handle_put_get(
+    reactor: &epics_base_rs::runtime::task::Reactor,
     frame: &Frame,
     tx: &SrvTx,
     channels: &mut HashMap<u32, ChannelState>,
@@ -4667,7 +4782,7 @@ async fn handle_put_get(
     let chan_tx = ChannelTx::new(tx.clone(), ch.stat.clone());
 
     // Dispatch to the CREATE_CHANNEL-bound owner, not the registry
-    // (pvxs serverchan.cpp:70-112 / server.cpp:100-112; see `handle_op`).
+    // (pvxs serverchan.cpp:70-112 / src/server.cpp:100-112; see `handle_op`).
     let source = ch.source.clone();
     let source = &source;
 
@@ -4695,7 +4810,7 @@ async fn handle_put_get(
         let intro = match ch.introspection.clone() {
             Some(d) => d,
             None => {
-                park_op_for_intro(ch, frame, OpKind::PutGet, subcmd, sid, ioid, park);
+                park_op_for_intro(reactor, ch, frame, OpKind::PutGet, subcmd, sid, ioid, park);
                 return Ok(());
             }
         };
@@ -4896,13 +5011,10 @@ async fn handle_put_get(
         scratch: None,
     };
     let exec_fin_tx_task = exec_fin_tx.clone();
-    let abort = poll_inline_or_spawn(async move {
+    let abort = poll_inline_or_spawn(reactor, async move {
         // return this op to `Idle` (via the read-loop owner) when the
         // task ends so a later explicit re-EXEC is accepted.
-        let mut exec_fin_guard = ExecFinishGuard {
-            tx: exec_fin_tx_task,
-            fin: exec_fin,
-        };
+        let mut exec_fin_guard = ExecFinishGuard::new(exec_fin_tx_task, exec_fin);
         let mut payload = Vec::new();
         payload.put_u32(ioid, order);
         payload.put_u8(subcmd);
@@ -4912,13 +5024,13 @@ async fn handle_put_get(
 
         // putGet (0x00) is the atomic WRITE+READ round trip; getGet/getPut
         // (read-only) carry no put payload and only read back. The default
-        // `put_get_checked` composes put_delta_checked + get_value_checked
+        // `put_get_checked` composes put_delta_checked + read_checked
         // over the same backing store, but a remote-fronting source (the
         // pva-gateway) overrides it to issue ONE upstream PUT_GET so the
         // put-then-get stays atomic upstream (pva2pva
-        // `p2pApp/channel.cpp:129-137`) instead of a local put plus a
+        // `p2pApp/channel.cpp:129-138`) instead of a local put plus a
         // separately-read cached get. The read-only legs stay a plain
-        // READ-gated `get_value_checked`. A panic in either user handler
+        // READ-gated `read_checked`. A panic in either user handler
         // becomes an error reply instead of skipping the reply below.
         // The error slot holds the `Status` this reply will carry, not text:
         // a source fronting a remote (the gateway) reports its upstream's own
@@ -4953,7 +5065,7 @@ async fn handle_put_get(
                 // Source borrow released — send the scratch home with the
                 // completion signal (every later exit goes through the
                 // guard's Drop).
-                exec_fin_guard.fin.scratch = Some((intro.clone(), put_delta));
+                exec_fin_guard.set_scratch((intro.clone(), put_delta));
                 outcome
             } else {
                 let read_checked = src
@@ -5005,7 +5117,9 @@ async fn handle_put_get(
         let mut buf = Vec::new();
         h.write_into(&mut buf);
         buf.extend_from_slice(&payload);
-        let _ = tx_clone.send(buf).await;
+        // PUT_GET is one-shot: `apply_exec_finish` removes a `last_request` op
+        // on every terminal reply regardless of status, so the flag is `false`.
+        exec_fin_guard.reply(&tx_clone, buf, false).await;
     });
     // Store the abort guard and, when this PUT_GET frame carried the
     // last-request bit (`subcmd & 0x10`), defer the op's removal until its
@@ -5033,6 +5147,7 @@ async fn handle_put_get(
 ///   destruction is `CMD_DESTROY_REQUEST`, handled elsewhere.
 #[allow(clippy::too_many_arguments)]
 async fn handle_process(
+    reactor: &epics_base_rs::runtime::task::Reactor,
     frame: &Frame,
     tx: &SrvTx,
     channels: &mut HashMap<u32, ChannelState>,
@@ -5102,7 +5217,7 @@ async fn handle_process(
     let chan_tx = ChannelTx::new(tx.clone(), ch.stat.clone());
 
     // Dispatch to the CREATE_CHANNEL-bound owner, not the registry
-    // (pvxs serverchan.cpp:70-112 / server.cpp:100-112; see `handle_op`).
+    // (pvxs serverchan.cpp:70-112 / src/server.cpp:100-112; see `handle_op`).
     let source = ch.source.clone();
     let source = &source;
 
@@ -5134,7 +5249,7 @@ async fn handle_process(
         let intro = match ch.introspection.clone() {
             Some(d) => d,
             None => {
-                park_op_for_intro(ch, frame, OpKind::Process, subcmd, sid, ioid, park);
+                park_op_for_intro(reactor, ch, frame, OpKind::Process, subcmd, sid, ioid, park);
                 return Ok(());
             }
         };
@@ -5144,7 +5259,7 @@ async fn handle_process(
         // but the create-time pvRequest carries `record._options` a
         // provider can interpret (and a gateway must forward through
         // `createChannelProcess(..., pvRequest)`, pva2pva
-        // channel.cpp:98-106), so it is preserved into the op state and
+        // channel.cpp:98-107), so it is preserved into the op state and
         // surfaced as `ChannelContext.pv_request` at EXEC. A present-but-
         // malformed pvRequest is a peer wire-decode fault. The previous
         // `decode_type_desc(..).ok().and_then(|d| decode_pv_field(..)
@@ -5239,13 +5354,10 @@ async fn handle_process(
         scratch: None,
     };
     let exec_fin_tx_task = exec_fin_tx.clone();
-    let abort = poll_inline_or_spawn(async move {
+    let abort = poll_inline_or_spawn(reactor, async move {
         // return this op to `Idle` (via the read-loop owner) when the
         // task ends so a later explicit re-EXEC is accepted.
-        let _exec_fin_guard = ExecFinishGuard {
-            tx: exec_fin_tx_task,
-            fin: exec_fin,
-        };
+        let exec_fin_guard = ExecFinishGuard::new(exec_fin_tx_task, exec_fin);
         let checked = src
             .access_gate()
             .check_with_roles(
@@ -5277,7 +5389,8 @@ async fn handle_process(
         let mut buf = Vec::new();
         h.write_into(&mut buf);
         buf.extend_from_slice(&payload);
-        let _ = tx_clone.send(buf).await;
+        // PROCESS is one-shot (see the PUT_GET reply): the flag is unread.
+        exec_fin_guard.reply(&tx_clone, buf, false).await;
     });
     // Store the abort guard and, when this PROCESS frame carried the
     // last-request bit (`subcmd & 0x10`), defer the op's removal until its
@@ -5351,6 +5464,7 @@ enum ChannelArrayReply {
 /// array field to act on without the trait holding per-op state.
 #[allow(clippy::too_many_arguments)]
 async fn handle_channel_array(
+    reactor: &epics_base_rs::runtime::task::Reactor,
     frame: &Frame,
     tx: &SrvTx,
     channels: &mut HashMap<u32, ChannelState>,
@@ -5602,11 +5716,8 @@ async fn handle_channel_array(
         scratch: None,
     };
     let exec_fin_tx_task = exec_fin_tx.clone();
-    let abort = poll_inline_or_spawn(async move {
-        let _exec_fin_guard = ExecFinishGuard {
-            tx: exec_fin_tx_task,
-            fin: exec_fin,
-        };
+    let abort = poll_inline_or_spawn(reactor, async move {
+        let exec_fin_guard = ExecFinishGuard::new(exec_fin_tx_task, exec_fin);
         let checked = src
             .access_gate()
             .check_with_roles(
@@ -5679,7 +5790,8 @@ async fn handle_channel_array(
         let mut buf = Vec::new();
         h.write_into(&mut buf);
         buf.extend_from_slice(&payload);
-        let _ = tx_clone.send(buf).await;
+        // ARRAY is one-shot (see the PUT_GET reply): the flag is unread.
+        exec_fin_guard.reply(&tx_clone, buf, false).await;
     });
     finish_exec_data_task(ch, ioid, subcmd, abort);
     Ok(())
@@ -5795,6 +5907,7 @@ fn build_server_connection_validation(
 /// and emits the wire response in FIFO order.
 #[allow(clippy::too_many_arguments)]
 async fn handle_create_channel(
+    reactor: &epics_base_rs::runtime::task::Reactor,
     source: &DynSource,
     frame: &Frame,
     tx: &SrvTx,
@@ -5895,7 +6008,7 @@ async fn handle_create_channel(
         // resolution and the open callback agree.
         let open_cred = cred.clone();
         let conn_ctx = channel_lifecycle_ctx(peer, &open_cred);
-        epics_base_rs::runtime::task::spawn(async move {
+        reactor.spawn(async move {
             for (cid, sid, nm) in batch {
                 let resolved = if src.has_pv_checked(&nm, conn_ctx.clone()).await {
                     // Bind the owner that accepted this channel so every
@@ -6441,7 +6554,7 @@ async fn handle_tcp_search(
     // names the transport advertised back in the SEARCH_RESPONSE.
     let protocol: &'static str = if config.tls.is_some() { "tls" } else { "tcp" };
     // Port advertised for `protocol`: pvxs returns `tls_port` for a
-    // protoTLS reply and `tcp_port` otherwise (server.cpp:849-857), so a
+    // protoTLS reply and `tcp_port` otherwise (src/server.cpp:849-857), so a
     // TLS server steers the client to its dedicated TLS listener. The
     // runtime stamps `config.tls_port` to the bound TLS port at start().
     let advertised_port = if config.tls.is_some() {
@@ -6461,7 +6574,7 @@ async fn handle_tcp_search(
     // (serverchan.cpp:197-222), so a source can still scope advertisement
     // by the established peer endpoint via `searchable_from`.
     let matched = super::search::matched_cids_for_requester(source, &req, peer).await;
-    // pvxs `serverchan.cpp:240-249`: emit the response only when
+    // pvxs `serverchan.cpp:230-231`: emit the response only when
     // there's a match OR MustReply was set. Skip otherwise to
     // avoid leaking server presence on every probe.
     if !matched.is_empty() || req.must_reply {
@@ -6480,6 +6593,7 @@ async fn handle_tcp_search(
 
 #[allow(clippy::too_many_arguments)]
 async fn handle_op(
+    reactor: &epics_base_rs::runtime::task::Reactor,
     frame: &Frame,
     tx: &SrvTx,
     channels: &mut HashMap<u32, ChannelState>,
@@ -6575,7 +6689,7 @@ async fn handle_op(
     // Dispatch every operation to the source bound at CREATE_CHANNEL,
     // not the top-level registry. pvxs installs the accepting source's
     // callbacks into the ServerChan (serverchan.cpp:70-112) and a later
-    // removeSource never rewrites them (server.cpp:100-112), so a live
+    // removeSource never rewrites them (src/server.cpp:100-112), so a live
     // channel keeps its owner even when the registry changes underneath.
     let source = ch.source.clone();
     let source = &source;
@@ -6630,7 +6744,7 @@ async fn handle_op(
             (OpKind::Rpc, None) => Arc::new(FieldDesc::Variant),
             (_, Some(d)) => d,
             (_, None) => {
-                park_op_for_intro(ch, frame, kind, subcmd, sid, ioid, park);
+                park_op_for_intro(reactor, ch, frame, kind, subcmd, sid, ioid, park);
                 return Ok(());
             }
         };
@@ -6880,7 +6994,7 @@ async fn handle_op(
                     // A `record._options._filter` that is syntactically
                     // present but unparseable rejects the MONITOR INIT,
                     // mirroring EPICS `dbChannelCreate()`
-                    // (`dbChannel.c:512-529`) and pvxs filter setup.
+                    // (`dbChannel.c:513-529`) and pvxs filter setup.
                     // Fail-open to an unfiltered stream would silently
                     // drop the requested throttling/slicing semantics.
                     match epics_base_rs::server::database::filters::try_parse_filter_chain(&j) {
@@ -7100,7 +7214,7 @@ async fn handle_op(
                 }
             });
             if let Some(args) = args {
-                let (join, start_ctl) = spawn_monitor_subscriber(args);
+                let (join, start_ctl) = spawn_monitor_subscriber(reactor, args);
                 if let Some(s) = ch.ops.get_mut(&ioid) {
                     s.monitor_started = true;
                     s.monitor_abort = Some(Arc::new(AbortOnDrop(join.abort_handle())));
@@ -7227,13 +7341,10 @@ async fn handle_op(
                 scratch: None,
             };
             let exec_fin_tx_task = exec_fin_tx.clone();
-            let abort = poll_inline_or_spawn(async move {
+            let abort = poll_inline_or_spawn(reactor, async move {
                 // returns this op to `Idle` (via the read-loop owner)
                 // when the task ends, so a later explicit re-EXEC is accepted.
-                let mut exec_fin_guard = ExecFinishGuard {
-                    tx: exec_fin_tx_task,
-                    fin: exec_fin,
-                };
+                let exec_fin_guard = ExecFinishGuard::new(exec_fin_tx_task, exec_fin);
                 let ctx = crate::server_native::source::ChannelContext {
                     peer,
                     creds: cred_t,
@@ -7259,43 +7370,46 @@ async fn handle_op(
                 let read = match got {
                     Ok(Some(v)) => v,
                     Ok(None) => {
-                        let _ = send_chan_op_error(
-                            &tx_clone,
-                            OpKind::Get,
-                            ioid,
-                            subcmd,
-                            Status::error("PV not found"),
-                            order,
-                        )
-                        .await;
+                        exec_fin_guard
+                            .reply_error(
+                                &tx_clone,
+                                OpKind::Get,
+                                ioid,
+                                subcmd,
+                                Status::error("PV not found"),
+                                order,
+                            )
+                            .await;
                         return;
                     }
                     Err(msg) => {
-                        let _ = send_chan_op_error(
-                            &tx_clone,
-                            OpKind::Get,
-                            ioid,
-                            subcmd,
-                            Status::error(msg.to_string()),
-                            order,
-                        )
-                        .await;
+                        exec_fin_guard
+                            .reply_error(
+                                &tx_clone,
+                                OpKind::Get,
+                                ioid,
+                                subcmd,
+                                Status::error(msg.to_string()),
+                                order,
+                            )
+                            .await;
                         return;
                     }
                 };
                 // source-side mismatch gate.
                 if let Err(e) = crate::pvdata::value_matches_descriptor(&read.value, &intro_t) {
-                    let _ = send_chan_op_error(
-                        &tx_clone,
-                        OpKind::Get,
-                        ioid,
-                        subcmd,
-                        Status::error(format!(
-                            "source value does not match opened descriptor: {e}"
-                        )),
-                        order,
-                    )
-                    .await;
+                    exec_fin_guard
+                        .reply_error(
+                            &tx_clone,
+                            OpKind::Get,
+                            ioid,
+                            subcmd,
+                            Status::error(format!(
+                                "source value does not match opened descriptor: {e}"
+                            )),
+                            order,
+                        )
+                        .await;
                     return;
                 }
                 let mut payload = Vec::new();
@@ -7323,8 +7437,7 @@ async fn handle_op(
                 // Successful GET data reply: a last_request op is cleaned up by
                 // the completion owner (pvxs serverget.cpp:112-114). Every
                 // error path above returned before reaching here.
-                exec_fin_guard.mark_success();
-                let _ = tx_clone.send(buf).await;
+                exec_fin_guard.reply(&tx_clone, buf, true).await;
             });
             finish_exec_data_task(ch, ioid, subcmd, abort);
         }
@@ -7342,7 +7455,7 @@ async fn handle_op(
             // landed.
             if subcmd & 0x40 != 0 {
                 // spawn GET-for-PUT-readback — blocks on
-                // source.get_value_checked which can be slow.
+                // source.read_checked which can be slow.
                 let pv_name = ch.name.clone();
                 let src = source.clone();
                 let tx_clone = chan_tx.clone();
@@ -7370,11 +7483,8 @@ async fn handle_op(
                     scratch: None,
                 };
                 let exec_fin_tx_task = exec_fin_tx.clone();
-                let abort = poll_inline_or_spawn(async move {
-                    let mut exec_fin_guard = ExecFinishGuard {
-                        tx: exec_fin_tx_task,
-                        fin: exec_fin,
-                    };
+                let abort = poll_inline_or_spawn(reactor, async move {
+                    let exec_fin_guard = ExecFinishGuard::new(exec_fin_tx_task, exec_fin);
                     let ctx = crate::server_native::source::ChannelContext {
                         peer,
                         creds: cred_t,
@@ -7401,27 +7511,29 @@ async fn handle_op(
                     let read = match got {
                         Ok(Some(v)) => v,
                         Ok(None) => {
-                            let _ = send_chan_op_error(
-                                &tx_clone,
-                                OpKind::Put,
-                                ioid,
-                                subcmd,
-                                Status::error("PV not found"),
-                                order,
-                            )
-                            .await;
+                            exec_fin_guard
+                                .reply_error(
+                                    &tx_clone,
+                                    OpKind::Put,
+                                    ioid,
+                                    subcmd,
+                                    Status::error("PV not found"),
+                                    order,
+                                )
+                                .await;
                             return;
                         }
                         Err(msg) => {
-                            let _ = send_chan_op_error(
-                                &tx_clone,
-                                OpKind::Put,
-                                ioid,
-                                subcmd,
-                                Status::error(msg.to_string()),
-                                order,
-                            )
-                            .await;
+                            exec_fin_guard
+                                .reply_error(
+                                    &tx_clone,
+                                    OpKind::Put,
+                                    ioid,
+                                    subcmd,
+                                    Status::error(msg.to_string()),
+                                    order,
+                                )
+                                .await;
                             return;
                         }
                     };
@@ -7451,8 +7563,7 @@ async fn handle_op(
                     // Successful PUT/Get readback reply (subcmd & 0x40): a
                     // last_request op is cleaned up by the completion owner;
                     // every error path above returned before reaching here.
-                    exec_fin_guard.mark_success();
-                    let _ = tx_clone.send(buf).await;
+                    exec_fin_guard.reply(&tx_clone, buf, true).await;
                 });
                 finish_exec_data_task(ch, ioid, subcmd, abort);
                 return Ok(());
@@ -7521,11 +7632,8 @@ async fn handle_op(
                 scratch: None,
             };
             let exec_fin_tx_task = exec_fin_tx.clone();
-            let abort = poll_inline_or_spawn(async move {
-                let mut exec_fin_guard = ExecFinishGuard {
-                    tx: exec_fin_tx_task,
-                    fin: exec_fin,
-                };
+            let abort = poll_inline_or_spawn(reactor, async move {
+                let mut exec_fin_guard = ExecFinishGuard::new(exec_fin_tx_task, exec_fin);
                 let ctx = crate::server_native::source::ChannelContext {
                     peer,
                     creds: cred_t,
@@ -7565,7 +7673,7 @@ async fn handle_op(
                 // Source borrow released — send the scratch home with the
                 // completion signal (every later exit path goes through
                 // the guard's Drop).
-                exec_fin_guard.fin.scratch = Some((intro_t.clone(), delta));
+                exec_fin_guard.set_scratch((intro_t.clone(), delta));
                 flush_remote_log(&op_log, ioid, order, &tx_clone).await;
                 let mut payload = Vec::new();
                 payload.put_u32(ioid, order);
@@ -7576,53 +7684,13 @@ async fn handle_op(
                 // last_request PUT/PUT_GET is cleaned up by the completion
                 // owner; an error reply keeps the op Idle with the sticky
                 // marker for a later EXEC.
+                // This is the EXEC-only leg: the 0x40 readback returned at
+                // the top of the arm, so a PUT reply here is a bare status
+                // word and the readback has exactly one framing owner.
                 let replied_ok = match result {
                     Ok(()) => {
-                        if subcmd & 0x40 != 0 {
-                            // PUT_GET readback: build readback
-                            // before emitting status so we know whether
-                            // READ was denied and can emit an empty
-                            // bitset instead of truncating the wire.
-                            let read_checked = src
-                                .access_gate()
-                                .check_with_roles(
-                                    &pv_name,
-                                    &ctx.creds.host,
-                                    &ctx.creds.account,
-                                    &ctx.creds.roles,
-                                    &ctx.creds.method,
-                                    &ctx.creds.authority,
-                                )
-                                .await;
-                            // a panic in the user GET (PUT_GET
-                            // readback) handler becomes an error reply instead
-                            // of skipping the reply below.
-                            let readback =
-                                catch_handler_panic(src.get_value_checked(read_checked, ctx)).await;
-                            flush_remote_log(&op_log, ioid, order, &tx_clone).await;
-                            match readback {
-                                Ok(Some(v)) => {
-                                    Status::ok().write_into(order, &mut payload);
-                                    let bits = BitSet::all_set(intro_t.total_bits());
-                                    bits.write_into(order, &mut payload);
-                                    encode_pv_field(&v, &intro_t, order, &mut payload);
-                                    true
-                                }
-                                Ok(None) => {
-                                    Status::ok().write_into(order, &mut payload);
-                                    let empty = BitSet::with_capacity(intro_t.total_bits());
-                                    empty.write_into(order, &mut payload);
-                                    true
-                                }
-                                Err(msg) => {
-                                    Status::error(msg).write_into(order, &mut payload);
-                                    false
-                                }
-                            }
-                        } else {
-                            Status::ok().write_into(order, &mut payload);
-                            true
-                        }
+                        Status::ok().write_into(order, &mut payload);
+                        true
                     }
                     Err(e) => {
                         e.wire_status().write_into(order, &mut payload);
@@ -7634,10 +7702,7 @@ async fn handle_op(
                 let mut buf = Vec::new();
                 h.write_into(&mut buf);
                 buf.extend_from_slice(&payload);
-                if replied_ok {
-                    exec_fin_guard.mark_success();
-                }
-                let _ = tx_clone.send(buf).await;
+                exec_fin_guard.reply(&tx_clone, buf, replied_ok).await;
             });
             finish_exec_data_task(ch, ioid, subcmd, abort);
         }
@@ -7881,11 +7946,8 @@ async fn handle_op(
                 scratch: None,
             };
             let exec_fin_tx_task = exec_fin_tx.clone();
-            let abort = poll_inline_or_spawn(async move {
-                let mut exec_fin_guard = ExecFinishGuard {
-                    tx: exec_fin_tx_task,
-                    fin: exec_fin,
-                };
+            let abort = poll_inline_or_spawn(reactor, async move {
+                let exec_fin_guard = ExecFinishGuard::new(exec_fin_tx_task, exec_fin);
                 let rpc_checked = src
                     .access_gate()
                     .check_with_roles(
@@ -7952,10 +8014,7 @@ async fn handle_op(
                 let mut buf = Vec::new();
                 h.write_into(&mut buf);
                 buf.extend_from_slice(&payload);
-                if replied_ok {
-                    exec_fin_guard.mark_success();
-                }
-                let _ = tx_clone.send(buf).await;
+                exec_fin_guard.reply(&tx_clone, buf, replied_ok).await;
             });
             finish_exec_data_task(ch, ioid, subcmd, abort);
         }
@@ -7973,7 +8032,9 @@ async fn handle_op(
 
 /// Returns `Some(AbortOnDrop)` when a slow-path task was spawned so the
 /// caller can store it for connection-lifetime abort on teardown.
+#[allow(clippy::too_many_arguments)] // the `reactor` capability is the 8th
 async fn handle_get_field(
+    reactor: &epics_base_rs::runtime::task::Reactor,
     frame: &Frame,
     tx: &SrvTx,
     channels: &mut HashMap<u32, ChannelState>,
@@ -8061,7 +8122,7 @@ async fn handle_get_field(
 
     // Slow path: introspection not yet cached; fetch from the
     // CREATE_CHANNEL-bound owner without blocking the read loop — not the
-    // top-level registry (pvxs serverchan.cpp:70-112 / server.cpp:100-112;
+    // top-level registry (pvxs serverchan.cpp:70-112 / src/server.cpp:100-112;
     // see `handle_op`).
     let pv_name = chan.name.clone();
     let src = chan.source.clone();
@@ -8106,13 +8167,10 @@ async fn handle_get_field(
         scratch: None,
     };
     let exec_fin_tx_task = exec_fin_tx.clone();
-    let abort = poll_inline_or_spawn(async move {
+    let abort = poll_inline_or_spawn(reactor, async move {
         // terminal finalizer — releases the reserved IOID on EVERY exit
         // (reply sent, panic, or abort), like the GET/PUT/RPC exec tasks.
-        let _exec_fin_guard = ExecFinishGuard {
-            tx: exec_fin_tx_task,
-            fin: exec_fin,
-        };
+        let exec_fin_guard = ExecFinishGuard::new(exec_fin_tx_task, exec_fin);
         // GET_FIELD parks like every other op: pvxs routes it through the
         // channel's own `onOp` (`serverintrospect.cpp:174-176`), so a
         // closed `SharedPV` puts this introspect in `pending` too and
@@ -8146,7 +8204,8 @@ async fn handle_get_field(
         let mut buf = Vec::new();
         h.write_into(&mut buf);
         buf.extend_from_slice(&payload);
-        let _ = tx_clone.send(buf).await;
+        // GET_FIELD is one-shot (see the PUT_GET reply): the flag is unread.
+        exec_fin_guard.reply(&tx_clone, buf, false).await;
     });
     // Install the abort guard on the reserved op so DESTROY_REQUEST /
     // teardown (which drop the op) cancel this task. `subcmd` is irrelevant
@@ -8283,11 +8342,11 @@ const _: u8 = PVA_VERSION;
 ///
 /// * `marked = Some(paths)` — the source declared what it assigned. Used by
 ///   the QSRV sources: a group monitor marks its `+trigger` targets
-///   (`groupsource.cpp:288`, assigned-not-changed, so an unchanged leaf still
-///   carries), and a read marks what `IOCSource::initialize` + `IOCSource::get`
-///   actually wrote (`getProperties` never assigns `control.minStep`,
-///   `valueAlarm.active`, the four `valueAlarm.*Severity` leaves or
-///   `valueAlarm.hysteresis`).
+///   (`groupsource.cpp:344-345`, assigned-not-changed, so an unchanged
+///   leaf still carries), and a read marks what `IOCSource::initialize` +
+///   `IOCSource::get` actually wrote (`getProperties` never assigns
+///   `control.minStep`, `valueAlarm.active`, the four
+///   `valueAlarm.*Severity` leaves or `valueAlarm.hysteresis`).
 /// * `marked = None` — a wholly-assigned value (pvxs's fully-marked `Value`):
 ///   every leaf the request selected.
 ///
@@ -8418,6 +8477,63 @@ fn coalesce_monitor_update(
         marked,
         type_changed: false,
         overrun,
+    }
+}
+
+/// [`coalesce_monitor_update`]'s raw-forward twin: pvxs
+/// `queue.back().assign(val)` on a pre-encoded body.
+///
+/// The raw FIFO used to squash with `|_old, new| new`, which is not
+/// `assign` — it DISCARDS every leaf the older frame changed and the newer
+/// one did not. An upstream source posts deltas, so that leaf's transition
+/// is gone for good: the downstream client's cached `Value` never sees it
+/// and no later frame repeats it. It also let a later post overwrite a
+/// `type_changed` boundary sitting in the tail, after which the forwarder
+/// keeps shipping bodies under a descriptor the upstream has already
+/// abandoned.
+///
+/// Both are closed here by the same rule the decoded path uses: a boundary
+/// on either side wins outright, otherwise the two bodies are merged
+/// ([`crate::pvdata::monitor_squash::squash_monitor_bodies`]).
+fn coalesce_raw_monitor_event(
+    intro: &FieldDesc,
+    older: crate::server_native::RawMonitorEvent,
+    newer: crate::server_native::RawMonitorEvent,
+) -> crate::server_native::RawMonitorEvent {
+    if older.type_changed || newer.type_changed {
+        return crate::server_native::RawMonitorEvent {
+            body_bytes: bytes::Bytes::new(),
+            byte_order: newer.byte_order,
+            type_changed: true,
+        };
+    }
+    match crate::pvdata::monitor_squash::squash_monitor_bodies(
+        intro,
+        crate::pvdata::monitor_squash::MonitorBody {
+            bytes: &older.body_bytes,
+            order: older.byte_order,
+        },
+        crate::pvdata::monitor_squash::MonitorBody {
+            bytes: &newer.body_bytes,
+            order: newer.byte_order,
+        },
+        newer.byte_order,
+    ) {
+        Ok(body) => crate::server_native::RawMonitorEvent {
+            body_bytes: bytes::Bytes::from(body),
+            byte_order: newer.byte_order,
+            type_changed: false,
+        },
+        Err(reason) => {
+            // A malformed upstream body cannot be merged. Keep the newest
+            // verbatim so the existing malformed-raw policy still applies to
+            // it downstream ([`raw_monitor_frame`]: forwarded same-endian so
+            // the client faults it, terminated cross-endian); fabricating a
+            // well-formed frame out of a corrupt one here would hide the
+            // upstream fault.
+            debug!(%reason, "raw monitor squash fell back to last-wins");
+            newer
+        }
     }
 }
 
@@ -8608,9 +8724,9 @@ fn now_nanos() -> u64 {
 /// budget, so the existing frame-count-oriented tests keep their exact
 /// semantics; the byte bound has its own dedicated tests. Defined at
 /// module level so every `#[cfg(test)]` sub-module reaches it via
-/// `super::*` — and *below* all production code, because the peer_buf
-/// source guard treats everything before the file's first column-0
-/// `#[cfg(test)]` as the production text it scans.
+/// `super::*`. Its position no longer matters: the source guards read a
+/// `cfg(test)` item wherever it sits, so this file's layout is not
+/// constrained by them any more.
 #[cfg(test)]
 fn test_srv_tx(depth: usize) -> (SrvTx, tokio::sync::mpsc::Receiver<Vec<u8>>) {
     let (tx, rx, _budget) = SrvTx::channel(depth, TxBudget::MAX_CHARGE);
@@ -8645,6 +8761,7 @@ mod tests {
     use crate::decode::{OpResponse, decode_op_response, try_parse_frame};
     use crate::pvdata::{PvStructure, ScalarType, ScalarValue};
     use crate::server_native::MonitorStream;
+    use source_guard::{Comments, production};
 
     /// Every task this file spawns for a *connection* — the writer, the MONITOR
     /// subscriber, the CREATE_CHANNEL resolver, and the seven data-phase
@@ -8669,13 +8786,9 @@ mod tests {
     #[test]
     fn connection_scope_spawns_go_through_the_runtime_seam() {
         let src = include_str!("tcp.rs");
-        // Production scope ends at the first column-0 `#[cfg(test)]`.
-        let prod = match src.find("\n#[cfg(test)]") {
-            Some(i) => &src[..i],
-            None => src,
-        };
-        // Fail closed: an earlier `#[cfg(test)]` helper must not shrink the
-        // slice past the connection handler and make this pass vacuously.
+        let prod = production(src, Comments::Keep);
+        // Fail closed anyway: the anchor proves the slice still covers the
+        // connection handler, whatever the rule does.
         assert!(
             prod.contains("async fn handle_connection_io"),
             "production slice no longer covers the connection handler"
@@ -8708,23 +8821,12 @@ mod tests {
     #[test]
     fn the_acf_host_is_written_only_by_the_peer_funnel() {
         let src = include_str!("tcp.rs");
-        let prod = match src.find("\n#[cfg(test)]") {
-            Some(i) => &src[..i],
-            None => src,
-        };
+        let prod = production(src, Comments::Strip);
         assert!(
             prod.contains("fn parse_client_credentials"),
             "production slice no longer covers the credentials parser"
         );
-        let code = |s: &str| -> String {
-            s.lines()
-                .filter(|l| !l.trim_start().starts_with("//"))
-                .collect::<Vec<_>>()
-                .join("\n")
-        };
-
-        let prod_code = code(prod);
-        let writes: Vec<&str> = prod_code
+        let writes: Vec<&str> = prod
             .lines()
             .filter(|l| l.contains(".host =") || l.contains(".host="))
             .collect();
@@ -8737,11 +8839,14 @@ mod tests {
         let start = prod
             .find("fn parse_client_credentials")
             .expect("checked above");
+        // Delimited by the item that follows, not by the doc comment above it:
+        // the slice this reads has its comments stripped, so a prose anchor
+        // would resolve to nothing.
         let end = prod[start..]
-            .find("\n/// Type-erased read/write halves")
-            .expect("parser is followed by the SrvRead/SrvWrite aliases")
+            .find("type SrvRead = Box<")
+            .expect("the parser is followed by the SrvRead/SrvWrite aliases")
             + start;
-        let parser = code(&prod[start..end]);
+        let parser = &prod[start..end];
         assert!(
             !parser.contains("\"host\""),
             "the CONNECTION_VALIDATION parser must have no `host` decode arm"
@@ -9765,9 +9870,9 @@ mod tests {
         assert!(pending[1].type_changed, "the terminal trails it");
 
         // Same rule on the RAW-forward FIFO: `RawMonitorEvent` carries the
-        // same `type_changed` boundary and coalesces with `|_old, new| new`,
-        // so pre-fix a terminal on a full raw queue replaced the newest raw
-        // frame outright.
+        // same `type_changed` boundary, so a terminal on a full raw queue
+        // must not replace the newest raw frame. A last-wins closure stands
+        // in for the coalesce here — this case never reaches it.
         let raw = |body: &[u8], terminal: bool| crate::server_native::RawMonitorEvent {
             body_bytes: bytes::Bytes::copy_from_slice(body),
             byte_order: ByteOrder::Little,
@@ -9787,6 +9892,86 @@ mod tests {
             "the newest raw frame is not destroyed by the terminal"
         );
         assert!(raw_pending[1].type_changed, "the raw terminal trails it");
+    }
+
+    /// PVA-3's live residual: the RAW-forward FIFO squashed with
+    /// `|_old, new| new`, which is not pvxs `queue.back().assign(val)`.
+    /// It discarded every leaf the older frame changed and the newer one
+    /// did not — a delta the upstream will never repeat — and it let a
+    /// later post overwrite a `type_changed` boundary sitting in the tail.
+    #[test]
+    fn coalesce_raw_monitor_event_merges_leaves_and_keeps_the_boundary() {
+        use crate::pvdata::encode::{
+            changed_bitset_paths, decode_pv_field_with_bitset, encode_pv_field_with_bitset,
+            marked_changed_bitset,
+        };
+        let order = ByteOrder::Little;
+        let intro = three_field_intro();
+        let ev = |marked: &[&str], v: (i32, i32, i32), terminal: bool| {
+            let paths: Vec<String> = marked.iter().map(|s| (*s).to_string()).collect();
+            let changed = marked_changed_bitset(&intro, &paths);
+            let mut body = Vec::new();
+            changed.write_into(order, &mut body);
+            encode_pv_field_with_bitset(
+                &three_field_value(v.0, v.1, v.2),
+                &intro,
+                &changed,
+                0,
+                order,
+                &mut body,
+            );
+            BitSet::new().write_into(order, &mut body);
+            crate::server_native::RawMonitorEvent {
+                body_bytes: bytes::Bytes::from(body),
+                byte_order: order,
+                type_changed: terminal,
+            }
+        };
+
+        // Merge: `a` is marked only by the older post and must survive.
+        let merged = coalesce_raw_monitor_event(
+            &intro,
+            ev(&["a"], (1, 0, 0), false),
+            ev(&["b"], (0, 2, 0), false),
+        );
+        assert!(!merged.type_changed);
+        let mut cur = std::io::Cursor::new(&merged.body_bytes[..]);
+        let changed = BitSet::decode(&mut cur, order).expect("changed");
+        let v = decode_pv_field_with_bitset(&intro, &changed, 0, &mut cur, order).expect("value");
+        assert_eq!(
+            changed_bitset_paths(&intro, &changed),
+            vec!["a".to_string(), "b".to_string()],
+            "a last-wins squash drops `a` here"
+        );
+        assert_eq!(v, three_field_value(1, 2, 0));
+
+        // Boundary: a descriptor change on EITHER side wins outright, so a
+        // later post cannot overwrite a terminal held in the tail.
+        assert!(
+            coalesce_raw_monitor_event(
+                &intro,
+                ev(&[], (0, 0, 0), true),
+                ev(&["a"], (5, 0, 0), false)
+            )
+            .type_changed,
+            "a post squashed onto a terminal must not erase the boundary"
+        );
+        assert!(
+            coalesce_raw_monitor_event(
+                &intro,
+                ev(&["a"], (5, 0, 0), false),
+                ev(&[], (0, 0, 0), true)
+            )
+            .type_changed
+        );
+
+        // A malformed upstream body cannot be merged: keep the newest
+        // verbatim so the existing malformed-raw policy still applies.
+        let mut bad = ev(&["a"], (1, 0, 0), false);
+        bad.body_bytes = bytes::Bytes::from_static(b"\xff");
+        let newest = ev(&["b"], (0, 2, 0), false);
+        let fallback = coalesce_raw_monitor_event(&intro, bad, newest.clone());
+        assert_eq!(fallback.body_bytes, newest.body_bytes);
     }
 
     /// server pipeline parser accepts the typed-bool /
@@ -10009,6 +10194,7 @@ mod tests {
         );
     }
 
+    #[cfg(tokio_backend)]
     /// Build a pvRequest carrying exactly the named `record._options`.
     fn make_options_request(pairs: &[(&str, PvField)]) -> PvField {
         let options = PvField::Structure(PvStructure {
@@ -10028,6 +10214,7 @@ mod tests {
         })
     }
 
+    #[cfg(tokio_backend)]
     /// R11-31 — the per-op queue limit is ONE value: pvxs seeds
     /// `uint32_t qSize = op->limit` from the `MonitorOp::limit = 4u`
     /// initializer (servermon.cpp:66) and overwrites it only for a valid
@@ -10378,6 +10565,7 @@ mod tests {
         }
     }
 
+    #[cfg(tokio_backend)]
     /// Regression (PVA parity): a peer wire-decode fault of the INIT
     /// pvRequest on the shared GET/PUT/RPC/MONITOR handler is
     /// connection-fatal, matching pvxs `from_wire_type_value` +
@@ -10440,6 +10628,7 @@ mod tests {
             };
             let frame = synth_frame(cmd, order, payload);
             handle_op(
+                &crate::test_reactor(),
                 &frame,
                 &tx,
                 &mut channels,
@@ -10481,6 +10670,7 @@ mod tests {
         );
     }
 
+    #[cfg(tokio_backend)]
     /// Regression: a GET/MONITOR INIT carrying a non-null descriptor that
     /// needs value bytes (scalar Int) but ENDS before them — a
     /// descriptor-only frame — is the same `from_wire_type_value` ->
@@ -10542,6 +10732,7 @@ mod tests {
             };
             let frame = synth_frame(cmd, order, payload);
             let result = handle_op(
+                &crate::test_reactor(),
                 &frame,
                 &tx,
                 &mut channels,
@@ -10585,6 +10776,7 @@ mod tests {
         );
     }
 
+    #[cfg(tokio_backend)]
     /// Control: the default content-less selector (an empty `structure {}`
     /// pvRequest = select all fields) consumes zero value bytes and
     /// `from_wire_full` stays good, so a descriptor-only frame whose
@@ -10642,6 +10834,7 @@ mod tests {
         crate::pvdata::encode::encode_type_desc(&req_desc, order, &mut payload);
         let frame = synth_frame(Command::Get, order, payload);
         let result = handle_op(
+            &crate::test_reactor(),
             &frame,
             &tx,
             &mut channels,
@@ -10676,6 +10869,7 @@ mod tests {
         );
     }
 
+    #[cfg(tokio_backend)]
     /// A NULL (`0xFF`) pvRequest type descriptor at INIT is legal and means
     /// "no pvRequest": pvxs `from_wire(buf, descs, cache)` returns on
     /// `TypeCode::Null` with the buffer still GOOD (`dataencode.cpp:79-80`),
@@ -10746,6 +10940,7 @@ mod tests {
             };
             let frame = synth_frame(cmd, order, payload);
             let fatal = handle_op(
+                &crate::test_reactor(),
                 &frame,
                 &tx,
                 &mut channels,
@@ -11252,10 +11447,11 @@ mod tests {
     /// storage into a string (`data.cpp:466-499`). Nothing catches it before
     /// `conn.cpp:277-282`, which does `bev.reset()` — the circuit is dropped.
     ///
-    /// The `:570-573` "Unable to parse …" Crit is dead code (it needs BOTH
-    /// conversions to fail, and anything that fails the string one has already
-    /// thrown at `:556`). The port used to emit exactly that Crit and serve the
-    /// monitor on with `ackAt = 1`, which is the divergence: pvxs never replies.
+    /// The `servermon.cpp:570-573` "Unable to parse …" Crit is dead code (it
+    /// needs BOTH conversions to fail, and anything that fails the string one
+    /// has already thrown at `servermon.cpp:556`). The port used to emit
+    /// exactly that Crit and serve the monitor on with `ackAt = 1`, which is
+    /// the divergence: pvxs never replies.
     #[test]
     fn pva_r9_33_non_scalar_ack_any_throws_instead_of_serving() {
         let non_scalar = [
@@ -11359,6 +11555,7 @@ mod tests {
         );
     }
 
+    #[cfg(tokio_backend)]
     /// Emission half of the remote-monitor-log path: a
     /// MONITOR INIT carrying a PRESENT-but-invalid option must put a
     /// pvxs-shaped CMD_MESSAGE (IOID-tagged) on the wire BEFORE the INIT
@@ -11420,6 +11617,7 @@ mod tests {
         crate::pvdata::encode::encode_pv_field(&req_val, &req_desc, order, &mut init_payload);
         let init_frame = synth_frame(Command::Monitor, order, init_payload);
         handle_op(
+            &crate::test_reactor(),
             &init_frame,
             &tx,
             &mut channels,
@@ -11473,6 +11671,7 @@ mod tests {
         );
     }
 
+    #[cfg(tokio_backend)]
     /// R9-33, on the wire. A pipelined MONITOR INIT whose `ackAny` no `copyOut`
     /// arm converts must DROP THE CIRCUIT: pvxs's `ackAny.as<std::string>()`
     /// (`servermon.cpp:556`) throws `NoConvert`, nothing catches it inside
@@ -11542,6 +11741,7 @@ mod tests {
         init_payload.put_u32(4, order);
         let init_frame = synth_frame(Command::Monitor, order, init_payload);
         let got = handle_op(
+            &crate::test_reactor(),
             &init_frame,
             &tx,
             &mut channels,
@@ -11576,6 +11776,7 @@ mod tests {
         );
     }
 
+    #[cfg(tokio_backend)]
     /// pvxs `servermon.cpp:133-135` parity: the MONITOR INIT reply
     /// subcommand is derived from operation STATE (`subcmd = 0x08` for the
     /// Creating→Idle frame), NOT echoed from the request. A client that set
@@ -11641,6 +11842,7 @@ mod tests {
         init_payload.put_u32(4, order); // initial nack (window credit)
         let init_frame = synth_frame(Command::Monitor, order, init_payload);
         handle_op(
+            &crate::test_reactor(),
             &init_frame,
             &tx,
             &mut channels,
@@ -11840,6 +12042,7 @@ mod tests {
         );
     }
 
+    #[cfg(tokio_backend)]
     /// Bypass path (the formerly-uncounted send site): the pipeline
     /// initial snapshot must consume a window credit, exactly like every
     /// subsequent DATA frame (pvxs `servermon.cpp:192`). With
@@ -11909,6 +12112,7 @@ mod tests {
         init_payload.put_u32(2, order);
         let init_frame = synth_frame(Command::Monitor, order, init_payload);
         handle_op(
+            &crate::test_reactor(),
             &init_frame,
             &tx,
             &mut channels,
@@ -11940,6 +12144,7 @@ mod tests {
         start_payload.put_u8(0x44);
         let start_frame = synth_frame(Command::Monitor, order, start_payload);
         handle_op(
+            &crate::test_reactor(),
             &start_frame,
             &tx,
             &mut channels,
@@ -12083,6 +12288,7 @@ mod tests {
         mon_fin: &mpsc::UnboundedSender<MonitorFinished>,
     ) -> PvaResult<()> {
         handle_op(
+            &crate::test_reactor(),
             frame,
             tx,
             channels,
@@ -13282,6 +13488,7 @@ mod tests {
         );
     }
 
+    #[cfg(tokio_backend)]
     /// A pipelined MONITOR INIT that omits the 0x80 initial-nack
     /// rider must seed the credit window to 0, NOT to the negotiated
     /// `queueSize`. pvxs initialises `nack = 0` and assigns
@@ -13350,6 +13557,7 @@ mod tests {
         crate::pvdata::encode::encode_pv_field(&req_val, &req_desc, order, &mut init_payload);
         let init_frame = synth_frame(Command::Monitor, order, init_payload);
         handle_op(
+            &crate::test_reactor(),
             &init_frame,
             &tx,
             &mut channels,
@@ -13380,6 +13588,7 @@ mod tests {
         start_payload.put_u8(0x44);
         let start_frame = synth_frame(Command::Monitor, order, start_payload);
         handle_op(
+            &crate::test_reactor(),
             &start_frame,
             &tx,
             &mut channels,
@@ -13423,6 +13632,7 @@ mod tests {
         );
     }
 
+    #[cfg(tokio_backend)]
     /// A NON-pipeline monitor that requests `record[queueSize=2]` must
     /// have that depth honoured as its server-side squash threshold, not
     /// silently discarded in favour of `PvaServerConfig::monitor_queue_depth`
@@ -13491,6 +13701,7 @@ mod tests {
         crate::pvdata::encode::encode_pv_field(&req_val, &req_desc, order, &mut init_payload);
         let init_frame = synth_frame(Command::Monitor, order, init_payload);
         handle_op(
+            &crate::test_reactor(),
             &init_frame,
             &tx,
             &mut channels,
@@ -13533,6 +13744,7 @@ mod tests {
         );
     }
 
+    #[cfg(tokio_backend)]
     /// Regression (PVA parity): only a real START frame (`0x44`) may
     /// move a MONITOR from Idle to Executing. pvxs gates START/STOP on
     /// `subcmd & 0x04` with `start = subcmd & 0x40` (`servermon.cpp:671-683`)
@@ -13596,6 +13808,7 @@ mod tests {
         crate::pvdata::encode::encode_pv_field(&req_val, &req_desc, order, &mut init_payload);
         let init_frame = synth_frame(Command::Monitor, order, init_payload);
         handle_op(
+            &crate::test_reactor(),
             &init_frame,
             &tx,
             &mut channels,
@@ -13651,6 +13864,7 @@ mod tests {
 
         // Plain 0x00: no stream-control bit → monitor stays idle.
         handle_op(
+            &crate::test_reactor(),
             &control_frame(0x00, None),
             &tx,
             &mut channels,
@@ -13679,6 +13893,7 @@ mod tests {
 
         // ACK-only 0x80 (+count): refills the window, never starts.
         handle_op(
+            &crate::test_reactor(),
             &control_frame(0x80, Some(4)),
             &tx,
             &mut channels,
@@ -13707,6 +13922,7 @@ mod tests {
 
         // Real START 0x44 (0x04 START/STOP | 0x40 start) → Executing.
         handle_op(
+            &crate::test_reactor(),
             &control_frame(0x44, None),
             &tx,
             &mut channels,
@@ -13734,6 +13950,7 @@ mod tests {
         );
     }
 
+    #[cfg(tokio_backend)]
     /// Build a `channels` map with a single live (started) MONITOR op
     /// whose pipeline window starts at 0, for the ACK-payload tests.
     fn ack_test_channels(
@@ -13790,6 +14007,7 @@ mod tests {
         channels
     }
 
+    #[cfg(tokio_backend)]
     /// pvxs `servermon.cpp:599-608`: a data-phase MONITOR ACK
     /// (`subcmd & 0x80`) whose u32 ack-count payload is missing/truncated
     /// is `!M.good()` → `bev.reset()` (connection-fatal). The previous
@@ -13818,6 +14036,7 @@ mod tests {
         payload.put_u8(0x80);
         let frame = synth_frame(Command::Monitor, order, payload);
         let err = handle_op(
+            &crate::test_reactor(),
             &frame,
             &tx,
             &mut channels,
@@ -13850,6 +14069,7 @@ mod tests {
         );
     }
 
+    #[cfg(tokio_backend)]
     /// A well-formed MONITOR ACK refills the pipeline window by exactly
     /// the decoded count — no fabricated default.
     #[epics_macros_rs::epics_test]
@@ -13876,6 +14096,7 @@ mod tests {
         payload.put_u32(3, order); // ack-count
         let frame = synth_frame(Command::Monitor, order, payload);
         handle_op(
+            &crate::test_reactor(),
             &frame,
             &tx,
             &mut channels,
@@ -13904,6 +14125,7 @@ mod tests {
         );
     }
 
+    #[cfg(tokio_backend)]
     /// A MONITOR ACK whose count would push the window past `u32::MAX`
     /// SATURATES the stored credit instead of wrapping it. A raw
     /// `fetch_add` would wrap to a tiny value, leaving `acquire`'s view
@@ -13934,6 +14156,7 @@ mod tests {
         payload.put_u32(100, order); // would overflow (MAX-1) + 100
         let frame = synth_frame(Command::Monitor, order, payload);
         handle_op(
+            &crate::test_reactor(),
             &frame,
             &tx,
             &mut channels,
@@ -13962,6 +14185,7 @@ mod tests {
         );
     }
 
+    #[cfg_attr(exec_backend, allow(dead_code))]
     /// Recorder source for the MONITOR ACK validate-order regression.
     /// Pushes every
     /// `notify_monitor_start` and `notify_watermark` edge into one ordered
@@ -14014,6 +14238,7 @@ mod tests {
         }
     }
 
+    #[cfg(tokio_backend)]
     /// Build a single started MONITOR op for the ACK validate-order tests.
     /// `paused` is the caller-held `monitor_paused` handle (so it can assert
     /// on it after the call); `executing` fires the initial Idle->Executing
@@ -14084,6 +14309,7 @@ mod tests {
         channels
     }
 
+    #[cfg(tokio_backend)]
     /// A truncated `0xC4` (ACK|START) frame with no ACK `u32` must be a
     /// connection-fatal Decode error with NO START side effect: `monitor_paused`
     /// stays paused and `notify_monitor_start` never fires. pvxs
@@ -14130,6 +14356,7 @@ mod tests {
         payload.put_u8(0xC4);
         let frame = synth_frame(Command::Monitor, order, payload);
         let err = handle_op(
+            &crate::test_reactor(),
             &frame,
             &tx,
             &mut channels,
@@ -14166,6 +14393,7 @@ mod tests {
         );
     }
 
+    #[cfg(tokio_backend)]
     /// A truncated `0x84` (ACK|STOP) frame with no ACK `u32` must be a
     /// connection-fatal Decode error with NO STOP side effect: `monitor_paused`
     /// stays cleared and `notify_monitor_start(false)` never fires. Pre-fix the
@@ -14211,6 +14439,7 @@ mod tests {
         payload.put_u8(0x84);
         let frame = synth_frame(Command::Monitor, order, payload);
         let err = handle_op(
+            &crate::test_reactor(),
             &frame,
             &tx,
             &mut channels,
@@ -14247,6 +14476,7 @@ mod tests {
         );
     }
 
+    #[cfg(tokio_backend)]
     /// A well-formed `0xC4` (ACK|START) refills the window AND resumes, and
     /// pvxs (servermon.cpp:643-689) applies ACK refill THEN START, so the
     /// `onHighMark` (Resume watermark) precedes `onStart`. Pre-fix the START
@@ -14292,6 +14522,7 @@ mod tests {
         payload.put_u32(3, order);
         let frame = synth_frame(Command::Monitor, order, payload);
         handle_op(
+            &crate::test_reactor(),
             &frame,
             &tx,
             &mut channels,
@@ -14448,7 +14679,7 @@ mod tests {
     /// this server does NOT host, with no `MustReply`, emits nothing. This
     /// pins that dropping the protocol gate did not turn the TCP handler
     /// into a reply-to-everything path — a genuine name miss is still
-    /// silent (pvxs serverchan.cpp:240-249 only replies on a match or
+    /// silent (pvxs serverchan.cpp:230-231 only replies on a match or
     /// MustReply).
     #[epics_macros_rs::epics_test]
     async fn tcp_search_unknown_name_without_mustreply_is_silent() {
@@ -14724,12 +14955,12 @@ mod tests {
     // Reactor-dependent, and specifically tokio-shaped: it stands a task up
     // with a bare `tokio::spawn` so it can hand `AbortOnDrop` a raw
     // `tokio::task::AbortHandle`, and it reads the outcome through tokio's
-    // `JoinError::is_cancelled`. Under `rtems-exec-model` the `runtime::task`
+    // `JoinError::is_cancelled`. Under `exec_backend` the `runtime::task`
     // seam's `TaskAbortHandle` is a *different* type with a different join
     // error, so the fixture does not even typecheck there — and the production
     // sites it stands in for (`finish_exec_data_task`, `monitor_abort`) take
     // their handle from the seam and do compile on both backends.
-    #[cfg(not(feature = "rtems-exec-model"))]
+    #[cfg(tokio_backend)]
     #[epics_macros_rs::epics_test]
     async fn cancel_request_pauses_monitor_without_aborting() {
         // cancel-vs-destroy parity: pvxs serverconn.cpp:262-289
@@ -14862,7 +15093,7 @@ mod tests {
     // a bare `tokio::spawn` handle into `AbortOnDrop` plus a tokio
     // `JoinError::is_cancelled` readout, neither of which exists on the
     // executor backend.
-    #[cfg(not(feature = "rtems-exec-model"))]
+    #[cfg(tokio_backend)]
     #[epics_macros_rs::epics_test]
     async fn cancel_request_returns_non_monitor_exec_to_idle_and_aborts_task() {
         let order = ByteOrder::Little;
@@ -15711,6 +15942,7 @@ mod tests {
         assert_eq!(reply.len(), PvaHeader::SIZE + 8);
     }
 
+    #[cfg(tokio_backend)]
     /// Same per-frame-order rule for a data operation: a MONITOR ACK
     /// encoded big-endian against a little-endian-configured server must
     /// decode its SID/IOID/ack-count from the frame header order. Before
@@ -15741,6 +15973,7 @@ mod tests {
         payload.put_u32(3, inbound_order); // ack-count, big-endian
         let frame = synth_frame(Command::Monitor, inbound_order, payload);
         handle_op(
+            &crate::test_reactor(),
             &frame,
             &tx,
             &mut channels,
@@ -16005,6 +16238,7 @@ mod tests {
 
         let alice = cred_ca("alice");
         handle_create_channel(
+            &crate::test_reactor(),
             &source,
             &frame,
             &tx,
@@ -16194,6 +16428,7 @@ mod tests {
         );
     }
 
+    #[cfg(tokio_backend)]
     /// Per-op edge
     /// (the converse guard). Only the channel *lifecycle* edges are pinned to
     /// the CREATE-time credential; per-operation handlers must keep using the
@@ -16258,6 +16493,7 @@ mod tests {
         payload.put_u8(0x40);
         let frame = synth_frame(Command::Get, order, payload);
         handle_op(
+            &crate::test_reactor(),
             &frame,
             &tx,
             &mut channels,
@@ -16426,6 +16662,7 @@ mod tests {
         );
     }
 
+    #[cfg(tokio_backend)]
     /// pvxs `serverget.cpp:83` echoes the request `subcmd` byte in the
     /// PUT data response. The PUT_GET (readback) case sets bit 0x40 in
     /// the client subcmd; pvxs `clientget.cpp:362-370` dispatches the
@@ -16504,6 +16741,7 @@ mod tests {
         crate::pvdata::encode::encode_pv_field(&req_val, &req_desc, order, &mut init_payload);
         let init_frame = synth_frame(Command::Put, order, init_payload);
         handle_op(
+            &crate::test_reactor(),
             &init_frame,
             &tx,
             &mut channels,
@@ -16546,6 +16784,7 @@ mod tests {
         let exec_frame = synth_frame(Command::Put, order, exec_payload);
 
         handle_op(
+            &crate::test_reactor(),
             &exec_frame,
             &tx,
             &mut channels,
@@ -16578,6 +16817,215 @@ mod tests {
         );
     }
 
+    #[cfg(tokio_backend)]
+    /// The PUT readback (`subcmd & 0x40`) frames the leaves the source
+    /// ASSIGNED, exactly like a GET reply.
+    ///
+    /// pvxs sends both through one call — `if(cmd==CMD_GET || (cmd==CMD_PUT
+    /// && (subcmd&0x40))) to_wire_valid(R, value, &pvMask)`
+    /// (`serverget.cpp:103-104`) — so a leaf its `getProperties`
+    /// (`iocsource.cpp:253-310`) never assigns is absent from the readback
+    /// for the same reason it is absent from a GET. The port's `PvField` has
+    /// no unassigned state, so the equivalent is the source's declared marks;
+    /// framing the full introspection instead put `control.minStep`,
+    /// `valueAlarm.active`, the four `valueAlarm.*Severity` and
+    /// `valueAlarm.hysteresis` in front of the client carrying fabricated
+    /// zeros.
+    #[epics_macros_rs::epics_test]
+    async fn a_put_readback_frames_only_the_leaves_the_record_assigns() {
+        use crate::server::native_source::PvDatabaseSource;
+        use crate::server_native::runtime::PvaServerConfig;
+        use crate::server_native::source::ChannelSource;
+        use crate::server_native::tcp::ClientCredentials;
+        use epics_base_rs::server::database::PvDatabase;
+        use epics_base_rs::server::records::ai::AiRecord;
+        use std::sync::Arc;
+
+        let order = ByteOrder::Little;
+        let sid: u32 = 1;
+        let ioid: u32 = 100;
+
+        let db = Arc::new(PvDatabase::new());
+        db.add_record("P:AI", Box::new(AiRecord::new(1.0)))
+            .await
+            .unwrap();
+        let db_source = PvDatabaseSource::new(db.clone());
+        let intro = db_source
+            .get_introspection("P:AI")
+            .await
+            .expect("the record has an NTScalar descriptor");
+        let source: DynSource = Arc::new(db_source);
+
+        let mut channels: HashMap<u32, ChannelState> = HashMap::new();
+        channels.insert(
+            sid,
+            ChannelState {
+                name: "P:AI".into(),
+                cid: 0,
+                sid,
+                introspection: Some(std::sync::Arc::new(intro.clone())),
+                source: source.clone(),
+                stat: crate::server_native::peers::ChannelStat::new(String::new()),
+                open_cred: Arc::new(ClientCredentials::anonymous(TEST_PEER)),
+                ops: HashMap::new(),
+                parked: HashMap::new(),
+                put_scratch: None,
+                intro_wire: None,
+            },
+        );
+
+        let (tx, mut rx) = test_srv_tx(16);
+        let config = PvaServerConfig::default();
+        let mut encode_cache = crate::pvdata::encode::EncodeTypeCache::new();
+        let peer: SocketAddr = "127.0.0.1:5075".parse().unwrap();
+        let cred = Arc::new(ClientCredentials::anonymous(TEST_PEER));
+        let park = ParkCtx {
+            peer,
+            cred: &Arc::new(ClientCredentials::anonymous(peer)),
+            ready_tx: &discard_intro_ready(),
+        };
+
+        // The bit a single leaf path occupies in this descriptor's wire
+        // changed-bitset, from the encoder that computes the real one.
+        let leaf_bit = |path: &str| {
+            crate::pvdata::encode::marked_wire_changed_bitset(
+                &intro,
+                &[path.to_string()],
+                &BitSet::all_set(intro.total_bits()),
+            )
+            .iter()
+            .next()
+        };
+
+        // PUT INIT with an empty-structure pvRequest — the full selection
+        // mask, so nothing but the source's marks can narrow the readback.
+        let req_desc = FieldDesc::Structure {
+            struct_id: String::new(),
+            fields: vec![],
+        };
+        let mut init_payload = Vec::new();
+        init_payload.put_u32(sid, order);
+        init_payload.put_u32(ioid, order);
+        init_payload.put_u8(0x08);
+        crate::pvdata::encode::encode_type_desc(&req_desc, order, &mut init_payload);
+        crate::pvdata::encode::encode_pv_field(
+            &PvField::Structure(PvStructure::new("")),
+            &req_desc,
+            order,
+            &mut init_payload,
+        );
+        handle_op(
+            &crate::test_reactor(),
+            &synth_frame(Command::Put, order, init_payload),
+            &tx,
+            &mut channels,
+            order,
+            &fixed_out_order(order),
+            OpKind::Put,
+            &config,
+            &mut encode_cache,
+            &mut TypeCache::new(),
+            peer,
+            &cred,
+            &discard_mon_fin(),
+            &discard_exec_fin(),
+            &park,
+        )
+        .await
+        .expect("PUT INIT ok");
+        let _init_resp = rx.try_recv().expect("INIT response emitted");
+
+        // PUT EXEC, readback bit set, writing the `value` leaf only.
+        let value_bit = leaf_bit("value").expect("the descriptor carries value");
+        let mut put_changed = BitSet::new();
+        put_changed.set(value_bit);
+        let mut delta = crate::pvdata::encode::default_value_for(&intro);
+        if let PvField::Structure(s) = &mut delta {
+            for (name, field) in s.fields.iter_mut() {
+                if name == "value" {
+                    *field = PvField::Scalar(ScalarValue::Double(7.5));
+                }
+            }
+        }
+        let mut exec_payload = Vec::new();
+        exec_payload.put_u32(sid, order);
+        exec_payload.put_u32(ioid, order);
+        exec_payload.put_u8(0x40);
+        put_changed.write_into(order, &mut exec_payload);
+        crate::pvdata::encode::encode_pv_field_with_bitset(
+            &delta,
+            &intro,
+            &put_changed,
+            0,
+            order,
+            &mut exec_payload,
+        );
+        handle_op(
+            &crate::test_reactor(),
+            &synth_frame(Command::Put, order, exec_payload),
+            &tx,
+            &mut channels,
+            order,
+            &fixed_out_order(order),
+            OpKind::Put,
+            &config,
+            &mut encode_cache,
+            &mut TypeCache::new(),
+            peer,
+            &cred,
+            &discard_mon_fin(),
+            &discard_exec_fin(),
+            &park,
+        )
+        .await
+        .expect("PUT EXEC ok");
+
+        let resp = rx.recv().await.expect("PUT readback response emitted");
+        let (rframe, _) = try_parse_frame(&resp)
+            .expect("frame parses")
+            .expect("complete frame");
+        let mut cur = rframe.cursor();
+        let _ioid = cur.get_u32(order).expect("ioid");
+        assert_eq!(cur.get_u8().expect("subcmd"), 0x40, "readback reply");
+        let status = Status::decode(&mut cur, order).expect("status");
+        assert!(status.is_success(), "PUT readback status: {status:?}");
+        let changed = BitSet::decode(&mut cur, order).expect("readback bitset");
+
+        assert!(
+            changed.get(value_bit),
+            "the readback must carry the value the PUT wrote"
+        );
+        // The seven `getProperties` never assigns, named so a failure says
+        // which leaf reached the client.
+        let never_assigned = [
+            "control.minStep",
+            "valueAlarm.active",
+            "valueAlarm.lowAlarmSeverity",
+            "valueAlarm.lowWarningSeverity",
+            "valueAlarm.highWarningSeverity",
+            "valueAlarm.highAlarmSeverity",
+            "valueAlarm.hysteresis",
+        ];
+        for path in never_assigned {
+            assert!(
+                leaf_bit(path).is_some(),
+                "{path} must be part of the NTScalar descriptor for this \
+                 assertion to mean anything"
+            );
+        }
+        let served: Vec<&str> = never_assigned
+            .into_iter()
+            .filter(|p| leaf_bit(p).is_some_and(|b| changed.get(b)))
+            .collect();
+        assert_eq!(
+            served,
+            Vec::<&str>::new(),
+            "the PUT readback framed leaves pvxs's getProperties never \
+             assigns (iocsource.cpp:253-310)"
+        );
+    }
+
+    #[cfg(tokio_backend)]
     /// Companion: a plain PUT EXEC (subcmd=0x00, no readback bit) must
     /// still emit `subcmd=0x00` in the response. Confirms the echo
     /// behaviour is symmetric — neither leaking 0x40 when not requested
@@ -16648,6 +17096,7 @@ mod tests {
         crate::pvdata::encode::encode_pv_field(&req_val, &req_desc, order, &mut init_payload);
         let init_frame = synth_frame(Command::Put, order, init_payload);
         handle_op(
+            &crate::test_reactor(),
             &init_frame,
             &tx,
             &mut channels,
@@ -16688,6 +17137,7 @@ mod tests {
         let exec_frame = synth_frame(Command::Put, order, exec_payload);
 
         handle_op(
+            &crate::test_reactor(),
             &exec_frame,
             &tx,
             &mut channels,
@@ -16718,6 +17168,7 @@ mod tests {
         );
     }
 
+    #[cfg(tokio_backend)]
     /// a GET EXEC that sets the last-request bit (`subcmd & 0x10`)
     /// keeps the op (and its IOID) reserved while the response task runs and
     /// only removes it once the completion signal is applied — matching pvxs
@@ -16803,6 +17254,7 @@ mod tests {
         let (tx, mut rx) = test_srv_tx(16);
         let (exec_fin_tx, mut exec_fin_rx) = mpsc::unbounded_channel::<ExecFinished>();
         handle_op(
+            &crate::test_reactor(),
             &exec_frame(0x50),
             &tx,
             &mut channels,
@@ -16869,6 +17321,7 @@ mod tests {
         let (tx, mut rx) = test_srv_tx(16);
         let (exec_fin_tx, mut exec_fin_rx) = mpsc::unbounded_channel::<ExecFinished>();
         handle_op(
+            &crate::test_reactor(),
             &exec_frame(0x00),
             &tx,
             &mut channels,
@@ -16913,6 +17366,7 @@ mod tests {
         );
     }
 
+    #[cfg(tokio_backend)]
     /// A client may advertise an inbound descriptor once with a
     /// `0xFD <slot>` define and reference it later on the *same connection*
     /// with `0xFE <slot>` — pvxs keeps one connection-scope `rxRegistry`
@@ -16999,6 +17453,7 @@ mod tests {
         // Shared connection cache: INIT #1 defines, INIT #2 resolves.
         let mut decode_cache = TypeCache::new();
         handle_op(
+            &crate::test_reactor(),
             &def_frame,
             &tx,
             &mut channels,
@@ -17027,6 +17482,7 @@ mod tests {
         );
 
         handle_op(
+            &crate::test_reactor(),
             &ref_frame,
             &tx,
             &mut channels,
@@ -17075,6 +17531,7 @@ mod tests {
         );
         let mut fresh_cache = TypeCache::new();
         let err = handle_op(
+            &crate::test_reactor(),
             &ref_frame,
             &tx,
             &mut empty_channels,
@@ -17432,6 +17889,7 @@ mod tests {
         );
     }
 
+    #[cfg(tokio_backend)]
     /// Regression (Defect 1): the PVA client encodes the PUT data
     /// phase as a BitSet delta — only the marked fields are present
     /// on the wire. A 3-field structure where only field `b` (bit 2)
@@ -17503,6 +17961,7 @@ mod tests {
         crate::pvdata::encode::encode_pv_field(&req_val, &req_desc, order, &mut init_payload);
         let init_frame = synth_frame(Command::Put, order, init_payload);
         handle_op(
+            &crate::test_reactor(),
             &init_frame,
             &tx,
             &mut channels,
@@ -17550,6 +18009,7 @@ mod tests {
         );
         let exec_frame = synth_frame(Command::Put, order, exec_payload);
         handle_op(
+            &crate::test_reactor(),
             &exec_frame,
             &tx,
             &mut channels,
@@ -17583,6 +18043,7 @@ mod tests {
         );
     }
 
+    #[cfg(tokio_backend)]
     /// Regression (Defect 1, PUT_GET path): same as the PUT delta
     /// test but via the dedicated `handle_put_get` (Command::PutGet,
     /// cmd 12). A 3-field structure PUT_GET where only field `c`
@@ -17647,6 +18108,7 @@ mod tests {
         crate::pvdata::encode::encode_pv_field(&req_val, &req_desc, order, &mut init_payload);
         let init_frame = synth_frame(Command::PutGet, order, init_payload);
         handle_put_get(
+            &crate::test_reactor(),
             &init_frame,
             &tx,
             &mut channels,
@@ -17688,6 +18150,7 @@ mod tests {
         );
         let data_frame = synth_frame(Command::PutGet, order, data_payload);
         handle_put_get(
+            &crate::test_reactor(),
             &data_frame,
             &tx,
             &mut channels,
@@ -18356,6 +18819,7 @@ mod tests {
 
         // Peer presents the matching root CA — WRITE must be granted.
         handle_process(
+            &crate::test_reactor(),
             &frame,
             &tx,
             &mut channels,
@@ -18419,6 +18883,7 @@ mod tests {
         let frame = synth_frame(Command::Process, order, payload);
 
         handle_process(
+            &crate::test_reactor(),
             &frame,
             &tx,
             &mut channels,
@@ -18522,6 +18987,7 @@ mod tests {
         let frame = synth_frame(Command::Process, order, payload);
 
         let res = handle_process(
+            &crate::test_reactor(),
             &frame,
             &tx,
             &mut channels,
@@ -18572,6 +19038,7 @@ mod tests {
         let frame = synth_frame(Command::Process, order, payload);
 
         let res = handle_process(
+            &crate::test_reactor(),
             &frame,
             &tx,
             &mut channels,
@@ -18656,6 +19123,7 @@ mod tests {
         let frame = process_init_frame(sid, ioid, pv_request, order);
 
         let result = handle_process(
+            &crate::test_reactor(),
             &frame,
             &tx,
             &mut channels,
@@ -18818,6 +19286,7 @@ mod tests {
         let frame = array_init_frame(sid, ioid, pv_request, order);
 
         let result = handle_channel_array(
+            &crate::test_reactor(),
             &frame,
             &tx,
             &mut channels,
@@ -18900,6 +19369,7 @@ mod tests {
         let frame = synth_frame(Command::PutGet, order, payload);
 
         let res = handle_put_get(
+            &crate::test_reactor(),
             &frame,
             &tx,
             &mut channels,
@@ -18958,6 +19428,7 @@ mod tests {
         let frame = synth_frame(Command::PutGet, order, payload);
 
         let res = handle_put_get(
+            &crate::test_reactor(),
             &frame,
             &tx,
             &mut channels,
@@ -19052,6 +19523,7 @@ mod tests {
         let frame = synth_frame(Command::PutGet, order, payload);
 
         handle_put_get(
+            &crate::test_reactor(),
             &frame,
             &tx,
             &mut channels,
@@ -19128,6 +19600,7 @@ mod tests {
         let frame = synth_frame(Command::Process, order, payload);
 
         handle_process(
+            &crate::test_reactor(),
             &frame,
             &tx,
             &mut channels,
@@ -19249,6 +19722,7 @@ mod tests {
         let frame = synth_frame(Command::PutGet, order, payload);
 
         handle_put_get(
+            &crate::test_reactor(),
             &frame,
             &tx,
             &mut channels,
@@ -19382,6 +19856,7 @@ mod tests {
         let peer: SocketAddr = "127.0.0.1:5075".parse().unwrap();
         let cred = Arc::new(ClientCredentials::anonymous(TEST_PEER));
         handle_get_field(
+            &crate::test_reactor(),
             &frame,
             &tx,
             &mut channels,
@@ -19443,6 +19918,7 @@ mod tests {
         let peer: SocketAddr = "127.0.0.1:5075".parse().unwrap();
         let cred = Arc::new(ClientCredentials::anonymous(TEST_PEER));
         handle_get_field(
+            &crate::test_reactor(),
             &frame,
             &tx,
             &mut channels,
@@ -19514,6 +19990,7 @@ mod tests {
         let peer: SocketAddr = "127.0.0.1:5075".parse().unwrap();
         let cred = Arc::new(ClientCredentials::anonymous(TEST_PEER));
         handle_get_field(
+            &crate::test_reactor(),
             &frame,
             &tx,
             &mut channels,
@@ -19703,6 +20180,7 @@ mod tests {
         // in `channels`, which stays in scope until after the reply below,
         // so the slow-path task is not aborted before it replies.
         handle_get_field(
+            &crate::test_reactor(),
             &frame,
             &tx,
             &mut channels,
@@ -19790,6 +20268,7 @@ mod tests {
         // in `channels`, which stays in scope until after the reply below,
         // so the slow-path task is not aborted before it replies.
         handle_get_field(
+            &crate::test_reactor(),
             &frame,
             &tx,
             &mut channels,
@@ -19900,6 +20379,7 @@ mod tests {
         // First GET_FIELD: reserves the IOID and spawns the (blocked) task.
         let frame1 = build();
         handle_get_field(
+            &crate::test_reactor(),
             &frame1,
             &tx,
             &mut channels,
@@ -19919,6 +20399,7 @@ mod tests {
         // must be dropped without spawning a second introspection.
         let frame2 = build();
         handle_get_field(
+            &crate::test_reactor(),
             &frame2,
             &tx,
             &mut channels,
@@ -20356,7 +20837,7 @@ mod tests {
         // `exec_rx.changed()` select arm); `bfr12_gate_reaches_a_parked_monitor`
         // covers the same path end to end through a real MONITOR.
         let mut gate_driver = MonitorGateDriver::new(Some(gate));
-        epics_base_rs::runtime::task::spawn(async move {
+        crate::test_reactor().spawn(async move {
             loop {
                 let executing = *exec_rx.borrow_and_update();
                 gate_driver.apply(executing).await;
@@ -20480,30 +20961,33 @@ mod tests {
 
         let (wire_tx, _wire_rx) = test_srv_tx(64);
         let (mon_fin_tx, _mon_fin_rx) = mpsc::unbounded_channel::<MonitorFinished>();
-        let (_join, start_ctl) = spawn_monitor_subscriber(MonitorSubscriberArgs {
-            sid: 1,
-            ioid: 2,
-            pv_name: "dut".into(),
-            intro: std::sync::Arc::new(intro.clone()),
-            mask: BitSet::with_capacity(intro.total_bits()),
-            tx: ChannelTx::new(
-                wire_tx,
-                crate::server_native::peers::ChannelStat::new("dut".into()),
-            ),
-            src: src.clone(),
-            queue_depth: 4,
-            high_watermark: 0,
-            mon_ctx: bfr12_anon_ctx(),
-            window: None,
-            window_notify: None,
-            filters: Arc::new(Default::default()),
-            monitor_options: Default::default(),
-            wm_seq: Arc::new(std::sync::atomic::AtomicU64::new(0)),
-            monitor_op_id: 7,
-            wm_levels: None,
-            mon_fin_tx,
-            out_order: fixed_out_order(ByteOrder::Little),
-        });
+        let (_join, start_ctl) = spawn_monitor_subscriber(
+            &crate::test_reactor(),
+            MonitorSubscriberArgs {
+                sid: 1,
+                ioid: 2,
+                pv_name: "dut".into(),
+                intro: std::sync::Arc::new(intro.clone()),
+                mask: BitSet::with_capacity(intro.total_bits()),
+                tx: ChannelTx::new(
+                    wire_tx,
+                    crate::server_native::peers::ChannelStat::new("dut".into()),
+                ),
+                src: src.clone(),
+                queue_depth: 4,
+                high_watermark: 0,
+                mon_ctx: bfr12_anon_ctx(),
+                window: None,
+                window_notify: None,
+                filters: Arc::new(Default::default()),
+                monitor_options: Default::default(),
+                wm_seq: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+                monitor_op_id: 7,
+                wm_levels: None,
+                mon_fin_tx,
+                out_order: fixed_out_order(ByteOrder::Little),
+            },
+        );
 
         async fn wait_len(log: &Arc<parking_lot::Mutex<Vec<bool>>>, n: usize) {
             for _ in 0..400 {
@@ -20538,17 +21022,68 @@ mod tests {
     fn bfr12_finish_guard_signals_on_drop() {
         let (tx, mut rx) = mpsc::unbounded_channel::<MonitorFinished>();
         {
-            let _g = MonitorFinishGuard {
-                tx: tx.clone(),
-                fin: MonitorFinished {
+            let _g = MonitorFinishGuard::new(
+                tx.clone(),
+                MonitorFinished {
                     sid: 3,
                     ioid: 11,
                     op_id: 77,
                 },
-            };
+            );
         } // guard drops here
         let got = rx.try_recv().expect("guard Drop must signal the owner");
         assert_eq!((got.sid, got.ioid, got.op_id), (3, 11, 77));
+    }
+
+    /// The removal signal must be QUEUED before the monitor's terminal frame,
+    /// for the same reason [`ExecFinishGuard::reply`] carries: a client may
+    /// re-INIT this ioid the instant it sees MONITOR FINISH, and `handle_op`'s
+    /// duplicate-INIT check is connection-FATAL, so the op has to be gone from
+    /// `channels` before that INIT is dispatched. Park
+    /// [`MonitorFinishGuard::reply`] on a full writer queue: the frame provably
+    /// has not been enqueued, and the signal must already be there. A
+    /// `Drop`-only guard fails this.
+    #[epics_macros_rs::epics_test]
+    async fn monitor_finish_signal_is_queued_before_its_terminal_frame() {
+        use std::future::Future;
+
+        let (srv_tx, mut wire_rx, _budget) = SrvTx::channel(1, 1 << 20);
+        let chan_tx = ChannelTx::new(
+            srv_tx,
+            crate::server_native::peers::ChannelStat::new(String::new()),
+        );
+        // Take the queue's only slot so the terminal frame cannot be enqueued.
+        chan_tx.send(vec![0u8]).await.expect("first frame fits");
+
+        let (tx, mut rx) = mpsc::unbounded_channel::<MonitorFinished>();
+        let guard = MonitorFinishGuard::new(
+            tx,
+            MonitorFinished {
+                sid: 3,
+                ioid: 11,
+                op_id: 77,
+            },
+        );
+
+        let mut reply = std::pin::pin!(guard.reply(&chan_tx, vec![1u8]));
+        let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+        assert!(
+            reply.as_mut().poll(&mut cx).is_pending(),
+            "the writer queue is full, so the frame cannot have been enqueued"
+        );
+        let got = rx
+            .try_recv()
+            .expect("the removal signal is queued ahead of the frame");
+        assert_eq!((got.sid, got.ioid, got.op_id), (3, 11, 77));
+
+        // Free the slot: the frame still goes out, and the guard signals once.
+        assert_eq!(wire_rx.recv().await.as_deref(), Some(&[0u8][..]));
+        reply.await;
+        assert_eq!(wire_rx.recv().await.as_deref(), Some(&[1u8][..]));
+        assert!(
+            rx.try_recv().is_err(),
+            "the guard signals exactly once, not again from Drop"
+        );
     }
 
     /// The owner removes only the op INSTANCE that signaled: a stale
@@ -20629,6 +21164,7 @@ mod tests {
         );
     }
 
+    #[cfg(tokio_backend)]
     /// Load-bearing regression: START a MONITOR through `handle_op`, let
     /// the source-close end the subscriber task, and prove the task
     /// signals its read-loop owner so the op is removed and the terminal
@@ -20693,6 +21229,7 @@ mod tests {
         crate::pvdata::encode::encode_pv_field(&req_val, &req_desc, order, &mut init_payload);
         let init_frame = synth_frame(Command::Monitor, order, init_payload);
         handle_op(
+            &crate::test_reactor(),
             &init_frame,
             &tx,
             &mut channels,
@@ -20727,6 +21264,7 @@ mod tests {
         start_payload.put_u8(0x44);
         let start_frame = synth_frame(Command::Monitor, order, start_payload);
         handle_op(
+            &crate::test_reactor(),
             &start_frame,
             &tx,
             &mut channels,
@@ -20841,6 +21379,7 @@ mod tests {
         }
     }
 
+    #[cfg(tokio_backend)]
     /// One channel `sid=1`/`dut` with the supplied prototype.
     fn bfr13_channels(intro: Option<FieldDesc>, source: DynSource) -> HashMap<u32, ChannelState> {
         let mut channels = HashMap::new();
@@ -20863,6 +21402,7 @@ mod tests {
         channels
     }
 
+    #[cfg(tokio_backend)]
     /// Encode an INIT pvRequest body (empty struct → all-field mask).
     fn bfr13_init_pv_request(order: ByteOrder, payload: &mut Vec<u8>) {
         let req_desc = FieldDesc::Structure {
@@ -20874,6 +21414,7 @@ mod tests {
         crate::pvdata::encode::encode_pv_field(&req_val, &req_desc, order, payload);
     }
 
+    #[cfg(tokio_backend)]
     /// `(subcmd, status)` from a status-only op reply payload.
     fn bfr13_parse_reply(buf: &[u8], order: ByteOrder, expect_cmd: Command) -> (u8, Status) {
         let (frame, _) = try_parse_frame(buf)
@@ -20891,6 +21432,7 @@ mod tests {
         (subcmd, status)
     }
 
+    #[cfg(tokio_backend)]
     /// a GET whose source read fails during the data phase
     /// replies with the request's data subcmd `0x00` and an error
     /// status — not an INIT `0x08` frame.
@@ -20917,6 +21459,7 @@ mod tests {
         bfr13_init_pv_request(order, &mut init_payload);
         let init_frame = synth_frame(Command::Get, order, init_payload);
         handle_op(
+            &crate::test_reactor(),
             &init_frame,
             &tx,
             &mut channels,
@@ -20947,6 +21490,7 @@ mod tests {
         exec_payload.put_u8(0x00);
         let exec_frame = synth_frame(Command::Get, order, exec_payload);
         handle_op(
+            &crate::test_reactor(),
             &exec_frame,
             &tx,
             &mut channels,
@@ -21007,6 +21551,7 @@ mod tests {
         channels
     }
 
+    #[cfg(tokio_backend)]
     /// An IOID already live on one channel makes an INIT reusing it on a
     /// *different* channel connection-fatal — pvxs scopes IOIDs to
     /// `ServerConn::opByIOID`, not per channel (serverget.cpp:378-384).
@@ -21043,6 +21588,7 @@ mod tests {
         bfr13_init_pv_request(order, &mut init_payload);
         let init_frame = synth_frame(Command::Get, order, init_payload);
         let err = handle_op(
+            &crate::test_reactor(),
             &init_frame,
             &tx,
             &mut channels,
@@ -21103,6 +21649,7 @@ mod tests {
         );
     }
 
+    #[cfg(tokio_backend)]
     /// a PUT readback (`subcmd & 0x40`) whose readback GET
     /// fails replies with the request's `0x40` subcmd and an error
     /// status — not INIT `0x08`.
@@ -21129,6 +21676,7 @@ mod tests {
         bfr13_init_pv_request(order, &mut init_payload);
         let init_frame = synth_frame(Command::Put, order, init_payload);
         handle_op(
+            &crate::test_reactor(),
             &init_frame,
             &tx,
             &mut channels,
@@ -21153,13 +21701,14 @@ mod tests {
         let _ = rx.recv().await.expect("PUT INIT reply");
 
         // PUT readback EXEC (subcmd 0x40) — the readback GET reads the
-        // current value via get_value_checked → None → send_op_error.
+        // current value via read_checked → get_value → None → send_op_error.
         let mut exec_payload = Vec::new();
         exec_payload.put_u32(sid, order);
         exec_payload.put_u32(ioid, order);
         exec_payload.put_u8(0x40);
         let exec_frame = synth_frame(Command::Put, order, exec_payload);
         handle_op(
+            &crate::test_reactor(),
             &exec_frame,
             &tx,
             &mut channels,
@@ -21194,6 +21743,7 @@ mod tests {
         );
     }
 
+    #[cfg(tokio_backend)]
     /// Boundary: an INIT-phase negotiation failure (here a pvRequest
     /// whose `field` entry is a scalar, so the mask resolves empty)
     /// must still echo the INIT subcmd `0x08`. The fix makes error
@@ -21237,6 +21787,7 @@ mod tests {
         crate::pvdata::encode::encode_pv_field(&req_val, &req_desc, order, &mut init_payload);
         let init_frame = synth_frame(Command::Get, order, init_payload);
         handle_op(
+            &crate::test_reactor(),
             &init_frame,
             &tx,
             &mut channels,
@@ -21271,6 +21822,7 @@ mod tests {
         );
     }
 
+    #[cfg(tokio_backend)]
     /// A channel that has no prototype yet PARKS its INIT instead of
     /// answering "must provide prototype": pvxs `sharedpv.cpp:239-249`
     /// inserts the `ConnectOp` into `pending` and `SharedPV::open`
@@ -21300,6 +21852,7 @@ mod tests {
         bfr13_init_pv_request(order, &mut init_payload);
         let init_frame = synth_frame(Command::Get, order, init_payload);
         handle_op(
+            &crate::test_reactor(),
             &init_frame,
             &tx,
             &mut channels,
@@ -21668,6 +22221,7 @@ mod tests {
     }
 }
 
+#[cfg(tokio_backend)]
 #[cfg(test)]
 mod autoexec_tests {
     //! R10-34: `autoExec` is a pvxs CLIENT-side builder flag
@@ -21763,6 +22317,7 @@ mod autoexec_tests {
         crate::pvdata::encode::encode_pv_field(&pv_request, &req_desc, order, &mut init_payload);
         let init_frame = synth_frame(Command::Put, order, init_payload);
         handle_op(
+            &crate::test_reactor(),
             &init_frame,
             &tx,
             &mut channels,
@@ -21801,6 +22356,7 @@ mod autoexec_tests {
         crate::pvdata::encode::encode_pv_field(&new_val, &intro, order, &mut exec_payload);
         let exec_frame = synth_frame(Command::Put, order, exec_payload);
         handle_op(
+            &crate::test_reactor(),
             &exec_frame,
             &tx,
             &mut channels,
@@ -22001,6 +22557,7 @@ mod r14_tests {
         let (mon_fin_tx, _mon_fin_rx) = mpsc::unbounded_channel::<MonitorFinished>();
         let (exec_fin_tx, _exec_fin_rx) = mpsc::unbounded_channel::<ExecFinished>();
         handle_op(
+            &crate::test_reactor(),
             &frame,
             &tx,
             &mut channels,
@@ -22192,8 +22749,9 @@ mod bfr15_tests {
     }
 
     // Used only by the three reactor-dependent tests gated below, so it
-    // carries the same predicate — otherwise it is dead code feature-ON.
-    #[cfg(not(feature = "rtems-exec-model"))]
+    // carries the same predicate — otherwise it is dead code on the exec
+    // backend.
+    #[cfg(tokio_backend)]
     fn put_exec_frame(sid: u32, ioid: u32, order: ByteOrder) -> Frame {
         let intro = nt_scalar_desc();
         let mut payload = Vec::new();
@@ -22207,8 +22765,9 @@ mod bfr15_tests {
     }
 
     // Used only by the three reactor-dependent tests gated below, so it
-    // carries the same predicate — otherwise it is dead code feature-ON.
-    #[cfg(not(feature = "rtems-exec-model"))]
+    // carries the same predicate — otherwise it is dead code on the exec
+    // backend.
+    #[cfg(tokio_backend)]
     fn destroy_frame(sid: u32, ioid: u32, order: ByteOrder) -> Frame {
         let mut payload = Vec::new();
         payload.put_u32(sid, order);
@@ -22219,8 +22778,9 @@ mod bfr15_tests {
     /// Poll `counter` until it reaches `want`, panicking after ~1 s. Used to
     /// wait for a spawned task to enter its (blocking) source call.
     // Used only by the three reactor-dependent tests gated below, so it
-    // carries the same predicate — otherwise it is dead code feature-ON.
-    #[cfg(not(feature = "rtems-exec-model"))]
+    // carries the same predicate — otherwise it is dead code on the exec
+    // backend.
+    #[cfg(tokio_backend)]
     async fn wait_for(counter: &AtomicUsize, want: usize) {
         for _ in 0..200 {
             if counter.load(Ordering::SeqCst) >= want {
@@ -22260,12 +22820,12 @@ mod bfr15_tests {
     /// source read nor aborts the first.
     // Reactor-dependent: the mock `ChannelSource` this test stands up blocks
     // inside `get_value`/`put_value` with `tokio::time::sleep`, and under
-    // `rtems-exec-model` the `runtime::task` seam drives that future on a
+    // `exec_backend` the `runtime::task` seam drives that future on a
     // `cbMedium` executor worker, which has no tokio reactor — the fixture
     // panics with "there is no reactor running" before the assertion is
     // reached. The production path under test is backend-neutral; only the
     // way the fixture blocks is not.
-    #[cfg(not(feature = "rtems-exec-model"))]
+    #[cfg(tokio_backend)]
     #[epics_macros_rs::epics_test]
     async fn bfr15_second_get_exec_while_executing_is_ignored_not_aborted() {
         let order = ByteOrder::Little;
@@ -22291,6 +22851,7 @@ mod bfr15_tests {
 
         // First EXEC: op was Idle → accepted, now Executing, source read spawned.
         handle_op(
+            &crate::test_reactor(),
             &get_exec_frame(sid, ioid, order),
             &tx,
             &mut channels,
@@ -22318,6 +22879,7 @@ mod bfr15_tests {
 
         // Second EXEC while Executing: ignored.
         handle_op(
+            &crate::test_reactor(),
             &get_exec_frame(sid, ioid, order),
             &tx,
             &mut channels,
@@ -22360,12 +22922,12 @@ mod bfr15_tests {
     /// the first is aborted.
     // Reactor-dependent: the mock `ChannelSource` this test stands up blocks
     // inside `get_value`/`put_value` with `tokio::time::sleep`, and under
-    // `rtems-exec-model` the `runtime::task` seam drives that future on a
+    // `exec_backend` the `runtime::task` seam drives that future on a
     // `cbMedium` executor worker, which has no tokio reactor — the fixture
     // panics with "there is no reactor running" before the assertion is
     // reached. The production path under test is backend-neutral; only the
     // way the fixture blocks is not.
-    #[cfg(not(feature = "rtems-exec-model"))]
+    #[cfg(tokio_backend)]
     #[epics_macros_rs::epics_test]
     async fn bfr15_second_put_exec_while_executing_is_ignored_not_aborted() {
         let order = ByteOrder::Little;
@@ -22393,6 +22955,7 @@ mod bfr15_tests {
         let (exec_tx, _exec_rx) = mpsc::unbounded_channel::<ExecFinished>();
 
         handle_op(
+            &crate::test_reactor(),
             &put_exec_frame(sid, ioid, order),
             &tx,
             &mut channels,
@@ -22419,6 +22982,7 @@ mod bfr15_tests {
         assert!(op_abort_armed(&channels, sid, ioid));
 
         handle_op(
+            &crate::test_reactor(),
             &put_exec_frame(sid, ioid, order),
             &tx,
             &mut channels,
@@ -22461,12 +23025,12 @@ mod bfr15_tests {
     /// an explicit teardown.)
     // Reactor-dependent: the mock `ChannelSource` this test stands up blocks
     // inside `get_value`/`put_value` with `tokio::time::sleep`, and under
-    // `rtems-exec-model` the `runtime::task` seam drives that future on a
+    // `exec_backend` the `runtime::task` seam drives that future on a
     // `cbMedium` executor worker, which has no tokio reactor — the fixture
     // panics with "there is no reactor running" before the assertion is
     // reached. The production path under test is backend-neutral; only the
     // way the fixture blocks is not.
-    #[cfg(not(feature = "rtems-exec-model"))]
+    #[cfg(tokio_backend)]
     #[epics_macros_rs::epics_test]
     async fn bfr15_destroy_request_aborts_in_flight_exec_task() {
         let order = ByteOrder::Little;
@@ -22491,6 +23055,7 @@ mod bfr15_tests {
         let (exec_tx, _exec_rx) = mpsc::unbounded_channel::<ExecFinished>();
 
         handle_op(
+            &crate::test_reactor(),
             &get_exec_frame(sid, ioid, order),
             &tx,
             &mut channels,
@@ -22554,6 +23119,7 @@ mod bfr15_tests {
         // First EXEC completes; the task sends its response, then its
         // ExecFinishGuard drops and signals the owner.
         handle_op(
+            &crate::test_reactor(),
             &get_exec_frame(sid, ioid, order),
             &tx,
             &mut channels,
@@ -22586,6 +23152,7 @@ mod bfr15_tests {
 
         // Re-EXEC against the now-Idle op is accepted and runs a fresh read.
         handle_op(
+            &crate::test_reactor(),
             &get_exec_frame(sid, ioid, order),
             &tx,
             &mut channels,
@@ -22658,6 +23225,65 @@ mod bfr15_tests {
             },
         );
         assert_eq!(op_exec_state(&channels, sid, ioid), ExecState::Idle);
+    }
+
+    /// The completion signal must be QUEUED before the terminal frame reaches
+    /// the writer. pvxs commits the transition inside `doReply`
+    /// (`serverget.cpp:112-115`) and enqueues the body afterwards (`:124`) on
+    /// the loop that also reads frames, so a client that has seen a reply can
+    /// never send a frame the server meets with a still-`Executing` op — and
+    /// `begin_exec` answers such a frame by dropping it with no reply at all.
+    ///
+    /// Park [`ExecFinishGuard::reply`] on a full writer queue: the frame
+    /// provably has not been enqueued, and the signal must already be there.
+    /// A `Drop`-only guard, which signalled after `tx.send(buf).await`
+    /// returned, fails this.
+    #[epics_macros_rs::epics_test]
+    async fn exec_finish_signal_is_queued_before_its_reply_frame() {
+        use std::future::Future;
+
+        let (srv_tx, mut wire_rx, _budget) = SrvTx::channel(1, 1 << 20);
+        let chan_tx = ChannelTx::new(
+            srv_tx,
+            crate::server_native::peers::ChannelStat::new(String::new()),
+        );
+        // Take the queue's only slot so the reply frame cannot be enqueued.
+        chan_tx.send(vec![0u8]).await.expect("first frame fits");
+
+        let (fin_tx, mut fin_rx) = mpsc::unbounded_channel();
+        let guard = ExecFinishGuard::new(
+            fin_tx,
+            ExecFinished {
+                sid: 1,
+                ioid: 500,
+                op_id: 7,
+                success: false,
+                scratch: None,
+            },
+        );
+
+        let mut reply = std::pin::pin!(guard.reply(&chan_tx, vec![1u8], true));
+        let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+        assert!(
+            reply.as_mut().poll(&mut cx).is_pending(),
+            "the writer queue is full, so the frame cannot have been enqueued"
+        );
+        let fin = fin_rx
+            .try_recv()
+            .expect("the completion signal is queued ahead of the frame");
+        assert_eq!(
+            (fin.sid, fin.ioid, fin.op_id, fin.success),
+            (1, 500, 7, true)
+        );
+
+        // Free the slot: the frame still goes out, and exactly once.
+        assert_eq!(wire_rx.recv().await.as_deref(), Some(&[0u8][..]));
+        reply.await;
+        assert_eq!(wire_rx.recv().await.as_deref(), Some(&[1u8][..]));
+        assert!(
+            fin_rx.try_recv().is_err(),
+            "the guard signals exactly once, not again from Drop"
+        );
     }
 
     /// pvxs `ServerGPR::doReply`

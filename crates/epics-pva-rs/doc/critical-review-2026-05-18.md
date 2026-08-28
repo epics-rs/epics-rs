@@ -6,8 +6,13 @@ This document is a running critical review of the PVA crate. Findings
 below are limited to issues with a concrete code path and file/line
 evidence. Product code was not changed during this review.
 
-Reference implementation: `~/codes/pvxs` at git `f8d6192` (working tree
+Reference implementation: `$PVXS_HOME` at git `f8d6192` (working tree
 had an untracked `.DS_Store`, ignored for this review).
+
+The `src/decode.rs` rows below were written as `src/client_native/decode.rs`;
+`24d514e8` (2026-07-21) moved that file to the crate root, keeping
+`client_native::decode` as a re-export. Only the path is rewritten — the line
+numbers still belong to this review's own revision, not to today's file.
 
 ## Method
 
@@ -18,11 +23,26 @@ had an untracked `.DS_Store`, ignored for this review).
   leaks, panics on peer-controlled input, or test gaps hiding such issues.
 - Kept speculative design preferences out of the findings list.
 
+## Recording note (2026-08-26)
+
+Every row below now carries a `Status:` line naming the commit that ended
+it. None of that is new work. Each verdict was already written down — in
+the implementation-status section at the end of this file, and on the
+driver punchlist `punchlist-2026-05-19.md` — but in a shape no per-row
+scan can attribute: a ledger bullet leading with a row id starts its own
+block, so the verdict standing in the section heading above it belongs to
+no row at all. The `Status:` lines move each verdict inside the row it is
+about. Two of them cite a commit whose subject carries the wrong id
+(`BR-R4` and `BR-R14`), which is why a subject search finds no fix for
+those two rows.
+
 ## Open Findings
 
 ### PVA-R1: Monitor pipeline negotiation is sent on the wrong wire phase
 
 Severity: High
+
+Status: **CLEARED** `5a690343` — `pv_request::build_pv_request_pipeline` puts `record._options.pipeline` into the MONITOR INIT pvRequest, and `codec::build_monitor_start` no longer carries the 4-byte trailer.
 
 Rust client:
 
@@ -69,6 +89,8 @@ pipeline options.
 
 Severity: Medium
 
+Status: **CLEARED** `479f77c0` — `tcp_timeout` is threaded through `ConnectionPool::get_or_connect` into the heartbeat task; regression `pva_r2_tcp_timeout_applied` in `src/client_native/server_conn.rs`.
+
 Rust:
 
 - `src/client_native/context.rs:58-61` documents a client-side TCP idle
@@ -104,6 +126,8 @@ effective setting instead of re-reading the process environment.
 
 Severity: Medium
 
+Status: **CLEARED** `cf5a0e5d` — `decode_pv_field_cached` threads the connection-scope `TypeCache` through nested Variant decode; regression `pva_r3_nested_variant_uses_typecache`.
+
 Rust:
 
 - `src/pvdata/encode.rs:665-725` can decode top-level `0xFD`/`0xFE`
@@ -115,12 +139,12 @@ Rust:
   `encode.rs:636-649`.
 - `src/pvdata/encode.rs:1662-1678` repeats the same empty-cache path for each
   `VariantArray` element.
-- `src/client_native/decode.rs:433-436` decodes an RPC response descriptor
+- `src/decode.rs:433-436` decodes an RPC response descriptor
   with the connection cache, then decodes its value without that cache.
-- `src/client_native/decode.rs:460-463` decodes GET/MONITOR values through
+- `src/decode.rs:460-463` decodes GET/MONITOR values through
   `decode_pv_field_with_bitset()`, whose Variant leaves also call the
   cache-less value decoder.
-- `src/client_native/decode.rs:503-620` flattens only the descriptor region
+- `src/decode.rs:503-620` flattens only the descriptor region
   at the start of known op-response frames; it copies the value tail
   verbatim, so Variant-embedded descriptors remain unresolved.
 
@@ -149,6 +173,8 @@ Variant value bodies or stop relying on flattening for per-op decoding.
 
 Severity: Medium
 
+Status: **CLEARED** `7dfe5de6` — `SearchEngine::spawn` keeps a persistent `ns_task` per TCP name server instead of a direct-connect fallback; regression `pva_r4_tcp_nameserver_persistent_peer`. That commit's subject reads `BR-R4`, which is why a subject search for this id finds nothing.
+
 Rust:
 
 - `src/client_native/context.rs:110-121` documents `name_servers()` as a
@@ -165,9 +191,9 @@ pvxs reference:
   setup.
 - `src/client.cpp:651-666` starts persistent TCP connections to each name
   server.
-- `src/client.cpp:1193-1213` writes SEARCH frames to every ready name-server
+- `src/client.cpp:1221-1236` writes SEARCH frames to every ready name-server
   connection.
-- `src/client.cpp:984-989` handles SEARCH_RESPONSE frames arriving on those
+- `src/client.cpp:1007-1018` handles SEARCH_RESPONSE frames arriving on those
   TCP connections through the normal search-reply path.
 
 Impact: Rust supports only the gateway-self-serve case where the configured
@@ -184,6 +210,8 @@ responses.
 ### PVA-R5: `SharedPV` does not enforce the opened value descriptor
 
 Severity: High
+
+Status: **CLEARED** `88232dea` — `SharedPV::try_post_checked` and the no-handler put-delta path both check the posted value against the opened descriptor.
 
 Rust:
 
@@ -224,6 +252,8 @@ checked method and route internal callers through it.
 
 Severity: Medium
 
+Status: **CLEARED** `c4bb773a` — `MonitorOutbox` / `MonitorInbox` give the subscriber queue squash-to-tail semantics; regression `pva_r6_squash_to_tail`.
+
 Rust:
 
 - `src/server_native/shared_pv.rs:211-229` calls `try_send()` for every
@@ -260,13 +290,15 @@ instead of `tokio::mpsc::try_send()` full errors.
 
 Severity: High
 
+Status: **CLEARED** `46cbb997` — the post-handshake reader splits `Ok(None)` / `Ok(Some)` / `Err` and closes the circuit on a frame-parse fault.
+
 Rust:
 
 - `src/client_native/server_conn.rs:320-365` appends bytes to the client
   connection buffer, peeks a header only when `PvaHeader::decode()` succeeds,
   then drains frames only inside `while let Ok(Some(...)) =
   try_parse_frame_role(...)`.
-- `src/client_native/decode.rs:68-105` returns `Err` for invalid headers and
+- `src/decode.rs:68-105` returns `Err` for invalid headers and
   direction-bit mismatches, exactly the cases the client reader comments say
   should close the connection.
 - The handshake path is stricter: `server_conn.rs:733-766` propagates
@@ -296,6 +328,8 @@ before the max-payload check so an undecodable header cannot bypass the cap.
 
 Severity: Medium
 
+Status: **CLEARED** `e4056db8` — `ADVERTISED_AUTH_METHODS` is `["anonymous", "ca"]`.
+
 Rust:
 
 - `src/server_native/tcp.rs:839-848` says pvxs advertises methods in
@@ -323,6 +357,8 @@ leaving validation acceptance unchanged.
 ### PVA-R9: Generic server responses can silently encode mismatched values
 
 Severity: High
+
+Status: **CLEARED** `88232dea` — the server GET data phase calls `value_matches_descriptor` before it encodes.
 
 Rust:
 
@@ -363,9 +399,11 @@ producer-side validator.
 
 Severity: Medium
 
+Status: **CLEARED** `ec131970` — the client rejects a SEARCH_RESPONSE whose advertised protocol is not `tcp`, and the broadcast SEARCH path gates on the requested protocol list.
+
 Rust:
 
-- `src/client_native/decode.rs:145-147` parses the SEARCH_RESPONSE protocol
+- `src/decode.rs:145-147` parses the SEARCH_RESPONSE protocol
   string, but `src/client_native/search_engine.rs:1442-1488` ignores
   `resp.protocol` and resolves only a `SocketAddr`.
 - The one-shot search helper has the same shape:
@@ -386,7 +424,7 @@ pvxs reference:
   `"tcp"` was requested.
 - `src/client.cpp:849-880` decodes the response protocol and ignores normal
   search replies unless `proto == "tcp"`.
-- `src/server.cpp:738-745` and `server.cpp:773-781` consistently advertise
+- `src/server.cpp:738-745` and `src/server.cpp:773-781` consistently advertise
   `"tcp"` in both SEARCH_RESPONSE and beacon frames.
 
 Impact: Rust can answer SEARCH requests from clients that did not ask for the
@@ -405,6 +443,8 @@ runtime protocol into beacon construction.
 
 Severity: Medium
 
+Status: **CLEARED** `cc66c95f` — `server_native::tcp::handle_tcp_search` answers SEARCH arriving on an established circuit.
+
 Rust:
 
 - `src/server_native/tcp.rs:1075-1269` dispatches TCP application commands but
@@ -414,8 +454,8 @@ pvxs reference:
 
 - `src/serverchan.cpp:173-255` implements `ServerConn::handle_SEARCH()` on an
   established TCP connection and enqueues a `CMD_SEARCH_RESPONSE`.
-- `src/client.cpp:1193-1213` sends SEARCH frames to ready TCP name-server
-  connections, and `client.cpp:984-989` handles SEARCH_RESPONSE frames from
+- `src/client.cpp:1221-1236` sends SEARCH frames to ready TCP name-server
+  connections, and `src/client.cpp:1007-1018` handles SEARCH_RESPONSE frames from
   those connections.
 
 Impact: this is the server-side half of the TCP name-server parity gap. A pvxs
@@ -430,6 +470,8 @@ semantics for reply address and port matching pvxs `serverchan.cpp`.
 ### PVA-R12: Warm GET failure drops the cleanup owner for the cached operation
 
 Severity: Medium
+
+Status: **CLEARED** `add08dd2` — a failed warm GET sends DESTROY_REQUEST and unregisters the IOID before the cold fallback runs.
 
 Rust:
 
@@ -467,6 +509,8 @@ DESTROY_REQUEST plus `unregister_ioid()` before falling back to a cold INIT.
 ### PVA-R13: Compound array elements use the wrong null/presence wire shape
 
 Severity: High
+
+Status: **CLEARED** `46cbb997` — structure, union and variant array elements carry a per-element presence byte on both encode and decode.
 
 Rust:
 
@@ -514,6 +558,8 @@ reject null elements explicitly instead of converting them to present defaults.
 
 Severity: Medium
 
+Status: **CLEARED** `601a568f` — every data-phase source call is spawned off the read loop with `OpState::data_task_abort` as its cancel owner; regression `pva_r14_source_calls_no_head_of_line_block`. That commit's subject reads `BR-R14`, which is why a subject search for this id finds nothing.
+
 Rust:
 
 - `src/server_native/tcp.rs:903-1217` reads one frame and awaits the full
@@ -558,6 +604,8 @@ future to return.
 
 Severity: Medium
 
+Status: **CLEARED** `b0f37eef` — `config::env::pvas_server_port` plus the auto-beacon and beacon-address-list fallbacks mirror the pvxs PickOne precedence.
+
 Rust:
 
 - `src/config/env.rs:157-163` reads `EPICS_PVA_SERVER_PORT` for the PVA TCP
@@ -576,7 +624,7 @@ pvxs reference:
 
 - `src/config.cpp:402-408` accepts `EPICS_PVAS_SERVER_PORT` first, then
   `EPICS_PVA_SERVER_PORT`.
-- `src/config.cpp:426-431` accepts `EPICS_PVAS_BEACON_ADDR_LIST` before
+- `src/config.cpp:426-432` accepts `EPICS_PVAS_BEACON_ADDR_LIST` before
   `EPICS_PVA_ADDR_LIST`, and `EPICS_PVAS_AUTO_BEACON_ADDR_LIST` before
   `EPICS_PVA_AUTO_ADDR_LIST`.
 - `src/config.cpp:476-479` exports both server-specific and shared PVA names
@@ -600,6 +648,8 @@ set.
 ### PVA-R16: Missing non-RPC prototypes are converted into successful Variant operations
 
 Severity: High
+
+Status: **CLEARED** `bed630f9` — a non-RPC INIT that carries no prototype no longer answers as a successful Variant operation.
 
 Rust:
 
@@ -641,6 +691,8 @@ introspection do not create successful non-RPC operations.
 
 Severity: Medium
 
+Status: **CLEARED** `b0f37eef` — FINISH releases the subscription through `MonitorTeardown::release`, which clears the handle's `active` tuple.
+
 Rust:
 
 - `src/client_native/ops_v2.rs:1194-1198` records the active
@@ -675,11 +727,13 @@ same completed operation.
 
 Severity: Medium
 
+Status: **CLEARED** `ec131970` — `proto::ip::ip_from_bytes_allow_unspec` routes an all-zero reply address through the wildcard substitution path.
+
 Rust:
 
 - `src/proto/ip.rs:24-30` treats an all-zero 16-byte PVA address as
   `None`.
-- `src/client_native/decode.rs:167-169` turns that `None` into a protocol
+- `src/decode.rs:167-169` turns that `None` into a protocol
   error while decoding SEARCH_RESPONSE.
 - `src/client_native/search_engine.rs:1454-1456` drops such SEARCH_RESPONSE
   frames after consuming them.
@@ -691,7 +745,7 @@ Rust:
 
 pvxs reference:
 
-- `src/evhelper.cpp:911-937` decodes a non-IPv4-mapped all-zero address as an
+- `src/evhelper.cpp:911-938` decodes a non-IPv4-mapped all-zero address as an
   IPv6 `SockAddr`.
 - `src/util.cpp:552-558` classifies IPv6 unspecified as `isAny()`.
 - `src/client.cpp:841-843` substitutes the UDP packet source address when a
@@ -713,6 +767,8 @@ then apply the same peer-source substitution that already exists for
 ### PVA-R19: Invalid pvRequest masks fall back to all fields
 
 Severity: High
+
+Status: **CLEARED** `bed630f9` — a pvRequest mask that selects no existing field returns `RequestMaskError::EmptyMask`, which becomes an INIT-status error.
 
 Rust:
 
@@ -749,6 +805,8 @@ status field; otherwise close/drop consistently with pvxs.
 ### PVA-R20: Server monitor pipeline parser ignores typed pvxs options
 
 Severity: Medium
+
+Status: **CLEARED** `5a690343` — the pipeline option parser accepts the typed pvxs shapes; `cc66c95f` added the unit and interop coverage.
 
 Rust:
 
@@ -788,6 +846,8 @@ the monitor INIT should return an error.
 
 Severity: High
 
+Status: **CLEARED** `bed630f9` — a duplicate INIT on a live IOID is a protocol fault rather than a state replacement.
+
 Rust:
 
 - `src/server_native/tcp.rs:2013-2024` explicitly allows an INIT for an IOID
@@ -823,6 +883,8 @@ guard to Rust-only PUT_GET and PROCESS if those commands remain implemented.
 
 Severity: High
 
+Status: **CLEARED** `e4056db8` — `parse_client_credentials` returns `PvaResult`, so an auth-payload decode fault is connection-fatal.
+
 Rust:
 
 - `src/server_native/tcp.rs:650-663` says `parse_client_credentials()` returns
@@ -840,11 +902,11 @@ Rust:
 
 pvxs reference:
 
-- `src/serverconn.cpp:204-209` always decodes both the selected method and the
+- `src/serverconn.cpp:204-208` always decodes both the selected method and the
   auth Value with `from_wire_type_value()`.
-- `src/serverconn.cpp:211-216` resets the connection when the auth Value is
+- `src/serverconn.cpp:211-214` resets the connection when the auth Value is
   truncated or invalid.
-- `src/serverconn.cpp:222-233` updates `method/account` from a successfully
+- `src/serverconn.cpp:221-234` updates `method/account` from a successfully
   decoded `ca` credential only; otherwise it falls back to anonymous.
 
 Impact: a peer can select an advertised auth method and omit or corrupt the
@@ -864,6 +926,8 @@ handshake consistently with pvxs.
 
 Severity: High
 
+Status: **CLEARED** `bed630f9` — `ServerConn::ioid_to_cmd` gates every operation reply on the command the IOID was opened with.
+
 Rust:
 
 - `src/client_native/server_conn.rs:76-88` stores IOID routes as `TwoShot`,
@@ -872,7 +936,7 @@ Rust:
 - `src/client_native/server_conn.rs:852-875` routes any application frame whose
   payload starts with a registered IOID to that sink. It does not check whether
   the frame command is the expected GET, PUT, MONITOR, or RPC command.
-- `src/client_native/decode.rs:341-353` accepts any of GET, PUT, MONITOR, or
+- `src/decode.rs:341-353` accepts any of GET, PUT, MONITOR, or
   RPC as an op response and decodes according to the incoming frame command.
 - `src/client_native/ops_v2.rs:250-278` shows the consequence for GET: the
   caller accepts `OpResponse::Init` and `OpResponse::Data` without verifying
@@ -905,6 +969,8 @@ PUT-getback phases.
 ### PVA-R24: Server data phase ignores the operation kind bound at INIT
 
 Severity: High
+
+Status: **CLEARED** `bed630f9` — a data-phase frame whose command does not match `OpState::kind` is a protocol fault.
 
 Rust:
 
@@ -942,11 +1008,13 @@ PUT_GET and PROCESS state if those operations stay enabled.
 
 Severity: Medium
 
+Status: **CLEARED** `e4056db8` — the null `Size` marker (0xFF) for the auth-method count is rejected instead of read as an empty list.
+
 Rust:
 
 - `src/proto/size.rs:44-55` returns `Ok(None)` for the `0xFF` null marker from
   the generic `decode_size()` helper.
-- `src/client_native/decode.rs:210-214` decodes the
+- `src/decode.rs:210-214` decodes the
   `CONNECTION_VALIDATION` auth-method count with that helper and maps
   `None` to `0`.
 - `src/client_native/server_conn.rs:220-232` then chooses `anonymous` whenever
@@ -976,6 +1044,8 @@ handshake decode error.
 ### PVA-R26: Stale CREATE_CHANNEL success is not destroyed after waiter timeout
 
 Severity: Medium
+
+Status: **CLEARED** `b0f37eef` — a late CREATE_CHANNEL success with no waiter goes through `maybe_destroy_stale_create_channel`.
 
 Rust:
 
@@ -1009,6 +1079,8 @@ closed/dropped waiter. On a late successful `CREATE_CHANNEL` response, send
 ### PVA-R27: `pvget_many()` re-caches failed warm GET operations
 
 Severity: Medium
+
+Status: **CLEARED** `add08dd2` — `pvget_many` restores the warm-GET cache only after a successful DATA response.
 
 Rust:
 
@@ -1048,6 +1120,8 @@ to repopulate the cache through the cold path.
 ### PVA-R28: Server silently ignores malformed management command payloads
 
 Severity: Medium
+
+Status: **CLEARED** `46cbb997` — the management-command handlers propagate a truncated payload as `PvaError::Decode`.
 
 Rust:
 
@@ -1189,7 +1263,7 @@ with reason.
   string `"true"`, typed Bool false, queueSize<2). Wire-level
   interop added via a C++ harness
   `tests/interop_pvxs_mods/cpp_helpers/r20_typed_monitor.cpp`
-  built on demand against `~/codes/pvxs/include` + libpvxs; it
+  built on demand against `$PVXS_HOME/include` + libpvxs; it
   subscribes with the typed-builder
   `Context::request().record("pipeline", true)` shape against the
   Rust server and the test asserts both event delivery and the
@@ -1249,15 +1323,21 @@ fixed:
   Rewrote the descriptor + value builders + NdAttribute struct
   to match pvxs nt.cpp:196 byte-exact.
 
-### Deferred (4 — substantial architectural changes)
+### Deferred by this round (5 — substantial architectural changes)
+
+All five were taken up afterwards on the driver punchlist
+`punchlist-2026-05-19.md`; each bullet names the commit that ended it,
+and each row's own `Status:` line above carries the same commit.
 
 - **PVA-R2** (MEDIUM) — `tcp_timeout` plumbing through
   ConnectionPool::get_or_connect + ServerConn::connect + spawned
   heartbeat task. Multi-layer signature change; out of scope for
   this fix round.
+  Ended by `479f77c0`.
 - **PVA-R3** (MEDIUM) — Nested Variant TypeCache plumbing.
   Requires `decode_pv_field` family to accept `&mut TypeCache` and
   thread through all op-response decoders + reader flattening.
+  Ended by `cf5a0e5d`.
 - **PVA-R4** (MEDIUM) — TCP name servers as persistent search
   peers (not direct-connect fallbacks). Architectural change to
   SearchEngine. The server side now answers TCP SEARCH (R11
@@ -1265,14 +1345,17 @@ fixed:
   `EPICS_PVA_NAME_SERVERS=<rust>:port` can resolve PVs against a
   Rust gateway — the missing piece is the *client*-side
   persistent name-server connection.
+  Ended by `7dfe5de6`, whose subject reads `BR-R4`.
 - **PVA-R6** (MEDIUM) — SharedPV subscriber queue with squash-to-
   tail semantics. tokio::mpsc has no sender-side "drop oldest";
   faithful fix needs custom Mutex<VecDeque>+Notify or
   tokio::sync::watch.
+  Ended by `c4bb773a`.
 - **PVA-R14** (MEDIUM) — Decouple server source calls from per-
   connection read loop. Requires operation-state-machine
   restructure so source futures don't head-of-line-block the
   socket parser.
+  Ended by `601a568f`, whose subject reads `BR-R14`.
 
 ### Coverage gaps cleared in the follow-up
 
@@ -1287,7 +1370,7 @@ fixed:
   cert signed by the CA. pvxget presents the CA-signed leaf
   via `EPICS_PVA_TLS_KEYCHAIN` and the GET round-trips.
 
-### Remaining (1 deferred — architectural)
+### Deferred by this round, second list (1 — architectural)
 
 - **TLS via name-server (mixed-mode listener)** — Batch 12 uses
   UDP search because pvxs's plaintext name-server query
@@ -1296,6 +1379,8 @@ fixed:
   either to plain handshake or `TlsAcceptor` — a substantive
   refactor of `server_native/tcp.rs:460-590`. Not blocked
   technically, just out of scope for this fix round.
+  Ended by `2d30aebc` (`run_tcp_server_on_listener` peeks the first
+  byte and dispatches; regression `pva_tls_nameserver_mixed_mode_listener`).
 
 ### Verification
 

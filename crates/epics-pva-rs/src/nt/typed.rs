@@ -306,7 +306,7 @@ pub mod __rt {
         }
     }
 
-    /// pvxs NTEnum `display` sub-struct: just `description` (`nt.cpp:129-131`).
+    /// pvxs NTEnum `display` sub-struct: just `description` (`nt.cpp:128-130`).
     fn enum_display_desc() -> FieldDesc {
         FieldDesc::Structure {
             struct_id: String::new(),

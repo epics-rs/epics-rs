@@ -1,11 +1,10 @@
 //! Names the one capability `auth::plain` needs and `cfg(unix)` cannot express.
 //!
 //! This script used to also call `epics_rtems_boot::contract::emit_link_args()`
-//! for `realtime-pva-ioc`. That binary now lives in `epics-bridge-rs`
-//! (doc/qsrv-rtems-design.md §9.7), and link arguments are emitted by the
-//! package that owns the binary, so the call moved with it. This package
-//! produces no RTEMS binary, so emitting them here would have decorated a link
-//! that never happens.
+//! for `realtime-pva-ioc`. That binary now lives in `epics-bridge-rs`, and
+//! link arguments are emitted by the package that owns the binary, so the call
+//! moved with it. This package produces no RTEMS binary, so emitting them here
+//! would have decorated a link that never happens.
 //!
 //! # The dual meaning this exists to split
 //!
@@ -90,7 +89,7 @@ const LOCAL_ACCOUNT_DB_TARGETS: &[&str] = &[
 // for this crate's own compilation:
 //
 //     exec_backend  ⟺  epics_embedded_target (target_os in {"rtems", "vxworks"})
-//                   ||  feature "rtems-exec-model"
+//                   ||  EPICS_RS_BUILD_EXEC_BACKEND=thread
 //     tokio_backend ⟺  otherwise
 //
 // Why the PVA client needs it. Every client task is started through
@@ -100,11 +99,11 @@ const LOCAL_ACCOUNT_DB_TARGETS: &[&str] = &[
 // elsewhere, because the runtime is not entered on that worker. The client's
 // UDP SEARCH transport was gated on `not(target_os = "rtems")`, which names
 // the target when the fact it needs is the *backend*; a host build with
-// `--features rtems-exec-model` compiled the UDP transport in and panicked on
-// it at `realtime-pva-ioc`'s first search (measured, `doc/calink-rtems-design.md`
-// §10.10 item 2). `tokio_backend` is the predicate that means "a reactor
-// exists", so every arm that needs one takes that predicate — the target's
-// shape, now reached by the host build that models the target.
+// `EPICS_RS_BUILD_EXEC_BACKEND=thread` compiled the UDP transport in and
+// panicked on it at `realtime-pva-ioc`'s first search (measured).
+// `tokio_backend` is the predicate that means "a reactor exists", so every arm
+// that needs one takes that predicate — the target's shape, now reached by the
+// host build that models the target.
 //
 // Neither SEARCH socket is one of those arms any longer. Both bind on both
 // backends, through `epics_base_rs::net::search_udp`'s `SearchUdpSocket` and
@@ -117,8 +116,8 @@ const LOCAL_ACCOUNT_DB_TARGETS: &[&str] = &[
 // This is a third copy of a four-line rule, so it is pinned rather than
 // trusted: a `const` assertion in `src/lib.rs` checks it against
 // `epics_base_rs::runtime::task::HAS_TOKIO_REACTOR` at compile time. A build
-// that enables `epics-base-rs/rtems-exec-model` without this crate's own
-// `rtems-exec-model` fails to compile instead of panicking at boot.
+// in which one of the two scripts missed `EPICS_RS_BUILD_EXEC_BACKEND` fails
+// to compile instead of panicking at boot.
 
 /// The `local_account_db` capability decision, as one named predicate.
 ///
@@ -147,8 +146,24 @@ fn main() {
         println!("cargo::rustc-cfg=epics_embedded_target");
     }
 
-    let host_exec_model = std::env::var_os("CARGO_FEATURE_RTEMS_EXEC_MODEL").is_some();
-    if embedded_target || host_exec_model {
+    // Build-time backend selection, from the environment rather than from a
+    // cargo feature: a feature that flips a backend is not additive, so
+    // `--all-features` turned the reactor off and no single invocation meant
+    // "everything on". `epics-libcom-rs`'s module docs carry the reasoning;
+    // `tools/rtems-exec-gate` holds every copy of this block against that
+    // crate's, so 23 derivations of one rule cannot drift apart.
+    println!("cargo::rerun-if-env-changed=EPICS_RS_BUILD_EXEC_BACKEND");
+    let requested = std::env::var_os("EPICS_RS_BUILD_EXEC_BACKEND").unwrap_or_default();
+    let host_exec_backend = match requested.to_string_lossy().as_ref() {
+        "thread" => true,
+        "" | "tokio" => false,
+        bad => panic!(
+            "EPICS_RS_BUILD_EXEC_BACKEND={bad}: the exec backend is `thread` \
+             (reactor-free std threads) or `tokio` (the host default, which an \
+             unset or empty variable also selects)"
+        ),
+    };
+    if embedded_target || host_exec_backend {
         println!("cargo::rustc-cfg=exec_backend");
     } else {
         println!("cargo::rustc-cfg=tokio_backend");

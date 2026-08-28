@@ -7,83 +7,39 @@
 //! subscription via the typed builder.
 //!
 //! The cpp helper (`cpp_helpers/r20_typed_monitor.cpp`) is built
-//! on the fly via `c++` against the resolved pvxs tree if
-//! the binary is missing. Test is SKIPped (not failed) when
-//! either the compiler or the pvxs/EPICS-base headers are absent
-//! — that way a CI host without pvxs installed isn't a hard
-//! failure but a host that *has* pvxs runs the real assertion.
+//! on the fly against the resolved pvxs tree if the binary is
+//! missing, and a build that does not produce it FAILS the test.
+//! The suite is opt-in (`--profile interop`), so a host without
+//! pvxs never reaches here; one that does reach here and cannot
+//! build the helper is a broken checkout, not a skip.
 
-// RTEMS-EXEC-MODEL-ALLOW(1): not run by the default nextest profile - this file is a module of the `interop_pvxs` binary, which `.config/nextest.toml`'s default-filter excludes.
+#![cfg(tokio_backend)]
 
-use super::interop_helpers::{pick_localhost_port, pvxs_lib_dir};
+use super::interop_helpers::{LogCapture, pvxs_lib_dir};
 
 use std::process::{Command, Stdio};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::Arc;
 use std::time::Duration;
-
-/// Shared capture buffer for tracing output emitted by the Rust
-/// server during this test. We install a process-global subscriber
-/// once that writes formatted events into this buffer; the test
-/// snapshots its length before and after the helper run so other
-/// concurrent tests in the same binary don't pollute the slice we
-/// inspect.
-fn capture_buffer() -> Arc<Mutex<Vec<u8>>> {
-    static BUF: OnceLock<Arc<Mutex<Vec<u8>>>> = OnceLock::new();
-    BUF.get_or_init(|| Arc::new(Mutex::new(Vec::new()))).clone()
-}
-
-#[derive(Clone)]
-struct CaptureWriter(Arc<Mutex<Vec<u8>>>);
-
-impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CaptureWriter {
-    type Writer = CaptureWriter;
-    fn make_writer(&'a self) -> Self::Writer {
-        self.clone()
-    }
-}
-
-impl std::io::Write for CaptureWriter {
-    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        self.0.lock().unwrap().extend_from_slice(buf);
-        Ok(buf.len())
-    }
-    fn flush(&mut self) -> std::io::Result<()> {
-        Ok(())
-    }
-}
-
-fn install_tracing_once() {
-    static INSTALLED: OnceLock<()> = OnceLock::new();
-    INSTALLED.get_or_init(|| {
-        use tracing_subscriber::{EnvFilter, fmt};
-        let writer = CaptureWriter(capture_buffer());
-        let _ = fmt()
-            .with_env_filter(
-                EnvFilter::try_new("epics_pva_rs=debug")
-                    .unwrap_or_else(|_| EnvFilter::new("debug")),
-            )
-            .with_writer(writer)
-            .with_ansi(false)
-            .with_target(true)
-            .try_init();
-    });
-}
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn interop_r20_typed_pipeline_from_pvxs_against_rust_server() {
     use epics_pva_rs::pvdata::{FieldDesc, PvField, PvStructure, ScalarType, ScalarValue};
-    use epics_pva_rs::server_native::{PvaServer, SharedPV, SharedSource};
+    use epics_pva_rs::server_native::PvaServer;
+    use epics_pva_rs::server_native::{SharedPV, SharedSource};
     use std::sync::atomic::{AtomicBool, Ordering};
 
-    let Some(helper) = super::interop_helpers::cpp_helper("r20_typed_monitor") else {
+    // The only absent-prerequisite skip on this path; everything past it
+    // is our own helper, so it panics rather than skipping.
+    if super::interop_helpers::require_cxx().is_none() {
         return;
-    };
+    }
+    let helper = super::interop_helpers::cpp_helper("r20_typed_monitor");
 
-    install_tracing_once();
-    // Snapshot the buffer length so we only inspect output emitted
-    // during this test.
-    let buf = capture_buffer();
-    let start_len = buf.lock().unwrap().len();
+    // Capture the server's debug output for the discriminating assertion
+    // below. The capture is this test's own; it starts empty and the
+    // subscriber behind it is owned by `interop_helpers`, so it no longer
+    // matters which test in this process asked for one first.
+    let log = LogCapture::start();
 
     // Spin up a Rust server hosting a counter PV and ticking the
     // value every 100 ms so the subscriber sees a stream, not a
@@ -107,9 +63,6 @@ async fn interop_r20_typed_pipeline_from_pvxs_against_rust_server() {
     source.add("R20:PV", pv.clone());
     let source_arc = Arc::new(source);
 
-    // Bind the server to a known TCP port — the helper's nameServer
-    // entry needs an exact host:port.
-    let _bind_port = pick_localhost_port();
     let server = PvaServer::isolated(source_arc).expect("server start");
     let addr = server.tcp_addr();
 
@@ -166,11 +119,10 @@ async fn interop_r20_typed_pipeline_from_pvxs_against_rust_server() {
     let output = match output {
         Ok(o) => o,
         Err(e) => {
-            eprintln!("SKIP: failed to run r20 helper: {e}");
             stop.store(true, Ordering::Relaxed);
             let _ = ticker.await;
             server.stop();
-            return;
+            panic!("failed to run r20 helper: {e}");
         }
     };
 
@@ -196,10 +148,7 @@ async fn interop_r20_typed_pipeline_from_pvxs_against_rust_server() {
     // the helper would still exit 0 — only this log assertion
     // distinguishes a fixed parser from a regressed one.
     tokio::time::sleep(Duration::from_millis(50)).await;
-    let captured = {
-        let g = buf.lock().unwrap();
-        String::from_utf8_lossy(&g[start_len..]).to_string()
-    };
+    let captured = log.text();
     assert!(
         captured.contains("MONITOR INIT pipeline negotiated"),
         "Regression: Rust server did not log \

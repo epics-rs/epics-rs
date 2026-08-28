@@ -7,12 +7,18 @@
 //!   pointed at the broadcast port we tell pvxlist to use. After
 //!   pvxlist's listen window, its stdout must contain the Rust
 //!   server's `<ip>:<port>` advertisement.
+// The tests that drive a live server are `tokio_backend`-only, so on
+// `exec_backend` the fixtures and imports they share go unreferenced while the
+// rest of this file still runs. The default build lints it in full.
+#![cfg_attr(exec_backend, allow(dead_code, unused_imports))]
 
-// RTEMS-EXEC-MODEL-ALLOW(2): not run by the default nextest profile - this file is a module of the `interop_pvxs` binary, which `.config/nextest.toml`'s default-filter excludes.
+// RTEMS-EXEC-MODEL-ALLOW(1): not run by the default nextest profile - this file is a module of the `interop_pvxs` binary, which `.config/nextest.toml`'s default-filter excludes.
 
 use super::interop_helpers::{pvxs_command, pvxs_lib_dir, require_pvxs};
 
-use epics_pva_rs::server_native::{PvaServer, PvaServerConfig, SharedSource};
+#[cfg(tokio_backend)]
+use epics_pva_rs::server_native::PvaServer;
+use epics_pva_rs::server_native::{PvaServerConfig, SharedSource};
 
 use std::process::Stdio;
 use std::sync::Arc;
@@ -26,6 +32,7 @@ fn env_key() -> &'static str {
     }
 }
 
+#[cfg(tokio_backend)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn interop_beacon_a_pvxlist_discovers_rust_server() {
     let Some(pvxlist) = require_pvxs("pvxlist") else {
@@ -202,10 +209,7 @@ async fn interop_beacon_b_rust_client_receives_pvxs_beacons() {
 
     let mut child = match cmd.spawn() {
         Ok(c) => c,
-        Err(e) => {
-            eprintln!("SKIP: failed to spawn softIocPVX: {e}");
-            return;
-        }
+        Err(e) => panic!("failed to spawn softIocPVX: {e}"),
     };
     // Wait for PVA TCP port to be live (proxies "IOC up").
     let tcp_addr: std::net::SocketAddr = format!("{local_v4}:{pva_port}").parse().unwrap();
@@ -229,19 +233,30 @@ async fn interop_beacon_b_rust_client_receives_pvxs_beacons() {
         );
     }
 
-    // Rust client configured to listen on the same broadcast port
-    // (so pvxs's beacons reach our UDP collector).
-    // SAFETY: set env before constructing the client.
-    // Tests in this file run serially because cargo nextest
-    // serialises within-binary tests by default.
-    // SAFETY (modern Rust): set_var is unsafe; we're single-threaded here.
-    unsafe {
-        std::env::set_var("EPICS_PVA_BROADCAST_PORT", beacon_port.to_string());
-        std::env::set_var("EPICS_PVA_AUTO_ADDR_LIST", "NO");
-        std::env::set_var("EPICS_PVA_ADDR_LIST", "");
-    }
+    // Rust client listening on the same broadcast port, so pvxs's beacons
+    // reach our UDP collector.
+    //
+    // This used to reach the client by mutating the process environment and
+    // justify it with two claims, both false: that nextest serialises
+    // within-binary tests (it runs each in its OWN process, which is a
+    // different thing and says nothing about `cargo test`), and that the
+    // test is single-threaded (it is `flavor = "multi_thread"`, under a
+    // libtest harness that runs tests as threads). `set_var`'s contract is
+    // that no other thread may touch the environment concurrently, and every
+    // sibling test here reads it — `PvaClient`/`PvaServer` for their EPICS_*
+    // config, `pvxs_command` for the library path. So a concurrent run was
+    // both a lost setting and a data race on `environ`.
+    //
+    // The builder takes all three directly and documents each as replacing
+    // what `new()` parsed from env, so nothing is left to share. It also pins
+    // this client to its own search engine rather than the process-wide
+    // shared one, which is the second thing a sibling could have taken from
+    // it.
     let client = epics_pva_rs::client_native::PvaClient::builder()
         .timeout(Duration::from_secs(5))
+        .broadcast_port(beacon_port)
+        .auto_addr_list(false)
+        .addr_list(Vec::new())
         .build();
     let mut rx = match client.discover().await {
         Ok(r) => r,
@@ -259,11 +274,6 @@ async fn interop_beacon_b_rust_client_receives_pvxs_beacons() {
 
     let _ = child.kill();
     let _ = child.wait();
-    unsafe {
-        std::env::remove_var("EPICS_PVA_BROADCAST_PORT");
-        std::env::remove_var("EPICS_PVA_AUTO_ADDR_LIST");
-        std::env::remove_var("EPICS_PVA_ADDR_LIST");
-    }
 
     let event = discovered
         .expect("timeout waiting for pvxs beacon")
@@ -280,7 +290,8 @@ async fn interop_beacon_b_rust_client_receives_pvxs_beacons() {
 /// interface, or None if there isn't one. Matches what the Rust
 /// client's `bind_non_loopback` UDP socket enumerates.
 fn local_non_loopback_v4() -> Option<std::net::Ipv4Addr> {
-    let interfaces = epics_base_rs::net::iface_map::IfaceMap::new();
+    let interfaces = epics_base_rs::net::iface_map::IfaceMap::new()
+        .expect("getifaddrs must succeed on the host");
     interfaces
         .up_non_loopback()
         .into_iter()

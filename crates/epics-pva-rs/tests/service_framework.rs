@@ -1,14 +1,22 @@
 //! Smoke test for `#[pva_service]` + `add_rpc_service`. Spins up
 //! an in-process server with a service that exposes two RPC
 //! methods, then drives them via `PvaClient::pvrpc`.
+// The tests that drive a live server are `tokio_backend`-only, so on
+// `exec_backend` the fixtures and imports they share go unreferenced while the
+// rest of this file still runs. The default build lints it in full.
+#![cfg_attr(exec_backend, allow(dead_code, unused_imports))]
+#![cfg(feature = "client")]
 
-// RTEMS-EXEC-MODEL-ALLOW(7): checked - these run and pass in the feature-ON suite.
+// RTEMS-EXEC-MODEL-ALLOW(1): checked - these run and pass in the exec-backend
+// suite.
 use std::sync::Arc;
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::time::Duration;
 
 use epics_pva_rs::pvdata::{FieldDesc, PvField, PvStructure, ScalarType, ScalarValue};
-use epics_pva_rs::server_native::{ChannelSource, OpError, PvaServer, SharedSource};
+#[cfg(tokio_backend)]
+use epics_pva_rs::server_native::PvaServer;
+use epics_pva_rs::server_native::{ChannelSource, OpError, SharedSource};
 use epics_pva_rs::service::{Status, pva_service};
 
 #[derive(Default)]
@@ -115,6 +123,7 @@ fn nturi_request(args: &[(&str, ScalarValue)]) -> (FieldDesc, PvField) {
     (desc, PvField::Structure(root))
 }
 
+#[cfg(tokio_backend)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn pva_service_dispatch_round_trip() {
     let source = SharedSource::new();
@@ -192,6 +201,7 @@ async fn pva_service_dispatch_round_trip() {
     assert_eq!(v2, 8); // 5 + 3
 }
 
+#[cfg(tokio_backend)]
 /// A service method that returns `Err(...)` must surface to the client
 /// as an RPC **operation error** (wire `Status::error`), NOT a success
 /// NTRPCStatus payload. Pre-fix the macro wrapped every return in
@@ -322,6 +332,7 @@ fn direct_struct_request(args: &[(&str, ScalarValue)]) -> (FieldDesc, PvField) {
     (desc, PvField::Structure(s))
 }
 
+#[cfg(tokio_backend)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn pva_service_accepts_direct_struct_request() {
     let source = SharedSource::new();
@@ -449,6 +460,7 @@ impl ChannelSource for FailAtDataSource {
     }
 }
 
+#[cfg(tokio_backend)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn bfr13_client_get_surfaces_data_phase_error() {
     let server =
@@ -520,6 +532,7 @@ impl ChannelSource for PanicSource {
     }
 }
 
+#[cfg(tokio_backend)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn sr21_panicking_get_handler_replies_error_not_hang() {
     let server =
@@ -537,6 +550,7 @@ async fn sr21_panicking_get_handler_replies_error_not_hang() {
     );
 }
 
+#[cfg(tokio_backend)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn sr21_panicking_put_handler_replies_error_not_hang() {
     let server =

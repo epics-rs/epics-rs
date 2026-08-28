@@ -19,14 +19,20 @@
 //!   hosts the same matrix; Rust client reads each PV via name-
 //!   server search. Asserts decoded values match. Proves the Rust
 //!   client wire decoder handles a BE server.
+// The tests that drive a live server are `tokio_backend`-only, so on
+// `exec_backend` the fixtures and imports they share go unreferenced while the
+// rest of this file still runs. The default build lints it in full.
+#![cfg_attr(exec_backend, allow(dead_code, unused_imports))]
 
-// RTEMS-EXEC-MODEL-ALLOW(2): not run by the default nextest profile - this file is a module of the `interop_pvxs` binary, which `.config/nextest.toml`'s default-filter excludes.
+// RTEMS-EXEC-MODEL-ALLOW(1): not run by the default nextest profile - this file is a module of the `interop_pvxs` binary, which `.config/nextest.toml`'s default-filter excludes.
 
 use super::interop_helpers::pv_builders::complex_pv_matrix;
 use super::interop_helpers::{PVXGET, pvxs_command, pvxs_lib_dir, require_pvxs};
 
 use epics_pva_rs::pvdata::ScalarValue;
-use epics_pva_rs::server_native::{PvaServer, SharedSource};
+#[cfg(tokio_backend)]
+use epics_pva_rs::server_native::PvaServer;
+use epics_pva_rs::server_native::SharedSource;
 
 use std::process::{Command, Stdio};
 use std::sync::Arc;
@@ -40,6 +46,7 @@ fn env_key() -> &'static str {
     }
 }
 
+#[cfg(tokio_backend)]
 /// Direction A: Rust server emits BE wire, pvxget (LE client) reads.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn interop_be_a_rust_server_emits_be_to_pvxget() {
@@ -146,37 +153,36 @@ async fn interop_be_a_rust_server_emits_be_to_pvxget() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn interop_be_b_rust_client_decodes_pvxs_be_server() {
-    let Some(helper) = super::interop_helpers::cpp_helper("be_reverse_server") else {
+    // The only absent-prerequisite skip on this path; everything past it
+    // is our own helper, so it panics rather than skipping.
+    if super::interop_helpers::require_cxx().is_none() {
         return;
-    };
+    }
+    let helper = super::interop_helpers::cpp_helper("be_reverse_server");
 
     let port = {
         let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         l.local_addr().unwrap().port()
     };
-    let ready = std::env::temp_dir().join(format!("be_rev_ready.{port}"));
-    let _ = std::fs::remove_file(&ready);
+    let ready = super::interop_helpers::ReadyFile::new("be_rev_ready");
 
     let mut child = match Command::new(&helper)
         .arg("--port")
         .arg(port.to_string())
         .arg("--ready")
-        .arg(&ready)
+        .arg(ready.path())
         .env(env_key(), pvxs_lib_dir())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
     {
         Ok(c) => c,
-        Err(e) => {
-            eprintln!("SKIP: failed to spawn be_reverse_server: {e}");
-            return;
-        }
+        Err(e) => panic!("failed to spawn be_reverse_server: {e}"),
     };
 
     let mut up = false;
     for _ in 0..50 {
-        if ready.exists() {
+        if ready.is_up() {
             up = true;
             break;
         }
@@ -185,10 +191,8 @@ async fn interop_be_b_rust_client_decodes_pvxs_be_server() {
     if !up {
         let _ = child.kill();
         let _ = child.wait();
-        eprintln!("SKIP: be_reverse_server did not become ready");
-        return;
+        panic!("be_reverse_server did not become ready");
     }
-    let _ = std::fs::remove_file(&ready);
 
     let addr: std::net::SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
     let client = epics_pva_rs::client_native::PvaClient::builder()

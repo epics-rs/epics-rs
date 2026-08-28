@@ -7,9 +7,9 @@
 //! Note: there is intentionally **no** per-server GUID-change suppression.
 //! pvxs treats a GUID change as a `Change` and pokes pending searches
 //! immediately, subject only to the engine's global 30-second
-//! `pokeHoldoff` and one-active-revolution guard (client.cpp:805-847,
+//! `pokeHoldoff` and one-active-revolution guard (src/client.cpp:805-847,
 //! 736-759). The only overload protection at this layer is the
-//! size cap, mirroring pvxs `beaconTrackLimit` (client.cpp:791-797).
+//! size cap, mirroring pvxs `beaconTrackLimit` (src/client.cpp:791-797).
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
@@ -31,7 +31,7 @@ const BEACON_TRACK_LIMIT: usize = 20_000;
 #[derive(Debug, Clone)]
 struct ServerEntry {
     guid: [u8; 12],
-    /// pvxs `BeaconInfo::peerVersion` (client.cpp:807): the PVA message
+    /// pvxs `BeaconInfo::peerVersion` (src/client.cpp:807): the PVA message
     /// header version of the last beacon. A change in *either* GUID or
     /// peerVersion is a `Change`.
     peer_version: u8,
@@ -39,12 +39,12 @@ struct ServerEntry {
 }
 
 /// Beacon identity key. pvxs keys `beaconTrack` by `(server, proto)`
-/// (client.cpp:780-782), so a server advertising both `tcp` and `tls` for
+/// (src/client.cpp:780-782), so a server advertising both `tcp` and `tls` for
 /// the same endpoint is two discovery identities, not one collapsed entry.
 type BeaconKey = (SocketAddr, String);
 
 /// Classification of an observed beacon, mirroring pvxs onBeacon's
-/// `New` / `Change` / `Update` decision (client.cpp:784-847). The engine
+/// `New` / `Change` / `Update` decision (src/client.cpp:784-847). The engine
 /// uses this to drive `Discovered` emission and reconnect pokes; it is the
 /// single owner of beacon-identity de-duplication (there is no separate
 /// "already announced" set).
@@ -54,9 +54,9 @@ pub enum BeaconAction {
     New,
     /// Known `(server, proto)` reported a different GUID or peerVersion —
     /// emit `Timeout` for the old identity then `Online` for the new one,
-    /// and poke (client.cpp:807-821). pvxs builds that `Timeout` from the
+    /// and poke (src/client.cpp:807-821). pvxs builds that `Timeout` from the
     /// *previous* GUID and peerVersion (`cur.guid` / `cur.peerVersion`,
-    /// client.cpp:814-819), so both are carried out for the emitter.
+    /// src/client.cpp:814-819), so both are carried out for the emitter.
     Changed {
         old_guid: [u8; 12],
         old_peer_version: u8,
@@ -84,7 +84,7 @@ impl BeaconTracker {
 
     /// Record an observed beacon and classify it. pvxs keys by
     /// `(server, proto)` and treats a change in GUID *or* peerVersion as a
-    /// `Change` (client.cpp:780-808). A GUID/version change is reported
+    /// `Change` (src/client.cpp:780-808). A GUID/version change is reported
     /// immediately — there is no per-server suppression window; pacing is
     /// the engine's global `pokeHoldoff`.
     pub fn observe(
@@ -169,10 +169,10 @@ impl BeaconTracker {
     /// caller can raise a `Discovered::Timeout` carrying the full beacon
     /// identity. The `proto` is load-bearing: pvxs keys `beaconTrack` by
     /// `(server, proto)` and emits one Timeout per pruned entry
-    /// (client.cpp:1295), so a server advertising both `tcp` and `tls` at
+    /// (src/client.cpp:1295), so a server advertising both `tcp` and `tls` at
     /// one endpoint expires as two distinguishable timeouts rather than one
     /// collapsed `(server, guid)`. Mirrors pvxs `tickBeaconClean`
-    /// (client.cpp:1254) which prunes after 2× the beacon-clean interval
+    /// (src/client.cpp:1254) which prunes after 2× the beacon-clean interval
     /// (default 360s).
     pub fn prune_stale(&self, max_age: Duration) -> Vec<(SocketAddr, String, [u8; 12], u8)> {
         let now = Instant::now();
@@ -216,7 +216,7 @@ mod tests {
         assert_eq!(t.observe(addr(), "tcp", [1u8; 12], V), BeaconAction::Update);
     }
 
-    /// pvxs keys beacon tracking by `(server, proto)` (client.cpp:780-782):
+    /// pvxs keys beacon tracking by `(server, proto)` (src/client.cpp:780-782):
     /// the same endpoint/GUID advertised on `tcp` and `tls` is two
     /// discovery identities, each a fresh `New`, not one collapsed entry.
     #[test]
@@ -233,7 +233,7 @@ mod tests {
 
     /// A GUID change (server restart) is a `Change` reporting the old GUID
     /// so the caller can emit Timeout(old)+Online(new); pvxs pokes at once
-    /// (client.cpp:805-847), with pacing left to the global pokeHoldoff.
+    /// (src/client.cpp:805-847), with pacing left to the global pokeHoldoff.
     #[test]
     fn guid_change_is_a_change() {
         let t = BeaconTracker::new();
@@ -249,7 +249,7 @@ mod tests {
     }
 
     /// pvxs classifies a peerVersion change as a `Change` even when the
-    /// GUID is unchanged (client.cpp:807): the version field participates
+    /// GUID is unchanged (src/client.cpp:807): the version field participates
     /// in identity.
     #[test]
     fn peer_version_change_is_a_change() {
@@ -276,7 +276,7 @@ mod tests {
 
     /// Stale entries — last_seen older than `max_age` — are pruned and
     /// returned so the caller can fire `Discovered::Timeout`. Mirrors
-    /// pvxs `tickBeaconClean` (client.cpp:1254).
+    /// pvxs `tickBeaconClean` (src/client.cpp:1254).
     #[test]
     fn prune_stale_returns_aged_out_entries() {
         let t = BeaconTracker::new();
@@ -300,7 +300,7 @@ mod tests {
     /// identities; stale cleanup must surface both with their proto so the
     /// caller can fire two *distinguishable* `Discovered::Timeout` events
     /// (pvxs `tickBeaconClean` erases one entry per `(server, proto)`,
-    /// client.cpp:1295). A `(server, guid)`-only return collapsed them.
+    /// src/client.cpp:1295). A `(server, guid)`-only return collapsed them.
     #[test]
     fn prune_stale_distinguishes_protocols_on_one_endpoint() {
         let t = BeaconTracker::new();

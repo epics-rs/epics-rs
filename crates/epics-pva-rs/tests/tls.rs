@@ -10,9 +10,10 @@
 //! Compiled only with the `tls` feature (ON by default) — without it the
 //! crate links no rustls, so there is nothing here to exercise.
 
-// RTEMS-EXEC-MODEL-ALLOW(8): checked - these run and pass in the feature-ON suite.
+#![cfg(tokio_backend)]
 #![cfg(feature = "tls")]
 #![allow(clippy::manual_async_fn)]
+#![cfg(feature = "client")]
 
 use epics_pva_rs::server_native::MonitorStream;
 use std::sync::Arc;
@@ -25,7 +26,8 @@ use tokio::sync::Mutex;
 use epics_pva_rs::auth::{TlsClientConfig, TlsServerConfig};
 use epics_pva_rs::client_native::context::PvaClient;
 use epics_pva_rs::pvdata::{FieldDesc, PvField, PvStructure, ScalarType, ScalarValue};
-use epics_pva_rs::server_native::{ChannelSource, OpError, PvaServer, PvaServerConfig};
+use epics_pva_rs::server_native::PvaServer;
+use epics_pva_rs::server_native::{ChannelSource, OpError, PvaServerConfig};
 
 /// Server-side hook invoked once a peer's credentials are resolved.
 type AuthCompleteHook = Arc<
@@ -231,10 +233,10 @@ async fn tls_client_to_tls_server_full_handshake() {
 /// distinct from the plaintext `tcp_port`, and a client addressed
 /// straight at that port must complete a TLS handshake + GET. pvxs binds
 /// a separate per-interface TLS socket on `effective.tls_port`
-/// (server.cpp:595-608) and advertises it for protoTLS SEARCH
-/// (server.cpp:849-852). Pre-fix the Rust server had no `tls_port` at
-/// all — EPICS_PVAS_TLS_PORT was ignored and TLS was reachable only on
-/// the plaintext port.
+/// (src/server.cpp:580-594, `tls` `b3a10bf0`) and advertises it for protoTLS
+/// SEARCH (src/server.cpp:835-844). Pre-fix the Rust server had no
+/// `tls_port` at all — EPICS_PVAS_TLS_PORT was ignored and TLS was
+/// reachable only on the plaintext port.
 #[tokio::test]
 async fn tls_server_binds_dedicated_tls_port_distinct_from_plaintext() {
     let _ = rustls::crypto::ring::default_provider().install_default();
@@ -309,7 +311,7 @@ async fn tls_server_binds_dedicated_tls_port_distinct_from_plaintext() {
 /// With `disable_plaintext` set the server must REFUSE a plaintext peer
 /// (anti-downgrade) while still serving a TLS client. pvxs carries
 /// `tls_disable_plaintext` in the shared config and refuses the downgrade
-/// client-side (it drops a plaintext SEARCH reply, client.cpp:944); the
+/// client-side (it drops a plaintext SEARCH reply, src/client.cpp:944); the
 /// Rust server unifies TLS + plaintext on each listener via the
 /// first-byte peek, so the server-side guarantee is to drop the non-TLS
 /// peer at accept time. Pre-fix the option was never parsed and a plain

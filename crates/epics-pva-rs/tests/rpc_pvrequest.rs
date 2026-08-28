@@ -13,15 +13,17 @@
 //! the INIT was answered with `Status::Error "invalid pvRequest mask: …"` —
 //! the RPC never ran.
 
-// RTEMS-EXEC-MODEL-ALLOW(2): checked - these run and pass in the feature-ON suite.
+#![cfg(tokio_backend)]
 #![cfg(test)]
+#![cfg(feature = "client")]
 
 use std::sync::Arc;
 use std::time::Duration;
 
 use epics_pva_rs::pv_request::PvRequestBuilder;
 use epics_pva_rs::pvdata::{FieldDesc, PvField, PvStructure, ScalarType, ScalarValue};
-use epics_pva_rs::server_native::{PvaServer, SharedPV, SharedSource};
+use epics_pva_rs::server_native::PvaServer;
+use epics_pva_rs::server_native::{SharedPV, SharedSource};
 
 /// An RPC echo PV: replies with `{ value: <the argument's `value` string> }`.
 fn echo_server() -> (PvaServer, epics_pva_rs::client_native::context::PvaClient) {

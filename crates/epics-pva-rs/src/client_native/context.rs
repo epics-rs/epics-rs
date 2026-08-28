@@ -15,7 +15,8 @@
 //! Public API stays compatible with the previous shape so existing callers
 //! (pvget-rs, pvput-rs, pvmonitor-rs, pvinfo-rs) keep working.
 
-// (1 search-timeout test gated out feature-ON below; §4.2 UDP search, stage 3.)
+// (1 search-timeout test gated out on the exec backend below; §4.2 UDP search,
+// stage 3.)
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
@@ -394,7 +395,7 @@ struct ClientInner {
     /// Client TCP idle timeout threaded through to every `ServerConn`
     /// spawned via this client's `ConnectionPool`. Governs the heartbeat
     /// task's inactivity threshold. pvxs `Config::tcpTimeout`
-    /// (clientconn.cpp:73-74).
+    /// (clientconn.cpp:71-72).
     tcp_timeout: Duration,
     /// True when `build()` was told to share the process-wide search
     /// engine. Routes [`PvaClient::search_engine`] through the static
@@ -424,7 +425,7 @@ static SHARED_SEARCH_ENGINE: tokio::sync::OnceCell<SearchEngine> =
 
 /// Interval between automatic channel-cache sweeps. pvxs enables a
 /// per-`ContextImpl` `cacheCleaner` timer at `channelCacheCleanInterval{10,0}`
-/// (client.cpp:57, 666) that runs `cacheClean("", Context::Clean)` over the
+/// (src/client.cpp:57, 666) that runs `cacheClean("", Context::Clean)` over the
 /// whole channel map so a long-lived client probing many PV names does not
 /// retain every idle channel until the context is closed.
 const CHANNEL_CACHE_CLEAN_INTERVAL: Duration = Duration::from_secs(10);
@@ -432,10 +433,10 @@ const CHANNEL_CACHE_CLEAN_INTERVAL: Duration = Duration::from_secs(10);
 /// Apply a [`CacheAction`] to the channel map, returning the channels that were
 /// removed so the caller can close `Disconnect`ed ones after releasing the map
 /// lock. An empty `pv_name` is the pvxs wildcard over every cached name
-/// (client.cpp:1341-1348). `Clean` keeps channels that still have a live
+/// (src/client.cpp:1341-1348). `Clean` keeps channels that still have a live
 /// external reference (`Arc::strong_count > 1`, the analog of pvxs
 /// `use_count > 1`); `Drop`/`Disconnect` remove unconditionally
-/// (client.cpp:1350-1366).
+/// (src/client.cpp:1350-1366).
 fn apply_cache_action(
     chans: &mut HashMap<String, Arc<Channel>>,
     pv_name: &str,
@@ -471,22 +472,22 @@ fn apply_cache_action(
 pub enum CacheAction {
     /// Remove only channels that are no longer in use (no live external
     /// `Arc<Channel>` beyond the cache's own, i.e. `use_count <= 1`), leaving
-    /// in-use channels connected and reusable. pvxs default (client.cpp:1350-1357).
+    /// in-use channels connected and reusable. pvxs default (src/client.cpp:1350-1357).
     #[default]
     Clean,
     /// Remove channels unconditionally so they will not be reused, but leave
     /// any in-progress operations running on the detached channel
-    /// (client.cpp:1358-1366).
+    /// (src/client.cpp:1358-1366).
     Drop,
     /// Like [`CacheAction::Drop`], and additionally close each removed channel
     /// so its operation waiters, connect watchers, and monitor loops observe a
     /// disconnect transition — the analog of pvxs `trash->disconnect(trash)`
-    /// (client.cpp:1367-1369).
+    /// (src/client.cpp:1367-1369).
     Disconnect,
 }
 
 /// Background channel-cache GC. Mirrors the pvxs `cacheCleaner` timer callback
-/// `cacheClean("", Context::Clean)` (client.cpp:666, 1339-1382): every `period`
+/// `cacheClean("", Context::Clean)` (src/client.cpp:666, 1339-1383): every `period`
 /// it removes cached channels whose only owner is the cache itself
 /// (`Arc::strong_count == 1`, the analog of pvxs `use_count <= 1`), leaving
 /// in-use channels connected and reusable.
@@ -495,7 +496,7 @@ pub enum CacheAction {
 /// context alive. It exits when the last [`PvaClient`] clone is dropped
 /// (`upgrade()` fails) or after [`PvaClient::close`] sets the `ConnectionPool`
 /// shutdown gate. Unlike pvxs, which removes the timer synchronously in
-/// `ContextImpl::close` (client.cpp:693-725), the Rust task exits on its next
+/// `ContextImpl::close` (src/client.cpp:693-725), the Rust task exits on its next
 /// tick — the same idle-until-observed divergence already documented for the
 /// search-engine timer in [`PvaClient::close`]; it does no work in the interim
 /// (the shutdown gate short-circuits the sweep and `close()` already drained
@@ -516,7 +517,7 @@ async fn cache_clean_loop(inner: std::sync::Weak<ClientInner>, period: Duration)
     // nothing a later one would have — so the distinction is immaterial here.
     let mut tick = epics_base_rs::runtime::task::interval(period);
     // pvxs arms the timer with `event_add(cacheCleaner, &channelCacheCleanInterval)`
-    // (client.cpp:666), i.e. the first sweep fires after one interval, not at
+    // (src/client.cpp:666), i.e. the first sweep fires after one interval, not at
     // startup. Consume the immediate first tick so the first real sweep is one
     // `period` away.
     tick.tick().await;
@@ -530,7 +531,7 @@ async fn cache_clean_loop(inner: std::sync::Weak<ClientInner>, period: Duration)
         }
         // Clean removes only channels whose sole reference is the map's own
         // Arc; the returned channels are dropped here. Clean never closes
-        // in-use channels (client.cpp:1350-1357), so there is nothing to
+        // in-use channels (src/client.cpp:1350-1357), so there is nothing to
         // close after releasing the lock.
         let _removed = {
             let mut chans = inner.channels.write();
@@ -644,9 +645,18 @@ impl PvaClient {
     }
 
     async fn search_engine(&self) -> PvaResult<&SearchEngine> {
+        // The second owner-creation point on the client path, and for the same
+        // reason as `channel_with_forced`: the engine's ring, its UDP receive
+        // loop and its name-server connections are reactor-bound tasks that
+        // outlive this call, and the builder that produced the client is a
+        // plain `fn` with no executor to take the capability from.
+        let reactor = epics_base_rs::runtime::task::Reactor::current()
+            .expect("the search engine is built on the client's executor");
         if self.uses_shared_search_engine() {
             let engine = SHARED_SEARCH_ENGINE
-                .get_or_try_init(|| async { SearchEngine::spawn(Vec::new(), Vec::new()).await })
+                .get_or_try_init(|| async {
+                    SearchEngine::spawn(&reactor, Vec::new(), Vec::new()).await
+                })
                 .await?;
             return Ok(engine);
         }
@@ -658,6 +668,7 @@ impl PvaClient {
             // drive the SEARCH path instead of the process environment. The
             // shared engine above never has either, so it needs neither.
             let engine = SearchEngine::spawn_with_config(
+                &reactor,
                 self.inner.search_config.clone(),
                 Vec::new(),
                 self.inner.name_servers.clone(),
@@ -688,7 +699,7 @@ impl PvaClient {
         }
         // Closed-context gate. pvxs `Channel::build()` refuses to
         // construct a channel once the context has left `Running`,
-        // throwing "Context close()d" (client.cpp:349-352). `close()`
+        // throwing "Context close()d" (src/client.cpp:349-352). `close()`
         // sets the single owner of that state — the per-client
         // `ConnectionPool` shutdown flag (via `pool.clear()`); every
         // channel factory routes through here, so this one gate makes
@@ -697,6 +708,12 @@ impl PvaClient {
         if self.inner.pool.is_shutdown() {
             return Err(PvaError::Protocol("context closed".into()));
         }
+        // The one mint on the client path. `PvaClientBuilder::build` is a
+        // plain `fn` that may run before any executor exists, so the client
+        // cannot hold the capability; every channel is built from here,
+        // inside `async`, and carries it from then on.
+        let reactor = epics_base_rs::runtime::task::Reactor::current()
+            .expect("channel construction is awaited on the client's executor");
         // Forced-server channels skip the cache entirely — pinning is a
         // per-call request, not a global property of the PV name.
         if forced.is_none() {
@@ -712,6 +729,7 @@ impl PvaClient {
             // both PvaClient-wide `server_addr` and per-channel
             // `forced_server` overrides (pvxs ConnectBuilder::server).
             Arc::new(Channel::new_direct(
+                reactor.clone(),
                 pv_name.to_string(),
                 self.inner.user.clone(),
                 self.inner.host.clone(),
@@ -723,6 +741,7 @@ impl PvaClient {
         } else {
             let search = self.search_engine().await?.clone();
             Arc::new(Channel::new(
+                reactor.clone(),
                 pv_name.to_string(),
                 self.inner.user.clone(),
                 self.inner.host.clone(),
@@ -739,11 +758,11 @@ impl PvaClient {
 
         // First channel about to enter the cache: arm the periodic cache
         // cleaner (pvxs starts `cacheCleaner` at context construction,
-        // client.cpp:666). Deferred to here so the cleaner holds a
+        // src/client.cpp:666). Deferred to here so the cleaner holds a
         // `Weak<ClientInner>` and is spawned inside the Tokio runtime that
         // every channel op already runs in; `Once` guarantees a single task.
         self.inner.cache_cleaner.call_once(|| {
-            epics_base_rs::runtime::task::spawn(cache_clean_loop(
+            reactor.spawn(cache_clean_loop(
                 Arc::downgrade(&self.inner),
                 CHANNEL_CACHE_CLEAN_INTERVAL,
             ));
@@ -759,7 +778,7 @@ impl PvaClient {
 
     /// Resolve `pv_name` against a specific server, bypassing UDP
     /// search and any cached search results. Mirrors pvxs
-    /// `ConnectBuilder::server` (client.cpp:208) — the returned future
+    /// `ConnectBuilder::server` (src/client.cpp:208) — the returned future
     /// performs a one-shot operation against the pinned server. Useful
     /// when a gateway or testing harness wants to direct an op to a
     /// known endpoint without affecting the cache for that PV name.
@@ -839,7 +858,7 @@ impl PvaClient {
     /// connection's negotiated byte order and sent at GET INIT.
     ///
     /// pva2pva forwards the exact downstream pvRequest into
-    /// `createChannelGet(..., pvRequest)` (`p2pApp/channel.cpp:109-114`), so
+    /// `createChannelGet(..., pvRequest)` (`p2pApp/channel.cpp:109-115`), so
     /// upstream providers that interpret GET pvRequest options (e.g. pvxs
     /// QSRV group GET reading `record._options.atomic` from
     /// `getOperation->pvRequest()`, `groupsource.cpp:479-481`) see the
@@ -973,25 +992,27 @@ impl PvaClient {
     /// keep the op alive past the handle's local scope.
     pub fn start_get(
         &self,
+        reactor: &epics_base_rs::runtime::task::Reactor,
         pv_name: &str,
     ) -> crate::client_native::operation::PvaOperation<PvField> {
         let client = self.clone();
         let name = pv_name.to_string();
-        crate::client_native::operation::PvaOperation::spawn(
-            async move { client.pvget(&name).await },
-        )
+        crate::client_native::operation::PvaOperation::spawn(reactor, async move {
+            client.pvget(&name).await
+        })
     }
 
     /// Start a PUT and return a [`PvaOperation`](crate::client_native::PvaOperation) handle.
     pub fn start_put(
         &self,
+        reactor: &epics_base_rs::runtime::task::Reactor,
         pv_name: &str,
         value_str: &str,
     ) -> crate::client_native::operation::PvaOperation<()> {
         let client = self.clone();
         let name = pv_name.to_string();
         let val = value_str.to_string();
-        crate::client_native::operation::PvaOperation::spawn(async move {
+        crate::client_native::operation::PvaOperation::spawn(reactor, async move {
             client.pvput(&name, &val).await
         })
     }
@@ -999,13 +1020,14 @@ impl PvaClient {
     /// Start an RPC and return a [`PvaOperation`](crate::client_native::PvaOperation) handle.
     pub fn start_rpc(
         &self,
+        reactor: &epics_base_rs::runtime::task::Reactor,
         pv_name: &str,
         request_desc: FieldDesc,
         request_value: PvField,
     ) -> crate::client_native::operation::PvaOperation<RpcReply> {
         let client = self.clone();
         let name = pv_name.to_string();
-        crate::client_native::operation::PvaOperation::spawn(async move {
+        crate::client_native::operation::PvaOperation::spawn(reactor, async move {
             client.pvrpc(&name, &request_desc, &request_value).await
         })
     }
@@ -1070,7 +1092,7 @@ impl PvaClient {
 
     /// Force the search engine into fast-tick mode for one revolution
     /// and reset every pending search's retry deadline. Mirrors pvxs
-    /// `Context::hurryUp` (client.cpp:430). Useful when the application
+    /// `Context::hurryUp` (src/client.cpp:430). Useful when the application
     /// has out-of-band evidence that the network state changed (link
     /// bounce, new IOC announced via side channel) and wants pending
     /// searches to retry immediately rather than wait for their
@@ -1086,7 +1108,7 @@ impl PvaClient {
     /// Drop cached state for `pv_name` using the default pvxs `Clean` action:
     /// only channels with no live external reference are removed, in-use
     /// channels are preserved, and the matching pending search (if any) is
-    /// cancelled. Mirrors pvxs `Context::cacheClear` (client.cpp:441-451),
+    /// cancelled. Mirrors pvxs `Context::cacheClear` (src/client.cpp:441-451),
     /// whose default `cacheAction` is `Clean`.
     ///
     /// Pass an empty `pv_name` to sweep every cached name (the pvxs wildcard).
@@ -1099,10 +1121,10 @@ impl PvaClient {
     ///
     /// `pv_name` empty is a wildcard over the whole channel map and pending
     /// search map (pvxs `cacheClean` skips the name filter when `name.empty()`,
-    /// client.cpp:1341-1348). The channel-map effect is governed by `action`:
+    /// src/client.cpp:1341-1348). The channel-map effect is governed by `action`:
     /// `Clean` keeps in-use channels, `Drop` removes unconditionally, and
     /// `Disconnect` additionally closes each removed channel so in-progress
-    /// operations observe the disconnect (client.cpp:1350-1369). The pending
+    /// operations observe the disconnect (src/client.cpp:1350-1369). The pending
     /// search for the name(s) is always cancelled regardless of `action`.
     pub async fn cache_clear_action(&self, pv_name: &str, action: CacheAction) {
         // Collect the channels to remove under the map lock, then release it
@@ -1140,7 +1162,7 @@ impl PvaClient {
     /// GUID are silently dropped; BEACONs from that server are still
     /// reported through `discover()` and still drive reconnect pokes.
     /// Mirrors pvxs `Context::ignoreServerGUIDs` — "Ignore any search
-    /// replies with these GUIDs" (client.h:593-595, client.cpp:880).
+    /// replies with these GUIDs" (client.h:593-595, src/client.cpp:880).
     /// Pass an empty `Vec` to clear the list.
     pub async fn ignore_server_guids(&self, guids: Vec<[u8; 12]>) {
         if let Ok(engine) = self.search_engine().await {
@@ -1172,7 +1194,7 @@ impl PvaClient {
     /// `pvget` / `pvput` / `monitor` / `connect` fails with
     /// `Protocol("context closed")` and no new socket is opened, matching
     /// pvxs `Channel::build()`'s refusal once the context has left
-    /// `Running` (client.cpp:349-352). `close()` is the single owner of
+    /// `Running` (src/client.cpp:349-352). `close()` is the single owner of
     /// that Stopped state: it sets the `ConnectionPool` shutdown flag
     /// (via `clear()`), which is enforced at both the channel-factory
     /// boundary (`channel_with_forced`) and the dial boundary
@@ -1183,12 +1205,12 @@ impl PvaClient {
     /// new search from being started, so it has no in-flight work, but
     /// it is not torn down here because the per-client engine lives in a
     /// shared `OnceLock` that a `&self` method cannot drain. pvxs removes
-    /// its search/beacon timers in `ContextImpl::close` (client.cpp:693-725);
+    /// its search/beacon timers in `ContextImpl::close` (src/client.cpp:693-725);
     /// the Rust idle-until-drop timer is a deliberate divergence.
     ///
-    /// Mirrors pvxs `Context::close` (client.cpp:422). Idempotent.
+    /// Mirrors pvxs `Context::close` (src/client.cpp:422). Idempotent.
     pub fn close(&self) {
-        // pvxs `ContextImpl::close` (client.cpp:693-718) is the single
+        // pvxs `ContextImpl::close` (src/client.cpp:693-718) is the single
         // owner of terminal teardown: it moves out the channel and
         // connection maps and runs `Connection::cleanup()` on each
         // connection, which resets the socket and disconnects every channel
@@ -1433,7 +1455,7 @@ impl PvaClient {
     /// PUT that writes no field — an empty changed bitset under
     /// `request`'s `record._options`. The interoperable form of "make the
     /// remote record process": pvxs implements no CMD_PROCESS handler
-    /// (`src/conn.cpp:249-275` drains the frame at `default:`), and its own
+    /// (`src/conn.cpp:249-276` drains the frame at `default:`), and its own
     /// pvalink forward link is exactly this PUT
     /// (`ioc/pvalink_lset.cpp:691` -> `ioc/pvalink_channel.cpp:225-263`).
     /// Prefer it over [`Self::pvprocess`] wherever the peer may be a pvxs
@@ -1459,7 +1481,7 @@ impl PvaClient {
     /// the record-options of `pvput_with_request` with the field-targeting
     /// of `pvput_field`. `field_path` must be non-empty.
     ///
-    /// pvxs `pvalink_channel.cpp:31-38 + 138` parity: INIT carries
+    /// pvxs `pvxs/ioc/pvalink_channel.cpp:31-38 + 138` parity: INIT carries
     /// `field() record[process=..,block=..]`, DATA targets `field_path`.
     pub async fn pvput_field_with_request(
         &self,
@@ -1536,7 +1558,7 @@ impl PvaClient {
     ///
     /// Used by pvalink OUT links that coalesce sibling fields into one
     /// shared PUT carrying typed staged values — pvxs `linkBuildPut`
-    /// (`pvalink_channel.cpp:127-159`) parity for the combined path.
+    /// (`pvxs/ioc/pvalink_channel.cpp:127-184`) parity for the combined path.
     pub async fn pvput_fields_typed(
         &self,
         pv_name: &str,
@@ -1573,7 +1595,7 @@ impl PvaClient {
     /// `pvput_pv_field` but INIT carries the caller's record options
     /// (`process`, `block`). DATA still targets `"value"`.
     ///
-    /// pvxs `pvalink_channel.cpp:268` parity for typed OUT arrays.
+    /// pvxs `pvxs/ioc/pvalink_channel.cpp:268` parity for typed OUT arrays.
     pub async fn pvput_pv_field_with_request(
         &self,
         pv_name: &str,
@@ -1629,7 +1651,7 @@ impl PvaClient {
     /// non-empty.
     ///
     /// Used by pvalink OUT links carrying `field=<subfield>` together
-    /// with a typed array/scalar value. pvxs `pvalink_channel.cpp:127`
+    /// with a typed array/scalar value. pvxs `pvxs/ioc/pvalink_channel.cpp:127`
     /// (`linkBuildPut`) parity for typed PUTs into the link's
     /// `fieldName` target.
     pub async fn pvput_pv_field_field_with_request(
@@ -1725,7 +1747,7 @@ impl PvaClient {
     /// _filter` chain the client requested. The request value is
     /// re-encoded in the upstream connection's byte order on every
     /// (re)connect (so a reconnect to an opposite-endian peer stays
-    /// correct). pvxs `p2pApp/channel.cpp:157-193` forwards the
+    /// correct). pva2pva `p2pApp/channel.cpp:157-193` forwards the
     /// serialized downstream pvRequest; `moncache.cpp:34-37` caches one
     /// upstream monitor per distinct request.
     pub async fn pvmonitor_raw_frames_handle_with_request<F, C>(
@@ -1955,8 +1977,8 @@ impl PvaClient {
     ) -> PvaResult<RpcReply> {
         let ch = self.channel(pv_name).await?;
         // The RPC INIT pvRequest and the RPC DATA argument are distinct
-        // wire values: pvxs `clientget.cpp:348-352` serializes the
-        // operation pvRequest at INIT and `:302-310` the argument at
+        // wire values: pvxs `clientget.cpp:350-352` serializes the
+        // operation pvRequest at INIT and `:325-329` the argument at
         // EXEC. Send the default empty pvRequest at INIT and carry
         // `(request_desc, request_value)` as the DATA argument; do NOT
         // also send the argument as the INIT pvRequest, which would make
@@ -1980,9 +2002,9 @@ impl PvaClient {
     /// pvRequest, kept distinct from the RPC DATA argument. A PVA-to-PVA
     /// gateway uses this to forward the downstream
     /// `createChannelRPC(..., pvRequest)` create-time request upstream
-    /// (pva2pva `channel.cpp:140-148`) while carrying the downstream
-    /// argument as the DATA value. pvxs `clientget.cpp:348-352` serializes
-    /// the pvRequest at INIT and `:302-310` the argument at EXEC.
+    /// (pva2pva `channel.cpp:140-149`) while carrying the downstream
+    /// argument as the DATA value. pvxs `clientget.cpp:350-352` serializes
+    /// the pvRequest at INIT and `:325-329` the argument at EXEC.
     pub async fn pvrpc_with_request(
         &self,
         pv_name: &str,
@@ -2099,7 +2121,7 @@ impl PvaClient {
     /// INIT; the value targets the `value` bit as in
     /// [`Self::pvput_pv_field_with_request_value`].
     ///
-    /// pvxs `p2pApp/channel.cpp:129-137` (`GWChannel::createChannelPutGet`)
+    /// pva2pva `p2pApp/channel.cpp:129-138` (`GWChannel::createChannelPutGet`)
     /// forwards the original pvRequest verbatim and returns the upstream
     /// readback.
     pub async fn pvput_get_pv_field_with_request_value(
@@ -2243,7 +2265,7 @@ impl PvaClient {
     /// A PVA-to-PVA gateway uses this to forward the downstream PROCESS
     /// create-time pvRequest — preserved into `ChannelContext.pv_request`
     /// — upstream, matching pva2pva `createChannelProcess(..., pvRequest)`
-    /// (channel.cpp:98-106).
+    /// (channel.cpp:98-107).
     pub async fn pvprocess_with_request_value(
         &self,
         pv_name: &str,
@@ -2398,13 +2420,13 @@ impl PvaClient {
     /// Snapshot of the client's current state — channel cache size,
     /// connection-pool peers, name-server count, and per-connection /
     /// per-channel byte counters. Mirrors pvxs `Context::report`
-    /// (client.h:597-599 / client.cpp:464-501): each [`ConnReport`] carries
+    /// (client.h:597-599 / src/client.cpp:464-501): each [`ConnReport`] carries
     /// its [`ConnReport::channels`] list with per-channel RX/TX counters.
     ///
     /// Like pvxs `Report report(bool zero=true)`, the no-argument form
     /// **zeros** the byte counters after snapshotting, so periodic
     /// `report()` calls yield per-interval deltas rather than ever-growing
-    /// cumulative totals (client.cpp:464-500 resets `statTx`/`statRx` when
+    /// cumulative totals (src/client.cpp:464-500 resets `statTx`/`statRx` when
     /// `zero`). Use [`Self::report_zeroed`]`(false)` for a non-resetting
     /// cumulative snapshot.
     pub fn report(&self) -> ClientReport {
@@ -2770,12 +2792,19 @@ impl PvaClient {
     ) where
         F: FnMut(usize, PvaResult<PvGetResult>),
     {
-        let mut set = tokio::task::JoinSet::new();
+        // The fan-out goes through the executor seam, not `tokio::task`. Every
+        // future below is a wait on the client's own channels — the sockets
+        // belong to the connection tasks — so it is placeable on whichever
+        // executor is polling this call, and `JoinSet::spawn` would instead
+        // reach for a tokio runtime that a callback-band caller does not have.
+        let reactor = epics_base_rs::runtime::task::Reactor::current()
+            .expect("pvget_many_full_streaming is awaited on an executor");
+        let mut set = epics_base_rs::runtime::task::TaskSet::new();
         for (idx, name) in pv_names.iter().enumerate() {
             let client = self.clone();
             let name = name.to_string();
             let request = request.cloned();
-            set.spawn(async move {
+            set.spawn(&reactor, async move {
                 let r = match &request {
                     Some(req) => client.pvget_with_request_full(&name, req).await,
                     None => client.pvget_full(&name).await,
@@ -2824,7 +2853,7 @@ impl PvaClient {
     /// `on_result(idx, result)` the instant its task completes — the same
     /// start-all, report-at-completion structure as
     /// [`Self::pvget_many_full_streaming`], mirroring pvxs
-    /// `tools/info.cpp:81-112` (`exec()` every op, install a per-op
+    /// `tools/info.cpp:83-112` (`exec()` every op, install a per-op
     /// `.result()` callback, `hurryUp()`, one shared wait). A slow or
     /// missing PV does not block its siblings from being reported, and the
     /// batch is bounded by one timeout. `idx` is the PV's position in
@@ -2834,11 +2863,16 @@ impl PvaClient {
     where
         F: FnMut(usize, PvaResult<PvInfoResult>),
     {
-        let mut set = tokio::task::JoinSet::new();
+        // Same seam as `pvget_many_full_streaming`, for the same reason.
+        let reactor = epics_base_rs::runtime::task::Reactor::current()
+            .expect("pvinfo_many_full_streaming is awaited on an executor");
+        let mut set = epics_base_rs::runtime::task::TaskSet::new();
         for (idx, name) in pv_names.iter().enumerate() {
             let client = self.clone();
             let name = name.to_string();
-            set.spawn(async move { (idx, client.pvinfo_full_with_credentials(&name).await) });
+            set.spawn(&reactor, async move {
+                (idx, client.pvinfo_full_with_credentials(&name).await)
+            });
         }
         self.hurry_up().await;
         while let Some(join_result) = set.join_next().await {
@@ -2906,7 +2940,7 @@ pub struct ConnReport {
     pub alive: bool,
     /// The channels currently bound to this connection, each with its own
     /// byte counters. pvxs `Report::Connection::channels`
-    /// (client.cpp:495-496).
+    /// (src/client.cpp:495-496).
     pub channels: Vec<ChanReport>,
 }
 
@@ -2996,7 +3030,7 @@ impl<'a> ConnectBuilder<'a> {
     ///
     /// Unlike a passive watcher, this actively drives resolution:
     /// pvxs `Channel::build()` starts initial discovery immediately
-    /// (client.cpp:347-390) — a searchable channel is pushed into the
+    /// (src/client.cpp:347-390) — a searchable channel is pushed into the
     /// initial search bucket, a forced-server channel opens the
     /// connection and sends `createChannels()`. A background driver
     /// task calls `ensure_active()` to start (and, across reconnects,
@@ -3015,7 +3049,7 @@ impl<'a> ConnectBuilder<'a> {
         };
         // pvxs samples the channel state in one worker dispatch right after
         // `Channel::build()` and BEFORE the channel processes its
-        // CREATE_CHANNEL response (client.cpp:274-282): a freshly built
+        // CREATE_CHANNEL response (src/client.cpp:274-282): a freshly built
         // channel is not yet Active, so the first connector fires the
         // synthetic initial `onDisconnect`; an already-active shared channel
         // fires only `onConnect`. Take that snapshot synchronously here,
@@ -3037,7 +3071,8 @@ impl<'a> ConnectBuilder<'a> {
         // held under the cancel select, so dropping the handle stops it.
         let ch_drive = ch.clone();
         let cancel_drive = cancel.clone();
-        let driver = epics_base_rs::runtime::task::spawn(async move {
+        let exec_reactor = ch.reactor().clone();
+        let driver = exec_reactor.spawn(async move {
             loop {
                 tokio::select! {
                     biased;
@@ -3060,10 +3095,10 @@ impl<'a> ConnectBuilder<'a> {
             }
         });
 
-        let task = epics_base_rs::runtime::task::spawn(async move {
+        let task = exec_reactor.spawn(async move {
             // pvxs invokes the initial callback right after building the
             // channel: `onConnect` if already active, otherwise
-            // `onDisconnect` once (client.cpp:274-282). A fresh channel
+            // `onDisconnect` once (src/client.cpp:274-282). A fresh channel
             // is Idle, so a searchable connect fires `on_disconnect`
             // first — the previous passive watcher fired nothing for the
             // initial not-connected state. Use the snapshot captured in
@@ -3139,7 +3174,7 @@ impl<'a> ConnectBuilder<'a> {
 ///
 /// **The synchronous teardown boundary is [`ConnectHandle::wait`], never
 /// `Drop`.** pvxs `~Connect()` runs `loop.tryInvoke(syncCancel, ...)`
-/// (client.cpp:255-267) and, with the default `syncCancel(true)`, *blocks
+/// (src/client.cpp:255-267) and, with the default `syncCancel(true)`, *blocks
 /// the destructor* until the worker has removed the connector and any
 /// in-progress callback has completed — so pvxs callback code may borrow
 /// caller-owned state. Async Rust cannot block in `Drop` (no `.await`), so
@@ -3225,9 +3260,12 @@ mod tests {
 
     // ── cache_clear CacheAction policy (pvxs Clean/Drop/Disconnect) ─────────
 
+    /// Must be called from an async test body — see `channel.rs`'s
+    /// `make_channel`: the executor is part of a `Channel`, not of its caller.
     fn cache_test_channel(name: &str) -> Arc<Channel> {
         let addr: SocketAddr = "127.0.0.1:5075".parse().unwrap();
         Arc::new(Channel::new_direct(
+            crate::test_reactor(),
             name.to_string(),
             "user".into(),
             "host".into(),
@@ -3238,8 +3276,8 @@ mod tests {
         ))
     }
 
-    #[test]
-    fn cache_action_clean_keeps_in_use_removes_unused() {
+    #[epics_macros_rs::epics_test]
+    async fn cache_action_clean_keeps_in_use_removes_unused() {
         let mut chans: HashMap<String, Arc<Channel>> = HashMap::new();
         chans.insert("unused".into(), cache_test_channel("unused"));
         let in_use = cache_test_channel("in_use");
@@ -3258,8 +3296,8 @@ mod tests {
         assert_eq!(removed.len(), 1, "only the unused channel is removed");
     }
 
-    #[test]
-    fn cache_action_drop_removes_in_use_unconditionally() {
+    #[epics_macros_rs::epics_test]
+    async fn cache_action_drop_removes_in_use_unconditionally() {
         let mut chans: HashMap<String, Arc<Channel>> = HashMap::new();
         let in_use = cache_test_channel("pv");
         chans.insert("pv".into(), Arc::clone(&in_use));
@@ -3272,8 +3310,8 @@ mod tests {
         assert_eq!(removed.len(), 1);
     }
 
-    #[test]
-    fn cache_action_disconnect_removes_and_closes() {
+    #[epics_macros_rs::epics_test]
+    async fn cache_action_disconnect_removes_and_closes() {
         use crate::client_native::channel::ChannelState;
         let mut chans: HashMap<String, Arc<Channel>> = HashMap::new();
         let in_use = cache_test_channel("pv");
@@ -3293,8 +3331,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn cache_action_empty_name_is_wildcard() {
+    #[epics_macros_rs::epics_test]
+    async fn cache_action_empty_name_is_wildcard() {
         let mut chans: HashMap<String, Arc<Channel>> = HashMap::new();
         chans.insert("a".into(), cache_test_channel("a"));
         chans.insert("b".into(), cache_test_channel("b"));
@@ -3312,10 +3350,7 @@ mod tests {
         // test deterministic without depending on one sleep landing on a tick.
         let client = PvaClient::builder().build();
         let period = Duration::from_millis(25);
-        epics_base_rs::runtime::task::spawn(cache_clean_loop(
-            Arc::downgrade(&client.inner),
-            period,
-        ));
+        crate::test_reactor().spawn(cache_clean_loop(Arc::downgrade(&client.inner), period));
 
         // (a) a cached channel with no external Arc is swept within a few ticks.
         client
@@ -3369,10 +3404,8 @@ mod tests {
     async fn periodic_cache_cleaner_exits_when_client_dropped() {
         let client = PvaClient::builder().build();
         let weak = Arc::downgrade(&client.inner);
-        let handle = epics_base_rs::runtime::task::spawn(cache_clean_loop(
-            weak.clone(),
-            Duration::from_millis(25),
-        ));
+        let handle =
+            crate::test_reactor().spawn(cache_clean_loop(weak.clone(), Duration::from_millis(25)));
 
         // Dropping the only PvaClient clone releases the last strong ref; the
         // cleaner's next `Weak::upgrade` fails and the task returns.
@@ -3460,9 +3493,10 @@ mod tests {
     /// through the op-timeout owner rather than bare `ensure_active`.
     // Drives a search that never resolves and asserts the op-timeout owner
     // fires; the search engine's spawned tick `interval` now runs on the
-    // reactor-less callback pool under `rtems-exec-model` (§4.2 UDP search is
-    // deferred). Reactor-dependent — gated out feature-ON (stage 3).
-    #[cfg(not(feature = "rtems-exec-model"))]
+    // reactor-less callback pool under `exec_backend` (§4.2 UDP search is
+    // deferred). Reactor-dependent — gated out on the exec backend (stage
+    // 3).
+    #[cfg(tokio_backend)]
     #[tokio::test(flavor = "current_thread")]
     async fn pva_fr_12_one_shot_ops_fail_at_op_timeout_not_hang() {
         use std::time::Duration;
@@ -3529,7 +3563,7 @@ mod tests {
     /// must fire the pvxs initial callback for the not-yet-connected
     /// channel WITHOUT depending on a separate GET/PUT/MONITOR
     /// operation. pvxs fires `onDisconnect` right after `Channel::build`
-    /// when the channel is not yet active (client.cpp:274-282); the old
+    /// when the channel is not yet active (src/client.cpp:274-282); the old
     /// passive watcher fired nothing for the initial idle state and only
     /// produced events if some other op happened to resolve the channel.
     ///
@@ -3591,7 +3625,7 @@ mod tests {
         let reached_end = Arc::new(AtomicBool::new(false));
         let handle = ConnectHandle {
             cancel: cancel.clone(),
-            task: Some(epics_base_rs::runtime::task::spawn({
+            task: Some(crate::test_reactor().spawn({
                 let flag = reached_end.clone();
                 let c = cancel.clone();
                 async move {
@@ -3622,7 +3656,7 @@ mod tests {
         let did_complete = Arc::new(AtomicBool::new(false));
         let handle2 = ConnectHandle {
             cancel: cancel2.clone(),
-            task: Some(epics_base_rs::runtime::task::spawn({
+            task: Some(crate::test_reactor().spawn({
                 let flag = did_complete.clone();
                 async move {
                     epics_base_rs::runtime::task::sleep(Duration::from_secs(5)).await;
@@ -3661,7 +3695,7 @@ mod tests {
         let finished = Arc::new(AtomicBool::new(false));
         let handle = ConnectHandle {
             cancel: cancel.clone(),
-            task: Some(epics_base_rs::runtime::task::spawn({
+            task: Some(crate::test_reactor().spawn({
                 let g = gate.clone();
                 let s = started.clone();
                 let f = finished.clone();
@@ -3695,7 +3729,7 @@ mod tests {
         let done = Arc::new(AtomicBool::new(false));
         let handle2 = ConnectHandle {
             cancel: cancel2.clone(),
-            task: Some(epics_base_rs::runtime::task::spawn({
+            task: Some(crate::test_reactor().spawn({
                 let c = cancel2.clone();
                 let d = done.clone();
                 async move {

@@ -1,7 +1,7 @@
 //! [`ServerInfoSource`] — the built-in `__server` diagnostic source.
 //!
 //! Mirrors pvxs `ServerSource` (`serversource.cpp`). pvxs registers a
-//! single internal source at `(order = -1, "__server")` (server.cpp:542-547),
+//! single internal source at `(order = -1, "__server")` (src/server.cpp:542-547),
 //! consulted BEFORE default-order user sources since the lowest order is
 //! called first (server.h:108-118), that exposes one special PV
 //! named `server`. That PV answers RPC only — pvxs `ServerSource::onCreate`
@@ -74,7 +74,7 @@ pub const SERVER_SOURCE_NAME: &str = "__server";
 ///
 /// NOT pvxs's `"__builtin"`. That key belongs to `Server::Pvt::builtinsrc`
 /// (`serverconn.h:265`), a source the *server* owns and only
-/// `Server::addPV` writes into (`server.cpp:174-181`); an application never
+/// `Server::addPV` writes into (`src/server.cpp:174-181`); an application never
 /// hands one in. `PvaServer::start` takes the application's own
 /// source, which is pvxs's `Server::addSource(name, src, order)` shape, and
 /// that defaults to order 0 (`pvxs/server.h:116-118`) — behind both
@@ -106,8 +106,8 @@ pub const USER_SOURCE_NAME: &str = "__user";
 /// # The rule
 ///
 /// pvxs registers both of its internal sources at order **-1**
-/// (`server.cpp:542-546`) and keys the registry by `(order, name)`
-/// (`serverconn.h:268`, `server.cpp:91`), iterating it ascending at
+/// (`src/server.cpp:542-546`) and keys the registry by `(order, name)`
+/// (`serverconn.h:268`, `src/server.cpp:91`), iterating it ascending at
 /// CREATE_CHANNEL (`serverchan.cpp:304`). Application sources go in through
 /// `Server::addSource`, whose order defaults to **0**
 /// (`pvxs/server.h:116-118`) — QSRV is the worked example, `qsrvSingle` at 0

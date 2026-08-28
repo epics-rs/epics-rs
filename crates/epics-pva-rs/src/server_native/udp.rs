@@ -4,7 +4,8 @@
 //! SEARCH_RESPONSE messages naming our TCP endpoint. Beacons are emitted
 //! periodically to advertise our presence.
 
-// RTEMS-EXEC-MODEL-ALLOW(6): checked - these run and pass in the feature-ON suite.
+// RTEMS-EXEC-MODEL-ALLOW(6): checked - these run and pass in the exec-backend
+// suite.
 use std::collections::HashSet;
 use std::io::Cursor;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
@@ -12,7 +13,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use epics_base_rs::net::{
-    AsyncUdpV4, IfaceMap, bind_loopback_mcast, enable_so_rxq_ovfl_for_socket,
+    AsyncUdpV4, IfaceMap, PortUse, bind_loopback_mcast, enable_so_rxq_ovfl_for_socket,
     recv_from_with_drop_count_socket,
 };
 use tracing::{debug, warn};
@@ -112,7 +113,7 @@ pub(crate) fn bind_udp(
     beacon_dests: &[Endpoint],
 ) -> PvaResult<(AsyncUdpV4, u16)> {
     // `EPICS_PVAS_INTF_ADDR_LIST` constrains the responder to the listed
-    // interfaces (pvxs `server.cpp:407-439` binds UDP search listeners
+    // interfaces (pvxs `src/server.cpp:407-439` binds UDP search listeners
     // only on the effective interface set). Empty list = the historical
     // all-NIC default. A constrained bind also gets each listed NIC's
     // broadcast-RX socket from `bind_on_interfaces`, so subnet-directed
@@ -133,13 +134,13 @@ pub(crate) fn bind_udp(
     .map_err(PvaError::Io)?;
 
     // The bound port, read off the socket. pvxs does the same read-back
-    // (`server.cpp:426`: `effective.udp_port = addr.addr.port()`), which is
+    // (`src/server.cpp:426`: `effective.udp_port = addr.addr.port()`), which is
     // what makes `EPICS_PVAS_BROADCAST_PORT=0` usable at all.
     let port = resolve_bound_udp_port(&sock, port)?;
-    // pvxs `config.cpp:512-518` calls `addGroups(ifaces, beaconDestinations,
+    // pvxs `config.cpp:512-519` calls `addGroups(ifaces, beaconDestinations,
     // ifmap)` after resolving the server's beacon destinations, so every
     // multicast address the server beacons to also becomes a search-listener
-    // interface (`config.cpp:310-335`); `server.cpp:411-423` then starts a
+    // interface (`config.cpp:310-335`); `src/server.cpp:411-423` then starts a
     // UDP listener — joining the group — for each. The join source is the
     // server's *effective beacon destinations*, which already encode the
     // `EPICS_PVAS_BEACON_ADDR_LIST` → `EPICS_PVA_ADDR_LIST` precedence and
@@ -154,7 +155,7 @@ pub(crate) fn bind_udp(
     // multicast destination is joined on every external NIC — even NICs
     // outside the configured interface list — and `&mut sock` lets
     // `ensure_iface_socket` add those listener sockets to the bundle.
-    let external_nics: Vec<Ipv4Addr> = IfaceMap::new()
+    let external_nics: Vec<Ipv4Addr> = IfaceMap::new()?
         .up_non_loopback()
         .into_iter()
         .map(|i| i.ip)
@@ -204,10 +205,10 @@ fn resolve_bound_udp_port(sock: &AsyncUdpV4, requested: u16) -> PvaResult<u16> {
 ///
 /// * an explicit `@iface` modifier (`Endpoint::iface`) resolves to that one
 ///   interface — the group is joined on that NIC alone (pvxs pushes the
-///   endpoint as-is, `config.cpp:320-322`); an unresolvable interface spec
+///   endpoint as-is, `config.cpp:320-324`); an unresolvable interface spec
 ///   is skipped (logged), the same outcome it would have for beacon egress.
 /// * a modifier-less destination expands over every external NIC
-///   (`external_nics`, pvxs `ifmap.all_external()`, `config.cpp:324-333`),
+///   (`external_nics`, pvxs `ifmap.all_external()`, `config.cpp:324-334`),
 ///   yielding one join target per NIC.
 ///
 /// `(group, iface)` pairs are deduplicated, first-appearance order
@@ -251,7 +252,7 @@ fn multicast_join_plan(
 
 /// Join every IPv4 multicast group in the server's effective beacon
 /// destinations on the responder bundle, so SEARCH packets sent to those
-/// groups reach us (pvxs `addGroups` / `server.cpp:411-423`).
+/// groups reach us (pvxs `addGroups` / `src/server.cpp:411-423`).
 ///
 /// Each plan entry is joined on its own interface via
 /// [`AsyncUdpV4::join_multicast_v4_on`], not fanned out across every NIC:
@@ -481,7 +482,7 @@ pub async fn run_udp_responder_on_socket(
         // Burst-then-slowdown cadence: emit `beacon_burst_count`
         // beacons at `beacon_period` (default 15s × 10), then drop to
         // `beacon_period_long` (default 180s) for steady state. Mirrors
-        // pvxs `server.cpp:826-832`: after the burst every receiver in
+        // pvxs `src/server.cpp:813-819`: after the burst every receiver in
         // earshot has had multiple chances to notice the new server, so
         // 12× more steady-state beacons just burn UDP without
         // information gain. Per-emitter monotonically advancing
@@ -490,7 +491,7 @@ pub async fn run_udp_responder_on_socket(
         let mut beacon_seq: u8 = 0;
         let mut change_count: u16 = 0;
         // pvxs writes `beaconChange` (bumped on every source add/remove)
-        // directly into the beacon (server.cpp:751-767). Track the
+        // directly into the beacon (src/server.cpp:751-767). Track the
         // registry counter so a topology change advances `change_count`
         // even when the PV-set hash below is unchanged (source replaced
         // by another serving the same names, or a priority change).
@@ -561,7 +562,7 @@ pub async fn run_udp_responder_on_socket(
                 // Per-destination dispatch:
                 // - V4 multicast → `send_multicast_v4`, which applies the
                 //   endpoint TTL (`,ttl`) and selects the egress NIC by
-                //   `@iface` (pvxs `mcast_prep_sendto`, evhelper.cpp:556-577).
+                //   `@iface` (pvxs `mcast_prep_sendto`, evhelper.cpp:556-592).
                 //   No `@iface` fans out every eligible NIC, matching the old
                 //   `fanout_to` behaviour but now at the correct TTL.
                 // - V4 limited broadcast → per-NIC `fanout_to` (TTL-agnostic).
@@ -870,6 +871,7 @@ async fn dispatch_search_outputs(
 pub async fn run_udp_responder_v6(
     source: DynSource,
     udp_port: u16,
+    udp_port_use: PortUse,
     tcp_port: u16,
     guid: [u8; 12],
     protocol: &'static str,
@@ -888,9 +890,17 @@ pub async fn run_udp_responder_v6(
     if let Err(e) = sock.set_only_v6(true) {
         debug!("v6 responder: set_only_v6 failed: {e}");
     }
-    // SO_REUSEADDR so a restart picks up the same port without TIME_WAIT.
-    if let Err(e) = sock.set_reuse_address(true) {
-        debug!("v6 responder: set_reuse_address failed: {e}");
+    // SO_REUSEADDR so a restart picks up the same port without TIME_WAIT,
+    // and so a second PVA process can co-bind the well-known port. Only for a
+    // number the operator chose: `udp_port` here has already been through
+    // `bind_udp`'s read-back, so on an `EPICS_PVAS_BROADCAST_PORT=0` server it
+    // is the *kernel's* answer, and SO_REUSEADDR alone is enough on Linux for
+    // a stranger's socket to co-bind a wildcard UDP port and take a share of
+    // the datagrams. `PortUse` is what still remembers which it was.
+    if udp_port_use == PortUse::Shared {
+        if let Err(e) = sock.set_reuse_address(true) {
+            debug!("v6 responder: set_reuse_address failed: {e}");
+        }
     }
     sock.set_nonblocking(true)
         .map_err(crate::error::PvaError::Io)?;
@@ -997,7 +1007,7 @@ async fn process_v6_search_datagram(
                 // from a tcp-only server. Shared helper. Requester
                 // endpoint is the resolved reply destination.
                 let matched_cids = search_matched_cids(source, &req, protocol, reply_dest).await;
-                // pvxs `server.cpp:730-732` (also reached for v6
+                // pvxs `src/server.cpp:715-717` (also reached for v6
                 // SEARCH via the same handler): honour `MustReply`
                 // with an empty (`found=0`, `nreply=0`) response so
                 // pvlist-style discovery sees the server.
@@ -1058,7 +1068,7 @@ fn build_beacon(
     // beacons advertise the runtime transport. Pre-fix
     // Rust hard-coded "tcp" even when SEARCH_RESPONSE said "tls",
     // making discovery inconsistent across the two announcement
-    // channels. pvxs `server.cpp:738-745, 773-781` keeps both
+    // channels. pvxs `src/server.cpp:727, 765` keeps both
     // consistent.
     encode_string_into(protocol, order, &mut payload);
     payload.put_u8(0xFF); // null serverStatus marker (matches pvxs)
@@ -1461,9 +1471,9 @@ mod tests {
 
     /// Stage B's point, stated as a test: the decode half runs with **no
     /// socket at all**. No `AsyncUdpV4`, no `tokio::net::UdpSocket`, and so
-    /// no `epics_base_rs::net` — none of which exist on the RTEMS target
-    /// (`doc/pva-rtems-item7-design.md` §1), which is why the blocking
-    /// driver could not reuse this decode before the split.
+    /// no `epics_base_rs::net` — none of which exist on the RTEMS target,
+    /// which is why the blocking driver could not reuse this decode before
+    /// the split.
     ///
     /// The reply bytes must be exactly what the wire builder produces, so
     /// a driver that sends them over `std::net::UdpSocket` is byte-identical
@@ -2681,21 +2691,13 @@ mod tests {
         let sniffer_port = sniffer.local_addr().unwrap().port();
         let v6_dest = SocketAddr::V6(SocketAddrV6::new(Ipv6Addr::LOCALHOST, sniffer_port, 0, 0));
 
-        // Pick a free UDP port for the responder itself (not used by
-        // this test directly — we only care about beacon TX).
-        let pick_udp = || {
-            let l =
-                std::net::UdpSocket::bind((std::net::Ipv4Addr::LOCALHOST, 0)).expect("probe bind");
-            let p = l.local_addr().unwrap().port();
-            drop(l);
-            p
-        };
-        let udp_port = pick_udp();
-
+        // The responder's own search port is ephemeral: this test reads only
+        // the beacon it transmits, so nothing here needs the number and
+        // nothing should be handed a port it has stopped holding.
         // Short beacon period so the first burst fires quickly.
         let task = tokio::spawn(run_udp_responder_with_config(
             Arc::new(SharedSource::new()) as DynSource,
-            udp_port,
+            0,    // ephemeral search port; `bind_udp` picks and owns it
             5075, // advertised TCP port (any non-zero value)
             [0xAB; 12],
             "tcp",
@@ -2761,7 +2763,7 @@ mod tests {
         assert!(!req2.must_reply);
     }
 
-    /// pvxs `server.cpp:743-744`: when `nreply==0` the `found` byte is
+    /// pvxs `src/server.cpp:728-729`: when `nreply==0` the `found` byte is
     /// `0`, not `1`. Building a response with an empty CID slice must
     /// emit `found=0` so a MustReply discovery probe sees the correct
     /// shape and counts our server as reachable-but-no-match.

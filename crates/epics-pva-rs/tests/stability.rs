@@ -15,11 +15,15 @@
 //!   we never crash (queue squashes).
 //! - **P8 channel coalescing** — multiple concurrent pvget on the same PV
 //!   share a single channel/connection.
-
-// RTEMS-EXEC-MODEL-ALLOW(26): checked - these run and pass in the feature-ON suite.
+// The tests that drive a live server are `tokio_backend`-only, so on
+// `exec_backend` the fixtures and imports they share go unreferenced while the
+// rest of this file still runs. The default build lints it in full.
+#![cfg_attr(exec_backend, allow(dead_code, unused_imports))]
 #![allow(clippy::manual_async_fn)]
+#![cfg(feature = "client")]
 
-// (5 live client↔server monitor tests gated out feature-ON above; stage 3.)
+// (5 live client↔server monitor tests gated out on the exec backend above;
+// stage 3.)
 
 use epics_pva_rs::server_native::MonitorStream;
 use std::sync::Arc;
@@ -29,9 +33,11 @@ use tokio::sync::{Mutex, mpsc};
 
 use epics_pva_rs::client_native::context::PvaClient;
 use epics_pva_rs::pvdata::{FieldDesc, PvField, PvStructure, ScalarType, ScalarValue};
-use epics_pva_rs::server_native::{ChannelSource, OpError, PvaServer, PvaServerConfig};
+#[cfg(tokio_backend)]
+use epics_pva_rs::server_native::PvaServer;
+use epics_pva_rs::server_native::{ChannelSource, OpError, PvaServerConfig};
 // Used only by the gated live client↔server monitor tests (stage 3).
-#[cfg(not(feature = "rtems-exec-model"))]
+#[cfg(tokio_backend)]
 use epics_pva_rs::server_native::{SharedPV, SharedSource};
 
 // ── A tiny in-memory ChannelSource we can pump events into ───────────
@@ -97,8 +103,8 @@ impl MemSource {
     /// snapshot the ordered start/stop edges recorded for a
     /// PV by [`ChannelSource::notify_monitor_start`].
     // Only consumers are the gated live-monitor tests, so it carries the same
-    // predicate — otherwise dead code feature-ON (stage 3).
-    #[cfg(not(feature = "rtems-exec-model"))]
+    // predicate — otherwise dead code on the exec backend (stage 3).
+    #[cfg(tokio_backend)]
     fn monitor_starts(&self, name: &str) -> Vec<bool> {
         self.inner
             .monitor_starts
@@ -292,6 +298,7 @@ impl ChannelSource for MemSource {
 
 // ── Helpers ──────────────────────────────────────────────────────────
 
+#[cfg(tokio_backend)]
 async fn spawn_server(source: Arc<MemSource>) -> (u16, u16, tokio::task::JoinHandle<()>) {
     let cfg = PvaServerConfig {
         tcp_port: 0,
@@ -340,6 +347,7 @@ fn capped_client_for(tcp_port: u16, cap: usize) -> PvaClient {
         .build()
 }
 
+#[cfg(tokio_backend)]
 /// spawn a server that opts into a tiny inbound cap. The
 /// client's CONNECTION_VALIDATION reply exceeds `cap` bytes, so the
 /// server drops the circuit during the handshake.
@@ -369,6 +377,7 @@ async fn spawn_server_capped(
 
 // ── Tests ────────────────────────────────────────────────────────────
 
+#[cfg(tokio_backend)]
 #[tokio::test]
 async fn p2_auto_reconnect_after_server_restart() {
     let source = Arc::new(MemSource::new());
@@ -444,6 +453,7 @@ async fn p2_auto_reconnect_after_server_restart() {
     let _ = tokio::time::timeout(Duration::from_secs(2), server2.wait()).await;
 }
 
+#[cfg(tokio_backend)]
 /// the default client is **unbounded** (pvxs parity — no
 /// RX message-size cap), while a client that opts into a tiny cap drops
 /// the connection and fails every op. Same server, two clients: proves
@@ -480,6 +490,7 @@ async fn sr9_client_default_unbounded_opt_in_cap_enforced() {
     let _ = h.await;
 }
 
+#[cfg(tokio_backend)]
 /// the server side of the opt-in cap. A server that opts into
 /// a 1-byte cap drops the client during the handshake (its
 /// CONNECTION_VALIDATION reply exceeds 1 byte), so the GET fails.
@@ -502,6 +513,7 @@ async fn sr9_server_opt_in_cap_enforced() {
     let _ = h.await;
 }
 
+#[cfg(tokio_backend)]
 #[tokio::test]
 async fn p5_monitor_pipeline_does_not_drop() {
     let source = Arc::new(MemSource::new());
@@ -556,7 +568,7 @@ async fn p5_monitor_pipeline_does_not_drop() {
 /// Poll the recorded on_start edges for `name` until at least `want_len`
 /// have landed (bounded ~2 s), then return them. Avoids fixed-sleep
 /// flakiness for the "at least N edges" assertions.
-#[cfg(not(feature = "rtems-exec-model"))]
+#[cfg(tokio_backend)]
 async fn wait_starts(source: &MemSource, name: &str, want_len: usize) -> Vec<bool> {
     for _ in 0..100 {
         let s = source.monitor_starts(name);
@@ -574,9 +586,9 @@ async fn wait_starts(source: &MemSource, name: &str, want_len: usize) -> Vec<boo
 /// `on_start(true)` once; DESTROY (handle drop) fires the terminal
 /// `on_start(false)`. Mirrors pvxs `servermon.cpp:677-683` onStart edges.
 // Live client ↔ server monitor over `tokio::net`; the client's connection
-// tasks route through the reactor-less callback pool under `rtems-exec-model`.
-// Reactor-dependent — gated out feature-ON (doc/pvalink-rtems-design.md §4.2).
-#[cfg(not(feature = "rtems-exec-model"))]
+// tasks route through the reactor-less callback pool under `exec_backend`.
+// Reactor-dependent — gated out on the exec backend.
+#[cfg(tokio_backend)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn pva_fr_11_on_start_fires_across_start_pause_resume_destroy() {
     let source = Arc::new(MemSource::new());
@@ -630,9 +642,9 @@ async fn pva_fr_11_on_start_fires_across_start_pause_resume_destroy() {
 /// silent — closing the dual-fire edge the single-owner design exists
 /// to prevent.
 // Live client ↔ server monitor over `tokio::net`; the client's connection
-// tasks route through the reactor-less callback pool under `rtems-exec-model`.
-// Reactor-dependent — gated out feature-ON (doc/pvalink-rtems-design.md §4.2).
-#[cfg(not(feature = "rtems-exec-model"))]
+// tasks route through the reactor-less callback pool under `exec_backend`.
+// Reactor-dependent — gated out on the exec backend.
+#[cfg(tokio_backend)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn pva_fr_11_destroy_after_pause_does_not_double_fire() {
     let source = Arc::new(MemSource::new());
@@ -670,9 +682,9 @@ async fn pva_fr_11_destroy_after_pause_does_not_double_fire() {
 /// pre-fix floor-drop). Mirrors pvxs queue-while-Idle +
 /// drain-on-START.
 // Live client ↔ server monitor over `tokio::net`; the client's connection
-// tasks route through the reactor-less callback pool under `rtems-exec-model`.
-// Reactor-dependent — gated out feature-ON (doc/pvalink-rtems-design.md §4.2).
-#[cfg(not(feature = "rtems-exec-model"))]
+// tasks route through the reactor-less callback pool under `exec_backend`.
+// Reactor-dependent — gated out on the exec backend.
+#[cfg(tokio_backend)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn pva_fr_8_pause_holds_latest_then_resume_delivers() {
     let source = Arc::new(MemSource::new());
@@ -733,6 +745,7 @@ async fn pva_fr_8_pause_holds_latest_then_resume_delivers() {
     h.abort();
 }
 
+#[cfg(tokio_backend)]
 /// the client report lists each live server connection with
 /// its byte counters, and `report_zeroed(true)` resets them so the next
 /// report is a delta (pvxs `Context::report(bool zero)`).
@@ -780,9 +793,9 @@ async fn pva_fr_2_client_report_has_connection_byte_counters() {
 /// (clientconn.cpp:44-56). Before the CLI fix, two PVs on the same IOC
 /// opened two clients and could open two connections.
 // Live client ↔ server monitor over `tokio::net`; the client's connection
-// tasks route through the reactor-less callback pool under `rtems-exec-model`.
-// Reactor-dependent — gated out feature-ON (doc/pvalink-rtems-design.md §4.2).
-#[cfg(not(feature = "rtems-exec-model"))]
+// tasks route through the reactor-less callback pool under `exec_backend`.
+// Reactor-dependent — gated out on the exec backend.
+#[cfg(tokio_backend)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn pva_fr_166_shared_client_one_connection_for_two_monitors() {
     let source = Arc::new(MemSource::new());
@@ -823,6 +836,7 @@ async fn pva_fr_166_shared_client_one_connection_for_two_monitors() {
     h.abort();
 }
 
+#[cfg(tokio_backend)]
 /// A `pvmonitor_events` subscription opened with both masks cleared
 /// surfaces the connect lifecycle the `pvmonitor-rs` CLI now prints: a
 /// `Connected` event carrying the server peer, followed by the initial
@@ -875,6 +889,7 @@ async fn pva_fr_25_monitor_events_surface_connected_with_peer_then_data() {
     h.abort();
 }
 
+#[cfg(tokio_backend)]
 /// Regression: commit c3f286c added a server-side pipeline
 /// credit window unconditionally for every Monitor op, but pvxs only
 /// applies flow control when the client's pvRequest explicitly
@@ -932,6 +947,7 @@ async fn p5_monitor_default_pvrequest_streams_freely() {
     h.abort();
 }
 
+#[cfg(tokio_backend)]
 /// Companion to the regression above: when the client *does* opt in
 /// via `record[pipeline=true,queueSize=N]`, the server-side window
 /// must still gate emission and the ACK refill loop must keep
@@ -986,6 +1002,7 @@ async fn p5_monitor_explicit_pipeline_window_works() {
     h.abort();
 }
 
+#[cfg(tokio_backend)]
 /// pvxs `servermon.cpp:537-540` parity: a pipelined monitor whose
 /// PRESENT `queueSize` is invalid (`< 2`) must be REJECTED at INIT
 /// (`ctrl->error(...)` + `return`), not silently downgraded to a
@@ -1017,6 +1034,7 @@ async fn pipeline_invalid_queue_size_rejects_monitor_init() {
     h.abort();
 }
 
+#[cfg(tokio_backend)]
 #[tokio::test]
 async fn p8_channel_coalesces_concurrent_pvget() {
     let source = Arc::new(MemSource::new());
@@ -1044,6 +1062,7 @@ async fn p8_channel_coalesces_concurrent_pvget() {
     h.abort();
 }
 
+#[cfg(tokio_backend)]
 /// PR #205 server-side filter PVA wire-through: a client that sets
 /// `record._options._filter` in its pvRequest must see the chain
 /// applied on the server side. Decimate by 3 — only every third
@@ -1116,6 +1135,7 @@ async fn server_side_filter_pva_dec_wire_through() {
     h.abort();
 }
 
+#[cfg(tokio_backend)]
 /// Regression: a server-side TRANSFORMATION filter (`arr`)
 /// must actually change the emitted monitor value. Before the fix
 /// the PVA monitor emit loop called `FilterChain::apply` only to
@@ -1232,6 +1252,7 @@ async fn ex_r12_server_side_arr_filter_slices_monitor_value() {
     h.abort();
 }
 
+#[cfg(tokio_backend)]
 /// Regression: pipeline credit must be consumed only for
 /// monitor DATA frames actually sent to the client. A pipelined
 /// monitor (`pipeline=true,queueSize=N`) combined with a server-side
@@ -1321,6 +1342,7 @@ async fn ex_r1_pipeline_credit_not_consumed_by_filtered_events() {
     h.abort();
 }
 
+#[cfg(tokio_backend)]
 /// pvxs `serverchan.cpp:269-358` parity: a single CREATE_CHANNEL
 /// frame can carry `count` (cid, name) pairs and the server must
 /// emit one reply per pair, in arrival order. Rust used to consume
@@ -1400,6 +1422,7 @@ async fn create_channel_multi_name_emits_one_reply_per_name() {
     h.abort();
 }
 
+#[cfg(tokio_backend)]
 /// PVA-126 / pvxs `serverchan.cpp:328-351` parity: a CREATE_CHANNEL for
 /// an unclaimed (missing) PV is a *refused* channel. pvxs replies with
 /// `sid = -1` (0xFFFFFFFF) and a Fatal status "Refused to create Channel"
@@ -1486,6 +1509,7 @@ async fn create_channel_missing_pv_refused_fatal() {
     h.abort();
 }
 
+#[cfg(tokio_backend)]
 /// pvxs `servermon.cpp:691-708` parity: the MONITOR command's destroy bit
 /// (`subcmd & 0x10`) tears the op down in any non-INIT MONITOR frame, the
 /// same as the dedicated `DESTROY_REQUEST` command. Before the fix the
@@ -1674,7 +1698,9 @@ impl FrameReader {
             }
             let mut chunk = [0u8; 512];
             match sock.read(&mut chunk) {
-                Ok(0) => continue,
+                // EOF is a close, not a slow reply: looping here would burn
+                // the whole deadline and then blame the timeout.
+                Ok(0) => panic!("server closed the circuit before sending a complete frame"),
                 Ok(n) => self.buf.extend_from_slice(&chunk[..n]),
                 Err(e)
                     if e.kind() == std::io::ErrorKind::WouldBlock
@@ -1691,6 +1717,7 @@ fn read_one_frame(sock: &mut std::net::TcpStream) -> epics_pva_rs::client_native
     FrameReader::new().read(sock)
 }
 
+#[cfg(tokio_backend)]
 /// pvxs `serverconn.cpp:238-241` parity: when the client picks an
 /// auth method we never advertised (e.g. "x509" against our
 /// `["ca","anonymous"]` advertisement), the server's
@@ -1792,6 +1819,7 @@ async fn auth_method_unadvertised_returns_status_error() {
     h.abort();
 }
 
+#[cfg(tokio_backend)]
 /// Regression: when a plain-TCP client selects an auth method
 /// the server never advertised (`x509`) and includes a non-empty
 /// `user` in its auth body, the server returns `Status::Error` AND
@@ -1809,7 +1837,9 @@ async fn ex_r7_unadvertised_auth_reverts_credential_to_anonymous() {
     use epics_pva_rs::proto::encode_string_into;
     use epics_pva_rs::proto::{ByteOrder, Command, PvaHeader, Status, WriteExt};
     use epics_pva_rs::pvdata::{FieldDesc, PvField, PvStructure, ScalarType, ScalarValue};
-    use epics_pva_rs::server_native::{PvaServer, PvaServerConfig};
+    #[cfg(tokio_backend)]
+    use epics_pva_rs::server_native::PvaServer;
+    use epics_pva_rs::server_native::PvaServerConfig;
 
     // Capture what the auth_complete hook observed.
     let captured: Arc<StdMutex<Option<(String, String)>>> = Arc::new(StdMutex::new(None));
@@ -1902,6 +1932,7 @@ async fn ex_r7_unadvertised_auth_reverts_credential_to_anonymous() {
     h.abort();
 }
 
+#[cfg(tokio_backend)]
 /// Regression: pvxs clients send `method="anonymous"` (non-empty
 /// string) + a null auth body (`0xFF`). Pre-fix Rust produced
 /// `account=""` for this case because the `is_empty()` early-return
@@ -1916,7 +1947,9 @@ async fn r70_anonymous_method_yields_account_anonymous() {
     use epics_pva_rs::codec::CMD_CONNECTION_VALIDATED;
     use epics_pva_rs::proto::encode_string_into;
     use epics_pva_rs::proto::{ByteOrder, Command, PvaHeader, Status, WriteExt};
-    use epics_pva_rs::server_native::{PvaServer, PvaServerConfig};
+    #[cfg(tokio_backend)]
+    use epics_pva_rs::server_native::PvaServer;
+    use epics_pva_rs::server_native::PvaServerConfig;
 
     let captured: Arc<StdMutex<Option<(String, String)>>> = Arc::new(StdMutex::new(None));
     let captured_hook = captured.clone();
@@ -1987,6 +2020,7 @@ async fn r70_anonymous_method_yields_account_anonymous() {
     h.abort();
 }
 
+#[cfg(tokio_backend)]
 /// Regression: `method="ca"` with no `user` field in the auth body
 /// must fall back to anonymous credentials (matches pvxs
 /// serverconn.cpp:223-231 — the ca lambda only fires when user is present;
@@ -2000,7 +2034,9 @@ async fn r70_ca_without_user_falls_back_to_anonymous() {
     use epics_pva_rs::proto::encode_string_into;
     use epics_pva_rs::proto::{ByteOrder, Command, PvaHeader, Status, WriteExt};
     use epics_pva_rs::pvdata::{FieldDesc, PvField, PvStructure, ScalarType, ScalarValue};
-    use epics_pva_rs::server_native::{PvaServer, PvaServerConfig};
+    #[cfg(tokio_backend)]
+    use epics_pva_rs::server_native::PvaServer;
+    use epics_pva_rs::server_native::PvaServerConfig;
 
     let captured: Arc<StdMutex<Option<(String, String)>>> = Arc::new(StdMutex::new(None));
     let captured_hook = captured.clone();
@@ -2086,6 +2122,7 @@ async fn r70_ca_without_user_falls_back_to_anonymous() {
     h.abort();
 }
 
+#[cfg(tokio_backend)]
 /// Regression: PVA `pvget_many` warm path.
 ///
 /// `pvget_many` initializes every result slot to `Err(PvaError::Timeout)`.
@@ -2161,8 +2198,9 @@ async fn ex_r4_pvget_many_warm_path_returns_responses() {
     h.abort();
 }
 
+#[cfg(tokio_backend)]
 /// Parity: pvxs consults `ignoreAddrs` only on the UDP SEARCH admission
-/// path (`Server::Pvt::onSearch`, server.cpp:654-670); the TCP accept
+/// path (`Server::Pvt::onSearch`, src/server.cpp:654-670); the TCP accept
 /// callback registers a `ServerConn` without any ignore-list check
 /// (serverconn.cpp:461-467). The Rust server previously rejected TCP
 /// accepts from an ignore-list peer, turning a discovery filter into a
@@ -2226,9 +2264,9 @@ async fn ignore_addr_list_does_not_block_direct_tcp_connect() {
 ///
 /// Pre-fix: two `1.0` frames at START. Post-fix: exactly one.
 // Live client ↔ server monitor over `tokio::net`; the client's connection
-// tasks route through the reactor-less callback pool under `rtems-exec-model`.
-// Reactor-dependent — gated out feature-ON (doc/pvalink-rtems-design.md §4.2).
-#[cfg(not(feature = "rtems-exec-model"))]
+// tasks route through the reactor-less callback pool under `exec_backend`.
+// Reactor-dependent — gated out on the exec backend.
+#[cfg(tokio_backend)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn pva_rs_155_shared_pv_monitor_seeds_current_value_once() {
     let pv = SharedPV::new();
@@ -2416,6 +2454,7 @@ fn create_one_channel(
     sid
 }
 
+#[cfg(tokio_backend)]
 /// Boundary — op absent. A getArray data-phase frame on an IOID that was
 /// never INIT'd must draw a CMD_ARRAY "bad request id" error reply, not a
 /// silent drop.
@@ -2485,6 +2524,7 @@ async fn array_data_phase_unknown_ioid_replies_error_not_silent() {
     h.abort();
 }
 
+#[cfg(tokio_backend)]
 /// Boundary — op executing. A second sub-op arriving while the first is
 /// still in flight must draw a CMD_ARRAY "other request pending" error
 /// reply, not a silent drop.
@@ -2590,6 +2630,7 @@ async fn array_concurrent_subop_replies_error_not_silent() {
     h.abort();
 }
 
+#[cfg(tokio_backend)]
 /// R12-33 — an exhausted pipeline window must stop the REPLY, not the DRAIN.
 ///
 /// pvxs `MonitorOp::maybeReply` simply does not fire while `op->window == 0`
@@ -2777,6 +2818,7 @@ async fn r12_33_stalled_pipeline_squashes_at_the_negotiated_limit() {
     h.abort();
 }
 
+#[cfg(tokio_backend)]
 /// R12-34 adjudication lock: a MONITOR INIT whose pvRequest selects no
 /// existing field is an **op-level** error and the circuit stays up.
 ///
@@ -2900,6 +2942,65 @@ async fn r12_34_monitor_empty_mask_is_an_op_error_not_a_circuit_reset() {
     assert!(
         st.is_success(),
         "a valid MONITOR INIT on the surviving circuit must succeed, got {st:?}"
+    );
+
+    h.abort();
+}
+
+#[cfg(tokio_backend)]
+/// The multi-PV fan-out is placed by the executor seam, so it runs wherever
+/// the caller's executor runs. `tokio::task::JoinSet::spawn` reads a tokio
+/// thread-local a callback-band worker does not have, which made
+/// `pvget_many_full_streaming` / `pvinfo_many_full_streaming` a panic waiting
+/// for the first caller on a band.
+///
+/// The batch is issued from inside `Reactor::spawn` rather than from the test
+/// task, and that is the whole point: `#[tokio::test]` hands the test task the
+/// very thread-local `JoinSet` was reading, so a batch driven from the test
+/// task passes on both backends and proves nothing. Under
+/// `EPICS_RS_BUILD_EXEC_BACKEND=thread` the spawned task is a `cbMedium`
+/// worker; on the tokio backend it is the same runtime, so one body covers
+/// both.
+#[tokio::test]
+async fn multi_pv_fan_out_runs_on_whichever_executor_polls_it() {
+    let source = Arc::new(MemSource::new());
+    source.add_pv("STAB:FAN:A", 1.0).await;
+    source.add_pv("STAB:FAN:B", 2.0).await;
+    let (tcp, _udp, h) = spawn_server(source).await;
+    let client = client_for(tcp);
+
+    let reactor =
+        epics_base_rs::runtime::task::Reactor::current().expect("the test task is on an executor");
+    let batch = reactor.spawn(async move {
+        let names = ["STAB:FAN:A", "STAB:FAN:B"];
+        let mut got: Vec<Option<String>> = vec![None, None];
+        client
+            .pvget_many_full_streaming(&names, None, |idx, r| {
+                got[idx] = r.map(|g| g.pv_name).ok();
+            })
+            .await;
+        let mut described = vec![false, false];
+        client
+            .pvinfo_many_full_streaming(&names, |idx, r| {
+                described[idx] = r.is_ok();
+            })
+            .await;
+        (got, described)
+    });
+    let (got, described) = batch.await.expect("the batch task ran to completion");
+
+    assert_eq!(
+        got,
+        vec![
+            Some("STAB:FAN:A".to_string()),
+            Some("STAB:FAN:B".to_string())
+        ],
+        "both GETs must complete through the seam-placed fan-out"
+    );
+    assert_eq!(
+        described,
+        vec![true, true],
+        "both describes must complete through the seam-placed fan-out"
     );
 
     h.abort();

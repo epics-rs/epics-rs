@@ -11,13 +11,16 @@
 //!    full INIT / getArray (full + sliced + strided) / putArray /
 //!    setLength / getLength round trips.
 
-// RTEMS-EXEC-MODEL-ALLOW(2): checked - these run and pass in the feature-ON suite.
+#![cfg(tokio_backend)]
+#![cfg(feature = "client")]
+
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use epics_pva_rs::pvdata::{FieldDesc, PvField, ScalarType, ScalarValue};
+use epics_pva_rs::server_native::PvaServer;
 use epics_pva_rs::server_native::source::AccessChecked;
-use epics_pva_rs::server_native::{ChannelContext, ChannelSource, OpError, PvaServer};
+use epics_pva_rs::server_native::{ChannelContext, ChannelSource, OpError};
 
 const TIMEOUT: Duration = Duration::from_secs(5);
 

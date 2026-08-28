@@ -85,10 +85,7 @@ async fn interop_r1_pipeline_option_visible_to_pvxs_server() {
 
     let child = match cmd.spawn() {
         Ok(c) => c,
-        Err(e) => {
-            eprintln!("SKIP: failed to spawn softIocPVX: {e}");
-            return;
-        }
+        Err(e) => panic!("failed to spawn softIocPVX: {e}"),
     };
     let _ioc = DropChild { child };
     // Wait until the IOC's PVA port is listening (poll up to 5s).

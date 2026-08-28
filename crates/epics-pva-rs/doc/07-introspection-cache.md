@@ -89,7 +89,7 @@ wire order — the only order in which a `0xFD` define is guaranteed to
 precede the `0xFE` reference to its slot. Per-op tasks are scheduled in
 arbitrary order, so they must never resolve markers against shared state.
 
-`flatten_type_cache_markers` (`client_native/decode.rs`) runs once per
+`flatten_type_cache_markers` (`src/decode.rs`) runs once per
 inbound application frame in the reader task. It rewrites **both** the
 leading `FieldDesc` region (INIT introspection, PUT_GET putIF/getIF,
 GET_FIELD type, RPC data type) AND the `0xFD`/`0xFE` markers embedded

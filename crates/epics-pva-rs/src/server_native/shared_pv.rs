@@ -1263,7 +1263,7 @@ pub struct SharedSource {
     /// [`ChannelSource::beacon_change`](super::source::ChannelSource::beacon_change).
     /// pvxs treats the built-in `StaticSource` PV registry as part of the
     /// single server `beaconChange`: `Server::addPV` / `removePV` bump it
-    /// (`server.cpp:180,189`) just like `addSource` / `removeSource`. This
+    /// (`src/server.cpp:180,189`) just like `addSource` / `removeSource`. This
     /// is the Rust equivalent of those `addPV` / `removePV` bumps —
     /// incremented by [`Self::try_add`] on a real insert and by
     /// [`Self::remove`] on a real erase — so the UDP beacon task advances
@@ -1334,7 +1334,7 @@ impl SharedSource {
                 slot.insert(pv);
                 // pvxs `Server::addPV` bumps `beaconChange` only after the
                 // built-in `StaticSource::add` succeeds (it throws on a
-                // duplicate, skipping the bump — server.cpp:177-180). This
+                // duplicate, skipping the bump — src/server.cpp:177-180). This
                 // is the single insertion owner, so bumping here on the
                 // vacant arm gives the lenient `add()` wrapper the same
                 // "bump on success, not on duplicate" semantics for free.
@@ -1366,17 +1366,15 @@ impl SharedSource {
     /// dynamic IOC topologies where PVs come and go at runtime.
     pub fn remove(&self, name: &str) -> Option<SharedPV> {
         let removed = self.pvs.lock().remove(name);
-        if removed.is_some() {
-            // pvxs `Server::removePV` bumps `beaconChange` so the next
-            // BEACON signals the registry change (server.cpp:184-189).
-            // Bump only on a real erase — consistent with
-            // [`CompositeSource::remove_source`], which treats a no-op
-            // remove (absent name) as not a topology change. A real erase
-            // combined with a re-add of the same name within one beacon
-            // interval still advances `change_count` (net `+2`) even
-            // though `list_pvs()` is unchanged.
-            self.beacon_change.fetch_add(1, Ordering::Relaxed);
-        }
+        // pvxs `Server::removePV` bumps `beaconChange` unconditionally
+        // (src/server.cpp:188-189): the `StaticSource::remove` it delegates to
+        // returns without throwing when the name is absent
+        // (sharedpv.cpp:593-595), so the bump is reached on the miss path
+        // too. Same rule as [`CompositeSource::remove_source`]. A real
+        // erase combined with a re-add of the same name within one beacon
+        // interval also advances `change_count` (net `+2`) even though
+        // `list_pvs()` is unchanged.
+        self.beacon_change.fetch_add(1, Ordering::Relaxed);
         removed
     }
 
@@ -1407,7 +1405,7 @@ impl super::source::ChannelSource for SharedSource {
     /// Surface this source's PV-registry counter so the UDP beacon task
     /// advances `change_count` on an `add` / `remove` of a hosted PV —
     /// the Rust equivalent of pvxs `Server::addPV` / `removePV` bumping
-    /// the single server `beaconChange` (`server.cpp:180,189`). Without
+    /// the single server `beaconChange` (`src/server.cpp:180,189`). Without
     /// this override the trait default returns `0`, and the beacon task
     /// would fall back to the PV-name-set hash, which cannot see a
     /// remove+re-add of the same name within one beacon interval.
@@ -2781,7 +2779,7 @@ mod tests {
     /// A built-in `SharedSource`
     /// PV registry mutation must advance the beacon-change counter, the
     /// Rust analog of pvxs `Server::addPV` / `removePV` bumping
-    /// `beaconChange` (server.cpp:180,189). The boundary case the PV-name
+    /// `beaconChange` (src/server.cpp:180,189). The boundary case the PV-name
     /// hash fallback cannot detect — remove + re-add of the SAME name
     /// within one beacon interval, so `list_pvs()` is identical
     /// before/after — must still advance the counter.
@@ -2798,7 +2796,7 @@ mod tests {
         assert!(v1 > v0, "add must bump beacon_change: {v0} -> {v1}");
 
         // try_add of a DUPLICATE name → Err, must NOT bump (pvxs addPV
-        // throws before the bump, server.cpp:177-180).
+        // throws before the bump, src/server.cpp:177-180).
         assert!(src.try_add("a", SharedPV::new()).is_err());
         assert_eq!(
             src.beacon_change(),
@@ -2811,13 +2809,16 @@ mod tests {
         let v2 = src.beacon_change();
         assert!(v2 > v1, "remove must bump beacon_change: {v1} -> {v2}");
 
-        // no-op remove of an absent name → must NOT bump (consistent with
-        // CompositeSource::remove_source's no-op semantics).
+        // remove of an absent name STILL bumps: `Server::removePV`
+        // bumps unconditionally (src/server.cpp:188-189) because
+        // `StaticSource::remove` returns without throwing on a miss
+        // (sharedpv.cpp:593-595). Same rule as
+        // CompositeSource::remove_source.
         assert!(src.remove("a").is_none());
-        assert_eq!(
-            src.beacon_change(),
-            v2,
-            "no-op remove must not advance beacon_change"
+        let v2b = src.beacon_change();
+        assert!(
+            v2b > v2,
+            "remove of an absent name must still advance beacon_change: {v2} -> {v2b}"
         );
 
         // The boundary case: re-add "b", capture the PV set, then

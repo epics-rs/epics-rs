@@ -19,7 +19,6 @@
 //! primitives, prefer `tokio::sync::mpsc` / `parking_lot::Mutex`
 //! directly.
 
-// RTEMS-EXEC-MODEL-ALLOW(1): checked - these run and pass in the feature-ON suite.
 use std::fmt;
 
 /// Server identity emitted in BEACON / SEARCH_RESPONSE frames.
@@ -118,14 +117,22 @@ pub struct Detailed(pub bool);
 /// shared `Notify` (not the `SigInt` itself), so there is no
 /// strong-reference cycle keeping it alive.
 ///
-/// Must be constructed inside a Tokio runtime — [`SigInt::new`] spawns a
-/// task, so calling it with no reactor panics (standard `tokio::spawn`
-/// precondition).
+/// `tokio_backend`, and structurally rather than by doc comment:
+/// [`SigInt::new`] spawns a task, so calling it with no reactor panics
+/// (standard `tokio::spawn` precondition). That is true of a host
+/// `exec_backend` build as much as of RTEMS or VxWorks, which is why the
+/// predicate is the backend and not the target — the embedded reason (tokio is
+/// built there without the `signal` feature; on RTEMS it pulls
+/// signal-hook-registry, which newlib cannot compile, design doc §8.1, and
+/// VxWorks drops it for the same dependency-availability reason) is a strictly
+/// narrower case of it.
+#[cfg(tokio_backend)]
 pub struct SigInt {
     triggered: std::sync::Arc<tokio::sync::Notify>,
     task: tokio::task::JoinHandle<()>,
 }
 
+#[cfg(tokio_backend)]
 impl SigInt {
     pub fn new() -> std::sync::Arc<Self> {
         let triggered = std::sync::Arc::new(tokio::sync::Notify::new());
@@ -133,19 +140,10 @@ impl SigInt {
         let task = tokio::spawn(async move {
             // tokio::signal::ctrl_c only succeeds on platforms with
             // signal support (Unix/Windows). Errors are non-fatal:
-            // SigInt simply never fires. Every embedded target is the same
-            // case reached one level earlier: tokio is built there without
-            // the `signal` feature at all (on RTEMS it pulls
-            // signal-hook-registry, which newlib cannot compile — design
-            // doc §8.1; VxWorks drops the same feature for the same
-            // dependency-availability reason), and an embedded IOC has no
-            // console interrupt to trap.
-            #[cfg(not(epics_embedded_target))]
+            // SigInt simply never fires.
             if (tokio::signal::ctrl_c().await).is_ok() {
                 notify.notify_waiters();
             }
-            #[cfg(epics_embedded_target)]
-            drop(notify);
         });
         std::sync::Arc::new(Self { triggered, task })
     }
@@ -156,6 +154,7 @@ impl SigInt {
     }
 }
 
+#[cfg(tokio_backend)]
 impl Drop for SigInt {
     fn drop(&mut self) {
         // Undo the trap: stop the background ctrl_c task so it doesn't
@@ -169,10 +168,17 @@ impl Drop for SigInt {
 /// one-shot constructor and no `cancel()` (drop the `Timer` to stop
 /// ticking). Prefer `tokio::time::interval` / `sleep` directly in new
 /// code; this exists to give the public surface a named type.
+///
+/// `tokio_backend` for the same reason [`SigInt`] is: `tokio::time::interval`
+/// arms a `TimerEntry` against the runtime's time driver and panics with no
+/// runtime entered, which is every reactor-free build and not just the two
+/// embedded targets.
+#[cfg(tokio_backend)]
 pub struct Timer {
     interval: tokio::time::Interval,
 }
 
+#[cfg(tokio_backend)]
 impl Timer {
     pub fn periodic(period: std::time::Duration) -> Self {
         Self {
@@ -244,6 +250,7 @@ mod tests {
         assert!(!d.0);
     }
 
+    #[cfg(tokio_backend)]
     #[tokio::test]
     async fn sigint_waits_without_spurious_fire_and_drops_clean() {
         let sig = SigInt::new();

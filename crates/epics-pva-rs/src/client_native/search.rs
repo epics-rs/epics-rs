@@ -16,7 +16,10 @@ use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::time::{Duration, Instant};
 
 use epics_base_rs::net::AsyncUdpV4;
-use tokio::time::timeout;
+// The seam, not `tokio::time`: `exec_backend` is selected on a host build by
+// `EPICS_RS_BUILD_EXEC_BACKEND=thread`, and this module is compiled into one
+// — its gate is `not(epics_embedded_target)`, which is a different question.
+use epics_base_rs::runtime::task::timeout;
 use tracing::debug;
 
 use crate::codec::PvaCodec;
@@ -29,7 +32,7 @@ use super::decode::{PeerRole, SearchResponse, decode_search_response, try_parse_
 /// Thin wrapper over [`crate::config::env::parse_addr_list`], the single
 /// owner of the address-list grammar — so this legacy public entry point
 /// can never diverge from the config path. Entries are
-/// **whitespace-separated** (pvxs `split_addr_into`, config.cpp:151-169);
+/// **whitespace-separated** (pvxs `split_addr_into`, config.cpp:151-183);
 /// the comma is per-entry multicast-TTL syntax (`<addr>,<ttl>@<iface>`),
 /// never a list separator. Plain IPs get `EPICS_PVA_BROADCAST_PORT`
 /// appended; `host:port` and bare hostnames resolve via DNS, IPv4

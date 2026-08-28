@@ -13,13 +13,14 @@
 //!   triples (§8.1), so this layer is host-only; each embedded target gets a
 //!   blocking thread-per-client driver instead (design doc §4, §9 phase 6
 //!   item 7), which sits on the protocol layer above. The gate is
-//!   `epics_embedded_target`, not a feature: it is not a choice a hosted
-//!   build can make.
+//!   `tokio_backend`: the layer needs a reactor, and the two embedded targets
+//!   plus a host `exec_backend` build are exactly the configurations that
+//!   have none.
 //!
 //! `accept` is the TCP side's only socket-bearing module; [`tcp`] and the
 //! protocol code behind it speak `AsyncRead`/`AsyncWrite` trait objects, so a
 //! second (blocking) driver is an addition beside `accept` rather than a
-//! `cfg` threaded through the protocol (`doc/pva-rtems-item7-design.md` §6).
+//! `cfg` threaded through the protocol.
 //! The re-point that moves the gate off `tcp` and onto `accept` — the owed
 //! half named in `4c75e766` — has landed: `tcp`, [`peers`] and [`search`]
 //! build for RTEMS, and the four items that held `tcp` back were fixed at
@@ -27,7 +28,7 @@
 //! the host-only modules that held them, tokio handle annotations routed
 //! through the runtime seam, `leaf_convert`'s PUT direction ungated).
 
-#[cfg(not(epics_embedded_target))]
+#[cfg(tokio_backend)]
 pub mod accept;
 // The blocking thread-per-connection driver — the second driver beside
 // `accept`, for targets with no reactor (RTEMS item 5 stage 3). Owns
@@ -43,7 +44,7 @@ pub mod op_handle;
 // Per-connection accounting for the report (`pvxsr`). Keyed by peer address
 // and driven from [`tcp`], but it holds no socket of its own.
 pub mod peers;
-#[cfg(not(epics_embedded_target))]
+#[cfg(tokio_backend)]
 pub mod runtime;
 // SEARCH parse / name-match / response framing. Protocol only — both the UDP
 // responders and the TCP-circuit handler feed it bytes they read themselves.
@@ -62,7 +63,7 @@ pub mod source;
 // `accept` supplies the hosted stream and the embedded-target blocking
 // driver will supply its own.
 pub mod tcp;
-#[cfg(not(epics_embedded_target))]
+#[cfg(tokio_backend)]
 pub mod udp;
 
 pub use composite::CompositeSource;
@@ -79,7 +80,7 @@ pub use op_handle::{
 // doc reference to the short path unresolvable on those targets.
 pub use config::{DEFAULT_MAX_MESSAGE_SIZE, PvaServerConfig};
 pub use peers::{ChannelReport, PeerEntry, PeerRegistry, PeerSnapshot};
-#[cfg(not(epics_embedded_target))]
+#[cfg(tokio_backend)]
 pub use runtime::{PvaServer, ServerReportHandle, run_pva_server};
 pub use server_info::{SERVER_PV_NAME, SERVER_SOURCE_NAME, ServerInfoSource, USER_SOURCE_NAME};
 pub use shared_pv::{AddPvError, SharedPV, SharedSource};

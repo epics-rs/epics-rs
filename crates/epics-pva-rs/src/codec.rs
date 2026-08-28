@@ -93,7 +93,7 @@ impl PvaCodec {
     }
 
     /// Build a SEARCH message carrying MANY channel names in one
-    /// datagram. pvxs `tickSearch` (`client.cpp:1063-1090`) writes the
+    /// datagram. pvxs `tickSearch` (`src/client.cpp:1063-1090`) writes the
     /// channel count ONCE and then packs `(cid, name)` entries into the
     /// same packet up to `maxSearchPayload`; this is the multi-name
     /// primitive that path requires. Callers are responsible for
@@ -112,12 +112,12 @@ impl PvaCodec {
         let flags: u8 = if unicast { 0x80 } else { 0x00 };
         // pvxs `tickSearch` writes the search-response address as
         // `IN6ADDR_ANY_INIT` — 16 raw zero bytes (`::`) — directly, NOT
-        // through `to_wire(SockAddr)` (client.cpp:1082-1085). So a wildcard
+        // through `to_wire(SockAddr)` (src/client.cpp:1082-1085). So a wildcard
         // response address must be raw zeros, not the IPv4-mapped
         // `::ffff:0.0.0.0` that `ip_to_bytes` produces for an AF_INET
         // address. A concrete (relay-substituted) responder address keeps
         // the v4-mapped form, matching pvxs `to_wire(SockAddr)`
-        // (evhelper.cpp:896-901). The server SEARCH_RESPONSE / beacon addr
+        // (evhelper.cpp:891-909). The server SEARCH_RESPONSE / beacon addr
         // fields are a separate path: pvxs writes `to_wire(SockAddr::
         // any(AF_INET))` there, which IS v4-mapped — see
         // `build_search_response_proto`/`build_beacon`.
@@ -156,7 +156,7 @@ impl PvaCodec {
 
     /// Return a copy of an already-built SEARCH frame with the `Unicast`
     /// flag bit (`0x80`) set in its flags octet. pvxs reuses one SEARCH
-    /// buffer and toggles this bit per destination (`client.cpp:1180-1187`):
+    /// buffer and toggles this bit per destination (`src/client.cpp:1180-1187`):
     /// set for a unicast target, clear for broadcast/multicast. The
     /// `build_*` helpers emit the broadcast shape (bit clear), so the search
     /// engine sends this unicast copy to a unicast destination — a
@@ -174,7 +174,7 @@ impl PvaCodec {
     /// Build a discover-style empty SEARCH packet — flags carry the
     /// `MustReply` bit (0x01), the protocol list is empty, and the
     /// channel list is empty. Mirrors pvxs `tickSearch(SearchKind::
-    /// discover)` (client.cpp:1054-1074): every reachable PVA server
+    /// discover)` (src/client.cpp:1054-1074): every reachable PVA server
     /// answers with a SEARCH_RESPONSE that the engine routes back into
     /// its `Discovered` event stream. The previous regular
     /// `build_search(..., "", ...)` packet had the wrong shape (count=1
@@ -293,7 +293,7 @@ impl PvaCodec {
     }
 
     /// MONITOR START — `subcmd=0x44` (`0x40` START | `0x04` PROCESS)
-    /// with no trailing payload. pvxs `clientmon.cpp:123-137` sends
+    /// with no trailing payload. pvxs `clientmon.cpp:133-142` sends
     /// START/STOP as `sid + ioid + subcmd` only. Pre-fix Rust
     /// appended a 4-byte `pipeline_size` trailer here — pipeline
     /// negotiation belongs on INIT (see [`Self::build_monitor_init`]).
@@ -303,7 +303,7 @@ impl PvaCodec {
     }
 
     /// Pause an active monitor — pvxs `Subscription::pause(true)`
-    /// (clientmon.cpp:127). subcmd `0x04` (STOP) tells the server to
+    /// (clientmon.cpp:121,133). subcmd `0x04` (STOP) tells the server to
     /// stop emitting updates; the channel + ioid remain alive.
     pub fn build_monitor_pause(&self, server_channel_id: u32, ioid: u32) -> Vec<u8> {
         let p = Self::op_payload(server_channel_id, ioid, 0x04, &[], self.order());
@@ -311,7 +311,7 @@ impl PvaCodec {
     }
 
     /// Resume a paused monitor — pvxs `Subscription::pause(false)`
-    /// (clientmon.cpp:127). subcmd `0x44` (START | PROCESS) restarts
+    /// (clientmon.cpp:121,133). subcmd `0x44` (START | PROCESS) restarts
     /// updates without re-sending INIT or pipeline window.
     pub fn build_monitor_resume(&self, server_channel_id: u32, ioid: u32) -> Vec<u8> {
         let p = Self::op_payload(server_channel_id, ioid, 0x44, &[], self.order());
@@ -452,7 +452,7 @@ mod tests {
     #[test]
     fn search_wildcard_response_addr_is_in6addr_any_raw_zeros() {
         // pvxs writes the search response-address field as IN6ADDR_ANY —
-        // 16 raw zero bytes — directly (client.cpp:1082-1085), NOT the
+        // 16 raw zero bytes — directly (src/client.cpp:1082-1085), NOT the
         // IPv4-mapped `::ffff:0.0.0.0` that an AF_INET addr would produce
         // through `to_wire(SockAddr)`. The addr field sits at frame[16..32]
         // (header 8 + seq 4 + flags 1 + reserved 3).
@@ -470,7 +470,7 @@ mod tests {
         );
 
         // A concrete responder address keeps the v4-mapped form, matching
-        // pvxs `to_wire(SockAddr)` (evhelper.cpp:896-901).
+        // pvxs `to_wire(SockAddr)` (evhelper.cpp:891-909).
         let bytes = codec(false).build_search_batch(
             0x6669_6e64,
             &[(7, "MY:PV")],

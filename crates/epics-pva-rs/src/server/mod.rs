@@ -1,25 +1,38 @@
 //! PVA server components — protocol bridge, server wrapper, protocol runner.
 //!
 //! [`native_source`] is the database→pvAccess bridge and is target-neutral.
-//! The wrapper (`pva_server`), its iocsh command (`iocsh`) and
-//! `run_pva_ioc` all drive `crate::server_native::runtime`, which is
-//! host-only — see that module for why an `epics_embedded_target` build
-//! (RTEMS or VxWorks) stops at the protocol layer.
+//! The wrapper (`pva_server`), its iocsh command (`iocsh`) and `run_pva_ioc`
+//! all drive `crate::server_native::runtime`, which is reactor-only — see
+//! that module for why a build without one (RTEMS, VxWorks, or a host
+//! `exec_backend` build) stops at the protocol layer.
 
-#[cfg(not(epics_embedded_target))]
+#[cfg(tokio_backend)]
 pub mod iocsh;
 pub mod native_source;
-#[cfg(not(epics_embedded_target))]
+#[cfg(tokio_backend)]
 pub mod pva_server;
 
 pub use native_source::PvDatabaseSource;
-#[cfg(not(epics_embedded_target))]
+#[cfg(tokio_backend)]
 pub use pva_server::{PvaServer, PvaServerBuilder};
 
-#[cfg(not(epics_embedded_target))]
+#[cfg(tokio_backend)]
 use epics_base_rs::error::CaResult;
-#[cfg(not(epics_embedded_target))]
+#[cfg(tokio_backend)]
 use epics_base_rs::server::ioc_app::IocRunConfig;
+
+/// Stand `app` up on pvAccess — [`run_pva_ioc`] with pvxs's
+/// `pvxsBaseRegistrar` already run.
+///
+/// pvxs registers `pvxsr` from an `epicsExportRegistrar`
+/// (`ioc/iochooks.cpp:461-476`), so it answers on the first `st.cmd` line.
+/// This port has no link-time registrar, so the pairing here is what keeps a
+/// head from getting the runner without it; `IocApplication::run(run_pva_ioc)`
+/// still reaches the interactive shell's copy.
+#[cfg(tokio_backend)]
+pub async fn run_pva_ioc_app(app: epics_base_rs::server::ioc_app::IocApplication) -> CaResult<()> {
+    iocsh::register_pvxs_commands(app).run(run_pva_ioc).await
+}
 
 /// Run an IOC with the pvAccess protocol.
 ///
@@ -30,12 +43,16 @@ use epics_base_rs::server::ioc_app::IocRunConfig;
 /// # Example
 ///
 /// ```rust,ignore
-/// IocApplication::new()
-///     .startup_script("st.cmd")
-///     .run(epics_pva_rs::server::run_pva_ioc)
-///     .await
+/// epics_pva_rs::server::run_pva_ioc_app(
+///     IocApplication::new().startup_script("st.cmd"),
+/// )
+/// .await
 /// ```
-#[cfg(not(epics_embedded_target))]
+///
+/// [`run_pva_ioc_app`] rather than `.run(run_pva_ioc)`, for the reason given
+/// there: this runner is dispatched after the startup script, so `pvxsr`
+/// registered from here reaches only the interactive shell.
+#[cfg(tokio_backend)]
 pub async fn run_pva_ioc(config: IocRunConfig) -> CaResult<()> {
     let server = PvaServer::from_parts(
         config.db,

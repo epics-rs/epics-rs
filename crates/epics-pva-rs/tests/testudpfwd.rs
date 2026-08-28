@@ -9,6 +9,12 @@
 //! `CARGO_BIN_EXE_mshim-rs` gives the test the path of the freshly-built
 //! binary.
 
+// All three cases drive the `mshim-rs` binary as a subprocess. Its collectors
+// wait on `server_native::udp`, which is `tokio_backend`-only, so on
+// `exec_backend` the binary refuses at startup. Nothing replaces it there:
+// an embedded image does not run mshim.
+#![cfg(tokio_backend)]
+
 use std::net::{Ipv4Addr, SocketAddr, UdpSocket};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
@@ -43,16 +49,12 @@ impl Drop for ChildGuard {
 #[test]
 #[serial]
 fn mshim_forwards_search_and_drops_unrecognized() {
-    // Skip on platforms where the binary path env var isn't set
-    // (older cargo) — environment_var-based binary lookup is the
-    // canonical way to find a sibling bin.
-    let bin = match option_env!("CARGO_BIN_EXE_mshim-rs") {
-        Some(p) => p,
-        None => {
-            eprintln!("CARGO_BIN_EXE_mshim-rs not set — skipping");
-            return;
-        }
-    };
+    // `env!`, not `option_env!`: `mshim-rs` is an unconditional `[[bin]]` of
+    // this package, so cargo always builds it for this test and an absent
+    // path is a broken build rather than an unmet prerequisite. The three
+    // `option_env!` arms this replaces returned early instead, and nextest
+    // scores an early return as a pass.
+    let bin = env!("CARGO_BIN_EXE_mshim-rs");
 
     let (listen_port, forward_port) = alloc_two_ports();
 
@@ -152,13 +154,7 @@ fn mshim_forwards_search_and_drops_unrecognized() {
 #[test]
 #[serial]
 fn mshim_forwards_only_first_chained_message() {
-    let bin = match option_env!("CARGO_BIN_EXE_mshim-rs") {
-        Some(p) => p,
-        None => {
-            eprintln!("CARGO_BIN_EXE_mshim-rs not set — skipping");
-            return;
-        }
-    };
+    let bin = env!("CARGO_BIN_EXE_mshim-rs");
 
     const PVA_HEADER_SIZE: usize = 8;
     const SEQ_A: u32 = 0x0000_0011;
@@ -249,10 +245,7 @@ fn mshim_forwards_only_first_chained_message() {
 #[test]
 #[serial]
 fn mshim_rejects_invalid_listen_endpoint() {
-    let bin = match option_env!("CARGO_BIN_EXE_mshim-rs") {
-        Some(p) => p,
-        None => return,
-    };
+    let bin = env!("CARGO_BIN_EXE_mshim-rs");
     let out = Command::new(bin)
         .arg("-L")
         .arg("not-an-ip:5076")

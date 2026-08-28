@@ -111,7 +111,6 @@ impl QosFlags {
     /// subcommand: read the current get-side data with no put payload
     /// (pvAccess `remote.h:78`).
     pub const GET: u8 = 0x40;
-    // MONITOR_START and MONITOR_STOP hold wrong values — see doc/source-review-2026-05-26.md.
     /// `0x44` — START a paused monitor (control bit `0x04` | GET bit `0x40`; subscriber → server).
     pub const MONITOR_START: u8 = 0x44;
     /// `0x04` — STOP a running monitor (control bit only; subscriber → server).

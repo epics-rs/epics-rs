@@ -1,5 +1,5 @@
 //! Blocking, thread-per-connection PVA server driver (RTEMS phase 6 item 5,
-//! stage 3 — `doc/pva-rtems-item5-design.md` §1, §3).
+//! stage 3).
 //!
 //! The second driver, beside `super::accept`. It serves one connection with
 //! three threads and **no reactor**:
@@ -29,10 +29,10 @@
 //! thread-lifecycle guards live in
 //! [`epics_base_rs::runtime::blocking_io`],
 //! because the PVA *client* and the CA client need the identical primitive and
-//! `epics-ca-rs` cannot depend on this crate (`doc/calink-rtems-design.md`
-//! §3.3). What remains in this file is what is genuinely server-side: the
-//! accept loop, the [`ConnRegistry`], the UDP search responder, and the
-//! assembly that gives one connection its two pumps.
+//! `epics-ca-rs` cannot depend on this crate. What remains in this file is
+//! what is genuinely server-side: the accept loop, the [`ConnRegistry`], the
+//! UDP search responder, and the assembly that gives one connection its two
+//! pumps.
 //!
 //! Crucially the threads hand over **bytes, not frames** (§1.3). The inbound
 //! type cache, the segment buffer and the channel map stay exactly where they
@@ -59,11 +59,11 @@
 //! # What "no reactor" is worth — at its measured strength, and no higher
 //!
 //! Not that a reactor cannot run on RTEMS. It can: a libevent reactor serves
-//! PVA on RTEMS 6 once steered to `kqueue`, measured end to end
-//! (`doc/rtems-scope-b-session-handoff.md` §5.3). The claim that survives
-//! measurement is narrower and still real — **the reference implementation
-//! ships an RTEMS-5-era workaround that makes it unusable on RTEMS 6 today**.
-//! pvxs `src/evhelper.cpp:183` carries `#ifdef __rtems__
+//! PVA on RTEMS 6 once steered to `kqueue`, measured end to end. The claim
+//! that survives measurement is narrower and still real — **the reference
+//! implementation ships an RTEMS-5-era workaround that makes it unusable on
+//! RTEMS 6 today**.
+//! pvxs `src/evhelper.cpp:177-184` carries `#ifdef __rtems__
 //! event_config_avoid_method(conf, "kqueue")`, written for "libbsd circa
 //! RTEMS 5.1", and it steers libevent onto the `poll` backend, which never
 //! blocks on this BSP: `poll()` returns `POLLERR` immediately on libevent's
@@ -107,12 +107,12 @@
 //! That third column is the point. §4.2b proposed closing the writer-death
 //! window with a `oneshot` and a **seventh `select!` arm** in the shared
 //! connection loop — which would have changed hosted teardown timing (a
-//! sign-off item) or else `cfg`-ed an arm into the protocol module, the one
-//! thing `doc/pva-rtems-item7-design.md` §6 forbids. Waking through the socket
-//! needs neither: a dead writer shuts the socket, the reader thread's `read`
-//! returns 0, and the connection unwinds down the **existing** EOF path. So
-//! `tcp.rs` is untouched by stage 4, the hosted `select!` is byte-identical,
-//! and the ≤15 s window is gone for this driver anyway.
+//! sign-off item) or else `cfg`-ed an arm into the protocol module. Waking
+//! through the socket needs neither: a dead writer shuts the socket, the
+//! reader thread's `read` returns 0, and the connection unwinds down the
+//! **existing** EOF path. So `tcp.rs` is untouched by stage 4, the hosted
+//! `select!` is byte-identical, and the ≤15 s window is gone for this driver
+//! anyway.
 //!
 //! # The accept side
 //!
@@ -122,11 +122,11 @@
 //! connection**: each connection *borrows* its three threads — connection body,
 //! reader pump, writer pump — as one set from a
 //! [`epics_base_rs::runtime::worker_pool::WorkerPool`], because
-//! every `std::thread` creation leaks 176–179 B permanently on RTEMS
-//! (`doc/rtems-connection-worker-pool-design.md`). All three workers take
-//! `PVA_SERVER_PRIORITY` — see that constant for why they share one number —
-//! and each is created once, with its stack class and band, and reused. A full
-//! pool refuses admission with `EAGAIN`, which *is* the `max_connections` limit.
+//! every `std::thread` creation leaks 176–179 B permanently on RTEMS. All
+//! three workers take `PVA_SERVER_PRIORITY` — see that constant for why they
+//! share one number — and each is created once, with its stack class and band,
+//! and reused. A full pool refuses admission with `EAGAIN`, which *is* the
+//! `max_connections` limit.
 //!
 //! # Discovery
 //!
@@ -145,7 +145,7 @@
 //! SEARCH to this server's port is answered; one that relies on being told we
 //! exist is not, yet.
 
-// RTEMS-EXEC-MODEL-ALLOW(16): checked - these run and pass in the feature-ON suite.
+// RTEMS-EXEC-MODEL-ALLOW(17): checked - 16 run and pass in the exec-backend suite; the 17th is `harness_reactor`'s `new_multi_thread` builder, whose `#[cfg(tokio_backend)]` arm is not compiled there at all.
 use std::collections::HashMap;
 use std::io;
 use std::net::{
@@ -470,7 +470,9 @@ pub(super) struct PumpWorkers {
 ///
 /// **Hosted callers must run this on a multi-thread runtime worker**; see the
 /// module docs. On RTEMS a bare thread is correct.
+#[allow(clippy::too_many_arguments)] // the `reactor` capability is the 8th
 pub(super) fn serve_connection_blocking(
+    reactor: epics_base_rs::runtime::task::Reactor,
     pumps: PumpWorkers,
     stream: TcpStream,
     peer: SocketAddr,
@@ -519,10 +521,10 @@ pub(super) fn serve_connection_blocking(
     // Both pumps come from `runtime::blocking_io`, the workspace's one blocking
     // byte source — the same primitive the PVA *client*'s `connect_blocking`
     // uses, in `epics-base-rs` rather than here because `epics-ca-rs` cannot
-    // reach this crate (`doc/calink-rtems-design.md` §3.3). They run on the two
-    // pump workers of this connection's leased set, whose band is
-    // `PVA_SERVER_PRIORITY` — like every other thread in this module; see that
-    // constant for why all of them share one number.
+    // reach this crate. They run on the two pump workers of this connection's
+    // leased set, whose band is `PVA_SERVER_PRIORITY` — like every other
+    // thread in this module; see that constant for why all of them share one
+    // number.
     //
     // Pooled, so infallible: the two threads already exist (they are the leased
     // workers), so there is no per-connection creation left to fail. Admission
@@ -549,6 +551,7 @@ pub(super) fn serve_connection_blocking(
     );
 
     let outcome = block_on_sync(handle_connection_io(
+        reactor,
         source,
         Box::new(reader_adapter),
         Box::new(writer_adapter),
@@ -635,9 +638,9 @@ pub struct BlockingPvaServer {
     /// pump — are borrowed from this pool as one set, never created per accept.
     /// Its capacity is `max_connections`, so `acquire` refusing with
     /// `WouldBlock` *is* the connection limit; the old `active >= max` check is
-    /// gone (`doc/rtems-connection-worker-pool-design.md` §5). Dropped after the
-    /// listener and the connections are stopped, in [`shutdown`](Self::shutdown)
-    /// order, so its `Stop`s never queue behind a live connection.
+    /// gone. Dropped after the listener and the connections are stopped, in
+    /// [`shutdown`](Self::shutdown) order, so its `Stop`s never queue behind a
+    /// live connection.
     conn_pool: WorkerPool<3>,
     shutdown: AtomicBool,
 }
@@ -797,7 +800,7 @@ impl BlockingPvaServer {
     /// Blocks the calling thread and takes it to `PVA_SERVER_PRIORITY`, so
     /// give it a thread of its own rather than calling it on a thread that has
     /// other work.
-    pub fn serve(&self) {
+    pub fn serve(&self, reactor: &epics_base_rs::runtime::task::Reactor) {
         let _ = enter_ioc_thread(PVA_SERVER_PRIORITY);
         let mut backoff = AcceptBackoff::new();
         for stream in self.listener.incoming() {
@@ -817,7 +820,7 @@ impl BlockingPvaServer {
                             continue;
                         }
                     };
-                    if let Err(e) = self.start_connection(stream, peer) {
+                    if let Err(e) = self.start_connection(reactor, stream, peer) {
                         warn!(?peer, error = %e, "blocking PVA server: connection not started");
                     }
                 }
@@ -859,7 +862,12 @@ impl BlockingPvaServer {
     /// `max_connections reached` — pointing at a config knob when the machine
     /// was out of memory. Matching the gate instead of an errno makes the two
     /// unmixable; the CA driver had the same defect on its own refusal path.
-    fn start_connection(&self, stream: TcpStream, peer: SocketAddr) -> io::Result<()> {
+    fn start_connection(
+        &self,
+        reactor: &epics_base_rs::runtime::task::Reactor,
+        stream: TcpStream,
+        peer: SocketAddr,
+    ) -> io::Result<()> {
         // One atomic borrow of all three roles — connection body, reader pump,
         // writer pump — so a server at capacity can never hold a partial set and
         // block for the rest.
@@ -932,10 +940,12 @@ impl BlockingPvaServer {
             channel_invalidator: invalidator,
             tx_limit_bytes: tx_limit_bytes(&stream),
         };
+        let conn_reactor = reactor.clone();
         conn_worker.run_detached(format!("PVA connection {peer}"), move || {
             let _lease = lease;
             let _slot = slot;
             let outcome = serve_connection_blocking(
+                conn_reactor,
                 PumpWorkers {
                     reader: reader_worker,
                     writer: writer_worker,
@@ -1250,6 +1260,7 @@ mod tests {
     use epics_base_rs::runtime::blocking_io::circuit_roster;
     use epics_base_rs::runtime::task::spawn_dedicated_thread;
     use epics_base_rs::runtime::worker_pool::SetLease;
+    use source_guard::{Comments, production};
     use std::io::{Cursor, Read, Write};
     use std::net::IpAddr;
     use std::sync::LazyLock;
@@ -1363,15 +1374,6 @@ mod tests {
         );
     }
 
-    /// Production scope of a source file: everything before the first
-    /// column-0 `#[cfg(test)]`. Same helper the accept-driver guard uses.
-    fn production_scope(src: &str) -> &str {
-        match src.find("\n#[cfg(test)]") {
-            Some(i) => &src[..i],
-            None => src,
-        }
-    }
-
     /// The RTEMS constraint this whole driver exists to satisfy: it must not
     /// reach for tokio's async net/timer/spawn machinery, none of which builds
     /// for `armv7-rtems-eabihf`, and it must not suspend a future directly —
@@ -1382,7 +1384,7 @@ mod tests {
     /// slice so the tests below may use the async machinery freely.
     #[test]
     fn blocking_driver_has_no_async_runtime_symbols() {
-        let prod = production_scope(include_str!("blocking.rs"));
+        let prod = production(include_str!("blocking.rs"), Comments::Strip);
         // Fail closed: if the driver is no longer in the slice, the slice is
         // wrong and every assertion below would pass vacuously.
         assert!(
@@ -1520,6 +1522,7 @@ mod tests {
                 // returns — is over; dropping it returns the set to the pool.
                 let _lease = lease;
                 serve_connection_blocking(
+                    crate::test_reactor(),
                     PumpWorkers {
                         reader: reader_worker,
                         writer: writer_worker,
@@ -1836,6 +1839,7 @@ mod tests {
         // this call is already on the thread the guard is about.
         let (_lease, reader_worker, writer_worker) = lease_pumps();
         let err = serve_connection_blocking(
+            crate::test_reactor(),
             PumpWorkers {
                 reader: reader_worker,
                 writer: writer_worker,
@@ -2378,15 +2382,11 @@ mod tests {
         // would shut the socket and answer that test's own question). Scanning
         // the whole file made this guard fire on that, which is a guard
         // punishing the test that proves the property it is guarding.
-        let src = production_scope(include_str!("blocking.rs"));
-        // Comment lines are skipped: the doc comment above names the banned
-        // shape on purpose, and this guard is about CODE. A real binding
-        // cannot live on a line starting with `//`. (Needles are split for the
-        // same reason — this guard lives in the file it reads.)
-        let code: Vec<&str> = src
-            .lines()
-            .filter(|l| !l.trim_start().starts_with("//"))
-            .collect();
+        // `Strip`: the doc comment above names the banned shape on purpose,
+        // and this guard is about CODE. (Needles are split for the same
+        // reason — this guard lives in the file it reads.)
+        let src = production(include_str!("blocking.rs"), Comments::Strip);
+        let code: Vec<&str> = src.lines().collect();
         for banned in [
             concat!("let reader = spawn_dedi", "cated_thread("),
             concat!("let writer = spawn_dedi", "cated_thread("),
@@ -2427,6 +2427,41 @@ mod tests {
     /// loop spawns capture it in turn. The ambient context propagates down the
     /// thread tree because every level was spawned the same way. On RTEMS
     /// there is nothing to propagate and the same code is a plain thread.
+    /// The executor this driver's hosted connections spawn on.
+    ///
+    /// Not `crate::test_reactor()`, and the difference is the module's own
+    /// claim: these bodies are deliberately synchronous `#[test]`s, because
+    /// the driver serves a connection with three threads and no reactor *of
+    /// its own*. On a hosted build `serve_connection_blocking` still runs
+    /// `handle_connection_io`, whose writer task needs a tokio runtime — see
+    /// "Where the async goes on each target" above, which requires every
+    /// hosted caller to be on a multi-thread runtime worker. So the harness
+    /// supplies exactly that runtime, once for the whole test binary, rather
+    /// than each body pretending to be async. On RTEMS the same call is the
+    /// process-global background executor and no runtime is built.
+    #[cfg(tokio_backend)]
+    fn harness_reactor() -> epics_base_rs::runtime::task::Reactor {
+        static RT: std::sync::OnceLock<tokio::runtime::Runtime> = std::sync::OnceLock::new();
+        let rt = RT.get_or_init(|| {
+            tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()
+                .expect("harness multi-thread runtime")
+        });
+        // The runtime is a `static`, so the handle this mints outlives every
+        // thread that spawns through it.
+        let _entered = rt.enter();
+        epics_base_rs::runtime::task::Reactor::current()
+            .expect("the harness runtime was just entered on this thread")
+    }
+
+    /// `exec_backend` twin: there is no runtime to build — see the
+    /// `tokio_backend` copy.
+    #[cfg(exec_backend)]
+    fn harness_reactor() -> epics_base_rs::runtime::task::Reactor {
+        crate::test_reactor()
+    }
+
     fn start_server(config: PvaServerConfig) -> (Arc<BlockingPvaServer>, thread::JoinHandle<()>) {
         let server = Arc::new(
             BlockingPvaServer::bind((Ipv4Addr::LOCALHOST, 0), test_source(), config)
@@ -2437,7 +2472,7 @@ mod tests {
             "test-PVAS-accept".into(),
             PVA_SERVER_PRIORITY,
             StackSizeClass::Medium,
-            move || serving.serve(),
+            move || serving.serve(&harness_reactor()),
         )
         .expect("accept thread spawned");
         (server, accept)
@@ -2468,7 +2503,7 @@ mod tests {
     }
 
     /// The priority is derived from upstream, not typed in. pvxs runs PVXTCP
-    /// at `epicsThreadPriorityCAServerLow-2` (`server.cpp:388`) and
+    /// at `epicsThreadPriorityCAServerLow-2` (`src/server.cpp:388`) and
     /// `epicsThreadPriorityCAServerLow` is 20 (`epicsThread.h:82`), so an edit
     /// that "rounds" this to CaServerLow or to 19 has to fail something.
     #[test]
@@ -2504,7 +2539,7 @@ mod tests {
     /// all — the pool's fixed set of workers is created once and reused.
     #[test]
     fn every_server_thread_goes_through_the_seam() {
-        let prod = production_scope(include_str!("blocking.rs"));
+        let prod = production(include_str!("blocking.rs"), Comments::Strip);
         assert_eq!(
             prod.matches(concat!("thread", "::Builder")).count(),
             0,
@@ -2851,7 +2886,7 @@ mod tests {
     /// pvxs deliberately runs discovery *below* the connections it serves:
     /// `PVXUDP` is `epicsThreadPriorityCAServerLow-4`
     /// (`udp_collector.cpp:93`), `PVXTCP` is `CAServerLow-2`
-    /// (`server.cpp:388`). Both numbers are pinned, and so is the ordering —
+    /// (`src/server.cpp:388`). Both numbers are pinned, and so is the ordering —
     /// an edit that unifies the two constants (the natural "simplification")
     /// removes the protection an established connection has against a SEARCH
     /// storm, and must fail here rather than in the field.
@@ -2882,7 +2917,7 @@ mod tests {
     /// uncounted.
     #[test]
     fn both_serve_loops_take_their_priority_at_the_top() {
-        let prod = production_scope(include_str!("blocking.rs"));
+        let prod = production(include_str!("blocking.rs"), Comments::Strip);
         assert_eq!(
             prod.matches("enter_ioc_thread(").count(),
             2,
@@ -3007,7 +3042,7 @@ mod tests {
     }
 
     /// `ignore_addrs` is consulted on the UDP path and only there (pvxs
-    /// `server.cpp:654-670` vs `serverconn.cpp:461-467`): a noisy host's
+    /// `src/server.cpp:654-670` vs `serverconn.cpp:461-467`): a noisy host's
     /// discovery traffic is dropped while its direct TCP clients still
     /// connect. The blocking responder must apply the same filter, so a
     /// gateway config that suppresses a peer is not silently ignored on RTEMS.
@@ -3154,15 +3189,31 @@ mod tests {
     /// The RTEMS driver's socket handles must be SHARED, never duplicated.
     ///
     /// The banned call is `std`'s clone-the-descriptor method, i.e.
-    /// `fcntl(F_DUPFD*)`. RTEMS 6 has no `F_DUPFD_CLOEXEC` case at all
-    /// (`cpukit/libcsupport/src/fcntl.c` falls to `default: EINVAL`), and
-    /// plain `F_DUPFD` goes through `duplicate_iop` (`fcntl.c:47-77`), which
-    /// calls the file's `open_h` — and rtems-libbsd installs
-    /// `rtems_bsd_sysgen_nodeops` on every socket
-    /// (`rtems-bsd-syscall-api.c:205`) whose `.open_h` is
-    /// `rtems_bsd_sysgen_open_error`. Measured on target: `dup`, `F_DUPFD`
-    /// and `F_DUPFD_CLOEXEC` all fail on an accepted socket with ENXIO, while
-    /// `F_DUPFD` on `/dev/console` succeeds.
+    /// `fcntl(F_DUPFD*)`. **The ban rests on the measurement**: on target
+    /// `dup`, `F_DUPFD` and `F_DUPFD_CLOEXEC` all fail on an accepted socket
+    /// with ENXIO, while `F_DUPFD` on `/dev/console` succeeds — so the
+    /// failure is specific to a libbsd socket and is not a general fcntl
+    /// gap. The `F_DUPFD_CLOEXEC` variant additionally cannot work on
+    /// **RTEMS 6** whatever the file is: `cpukit/libcsupport/src/fcntl.c`
+    /// has no case for it and falls to `default: EINVAL`. That is a
+    /// series-6 statement (`rtems-kernel_6` `51f962fb3`); the series-7
+    /// kernel was not read, and neither tree is checked out here
+    /// (`revisions.py` `ABSENT_HERE`).
+    ///
+    /// **Withdrawn:** this comment used to explain the plain-`F_DUPFD`
+    /// failure by saying `duplicate_iop` (`fcntl.c:47-77`) calls the file's
+    /// `open_h` and that `rtems_bsd_sysgen_nodeops.open_h` is
+    /// `rtems_bsd_sysgen_open_error`. The `duplicate_iop` half is right; the
+    /// libbsd half is FALSE at **both** declared pins (`7-freebsd-14`
+    /// `fdd9fa734`, `6-freebsd-14` `6d027f0bb`), where `.open_h` is
+    /// `rtems_bsd_sysgen_dup` — a real dup through `fget`/`finstall` — and
+    /// `rtems_bsd_sysgen_open_error` is defined but named by no handler
+    /// table at all. `c86cbc57` and `08d8e275` (both 2026-07-28) made it so,
+    /// and both are ancestors of both pins, so the ENXIO measurement
+    /// predates the change and the current tree does not explain it. Do not
+    /// go read the handler table expecting to confirm the ban: it says the
+    /// opposite. The rule itself does not move — the measurement stands and
+    /// `Arc<TcpStream>` stays.
     ///
     /// Host CI cannot catch a reintroduced duplicate here — it works
     /// perfectly on Linux and fails only after a target boot. This guard is

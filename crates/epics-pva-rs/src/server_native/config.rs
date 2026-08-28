@@ -6,7 +6,7 @@
 //! socket in it and therefore has to compile for RTEMS; `runtime` is the
 //! host-only async driver that binds the listeners. Leaving the config in
 //! `runtime` made the whole protocol layer inherit the host gate through one
-//! type reference (`doc/pva-rtems-item7-design.md` §6).
+//! type reference.
 //!
 //! Nothing here touches the network. The fields describe *what* to bind and
 //! *how* to behave once bound; `runtime` (host) and the blocking driver
@@ -50,9 +50,9 @@ pub struct PvaServerConfig {
     /// port (in addition to the plaintext [`Self::tcp_port`] listener)
     /// and advertises it as the `"tls"` endpoint in UDP / TCP-circuit
     /// SEARCH replies. Mirrors pvxs, which binds a separate per-interface
-    /// TLS socket on `effective.tls_port` (`server.cpp:595-608`) and
-    /// returns it for a protoTLS SEARCH (`server.cpp:849-852`,
-    /// `serverchan.cpp:195,250`).
+    /// TLS socket on `effective.tls_port` (`src/server.cpp:580-594`, `tls`
+    /// `b3a10bf0`) and returns it for a protoTLS SEARCH
+    /// (`src/server.cpp:835-844`, `serverchan.cpp:195,250`).
     ///
     /// `0` requests an OS-ephemeral TLS port (the bound value is stamped
     /// back here at `start()`, like [`Self::tcp_port`]). When the
@@ -64,7 +64,7 @@ pub struct PvaServerConfig {
     /// `EPICS_PVAS_TLS_PORT` / `EPICS_PVA_TLS_PORT` by [`Self::with_env`].
     pub tls_port: u16,
     /// Server identity, propagated into the TCP-circuit `Command::Search`
-    /// reply (`pvxs serverchan.cpp:215-235`); the UDP SEARCH_RESPONSE and the
+    /// reply (`pvxs serverchan.cpp:238`); the UDP SEARCH_RESPONSE and the
     /// beacons carry the same 12 bytes.
     ///
     /// **Whatever you put here is not what gets served.** Every server
@@ -150,11 +150,15 @@ pub struct PvaServerConfig {
     /// from `disable_plaintext=true` in `EPICS_PVAS_TLS_OPTIONS` /
     /// `EPICS_PVA_TLS_OPTIONS` by [`Self::with_env`]; default `false`.
     ///
-    /// pvxs carries `tls_disable_plaintext` in the shared `ConfigCommon`
-    /// (`netcommon.h:172`) and enforces the downgrade refusal on the
-    /// CLIENT — it drops a plaintext (`"tcp"`) SEARCH reply
-    /// (`client.cpp:944`). Because the Rust server unifies TLS and
-    /// plaintext on each listener via the first-byte peek
+    /// Upstream pvxs has no such option: at `origin/tls` `b3a10bf0` the
+    /// client accepts whichever of `"tcp"` / `"tls"` the server offers
+    /// (`src/client.cpp:979-989`).  `tls_disable_plaintext` exists only on the
+    /// personal fork branch `fork/fix/tls-peer-identity-and-downgrade`,
+    /// which carries it in the shared `ConfigCommon` (`netcommon.h:172`)
+    /// and enforces the downgrade refusal on the CLIENT — it drops a
+    /// plaintext (`"tcp"`) SEARCH reply (`src/client.cpp:944`). Because the
+    /// Rust server unifies TLS and plaintext on each listener via the
+    /// first-byte peek
     /// (`run_tcp_server_on_listener`), the equivalent server-side
     /// guarantee is to refuse a non-TLS peer at accept time so a
     /// stripped/downgraded connection can never reach the plain code
@@ -202,7 +206,7 @@ pub struct PvaServerConfig {
     pub beacon_period_long: Duration,
     /// Number of short-interval beacons emitted before the cadence
     /// drops to `beacon_period_long`. Default 10 (pvxs
-    /// `server.cpp:829` hardcodes the same value). After this many
+    /// `src/server.cpp:829` hardcodes the same value). After this many
     /// bursts every receiver in earshot has had multiple chances to
     /// notice the new server; further short-interval beacons just
     /// burn UDP bandwidth without informational gain.
@@ -307,7 +311,7 @@ pub struct PvaServerConfig {
     /// matching UDP SEARCH datagrams are silently dropped before
     /// admission. `port == 0` matches any port from that IP. Mirrors
     /// pvxs `Config::ignoreAddrs`, which is consulted ONLY from the UDP
-    /// search path (`Server::Pvt::onSearch`, server.cpp:654-670) and NOT
+    /// search path (`Server::Pvt::onSearch`, src/server.cpp:654-670) and NOT
     /// from the TCP accept callback (serverconn.cpp:461-467): a noisy
     /// host's discovery traffic can be suppressed while its direct TCP
     /// clients still connect. Empty = allow all (default).
@@ -464,9 +468,10 @@ impl PvaServerConfig {
         if let Some(v) = env::pvas_server_port_opt() {
             self.tcp_port = v;
         }
-        // Server TLS listen port: EPICS_PVAS_TLS_PORT first, then the
-        // shared EPICS_PVA_TLS_PORT (pvxs config.cpp:513-519 PickOne).
-        // Only takes effect when `tls` is configured (see `tls_port`).
+        // Server TLS listen port: EPICS_PVAS_TLS_PORT first, then the shared
+        // EPICS_PVA_TLS_PORT (pvxs config.cpp:495-501 PickOne, `tls`
+        // `b3a10bf0`). Only takes effect when `tls` is configured (see
+        // `tls_port`).
         if let Some(v) = env::pvas_tls_port_opt() {
             self.tls_port = v;
         }
@@ -474,7 +479,9 @@ impl PvaServerConfig {
             self.udp_port = v;
         }
         // Anti-downgrade: `disable_plaintext=true` in the TLS options makes
-        // the server refuse plaintext (pvxs parseTLSOptions, config.cpp:453).
+        // the server refuse plaintext (parseTLSOptions, config.cpp:453-460 on
+        // the personal fork branch `fork/fix/tls-peer-identity-and-downgrade`
+        // `6547f25` — upstream pvxs has no such option).
         if let Some(v) = env::server_tls_disable_plaintext_opt() {
             self.disable_plaintext = v;
         }

@@ -1,0 +1,12 @@
+[package]
+name = "ioc-spawn-gate"
+version = "0.0.0"
+edition = "2024"
+publish = false
+license = "EPICS"
+description = "Dev-only: derives, from the sources, which nextest binaries spawn an EPICS IOC and checks each one is declared in an IOC test-group"
+
+[dependencies]
+
+[dev-dependencies]
+tempfile = "3"

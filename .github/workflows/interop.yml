@@ -225,7 +225,7 @@ jobs:
     - name: Run wire-golden + interop suites
       # The `interop` profile in .config/nextest.toml filters to
       # the gated binaries (wire_golden_ext, wire_golden_pvxs,
-      # interop_*_rust_*, differential_libca, parity_interop,
-      # interop_pvxs). Skips wrapped in `require_tool` print a
+      # interop_*_rust_*, differential_libca, interop_pvxs).
+      # Skips wrapped in `require_tool` print a
       # SKIP line + exit 0 when binaries are still missing.
       run: cargo nextest run --profile interop --no-fail-fast

@@ -4,6 +4,6 @@ version = "0.0.0"
 edition = "2024"
 publish = false
 license = "EPICS"
-description = "Dev-only: the rtems-exec-model test-gating census, shared by every crate in the RTEMS closure"
+description = "Dev-only: the exec-backend test-gating census, shared by every crate in the RTEMS closure"
 
 [dependencies]

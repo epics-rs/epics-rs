@@ -10,7 +10,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
 
-use crate::parse::{Device, Field, Menu, RecordType};
+use crate::parse::{Device, Field, Menu, RecordType, Variable};
 
 /// The `DBF_*` -> `DbFieldType` map, mirroring C `dbStaticLib`'s `dbfType`
 /// enum and `dbAccess.c`'s `mapDBFToDBR`:
@@ -43,6 +43,38 @@ pub fn dbf_to_rust(dbf: &str) -> Option<&'static str> {
     })
 }
 
+/// The `DbfCode` variant for a `DBF_*` token — C's `dbfType` code
+/// (`dbFldTypes.h:24-43` @R7.0.10), carried onto `FieldDesc::declared_dbf`.
+///
+/// Total where [`dbf_to_rust`] is lossy, and that is the whole point: this is
+/// the DECLARATION, so it keeps the six tokens `dbf_to_rust` collapses onto
+/// two served types apart. Unknown tokens are an error rather than a drop —
+/// a `.dbd` gaining a nineteenth type must fail the generator, not lose its
+/// declaration silently.
+pub fn dbf_to_code(dbf: &str) -> Result<&'static str, String> {
+    Ok(match dbf {
+        "DBF_STRING" => "String",
+        "DBF_CHAR" => "Char",
+        "DBF_UCHAR" => "UChar",
+        "DBF_SHORT" => "Short",
+        "DBF_USHORT" => "UShort",
+        "DBF_LONG" => "Long",
+        "DBF_ULONG" => "ULong",
+        "DBF_INT64" => "Int64",
+        "DBF_UINT64" => "UInt64",
+        "DBF_FLOAT" => "Float",
+        "DBF_DOUBLE" => "Double",
+        "DBF_ENUM" => "Enum",
+        "DBF_MENU" => "Menu",
+        "DBF_DEVICE" => "Device",
+        "DBF_INLINK" => "Inlink",
+        "DBF_OUTLINK" => "Outlink",
+        "DBF_FWDLINK" => "Fwdlink",
+        "DBF_NOACCESS" => "NoAccess",
+        other => return Err(format!("{other}: not one of C's 18 DBF_* types")),
+    })
+}
+
 /// True for a field that has no CA-visible representation at all: a
 /// `DBF_NOACCESS` C-internal pointer (`RSET`, `DPVT`, `MLOK`, `BPTR`, ...).
 ///
@@ -56,13 +88,64 @@ pub fn is_internal(f: &Field) -> bool {
     f.dbf == "DBF_NOACCESS" && f.special.as_deref() != Some("SPC_DBADDR")
 }
 
+/// The byte width of the C struct member an `extra("...")` declaration names.
+///
+/// No `.dbd` spells this. A C IOC's generated `<rec>RecordSizeOffset` writes
+/// `sizeof(prec->member)` into `pdbFldDes->size`, so the width comes from the
+/// C type — which is why the declaration text has to be carried at all, and
+/// why `dbpr`'s `DBF_NOACCESS` arm reads both (`dbTest.c:1235-1262`).
+///
+/// `None` for a member this port cannot state a width for, and the test is on
+/// the DECLARATOR, not just the type name: only a plain scalar member has a
+/// width the type alone gives. A pointer (`*`) is refused because C prints its
+/// ADDRESS (`PTR %p`), which no two IOCs agree on. An array (`[`) is refused
+/// because its width is the bound, not the element — `calc.RPCL` is
+/// `extra("char rpcl[INFIX_TO_POSTFIX_SIZE(160)]")`, whose size is that C
+/// macro expanded, and reading the leading `char` would carry the row at one
+/// byte and print a one-byte `dbpr` line where C prints the whole buffer.
+fn extra_width(extra: &str) -> Option<u16> {
+    if extra.contains('*') || extra.contains('[') {
+        return None;
+    }
+    match extra.split_whitespace().next()? {
+        "epicsInt8" | "epicsUInt8" | "char" => Some(1),
+        "epicsInt16" | "epicsUInt16" | "short" => Some(2),
+        "epicsInt32" | "epicsUInt32" | "epicsFloat32" => Some(4),
+        "epicsInt64" | "epicsUInt64" | "epicsFloat64" => Some(8),
+        // `epicsTimeStamp` is two `epicsUInt32` (`epicsTime.h`), which is
+        // what `dbCommon.TIME` stands for.
+        "epicsTimeStamp" => Some(8),
+        _ => None,
+    }
+}
+
+/// An internal the port carries as a full `FieldDesc` rather than as a bare
+/// name in `record_noaccess_fields` / `DB_COMMON_NOACCESS`.
+///
+/// A `DBF_NOACCESS` row is never SERVED — `mapDBFToDBR` refuses its channel —
+/// but C still resolves the name and still prints the field in `dbpr`, and
+/// both need the declaration, not just proof that the name exists. So the row
+/// is kept exactly when the port can say how wide it is; everything else stays
+/// a name.
+pub fn internal_width(f: &Field) -> Option<u16> {
+    if !is_internal(f) {
+        return None;
+    }
+    extra_width(f.extra.as_deref()?)
+}
+
+/// True when the row is dropped to a bare name.
+pub fn is_dropped_internal(f: &Field) -> bool {
+    is_internal(f) && internal_width(f).is_none()
+}
+
 /// What C's `cvt_dbaddr` makes of one `special(SPC_DBADDR)` field —
 /// `dbd/cvt_dbaddr.types`.
 pub struct CvtDbAddr {
     pub dbf: String,
     /// The `special` C leaves on the DBADDR. Usually still `SPC_DBADDR`, but
     /// `lsi`/`lso`/`asyn` raise `SPC_NOMOD` (making the field unwritable over
-    /// CA — `rsrv/camessage.c:2611-2613`) or `SPC_MOD` inside `cvt_dbaddr` itself.
+    /// CA — `rsrv/camessage.c:2545-2547`) or `SPC_MOD` inside `cvt_dbaddr` itself.
     pub special: String,
     /// The field whose value selects the type at runtime (`FTVL`, `SDEF`,
     /// `FTA`), or `None` when C's `cvt_dbaddr` always yields the same type.
@@ -186,6 +269,14 @@ fn rust_str(s: &str) -> String {
     format!("{s:?}")
 }
 
+/// An optional `.dbd` string attribute as a Rust `Option<&'static str>`.
+fn opt_str(v: &Option<String>) -> String {
+    match v {
+        Some(t) => format!("Some({})", rust_str(t)),
+        None => "None".to_string(),
+    }
+}
+
 pub struct Input<'a> {
     pub menus: &'a BTreeMap<String, Menu>,
     pub devices: &'a [Device],
@@ -209,6 +300,8 @@ pub struct Input<'a> {
     /// Record type names in DBD load order. Emitted only by the base target;
     /// empty everywhere else.
     pub order: &'a [String],
+    /// Every `variable()` this target's `.dbd`s declare.
+    pub variables: &'a [Variable],
 }
 
 /// The type to emit for one field: the `.dbd`'s `DBF_*`, except for a
@@ -266,14 +359,23 @@ pub fn emit(input: &Input<'_>) -> Result<String, String> {
          //!   into every record table would double-declare them. Base's table emits\n\
          //!   them separately as `DB_COMMON_FIELDS` so the two models can be reconciled\n\
          //!   (and so a `dbCommon` addition is a diff, not a silent gap).\n\
-         //! * **`DBF_NOACCESS` fields** (`RSET`, `DPVT`, `MLOK`, `BPTR`, `PPN`, ...).\n\
-         //!   These are C-internal pointers with no CA/PVA representation — C's\n\
-         //!   `mapDBFToDBR` sends them to `DBR_NOACCESS` and `dbChannelCreate` refuses\n\
-         //!   a channel on them. A Rust port has no pointer to expose, so their\n\
-         //!   *descriptors* are dropped rather than invented — but their NAMES are\n\
-         //!   kept (`record_noaccess_fields`): C's `dbNameToAddr` resolves them, so\n\
-         //!   a SEARCH for `REC.BPTR` is answered and the refusal lands at channel\n\
-         //!   creation, and the search gate needs the names to do the same.\n",
+         //! * **`DBF_NOACCESS` rows whose `extra(...)` names a pointer or an\n\
+         //!   array** (`RSET`, `DPVT`, `MLOK`, `BPTR`, `PPN`, ...). C keeps\n\
+         //!   `sizeof` the struct member in `pdbFldDes->size`, and neither a\n\
+         //!   pointer (whose C value is an address no two IOCs agree on) nor an\n\
+         //!   array (whose width is its bound, not its element) has one this port\n\
+         //!   can state, so the *descriptor* is dropped rather than invented —\n\
+         //!   but the NAME is kept (`record_noaccess_fields`): C's `dbNameToAddr`\n\
+         //!   resolves them, so a SEARCH for `REC.BPTR` is answered and the\n\
+         //!   refusal lands at channel creation, and the search gate needs the\n\
+         //!   names to do the same.\n\
+         //!\n\
+         //!   A row whose `extra(...)` names a plain scalar — `dbCommon`'s `BKPT`\n\
+         //!   and `TIME` — is CARRIED, descriptor and width both, because `dbpr`\n\
+         //!   prints its bytes and `dba` reports its `Field Size` and both read\n\
+         //!   the declaration. Carried is not servable: `FieldDesc::unreadable`\n\
+         //!   is what refuses the read, so the SEARCH is answered off the\n\
+         //!   descriptor instead of off the name list.\n",
         input.dbd_dir
     )
     .unwrap();
@@ -281,7 +383,7 @@ pub fn emit(input: &Input<'_>) -> Result<String, String> {
     if !input.devices.is_empty() {
         writeln!(out, "use {base}::server::record::DbLinkType;").unwrap();
     }
-    // `Asl`, `Special` and `DbFieldType` appear ONLY in an emitted `FieldDesc`
+    // `Asl`, `Special`, `DbFieldType` and `DbfCode` appear ONLY in an emitted `FieldDesc`
     // literal, so a target with no record fields (asyn declares only `device()`
     // lines, no `recordtype`) would import them unused — a hard error under
     // `clippy -D warnings`, which promotes rustc's `unused_imports`. `FieldDesc`
@@ -291,10 +393,10 @@ pub fn emit(input: &Input<'_>) -> Result<String, String> {
     if emits_fields {
         writeln!(
             out,
-            "use {base}::server::record::{{Asl, FieldDesc, Special}};"
+            "use {base}::server::record::{{Asl, Base, FieldDesc, Special}};"
         )
         .unwrap();
-        writeln!(out, "use {base}::types::DbFieldType;\n").unwrap();
+        writeln!(out, "use {base}::types::{{DbFieldType, DbfCode}};\n").unwrap();
     } else {
         writeln!(out, "use {base}::server::record::FieldDesc;\n").unwrap();
     }
@@ -363,6 +465,62 @@ pub fn emit(input: &Input<'_>) -> Result<String, String> {
     );
     out.push_str("}\n\n");
 
+    // The `choice()` identifier is the C enum name, so nothing on the wire ever
+    // sees it and `menu_choices` has no column for it — but `dbWriteMenuFP`
+    // (`dbStaticLib.c:919-924`) prints `choice(<ident>,"<value>")`, so
+    // `dbDumpMenu` cannot reproduce its report from the values alone.
+    out.push_str(
+        "/// Every `menu()` this target declares: EPICS name, `choice()` identifiers,\n\
+         /// and choice values — the three columns `dbWriteMenuFP` prints\n\
+         /// (`dbStaticLib.c:919-924`), which is what `dbDumpMenu` reports.\n\
+         ///\n\
+         /// C walks `pdbbase->menuList` in `.dbd` LOAD order. A compiled-in table has\n\
+         /// no load order, so the rows are in name order; the per-menu choice order is\n\
+         /// still the `.dbd` order, because that one is the wire-visible index.\n\
+         pub static MENUS: &[(&str, &[&str], &[&str])] = &[\n",
+    );
+    for (name, menu) in input.menus {
+        let konst = menu_const(name);
+        write!(out, "    ({}, &[", rust_str(name)).unwrap();
+        for (i, id) in menu.identifiers.iter().enumerate() {
+            if i > 0 {
+                out.push_str(", ");
+            }
+            out.push_str(&rust_str(id));
+        }
+        writeln!(out, "], {konst}),").unwrap();
+    }
+    out.push_str("];\n\n");
+
+    // `variable()` is the second half of C's `dbCore.dbd`-style declaration:
+    // `dbVariable` appends it to `pdbbase->variableList`, which is what
+    // `dbDumpVariable` prints. It is NOT the iocsh `var` table — C fills that
+    // one from these declarations through `registerRecordDeviceDriver.pl`, and
+    // a variable registered directly from C code (`asCheckClientIP`) is in the
+    // iocsh table and absent from this one.
+    out.push_str(
+        "/// Every `variable()` this target's `.dbd`s declare, as EPICS name and\n\
+         /// declared type — the two columns `dbWriteVariableFP` prints\n\
+         /// (`dbStaticLib.c:1136-1149`), which is what `dbDumpVariable` reports.\n\
+         ///\n\
+         /// Name order, which is also C's: `dbVariable` appends in load order, but\n\
+         /// the loaded `.dbd` is `dbExpand` output and that tool emits each\n\
+         /// declaration family sorted (measured in an installed `softIoc.dbd`).\n\
+         pub static VARIABLES: &[(&str, &str)] = &[\n",
+    );
+    let mut variables: Vec<&Variable> = input.variables.iter().collect();
+    variables.sort_by(|a, b| a.name.cmp(&b.name));
+    for var in variables {
+        writeln!(
+            out,
+            "    ({}, {}),",
+            rust_str(&var.name),
+            rust_str(&var.dtype)
+        )
+        .unwrap();
+    }
+    out.push_str("];\n\n");
+
     // --- field tables ---------------------------------------------------
     out.push_str(
         "// ---------------------------------------------------------------------\n\
@@ -373,17 +531,19 @@ pub fn emit(input: &Input<'_>) -> Result<String, String> {
 
     let mut record_consts: Vec<(String, String)> = Vec::new();
     let mut noaccess_consts: Vec<(String, String)> = Vec::new();
+    let mut decl_consts: Vec<(String, String)> = Vec::new();
+    let mut no_prompt: Vec<(String, usize)> = Vec::new();
     for rec in input.records {
         let konst = fields_const(&rec.name);
         let own: Vec<&Field> = rec
             .fields
             .iter()
-            .filter(|f| !f.from_common && !is_internal(f))
+            .filter(|f| !f.from_common && !is_dropped_internal(f))
             .collect();
         let internal: Vec<&str> = rec
             .fields
             .iter()
-            .filter(|f| !f.from_common && is_internal(f))
+            .filter(|f| !f.from_common && is_dropped_internal(f))
             .map(|f| f.name.as_str())
             .collect();
 
@@ -414,24 +574,58 @@ pub fn emit(input: &Input<'_>) -> Result<String, String> {
         // resolves a `DBF_NOACCESS` field, so a SEARCH for it is answered
         // and the refusal lands at channel creation. The search gate
         // consults this list to answer the same way.
-        if !internal.is_empty() {
-            let na_konst = format!("{}_NOACCESS", konst.trim_end_matches("_FIELDS"));
-            writeln!(
-                out,
-                "/// `recordtype({})` — the `DBF_NOACCESS` internal names dropped from\n\
-                 /// [`{konst}`]: resolvable (a SEARCH is answered), never servable.",
-                rec.name
-            )
-            .unwrap();
-            writeln!(out, "pub static {na_konst}: &[&str] = &[").unwrap();
-            for name in &internal {
-                writeln!(out, "    {},", rust_str(name)).unwrap();
-            }
-            out.push_str("];\n\n");
-            noaccess_consts.push((rec.name.clone(), na_konst));
-        } else {
-            noaccess_consts.push((rec.name.clone(), "&[]".to_string()));
+        // Emitted for every record type, empty included: whether a type has a
+        // dropped internal depends on what its `extra()` declarations name, so
+        // a const that comes and goes with that breaks downstream code the day
+        // one of those declarations becomes carryable.
+        let na_konst = format!("{}_NOACCESS", konst.trim_end_matches("_FIELDS"));
+        writeln!(
+            out,
+            "/// `recordtype({})` — the `DBF_NOACCESS` internal names dropped from\n\
+             /// [`{konst}`]: resolvable (a SEARCH is answered), never servable.",
+            rec.name
+        )
+        .unwrap();
+        writeln!(out, "pub static {na_konst}: &[&str] = &[").unwrap();
+        for name in &internal {
+            writeln!(out, "    {},", rust_str(name)).unwrap();
         }
+        out.push_str("];\n\n");
+        noaccess_consts.push((rec.name.clone(), na_konst));
+
+        // C's `papFldDes` — EVERY declaration in `.dbd` order with dbCommon
+        // spliced at the `include`, internals included. It is a different list
+        // from `{konst}` in a different order, and it is the one C indexes:
+        // `dbRecordtypeBody` (`dbLexRoutines.c:745-750`) numbers `indRecordType`
+        // over it, and `link_ind`, `sortFldInd` and `indvalFlddes` are all
+        // indices into it. Names only — `offset` and the non-`DBF_STRING`
+        // `size` are `offsetof`/`sizeof` of the generated C struct, which this
+        // port has no counterpart for — except on a carried `DBF_NOACCESS`
+        // row, whose width comes from the C type its `extra()` names.
+        let decl_konst = format!("{}_DECL", konst.trim_end_matches("_FIELDS"));
+        writeln!(
+            out,
+            "/// `recordtype({})` — C's `papFldDes` order, all {} declarations\n\
+             /// including the internals [`{konst}`] drops. The index into this is\n\
+             /// C's `indRecordType`.",
+            rec.name,
+            rec.fields.len()
+        )
+        .unwrap();
+        writeln!(out, "pub static {decl_konst}: &[&str] = &[").unwrap();
+        for f in &rec.fields {
+            writeln!(out, "    {},", rust_str(&f.name)).unwrap();
+        }
+        out.push_str("];\n\n");
+        decl_consts.push((rec.name.clone(), decl_konst));
+        // `dbRecordtypeBody:752` counts `promptgroup`, not `prompt`.
+        no_prompt.push((
+            rec.name.clone(),
+            rec.fields
+                .iter()
+                .filter(|f| f.promptgroup.is_some())
+                .count(),
+        ));
     }
 
     // Every `cvt_dbaddr.types` row must name a field that really is
@@ -463,7 +657,11 @@ pub fn emit(input: &Input<'_>) -> Result<String, String> {
     // port and it is base's `dbd/dbCommon.dbd`. A downstream `.dbd` that says
     // `include "dbCommon.dbd"` is served that one — its fields are marked
     // `from_common` and dropped from its record tables, exactly as base's are.
-    let common_own: Vec<&Field> = input.common.iter().filter(|f| !is_internal(f)).collect();
+    let common_own: Vec<&Field> = input
+        .common
+        .iter()
+        .filter(|f| !is_dropped_internal(f))
+        .collect();
     if !common_own.is_empty() {
         writeln!(
             out,
@@ -491,7 +689,7 @@ pub fn emit(input: &Input<'_>) -> Result<String, String> {
         let common_internal: Vec<&str> = input
             .common
             .iter()
-            .filter(|f| is_internal(f))
+            .filter(|f| is_dropped_internal(f))
             .map(|f| f.name.as_str())
             .collect();
         if !common_internal.is_empty() {
@@ -560,6 +758,39 @@ pub fn emit(input: &Input<'_>) -> Result<String, String> {
             .iter()
             .map(|(k, v)| (k.as_str(), v.as_str())),
     );
+    out.push_str("}\n\n");
+
+    out.push_str(
+        "/// Every field a record type declares, in C's `papFldDes` order — the order\n\
+         /// `dbDumpRecordType` indexes and `link_ind`/`sortFldInd`/`indvalFlddes`\n\
+         /// point into. Unlike `record_fields` this keeps the `DBF_NOACCESS`\n\
+         /// internals and splices dbCommon where the `.dbd` puts its `include`, so\n\
+         /// the index of a name here is C's own `indRecordType` for it.\n\
+         pub fn record_declaration_order(record_type: &str) -> Option<&'static [&'static str]> {\n",
+    );
+    emit_str_lookup(
+        &mut out,
+        "record_type",
+        decl_consts.iter().map(|(k, v)| (k.as_str(), v.as_str())),
+    );
+    out.push_str("}\n\n");
+
+    out.push_str(
+        "/// C's `pdbRecordType->no_prompt`: how many of `record_declaration_order`'s\n\
+         /// declarations carry a `promptgroup(...)` (`dbLexRoutines.c:752`). Counted\n\
+         /// here because the port drops `promptgroup` at emit, so it cannot be\n\
+         /// recovered from the field tables.\n\
+         pub fn record_no_prompt(record_type: &str) -> Option<u16> {\n",
+    );
+    if no_prompt.is_empty() {
+        out.push_str("    let _ = record_type;\n    None\n");
+    } else {
+        out.push_str("    Some(match record_type {\n");
+        for (name, n) in &no_prompt {
+            writeln!(out, "        {} => {n},", rust_str(name)).unwrap();
+        }
+        out.push_str("        _ => return None,\n    })\n");
+    }
     out.push_str("}\n\n");
 
     writeln!(
@@ -752,12 +983,27 @@ fn emit_field(
     dbd_dir: &str,
 ) -> Result<String, String> {
     let (dbf, spc) = field_dbf(record, f, cvt, dbd_dir)?;
-    let ty = dbf_to_rust(dbf).ok_or_else(|| format!("{record}.{}: unknown {dbf}", f.name))?;
-    let special = if spc.is_empty() {
-        "Special::None".to_string()
-    } else {
-        format!("Special::{}", special_variant(spc)?)
+    // A kept `DBF_NOACCESS` internal has no served type — its channel is
+    // refused at creation — and every reader C allows treats it as `size`
+    // raw bytes (`dbTest.c:1249-1262`), so that is the type it carries.
+    let kept_internal = internal_width(f);
+    let ty = match kept_internal {
+        Some(_) => "UChar",
+        None => dbf_to_rust(dbf).ok_or_else(|| format!("{record}.{}: unknown {dbf}", f.name))?,
     };
+    let variant = |token: &str| -> Result<String, String> {
+        Ok(if token.is_empty() {
+            "Special::None".to_string()
+        } else {
+            format!("Special::{}", special_variant(token)?)
+        })
+    };
+    let special = variant(spc)?;
+    // `field_dbf` swapped in the `cvt_dbaddr` code for an SPC_DBADDR field, so
+    // `spc` above is what C's resolved `DBADDR` carries. The `.dbd`'s own token
+    // is a SECOND fact — it is what `pdbFldDes->special` keeps, and what every
+    // reader of the declaration (the loader's field suggestion) must see.
+    let declared_special = variant(f.special.as_deref().unwrap_or(""))?;
     // C's `.dbd` default is ASL1 (`dbLexRoutines.c:570`); `asl(ASL0)` lowers it.
     let asl = match f.asl.as_deref() {
         Some("ASL0") => "Asl::Asl0",
@@ -765,6 +1011,15 @@ fn emit_field(
         Some(other) => return Err(format!("{}: unknown asl({other})", f.name)),
     };
     let menu = match &f.menu {
+        // `menuScan` is the one menu that is NOT a compile-time table. C reads
+        // it out of `pdbbase` at `iocInit` (`initPeriodic`, `dbScan.c:858`)
+        // because a site may ship its own `menuScan.dbd` with other rates, so
+        // a field declared `menu(menuScan)` — `SSCN`, on the 21 records that
+        // carry it — must resolve through the LOADED menu. Emitting `None`
+        // sends it to `shared_menu_choices`, which is where that lives; a
+        // `Some(MENU_SCAN)` here would pin the field to base's own rates and
+        // serve a site IOC labels its menu does not have.
+        Some(m) if m == "menuScan" => "None".to_string(),
         Some(m) => {
             let konst = menus.get(m).ok_or_else(|| {
                 format!("{}: menu({m}) is not declared by any vendored .dbd", f.name)
@@ -773,10 +1028,7 @@ fn emit_field(
         }
         None => "None".to_string(),
     };
-    let initial = match &f.initial {
-        Some(i) => format!("Some({})", rust_str(i)),
-        None => "None".to_string(),
-    };
+    let initial = opt_str(&f.initial);
 
     let mut s = String::new();
     // An SPC_DBADDR field's type is not in the `.dbd` — say where it came from,
@@ -800,22 +1052,56 @@ fn emit_field(
         }
     }
     let runtime_typed = entry.is_some_and(|c| c.selector.is_some());
+    // The RAW declaration, before `field_dbf` swapped in the cvt_dbaddr type —
+    // C's `pdbFldDes->field_type`, which `dbDumpField` prints and which
+    // `dbPutString` refuses a `.db` assignment on (`dbStaticLib.c:2646-2650`).
+    // It is a SECOND fact, not a spelling of `dbf_type`: `dbf_to_rust` above
+    // collapses six tokens onto two served types and the swap loses the rest,
+    // so after either one the row can no longer say what it was declared.
+    let declared_dbf = dbf_to_code(&f.dbf).map_err(|e| format!("{}: {e}", f.name))?;
     // `read_only` is `special(SPC_NOMOD)` — its own bit because it is the one
     // attribute the runtime put gate reads on every write.
     let read_only = spc == "SPC_NOMOD";
     writeln!(s, "    FieldDesc {{").unwrap();
     writeln!(s, "        name: {},", rust_str(&f.name)).unwrap();
     writeln!(s, "        dbf_type: DbFieldType::{ty},").unwrap();
+    writeln!(s, "        declared_dbf: DbfCode::{declared_dbf},").unwrap();
     writeln!(s, "        runtime_typed: {runtime_typed},").unwrap();
     writeln!(s, "        read_only: {read_only},").unwrap();
     writeln!(s, "        special: {special},").unwrap();
+    writeln!(s, "        declared_special: {declared_special},").unwrap();
     writeln!(s, "        pp: {},", f.pp).unwrap();
     writeln!(s, "        asl: {asl},").unwrap();
-    writeln!(s, "        size: {},", f.size.unwrap_or(0)).unwrap();
+    writeln!(
+        s,
+        "        size: {},",
+        kept_internal.unwrap_or_else(|| f.size.unwrap_or(0) as u16)
+    )
+    .unwrap();
+    // C's loader requires `extra` on every DBF_NOACCESS row and `size` on
+    // every DBF_STRING one (`dbLexRoutines.c:755-762`); both are carried
+    // because `dbpr`'s DBF_NOACCESS arm reads the declaration TEXT to choose
+    // a renderer (`dbTest.c:1235-1247`).
+    writeln!(s, "        extra: {},", opt_str(&f.extra)).unwrap();
     writeln!(s, "        menu: {menu},").unwrap();
     writeln!(s, "        initial: {initial},").unwrap();
     writeln!(s, "        interest: {},", f.interest.unwrap_or(0)).unwrap();
     writeln!(s, "        prop: {},", f.prop).unwrap();
+    // `prompt` is the parenthesised half of the db loader's field suggestion
+    // and `promptgroup` one of its weights (`dbLexRoutines.c:1288`, `:1382`),
+    // so a table without them cannot reproduce that line. The parser has
+    // always read both; only the emitter dropped them.
+    writeln!(s, "        prompt: {},", opt_str(&f.prompt)).unwrap();
+    writeln!(s, "        promptgroup: {},", opt_str(&f.promptgroup)).unwrap();
+    // `base(HEX)` picks `ulongToHexString` over the decimal converters inside
+    // `dbGetStringNum` (`dbStaticLib.c:2074-2124`), so a table without it
+    // makes `dbpr` print `ZRVL: 10` where C prints `ZRVL: 0xa`.
+    writeln!(
+        s,
+        "        base: Base::{},",
+        if f.base_hex { "Hex" } else { "Decimal" }
+    )
+    .unwrap();
     writeln!(s, "    }},").unwrap();
     Ok(s)
 }

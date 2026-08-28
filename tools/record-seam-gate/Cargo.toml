@@ -7,3 +7,9 @@ license = "EPICS"
 description = "Dev-only: the record-processing runtime-seam census, shared by every crate that hosts record or device support"
 
 [dependencies]
+# This crate is itself `publish = false` and dev-only, so the shared
+# production-slice rule is a plain dependency here rather than a dev one.
+source-guard = { path = "../../crates/source-guard" }
+
+[dev-dependencies]
+tempfile = "3"

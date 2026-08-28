@@ -14,7 +14,7 @@
 //! (CBUG-D4): `epicsStrnEscapedFromRaw` has a deliberate `case '\0'` printing
 //! `\0` (:145), while `epicsStrPrintEscaped` forgot it, so NUL falls through to
 //! the `\xNN` default and prints `\x00` (:259). Under the clean-is-the-goal
-//! strategy (`doc/strategy-2026-07-13.md §2`) the port **refuses** that
+//! strategy the port **refuses** that
 //! divergence: both forms render NUL as `\0` — C's deliberate escape, the one
 //! its round-trippable decoder `epicsStrnRawFromEscaped` was written to accept
 //! (`case '0'`). The refusal is structural: [`escape`] holds the single table
@@ -64,7 +64,7 @@ pub(crate) fn escaped_from_raw(src: &[u8], dstlen: usize) -> String {
 /// [`escaped_from_raw`] (both reach the one [`escape`] table). It writes to a
 /// stream, so it has no destination bound.
 ///
-/// It takes an explicit `len`, yet guards on `strlen(s) == 0` (`:236-237`):
+/// It takes an explicit `len`, yet guards on `strlen(s) == 0` (`:237-238`):
 /// a buffer whose **first byte** is NUL is "no work to do" and prints
 /// *nothing*, however many bytes follow it. A NUL anywhere later is escaped
 /// normally — `strlen` only looks at the first one. Compiled libCom:
@@ -73,7 +73,22 @@ pub(crate) fn escaped_from_raw(src: &[u8], dstlen: usize) -> String {
 /// CBUG-D4 and renders `a\0b`). This first-byte-NUL early-return is a C quirk,
 /// not a Rust convenience: the ESCAPE trace form on a `FILE *` sink prints an
 /// empty data line for a payload that starts with NUL. It is a *separate*
-/// behaviour from the NUL-rendering divergence, and is kept.
+/// behaviour from the NUL-rendering divergence.
+///
+/// **Allowlist row, not a parity claim — upstream has deleted this guard.**
+/// The two reads, both taken from `modules/libcom/src/misc/epicsString.c:237`:
+///
+/// - `R7.0.10` (the declared base pin): `if (s == NULL || strlen(s) == 0 || len == 0)`
+/// - `origin/7.0`: `if (s == NULL || len == 0)`
+///
+/// The `strlen(s) == 0` disjunct was removed by `2f20e78e4`
+/// ("epicsStrPrintEscaped() operate on unterminated string", Michael
+/// Davidsaver, 2026-05-12), which is reachable from `origin/7.0` and from no
+/// tag. So [`print_escaped`]'s early return matches the pin this port declares
+/// and deviates from current upstream, which now escapes all `len` bytes of a
+/// buffer beginning with NUL. When the base pin advances past `2f20e78e4` the
+/// early return below must be deleted, not re-pinned: the behaviour it mirrors
+/// will no longer exist.
 pub(crate) fn print_escaped(src: &[u8]) -> String {
     if src.first().is_none_or(|&c| c == 0) {
         return String::new();

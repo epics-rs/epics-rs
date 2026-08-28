@@ -169,7 +169,7 @@ pub enum Capability {
     /// register it explicitly (`option.interfaceType = asynOptionType` in
     /// drvAsynIPPort.c:1025, drvAsynSerialPort.c:1098, drvVxi11.c:1777,
     /// drvAsynFTDIPort.cpp:582) and asynRecord's `optioniv` is the result of
-    /// `findInterface(asynOptionType)` (asynRecord.c:1177-1187).
+    /// `findInterface(asynOptionType)` (asynRecord.c:1177-1186).
     Option,
     /// The `asynDrvUser` interface — see [`InterfaceType::DrvUser`]. A driver
     /// that declares it can resolve a `drvInfo` string to a parameter reason

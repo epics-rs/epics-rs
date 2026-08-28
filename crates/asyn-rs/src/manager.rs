@@ -449,6 +449,12 @@ mod tests {
         // duplicate names now error (C registerPort parity).
         let mut drv = DummyDriver::new("mgr_eos_port");
         drv.base.create_param("VAL", ParamType::Int32).unwrap();
+        // A port that accepts an EOS is one C configured with `processEosIn/
+        // Out`, so `asynOctetBase::initialize` installed `asynInterposeEos`
+        // above the driver (asynOctetBase.c:169-171). A driver with no EOS
+        // methods and no such layer answers "not implemented" (R18-71).
+        drv.base
+            .install_octet_interpose(Box::new(crate::interpose::eos::EosInterpose::default()));
         let handle = mgr.register_port(drv).unwrap();
 
         // Drive through the public handle helper — same path as

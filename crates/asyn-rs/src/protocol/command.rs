@@ -87,6 +87,9 @@ pub enum PortCommand {
         data: Vec<f32>,
     },
     Flush,
+    /// C `asynCallbackProcess` with `tmod == asynTMOD_NoIO` — a queued
+    /// request that performs no transfer. See [`crate::request::RequestOp::NoIo`].
+    NoIo,
     Connect,
     Disconnect,
     /// `ASYN_DESTRUCTIBLE` port shutdown — C asynManager.c:2251.
@@ -106,7 +109,7 @@ pub enum PortCommand {
         yes: bool,
     },
     /// Per-device auto-connect toggle — the `addr` half of the same C call,
-    /// selected by `findDpCommon` (asynManager.c:496-509).
+    /// selected by `findDpCommon` (asynManager.c:536-544).
     SetAutoConnectAddr {
         yes: bool,
     },
@@ -116,8 +119,18 @@ pub enum PortCommand {
     GetEnable,
     /// Query whether auto-connect is enabled for the port.
     GetAutoConnect,
-    BlockProcess,
-    UnblockProcess,
+    /// C's `allDevices` argument to `blockProcessCallback`
+    /// (asynManager.c:1692): `true` takes the port-wide holder, `false` the
+    /// holder of the `dpCommon` the request's own `addr` resolves to. The
+    /// variant was a unit before, which is the wire shape of a port-wide
+    /// block only — an externally-tagged unit variant and a struct variant do
+    /// not interconvert, so this is a wire change, not an additive one.
+    BlockProcess {
+        all_devices: bool,
+    },
+    UnblockProcess {
+        all_devices: bool,
+    },
     DrvUserCreate {
         drv_info: String,
         /// The record's asyn `addr` (C `drvUserCreate` `checkOffset` input).
@@ -162,7 +175,7 @@ pub enum PortCommand {
     /// Install the delay interpose — C
     /// `asynInterposeDelay(portName, addr, delay)`. The delay travels as
     /// seconds, the C `double` argument's own unit
-    /// (asynInterposeDelay.c:223). Appended last: the variant order is the
+    /// (asynInterposeDelay.c:217). Appended last: the variant order is the
     /// wire encoding.
     PushDelayInterpose {
         delay_secs: f64,
@@ -243,6 +256,7 @@ mod tests {
                 data: vec![1.0, 2.0],
             },
             PortCommand::Flush,
+            PortCommand::NoIo,
             PortCommand::Connect,
             PortCommand::Disconnect,
             PortCommand::ConnectAddr,
@@ -256,8 +270,8 @@ mod tests {
             PortCommand::GetBoundsInt64,
             PortCommand::GetEnable,
             PortCommand::GetAutoConnect,
-            PortCommand::BlockProcess,
-            PortCommand::UnblockProcess,
+            PortCommand::BlockProcess { all_devices: true },
+            PortCommand::UnblockProcess { all_devices: true },
             PortCommand::DrvUserCreate {
                 drv_info: "MOTOR_STATUS".into(),
                 addr: 0,

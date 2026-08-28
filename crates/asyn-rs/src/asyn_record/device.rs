@@ -17,7 +17,7 @@
 use std::sync::Arc;
 
 use epics_base_rs::error::CaResult;
-use epics_base_rs::server::device_support::DeviceSupport;
+use epics_base_rs::server::device_support::{DeviceInitOutcome, DeviceSupport};
 use epics_base_rs::server::record::Record;
 
 use super::AsynRecord;
@@ -47,12 +47,12 @@ impl AsynRecordDevice {
 impl DeviceSupport for AsynRecordDevice {
     /// C's DSET has no `init_record` slot (asynRecord.c:266). This is not that:
     /// it is where the DSET picks up its `dpvt` — the record's `IoIntrScan`.
-    fn init(&mut self, record: &mut dyn Record) -> CaResult<()> {
+    fn init(&mut self, record: &mut dyn Record) -> CaResult<DeviceInitOutcome> {
         self.scan = record
             .as_any_mut()
             .and_then(|any| any.downcast_mut::<AsynRecord>())
             .map(|rec| rec.io_intr_scan());
-        Ok(())
+        Ok(DeviceInitOutcome::Live)
     }
 
     /// C's DSET has no `write` (slot 5 is 0): the asyn record is not an output

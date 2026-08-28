@@ -12,21 +12,28 @@ pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(1);
 
 /// The single owner of every `f64 seconds` → [`AsynUser::timeout`] conversion.
 ///
-/// C carries the timeout as a `double` and accepts operator values this type
-/// cannot hold: `strtod` parses the negative "wait forever" sentinel
-/// (`@asyn(PORT,0,-1)`, asynEpicsUtils.c:125), and a record's TMOT field can
-/// hold a negative, NaN or infinite double. [`AsynUser::timeout`] is an
-/// unsigned `Duration` — the signed-off framework deviation **DRV-42**, which
-/// keeps every blocking driver operation bounded so a stuck device cannot
-/// wedge the port actor thread — so none of those values is representable.
+/// C carries the timeout as a `double` whose **sign** carries meaning: a
+/// negative value is the "wait forever" the operator asked for, and every wait
+/// built from it is unbounded — `readPollmsec = -1` for the IP driver
+/// (drvAsynIPPort.c:741-743), `VMIN = 1` with no `VTIME` for the serial driver
+/// (drvAsynSerialPort.c:906-909). It reaches asyn from `@asyn(PORT,0,-1)`
+/// (`strtod`, asynEpicsUtils.c:125) and from a record's TMOT field. `None` is
+/// that value here (DRV-42); it used to take [`DEFAULT_TIMEOUT`] instead, so a
+/// record told to wait forever timed out after a second and raised an alarm C
+/// never raises.
 ///
-/// Every such value therefore takes the bounded [`DEFAULT_TIMEOUT`]. Callers
-/// must not construct a `Duration` from an operator-supplied `f64` themselves:
+/// The values that remain unrepresentable are the ones C has no defined
+/// behaviour for either — NaN, infinity, and a magnitude beyond `Duration` —
+/// and those still take the bounded [`DEFAULT_TIMEOUT`]. Callers must not
+/// construct a `Duration` from an operator-supplied `f64` themselves:
 /// `Duration::from_secs_f64` *panics* on exactly the inputs C accepts, so
 /// routing the conversion through this function is what makes the panic
 /// structurally impossible rather than merely unobserved.
-pub fn timeout_from_secs(secs: f64) -> Duration {
-    Duration::try_from_secs_f64(secs).unwrap_or(DEFAULT_TIMEOUT)
+pub fn timeout_from_secs(secs: f64) -> Option<Duration> {
+    if secs.is_finite() && secs < 0.0 {
+        return None;
+    }
+    Some(Duration::try_from_secs_f64(secs).unwrap_or(DEFAULT_TIMEOUT))
 }
 
 /// C `ASYN_REASON_QUEUE_EVEN_IF_NOT_CONNECTED` (asynDriver.h:105, aliasing
@@ -75,16 +82,28 @@ pub enum ConnectCheck {
 pub struct AsynUser {
     /// Parameter index (called "reason" in C asyn).
     pub reason: usize,
-    /// Sub-address for multi-device ports. Always 0 for single-device ports.
+    /// The device this user is connected to, or `-1` when it is connected to
+    /// the port itself. `-1` is the default: C decides port-vs-device from
+    /// whether `connectDevice` allocated a device at all (`puserPvt->pdevice`,
+    /// set only for `addr >= 0`, asynManager.c:1348-1351), and renders the
+    /// no-device case as -1 at the driver boundary (`getAddr`, :2004-2008;
+    /// `connectAttempt`, :752). A non-negative value therefore means a device
+    /// was deliberately chosen — `0` is device 0, never "unset".
     pub addr: i32,
     /// I/O timeout. Only meaningful for drivers that perform real I/O.
     ///
-    /// This is an unsigned `Duration`, so unlike C asyn's `double`
-    /// `pasynUser->timeout` it cannot carry the negative "wait forever"
-    /// sentinel (a finite timeout is always supplied). A deliberate
-    /// framework-wide divergence: every blocking driver operation is bounded,
-    /// so a stuck device cannot wedge the port actor thread indefinitely.
-    pub timeout: Duration,
+    /// `None` is C's negative `pasynUser->timeout`: **wait forever**, the wait
+    /// the operator asks for with `@asyn(PORT,0,-1)` or a negative TMOT. Every
+    /// driver wait built from this field must be unbounded in that case — that
+    /// is what C's `readPollmsec = -1` (drvAsynIPPort.c:741-743) and its
+    /// `VMIN = 1` (drvAsynSerialPort.c:906-909) do — and the operations C keys
+    /// off the *sign* must read it the same way: `disconnectOnReadTimeout`
+    /// fires only for `pasynUser->timeout > 0` (drvAsynIPPort.c:799), so a
+    /// forever-wait never tears the socket down.
+    ///
+    /// `Some(Duration::ZERO)` is a different thing again — C's non-blocking
+    /// poll, floored to a 1 ms wait by the drivers that poll.
+    pub timeout: Option<Duration>,
     /// How long this request may wait **in the port queue** before it is removed
     /// and reported as never having run — C `queueRequest`'s `timeout` argument
     /// (asynManager.c:1514,1617-1623), which is a different clock from
@@ -119,7 +138,7 @@ pub struct AsynUser {
     ///
     /// C's `pasynUser` reaches the trace through its `userPvt → pport/pdevice`
     /// linkage, which is what lets any layer holding the user call
-    /// `asynPrint`/`asynPrintIO` (`findTracePvt`, asynManager.c:3040-3060) —
+    /// `asynPrint`/`asynPrintIO` (`findTracePvt`, asynManager.c:546-551) —
     /// including an *interpose*, which has no other handle on the port
     /// (`asynInterposeCom.c:237-239` prints the unstuffed read at
     /// `ASYN_TRACEIO_FILTER`). `PortActor` is the single
@@ -150,8 +169,8 @@ impl Default for AsynUser {
     fn default() -> Self {
         Self {
             reason: 0,
-            addr: 0,
-            timeout: Duration::from_secs(1),
+            addr: -1,
+            timeout: Some(DEFAULT_TIMEOUT),
             queue_timeout: None,
             priority: QueuePriority::default(),
             timestamp: None,
@@ -189,7 +208,7 @@ impl AsynUser {
     ///
     /// Both halves are set here because C's gate reads both (:1536-1538) and
     /// every C caller sets both together: `asynSetOption`
-    /// (asynShellCommands.c:121,126), `asynSetEos`/`asynShowEos` (:240,:291),
+    /// (asynShellCommands.c:121,127), `asynSetEos`/`asynShowEos` (:240,:291),
     /// the record's HOSTINFO put (asynRecord.c:566-569) and its connect-time
     /// option readback (:1277-1280). Setting only the reason would leave the
     /// request at Low priority, where C still refuses it.
@@ -227,8 +246,21 @@ impl AsynUser {
         }
     }
 
-    pub fn with_timeout(mut self, timeout: Duration) -> Self {
+    pub fn with_timeout(self, timeout: Duration) -> Self {
+        self.with_timeout_opt(Some(timeout))
+    }
+
+    /// Carry a timeout that may already be C's "wait forever" — for a caller
+    /// passing on the timeout it was itself given. See [`Self::timeout`].
+    pub fn with_timeout_opt(mut self, timeout: Option<Duration>) -> Self {
         self.timeout = timeout;
+        self
+    }
+
+    /// C's negative `pasynUser->timeout`: this request's driver wait has no
+    /// bound at all — see [`Self::timeout`].
+    pub fn waiting_forever(mut self) -> Self {
+        self.timeout = None;
         self
     }
 
@@ -239,15 +271,39 @@ impl AsynUser {
         self
     }
 
-    /// C `asynPrintIO(pasynUser, mask, data, len, format, …)`
-    /// (asynManager.c:3080-3099): print the buffer through the trace config of
-    /// the port/device this user is connected to, if that mask is enabled there.
-    /// Silent for a user with no port.
-    pub fn print_io(&self, mask: crate::trace::TraceMask, data: &[u8], label: &str) {
+    /// C `asynPrintIO(pasynUser, mask, data, len, format, …)` — `tracePrintIO`
+    /// (asynManager.c:3096-3100) into `traceVprintIOSource` (:3123-3133): print
+    /// the buffer through the trace config of the port/device this user is
+    /// connected to, if that mask is enabled there. Silent for a user with no port.
+    ///
+    /// `file`/`line` are the caller's, because C's `asynPrintIO` is a macro
+    /// that captures `__FILE__`/`__LINE__` at the call site
+    /// (asynDriver.h:296-299); passing anything else would attribute the line
+    /// to this function rather than to the driver that emitted it.
+    pub fn print_io(
+        &self,
+        mask: crate::trace::TraceMask,
+        data: &[u8],
+        label: &str,
+        file: &str,
+        line: u32,
+    ) {
         let Some(t) = &self.trace else { return };
         if t.manager.is_enabled(&t.port, mask) {
-            t.manager
-                .output_device_io(&t.port, Some(self.addr), mask, data, label);
+            // C's `pasynUser->reason` is an `int` and `printPort` writes it
+            // with `%d` (asynManager.c:3018); the whole reason domain,
+            // `ASYN_REASON_SIGNAL` (-1) through `ASYN_REASON_RESERVED_HIGH`
+            // (0x7FFFFFFF), fits an `i32`.
+            t.manager.output_device_io(
+                &t.port,
+                Some(self.addr),
+                self.reason as i32,
+                mask,
+                data,
+                label,
+                file,
+                line,
+            );
         }
     }
 }
@@ -260,8 +316,12 @@ mod tests {
     fn test_user_default() {
         let u = AsynUser::default();
         assert_eq!(u.reason, 0);
-        assert_eq!(u.addr, 0);
-        assert_eq!(u.timeout, Duration::from_secs(1));
+        // A user that has not been connected to a device is port-level. C
+        // renders that as -1: `connectDevice` sets `puserPvt->pdevice` only
+        // when `addr >= 0` (asynManager.c:1348-1351), and `getAddr` returns -1
+        // whenever `pdevice` is NULL (:2004-2008).
+        assert_eq!(u.addr, -1);
+        assert_eq!(u.timeout, Some(Duration::from_secs(1)));
     }
 
     #[test]
@@ -271,6 +331,6 @@ mod tests {
             .with_timeout(Duration::from_millis(500));
         assert_eq!(u.reason, 42);
         assert_eq!(u.addr, 3);
-        assert_eq!(u.timeout, Duration::from_millis(500));
+        assert_eq!(u.timeout, Some(Duration::from_millis(500)));
     }
 }

@@ -205,7 +205,9 @@ struct SerialIoStateWin32 {
     n_written: u64,
     /// Last timeout pushed via `SetCommTimeouts`; re-applied only when the
     /// per-request timeout changes (C readIt caches `tty->readTimeout`).
-    last_timeout: Option<Duration>,
+    /// Outer `Option`: whether any timeout has been programmed on this handle
+    /// yet. Inner: the value, `None` being C's wait-forever.
+    last_timeout: Option<Option<Duration>>,
     /// C `tty->break_active` (`drvAsynSerialPortWin32.c:64`). A Win32 BREAK is
     /// LATCHED, not momentary: `setOption("break","on")` leaves the line
     /// asserted and only `"off"` or a timed form clears it. Both the setter
@@ -240,29 +242,52 @@ impl SerialIoStateWin32 {
     /// Program the comm timeouts from the request timeout, matching C readIt's
     /// `SetCommTimeouts` policy. `timeout == 0` returns immediately with
     /// whatever is already buffered; `timeout > 0` bounds the total read/write
-    /// by that many milliseconds.
-    fn apply_timeouts(&mut self, handle: HANDLE, timeout: Duration) -> AsynResult<()> {
+    /// by that many milliseconds; `None` — C's negative timeout — waits for the
+    /// device with no bound at all.
+    fn apply_timeouts(&mut self, handle: HANDLE, timeout: Option<Duration>) -> AsynResult<()> {
         if self.last_timeout == Some(timeout) {
             return Ok(());
         }
         let mut ct: COMMTIMEOUTS = unsafe { std::mem::zeroed() };
-        if timeout.is_zero() {
-            // MAXDWORD interval with zero totals = return immediately.
-            ct.ReadIntervalTimeout = u32::MAX;
-            ct.ReadTotalTimeoutMultiplier = 0;
-            ct.ReadTotalTimeoutConstant = 0;
-            ct.WriteTotalTimeoutMultiplier = 0;
-            // 0 would mean "no write timeout" (block forever); 1ms keeps a
-            // zero-timeout write near-immediate like the unix single-attempt
-            // path.
-            ct.WriteTotalTimeoutConstant = 1;
-        } else {
-            let ms = wait_millis(timeout).min(u32::MAX as u128 - 1) as u32;
-            ct.ReadIntervalTimeout = ms;
-            ct.ReadTotalTimeoutMultiplier = 1;
-            ct.ReadTotalTimeoutConstant = ms;
-            ct.WriteTotalTimeoutMultiplier = 1;
-            ct.WriteTotalTimeoutConstant = ms;
+        match timeout {
+            // C leaves `SetCommTimeouts` uncalled for a negative timeout
+            // (`if (pasynUser->timeout >= 0)`, drvAsynSerialPortWin32.c:577)
+            // and starts no timer (`readTimeout > 0`, :606), so its
+            // one-byte `ReadFile` blocks until the device answers. This
+            // backend reads into the whole buffer rather than a byte at a
+            // time, so the same "return on the first byte, never time out"
+            // has to be programmed: MAXDWORD interval with a MAXDWORD
+            // multiplier and a below-MAXDWORD constant is the documented
+            // form of it. Zeroing the read fields instead would block until
+            // the buffer filled — a wait C never performs (DRV-42).
+            None => {
+                ct.ReadIntervalTimeout = u32::MAX;
+                ct.ReadTotalTimeoutMultiplier = u32::MAX;
+                ct.ReadTotalTimeoutConstant = u32::MAX - 1;
+                // Zero totals are Windows' "no write timeout", which is C's
+                // untimed write loop for the same negative timeout (:508).
+                ct.WriteTotalTimeoutMultiplier = 0;
+                ct.WriteTotalTimeoutConstant = 0;
+            }
+            Some(t) if t.is_zero() => {
+                // MAXDWORD interval with zero totals = return immediately.
+                ct.ReadIntervalTimeout = u32::MAX;
+                ct.ReadTotalTimeoutMultiplier = 0;
+                ct.ReadTotalTimeoutConstant = 0;
+                ct.WriteTotalTimeoutMultiplier = 0;
+                // 0 would mean "no write timeout" (block forever); 1ms keeps a
+                // zero-timeout write near-immediate like the unix single-attempt
+                // path.
+                ct.WriteTotalTimeoutConstant = 1;
+            }
+            Some(t) => {
+                let ms = wait_millis(t).min(u32::MAX as u128 - 1) as u32;
+                ct.ReadIntervalTimeout = ms;
+                ct.ReadTotalTimeoutMultiplier = 1;
+                ct.ReadTotalTimeoutConstant = ms;
+                ct.WriteTotalTimeoutMultiplier = 1;
+                ct.WriteTotalTimeoutConstant = ms;
+            }
         }
         if unsafe { SetCommTimeouts(handle, &ct) } == 0 {
             return Err(io_err());
@@ -333,9 +358,11 @@ impl OctetNext for SerialIoStateWin32 {
 
         // Bound the TOTAL write by one deadline (matching the unix backend and
         // C writeIt's single pre-loop timer), while WriteFile's own comm
-        // timeout bounds each call.
-        let deadline = Instant::now() + user.timeout;
-        // C parity (drvAsynSerialPortWin32.c writeIt, drvAsynSerialPort.c:849):
+        // timeout bounds each call. `None` is C's negative timeout: no timer is
+        // started at all (`writeTimeout > 0`, drvAsynSerialPortWin32.c:508), so
+        // the loop runs until every byte is out.
+        let deadline = user.timeout.map(|t| Instant::now() + t);
+        // C parity (drvAsynSerialPortWin32.c writeIt, drvAsynSerialPort.c:843):
         // the bytes the port accepted are reported alongside the failing status,
         // never dropped — carry `total` out on the error via
         // `with_partial_write` so `asynRecord`'s NAWT can show it.
@@ -363,7 +390,7 @@ impl OctetNext for SerialIoStateWin32 {
             }
             // WriteFile returned fewer than requested → its comm timeout fired,
             // or the deadline passed. C writeIt breaks with asynTimeout here.
-            if n_written == 0 || Instant::now() >= deadline {
+            if n_written == 0 || deadline.is_some_and(|d| Instant::now() >= d) {
                 return Err(AsynError::Status {
                     status: AsynStatus::Timeout,
                     message: "serial write timeout".into(),
@@ -447,7 +474,7 @@ impl DrvAsynSerialPort {
             PortFlags {
                 multi_device: false,
                 can_block: true,
-                destructible: true,
+                ..PortFlags::default()
             },
         );
         base.init_connected(false);
@@ -573,9 +600,13 @@ impl DrvAsynSerialPort {
     /// every `set_option` key.
     ///
     /// The cache is rolled back when the device refuses the result, so
-    /// `get_option` can never report a value the line rejected — C keeps the
-    /// same `dcbPrev` snapshot (drvAsynSerialPortWin32.c:342-347) and the POSIX
-    /// backend the same `termios_prev`.
+    /// `get_option` can never report a value the line rejected. C-Win32 keeps
+    /// no such snapshot: `setOption` re-reads the config with `GetCommConfig`
+    /// on entry (drvAsynSerialPortWin32.c:184-190) and pushes it back with
+    /// `SetCommConfig` (:345-351), leaving the stale cache in place when the
+    /// line refuses. The snapshot-and-restore this mirrors is the POSIX
+    /// driver's `termiosPrev`/`baudPrev` (drvAsynSerialPort.c:255-256, restored
+    /// at :599-605) — the same shape as `termios_prev` in [`super::serial_port`].
     fn modify_dcb<F: FnOnce(&mut DCB)>(&mut self, f: F) -> AsynResult<()> {
         self.io.handle_or_err()?;
         let prev = *self.dcb_or_err()?;
@@ -715,7 +746,7 @@ impl PortDriver for DrvAsynSerialPort {
             let _ = writeln!(out, "    Characters written: {}", self.io.n_written);
             let _ = writeln!(out, "       Characters read: {}", self.io.n_read);
             // The level is passed through, as C's `asynPortDriver::report`
-            // passes it to `reportParams` (asynPortDriver.cpp:3692).
+            // passes it to `reportParams` (asynPortDriver.cpp:3693).
             self.base.report_params(out, level);
         }
     }
@@ -733,7 +764,7 @@ impl PortDriver for DrvAsynSerialPort {
     /// `closeConnection` on any exit — the file has exactly two call sites,
     /// the explicit `disconnect` (`drvAsynSerialPortWin32.c:470`) and `writeIt`
     /// (`:525`) — so a failing `ReadFile` reports `asynError` with the port
-    /// still connected (`:596-640`). The asymmetry against `write_octet` below
+    /// still connected (`:618-625`). The asymmetry against `write_octet` below
     /// is the backend's, not an oversight: on Win32 a line error (framing,
     /// parity, overrun) also surfaces as a failed `ReadFile`, whereas the POSIX
     /// twin sees those as a short `read()` and reserves its errno branch for a
@@ -789,7 +820,7 @@ impl PortDriver for DrvAsynSerialPort {
     fn set_option(&mut self, _user: &mut AsynUser, key: &str, value: &str) -> AsynResult<()> {
         use dcb_bits::*;
 
-        // C-Win32 setOption's opening guard (drvAsynSerialPortWin32.c:180-185):
+        // C-Win32 setOption's opening guard (drvAsynSerialPortWin32.c:178-182):
         // a closed handle errors for every key, before any value is parsed or
         // stored. Unlike the POSIX backend — whose C twin mutates its cached
         // termios whether or not the port is open (R7-48) — Win32 refuses the

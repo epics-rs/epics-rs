@@ -70,6 +70,7 @@ impl From<&RequestOp> for PortCommand {
             },
             RequestOp::Float32ArrayWrite { data } => Self::Float32ArrayWrite { data: data.clone() },
             RequestOp::Flush => Self::Flush,
+            RequestOp::NoIo => Self::NoIo,
             RequestOp::Connect => Self::Connect,
             RequestOp::Disconnect => Self::Disconnect,
             RequestOp::ShutdownPort => Self::ShutdownPort,
@@ -99,8 +100,12 @@ impl From<&RequestOp> for PortCommand {
             RequestOp::PushFlushInterpose { flush_timeout } => Self::PushFlushInterpose {
                 flush_timeout_secs: flush_timeout.as_secs_f64(),
             },
-            RequestOp::BlockProcess => Self::BlockProcess,
-            RequestOp::UnblockProcess => Self::UnblockProcess,
+            RequestOp::BlockProcess { all_devices } => Self::BlockProcess {
+                all_devices: *all_devices,
+            },
+            RequestOp::UnblockProcess { all_devices } => Self::UnblockProcess {
+                all_devices: *all_devices,
+            },
             RequestOp::DrvUserCreate(req) => Self::DrvUserCreate {
                 drv_info: req.drv_info.clone(),
                 addr: req.addr,
@@ -196,6 +201,7 @@ impl From<&PortCommand> for RequestOp {
                 Self::Float32ArrayWrite { data: data.clone() }
             }
             PortCommand::Flush => Self::Flush,
+            PortCommand::NoIo => Self::NoIo,
             PortCommand::Connect => Self::Connect,
             PortCommand::Disconnect => Self::Disconnect,
             PortCommand::ShutdownPort => Self::ShutdownPort,
@@ -228,8 +234,12 @@ impl From<&PortCommand> for RequestOp {
             PortCommand::PushFlushInterpose { flush_timeout_secs } => Self::PushFlushInterpose {
                 flush_timeout: std::time::Duration::from_secs_f64(*flush_timeout_secs),
             },
-            PortCommand::BlockProcess => Self::BlockProcess,
-            PortCommand::UnblockProcess => Self::UnblockProcess,
+            PortCommand::BlockProcess { all_devices } => Self::BlockProcess {
+                all_devices: *all_devices,
+            },
+            PortCommand::UnblockProcess { all_devices } => Self::UnblockProcess {
+                all_devices: *all_devices,
+            },
             PortCommand::DrvUserCreate {
                 drv_info,
                 addr,
@@ -400,10 +410,13 @@ mod tests {
                 data: vec![1.0, 2.0],
             },
             RequestOp::Flush,
+            RequestOp::NoIo,
             RequestOp::Connect,
             RequestOp::Disconnect,
-            RequestOp::BlockProcess,
-            RequestOp::UnblockProcess,
+            RequestOp::BlockProcess { all_devices: true },
+            RequestOp::BlockProcess { all_devices: false },
+            RequestOp::UnblockProcess { all_devices: true },
+            RequestOp::UnblockProcess { all_devices: false },
             RequestOp::DrvUserCreate(
                 crate::port::DrvUserRequest::new("INFO", 0)
                     .with_iface(crate::interfaces::InterfaceType::Float64),

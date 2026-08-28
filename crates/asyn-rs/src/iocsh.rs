@@ -1,6 +1,6 @@
 //! Asyn iocsh shell-command registration.
 //!
-//! C parity: `asynShellCommands.c:580-906` registers six shell commands
+//! C parity: `asynShellCommands.c:581-906` registers six shell commands
 //! (`asynReport`, `asynSetOption`, `asynSetTraceMask`, `asynSetTraceIOMask`,
 //! `asynSetTraceInfoMask`, `asynSetTraceFile`) plus the
 //! `asynSetTraceIOTruncateSize` setter. This module exposes the same
@@ -10,6 +10,14 @@
 //! `TraceManager` is the back-end for the trace mutators.
 //!
 //! Available only with the `epics` feature.
+
+// RTEMS-EXEC-MODEL-ALLOW(1): checked, not waived — all 1 ran and passed
+// on the exec backend (measured on this tree:
+// `EPICS_RS_BUILD_EXEC_BACKEND=thread cargo nextest run -p asyn-rs
+// --all-features`, 1081/1081). asyn-rs became a census subject when its
+// `build.rs` began deriving `tokio_backend`; nothing here builds a CA
+// server, and the reactor these obtain comes from `#[tokio::test]`
+// itself, which the backend does not remove.
 
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
@@ -48,16 +56,16 @@ use crate::user::AsynUser;
 /// port-creation commands (`drvAsynIPPortConfigure`,
 /// `drvAsynSerialPortConfigure`, `drvAsynPrologixPortConfigure`).
 ///
-/// Every one of them is registered on **both** shells: the startup shell that
-/// executes `st.cmd` before `iocInit`, and the interactive shell that follows
-/// it. In C these are plain iocsh commands, so a startup script may create a
-/// port and set its EOS before `iocInit` — the usual sequence for a socket
-/// detector. Registering the set as interactive-only would make every one of
-/// them an unknown command in `st.cmd`, which aborts the script.
+/// Registered once. In C these are plain iocsh commands on the one command
+/// table, so a startup script may create a port and set its EOS before
+/// `iocInit` — the usual sequence for a socket detector — and the same names
+/// answer at the `epics>` prompt. Each was registered twice here, through both
+/// of `IocApplication`'s `register_*` methods, because the port used to give
+/// the startup shell and the interactive shell a table each; the table is now
+/// one, so the second call would only displace the name with itself.
 pub fn register_asyn_commands(mut app: IocApplication, mgr: Arc<PortManager>) -> IocApplication {
     for def in build_asyn_commands(mgr) {
-        app = app.register_startup_command(def.clone());
-        app = app.register_shell_command(def);
+        app = app.register_startup_command(def);
     }
     app
 }
@@ -199,7 +207,7 @@ fn shell_eos_user(addr: i32) -> AsynUser {
 
 /// Shared body of `asynOctetSetInputEos` / `asynOctetSetOutputEos`.
 ///
-/// C parity: `asynShellCommands.c::asynSetEos` (:222-260) escape-decodes the
+/// C parity: `asynShellCommands.c::asynSetEos` (:219-253) escape-decodes the
 /// `eos` argument, `connectDevice`s its `asynUser` to `(portName, addr)` through
 /// `findInterface` (:79-80, :233-234) and routes the bytes to
 /// `pasynOctet->setInputEos`/`setOutputEos` — which read the addr off that user
@@ -305,22 +313,19 @@ fn enable_style_args() -> Vec<ArgDesc> {
         ArgDesc {
             name: "portName",
             arg_type: ArgType::String,
-            optional: false,
         },
         ArgDesc {
             name: "addr",
             arg_type: ArgType::Int,
-            optional: false,
         },
         ArgDesc {
             name: "yesNo",
             arg_type: ArgType::Int,
-            optional: false,
         },
     ]
 }
 
-/// C `findDpCommon` (asynManager.c:496-509): an operation lands on a DEVICE's
+/// C `findDpCommon` (asynManager.c:536-544): an operation lands on a DEVICE's
 /// state only when the port is multi-device and the caller named a device;
 /// otherwise it lands on the port itself. `asynEnable`/`asynAutoConnect` both
 /// go through it, so the rule lives in one place here too.
@@ -411,12 +416,10 @@ pub fn build_asyn_commands(mgr: Arc<PortManager>) -> Vec<CommandDef> {
                 ArgDesc {
                     name: "level",
                     arg_type: ArgType::Int,
-                    optional: true,
                 },
                 ArgDesc {
                     name: "port",
                     arg_type: ArgType::String,
-                    optional: true,
                 },
             ],
             "asynReport [level] [portName] - Report registered ports",
@@ -438,22 +441,18 @@ pub fn build_asyn_commands(mgr: Arc<PortManager>) -> Vec<CommandDef> {
                 ArgDesc {
                     name: "portName",
                     arg_type: ArgType::String,
-                    optional: false,
                 },
                 ArgDesc {
                     name: "addr",
                     arg_type: ArgType::Int,
-                    optional: false,
                 },
                 ArgDesc {
                     name: "key",
                     arg_type: ArgType::String,
-                    optional: false,
                 },
                 ArgDesc {
                     name: "value",
                     arg_type: ArgType::String,
-                    optional: false,
                 },
             ],
             "asynSetOption portName addr key value",
@@ -500,17 +499,14 @@ pub fn build_asyn_commands(mgr: Arc<PortManager>) -> Vec<CommandDef> {
                 ArgDesc {
                     name: "portName",
                     arg_type: ArgType::String,
-                    optional: false,
                 },
                 ArgDesc {
                     name: "addr",
                     arg_type: ArgType::Int,
-                    optional: false,
                 },
                 ArgDesc {
                     name: "eos",
                     arg_type: ArgType::String,
-                    optional: false,
                 },
             ],
             "asynOctetSetInputEos portName addr eos - set the port input EOS (e.g. \"\\r\\n\")",
@@ -527,17 +523,14 @@ pub fn build_asyn_commands(mgr: Arc<PortManager>) -> Vec<CommandDef> {
                 ArgDesc {
                     name: "portName",
                     arg_type: ArgType::String,
-                    optional: false,
                 },
                 ArgDesc {
                     name: "addr",
                     arg_type: ArgType::Int,
-                    optional: false,
                 },
                 ArgDesc {
                     name: "eos",
                     arg_type: ArgType::String,
-                    optional: false,
                 },
             ],
             "asynOctetSetOutputEos portName addr eos - set the port output EOS (e.g. \"\\r\\n\")",
@@ -547,7 +540,7 @@ pub fn build_asyn_commands(mgr: Arc<PortManager>) -> Vec<CommandDef> {
 
     // asynOctetGetInputEos portName addr ----------------------------------
     //
-    // C `asynOctetGetInputEos` (asynShellCommands.c:532-536) → `asynShowEos`,
+    // C `asynOctetGetInputEos` (asynShellCommands.c:531-535) → `asynShowEos`,
     // the readback the operator uses to see which terminator a device actually
     // ended up with. It answers per (port, addr), like the setter.
     {
@@ -558,12 +551,10 @@ pub fn build_asyn_commands(mgr: Arc<PortManager>) -> Vec<CommandDef> {
                 ArgDesc {
                     name: "portName",
                     arg_type: ArgType::String,
-                    optional: false,
                 },
                 ArgDesc {
                     name: "addr",
                     arg_type: ArgType::Int,
-                    optional: false,
                 },
             ],
             "asynOctetGetInputEos portName addr - print the device's input EOS",
@@ -580,12 +571,10 @@ pub fn build_asyn_commands(mgr: Arc<PortManager>) -> Vec<CommandDef> {
                 ArgDesc {
                     name: "portName",
                     arg_type: ArgType::String,
-                    optional: false,
                 },
                 ArgDesc {
                     name: "addr",
                     arg_type: ArgType::Int,
-                    optional: false,
                 },
             ],
             "asynOctetGetOutputEos portName addr - print the device's output EOS",
@@ -595,11 +584,11 @@ pub fn build_asyn_commands(mgr: Arc<PortManager>) -> Vec<CommandDef> {
 
     // asynInterposeEcho portName addr -------------------------------------
     //
-    // C `asynInterposeEcho.c:189-207` registers this so a startup script can
+    // C `asynInterposeEcho.c:189-210` registers this so a startup script can
     // install the echo layer on an already-configured port — the interpose is
     // useless without it, since a driver's own configure command never installs
     // it. C reports "%s interposeInterface failed." and returns -1 when the
-    // port is unknown (:180-184).
+    // port is unknown (:178-182).
     //
     // The `addr` names the DEVICE the layer lands on: C hands it to
     // `interposeInterface` (:176), which puts the layer on that device's
@@ -614,12 +603,10 @@ pub fn build_asyn_commands(mgr: Arc<PortManager>) -> Vec<CommandDef> {
                 ArgDesc {
                     name: "portName",
                     arg_type: ArgType::String,
-                    optional: false,
                 },
                 ArgDesc {
                     name: "addr",
                     arg_type: ArgType::Int,
-                    optional: true,
                 },
             ],
             "asynInterposeEcho portName [addr] - install the echo interpose \
@@ -662,17 +649,14 @@ pub fn build_asyn_commands(mgr: Arc<PortManager>) -> Vec<CommandDef> {
                 ArgDesc {
                     name: "portName",
                     arg_type: ArgType::String,
-                    optional: false,
                 },
                 ArgDesc {
                     name: "addr",
                     arg_type: ArgType::Int,
-                    optional: false,
                 },
                 ArgDesc {
                     name: "delay(sec)",
                     arg_type: ArgType::Double,
-                    optional: false,
                 },
             ],
             "asynInterposeDelay portName addr delay(sec) - install the delay \
@@ -683,7 +667,7 @@ pub fn build_asyn_commands(mgr: Arc<PortManager>) -> Vec<CommandDef> {
                     .ok_or_else(|| "portName required".to_string())?;
                 let addr = arg_int(args, 1).unwrap_or(0) as i32;
                 // C takes the delay as a `double` seconds and stores it verbatim
-                // (`pvt->delay = delay`, asynInterposeDelay.c:214). iocsh can
+                // (`pvt->delay = delay`, asynInterposeDelay.c:210). iocsh can
                 // supply a negative or NaN one; `delay_from_secs` owns the
                 // conversion and collapses those to C's "no delay".
                 let delay =
@@ -706,8 +690,8 @@ pub fn build_asyn_commands(mgr: Arc<PortManager>) -> Vec<CommandDef> {
     }
 
     // asynShowOption portName addr key ------------------------------------
-    // C asynShellCommands.c:154-190 — the read half of asynSetOption. It prints
-    // `key=value` (:184) and reaches the driver through the same queued option
+    // C asynShellCommands.c:153-184 — the read half of asynSetOption. It prints
+    // `key=value` (:149) and reaches the driver through the same queued option
     // call, so a port whose device is not up yet still answers.
     {
         let mgr_r = mgr.clone();
@@ -717,17 +701,14 @@ pub fn build_asyn_commands(mgr: Arc<PortManager>) -> Vec<CommandDef> {
                 ArgDesc {
                     name: "portName",
                     arg_type: ArgType::String,
-                    optional: false,
                 },
                 ArgDesc {
                     name: "addr",
                     arg_type: ArgType::Int,
-                    optional: false,
                 },
                 ArgDesc {
                     name: "key",
                     arg_type: ArgType::String,
-                    optional: false,
                 },
             ],
             "asynShowOption portName addr key - print one driver option",
@@ -764,17 +745,14 @@ pub fn build_asyn_commands(mgr: Arc<PortManager>) -> Vec<CommandDef> {
                 ArgDesc {
                     name: "portName",
                     arg_type: ArgType::String,
-                    optional: false,
                 },
                 ArgDesc {
                     name: "addr",
                     arg_type: ArgType::Int,
-                    optional: false,
                 },
                 ArgDesc {
                     name: "size",
                     arg_type: ArgType::Int,
-                    optional: false,
                 },
             ],
             "asynSetTraceIOTruncateSize portName addr size - bytes of each I/O to trace",
@@ -786,7 +764,7 @@ pub fn build_asyn_commands(mgr: Arc<PortManager>) -> Vec<CommandDef> {
                 // Same addr routing as the trace-mask setters: C connects the
                 // asynUser to (port, addr) first, so `addr >= 0` writes the
                 // device's dpCommon and `addr < 0` the port's
-                // (asynManager.c:2929-2957 via findTracePvt).
+                // (asynManager.c:2945-2959 via findTracePvt).
                 match port.as_deref() {
                     Some(p) if addr >= 0 => trace.set_device_io_truncate_size(p, addr, size),
                     Some(p) => trace.set_io_truncate_size(Some(p), size),
@@ -806,12 +784,10 @@ pub fn build_asyn_commands(mgr: Arc<PortManager>) -> Vec<CommandDef> {
                 ArgDesc {
                     name: "portName",
                     arg_type: ArgType::String,
-                    optional: false,
                 },
                 ArgDesc {
                     name: "functionName",
                     arg_type: ArgType::String,
-                    optional: false,
                 },
             ],
             "asynRegisterTimeStampSource portName functionName - stamp this port's values with \
@@ -848,7 +824,6 @@ pub fn build_asyn_commands(mgr: Arc<PortManager>) -> Vec<CommandDef> {
             vec![ArgDesc {
                 name: "portName",
                 arg_type: ArgType::String,
-                optional: false,
             }],
             "asynUnregisterTimeStampSource portName - back to the port's default clock",
             move |args: &[ArgValue], ctx: &CommandContext| {
@@ -872,7 +847,7 @@ pub fn build_asyn_commands(mgr: Arc<PortManager>) -> Vec<CommandDef> {
     }
 
     // asynSetMinTimerPeriod period ----------------------------------------
-    // C implements this only under `_WIN32` (asynShellCommands.c:1226-1257,
+    // C implements this only under `_WIN32` (asynShellCommands.c:1226-1255,
     // `timeBeginPeriod`); on every other OS the body is a single printf saying
     // so and a -1 return (:1259-1263). The command must still EXIST — an
     // st.cmd that carries the line has to keep running — so it is registered
@@ -882,7 +857,6 @@ pub fn build_asyn_commands(mgr: Arc<PortManager>) -> Vec<CommandDef> {
         vec![ArgDesc {
             name: "minimum period",
             arg_type: ArgType::Double,
-            optional: false,
         }],
         "asynSetMinTimerPeriod period - Windows-only timer resolution (no effect here)",
         move |_args: &[ArgValue], ctx: &CommandContext| {
@@ -905,12 +879,10 @@ pub fn build_asyn_commands(mgr: Arc<PortManager>) -> Vec<CommandDef> {
                 ArgDesc {
                     name: "portName",
                     arg_type: ArgType::String,
-                    optional: false,
                 },
                 ArgDesc {
                     name: "timeout",
                     arg_type: ArgType::Double,
-                    optional: false,
                 },
             ],
             "asynWaitConnect portName timeout - block until the port is connected",
@@ -947,7 +919,6 @@ pub fn build_asyn_commands(mgr: Arc<PortManager>) -> Vec<CommandDef> {
         vec![ArgDesc {
             name: "timeout",
             arg_type: ArgType::Double,
-            optional: false,
         }],
         "asynSetAutoConnectTimeout timeout - seconds a new port waits for its first connect \
          (C default 0.5)",
@@ -975,22 +946,18 @@ pub fn build_asyn_commands(mgr: Arc<PortManager>) -> Vec<CommandDef> {
                 ArgDesc {
                     name: "portName",
                     arg_type: ArgType::String,
-                    optional: false,
                 },
                 ArgDesc {
                     name: "addr",
                     arg_type: ArgType::Int,
-                    optional: false,
                 },
                 ArgDesc {
                     name: "processIn",
                     arg_type: ArgType::Int,
-                    optional: false,
                 },
                 ArgDesc {
                     name: "processOut",
                     arg_type: ArgType::Int,
-                    optional: false,
                 },
             ],
             "asynInterposeEosConfig portName addr processIn processOut - install the EOS \
@@ -1026,17 +993,14 @@ pub fn build_asyn_commands(mgr: Arc<PortManager>) -> Vec<CommandDef> {
                 ArgDesc {
                     name: "portName",
                     arg_type: ArgType::String,
-                    optional: false,
                 },
                 ArgDesc {
                     name: "addr",
                     arg_type: ArgType::Int,
-                    optional: false,
                 },
                 ArgDesc {
                     name: "timeout(msec)",
                     arg_type: ArgType::Double,
-                    optional: false,
                 },
             ],
             "asynInterposeFlushConfig portName addr timeout(msec) - install the flush \
@@ -1075,17 +1039,14 @@ pub fn build_asyn_commands(mgr: Arc<PortManager>) -> Vec<CommandDef> {
                 ArgDesc {
                     name: "portName",
                     arg_type: ArgType::String,
-                    optional: true,
                 },
                 ArgDesc {
                     name: "addr",
                     arg_type: ArgType::Int,
-                    optional: true,
                 },
                 ArgDesc {
                     name: "mask",
                     arg_type: ArgType::String,
-                    optional: false,
                 },
             ],
             "asynSetTraceMask [portName] [addr] mask",
@@ -1125,17 +1086,14 @@ pub fn build_asyn_commands(mgr: Arc<PortManager>) -> Vec<CommandDef> {
                 ArgDesc {
                     name: "portName",
                     arg_type: ArgType::String,
-                    optional: true,
                 },
                 ArgDesc {
                     name: "addr",
                     arg_type: ArgType::Int,
-                    optional: true,
                 },
                 ArgDesc {
                     name: "mask",
                     arg_type: ArgType::String,
-                    optional: false,
                 },
             ],
             "asynSetTraceIOMask [portName] [addr] mask",
@@ -1183,17 +1141,14 @@ pub fn build_asyn_commands(mgr: Arc<PortManager>) -> Vec<CommandDef> {
                 ArgDesc {
                     name: "portName",
                     arg_type: ArgType::String,
-                    optional: true,
                 },
                 ArgDesc {
                     name: "addr",
                     arg_type: ArgType::Int,
-                    optional: true,
                 },
                 ArgDesc {
                     name: "mask",
                     arg_type: ArgType::String,
-                    optional: false,
                 },
             ],
             "asynSetTraceInfoMask [portName] [addr] mask",
@@ -1239,17 +1194,14 @@ pub fn build_asyn_commands(mgr: Arc<PortManager>) -> Vec<CommandDef> {
                 ArgDesc {
                     name: "portName",
                     arg_type: ArgType::String,
-                    optional: true,
                 },
                 ArgDesc {
                     name: "addr",
                     arg_type: ArgType::Int,
-                    optional: true,
                 },
                 ArgDesc {
                     name: "filename",
                     arg_type: ArgType::String,
-                    optional: true,
                 },
             ],
             "asynSetTraceFile [portName] [addr] [filename]",
@@ -1269,7 +1221,7 @@ pub fn build_asyn_commands(mgr: Arc<PortManager>) -> Vec<CommandDef> {
                     },
                 };
                 let trace = mgr_r.trace_manager();
-                // C parity: asynShellCommands.c:855-877 routes through
+                // C parity: asynShellCommands.c:858-892 routes through
                 // `connectDevice(pasynUser, portName, addr)`. The
                 // `setTraceFile` resolver (asynManager.c:2898-2926)
                 // walks `findTracePvt(puserPvt)` which picks the
@@ -1395,27 +1347,22 @@ pub fn drv_asyn_ip_port_configure_command(services: PortServices) -> CommandDef 
             ArgDesc {
                 name: "portName",
                 arg_type: ArgType::String,
-                optional: false,
             },
             ArgDesc {
                 name: "hostInfo",
                 arg_type: ArgType::String,
-                optional: false,
             },
             ArgDesc {
                 name: "priority",
                 arg_type: ArgType::Int,
-                optional: true,
             },
             ArgDesc {
                 name: "noAutoConnect",
                 arg_type: ArgType::Int,
-                optional: true,
             },
             ArgDesc {
                 name: "noProcessEos",
                 arg_type: ArgType::Int,
-                optional: true,
             },
         ],
         "drvAsynIPPortConfigure portName hostInfo [priority] [noAutoConnect] [noProcessEos] \
@@ -1455,10 +1402,10 @@ pub fn drv_asyn_ip_port_configure_command(services: PortServices) -> CommandDef 
 /// Build the `drvAsynIPServerPortConfigure` iocsh command.
 ///
 /// C parity: `drvAsynIPServerPort.c::drvAsynIPServerPortConfigure(portName,
-/// serverInfo, maxClients, priority, noAutoConnect, noProcessEos)` (:640-722),
-/// registered as a 6-argument iocsh command (:766-776). Configure binds the
+/// serverInfo, maxClients, priority, noAutoConnect, noProcessEos)` (:523-722),
+/// registered as a 6-argument iocsh command (:727-739). Configure binds the
 /// listening socket, pre-creates one child port per client slot named
-/// `<parent>:<N>` (:681-708), and starts the `connectionListener` thread
+/// `<parent>:<N>` (:682-708), and starts the `connectionListener` thread
 /// (:711-714) — so by the time `st.cmd` returns from this line, the server is
 /// accepting and every child port an IOC could bind device support to exists.
 ///
@@ -1471,32 +1418,26 @@ pub fn drv_asyn_ip_server_port_configure_command(services: PortServices) -> Comm
             ArgDesc {
                 name: "portName",
                 arg_type: ArgType::String,
-                optional: false,
             },
             ArgDesc {
                 name: "serverInfo",
                 arg_type: ArgType::String,
-                optional: false,
             },
             ArgDesc {
                 name: "maxClients",
                 arg_type: ArgType::Int,
-                optional: false,
             },
             ArgDesc {
                 name: "priority",
                 arg_type: ArgType::Int,
-                optional: true,
             },
             ArgDesc {
                 name: "noAutoConnect",
                 arg_type: ArgType::Int,
-                optional: true,
             },
             ArgDesc {
                 name: "noProcessEos",
                 arg_type: ArgType::Int,
-                optional: true,
             },
         ],
         "drvAsynIPServerPortConfigure portName serverInfo maxClients [priority] \
@@ -1540,7 +1481,7 @@ pub fn drv_asyn_ip_server_port_configure_command(services: PortServices) -> Comm
                 driver.base_mut().auto_connect = false;
             }
 
-            // The child ports C pre-creates at configure (:681-708) — device
+            // The child ports C pre-creates at configure (:682-708) — device
             // support binds to `<parent>:<N>` before any client has connected.
             let n_children = driver.child_port_names().len();
             let children = (0..n_children)
@@ -1565,8 +1506,10 @@ pub fn drv_asyn_ip_server_port_configure_command(services: PortServices) -> Comm
             };
             // C binds the listening socket inside configure — `createServerSocket`
             // at drvAsynIPServerPort.c:605, before `registerPort` and regardless
-            // of `noAutoConnect` (which governs the *child* ports' connect
-            // policy, :627/:693). So the server is listening when st.cmd moves to
+            // of `noAutoConnect`, which governs only the *server* port's own
+            // autoConnect (:627); the child ports are created with
+            // `noAutoConnect = 1` unconditionally (:693, and the comment saying
+            // why at :689). So the server is listening when st.cmd moves to
             // the next line, not when some record first pokes it.
             if let Err(e) = handle.port_handle().connect_blocking() {
                 ctx.println(&format!(
@@ -1622,27 +1565,22 @@ pub fn drv_asyn_serial_port_configure_command(services: PortServices) -> Command
             ArgDesc {
                 name: "portName",
                 arg_type: ArgType::String,
-                optional: false,
             },
             ArgDesc {
                 name: "ttyName",
                 arg_type: ArgType::String,
-                optional: false,
             },
             ArgDesc {
                 name: "priority",
                 arg_type: ArgType::Int,
-                optional: true,
             },
             ArgDesc {
                 name: "noAutoConnect",
                 arg_type: ArgType::Int,
-                optional: true,
             },
             ArgDesc {
                 name: "noProcessEos",
                 arg_type: ArgType::Int,
-                optional: true,
             },
         ],
         "drvAsynSerialPortConfigure portName ttyName [priority] [noAutoConnect] [noProcessEos] \
@@ -1701,22 +1639,18 @@ pub fn drv_asyn_prologix_port_configure_command(services: PortServices) -> Comma
             ArgDesc {
                 name: "portName",
                 arg_type: ArgType::String,
-                optional: false,
             },
             ArgDesc {
                 name: "host",
                 arg_type: ArgType::String,
-                optional: false,
             },
             ArgDesc {
                 name: "priority",
                 arg_type: ArgType::Int,
-                optional: true,
             },
             ArgDesc {
                 name: "noAutoConnect",
                 arg_type: ArgType::Int,
-                optional: true,
             },
         ],
         "prologixGPIBConfigure portName host [priority] [noAutoConnect] \
@@ -1753,7 +1687,8 @@ pub fn drv_asyn_prologix_port_configure_command(services: PortServices) -> Comma
 
 /// The single path a `*Configure` shell command uses to turn a freshly built
 /// driver into a live, named, traceable port — C's `registerPort`, which is the
-/// sole entry into the port list (asynManager.c:503, :611-637). Binding the
+/// sole entry into the port list (asynManager.c:2045, adding the port at
+/// :2094). Binding the
 /// port to its trace configuration and exception list happens inside
 /// [`create_port_runtime`], driven by the services passed here, so a port an
 /// st.cmd builds is traceable from the moment it exists.
@@ -1820,12 +1755,10 @@ pub fn drv_asyn_ftdi_port_configure_command(services: PortServices) -> CommandDe
     let mut arg_descs = vec![ArgDesc {
         name: "portName",
         arg_type: ArgType::String,
-        optional: false,
     }];
     arg_descs.extend(int_args.into_iter().map(|name| ArgDesc {
         name,
         arg_type: ArgType::Int,
-        optional: true,
     }));
     CommandDef::new(
         "drvAsynFTDIPortConfigure",
@@ -1879,37 +1812,30 @@ pub fn vxi11_configure_command(services: PortServices) -> CommandDef {
             ArgDesc {
                 name: "portName",
                 arg_type: ArgType::String,
-                optional: false,
             },
             ArgDesc {
                 name: "hostName",
                 arg_type: ArgType::String,
-                optional: false,
             },
             ArgDesc {
                 name: "flags",
                 arg_type: ArgType::Int,
-                optional: true,
             },
             ArgDesc {
                 name: "defaultTimeout",
                 arg_type: ArgType::String,
-                optional: true,
             },
             ArgDesc {
                 name: "vxiName",
                 arg_type: ArgType::String,
-                optional: true,
             },
             ArgDesc {
                 name: "priority",
                 arg_type: ArgType::Int,
-                optional: true,
             },
             ArgDesc {
                 name: "noAutoConnect",
                 arg_type: ArgType::Int,
-                optional: true,
             },
         ],
         "vxi11Configure portName hostName [flags] [defaultTimeout] [vxiName] [priority] \
@@ -1958,32 +1884,26 @@ pub fn usbtmc_configure_command(services: PortServices) -> CommandDef {
             ArgDesc {
                 name: "portName",
                 arg_type: ArgType::String,
-                optional: false,
             },
             ArgDesc {
                 name: "vendorID",
                 arg_type: ArgType::Int,
-                optional: true,
             },
             ArgDesc {
                 name: "productID",
                 arg_type: ArgType::Int,
-                optional: true,
             },
             ArgDesc {
                 name: "serialNumber",
                 arg_type: ArgType::String,
-                optional: true,
             },
             ArgDesc {
                 name: "priority",
                 arg_type: ArgType::Int,
-                optional: true,
             },
             ArgDesc {
                 name: "flags",
                 arg_type: ArgType::Int,
-                optional: true,
             },
         ],
         "usbtmcConfigure portName [vendorID] [productID] [serialNumber] [priority] [flags] \
@@ -2113,6 +2033,18 @@ mod tests {
         mgr
     }
 
+    /// The same, for a port that carries `ASYN_MULTIDEVICE`. An `addr`
+    /// names a device only on such a port — `locateDevice` returns NULL
+    /// otherwise (asynManager.c:574) — so every per-device trace routing
+    /// test has to build its port this way.
+    fn fresh_mgr_with_multi_device_port(name: &str, max_addr: usize) -> Arc<PortManager> {
+        let mgr = Arc::new(PortManager::new());
+        let _ = mgr
+            .register_port(DummyDriver::multi_device(name, max_addr))
+            .unwrap();
+        mgr
+    }
+
     /// `asynSetTraceMask` registered through `build_asyn_commands`
     /// must mutate the underlying `TraceManager` per-port mask. Wire
     /// C parity: `pasynTrace->setTraceMask` (asynShellCommands.c:660).
@@ -2215,10 +2147,10 @@ mod tests {
 
     /// R19-120: `asynSetTraceIOTruncateSize` routes `addr` the way every other
     /// trace setter does — device dpCommon when `addr >= 0`, port when `addr <
-    /// 0` (C asynManager.c:2929-2957 via `findTracePvt`).
+    /// 0` (C asynManager.c:2945-2959 via `findTracePvt`).
     #[test]
     fn iocsh_set_trace_io_truncate_size_routes_addr_to_the_device() {
-        let mgr = fresh_mgr_with_port("trunc_port");
+        let mgr = fresh_mgr_with_multi_device_port("trunc_port", 8);
         let trace = mgr.trace_manager().clone();
         let cmds = build_asyn_commands(mgr);
         let ctx = make_ctx();
@@ -2248,7 +2180,7 @@ mod tests {
     }
 
     /// R19-120: `asynShowOption` prints `key=value` for a driver option
-    /// (C asynShellCommands.c:184), and reports the driver's error otherwise.
+    /// (C asynShellCommands.c:146-149), and reports the driver's error otherwise.
     #[test]
     fn iocsh_show_option_reads_back_what_set_option_wrote() {
         let mgr = fresh_mgr_with_port("show_opt");
@@ -2506,9 +2438,19 @@ mod tests {
         handle
             .set_input_eos_blocking(shell_eos_user(0), b"\n")
             .unwrap();
-        handle
+        // processOut = 0: C's interpose does NOT take the output terminator —
+        // it delegates down to `poctet->setOutputEos` (asynInterposeEos.c:341-344),
+        // and this driver has none, so `setOutputEosFail` answers
+        // "<port> setOutputEos not implemented" (asynOctetBase.c:117, :409-411).
+        // The write below therefore appends nothing for two reasons at once,
+        // and the refusal is the one C reports.
+        let refused = handle
             .set_output_eos_blocking(shell_eos_user(0), b"\n")
-            .unwrap();
+            .expect_err("processOut=0 delegates to a driver with no setOutputEos");
+        assert!(
+            refused.to_string().contains("setOutputEos not implemented"),
+            "got {refused}"
+        );
 
         // processIn = 1: the read stops at the terminator and strips it.
         let user = AsynUser::default()
@@ -2603,7 +2545,7 @@ mod tests {
 
     /// R19-116: `asynEnable` / `asynAutoConnect` exist on the shell, and they
     /// pick port-level vs device-level state by C's `findDpCommon` rule
-    /// (asynManager.c:496-509) — a device only when the port is multi-device
+    /// (asynManager.c:536-544) — a device only when the port is multi-device
     /// AND the caller named one.
     #[test]
     fn iocsh_enable_and_autoconnect_follow_c_find_dp_common() {
@@ -2715,7 +2657,7 @@ mod tests {
         let user = shell_eos_user(0);
         assert_eq!(
             user.timeout,
-            Duration::from_secs(2),
+            Some(Duration::from_secs(2)),
             "C asynSetEos sets pasynUser->timeout = 2 (asynShellCommands.c:239)"
         );
         // The other half C sets on the same user, kept under the same test so a
@@ -2727,7 +2669,8 @@ mod tests {
              (asynShellCommands.c:241)"
         );
         assert_eq!(
-            user.timeout, SHELL_IO_TIMEOUT,
+            user.timeout,
+            Some(SHELL_IO_TIMEOUT),
             "the EOS user takes its deadline from the shared shell constant"
         );
     }
@@ -2843,6 +2786,26 @@ mod tests {
             fn base_mut(&mut self) -> &mut PortDriverBase {
                 &mut self.base
             }
+
+            // A multiDevice port cannot carry `asynInterposeEos` at all — C
+            // refuses to install it (asynOctetBase.c:149-153) — so a
+            // multi-device driver that supports EOS must implement the
+            // methods itself, which is the non-NULL `asynOctet` entry the
+            // Fail-stub default stands in for (R18-71).
+            fn set_input_eos(&mut self, user: &AsynUser, eos: &[u8]) -> AsynResult<()> {
+                self.base.set_input_eos(user.addr, eos);
+                Ok(())
+            }
+            fn get_input_eos(&self, user: &AsynUser) -> Vec<u8> {
+                self.base.input_eos(user.addr).to_vec()
+            }
+            fn set_output_eos(&mut self, user: &AsynUser, eos: &[u8]) -> AsynResult<()> {
+                self.base.set_output_eos(user.addr, eos);
+                Ok(())
+            }
+            fn get_output_eos(&self, user: &AsynUser) -> Vec<u8> {
+                self.base.output_eos(user.addr).to_vec()
+            }
         }
 
         let mgr = Arc::new(PortManager::new());
@@ -2949,7 +2912,7 @@ mod tests {
     }
 
     /// R8-49: C registers `asynInterposeEcho` with iocsh
-    /// (`asynInterposeEcho.c:189-207`) because nothing else installs the layer
+    /// (`asynInterposeEcho.c:189-210`) because nothing else installs the layer
     /// — no driver configure command pushes it, so without the registrar a
     /// startup script cannot reach a half-duplex echo device at all. Drive the
     /// command against a registered port and prove the port's octet write goes
@@ -3071,7 +3034,7 @@ mod tests {
             "asynInterposeEcho must install the echo layer on the live port"
         );
 
-        // An unknown port is C's `interposeInterface failed.` (:180-184), not a
+        // An unknown port is C's `interposeInterface failed.` (:178-182), not a
         // panic and not a silent success.
         echo_cmd
             .handler
@@ -3236,7 +3199,7 @@ mod tests {
     /// announce (addr propagated through to the device setter).
     #[test]
     fn iocsh_trace_setters_route_addr_to_device_announce() {
-        let mgr = fresh_mgr_with_port("trace_dev_port");
+        let mgr = fresh_mgr_with_multi_device_port("trace_dev_port", 8);
         let ctx = make_ctx();
 
         let observed: Arc<Mutex<Vec<(AsynException, i32)>>> = Arc::new(Mutex::new(Vec::new()));

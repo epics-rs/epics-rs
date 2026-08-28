@@ -74,6 +74,13 @@ impl PortRegistry {
         match reg.entry(name.to_string()) {
             Entry::Occupied(_) => Err(AsynError::PortAlreadyRegistered(name.to_string())),
             Entry::Vacant(slot) => {
+                // C `registerPort` builds the port's `dpCommon` and records
+                // its attributes in the same call that adds it to the port
+                // list (asynManager.c:2045-2095), so the trace facility can
+                // never be asked about a port whose `ASYN_MULTIDEVICE` bit it
+                // does not know. This is the one site that claims a name in
+                // this process, so it is the one place that has to say so.
+                trace.register_port(name, handle.is_multi_device());
                 slot.insert(PortEntry { handle, trace });
                 Ok(())
             }

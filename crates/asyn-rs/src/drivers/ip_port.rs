@@ -9,7 +9,7 @@ use std::time::Duration;
 
 use epics_libcom_rs::runtime::socket;
 
-use super::option_parse::parse_yn_option;
+use super::option_parse::{invalid_option_value, parse_yn_option};
 use super::wait_millis;
 use crate::error::{AsynError, AsynResult, AsynStatus};
 use crate::exception::AsynException;
@@ -33,7 +33,7 @@ use crate::{asyn_trace, asyn_trace_io};
 /// - `UDP*` → UDP + `SO_BROADCAST` (C line 379-382, NOT multicast)
 /// - `UDP*&` → UDP + `SO_BROADCAST` + `SO_REUSEPORT` (C line 383-387)
 /// - `unix://path` → Unix domain socket. Present wherever C defines
-///   `HAS_AF_UNIX` — every unix but VxWorks, which `drvAsynIPPort.c:62`
+///   `HAS_AF_UNIX` — every unix but VxWorks, which `drvAsynIPPort.c:63-65`
 ///   excludes by name. RTEMS keeps it; C excludes only `_WIN32` and
 ///   `vxWorks`.
 /// - `HTTP` → TCP + `FLAG_CONNECT_PER_TRANSACTION` (C line 368-371)
@@ -108,8 +108,10 @@ pub struct IpPortConfig {
 /// C's single long block. This is a deliberate robustness improvement, not a
 /// copied C bug; the trade-off is a device that genuinely needs >5 s to
 /// accept a TCP connection (pathological on a control LAN) would fail here
-/// where C's OS-default block might eventually succeed. C exposes no connect
-/// timeout option, so this is not runtime-settable either.
+/// where C's OS-default block might eventually succeed — so this is only the
+/// *default*: the `connectTimeout` option below moves it, and a value at or
+/// above the OS SYN timeout hands the bound back to the OS, which is C
+/// exactly (DRV-13).
 const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 
 impl IpPortConfig {
@@ -132,7 +134,7 @@ impl IpPortConfig {
             // Where the platform has no AF_UNIX the spec is refused *here*, in
             // parsing, which is where C refuses it — `drvAsynIPPortConfigure`
             // prints "AF_UNIX not available on this platform." and returns -1
-            // from inside this same `unix://` branch (drvAsynIPPort.c:315-317).
+            // from inside this same `unix://` branch (drvAsynIPPort.c:316-317).
             // That makes a startup script fail on the line that is wrong,
             // rather than accepting it and failing later on the first connect.
             #[cfg(not(asyn_af_unix))]
@@ -181,7 +183,7 @@ impl IpPortConfig {
 /// Split the trailing protocol token off the address part.
 /// Returns `(addr_part, protocol)`.
 ///
-/// C `drvAsynIPPort.c:348-350`: the protocol begins at the first blank
+/// C `drvAsynIPPort.c:349-351`: the protocol begins at the first blank
 /// (`strchr(cp, ' ')`) and `sscanf(blank+1, "%5s", protocol)` takes the first
 /// whitespace-delimited run, truncated to five characters (`char protocol[6]`);
 /// whatever follows that run is ignored. With no blank at all, `protocol[0]` is
@@ -338,26 +340,37 @@ const POLLIN_EVENT: libc::c_short = libc::POLLIN;
 #[cfg(all(unix, not(target_os = "rtems")))]
 const SEND_DONTWAIT: libc::c_int = libc::MSG_DONTWAIT;
 
-/// Wait until the socket will take bytes, or `deadline` passes first
+/// Wait until the socket will take bytes, or the poll interval expires
 /// (`Ok(false)`).
+///
+/// `Ok(false)` is C's `asynTimeout`; it does NOT prove `deadline` has passed.
+/// The interval given to `poll` is [`wait_millis`] of the budget still left,
+/// so a sub-millisecond remainder truncates and the wait can end up to 1 ms
+/// early. That is C's own arithmetic — `writePollmsec = (int)(timeout *
+/// 1000.0)` (`drvAsynIPPort.c:615-617`) — and C likewise returns `asynTimeout`
+/// straight off `pollstatus == 0` without re-reading any deadline (`:648`).
+/// Reproducing the early edge is deliberate; a caller needing the deadline
+/// held exactly must re-check it, not this trait.
 ///
 /// C parity, and why the write bound is not `SO_SNDTIMEO`: `drvAsynIPPort.c`
 /// compiles the `setsockopt(SO_SNDTIMEO)` block only under `USE_SOCKTIMEOUT`,
 /// which is `#if defined(__rtems__)` (`:71-72`). Every other target — vxWorks
 /// included, through its own `FAKE_POLL` (`:75-76`) — takes `USE_POLL` (`:74`),
-/// where `writeIt` polls `POLLOUT` for `writePollmsec` (`:667-686`) and then
+/// where `writeIt` polls `POLLOUT` for `writePollmsec` (`:634-652`) and then
 /// sends. This port armed `SO_SNDTIMEO` on all platforms instead, and VxWorks 7
 /// does not implement the option: `setsockopt` fails `ENOPROTOOPT` (errno 42,
 /// measured on target), so the `?` on it failed every asyn IP write there
 /// before a byte was sent.
 pub(super) trait WaitWritable {
-    fn wait_writable(&self, deadline: std::time::Instant) -> std::io::Result<bool>;
+    /// `None` is a wait with no deadline — C's negative `pasynUser->timeout`,
+    /// which reaches `poll` as its own `-1` (drvAsynIPPort.c:615-617).
+    fn wait_writable(&self, deadline: Option<std::time::Instant>) -> std::io::Result<bool>;
 }
 
 /// Hand bytes to the socket without parking — the stream arms of [`IpIoInner`].
 ///
 /// C reaches the same place by putting the socket in non-blocking mode once, at
-/// connect (`setNonBlock(fd, 1)`, `drvAsynIPPort.c:511`, under `USE_POLL`), and
+/// connect (`setNonBlock(fd, 1)`, `drvAsynIPPort.c:536`, under `USE_POLL`), and
 /// so does this driver — [`OWNED_NONBLOCKING`]. The per-send `MSG_DONTWAIT`
 /// below is kept on top of it, not instead of it.
 ///
@@ -376,7 +389,7 @@ pub(super) trait WaitWritable {
 /// XNU's `sosend` sleeps on `so_state & SS_NBIO` and its internal `MSG_NBIO`,
 /// not on `MSG_DONTWAIT`, so while the flag was the only thing holding the send
 /// out of a park, a stalled 8 MiB write on macOS outlived a 240 s test timeout
-/// (measured, macOS CI 2026-07-27, `doc/darwin-send-dontwait-gap.md`). C never
+/// (measured, macOS CI 2026-07-27). C never
 /// had the exposure because it takes the other branch described above, and this
 /// driver now takes it too — [`OWNED_NONBLOCKING`], applied at connect. The
 /// flag stays because where it is honoured it saves the loop a `poll`.
@@ -390,9 +403,9 @@ pub(super) trait SendWithoutParking {
 /// connection.
 ///
 /// Non-blocking on unix, which is C's `setNonBlock(fd, 1)`
-/// (`drvAsynIPPort.c:511`) under `USE_POLL` — one statement covering both,
+/// (`drvAsynIPPort.c:536`) under `USE_POLL` — one statement covering both,
 /// since the server-accepted fd reaches `connectIt` through
-/// `pasynUser->reason` (:434-436) and passes the same line. With the mode owned, neither
+/// `pasynUser->reason` (:435-436) and passes the same line. With the mode owned, neither
 /// direction can park whatever the target does with `MSG_DONTWAIT`,
 /// `SO_SNDTIMEO` or `SO_RCVTIMEO`, and the bound is the poll in
 /// [`WaitWritable`] / [`BoundNextRead`] on every unix alike. Blocking
@@ -411,23 +424,28 @@ pub(super) const OWNED_NONBLOCKING: bool = cfg!(unix);
 /// Returns nothing on purpose. A poll error, and the expiry itself, both fall
 /// through to the read, which reports the real outcome — expiry as `WouldBlock`
 /// on the non-blocking socket, the same `asynTimeout` `SO_RCVTIMEO` produced
-/// (see [`classify_read_error`]). That is C's own fall-through: `readRaw`
+/// (see [`classify_read_error`]). That is C's own fall-through: `readIt`
 /// records a failed `setsockopt(SO_RCVTIMEO)` and proceeds to `recv` anyway
 /// (`drvAsynIPPort.c:744-756`), letting the recv outcome govern teardown
-/// (`:797-821`).
+/// (`:798-821`).
 pub(super) trait BoundNextRead {
-    fn bound_next_read(&self, timeout: Duration);
+    fn bound_next_read(&self, timeout: Option<Duration>);
 }
 
 #[cfg(unix)]
 impl<T: std::os::fd::AsRawFd> BoundNextRead for T {
-    fn bound_next_read(&self, timeout: Duration) {
+    fn bound_next_read(&self, timeout: Option<Duration>) {
         let mut fds = libc::pollfd {
             fd: self.as_raw_fd(),
             events: POLLIN_EVENT,
             revents: 0,
         };
-        let ms = wait_millis(timeout).min(libc::c_int::MAX as u128) as libc::c_int;
+        // `None` is C's negative timeout: `readPollmsec = -1`
+        // (drvAsynIPPort.c:743), which is `poll`'s own "no timeout".
+        let ms = match timeout {
+            Some(t) => wait_millis(t).min(libc::c_int::MAX as u128) as libc::c_int,
+            None => -1,
+        };
         // SAFETY: one initialised `pollfd` whose `fd` is this borrowed socket's
         // and stays open for the call; `poll` reads `fd`/`events` and writes
         // only `revents`.
@@ -437,32 +455,39 @@ impl<T: std::os::fd::AsRawFd> BoundNextRead for T {
 
 #[cfg(not(unix))]
 impl BoundNextRead for TcpStream {
-    fn bound_next_read(&self, timeout: Duration) {
-        let _ = self.set_read_timeout(Some(timeout));
+    fn bound_next_read(&self, timeout: Option<Duration>) {
+        // `None` clears `SO_RCVTIMEO`, which is the blocking read C's
+        // `readPollmsec = -1` performs (drvAsynIPPort.c:743).
+        let _ = self.set_read_timeout(timeout);
     }
 }
 
 #[cfg(not(unix))]
 impl BoundNextRead for UdpSocket {
-    fn bound_next_read(&self, timeout: Duration) {
-        let _ = self.set_read_timeout(Some(timeout));
+    fn bound_next_read(&self, timeout: Option<Duration>) {
+        let _ = self.set_read_timeout(timeout);
     }
 }
 
 #[cfg(unix)]
 impl<T: std::os::fd::AsRawFd> WaitWritable for T {
-    fn wait_writable(&self, deadline: std::time::Instant) -> std::io::Result<bool> {
+    fn wait_writable(&self, deadline: Option<std::time::Instant>) -> std::io::Result<bool> {
         loop {
-            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
-            if remaining.is_zero() {
-                return Ok(false);
-            }
+            let ms = match deadline {
+                Some(deadline) => {
+                    let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+                    if remaining.is_zero() {
+                        return Ok(false);
+                    }
+                    wait_millis(remaining).min(libc::c_int::MAX as u128) as libc::c_int
+                }
+                None => -1,
+            };
             let mut fds = libc::pollfd {
                 fd: self.as_raw_fd(),
                 events: POLLOUT_EVENT,
                 revents: 0,
             };
-            let ms = wait_millis(remaining).min(libc::c_int::MAX as u128) as libc::c_int;
             let rc = unsafe { libc::poll(&mut fds, 1, ms) };
             if rc > 0 {
                 return Ok(true);
@@ -501,8 +526,14 @@ impl<T: std::os::fd::AsRawFd> SendWithoutParking for T {
 #[cfg(not(unix))]
 fn arm_send_timeout(
     set: impl FnOnce(Option<Duration>) -> std::io::Result<()>,
-    deadline: std::time::Instant,
+    deadline: Option<std::time::Instant>,
 ) -> std::io::Result<bool> {
+    // `None` clears `SO_SNDTIMEO`: the send waits as long as it takes, which is
+    // what C's negative `pasynUser->timeout` asks for.
+    let Some(deadline) = deadline else {
+        set(None)?;
+        return Ok(true);
+    };
     let remaining = deadline.saturating_duration_since(std::time::Instant::now());
     if remaining.is_zero() {
         return Ok(false);
@@ -513,14 +544,14 @@ fn arm_send_timeout(
 
 #[cfg(not(unix))]
 impl WaitWritable for TcpStream {
-    fn wait_writable(&self, deadline: std::time::Instant) -> std::io::Result<bool> {
+    fn wait_writable(&self, deadline: Option<std::time::Instant>) -> std::io::Result<bool> {
         arm_send_timeout(|t| self.set_write_timeout(t), deadline)
     }
 }
 
 #[cfg(not(unix))]
 impl WaitWritable for UdpSocket {
-    fn wait_writable(&self, deadline: std::time::Instant) -> std::io::Result<bool> {
+    fn wait_writable(&self, deadline: Option<std::time::Instant>) -> std::io::Result<bool> {
         arm_send_timeout(|t| self.set_write_timeout(t), deadline)
     }
 }
@@ -535,15 +566,29 @@ impl SendWithoutParking for TcpStream {
 /// Write `data` to the stream, retrying short writes until the deadline.
 ///
 /// Returns the bytes the peer accepted. C parity
-/// (`drvAsynIPPort.c::writeIt`, like `drvAsynSerialPort.c:849`): a write that
+/// (`drvAsynIPPort.c::writeIt`, like `drvAsynSerialPort.c:843`): a write that
 /// stalls part-way reports `*nbytesTransfered` **together with** its
 /// `asynTimeout`/`asynError` status, so a failure here carries the accepted
 /// count in [`AsynError::with_partial_write`] rather than dropping it — that
 /// count is what `asynRecord` publishes as NAWT (asynRecord.c:1547).
 ///
 /// The loop is C's shape: wait for `POLLOUT`, send, advance, repeat until the
-/// buffer is gone (`drvAsynIPPort.c:666-733`). Waiting first is what bounds the
+/// buffer is gone (`drvAsynIPPort.c:632-700`). Waiting first is what bounds the
 /// call — see [`WaitWritable`] for why that bound is not `SO_SNDTIMEO`.
+///
+/// `poll` is C's `writePollmsec` (`:615-616`) and it bounds **one** wait for
+/// `POLLOUT`, re-armed on every pass exactly as C re-arms it (`:638-647`,
+/// `asynTimeout` only when that single poll expires, `:648-652`). A peer that
+/// keeps taking bytes therefore never times out, however long the transfer
+/// runs — which is what C does, and what one deadline built at write-start did
+/// not: it expired mid-transfer and handed the caller `asynTimeout` with a
+/// partial count where C returns success, so an `asynOctetWrite` record raised
+/// a WRITE alarm and published NAWT below NOWT (DRV-58).
+///
+/// `cap` is not C's. It is the outer budget a caller may impose over the whole
+/// transfer — the server port's broadcast states one timeout for all its slots,
+/// so slot N+1 inherits what slot N left rather than restarting the clock. A
+/// caller that wants C's rule alone passes `None`.
 ///
 /// Shared with [`super::ip_server_port::ClientSlot`], whose accepted sockets
 /// need the same bound and the same partial count. C shares it the same way:
@@ -553,10 +598,18 @@ impl SendWithoutParking for TcpStream {
 pub(super) fn write_with_retry(
     stream: &(impl WaitWritable + SendWithoutParking),
     data: &[u8],
-    deadline: std::time::Instant,
+    poll: Option<Duration>,
+    cap: Option<std::time::Instant>,
 ) -> AsynResult<usize> {
     let mut offset = 0;
     while offset < data.len() {
+        // `poll == None` is C's negative timeout — an unbounded wait, which
+        // only the caller's own budget (`cap`) can cut short.
+        let deadline = match (poll.map(|p| std::time::Instant::now() + p), cap) {
+            (Some(pass), Some(cap)) => Some(pass.min(cap)),
+            (Some(pass), None) => Some(pass),
+            (None, cap) => cap,
+        };
         match stream.wait_writable(deadline) {
             Ok(true) => {}
             Ok(false) => {
@@ -578,8 +631,9 @@ pub(super) fn write_with_retry(
             }
             Ok(n) => offset += n,
             // C retries both of these against `pasynUser->timeout`
-            // (`drvAsynIPPort.c:694-710`); the deadline is re-read at the top
-            // of the loop, so the retry is bounded without a sleep.
+            // (`drvAsynIPPort.c:661-676`), whose clock it restarts at the top
+            // of each pass; the wait at the top of this loop is that bound, so
+            // the retry needs no sleep of its own.
             Err(ref e)
                 if e.kind() == std::io::ErrorKind::WouldBlock
                     || e.kind() == std::io::ErrorKind::Interrupted => {}
@@ -603,7 +657,7 @@ impl IpIoInner {
     /// it must run *before* the socket is installed — see
     /// [`DrvAsynIPPort::publish_transport`]. C is the same shape and the same
     /// order: `setNonBlock(fd, 1)` right after the connect succeeds
-    /// (`drvAsynIPPort.c:511`), `tty->fd = fd` only at `:581`.
+    /// (`drvAsynIPPort.c:536`), `tty->fd = fd` only at `:547`.
     fn own_blocking_mode(&self) -> AsynResult<()> {
         match self {
             IpIoInner::Tcp(stream) => stream.set_nonblocking(OWNED_NONBLOCKING),
@@ -621,7 +675,7 @@ impl OctetNext for IpIoState {
             status: AsynStatus::Disconnected,
             message: "not connected".into(),
         })?;
-        // C readRaw (drvAsynIPPort.c:736-740): reject maxchars == 0 *after*
+        // C readIt (drvAsynIPPort.c:736-740): reject maxchars == 0 *after*
         // the connect check and *before* touching the socket, so a zero-length
         // request never reaches `stream.read`, where an empty buffer would
         // yield Ok(0) and be misread as a peer EOF (tearing down the socket).
@@ -630,16 +684,16 @@ impl OctetNext for IpIoState {
         }
         match inner {
             IpIoInner::Tcp(stream) => {
-                // C readRaw (drvAsynIPPort.c:744-756) records a failed bound but
+                // C readIt (drvAsynIPPort.c:744-756) records a failed bound but
                 // falls through to recv(); the recv outcome governs teardown
-                // (:797-821). Keeping that shape is what lets an ECONNRESET the
+                // (:798-821). Keeping that shape is what lets an ECONNRESET the
                 // read is about to surface reach the caller, instead of a
                 // synthetic "arming the bound failed" that would leave the port
                 // never classifying the transport as dead — the status taint C
                 // keeps for a >0-byte read (:822-831) is unreachable here.
                 stream.bound_next_read(socket_poll_timeout(user.timeout));
                 match stream.read(buf) {
-                    // C drvAsynIPPort.c::readRaw (815-821): recv()==0 on a
+                    // C drvAsynIPPort.c::readIt (815-821): recv()==0 on a
                     // SOCK_STREAM socket means the peer closed — report
                     // success with ASYN_EOM_END and zero bytes (the driver
                     // then closes the fd). Returning an error here would hide
@@ -665,15 +719,15 @@ impl OctetNext for IpIoState {
             }
             IpIoInner::Udp(socket, _peer) => {
                 // Same C fall-through as the TCP arm: the bound precedes the
-                // socketType branch in readRaw (:749) and a failure does not
+                // socketType branch in readIt (:749) and a failure does not
                 // return — the recvfrom governs.
                 socket.bound_next_read(socket_poll_timeout(user.timeout));
-                // C drvAsynIPPort.c::readRaw (775-789) uses recvfrom on the
+                // C drvAsynIPPort.c::readIt (775-789) uses recvfrom on the
                 // unconnected datagram socket so it accepts replies from any
                 // peer (broadcast/multi-peer); the source address is only
                 // used for trace, so we discard it.
                 match socket.recv_from(buf) {
-                    // C drvAsynIPPort.c::readRaw: a SOCK_DGRAM recvfrom()==0
+                    // C drvAsynIPPort.c::readIt: a SOCK_DGRAM recvfrom()==0
                     // is a legitimate zero-length datagram, NOT a connection
                     // close — the EOF/ASYN_EOM_END branch (line 815) is
                     // SOCK_STREAM only. Report a successful zero-byte read and
@@ -727,7 +781,7 @@ impl OctetNext for IpIoState {
             status: AsynStatus::Disconnected,
             message: "not connected".into(),
         })?;
-        // C drvAsynIPPort.c::writeRaw (613-614): after the connection check,
+        // C drvAsynIPPort.c::writeIt (613-614): after the connection check,
         // a zero-length write returns success immediately and sends nothing —
         // in particular it must NOT emit an empty UDP datagram. (Any output
         // EOS has already been appended by the interpose above, so reaching
@@ -735,17 +789,19 @@ impl OctetNext for IpIoState {
         if data.is_empty() {
             return Ok(0);
         }
-        // Floor the write deadline with the same C poll-interval floor as the
-        // socket send timeout: C `writeIt` (:649-651) floors a zero timeout to a
+        // Floor the write poll with the same C poll-interval floor as the
+        // socket send timeout: C `writeIt` (:615-616) floors a zero timeout to a
         // 1 ms poll and then attempts the send (poll POLLOUT then send), so a
         // `timeout == 0` write of a writable socket succeeds. Without the
-        // floor the deadline would be `now`, and `write_with_retry`'s
-        // top-of-loop `now > deadline` check would return Timeout *before*
+        // floor the wait would expire at `now` and return Timeout *before*
         // ever attempting `write` — failing a zero-timeout write that C lets
         // through. socket_poll_timeout is a no-op for any positive timeout, so
         // this only affects the `timeout == 0` case.
-        let deadline = std::time::Instant::now() + socket_poll_timeout(user.timeout);
-        // C writeRaw reports what the socket took (`*nbytesTransfered`) on
+        //
+        // The bound is per wait, not per transfer, and this port imposes no
+        // outer cap — C bounds only the individual `poll(POLLOUT)`.
+        let poll = socket_poll_timeout(user.timeout);
+        // C writeIt reports what the socket took (`*nbytesTransfered`) on
         // success and on failure alike; return the real count rather than
         // assuming the whole buffer went out.
         // No arm arms `SO_SNDTIMEO`: the deadline is enforced by the wait in
@@ -753,12 +809,12 @@ impl OctetNext for IpIoState {
         // `WaitWritable` — VxWorks 7 rejects the option outright, so setting it
         // here failed every write on that target before a byte was sent.
         match inner {
-            IpIoInner::Tcp(stream) => write_with_retry(stream, data, deadline),
+            IpIoInner::Tcp(stream) => write_with_retry(stream, data, poll, None),
             IpIoInner::Udp(socket, peer) => {
                 // C polls `POLLOUT` before the datagram too — `writeIt` shares
                 // one loop across `SOCK_DGRAM` and `SOCK_STREAM`
                 // (`drvAsynIPPort.c:666-691`).
-                if !socket.wait_writable(deadline)? {
+                if !socket.wait_writable(poll.map(|p| std::time::Instant::now() + p))? {
                     return Err(AsynError::Status {
                         status: AsynStatus::Timeout,
                         message: "write timeout".into(),
@@ -771,7 +827,7 @@ impl OctetNext for IpIoState {
                 Ok(socket.send_to(data, *peer)?)
             }
             #[cfg(asyn_af_unix)]
-            IpIoInner::Unix(stream) => write_with_retry(stream, data, deadline),
+            IpIoInner::Unix(stream) => write_with_retry(stream, data, poll, None),
         }
     }
 
@@ -921,7 +977,7 @@ impl OctetNext for ComLink<'_> {
     }
 }
 
-/// True for a socket read error that C `readRaw` treats as a non-fatal
+/// True for a socket read error that C `readIt` treats as a non-fatal
 /// timeout — the socket is left intact and the caller retries. C
 /// (drvAsynIPPort.c:798-800) excludes BOTH `EWOULDBLOCK` *and* `EINTR` from
 /// the fatal-disconnect disjunct, so a would-block / poll timeout AND a
@@ -938,7 +994,7 @@ pub(crate) fn is_nonfatal_read_timeout(kind: std::io::ErrorKind) -> bool {
     )
 }
 
-/// Error for a zero-length read request. C `readRaw` (drvAsynIPPort.c:736-740)
+/// Error for a zero-length read request. C `readIt` (drvAsynIPPort.c:736-740)
 /// rejects `maxchars == 0` with `asynError` ("maxchars %d. Why <=0?") before
 /// touching the socket. Without this guard a Rust `stream.read(&mut [])`
 /// returns `Ok(0)`, which the TCP read arm interprets as a peer EOF and tears
@@ -951,7 +1007,7 @@ pub(crate) fn maxchars_zero_error() -> AsynError {
     }
 }
 
-/// What C `readRaw` does with a failed read (drvAsynIPPort.c:797-812) — the
+/// What C `readIt` does with a failed read (drvAsynIPPort.c:798-813) — the
 /// teardown and the status it reports, as one value.
 ///
 /// ```c
@@ -985,32 +1041,36 @@ struct ReadFailure {
     error: AsynError,
 }
 
-/// Single owner of C `readRaw`'s failed-read rule. C applies it *inside*
-/// `readRaw`, which is below the interpose chain — so it governs both the data
+/// Single owner of C `readIt`'s failed-read rule. C applies it *inside*
+/// `readIt`, which is below the interpose chain — so it governs both the data
 /// path ([`DrvAsynIPPort::read_octet_core`]) and the RFC 2217 negotiation
-/// ([`NegotiationLink`]), which C likewise drives through `readIt`/`readRaw`
+/// ([`NegotiationLink`]), which C likewise drives through `readIt`
 /// (`asynInterposeCom.c:103` calls `pasynOctetDrv->read`, the driver below).
 /// Both callers take the teardown *and* the reported status from here, so
 /// neither can drift.
 fn classify_read_failure(
     e: AsynError,
     disconnect_on_read_timeout: bool,
-    timeout: Duration,
+    timeout: Option<Duration>,
     device_name: &str,
 ) -> ReadFailure {
     // Classify by the carried status, not the variant: an interpose below may
     // wrap the lower-layer timeout in `PartialRead`, and a variant match would
     // miss it.
     let is_timeout = e.status() == AsynStatus::Timeout;
-    let disconnect = (disconnect_on_read_timeout && is_timeout && timeout > Duration::ZERO)
-        || e.is_fatal_transport();
+    // C tests the *sign*: `(tty->disconnectOnReadTimeout) && (pasynUser->timeout
+    // > 0)` (drvAsynIPPort.c:799). A negative timeout — `None` here — is not
+    // `> 0`, so a forever-wait never tears the socket down.
+    let disconnect =
+        (disconnect_on_read_timeout && is_timeout && timeout.is_some_and(|t| t > Duration::ZERO))
+            || e.is_fatal_transport();
     if !disconnect {
         return ReadFailure {
             disconnect: false,
             error: e,
         };
     }
-    // C overwrites `pasynUser->errorMessage` and the status together (:801-805)
+    // C overwrites `pasynUser->errorMessage` and the status together (:801-806)
     // — while the partial transfer already in the caller's buffer stands, because
     // `*nbytesTransfered = thisRead` (:824) runs on both branches. So restamp the
     // failure and re-attach whatever the read did deliver.
@@ -1034,7 +1094,7 @@ fn classify_read_failure(
 /// C's COM interpose negotiates against `pinterposePvt->pasynOctetDrv`
 /// (`asynInterposeCom.c:339`, :430, :103) — the octet driver *below* itself, so
 /// the negotiation is neither IAC-stuffed nor unstuffed. But that lower driver is
-/// `drvAsynIPPort`'s `readIt`/`readRaw`, which still applies the
+/// `drvAsynIPPort`'s `readIt`, which still applies the
 /// disconnect-on-read-timeout / fatal-error teardown per read. Handing
 /// [`ComPortOptions`] a bare `IpIoState` would have skipped it, leaving a COM
 /// port with `disconnectOnReadTimeout=Y` holding a socket C would have closed.
@@ -1047,10 +1107,10 @@ fn classify_read_failure(
 struct NegotiationLink<'a> {
     io: &'a mut IpIoState,
     disconnect_on_read_timeout: bool,
-    /// C `tty->IPDeviceName`, for the `"%s read error: %s"` text `readRaw`
+    /// C `tty->IPDeviceName`, for the `"%s read error: %s"` text `readIt`
     /// reports on the teardown branch (drvAsynIPPort.c:801-803).
     device_name: &'a str,
-    /// Set when a read failed in a way C's `readRaw` would have closed the
+    /// Set when a read failed in a way C's `readIt` would have closed the
     /// socket for. Read back by [`DrvAsynIPPort::with_negotiation`].
     teardown: bool,
 }
@@ -1077,7 +1137,7 @@ impl OctetNext for NegotiationLink<'_> {
     fn write(&mut self, user: &mut AsynUser, data: &[u8]) -> AsynResult<usize> {
         let r = self.io.write(user, data);
         if let Err(ref e) = r {
-            // C `writeRaw` (drvAsynIPPort.c:625-640) closes the connection on any
+            // C `writeIt` (drvAsynIPPort.c:692-698) closes the connection on any
             // failing send, which `is_fatal_transport` is the single owner of.
             if e.is_fatal_transport() {
                 self.teardown = true;
@@ -1111,8 +1171,8 @@ fn classify_read_error(e: std::io::Error) -> AsynError {
 /// applying the C `drvAsynIPPort` poll-interval floor.
 ///
 /// C `readIt`/`writeIt` compute `pollmsec = (int)(timeout * 1000.0)` and
-/// then `if (pollmsec == 0) pollmsec = 1` (drvAsynIPPort.c:775-777 and
-/// :649-651): a zero timeout (a poll / non-blocking request) becomes a 1 ms
+/// then `if (pollmsec == 0) pollmsec = 1` (drvAsynIPPort.c:741-743 and
+/// :615-617): a zero timeout (a poll / non-blocking request) becomes a 1 ms
 /// poll, never an immediate-return zero interval. `std::net`'s
 /// `set_read_timeout`/`set_write_timeout` likewise reject a zero `Duration`
 /// (they return `InvalidInput`), so passing `user.timeout` verbatim would
@@ -1121,18 +1181,17 @@ fn classify_read_error(e: std::io::Error) -> AsynError {
 /// IP-family socket-timeout site (client read/write plus the server-mode
 /// reads).
 ///
-/// A negative "wait forever" timeout has no representation in the
-/// framework's unsigned `Duration` (DRV-42), so only the zero floor
-/// applies. A positive sub-millisecond timeout passes through verbatim,
+/// A `None` timeout is C's negative "wait forever" (`pollmsec = -1`,
+/// :743 and :617) and passes straight through: there is no interval to
+/// floor. A positive sub-millisecond timeout passes through verbatim,
 /// which is what the socket-option sites want; the sites that then hand the
 /// budget to `poll` round it up to a whole tick through
 /// [`super::wait_millis`], because truncating it there would turn the wait
 /// into a non-blocking probe.
-pub(crate) fn socket_poll_timeout(timeout: Duration) -> Duration {
-    if timeout.is_zero() {
-        Duration::from_millis(1)
-    } else {
-        timeout
+pub(crate) fn socket_poll_timeout(timeout: Option<Duration>) -> Option<Duration> {
+    match timeout {
+        Some(t) if t.is_zero() => Some(Duration::from_millis(1)),
+        other => other,
     }
 }
 
@@ -1194,7 +1253,7 @@ impl DrvAsynIPPort {
                     &buf[..r.nbytes_transferred],
                     "read"
                 );
-                // C drvAsynIPPort.c::readRaw (815-819): a TCP EOF (reported
+                // C drvAsynIPPort.c::readIt (815-819): a TCP EOF (reported
                 // as ASYN_EOM_END by the base read) is the *only* thing that
                 // closes the connection on a successful read. HTTP is
                 // connect-per-transaction but the response still ends on the
@@ -1223,7 +1282,7 @@ impl DrvAsynIPPort {
                 // lower-layer `asynTimeout`, unchanged, alongside the count).
                 // A variant match therefore never saw a timeout on a default
                 // IP port and `disconnectOnReadTimeout` could not fire; C runs
-                // its test inside readRaw, below the interpose, where the raw
+                // its test inside readIt, below the interpose, where the raw
                 // recv timeout is visible (drvAsynIPPort.c:798-806).
                 let failure = classify_read_failure(
                     e,
@@ -1257,7 +1316,7 @@ impl DrvAsynIPPort {
             PortFlags {
                 multi_device: false,
                 can_block: true,
-                destructible: true,
+                ..PortFlags::default()
             },
         );
         base.init_connected(false);
@@ -1334,7 +1393,7 @@ impl DrvAsynIPPort {
     }
 
     /// Run one RFC 2217 exchange against the link below the interpose, then
-    /// apply whatever teardown C's `readRaw`/`writeRaw` would have applied
+    /// apply whatever teardown C's `readIt`/`writeIt` would have applied
     /// during it.
     ///
     /// The single gate for every negotiation in this driver — the connect-time
@@ -1428,8 +1487,8 @@ impl DrvAsynIPPort {
     }
 
     /// Create the socket C's `connectIt` creates: fresh fd, then every option
-    /// the protocol suffix asked for — `SO_BROADCAST` (drvAsynIPPort.c:448-459)
-    /// and `SO_REUSEPORT` (:461-477) — applied **before** the socket is bound or
+    /// the protocol suffix asked for — `SO_BROADCAST` (drvAsynIPPort.c:451-459)
+    /// and `SO_REUSEPORT` (:464-477) — applied **before** the socket is bound or
     /// connected, because that is the only time the kernel honours them. Binding
     /// first and setting `SO_REUSEPORT` afterwards, as this driver used to, left
     /// `udp&` with a local port failing `EADDRINUSE` where C binds.
@@ -1455,7 +1514,7 @@ impl DrvAsynIPPort {
         use std::net::ToSocketAddrs;
         let addr_str = format!("{}:{}", self.config.host, self.config.port);
         // Resolve the remote first: C delays the lookup to connect time too, in
-        // case the device has just appeared in DNS (drvAsynIPPort.c:479-493).
+        // case the device has just appeared in DNS (drvAsynIPPort.c:484-493).
         let addrs: Vec<std::net::SocketAddr> = addr_str
             .to_socket_addrs()
             .map_err(|e| AsynError::Status {
@@ -1467,7 +1526,7 @@ impl DrvAsynIPPort {
         let mut last_err: Option<AsynError> = None;
         for remote_addr in &addrs {
             // C binds the local address only when one was configured — "a very
-            // unusual configuration" (:495-506).
+            // unusual configuration" (:499-506).
             let local_addr: Option<std::net::SocketAddr> =
                 self.config.local_port.map(|local_port| {
                     if remote_addr.is_ipv6() {
@@ -1518,7 +1577,7 @@ impl DrvAsynIPPort {
         };
         // The options go on the fresh socket, before the bind — the whole point
         // of `udp&` is two ports sharing one local port, and the kernel only
-        // honours SO_REUSEPORT on an unbound socket (C :461-477, then :495-506).
+        // honours SO_REUSEPORT on an unbound socket (C :464-477, then :499-506).
         // That ordering is the seam's contract, not this call site's.
         let socket = socket::udp_socket(local_addr, self.socket_options()).map_err(|e| {
             AsynError::Status {
@@ -1548,8 +1607,8 @@ impl DrvAsynIPPort {
     /// **Invariant: `connect` returning `Err` MUST leave `io.inner` empty.**
     /// The socket is published *after* the last step that can fail, which is C
     /// exactly — every fallible step in `connectIt` runs `epicsSocketDestroy(fd)`
-    /// and returns (`drvAsynIPPort.c:511-517` for `setNonBlock`, `:570-577` for
-    /// `TCP_NODELAY`), and `tty->fd = fd` lands only at `:581`. That ordering is
+    /// and returns (`drvAsynIPPort.c:535-543` for `setNonBlock`, `:525-534` for
+    /// `TCP_NODELAY`), and `tty->fd = fd` lands only at `:547`. That ordering is
     /// what makes a failed connect retryable: `tty->fd` is still
     /// `INVALID_SOCKET`, so the already-open guard at `:424-427` does not fire.
     ///
@@ -1608,7 +1667,7 @@ impl PortDriver for DrvAsynIPPort {
                 if self.config.no_delay {
                     stream.set_nodelay(true)?;
                 }
-                // `tcp&` = TCP + SO_REUSEPORT (C :360-363, :461-477). The option
+                // `tcp&` = TCP + SO_REUSEPORT (C :360-363, :464-477). The option
                 // is set by `new_socket` on the unconnected socket, which is the
                 // only place it means anything.
                 IpIoInner::Tcp(stream)
@@ -1691,7 +1750,7 @@ impl PortDriver for DrvAsynIPPort {
     ) -> AsynResult<(usize, EomReason)> {
         // Override the synthetic default so the real END/EOS reason from the
         // base read + interpose chain reaches the actor (C reports eomReason
-        // from readRaw; END marks a TCP EOF, EOS an input-EOS match).
+        // from readIt; END marks a TCP EOF, EOS an input-EOS match).
         self.read_octet_core(user, buf)
     }
 
@@ -1701,7 +1760,7 @@ impl PortDriver for DrvAsynIPPort {
         // stays logically connected across transactions, so the lazy reopen
         // keys off `io.inner.is_none()`, not `!connected` (which would never
         // fire post-EOF since `connected` is left `true`). This is the C
-        // `writeRaw` lazy `connectIt` on `fd == INVALID_SOCKET`
+        // `writeIt` lazy `connectIt` on `fd == INVALID_SOCKET`
         // (drvAsynIPPort.c:590-606). Surface the connect failure cause
         // rather than masking it.
         if self.config.protocol == IpProtocol::Http && self.io.inner.is_none() {
@@ -1759,7 +1818,7 @@ impl PortDriver for DrvAsynIPPort {
         // independent option maps.
         if self.com.is_some() && ComPortOptions::owns_key(key) {
             // Same teardown gate as the connect-time handshake: C's setOption
-            // reads run through the same `readIt`/`readRaw` below the interpose.
+            // reads run through the same `readIt` below the interpose.
             return self
                 .with_negotiation(|com, link| com.set_option(user, link, key, value))
                 .expect("com is Some");
@@ -1787,6 +1846,26 @@ impl PortDriver for DrvAsynIPPort {
             if let Some(IpIoInner::Tcp(ref stream)) = self.io.inner {
                 stream.set_nodelay(enabled)?;
             }
+        } else if key.eq_ignore_ascii_case("connectTimeout") {
+            // Also not C's — C has no connect timeout at all, because its
+            // `connect()` runs on a still-blocking socket (:513-523,
+            // `setNonBlock` only at :536) and so takes the OS SYN timeout,
+            // roughly two minutes on Linux. The port-actor model cannot park
+            // that long, hence the 5 s default; but a device that answers late
+            // — congested link, slow gateway, a controller still booting —
+            // connects under C and never connects here, and the record shows
+            // CNCT 0 where C shows 1. Making the bound settable is what gives
+            // that device C's behaviour back: any value at or beyond the OS
+            // SYN timeout leaves the OS to end the connect, which is what C
+            // does. Seconds, as every asyn timeout is spelled.
+            let secs: f64 = value
+                .trim()
+                .parse()
+                .map_err(|_| invalid_option_value("connectTimeout"))?;
+            if !secs.is_finite() || secs <= 0.0 {
+                return Err(invalid_option_value("connectTimeout"));
+            }
+            self.config.connect_timeout = Duration::from_secs_f64(secs);
         } else if key.eq_ignore_ascii_case("disconnectOnReadTimeout") {
             // C drvAsynIPPort.c::setOption (924-935): only "Y"/"N"
             // (case-insensitive) are valid; any other value returns
@@ -1834,8 +1913,9 @@ impl PortDriver for DrvAsynIPPort {
             self.config.protocol = new_config.protocol;
             // connect_timeout / no_delay are not re-applied on a hostInfo
             // reparse: C parseHostInfo touches neither (no_delay is set
-            // unconditionally in connectIt; C has no connect-timeout option
-            // at all — see DEFAULT_CONNECT_TIMEOUT / DRV-13).
+            // unconditionally in connectIt, and a `connectTimeout` the
+            // operator set stays set — re-parsing the endpoint must not
+            // silently restore the default bound).
             //
             // C parseHostInfo replaces tty->IPDeviceName with
             // epicsStrDup(hostInfo); store the verbatim spec so a later
@@ -1869,7 +1949,9 @@ impl PortDriver for DrvAsynIPPort {
                 return com.options.get_option(key);
             }
         }
-        if key.eq_ignore_ascii_case("disconnectOnReadTimeout") {
+        if key.eq_ignore_ascii_case("connectTimeout") {
+            Ok(format!("{}", self.config.connect_timeout.as_secs_f64()))
+        } else if key.eq_ignore_ascii_case("disconnectOnReadTimeout") {
             Ok(if self.disconnect_on_read_timeout {
                 "Y"
             } else {
@@ -2175,7 +2257,7 @@ mod tests {
 
         let user = AsynUser::new(0).with_timeout(Duration::from_secs(1));
         let mut buf = [0u8; 32];
-        // C drvAsynIPPort.c::readRaw (815-821): a TCP EOF returns success
+        // C drvAsynIPPort.c::readIt (815-821): a TCP EOF returns success
         // with zero bytes and ASYN_EOM_END, then closes the connection.
         let (n, eom) = drv.io_read_octet_eom(&user, &mut buf).unwrap();
         assert_eq!(n, 0);
@@ -2443,7 +2525,7 @@ mod tests {
     }
 
     /// R8-57 boundary: C runs the negotiation's reads through
-    /// `readIt`/`readRaw`, so `readRaw`'s teardown gate (drvAsynIPPort.c:798-806)
+    /// `readIt`, so `readIt`'s teardown gate (drvAsynIPPort.c:798-806)
     /// governs them too — a negotiation read that times out with
     /// `disconnectOnReadTimeout=Y` closes the socket. Driving the raw link would
     /// have silently skipped that.
@@ -2492,7 +2574,7 @@ mod tests {
         server.join().unwrap();
 
         // Option ON — the same silent server now costs the socket, because C
-        // applies readRaw's teardown to the negotiation's reads too.
+        // applies readIt's teardown to the negotiation's reads too.
         let (port, server) = silent_server();
         let mut drv = DrvAsynIPPort::new("comto2", &format!("127.0.0.1:{port} COM")).unwrap();
         drv.set_option(&mut AsynUser::default(), "disconnectOnReadTimeout", "Y")
@@ -2500,7 +2582,7 @@ mod tests {
         drv.connect(&AsynUser::default()).unwrap();
         assert!(
             !drv.base.is_connected(),
-            "a timed-out negotiation read must close the socket, as C readRaw does"
+            "a timed-out negotiation read must close the socket, as C readIt does"
         );
         assert!(drv.io.inner.is_none());
         server.join().unwrap();
@@ -2540,7 +2622,7 @@ mod tests {
     /// timeout even when the EOS interpose is installed — which
     /// `drvAsynIPPortConfigure` does by default (iocsh.rs), so this is the
     /// *normal* configuration, not a corner case. C runs its disconnect test
-    /// inside readRaw, below the interpose, on the raw recv timeout
+    /// inside readIt, below the interpose, on the raw recv timeout
     /// (drvAsynIPPort.c:798-806); asyn-rs runs it above the interpose, where
     /// the same timeout arrives wrapped as `PartialRead` — so the test must
     /// key off `e.status()`, not the error variant. Matching by variant made
@@ -2579,7 +2661,7 @@ mod tests {
         assert_eq!(
             err.status(),
             AsynStatus::Error,
-            "C readRaw overwrites the status on the disconnect branch"
+            "C readIt overwrites the status on the disconnect branch"
         );
         assert!(
             err.message().contains("read error"),
@@ -2650,7 +2732,7 @@ mod tests {
         }
         .with_partial_read(partial);
 
-        let f = classify_read_failure(timed_out, true, timeout, "127.0.0.1:5001");
+        let f = classify_read_failure(timed_out, true, Some(timeout), "127.0.0.1:5001");
         assert!(f.disconnect, "disconnectOnReadTimeout + timeout > 0");
         assert_eq!(f.error.status(), AsynStatus::Error, "C :805");
         assert_eq!(
@@ -2677,23 +2759,30 @@ mod tests {
         let dev = "host:1";
 
         // option off → no teardown, status unchanged, whatever the timeout.
-        let f = classify_read_failure(timeout(), false, Duration::from_secs(1), dev);
+        let f = classify_read_failure(timeout(), false, Some(Duration::from_secs(1)), dev);
         assert!(!f.disconnect);
         assert_eq!(f.error.status(), AsynStatus::Timeout);
 
         // option on but timeout == 0 (a poll) → C's `pasynUser->timeout > 0`
         // fails: no teardown, asynTimeout stands.
-        let f = classify_read_failure(timeout(), true, Duration::ZERO, dev);
+        let f = classify_read_failure(timeout(), true, Some(Duration::ZERO), dev);
+        assert!(!f.disconnect);
+        assert_eq!(f.error.status(), AsynStatus::Timeout);
+
+        // option on, negative timeout (`None`, C's wait forever) → the same
+        // `pasynUser->timeout > 0` test fails: a forever-wait keeps its socket
+        // (DRV-42).
+        let f = classify_read_failure(timeout(), true, None, dev);
         assert!(!f.disconnect);
         assert_eq!(f.error.status(), AsynStatus::Timeout);
 
         // option on, timeout > 0 → teardown + asynError.
-        let f = classify_read_failure(timeout(), true, Duration::from_millis(1), dev);
+        let f = classify_read_failure(timeout(), true, Some(Duration::from_millis(1)), dev);
         assert!(f.disconnect);
         assert_eq!(f.error.status(), AsynStatus::Error);
 
         // a real errno tears down with the option off — C's second disjunct.
-        let f = classify_read_failure(fatal(), false, Duration::ZERO, dev);
+        let f = classify_read_failure(fatal(), false, Some(Duration::ZERO), dev);
         assert!(f.disconnect);
         assert_eq!(f.error.status(), AsynStatus::Error);
         assert_eq!(f.error.message(), "host:1 read error: IO: cable yanked");
@@ -2811,7 +2900,7 @@ mod tests {
     #[test]
     fn test_udp_empty_datagram_is_not_eof() {
         // DRV-4: a zero-length UDP datagram is a legitimate read of 0 bytes,
-        // not a connection close. C readRaw only treats recv()==0 as EOF for
+        // not a connection close. C readIt only treats recv()==0 as EOF for
         // SOCK_STREAM; a DGRAM 0-byte recvfrom leaves the port open.
         let server = UdpSocket::bind("127.0.0.1:0").unwrap();
         let server_port = server.local_addr().unwrap().port();
@@ -2844,7 +2933,7 @@ mod tests {
 
     #[test]
     fn test_udp_zero_length_write_sends_nothing() {
-        // DRV-14: C writeRaw (613-614) returns success on a zero-length
+        // DRV-14: C writeIt (613-614) returns success on a zero-length
         // write without sending — in particular no empty UDP datagram.
         let server = UdpSocket::bind("127.0.0.1:0").unwrap();
         server
@@ -2897,21 +2986,24 @@ mod tests {
 
     #[test]
     fn socket_poll_timeout_floors_zero_to_one_ms() {
-        // C drvAsynIPPort.c::readRaw/writeRaw floor `(int)(timeout*1000)==0`
+        // C drvAsynIPPort.c::readIt/writeIt floor `(int)(timeout*1000)==0`
         // to a 1 ms poll; std rejects a zero Duration in set_read_timeout.
         assert_eq!(
-            socket_poll_timeout(Duration::ZERO),
-            Duration::from_millis(1)
+            socket_poll_timeout(Some(Duration::ZERO)),
+            Some(Duration::from_millis(1))
         );
+        // A negative "wait forever" has no interval to floor: it passes through
+        // as C's `pollmsec = -1` (DRV-42).
+        assert_eq!(socket_poll_timeout(None), None);
         // Positive timeouts pass through verbatim; the whole-millisecond
         // rounding the poll sites need belongs to `wait_millis`, not here.
         assert_eq!(
-            socket_poll_timeout(Duration::from_micros(500)),
-            Duration::from_micros(500)
+            socket_poll_timeout(Some(Duration::from_micros(500))),
+            Some(Duration::from_micros(500))
         );
         assert_eq!(
-            socket_poll_timeout(Duration::from_secs(2)),
-            Duration::from_secs(2)
+            socket_poll_timeout(Some(Duration::from_secs(2))),
+            Some(Duration::from_secs(2))
         );
     }
 
@@ -2930,7 +3022,7 @@ mod tests {
         let _accepted = listener.accept().unwrap();
 
         let start = std::time::Instant::now();
-        client.bound_next_read(Duration::from_micros(500));
+        client.bound_next_read(Some(Duration::from_micros(500)));
         let elapsed = start.elapsed();
 
         assert!(
@@ -2941,7 +3033,7 @@ mod tests {
 
     #[test]
     fn zero_timeout_read_polls_without_disconnect() {
-        // C drvAsynIPPort.c::readRaw: a `timeout == 0` read becomes a 1 ms
+        // C drvAsynIPPort.c::readIt: a `timeout == 0` read becomes a 1 ms
         // poll (line 742) and the disconnect-on-read-timeout teardown is
         // gated on `timeout > 0` (line 799). So a zero-timeout read of a
         // silent socket must return asynTimeout WITHOUT a hard
@@ -2979,7 +3071,7 @@ mod tests {
 
     #[test]
     fn classify_read_error_eintr_and_wouldblock_are_nonfatal_timeout() {
-        // C readRaw (798-800) excludes EWOULDBLOCK *and* EINTR from the fatal
+        // C readIt (798-800) excludes EWOULDBLOCK *and* EINTR from the fatal
         // disjunct, so a signal-interrupted read must be a non-fatal timeout
         // (socket intact), identical to a would-block — never an Io→teardown.
         use std::io::{Error, ErrorKind};
@@ -3005,6 +3097,85 @@ mod tests {
         let reset = classify_read_error(Error::from(ErrorKind::ConnectionReset));
         assert!(matches!(reset, AsynError::Io(_)));
         assert!(reset.is_fatal_transport());
+    }
+
+    /// A peer that accepts `chunk` bytes per pass, each pass becoming
+    /// writable `delay` after the wait starts.
+    struct DribblePeer {
+        chunk: usize,
+        delay: Duration,
+    }
+
+    impl WaitWritable for DribblePeer {
+        fn wait_writable(&self, deadline: Option<std::time::Instant>) -> std::io::Result<bool> {
+            let ready = std::time::Instant::now() + self.delay;
+            if deadline.is_some_and(|d| ready > d) {
+                // What `poll` does when its interval expires first.
+                let deadline = deadline.expect("checked above");
+                std::thread::sleep(deadline.saturating_duration_since(std::time::Instant::now()));
+                return Ok(false);
+            }
+            std::thread::sleep(self.delay);
+            Ok(true)
+        }
+    }
+
+    impl SendWithoutParking for DribblePeer {
+        fn send_without_parking(&self, buf: &[u8]) -> std::io::Result<usize> {
+            Ok(self.chunk.min(buf.len()))
+        }
+    }
+
+    /// DRV-58. C's `writePollmsec` bounds one `poll(POLLOUT)` and is re-armed
+    /// on every pass (drvAsynIPPort.c:615-616, 638-652), so a peer that keeps
+    /// taking bytes never times out however long the transfer runs. One
+    /// deadline built at write-start instead expired mid-transfer and returned
+    /// `asynTimeout` with a partial count where C returns success — a WRITE
+    /// alarm and NAWT below NOWT on an `asynOctetWrite` record.
+    #[test]
+    fn a_slow_but_progressing_peer_never_times_out() {
+        let peer = DribblePeer {
+            chunk: 1,
+            delay: Duration::from_millis(20),
+        };
+        // Six passes of 20 ms against a 50 ms bound: every individual wait is
+        // inside the bound, the whole transfer is far outside it.
+        let n = write_with_retry(&peer, b"abcdef", Some(Duration::from_millis(50)), None)
+            .expect("a peer that keeps accepting bytes must not time out");
+        assert_eq!(n, 6);
+    }
+
+    /// The other half of the same bound: when one wait really does outlast it,
+    /// C reports `asynTimeout` with `*nbytesTransfered` (`:648-652`, `:678`).
+    #[test]
+    fn a_peer_that_stalls_longer_than_one_poll_times_out_with_its_count() {
+        let peer = DribblePeer {
+            chunk: 1,
+            delay: Duration::from_millis(50),
+        };
+        let err = write_with_retry(&peer, b"abcdef", Some(Duration::from_millis(5)), None)
+            .expect_err("a wait longer than the bound is C's asynTimeout");
+        assert_eq!(err.status(), AsynStatus::Timeout);
+        assert_eq!(err.partial_write(), Some(0));
+    }
+
+    /// The caller's own budget still caps the transfer where one exists — the
+    /// server port's broadcast states a single timeout for all its slots.
+    #[test]
+    fn a_caller_budget_still_caps_a_progressing_transfer() {
+        let peer = DribblePeer {
+            chunk: 1,
+            delay: Duration::from_millis(20),
+        };
+        let cap = std::time::Instant::now() + Duration::from_millis(50);
+        let err = write_with_retry(&peer, b"abcdef", Some(Duration::from_millis(50)), Some(cap))
+            .expect_err("the caller's budget bounds the whole call");
+        assert_eq!(err.status(), AsynStatus::Timeout);
+        assert!(
+            matches!(err.partial_write(), Some(n) if (1..6).contains(&n)),
+            "the accepted count rides out on the failure, got {:?}",
+            err.partial_write()
+        );
     }
 
     #[test]
@@ -3135,7 +3306,7 @@ mod tests {
 
     #[test]
     fn zero_length_read_request_rejected_not_eof_teardown() {
-        // DRV-55: C readRaw (736-740) rejects maxchars == 0 with asynError
+        // DRV-55: C readIt (736-740) rejects maxchars == 0 with asynError
         // before touching the socket. A Rust stream.read(&mut []) returns
         // Ok(0), which the TCP arm would misread as a peer EOF and tear down a
         // healthy connection. The guard must reject the empty request *and*
@@ -3247,6 +3418,52 @@ mod tests {
             .unwrap();
         assert!(!drv.base().is_connected());
         assert_eq!(drv.config.port, 9999);
+    }
+
+    /// DRV-13. The connect bound is 5 s where C's still-blocking `connect()`
+    /// (drvAsynIPPort.c:513-523) takes the OS SYN timeout, so a device that
+    /// answers late connects under C and shows CNCT 0 here. The bound has to
+    /// stay — an unbounded connect parks the port actor — so what closes the
+    /// gap is reaching it from an option: `asynSetOption connectTimeout` moves
+    /// it, `asynGetOption` reads it back, and a value at or beyond the OS SYN
+    /// timeout is C exactly. A later `hostInfo` write must not quietly put the
+    /// default back.
+    #[test]
+    fn connect_timeout_is_settable_and_readable_as_an_option() {
+        let mut drv = DrvAsynIPPort::new("iptest", "127.0.0.1:5025 tcp").unwrap();
+        assert_eq!(drv.get_option("connectTimeout").unwrap(), "5");
+
+        // asynRecord writes option keys lowercase; C compares with
+        // epicsStrCaseCmp.
+        drv.set_option(&mut AsynUser::default(), "connecttimeout", "180")
+            .unwrap();
+        assert_eq!(drv.config.connect_timeout, Duration::from_secs(180));
+        assert_eq!(drv.get_option("CONNECTTIMEOUT").unwrap(), "180");
+
+        // Sub-second bounds are expressible too — asyn spells every timeout in
+        // seconds as a float.
+        drv.set_option(&mut AsynUser::default(), "connectTimeout", "0.25")
+            .unwrap();
+        assert_eq!(drv.config.connect_timeout, Duration::from_millis(250));
+        assert_eq!(drv.get_option("connectTimeout").unwrap(), "0.25");
+
+        // Re-pointing the port at another device keeps the operator's bound.
+        drv.set_option(&mut AsynUser::default(), "hostInfo", "10.0.0.5:1234 tcp")
+            .unwrap();
+        assert_eq!(drv.config.connect_timeout, Duration::from_millis(250));
+
+        // A value that is not a positive number is refused in C's words rather
+        // than coerced, like every other option value here.
+        for bad in ["0", "-1", "abc", "", "nan"] {
+            let err = drv
+                .set_option(&mut AsynUser::default(), "connectTimeout", bad)
+                .unwrap_err();
+            assert!(
+                err.to_string().contains("Invalid connectTimeout value."),
+                "value {bad:?} must be refused, got {err}"
+            );
+        }
+        assert_eq!(drv.config.connect_timeout, Duration::from_millis(250));
     }
 
     /// hostInfo runtime reparse must update the protocol field too,
@@ -3892,7 +4109,7 @@ mod tests {
         assert!(!drv.base.is_connected());
 
         // The wedge C avoids by leaving `tty->fd == INVALID_SOCKET`
-        // (drvAsynIPPort.c:511-517, :581): with a socket left behind, every
+        // (drvAsynIPPort.c:535-543, :547): with a socket left behind, every
         // later connect answers the already-open guard instead of retrying,
         // and nothing clears it because `drop_connection` is gated on
         // `is_connected()`.

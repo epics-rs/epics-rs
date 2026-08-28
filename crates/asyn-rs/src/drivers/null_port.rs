@@ -47,14 +47,17 @@ impl NullOctetPort {
     /// (PCNCT=1) but the link never opens (CNCT=0).
     pub fn new(port_name: &str) -> Self {
         // Single-device, blocking (ASYN_CANBLOCK, mirroring a real transport
-        // port like drvAsynIPPort), destructible.
+        // port like drvAsynIPPort, whose `registerPort` attributes are exactly
+        // that — drvAsynIPPort.c:1028-1029). This driver has no C original, so
+        // that mirror is the whole of its flag model: it grants no shutdown
+        // rights either, because drvAsynIPPort grants none.
         let mut base = PortDriverBase::new(
             port_name,
             1,
             PortFlags {
                 multi_device: false,
                 can_block: true,
-                destructible: true,
+                ..PortFlags::default()
             },
         );
         // Disconnected link, noAutoConnect — the two properties that make CNCT

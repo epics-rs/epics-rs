@@ -1,12 +1,20 @@
 //! R18-58: an IP server port accepts connections.
 //!
 //! C `drvAsynIPServerPortConfigure` binds the socket, pre-creates one child port
-//! per client slot (`<parent>:<N>`, drvAsynIPServerPort.c:681-708) and starts
+//! per client slot (`<parent>:<N>`, drvAsynIPServerPort.c:682-708) and starts
 //! `connectionListener` (:711-714), which loops on `epicsSocketAccept` (:326).
 //! Before the fix, nothing in the port ever accepted — `accept_one` had no
 //! caller outside `mod tests` — and `drvAsynIPServerPortConfigure` was not an
 //! iocsh command at all. A TCP client sat in the backlog until it timed out
 //! while the port reported Connected.
+
+// RTEMS-EXEC-MODEL-ALLOW(1): checked, not waived — all 1 ran and passed
+// on the exec backend (measured on this tree:
+// `EPICS_RS_BUILD_EXEC_BACKEND=thread cargo nextest run -p asyn-rs
+// --all-features`, 1081/1081). asyn-rs became a census subject when its
+// `build.rs` began deriving `tokio_backend`; nothing here builds a CA
+// server, and the reactor these obtain comes from `#[tokio::test]`
+// itself, which the backend does not remove.
 
 use std::io::{Read, Write};
 use std::sync::Arc;
@@ -19,6 +27,7 @@ use asyn_rs::sync_io::SyncIOHandle;
 use asyn_rs::trace::TraceManager;
 use epics_base_rs::server::database::PvDatabase;
 use epics_base_rs::server::iocsh::registry::{ArgValue, CommandContext, CommandDef};
+use named_port::on_a_named_port;
 
 fn make_ctx() -> CommandContext {
     let rt = tokio::runtime::Runtime::new().unwrap();
@@ -37,14 +46,6 @@ fn find<'a>(cmds: &'a [CommandDef], name: &str) -> &'a CommandDef {
         .unwrap_or_else(|| panic!("{name} not registered as an iocsh command"))
 }
 
-/// Take a free TCP port by binding one and letting it go — the server binds the
-/// same number a moment later. (`bind_port = 0` would be cleaner, but the whole
-/// point of this test is the st.cmd path, which names a port.)
-fn free_port() -> u16 {
-    let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-    l.local_addr().unwrap().port()
-}
-
 /// ```text
 /// drvAsynIPServerPortConfigure("R1858", "127.0.0.1:<port> TCP", 2, 0, 0, 0)
 /// ```
@@ -59,39 +60,33 @@ fn an_iocsh_configured_server_port_accepts_a_client() {
     let ctx = make_ctx();
     let configure = find(&cmds, "drvAsynIPServerPortConfigure");
 
-    // Probe-then-rebind race: `free_port()` drops its listener and the server
-    // re-binds that number inside configure (`connect_blocking` -> `open_listener`
-    // -> bind). Under parallel nextest a neighbour can steal the number in that
-    // window. On a lost bind the handler reports "cannot listen" on the shell and
-    // UNREGISTERS the server port (iocsh.rs:1602-1608) — it does NOT fail the
-    // command — so a steal is exactly "the server port object is absent after the
-    // call". Retry with a fresh number and a fresh, globally-unique port name
-    // (asyn port names are a global registry) until our bind wins.
-    let (name, port) = {
-        let mut won = None;
-        for attempt in 0..50 {
-            let port = free_port();
-            let name = format!("R1858_{attempt}");
-            configure
-                .handler
-                .call(
-                    &[
-                        ArgValue::String(name.clone()),
-                        ArgValue::String(format!("127.0.0.1:{port} TCP")),
-                        ArgValue::Int(2),
-                    ],
-                    &ctx,
-                )
-                .expect("the command reports errors on the shell, it does not fail the command");
-            // Registered ⟺ the synchronous `connect_blocking` bind won the number
-            // (the handler unregisters on a bind failure). That is the steal test.
-            if asyn_rs::asyn_record::get_port(&name).is_some() {
-                won = Some((name, port));
-                break;
-            }
-        }
-        won.expect("could not win a free TCP port in 50 attempts")
-    };
+    // This test cannot ask the kernel for a port: the property under test is the
+    // st.cmd line, which names one. So the number is a candidate, and the
+    // discriminator for "somebody else got it" is the registry — on a lost bind
+    // the handler reports "cannot listen" on the shell and UNREGISTERS the
+    // server port (iocsh.rs:1573-1580) rather than failing the command, so an
+    // absent port object after a successful call means exactly that and nothing
+    // else. A fresh port NAME per attempt too, because asyn port names are a
+    // global registry and a lost attempt has already spent one.
+    let mut spent = 0;
+    let (name, port) = on_a_named_port(|port| {
+        let name = format!("R1858_{spent}");
+        spent += 1;
+        configure
+            .handler
+            .call(
+                &[
+                    ArgValue::String(name.clone()),
+                    ArgValue::String(format!("127.0.0.1:{port} TCP")),
+                    ArgValue::Int(2),
+                ],
+                &ctx,
+            )
+            .expect("the command reports errors on the shell, it does not fail the command");
+        asyn_rs::asyn_record::get_port(&name)
+            .is_some()
+            .then_some((name, port))
+    });
 
     // C pre-creates the child ports at configure — device support binds to them
     // before any client has connected.
@@ -100,7 +95,7 @@ fn an_iocsh_configured_server_port_accepts_a_client() {
         assert!(
             asyn_rs::asyn_record::get_port(&child).is_some(),
             "child port {child} must exist after configure \
-             (drvAsynIPServerPort.c:681-708)"
+             (drvAsynIPServerPort.c:682-708)"
         );
     }
 
@@ -175,7 +170,10 @@ fn an_iocsh_server_port_with_zero_max_clients_is_not_created() {
     let cmds = build_asyn_commands(mgr);
     let ctx = make_ctx();
 
-    let port = free_port();
+    // No retry here, and none possible: maxClients=0 is refused at `with_config`
+    // before registration and before any bind, so this number is never bound and
+    // cannot be lost to anyone.
+    let port = named_port::free_for_tcp_and_udp();
     find(&cmds, "drvAsynIPServerPortConfigure")
         .handler
         .call(
@@ -189,7 +187,7 @@ fn an_iocsh_server_port_with_zero_max_clients_is_not_created() {
         .expect("the command reports the error on the shell, it does not fail the shell");
 
     // The handler registers the port and only then binds inside `connect_blocking`
-    // (iocsh.rs; a bind failure unregisters it, iocsh.rs:1602-1608). So a
+    // (iocsh.rs; a bind failure unregisters it, iocsh.rs:1573-1580). So a
     // successful bind ⟺ the port stays registered: `get_port` SOME is exactly
     // "a listener was bound". maxClients=0 is rejected at `with_config`, before
     // registration and before any bind (C drvAsynIPServerPort.c:545-548), so the

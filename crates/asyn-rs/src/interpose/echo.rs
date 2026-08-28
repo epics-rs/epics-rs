@@ -51,17 +51,17 @@ impl OctetInterpose for EchoInterpose {
         data: &[u8],
         next: &mut dyn OctetNext,
     ) -> AsynResult<usize> {
-        // C `asynInterposeEcho.c::writeIt` (:53-90) counts a byte as transferred
+        // C `asynInterposeEcho.c::writeIt` (:40-85) counts a byte as transferred
         // only once its echo has come back and matched — `transfered++` sits at
         // the bottom of the loop, after the echo check — and publishes that
-        // count on *every* break (`*nbytesTransfered = transfered`, :88). So a
+        // count on *every* break (`*nbytesTransfered = transfered`, :83). So a
         // half-echoed command reports the bytes the device confirmed, and each
         // failure exit here carries `total` out with it.
         let mut total = 0;
         for byte in data {
             // Write one byte. A failing lower-layer write propagates its status
             // and message untouched — C breaks on `status != asynSuccess`
-            // without rewriting either (:57).
+            // without rewriting either (:54).
             let n = match next.write(user, std::slice::from_ref(byte)) {
                 Ok(n) => n,
                 Err(e) => return Err(e.with_partial_write(total)),
@@ -78,10 +78,10 @@ impl OctetInterpose for EchoInterpose {
             let mut echo_buf = [0u8; 1];
             let echo_user = AsynUser::new(user.reason)
                 .with_addr(user.addr)
-                .with_timeout(user.timeout);
+                .with_timeout_opt(user.timeout);
             let echo_result = match next.read(&echo_user, &mut echo_buf) {
                 Ok(r) => r,
-                // C :64-72 — a timed-out echo read keeps its `asynTimeout`
+                // C :64-68 — a timed-out echo read keeps its `asynTimeout`
                 // status and only *replaces the message*; it does not become
                 // `asynError`. The status is the contract: `asynRecord` maps it
                 // to a different alarm than a generic error, and a device
@@ -100,12 +100,12 @@ impl OctetInterpose for EchoInterpose {
                     }
                     .with_partial_write(total));
                 }
-                // C :73 — any other failing status breaks with the lower
+                // C :69 — any other failing status breaks with the lower
                 // layer's status and message intact.
                 Err(e) => return Err(e.with_partial_write(total)),
             };
 
-            // C :74-83 — a short echo read and a mismatched echo are ONE
+            // C :70-79 — a short echo read and a mismatched echo are ONE
             // branch, reporting what came back against what went out.
             let echo = &echo_buf[..echo_result.nbytes_transferred.min(1)];
             if echo_result.nbytes_transferred != 1 || echo[0] != *byte {
@@ -119,7 +119,7 @@ impl OctetInterpose for EchoInterpose {
                 }
                 .with_partial_write(total));
             }
-            // C `transfered++` (:86) — after the echo matched, not after the
+            // C `transfered++` (:80) — after the echo matched, not after the
             // write.
             total += n;
         }
@@ -223,11 +223,11 @@ mod tests {
         let err = stack
             .dispatch_write(&mut user, b"A", &mut base)
             .unwrap_err();
-        // R8-49: C's exact diagnostic (asynInterposeEcho.c:78-82) — what came
+        // R8-49: C's exact diagnostic (asynInterposeEcho.c:75-76) — what came
         // back against what went out, both escaped.
         assert_eq!(err.status(), AsynStatus::Error);
         assert_eq!(err.message(), "got back 'X' instead of 'A'");
-        // C `asynInterposeEcho.c:88` publishes `*nbytesTransfered = transfered`
+        // C `asynInterposeEcho.c:83` publishes `*nbytesTransfered = transfered`
         // on the mismatch break — the byte was sent but never confirmed, so it
         // does not count as transferred.
         assert_eq!(err.partial_write(), Some(0));
@@ -260,7 +260,7 @@ mod tests {
         let err = stack
             .dispatch_write(&mut user, b"A", &mut base)
             .unwrap_err();
-        // R8-49: C (asynInterposeEcho.c:64-72) keeps `asynTimeout` on a
+        // R8-49: C (asynInterposeEcho.c:64-68) keeps `asynTimeout` on a
         // timed-out echo read and only replaces the message. It does NOT
         // become `asynError` — asynRecord raises a different alarm for a
         // timeout, and retry-on-timeout device support must still see one.
@@ -350,9 +350,9 @@ mod tests {
         assert_eq!(err.partial_write(), Some(0));
     }
 
-    /// R8-49: C (:74-83) treats a short echo read and a wrong echo as the same
+    /// R8-49: C (:70-79) treats a short echo read and a wrong echo as the same
     /// break, and escapes both sides of the comparison
-    /// (`epicsStrnEscapedFromRaw`, :78-80).
+    /// (`epicsStrnEscapedFromRaw`, :73-74).
     #[test]
     fn short_echo_and_control_chars_use_the_escaped_mismatch_message() {
         struct ShortEchoBase;
@@ -383,7 +383,7 @@ mod tests {
     }
 
     /// R8-49: a short write from the layer below is C's `nbytesTransfered != 1`
-    /// break (:59-63), reported as its own diagnostic rather than folded into
+    /// break (:55-60), reported as its own diagnostic rather than folded into
     /// the echo mismatch.
     #[test]
     fn short_write_reports_the_char_count_c_reports() {

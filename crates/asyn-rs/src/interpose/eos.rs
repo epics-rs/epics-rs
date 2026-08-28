@@ -34,9 +34,9 @@ impl Default for EosConfig {
     }
 }
 
-/// One device's EOS state — C's `eosPvt` (asynInterposeEos.c:35-54), of which
+/// One device's EOS state — C's `eosPvt` (asynInterposeEos.c:36-55), of which
 /// there is exactly one per (port, addr) because `asynInterposeEosConfig` takes
-/// the addr and creates the instance for it (:84-120).
+/// the addr and creates the instance for it (:84-140).
 struct EosDevice {
     config: EosConfig,
     /// Fixed-size internal read buffer.
@@ -64,7 +64,7 @@ impl EosDevice {
     /// (`in_buf_head` / `in_buf_tail`) and the partial-EOS match position
     /// (`eos_in_match`). Every site that must forget bytes belonging to a
     /// past link or a past terminator routes through here — `flush`
-    /// (C `flushIt`, asynInterposeEos.c:262-264) and `connection_changed`
+    /// (C `flushIt`, asynInterposeEos.c:264-266) and `connection_changed`
     /// (C `eosInExceptionHandler`, asynInterposeEos.c:146-150) clear all
     /// three; `set_input_eos` clears only the match position, because C
     /// leaves `inBuf` alone on a terminator change.
@@ -375,25 +375,28 @@ impl OctetInterpose for EosInterpose {
         next.flush(user)
     }
 
-    fn set_input_eos(&mut self, addr: i32, eos: &[u8]) {
-        // C :260 — with `processEosIn == 0` the terminator belongs to the
-        // driver, not to this layer; taking it here would make `read` (which
-        // delegates) and the stored terminator disagree.
+    fn set_input_eos(&mut self, addr: i32, eos: &[u8]) -> bool {
+        // C :293-295 — with `processEosIn == 0` the terminator belongs to the
+        // driver, not to this layer, and the call is *delegated downwards*;
+        // taking it here would make `read` (which delegates) and the stored
+        // terminator disagree.
         if !self.process_in {
-            return;
+            return false;
         }
         let dev = self.device(addr);
         dev.config.input_eos = eos.to_vec();
         // Reset the resync state machine — a mid-stream terminator change
         // must not carry a partial match from the old terminator.
         dev.eos_in_match = 0;
+        true
     }
 
-    fn set_output_eos(&mut self, addr: i32, eos: &[u8]) {
+    fn set_output_eos(&mut self, addr: i32, eos: &[u8]) -> bool {
         if !self.process_out {
-            return;
+            return false;
         }
         self.device(addr).config.output_eos = eos.to_vec();
+        true
     }
 
     /// C `eosInExceptionHandler` (asynInterposeEos.c:142-151): on
@@ -405,8 +408,10 @@ impl OctetInterpose for EosInterpose {
     /// byte of the new session complete a spurious EOS match.
     fn connection_changed(&mut self) {
         // The connect exception is port-level: C fires it at every `eosPvt`
-        // registered on the port (`exceptionOccurred`, asynManager.c:2100-2140,
-        // walks the exception-user list), so every device drops its read-ahead.
+        // registered on the port — `exceptionOccurred` (asynManager.c:638)
+        // hands off to `announceExceptionOccurred` (:611-637), which walks the
+        // dpCommon's `exceptionUserList` (:621-625) — so every device drops its
+        // read-ahead.
         for dev in self.devices.values_mut() {
             dev.reset_link_state();
         }

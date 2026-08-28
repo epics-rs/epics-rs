@@ -11,6 +11,14 @@
 //! actually builds, `asynSetTraceMask MYPORT -1 …` produced no output and no
 //! exception callback ever fired.
 
+// RTEMS-EXEC-MODEL-ALLOW(1): checked, not waived — all 1 ran and passed
+// on the exec backend (measured on this tree:
+// `EPICS_RS_BUILD_EXEC_BACKEND=thread cargo nextest run -p asyn-rs
+// --all-features`, 1081/1081). asyn-rs became a census subject when its
+// `build.rs` began deriving `tokio_backend`; nothing here builds a CA
+// server, and the reactor these obtain comes from `#[tokio::test]`
+// itself, which the backend does not remove.
+
 use std::io::Read;
 use std::sync::{Arc, Mutex};
 
@@ -62,9 +70,13 @@ fn iocsh_created_port_traces_and_announces_exceptions() {
         std::thread::sleep(std::time::Duration::from_secs(5));
     });
 
-    let mut path = std::env::temp_dir();
-    path.push(format!("asyn_r18_57_{}.log", std::process::id()));
-    let _ = std::fs::remove_file(&path);
+    // An exclusive root rather than a pid-tagged name in the shared temp dir: the
+    // pid distinguishes live processes but is reused after one exits, so the
+    // remove-on-the-way-in this replaces was load-bearing. `TempDir` cannot hold a
+    // previous run's log to begin with, and drops the trace file on every exit
+    // path including a panicking one.
+    let dir = tempfile::tempdir().expect("fixture root");
+    let path = dir.path().join("asyn_r18_57.log");
     let file = std::fs::File::create(&path).unwrap();
 
     let services = PortServices::new(Arc::new(TraceManager::new()));
@@ -124,7 +136,7 @@ fn iocsh_created_port_traces_and_announces_exceptions() {
     assert!(
         log.contains("connected to"),
         "an iocsh-created port must honour asynSetTraceMask — C traces the \
-         connect at ASYN_TRACE_FLOW (drvAsynIPPort.c:1311); trace file held: {log:?}"
+         connect at ASYN_TRACE_FLOW (drvAsynIPPort.c:545-546); trace file held: {log:?}"
     );
 
     let evs = events.lock().unwrap();

@@ -22,9 +22,9 @@ use crate::error::{AsynError, AsynResult, AsynStatus};
 /// halves of a driver's option interface enter through.
 ///
 /// Every C option entry point compares the key case-insensitively —
-/// `drvAsynSerialPort.c` `getOption` (:143-587) and `setOption` (:262-594),
+/// `drvAsynSerialPort.c` `getOption` (:143-230) and `setOption` (:261-598),
 /// `drvAsynSerialPortWin32.c` `getOption` (:110-155) and `setOption`
-/// (:186-340) — so `BAUD`, `Baud` and `baud` name one key on both paths. The
+/// (:192-344) — so `BAUD`, `Baud` and `baud` name one key on both paths. The
 /// two halves used to disagree here: `setOption` lowercased the key while
 /// `getOption` matched the caller's spelling against lowercase literals, so an
 /// option an operator set as `BAUD` read back `OptionNotFound` and an

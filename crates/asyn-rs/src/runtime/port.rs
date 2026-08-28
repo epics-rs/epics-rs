@@ -67,32 +67,91 @@ impl PortRuntimeHandle {
     /// Repeated calls are harmless: the request is already queued (or the actor
     /// has already gone), and both are a no-op.
     pub fn shutdown(&self) {
-        // Poison-tolerant: shutdown must stay infallible even if a thread
-        // panicked while holding the lock.
-        let guard = self.shutdown_tx.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(tx) = guard.as_ref() {
-            // Capacity-1 channel: `Full` means a shutdown is already queued,
-            // `Closed` means the actor has already stopped. Neither is an error.
-            let _ = tx.try_send(());
-        }
+        request_shutdown(&self.shutdown_tx);
     }
 
     /// Signal shutdown and wait for the actor thread to exit.
+    ///
+    /// The wait is what makes the driver's own teardown observable: the actor
+    /// owns the driver, so the driver is dropped — and its `Drop` has run
+    /// whatever protocol goodbye it owes — only once this returns. Unbounded,
+    /// because a caller who asked to wait has a reason to; the process-exit
+    /// path bounds its wait instead (see `stop_port_actor`).
     pub fn shutdown_and_wait(&self) {
-        self.shutdown();
-        let rx = self
-            .completion_rx
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .take();
-        if let Some(rx) = rx {
-            let _ = rx.recv();
-        }
+        stop_port_actor(
+            &self.port_name,
+            &self.shutdown_tx,
+            &self.completion_rx,
+            None,
+        );
     }
 
     /// Port name.
     pub fn port_name(&self) -> &str {
         &self.port_name
+    }
+}
+
+/// Ask a port actor to stop. The one site that sends the request, so
+/// [`PortRuntimeHandle::shutdown`] and the process-exit callback cannot drift
+/// apart on what "ask" means.
+fn request_shutdown(shutdown_tx: &Arc<std::sync::Mutex<Option<mpsc::Sender<()>>>>) {
+    // Poison-tolerant: shutdown must stay infallible even if a thread panicked
+    // while holding the lock.
+    let guard = shutdown_tx.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(tx) = guard.as_ref() {
+        // Capacity-1 channel: `Full` means a shutdown is already queued,
+        // `Closed` means the actor has already stopped. Neither is an error.
+        let _ = tx.try_send(());
+    }
+}
+
+/// Stop a port actor and wait for it to have dropped its driver — the one
+/// stop sequence, shared by [`PortRuntimeHandle::shutdown_and_wait`] and by the
+/// port's process-exit callback.
+///
+/// It takes the two channel ends rather than a `PortRuntimeHandle` on purpose.
+/// A `PortRuntimeHandle` carries a `PortHandle`, and a `PortHandle` kept alive
+/// keeps the port alive; the exit callback must be able to stop a port without
+/// having been the reason it was still running. These two ends carry no
+/// reachability: the actor stops on a `()` *sent* on the shutdown channel, never
+/// on it closing.
+///
+/// `wait` bounds how long to wait for the actor thread. `None` blocks. The exit
+/// path passes a bound because the actor may be inside a driver call that
+/// answers no clock — a serial read with no timeout — and a process must be
+/// able to leave even when one of its ports will not.
+fn stop_port_actor(
+    port_name: &str,
+    shutdown_tx: &Arc<std::sync::Mutex<Option<mpsc::Sender<()>>>>,
+    completion_rx: &Arc<std::sync::Mutex<Option<std::sync::mpsc::Receiver<()>>>>,
+    wait: Option<std::time::Duration>,
+) {
+    request_shutdown(shutdown_tx);
+    let rx = completion_rx
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .take();
+    let Some(rx) = rx else {
+        // Someone already waited for this actor; its driver is long dropped.
+        return;
+    };
+    match wait {
+        None => {
+            let _ = rx.recv();
+        }
+        Some(limit) => {
+            if rx.recv_timeout(limit).is_err() {
+                // Loud, and on stderr: this is the one report that a driver's
+                // teardown did NOT run, and it happens on the way out of a
+                // process where a `tracing` subscriber may already be gone —
+                // on the embedded targets there was never one to begin with.
+                eprintln!(
+                    "asyn: port '{port_name}' did not stop within {limit:?}; its driver's \
+                     teardown has not run"
+                );
+            }
+        }
     }
 }
 
@@ -194,7 +253,9 @@ pub fn create_port_runtime_boxed(
 ) -> AsynResult<(PortRuntimeHandle, std::thread::JoinHandle<()>)> {
     // The one site that binds a port to its trace configuration and exception
     // list. C does it inside `registerPort` — the sole path into the port list
-    // — so no port can exist without them (asynManager.c:503, :611-637). Every
+    // — which calls `dpCommonInit` (asynManager.c:2066) before adding the port
+    // (:2094); `dpCommonInit` (:510-529) is what inits `exceptionUserList` (:524)
+    // and the port's own `tracePvt` (:528), so no port can exist without them. Every
     // port creator in this crate (`PortManager::register_port`, the
     // `drvAsyn*PortConfigure` iocsh commands, driver-owned ports) funnels
     // through here, so binding here is what makes that true for the port too.
@@ -224,7 +285,7 @@ pub fn create_port_runtime_boxed(
     let max_addr = driver.base().max_addr as i32;
     // The driver's interface declaration, taken once here — C's port
     // registration is where `registerInterface` is called too, and the set never
-    // changes afterwards (asynManager.c:2100-2120).
+    // changes afterwards (asynManager.c:2105-2138).
     let interfaces = driver.capabilities();
 
     // Event broadcast
@@ -249,7 +310,7 @@ pub fn create_port_runtime_boxed(
     let event_tx_clone = event_tx.clone();
     let name_clone = port_name.clone();
 
-    // C's `waitConnect` (asynManager.c:2135, :3288-3336): registration waits on
+    // C's `waitConnect` (asynManager.c:2135, :3294-3337): registration waits on
     // the port's *connect exception* for at most `autoConnectTimeout`, so the
     // line of st.cmd after `drvAsynIPPortConfigure` already sees a live port.
     // The waiter is armed before the actor thread exists, so the connect it
@@ -305,8 +366,53 @@ pub fn create_port_runtime_boxed(
         port_name,
     };
 
+    // C `registerPort` ends by arming the port's own process-exit callback —
+    // `epicsAtExit(destroyPortDriver, (void *)pport->portName)`
+    // (asynManager.c:2097) — so a port is wired into shutdown by the same call
+    // that brings it up, and no port creator has to remember to do it. This is
+    // that line: every port in this process, however it was made, is stopped by
+    // the IOC's shutdown owner (`epics_libcom_rs::runtime::exit`).
+    //
+    // Stopping the actor is the whole mechanism. The actor owns the driver
+    // exclusively, so its thread ending drops the driver, and the driver's
+    // `Drop` runs whatever teardown it owes its device — an MQTT DISCONNECT, a
+    // serial `disconnect`. Drivers therefore need to know nothing about
+    // shutdown, which is C's arrangement too: `shutdownPort` fires
+    // `asynExceptionShutdown` and leaves the destruction to the driver
+    // (asynManager.c:2300-2304).
+    //
+    // The callback holds the two channel ends, not the runtime handle: holding
+    // a `PortHandle` would keep the port reachable, and so alive, for the life
+    // of the process — turning every port ever created into a leak, and
+    // breaking the "last `PortHandle` dropped stops the port" contract above.
+    // These ends keep nothing alive, exactly as C's callback holds only the
+    // port *name* and looks it up at exit time (asynManager.c:2026-2043).
+    let exit_shutdown_tx = handle.shutdown_tx.clone();
+    let exit_completion_rx = handle.completion_rx.clone();
+    let exit_port_name = handle.port_name.clone();
+    epics_libcom_rs::runtime::exit::at_exit(format!("asynPort {exit_port_name}"), move || {
+        stop_port_actor(
+            &exit_port_name,
+            &exit_shutdown_tx,
+            &exit_completion_rx,
+            Some(PORT_EXIT_STOP_TIMEOUT),
+        );
+    });
+
     Ok((handle, join_handle))
 }
+
+/// How long process shutdown waits for one port actor to stop before reporting
+/// it and moving on to the next.
+///
+/// C does not wait at all — `shutdownPort` disables the port, fires the
+/// shutdown exception and returns (asynManager.c:2296-2306) — but C's teardown
+/// is the exception handler, which has already run by then. Ours is the
+/// driver's `Drop`, which runs on the actor thread, so leaving without waiting
+/// would be leaving before the teardown this whole path exists to reach. The
+/// bound is what keeps that wait from being unbounded: a driver parked in a
+/// read with no timeout would otherwise hold the process open forever.
+const PORT_EXIT_STOP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// The error a port whose runtime thread the OS refused to create reports.
 ///
@@ -330,8 +436,8 @@ fn port_thread_unavailable(port_name: &str, err: &std::io::Error) -> AsynError {
 /// This is a **deliberate deviation** from C, stated rather than inherited.
 /// C's constructor prints and `throw`s when `registerPort` fails
 /// (`asynPortDriver.cpp:4036-4040`), but iocsh catches every exception a
-/// command throws (`iocsh.cpp:1274-1284`, `"C++ error: ..."`) and a startup
-/// script's default `on error` is `Continue` (`iocsh.cpp:1001`, `:1129`) — so
+/// command throws (`iocsh.cpp:1269-1279`, `"C++ error: ..."`) and a startup
+/// script's default `on error` is `Continue` (`iocsh.cpp:995`, `:1123`) — so
 /// the C IOC prints, runs the rest of st.cmd, and goes on serving with the port
 /// missing and every record bound to it dead. That is the half-IOC this
 /// workspace refuses to build. There is no third option here: the caller's

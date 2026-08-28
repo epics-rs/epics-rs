@@ -54,6 +54,10 @@ pub const USBTMC_INTERFACE_CLASS: u8 = 0xFE;
 /// USB-IF assigned interface sub-class for USBTMC.
 pub const USBTMC_INTERFACE_SUBCLASS: u8 = 0x03;
 
+/// C `BULK_IO_OUTPUT_EOS_CAPACITY` (`drvAsynUSBTMC.c:37`) — how many
+/// terminator bytes `asynOctetSetOutputEos` will hold.
+pub const OUTPUT_EOS_CAPACITY: usize = 2;
+
 /// `MESSAGE_ID_DEV_DEP_MSG_OUT` — Bulk-OUT data transfer from host.
 pub const MESSAGE_ID_DEV_DEP_MSG_OUT: u8 = 1;
 /// `MESSAGE_ID_REQUEST_DEV_DEP_MSG_IN` — host requesting Bulk-IN data.
@@ -132,7 +136,7 @@ pub fn build_bulk_out_header(
 /// bit clear the device returns the full `max_transfer_size` or times out, so
 /// a read that is supposed to stop on a terminator never does. The earlier
 /// version of this function had no such parameter and cited `:855-863` as
-/// authority for it — a range that stops one line before `:863`, the line that
+/// authority for it — a range that stops one line before `:864`, the line that
 /// sets the bit.
 pub fn build_request_bulk_in_header(
     b_tag: u8,
@@ -224,6 +228,8 @@ pub struct DrvAsynUsbtmcPort {
     /// USBTMC port has no software EOS interpose and the terminator has
     /// nowhere else to live.
     term_char: Option<u8>,
+    /// C `pdpvt->outputEOS` / `outputEOSlen` (`drvAsynUSBTMC.c:123-124`).
+    output_eos: Vec<u8>,
     /// C `pdpvt->tmcDeviceCapabilities` (`:106`), byte 5 of the
     /// `GET_CAPABILITIES` response (`:544`). Zero until a connect has read it,
     /// which is also C's state on a port that has not connected — and an EOS
@@ -252,7 +258,7 @@ impl DrvAsynUsbtmcPort {
             PortFlags {
                 multi_device: false,
                 can_block: true,
-                destructible: true,
+                ..PortFlags::default()
             },
         );
         base.init_connected(false);
@@ -262,6 +268,7 @@ impl DrvAsynUsbtmcPort {
             config,
             b_tag: 1,                   // C initializes pdpvt->bTag = 1
             term_char: None,            // C `pdpvt->termChar = -1` (:1259)
+            output_eos: Vec::new(),     // C `outputEOSlen = 0` from the calloc
             tmc_device_capabilities: 0, // C callocs pdpvt; connect fills it in
         })
     }
@@ -367,6 +374,37 @@ impl PortDriver for DrvAsynUsbtmcPort {
             Some(c) => vec![c],
             None => Vec::new(),
         }
+    }
+
+    /// C `asynOctetSetOutputEos` (`drvAsynUSBTMC.c:1004-1016`): up to
+    /// `BULK_IO_OUTPUT_EOS_CAPACITY` (2, :37) bytes stored on the driver.
+    /// USBTMC has a real entry in C's `asynOctet` table for this (:1036), so
+    /// it must not fall through to [`PortDriver`]'s Fail-stub default — a
+    /// USBTMC port is not a port without output-EOS support.
+    ///
+    /// KNOWN GAP, unchanged by this method: C's `asynOctetWrite` appends the
+    /// stored bytes to the last packet of a transfer (:759-762) and this
+    /// driver's write does not, so the terminator is stored and read back but
+    /// not yet sent. Storing it here keeps the readback honest and keeps the
+    /// refusal for ports that really have no output EOS.
+    fn set_output_eos(&mut self, _user: &AsynUser, eos: &[u8]) -> AsynResult<()> {
+        if eos.len() > OUTPUT_EOS_CAPACITY {
+            return Err(AsynError::Status {
+                status: AsynStatus::Error,
+                message: format!(
+                    "USBTMC output EOS is at most {OUTPUT_EOS_CAPACITY} bytes, got {}",
+                    eos.len()
+                ),
+            });
+        }
+        self.output_eos = eos.to_vec();
+        Ok(())
+    }
+
+    /// C `asynOctetGetOutputEos` (`drvAsynUSBTMC.c:1018-1028`) — reads back
+    /// the same field the setter wrote.
+    fn get_output_eos(&self, _user: &AsynUser) -> Vec<u8> {
+        self.output_eos.clone()
     }
 
     fn connect(&mut self, _user: &AsynUser) -> AsynResult<()> {

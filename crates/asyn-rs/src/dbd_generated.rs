@@ -15,14 +15,23 @@
 //!   into every record table would double-declare them. Base's table emits
 //!   them separately as `DB_COMMON_FIELDS` so the two models can be reconciled
 //!   (and so a `dbCommon` addition is a diff, not a silent gap).
-//! * **`DBF_NOACCESS` fields** (`RSET`, `DPVT`, `MLOK`, `BPTR`, `PPN`, ...).
-//!   These are C-internal pointers with no CA/PVA representation — C's
-//!   `mapDBFToDBR` sends them to `DBR_NOACCESS` and `dbChannelCreate` refuses
-//!   a channel on them. A Rust port has no pointer to expose, so their
-//!   *descriptors* are dropped rather than invented — but their NAMES are
-//!   kept (`record_noaccess_fields`): C's `dbNameToAddr` resolves them, so
-//!   a SEARCH for `REC.BPTR` is answered and the refusal lands at channel
-//!   creation, and the search gate needs the names to do the same.
+//! * **`DBF_NOACCESS` rows whose `extra(...)` names a pointer or an
+//!   array** (`RSET`, `DPVT`, `MLOK`, `BPTR`, `PPN`, ...). C keeps
+//!   `sizeof` the struct member in `pdbFldDes->size`, and neither a
+//!   pointer (whose C value is an address no two IOCs agree on) nor an
+//!   array (whose width is its bound, not its element) has one this port
+//!   can state, so the *descriptor* is dropped rather than invented —
+//!   but the NAME is kept (`record_noaccess_fields`): C's `dbNameToAddr`
+//!   resolves them, so a SEARCH for `REC.BPTR` is answered and the
+//!   refusal lands at channel creation, and the search gate needs the
+//!   names to do the same.
+//!
+//!   A row whose `extra(...)` names a plain scalar — `dbCommon`'s `BKPT`
+//!   and `TIME` — is CARRIED, descriptor and width both, because `dbpr`
+//!   prints its bytes and `dba` reports its `Field Size` and both read
+//!   the declaration. Carried is not servable: `FieldDesc::unreadable`
+//!   is what refuses the read, so the SEARCH is answered off the
+//!   descriptor instead of off the name list.
 
 #![allow(clippy::all)]
 
@@ -44,6 +53,24 @@ pub fn menu_choices(menu: &str) -> Option<&'static [&'static str]> {
     let _ = menu;
     None
 }
+
+/// Every `menu()` this target declares: EPICS name, `choice()` identifiers,
+/// and choice values — the three columns `dbWriteMenuFP` prints
+/// (`dbStaticLib.c:919-924`), which is what `dbDumpMenu` reports.
+///
+/// C walks `pdbbase->menuList` in `.dbd` LOAD order. A compiled-in table has
+/// no load order, so the rows are in name order; the per-menu choice order is
+/// still the `.dbd` order, because that one is the wire-visible index.
+pub static MENUS: &[(&str, &[&str], &[&str])] = &[];
+
+/// Every `variable()` this target's `.dbd`s declare, as EPICS name and
+/// declared type — the two columns `dbWriteVariableFP` prints
+/// (`dbStaticLib.c:1136-1149`), which is what `dbDumpVariable` reports.
+///
+/// Name order, which is also C's: `dbVariable` appends in load order, but
+/// the loaded `.dbd` is `dbExpand` output and that tool emits each
+/// declaration family sorted (measured in an installed `softIoc.dbd`).
+pub static VARIABLES: &[(&str, &str)] = &[];
 
 // ---------------------------------------------------------------------
 // Per-record-type field tables. Record-*own* fields only: `dbCommon` is
@@ -407,6 +434,25 @@ pub fn record_fields(record_type: &str) -> Option<&'static [FieldDesc]> {
 /// refused at creation (`mapDBFToDBR` -> `DBR_NOACCESS`). Empty for a type
 /// declaring none, `None` for a type no vendored `.dbd` declares.
 pub fn record_noaccess_fields(record_type: &str) -> Option<&'static [&'static str]> {
+    let _ = record_type;
+    None
+}
+
+/// Every field a record type declares, in C's `papFldDes` order — the order
+/// `dbDumpRecordType` indexes and `link_ind`/`sortFldInd`/`indvalFlddes`
+/// point into. Unlike `record_fields` this keeps the `DBF_NOACCESS`
+/// internals and splices dbCommon where the `.dbd` puts its `include`, so
+/// the index of a name here is C's own `indRecordType` for it.
+pub fn record_declaration_order(record_type: &str) -> Option<&'static [&'static str]> {
+    let _ = record_type;
+    None
+}
+
+/// C's `pdbRecordType->no_prompt`: how many of `record_declaration_order`'s
+/// declarations carry a `promptgroup(...)` (`dbLexRoutines.c:752`). Counted
+/// here because the port drops `promptgroup` at emit, so it cannot be
+/// recovered from the field tables.
+pub fn record_no_prompt(record_type: &str) -> Option<u16> {
     let _ = record_type;
     None
 }

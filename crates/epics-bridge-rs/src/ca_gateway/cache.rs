@@ -26,7 +26,8 @@
 //!      │   Dead   │                last subscriber leaves             │
 //!      └──────────┘◄──────────────────────────────────────────────────┘
 
-// RTEMS-EXEC-MODEL-ALLOW(4): checked - these run and pass in the feature-ON suite.
+// RTEMS-EXEC-MODEL-ALLOW(4): checked - these run and pass in the exec-backend
+// suite.
 
 use std::collections::HashMap;
 use std::sync::Arc;

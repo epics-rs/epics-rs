@@ -21,20 +21,24 @@
 //! implementation forwards calls verbatim by default; override the
 //! method to insert pre/post hooks.
 
-// RTEMS-EXEC-MODEL-ALLOW(18): checked to pass feature-ON under
-// --features rtems-exec-model,pva-gateway (the gateway's spawns/timers ride the
-// runtime::task seam). The default feature-ON gate omits `pva-gateway`, so re-run
-// that combo when touching this module.
+// RTEMS-EXEC-MODEL-ALLOW(18): checked to pass on the exec backend under
+// `EPICS_RS_BUILD_EXEC_BACKEND=thread cargo nextest run -p epics-bridge-rs
+// --features pva-gateway` (the gateway's spawns/timers ride the runtime::task
+// seam; 739 run, 739 passed on this tree). The default exec-backend gate omits
+// `pva-gateway`, so re-run that combo when touching this module.
 
 use std::net::SocketAddr;
 use std::sync::Arc;
 
+use epics_base_rs::runtime::task::Reactor;
 use epics_pva_rs::pvdata::{FieldDesc, PvField, RpcReply};
 use epics_pva_rs::server_native::ChannelContext;
 use epics_pva_rs::server_native::source::{
-    ChannelSource, DynSource, MonitorStream, OpError, OpErrorKind, RawMonitorEvent, SourceRead,
-    WatermarkEvent,
+    ChannelSource, MonitorStream, OpError, OpErrorKind, RawMonitorEvent, SourceRead, WatermarkEvent,
 };
+// Follows `layer_access_control`, its only user.
+#[cfg(any(tokio_backend, test))]
+use epics_pva_rs::server_native::source::DynSource;
 
 /// Wrap a [`ChannelSource`] and produce a new one with extra
 /// behaviour. Implementations override only the methods they need;
@@ -239,8 +243,8 @@ impl<S: ChannelSource> ChannelSource for ReadOnly<S> {
     }
     // Forward the single-seed MONITOR to the inner source so a
     // self-seeding inner (a gateway's atomic cached snapshot) supplies
-    // the connect-time seed; the default would seed via inner.get_value
-    // and bypass that atomic seed.
+    // the connect-time seed; the default would seed via the inner's
+    // `read_checked` and bypass that atomic seed.
     async fn subscribe_seeded(
         &self,
         checked: epics_pva_rs::server_native::source::AccessChecked,
@@ -263,7 +267,7 @@ impl<S: ChannelSource> ChannelSource for ReadOnly<S> {
     }
     // RPC is commonly state-mutating and pva2pva blocks
     // `createChannelRPC` under `p2pReadOnly` exactly the way it blocks
-    // Put/Process/PutGet (`channel.cpp:140-150`, the `if(!p2pReadOnly)`
+    // Put/Process/PutGet (`p2pApp/channel.cpp:140-149`, the `if(!p2pReadOnly)`
     // guard; only Get/Monitor are unconditional). Reject it here as
     // PUT/PROCESS are, rather than forwarding to the inner source —
     // without this override a read-only gateway forwarded downstream
@@ -293,7 +297,8 @@ impl<S: ChannelSource> ChannelSource for ReadOnly<S> {
     // support entirely (the wrapper-severs-override defect family). This is
     // stricter than pva2pva, whose `createChannelArray` lacks the
     // `p2pReadOnly` guard its Put/PutGet/Process/RPC creates carry
-    // (`channel.cpp:227-232` vs `:118-148`) and so leaks array writes under
+    // (`p2pApp/channel.cpp:226-232` vs the `if(!p2pReadOnly)` guards at
+    // `:103`, `:123`, `:134`, `:145`) and so leaks array writes under
     // read-only mode; putArray/setLength mutate upstream array state and are
     // WRITE-class here, so a read-only gateway must refuse them.
     async fn channel_array_init(
@@ -758,8 +763,8 @@ impl<S: ChannelSource> ChannelSource for Acl<S> {
     // A PUT_GET writes — gate it by the same static allowlist as
     // `put_value_checked`/`put_delta_checked`, then forward to the inner's
     // atomic `put_get_checked`. Without this override the trait default
-    // decomposes into `put_delta_checked` + `get_value_checked` on THIS
-    // layer, bypassing the inner source's single-op PUT_GET (the gateway's
+    // decomposes into `put_delta_checked` + `read_checked` on THIS layer,
+    // bypassing the inner source's single-op PUT_GET (the gateway's
     // one-upstream-PUT_GET forward).
     async fn put_get_checked(
         &self,
@@ -1191,9 +1196,9 @@ impl MpscAuditSink {
     /// that the layer's `record()` becomes a no-op + drop counter
     /// increment. `inner` runs on the spawned drainer task — its
     /// `record()` is allowed to block.
-    pub fn wrap<A: AuditSink>(capacity: usize, inner: A) -> Self {
+    pub fn wrap<A: AuditSink>(reactor: &Reactor, capacity: usize, inner: A) -> Self {
         let (tx, mut rx) = tokio::sync::mpsc::channel::<AuditEvent>(capacity.max(1));
-        epics_base_rs::runtime::task::spawn(async move {
+        reactor.spawn(async move {
             while let Some(ev) = rx.recv().await {
                 inner.record(ev);
             }
@@ -1342,9 +1347,9 @@ impl AuditLayer<MpscAuditSink> {
     /// becomes a non-blocking try_send and a background drainer task
     /// services the blocking I/O. Audit events past `capacity` are
     /// dropped (counted via [`MpscAuditSink::drops`]).
-    pub fn with_blocking_sink<I: AuditSink>(capacity: usize, inner: I) -> Self {
+    pub fn with_blocking_sink<I: AuditSink>(reactor: &Reactor, capacity: usize, inner: I) -> Self {
         Self {
-            sink: Arc::new(MpscAuditSink::wrap(capacity, inner)),
+            sink: Arc::new(MpscAuditSink::wrap(reactor, capacity, inner)),
             audit_get: false,
             audit_subscribe: false,
             audit_rpc: false,
@@ -1465,7 +1470,7 @@ impl<S: ChannelSource, A: AuditSink> ChannelSource for Audited<S, A> {
     // A BitSet-delta PUT records the same audit row shape as
     // `put_value_checked` (event kind Put, peer credentials) and
     // forwards through the inner's `put_delta_checked`. Without this
-    // override the trait default would run get_value + merge +
+    // override the trait default would run get_value_checked + merge +
     // put_value_checked on THIS layer: it would still audit (via the
     // put_value_checked above) but bypass the inner source's atomic
     // `put_delta_checked`, re-opening the concurrent-partial-PUT
@@ -1493,9 +1498,9 @@ impl<S: ChannelSource, A: AuditSink> ChannelSource for Audited<S, A> {
     // shape as `put_delta_checked` and forward through the inner's
     // `put_get_checked` so the inner's single-op PUT_GET (the pva-gateway's
     // one-upstream-PUT_GET forward) is preserved. Without this override the
-    // trait default decomposes into `put_delta_checked` + `get_value_checked`
-    // on THIS layer, bypassing that atomic forward (and recording a Put plus
-    // a Get audit row instead of one Put).
+    // trait default decomposes into `put_delta_checked` + `read_checked` on
+    // THIS layer, bypassing that atomic forward (and recording a Put plus a
+    // Get audit row instead of one Put).
     async fn put_get_checked(
         &self,
         checked: epics_pva_rs::server_native::source::AccessChecked,
@@ -2054,6 +2059,11 @@ impl<S: ChannelSource, A: AuditSink> ChannelSource for Audited<S, A> {
 /// `PvaServer::start::<S>` (which requires `S: ChannelSource`, a bound
 /// the type-erased `DynSource` does not satisfy); this helper serves
 /// the composite-only topologies such as the multi-tenant gateway.
+///
+/// `cfg` because that sole production consumer is `multi_gateway`, which is
+/// `tokio_backend`; the chain shape it builds is backend-neutral, so the unit
+/// test below still exercises it on the reactor-free backend.
+#[cfg(any(tokio_backend, test))]
 pub(crate) fn layer_access_control<S>(
     source: S,
     acl: AclConfig,
@@ -2248,7 +2258,7 @@ mod tests {
         use epics_pva_rs::client::PvaClient;
 
         let client = Arc::new(PvaClient::builder().build());
-        let cache = ChannelCache::new(client, DEFAULT_CLEANUP_INTERVAL);
+        let cache = ChannelCache::new(crate::test_reactor(), client, DEFAULT_CLEANUP_INTERVAL);
         let inner = GatewayChannelSource::new(cache);
 
         let cfg = AclConfig::default().deny_regex(r"SECRET:.*").unwrap();
@@ -2977,7 +2987,7 @@ mod tests {
 
     /// RPC through the `ReadOnly` wrapper must be rejected at the layer.
     /// pva2pva blocks `createChannelRPC` under `p2pReadOnly` the same way
-    /// it blocks Put/Process (`channel.cpp:140-150`). The override
+    /// it blocks Put/Process (`p2pApp/channel.cpp:140-149`). The override
     /// returns the read-only error without touching the inner source, so
     /// the "read-only" message distinguishes rejection from forwarding
     /// (a forwarded RPC would surface the inner source's own error).
@@ -3244,7 +3254,7 @@ mod tests {
         // so the handle has to survive three wrappers in the longest one.
         for read_only in [false, true] {
             let client = Arc::new(PvaClient::builder().build());
-            let cache = ChannelCache::new(client, Duration::from_secs(60));
+            let cache = ChannelCache::new(crate::test_reactor(), client, Duration::from_secs(60));
             let gw = GatewayChannelSource::new(cache.clone());
             let layered: DynSource = layer_access_control(
                 gw.clone(),

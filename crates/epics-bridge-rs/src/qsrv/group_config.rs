@@ -62,10 +62,10 @@ pub struct GroupPvDef {
     /// This lock remains only as an internal group-vs-group
     /// serialization aid. See `GroupChannel::put`.
     ///
-    /// **L33**, `doc/rtems-priority-locks-design.md` §3 / §5 step 6. A
-    /// blocking `PriorityInheritanceMutex`, not a `tokio::sync::Mutex`: it is
-    /// acquired above `PvDatabase::lock_records` (L1) and released after the
-    /// member loop, and every one of those steps — the up-front value
+    /// **L33**. A blocking `PriorityInheritanceMutex`, not a
+    /// `tokio::sync::Mutex`: it is acquired above `PvDatabase::lock_records`
+    /// (L1) and released after the member loop, and every one of those
+    /// steps — the up-front value
     /// conversion, `lock_records` itself, the member writes — is synchronous
     /// since the L1 flip, so the window contains no suspension point. It was
     /// a tokio lock only for as long as `lock_records` was an `.await`, where
@@ -74,6 +74,22 @@ pub struct GroupPvDef {
     /// L33 → L1 → L46 acquisition order this lock heads.
     pub atomic_write_lock:
         std::sync::Arc<epics_base_rs::runtime::sync::PriorityInheritanceMutex<()>>,
+    /// One bound [`MemberChannel`] per entry of [`Self::members`], in the
+    /// same order — the port's `Group::fields` (`ioc/group.h:44`).
+    ///
+    /// pvxs binds these once, while the group is built, and keeps them in
+    /// the process-global `IOCGroupConfig::groupMap`; every client of the
+    /// group shares one `Group&` (`ioc/groupsource.cpp:43-44`). Sharing them
+    /// behind one `Arc` reproduces that: `create_channel` clones the def per
+    /// downstream channel and all clones for a group name come from one map
+    /// entry, so a member's `dbnd` baseline is IOC-wide exactly as in pvxs.
+    ///
+    /// [`Self::finalize`] is the single owner. Nothing else writes this
+    /// field, and every path that finishes mutating `members` ends there,
+    /// so the two vectors cannot drift out of step.
+    ///
+    /// [`MemberChannel`]: super::channel::MemberChannel
+    pub channels: std::sync::Arc<Vec<super::channel::MemberChannel>>,
 }
 
 /// A single member within a group PV.
@@ -92,7 +108,7 @@ pub struct GroupMember {
     ///
     /// pvxs defaults the missing-field sentinel to
     /// `i64::MIN` (`fieldconfig.h:37`) and treats that value as
-    /// not-putable (`groupsource.cpp:503`). Wire parity therefore
+    /// not-putable (`groupsource.cpp:555`). Wire parity therefore
     /// requires `Option<i64>` here, not a defaulted value — a
     /// member without an explicit `+putorder` must be silently
     /// dropped from the PUT ordering, NOT written under an
@@ -120,7 +136,7 @@ impl GroupPvDef {
     /// narrowed to that member's leaves by structurally diffing
     /// consecutive snapshots — exactly the leaf set pvxs marks via
     /// `IOCSource::get` for a self-triggered field
-    /// (`groupsource.cpp:288`). A group containing an explicit
+    /// (`groupsource.cpp:344-345`). A group containing an explicit
     /// `+trigger:"*"` ([`TriggerDef::All`]) or named-field
     /// ([`TriggerDef::Fields`]) member is excluded: pvxs marks the
     /// whole *triggered target set* there (assigned-not-changed
@@ -150,7 +166,28 @@ impl GroupPvDef {
     /// Idempotent and monotonic: a group only gains members via
     /// [`merge_group_defs`], so "has an explicit trigger" never reverts;
     /// re-running after a merge can only demote more `SelfOnly` members.
-    pub fn resolve_self_trigger_default(&mut self) {
+    /// Close this def after a mutation of [`Self::members`]: resolve the
+    /// group-level `+trigger` default, then re-bind [`Self::channels`].
+    ///
+    /// THE single owner of both derived states. `raw_to_group_def` calls it
+    /// once the members of a single source are known, and
+    /// [`merge_group_defs`] calls it again after a second source's members
+    /// have been appended and re-sorted — the two points where `members`
+    /// stops changing. Binding here rather than at each use site is what
+    /// makes a member's filter state per channel instead of per operation
+    /// (see [`MemberChannel`](super::channel::MemberChannel)).
+    pub fn finalize(&mut self) {
+        self.resolve_self_trigger_default();
+        self.channels = std::sync::Arc::new(
+            self.members
+                .iter()
+                .cloned()
+                .map(super::channel::MemberChannel::new)
+                .collect(),
+        );
+    }
+
+    fn resolve_self_trigger_default(&mut self) {
         let has_explicit = self
             .members
             .iter()
@@ -166,7 +203,7 @@ impl GroupPvDef {
 
     /// Resolved `+trigger` target field names for member `idx`, mirroring
     /// the pvxs `field.triggers` set built by `initialiseTriggers`
-    /// (`groupconfigprocessor.cpp:536-560`): the group fields *with a
+    /// (`groupconfigprocessor.cpp:537-564`): the group fields *with a
     /// channel* whose mappings a change on this member posts. A
     /// channel-less source posts nothing (pvxs's outer
     /// `!fieldDefinition.channel.empty()` guard); `SelfOnly` resolves to
@@ -218,7 +255,7 @@ pub enum TriggerDef {
     /// Named fields — update only these fields.
     Fields(Vec<String>),
     /// missing `+trigger` — pvxs default is self-trigger
-    /// (`groupconfigprocessor.cpp:323`): the member triggers only
+    /// (`groupconfigprocessor.cpp:327-338`): the member triggers only
     /// its own field, NOT every other group field. Distinct from
     /// `All` (`"*"`) and from `None` (`""`, explicit silence). The
     /// monitor encoder narrows the changed-bitset accordingly so
@@ -365,7 +402,7 @@ pub fn merge_group_defs(existing: &mut HashMap<String, GroupPvDef>, new_defs: Ve
             // self-trigger group into a mixed-trigger group (a new member
             // carries `+trigger`). Re-resolve so any `SelfOnly` member is
             // demoted to silent, matching pvxs's group-level resolution.
-            existing_def.resolve_self_trigger_default();
+            existing_def.finalize();
             // Update struct_id if newly specified (last wins)
             if def.struct_id.is_some() {
                 existing_def.struct_id = def.struct_id;
@@ -606,7 +643,7 @@ fn raw_to_group_def(name: String, raw: RawGroupDef) -> BridgeResult<GroupPvDef> 
     // case — only writable members carry +putorder) in arbitrary order,
     // making the wire field/bit layout non-deterministic. pvxs derives a
     // deterministic putOrder-then-name order from a name-sorted std::map +
-    // stable_sort (groupconfig.h:28, groupconfigprocessor.cpp:253-262); the
+    // stable_sort (groupconfig.h:28, groupconfigprocessor.cpp:253-263); the
     // field-name tiebreak reproduces it independent of HashMap order.
     sort_members_canonical(&mut members);
 
@@ -626,7 +663,7 @@ fn raw_to_group_def(name: String, raw: RawGroupDef) -> BridgeResult<GroupPvDef> 
             for target in targets {
                 if !member_names.contains(target.as_str()) {
                     // pvxs `defineGroupTriggers` (groupconfigprocessor.cpp:
-                    // 396-397) logs the bad reference and `continue`s,
+                    // 396-398) logs the bad reference and `continue`s,
                     // dropping just this trigger target — the group and
                     // every sibling group still load. Do NOT fail the
                     // whole config. The unknown ref is then filtered out
@@ -677,7 +714,7 @@ fn raw_to_group_def(name: String, raw: RawGroupDef) -> BridgeResult<GroupPvDef> 
         None => None,
         Some(v) => match json_value_as_string(v) {
             // pvxs merges `+id` into the group definition only when the
-            // coerced string is non-empty (groupconfigprocessor.cpp:187-188:
+            // coerced string is non-empty (groupconfigprocessor.cpp:187-189:
             // `if (!groupConfig.structureId.empty()) groupDefinitionMap[...]
             // .structureId = groupConfig.structureId`). So an empty `+id`
             // never sets the group's structure ID, and on a later fragment
@@ -706,10 +743,12 @@ fn raw_to_group_def(name: String, raw: RawGroupDef) -> BridgeResult<GroupPvDef> 
         atomic_write_lock: std::sync::Arc::new(
             epics_base_rs::runtime::sync::PriorityInheritanceMutex::new(()),
         ),
+        // Bound by the `finalize()` below, once `members` is settled.
+        channels: std::sync::Arc::new(Vec::new()),
     };
     // resolve the per-member self-trigger default now that every
     // member of this (single-source) group is known. Re-run after merge.
-    def.resolve_self_trigger_default();
+    def.finalize();
     Ok(def)
 }
 
@@ -858,7 +897,7 @@ fn parse_member(field_name: &str, value: &serde_json::Value) -> BridgeResult<Gro
             None => TriggerDef::SelfOnly,
             Some(v) => match json_value_as_string(v).as_deref() {
                 Some("*") => TriggerDef::All,
-                // pvxs groupconfigprocessor.cpp:323 defaults a
+                // pvxs groupconfigprocessor.cpp:327-338 defaults a
                 // missing `+trigger` to self-trigger (only this member's
                 // own field re-emits in the group), not All. The Rust
                 // path treated None as All and emitted a full-group
@@ -877,7 +916,7 @@ fn parse_member(field_name: &str, value: &serde_json::Value) -> BridgeResult<Gro
                 // An explicit `+trigger:""` is NOT distinct from a missing
                 // `+trigger`: pvxs stores both as the empty string
                 // (`fieldconfig.h:50-54`) and sets `hasTriggers` only for a
-                // NON-empty trigger string (`groupconfigprocessor.cpp:297-309`).
+                // NON-empty trigger string (`groupconfigprocessor.cpp:297-310`).
                 // So an empty trigger gets the same provisional self-trigger
                 // default and is resolved at group scope — a one-member
                 // `"+trigger":""` group, or an all-empty group, still
@@ -968,7 +1007,7 @@ const CONST_OBJECT_TOO_DEEP: &str = "group +const cannot contain a nested object
 /// (groupprocessorcontext.cpp:80-86), then clears `key` so a later scalar
 /// in the same value falls through to the unknown-field-option warning.
 /// Crucially it registers NO array callbacks (`start_array`/`end_array` are
-/// `nullptr`, groupconfigprocessor.cpp:778-789), so array brackets never
+/// `nullptr`, groupconfigprocessor.cpp:778-790), so array brackets never
 /// change the parser depth: every array element is processed at the
 /// field-definition depth in document order, and the FIRST scalar/null wins
 /// while the rest are ignored. An object anywhere starts a block, pushing
@@ -996,7 +1035,7 @@ fn json_to_pv_field(v: &serde_json::Value) -> Result<epics_pva_rs::pvdata::PvFie
             if let Some(i) = n.as_i64() {
                 // pvxs builds a JSON integer const as `TypeDef(TypeCode::
                 // Int64)` and assigns the full `int64_t`
-                // (groupconfigprocessor.cpp:680-686); the group field
+                // (groupconfigprocessor.cpp:680-688); the group field
                 // descriptor is then derived from that const's type
                 // (596-603), so a JSON integer const is a PVA `long`, not
                 // `int`. The prior `i as i32` truncated large constants
@@ -1019,17 +1058,18 @@ fn json_to_pv_field(v: &serde_json::Value) -> Result<epics_pva_rs::pvdata::PvFie
 /// Resolve a `+const` JSON array the way pvxs's yajl parser does.
 ///
 /// Because pvxs registers no array callbacks (groupconfigprocessor.cpp:
-/// 778-789), array brackets are invisible to the parser: elements are
+/// 778-790), array brackets are invisible to the parser: elements are
 /// processed at the field-definition depth in document order, so the FIRST
 /// scalar/null is assigned to `cval` and every later element is ignored
 /// (groupprocessorcontext.cpp:80-86). Nested arrays are transparent the same
 /// way, so `[[1,2],[3,4]]` yields the first flattened scalar `1`. An object
 /// anywhere starts a block that pushes the depth past 3 and throws "too
-/// deep" (:733-739), which rejects the group regardless of whether a scalar
-/// was already assigned — so a single document-order scan both captures the
-/// first scalar/null and fails on the first object it meets. An array with
-/// no scalar/null element (e.g. `[]`) leaves `cval` at pvxs's empty default,
-/// which the const template builds as a null const (:596-604).
+/// deep" (groupconfigprocessor.cpp:733-739), which rejects the group
+/// regardless of whether a scalar was already assigned — so a single
+/// document-order scan both captures the first scalar/null and fails on the
+/// first object it meets. An array with no scalar/null element (e.g. `[]`)
+/// leaves `cval` at pvxs's empty default, which the const template builds as
+/// a null const (groupconfigprocessor.cpp:596-604).
 fn const_from_array(items: &[serde_json::Value]) -> Result<epics_pva_rs::pvdata::PvField, String> {
     use epics_pva_rs::pvdata::PvField;
 
@@ -1353,7 +1393,7 @@ mod tests {
         let m = &groups[0].members[0];
         assert_eq!(m.mapping, FieldMapping::Scalar); // default
         // pvxs default for a missing `+trigger` is self-trigger
-        // (`groupconfigprocessor.cpp:323`), not All.
+        // (`groupconfigprocessor.cpp:327-338`), not All.
         assert!(matches!(m.triggers, TriggerDef::SelfOnly));
         // missing `+putorder` → `None` (not putable),
         // mirroring pvxs `fieldconfig.h:37` sentinel.
@@ -1718,7 +1758,7 @@ mod tests {
 
     /// pvxs merges `+id`
     /// into the group definition only when the coerced string is non-empty
-    /// (groupconfigprocessor.cpp:187-188), so a later fragment that supplies
+    /// (groupconfigprocessor.cpp:187-189), so a later fragment that supplies
     /// an empty `+id` must NOT clear an earlier non-empty structure ID, while
     /// a non-empty `+id` still wins last. The Rust port collapses an empty
     /// `+id` to `None` at the sole construction site, giving
@@ -2108,7 +2148,7 @@ mod tests {
 
     #[test]
     fn trigger_validation_unknown_field_drops_ref_not_config() {
-        // pvxs (groupconfigprocessor.cpp:396-397) logs an unknown
+        // pvxs (groupconfigprocessor.cpp:396-398) logs an unknown
         // trigger target and `continue`s — it drops only that reference,
         // never the group or its siblings. Pre-fix the Rust parser
         // returned Err, aborting the whole blob and dropping EVERY group.
@@ -2275,7 +2315,7 @@ mod tests {
 
     /// A `+const` integer above the int32 range must survive at its
     /// full int64 width — pvxs builds it as `TypeCode::Int64`
-    /// (groupconfigprocessor.cpp:680-686), so narrowing to i32 (the
+    /// (groupconfigprocessor.cpp:680-688), so narrowing to i32 (the
     /// prior bug) corrupted large constants such as version IDs.
     #[test]
     fn parse_const_large_integer_preserved_at_int64() {
@@ -2355,7 +2395,7 @@ mod tests {
 
     /// The one allowed empty key: `+type:"meta"` is preserved so its
     /// alarm/timeStamp members flatten to the struct root (pvxs
-    /// groupconfigprocessor.cpp:940-952).
+    /// groupconfigprocessor.cpp:940-953).
     #[test]
     fn parse_empty_field_name_meta_is_kept() {
         let json = r#"{ "GRP:m": { "": { "+type": "meta", "+channel": "REC" } } }"#;
@@ -2393,7 +2433,7 @@ mod tests {
     }
 
     /// pvxs's group JSON parser registers no array callbacks
-    /// (groupconfigprocessor.cpp:778-789), so array brackets are invisible to
+    /// (groupconfigprocessor.cpp:778-790), so array brackets are invisible to
     /// the parser depth and a `+const` array is assigned its FIRST
     /// scalar/null element (groupprocessorcontext.cpp:80-86); later elements
     /// are ignored. Nested arrays are transparent, so the first flattened

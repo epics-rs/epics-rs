@@ -23,10 +23,11 @@
 //! entry. See `UpstreamEntry::is_retained` for the full rationale and
 //! the (Low) cost of the narrowing.
 
-// RTEMS-EXEC-MODEL-ALLOW(7): checked to pass feature-ON under
-// --features rtems-exec-model,pva-gateway (the gateway's spawns/timers ride the
-// runtime::task seam). The default feature-ON gate omits `pva-gateway`, so re-run
-// that combo when touching this module.
+// RTEMS-EXEC-MODEL-ALLOW(7): checked to pass on the exec backend under
+// `EPICS_RS_BUILD_EXEC_BACKEND=thread cargo nextest run -p epics-bridge-rs
+// --features pva-gateway` (the gateway's spawns/timers ride the runtime::task
+// seam; 739 run, 739 passed on this tree). The default exec-backend gate omits
+// `pva-gateway`, so re-run that combo when touching this module.
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
@@ -38,6 +39,7 @@ use std::time::Duration;
 use parking_lot::RwLock;
 use tokio::sync::{Mutex, Notify, broadcast};
 
+use epics_base_rs::runtime::task::Reactor;
 use epics_pva_rs::client::PvaClient;
 use epics_pva_rs::pvdata::{FieldDesc, PvField};
 use epics_pva_rs::server_native::MonitorUpdate;
@@ -119,12 +121,13 @@ pub struct UpstreamEntry {
 // reading the same stream and a pause is not divisible.
 //
 // This is pva2pva's design, and it is explicit about it —
-// `MonitorCacheEntry::notify` (`moncache.cpp:133-174`) polls the upstream dry
-// (`while((update=monitor->poll()))`) with a bare `//TODO: flow control` where
-// an upstream throttle would go, and absorbs a downstream that cannot keep up
-// *in that downstream's own buffer*: its `overflowElement` accumulates the
-// changed/overrun bitsets and takes the latest value, `ndropped` counts what
-// was coalesced away, and the upstream keeps flowing for everyone else.
+// `MonitorCacheEntry::monitorEvent` (`moncache.cpp:133-174`) polls the
+// upstream dry (`while((update=monitor->poll()))`) with a bare
+// `//TODO: flow control` where an upstream throttle would go, and absorbs
+// a downstream that cannot keep up *in that downstream's own buffer*: its
+// `overflowElement` accumulates the changed/overrun bitsets and takes the
+// latest value, `ndropped` counts what was coalesced away, and the upstream
+// keeps flowing for everyone else.
 //
 // The port does the same, structurally: each downstream forwarder owns a
 // `broadcast::Receiver` and an mpsc queue, and a slow one lags its OWN
@@ -198,7 +201,7 @@ struct MonitorEventOutcome {
     /// This is the UPDATE path, and only the update path: pva2pva copies the
     /// upstream event's changed bitset onto each downstream element
     /// (`moncache.cpp:142` `*lastelem->changedBitSet = *update->changedBitSet`,
-    /// `:189` the per-user copy). The SEED is a different rule entirely — the
+    /// `:187` the per-user copy). The SEED is a different rule entirely — the
     /// root bit, see `monitor_seed`.
     marked: Option<Vec<String>>,
 }
@@ -256,7 +259,7 @@ fn apply_monitor_event(
     // Translate the upstream event's `changed` bitset into the changed-leaf
     // field paths so the downstream cooked monitor advertises the real
     // changed-bitset (pva2pva copies `*update->changedBitSet` verbatim,
-    // moncache.cpp:142,189) rather than a synthesised full mask. A set root
+    // moncache.cpp:142,187) rather than a synthesised full mask. A set root
     // bit (0) means the whole structure changed — represented as `None`
     // (full mask) since the root has no path.
     let marked = if changed.get(0) {
@@ -415,8 +418,9 @@ impl UpstreamEntry {
     /// `cacheClean::expire` evicts on `!dropPoke && interested.empty()`
     /// (`chancache.cpp:121`), where `interested` is the set of ALL open
     /// downstream `GWChannel`s — every channel inserted at `createChannel`
-    /// (`server.cpp:62-78`) regardless of whether it does GET/PUT/MONITOR/
-    /// RPC. The Rust gateway cannot key retention on that set: its one-shot
+    /// (`p2pApp/server.cpp:75-80`) regardless of whether it does
+    /// GET/PUT/MONITOR/RPC. The Rust gateway cannot key retention on that
+    /// set: its one-shot
     /// GET / PUT / RPC / introspection ops deliberately bypass this cache
     /// (`source.rs` `get_value` / `put_value*` / `get_introspection*` go
     /// straight to `cache.client()`), because routing them through a cache
@@ -462,15 +466,16 @@ impl Drop for AbortOnDrop {
 /// ([`ChannelCache::entries`]) is keyed by channel name; `cacheSize`, the
 /// admission cap, and the cleaner counters all operate on this level
 /// (channels), exactly as pva2pva reports `entries.size()` channels and
-/// `cleanerDust` channels (`server.cpp:182-198`). Each channel holds its
-/// own nested map of monitor variants keyed by serialized downstream
+/// `cleanerDust` channels (`p2pApp/server.cpp:182-198`). Each channel
+/// holds its own nested map of monitor variants keyed by serialized
+/// downstream
 /// pvRequest (pva2pva `mon_entries`, `chancache.h:123-125`): two
 /// downstream monitors that ask for different field sets / `record._options`
 /// / `_filter` chains each get their own upstream monitor opened with their
 /// own request rather than all sharing one gateway-default stream
-/// (`moncache.cpp:34-37`, `channel.cpp:157-193`). An empty pvRequest key
-/// is the no-request default fanout (the ctx-less `subscribe`/`subscribe_raw`
-/// paths, which carry no downstream request).
+/// (`moncache.cpp:34-43`, `p2pApp/channel.cpp:157-224`). An empty
+/// pvRequest key is the no-request default fanout (the ctx-less
+/// `subscribe`/`subscribe_raw` paths, which carry no downstream request).
 ///
 /// Splitting the two levels keeps `cacheSize` a *channel* count: one PV
 /// asked for under three pvRequests is ONE cached channel with three
@@ -593,6 +598,13 @@ fn resubscribe_backoff(
 /// Process-wide cache. Handed to the gateway server source as an
 /// `Arc<ChannelCache>`; cheap to clone (only the Arc is bumped).
 pub struct ChannelCache {
+    /// The executor every task this cache owns is spawned through — the
+    /// cleanup tick, each upstream monitor, and the contended-lock orphan
+    /// reaper in `lookup_with_request`'s drop guard. Held as a value so a
+    /// `Drop` impl and the `ChannelSource` trait methods, neither of which
+    /// can take an extra parameter, still spawn through a capability the
+    /// caller had to prove it holds.
+    reactor: Reactor,
     client: Arc<PvaClient>,
     /// Top-level cache, keyed by channel (PV) name — pva2pva
     /// `ChannelCache::entries` (`p2pApp/chancache.cpp:165-209`). Each
@@ -646,7 +658,7 @@ pub struct EntryStatus {
     pub subscribers: usize,
     /// Distinct downstream pvRequest variants (upstream monitors) open for
     /// this channel — pva2pva's per-channel "`<n>` unique subscription(s)"
-    /// (`server.cpp:218,228`).
+    /// (`p2pApp/server.cpp:218,228`).
     pub subscriptions: usize,
     /// Idle-eviction grace bit (set while any variant is still poked).
     pub drop_poke: bool,
@@ -673,17 +685,19 @@ impl ChannelCache {
     /// resulting cache uses [`DEFAULT_MAX_ENTRIES`] for its ceiling;
     /// override via [`Self::with_max_entries`] before publishing the
     /// `Arc` if a larger or smaller cap is needed.
-    pub fn new(client: Arc<PvaClient>, cleanup_interval: Duration) -> Arc<Self> {
-        Self::with_max_entries(client, cleanup_interval, DEFAULT_MAX_ENTRIES)
+    pub fn new(reactor: Reactor, client: Arc<PvaClient>, cleanup_interval: Duration) -> Arc<Self> {
+        Self::with_max_entries(reactor, client, cleanup_interval, DEFAULT_MAX_ENTRIES)
     }
 
     /// Variant of [`Self::new`] with an explicit max-entries cap.
     pub fn with_max_entries(
+        reactor: Reactor,
         client: Arc<PvaClient>,
         cleanup_interval: Duration,
         max_entries: usize,
     ) -> Arc<Self> {
         let cache = Arc::new(Self {
+            reactor,
             client,
             entries: Arc::new(Mutex::new(HashMap::new())),
             cleanup_task: parking_lot::Mutex::new(None),
@@ -693,7 +707,7 @@ impl ChannelCache {
             invalidator: OnceLock::new(),
         });
         let weak = Arc::downgrade(&cache);
-        let task = epics_base_rs::runtime::task::spawn(async move {
+        let task = cache.reactor.spawn(async move {
             let mut tick = epics_base_rs::runtime::task::interval(cleanup_interval);
             tick.tick().await; // skip first immediate tick
             loop {
@@ -710,6 +724,13 @@ impl ChannelCache {
     /// to issue one-shot GET / PUT through the same connection pool.
     pub fn client(&self) -> &Arc<PvaClient> {
         &self.client
+    }
+
+    /// The executor this cache spawns through. Callers that own an
+    /// `Arc<ChannelCache>` — the gateway source, the control surface —
+    /// take their capability from here rather than re-deriving one.
+    pub fn reactor(&self) -> &Reactor {
+        &self.reactor
     }
 
     /// Cheap, non-spawning probe for "is this PV in the cache right
@@ -748,8 +769,8 @@ impl ChannelCache {
     /// `pv_request` (`None` = the default-fanout key). Each distinct
     /// `(pv_name, serialized pv_request)` shares exactly one upstream
     /// monitor, opened with that request — pva2pva keys its monitor
-    /// cache the same way (`p2pApp/moncache.cpp:34-37`,
-    /// `channel.cpp:157-193`). Waits up to `connect_timeout` for the
+    /// cache the same way (`p2pApp/moncache.cpp:34-43`,
+    /// `p2pApp/channel.cpp:157-224`). Waits up to `connect_timeout` for the
     /// first upstream event so downstream callers see a populated
     /// `snapshot()` before this returns. Mirrors `pva2pva
     /// ChannelCache::lookup` blocking on `isConnected()`.
@@ -866,7 +887,7 @@ impl ChannelCache {
                 let entries = self.cache.entries.clone();
                 let pv_name = self.pv_name.to_string();
                 let req_key = self.req_key.to_vec();
-                epics_base_rs::runtime::task::spawn(async move {
+                self.cache.reactor.spawn(async move {
                     let mut map = entries.lock().await;
                     remove_variant(&mut map, &pv_name, &req_key);
                 });
@@ -988,7 +1009,7 @@ impl ChannelCache {
         // connection.
         let pv_request_for_task = pv_request;
 
-        let join = epics_base_rs::runtime::task::spawn(async move {
+        let join = self.reactor.spawn(async move {
             let mut backoff = Duration::from_millis(250);
             let max_backoff = Duration::from_secs(30);
             // Whether the current subscription delivered any upstream event
@@ -1043,7 +1064,7 @@ impl ChannelCache {
                             );
                             // pvxs treats reconnect/type-change as
                             // a subscription boundary
-                            // (pvalink_channel.cpp:342-351 `onTypeChange()`).
+                            // (ioc/pvalink_channel.cpp:342-351 `onTypeChange()`).
                             // Forwarding the new body under the downstream's
                             // original MONITOR INIT descriptor would deliver
                             // bytes the client can't decode — possibly causing
@@ -1088,7 +1109,7 @@ impl ChannelCache {
                                 // paths so the downstream cooked monitor's
                                 // changedBitSet matches what the upstream IOC
                                 // marked, not a full mask of every requested
-                                // leaf (pva2pva moncache.cpp:142,189 copy the
+                                // leaf (pva2pva moncache.cpp:142,187 copy the
                                 // upstream changedBitSet verbatim). `overrun`
                                 // is filled later by `subscribe_inner` on lag.
                                 let _ = tx_inner.send(epics_pva_rs::server_native::MonitorUpdate {
@@ -1120,7 +1141,7 @@ impl ChannelCache {
                 // 200 ms, loop), so a plain upstream loss never makes the
                 // handle's task return and the boundary below never fired —
                 // downstream monitors kept being served the cached value of a
-                // dead IOC at NoAlarm (doc/pvalink-rtems-design.md §12.10).
+                // dead IOC at NoAlarm.
                 // pva2pva surfaces a lost upstream as downstream *unlisten*
                 // (`moncache.cpp:212-235`); `signal_disconnect_boundary` is
                 // that unlisten and is idempotent per outage, so calling it
@@ -1157,7 +1178,7 @@ impl ChannelCache {
                 // upstream server applies the same field projection /
                 // `record._options._filter` chain the client asked
                 // for), else the default all-fields request. pva2pva
-                // `p2pApp/channel.cpp:157-193` forwards the serialized
+                // `p2pApp/channel.cpp:157-224` forwards the serialized
                 // downstream pvRequest rather than a gateway default.
                 let handle_result = match pv_request_for_task.clone() {
                     Some(req) => {
@@ -1360,7 +1381,8 @@ impl ChannelCache {
         });
         // pva2pva bumps `cleanerRuns` every sweep and `cleanerDust` by the
         // number of evicted CHANNELS (`chancache.cpp:230-262`,
-        // `server.cpp:182-198`); both surface in the operator status report.
+        // `p2pApp/server.cpp:182-198`); both surface in the operator
+        // status report.
         // Relaxed is sufficient — these are monotonic diagnostic counters
         // with no ordering dependency.
         self.cleaner_runs.fetch_add(1, Ordering::Relaxed);
@@ -1421,7 +1443,7 @@ impl ChannelCache {
                 pv_name: pv_name.clone(),
                 // Channel-level aggregates over the monitor variants — pva2pva
                 // emits one row per channel with its `<n>` unique
-                // subscriptions (`server.cpp:218,228`), not one row per
+                // subscriptions (`p2pApp/server.cpp:218,228`), not one row per
                 // variant.
                 connected: channel.connected(),
                 subscribers: channel.subscriber_count(),
@@ -1539,7 +1561,7 @@ impl ChannelCache {
         drop(rx0);
         let (tx_raw, rx0_raw) = broadcast::channel::<crate::pva_gateway::source::RawEvent>(4);
         drop(rx0_raw);
-        let task = epics_base_rs::runtime::task::spawn(std::future::pending::<()>());
+        let task = self.reactor.spawn(std::future::pending::<()>());
         let entry = Arc::new(UpstreamEntry {
             pv_name: pv_name.to_string(),
             state: Arc::new(RwLock::new(EntryState::default())),
@@ -1832,7 +1854,7 @@ mod tests {
     /// BR-2 regression: `apply_monitor_event` must report the upstream
     /// event's real changed-leaf paths in `outcome.marked`, so the
     /// downstream cooked monitor advertises the upstream changedBitSet
-    /// (pva2pva `p2pApp/moncache.cpp:142,189` copy it verbatim) instead of
+    /// (pva2pva `p2pApp/moncache.cpp:142,187` copy it verbatim) instead of
     /// a full mask of every requested leaf. A whole-structure (root-bit)
     /// event reports `None` (= full mask); a delta reports exactly its
     /// changed leaves.
@@ -2004,7 +2026,7 @@ mod tests {
         drop(rx0);
         let (tx_raw, rx0_raw) = broadcast::channel::<crate::pva_gateway::source::RawEvent>(4);
         drop(rx0_raw);
-        let task = epics_base_rs::runtime::task::spawn(async {
+        let task = crate::test_reactor().spawn(async {
             epics_base_rs::runtime::task::sleep(Duration::from_secs(60)).await;
         });
         let entry = UpstreamEntry {
@@ -2037,7 +2059,7 @@ mod tests {
             drop(rx0);
             let (tx_raw, rx0_raw) = broadcast::channel::<crate::pva_gateway::source::RawEvent>(4);
             drop(rx0_raw);
-            let task = epics_base_rs::runtime::task::spawn(std::future::pending::<()>());
+            let task = crate::test_reactor().spawn(std::future::pending::<()>());
             UpstreamEntry {
                 pv_name: "X".into(),
                 state: Arc::new(RwLock::new(EntryState::default())),
@@ -2177,7 +2199,7 @@ mod tests {
     #[tokio::test]
     async fn drop_entry_publishes_removed_name_on_invalidator() {
         let client = Arc::new(PvaClient::builder().build());
-        let cache = ChannelCache::new(client, Duration::from_secs(60));
+        let cache = ChannelCache::new(crate::test_reactor(), client, Duration::from_secs(60));
         let inv = ChannelInvalidator::new();
         let mut rx = inv.subscribe();
         cache.set_invalidator(inv.clone());
@@ -2206,7 +2228,7 @@ mod tests {
     #[tokio::test]
     async fn flush_publishes_all_removed_names_in_one_batch() {
         let client = Arc::new(PvaClient::builder().build());
-        let cache = ChannelCache::new(client, Duration::from_secs(60));
+        let cache = ChannelCache::new(crate::test_reactor(), client, Duration::from_secs(60));
         let inv = ChannelInvalidator::new();
         let mut rx = inv.subscribe();
         cache.set_invalidator(inv.clone());
@@ -2232,7 +2254,7 @@ mod tests {
     /// `cacheSize` (`entry_count`), the admission cap, and `cleanerRemoved`
     /// must therefore count CHANNELS, not monitor variants; the report row
     /// surfaces the variant count separately as pva2pva's `<n>` unique
-    /// subscription(s) (`server.cpp:218,228`).
+    /// subscription(s) (`p2pApp/server.cpp:218,228`).
     ///
     /// Pre-fix the flat `(pv_name, pv_request)` map made all three of these
     /// count variants, so this same PV reported `cacheSize=3`, ate three
@@ -2242,7 +2264,7 @@ mod tests {
     #[tokio::test]
     async fn monitor_variants_count_as_one_channel() {
         let client = Arc::new(PvaClient::builder().build());
-        let cache = ChannelCache::new(client, Duration::from_secs(60));
+        let cache = ChannelCache::new(crate::test_reactor(), client, Duration::from_secs(60));
         // Same PV name, three distinct serialized-pvRequest keys.
         cache.insert_test_variant("VAR:PV", Vec::new()).await;
         cache.insert_test_variant("VAR:PV", vec![1, 2, 3]).await;
@@ -2288,7 +2310,7 @@ mod tests {
     #[tokio::test]
     async fn connection_admission_counts_ages_out_and_drops() {
         let client = Arc::new(PvaClient::builder().build());
-        let cache = ChannelCache::new(client, Duration::from_secs(60));
+        let cache = ChannelCache::new(crate::test_reactor(), client, Duration::from_secs(60));
 
         cache.insert_test_connection("CONN:PV").await;
         assert_eq!(
@@ -2345,7 +2367,7 @@ mod tests {
     #[tokio::test]
     async fn unwired_cache_drop_and_flush_are_silent() {
         let client = Arc::new(PvaClient::builder().build());
-        let cache = ChannelCache::new(client, Duration::from_secs(60));
+        let cache = ChannelCache::new(crate::test_reactor(), client, Duration::from_secs(60));
         cache.insert_test_entry("WM:PV").await;
         assert!(cache.drop_entry("WM:PV").await);
         cache.insert_test_entry("WM:PV2").await;

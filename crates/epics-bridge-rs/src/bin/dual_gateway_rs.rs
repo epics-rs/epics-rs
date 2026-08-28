@@ -26,6 +26,12 @@
 //! first one to exit terminates the process and aborts the other.
 //! Mirrors the abort-the-loser pattern from `PvaServer::wait`.
 
+// On `exec_backend` this program's `main` refuses instead of running, so
+// everything below it is unreachable in that configuration by construction.
+// The lint is reporting the intent, not dead code: the default build still
+// lints this file in full.
+#![cfg_attr(exec_backend, allow(dead_code, unused_imports))]
+
 use std::net::IpAddr;
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -34,7 +40,9 @@ use std::time::Duration;
 use clap::parser::ValueSource;
 use clap::{ArgMatches, CommandFactory, FromArgMatches, Parser};
 
+#[cfg(tokio_backend)]
 use epics_bridge_rs::ca_gateway::{GatewayConfig, GatewayServer, PutLogScope};
+#[cfg(tokio_backend)]
 use epics_bridge_rs::pva_gateway::{PvaGateway, PvaGatewayConfig};
 use epics_pva_rs::server_native::PvaServerConfig;
 
@@ -355,6 +363,7 @@ fn init_tracing(verbose: u8) {
         .try_init();
 }
 
+#[cfg(tokio_backend)]
 async fn run_ca_gateway(args: &Args) -> Result<(), String> {
     let config = GatewayConfig {
         pvlist_path: args.ca_pvlist.clone(),
@@ -422,6 +431,7 @@ async fn run_ca_gateway(args: &Args) -> Result<(), String> {
         .map_err(|e| format!("CA runtime error: {e}"))
 }
 
+#[cfg(tokio_backend)]
 async fn run_pva_gateway(args: &Args) -> Result<(), String> {
     // Precedence is flag > TOML > EPICS env > compiled default. The TOML
     // layer has already been merged into `args` (`merge_config`), so a
@@ -461,7 +471,9 @@ async fn run_pva_gateway(args: &Args) -> Result<(), String> {
         ..base
     };
     tracing::info!("dual-gateway-rs: starting PVA gateway");
-    let gateway = PvaGateway::start(cfg).map_err(|e| format!("PVA start failed: {e}"))?;
+    let reactor = epics_base_rs::runtime::task::Reactor::current()
+        .expect("run_pva_gateway is awaited on the daemon's runtime");
+    let gateway = PvaGateway::start(&reactor, cfg).map_err(|e| format!("PVA start failed: {e}"))?;
     if !args.pva_prefetch.is_empty() {
         let names: Vec<&str> = args.pva_prefetch.iter().map(String::as_str).collect();
         tracing::info!(count = names.len(), "pva-gateway: pre-warming cache");
@@ -669,6 +681,7 @@ fn merge_config(args: &mut Args, cfg: &ConfigFile, matches: &ArgMatches) {
     }
 }
 
+#[cfg(tokio_backend)]
 fn main() -> ExitCode {
     // Keep the raw `ArgMatches` so `merge_config` can ask clap which
     // flags the operator actually typed (vs. clap-supplied defaults),
@@ -729,9 +742,8 @@ fn main() -> ExitCode {
 
     // One worker, reactor-style — see qsrv_rs.rs: the default per-CPU
     // pool migrates the mostly-serial serving work across idle workers,
-    // costing ~35 µs of extra CPU per op on a 96-core host
-    // (doc/qsrv-put-perf.md). Multi-thread flavor is kept so
-    // `block_on_sync` works from runtime tasks.
+    // costing ~35 µs of extra CPU per op on a 96-core host. Multi-thread
+    // flavor is kept so `block_on_sync` works from runtime tasks.
     let runtime = match tokio::runtime::Builder::new_multi_thread()
         .worker_threads(1)
         .enable_all()
@@ -746,6 +758,7 @@ fn main() -> ExitCode {
     runtime.block_on(async_main(args))
 }
 
+#[cfg(tokio_backend)]
 async fn async_main(args: Args) -> ExitCode {
     tracing::info!(
         ca_enabled = !args.no_ca,
@@ -809,6 +822,19 @@ async fn async_main(args: Args) -> ExitCode {
         Ok(()) => ExitCode::SUCCESS,
         Err(_) => ExitCode::FAILURE,
     }
+}
+
+/// The `exec_backend` arm. Both gateways are clients *and* servers through the
+/// reactor-bound front-ends, so on the reactor-free backend neither half
+/// exists. Nothing replaces it: an RTEMS image runs an IOC, not a gateway.
+#[cfg(exec_backend)]
+fn main() -> ExitCode {
+    eprintln!(
+        "dual-gateway-rs: this build selects the reactor-free execution \
+         backend (EPICS_RS_BUILD_EXEC_BACKEND=thread), and the CA and PVA gateway halves both \
+         need a tokio reactor. Rebuild without that feature to run the gateway."
+    );
+    ExitCode::FAILURE
 }
 
 #[cfg(test)]

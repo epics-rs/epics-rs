@@ -1,5 +1,5 @@
 //! The RTEMS blocking PVA driver serving QSRV groups, driven end-to-end on
-//! the host — the coverage gap `doc/qsrv-rtems-design.md` §9.15 exposed.
+//! the host.
 //!
 //! The first GroupPump landing passed every host gate and then wedged the
 //! QEMU target server-wide the moment one group subscription saw sustained
@@ -9,7 +9,7 @@
 //! forwarders that share the band and (at SCHED_FIFO 64 on one core) every
 //! thread below it. The gates stayed green because nothing on the host drove
 //! [`BlockingPvaServer`] with a group source under sustained posting; the
-//! feature-ON qsrv tests exercised `GroupMonitor` directly and briefly.
+//! exec-backend qsrv tests exercised `GroupMonitor` directly and briefly.
 //!
 //! This test closes that gap with the measured target scenario itself: one
 //! real client monitoring a 20-member group, one real client monitoring an
@@ -23,9 +23,11 @@
 //! Exec-model only: this drives the blocking driver + background-executor
 //! configuration the target runs; the hosted tokio driver is a different
 //! server (`PvaServer::start`) with its own suites.
-#![cfg(feature = "rtems-exec-model")]
+#![cfg(exec_backend)]
+#![cfg(feature = "qsrv-core")]
 
-// RTEMS-EXEC-MODEL-ALLOW(1): checked - runs and passes in the feature-ON suite.
+// RTEMS-EXEC-MODEL-ALLOW(1): checked - runs and passes in the exec-backend
+// suite.
 
 use std::io::Write as _;
 use std::net::{Ipv4Addr, SocketAddr};
@@ -129,9 +131,11 @@ async fn group_flood_starves_neither_the_scalar_monitor_nor_a_fresh_get() {
     );
     let addr = SocketAddr::from((Ipv4Addr::LOCALHOST, server.tcp_port()));
     let srv = server.clone();
+    let serve_reactor = epics_base_rs::runtime::task::Reactor::current()
+        .expect("the exec backend's executor is process-global");
     let serve_thread = std::thread::Builder::new()
         .name("PVAS-TCP-test".into())
-        .spawn(move || srv.serve())
+        .spawn(move || srv.serve(&serve_reactor))
         .expect("spawn the accept thread");
 
     // ── Two subscriptions on two circuits (the target evidence shape) ───

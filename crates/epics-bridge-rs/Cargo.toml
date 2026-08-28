@@ -37,39 +37,6 @@ default = ["qsrv", "qsrv-bin", "ca-gateway", "ca-gateway-bin"]
 # with no features at all compiles `error`/`convert`/`lib.rs` and nothing else,
 # which is a green that proves nothing.
 qsrv-core = ["dep:epics-pva-rs", "dep:serde", "dep:serde_json"]
-# Host-selectable RTEMS execution model — passthrough to
-# `epics-base-rs/rtems-exec-model`, exactly as `epics-ca-rs` and `epics-pva-rs`
-# declare it. Routes the `runtime::task` seam to the std-thread background
-# executor on a hosted target, which is what compiles `realtime-pva-ioc`'s real
-# entry point off RTEMS so it can be linted and tested here. OFF by default.
-#
-# It is NOT what selects the executor on the target: `armv7-rtems-eabihf` (and
-# the `*-wrs-vxworks*` triples) reach the same backend through
-# `epics_embedded_target`, so `scripts/rtems-check.sh` does not pass this
-# feature. Declaring it here buys
-# the *host* half — and with it the `rtems-exec-gate` census below, which is
-# the price of the feature and the reason it landed as its own stage
-# (doc/qsrv-rtems-design.md §6.3, §7 stage 4).
-#
-# The two client crates are in this list, and forwarding to `epics-base-rs`
-# alone was a defect. Cargo unifies features per *package*, so
-# `epics-base-rs/rtems-exec-model` moved `runtime::task::spawn` onto the
-# reactor-free background executor while `epics-ca-rs` and `epics-pva-rs`
-# still compiled — and selected — their reactor-backed UDP SEARCH transports:
-# exactly the split that panicked `realtime-pva-ioc` at boot with "there is no
-# reactor running" (`doc/calink-rtems-design.md` §10.10 item 2). Each client
-# crate now asserts the agreement in its own `lib.rs`, so this line cannot
-# regress silently — it would fail to compile.
-#
-# `?/` on both: neither is a hard dependency (`epics-pva-rs` arrives with
-# `qsrv-core`, `epics-ca-rs` with `qsrv`/`ca-gateway`), and a plain `/` would
-# turn this feature into one that pulls them in. `realtime-pva-ioc` requires
-# `qsrv-core` + `pvalink`, so both are present in the build that produces it.
-rtems-exec-model = [
-    "epics-base-rs/rtems-exec-model",
-    "epics-ca-rs?/rtems-exec-model",
-    "epics-pva-rs?/rtems-exec-model",
-]
 # The RTEMS bring-up measurement rig for `realtime-pva-ioc` (the family twin of
 # `epics-ca-rs/bringup-probes` — doc/calink-rtems-design.md §11.7 item 3): the
 # stage-5 pvalink probe records (doc/pvalink-rtems-design.md §12), the §8 QSRV
@@ -337,11 +304,14 @@ required-features = ["qsrv-core", "pvalink"]
 epics-rtems-boot = { workspace = true }
 
 [dev-dependencies]
+# Dev-only and `path`-only, so `cargo package` drops it from the uploaded
+# manifest: the source guards in this crate share one production-slice rule.
+source-guard = { path = "../source-guard" }
 # Dev-only, path-only (no `version`, so `cargo publish` strips the entry
-# entirely): the shared `rtems-exec-model` test-gating census, called by
+# entirely): the shared exec-backend test-gating census, called by
 # `tests/rtems_exec_model_gate.rs`. Shared rather than copied because every
-# crate that declares the feature has the same hole, and four copies of a
-# 300-line audit is how four copies of a rule come to disagree.
+# crate that derives the backend has the same hole, and a 300-line audit
+# copied once per crate is how copies of a rule come to disagree.
 rtems-exec-gate = { path = "../../tools/rtems-exec-gate" }
 serial_test = "3"
 tempfile = "3"

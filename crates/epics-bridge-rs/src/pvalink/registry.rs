@@ -3,8 +3,9 @@
 //! Used by record handlers so multiple records pointing at the same PV
 //! share a single underlying client connection.
 
-// RTEMS-EXEC-MODEL-ALLOW(5): checked - these run and pass in the feature-ON suite.
-// (1 live-upstream monitor test gated out feature-ON below; §4.2, stage 3.)
+// RTEMS-EXEC-MODEL-ALLOW(5): checked - these run and pass in the exec-backend
+// suite. (1 live-upstream monitor test gated out on the exec backend below;
+// §4.2, stage 3.)
 
 use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
@@ -32,12 +33,12 @@ const PVALINK_CLIENT_TIMEOUT: Duration = Duration::from_secs(5);
 /// All four members — `(pv_name, pipeline, queue_size, direction)` —
 /// mirror pvxs's `channels_key_t = (channelName, pvRequest)` where
 /// pvRequest encodes `pipeline` and `queueSize`
-/// (`pvxs/ioc/pvalink_lset.cpp:49-65`, `pvxs/ioc/pvalink.h:116`). The
+/// (`pvxs/ioc/pvalink_lset.cpp:99-100`, `pvxs/ioc/pvalink.h:116`). The
 /// key deliberately does NOT include the per-link OUT options
 /// (`field`, `process`, `defer`, `retry`): pvxs caches one shared
 /// `pvaLinkChannel` per `(channelName, pvRequest)` and keeps the
 /// per-link `field`/`proc`/`defer`/`retry` on the child `pvaLink`
-/// objects, not in the channel key (`pvxs/ioc/pvalink_lset.cpp:99-122`,
+/// objects, not in the channel key (`pvxs/ioc/pvalink_lset.cpp:99-131`,
 /// `pvxs/ioc/pvalink.h:65,116`).
 ///
 /// Folding sibling OUT links to one upstream PV onto one shared
@@ -84,7 +85,7 @@ pub struct ChannelDiag {
     /// with `plink->precord->name`; the registry folds field/sevr-only
     /// variants onto one channel entry, so this is the de-duplicated set
     /// of owning records. Backs `dbpvar`'s record-name glob filter
-    /// (`pvxs/ioc/pvalink.cpp:213-243`). Empty for channels opened
+    /// (`pvxs/ioc/pvalink.cpp:216-231`). Empty for channels opened
     /// manually (e.g. `pvxr`) with no owning record.
     pub records: Vec<String>,
 }
@@ -95,7 +96,7 @@ pub struct PvaLinkRegistry {
     /// The ONE [`PvaClient`] every link opened through this registry
     /// runs on — the single owner pvxs calls
     /// `linkGlobal->provider_remote`, built once in `linkGlobal_t::alloc()`
-    /// (`pvxs/ioc/pvalink.h:107`, `pvalink.cpp:51-63`).
+    /// (`pvxs/ioc/pvalink.h:107`, `pvxs/ioc/pvalink.cpp:51-64`).
     ///
     /// The registry, not the link, owns it because the registry is what
     /// constructs links: [`PvaLink::open`] takes a client and never builds
@@ -121,7 +122,7 @@ pub struct PvaLinkRegistry {
     /// `plink->precord->name`): the set of records whose links attached
     /// to each cached channel. Populated at open time via
     /// [`Self::attach_record`]; backs the `dbpvar` record-name glob
-    /// filter (`pvxs/ioc/pvalink.cpp:213-243`).
+    /// filter (`pvxs/ioc/pvalink.cpp:216-231`).
     channel_records: RwLock<HashMap<RegistryKey, BTreeSet<String>>>,
 }
 
@@ -177,7 +178,7 @@ impl PvaLinkRegistry {
     /// `(channelName, pvRequest)` identity the registry caches by, so a
     /// fold of field/sevr-only variants still accumulates every owning
     /// record. Mirrors pvxs appending a `pvaLink` to
-    /// `pvaLinkChannel::links` (`pvalink_channel.cpp` link attach).
+    /// `pvaLinkChannel::links` (`pvxs/ioc/pvalink_channel.cpp` link attach).
     pub fn attach_record(&self, config: &PvaLinkConfig, record: &str) {
         self.channel_records
             .write()
@@ -205,7 +206,7 @@ impl PvaLinkRegistry {
     /// The monitor variant is fully described by these three fields —
     /// matching pvxs's `channels_key_t = (channelName, pvRequest)` where
     /// the pvRequest encodes `pipeline` / `queueSize`
-    /// (`pvxs/ioc/pvalink.h:115-120`). Resolver hot paths use this
+    /// (`pvxs/ioc/pvalink.h:116-120`). Resolver hot paths use this
     /// instead of a bare-PV-name match so a `Q=1` record reads from its
     /// own monitor, never from a `Q=64` sibling that merely shares the
     /// upstream PV name.
@@ -414,7 +415,7 @@ impl PvaLinkRegistry {
     ///
     /// Two INP links to the same upstream PV with different `pipeline` /
     /// `queue_size` are DISTINCT monitor variants (distinct subscriptions
-    /// in pvxs, `pvxs/ioc/pvalink.h:115-120`), so each is reported
+    /// in pvxs, `pvxs/ioc/pvalink.h:116-120`), so each is reported
     /// separately: a per-variant `is_connected` must land on that
     /// variant's own monitor, not just the first to share the PV name.
     /// Links that share the exact `(pv_name, pipeline, queue_size)`
@@ -616,7 +617,7 @@ mod tests {
     /// channel (folding field/sevr-only variants onto one entry), and
     /// `channel_diagnostics` surfaces the de-duplicated, sorted set.
     /// pvxs equivalent: `pvaLinkChannel::links` filtered by
-    /// `epicsStrGlobMatch(precord->name, ...)` (`pvalink.cpp:213-243`).
+    /// `epicsStrGlobMatch(precord->name, ...)` (`pvxs/ioc/pvalink.cpp:216-231`).
     #[tokio::test]
     async fn channel_diagnostics_carries_attached_record_names() {
         let reg = PvaLinkRegistry::new();
@@ -664,7 +665,7 @@ mod tests {
     /// child `pvaLink` objects, so two links to the same channel share
     /// the owner and each contributes its staged value with its own
     /// `field`/`proc` at PUT-build time
-    /// (`pvxs/ioc/pvalink_lset.cpp:99-122`, `pvalink_channel.cpp:127-156`).
+    /// (`pvxs/ioc/pvalink_lset.cpp:99-131`, `pvxs/ioc/pvalink_channel.cpp:127-184`).
     ///
     /// The per-link `field`/`proc`/`defer`/`retry` no longer live in
     /// the registry key (they travel with each write via
@@ -719,14 +720,13 @@ mod tests {
         assert_eq!(reg.len(), 2, "two distinct channel owners cached");
     }
 
-    /// Stage 0 gate (`doc/pvalink-rtems-design.md` §5): the registry owns
-    /// ONE [`PvaClient`] for the whole IOC, so links that are deliberately
-    /// *distinct* still cost the upstream IOC exactly **one** TCP
-    /// connection.
+    /// Stage 0 gate: the registry owns ONE [`PvaClient`] for the whole IOC,
+    /// so links that are deliberately *distinct* still cost the upstream IOC
+    /// exactly **one** TCP connection.
     ///
     /// Two INP links to the same `pv_name` with different `queue_size` are
     /// different `pvRequest`s — pvxs `channels_key_t = (channelName,
-    /// pvRequest)` (`pvxs/ioc/pvalink.h:115-120`) — hence distinct
+    /// pvRequest)` (`pvxs/ioc/pvalink.h:116-120`) — hence distinct
     /// `RegistryKey`s and distinct `PvaLink`s, each with its own monitor
     /// subscription. What they must NOT have is distinct transports: both
     /// resolve through the one client's `ConnectionPool`, which is keyed on
@@ -741,10 +741,9 @@ mod tests {
     /// exercises the connection pool without any UDP search.
     // Drives two live pvalink monitor subscriptions to a real upstream server;
     // the link's monitor task now spawns onto the reactor-less callback pool
-    // under `rtems-exec-model`, where the client's `tokio::net` transport
-    // cannot run. Reactor-dependent — gated out feature-ON
-    // (doc/pvalink-rtems-design.md §4.2, stage 3).
-    #[cfg(not(feature = "rtems-exec-model"))]
+    // under `exec_backend`, where the client's `tokio::net` transport cannot
+    // run. Reactor-dependent — gated out on the exec backend (stage 3).
+    #[cfg(tokio_backend)]
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn stage0_distinct_link_variants_share_one_upstream_connection() {
         use epics_pva_rs::pvdata::{FieldDesc, PvField, PvStructure, ScalarType, ScalarValue};

@@ -43,7 +43,8 @@
 //! [`PutLogLine::TrapWrite`] writes the C default valueless line,
 //! [`PutLogLine::AllWrites`] writes the value/old/outcome audit line.
 
-// RTEMS-EXEC-MODEL-ALLOW(4): checked - these run and pass in the feature-ON suite.
+// RTEMS-EXEC-MODEL-ALLOW(4): checked - these run and pass in the exec-backend
+// suite.
 
 /// Which client writes the put log records. Selected by the write hook
 /// from gateway configuration; see the module docs for the per-mode line
@@ -277,6 +278,7 @@ impl PutLog {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use source_guard::{Comments, production};
 
     /// B1: no field a CA peer controls can forge a putlog record.
     ///
@@ -360,10 +362,7 @@ mod tests {
     #[test]
     fn neither_line_shape_carries_its_own_terminator() {
         let src = include_str!("putlog.rs");
-        let prod = match src.find("\n#[cfg(test)]") {
-            Some(i) => &src[..i],
-            None => src,
-        };
+        let prod = production(src, Comments::Keep);
         let owner = concat!("runtime::log::single", "_line");
         let owners: Vec<usize> = prod
             .lines()

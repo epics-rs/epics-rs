@@ -29,7 +29,8 @@
 //! processGroups
 //! ```
 
-// RTEMS-EXEC-MODEL-ALLOW(1): checked - these run and pass in the feature-ON suite.
+// RTEMS-EXEC-MODEL-ALLOW(1): checked - these run and pass in the exec-backend
+// suite.
 
 use std::sync::Arc;
 
@@ -50,7 +51,7 @@ use super::provider::BridgeProvider;
 ///
 /// pvxs only creates the `MAC_HANDLE` when the macros argument is
 /// non-empty (`groupconfigprocessor.cpp` guards on `macros[0]!='\0'`,
-/// `groupsourcehooks.cpp:153`); with an empty macros argument the JSON
+/// `groupsourcehooks.cpp:154`); with an empty macros argument the JSON
 /// lines are used verbatim and no macro/env expansion happens at all.
 /// We mirror that: an empty `macros` string skips expansion entirely.
 pub fn db_load_group_command(provider: Arc<BridgeProvider>) -> CommandDef {
@@ -60,12 +61,10 @@ pub fn db_load_group_command(provider: Arc<BridgeProvider>) -> CommandDef {
             ArgDesc {
                 name: "filename",
                 arg_type: ArgType::String,
-                optional: false,
             },
             ArgDesc {
                 name: "macros",
                 arg_type: ArgType::String,
-                optional: true,
             },
         ],
         "dbLoadGroup <jsonFilename> [<macros>]",
@@ -113,7 +112,7 @@ pub fn db_load_group_command(provider: Arc<BridgeProvider>) -> CommandDef {
 
 /// Apply one `dbLoadGroup(filename, macros)` to `provider`: read the file,
 /// run it through macLib **only when `macros` is non-empty** (matching
-/// pvxs's `macros[0]!='\0'` guard, groupsourcehooks.cpp:153), and merge the
+/// pvxs's `macros[0]!='\0'` guard, groupsourcehooks.cpp:154), and merge the
 /// parsed groups into the provider under the `(filename, macros)` source
 /// identity so a later `dbLoadGroup("-file", macros)` can remove them.
 /// Returns the running group count.
@@ -122,7 +121,7 @@ pub fn db_load_group_command(provider: Arc<BridgeProvider>) -> CommandDef {
 /// [`db_load_group_command`] and the QSRV protocol runner, which calls it
 /// for every entry drained from the base `dbLoadGroup` startup queue
 /// (pvxs `GroupConfigProcessor::loadConfigFiles`,
-/// groupsourcehooks.cpp:200-207).
+/// groupsourcehooks.cpp:201).
 pub(crate) fn apply_group_file(
     provider: &BridgeProvider,
     filename: &str,
@@ -138,7 +137,7 @@ pub(crate) fn apply_group_file(
         // macro makes `macExpandString` return a negative length, so
         // `macDefExpand` returns `NULL`), logs an error and skips that line —
         // the failed line never reaches the JSON buffer
-        // (groupconfigprocessor.cpp:88-105). Expanding line-by-line, rather
+        // (groupconfigprocessor.cpp:88-106). Expanding line-by-line, rather
         // than the whole file at once, is what stops an undefined reference
         // inside a quoted string (`"+channel": "$(MISSING)"`) or a group name
         // from surviving as a literal `$(MISSING,undefined)` placeholder.
@@ -186,7 +185,7 @@ pub(crate) fn apply_group_file(
 /// Env-var fallback is intentionally NOT applied here. pvxs seeds the
 /// `environ` scope into the `MAC_HANDLE` and resolves `$(...)` references
 /// at `macExpandString` time with supplied macros taking precedence over
-/// the environment (`groupsourcehooks.cpp:154-169`). QSRV mirrors that in
+/// the environment (`groupsourcehooks.cpp:154-170`). QSRV mirrors that in
 /// [`expand_macros`], which is the sole expansion owner; resolving the
 /// environment eagerly at parse time (as the base `parse_macro_string`
 /// does) would let env values shadow chained supplied-macro references.
@@ -206,17 +205,17 @@ fn parse_macros(s: &str) -> std::collections::HashMap<String, String> {
 /// Expand `$(...)` / `${...}` macro references in `s`, mirroring the C
 /// EPICS Base `macLib` engine (`modules/libcom/src/macLib/macCore.c`
 /// `trans` / `refer` / `lookup`) that pvxs drives through `macDefExpand`
-/// (`groupconfigprocessor.cpp:88-101`). Implemented behaviors:
+/// (`groupconfigprocessor.cpp:88-106`). Implemented behaviors:
 ///
 ///   - `$(NAME)` and `${NAME}` are both references; `\<char>` blocks
 ///     detection. At level 0 (the user's source string) both bytes are
 ///     copied verbatim; at a discard level (a substituted macro value) the
 ///     escape backslash is dropped and only the escaped byte is kept
-///     (`trans:740-743`, `discard = level > 0`).
+///     (`trans:741-744`, `discard = level > 0`).
 ///   - quote delimiters are kept at level 0 (the user's quotes) but removed
 ///     from substituted macro values/names/defaults/scopes
-///     (`trans:716-726`).
-///   - macros are NOT expanded inside single quotes (`trans:722-733`).
+///     (`trans:717-726`).
+///   - macros are NOT expanded inside single quotes (`trans:734-737`).
 ///   - a reference name is itself macro-expanded before lookup, so
 ///     `$($(WHICH))` resolves the inner reference first.
 ///   - the name terminates at `=`, `,`, or the closing bracket
@@ -226,7 +225,7 @@ fn parse_macros(s: &str) -> std::collections::HashMap<String, String> {
 ///   - lookup order is scoped frames (innermost first), then the
 ///     supplied `macros`, then the process environment (pvxs creates
 ///     the handle with the `{"","environ"}` pair —
-///     `groupsourcehooks.cpp:154`, `lookup`+`FLAG_USE_ENVIRONMENT`).
+///     `groupsourcehooks.cpp:156-158`, `lookup`+`FLAG_USE_ENVIRONMENT`).
 ///   - a resolved (macro or env) value is re-scanned for further
 ///     references (chained expansion); a self-referential macro is a
 ///     recursive reference and fails the expansion (`refentry->visited`).
@@ -247,7 +246,7 @@ fn expand_macros(s: &str, macros: &std::collections::HashMap<String, String>) ->
     // `error` mirrors C `entry.error`: any undefined or recursive reference
     // anywhere in the (possibly nested) expansion sets it. The reference name
     // and an actually-used default value are translated through this same flag
-    // (C uses the outer `entry`, macCore.c:798,890-893), so their errors
+    // (C uses the outer `entry`, macCore.c:798,890-894), so their errors
     // propagate; scoped-definition names/values are NOT (separate `subs`,
     // macCore.c:821-826), handled inside `mac_parse_scoped`.
     let mut error = false;
@@ -256,7 +255,7 @@ fn expand_macros(s: &str, macros: &std::collections::HashMap<String, String>) ->
     // (`macExpandString` → `trans(handle, &entry, 0, ...)`, macCore.c:216).
     // Substituted macro values/names/defaults/scopes are translated at
     // level+1 inside `mac_refer`, where `discard = true` strips them
-    // (matching C `expand`/`refer`, macCore.c:667-673,798,892).
+    // (matching C `expand`/`refer`, macCore.c:669-673,798,892).
     mac_trans(
         &chars,
         macros,
@@ -298,7 +297,7 @@ fn mac_trans(
         // discard level (`level > 0` — i.e. these are NOT the user's quotes
         // but a substituted macro value/name/default/scope) the quote
         // DELIMITERS are dropped: C `continue`s past the opening and the
-        // closing quote without copying them (macCore.c:716-726). The
+        // closing quote without copying them (macCore.c:717-726). The
         // characters between the quotes are still emitted.
         if let Some(q) = quote {
             if c == q {
@@ -319,7 +318,7 @@ fn mac_trans(
         // `\<char>`: copy the escaped character; the backslash itself is
         // kept only at level 0 (the user's escape) and dropped at a discard
         // level (C `if (v < valend && !discard) *v++ = '\\'`,
-        // macCore.c:740-743). Either way the macro detector does not see the
+        // macCore.c:741-744). Either way the macro detector does not see the
         // escaped byte.
         if c == '\\' && i + 1 < chars.len() {
             if !discard {
@@ -445,7 +444,7 @@ fn mac_refer(
             if visiting.contains(&name) {
                 // Recursive reference: C `refer` finds `refentry->visited`
                 // already set, sets `entry->error = TRUE`, and writes the
-                // `$(name,recursive)` placeholder (macCore.c:880-882,903-912).
+                // `$(name,recursive)` placeholder (macCore.c:881-882,904-912).
                 // `macExpandString` then reports a negative length so
                 // `macDefExpand` returns `NULL`. Flag the error; the
                 // placeholder text is discarded by `expand_macros` on error,
@@ -460,7 +459,7 @@ fn mac_refer(
                 // A resolved macro value is a substituted (level+1) value:
                 // its quote delimiters and escape backslashes are stripped
                 // (C `trans(handle, entry, level+1, "", &rv, ...)` /
-                // pre-`expand` at level 1, macCore.c:667-673,875). Errors in
+                // pre-`expand` at level 1, macCore.c:669-673,875). Errors in
                 // the value (e.g. a chained reference to an undefined macro)
                 // propagate through the shared `entry` (macCore.c:870,875).
                 mac_trans(&val_chars, macros, scopes, visiting, true, error, out);
@@ -481,7 +480,7 @@ fn mac_refer(
             None => {
                 // Undefined reference with no default: C `refer` sets
                 // `entry->error = TRUE` and writes the `$(name,undefined)`
-                // placeholder (macCore.c:895-896,903-912), so
+                // placeholder (macCore.c:895-896,904-912), so
                 // `macExpandString` returns a negative length and
                 // `macDefExpand` returns `NULL`. Flag the error; the
                 // placeholder is discarded by `expand_macros` on error.
@@ -636,7 +635,6 @@ pub fn qsrv_stats_command(provider: Arc<BridgeProvider>) -> CommandDef {
         vec![ArgDesc {
             name: "name",
             arg_type: ArgType::String,
-            optional: true,
         }],
         "qsrvStats [<recordOrGroupName>]",
         move |args: &[ArgValue], ctx: &CommandContext| {
@@ -710,7 +708,6 @@ pub fn pvxsl_command(provider: Arc<BridgeProvider>) -> CommandDef {
         vec![ArgDesc {
             name: "detail",
             arg_type: ArgType::Int,
-            optional: true,
         }],
         "pvxsl [<detail>]",
         move |args: &[ArgValue], ctx: &CommandContext| {
@@ -766,7 +763,7 @@ fn pvxsl_lines(names: &[String], detail: i64) -> Vec<String> {
 
 /// `pvxgl [<level>] [<pattern>]` — list QSRV group PV names, optionally
 /// filtered by a glob `pattern` and, when `level > 0`, with group
-/// detail. Mirrors pvxs `pvxsgl` (`groupsourcehooks.cpp:50-83`,
+/// detail. Mirrors pvxs `pvxsgl` (`groupsourcehooks.cpp:57-83`,
 /// registered at `:233-240`) and `Group::show` (`group.cpp`): an empty
 /// pattern matches every group; `level > 0` prints the atomic flag and
 /// member count; `level > 1` prints one line per member.
@@ -777,12 +774,10 @@ pub fn pvxgl_command(provider: Arc<BridgeProvider>) -> CommandDef {
             ArgDesc {
                 name: "level",
                 arg_type: ArgType::Int,
-                optional: true,
             },
             ArgDesc {
                 name: "pattern",
                 arg_type: ArgType::String,
-                optional: true,
             },
         ],
         "pvxgl [<level>] [<pattern>]",
@@ -805,7 +800,7 @@ pub fn pvxgl_command(provider: Arc<BridgeProvider>) -> CommandDef {
 }
 
 /// Build the `pvxgl` output lines for a group-definition map, mirroring
-/// pvxs `pvxsgl` (`groupsourcehooks.cpp:50-83`) plus `Group::show`
+/// pvxs `pvxsgl` (`groupsourcehooks.cpp:57-83`) plus `Group::show`
 /// (`group.cpp:61-94`). Split out of [`pvxgl_command`] so the exact
 /// pvxs-compatible text is unit-testable without capturing stdout.
 ///
@@ -1023,7 +1018,8 @@ mod tests {
                 "value": { "+channel": "TEST:val.VAL", "+type": "plain" }
             }
         }"#;
-        let path = std::env::temp_dir().join("qsrv_iocsh_test.json");
+        let tmpdir = tempfile::tempdir().expect("fixture root");
+        let path = tmpdir.path().join("qsrv_iocsh_test.json");
         std::fs::write(&path, json).unwrap();
 
         provider.load_group_file(path.to_str().unwrap()).unwrap();
@@ -1242,7 +1238,7 @@ mod tests {
         // when the macro is otherwise undefined (macLib default arm).
         let m = std::collections::HashMap::new();
         // A present, resolvable default is NOT an error (C uses the default
-        // arm and leaves `entry->error` clear, macCore.c:890-893).
+        // arm and leaves `entry->error` clear, macCore.c:890-894).
         assert_eq!(expand_macros("${P=DEFAULT}", &m).unwrap(), "DEFAULT");
         let mut m2 = std::collections::HashMap::new();
         m2.insert("P".to_string(), "SET".to_string());
@@ -1278,7 +1274,7 @@ mod tests {
 
     /// C `macCore.c` expands a substituted macro value at `level > 0`, where
     /// `discard` removes the value's quote delimiters and escape backslashes
-    /// (macCore.c:716-726,740-743). A site macro `P="IOC:"` therefore expands
+    /// (macCore.c:717-726,741-744). A site macro `P="IOC:"` therefore expands
     /// to `IOC:`, not `"IOC:"`. The Rust expander used to copy quotes/escapes
     /// from every level, corrupting JSON or PV names substituted from quoted
     /// macro values.
@@ -1325,7 +1321,7 @@ mod tests {
     /// `A=$(A)` must not recurse forever (macLib `visited`), and the recursion
     /// is an *error*: C `refer` sets `entry->error` on the recursive reference,
     /// so `macExpandString` returns a negative length and `macDefExpand`
-    /// returns `NULL` (macCore.c:880-882,210,220). pvxs then drops the line, so
+    /// returns `NULL` (macCore.c:881-882,210,220). pvxs then drops the line, so
     /// the recursive macro never reaches the JSON parser as literal text —
     /// `expand_macros` must return `None`, not the resolved value.
     #[test]
@@ -1351,7 +1347,7 @@ mod tests {
     }
 
     /// pvxs expands each group-config line through `macDefExpand` and skips a
-    /// line whose expansion returns `NULL` (groupconfigprocessor.cpp:88-105).
+    /// line whose expansion returns `NULL` (groupconfigprocessor.cpp:88-106).
     /// An undefined macro inside a quoted `+channel` value must therefore never
     /// register as a literal `$(MISSING,undefined)` channel: the line is
     /// dropped, leaving no such group.
@@ -1363,7 +1359,8 @@ mod tests {
         // line dropped the buffer is empty, so parsing fails and — crucially —
         // no group named after the placeholder is ever created.
         let json = r#"{ "G:grp": { "value": { "+channel": "$(R0604_MISSING_CHANNEL)", "+type": "plain" } } }"#;
-        let path = std::env::temp_dir().join("qsrv_iocsh_undef_macro_line.json");
+        let tmpdir = tempfile::tempdir().expect("fixture root");
+        let path = tmpdir.path().join("qsrv_iocsh_undef_macro_line.json");
         std::fs::write(&path, json).unwrap();
         // Non-empty macros enables expansion (pvxs `macros[0] != '\0'` gate).
         let res = apply_group_file(&provider, path.to_str().unwrap(), "DUMMY=1");

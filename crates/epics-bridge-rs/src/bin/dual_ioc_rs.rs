@@ -15,6 +15,12 @@
 //! dual-ioc-rs --db records.db -m P=BL13:
 //! ```
 
+// On `exec_backend` this program's `main` refuses instead of running, so
+// everything below it is unreachable in that configuration by construction.
+// The lint is reporting the intent, not dead code: the default build still
+// lints this file in full.
+#![cfg_attr(exec_backend, allow(dead_code, unused_imports))]
+
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -24,7 +30,9 @@ use clap::Parser;
 use epics_base_rs::error::CaResult;
 use epics_base_rs::server::ioc_builder::IocBuilder;
 use epics_base_rs::types::EpicsValue;
+#[cfg(tokio_backend)]
 use epics_ca_rs::server::CaServer;
+#[cfg(tokio_backend)]
 use epics_pva_rs::server::PvaServer;
 
 #[derive(Parser, Debug)]
@@ -114,8 +122,9 @@ fn parse_pv(def: &str) -> CaResult<(String, EpicsValue)> {
 
 // One worker, reactor-style — see qsrv_rs.rs: the default per-CPU pool
 // migrates the mostly-serial serving work across idle workers, costing
-// ~35 µs of extra CPU per put on a 96-core host (doc/qsrv-put-perf.md).
-// Multi-thread flavor is kept so `block_on_sync` works from runtime tasks.
+// ~35 µs of extra CPU per put on a 96-core host. Multi-thread flavor is
+// kept so `block_on_sync` works from runtime tasks.
+#[cfg(tokio_backend)]
 #[tokio::main(worker_threads = 1)]
 async fn main() -> ExitCode {
     tracing_subscriber::fmt()
@@ -142,10 +151,15 @@ async fn main() -> ExitCode {
     let macros = parse_macros(&args.macros);
     let mut builder = IocBuilder::new();
 
+    // Startup progress goes to the subscriber, not to stderr. An IOC that
+    // loaded a database says nothing about it: C `softIoc -d file.db` is
+    // silent, and prints the `dbLoadRecords(...)` call only under `-v`
+    // (`softMain.cpp:192-198`). Anything a site scrapes from an IOC's first
+    // lines is therefore C's, and these two were not.
     for pv_def in &args.pvs {
         match parse_pv(pv_def) {
             Ok((name, value)) => {
-                eprintln!("  PV: {name}");
+                tracing::debug!(pv = %name, "defined from --pv");
                 builder = builder.pv(&name, value);
             }
             Err(e) => {
@@ -156,7 +170,7 @@ async fn main() -> ExitCode {
     }
 
     for db_path in &args.db_files {
-        eprintln!("  Loading DB: {}", db_path.display());
+        tracing::debug!(db = %db_path.display(), "loading records");
         let path_str = db_path.to_string_lossy().to_string();
         builder = match builder.db_file(&path_str, &macros) {
             Ok(b) => b,
@@ -242,12 +256,29 @@ async fn main() -> ExitCode {
     }
 }
 
+#[cfg(tokio_backend)]
 fn format_join(which: &str, r: Result<CaResult<()>, tokio::task::JoinError>) -> Result<(), String> {
     match r {
         Ok(Ok(())) => Ok(()),
         Ok(Err(e)) => Err(format!("{which} server exited: {e}")),
         Err(e) => Err(format!("{which} task panicked: {e}")),
     }
+}
+
+/// The `exec_backend` arm. Both halves of this program are the reactor-bound
+/// front-ends — `epics_ca_rs::server::CaServer` and
+/// `epics_pva_rs::server::PvaServer` — so on the reactor-free backend there is
+/// no dual IOC to stand. `realtime-pva-ioc` is the entry point that brings a
+/// CA+PVA IOC up on this execution model.
+#[cfg(exec_backend)]
+fn main() -> ExitCode {
+    eprintln!(
+        "dual-ioc-rs: this build selects the reactor-free execution backend \
+         (EPICS_RS_BUILD_EXEC_BACKEND=thread), and both the CA and the PVA server front-ends \
+         need a tokio reactor. Use `realtime-pva-ioc` on this backend, or \
+         rebuild without that feature."
+    );
+    ExitCode::FAILURE
 }
 
 #[cfg(test)]

@@ -17,7 +17,8 @@
 //! the target's own selection for no reason.
 #![cfg(feature = "qsrv-core")]
 
-// RTEMS-EXEC-MODEL-ALLOW(25): checked - these run and pass in the feature-ON suite.
+// RTEMS-EXEC-MODEL-ALLOW(26): checked - these run and pass in the exec-backend
+// suite.
 
 use std::sync::Arc;
 
@@ -94,8 +95,8 @@ async fn put_then_get_round_trips_double() {
     assert!(matches!(value, PvField::Scalar(ScalarValue::Double(v)) if (*v - 7.5).abs() < 1e-9));
 }
 
-/// pvxs `IOCSource::doPreProcessing` parity (iocsource.cpp:363-375,
-/// invoked from singlesource.cpp:354-356): a QSRV put to a `DISP=1`
+/// pvxs `IOCSource::doPreProcessing` parity (iocsource.cpp:362-375,
+/// invoked from singlesource.cpp:356-359): a QSRV put to a `DISP=1`
 /// record is rejected in *every* process mode, before any write. The
 /// `Force` (process=true) and `Inhibit` (process=false) routes go
 /// through `put_pv`, which does not itself gate DISP, so without the
@@ -271,9 +272,71 @@ async fn dollar_modifier_serves_string_field_as_long_string() {
     }
 }
 
+/// The SECOND channel for a `$` name — the one `BridgeProvider` builds from
+/// its metadata cache through `BridgeChannel::from_cached` — carries the same
+/// view as the first.
+///
+/// The cache is keyed by the full requested name, `$` included, and a name
+/// with no `{json}` suffix takes the cached path, so `REC.VAL$` reaches
+/// `from_cached` on every request after the first. `from_cached` is handed
+/// only `(record, FIELD, nt_type, dbf)`, so it derives the view from
+/// `pv_name` with the same `parse_channel_name` that `new` used rather than
+/// taking it as an argument: a constructor that could be given a field
+/// without its view is a constructor that can build the channel C's
+/// `dbChannelCreate` never would.
+///
+/// Regression guard, not a fails-first witness: for the two eligible C
+/// branches the viewed and unviewed reads currently agree on the value, so
+/// this locks the door choice rather than catching a live divergence.
+#[tokio::test]
+async fn a_cached_dollar_channel_keeps_the_view_of_its_name() {
+    use epics_bridge_rs::qsrv::provider::BridgeProvider;
+
+    let db = Arc::new(PvDatabase::new());
+    db.add_record("TEST:cached", Box::new(StringinRecord::new("seed")))
+        .await
+        .unwrap();
+    let provider = Arc::new(BridgeProvider::new(db.clone()));
+
+    let build = |name: &'static str| {
+        let provider = provider.clone();
+        async move {
+            match provider.create_channel_for(name, "u", "h").await.unwrap() {
+                epics_bridge_rs::qsrv::AnyChannel::Single(c) => c,
+                _ => panic!("expected single-record channel"),
+            }
+        }
+    };
+
+    let first = build("TEST:cached.VAL$").await;
+    let cached = build("TEST:cached.VAL$").await;
+    assert!(
+        matches!(cached.nt_type(), NtType::LongString),
+        "the cached channel advertises the same long-string NT"
+    );
+
+    let of = |r: &PvStructure| match extract_value(r).expect("NTScalar.value") {
+        PvField::Scalar(ScalarValue::String(s)) => s.clone(),
+        other => panic!("expected a string scalar, got {other:?}"),
+    };
+    let a = of(&first.get(&empty_request()).await.expect("first get"));
+    let b = of(&cached.get(&empty_request()).await.expect("cached get"));
+    assert_eq!(a, "seed");
+    assert_eq!(a, b, "the cached channel serves what the fresh one serves");
+
+    // The unviewed channel for the SAME field is a different channel, and
+    // stays one: `TEST:cached.VAL` has no `$`, so nothing about the cached
+    // `$` entry may leak into it.
+    let plain = build("TEST:cached.VAL").await;
+    assert_eq!(
+        of(&plain.get(&empty_request()).await.expect("plain get")),
+        "seed"
+    );
+}
+
 /// `$` on a link field: C views a link (`DBF_INLINK..DBF_FWDLINK`) as a
-/// `PVLINK_STRINGSZ` `DBR_CHAR` array (`dbChannel.c:494-498`), and pvxs
-/// gives link fields the same string-form view (`ioc/channel.cpp:62-74`).
+/// `PVLINK_STRINGSZ` `DBR_CHAR` array (`dbChannel.c:494-499`), and pvxs
+/// gives link fields the same string-form view (`ioc/channel.cpp:69-74`).
 /// `REC.FLNK$` must resolve the link's textual form as a string scalar
 /// rather than rejecting the `$` suffix as an unknown field.
 #[tokio::test]
@@ -480,7 +543,7 @@ async fn channel_filter_suffix_strips_before_resolution() {
 
 /// pvxs wraps every QSRV GET in a `LocalFieldLog` and runs the
 /// field-log chain before serialization (ioc/singlesource.cpp:278-292,
-/// ioc/localfieldlog.cpp:15-24), so an `arr` channel filter reshapes
+/// ioc/localfieldlog.cpp:15-27), so an `arr` channel filter reshapes
 /// the GET read value exactly as it reshapes a monitor event. This
 /// asserts the three-way parity: filtered GET == filtered monitor
 /// event == the arr slice, and that an unfiltered channel on the same
@@ -798,7 +861,7 @@ async fn lsi_long_string_get_put_round_trips_as_string() {
 /// BR-59 parity: a common-field channel (`.DESC`, `.PROC`, `.UTAG`, …)
 /// must advertise its real DBF type in the `getField` descriptor, not
 /// the `double` fallback. pvxs derives the served type from
-/// `dbChannelFinalFieldType(chan)` (singlesource.cpp:189-205), which
+/// `dbChannelFinalFieldType(chan)` (singlesource.cpp:189-206), which
 /// covers `dbCommon` fields. Because the descriptor type and the GET
 /// value both come from the field's resolved value, they must agree —
 /// the prior `field_list` + `Double` fallback produced `double value`
@@ -869,7 +932,7 @@ async fn common_field_descriptor_matches_value_type() {
 /// as NTEnum (value.index + value.choices), not forced into NTScalar.
 /// pvxs builds the single-record prototype from
 /// `dbChannelFinalFieldType(chan)`, so DBF_ENUM/MENU/DEVICE fields select
-/// nt::NTEnum regardless of the field name (singlesource.cpp:189-205,
+/// nt::NTEnum regardless of the field name (singlesource.cpp:189-206,
 /// dbAccess.c:88-90). A non-VAL scalar field stays NTScalar (no
 /// over-promotion).
 #[tokio::test]
@@ -1257,7 +1320,7 @@ async fn trapped_single_put_failure_emits_one_after_fail() {
 /// record carries `info(Q:form, "String")` — is served as an
 /// `NTScalar<string>`, not an `NTScalarArray<byte>`.
 ///
-/// pvxs `IOCSource::getChannelValueType` (ioc/iocsource.cpp:634-636):
+/// pvxs `IOCSource::getChannelValueType` (ioc/iocsource.cpp:635-636):
 /// `final_field_type == DBR_CHAR && isArray && format() == "String"` →
 /// `TypeCode::String`; the GET collapses the buffer at the NUL
 /// (`getArrayValue`, :133-137) and a string PUT goes through
@@ -1371,7 +1434,7 @@ async fn r17_31_char_waveform_without_qform_stays_a_byte_array() {
 /// (`iocsource.cpp:451-458`) and the single source skips post-processing
 /// for links entirely (`singlesource.cpp:374-383`); a blocking put lands in
 /// `dbProcessNotify`'s link special case (write + immediate done,
-/// `dbNotify.c:337-353`). The port's Force/Inhibit routes used `put_pv`,
+/// `dbNotify.c:337-354`). The port's Force/Inhibit routes used `put_pv`,
 /// the `dbPut` analogue that now refuses link fields (S_db_badDbrtype,
 /// `dbAccess.c:1340`) — a link-field put must re-route, not refuse.
 #[tokio::test]

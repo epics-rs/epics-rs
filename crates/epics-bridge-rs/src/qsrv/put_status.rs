@@ -3,20 +3,20 @@
 //!
 //! pvxs rejects a put by throwing a bare `std::runtime_error` whose `what()`
 //! the server forwards verbatim as the remote error message
-//! (`groupsource.cpp:648-660`, `singlesource.cpp` `onPut` catch). The texts
+//! (`groupsource.cpp:656-667`, `singlesource.cpp` `onPut` catch). The texts
 //! are a fixed contract:
 //!
 //! - `"Unable to put value: Modifications not allowed: S_db_noMod"` —
 //!   `iocsource.cpp:366` (`special == SPC_ATTRIBUTE`)
 //! - `"Unable to put value: Field Disabled: S_db_putDisabled"` —
-//!   `iocsource.cpp:368` (`precord->disp`)
+//!   `iocsource.cpp:367-368` (`precord->disp`)
 //! - `"Put not permitted"` — `iocsource.cpp:385` (`!securityClient.canWrite()`)
 //! - `"Links not supported for put"` — `groupsource.cpp:605`
 //! - `"No fields changed"` — `groupsource.cpp:658`
 //!
 //! None of them carries record/group/member identity, a user/host, or a
 //! source citation: pvxs keeps that detail in `log_debug_printf`
-//! (`groupsource.cpp:663-664`). Every QSRV put-rejection message is built
+//! (`groupsource.cpp:662-663`). Every QSRV put-rejection message is built
 //! here so no call site can put its own text — including an internal
 //! `pvxs <file>:<line>` citation — on the wire.
 
@@ -37,7 +37,7 @@ pub(crate) const UNABLE_NO_MOD: &str = "Unable to put value: Modifications not a
 pub(crate) const UNABLE_PUT_DISABLED: &str =
     "Unable to put value: Field Disabled: S_db_putDisabled";
 
-/// `IOCSource::doPreProcessing` (`iocsource.cpp:363-374`), which pvxs runs on
+/// `IOCSource::doPreProcessing` (`iocsource.cpp:362-375`), which pvxs runs on
 /// every QSRV put — single record (`singlesource.cpp:356`) and each group
 /// member (`groupsource.cpp:601`) — before the write-ACF check.
 ///
@@ -79,7 +79,7 @@ pub(crate) fn links_not_supported(detail: &str) -> BridgeError {
     BridgeError::PutRejected(LINKS_NOT_SUPPORTED.to_string())
 }
 
-/// `groupsource.cpp:657-659` — `!didSomething && value.isMarked(true, true)`.
+/// `groupsource.cpp:656-659` — `!didSomething && value.isMarked(true, true)`.
 pub(crate) fn no_fields_changed(detail: &str) -> BridgeError {
     tracing::debug!("QSRV PUT rejected: {NO_FIELDS_CHANGED} ({detail})");
     BridgeError::PutRejected(NO_FIELDS_CHANGED.to_string())
@@ -87,7 +87,7 @@ pub(crate) fn no_fields_changed(detail: &str) -> BridgeError {
 
 /// The `Status.message` a failed QSRV operation puts on the wire.
 ///
-/// pvxs forwards the thrown `e.what()` verbatim (`groupsource.cpp:668`,
+/// pvxs forwards the thrown `e.what()` verbatim (`groupsource.cpp:666`,
 /// `singlesource.cpp` `onPut` catch → `putOperation->error(e.what())`), so a
 /// rejection message must reach the client exactly as authored above — the
 /// `Display` prefix `BridgeError` puts on its variants (`"put rejected: …"`)

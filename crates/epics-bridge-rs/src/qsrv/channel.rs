@@ -2,7 +2,8 @@
 //!
 //! Corresponds to C++ QSRV's `PDBSinglePV` / `PDBSingleChannel`.
 
-// RTEMS-EXEC-MODEL-ALLOW(11): checked - these run and pass in the feature-ON suite.
+// RTEMS-EXEC-MODEL-ALLOW(13): checked - these run and pass in the exec-backend
+// suite.
 
 use std::sync::Arc;
 
@@ -11,6 +12,7 @@ use epics_base_rs::types::{DbFieldType, DbfLinkClass, EpicsValue};
 use epics_pva_rs::pvdata::{FieldDesc, PvField, PvStructure, convert};
 use epics_pva_rs::server_native::source::RemoteLog;
 
+use super::group_config::GroupMember;
 use super::monitor::BridgeMonitor;
 use super::provider::Channel;
 use super::pvif::{
@@ -39,7 +41,7 @@ pub use epics_pva_rs::server_native::source::{PutOptions, dbe_mask_from_pv_reque
 /// falls back to the group's default atomicity.
 ///
 /// pvxs resolves group atomicity with `pvRequest["record._options.atomic"]
-/// .as(atomic)` on both PUT and GET (`groupsource.cpp:203,480`), i.e.
+/// .as(atomic)` on both PUT and GET (`groupsource.cpp:204,481`), i.e.
 /// `Value::as(bool&)`. Route through the shared
 /// [`epics_pva_rs::pvdata::convert::as_bool`] owner so the coercion is
 /// identical to `record._options.block` / `process` — and to the native
@@ -67,7 +69,7 @@ pub fn atomic_from_pv_request(request: &PvStructure) -> Option<bool> {
 // BridgeChannel
 // ---------------------------------------------------------------------------
 
-/// `dbChannelCreate(name)` admission test (C `dbChannel.c:440-530`) for a
+/// `dbChannelCreate(name)` admission test (C `dbChannel.c:448-532`) for a
 /// QSRV channel name: does `name` name a field of a record in `db`, and — if
 /// it carries the `$` modifier — is that field `$`-eligible?
 ///
@@ -81,53 +83,38 @@ pub fn atomic_from_pv_request(request: &PvStructure) -> Option<bool> {
 /// Returns the pvxs error text on refusal so the caller can reproduce
 /// `createGroups`' `"%s: Error Group not created: %s\n"` line verbatim.
 ///
-/// DEVIATION (Tier 2), stated where it is made: the group value/put/monitor
-/// paths bind `member.channel` field-by-name and have no `$` char-array view,
-/// so a `$` member this port admitted would connect and then answer
-/// `FieldNotFound` to every operation — the very state pvxs's refusal exists
-/// to prevent. Until the group path grows the view, a `$` `+channel` is
-/// refused with a named reason rather than half-served. pvxs would create the
-/// `DBF_STRING` case (it serves the raw `int8_t[]`); it refuses the ineligible
-/// case exactly as we do, with the same `Invalid PV:` text.
+/// A `{json}` / `[range]` filter suffix is honoured: [`MemberChannel`] binds
+/// the member's two chains once, so the only thing this gate has to answer is
+/// whether the suffix parsed — the same question `dbChannelCreate` answers at
+/// `dbChannel.c:513-529`, and the same failure pvxs turns into a dropped
+/// group. It reads [`MemberChannel::filter_error`] rather than re-parsing, so
+/// the chain a served member holds is the chain this gate judged.
 ///
-/// DEVIATION (Tier 2), same shape and same reason: a `+channel` carrying a
-/// `{json}` / `[range]` channel filter is refused too. Every group path
-/// binds `member.channel` by record and field and has nowhere to hang a
-/// per-member [`FilterChain`](epics_base_rs::server::database::filters::FilterChain)
-/// — the single-record path keeps its two chains on `BridgeChannel`, which a
-/// member does not get — so an admitted filtered member would resolve to no
-/// record at all and answer every operation with an error. pvxs runs
-/// `dbChannelCreate` per member channel and honours the suffix
-/// (`ioc/channel.cpp:29-38`).
-pub(super) async fn resolve_db_channel(db: &PvDatabase, name: &str) -> Result<(), String> {
-    let cn = epics_base_rs::server::database::filters::parse_channel_name(name);
-    let (record_name, field, string_view) = (&cn.record, &cn.field, cn.string_view);
-    if cn.json_suffix.is_some() {
-        return Err(format!(
-            "channel filter is not supported in a group: {name}"
-        ));
+/// The `$` modifier is honoured, not refused. `dbChannelCreate` re-views a
+/// `DBF_STRING` or link field as a `DBR_CHAR` array and returns
+/// `S_dbLib_fieldNotFound` for every other field type
+/// (`dbChannel.c:486-505`), and the group path reaches that view through the
+/// same `IOCSource::get` the single-record path does: `groupsource.cpp:344,377`
+/// and `singlesource.cpp:59,289` call one function, whose long-string branch
+/// is `iocsource.cpp:133-136` (which leaf types reach that branch, and where
+/// this port deviates, is [`pvif::nt_type_for_channel`]). So the two surfaces
+/// are asked one question here
+/// — [`epics_base_rs::server::record::RecordInstance::channel_field_value`],
+/// which resolves through the member's own view — and an ineligible `$` fails
+/// it with the same `Invalid PV:` text pvxs prints.
+pub(super) async fn resolve_db_channel(
+    db: &PvDatabase,
+    member: &MemberChannel,
+) -> Result<(), String> {
+    let name = member.def.channel.as_str();
+    if let Some(e) = &member.filter_error {
+        return Err(format!("Invalid PV: {name}: {e}"));
     }
-    let Some(rec) = db.get_record(record_name) else {
+    let Some(rec) = db.get_record(&member.record) else {
         return Err(format!("Invalid PV: {name}"));
     };
     let instance = rec.read();
-    if string_view {
-        // `$` is `S_dbLib_fieldNotFound` on anything but a `DBF_STRING` or
-        // link field (`dbChannel.c:486-505`), which aborts channel creation.
-        // `resolve_string_view_field` is the base's owner of that eligibility
-        // rule — the same one `BridgeChannel::new` consults — so a `$` on a
-        // `DBF_CHAR` waveform is refused here (verbatim pvxs text) instead of
-        // reaching the introspection builder as an unresolvable field it
-        // renders as a fabricated `double` leaf.
-        return if instance.resolve_string_view_field(field).is_none() {
-            Err(format!("Invalid PV: {name}"))
-        } else {
-            Err(format!(
-                "long-string '$' channel is not supported in a group: {name}"
-            ))
-        };
-    }
-    if instance.resolve_field(field).is_some() {
+    if member.value_in(&instance).is_some() {
         Ok(())
     } else {
         Err(format!("Invalid PV: {name}"))
@@ -144,22 +131,210 @@ pub(super) async fn resolve_db_channel(db: &PvDatabase, name: &str) -> Result<()
 /// throws for `DBF_INLINK..=DBF_OUTLINK` on the type-build path
 /// (`iocsource.cpp:626-630`), while `groupsource.cpp:603-604` tests
 /// `DBF_INLINK..=DBF_FWDLINK` on the put path.
-pub(super) fn channel_link_class(db: &PvDatabase, name: &str) -> Option<DbfLinkClass> {
-    let cn = epics_base_rs::server::database::filters::parse_channel_name(name);
+pub(super) fn channel_link_class(db: &PvDatabase, member: &MemberChannel) -> Option<DbfLinkClass> {
     // The record type resolves the two direction-ambiguous families
     // (`SIOL`, `LNK*`); an unresolvable record still classifies the
     // unambiguous ones by name.
-    let record_type: &'static str = match db.get_record(&cn.record) {
+    let record_type: &'static str = match db.get_record(&member.record) {
         Some(rec) => rec.read().record.record_type(),
         None => "",
     };
-    epics_base_rs::types::dbf_link_class(record_type, &cn.field)
+    epics_base_rs::types::dbf_link_class(record_type, &member.field)
+}
+
+// ---------------------------------------------------------------------------
+// MemberChannel
+// ---------------------------------------------------------------------------
+
+/// One group member's resolved channel pair — this port's `Field::value` and
+/// `Field::properties`.
+///
+/// pvxs binds a member's two `dbChannel`s ONCE, in `Field::Field`
+/// (`ioc/field.cpp:23-26`: `value = Channel(def.channel); properties =
+/// Channel(def.channel);`), and that `Field` lives in a `Group` owned by the
+/// process-global `IOCGroupConfig::groupMap` (`ioc/group.h:39-53`, with
+/// `Group(const Group&) = delete`). A group member's channel state is
+/// therefore IOC-wide and shared by every client of the group — unlike the
+/// single-record path, where `dbChannelCreate` runs per client channel.
+/// [`GroupPvDef::channels`](super::group_config::GroupPvDef::channels) holds
+/// these behind one `Arc`, so cloning a def per downstream channel shares
+/// them the way pvxs's `Group&` does.
+///
+/// Binding once is also what gives a member somewhere to keep a
+/// [`FilterChain`](epics_base_rs::server::database::filters::FilterChain).
+/// A `{"dbnd":…}` chain carries a per-instance baseline; re-parsed per
+/// operation it would reset that baseline on every call and never filter
+/// anything, which is why the group paths could not honour a filtered
+/// `+channel` while they re-derived `(record, field)` from the raw string.
+pub struct MemberChannel {
+    /// The config member this resolves. Group code reads mapping, triggers
+    /// and `+putorder` through here, so a resolved channel and the
+    /// definition it came from cannot be held apart.
+    pub def: GroupMember,
+    /// Record name from the member's `+channel`, filter suffix and `$`
+    /// modifier already peeled (`dbChannel.c:448-532`). Empty for a
+    /// channel-less (Structure / Const) member.
+    pub record: String,
+    /// Uppercased field name from the same split.
+    pub field: String,
+    /// `record[.FIELD]` with the `{json}` suffix and the `$` modifier
+    /// peeled (`ChannelName::record_path`) — the name a database lookup
+    /// takes. The raw `+channel` must never reach `parse_pv_name`, which
+    /// does not peel and would take the suffix for part of the field name;
+    /// binding the peeled form here is what lets the member subscription
+    /// address `REC.VAL` while its chain carries the `{"dbnd":…}`.
+    pub pv_name: String,
+    /// The `+channel` asked for the `$` long-string view.
+    pub string_view: bool,
+    /// The value channel's filter chain — pvxs's `Field::value` filters.
+    pub value_filters: Arc<epics_base_rs::server::database::filters::FilterChain>,
+    /// The PROPERTY channel's chain: an INDEPENDENT parse of the same
+    /// suffix, because pvxs calls `Channel(def.channel)` twice and
+    /// `dbChannelCreate` re-runs the filter constructors per channel
+    /// (`dbChannel.c:471`). Filter state is per channel, so the value and
+    /// property subscriptions must not share one `dbnd` baseline.
+    pub property_filters: Arc<epics_base_rs::server::database::filters::FilterChain>,
+    /// Why the `{json}` suffix would not parse into a chain, when it would
+    /// not. `dbChannelCreate` fails on an unparseable filter
+    /// (`dbChannel.c:513-529`) and pvxs drops the WHOLE group
+    /// (`groupconfigprocessor.cpp:429-444`); binding is infallible here, so
+    /// the failure is recorded on the object and
+    /// `resolve_db_channel` — the creation gate — reads it. Nothing else
+    /// re-parses the suffix, so the chain a served member actually holds and
+    /// the chain the gate judged are the same parse.
+    pub filter_error: Option<String>,
+}
+
+impl MemberChannel {
+    /// Bind `def.channel`. A channel-less member (Structure / Const, and a
+    /// `proc` member without a `+channel`) binds nothing — pvxs guards the
+    /// whole block on `if(!def.channel.empty())` (`ioc/field.cpp:23`).
+    pub fn new(def: GroupMember) -> Self {
+        use epics_base_rs::server::database::filters as f;
+        if def.channel.is_empty() {
+            return Self {
+                def,
+                record: String::new(),
+                field: String::new(),
+                pv_name: String::new(),
+                string_view: false,
+                value_filters: Arc::new(f::FilterChain::new()),
+                property_filters: Arc::new(f::FilterChain::new()),
+                filter_error: None,
+            };
+        }
+        let cn = f::parse_channel_name(&def.channel);
+        // Two parses, not one clone: see `property_filters`.
+        let mut filter_error = None;
+        let (value_filters, property_filters) = match cn.json_suffix.as_deref() {
+            Some(json) => {
+                let mut parse = || match f::try_parse_filter_chain(json) {
+                    Ok(chain) => chain,
+                    Err(e) => {
+                        filter_error.get_or_insert_with(|| e.to_string());
+                        f::FilterChain::new()
+                    }
+                };
+                (Arc::new(parse()), Arc::new(parse()))
+            }
+            None => (
+                Arc::new(f::FilterChain::new()),
+                Arc::new(f::FilterChain::new()),
+            ),
+        };
+        Self {
+            def,
+            record: cn.record,
+            field: cn.field,
+            pv_name: cn.record_path,
+            string_view: cn.string_view,
+            value_filters,
+            property_filters,
+            filter_error,
+        }
+    }
+
+    /// True iff this member binds a backing `dbChannel` at all.
+    pub fn has_channel(&self) -> bool {
+        !self.def.channel.is_empty()
+    }
+
+    /// `(record, FIELD)` as the group paths need them.
+    pub fn names(&self) -> (&str, &str) {
+        (self.record.as_str(), self.field.as_str())
+    }
+
+    /// The value this member's channel serves, read through the `$` view it
+    /// was bound with — [`epics_base_rs::server::record::RecordInstance::
+    /// channel_field_value`] with this member's `string_view`.
+    ///
+    /// Every group path that needs a member's value goes through here rather
+    /// than resolving [`Self::names`]'s field itself: the bare name has lost
+    /// the view by then, and a path that re-resolves it serves the unviewed
+    /// value under a descriptor built from the viewed one.
+    pub fn value_in(
+        &self,
+        instance: &epics_base_rs::server::record::RecordInstance,
+    ) -> Option<epics_base_rs::types::EpicsValue> {
+        instance.channel_field_value(&self.field, self.string_view)
+    }
+
+    /// [`Self::value_in`] with the field's full metadata attached — the
+    /// snapshot the `+type:"scalar"` and `+type:"meta"` mappings serve.
+    ///
+    /// `backing` is the caller's, not this member's: a link-backed member
+    /// answers its units/precision from the LINK TARGET's record, which has
+    /// to be resolved before any member read guard is taken, so the two read
+    /// paths resolve it themselves (`read_group`'s `member_backings` for the
+    /// atomic one, `read_member` for the non-atomic one) and hand it down.
+    /// This method owns only the `$` view; it carries `backing` through
+    /// untouched.
+    pub fn snapshot_in(
+        &self,
+        instance: &epics_base_rs::server::record::RecordInstance,
+        backing: epics_base_rs::server::database::LinkBacking<'_>,
+    ) -> Option<epics_base_rs::server::snapshot::Snapshot> {
+        instance.channel_snapshot_for_field(&self.field, self.string_view, backing)
+    }
+
+    /// The NT this member serves — the port's `getChannelValueType` asked
+    /// with this member's view, so a `$` member is the same long string on
+    /// the group surface as on the single-record one.
+    pub(super) fn nt_type_in(
+        &self,
+        instance: &epics_base_rs::server::record::RecordInstance,
+        resolved: Option<&epics_base_rs::types::EpicsValue>,
+    ) -> NtType {
+        pvif::nt_type_for_channel(instance, &self.field, resolved, self.string_view)
+    }
+
+    /// `dbIsValueField(dbChannelFldDes(chan))` for this member — the fact
+    /// `IOCSource::initialize` gates `display.form.index` on
+    /// (`iocsource.cpp:54`). Answered off the bound field, so a
+    /// `REC.VAL{"dbnd":…}` member is VAL and a `REC.RVAL` one is not.
+    pub fn is_value_field(&self) -> bool {
+        epics_base_rs::server::database::is_value_field(&self.field)
+    }
+}
+
+impl std::fmt::Debug for MemberChannel {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MemberChannel")
+            .field("def", &self.def)
+            .field("record", &self.record)
+            .field("field", &self.field)
+            .field("pv_name", &self.pv_name)
+            .field("string_view", &self.string_view)
+            .field("value_filters", &self.value_filters.len())
+            .field("property_filters", &self.property_filters.len())
+            .finish()
+    }
 }
 
 /// `dbIsValueField(dbChannelFldDes(chan))` for a QSRV channel name (single
 /// channel) or a group member's `+channel` — the fact QSRV's
 /// `IOCSource::initialize` gates `display.form.index` on
-/// (`iocsource.cpp:53`). Peels the filter suffix and `$` modifier first, so
+/// (`iocsource.cpp:54`). Peels the filter suffix and `$` modifier first, so
 /// `REC.VAL{"dbnd":…}` and `REC` are VAL while `REC.RVAL` is not.
 pub(super) fn channel_is_value_field(name: &str) -> bool {
     let cn = epics_base_rs::server::database::filters::parse_channel_name(name);
@@ -183,6 +358,12 @@ pub struct BridgeChannel {
     record_name: String,
     /// Uppercased field name. Defaults to `"VAL"`.
     field: String,
+    /// The `$` char-array re-view this channel was created with
+    /// (`dbChannel.c:486-505`). Derived from [`Self::pv_name`] by BOTH
+    /// constructors rather than passed in, so it can never disagree with the
+    /// name the client asked for — and so no construction path can produce a
+    /// channel that has a field but has lost its view.
+    string_view: bool,
     nt_type: NtType,
     /// The DBF type of the bound field (not always VAL).
     value_dbf: DbFieldType,
@@ -192,7 +373,7 @@ pub struct BridgeChannel {
     /// carries no suffix. pvxs attaches the chain to the `dbChannel`, so
     /// it governs BOTH the monitor subscription AND one-shot GET reads:
     /// GET wraps the read in a `LocalFieldLog` and runs the pre/post
-    /// chain (`ioc/singlesource.cpp:278-292`, `localfieldlog.cpp:15-24`).
+    /// chain (`ioc/singlesource.cpp:278-292`, `localfieldlog.cpp:15-27`).
     /// The monitor path installs the chain on its subscription; the GET
     /// path applies it in read context via
     /// [`FilterChain::apply_to_read_value`](epics_base_rs::server::database::filters::FilterChain::apply_to_read_value). PUT writes the raw value
@@ -223,6 +404,8 @@ impl BridgeChannel {
         value_dbf: DbFieldType,
     ) -> Self {
         Self {
+            string_view: epics_base_rs::server::database::filters::parse_channel_name(&pv_name)
+                .string_view,
             db,
             pv_name,
             record_name,
@@ -261,7 +444,7 @@ impl BridgeChannel {
         let parsed = epics_base_rs::server::database::filters::parse_channel_name(name);
         // A syntactically-present filter suffix that cannot be parsed
         // into the requested chain aborts channel creation, mirroring
-        // EPICS `dbChannelCreate()` (`dbChannel.c:512-529`). Fail-open
+        // EPICS `dbChannelCreate()` (`dbChannel.c:513-529`). Fail-open
         // to an unfiltered monitor would silently drop the requested
         // throttling/slicing semantics.
         // Parse the suffix into TWO independent chains: one for the value
@@ -289,9 +472,9 @@ impl BridgeChannel {
         };
         // EPICS `$` long-string field modifier (C `dbChannel.c:486-505`):
         // a trailing `$` re-views a `DBF_STRING` or link field as a
-        // `DBR_CHAR` character array, which pvxs serves as the
-        // `form = "String"` long-string `NTScalar`
-        // (`ioc/iocsource.cpp:133-136`, `ioc/channel.cpp:62-74`). The `$`
+        // `DBR_CHAR` character array, which this port serves as the
+        // `form = "String"` long-string `NTScalar` — pvxs only for the link
+        // half, see [`pvif::nt_type_for_channel`]. The `$`
         // is innermost in the channel name (`REC.FIELD$[range]{json}`) and
         // `split_channel_name` has already peeled `{json}` and `[range]`,
         // so the modifier is the final character of the record path. It is
@@ -308,63 +491,46 @@ impl BridgeChannel {
             .ok_or_else(|| BridgeError::RecordNotFound(record_name.to_string()))?;
 
         let instance = rec.read();
-        // Resolve the bound field's actual value once (record field →
-        // common field → virtual field). This is the single source of
-        // truth for both the served DBF type and (below) the NT shape,
-        // so the advertised descriptor cannot drift from the value the
-        // GET path will serialize.
-        let (value, nt_type) = if string_view {
-            // The `$` modifier is valid only on a `DBF_STRING` or link
-            // field; every other field type is `S_dbLib_fieldNotFound` and
-            // aborts channel creation, matching `dbChannelCreate`
-            // (`dbChannel.c:500-503`). An eligible field is served as the
-            // long-string string view — the same `form = "String"`
-            // `NTScalar` as an `lsi`/`lso`/`printf` long-string field —
-            // because pvxs collapses the `DBR_CHAR` `$` view to a
-            // NUL-terminated `pvString` (`ioc/iocsource.cpp:133-136`), so
-            // the `$` view reuses the existing string-view path rather than
-            // a parallel byte array that would diverge from the wire.
-            let v = instance
-                .resolve_string_view_field(&field_upper)
-                .ok_or_else(|| BridgeError::FieldNotFound {
-                    record: record_name.to_string(),
-                    field: format!("{field_upper}$"),
-                })?;
-            (v, NtType::LongString)
-        } else {
-            // `client_field_value`, not `resolve_field`: the value projected
-            // onto the field's DECLARED type, which is what every delivery
-            // path serves. Reading the DBF off the raw stored variant is what
-            // advertised `.PROC` (`DBF_UCHAR`) as a signed byte and a
-            // `DBF_MENU` field as a short.
-            //
-            // `None` means the record does not have the field at all — the
-            // projection is infallible, so this is exactly `resolve_field`
-            // returning `None` — and C aborts channel creation there
-            // (`dbChannelCreate` → `S_dbLib_fieldNotFound`,
-            // `dbChannel.c:456-462`; pvxs renders it `Invalid PV:`,
-            // `ioc/channel.cpp:29-38`). Falling through used to fabricate an
-            // NTScalar double prototype the client would connect to and then
-            // fail every operation against (pvxs#193, server half).
-            let value = instance.client_field_value(&field_upper).ok_or_else(|| {
-                BridgeError::FieldNotFound {
-                    record: record_name.to_string(),
-                    field: field_upper.clone(),
-                }
+        // One resolution for both views. `RecordInstance::channel_field_value`
+        // is the owner of "what does a channel bound to (field, `$`) serve":
+        // without `$` it is `client_field_value`, the value projected onto the
+        // field's DECLARED type, which is what every delivery path serves
+        // (reading the DBF off the raw stored variant is what advertised
+        // `.PROC` (`DBF_UCHAR`) as a signed byte and a `DBF_MENU` field as a
+        // short); with `$` it is the char-array re-view, which this port
+        // serves as the string it collapses to, the way pvxs collapses a
+        // `TypeCode::String` leaf over a `DBR_CHAR` buffer
+        // (`ioc/iocsource.cpp:133-136`) rather than shipping a parallel byte
+        // array. Which channels get that leaf — and where pvxs and this port
+        // part company over `$` — is [`pvif::nt_type_for_channel`].
+        //
+        // `None` means `dbChannelCreate` would have returned NULL — the
+        // record has no such field, or `$` was applied to a field that cannot
+        // be re-viewed (`dbChannel.c:460-462,486-505`; pvxs renders it
+        // `Invalid PV:`, `ioc/channel.cpp:29-38`). Falling through used to
+        // fabricate an NTScalar double prototype the client would connect to
+        // and then fail every operation against (pvxs#193, server half).
+        let value = instance
+            .channel_field_value(&field_upper, string_view)
+            .ok_or_else(|| BridgeError::FieldNotFound {
+                record: record_name.to_string(),
+                field: if string_view {
+                    format!("{field_upper}$")
+                } else {
+                    field_upper.clone()
+                },
             })?;
-            // `pvif::nt_type_for_channel` is the single owner of the NT
-            // choice (the port's `getChannelValueType`): a record-declared
-            // long-string field (`lsi`/`lso` VAL/OVAL, `printf` VAL) AND a
-            // `DBF_CHAR` array VAL carrying `info(Q:form, "String")` — the
-            // QSRV long-string idiom — both resolve to the scalar-string
-            // NTScalar, not the byte array the `DBF_CHAR` type alone would
-            // select.
-            let nt_type = pvif::nt_type_for_channel(&instance, &field_upper, Some(&value));
-            (value, nt_type)
-        };
+        // `pvif::nt_type_for_channel` is the single owner of the NT choice
+        // (the port's `getChannelValueType`): the `$` view, a record-declared
+        // long-string field (`lsi`/`lso` VAL/OVAL, `printf` VAL) and a
+        // `DBF_CHAR` array VAL carrying `info(Q:form, "String")` — the QSRV
+        // long-string idiom — all resolve to the scalar-string NTScalar. It
+        // is asked with `string_view` rather than branched around, so the
+        // group path cannot reach a different answer for the same channel.
+        let nt_type = pvif::nt_type_for_channel(&instance, &field_upper, Some(&value), string_view);
 
         // DBF type for the bound field. pvxs serves the type from
-        // `dbChannelFinalFieldType(chan)` (singlesource.cpp:189-205,
+        // `dbChannelFinalFieldType(chan)` (singlesource.cpp:189-206,
         // dbChannel.h:452) — the channel's final field type after lookup,
         // which covers `dbCommon` fields, not only record-specific ones.
         //
@@ -382,6 +548,7 @@ impl BridgeChannel {
             pv_name: name.to_string(),
             record_name: record_name.to_string(),
             field: field_upper,
+            string_view,
             nt_type,
             value_dbf,
             channel_filters,
@@ -413,7 +580,7 @@ impl BridgeChannel {
     /// PUT with caller-supplied options.
     ///
     /// pvxs reads `record._options.process` and `record._options.block`
-    /// from the INIT pvRequest (`iocsource.cpp:429`), not from the
+    /// from the INIT pvRequest (`iocsource.cpp:430`), not from the
     /// data-phase value. The wire layer captures the INIT pvRequest
     /// and forwards it via [`epics_pva_rs::server_native::source::
     /// ChannelContext::pv_request`]; the bridge converts it to
@@ -425,9 +592,9 @@ impl BridgeChannel {
         value: &PvStructure,
         opts: PutOptions,
     ) -> BridgeResult<()> {
-        // C `IOCSource::doPreProcessing` (iocsource.cpp:363-375), which
+        // C `IOCSource::doPreProcessing` (iocsource.cpp:362-375), which
         // pvxs runs on every QSRV put in every process mode
-        // (singlesource.cpp:354-356) BEFORE the write-ACF check: reject a
+        // (singlesource.cpp:356-359) BEFORE the write-ACF check: reject a
         // put to a DISP-disabled record (except the DISP field) or a
         // read-only field. The `Passive` route enforces this inside
         // `put_record_field_from_ca`, but the `Force`/`Inhibit` routes go
@@ -516,7 +683,7 @@ impl BridgeChannel {
         // bound field, but Force *also* triggers an explicit
         // full record-processing cycle afterwards. pvxs's
         // `doPostProcessing(forceProcessing==True)` calls
-        // `dbProcess(precord)` (iocsource.cpp:397-417), the full
+        // `dbProcess(precord)` (iocsource.cpp:397-421), the full
         // record-processing entry that runs record support, OUT
         // links, and FLNK side effects — not a value-only local
         // notification. The Rust analogue is `process_record_with_links`
@@ -581,36 +748,46 @@ impl Channel for BridgeChannel {
             .get_record(&self.record_name)
             .ok_or_else(|| BridgeError::RecordNotFound(self.record_name.clone()))?;
 
-        let instance = rec.read();
-        let mut snapshot =
-            instance
-                .snapshot_for_field(&self.field)
-                .ok_or_else(|| BridgeError::FieldNotFound {
-                    record: self.record_name.clone(),
-                    field: self.field.clone(),
-                })?;
+        // Through the database, which resolves a link-backed field's metadata
+        // from the LINK TARGET's record — a second lock this holds none of —
+        // and which is asked with this channel's `$` view, not its bare field
+        // name. Reading the bare field here was the second door: `new` decided
+        // the view, used it for `nt_type`, and dropped it, so the GET served
+        // the unviewed value under a descriptor built from the viewed one.
+        let mut snapshot = self
+            .db
+            .channel_snapshot_for_field(&rec, &self.field, self.string_view)
+            .ok_or_else(|| BridgeError::FieldNotFound {
+                record: self.record_name.clone(),
+                field: self.field.clone(),
+            })?;
 
         // Apply the channel-filter chain in READ context. pvxs wraps
         // every QSRV GET in a `LocalFieldLog` and runs the field-log
         // pre/post chain before serialization (ioc/singlesource.cpp:
-        // 278-292, ioc/localfieldlog.cpp:15-24); a GET on a filtered
+        // 278-292, ioc/localfieldlog.cpp:15-27); a GET on a filtered
         // channel must return the same transformed value as the monitor,
         // not the raw record snapshot. `arr` slicing and `ts` tagging
-        // transform the value; the stream-only filters (`dbnd`/`dec`/
-        // `sync`) short-circuit in read context. A chain that drops the
-        // read yields no value — surface the error rather than serving
-        // the unfiltered snapshot (matching the C `if(pLog)` no-frame
-        // contract that `apply_to_event_value` also honors).
+        // transform the value.
+        //
+        // A chain that DROPS the read yields the unfiltered value, not an
+        // error. `db_create_read_log` builds the log through
+        // `db_create_field_log`'s `freeListCalloc` and sets only `ctx`
+        // (`dbEvent.c:760-770`, `:702`), so `mask` is zero: `dbnd`'s
+        // `send = pfl->mask & ~(DBE_VALUE|DBE_LOG)` starts at 0 and
+        // `recGblCheckDeadband`'s zero `add_mask` can never raise it
+        // (`filters/dbnd.c:83-88`), so the log is deleted and the chain
+        // returns NULL. `LocalFieldLog` keeps that NULL
+        // (`localfieldlog.cpp:15-27`) and `IOCSource::get` hands it to
+        // `dbChannelGet` (`iocsource.cpp:79`), which reads the LIVE record
+        // when `pfl` is null (`dbAccess.c:924-930`). So a `{"dbnd":…}`
+        // channel answers every GET; only its event stream is gated.
         if !self.channel_filters.is_empty() {
+            let raw = snapshot.value.clone();
             snapshot.value = self
                 .channel_filters
                 .apply_to_read_value(snapshot.value)
-                .ok_or_else(|| {
-                    BridgeError::ChannelFilterError(format!(
-                        "filter chain dropped the read value for {}",
-                        self.pv_name
-                    ))
-                })?;
+                .unwrap_or(raw);
         }
 
         let full = snapshot_to_pv_structure(&snapshot, self.nt_type);
@@ -786,8 +963,41 @@ mod tests {
         assert!(matches!(res, Err(BridgeError::ChannelFilterError(_))));
     }
 
+    /// A value-gating filter never fails a GET.
+    ///
+    /// `dbnd` deletes the read log (its `send` starts at zero for a
+    /// zero-mask read log and `recGblCheckDeadband`'s zero `add_mask`
+    /// cannot raise it, `filters/dbnd.c:83-88`), and the resulting NULL
+    /// makes `dbChannelGet` read the live record (`dbAccess.c:924-930`,
+    /// via `localfieldlog.cpp:15-27` and `iocsource.cpp:79`). The port
+    /// answered `ChannelFilterError` instead, so every GET after the
+    /// first on a `{"dbnd":…}` channel failed where pvxs serves the
+    /// current value.
+    #[tokio::test]
+    async fn a_deadband_filter_never_fails_a_get() {
+        let db = db_with_rec().await;
+        let ch = BridgeChannel::new(db.clone(), r#"REC.VAL{"dbnd":{"d":10.0}}"#)
+            .await
+            .expect("a dbnd channel is created");
+        let request = PvStructure::new("");
+
+        let value_of = |pv: &PvStructure| match pv.get_field("value") {
+            Some(PvField::Scalar(epics_pva_rs::pvdata::ScalarValue::Double(v))) => *v,
+            other => panic!("value must be a double, got {other:?}"),
+        };
+
+        // The first GET moves the deadband baseline to the current value;
+        // the second sits inside the band and the chain drops it.
+        assert_eq!(value_of(&ch.get(&request).await.expect("first GET")), 1.0);
+        assert_eq!(
+            value_of(&ch.get(&request).await.expect("second GET must not fail")),
+            1.0,
+            "a dropped read serves the live record value"
+        );
+    }
+
     /// Malformed JSON aborts channel creation rather than failing open
-    /// to an unfiltered monitor (`dbChannel.c:512-529`).
+    /// to an unfiltered monitor (`dbChannel.c:513-529`).
     #[tokio::test]
     async fn channel_filter_rejects_malformed_json() {
         let db = db_with_rec().await;
@@ -817,7 +1027,7 @@ mod tests {
 
     /// pvxs#193, server half: a field the record does not declare aborts
     /// channel creation (C `dbChannelCreate` → `S_dbLib_fieldNotFound`,
-    /// `dbChannel.c:456-462`) instead of fabricating an NTScalar double
+    /// `dbChannel.c:457-462`) instead of fabricating an NTScalar double
     /// prototype the client connects to and then fails every GET against.
     #[tokio::test]
     async fn a_field_the_record_does_not_have_refuses_the_channel() {
@@ -1023,9 +1233,10 @@ mod tests {
     /// `Status.message` via `OpError::failed`). pvxs throws
     /// `"Unable to put value: Field Disabled: S_db_putDisabled"` /
     /// `"…: Modifications not allowed: S_db_noMod"` (iocsource.cpp:366-368)
-    /// and `"Put not permitted"` (:385) — no record name, no user/host, no
-    /// source citation. Boundary: SPC_ATTRIBUTE is tested *before* `disp` in
-    /// C, so a read-only field on a DISP=1 record reports noMod.
+    /// and `"Put not permitted"` (iocsource.cpp:385) — no record name, no
+    /// user/host, no source citation. Boundary: SPC_ATTRIBUTE is tested
+    /// *before* `disp` in C, so a read-only field on a DISP=1 record reports
+    /// noMod.
     #[tokio::test]
     async fn put_rejection_messages_are_pvxs_contract_text() {
         use crate::qsrv::provider::{AccessContext, AccessControl};
@@ -1087,31 +1298,94 @@ mod tests {
         );
     }
 
-    /// A group `+channel` carrying a channel filter is refused at group
-    /// build, not admitted and then dead.
-    ///
-    /// The group paths bind `member.channel` by record and field; a filtered
-    /// member name resolves to no record there, so admitting it produced a
-    /// group whose member answered every operation with an error. Refusing it
-    /// with a named reason is the same Tier-2 deviation the `$` member takes,
-    /// for the same missing machinery.
+    fn member(channel: &str) -> MemberChannel {
+        MemberChannel::new(GroupMember {
+            field_name: "f".into(),
+            channel: channel.into(),
+            mapping: crate::qsrv::FieldMapping::Scalar,
+            triggers: super::super::group_config::TriggerDef::SelfOnly,
+            put_order: None,
+            struct_id: None,
+            const_value: None,
+        })
+    }
+
+    /// A group `+channel` carrying a *parseable* channel filter is now
+    /// admitted: [`MemberChannel`] binds the member's two chains once, so
+    /// there is somewhere for the filter state to live, and the creation
+    /// gate has nothing left to refuse. pvxs runs `dbChannelCreate` per
+    /// member channel and honours the suffix (`ioc/channel.cpp:29-38`).
     #[tokio::test]
-    async fn a_filtered_group_member_channel_is_refused() {
+    async fn a_filtered_group_member_channel_is_admitted() {
         use epics_base_rs::server::records::ai::AiRecord;
         let db = PvDatabase::new();
         db.add_record("GRP:AI", Box::new(AiRecord::new(0.0)))
             .await
             .unwrap();
 
-        let err = resolve_db_channel(&db, r#"GRP:AI{"arr":{"s":0}}"#)
+        let m = member(r#"GRP:AI{"arr":{"s":0}}"#);
+        assert_eq!(m.names(), ("GRP:AI", "VAL"), "the suffix is peeled first");
+        assert_eq!(m.value_filters.len(), 1);
+        assert_eq!(m.property_filters.len(), 1);
+        resolve_db_channel(&db, &m)
             .await
-            .expect_err("a filtered member must not be admitted");
-        assert!(
-            err.contains("channel filter is not supported in a group"),
-            "the refusal must name the reason, got {err:?}"
-        );
-        resolve_db_channel(&db, "GRP:AI")
+            .expect("a parseable filter suffix is admitted");
+        resolve_db_channel(&db, &member("GRP:AI"))
             .await
             .expect("the unfiltered member still resolves");
+    }
+
+    /// An UNPARSEABLE suffix still drops the group — `dbChannelCreate`
+    /// fails (`dbChannel.c:513-529`) and pvxs's `createGroups` catches the
+    /// throw (`groupconfigprocessor.cpp:429-444`). The gate reads the parse
+    /// the member already performed, so it cannot disagree with the chain
+    /// the member would serve.
+    #[tokio::test]
+    async fn an_unparseable_group_member_filter_drops_the_group() {
+        use epics_base_rs::server::records::ai::AiRecord;
+        let db = PvDatabase::new();
+        db.add_record("GRP:AI", Box::new(AiRecord::new(0.0)))
+            .await
+            .unwrap();
+
+        let m = member(r#"GRP:AI{"nosuchfilter":{}}"#);
+        assert!(m.filter_error.is_some(), "the bad suffix is recorded");
+        assert!(m.value_filters.is_empty(), "and no chain is served");
+        let err = resolve_db_channel(&db, &m)
+            .await
+            .expect_err("an unparseable filter must not be admitted");
+        assert!(err.starts_with("Invalid PV: "), "got {err:?}");
+    }
+
+    /// The member split is `dbChannelCreate`'s order — suffix first, then
+    /// the last `.` (`dbChannel.c:448-532`). A bare `rsplit_once('.')`
+    /// tears the JSON apart at its own decimal point, which is what the
+    /// twelve former call sites would have done once the refusal lifted.
+    #[test]
+    fn member_channel_peels_the_suffix_before_splitting() {
+        assert_eq!(
+            member(r#"REC.VAL{"dbnd":{"d":0.5}}"#).names(),
+            ("REC", "VAL")
+        );
+        assert_eq!(member("REC.VAL[1:3]").names(), ("REC", "VAL"));
+        assert_eq!(member("REC.VAL$").names(), ("REC", "VAL"));
+        assert!(member("REC.VAL$").string_view);
+        // the ordinary cases the old split already got right
+        assert_eq!(member("REC.egu").names(), ("REC", "EGU"));
+        assert_eq!(member("REC").names(), ("REC", "VAL"));
+    }
+
+    /// The two chains are independent parses, not one shared instance:
+    /// pvxs calls `Channel(def.channel)` twice (`ioc/field.cpp:23-26`) and
+    /// `dbChannelCreate` re-runs the filter constructors per channel
+    /// (`dbChannel.c:471`), so a `dbnd` baseline moved by a value event
+    /// must not move the property stream's.
+    #[test]
+    fn the_two_member_chains_do_not_share_state() {
+        let m = member(r#"REC.VAL{"dbnd":{"d":10.0}}"#);
+        assert!(
+            !std::sync::Arc::ptr_eq(&m.value_filters, &m.property_filters),
+            "the value and property chains must be separate instances"
+        );
     }
 }

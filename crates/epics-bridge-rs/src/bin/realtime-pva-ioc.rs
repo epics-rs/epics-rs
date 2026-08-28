@@ -28,9 +28,9 @@
 //! `Q:group` PVs means mounting QSRV, QSRV lives in `epics-bridge-rs`, and
 //! `epics-bridge-rs` already depends on `epics-pva-rs` — so the mount cannot
 //! be made from the other side without a cyclic package dependency, which
-//! cargo rejects outright (measured; doc/qsrv-rtems-design.md §9.7). The
-//! binary moved down-graph to the crate that can see every source it
-//! composes. That is also the C layering: QSRV sits above pvxs and base.
+//! cargo rejects outright (measured). The binary moved down-graph to the
+//! crate that can see every source it composes. That is also the C layering:
+//! QSRV sits above pvxs and base.
 //!
 //! It is still exactly **one** target PVA IOC, which is the point — one copy
 //! of the source-text guards at the bottom of this file, one `STATUS_PREFIX`,
@@ -85,12 +85,19 @@
 //! `EPICS_PVA_SERVER_PORT` > 5075 for TCP; `EPICS_PVAS_BROADCAST_PORT` >
 //! `EPICS_PVA_BROADCAST_PORT` > 5076 for the search port).
 //!
-//! Command-line arguments are this target's st.cmd, because it has no iocsh:
-//! an argument ending in `.json` is a `dbLoadGroup` group-definition file,
-//! anything else is a `.db` record file. Both are applied in order (the
-//! `dbLoadRecords` / `dbLoadGroup` equivalents). With no arguments a small
-//! built-in database is loaded, so the binary is runnable standalone on a bare
-//! target. Records carrying `info(Q:group, ...)` need no `.json` at all — that
+//! Command-line arguments are this target's st.cmd, because it has no iocsh: a
+//! `NAME=VALUE` argument is `epicsEnvSet`, an argument ending in `.json` is a
+//! `dbLoadGroup` group-definition file, anything else is a `.db` record file.
+//! The files are applied in order (the `dbLoadRecords` / `dbLoadGroup`
+//! equivalents), and every assignment is applied before the first file is read
+//! so the environment above is complete before any of it is consumed — see
+//! [`epics_rtems_boot::boot_args`], which owns
+//! that rule for both target IOCs. With no arguments a small built-in database
+//! is loaded, so the binary is runnable standalone on a bare target.
+//!
+//! On the RTEMS target the line comes from `EPICS_RTEMS_CMDLINE` at build time
+//! or the DHCP option `rtems_cmdline` at boot, whichever the board got last;
+//! `csrc/rtems_init.c` splits it into argv. Records carrying `info(Q:group, ...)` need no `.json` at all — that
 //! source is read straight off the database.
 //!
 //! QSRV2 answers to `PVXS_QSRV_ENABLE` / `EPICS_IOC_IGNORE_SERVERS=qsrv2` here
@@ -110,23 +117,19 @@
 //! it stays compiled and linted in the default test set, but refuses to run
 //! rather than silently starting the runtime it exists to avoid.
 //!
-//! The predicate is `any(target_os = "rtems", target_os = "vxworks", feature
-//! = "rtems-exec-model")`, the same one `realtime-ca-ioc` carries. It was
-//! narrowed to `target_os = "rtems"` alone for one stage — `epics-bridge-rs`
-//! did not yet declare `rtems-exec-model`, and naming a feature the crate
-//! does not have is a dangling predicate: `unexpected_cfg` warnings and an
-//! arm no configuration can select. Stage 4 declared the feature *with* the
+//! The predicate is `exec_backend`, the same one `realtime-ca-ioc` carries. It
+//! was narrowed to `target_os = "rtems"` alone for one stage — `epics-bridge-rs`
+//! had no `build.rs` deriving the backend cfg yet, and naming a cfg nothing
+//! emits is a dangling predicate: `unexpected_cfg` warnings and an arm no
+//! configuration can select. Stage 4 added the derivation *with* the
 //! `rtems-exec-gate` census it owes (§6.3) rather than dodging the bill by
-//! adding the name alone, so the `any(...)` form is back and the body below
-//! is host-compiled, host-linted and host-tested under `--features
-//! rtems-exec-model`. `target_os = "vxworks"` is bin-side plumbing only — the
-//! `exec_backend` cfg `epics-base-rs/build.rs` derives for the
-//! `runtime::task` seam still gates on `target_os = "rtems"` or the feature,
-//! so a VxWorks build also needs one of those until its own `exec_backend`
-//! predicate lands.
+//! adding the name alone, so the body below is host-compiled, host-linted and
+//! host-tested under `EPICS_RS_BUILD_EXEC_BACKEND=thread`. `target_os =
+//! "vxworks"` is bin-side plumbing only — `epics_embedded_target`, which is
+//! what makes `exec_backend` unconditional on the embedded triples, covers it.
 //!
 //! Coverage today, in full: `scripts/rtems-check.sh` compiles it for the
-//! target in both configurations; the host feature-ON selection compiles it
+//! target in both configurations; the host exec-backend selection compiles it
 //! and runs the `mod ioc` unit tests; the source-text guards at the bottom of
 //! the file are outside `mod ioc` and run in every host test pass, featured or
 //! not.
@@ -139,17 +142,12 @@ use std::process::ExitCode;
 /// host selection can check for real — with no feature flag, so a typo inside
 /// the `info(Q:group, …)` bodies below cannot reach a reader as a silent "no
 /// such PV" on a serial console with no shell to ask, even in a test pass that
-/// never selects `rtems-exec-model`.
+/// never selects the exec backend.
 /// The `test` arm of the predicate is what lets the guard at the bottom of
-/// this file parse it and build the group for real; the `rtems` and
-/// `rtems-exec-model` arms are the production use. On a host non-test build
-/// with the feature off it is compiled away, so it is never dead code.
-#[cfg(any(
-    target_os = "rtems",
-    target_os = "vxworks",
-    feature = "rtems-exec-model",
-    test
-))]
+/// this file parse it and build the group for real; the `exec_backend` arm is
+/// the production use. On a host non-test build with the hosted backend it is
+/// compiled away, so it is never dead code.
+#[cfg(any(exec_backend, test))]
 mod demo_db {
     /// The database loaded when no `.db` file is given on the command line —
     /// small enough to run on a bare target, wide enough to exercise the
@@ -183,17 +181,16 @@ mod demo_db {
         "}\n",
     );
 
-    /// STAGE-5 PROBE (doc/pvalink-rtems-design.md §5 stage 5, topology A),
-    /// loaded on top of [`DEMO_DB`] only under the `bringup-probes` feature
-    /// (`doc/calink-rtems-design.md` §11.7 item 3's family: measurement rig,
-    /// not IOC content — and the records below are the *only* link-bearing
-    /// records in the built-in set, so a default build is also link-free).
+    /// STAGE-5 PROBE (topology A), loaded on top of [`DEMO_DB`] only under
+    /// the `bringup-probes` feature (measurement rig, not IOC content — and
+    /// the records below are the *only* link-bearing records in the built-in
+    /// set, so a default build is also link-free).
     ///
     /// The records the stage-5 gate is about: two INP links with `CP` (the
     /// monitor path) and one OUT link (the put path), all naming PVs served
     /// by the host-side upstream IOC. They are compiled in rather than in a
     /// `.db` file because a `-kernel` boot has no filesystem to name one on
-    /// and `rtems_init.c:195` hands `main` a fixed one-element argv.
+    /// and `csrc/rtems_init.c:331` hands `main` a fixed one-element argv.
     #[cfg(feature = "bringup-probes")]
     pub const STAGE5_PROBE_DB: &str = concat!(
         //
@@ -222,17 +219,16 @@ mod demo_db {
         "}\n",
     );
 
-    /// QSRV LOAD PROBE (`doc/qsrv-rtems-design.md` §8 items 2 and 5): the
-    /// 20-member group whose monitor spawns the ~40 forwarder tasks the
-    /// spawn-count asymmetry is about (`group.rs:2496`, `:2532`; C runs ONE
-    /// `qsrvGroup` pump thread, `ioc/groupsource.cpp:96`).
+    /// QSRV LOAD PROBE: the 20-member group whose monitor spawns the ~40
+    /// forwarder tasks the spawn-count asymmetry is about (`group.rs:2496`,
+    /// `:2532`; C runs ONE `qsrvGroup` pump thread,
+    /// `ioc/groupsource.cpp:96`).
     ///
     /// Every member drives itself: `SCAN ".1 second"` + `CALC "VAL+1"`, the
     /// standard counter idiom (`VAL` is `FETCH_VAL`, calcPerform.c:73-74).
     /// Periodic scan is record *processing*, so monitors post on the same
     /// path a production IOC uses — deliberately NOT a probe thread calling
-    /// `put_pv`, which posts no monitor event at all (the §11.7-item-2
-    /// defect `doc/calink-rtems-design.md` records; the C6 tick had to be
+    /// `put_pv`, which posts no monitor event at all (the C6 tick had to be
     /// read by polling because of it). No load-driver code exists on the
     /// guest: the members always self-count, and the *load* is switched
     /// from the host side by opening and closing a MONITOR on the group —
@@ -271,11 +267,7 @@ mod demo_db {
     }
 }
 
-#[cfg(any(
-    target_os = "rtems",
-    target_os = "vxworks",
-    feature = "rtems-exec-model"
-))]
+#[cfg(exec_backend)]
 mod ioc {
     use std::collections::HashMap;
     use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
@@ -342,10 +334,26 @@ mod ioc {
     /// Load the database: every record-file argument is a `.db` file path
     /// (loaded in order, C `dbLoadRecords`), or the built-in demo database
     /// when there are none.
+    ///
+    /// Which of the two it was is printed, and that is the point of the print
+    /// rather than a courtesy. A boot whose database argument never arrived —
+    /// a DHCP command line the shim refused as oversized, a token past
+    /// `EPICS_RTEMS_MAX_BOOT_ARGS`, a path spelled so it parsed as an
+    /// assignment — serves the demo PVs instead of the site's, and from
+    /// outside that is indistinguishable from a healthy IOC serving the wrong
+    /// records. The console is this target's only report, so the substitution
+    /// has to name itself there. A named file that fails to load is already an
+    /// error and stays one: falling back to the demo database on a load
+    /// failure would be the same defect with a louder cause.
     fn load_database(db_files: &[String]) -> CaResult<Arc<PvDatabase>> {
         let macros = HashMap::new();
         let mut builder = IocBuilder::new();
         if db_files.is_empty() {
+            println!(
+                "realtime-pva-ioc: no database named on the boot command line; \
+                 loading the BUILT-IN DEMO database. A site database is named \
+                 by putting its path on that line."
+            );
             builder = builder.db_string(DEMO_DB, &macros)?;
             // The STAGE-5 and QSRV LOAD probe records ride along whenever the
             // built-in database is the source — a bare `-kernel` boot cannot
@@ -356,6 +364,12 @@ mod ioc {
                 builder = builder.db_string(&crate::demo_db::qsrv_load_probe_db(), &macros)?;
             }
         } else {
+            println!(
+                "realtime-pva-ioc: loading {} database file(s) from the boot \
+                 command line: {}",
+                db_files.len(),
+                db_files.join(" ")
+            );
             for path in db_files {
                 builder = builder.db_file(path, &macros)?;
             }
@@ -436,7 +450,10 @@ mod ioc {
             let bport = config.broadcast_port;
             // No name servers, no extra targets: auto-address broadcast is the
             // only way this engine can reach anything.
+            let reactor = epics_base_rs::runtime::task::Reactor::current()
+                .expect("the exec backend's executor is process-global");
             let engine = SearchEngine::spawn_with_config(
+                &reactor,
                 config,
                 Vec::new(),
                 Vec::new(),
@@ -541,6 +558,28 @@ mod ioc {
         //     absent from the image. Compiles to nothing on a host build.
         epics_rtems_boot::link_anchor();
 
+        // (0-env) The boot command line — this target's st.cmd. Its
+        //     `NAME=VALUE` tokens are `epicsEnvSet`, and they are applied here,
+        //     first, before anything in this image reads the environment:
+        //     `PvaServerConfig::with_env`, the pvalink resolver's one client
+        //     and QSRV2's `PVXS_QSRV_ENABLE` all read theirs once, and a
+        //     variable that arrived after its reader is a variable the site did
+        //     not set.
+        //
+        //     C reaches the same state through iocsh running the startup script
+        //     the BOOTP command line names
+        //     ($EPICS_BASE/modules/libcom/RTEMS/posix/rtems_init.c:103,256,1184
+        //     at R7.0.10); we have no script and no filesystem to hold one, so
+        //     the line itself carries the assignments. `epics-rtems-boot` owns
+        //     the rule so this binary and `realtime-ca-ioc` cannot come to
+        //     disagree about it.
+        //
+        //     SAFETY (edition 2024): the entry thread, before `background_init`
+        //     or any server has started anything, so no concurrent reader or
+        //     writer of the environment exists.
+        let boot_args: Vec<String> =
+            unsafe { epics_rtems_boot::boot_args::apply_boot_env(std::env::args().skip(1)) };
+
         // (0-reg) Announce this thread to the statistics funnel's thread
         //     census. Every other IOC thread does this from
         //     `runtime::task::enter_ioc_thread`, which `main` deliberately does
@@ -554,16 +593,17 @@ mod ioc {
         epics_rtems_boot::stats::register_task();
 
         // (0-probe) STAGE-5 PROBE: the target's `EPICS_PVA_NAME_SERVERS`.
-        // `rtems_init.c:195` hands `main` a fixed one-element argv and
-        // `POSIX_Init` calls `setenv` zero times, so on the target nothing
-        // outside the image can configure it — the value compiled in here is
-        // the one that takes effect. Set before `install_pvalink_resolver`
-        // builds the ONE client, because `PvaClientBuilder`'s default reads
-        // the variable once at construction (`client_native/context.rs:171`).
+        // Set before `install_pvalink_resolver` builds the ONE client, because
+        // `PvaClientBuilder`'s default reads the variable once at construction
+        // (`client_native/context.rs:171`).
         //
-        // A default, not an override: an already-set variable stays as set,
-        // so a host harness (`tests/realtime_pva_ioc_boots.rs`) can point the
-        // dial somewhere it controls instead of the image's SLIRP address.
+        // A default, not an override: an already-set variable stays as set.
+        // That now means the same thing on the target as on a host — step
+        // (0-env) above has already applied the boot command line, so an
+        // `EPICS_PVA_NAME_SERVERS=...` boot argument wins over the value
+        // compiled in here, and a host harness
+        // (`tests/realtime_pva_ioc_boots.rs`) points the dial somewhere it
+        // controls the same way.
         //
         // SAFETY (edition 2024): this runs on the single init thread before
         // `background_init` starts any other thread, so no concurrent
@@ -594,13 +634,23 @@ mod ioc {
         //      take a record gate exists, so the line cannot be read as a
         //      report about a process that already ran without it.
         epics_base_rs::runtime::sync::report_lock_protocol();
+        // The board's epoch is fixed for the life of the boot, so this is the
+        // one moment the message can be acted on. Every stamp served past the
+        // EPICS time stamp's range wraps exactly as C's `epicsTimeFromTime_t`
+        // wraps it; saying so per read would be noise and refusing per read
+        // would take the IOC off the air for a condition it cannot fix.
+        if let Some(why) =
+            epics_base_rs::types::wall_clock_range_warning(std::time::SystemTime::now())
+        {
+            eprintln!("epics-rs: {why}");
+        }
 
         // (1) C `callbackInit` (callback.c:286). Idempotent.
         background_init();
 
-        // (2) The database.
-        let args: Vec<String> = std::env::args().skip(1).collect();
-        let (db_files, group_files) = split_load_args(&args);
+        // (2) The database — every boot argument that was not an
+        //     `epicsEnvSet` is a file to load, split by suffix below.
+        let (db_files, group_files) = split_load_args(&boot_args);
         let db = match load_database(&db_files) {
             Ok(db) => db,
             Err(e) => {
@@ -790,6 +840,8 @@ mod ioc {
         // so is the charge, which is what the other wants: a thread the process
         // account never hears about is memory the worker pool spends twice.
         let srv_tcp = server.clone();
+        let serve_reactor = epics_base_rs::runtime::task::Reactor::current()
+            .expect("the exec backend's executor is process-global");
         let charge = ThreadCharge::fixed(StackSizeClass::Medium);
         let tcp_thread = match thread::Builder::new()
             .name("PVAS-TCP".to_string())
@@ -798,7 +850,7 @@ mod ioc {
             .stack_size(StackSizeClass::Medium.bytes())
             .spawn(move || {
                 let _charge = charge;
-                srv_tcp.serve()
+                srv_tcp.serve(&serve_reactor)
             }) {
             Ok(h) => h,
             Err(e) => {
@@ -1008,33 +1060,27 @@ mod ioc {
     }
 }
 
-#[cfg(any(
-    target_os = "rtems",
-    target_os = "vxworks",
-    feature = "rtems-exec-model"
-))]
+#[cfg(exec_backend)]
 fn main() -> ExitCode {
     ioc::main()
 }
 
-#[cfg(not(any(
-    target_os = "rtems",
-    target_os = "vxworks",
-    feature = "rtems-exec-model"
-)))]
+#[cfg(tokio_backend)]
 fn main() -> ExitCode {
     eprintln!(
         "realtime-pva-ioc: built with the tokio task backend, which this entry point \
          does not start a runtime for.\n\
-         Build it for `armv7-rtems-eabihf` or a VxWorks target, or on a host select \
-         `--features rtems-exec-model`, which routes the `runtime::task` seam to \
-         the same std-thread executor the target uses."
+         Build it for `armv7-rtems-eabihf` or a VxWorks target, or on a host \
+         rebuild with EPICS_RS_BUILD_EXEC_BACKEND=thread, which routes the \
+         `runtime::task` seam to the same std-thread executor the target uses."
     );
     ExitCode::FAILURE
 }
 
 #[cfg(test)]
 mod tests {
+    use source_guard::{Comments, production};
+
     /// The RTEMS constraint for the entry point: it must never construct or
     /// enter a tokio runtime, and must never reach for tokio's async
     /// net/timer/spawn machinery — none of which the RTEMS build can drive.
@@ -1111,10 +1157,7 @@ mod tests {
     #[test]
     fn every_thread_here_is_charged_to_the_process_account() {
         let src = include_str!("realtime-pva-ioc.rs");
-        let prod = match src.find("\n#[cfg(test)]") {
-            Some(i) => &src[..i],
-            None => src,
-        };
+        let prod = production(src, Comments::Keep);
         // Needle assembled with `concat!` so this guard does not match itself
         // in the file it is written in.
         let mut sites = 0usize;
@@ -1158,10 +1201,7 @@ mod tests {
     #[test]
     fn this_entry_point_names_no_scheduling_band() {
         let src = include_str!("realtime-pva-ioc.rs");
-        let prod = match src.find("\n#[cfg(test)]") {
-            Some(i) => &src[..i],
-            None => src,
-        };
+        let prod = production(src, Comments::Keep);
         assert!(
             !prod.contains(concat!("Thread", "Priority")),
             "this file must not name a scheduling band — ask \
@@ -1232,10 +1272,7 @@ mod tests {
     #[test]
     fn the_entry_point_publishes_its_status() {
         let src = include_str!("realtime-pva-ioc.rs");
-        let prod = match src.find("\n#[cfg(test)]") {
-            Some(i) => &src[..i],
-            None => src,
-        };
+        let prod = production(src, Comments::Keep);
         assert!(
             prod.contains(concat!("serve_status_", "pvs(")),
             "the entry point registers no status PVs; on a target with no iocsh \
@@ -1262,10 +1299,7 @@ mod tests {
     #[test]
     fn a_panic_reaches_the_errlog_and_says_what_it_costs() {
         let src = include_str!("realtime-pva-ioc.rs");
-        let prod = match src.find("\n#[cfg(test)]") {
-            Some(i) => &src[..i],
-            None => src,
-        };
+        let prod = production(src, Comments::Keep);
         assert!(
             prod.contains(concat!("install_panic_", "hook()")),
             "this entry point installs no panic hook, so a panicking worker \
@@ -1289,10 +1323,7 @@ mod tests {
     #[test]
     fn the_qsrv2_facilities_are_mounted_through_the_one_gate() {
         let src = include_str!("realtime-pva-ioc.rs");
-        let prod = match src.find("\n    #[cfg(test)]") {
-            Some(i) => &src[..i],
-            None => src,
-        };
+        let prod = production(src, Comments::Keep);
         // `concat!` so these assertions cannot match their own source text.
         assert!(
             prod.contains(concat!("install_", "sources(&db, &composite)")),
@@ -1332,10 +1363,7 @@ mod tests {
     #[test]
     fn the_config_is_built_through_with_env() {
         let src = include_str!("realtime-pva-ioc.rs");
-        let prod = match src.find("\n    #[cfg(test)]") {
-            Some(i) => &src[..i],
-            None => src,
-        };
+        let prod = production(src, Comments::Keep);
         assert!(
             prod.contains(concat!("PvaServerConfig::default().with_", "env()")),
             "the PVA server config must come from `PvaServerConfig::default().with_env()`; \
@@ -1417,8 +1445,7 @@ mod tests {
 
     /// The default binary is IOC content only: no stage-5 link records, no
     /// QSRV load-probe group — and no link fields at all, the same link-free
-    /// default `realtime-ca-ioc` keeps (`doc/calink-rtems-design.md` §11.7
-    /// items 3 and 4).
+    /// default `realtime-ca-ioc` keeps.
     ///
     /// Runs in every host test pass (the probe rig moved to
     /// `STAGE5_PROBE_DB` / `qsrv_load_probe_db`, which only exist under
@@ -1438,7 +1465,7 @@ mod tests {
             "the default database is the three group members and nothing else"
         );
         for rec in &recs {
-            for (field, _) in &rec.fields {
+            for field in rec.fields.iter().map(|f| &f.name) {
                 assert!(
                     !matches!(field.as_str(), "INP" | "OUT" | "FLNK"),
                     "{}.{field} is a link field: the default image must be \
@@ -1458,10 +1485,7 @@ mod tests {
     #[test]
     fn the_probe_dbs_load_only_behind_the_feature() {
         let src = include_str!("realtime-pva-ioc.rs");
-        let prod = match src.find("\n#[cfg(test)]") {
-            Some(i) => &src[..i],
-            None => src,
-        };
+        let prod = production(src, Comments::Keep);
         for needle in [
             concat!("crate::demo_db::STAGE5_PROBE_", "DB, &macros"),
             concat!("crate::demo_db::qsrv_load_probe_", "db(), &macros"),
@@ -1479,8 +1503,7 @@ mod tests {
     }
 
     /// With the feature on, the stage-5 rig is exactly the three link
-    /// records the pvalink gate measured with, in both surviving spellings
-    /// (`doc/pvalink-rtems-design.md` §12.2).
+    /// records the pvalink gate measured with, in both surviving spellings.
     #[cfg(feature = "bringup-probes")]
     #[test]
     fn the_stage5_rig_defines_the_three_link_records() {
@@ -1500,8 +1523,8 @@ mod tests {
         let field = |name: &str, field: &str| {
             recs.iter()
                 .find(|r| r.name == name)
-                .and_then(|r| r.fields.iter().find(|(f, _)| f == field))
-                .map(|(_, v)| v.to_string())
+                .and_then(|r| r.fields.iter().find(|f| f.name == field))
+                .map(|f| f.value.to_string())
         };
         assert_eq!(
             field("RTEMS:PVA:DOWN", "INP").as_deref(),
@@ -1520,10 +1543,9 @@ mod tests {
         );
     }
 
-    /// The QSRV load probe (`doc/qsrv-rtems-design.md` §8 items 2/5) must
-    /// survive the same offline reading as the demo group: a typo in a
-    /// generated fragment would otherwise surface only as a missing PV on a
-    /// serial console with no shell to ask.
+    /// The QSRV load probe must survive the same offline reading as the demo
+    /// group: a typo in a generated fragment would otherwise surface only as
+    /// a missing PV on a serial console with no shell to ask.
     #[cfg(feature = "bringup-probes")]
     #[test]
     fn the_load_probe_defines_the_twenty_member_group() {

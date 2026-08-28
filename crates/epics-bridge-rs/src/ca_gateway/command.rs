@@ -10,10 +10,8 @@
 //!
 //! 1. **Signal handler**: Unix-only. SIGUSR1 reads the command file and
 //!    dispatches commands. Used in production deployments.
-//! 2. **Programmatic**: [`CommandHandler::dispatch`] for direct invocation
+//! 2. **Programmatic**: `CommandHandler::dispatch` for direct invocation
 //!    from tests or REST APIs.
-
-// RTEMS-EXEC-MODEL-ALLOW(8): checked - these run and pass in the feature-ON suite.
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -29,6 +27,7 @@ use super::cache::PvCache;
 use super::pvlist::{PvList, parse_pvlist_file};
 use super::report::{self, PvReportEntry, StatsSnapshot};
 use super::stats::Stats;
+#[cfg(tokio_backend)]
 use super::upstream::UpstreamManager;
 
 /// Commands that can be issued to a running gateway at runtime.
@@ -83,6 +82,7 @@ impl GatewayCommand {
     }
 }
 
+#[cfg(tokio_backend)]
 /// Handles runtime commands against a live gateway.
 pub struct CommandHandler {
     cache: Arc<RwLock<PvCache>>,
@@ -114,6 +114,7 @@ pub struct CommandHandler {
     report_path: Option<PathBuf>,
 }
 
+#[cfg(tokio_backend)]
 impl CommandHandler {
     pub fn new(
         cache: Arc<RwLock<PvCache>>,
@@ -513,6 +514,7 @@ mod tests {
         assert!(GatewayCommand::parse("BOGUS").is_none());
     }
 
+    #[cfg(tokio_backend)]
     #[tokio::test]
     async fn dispatch_version() {
         let cache = Arc::new(RwLock::new(PvCache::new()));
@@ -523,6 +525,7 @@ mod tests {
         assert!(out.contains("ca-gateway-rs"));
     }
 
+    #[cfg(tokio_backend)]
     #[tokio::test]
     async fn dispatch_summary_empty_cache() {
         let cache = Arc::new(RwLock::new(PvCache::new()));
@@ -538,6 +541,7 @@ mod tests {
         assert!(out.contains("total PVs=0 connecting=0 dead=0 disconnect=0 inactive=0 active=0"));
     }
 
+    #[cfg(tokio_backend)]
     /// R1/R2/R3 must APPEND C-compatible report sections to the configured
     /// report file (C report1/report2/report3 open `-report` in append
     /// mode, gateServer.cc:689-979), returning only a status line — not the
@@ -622,6 +626,7 @@ mod tests {
         let _ = std::fs::remove_file(&report_path);
     }
 
+    #[cfg(tokio_backend)]
     /// the `AS` command must reload BOTH the access file and the
     /// pvlist, matching C `gateServer::newAs` →
     /// `gateAs::reInitialize(accessFile, listFile)` (gateAs.cc:678-719).
@@ -678,6 +683,7 @@ mod tests {
         let _ = std::fs::remove_file(&pvl_path);
     }
 
+    #[cfg(tokio_backend)]
     /// a successful `PVL`/`AS` pvlist reload must fire a beacon anomaly so
     /// downstream CA clients re-search and discover newly-admitted PVs
     /// (C gateServer::newAs → generateBeaconAnomaly, gateServer.cc:684-686).
@@ -713,6 +719,7 @@ mod tests {
         let _ = std::fs::remove_file(&pvl_path);
     }
 
+    #[cfg(tokio_backend)]
     /// C `gateCommands` collapses multi-token/comment lines into the four
     /// flags and runs each once (gateServer.cc:458-493). A command file may
     /// put several tokens on one line and end in a trailing `#` comment, but
@@ -751,6 +758,7 @@ mod tests {
         let _ = std::fs::remove_file(&cmd_path);
     }
 
+    #[cfg(tokio_backend)]
     /// C `gateCommands` runs the flags in a FIXED order — `R1`, `R2`, `AS`,
     /// `R3` — independent of token order in the file, with `R3` after `AS`
     /// so the access report reflects the just-reloaded rules
@@ -794,6 +802,7 @@ mod tests {
         let _ = std::fs::remove_file(&cmd_path);
     }
 
+    #[cfg(tokio_backend)]
     /// a reload with no beacon attached (stat-only/test handler) must not
     /// panic — the beacon call is guarded by the `Option`.
     #[tokio::test]

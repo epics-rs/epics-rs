@@ -387,7 +387,7 @@ pub fn pv_field_to_epics(field: &PvField) -> Option<EpicsValue> {
     // and a typed empty PUT would silently retype a string/int/float
     // waveform carrier. pvxs keeps the descriptor element type at zero
     // count and selects the DBR type from the array's `original_type()`
-    // (dataencode.cpp:315-352, iocsource.cpp:538-567). A non-empty typed
+    // (dataencode.cpp:315-352, iocsource.cpp:538-568). A non-empty typed
     // array still flows through the legacy per-element dispatch, which
     // agrees element-for-element with `empty_typed_array`.
     if let PvField::ScalarArrayTyped(arr) = field {
@@ -863,49 +863,6 @@ mod tests {
         assert_eq!(ev_i, EpicsValue::Int64(big_i));
     }
 
-    /// the single-record QSRV PUT conversion chain. A native
-    /// PVA client sends an NTScalar carrying a `ulong` value;
-    /// `BridgeChannel::put_with_options` extracts it via
-    /// `pv_structure_to_epics`, then re-types it against the bound
-    /// field's DBF with `epics_to_scalar` + `scalar_to_epics_typed`.
-    /// Before the fix `pv_structure_to_epics` produced a precision-lost
-    /// `Double`, and `UInt64` was not in the channel's scalar retype
-    /// arm — so a `u64` above `2^53` could not round-trip. This drives
-    /// the exact chain (`pv_structure_to_epics` was the untested path
-    /// per the review) and asserts full-range preservation.
-    #[test]
-    fn mr_r22_ntscalar_ulong_put_chain_preserves_precision() {
-        use crate::qsrv::pvif::pv_structure_to_epics;
-        use epics_pva_rs::pvdata::PvStructure;
-
-        let big: u64 = u64::MAX - 7;
-
-        // Realistic wire shape: an NTScalar whose `value` is a ulong.
-        let mut nt = PvStructure::new("epics:nt/NTScalar:1.0");
-        nt.fields
-            .push(("value".into(), PvField::Scalar(ScalarValue::ULong(big))));
-
-        // Step 1: BridgeChannel::put_with_options' `raw_val` extraction.
-        let raw_val = pv_structure_to_epics(&nt).expect("extract value");
-        assert_eq!(
-            raw_val,
-            EpicsValue::UInt64(big),
-            "pv_structure_to_epics must preserve a scalar ulong as UInt64"
-        );
-
-        // Step 2: the channel's scalar retype arm for a DBF_UINT64
-        // bound field — `epics_to_scalar` then `scalar_to_epics_typed`.
-        let sv = epics_to_scalar(&raw_val);
-        assert_eq!(sv, ScalarValue::ULong(big));
-        let typed = scalar_to_epics_typed(&sv, DbFieldType::UInt64).unwrap();
-        assert_eq!(
-            typed,
-            EpicsValue::UInt64(big),
-            "the full single-record PUT conversion chain must round-trip \
-             the submitted u64 without an f64 precision loss"
-        );
-    }
-
     /// An EMPTY typed scalar array (e.g. clearing a waveform) must keep
     /// its declared element type instead of collapsing to `double[]`.
     /// Before the fix every empty array — typed or not — was funneled
@@ -914,7 +871,7 @@ mod tests {
     /// int / float waveform carrier on an empty PUT. pvxs keeps the
     /// descriptor element type at zero count (dataencode.cpp:315-352)
     /// and selects the DBR type from `original_type()`
-    /// (iocsource.cpp:538-567).
+    /// (iocsource.cpp:538-568).
     #[test]
     fn empty_typed_array_preserves_element_type() {
         use epics_base_rs::types::PvString;

@@ -89,7 +89,8 @@
 //! | `<prefix>postEventCount` | Long | Cumulative monitor posts fanned downstream |
 //! | `<prefix>loopCount` | Long | Cumulative gateway run-loop iterations |
 
-// RTEMS-EXEC-MODEL-ALLOW(10): checked - these run and pass in the feature-ON suite.
+// RTEMS-EXEC-MODEL-ALLOW(10): checked - these run and pass in the exec-backend
+// suite.
 
 use std::collections::HashSet;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -890,14 +891,18 @@ mod tests {
         assert_eq!(stats.loop_count.load(Ordering::Relaxed), 1);
     }
 
+    /// The fourth member of the skip family, keyed the same way as
+    /// [`open_fd_count_tracks_new_descriptors`]: the test process always has
+    /// at least stdin/stdout/stderr open, so once an fd directory reads the
+    /// count is owed and must be plausible.
     #[test]
     fn open_fd_count_is_plausible() {
-        // The test process always has at least stdin/stdout/stderr
-        // open, so on any supported platform the count is non-zero.
-        // On an unsupported platform `None` is acceptable.
-        if let Some(n) = open_fd_count() {
-            assert!(n >= 3, "expected at least 3 open fds, got {n}");
+        if std::fs::read_dir("/proc/self/fd").is_err() && std::fs::read_dir("/dev/fd").is_err() {
+            eprintln!("skipping: no readable fd directory on this platform");
+            return;
         }
+        let n = open_fd_count().expect("an fd directory reads, so open_fd_count must answer");
+        assert!(n >= 3, "expected at least 3 open fds, got {n}");
     }
 
     /// Env var marking "this process is the isolated child `run_isolated`
@@ -941,10 +946,22 @@ mod tests {
         run_isolated(
             "ca_gateway::stats::tests::open_fd_count_tracks_new_descriptors",
             || {
-                let before = match open_fd_count() {
-                    Some(n) => n,
-                    None => return, // unsupported platform — nothing to assert
-                };
+                // Establish the platform fact WITHOUT asking the function
+                // under test. `open_fd_count` answers `None` both for "this
+                // platform has no fd directory" and for "reading it failed",
+                // so a `None`-driven early return let a regression in the
+                // reader report as a pass on Linux, where the directory is
+                // always there. Gate on READING the directory rather than on
+                // its existing, so one that is present but unreadable cannot
+                // pass the probe and then blow up in the `expect` below.
+                if std::fs::read_dir("/proc/self/fd").is_err()
+                    && std::fs::read_dir("/dev/fd").is_err()
+                {
+                    eprintln!("skipping: no readable fd directory on this platform");
+                    return;
+                }
+                let before =
+                    open_fd_count().expect("an fd directory reads, so open_fd_count must answer");
                 // In the isolated child no other thread touches the fd
                 // table, so holding BATCH new files open must raise the
                 // count by the full batch (anything the harness itself
@@ -1144,15 +1161,27 @@ mod tests {
 
     /// `proc_self_cpu_jiffies` reports a monotonically non-decreasing
     /// total of process CPU jiffies on a procfs platform. Two reads
-    /// bracketing a busy loop must not go backwards. On a platform
-    /// without procfs the source is `None` and there is nothing to
-    /// assert (matching the cpuFract leave-at-last fallback).
+    /// bracketing a busy loop must not go backwards.
+    ///
+    /// The skip is keyed on `/proc/self/stat` being unreadable, not on
+    /// `proc_self_cpu_jiffies()` returning `None`: that `None` covers the
+    /// absent-procfs case *and* all four of the parser's own failure modes
+    /// (`rsplit_once(')')`, the field-11 index, the two `parse()`s), so
+    /// skipping on it would turn a broken parser on a procfs machine into
+    /// a silent pass — the regression this test exists to catch. The same
+    /// reasoning keys [`open_fd_count_is_plausible`],
+    /// [`open_fd_count_tracks_new_descriptors`] and
+    /// [`load_average_1min_is_non_negative_on_procfs`]; and when a skip does
+    /// fire it announces itself on stderr, since a silent skip is the defect
+    /// this family exists to prevent.
     #[test]
     fn proc_self_cpu_jiffies_is_monotonic_on_procfs() {
-        let first = match proc_self_cpu_jiffies() {
-            Some(j) => j,
-            None => return, // no procfs on this platform
-        };
+        if std::fs::read_to_string("/proc/self/stat").is_err() {
+            eprintln!("skipping: /proc/self/stat is unreadable, so there is no procfs here");
+            return;
+        }
+        let first = proc_self_cpu_jiffies()
+            .expect("/proc/self/stat reads, so the field walk and parse must succeed");
         // Burn a little CPU so a second read can advance.
         let mut acc: u64 = 0;
         for i in 0..5_000_000u64 {
@@ -1167,16 +1196,23 @@ mod tests {
     }
 
     /// `load_average_1min` returns a non-negative load on a procfs
-    /// platform (the 1-minute field of `/proc/loadavg`), or `None` where
-    /// procfs is absent.
+    /// platform (the 1-minute field of `/proc/loadavg`).
+    ///
+    /// Keyed on the file reading for the same reason as
+    /// [`proc_self_cpu_jiffies_is_monotonic_on_procfs`]: the old
+    /// `if let Some(load)` asserted nothing at all when the parse failed,
+    /// which is the one outcome worth failing on.
     #[test]
     fn load_average_1min_is_non_negative_on_procfs() {
-        if let Some(load) = load_average_1min() {
-            assert!(
-                load >= 0.0,
-                "1-minute load average must be >= 0.0, got {load}"
-            );
+        if std::fs::read_to_string("/proc/loadavg").is_err() {
+            eprintln!("skipping: /proc/loadavg is unreadable, so there is no procfs here");
+            return;
         }
+        let load = load_average_1min().expect("/proc/loadavg reads, so the first field must parse");
+        assert!(
+            load >= 0.0,
+            "1-minute load average must be >= 0.0, got {load}"
+        );
     }
 
     /// `vctotal` must count only cache entries with an attached

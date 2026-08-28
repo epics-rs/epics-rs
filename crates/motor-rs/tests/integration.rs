@@ -664,7 +664,7 @@ async fn init_does_not_reseed_controller_when_nothing_restored() {
     );
 }
 
-/// C init_record 716-718 ("Reset limits in case database values are
+/// C init_record 717-718 ("Reset limits in case database values are
 /// invalid"): both dial limits are forwarded to the driver at init,
 /// after the initial readback.
 #[tokio::test]

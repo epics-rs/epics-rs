@@ -97,11 +97,11 @@ impl MotorRecord {
                 });
                 return effects;
             }
-            // C enter_do_work (1462-1483) re-evaluates LVIO on every
+            // C enter_do_work (1463-1484) re-evaluates LVIO on every
             // process pass; for an in-flight motion the poll is the pass
             // where RBV changes. A rising violation outside SET mode
             // stops the axis and releases the buttons in the same pass
-            // (1476-1482 sets stop=1, the do_work top block consumes it).
+            // (1475-1484 sets stop=1, the do_work top block consumes it).
             if self.recompute_lvio_during_motion() {
                 self.stop_axis(&mut effects);
                 return effects;
@@ -127,7 +127,7 @@ impl MotorRecord {
             // Only an explicit queued request (internal.queued_motion) is
             // replayed — an active jog/home that a plain STOP just halted
             // is NOT (the stop path replaces MIP wholesale and clears the
-            // buttons, C motorRecord.cc:1893/1903). The queue parked MIP
+            // buttons, C motorRecord.cc:1893/1905). The queue parked MIP
             // as JOGF/JOGR|STOP or HOMF/HOMR|STOP (2028/2111), so dropping
             // STOP leaves the direction bit — like C postProcess re-firing
             // a home with `mip &= ~MIP_STOP` (866) — and the resumed
@@ -139,7 +139,7 @@ impl MotorRecord {
             // landed in the button state must not resurrect it here.
             // Fall through to the plain pp stop instead. A queued home
             // re-fires regardless of its button, like C postProcess
-            // (855-890 keys on MIP alone).
+            // (856-891 keys on MIP alone).
             if let Some(QueuedMotion::Jog { forward }) = self.internal.queued_motion {
                 let held = if forward {
                     self.ctrl.jogf
@@ -155,8 +155,8 @@ impl MotorRecord {
                 self.stat.mip.remove(MipFlags::STOP);
                 // C: the queued request armed pp=TRUE (2025/2110), so this
                 // stop completion runs postProcess first — VAL/DVAL/RVAL
-                // sync to the rest position (826-849) — and only then
-                // re-fires the request (858-890). A target written while
+                // sync to the rest position (827-849) — and only then
+                // re-fires the request (859-890). A target written while
                 // the stop was in flight is dropped here, like C's replay
                 // gate refusing `mip & MIP_STOP` (1385). The re-fired
                 // motion starts with pp armed again (887, 2125), so a
@@ -185,7 +185,7 @@ impl MotorRecord {
                     QueuedMotion::Jog { forward } => {
                         self.set_phase(MotionPhase::Jog);
                         // C replays through the same do_work jog section
-                        // (2118-2143), re-deriving both the commanded
+                        // (2117-2144), re-deriving both the commanded
                         // direction and CDIR — route through the single
                         // jog-emission owner.
                         self.emit_jog(forward, &mut effects);
@@ -194,10 +194,10 @@ impl MotorRecord {
                 effects.request_poll = true;
                 return effects;
             }
-            // Plain stop. C discriminates by pp (motorRecord.cc:1383-1402):
+            // Plain stop. C discriminates by pp (motorRecord.cc:1382-1402):
             // a commanded stop (or interrupted jog/home/backlash, all of
             // which armed pp) runs postProcess — VAL/DVAL/RVAL <- readback
-            // and MIP_STOP cleared (826-849, 1027-1032) — so maybeRetry
+            // and MIP_STOP cleared (827-849, 1027-1032) — so maybeRetry
             // never runs (mip == MIP_DONE at its 1432 gate).
             let pp = std::mem::take(&mut self.internal.pp);
             if pp {
@@ -207,19 +207,15 @@ impl MotorRecord {
             }
             // A Pause never set pp: postProcess is skipped, mip stays
             // MIP_STOP, and maybeRetry (1040-1100) runs against the
-            // preserved target. A limit switch in the commanded direction
-            // blocks the retry (1048).
+            // preserved target — unless a limit switch in the commanded
+            // direction ended the coast, which C makes terminal ahead of
+            // both the pp test and maybeRetry (1367-1380), so the pause is
+            // not resumable and the drive fields adopt the limit readback.
             let diff = (self.pos.dval - self.pos.drbv).abs();
-            let same_polarity = (self.conv.dir == MotorDir::Pos) == (self.conv.mres >= 0.0);
-            let user_cdir = if same_polarity {
-                self.stat.cdir
-            } else {
-                !self.stat.cdir
-            };
-            let ls_blocks = (self.limits.hls && user_cdir) || (self.limits.lls && !user_cdir);
+            let ls_blocks = self.sync_if_limit_stopped();
             if diff >= self.retry.rdbd && !ls_blocks && self.retry.rtry != 0 {
                 if self.retry.rcnt >= self.retry.rtry {
-                    // C 1060-1075: too many retries — give up, MISS
+                    // C 1059-1074: too many retries — give up, MISS
                     // latches, the lasts adopt the unreached target
                     // (finalize_motion's lval/ldvl sync matches 1067-1069).
                     // The give-up pass still counts (`++rcnt > rtry`).
@@ -254,9 +250,10 @@ impl MotorRecord {
                 }
             } else {
                 // Close enough, RTRY disabled, or LS blocked: C maybeRetry
-                // else-branch (1084-1102) — collapse to DONE without any
-                // sync (the lasts already equal the reached target from
-                // the dispatch-time load). MISS clears and SPMG restores
+                // else-branch (1084-1102) — collapse to DONE. Only the LS
+                // arm syncs, and `sync_if_limit_stopped` has already done
+                // it; on the other two the lasts already equal the reached
+                // target from the dispatch-time load. MISS clears and SPMG restores
                 // Move->Pause only on the close-enough/LS path
                 // (1087-1101); the rtry==0 path leaves both. DLY arms
                 // only on a real completion edge (C 1457 needs a fresh
@@ -372,7 +369,7 @@ impl MotorRecord {
                 // truncate the delay on the first poll tick.
             }
             MotionPhase::Idle => {
-                // C process (1404-1409, postProcess 851-852): the
+                // C process (1405-1409, postProcess 851-852): the
                 // GET_INFO callback after a LOAD_POS collapses MIP_LOAD_P
                 // to MIP_DONE and DMOV returns TRUE — no DLY, no retry
                 // evaluation, no drive-triplet resync (load_pos synced
@@ -391,11 +388,11 @@ impl MotorRecord {
                     self.stat.mip = MipFlags::empty();
                     self.stat.dmov = true;
                 }
-                // C process (1396-1402): a done status callback with pp
+                // C process (1382-1402): a done status callback with pp
                 // armed and no motion runs postProcess, whose first
                 // block re-syncs the drive values from the readback
-                // (826-849). The SET-mode resolution re-anchor
-                // (do_work 1980-1986: pp = TRUE + GET_INFO) completes
+                // (827-849). The SET-mode resolution re-anchor
+                // (do_work 1981-1987: pp = TRUE + GET_INFO) completes
                 // here, re-deriving VAL/DVAL/RVAL at the new
                 // resolution.
                 if self.internal.pp && self.stat.msta.contains(MstaFlags::DONE) && !self.stat.movn {
@@ -419,7 +416,7 @@ impl MotorRecord {
                     self.postprocess_sync();
                     self.finalize_motion(&mut effects);
                 }
-                // C do_work gate (motorRecord.cc:1486-1492): a
+                // C do_work gate (motorRecord.cc:1487-1492): a
                 // done-record callback falls into do_work through the
                 // dmov arm, where the home/jog/tweak sections act on
                 // latched button state. The idle poll is the
@@ -527,7 +524,7 @@ impl MotorRecord {
         }
     }
 
-    /// C maybeRetry close-enough restore (motorRecord.cc:1096-1101): a
+    /// C maybeRetry close-enough restore (motorRecord.cc:1097-1101): a
     /// motion initiated by the SPMG "Move" one-shot reverts to Pause
     /// when the target is reached. Only that maybeRetry branch
     /// restores — the give-up/MISS branch leaves SPMG=Move (C keeps the
@@ -545,7 +542,7 @@ impl MotorRecord {
         }
     }
 
-    /// C overtaken-target replay (motorRecord.cc:1383-1397): at a motion
+    /// C overtaken-target replay (motorRecord.cc:1384-1399): at a motion
     /// completion, `val != lval` means a position was written mid-motion
     /// on a path that could not dispatch it (jog in flight, home in
     /// flight, jog backlash — handle_retarget ignores those). C collapses
@@ -566,7 +563,7 @@ impl MotorRecord {
         true
     }
 
-    /// C enter_do_work LVIO re-evaluation (motorRecord.cc:1462-1483).
+    /// C enter_do_work LVIO re-evaluation (motorRecord.cc:1463-1483).
     /// Disabled limits (DHLM == DLLM == 0) clear it; an active jog checks
     /// the live readback against the soft limits widened by one second of
     /// jog travel (RBV > HLM - JVEL / RBV < LLM + JVEL) or an inverted
@@ -646,6 +643,51 @@ impl MotorRecord {
         }
     }
 
+    /// C "Do another update after LS error" (motorRecord.cc:1367-1380) —
+    /// the single owner of the limit-switch completion, predicate and
+    /// consequence together. Returns whether a struck limit switch in the
+    /// commanded direction terminated this move, having already applied the
+    /// drive-field sync that termination implies.
+    ///
+    /// C tests the limit BEFORE the `pp` test (1382) and the retry gate
+    /// (1405) and then `goto process_exit`, so `maybeRetry` never runs on
+    /// that pass: an axis that ends on a limit in the commanded direction is
+    /// a TERMINAL limit completion whatever `pp` was, forced to `pp = TRUE`
+    /// with a GET_INFO and `mip = MIP_DONE` (1376-1377). The next callback's
+    /// `postProcess` (827-849) adopts the limit readback into VAL/DVAL/RVAL
+    /// and zeroes DIFF/RDIF; the Rust poll already carries that readback
+    /// (`process_motor_info` ran this cycle), so the sync applies directly.
+    ///
+    /// C compares raw `rhls`/`rlls` against raw `cdir`; the user-frame pair
+    /// is the same condition, since `process_motor_info` (3733-3734) maps
+    /// `hls`/`lls` from `rhls`/`rlls` under the same DIR/MRES polarity flip
+    /// applied to `cdir` here.
+    ///
+    /// Both completion paths that can retry — the inline MIP_STOP (Pause)
+    /// branch and [`Self::evaluate_position_error`] — decide through this
+    /// one call, so no path can suppress the retry on a limit without also
+    /// performing the sync. Holding the two apart is what left the Pause
+    /// branch advertising a target the axis never reached after the
+    /// positional branch was fixed.
+    ///
+    /// Scope is the LS-stop ALONE: a plain MOVE_ABS never sets C `pp` (the
+    /// dispatch sites at 1983/2025/2110/2125 are SET-mode, HOME and JOG, not
+    /// positional moves), so a close-enough or rtry-disabled completion is
+    /// still not synced. Do not extend the sync to those branches.
+    fn sync_if_limit_stopped(&mut self) -> bool {
+        let same_polarity = (self.conv.dir == MotorDir::Pos) == (self.conv.mres >= 0.0);
+        let user_cdir = if same_polarity {
+            self.stat.cdir
+        } else {
+            !self.stat.cdir
+        };
+        let ls_stopped = (self.limits.hls && user_cdir) || (self.limits.lls && !user_cdir);
+        if ls_stopped {
+            self.postprocess_sync();
+        }
+        ls_stopped
+    }
+
     /// The C `maybeRetry` port (motorRecord.cc:1042-1104) — the single
     /// post-settle completion evaluation, reached either directly (DLY
     /// <= 0) via [`Self::settle_then_evaluate`] or from the DELAY_ACK
@@ -657,14 +699,7 @@ impl MotorRecord {
 
         let diff = (self.pos.dval - self.pos.drbv).abs();
 
-        // C: compute user_cdir for retry direction check with mapped limit switches
-        let same_polarity = (self.conv.dir == MotorDir::Pos) == (self.conv.mres >= 0.0);
-        let user_cdir = if same_polarity {
-            self.stat.cdir
-        } else {
-            !self.stat.cdir
-        };
-        let ls_blocks_retry = (self.limits.hls && user_cdir) || (self.limits.lls && !user_cdir);
+        let ls_blocks_retry = self.sync_if_limit_stopped();
 
         // C `maybeRetry` (motorRecord.cc:1049): the retry comparison is
         // `fabs(pmr->diff) >= pmr->rdbd` — inclusive of the boundary.
@@ -716,7 +751,7 @@ impl MotorRecord {
 
             // C maybeRetry 1077-1082 only arms the retry (mip = MIP_RETRY,
             // dmov = FALSE); the next do_work pass re-enters the FULL move
-            // block — entry via !dmov (2240), dispatch gate via MIP_RETRY
+            // block — entry via !dmov (2241), dispatch gate via MIP_RETRY
             // (2455) — so RMOD scaling with its one-step floors, the
             // retry-deadband too_small suppression, LVIO, and the
             // three-case backlash dispatch all re-run for the retry.
@@ -734,22 +769,6 @@ impl MotorRecord {
             if diff < self.retry.rdbd || ls_blocks_retry {
                 self.retry.miss = false;
                 self.restore_spmg_move_to_pause();
-            }
-            if ls_blocks_retry {
-                // C motorRecord.cc:1366-1380 — a positional move halted by a
-                // hardware limit switch in the travel direction forces
-                // `pp = TRUE` and re-arms a GET_INFO cycle; the next callback
-                // runs postProcess (826-849), which adopts the limit readback
-                // into VAL/DVAL/RVAL and zeroes DIFF/RDIF. The Rust poll
-                // already carries the fresh limit readback (process_motor_info
-                // ran this cycle), so postprocess_sync() applies it directly.
-                //
-                // Scope is the LS-stop ALONE: a plain MOVE_ABS never sets `pp`
-                // (the dispatch sites at C 1983/2025/2110/2125 are SET-mode,
-                // HOME, and JOG — not positional moves), so C does NOT sync a
-                // close-enough or rtry-disabled completion. Do not extend the
-                // sync to those branches.
-                self.postprocess_sync();
             }
             self.finalize_motion(effects);
         }

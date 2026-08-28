@@ -393,7 +393,7 @@ fn spmg_stop_blocks_new_commands() {
     let mut rec = make_record();
     // Bare SPMG=Stop (lspg still Go): the next pass runs the C top block
     // — STOP_AXIS goes out "just in case" and the position write is
-    // discarded (motorRecord.cc:1871-1911).
+    // discarded (motorRecord.cc:1872-1911).
     rec.ctrl.spmg = SpmgMode::Stop;
 
     rec.pos.dval = 50.0;
@@ -435,7 +435,7 @@ fn spmg_pause_sends_stop_and_arms_paused_resume() {
     assert!(rec.stat.mip.contains(MipFlags::STOP));
 
     // Motor stops at 25. C: Pause never set pp — postProcess is skipped
-    // (1383-1402), the target survives, and maybeRetry (1077-1082) arms
+    // (1382-1402), the target survives, and maybeRetry (1077-1082) arms
     // MIP_RETRY with DMOV left FALSE for the Go resume.
     complete_move(&mut rec, 25.0);
     let _effects = rec.check_completion();
@@ -546,7 +546,7 @@ fn startup_moving_starts_polling() {
 
 #[test]
 fn startup_event_runs_initial_readback_through_live_path() {
-    // C init_record (motorRecord.cc:687-733) + devMotorAsyn.c
+    // C init_record (motorRecord.cc:690-733) + devMotorAsyn.c
     // init_controller: the FIRST device status must flow through
     // initial_readback — readback adoption and the RSTM restore — not
     // just flip `initialized`. Drives the real process() path: shared
@@ -703,7 +703,7 @@ fn idle_status_at(seq: u64, pos: f64) -> motor_rs::device_state::StampedStatus {
 
 #[test]
 fn set_mode_load_pos_collapses_through_live_path() {
-    // C process (1404-1409): the GET_INFO callback after a LOAD_POS
+    // C process (1405-1409): the GET_INFO callback after a LOAD_POS
     // collapses MIP_LOAD_P to MIP_DONE and DMOV returns TRUE. In the
     // live IOC that callback lands at phase Idle, where
     // determine_event consumes the status in place — the pass must
@@ -796,7 +796,7 @@ fn parked_set_redefinition_replays_at_load_pos_collapse() {
     // C move-block set test (2257-2263): a second SET redefinition
     // written while a LOAD_POS is in flight parks (load_pos is skipped
     // while MIP_LOAD_P is set); the collapse pass re-enters do_work
-    // and its `dval != ldvl` entry (2240) replays it through load_pos.
+    // and its `dval != ldvl` entry (2241) replays it through load_pos.
     use motor_rs::device_state::new_shared_state;
 
     let state = new_shared_state();
@@ -1073,7 +1073,7 @@ fn sub_step_move_pulses_dmov() {
     let mut rec = make_record();
 
     // Sub-step move: the target differs from the last-dispatched one
-    // (C 2240 enters via dval != ldvl) but by < 1 step -- no motor
+    // (C 2241 enters via dval != ldvl) but by < 1 step -- no motor
     // command, DMOV pulses (deliberate ophyd/bluesky deviation).
     rec.pos.dval = 0.0004; // 0.4 steps at mres = 0.001
     rec.pos.drbv = 0.0;
@@ -1170,9 +1170,9 @@ fn sim_motor_end_to_end() {
 }
 
 /// A database put of VAL to the current position produces a DMOV
-/// 1→0→1 pulse: the special() pass-0 blink (motorRecord.cc:2582-2608)
-/// drops DMOV, the move-block entry gate (2240) passes via `!dmov`,
-/// and too_small (2333-2342) completes the zero-length "move".
+/// 1→0→1 pulse: the special() pass-0 blink (motorRecord.cc:2591-2620)
+/// drops DMOV, the move-block entry gate (2241) passes via `!dmov`,
+/// and too_small (2332-2349) completes the zero-length "move".
 /// ophyd/bluesky rely on this edge to detect move completion.
 /// Full framework order: special(pass 0) → put_field → process pass
 /// (consumes last_write) → recovery pass restores DMOV.
@@ -1212,7 +1212,7 @@ fn dbput_to_same_position_pulses_dmov() {
 /// end-to-end through the completion flow: the blink re-opens the
 /// entry gate, too_small pulses. An unblinked same-value pass (no
 /// fresh drive write — C's closed-loop DOL dbGetLink delivery) is the
-/// one the entry gate (2240) refuses with no DMOV edge.
+/// one the entry gate (2241) refuses with no DMOV edge.
 #[test]
 fn same_position_reput_after_completed_move_pulses() {
     let mut rec = make_record();
@@ -1343,7 +1343,7 @@ fn calibration_set_current_position_updates_offset() {
 
     // C 2206-2227: a FOFF=Variable redefinition is offset-only — no
     // controller command (LOAD_POS belongs to the Frozen leg and the
-    // DVAL/RVAL paths). DVAL is untouched, so the C entry gate (2240)
+    // DVAL/RVAL paths). DVAL is untouched, so the C entry gate (2241)
     // refuses the put pass outright.
     assert!(
         effects.commands.is_empty(),

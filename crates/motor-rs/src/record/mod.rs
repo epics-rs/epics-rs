@@ -288,6 +288,11 @@ impl Record for MotorRecord {
                 result: RecordProcessResult::AsyncPendingNotify(fields),
                 actions,
                 device_did_compute: false,
+                // DMOV stays a `process()` store: C reads it back at
+                // `motorRecord.cc:1509-1510` to gate `recGblFwdLink`, so it is
+                // an input to a later decision in the same cycle, not a
+                // completion flag published after the writes.
+                post_write_fields: Vec::new(),
             })
         } else {
             // Ongoing motion or idle: full snapshot so all changed fields
@@ -404,14 +409,14 @@ impl Record for MotorRecord {
         dbd_generated::MOTOR_NOACCESS
     }
 
-    /// C `special()` pass-0 blink (motorRecord.cc:2582-2608): "Someone
+    /// C `special()` pass-0 blink (motorRecord.cc:2591-2620): "Someone
     /// wrote to drive field. Blink .dmov unless record is disabled."
     /// Every database put to a drive field drops DMOV before the record
     /// processes — that blink is what carries the put pass through the
-    /// do_work move-block entry gate (2240, `dval != ldvl || !dmov`)
+    /// do_work move-block entry gate (2241, `dval != ldvl || !dmov`)
     /// even when the target equals the last-dispatched one; the move
     /// block then decides between the sub-step pulse restore
-    /// (too_small, 2333-2342), a re-dispatch (2455, `mip == MIP_DONE ||
+    /// (too_small, 2332-2349), a re-dispatch (2455, `mip == MIP_DONE ||
     /// MIP_RETRY`), and the SET-mode load_pos. The entry gate itself
     /// only ever refuses passes that did NOT come through database put
     /// access — C's closed-loop DOL collection is a bare `dbGetLink`
@@ -450,11 +455,14 @@ impl Record for MotorRecord {
     fn init_record(&mut self, pass: u8) -> CaResult<()> {
         if pass == 1 {
             // C init_record runs check_speed_and_resolution (641) with the
-            // resolution triple first (3904-3927), then the speed pairs,
+            // resolution triple first (3905-3927), then the speed pairs,
             // then the raw-limit rules.
             field_access::motor_sync_resolution_at_init(self);
             field_access::motor_sync_speed_at_init(self);
             field_access::motor_sync_limits_at_init(self);
+            // C 653-670: CARD from the OUT link's type, the record's only
+            // read of that link at init.
+            field_access::motor_derive_card(self);
             // C 642: the single load-order-independent enforcement of
             // RDBD >= |MRES|, against the reconciled resolution. The RDBD
             // put handler stays inert during load.
@@ -513,7 +521,7 @@ impl Record for MotorRecord {
     /// alarm transition fired, even when unmarked — `local_mask =
     /// monitor_mask | (MARKED(x) ? DBE_VAL_LOG : 0)` is non-zero for
     /// unmarked fields once `monitor_mask != 0` (motorRecord.cc
-    /// 3513-3645), so a `DBE_ALARM`-only subscriber on any of them
+    /// 3456-3646), so a `DBE_ALARM`-only subscriber on any of them
     /// observes the alarm moment. The list is C's posting order, minus
     /// RBV (the deadband-gated field, delivered by the deadband
     /// trigger with the same alarm bits) and CNEN (C posts it only on

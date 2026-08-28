@@ -13,14 +13,20 @@
 //!
 //! # Layout
 //!
+//! * [`boot_args`] — the boot command line: the target's `st.cmd`, and the one
+//!   owner of its effect on the process environment. Pure and host-tested.
 //! * [`contract`] — the link flags, pure and host-tested. Also the module a
 //!   dependent's `build.rs` calls into.
 //! * `csrc/rtems_config.c` — the `CONFIGURE_*` directives, derived from EPICS
 //!   base's POSIX arm. Its file-descriptor ceiling deviates from that arm — we
 //!   take 150 from base's *score* arm where the POSIX arm base actually
 //!   compiles on RTEMS 6 says 64 — and that ceiling is what caps concurrent
-//!   clients; `doc/rtems-fd-ceiling-deviation.md` is the measured record.
+//!   clients.
 //! * `csrc/rtems_init.c` — `POSIX_Init`: console, clock, libbsd, DHCP, `main`.
+//! * `csrc/boot_args.c` — the boot command line's tokeniser, split out of
+//!   `rtems_init.c` because it calls no RTEMS API and so can be compiled and
+//!   run by a gate that has no toolchain (`scripts/csrc-check.sh`). The rest of
+//!   the C needs the BSP headers and is compiled only by an image build.
 //! * [`stats`] — descriptor and heap usage, the two IOC-statistics values Rust
 //!   cannot reach on this target, over `csrc/rtems_stats.c`.
 //! * `build.rs` — compiles the C files with `cc` and emits the propagating
@@ -52,11 +58,10 @@
 //! undefined reference to `epics_rtems_boot__RTEMS_BSP_PREFIX_was_not_set_at_build_time'
 //! ```
 //!
-//! This is a deliberate deviation from `doc/rtems-boot-shim-design.md` §3.2,
-//! which asks the build script to fail outright when the variable is unset.
-//! That would satisfy §3.2 at the cost of §4.2's `rtems-check` job, and the
-//! design says of that job that it "must keep running independently — it is the
-//! only gate that works without the box". Moving the failure from build time to
+//! This is a deliberate deviation from the rule that the build script fail
+//! outright when the variable is unset. That would cost the `rtems-check`
+//! job, which must keep running independently because it is the only gate
+//! that works without the box. Moving the failure from build time to
 //! link time keeps both: nothing that can only be caught by linking is
 //! suppressed, and nothing that never links is broken.
 //!
@@ -95,15 +100,14 @@
 //!    `CONFIGURE_LIBIO_MAXIMUM_FILE_DESCRIPTORS` in RTEMS 6.~~ **Closed on the
 //!    box**, and `csrc/rtems_config.c` §F is where the evidence lives:
 //!    `CONFIGURE_MAXIMUM_FILE_DESCRIPTORS` is the RTEMS 6 spelling
-//!    (`confdefs/libio.h:89` reads it; `confdefs/obsolete.h:109-111` makes the
+//!    (`confdefs/libio.h:89` (`rtems_6`) reads it; `confdefs/obsolete.h:109-111` (`rtems_6`) makes the
 //!    older name a rename `#warning`), the ceiling is measured at 142
 //!    concurrent CA connections with the 143rd refused `ENFILE`, and
 //!    `FD_SETSIZE` on this BSP is 256 rather than newlib's default 64, so
 //!    base's `select()` caveat cannot fire at a cap of 150 whatever any library
 //!    does. The deviation this leaves — we run base's *score*-arm 150 on a
 //!    target where base compiles the *POSIX* arm and runs 64, and the cap is
-//!    overridable through the `#ifndef` — is recorded with every measurement in
-//!    `doc/rtems-fd-ceiling-deviation.md`.
+//!    overridable through the `#ifndef` — is deliberate.
 //!    **Still genuinely open:** *libbsd's internals were never audited for
 //!    `select()` use.* That does not bind at 150 (`FD_SETSIZE` is 256), so it
 //!    is a precondition for raising the cap **above 256**, not a live risk
@@ -117,7 +121,50 @@
 //! 6. **Interworking is reasoned, not observed.** A32 Rust objects calling into
 //!    the Thumb multilib is standard Armv7-A behaviour; only a link proves the
 //!    veneers resolve.
+//!
+//! # C reference pins
+//!
+//! Every `file.c:NNN` citation in this crate resolves at the tree and revision
+//! below, not at whatever that tree's working copy holds today. These trees are
+//! checked out on local branches here and run ahead of their pins.
+//!
+//! | tree | pinned revision |
+//! | --- | --- |
+//! | `epics-base` | `R7.0.10` |
+//!
+//! **Resolve by symbol at the pin; the line is a hint.** Find the named
+//! function, struct, macro or field first, and treat the line number as a hint
+//! that has to land inside that construct. Three cases follow:
+//!
+//! 1. Construct at the pin, line lands in it — the citation is exact. A
+//!    reference checkout ahead of the pin will disagree; that disagreement is
+//!    the checkout's, not the citation's.
+//! 2. Construct at the pin, line lands outside it — line drift. Keep the
+//!    symbol and move the line to the pin's.
+//! 3. Construct absent at the pin — the citation means code added after it,
+//!    and is NOT moved onto the pin, where it would point at lines that do not
+//!    exist. It names the revision it means inline, beside the line span: the
+//!    upstream PR and commit, and that both are later than the pin this table
+//!    gives. `epics-libcom-rs` already carries that form.
+//!
+//! Every pin above passes `git merge-base --is-ancestor <pin> origin/<default>`
+//! in its own tree, which is the test a pin has to meet. A `git describe`
+//! string names an exact commit and is worth as much as a tag; what
+//! disqualifies a revision is being reachable only from a fork branch or an
+//! unmerged PR, because then it names nothing a reader outside this workspace
+//! can fetch.
+//!
+//! Resolve each citation on its own. One sentence can cite two lines that are
+//! right at different revisions, and a check run at either revision then
+//! reports a single tidy error while vouching for the very citation the other
+//! condemns.
+//!
+//! A row reading *no settled pin* means no revision has been agreed for that
+//! tree: say which revision you read, and do not take its `HEAD` for the pin.
+//! Citations into non-EPICS sources (libc, RTEMS, `rtems-libbsd`, VxWorks,
+//! vendored third-party) are outside this table and carry no pin.
 
+pub mod boot_args;
 pub mod contract;
 pub mod stats;
 
@@ -281,8 +328,8 @@ pub const RTEMS_LIBC_SOCKET_LAYOUT_IS_CORRECT: bool =
 /// build-stopping `assert!` is scoped to builds that can produce an image.
 /// Putting the assertion itself at that scope would delete that gate — the
 /// same trade this crate already makes for the missing toolchain, and for the
-/// same reason (`doc/rtems-boot-shim-design.md` §4.2: the portability check
-/// "is the only gate that works without the box").
+/// same reason: the portability check is the only gate that works without
+/// the box.
 #[cfg(all(target_os = "rtems", rtems_boot_linked))]
 const _RTEMS_LIBC_TIME_LAYOUT: () = assert!(
     RTEMS_LIBC_TIME_LAYOUT_IS_CORRECT,
@@ -584,7 +631,7 @@ mod tests {
     /// libblock from the image, only its configuration, and
     /// `RTEMS_BSD_CONFIG_BSP_CONFIG` pulls in this BSP's nexus devices —
     /// including its two SDHCI controllers, whose SD/MMC stack references bdbuf
-    /// unconditionally. `confdefs/bdbuf.h:54,133` defines the symbol only under
+    /// unconditionally. `confdefs/bdbuf.h:54,133` (`rtems_6`) defines the symbol only under
     /// this macro.
     #[test]
     fn the_shim_configures_libblock_for_the_bsps_block_devices() {
@@ -664,7 +711,7 @@ mod tests {
     }
 
     /// The shim's whole purpose is to reach Rust; base's own contract is the
-    /// `main(argc, argv)` call at `rtems_init.c:1183`.
+    /// `main(argc, argv)` call at `posix/rtems_init.c:1184`.
     #[test]
     fn the_entry_task_calls_main() {
         let init = include_str!("../csrc/rtems_init.c");

@@ -72,7 +72,7 @@ pub const BSP_PREFIX_ENV: &str = "RTEMS_BSP_PREFIX";
 /// Environment variable selecting the BSP, defaulting to [`DEFAULT_BSP`].
 pub const BSP_ENV: &str = "RTEMS_BSP";
 
-/// The BSP the acceptance ladder runs on (`doc/rtems-qemu-bringup-artefacts.md`).
+/// The BSP the acceptance ladder runs on.
 pub const DEFAULT_BSP: &str = "xilinx_zynq_a9_qemu";
 
 /// The toolchain target triple, as it appears in the install tree layout.
@@ -93,7 +93,7 @@ pub const ENTRY_SYMBOL: &str = "POSIX_Init";
 pub const MULTILIB: &str = "thumb/armv7-a+simd/hard";
 
 /// The flags that select [`MULTILIB`], measured from a real
-/// `arm-rtems6-gcc -qrtems` expansion (`doc/rtems-qemu-bringup-artefacts.md`).
+/// `arm-rtems6-gcc -qrtems` expansion.
 ///
 /// Applied to both the C shim's compilation and the final link so the C
 /// objects, the Rust objects and the toolchain libraries agree.
@@ -340,7 +340,7 @@ mod tests {
     #[test]
     fn the_contract_source_hard_codes_no_install_path() {
         let src = include_str!("contract.rs");
-        let production: &str = src.split("\n#[cfg(test)]").next().expect("test module");
+        let production = source_guard::production(src, source_guard::Comments::Keep);
         for needle in ["/home/", "$HOME", "/opt/rtems", "rtems-bringup"] {
             assert!(
                 !production.contains(needle),

@@ -11,10 +11,17 @@
  * hack).
  *
  * The contract with Rust is one line: base's `main(argc, argv)` call at
- * :1183. rustc emits a C `main` that hands argc/argv to the Rust runtime, so
- * `std::env::args()` inside the IOC sees whatever is passed here.
+ * :1184. rustc emits a C `main` that hands argc/argv to the Rust runtime, so
+ * `std::env::args()` inside the IOC sees whatever is passed here. That is the
+ * whole configuration surface of a target image, so what this file puts in
+ * argv is what a site can set: see `EPICS_RTEMS_CMDLINE` below, and
+ * `src/boot_args.rs` for the meaning the IOC gives the tokens.
  *
- * NOT COMPILED ON THIS MACHINE — see the note at the top of rtems_config.c.
+ * NOT BUILT FOR THE TARGET ON THIS MACHINE — see the note at the top of
+ * rtems_config.c. It is compiled FOR THE HOST on every push, against the
+ * RTEMS declarations recorded in tests/rtems-api/, so a name, an arity or a
+ * format string that is wrong here fails CI rather than the board's console;
+ * that record's README.md says what the host compile does and does not prove.
  */
 
 #include <assert.h>
@@ -40,6 +47,8 @@
 #include <rtems/stackchk.h>
 
 #include <machine/rtems-bsd-commands.h>
+
+#include "boot_args.h"
 
 /* The Rust entry point (rustc emits this C symbol for `fn main`). */
 extern int main(int argc, char **argv);
@@ -74,6 +83,37 @@ extern int main(int argc, char **argv);
 #ifndef EPICS_RTEMS_BOOT_EPOCH
 #define EPICS_RTEMS_BOOT_EPOCH 1397460606
 #endif
+
+/*
+ * The boot command line — this image's `st.cmd`.
+ *
+ * Base names a startup script here (`bootp_cmdline_init`, base :103) and runs
+ * it through iocsh; §1.1 drops both the script and the filesystems that carry
+ * it, so the line itself has to carry the configuration. Its tokens are split
+ * on whitespace into `argv[1..]` and given their meaning by the Rust side
+ * (`src/boot_args.rs`): `NAME=VALUE` is `epicsEnvSet`, anything else is a file
+ * to load. Without this the image had no configuration surface at all — the
+ * compiled-in defaults were the only values it could ever have, and a site's
+ * EPICS_CA_ADDR_LIST was ignored with no error.
+ *
+ * Compile-time default, overridden at run time by the DHCP option
+ * `rtems_cmdline` exactly as base overrides its own (base :762). Build with
+ *
+ *     -DEPICS_RTEMS_CMDLINE="EPICS_CA_ADDR_LIST=10.0.2.2 /db/site.db"
+ *
+ * The buffer is larger than base's 128: base holds one pathname, this holds a
+ * site's whole environment. It is never truncated — a half-copied
+ * EPICS_CA_ADDR_LIST is a wrong address list, which is worse than a refused
+ * one — so an oversized value is refused with a message, as base refuses its
+ * own (base :789-791).
+ */
+#ifndef EPICS_RTEMS_CMDLINE
+#define EPICS_RTEMS_CMDLINE ""
+#endif
+
+static char boot_cmdline[1024] = EPICS_RTEMS_CMDLINE;
+
+static char *boot_argv[EPICS_RTEMS_MAX_BOOT_ARGS + 2];
 
 /*
  * Delay before dying, so the console actually flushes the message (base
@@ -127,9 +167,16 @@ static void report_stack_usage(int exit_code, void *arg)
  * Step 10 — the DHCP hook.
  *
  * Base parses seven variables out of the dhcpcd environment (NTP servers, TFTP
- * server, bootfile, kernel command line) into globals (:742-811); every one of
- * those feeds a facility §1.1 drops. What remains is the two things we use: the
- * BOUND edge, and the hostname.
+ * server, bootfile, kernel command line) into globals (:742-811); five of those
+ * feed a facility §1.1 drops. What remains is three things: the BOUND edge, the
+ * hostname, and `rtems_cmdline` — which base takes as `new_rtems_cmdline`
+ * (:762) into the same buffer its compile-time default lives in, and which is
+ * how a site configures a board it cannot rebuild.
+ *
+ * Base requires the keys to arrive in order and ignores everything before it
+ * has seen `reason=` (:786-788); this loop instead notes the values and commits
+ * them once, after the loop, when the reason really was BOUND. Same outcome,
+ * no dependence on dhcpcd's emission order.
  */
 static volatile int dhcp_bound = 0;
 
@@ -137,6 +184,7 @@ static void dhcpcd_hook_handler(rtems_dhcpcd_hook *hook, char *const *env)
 {
     const char *reason = NULL;
     const char *host = NULL;
+    const char *cmdline = NULL;
 
     (void)hook;
 
@@ -146,12 +194,29 @@ static void dhcpcd_hook_handler(rtems_dhcpcd_hook *hook, char *const *env)
             reason = *env + 7;
         } else if (strncmp(*env, "new_host_name=", 14) == 0) {
             host = *env + 14;
+        } else if (strncmp(*env, "new_rtems_cmdline=", 18) == 0) {
+            cmdline = *env + 18;
         }
     }
 
     if (reason != NULL && strcmp(reason, "BOUND") == 0) {
         if (host != NULL && host[0] != '\0') {
             sethostname(host, strlen(host));
+        }
+        /*
+         * Refuse rather than truncate (base :789-791): half an address list is
+         * a wrong address list, and it would be indistinguishable from one the
+         * site actually asked for.
+         */
+        if (cmdline != NULL) {
+            if (strlen(cmdline) >= sizeof(boot_cmdline)) {
+                printf("rtems-boot: ***** DHCP rtems_cmdline is %zu bytes, "
+                       "buffer is %zu; IGNORED. Expand boot_cmdline and "
+                       "rebuild. *****\n",
+                       strlen(cmdline), sizeof(boot_cmdline));
+            } else {
+                strcpy(boot_cmdline, cmdline);
+            }
         }
         printf("rtems-boot: dhcp BOUND\n");
         dhcp_bound = 1;
@@ -328,7 +393,7 @@ void *POSIX_Init(void *argument)
     struct timespec now;
     rtems_status_code sc;
     rtems_task_priority old_prio;
-    char *argv[] = {"rtems-ioc", NULL};
+    int argc;
     int result;
     int waited;
 
@@ -358,7 +423,7 @@ void *POSIX_Init(void *argument)
      * This value is INHERITED, and that is the whole reason it matters.
      * `_POSIX_Threads_Default_attributes` sets
      * `inheritsched = PTHREAD_INHERIT_SCHED`
-     * (`cpukit/posix/src/pthreadattrdefault.c:49-58`), and Rust's `std` never
+     * (`cpukit/posix/src/pthreadattrdefault.c:49-58` (both `rtems` pins)), and Rust's `std` never
      * calls `pthread_attr_setinheritsched`, so a thread created from here gets
      * *this* priority rather than one of its own. Base does not have that
      * problem because `epicsThreadCreate` sets `PTHREAD_EXPLICIT_SCHED` on the
@@ -451,9 +516,30 @@ void *POSIX_Init(void *argument)
         rtems_bsd_command_netstat(2, netstat_argv);
     }
 
-    /* 11. The Rust IOC (base :1183-1191). */
+    /*
+     * 11. The boot command line, then the Rust IOC (base :1127 then
+     *     :1184-1191 — base builds argv from the BOOTP command line in
+     *     `initialize_local_filesystem`/`initialize_remote_filesystem` and
+     *     hands it to `main` the same way).
+     *
+     *     Built here, after DHCP, so the `rtems_cmdline` option has already
+     *     had its chance to replace the compiled-in default; and echoed,
+     *     because the console is this target's only report and a boot that
+     *     silently took the default is the failure this closes.
+     */
+    argc = epics_rtems_build_boot_argv(
+        boot_cmdline, boot_argv, (int)(sizeof(boot_argv) / sizeof(boot_argv[0])));
+    {
+        int i;
+        printf("rtems-boot: boot command line (%d argument(s)):", argc - 1);
+        for (i = 1; i < argc; ++i) {
+            printf(" [%s]", boot_argv[i]);
+        }
+        printf("\n");
+    }
+
     printf("rtems-boot: main() reached\n");
-    result = main((int)(sizeof(argv) / sizeof(argv[0])) - 1, argv);
+    result = main(argc, boot_argv);
     printf("rtems-boot: IOC terminated with %d\n", result);
 
     exit(result);

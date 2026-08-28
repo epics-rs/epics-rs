@@ -89,9 +89,8 @@ mod backend;
 ///
 /// The cap of 150 is base's own score-arm value, run on a target where base
 /// itself compiles the POSIX arm and runs 64 — a deviation in which arm's
-/// number we take, not an invented number. `doc/rtems-fd-ceiling-deviation.md`
-/// carries the measurements, including why `free()` at idle is numerically the
-/// connection ceiling and why `CA_REFUSED_CNT` never sees this wall.
+/// number we take, not an invented number. `free()` at idle is numerically
+/// the connection ceiling, and `CA_REFUSED_CNT` never sees this wall.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct FdUsage {
     /// Descriptors currently open, across the whole image — sockets, the
@@ -246,23 +245,17 @@ pub fn register_task() {
 mod tests {
     use super::*;
 
-    /// The funnel's own source lines — this file down to the test module, with
-    /// comments dropped.
+    /// The funnel's own production lines, comments stripped.
     ///
-    /// Both halves matter. The `#[cfg(test)]` split keeps the tests below out
-    /// of scope, since they legitimately carry the attributes and call the
-    /// paths the guards forbid above them. Dropping comment lines keeps the
-    /// *prose* out too: the module docs explain the backend selection by
-    /// quoting the shapes it replaced, and a guard that reads its own
-    /// explanation as code fails on the sentence describing it. Measured — both
-    /// guards below failed exactly that way on their first run.
+    /// Both halves matter. Excluding the tests below keeps them out of scope,
+    /// since they legitimately carry the attributes and call the paths the
+    /// guards forbid above them. Stripping comments keeps the *prose* out too:
+    /// the module docs explain the backend selection by quoting the shapes it
+    /// replaced, and a guard that reads its own explanation as code fails on
+    /// the sentence describing it. Measured — both guards below failed exactly
+    /// that way on their first run.
     fn funnel_code() -> impl Iterator<Item = &'static str> {
-        include_str!("mod.rs")
-            .split_once("#[cfg(test)]")
-            .expect("the test module is still here")
-            .0
-            .lines()
-            .filter(|l| !l.trim_start().starts_with("//"))
+        source_guard::production(include_str!("mod.rs"), source_guard::Comments::Strip).lines()
     }
 
     /// The host has no backend, so both readers must say so rather than

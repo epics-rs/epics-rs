@@ -19,6 +19,8 @@ use contract::*;
 
 fn main() {
     println!("cargo::rustc-check-cfg=cfg(rtems_boot_linked)");
+    println!("cargo::rerun-if-changed=csrc/boot_args.c");
+    println!("cargo::rerun-if-changed=csrc/boot_args.h");
     println!("cargo::rerun-if-changed=csrc/rtems_config.c");
     println!("cargo::rerun-if-changed=csrc/rtems_init.c");
     println!("cargo::rerun-if-changed=csrc/rtems_stats.c");
@@ -52,6 +54,10 @@ fn main() {
 
     let mut build = cc::Build::new();
     build
+        // Compiled here as well as by `scripts/csrc-check.sh`: the gate proves
+        // the tokeniser still behaves, this line is what puts it in the image.
+        // One source, so the gate cannot drift from what boots.
+        .file("csrc/boot_args.c")
         .file("csrc/rtems_config.c")
         .file("csrc/rtems_init.c")
         .file("csrc/rtems_stats.c")

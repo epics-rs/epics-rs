@@ -1810,9 +1810,22 @@ mod thread_registry {
         unsafe { libc::pthread_self() as u64 }
     }
 
-    #[cfg(not(unix))]
+    /// Windows prints a `WIN32-ID` column, which C fills from
+    /// `GetCurrentThreadId()` (`os/WIN32/osdThread.c:564`, printed at
+    /// `:1043`). The zero this used to return is not a thread id there and
+    /// was the same one for every row, so `thread_by_id` matched the token
+    /// `0` against whichever thread the snapshot listed first — enough for
+    /// `epicsThreadShow 0` to print a stranger's row and for
+    /// `epicsThreadResume 0` to report on it instead of rejecting the id.
+    #[cfg(windows)]
     fn os_thread_id() -> u64 {
-        0
+        // SAFETY: `GetCurrentThreadId` takes no arguments and cannot fail.
+        unsafe { GetCurrentThreadId() }.into()
+    }
+
+    #[cfg(windows)]
+    unsafe extern "system" {
+        fn GetCurrentThreadId() -> u32;
     }
 }
 

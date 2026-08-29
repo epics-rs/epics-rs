@@ -2,7 +2,7 @@
 //! `<undefined>`, not the EPICS epoch.
 //!
 //! C's `epicsTimeToStrftime` short-circuits before it ever builds a `tm`
-//! (`epicsTime.cpp:174-179`):
+//! (`epicsTime.cpp:175-179`):
 //!
 //! ```c
 //! // presume that EPOCH date is an uninitialized time stamp
@@ -24,6 +24,8 @@
 //! Every zeroed stamp reaches this: `camonitor`, `caget -a`, `caget -d
 //! DBR_TIME_*`, `caput -l`, and every timed-out synchronous readback
 //! (`cli::zero_dbr_snapshot`).
+
+#![cfg(all(feature = "client-core", not(epics_embedded_target)))]
 
 use epics_base_rs::types::WallTime;
 use epics_ca_rs::cli::{EPICS_EPOCH_UNIX_SECS, format_time};

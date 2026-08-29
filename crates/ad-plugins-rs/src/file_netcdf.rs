@@ -5,13 +5,14 @@ use ad_core_rs::error::{ADError, ADResult};
 use ad_core_rs::finalize::Finalize;
 use ad_core_rs::ndarray::{NDArray, NDDataBuffer, NDDataType, NDDimension};
 use ad_core_rs::ndarray_pool::NDArrayPool;
-use ad_core_rs::plugin::file_base::{NDFileMode, NDFileWriter};
+use ad_core_rs::plugin::file_base::{FileAttributes, NDFileMode, NDFileWriter};
 use ad_core_rs::plugin::file_controller::FilePluginController;
 use ad_core_rs::plugin::runtime::{
     NDPluginProcess, ParamChangeResult, PluginParamSnapshot, ProcessResult,
 };
 
 use netcdf3::{DataSet, FileReader, FileWriter, Version};
+use parking_lot::Mutex;
 
 const VAR_NAME: &str = "array_data";
 const DIM_UNLIMITED: &str = "numArrays";
@@ -102,6 +103,9 @@ pub struct NetcdfWriter {
     /// re-derived later from how many frames happened to arrive: a Capture file
     /// that captured exactly one frame is still NC_UNLIMITED.
     open_multiple: bool,
+    /// C `pFileAttributes` (NDFileNetCDF.cpp:72, :362): the writer's own
+    /// attribute list, sticky for the life of the file.
+    file_attributes: FileAttributes,
 }
 
 impl NetcdfWriter {
@@ -110,17 +114,18 @@ impl NetcdfWriter {
             current_path: None,
             frames: Vec::new(),
             open_multiple: false,
+            file_attributes: FileAttributes::default(),
         }
     }
 }
 
 /// nc_type of the `array_data` variable, i.e. C's `switch (pArray->dataType)`
-/// (NDFileNetCDF.cpp:152-178).
+/// (NDFileNetCDF.cpp:154-180).
 ///
 /// netCDF-3 has no unsigned types, so C maps *both* Int8 and UInt8 to NC_BYTE
 /// and lets the `dataType` global attribute carry the sign back to the reader
-/// (:88-92). It has no 64-bit integer either, so Int64/UInt64 are cast to
-/// NC_DOUBLE (:169-172).
+/// (:92-94). It has no 64-bit integer either, so Int64/UInt64 are cast to
+/// NC_DOUBLE (:171-173).
 ///
 /// Beware the netcdf3 crate's spelling: `DataType::I8` is NC_BYTE (nc_type 1),
 /// but `DataType::U8` is NC_CHAR (nc_type 2) — a *text* type. C never stores
@@ -341,7 +346,7 @@ fn write_attr_value(
 }
 
 /// Build the netCDF-3 header, mirroring C `NDFileNetCDF::openFile`
-/// (NDFileNetCDF.cpp:83-333) statement for statement.
+/// (NDFileNetCDF.cpp:41-333) statement for statement.
 ///
 /// A netCDF-3 header stores its dimensions, its global attributes and its
 /// variables as three ordered lists, and every reader that walks a file by
@@ -365,7 +370,7 @@ fn define_data_set(
     let mut ds = DataSet::new();
     let ndims = first.dims.len();
 
-    // --- Global attributes, part 1 (C :88-101, :107-110, :137-151) ---------
+    // --- Global attributes, part 1 (C :92-101, :108-110, :140-151) ---------
     // C emits dataType and NDNetCDFFileVersion before it defines any
     // dimension, and the dim* metadata attributes right after; the gatt list
     // therefore starts with these seven, in this order.
@@ -394,9 +399,9 @@ fn define_data_set(
     ds.add_global_attr_i32("dimReverse", dim_reverse)
         .map_err(map_def)?;
 
-    // --- Dimensions (C :113-136) ------------------------------------------
+    // --- Dimensions (C :117-137) ------------------------------------------
     // numArrays first: NC_UNLIMITED for a multi-array file, fixed size 1
-    // otherwise (:118-120).
+    // otherwise (:117-120).
     if multi {
         ds.set_unlimited_dim(DIM_UNLIMITED, num_frames)
             .map_err(map_def)?;
@@ -404,7 +409,7 @@ fn define_data_set(
         ds.add_fixed_dim(DIM_UNLIMITED, 1).map_err(map_def)?;
     }
     // Then the array dimensions, reversed: netCDF's first dimension varies
-    // slowest, the opposite of the NDArray convention (:122-127).
+    // slowest, the opposite of the NDArray convention (:123-132).
     let mut dim_names: Vec<String> = Vec::new();
     for i in 0..ndims {
         let name = format!("dim{}", i);
@@ -412,12 +417,12 @@ fn define_data_set(
             .map_err(map_def)?;
         dim_names.push(name);
     }
-    // attrStringSize last — defined unconditionally (:134-136), even when no
+    // attrStringSize last — defined unconditionally (:135-137), even when no
     // string attribute uses it. It is part of the header C always writes.
     ds.add_fixed_dim(ATTR_STRING_DIM, ATTR_STRING_SIZE)
         .map_err(map_def)?;
 
-    // --- Variables (C :181-206) -------------------------------------------
+    // --- Variables (C :183-204) -------------------------------------------
     // The four per-array metadata variables come first, array_data fifth.
     ds.add_var("uniqueId", &[DIM_UNLIMITED], netcdf3::DataType::I32)
         .map_err(map_def)?;
@@ -429,7 +434,7 @@ fn define_data_set(
         .map_err(map_def)?;
 
     // array_data always carries the leading numArrays dimension, so a
-    // single-array file is still rank ndims+1 (:203-205).
+    // single-array file is still rank ndims+1 (:202-204).
     let mut var_dims: Vec<&str> = vec![DIM_UNLIMITED];
     var_dims.extend(dim_names.iter().map(|s| s.as_str()));
     ds.add_var(VAR_NAME, &var_dims, nc_data_type(first.data_type)?)
@@ -439,7 +444,7 @@ fn define_data_set(
     // One pass over the attribute list, exactly as C does: the four
     // Attr_<name>_* global text attributes, then the Attr_<name> variable.
     // The attribute set is the first frame's — C snapshots the list at
-    // openFile time and requires it not to change (:417).
+    // openFile time and requires it not to change (C's comment at :418).
     let mut attr_var_names: Vec<String> = Vec::new();
     for attr in &first.attrs {
         ds.add_global_attr_string(
@@ -478,9 +483,12 @@ fn define_data_set(
 }
 
 impl NDFileWriter for NetcdfWriter {
-    fn open_file(&mut self, path: &Path, mode: NDFileMode, _array: &NDArray) -> ADResult<()> {
+    fn open_file(&mut self, path: &Path, mode: NDFileMode, array: &NDArray) -> ADResult<()> {
         self.current_path = Some(path.to_path_buf());
         self.frames.clear();
+        // C `openFile` clears `pFileAttributes` and copies this frame's list
+        // into it (NDFileNetCDF.cpp:72-77).
+        self.file_attributes.open(array);
         // C: NDPluginFile opens Single with `NDFileModeWrite` and Capture/Stream
         // with `NDFileModeWrite | NDFileModeMultiple` (NDPluginFile.cpp:245, :281,
         // :335) — this writer reports supportsMultipleArrays, so those two modes
@@ -504,8 +512,14 @@ impl NDFileWriter for NetcdfWriter {
                 reverse: d.reverse,
             })
             .collect();
-        let attrs: Vec<AttrData> = array
-            .attributes
+        // C `writeFile` merges this frame into `pFileAttributes` and then
+        // writes every attribute variable out of that list
+        // (NDFileNetCDF.cpp:359-362, :419-483), so an attribute that drops out
+        // of a later frame goes on record at its most recent value rather than
+        // at the first frame's.
+        self.file_attributes.frame(array);
+        let attrs: Vec<AttrData> = self
+            .file_attributes
             .iter()
             .map(|a| AttrData {
                 name: a.name.clone(),
@@ -583,16 +597,13 @@ impl NDFileWriter for NetcdfWriter {
                     writer
                         .write_record_i32("epicsTSNsec", i, &[frame.epics_ts_nsec])
                         .map_err(map_write)?;
-                    // Per-attribute values: align to the first frame's attribute
-                    // order; missing attributes in later frames are skipped.
-                    for (attr, var_name) in first.attrs.iter().zip(&attr_var_names) {
-                        let value = frame
-                            .attrs
-                            .iter()
-                            .find(|a| a.name == attr.name)
-                            .map(|a| &a.value)
-                            .unwrap_or(&attr.value);
-                        write_attr_value(&mut writer, var_name, i, true, value)?;
+                    // Per-attribute values. Every frame's `attrs` is a
+                    // snapshot of the same sticky list, which only ever grows
+                    // and never re-orders, so the header's variables line up
+                    // positionally with this frame's entries and there is no
+                    // lookup left to miss.
+                    for (attr, var_name) in frame.attrs.iter().zip(&attr_var_names) {
+                        write_attr_value(&mut writer, var_name, i, true, &attr.value)?;
                     }
                 }
             } else {
@@ -721,13 +732,13 @@ impl NDFileWriter for NetcdfWriter {
 
 /// NetCDF file processor wrapping NDPluginFileBase + NetcdfWriter.
 pub struct NetcdfFileProcessor {
-    ctrl: FilePluginController<NetcdfWriter>,
+    ctrl: Mutex<FilePluginController<NetcdfWriter>>,
 }
 
 impl NetcdfFileProcessor {
     pub fn new() -> Self {
         Self {
-            ctrl: FilePluginController::new(NetcdfWriter::new()),
+            ctrl: Mutex::new(FilePluginController::new(NetcdfWriter::new())),
         }
     }
 }
@@ -739,8 +750,8 @@ impl Default for NetcdfFileProcessor {
 }
 
 impl NDPluginProcess for NetcdfFileProcessor {
-    fn process_array(&mut self, array: &NDArray, _pool: &NDArrayPool) -> ProcessResult {
-        self.ctrl.process_array(array)
+    fn process_array(&self, array: &NDArray, _pool: &NDArrayPool) -> ProcessResult {
+        self.ctrl.lock().process_array(array)
     }
 
     fn plugin_type(&self) -> &str {
@@ -757,15 +768,11 @@ impl NDPluginProcess for NetcdfFileProcessor {
         &mut self,
         base: &mut asyn_rs::port::PortDriverBase,
     ) -> asyn_rs::error::AsynResult<()> {
-        self.ctrl.register_params(base)
+        self.ctrl.lock().register_params(base)
     }
 
-    fn on_param_change(
-        &mut self,
-        reason: usize,
-        params: &PluginParamSnapshot,
-    ) -> ParamChangeResult {
-        self.ctrl.on_param_change(reason, params)
+    fn on_param_change(&self, reason: usize, params: &PluginParamSnapshot) -> ParamChangeResult {
+        self.ctrl.lock().on_param_change(reason, params)
     }
 }
 
@@ -780,7 +787,12 @@ mod tests {
 
     fn temp_path(prefix: &str) -> PathBuf {
         let n = TEST_COUNTER.fetch_add(1, Ordering::Relaxed);
-        std::env::temp_dir().join(format!("adcore_test_{}_{}.nc", prefix, n))
+        std::env::temp_dir().join(format!(
+            "adcore_test_{}_{}_{}.nc",
+            std::process::id(),
+            prefix,
+            n
+        ))
     }
 
     /// D2 sibling: `NetcdfWriter::close_file` is where the buffered frames are
@@ -789,10 +801,12 @@ mod tests {
     /// `open_file` happened to clear them.
     #[test]
     fn close_file_clears_the_frame_buffer_when_the_write_fails() {
-        // A directory that does not exist, so `FileWriter::open` fails.
-        let path = std::env::temp_dir()
-            .join("adcore-no-such-dir-for-netcdf-close")
-            .join("frames.nc");
+        // The precondition is a parent that does NOT exist, so `FileWriter::open`
+        // fails. Spelling it as an implausible name under the shared temp dir made
+        // that a hope about every process on the host; an exclusive root we own and
+        // then leave unpopulated makes it a fact about this test.
+        let root = tempfile::tempdir().expect("fixture root");
+        let path = root.path().join("no-such-dir").join("frames.nc");
         let mut writer = NetcdfWriter::new();
 
         let arr = NDArray::new(
@@ -1131,6 +1145,46 @@ mod tests {
             assert_eq!(v, vec![42]);
         } else {
             panic!("Attr_gain should be I32");
+        }
+
+        drop(reader);
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// ADP-102. C merges each frame into the sticky `pFileAttributes`
+    /// (NDFileNetCDF.cpp:362) and writes every attribute variable out of that
+    /// list (`:419-483`), so a dropped attribute records its most recent value.
+    /// The port read each frame's own list and fell back to the *first*
+    /// frame's value, which is the same only until the attribute changes.
+    #[test]
+    fn attribute_that_drops_out_records_its_last_value() {
+        let path = temp_path("nc_attr_sticky");
+        let mut writer = NetcdfWriter::new();
+
+        let mk = |exposure: Option<f64>| {
+            let mut arr = NDArray::new(vec![NDDimension::new(4)], NDDataType::UInt8);
+            if let Some(v) = exposure {
+                arr.attributes.add(NDAttribute::new_static(
+                    "exposure",
+                    "",
+                    NDAttrSource::Driver,
+                    NDAttrValue::Float64(v),
+                ));
+            }
+            arr
+        };
+
+        let a0 = mk(Some(0.5));
+        writer.open_file(&path, NDFileMode::Stream, &a0).unwrap();
+        writer.write_file(&a0).unwrap();
+        writer.write_file(&mk(Some(0.75))).unwrap();
+        writer.write_file(&mk(None)).unwrap();
+        writer.close_file().unwrap();
+
+        let mut reader = FileReader::open(&path).unwrap();
+        match reader.read_var("Attr_exposure").unwrap() {
+            netcdf3::DataVector::F64(v) => assert_eq!(v, vec![0.5, 0.75, 0.75]),
+            other => panic!("Attr_exposure should be F64, got {other:?}"),
         }
 
         drop(reader);
@@ -1542,7 +1596,7 @@ mod tests {
     /// Dimensions: numArrays, the reversed array dims, attrStringSize.
     /// Variables: the four metadata variables, array_data, then the
     /// attributes. Global attributes: the seven fixed ones, then four per
-    /// attribute (NDFileNetCDF.cpp:88-330).
+    /// attribute (NDFileNetCDF.cpp:92-330).
     #[test]
     fn test_r8_68_definition_order_matches_c() {
         let path = temp_path("nc_r8_68_order");
@@ -1562,7 +1616,7 @@ mod tests {
             hdr.dim_names(),
             vec!["numArrays", "dim0", "dim1", "attrStringSize"]
         );
-        // Reversed: netCDF's first dimension varies slowest (:122-127).
+        // Reversed: netCDF's first dimension varies slowest (:123-132).
         assert_eq!(hdr.dims[1].1, 2);
         assert_eq!(hdr.dims[2].1, 4);
 

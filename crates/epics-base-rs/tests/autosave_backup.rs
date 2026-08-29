@@ -3,6 +3,7 @@ use std::time::Duration;
 use epics_base_rs::server::autosave::backup::{
     BackupConfig, BackupState, find_best_save_file, rotate_backups,
 };
+use epics_base_rs::server::autosave::format::CompatMode;
 use epics_base_rs::server::autosave::save_file::{SaveEntry, write_save_file};
 
 fn make_entry(name: &str, val: &str) -> SaveEntry {
@@ -32,9 +33,15 @@ async fn test_savb_created() {
     };
     let mut state = BackupState::default();
 
-    rotate_backups(&sav_path, &config, &mut state)
-        .await
-        .unwrap();
+    rotate_backups(
+        &sav_path,
+        &config,
+        &mut state,
+        &[make_entry("PV1", "1.0")],
+        CompatMode::Native,
+    )
+    .await
+    .unwrap();
 
     let savb_path = sav_path.with_extension("savB");
     assert!(savb_path.exists());
@@ -60,9 +67,15 @@ async fn test_seq_rotation() {
             .await
             .unwrap();
         epics_base_rs::runtime::task::sleep(Duration::from_millis(5)).await;
-        rotate_backups(&sav_path, &config, &mut state)
-            .await
-            .unwrap();
+        rotate_backups(
+            &sav_path,
+            &config,
+            &mut state,
+            &[make_entry("PV1", &i.to_string())],
+            CompatMode::Native,
+        )
+        .await
+        .unwrap();
     }
 
     // All 3 seq files should exist
@@ -89,9 +102,15 @@ async fn test_dated_filename() {
     };
     let mut state = BackupState::default();
 
-    rotate_backups(&sav_path, &config, &mut state)
-        .await
-        .unwrap();
+    rotate_backups(
+        &sav_path,
+        &config,
+        &mut state,
+        &[make_entry("PV1", "1.0")],
+        CompatMode::Native,
+    )
+    .await
+    .unwrap();
 
     // Check that a dated file was created (sav_YYMMDD-HHMMSS)
     let entries: Vec<_> = std::fs::read_dir(dir.path())
@@ -205,9 +224,15 @@ async fn test_rotate_preserves_existing() {
     let mut state = BackupState::default();
 
     // Rotate
-    rotate_backups(&sav_path, &config, &mut state)
-        .await
-        .unwrap();
+    rotate_backups(
+        &sav_path,
+        &config,
+        &mut state,
+        &[make_entry("PV1", "1.0")],
+        CompatMode::Native,
+    )
+    .await
+    .unwrap();
 
     // Original .sav should still exist
     assert!(sav_path.exists());

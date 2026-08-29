@@ -3,9 +3,9 @@
 //!
 //! | dialect | bit / shift | MODULO | NINT |
 //! |---|---|---|---|
-//! | base `calcPerform.c` | `d2i`/`d2ui` (:324-325) | `d2i` (:176-190) since `669a25697`/PR #925 — NaN on zero | `d2i` (:313-317) |
-//! | sCalc `sCalcPerform.c` | plain `(long)` (:578-631) | `(long)` (:1121) — error on zero | `(long)` (:730) |
-//! | aCalc `aCalcPerform.c` | plain `(int)` (:1355-1357) | `(int)` (:661,:685,:711) — myMAXFLOAT on zero | `(long)` (:839,:1096) |
+//! | base `calcPerform.c` | `d2i`/`d2ui` (:324-325 at R7.0.10) | `d2i` (:176-190 at unmerged PR #925) — NaN on zero | `d2i` (:313-317, same PR) |
+//! | sCalc `sCalcPerform.c` | plain `(long)` (:578-631) | `(long)` (:1109) — error on zero | `(long)` (:718) |
+//! | aCalc `aCalcPerform.c` | plain `(int)` (:1355-1357) | `(int)` (:650,:674,:701) — myMAXFLOAT on zero | `(long)` (:828,:1085) |
 //!
 //! **CBUG-A2 — each engine narrows MODULO and NINT with its OWN dialect's cast**,
 //! mirroring that engine's pristine/fixed C. They genuinely disagree because the
@@ -77,8 +77,8 @@ fn modulo_above_2_31_mirrors_each_dialect_width() {
 
 /// sCalc's C picks its evaluator from the `USES_STRING` marker
 /// (`sCalcPostfix.c:447-475`) and its two evaluators cast MODULO at different
-/// widths — `(int)` no-string (`sCalcPerform.c:574`) vs `(long)` string
-/// (`:1121`). The port models the wider `(long)` path uniformly, so the marker
+/// widths — `(int)` no-string (`sCalcPerform.c:562`) vs `(long)` string
+/// (`:1108`). The port models the wider `(long)` path uniformly, so the marker
 /// no longer perturbs the arithmetic: both are `4`. This test used to pin the
 /// split.
 #[test]

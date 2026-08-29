@@ -47,13 +47,13 @@ use super::source::DynSource;
 /// when the entropy source was unavailable. That is worse than an error,
 /// because **every consumer of a GUID collision degrades silently**:
 ///
-/// * pvxs `client.cpp:938-943` logs "Duplicate PV name" only when the two
+/// * pvxs `src/client.cpp:938-943` logs "Duplicate PV name" only when the two
 ///   GUIDs *differ*, so two servers sharing one GUID and one PV name make the
 ///   warning disappear — exactly the case an operator most needs told.
-/// * pvxs `client.cpp:807-824` treats a GUID change as a server restart. A
+/// * pvxs `src/client.cpp:807-824` treats a GUID change as a server restart. A
 ///   board that reboots into the same GUID is not seen to have restarted, so
 ///   no `Discovered::Timeout` is emitted and clients keep stale state.
-/// * pvxs `client.cpp:454-460` + `:880-886` (`ignoreServerGUIDs`) is gateway
+/// * pvxs `src/client.cpp:454-462` + `:880-886` (`ignoreServerGUIDs`) is gateway
 ///   loop-avoidance. Two servers sharing a GUID means ignoring one silently
 ///   blackholes the other.
 ///
@@ -63,7 +63,7 @@ use super::source::DynSource;
 ///
 /// The fallback was also *specifically* dangerous on RTEMS, where both of its
 /// inputs are near-constant: EPICS base sets a fixed boot wall-clock
-/// (`rtems_init.c:958-966`) and there is one process. Two boards, or one board
+/// (`posix/rtems_init.c:958-966`) and there is one process. Two boards, or one board
 /// twice, could serve identical GUIDs.
 pub fn random_guid() -> io::Result<[u8; 12]> {
     let mut buf = [0u8; 12];
@@ -268,7 +268,7 @@ pub(crate) enum SearchOutput {
 /// this decode verbatim and produce byte-identical replies, the same shape
 /// CA took for its blocking front-end (`epics-ca-rs` `ad477153`:
 /// `parse_search_datagram` pure, `send_reply_dg` the tail). RTEMS phase 6
-/// item 7 stage B, `doc/pva-rtems-item7-design.md` §3.3.
+/// item 7 stage B.
 ///
 /// `origin_tag_forwarding` stands in for "a loopback multicast socket is
 /// bound": the forward path is skipped when it is `false`, exactly as it
@@ -402,9 +402,9 @@ pub(crate) async fn process_search_datagram(
                 // TCP-circuit responders. See `search_matched_cids`.
                 // The requester endpoint is the resolved reply
                 // destination (pvxs fills Search::source from
-                // msg.replyDest, server.cpp:674-704).
+                // msg.replyDest, src/server.cpp:674-704).
                 let matched_cids = search_matched_cids(source, &req, protocol, reply_dest).await;
-                // pvxs `server.cpp:730-732`: when `nreply==0` AND the
+                // pvxs `src/server.cpp:715-717`: when `nreply==0` AND the
                 // SEARCH header did not set `MustReply`, drop the
                 // SEARCH silently. Honouring `MustReply` even with
                 // `nreply==0` is what lets `pvlist` build its server
@@ -466,7 +466,7 @@ pub(crate) async fn process_search_datagram(
 /// This is what stops a TLS-only client from getting `found=1` off a
 /// tcp-only server, and what makes a zero-protocol UDP SEARCH produce no
 /// claims (only a `MustReply` header then forces a `found=0` reply, pvxs
-/// `server.cpp:715-716`). `searchable` (not `has_pv`) keeps non-advertised
+/// `src/server.cpp:715-717`). `searchable` (not `has_pv`) keeps non-advertised
 /// built-in sources (e.g. the `server` PV) out of broadcast SEARCH
 /// answers; a direct TCP connect still resolves them.
 ///
@@ -527,7 +527,7 @@ pub(crate) async fn search_matched_cids(
 /// does, because that socket is the only thing that can deliver one:
 /// `super::udp` joins `224.0.0.128` on loopback and classifies what arrives
 /// there (`super::udp::classify_loopback_datagram`). That module is
-/// `#[cfg(not(epics_embedded_target))]`, and the driver that replaces it on
+/// `#[cfg(tokio_backend)]`, and the driver that replaces it on
 /// an embedded target — [`super::blocking`]'s UDP responder — serves one
 /// plain `std::net::UdpSocket`, passes `origin_tag_forwarding = false`, and
 /// can therefore only ever produce [`Origin::Direct`].
@@ -541,7 +541,7 @@ pub(crate) async fn search_matched_cids(
 /// states the target's actual property in the type — "this server has exactly
 /// one search origin" — the same shape `epics-ca-rs` took with
 /// `SearchTransport::NameServersOnly` ("no UDP socket is a fact about the
-/// type, not a runtime branch", `doc/calink-rtems-design.md` §10.1).
+/// type, not a runtime branch").
 ///
 /// A target build that ever grows a loopback multicast socket must bring these
 /// back with it; the `cfg` is what makes that a compile error rather than a
@@ -549,25 +549,17 @@ pub(crate) async fn search_matched_cids(
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Origin {
     Direct,
-    #[cfg(not(epics_embedded_target))]
+    #[cfg(tokio_backend)]
     FromOriginTag,
-    #[cfg(not(epics_embedded_target))]
+    #[cfg(tokio_backend)]
     Forwarded,
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use source_guard::{Comments, production};
     use std::collections::HashSet;
-
-    /// Production scope of a source file: everything before the first
-    /// column-0 `#[cfg(test)]`. Same helper the driver modules use.
-    fn production_scope(src: &str) -> &str {
-        match src.find("\n#[cfg(test)]") {
-            Some(i) => &src[..i],
-            None => src,
-        }
-    }
 
     /// The GUID is drawn, not defaulted. `[0u8; 12]` is what
     /// `PvaServerConfig::default()` carries, so a `random_guid` that silently
@@ -588,7 +580,7 @@ mod tests {
     /// The fallback packed `SystemTime::now()` nanos into bytes 0..8 and the
     /// PID into 8..12. One process has one PID, so two draws differed *only*
     /// by the clock; under EPICS base's fixed RTEMS boot wall-clock
-    /// (`rtems_init.c:958-966`) plus a coarse tick, two draws in the same tick
+    /// (`posix/rtems_init.c:958-966`) plus a coarse tick, two draws in the same tick
     /// were byte-identical. Drawing many times in a tight loop is what makes
     /// that mechanism visible on any host: a clock-derived GUID collides here,
     /// an entropy-derived one does not.
@@ -618,7 +610,7 @@ mod tests {
     /// rather than on a board.
     #[test]
     fn rtems_selects_entropy_by_target_not_by_family() {
-        let prod = production_scope(include_str!("search_engine.rs"));
+        let prod = production(include_str!("search_engine.rs"), Comments::Strip);
         assert_eq!(
             prod.matches(r#"#[cfg(target_os = "rtems")]"#).count(),
             1,
@@ -674,7 +666,7 @@ mod tests {
     /// a forwarding loop on a board.
     #[test]
     fn the_blocking_udp_responder_produces_only_a_direct_origin() {
-        let prod = production_scope(include_str!("blocking.rs"));
+        let prod = production(include_str!("blocking.rs"), Comments::Strip);
         assert_eq!(
             prod.matches("Origin::Direct").count(),
             1,
@@ -684,7 +676,7 @@ mod tests {
             assert_eq!(
                 prod.matches(gated).count(),
                 0,
-                "`{gated}` is `#[cfg(not(epics_embedded_target))]`; naming it \
+                "`{gated}` is `#[cfg(tokio_backend)]`; naming it \
                  from the target's own UDP responder cannot compile there, and \
                  doing so means the loopback-multicast path arrived without \
                  the anti-loop rules that go with it"
@@ -708,14 +700,10 @@ mod tests {
     /// consumer (see [`random_guid`]) while an error does not.
     #[test]
     fn no_arm_derives_a_guid_instead_of_drawing_one() {
-        // Comment lines are stripped, because the doc on `random_guid` names
-        // the removed fallback in order to explain why it is gone — the guard
-        // is about what the code does, not about what it documents.
-        let prod: String = production_scope(include_str!("search_engine.rs"))
-            .lines()
-            .filter(|l| !l.trim_start().starts_with("//"))
-            .collect::<Vec<_>>()
-            .join("\n");
+        // `Strip`, because the doc on `random_guid` names the removed
+        // fallback in order to explain why it is gone — the guard is about
+        // what the code does, not about what it documents.
+        let prod = production(include_str!("search_engine.rs"), Comments::Strip);
         for banned in ["SystemTime::now", "process::id", "UNIX_EPOCH"] {
             assert_eq!(
                 prod.matches(banned).count(),

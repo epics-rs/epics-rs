@@ -55,22 +55,18 @@ impl SimMotorHolder {
                 ArgDesc {
                     name: "port",
                     arg_type: ArgType::String,
-                    optional: false,
                 },
                 ArgDesc {
                     name: "lowLimit",
                     arg_type: ArgType::Double,
-                    optional: false,
                 },
                 ArgDesc {
                     name: "highLimit",
                     arg_type: ArgType::Double,
-                    optional: false,
                 },
                 ArgDesc {
                     name: "pollMs",
                     arg_type: ArgType::Int,
-                    optional: true,
                 },
             ],
             "simMotorCreate(port, lowLimit, highLimit, [pollMs]) - Create a simulated motor",

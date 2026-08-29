@@ -58,7 +58,7 @@ impl OctetInterpose for FlushTimeoutInterpose {
     fn flush(&mut self, user: &mut AsynUser, next: &mut dyn OctetNext) -> AsynResult<()> {
         // Save the user's original timeout and set our short flush timeout
         let save_timeout = user.timeout;
-        user.timeout = self.flush_timeout;
+        user.timeout = Some(self.flush_timeout);
 
         // Discard stale data by reading until nothing comes back.
         //
@@ -182,12 +182,12 @@ mod tests {
         let mut base = FlushableBase::new(0);
         let original_timeout = Duration::from_secs(5);
         let mut user = AsynUser {
-            timeout: original_timeout,
+            timeout: Some(original_timeout),
             ..Default::default()
         };
 
         interpose.flush(&mut user, &mut base).unwrap();
-        assert_eq!(user.timeout, original_timeout);
+        assert_eq!(user.timeout, Some(original_timeout));
     }
 
     /// One lower-layer read outcome. These are the drain loop's boundaries:

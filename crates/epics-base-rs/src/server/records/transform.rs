@@ -15,12 +15,12 @@ use crate::server::database::AsyncDbHandle;
 const NUM_CHANNELS: usize = 16; // A-P
 
 /// The sixteen channel value fields, in `A..P` order — the set C's `monitor()`
-/// walks (`transformRecord.c:796-806`) and the only fields it posts.
+/// walks (`transformRecord.c:797-806`) and the only fields it posts.
 const CHANNEL_FIELDS: &[&str] = &[
     "A", "B", "C", "D", "E", "F", "G", "H", "I", "J", "K", "L", "M", "N", "O", "P",
 ];
 
-/// C `transformRecord.c:211` `#define COMMENT_SIZE 39` — the `CMTx` field width
+/// C `transformRecord.c:210` `#define COMMENT_SIZE 39` — the `CMTx` field width
 /// (`transformRecord.dbd:681` `size(39)`). `getMacros` plants the terminator at
 /// `[COMMENT_SIZE-1]` and scans the macro name with `j < COMMENT_SIZE-1`, so a
 /// macro name is at most 38 bytes including its leading `$`.
@@ -29,7 +29,7 @@ const COMMENT_SIZE: usize = 39;
 /// Code version reported by `VERS` (C `transformRecord.c:92 #define VERSION 5.8`).
 const VERSION: f64 = 5.8;
 
-/// C `transformRecord.c:754-766` `get_precision` names `VERS` and answers a
+/// C `transformRecord.c:752-767` `get_precision` names `VERS` and answers a
 /// LITERAL 2, ahead of the `fieldIndex >= transformRecordVAL` arm that serves
 /// `prec->prec` — so `caget -s T.VERS` reads `5.80` however PREC is set.
 const TRANSFORM_VERS_PRECISION: i16 = 2;
@@ -55,7 +55,7 @@ pub struct TransformRecord {
     /// `LA..LP` — "Prev Value of A".."Prev Value of P"
     /// (`transformRecord.dbd:505-584`, DBF_DOUBLE, `special(SPC_NOMOD)`).
     ///
-    /// C's `monitor()` (`transformRecord.c:797-804`) is the only writer: it
+    /// C's `monitor()` (`transformRecord.c:797-806`) is the only writer: it
     /// posts each changed channel and copies the posted value into its `l*`
     /// cell, so once `monitor()` has run, `l* == *` for every channel. They
     /// diverge only between cycles — a client writing `A` on a non-Passive
@@ -75,7 +75,7 @@ pub struct TransformRecord {
     ///
     /// They are OPI labels, and a comment whose FIRST character is `$` also
     /// DEFINES A MACRO for the calc expressions: `getMacros`
-    /// (`transformRecord.c:257-294`) takes `$` plus every non-space character
+    /// (`transformRecord.c:257-295`) takes `$` plus every non-space character
     /// that follows as the name and this channel's own letter as the
     /// replacement, so `CMTA="$in"` makes `$in` mean `A` in every CLCx. Without
     /// them the expression side has no macro source at all and a macro-using
@@ -102,10 +102,10 @@ pub struct TransformRecord {
     /// inside `dbGetLink`, i.e. before the record body reads it
     /// (`transformRecord.c:554`).
     nsev: AlarmSeverity,
-    /// `dbCommon.udf` as transform maintains it. C `transformRecord.c:521`
+    /// `dbCommon.udf` as transform maintains it. C `transformRecord.c:524`
     /// clears `ptran->udf` at the top of every `process()` and sets it TRUE
     /// only where a channel's `sCalcPerform` fails (`:593-596`, alongside
-    /// `recGblSetSevr(CALC_ALARM, INVALID_ALARM)`); `checkAlarms` (`:773-779`)
+    /// `recGblSetSevr(CALC_ALARM, INVALID_ALARM)`); `checkAlarms` (`:771-782`)
     /// then raises `UDF_ALARM` at `UDFS`. It is a per-cycle flag, not a
     /// property of any value — transform's VAL is an inert dummy (R9-62), so
     /// the framework's default `value_is_undefined()` (VAL is NaN) can never
@@ -113,17 +113,19 @@ pub struct TransformRecord {
     /// [`Record::check_alarms`] read this cell.
     calc_failed: bool,
     /// `IAV..IPV` / `OAV..OPV` — the per-channel link-connection status C
-    /// derives in `init_record` (`transformRecord.c:443-472`) and re-derives in
-    /// `special()` on any INPx/OUTx put (`:712-740`). Written only by
+    /// derives in `init_record` (`transformRecord.c:444-473`) and re-derives in
+    /// `special()` on any INPx/OUTx put (`:709-742`). Written only by
     /// [`Self::refresh_link_status`] (through `post_fields`), never by a
     /// client: the fields are `special(SPC_NOMOD)`.
     in_status: [i16; NUM_CHANNELS],
     out_status: [i16; NUM_CHANNELS],
     /// Async surface + generation gate for `refresh_link_status`, the shape
-    /// calcout/sseq/swait use (see `link_status::post_link_status`).
+    /// calcout/scalcout/acalcout use (see `link_status::post_link_status`).
+    /// sseq and swait own link-status fields too but post them from their own
+    /// refresh, because their field sets are not one enum per link.
     async_ctx: Option<(String, AsyncDbHandle)>,
     link_gen: LinkStatusGen,
-    /// C `transformRecord.c:808` `prpvt->firstCalcPosted`. `rpvt` is
+    /// C `transformRecord.c:807` `prpvt->firstCalcPosted`. `rpvt` is
     /// `calloc`'d in `init_record`, `monitor()` sets this to 1
     /// UNCONDITIONALLY after its post loop (`:807`), and nothing ever clears
     /// it — so it fires on exactly one process cycle per IOC lifetime, and it
@@ -186,7 +188,7 @@ impl TransformRecord {
         }
     }
 
-    /// C `convertExpression` (`transformRecord.c:384-389`): shortcuts first,
+    /// C `convertExpression` (`transformRecord.c:384-390`): shortcuts first,
     /// then macros. The order is the point — `convertShortcuts` runs first
     /// precisely so that a user macro cannot shadow a built-in function
     /// spelling (`:228-238` says so at length).
@@ -200,8 +202,8 @@ impl TransformRecord {
         String::from_utf8_lossy(&expanded).into_owned()
     }
 
-    /// C `getMacros` (`transformRecord.c:257-294`) followed by `sortMacros`
-    /// (`:239-254`).
+    /// C `getMacros` (`transformRecord.c:257-295`) followed by `sortMacros`
+    /// (`:241-255`).
     ///
     /// A comment defines a macro only when its first character is `$`; the name
     /// then runs to the first whitespace, bounded by the field width, and the
@@ -308,7 +310,7 @@ impl TransformRecord {
         Self::link_is_constant(&parse_output_link_v2(&self.out_links[i]))
     }
 
-    /// C's `same` test, `transformRecord.c:574-575`:
+    /// C's `same` test, `transformRecord.c:573-575`:
     ///
     /// ```c
     /// pu = (int *)pval;  plu = (int *)plval;
@@ -333,7 +335,7 @@ impl TransformRecord {
     /// A..P.
     ///
     /// Each is DERIVED from its link, never client-set: C `init_record`
-    /// (`transformRecord.c:430-471`) and `checkLinks` (`:713-741`) classify the
+    /// (`transformRecord.c:444-473`) and `special()` (`:709-742`) classify the
     /// link and store `transformIAV_CON` (=3) for every CONSTANT link, and a
     /// default record has all links constant. As with the sibling `acalcout`
     /// calc record, this port classifies the status STATICALLY (there is no
@@ -360,8 +362,8 @@ impl TransformRecord {
     }
 
     /// Classify all 32 links and publish `IAV..IPV` / `OAV..OPV`, mirroring C
-    /// `transformRecord.c::init_record` (443-472) and the `special()`
-    /// re-classification (712-740). No-op without an async context.
+    /// `transformRecord.c::init_record` (444-473) and the `special()`
+    /// re-classification (709-742). No-op without an async context.
     fn refresh_link_status(&self) {
         let mut links: Vec<(&'static str, String, LinkRole)> = Vec::with_capacity(2 * NUM_CHANNELS);
         for i in 0..NUM_CHANNELS {
@@ -376,7 +378,13 @@ impl TransformRecord {
                 LinkRole::Output,
             ));
         }
-        post_link_status(self.async_ctx.as_ref(), &self.link_gen, links);
+        // C `transformRecord.c:741`, `:858`, `:863`.
+        post_link_status(
+            self.async_ctx.as_ref(),
+            &self.link_gen,
+            links,
+            crate::server::recgbl::EventMask::VALUE | crate::server::recgbl::EventMask::LOG,
+        );
     }
 
     /// LA..LP — "Prev Value of A".."Prev Value of P"
@@ -400,14 +408,20 @@ struct TransformMacro {
     letter: u8,
 }
 
-/// C's `isspace()` in the "C" locale, which is what `getMacros` (`:277`) ends
+/// C's `isspace()` in the "C" locale, which is what `getMacros` (`:276`) ends
 /// the macro name on: space and the five control characters `\t`..`\r`.
 fn is_c_space(b: u8) -> bool {
     b == b' ' || (b'\t'..=b'\r').contains(&b)
 }
 
-/// C `shortcuts[]` (`transformRecord.c:333-341`), applied before macros so a
-/// user macro can never shadow a built-in function spelling.
+/// C `shortcuts[]` (`transformRecord.c:333-343`), applied before macros so a
+/// user macro can never shadow a built-in function spelling. The six rows are
+/// `:337-342` — `$P(`, `$T(`, `$W(`, `$S(`, `$R(`, `$E(` — inside the
+/// `struct shortcut ... shortcuts[NUMSHORTCUTS] = {` opening at `:333-336` and
+/// the `};` at `:343`. (`cdbcd708`, which widened this citation from the
+/// earlier `:333-341`, said that range dropped two rows, `$R(` and `$E(`. It
+/// dropped one row and the terminator: `:341` IS `{"$R(", "$READ("},`, so what
+/// fell outside was `$E(` at `:342` and the closing `};` at `:343`.)
 ///
 /// **One deliberate deviation, and it is the whole reason this comment is
 /// long.** C's replacements carry a leading `$` — `{"$P(", "$PRINTF("}` — and
@@ -425,7 +439,7 @@ fn is_c_space(b: u8) -> bool {
 /// element (`sCalcPostfix.c:173-174`), so a working expression keeps working
 /// and keeps its meaning, while the ordering the table exists for still holds:
 /// the shortcut is consumed before `convert_macros` runs, and the result
-/// carries no `$` for a macro to match. `doc/upstream-c-bugs.md` CBUG-H1.
+/// carries no `$` for a macro to match.
 const SHORTCUTS: [(&str, &str); 6] = [
     ("$P(", "PRINTF("),
     ("$T(", "TR_ESC("),
@@ -435,7 +449,7 @@ const SHORTCUTS: [(&str, &str); 6] = [
     ("$E(", "ESC("),
 ];
 
-/// C `convertShortcuts` (`:368-380`) — every entry of [`SHORTCUTS`] applied in
+/// C `convertShortcuts` (`:370-381`) — every entry of [`SHORTCUTS`] applied in
 /// table order.
 fn convert_shortcuts(src: &[u8]) -> Vec<u8> {
     SHORTCUTS
@@ -445,7 +459,7 @@ fn convert_shortcuts(src: &[u8]) -> Vec<u8> {
         })
 }
 
-/// C `convertShortcut` (`:343-366`): a case-insensitive (`epicsStrnCaseCmp`)
+/// C `convertShortcut` (`:345-368`): a case-insensitive (`epicsStrnCaseCmp`)
 /// literal scan-and-replace across the whole expression, quoted string
 /// literals included — C draws no such boundary.
 fn replace_ci(src: &[u8], target: &[u8], replacement: &[u8]) -> Vec<u8> {
@@ -463,7 +477,7 @@ fn replace_ci(src: &[u8], target: &[u8], replacement: &[u8]) -> Vec<u8> {
     out
 }
 
-/// C `convertMacros` (`:296-330`). At a `$` the sorted table is walked and each
+/// C `convertMacros` (`:297-329`). At a `$` the sorted table is walked and each
 /// entry matching at the cursor — case-insensitively, longest name first — is
 /// consumed in turn; anything else is copied one byte and the scan advances.
 fn convert_macros(src: &[u8], macros: &[TransformMacro]) -> Vec<u8> {
@@ -552,7 +566,7 @@ impl Record for TransformRecord {
     }
 
     fn process(&mut self) -> CaResult<ProcessOutcome> {
-        // C `transformRecord.c:521` `ptran->udf = FALSE;` — the very first
+        // C `transformRecord.c:524` `ptran->udf = FALSE;` — the very first
         // thing every cycle does, including the IVLA-abandoned one below (C
         // clears it before the test), so the flag only ever reports THIS
         // cycle's calc failures.
@@ -590,7 +604,7 @@ impl Record for TransformRecord {
         // the take sits below that return, not above it).
         let map = std::mem::take(&mut self.map);
 
-        // Evaluate each calc expression A-P. synApps `transformRecord.c:584-591`:
+        // Evaluate each calc expression A-P. synApps `transformRecord.c:584-598`:
         //
         //   new_value   = (!same || ((ptran->map & (1<<i)) != 0));
         //   postfix_ok  = *pclcbuf && (*prpcbuf != BAD_EXPRESSION);
@@ -606,7 +620,7 @@ impl Record for TransformRecord {
         //       - `!same`: the channel's value differs from the LA..LP cell C's
         //         `monitor()` left behind — which catches every write that does
         //         NOT go through `special()`, notably the CONSTANT-INPx re-seed
-        //         (`:717`, R19-1) and a store opcode in a SIBLING channel's
+        //         (`:718`, R19-1) and a store opcode in a SIBLING channel's
         //         expression (`CLCB="A:=A+1"` writes A through `&ptran->a`).
         //     A channel holding such a value keeps it for one cycle instead of
         //     being overwritten by its own CLCx.
@@ -640,7 +654,7 @@ impl Record for TransformRecord {
                 //
                 // But the failing status does NOT cancel the write: C's epilogue
                 // stores `*presult` and only THEN returns -1, so the channel
-                // KEEPS the inf/NaN and `:594-596` alarms beside it — and the
+                // KEEPS the inf/NaN and `:594-595` alarms beside it — and the
                 // OUTx loop below fans that non-finite value out. Only the
                 // OTHER -1 (an operator refusing outright: `1/0`, `SQRT(-1)`)
                 // leaves the channel untouched, because C returns before the
@@ -678,7 +692,7 @@ impl Record for TransformRecord {
                         //
                         // Written FIRST, unconditionally: a non-finite result is
                         // stored in the channel and THEN alarmed
-                        // (`transformRecord.c:593-597` keeps `*pval` = inf and
+                        // (`transformRecord.c:593-596` keeps `*pval` = inf and
                         // fans it through OUTx).
                         self.vals[i] = result.val;
                         if result.non_finite {
@@ -726,12 +740,12 @@ impl Record for TransformRecord {
             });
         }
 
-        // C `monitor()` (`transformRecord.c:797-804`): every channel it posts,
+        // C `monitor()` (`transformRecord.c:797-806`): every channel it posts,
         // it copies into the channel's `l*` cell — and it posts exactly the
         // channels that differ from it. So the state `monitor()` leaves behind
         // is `l* == *` for ALL channels, which is this one assignment. It is
         // deliberately NOT reached by the IVLA "Do Nothing" early return above:
-        // that path (`:544-549`) runs checkAlarms/recGblResetAlarms and returns
+        // that path (`:554-560`) runs checkAlarms/recGblResetAlarms and returns
         // WITHOUT calling `monitor()`, so LA..LP keep the values from the last
         // cycle that did.
         self.lvals = self.vals;
@@ -890,7 +904,7 @@ impl Record for TransformRecord {
 
     fn set_async_context(&mut self, name: String, db: AsyncDbHandle) {
         self.async_ctx = Some((name, db));
-        // C `init_record` (transformRecord.c:443-472) classifies all 32 links
+        // C `init_record` (transformRecord.c:444-473) classifies all 32 links
         // before any process. Both link tables are transform-owned fields,
         // already applied by the time `add_record` runs, so one refresh here
         // covers what C's init loop does.
@@ -907,14 +921,14 @@ impl Record for TransformRecord {
     /// `new_value` at all.
     fn special(&mut self, field: &str, after: bool) -> CaResult<()> {
         if after {
-            // C `transformRecord.c:698-704` marks the bitmap only for a field
+            // C `transformRecord.c:699-705` marks the bitmap only for a field
             // in the `A..P` range (`i = fieldIndex - transformRecordA; if ((i
             // >= 0) && (i < MAX_FIELDS))`). VAL sits below `transformRecordA`,
             // so a put to VAL marks nothing — it is not a channel.
             if let Some(i) = Self::channel_index(field) {
                 self.map[i] = true;
             }
-            // C `transformRecord.c:708-741` re-classifies the link a put just
+            // C `transformRecord.c:709-742` re-classifies the link a put just
             // re-pointed, over the whole INPA..OUTP range.
             if Self::inp_field_index(field).is_some() || Self::out_field_index(field).is_some() {
                 self.refresh_link_status();
@@ -976,11 +990,11 @@ impl Record for TransformRecord {
         }
     }
 
-    /// C `transformRecord.c:593-595`: a channel whose `sCalcPerform` failed
+    /// C `transformRecord.c:593-596`: a channel whose `sCalcPerform` failed
     /// raises `recGblSetSevr(ptran, CALC_ALARM, INVALID_ALARM)`. Raised from
     /// the `checkAlarms` slot, which the framework runs BEFORE
     /// `rec_gbl_check_udf` — so on a calc failure CALC_ALARM lands first and
-    /// the equal-severity UDF_ALARM (`checkAlarms`, `:773-779`) cannot displace
+    /// the equal-severity UDF_ALARM (`checkAlarms`, `:771-782`) cannot displace
     /// it under `rec_gbl_set_sevr`'s strict-greater rule. Same order, same
     /// outcome as C.
     fn check_alarms(&mut self, common: &mut crate::server::record::CommonFields) {
@@ -995,14 +1009,14 @@ impl Record for TransformRecord {
 
     /// C `transformRecord.c:793-794` throws away `recGblResetAlarms`'s mask —
     /// it assigns `monitor_mask = DBE_VALUE|DBE_LOG` over it — and the A..P
-    /// change loop (:796-806) posts every one of the sixteen value fields with
+    /// change loop (:797-806) posts every one of the sixteen value fields with
     /// that literal. No transform field ever carries an alarm bit, so a
     /// `DBE_ALARM`-only subscriber on `.A` is notified on no cycle at all.
     fn fields_posted_without_alarm_bits(&self) -> &'static [&'static str] {
         CHANNEL_FIELDS
     }
 
-    /// C `transformRecord.c::monitor()` (`:786-808`) is the record's ONLY
+    /// C `transformRecord.c::monitor()` (`:786-809`) is the record's ONLY
     /// `db_post_events` caller, and it posts exactly the sixteen channels
     /// A..P — the changed ones (plus every one of them on the first post).
     /// Nothing else. In particular it does NOT post `VAL`: transform's VAL is
@@ -1056,7 +1070,7 @@ impl Record for TransformRecord {
         crate::server::record::seed_input_links(self.multi_input_links())
     }
 
-    /// C `transformRecord.c::special` (714-719) — a runtime put to an INPn that
+    /// C `transformRecord.c::special` (715-723) — a runtime put to an INPn that
     /// leaves the link CONSTANT re-runs `recGblInitConstantLink(plink,
     /// DBF_DOUBLE, pvalue)` and posts the value field. C guards it with
     /// `if (fieldIndex < transformRecordOUTA)`: the OUT half of the same
@@ -1066,7 +1080,7 @@ impl Record for TransformRecord {
         self.multi_input_links()
     }
 
-    /// C `transformRecord.c:718` posts the re-seeded value with
+    /// C `transformRecord.c:719` posts the re-seeded value with
     /// `DBE_VALUE | DBE_LOG` — unlike the calcout family's bare `DBE_VALUE`.
     fn special_reseed_post_mask(&self) -> crate::server::recgbl::EventMask {
         crate::server::recgbl::EventMask::VALUE | crate::server::recgbl::EventMask::LOG
@@ -1217,7 +1231,7 @@ mod tests {
     ///
     /// C `transformRecord.c:593-596`:
     /// `if (sCalcPerform(...)) { recGblSetSevr(ptran, CALC_ALARM, INVALID_ALARM);
-    /// ptran->udf = TRUE; }`, and `checkAlarms` (`:773-779`) then raises
+    /// ptran->udf = TRUE; }`, and `checkAlarms` (`:771-782`) then raises
     /// UDF_ALARM at UDFS. The port raised nothing at all.
     #[test]
     fn r9_63_calc_failure_raises_calc_alarm_and_udf() {
@@ -1248,7 +1262,7 @@ mod tests {
     }
 
     /// The flag is per-cycle: C clears `ptran->udf` at the top of every
-    /// `process()` (`transformRecord.c:521`), so a cycle whose calc succeeds
+    /// `process()` (`transformRecord.c:524`), so a cycle whose calc succeeds
     /// clears the alarm the previous failure raised.
     #[test]
     fn r9_63_calc_success_clears_the_previous_failure() {

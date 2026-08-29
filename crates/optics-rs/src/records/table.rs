@@ -2846,6 +2846,21 @@ impl Record for TableRecord {
                 }
             };
         }
+        // Copy into an `SPC_DBADDR` channel's cells, C's array-row put: from
+        // element 0, truncated to whichever runs out first (`dbAccess.c:1360`).
+        macro_rules! put_dbaddr_array {
+            ($cells:expr) => {{
+                let src: &[f64] = match value {
+                    EpicsValue::DoubleArray(ref v) => v.as_slice(),
+                    EpicsValue::Double(ref v) => std::slice::from_ref(v),
+                    _ => return Err(CaError::TypeMismatch(name.into())),
+                };
+                for (cell, v) in $cells.zip(src.iter()) {
+                    *cell = *v;
+                }
+                Ok(())
+            }};
+        }
         macro_rules! put_enum {
             ($field:expr, $conv:expr) => {
                 match value {
@@ -2973,6 +2988,34 @@ impl Record for TableRecord {
             "PREC" => put_short!(self.prec),
             "GEOM" => put_enum!(self.geom, Geometry::from_u16),
             "AUNIT" => put_enum!(self.aunit, AngleUnit::from_u16),
+            // The write half of the eight `special(SPC_DBADDR)` fields, the
+            // same channels `get_field` serves above. `tableRecord.dbd:828-883`
+            // declares each of them `DBF_NOACCESS` and `cvt_dbaddr`
+            // (`tableRecord.c:727-745`) redirects the channel to the record's
+            // own storage, so the put is an ordinary array write into that
+            // memory:
+            //
+            //   - `dbAccess.c:1350` sends a put to an `SPC_DBADDR` field down
+            //     the ARRAY row whatever its element count is, so a one-element
+            //     put writes element 0 rather than taking the scalar row.
+            //   - `:1360` truncates to the channel's `no_elements` — 9 for the
+            //     matrices, 3 for a pivot point — and copies from element 0, so
+            //     a short put leaves the tail of the field standing.
+            //   - `tableRecord.c:171-172` defines neither `get_array_info` nor
+            //     `put_array_info`, so there is no offset and no stored count.
+            //   - SPC_DBADDR is 2, below `SPC_MOD` (`special.h:27,33`), and
+            //     `dbPutSpecial` (`dbAccess.c:122-135`) matches none of its
+            //     three sub-100 arms — no `special()` callback runs. The
+            //     elements land and nothing else happens, which is why these
+            //     arms recompute nothing.
+            "A" => put_dbaddr_array!(self.a.iter_mut().flatten()),
+            "B" => put_dbaddr_array!(self.b.iter_mut().flatten()),
+            "PP0" => put_dbaddr_array!(self.pp0.iter_mut()),
+            "PP1" => put_dbaddr_array!(self.pp1.iter_mut()),
+            "PP2" => put_dbaddr_array!(self.pp2.iter_mut()),
+            "PPO0" => put_dbaddr_array!(self.ppo0.iter_mut()),
+            "PPO1" => put_dbaddr_array!(self.ppo1.iter_mut()),
+            "PPO2" => put_dbaddr_array!(self.ppo2.iter_mut()),
             _ => Err(CaError::FieldNotFound(name.into())),
         }
     }
@@ -3185,7 +3228,7 @@ impl Record for TableRecord {
     /// (the six user coordinates AX,AY,AZ,X,Y,Z report disp & ctrl limits =
     /// `(hlax[i], llax[i])`; :784-787, :801-804), and `get_precision`
     /// (`VERS` → 2, every other record-specific field → the `PREC` field,
-    /// dbCommon → `recGblGetPrec`; :818-826). The framework has no record-level
+    /// dbCommon → `recGblGetPrec`; :819-826). The framework has no record-level
     /// metadata for
     /// the `table` type, so without this hook a DBR_GR/CTRL/units request
     /// returned no units and default (unset) limits.
@@ -3204,7 +3247,7 @@ impl Record for TableRecord {
             ..Default::default()
         };
 
-        // C get_precision (tableRecord.c:818-826): VERS reports precision 2;
+        // C get_precision (tableRecord.c:813-828): VERS reports precision 2;
         // every other record-specific field (fieldIndex >= tableRecordVAL)
         // reports the record's PREC field; dbCommon fields (index < VAL) fall
         // through to the framework's recGblGetPrec. `field_list()` holds exactly
@@ -5372,7 +5415,7 @@ mod rset_routing_tests {
     /// coordinates `AX`..`Z`, answered from `hlax[i]`/`llax[i]` — and hand
     /// every other field to `recGblGetGraphicDouble` /
     /// `recGblGetControlDouble`. `VAL` is not in that window, so C serves it
-    /// the DBF_DOUBLE type range (`recGbl.c:55` `getMaxRangeValues`), and the
+    /// the DBF_DOUBLE type range (`recGbl.c:413-416` `getMaxRangeValues`), and the
     /// port served the record-level cache instead — which `table` never
     /// populates, so the wire carried 0/0 on a channel that declares both
     /// leaves.

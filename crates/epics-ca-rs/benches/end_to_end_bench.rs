@@ -16,6 +16,11 @@
 //! Tracking baselines: see `BENCHMARKS.md` for the numbers that
 //! were current when this file landed. Use them to spot regressions
 //! when refactoring hot paths.
+// On `exec_backend` this program's `main` refuses instead of running, so
+// everything below it is unreachable in that configuration by construction.
+// The lint is reporting the intent, not dead code: the default build still
+// lints this file in full.
+#![cfg_attr(exec_backend, allow(dead_code, unused_imports))]
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -25,6 +30,7 @@ use tokio::runtime::Runtime;
 
 use epics_base_rs::types::EpicsValue;
 use epics_ca_rs::client::CaClient;
+#[cfg(tokio_backend)]
 use epics_ca_rs::server::CaServer;
 
 fn make_runtime() -> Runtime {
@@ -35,6 +41,7 @@ fn make_runtime() -> Runtime {
         .expect("tokio runtime")
 }
 
+#[cfg(tokio_backend)]
 /// Spin up a softioc populated with N PVs of the given type on a
 /// kernel-assigned port. Returns `(server_handle, udp_port)`. The
 /// server is bound and accepting by the time this returns; it runs
@@ -65,6 +72,7 @@ fn point_addr_list_at(port: u16) {
     }
 }
 
+#[cfg(tokio_backend)]
 fn bench_caget(c: &mut Criterion) {
     let rt = make_runtime();
     let (_server, port) = rt.block_on(boot_softioc(8));
@@ -91,6 +99,7 @@ fn bench_caget(c: &mut Criterion) {
     });
 }
 
+#[cfg(tokio_backend)]
 /// Parallel reads — exercises the Option C direct-dispatch path.
 /// Pre-Phase-A this benchmark measured ~1.8 ms wall against a
 /// localhost IOC for 20 channels because every read serialised
@@ -138,6 +147,7 @@ fn bench_bulk_caget(c: &mut Criterion) {
     });
 }
 
+#[cfg(tokio_backend)]
 /// Bulk reads over persistent channels using the batched `get_many`
 /// API. This is the closest Rust-side analogue to libca's "queue N
 /// reads, flush once, then collect completions" path.
@@ -177,6 +187,7 @@ fn bench_bulk_get_many(c: &mut Criterion) {
     });
 }
 
+#[cfg(tokio_backend)]
 /// Bulk-read scaling bench: same in-process softIoc, vary N over
 /// {10, 20, 50, 100} to expose super-linear scaling on the server's
 /// response path. Measures the same `get_many` route as
@@ -222,6 +233,7 @@ fn bench_bulk_get_many_scaling(c: &mut Criterion) {
     group.finish();
 }
 
+#[cfg(tokio_backend)]
 /// Bulk reads by PV name. First warm call populates CaClient's
 /// one-shot channel cache; timed iterations should then take the same
 /// hot batched-read path as `get_many`.
@@ -254,6 +266,7 @@ fn bench_bulk_caget_many(c: &mut Criterion) {
     });
 }
 
+#[cfg(tokio_backend)]
 fn bench_caput(c: &mut Criterion) {
     let rt = make_runtime();
     let (_server, port) = rt.block_on(boot_softioc(1));
@@ -274,6 +287,7 @@ fn bench_caput(c: &mut Criterion) {
     });
 }
 
+#[cfg(tokio_backend)]
 criterion_group! {
     name = e2e;
     // Lower sample size — each iteration is an actual TCP round-trip,
@@ -284,4 +298,16 @@ criterion_group! {
         .warm_up_time(Duration::from_secs(2));
     targets = bench_caget, bench_bulk_caget, bench_bulk_get_many, bench_bulk_get_many_scaling, bench_bulk_caget_many, bench_caput
 }
+#[cfg(tokio_backend)]
 criterion_main!(e2e);
+
+/// The `exec_backend` arm. Every benchmark here drives a live in-process
+/// softIoc over the async CA front-end, which is `tokio_backend`-only, so on
+/// the reactor-free backend there is nothing to measure.
+#[cfg(exec_backend)]
+fn main() {
+    eprintln!(
+        "end_to_end_bench: needs the tokio backend; this build selects \
+         EPICS_RS_BUILD_EXEC_BACKEND=thread."
+    );
+}

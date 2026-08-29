@@ -93,9 +93,8 @@ let mut app = IocApplication::new();
 app = asyn_rs::adapter::register_asyn_device_support(app);
 app = register_mqtt_commands(app, handle, trace);
 
-app.startup_script("st.cmd")
-    .run(epics_ca_rs::server::run_ca_ioc)
-    .await
+// The `_app` entry point runs C's `rsrvRegistrar` before the script.
+epics_ca_rs::server::run_ca_ioc_app(app.startup_script("st.cmd")).await
 ```
 
 ## Zigbee2MQTT Builders

@@ -309,7 +309,7 @@ fn test_process_idle_no_change() {
     assert_eq!(rec.us, 0);
 }
 
-// C `scalerRecord.c:471,770-787` — `process()` calls `monitor()` (the
+// C `scalerRecord.c:471,770-772` — `process()` calls `monitor()` (the
 // S1..Snch DBE_LOG sweep) ONLY while `ss == SCALER_STATE_IDLE`. So the
 // record advertises the active-channel sweep set only when idle, and an
 // empty set while counting or waiting.
@@ -336,7 +336,7 @@ fn test_log_swept_fields_idle_active_channels_only() {
 // Every C `scalerRecord.c` post outside the idle `monitor()` sweep is a literal
 // `DBE_VALUE`: the process/updateCounts posts of CNT/T/VAL/PR1/TP/FREQ and the
 // active channels' Sn (:316/322/329/334/372/425/427/430/478/530/582/588), AND
-// the `special()` posts of PRn/Gn/Dn (:673-676, :682-687, :703-705, :716). The
+// the `special()` posts of PRn/Gn/Dn (:673-676, :682-687, :705-706, :719). The
 // only `DBE_LOG` post is the idle sweep of S1..Snch (line 771). The record
 // advertises all of them as value-only so the framework strips the LOG bit —
 // which for PRn/Gn/Dn means a DBE_LOG subscriber never sees them at all, as in C.

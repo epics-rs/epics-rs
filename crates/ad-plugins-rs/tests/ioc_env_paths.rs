@@ -1,5 +1,8 @@
 //! `AdIoc::new()` publishes the search paths an st.cmd resolves `$(ADCORE)/...`
 //! against. Every one of them must name a directory that actually exists.
+// `ad_plugins_rs::ioc` mounts on the tokio-backend-only IOC runners, so
+// this file is gated with the module it exercises.
+#![cfg(tokio_backend)]
 #![cfg(feature = "ioc")]
 
 use std::collections::HashMap;

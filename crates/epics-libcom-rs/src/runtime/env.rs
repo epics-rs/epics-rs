@@ -47,7 +47,7 @@ impl EnvParam {
     /// `None`.
     ///
     /// The `None`/`Some` answer is a load-bearing *presence* test, not just an
-    /// absence check: `caservertask.c:491-508` uses it to pick *which* of two
+    /// absence check: `caservertask.c:492-509` uses it to pick *which* of two
     /// parameters to resolve, so `FOO=` must read as "not configured".
     pub fn get(&self) -> Option<String> {
         let v = std::env::var(self.name).unwrap_or_else(|_| self.default.to_string());
@@ -121,7 +121,7 @@ impl EnvParam {
     ///
     /// `fallback` is the *compiled* port the C caller passes as `defaultPort`
     /// — for the `EPICS_CAS_*` overrides that is a **different** parameter's
-    /// default (`caservertask.c:491-508` passes `CA_SERVER_PORT`), which is why
+    /// default (`caservertask.c:493-494` passes `CA_SERVER_PORT`), which is why
     /// it is an argument rather than `self.default`. Derive it with
     /// [`EnvParam::default_port`] so it still comes from the table.
     ///

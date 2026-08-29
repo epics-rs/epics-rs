@@ -2,7 +2,8 @@
 //!
 //! Built on top of the native runtime in [`crate::server_native`].
 
-// RTEMS-EXEC-MODEL-ALLOW(1): checked - these run and pass in the feature-ON suite.
+// RTEMS-EXEC-MODEL-ALLOW(1): checked - these run and pass in the exec-backend
+// suite.
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -199,9 +200,13 @@ impl PvaServer {
     }
 
     /// As [`Self::run`], but publishes a [`ServerReportHandle`] into
-    /// `report_tx` the instant the native server binds. Backs the iocsh
-    /// `pvxsr` command on the default-source shell path
-    /// ([`Self::run_with_shell`]).
+    /// `report_tx` the instant the native server binds.
+    ///
+    /// The iocsh `pvxsr` command does NOT ride on this channel: it is
+    /// registered by a registrar before any server exists, so it reads
+    /// `iocsh::publish_pvxs_report`, which every run path fills whether or
+    /// not a `report_tx` was supplied. This parameter is for a caller that
+    /// needs the handle in its own code.
     ///
     /// Paired with `from_parts(db, 0, ..)` this is **bind-and-read-back**: the
     /// handle's `report()` names the TCP/UDP ports the kernel actually
@@ -232,10 +237,10 @@ impl PvaServer {
 
     /// As [`Self::run_with_source`], but publishes a
     /// [`ServerReportHandle`] into `report_tx` the instant the native
-    /// server binds its listeners (so the actually-bound ports are
-    /// known). [`Self::run_with_source_and_shell`] uses this to back the
-    /// iocsh `pvxsr` command; the plain [`Self::run_with_source`] passes
-    /// `None`.
+    /// server binds its listeners (so the actually-bound ports are known).
+    /// Only a caller that needs the handle itself passes `Some`; the iocsh
+    /// `pvxsr` command reads `iocsh::publish_pvxs_report`, which this fills
+    /// on every path.
     async fn run_with_source_inner<S: ChannelSource + 'static>(
         &self,
         source: Arc<S>,
@@ -260,14 +265,19 @@ impl PvaServer {
         // ScanOwner`, started by `IocApplication::run` at the C `scanRun`
         // point or by the IOC entry binary — never by a protocol server.
 
+        // Every `run*` entry point funnels through here, so this is the one
+        // place the server needs the capability: the autosave tail is a
+        // reactor-bound task and says so in `AutosaveManager::start`.
+        let reactor = epics_base_rs::runtime::task::Reactor::current()
+            .expect("the PVA server's run loop is awaited on an executor");
         let autosave_handle = if let Some(ref mgr) = self.autosave_manager {
-            Some(mgr.clone().start(self.db.clone()))
+            Some(mgr.clone().start(&reactor, self.db.clone()))
         } else if let Some(ref cfg) = self.autosave_config {
             let builder = autosave::AutosaveBuilder::new().add_set(cfg.clone());
             // `build` cannot fail: a set it could not construct is reported
             // on the error log and carried as that set's error status, so
             // there is nothing left here to abandon the autosave task for.
-            Some(Arc::new(builder.build().await).start(self.db.clone()))
+            Some(Arc::new(builder.build().await).start(&reactor, self.db.clone()))
         } else {
             None
         };
@@ -276,11 +286,24 @@ impl PvaServer {
             source,
             config,
             move |handle| {
+                // pvxs `initialisePvxsServer` filling the `server()`
+                // singleton its already-registered `pvxsr` reads. Every
+                // caller publishes, shell or not, because the command may
+                // have been registered by `iocsh::register_pvxs_commands`
+                // at an application head this server knows nothing about.
+                super::iocsh::publish_pvxs_report(handle.clone());
                 if let Some(tx) = report_tx {
                     // Best-effort: a dropped receiver (no shell) just
                     // means nobody is watching the report.
                     let _ = tx.send(Some(handle));
                 }
+                // Last in the callback, after everything the bound half owes:
+                // bound, published, report handed out, and about to serve —
+                // the PVA layer's half of what C's `dbRunServers()` returns
+                // having done. Every `run*` entry funnels through here, so it
+                // is the one place the layer can say it, and `BuiltIoc::run`
+                // holds the startup script's `iocInit` line until it has.
+                epics_base_rs::server::db_server::announce_serving();
             },
         )
         .await
@@ -307,14 +330,16 @@ impl PvaServer {
 
         let server = Arc::new(self);
 
-        let (report_tx, report_rx) = watch::channel(None);
         let server_clone = server.clone();
-        let server_handle = epics_base_rs::runtime::task::spawn(async move {
-            server_clone.run_reporting(Some(report_tx)).await
-        });
+        let server_handle = bridge
+            .reactor()
+            .spawn(async move { server_clone.run_reporting(None).await });
 
         let (tx, rx) = epics_base_rs::runtime::sync::oneshot::channel();
         std::thread::spawn(move || {
+            // C runs `iocsh()` on the thread `epicsThreadInit` listed as
+            // `_main_` (`osdThread.c:406-412`); this driver runs it here.
+            epics_base_rs::runtime::task::register_main_thread();
             // Administer this server's live policy cell so an interactive
             // `asInit` is a real ACF (re)load, not a dead-end.
             let shell = iocsh::IocShell::new_with_acf(db, bridge, acf);
@@ -324,7 +349,7 @@ impl PvaServer {
                     shell.register(cmd);
                 }
             }
-            shell.register(super::iocsh::pvxsr_command(report_rx));
+            shell.register(super::iocsh::pvxsr_command());
             let result = shell.run_repl();
             let _ = tx.send(result);
         });
@@ -367,16 +392,16 @@ impl PvaServer {
 
         let server = Arc::new(self);
 
-        let (report_tx, report_rx) = watch::channel(None);
         let server_clone = server.clone();
-        let server_handle = epics_base_rs::runtime::task::spawn(async move {
-            server_clone
-                .run_with_source_inner(source, Some(report_tx))
-                .await
-        });
+        let server_handle = bridge
+            .reactor()
+            .spawn(async move { server_clone.run_with_source_inner(source, None).await });
 
         let (tx, rx) = epics_base_rs::runtime::sync::oneshot::channel();
         std::thread::spawn(move || {
+            // C runs `iocsh()` on the thread `epicsThreadInit` listed as
+            // `_main_` (`osdThread.c:406-412`); this driver runs it here.
+            epics_base_rs::runtime::task::register_main_thread();
             // Same as `run_with_shell`: the shell administers this
             // server's live policy cell.
             let shell = iocsh::IocShell::new_with_acf(db, bridge, acf);
@@ -386,7 +411,7 @@ impl PvaServer {
                     shell.register(cmd);
                 }
             }
-            shell.register(super::iocsh::pvxsr_command(report_rx));
+            shell.register(super::iocsh::pvxsr_command());
             let result = shell.run_repl();
             let _ = tx.send(result);
         });

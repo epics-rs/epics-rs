@@ -3,11 +3,11 @@
 //! C `transformRecord.c` never hands `sCalcPostfix` the stored infix. Both
 //! compile sites run `getMacros` and then `convertExpression`
 //! (`:426`/`:481-482` in `init_record`, `:682-684` in `special`), and
-//! `convertExpression` (`:384-389`) is `convertShortcuts` followed by
+//! `convertExpression` (`:384-390`) is `convertShortcuts` followed by
 //! `convertMacros`. A `CMTx` beginning with `$` defines a macro whose name is
 //! `$` plus the comment's leading non-space run and whose replacement is that
-//! channel's letter (`getMacros`, `:257-294`), matched case-insensitively and
-//! longest-name-first (`sortMacros`, `:239-254`; `convertMacros`, `:296-330`).
+//! channel's letter (`getMacros`, `:257-295`), matched case-insensitively and
+//! longest-name-first (`sortMacros`, `:241-255`; `convertMacros`, `:297-329`).
 //!
 //! Compiling the raw text instead makes every macro-using expression a syntax
 //! error, so the channel is never evaluated at all.
@@ -99,7 +99,7 @@ async fn the_longer_macro_name_wins_over_the_prefix_it_contains() {
     assert_eq!(channel(&db, "T.C"), 8.0, "$xy is B, not A followed by 'y'");
 }
 
-/// The name is `$` plus every non-space character (`:277` stops on `isspace`),
+/// The name is `$` plus every non-space character (`:276` stops on `isspace`),
 /// so a comment may carry prose after it; and a comment NOT starting with `$`
 /// defines nothing at all, which leaves the expression uncompilable and the
 /// channel untouched.
@@ -134,7 +134,7 @@ async fn the_macro_name_ends_at_the_first_space_and_needs_the_leading_dollar() {
     );
 }
 
-/// `convertMacros` compares with `epicsStrnCaseCmp` (`:312`).
+/// `convertMacros` compares with `epicsStrnCaseCmp` (`:313`).
 #[epics_macros_rs::epics_test]
 async fn the_macro_match_is_case_insensitive() {
     let db = PvDatabase::new();
@@ -180,9 +180,8 @@ async fn a_shortcut_is_expanded_before_the_macro_pass() {
 /// compiling the moment the conversion runs — measured against `libcalc` on
 /// this host: `$S("7","%d")` status 0, `$SSCANF("7","%d")` status -1 error 11.
 /// The port drops the `$` from the replacement and keeps the expression
-/// working, which is the one deliberate deviation in this fix
-/// (`doc/upstream-c-bugs.md` CBUG-H1); `SSCANF` and `$S` are the same element,
-/// so the value is unchanged.
+/// working, which is the one deliberate deviation in this fix; `SSCANF` and
+/// `$S` are the same element, so the value is unchanged.
 #[epics_macros_rs::epics_test]
 async fn the_shortcut_expansion_keeps_the_expression_compilable() {
     let db = PvDatabase::new();

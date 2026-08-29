@@ -64,11 +64,11 @@ async fn canonical_scan_labels_and_indices_still_resolve() {
     let db = ai_db().await;
 
     for (label, expect) in [
-        (".5 second", ScanType::Sec05),
-        (".2 second", ScanType::Sec02),
-        (".1 second", ScanType::Sec01),
+        (".5 second", ScanType::SEC05),
+        (".2 second", ScanType::SEC02),
+        (".1 second", ScanType::SEC01),
         ("I/O Intr", ScanType::IoIntr),
-        ("10 second", ScanType::Sec10),
+        ("10 second", ScanType::SEC10),
         ("Passive", ScanType::Passive),
     ] {
         db.put_record_field_from_ca("REC", "SCAN", EpicsValue::String(label.into()))
@@ -81,7 +81,7 @@ async fn canonical_scan_labels_and_indices_still_resolve() {
     db.put_record_field_from_ca("REC", "SCAN", EpicsValue::String("6".into()))
         .await
         .unwrap();
-    assert_eq!(scan_of(&db).await, ScanType::Sec1);
+    assert_eq!(scan_of(&db).await, ScanType::SEC1);
 }
 
 /// The case that used to end in `Passive` instead of an error: `from_u16`
@@ -104,7 +104,7 @@ async fn out_of_menu_scan_index_is_bad_choice_not_passive() {
         );
         // The refused put leaves the scan mechanism alone — C never reaches
         // the store, let alone `scanAdd`.
-        assert_eq!(scan_of(&db).await, ScanType::Sec1, "after {bad:?}");
+        assert_eq!(scan_of(&db).await, ScanType::SEC1, "after {bad:?}");
     }
 }
 
@@ -144,11 +144,11 @@ async fn sscn_sentinel_loads_from_db_but_is_refused_at_runtime() {
 
     inst.put_common_field_db_load("SSCN", EpicsValue::String("1 second".into()))
         .unwrap();
-    assert_eq!(inst.common.sscn, SimModeScan::from_scan(ScanType::Sec1));
+    assert_eq!(inst.common.sscn, SimModeScan::from_scan(ScanType::SEC1));
 
     let err = inst
         .put_common_field("SSCN", EpicsValue::String("65535".into()))
         .expect_err("putStringMenu bounds the index by nChoice");
     assert!(matches!(err, CaError::BadChoice(_)), "got {err:?}");
-    assert_eq!(inst.common.sscn, SimModeScan::from_scan(ScanType::Sec1));
+    assert_eq!(inst.common.sscn, SimModeScan::from_scan(ScanType::SEC1));
 }

@@ -48,7 +48,7 @@ use epics_base_rs::server::snapshot::PropertySupport;
 /// update (UDF -> NO_ALARM changed the alarm, so the record's `monitor()`
 /// OR'd in `DBE_ALARM`) and value+timeStamp on every update after it.
 pub fn event_leaves(mask: EventMask, props: PropertySupport, value_is_enum: bool) -> Vec<String> {
-    // `subscriptionValueCallback` normalization (`singlesource.cpp:85-93`).
+    // `subscriptionValueCallback` normalization (`singlesource.cpp:86-93`).
     let mut change = mask;
     if change.intersects(EventMask::LOG) {
         change = EventMask::from_bits(change.bits() & !EventMask::LOG.bits()) | EventMask::VALUE;
@@ -104,11 +104,11 @@ pub const FORM_CHOICES: [&str; 7] = [
 ];
 
 /// The leaves pvxs `IOCSource::getProperties` assigns for a record whose
-/// rset supplies `props` (`ioc/iocsource.cpp:252-310`).
+/// rset supplies `props` (`ioc/iocsource.cpp:253-310`).
 ///
 /// `getProperties` asks `dbChannelGet` for all six DBR property groups, and
 /// `dbGet` **clears** the option bit of every group the record type left NULL
-/// (`dbAccess.c:336-427`). Each NT leaf is then assigned only under its
+/// (`dbAccess.c:336-426`). Each NT leaf is then assigned only under its
 /// surviving bit, so [`PropertySupport`] — already narrowed to the addressed
 /// field by the DB layer — is the whole input to this decision.
 ///

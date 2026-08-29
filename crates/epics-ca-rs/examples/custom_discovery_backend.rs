@@ -19,11 +19,23 @@
 //! workspace, but we keep this example dependency-free by stubbing
 //! the request out — drop in your real client where marked.
 
+// `epics_ca_rs::client::CaClient` is `tokio_backend`-only — it awaits on the
+// UDP search transport — so every item here follows it, and the `exec_backend`
+// arm is a `main` that says why rather than a build error. Not the discovery
+// module: only its `mdns`/`dnssd`/`dns_update` submodules need a reactor, and
+// the `Backend` trait this example implements does not.
+// Cargo's `required-features` cannot name a build-script cfg, so the gate is
+// in this file; the example is still built and linted in that configuration.
+#[cfg(tokio_backend)]
 use std::net::SocketAddr;
 
+#[cfg(tokio_backend)]
 use async_trait::async_trait;
+#[cfg(tokio_backend)]
 use epics_ca_rs::client::{CaClient, CaClientConfig};
+#[cfg(tokio_backend)]
 use epics_ca_rs::discovery::{Backend, DiscoveryEvent};
+#[cfg(tokio_backend)]
 use tokio::sync::mpsc;
 
 // ─── 1. Static-from-file backend ────────────────────────────────────
@@ -32,10 +44,12 @@ use tokio::sync::mpsc;
 // Useful as a thin wrapper around an existing site config or to test
 // the wiring without any extra infrastructure.
 
+#[cfg(tokio_backend)]
 struct FileBackend {
     path: std::path::PathBuf,
 }
 
+#[cfg(tokio_backend)]
 #[async_trait]
 impl Backend for FileBackend {
     async fn discover(&self) -> Vec<SocketAddr> {
@@ -58,10 +72,12 @@ impl Backend for FileBackend {
 // IOCs at a known URL. Drop in any HTTP client (`reqwest`, `ureq`,
 // `hyper`); we leave the call as a placeholder.
 
+#[cfg(tokio_backend)]
 struct HttpRegistryBackend {
     endpoint: String,
 }
 
+#[cfg(tokio_backend)]
 #[async_trait]
 impl Backend for HttpRegistryBackend {
     async fn discover(&self) -> Vec<SocketAddr> {
@@ -83,11 +99,13 @@ impl Backend for HttpRegistryBackend {
 // fetch, but afterwards the client tracks live changes from the
 // channel.
 
+#[cfg(tokio_backend)]
 struct PushBackend {
     initial: Vec<SocketAddr>,
     rx: std::sync::Mutex<Option<mpsc::UnboundedReceiver<DiscoveryEvent>>>,
 }
 
+#[cfg(tokio_backend)]
 impl PushBackend {
     fn new(initial: Vec<SocketAddr>) -> (Self, mpsc::UnboundedSender<DiscoveryEvent>) {
         let (tx, rx) = mpsc::unbounded_channel();
@@ -99,6 +117,7 @@ impl PushBackend {
     }
 }
 
+#[cfg(tokio_backend)]
 #[async_trait]
 impl Backend for PushBackend {
     async fn discover(&self) -> Vec<SocketAddr> {
@@ -112,6 +131,7 @@ impl Backend for PushBackend {
 
 // ─── Wiring ─────────────────────────────────────────────────────────
 
+#[cfg(tokio_backend)]
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let pv_name = std::env::args().nth(1).unwrap_or_else(|| "TEST:PV".into());
@@ -147,4 +167,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let (_dbf, value) = client.caget(&pv_name).await?;
     println!("{pv_name} = {value}");
     Ok(())
+}
+
+/// The `exec_backend` arm. Discovery backends need a reactor to await their
+/// registry sockets on, and this build has none, so there is nothing for the
+/// example to demonstrate.
+#[cfg(exec_backend)]
+fn main() {
+    eprintln!(
+        "custom_discovery_backend: needs the tokio backend; this build selects \
+         EPICS_RS_BUILD_EXEC_BACKEND=thread, which has no reactor for a discovery backend to \
+         await on."
+    );
 }

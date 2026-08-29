@@ -1,4 +1,4 @@
-//! PVA interop: Rust ↔ pvxs (`~/codes/pvxs`) `pvget`/`pvput`/`pvmonitor`.
+//! PVA interop: Rust ↔ pvxs (`$PVXS_HOME`) `pvget`/`pvput`/`pvmonitor`.
 //!
 //! Opt-in via `cargo nextest run --profile interop`. Each test
 //! shells out to a pvxs CLI binary; missing binaries → skip with a
@@ -22,6 +22,8 @@
 //!   the established TCP circuit, expecting the Rust server to
 //!   answer with SEARCH_RESPONSE on the same circuit.
 
+#![cfg(feature = "client")]
+
 mod interop_helpers;
 
 #[cfg(unix)]
@@ -42,6 +44,9 @@ mod complex_types;
 #[cfg(unix)]
 #[path = "interop_pvxs_mods/field_projection.rs"]
 mod field_projection;
+#[cfg(unix)]
+#[path = "interop_pvxs_mods/harness_paths.rs"]
+mod harness_paths;
 #[cfg(unix)]
 #[path = "interop_pvxs_mods/large_array.rs"]
 mod large_array;

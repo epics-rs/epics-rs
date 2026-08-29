@@ -9,8 +9,8 @@
 //!  * `special()` — a RUNTIME put to the link field that leaves it constant
 //!    re-runs the same load, so `caput CO.INPB 7` makes `B == 7` for the next
 //!    calculation exactly as `field(INPB,"7")` at load would
-//!    (`calcoutRecord.c:367-378`, `sCalcoutRecord.c:512-517`,
-//!    `aCalcoutRecord.c:534-540`). The put path
+//!    (`calcoutRecord.c:373-378`, `sCalcoutRecord.c:513-518`,
+//!    `aCalcoutRecord.c:533-538`). The put path
 //!    (`database::field_io::special_after_put`) drives it from
 //!    [`Record::special_reseed_input_links`].
 //!

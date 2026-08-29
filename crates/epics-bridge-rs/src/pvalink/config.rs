@@ -1,6 +1,6 @@
 //! Parser for `pva://...` link strings.
 //!
-//! Accepted forms (matches pvxs `pvalink_jlif.cpp`):
+//! Accepted forms (matches `pvxs/ioc/pvalink_jlif.cpp`):
 //!
 //! ```text
 //! pva://PV:NAME                              — bare PV name, default options
@@ -27,7 +27,7 @@ pub enum LinkDirection {
 /// Maximize-severity mode for a pvalink (the `sevr` JSON option and the
 /// legacy `MS`/`NMS`/`MSI`/`MSS` bare modifiers).
 ///
-/// Mirrors pvxs `pvaLinkConfig::sevr` (`pvalink.h` enum
+/// Mirrors pvxs `pvaLinkConfig::sevr` (`pvxs/ioc/pvalink.h` enum
 /// `NMS`/`MS`/`MSI`/`MSS`). Controls whether a non-`NO_ALARM` severity
 /// observed on the *remote* NT `alarm.severity` field propagates into
 /// the owning record's `LINK_ALARM`.
@@ -53,7 +53,7 @@ impl SevrMode {
     /// (`0 = NO_ALARM`, `1 = MINOR`, `2 = MAJOR`, `3 = INVALID`),
     /// which is also the pvData NT `alarm.severity` encoding.
     ///
-    /// Mirrors pvxs `pvalink_lset.cpp:418`:
+    /// Mirrors `pvxs/ioc/pvalink_lset.cpp:424-425`:
     /// ```text
     /// (snap_severity != NO_ALARM && sevr == MS) ||
     /// (snap_severity == INVALID_ALARM && sevr == MSI)
@@ -70,12 +70,12 @@ impl SevrMode {
 }
 
 /// pvxs pvalink `proc` mode — the five-state enum the JSON / legacy
-/// parser preserves (`pvalink_jlif.cpp:69-166`).
+/// parser preserves (`pvxs/ioc/pvalink_jlif.cpp:69-166`).
 ///
 /// the OUT-side process behaviour and the INP-side
 /// scan-on-update behaviour are *related but distinct* (pvxs derives
-/// INP scan at `pvalink_link.cpp:122` and the PUT process request at
-/// `pvalink_channel.cpp:237-263` from the same enum). Collapsing this
+/// INP scan at `pvxs/ioc/pvalink_link.cpp:122` and the PUT process request at
+/// `pvxs/ioc/pvalink_channel.cpp:237-263` from the same enum). Collapsing this
 /// into a single `bool` lost two distinctions: `Default` vs `Npp`
 /// (both wrote the wire value `"passive"` instead of `"passive"` vs
 /// `"false"`), and `Cp`/`Cpp` (which request remote processing on PUT,
@@ -105,7 +105,7 @@ pub enum ProcMode {
 
 impl ProcMode {
     /// The `record._options.process` wire value for an OUT PUT.
-    /// Mirrors pvxs `pvalink_channel.cpp:237-263`:
+    /// Mirrors `pvxs/ioc/pvalink_channel.cpp:237-263`:
     /// `Default → "passive"`, `Npp → "false"`,
     /// `Pp` / `Cp` / `Cpp → "true"`.
     pub fn put_process_request(self) -> &'static str {
@@ -121,7 +121,7 @@ impl ProcMode {
     /// `Cpp` gates on the owning record being Passive. `Pp` is *not* a
     /// scan mode for an INP link.
     /// Mirrors pvxs/ioc `pvaLink::scanOnUpdate()`
-    /// (`pvalink_link.cpp:122-134`): it returns `scanOnUpdateYes` only for
+    /// (`pvxs/ioc/pvalink_link.cpp:122-133`): it returns `scanOnUpdateYes` only for
     /// `CP`, `scanOnUpdatePassive` only for `CPP`, and `scanOnUpdateNo`
     /// for every other mode (including `PP`/`NPP`/`Default`), so a `PP`
     /// INP link never registers in the monitor-event scan lists and only
@@ -155,13 +155,13 @@ pub struct PvaLinkConfig {
     /// When true, every monitor update triggers `process()` on the
     /// owning record (INP-side equivalent of the legacy
     /// `record(... CP)` flag). Mirrors pvxs `pvaLink::scanOnUpdate`
-    /// (pvalink_link.cpp:122). Default `false` — record must be
+    /// (pvxs/ioc/pvalink_link.cpp:122). Default `false` — record must be
     /// scanned externally.
     pub scan_on_update: bool,
     /// when true, the `scan_on_update` processing fires only
     /// when the owning record's `SCAN` is `Passive`. Distinguishes
-    /// pvxs `CPP` (`scanOnUpdatePassive`, pvalink_link.cpp:122 →
-    /// pvalink_channel.cpp:313) from `CP` (`scanOnUpdateYes`, which
+    /// pvxs `CPP` (`scanOnUpdatePassive`, pvxs/ioc/pvalink_link.cpp:122 →
+    /// pvxs/ioc/pvalink_channel.cpp:313) from `CP` (`scanOnUpdateYes`, which
     /// always fires). Without this flag, `CPP` collapses to `CP` and
     /// can trigger processing on non-Passive records — changing
     /// FLNK/output-link cascades vs pvxs.
@@ -207,11 +207,11 @@ pub struct PvaLinkConfig {
     /// `-1024..=1024`. Lower values process first. Mirrors pvxs
     /// `pvaLinkConfig::monorder`.
     pub monorder: i32,
-    /// when true, the owning record's TIME is adopted from
-    /// the linked PV's NT `timeStamp` on each read. Mirrors pvxs
-    /// `pvaLinkConfig::time` (`pvalink_jlif.cpp:35` / parsing at
-    /// `:104`; consumer at `pvalink_lset.cpp:427`). Default `false`
-    /// — the owning record keeps its locally-stamped processing
+    /// when true, the owning record's TIME is adopted from the linked PV's
+    /// NT `timeStamp` on each read. Mirrors pvxs `pvaLinkConfig::time`
+    /// (option-list comment `pvxs/ioc/pvalink_jlif.cpp:35`, parsed at
+    /// `:104`; consumer at `pvxs/ioc/pvalink_lset.cpp:433-435`). Default
+    /// `false` — the owning record keeps its locally-stamped processing
     /// time.
     pub time: bool,
     /// Direction inferred from caller, not parsed.
@@ -237,9 +237,9 @@ impl PvaLinkConfig {
     pub fn parse(s: &str, direction: LinkDirection) -> Result<Self, PvaLinkParseError> {
         // A leading `@` is the INST_IO sigil: the record loader claims such a
         // field as INST_IO before the scheme arm runs and iocInit refuses it
-        // on a soft record (doc/pvalink-rtems-design.md §12.2, measured on
-        // target). The parser gives the same answer so there is one rule for
-        // the spelling, not a stricter loader in front of a laxer parser.
+        // on a soft record (measured on target). The parser gives the same
+        // answer so there is one rule for the spelling, not a stricter loader
+        // in front of a laxer parser.
         let s = s.trim();
         // pvxs accepts both `pva://` and bare `pva:` prefixes.
         let body = s
@@ -287,8 +287,8 @@ impl PvaLinkConfig {
                     // flags from it via the single `inp_scan` owner — the
                     // same uniform derivation used for the query `proc=`
                     // path above. `PP` is NOT special-cased to skip scan:
-                    // pvxs's scan-list builder
-                    // (`pva2pva/pdbApp/pvalink_channel.cpp:393-397`)
+                    // pva2pva's scan-list builder
+                    // (`pva2pva/pdbApp/pvalink_channel.cpp:394-398`)
                     // includes `PP`/`CP`/`CPP` INP links and gates `PP`
                     // (like `CPP`) on the owning record being Passive, so
                     // a legacy `PP` suffix on an INP link must register a
@@ -308,11 +308,11 @@ impl PvaLinkConfig {
                 }
                 "MS" => cfg.sevr = SevrMode::Ms,
                 "MSI" => cfg.sevr = SevrMode::Msi,
-                // pvxs aliases MSS onto MS itself, not a Rust limitation:
-                // its `sevr` enum has no MSS variant (pvalink.h:83-86) and
-                // the string parser maps it explicitly (pvalink_jlif.cpp:179-183,
-                // "not sure how to handle mapping severity for MSS … handling as
-                // alias for MS until then"). Exact parity, not coarse granularity.
+                // pvxs aliases MSS onto MS itself, not a Rust limitation: its `sevr`
+                // enum has no MSS variant (pvxs/ioc/pvalink.h:82-86) and the string
+                // parser maps it explicitly (pvxs/ioc/pvalink_jlif.cpp:179-183, "not
+                // sure how to handle mapping severity for MSS … handling as alias
+                // for MS until then"). Exact parity, not coarse granularity.
                 "MSS" => cfg.sevr = SevrMode::Ms,
                 "NMS" => cfg.sevr = SevrMode::Nms,
                 _ => {}
@@ -328,17 +328,17 @@ impl PvaLinkConfig {
     /// through a `?key=value` query string.
     ///
     /// pvxs parses pvalink options only as JLink map keys / typed values
-    /// (`pvalink_jlif.cpp:69-196`) — there is no `?key=value` URI query
-    /// parser in the JLink callback table (`:286-300`). pvxs dispatches
+    /// (`pvxs/ioc/pvalink_jlif.cpp:69-196`) — there is no `?key=value` URI query
+    /// parser in the JLink callback table (`:286-304`). pvxs dispatches
     /// each option STRICTLY by its JSON value KIND through distinct
     /// callbacks (`pva_parse_{null,bool,integer,string}`, wired at
-    /// `:286-300`). This path reproduces that dispatch via
+    /// `:286-304`). This path reproduces that dispatch via
     /// `Self::apply_jlink_option`; it does NOT share the
     /// convenience-URI `Self::apply_options`, which collapses every
     /// value to text and accepts lenient `yes`/`no` booleans. Keeping the
     /// two paths separate is the structural reason a JSON string on a
     /// boolean key (`pipeline:"yes"`) is IGNORED here, exactly as pvxs
-    /// ignores it (`pva_parse_string` unknown-key branch, `:189-191`),
+    /// ignores it (`pva_parse_string` unknown-key branch, `:189-192`),
     /// instead of being honored as a Rust extension. [`Self::parse`]
     /// remains the Rust convenience-URI path.
     pub fn from_jlink_options(
@@ -361,7 +361,7 @@ impl PvaLinkConfig {
         // `proc` CP/CPP imply an open monitor + INP scan-on-update.
         // Derive the scan flags from the FINAL `proc` value (pvxs builds
         // its scan list at open() time from the parsed config,
-        // `pvalink_channel.cpp:393-397`, not per-option), so a `proc:"CP"`
+        // `pvxs/ioc/pvalink_channel.cpp:392-396`, not per-option), so a `proc:"CP"`
         // forces the monitor on regardless of option order.
         let (sou, sop) = cfg.proc.inp_scan();
         if sou {
@@ -404,7 +404,7 @@ impl PvaLinkConfig {
                 _ => warn_ignored_jlink(pv_name, key, val),
             },
             JlinkValue::Int(n) => match key {
-                // pvxs clamps `Q < 1` to 1 (pvalink_jlif.cpp:129-130).
+                // pvxs clamps `Q < 1` to 1 (pvxs/ioc/pvalink_jlif.cpp:129-130).
                 "Q" => cfg.queue_size = if *n < 1 { 1 } else { *n as usize },
                 // pvxs clamps monorder to [-1024, 1024] (`:131-132`).
                 "monorder" => cfg.monorder = (*n).clamp(-1024, 1024) as i32,
@@ -475,26 +475,26 @@ impl PvaLinkConfig {
         apply_or_warn(pv_name, "monitor", opts, &mut cfg.monitor, parse_bool);
         if let Some(v) = opts.get("proc") {
             // pvxs `proc` is a five-state enum
-            // (`pvalink_jlif.cpp:69-166`): boolean true→PP / false→NPP,
-            // plus the strings NPP/PP/CP/CPP. `CP`/`CPP` additionally
-            // imply an open monitor and INP scan-on-update. Store the
-            // enum and derive the scan flags from it. `PASSIVE` is NOT
-            // a pvxs `proc` enum value (it is only the later wire
-            // request string for `Default`); an unknown value is warned
-            // and the prior (default) mode is kept — pvxs does the same
-            // (`log_warn_printf` + `jlif_continue`, pvalink_jlif.cpp:156-170)
-            // rather than failing the whole link.
+            // (`pvxs/ioc/pvalink_jlif.cpp:69-166`): boolean true→PP / false→NPP,
+            // plus the strings NPP/PP/CP/CPP. `CP`/`CPP` additionally imply an open
+            // monitor and INP scan-on-update. Store the enum and derive the scan
+            // flags from it. `PASSIVE` is NOT a pvxs `proc` enum value (it is only
+            // the later wire request string for `Default`); an unknown value is
+            // warned and the prior (default) mode is kept — pvxs does the same
+            // (`log_warn_printf` + `jlif_continue`,
+            // pvxs/ioc/pvalink_jlif.cpp:156-170) rather than failing the whole
+            // link.
             //
-            // The enum string forms are CASE-SENSITIVE uppercase, matching
-            // pvxs `pva_parse_string` (`pvalink_jlif.cpp:156-170`), which
-            // compares `sval` byte-for-byte against `CP`/`CPP`/`PP`/`NPP`
-            // and warns "unknown proc" on anything else. A lowercase typo
-            // like `proc=cp` must therefore be ignored (kept at default),
-            // not silently activated — otherwise the same link behaves
-            // differently under Rust vs pvxs/QSRV. The boolean shorthands
-            // (`true`/`false`/`1`/`0`) are a distinct path: pvxs accepts a
-            // JSON boolean `proc:true`→PP / `proc:false`→NPP via
-            // `pva_parse_bool` (`pvalink_jlif.cpp:96-98`), so they are kept.
+            // The enum string forms are CASE-SENSITIVE uppercase, matching pvxs
+            // `pva_parse_string` (`pvxs/ioc/pvalink_jlif.cpp:156-170`), which
+            // compares `sval` byte-for-byte against `CP`/`CPP`/`PP`/`NPP` and warns
+            // "unknown proc" on anything else. A lowercase typo like `proc=cp` must
+            // therefore be ignored (kept at default), not silently activated —
+            // otherwise the same link behaves differently under Rust vs pvxs/QSRV.
+            // The boolean shorthands (`true`/`false`/`1`/`0`) are a distinct path:
+            // pvxs accepts a JSON boolean `proc:true`→PP / `proc:false`→NPP via
+            // `pva_parse_bool` (`pvxs/ioc/pvalink_jlif.cpp:96-98`), so they are
+            // kept.
             match v.as_str() {
                 "TRUE" | "true" | "1" => cfg.proc = ProcMode::Pp,
                 "FALSE" | "false" | "0" => cfg.proc = ProcMode::Npp,
@@ -555,7 +555,7 @@ impl PvaLinkConfig {
             pv_name: pv_name.to_string(),
             // pvxs's default `field` is the empty string, which selects
             // the top-level structure (`pvalink.rst:13-30`,
-            // `pvalink_link.cpp:90-110`): if that root is a structure
+            // `pvxs/ioc/pvalink_link.cpp:90-110`): if that root is a structure
             // its `.value` is used, otherwise the root itself is the
             // value. Defaulting to `"value"` instead conflated the
             // default with an explicit `field=value` and could not
@@ -602,7 +602,7 @@ fn parse_query(pv: &str, q: &str) -> HashMap<String, String> {
                 out.insert(k.to_string(), v.to_string());
             }
             // pvxs warns on a malformed token and keeps parsing the rest
-            // (`pvalink_jlif.cpp` parse callbacks return `jlif_continue`).
+            // (`pvxs/ioc/pvalink_jlif.cpp` parse callbacks return `jlif_continue`).
             // A segment without `=` is skipped so the link's valid
             // `key=value` siblings are still applied rather than the whole
             // link being discarded.
@@ -622,7 +622,7 @@ fn parse_query(pv: &str, q: &str) -> HashMap<String, String> {
 /// the value does not parse. Reads `key` from `opts`; a missing key
 /// leaves the default untouched. pvxs parity: an unparseable option value
 /// is logged and ignored, never failing the whole link
-/// (`pvalink_jlif.cpp:90-194`, `log_warn_printf` + `jlif_continue`).
+/// (`pvxs/ioc/pvalink_jlif.cpp:90-194`, `log_warn_printf` + `jlif_continue`).
 fn apply_or_warn<T>(
     pv: &str,
     key: &str,
@@ -639,7 +639,7 @@ fn apply_or_warn<T>(
 }
 
 /// Warn that an option value could not be parsed and was ignored, leaving
-/// the field at its default. pvxs parity (`pvalink_jlif.cpp:90-194`):
+/// the field at its default. pvxs parity (`pvxs/ioc/pvalink_jlif.cpp:90-194`):
 /// each parse callback `log_warn_printf`s an unknown/unparseable key or
 /// value and returns `jlif_continue`, so one bad option never discards
 /// the rest of the link.
@@ -671,15 +671,15 @@ fn warn_ignored_option(pv: &str, key: &str, value: &str) {
 ///
 /// The enum string forms are CASE-SENSITIVE uppercase
 /// (`NMS`/`MS`/`MSI`/`MSS`), matching pvxs `pva_parse_string`
-/// (`pvalink_jlif.cpp:172-187`), which compares `sval` byte-for-byte and
+/// (`pvxs/ioc/pvalink_jlif.cpp:172-187`), which compares `sval` byte-for-byte and
 /// warns "unknown sevr" on anything else (so a lowercase typo like
 /// `sevr=msi` is ignored, keeping the default NMS — not silently turned
 /// into INVALID-only propagation). `MSS` is accepted as an alias for
-/// `MS` exactly as pvxs does (`pvalink_jlif.cpp:179-183`).
+/// `MS` exactly as pvxs does (`pvxs/ioc/pvalink_jlif.cpp:179-183`).
 ///
 /// The boolean shorthands (`true`/`false`/`1`/`0`) are a distinct path:
 /// pvxs maps a JSON boolean `sevr:true` → `MS` and `sevr:false` → `NMS`
-/// via `pva_parse_bool` (`pvalink_jlif.cpp:99`), so they are kept.
+/// via `pva_parse_bool` (`pvxs/ioc/pvalink_jlif.cpp:99`), so they are kept.
 fn parse_sevr(v: &str) -> Result<SevrMode, PvaLinkParseError> {
     match v {
         "NMS" | "false" | "FALSE" | "0" | "no" | "NO" => Ok(SevrMode::Nms),
@@ -719,7 +719,7 @@ mod tests {
     // ---- JLink (structured `{pva:{...}}`) option kind dispatch ----
     //
     // pvxs routes each pvalink option strictly by its JSON value KIND
-    // (pvalink_jlif.cpp:286-300): a boolean key reached with a string,
+    // (pvxs/ioc/pvalink_jlif.cpp:286-304): a boolean key reached with a string,
     // or a string key reached with a non-enum string, is IGNORED. These
     // assert `from_jlink_options` reproduces that, NOT the lenient
     // convenience-URI behavior (which accepts `yes`/`no` and `"true"`).
@@ -742,7 +742,7 @@ mod tests {
     #[test]
     fn jlink_string_on_bool_key_is_ignored() {
         // `pipeline:"yes"` is a JSON string on a boolean-only key. pvxs's
-        // pva_parse_string ignores it (pvalink_jlif.cpp:189-191); the
+        // pva_parse_string ignores it (pvxs/ioc/pvalink_jlif.cpp:189-191); the
         // convenience-URI path would have accepted "yes" as true.
         let c = jlink("X", vec![("pipeline", JlinkValue::Str("yes".to_string()))]);
         assert!(
@@ -760,7 +760,7 @@ mod tests {
     #[test]
     fn jlink_string_proc_true_is_ignored() {
         // pva_parse_string accepts only CP/CPP/PP/NPP/empty for `proc`;
-        // "true" is unknown and ignored (pvalink_jlif.cpp:156-170). The
+        // "true" is unknown and ignored (pvxs/ioc/pvalink_jlif.cpp:156-170). The
         // convenience-URI applier mapped the string "true" → PP.
         let c = jlink("X", vec![("proc", JlinkValue::Str("true".to_string()))]);
         assert_eq!(
@@ -851,11 +851,10 @@ mod tests {
     /// `@pva://X` is refused by the parser exactly as the record loader
     /// refuses it: `try_parse_hw_link` (`epics-base-rs` `link.rs:1074-1086`)
     /// claims any field starting with `@` as INST_IO before the scheme arm
-    /// runs, and `iocInit` then refuses it on a soft record
-    /// (`doc/pvalink-rtems-design.md` §12.2, measured on target). The parser
-    /// previously stripped the `@` — a laxer second rule on a path with no
-    /// producer — removed by user decision 2026-07-23 so one rule covers the
-    /// spelling everywhere.
+    /// runs, and `iocInit` then refuses it on a soft record (measured on
+    /// target). The parser previously stripped the `@` — a laxer second rule
+    /// on a path with no producer — removed by user decision 2026-07-23 so
+    /// one rule covers the spelling everywhere.
     #[test]
     fn at_prefix_is_refused_like_the_record_loader_refuses_it() {
         let err = PvaLinkConfig::parse("@pva://X", LinkDirection::Out).unwrap_err();
@@ -923,8 +922,8 @@ mod tests {
 
     /// `CP`/`CPP` derive INP scan-on-update from the same
     /// enum (`inp_scan`), independent of the PUT process request — they
-    /// are related but distinct outputs (pvxs `pvalink_link.cpp:122` vs
-    /// `pvalink_channel.cpp:237`).
+    /// are related but distinct outputs (`pvxs/ioc/pvalink_link.cpp:122` vs
+    /// `pvxs/ioc/pvalink_channel.cpp:237`).
     #[test]
     fn fr16_cp_cpp_derive_scan_flags_and_put_true() {
         let cp = PvaLinkConfig::parse("pva://X?proc=CP", LinkDirection::Inp).unwrap();
@@ -940,7 +939,7 @@ mod tests {
 
     /// `PP` (`proc=PP`, `proc=true`, and the legacy bare `PP` suffix) is
     /// NOT an INP monitor scan mode under the pvxs/ioc pvalink dialect:
-    /// `pvaLink::scanOnUpdate()` (`pvalink_link.cpp:122-134`) returns
+    /// `pvaLink::scanOnUpdate()` (`pvxs/ioc/pvalink_link.cpp:122-133`) returns
     /// `scanOnUpdateNo` for everything except `CP`/`CPP`, so a `PP` INP
     /// link never registers a scan target and only carries the OUT-side
     /// `record._options.process` request.
@@ -976,7 +975,7 @@ mod tests {
     /// `PASSIVE` is the wire request string for `Default`, not a pvxs
     /// `proc` enum value. pvxs warns on an unknown `proc` value and keeps
     /// the prior (default) mode rather than failing the link
-    /// (pvalink_jlif.cpp:156-170), so the link parses Ok with
+    /// (pvxs/ioc/pvalink_jlif.cpp:156-170), so the link parses Ok with
     /// `proc == Default` and the bad value ignored — not as
     /// process-on-PUT.
     #[test]
@@ -1075,7 +1074,7 @@ mod tests {
 
     /// pvxs enum string forms are case-sensitive uppercase. A lowercase
     /// typo such as `proc=cp` or `sevr=msi` is "unknown" to pvxs
-    /// `pva_parse_string` (`pvalink_jlif.cpp:156-187`) and to EPICS
+    /// `pva_parse_string` (`pvxs/ioc/pvalink_jlif.cpp:156-187`) and to EPICS
     /// base's modifier parser (`dbStaticLib.c:2369-2378`): it is warned
     /// and the prior/default mode is kept, never silently activated.
     /// The same link must therefore behave identically under Rust and
@@ -1231,7 +1230,7 @@ mod tests {
 
     /// pvxs parity: an unparseable option value is warned and ignored,
     /// the field keeps its default, and the link still parses (it is NOT
-    /// rejected). Mirrors `pvalink_jlif.cpp:90-194` (`log_warn_printf` +
+    /// rejected). Mirrors `pvxs/ioc/pvalink_jlif.cpp:90-194` (`log_warn_printf` +
     /// `jlif_continue`).
     #[test]
     fn bad_option_value_ignored_keeps_default() {

@@ -20,7 +20,7 @@
 //! return status;                          /* the put FAILS; nothing stored */
 //! ```
 //!
-//! and `mbboRecord.c:354-371` / `boRecord.c` / `biRecord.c:290-298` /
+//! and `mbboRecord.c:354-371` / `boRecord.c` / `biRecord.c:208-217` /
 //! `mbbiRecord.c:273-291` / `busyRecord.c`, all of which are an exact,
 //! case-sensitive `strncmp` against the state strings and `S_db_badChoice`
 //! otherwise.
@@ -105,7 +105,7 @@ async fn unmatched_name_fails_the_put_and_stores_nothing() {
     assert_eq!(
         val_of(&db, "M").await,
         EpicsValue::Enum(2),
-        "C aborts before storing (dbAccess.c:1362 `if (status) goto done`)"
+        "C aborts before storing (dbAccess.c:1357 `if (status) goto done`)"
     );
 }
 

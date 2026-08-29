@@ -176,8 +176,8 @@ fn test_ao_readback_skip_convert_bypasses_forward_convert() {
 
 // The asynFloat64 ao readback hook applies the forward ASLO/AOFF scaling
 // (VAL = value*ASLO + AOFF) and sets VAL only — a float64 ao carries no raw
-// path, so RVAL is untouched. C `initAo`/`processAo` (devAsynFloat64.c:627-629
-// / :646-649). Contrast apply_raw_readback (int32), which also seeds RVAL.
+// path, so RVAL is untouched. C `initAo`/`processAo` (devAsynFloat64.c:628-630
+// / :647-649). Contrast apply_raw_readback (int32), which also seeds RVAL.
 #[test]
 fn test_ao_float64_readback_applies_aslo_aoff_val_only() {
     let mut rec = AoRecord::new(0.0);
@@ -552,7 +552,7 @@ fn test_mbbo_zrvl_high_bit_round_trip() {
     // ZRVL into RVAL (C `mbboRecord.c:177`, after the constant-DOL load); the
     // high bit must not be lost to sign.
     rec.init_record(0).unwrap();
-    rec.seed_deadband_tracking();
+    rec.init_record_tail();
     assert_eq!(rec.get_field("RVAL"), Some(EpicsValue::ULong(0x8000_0000)));
 }
 
@@ -693,7 +693,7 @@ fn test_common_field_put() {
         .put_common_field("SCAN", EpicsValue::String("1 second".into()))
         .unwrap();
     assert!(matches!(result, CommonFieldPutResult::ScanChanged { .. }));
-    assert_eq!(instance.common.scan, ScanType::Sec1);
+    assert_eq!(instance.common.scan, ScanType::SEC1);
 
     instance
         .put_common_field("HIHI", EpicsValue::Double(100.0))
@@ -740,27 +740,6 @@ fn test_evaluate_alarms() {
 }
 
 #[test]
-fn test_parse_link() {
-    assert!(parse_link("").is_none());
-
-    let link = parse_link("TEMP").unwrap();
-    assert_eq!(link.record, "TEMP");
-    assert_eq!(link.field, "VAL");
-
-    let link = parse_link("TEMP.EGU").unwrap();
-    assert_eq!(link.record, "TEMP");
-    assert_eq!(link.field, "EGU");
-
-    let link = parse_link("TEMP.VAL PP").unwrap();
-    assert_eq!(link.record, "TEMP");
-    assert_eq!(link.field, "VAL");
-    assert_eq!(link.policy, LinkProcessPolicy::ProcessPassive);
-
-    let link = parse_link("TEMP.VAL NPP").unwrap();
-    assert_eq!(link.policy, LinkProcessPolicy::NoProcess);
-}
-
-#[test]
 fn test_parse_link_v2() {
     assert_eq!(parse_link_v2(""), ParsedLink::None);
     assert_eq!(parse_link_v2("  "), ParsedLink::None);
@@ -780,32 +759,48 @@ fn test_parse_link_v2() {
     // Was wrongly `ProcessPassive`.
     assert_eq!(
         parse_link_v2("TEMP"),
-        ParsedLink::Db(DbLink {
-            record: "TEMP".into(),
-            field: "VAL".into(),
-            policy: LinkProcessPolicy::NoProcess,
-            monitor_switch: MonitorSwitch::NoMaximize,
-        })
+        ParsedLink::Db(DbLink::new(
+            "TEMP",
+            LinkProcessPolicy::NoProcess,
+            MonitorSwitch::NoMaximize,
+        ))
     );
 
     assert_eq!(
         parse_link_v2("TEMP.EGU"),
-        ParsedLink::Db(DbLink {
-            record: "TEMP".into(),
-            field: "EGU".into(),
-            policy: LinkProcessPolicy::NoProcess,
-            monitor_switch: MonitorSwitch::NoMaximize,
-        })
+        ParsedLink::Db(DbLink::new(
+            "TEMP.EGU",
+            LinkProcessPolicy::NoProcess,
+            MonitorSwitch::NoMaximize,
+        ))
     );
 
     assert_eq!(
         parse_link_v2("TEMP.EGU NPP"),
-        ParsedLink::Db(DbLink {
-            record: "TEMP".into(),
-            field: "EGU".into(),
-            policy: LinkProcessPolicy::NoProcess,
-            monitor_switch: MonitorSwitch::NoMaximize,
-        })
+        ParsedLink::Db(DbLink::new(
+            "TEMP.EGU",
+            LinkProcessPolicy::NoProcess,
+            MonitorSwitch::NoMaximize,
+        ))
+    );
+
+    // The two cases the deleted `parse_link`/`LinkAddress` wrapper covered
+    // and nothing else did: an explicit `.VAL` carrying each process modifier.
+    assert_eq!(
+        parse_link_v2("TEMP.VAL PP"),
+        ParsedLink::Db(DbLink::new(
+            "TEMP.VAL",
+            LinkProcessPolicy::ProcessPassive,
+            MonitorSwitch::NoMaximize,
+        ))
+    );
+    assert_eq!(
+        parse_link_v2("TEMP.VAL NPP"),
+        ParsedLink::Db(DbLink::new(
+            "TEMP.VAL",
+            LinkProcessPolicy::NoProcess,
+            MonitorSwitch::NoMaximize,
+        ))
     );
 
     assert_eq!(
@@ -838,7 +833,7 @@ fn test_link_cache_invalidation() {
         .put_common_field("INP", EpicsValue::String("SOURCE.VAL".into()))
         .unwrap();
     if let ParsedLink::Db(ref db) = instance.parsed_inp {
-        assert_eq!(db.record, "SOURCE");
+        assert_eq!(db.target().record, "SOURCE");
     } else {
         panic!("expected Db link");
     }
@@ -847,8 +842,7 @@ fn test_link_cache_invalidation() {
         .put_common_field("INP", EpicsValue::String("OTHER".into()))
         .unwrap();
     if let ParsedLink::Db(ref db) = instance.parsed_inp {
-        assert_eq!(db.record, "OTHER");
-        assert_eq!(db.field, "VAL");
+        assert_eq!(db.pvname(), "OTHER");
     } else {
         panic!("expected Db link");
     }
@@ -1175,7 +1169,7 @@ fn test_mbbi_unsv() {
 
 #[test]
 fn test_deadband_alarm_on_change_bypasses_value_deadband() {
-    // C `recGbl.c:202-210` (`recGblResetAlarms`): SEVR is posted only
+    // C `recGbl.c:202-222` (`recGblResetAlarms`): SEVR is posted only
     // when `prev_sevr != new_sevr`, and STAT only when `stat_mask` is
     // set (sevr change / stat change / amsg change). The alarm-field
     // posts are NOT gated by the VAL monitor deadband (MDEL/ADEL) —
@@ -1386,7 +1380,7 @@ fn test_acks_posts_once_with_dbe_value_only() {
 
 #[test]
 fn test_no_alarm_change_does_not_post_sevr_stat() {
-    // C `recGbl.c:202-207`: when `prev_sevr == new_sevr` and
+    // C `recGbl.c:202-208`: when `prev_sevr == new_sevr` and
     // `prev_stat == new_stat`, `recGblResetAlarms` posts neither
     // SEVR nor STAT. A record processed with no alarm transition
     // must not emit alarm-field monitor events — neither in the
@@ -1403,7 +1397,7 @@ fn test_no_alarm_change_does_not_post_sevr_stat() {
     assert!(
         first_posts.iter().any(|(f, _)| *f == "STAT"),
         "STAT moved UDF -> NO_ALARM, and C posts the field that changed \
-         (recGbl.c:206-207). SEVR did not move on this bare instance, so C \
+         (recGbl.c:206-208). SEVR did not move on this bare instance, so C \
          posts no SEVR (recGbl.c:202-205)."
     );
 
@@ -1744,7 +1738,7 @@ fn test_lcnt_increments_on_reentrance() {
 
 #[test]
 fn test_lcnt_alarm_threshold() {
-    // C `dbProcess` (dbAccess.c:544-557): the SCAN_ALARM raise fires on
+    // C `dbProcess` (dbAccess.c:543-556): the SCAN_ALARM raise fires on
     // the attempt whose PRE-increment lcnt equals MAX_LOCK=10 — i.e.
     // the 11th consecutive reentrant attempt, not the 10th.
     let mut instance = RecordInstance::new("TEST".into(), AoRecord::new(0.0));
@@ -1774,7 +1768,7 @@ fn test_lcnt_alarm_threshold() {
 fn test_lcnt_alarm_posts_exactly_once() {
     // C posts the SCAN_ALARM transition exactly once: subsequent
     // reentrant attempts bail on `stat == SCAN_ALARM` / `sevr >=
-    // INVALID_ALARM` (dbAccess.c:545-547). The pre-fix guard re-posted
+    // INVALID_ALARM` (dbAccess.c:544-546). The pre-fix guard re-posted
     // the unchanged SEVR/STAT/VAL on every attempt past the threshold.
     let mut instance = RecordInstance::new("TEST".into(), AoRecord::new(0.0));
     instance.enter_pact();
@@ -2265,7 +2259,7 @@ fn test_snapshot_dfanout_omsl_ivoa_serve_as_enum() {
 }
 
 // R6-1 — every dbCommon DBF_MENU field is served as DBR_ENUM with its menu's
-// choice strings, not as a bare SHORT/CHAR. C `dbAccess.c:1074`
+// choice strings, not as a bare SHORT/CHAR. C `dbAccess.c:89`
 // (`mapDBFToDBR[DBF_MENU] == DBR_ENUM`) + `:167-175` (`get_enum_strs` serves
 // the menu's `papChoiceValue[]`). Pre-fix `caget REC.SEVR` returned DBR_SHORT
 // 2 with no strings where a C IOC returns DBR_ENUM 2 + "MAJOR".
@@ -2518,11 +2512,12 @@ fn test_snapshot_alarm_state() {
 //       AFTC accumulator into a local; the Rust port persists it via
 //       `record.put_field("AFVL", …)` each cycle.
 //   (2) mbbi / bi LALM update around the COS_ALARM check
-//       (`mbbiRecord.c:339-340`, `biRecord.c:239-240`).
+//       (`mbbiRecord.c:344-348`, `biRecord.c:276-278`).
 //
 // The shared AFTC alarm-range filter primitive itself is covered by the
 // `records::alarm_filter` pure-function tests. `bi` gained the AFTC/AFVL
-// alarm filter in EPICS PR #817 (`c9817fa59`), so the bi-specific tests
+// alarm filter in EPICS PR #817 (`c9817fa59`); its line numbers below
+// resolve at `678092d03`, five lines later. The bi-specific tests
 // below pin (a) the fields being served, (b) the filter seeding AFVL, and
 // (c) the parity distinction that — unlike mbbi/ai — the bi UDF path does
 // NOT zero AFVL (biRecord.c:237-240 returns before `prec->afvl = afvl`).
@@ -2553,7 +2548,7 @@ fn test_bi_serves_aftc_and_afvl_fields() {
 }
 
 /// `bi` engages the alarm-range AFTC filter. On the first sample (AFVL == 0)
-/// `biRecord.c:256-257` seeds AFVL with the raw state severity and passes it
+/// `biRecord.c:256-257` (at `678092d03`) seeds AFVL with the raw state severity and passes it
 /// through, matching the shared `aftc_filter` seed branch. val==1 selects OSV.
 #[test]
 fn test_bi_aftc_filter_seeds_afvl() {
@@ -2570,12 +2565,12 @@ fn test_bi_aftc_filter_seeds_afvl() {
     assert_eq!(
         inst.record.get_field("AFVL").and_then(|v| v.to_f64()),
         Some(AlarmSeverity::Major as u16 as f64),
-        "first AFTC cycle seeds AFVL with the raw OSV severity (biRecord.c:256-257)"
+        "first AFTC cycle seeds AFVL with the raw OSV severity (biRecord.c:256-257 at 678092d03)"
     );
 }
 
 /// Parity distinction from mbbi/ai: the `bi` UDF path raises UDF_ALARM and
-/// returns WITHOUT touching AFVL — `biRecord.c:237-240` returns before the
+/// returns WITHOUT touching AFVL — `biRecord.c:237-240` (at `678092d03`) returns before the
 /// `prec->afvl = afvl` store, unlike `mbbiRecord.c`/`aiRecord.c` which zero it.
 #[test]
 fn test_bi_udf_cycle_leaves_afvl_untouched() {
@@ -2599,12 +2594,14 @@ fn test_bi_udf_cycle_leaves_afvl_untouched() {
 }
 
 /// mbbi persists the AFTC accumulator back to AFVL each cycle.
-/// `mbbiRecord.c::checkAlarms` (mbbiRecord.c:319-337) computes the new
-/// accumulator into a local but — unlike `aiRecord.c` etc. — never
-/// stores `prec->afvl = afvl`, so the C mbbi filter is inert (it
-/// re-seeds from AFVL==0 every cycle). The Rust port routes through
-/// `record.put_field("AFVL", …)` after `aftc_filter`, so its filter
-/// retains state. This test pins the Rust writeback behaviour.
+/// `mbbiRecord.c::checkAlarms` (mbbiRecord.c:319-338) at the `R7.0.10`
+/// pin computes the new accumulator into a local but — unlike
+/// `aiRecord.c` etc. — never stores `prec->afvl = afvl`, so the pin's
+/// mbbi filter is inert (it re-seeds from AFVL==0 every cycle). That is
+/// the bug EPICS PR #817 `c9817fa59` fixed, adding the store at `:339`;
+/// the Rust port routes through `record.put_field("AFVL", …)` after
+/// `aftc_filter` and so implements the POST-fix C. Deviation from the
+/// pin, documented at `MbbiRecord::check_alarms`. This test pins it.
 #[test]
 fn test_mbbi_aftc_writes_afvl_back_each_cycle() {
     use epics_base_rs::server::records::mbbi::MbbiRecord;
@@ -2772,7 +2769,7 @@ fn test_int64in_aftc_filter_engages_and_seeds() {
 
 /// When AFTC <= 0 the filter is disabled. C `checkAlarms` initialises the
 /// local `afvl = 0` and unconditionally stores `prec->afvl = afvl`
-/// (aiRecord.c:356,402), so a disabled filter drives AFVL to 0. The
+/// (aiRecord.c:356,401), so a disabled filter drives AFVL to 0. The
 /// framework owner does the same, so a stale accumulator from a prior
 /// AFTC>0 run cannot mis-seed a later re-enable.
 #[test]
@@ -2807,19 +2804,19 @@ fn test_ai_aftc_disabled_resets_stale_afvl() {
 }
 
 /// Pins the Rust port's "LALM always advances on a VAL transition"
-/// behaviour. C `mbbiRecord.c:339-340` is
+/// behaviour. At the `R7.0.10` pin `mbbiRecord.c:344-348` is
 /// `if (val == prec->lalm || recGblSetSevr(prec, COS_ALARM, prec->cosv)) return; prec->lalm = val;`
 /// — `recGblSetSevr` returns TRUE when it raises the severity
-/// (`recGbl.c:252-255`), so when COSV≠0 raises COS_ALARM the `||`
+/// (`recGbl.c:242-254`), so when COSV≠0 raises COS_ALARM the `||`
 /// short-circuits to the early `return` and `prec->lalm = val` is
-/// skipped. The Rust port instead writes LALM unconditionally in the
-/// `val != lalm` branch after firing COS_ALARM. This test pins that
-/// Rust behaviour end-to-end:
+/// skipped, leaving the next transition to re-fire COS against a stale
+/// LALM. EPICS PR #817 `c9817fa59` splits the test from the call at the
+/// same `:344-348`, so LALM always advances; the Rust port implements
+/// that POST-fix C. Deviation from the pin, documented at
+/// `MbbiRecord::check_alarms`. This test pins it end-to-end:
 ///   (a) one transition with COSV≠NoAlarm bumps LALM to the new val;
 ///   (b) a subsequent transition still fires COS because LALM was
 ///       updated, and LALM advances again.
-/// (The Rust-vs-C divergence on the skipped-LALM path is a separate
-/// parity question, not addressed here.)
 #[test]
 fn test_mbbi_lalm_updates_when_cosv_set() {
     use epics_base_rs::server::records::mbbi::MbbiRecord;

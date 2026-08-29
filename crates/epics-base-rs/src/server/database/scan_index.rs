@@ -1,8 +1,123 @@
+use std::collections::BTreeSet;
+
 use crate::server::record::{PiniMode, RecordInstance, ScanList, ScanType};
 
 use super::PvDatabase;
 
+/// The scan buckets themselves. `bucket` is private to THIS module, so no
+/// other file in `database` can open a bucket and write it — the only
+/// transitions are [`PvDatabase::add_to_scan_list`] and
+/// [`PvDatabase::delete_from_scan_list`], which is C's arrangement:
+/// `addToList`/`deleteFromList` are `static` in `dbScan.c` and `scanAdd` /
+/// `scanDelete` (`dbScan.c:240`/`:308` at R7.0.10) are the whole public
+/// surface.
+pub(super) struct ScanIndex {
+    /// One bucket per scan list. Sized from the LOADED `menuScan`
+    /// ([`ScanList::count`]), not from a compile-time rate list, and built on
+    /// first use rather than at construction: the site's `menuScan.dbd` is
+    /// loaded after the database object exists, so sizing this eagerly would
+    /// freeze the menu before the loader could install one. C reaches the same
+    /// point by ordering — `dbLoadDatabase`, then `iocInit` → `initPeriodic`
+    /// sizes `papPeriodic`.
+    buckets: std::sync::OnceLock<
+        Box<[crate::runtime::sync::PriorityInheritanceMutex<BTreeSet<super::ScanKey>>]>,
+    >,
+    /// Cumulative over-runs per list — C `periodic_scan_list::overruns`
+    /// (`dbScan.c:95`), which `scanppl` prints beside the list it belongs to
+    /// (`dbScan.c:408-409`). It lives here for the same reason C puts it on
+    /// `periodic_scan_list`: one owner per rate holds both the list and its
+    /// over-run count, so the counter cannot drift away from the list it
+    /// counts. Only the periodic scan threads write it.
+    overruns: std::sync::OnceLock<Box<[std::sync::atomic::AtomicU64]>>,
+}
+
+impl ScanIndex {
+    pub(super) fn new() -> Self {
+        Self {
+            buckets: std::sync::OnceLock::new(),
+            overruns: std::sync::OnceLock::new(),
+        }
+    }
+
+    /// The bucket holding `list`'s records. Total — see [`ScanList::slot`].
+    fn bucket(
+        &self,
+        list: ScanList,
+    ) -> &crate::runtime::sync::PriorityInheritanceMutex<BTreeSet<super::ScanKey>> {
+        &self
+            .buckets
+            .get_or_init(|| {
+                (0..ScanList::count())
+                    .map(|_| crate::runtime::sync::PriorityInheritanceMutex::new(BTreeSet::new()))
+                    .collect()
+            })
+            .as_ref()[list.slot()]
+    }
+
+    /// This list's over-run counter — the same lazy sizing as [`Self::bucket`].
+    fn overrun(&self, list: ScanList) -> &std::sync::atomic::AtomicU64 {
+        &self
+            .overruns
+            .get_or_init(|| {
+                (0..ScanList::count())
+                    .map(|_| std::sync::atomic::AtomicU64::new(0))
+                    .collect()
+            })
+            .as_ref()[list.slot()]
+    }
+}
+
 impl PvDatabase {
+    /// C `addToList` (`dbScan.c:1074` at R7.0.10) — the ONE place a record
+    /// enters a scan bucket.
+    ///
+    /// C keeps it `static` so that `scanAdd` is the only way in; the port's
+    /// equivalent is this being the only `scan_index.bucket(..).lock()` write
+    /// outside the readers. It takes the bucket lock itself, exactly as C
+    /// takes `psl->lock`, and takes no registration lock: L46 belongs to
+    /// whichever owner called — [`Self::update_scan_index`], which acquires it,
+    /// or `add_record`, which is already inside it. Both used to open-code the
+    /// bucket write instead, which is how a transition could bypass its owner.
+    ///
+    /// A SCAN that names no list (`Passive`, or an index outside `menuScan`)
+    /// keys no bucket — C `scanAdd` refuses the same two, the latter with
+    /// "scanAdd detected illegal SCAN value".
+    pub(super) fn add_to_scan_list(
+        &self,
+        scan: ScanType,
+        phas: i16,
+        record_type: &str,
+        load_order: u64,
+        name: &str,
+    ) {
+        let Some(list) = scan.scan_list() else {
+            return;
+        };
+        self.inner
+            .scan_index
+            .bucket(list)
+            .lock()
+            .insert(super::ScanKey::new(phas, record_type, load_order, name));
+    }
+
+    /// C `deleteFromList` (`dbScan.c:1096` at R7.0.10) — the ONE place a
+    /// record leaves a scan bucket. Same ownership rules as
+    /// [`Self::add_to_scan_list`].
+    ///
+    /// Matches by record name alone: PHAS and load-order may be stale relative
+    /// to the entry actually present, and a stale secondary key would leave a
+    /// phantom entry behind.
+    pub(super) fn delete_from_scan_list(&self, scan: ScanType, name: &str) {
+        let Some(list) = scan.scan_list() else {
+            return;
+        };
+        self.inner
+            .scan_index
+            .bucket(list)
+            .lock()
+            .retain(|k| k.name != name);
+    }
+
     /// Update scan index when a record's SCAN or PHAS field changes.
     ///
     /// Takes `registration_mutex` so the read of
@@ -28,7 +143,7 @@ impl PvDatabase {
     /// section — which is what lets it run *inside* the L1 record-gate window
     /// without putting an `.await` there. C reaches `scanAdd`/`scanDelete`
     /// (`dbScan.c:241-330`) the same way, from inside `dbPut` under
-    /// `dbScanLock`. `doc/rtems-priority-locks-design.md` §5 step 4.
+    /// `dbScanLock`.
     pub fn update_scan_index(
         &self,
         name: &str,
@@ -40,15 +155,8 @@ impl PvDatabase {
         let _gate = self.lock_registration("update_scan_index");
         let _ = old_phas; // entry matched by name; PHAS not needed.
         // 1) Remove the OLD entry the caller knew about — even if
-        // remove_record already swept it. Match by record name so a
-        // stale PHAS / load_order does not leave a phantom entry.
-        if let Some(list) = old_scan.scan_list() {
-            self.inner
-                .scan_index
-                .bucket(list)
-                .lock()
-                .retain(|k| k.name != name);
-        }
+        // remove_record already swept it.
+        self.delete_from_scan_list(old_scan, name);
         // 2) Look up the LIVE record under the mutex. If concurrent
         // remove+re-add replaced the Arc with a fresh one whose
         // scan differs from the caller's `_new_scan`, we re-insert
@@ -69,21 +177,12 @@ impl PvDatabase {
                 inst.record.record_type(),
             )
         };
-        // C `scanAdd` refuses both `Passive` and an out-of-menu index — the
-        // latter with "scanAdd detected illegal SCAN value" — so neither can
-        // key a bucket. [`ScanList::of`] is that refusal.
-        if let Some(list) = cur_scan.scan_list() {
-            // Re-use the record's existing load-order sequence so the
-            // scan-index secondary key stays stable across SCAN/PHAS
-            // edits. A record loaded before should always scan before
-            // a later-loaded record at the same PHAS.
-            let seq = self.inner.load_order.load().get(name).copied().unwrap_or(0);
-            self.inner
-                .scan_index
-                .bucket(list)
-                .lock()
-                .insert(super::ScanKey::new(cur_phas, cur_type, seq, name));
-        }
+        // Re-use the record's existing load-order sequence so the scan-index
+        // secondary key stays stable across SCAN/PHAS edits. A record loaded
+        // before should always scan before a later-loaded record at the same
+        // PHAS.
+        let seq = self.inner.load_order.load().get(name).copied().unwrap_or(0);
+        self.add_to_scan_list(cur_scan, cur_phas, cur_type, seq, name);
     }
 
     /// Count one over-run for `scan`'s list — C `ppsl->overruns++`
@@ -91,7 +190,9 @@ impl PvDatabase {
     /// caller; a SCAN value naming no list has no counter to move.
     pub(crate) fn record_scan_overrun(&self, scan: ScanType) {
         if let Some(list) = scan.scan_list() {
-            self.inner.scan_index.overruns[list.slot()]
+            self.inner
+                .scan_index
+                .overrun(list)
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
     }
@@ -99,7 +200,10 @@ impl PvDatabase {
     /// How many times `list`'s sweep has run past its deadline since boot —
     /// what C's `scanppl` prints as `(%lu over-runs)` (`dbScan.c:408-409`).
     pub(crate) fn scan_overruns(&self, list: crate::server::record::ScanList) -> u64 {
-        self.inner.scan_index.overruns[list.slot()].load(std::sync::atomic::Ordering::Relaxed)
+        self.inner
+            .scan_index
+            .overrun(list)
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// A **snapshot** of a scan list, in C's order: PHAS, then DBD
@@ -286,6 +390,11 @@ impl PvDatabase {
     /// routing — see `dbScan.c:548-552` `post_event` →
     /// `postEvent(pevent_list[event])`.
     pub async fn post_event(&self) {
+        // C `postEvent` (`dbScan.c:536-539`): an event posted while the
+        // facility is not running queues nothing at all.
+        if !crate::server::scan::scan_is_running() {
+            return;
+        }
         if let Some(list) = ScanType::Event.scan_list() {
             self.scan_list_once(list).await;
         }
@@ -301,6 +410,12 @@ impl PvDatabase {
     /// integer part in `[1,255]` is normalised to its integer form so
     /// `"5"`, `" 5 "` and `"5.0"` all name the same event.
     pub async fn post_event_named(&self, event_name: &str) {
+        // C `postEvent` (`dbScan.c:536-539`), reached through
+        // `post_event`/`eventNameToHandle` — the same gate, applied before
+        // the name lookup because C applies it before touching the list.
+        if !crate::server::scan::scan_is_running() {
+            return;
+        }
         let want = normalize_event_name(event_name);
         if want.is_empty() {
             // `eventNameToHandle` returns NULL for "0"/empty — no event.
@@ -455,7 +570,7 @@ mod tests {
         let held = db.lock_registration("a_test_standing_in_for_a_registration_entry_point");
 
         let violation = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            db.update_scan_index("ANY", ScanType::Passive, ScanType::Sec01, 0, 0);
+            db.update_scan_index("ANY", ScanType::Passive, ScanType::SEC01, 0, 0);
         }));
 
         let payload = violation
@@ -478,7 +593,7 @@ mod tests {
     #[test]
     fn the_scan_index_owner_takes_l46_itself_when_no_caller_holds_it() {
         let db = PvDatabase::new();
-        db.update_scan_index("ANY", ScanType::Passive, ScanType::Sec01, 0, 0);
+        db.update_scan_index("ANY", ScanType::Passive, ScanType::SEC01, 0, 0);
     }
 
     /// The gate is released on drop, including by unwinding out of a panic

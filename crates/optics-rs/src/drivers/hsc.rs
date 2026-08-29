@@ -497,12 +497,10 @@ impl HscHolder {
                 ArgDesc {
                     name: "port",
                     arg_type: ArgType::String,
-                    optional: false,
                 },
                 ArgDesc {
                     name: "pollMs",
                     arg_type: ArgType::Int,
-                    optional: true,
                 },
             ],
             "simHscCreate(port, [pollMs]) - Create a simulated HSC-1 slit controller",

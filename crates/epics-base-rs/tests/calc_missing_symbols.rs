@@ -1,8 +1,8 @@
 //! R9-8 — symbols the synApps element tables spell that the port never lexed.
 //!
 //! * aCalc: `@` (A_FETCH, `aCalcPostfix.c:93`), `@@` (A_AFETCH, `:94`), `AVAL`
-//!   (`:118`), `ANEG`/`APOS` (`:153-154`), `LEN` (`:199`), `[` / `{`
-//!   (SUBRANGE / SUBRANGE_IP, `:212-213`), `R2S`/`S2R` (`:186,195`).
+//!   (`:118`), `ANEG`/`APOS` (`:153-154`), `LEN` (`:197`), `[` / `{`
+//!   (SUBRANGE / SUBRANGE_IP, `:210-211`), `R2S`/`S2R` (`:184,193`).
 //! * sCalc: `R2S`/`S2R` (`sCalcPostfix.c:136,173`), the `$E $P $R $S $T $W`
 //!   aliases (`:176-194`), and `-|` (`:243`, the SUB opcode — "subtract first
 //!   occurrence", the mirror of `|-`).
@@ -80,7 +80,7 @@ fn dyn_fetch_indexes_the_scalar_args() {
     assert_eq!(num("@1.6"), 3.0);
 }
 
-/// C `:1470-1473` prints "fetch index out of range" and answers 0 — it does not
+/// C `:1459-1462` prints "fetch index out of range" and answers 0 — it does not
 /// fail the calculation (`perform` still returns 0).
 #[test]
 fn dyn_fetch_out_of_range_is_zero() {
@@ -88,14 +88,14 @@ fn dyn_fetch_out_of_range_is_zero() {
     assert_eq!(num("@-1"), 0.0);
 }
 
-/// `@@x` (A_AFETCH, `:1479-1494`) is the same one dimension up: `@@0` is AA,
+/// `@@x` (A_AFETCH, `:1468-1483`) is the same one dimension up: `@@0` is AA,
 /// `@@1` is BB — and the result is an ARRAY even when the index misses
 /// (C `toArray(ps,0)` before the range test).
 #[test]
 fn dyn_afetch_indexes_the_array_args() {
     assert_eq!(arr("@@0"), vec![10.0, 20.0, 30.0, 40.0, 50.0, 60.0]);
     assert_eq!(arr("@@1"), vec![-1.0, 2.0, -3.0, 4.0, -5.0, 6.0]);
-    // C `:1490-1493` — an argument the record never allocated is all zeros.
+    // C `:1479-1482` — an argument the record never allocated is all zeros.
     // myNINT(1.6) = 2, i.e. CC, which this driver leaves unset.
     assert_eq!(arr("@@1.6"), vec![0.0; 6]);
     assert_eq!(arr("@@99"), vec![0.0; 6]);
@@ -103,7 +103,7 @@ fn dyn_afetch_indexes_the_array_args() {
 
 // --- aCalc: AVAL ---------------------------------------------------------
 
-/// `AVAL` (FETCH_AVAL, `:534-539`) pushes `p_aresult` — the record's previous
+/// `AVAL` (FETCH_AVAL, `:529-534`) pushes `p_aresult` — the record's previous
 /// ARRAY result, the counterpart of `VAL`.
 #[test]
 fn aval_pushes_the_previous_array_result() {
@@ -114,7 +114,7 @@ fn aval_pushes_the_previous_array_result() {
 // --- aCalc: ANEG / APOS --------------------------------------------------
 
 /// `ANEG` zeroes the NEGATIVE elements (`:772` array, `:1046` scalar) and `APOS`
-/// the POSITIVE ones (`:773`, `:1047`) — the name says which sign it REMOVES.
+/// the POSITIVE ones (`:773`, `:1036`) — the name says which sign it REMOVES.
 #[test]
 fn aneg_and_apos_zero_the_named_sign() {
     assert_eq!(arr("ANEG(BB)"), vec![0.0, 2.0, 0.0, 4.0, 0.0, 6.0]);
@@ -142,13 +142,14 @@ fn acalc_len_is_a_no_op() {
 
 // --- aCalc: [ ] and { } --------------------------------------------------
 
-/// SUBRANGE (`:1536-1541`): BOTH bounds are inclusive, the selected elements are
+/// SUBRANGE (`aCalcPerform.c:1536-1541`): BOTH bounds are inclusive, the
+/// selected elements are
 /// SHIFTED DOWN to index 0, and the tail is zero-filled — the result is still a
 /// full `arraySize` buffer.
 #[test]
 fn subrange_shifts_the_selection_to_the_front() {
     assert_eq!(arr("AA[1,3]"), vec![20.0, 30.0, 40.0, 0.0, 0.0, 0.0]);
-    // The bounds are truncating `(int)` casts (`:1527,1531`), not myNINT.
+    // The bounds are truncating `(int)` casts (`:1516,1520`), not myNINT.
     assert_eq!(arr("AA[1.7,3.9]"), vec![20.0, 30.0, 40.0, 0.0, 0.0, 0.0]);
 }
 
@@ -160,7 +161,7 @@ fn subrange_in_place_keeps_the_positions() {
     assert_eq!(arr("AA{2,-1}"), vec![0.0, 0.0, 30.0, 40.0, 50.0, 60.0]);
 }
 
-/// A negative bound counts back from the end (`:1528,1532`: `if (i < 0) i += arraySize`).
+/// A negative bound counts back from the end (`:1517,1521`: `if (i < 0) i += arraySize`).
 #[test]
 fn a_negative_subrange_bound_wraps_to_the_end() {
     assert_eq!(arr("AA[-2,5]"), vec![50.0, 60.0, 0.0, 0.0, 0.0, 0.0]);

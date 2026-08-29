@@ -7,15 +7,20 @@
 //!               [--preload preload.txt] [--port 5064]
 //!               [--read-only] [--no-stats]
 //! ```
+// On `exec_backend` this program's `main` refuses instead of running, so
+// everything below it is unreachable in that configuration by construction.
+// The lint is reporting the intent, not dead code: the default build still
+// lints this file in full.
+#![cfg_attr(exec_backend, allow(dead_code, unused_imports))]
 
 use std::path::PathBuf;
 use std::process::ExitCode;
 
 use clap::Parser;
 
-use epics_bridge_rs::ca_gateway::{
-    GatewayConfig, GatewayServer, PutLogScope, RestartPolicy, supervise,
-};
+#[cfg(tokio_backend)]
+use epics_bridge_rs::ca_gateway::{GatewayConfig, GatewayServer};
+use epics_bridge_rs::ca_gateway::{PutLogScope, RestartPolicy, supervise};
 
 #[derive(Parser, Debug)]
 #[command(
@@ -300,6 +305,7 @@ fn build_upstream_tls(args: &Args) -> Result<Option<epics_ca_rs::tls::TlsConfig>
     Ok(Some(cfg))
 }
 
+#[cfg(tokio_backend)]
 async fn run_once(config: GatewayConfig) -> Result<(), String> {
     tracing::info!("ca-gateway-rs: starting");
     let server = GatewayServer::build(config)
@@ -311,6 +317,7 @@ async fn run_once(config: GatewayConfig) -> Result<(), String> {
         .map_err(|e| format!("runtime error: {e}"))
 }
 
+#[cfg(tokio_backend)]
 fn main() -> ExitCode {
     let args = Args::parse();
 
@@ -342,9 +349,8 @@ fn main() -> ExitCode {
 
     // One worker, reactor-style — see qsrv_rs.rs: the default per-CPU
     // pool migrates the mostly-serial serving work across idle workers,
-    // costing ~35 µs of extra CPU per op on a 96-core host
-    // (doc/qsrv-put-perf.md). Multi-thread flavor is kept so
-    // `block_on_sync` works from runtime tasks.
+    // costing ~35 µs of extra CPU per op on a 96-core host. Multi-thread
+    // flavor is kept so `block_on_sync` works from runtime tasks.
     let runtime = match tokio::runtime::Builder::new_multi_thread()
         .worker_threads(1)
         .enable_all()
@@ -359,6 +365,7 @@ fn main() -> ExitCode {
     runtime.block_on(async_main(args))
 }
 
+#[cfg(tokio_backend)]
 async fn async_main(args: Args) -> ExitCode {
     // Initialize structured logging — RUST_LOG controls verbosity. The
     // gateway's hot paths (cache eviction, command processing, signal
@@ -467,4 +474,18 @@ async fn async_main(args: Args) -> ExitCode {
             }
         }
     }
+}
+
+/// The `exec_backend` arm. The gateway is a CA client *and* a CA server, both
+/// through the async front-ends, so on the reactor-free backend neither half
+/// exists. Nothing replaces it: an RTEMS image runs an IOC, not a gateway.
+#[cfg(exec_backend)]
+fn main() -> ExitCode {
+    eprintln!(
+        "ca-gateway-rs: this build selects the reactor-free execution backend \
+         (EPICS_RS_BUILD_EXEC_BACKEND=thread), and both the upstream CA client and the \
+         downstream CA server need a tokio reactor. Rebuild without that \
+         feature."
+    );
+    ExitCode::FAILURE
 }

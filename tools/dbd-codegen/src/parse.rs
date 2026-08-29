@@ -28,6 +28,11 @@ pub struct Menu {
     /// Choice labels in `menu()` declaration order. The index is the stored
     /// `epicsEnum16` value and is wire-visible, so order is load-bearing.
     pub choices: Vec<String>,
+    /// The `choice(IDENT,...)` identifiers, parallel to [`Self::choices`]. Not
+    /// wire-visible — it is the C enum name — but `dbWriteMenuFP`
+    /// (`dbStaticLib.c:921`) prints it, so `dbDumpMenu` cannot reproduce its
+    /// report without it.
+    pub identifiers: Vec<String>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -46,7 +51,11 @@ pub struct Field {
     pub initial: Option<String>,
     pub interest: Option<u32>,
     pub prop: bool,
-    pub base: Option<String>,
+    /// `base(HEX)` — C `pdbFldDes->base = CT_HEX` (`dbLexRoutines.c:652-661`).
+    /// A bool and not an `Option<String>` because C admits exactly two
+    /// spellings and errors on any third, so "absent" and "DECIMAL" are the
+    /// same state.
+    pub base_hex: bool,
     pub extra: Option<String>,
     /// True when the field came from `include "dbCommon.dbd"` rather than the
     /// record's own body. The port models dbCommon separately (`CommonFields`),
@@ -81,11 +90,29 @@ pub struct Device {
     pub name: String,
 }
 
+/// One `variable(name[, type])` declaration.
+///
+/// C's `dbVariable` appends these to `pdbbase->variableList`
+/// (`dbLexRoutines.c:949-971`), which is the list `dbDumpVariable` prints and
+/// which `registerRecordDeviceDriver.pl` separately turns into `iocshVariable`
+/// registrations. The two are different tables in C: an `iocshRegisterVariable`
+/// call from C code (`asCheckClientIP`) reaches the second and not the first.
+///
+/// The type defaults to `int` when omitted, because C's one-argument form is
+/// `dbVariable($3, "int")` (`dbYacc.y:192-202`) — the type is absent from the
+/// source text, never from the declaration.
+#[derive(Debug, Clone)]
+pub struct Variable {
+    pub name: String,
+    pub dtype: String,
+}
+
 #[derive(Debug, Default)]
 pub struct Dbd {
     pub menus: BTreeMap<String, Menu>,
     pub records: Vec<RecordType>,
     pub devices: Vec<Device>,
+    pub variables: Vec<Variable>,
 }
 
 /// One lexical token. The `.dbd` grammar needs nothing richer: identifiers,
@@ -261,8 +288,14 @@ pub fn parse_str(src: &str, source: &str, common: &[Field]) -> Result<Dbd, Strin
             Tok::Ident(kw) if kw == "menu" => {
                 p.next();
                 let name = p.paren_arg()?;
-                let choices = parse_menu_body(&mut p)?;
-                dbd.menus.insert(name, Menu { choices });
+                let (choices, identifiers) = parse_menu_body(&mut p)?;
+                dbd.menus.insert(
+                    name,
+                    Menu {
+                        choices,
+                        identifiers,
+                    },
+                );
             }
             Tok::Ident(kw) if kw == "device" => {
                 p.next();
@@ -292,7 +325,19 @@ pub fn parse_str(src: &str, source: &str, common: &[Field]) -> Result<Dbd, Strin
                     source: source.to_string(),
                 });
             }
-            // `include`, `driver`, `registrar`, `variable`,
+            Tok::Ident(kw) if kw == "variable" => {
+                p.next();
+                let args = p.paren_args()?;
+                let mut args = args.into_iter();
+                let (Some(name), dtype, None) = (args.next(), args.next(), args.next()) else {
+                    return Err("variable() takes 1 or 2 arguments".into());
+                };
+                dbd.variables.push(Variable {
+                    name,
+                    dtype: dtype.unwrap_or_else(|| "int".to_string()),
+                });
+            }
+            // `include`, `driver`, `registrar`,
             // `function`, `breaktable` — declarations this generator does not
             // model. Skip the statement and any brace body that follows.
             Tok::Ident(_) => {
@@ -345,20 +390,22 @@ fn skip_statement(p: &mut Parser) -> Result<(), String> {
     Ok(())
 }
 
-fn parse_menu_body(p: &mut Parser) -> Result<Vec<String>, String> {
+fn parse_menu_body(p: &mut Parser) -> Result<(Vec<String>, Vec<String>), String> {
     p.expect(&Tok::LBrace)?;
     let mut choices = Vec::new();
+    let mut identifiers = Vec::new();
     loop {
         match p.next() {
             Some(Tok::RBrace) => break,
             Some(Tok::Ident(kw)) if kw == "choice" => {
                 p.expect(&Tok::LParen)?;
-                // choice(IDENT,"label") — the identifier is the C enum name and
-                // is not wire-visible; only the label is.
-                match p.next() {
-                    Some(Tok::Ident(_)) | Some(Tok::Str(_)) => {}
+                // choice(IDENT,"label") — the identifier is the C enum name, so
+                // it is not wire-visible the way the label is; it is kept
+                // because `dbWriteMenuFP` prints it.
+                let ident = match p.next() {
+                    Some(Tok::Ident(s)) | Some(Tok::Str(s)) => s,
                     other => return Err(format!("choice: expected ident, found {other:?}")),
-                }
+                };
                 p.expect(&Tok::Comma)?;
                 let label = match p.next() {
                     Some(Tok::Str(s)) | Some(Tok::Ident(s)) => s,
@@ -366,11 +413,12 @@ fn parse_menu_body(p: &mut Parser) -> Result<Vec<String>, String> {
                 };
                 p.expect(&Tok::RParen)?;
                 choices.push(label);
+                identifiers.push(ident);
             }
             other => return Err(format!("menu body: unexpected {other:?}")),
         }
     }
-    Ok(choices)
+    Ok((choices, identifiers))
 }
 
 fn parse_recordtype_body(p: &mut Parser, common: &[Field]) -> Result<Vec<Field>, String> {
@@ -476,7 +524,22 @@ fn parse_field(p: &mut Parser) -> Result<Field, String> {
                     // `DBE_PROPERTY` where C does not fires property monitors
                     // no C IOC sends.
                     "prop" => f.prop = arg == "YES",
-                    "base" => f.base = Some(arg),
+                    // C (`dbLexRoutines.c:652-661`) takes DECIMAL or HEX and
+                    // `yyerror`s on anything else, which fails the whole
+                    // `.dbd` load — so an unrecognised spelling must not
+                    // silently become DECIMAL here either.
+                    "base" => {
+                        f.base_hex = match arg.as_str() {
+                            "HEX" => true,
+                            "DECIMAL" => false,
+                            other => {
+                                return Err(format!(
+                                    "{}: Invalid 'base' value '{other}', must be DECIMAL/HEX",
+                                    f.name
+                                ));
+                            }
+                        }
+                    }
                     "extra" => f.extra = Some(arg),
                     other => return Err(format!("{}: unknown field attribute {other}", f.name)),
                 }
@@ -561,7 +624,7 @@ recordtype(demo) {
         assert_eq!(nm.interest, Some(2));
         assert_eq!(nm.initial.as_deref(), Some("x"));
         assert_eq!(nm.menu.as_deref(), Some("menuSimm"));
-        assert_eq!(nm.base.as_deref(), Some("HEX"));
+        assert!(nm.base_hex);
         assert_eq!(nm.extra.as_deref(), Some("void *p"));
         assert!(!nm.pp);
     }

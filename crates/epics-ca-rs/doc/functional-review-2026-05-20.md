@@ -1,7 +1,22 @@
 # Functional Review - 2026-05-20
 
+> **Reference pin.** This document declared no reference revision when it was
+> written. **epics-base = `R7.0.10`** (tag object `e1c98a45`, commit `bf11a0c3`), established by resolving its
+> citations rather than from its date: all 45 line-numbered C citations here
+> resolve at that revision, so no row is marked as unresolved. The revision is
+> bounded above by `7e18b8cff` (2026-05-12, `asDump* quote UAG and HAG
+> entries`), which moves the per-ASG `pavalue` allocation off
+> `asLibRoutines.c:117` and the `calcPerform()` call off `:957-964`;
+> `2d8a6f91a` (2026-03-18) is the newest commit before it that touches a cited
+> file. Going backwards the bound is `271f20faa` (2025-08-27), which already
+> fails those same two rows. Every revision inside `271f20faa..7e18b8cff` fits
+> the citations equally, `R7.0.10` among them; the tag is chosen because it is
+> durable where a bare commit is not. The checkout was therefore no newer than
+> 2026-05-12, eight days before the review date — the date is not evidence for
+> the revision.
+
 Scope: `epics-ca-rs` current workspace state, compared against
-`~/codes/epics-base` CA client (`modules/ca/src/client`) and rsrv / access
+`$EPICS_BASE` CA client (`modules/ca/src/client`) and rsrv / access
 security (`modules/database/src/ioc/rsrv`,
 `modules/libcom/src/as`). This file records open functional gaps and bugs that
 are still visible in the current Rust code. Older findings that current code has
@@ -9,16 +24,22 @@ closed are not repeated here.
 
 ## Summary
 
-| ID | Type | Severity | Area | Status |
-|----|------|----------|------|--------|
-| CA-FR-1 | Missing C behavior | High | ACF `CALC` / `INP*` | Done |
-| CA-FR-2 | Bug | Medium | client id allocation | Done |
-| CA-FR-3 | Missing C behavior | Medium | client priority / contexts | Done |
-| CA-FR-4 | Missing C tool behavior | Medium | CLI request options | Done |
-| CA-FR-5 | Missing C behavior | Medium | sync group lifecycle | Done |
-| CA-FR-6 | Bug | Medium | SimplePv monitor masks | Done |
-| CA-FR-7 | Bug | High | DBR payload sizing | Done |
-| CA-FR-8 | Missing C behavior | Medium | channel filters on READ / SimplePv | Done |
+Recording note (2026-08-26): the Status column read `Done` for every row.
+That word is in no verdict vocabulary and it names no commit, so a per-row
+scan reported all eight of these open. The column now carries a verdict and
+the commit behind it; the sections below still describe each gap in the
+present tense of the day they were written.
+
+| ID | Type | Severity | Area | Status | Closed by |
+|----|------|----------|------|--------|-----------|
+| CA-FR-1 | Missing C behavior | High | ACF `CALC` / `INP*` | **CLEARED** | `7f777623`, over `3d59e9d0` and `adf6490b` |
+| CA-FR-2 | Bug | Medium | client id allocation | **CLEARED** | `10963784` |
+| CA-FR-3 | Missing C behavior | Medium | client priority / contexts | **CLEARED** | `54708dd7` |
+| CA-FR-4 | Missing C tool behavior | Medium | CLI request options | **CLEARED** | `773367b4`, `62217f86`, `150421ba`, `3d4f9181`, `18ed9da9`, `86ccc017`, `779da7a5`, `fba0f95d` |
+| CA-FR-5 | Missing C behavior | Medium | sync group lifecycle | **CLEARED** | `3c305ecd` |
+| CA-FR-6 | Bug | Medium | SimplePv monitor masks | **CLEARED** | `df6c8e0a` |
+| CA-FR-7 | Bug | High | DBR payload sizing | **CLEARED** | `6d613a05` |
+| CA-FR-8 | Missing C behavior | Medium | channel filters on READ / SimplePv | **CLEARED** | `67e9fe1c` |
 
 ## CA-FR-1: ACF `CALC` / `INP*` rules fail closed instead of evaluating
 
@@ -38,7 +59,7 @@ Rust evidence:
 
 C reference:
 
-- `~/codes/epics-base/modules/libcom/src/as/asLibRoutines.c:117` allocates
+- `$EPICS_BASE/modules/libcom/src/as/asLibRoutines.c:117` allocates
   per-ASG `pavalue` storage for CALC inputs.
 - `asLibRoutines.c:957-964` calls `calcPerform()` when the inputs changed.
 - `asLibRoutines.c:1038-1042` grants the rule when the CALC result is true and
@@ -91,7 +112,7 @@ Rust evidence:
 
 C reference:
 
-- `~/codes/epics-base/modules/ca/src/client/cac.cpp:533-535` allocates a
+- `$EPICS_BASE/modules/ca/src/client/cac.cpp:533-535` allocates a
   channel and registers it through `chanTable.idAssignAdd()`.
 - `cac.cpp:711-719` allocates write-notify IO through `ioTable.idAssignAdd()`.
 - `cac.cpp:725-733` allocates read-notify IO through `ioTable.idAssignAdd()`.
@@ -145,10 +166,10 @@ Rust evidence:
 
 C reference:
 
-- `~/codes/epics-base/modules/ca/src/client/cadef.h:498-508` defines the
+- `$EPICS_BASE/modules/ca/src/client/cadef.h:498-508` defines the
   `ca_create_channel()` priority parameter and states that each priority used
   on a server creates an independent virtual circuit and data structures.
-- `~/codes/epics-base/modules/ca/src/client/cac.cpp:512-520` range-checks the
+- `$EPICS_BASE/modules/ca/src/client/cac.cpp:512-520` range-checks the
   requested priority.
 - `cac.cpp:539-559` creates or finds a virtual circuit with the requested
   priority.
@@ -198,7 +219,7 @@ Rust evidence:
 
 C reference:
 
-- `~/codes/epics-base/modules/ca/src/tools/tool_lib.c:58` stores
+- `$EPICS_BASE/modules/ca/src/tools/tool_lib.c:58` stores
   `caPriority`, and `:589-593` passes it to `ca_create_channel()`.
 - `caget.c:415-435` parses `-d`, `:175-187` selects the DBR request type, and
   `:214-217` passes that type to `ca_array_get()`.
@@ -259,7 +280,7 @@ Rust evidence:
 
 C reference:
 
-- `~/codes/epics-base/modules/ca/src/client/cadef.h:1553-1557` describes
+- `$EPICS_BASE/modules/ca/src/client/cadef.h:1553-1557` describes
   `ca_sg_block`, `ca_sg_test`, and `ca_sg_reset` as part of the synchronous group
   contract.
 - `cadef.h:1604-1610` states that `ca_sg_block()` waits only for requests issued
@@ -268,7 +289,7 @@ C reference:
   `ECA_IOINPROGRESS`.
 - `cadef.h:1656-1673` defines `ca_sg_reset()` as resetting outstanding request
   count to zero.
-- `~/codes/epics-base/modules/ca/src/client/syncgrp.cpp:128-148` calls
+- `$EPICS_BASE/modules/ca/src/client/syncgrp.cpp:128-148` calls
   `sync_group_reset()` after `ca_sg_block()`.
 - `syncgrp.cpp:156-198` implements `ca_sg_reset()` and `ca_sg_stat()`.
 - `syncgrp.cpp:203-241` implements `ca_sg_test()`.
@@ -327,11 +348,11 @@ Rust evidence:
 
 C reference:
 
-- `~/codes/epics-base/modules/database/src/ioc/rsrv/camessage.c:1803-1813`
+- `$EPICS_BASE/modules/database/src/ioc/rsrv/camessage.c:1803-1813`
   stores the client monitor mask and passes it to `db_add_event()`.
-- `~/codes/epics-base/modules/database/src/ioc/db/dbEvent.c:892-900` queues an
+- `$EPICS_BASE/modules/database/src/ioc/db/dbEvent.c:892-900` queues an
   event only when `caEventMask & pevent->select` is non-zero.
-- `~/codes/epics-base/modules/ca/src/tools/camonitor.c:285-303` lets users pick
+- `$EPICS_BASE/modules/ca/src/tools/camonitor.c:285-303` lets users pick
   the same mask bits with `camonitor -m`.
 
 Impact:
@@ -383,7 +404,7 @@ Rust evidence:
 
 C reference:
 
-- `~/codes/epics-base/modules/ca/src/client/db_access.h:250-300` defines
+- `$EPICS_BASE/modules/ca/src/client/db_access.h:250-300` defines
   TIME_SHORT / TIME_ENUM / TIME_CHAR / TIME_DOUBLE with RISC pad fields before
   the value.
 - `db_access.h:308-402` defines GR structs whose metadata size depends on the
@@ -424,7 +445,7 @@ Regression tests to add:
 
 `CA_PROTO_READ_BUILD` (16) and `CA_PROTO_SIGNAL` (25) are not counted as an
 open gap in this review. epics-base defines the opcodes in
-`~/codes/epics-base/modules/ca/src/client/caProto.h:103` and `:112`, but rsrv's
+`$EPICS_BASE/modules/ca/src/client/caProto.h:103` and `:112`, but rsrv's
 TCP jump table maps those slots to `bad_tcp_cmd_action`
 (`modules/database/src/ioc/rsrv/camessage.c:2312`, `:2321`). Current Rust maps
 unsupported server commands through the same error-and-close policy in
@@ -457,12 +478,12 @@ Rust evidence:
 
 C reference:
 
-- `~/codes/epics-base/modules/database/src/ioc/db/db_access.c:160-167` creates a
+- `$EPICS_BASE/modules/database/src/ioc/db/db_access.c:160-168` creates a
   read field-log and runs `dbChannelRunPreChain()` / `dbChannelRunPostChain()`
   when filters exist on a read channel.
-- `~/codes/epics-base/modules/database/src/ioc/db/dbChannel.c:640-649` does the
+- `$EPICS_BASE/modules/database/src/ioc/db/dbChannel.c:641-648` does the
   same for `dbChannelGetField()`.
-- `~/codes/epics-base/modules/database/src/ioc/db/dbEvent.c:896-902` runs
+- `$EPICS_BASE/modules/database/src/ioc/db/dbEvent.c:896-902` runs
   `dbChannelRunPreChain()` before queueing monitor events.
 
 Impact:

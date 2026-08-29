@@ -19,7 +19,8 @@
 //! Self-contained (no external EPICS/pvxs tools), so it runs in the default
 //! nextest profile rather than the gated `interop` suites.
 
-// RTEMS-EXEC-MODEL-ALLOW(2): checked - these run and pass in the feature-ON suite.
+#![cfg(tokio_backend)]
+
 use std::io::{Cursor, Read};
 use std::net::TcpStream;
 use std::sync::Arc;
@@ -28,7 +29,8 @@ use std::time::Duration;
 use epics_pva_rs::proto::{ByteOrder, ControlCommand, PvaHeader};
 use epics_pva_rs::pvdata::{FieldDesc, PvField};
 use epics_pva_rs::server_native::MonitorStream;
-use epics_pva_rs::server_native::{ChannelSource, OpError, PvaServer, PvaServerConfig};
+use epics_pva_rs::server_native::PvaServer;
+use epics_pva_rs::server_native::{ChannelSource, OpError, PvaServerConfig};
 
 /// The server's beat period (`tcp.rs`, `interval(Duration::from_secs(15))`),
 /// matching pvxs. Not configurable, so the idle test has to wait it out.

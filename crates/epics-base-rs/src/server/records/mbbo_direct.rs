@@ -34,11 +34,6 @@ pub struct MbboDirectRecord {
     pub siol: String,
     pub sims: i16,
     pub sdly: f64,
-    // VAL change gate. C
-    // mbboDirectRecord.c:311-314 monitor() raises DBE_VALUE|DBE_LOG for VAL
-    // only when `mlst != val`. Captured during process() because the
-    // framework reads monitor_value_changed() after process() commits mlst.
-    value_changed: bool,
     /// Set by `set_device_did_compute(true)` when a device readback has
     /// already produced both RVAL and VAL (`apply_raw_readback`). One-shot:
     /// `process()` then skips the forward `VAL -> RVAL` convert that would
@@ -70,7 +65,6 @@ impl Default for MbboDirectRecord {
             siol: String::new(),
             sims: 0,
             sdly: -1.0,
-            value_changed: false,
             skip_convert: false,
         }
     }
@@ -88,6 +82,35 @@ impl MbboDirectRecord {
         for i in 0..32 {
             self.val |= (self.bits[i] as u32 & 1) << i;
         }
+    }
+
+    /// C `mbboDirectRecord.c:342-349` `convert()` — the whole VAL->RVAL
+    /// translation:
+    ///
+    /// ```c
+    ///     prec->rval = prec->val;
+    ///     if (prec->shft > 0) prec->rval <<= prec->shft;
+    /// ```
+    ///
+    /// MASK is not read. It belongs to device support, which positions it
+    /// (`prec->mask <<= prec->shft`, devMbboDirectSoftRaw.c:31) and applies it
+    /// on the way OUT (`data = prec->rval & prec->mask`, `:40`) — so the
+    /// record's RVAL stays the full shifted value and only the wire word is
+    /// trimmed. Masking here with the record's own UNSHIFTED NOBT mask cleared
+    /// exactly the bits the shift had just placed.
+    ///
+    /// C reaches this from two places — the ordinary `process()` path and the
+    /// `IVOA = Set_output_to_IVOV` arm at `mbboDirectRecord.c:210-214` — so it
+    /// lives here rather than inline in [`Record::process`], where the arm
+    /// could not call it.
+    fn convert(&mut self) {
+        let mut raw = self.val;
+        if self.shft > 0 {
+            // Saturating, like every other SHFT site in this module --
+            // see `mbbi_direct::convert` for why C has no answer here.
+            raw = raw.checked_shl(self.shft as u32).unwrap_or(0);
+        }
+        self.rval = raw;
     }
 }
 
@@ -209,11 +232,19 @@ impl Record for MbboDirectRecord {
         }
     }
 
-    // C recMbboDirect.c IVOA=set_to_IVOV: val = ivov; rval = ivov.
+    /// C `mbboDirectRecord.c:210-214` is `prec->val = prec->ivov;` followed by
+    /// `convert(prec)` — the record's own VAL->RVAL translation
+    /// (`Self::convert`, C `:342-349`), which applies SHFT. RVAL is
+    /// therefore IVOV shifted, never IVOV itself.
+    ///
+    /// Writing `RVAL = IVOV` directly dropped the shift, so an INVALID
+    /// `mbboDirect` with `field(SHFT,"8")` drove the IVOV word unshifted and
+    /// the device wrote it into the wrong bit positions.
     fn apply_invalid_output_value(&mut self, ivov: EpicsValue) -> CaResult<()> {
-        // IVOV is Long on mbboDirect; both VAL and RVAL accept Long.
-        self.put_field("RVAL", ivov.clone())?;
-        self.put_field("VAL", ivov)
+        // IVOV is served as Long (`get_field`); VAL accepts Long.
+        self.put_field("VAL", ivov)?;
+        self.convert();
+        Ok(())
     }
 
     fn uses_monitor_deadband(&self) -> bool {
@@ -256,12 +287,15 @@ impl Record for MbboDirectRecord {
         field == self.primary_field() || BIT_NAMES.contains(&field)
     }
 
-    /// VAL posts DBE_VALUE|DBE_LOG
-    /// only when it changed (C mbboDirectRecord.c:311-314 `mlst != val`), not
-    /// every process cycle. The comparison is captured in process(); see
-    /// `value_changed`.
-    fn monitor_value_changed(&self) -> Option<bool> {
-        Some(self.value_changed)
+    /// C `mbboDirectRecord.c:311-314` `monitor()`: `if (prec->mlst != prec->val) { events |=
+    /// DBE_VALUE | DBE_LOG; prec->mlst = prec->val; }` — compared and
+    /// committed HERE, at C's position, never captured during `process()`.
+    fn monitor_value_changed(&mut self) -> Option<bool> {
+        let changed = self.mlst != self.val;
+        if changed {
+            self.mlst = self.val;
+        }
+        Some(changed)
     }
 
     fn init_record(&mut self, pass: u8) -> CaResult<()> {
@@ -309,18 +343,23 @@ impl Record for MbboDirectRecord {
         )]
     }
 
-    /// C `mbboDirectRecord.c:142-143,160-162` — the init tail, run right after
-    /// the constant load: `bitsFromVAL(prec)` re-derives B0..B1F from whatever
-    /// VAL now holds, then `mlst = val; oraw = rval; orbv = rbv`. C runs
-    /// `bitsFromVAL` only on the `!udf` arm, but every path that leaves UDF set
-    /// also leaves VAL and the bits both zero, so the unconditional form is the
-    /// same derivation. No `convert()`: C does not translate VAL to RVAL at
-    /// init on this record.
-    fn seed_deadband_tracking(&mut self) {
+    /// C `mbboDirectRecord.c:142-143,161-162` — the derived half of the init
+    /// tail, run right after the constant load: `bitsFromVAL(prec)` re-derives
+    /// B0..B1F from whatever VAL now holds, then `oraw = rval; orbv = rbv`. C
+    /// runs `bitsFromVAL` only on the `!udf` arm, but every path that leaves
+    /// UDF set also leaves VAL and the bits both zero, so the unconditional
+    /// form is the same derivation. No `convert()`: C does not translate VAL to
+    /// RVAL at init on this record.
+    fn init_record_tail(&mut self) {
         self.val_to_bits();
-        self.mlst = self.val;
         self.oraw = self.rval;
         self.orbv = self.rbv;
+    }
+
+    /// C `mbboDirectRecord.c:160` — `mlst = val`, and that is the whole tracker
+    /// half: mbboDirect has neither ADEL nor LALM.
+    fn seed_deadband_tracking(&mut self) {
+        self.mlst = self.val;
     }
 
     /// C `mbboDirectRecord.c::process` (line 198) calls `convert(prec)`
@@ -331,27 +370,12 @@ impl Record for MbboDirectRecord {
     /// `soft_channel_skips_convert` — the soft-channel convert-skip
     /// applies only to INPUT records.
     fn process(&mut self) -> CaResult<ProcessOutcome> {
-        // C `mbboDirectRecord.c:342-349` is the whole convert:
-        //
-        //     prec->rval = prec->val;
-        //     if (prec->shft > 0) prec->rval <<= prec->shft;
-        //
-        // MASK is not read. It belongs to device support, which positions it
-        // (`prec->mask <<= prec->shft`, devMbboDirectSoftRaw.c:31) and applies
-        // it on the way OUT (`data = prec->rval & prec->mask`, `:40`) — so the
-        // record's RVAL stays the full shifted value and only the wire word is
-        // trimmed. Masking here with the record's own UNSHIFTED NOBT mask
-        // cleared exactly the bits the shift had just placed.
-        //
-        // Skipped when a device readback (`apply_raw_readback`) already set
-        // both RVAL and VAL, and when a failed closed-loop DOL read took C's
-        // `goto CONTINUE` (`closed_loop_dol_read_failed`).
+        // [`Self::convert`] is C's `convert(prec)`. Skipped when a device
+        // readback (`apply_raw_readback`) already set both RVAL and VAL, and
+        // when a failed closed-loop DOL read took C's `goto CONTINUE`
+        // (`closed_loop_dol_read_failed`).
         if !self.skip_convert {
-            let mut raw = self.val;
-            if self.shft > 0 {
-                raw = raw.wrapping_shl(self.shft as u32);
-            }
-            self.rval = raw;
+            self.convert();
         }
         self.skip_convert = false;
         // C `mbboDirectRecord.c` — RBV is updated ONLY by device support
@@ -360,13 +384,6 @@ impl Record for MbboDirectRecord {
         // so we only roll `orbv` forward and leave `rbv` untouched.
         self.orbv = self.rbv;
         self.oraw = self.rval;
-        // Capture the VAL-change
-        // gate now (C mbboDirectRecord.c:311-314 `mlst != val`); the framework
-        // reads monitor_value_changed() after process().
-        self.value_changed = self.mlst != self.val;
-        if self.value_changed {
-            self.mlst = self.val;
-        }
         Ok(ProcessOutcome::complete())
     }
 

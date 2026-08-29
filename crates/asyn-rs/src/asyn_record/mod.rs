@@ -1,3 +1,10 @@
+// RTEMS-EXEC-MODEL-ALLOW(10): checked, not waived — all 10 ran and passed
+// on the exec backend (measured on this tree:
+// `EPICS_RS_BUILD_EXEC_BACKEND=thread cargo nextest run -p asyn-rs
+// --all-features`, 1081/1081). asyn-rs became a census subject when its
+// `build.rs` began deriving `tokio_backend`; nothing here builds a CA
+// server, and the reactor these obtain comes from `#[tokio::test]`
+// itself, which the backend does not remove.
 pub mod device;
 mod io_intr;
 pub use device::{ASYN_RECORD_DTYP, AsynRecordDevice};
@@ -26,6 +33,7 @@ use epics_base_rs::server::record::{
 };
 use epics_base_rs::types::{DbFieldType, EpicsValue};
 
+use crate::drivers::option_parse::option_key;
 use crate::error::{AsynError, AsynResult, AsynStatus};
 use crate::exception::{AsynException, ExceptionCallbackId, ExceptionManager};
 use crate::interpose::EomReason;
@@ -128,7 +136,7 @@ impl InterfaceType {
     }
 
     /// The asyn interface name C reports when the port does not implement it —
-    /// `"No asynUInt32Digital interface"` (asynRecord.c:1345), spelled in full,
+    /// `"No asynUInt32Digital interface"` (asynRecord.c:637), spelled in full,
     /// unlike [`Self::c_errs_name`].
     fn c_asyn_name(self) -> &'static str {
         match self {
@@ -164,7 +172,7 @@ impl InterfaceType {
 // silent no-op, and a record must not treat it as one — that is what leaves an
 // operator's mis-set field showing a value the port never took.
 
-/// C `baud_choices` (asynRecord.c:49-53).
+/// C `baud_choices` (asynRecord.c:49-52).
 const BAUD_CHOICES: &[&str] = &[
     "Unknown", "300", "600", "1200", "2400", "4800", "9600", "19200", "38400", "57600", "115200",
     "230400", "460800", "576000", "921600", "1152000",
@@ -253,6 +261,16 @@ enum AsynArrayField {
 /// `IMAX`-sized `BINP` buffer.
 const AINP_SIZE: usize = 40;
 
+/// Capacity of the `ERRS` diagnostic buffer, in bytes — C `ERR_SIZE`
+/// (asynRecord.c:69), the `callocMustSucceed` size at `:301-302` and the
+/// `no_elements` both `cvt_dbaddr` (`:958`) and `get_array_info` (`:978`)
+/// report. ERRS is not a `DBF_STRING`: `cvt_dbaddr` gives it
+/// `field_type = DBF_CHAR` and `dbr_field_type = DBR_CHAR` (`:959-961`), so a
+/// CA client sees a 100-element char array, not a 40-byte string. `reportError`
+/// formats through `epicsVsnprintf(buffer, ERR_SIZE, ...)` (`:2037`), which
+/// leaves at most `ERR_SIZE - 1` characters plus the NUL.
+const ERR_SIZE: usize = 100;
+
 /// Capacity of the `TINP` translated-input string, in bytes —
 /// `sizeof(pasynRec->tinp)`, a `DBF_STRING` like `AINP`. C passes exactly this
 /// as the `epicsStrSnPrintEscaped` destination length on both TINP writers
@@ -271,7 +289,7 @@ pub(super) const EOS_SIZE: usize = 10;
 /// driver layer expects. Mirrors EPICS base's `dbTranslateEscape`
 /// (`libCom/misc/dbTranslateEscape.c`) — supports the standard
 /// escape sequences `\r \n \t \\ \" \0` plus octal `\NNN`. Used by
-/// asynRecord OEOS/IEOS writes (C asynRecord.c:374-393) and ASCII octet
+/// asynRecord OEOS/IEOS writes (C asynRecord.c:1965, :1974) and ASCII octet
 /// output (`:1489`) so a configured `\r\n` reaches the driver as the two
 /// raw bytes `0x0D 0x0A`, not the four-byte literal. Also used by the
 /// `asynOctetCmdResponse` factory to escape the literal command (C
@@ -474,6 +492,13 @@ pub struct AsynRecord {
     // readback fields out-of-band — neither of which the async callback can
     // do by mutating the framework-owned record directly.
     async_ctx: Option<(String, AsyncDbHandle)>,
+    /// The callback band this record's `PRIO` selects, refreshed from
+    /// `ProcessContext` before every `process()`. C asyn device support
+    /// completes through
+    /// `callbackRequestProcessCallback(&pPvt->callback, pPvt->pr->prio, pPvt->pr)`
+    /// — the record's own PRIO picks the queue the re-entry runs on. Low until
+    /// the first cycle, the band an unwritten `PRIO` already has.
+    callback_priority: epics_libcom_rs::runtime::task::CallbackPriority,
     // A non-blocking port request that is queued / in flight. `Some` exactly
     // while `process()` has returned `AsyncPending` and the off-thread
     // orchestration has not yet re-entered (C `stateIO`, asynRecord.c:216).
@@ -495,10 +520,10 @@ pub struct AsynRecord {
     // be removed on disconnect / drop (C `exceptionCallbackRemove`,
     // asynRecord.c:523,1154,1313).
     except_cb: Option<(Arc<ExceptionManager>, ExceptionCallbackId)>,
-    // The record alarm `(stat, sevr)` raised by this process cycle's I/O —
-    // the C `recGblSetSevr(pasynRec, …)` calls in `performIO`
-    // (asynRecord.c:1380-1621) and the no-asynGpib-interface COMM alarm
-    // (:1649/:1695). Set by `apply_io_outcome` / the UCMD-ACMD short-circuits;
+    // The record alarm `(stat, sevr)` raised by this process cycle's I/O — the C
+    // `recGblSetSevr(pasynRec, …)` calls in the `perform*IO` helpers `performIO`
+    // dispatches to (asynRecord.c:1364-1636) and the no-asynGpib-interface COMM
+    // alarm (:1649/:1695). Set by `apply_io_outcome` / the UCMD-ACMD short-circuits;
     // the single consumer is `check_alarms`, which `take()`s it and commits it
     // via `rec_gbl_set_sevr`. Every complete-returning process cycle reaches
     // `check_alarms`, so the `take()` is the single clear point — no path
@@ -606,6 +631,7 @@ impl Default for AsynRecord {
             port_entry: None,
             resolved_reason: 0,
             async_ctx: None,
+            callback_priority: epics_libcom_rs::runtime::task::CallbackPriority::Low,
             io_inflight: None,
             status_dirty: Arc::new(AtomicBool::new(false)),
             except_cb: None,
@@ -630,7 +656,7 @@ impl Default for AsynRecord {
 struct IoInFlight {
     /// Shared with the orchestration task. Cancelling it makes the actor drop
     /// the request at its cancel check (a still-queued phase is removed,
-    /// C `cancelRequest` `wasQueued==true`, asynManager.c:1663-1668), so
+    /// C `cancelRequest` `wasQueued==true`, asynManager.c:1661-1668), so
     /// `run_io_plan` records the `AQR` "I/O request canceled" outcome. An
     /// `AQR` write (asynRecord.c:393-408) sets this; the completion re-entry
     /// then applies the cancel and finishes the record.
@@ -669,7 +695,9 @@ struct IoPlan {
     // every phase consumes a fresh user by value (`io_user`/`flush_user`).
     reason: usize,
     addr: i32,
-    timeout: std::time::Duration,
+    /// `None` is C's negative TMOT — wait forever; see
+    /// [`crate::user::AsynUser::timeout`].
+    timeout: Option<std::time::Duration>,
     // Write inputs (`performOctetIO`/`performGPIBIO`, asynRecord.c:1470+).
     octet_out: Vec<u8>,
     octet_out_len: usize,
@@ -710,12 +738,12 @@ struct IoOutcome {
     spr: Option<i32>,
     errs: Option<String>,
     /// Record alarm `(stat, sevr)` this I/O cycle raises — the C
-    /// `recGblSetSevr(pasynRec, …)` calls scattered through `performIO`
-    /// (asynRecord.c:1380-1621). Accumulated with the "raise only if strictly
-    /// higher" rule via [`raise_io_alarm`] so a write-then-read `Write_Read`
-    /// keeps the first equal-severity stat, exactly as C's repeated
-    /// `recGblSetSevr` does. Applied to the record in [`AsynRecord::apply_io_outcome`]
-    /// and committed by [`AsynRecord::check_alarms`].
+    /// `recGblSetSevr(pasynRec, …)` calls scattered through the `perform*IO`
+    /// helpers `performIO` dispatches to (asynRecord.c:1364-1636). Accumulated
+    /// with the "raise only if strictly higher" rule via [`raise_io_alarm`] so a
+    /// write-then-read `Write_Read` keeps the first equal-severity stat, exactly as
+    /// C's repeated `recGblSetSevr` does. Applied to the record in
+    /// [`AsynRecord::apply_io_outcome`] and committed by [`AsynRecord::check_alarms`].
     alarm: Option<(u16, AlarmSeverity)>,
 }
 
@@ -751,7 +779,7 @@ impl IoOutcome {
     }
 
     /// The queue-timeout outcome of a **process** request, C
-    /// `queueTimeoutCallbackProcess` (asynRecord.c:919-926): `reportError(…
+    /// `queueTimeoutCallbackProcess` (asynRecord.c:919-927): `reportError(…
     /// "process queueRequest timeout")`, `recGblSetSevr(STATE_ALARM,
     /// MAJOR_ALARM)`, then `callbackRequestProcessCallback` to complete the
     /// record that is still sitting at `pact = TRUE`.
@@ -798,7 +826,7 @@ fn c_read_status_word(e: &crate::error::AsynError) -> &'static str {
 }
 
 /// Raise `(stat, sevr)` into an [`IoOutcome`] mirroring `recGblSetSevr`
-/// (recGbl.c:258, [`rec_gbl_set_sevr`]): a new severity replaces the pending
+/// (recGbl.c:258-261, [`rec_gbl_set_sevr`]): a new severity replaces the pending
 /// alarm only when it is **strictly higher**, so an equal-severity later call
 /// keeps the earlier `stat`. C's `performIO` relies on this when both the
 /// write and read phase of a `Write_Read` fail at MAJOR — the write's stat is
@@ -821,7 +849,7 @@ fn raise_io_alarm(out: &mut IoOutcome, stat: u16, sevr: AlarmSeverity) {
 fn io_user(plan: &IoPlan) -> AsynUser {
     AsynUser::new(plan.reason)
         .with_addr(plan.addr)
-        .with_timeout(plan.timeout)
+        .with_timeout_opt(plan.timeout)
         .with_queue_timeout(QUEUE_TIMEOUT)
 }
 
@@ -846,15 +874,19 @@ enum IoPhase {
     /// C `gpibAddressedCmd`'s `addressedCmd(acmd, lenCmd)` (asynRecord.c:1750);
     /// the frame is [`GpibCycle::Addressed`]'s.
     GpibAddressed,
-    /// Serial Poll step 1 — `universalCmd(IBSPE)` (asynRecord.c:1719-1726).
+    /// Serial Poll step 1 — `universalCmd(IBSPE)` (asynRecord.c:1720-1726).
     GpibSerialPollEnable,
     /// Serial Poll step 2 — a one-byte octet read into SPR
-    /// (asynRecord.c:1728-1735).
+    /// (asynRecord.c:1729-1735).
     GpibSerialPollRead,
-    /// Serial Poll step 3 — `universalCmd(IBSPD)` (asynRecord.c:1737-1744).
+    /// Serial Poll step 3 — `universalCmd(IBSPD)` (asynRecord.c:1738-1744).
     /// C runs it even when the enable or the read failed, so it is a phase like
     /// any other: a failing phase reports, it does not abort the cycle.
     GpibSerialPollDisable,
+    /// `TMOD = NoI/O`: C still queues the cycle (asynRecord.c:342-353) and the
+    /// callback simply calls nothing (`:827`). The phase carries the queue
+    /// entry — the port-thread wake and the queue gate — and no transfer.
+    NoIo,
 }
 
 /// The phases one `performIO` cycle runs, in C's execution order — the single
@@ -865,7 +897,7 @@ enum IoPhase {
 /// C `performOctetIO` (asynRecord.c:1518-1558):
 ///
 /// 1. **Flush, before the write**, for `TMOD == Flush` *and* `TMOD ==
-///    Write_Read` (`:1518-1520`). Write/Read is the default TMOD, and this is
+///    Write_Read` (`:1518-1523`). Write/Read is the default TMOD, and this is
 ///    the whole point of the flush: drop bytes left in the driver from a
 ///    previous transaction so they cannot be prepended to the fresh response.
 ///    Running it after the read — or only for `TMOD == Flush` — leaves exactly
@@ -891,6 +923,14 @@ fn io_phases(plan: &IoPlan) -> Vec<IoPhase> {
                 IoPhase::GpibSerialPollDisable,
             ],
         };
+    }
+    // C's `queueRequest` is unconditional: a NoI/O cycle occupies the queue and
+    // wakes the port thread exactly like a transfer, and only the callback body
+    // is empty (asynRecord.c:342-353, :827). Modelling it as "no phases" made
+    // the cycle touch the port at all — so the reconnect-nudge idiom poked
+    // nothing and a down port raised no alarm (R18-87).
+    if plan.tmod == TransferMode::NoIo {
+        return vec![IoPhase::NoIo];
     }
     let mut phases = Vec::with_capacity(3);
     if plan.iface == InterfaceType::Octet
@@ -982,6 +1022,7 @@ fn io_phase_op(plan: &IoPlan, phase: IoPhase) -> RequestOp {
         IoPhase::GpibSerialPollDisable => RequestOp::GpibUniversalCmd {
             cmd: crate::interfaces::gpib::IBSPD,
         },
+        IoPhase::NoIo => RequestOp::NoIo,
     }
 }
 
@@ -1022,7 +1063,7 @@ fn record_write_result(plan: &IoPlan, out: &mut IoOutcome, res: AsynResult<Reque
     }
 
     // C performOctetIO write branch (asynRecord.c:1524-1556). `nbytesTransfered`
-    // is what the *device* took: C seeds it to 0 (:1526), the octet chain writes
+    // is what the *device* took: C seeds it to 0 (:1527), the octet chain writes
     // it out on success and on failure alike, and the record commits it —
     // `nawt = nbytesTransfered` (:1547) runs *before* the status test at :1551.
     // So both arms report a real count: the reply's `nbytes` on success, and the
@@ -1337,7 +1378,7 @@ fn record_phase_result(
             }
         }
         IoPhase::GpibSerialPollRead => {
-            // C Serial Poll step 2 (asynRecord.c:1728-1735): the response byte
+            // C Serial Poll step 2 (asynRecord.c:1729-1735): the response byte
             // lands in SPR, and *either* a failing status *or* a transfer of
             // other than one byte is the error — the record keeps the last SPR
             // in that case, because C only ever wrote through the pointer if the
@@ -1361,7 +1402,7 @@ fn record_phase_result(
             }
         }
         IoPhase::GpibSerialPollDisable => {
-            // C Serial Poll step 3 (asynRecord.c:1737-1744).
+            // C Serial Poll step 3 (asynRecord.c:1738-1744).
             if let Err(e) = res {
                 out.report_error(format!(
                     "Error in GPIB Serial Poll disable write, {}",
@@ -1370,13 +1411,18 @@ fn record_phase_result(
                 raise_io_alarm(out, alarm_status::WRITE_ALARM, AlarmSeverity::Major);
             }
         }
+        // The queue entry was the request. C's callback body is empty for
+        // `asynTMOD_NoIO` (asynRecord.c:827), so a request that reached the port
+        // reports nothing; the refusal and the queue timeout were already taken
+        // above, which is the whole of what a NoI/O cycle can observe.
+        IoPhase::NoIo => {}
     }
     PhaseFlow::Continue
 }
 
 /// Run `performIO`'s flush/write/read phases off the scan thread against the
 /// port actor, threading the shared `CancelToken` so an `AQR`/`cancelRequest`
-/// (asynManager.c:1632) aborts a still-queued phase. Mirrors the synchronous
+/// (asynManager.c:1630) aborts a still-queued phase. Mirrors the synchronous
 /// [`AsynRecord::perform_io`] phase order; both feed
 /// [`AsynRecord::apply_io_outcome`], so the field mapping lives in one place.
 ///
@@ -1426,7 +1472,7 @@ const CANCELED_MSG: &str = "I/O request canceled";
 /// [`AsynUser::queue_timeout`] of the users the record builds below.
 const QUEUE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
-/// C `queueTimeoutCallbackProcess` (asynRecord.c:919-926) — the process request
+/// C `queueTimeoutCallbackProcess` (asynRecord.c:919-927) — the process request
 /// waited out `QUEUE_TIMEOUT` and was removed from the queue.
 const PROCESS_QUEUE_TIMEOUT_MSG: &str = "process queueRequest timeout";
 
@@ -1482,7 +1528,7 @@ const OPTION_READBACK_KEYS: &[&str] = &[
     "disconnectOnReadTimeout",
 ];
 
-/// The fields C `monitorStatus` POST_IF_NEWs (asynRecord.c:1102-1141) — the
+/// The fields C `monitorStatus` POST_IF_NEWs (asynRecord.c:1102-1139) — the
 /// readbacks it re-imports from the trace manager and the port, plus the two it
 /// posts because `special()` changed them behind the operator's back (REASON and
 /// the DRVINFO its put blanks, :488-489).
@@ -1495,7 +1541,7 @@ const MONITOR_STATUS_FIELDS: &[&str] = &[
     "DRVINFO", "ENBL", "OCTETIV", "OPTIONIV", "GPIBIV", "I32IV", "UI32IV", "F64IV",
 ];
 
-/// The driver option key C's HOSTINFO field writes (asynRecord.c:1802-1806) —
+/// The driver option key C's HOSTINFO field writes (asynRecord.c:1823-1825) —
 /// the one option put C queues on a port that is not connected.
 const HOSTINFO_OPTION_KEY: &str = "hostinfo";
 
@@ -1504,7 +1550,7 @@ const HOSTINFO_OPTION_KEY: &str = "hostinfo";
 /// `queueRequest(..., asynQueuePriorityConnect, ...)` with
 /// `ASYN_REASON_QUEUE_EVEN_IF_NOT_CONNECTED` on the user.
 ///
-/// C makes that choice per *field* (asynRecord.c:565-569), so it is made here
+/// C makes that choice per *field* (asynRecord.c:566-570), so it is made here
 /// per option *key* and nowhere else: [`Self::for_key`] is the single owner of
 /// "may this option request run on a disconnected port".
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1516,8 +1562,17 @@ enum OptionQueue {
 }
 
 impl OptionQueue {
+    /// The key enters through [`option_key`], the same normalisation both halves
+    /// of every driver's option interface use, because the spelling that reaches
+    /// here is not this crate's to choose: C writes the key capital-I
+    /// (`"hostInfo"`, asynRecord.c:1825) and matches it with
+    /// `epicsStrCaseCmp` on both driver halves (drvAsynIPPort.c:899, :937).
+    /// Comparing the caller's spelling against a lowercase literal would hand a
+    /// C- or operator-spelled `hostInfo` the `Normal` queue, and HOSTINFO is the
+    /// one option C deliberately queues on a *disconnected* port — see the
+    /// waiver in [`AsynRecord::write_option_body`].
     fn for_key(key: &str) -> Self {
-        if key == HOSTINFO_OPTION_KEY {
+        if option_key(key) == HOSTINFO_OPTION_KEY {
             Self::EvenIfNotConnected
         } else {
             Self::Normal
@@ -1568,7 +1623,7 @@ struct TraceReadback {
 /// about to install *before* installing it — C does exactly that, and for the
 /// same reason: `setTraceFile` fires an exception whose callback re-enters this
 /// sample, and the record's own write must not be reported as foreign
-/// (asynRecord.c:470-475). A first sample (no id remembered yet) seeds the cache
+/// (asynRecord.c:474-475). A first sample (no id remembered yet) seeds the cache
 /// and reports no change: C's zero-initialised `old.traceFd` matches the default
 /// errlog sink's `FILE *` of 0, so its first `monitorStatus` is silent too.
 fn sample_trace_readback(
@@ -1837,14 +1892,14 @@ impl AsynRecord {
 
     /// Resolve the trace target for this record's trace-control writes.
     ///
-    /// C `findTracePvt` (asynManager.c:541-549) routes a trace mutation to
-    /// the device `dpCommon` when the connected `pasynUser` names a device
-    /// — a multi-device port addressed by `ADDR >= 0` — otherwise to the
-    /// port-wide `dpc`. `Some(addr)` selects the device override;
-    /// `None` the port default. Every `apply_trace_*` path routes through
-    /// this single resolver so a record adjusting one address cannot mutate
-    /// the whole port (or vice versa), and future trace controls inherit
-    /// the rule by construction.
+    /// C `findTracePvt` (asynManager.c:548-550) routes a trace mutation to the
+    /// `dpCommon` that `findDpCommon` picks (:541-543): the device one when the
+    /// connected `pasynUser` names a device — a multi-device port addressed by
+    /// `ADDR >= 0` — otherwise the port-wide `dpc`. `Some(addr)` selects the
+    /// device override; `None` the port default. Every `apply_trace_*` path
+    /// routes through this single resolver so a record adjusting one address
+    /// cannot mutate the whole port (or vice versa), and future trace controls
+    /// inherit the rule by construction.
     fn trace_addr_target(&self) -> Option<i32> {
         match self.port_entry {
             Some(ref entry) if self.addr >= 0 && entry.handle.is_multi_device() => Some(self.addr),
@@ -1928,7 +1983,7 @@ impl AsynRecord {
         // C stores the new `FILE *` in `old.traceFd` BEFORE calling setTraceFile,
         // because setTraceFile fires an exception whose callback runs
         // monitorStatus — which would otherwise see the record's own write as a
-        // foreign change and overwrite TFIL with "Unknown" (asynRecord.c:470-475).
+        // foreign change and overwrite TFIL with "Unknown" (asynRecord.c:474-475).
         if let Ok(mut cached) = self.old_trace_file_id.lock() {
             *cached = Some(file.id());
         }
@@ -2015,14 +2070,17 @@ impl AsynRecord {
         let handle = entry.handle.clone();
         let dirty = Arc::clone(&self.status_dirty);
         // The immediate out-of-band post needs both a database handle (to post
-        // through) and a runtime handle (the exception fires from the thread
+        // through) and a task capability (the exception fires from the thread
         // that raised it — iocsh, or the port actor itself — which is not a
-        // tokio worker, so `tokio::spawn` would panic; an explicit `Handle`
-        // submits to the runtime from any thread). Capture them once here,
-        // where registration runs in the database's async init context.
+        // worker of the IOC's executor, so an ambient spawn would panic; a
+        // captured `Reactor` submits from any thread). Capture them once here,
+        // where registration runs in the database's async init context. `None`
+        // keeps its established meaning — no immediate post, `process()` drains
+        // the dirty flag instead — and it is a case that only arises on the
+        // hosted backend, where an IOC can be built without a runtime.
         let immediate = match (
             self.async_ctx.clone(),
-            tokio::runtime::Handle::try_current().ok(),
+            crate::runtime::task::Reactor::current(),
         ) {
             (Some((name, db)), Some(rt)) => Some((name, db, rt)),
             _ => None,
@@ -2056,7 +2114,7 @@ impl AsynRecord {
         ));
         let id = mgr.add_callback(move |ev| {
             // C `exceptCallback` filters on nothing: its body is an
-            // unconditional `monitorStatus` (asynRecord.c:913), so every
+            // unconditional `monitorStatus` (asynRecord.c:914), so every
             // exception on the record's port refreshes every readback field.
             // The subscription is per-port in C (the callback hangs off the
             // record's `pasynUser`), which is what this name check reproduces.
@@ -2128,7 +2186,7 @@ impl AsynRecord {
     /// one.
     fn read_options_from_driver(&mut self, handle: &PortHandle, queue: OptionQueue) {
         // C returns immediately when the port carries no asynOption interface
-        // (asynRecord.c:1843-1844) — the record keeps the values it had.
+        // (asynRecord.c:1844) — the record keeps the values it had.
         if !handle.has_interface(crate::interfaces::InterfaceType::Option) {
             return;
         }
@@ -2142,7 +2200,7 @@ impl AsynRecord {
         };
         // C hands `getOption` a buffer the driver clears at entry
         // (`val[0] = '\0'`, drvAsynSerialPort.c:142, drvAsynIPPort.c:894) and
-        // then ignores the returned status (asynRecord.c:1863-1928). So a key the
+        // then ignores the returned status (asynRecord.c:1864-1927). So a key the
         // port does not implement is an *empty readback*, not a skipped field: an
         // IP port answers "" for `parity`, and PRTY lands on its Unknown choice
         // instead of keeping a stale value from the serial port the record used
@@ -2259,7 +2317,7 @@ impl AsynRecord {
     }
 
     /// Read both EOS strings back from the driver into IEOS/OEOS — C `getEos`
-    /// (asynRecord.c:1985-2026). The single driver-side writer of
+    /// (asynRecord.c:1987-2025). The single driver-side writer of
     /// [`EOS_READBACK_FIELDS`], run after every EOS put (see the `IEOS`/`OEOS`
     /// arms of `special`).
     ///
@@ -2308,7 +2366,7 @@ impl AsynRecord {
     }
 
     /// Snapshot the named fields' current values — C `REMEMBER_STATE`
-    /// (asynRecord.c:1850-1862, :1999-2000): the "before" half of a
+    /// (asynRecord.c:1851-1861, :1045-1064): the "before" half of a
     /// driver-readback POST_IF_NEW. Feed the result to [`Self::post_if_new`]
     /// after the readback has written the fields.
     fn field_snapshot(&self, names: &[&str]) -> Vec<(String, EpicsValue)> {
@@ -2333,8 +2391,8 @@ impl AsynRecord {
     ///
     /// The single owner of "a readback that moved a field fires its monitor".
     /// Every place that re-reads record fields from the port goes through it —
-    /// `getOptions` (:1850-1938), `getEos` (:1999-2024), `monitorStatus`
-    /// (:1042-1141) — because C posts from *inside* each of those, not from the
+    /// `getOptions` (:1836-1944), `getEos` (:1987-2025), `monitorStatus`
+    /// (:1036-1140) — because C posts from *inside* each of those, not from the
     /// caller. `connectDevice` refreshed all three and posted none of them
     /// (R14-47): the operator's screen kept the previous port's BAUD/IEOS/CNCT
     /// until something else happened to fire a monitor.
@@ -2356,9 +2414,12 @@ impl AsynRecord {
         if changed.is_empty() {
             return;
         }
-        let (Some((name, db)), Ok(rt)) = (
+        // Same capture-and-submit as `register_exception_callback`: `post_if_new`
+        // is reached from `special`/`process` on the caller's thread, not on an
+        // executor worker.
+        let (Some((name, db)), Some(rt)) = (
             self.async_ctx.clone(),
-            tokio::runtime::Handle::try_current(),
+            crate::runtime::task::Reactor::current(),
         ) else {
             return;
         };
@@ -2396,7 +2457,7 @@ impl AsynRecord {
             // No port: `special()` never queued the callback, so nothing ran.
             return SpecialRan::No;
         };
-        // C setOption (asynRecord.c:1766-1771): a port with no asynOption
+        // C setOption (asynRecord.c:1767-1771): a port with no asynOption
         // interface takes the same refusal as a missing I/O interface. The
         // `return` is out of `setOption`, not out of `asynCallbackSpecial` — the
         // status repost still happens.
@@ -2408,7 +2469,7 @@ impl AsynRecord {
         // one exception it calls out by name: HOSTINFO goes at
         // `asynQueuePriorityConnect` carrying
         // `ASYN_REASON_QUEUE_EVEN_IF_NOT_CONNECTED`, "Enable changing host:port
-        // when not connected" (asynRecord.c:565-569). It is the operator's only
+        // when not connected" (asynRecord.c:566-570). It is the operator's only
         // route to repoint an IP port that is aimed at a wrong or moved host,
         // and such a port is disconnected by definition — refusing the put is
         // refusing the repair.
@@ -2441,7 +2502,7 @@ impl AsynRecord {
     /// Whether an `asynCallbackSpecial` body actually ran, which is what decides
     /// whether C's tail runs — see [`Self::special_callback`].
     ///
-    /// C `asynCallbackSpecial` (asynRecord.c:788-900) is a switch whose every arm
+    /// C `asynCallbackSpecial` (asynRecord.c:836-901) is a switch whose every arm
     /// falls out to one `monitorStatus` (:897). An arm's error `break` (:862,
     /// :872, :886) leaves the *switch*, not the function, and `setOption`'s "No
     /// asynOption interface" `return` (:1767-1771) leaves `setOption`, not the
@@ -2484,7 +2545,18 @@ impl AsynRecord {
     /// every second with text the client already has.
     fn report_error(&mut self, msg: impl Into<String>) {
         let before = self.field_snapshot(&["ERRS"]);
-        self.errs = msg.into();
+        let mut msg = msg.into();
+        // C formats into a `ERR_SIZE` buffer with `epicsVsnprintf` (:2037), so
+        // the text the operator sees is cut at `ERR_SIZE - 1` characters. Cut on
+        // a char boundary so the field stays valid UTF-8; C cuts on a byte.
+        if msg.len() > ERR_SIZE - 1 {
+            let end = (0..=ERR_SIZE - 1)
+                .rev()
+                .find(|&i| msg.is_char_boundary(i))
+                .unwrap_or(0);
+            msg.truncate(end);
+        }
+        self.errs = msg;
         self.post_if_new(&before);
     }
 
@@ -2636,7 +2708,8 @@ impl AsynRecord {
         // through `block_on_sync` → `park_on`, or the callback pool a record
         // tail was deferred to. The database put awaited below needs no
         // reactor.
-        epics_libcom_rs::runtime::task::spawn_background(async move {
+        let prio = self.callback_priority;
+        epics_libcom_rs::runtime::task::spawn_background(prio, async move {
             let _ = db.put_pv(&format!("{name}.SCAN"), passive).await;
         });
     }
@@ -2694,7 +2767,7 @@ impl AsynRecord {
         let Some(entry) = self.port_entry.clone() else {
             return SpecialRan::No;
         };
-        // C setEos (asynRecord.c:1956-1961). Same as `setOption`'s refusal: the
+        // C setEos (asynRecord.c:1957-1961). Same as `setOption`'s refusal: the
         // return leaves `setEos`, and the callback's tail still runs.
         if !self.has_interface(InterfaceType::Octet) {
             self.report_no_interface(InterfaceType::Octet.c_asyn_name());
@@ -2752,7 +2825,7 @@ impl AsynRecord {
     ///
     /// The single owner of that refresh. C runs it from `connectDevice`
     /// (:1271,:1319), from every completed callback (:897), and from
-    /// `exceptCallback` (:913). Here the first two are this function; the
+    /// `exceptCallback` (:914). Here the first two are this function; the
     /// exception path cannot take `&mut self` (the record is owned by the
     /// database), so it does the same work out of band through
     /// [`Self::register_exception_callback`], falling back to `status_dirty` +
@@ -2804,7 +2877,7 @@ impl AsynRecord {
             self.port_entry = None;
             self.clear_exception_callback();
             // C's failure path is not silent: `bad:` falls into `done:`, which is
-            // `cancelIOInterruptScan` + `monitorStatus` (:1310-1319) — the same
+            // `cancelIOInterruptScan` + `monitorStatus` (:1309-1320) — the same
             // tail the success path takes, so the operator sees PCNCT and CNCT go
             // to 0 on the record that just lost its port.
             self.monitor_status();
@@ -2843,8 +2916,17 @@ impl AsynRecord {
                                 // C reports the bare literal — the driver's own text
                                 // reaches the operator through the trace file, not
                                 // ERRS (asynRecord.c:1255).
+                                //
+                                // …and assigns NEITHER reason. C writes
+                                // `pasynRec->reason = pasynUser->reason` only on
+                                // success (asynRecord.c:1253), and a failed
+                                // `create` leaves `pasynUser->reason` untouched
+                                // too. Zeroing the resolved reason here pointed
+                                // every subsequent read and write at parameter 0
+                                // while REASON still read back what the operator
+                                // set — the record silently operating on the
+                                // wrong parameter (R18-89).
                                 self.report_error("Error in asynDrvUser->create()");
-                                self.resolved_reason = 0;
                             }
                         }
                     } else {
@@ -2947,7 +3029,7 @@ impl AsynRecord {
                 self.pcnct = 0;
                 self.port_entry = None;
                 self.clear_exception_callback();
-                // C's `bad:` → `done:` tail, as above (:1310-1319).
+                // C's `bad:` → `done:` tail, as above (:1309-1320).
                 self.monitor_status();
                 self.post_if_new(&before_status);
                 self.publish_io_intr_binding();
@@ -2981,11 +3063,11 @@ impl AsynRecord {
     /// is three-valued, and the transports read all three:
     ///
     /// * `> 0` — bounded wait.
-    /// * `== 0` — non-blocking poll. `drvAsynIPPort.c:775-776` computes
+    /// * `== 0` — non-blocking poll. `drvAsynIPPort.c:741-742` computes
     ///   `readPollmsec = (int)(timeout * 1000.0)` and floors a zero to a 1 ms
     ///   poll; `drvAsynSerialPort.c:902-905` sets `VMIN=0, VTIME=0`, the termios
     ///   "return whatever is already buffered" read.
-    /// * `< 0` — wait forever (`readPollmsec = -1`, `drvAsynIPPort.c:777`).
+    /// * `< 0` — wait forever (`readPollmsec = -1`, `drvAsynIPPort.c:743`).
     ///
     /// The port used to substitute a 1 s wait for BOTH non-positive cases, so an
     /// operator asking for a poll got a one-second block on a silent device.
@@ -2994,21 +3076,18 @@ impl AsynRecord {
     /// (`ip_port::socket_poll_timeout` floors it to the same 1 ms;
     /// `serial_port::duration_to_poll_ms` yields the same 0 ms `poll()`).
     ///
-    /// `tmot < 0` cannot be expressed. `AsynUser::timeout` is an unsigned
-    /// `Duration` by deliberate framework-wide design — every blocking driver
-    /// operation is bounded, so a stuck device cannot wedge the port actor
-    /// thread indefinitely. That is the signed-off deviation **DRV-42**
-    /// (`user.rs:15-22`, filed at
-    /// `doc/c-parity-review-drivers-2026-06-29.md:98`), and this record is not
-    /// allowed to override it: a negative TMOT falls back to the bounded
-    /// [`crate::user::DEFAULT_TIMEOUT`]. A non-finite or out-of-range TMOT takes
-    /// the same fallback — C's `(int)` cast of such a value is undefined
+    /// `tmot < 0` passes through as well, as `None` — the operator asked to
+    /// wait forever and every driver wait built from it is unbounded (DRV-42).
+    /// It used to fall back to the bounded [`crate::user::DEFAULT_TIMEOUT`], so
+    /// a record told to wait forever timed out after a second and raised a
+    /// READ/WRITE alarm C never raises. A non-finite or out-of-range TMOT still
+    /// takes that fallback — C's `(int)` cast of such a value is undefined
     /// behaviour, so there is no C semantics to port.
     ///
-    /// The substitution itself belongs to [`crate::user::timeout_from_secs`],
-    /// the crate-wide owner of `f64 seconds` → `AsynUser::timeout`; this method
-    /// only names TMOT as the source.
-    fn io_timeout(&self) -> std::time::Duration {
+    /// The mapping itself belongs to [`crate::user::timeout_from_secs`], the
+    /// crate-wide owner of `f64 seconds` → `AsynUser::timeout`; this method only
+    /// names TMOT as the source.
+    fn io_timeout(&self) -> Option<std::time::Duration> {
         crate::user::timeout_from_secs(self.tmot)
     }
 
@@ -3029,7 +3108,7 @@ impl AsynRecord {
     fn option_user(&self) -> AsynUser {
         AsynUser::new(self.resolved_reason)
             .with_addr(self.addr)
-            .with_timeout(self.io_timeout())
+            .with_timeout_opt(self.io_timeout())
             // C `special()` queues the option callback with `QUEUE_TIMEOUT`
             // (asynRecord.c:571-572), and `connectDevice` queues its
             // getOption/getEos readbacks with the same (:1281,:1297) — every
@@ -3054,7 +3133,7 @@ impl AsynRecord {
     /// value back into the record itself — `nowt = omax` when a Binary write
     /// asks for more than the output buffer holds (asynRecord.c:1499) and
     /// `nrrd = inlen` when the read asks for more than the IFMT-selected input
-    /// buffer holds (:1512) — and `monitor()` `POST_IF_NEW`s both (:1020,1022).
+    /// buffer holds (:1513) — and `monitor()` `POST_IF_NEW`s both (:1020,1022).
     /// The fields therefore show the *effective* transfer sizes, not the
     /// requested ones. Called from [`Self::build_io_plan`] on the scan thread
     /// before the plan snapshot, so the synchronous and off-thread runners see
@@ -3124,8 +3203,17 @@ impl AsynRecord {
     /// length-bounded by `NOWT`. Previously the record sent raw AOUT
     /// for both ASCII and Hybrid (ASCII shipped literal backslashes, Hybrid
     /// ignored BOUT) and clamped every mode by `NOWT`.
+    ///
+    /// R18-84: `OMAX` bounds the payload in **every** mode, not just Binary.
+    /// C never sends from anywhere but an `omax`-sized allocation — `optr` for
+    /// Binary and `pasynRecPvt->outbuff` for the two translated modes, both
+    /// `callocMustSucceed(pasynRec->omax, ...)` at asynRecord.c:295-300 — so
+    /// the physical size of the buffer is the bound and it is uniform. Binary
+    /// additionally clamps `NOWT` into the field (`:1499`) because that count
+    /// is operator-visible; the truncation below is what makes the bound hold
+    /// for ASCII and Hybrid, where C has no count to clamp.
     fn octet_output_buffer(&self) -> Vec<u8> {
-        match self.ofmt {
+        let mut payload = match self.ofmt {
             ASYN_FMT_BINARY => {
                 let nowt = self.nowt.max(0) as usize;
                 self.bout[..nowt.min(self.bout.len())].to_vec()
@@ -3139,7 +3227,9 @@ impl AsynRecord {
                 translate_escape_bytes(&self.bout[..end])
             }
             _ => translate_escape(&self.aout),
-        }
+        };
+        payload.truncate(self.omax.max(0) as usize);
+        payload
     }
 
     /// Perform I/O based on TMOD and IFACE.
@@ -3179,14 +3269,19 @@ impl AsynRecord {
         // (asynRecord.c:1326-1331). Gate both here for the same reason: a
         // register-interface cycle must leave NRRD/NOWT alone and has no octet
         // payload to send.
-        let (octet_out, octet_out_len) = if gpib.is_none() && iface == InterfaceType::Octet {
-            self.clamp_transfer_sizes(in_len);
-            let out = self.octet_output_buffer();
-            let len = out.len();
-            (out, len)
-        } else {
-            (Vec::new(), 0)
-        };
+        // …and neither does a `TMOD = NoI/O` cycle: C's callback skips
+        // `performIO` entirely (asynRecord.c:827), so the clamps and the payload
+        // build are as unreachable there as they are for a GPIB command.
+        let tmod = TransferMode::from_u16(self.tmod as u16);
+        let (octet_out, octet_out_len) =
+            if gpib.is_none() && tmod != TransferMode::NoIo && iface == InterfaceType::Octet {
+                self.clamp_transfer_sizes(in_len);
+                let out = self.octet_output_buffer();
+                let len = out.len();
+                (out, len)
+            } else {
+                (Vec::new(), 0)
+            };
         // NRRD is already clamped to `in_len` for the octet interface — the only
         // one that reads this field — so `min` is the same bound.
         let octet_buf_size = if self.nrrd > 0 {
@@ -3196,7 +3291,7 @@ impl AsynRecord {
         };
         let timeout = self.io_timeout();
         IoPlan {
-            tmod: TransferMode::from_u16(self.tmod as u16),
+            tmod,
             iface,
             gpib,
             reason: self.resolved_reason,
@@ -3344,10 +3439,12 @@ impl AsynRecord {
         // Background executor, not the ambient one: `process_cycle` is reached
         // from every thread that can process a record, including ones with no
         // tokio runtime. `run_io_plan` is safe there — its only timer,
-        // `PortHandle::await_reply`'s queue-wait deadline, already gates itself
-        // on `Handle::try_current()` and falls back to the actor's dequeue
-        // re-check, which is what C does for a blocked caller anyway.
-        epics_libcom_rs::runtime::task::spawn_background(async move {
+        // `PortHandle::await_reply`'s queue-wait deadline, is armed through the
+        // task seam, which has one on both backends, and falls back to the
+        // actor's dequeue re-check only where the seam cannot arm it from the
+        // calling thread.
+        let prio = self.callback_priority;
+        epics_libcom_rs::runtime::task::spawn_background(prio, async move {
             let outcome = run_io_plan(handle, plan, cancel_task).await;
             *slot_task.lock().unwrap() = Some(outcome);
             // Mint a fresh re-entry token (superseding any older one) wired
@@ -3543,10 +3640,16 @@ impl Record for AsynRecord {
         self.async_ctx = Some((name, db));
     }
 
-    /// C `performIO`'s `recGblSetSevr` calls raise a record alarm severity for
-    /// every I/O failure: read error -> READ/MAJOR, ASCII/Hybrid input overflow
-    /// -> READ/MINOR, register write error -> WRITE/MAJOR, missing GPIB
-    /// interface -> COMM/MAJOR (asynRecord.c:1380-1621/1649/1695). The record
+    fn set_process_context(&mut self, ctx: &epics_base_rs::server::record::ProcessContext) {
+        // C re-reads `pPvt->pr->prio` on every completion, so a `PRIO` written
+        // between cycles moves the next one.
+        self.callback_priority = ctx.callback_priority;
+    }
+
+    /// The `recGblSetSevr` calls in the `perform*IO` helpers raise a record alarm
+    /// severity for every I/O failure: read error -> READ/MAJOR, ASCII/Hybrid
+    /// input overflow -> READ/MINOR, register write error -> WRITE/MAJOR, missing
+    /// GPIB interface -> COMM/MAJOR (asynRecord.c:1364-1636/1649/1695). The record
     /// stages the cycle's alarm in `io_alarm` as the I/O result is applied; the
     /// framework calls this hook on the same completion cycle (sync return or
     /// async re-entry), where it commits the staged alarm via `rec_gbl_set_sevr`
@@ -3634,7 +3737,16 @@ impl Record for AsynRecord {
             "CNCT" => Some(EpicsValue::Enum(self.cnct as u16)),
             "ENBL" => Some(EpicsValue::Enum(self.enbl as u16)),
             "VAL" => Some(EpicsValue::Long(self.val)),
-            "ERRS" => Some(EpicsValue::String(self.errs.clone().into())),
+            // C serves ERRS as a `DBR_CHAR` array of exactly `ERR_SIZE`
+            // elements (`cvt_dbaddr` :956-962, `get_array_info` :976-979) — the
+            // whole buffer, NUL-padded, not the message length. A `DBF_STRING`
+            // here clipped a 68-character connect diagnostic to 39 and handed
+            // the client the wrong DBR type (R18-85).
+            "ERRS" => {
+                let mut buf = self.errs.clone().into_bytes();
+                buf.resize(ERR_SIZE, 0);
+                Some(EpicsValue::CharArray(buf))
+            }
             "AQR" => Some(EpicsValue::Char(self.aqr as u8)),
             _ => None,
         }
@@ -3877,8 +3989,16 @@ impl Record for AsynRecord {
             "VAL" => {
                 self.val = to_i32(&value);
             }
+            // `cvt_dbaddr` marks ERRS `SPC_NOMOD` (asynRecord.c:962), so
+            // `dbPut` refuses a client put outright. `report_error` /
+            // `reset_error` remain the only writers.
+            // `cvt_dbaddr` marks ERRS `SPC_NOMOD` (asynRecord.c:962), so
+            // `dbPut` refuses a client put outright. `report_error` /
+            // `reset_error` remain the only writers, and the post owner's
+            // write-back reaches the field through `put_field_internal`, which
+            // the trait defines as the path that bypasses read-only checks.
             "ERRS" => {
-                self.errs = to_str(&value);
+                return Err(CaError::ReadOnlyField("ERRS".to_string()));
             }
             "AQR" => {
                 self.aqr = to_i32(&value);
@@ -3891,6 +4011,21 @@ impl Record for AsynRecord {
     }
 
     fn init_record(&mut self, pass: u8) -> CaResult<()> {
+        if pass == 0 {
+            // C `init_record` sizes the binary buffers before allocating them:
+            // `if(pasynRec->omax <= 0) pasynRec->omax = MAX_STRING_SIZE;` and the
+            // same for `imax` (asynRecord.c:293-294), MAX_STRING_SIZE being 40.
+            // The dbd's `initial("80")` covers a db that says nothing; this
+            // covers a db that says `field(IMAX, "0")` — without it that record
+            // gets a zero-length buffer, `dbaddr_capacity` advertises 0, and
+            // every read is sized 0 (R18-88).
+            if self.omax <= 0 {
+                self.omax = AINP_SIZE as i32;
+            }
+            if self.imax <= 0 {
+                self.imax = AINP_SIZE as i32;
+            }
+        }
         if pass == 1 && !self.port.is_empty() {
             // C init_record (asynRecord.c:281-283) ignores the returned status
             // beyond the state it sets; `connectDevice`'s own "Connect error…"
@@ -4296,7 +4431,7 @@ impl Record for AsynRecord {
         Ok(())
     }
 
-    /// C `process()` (asynRecord.c:329-372). The body is `Self::process_cycle`;
+    /// C `process()` (asynRecord.c:324-372). The body is `Self::process_cycle`;
     /// this wrapper is C's `done:` label (:369-371), whose `gotValue = 0` is the
     /// invariant that keeps the interrupt cell honest:
     ///
@@ -4360,6 +4495,31 @@ impl Record for AsynRecord {
         true
     }
 
+    /// C `monitor()` (asynRecord.c:1006-1030) splits into two groups, and the
+    /// split is the whole point of this hook: the input buffers are posted with
+    /// a bare `db_post_events` on every read cycle (`:1012-1019`), *above* the
+    /// `POST_IF_NEW` block that guards everything else on a change. A device
+    /// that answers the same string every scan therefore still fires one AINP
+    /// (or BINP) and one TINP monitor per scan — which is what an operator
+    /// watching a steady reading expects to see refresh (R18-86).
+    ///
+    /// Which input buffer is posted is C's `ifmt` choice at `:1014-1017`: ASCII
+    /// reads land in `ainp`, Hybrid and Binary in `iptr` (BINP). TINP is posted
+    /// either way. Non-read transfer modes post neither, so the set is exactly
+    /// C's three static shapes.
+    fn force_posted_fields(&self) -> &'static [&'static str] {
+        match TransferMode::from_u16(self.tmod as u16) {
+            TransferMode::Read | TransferMode::WriteRead => {
+                if self.ifmt == ASYN_FMT_ASCII {
+                    &["AINP", "TINP"]
+                } else {
+                    &["BINP", "TINP"]
+                }
+            }
+            _ => &[],
+        }
+    }
+
     /// The `SPC_DBADDR` octet buffers: C `cvt_dbaddr` (asynRecord.c:948-955)
     /// fixes the channel's `no_elements = omax` (BOUT) / `imax` (BINP) — the
     /// buffer capacity, `80` by default — while `get_array_info` reports the
@@ -4369,8 +4529,32 @@ impl Record for AsynRecord {
         match field {
             "BOUT" => Some(self.omax.max(0) as u32),
             "BINP" => Some(self.imax.max(0) as u32),
+            // ERRS is the third `SPC_DBADDR` field, and its capacity is the
+            // fixed `ERR_SIZE` (asynRecord.c:958).
+            "ERRS" => Some(ERR_SIZE as u32),
             _ => None,
         }
+    }
+
+    /// ERRS is `SPC_NOMOD` to a client (see [`Record::put_field`]) but not to
+    /// the record itself: C `reportError` stores straight into `pasynRec->errs`
+    /// and then posts it (asynRecord.c:2043-2048). `post_fields_with_mask`
+    /// writes the posted value back through this path, which the trait defines
+    /// as the one that bypasses read-only checks — so the store lives here and
+    /// the refusal stays on the client path.
+    fn put_field_internal(&mut self, name: &str, value: EpicsValue) -> CaResult<()> {
+        if name == "ERRS" {
+            let bytes = match &value {
+                EpicsValue::CharArray(b) => b.clone(),
+                other => format!("{other}").into_bytes(),
+            };
+            // Drop the `ERR_SIZE` NUL padding `get_field` adds: C's buffer is
+            // fixed-size but the text in it ends at the first NUL (`:2037`).
+            let end = bytes.iter().position(|&b| b == 0).unwrap_or(bytes.len());
+            self.errs = String::from_utf8_lossy(&bytes[..end]).into_owned();
+            return Ok(());
+        }
+        epics_base_rs::server::record::put_field_internal_default(self, name, value)
     }
 }
 
@@ -4467,10 +4651,6 @@ impl AsynRecord {
             }
             self.build_io_plan_for(Some(cycle))
         } else {
-            if TransferMode::from_u16(self.tmod as u16) == TransferMode::NoIo {
-                return Ok(ProcessOutcome::complete());
-            }
-
             // `performIO` dispatches on IFACE and refuses the transfer when the
             // port does not implement the selected interface — "No asynInt32
             // interface" + COMM_ALARM/MAJOR_ALARM, no I/O (asynRecord.c:1328-1360).
@@ -4478,10 +4658,19 @@ impl AsynRecord {
             // valid interface, so this is the ordinary answer for a record pointed
             // at one with IFACE=Int32, not an edge case. The gate sits here, above
             // the blocking/non-blocking split, so both paths take the same refusal.
-            let iface = InterfaceType::from_u16(self.iface as u16);
-            if !self.has_interface(iface) {
-                self.report_no_interface(iface.c_asyn_name());
-                return Ok(ProcessOutcome::complete());
+            //
+            // `TMOD = NoI/O` skips it, because C's callback never enters
+            // `performIO` at all under that mode (asynRecord.c:827) — the
+            // interface it would have dispatched on is never consulted. The cycle
+            // still goes on to queue: `process()` queues unconditionally
+            // (`:342-353`), which is what makes a NoI/O process poke auto-connect
+            // and raise STATE/MINOR on a port that refuses it (R18-87).
+            if TransferMode::from_u16(self.tmod as u16) != TransferMode::NoIo {
+                let iface = InterfaceType::from_u16(self.iface as u16);
+                if !self.has_interface(iface) {
+                    self.report_no_interface(iface.c_asyn_name());
+                    return Ok(ProcessOutcome::complete());
+                }
             }
             self.build_io_plan()
         };
@@ -4674,6 +4863,52 @@ mod tests {
             rec.get_field("UI32MASK"),
             Some(EpicsValue::ULong(0xFFFF_FFFF))
         );
+    }
+
+    /// R18-85. ERRS is not a `DBF_STRING`. C `cvt_dbaddr` gives it
+    /// `pfield = pasynRec->errs`, `no_elements = ERR_SIZE`,
+    /// `field_type = DBF_CHAR`, `dbr_field_type = DBR_CHAR` and
+    /// `special = SPC_NOMOD` (asynRecord.c:956-962), and `get_array_info`
+    /// reports `ERR_SIZE` again (`:976-979`). Serving it as a 40-byte string
+    /// clipped a 68-character connect diagnostic at 39 characters and handed
+    /// the client `DBR_STRING` for a field C declares `DBR_CHAR`.
+    #[test]
+    fn errs_is_a_hundred_byte_char_array_a_client_cannot_write() {
+        let mut rec = AsynRecord::default();
+
+        // The connect-error shape the row names.
+        let long = "Connect error, status=3, port sim_serial_port_1 is not connected to a d";
+        assert_eq!(long.len(), 71, "well past a DBF_STRING's 39");
+        rec.report_error(long);
+
+        let Some(EpicsValue::CharArray(buf)) = rec.get_field("ERRS") else {
+            panic!("ERRS must serve as a char array, not a string");
+        };
+        assert_eq!(buf.len(), ERR_SIZE, "C reports no_elements = ERR_SIZE");
+        assert_eq!(&buf[..long.len()], long.as_bytes(), "no 39-byte clip");
+        assert!(buf[long.len()..].iter().all(|&b| b == 0), "NUL-padded");
+        assert_eq!(rec.dbaddr_capacity("ERRS"), Some(ERR_SIZE as u32));
+
+        // `epicsVsnprintf(buffer, ERR_SIZE, ...)` (:2037) is the real bound:
+        // at most ERR_SIZE - 1 characters reach the field.
+        rec.report_error("x".repeat(250));
+        assert_eq!(rec.errs.len(), ERR_SIZE - 1);
+
+        // SPC_NOMOD: a client put is refused outright.
+        assert!(matches!(
+            rec.put_field("ERRS", EpicsValue::String("operator text".into())),
+            Err(CaError::ReadOnlyField(_))
+        ));
+        assert_eq!(
+            rec.errs.len(),
+            ERR_SIZE - 1,
+            "the refused put changed nothing"
+        );
+
+        // The record's own post owner still writes through the internal path.
+        rec.put_field_internal("ERRS", errs_on_the_wire("Read error, timeout"))
+            .unwrap();
+        assert_eq!(rec.errs, "Read error, timeout");
     }
 
     /// Plain numeric / string fields (text-entry widgets) must NOT be
@@ -4906,6 +5141,104 @@ mod tests {
         assert_eq!(ours, theirs);
     }
 
+    /// R18-88. C `init_record` sizes the binary buffers before allocating them:
+    /// `if(pasynRec->omax <= 0) pasynRec->omax = MAX_STRING_SIZE;` and the same
+    /// for `imax` (asynRecord.c:293-294). The dbd's `initial("80")` covers a db
+    /// that says nothing about them; the fixup covers a db that says `0` (or a
+    /// negative) outright, which otherwise leaves a zero-length buffer, a
+    /// channel advertising 0 elements, and reads sized 0.
+    #[test]
+    fn init_record_floors_a_zero_omax_imax_at_forty() {
+        use epics_base_rs::server::record::Record;
+
+        let mut rec = AsynRecord::default();
+        rec.omax = 0;
+        rec.imax = -1;
+        rec.init_record(0).unwrap();
+        assert_eq!(rec.omax, 40, "C MAX_STRING_SIZE, not the dbd's 80");
+        assert_eq!(rec.imax, 40);
+        assert_eq!(rec.dbaddr_capacity("BOUT"), Some(40));
+        assert_eq!(rec.dbaddr_capacity("BINP"), Some(40));
+
+        // A db that sized them itself is left alone — the fixup is a floor at
+        // zero, not a default.
+        let mut sized = AsynRecord::default();
+        sized.omax = 256;
+        sized.imax = 512;
+        sized.init_record(0).unwrap();
+        assert_eq!((sized.omax, sized.imax), (256, 512));
+    }
+
+    /// R18-87. C's `process()` queues unconditionally (asynRecord.c:342-353) and
+    /// only the callback body skips the transfer (`:827`). So a `TMOD = NoI/O`
+    /// cycle is a real queue entry, and everything that follows from one
+    /// follows here: the port-thread wake that runs auto-connect — the
+    /// reconnect-nudge idiom, a scan whose only job is to poke a down link — and
+    /// the queue gate, which is what a refusing port answers with.
+    ///
+    /// The gate outcome is what this pins, because it is the mechanism and it is
+    /// deterministic: the auto-connect attempt riding on the same wake is
+    /// suppressed by C's own throttle window (`asynManager.c:712-713`) for two
+    /// seconds after the attach every record does at `connect_device`.
+    ///
+    /// Boundaries: a gate that admits (connected port) and a gate that refuses
+    /// (disconnected, auto-connect off). Before the fix the cycle returned above
+    /// the queue submit, so neither reached the port and both looked identical
+    /// and healthy.
+    #[test]
+    fn a_noio_process_enters_the_port_queue() {
+        use crate::port::{PortDriver, PortDriverBase, PortFlags};
+        use crate::runtime::{RuntimeConfig, create_port_runtime};
+
+        struct Link(PortDriverBase);
+        impl PortDriver for Link {
+            fn base(&self) -> &PortDriverBase {
+                &self.0
+            }
+            fn base_mut(&mut self) -> &mut PortDriverBase {
+                &mut self.0
+            }
+        }
+
+        let attach = |name: &'static str, connected: bool| {
+            let mut base = PortDriverBase::new(name, 1, PortFlags::default());
+            base.init_connected(connected);
+            base.auto_connect = false;
+            let (rt, _jh) = create_port_runtime(Link(base), RuntimeConfig::default())
+                .expect("the port runtime thread must start");
+            register_port(
+                name,
+                rt.port_handle().clone(),
+                Arc::new(TraceManager::new()),
+            )
+            .unwrap();
+            let mut rec = AsynRecord::default();
+            rec.port = name.to_string();
+            rec.connect_device().unwrap();
+            rec.tmod = TransferMode::NoIo as i32;
+            (rec, rt)
+        };
+
+        // The gate admits: the request ran, and an empty body reports nothing.
+        let (mut up, _rt_up) = attach("r18_87_up", true);
+        up.process().unwrap();
+        assert_eq!(up.errs, "", "an admitted NoI/O cycle reports nothing");
+        assert_eq!(
+            read_alarm(&mut up),
+            (alarm_status::NO_ALARM, AlarmSeverity::NoAlarm)
+        );
+
+        // The gate refuses: C turns `queueRequest`'s failure into
+        // "queueRequest failed" + STATE/MINOR (asynRecord.c:355-361).
+        let (mut down, _rt_down) = attach("r18_87_down", false);
+        down.process().unwrap();
+        assert_eq!(down.errs, PROCESS_QUEUE_REFUSED_MSG);
+        assert_eq!(
+            read_alarm(&mut down),
+            (alarm_status::STATE_ALARM, AlarmSeverity::Minor),
+        );
+    }
+
     /// R10-47: C `process()` resets ERRS at the top of its idle branch
     /// (asynRecord.c:339) and again in the callback it queues (:817) — both
     /// *above* the TMOD dispatch. So a record that failed a transfer and is then
@@ -5066,18 +5399,24 @@ mod tests {
                 key: &str,
                 value: &str,
             ) -> crate::error::AsynResult<()> {
+                // A real driver folds at the entry (`epicsStrCaseCmp`,
+                // drvAsynIPPort.c:899); a fixture that matched the caller's
+                // spelling would answer only the record's current literal and
+                // hide a regression in what spelling the record forwards.
+                let key = option_key(key);
                 self.log
                     .lock()
                     .unwrap()
                     .option_sets
-                    .push((key.to_string(), value.to_string()));
+                    .push((key.clone(), value.to_string()));
                 if key == "hostinfo" {
                     *self.host.lock().unwrap() = value.to_string();
                 }
                 Ok(())
             }
             fn get_option(&self, key: &str) -> crate::error::AsynResult<String> {
-                match key {
+                let key = option_key(key);
+                match key.as_str() {
                     // A serial/IP driver answers its configured line settings from
                     // its own state; none of it needs the wire to be up.
                     "baud" => Ok("9600".to_string()),
@@ -5154,7 +5493,7 @@ mod tests {
         assert_eq!(rec.hostinfo, "newhost:5000");
 
         // An ordinary option put carries no waiver: C queues it at Low priority
-        // (asynRecord.c:560-564) and the gate refuses it.
+        // (asynRecord.c:561-565) and the gate refuses it.
         log.lock().unwrap().option_sets.clear();
         rec.baud = baud_choice_index("19200");
         rec.special("BAUD", true).unwrap();
@@ -5187,6 +5526,41 @@ mod tests {
         );
     }
 
+    /// The waiver above must survive the key's spelling, the way
+    /// `get_option_folds_the_key_case_like_set_option` makes the serial driver's
+    /// dispatch survive it. C settles the spelling in two places and they do not
+    /// agree with a lowercase literal: `asynRecord` writes the key capital-I
+    /// (`"hostInfo"`, asynRecord.c:1825) and both driver halves match it with
+    /// `epicsStrCaseCmp` (drvAsynIPPort.c:899, :937), which is a fold, not a
+    /// comparison.
+    ///
+    /// [`OptionQueue::for_key`] is the single owner of "may this option request
+    /// run on a disconnected port", so a spelling it fails to recognise does not
+    /// merely mis-route: it hands the put the `Normal` queue, the gate refuses it
+    /// on the down port, and the operator loses the only route to repoint a port
+    /// aimed at a wrong host. No caller forwards such a spelling today — the
+    /// twelve `write_option` sites pass literals, and the HOSTINFO one passes
+    /// `"hostinfo"` — but `"disconnectOnReadTimeout"` at the DRTO arm shows the
+    /// dispatch already emits camelCase, so the distance to the defect is one
+    /// literal.
+    #[test]
+    fn the_hostinfo_queue_waiver_survives_the_keys_spelling() {
+        for spelling in ["hostinfo", "hostInfo", "HOSTINFO", "HostInfo", " hostInfo "] {
+            assert_eq!(
+                OptionQueue::for_key(spelling),
+                OptionQueue::EvenIfNotConnected,
+                "{spelling} must take C's disconnected-port waiver"
+            );
+        }
+        for spelling in ["baud", "BAUD", "disconnectOnReadTimeout", "hostinfos", ""] {
+            assert_eq!(
+                OptionQueue::for_key(spelling),
+                OptionQueue::Normal,
+                "{spelling} must stay on the ordinary queue"
+            );
+        }
+    }
+
     /// R10-48: an option put is dispatched whatever its value — C `setOption`
     /// has a `case` per field and no value gate (asynRecord.c:1777-1826), so the
     /// index-0 "Unknown" of each menu goes to the driver like any other choice
@@ -5206,7 +5580,7 @@ mod tests {
 
         /// Logs every `setOption` it is given and refuses the ones it cannot
         /// parse — a real serial driver's answer to "Unknown"
-        /// (drvAsynSerialPort.c:355-372 reports "Bad baud rate").
+        /// (drvAsynSerialPort.c:594-598 reports `Unsupported key "%s"`).
         struct LoggingDriver {
             base: PortDriverBase,
             sets: Arc<Mutex<Vec<(String, String)>>>,
@@ -5853,7 +6227,7 @@ mod tests {
     ///
     /// On a multi-device port a record with ADDR >= 0 must route trace
     /// controls to the (PORT,ADDR) device trace state, not the port-wide
-    /// state (C findTracePvt, asynManager.c:541-549). A record adjusting
+    /// state (C findTracePvt, asynManager.c:548-550). A record adjusting
     /// device 3 must not change device 4 or the port default.
     #[test]
     fn trace_controls_route_to_device_on_multi_device_port() {
@@ -7322,7 +7696,7 @@ mod tests {
     /// R8-48: NAWT is what the *device* took, on both arms. C `performOctetIO`
     /// (asynRecord.c:1524-1556) seeds `nbytesTransfered = 0`, hands it to the
     /// octet chain — which fills it in on success and on failure alike
-    /// (`drvAsynSerialPort.c:849` writes `numchars - nleft` on the timeout
+    /// (`drvAsynSerialPort.c:843` writes `numchars - nleft` on the timeout
     /// break) — and commits it with `nawt = nbytesTransfered` (:1547) *before*
     /// testing the status (:1551). The short-write diagnostic then fires
     /// whenever the status failed **or** fewer bytes went out than were asked
@@ -7438,8 +7812,8 @@ mod tests {
         assert!(full.errs.is_empty(), "a complete write reports nothing");
     }
 
-    /// C `performIO` raises a record alarm severity for every I/O failure via
-    /// `recGblSetSevr` (asynRecord.c:1380-1621): octet/register read error ->
+    /// C's `perform*IO` helpers raise a record alarm severity for every I/O
+    /// failure via `recGblSetSevr` (asynRecord.c:1364-1636): octet/register read error ->
     /// READ/MAJOR, register write error -> WRITE/MAJOR, while the octet *write*
     /// branch (:1551-1555) raises none. The asyn record stages the alarm in
     /// `io_alarm` and `check_alarms` commits it to NSEV/NSTA.
@@ -7568,7 +7942,7 @@ mod tests {
 
     /// A port whose driver hands back `min(fill, buf.len())` `Z` bytes with the
     /// given end-of-message reason, and records the buffer size the record asked
-    /// for. The requested size IS C's `nread` (asynRecord.c:1512-1517), so it
+    /// for. The requested size IS C's `nread` (asynRecord.c:1513-1517), so it
     /// pins which capacity — `sizeof(ainp)` or IMAX — sized the read.
     fn spawn_fill_port(
         port_name: &'static str,
@@ -7631,18 +8005,19 @@ mod tests {
     /// R9-46: C `asynCallbackProcess` assigns TMOT to the asynUser verbatim —
     /// `pasynUser->timeout = pasynRec->tmot` (asynRecord.c:818) — and the value
     /// is three-valued: `>0` bounded wait, `==0` non-blocking poll
-    /// (`drvAsynIPPort.c:775-776` floors the poll to 1 ms;
+    /// (`drvAsynIPPort.c:741-742` floors the poll to 1 ms;
     /// `drvAsynSerialPort.c:902-905` sets `VMIN=0,VTIME=0`), `<0` wait forever.
     /// The port substituted a 1 s wait for BOTH non-positive cases, so an
-    /// operator asking for a poll got a one-second block on a silent device.
+    /// operator asking for a poll got a one-second block on a silent device and
+    /// one asking to wait forever got an alarm after a second.
     ///
-    /// `tmot >= 0` now passes through verbatim. `tmot < 0` remains the bounded
-    /// 1 s fallback: DRV-42 (`user.rs:15-22`) makes `AsynUser::timeout` an
-    /// unsigned `Duration` on purpose — every blocking driver op is bounded —
-    /// and that is a signed-off framework deviation, not something this record
-    /// may override. Boundary-per-case, not scenario-per-case.
+    /// All three values now pass through: `tmot < 0` is the operator asking to
+    /// wait forever and reaches the drivers as `None`, the unbounded wait C
+    /// builds from it (DRV-42). It used to take the bounded 1 s fallback, so a
+    /// record told to wait forever timed out after a second and raised an alarm
+    /// C never raises. Boundary-per-case, not scenario-per-case.
     #[test]
-    fn tmot_is_passed_through_verbatim_when_non_negative() {
+    fn tmot_is_passed_through_verbatim() {
         use std::time::Duration;
 
         let plan_timeout = |tmot: f64| {
@@ -7654,22 +8029,28 @@ mod tests {
         // The defect: a zero TMOT is a poll, not a one-second wait.
         assert_eq!(
             plan_timeout(0.0),
-            Duration::ZERO,
+            Some(Duration::ZERO),
             "TMOT=0 is C's non-blocking poll"
         );
         // Positive values were already verbatim; pin them so the owner keeps them.
-        assert_eq!(plan_timeout(2.5), Duration::from_millis(2500));
-        assert_eq!(plan_timeout(0.001), Duration::from_millis(1));
-        // DRV-42: "wait forever" is unrepresentable — bounded fallback.
+        assert_eq!(plan_timeout(2.5), Some(Duration::from_millis(2500)));
+        assert_eq!(plan_timeout(0.001), Some(Duration::from_millis(1)));
+        // DRV-42: negative TMOT is C's "wait forever".
         assert_eq!(
             plan_timeout(-1.0),
-            Duration::from_secs(1),
-            "negative TMOT falls back to the DRV-42 bounded default"
+            None,
+            "negative TMOT is C's unbounded wait, not a bounded default"
         );
-        // Same fallback for values `Duration` cannot carry. C casts these with
-        // `(int)`, which is undefined behaviour, so there is no C semantics here.
-        assert_eq!(plan_timeout(f64::NAN), Duration::from_secs(1));
-        assert_eq!(plan_timeout(f64::INFINITY), Duration::from_secs(1));
+        assert_eq!(plan_timeout(-0.001), None);
+        // The values `Duration` cannot carry keep the bounded fallback. C casts
+        // these with `(int)`, which is undefined behaviour, so there is no C
+        // semantics here.
+        assert_eq!(plan_timeout(f64::NAN), Some(Duration::from_secs(1)));
+        assert_eq!(plan_timeout(f64::INFINITY), Some(Duration::from_secs(1)));
+        assert_eq!(
+            plan_timeout(f64::NEG_INFINITY),
+            Some(Duration::from_secs(1))
+        );
     }
 
     /// R9-46, end to end: the TMOT the operator set is the timeout the driver's
@@ -7685,7 +8066,9 @@ mod tests {
 
         struct TimeoutSpy {
             base: PortDriverBase,
-            seen: Arc<Mutex<Option<std::time::Duration>>>,
+            /// Outer `Option`: whether the driver was reached at all. Inner:
+            /// the timeout it was reached with, `None` being C's wait-forever.
+            seen: Arc<Mutex<Option<Option<std::time::Duration>>>>,
         }
         impl PortDriver for TimeoutSpy {
             fn base(&self) -> &PortDriverBase {
@@ -7731,8 +8114,78 @@ mod tests {
 
         assert_eq!(
             *seen.lock().unwrap(),
-            Some(std::time::Duration::ZERO),
+            Some(Some(std::time::Duration::ZERO)),
             "the driver's asynUser must carry the operator's TMOT=0 poll"
+        );
+    }
+
+    /// DRV-42, the other end of the same boundary: a negative TMOT is C's
+    /// "wait forever" and must reach the driver as an unbounded wait. It used
+    /// to arrive as the 1 s default, so a record told to wait forever timed out
+    /// and alarmed where C waits.
+    #[test]
+    fn tmot_negative_reaches_the_driver_as_wait_forever() {
+        use crate::interrupt::InterruptManager;
+        use crate::port::{PortDriver, PortDriverBase, PortFlags};
+        use crate::port_actor::PortActor;
+        use crate::user::AsynUser;
+        use tokio::sync::mpsc;
+
+        struct TimeoutSpy {
+            base: PortDriverBase,
+            seen: Arc<Mutex<Option<Option<std::time::Duration>>>>,
+        }
+        impl PortDriver for TimeoutSpy {
+            fn base(&self) -> &PortDriverBase {
+                &self.base
+            }
+            fn base_mut(&mut self) -> &mut PortDriverBase {
+                &mut self.base
+            }
+            fn io_read_octet(
+                &mut self,
+                user: &AsynUser,
+                buf: &mut [u8],
+            ) -> crate::error::AsynResult<usize> {
+                *self.seen.lock().unwrap() = Some(user.timeout);
+                buf[0] = b'x';
+                Ok(1)
+            }
+        }
+
+        let port_name = "test_tmot_forever_to_driver";
+        let seen = Arc::new(Mutex::new(None));
+        let (tx, rx) = mpsc::channel(256);
+        let actor = PortActor::new(
+            Box::new(TimeoutSpy {
+                base: PortDriverBase::new(port_name, 1, PortFlags::default()),
+                seen: seen.clone(),
+            }),
+            rx,
+        );
+        let actor_id = actor.id();
+        std::thread::spawn(move || actor.run());
+        let handle = PortHandle::new(
+            tx,
+            port_name.into(),
+            Arc::new(InterruptManager::new(256)),
+            actor_id,
+        );
+        register_port(port_name, handle, Arc::new(TraceManager::new())).unwrap();
+
+        let mut rec = read_rec(port_name, 0, 40, 0);
+        rec.tmot = -1.0;
+        rec.process().unwrap();
+
+        assert_eq!(
+            *seen.lock().unwrap(),
+            Some(None),
+            "the driver's asynUser must carry the operator's wait-forever"
+        );
+        assert_eq!(
+            read_alarm(&mut rec),
+            (alarm_status::NO_ALARM, AlarmSeverity::NoAlarm),
+            "waiting forever is not an alarm condition"
         );
     }
 
@@ -7865,7 +8318,11 @@ mod tests {
         assert_eq!(plan(TransferMode::Write, Octet), [Write]);
         assert_eq!(plan(TransferMode::Read, Octet), [Read]);
         assert_eq!(plan(TransferMode::Flush, Octet), [Flush]);
-        assert_eq!(plan(TransferMode::NoIo, Octet), []);
+        // R18-87: NoI/O is one queue entry with an empty body, not zero queue
+        // entries — C `process()` queues unconditionally (asynRecord.c:342-353)
+        // and only the callback skips `performIO` (`:827`).
+        assert_eq!(plan(TransferMode::NoIo, Octet), [IoPhase::NoIo]);
+        assert_eq!(plan(TransferMode::NoIo, Int32), [IoPhase::NoIo]);
 
         // Register interfaces: no flush phase in C, in any TMOD.
         assert_eq!(plan(TransferMode::WriteRead, Int32), [Write, Read]);
@@ -8125,6 +8582,45 @@ mod tests {
         assert_eq!(rec.octet_output_buffer(), vec![b'\\', b'r', 0x00]);
     }
 
+    /// R18-84. C sends from an `omax`-sized allocation in every mode: `optr`
+    /// for Binary and `pasynRecPvt->outbuff` for ASCII and Hybrid, both
+    /// `callocMustSucceed(pasynRec->omax, ...)` (asynRecord.c:295-300), with
+    /// `outptr` set to one of them at `:1489/:1495/:1501`. Only Binary has a
+    /// count to clamp (`nowt > omax`, `:1499`), so a Hybrid or ASCII write used
+    /// to put more than OMAX bytes on the wire — the device saw a payload
+    /// longer than the buffer the operator sized for it.
+    #[test]
+    fn every_output_mode_is_bounded_by_omax() {
+        let mut rec = AsynRecord::default();
+        rec.omax = 4;
+
+        // Hybrid: BOUT escape-translated, then cut at OMAX.
+        rec.ofmt = ASYN_FMT_HYBRID;
+        rec.bout = b"abcdefghij".to_vec();
+        assert_eq!(
+            rec.octet_output_buffer(),
+            b"abcd".to_vec(),
+            "Hybrid must not exceed OMAX"
+        );
+
+        // ASCII: AOUT escape-translated, then cut at OMAX. The translation
+        // shortens `\\r\\n` to two bytes, so the bound is measured on the
+        // translated payload, exactly as C's `outbuff` bounds it.
+        rec.ofmt = ASYN_FMT_ASCII;
+        rec.aout = "ab\\r\\ncdef".to_string();
+        assert_eq!(
+            rec.octet_output_buffer(),
+            vec![b'a', b'b', 0x0D, 0x0A],
+            "ASCII must not exceed OMAX"
+        );
+
+        // Binary already clamped NOWT into the field; the same bound applies
+        // when NOWT was never clamped (a payload put with no processing yet).
+        rec.ofmt = ASYN_FMT_BINARY;
+        rec.nowt = 10;
+        assert_eq!(rec.octet_output_buffer(), b"abcd".to_vec());
+    }
+
     /// R18-83: C's `put_array_info` (asynRecord.c:983-993) sets NOWT from the
     /// element count of the BOUT put, and NORD from the count of a BINP put —
     /// `dbPut` calls it on every array put (`dbAccess.c:1366-1369`). Writing the
@@ -8195,7 +8691,7 @@ mod tests {
 
     /// R8-54: C `performOctetIO` writes the clamped transfer sizes back into
     /// the record — `nowt = omax` (asynRecord.c:1499) and `nrrd = inlen`
-    /// (:1512) — and `monitor()` POST_IF_NEWs them (:1020,1022), so the fields
+    /// (:1513) — and `monitor()` POST_IF_NEWs them (:1020,1022), so the fields
     /// show the *effective* sizes. The port used to clamp only into locals, so
     /// NOWT/NRRD kept the operator's over-large request forever.
     #[test]
@@ -8215,7 +8711,7 @@ mod tests {
         assert_eq!(rec.nrrd, 16, "NRRD clamps back to IMAX for a Binary read");
 
         // ASCII input: the read capacity is sizeof(AINP), not IMAX
-        // (asynRecord.c:1504-1505), so NRRD clamps to 40 even with IMAX=80.
+        // (asynRecord.c:1505-1506), so NRRD clamps to 40 even with IMAX=80.
         let mut ascii = AsynRecord::default();
         ascii.iface = InterfaceType::Octet as i32;
         ascii.tmod = TransferMode::Read as i32;
@@ -8830,7 +9326,12 @@ mod tests {
     /// type-from-the-value defect — the port served `DBF_STRING` where the C
     /// IOC serves `DBF_CHAR[ERR_SIZE]`.
     fn errs_on_the_wire(text: &str) -> EpicsValue {
-        EpicsValue::CharArray(text.bytes().collect())
+        // C reports `no_elements = ERR_SIZE` for ERRS from both `cvt_dbaddr`
+        // (asynRecord.c:958) and `get_array_info` (`:978`), so the client sees
+        // the whole buffer NUL-padded, never just the message (R18-85).
+        let mut buf = text.as_bytes().to_vec();
+        buf.resize(ERR_SIZE, 0);
+        EpicsValue::CharArray(buf)
     }
 
     #[tokio::test]
@@ -8968,7 +9469,7 @@ mod tests {
     ///
     /// C posts from three places inside the attach, and they are what put the new
     /// port's state on the operator's screen without a `process()`:
-    /// `monitorStatus` (asynRecord.c:1270 and again at :1319) POST_IF_NEWs the
+    /// `monitorStatus` (asynRecord.c:1271 and again at :1319) POST_IF_NEWs the
     /// trace masks, AUCT/CNCT/ENBL, PCNCT, REASON, DRVINFO and the interface
     /// flags; the queued `getOptions` callback posts BAUD…DRTO and HOSTINFO
     /// (:1926-1938); the queued `getEos` callback posts IEOS/OEOS (:2016-2024).
@@ -9015,7 +9516,11 @@ mod tests {
         }
 
         let port_name = "r14_47_connect_posts";
-        let mut drv = Serialish(PortDriverBase::new(port_name, 1, PortFlags::default()));
+        let mut base = PortDriverBase::new(port_name, 1, PortFlags::default());
+        // See `connect_device_reads_the_eos_back_from_the_driver`: an EOS is
+        // only settable on a port carrying C's `asynInterposeEos` (R18-71).
+        base.install_octet_interpose(Box::new(crate::interpose::eos::EosInterpose::default()));
+        let mut drv = Serialish(base);
         drv.set_input_eos(&AsynUser::default(), b"\r\n").unwrap();
         let (tx, rx) = mpsc::channel(64);
         let actor = PortActor::new(Box::new(drv), rx);
@@ -9078,6 +9583,105 @@ mod tests {
             pcnct_sub.recv().await,
             Some(EpicsValue::Enum(1)),
             "monitorStatus posts PCNCT (asynRecord.c:1128)"
+        );
+    }
+
+    /// R18-86. C `monitor()` posts the input buffers with a bare
+    /// `db_post_events` on every read cycle (asynRecord.c:1012-1019), above the
+    /// `POST_IF_NEW` block that guards the rest. A device that answers the same
+    /// string every scan therefore still fires one AINP and one TINP monitor per
+    /// scan; with only generic change detection the operator's screen went
+    /// silent the moment the reading stopped moving.
+    ///
+    /// The boundary is the SECOND scan: the first changes AINP from empty and
+    /// would post either way.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_steady_reading_still_posts_ainp_every_scan() {
+        use crate::interrupt::InterruptManager;
+        use crate::port::{PortDriver, PortDriverBase, PortFlags};
+        use crate::port_actor::PortActor;
+        use crate::trace::TraceManager;
+        use crate::user::AsynUser;
+        use epics_base_rs::server::database::PvDatabase;
+        use epics_base_rs::server::database::db_access::DbSubscription;
+        use std::time::Duration;
+        use tokio::sync::mpsc;
+
+        /// A device stuck on one reading — the case the row is about.
+        struct SteadyDevice(PortDriverBase);
+        impl PortDriver for SteadyDevice {
+            fn base(&self) -> &PortDriverBase {
+                &self.0
+            }
+            fn base_mut(&mut self) -> &mut PortDriverBase {
+                &mut self.0
+            }
+            fn io_read_octet(
+                &mut self,
+                _user: &AsynUser,
+                buf: &mut [u8],
+            ) -> crate::error::AsynResult<usize> {
+                let resp = b"12.345";
+                let n = resp.len().min(buf.len());
+                buf[..n].copy_from_slice(&resp[..n]);
+                Ok(n)
+            }
+        }
+
+        let port_name = "r18_86_steady";
+        let base = PortDriverBase::new(port_name, 1, PortFlags::default());
+        let (tx, rx) = mpsc::channel(64);
+        let actor = PortActor::new(Box::new(SteadyDevice(base)), rx);
+        let actor_id = actor.id();
+        std::thread::spawn(move || actor.run());
+        let handle = PortHandle::new(
+            tx,
+            port_name.into(),
+            Arc::new(InterruptManager::new(64)),
+            actor_id,
+        );
+        register_port(port_name, handle, Arc::new(TraceManager::new())).unwrap();
+
+        let db = PvDatabase::new();
+        let rec_name = "R18_86_REC";
+        db.add_record(rec_name, Box::new(AsynRecord::default()))
+            .await
+            .unwrap();
+        {
+            let inst = db.get_record(rec_name).unwrap();
+            let mut g = inst.write();
+            let rec = g
+                .record
+                .as_any_mut()
+                .unwrap()
+                .downcast_mut::<AsynRecord>()
+                .unwrap();
+            rec.port = port_name.to_string();
+            rec.special("PORT", true).unwrap();
+            rec.iface = InterfaceType::Octet as i32;
+            rec.tmod = TransferMode::Read as i32;
+            rec.ifmt = ASYN_FMT_ASCII;
+        }
+
+        let mut ainp_sub = DbSubscription::subscribe(&db, &format!("{rec_name}.AINP"))
+            .await
+            .expect("subscribe AINP");
+
+        db.process_record(rec_name).await.unwrap();
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(2), ainp_sub.recv())
+                .await
+                .expect("first scan must post AINP"),
+            Some(EpicsValue::String("12.345".into()))
+        );
+
+        // The same bytes again: nothing changed, and C posts anyway.
+        db.process_record(rec_name).await.unwrap();
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(2), ainp_sub.recv())
+                .await
+                .expect("an unchanged reading must still post AINP"),
+            Some(EpicsValue::String("12.345".into()))
         );
     }
 
@@ -9393,7 +9997,7 @@ mod tests {
         use std::sync::Mutex as StdMutex;
         use std::time::Duration;
 
-        static SEEN: StdMutex<Option<Duration>> = StdMutex::new(None);
+        static SEEN: StdMutex<Option<Option<Duration>>> = StdMutex::new(None);
 
         struct OptionSpy(PortDriverBase);
         impl PortDriver for OptionSpy {
@@ -9440,14 +10044,14 @@ mod tests {
 
         assert_eq!(
             SEEN.lock().unwrap().take(),
-            Some(Duration::from_millis(3500)),
+            Some(Some(Duration::from_millis(3500))),
             "the driver's setOption runs under the record's TMOT"
         );
     }
 
     /// R9-53, the interfaces with no IFACE menu entry: `setOption` and `setEos`
     /// take the same refusal from the same owner. C `setOption` on `!optioniv`
-    /// (asynRecord.c:1766-1771) and `setEos` on `!octetiv` (:1956-1961) report
+    /// (asynRecord.c:1767-1771) and `setEos` on `!octetiv` (:1957-1961) report
     /// "No asyn<X> interface" and raise COMM_ALARM/MAJOR_ALARM without touching
     /// the driver.
     #[test]
@@ -9535,7 +10139,7 @@ mod tests {
         assert_eq!(AsynUser::new(3).with_addr(1).queue_timeout, None);
     }
 
-    /// R10-49. C `queueTimeoutCallbackProcess` (asynRecord.c:919-926): the
+    /// R10-49. C `queueTimeoutCallbackProcess` (asynRecord.c:919-927): the
     /// process request that never ran reports "process queueRequest timeout",
     /// raises STATE_ALARM/MAJOR_ALARM and forces the record's completion. It is
     /// **not** an I/O result: no transfer happened, so no NAWT/NORD/EOMR is
@@ -9652,10 +10256,11 @@ mod tests {
                 &mut self.0
             }
             fn get_option(&self, key: &str) -> crate::error::AsynResult<String> {
+                let key = option_key(key);
                 if key == "baud" {
                     Ok(self.1.to_string())
                 } else {
-                    Err(crate::error::AsynError::OptionNotFound(key.to_string()))
+                    Err(crate::error::AsynError::OptionNotFound(key))
                 }
             }
         }
@@ -9872,6 +10477,12 @@ mod tests {
             let mut base = PortDriverBase::new(port_name, 1, PortFlags::default());
             base.auto_connect = false;
             base.init_connected(connected);
+            // A port that accepts an EOS at all is one C configured with
+            // `processEosIn/Out` set, so `asynOctetBase::initialize` installed
+            // `asynInterposeEos` above the driver (asynOctetBase.c:169-171).
+            // Without that layer the driver's own `setInputEos` is NULL and
+            // C answers "not implemented" (R18-71).
+            base.install_octet_interpose(Box::new(crate::interpose::eos::EosInterpose::default()));
             // The driver already holds an EOS — st.cmd's `asynOctetSetInputEos`.
             let mut drv = EosPort(base);
             drv.set_input_eos(&AsynUser::default(), b"\r\n").unwrap();
@@ -10008,6 +10619,41 @@ mod tests {
         assert_eq!(rec.resolved_reason, 3, "and the I/O user with it");
     }
 
+    /// R18-89. C assigns the reason only on success:
+    /// `if (status == asynSuccess) pasynRec->reason = pasynUser->reason; else
+    /// reportError(...)` (asynRecord.c:1248-1257). The failure arm touches
+    /// neither `pasynRec->reason` nor `pasynUser->reason`, so a bad DRVINFO put
+    /// leaves the record pointed where it already was.
+    ///
+    /// Zeroing the resolved reason instead split the two: REASON kept reading
+    /// back what the operator set while every read and write went to parameter 0
+    /// — the record operating on the wrong parameter with no sign of it beyond
+    /// the ERRS text.
+    #[test]
+    fn a_failed_drv_user_create_leaves_the_resolved_reason_alone() {
+        let port_name = "r18_89_create_fail";
+        register_param_port(port_name, "GAIN");
+
+        let mut rec = AsynRecord::default();
+        rec.port = port_name.to_string();
+        rec.drvinfo = "GAIN".to_string();
+        rec.connect_device().unwrap();
+        assert_eq!((rec.reason, rec.resolved_reason), (1, 1));
+
+        // The operator mistypes DRVINFO. C reports it and changes nothing else.
+        rec.drvinfo = "GAIM".to_string();
+        rec.connect_device().unwrap();
+        assert_eq!(rec.errs, "Error in asynDrvUser->create()");
+        assert_eq!(
+            rec.resolved_reason, 1,
+            "the I/O must not be redirected to parameter 0"
+        );
+        assert_eq!(
+            rec.reason, 1,
+            "and REASON must not disagree with what the I/O uses"
+        );
+    }
+
     /// R11-48: the zeroing is unconditional — C runs `pasynRec->reason = 0` above
     /// the DRVINFO test, so an empty DRVINFO zeroes REASON too and leaves ERRS
     /// clean.
@@ -10049,7 +10695,10 @@ mod tests {
         rec.drvinfo = "NO_SUCH_PARAM".to_string();
         rec.connect_device().unwrap();
         assert_eq!(rec.errs, "Error in asynDrvUser->create()");
-        assert_eq!(rec.resolved_reason, 0);
+        // R18-89: a failed create assigns neither reason, so the previous
+        // resolution stands.
+        assert_eq!(rec.resolved_reason, 1);
+        assert_eq!(rec.reason, 1);
 
         // A blank DRVINFO on such a port keeps the operator's REASON — C never
         // zeroes it on the asynDrvUser branch (asynRecord.c:1244-1257).
@@ -10135,7 +10784,7 @@ mod tests {
 
     /// R11-46. C's I/O Intr mode: `getIoIntInfo` registers the driver callbacks
     /// (asynRecord.c:582-597), `callbackInterruptInt32` stores the pushed value in
-    /// I32INP and sets `gotValue` (:747-751), and `process` skips **all** I/O for
+    /// I32INP and sets `gotValue` (:746-749), and `process` skips **all** I/O for
     /// the cycle that value drove (`if (gotValue) goto done`, :341). The port had
     /// no I/O Intr mechanism at all: a record on `SCAN="I/O Intr"` was demoted to
     /// Passive at iocInit and never saw a driver value.
@@ -10228,7 +10877,7 @@ mod tests {
     /// R11-46. C's callback drops its value when the record has not processed the
     /// previous one: "If gotValue is 1 then the record has not yet processed the
     /// previous interrupt" — `if (pasynRecPvt->gotValue) return` (asynRecord.c:
-    /// 717-719,738-740,759-761,780-782). The FIRST unprocessed value is kept, not
+    /// 717-719,739-741,760-762,781-783). The FIRST unprocessed value is kept, not
     /// the latest.
     #[test]
     fn a_second_interrupt_before_the_record_processes_is_dropped() {

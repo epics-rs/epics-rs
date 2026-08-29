@@ -34,13 +34,6 @@
 //! Never bind 5064 here: the rejected cases are proven by the SEARCH *not*
 //! arriving at the probe.
 
-// Host/tokio-only: drives the async `caget`/`caput` CLI binaries out of
-// process. Those binaries are built with this feature too, so their
-// `CaClient` stack routes `spawn` to the background executor and then
-// reaches tokio I/O with no reactor. Inapplicable under the executor
-// backend; the RTEMS model has no async CLI client.
-#![cfg(not(feature = "rtems-exec-model"))]
-
 use std::net::UdpSocket;
 use std::process::Command;
 use std::time::Duration;
@@ -146,11 +139,20 @@ fn empty_server_port_skips_the_unable_to_find_line() {
 /// `this->repeaterPort` — so a client prints the diagnostics exactly once,
 /// not once per registration attempt.
 ///
-/// `client` only, unlike its `EPICS_CA_SERVER_PORT` siblings above: the
-/// repeater port is resolved by the repeater registration the `client` feature
-/// adds, so a `client-core` build registers with no repeater and prints no
-/// diagnostic for it. Per-test rather than per-file — the server-port cases in
-/// this file hold under both feature sets.
+/// `feature = "client"` only, unlike its `EPICS_CA_SERVER_PORT` siblings above,
+/// and that is the whole condition: `CaClient::new_with_config` resolves the
+/// repeater port under the feature alone, so an `exec_backend` client prints
+/// this pair exactly as a `tokio_backend` one does — measured directly, not
+/// inferred. `client-core` is the build that really has no repeater port to
+/// resolve, because it binds no UDP socket for a repeater to fan beacons into,
+/// and it still builds `caget-rs` and this file.
+///
+/// The gate read `ca_beacon_monitor` while the resolution was gated that way.
+/// That cfg also asserts `tokio_backend`, which is a statement about the
+/// executor rather than about whether an operator configured a repeater port,
+/// so it silently excused the one target where a rejected value is hardest to
+/// notice. Per-test rather than per-file: the server-port cases here hold on
+/// every build.
 #[cfg(feature = "client")]
 #[test]
 fn out_of_range_repeater_port_prints_cs_two_lines_once() {

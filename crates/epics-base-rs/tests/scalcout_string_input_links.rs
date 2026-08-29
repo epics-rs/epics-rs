@@ -60,7 +60,7 @@ async fn r10_65_string_input_link_is_fetched_into_aa() {
     assert_eq!(
         field(&db, "SC", "AA").await,
         EpicsValue::String("hello".into()),
-        "C fetch_values (:934) reads INAA as DBR_STRING into AA"
+        "C fetch_values (:930) reads INAA as DBR_STRING into AA"
     );
     assert_eq!(
         field(&db, "SC", "SVAL").await,

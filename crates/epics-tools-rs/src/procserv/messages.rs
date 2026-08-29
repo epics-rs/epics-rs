@@ -27,16 +27,21 @@ pub const RULER: &str = "@@@ @@@ @@@ @@@ @@@\r\n";
 /// `c + 64` (so `0x12` → `^R`); any other byte prints literally.
 ///
 /// C's macro expands `CTL_SC(0)` to `"" + '\0'`, emitting a literal NUL
-/// into the stream. The port returns an empty string for byte 0 instead —
+/// into the stream. The port returns nothing for byte 0 instead —
 /// injecting a NUL is a C quirk, not a feature, and disabled keys are the
 /// only callers that pass 0.
-pub fn ctl_sc(c: u8) -> String {
+///
+/// PS-46: the return is bytes, not a `String`, because C's `%c` writes the
+/// key byte itself. A key bound to `0x80..=0xff` has no `char` that encodes
+/// back to one byte, so no `String` can carry it and every builder that
+/// embeds a rendered key builds bytes too.
+pub fn ctl_sc(c: u8) -> Vec<u8> {
     if c > 0 && c < 32 {
-        format!("^{}", (c + 64) as char)
+        vec![b'^', c + 64]
     } else if c == 0 {
-        String::new()
+        Vec::new()
     } else {
-        (c as char).to_string()
+        vec![c]
     }
 }
 
@@ -85,15 +90,21 @@ pub fn info_message2(name: &str, child_pid: Option<i32>) -> String {
 /// The command-key menu — C `infoMessage3` (procServ.cc:442-450). Shown
 /// at connect time while the child is dead, and again in the shutdown
 /// block of every non-oneshot child death.
-pub fn info_message3(keys: &KeyBindings) -> String {
-    let restart = keys.restart.map(ctl_sc).unwrap_or_default();
-    let kill = keys.kill.map(ctl_sc).unwrap_or_default();
-    let quit = keys.quit.map(ctl_sc).unwrap_or_default();
-    let mut s = format!("@@@ {restart} or {kill} restarts the child, {quit} quits the server");
+pub fn info_message3(keys: &KeyBindings) -> Vec<u8> {
+    let mut s = Vec::new();
+    s.extend_from_slice(b"@@@ ");
+    s.extend_from_slice(&keys.restart.map(ctl_sc).unwrap_or_default());
+    s.extend_from_slice(b" or ");
+    s.extend_from_slice(&keys.kill.map(ctl_sc).unwrap_or_default());
+    s.extend_from_slice(b" restarts the child, ");
+    s.extend_from_slice(&keys.quit.map(ctl_sc).unwrap_or_default());
+    s.extend_from_slice(b" quits the server");
     if let Some(l) = keys.logout {
-        s.push_str(&format!(", {} closes this connection", ctl_sc(l)));
+        s.extend_from_slice(b", ");
+        s.extend_from_slice(&ctl_sc(l));
+        s.extend_from_slice(b" closes this connection");
     }
-    s.push_str(NL);
+    s.extend_from_slice(NL.as_bytes());
     s
 }
 
@@ -116,16 +127,17 @@ pub fn child_reaped(pid: i32, exit: ChildExit) -> String {
 /// the current time, the mode-dependent shutdown reason, and (unless
 /// oneshot) the command menu redisplayed. `now` is preformatted with the
 /// banner time format; `info3` is [`info_message3`] for the active keys.
-pub fn child_shutting_down(now: &str, mode: RestartMode, info3: &str) -> String {
+pub fn child_shutting_down(now: &str, mode: RestartMode, info3: &[u8]) -> Vec<u8> {
     let reason = match mode {
         RestartMode::OnExit => "a new one will be restarted shortly",
         RestartMode::Disabled => "auto restart is disabled",
         RestartMode::OneShot => "oneshot mode: server will exit",
     };
     let mut s =
-        format!("@@@ Current time: {now}{NL}@@@ Child process is shutting down, {reason}{NL}");
+        format!("@@@ Current time: {now}{NL}@@@ Child process is shutting down, {reason}{NL}")
+            .into_bytes();
     if mode != RestartMode::OneShot {
-        s.push_str(info3);
+        s.extend_from_slice(info3);
     }
     s
 }
@@ -179,53 +191,57 @@ pub struct WelcomeCtx<'a> {
 /// greeting + key hints (interactive only) → infoMessage1 → infoMessage2
 /// → start times → peer counts (interactive only) → command menu (only
 /// while the child is dead).
-pub fn welcome(ctx: &WelcomeCtx) -> String {
-    let mut s = String::new();
+pub fn welcome(ctx: &WelcomeCtx) -> Vec<u8> {
+    let mut s = Vec::new();
 
     // greeting1 + greeting2 — C writes these only to non-readonly
     // (interactive) clients (clientFactory.cc:151-154).
     if !ctx.readonly {
-        s.push_str(&format!("@@@ Welcome to procServ ({}){NL}", ctx.version));
-        s.push_str(&greeting2(ctx.keys, ctx.restart_mode));
+        s.extend_from_slice(format!("@@@ Welcome to procServ ({}){NL}", ctx.version).as_bytes());
+        s.extend_from_slice(&greeting2(ctx.keys, ctx.restart_mode));
     }
 
     // infoMessage1 + infoMessage2 — every client (clientFactory.cc:157-158).
-    s.push_str(&info_message1(
-        ctx.pid,
-        ctx.startup_dir,
-        ctx.child_dir,
-        ctx.name,
-        ctx.command,
-        ctx.log_path,
-    ));
-    s.push_str(&info_message2(ctx.name, ctx.child.as_ref().map(|c| c.pid)));
+    s.extend_from_slice(
+        info_message1(
+            ctx.pid,
+            ctx.startup_dir,
+            ctx.child_dir,
+            ctx.name,
+            ctx.command,
+            ctx.log_path,
+        )
+        .as_bytes(),
+    );
+    s.extend_from_slice(info_message2(ctx.name, ctx.child.as_ref().map(|c| c.pid)).as_bytes());
 
     // buf1: start times — every client (clientFactory.cc:134-141,159).
-    s.push_str(&format!(
-        "@@@ procServ server started at: {}{NL}",
-        ctx.proc_started
-    ));
+    s.extend_from_slice(
+        format!("@@@ procServ server started at: {}{NL}", ctx.proc_started).as_bytes(),
+    );
     if let Some(c) = &ctx.child {
-        s.push_str(&format!(
-            "@@@ Child \"{}\" started at: {}{NL}",
-            ctx.name, c.started
-        ));
+        s.extend_from_slice(
+            format!("@@@ Child \"{}\" started at: {}{NL}", ctx.name, c.started).as_bytes(),
+        );
     }
 
     // buf2: connected-peer counts — interactive clients only
     // (clientFactory.cc:143-144,160-161). Counted excluding the joining
     // client → C's "(plus you)".
     if !ctx.readonly {
-        s.push_str(&format!(
-            "@@@ {} user(s) and {} logger(s) connected (plus you){NL}",
-            ctx.users, ctx.loggers
-        ));
+        s.extend_from_slice(
+            format!(
+                "@@@ {} user(s) and {} logger(s) connected (plus you){NL}",
+                ctx.users, ctx.loggers
+            )
+            .as_bytes(),
+        );
     }
 
     // infoMessage3: the command menu — only when no child is running
     // (clientFactory.cc:162-163).
     if ctx.child.is_none() {
-        s.push_str(&info_message3(ctx.keys));
+        s.extend_from_slice(&info_message3(ctx.keys));
     }
 
     s
@@ -235,22 +251,29 @@ pub fn welcome(ctx: &WelcomeCtx) -> String {
 /// (clientFactory.cc:108-124). Packed onto combined lines exactly as C
 /// builds it: the kill hint and restart-mode share a line with the toggle
 /// hint, then an optional logout line.
-fn greeting2(keys: &KeyBindings, mode: RestartMode) -> String {
-    let mut s = String::new();
+fn greeting2(keys: &KeyBindings, mode: RestartMode) -> Vec<u8> {
+    let mut s = Vec::new();
     match keys.kill {
-        Some(k) => s.push_str(&format!("@@@ Use {} to kill the child, ", ctl_sc(k))),
-        None => s.push_str("@@@ Kill command disabled, "),
+        Some(k) => {
+            s.extend_from_slice(b"@@@ Use ");
+            s.extend_from_slice(&ctl_sc(k));
+            s.extend_from_slice(b" to kill the child, ");
+        }
+        None => s.extend_from_slice(b"@@@ Kill command disabled, "),
     }
-    s.push_str(&format!("auto restart mode is {}, ", mode.label()));
+    s.extend_from_slice(format!("auto restart mode is {}, ", mode.label()).as_bytes());
     match keys.toggle_restart {
-        Some(t) => s.push_str(&format!("use {} to toggle auto restart{NL}", ctl_sc(t))),
-        None => s.push_str(&format!("auto restart toggle disabled{NL}")),
+        Some(t) => {
+            s.extend_from_slice(b"use ");
+            s.extend_from_slice(&ctl_sc(t));
+            s.extend_from_slice(format!(" to toggle auto restart{NL}").as_bytes());
+        }
+        None => s.extend_from_slice(format!("auto restart toggle disabled{NL}").as_bytes()),
     }
     if let Some(l) = keys.logout {
-        s.push_str(&format!(
-            "@@@ Use {} to logout from procServ server{NL}",
-            ctl_sc(l)
-        ));
+        s.extend_from_slice(b"@@@ Use ");
+        s.extend_from_slice(&ctl_sc(l));
+        s.extend_from_slice(format!(" to logout from procServ server{NL}").as_bytes());
     }
     s
 }
@@ -258,6 +281,13 @@ fn greeting2(keys: &KeyBindings, mode: RestartMode) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Text view of a byte builder's output. Every assertion below is a
+    /// default (ASCII) key set; the PS-46 case, whose whole point is a key
+    /// byte no `str` can hold, asserts the bytes directly instead.
+    fn text(bytes: Vec<u8>) -> String {
+        String::from_utf8(bytes).expect("ASCII key bindings render as text")
+    }
 
     fn keys() -> KeyBindings {
         // C defaults: kill ^X, toggle ^T, restart ^R, quit ^Q, logout off.
@@ -272,24 +302,50 @@ mod tests {
 
     #[test]
     fn ctl_sc_renders_control_chars_with_caret() {
-        assert_eq!(ctl_sc(0x12), "^R");
-        assert_eq!(ctl_sc(0x18), "^X");
-        assert_eq!(ctl_sc(0x11), "^Q");
-        assert_eq!(ctl_sc(0x1d), "^]");
+        assert_eq!(text(ctl_sc(0x12)), "^R");
+        assert_eq!(text(ctl_sc(0x18)), "^X");
+        assert_eq!(text(ctl_sc(0x11)), "^Q");
+        assert_eq!(text(ctl_sc(0x1d)), "^]");
     }
 
     #[test]
     fn ctl_sc_passes_printable_chars_literally_and_drops_nul() {
-        assert_eq!(ctl_sc(b'a'), "a");
+        assert_eq!(text(ctl_sc(b'a')), "a");
         // C would emit a NUL; the port emits nothing (don't copy the quirk).
-        assert_eq!(ctl_sc(0), "");
+        assert_eq!(text(ctl_sc(0)), "");
+    }
+
+    /// PS-46: `CTL_SC` is a printf `%c` (procServ.h:67), so a key bound to a
+    /// byte >= 0x80 puts exactly that byte on the connection. Rendering it
+    /// through `char` UTF-8-encoded it to two bytes, which is why the whole
+    /// chain from `ctl_sc` to the banner carries bytes rather than `String`.
+    #[test]
+    fn ctl_sc_emits_the_raw_byte_for_a_high_key() {
+        assert_eq!(ctl_sc(0x80), vec![0x80]);
+        assert_eq!(ctl_sc(0xff), vec![0xff]);
+        assert_eq!(ctl_sc(0xa9), vec![0xa9]);
+
+        // ...and the byte survives the builders that embed it.
+        let mut k = keys();
+        k.kill = Some(0x80);
+        for block in [info_message3(&k), greeting2(&k, RestartMode::OnExit)] {
+            assert_eq!(
+                block.iter().filter(|&&b| b == 0x80).count(),
+                1,
+                "the key byte reaches the wire once"
+            );
+            assert!(
+                !block.windows(2).any(|w| w == [0xc2, 0x80]),
+                "and never as its UTF-8 encoding"
+            );
+        }
     }
 
     #[test]
     fn info_message3_matches_c_menu_with_logout_off() {
         // C procServ.cc:443-444 with logout disabled.
         assert_eq!(
-            info_message3(&keys()),
+            text(info_message3(&keys())),
             "@@@ ^R or ^X restarts the child, ^Q quits the server\r\n"
         );
     }
@@ -299,7 +355,7 @@ mod tests {
         let mut k = keys();
         k.logout = Some(0x1d);
         assert_eq!(
-            info_message3(&k),
+            text(info_message3(&k)),
             "@@@ ^R or ^X restarts the child, ^Q quits the server, ^] closes this connection\r\n"
         );
     }
@@ -329,25 +385,30 @@ mod tests {
     #[test]
     fn child_shutting_down_picks_reason_and_redisplays_menu_unless_oneshot() {
         let info3 = info_message3(&keys());
+        let menu = text(info3.clone());
         // Auto-restart mode: reason + menu redisplayed.
         assert_eq!(
-            child_shutting_down("Mon Jun 28 10:00:00 2026", RestartMode::OnExit, &info3),
+            text(child_shutting_down(
+                "Mon Jun 28 10:00:00 2026",
+                RestartMode::OnExit,
+                &info3
+            )),
             format!(
                 "@@@ Current time: Mon Jun 28 10:00:00 2026\r\n\
-                 @@@ Child process is shutting down, a new one will be restarted shortly\r\n{info3}"
+                 @@@ Child process is shutting down, a new one will be restarted shortly\r\n{menu}"
             )
         );
         // norestart: different reason, menu still shown.
         assert_eq!(
-            child_shutting_down("T", RestartMode::Disabled, &info3),
+            text(child_shutting_down("T", RestartMode::Disabled, &info3)),
             format!(
                 "@@@ Current time: T\r\n\
-                 @@@ Child process is shutting down, auto restart is disabled\r\n{info3}"
+                 @@@ Child process is shutting down, auto restart is disabled\r\n{menu}"
             )
         );
         // oneshot: reason line only, NO menu (C processFactory.cc:113).
         assert_eq!(
-            child_shutting_down("T", RestartMode::OneShot, &info3),
+            text(child_shutting_down("T", RestartMode::OneShot, &info3)),
             "@@@ Current time: T\r\n@@@ Child process is shutting down, oneshot mode: server will exit\r\n"
         );
     }
@@ -436,7 +497,7 @@ mod tests {
             loggers: 0,
         };
         assert_eq!(
-            welcome(&ctx),
+            text(welcome(&ctx)),
             "@@@ Welcome to procServ (2.8.0)\r\n\
              @@@ Use ^X to kill the child, auto restart mode is ON, use ^T to toggle auto restart\r\n\
              @@@ procServ server PID: 100\r\n\
@@ -472,7 +533,7 @@ mod tests {
             loggers: 1,
         };
         assert_eq!(
-            welcome(&ctx),
+            text(welcome(&ctx)),
             "@@@ procServ server PID: 100\r\n\
              @@@ Server startup directory: /srv\r\n\
              @@@ Child startup directory: /srv\r\n\

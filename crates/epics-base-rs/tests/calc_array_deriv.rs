@@ -16,7 +16,7 @@
 //! Every expectation below is the output of a driver compiled from
 //! `/home/stevek/work/epics-modules/calc/calcApp/src/{aCalcPerform,aCalcPostfix,calcUtil}.c`.
 
-use epics_base_rs::calc::{ArrayInputs, ArrayStackValue, acalc};
+use epics_base_rs::calc::{ArrayInputs, ArrayStackValue, CalcError, acalc};
 
 /// A deliberately non-polynomial y, so every block of the sliding fit is observable.
 fn noisy9() -> ArrayInputs {
@@ -154,15 +154,19 @@ fn r11_8_nderiv_fits_the_window_and_zeroes_the_rest() {
     );
 }
 
-/// npts = 0 gives m = 1, and `fitpoly` needs three points (`calcUtil.c:270`), so C
-/// answers -1. The curve is zeros; the status is R10-11's subject.
+/// npts = 0 gives m = 1, and `fitpoly` needs three points (`calcUtil.c:271`), so C
+/// answers -1. R10-11 (`b80ef9b3`) settled that status: the engine propagates it as
+/// [`CalcError::FitFailed`], and a non-zero `status` suppresses the result write
+/// entirely (`aCalcPerform.c:1602-1605`), so there is no curve to compare at this
+/// boundary: the engine hands back the status and no array. The zeros a compiled C
+/// driver prints for `aresult` are that driver's untouched output buffer, which is a
+/// record-side observation this test cannot make.
 #[test]
 fn r11_8_nderiv_with_no_points_per_side_has_no_fit() {
     let mut i = noisy9();
-    let got = match acalc("NDERIV(AA,0)", &mut i) {
-        Ok(ArrayStackValue::Array(cell)) => cell.buf().to_vec(),
-        Ok(other) => panic!("expected an Array result, got {other:?}"),
-        Err(_) => return,
-    };
-    assert_eq!(got, vec![0.0; 9], "no fit means no derivative, not a line");
+    assert_eq!(
+        acalc("NDERIV(AA,0)", &mut i),
+        Err(CalcError::FitFailed),
+        "npts = 0 is a window of one point: C's fitpoly -1, not a silent zero curve"
+    );
 }

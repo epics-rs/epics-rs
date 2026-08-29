@@ -1,6 +1,6 @@
 //! R9-78 — aSub drives OUTA..OUTU from VALA..VALU.
 //!
-//! C `aSubRecord.c::process` (232-239):
+//! C `aSubRecord.c::process` (234-240):
 //!
 //! ```c
 //! /* Push the output link values */
@@ -102,7 +102,7 @@ async fn r9_78_successful_do_sub_pushes_every_output_link() {
     assert_eq!(
         field(&db, "SINK_A", "VAL").await,
         Some(11.0),
-        "OUTA takes VALA (aSubRecord.c:236-238)"
+        "OUTA takes VALA (aSubRecord.c:237-239)"
     );
     assert_eq!(
         field(&db, "SINK_B", "VAL").await,
@@ -194,7 +194,7 @@ async fn r9_78_empty_snam_pushes_output_links() {
 
 /// A declared `FTVB=STRING` output carries its string through OUTB — the
 /// push reads the FTVx-typed cell (C `dbPutLink(&(&prec->outa)[i],
-/// (&prec->ftva)[i], ...)`, aSubRecord.c:236-238), so the sink receives a
+/// (&prec->ftva)[i], ...)`, aSubRecord.c:237-239), so the sink receives a
 /// string, not a numeric collapse.
 #[epics_macros_rs::epics_test]
 async fn r9_78_string_output_pushes_through_out_link() {

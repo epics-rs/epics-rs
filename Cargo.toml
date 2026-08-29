@@ -27,6 +27,24 @@ default-members = [
     # Same reason: the record-processing runtime-seam census's own boundary
     # tests. The per-crate halves ride their crates; these prove the slicer.
     "tools/record-seam-gate",
+    # And again: the production-slice rule every source guard in the workspace
+    # runs on. Its own boundary tests are what keep a guard from going quiet.
+    "crates/source-guard",
+    # Same reason again: the IOC-spawn census checks .config/nextest.toml
+    # against the sources, so a new test binary that spawns an IOC without
+    # being declared in a test-group is red on the commit that adds it.
+    "tools/ioc-spawn-gate",
+    # And the exec-backend census, for the same reason and one more of its
+    # own: its per-crate halves are `#![cfg(exec_backend)]`, so they compile
+    # away in every configuration anyone runs by default. The
+    # workspace-level half here is the only reading of the rule a bare
+    # `cargo nextest run` can reach, and until this line it was not reachable
+    # either.
+    "tools/rtems-exec-gate",
+    # And again, for the rule that a target declares the cfg its own imports
+    # require. The configuration it protects is the one a bare run does not
+    # build, so the gate has to ride the run that everybody does make.
+    "tools/target-cfg-gate",
 ]
 resolver = "3"
 

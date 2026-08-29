@@ -86,7 +86,7 @@ impl SimMode {
 ///   branch, substituting a device read C refuses to perform.
 ///
 /// swait is the one record with no `default:` arm at all
-/// (`swaitRecord.c:407-421` is a plain `if (simm == menuYesNoNO) … else …`):
+/// (`swaitRecord.c:407-422` is a plain `if (simm == menuYesNoNO) … else …`):
 /// every non-NO value simulates. It says so via
 /// [`Record::rejects_illegal_sim_mode`](crate::server::record::Record::rejects_illegal_sim_mode).
 pub fn resolve_sim_mode(record: &dyn crate::server::record::Record) -> SimMode {

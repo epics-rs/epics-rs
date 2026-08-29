@@ -115,7 +115,7 @@ macro_rules! impl_resp_scalar {
             fn into_service_response(self) -> ServiceResponse {
                 // Route through the shared NTScalar builder so the RPC
                 // response carries value + alarm + timeStamp by
-                // construction (pvxs nt.cpp:37-53), not a value-only
+                // construction (pvxs nt.cpp:44-53), not a value-only
                 // truncated NTScalar that claims the normative id while
                 // omitting the mandatory metadata.
                 let builder = NTScalar::new(ScalarType::$st);
@@ -145,7 +145,7 @@ impl_resp_scalar!(bool, Boolean, Boolean);
 impl IntoServiceResponse for String {
     fn into_service_response(self) -> ServiceResponse {
         // Same NTScalar baseline as the numeric scalars: value + alarm +
-        // timeStamp present by construction (pvxs nt.cpp:37-53).
+        // timeStamp present by construction (pvxs nt.cpp:44-53).
         let builder = NTScalar::new(ScalarType::String);
         let descriptor = builder.build();
         let mut value = builder.create();

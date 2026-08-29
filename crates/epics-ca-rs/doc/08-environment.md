@@ -174,13 +174,13 @@ What C actually has is the global `asCheckClientIP`
 (`asLibRoutines.c:34`), default `0`, set from the shell:
 
 * **`0` (default)** — rsrv stores the hostname the client sends in
-  `CA_PROTO_HOST_NAME` unconditionally (`camessage.c:845-875`) and
+  `CA_PROTO_HOST_NAME` unconditionally (`camessage.c:797-878`) and
   `HAG` entries are host *names* (`asHagAddHost` lowercases them). This
   is what a `HOST(node)` rule in a facility `.acf` is written against.
   rsrv does not verify the claim — the trust model assumes a controlled
   subnet.
 * **`1`** — rsrv fills the client's host with the peer's dotted-quad IP
-  at accept time (`caservertask.c:1425-1437`), ignores
+  at accept time (`caservertask.c:1425-1439`), ignores
   `CA_PROTO_HOST_NAME`, and resolves every `HAG` entry to an IP when the
   ACF is loaded. Use this when the network is not trusted.
 

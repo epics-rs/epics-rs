@@ -23,7 +23,7 @@ pub struct CasUdpConfig {
     /// Steady-state beacon interval (post-ramp).
     pub beacon_period: Duration,
     /// multicast groups (224.0.0.0/4) extracted from
-    /// `EPICS_CAS_INTF_ADDR_LIST`. C `rsrv/caservertask.c:367-371,
+    /// `EPICS_CAS_INTF_ADDR_LIST`. C `rsrv/caservertask.c:368-372,
     /// 633-668` keeps these in `casMCastAddrList` and joins each
     /// group via `IP_ADD_MEMBERSHIP` from a wildcard-bound socket;
     /// they cannot be unicast-bound.
@@ -62,7 +62,7 @@ impl Default for CasUdpConfig {
 ///
 /// returns `Err` when `EPICS_CAS_INTF_ADDR_LIST` mixes
 /// `0.0.0.0` with specific interface IPs — C
-/// `rsrv/caservertask.c:390-392` `cantProceed`s on this combination
+/// `rsrv/caservertask.c:391-393` `cantProceed`s on this combination
 /// (which kills the IOC process). The error propagates to the
 /// caller (`CaServer::run` / `run_tcp_listener`) which fails
 /// startup, matching C's fatal behaviour. The check runs
@@ -98,11 +98,11 @@ fn resolve_from_env() -> CaResult<CasUdpConfig> {
     let mut cfg = CasUdpConfig::default();
 
     if let Some(list) = epics_base_rs::runtime::env_table::EPICS_CAS_INTF_ADDR_LIST.get() {
-        // C `caservertask.c:341-343` tokenizes with the server's UDP port —
+        // C `caservertask.c:342-344` tokenizes with the server's UDP port —
         // which is the port its duplicate warning dots the address with.
         let udp_port = epics_base_rs::runtime::net::cas_server_port();
         let parsed = parse_ipv4_list(&list, "EPICS_CAS_INTF_ADDR_LIST", udp_port);
-        // C `rsrv/caservertask.c:367-371, 633-668` splits
+        // C `rsrv/caservertask.c:368-372, 633-668` splits
         // multicast (224.0.0.0/4) entries off into
         // `casMCastAddrList` and joins each group via
         // `IP_ADD_MEMBERSHIP` on a wildcard-bound socket; trying
@@ -125,11 +125,11 @@ fn resolve_from_env() -> CaResult<CasUdpConfig> {
 
     // Server-side beacon port: EPICS_CAS_BEACON_PORT when configured,
     // else EPICS_CA_REPEATER_PORT, each resolved by the one owner of
-    // C `envGetInetPortConfigParam` (rsrv/caservertask.c:501-508).
+    // C `envGetInetPortConfigParam` (rsrv/caservertask.c:502-509).
     let beacon_port = epics_base_rs::runtime::net::cas_beacon_port();
 
     // Beacon addr list: only EPICS_CAS_BEACON_ADDR_LIST. The C IOC
-    // server (rsrv/caservertask.c:413) calls
+    // server (rsrv/caservertask.c:414) calls
     // `addAddrToChannelAccessAddressList ( &temp,
     //   &EPICS_CAS_BEACON_ADDR_LIST, ca_beacon_port, 0 )` with no
     // fallback. The fallback to EPICS_CA_ADDR_LIST was intentionally
@@ -142,7 +142,7 @@ fn resolve_from_env() -> CaResult<CasUdpConfig> {
     // sending beacons to every search target on the client list —
     // unwanted UDP fan-out on sites that intentionally separated
     // client search targets from beacon destinations. Note: the
-    // standalone `caRepeater` daemon (repeater.cpp:545-547) DOES still
+    // standalone `caRepeater` daemon (repeater.cpp:533-535) DOES still
     // fall back; that path lives in `repeater.rs` and is unaffected.
     let mut beacon_addrs: Vec<SocketAddr> = Vec::new();
     if let Some(list) = epics_base_rs::runtime::env_table::EPICS_CAS_BEACON_ADDR_LIST.get() {
@@ -181,7 +181,7 @@ fn resolve_from_env() -> CaResult<CasUdpConfig> {
         Some(s) => s.eq_ignore_ascii_case("YES"),
     };
     // mixed-0.0.0.0+specific check runs UNCONDITIONALLY, not
-    // just under `if auto_on`. C `rsrv/caservertask.c:390-392`
+    // just under `if auto_on`. C `rsrv/caservertask.c:391-393`
     // `cantProceed`s on this combination regardless of
     // `EPICS_CAS_AUTO_BEACON_ADDR_LIST` (the per-iteration
     // `if(!doautobeacon) continue` at line 374-375 only short-circuits
@@ -201,13 +201,13 @@ fn resolve_from_env() -> CaResult<CasUdpConfig> {
     if !intf_specific.is_empty() && intf_has_wildcard {
         return Err(CaError::Protocol(
             "EPICS_CAS_INTF_ADDR_LIST may not mix 0.0.0.0 with specific interface IPs \
-             (rsrv `cantProceed` parity, caservertask.c:390-392). \
+             (rsrv `cantProceed` parity, caservertask.c:391-393). \
              Use either 0.0.0.0 alone or a list of specific interface IPs."
                 .to_string(),
         ));
     }
     if auto_on {
-        // C `rsrv/caservertask.c:374-388` filters auto-beacon
+        // C `rsrv/caservertask.c:375-389` filters auto-beacon
         // expansion by `casIntfAddrList` when specific (non-wildcard)
         // interface IPs are listed — beacons only go out via those
         // NICs' broadcasts. Pre-fix Rust unconditionally walked every
@@ -227,14 +227,14 @@ fn resolve_from_env() -> CaResult<CasUdpConfig> {
         // No `contains` guard: on the server C dedups the WHOLE beacon list —
         // user entries and auto-discovered broadcasts together — with one
         // `removeDuplicateAddresses(&beaconAddrList, &temp, 0)` at
-        // `caservertask.c:438`, which reports every repeat it drops. Two NICs on
+        // `caservertask.c:439`, which reports every repeat it drops. Two NICs on
         // one subnet, or an operator who lists a broadcast the discovery already
         // found, are exactly the cases C reports and the port swallowed.
         for bcast in bcast_iter {
             beacon_addrs.push(SocketAddr::V4(SocketAddrV4::new(bcast, beacon_port)));
         }
     }
-    // C `caservertask.c:438` — outside the `if (autobeaconlist)`, so the user's
+    // C `caservertask.c:439` — outside the `if (autobeaconlist)`, so the user's
     // own list is deduped and reported even when auto-discovery is off.
     let mut beacon_addrs = crate::iocinf::remove_duplicate_addresses(beacon_addrs, |a| *a);
     if auto_on {
@@ -258,7 +258,7 @@ fn resolve_from_env() -> CaResult<CasUdpConfig> {
     cfg.beacon_addrs = beacon_addrs;
 
     if let Some(list) = epics_base_rs::runtime::env_table::EPICS_CAS_IGNORE_ADDR_LIST.get() {
-        // C `caservertask.c:450-451` builds this one with `port = 0`, so the
+        // C `caservertask.c:451-452` builds this one with `port = 0`, so the
         // duplicate it reports is dotted as `10.1.2.3:0` — captured from the
         // compiled `softIoc`, which is why the port is not the server's here.
         cfg.ignore_addrs = parse_ipv4_list(&list, "EPICS_CAS_IGNORE_ADDR_LIST", 0);
@@ -322,8 +322,8 @@ fn resolve_from_env() -> CaResult<CasUdpConfig> {
 
 /// One `EPICS_CAS_*` address list, tokenized and deduped exactly as C does it:
 /// `addAddrToChannelAccessAddressList` then
-/// `removeDuplicateAddresses(…, silent=0)` (`caservertask.c:341-343`,
-/// `:413-438`, `:450-451`). Both diagnostics — the bad token and the discarded
+/// `removeDuplicateAddresses(…, silent=0)` (`caservertask.c:342-344`,
+/// `:414-439`, `:451-452`). Both diagnostics — the bad token and the discarded
 /// duplicate — belong to those two functions and are printed by them.
 pub fn parse_addr_list(list: &str, env_name: &str, default_port: u16) -> Vec<SocketAddr> {
     let tokens =
@@ -451,7 +451,7 @@ mod tests {
     #[test]
     fn broadcast_for_ip_rejects_unspecified_and_loopback() {
         // C `osdNetIfAddrs.c:42-54` special-cases loopback (returns
-        // INADDR_LOOPBACK as the "broadcast") but `caservertask.c:677`
+        // INADDR_LOOPBACK as the "broadcast") but `caservertask.c:678`
         // gates the secondary-bind path on `!= INADDR_ANY`. We collapse
         // both cases by returning None for unspecified and loopback
         // inputs — the caller (`udp.rs::run_single_responder`) only
@@ -475,12 +475,12 @@ mod tests {
     }
 
     /// `from_env` MUST NOT fall back to `EPICS_CA_ADDR_LIST` for the
-    /// IOC beacon list. C IOC `rsrv/caservertask.c:413` removed that
+    /// IOC beacon list. C IOC `rsrv/caservertask.c:414` removed that
     /// fallback in EPICS 3.15 (RELEASE-3.15.md). Sites now must set
     /// both env vars; Rust no longer silently re-enables the
     /// deprecated path. The standalone caRepeater (`repeater.rs`)
     /// path keeps the fallback for documented parity with
-    /// `epics-base/modules/ca/src/client/repeater.cpp:545-547`.
+    /// `epics-base/modules/ca/src/client/repeater.cpp:533-535`.
     #[test]
     #[serial_test::serial]
     fn from_env_does_not_fall_back_to_ca_addr_list() {

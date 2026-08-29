@@ -4,9 +4,9 @@
 //! A bare `record(bo,"X"){}` has VAL=0 and UDF=1. `caput X.ZSV 3` sets the
 //! zero-state severity to INVALID; ZSV is `field(ZSV,DBF_MENU){ pp(TRUE) }`
 //! (boRecord.dbd:93-99), so the put processes the record. C `boRecord.c`
-//! `checkAlarms` raises the UDF alarm FIRST (`:371-373`,
+//! `checkAlarms` raises the UDF alarm FIRST (`:366-368`,
 //! `recGblSetSevr(UDF_ALARM, udfs=INVALID)`) then the STATE alarm
-//! (`:376-380`, `recGblSetSevr(STATE_ALARM, zsv=INVALID)`). `recGblSetSevr`
+//! (`:371-375`, `recGblSetSevr(STATE_ALARM, zsv=INVALID)`). `recGblSetSevr`
 //! overrides only on strictly greater severity (recGbl.c:242,
 //! `if (nsev < new_sevr)`), so the equal-severity STATE alarm does NOT displace
 //! the UDF already set — STAT stays UDF, SEVR INVALID.

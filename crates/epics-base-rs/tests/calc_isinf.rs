@@ -1,7 +1,7 @@
 //! CBUG-A3 — ISINF is a BOOLEAN predicate in every engine.
 //!
 //! DEVIATION from C, deliberate. C assigns the `isinf` macro's result straight
-//! into a double (`calcPerform.c:277`, `sCalcPerform.c:703,1407`,
+//! into a double (`calcPerform.c:276`, `sCalcPerform.c:703,1407`,
 //! `aCalcPerform.c:826,1084`), and glibc's `isinf` is `__builtin_isinf_sign` —
 //! it returns the SIGN, so `-inf` gives **-1** (verified by compiling the macro
 //! on this host: isinf(+inf)=1, isinf(-inf)=-1, isinf(nan)=0, isinf(3)=0).

@@ -10,6 +10,11 @@
 //! qsrv-rs --db-file records.db [--group-file groups.json] [--port 5075]
 //!         [--macro KEY=VAL]...
 //! ```
+// On `exec_backend` this program's `main` refuses instead of running, so
+// everything below it is unreachable in that configuration by construction.
+// The lint is reporting the intent, not dead code: the default build still
+// lints this file in full.
+#![cfg_attr(exec_backend, allow(dead_code, unused_imports))]
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -19,6 +24,7 @@ use std::sync::Arc;
 use clap::Parser;
 
 use epics_bridge_rs::qsrv::{BridgeProvider, QsrvPvStore};
+#[cfg(tokio_backend)]
 use epics_pva_rs::server::{PvaServer, PvaServerBuilder};
 use epics_pva_rs::server_native::ChannelSource;
 
@@ -58,8 +64,9 @@ fn parse_macro(raw: &str) -> Result<(String, String), String> {
 // One worker, reactor-style — the shape pvxs serves from (a single event
 // loop). With the default per-CPU pool, the mostly-serial serving work
 // migrates across idle workers, costing ~35 µs of extra CPU per put on a
-// 96-core host (doc/qsrv-put-perf.md). Multi-thread flavor is kept:
-// current_thread would refuse `block_on_sync` from runtime tasks.
+// 96-core host. Multi-thread flavor is kept: current_thread would refuse
+// `block_on_sync` from runtime tasks.
+#[cfg(tokio_backend)]
 #[tokio::main(worker_threads = 1)]
 async fn main() -> ExitCode {
     tracing_subscriber::fmt()
@@ -80,6 +87,7 @@ async fn main() -> ExitCode {
     }
 }
 
+#[cfg(tokio_backend)]
 async fn run(args: Args) -> Result<(), String> {
     let mut builder: PvaServerBuilder = PvaServer::builder();
     if let Some(port) = args.port {
@@ -106,7 +114,11 @@ async fn run(args: Args) -> Result<(), String> {
             .load_group_file(path.to_string_lossy().as_ref())
             .map_err(|e| format!("loading group file {}: {e}", path.display()))?;
     }
-    let store = Arc::new(QsrvPvStore::new(Arc::new(provider)));
+    let store = Arc::new(QsrvPvStore::new(
+        epics_base_rs::runtime::task::Reactor::current()
+            .expect("qsrv-rs main is awaited on the tool's runtime"),
+        Arc::new(provider),
+    ));
 
     let pv_count = store.list_pvs().await.len();
     let group_count = store.provider().groups().len();
@@ -118,4 +130,17 @@ async fn run(args: Args) -> Result<(), String> {
         .run_with_source(store)
         .await
         .map_err(|e| e.to_string())
+}
+
+/// The `exec_backend` arm. QSRV serves its groups over the async PVA front-end
+/// (`server_native::runtime`), which is `tokio_backend`-only; `realtime-pva-ioc`
+/// is the entry point for this execution model.
+#[cfg(exec_backend)]
+fn main() -> ExitCode {
+    eprintln!(
+        "qsrv-rs: this build selects the reactor-free execution backend \
+         (EPICS_RS_BUILD_EXEC_BACKEND=thread), and the PVA server front-end needs \
+         a tokio reactor. Unset that variable and rebuild."
+    );
+    ExitCode::FAILURE
 }

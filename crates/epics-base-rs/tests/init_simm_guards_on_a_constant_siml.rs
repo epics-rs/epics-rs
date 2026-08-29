@@ -101,7 +101,7 @@ record(longin, "L") { field(SIML, "SRC.VAL") field(SIMM, "YES")
     );
     assert_eq!(
         scan(&db, "L"),
-        ScanType::Sec1,
+        ScanType::SEC1,
         "no recGblCheckSimm at init: SCAN is where the .db put it"
     );
     assert_eq!(
@@ -128,5 +128,5 @@ async fn an_unset_siml_is_constant_and_latches_without_loading() {
         Some(EpicsValue::Short(1)),
         "the latch ran and took the current mode"
     );
-    assert_eq!(scan(&db, "U"), ScanType::Sec1, "no transition, no swap");
+    assert_eq!(scan(&db, "U"), ScanType::SEC1, "no transition, no swap");
 }

@@ -5,9 +5,9 @@
 //! the operator at both ends:
 //!
 //! * an ARRAY operand was collapsed to its `a[0]` and rebroadcast — C leaves it alone,
-//!   window and all, because `toArray` tests `isDouble` first (`:145`).
+//!   window and all, because `toArray` tests `isDouble` first (`:146`).
 //! * a NaN scalar was copied verbatim — C's `to_array` fills 0 for a NaN
-//!   (`:135-137`), so an aCalcout could not publish an all-NaN AVAL.
+//!   (`:134-136`), so an aCalcout could not publish an all-NaN AVAL.
 //!
 //! Every expectation below is the output of a driver compiled from
 //! `/home/stevek/work/epics-modules/calc/calcApp/src/{aCalcPerform,aCalcPostfix,calcUtil}.c`.
@@ -27,7 +27,7 @@ fn buf(expr: &str, inputs: &mut ArrayInputs) -> Vec<f64> {
     }
 }
 
-/// C's `to_array` fills 0 for a NaN scalar (`:135-137`) — the ONE place aCalc keeps a
+/// C's `to_array` fills 0 for a NaN scalar (`:134-136`) — the ONE place aCalc keeps a
 /// NaN out of an array. Compiled C, arraySize 4, A=NaN: `ARR(A)` is [0,0,0,0].
 #[test]
 fn r11_6_arr_of_a_nan_scalar_fills_zero() {

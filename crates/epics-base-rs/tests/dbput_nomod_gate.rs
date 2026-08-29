@@ -1,6 +1,6 @@
 //! R16-79: the `SPC_NOMOD` gate lives in `dbPut`, BELOW every put route.
 //!
-//! C `dbAccess.c:1330-1332` (`special == SPC_ATTRIBUTE` → `S_db_noMod`) and
+//! C `dbAccess.c:1327-1329` (`special == SPC_ATTRIBUTE` → `S_db_noMod`) and
 //! `dbAccess.c:123-126` (`dbPutSpecial` pass 0, `SPC_NOMOD` → `S_db_noMod`) sit
 //! inside `dbPut` — under `dbPutField` (CA / `dbpf`) AND under `dbPutLink` (a
 //! record's OUT link). A refused `dbPutLink` then raises the WRITER's alarm
@@ -214,7 +214,7 @@ async fn every_dbcommon_nomod_field_is_refused_on_every_route() {
 /// The other half of R17-62: refusing the ACKS/ACKT *fields* must not break
 /// alarm acknowledgement, because C never acknowledged through those fields.
 /// `dbPut` dispatches on the DBR request type ABOVE the gate
-/// (`dbAccess.c:1331-1335`), so the ack route stays open.
+/// (`dbAccess.c:1328-1332`), so the ack route stays open.
 ///
 /// softIoc (`record(ai,"N1"){field(HIGH,"1") field(HSV,"MAJOR")}`, VAL=5 →
 /// SEVR=MAJOR, ACKS=MAJOR):

@@ -15,10 +15,11 @@
 //!    Out-of-band reads still work — `block_on` will issue a GET — but
 //!    pre-warmed monitors are always cheaper.
 //!
-//! pvxs equivalent: `ioc/pvalink.cpp` + `pvalink_channel.cpp`
+//! pvxs equivalent: `ioc/pvalink.cpp` + `ioc/pvalink_channel.cpp`
 //! (`pvalinkInit`, `pvalinkOpen`, `dbpvxr`).
 
-// RTEMS-EXEC-MODEL-ALLOW(39): checked - these run and pass in the feature-ON suite.
+// RTEMS-EXEC-MODEL-ALLOW(37): checked - these run and pass in the exec-backend
+// suite.
 
 use std::sync::Arc;
 
@@ -41,6 +42,14 @@ use super::registry::PvaLinkRegistry;
 /// target).
 #[derive(Clone)]
 pub struct PvaLinkResolver {
+    /// The executor every link-staging task is spawned through.
+    ///
+    /// The `LinkSet` entry points below (`scan_forward`, the resolver
+    /// closure) are called synchronously from the record-processing thread,
+    /// which is not a reactor thread. Holding the capability makes that a
+    /// property of construction rather than of whoever happens to call the
+    /// link — the reason [`Default`] no longer exists for this type.
+    reactor: epics_base_rs::runtime::task::Reactor,
     registry: Arc<PvaLinkRegistry>,
     /// Counter incremented on every successful link read. Used by
     /// `pvalinkrefdiff` to report "links touched since last call". Wraps
@@ -49,8 +58,8 @@ pub struct PvaLinkResolver {
     /// Master enable flag. Set false via [`Self::set_enabled`] (or
     /// the `pvalink_disable` iocsh command) to make every resolve
     /// return None — useful for site-level pvalink kill switches.
-    /// Mirrors pvxs `pvalink_enable` / `pvalink_disable` iocsh
-    /// commands (pvalink.cpp:328).
+    /// An epics-rs addition: pvxs has no `pvalink_disable`, and its
+    /// `pvalink_enable` (`pvxs/ioc/pvalink.cpp:328`) registers `dbpvar`.
     enabled: Arc<std::sync::atomic::AtomicBool>,
     /// Per-PV link-option overrides.
     ///
@@ -106,7 +115,7 @@ pub struct PvaLinkResolver {
 /// Identity of an INP monitor variant: the subset of the registry key
 /// that distinguishes two monitors of the same upstream PV. Mirrors
 /// pvxs `channels_key_t = (channelName, pvRequest)` where the pvRequest
-/// encodes `pipeline` / `queueSize` (`pvxs/ioc/pvalink.h:115-120`).
+/// encodes `pipeline` / `queueSize` (`pvxs/ioc/pvalink.h:116-120`).
 ///
 /// Scan fan-out and forwarder dedup key on this rather than the bare PV
 /// name so a `Q=1` record's CP/CPP scans are driven by its own monitor,
@@ -155,20 +164,15 @@ struct ScanTarget {
     atomic: bool,
     /// pvxs distinguishes `CP` (scanOnUpdateYes) from `CPP`
     /// (scanOnUpdatePassive). `CPP` is gated by the owning record's
-    /// SCAN being Passive (pvalink_channel.cpp:313). True here means
+    /// SCAN being Passive (pvxs/ioc/pvalink_channel.cpp:313). True here means
     /// "skip processing when the owning record's SCAN != Passive".
     passive_only: bool,
 }
 
-impl Default for PvaLinkResolver {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 impl PvaLinkResolver {
-    pub fn new() -> Self {
+    pub fn new(reactor: epics_base_rs::runtime::task::Reactor) -> Self {
         Self {
+            reactor,
             registry: Arc::new(PvaLinkRegistry::new()),
             reads: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             enabled: Arc::new(std::sync::atomic::AtomicBool::new(true)),
@@ -218,7 +222,7 @@ impl PvaLinkResolver {
     /// Master enable / disable. When disabled, the resolver closure
     /// returns `None` for every lookup so dependent records see
     /// LINK/INVALID alarms but no stale cached values bleed through.
-    /// Mirrors pvxs `pvalink_enable(false)` / `pvalink_disable`.
+    /// An epics-rs addition; pvxs has no such switch (see `enabled`).
     pub fn set_enabled(&self, on: bool) {
         self.enabled.store(on, std::sync::atomic::Ordering::Relaxed);
     }
@@ -229,7 +233,7 @@ impl PvaLinkResolver {
     }
 
     /// Open / cache a link for `pv_name` in INP+monitor mode. Mirrors
-    /// pvxs `pvalinkOpen` (pvalink_channel.cpp). After this returns,
+    /// pvxs `pvalinkOpen` (pvxs/ioc/pvalink_channel.cpp). After this returns,
     /// later calls to [`LinkSet::get_cached_value`] for the same name will read
     /// the cached monitor value (no async block).
     ///
@@ -350,7 +354,7 @@ impl PvaLinkResolver {
         // Record the owning record on this channel's back-index (every
         // INP link, not just CP/CPP scan targets) so `dbpvar` can filter
         // channels by record-name glob, matching pvxs's
-        // `pvaLinkChannel::links` (`pvalink.cpp:213-243`).
+        // `pvaLinkChannel::links` (`pvxs/ioc/pvalink.cpp:216-231`).
         if let Some(rec) = &record {
             self.registry.attach_record(&cfg, rec);
         }
@@ -359,7 +363,7 @@ impl PvaLinkResolver {
         // variant identity, NOT bare PV name, so a `Q=1` record's scan
         // targets are not merged with a `Q=64` sibling's
         // (pvxs keys links onto their channel
-        // by `(channelName, pvRequest)`, `pvxs/ioc/pvalink.h:115-120`).
+        // by `(channelName, pvRequest)`, `pvxs/ioc/pvalink.h:116-120`).
         let monitor_key = MonitorKey::from_config(&cfg);
         // Track the newly-attached scan target so an attach-time scan
         // can fire below once the (possibly reused) channel is known
@@ -383,7 +387,7 @@ impl PvaLinkResolver {
         };
         let link = self.registry.get_or_open(cfg).await?;
         self.spawn_notify_forwarder(monitor_key, &link);
-        // Attach-time scan (pvxs `pvalink_lset.cpp:148-167`,
+        // Attach-time scan (`pvxs/ioc/pvalink_lset.cpp:148-167`,
         // `scanOnce(plink->precord)`): when the shared channel is
         // ALREADY connected at attach, fire one immediate scan of just
         // the newly attached record. This is observably needed on the
@@ -427,7 +431,7 @@ impl PvaLinkResolver {
         let scan_overrun = link.scan_overrun();
         // field is now per-ScanTarget (not shared across all
         // targets). `run_notify_forwarder` reads each target's own field.
-        task::spawn(run_notify_forwarder(
+        self.reactor.spawn(run_notify_forwarder(
             key,
             rx,
             scan_targets,
@@ -438,7 +442,7 @@ impl PvaLinkResolver {
 
     /// Fire one immediate scan of a single newly-attached scan target —
     /// the attach-time scan pvxs runs when the shared channel is already
-    /// connected at link-open (`pvalink_lset.cpp:148-167`). Applies the
+    /// connected at link-open (`pvxs/ioc/pvalink_lset.cpp:148-167`). Applies the
     /// same CPP passive gate + PACT pre-check as the steady-state
     /// forwarder, then processes the one record through the
     /// gate-acquiring entry. There is no atomic group and no epoch is
@@ -461,7 +465,7 @@ impl PvaLinkResolver {
     /// `registry.get_or_open` on both the INP and OUT paths.
     ///
     /// pvxs applies `pvaLinkConfig::local` inside `pvaOpenLink()`
-    /// (`ioc/pvalink_lset.cpp:69-74`), the single open function used for
+    /// (`ioc/pvalink_lset.cpp:69-75`), the single open function used for
     /// every link direction: if `local` is set and `dbChannelTest()`
     /// cannot find the channel in this IOC, the link set is cleared
     /// (`plink->lset = NULL`) and the link never opens, reads, or writes a
@@ -520,7 +524,7 @@ impl PvaLinkResolver {
     /// modifier are stripped and ignored for the locality decision, and
     /// an empty/trailing-dot field (`x.`, `x.{}`) resolves to the
     /// default value field — matching the modifiers the same test allows
-    /// (`dbChannelTest.c:183-186`).
+    /// (`dbChannelTest.c:184-186`).
     ///
     /// All lookups are local-only (`find_pv`/`get_record` consult the
     /// simple-PV, record, and alias maps; never a remote search), so the
@@ -612,7 +616,7 @@ impl PvaLinkResolver {
     /// operator's proc / field / defer settings on every write.
     ///
     /// Mirrors [`Self::open_link`] for the OUT direction. pvxs equivalent:
-    /// `pvaLinkConfig` carried on the `jlink` (pvalink_jlif.cpp).
+    /// `pvaLinkConfig` carried on the `jlink` (pvxs/ioc/pvalink_jlif.cpp).
     pub async fn open_out_link(
         &self,
         link_string: &str,
@@ -700,7 +704,7 @@ impl PvaLinkResolver {
     /// link's `MS`/`MSI` mode says the remote severity propagates;
     /// `None` for `NMS` links, sub-threshold severities, links not
     /// yet open, or links with no cached value. Mirrors pvxs
-    /// `pvaGetAlarmMsg`'s severity output (pvalink_lset.cpp:544).
+    /// `pvaGetAlarmMsg`'s severity output (pvxs/ioc/pvalink_lset.cpp:550-552).
     pub fn link_alarm_severity(&self, pv_name: &str) -> Option<i32> {
         // apply the caller's own parsed `sevr` mode and resolve the
         // caller's own monitor variant. Pre-fix this called
@@ -709,7 +713,7 @@ impl PvaLinkResolver {
         // `config.sevr` and monitor variant belong to an arbitrary other
         // caller. pvxs `pvaLinkConfig` is per-link and the channel is
         // keyed by `(channelName, pvRequest)`
-        // (`pvxs/ioc/pvalink.h:65,115-120`).
+        // (`pvxs/ioc/pvalink.h:65,116-120`).
         let full = strip_scheme(pv_name)?;
         let bare = link_pv_name(full);
         if full != bare {
@@ -725,7 +729,7 @@ impl PvaLinkResolver {
     /// Wait until the link for `pv_name` has received at least one
     /// monitor event (i.e., the cached value is populated). Returns
     /// `false` on timeout. Mirrors pvxs
-    /// `testqsrvWaitForLinkConnected` (pvalink.cpp:131) — the
+    /// `testqsrvWaitForLinkConnected` (pvxs/ioc/pvalink.cpp:131) — the
     /// canonical test helper for "wait for the upstream IOC to come
     /// online before continuing".
     pub async fn wait_for_link_connected(
@@ -758,9 +762,9 @@ impl PvaLinkResolver {
     /// reason: this closure runs on the record-processing thread with the
     /// record's advisory gate held. C `dbCaGetLink` reads `pca->pgetNative`
     /// under `pca->lock` and returns -1 while the link is down
-    /// (`dbCa.c:448-535`, `:459-464`); it never waits for the wire. A miss
+    /// (`dbCa.c:419-506`, `:430-435`); it never waits for the wire. A miss
     /// therefore stages the open on the pvalink runtime — C `dbCaAddLink`'s
-    /// `addAction(pca, CA_CONNECT)` (`dbCa.c:735-800`) — and reports `None`
+    /// `addAction(pca, CA_CONNECT)` (`dbCa.c:393`) — and reports `None`
     /// for this cycle, so the reading record takes LINK/INVALID until the
     /// monitor cache is warm.
     pub fn build_resolver(self) -> ExternalPvResolver {
@@ -809,7 +813,7 @@ impl PvaLinkResolver {
                 }
                 // Open but the first monitor event has not landed. C's
                 // `!pca->gotInNative` arm returns without a value
-                // (`dbCa.c:465-470`).
+                // (`dbCa.c:459-464`).
                 return None;
             }
 
@@ -818,7 +822,7 @@ impl PvaLinkResolver {
             // `open_link` keeps its options (`sevr`, `Q`, `pipeline`,
             // `monorder`); `default_inp_cfg` would discard them.
             let registry = resolver.registry.clone();
-            task::spawn(async move {
+            resolver.reactor.spawn(async move {
                 let _ = registry.get_or_open(cfg).await;
             });
             None
@@ -840,7 +844,7 @@ impl PvaLinkResolver {
 /// `eprintln!` rather than `tracing::warn!` deliberately, on two grounds:
 /// pvxs reports the same class of init-time link refusal with
 /// `fprintf(stderr, "%s Error: local:true link to '%s' can't be fulfilled\n")`
-/// (`ioc/pvalink_lset.cpp:70-76`), and the sibling QSRV group loader in this
+/// (`ioc/pvalink_lset.cpp:71-72`), and the sibling QSRV group loader in this
 /// crate already reports config-load failures the same way
 /// (`qsrv/group_config.rs`, `qsrv/provider.rs:1071`). It is also the only
 /// path that reaches an RTEMS console: the target installs no `tracing`
@@ -868,9 +872,12 @@ fn report_open_failure(
 /// also pre-registers pvalink options and CP/CPP scan targets
 /// for every loaded DB record that carries a JSON-object pvalink with
 /// options. pvxs equivalent: options live on the `jlink` struct for
-/// the lifetime of the link (pvalink_jlif.cpp).
+/// the lifetime of the link (pvxs/ioc/pvalink_jlif.cpp).
 pub async fn install_pvalink_resolver(db: &Arc<PvDatabase>) -> PvaLinkResolver {
-    let resolver = PvaLinkResolver::new();
+    let resolver = PvaLinkResolver::new(
+        epics_base_rs::runtime::task::Reactor::current()
+            .expect("install_pvalink_resolver is awaited on the IOC's reactor"),
+    );
     // B3: give the resolver the DB handle so the scan-on-update
     // forwarder can process owning records.
     resolver.attach_database((**db).clone());
@@ -889,9 +896,9 @@ pub async fn install_pvalink_resolver(db: &Arc<PvDatabase>) -> PvaLinkResolver {
     // `record_link_fields` also yields `FLNK`, and this scan must see it:
     // pvxs installs a pvaLink on a forward link exactly as on an input or
     // output one. `dbInitLink` hands a `JSON_LINK` to `dbJLinkInit`
-    // (`dbLink.c:107-111`) *before* any `dbfType` discrimination, `pva_lset`
+    // (`dbLink.c:107-110`) *before* any `dbfType` discrimination, `pva_lset`
     // supplies the `DBF_FWDLINK` entry point `pvaScanForward`
-    // (`pvxs/ioc/pvalink_lset.cpp:680-694`), and pvxs' own test helper accepts
+    // (`pvxs/ioc/pvalink_lset.cpp:672-688`), and pvxs' own test helper accepts
     // `DBF_FWDLINK` as a pvalink field (`pvxs/ioc/pvalink.cpp:117-127`).
     //
     // An `FLNK` takes the non-`OUT` arm below on purpose even though a pvxs
@@ -909,16 +916,16 @@ pub async fn install_pvalink_resolver(db: &Arc<PvDatabase>) -> PvaLinkResolver {
                 // form (`TARGET MS`, `TARGET CPP`).
                 //
                 // A BARE PV (no query, no modifiers) is opened here too.
-                // pvxs `pvaOpenLink` (`pvalink_lset.cpp:64-137`) creates and
+                // `pvaOpenLink` (`pvxs/ioc/pvalink_lset.cpp:63-137`) creates and
                 // opens a `pvaLinkChannel` for EVERY pvalink at link-init —
                 // both directions, options or not; the one early-out is an
-                // empty channel name (`:98`). Skipping bare links because
+                // empty channel name (`:96-97`). Skipping bare links because
                 // "there are no options to pre-register" conflated *carrying
                 // options* with *needing a channel*, and the missing channel
                 // is load-bearing on the OUT side: `PvaLink::open` starts the
                 // OUT connection-tracking monitor, and the non-retry write
                 // gate refuses a put while `is_connected()` is false
-                // (pvxs `valid() == connected && root`, `pvalink_link.cpp:69`).
+                // (`valid() == connected && root`, `pvxs/ioc/pvalink_link.cpp:69`).
                 // Opening lazily on the first put therefore DROPPED that put.
                 // Measured on the RTEMS target, stage 5:
                 // `record(ao,"RTEMS:PVA:UPLNK"){field(OUT,"{pva:{pv:'UPSTREAM:AO'}}")}`
@@ -1000,7 +1007,7 @@ async fn run_notify_forwarder(
     // After each pass, drain any coalesced overruns: when the bounded
     // queue filled, the monitor task armed `scan_overrun` instead of
     // dropping the event (EPICS `db_queue_event_log`,
-    // `dbEvent.c:808-826`) — each armed flag owes one more scan with the
+    // `dbEvent.c:812-827`) — each armed flag owes one more scan with the
     // latest cached value, so a saturated queue never silently skips a
     // CP/CPP process. The queue was full when the flag was set, so the
     // backlog `recv` already woke this task (no lost wakeup), matching
@@ -1029,7 +1036,7 @@ async fn run_notify_forwarder(
 /// [`run_notify_forwarder`]).
 /// CPP passive gate + PACT pre-check for one scan target, evaluated
 /// under the target's write lock — pvxs `ScanTrack::scan`
-/// (`pvalink_channel.cpp:313-323`). Returns `true` if the record should
+/// (`pvxs/ioc/pvalink_channel.cpp:313-323`). Returns `true` if the record should
 /// be processed now, `false` if it was gated out:
 ///   - a `CPP` (`passive_only`) target whose SCAN is not Passive is
 ///     skipped (pvxs `check_passive && prec->scan != 0`); a non-zero
@@ -1090,8 +1097,8 @@ async fn scan_once(
 
     // pvxs builds a `DBManyLock` over every atomic
     // scan-on-update target record and holds a `DBManyLocker`
-    // across the whole atomic scan (`pvxs/ioc/pvalink_channel.cpp:386`
-    // and `:422`). Acquire the database-level multi-record epoch
+    // across the whole atomic scan (`pvxs/ioc/pvalink_channel.cpp:409`
+    // and `:422-427`). Acquire the database-level multi-record epoch
     // lock over the atomic target set *before* scanning any of
     // them, and hold it across the whole atomic group, so a
     // direct writer, another scan, or an atomic sibling cannot
@@ -1128,7 +1135,7 @@ async fn scan_once(
     // `Option` as live across the non-atomic `.await` regardless.
     {
         // Atomic phase. Zero `.await`s below this line while the epoch is
-        // held (`doc/rtems-priority-locks-design.md` §1.1 H7, §5 step 6).
+        // held.
         let _atomic_epoch = if atomic_records.is_empty() {
             None
         } else {
@@ -1253,12 +1260,12 @@ impl LinkSet for PvaLinkResolver {
         pvfield_to_epics_value(&value)
     }
 
-    /// C `dbCaGetLink` (`dbCa.c:448-535`) — the monitor-fed cache only.
+    /// C `dbCaGetLink` (`dbCa.c:419-506`) — the monitor-fed cache only.
     /// This is [`Self::get_value`]'s fast path (`integration.rs:1155-1166`)
     /// without the `get_or_open` + `read_with_field` slow path, so the
     /// record-processing read cannot suspend on a PVA connect or GET round
     /// trip. pvxs reads the same way: `pvaGetValue` serves the monitor
-    /// snapshot the channel task refreshed (`pvalink_lset.cpp:199-236`).
+    /// snapshot the channel task refreshed (`pvxs/ioc/pvalink_lset.cpp:199-240`).
     fn get_cached_value(&self, name: &str) -> Option<EpicsValue> {
         if !self.is_enabled() {
             return None;
@@ -1278,7 +1285,7 @@ impl LinkSet for PvaLinkResolver {
         pvfield_to_epics_value(&value)
     }
 
-    /// C `dbCaAddLink`'s `CA_CONNECT` (`dbCa.c:735-800`): open the monitor so
+    /// C `dbCaAddLink`'s `CA_CONNECT` (`dbCa.c:393`): open the monitor so
     /// later cached reads have something to serve. Runs on the database's
     /// link work owner, never on a record-processing thread.
     async fn connect_link(&self, name: &str) {
@@ -1296,7 +1303,7 @@ impl LinkSet for PvaLinkResolver {
     }
 
     /// C `dbCaPutLinkCallback`'s `if (!pca->isConnected || !pca->hasWriteAccess)
-    /// return -1;` (`dbCa.c:558-561`), answered from cached state only — the
+    /// return -1;` (`dbCa.c:529-532`), answered from cached state only — the
     /// database asks this on the record-processing thread, inside the
     /// record's advisory write gate.
     ///
@@ -1307,8 +1314,8 @@ impl LinkSet for PvaLinkResolver {
     /// healthy channel. An OUT `PvaLink` tracks its connection through its
     /// own liveness monitor — pvxs runs a monitor on every channel, INP and
     /// OUT alike, to maintain `lchan->connected`
-    /// (`pvalink_channel.cpp:342-363`), and gates the write on
-    /// `valid() = connected && root` (`pvalink_lset.cpp:609`).
+    /// (`pvxs/ioc/pvalink_channel.cpp:342-363`), and gates the write on
+    /// `valid() = connected && root` (`pvxs/ioc/pvalink_lset.cpp:609`).
     ///
     /// A link never opened reports `Unopened` so the write is still staged
     /// and `put_value`'s lazy `get_or_open` performs the open; pvxs opens at
@@ -1329,7 +1336,7 @@ impl LinkSet for PvaLinkResolver {
         }
         let cfg = self.out_cfg_for(full);
         // pvxs gates the write on `if(!self->retry && !self->valid())`
-        // (`pvalink_lset.cpp:609`): a `retry` link deliberately skips the
+        // (`pvxs/ioc/pvalink_lset.cpp:609`): a `retry` link deliberately skips the
         // connection gate and queues for replay on reconnect. Refusing it
         // here would delete that whole mechanism, so a retry link is always
         // admitted and `flush_scratch` owns its disconnect handling.
@@ -1415,23 +1422,24 @@ impl LinkSet for PvaLinkResolver {
         .await
     }
 
-    /// C `dbCa.c:643-648` `scanForward`: the FWD link is a
+    /// C `dbCa.c:614-619` `scanForward`: the FWD link is a
     /// `dbCaPutLink(plink, DBR_SHORT, &fwdLinkValue, 1)`, i.e. it stages a
-    /// `CA_WRITE_NATIVE` action and **returns** — the upstream round trip
-    /// is the `dbCaTask`'s work, never the record thread's. The gate before
-    /// staging is C's `if (!pca->isConnected) return -1` (`dbCa.c:558-561`),
-    /// which pvxs surfaces as `pvaScanForward`'s `is_connected` check
-    /// (`pvalink_lset.cpp:685`); a link this resolver has never opened is
-    /// staged for open here and refused for this cycle, exactly as a cache
-    /// miss on the value-read path is.
+    /// `CA_WRITE_NATIVE` action and **returns** — the upstream round trip is
+    /// the `dbCaTask`'s work, never the record thread's. The gate before
+    /// staging is C's
+    /// `if (!pca->isConnected || !pca->hasWriteAccess) return -1`
+    /// (`dbCa.c:529-532`), which pvxs surfaces as `pvaScanForward`'s
+    /// `is_connected` check (`pvxs/ioc/pvalink_lset.cpp:677-680`); a link this
+    /// resolver has never opened is staged for open here and refused for this
+    /// cycle, exactly as a cache miss on the value-read path is.
     ///
     /// Both refusals return `Err`, which `dbScanFwdLink`'s caller turns into
     /// LINK/INVALID on the source record — pvxs's `recGblSetSevrMsg(...,
-    /// "Disconn")` at `pvalink_lset.cpp:686`. A failure of the spawned put
+    /// "Disconn")` at `pvxs/ioc/pvalink_lset.cpp:678`. A failure of the spawned put
     /// itself stays a console diagnostic and raises no alarm, because pvxs's
     /// is one too: `linkPutDone` reports it with `errlogPrintf` and carries
     /// an explicit `// TODO: signal INVALID_ALARM ?`
-    /// (`pvalink_channel.cpp:185-195`).
+    /// (`pvxs/ioc/pvalink_channel.cpp:192-195`).
     fn scan_forward(&self, name: &str) -> Result<(), String> {
         if !self.is_enabled() {
             return Err("pvalink disabled".into());
@@ -1443,7 +1451,7 @@ impl LinkSet for PvaLinkResolver {
         // lazily register per-link options from the query string; a
         // forward link shares the same monitor-backed channel a value
         // INP link would open (pvxs's `pvaLinkChannel` always monitors —
-        // `pvalink_channel.cpp`), which is what `is_connected` checks.
+        // `pvxs/ioc/pvalink_channel.cpp`), which is what `is_connected` checks.
         if full != bare {
             lazy_register_inp_opts(&self.link_options, full);
         }
@@ -1455,17 +1463,23 @@ impl LinkSet for PvaLinkResolver {
             // Never opened. Stage the open off the record thread (C's
             // `CA_CONNECT`) and refuse this cycle.
             let registry = self.registry.clone();
-            task::spawn(async move {
+            self.reactor.spawn(async move {
                 let _ = registry.get_or_open(cfg).await;
             });
             return Err(format!("pvalink forward link '{name}' is not open yet"));
         };
-        if !link.is_connected() {
+        // pvxs `pvaScanForward`'s gate is `if(!self->retry &&
+        // !self->valid())` (`pvxs/ioc/pvalink_lset.cpp:677`), and this synchronous
+        // refusal is what stands in for its `recGblSetSevrMsg(LINK_ALARM,
+        // INVALID_ALARM, "Disconn")`. `retry` is read off the link itself,
+        // matching `self->retry`; a retry link falls through and the put
+        // is held by the client until the channel connects.
+        if !link.config().retry && !link.is_connected() {
             return Err(format!("pvalink forward link '{name}' is not connected"));
         }
-        // Staged, signalled, returned — `dbCa.c:622-624`.
+        // Staged, signalled, returned — `dbCa.c:593-595`.
         let channel = bare.to_string();
-        task::spawn(async move {
+        self.reactor.spawn(async move {
             if let Err(e) = link.scan_forward().await {
                 // pvxs `linkPutDone`: `errlogPrintf("%s PVA link put ERROR:
                 // %s\n", key.first, e.what())` — named channel, console
@@ -1515,12 +1529,12 @@ impl LinkSet for PvaLinkResolver {
         let cfg = self.inp_cfg_for(full);
         let sevr = cfg.sevr;
         let field = cfg.field.clone();
-        // Cache-only: C's `getAttributes` family reads `pca->...` and never
-        // creates a channel (`dbCa.c:662-704`); pvxs's metadata getters read
-        // the cached NT value under the channel lock
-        // (`pvalink_lset.cpp:199-254`). The open is staged by the value-read
-        // path / `connect_link` on the link work owner, never here — this runs
-        // on the record thread inside the record's advisory write gate.
+        // Cache-only: C's `getAttributes` family reads `pca->...` and never creates
+        // a channel (`dbCa.c:633-675`); pvxs's metadata getters read the cached NT
+        // value under the channel lock (`pvxs/ioc/pvalink_lset.cpp:199-257`). The
+        // open is staged by the value-read path / `connect_link` on the link work
+        // owner, never here — this runs on the record thread inside the record's
+        // advisory write gate.
         let link = self
             .registry
             .try_get_inp(bare, cfg.pipeline, cfg.queue_size)?;
@@ -1543,12 +1557,12 @@ impl LinkSet for PvaLinkResolver {
         let cfg = self.inp_cfg_for(full);
         let sevr = cfg.sevr;
         let field = cfg.field.clone();
-        // Cache-only: C's `getAttributes` family reads `pca->...` and never
-        // creates a channel (`dbCa.c:662-704`); pvxs's metadata getters read
-        // the cached NT value under the channel lock
-        // (`pvalink_lset.cpp:199-254`). The open is staged by the value-read
-        // path / `connect_link` on the link work owner, never here — this runs
-        // on the record thread inside the record's advisory write gate.
+        // Cache-only: C's `getAttributes` family reads `pca->...` and never creates
+        // a channel (`dbCa.c:633-675`); pvxs's metadata getters read the cached NT
+        // value under the channel lock (`pvxs/ioc/pvalink_lset.cpp:199-257`). The
+        // open is staged by the value-read path / `connect_link` on the link work
+        // owner, never here — this runs on the record thread inside the record's
+        // advisory write gate.
         let link = self
             .registry
             .try_get_inp(bare, cfg.pipeline, cfg.queue_size)?;
@@ -1560,7 +1574,7 @@ impl LinkSet for PvaLinkResolver {
         // (`dbGetAlarm`/`dbGetAlarmMsg`). Unlike `alarm_severity`, this
         // applies NO `sevr` gate — a default `NMS` link still reports
         // its remote severity here. pvxs `pvaGetAlarmMsg`
-        // (`pvalink_lset.cpp:542-575`) reads the snapshot directly. The
+        // (`pvxs/ioc/pvalink_lset.cpp:542-569`) reads the snapshot directly. The
         // per-link `field` still selects the metadata root, matching the
         // value/alarm getters.
         let full = strip_scheme(name)?;
@@ -1570,12 +1584,12 @@ impl LinkSet for PvaLinkResolver {
         }
         let cfg = self.inp_cfg_for(full);
         let field = cfg.field.clone();
-        // Cache-only: C's `getAttributes` family reads `pca->...` and never
-        // creates a channel (`dbCa.c:662-704`); pvxs's metadata getters read
-        // the cached NT value under the channel lock
-        // (`pvalink_lset.cpp:199-254`). The open is staged by the value-read
-        // path / `connect_link` on the link work owner, never here — this runs
-        // on the record thread inside the record's advisory write gate.
+        // Cache-only: C's `getAttributes` family reads `pca->...` and never creates
+        // a channel (`dbCa.c:633-675`); pvxs's metadata getters read the cached NT
+        // value under the channel lock (`pvxs/ioc/pvalink_lset.cpp:199-257`). The
+        // open is staged by the value-read path / `connect_link` on the link work
+        // owner, never here — this runs on the record thread inside the record's
+        // advisory write gate.
         let link = self
             .registry
             .try_get_inp(bare, cfg.pipeline, cfg.queue_size)?;
@@ -1602,18 +1616,18 @@ impl LinkSet for PvaLinkResolver {
         let cfg = self.inp_cfg_for(full);
         let want_time = cfg.time;
         let field = cfg.field.clone();
-        // Cache-only: C's `getAttributes` family reads `pca->...` and never
-        // creates a channel (`dbCa.c:662-704`); pvxs's metadata getters read
-        // the cached NT value under the channel lock
-        // (`pvalink_lset.cpp:199-254`). The open is staged by the value-read
-        // path / `connect_link` on the link work owner, never here — this runs
-        // on the record thread inside the record's advisory write gate.
+        // Cache-only: C's `getAttributes` family reads `pca->...` and never creates
+        // a channel (`dbCa.c:633-675`); pvxs's metadata getters read the cached NT
+        // value under the channel lock (`pvxs/ioc/pvalink_lset.cpp:199-257`). The
+        // open is staged by the value-read path / `connect_link` on the link work
+        // owner, never here — this runs on the record thread inside the record's
+        // advisory write gate.
         let link = self
             .registry
             .try_get_inp(bare, cfg.pipeline, cfg.queue_size)?;
         // only adopt the upstream timestamp when this caller's
         // link was configured with `time=true`. pvxs
-        // `pvalink_lset.cpp:427` copies the latched remote NT
+        // `pvxs/ioc/pvalink_lset.cpp:433-435` copies the latched remote NT
         // timestamp into the owning record only when this flag is
         // set; otherwise the owning record keeps its locally-stamped
         // processing time.
@@ -1626,8 +1640,9 @@ impl LinkSet for PvaLinkResolver {
     fn link_metadata(&self, name: &str) -> Option<epics_base_rs::server::database::LinkMetadata> {
         // surface the remote display/control/valueAlarm
         // metadata, DBF type and element count through the DB link
-        // API, mirroring the pvxs pvalink lset metadata getter set
-        // installed at `pvxs/ioc/pvalink_lset.cpp:700`. Reads the
+        // API, mirroring the pvxs pvalink lset metadata getter set —
+        // the `&pvaGetControlLimits` … `&pvaGetUnits` slots of
+        // `pva_lset` (`pvxs/ioc/pvalink_lset.cpp:715-719`). Reads the
         // cached NT value — no fresh GET — exactly as the pvxs
         // getters read `fld_meta` / `fld_value` under the channel
         // lock.
@@ -1646,12 +1661,12 @@ impl LinkSet for PvaLinkResolver {
         }
         let cfg = self.inp_cfg_for(full);
         let field = cfg.field.clone();
-        // Cache-only: C's `getAttributes` family reads `pca->...` and never
-        // creates a channel (`dbCa.c:662-704`); pvxs's metadata getters read
-        // the cached NT value under the channel lock
-        // (`pvalink_lset.cpp:199-254`). The open is staged by the value-read
-        // path / `connect_link` on the link work owner, never here — this runs
-        // on the record thread inside the record's advisory write gate.
+        // Cache-only: C's `getAttributes` family reads `pca->...` and never creates
+        // a channel (`dbCa.c:633-675`); pvxs's metadata getters read the cached NT
+        // value under the channel lock (`pvxs/ioc/pvalink_lset.cpp:199-257`). The
+        // open is staged by the value-read path / `connect_link` on the link work
+        // owner, never here — this runs on the record thread inside the record's
+        // advisory write gate.
         let link = self
             .registry
             .try_get_inp(bare, cfg.pipeline, cfg.queue_size)?;
@@ -1753,7 +1768,7 @@ fn link_pv_name(s: &str) -> &str {
 ///
 /// keyed by `full` (not bare PV name) so two links to the
 /// same PV with different options each get their own entry.
-/// pvxs parity: pvalink_jlif.cpp:24-196.
+/// pvxs parity: pvxs/ioc/pvalink_jlif.cpp:69-196.
 ///
 /// A structured-JSON identity key (`PV<SEP>k=kind:v…`) is NEVER
 /// lazy-registered here: it is always pre-registered at link-open time
@@ -1858,14 +1873,14 @@ fn is_array_value(value: &EpicsValue) -> bool {
 fn pvfield_to_epics_value(field: &PvField) -> Option<EpicsValue> {
     // Follow a selected union / non-empty variant to its concrete member
     // before conversion — pvxs `value.lookup("->")` for an Any/Union
-    // value (`pvalink_lset.cpp:278-279`). The standard NTNDArray carries
+    // value (`pvxs/ioc/pvalink_lset.cpp:278-279`). The standard NTNDArray carries
     // its pixels in a discriminated union `value` member; without this an
     // INP pvalink pointed at an NTNDArray reported no usable value.
     // Idempotent on plain scalars/arrays/structures.
     match field.deref_selected() {
         PvField::Scalar(sv) => Some(scalar_to_epics(sv)),
         PvField::Structure(s) => {
-            // NTEnum (pvxs `pvalink_lset.cpp:331`, gated on
+            // NTEnum (`pvxs/ioc/pvalink_lset.cpp:331`, gated on
             // `value.id()=="enum_t"`): the value lives in the `index`
             // int of the `enum_t` sub-structure, never a `value`
             // scalar. The generic `value`-child collapse below would
@@ -1883,14 +1898,14 @@ fn pvfield_to_epics_value(field: &PvField) -> Option<EpicsValue> {
                         EpicsValue::Enum(v) => v,
                         other => other.to_f64().map(|f| f as u16).unwrap_or(0),
                     };
-                    // pvxs `pvaGetValue` reads the sibling `choices`
-                    // string[] alongside `index` (`pvalink_lset.cpp:344-356`)
-                    // so a later type-aware `put_field` can store the
-                    // label on a DBR_STRING target or the index on a
-                    // numeric one. The resolver boundary is dbrType-blind,
-                    // so carry both through `EnumWithChoices`; an
-                    // absent/empty `choices` makes the string-target path
-                    // fall back to the "%u" index form.
+                    // pvxs `pvaGetValue` reads the sibling `choices` string[]
+                    // alongside `index` (`pvxs/ioc/pvalink_lset.cpp:344-356`)
+                    // so a later type-aware `put_field` can store the label on
+                    // a DBR_STRING target or the index on a numeric one. The
+                    // resolver boundary is dbrType-blind, so carry both
+                    // through `EnumWithChoices`; an absent/empty `choices`
+                    // makes the string-target path fall back to the "%u" index
+                    // form.
                     let choices = match s.get_field("choices") {
                         Some(PvField::ScalarArray(arr)) => arr
                             .iter()
@@ -1912,7 +1927,7 @@ fn pvfield_to_epics_value(field: &PvField) -> Option<EpicsValue> {
             None
         }
         PvField::ScalarArray(arr) => {
-            // pvxs `pvalink_lset.cpp:287` handles every pvData
+            // `pvxs/ioc/pvalink_lset.cpp:287` handles every pvData
             // scalar-array variant (signed/unsigned 8/16/32/64-bit,
             // float32/float64, bool, string). Mirror that coverage so
             // an INP pvalink can read any waveform the upstream serves.
@@ -2000,7 +2015,7 @@ fn pvfield_to_epics_value(field: &PvField) -> Option<EpicsValue> {
                 // same width-preserving contract `long[] => Int64Array`
                 // / `ulong[] => UInt64Array` use here (pvxs routes
                 // DBR_ULONG arrays through `ArrayType::UInt32`,
-                // `pvxs/ioc/pvalink_lset.cpp:287-325`).
+                // `pvxs/ioc/pvalink_lset.cpp:287-328`).
                 ScalarValue::UInt(_) => Some(EpicsValue::Int64Array(
                     arr.iter()
                         .filter_map(|s| {
@@ -2139,7 +2154,7 @@ fn scalar_to_epics(sv: &ScalarValue) -> EpicsValue {
         // a remote PVA `uint` is unsigned 32-bit and the link
         // advertises DBF_ULONG metadata (`link.rs` `ScalarValue::UInt
         // => LinkDbfType::ULong`, mirroring pvxs `pvaGetDBFtype`
-        // `TypeCode::UInt32 => DBF_ULONG`, `pvxs/ioc/pvalink_lset.cpp:215-223`).
+        // `TypeCode::UInt32 => DBF_ULONG`, `pvxs/ioc/pvalink_lset.cpp:222`).
         // Carrying it as `EpicsValue::Long` (i32) sign-casts any value
         // above i32::MAX (e.g. 0x8000_0000 → -2147483648), so the
         // record would consume a negative value the unsigned metadata
@@ -2203,7 +2218,7 @@ mod tests {
         nt.fields.push(("value".into(), PvField::Structure(enum_t)));
         // The carrier keeps BOTH the index and the choice labels so the
         // consumer (`convert_to`) can copy the label on a DBR_STRING target
-        // (pvxs `pvalink_lset.cpp:330-360`, `case DBR_STRING`) while every
+        // (`pvxs/ioc/pvalink_lset.cpp:331-363`, `case DBR_STRING`) while every
         // numeric target still gets the index.
         assert_eq!(
             pvfield_to_epics_value(&PvField::Structure(nt)),
@@ -2227,7 +2242,7 @@ mod tests {
 
     /// An NTNDArray `value` is a discriminated union; conversion must
     /// follow it to its active member (pvxs `value.lookup("->")`,
-    /// `pvalink_lset.cpp:278-279`). Pre-fix a `PvField::Union` hit the
+    /// `pvxs/ioc/pvalink_lset.cpp:278-279`). Pre-fix a `PvField::Union` hit the
     /// catch-all and returned `None`, so an INP pvalink on an NTNDArray
     /// reported no usable value.
     #[test]
@@ -2395,7 +2410,7 @@ mod tests {
     /// unsigned metadata. It must now widen losslessly to `Int64` /
     /// `Int64Array` (pvxs maps `TypeCode::UInt32 => DBF_ULONG` and routes
     /// the arrays through `ArrayType::UInt32`,
-    /// `pvxs/ioc/pvalink_lset.cpp:215-223`, `:287-325`).
+    /// `pvxs/ioc/pvalink_lset.cpp:222`, `:287-328`).
     #[test]
     fn inp_uint_preserves_unsigned_value_above_i32_max() {
         use epics_pva_rs::pvdata::TypedScalarArray;
@@ -2531,7 +2546,7 @@ mod tests {
 
     /// PACT pre-check: a CP scan onto a target already processing async
     /// (PACT) must set `rpro = true` and NOT re-process it, mirroring
-    /// pvxs `ScanTrack::scan` (`pvalink_channel.cpp:316-323`,
+    /// pvxs `ScanTrack::scan` (`pvxs/ioc/pvalink_channel.cpp:313-325`,
     /// `else if (prec->pact) { prec->rpro = TRUE; }`). Pre-fix the scan
     /// drove the PACT target through the `dbProcess` entry guard, which
     /// bumps LCNT toward SCAN_ALARM and never sets RPRO — so a fast
@@ -2595,7 +2610,7 @@ mod tests {
         );
     }
 
-    /// Attach-time scan (pvxs `pvalink_lset.cpp:148-167`): attaching a
+    /// Attach-time scan (`pvxs/ioc/pvalink_lset.cpp:148-167`): attaching a
     /// record to an ALREADY-connected, reused monitor variant fires one
     /// immediate scan, so the record does not stay unprocessed until the
     /// next upstream update. Reuse is simulated by seeding the registry
@@ -2615,7 +2630,7 @@ mod tests {
         .await
         .unwrap();
 
-        let resolver = PvaLinkResolver::new();
+        let resolver = PvaLinkResolver::new(crate::test_reactor());
         resolver.attach_database(db);
 
         // A connected, already-open CP monitor variant for SRC.
@@ -2663,7 +2678,7 @@ mod tests {
         .await
         .unwrap();
 
-        let resolver = PvaLinkResolver::new();
+        let resolver = PvaLinkResolver::new(crate::test_reactor());
         resolver.attach_database(db);
 
         let cfg = PvaLinkConfig {
@@ -2822,7 +2837,7 @@ mod tests {
     /// record processes the upstream disconnect (and can expose
     /// LINK_ALARM/INVALID). pvxs runs the same scan loop after the
     /// `catch(client::Disconnect&)` branch as after a value update
-    /// (`pvxs/ioc/pvalink_channel.cpp:359-373` + `:420-432`).
+    /// (`pvxs/ioc/pvalink_channel.cpp:360-373` + `:422-432`).
     ///
     /// Pre-fix the forwarder channel carried only `PvField` values, so
     /// a disconnect produced no event and the record was never
@@ -2975,7 +2990,7 @@ mod tests {
     /// target and retains its parsed options (B2 `sevr` included).
     #[tokio::test]
     async fn b3_open_link_for_record_registers_scan_target() {
-        let resolver = PvaLinkResolver::new();
+        let resolver = PvaLinkResolver::new(crate::test_reactor());
         // proc=CP → scan_on_update; sevr=MS exercised together.
         let _ = resolver
             .open_link_for_record("pva://SRC:PV?proc=CP&sevr=MS", "MY:REC")
@@ -2999,7 +3014,7 @@ mod tests {
     /// register a scan target — only CP/CPP fan out.
     #[tokio::test]
     async fn b3_non_cp_link_registers_no_scan_target() {
-        let resolver = PvaLinkResolver::new();
+        let resolver = PvaLinkResolver::new(crate::test_reactor());
         let _ = resolver
             .open_link_for_record("pva://OTHER:PV?proc=NPP", "REC2")
             .await;
@@ -3011,7 +3026,7 @@ mod tests {
     /// key is the full query-bearing string, not the bare PV name.
     #[tokio::test]
     async fn b2_open_link_retains_sevr_mode() {
-        let resolver = PvaLinkResolver::new();
+        let resolver = PvaLinkResolver::new(crate::test_reactor());
         let _ = resolver.open_link("pva://A:PV?sevr=MSI").await;
         // look up by the full link string (with query) — that is the key.
         let cfg = resolver.inp_cfg_for("A:PV?sevr=MSI").clone();
@@ -3029,7 +3044,7 @@ mod tests {
     /// `link_names → is_connected` identity contract still holds.
     #[tokio::test]
     async fn fr15_link_names_reports_opened_inp_pvs_queryable_by_is_connected() {
-        let resolver = PvaLinkResolver::new();
+        let resolver = PvaLinkResolver::new(crate::test_reactor());
 
         // A connected INP link (for_test seeds a cached value, so
         // is_connected() reads true), a pending INP link (no value yet),
@@ -3245,7 +3260,7 @@ mod tests {
     /// The install scan opens a channel for a link that carries NO
     /// options, in both directions.
     ///
-    /// pvxs `pvaOpenLink` (`pvalink_lset.cpp:64-137`) creates and opens a
+    /// pvxs `pvaOpenLink` (`pvxs/ioc/pvalink_lset.cpp:63-137`) creates and opens a
     /// `pvaLinkChannel` for every pvalink at link-init; the only early-out
     /// is an empty channel name. This scan used to skip any link whose
     /// verbatim string equalled its bare PV name, on the reasoning that
@@ -3256,8 +3271,8 @@ mod tests {
     /// put while `is_connected()` is false, so the first put through a
     /// lazily-opened OUT link was always discarded.
     ///
-    /// Measured on the RTEMS target (stage 5, `doc/pvalink-rtems-design.md`
-    /// §5): `field(OUT,"{pva:{pv:'UPSTREAM:AO'}}")` — a pv-only longhand
+    /// Measured on the RTEMS target (stage 5):
+    /// `field(OUT,"{pva:{pv:'UPSTREAM:AO'}}")` — a pv-only longhand
     /// parses to a plain `Pva` — never appeared in `channel_diagnostics()`.
     #[tokio::test]
     async fn install_scan_opens_option_less_links_in_both_directions() {
@@ -3321,7 +3336,7 @@ mod tests {
     /// `x`, `x.`, `x.VAL`, `x.NAME`, `x.INP`
     /// (`modules/database/test/ioc/db/dbChannelTest.c:175-179`); pvxs
     /// gates the option through that same channel parser
-    /// (`ioc/pvalink_lset.cpp:63-75`).
+    /// (`ioc/pvalink_lset.cpp:69-75`).
     #[tokio::test]
     async fn b4_local_link_accepts_record_field() {
         use epics_base_rs::server::records::ai::AiRecord;
@@ -3377,7 +3392,7 @@ mod tests {
     /// An OUT link with `local=true` to
     /// a PV not served by this IOC must be rejected at open time, exactly
     /// like the INP path. pvxs applies `pvaLinkConfig::local` inside
-    /// `pvaOpenLink()` for every direction (`ioc/pvalink_lset.cpp:69-74`);
+    /// `pvaOpenLink()` for every direction (`ioc/pvalink_lset.cpp:69-75`);
     /// before this fix the OUT open path stored the options and opened the
     /// remote channel without ever evaluating `local`.
     #[tokio::test]
@@ -3473,7 +3488,7 @@ mod tests {
     /// modifier, an empty `{}` filter, and a `{json:true}` filter all
     /// still resolve the underlying record field. Mirrors
     /// `dbChannelTest("x.NAME$")`, `dbChannelTest("x.{}")`,
-    /// `dbChannelTest("x.VAL{json:true}")` (`dbChannelTest.c:183-186`).
+    /// `dbChannelTest("x.VAL{json:true}")` (`dbChannelTest.c:184-186`).
     #[tokio::test]
     async fn b4_local_link_accepts_field_modifiers() {
         use epics_base_rs::server::records::ai::AiRecord;
@@ -3573,9 +3588,9 @@ mod tests {
     /// name — the same path install_pvalink_resolver's pre-scanner follows
     /// for a loaded record.
     ///
-    /// Upstream parity: pvxs pvalink_jlif.cpp:24-196 (all pvalink JSON
+    /// Upstream parity: pvxs/ioc/pvalink_jlif.cpp:69-196 (all pvalink JSON
     /// keys parsed as JLink map keys / typed values and stored on the
-    /// jlink struct for the link's lifetime); :286-300 (no `?key=value`
+    /// jlink struct for the link's lifetime); :286-304 (no `?key=value`
     /// URI query parser exists in the JLink callback table).
     #[tokio::test]
     async fn br_r10_db_json_pvalink_options_preserved() {
@@ -3620,7 +3635,7 @@ mod tests {
         // Part 3: the integration layer wires the structured options
         // exactly as install_pvalink_resolver's pre-scanner does for a
         // loaded record carrying this PvaJson link.
-        let resolver = PvaLinkResolver::new();
+        let resolver = PvaLinkResolver::new(crate::test_reactor());
         let _ = resolver
             .open_json_link_for_record(&j.pv, &j.options, "MY:RECORD")
             .await;
@@ -3711,7 +3726,7 @@ mod tests {
 
         // Part 3: the integration layer registers options + scan target
         // for a suffix link exactly as it does for a query-bearing one.
-        let resolver = PvaLinkResolver::new();
+        let resolver = PvaLinkResolver::new(crate::test_reactor());
         let _ = resolver
             .open_link_for_record(&format!("pva://{stored}"), "MY:RECORD")
             .await;
@@ -3760,7 +3775,7 @@ mod tests {
     ///   pvxs/ioc/pvalink_link.cpp:91 — `root = lchan->root[fieldName]`
     #[tokio::test]
     async fn br_r27_pvalink_cache_separates_per_link_options() {
-        let resolver = PvaLinkResolver::new();
+        let resolver = PvaLinkResolver::new(crate::test_reactor());
 
         // Link A: read sub-field "alarm.severity", CPP (scan on passive).
         let link_a = "pva://TARGET:PV?field=alarm.severity&proc=CPP";
@@ -3838,7 +3853,7 @@ mod tests {
     async fn br_json_links_same_pv_distinct_options_do_not_collide() {
         use epics_base_rs::server::record::pvajson_identity_key;
 
-        let resolver = PvaLinkResolver::new();
+        let resolver = PvaLinkResolver::new(crate::test_reactor());
 
         // Link A: read "alarm.severity", CPP (scan on passive).
         let opts_a: Vec<(String, JlinkValue)> = vec![
@@ -3910,13 +3925,13 @@ mod tests {
 
     /// Structured-JSON links to the same PV that differ by `Q` are
     /// distinct monitor variants (distinct pvxs subscriptions,
-    /// `pvxs/ioc/pvalink.h:115-120`), exactly as the convenience-URI form
+    /// `pvxs/ioc/pvalink.h:116-120`), exactly as the convenience-URI form
     /// in [`Self::br128_distinct_q_variants_do_not_collapse`]. Their CP
     /// scan fan-outs must land in SEPARATE [`MonitorKey`] buckets even
     /// though both arrive through the JSON identity-key boundary.
     #[tokio::test]
     async fn br_json_distinct_q_variants_do_not_collapse() {
-        let resolver = PvaLinkResolver::new();
+        let resolver = PvaLinkResolver::new(crate::test_reactor());
 
         let opts_q1: Vec<(String, JlinkValue)> = vec![
             ("proc".to_string(), JlinkValue::Str("CP".to_string())),
@@ -3970,7 +3985,7 @@ mod tests {
     async fn br_json_out_links_same_pv_distinct_options_do_not_collide() {
         use epics_base_rs::server::record::pvajson_identity_key;
 
-        let resolver = PvaLinkResolver::new();
+        let resolver = PvaLinkResolver::new(crate::test_reactor());
 
         let opts_a: Vec<(String, JlinkValue)> =
             vec![("field".to_string(), JlinkValue::Str("a.b".to_string()))];
@@ -3994,7 +4009,7 @@ mod tests {
 
     /// Two records linking the SAME upstream
     /// PV with different `Q` are distinct monitor variants (distinct
-    /// pvxs subscriptions, `pvxs/ioc/pvalink.h:115-120`). Their CP scan
+    /// pvxs subscriptions, `pvxs/ioc/pvalink.h:116-120`). Their CP scan
     /// fan-out must land in SEPARATE [`MonitorKey`] buckets — pre-fix
     /// both collapsed onto one bare-PV-name entry, so a `Q=1` record
     /// could be driven by the `Q=64` monitor's events, and only one
@@ -4003,7 +4018,7 @@ mod tests {
     /// connection is awaited independently.
     #[tokio::test]
     async fn br128_distinct_q_variants_do_not_collapse() {
-        let resolver = PvaLinkResolver::new();
+        let resolver = PvaLinkResolver::new(crate::test_reactor());
 
         // Same PV, CP scan, but different queue depths → two variants.
         let _ = resolver
@@ -4065,13 +4080,13 @@ mod tests {
     /// identity must also separate variants — a default link and a
     /// `Q=1&pipeline=true` link to the same PV are distinct monitor
     /// channels (distinct pvRequest, `pvxs/ioc/pvalink_link.cpp:49-65`,
-    /// `pvxs/ioc/pvalink_lset.cpp:99-122`). Each must open its OWN
+    /// `pvxs/ioc/pvalink_lset.cpp:99-131`). Each must open its OWN
     /// cached link (its own monitor receiver) and register its scan
     /// fan-out under its own [`MonitorKey`], rather than the default
     /// link satisfying both reads and CP scans for the pipelined one.
     #[tokio::test]
     async fn br37_pipeline_variant_opens_its_own_monitor() {
-        let resolver = PvaLinkResolver::new();
+        let resolver = PvaLinkResolver::new(crate::test_reactor());
 
         // Default variant (no query options) and a pipelined Q=1 variant
         // of the SAME PV, both CP so each registers a scan target.
@@ -4193,7 +4208,7 @@ mod tests {
     /// a single locked scan epoch over the atomic target record set,
     /// so no other writer can interleave *between* the atomic
     /// targets. Mirrors pvxs `DBManyLocker L(atomic_lock)` held across
-    /// the atomic scan in `pvxs/ioc/pvalink_channel.cpp:422`.
+    /// the atomic scan in `pvxs/ioc/pvalink_channel.cpp:423`.
     ///
     /// The forwarder scans an atomic group {A, B}. The first atomic
     /// target (A) signals `epoch_entered` from inside its body — the
@@ -4333,7 +4348,7 @@ mod tests {
             .push(("timeStamp".into(), PvField::Structure(ts)));
         let cached = PvField::Structure(root);
 
-        let resolver = PvaLinkResolver::new();
+        let resolver = PvaLinkResolver::new(crate::test_reactor());
 
         // Seed the registry with a cached INP link whose own config
         // is the bare default: NMS, time=false, field="value".
@@ -4373,7 +4388,7 @@ mod tests {
         // any value read it is the pvxs initial INVALID_ALARM(3) /
         // LINK_ALARM(14) / blank (`pvxs/ioc/pvalink.h:250`) — exactly like
         // `dbGetAlarm` before the first `dbGetLink`
-        // (`pvxs/test/testpvalink.cpp:370-428`). The earlier
+        // (`pvxs/test/testpvalink.cpp:373-375`). The earlier
         // `alarm_severity` calls read the cached value live and do NOT
         // latch, so the snapshot is still INVALID here.
         let pre = LinkSet::remote_alarm(&resolver, nms_name)
@@ -4414,6 +4429,7 @@ mod tests {
         );
     }
 
+    #[cfg(tokio_backend)]
     /// an OUT pvalink fed by an `EpicsValue::UInt64Array`
     /// (from an `FTVL=UINT64` waveform) must go through the typed
     /// `ulong[]` encoder, not the scalar string-PUT path. Pre-fix the
@@ -4435,6 +4451,7 @@ mod tests {
         .await;
     }
 
+    #[cfg(tokio_backend)]
     /// an OUT pvalink fed by an `EpicsValue::Int64Array`
     /// (from an `FTVL=INT64` waveform) must go through the typed
     /// `long[]` encoder. `origin/main` already had `Int64Array` but
@@ -4455,6 +4472,7 @@ mod tests {
         .await;
     }
 
+    #[cfg(tokio_backend)]
     /// Shared body for the OUT typed-array
     /// regression tests. Stands up a PVA server hosting a
     /// `long[]` / `ulong[]` PV, seeds the registry with a
@@ -4471,7 +4489,9 @@ mod tests {
         use crate::pvalink::link::PvaLink;
         use epics_pva_rs::client::PvaClient;
         use epics_pva_rs::pvdata::{FieldDesc, PvField, ScalarValue};
-        use epics_pva_rs::server_native::{PvaServer, SharedPV, SharedSource};
+        #[cfg(tokio_backend)]
+        use epics_pva_rs::server_native::PvaServer;
+        use epics_pva_rs::server_native::{SharedPV, SharedSource};
 
         // PVA server hosting a `long[]` / `ulong[]`-valued PV.
         let desc = FieldDesc::Structure {
@@ -4495,7 +4515,7 @@ mod tests {
             PvaServer::isolated(std::sync::Arc::new(source)).expect("test PVA server starts");
         let addr = server.tcp_addr();
 
-        let resolver = PvaLinkResolver::new();
+        let resolver = PvaLinkResolver::new(crate::test_reactor());
 
         // Seed the registry with a pinned-client OUT link under the
         // exact key `put_value` will look up for the bare PV name, so

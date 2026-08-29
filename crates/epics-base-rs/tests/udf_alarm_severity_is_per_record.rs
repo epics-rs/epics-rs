@@ -72,12 +72,12 @@ async fn lso_udf_is_invalid_even_when_udfs_says_minor() {
 }
 
 /// `mbbiDirect` is driven through the owner rather than through a process
-/// cycle: this port clears `UDF` on every `mbbiDirect` cycle, including the
-/// failed-link one where C leaves it set (`mbbiDirectRecord.c:155-166` only
-/// clears on `status == 0`), so no database setup reaches `checkAlarms` with
-/// the record still undefined. That clear is a separate defect and is reported
-/// UNFIXED; it is upstream of this hook, and the four cases above already
-/// prove the `evaluate_alarms` wiring.
+/// cycle, because the four cases above are about the `evaluate_alarms` wiring
+/// and a process cycle would also exercise the read-status gate that decides
+/// whether the record is still undefined by the time `checkAlarms` runs. That
+/// gate — C's `mbbiDirectRecord.c:155-166`, where the `udf = FALSE` sits
+/// inside the `status == 0` arm — is pinned across the whole status-gated
+/// family by `udf_survives_a_failed_soft_inp_read.rs`, `MBD` included.
 #[epics_macros_rs::epics_test]
 async fn mbbi_direct_udf_is_invalid_even_when_udfs_says_minor() {
     let rec = MbbiDirectRecord::default();

@@ -30,12 +30,26 @@
 //! Increment-per-success keeps one frame to one file with consecutive
 //! numbers whether or not the flush was retried, at the cost that
 //! `NDFileNumber_RBV` advances more slowly than C's after a failure and that
-//! a retry overwrites the partial file rather than leaving it beside the good
-//! one. Tier 3, correctness over byte parity.
+//! the retry reuses the number the failed attempt had already opened a file
+//! at. What sits at that number is not a partial image: every writer creates
+//! or truncates the file at open, before any image data reaches it —
+//! `TIFFOpen(fileName, "w")` (`NDFileTIFF.cpp:120`), `fopen(fileName, "wb")`
+//! followed straight away by `jpeg_start_compress` (`NDFileJPEG.cpp:87`,
+//! `:103`), `H5Fcreate(fileName, H5F_ACC_TRUNC, ..)`
+//! (`NDFileHDF5.cpp:3833`) — so the leftover is empty, header-only or an
+//! empty container according to which writer failed, and the retry's own open
+//! truncates it again. Tier 3, correctness over byte parity.
+//!
+//! C++ line numbers here resolve against ADCore `R3-14-111-g6c53844e`, the
+//! revision this port was written from. `NDPluginFile.cpp`, `NDFileTIFF.cpp`
+//! and `NDFileJPEG.cpp` are byte-identical between it and the checkout at
+//! `R3-14-173-g926bb4c8`; `NDFileHDF5.cpp` is not, and `:3833` above was read
+//! at the pin.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use crate::attributes::{NDAttribute, NDAttributeList};
 use crate::error::{ADError, ADResult};
 use crate::finalize::Finalize;
 use crate::ndarray::NDArray;
@@ -80,6 +94,65 @@ pub trait NDFileWriter: Send + Sync {
     /// out. The default is `true`.
     fn writes_incrementally(&self) -> bool {
         true
+    }
+}
+
+/// A multi-frame writer's own NDAttribute list — C's `pFileAttributes`
+/// (`NDFileHDF5.h`, `NDFileNetCDF.h`, `NDFileNexus.h`), which is deliberately
+/// separate from the list on any one frame.
+///
+/// It is **sticky for the life of the file**. `NDAttributeList::copy`
+/// (`NDAttributeList.cpp:185-205`) walks the input list and either overwrites
+/// the same-named output entry or appends a new one — it never removes — and
+/// the writers clear it in `openFile` alone (`NDFileHDF5.cpp:243`,
+/// `NDFileNetCDF.cpp:72`) and merge each subsequent frame into it
+/// (`NDFileHDF5.cpp:1437`, `NDFileNetCDF.cpp:362`). So an attribute that
+/// appears in one frame and is absent from the next keeps its previous value
+/// for the rest of the file, and that value is what the later frame's record
+/// carries. Reading the frame's own list instead makes a drop-out look like a
+/// missing value, which each writer then has to invent a rule for — a zero, or
+/// the first frame's value.
+///
+/// Only [`open`](FileAttributes::open) may reset the contents, so the mid-file
+/// clear that would reintroduce that miss cannot be written; and because the
+/// list only ever grows, the order of the names is a stable prefix of every
+/// later state of it.
+#[derive(Debug, Clone, Default)]
+pub struct FileAttributes {
+    list: NDAttributeList,
+}
+
+impl FileAttributes {
+    /// Start a new file from `array`'s attributes (C `openFile`: `clear()`
+    /// then `copy`).
+    pub fn open(&mut self, array: &NDArray) {
+        self.list.clear();
+        self.list.copy_from(&array.attributes);
+    }
+
+    /// Merge one frame's attributes in (C `writeFile`: `copy` with no clear).
+    pub fn frame(&mut self, array: &NDArray) {
+        self.list.copy_from(&array.attributes);
+    }
+
+    /// The current value for `name`, which is the most recent frame that
+    /// carried it, not necessarily the frame being written.
+    pub fn get(&self, name: &str) -> Option<&NDAttribute> {
+        self.list.get(name)
+    }
+
+    /// Every attribute seen since [`open`](FileAttributes::open), in the order
+    /// the names first appeared.
+    pub fn iter(&self) -> impl Iterator<Item = &NDAttribute> {
+        self.list.iter()
+    }
+
+    pub fn len(&self) -> usize {
+        self.list.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.list.is_empty()
     }
 }
 
@@ -805,8 +878,14 @@ mod tests {
         // C++ NDPluginFile deletes the driver file per frame in Capture mode
         // too, not only Single/Stream.
         let dir = std::env::temp_dir();
-        let f1 = dir.join("adcore_capture_driver_1.raw");
-        let f2 = dir.join("adcore_capture_driver_2.raw");
+        let f1 = dir.join(format!(
+            "adcore_capture_driver_1_{}.raw",
+            std::process::id()
+        ));
+        let f2 = dir.join(format!(
+            "adcore_capture_driver_2_{}.raw",
+            std::process::id()
+        ));
         std::fs::write(&f1, b"x").unwrap();
         std::fs::write(&f2, b"y").unwrap();
 
@@ -843,7 +922,10 @@ mod tests {
     #[test]
     fn test_delete_driver_file_capture_single_image_format() {
         let dir = std::env::temp_dir();
-        let f1 = dir.join("adcore_capture_si_driver_1.raw");
+        let f1 = dir.join(format!(
+            "adcore_capture_si_driver_1_{}.raw",
+            std::process::id()
+        ));
         std::fs::write(&f1, b"x").unwrap();
 
         let mut fb = NDPluginFileBase::new();

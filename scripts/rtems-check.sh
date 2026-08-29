@@ -6,6 +6,10 @@
 # target", on a machine with no RTEMS toolchain and no BSP. `cargo check` does
 # not link, so it needs neither.
 #
+# It is the RUST half only. `cargo check` never runs `cc`, so nothing in
+# `crates/epics-rtems-boot/csrc/` is compiled here; `scripts/csrc-check.sh` is
+# the C half, and states plainly which of those sources a runner can reach.
+#
 # WHY THIS FILE EXISTS
 #
 # The invocation used to live only in prose (doc/rtems-runtime-portability-

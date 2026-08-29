@@ -39,7 +39,9 @@ pub enum ParamValue {
     Int64(i64),
     UInt64(u64),
     Float64(f64),
-    Octet(String),
+    /// Byte string, as [`param::ParamValue::Octet`] — the transport must not
+    /// be the place a device byte becomes U+FFFD.
+    Octet(Vec<u8>),
     UInt32Digital(u32),
     Int8Array(Vec<i8>),
     Int16Array(Vec<i16>),

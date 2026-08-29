@@ -1,6 +1,14 @@
+// RTEMS-EXEC-MODEL-ALLOW(1): checked, not waived — all 1 ran and passed
+// on the exec backend (measured on this tree:
+// `EPICS_RS_BUILD_EXEC_BACKEND=thread cargo nextest run -p ad-plugins-rs
+// --all-features`, 556/556). ad-plugins-rs became a census subject when
+// its `build.rs` began deriving `tokio_backend`; nothing here builds a
+// CA server, and the reactor these obtain comes from `#[tokio::test]`
+// itself, which the backend does not remove.
 use std::sync::Arc;
 
-#[cfg(feature = "parallel")]
+// Not gated on `parallel`: `should_parallelize` is the whole decision now
+// and this file asks it on both arms.
 use crate::par_util;
 #[cfg(feature = "parallel")]
 use rayon::prelude::*;
@@ -276,13 +284,13 @@ pub fn compute_stats(
 
             // Background subtraction.
             //
-            // C parity: NDPluginStats.cpp:486-528 `doComputeStatistics` background
+            // C parity: NDPluginStats.cpp:488-530 `doComputeStatistics` background
             // section. The background is the union of, per dimension, a low-edge
             // strip and a high-edge strip (each spanning the full extent of every
             // other dimension). Strip totals/pixel-counts are SUMMED, so pixels in
             // the corner of multiple strips are counted twice in both `bgdCounts`
             // and `bgdPixels` — the C++ source documents this as intentional
-            // (NDPluginStats.cpp:485-488). Works for any dimensionality (1-D,
+            // (NDPluginStats.cpp:484-487). Works for any dimensionality (1-D,
             // 2-D, 3-D+).
             let net = if bgd_width > 0 && !dims.is_empty() {
                 let sizes: Vec<usize> = dims.iter().map(|d| d.size).collect();
@@ -356,7 +364,7 @@ pub fn compute_stats(
                     bgd_counts += high_sum;
                     bgd_pixels += high_n;
                 }
-                // C parity: NDPluginStats.cpp:526 — `if (bgdPixels < 1) bgdPixels = 1`.
+                // C parity: NDPluginStats.cpp:527 — `if (bgdPixels < 1) bgdPixels = 1`.
                 let bgd_avg = bgd_counts / bgd_pixels.max(1) as f64;
                 total - bgd_avg * v.len() as f64
             } else {
@@ -704,10 +712,7 @@ pub fn compute_histogram(
     let range = hist_max - hist_min;
     let n = data.len();
 
-    #[cfg(feature = "parallel")]
     let use_parallel = par_util::should_parallelize(n);
-    #[cfg(not(feature = "parallel"))]
-    let use_parallel = false;
 
     if use_parallel {
         #[cfg(feature = "parallel")]
@@ -877,8 +882,10 @@ pub fn compute_profiles(
 }
 
 /// Pure processing logic for statistics computation.
-pub struct StatsProcessor {
-    latest_stats: Arc<Mutex<StatsResult>>,
+/// The compute-enable flags and their tuning values, all written by
+/// `on_param_change` and read as one set per frame.
+#[derive(Debug, Clone, Copy)]
+struct StatsConfig {
     do_compute_statistics: bool,
     do_compute_centroid: bool,
     do_compute_histogram: bool,
@@ -890,17 +897,11 @@ pub struct StatsProcessor {
     hist_size: usize,
     hist_min: f64,
     hist_max: f64,
-    params: NDStatsParams,
-    /// Shared cell to export params after register_params is called.
-    params_out: Arc<Mutex<NDStatsParams>>,
-    /// Optional sender to push time series data to the TS port driver.
-    ts_sender: Option<crate::time_series::TimeSeriesSender>,
 }
 
-impl StatsProcessor {
-    pub fn new() -> Self {
+impl Default for StatsConfig {
+    fn default() -> Self {
         Self {
-            latest_stats: Arc::new(Mutex::new(StatsResult::default())),
             do_compute_statistics: true,
             do_compute_centroid: true,
             do_compute_histogram: false,
@@ -912,6 +913,25 @@ impl StatsProcessor {
             hist_size: 256,
             hist_min: 0.0,
             hist_max: 255.0,
+        }
+    }
+}
+
+pub struct StatsProcessor {
+    latest_stats: Arc<Mutex<StatsResult>>,
+    config: Mutex<StatsConfig>,
+    params: NDStatsParams,
+    /// Shared cell to export params after register_params is called.
+    params_out: Arc<Mutex<NDStatsParams>>,
+    /// Optional sender to push time series data to the TS port driver.
+    ts_sender: Option<crate::time_series::TimeSeriesSender>,
+}
+
+impl StatsProcessor {
+    pub fn new() -> Self {
+        Self {
+            latest_stats: Arc::new(Mutex::new(StatsResult::default())),
+            config: Mutex::new(StatsConfig::default()),
             params: NDStatsParams::default(),
             params_out: Arc::new(Mutex::new(NDStatsParams::default())),
             ts_sender: None,
@@ -941,19 +961,20 @@ impl Default for StatsProcessor {
 }
 
 impl NDPluginProcess for StatsProcessor {
-    fn process_array(&mut self, array: &NDArray, _pool: &NDArrayPool) -> ProcessResult {
+    fn process_array(&self, array: &NDArray, _pool: &NDArrayPool) -> ProcessResult {
         let p = &self.params;
         let info = array.info();
+        let cfg = *self.config.lock();
 
-        let mut result = if self.do_compute_statistics {
-            compute_stats(&array.data, &array.dims, self.bgd_width)
+        let mut result = if cfg.do_compute_statistics {
+            compute_stats(&array.data, &array.dims, cfg.bgd_width)
         } else {
             StatsResult::default()
         };
 
         // Centroid computation
         let mut centroid = CentroidResult::default();
-        if self.do_compute_centroid {
+        if cfg.do_compute_centroid {
             // C rejects ndims>2 (NDPluginStats.cpp:205 `if (ndims>2) return
             // asynError`): centroid is computed only for a true 2-D image, never
             // by treating the first two dims of a 4-D (or [x,y,1]) array as a
@@ -964,15 +985,15 @@ impl NDPluginProcess for StatsProcessor {
                     &array.data,
                     info.x_size,
                     info.y_size,
-                    self.centroid_threshold,
+                    cfg.centroid_threshold,
                 );
             }
         }
 
         // Histogram computation
-        if self.do_compute_histogram {
+        if cfg.do_compute_histogram {
             let (histogram, below, above, entropy) =
-                compute_histogram(&array.data, self.hist_size, self.hist_min, self.hist_max);
+                compute_histogram(&array.data, cfg.hist_size, cfg.hist_min, cfg.hist_max);
             result.histogram = histogram;
             result.hist_below = below;
             result.hist_above = above;
@@ -981,16 +1002,16 @@ impl NDPluginProcess for StatsProcessor {
 
         // Profile computation. C also rejects ndims>2 here (NDPluginStats.cpp:338),
         // so profiles are computed only for a true 2-D image.
-        if self.do_compute_profiles && info.color_size <= 1 && array.dims.len() == 2 {
+        if cfg.do_compute_profiles && info.color_size <= 1 && array.dims.len() == 2 {
             let profiles = compute_profiles(
                 &array.data,
                 info.x_size,
                 info.y_size,
-                self.centroid_threshold,
+                cfg.centroid_threshold,
                 centroid.centroid_x,
                 centroid.centroid_y,
-                self.cursor_x,
-                self.cursor_y,
+                cfg.cursor_x,
+                cfg.cursor_y,
             );
             result.profile_avg_x = profiles.avg_x;
             result.profile_avg_y = profiles.avg_y;
@@ -1006,8 +1027,8 @@ impl NDPluginProcess for StatsProcessor {
         // cursor to the last valid pixel (NDPluginStats.cpp:357-362) and always
         // reads it — an out-of-range cursor yields the edge pixel, never 0.
         if info.color_size <= 1 && array.dims.len() == 2 && info.x_size > 0 && info.y_size > 0 {
-            let cx = self.cursor_x.min(info.x_size - 1);
-            let cy = self.cursor_y.min(info.y_size - 1);
+            let cx = cfg.cursor_x.min(info.x_size - 1);
+            let cy = cfg.cursor_y.min(info.y_size - 1);
             result.cursor_value = array.data.get_as_f64(cy * info.x_size + cx).unwrap_or(0.0);
         }
 
@@ -1048,20 +1069,20 @@ impl NDPluginProcess for StatsProcessor {
         // `histX[i] = histMin + i*scale` for i in 0..histSize. The divisor is
         // the bin count (histSize), not histSize-1, so the last bin's X is
         // histMin + (histSize-1)*scale, strictly below histMax.
-        if self.do_compute_histogram && !result.histogram.is_empty() {
+        if cfg.do_compute_histogram && !result.histogram.is_empty() {
             updates.push(ParamUpdate::float64_array(
                 p.hist_array,
                 result.histogram.clone(),
             ));
             let n = result.histogram.len();
-            let step = (self.hist_max - self.hist_min) / n as f64;
-            let hist_x: Vec<f64> = (0..n).map(|i| self.hist_min + i as f64 * step).collect();
+            let step = (cfg.hist_max - cfg.hist_min) / n as f64;
+            let hist_x: Vec<f64> = (0..n).map(|i| cfg.hist_min + i as f64 * step).collect();
             updates.push(ParamUpdate::float64_array(p.hist_x_array, hist_x));
         }
 
         // Profile waveforms: emit the computed X/Y projections to asyn
         // clients (C++ doCallbacksFloat64Array for each PROFILE_* waveform).
-        if self.do_compute_profiles && !result.profile_avg_x.is_empty() {
+        if cfg.do_compute_profiles && !result.profile_avg_x.is_empty() {
             updates.push(ParamUpdate::float64_array(
                 p.profile_average_x,
                 result.profile_avg_x.clone(),
@@ -1233,33 +1254,34 @@ impl NDPluginProcess for StatsProcessor {
     }
 
     fn on_param_change(
-        &mut self,
+        &self,
         reason: usize,
         snapshot: &PluginParamSnapshot,
     ) -> ad_core_rs::plugin::runtime::ParamChangeResult {
         let p = &self.params;
+        let mut cfg = self.config.lock();
         if reason == p.compute_statistics {
-            self.do_compute_statistics = snapshot.value.as_i32() != 0;
+            cfg.do_compute_statistics = snapshot.value.as_i32() != 0;
         } else if reason == p.compute_centroid {
-            self.do_compute_centroid = snapshot.value.as_i32() != 0;
+            cfg.do_compute_centroid = snapshot.value.as_i32() != 0;
         } else if reason == p.compute_histogram {
-            self.do_compute_histogram = snapshot.value.as_i32() != 0;
+            cfg.do_compute_histogram = snapshot.value.as_i32() != 0;
         } else if reason == p.compute_profiles {
-            self.do_compute_profiles = snapshot.value.as_i32() != 0;
+            cfg.do_compute_profiles = snapshot.value.as_i32() != 0;
         } else if reason == p.bgd_width {
-            self.bgd_width = snapshot.value.as_i32().max(0) as usize;
+            cfg.bgd_width = snapshot.value.as_i32().max(0) as usize;
         } else if reason == p.centroid_threshold {
-            self.centroid_threshold = snapshot.value.as_f64();
+            cfg.centroid_threshold = snapshot.value.as_f64();
         } else if reason == p.cursor_x {
-            self.cursor_x = snapshot.value.as_i32().max(0) as usize;
+            cfg.cursor_x = snapshot.value.as_i32().max(0) as usize;
         } else if reason == p.cursor_y {
-            self.cursor_y = snapshot.value.as_i32().max(0) as usize;
+            cfg.cursor_y = snapshot.value.as_i32().max(0) as usize;
         } else if reason == p.hist_size {
-            self.hist_size = (snapshot.value.as_i32().max(1)) as usize;
+            cfg.hist_size = (snapshot.value.as_i32().max(1)) as usize;
         } else if reason == p.hist_min {
-            self.hist_min = snapshot.value.as_f64();
+            cfg.hist_min = snapshot.value.as_f64();
         } else if reason == p.hist_max {
-            self.hist_max = snapshot.value.as_f64();
+            cfg.hist_max = snapshot.value.as_f64();
         }
         ad_core_rs::plugin::runtime::ParamChangeResult::empty()
     }
@@ -1782,7 +1804,7 @@ mod tests {
 
     #[test]
     fn test_stats_processor_direct() {
-        let mut proc = StatsProcessor::new();
+        let proc = StatsProcessor::new();
         let pool = NDArrayPool::new(1_000_000);
 
         let mut arr = NDArray::new(vec![NDDimension::new(5)], NDDataType::UInt8);
@@ -1818,11 +1840,11 @@ mod tests {
         let _ = ad_core_rs::plugin::params::PluginBaseParams::create(&mut base);
         proc.register_params(&mut base).unwrap();
 
-        proc.do_compute_histogram = true;
-        proc.do_compute_profiles = true;
-        proc.hist_size = 8;
-        proc.hist_min = 0.0;
-        proc.hist_max = 7.0;
+        proc.config.lock().do_compute_histogram = true;
+        proc.config.lock().do_compute_profiles = true;
+        proc.config.lock().hist_size = 8;
+        proc.config.lock().hist_min = 0.0;
+        proc.config.lock().hist_max = 7.0;
         let pool = NDArrayPool::new(1_000_000);
 
         let mut arr = NDArray::new(
@@ -1884,8 +1906,8 @@ mod tests {
         let _ = ad_core_rs::params::ndarray_driver::NDArrayDriverParams::create(&mut base);
         let _ = ad_core_rs::plugin::params::PluginBaseParams::create(&mut base);
         proc.register_params(&mut base).unwrap();
-        proc.do_compute_centroid = true;
-        proc.do_compute_profiles = true;
+        proc.config.lock().do_compute_centroid = true;
+        proc.config.lock().do_compute_profiles = true;
         let pool = NDArrayPool::new(1_000_000);
 
         // 4-D mono array [x=4, y=4, z=2, w=2]. The first 4x4 plane has a bright
@@ -1955,10 +1977,10 @@ mod tests {
         let _ = ad_core_rs::params::ndarray_driver::NDArrayDriverParams::create(&mut base);
         let _ = ad_core_rs::plugin::params::PluginBaseParams::create(&mut base);
         proc.register_params(&mut base).unwrap();
-        proc.do_compute_histogram = true;
-        proc.hist_size = 4;
-        proc.hist_min = 2.0;
-        proc.hist_max = 5.0;
+        proc.config.lock().do_compute_histogram = true;
+        proc.config.lock().hist_size = 4;
+        proc.config.lock().hist_min = 2.0;
+        proc.config.lock().hist_max = 5.0;
         let pool = NDArrayPool::new(1_000_000);
 
         // 8 pixels: 0,1 below min(2) → below=2; 9,9,9 above max(5) → above=3;
@@ -2020,10 +2042,10 @@ mod tests {
         let _ = ad_core_rs::plugin::params::PluginBaseParams::create(&mut base);
         proc.register_params(&mut base).unwrap();
 
-        proc.do_compute_histogram = true;
-        proc.hist_size = 256;
-        proc.hist_min = 0.0;
-        proc.hist_max = 255.0;
+        proc.config.lock().do_compute_histogram = true;
+        proc.config.lock().hist_size = 256;
+        proc.config.lock().hist_min = 0.0;
+        proc.config.lock().hist_max = 255.0;
         let pool = NDArrayPool::new(1_000_000);
 
         let mut arr = NDArray::new(

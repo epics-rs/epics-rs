@@ -6,10 +6,11 @@
 //! that downstream clients connect to, and route every server op
 //! through the cache.
 
-// RTEMS-EXEC-MODEL-ALLOW(2): checked to pass feature-ON under
-// --features rtems-exec-model,pva-gateway (the gateway's spawns/timers ride the
-// runtime::task seam). The default feature-ON gate omits `pva-gateway`, so re-run
-// that combo when touching this module.
+// RTEMS-EXEC-MODEL-ALLOW(2): checked to pass on the exec backend under
+// `EPICS_RS_BUILD_EXEC_BACKEND=thread cargo nextest run -p epics-bridge-rs
+// --features pva-gateway` (the gateway's spawns/timers ride the runtime::task
+// seam; 739 run, 739 passed on this tree). The default exec-backend gate omits
+// `pva-gateway`, so re-run that combo when touching this module.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -224,6 +225,18 @@ impl PvaGatewayConfig {
 /// Running PVA gateway. Hold this for the lifetime of the gateway
 /// process; consume it via [`Self::run`] for daemons or drop to
 /// tear everything down.
+///
+/// ```no_run
+/// use epics_base_rs::runtime::task::Reactor;
+/// use epics_bridge_rs::pva_gateway::{PvaGateway, PvaGatewayConfig};
+///
+/// # async fn run() -> epics_bridge_rs::pva_gateway::error::GwResult<()> {
+/// let reactor = Reactor::current().expect("started on the daemon's runtime");
+/// let gw = PvaGateway::start(&reactor, PvaGatewayConfig::default())?;
+/// gw.run().await?;
+/// # Ok(())
+/// # }
+/// ```
 pub struct PvaGateway {
     cache: Arc<ChannelCache>,
     server: PvaServer,
@@ -251,11 +264,20 @@ impl PvaGateway {
     /// - `Audit` is outermost so it records the *final* outcome,
     ///   including ACL / read-only denials, not just PUTs that
     ///   reached the upstream.
-    pub fn start(config: PvaGatewayConfig) -> GwResult<Self> {
+    ///
+    /// `reactor` is the executor the gateway's own tasks run on — the
+    /// cache cleanup tick starts here, before `start` returns, so the
+    /// requirement is a parameter rather than a runtime lookup that
+    /// panics off-executor.
+    pub fn start(
+        reactor: &epics_base_rs::runtime::task::Reactor,
+        config: PvaGatewayConfig,
+    ) -> GwResult<Self> {
         let client = config
             .upstream_client
             .unwrap_or_else(|| Arc::new(PvaClient::builder().build()));
         let cache = ChannelCache::with_max_entries(
+            reactor.clone(),
             client,
             config.cleanup_interval,
             config.max_cache_entries,
@@ -374,8 +396,11 @@ impl PvaGateway {
     /// ports. Mirrors `PvaServer::isolated` semantics — useful for
     /// in-process tests where the gateway should not interact with
     /// the real network.
-    pub fn isolated(client: Arc<PvaClient>) -> GwResult<Self> {
-        let cache = ChannelCache::new(client, DEFAULT_CLEANUP_INTERVAL);
+    pub fn isolated(
+        reactor: &epics_base_rs::runtime::task::Reactor,
+        client: Arc<PvaClient>,
+    ) -> GwResult<Self> {
+        let cache = ChannelCache::new(reactor.clone(), client, DEFAULT_CLEANUP_INTERVAL);
         let source = GatewayChannelSource::new(cache.clone());
         let server = PvaServer::isolated(Arc::new(source.clone()))?;
         Ok(Self {
@@ -504,7 +529,7 @@ mod tests {
             control_acf_path: Some("/no/such/pva_gw_control.acf".to_string()),
             ..isolated_cfg()
         };
-        let res = PvaGateway::start(cfg);
+        let res = PvaGateway::start(&crate::test_reactor(), cfg);
         assert!(
             res.is_err(),
             "unreadable control ACF must fail startup, not silently close the surface"
@@ -527,7 +552,8 @@ mod tests {
             control_acf_path: Some(path.to_str().unwrap().to_string()),
             ..isolated_cfg()
         };
-        let gw = PvaGateway::start(cfg).expect("gateway with a valid control ACF must start");
+        let gw = PvaGateway::start(&crate::test_reactor(), cfg)
+            .expect("gateway with a valid control ACF must start");
         gw.stop();
         let _ = std::fs::remove_file(&path);
     }

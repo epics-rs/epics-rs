@@ -6,7 +6,7 @@
 //! The CA server is being made runnable on RTEMS (armv7-rtems-eabihf) with
 //! **one** async engine. On a hosted target, async *tails* — PACT device
 //! completion, FLNK/scanOnce chains, SDLY/ODLY/watchdog timers, WRITE_NOTIFY
-//! completion — run as tokio tasks via [`crate::runtime::task::spawn`]. RTEMS
+//! completion — run as tokio tasks via [`crate::runtime::task::Reactor::spawn`]. RTEMS
 //! has no tokio runtime (`tokio::spawn`/`tokio::time` need one), so those tails
 //! need a runtime-free home. This module is that home: three C-parity
 //! facilities built from **plain `std` threads + `Mutex`/`Condvar`**, carrying
@@ -24,7 +24,7 @@
 //! [`BackgroundExecutor::handle`] hands out a cheap, clonable
 //! [`BackgroundHandle`] that the future seam wiring routes synchronous-tail
 //! hand-offs through. The hosted (tokio) build keeps calling
-//! [`crate::runtime::task::spawn`] — this module is **only** the RTEMS route,
+//! [`crate::runtime::task::Reactor::spawn`] — this module is **only** the RTEMS route,
 //! and this increment adds the infrastructure without switching any call site
 //! over to it (that is a later increment).
 
@@ -46,8 +46,8 @@ pub mod timer_sleep;
 use std::time::Duration;
 
 pub use callback_executor::{
-    Callback, CallbackError, CallbackHandle, CallbackPool, CallbackPriority, DEFAULT_QUEUE_SIZE,
-    DEFAULT_THREADS_PER_PRIORITY, NUM_CALLBACK_PRIORITIES,
+    Callback, CallbackError, CallbackHandle, CallbackPool, CallbackPriority, CallbackQueueStats,
+    DEFAULT_QUEUE_SIZE, DEFAULT_THREADS_PER_PRIORITY, NUM_CALLBACK_PRIORITIES,
 };
 pub use delayed_timer::{DelayedTimer, TimerHandle};
 pub use future_exec::{
@@ -57,6 +57,7 @@ pub use timer_sleep::{Sleep, TimerInterval};
 
 pub use scan_once::{
     DEFAULT_ONCE_QUEUE_SIZE, OnceCallback, ScanOnceHandle, ScanOnceOverflow, ScanOnceQueue,
+    ScanOnceQueueStats,
 };
 
 /// Owns the three background facilities (callback pool, delayed timer, scanOnce
@@ -121,7 +122,7 @@ impl Default for BackgroundExecutor {
 /// enqueues and returns immediately; the work runs on a background thread.
 ///
 /// This is the type the sans-io seam routes RTEMS tail hand-offs into — the
-/// runtime-free counterpart of [`crate::runtime::task::spawn`].
+/// runtime-free counterpart of [`crate::runtime::task::Reactor::spawn`].
 #[derive(Clone)]
 pub struct BackgroundHandle {
     callbacks: CallbackHandle,
@@ -142,7 +143,7 @@ impl BackgroundHandle {
         self.timer.schedule(delay, priority, cb);
     }
 
-    /// Enqueue a one-shot record-process tail — C `scanOnce` (`dbScan.c:664`).
+    /// Enqueue a one-shot record-process tail — C `scanOnce` (`dbScan.c:660`).
     pub fn scan_once(&self, cb: OnceCallback) -> Result<(), ScanOnceOverflow> {
         self.scan_once.scan_once(cb)
     }

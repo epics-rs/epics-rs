@@ -98,7 +98,7 @@ impl NTURI {
     /// the supplied query values, while still emitting **all four**
     /// normative members — `scheme`, `authority`, `path`, `query` — that
     /// pvxs `NTURI::NTURI()` defines unconditionally
-    /// (`src/nt.cpp:253-262`). `authority` is the empty string, matching
+    /// (`src/nt.cpp:253-263`). `authority` is the empty string, matching
     /// pvxs `pvxcall`, which builds `nt::NTURI({}).build()` and sets only
     /// scheme/path/query (`tools/call.cpp:104-118`).
     ///

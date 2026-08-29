@@ -12,18 +12,20 @@
 //! info, a real in-process server+client opening a channel, and an
 //! assertion that the info reaches the server report.
 
-// RTEMS-EXEC-MODEL-ALLOW(2): checked - these run and pass in the feature-ON suite.
+#![cfg(tokio_backend)]
 #![cfg(test)]
 // `ChannelSource` trait methods return `impl Future` (RPITIT); test impls
 // mirror that shape rather than `async fn`, as in the sibling test files.
 #![allow(clippy::manual_async_fn)]
+#![cfg(feature = "client")]
 
 use epics_pva_rs::server_native::MonitorStream;
 use std::sync::Arc;
 use std::time::Duration;
 
 use epics_pva_rs::pvdata::{FieldDesc, PvField, PvStructure, ScalarType, ScalarValue};
-use epics_pva_rs::server_native::{ChannelSource, OpError, PvaServer};
+use epics_pva_rs::server_native::PvaServer;
+use epics_pva_rs::server_native::{ChannelSource, OpError};
 
 /// The contextual string a source attaches to every channel it serves.
 const INFO: &str = "owner=test-source pid=4242";

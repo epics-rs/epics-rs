@@ -233,9 +233,9 @@ fn caput_without_a_value_reports_no_value_specified() {
 /// paths. The exit-1 mapping must not swallow them.
 ///
 /// The STREAMS differ, and C picks them per call: `usage()` is one
-/// `fprintf(stderr, ...)` (`caget.c:55-58`, `camonitor.c:45-47`,
+/// `fprintf(stderr, ...)` (`caget.c:56-58`, `camonitor.c:45-47`,
 /// `caput.c:60-62`, `cainfo.c:37-39`), while `case 'V'` is a `printf`
-/// (`caget.c:403`). So `-h` writes stderr and `-V` writes stdout — R14-16;
+/// (`caget.c:404`). So `-h` writes stderr and `-V` writes stdout — R14-16;
 /// the port used to send the exit-0 help block to stdout because that is
 /// clap's stream.
 #[test]

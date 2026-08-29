@@ -1,5 +1,5 @@
 use epics_base_rs::error::CaResult;
-use epics_base_rs::server::device_support::{DeviceReadOutcome, DeviceSupport};
+use epics_base_rs::server::device_support::{DeviceReadOutcome, DeviceSupport, DeviceUdf};
 use epics_base_rs::server::record::Record;
 
 use crate::records::epid::EpidRecord;
@@ -43,7 +43,9 @@ impl DeviceSupport for EpidSoftCallbackDeviceSupport {
             .and_then(|a| a.downcast_mut::<EpidRecord>())
             .expect("EpidSoftCallbackDeviceSupport requires an EpidRecord");
         super::epid_soft::EpidSoftDeviceSupport::do_pid(epid);
-        Ok(DeviceReadOutcome::computed())
+        // Same as the synchronous soft dset: C `devEpidSoft.c` writes no
+        // `pepid->udf` (see `epid_soft.rs`).
+        Ok(DeviceReadOutcome::computed(DeviceUdf::Untouched))
     }
 
     fn write(&mut self, _record: &mut dyn Record) -> CaResult<()> {

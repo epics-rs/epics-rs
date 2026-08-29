@@ -50,7 +50,7 @@ impl FieldMapping {
 
     /// True iff a client PUT of this member carries a leaf the server
     /// writes to the database. pvxs `IOCSource::put` (iocsource.cpp:
-    /// 576-598) writes for `Scalar` / `Plain` / `Any`, and returns without
+    /// 576-610) writes for `Scalar` / `Plain` / `Any`, and returns without
     /// writing for `Meta`, `Proc`, `Structure` (explicitly "can't write")
     /// and `Const` (the value comes from the group config, never the
     /// client). `Proc` is separately routed to record processing by the
@@ -68,7 +68,7 @@ impl FieldMapping {
 // ---------------------------------------------------------------------------
 
 /// The leaves a DBE_PROPERTY event marks on a Scalar mapping — exactly the
-/// fields pvxs `getProperties` (`pvxs/ioc/iocsource.cpp:252-310`) assigns.
+/// fields pvxs `getProperties` (`pvxs/ioc/iocsource.cpp:253-310`) assigns.
 ///
 /// Delegates to [`epics_pva_rs::nt::property_leaves`], the single owner of
 /// that rule. The NATIVE PVA server needs the same answer for the same
@@ -92,7 +92,7 @@ fn property_leaves(props: PropertySupport) -> Vec<&'static str> {
 /// at the root of its NT (empty prefix).
 ///
 /// * properties iff `change & Property` — `getProperties`
-///   (`iocsource.cpp:252-310`) is gated on `info.type == Scalar`, so only
+///   (`iocsource.cpp:253-310`) is gated on `info.type == Scalar`, so only
 ///   Scalar mappings carry property leaves. It assigns exactly
 ///   `property_leaves`: the whole `display` / `control` / `valueAlarm`
 ///   structures are NOT assigned;
@@ -228,16 +228,16 @@ pub fn change_leaf_paths(
 ///   delta (`testqsingle.cpp:129-149`) even though no DBE class assigns it;
 /// * `display.form.index` — assigned by the SAME initialize, but ONLY when
 ///   the mapping's channel addresses the record's VAL field
-///   (`if(dbIsValueField(dbChannelFldDes(chan)))`, `iocsource.cpp:53`), which
+///   (`if(dbIsValueField(dbChannelFldDes(chan)))`, `iocsource.cpp:54`), which
 ///   is what `is_value_field` carries here. A channel on `REC.RVAL` leaves the
 ///   index unassigned, so marking it shipped one changed bit and four bytes
 ///   pvxs never sends;
 /// * a `Const` member's own node — `IOCSource::get` assigns `info.cval`
-///   (`iocsource.cpp:319-322`) on a read, where no runtime event ever fires
+///   (`iocsource.cpp:322-325`) on a read, where no runtime event ever fires
 ///   for it.
 ///
 /// `Structure` / `Proc` members assign nothing on a read either (pvxs skips
-/// them: `iocsource.cpp:316-317`, and `groupsource.cpp:495` / `:513` `continue`
+/// them: `iocsource.cpp:319-320`, and `groupsource.cpp:495` / `:513` `continue`
 /// before even reading), so they stay unmarked.
 ///
 /// The seven leaves the port's NT carries but `getProperties` never assigns —
@@ -303,7 +303,7 @@ fn enclosing_array_field(path: &str) -> Option<&str> {
 /// structure path to its whole subtree — so a bare `value` mark would
 /// re-send the property-only `value.choices` on every value update. pvxs
 /// assigns only `value.index` on a value/alarm event
-/// (`iocsource.cpp:107-109,331-351`) and fills `value.choices` solely from
+/// (`iocsource.cpp:107-112,331-333,335-351`) and fills `value.choices` solely from
 /// `getProperties` on a property event (`iocsource.cpp:278-285`). Rewrite
 /// each marked `<node>.value` (or the bare root `value`) whose concrete
 /// node is an enum to `…value.index`; plain-scalar `value` leaves and
@@ -358,7 +358,7 @@ pub enum NtType {
     /// `DBF_CHAR` array that semantically holds a NUL-terminated string.
     /// Served as a scalar-string NTScalar — the `CharArray` storage is
     /// decoded to a `pvString` value at the QSRV boundary, matching
-    /// pvxs's `form = "String"` view (`ioc/iocsource.cpp:619-643`). This
+    /// pvxs's `form = "String"` view (`ioc/iocsource.cpp:619-644`). This
     /// removes the dual meaning of a `CharArray` snapshot (byte array vs.
     /// string) by making the channel's intent explicit.
     LongString,
@@ -383,7 +383,7 @@ impl NtType {
 /// The NT is chosen from the field's *resolved value's* final DBR/DBF
 /// type and element count, mirroring pvxs, which builds every channel
 /// prototype from `dbChannelFinalFieldType(chan)`
-/// (singlesource.cpp:189-205; group members via `getTypeDefForChannel` /
+/// (singlesource.cpp:189-206; group members via `getTypeDefForChannel` /
 /// `IOCSource::getChannelValueType`, groupconfigprocessor.cpp:867-974):
 /// `DBF_ENUM`/`DBF_MENU`/`DBF_DEVICE` resolve to `DBR_ENUM`
 /// (db/dbAccess.c:88-90) and select `NTEnum`, an array field selects
@@ -423,32 +423,61 @@ pub(crate) fn nt_type_for_field(value: Option<&EpicsValue>) -> NtType {
 }
 
 /// The port's `IOCSource::getChannelValueType` (pvxs
-/// `ioc/iocsource.cpp:619-643`): the NT a channel bound to
+/// `ioc/iocsource.cpp:619-644`): the NT a channel bound to
 /// `record.field` serves, INCLUDING the long-string collapse. Single
 /// owner — the single-record channel ([`super::channel::BridgeChannel`])
 /// and the group scalar-member path ([`super::group::GroupChannel`]) both
 /// resolve their NT here, so a long-string field cannot be a string on one
 /// surface and a byte array on the other.
 ///
-/// Two ways a channel is a long string, both of which pvxs decides as
-/// "final field type is `DBR_CHAR`, the field is an array, and the
-/// channel's format is `String`":
+/// Three ways a channel is a long string. Two are pvxs's own test
+/// ("final field type is `DBR_CHAR`, the field is an array, and the
+/// channel's format is `String`"); the third, `$` on a `DBF_STRING`
+/// field, is a deliberate deviation because pvxs's code does not honour
+/// it — see the last bullet.
 ///
 /// - The record type declares the field one (`Record::long_string_fields`
 ///   — `lsi`/`lso` VAL/OVAL, `printf` VAL). These are C's `SPC_DBADDR`
 ///   fields whose `cvt_dbaddr` reports a `DBF_STRING` with `field_size >
 ///   MAX_STRING_SIZE+1`; pvxs re-views them as a `DBR_CHAR` array and
-///   forces `form = "String"` (`ioc/channel.cpp:52-74`).
+///   forces `form = "String"` (`ioc/channel.cpp:59-74`).
 /// - The record carries `info(Q:form, "String")` and the field is the VAL
 ///   of a `DBF_CHAR` array — the QSRV long-string idiom for a plain
 ///   `waveform`/`aai` of CHAR. The info tag applies to VAL only
-///   (`dbIsValueField`, `ioc/channel.cpp:43-47`), so another field of the
+///   (`dbIsValueField`, `ioc/channel.cpp:40-47`), so another field of the
 ///   same record stays a byte array.
+/// - The channel name carried the `$` modifier. `dbChannelCreate` re-views
+///   a `DBF_STRING` or link field as a `DBR_CHAR` array
+///   (`dbChannel.c:486-505`), but pvxs ends up with `form = "String"` for
+///   the LINK case only: `dbChannelCreate` rewrites `addr.field_type` to
+///   `DBF_CHAR` for a `DBF_STRING` field (`dbChannel.c:488-493`) and keeps
+///   the original type for a link (`:494-499`), so pvxs's duplicate of that
+///   logic (`ioc/channel.cpp:59-74`) can only fire on the link arm and a
+///   `$`-ed `DBF_STRING` field keeps `form = "Default"`. Measured against a
+///   stock pvxs 1.5.2 IOC, `record.NAME$` returns `NTScalarArray int8_t[]`
+///   while `record.INP$` returns a string; pvxs's own `NAME$` case
+///   (`test/testqsingle.cpp:268`) does not catch it because `testFldEq`'s
+///   conversion-failure arm is `testFalse(false)` (`test/testioc.h:66-69`),
+///   which always passes. This port serves both as a long string, following
+///   pvxs's documentation (`documentation/ioc.rst:112-116` — a `$` on a
+///   `DBF_STRING` or `DBF_*LINK` field makes it "visible as a PVA string")
+///   rather than its code.
 pub(crate) fn nt_type_for_channel(
     instance: &epics_base_rs::server::record::RecordInstance,
     field_upper: &str,
     resolved: Option<&EpicsValue>,
+    string_view: bool,
 ) -> NtType {
+    // The `$` view, decided first. `getChannelValueType` reads the decision
+    // back off `chan.format()` (`iocsource.cpp:635-636`), which pvxs sets to
+    // "String" for a `$`-ed LINK field only — the deviation above. Deciding
+    // it here is what keeps this function the whole of
+    // `getChannelValueType`: the single-record path used to branch on `$`
+    // before calling in, so the group path — which has no such branch —
+    // served the unviewed NT.
+    if string_view {
+        return NtType::LongString;
+    }
     if instance
         .record
         .long_string_fields()
@@ -475,7 +504,7 @@ pub(crate) fn nt_type_for_channel(
 /// value type — `addMembersForPlainType` (`ioc/groupconfigprocessor.cpp:886-895`)
 /// is `TypeDef leaf(IOCSource::getChannelValueType(chan, true))` — and the read
 /// path then fills *that same* `Value`: `getArrayValue`
-/// (`ioc/iocsource.cpp:132-137`) collapses a `DBR_CHAR` buffer at the NUL
+/// (`ioc/iocsource.cpp:133-136`) collapses a `DBR_CHAR` buffer at the NUL
 /// exactly when the leaf it is filling is `TypeCode::String`. One type code,
 /// two renderings.
 ///
@@ -491,7 +520,7 @@ pub(crate) fn nt_type_for_channel(
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum BareLeaf {
     /// A `DBR_CHAR` array whose channel format is `String` — pvxs
-    /// `TypeCode::String` (`getChannelValueType`, `iocsource.cpp:634-636`).
+    /// `TypeCode::String` (`getChannelValueType`, `iocsource.cpp:635-636`).
     LongString,
     /// The value is stored as an `*Array` variant ([`nt_type_for_field`])
     /// — pvxs `valueType.arrayOf()`. Deliberate divergence: pvxs keys
@@ -512,11 +541,15 @@ impl BareLeaf {
         field_upper: &str,
         resolved: Option<&EpicsValue>,
         field_dbf: epics_base_rs::types::DbFieldType,
+        string_view: bool,
     ) -> Self {
         let scalar = crate::convert::dbf_to_scalar_type(
             resolved.map(|v| v.db_field_type()).unwrap_or(field_dbf),
         );
-        Self::from_nt(nt_type_for_channel(instance, field_upper, resolved), scalar)
+        Self::from_nt(
+            nt_type_for_channel(instance, field_upper, resolved, string_view),
+            scalar,
+        )
     }
 
     /// The same classification, from an NT already resolved through
@@ -686,7 +719,7 @@ pub fn snapshot_to_nt_scalar(snapshot: &Snapshot) -> PvStructure {
     // leaf is not claiming it: pvxs reads into a `cloneEmpty()` whose
     // descriptor carries the same leaves, and simply never ASSIGNS the ones
     // `dbChannelGet` reported unsupplied, so they reach no client
-    // (`iocsource.cpp:263-305`). The port says the same thing by leaving
+    // (`iocsource.cpp:264-305`). The port says the same thing by leaving
     // them out of the changed-bitset — see `property_leaves`, which is
     // the one gate, keyed off the snapshot's [`PropertySupport`].
     let disp = snapshot.display.clone().unwrap_or_default();
@@ -813,7 +846,7 @@ pub fn snapshot_to_nt_scalar_array(snapshot: &Snapshot) -> PvStructure {
     // (with descriptor defaults when the record has no metadata, e.g.
     // histogram), and a string array carries `display` only. Emitting
     // them only when the snapshot had metadata diverged from the
-    // `getField` descriptor (src/nt.cpp:44-112, iocsource.cpp:254-309).
+    // `getField` descriptor (src/nt.cpp:44-112, iocsource.cpp:253-310).
     let disp = snapshot.display.clone().unwrap_or_default();
     pv.fields.push((
         "display".into(),
@@ -841,7 +874,7 @@ pub fn snapshot_to_nt_scalar_array(snapshot: &Snapshot) -> PvStructure {
 /// representation); the QSRV boundary reads it back as the NUL-terminated
 /// byte run verbatim — pvxs serves the `DBF_CHAR` `form="String"` view as a
 /// `pvString` of the raw bytes up to NUL with no UTF-8 validation
-/// (`singlesource.cpp:189-205`), so the bytes pass through unmodified.
+/// (`ioc/iocsource.cpp:133-136`), so the bytes pass through unmodified.
 pub(crate) fn long_string_value(value: &EpicsValue) -> PvString {
     match value {
         EpicsValue::CharArray(bytes) => {
@@ -861,7 +894,7 @@ pub(crate) fn long_string_value(value: &EpicsValue) -> PvString {
 /// Convert a long-string Snapshot into a scalar-string NTScalar.
 ///
 /// pvxs serves a `form = "String"` `DBF_CHAR` view as a `pvString`
-/// NTScalar (`ioc/iocsource.cpp:123-137`, `singlesource.cpp:189-205`).
+/// NTScalar (`ioc/iocsource.cpp:123-136`, `singlesource.cpp:189-206`).
 /// We decode the `CharArray` to a `String` and reuse the standard
 /// NTScalar builder, which emits the string-scalar metadata set
 /// (`display = {description, units}`, no numeric `control`/`valueAlarm`).
@@ -999,7 +1032,7 @@ fn filter_by_spec(pv: &PvStructure, spec: &PvStructure) -> PvStructure {
 ///
 /// `display`/`control`/`valueAlarm` limits take `scalar_type`, and
 /// `control`/`valueAlarm` are omitted for non-numeric (string) values —
-/// matching pvxs `NTScalar::build` (`src/nt.cpp:37-114`).
+/// matching pvxs `NTScalar::build` (`src/nt.cpp:37-115`).
 pub fn build_nt_scalar_desc(scalar_type: ScalarType) -> FieldDesc {
     let numeric = is_numeric_scalar(scalar_type);
     let mut fields = vec![
@@ -1526,6 +1559,49 @@ mod tests {
     use epics_base_rs::server::snapshot::{EnumInfo, Snapshot};
     use std::time::UNIX_EPOCH;
 
+    /// the single-record QSRV PUT conversion chain. A native
+    /// PVA client sends an NTScalar carrying a `ulong` value;
+    /// `BridgeChannel::put_with_options` extracts it via
+    /// `pv_structure_to_epics`, then re-types it against the bound
+    /// field's DBF with `epics_to_scalar` + `scalar_to_epics_typed`.
+    /// Before the fix `pv_structure_to_epics` produced a precision-lost
+    /// `Double`, and `UInt64` was not in the channel's scalar retype
+    /// arm — so a `u64` above `2^53` could not round-trip. This drives
+    /// the exact chain (`pv_structure_to_epics` was the untested path
+    /// per the review) and asserts full-range preservation.
+    #[test]
+    fn mr_r22_ntscalar_ulong_put_chain_preserves_precision() {
+        use crate::convert::scalar_to_epics_typed;
+        use epics_base_rs::types::DbFieldType;
+
+        let big: u64 = u64::MAX - 7;
+
+        // Realistic wire shape: an NTScalar whose `value` is a ulong.
+        let mut nt = PvStructure::new("epics:nt/NTScalar:1.0");
+        nt.fields
+            .push(("value".into(), PvField::Scalar(ScalarValue::ULong(big))));
+
+        // Step 1: BridgeChannel::put_with_options' `raw_val` extraction.
+        let raw_val = pv_structure_to_epics(&nt).expect("extract value");
+        assert_eq!(
+            raw_val,
+            EpicsValue::UInt64(big),
+            "pv_structure_to_epics must preserve a scalar ulong as UInt64"
+        );
+
+        // Step 2: the channel's scalar retype arm for a DBF_UINT64
+        // bound field — `epics_to_scalar` then `scalar_to_epics_typed`.
+        let sv = epics_to_scalar(&raw_val);
+        assert_eq!(sv, ScalarValue::ULong(big));
+        let typed = scalar_to_epics_typed(&sv, DbFieldType::UInt64).unwrap();
+        assert_eq!(
+            typed,
+            EpicsValue::UInt64(big),
+            "the full single-record PUT conversion chain must round-trip \
+             the submitted u64 without an f64 precision loss"
+        );
+    }
+
     /// The mask an `ai`-class channel resolves to: every numeric property
     /// supplied, no enum strings. The cases below fix the CHANGE-CLASS
     /// narrowing (which leaves a value / property / read event assigns); the
@@ -1612,7 +1688,7 @@ mod tests {
     /// PVA-89: a long-string (`DBF_CHAR` `form="String"`) gateway
     /// pass-through must preserve non-UTF-8 bytes verbatim. pvxs reads the
     /// raw byte run up to NUL with no UTF-8 validation
-    /// (`singlesource.cpp:189-205`); the port keeps the bytes in
+    /// (`ioc/iocsource.cpp:133-136`); the port keeps the bytes in
     /// `PvString::from_bytes`, so a Latin-1 / binary CharArray reaches the
     /// PVA client unmangled rather than as U+FFFD replacements.
     #[test]
@@ -2316,7 +2392,7 @@ mod tests {
 
     /// NTEnum node must narrow its `value` leaf to `value.index`,
     /// not mark the whole `value` subtree. pvxs assigns only `value.index`
-    /// on a value event (`iocsource.cpp:107-109,331-351`) and fills
+    /// on a value event (`iocsource.cpp:107-112,335-351`) and fills
     /// `value.choices` solely via getProperties (`iocsource.cpp:278-285`).
     /// A bare `value` mark would, through `marked_changed_bitset`'s
     /// whole-subtree expansion, re-send the property-only `choices` array
@@ -2409,7 +2485,7 @@ mod tests {
     /// `groupsource.cpp:454-460`), then frames it with
     /// `to_wire_valid(R, value, &pvMask)` (`serverget.cpp:104`). So the wire
     /// carries only assigned leaves, and `getProperties`
-    /// (`iocsource.cpp:252-310`) assigns neither `control.minStep`, nor
+    /// (`iocsource.cpp:253-310`) assigns neither `control.minStep`, nor
     /// `valueAlarm.active`, nor the four `valueAlarm.*Severity` leaves, nor
     /// `valueAlarm.hysteresis` — pinned by pvxs's own delta,
     /// `testqsingle.cpp:129-149`, where those seven are absent while
@@ -2421,9 +2497,9 @@ mod tests {
     /// read-only-assigned `Const` node.
     /// R19-41: a property leaf the record type does not SUPPLY is never
     /// marked — on a read or on a property event alike. One case per gate
-    /// boundary of `dbChannelGet`'s option narrowing (`dbAccess.c:336-427`),
+    /// boundary of `dbChannelGet`'s option narrowing (`dbAccess.c:336-426`),
     /// which is what pvxs's `if(options & DBR_*)` reads
-    /// (`iocsource.cpp:263-305`):
+    /// (`iocsource.cpp:264-305`):
     ///
     /// * `units` off — the measured `stringout`;
     /// * `alarm_double` off — the measured `waveform`;
@@ -2592,7 +2668,7 @@ mod tests {
         );
 
         // `IOCSource::get` assigns `info.cval` for a Const member
-        // (`iocsource.cpp:319-322`) — a read frames it, no event ever posts
+        // (`iocsource.cpp:322-325`) — a read frames it, no event ever posts
         // it. Structure/Proc members are skipped on read as on post.
         assert_eq!(
             read_leaf_paths("k", FieldMapping::Const, true, NUMERIC_PROPS),
@@ -2601,7 +2677,7 @@ mod tests {
         );
         assert!(
             read_leaf_paths("s", FieldMapping::Structure, true, NUMERIC_PROPS).is_empty(),
-            "pvxs skips a Structure member on a read (`iocsource.cpp:316-317`)"
+            "pvxs skips a Structure member on a read (`iocsource.cpp:319-320`)"
         );
 
         // A subscripted member collapses to its enclosing array field on a
@@ -2615,7 +2691,7 @@ mod tests {
 
     /// R16-31: `IOCSource::initialize` assigns `display.form.index` only when
     /// the channel addresses the record's VAL field (`dbIsValueField`,
-    /// `iocsource.cpp:53`); `display.form.choices` is assigned for every
+    /// `iocsource.cpp:54`); `display.form.choices` is assigned for every
     /// field. A non-VAL channel (`REC.RVAL`) that marked the index shipped a
     /// changed bit and four bytes pvxs never sends.
     #[test]

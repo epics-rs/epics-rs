@@ -16,7 +16,7 @@
 //! The port had NEITHER half: no init load, and `read_link_value_soft` returned
 //! the constant on every cycle. The everyday consequence is not the exotic
 //! `field(INP,"[1,2,3]")` case — it is that an aai/waveform with an UNSET INP is
-//! a constant link too (`dbLink.c:220`), which is how EVERY client-fed array
+//! a constant link too (`dbLink.c:218`), which is how EVERY client-fed array
 //! record is configured. Whatever a client caput into VAL was overwritten by the
 //! empty constant on the next scan.
 //!
@@ -123,7 +123,7 @@ async fn constant_inp_is_not_re_applied_at_process() {
     }
 }
 
-/// The common case: an UNSET INP is a constant link (`dbLink.c:220`), so a
+/// The common case: an UNSET INP is a constant link (`dbLink.c:218`), so a
 /// device-fed / client-fed array record keeps the data it was given across
 /// scans. This is the case the pre-fix port wiped on every process.
 #[epics_macros_rs::epics_test]

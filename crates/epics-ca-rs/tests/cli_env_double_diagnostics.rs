@@ -22,18 +22,16 @@
 //! reject, `0x10` → 16, `1e400` → reject) are pinned by the per-boundary
 //! unit tests in `client::transport` and `server::tcp`.
 
-// Host/tokio-only: drives the async `caget`/`caput` CLI binaries out of
-// process. Those binaries are built with this feature too, so their
-// `CaClient` stack routes `spawn` to the background executor and then
-// reaches tokio I/O with no reactor. Inapplicable under the executor
-// backend; the RTEMS model has no async CLI client.
-#![cfg(not(feature = "rtems-exec-model"))]
-
 mod common;
 
-use std::process::{Command, Stdio};
+use std::process::Command;
 
+// Both are used only by the one `softioc-rs` case below, which the
+// reactor-free backend does not build.
+#[cfg(tokio_backend)]
 use common::LineCollector;
+#[cfg(tokio_backend)]
+use std::process::Stdio;
 
 /// stderr of `caget-rs` for a PV that does not exist — the tool still
 /// builds its client, which is where both variables are resolved. `-w 0.1`
@@ -74,18 +72,40 @@ fn conn_tmo_erange_prints_the_same_lines() {
     );
 }
 
-/// `inf` is a value C ACCEPTS (errno stays clear), so it must be silent —
-/// and must not abort the tool, which is what it used to do.
+/// `inf` PARSES — `strtod` leaves errno clear, so neither parse
+/// diagnostic is due — but it fails C's `finite()` guard
+/// (`cac.cpp:189-195` @`a8180003e`), so C defaults and says so, and so do
+/// we. It must also not abort the tool, which is what it used to do.
 #[test]
-fn conn_tmo_inf_is_accepted_silently() {
+fn conn_tmo_inf_parses_but_is_refused_like_c() {
     let err = caget_stderr("EPICS_CA_CONN_TMO", "inf");
     assert!(
         !err.contains("double fetch failed") && !err.contains("Unable to find a real number"),
-        "inf is a valid double for strtod; no diagnostic is due:\n{err}"
+        "inf is a valid double for strtod; no parse diagnostic is due:\n{err}"
+    );
+    assert!(
+        err.contains("\"EPICS_CA_CONN_TMO\" = inf is not a positive period"),
+        "a non-finite period is refused out loud, as C refuses it:\n{err}"
     );
     assert!(
         !err.contains("cannot convert float seconds to Duration"),
         "the from_secs_f64 panic must be gone:\n{err}"
+    );
+}
+
+/// Finite and enormous passes C's `finite()` guard, so C obeys it: the
+/// watchdog simply never fires. No diagnostic, no panic, no overflow when
+/// the deadline is built from `Duration::MAX`.
+#[test]
+fn conn_tmo_finite_enormous_is_obeyed_silently() {
+    let err = caget_stderr("EPICS_CA_CONN_TMO", "1e300");
+    assert!(
+        !err.contains("is not a positive period") && !err.contains("double fetch failed"),
+        "1e300 is finite and positive, so C obeys it:\n{err}"
+    );
+    assert!(
+        !err.contains("overflow when adding duration to instant"),
+        "the deadline built from Duration::MAX must saturate:\n{err}"
     );
 }
 
@@ -157,10 +177,14 @@ fn max_search_period_below_lower_limit_is_named() {
 /// "float fetch failed" pair for a bad value. The port resolved the server's
 /// UDP config from three points in startup (`bind_tcp_listeners`,
 /// `bind_sockets`, `CaServer::run`) and so printed the pair three times.
+// The only case here that spawns `softioc-rs` rather than `caget-rs`; that
+// binary refuses on `exec_backend`, where the async CA server it starts does
+// not exist. The other twelve read the client's own diagnostics and stay.
+#[cfg(tokio_backend)]
 #[test]
 fn beacon_period_reject_is_diagnosed_once_per_process() {
     let mut child = Command::new(env!("CARGO_BIN_EXE_softioc-rs"))
-        .args(["--pv", "R16-18:PV:double:1.0"])
+        .args(["-S", "--pv", "R16-18:PV:double:1.0"])
         // Keep the IOC off the network: loopback interface, loopback beacon
         // target, and a port the harness picks nothing else on.
         .env("EPICS_CAS_INTF_ADDR_LIST", "127.0.0.1")
@@ -179,7 +203,7 @@ fn beacon_period_reject_is_diagnosed_once_per_process() {
     // then take the IOC down and judge everything it wrote.
     let err_lines = LineCollector::spawn(child.stderr.take().expect("piped stderr"));
     assert!(
-        err_lines.wait_for(std::time::Duration::from_secs(10), |t| {
+        err_lines.wait_for(budget::FACT_BUDGET, |t| {
             t.contains("CA server: UDP search on port")
         }),
         "softioc-rs never printed its startup banner; stderr: {:?}",
@@ -230,3 +254,6 @@ fn conn_tmo_positive_period_is_silent() {
         "10.5 s is a valid period; no diagnostic is due:\n{err}"
     );
 }
+
+#[cfg(tokio_backend)]
+use common::budget;

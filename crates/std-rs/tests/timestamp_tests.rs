@@ -38,12 +38,18 @@ fn test_process_updates_oval() {
     let mut rec = TimestampRecord::default();
     rec.process().unwrap();
     let first = rec.val.clone();
-    // oval should be the old (empty) value
+    // OVAL is committed by `monitor_value_changed`, which is C's `monitor()`
+    // (`timestampRecord.c:158-162`), so it is still the old (empty) value
+    // until that hook runs.
     assert_eq!(rec.oval, "");
+    rec.monitor_value_changed();
+    assert_eq!(rec.oval, first, "the hook commits VAL into OVAL");
 
     rec.process().unwrap();
-    // oval should now be the first timestamp
-    assert_eq!(rec.oval, first);
+    rec.monitor_value_changed();
+    // The second cycle's value replaces it only if it differs; within the same
+    // second it does not, so OVAL still reads the first timestamp either way.
+    assert_eq!(rec.oval, rec.val);
 }
 
 #[test]
@@ -277,6 +283,7 @@ fn ctx_with_tse(tse: i16) -> ProcessContext {
         time: std::time::SystemTime::UNIX_EPOCH,
         tsel: String::new(),
         dtyp: String::new(),
+        callback_priority: epics_base_rs::runtime::task::CallbackPriority::Low,
     }
 }
 

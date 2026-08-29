@@ -1,8 +1,12 @@
 //! Top-level [`PvaServer`] runtime: spawns UDP responder + TCP listener.
 
-// RTEMS-EXEC-MODEL-ALLOW(10): checked - these run and pass in the feature-ON suite.
+// RTEMS-EXEC-MODEL-ALLOW(12): checked - these run and pass in the exec-backend
+// suite; the two v6 co-bind sites were run under
+// `EPICS_RS_BUILD_EXEC_BACKEND=thread` before being counted.
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::Arc;
+
+use epics_base_rs::net::PortUse;
 
 use crate::error::{PvaError, PvaResult};
 
@@ -63,7 +67,7 @@ where
 ///
 /// `EPICS_PVAS_INTF_ADDR_LIST` (`interfaces`) is the address set the
 /// server binds to; when empty it falls back to the single `bind_ip`
-/// wildcard default (pvxs `server.cpp:407-487` derives the TCP listener
+/// wildcard default (pvxs `src/server.cpp:407-487` derives the TCP listener
 /// set from `effective.interfaces`). A wildcard entry (`0.0.0.0` /
 /// `[::]`) subsumes every specific address — binding a specific address
 /// on top of a wildcard already holding the port would fail — so it is
@@ -166,32 +170,25 @@ impl PvaServer {
     where
         S: ChannelSource + 'static,
     {
-        // Robustness: pass `tcp_port = 0` and let the OS pick during
-        // the synchronous bind inside Self::start. The previous
-        // design pre-bound ephemeral ports just to know them, then
-        // dropped the binders before re-binding inside the accept
-        // task — a concurrent test could steal the freshly-released
-        // port in that window. Now there's no window at all: the
-        // listener that ends up serving clients is the one we bound
-        // before returning.
+        // Both ports stay 0 and `Self::start` does the binding, so the
+        // socket that serves clients is the one the binder is still
+        // holding. The pre-bind-read-drop this replaces handed back a
+        // number it had stopped owning: anything on the box could take
+        // the port between the drop and the responder's own bind. TCP
+        // was moved off that shape earlier; UDP kept it on the grounds
+        // that the responder task owned the socket lifecycle, which
+        // stopped being true once `start` began binding the search
+        // socket itself and stamping the kernel's answer onto
+        // `config.udp_port`.
         //
-        // UDP still uses pick-and-drop because the responder task
-        // owns the UDP socket lifecycle and we don't yet thread a
-        // pre-bound socket through; UDP search is also self-contained
-        // (each test gets its own ephemeral port and discovers via
-        // direct addr) so the race window is harmless there.
-        let pick_udp = || -> PvaResult<u16> {
-            let l = std::net::UdpSocket::bind((std::net::Ipv4Addr::LOCALHOST, 0))?;
-            let p = l.local_addr()?.port();
-            drop(l);
-            Ok(p)
-        };
-        let cfg = PvaServerConfig {
-            tcp_port: 0,
-            udp_port: pick_udp()?,
-            ..PvaServerConfig::isolated()
-        };
-        Self::start(source, cfg)
+        // The window mattered more here than a lost bind would: the
+        // search socket sets SO_REUSEPORT unconditionally, so a
+        // collision does not fail — a second server binds the same
+        // number and the two answer searches at random, with no error
+        // to detect afterwards. `bind_udp`'s own contract says the port
+        // must be read back and never probed; this was the one caller
+        // still probing it.
+        Self::start(source, PvaServerConfig::isolated())
     }
 
     /// Spawn the UDP responder and TCP listener; return a handle.
@@ -209,7 +206,7 @@ impl PvaServer {
     /// [`super::CompositeSource`] together with the built-in
     /// [`super::server_info::ServerInfoSource`]. The diagnostic source
     /// goes in at `"__server"`, `order = -1`, where pvxs keeps its
-    /// internals (server.cpp:542-546); the hand-in source goes in at
+    /// internals (src/server.cpp:542-546); the hand-in source goes in at
     /// `order = 0`, the default `Server::addSource` gives an application
     /// source (pvxs/server.h:116-118), so it sits strictly behind the
     /// internals as QSRV's own sources do (ioc/singlesourcehooks.cpp:158,
@@ -351,13 +348,13 @@ impl PvaServer {
 
         // Dedicated TLS listener(s). pvxs binds a SEPARATE per-interface TLS
         // socket on `effective.tls_port` alongside the plaintext one
-        // (server.cpp:595-608) and advertises it for a protoTLS SEARCH
-        // (server.cpp:849-852). Without a distinct listener a deployment that
-        // sets EPICS_PVAS_TLS_PORT — or a client addressed straight at the
-        // TLS port via a name server — could not reach the server, since the
-        // Rust server otherwise only listens on `tcp_port`. The listener runs
-        // the same first-byte dispatch as the plaintext one
-        // (`run_tcp_server_on_listener`): a TLS ClientHello is upgraded; a
+        // (src/server.cpp:580-594, `tls` `b3a10bf0`) and advertises it for a
+        // protoTLS SEARCH (src/server.cpp:835-844). Without a distinct listener a
+        // deployment that sets EPICS_PVAS_TLS_PORT — or a client addressed
+        // straight at the TLS port via a name server — could not reach the
+        // server, since the Rust server otherwise only listens on `tcp_port`.
+        // The listener runs the same first-byte dispatch as the plaintext
+        // one (`run_tcp_server_on_listener`): a TLS ClientHello is upgraded; a
         // plaintext peer is served plain unless `disable_plaintext` refuses
         // it. `bound_tls_port` is the port advertised as the `"tls"` endpoint.
         //
@@ -431,7 +428,7 @@ impl PvaServer {
         let protocol: &'static str = if config.tls.is_some() { "tls" } else { "tcp" };
         // The port advertised for `protocol` in SEARCH replies / beacons.
         // pvxs returns `tls_port` for a protoTLS reply and `tcp_port`
-        // otherwise (server.cpp:849-857); on a TLS server clients are
+        // otherwise (src/server.cpp:849-857); on a TLS server clients are
         // therefore steered to the dedicated TLS listener bound above.
         let advertised_tcp_port = if config.tls.is_some() {
             bound_tls_port
@@ -445,7 +442,12 @@ impl PvaServer {
         // beacons, and `client_config()` would all advertise 0. Binding here
         // and stamping the result back onto `config` keeps a single
         // bound-port source of truth (pvxs does the same read-back at
-        // `server.cpp:426`).
+        // `src/server.cpp:426`).
+        // Read *before* the stamp below: once `config.udp_port` carries the
+        // bound number, nothing downstream can tell an operator-configured
+        // port from the one the kernel chose, and the v6 companion would put
+        // the co-bind flag on a port nobody asked to share.
+        let udp_port_use = PortUse::from_caller(config.udp_port);
         let (udp_socket, bound_udp_port) = crate::server_native::udp::bind_udp(
             config.udp_port,
             &udp_interfaces,
@@ -476,6 +478,7 @@ impl PvaServer {
             Some(tokio::spawn(run_udp_responder_v6(
                 dyn_source.clone(),
                 config.udp_port,
+                udp_port_use,
                 advertised_tcp_port,
                 guid,
                 protocol,
@@ -643,7 +646,7 @@ impl PvaServer {
 
     /// like [`Self::report`] but, when `zero` is true, resets each peer's
     /// connection byte counters AND every per-channel tx/rx counter after
-    /// the snapshot — pvxs `Server::report(bool zero)` (server.cpp:256-272),
+    /// the snapshot — pvxs `Server::report(bool zero)` (src/server.cpp:256-272),
     /// so a subsequent report returns the deltas since this one. Channel
     /// membership and credentials are not reset.
     pub fn report_zeroed(&self, zero: bool) -> ServerReport {
@@ -710,7 +713,7 @@ impl PvaServer {
     /// Stop accepting new connections. Aborts both background tasks;
     /// per-client tasks already spawned continue independently and
     /// unwind on their next failed I/O. Mirrors pvxs `Server::stop`
-    /// (server.cpp:616) at the "no new connections" granularity. For
+    /// (src/server.cpp:616) at the "no new connections" granularity. For
     /// hard-stop semantics drop the entire `PvaServer` instead.
     pub fn stop(&self) {
         self.tcp_abort.abort();
@@ -1048,6 +1051,115 @@ mod tcp_fallback_tests {
         drop(server);
     }
 
+    /// Boundary — an *ephemeral* `udp_port`. `bind_udp` stamps the kernel's
+    /// answer back onto `config.udp_port`, so by the time the v6 companion is
+    /// spawned the number looks exactly like a configured one. Setting
+    /// SO_REUSEADDR on it lets a stranger co-bind `[::]:port` — measured on
+    /// Linux, SO_REUSEADDR on both sides is enough to share a wildcard UDP
+    /// port — and take a share of this server's v6 SEARCHes.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn an_ephemeral_v6_responder_port_cannot_be_co_bound() {
+        use crate::nt::typed::TypedNT;
+        use socket2::{Domain, Protocol, Socket, Type};
+        use std::net::{Ipv6Addr, SocketAddrV6};
+
+        let pv = crate::server_native::SharedPV::new();
+        pv.open(f64::descriptor(), f64::to_pv_field(&1.0)).unwrap();
+        let source = Arc::new(SharedSource::new());
+        source.add("V6:EPHEMERAL:PV", pv);
+
+        let config = PvaServerConfig {
+            tcp_port: 0,
+            udp_port: 0,
+            bind_ip: IpAddr::V4(Ipv4Addr::LOCALHOST),
+            auto_beacon: false,
+            beacon_destinations: Vec::new(),
+            enable_ipv6_udp: true,
+            ..Default::default()
+        };
+        let server = PvaServer::start(source, config).expect("v6 udp server must start");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let report = server.report();
+        assert!(report.udp_v6_alive, "the v6 responder must be running");
+        assert_ne!(report.udp_port, 0, "the bound port must be reported");
+
+        let intruder = Socket::new(Domain::IPV6, Type::DGRAM, Some(Protocol::UDP)).expect("socket");
+        intruder.set_only_v6(true).expect("v6 only");
+        // Asks for everything a sharer could ask for, so the refusal is the
+        // responder's exclusive bind and not the intruder's own half-set.
+        intruder.set_reuse_address(true).expect("reuse addr");
+        #[cfg(unix)]
+        intruder.set_reuse_port(true).expect("reuse port");
+        let addr = SocketAddrV6::new(Ipv6Addr::UNSPECIFIED, report.udp_port, 0, 0);
+        assert!(
+            intruder.bind(&addr.into()).is_err(),
+            "the v6 responder's ephemeral port {} must be exclusively owned; a \
+             second socket co-binding it would steal half the v6 SEARCHes",
+            report.udp_port
+        );
+        drop(server);
+    }
+
+    /// Boundary — a *configured* `udp_port` keeps SO_REUSEADDR, so two PVA
+    /// processes on one host can still both answer v6 SEARCHes on the
+    /// well-known port. This is what stops the fix above from being applied
+    /// to every v6 responder.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_configured_v6_responder_port_still_allows_co_bind() {
+        use crate::nt::typed::TypedNT;
+        use socket2::{Domain, Protocol, Socket, Type};
+        use std::net::{Ipv6Addr, SocketAddrV6};
+
+        // Take a port from the OS and hand the number back as a *configured*
+        // one, so the test never guesses at a free port.
+        let udp_port = {
+            let l = std::net::UdpSocket::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+                .expect("isolated udp port");
+            let p = l.local_addr().unwrap().port();
+            drop(l);
+            p
+        };
+
+        let pv = crate::server_native::SharedPV::new();
+        pv.open(f64::descriptor(), f64::to_pv_field(&1.0)).unwrap();
+        let source = Arc::new(SharedSource::new());
+        source.add("V6:CONFIGURED:PV", pv);
+
+        let config = PvaServerConfig {
+            tcp_port: 0,
+            udp_port,
+            bind_ip: IpAddr::V4(Ipv4Addr::LOCALHOST),
+            auto_beacon: false,
+            beacon_destinations: Vec::new(),
+            enable_ipv6_udp: true,
+            ..Default::default()
+        };
+        let server = PvaServer::start(source, config).expect("v6 udp server must start");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(
+            server.report().udp_v6_alive,
+            "the v6 responder must be running"
+        );
+
+        let peer = Socket::new(Domain::IPV6, Type::DGRAM, Some(Protocol::UDP)).expect("socket");
+        peer.set_only_v6(true).expect("v6 only");
+        // What a second IOC really binds with: the whole `PortUse::Shared`
+        // set. `SO_REUSEADDR` alone is enough for this on Linux and is not on
+        // macOS/BSD, where an exact-duplicate datagram bind needs both ends to
+        // carry `SO_REUSEPORT` — so a peer holding half of it measured the
+        // host's kernel rather than the responder's options.
+        peer.set_reuse_address(true).expect("reuse addr");
+        #[cfg(unix)]
+        peer.set_reuse_port(true).expect("reuse port");
+        let addr = SocketAddrV6::new(Ipv6Addr::UNSPECIFIED, udp_port, 0, 0);
+        assert!(
+            peer.bind(&addr.into()).is_ok(),
+            "a configured v6 responder port {udp_port} must stay co-bindable; \
+             a second IOC on this host has to receive the same v6 SEARCHes"
+        );
+        drop(server);
+    }
+
     /// PR #205 IPv6 Stage 2 — `enable_ipv6_udp = true` spawns a
     /// companion `[::]:udp_port` SEARCH responder. We send a hand-
     /// rolled SEARCH datagram from a v6 client socket against
@@ -1061,26 +1173,17 @@ mod tcp_fallback_tests {
         use std::net::Ipv6Addr;
         use tokio::net::UdpSocket as TokioUdp;
 
-        // Pick a free v4 UDP port via `Ipv4Addr::LOCALHOST` so the
-        // server's pick is OS-coordinated; the v6 responder will
-        // bind `[::]:that_port` for its companion listener.
-        let pick_udp = || {
-            let l = std::net::UdpSocket::bind((std::net::Ipv4Addr::LOCALHOST, 0))
-                .expect("isolated udp port");
-            let p = l.local_addr().unwrap().port();
-            drop(l);
-            p
-        };
-
         let pv = crate::server_native::SharedPV::new();
         pv.open(f64::descriptor(), f64::to_pv_field(&1.0)).unwrap();
         let source = Arc::new(SharedSource::new());
         source.add("V6:UDP:PV", pv);
 
-        let udp_port = pick_udp();
+        // Ephemeral, then read back: the v6 responder binds
+        // `[::]:udp_port` from the config `start` stamps, so a probed
+        // number would be one nobody held between the drop and the bind.
         let config = PvaServerConfig {
             tcp_port: 0,
-            udp_port,
+            udp_port: 0,
             bind_ip: IpAddr::V4(Ipv4Addr::LOCALHOST),
             auto_beacon: false,
             beacon_destinations: Vec::new(),
@@ -1089,6 +1192,7 @@ mod tcp_fallback_tests {
         };
         let server = PvaServer::start(source, config).expect("v6 udp server must start");
         let server_tcp_port = server.report().tcp_port;
+        let udp_port = server.report().udp_port;
         // Wait briefly for the v6 listener to bind.
         tokio::time::sleep(Duration::from_millis(50)).await;
         let report = server.report();
@@ -1663,9 +1767,9 @@ mod with_env_preserve_tests {
     const TLS_PORT_VARS: &[&str] = &["EPICS_PVAS_TLS_PORT", "EPICS_PVA_TLS_PORT"];
 
     /// `EPICS_PVAS_TLS_PORT` overrides `tls_port`; with only the shared
-    /// `EPICS_PVA_TLS_PORT` set that form wins (pvxs `config.cpp:513`
-    /// `PickOne{EPICS_PVAS_TLS_PORT, EPICS_PVA_TLS_PORT}`); an absent var
-    /// preserves the caller value.
+    /// `EPICS_PVA_TLS_PORT` set that form wins (pvxs `config.cpp:495`, `tls`
+    /// `b3a10bf0`, `PickOne{EPICS_PVAS_TLS_PORT, EPICS_PVA_TLS_PORT}`); an
+    /// absent var preserves the caller value.
     #[test]
     #[serial_test::serial(epics_env)]
     fn with_env_tls_port_pvas_first_then_shared_then_preserve() {
@@ -1719,5 +1823,56 @@ mod with_env_preserve_tests {
                 "isolated().with_env() must keep auto_beacon off"
             );
         });
+    }
+}
+
+/// The binder owns the socket and reports the number.
+///
+/// Stated over the source rather than over an outcome, because the outcome is
+/// unobservable: the search socket sets `SO_REUSEPORT`, so the collision this
+/// prevents does not fail a bind — the second server takes the same number and
+/// the two answer searches at random, with no error afterwards to assert on.
+/// What can be asserted is the shape `bind_udp`'s contract asks for, that no
+/// port reaches `start` from a socket the caller has already let go.
+#[cfg(test)]
+mod ports_are_read_back_not_probed {
+    /// `isolated()` hands `start` a config and nothing else. Needles are
+    /// assembled with `concat!` so this module's own text cannot satisfy the
+    /// check it performs.
+    #[test]
+    fn isolated_binds_no_socket_of_its_own() {
+        let prod =
+            source_guard::production(include_str!("runtime.rs"), source_guard::Comments::Strip);
+        let start = prod
+            .find("pub fn isolated<S>")
+            .expect("PvaServer::isolated is still in the production slice");
+        let end = prod[start..]
+            .find("pub fn start<S>")
+            .expect("start still follows isolated")
+            + start;
+        let body = &prod[start..end];
+        for needle in [
+            concat!("UdpSocket", "::bind("),
+            concat!("TcpListener", "::bind("),
+            concat!("TcpStream", "::connect("),
+        ] {
+            assert!(
+                !body.contains(needle),
+                "PvaServer::isolated opens a socket of its own (`{needle}`); the \
+                 port it then reports is one it has stopped holding, and a PVA \
+                 search-port collision is silent because the socket sets \
+                 SO_REUSEPORT"
+            );
+        }
+    }
+
+    /// The ephemeral sentinel is what `isolated()` relies on, so pin it: if
+    /// `PvaServerConfig::isolated()` ever grew a fixed port the guard above
+    /// would still pass while every isolated server shared one number.
+    #[test]
+    fn the_isolated_config_asks_for_ephemeral_ports() {
+        let cfg = super::PvaServerConfig::isolated();
+        assert_eq!(cfg.tcp_port, 0);
+        assert_eq!(cfg.udp_port, 0);
     }
 }

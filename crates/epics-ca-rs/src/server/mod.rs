@@ -7,15 +7,17 @@ pub mod addr_list;
 // the `discovery` stack) — is host-only; its deps do not build for RTEMS or
 // VxWorks. The embedded build serves CA through the `std::net` `blocking`
 // driver plus the runtime-agnostic shared logic in
-// `tcp`/`udp`/`monitor`/`stats`. Gated out for `epics_embedded_target`
-// (`armv7-rtems-eabihf`, the `*-wrs-vxworks*` triples).
-#[cfg(not(epics_embedded_target))]
+// `tcp`/`udp`/`monitor`/`stats`. The gate is `tokio_backend` — the accept loop
+// hands each client to `runtime::task::Reactor`, so it needs a build where
+// that seam is the tokio runtime, which excludes the two embedded targets and
+// a host `exec_backend` build alike.
+#[cfg(tokio_backend)]
 pub mod beacon;
 pub mod blocking;
-#[cfg(not(epics_embedded_target))]
+#[cfg(tokio_backend)]
 pub mod ca_server;
 pub(crate) mod frame;
-#[cfg(not(epics_embedded_target))]
+#[cfg(tokio_backend)]
 pub mod introspection;
 pub mod ioc_app;
 pub mod iocsh;
@@ -24,13 +26,13 @@ pub mod outbox;
 pub mod rate_limit;
 pub(crate) mod recv;
 pub(crate) mod send;
-#[cfg(all(feature = "cap-tokens", not(epics_embedded_target)))]
+#[cfg(all(feature = "cap-tokens", tokio_backend))]
 pub mod signed_beacon;
 pub mod stats;
 pub mod tcp;
 pub mod udp;
 
-#[cfg(not(epics_embedded_target))]
+#[cfg(tokio_backend)]
 pub use ca_server::{AccessRightsNotifier, CaServer, CaServerBuilder};
 /// Live-connection / byte / channel / subscription counters. Runtime-agnostic
 /// (pure atomics) and shared by the async server and the blocking driver's
@@ -39,11 +41,12 @@ pub use stats::ServerStats;
 pub use tcp::ServerConnectionEvent;
 
 // `run_ca_ioc` (below) builds a `CaServer` — the async front-end — so both it
-// and these imports are host-only. The embedded IOC entry point is the
-// blocking server driver (`server::blocking`).
-#[cfg(not(epics_embedded_target))]
+// and these imports carry its `tokio_backend` gate. Every reactor-free build
+// enters through the blocking server driver (`server::blocking`) instead: the
+// two embedded targets, and a host `exec_backend` build with them.
+#[cfg(tokio_backend)]
 use epics_base_rs::error::CaResult;
-#[cfg(not(epics_embedded_target))]
+#[cfg(tokio_backend)]
 use epics_base_rs::server::ioc_app::IocRunConfig;
 
 /// Convert a `$`-channel snapshot value from `EpicsValue::String` to
@@ -72,7 +75,7 @@ pub(super) fn apply_long_string(snap: &mut epics_base_rs::server::snapshot::Snap
 /// `EpicsValue::CharArray` to a scalar `EpicsValue::String`. C
 /// `cvt_dbaddr` presents lsi/lso VAL & OVAL and printf VAL as a scalar
 /// `DBF_STRING` with `no_elements = 1` (lsiRecord.c:141-143,
-/// lsoRecord.c:183-185, printfRecord.c:411-413); the record stores the
+/// lsoRecord.c:183-185, printfRecord.c:415-417); the record stores the
 /// value as a NUL-terminable CHAR array (the long-string carrier). This
 /// is the inverse of [`apply_long_string`] — the conversion the CA
 /// boundary applies for *plain* (non-`$`) access so the channel ships a
@@ -125,6 +128,25 @@ pub(super) fn apply_long_string_mode(
     }
 }
 
+/// Stand `app` up on Channel Access — [`run_ca_ioc`] with C's `rsrvRegistrar`
+/// already run, which is the only order that works.
+///
+/// C runs `rsrvRegistrar` out of `dbLoadDatabase`'s `.dbd` expansion
+/// (`rsrvIocRegister.c:34-38`), so `casr` and the `dbServer` join are in
+/// place before the first `st.cmd` line. Rust has no link-time registrar, so
+/// the port has to make the call — and a call every application head must
+/// remember is a rule that holds until one forgets. Pairing it with the
+/// runner here is what removes the choice: the head that wants a CA server
+/// says so once, and gets the registrar with it.
+///
+/// `IocApplication::run(run_ca_ioc)` still works and still registers `casr`
+/// on the INTERACTIVE shell — it is the startup shell, the one `st.cmd`
+/// executes on, that only this entry point can reach.
+#[cfg(tokio_backend)]
+pub async fn run_ca_ioc_app(app: epics_base_rs::server::ioc_app::IocApplication) -> CaResult<()> {
+    iocsh::register_rsrv_commands(app).run(run_ca_ioc).await
+}
+
 /// Run an IOC with the Channel Access protocol.
 ///
 /// This is the standard protocol runner for [`epics_base_rs::server::ioc_app::IocApplication::run`].
@@ -134,13 +156,24 @@ pub(super) fn apply_long_string_mode(
 /// # Example
 ///
 /// ```rust,ignore
-/// IocApplication::new()
-///     .startup_script("st.cmd")
-///     .run(epics_ca_rs::server::run_ca_ioc)
-///     .await
+/// epics_ca_rs::server::run_ca_ioc_app(
+///     IocApplication::new().startup_script("st.cmd"),
+/// )
+/// .await
 /// ```
-#[cfg(not(epics_embedded_target))]
+///
+/// [`run_ca_ioc_app`] rather than `.run(run_ca_ioc)`: a head that hands this
+/// runner to `IocApplication::run` directly gets `casr` on the prompt but not
+/// on the script, because this function is dispatched after the script has
+/// already run.
+#[cfg(tokio_backend)]
 pub async fn run_ca_ioc(config: IocRunConfig) -> CaResult<()> {
+    // For a caller that reaches the CA server only through this runner: C's
+    // `registrar(rsrvRegistrar)` is there from the moment the binary links
+    // RSRV, so it must not wait on `run_with_shell`. It is still too late for
+    // the startup script, which has already run by the time this runner is
+    // dispatched; `run_ca_ioc_app` is the entry point that is early enough.
+    iocsh::declare_rsrv_registrar();
     let server = CaServer::from_parts(
         config.db,
         config.port,
@@ -154,13 +187,178 @@ pub async fn run_ca_ioc(config: IocRunConfig) -> CaResult<()> {
     // `IocApplication::run` drains the hooks itself after PINI (H3) and
     // owns scanning via the core `ScanOwner`, so the CA server neither
     // runs hooks nor scans.
-    let casr = iocsh::casr_command(server.stats());
+    // No `casr` here: `run_with_shell` registers it for every caller, so
+    // pushing a second copy would depend on which one the registry keeps.
     server
         .run_with_shell(move |shell| {
-            shell.register(casr);
             for cmd in config.shell_commands {
                 shell.register(cmd);
             }
         })
         .await
+}
+
+/// The address lists RSRV's `casr` prints from level 1 up
+/// (`caservertask.c:938-1017`), assembled for
+/// [`iocsh::casr_command`].
+///
+/// C builds its `servers` list at bind time out of `casIntfAddrList`,
+/// and its multicast / beacon / ignore lists out of the same env parse;
+/// [`addr_list::from_env`] is that parse and is memoized, so reading it
+/// here re-derives the binder's own lists rather than re-resolving them.
+/// The one place this can disagree with the sockets actually bound is an
+/// interface whose broadcast responder failed to bind — `bind_udp_responders`
+/// logs that failure and continues, and C's report, reading the socket,
+/// would drop back to the "name server" wording.
+#[cfg(tokio_backend)]
+pub(crate) fn casr_addrs(server: &CaServer) -> CaResult<iocsh::CasrAddrs> {
+    use std::net::SocketAddr;
+
+    let cfg = addr_list::from_env()?;
+    let (udp_port, tcp_port) = (server.udp_port(), server.tcp_port());
+    Ok(iocsh::CasrAddrs {
+        interfaces: cfg
+            .intf_addrs
+            .iter()
+            .map(|ip| iocsh::CasrInterface {
+                tcp: SocketAddr::from((*ip, tcp_port)),
+                udp: SocketAddr::from((*ip, udp_port)),
+                udp_bcast: bcast_responder_addr(*ip, udp_port),
+            })
+            .collect(),
+        mcast: cfg
+            .mcast_addrs
+            .iter()
+            .map(|ip| SocketAddr::from((*ip, udp_port)))
+            .collect(),
+        beacon: cfg.beacon_addrs.clone(),
+        // C prints these with `sin_port = 0`.
+        ignore: cfg
+            .ignore_addrs
+            .iter()
+            .map(|ip| SocketAddr::from((*ip, 0)))
+            .collect(),
+    })
+}
+
+/// Where C binds a second UDP name-server socket for an interface, and this
+/// port binds one too.
+///
+/// Loopback is the one place the answer is `None` while C still binds:
+/// `osiSockDiscoverBroadcastAddresses` short-circuits an `INADDR_LOOPBACK`
+/// match to the loopback address itself (`osdNetIfAddrs.c:42-54`), so
+/// `rsrv_init` binds `udpbcast` to the same `127.0.0.1:<port>` under
+/// `epicsSocketEnableAddressUseForDatagramFanout` and runs a second
+/// `cast_server` thread, `CAS-UDP2` (`caservertask.c:677-706`, `:728-738`).
+/// SO_REUSEPORT hands each datagram to exactly one of that pair, so C
+/// answers a loopback search once — which is what one socket does.
+/// Measured with `ss -lunp`, `softIoc R7.0.10` against this port with
+/// `EPICS_CAS_INTF_ADDR_LIST` pinned: on `172.17.0.1` (`IFF_BROADCAST`)
+/// both bind `172.17.0.1:5188` and `172.17.255.255:5188`; on `127.0.0.1`
+/// C binds `127.0.0.1:5188` twice and this binds it once.
+///
+/// `casr` needs no adjustment for that: C picks its wording from whether
+/// the second socket exists, not from what the interface is
+/// (`caservertask.c:953-966`), so one socket prints C's own single
+/// `CAS-UDP name server` line.
+///
+/// The broadcast responder address for one interface, under the same
+/// gate `bind_udp_responders` binds the socket with — C
+/// `caservertask.c:671,728` skips it on Windows, and there is no
+/// broadcast address for a wildcard or loopback interface.
+#[cfg(tokio_backend)]
+fn bcast_responder_addr(ip: std::net::Ipv4Addr, port: u16) -> Option<std::net::SocketAddr> {
+    #[cfg(any(windows, target_os = "windows"))]
+    {
+        let _ = (ip, port);
+        None
+    }
+    #[cfg(not(any(windows, target_os = "windows")))]
+    {
+        addr_list::broadcast_for_ip(ip).map(|b| std::net::SocketAddr::from((b, port)))
+    }
+}
+
+#[cfg(test)]
+mod spawn_capability_guard {
+    //! The CA server's production code may not read an executor out of the
+    //! calling thread.
+    //!
+    //! Two entry points state which executor the server is on, and they are
+    //! the only places allowed to: `run_with_shell` starts `run` on the
+    //! ambient tokio `Handle` (`ca_server.rs:902`) because `run` drives
+    //! `tokio::net` listeners, and `run` mints from its own runtime the two
+    //! capabilities the sites below it need (`:997` tokio, `:999` seam).
+    //! `bridge.reactor()` used to place `run`, and on the exec backend that
+    //! is a callback band with no reactor, so the server bound its sockets
+    //! and then panicked inside `tokio::net` on the first accepted client.
+    //!
+    //! Below those two, a task site must take the capability as an argument.
+    //! A bare `tokio::spawn` reads the thread-local of whichever worker
+    //! happens to poll the caller, which is not necessarily the runtime that
+    //! owns the sockets — and being right on the host proves nothing about
+    //! the placement, which is the whole failure mode.
+    //!
+    //! `spawn_blocking` is deliberately not on this list — it names a
+    //! different pool with different band semantics on the exec backend, and
+    //! folding it in here would hide that difference behind one needle.
+    //!
+    //! `introspection.rs` is not on the file list either, and for the opposite
+    //! reason: its accept loop hands each request to a handler that does
+    //! `tokio::net` I/O, so that task belongs on the tokio runtime and nowhere
+    //! else — routing it through the seam `Reactor` puts it on a callback
+    //! worker under `exec_backend`, where it panics on the first poll
+    //! (`end_to_end_healthz` measures exactly that). The ambient read is sound
+    //! there because a successful `TcpListener::bind` earlier on the same task
+    //! already proves the runtime it reads.
+    //!
+    //! Needles are assembled with `concat!` so this module's own text cannot
+    //! satisfy the check it performs.
+
+    use source_guard::{Comments, production};
+
+    #[test]
+    fn server_production_spawns_go_through_a_held_reactor() {
+        let files: [(&str, &str); 4] = [
+            ("ca_server.rs", include_str!("ca_server.rs")),
+            ("tcp.rs", include_str!("tcp.rs")),
+            ("blocking.rs", include_str!("blocking.rs")),
+            ("monitor.rs", include_str!("monitor.rs")),
+        ];
+
+        // Fail closed: if the slicer ever stops covering the code this guard
+        // is about, say so instead of reporting a vacuous pass.
+        let anchors = [
+            ("ca_server.rs", "pub async fn run("),
+            ("tcp.rs", "fn write_notify_queue("),
+            ("blocking.rs", "fn command_drives_without_spawn("),
+            ("monitor.rs", "fn spawn_monitor_sender"),
+        ];
+
+        let bare = concat!("tokio", "::spawn(");
+        let aliased = concat!("tokio::task", "::spawn(");
+
+        for (name, src) in files {
+            let prod = production(src, Comments::Strip);
+            let anchor = anchors.iter().find(|(n, _)| *n == name).unwrap().1;
+            assert!(
+                prod.contains(anchor),
+                "{name}: production slice no longer contains `{anchor}` — the \
+                 slicer stopped covering the guarded code"
+            );
+            assert_eq!(
+                prod.matches(bare).count(),
+                0,
+                "{name}: production must start tasks on a capability handed \
+                 down from `run`; found bare `{bare}`, which reads the \
+                 executor out of whichever worker polls the caller"
+            );
+            assert_eq!(
+                prod.matches(aliased).count(),
+                0,
+                "{name}: found `{aliased}` — the same ambient read under \
+                 another name"
+            );
+        }
+    }
 }

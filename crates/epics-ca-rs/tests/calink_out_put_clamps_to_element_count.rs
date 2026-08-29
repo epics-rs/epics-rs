@@ -5,10 +5,10 @@
 //! `dbCaPutLinkCallback` does it before the CA request exists —
 //! `if(nRequest>pca->nelements) nRequest = pca->nelements;` then
 //! `aConvert(&dbAddr, pbuffer, nRequest, pca->nelements, 0)`
-//! (`dbCa.c:604-606`), against `pca->nelements = ca_element_count(chid)`
-//! (`:906`) — and `dbPut` does it for a local target with
+//! (`dbCa.c:575-577`), against `pca->nelements = ca_element_count(chid)`
+//! (`:862`) — and `dbPut` does it for a local target with
 //! `if (no_elements < nRequest) nRequest = no_elements;`
-//! (`dbAccess.c:1365`). Either way the surplus elements are dropped and
+//! (`dbAccess.c:1360-1361`). Either way the surplus elements are dropped and
 //! the put SUCCEEDS.
 //!
 //! The refusal that must survive is libca's own: a direct
@@ -18,12 +18,12 @@
 //! already clamped — which is why the clamp belongs to the link path and
 //! not to the client's write API. The last case pins that split.
 //!
-//! Not this rule: `dbAccess.c:995-1006` clamps `nRequest` on the GET
+//! Not this rule: `dbAccess.c:995-1003` clamps `nRequest` on the GET
 //! side against `no_elements` and against the caller's capacity. That is
 //! the read direction and a separate bound.
 
-// Host/tokio-only, for the reason given in `calink.rs`.
-#![cfg(not(feature = "rtems-exec-model"))]
+#![cfg(tokio_backend)]
+#![cfg(feature = "client-core")]
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -70,7 +70,7 @@ async fn wf3(pv: &str) -> (Arc<CaClient>, CaLinkResolver) {
     let resolver = CaLinkResolver::with_client(client.clone());
     assert!(
         resolver
-            .wait_for_link_connected(pv, Duration::from_secs(5))
+            .wait_for_link_connected(pv, budget::FACT_BUDGET)
             .await,
         "CA link must connect to the upstream CA server"
     );
@@ -81,13 +81,13 @@ async fn wf3(pv: &str) -> (Arc<CaClient>, CaLinkResolver) {
 /// fire-and-forget put is not raced.
 async fn readback_becomes(client: &CaClient, pv: &str, want: EpicsValue) {
     let ch = client.create_channel(pv);
-    ch.wait_connected(Duration::from_secs(5))
+    ch.wait_connected(budget::FACT_BUDGET)
         .await
         .expect("readback channel");
-    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    let deadline = std::time::Instant::now() + budget::FACT_BUDGET;
     loop {
         let got = ch
-            .get_with_timeout_count(Duration::from_secs(5), 0)
+            .get_with_timeout_count(budget::FACT_BUDGET, 0)
             .await
             .expect("readback get")
             .1;
@@ -117,7 +117,7 @@ async fn an_oversized_array_put_truncates_instead_of_failing() {
         LinkPutOp::Async,
     )
     .await
-    .expect("an oversized link put truncates, it does not fail (dbCa.c:604-605)");
+    .expect("an oversized link put truncates, it does not fail (dbCa.c:575-576)");
 
     readback_becomes(
         &client,
@@ -129,7 +129,7 @@ async fn an_oversized_array_put_truncates_instead_of_failing() {
 
 /// The plain fire-and-forget arm takes the same clamp — C applies it in
 /// `dbCaPutLinkCallback`, which is upstream of the `CA_PUT` /
-/// `CA_PUT_CALLBACK` split (`dbCa.c:614-624`), so both delivery
+/// `CA_PUT_CALLBACK` split (`dbCa.c:585-592`), so both delivery
 /// semantics see the already-clamped request.
 #[tokio::test(flavor = "multi_thread")]
 #[serial(epics_env)]
@@ -176,7 +176,7 @@ async fn an_oversized_put_to_a_scalar_target_keeps_the_first_element() {
     let resolver = CaLinkResolver::with_client(client.clone());
     assert!(
         resolver
-            .wait_for_link_connected("CALINK:CLAMP:AI", Duration::from_secs(5))
+            .wait_for_link_connected("CALINK:CLAMP:AI", budget::FACT_BUDGET)
             .await
     );
 
@@ -203,7 +203,7 @@ async fn a_direct_client_put_is_still_refused() {
     let (client, _resolver) = wf3("CALINK:CLAMP:DIRECT").await;
 
     let ch = client.create_channel("CALINK:CLAMP:DIRECT");
-    ch.wait_connected(Duration::from_secs(5))
+    ch.wait_connected(budget::FACT_BUDGET)
         .await
         .expect("direct channel");
     let err = ch
@@ -215,3 +215,6 @@ async fn a_direct_client_put_is_still_refused() {
         "the direct-write refusal must stay ECA_BADCOUNT-shaped, got: {err}"
     );
 }
+
+#[path = "common/budget.rs"]
+mod budget;

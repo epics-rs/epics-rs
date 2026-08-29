@@ -22,10 +22,10 @@ pub mod vxi11;
 // takes the plain POSIX path there too.
 //
 // VxWorks does *not* take the transport C uses: C predates VxWorks 7's POSIX
-// termios and drives the line through `ioctl(SIO_HW_OPTS_SET)` on a fake
-// one-field struct (`drvAsynSerialPort.c:43-62`). RTEMS's `libc` binding is
-// wrong rather than merely incomplete, so the ABI is declared in asyn-rs. The
-// evidence for both decisions is on `serial_port::platform`.
+// termios and drives the line through `ioctl(SIO_HW_OPTS_SET)`
+// (`drvAsynSerialPort.c:114`) on a fake one-field struct (`:55-62`). RTEMS's
+// `libc` binding is wrong rather than merely incomplete, so the ABI is declared
+// in asyn-rs. The evidence for both decisions is on `serial_port::platform`.
 #[cfg(unix)]
 pub mod serial_port;
 
@@ -49,7 +49,7 @@ pub mod serial_port;
 ///
 /// C reaches the same place from the other side: `readIt`/`writeIt` compute
 /// `pollmsec = (int)(timeout * 1000.0)` and then `if (pollmsec == 0) pollmsec =
-/// 1` (`drvAsynIPPort.c:775-777`, `:649-651`). Rounding every positive budget
+/// 1` (`drvAsynIPPort.c:741-743`, `:615-617`). Rounding every positive budget
 /// up is that floor generalised — C only ever sees the caller's timeout here,
 /// whereas the deadline loops also feed this a remainder. Each of those C
 /// triples ends `if (pollmsec < 0) pollmsec = -1`, the wait-forever case a
@@ -78,11 +78,91 @@ pub(crate) fn wait_millis(budget: std::time::Duration) -> u128 {
 
 #[cfg(test)]
 mod tests {
-    use super::wait_millis;
+    use super::*;
+    use crate::port::PortDriver;
     use std::time::Duration;
 
     /// The boundary the owner exists to hold: the two zeros stay apart, and
     /// nothing positive rounds down into the expired one.
+    /// No production C asyn driver passes `ASYN_DESTRUCTIBLE` to `registerPort`
+    /// at pin `e2a281e2`. The flag occurs in exactly six places there — its
+    /// definition (asynDriver.h:97), its two consumers (asynManager.c:2096 in
+    /// `registerPort`, :2271 in `shutdownPort`), the `asynPortDriver` base that
+    /// forwards a caller's `asynFlags` (asynPortDriver.cpp:3996), and two *test*
+    /// drivers (testAsynPortDriver.cpp:54, asynPortDriverTest.cpp:58) — plus
+    /// documentation. Every real transport registers without it, so a port that
+    /// grants `PortManager::shutdown_port` rights grants what C refuses.
+    ///
+    /// The attribute argument each C original actually passes:
+    ///
+    /// | port | C original | attributes |
+    /// |---|---|---|
+    /// | FTDI | drvAsynFTDIPort.cpp:586-587 | `ASYN_CANBLOCK` |
+    /// | IP | drvAsynIPPort.c:1028-1029 | `ASYN_CANBLOCK` |
+    /// | IP server (listener) | drvAsynIPServerPort.c:625-626 | `ASYN_CANBLOCK` |
+    /// | IP server (child) | drvAsynIPServerPort.c:690 → drvAsynIPPortConfigure | `ASYN_CANBLOCK` |
+    /// | serial | drvAsynSerialPort.c:1101-1102 | `ASYN_CANBLOCK` |
+    /// | serial (win32) | drvAsynSerialPortWin32.c:774-775 | `ASYN_CANBLOCK` |
+    /// | USBTMC | drvAsynUSBTMC.c:1273-1274 | `ASYN_CANBLOCK` |
+    /// | VXI-11 | drvVxi11.c:1759-1762 | `ASYN_CANBLOCK` (`\| ASYN_MULTIDEVICE` unless single-link) |
+    /// | Prologix GPIB | drvPrologixGPIB.c:592-593 | `ASYN_CANBLOCK \| ASYN_MULTIDEVICE` |
+    ///
+    /// `null_port` has no C original; it declares itself a mirror of
+    /// drvAsynIPPort, so it inherits that row.
+    ///
+    /// The win32 serial port is not compiled on this host (`#[cfg(windows)]`,
+    /// drivers/mod.rs:32-34), so it is fixed but not covered here.
+    #[test]
+    fn no_ported_driver_grants_the_shutdown_rights_c_withholds() {
+        // Collect rather than assert per port: a first-failure panic would hide
+        // how far the family reaches, and the family is the point.
+        let mut granted: Vec<&str> = Vec::new();
+        let mut check = |what: &'static str, d: &dyn PortDriver| {
+            if d.base().flags.destructible {
+                granted.push(what);
+            }
+        };
+
+        let server =
+            ip_server_port::DrvAsynIPServerPort::new("SRV", "127.0.0.1:0 tcp").expect("server");
+        let child = server.make_subport(0).expect("subport 0");
+
+        check(
+            "ftdi",
+            &ftdi::DrvAsynFtdiPort::configure("FTDI", 0x0403, 0x6001, 9600, 1, 0, true, false, 0)
+                .expect("ftdi"),
+        );
+        check(
+            "ip_port",
+            &ip_port::DrvAsynIPPort::new("IP", "127.0.0.1:1234 TCP").expect("ip"),
+        );
+        check("ip_server_port (listener)", &server);
+        check("ip_server_port (child)", &child);
+        check("null_port", &null_port::NullOctetPort::new("NULLP"));
+        check(
+            "prologix",
+            &prologix::DrvAsynPrologixPort::new("GPIB", "127.0.0.1:1234", true).expect("prologix"),
+        );
+        check(
+            "serial_port",
+            &serial_port::DrvAsynSerialPort::new("SER", "/dev/null").expect("serial"),
+        );
+        check(
+            "usbtmc",
+            &usbtmc::DrvAsynUsbtmcPort::configure("TMC", 0x0957, 0x1755, "", 0, 1).expect("usbtmc"),
+        );
+        check(
+            "vxi11",
+            &vxi11::DrvVxi11Port::configure("VXI", "127.0.0.1", 0, "", "inst0", 0, true)
+                .expect("vxi11"),
+        );
+
+        assert!(
+            granted.is_empty(),
+            "these ports grant ASYN_DESTRUCTIBLE where their C original withholds it: {granted:?}"
+        );
+    }
+
     #[test]
     fn wait_millis_separates_an_expired_budget_from_a_sub_millisecond_one() {
         assert_eq!(wait_millis(Duration::ZERO), 0);

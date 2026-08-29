@@ -33,21 +33,27 @@ mod r#static;
 
 pub use r#static::StaticBackend;
 
-#[cfg(feature = "discovery-dns-update")]
+// `tokio_backend` on the three that own a socket, and on nothing else. `zone`
+// renders text, so it follows its cargo feature alone.
+#[cfg(all(feature = "discovery-dns-update", tokio_backend))]
 mod dns_update;
-#[cfg(feature = "discovery")]
+#[cfg(all(feature = "discovery", tokio_backend))]
 mod dnssd;
-#[cfg(feature = "discovery")]
+#[cfg(all(feature = "discovery", tokio_backend))]
 mod mdns;
+#[cfg(feature = "discovery-dns-update")]
+mod tsig;
 #[cfg(feature = "discovery")]
 mod zone;
 
-#[cfg(feature = "discovery-dns-update")]
-pub use dns_update::{DnsRegistration, DnsUpdater, TsigAlgo, TsigKey};
-#[cfg(feature = "discovery")]
+#[cfg(all(feature = "discovery-dns-update", tokio_backend))]
+pub use dns_update::{DnsRegistration, DnsUpdater};
+#[cfg(all(feature = "discovery", tokio_backend))]
 pub use dnssd::DnsSdBackend;
-#[cfg(feature = "discovery")]
+#[cfg(all(feature = "discovery", tokio_backend))]
 pub use mdns::{MdnsAnnouncer, MdnsBackend};
+#[cfg(feature = "discovery-dns-update")]
+pub use tsig::{TsigAlgo, TsigKey};
 #[cfg(feature = "discovery")]
 pub use zone::ZoneSnippet;
 
@@ -102,11 +108,11 @@ pub enum DiscoveryConfig {
     /// Plain `EPICS_CA_ADDR_LIST` style — explicit list of addresses.
     Static(Vec<SocketAddr>),
     /// Discover via mDNS on the link-local segment.
-    #[cfg(feature = "discovery")]
+    #[cfg(all(feature = "discovery", tokio_backend))]
     Mdns,
     /// Discover via unicast DNS-SD against a site DNS server.
     /// `zone` is the DNS zone to query, e.g. `facility.local`.
-    #[cfg(feature = "discovery")]
+    #[cfg(all(feature = "discovery", tokio_backend))]
     DnsSd { zone: String },
     /// Try multiple backends in order, merging the results.
     Composite(Vec<DiscoveryConfig>),
@@ -118,7 +124,7 @@ pub fn build_backends(cfg: DiscoveryConfig) -> Vec<Box<dyn Backend>> {
     match cfg {
         DiscoveryConfig::Static(addrs) => vec![Box::new(StaticBackend::new(addrs))],
         DiscoveryConfig::Composite(items) => items.into_iter().flat_map(build_backends).collect(),
-        #[cfg(feature = "discovery")]
+        #[cfg(all(feature = "discovery", tokio_backend))]
         DiscoveryConfig::Mdns => match mdns::MdnsBackend::new() {
             Ok(b) => vec![Box::new(b)],
             Err(e) => {
@@ -126,7 +132,7 @@ pub fn build_backends(cfg: DiscoveryConfig) -> Vec<Box<dyn Backend>> {
                 vec![]
             }
         },
-        #[cfg(feature = "discovery")]
+        #[cfg(all(feature = "discovery", tokio_backend))]
         DiscoveryConfig::DnsSd { zone } => match dnssd::DnsSdBackend::new(zone) {
             Ok(b) => vec![Box::new(b)],
             Err(e) => {
@@ -166,28 +172,32 @@ pub fn from_env() -> Option<DiscoveryConfig> {
 
 fn parse_token(tok: &str) -> Option<DiscoveryConfig> {
     if tok == "mdns" {
-        #[cfg(feature = "discovery")]
+        #[cfg(all(feature = "discovery", tokio_backend))]
         {
             return Some(DiscoveryConfig::Mdns);
         }
-        #[cfg(not(feature = "discovery"))]
+        #[cfg(not(all(feature = "discovery", tokio_backend)))]
         {
-            tracing::warn!("EPICS_CA_DISCOVERY=mdns ignored — built without `discovery` feature");
+            tracing::warn!(
+                "EPICS_CA_DISCOVERY=mdns ignored — this build has no mDNS backend \
+                 (needs the `discovery` feature and a reactor-backed execution model)"
+            );
             return None;
         }
     }
     if let Some(zone) = tok.strip_prefix("dnssd:") {
-        #[cfg(feature = "discovery")]
+        #[cfg(all(feature = "discovery", tokio_backend))]
         {
             return Some(DiscoveryConfig::DnsSd {
                 zone: zone.to_string(),
             });
         }
-        #[cfg(not(feature = "discovery"))]
+        #[cfg(not(all(feature = "discovery", tokio_backend)))]
         {
             let _ = zone;
             tracing::warn!(
-                "EPICS_CA_DISCOVERY=dnssd:* ignored — built without `discovery` feature"
+                "EPICS_CA_DISCOVERY=dnssd:* ignored — this build has no DNS-SD backend \
+                 (needs the `discovery` feature and a reactor-backed execution model)"
             );
             return None;
         }
@@ -264,13 +274,13 @@ mod tests {
         }
     }
 
-    #[cfg(feature = "discovery")]
+    #[cfg(all(feature = "discovery", tokio_backend))]
     #[test]
     fn parse_mdns_token() {
         assert!(matches!(parse_token("mdns"), Some(DiscoveryConfig::Mdns)));
     }
 
-    #[cfg(feature = "discovery")]
+    #[cfg(all(feature = "discovery", tokio_backend))]
     #[test]
     fn parse_dnssd_token() {
         let cfg = parse_token("dnssd:facility.local").unwrap();

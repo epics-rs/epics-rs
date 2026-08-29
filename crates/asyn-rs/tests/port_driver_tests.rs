@@ -6,6 +6,14 @@
 //! - testErrors: error status propagation
 //! - echoDriver: octet read/write
 
+// RTEMS-EXEC-MODEL-ALLOW(20): checked, not waived — all 20 ran and passed
+// on the exec backend (measured on this tree:
+// `EPICS_RS_BUILD_EXEC_BACKEND=thread cargo nextest run -p asyn-rs
+// --all-features`, 1081/1081). asyn-rs became a census subject when its
+// `build.rs` began deriving `tokio_backend`; nothing here builds a CA
+// server, and the reactor these obtain comes from `#[tokio::test]`
+// itself, which the backend does not remove.
+
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -186,8 +194,8 @@ impl PortDriver for EchoDriver {
     }
 
     fn write_octet(&mut self, user: &mut AsynUser, data: &[u8]) -> AsynResult<usize> {
-        let s = String::from_utf8_lossy(data).to_string();
-        self.base.set_string_param(user.reason, user.addr, s)?;
+        self.base
+            .set_string_param(user.reason, user.addr, data.to_vec())?;
         self.base.call_param_callbacks(user.addr)?;
         Ok(data.len())
     }

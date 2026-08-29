@@ -1,7 +1,7 @@
 # Functional Review - 2026-05-20
 
 Scope: `epics-pva-rs` current workspace state, compared against
-`~/codes/pvxs` client/server/pvData behavior. This file records open
+`$PVXS_HOME` client/server/pvData behavior. This file records open
 functional gaps and bugs that are still visible in the current Rust code.
 Older review items that current code has closed, such as NTNDArray schema
 support, OriginTag UDP handling, and partial monitor bitsets, are not repeated
@@ -9,20 +9,26 @@ as open findings.
 
 ## Summary
 
-| ID | Type | Severity | Area | Status |
-|----|------|----------|------|--------|
-| PVA-FR-1 | Bug / missing pvxs wire case | High | compound arrays | Done |
-| PVA-FR-2 | Missing pvxs API behavior | Medium | report diagnostics | Done |
-| PVA-FR-3 | Missing pvxs IOC access behavior | Medium | ACF roles / CALC | Done |
-| PVA-FR-4 | Missing pvxs monitor behavior | Medium | pipeline watermarks | Done |
-| PVA-FR-5 | Bug / lossy wire fallback | Medium | `any` descriptor recovery | Done |
-| PVA-FR-6 | Missing pvxs tool behavior | Medium | `pvput-rs` field assignment | Done |
-| PVA-FR-7 | Bug | Medium | operation wait timeout | Done |
-| PVA-FR-8 | Bug | High | monitor pause/resume queueing | Done |
-| PVA-FR-9 | Missing pvxs API behavior | Medium | operation interrupt result | Done |
-| PVA-FR-10 | Bug / missing pvxs API behavior | Medium | subscription stats | Done |
-| PVA-FR-11 | Missing pvxs API behavior | Medium | monitor start / pause callback | Done |
-| PVA-FR-12 | Bug / missing pvxs behavior | Medium | initial search timeout | Done |
+Recording note (2026-08-26): the Status column read `Done` for every row,
+which is a word outside every verdict vocabulary and names no commit, so a
+per-row scan reported all twelve of these open. The column now carries a
+verdict and a commit; the sections below still describe each gap in the
+present tense of the day they were written.
+
+| ID | Type | Severity | Area | Status | Closed by |
+|----|------|----------|------|--------|-----------|
+| PVA-FR-1 | Bug / missing pvxs wire case | High | compound arrays | **CLEARED** | `ba2cf956` |
+| PVA-FR-2 | Missing pvxs API behavior | Medium | report diagnostics | **CLEARED** | `92270a36` client, `75b8da21` server |
+| PVA-FR-3 | Missing pvxs IOC access behavior | Medium | ACF roles / CALC | **CLEARED** | `adf6490b`, `3d59e9d0`, `2d6790b3` |
+| PVA-FR-4 | Missing pvxs monitor behavior | Medium | pipeline watermarks | **CLEARED** | `48702451` |
+| PVA-FR-5 | Bug / lossy wire fallback | Medium | `any` descriptor recovery | **CLEARED** | `be116923` |
+| PVA-FR-6 | Missing pvxs tool behavior | Medium | `pvput-rs` field assignment | **CLEARED** | `0ca7135e` |
+| PVA-FR-7 | Bug | Medium | operation wait timeout | **CLEARED** | `c87f71a6` |
+| PVA-FR-8 | Bug | High | monitor pause/resume queueing | **CLEARED** | `18924ac0` |
+| PVA-FR-9 | Missing pvxs API behavior | Medium | operation interrupt result | **CLEARED** | `7fafed76` |
+| PVA-FR-10 | Bug / missing pvxs API behavior | Medium | subscription stats | **CLEARED** | `afee6604` |
+| PVA-FR-11 | Missing pvxs API behavior | Medium | monitor start / pause callback | **CLEARED** | `6b24c4fd` |
+| PVA-FR-12 | Bug / missing pvxs behavior | Medium | initial search timeout | **CLEARED** | `d65c91a2` |
 
 ## PVA-FR-1: compound arrays cannot preserve null elements
 
@@ -51,7 +57,7 @@ Rust evidence:
 
 pvxs reference:
 
-- `~/codes/pvxs/src/dataencode.cpp:354-365` writes `0x00` for null
+- `$PVXS_HOME/src/dataencode.cpp:354-365` writes `0x00` for null
   `StructA` elements and `0x01 + body` for present elements.
 - `dataencode.cpp:368-378` does the same for `UnionA`.
 - `dataencode.cpp:382-393` does the same for `AnyA`.
@@ -109,11 +115,11 @@ Rust evidence:
 
 pvxs reference:
 
-- `~/codes/pvxs/src/pvxs/netcommon.h:43-68` defines `Report` with
+- `$PVXS_HOME/src/pvxs/netcommon.h:43-68` defines `Report` with
   connections and per-connection channel lists.
-- `~/codes/pvxs/src/client.cpp:463-505` snapshots client connection and
+- `$PVXS_HOME/src/client.cpp:463-505` snapshots client connection and
   channel byte counters, then zeros counters when requested.
-- `~/codes/pvxs/src/server.cpp:237-278` snapshots server connections,
+- `$PVXS_HOME/src/server.cpp:237-278` snapshots server connections,
   credentials, channel counters, and `ReportInfo`, then zeros counters when
   requested.
 
@@ -162,13 +168,13 @@ Rust evidence:
 
 pvxs / epics-base reference:
 
-- `~/codes/pvxs/ioc/securityclient.cpp:19-31` creates AS clients through
+- `$PVXS_HOME/ioc/securityclient.cpp:19-31` creates AS clients through
   epics-base `asAddClient()`, so QSRV uses the C access-security engine for IOC
   records.
-- `~/codes/pvxs/documentation/ioc.rst:181-188` documents QSRV-specific access
+- `$PVXS_HOME/documentation/ioc.rst:181-188` documents QSRV-specific access
   policy differences, including `role/...` UAG members matched against local
   group-derived role credentials.
-- `~/codes/epics-base/modules/libcom/src/as/asLibRoutines.c:957-964` and
+- `$EPICS_BASE/modules/libcom/src/as/asLibRoutines.c:957-964` and
   `:1038-1042` dynamically evaluate CALC-gated rules.
 
 Impact:
@@ -220,10 +226,10 @@ Rust evidence:
 
 pvxs reference:
 
-- `~/codes/pvxs/src/pvxs/source.h:120-128` defines watermarks as flow-control
+- `$PVXS_HOME/src/pvxs/source.h:120-128` defines watermarks as flow-control
   levels on the outbound window and says high fires after client ACK when the
   window is above `high`.
-- `~/codes/pvxs/src/servermon.cpp:321-334` stores per-operation low/high levels
+- `$PVXS_HOME/src/servermon.cpp:321-334` stores per-operation low/high levels
   from `setWatermarks()`.
 - `servermon.cpp:653-663` fires `onHighMark` in the ACK path after adding window
   credit.
@@ -286,11 +292,11 @@ Rust evidence:
 
 pvxs reference:
 
-- `~/codes/pvxs/src/dataimpl.h:35` exposes `Value::Helper::desc(val)` as the
+- `$PVXS_HOME/src/dataimpl.h:35` exposes `Value::Helper::desc(val)` as the
   stored descriptor pointer.
-- `~/codes/pvxs/src/type.cpp:317-333` builds a `TypeDef` from the descriptor
+- `$PVXS_HOME/src/type.cpp:317-333` builds a `TypeDef` from the descriptor
   attached to a `Value`, not by reconstructing schema from the current contents.
-- `~/codes/pvxs/src/dataencode.cpp:411` encodes values through
+- `$PVXS_HOME/src/dataencode.cpp:411` encodes values through
   `Value::Helper::desc(val)`, and `:416-418` does the same for masked valid
   encoding.
 
@@ -351,7 +357,7 @@ Rust evidence:
 
 pvxs reference:
 
-- `~/codes/pvxs/tools/put.cpp:83-104` parses one bare value as `value=<arg>`;
+- `$PVXS_HOME/tools/put.cpp:83-104` parses one bare value as `value=<arg>`;
   otherwise every argument must be `<field>=<value>` and is stored by field path.
 - `put.cpp:115-134` builds from the channel prototype, calls
   `val.unmark(false, true)`, assigns every parsed field with `val[pair.first] =
@@ -407,11 +413,11 @@ Rust evidence:
 
 pvxs reference:
 
-- `~/codes/pvxs/src/pvxs/client.h:132-142` defines `Operation::wait(timeout)` as
+- `$PVXS_HOME/src/pvxs/client.h:132-142` defines `Operation::wait(timeout)` as
   waiting for completion, timeout, or interruption.
-- `~/codes/pvxs/src/client.cpp:287-299` throws `Timeout()` when
+- `$PVXS_HOME/src/client.cpp:287-299` throws `Timeout()` when
   `notify.wait(timeout)` expires, without changing the waiter's `outcome`.
-- `client.cpp:301-310` changes the outcome only when the operation completes or
+- `src/client.cpp:302-312` changes the outcome only when the operation completes or
   is interrupted.
 
 Impact:
@@ -461,9 +467,9 @@ Rust evidence:
 
 pvxs reference:
 
-- `~/codes/pvxs/src/clientmon.cpp:115-140` sends STOP (`0x04`) and START
+- `$PVXS_HOME/src/clientmon.cpp:115-140` sends STOP (`0x04`) and START
   (`0x44`) for `Subscription::pause()`.
-- `~/codes/pvxs/src/servermon.cpp:671-688` changes the monitor operation state
+- `$PVXS_HOME/src/servermon.cpp:671-688` changes the monitor operation state
   between `Idle` and `Executing` and calls `maybeReply()` on START.
 - `servermon.cpp:271-296` queues posted values before `maybeReply()` without
   requiring the operation state to be `Executing`.
@@ -518,13 +524,13 @@ Rust evidence:
 
 pvxs reference:
 
-- `~/codes/pvxs/src/pvxs/client.h:67-79` declares separate `Interrupted` and
+- `$PVXS_HOME/src/pvxs/client.h:67-79` declares separate `Interrupted` and
   `Timeout` exception types.
 - `client.h:132-150` documents `Operation::wait()` as throwing `Timeout` for
   deadline expiry and `Interrupted` for `interrupt()`.
-- `~/codes/pvxs/src/client.cpp:287-299` throws `Timeout()` when the wait expires
+- `$PVXS_HOME/src/client.cpp:287-299` throws `Timeout()` when the wait expires
   and `Interrupted()` when the waiter outcome is aborted by interrupt.
-- `client.cpp:333-337` implements `OperationBase::interrupt()` by completing the
+- `src/client.cpp:334-338` implements `OperationBase::interrupt()` by completing the
   waiter with the interrupt path.
 
 Impact:
@@ -581,9 +587,9 @@ Rust evidence:
 
 pvxs reference:
 
-- `~/codes/pvxs/src/pvxs/client.h:165-177` defines `SubscriptionStat` with
+- `$PVXS_HOME/src/pvxs/client.h:165-177` defines `SubscriptionStat` with
   `nQueue`, `nSrvSquash`, `nCliSquash`, `maxQueue`, and `limitQueue`.
-- `~/codes/pvxs/src/clientmon.cpp:549-558` parses the MONITOR overrun bitset and
+- `$PVXS_HOME/src/clientmon.cpp:549-558` parses the MONITOR overrun bitset and
   sets a `servSquash` flag when any word is non-zero.
 - `clientmon.cpp:676-685` increments `nCliSquash` when the client queue squashes
   a value update.
@@ -646,9 +652,9 @@ Rust evidence:
 
 pvxs reference:
 
-- `~/codes/pvxs/src/pvxs/source.h:130-133` declares
+- `$PVXS_HOME/src/pvxs/source.h:130-133` declares
   `MonitorControlOp::onStart(std::function<void(bool start)>)`.
-- `~/codes/pvxs/src/servermon.cpp:34-39` calls `onStart(false)` when a running
+- `$PVXS_HOME/src/servermon.cpp:34-39` calls `onStart(false)` when a running
   monitor is cancelled back to idle.
 - `servermon.cpp:339-346` stores the user callback.
 - `servermon.cpp:677-683` calls `onStart(start)` when MONITOR START / STOP
@@ -703,14 +709,14 @@ Rust evidence:
 
 pvxs reference:
 
-- `~/codes/pvxs/src/client.cpp:42` sets the initial search delay to 10 ms, not a
+- `$PVXS_HOME/src/client.cpp:43` sets the initial search delay to 10 ms, not a
   failure deadline.
-- `client.cpp:377-380` places a new channel into `initialSearchBucket` and
+- `src/client.cpp:378-381` places a new channel into `initialSearchBucket` and
   schedules the initial searcher.
-- `client.cpp:740-746` schedules the initial search callback.
-- `client.cpp:1243-1249` runs initial search by calling
+- `src/client.cpp:761-771` schedules the initial search callback.
+- `src/client.cpp:1266-1275` runs initial search by calling
   `tickSearch(SearchKind::initial, false)`.
-- `client.cpp:287-293` and `:326-330` make the public operation wait timeout the
+- `src/client.cpp:288-300` and `:327-332` make the public operation wait timeout the
   timeout that returns `pvxs::client::Timeout`.
 
 Impact:

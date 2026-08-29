@@ -44,7 +44,7 @@
 /// * A trailing lone `\` is dropped.
 ///
 /// A `\xHH` denotes ONE byte — including `HH >= 0x80`, where C's `OUT(u)`
-/// (`epicsString.c:106`) writes a single `char`. That is why this returns
+/// (`epicsString.c:105`) writes a single `char`. That is why this returns
 /// BYTES: a `DBF_STRING` is a byte string with a 40-byte budget, and modelling
 /// it as a Rust `String` turned `\xff` into the two UTF-8 bytes of U+00FF.
 /// Measured on softIoc — `field(VAL,"h\xffz")` stores the three bytes `h`,

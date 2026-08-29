@@ -42,6 +42,7 @@ record(busy, "BSY") {
 #[epics_macros_rs::epics_test]
 async fn a_foreign_process_inside_the_high_window_does_not_release_the_pulse() {
     let db = IocBuilder::new()
+        .register_record_type("busy", || Box::new(BusyRecord::default()))
         .db_string(DB, &std::collections::HashMap::new())
         .unwrap()
         .build()
@@ -80,6 +81,7 @@ async fn a_foreign_process_inside_the_high_window_does_not_release_the_pulse() {
 #[epics_macros_rs::epics_test]
 async fn a_foreign_process_does_not_clear_a_busy_flag_early() {
     let db = IocBuilder::new()
+        .register_record_type("busy", || Box::new(BusyRecord::default()))
         .db_string(DB, &std::collections::HashMap::new())
         .unwrap()
         .build()
@@ -118,6 +120,7 @@ record(bo, "SB") {
 }
 "#;
     let db = IocBuilder::new()
+        .register_record_type("busy", || Box::new(BusyRecord::default()))
         .db_string(SHORT, &std::collections::HashMap::new())
         .unwrap()
         .build()

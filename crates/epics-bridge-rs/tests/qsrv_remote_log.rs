@@ -14,8 +14,7 @@
 //! ioid, its `messageType` byte, and its text.
 
 #![cfg(feature = "qsrv")]
-
-// RTEMS-EXEC-MODEL-ALLOW(16): checked - these run and pass in the feature-ON suite.
+#![cfg(tokio_backend)]
 
 use std::io::Write;
 use std::net::SocketAddr;
@@ -37,7 +36,8 @@ use epics_pva_rs::pvdata::encode::{
     encode_type_desc,
 };
 use epics_pva_rs::pvdata::{FieldDesc, PvField, PvStructure, ScalarValue};
-use epics_pva_rs::server_native::{PvaServer, PvaServerConfig};
+use epics_pva_rs::server_native::PvaServer;
+use epics_pva_rs::server_native::PvaServerConfig;
 
 const ORDER: ByteOrder = ByteOrder::Little;
 
@@ -69,7 +69,10 @@ fn spawn_qsrv(provider: Arc<BridgeProvider>) -> (PvaServer, SocketAddr) {
         std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
         cfg.tcp_port,
     );
-    let source = QsrvPvStore::new(provider);
+    let source = QsrvPvStore::new(
+        epics_base_rs::runtime::task::Reactor::current().expect("the test enters a runtime"),
+        provider,
+    );
     let server = PvaServer::start(Arc::new(source), cfg).expect("qsrv test server must start");
     (server, bound)
 }
@@ -139,35 +142,22 @@ impl FrameReader {
         me
     }
 
+    /// Read one frame, failing loudly if the server closes instead.
+    ///
+    /// Every read goes through [`read_or_closed`](Self::read_or_closed), so
+    /// a close is reported as a close on every path; only a genuinely silent
+    /// server reaches the deadline panic.
     fn read(&mut self) -> Frame {
-        use epics_pva_rs::client_native::decode::try_parse_frame;
-        use std::io::Read;
-        let deadline = std::time::Instant::now() + Duration::from_secs(5);
-        loop {
-            if let Ok(Some((frame, n))) = try_parse_frame(&self.buf) {
-                self.buf.drain(..n);
-                return frame;
-            }
-            if std::time::Instant::now() >= deadline {
-                panic!("no complete frame within deadline");
-            }
-            let mut chunk = [0u8; 1024];
-            match self.sock.read(&mut chunk) {
-                Ok(0) => continue,
-                Ok(n) => self.buf.extend_from_slice(&chunk[..n]),
-                Err(e)
-                    if e.kind() == std::io::ErrorKind::WouldBlock
-                        || e.kind() == std::io::ErrorKind::TimedOut => {}
-                Err(e) => panic!("frame read failed: {e}"),
-            }
+        match self.read_or_closed() {
+            Some(frame) => frame,
+            None => panic!("server closed the circuit before sending a complete frame"),
         }
     }
 
     /// Read one frame, or `None` if the server CLOSED the circuit first.
     ///
-    /// `read` above loops on EOF until it times out, which cannot tell a
-    /// reset apart from a slow reply. This is the pvxs `bev.reset()` probe:
-    /// the server drops the connection rather than answering.
+    /// This is also the pvxs `bev.reset()` probe: the server drops the
+    /// connection rather than answering.
     fn read_or_closed(&mut self) -> Option<Frame> {
         use epics_pva_rs::client_native::decode::try_parse_frame;
         use std::io::Read;
@@ -316,7 +306,7 @@ async fn db_with_two_records() -> Arc<PvDatabase> {
 }
 
 /// `a` is putable (`+putorder`), `b` is not — pvxs's not-putable sentinel
-/// (`fieldconfig.h:37`, `groupsource.cpp:503`).
+/// (`fieldconfig.h:37`, `groupsource.cpp:555`).
 const GROUP_MIXED_PUTORDER: &str = r#"{
     "RLOG:grp": {
         "+atomic": false,
@@ -492,7 +482,7 @@ fn monitor_until_data(
     panic!("no MONITOR data frame within 6 frames");
 }
 
-/// pvxs `singlesource.cpp:122-130`: a `record._options.DBE` string whose
+/// pvxs `singlesource.cpp:122-131`: a `record._options.DBE` string whose
 /// sloppy substring parse matches none of VALUE / ARCHIVE / ALARM selects
 /// an empty value mask. The subscription still falls back to VALUE|ALARM,
 /// but pvxs first tells the client its selection was empty. `"LOG"` is
@@ -532,7 +522,7 @@ async fn monitor_dbe_empty_mask_warns_over_the_wire() {
 /// R10-37: the empty-mask diagnostic is an INIT-time event, so it must reach
 /// the client BEFORE the MONITOR INIT reply.
 ///
-/// pvxs records it inside `onSubscribe` (`singlesource.cpp:128-130`), which
+/// pvxs records it inside `onSubscribe` (`singlesource.cpp:128-131`), which
 /// runs before the `connect()` that emits the INIT reply — so a pvxs client
 /// reads CMD_MESSAGE, then the INIT reply. The port used to parse DBE twice:
 /// once at INIT against a discarded log (for the `NoConvert` throw only) and
@@ -582,7 +572,7 @@ async fn monitor_dbe_empty_mask_precedes_the_init_reply() {
 
 /// Negative control for the ordering above: a group MONITOR carrying the same
 /// empty-mask DBE draws NO diagnostic at all. pvxs serves groups through
-/// `GroupSource::onSubscribe` (`ioc/groupsource.cpp:395-405`), which reads
+/// `GroupSource::onSubscribe` (`ioc/groupsource.cpp:395-451`), which reads
 /// `atomic` and never `DBE` — so there is nothing to report. Logging from the
 /// START-time parse (as the port used to) warned here as well, for an option
 /// pvxs's group source never looks at.

@@ -10,7 +10,7 @@
 //! ```
 //!
 //! so at `iocInit` every `ai` is `scanAdd`ed before every `calc`, whatever
-//! order the `.db` declared them in. `addToList` (`:1085-1091`) then appends
+//! order the `.db` declared them in. `addToList` (`:1081-1087`) then appends
 //! after the last element whose `phas <=` the new record's, which preserves
 //! that feed order within a PHAS. Record-type order is DBD include order
 //! (`dbd/stdRecords.dbd`, `aiRecord.dbd` before `calcRecord.dbd`).
@@ -39,7 +39,7 @@ async fn order(db: &str) -> Vec<String> {
         .await
         .unwrap()
         .0
-        .records_for_scan(ScanType::Sec1)
+        .records_for_scan(ScanType::SEC1)
         .await
 }
 
@@ -132,12 +132,12 @@ async fn an_undeclared_record_type_sorts_after_every_declared_one() {
     .await
     .unwrap();
     for name in ["FIRST", "SECOND"] {
-        db.get_record(name).unwrap().write().common.scan = ScanType::Sec1;
-        db.update_scan_index(name, ScanType::Passive, ScanType::Sec1, 0, 0);
+        db.get_record(name).unwrap().write().common.scan = ScanType::SEC1;
+        db.update_scan_index(name, ScanType::Passive, ScanType::SEC1, 0, 0);
     }
 
     assert_eq!(
-        db.records_for_scan(ScanType::Sec1).await,
+        db.records_for_scan(ScanType::SEC1).await,
         vec!["SECOND".to_string(), "FIRST".to_string()],
         "an undeclared type sorts behind every declared one, as in C"
     );

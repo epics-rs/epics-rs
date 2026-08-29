@@ -85,11 +85,6 @@ pub struct MbboRecord {
     /// raised in `check_alarms()` since `convert()` has no access to
     /// `CommonFields`.
     soft_alarm: bool,
-    // VAL change gate. C
-    // mbboRecord.c:400-403 monitor() raises DBE_VALUE|DBE_LOG for VAL only
-    // when `mlst != val`. Captured during process() because the framework
-    // reads monitor_value_changed() after process() has committed mlst.
-    value_changed: bool,
     /// Set by `set_device_did_compute(true)` when a device readback has
     /// already produced both RVAL and VAL (`apply_raw_readback`). One-shot:
     /// `process()` then skips the forward `VAL -> RVAL` `convert()` that
@@ -172,7 +167,6 @@ impl Default for MbboRecord {
             sims: 0,
             sdly: -1.0,
             soft_alarm: false,
-            value_changed: false,
             skip_convert: false,
         }
     }
@@ -293,7 +287,7 @@ macro_rules! mbb_get_field {
     };
     ($self:expr, $name:expr, $( $str:literal => $field:ident : $variant:ident ),* $(,)?) => {
         match $name {
-            // C `mbboRecord.c:300-312` `cvt_dbaddr`: VAL is `special(SPC_DBADDR)`
+            // C `mbboRecord.c:300-313` `cvt_dbaddr`: VAL is `special(SPC_DBADDR)`
             // and the record RE-TYPES it from its own state. With no state table
             // defined (`!prec->sdef` — every ZRVL..FFVL zero and every ZRST..FFST
             // empty) there are no labels to hand a client, so C degenerates VAL to
@@ -490,7 +484,7 @@ impl Record for MbboRecord {
         ]))
     }
 
-    /// C `get_enum_str` (mbboRecord.c:314-333): any `val <= 15` reads its state slot,
+    /// C `get_enum_str` (mbboRecord.c:315-333): any `val <= 15` reads its state slot,
     /// defined or not, so an unset state renders EMPTY; past 15 it is
     /// `"Illegal Value"`. `enum_state_strings` above stops at the last
     /// non-empty state because `no_str` says how many labels are meaningful —
@@ -504,10 +498,19 @@ impl Record for MbboRecord {
         ]))
     }
 
-    // C recMbbo.c IVOA=set_to_IVOV: val = ivov; rval = ivov. IVOV is
-    // DBF_USHORT (mbboRecord.dbd.pod:717); RVAL is DBF_ULONG
-    // (mbboRecord.dbd.pod:620). Coerce the incoming carrier to the
-    // unsigned state index, then write the native unsigned variants.
+    /// C `mbboRecord.c:232-236` is `prec->val = prec->ivov;` followed by
+    /// `convert(prec)` — the record's own VAL->RVAL translation
+    /// (`mbboRecord.c:418-435`), which is the ZRVL..FFVL state-value lookup
+    /// when SDEF is set, the `val > 15` SOFT/INVALID arm, and the `rval <<=
+    /// shft` shift. RVAL is therefore IVOV translated, never IVOV itself.
+    ///
+    /// Writing `RVAL = IVOV` directly put the STATE INDEX on the wire in place
+    /// of the raw word the state table names, so an INVALID `mbbo` with
+    /// `field(TWVL,"0x40")` drove 2 instead of 0x40, and every SHFT was
+    /// dropped.
+    ///
+    /// IVOV is DBF_USHORT (mbboRecord.dbd.pod:717); coerce the incoming
+    /// carrier to the unsigned state index before storing it.
     fn apply_invalid_output_value(&mut self, ivov: EpicsValue) -> CaResult<()> {
         let v: u16 = match ivov {
             EpicsValue::UShort(v) => v,
@@ -516,20 +519,24 @@ impl Record for MbboRecord {
             EpicsValue::Long(v) => v as u16,
             _ => return Err(CaError::TypeMismatch("IVOV".into())),
         };
-        self.put_field("RVAL", EpicsValue::ULong(u32::from(v)))?;
-        self.put_field("VAL", EpicsValue::Enum(v))
+        self.put_field("VAL", EpicsValue::Enum(v))?;
+        self.convert();
+        Ok(())
     }
 
     fn uses_monitor_deadband(&self) -> bool {
         false
     }
 
-    /// VAL posts DBE_VALUE|DBE_LOG
-    /// only when it changed (C mbboRecord.c:400-403 `mlst != val`), not every
-    /// process cycle. The comparison is captured in process(); see
-    /// `value_changed`.
-    fn monitor_value_changed(&self) -> Option<bool> {
-        Some(self.value_changed)
+    /// C `mbboRecord.c:400-403` `monitor()`: `if (prec->mlst != prec->val) { events |=
+    /// DBE_VALUE | DBE_LOG; prec->mlst = prec->val; }` — compared and
+    /// committed HERE, at C's position, never captured during `process()`.
+    fn monitor_value_changed(&mut self) -> Option<bool> {
+        let changed = self.mlst != self.val;
+        if changed {
+            self.mlst = self.val;
+        }
+        Some(changed)
     }
 
     fn init_record(&mut self, pass: u8) -> CaResult<()> {
@@ -554,15 +561,20 @@ impl Record for MbboRecord {
         )]
     }
 
-    /// C `mbboRecord.c:176-182` — the init tail, run right after the constant
-    /// load: `convert(prec)` maps the seeded state index to RVAL, then
-    /// `mlst = lalm = val; oraw = rval; orbv = rbv`.
-    fn seed_deadband_tracking(&mut self) {
+    /// C `mbboRecord.c:177,181-182` — the derived half of the init tail,
+    /// run right after the constant load: `convert(prec)` maps the seeded state
+    /// index to RVAL, then `oraw = rval; orbv = rbv`.
+    fn init_record_tail(&mut self) {
         self.convert();
-        self.mlst = self.val;
-        self.lalm = self.val;
         self.oraw = self.rval;
         self.orbv = self.rbv;
+    }
+
+    /// C `mbboRecord.c:179-180` — `mlst = lalm = val`. No ALST: mbbo has no
+    /// ADEL.
+    fn seed_deadband_tracking(&mut self) {
+        self.mlst = self.val;
+        self.lalm = self.val;
     }
 
     /// C `mbboRecord.c::process` (line 217) calls `convert(prec)`
@@ -586,13 +598,6 @@ impl Record for MbboRecord {
         self.skip_convert = false;
         self.oraw = self.rval;
         self.orbv = self.rbv;
-        // Capture the VAL-change
-        // gate now (C mbboRecord.c:400-403 `mlst != val`); the framework reads
-        // monitor_value_changed() after process().
-        self.value_changed = self.mlst != self.val;
-        if self.value_changed {
-            self.mlst = self.val;
-        }
         Ok(ProcessOutcome::complete())
     }
 

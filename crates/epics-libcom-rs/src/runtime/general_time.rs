@@ -390,9 +390,10 @@ pub fn highest_current_name() -> Option<String> {
 /// - `event == -1`: "BestTime" — queries current providers with its own ratchet.
 /// - `event 1..=255`: per-slot ratcheted event time from event providers.
 /// - `event >= 256`: event time from event providers, no ratchet.
-/// - no event provider answers: `S_time_noProvider` (`:243`, the initial
-///   `status`). C installs no event provider by default —
-///   `installLastResortEventProvider` (`:521-525`) is an iocsh command —
+/// - no event provider answers: `S_time_noProvider`
+///   (`epicsGeneralTime.c:245`, the initial `status`). C installs no event
+///   provider by default — `installLastResortEventProvider`
+///   (`epicsGeneralTime.c:521-525`) is an iocsh command —
 ///   so an IOC with none holds the old stamp instead of stamping now.
 pub fn get_event(event: i32) -> Option<SystemTime> {
     if event < -1 {
@@ -495,6 +496,42 @@ pub fn event_provider_name() -> Option<String> {
 fn format_time_sample(t: SystemTime) -> String {
     let dt: chrono::DateTime<chrono::Local> = t.into();
     dt.format("%Y-%m-%d %H:%M:%S.%6f").to_string()
+}
+
+/// When this process first touched the time registry — C's
+/// `ClockTimePvt.startTime` (`osiClockTime.c:132` @R7.0.10).
+///
+/// C sets it inside `ClockTime_Init`, which the IOC calls during
+/// initialisation rather than at `main()`, so "program start" already means
+/// "when the clock provider came up" there. This `LazyLock` is forced by the
+/// first use of the registry, which is the same moment.
+static PROGRAM_START: LazyLock<SystemTime> = LazyLock::new(SystemTime::now);
+
+/// C's `ClockTime_Report` (`osiClockTime.c:266-312` @R7.0.10).
+///
+/// The synchronizing branch C prints above this one is `#if defined(vxWorks)
+/// || defined(__rtems__)` territory *and* needs a running `ClockTimeSync`
+/// thread; this port starts none on any target, so it always takes C's `else`.
+/// The trailing "not running" line is inside the same C guard, so it is
+/// emitted on exactly the targets C emits it on.
+///
+/// `level` is accepted and unused, as it is in C's `else` branch. **Deviation,
+/// deliberate:** C cannot actually be passed 0 — `ReportFuncDef` declares
+/// `interest_level` as `iocshArgArgv` while `ReportCallFunc` reads
+/// `args[0].ival` (`osiClockTime.c:85-93`), and `ival` aliases `aval.ac` in
+/// `iocshArgBuf` (`iocsh.h:19-31`), so the handler receives the token count —
+/// 1 with no argument, 2 with one — and never the number the operator typed.
+/// The port declares the argument as the integer it is meant to be.
+pub fn clock_time_report(level: i32) -> String {
+    let _ = level;
+    let mut out = format!(
+        "Program started at {}\n",
+        format_time_sample(*PROGRAM_START)
+    );
+    if cfg!(any(target_os = "vxworks", target_os = "rtems")) {
+        out.push_str("IOC's OS Clock synchronization thread is not running.\n");
+    }
+    out
 }
 
 /// Generate a report of registered providers.
@@ -670,7 +707,7 @@ mod tests {
     }
 
     /// C `generalTimeGetEventPriority` enters with
-    /// `status = S_time_noProvider` (`epicsGeneralTime.c:243`) and only an
+    /// `status = S_time_noProvider` (`epicsGeneralTime.c:245`) and only an
     /// answering provider clears it. Nothing registers an event provider by
     /// default — `installLastResortEventProvider` (`:521-525`) is an iocsh
     /// command — so an event number no provider serves is an error, not the

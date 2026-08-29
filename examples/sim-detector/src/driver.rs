@@ -40,15 +40,11 @@ impl SimDetector {
 
         // Set default values matching C++ constructor
         let base = &mut ad.port_base;
-        base.set_string_param(ad.params.base.manufacturer, 0, "Simulated detector".into())?;
-        base.set_string_param(ad.params.base.model, 0, "Basic simulator".into())?;
-        base.set_string_param(ad.params.base.serial_number, 0, "No serial number".into())?;
-        base.set_string_param(ad.params.base.firmware_version, 0, "No firmware".into())?;
-        base.set_string_param(
-            ad.params.base.sdk_version,
-            0,
-            env!("CARGO_PKG_VERSION").into(),
-        )?;
+        base.set_string_param(ad.params.base.manufacturer, 0, "Simulated detector")?;
+        base.set_string_param(ad.params.base.model, 0, "Basic simulator")?;
+        base.set_string_param(ad.params.base.serial_number, 0, "No serial number")?;
+        base.set_string_param(ad.params.base.firmware_version, 0, "No firmware")?;
+        base.set_string_param(ad.params.base.sdk_version, 0, env!("CARGO_PKG_VERSION"))?;
 
         base.set_int32_param(ad.params.min_x, 0, 0)?;
         base.set_int32_param(ad.params.min_y, 0, 0)?;
@@ -195,15 +191,13 @@ impl PortDriver for SimDetector {
             if value != 0 && acquiring == 0 {
                 self.ad
                     .port_base
-                    .set_string_param(status_msg_idx, 0, "Acquiring data".into())?;
+                    .set_string_param(status_msg_idx, 0, "Acquiring data")?;
                 self.ad.port_base.set_int32_param(acquire_idx, 0, value)?;
                 let _ = self.acq_tx.try_send(AcqCommand::Start);
             } else if value == 0 && acquiring != 0 {
-                self.ad.port_base.set_string_param(
-                    status_msg_idx,
-                    0,
-                    "Acquisition stopped".into(),
-                )?;
+                self.ad
+                    .port_base
+                    .set_string_param(status_msg_idx, 0, "Acquisition stopped")?;
                 self.ad.port_base.set_int32_param(acquire_idx, 0, value)?;
                 let _ = self.acq_tx.try_send(AcqCommand::Stop);
             } else {

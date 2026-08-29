@@ -2,7 +2,9 @@ use std::path::Path;
 use std::sync::Arc;
 
 use asyn_rs::error::AsynResult;
+use asyn_rs::param::ParamValue;
 use asyn_rs::port::{PortDriverBase, PortFlags};
+use asyn_rs::request::ParamSetValue;
 
 use crate::attributes::{
     EpicsPvAttributeSource, FunctionAttributeSource, NDAttrSource, NDAttrValue, NDAttribute,
@@ -13,6 +15,15 @@ use crate::ndarray::NDArray;
 use crate::ndarray_pool::NDArrayPool;
 use crate::params::ndarray_driver::NDArrayDriverParams;
 use crate::plugin::channel::{NDArrayOutput, NDArraySender, QueuedArrayCounter};
+
+/// An octet parameter read back as text.
+///
+/// `getStringParam` hands out the bytes the driver stored, which is what C's
+/// `char *` is; the file-name and attribute paths below are text, so they
+/// decode here rather than making the parameter store guess.
+fn octet_text(bytes: &[u8]) -> String {
+    String::from_utf8_lossy(bytes).into_owned()
+}
 
 /// `ND_ATTRIBUTES_STATUS` code: attributes loaded successfully
 /// (C++ `NDAttributesOK`).
@@ -353,7 +364,7 @@ pub(crate) fn write_array_params(
     // G6: codec name and compressed size, published from NDArray.codec.
     match &array.codec {
         Some(codec) => {
-            port_base.set_string_param(params.codec, 0, codec.name.as_str().into())?;
+            port_base.set_string_param(params.codec, 0, codec.name.as_str())?;
             port_base.set_int32_param(params.compressed_size, 0, codec.compressed_size as i32)?;
         }
         None => {
@@ -387,7 +398,7 @@ pub fn init_read_only_params(
     params: &NDArrayDriverParams,
     port_name: &str,
 ) -> AsynResult<()> {
-    port_base.set_string_param(params.port_name_self, 0, port_name.into())?;
+    port_base.set_string_param(params.port_name_self, 0, port_name)?;
     // C `:961-966` publishes "ADCORE_VERSION.ADCORE_REVISION.
     // ADCORE_MODIFICATION" into both strings. There is no ADCore in this
     // workspace to take a version from, so both carry the `ad-core-rs` crate
@@ -395,8 +406,8 @@ pub fn init_read_only_params(
     // comment at `:964-965` applies unchanged: a concrete driver overwrites
     // DriverVersion after construction.
     let version = env!("CARGO_PKG_VERSION");
-    port_base.set_string_param(params.ad_core_version, 0, version.into())?;
-    port_base.set_string_param(params.driver_version, 0, version.into())?;
+    port_base.set_string_param(params.ad_core_version, 0, version)?;
+    port_base.set_string_param(params.driver_version, 0, version)?;
 
     port_base.set_int32_param(params.array_size_x, 0, 0)?;
     port_base.set_int32_param(params.array_size_y, 0, 0)?;
@@ -420,10 +431,10 @@ pub fn init_read_only_params(
     port_base.set_string_param(params.file_name, 0, String::new())?;
     port_base.set_int32_param(params.file_number, 0, 0)?;
     port_base.set_int32_param(params.auto_increment, 0, 0)?;
-    // C `:986-987` explains why this one is not left to the database: it is a
-    // waveform record, and the waveform does not read the driver value at
-    // initialization.
-    port_base.set_string_param(params.file_template, 0, "%s%s_%3.3d.dat".into())?;
+    // C `:991`, whose comment at `:985-986` explains why this one is not left
+    // to the database: it is a waveform record, and the waveform does not read
+    // the driver value at initialization.
+    port_base.set_string_param(params.file_template, 0, "%s%s_%3.3d.dat")?;
     port_base.set_int32_param(params.num_captured, 0, 0)?;
     port_base.set_int32_param(params.free_capture, 0, 0)?;
     port_base.set_int32_param(params.create_dir, 0, 0)?;
@@ -441,8 +452,43 @@ pub fn init_read_only_params(
     Ok(())
 }
 
-/// Refresh the pool-statistics parameters (`POOL_MAX_MEMORY`,
-/// `POOL_USED_MEMORY`, `POOL_ALLOC_BUFFERS`, `POOL_FREE_BUFFERS`) from a pool.
+/// What the four pool-statistics readbacks (`POOL_MAX_MEMORY`,
+/// `POOL_USED_MEMORY`, `POOL_ALLOC_BUFFERS`, `POOL_FREE_BUFFERS`) say about a
+/// pool right now, as C reads them in one block
+/// (asynNDArrayDriver.cpp:690-693).
+///
+/// The single owner of that reading, so a port that publishes it through a
+/// param batch rather than a `PortDriverBase` cannot drift from one that does.
+pub(crate) fn pool_stats_values(
+    params: &NDArrayDriverParams,
+    pool: &NDArrayPool,
+) -> Vec<ParamSetValue> {
+    const MEGABYTE: f64 = 1_048_576.0;
+    vec![
+        ParamSetValue::new(
+            params.pool_max_memory,
+            0,
+            ParamValue::Float64(pool.max_memory() as f64 / MEGABYTE),
+        ),
+        ParamSetValue::new(
+            params.pool_used_memory,
+            0,
+            ParamValue::Float64(pool.allocated_bytes() as f64 / MEGABYTE),
+        ),
+        ParamSetValue::new(
+            params.pool_alloc_buffers,
+            0,
+            ParamValue::Int32(pool.num_alloc_buffers() as i32),
+        ),
+        ParamSetValue::new(
+            params.pool_free_buffers,
+            0,
+            ParamValue::Int32(pool.num_free_buffers() as i32),
+        ),
+    ]
+}
+
+/// Refresh the pool-statistics parameters from a pool.
 ///
 /// Shared by the `NDPoolPollStats` dispatch and `preAllocateBuffers`.
 pub(crate) fn refresh_pool_stats(
@@ -450,23 +496,21 @@ pub(crate) fn refresh_pool_stats(
     params: &NDArrayDriverParams,
     pool: &NDArrayPool,
 ) -> AsynResult<()> {
-    const MEGABYTE: f64 = 1_048_576.0;
-    port_base.set_float64_param(
-        params.pool_max_memory,
-        0,
-        pool.max_memory() as f64 / MEGABYTE,
-    )?;
-    port_base.set_float64_param(
-        params.pool_used_memory,
-        0,
-        pool.allocated_bytes() as f64 / MEGABYTE,
-    )?;
-    port_base.set_int32_param(
-        params.pool_alloc_buffers,
-        0,
-        pool.num_alloc_buffers() as i32,
-    )?;
-    port_base.set_int32_param(params.pool_free_buffers, 0, pool.num_free_buffers() as i32)?;
+    for set in pool_stats_values(params, pool) {
+        match set {
+            ParamSetValue::Value {
+                reason,
+                addr,
+                value: ParamValue::Float64(v),
+            } => port_base.set_float64_param(reason, addr, v)?,
+            ParamSetValue::Value {
+                reason,
+                addr,
+                value: ParamValue::Int32(v),
+            } => port_base.set_int32_param(reason, addr, v)?,
+            _ => unreachable!("pool_stats_values yields only Float64/Int32 values"),
+        }
+    }
     Ok(())
 }
 
@@ -720,12 +764,15 @@ impl NDArrayDriverBase {
         // status here, so a missing directory does not abort the name.
         self.check_path()?;
 
-        let path = self.port_base.get_string_param(self.params.file_path, 0)?;
-        let name = self.port_base.get_string_param(self.params.file_name, 0)?;
+        // An octet parameter is bytes; a file name is text. Decode here, at
+        // the one place these three become a path.
+        let path = octet_text(self.port_base.get_string_param(self.params.file_path, 0)?);
+        let name = octet_text(self.port_base.get_string_param(self.params.file_name, 0)?);
         let number = self.port_base.get_int32_param(self.params.file_number, 0)?;
-        let template = self
-            .port_base
-            .get_string_param(self.params.file_template, 0)?;
+        let template = octet_text(
+            self.port_base
+                .get_string_param(self.params.file_template, 0)?,
+        );
         let auto_increment = self
             .port_base
             .get_int32_param(self.params.auto_increment, 0)
@@ -734,7 +781,7 @@ impl NDArrayDriverBase {
         // C parity: an empty FILE_TEMPLATE is passed straight to epicsSnprintf,
         // which yields an empty string. Do NOT fabricate a default template.
         // sprintf_template handles the empty case correctly (no specifiers).
-        let full = sprintf_template(template, path, name, number);
+        let full = sprintf_template(&template, &path, &name, number);
 
         self.port_base
             .set_string_param(self.params.full_file_name, 0, full.clone())?;
@@ -770,8 +817,8 @@ impl NDArrayDriverBase {
     pub fn check_path(&mut self) -> AsynResult<bool> {
         let mut path = self
             .port_base
-            .get_string_param(self.params.file_path, 0)?
-            .to_string();
+            .get_string_param(self.params.file_path, 0)
+            .map(octet_text)?;
         if path.is_empty() {
             return Ok(false);
         }
@@ -891,16 +938,17 @@ impl NDArrayDriverBase {
     /// file is still loaded, because `PARAM`, `FUNCTION` and `CONST`
     /// attributes are fed and work; only the status tells the truth about the
     /// ones that are not. `NDAttributesStatus` is an mbbi with exactly four
-    /// states (NDArrayBase.template:807-824), so `XML_SYNTAX_ERROR` is the
+    /// states (NDArrayBase.template:805-822), so `XML_SYNTAX_ERROR` is the
     /// nearest of C's codes rather than an accurate one.
     ///
     /// It is the nearest even though C's own vocabulary has a code for "no
     /// attribute set is in effect": `NDAttributesFileNotFound` is what the
-    /// constructor seeds (C `:997`) and what an IOC that never loads a file
-    /// keeps. That is exactly why this case cannot borrow it — code 1 is now
-    /// the value every port carries before anything is loaded, so reusing it
-    /// here would make a file whose `PARAM`/`FUNCTION`/`CONST` attributes are
-    /// live and working indistinguishable from a port that loaded nothing at
+    /// constructor seeds (C `asynNDArrayDriver.cpp:997`) and what an IOC that
+    /// never loads a file keeps. That is exactly why this case cannot borrow it
+    /// — code 1 is now the value every port carries before anything is loaded,
+    /// so reusing it here would make a file whose `PARAM`/`FUNCTION`/`CONST`
+    /// attributes are live and working indistinguishable from a port that
+    /// loaded nothing at
     /// all. `write_octet` discards this `Err`, so the mbbi is the operator's
     /// only signal that the `EPICS_PV` half is dead.
     /// Install the CA client that feeds `EPICS_PV` attributes, and start
@@ -976,8 +1024,8 @@ impl NDArrayDriverBase {
     pub fn read_nd_attributes_file(&mut self) -> AsynResult<()> {
         let file_param = self
             .port_base
-            .get_string_param(self.params.attributes_file, 0)?
-            .to_string();
+            .get_string_param(self.params.attributes_file, 0)
+            .map(octet_text)?;
 
         // Clear any existing attributes (C++ clears unconditionally first).
         self.clear_attributes();
@@ -986,7 +1034,7 @@ impl NDArrayDriverBase {
             // with no `setIntegerParam`. The status keeps whatever it had,
             // which for an IOC that never loaded a file is the constructor's
             // `NDAttributesFileNotFound`. Writing OK here erased that value
-            // on every `NDAttributesFile` PINI write (NDArrayBase.template:794).
+            // on every `NDAttributesFile` PINI write (NDArrayBase.template:793).
             return Ok(());
         }
 
@@ -1127,7 +1175,7 @@ impl NDArrayDriverBase {
                 .params
                 .get_string(index, addr)
                 .ok()
-                .map(|s| NDAttrValue::String(s.to_string())),
+                .map(|s| NDAttrValue::String(octet_text(s))),
             ParamAttrType::Unknown => None,
         }
     }
@@ -1164,7 +1212,7 @@ pub(crate) mod tests {
             assert_eq!(
                 base.get_string_param_strict(index, 0)
                     .unwrap_or_else(|e| { panic!("{name} unset after construction: {e:?}") }),
-                want,
+                want.as_bytes(),
                 "{name}"
             );
         }
@@ -1257,7 +1305,7 @@ pub(crate) mod tests {
         // C `:327` returns asynSuccess on an empty NDAttributesFile without
         // touching NDAttributesStatus, so an IOC that never loads one reads
         // "File not found" — including after the PINI="YES" write that
-        // NDArrayBase.template:794 performs at iocInit.
+        // NDArrayBase.template:793 performs at iocInit.
         let mut drv = NDArrayDriverBase::new("TEST", 1_000_000).unwrap();
         drv.read_nd_attributes_file().unwrap();
         assert_eq!(drv.attributes().len(), 0);
@@ -1336,16 +1384,16 @@ pub(crate) mod tests {
         // verbatim, producing an empty string — no fabricated default.
         let mut drv = NDArrayDriverBase::new("TEST", 1_000_000).unwrap();
         drv.port_base
-            .set_string_param(drv.params.file_path, 0, "/tmp/".into())
+            .set_string_param(drv.params.file_path, 0, "/tmp/")
             .unwrap();
         drv.port_base
-            .set_string_param(drv.params.file_name, 0, "test_".into())
+            .set_string_param(drv.params.file_name, 0, "test_")
             .unwrap();
         drv.port_base
             .set_int32_param(drv.params.file_number, 0, 42)
             .unwrap();
         drv.port_base
-            .set_string_param(drv.params.file_template, 0, "".into())
+            .set_string_param(drv.params.file_template, 0, "")
             .unwrap();
 
         let name = drv.create_file_name().unwrap();
@@ -1356,16 +1404,16 @@ pub(crate) mod tests {
     fn test_create_file_name_standard_template() {
         let mut drv = NDArrayDriverBase::new("TEST", 1_000_000).unwrap();
         drv.port_base
-            .set_string_param(drv.params.file_path, 0, "/tmp/".into())
+            .set_string_param(drv.params.file_path, 0, "/tmp/")
             .unwrap();
         drv.port_base
-            .set_string_param(drv.params.file_name, 0, "test".into())
+            .set_string_param(drv.params.file_name, 0, "test")
             .unwrap();
         drv.port_base
             .set_int32_param(drv.params.file_number, 0, 42)
             .unwrap();
         drv.port_base
-            .set_string_param(drv.params.file_template, 0, "%s%s_%3.3d.dat".into())
+            .set_string_param(drv.params.file_template, 0, "%s%s_%3.3d.dat")
             .unwrap();
 
         let name = drv.create_file_name().unwrap();
@@ -1394,13 +1442,13 @@ pub(crate) mod tests {
             .set_string_param(drv.params.file_path, 0, no_sep.clone())
             .unwrap();
         drv.port_base
-            .set_string_param(drv.params.file_name, 0, "img".into())
+            .set_string_param(drv.params.file_name, 0, "img")
             .unwrap();
         drv.port_base
             .set_int32_param(drv.params.file_number, 0, 42)
             .unwrap();
         drv.port_base
-            .set_string_param(drv.params.file_template, 0, "%s%s_%3.3d.dat".into())
+            .set_string_param(drv.params.file_template, 0, "%s%s_%3.3d.dat")
             .unwrap();
 
         let name = drv.create_file_name().unwrap();
@@ -1412,8 +1460,8 @@ pub(crate) mod tests {
         let stored = drv
             .port_base
             .get_string_param(drv.params.file_path, 0)
-            .unwrap()
-            .to_string();
+            .map(octet_text)
+            .unwrap();
         assert_eq!(
             stored,
             format!("{}{}", no_sep, std::path::MAIN_SEPARATOR),
@@ -1509,7 +1557,7 @@ pub(crate) mod tests {
     fn test_check_path_not_exists() {
         let mut drv = NDArrayDriverBase::new("TEST", 1_000_000).unwrap();
         drv.port_base
-            .set_string_param(drv.params.file_path, 0, "/nonexistent_path_xyz".into())
+            .set_string_param(drv.params.file_path, 0, "/nonexistent_path_xyz")
             .unwrap();
         assert!(!drv.check_path().unwrap());
     }
@@ -1608,7 +1656,7 @@ pub(crate) mod tests {
 
         assert_eq!(
             drv.port_base.get_string_param(drv.params.codec, 0).unwrap(),
-            "bslz4"
+            b"bslz4"
         );
         assert_eq!(
             drv.port_base
@@ -1684,7 +1732,7 @@ pub(crate) mod tests {
             <Attribute name="Temp" type="EPICS_PV" source="$(P)Temp"/>
         </Attributes>"#;
         drv.port_base
-            .set_string_param(drv.params.attributes_file, 0, xml.into())
+            .set_string_param(drv.params.attributes_file, 0, xml)
             .unwrap();
         // The EPICS_PV attribute parses and is kept, but nothing can feed it,
         // so the file does not load clean — see the status assertion below.
@@ -1721,8 +1769,7 @@ pub(crate) mod tests {
                 0,
                 r#"<Attributes>
                     <Attribute name="Temp" type="EPICS_PV" source="TST:Temp"/>
-                </Attributes>"#
-                    .into(),
+                </Attributes>"#,
             )
             .unwrap();
         assert!(drv.read_nd_attributes_file().is_err());
@@ -1744,8 +1791,7 @@ pub(crate) mod tests {
                 0,
                 r#"<Attributes>
                     <Attribute name="Comment" type="const" source="hello"/>
-                </Attributes>"#
-                    .into(),
+                </Attributes>"#,
             )
             .unwrap();
         drv.read_nd_attributes_file().unwrap();
@@ -1770,8 +1816,7 @@ pub(crate) mod tests {
                 r#"<Attributes>
                     <Attribute name="Temp" type="EPICS_PV" source="TST:Temp"
                                dbrtype="DBR_FLOAT32"/>
-                </Attributes>"#
-                    .into(),
+                </Attributes>"#,
             )
             .unwrap();
         let err = drv.read_nd_attributes_file().unwrap_err().to_string();
@@ -1830,7 +1875,7 @@ pub(crate) mod tests {
             <Attribute name="Maker" type="PARAM" source="MANUFACTURER" datatype="STRING"/>
         </Attributes>"#;
         drv.port_base
-            .set_string_param(drv.params.attributes_file, 0, xml.into())
+            .set_string_param(drv.params.attributes_file, 0, xml)
             .unwrap();
         drv.read_nd_attributes_file().unwrap();
 
@@ -1839,7 +1884,7 @@ pub(crate) mod tests {
             .set_int32_param(drv.params.array_counter, 0, 17)
             .unwrap();
         drv.port_base
-            .set_string_param(drv.params.manufacturer, 0, "ACME".into())
+            .set_string_param(drv.params.manufacturer, 0, "ACME")
             .unwrap();
         let snap = drv.update_attributes();
         assert_eq!(snap.get("Counter").unwrap().value, NDAttrValue::Int32(17));
@@ -1871,7 +1916,7 @@ pub(crate) mod tests {
             <Attribute name="Counter" type="PARAM" source="ARRAY_COUNTER"/>
         </Attributes>"#;
         drv.port_base
-            .set_string_param(drv.params.attributes_file, 0, xml.into())
+            .set_string_param(drv.params.attributes_file, 0, xml)
             .unwrap();
         drv.read_nd_attributes_file().unwrap();
         drv.port_base
@@ -1899,7 +1944,7 @@ pub(crate) mod tests {
             <Attribute name="AsInt" type="PARAM" source="ARRAY_COUNTER" datatype="INT"/>
         </Attributes>"#;
         drv.port_base
-            .set_string_param(drv.params.attributes_file, 0, xml.into())
+            .set_string_param(drv.params.attributes_file, 0, xml)
             .unwrap();
         drv.read_nd_attributes_file().unwrap();
         drv.port_base
@@ -1932,7 +1977,7 @@ pub(crate) mod tests {
             <Attribute name="Live" type="FUNCTION" source="tick" param="seq"/>
         </Attributes>"#;
         drv.port_base
-            .set_string_param(drv.params.attributes_file, 0, xml.into())
+            .set_string_param(drv.params.attributes_file, 0, xml)
             .unwrap();
         drv.read_nd_attributes_file().unwrap();
         // Construction evaluated the function once (value = "seq=1").
@@ -1962,7 +2007,7 @@ pub(crate) mod tests {
             <Attribute name="Missing" type="FUNCTION" source="no_such_fn"/>
         </Attributes>"#;
         drv.port_base
-            .set_string_param(drv.params.attributes_file, 0, xml.into())
+            .set_string_param(drv.params.attributes_file, 0, xml)
             .unwrap();
         drv.read_nd_attributes_file().unwrap();
         let snap = drv.update_attributes();
@@ -1990,11 +2035,7 @@ pub(crate) mod tests {
         // G9: a non-existent file path yields FILE_NOT_FOUND status.
         let mut drv = NDArrayDriverBase::new("TEST", 1_000_000).unwrap();
         drv.port_base
-            .set_string_param(
-                drv.params.attributes_file,
-                0,
-                "/nonexistent_attrs_xyz.xml".into(),
-            )
+            .set_string_param(drv.params.attributes_file, 0, "/nonexistent_attrs_xyz.xml")
             .unwrap();
         assert!(drv.read_nd_attributes_file().is_err());
         assert_eq!(

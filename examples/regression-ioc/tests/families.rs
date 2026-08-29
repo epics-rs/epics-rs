@@ -24,6 +24,9 @@
 //!   L — an unsigned DBF_ULONG field (mbbo MASK) keeps its native PVA uint
 //!       wire type (PVA-only; CA has no unsigned types)
 //!   Q — a record's UTAG reaches the PVA timeStamp.userTag (PVA-only)
+// The harness crate is `tokio_backend`-only, so this file is too:
+// `regression_ioc::RegressionIoc` does not exist on the reactor-free backend.
+#![cfg(tokio_backend)]
 
 use std::time::Duration;
 

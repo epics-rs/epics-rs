@@ -15,13 +15,123 @@ use std::time::Duration;
 /// stdout and errors to stderr, and `use_stderr()` is exactly that
 /// split, so only the code is ours.
 pub fn parse_or_exit<T: clap::Parser>() -> T {
-    match T::try_parse() {
+    parse_or_exit_styled(UsageErrorStyle::PvTools)
+}
+
+/// Which upstream family a tool's usage errors follow. Both exit 1;
+/// they differ in whether upstream has a message worth reproducing.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum UsageErrorStyle {
+    /// The pvAccess `pvtoolsSrc` family (`pvget`, `pvput`, `pvinfo`,
+    /// `pvlist`, `pvcall`, and the monitor mode of `pvget`), whose two
+    /// fixed lines `c_option_error` reproduces.
+    PvTools,
+    /// The pvxs `tools` family (`mshim`, `pvxvct`). Their message is
+    /// NOT reproduced: their `getopt` optstring has no leading `:`, so
+    /// the `default:` arm runs with `opt == '?'` and
+    /// `std::cerr<<char(opt)` prints a literal `?` where the code means
+    /// to print the offending letter (`tools/mshim.cpp:271-274`,
+    /// `tools/pvxvct.cpp:140-144`). clap's message is kept; only the
+    /// exit code is upstream's.
+    Pvxs,
+}
+
+/// [`parse_or_exit`] for a tool that follows a different upstream
+/// family — see [`UsageErrorStyle`].
+pub fn parse_or_exit_styled<T: clap::Parser>(style: UsageErrorStyle) -> T {
+    let argv: Vec<std::ffi::OsString> = std::env::args_os().collect();
+    match T::try_parse_from(&argv) {
         Ok(args) => args,
         Err(e) => {
-            let _ = e.print();
+            let cmd = <T as clap::CommandFactory>::command();
+            match (style == UsageErrorStyle::PvTools)
+                .then(|| c_option_error(&e, &cmd, &argv))
+                .flatten()
+            {
+                Some(msg) => eprint!("{msg}"),
+                None => {
+                    let _ = e.print();
+                }
+            }
             std::process::exit(i32::from(e.use_stderr()));
         }
     }
+}
+
+/// C's wording for the two `getopt` failures every pvAccess tool
+/// answers itself, or `None` when C has no such answer and clap's own
+/// message stands.
+///
+/// `getopt` is given a leading-`:` optstring (`pvget.cpp:279`), so it
+/// reports an unknown letter as `'?'` and a letter whose argument is
+/// missing as `':'`, and each arm prints one fixed line naming the
+/// letter and the tool (`pvget.cpp:353-362`; identically in
+/// `pvput.cpp:349-356`, `pvinfo.cpp:152-159`, `pvlist.cpp:571-578`,
+/// `pvcall.cpp:156-163`). clap's text says neither.
+///
+/// The letter comes from clap's `InvalidArg` context, which names the
+/// offending option in its CANONICAL spelling plus a value placeholder
+/// — the long form whenever the option has one, whichever form was
+/// typed. C only ever has the letter, and every long form here is a
+/// port addition on top of a C short option, so a canonical long is
+/// mapped back through the command's own argument table. `argv`
+/// decides between the two spellings: naming `-F` to someone who typed
+/// `--format` would name an option they never used, so a long
+/// invocation keeps clap's message. So does an option with no short
+/// form at all, and so does any long that `getopt` would never have
+/// seen as an option in the first place (it takes `--anything` as the
+/// end of options).
+fn c_option_error(
+    err: &clap::Error,
+    cmd: &clap::Command,
+    argv: &[std::ffi::OsString],
+) -> Option<String> {
+    use clap::error::{ContextKind, ContextValue, ErrorKind};
+
+    let ContextValue::String(invalid_arg) = err.get(ContextKind::InvalidArg)? else {
+        return None;
+    };
+    let letter = short_form(invalid_arg.split_whitespace().next()?, cmd, argv)?;
+    let exec = cmd.get_name();
+
+    match err.kind() {
+        ErrorKind::UnknownArgument => Some(format!(
+            "Unrecognized option: '-{letter}'. ('{exec} -h' for help.)\n"
+        )),
+        // clap folds "no value supplied" into `InvalidValue` with an
+        // empty value (`clap_builder/src/error/format.rs:208-221`).
+        ErrorKind::InvalidValue if matches!(err.get(ContextKind::InvalidValue), Some(ContextValue::String(v)) if v.is_empty()) => {
+            Some(format!(
+                "Option '-{letter}' requires an argument. ('{exec} -h' for help.)\n"
+            ))
+        }
+        _ => None,
+    }
+}
+
+/// The short letter `token` stands for, when the command line used the
+/// short spelling. `None` for a long invocation, a long-only option,
+/// and anything that is not an option token.
+fn short_form(token: &str, cmd: &clap::Command, argv: &[std::ffi::OsString]) -> Option<char> {
+    if let Some(long) = token.strip_prefix("--") {
+        let short = cmd
+            .get_arguments()
+            .find(|a| a.get_long() == Some(long))?
+            .get_short()?;
+        // `--long`, `--long=value`; a prefix abbreviation is clap-only
+        // and reads as a long invocation either way.
+        let typed_long = argv.iter().filter_map(|a| a.to_str()).any(|a| {
+            let Some(spelling) = a.strip_prefix("--") else {
+                return false;
+            };
+            let spelling = spelling.split('=').next().unwrap_or(spelling);
+            !spelling.is_empty() && long.starts_with(spelling)
+        });
+        return (!typed_long).then_some(short);
+    }
+    let mut letters = token.strip_prefix('-')?.chars();
+    let letter = letters.next()?;
+    letters.next().is_none().then_some(letter)
 }
 
 /// Default PVA CLI timeout in seconds when a user-supplied `-w`
@@ -132,7 +242,7 @@ impl TimeoutPolicy {
 /// Those tools parse `-w` into a `double timeout` and, after issuing the
 /// operation, wait with `done.wait(timeout)` (`tools/get.cpp:72,132`,
 /// `tools/put.cpp:64,153`, `tools/info.cpp:66,112`,
-/// `tools/call.cpp:44-65,125-154`). EPICS `epicsEvent::wait(double)`
+/// `tools/call.cpp:44-65,150-155`). EPICS `epicsEvent::wait(double)`
 /// treats a timeout of zero or less as `tryWait()` — a non-blocking poll
 /// that returns immediately (`libcom/src/osi/epicsEvent.h:101-107,
 /// 192-201`). So `-w 0` on any of them is an immediate completion poll,
@@ -201,18 +311,18 @@ pub fn version_information() -> &'static str {
 /// operation, prints `Effective config\n` followed by the client
 /// context configuration — `tools/get.cpp:99-100`,
 /// `tools/monitor.cpp:97-98`, `tools/put.cpp:109-110`,
-/// `tools/call.cpp:122-123`, and `tools/info.cpp:76-79`. Every one of
+/// `tools/call.cpp:122-123`, and `tools/info.cpp:78-79`. Every one of
 /// those tools emits the same block, so it lives here as a single owner
 /// rather than being re-implemented (or, worse, overloaded onto the
 /// output formatter) per binary.
 ///
 /// The configuration shown is the *effective* one. pvxs's
 /// `ContextImpl::effective` is the environment config with `expand()`
-/// applied (`client.cpp:542-547`), and `-v` prints that expanded config
+/// applied (`src/client.cpp:542-547`), and `-v` prints that expanded config
 /// (`ctxt.config()`), not the raw environment. So `EPICS_PVA_ADDR_LIST`
 /// is the post-`expand()` SEARCH list — the auto-address-list broadcast
 /// fan-out folded in and the `AUTO_ADDR_LIST` flag cleared to `NO`
-/// (`config.cpp:640-643`) — exactly as the client will search.
+/// (`config.cpp:640-644`) — exactly as the client will search.
 #[cfg(not(epics_embedded_target))]
 pub fn print_effective_config() {
     print!("{}", effective_config_string());
@@ -254,10 +364,10 @@ pub fn effective_config_string() -> String {
     // Build and expand the client config exactly as the client Context does,
     // so the readback shows the *effective* SEARCH configuration rather than
     // the raw environment. pvxs builds `ContextImpl::effective` as the env
-    // config with `expand()` applied (`client.cpp:542-547`) and `-v` prints
+    // config with `expand()` applied (`src/client.cpp:542-547`) and `-v` prints
     // that effective config (`tools/get.cpp:99-100` prints `ctxt.config()`).
     // `expand()` folds the auto-address-list broadcast fan-out into the
-    // address list and clears the flag (`config.cpp:640-643`).
+    // address list and clears the flag (`config.cpp:640-644`).
     let mut cfg = config::env::Config::from_client_env();
     cfg.expand();
 
@@ -280,7 +390,7 @@ pub fn effective_config_string() -> String {
     let mut s = String::new();
     let _ = writeln!(s, "Effective config");
     // pvxs prints the effective Config as a sorted `updateDefs()` map
-    // (config.cpp:613-658), so the keys come out alphabetically and use
+    // (config.cpp:613-622, 653-663), so the keys come out alphabetically and use
     // their canonical `EPICS_PVA_*` names.
     let _ = writeln!(s, "  EPICS_PVA_ADDR_LIST={addr_list}");
     // After `expand()` the auto flag is always cleared (`config.cpp:643`),
@@ -416,10 +526,10 @@ pub fn resolve_host_ipv4(host: &str) -> Result<std::net::Ipv4Addr, String> {
 /// Accepts either a literal IPv4 address (returned verbatim) or an OS
 /// interface name (`eth0`, `en0`, `lo0`), looked up via `getifaddrs`.
 ///
-/// pvxs normalizes the multicast `@iface` of a `SockEndpoint` through
-/// `IfaceMap`, which accepts both an interface name and an interface
-/// IPv4 address (`evhelper.cpp:556-575`). Resolving the suffix only as a
-/// DNS host — as the cable tester previously did — made
+/// pvxs's `SockEndpoint` ctor accepts both an interface name and an
+/// interface IPv4 address, normalising the address back to a name
+/// through `IfaceMap::name_of` (`config.cpp:76-80`). Resolving the
+/// suffix only as a DNS host — as the cable tester previously did — made
 /// `pvxvct -B 224.0.1.1@en0` fail unless `en0` happened to exist in DNS.
 /// This is the single owner both tools share for `@iface` resolution.
 pub fn resolve_iface_ipv4(spec: &str) -> Result<std::net::Ipv4Addr, String> {
@@ -619,8 +729,8 @@ mod tests {
     /// comes back with its effective UDP port, and `EPICS_PVA_AUTO_ADDR_LIST`
     /// always reads `NO` because `expand()` folds the broadcast fan-out into
     /// the list and clears the flag — exactly what pvxs prints, since it too
-    /// renders `ctxt.config()` post-`expand()` (client.cpp:542-547,
-    /// config.cpp:640-643). Serialised on `epics_env` because it mutates the
+    /// renders `ctxt.config()` post-`expand()` (src/client.cpp:542-547,
+    /// config.cpp:640-644). Serialised on `epics_env` because it mutates the
     /// process-global environment.
     #[test]
     #[serial_test::serial(epics_env)]
@@ -738,8 +848,8 @@ mod tests {
 
     /// `resolve_iface_ipv4` accepts a literal interface IPv4 address
     /// verbatim and, on Unix, resolves an interface *name* to its IPv4
-    /// address — the dual form pvxs `IfaceMap` accepts
-    /// (`evhelper.cpp:556-575`). The loopback interface is `lo` on Linux
+    /// address — the dual form pvxs's `SockEndpoint` ctor accepts
+    /// (`config.cpp:76-80`). The loopback interface is `lo` on Linux
     /// and `lo0` on macOS/BSD; try both.
     #[test]
     fn resolve_iface_ipv4_literal_and_name() {
@@ -753,6 +863,77 @@ mod tests {
             if let Ok(v4) = lo {
                 assert!(v4.is_loopback(), "loopback iface IPv4 expected, got {v4}");
             }
+        }
+    }
+
+    /// The two `getopt` failure lines every pvAccess tool prints for
+    /// itself (`pvget.cpp:353-362`), and the cases where C has no such
+    /// line and clap's message must stand.
+    mod c_option_wording {
+        use super::super::c_option_error;
+        use clap::{CommandFactory, Parser};
+
+        /// The shape every pvAccess tool has: C short options, some of
+        /// which the port also spells long (`pvget-rs -F` /
+        /// `--format`).
+        #[derive(Parser, Debug)]
+        #[command(name = "pvget-rs")]
+        struct Args {
+            #[arg(short = 'w')]
+            timeout: Option<f64>,
+            #[arg(short = 'F', long = "format")]
+            format: Option<String>,
+            #[arg(short = 'm')]
+            monitor: bool,
+            names: Vec<String>,
+        }
+
+        fn c_error(argv: &[&str]) -> Option<String> {
+            let argv: Vec<std::ffi::OsString> = argv.iter().map(Into::into).collect();
+            let err = Args::try_parse_from(&argv).expect_err("must be a usage error");
+            c_option_error(&err, &Args::command(), &argv)
+        }
+
+        #[test]
+        fn an_unknown_short_option_names_the_letter_and_the_tool() {
+            assert_eq!(
+                c_error(&["pvget-rs", "-Z", "X"]).as_deref(),
+                Some("Unrecognized option: '-Z'. ('pvget-rs -h' for help.)\n")
+            );
+        }
+
+        #[test]
+        fn a_short_option_missing_its_value_says_so() {
+            assert_eq!(
+                c_error(&["pvget-rs", "-w"]).as_deref(),
+                Some("Option '-w' requires an argument. ('pvget-rs -h' for help.)\n")
+            );
+        }
+
+        /// clap names `-F` by its long spelling in the error context;
+        /// the letter is what C prints and what the user typed.
+        #[test]
+        fn a_short_option_that_also_has_a_long_form_still_names_the_letter() {
+            assert_eq!(
+                c_error(&["pvget-rs", "-F"]).as_deref(),
+                Some("Option '-F' requires an argument. ('pvget-rs -h' for help.)\n")
+            );
+        }
+
+        #[test]
+        fn a_long_invocation_keeps_claps_message() {
+            // `getopt` treats `--anything` as the end of options, so C
+            // has no wording for a long form at all, and the letter
+            // behind `--format` is not what this user typed.
+            assert_eq!(c_error(&["pvget-rs", "--nope"]), None);
+            assert_eq!(c_error(&["pvget-rs", "--format"]), None);
+        }
+
+        #[test]
+        fn a_bad_value_keeps_claps_message() {
+            // C's `:` arm is "missing", not "malformed"; a malformed
+            // value is the tool's own `epicsParseDouble` diagnostic.
+            assert_eq!(c_error(&["pvget-rs", "-w", "abc"]), None);
         }
     }
 }

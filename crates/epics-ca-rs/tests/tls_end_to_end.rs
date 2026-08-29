@@ -5,14 +5,18 @@
 //! across the encrypted virtual circuit. Built only with the `tls`
 //! feature.
 
-#![cfg(feature = "experimental-rust-tls")]
+//!
+//! `tokio_backend` as well: the IOC it stands is an `epics_ca_rs::server::
+//! CaServer`. Being behind a non-default feature is why the exec-gate sweep's
+//! `--all-targets` runs never compiled this file — `--all-features` does, and
+//! selects the exec backend at the same time.
 
-// RTEMS-EXEC-MODEL-ALLOW(1): not built by default - this file is behind the `experimental-rust-tls` feature.
+#![cfg(all(feature = "experimental-rust-tls", tokio_backend))]
+#![cfg(feature = "client-core")]
 
 use epics_ca_rs::client::{CaClient, CaClientConfig};
 use epics_ca_rs::server::CaServer;
 use epics_ca_rs::tls;
-use std::time::Duration;
 
 fn fresh_cert_and_key() -> (
     Vec<rustls_pki_types::CertificateDer<'static>>,
@@ -82,12 +86,12 @@ async fn rust_client_tls_to_rust_server() {
     .expect("client");
 
     let ch = client.create_channel("TLS:VAL");
-    ch.wait_connected(Duration::from_secs(5))
+    ch.wait_connected(budget::FACT_BUDGET)
         .await
         .expect("connect over TLS");
 
     let (_, value) = ch
-        .get_with_timeout(Duration::from_secs(3))
+        .get_with_timeout(budget::FACT_BUDGET)
         .await
         .expect("read over TLS");
     assert_eq!(value.to_f64().unwrap_or(0.0) as i64, 7777);
@@ -95,3 +99,6 @@ async fn rust_client_tls_to_rust_server() {
     // Don't tear down via drop ordering: just abort the server task.
     server_task.abort();
 }
+
+#[path = "common/budget.rs"]
+mod budget;

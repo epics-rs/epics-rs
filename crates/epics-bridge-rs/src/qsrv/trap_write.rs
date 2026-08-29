@@ -13,7 +13,7 @@
 //! and whose destructor calls `asTrapWriteAfterWrite`
 //! (`pvxs/ioc/securitylogger.h:23-59`), built once per put in
 //! `IOCSource::put` (`pvxs/ioc/singlesource.cpp:354-360`,
-//! `pvxs/ioc/iocsource.cpp:363-374`) and once per group field in
+//! `pvxs/ioc/iocsource.cpp:362-375`) and once per group field in
 //! `OnPut::onPut` (`pvxs/ioc/groupsource.cpp:594-602`). One logger maps
 //! to one Before/After pair around one backing write.
 //!
@@ -35,7 +35,8 @@
 //! the access layer; this helper reads only that flag and never
 //! re-derives the trap mask at the emission site.
 
-// RTEMS-EXEC-MODEL-ALLOW(2): checked - these run and pass in the feature-ON suite.
+// RTEMS-EXEC-MODEL-ALLOW(2): checked - these run and pass in the exec-backend
+// suite.
 
 use epics_base_rs::server::access_security;
 use epics_base_rs::types::EpicsValue;

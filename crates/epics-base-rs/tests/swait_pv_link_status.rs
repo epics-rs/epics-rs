@@ -4,11 +4,11 @@
 //! C `swaitRecord.dbd:166-250` declares fourteen `DBF_MENU`/`SPC_NOMOD` status
 //! fields — one per link, in the same order as the names INAN..INLN/DOLN/OUTN.
 //! `init_record` (swaitRecord.c:338-373) sets `NO_PV` for a blank name and
-//! `PV_NC` for any other, then `pvSearchCallback` (900-928) flips a connected
+//! `PV_NC` for any other, then `pvSearchCallback` (901-926) flips a connected
 //! one to `PV_OK`. The port had none of the fields: a client read of INAV..OUTV
 //! was a `FieldNotFound`.
 //!
-//! `execOutput` also reads DOL only `if (!pwait->dolv)` (:765). That guard's
+//! `execOutput` also reads DOL only `if (!pwait->dolv)` (:764). That guard's
 //! observable effect — an unset or unresolvable DOL leaves DOLD alone, and C
 //! writes the stale DOLD to OUT anyway — is what the framework's output-time
 //! fetch already produces by dropping a failed read, so the port does not gate
@@ -47,10 +47,10 @@ async fn process(db: &PvDatabase, rec: &str) {
 /// hands the thread to another task *on the caller's runtime*, and the
 /// classification is not always there: `refresh_link_status` goes through
 /// `schedule_record_init`, which spawns through the runtime seam, and under
-/// `rtems-exec-model` that is a background-executor thread with no relation to
+/// `exec_backend` that is a background-executor thread with no relation to
 /// this test's runtime at all. Eight yields then synchronise with nothing, and
 /// which assertion loses the race varied per run — the two tests that failed
-/// feature-ON were not the same two each time.
+/// on the exec backend were not the same two each time.
 ///
 /// Waiting on the observable instead is correct on every backend, and at every
 /// call site here it waits for a value the field did NOT already hold — a
@@ -119,7 +119,7 @@ async fn r9_76_pv_status_classifies_each_link() {
     );
 }
 
-/// A runtime re-point re-runs the search: C `special()` (swaitRecord.c:507-553)
+/// A runtime re-point re-runs the search: C `special()` (swaitRecord.c:507-559)
 /// re-issues `recDynLinkAddInput` for the new name and clears to NO_PV when the
 /// name is emptied.
 #[epics_macros_rs::epics_test]
@@ -132,7 +132,7 @@ async fn r9_76_put_to_a_pv_name_reclassifies_it() {
         .await
         .unwrap();
     // No wait here, and it would not be one: `SwaitRecord`'s constructed
-    // `pv_status` is already `[SWAIT_NO_PV; 14]` (swait.rs:211), so the
+    // `pv_status` is already `[SWAIT_NO_PV; 14]` (swait.rs:221), so the
     // classification writes NO_PV over NO_PV and there is no transition to
     // observe. This assertion pins the constructed default; the two waits
     // below are the ones that pin the classification.

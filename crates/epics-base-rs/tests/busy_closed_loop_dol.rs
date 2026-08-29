@@ -28,6 +28,7 @@
 
 use epics_base_rs::server::ioc_builder::IocBuilder;
 use epics_base_rs::server::record::AlarmSeverity;
+use epics_base_rs::server::records::busy::BusyRecord;
 use epics_base_rs::types::EpicsValue;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -36,6 +37,7 @@ type Db = Arc<epics_base_rs::server::database::PvDatabase>;
 
 async fn build(db_text: &str) -> Db {
     IocBuilder::new()
+        .register_record_type("busy", || Box::new(BusyRecord::default()))
         .db_string(db_text, &HashMap::new())
         .unwrap()
         .build()

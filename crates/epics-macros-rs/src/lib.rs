@@ -1,10 +1,84 @@
+//! # C reference pins
+//!
+//! Every `file.c:NNN` citation in this crate resolves at the tree and revision
+//! below, not at whatever that tree's working copy holds today. These trees are
+//! checked out on local branches here and run ahead of their pins.
+//!
+//! | tree | pinned revision |
+//! | --- | --- |
+//! | `pvxs` | `1.5.1-42-gb568e93` |
+//!
+//! **Resolve by symbol at the pin; the line is a hint.** Find the named
+//! function, struct, macro or field first, and treat the line number as a hint
+//! that has to land inside that construct. Three cases follow:
+//!
+//! 1. Construct at the pin, line lands in it — the citation is exact. A
+//!    reference checkout ahead of the pin will disagree; that disagreement is
+//!    the checkout's, not the citation's.
+//! 2. Construct at the pin, line lands outside it — line drift. Keep the
+//!    symbol and move the line to the pin's.
+//! 3. Construct absent at the pin — the citation means code added after it,
+//!    and is NOT moved onto the pin, where it would point at lines that do not
+//!    exist. It names the revision it means inline, beside the line span: the
+//!    upstream PR and commit, and that both are later than the pin this table
+//!    gives. `epics-libcom-rs` already carries that form.
+//!
+//! Every pin above passes `git merge-base --is-ancestor <pin> origin/<default>`
+//! in its own tree, which is the test a pin has to meet. A `git describe`
+//! string names an exact commit and is worth as much as a tag; what
+//! disqualifies a revision is being reachable only from a fork branch or an
+//! unmerged PR, because then it names nothing a reader outside this workspace
+//! can fetch.
+//!
+//! Resolve each citation on its own. One sentence can cite two lines that are
+//! right at different revisions, and a check run at either revision then
+//! reports a single tidy error while vouching for the very citation the other
+//! condemns.
+//!
+//! A row reading *no settled pin* means no revision has been agreed for that
+//! tree: say which revision you read, and do not take its `HEAD` for the pin.
+//! Citations into non-EPICS sources (libc, RTEMS, `rtems-libbsd`, VxWorks,
+//! vendored third-party) are outside this table and carry no pin.
+
 use proc_macro::TokenStream;
 use proc_macro_crate::{FoundCrate, crate_name};
 use quote::quote;
 use syn::{Data, DeriveInput, Fields, ItemFn, Lit, parse_macro_input};
 
+/// Resolve the path to the `runtime` module `#[epics_test]` expands into.
+///
+/// `runtime::task::test_block_on` is OWNED by `epics-libcom-rs`;
+/// `epics_base_rs::runtime` is only `pub use epics_libcom_rs::{net, runtime}`.
+/// Probing the owner first is what makes the expansion survive a consumer
+/// whose `epics-base-rs` is optional: `proc_macro_crate` reads the manifest,
+/// not the resolved feature set, so it finds a disabled optional dependency
+/// and names a crate the build did not link. `asyn-rs`'s one `#[epics_test]`
+/// was `E0433` under `--no-default-features` — which is that crate's own
+/// embedded configuration (`scripts/rtems-check.sh:190-197`) — and no
+/// spelling at the call site could fix it, because the crate name is emitted
+/// by this function.
+///
+/// `epics-base-rs` and the `epics-rs` umbrella stay in the chain below for a
+/// consumer that has neither `epics-libcom-rs` nor a direct base dependency.
+fn epics_runtime_path() -> proc_macro2::TokenStream {
+    if let Ok(found) = crate_name("epics-libcom-rs") {
+        return match found {
+            FoundCrate::Itself => quote!(::epics_libcom_rs),
+            FoundCrate::Name(name) => {
+                let ident = proc_macro2::Ident::new(&name, proc_macro2::Span::call_site());
+                quote!(::#ident)
+            }
+        };
+    }
+    epics_base_path()
+}
+
 /// Resolve the path to `epics_base_rs`, supporting both direct dependency
 /// (`epics-base-rs`) and umbrella crate (`epics-rs`) usage.
+///
+/// Still base-first, because its remaining caller — [`epics_main`] — needs
+/// `__tokio`, which only `epics-base-rs` re-exports. A path that answers two
+/// different questions is what let the `runtime` one above go wrong.
 fn epics_base_path() -> proc_macro2::TokenStream {
     if let Ok(found) = crate_name("epics-base-rs") {
         match found {
@@ -122,7 +196,8 @@ pub fn epics_main(attr: TokenStream, item: TokenStream) -> TokenStream {
 /// Expands to a plain `#[test]` whose body runs through
 /// `epics_base_rs::runtime::task::test_block_on`: on the tokio backend that
 /// is a fresh current-thread runtime (exactly what `#[tokio::test]` builds);
-/// on the exec backend (`--features rtems-exec-model` / the RTEMS target) the
+/// on the exec backend (`EPICS_RS_BUILD_EXEC_BACKEND=thread` / the RTEMS
+/// target) the
 /// test thread drives the future itself and spawns/sleeps land on the
 /// background executor. Use this instead of `#[tokio::test]` for any test
 /// whose body sticks to the `runtime::` abstractions — such a test needs no
@@ -188,7 +263,7 @@ pub fn epics_test(attr: TokenStream, item: TokenStream) -> TokenStream {
     let name = &sig.ident;
     let ret = &sig.output;
     let body = &input.block;
-    let base = epics_base_path();
+    let base = epics_runtime_path();
 
     quote! {
         #[test]
@@ -214,6 +289,11 @@ pub fn epics_test(attr: TokenStream, item: TokenStream) -> TokenStream {
 ///   `Record::process_posts_value_monitor` returning `false`, for a "trigger"
 ///   record (fanout/seq) whose C `process()` posts VAL only with alarm events;
 ///   omitted, the trait default `true` applies
+/// - `#[record(type = "longin", dset_owns_udf_on_computed)]` — emit
+///   `Record::rederives_udf_on_computed_read` returning `false`, for a record
+///   whose C `process()` keeps `prec->udf = FALSE` inside `if (status == 0)`
+///   and folds `2` into `0` only afterwards (or not at all); omitted, the
+///   trait default `true` applies
 /// - `#[field(type = "Double")]` — sets the DBR type for a field
 /// - `#[field(type = "Double", read_only)]` — marks a field as read-only
 /// - `#[field(type = "Short", menu_choices = SELM_CHOICES)]` — a
@@ -275,6 +355,15 @@ struct RecordAttrs {
     /// with alarm events, never `DBE_VALUE`/`DBE_LOG`. Default `false` (the
     /// trait default `true` applies), so ordinary value records are unaffected.
     no_value_monitor: bool,
+    /// `#[record(dset_owns_udf_on_computed)]` — the record's C `process()` does
+    /// NOT re-derive `udf` after a device read that wrote VAL directly (C
+    /// `return 2`), because the `else if (status == 2) status = 0;` fold sits
+    /// AFTER the UDF assignment (`biRecord.c:136-141`) or is absent entirely
+    /// (`longinRecord.c:148`, `int64inRecord.c:144`). Emitted as
+    /// `Record::rederives_udf_on_computed_read` → `false`. Default `false` (the
+    /// trait default `true` applies), which is `aiRecord.c:158-161`'s shape and
+    /// the majority.
+    dset_owns_udf_on_computed: bool,
 }
 
 struct FieldInfo {
@@ -480,11 +569,25 @@ fn impl_epics_record(input: &DeriveInput) -> syn::Result<proc_macro2::TokenStrea
         quote! {}
     };
 
+    // `#[record(dset_owns_udf_on_computed)]` — emit
+    // `Record::rederives_udf_on_computed_read` returning `false` for the five
+    // records whose C `process()` leaves `udf` to the dset on a `return 2`.
+    let computed_udf_method = if attrs.dset_owns_udf_on_computed {
+        quote! {
+            fn rederives_udf_on_computed_read(&self) -> bool {
+                false
+            }
+        }
+    } else {
+        quote! {}
+    };
+
     let expanded = quote! {
         impl #krate::server::record::Record for #name {
             #constant_init_method
             #init_method
             #value_monitor_method
+            #computed_udf_method
             #metadata_override_method
             #link_metadata_field_method
 
@@ -526,6 +629,7 @@ fn parse_record_attrs(input: &DeriveInput) -> syn::Result<RecordAttrs> {
     let mut metadata_override: Option<syn::Path> = None;
     let mut link_metadata_field: Option<syn::Path> = None;
     let mut no_value_monitor = false;
+    let mut dset_owns_udf_on_computed = false;
 
     for attr in &input.attrs {
         if attr.path().is_ident("record") {
@@ -570,11 +674,15 @@ fn parse_record_attrs(input: &DeriveInput) -> syn::Result<RecordAttrs> {
                     // Bare flag, like a field's `read_only`: no `= value`.
                     no_value_monitor = true;
                     Ok(())
+                } else if meta.path.is_ident("dset_owns_udf_on_computed") {
+                    // Bare flag.
+                    dset_owns_udf_on_computed = true;
+                    Ok(())
                 } else {
                     Err(meta.error(
                         "expected `type`, `crate_path`, `constant_init`, `init`, \
-                         `metadata_override`, `link_metadata_field` or \
-                         `no_value_monitor`",
+                         `metadata_override`, `link_metadata_field`, \
+                         `no_value_monitor` or `dset_owns_udf_on_computed`",
                     ))
                 }
             })?;
@@ -592,6 +700,7 @@ fn parse_record_attrs(input: &DeriveInput) -> syn::Result<RecordAttrs> {
         metadata_override,
         link_metadata_field,
         no_value_monitor,
+        dset_owns_udf_on_computed,
     })
 }
 

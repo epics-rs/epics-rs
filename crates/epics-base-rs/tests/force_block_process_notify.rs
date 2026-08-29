@@ -1,4 +1,4 @@
-// RTEMS-EXEC-MODEL-ALLOW(1): a multi-thread-flavored tokio test — the gated install has to block on a second worker; runs and passes in the feature-ON suite.
+// RTEMS-EXEC-MODEL-ALLOW(1): a multi-thread-flavored tokio test — the gated install has to block on a second worker; runs and passes in the exec-backend suite.
 //! `PvDatabase::process_record_with_notify` — the QSRV
 //! `record[process=true,block=true]` (Force + block) completion barrier.
 //!
@@ -149,12 +149,12 @@ async fn force_block_install_waits_for_the_record_put_gate() {
     // the window; a gated install spends the whole budget blocked instead.
     for _ in 0..40 {
         tokio::time::sleep(std::time::Duration::from_millis(5)).await;
-        if rec.read().notify.is_some() {
+        if rec.read().has_notify() {
             break;
         }
     }
     assert!(
-        rec.read().notify.is_none(),
+        !rec.read().has_notify(),
         "no put-notify may take the record's slot while another put holds its \
          write gate"
     );
@@ -169,7 +169,7 @@ async fn force_block_install_waits_for_the_record_put_gate() {
         "the forced cycle runs to completion once it owns the gate"
     );
     assert!(
-        rec.read().notify.is_none(),
+        !rec.read().has_notify(),
         "the cycle drains the wait-set it installed"
     );
 }

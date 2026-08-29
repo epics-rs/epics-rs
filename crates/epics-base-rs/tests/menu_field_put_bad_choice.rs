@@ -10,7 +10,7 @@
 //!
 //! Exact `strcmp` — no trim, no case folding — then a base-0 index that must be
 //! BELOW `nChoice`. Anything else is `S_db_badChoice`, returned from inside
-//! `dbPut` *before* the value is stored (`dbAccess.c:1362` `if (status) goto
+//! `dbPut` *before* the value is stored (`dbAccess.c:1357` `if (status) goto
 //! done`), so the field keeps its previous value, no monitor is posted, and the
 //! record is not processed. rsrv answers a put-callback with ECA_PUTFAIL
 //! (`db_access.c:1041` → `camessage.c:1386`).
@@ -20,7 +20,7 @@
 //! string became `to_f64().unwrap_or(0.0) as u16`, i.e. **menu index 0**. So
 //! `caput FAN.SELM Bogus` silently selected `All`.
 
-use epics_base_rs::error::CaError;
+use epics_base_rs::error::{CaError, CaOp};
 use epics_base_rs::server::database::PvDatabase;
 use epics_base_rs::server::records::fanout::FanoutRecord;
 use epics_base_rs::types::EpicsValue;
@@ -58,7 +58,7 @@ async fn out_of_menu_index_is_bad_choice_and_stores_nothing() {
             .await
             .expect_err("C: val >= nChoice → S_db_badChoice");
         assert!(matches!(err, CaError::BadChoice(_)), "got {err:?}");
-        assert_eq!(err.to_eca_status(), ECA_PUTFAIL);
+        assert_eq!(err.to_eca_status(CaOp::Write), ECA_PUTFAIL);
         // C returns before `dbFastPutConvertRoutine` ever runs.
         assert_eq!(selm(&db).await, 2, "a refused put must not touch the field");
     }

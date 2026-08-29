@@ -88,6 +88,58 @@ impl NumericField {
     }
 }
 
+/// What a C string→numeric row did to its destination.
+///
+/// `cvt_st_ul` is the one row in the family that can return SUCCESS while
+/// writing nothing. Its via-double fallback stores only inside the destination
+/// band —
+///
+/// ```c
+/// status = epicsParseFloat64(from, &dval, &end);
+/// if (!status && dval >= 0 && dval <= UINT_MAX)
+///     *to = dval;             /* dbFastLinkConv.c:182-185 */
+/// ```
+///
+/// — and then `return status`, which is the FLOAT parse's status and is zero.
+/// When the integer parse consumed no digits there is nothing in the
+/// destination but its old value, so C reports success and the field keeps it.
+/// The array twins do the same per element (`dbConvert.c:305-306` in
+/// `getStringUlong`, `:1055-1056` in `putStringUlong`).
+///
+/// The inputs that reach it are the ones with NO leading digits whose double is
+/// outside `0..=UINT_MAX`: `-.5` and the non-finite literals `nan`, `inf`,
+/// `-inf` (`nan` fails `dval >= 0`, the infinities fail one comparison each).
+/// With digits, the first parse already wrote its prefix and the skipped store
+/// leaves THAT — which is a stored value, [`Self::Stored`], not this variant.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Converted {
+    /// The row wrote this value.
+    Stored(EpicsValue),
+    /// The row returned success WITHOUT writing. The destination keeps its old
+    /// value and the put continues — in C nothing after the converter tests
+    /// anything but `status`, so the UDF clear, the monitors and the record's
+    /// processing all run exactly as they do for a stored value.
+    Unchanged,
+}
+
+/// A row's three outcomes, before the direction picks how to report them: a put
+/// has a channel for all three, a get does not (see [`get_string`]).
+enum Row {
+    Stored(EpicsValue),
+    Unchanged,
+    Refused,
+}
+
+impl Row {
+    /// `Some` is C's zero status with a value to store, `None` its non-zero.
+    fn stored(v: Option<EpicsValue>) -> Self {
+        match v {
+            Some(v) => Self::Stored(v),
+            None => Self::Refused,
+        }
+    }
+}
+
 /// The refusal. C distinguishes `S_stdlib_noConversion` / `_overflow` /
 /// `_underflow`, but `dbPut` only tests the status for zero and `rsrv` maps
 /// every non-zero to `ECA_PUTFAIL`, so the distinction is not observable to a
@@ -98,38 +150,94 @@ fn refuse(field: &str, s: &str, target: NumericField) -> CaError {
     ))
 }
 
-/// C `dbFastPutConvertRoutine[DBR_STRING][target]` — parse `s`, or refuse the
-/// put exactly where C's `epicsParse*` returns a non-zero status.
-pub fn put_string(field: &str, target: NumericField, s: &str) -> CaResult<EpicsValue> {
-    parse(target, s).ok_or_else(|| refuse(field, s, target))
+/// C `dbFastPutConvertRoutine[DBR_STRING][target]` (`dbFastLinkConv.c:1698`) —
+/// the SCALAR put row, `cvt_st_*`. Parse `s`, or refuse the put exactly where
+/// C's `epicsParse*` returns a non-zero status.
+///
+/// Every `cvt_st_*` opens with the empty-string arm before it parses anything
+/// (`cvt_st_c` at `:91`, `cvt_st_l` at `:147`, `cvt_st_d` at `:233`, and so on
+/// for each width):
+///
+/// ```c
+/// if (*from == 0) {
+///     *to = 0;
+///     return 0;
+/// }
+/// ```
+///
+/// so `caput REC.VAL ""` STORES 0 rather than being refused. This row is what
+/// `dbPut` selects for a scalar put — `nRequest == 1` and the field is not
+/// `special(SPC_DBADDR)` (`dbAccess.c:1350`, taking the `else` at `:1375` /
+/// `:1386`); the array row [`put_string_element`] is the one with no such arm.
+/// A whitespace-only string is not empty by this test and reaches
+/// `epicsParse*`, which refuses it.
+pub fn put_string(field: &str, target: NumericField, s: &str) -> CaResult<Converted> {
+    if s.is_empty() {
+        return Ok(Converted::Stored(zero(target)));
+    }
+    match parse(target, s) {
+        Row::Stored(v) => Ok(Converted::Stored(v)),
+        Row::Unchanged => Ok(Converted::Unchanged),
+        Row::Refused => Err(refuse(field, s, target)),
+    }
 }
 
-/// C `dbGetConvertRoutine[DBF_STRING][target]` / `dbFastGetConvertRoutine` —
-/// the same `epicsParse*` as [`put_string`], with the get direction's own
-/// empty-string rule.
+/// C `dbPutConvertRoutine[DBR_STRING][target]` (`dbAccess.c:1362`) — the ARRAY
+/// put row, `putString*`.
 ///
-/// `cvt_st_c` (`dbFastLinkConv.c:91-101`), `cvt_st_d` (`:233-244`) and the
-/// array twin `getStringDouble` (`dbConvert.c:392-414`) all test the empty
-/// string FIRST and answer with a successful zero:
+/// The same `epicsParse*` as [`put_string`] and deliberately WITHOUT its
+/// empty-string arm: `putStringLong` (`dbConvert.c:1017`) and `putStringDouble`
+/// (`:1130`) go straight to the parse, so an empty element is
+/// `S_stdlib_noConversion` and the whole `dbPut` fails. `dbPut` selects this
+/// row when `nRequest > 1` OR the field is `special(SPC_DBADDR)`
+/// (`dbAccess.c:1350`) — which is why a waveform reaches it even for a
+/// one-element string put.
+pub fn put_string_element(field: &str, target: NumericField, s: &str) -> CaResult<Converted> {
+    match parse(target, s) {
+        Row::Stored(v) => Ok(Converted::Stored(v)),
+        Row::Unchanged => Ok(Converted::Unchanged),
+        Row::Refused => Err(refuse(field, s, target)),
+    }
+}
+
+/// C `dbFastGetConvertRoutine[DBF_STRING][target]` (`dbFastLinkConv.c:1642`) —
+/// the SCALAR get row.
+///
+/// It is the SAME `cvt_st_*` function as [`put_string`]: the get table is
+/// indexed `[field type][request type]` and the put table
+/// `[request type][field type]`, and both name `cvt_st_c, cvt_st_uc, …,
+/// cvt_st_d` in their DBF_STRING/DBR_STRING row (`:1645` and `:1701`). So the
+/// empty-string arm is common to both directions, and the two entry points are
+/// separate only because their failures differ (`GetConvertFailed` vs a refused
+/// put).
 ///
 /// ```c
 /// if (*from == 0) { *to = 0; return 0; }
 /// ```
 ///
-/// The put row has no such test (`putStringDouble`, `dbConvert.c:1130-1147`),
-/// so an empty `DBF_STRING` field READS as 0 while an empty `caput` is refused.
-/// That asymmetry is why the two directions cannot share one entry point. A
-/// whitespace-only field is not empty by this test and reaches `epicsParse*`,
-/// which refuses it.
+/// The array twin `getStringDouble` (`dbConvert.c:392-413`) carries the arm too
+/// — inside the per-element loop. Of the four rows, exactly one lacks it: the
+/// array PUT row, [`put_string_element`]. A whitespace-only field is not empty
+/// by this test and reaches `epicsParse*`, which refuses it.
 pub fn get_string(target: NumericField, s: &str) -> CaResult<EpicsValue> {
     if s.is_empty() {
         return Ok(zero(target));
     }
-    parse(target, s).ok_or_else(|| {
-        CaError::GetConvertFailed(format!(
+    match parse(target, s) {
+        Row::Stored(v) => Ok(v),
+        // DELIBERATE DEVIATION, the one place [`Converted::Unchanged`] is not
+        // portable: on a get the destination is the CALLER's buffer, and C
+        // returning success without writing hands `dbGet`'s caller whatever
+        // that buffer already held — for `rsrv` a reused response buffer, so
+        // `caget -t` of a `DBF_STRING` field holding `nan` as `DBR_ULONG`
+        // answers ECA_NORMAL with stale bytes. This port has no prior buffer to
+        // keep at that boundary and will not invent a value, so the get fails
+        // where C succeeds with garbage. The PUT direction has a real previous
+        // value and does express it.
+        Row::Unchanged | Row::Refused => Err(CaError::GetConvertFailed(format!(
             "cannot convert \"{s}\" to {target:?} (C epicsParse* returns a non-zero status)"
-        ))
-    })
+        ))),
+    }
 }
 
 /// C `dbGetConvertRoutine[DBF_STRING][target]` — [`get_string`] run over a
@@ -196,7 +304,16 @@ fn zero(target: NumericField) -> EpicsValue {
     }
 }
 
-fn parse(target: NumericField, s: &str) -> Option<EpicsValue> {
+/// The row for `target`. `ULong` is the only one with three outcomes; every
+/// other width either produces a value or returns a non-zero status.
+fn parse(target: NumericField, s: &str) -> Row {
+    if target == NumericField::ULong {
+        return parse_ulong_via_double(s);
+    }
+    Row::stored(parse_two_way(target, s))
+}
+
+fn parse_two_way(target: NumericField, s: &str) -> Option<EpicsValue> {
     Some(match target {
         // The signed widths range-check against the destination and refuse a
         // value outside it (`epicsStdlib.c:181-261`).
@@ -220,12 +337,14 @@ fn parse(target: NumericField, s: &str) -> Option<EpicsValue> {
         // out-of-range *positive* band is rejected.
         NumericField::UChar => EpicsValue::UChar(outside_band(parse_ulong(s)?, 0xff)? as u8),
         NumericField::UShort => EpicsValue::UShort(outside_band(parse_ulong(s)?, 0xffff)? as u16),
-        NumericField::ULong => EpicsValue::ULong(parse_ulong_via_double(s)?),
         // No band: the destination is as wide as `unsigned long`.
         NumericField::UInt64 => EpicsValue::UInt64(parse_ulong(s)?),
 
         NumericField::Float => EpicsValue::Float(narrow_to_f32(parse_double(s)?)?),
         NumericField::Double => EpicsValue::Double(parse_double(s)?),
+
+        // `parse` takes it: it is the one row with three outcomes.
+        NumericField::ULong => return None,
     })
 }
 
@@ -280,21 +399,34 @@ fn outside_band(v: u64, max: u64) -> Option<u64> {
 /// already-parsed integer prefix (`1.5e20` stores 1). An integer parse that
 /// overflowed (ERANGE or the band test) gets NO fallback and stays refused.
 ///
-/// Deviation: with no leading digits AND a double outside `0..=UINT_MAX`
-/// (e.g. `-.5`), C reports success while writing nothing — the field keeps
-/// its old value (`dbConvert.c:1055-1058` skips the store, status stays 0;
-/// measured: `dbpf B.SVAL -.5` leaves the previous value in place).
-/// "Accepted but writes nothing" is not expressible through this owner's
-/// return value, so that input is refused instead. Relatedly, on a
-/// double-parse ERANGE (`1e999`) C returns the error AFTER the first parse
-/// already wrote the integer prefix through `pdst` (measured: the field
-/// becomes 1); this owner refuses without writing — puts here are atomic.
-fn parse_ulong_via_double(s: &str) -> Option<u32> {
-    let d = scan_int(s);
+/// With no leading digits AND a double outside `0..=UINT_MAX`, C reports
+/// success while writing nothing — the field keeps its old value
+/// (`dbConvert.c:1055-1058` skips the store, status stays 0; measured:
+/// `dbpf B.SVAL -.5` leaves the previous value in place). The inputs that reach
+/// it are `-.5`, `nan`, `inf` and `-inf`: `nan` fails `dval >= 0` and the
+/// infinities fail one comparison each, so all four take the same
+/// silent-success exit. That is [`Converted::Unchanged`], and it is why this
+/// row returns [`Row`] rather than an `Option`.
+///
+/// Deviation: on a double-parse ERANGE (`1e999`) C returns the error AFTER the
+/// first parse already wrote the integer prefix through `pdst` (measured: the
+/// field becomes 1); this owner refuses without writing — puts here are atomic.
+fn parse_ulong_via_double(s: &str) -> Row {
+    let stored = |v: u32| Row::Stored(EpicsValue::ULong(v));
+    let d = scan_int(s, 0);
     let int_value = if d.any {
-        let v = u64::try_from(d.magnitude?).ok()?;
-        let v = if d.negative { v.wrapping_neg() } else { v };
-        Some(outside_band(v, 0xffff_ffff)? as u32)
+        let parsed = (|| {
+            let v = u64::try_from(d.magnitude?).ok()?;
+            let v = if d.negative { v.wrapping_neg() } else { v };
+            Some(outside_band(v, 0xffff_ffff)? as u32)
+        })();
+        match parsed {
+            // An integer parse that overflowed gets NO fallback: C's `status`
+            // is not `S_stdlib_noConversion`, so the via-double arm is skipped
+            // and the overflow is returned.
+            None => return Row::Refused,
+            some => some,
+        }
     } else {
         None
     };
@@ -304,21 +436,21 @@ fn parse_ulong_via_double(s: &str) -> Option<u32> {
         .is_some_and(|c| matches!(c, b'.' | b'e' | b'E'));
     match int_value {
         Some(prefix) if stopped_at_float => match parse_double(s) {
-            Some(dval) if (0.0..=u32::MAX as f64).contains(&dval) => Some(dval as u32),
+            Some(dval) if (0.0..=u32::MAX as f64).contains(&dval) => stored(dval as u32),
             // Out-of-band double: C skips the store, keeping the integer
             // prefix the first parse already wrote into the field.
-            Some(_) => Some(prefix),
+            Some(_) => stored(prefix),
             // Double-parse ERANGE (`1e999`): C returns that status.
-            None => None,
+            None => Row::Refused,
         },
-        Some(prefix) => Some(prefix),
-        // No digits at all (S_stdlib_noConversion) → via-double or refuse.
-        None => {
-            let dval = parse_double(s)?;
-            (0.0..=u32::MAX as f64)
-                .contains(&dval)
-                .then_some(dval as u32)
-        }
+        Some(prefix) => stored(prefix),
+        // No digits at all (S_stdlib_noConversion) → via-double, and the
+        // out-of-band double is the store C skips.
+        None => match parse_double(s) {
+            Some(dval) if (0.0..=u32::MAX as f64).contains(&dval) => stored(dval as u32),
+            Some(_) => Row::Unchanged,
+            None => Row::Refused,
+        },
     }
 }
 
@@ -337,10 +469,14 @@ struct Digits {
     end: usize,
 }
 
-/// The scanning half of `strtol`/`strtoul` with `base == 0`: leading space, an
-/// optional sign, the base prefix, then the digits. Trailing text is left
-/// unread — the caller's `units` pointer makes that legal.
-fn scan_int(s: &str) -> Digits {
+/// The scanning half of `strtol`/`strtoul`: leading space, an optional sign,
+/// the base prefix, then the digits. Trailing text is left unread — whether
+/// that is legal is the caller's `units` argument, not this scanner's business.
+///
+/// `base == 0` is `strtol`'s auto-detect, which is what `dbConvertBase` gives
+/// the `dbConvert` rows; `dbtpf` passes a literal 10 instead, so `0x10` there
+/// scans as the single digit `0` and leaves `x10` for the extraneous test.
+fn scan_int(s: &str, mut base: u32) -> Digits {
     let b = s.as_bytes();
     let mut i = 0;
     while i < b.len() && crate::runtime::stdlib::c_isspace(b[i] as char) {
@@ -356,19 +492,21 @@ fn scan_int(s: &str) -> Digits {
     // the `x`/`b` is trailing text. `0b` is binary on the reference toolchain
     // (glibc implements the C23 binary literal in `strtol` base 0, measured:
     // `caput REC.PREC 0b11` stores 3).
-    let mut base = 10u32;
-    if i < b.len() && b[i] == b'0' {
-        let next = b.get(i + 1).map(|c| c.to_ascii_lowercase());
-        let after = b.get(i + 2).copied();
-        if next == Some(b'x') && after.is_some_and(|c| c.is_ascii_hexdigit()) {
-            base = 16;
-            i += 2;
-        } else if next == Some(b'b') && after.is_some_and(|c| c == b'0' || c == b'1') {
-            base = 2;
-            i += 2;
-        } else {
-            // The leading `0` is a valid octal digit and is consumed by the loop.
-            base = 8;
+    if base == 0 {
+        base = 10;
+        if i < b.len() && b[i] == b'0' {
+            let next = b.get(i + 1).map(|c| c.to_ascii_lowercase());
+            let after = b.get(i + 2).copied();
+            if next == Some(b'x') && after.is_some_and(|c| c.is_ascii_hexdigit()) {
+                base = 16;
+                i += 2;
+            } else if next == Some(b'b') && after.is_some_and(|c| c == b'0' || c == b'1') {
+                base = 2;
+                i += 2;
+            } else {
+                // The leading `0` is a valid octal digit and is consumed by the loop.
+                base = 8;
+            }
         }
     }
 
@@ -392,10 +530,9 @@ fn scan_int(s: &str) -> Digits {
     }
 }
 
-/// C `strtol(s, &end, 0)` plus `epicsParseLong`'s status: `None` for
+/// C `strtol`'s signed result plus `epicsParseLong`'s status: `None` for
 /// `S_stdlib_noConversion` and for `ERANGE`.
-fn parse_long(s: &str) -> Option<i64> {
-    let d = scan_int(s);
+fn long_from(d: &Digits) -> Option<i64> {
     if !d.any {
         return None;
     }
@@ -408,17 +545,110 @@ fn parse_long(s: &str) -> Option<i64> {
     }
 }
 
-/// C `strtoul(s, &end, 0)` plus `epicsParseULong`'s status. A leading `-`
+/// C `strtoul`'s unsigned result plus `epicsParseULong`'s status. A leading `-`
 /// negates modulo 2^64 and is NOT an error — that is what lets `-1` reach an
 /// unsigned field as `ULONG_MAX`.
-fn parse_ulong(s: &str) -> Option<u64> {
-    let d = scan_int(s);
+fn ulong_from(d: &Digits) -> Option<u64> {
     if !d.any {
         return None;
     }
     let m = d.magnitude?;
     let v = u64::try_from(m).ok()?;
     Some(if d.negative { v.wrapping_neg() } else { v })
+}
+
+/// C `strtol(s, &end, 0)` plus `epicsParseLong`'s status.
+fn parse_long(s: &str) -> Option<i64> {
+    long_from(&scan_int(s, 0))
+}
+
+/// C `strtoul(s, &end, 0)` plus `epicsParseULong`'s status.
+fn parse_ulong(s: &str) -> Option<u64> {
+    ulong_from(&scan_int(s, 0))
+}
+
+/// `if (c && !units) return S_stdlib_extraneous;`, after the trailing
+/// whitespace skip (`epicsStdlib.c:44-48`).
+fn extraneous(s: &str, end: usize) -> bool {
+    !s[end..]
+        .trim_start_matches(crate::runtime::stdlib::c_isspace)
+        .is_empty()
+}
+
+fn strict_long(s: &str, base: u32) -> Option<i64> {
+    let d = scan_int(s, base);
+    let v = long_from(&d)?;
+    (!extraneous(s, d.end)).then_some(v)
+}
+
+fn strict_ulong(s: &str, base: u32) -> Option<u64> {
+    let d = scan_int(s, base);
+    let v = ulong_from(&d)?;
+    (!extraneous(s, d.end)).then_some(v)
+}
+
+/// The `epicsParse*(str, &value, 10, NULL)` family — the STRICT form, which
+/// the `dbConvert` rows above never use but `dbtpf` does
+/// (`dbTest.c:645-679`). Two things change against [`put_string`], both from
+/// the arguments rather than from the width ladder, which is shared:
+///
+/// * `units == NULL` makes a trailing non-space tail `S_stdlib_extraneous`
+///   (`epicsStdlib.c:44-48`), so `9.25` is REFUSED for every integer width
+///   where the `dbConvert` row stores 9.
+/// * base 10 is literal, not `dbConvertBase`'s auto-detect, so `0x10` scans
+///   as `0` and then trips the extraneous test.
+///
+/// `DBR_ULONG` here is a plain `epicsParseUInt32`; it does NOT get
+/// `putStringUlong`'s via-double fallback, so `dbtpf REC 1.0e3` refuses the
+/// `DBR_ULONG` row while `dbpf REC.VAL 1.0e3` stores 1000. `DBR_ENUM` is
+/// `epicsParseUInt16` (`dbTest.c:678`), i.e. this function's
+/// [`NumericField::UShort`] row.
+pub fn parse_base10_units_null(target: NumericField, s: &str) -> Option<EpicsValue> {
+    parse_units_null(target, s, 10)
+}
+
+/// The same family with `dbConvertBase` (base 0) rather than a literal 10 —
+/// C's `epicsParse*(value, &dummy, 0, &end)` in `dbRecordField`'s field-name
+/// suggestion (`dbLexRoutines.c:1300-1330`).
+///
+/// That call site passes a NON-NULL `units` and then tests `*end == quote`
+/// itself, which accepts exactly what a NULL `units` accepts: both require the
+/// tail after `epicsParseLong`'s trailing-whitespace skip to be empty. So the
+/// strictness is shared with [`parse_base10_units_null`] and only the base
+/// differs — `0x10` scans as 16 here and as an extraneous `0` there.
+pub fn parse_auto_base_units_null(target: NumericField, s: &str) -> Option<EpicsValue> {
+    parse_units_null(target, s, 0)
+}
+
+fn parse_units_null(target: NumericField, s: &str, base: u32) -> Option<EpicsValue> {
+    Some(match target {
+        NumericField::Char => {
+            EpicsValue::Char(in_range(strict_long(s, base)?, -0x80, 0x7f)? as i8 as u8)
+        }
+        NumericField::Short => {
+            EpicsValue::Short(in_range(strict_long(s, base)?, -0x8000, 0x7fff)? as i16)
+        }
+        NumericField::Long => {
+            EpicsValue::Long(in_range(strict_long(s, base)?, -0x8000_0000, 0x7fff_ffff)? as i32)
+        }
+        NumericField::Int64 => EpicsValue::Int64(strict_long(s, base)?),
+        NumericField::UChar => EpicsValue::UChar(outside_band(strict_ulong(s, base)?, 0xff)? as u8),
+        NumericField::UShort => {
+            EpicsValue::UShort(outside_band(strict_ulong(s, base)?, 0xffff)? as u16)
+        }
+        NumericField::ULong => {
+            EpicsValue::ULong(outside_band(strict_ulong(s, base)?, 0xffff_ffff)? as u32)
+        }
+        NumericField::UInt64 => EpicsValue::UInt64(strict_ulong(s, base)?),
+        // `epicsParseFloat32`/`Float64` are `epicsParseDouble` with the same
+        // NULL `units`, which is the one this workspace already owns.
+        NumericField::Float => EpicsValue::Float(narrow_to_f32(
+            crate::runtime::stdlib::epics_parse_double(s).ok()?,
+        )?),
+        NumericField::Double => {
+            EpicsValue::Double(crate::runtime::stdlib::epics_parse_double(s).ok()?)
+        }
+    })
 }
 
 /// C `epicsParseDouble` (`epicsStdlib.c:150-176`): `strtod`, then ERANGE is a
@@ -487,14 +717,28 @@ fn strtod(s: &str) -> Option<(f64, Literal)> {
     // Decimal: the longest prefix Rust's own parser accepts, which is the same
     // grammar `strtod` scans. It yields `inf` on overflow and `0.0`/subnormal on
     // underflow instead of an errno, which `parse_double` then classifies.
+    //
+    // At most ONE `.`: `strtod` ends the mantissa at the second one and leaves
+    // the rest as trailing text, which every call site here permits (a non-NULL
+    // `units`). Scanning greedily instead made the whole slice unparseable and
+    // refused the put, so `12.34.56` — accepted by C as 12.34 into a DBF_DOUBLE
+    // or DBF_FLOAT, and as 12 into a DBF_ULONG through `cvt_st_ul`'s via-double
+    // fallback (`dbFastLinkConv.c:172-187`) — was rejected outright. Bounding
+    // the scan is also what makes `body[..i]` a well-formed float literal by
+    // construction rather than by hope.
     let b = body.as_bytes();
     let mut i = 0;
     let mut significant = false;
     let mut mantissa_digits = 0;
-    while i < b.len() && (b[i].is_ascii_digit() || b[i] == b'.') {
+    let mut seen_point = false;
+    while i < b.len() {
         if b[i].is_ascii_digit() {
             mantissa_digits += 1;
             significant |= b[i] != b'0';
+        } else if b[i] == b'.' && !seen_point {
+            seen_point = true;
+        } else {
+            break;
         }
         i += 1;
     }
@@ -578,7 +822,20 @@ mod tests {
     /// Every expected value below was MEASURED against the compiled reference
     /// softIoc (`caput -c` then `caget`), never computed by hand.
     fn put(t: NumericField, s: &str) -> Option<EpicsValue> {
-        put_string("F", t, s).ok()
+        match put_string("F", t, s) {
+            Ok(Converted::Stored(v)) => Some(v),
+            // `Unchanged` has its own assertions; a helper that returned
+            // `None` for both would let a store-skip pass as a refusal.
+            Ok(Converted::Unchanged) | Err(_) => None,
+        }
+    }
+
+    /// The array row — same parse, no empty-string carve-out.
+    fn put_elem(t: NumericField, s: &str) -> Option<EpicsValue> {
+        match put_string_element("F", t, s) {
+            Ok(Converted::Stored(v)) => Some(v),
+            Ok(Converted::Unchanged) | Err(_) => None,
+        }
     }
 
     // --- the refusals: the boundary C will not cross -------------------------
@@ -632,8 +889,25 @@ mod tests {
         // softIoc: `caput T:C.PREC notanumber` -> ERROR. The port used to store 0.
         assert_eq!(put(NumericField::Short, "notanumber"), None);
         assert_eq!(put(NumericField::Double, "notanumber"), None);
-        assert_eq!(put(NumericField::Short, ""), None);
-        assert_eq!(put(NumericField::Double, ""), None);
+        // Whitespace only: not the empty string to C's `*from == 0`, so it
+        // reaches `epicsParse*` and is refused on BOTH rows.
+        assert_eq!(put(NumericField::Short, "   "), None);
+        assert_eq!(put(NumericField::Double, "   "), None);
+        assert_eq!(put_elem(NumericField::Short, "   "), None);
+    }
+
+    /// The one place the two put rows disagree — `cvt_st_l`
+    /// (`dbFastLinkConv.c:147`) answers the empty string with a successful
+    /// zero, `putStringLong` (`dbConvert.c:1017`) parses it and fails. This
+    /// assertion used to read `put(..., "") == None`, which is how a false doc
+    /// comment naming the array row as "the put row" became a false test.
+    #[test]
+    fn the_empty_string_is_zero_on_the_scalar_row_and_refused_on_the_array_row() {
+        assert_eq!(put(NumericField::Short, ""), Some(EpicsValue::Short(0)));
+        assert_eq!(put(NumericField::Double, ""), Some(EpicsValue::Double(0.0)));
+        assert_eq!(put(NumericField::UChar, ""), Some(EpicsValue::UChar(0)));
+        assert_eq!(put_elem(NumericField::Short, ""), None);
+        assert_eq!(put_elem(NumericField::Double, ""), None);
     }
 
     // --- the unsigned band: negatives are ACCEPTED, wide positives are not ---
@@ -685,9 +959,30 @@ mod tests {
         assert_eq!(put(NumericField::ULong, "1e999"), None);
         // Band overflow on the integer parse gets NO fallback.
         assert_eq!(put(NumericField::ULong, "4294967296.5"), None);
-        // No digits + double outside the band: C silently writes nothing;
-        // this owner refuses (documented deviation).
-        assert_eq!(put(NumericField::ULong, "-.5"), None);
+        // No digits + double outside the band: C returns success and skips
+        // the store, so the field keeps its old value. Every input that
+        // reaches that exit, in both directions of the row.
+        for s in ["-.5", "nan", "inf", "-inf"] {
+            assert!(
+                matches!(
+                    put_string("F", NumericField::ULong, s),
+                    Ok(Converted::Unchanged)
+                ),
+                "dbpf B.SVAL {s} leaves SVAL alone on the reference softIoc"
+            );
+            assert!(
+                matches!(
+                    put_string_element("F", NumericField::ULong, s),
+                    Ok(Converted::Unchanged)
+                ),
+                "putStringUlong skips the element store the same way"
+            );
+        }
+        // The GET row cannot express it: no prior buffer to keep.
+        assert!(get_string(NumericField::ULong, "-.5").is_err());
+        // A leading digit changes the answer — the first parse already wrote
+        // its prefix, so the skipped store leaves a STORED value.
+        assert_eq!(put(NumericField::ULong, "-0.5"), Some(EpicsValue::ULong(0)));
         // The fallback is putStringUlong-only: UInt64 keeps the longest
         // integer prefix (C `putStringUInt64`, dbConvert.c:1089-1109, has
         // no via-double path).

@@ -20,6 +20,14 @@
 //! fixed at the framework — every value-class post now advances it — so this
 //! hook no longer carries that load.)
 
+// RTEMS-EXEC-MODEL-ALLOW(5): checked, not waived — all 5 ran and passed
+// on the exec backend (measured on this tree:
+// `EPICS_RS_BUILD_EXEC_BACKEND=thread cargo nextest run -p scaler-rs
+// --all-features`, 112/112). scaler-rs became a census subject when its
+// `build.rs` began deriving `tokio_backend`; nothing here builds a CA
+// server, and the reactor these obtain comes from `#[tokio::test]`
+// itself, which the backend does not remove.
+
 use epics_base_rs::server::database::PvDatabase;
 use epics_base_rs::server::event_queue::EventReader;
 use epics_base_rs::server::recgbl::EventMask;
@@ -145,7 +153,7 @@ async fn r10_63_internal_state_fields_are_not_posted() {
 
 /// Negative control 1 — the fields C DOES post from a process cycle still post.
 /// `Sn` is in the declared set, so the idle `monitor()` DBE_LOG sweep
-/// (`scalerRecord.c:770-787`) survives the gate.
+/// (`scalerRecord.c:770-772`) survives the gate.
 #[tokio::test]
 async fn r10_63_the_idle_sn_log_sweep_still_posts() {
     let db = scaler_db().await;

@@ -5,7 +5,7 @@
 //! if ( RTN_SUCCESS(fetch_values(prec)) ) {
 //!     do_sel(prec);
 //! }
-//! /* selRecord.c:433-436 — the all-inputs loop */
+//! /* selRecord.c:434-436 — the all-inputs loop */
 //! for(i=0; i<SEL_MAX; i++, plink++, pvalue++) {
 //!     status=dbGetLink(plink,DBR_DOUBLE, pvalue,0,0);
 //! }
@@ -20,7 +20,7 @@
 //! "any input failed" rule of its own.
 //!
 //! `Specified` mode is the same rule over a one-link fetch list
-//! (`selRecord.c:421-431`): `dbGetLink(&nvl, ...)` first, an early
+//! (`selRecord.c:421-432`): `dbGetLink(&nvl, ...)` first, an early
 //! `return(status)` on failure, then the selected `INP[SELN]`. NVL is read
 //! ONLY there — the all-inputs loop never touches it — so a dead NVL is
 //! invisible to High/Low/Median.
@@ -103,8 +103,15 @@ async fn build() -> std::sync::Arc<PvDatabase> {
 /// Seed VAL without processing, then process once. The seed is the sentinel
 /// that says "`do_sel` did not run".
 async fn seed_and_process(db: &PvDatabase, rec: &str, seed: f64) -> f64 {
-    db.put_pv_no_process(rec, EpicsValue::Double(seed))
-        .await
+    // `selRecord.dbd` marks VAL `special(SPC_NOMOD)`, so no runtime put route
+    // — `dbPut`, `dbPutField`, an autosave restore — may seed it; the record's
+    // own `do_sel` is its only writer. The seed goes in the way the record
+    // writes it, through the internal path.
+    db.get_record(rec)
+        .unwrap()
+        .write()
+        .record
+        .put_field_internal("VAL", EpicsValue::Double(seed))
         .unwrap();
     let mut visited = HashSet::new();
     db.process_record_with_links(rec, &mut visited, 0)
@@ -153,7 +160,7 @@ async fn a_failed_non_last_link_does_not_freeze_the_selection() {
         "INPA failed but INPL (unset) succeeded, so C's `status` is 0 and \
          High picks INPB"
     );
-    // The failed read still raises its own `setLinkAlarm` (`dbLink.c:339`).
+    // The failed read still raises its own `setLinkAlarm` (`dbLink.c:337`).
     assert_eq!(
         alarm(&db, "SEL:HIGH:DEADA"),
         (AlarmSeverity::Invalid, alarm_status::LINK_ALARM)
@@ -181,7 +188,7 @@ async fn specified_mode_still_freezes_on_its_selected_input() {
 }
 
 /// Boundary: NVL. C reads it only inside `if (selm == Specified)`
-/// (`selRecord.c:420-421`), so a dead NVL gates there and is invisible
+/// (`selRecord.c:421`), so a dead NVL gates there and is invisible
 /// everywhere else — no gate, and no `setLinkAlarm` from a link C never reads.
 #[epics_macros_rs::epics_test]
 async fn a_dead_nvl_gates_specified_and_is_never_read_by_high() {

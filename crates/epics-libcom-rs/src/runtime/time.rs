@@ -28,6 +28,18 @@ pub fn now_mono() -> Instant {
 /// therefore slept forever where the exec build unwound the task, and it
 /// is that disagreement — not the arithmetic — that is the defect, so
 /// the fallback here is tokio's, to the same constant.
+///
+/// Measured on `armv7-rtems-eabihf` (QEMU `xilinx-zynq-a9`,
+/// `realtime-ca-ioc`), which is where the panic was filed: `caput
+/// RTEMS:BO.HIGH 1e300` then `caput RTEMS:BO 1` makes `bo::process` arm
+/// `DelayedCallbackAfter(Duration::MAX)`. With this fallback the guest
+/// takes it silently and the one-shot simply never fires — the record
+/// still reads `On` eight seconds later, and a 0.5 s one-shot armed
+/// afterwards still reverts it. Rebuilding the same image with `base + d`
+/// in place of the `checked_add` gives *"panic on thread `cbMedium` at
+/// runtime/time.rs: overflow when adding duration to instant"*, so the
+/// embedded timer path really does consume this sum and the guard is what
+/// keeps it off the console. VxWorks is still arithmetic-only.
 pub fn deadline_after(base: Instant, d: Duration) -> Instant {
     base.checked_add(d).unwrap_or_else(far_future)
 }
@@ -37,10 +49,15 @@ pub fn deadline_from_now(d: Duration) -> Instant {
     deadline_after(Instant::now(), d)
 }
 
-/// Roughly thirty years from now — tokio's `Instant::far_future()`, the
-/// "never fires" deadline an unrepresentable one collapses to.
+/// Roughly thirty years — the offset in tokio's `Instant::far_future()`,
+/// the "never fires" deadline an unrepresentable one collapses to.
+/// Shared with [`crate::runtime::task::deadline_after`], which applies
+/// the same rule to the runtime's own `Instant` alias.
+pub(crate) const FAR_FUTURE: Duration = Duration::from_secs(86_400 * 365 * 30);
+
+/// See [`FAR_FUTURE`].
 fn far_future() -> Instant {
-    Instant::now() + Duration::from_secs(86_400 * 365 * 30)
+    Instant::now() + FAR_FUTURE
 }
 
 /// The OS clock-tick period, in seconds — C `epicsThreadSleepQuantum()`.
@@ -57,7 +74,7 @@ fn far_future() -> Instant {
 /// ```
 ///
 /// Records use it to round a delay field to a whole number of ticks — e.g.
-/// `sseqRecord.c:197-200` quantizes every `DLYn` at init. Returns 0.0 when the
+/// `sseqRecord.c:198-200` quantizes every `DLYn` at init. Returns 0.0 when the
 /// tick rate is unavailable, exactly as C does; callers must treat that as "no
 /// quantization" rather than dividing by it.
 ///
@@ -74,9 +91,9 @@ fn far_future() -> Instant {
 ///
 /// ```text
 /// sysconf(_SC_CLK_TCK)
-///   -> rtems_clock_get_ticks_per_second()      cpukit/posix/src/sysconf.c:60-61
-///   -> _Watchdog_Ticks_per_second              rtems/rtems/clock.h:871
-///    = 1000000 / CONFIGURE_MICROSECONDS_PER_TICK   confdefs/clock.h:100-101
+///   -> rtems_clock_get_ticks_per_second()      cpukit/posix/src/sysconf.c:60-61 (rtems_6)
+///   -> _Watchdog_Ticks_per_second              rtems/rtems/clock.h:871 (both rtems pins)
+///    = 1000000 / CONFIGURE_MICROSECONDS_PER_TICK   confdefs/clock.h:100-101 (rtems_6)
 /// ```
 ///
 /// This is also what C itself does on RTEMS — `RTEMS-score/osdThread.c:860-865`
@@ -111,7 +128,7 @@ pub fn thread_sleep_quantum() -> f64 {
 ///                   NINT(plinkGroup->dly / epicsThreadSleepQuantum());
 /// ```
 ///
-/// (`sseqRecord.c:67`, `:197-199`.) The `NINT` cast is to a C `long` (i64),
+/// (`sseqRecord.c:67`, `:198-199`.) The `NINT` cast is to a C `long` (i64),
 /// NOT an f64 round, and the served DLY must reproduce that cast byte-for-byte
 /// — see `c_long_cast`. Two boundaries C's cast owns that an `f64::trunc`
 /// port gets wrong:
@@ -198,17 +215,68 @@ pub fn duration_from_secs(secs: f64) -> Duration {
     })
 }
 
+/// Block the calling thread for `secs` — C `epicsThreadSleep`, and the
+/// single owner of "turn a caller-supplied delay into a sleep".
+///
+/// C (`libcom/src/osi/os/posix/osdThread.c:916-934` @R7.0.10) truncates
+/// `seconds` into `timespec.tv_sec`, zeroes the delay when
+/// `seconds <= 0`, and lets `nanosleep` reject whatever will not fit.
+/// Measured against `bin/linux-x86_64/softIoc` driving
+/// `epicsThreadSleep`, `1e300`, `inf`, `nan` and `-5` each return inside
+/// the process's own 0.33 s startup while `0.25` and `1.5` sleep their
+/// full delay: a delay that is not a representable positive `Duration`
+/// is not slept at all.
+///
+/// Deliberately NOT [`duration_from_secs`]. That owner saturates to
+/// [`Duration::MAX`] because a *deadline* built from an absurd delay
+/// must never fire; sleeping on [`Duration::MAX`] would park the caller
+/// for 584 billion years exactly where C returns at once, and
+/// `Duration::from_secs_f64` would panic. The two meanings need two
+/// owners, not one conversion reused on both sides.
+pub fn sleep_secs(secs: f64) {
+    if let Ok(d) = Duration::try_from_secs_f64(secs) {
+        std::thread::sleep(d);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use source_guard::{Comments, production};
 
-    /// Everything before the first column-0 `#[cfg(test)]` — the code that
-    /// actually ships. Same helper as `epics-pva-rs`'s source guards.
-    fn production_scope(src: &str) -> &str {
-        match src.find("\n#[cfg(test)]") {
-            Some(i) => &src[..i],
-            None => src,
+    /// The sleep owner's boundaries are the *opposite* of the deadline
+    /// owner's, which is the whole reason it exists: everything
+    /// `duration_from_secs` saturates to [`Duration::MAX`] is a delay
+    /// `nanosleep` refuses, so C returns from it at once and so must we.
+    ///
+    /// The pairs measured against `softIoc`: `1e300`, `inf`, `nan`, `-5`
+    /// returned in C's 0.33 s startup baseline; `0.25` and `1.5` slept.
+    #[test]
+    fn sleep_secs_returns_at_once_on_every_delay_nanosleep_refuses() {
+        for refused in [
+            f64::INFINITY,
+            f64::NEG_INFINITY,
+            f64::NAN,
+            1e300,
+            -5.0,
+            u64::MAX as f64,
+        ] {
+            let t = Instant::now();
+            sleep_secs(refused);
+            assert!(
+                t.elapsed() < Duration::from_millis(50),
+                "sleep_secs({refused}) must return at once, as C's nanosleep does"
+            );
         }
+        // Zero is representable, and C's `nanosleep(0,0)` also returns
+        // at once — it must not be confused with the refused set.
+        let t = Instant::now();
+        sleep_secs(0.0);
+        assert!(t.elapsed() < Duration::from_millis(50));
+        // A representable positive delay is slept in full.
+        let t = Instant::now();
+        sleep_secs(0.05);
+        assert!(t.elapsed() >= Duration::from_millis(50));
     }
 
     /// Boundaries of the one rule, not scenarios: every input
@@ -246,15 +314,10 @@ mod tests {
     /// Fails today, on Linux, with no cross toolchain.
     #[test]
     fn the_tick_rate_is_asked_for_not_restated() {
-        // Comment lines are stripped: the doc above `thread_sleep_quantum`
-        // spells out `1000000 / CONFIGURE_MICROSECONDS_PER_TICK` to explain
-        // the chain, and that text must not read as a restatement.
-        let src: String = production_scope(include_str!("time.rs"))
-            .lines()
-            .filter(|l| !l.trim_start().starts_with("//"))
-            .collect::<Vec<_>>()
-            .join("\n");
-        let src = src.as_str();
+        // `Strip`: the doc above `thread_sleep_quantum` spells out
+        // `1000000 / CONFIGURE_MICROSECONDS_PER_TICK` to explain the chain,
+        // and that text must not read as a restatement.
+        let src = production(include_str!("time.rs"), Comments::Strip);
 
         assert!(
             src.contains("libc::sysconf(libc::_SC_CLK_TCK)"),

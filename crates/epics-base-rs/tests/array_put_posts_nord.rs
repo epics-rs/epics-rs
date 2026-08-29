@@ -1,7 +1,7 @@
 //! R18-109: NORD is posted by the put, not by the put *route*.
 //!
-//! C `put_array_info` (`waveformRecord.c:202-216`; `aaiRecord.c:232-245`,
-//! `aaoRecord.c:164-190`, `subArrayRecord.c:190-202`):
+//! C `put_array_info` (`waveformRecord.c:202-216`; `aaiRecord.c:227-240`,
+//! `aaoRecord.c:163-189`, `subArrayRecord.c:186-198`):
 //!
 //! ```c
 //! static long put_array_info(DBADDR *paddr, long nNew)

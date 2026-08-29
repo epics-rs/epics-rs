@@ -1,7 +1,7 @@
 //! A value-field put defines the record on EVERY put route.
 //!
 //! C `dbPut` ends with `isValueField = dbIsValueField(pfldDes); if
-//! (isValueField) precord->udf = FALSE;` (`dbAccess.c:1413-1414`) — one rule,
+//! (isValueField) precord->udf = FALSE;` (`dbAccess.c:1408-1409`) — one rule,
 //! reached by every caller, `dbPutField` and the autosave restore path alike.
 //! It clears `udf` and NOTHING else: STAT/SEVR keep the born `UDF_ALARM` until
 //! the record's own cycle recomputes them.
@@ -38,7 +38,7 @@ async fn a_value_field_put_clears_udf() {
         .await
         .unwrap();
 
-    assert_eq!(udf(&db, "A"), 0, "C dbAccess.c:1414");
+    assert_eq!(udf(&db, "A"), 0, "C dbAccess.c:1409");
 }
 
 /// BOUNDARY: the bare record name addresses the same value field.

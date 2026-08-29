@@ -1,3 +1,5 @@
+use std::sync::atomic::{AtomicI32, AtomicU64, Ordering};
+
 use super::calc_compile;
 use super::link_status::{
     LINK_CON, LINK_STATUS_CHOICES, LinkRole, LinkStatusGen, post_link_status,
@@ -23,11 +25,31 @@ const CALCOUT_INAV_FIELDS: [&str; 21] = [
 
 /// C `calcoutRecord.c:89` `int calcoutODLYprecision = 2;` — the precision
 /// `get_precision` serves for `ODLY`, the output-delay field.
-const CALCOUT_ODLY_PRECISION: i16 = 2;
+static CALCOUT_ODLY_PRECISION: AtomicI32 = AtomicI32::new(2);
+
+/// The iocsh knob `calcoutODLYprecision`, read and written by `var`.
+pub(crate) fn calcout_odly_precision() -> i32 {
+    CALCOUT_ODLY_PRECISION.load(Ordering::Relaxed)
+}
+
+/// See [`calcout_odly_precision`].
+pub(crate) fn set_calcout_odly_precision(value: i32) {
+    CALCOUT_ODLY_PRECISION.store(value, Ordering::Relaxed);
+}
 
 /// C `calcoutRecord.c:91` `double calcoutODLYlimit = 100000;` — the control
 /// upper `get_control_double` serves for `ODLY`, over a literal `0.0` lower.
-const CALCOUT_ODLY_LIMIT: f64 = 100000.0;
+static CALCOUT_ODLY_LIMIT: AtomicU64 = AtomicU64::new(100000f64.to_bits());
+
+/// The iocsh knob `calcoutODLYlimit`, read and written by `var`.
+pub(crate) fn calcout_odly_limit() -> f64 {
+    f64::from_bits(CALCOUT_ODLY_LIMIT.load(Ordering::Relaxed))
+}
+
+/// See [`calcout_odly_limit`].
+pub(crate) fn set_calcout_odly_limit(value: f64) {
+    CALCOUT_ODLY_LIMIT.store(value.to_bits(), Ordering::Relaxed);
+}
 
 /// Calcout record — calc with output.
 pub struct CalcoutRecord {
@@ -158,6 +180,13 @@ pub struct CalcoutRecord {
     // freezes VAL/UDF and raises no CALC_ALARM, while the OOPT switch, the
     // output and the monitors still run against the frozen VAL.
     fetch_gate_failed: bool,
+    // This cycle reached one of C's two `prec->udf` writes: the CALC pass's
+    // `else prec->udf = isnan(prec->val)` (`calcoutRecord.c:241`) or
+    // `execOutput`'s `else prec->udf = isnan(prec->oval)` (`:624`). Both sit on
+    // a `calcPerform` SUCCESS arm, the CALC one additionally inside the
+    // `fetch_values` gate. Consumed by `check_alarms`, which owns the write;
+    // a cycle that sets neither leaves UDF frozen, as C does.
+    value_computed: bool,
     // Cached compiled expressions (RPCL/ORPC equivalents)
     // C `RPCL` / `ORPC`. Always a program: an empty or uncompilable CALC/OCAL
     // carries C's empty `END_EXPRESSION` postfix, which `calcPerform` refuses to
@@ -286,6 +315,7 @@ impl Default for CalcoutRecord {
             pending_output: false,
             calc_alarm: None,
             fetch_gate_failed: false,
+            value_computed: false,
             rpcl: crate::calc::CompiledExpr::empty(crate::calc::ExprKind::Numeric),
             orpc: crate::calc::CompiledExpr::empty(crate::calc::ExprKind::Numeric),
             clcv: 0,
@@ -374,6 +404,7 @@ impl CalcoutRecord {
                 // (`:628`) so IVOA gates the OUT write — without this a finite
                 // VAL but NaN OVAL drives NaN to OUT with NO_ALARM.
                 self.ocal_udf_override = Some(self.oval.is_nan());
+                self.value_computed = true;
             }
             // C `:622`: OCAL calcPerform failure raises CALC_ALARM (amsg "OCAL
             // calcPerform") and leaves udf VAL-based (no override).
@@ -513,7 +544,13 @@ impl CalcoutRecord {
             .map(|(i, link)| (CALCOUT_INAV_FIELDS[i], link, LinkRole::Input))
             .collect();
         links.push(("OUTV", self.out.clone(), LinkRole::Output));
-        post_link_status(self.async_ctx.as_ref(), &self.link_gen, links);
+        // C `calcoutRecord.c:404`, `:752`, `:757`.
+        post_link_status(
+            self.async_ctx.as_ref(),
+            &self.link_gen,
+            links,
+            crate::server::recgbl::EventMask::VALUE,
+        );
     }
 }
 
@@ -544,7 +581,7 @@ impl Record for CalcoutRecord {
 
     /// `ODLY` is the one field in base whose graphic case is neither the
     /// record's limits, nor a link, nor a plain `default:` arm
-    /// (`calcoutRecord.c:471-474`):
+    /// (`calcoutRecord.c:490-493`):
     ///
     /// ```c
     /// case indexof(ODLY):
@@ -572,9 +609,9 @@ impl Record for CalcoutRecord {
             .eq_ignore_ascii_case("ODLY")
             .then(|| FieldMetadataOverride {
                 units: Some("s".into()),
-                precision: Some(CALCOUT_ODLY_PRECISION),
+                precision: Some(calcout_odly_precision() as i16),
                 disp_limits: Some((1e300, 0.0)),
-                ctrl_limits: Some((CALCOUT_ODLY_LIMIT, 0.0)),
+                ctrl_limits: Some((calcout_odly_limit(), 0.0)),
                 ..Default::default()
             })
     }
@@ -623,7 +660,7 @@ impl Record for CalcoutRecord {
 
     fn init_record(&mut self, pass: u8) -> CaResult<()> {
         if pass == 0 {
-            // C `calcoutRecord.c::init_record:190-205` — `clcv = postfix(...)`
+            // C `calcoutRecord.c::init_record:191-205` — `clcv = postfix(...)`
             // and `oclv = postfix(...)`, UNCONDITIONALLY, both logged but never
             // fatal. Base `postfix()` refuses an empty expression
             // (`postfix.c:235-240`: CALC_ERR_NULL_ARG, return -1), so C's own
@@ -652,7 +689,7 @@ impl Record for CalcoutRecord {
     fn process(&mut self) -> CaResult<ProcessOutcome> {
         // ODLY continuation: this is the delayed re-process scheduled by a
         // previous cycle (C `calcoutRecord.c::process` `pact==TRUE` + `dlya`
-        // branch, `:293-303`). No input fetch and no CALC pass — C's `pact`
+        // branch, `:294-301`). No input fetch and no CALC pass — C's `pact`
         // arm re-enters below them — but `execOutput` DOES run here, and the
         // DOPT switch is its first half, so OVAL is computed now, from the
         // A..U present at expiry.
@@ -692,7 +729,12 @@ impl Record for CalcoutRecord {
             // *previous* VAL. Seed before `self.val` is overwritten below.
             inputs.prev_val = self.val;
             match crate::calc::eval(&self.rpcl, &mut inputs) {
-                Ok(v) => self.val = v,
+                Ok(v) => {
+                    self.val = v;
+                    // C `:241` `else prec->udf = isnan(prec->val)` — this arm
+                    // only; the write itself is made in `check_alarms`.
+                    self.value_computed = true;
+                }
                 // C `calcoutRecord.c:239`: CALC failure → amsg "calcPerform".
                 Err(_) => {
                     self.calc_alarm.get_or_insert("calcPerform");
@@ -744,6 +786,7 @@ impl Record for CalcoutRecord {
                 )]),
                 actions: vec![ProcessAction::ReprocessAfter(delay)],
                 device_did_compute: false,
+                post_write_fields: Vec::new(),
             });
         }
 
@@ -1295,6 +1338,15 @@ impl Record for CalcoutRecord {
         self.fetch_gate_failed = failed;
     }
 
+    /// Both of C's `prec->udf` writes sit on a `calcPerform` success arm
+    /// (`calcoutRecord.c:241`, `:624`), the CALC one inside the `fetch_values`
+    /// gate (`:237`), so a failed input link or a failed CALC/OCAL leaves UDF at
+    /// its previous value. The write lives with the compute now — see
+    /// [`Self::check_alarms`].
+    fn clears_udf(&self) -> bool {
+        false
+    }
+
     fn should_output(&self) -> bool {
         self.cached_should_output
     }
@@ -1398,6 +1450,16 @@ impl Record for CalcoutRecord {
     }
 
     fn check_alarms(&mut self, common: &mut crate::server::record::CommonFields) {
+        // C's two `prec->udf` writes (`calcoutRecord.c:241` CALC, `:624` OCAL),
+        // applied here because `check_alarms` is the record's only hook holding
+        // `CommonFields` and it runs before `recGblCheckUDF`. A cycle whose
+        // `fetch_values` failed reaches neither write, so UDF freezes — the
+        // blanket re-derive used to clear it and report a never-computed record
+        // as defined.
+        if std::mem::take(&mut self.value_computed) {
+            common.udf = self.value_is_undefined() as u8;
+        }
+
         // The OUT link lives in the common fields, not a calcout-owned field.
         // `init_links` captures it at load; this hook catches a *runtime* OUT
         // re-point (a put to OUT does not process, so `special("OUT")` cannot

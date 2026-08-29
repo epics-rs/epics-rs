@@ -2,8 +2,8 @@
 //! hostname the client claims over `CA_PROTO_HOST_NAME`.
 //!
 //! C rsrv's default (`asCheckClientIP == 0`, `asLibRoutines.c:34`) stores
-//! the client-supplied name unconditionally (`camessage.c:845-875`) and
-//! matches HAGs against it (`asLibRoutines.c:1223`). The port instead
+//! the client-supplied name unconditionally (`camessage.c:797-878`) and
+//! matches HAGs against it (`asLibRoutines.c:1031`). The port instead
 //! keyed ACF on the peer IP unless `EPICS_CAS_USE_HOST_NAMES=YES` was set
 //! — a variable that exists nowhere in epics-base — so an `.acf` that
 //! granted WRITE under C granted nothing here.
@@ -11,14 +11,8 @@
 //! Pre-fix this test fails: the identity is `127.0.0.1`, the `HAG(ops)`
 //! entry is `opi-01.lab`, no rule matches, and the put is denied.
 
-// Host/tokio-only: builds the async `CaClient`/`CaServer` stack in process.
-// Under `rtems-exec-model` the `runtime::task` seam routes their `spawn`
-// to the background executor, whose worker has no tokio reactor, so the
-// listener/transport tasks panic. The RTEMS model serves from
-// `BlockingCaServer` instead, so this path is inapplicable there.
-#![cfg(not(feature = "rtems-exec-model"))]
-
-use std::time::Duration;
+#![cfg(tokio_backend)]
+#![cfg(feature = "client-core")]
 
 use epics_base_rs::types::EpicsValue;
 use epics_ca_rs::client::CaClient;
@@ -82,7 +76,7 @@ async fn claimed_host_name_matches_a_host_hag_and_grants_write() {
     client.set_host_name("opi-01.lab");
 
     let ch = client.create_channel("SEC:VAL");
-    ch.wait_connected(Duration::from_secs(3))
+    ch.wait_connected(budget::FACT_BUDGET)
         .await
         .expect("connect");
 
@@ -115,7 +109,7 @@ async fn unlisted_host_name_is_denied_write() {
     client.set_host_name("intruder.example");
 
     let ch = client.create_channel("SEC:VAL");
-    ch.wait_connected(Duration::from_secs(3))
+    ch.wait_connected(budget::FACT_BUDGET)
         .await
         .expect("connect");
 
@@ -125,3 +119,6 @@ async fn unlisted_host_name_is_denied_write() {
         "a host outside HAG(ops) must not get WRITE; got {put:?}"
     );
 }
+
+#[path = "common/budget.rs"]
+mod budget;

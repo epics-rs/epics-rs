@@ -16,11 +16,19 @@
 //! per-NIC SEARCH path tight while still fielding ORIGIN_TAG forwards.
 //!
 //! Reference: pvxs `udp_collector.cpp:140-167` (bind + mcast join),
-//! `udp_collector.cpp:561-567` (forward send), `evhelper.cpp:519-585`
-//! (mcast option setters).
+//! `udp_collector.cpp:561-567` (forward send), `evhelper.cpp:519-592`
+//! (the mcast option setters: `mcast_join`, `mcast_leave`, `mcast_prep_sendto`).
+//!
+//! PIN-ONLY: the `evhelper.cpp` span resolves at the pvxs pin `b568e93`
+//! (1.5.1-42), where `mcast_join` opens at `:519`. It does NOT resolve at
+//! this machine's pvxs HEAD `bd2243d` (1.5.2-26), which adds five lines
+//! ahead of it — there the same three are `:524-597`, with `mcast_join` at
+//! `:524`, `mcast_leave` `:547`, `mcast_prep_sendto` `:561`, and `:519` an
+//! `#endif`. A repin to HEAD must add 5; leaving the number is what makes it
+//! wrong.
 
 // RTEMS-EXEC-MODEL-ALLOW(3): every test binds tokio::net UDP sockets, which
-// need a reactor the exec backend does not start; under the feature these
+// need a reactor the exec backend does not start; on the exec backend these
 // still run on the tokio driver `#[tokio::test]` builds, and pass.
 use std::io;
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};

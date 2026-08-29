@@ -14,5 +14,7 @@ asyn-rs = { workspace = true }
 tokio = { version = "1", features = ["sync", "time", "rt"] }
 tracing = "0.1"
 
+[features]
+
 [dev-dependencies]
 tokio = { version = "1", features = ["full", "test-util"] }

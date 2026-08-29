@@ -10,11 +10,11 @@
 //! and never names a socket type.
 //!
 //! The split is drawn here because a second, blocking driver is coming (RTEMS
-//! phase 6 item 7, `doc/pva-rtems-item7-design.md` §6 stage A): a
-//! thread-per-client accept loop over `std::net::TcpListener` that hands
-//! `handle_connection_io` the same two boxes this one does. Keeping the
-//! sockets in one small module means that driver is an addition beside this
-//! file rather than a set of `cfg`s threaded through the protocol code.
+//! phase 6 item 7, stage A): a thread-per-client accept loop over
+//! `std::net::TcpListener` that hands `handle_connection_io` the same two
+//! boxes this one does. Keeping the sockets in one small module means that
+//! driver is an addition beside this file rather than a set of `cfg`s threaded
+//! through the protocol code.
 //!
 //! Moved verbatim from `tcp.rs:2428-2727`; no behaviour changed.
 
@@ -92,6 +92,12 @@ pub async fn run_tcp_server_on_listener(
 ) -> PvaResult<()> {
     let bind_addr = listener.local_addr().map_err(PvaError::Io)?;
     debug!(?bind_addr, "TCP listener up");
+    // The accept loop is the server's connection owner, so it is where the
+    // capability every per-connection task needs is taken: each task gets a
+    // clone, and `handle_connection_io` states the requirement in its
+    // signature instead of re-deriving it from the task's thread.
+    let reactor = epics_base_rs::runtime::task::Reactor::current()
+        .expect("the PVA accept loop is awaited on the server's reactor");
     let active = Arc::new(AtomicUsize::new(0));
 
     #[cfg(feature = "tls")]
@@ -131,7 +137,7 @@ pub async fn run_tcp_server_on_listener(
             Ok((stream, peer)) => {
                 backoff.accepted();
                 // pvxs scopes `ignoreAddrs` to the UDP SEARCH admission
-                // path (`Server::Pvt::onSearch`, server.cpp:654-670); the
+                // path (`Server::Pvt::onSearch`, src/server.cpp:654-670); the
                 // TCP accept callback registers a `ServerConn` with no
                 // ignore-list check (serverconn.cpp:461-467). Applying it
                 // to TCP accepts here turned a discovery filter into a
@@ -154,6 +160,7 @@ pub async fn run_tcp_server_on_listener(
                 let acceptor = tls_acceptor.clone();
                 let peers_for_task = peers.clone();
                 let conn_invalidator = channel_invalidator.clone();
+                let conn_reactor = reactor.clone();
                 conn_tasks.spawn(async move {
                     stream.set_nodelay(true).ok();
                     // Enable OS-level TCP keepalive so half-open connections
@@ -229,7 +236,7 @@ pub async fn run_tcp_server_on_listener(
                     // (`disable_plaintext`), refuse a non-TLS peer before it
                     // can reach the plain code path. pvxs enforces the
                     // refusal on the CLIENT (it drops a plaintext SEARCH
-                    // reply, client.cpp:944); the Rust server unifies TLS +
+                    // reply, src/client.cpp:944); the Rust server unifies TLS +
                     // plaintext on each listener via the peek above, so the
                     // equivalent server-side guarantee lives here. Gated on
                     // `acceptor.is_some()` so a misconfigured server with no
@@ -295,6 +302,7 @@ pub async fn run_tcp_server_on_listener(
                                     };
                                     let (r, w) = tokio::io::split(tls_stream);
                                     handle_connection_io(
+                                        conn_reactor,
                                         src,
                                         Box::new(r),
                                         Box::new(w),
@@ -328,6 +336,7 @@ pub async fn run_tcp_server_on_listener(
                             // non-TLS bytes (name-server, plain pvxs peer).
                             let (r, w) = stream.into_split();
                             handle_connection_io(
+                                conn_reactor,
                                 src,
                                 Box::new(r),
                                 Box::new(w),
@@ -366,15 +375,7 @@ pub async fn run_tcp_server_on_listener(
 
 #[cfg(test)]
 mod tests {
-    /// Production scope of a source file: everything before the first
-    /// column-0 `#[cfg(test)]`.
-    fn production_scope(src: &str) -> &str {
-        match src.find("\n#[cfg(test)]") {
-            Some(i) => &src[..i],
-            None => src,
-        }
-    }
-
+    use source_guard::{Comments, production};
     /// Stage A's invariant, stated as source inspection: the TCP protocol
     /// module names no socket type. That is what makes a second, blocking
     /// driver an addition beside this file rather than a `cfg` threaded
@@ -383,7 +384,7 @@ mod tests {
     /// one convenience at a time.
     #[test]
     fn the_protocol_scope_owns_no_socket() {
-        let prod = production_scope(include_str!("tcp.rs"));
+        let prod = production(include_str!("tcp.rs"), Comments::Strip);
         // Fail closed: if the connection handler is no longer in the slice,
         // the slice is wrong and the assertion below would pass vacuously.
         assert!(
@@ -412,7 +413,7 @@ mod tests {
     /// by its absence from `tcp.rs`, not by a ceiling here.
     #[test]
     fn the_accept_driver_spawns_no_bare_task_either() {
-        let prod = production_scope(include_str!("accept.rs"));
+        let prod = production(include_str!("accept.rs"), Comments::Strip);
         assert!(
             prod.contains("pub async fn run_tcp_server_on_listener"),
             "production slice no longer covers the accept loop"

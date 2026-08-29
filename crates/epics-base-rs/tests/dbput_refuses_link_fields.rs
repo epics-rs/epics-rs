@@ -1,9 +1,9 @@
 //! UI-64 (epics-base#876): only `dbPutField` changes DBF link fields.
 //!
 //! C `dbPut` refuses a put to an INLINK/OUTLINK/FWDLINK target with
-//! `S_db_badDbrtype` (`field_type > DBF_DEVICE`, `dbAccess.c:1340-1347`);
+//! `S_db_badDbrtype` (`field_type > DBF_DEVICE`, `dbAccess.c:1337-1344`);
 //! `dbPutField` routes link fields through `dbPutFieldLink` instead
-//! (`dbAccess.c:1261-1262`). The pre-fix port let every write funnel fall
+//! (`dbAccess.c:1258-1259`). The pre-fix port let every write funnel fall
 //! through to `put_common_field`'s INP/OUT/FLNK re-parse arms, so a record's
 //! DB OUT link could silently rewire another record's link field on every
 //! process cycle.
@@ -66,7 +66,7 @@ async fn db_out_link_write_to_a_link_field_is_refused() {
     assert_eq!(
         link_text(&db, "TGT.INP"),
         "",
-        "the DB OUT link must not rewire TGT.INP (C dbPut refuses, dbAccess.c:1340)"
+        "the DB OUT link must not rewire TGT.INP (C dbPut refuses, dbAccess.c:1337)"
     );
     let rec = db.get_record("SRC").unwrap();
     let (stat, sevr) = {
@@ -115,7 +115,7 @@ async fn put_pv_and_post_refuses_a_link_field() {
 }
 
 /// The `dbPutField` analogue still rewires: this is `dbPutFieldLink`
-/// (`dbAccess.c:1261`), the one sanctioned link-write path.
+/// (`dbAccess.c:1258`), the one sanctioned link-write path.
 #[epics_macros_rs::epics_test]
 async fn ca_route_still_rewires_a_link_field() {
     let db = build(
@@ -128,7 +128,9 @@ async fn ca_route_still_rewires_a_link_field() {
     db.put_record_field_from_ca_no_notify("R3", "INP", EpicsValue::String("SRC3.VAL".into()))
         .await
         .unwrap();
-    assert_eq!(link_text(&db, "R3.INP"), "SRC3.VAL");
+    // Reading a link field is C `dbGetString`, so the modifiers the write
+    // omitted come back as their defaults (measured against C softIoc).
+    assert_eq!(link_text(&db, "R3.INP"), "SRC3.VAL NPP NMS");
 }
 
 /// `put_pv_no_process` is the autosave-restore entry; its C analogue
@@ -146,7 +148,7 @@ async fn put_pv_no_process_still_rewires_for_restore() {
     db.put_pv_no_process("R4.INP", EpicsValue::String("SRC4.VAL".into()))
         .await
         .unwrap();
-    assert_eq!(link_text(&db, "R4.INP"), "SRC4.VAL");
+    assert_eq!(link_text(&db, "R4.INP"), "SRC4.VAL NPP NMS");
 }
 
 /// An autosave restore in `RestoreMode::Process` must still restore a saved
@@ -184,5 +186,5 @@ async fn autosave_process_mode_restores_a_link_field() {
         "link-field restore must not fail: {:?}",
         result.failed_puts
     );
-    assert_eq!(link_text(&db, "R5.INP"), "SRC5.VAL");
+    assert_eq!(link_text(&db, "R5.INP"), "SRC5.VAL NPP NMS");
 }

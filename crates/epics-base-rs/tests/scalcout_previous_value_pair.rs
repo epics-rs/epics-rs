@@ -5,8 +5,9 @@
 //! * `PVAL` (`sCalcoutRecord.dbd:60`, DBF_DOUBLE, writable) is the VAL from the
 //!   end of the last process cycle. The OOPT switch compares against it
 //!   (`sCalcoutRecord.c:379` On Change, `:382`/`:385` the transitions) and C
-//!   advances it at `:397` — AFTER the switch has read it, on every cycle.
-//! * `PSVL` (`:63`, DBF_STRING, SPC_NOMOD) is the SVAL C last posted:
+//!   advances it at `:393` — AFTER the switch has read it, on every cycle.
+//! * `PSVL` (`sCalcoutRecord.dbd:63`, DBF_STRING, SPC_NOMOD) is the SVAL C
+//!   last posted:
 //!   `monitor()` posts SVAL when it differs from PSVL and then copies it
 //!   (`:842-846`).
 //!

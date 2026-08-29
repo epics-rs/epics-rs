@@ -121,20 +121,16 @@ mod tests {
         ("src/client_native/search_engine.rs", "rx_buf"),
     ];
 
-    /// Production text of `path` — everything before its first column-0
-    /// `#[cfg(test)]`, with comment lines dropped so a needle quoted in prose
-    /// (this module's own docs do quote them) cannot fail the guard.
+    /// Production text of `path`, comments stripped so a needle quoted in
+    /// prose (this module's own docs do quote them) cannot fail the guard.
+    ///
+    /// Read from disk rather than through `include_str!` — the census spans
+    /// four files in two modules — so `production_str` rather than the
+    /// memoized `production`.
     fn production_source(path: &str) -> String {
         let full = std::fs::read_to_string(format!("{}/{path}", env!("CARGO_MANIFEST_DIR")))
             .unwrap_or_else(|e| panic!("{path}: {e}"));
-        let prod = match full.find("\n#[cfg(test)]") {
-            Some(i) => &full[..i],
-            None => &full[..],
-        };
-        prod.lines()
-            .filter(|l| !l.trim_start().starts_with("//"))
-            .collect::<Vec<_>>()
-            .join("\n")
+        source_guard::production_str(&full, source_guard::Comments::Strip)
     }
 
     /// The invariant, enforced against the source rather than against a

@@ -12,6 +12,57 @@
 //!
 //! This crate provides the pvAccess wire protocol implementation,
 //! separated from the core IOC infrastructure in `epics-base-rs`.
+//!
+//! # C reference pins
+//!
+//! Every `file.c:NNN` citation in this crate resolves at the tree and revision
+//! below, not at whatever that tree's working copy holds today. These trees are
+//! checked out on local branches here and run ahead of their pins.
+//!
+//! | tree | pinned revision |
+//! | --- | --- |
+//! | `pvxs` | `1.5.1-42-gb568e93`; the TLS/x509 family (`src/ossl.cpp`,
+//!   `netcommon.h:133`, `config.cpp:654-660`) exists only on the unmerged
+//!   UPSTREAM branch `origin/tls`, cited at `b3a10bf0` (`1.5.2-42-gb3a10bf`)
+//!   — not on `fork/tls`, which is a personal fork.  The require-TLS
+//!   anti-downgrade family (`tls_disable_plaintext` at `netcommon.h:172`,
+//!   its `EPICS_PVA_TLS_OPTIONS` parse at `config.cpp:453-460`, its
+//!   enforcement at `src/client.cpp:944`) is on NEITHER: it lives only on the
+//!   personal fork branch `fork/fix/tls-peer-identity-and-downgrade`
+//!   at `6547f25`, and every citation of it says so |
+//! | `epics-base` | `R7.0.10` |
+//!
+//! **Resolve by symbol at the pin; the line is a hint.** Find the named
+//! function, struct, macro or field first, and treat the line number as a hint
+//! that has to land inside that construct. Three cases follow:
+//!
+//! 1. Construct at the pin, line lands in it — the citation is exact. A
+//!    reference checkout ahead of the pin will disagree; that disagreement is
+//!    the checkout's, not the citation's.
+//! 2. Construct at the pin, line lands outside it — line drift. Keep the
+//!    symbol and move the line to the pin's.
+//! 3. Construct absent at the pin — the citation means code added after it,
+//!    and is NOT moved onto the pin, where it would point at lines that do not
+//!    exist. It names the revision it means inline, beside the line span: the
+//!    upstream PR and commit, and that both are later than the pin this table
+//!    gives. `epics-libcom-rs` already carries that form.
+//!
+//! Every pin above passes `git merge-base --is-ancestor <pin> origin/<default>`
+//! in its own tree, which is the test a pin has to meet. A `git describe`
+//! string names an exact commit and is worth as much as a tag; what
+//! disqualifies a revision is being reachable only from a fork branch or an
+//! unmerged PR, because then it names nothing a reader outside this workspace
+//! can fetch.
+//!
+//! Resolve each citation on its own. One sentence can cite two lines that are
+//! right at different revisions, and a check run at either revision then
+//! reports a single tidy error while vouching for the very citation the other
+//! condemns.
+//!
+//! A row reading *no settled pin* means no revision has been agreed for that
+//! tree: say which revision you read, and do not take its `HEAD` for the pin.
+//! Citations into non-EPICS sources (libc, RTEMS, `rtems-libbsd`, VxWorks,
+//! vendored third-party) are outside this table and carry no pin.
 
 pub mod auth;
 pub mod cli;
@@ -46,22 +97,25 @@ pub use error::{PvaError, PvaResult};
 // `epics-base-rs`'s.
 //
 // Both scripts compute the same rule from the same two inputs — the target OS
-// and their own `rtems-exec-model` feature — and cargo features unify per
-// *package*, so a build that turned on `epics-base-rs/rtems-exec-model`
-// without this crate's own `rtems-exec-model` would give `runtime::task::spawn`
-// a reactor-free backend while this crate still compiled the reactor-backed
-// UDP SEARCH transport in and selected it. That is exactly the configuration
-// `doc/calink-rtems-design.md` §10.10 item 2 measured as a boot panic, and it
-// is the one state the two-variant `client_native::search_engine::
-// SearchTransport` cannot rule out on its own.
+// and `EPICS_RS_BUILD_EXEC_BACKEND` — but they compute it independently, so a
+// build in which one of the two scripts did not see the variable would give
+// `runtime::task::spawn` a reactor-free backend while this crate still compiled
+// the reactor-backed UDP SEARCH transport in and selected it. That is exactly
+// the configuration measured as a boot panic, and it is the one state the
+// two-variant `client_native::search_engine::SearchTransport` cannot rule out
+// on its own.
 //
 // So it is ruled out here instead: the two views must agree or the crate does
 // not compile.
 const _: () = assert!(
     epics_base_rs::runtime::task::HAS_TOKIO_REACTOR == cfg!(tokio_backend),
-    "epics-pva-rs and epics-base-rs disagree about the runtime::task backend: \
-     enable `epics-pva-rs/rtems-exec-model` rather than \
-     `epics-base-rs/rtems-exec-model` alone"
+    "epics-pva-rs and epics-base-rs disagree about the runtime::task backend. \
+     Both derive it from EPICS_RS_BUILD_EXEC_BACKEND, so they cannot disagree \
+     over what was asked for: one of the two build scripts did not see the \
+     variable. Check that both carry \
+     `rtems_exec_gate::CANONICAL_DERIVATION`, whose \
+     `cargo::rerun-if-env-changed` line is what makes a changed value rebuild \
+     this crate"
 );
 
 // Re-export commonly used types from epics-base-rs
@@ -99,4 +153,16 @@ const fn parse_u32(s: &str) -> u32 {
         i += 1;
     }
     out
+}
+
+/// The reactor a unit test spawns on.
+///
+/// Production code never mints its capability from the ambient executor —
+/// that is the whole point of [`epics_base_rs::runtime::task::Reactor`] —
+/// but a test *is* the owner of its own executor, so the mint is honest
+/// here and the `expect` names the requirement the test already meets.
+#[cfg(test)]
+pub(crate) fn test_reactor() -> epics_base_rs::runtime::task::Reactor {
+    epics_base_rs::runtime::task::Reactor::current()
+        .expect("this test body runs inside an executor")
 }

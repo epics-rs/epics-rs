@@ -1,6 +1,6 @@
 //! Inline `file` macros are split before they are expanded, not after.
 //!
-//! C `macParseDefns` (`macUtil.c:74-196`) splits the RAW definition string
+//! C `macParseDefns` (`macUtil.c:71-193`) splits the RAW definition string
 //! into `name`/`value` pairs and keeps the values verbatim — its own
 //! comment says quotes and escapes are removed from names only because
 //! "unlike values, they will not be re-parsed" — and `macGetValue` expands

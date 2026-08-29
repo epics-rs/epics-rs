@@ -18,16 +18,17 @@
 //! This module mirrors that flag model exactly: each flag PV carries a
 //! [`WriteHook`] that, on a positive write, RAISES a shared boolean flag in
 //! [`ControlFlags`] (it does not enqueue a discrete command) and wakes the
-//! single control owner. The owner ([`spawn_control_owner`]) drains the
+//! single control owner. The owner (`spawn_control_owner`) drains the
 //! raised flags once per pass in C's fixed main-loop order — `commandFlag`,
 //! `report1Flag`, `report2Flag`, `report3Flag`, `newAsFlag`, `quitFlag`,
 //! `quitServerFlag` (`gateServer.cc:336-379`) — dispatching each through the
-//! same [`CommandHandler`] the SIGUSR1 path uses and resetting each consumed
+//! same `CommandHandler` the SIGUSR1 path uses and resetting each consumed
 //! flag PV back to zero. Multiple positive writes to one flag before a pass
 //! therefore collapse to a single action, and a burst of different flags
 //! runs in main-loop order, not client write order.
 
-// RTEMS-EXEC-MODEL-ALLOW(7): checked - these run and pass in the feature-ON suite.
+// RTEMS-EXEC-MODEL-ALLOW(2): checked - these run and pass in the exec-backend
+// suite.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -38,7 +39,9 @@ use epics_base_rs::server::pv::{WriteContext, WriteHook};
 use epics_base_rs::types::EpicsValue;
 use tokio::sync::Notify;
 
-use super::command::{CommandHandler, GatewayCommand};
+#[cfg(tokio_backend)]
+use super::command::CommandHandler;
+use super::command::GatewayCommand;
 
 /// The control action a flag PV triggers when written with a positive
 /// value. Mirrors C `gateServer::processStat`'s flag fan-out.
@@ -218,6 +221,7 @@ pub async fn publish_control_pvs(db: &PvDatabase, prefix: &str) -> Option<Arc<Co
     Some(flags)
 }
 
+#[cfg(tokio_backend)]
 /// Spawn the single control owner that drains the raised flags and
 /// dispatches each through `handler` — the same `CommandHandler` the
 /// SIGUSR1 path uses.
@@ -231,13 +235,14 @@ pub async fn publish_control_pvs(db: &PvDatabase, prefix: &str) -> Option<Arc<Co
 /// quit raised in the same pass as a report/reload never pre-empts those
 /// earlier flags; once consumed it fires `shutdown` and the owner exits.
 pub fn spawn_control_owner(
+    reactor: &epics_base_rs::runtime::task::Reactor,
     flags: Arc<ControlFlags>,
     handler: CommandHandler,
     db: Arc<PvDatabase>,
     command_path: Option<std::path::PathBuf>,
     shutdown: Arc<Notify>,
 ) -> epics_base_rs::runtime::task::TaskHandle<()> {
-    epics_base_rs::runtime::task::spawn(async move {
+    reactor.spawn(async move {
         loop {
             flags.wake.notified().await;
 
@@ -289,6 +294,7 @@ pub fn spawn_control_owner(
     })
 }
 
+#[cfg(tokio_backend)]
 /// Run the configured command file (the `commandFlag` action), logging its
 /// output. A missing command-file path is a warned no-op, matching the
 /// previous behaviour.
@@ -319,6 +325,7 @@ async fn reset_flag_pv(db: &Arc<PvDatabase>, pv: &str) {
     }
 }
 
+#[cfg(tokio_backend)]
 async fn dispatch_logged(handler: &CommandHandler, cmd: GatewayCommand) {
     match handler.dispatch(cmd).await {
         Ok(out) if !out.is_empty() => {
@@ -419,6 +426,7 @@ mod tests {
         );
     }
 
+    #[cfg(tokio_backend)]
     /// the owner dispatches a Report flag through the shared CommandHandler
     /// and resets the raising flag PV back to zero (DBR_DOUBLE 0.0).
     #[tokio::test]
@@ -431,7 +439,14 @@ mod tests {
         let access = Arc::new(ArcSwap::from_pointee(AccessConfig::allow_all()));
         let handler = CommandHandler::new(cache, pvlist, access, None, None);
         let shutdown = Arc::new(Notify::new());
-        let owner = spawn_control_owner(flags.clone(), handler, db.clone(), None, shutdown);
+        let owner = spawn_control_owner(
+            &crate::test_reactor(),
+            flags.clone(),
+            handler,
+            db.clone(),
+            None,
+            shutdown,
+        );
 
         // Drive report2Flag positive via its write hook.
         let pv = db.find_pv("gw:report2Flag").await.unwrap();
@@ -454,6 +469,7 @@ mod tests {
         owner.abort();
     }
 
+    #[cfg(tokio_backend)]
     /// a quit flag fires the shutdown Notify and stops the owner.
     #[tokio::test]
     async fn quit_trigger_signals_shutdown() {
@@ -465,7 +481,14 @@ mod tests {
         let access = Arc::new(ArcSwap::from_pointee(AccessConfig::allow_all()));
         let handler = CommandHandler::new(cache, pvlist, access, None, None);
         let shutdown = Arc::new(Notify::new());
-        let owner = spawn_control_owner(flags.clone(), handler, db.clone(), None, shutdown.clone());
+        let owner = spawn_control_owner(
+            &crate::test_reactor(),
+            flags.clone(),
+            handler,
+            db.clone(),
+            None,
+            shutdown.clone(),
+        );
 
         let pv = db.find_pv("gw:quitFlag").await.unwrap();
         fire(&pv, EpicsValue::Long(1)).await.unwrap();
@@ -480,6 +503,7 @@ mod tests {
         let _ = tokio::time::timeout(std::time::Duration::from_secs(2), owner).await;
     }
 
+    #[cfg(tokio_backend)]
     /// Build a report-file-backed CommandHandler so dispatched reports are
     /// observable (each R1/R2/R3 appends a section, R2 = SIGUSR2 shortcut).
     fn report_handler(report_path: std::path::PathBuf) -> CommandHandler {
@@ -505,6 +529,7 @@ mod tests {
         std::fs::read_to_string(path).unwrap_or_default()
     }
 
+    #[cfg(tokio_backend)]
     /// Multiple positive writes to one flag before the owner's pass collapse
     /// to ONE action — C sets a boolean and consumes it once per main-loop
     /// pass (gateServer.cc:347-351). Three report2Flag raises must produce a
@@ -526,6 +551,7 @@ mod tests {
 
         let shutdown = Arc::new(Notify::new());
         let owner = spawn_control_owner(
+            &crate::test_reactor(),
             flags.clone(),
             report_handler(report_path.clone()),
             db.clone(),
@@ -549,6 +575,7 @@ mod tests {
         let _ = std::fs::remove_file(&report_path);
     }
 
+    #[cfg(tokio_backend)]
     /// A burst of different flags runs in C's FIXED main-loop order, not
     /// client write order: report1/2/3 raised in reverse order still append
     /// R1, then R2, then R3 (gateServer.cc:342-356).
@@ -568,6 +595,7 @@ mod tests {
 
         let shutdown = Arc::new(Notify::new());
         let owner = spawn_control_owner(
+            &crate::test_reactor(),
             flags.clone(),
             report_handler(report_path.clone()),
             db.clone(),
@@ -593,6 +621,7 @@ mod tests {
         let _ = std::fs::remove_file(&report_path);
     }
 
+    #[cfg(tokio_backend)]
     /// A quit raised in the same pass as a report does NOT skip the earlier
     /// flag: C checks quitFlag/quitServerFlag last in the loop
     /// (gateServer.cc:363-378), so the report still runs before shutdown.
@@ -610,6 +639,7 @@ mod tests {
 
         let shutdown = Arc::new(Notify::new());
         let owner = spawn_control_owner(
+            &crate::test_reactor(),
             flags.clone(),
             report_handler(report_path.clone()),
             db.clone(),

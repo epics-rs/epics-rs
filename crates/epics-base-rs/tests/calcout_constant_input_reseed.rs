@@ -6,14 +6,14 @@
 //! CO.INPB 7` stores the link text and `B` keeps its `.db` value forever — the
 //! put looks accepted and changes nothing.
 //!
-//! C's INTENT is explicit (`calcoutRecord.c:367-378`, `sCalcoutRecord.c:512-517`,
-//! `aCalcoutRecord.c:534-540`): `special()` re-runs `recGblInitConstantLink`,
+//! C's INTENT is explicit (`calcoutRecord.c:373-378`, `sCalcoutRecord.c:513-518`,
+//! `aCalcoutRecord.c:533-538`): `special()` re-runs `recGblInitConstantLink`,
 //! posts the value field with `DBE_VALUE`, and sets `INAV = CON`.
 //!
 //! C's compiled BEHAVIOUR does not do it — an ordering bug defeats the code:
-//! `dbPutFieldLink` (`dbAccess.c:1167-1179`) calls `dbRemoveLink` (which NULLs
-//! `plink->lset`, `dbLink.c:209`), then `dbPutSpecial(paddr, 1)`, and only then
-//! `dbAddLink` (`:1211`) installs the new lset. So inside `special()` the lset is
+//! `dbPutFieldLink` (`dbAccess.c:1164-1176`) calls `dbRemoveLink` (which NULLs
+//! `plink->lset`, `dbLink.c:207`), then `dbPutSpecial(paddr, 1)`, and only then
+//! `dbAddLink` (`:1205`) installs the new lset. So inside `special()` the lset is
 //! still NULL, and `recGblInitConstantLink` -> `dbLoadLink` -> `S_db_noLSET`
 //! (`dbLink.c:241`, `recGbl.c:175`) returns FALSE without loading anything.
 //! Measured on softIoc 7.0.10.1-DEV: `caput -s CO.INPB 7` leaves INPB="7" and
@@ -200,10 +200,10 @@ async fn acalcout_reseeds_numeric_inputs_only() {
 }
 
 /// transform: the FOURTH record whose C `special()` re-seeds
-/// (`transformRecord.c:714-719`) — the same defect family, found by searching
+/// (`transformRecord.c:715-723`) — the same defect family, found by searching
 /// the anchor (`recGblInitConstantLink` inside a `special()` body) across every
 /// C record in base and synApps calc. Its post carries `DBE_VALUE | DBE_LOG`
-/// (`:718`), unlike the calcout family's bare `DBE_VALUE`.
+/// (`:719`), unlike the calcout family's bare `DBE_VALUE`.
 #[epics_macros_rs::epics_test]
 async fn transform_put_to_a_constant_inp_reseeds_and_posts_value_log() {
     use epics_base_rs::server::records::transform::TransformRecord;

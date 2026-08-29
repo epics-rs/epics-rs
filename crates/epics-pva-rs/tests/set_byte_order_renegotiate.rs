@@ -18,7 +18,8 @@
 //! Self-contained (no external EPICS/pvxs tools), so it runs in the default
 //! nextest profile rather than the gated `interop` suites.
 
-// RTEMS-EXEC-MODEL-ALLOW(1): checked - these run and pass in the feature-ON suite.
+#![cfg(tokio_backend)]
+
 use epics_pva_rs::server_native::MonitorStream;
 use std::io::{Cursor, Read, Write};
 use std::net::TcpStream;
@@ -27,7 +28,8 @@ use std::time::Duration;
 
 use epics_pva_rs::proto::{ByteOrder, ControlCommand, PvaHeader};
 use epics_pva_rs::pvdata::{FieldDesc, PvField};
-use epics_pva_rs::server_native::{ChannelSource, OpError, PvaServer, PvaServerConfig};
+use epics_pva_rs::server_native::PvaServer;
+use epics_pva_rs::server_native::{ChannelSource, OpError, PvaServerConfig};
 
 /// Minimal source — the control-frame path is independent of channels, so
 /// the server needs no real PVs to handle SET_BYTE_ORDER / ECHO.

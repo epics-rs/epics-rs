@@ -13,9 +13,9 @@
 //! * SGNL SPC_MOD `special()` path: no monitor follows, so the direct write
 //!   STICKS and a `caget` reports STAT=SOFT SEVR=INVALID.
 //!
-//! Per `doc/strategy-2026-07-13.md` §2 — *clean is the goal* — the port REFUSES
-//! that path-dependent dead-code/sticky behaviour. An inverted-limits histogram
-//! is genuinely misconfigured (it can bin nothing), so the port raises the
+//! *clean is the goal* — the port REFUSES that path-dependent dead-code/sticky
+//! behaviour. An inverted-limits histogram is genuinely misconfigured (it can
+//! bin nothing), so the port raises the
 //! alarm through the single `nsta`/`nsev` owner and reports SOFT/INVALID
 //! CONSISTENTLY on BOTH paths: committed by `recGblResetAlarms` on the process
 //! path, and committed by the SGNL special path's own post-`check_alarms`

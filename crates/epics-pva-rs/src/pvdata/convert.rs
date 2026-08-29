@@ -16,7 +16,7 @@
 //! * `bool Value::as(T& out)` (`data.h:634-647`) swallows the throw and
 //!   answers `false` — pvxs's `pipeline.as(v)` / `queueSize.as(qSize)`.
 //!   Callers map that to [`Result::ok`].
-//! * `T Value::as()` (`data.h:625-631`) lets `NoConvert` escape. Inside a
+//! * `T Value::as()` (`data.h:626-631`) lets `NoConvert` escape. Inside a
 //!   server command handler there is no catch between it and
 //!   `conn.cpp:277-282`, which logs and does `bev.reset()` — the circuit
 //!   drops. Callers propagate the [`NoConvert`].
@@ -266,7 +266,7 @@ pub fn as_u64(f: &PvField) -> Result<u64, NoConvert> {
 }
 
 /// pvxs `Value::as<uint32_t>()` — [`as_u64`] narrowed by
-/// `StoreTransform<uint32_t>::out` (`data.h:81-86, 625-631`), which binds the
+/// `StoreTransform<uint32_t>::out` (`data.h:111-116, 626-631`), which binds the
 /// `uint64_t` store to a `const uint32_t&` and so TRUNCATES. `ackAny = -1`
 /// therefore reaches `op->ackAt` as `0xFFFF_FFFF`, not as 1 or 0.
 pub fn as_u32(f: &PvField) -> Result<u32, NoConvert> {

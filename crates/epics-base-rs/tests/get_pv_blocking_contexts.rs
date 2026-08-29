@@ -1,4 +1,4 @@
-// RTEMS-EXEC-MODEL-ALLOW(3): blocking-context tests that hand-build specific tokio runtimes on purpose; run and pass in the feature-ON suite.
+// RTEMS-EXEC-MODEL-ALLOW(3): blocking-context tests that hand-build specific tokio runtimes on purpose; run and pass in the exec-backend suite.
 //! `PvDatabase::get_pv_blocking` across caller contexts.
 //!
 //! It USED to be a sync bridge over an async `get_pv`, and whether blocking was
@@ -6,7 +6,7 @@
 //! multi-threaded worker were fine, a current-thread runtime was not blockable
 //! at all and had to be refused with an error.
 //!
-//! Since the H6 restructure (`doc/rtems-priority-locks-design.md`) `get_pv` is
+//! Since the H6 restructure `get_pv` is
 //! a `fn`: the read path is cache-only lock work, exactly as C `dbGetField`
 //! is a plain call from any thread. There is no bridge left, so there is no
 //! context-dependent soundness question either — every context below must

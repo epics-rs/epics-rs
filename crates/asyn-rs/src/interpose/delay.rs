@@ -9,7 +9,7 @@ use crate::user::AsynUser;
 /// The single owner of every `f64 seconds` → per-character delay conversion.
 ///
 /// C stores the operator's `double` verbatim (`pvt->delay = delay`,
-/// asynInterposeDelay.c:214) and hands it to `epicsThreadSleep`, which returns
+/// asynInterposeDelay.c:210) and hands it to `epicsThreadSleep`, which returns
 /// immediately for any non-positive argument. `Duration::from_secs_f64` instead
 /// *panics* on a negative or non-finite value, so every f64 the operator can
 /// reach — iocsh argument, protocol wire field, `set_delay` string — is

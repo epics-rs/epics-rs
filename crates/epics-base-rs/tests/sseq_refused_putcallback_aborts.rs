@@ -1,8 +1,8 @@
 //! A `WAITn` put-with-completion that is REFUSED aborts the sequence.
 //!
 //! C `sseqRecord.c::processCallback` reads the status of
-//! `dbCaPutLinkCallback` itself, in three identical arms (`:727-733`,
-//! `:748-753`, `:779-784`):
+//! `dbCaPutLinkCallback` itself, in three identical arms (`:722-730`,
+//! `:744-752`, `:774-782`):
 //!
 //! ```c
 //! status = dbCaPutLinkCallback(&(plinkGroup->lnk), DBR_DOUBLE, ...);
@@ -17,10 +17,11 @@
 //! }
 //! ```
 //!
-//! The status comes from `dbCa.c:557-561` — `if (!pca->isConnected ||
+//! The status comes from `dbCa.c:528-532` — `if (!pca->isConnected ||
 //! !pca->hasWriteAccess) return -1;`. With `abort` set, `processNextLink`
-//! (`:443`) skips the `DLYn` delay and the callback it requests bails at
-//! `processCallback`'s abort gate (`:621-627`) into `asyncFinish` (`:461-506`),
+//! (`sseqRecord.c:443`) skips the `DLYn` delay and the callback it requests
+//! bails at `processCallback`'s abort gate (`sseqRecord.c:621-627`) into
+//! `asyncFinish` (`sseqRecord.c:460-508`),
 //! so every LATER link group is skipped.
 //!
 //! The port raised `waiting`/`WTGn` and pushed the step into `in_flight`
@@ -29,7 +30,8 @@
 //!
 //! The link here reports a DBF class while refusing the put — C's cached
 //! `lnk_field_type` (resolved at `init_record`/`checkLinks` while the channel
-//! was up, `:225-238`) with the put refused at issue time. A link that never
+//! was up, `sseqRecord.c:225-238`) with the put refused at issue time. A link
+//! that never
 //! resolved a class takes C's `default:` arm instead, makes no put at all and
 //! raises nothing — that boundary is `sseq_unresolved_lnk_no_wait.rs`.
 
@@ -100,6 +102,26 @@ async fn poll_short(db: &PvDatabase, pv: &str, want: i16, label: &str) {
     );
 }
 
+/// Wait for a step's TARGET to hold the value the step put there — the fact a
+/// "step n ran" assertion needs. `BUSY == 0` is a different fact: `finish`
+/// clears `busy` inside `process()` (`sseq.rs:937-940`) while a no-wait step's
+/// write is a queued [`ProcessAction::WriteDbLink`] (`sseq.rs:772-780`) the
+/// framework runs after `process()` returns.
+async fn poll_double(db: &PvDatabase, pv: &str, want: f64, label: &str) {
+    for _ in 0..400 {
+        if let Ok(EpicsValue::Double(v)) = db.get_pv(pv)
+            && (v - want).abs() < 1e-10
+        {
+            return;
+        }
+        epics_base_rs::runtime::task::sleep(Duration::from_millis(5)).await;
+    }
+    panic!(
+        "{label}: {pv} did not reach Double({want}) (last {:?})",
+        db.get_pv(pv)
+    );
+}
+
 /// Three steps, the first a `WAITn` into a remote link that refuses the put.
 async fn three_step_sseq(db: &PvDatabase, prefix: &str, admission: PutAdmission) {
     db.register_link_set("ca", Arc::new(AdmissionLset { admission }))
@@ -146,11 +168,17 @@ async fn a_refused_put_callback_aborts_the_whole_sequence() {
 
     kick(&db, "SS_REF").await;
     poll_short(&db, "SS_REF.BUSY", 0, "the aborted sequence must finish").await;
+    // Settle before the negatives: `BUSY == 0` does not imply "no write will
+    // land", because a step's write is a queued `ProcessAction::WriteDbLink`
+    // the framework runs after `process()` returns, while `finish` clears
+    // `busy` inside it. Without the settle a step that DID run could still be
+    // in the queue and the assertions below would pass on a defect.
+    epics_base_rs::runtime::task::sleep(Duration::from_millis(40)).await;
 
     assert_eq!(
         db.get_pv("SS_REF_T2.VAL").unwrap(),
         EpicsValue::Double(0.0),
-        "step 2 must never run — C aborts at step 1 (sseqRecord.c:745-748)"
+        "step 2 must never run — C aborts at step 1 (sseqRecord.c:744-747)"
     );
     assert_eq!(
         db.get_pv("SS_REF_T3.VAL").unwrap(),
@@ -203,6 +231,8 @@ async fn an_admitted_put_callback_still_waits_and_completes() {
 
     kick(&db, "SS_OK").await;
     poll_short(&db, "SS_OK.BUSY", 0, "the sequence must complete").await;
+    poll_double(&db, "SS_OK_T2.VAL", 22.0, "step 2's write must land").await;
+    poll_double(&db, "SS_OK_T3.VAL", 33.0, "step 3's write must land").await;
 
     assert_eq!(
         db.get_pv("SS_OK_T2.VAL").unwrap(),
@@ -222,7 +252,7 @@ async fn an_admitted_put_callback_still_waits_and_completes() {
     }
     assert!(
         saw_wait,
-        "the issued branch raises `waiting` and posts WTG1 (sseqRecord.c:748-750)"
+        "the issued branch raises `waiting` and posts WTG1 (sseqRecord.c:749-751)"
     );
     assert_eq!(
         db.get_pv("SS_OK.ABORT").unwrap(),

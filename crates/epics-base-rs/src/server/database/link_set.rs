@@ -14,13 +14,13 @@
 //!
 //! The trait is **split by thread**, mirroring the C `dbCa` split
 //! between the record-processing thread and the `dbCaTask`
-//! (`dbCa.c:1191-1248`):
+//! (`dbCa.c:1093-1260`):
 //!
 //! * **Synchronous methods** are the ones record processing calls while
 //!   it holds the record's advisory write gate (C `dbScanLock`). They
 //!   answer from cached, monitor-fed state and MUST NOT perform I/O —
 //!   C `dbCaGetLink` copies out of `pca->pgetNative` and never touches
-//!   the wire (`dbCa.c:448-535`). Their signature is what enforces
+//!   the wire (`dbCa.c:419-506`). Their signature is what enforces
 //!   that: a `fn` cannot await, so it cannot suspend the record thread.
 //! * **Async methods** ([`LinkSet::get_value`],
 //!   [`LinkSet::connect_link`], [`LinkSet::put_value`],
@@ -113,7 +113,7 @@ pub enum LinkPutOp {
 ///     return -1;
 /// }
 /// ```
-/// (`dbCa.c:558-561`).
+/// (`dbCa.c:529-532`).
 ///
 /// Answered from cached state only: it runs on a record-processing thread
 /// inside the record's advisory write gate, which is exactly where C never
@@ -121,12 +121,12 @@ pub enum LinkPutOp {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PutAdmission {
     /// The lset tracks this link and its channel is up — stage the write.
-    /// C's fall-through to `addAction` (`dbCa.c:622`).
+    /// C's fall-through to `addAction` (`dbCa.c:593`).
     Connected,
     /// The lset tracks this link and will not take the write — the channel
     /// is down, or it is up but the server denies write access. One variant
     /// for both because C has one outcome for both: `-1`, stage nothing
-    /// (`dbCa.c:558-561`). The caller raises the owning record's
+    /// (`dbCa.c:529-532`). The caller raises the owning record's
     /// LINK/INVALID through `dbPutLink`'s `setLinkAlarm`
     /// (`dbLink.c:434-448`).
     ///
@@ -144,11 +144,56 @@ pub enum PutAdmission {
     Unopened,
 }
 
+/// One external link's report state — the `caLink` fields `dbcar` prints
+/// per link (`dbCaTest.c:95-133`).
+///
+/// C reads them off one `caLink` struct because dbCa owns the channel, the
+/// staged out-value and the connection callback together. Here those belong
+/// to two owners — the lset owns the channel and the connection edge, the
+/// database's link-put queue owns the staged out-value — so this type
+/// carries only the lset's half and `dbcar` joins it with
+/// [`PvDatabase::external_link_puts_coalesced_for`], C's `nNoWrite`.
+///
+/// [`PvDatabase::external_link_puts_coalesced_for`]: super::PvDatabase::external_link_puts_coalesced_for
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct LinkDiagnostics {
+    /// C's `pca->chid && ca_field_type(pca->chid) != TYPENOTCONN`
+    /// (`dbCaTest.c:95-97`) — the channel is up. Not
+    /// [`LinkSet::is_connected`], which is the *readable-cache* gate
+    /// `dbCaGetLink` applies; a channel that has connected but has yet to
+    /// deliver a monitor event counts as connected to `dbcar` and as
+    /// unreadable to a record.
+    pub connected: bool,
+    /// C `ca_host_name(pca->chid)` — the server's name with its port.
+    pub host: String,
+    /// C `ca_read_access(pca->chid)`.
+    pub read_access: bool,
+    /// C `ca_write_access(pca->chid)`.
+    pub write_access: bool,
+    /// C `pca->nDisconnect` (`dbCa.c:822`) — connect→disconnect edges since
+    /// the link was opened.
+    pub n_disconnect: u64,
+    /// `pvlOptInpNative`: the link has served a native input transfer
+    /// (`dbCa.c:456`, set on the first `dbCaGetLink` that needs the native
+    /// monitor).
+    pub input_native: bool,
+    /// `pvlOptInpString`: the link has served a *string* input transfer,
+    /// which C reaches only for a `DBR_ENUM` channel read as `DBR_STRING`
+    /// (`dbCa.c:441`).
+    pub input_string: bool,
+    /// `pvlOptOutNative` (`dbCa.c:557`). Dead at the pin: the assignment is
+    /// inside a `/* Disabled by ANJ ... */` comment, so C never sets it and
+    /// `dbcar` always prints the column blank.
+    pub output_native: bool,
+    /// `pvlOptOutString` (`dbCa.c:541`), disabled by the same ANJ comment.
+    pub output_string: bool,
+}
+
 /// Remote display / control / valueAlarm metadata snapshot for a
 /// link, as exposed by pvxs's pvalink lset metadata getters.
 ///
-/// Mirrors the pvxs `pvalink_lset.cpp` metadata getter set installed
-/// at `pvxs/ioc/pvalink_lset.cpp:700`:
+/// Mirrors the `pvxs/ioc/pvalink_lset.cpp` metadata getter set installed
+/// at `pvxs/ioc/pvalink_lset.cpp:706-732`:
 /// `pvaGetDBFtype`, `pvaGetElements`, `pvaGetControlLimits`,
 /// `pvaGetGraphicLimits`, `pvaGetAlarmLimits`, `pvaGetPrecision`,
 /// `pvaGetUnits`.
@@ -158,16 +203,77 @@ pub enum PutAdmission {
 /// unchanged when the sub-field is absent. `None` here means the
 /// remote NT value carried no such metadata — the record support
 /// then keeps its local/default metadata, exactly as the C path does.
+/// The link-backed metadata resolved for **one snapshot build** — the single
+/// channel through which a link's target metadata can reach a served
+/// [`Snapshot`](crate::server::snapshot::Snapshot).
+///
+/// The invariant it makes true by construction is *a served snapshot's
+/// link-backed metadata was resolved during THIS build*. Three things enforce
+/// it, none of them a runtime check:
+///
+/// * the field is private and [`LinkBacking::resolved`] is `pub(crate)`, so a
+///   crate outside `epics-base-rs` cannot make one and must go through
+///   [`PvDatabase::channel_snapshot_for_field`](crate::server::database::PvDatabase::channel_snapshot_for_field);
+/// * it borrows the resolve's own output, so it cannot outlive the resolve and
+///   there is nowhere to *store* it — a stale value is unrepresentable;
+/// * `RecordInstance` keeps no link-metadata map, so the consumer has no second
+///   source to read.
+///
+/// C needs no equivalent. `dbLock.c:725-760` merges every DB_LINK-connected
+/// record into one lock set behind one recursive mutex, so `get_units` and its
+/// siblings call `dbGetUnits`/`dbGetPrecision`/... inline under the target's
+/// lock (`dbDbLink.c:240-261`). The port has one `RwLock` per record and no
+/// lock sets, so it must resolve with no record lock held and hand the answer
+/// in; this type is that hand-off.
+#[derive(Clone, Copy)]
+pub struct LinkBacking<'a>(Option<&'a std::collections::HashMap<String, LinkMetadata>>);
+
+impl<'a> LinkBacking<'a> {
+    /// Nothing was resolved for this build: the record backs no field's
+    /// metadata with a link, or the caller is a path that serves only
+    /// non-link-backed fields. Every lookup answers `None`, which serves each
+    /// rset slot's C seed — the same answer C's untouched buffer gives for a
+    /// CONSTANT link, an unresolvable target, or a link its
+    /// `DBLINK_FLAG_VISITED` guard refused.
+    pub const fn none() -> Self {
+        Self(None)
+    }
+
+    /// What the links this record's metadata is backed by resolved to, keyed
+    /// by link field (`INPA`, `INPB`, ...), resolved with no record lock held.
+    pub const fn resolved(resolved: &'a std::collections::HashMap<String, LinkMetadata>) -> Self {
+        Self(Some(resolved))
+    }
+
+    /// The metadata behind one link field. The *predicate* — whether this
+    /// served field is link-backed at all — stays with
+    /// `Record::link_backed_metadata_field`, so this type answers only the
+    /// value and carries one meaning.
+    pub(crate) fn metadata(&self, link_field: &str) -> Option<&'a LinkMetadata> {
+        self.0.and_then(|m| m.get(link_field))
+    }
+
+    /// True for [`Self::none`] — the caller resolved nothing. Distinct from a
+    /// resolve that came back empty, and the difference is what the monitor
+    /// poster's `debug_assert` reads: a link-backed field posted through an
+    /// unresolved backing is a poster that skipped its resolve, whereas the
+    /// same field posted through an empty resolve is a link that genuinely
+    /// answered nothing and correctly serves its C seed.
+    pub(crate) const fn is_unresolved(&self) -> bool {
+        self.0.is_none()
+    }
+}
+
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct LinkMetadata {
     /// DBF type the remote value maps to (`pvaGetDBFtype`). A connected
     /// link always reports a type — an unmappable value shape falls back
     /// to `Long`, the `default:` arm of pvxs `pvaGetDBFtype`
-    /// (`pvalink_lset.cpp:199-236`). `None` therefore means "not
+    /// (`pvxs/ioc/pvalink_lset.cpp:199-236`). `None` therefore means "not
     /// connected" (no cached value), never "connected but unmappable".
     pub dbf_type: Option<LinkDbfType>,
     /// Element count: array length, or `1` for a scalar / any connected
-    /// non-array shape (`pvaGetElements`, `pvalink_lset.cpp:242-254`).
+    /// non-array shape (`pvaGetElements`, `pvxs/ioc/pvalink_lset.cpp:242-257`).
     /// As with `dbf_type`, `None` means "not connected".
     pub element_count: Option<i64>,
     /// `display.limitLow` / `display.limitHigh` (`pvaGetGraphicLimits`).
@@ -201,7 +307,9 @@ pub struct LinkMetadata {
 /// This is the DB-link inspection counterpart pvxs exposes through
 /// `dbGetAlarm` / `dbGetAlarmMsg` — `pvaGetAlarmMsg` returns the cached
 /// `snap_severity` / `snap_message` directly and never consults the
-/// link's `sevr` mode (`pvxs/ioc/pvalink_lset.cpp:542-575`). A default
+/// link's `sevr` mode (`pvxs/ioc/pvalink_lset.cpp:542-569`; `pvaGetAlarm`
+/// `:571-575` is the thin wrapper that calls it with no message buffer).
+/// A default
 /// `NMS` link must still report its remote severity here even though it
 /// does not maximize the owning record's severity.
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -211,18 +319,18 @@ pub struct RemoteAlarm {
     pub severity: i32,
     /// Remote alarm status code, derived from `severity` exactly as
     /// pvxs `pvaGetAlarmMsg` does (`LINK_ALARM` when severity is
-    /// non-`NO_ALARM`, else `NO_ALARM` — `pvalink_lset.cpp:551`). See
+    /// non-`NO_ALARM`, else `NO_ALARM` — `pvxs/ioc/pvalink_lset.cpp:554`). See
     /// [`RemoteAlarm::from_severity_message`].
     pub status: i32,
     /// Remote `alarm.message`. Empty when the remote carried none or
     /// the severity is `NO_ALARM` (pvxs clears `snap_message` unless
-    /// `snap_severity != 0` — `pvalink_lset.cpp:418-422`).
+    /// `snap_severity != 0` — `pvxs/ioc/pvalink_lset.cpp:418-422`).
     pub message: String,
 }
 
 impl RemoteAlarm {
     /// Build a snapshot whose `status` is derived from `severity`
-    /// exactly as pvxs `pvaGetAlarmMsg` (`pvalink_lset.cpp:551`):
+    /// exactly as pvxs `pvaGetAlarmMsg` (`pvxs/ioc/pvalink_lset.cpp:554`):
     /// `LINK_ALARM` when the remote severity is non-`NO_ALARM`, else
     /// `NO_ALARM`. status and severity cannot disagree by construction.
     pub fn from_severity_message(severity: i32, message: String) -> Self {
@@ -257,8 +365,10 @@ pub trait LinkSet: Send + Sync {
 
     /// True iff `name` has completed every post-connect init action
     /// iocInit's external-link wait holds for — C `testInitReady`
-    /// (dbCa.c:835-845, epics-base #856 "dbCa: iocInit wait for all
-    /// conditions"): connected with the first monitor event cached AND
+    /// (`dbCa.c:835-845` at `ef4829829`, epics-base #856 "dbCa: iocInit
+    /// wait for all conditions" — post-`R7.0.10` and in no tag, so this
+    /// is the one citation here that is not pin-relative): connected with
+    /// the first monitor event cached AND
     /// the attribute (metadata) fetch complete. Distinct from
     /// [`Self::is_connected`], which is C's lset `isConnected` and keeps
     /// its readable-cache semantics.
@@ -280,12 +390,13 @@ pub trait LinkSet: Send + Sync {
     async fn get_value(&self, name: &str) -> Option<EpicsValue>;
 
     /// Read `name` from cached, monitor-fed state ONLY — the
-    /// record-processing read. C `dbCaGetLink` (`dbCa.c:448-535`) copies
+    /// record-processing read. C `dbCaGetLink` (`dbCa.c:419-506`) copies
     /// out of `pca->pgetNative`, the buffer the CA monitor callback
-    /// (`eventCallback`, `dbCa.c:925`) keeps fresh on the `dbCaTask`; it
-    /// never opens a channel and never waits on the wire. Returns None
+    /// (`eventCallback`, `dbCa.c:891-967`, the fill at `:941-944`)
+    /// keeps fresh on the `dbCaTask`; it never opens a channel and never
+    /// waits on the wire. Returns None
     /// when the link has no cached value yet, which is C returning -1 for
-    /// `!pca->isConnected` (`dbCa.c:459-464`) — the reading record takes
+    /// `!pca->isConnected` (`dbCa.c:430-435`) — the reading record takes
     /// LINK/INVALID for that cycle.
     ///
     /// MUST NOT perform I/O — which is why this is a `fn` and
@@ -304,13 +415,24 @@ pub trait LinkSet: Send + Sync {
 
     /// Open (subscribe / connect) `name` so later
     /// [`Self::get_cached_value`] reads have a cache to serve — C
-    /// `dbCaAddLink` (`dbCa.c:735-800`), which stages a `CA_CONNECT`
-    /// action whose `ca_create_channel` + `ca_add_array_event` run on the
-    /// `dbCaTask`, not on the caller.
+    /// `dbCaAddLink` (`dbCa.c:397-401`), which stages a `CA_CONNECT`
+    /// action whose `ca_create_channel` +
+    /// `ca_add_array_event` run on the `dbCaTask`, not on the caller.
     ///
     /// **Called from the database's link work owner task**, so it MAY
     /// block on the network. Idempotent: the owner may call it again for
     /// a link that is already open or still connecting.
+    ///
+    /// More precisely, it is called on the tokio runtime the database
+    /// captured at construction, so `tokio::net` is usable here — and that
+    /// is the *only* place it is usable. A database built with no runtime
+    /// entered anywhere captured none, and there is no second executor that
+    /// could stand in: the process-global background executor deliberately
+    /// carries no `tokio::net` reactor. Such a database therefore never
+    /// calls this method at all; it refuses the link instead
+    /// (`PvDatabase::external_put_gate`). Do not read the absence of a
+    /// runtime as a reason to open the channel synchronously on the
+    /// caller — there is no caller thread that may block that way.
     ///
     /// Default: drive the lset's own lazy open by reading through
     /// [`Self::get_value`] and discarding the result — correct for every
@@ -323,7 +445,7 @@ pub trait LinkSet: Send + Sync {
     /// record-processing thread *before* the write is staged onto the
     /// database's link-put queue — C `dbCaPutLinkCallback`'s
     /// `if (!pca->isConnected || !pca->hasWriteAccess) return -1;`
-    /// (`dbCa.c:558-561`).
+    /// (`db/dbCa.c:529-532` (`dbCaPutLinkCallback`); epics-base R7.0.10).
     ///
     /// MUST NOT perform I/O. It is the one lset call left inside the
     /// record's advisory write gate, and the whole point of the queue is
@@ -353,7 +475,15 @@ pub trait LinkSet: Send + Sync {
     ///
     /// **Called from the database's link-put owner task, never from a
     /// record-processing thread** — this is the `dbCaTask` half of the
-    /// split (`dbCa.c:1226-1248`), so it may block on the network.
+    /// split (`db/dbCa.c:1161-1183` (`dbCaTask`); epics-base R7.0.10), so it
+    /// may block on the network.
+    ///
+    /// As with [`Self::connect_link`], "may block on the network" means "on
+    /// the tokio runtime the database captured", which is where the owner
+    /// dispatches it. A database that captured no runtime never reaches this
+    /// method: the write is refused at `PvDatabase::external_put_gate` with
+    /// nothing staged, C's shape for a put it cannot deliver
+    /// (`db/dbCa.c:529-532` (`dbCaPutLinkCallback`); R7.0.10).
     async fn put_value(&self, name: &str, value: EpicsValue, op: LinkPutOp) -> Result<(), String> {
         let _ = (name, value, op);
         Err("link set is read-only".into())
@@ -370,7 +500,7 @@ pub trait LinkSet: Send + Sync {
     /// process when the source record fires its FLNK.
     ///
     /// The lset applies the same non-retry validity gate pvxs does
-    /// (`pvalink_lset.cpp:677`): on a non-retry link that is not currently
+    /// (`pvxs/ioc/pvalink_lset.cpp:677`): on a non-retry link that is not currently
     /// connected it performs NO trigger and returns `Err`, so the caller
     /// raises LINK/INVALID on the owning record — pvxs calls
     /// `recGblSetSevrMsg(LINK_ALARM, INVALID_ALARM, "Disconn")` there.
@@ -397,7 +527,7 @@ pub trait LinkSet: Send + Sync {
     ///
     /// Mirrors the role of pvxs's shared `pvaLinkChannel::put()` being
     /// driven from record processing rather than left to manual calls
-    /// (`pvxs/ioc/pvalink_lset.cpp:647`, `pvalink_channel.cpp:220-263`).
+    /// (`pvxs/ioc/pvalink_lset.cpp:653`, `pvxs/ioc/pvalink_channel.cpp:220-280`).
     async fn flush_puts(&self) {}
 
     /// Most recent alarm message string from the upstream PV, when
@@ -418,7 +548,7 @@ pub trait LinkSet: Send + Sync {
     /// retains it). A returned `Some(sev)` is therefore already
     /// gated and the record processing loop propagates it verbatim
     /// as a maximize-severity contribution. Mirrors pvxs
-    /// `pvalink_lset.cpp` `pvaGetAlarm` feeding `recGblSetSevr`.
+    /// `pvxs/ioc/pvalink_lset.cpp` `pvaGetAlarm` feeding `recGblSetSevr`.
     fn alarm_severity(&self, _name: &str) -> Option<i32> {
         None
     }
@@ -433,7 +563,7 @@ pub trait LinkSet: Send + Sync {
     /// cannot report a remote status (no cache, or the link set does not
     /// track it); the caller falls back to `LINK_ALARM`, which is the
     /// behaviour for every non-`MSS` modifier and for lsets that leave
-    /// this default. Mirrors pvxs `pvalink_lset.cpp` `pvaGetAlarm`
+    /// this default. Mirrors `pvxs/ioc/pvalink_lset.cpp` `pvaGetAlarm`
     /// surfacing the remote `alarm.status` to `recGblSetSevrMsg`.
     fn alarm_status(&self, _name: &str) -> Option<i32> {
         None
@@ -450,13 +580,14 @@ pub trait LinkSet: Send + Sync {
     /// through [`LinkSet::alarm_severity`]), whereas `pvaGetAlarmMsg`
     /// returns the cached `snap_severity` / `snap_message` snapshot
     /// directly and never consults `sevr`
-    /// (`pvxs/ioc/pvalink_lset.cpp:542-575` — surfaced here). A caller
+    /// (`pvxs/ioc/pvalink_lset.cpp:542-569`, with `pvaGetAlarm` `:571-575`
+    /// its no-message-buffer wrapper — surfaced here). A caller
     /// inspecting the DB link's alarm (`dbGetAlarm` / `dbGetAlarmMsg`)
     /// therefore sees the remote severity even on a default `NMS` link
     /// that leaves the owning record unraised.
     ///
     /// `None` means the lset cannot report a snapshot: no cache, the
-    /// link is not connected (pvxs `CHECK_VALID` — `pvalink_lset.cpp:545`),
+    /// link is not connected (pvxs `CHECK_VALID` — `pvxs/ioc/pvalink_lset.cpp:548`),
     /// or the link set does not track remote alarms. Default: none.
     fn remote_alarm(&self, _name: &str) -> Option<RemoteAlarm> {
         None
@@ -477,7 +608,7 @@ pub trait LinkSet: Send + Sync {
     /// The Rust counterpart of pvxs's pvalink lset metadata getter
     /// set (`pvaGetDBFtype`, `pvaGetElements`, `pvaGetControlLimits`,
     /// `pvaGetGraphicLimits`, `pvaGetAlarmLimits`, `pvaGetPrecision`,
-    /// `pvaGetUnits` — installed at `pvxs/ioc/pvalink_lset.cpp:700`).
+    /// `pvaGetUnits` — installed at `pvxs/ioc/pvalink_lset.cpp:706-732`).
     /// A structured snapshot is used instead of seven separate trait
     /// methods so the lset reads its cache once and record support
     /// gets every linked-metadata field together.
@@ -499,6 +630,24 @@ pub trait LinkSet: Send + Sync {
     fn link_names(&self) -> Vec<String> {
         Vec::new()
     }
+
+    /// This link's `dbcar` report state, or `None` when the lset has never
+    /// opened `name` — C's `pca == NULL`, which `dbcar` prints as a
+    /// not-connected link with zero counters (`dbCaTest.c:127-132`).
+    ///
+    /// Async because C's host field is `ca_host_name(pca->chid)`, and this
+    /// port's twin (`CaChannel::host_name`) resolves the peer's PTR record
+    /// on a blocking thread exactly as libca's `hostNameCache` does. That
+    /// makes this the one `LinkSet` method neither half of the C split owns:
+    /// it is a diagnostic, called from iocsh, never from record processing
+    /// and never from the link work owner.
+    ///
+    /// Default: `None`, i.e. "this lset has no per-link report state".
+    /// Such an lset's links are invisible to `dbcar`, which is right — C's
+    /// `dbcar` walks `plink->type == CA_LINK` and no other link flavour.
+    async fn link_diagnostics(&self, _name: &str) -> Option<LinkDiagnostics> {
+        None
+    }
 }
 
 /// Type-erased lset reference held by the [`LinkSetRegistry`].
@@ -506,9 +655,9 @@ pub type DynLinkSet = Arc<dyn LinkSet>;
 
 /// Per-scheme registry. Held in a snapshot cell inside
 /// [`super::PvDatabase`]: readers take an `Arc` of the whole registry with no
-/// lock, and `register` rebuilds and republishes under the cell's writer gate
-/// (`doc/rtems-priority-locks-design.md` §3 row L8i). `Clone` is what makes
-/// that rebuild possible; it is a per-scheme `Arc` clone, not a deep copy.
+/// lock, and `register` rebuilds and republishes under the cell's writer gate.
+/// `Clone` is what makes that rebuild possible; it is a per-scheme `Arc`
+/// clone, not a deep copy.
 #[derive(Clone, Default)]
 pub struct LinkSetRegistry {
     inner: std::collections::HashMap<String, DynLinkSet>,

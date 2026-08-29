@@ -16,13 +16,15 @@
 //!
 //! The clear is inside the success arm — a failed read leaves UDF where it was,
 //! which is the only thing that makes the UDF_ALARM two lines down reachable.
-//! Same shape in `aiRecord.c:161`, `biRecord.c:144-148`, `mbbiRecord.c:168-174`,
-//! `longinRecord.c:148` and `int64inRecord.c:144`.
+//! Same shape, each at its own extent: `aiRecord.c:161`, `longinRecord.c:148`
+//! and `int64inRecord.c:144` are one-line guarded clears, while `bi` and `mbbi`
+//! put the clear inside a braced conversion arm — `biRecord.c:136-140` with the
+//! clear at `:139`, `mbbiRecord.c:168-191` with the clear at `:174`.
 //!
 //! The exceptions are enumerated, not assumed: `waveformRecord.c:144` and
-//! `aaiRecord.c:174` clear UDF on the line after `readValue` whatever it
-//! returned, `compressRecord.c:341-366` folds a failed `dbGetLink` into
-//! `status = 0` and clears anyway, and `subArrayRecord.c:148` assigns
+//! `aaiRecord.c:173` clear UDF on the line after `readValue` whatever it
+//! returned, `compressRecord.c:342-366` folds a failed `dbGetLink` into
+//! `status = 0` and clears anyway, and `subArrayRecord.c:147` assigns
 //! `udf = !!status`. Those four keep deriving; the six above must not.
 
 use epics_base_rs::server::ioc_builder::IocBuilder;

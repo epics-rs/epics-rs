@@ -205,8 +205,7 @@ pub type InpResolver = std::sync::Arc<
 /// [`AccessGate`] built from it.
 ///
 /// Lock-free by construction: a reader takes an `Arc` snapshot of the policy
-/// and an operator reload publishes a whole new one. This is
-/// `doc/rtems-priority-locks-design.md` §3 row **L9**, and it is the ACF cell
+/// and an operator reload publishes a whole new one. This is the ACF cell
 /// `epics-pva-rs` and `epics-ca-rs` share. It used to be a
 /// `tokio::sync::RwLock` whose read guard was held across the *whole* check —
 /// including the async ASG resolve and every CALC `INP*` resolve — so a
@@ -277,6 +276,36 @@ pub fn new_acf_cell_watching(
     cell
 }
 
+/// Start the housekeeping an [`AcfCell`] that gates `db` must have: the ASG
+/// `INP*` watcher (C `asCaStart`, `asCa.c:180-205`) and the HAG DNS
+/// refresher.
+///
+/// Split from [`new_acf_cell_watching`] for one reason. Both tasks run on the
+/// process-global callback pool, and building that pool is `iocInit`'s job in
+/// C — `callbackInit` sits inside `iocBuild_1` (`iocInit.c:152`) — because the
+/// pool reads `callbackSetQueueSize` / `callbackParallelThreads` once, when it
+/// is constructed, and both commands refuse afterwards (`callback.c:106-109`,
+/// `:162-165`). Anything that spawns on the pool before the startup script
+/// runs therefore silently disarms those two commands for the whole script.
+/// So an IOC with a lifecycle creates its cell with [`new_acf_cell`] before
+/// the script and calls this from the build.
+///
+/// That leaves the cell unwatched for the length of the script, which cannot
+/// re-open the cached-grant hole [`new_acf_cell_watching`] exists to close:
+/// nothing is serving the database yet, so no channel is holding an access
+/// level to go stale. A caller with no such lifecycle — a bare
+/// `CaServerBuilder`/`PvaServerBuilder`, already past `iocInit` by
+/// construction — keeps using [`new_acf_cell_watching`].
+///
+/// Must be called from within the runtime: it spawns.
+pub fn start_acf_watchers(
+    db: &std::sync::Arc<crate::server::database::PvDatabase>,
+    cell: &AcfCell,
+) {
+    spawn_asg_inp_watcher(db, cell);
+    spawn_hag_refresh(cell);
+}
+
 /// HAG DNS re-resolution cadence — the same 60 s the CA client's
 /// `refresh_dns` interval uses for its half of epics-base#863.
 const HAG_DNS_REFRESH: std::time::Duration = std::time::Duration::from_secs(60);
@@ -294,27 +323,34 @@ const HAG_DNS_REFRESH: std::time::Duration = std::time::Duration::from_secs(60);
 /// pattern): a wedged resolver delays this refresher, nothing else. The
 /// task holds only a `Weak` to the cell and ends when the owning IOC
 /// drops it.
-pub fn spawn_hag_refresh(cell: &AcfCell) {
+fn spawn_hag_refresh(cell: &AcfCell) {
     let weak = std::sync::Arc::downgrade(&cell.0);
-    crate::runtime::task::spawn_background(async move {
-        loop {
-            crate::runtime::task::sleep_background(HAG_DNS_REFRESH).await;
-            let Some(inner) = weak.upgrade() else { break };
-            if !as_check_client_ip() {
-                continue;
+    // Middle band: an IOC-wide HAG re-resolution owns no record and so has no
+    // PRIO to read. It is one of the two entries that make `callbackQueueShow`
+    // report a cbMedium high-water of 2 where C reports 0 — C has no HAG
+    // refresher at all — and that difference is intended, not a leak.
+    crate::runtime::task::spawn_background(
+        crate::runtime::task::CallbackPriority::Medium,
+        async move {
+            loop {
+                crate::runtime::task::sleep_background(HAG_DNS_REFRESH).await;
+                let Some(inner) = weak.upgrade() else { break };
+                if !as_check_client_ip() {
+                    continue;
+                }
+                let Some(config) = inner.load_full() else {
+                    continue;
+                };
+                if let Some(refreshed) = config.with_refreshed_hags() {
+                    tracing::info!(
+                        target: "epics_base_rs::access_security",
+                        "HAG DNS refresh: re-resolved members changed; republishing policy"
+                    );
+                    AcfCell(inner).store(Some(std::sync::Arc::new(refreshed)));
+                }
             }
-            let Some(config) = inner.load_full() else {
-                continue;
-            };
-            if let Some(refreshed) = config.with_refreshed_hags() {
-                tracing::info!(
-                    target: "epics_base_rs::access_security",
-                    "HAG DNS refresh: re-resolved members changed; republishing policy"
-                );
-                AcfCell(inner).store(Some(std::sync::Arc::new(refreshed)));
-            }
-        }
-    });
+        },
+    );
 }
 
 /// Retry cadence for an ASG `INP*` link whose record is not in the database
@@ -350,55 +386,85 @@ fn spawn_asg_inp_watcher(db: &std::sync::Arc<crate::server::database::PvDatabase
     let weak_cell = std::sync::Arc::downgrade(&cell.0);
     let weak_db = std::sync::Arc::downgrade(db);
     let mut acf_rx = subscribe_asg_changes();
-    crate::runtime::task::spawn_background(async move {
-        enum Wake {
-            /// A watched link posted a new value.
-            Values,
-            /// Re-derive the watch set (policy may have been replaced, or a
-            /// link's record may have loaded since the last attempt).
-            Rebuild,
-            Stop,
-        }
-        let mut readers: Vec<crate::server::event_queue::EventReader> = Vec::new();
-        // Targets not yet attached because their record is not loaded.
-        let mut pending: Vec<(String, String)> = Vec::new();
-        // Identity of the policy `readers` was built from. A notification this
-        // task raises itself does not move it, so the watcher cannot re-enter
-        // its own rebuild.
-        let mut built_from: usize = 0;
-
-        loop {
-            let (Some(inner), Some(db)) = (weak_cell.upgrade(), weak_db.upgrade()) else {
-                break;
-            };
-            let config = inner.load_full();
-            drop(inner);
-            let id = config
-                .as_ref()
-                .map_or(0, |c| std::sync::Arc::as_ptr(c) as usize);
-            if id != built_from {
-                built_from = id;
-                readers.clear();
-                pending = config.map(|c| c.inp_link_targets()).unwrap_or_default();
+    // Middle band: the watcher spans every ASG INP link in the IOC, so no one
+    // record's PRIO applies. It is the other entry behind the cbMedium
+    // high-water of 2: C does this work on `asCaTask`, a CA client thread that
+    // is not in the callback pool, so its own `callbackQueueShow` reports 0.
+    crate::runtime::task::spawn_background(
+        crate::runtime::task::CallbackPriority::Medium,
+        async move {
+            // C `asCaTask` registers with the watchdog as its first act
+            // (`asCa.c:171`) and removes on the way out (`:232`) — but the
+            // thread itself only exists between `asCaStart` and `asCaStop`,
+            // which nothing but `asInitCommon` calls (`asDbLib.c:147`, `:136`).
+            // A C IOC with no access-security file therefore lists no
+            // `asCaTask` at all. Here the watcher is welded to the cell
+            // instead, so it is the entry that carries C's condition: held
+            // exactly while there is a policy to serve, and released the
+            // moment there is not. Unbounded, as C's is: the loop parks on its
+            // ASG INP readers, and access inputs that never change are not a
+            // fault.
+            let mut watched: Option<crate::runtime::taskwd::TaskwdEntry> = None;
+            enum Wake {
+                /// A watched link posted a new value.
+                Values,
+                /// Re-derive the watch set (policy may have been replaced, or a
+                /// link's record may have loaded since the last attempt).
+                Rebuild,
+                Stop,
             }
-            pending.retain(|(record, field)| !attach_asg_inp(&db, record, field, &mut readers));
-            drop(db);
+            let mut readers: Vec<crate::server::event_queue::EventReader> = Vec::new();
+            // Targets not yet attached because their record is not loaded.
+            let mut pending: Vec<(String, String)> = Vec::new();
+            // Identity of the policy `readers` was built from. A notification this
+            // task raises itself does not move it, so the watcher cannot re-enter
+            // its own rebuild.
+            let mut built_from: usize = 0;
 
-            let wake = tokio::select! {
-                r = acf_rx.recv() => match r {
-                    Err(tokio::sync::broadcast::error::RecvError::Closed) => Wake::Stop,
-                    _ => Wake::Rebuild,
-                },
-                () = drain_any_asg_inp(&mut readers) => Wake::Values,
-                () = crate::runtime::task::sleep_background(ASG_INP_RETRY) => Wake::Rebuild,
-            };
-            match wake {
-                Wake::Stop => break,
-                Wake::Rebuild => {}
-                Wake::Values => notify_asg_field_changed(),
+            loop {
+                let (Some(inner), Some(db)) = (weak_cell.upgrade(), weak_db.upgrade()) else {
+                    break;
+                };
+                let config = inner.load_full();
+                drop(inner);
+                match (config.is_some(), watched.is_some()) {
+                    (true, false) => {
+                        watched = Some(crate::runtime::taskwd::taskwd_insert(
+                            "asCaTask",
+                            crate::runtime::taskwd::CheckIn::Unbounded,
+                            None,
+                        ))
+                    }
+                    (false, true) => watched = None,
+                    _ => {}
+                }
+                let id = config
+                    .as_ref()
+                    .map_or(0, |c| std::sync::Arc::as_ptr(c) as usize);
+                if id != built_from {
+                    built_from = id;
+                    readers.clear();
+                    pending = config.map(|c| c.inp_link_targets()).unwrap_or_default();
+                }
+                pending.retain(|(record, field)| !attach_asg_inp(&db, record, field, &mut readers));
+                drop(db);
+
+                let wake = tokio::select! {
+                    r = acf_rx.recv() => match r {
+                        Err(tokio::sync::broadcast::error::RecvError::Closed) => Wake::Stop,
+                        _ => Wake::Rebuild,
+                    },
+                    () = drain_any_asg_inp(&mut readers) => Wake::Values,
+                    () = crate::runtime::task::sleep_background(ASG_INP_RETRY) => Wake::Rebuild,
+                };
+                match wake {
+                    Wake::Stop => break,
+                    Wake::Rebuild => {}
+                    Wake::Values => notify_asg_field_changed(),
+                }
             }
-        }
-    });
+        },
+    );
 }
 
 /// Subscribe one `INP*` target to its record's value events. `false` = not
@@ -838,9 +904,15 @@ pub struct AccessRule {
     /// Write-trap mask (epics-base `asLib.y:272-283` `rule_log_option`,
     /// `AS_TRAP_WRITE`). `true` when the RULE header carried the
     /// `TRAPWRITE` option, `false` for `NOTRAPWRITE` or no option.
-    /// The grammar is honoured here; the `asTrapWrite` put-logging
-    /// listener that consumes this mask is a separate subsystem not
-    /// present in this crate (see the UNFIXED note).
+    /// The mask is what arms the put-log bracket: a matching rule hands
+    /// it out with the access it grants, [`trap_write_armed`] folds it
+    /// with C's `asActive` test (`asLib.h:57-60`
+    /// `asTrapWriteWithData`), and [`TrapWriteGuard`] fires the
+    /// Before/After pair that C's `asTrapWriteBeforeWithData`
+    /// (`asTrapWrite.c:114`) and `asTrapWriteAfterWrite` fire. What is
+    /// per-server is only the LISTENER, registered through
+    /// [`register_trap_write_listener`] — C keeps the same split
+    /// (`asTrapWrite.c:122-123` returns 0 on an empty `listenerList`).
     pub trap: bool,
     /// CALC condition expression (epics-base `asLib.y:294-299`,
     /// `RULE(...) { CALC("A=1") }`). `None` means an unconditional
@@ -1436,7 +1508,7 @@ impl AccessSecurityConfig {
 ///
 /// C `libcom/src/as/asLib.h:57-62` defines `asTrapWriteWithData` which
 /// is invoked unconditionally around every `dbChannel_put` in
-/// `rsrv/camessage.c:799-810`. Listeners registered via
+/// `rsrv/camessage.c:768-779`. Listeners registered via
 /// `asTrapWriteRegisterListener` receive the put event — this is the
 /// hook `caPutLog` and site put-loggers attach to. Pre-fix Rust
 /// parsed the `TRAPWRITE`/`NOTRAPWRITE` keyword into
@@ -1687,9 +1759,9 @@ impl TrapWriteFields {
 /// This makes the C invariant hold *by construction*: every
 /// `asTrapWriteWithData` (BeforeWrite) is matched by exactly one
 /// `asTrapWriteAfter` (AfterWrite) on all rsrv exit paths — normal
-/// completion (`rsrv/camessage.c:1431`), still-busy teardown
+/// completion (`rsrv/camessage.c:1400`), still-busy teardown
 /// (`rsrvFreePutNotify`, `camessage.c:1621-1660`), and supersede-cancel
-/// (`write_notify_action`, `camessage.c:1741-1744`) — and mirrors pvxs's
+/// (`write_notify_action`, `camessage.c:1697-1700`) — and mirrors pvxs's
 /// `SecurityLogger`, whose destructor calls `asTrapWriteAfterWrite`
 /// (`ioc/securitylogger.h:23-59`). Before this guard the Rust emitters
 /// dispatched AfterWrite from an explicit call that an
@@ -1946,6 +2018,121 @@ fn dump_quoted(out: &mut String, s: &str) {
     out.push('"');
 }
 
+/// The ACF reader, and the single owner of the line counter every rejection
+/// out of this parser carries.
+///
+/// The counter is the reason this is a type rather than a bare
+/// `Peekable<Chars>`: [`Self::next`] is the ONLY way the input advances, so
+/// `line` cannot drift from the text — no caller can step over a newline
+/// without the counter seeing it. C keeps the same number in
+/// `asLib_lex.l`'s `line_num`; this port keeps its own, more specific
+/// sentences and simply says where they happened, because an ACF that fails
+/// on line 240 of 900 is otherwise unlocatable.
+struct AcfScanner<'a> {
+    src: &'a str,
+    /// Byte offset of the next character. The text stays addressable behind
+    /// the cursor so a diagnostic can quote what the operator wrote without
+    /// consuming it — see [`Self::offending`].
+    pos: usize,
+    /// 1-based, counting every `\n` consumed.
+    line: u32,
+}
+
+impl<'a> AcfScanner<'a> {
+    fn new(content: &'a str) -> Self {
+        Self {
+            src: content,
+            pos: 0,
+            line: 1,
+        }
+    }
+
+    fn peek(&mut self) -> Option<char> {
+        self.src[self.pos..].chars().next()
+    }
+
+    /// The one place the input advances, so the one place `line` moves.
+    fn next(&mut self) -> Option<char> {
+        let c = self.src[self.pos..].chars().next()?;
+        self.pos += c.len_utf8();
+        if c == '\n' {
+            self.line += 1;
+        }
+        Some(c)
+    }
+
+    /// Quote the token the operator actually typed, for a diagnostic that
+    /// says `got '…'`.
+    ///
+    /// A "consume while it matches" loop stops BEFORE the character that
+    /// broke it, so its buffer holds only what was ACCEPTED — on
+    /// `RULE(abc, READ)` the digit loop accepts nothing and the buffer is
+    /// empty, and quoting it reports `got ''`, a token that is nowhere in
+    /// the file. `accepted` is that buffer; the rest is read forward from
+    /// the cursor to the next delimiter, without consuming, so the same call
+    /// is right whether the caller is about to unwind or to carry on.
+    ///
+    /// Capped so a file with a megabyte-long run cannot put a megabyte on
+    /// the operator's console.
+    fn offending(&self, accepted: &str) -> String {
+        const CAP: usize = 32;
+        let rest: String = self.src[self.pos..]
+            .chars()
+            .take_while(|c| !c.is_whitespace() && !matches!(c, '(' | ')' | '{' | '}' | ',' | '#'))
+            .collect();
+        let token: String = accepted.chars().chain(rest.chars()).collect();
+        if token.chars().count() > CAP {
+            let head: String = token.chars().take(CAP).collect();
+            format!("{head}…")
+        } else {
+            token
+        }
+    }
+
+    /// Whitespace and `#` comments are not tokens; a comment runs to the end
+    /// of its line and the newline that ends it still counts.
+    fn skip_ws_comments(&mut self) {
+        while let Some(c) = self.peek() {
+            if c.is_whitespace() {
+                self.next();
+            } else if c == '#' {
+                while let Some(c) = self.peek() {
+                    self.next();
+                    if c == '\n' {
+                        break;
+                    }
+                }
+            } else {
+                break;
+            }
+        }
+    }
+
+    /// Build this parser's rejection: the port's own sentence, prefixed with
+    /// where in the file it happened. Every failure path goes through here,
+    /// so none of them can be written without the location.
+    ///
+    /// Use this only for a complaint about the token under the cursor. A
+    /// complaint about a construct that OPENED earlier — every
+    /// `unterminated …`, and the CALC clause — belongs to [`Self::reject_at`]
+    /// against the line the construct started on.
+    fn reject(&self, what: impl std::fmt::Display) -> CaError {
+        self.reject_at(self.line, what)
+    }
+
+    /// Reject against a line the caller stamped when it entered the
+    /// construct.
+    ///
+    /// The parser only discovers an unterminated `(`, `{` or `"` at EOF, so
+    /// its own position is the END of the file. On the 900-line ACF this line
+    /// number exists for, that number is worse than useless — it points every
+    /// unterminated construct at the same place. The opening line is the one
+    /// the operator has to edit.
+    fn reject_at(&self, line: u32, what: impl std::fmt::Display) -> CaError {
+        CaError::Protocol(format!("ACF line {line}: {what}"))
+    }
+}
+
 pub fn parse_acf(content: &str) -> CaResult<AccessSecurityConfig> {
     let mut config = AccessSecurityConfig {
         uag: HashMap::new(),
@@ -1966,31 +2153,31 @@ pub fn parse_acf(content: &str) -> CaResult<AccessSecurityConfig> {
         .asg
         .insert("DEFAULT".to_string(), AccessSecurityGroup::default());
 
-    let mut chars = content.chars().peekable();
+    let mut sc = AcfScanner::new(content);
     let mut buf = String::new();
 
-    while chars.peek().is_some() {
-        skip_ws_comments(&mut chars);
+    while sc.peek().is_some() {
+        sc.skip_ws_comments();
         buf.clear();
-        read_word(&mut chars, &mut buf);
+        read_word(&mut sc, &mut buf);
 
         match buf.as_str() {
             "UAG" => {
-                let name = read_paren_name(&mut chars)?;
-                let members = read_brace_list(&mut chars)?;
+                let name = read_paren_name(&mut sc)?;
+                let members = read_brace_list(&mut sc)?;
                 config.uag.insert(name, members);
             }
             "HAG" => {
-                let name = read_paren_name(&mut chars)?;
-                let members = read_brace_list(&mut chars)?;
+                let name = read_paren_name(&mut sc)?;
+                let members = read_brace_list(&mut sc)?;
                 // C `asHagAddHost` reads `asCheckClientIP` at ACF-parse
                 // time and stores names or resolved IPs accordingly.
                 config.hag.insert(name.clone(), hag_members(&members));
                 config.hag_raw.insert(name, members);
             }
             "ASG" => {
-                let name = read_paren_name(&mut chars)?;
-                let asg = parse_asg_body(&mut chars)?;
+                let name = read_paren_name(&mut sc)?;
+                let asg = parse_asg_body(&mut sc)?;
                 config.asg.insert(name, asg);
             }
             "" => {
@@ -1999,7 +2186,7 @@ pub fn parse_acf(content: &str) -> CaResult<AccessSecurityConfig> {
                 // word means one of two things:
                 //
                 //   * genuine EOF / whitespace-only / comment-only
-                //     input — `chars.peek()` is `None` ⇒ break, `Ok`
+                //     input — `sc.peek()` is `None` ⇒ break, `Ok`
                 //     (the pre-existing, deliberate empty-file
                 //     divergence from C; see `empty_acf_denies_all_access`);
                 //   * a stray top-level punctuation token where a
@@ -2008,10 +2195,10 @@ pub fn parse_acf(content: &str) -> CaResult<AccessSecurityConfig> {
                 //     with bare punctuation at top level ⇒ `yyerror`.
                 //     A file of only `(((` or only `}` is genuine
                 //     garbage and must fail closed.
-                match chars.peek() {
-                    Some(&c) if matches!(c, '(' | ')' | '{' | '}' | ',') => {
-                        return Err(CaError::Protocol(format!(
-                            "ACF: unexpected '{c}' where a top-level block keyword is expected"
+                match sc.peek() {
+                    Some(c) if matches!(c, '(' | ')' | '{' | '}' | ',') => {
+                        return Err(sc.reject(format!(
+                            "unexpected '{c}' where a top-level block keyword is expected"
                         )));
                     }
                     // EOF, or any other stray character — preserve the
@@ -2039,7 +2226,7 @@ pub fn parse_acf(content: &str) -> CaResult<AccessSecurityConfig> {
                 // fails. `skip_unknown_top_level_block` enforces exactly
                 // that: it returns `Err` for genuine garbage and `Ok`
                 // (after warning) for a well-formed unknown block.
-                skip_unknown_top_level_block(other, &mut chars)?;
+                skip_unknown_top_level_block(other, &mut sc)?;
             }
         }
     }
@@ -2064,24 +2251,27 @@ pub fn parse_acf(content: &str) -> CaResult<AccessSecurityConfig> {
 ///   fails. Return `Err`;
 /// * unbalanced parens/braces (depth never returns to 0 before EOF) ⇒
 ///   the C lexer/parser raises `yyerror` ⇒ return `Err`.
-fn skip_unknown_top_level_block(
-    keyword: &str,
-    chars: &mut std::iter::Peekable<std::str::Chars>,
-) -> CaResult<()> {
-    skip_ws_comments(chars);
+fn skip_unknown_top_level_block(keyword: &str, sc: &mut AcfScanner) -> CaResult<()> {
+    // Every complaint below names `keyword`, so every one of them belongs to
+    // the line the keyword is on — not to wherever the scan ran out.
+    let at = sc.line;
+    sc.skip_ws_comments();
     // C `generic_head` requires a `(` here. A bare keyword with another
     // word or EOF after it matches no production ⇒ hard parse error.
-    if chars.peek() != Some(&'(') {
-        return Err(CaError::Protocol(format!(
-            "ACF: unexpected token '{keyword}' — expected a top-level \
-             UAG/HAG/ASG block or an unknown keyword followed by '('"
-        )));
+    if sc.peek() != Some('(') {
+        return Err(sc.reject_at(
+            at,
+            format!(
+                "unexpected token '{keyword}' — expected a top-level \
+                 UAG/HAG/ASG block or an unknown keyword followed by '('"
+            ),
+        ));
     }
     // Consume the balanced `(...)` head. Unbalanced ⇒ error.
     let mut depth = 0;
     let mut closed = false;
-    while let Some(&c) = chars.peek() {
-        chars.next();
+    while let Some(c) = sc.peek() {
+        sc.next();
         match c {
             '(' => depth += 1,
             ')' => {
@@ -2095,18 +2285,19 @@ fn skip_unknown_top_level_block(
         }
     }
     if !closed {
-        return Err(CaError::Protocol(format!(
-            "ACF: unbalanced '(' in unsupported top-level block '{keyword}'"
-        )));
+        return Err(sc.reject_at(
+            at,
+            format!("unbalanced '(' in unsupported top-level block '{keyword}'"),
+        ));
     }
-    skip_ws_comments(chars);
+    sc.skip_ws_comments();
     // The `{...}` body is optional (the `tokenSTRING generic_head` bare
     // form). If present it must be balanced.
-    if chars.peek() == Some(&'{') {
+    if sc.peek() == Some('{') {
         let mut depth = 0;
         let mut closed = false;
-        while let Some(&c) = chars.peek() {
-            chars.next();
+        while let Some(c) = sc.peek() {
+            sc.next();
             match c {
                 '{' => depth += 1,
                 '}' => {
@@ -2120,14 +2311,16 @@ fn skip_unknown_top_level_block(
             }
         }
         if !closed {
-            return Err(CaError::Protocol(format!(
-                "ACF: unbalanced '{{' in unsupported top-level block '{keyword}'"
-            )));
+            return Err(sc.reject_at(
+                at,
+                format!("unbalanced '{{' in unsupported top-level block '{keyword}'"),
+            ));
         }
     }
     // Well-formed unknown block: warn and continue.
     tracing::warn!(
         target: "epics_base_rs::access_security",
+        line = at,
         keyword = %keyword,
         "ACF: ignoring unsupported top-level block"
     );
@@ -2144,7 +2337,7 @@ fn skip_unknown_top_level_block(
 ///   names, or resolved dotted-quad IPs;
 /// * what the CA server records as a client's host — the name the client
 ///   claims over `CA_PROTO_HOST_NAME`, or its peer IP
-///   (`camessage.c:839-843`, `caservertask.c:1425-1437`).
+///   (`camessage.c:839-843`, `caservertask.c:1425-1439`).
 ///
 /// C's default is `0`: rsrv stores the client-supplied hostname
 /// unconditionally and HAGs match on names. The IP-checking mode is opt-in.
@@ -2158,7 +2351,7 @@ pub fn as_check_client_ip() -> bool {
 
 /// Set the `AS_CHECK_CLIENT_IP` mode. C exposes this as an iocsh
 /// *variable* (`var asCheckClientIP 1`, registered in
-/// `libComRegister.c:491-495`, `:535-537`), and so does this port —
+/// `libComRegister.c:475-479`, `:518-520` at `R7.0.10`), and so does this port —
 /// `var asCheckClientIP 1` reaches this setter through the iocsh
 /// variable table.
 ///
@@ -2218,41 +2411,24 @@ fn hag_members(members: &[String]) -> Vec<String> {
         .collect()
 }
 
-fn skip_ws_comments(chars: &mut std::iter::Peekable<std::str::Chars>) {
-    while let Some(&c) = chars.peek() {
-        if c.is_whitespace() {
-            chars.next();
-        } else if c == '#' {
-            // Skip line comment
-            while let Some(&c) = chars.peek() {
-                chars.next();
-                if c == '\n' {
-                    break;
-                }
-            }
-        } else {
-            break;
-        }
-    }
-}
-
-fn read_word(chars: &mut std::iter::Peekable<std::str::Chars>, buf: &mut String) {
-    while let Some(&c) = chars.peek() {
+fn read_word(sc: &mut AcfScanner, buf: &mut String) {
+    while let Some(c) = sc.peek() {
         if c.is_alphanumeric() || c == '_' {
             buf.push(c);
-            chars.next();
+            sc.next();
         } else {
             break;
         }
     }
 }
 
-fn read_paren_name(chars: &mut std::iter::Peekable<std::str::Chars>) -> CaResult<String> {
-    skip_ws_comments(chars);
-    if chars.next() != Some('(') {
-        return Err(CaError::Protocol("ACF: expected '('".into()));
+fn read_paren_name(sc: &mut AcfScanner) -> CaResult<String> {
+    sc.skip_ws_comments();
+    if sc.next() != Some('(') {
+        return Err(sc.reject("expected '('"));
     }
-    skip_ws_comments(chars);
+    let opened = sc.line;
+    sc.skip_ws_comments();
     // L-4: C's lexer requires a single `tokenSTRING` then `')'`.
     // Accept an optional double-quoted form; in the unquoted form
     // interior whitespace ends the name — a second non-space run
@@ -2260,11 +2436,11 @@ fn read_paren_name(chars: &mut std::iter::Peekable<std::str::Chars>) -> CaResult
     // (`UAG(my group)` must NOT become `mygroup`). EOF before `)` is
     // also an error.
     let mut name = String::new();
-    if chars.peek() == Some(&'"') {
-        chars.next();
+    if sc.peek() == Some('"') {
+        sc.next();
         let mut closed = false;
-        while let Some(&c) = chars.peek() {
-            chars.next();
+        while let Some(c) = sc.peek() {
+            sc.next();
             if c == '"' {
                 closed = true;
                 break;
@@ -2272,74 +2448,67 @@ fn read_paren_name(chars: &mut std::iter::Peekable<std::str::Chars>) -> CaResult
             name.push(c);
         }
         if !closed {
-            return Err(CaError::Protocol("ACF: unterminated quoted name".into()));
+            return Err(sc.reject_at(opened, "unterminated quoted name"));
         }
-        skip_ws_comments(chars);
-        if chars.next() != Some(')') {
-            return Err(CaError::Protocol(
-                "ACF: expected ')' after quoted name".into(),
-            ));
+        sc.skip_ws_comments();
+        if sc.next() != Some(')') {
+            return Err(sc.reject("expected ')' after quoted name"));
         }
         return Ok(name);
     }
     loop {
-        match chars.peek() {
-            Some(&')') => {
-                chars.next();
+        match sc.peek() {
+            Some(')') => {
+                sc.next();
                 break;
             }
-            Some(&c) if c.is_whitespace() => {
+            Some(c) if c.is_whitespace() => {
                 // Whitespace ends the name. Allow only trailing
                 // whitespace before `)`; reject embedded whitespace.
-                skip_ws_comments(chars);
-                match chars.peek() {
-                    Some(&')') => {
-                        chars.next();
+                sc.skip_ws_comments();
+                match sc.peek() {
+                    Some(')') => {
+                        sc.next();
                         break;
                     }
                     Some(_) => {
-                        return Err(CaError::Protocol(
-                            "ACF: whitespace inside parenthesised name".into(),
-                        ));
+                        return Err(sc.reject("whitespace inside parenthesised name"));
                     }
                     None => {
-                        return Err(CaError::Protocol(
-                            "ACF: unterminated '(' — missing ')'".into(),
-                        ));
+                        return Err(sc.reject_at(opened, "unterminated '(' — missing ')'"));
                     }
                 }
             }
-            Some(&c) => {
+            Some(c) => {
                 name.push(c);
-                chars.next();
+                sc.next();
             }
             None => {
-                return Err(CaError::Protocol(
-                    "ACF: unterminated '(' — missing ')'".into(),
-                ));
+                return Err(sc.reject_at(opened, "unterminated '(' — missing ')'"));
             }
         }
     }
     Ok(name)
 }
 
-fn read_brace_list(chars: &mut std::iter::Peekable<std::str::Chars>) -> CaResult<Vec<String>> {
-    skip_ws_comments(chars);
-    if chars.next() != Some('{') {
-        return Err(CaError::Protocol("ACF: expected '{'".into()));
+fn read_brace_list(sc: &mut AcfScanner) -> CaResult<Vec<String>> {
+    sc.skip_ws_comments();
+    if sc.next() != Some('{') {
+        return Err(sc.reject("expected '{'"));
     }
+    let opened = sc.line;
     let mut items = Vec::new();
     let mut current = String::new();
 
     loop {
-        skip_ws_comments(chars);
-        match chars.peek() {
-            Some(&'}') => {
-                chars.next();
+        sc.skip_ws_comments();
+        match sc.peek() {
+            Some('}') => {
+                sc.next();
                 break;
             }
-            Some(&',') => {
-                chars.next();
+            Some(',') => {
+                sc.next();
                 if !current.is_empty() {
                     items.push(current.clone());
                     current.clear();
@@ -2348,25 +2517,24 @@ fn read_brace_list(chars: &mut std::iter::Peekable<std::str::Chars>) -> CaResult
             // Quoted string: asLib_lex.l `{doublequote}({stringchar}|{escape})*{doublequote}`
             // where stringchar is [^"\n\\]. Allows '/' so "role/groupname" entries work.
             // pvxs/documentation/ioc.rst shows: UAG(special) { someone, "role/op" }
-            Some(&'"') => {
-                chars.next(); // consume opening '"'
+            Some('"') => {
+                sc.next(); // consume opening '"'
+                let quote_opened = sc.line;
                 if !current.is_empty() {
                     items.push(current.clone());
                     current.clear();
                 }
                 let mut quoted = String::new();
                 loop {
-                    match chars.next() {
+                    match sc.next() {
                         Some('"') => break,
                         Some('\\') => {
-                            if let Some(esc) = chars.next() {
+                            if let Some(esc) = sc.next() {
                                 quoted.push(esc);
                             }
                         }
                         Some('\n') | None => {
-                            return Err(CaError::Protocol(
-                                "ACF: unterminated quoted string".into(),
-                            ));
+                            return Err(sc.reject_at(quote_opened, "unterminated quoted string"));
                         }
                         Some(c) => quoted.push(c),
                     }
@@ -2376,17 +2544,17 @@ fn read_brace_list(chars: &mut std::iter::Peekable<std::str::Chars>) -> CaResult
                 }
             }
             // Unquoted name: asLib_lex.l `name [a-zA-Z0-9_\-+:.\[\]<>;]`
-            Some(&c)
+            Some(c)
                 if c.is_alphanumeric()
                     || matches!(c, '_' | '.' | '-' | '+' | ':' | '[' | ']' | '<' | '>' | ';') =>
             {
                 current.push(c);
-                chars.next();
+                sc.next();
             }
             Some(_) => {
-                chars.next();
+                sc.next();
             }
-            None => return Err(CaError::Protocol("ACF: unterminated '{'".into())),
+            None => return Err(sc.reject_at(opened, "unterminated '{'")),
         }
     }
     if !current.is_empty() {
@@ -2395,28 +2563,27 @@ fn read_brace_list(chars: &mut std::iter::Peekable<std::str::Chars>) -> CaResult
     Ok(items)
 }
 
-fn parse_asg_body(
-    chars: &mut std::iter::Peekable<std::str::Chars>,
-) -> CaResult<AccessSecurityGroup> {
-    skip_ws_comments(chars);
-    if chars.next() != Some('{') {
-        return Err(CaError::Protocol("ACF: expected '{' after ASG name".into()));
+fn parse_asg_body(sc: &mut AcfScanner) -> CaResult<AccessSecurityGroup> {
+    sc.skip_ws_comments();
+    if sc.next() != Some('{') {
+        return Err(sc.reject("expected '{' after ASG name"));
     }
+    let opened = sc.line;
 
     let mut asg = AccessSecurityGroup::default();
 
     loop {
-        skip_ws_comments(chars);
-        match chars.peek() {
-            Some(&'}') => {
-                chars.next();
+        sc.skip_ws_comments();
+        match sc.peek() {
+            Some('}') => {
+                sc.next();
                 break;
             }
             Some(_) => {
                 let mut kw = String::new();
-                read_word(chars, &mut kw);
+                read_word(sc, &mut kw);
                 if kw == "RULE" {
-                    let rule = parse_rule(chars)?;
+                    let rule = parse_rule(sc)?;
                     asg.rules.push(rule);
                 } else if let Some(stripped) = kw.strip_prefix("INP") {
                     // `INP(A..U)("link")` — C `asLib_lex.l:48-52`
@@ -2427,22 +2594,22 @@ fn parse_asg_body(
                     let index = match parse_inp_index(stripped) {
                         Some(i) => i,
                         None => {
-                            return Err(CaError::Protocol(format!(
-                                "ACF: invalid INP link selector 'INP{stripped}' \
+                            return Err(sc.reject(format!(
+                                "invalid INP link selector 'INP{stripped}' \
                                  (expected INPA..INPU)"
                             )));
                         }
                     };
-                    let link = read_paren_name(chars)?;
+                    let link = read_paren_name(sc)?;
                     asg.inp.push(AsgInp { index, link });
                 } else if kw.is_empty() {
-                    chars.next(); // skip unknown char
+                    sc.next(); // skip unknown char
                 }
                 // Unknown alphanumeric keywords inside an ASG body are
                 // skipped (forward-compat); the next loop iteration
                 // resumes from the following token.
             }
-            None => return Err(CaError::Protocol("ACF: unterminated ASG".into())),
+            None => return Err(sc.reject_at(opened, "unterminated ASG")),
         }
     }
 
@@ -2470,10 +2637,10 @@ fn parse_inp_index(suffix: &str) -> Option<u8> {
     }
 }
 
-fn parse_rule(chars: &mut std::iter::Peekable<std::str::Chars>) -> CaResult<AccessRule> {
-    skip_ws_comments(chars);
-    if chars.next() != Some('(') {
-        return Err(CaError::Protocol("ACF: expected '(' after RULE".into()));
+fn parse_rule(sc: &mut AcfScanner) -> CaResult<AccessRule> {
+    sc.skip_ws_comments();
+    if sc.next() != Some('(') {
+        return Err(sc.reject("expected '(' after RULE"));
     }
 
     // Read level. C `asLib.y:253-258` requires `tokenINT64` and
@@ -2481,35 +2648,35 @@ fn parse_rule(chars: &mut std::iter::Peekable<std::str::Chars>) -> CaResult<Acce
     // fails the whole ACF load (a fail-safe abort). Accept an optional
     // leading sign so a `RULE(-1, ...)` is detected and rejected
     // rather than silently re-read as level 1.
-    skip_ws_comments(chars);
+    sc.skip_ws_comments();
     let mut level_str = String::new();
-    if matches!(chars.peek(), Some('+') | Some('-')) {
-        level_str.push(chars.next().unwrap());
+    if matches!(sc.peek(), Some('+') | Some('-')) {
+        level_str.push(sc.next().unwrap());
     }
-    while let Some(&c) = chars.peek() {
+    while let Some(c) = sc.peek() {
         if c.is_ascii_digit() {
             level_str.push(c);
-            chars.next();
+            sc.next();
         } else {
             break;
         }
     }
-    let level_num: i64 = level_str.parse().map_err(|_| {
-        CaError::Protocol(format!(
-            "ACF: RULE level must be an integer, got '{level_str}'"
-        ))
-    })?;
+    let level_num: i64 = match level_str.parse() {
+        Ok(n) => n,
+        Err(_) => {
+            let got = sc.offending(&level_str);
+            return Err(sc.reject(format!("RULE level must be an integer, got '{got}'")));
+        }
+    };
     if level_num < 0 {
-        return Err(CaError::Protocol(format!(
-            "ACF: RULE LEVEL must be positive: {level_num}"
-        )));
+        return Err(sc.reject(format!("RULE LEVEL must be positive: {level_num}")));
     }
     let level: u8 = u8::try_from(level_num)
-        .map_err(|_| CaError::Protocol(format!("ACF: RULE level out of range: {level_num}")))?;
+        .map_err(|_| sc.reject(format!("RULE level out of range: {level_num}")))?;
 
-    skip_ws_comments(chars);
-    if chars.peek() == Some(&',') {
-        chars.next();
+    sc.skip_ws_comments();
+    if sc.peek() == Some(',') {
+        sc.next();
     }
 
     // Read access keyword. C `asLib.y:259-264` matches `NONE`/`READ`/
@@ -2520,9 +2687,9 @@ fn parse_rule(chars: &mut std::iter::Peekable<std::str::Chars>) -> CaResult<Acce
     // must not build an active Write rule. We keep the rule but mark it
     // `ignore` (inert) so any unsupported keyword fails CLOSED — the
     // same effect as C dropping the rule.
-    skip_ws_comments(chars);
+    sc.skip_ws_comments();
     let mut access_str = String::new();
-    read_word(chars, &mut access_str);
+    read_word(sc, &mut access_str);
     let (access, mut ignore) = if access_str == "WRITE" {
         (RuleAccess::Write, false)
     } else if access_str == "READ" {
@@ -2530,9 +2697,14 @@ fn parse_rule(chars: &mut std::iter::Peekable<std::str::Chars>) -> CaResult<Acce
     } else if access_str == "NONE" {
         (RuleAccess::None, false)
     } else {
+        // `offending` and not `access_str`: `read_word` stops before the
+        // character it cannot take, so on `RULE(1, %)` the buffer is empty
+        // and the warning would name a keyword the operator never wrote.
+        let keyword = sc.offending(&access_str);
         tracing::warn!(
             target: "epics_base_rs::access_security",
-            keyword = %access_str,
+            line = sc.line,
+            keyword = %keyword,
             "ACF: ignoring RULE with unsupported access keyword"
         );
         (RuleAccess::None, true)
@@ -2549,24 +2721,25 @@ fn parse_rule(chars: &mut std::iter::Peekable<std::str::Chars>) -> CaResult<Acce
     // put-logging listener that would consume it is a separate
     // subsystem not present in this crate (see the UNFIXED note).
     let mut trap = false;
-    skip_ws_comments(chars);
-    if chars.peek() == Some(&',') {
-        chars.next();
-        skip_ws_comments(chars);
+    sc.skip_ws_comments();
+    if sc.peek() == Some(',') {
+        sc.next();
+        sc.skip_ws_comments();
         let mut log_opt = String::new();
-        read_word(chars, &mut log_opt);
+        read_word(sc, &mut log_opt);
         if log_opt == "TRAPWRITE" {
             trap = true;
         } else if log_opt != "NOTRAPWRITE" {
-            return Err(CaError::Protocol(format!(
-                "ACF: RULE log option must be TRAPWRITE or NOTRAPWRITE, got '{log_opt}'"
+            let got = sc.offending(&log_opt);
+            return Err(sc.reject(format!(
+                "RULE log option must be TRAPWRITE or NOTRAPWRITE, got '{got}'"
             )));
         }
     }
 
-    skip_ws_comments(chars);
-    if chars.peek() == Some(&')') {
-        chars.next();
+    sc.skip_ws_comments();
+    if sc.peek() == Some(')') {
+        sc.next();
     }
 
     // Optional body with UAG/HAG/METHOD/AUTHORITY/CALC.
@@ -2574,44 +2747,48 @@ fn parse_rule(chars: &mut std::iter::Peekable<std::str::Chars>) -> CaResult<Acce
     let mut hag = Vec::new();
     let mut method = Vec::new();
     let mut authority = Vec::new();
-    let mut calc: Option<String> = None;
+    // The CALC clause travels with the line it was written on: the two
+    // rejections below name the expression, and a rule body can close many
+    // lines after the `CALC(...)` that is wrong.
+    let mut calc: Option<(u32, String)> = None;
 
-    skip_ws_comments(chars);
-    if chars.peek() == Some(&'{') {
-        chars.next();
+    sc.skip_ws_comments();
+    if sc.peek() == Some('{') {
+        sc.next();
         loop {
-            skip_ws_comments(chars);
-            match chars.peek() {
-                Some(&'}') => {
-                    chars.next();
+            sc.skip_ws_comments();
+            match sc.peek() {
+                Some('}') => {
+                    sc.next();
                     break;
                 }
                 Some(_) => {
                     let mut kw = String::new();
-                    read_word(chars, &mut kw);
+                    read_word(sc, &mut kw);
                     if kw == "UAG" {
-                        let name = read_paren_name(chars)?;
+                        let name = read_paren_name(sc)?;
                         uag.push(name);
                     } else if kw == "HAG" {
-                        let name = read_paren_name(chars)?;
+                        let name = read_paren_name(sc)?;
                         hag.push(name);
                     } else if kw == "METHOD" {
                         // PR #563: METHOD("ca", "x509", ...)
-                        method.extend(read_paren_string_list(chars)?);
+                        method.extend(read_paren_string_list(sc)?);
                     } else if kw == "AUTHORITY" {
                         // PR #563/#618: AUTHORITY("CA Issuer", ...)
-                        authority.extend(read_paren_string_list(chars)?);
+                        authority.extend(read_paren_string_list(sc)?);
                     } else if kw == "CALC" {
                         // `CALC("<expr>")` — C `asLib.y:294-299`.
                         // The expression gates the rule against the
                         // ASG's INP* link values. Take the *last*
                         // CALC clause if several are given (matches
                         // C `asAsgRuleCalc` last-wins overwrite).
-                        let expr = read_paren_name_raw(chars)?;
-                        calc = Some(expr);
+                        let at = sc.line;
+                        let expr = read_paren_name_raw(sc)?;
+                        calc = Some((at, expr));
                     } else if kw.is_empty() {
                         // Unknown punctuation — advance to avoid infinite loop.
-                        chars.next();
+                        sc.next();
                     } else {
                         // C `asLib.y:300-306`: a RULE body with
                         // an unsupported keyword is *disabled* by
@@ -2620,13 +2797,14 @@ fn parse_rule(chars: &mut std::iter::Peekable<std::str::Chars>) -> CaResult<Acce
                         // present so parsing recovers.
                         tracing::warn!(
                             target: "epics_base_rs::access_security",
+                            line = sc.line,
                             keyword = %kw,
                             "ACF: ignoring RULE with unsupported keyword — rule disabled"
                         );
                         ignore = true;
-                        skip_ws_comments(chars);
-                        if chars.peek() == Some(&'(') {
-                            let _ = read_paren_name(chars)?;
+                        sc.skip_ws_comments();
+                        if sc.peek() == Some('(') {
+                            let _ = read_paren_name(sc)?;
                         }
                     }
                 }
@@ -2655,10 +2833,9 @@ fn parse_rule(chars: &mut std::iter::Peekable<std::str::Chars>) -> CaResult<Acce
     // hard-disabling the rule.
     let mut inp_used: u32 = 0;
     let calc_compiled = match calc {
-        Some(ref expr) => {
-            let compiled = crate::calc::compile(expr).map_err(|e| {
-                CaError::Protocol(format!("ACF: bad CALC expression '{expr}': {e}"))
-            })?;
+        Some((at, ref expr)) => {
+            let compiled = crate::calc::compile(expr)
+                .map_err(|e| sc.reject_at(at, format!("bad CALC expression '{expr}': {e}")))?;
             // C `asAsgRuleCalc` (`asLibRoutines.c:1416-1425`) runs
             // `calcArgUsage` right after `postfix()` and refuses the rule when
             // the expression stores into an argument:
@@ -2677,9 +2854,10 @@ fn parse_rule(chars: &mut std::iter::Peekable<std::str::Chars>) -> CaResult<Acce
             // to everyone in the group.
             let (used, stores) = compiled.arg_usage();
             if stores != 0 {
-                return Err(CaError::Protocol(format!(
-                    "ACF: assignment operator used in CALC expression '{expr}'"
-                )));
+                return Err(sc.reject_at(
+                    at,
+                    format!("assignment operator used in CALC expression '{expr}'"),
+                ));
             }
             inp_used = used;
             Some(compiled)
@@ -2695,7 +2873,7 @@ fn parse_rule(chars: &mut std::iter::Peekable<std::str::Chars>) -> CaResult<Acce
         method,
         authority,
         trap,
-        calc,
+        calc: calc.map(|(_, expr)| expr),
         calc_compiled,
         inp_used,
         ignore,
@@ -2707,37 +2885,36 @@ fn parse_rule(chars: &mut std::iter::Peekable<std::str::Chars>) -> CaResult<Acce
 /// spaces that `read_paren_name` would mangle (it strips whitespace).
 /// Accepts `( "expr" )` or `( expr )`; whitespace around the parens is
 /// skipped, whitespace *inside* a quoted body is preserved.
-fn read_paren_name_raw(chars: &mut std::iter::Peekable<std::str::Chars>) -> CaResult<String> {
-    skip_ws_comments(chars);
-    if chars.next() != Some('(') {
-        return Err(CaError::Protocol("ACF: expected '(' after CALC".into()));
+fn read_paren_name_raw(sc: &mut AcfScanner) -> CaResult<String> {
+    sc.skip_ws_comments();
+    if sc.next() != Some('(') {
+        return Err(sc.reject("expected '(' after CALC"));
     }
-    skip_ws_comments(chars);
+    let opened = sc.line;
+    sc.skip_ws_comments();
     let mut body = String::new();
-    if chars.peek() == Some(&'"') {
-        chars.next();
-        while let Some(&c) = chars.peek() {
-            chars.next();
+    if sc.peek() == Some('"') {
+        sc.next();
+        while let Some(c) = sc.peek() {
+            sc.next();
             if c == '"' {
                 break;
             }
             body.push(c);
         }
-        skip_ws_comments(chars);
-        if chars.next() != Some(')') {
-            return Err(CaError::Protocol(
-                "ACF: expected ')' after CALC expression".into(),
-            ));
+        sc.skip_ws_comments();
+        if sc.next() != Some(')') {
+            return Err(sc.reject_at(opened, "expected ')' after CALC expression"));
         }
     } else {
         // Unquoted form — read until the closing paren.
-        while let Some(&c) = chars.peek() {
+        while let Some(c) = sc.peek() {
             if c == ')' {
-                chars.next();
+                sc.next();
                 break;
             }
             body.push(c);
-            chars.next();
+            sc.next();
         }
     }
     Ok(body.trim().to_string())
@@ -2748,44 +2925,39 @@ fn read_paren_name_raw(chars: &mut std::iter::Peekable<std::str::Chars>) -> CaRe
 /// rule clauses (epics-base PR #563/#618). Whitespace inside an
 /// unquoted item is preserved verbatim *between* word characters but
 /// trimmed at the boundaries; the typical caller passes quoted strings.
-fn read_paren_string_list(
-    chars: &mut std::iter::Peekable<std::str::Chars>,
-) -> CaResult<Vec<String>> {
-    skip_ws_comments(chars);
-    if chars.next() != Some('(') {
-        return Err(CaError::Protocol(
-            "ACF: expected '(' after METHOD/AUTHORITY".into(),
-        ));
+fn read_paren_string_list(sc: &mut AcfScanner) -> CaResult<Vec<String>> {
+    sc.skip_ws_comments();
+    if sc.next() != Some('(') {
+        return Err(sc.reject("expected '(' after METHOD/AUTHORITY"));
     }
+    let opened = sc.line;
     let mut items = Vec::new();
     let mut current = String::new();
     let mut in_quotes = false;
     loop {
-        match chars.peek() {
-            Some(&'"') => {
-                chars.next();
+        match sc.peek() {
+            Some('"') => {
+                sc.next();
                 in_quotes = !in_quotes;
             }
-            Some(&')') if !in_quotes => {
-                chars.next();
+            Some(')') if !in_quotes => {
+                sc.next();
                 break;
             }
-            Some(&',') if !in_quotes => {
-                chars.next();
+            Some(',') if !in_quotes => {
+                sc.next();
                 let trimmed = current.trim().to_string();
                 if !trimmed.is_empty() {
                     items.push(trimmed);
                 }
                 current.clear();
             }
-            Some(&c) => {
+            Some(c) => {
                 current.push(c);
-                chars.next();
+                sc.next();
             }
             None => {
-                return Err(CaError::Protocol(
-                    "ACF: unterminated METHOD/AUTHORITY list".into(),
-                ));
+                return Err(sc.reject_at(opened, "unterminated METHOD/AUTHORITY list"));
             }
         }
     }
@@ -3289,6 +3461,124 @@ ASG(MIXED_CASE) {
             config.check_access("DEFAULT", "host", "alice"),
             AccessLevel::NoAccess
         );
+    }
+
+    /// A diagnostic that quotes a token must quote the operator's text.
+    ///
+    /// Every capture in this parser comes from a "consume while it matches"
+    /// loop, which stops BEFORE the character that broke it — so its buffer
+    /// holds what was accepted, which is empty exactly when the input was
+    /// rejected. Quoting the buffer reported `got ''` and sent the reader
+    /// looking for an empty token that is not in their file.
+    ///
+    /// The boundary is whether the loop accepted anything at all, so both
+    /// sides of it are here: a run the loop refused outright, a run it
+    /// accepted in full, and a run it accepted a prefix of.
+    #[test]
+    fn a_rejected_token_is_quoted_as_the_operator_wrote_it() {
+        for (acf, got) in [
+            // Accepted nothing.
+            ("ASG(G) { RULE(abc, READ) }", "abc"),
+            // Accepted the sign, then nothing.
+            ("ASG(G) { RULE(-abc, READ) }", "-abc"),
+            // Accepted nothing; the token is pure punctuation.
+            ("ASG(G) { RULE(1, READ, %%%) }", "%%%"),
+            // Accepted the whole word — unchanged by the fix.
+            ("ASG(G) { RULE(1, READ, trapwrite) }", "trapwrite"),
+            // Accepted a prefix, then hit a character it could not take.
+            ("ASG(G) { RULE(1, READ, TRAP%WRITE) }", "TRAP%WRITE"),
+        ] {
+            let e = parse_acf(acf).unwrap_err().to_string();
+            assert!(
+                e.contains(&format!("got '{got}'")),
+                "expected got '{got}', of {acf:?}, got {e:?}"
+            );
+        }
+
+        // A pathological run does not put the whole file on the console.
+        let long = "z".repeat(4096);
+        let e = parse_acf(&format!("ASG(G) {{ RULE({long}, READ) }}"))
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains('…') && e.len() < 200, "uncapped quote: {e:?}");
+    }
+
+    /// Every rejection out of the ACF parser names the line it belongs to.
+    ///
+    /// Site ACFs run to hundreds of lines, and a bare "whitespace inside
+    /// parenthesised name" gives an operator nothing to open the editor on.
+    /// The number is the port's own addition; C has one too but spells the
+    /// sentence far less specifically, so the wording here stays.
+    ///
+    /// The cases are the two boundaries the number has, not a tour of the
+    /// grammar: a complaint about the token under the cursor takes the
+    /// CURRENT line, and a complaint about a construct that opened earlier
+    /// takes the line it OPENED on. The second is the one worth pinning —
+    /// a `{` left unclosed on line 3 is only discovered at EOF, and naming
+    /// EOF sends the operator to the wrong end of the file.
+    #[test]
+    fn every_parse_rejection_names_its_line() {
+        // Boundary 1: the offending token is under the cursor.
+        for (acf, line, needle) in [
+            (
+                "UAG(a) { x }\n\nUAG(my group) { b }\n",
+                3,
+                "whitespace inside",
+            ),
+            ("ASG(G) {\n  RULE(-1, READ)\n}\n", 2, "must be positive"),
+            (
+                "ASG(G) {\n  RULE(1, READ, BOGUS)\n}\n",
+                2,
+                "TRAPWRITE or NOTRAPWRITE",
+            ),
+            ("UAG(a) { x }\n}\n", 2, "top-level block keyword"),
+        ] {
+            let e = parse_acf(acf).unwrap_err().to_string();
+            assert!(
+                e.contains(&format!("ACF line {line}:")) && e.contains(needle),
+                "expected line {line} and {needle:?}, got {e:?}"
+            );
+        }
+
+        // Boundary 2: the construct opened earlier and the parser only found
+        // out at EOF. Each of these puts five blank lines between the opening
+        // token and the end of the file, so naming the cursor's line would
+        // report 7 where the operator needs 1.
+        let tail = "\n\n\n\n\n";
+        for (acf, line, needle) in [
+            (format!("UAG(a{tail}"), 1, "missing ')'"),
+            (format!("UAG(\"abc{tail}"), 1, "unterminated quoted name"),
+            (format!("UAG(a) {{ x{tail}"), 1, "unterminated '{'"),
+            (
+                format!("UAG(a) {{ \"unterminated{tail}"),
+                1,
+                "unterminated quoted string",
+            ),
+            (
+                format!("ASG(G) {{ INPA(\"g\"){tail}"),
+                1,
+                "unterminated ASG",
+            ),
+            (format!("BOGUS{tail}"), 1, "unexpected token 'BOGUS'"),
+            (
+                // The CALC is on line 3; the rule body closes on line 4 and
+                // the ASG on line 5.
+                "ASG(G) {\n  RULE(1, WRITE) {\n    CALC(\"A:=1;1\")\n  }\n}\n".to_string(),
+                3,
+                "assignment operator",
+            ),
+            (
+                "ASG(G) {\n  RULE(1, WRITE) {\n    CALC(\"A+\")\n  }\n}\n".to_string(),
+                3,
+                "bad CALC expression",
+            ),
+        ] {
+            let e = parse_acf(&acf).unwrap_err().to_string();
+            assert!(
+                e.contains(&format!("ACF line {line}:")) && e.contains(needle),
+                "expected line {line} and {needle:?}, got {e:?}"
+            );
+        }
     }
 
     /// an empty ACF file, or one with only comments / only
@@ -3917,5 +4207,58 @@ ASG(G) {
                 (TrapWriteOp::AfterWrite, Some("superseded".to_string())),
             ]
         );
+    }
+}
+
+#[cfg(test)]
+mod as_ca_task_tests {
+    use super::*;
+
+    /// C only has an `asCaTask` between `asCaStart` and `asCaStop`, and
+    /// nothing but `asInitCommon` calls either (`asDbLib.c:147`, `:136`), so
+    /// `taskwdShow` on a softIoc with no access-security file lists 15 threads
+    /// and none of them is `asCaTask`. The port welds the watcher to the cell
+    /// so a policy loaded later cannot find it missing, which left the row
+    /// standing on an IOC that has no policy at all.
+    ///
+    /// Both transitions are asserted, not just the initial absence: an
+    /// absence-only test would also pass if the entry were simply never taken.
+    #[epics_macros_rs::epics_test]
+    async fn the_as_ca_task_row_tracks_the_loaded_policy() {
+        fn table() -> String {
+            let out = std::cell::RefCell::new(String::new());
+            crate::runtime::taskwd::taskwd_show(1, &|line| {
+                out.borrow_mut().push_str(line);
+                out.borrow_mut().push('\n');
+            });
+            out.into_inner()
+        }
+        async fn wait_until(want: bool) {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            while table().contains("asCaTask") != want {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "`asCaTask` never became {}:\n{}",
+                    if want { "present" } else { "absent" },
+                    table()
+                );
+                crate::runtime::task::sleep_background(std::time::Duration::from_millis(10)).await;
+            }
+        }
+
+        let db = std::sync::Arc::new(crate::server::database::PvDatabase::new());
+        let cell = new_acf_cell_watching(None, &db);
+        assert!(
+            !table().contains("asCaTask"),
+            "a cell built with no policy registered the access-security task"
+        );
+
+        cell.store(Some(std::sync::Arc::new(
+            parse_acf("ASG(DEFAULT) { RULE(1, READ) }").expect("minimal ACF"),
+        )));
+        wait_until(true).await;
+
+        cell.store(None);
+        wait_until(false).await;
     }
 }

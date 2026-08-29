@@ -88,7 +88,7 @@ pub struct ScalcoutRecord {
     /// LALM — C `sCalcoutRecord.dbd:858` `field(LALM,DBF_DOUBLE)`,
     /// `special(SPC_NOMOD)`.
     ///
-    /// The level `checkAlarms` last alarmed at (`sCalcoutRecord.c:699-751`),
+    /// The level `checkAlarms` last alarmed at (`sCalcoutRecord.c:699-752`),
     /// which is what makes HYST a per-level hysteresis rather than a plain
     /// deadband. Written only by the framework's analog ladder — the single
     /// owner of the ten-field alarm surface this record shares with
@@ -121,7 +121,7 @@ pub struct ScalcoutRecord {
     /// This cycle's `fetch_values()` outcome, pushed by the framework through
     /// `set_fetch_gate_failed`. C `sCalcoutRecord.c::process` (356) runs
     /// `sCalcPerform` only `if (fetch_values(pcalc)==0)`, and `fetch_values`
-    /// (885-887) returns at the first failing numeric `dbGetLink`.
+    /// (884-888) returns at the first failing numeric `dbGetLink`.
     fetch_gate_failed: bool,
     /// Output decision from the last `process()`. The framework's
     /// generic multi-output dispatch reads `multi_output_links()`
@@ -145,9 +145,20 @@ pub struct ScalcoutRecord {
     /// the numeric software event (`post_event((int)oevt)`); see
     /// [`Record::output_event`].
     oevt: u16,
+    /// Resolved OUT target, cached before `process()` by
+    /// [`ProcessAction::ResolveOutTarget`]. C caches the OUT link's class
+    /// outside the put too (`checkLinks`, `sCalcoutRecord.c:1020-1040`), and
+    /// `write_scalcout` reads `plink->type` to pick sync vs async
+    /// (`devsCalcoutSoft.c:78`). The record needs the answer BEFORE it issues
+    /// anything, because the same test decides whether PACT is held.
+    out_target: OutTarget,
+    /// True between issuing a `WAIT` put-callback and its completion — C's
+    /// `pact == TRUE` with `dlya == 0`, the state `sCalcoutRecord.c:438`
+    /// calls "we must have been called by asynchronous device support".
+    awaiting_out: bool,
     /// `INAV..INLV` / `IAAV..ILLV` / `OUTV` — the per-link connection status C
-    /// derives in `init_record` (`sCalcoutRecord.c:254-287`) and re-derives in
-    /// `special()` on any INPx/INxx/OUT put (`:495-569`). Written only by
+    /// derives in `init_record` (`sCalcoutRecord.c:254-288`) and re-derives in
+    /// `special()` on any INPx/INxx/OUT put (`:508-569`). Written only by
     /// [`Self::refresh_link_status`] (through `post_fields`), never by a
     /// client: the fields are `special(SPC_NOMOD)`.
     in_status: [i16; 12],
@@ -204,6 +215,8 @@ impl Default for ScalcoutRecord {
             dlya: 0,
             pending_output: false,
             oevt: 0,
+            out_target: OutTarget::UNRESOLVED,
+            awaiting_out: false,
         }
     }
 }
@@ -264,6 +277,47 @@ impl ScalcoutRecord {
         self.sval = PvString::from_bytes(result.sval.as_bytes());
     }
 
+    /// C `devsCalcoutSoft.c::write_scalcout` (66-108): the OUT put goes out
+    /// as a put-WITH-COMPLETION, and the record holds PACT until it lands,
+    /// when — and only when — the link is a `CA_LINK` and `WAIT` is set
+    /// (`:78`). Every other combination takes the synchronous `dbPutLink`
+    /// arm (`:110-141`), which is the framework's generic `multi_output_links`
+    /// dispatch and is left exactly as it was.
+    ///
+    /// Returns `Some(outcome)` when the cycle went asynchronous. The
+    /// `AsyncPending` result is what suppresses this cycle's generic OUT
+    /// write, alarm commit, timestamp, monitors and FLNK — C returns at
+    /// `sCalcoutRecord.c:416` before `monitor()` for the same reason — while
+    /// still running the [`ProcessAction::WriteDbLinkNotify`] that carries the
+    /// put. The completion re-enters `process()`, which takes the
+    /// `awaiting_out` arm above and runs that tail once.
+    ///
+    /// The buffer is chosen by the SAME switch the synchronous path uses
+    /// ([`Record::multi_output_buffer`]), so `WAIT` changes when the value is
+    /// delivered and never what is delivered.
+    ///
+    /// `WAIT` on a non-CA link is inert here, which is C: `init_record`
+    /// (`sCalcoutRecord.c:275-277`), `special` (`:552-554`) and `checkLinks`
+    /// (`:1034-1036`) each print "Can't wait with non-CA link attribute" and
+    /// leave the put synchronous.
+    fn issue_wait_put(&mut self) -> Option<ProcessOutcome> {
+        if !self.cached_should_output || self.wait == 0 || !self.out_target.is_ca_link {
+            return None;
+        }
+        let target = self.out_target;
+        let value = self.multi_output_buffer("OUT", EpicsValue::Double(self.oval), &target);
+        self.awaiting_out = true;
+        Some(ProcessOutcome {
+            result: RecordProcessResult::AsyncPending,
+            actions: vec![ProcessAction::WriteDbLinkNotify {
+                link_field: "OUT",
+                value,
+            }],
+            device_did_compute: false,
+            post_write_fields: Vec::new(),
+        })
+    }
+
     /// C `sCalcoutRecord.c::execOutput` (755-777), the "Determine output data"
     /// half: the DOPT switch that fills OVAL/OSV.
     ///
@@ -317,7 +371,7 @@ impl ScalcoutRecord {
         self.apply_stores(&inputs);
     }
 
-    /// C `sCalcoutRecord.c:374-395` — the OOPT switch. "On Change" is the
+    /// C `sCalcoutRecord.c:374-396` — the OOPT switch. "On Change" is the
     /// numeric MDEL-deadband test `fabs(pcalc->pval - pcalc->val) > pcalc->mdel`
     /// (:379) and nothing else: SVAL does not take part, so a cycle that changed
     /// only the string result does NOT drive OUT on C, and a numeric change
@@ -363,7 +417,7 @@ impl ScalcoutRecord {
         self.compiled_calc = compiled.program;
     }
 
-    /// C `sCalcoutRecord.c::special:474-482` — same, into ORPC/OCLV.
+    /// C `sCalcoutRecord.c::special:474-481` — same, into ORPC/OCLV.
     fn recompile_ocal(&mut self) {
         let compiled = calc_compile::scalc_postfix("scalcout", "OCAL", &self.ocal);
         self.oclv = compiled.status;
@@ -411,7 +465,7 @@ impl ScalcoutRecord {
     /// `special(SPC_NOMOD)`).
     ///
     /// Each is DERIVED from its link, never client-set: C `init_record`
-    /// (`sCalcoutRecord.c`, same shape as `aCalcoutRecord.c:208-242`) stores
+    /// (`sCalcoutRecord.c`, same shape as `aCalcoutRecord.c:209-243`) stores
     /// `scalcoutINAV_CON` (=3) for every CONSTANT link, and a default record
     /// has all links constant. Like the sibling `acalcout` record this port
     /// classifies the status STATICALLY (no live re-derivation on a link
@@ -424,8 +478,8 @@ impl ScalcoutRecord {
     }
 
     /// Classify all 25 links and publish INAV..INLV / IAAV..ILLV / OUTV,
-    /// mirroring C `sCalcoutRecord.c::init_record` (254-287) and the
-    /// `special()` re-classification (495-569). No-op without an async context.
+    /// mirroring C `sCalcoutRecord.c::init_record` (254-288) and the
+    /// `special()` re-classification (508-569). No-op without an async context.
     fn refresh_link_status(&self) {
         let mut links: Vec<(&'static str, String, LinkRole)> = Vec::with_capacity(25);
         for i in 0..12 {
@@ -441,7 +495,13 @@ impl ScalcoutRecord {
             ));
         }
         links.push(("OUTV", self.out.clone(), LinkRole::Output));
-        post_link_status(self.async_ctx.as_ref(), &self.link_gen, links);
+        // C `sCalcoutRecord.c:287`, `:569`, `:1015`, `:1045`.
+        post_link_status(
+            self.async_ctx.as_ref(),
+            &self.link_gen,
+            links,
+            crate::server::recgbl::EventMask::VALUE,
+        );
     }
 }
 
@@ -519,8 +579,8 @@ impl Record for ScalcoutRecord {
         self.get_field(name).is_some()
     }
 
-    /// C `scalcoutRecord.c::init_record` compiles CALC/OCAL into RPCL/ORPC and
-    /// stores the postfix status in CLCV/OCLV (sCalcoutRecord.c:245-261) —
+    /// C `sCalcoutRecord.c::init_record` compiles CALC/OCAL into RPCL/ORPC and
+    /// stores the postfix status in CLCV/OCLV (sCalcoutRecord.c:290-304) —
     /// the load-time half of the compile owner. A put goes through
     /// `special()` instead; `put_field` only stores the string, as C's dbPut
     /// does.
@@ -532,7 +592,7 @@ impl Record for ScalcoutRecord {
         Ok(())
     }
 
-    /// C `sCalcoutRecord.c::special:462-482` — a put to CALC/OCAL recompiles
+    /// C `sCalcoutRecord.c::special:462-481` — a put to CALC/OCAL recompiles
     /// into RPCL/ORPC, stores `sCalcPostfix()`'s return status in CLCV/OCLV,
     /// posts DBE_VALUE for it, and returns 0: the put is ACCEPTED even for a
     /// garbage expression (unlike calcRecord, which refuses it — R8-1).
@@ -558,7 +618,7 @@ impl Record for ScalcoutRecord {
 
     fn set_async_context(&mut self, name: String, db: AsyncDbHandle) {
         self.async_ctx = Some((name, db));
-        // C `init_record` (sCalcoutRecord.c:254-287) classifies all 25 links
+        // C `init_record` (sCalcoutRecord.c:254-288) classifies all 25 links
         // before any process. Every one of them is a scalcout-owned field
         // (OUT included), already applied when `add_record` runs.
         self.refresh_link_status();
@@ -622,17 +682,38 @@ impl Record for ScalcoutRecord {
         // and the DOPT switch is its first half (`:757-777`), so OVAL/OSV are
         // computed now, from the A..L / AA..LL present at expiry. Mirrors
         // calcout.rs.
+        // WAIT completion re-entry: the OUT put-callback this record issued
+        // has fired. C `sCalcoutRecord.c:437-439` — `pact == TRUE` with
+        // `dlya == 0` is "called by asynchronous device support", whose
+        // `writeValue` returns immediately (`devsCalcoutSoft.c:76`,
+        // `if (pscalcout->pact) return 0`) and falls through to the shared
+        // `monitor()` / `recGblFwdLink()` / `pact = FALSE` tail at `:441-443`.
+        // No input fetch, no CALC pass and no second OUT write: clearing
+        // `cached_should_output` is what keeps `multi_output_links()` empty so
+        // the generic dispatch cannot re-issue the put that just completed.
+        if self.awaiting_out {
+            self.awaiting_out = false;
+            self.cached_should_output = false;
+            self.sync_psvl();
+            return Ok(ProcessOutcome::complete());
+        }
+
         if self.dlya == 1 {
             self.dlya = 0;
             self.cached_should_output = self.pending_output;
             self.pending_output = false;
             self.exec_output_data();
             self.sync_psvl();
+            // C `:429-431` — the delayed `execOutput` reaches the same
+            // `writeValue`, so the continuation can itself go async.
+            if let Some(outcome) = self.issue_wait_put() {
+                return Ok(outcome);
+            }
             return Ok(ProcessOutcome::complete());
         }
 
-        // C `sCalcoutRecord.c::process` (356-367) runs the calc only
-        // `if (fetch_values(pcalc)==0)`, and its `fetch_values` (885-887)
+        // C `sCalcoutRecord.c::process` (356-368) runs the calc only
+        // `if (fetch_values(pcalc)==0)`, and its `fetch_values` (884-888)
         // returns at the FIRST failing numeric `dbGetLink`. A failed input link
         // therefore freezes VAL/SVAL/UDF and raises no CALC_ALARM; the OOPT
         // switch, ODLY and the output below still run against the frozen VAL,
@@ -745,6 +826,7 @@ impl Record for ScalcoutRecord {
                 )]),
                 actions: vec![ProcessAction::ReprocessAfter(delay)],
                 device_did_compute: false,
+                post_write_fields: Vec::new(),
             });
         }
 
@@ -756,6 +838,9 @@ impl Record for ScalcoutRecord {
             self.exec_output_data();
         }
         self.sync_psvl();
+        if let Some(outcome) = self.issue_wait_put() {
+            return Ok(outcome);
+        }
         Ok(ProcessOutcome::complete())
     }
 
@@ -1043,7 +1128,7 @@ impl Record for ScalcoutRecord {
         crate::server::record::seed_input_links(self.multi_input_links())
     }
 
-    /// C `sCalcoutRecord.c::special` (512-517) — same re-seed as calcout, under
+    /// C `sCalcoutRecord.c::special` (513-518) — same re-seed as calcout, under
     /// C's `if (fieldIndex <= scalcoutRecordINPL)` guard: only the NUMERIC
     /// inputs A..L are re-loaded (`INAA..INLL` still get `INAV = CON`, which the
     /// link-status refresh below covers, but no constant re-load). The port's
@@ -1151,8 +1236,30 @@ impl Record for ScalcoutRecord {
     /// condition-not-met cycle does not write the OUT link. Previously
     /// `OUT` was stored but never written — the scalcout output side
     /// was a dead feature.
+    /// Ask the framework to resolve the OUT link's target class before this
+    /// cycle's `process()`. C caches it outside the put — `checkLinks`
+    /// (`sCalcoutRecord.c:1020-1040`) — because `write_scalcout` must know
+    /// `plink->type` to choose sync vs async (`devsCalcoutSoft.c:78`), and
+    /// that choice decides whether PACT is held. Resolving from inside the
+    /// framework's put path would be too late: the record would have to
+    /// commit the cycle first and learn afterwards that it should have waited.
+    fn pre_process_actions(&mut self) -> Vec<ProcessAction> {
+        vec![ProcessAction::ResolveOutTarget { link_field: "OUT" }]
+    }
+
+    fn set_resolved_out_target(&mut self, link_field: &str, target: OutTarget) {
+        if link_field == "OUT" {
+            self.out_target = target;
+        }
+    }
+
     fn multi_output_links(&self) -> &[(&'static str, &'static str)] {
-        if self.cached_should_output {
+        // `awaiting_out` is the second gate, and it is what makes a double
+        // write structurally impossible rather than merely unlikely: while
+        // this record's own put-callback is in flight, the generic dispatch
+        // has no OUT pair to write. `cached_should_output` keeps its single
+        // meaning (the OOPT decision) so OEVT and the IVOA gate are unaffected.
+        if self.cached_should_output && !self.awaiting_out {
             &[("OUT", "OVAL")]
         } else {
             &[]
@@ -1949,9 +2056,10 @@ mod tests {
         );
     }
 
-    /// A disconnected CA target reports no type (`dbCaGetLinkDBFtype` → -1,
-    /// `dbCa.c:695-704`), which in C leaves the `default:` arm — `DBR_DOUBLE`
-    /// from OVAL.
+    /// A disconnected CA target reports no type (`dbCaGetLinkDBFtype` → -1:
+    /// `getDBFtype` is `dbCa.c:666-675` and its `-1` comes from the
+    /// `pcaGetCheck` disconnected refusal at `:628-631`), which in C leaves
+    /// the `default:` arm — `DBR_DOUBLE` from OVAL.
     #[test]
     fn r14_61_disconnected_ca_target_gets_oval() {
         let rec = three_buffer_scalcout();

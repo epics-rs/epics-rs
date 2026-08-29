@@ -177,9 +177,12 @@ here are exactly the fat-dbd types whose rset supplies get_precision while NULLi
 get_graphic_double (bo/mbbiDirect/mbboDirect in base; busy/asyn/transform/sseq in the
 modules). The port declines to reproduce the drop -- nt::qsrv_marks::property_leaves
 gates display.precision on its own DBR_PRECISION slot -- so the port's pvxget reply
-carries a display.precision leaf (bo.HIGH = 2 = boHIGHprecision; the rest = 0, the
-recGblGetPrec default) that pvxs omits. The value the port serves is the same one CA
-serves, so this is PVA-vs-CA consistency, not a new number.
+carries a display.precision leaf that pvxs omits. Four of the seven types answer a
+LITERAL on one field -- bo.HIGH = 2 (boHIGHprecision, boRecord.c:85),
+busy.HIGH = 2 (busyRecord.c:281), transform.VERS = 2 (transformRecord.c:759),
+asyn.TMOT = 4 (asynRecord.c:998) -- and every other field of every type takes the
+recGblGetPrec default of 0. The value the port serves is the same one CA serves, so
+this is PVA-vs-CA consistency, not a new number.
 
 The same add shows on the monitor SEED (the initial full update carries the same
 getProperties leaves), so the row covers both surfaces: value_marking (read) and
@@ -304,15 +307,18 @@ port serves the same menu minus that one instrument-only choice.
 """
 
 # --------------------------------------------------------------------------
-# REPRODUCED entries that touch this surface.
+# Entries that were REPRODUCED and have since been re-adjudicated.
 #
-# These are NOT deviations today: the port deliberately carries C's bug, so the
-# oracle must see AGREEMENT. They are recorded here (disabled) because
-# doc/strategy-2026-07-13.md §4 schedules them for re-adjudication under the
-# clean policy -- when the port stops reproducing them, these become live rows
-# and the diff they produce is EXPECTED, not a defect. Until then, a diff on
-# this surface would mean the port drifted off C without a decision, which is a
-# finding.
+# A REPRODUCED entry is not a deviation: the port deliberately carries C's bug,
+# so the oracle must see AGREEMENT, and the row sits here disabled while
+# doc/strategy-2026-07-13.md §4 schedules it for re-adjudication under the clean
+# policy. When the port STOPS reproducing the bug the row is flipped to
+# NOT-REPRODUCED and enabled, and the diff it then produces is EXPECTED rather
+# than a defect.
+#
+# The one row below has already made that transition -- it is NOT-REPRODUCED and
+# LIVE, not disabled -- so read `enabled` and `bucket` on the row, never this
+# heading, for what any given row is doing.
 # --------------------------------------------------------------------------
 
 [[deviation]]

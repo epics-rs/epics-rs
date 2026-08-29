@@ -30,6 +30,28 @@ async fn process(db: &PvDatabase, name: &str) {
     db.process_record_with_links(name, &mut v, 0).await.unwrap();
 }
 
+/// seq is an async record in C — `process` sets `prec->pact = TRUE` and hands
+/// the group chain to the callback task whatever the DLYn
+/// (`seqRecord.c:143`, `:210-215`), so `process_record_with_links` returns once
+/// the chain is *armed*. The cycle's alarm commit, monitors and FLNK are
+/// `asyncFinish`'s (`:219-241`), reached from the chain's last hop. Wait for
+/// that, then read — "the same cycle" is the seq's cycle, not the caller's
+/// call.
+async fn settle(db: &PvDatabase, name: &str) {
+    for _ in 0..400 {
+        if !db
+            .get_record(name)
+            .expect("record exists")
+            .read()
+            .is_processing()
+        {
+            return;
+        }
+        epics_base_rs::runtime::task::sleep(std::time::Duration::from_millis(5)).await;
+    }
+    panic!("{name} never left PACT — the seq group chain did not finish");
+}
+
 async fn alarm_of(db: &PvDatabase, name: &str) -> (u16, AlarmSeverity) {
     let rec = db.get_record(name).expect("record exists");
     let inst = rec.read();
@@ -54,6 +76,7 @@ async fn r15_62_failed_seq_lnk_put_alarms_in_the_same_cycle() {
     db.add_record("SEQ_BAD", Box::new(seq)).await.unwrap();
 
     process(&db, "SEQ_BAD").await;
+    settle(&db, "SEQ_BAD").await;
 
     assert_eq!(
         alarm_of(&db, "SEQ_BAD").await,
@@ -83,6 +106,7 @@ async fn r15_62_successful_seq_lnk_put_leaves_no_alarm() {
     db.add_record("SEQ_OK", Box::new(seq)).await.unwrap();
 
     process(&db, "SEQ_OK").await;
+    settle(&db, "SEQ_OK").await;
 
     assert_eq!(
         alarm_of(&db, "SEQ_OK").await,

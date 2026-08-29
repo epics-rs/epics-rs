@@ -3,8 +3,9 @@ use std::sync::Arc;
 use ad_core_rs::ndarray::{NDArray, NDDataBuffer, NDDataType, NDDimension};
 use ad_core_rs::ndarray_pool::NDArrayPool;
 use ad_core_rs::plugin::runtime::{NDPluginProcess, ProcessResult};
-use rustfft::FftPlanner;
+use parking_lot::Mutex;
 use rustfft::num_complex::Complex;
+use rustfft::{Fft, FftPlanner};
 
 /// FFT direction (forward or inverse transform).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -19,6 +20,7 @@ pub enum FFTDirection {
 /// `NDPluginFFT::processCallbacks` (NDPluginFFT.cpp:298-315) it is taken from
 /// the input array's `ndims` on every frame, so a 1-D input drives a 1-D FFT
 /// and a 2-D input a full 2-D FFT.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct FFTConfig {
     pub direction: FFTDirection,
     /// Zero out DC component (k=0) in the output magnitudes.
@@ -224,9 +226,16 @@ struct FFTParamIndices {
     freq_axis: Option<usize>,
 }
 
-pub struct FFTProcessor {
+/// Everything a frame mutates: the tuning config and the running-average
+/// accumulator. One transform advances both, so they live under one lock
+/// rather than one lock each.
+///
+/// The planner is deliberately NOT here. It is a plan cache, not frame
+/// state, and keeping it in this mutex would force the transform itself to
+/// run under the lock that a param write contends for -- the shape C avoids
+/// by releasing at NDPluginFFT.cpp:334.
+struct FFTState {
     config: FFTConfig,
-    planner: FftPlanner<f64>,
     /// Running average magnitude buffer.
     avg_buffer: Option<Vec<f64>>,
     /// Number of frames accumulated so far.
@@ -236,6 +245,14 @@ pub struct FFTProcessor {
     /// Seconds per input time point (C++ `timePerPoint_`); scales the time
     /// and frequency axis waveforms.
     time_per_point: f64,
+}
+
+pub struct FFTProcessor {
+    state: Mutex<FFTState>,
+    /// Plan cache, shared across frames and across pool workers. Locked only
+    /// for the plan lookup itself (one or two per frame), never across a
+    /// transform.
+    planner: Mutex<FftPlanner<f64>>,
     params: FFTParamIndices,
 }
 
@@ -246,16 +263,20 @@ impl FFTProcessor {
 
     pub fn with_config(config: FFTConfig) -> Self {
         Self {
-            config,
-            planner: FftPlanner::new(),
-            avg_buffer: None,
-            avg_count: 0,
-            cached_dims: Vec::new(),
-            time_per_point: 1.0,
+            state: Mutex::new(FFTState {
+                config,
+                avg_buffer: None,
+                avg_count: 0,
+                cached_dims: Vec::new(),
+                time_per_point: 1.0,
+            }),
+            planner: Mutex::new(FftPlanner::new()),
             params: FFTParamIndices::default(),
         }
     }
+}
 
+impl FFTState {
     /// Check if dimensions changed and reset averaging state if so.
     fn check_dims_changed(&mut self, dims: &[NDDimension]) {
         let current: Vec<usize> = dims.iter().map(|d| d.size).collect();
@@ -266,13 +287,75 @@ impl FFTProcessor {
         }
     }
 
+    /// Apply magnitude averaging using exponential moving average (matching C++).
+    ///
+    /// C++: `FFTAbsValue_[j] = FFTAbsValue_[j] * oldFraction + new[j] * newFraction`
+    /// where `oldFraction = 1 - 1/numAveraged`, `newFraction = 1/numAveraged`.
+    fn apply_averaging(&mut self, magnitudes: &[f64]) -> Vec<f64> {
+        let num_avg = self.config.num_average;
+        if num_avg <= 1 {
+            return magnitudes.to_vec();
+        }
+
+        let buf = self
+            .avg_buffer
+            .get_or_insert_with(|| vec![0.0; magnitudes.len()]);
+
+        // Reset if buffer size changed
+        if buf.len() != magnitudes.len() {
+            *buf = vec![0.0; magnitudes.len()];
+            self.avg_count = 0;
+        }
+
+        self.avg_count += 1;
+        // Cap at num_average for the weighting
+        let n = self.avg_count.min(num_avg) as f64;
+        let new_fraction = 1.0 / n;
+        let old_fraction = 1.0 - new_fraction;
+
+        // C++ exponential moving average
+        for (b, &m) in buf.iter_mut().zip(magnitudes.iter()) {
+            *b = *b * old_fraction + m * new_fraction;
+        }
+
+        buf.clone()
+    }
+}
+
+/// The per-frame view of the configuration: everything the transform reads
+/// and nothing it writes.
+///
+/// C takes exactly this snapshot under the port lock -- `suppressDC` at
+/// NDPluginFFT.cpp:325 and `timePerPoint_` at :330 -- and then releases at
+/// :334 ("things below don't access shared memory") before converting the
+/// input and running `computeFFT_1D`/`computeFFT_2D`. Splitting the config
+/// off `FFTState` is what lets us do the same: the transform borrows this
+/// value, so it cannot be holding the state lock while it runs.
+struct FFTFrame<'a> {
+    config: FFTConfig,
+    time_per_point: f64,
+    planner: &'a Mutex<FftPlanner<f64>>,
+}
+
+impl FFTFrame<'_> {
+    /// Look a forward plan up in the shared cache. The lock spans the lookup
+    /// only -- never `Fft::process`.
+    fn plan_forward(&self, len: usize) -> Arc<dyn Fft<f64>> {
+        self.planner.lock().plan_fft_forward(len)
+    }
+
+    /// Inverse counterpart of [`FFTFrame::plan_forward`].
+    fn plan_inverse(&self, len: usize) -> Arc<dyn Fft<f64>> {
+        self.planner.lock().plan_fft_inverse(len)
+    }
+
     /// Compute FFT using cached planner for plan reuse across frames.
     ///
     /// The rank is taken from the input array's dimension count, matching C
     /// `NDPluginFFT::processCallbacks` (NDPluginFFT.cpp:298-315): `ndims==1`
     /// drives a 1-D FFT, `ndims==2` a full 2-D FFT, and any other rank is
     /// rejected (C prints an error and returns with no output).
-    fn compute_fft(&mut self, src: &NDArray) -> Option<NDArray> {
+    fn compute_fft(&self, src: &NDArray) -> Option<NDArray> {
         let suppress_dc = self.config.suppress_dc;
 
         match (src.dims.len(), self.config.direction) {
@@ -296,7 +379,7 @@ impl FFTProcessor {
     /// the two spectral arrays when `suppress_dc` is set (C++ behaviour); the
     /// time series is never DC-suppressed.
     fn compute_row_spectrum(
-        &mut self,
+        &self,
         src: &NDArray,
         suppress_dc: bool,
     ) -> Option<(Vec<f64>, Vec<f64>, Vec<f64>)> {
@@ -312,7 +395,7 @@ impl FFTProcessor {
         if n_freq == 0 {
             return None;
         }
-        let fft = self.planner.plan_fft_forward(padded);
+        let fft = self.plan_forward(padded);
 
         // The first row, zero-extended to the padded length nTimeX. C posts the
         // padded series (calloc'd to nTimeX, the input copied into [0,width)),
@@ -366,7 +449,7 @@ impl FFTProcessor {
         (0..n_time).map(|i| i as f64 * tpp).collect()
     }
 
-    fn compute_fft_1d_rows_forward(&mut self, src: &NDArray, suppress_dc: bool) -> Option<NDArray> {
+    fn compute_fft_1d_rows_forward(&self, src: &NDArray, suppress_dc: bool) -> Option<NDArray> {
         if src.dims.is_empty() {
             return None;
         }
@@ -384,7 +467,7 @@ impl FFTProcessor {
 
         // C++ zero-pads the time series to the next power of two.
         let padded = next_pow2(width);
-        let fft = self.planner.plan_fft_forward(padded);
+        let fft = self.plan_forward(padded);
 
         // C++: nFreqX = paddedWidth / 2 (only positive frequencies)
         let n_freq = padded / 2;
@@ -425,7 +508,7 @@ impl FFTProcessor {
         Some(arr)
     }
 
-    fn compute_fft_1d_rows_inverse(&mut self, src: &NDArray, suppress_dc: bool) -> Option<NDArray> {
+    fn compute_fft_1d_rows_inverse(&self, src: &NDArray, suppress_dc: bool) -> Option<NDArray> {
         if src.dims.is_empty() {
             return None;
         }
@@ -441,7 +524,7 @@ impl FFTProcessor {
             return None;
         }
 
-        let fft = self.planner.plan_fft_inverse(width);
+        let fft = self.plan_inverse(width);
         let scale = 1.0 / width as f64;
 
         // An inverse transform of a real-valued spectrum yields signed real
@@ -472,7 +555,7 @@ impl FFTProcessor {
         Some(arr)
     }
 
-    fn compute_fft_2d_forward(&mut self, src: &NDArray, suppress_dc: bool) -> Option<NDArray> {
+    fn compute_fft_2d_forward(&self, src: &NDArray, suppress_dc: bool) -> Option<NDArray> {
         if src.dims.len() < 2 {
             return None;
         }
@@ -488,8 +571,8 @@ impl FFTProcessor {
         let w = next_pow2(src_w);
         let h = next_pow2(src_h);
 
-        let fft_row = self.planner.plan_fft_forward(w);
-        let fft_col = self.planner.plan_fft_forward(h);
+        let fft_row = self.plan_forward(w);
+        let fft_col = self.plan_forward(h);
 
         let mut data = vec![Complex::new(0.0, 0.0); w * h];
         let mut row_buf = vec![Complex::new(0.0, 0.0); w];
@@ -544,7 +627,7 @@ impl FFTProcessor {
         Some(arr)
     }
 
-    fn compute_fft_2d_inverse(&mut self, src: &NDArray, suppress_dc: bool) -> Option<NDArray> {
+    fn compute_fft_2d_inverse(&self, src: &NDArray, suppress_dc: bool) -> Option<NDArray> {
         if src.dims.len() < 2 {
             return None;
         }
@@ -556,8 +639,8 @@ impl FFTProcessor {
             return None;
         }
 
-        let fft_row = self.planner.plan_fft_inverse(w);
-        let fft_col = self.planner.plan_fft_inverse(h);
+        let fft_row = self.plan_inverse(w);
+        let fft_col = self.plan_inverse(h);
         let scale = 1.0 / (w * h) as f64;
 
         let mut data = vec![Complex::new(0.0, 0.0); w * h];
@@ -598,40 +681,6 @@ impl FFTProcessor {
         arr.attributes = src.attributes.clone();
         Some(arr)
     }
-
-    /// Apply magnitude averaging using exponential moving average (matching C++).
-    ///
-    /// C++: `FFTAbsValue_[j] = FFTAbsValue_[j] * oldFraction + new[j] * newFraction`
-    /// where `oldFraction = 1 - 1/numAveraged`, `newFraction = 1/numAveraged`.
-    fn apply_averaging(&mut self, magnitudes: &[f64]) -> Vec<f64> {
-        let num_avg = self.config.num_average;
-        if num_avg <= 1 {
-            return magnitudes.to_vec();
-        }
-
-        let buf = self
-            .avg_buffer
-            .get_or_insert_with(|| vec![0.0; magnitudes.len()]);
-
-        // Reset if buffer size changed
-        if buf.len() != magnitudes.len() {
-            *buf = vec![0.0; magnitudes.len()];
-            self.avg_count = 0;
-        }
-
-        self.avg_count += 1;
-        // Cap at num_average for the weighting
-        let n = self.avg_count.min(num_avg) as f64;
-        let new_fraction = 1.0 / n;
-        let old_fraction = 1.0 - new_fraction;
-
-        // C++ exponential moving average
-        for (b, &m) in buf.iter_mut().zip(magnitudes.iter()) {
-            *b = *b * old_fraction + m * new_fraction;
-        }
-
-        buf.clone()
-    }
 }
 
 impl Default for FFTProcessor {
@@ -641,7 +690,7 @@ impl Default for FFTProcessor {
 }
 
 impl NDPluginProcess for FFTProcessor {
-    fn process_array(&mut self, array: &NDArray, _pool: &NDArrayPool) -> ProcessResult {
+    fn process_array(&self, array: &NDArray, _pool: &NDArrayPool) -> ProcessResult {
         use ad_core_rs::plugin::runtime::ParamUpdate;
 
         // C processes only 1-D and 2-D inputs (NDPluginFFT.cpp:298-315); any
@@ -653,12 +702,28 @@ impl NDPluginProcess for FFTProcessor {
             return ProcessResult::sink(Vec::new());
         }
 
-        self.check_dims_changed(&array.dims);
+        // C reads the frame's tuning under the port lock, then releases before
+        // the transform (NDPluginFFT.cpp:334). Take the same snapshot here and
+        // drop the state lock: everything from `compute_fft` to the axis
+        // waveforms below reads only the snapshot, so a param write lands
+        // while the transform runs instead of queueing behind it.
+        let (frame, avg_count) = {
+            let mut state = self.state.lock();
+            state.check_dims_changed(&array.dims);
+            (
+                FFTFrame {
+                    config: state.config,
+                    time_per_point: state.time_per_point,
+                    planner: &self.planner,
+                },
+                state.avg_count,
+            )
+        };
 
-        let result = self.compute_fft(array);
+        let result = frame.compute_fft(array);
         let mut updates = Vec::new();
         if let Some(idx) = self.params.num_averaged {
-            updates.push(ParamUpdate::int32(idx, self.avg_count as i32));
+            updates.push(ParamUpdate::int32(idx, avg_count as i32));
         }
 
         // Emit the C++ NDPluginFFT waveform records. On a forward transform
@@ -670,9 +735,10 @@ impl NDPluginProcess for FFTProcessor {
         // most once per frame. The averaged FFTAbsValue waveform and the
         // averaged NDArray output therefore share a single averaging pass.
         let mut averaged_mags: Option<Vec<f64>> = None;
-        if self.config.direction == FFTDirection::Forward {
-            let suppress_dc = self.config.suppress_dc;
-            if let Some((time_series, real, imag)) = self.compute_row_spectrum(array, suppress_dc) {
+        if frame.config.direction == FFTDirection::Forward {
+            let suppress_dc = frame.config.suppress_dc;
+            if let Some((time_series, real, imag)) = frame.compute_row_spectrum(array, suppress_dc)
+            {
                 let n_time = time_series.len();
                 let n_freq = real.len();
                 if let Some(idx) = self.params.time_series {
@@ -685,19 +751,27 @@ impl NDPluginProcess for FFTProcessor {
                     updates.push(ParamUpdate::float64_array(idx, imag));
                 }
                 if let Some(idx) = self.params.time_axis {
-                    updates.push(ParamUpdate::float64_array(idx, self.time_axis(n_time)));
+                    updates.push(ParamUpdate::float64_array(idx, frame.time_axis(n_time)));
                 }
                 if let Some(idx) = self.params.freq_axis {
-                    updates.push(ParamUpdate::float64_array(idx, self.freq_axis(n_freq)));
+                    updates.push(ParamUpdate::float64_array(idx, frame.freq_axis(n_freq)));
                 }
             }
         }
 
         match result {
             Some(mut out) => {
-                if self.config.num_average > 1 {
-                    if let NDDataBuffer::F64(ref mags) = out.data {
-                        let averaged = self.apply_averaging(mags);
+                // The EMA accumulator is the one part of the frame that cannot
+                // run released: it is shared mutable state advanced once per
+                // frame. C re-takes the lock for exactly this
+                // (NDPluginFFT.cpp:373) and re-reads NumAverage inside
+                // `doArrayCallbacks` (:189-203) rather than trusting the value
+                // it snapshotted before the transform, so re-read it here too.
+                if let NDDataBuffer::F64(ref mags) = out.data {
+                    let mut state = self.state.lock();
+                    if state.config.num_average > 1 {
+                        let averaged = state.apply_averaging(mags);
+                        drop(state);
                         averaged_mags = Some(averaged.clone());
                         out.data = NDDataBuffer::F64(averaged);
                     }
@@ -705,7 +779,7 @@ impl NDPluginProcess for FFTProcessor {
                 // FFTAbsValue waveform mirrors the (possibly averaged) NDArray
                 // magnitude buffer — for 1D forward this is the half-spectrum
                 // magnitude that the NDArray output already carries.
-                if self.config.direction == FFTDirection::Forward {
+                if frame.config.direction == FFTDirection::Forward {
                     if let Some(idx) = self.params.abs_value {
                         let abs = match (&averaged_mags, &out.data) {
                             (Some(avg), _) => avg.clone(),
@@ -763,30 +837,31 @@ impl NDPluginProcess for FFTProcessor {
     }
 
     fn on_param_change(
-        &mut self,
+        &self,
         reason: usize,
         params: &ad_core_rs::plugin::runtime::PluginParamSnapshot,
     ) -> ad_core_rs::plugin::runtime::ParamChangeResult {
+        let mut state = self.state.lock();
         if Some(reason) == self.params.direction {
-            self.config.direction = if params.value.as_i32() == 0 {
+            state.config.direction = if params.value.as_i32() == 0 {
                 FFTDirection::Forward
             } else {
                 FFTDirection::Inverse
             };
         } else if Some(reason) == self.params.suppress_dc {
-            self.config.suppress_dc = params.value.as_i32() != 0;
+            state.config.suppress_dc = params.value.as_i32() != 0;
         } else if Some(reason) == self.params.num_average {
-            self.config.num_average = params.value.as_i32().max(0) as usize;
+            state.config.num_average = params.value.as_i32().max(0) as usize;
         } else if Some(reason) == self.params.reset_average {
             if params.value.as_i32() != 0 {
-                self.avg_buffer = None;
-                self.avg_count = 0;
+                state.avg_buffer = None;
+                state.avg_count = 0;
             }
         } else if Some(reason) == self.params.time_per_point {
             // Scales the FFTTimeAxis / FFTFreqAxis waveforms.
             let v = params.value.as_f64();
             if v > 0.0 {
-                self.time_per_point = v;
+                state.time_per_point = v;
             }
         }
         ad_core_rs::plugin::runtime::ParamChangeResult::updates(vec![])
@@ -971,7 +1046,7 @@ mod tests {
             suppress_dc: true,
             num_average: 0,
         };
-        let mut proc = FFTProcessor::with_config(config);
+        let proc = FFTProcessor::with_config(config);
         let pool = NDArrayPool::new(0);
 
         let mut arr = NDArray::new(vec![NDDimension::new(8)], NDDataType::Float64);
@@ -998,7 +1073,7 @@ mod tests {
             suppress_dc: false,
             num_average: 2,
         };
-        let mut proc = FFTProcessor::with_config(config);
+        let proc = FFTProcessor::with_config(config);
         let pool = NDArrayPool::new(0);
 
         // Frame 1: constant = 2.0 => DC magnitude (normalized) = 2.0
@@ -1039,7 +1114,7 @@ mod tests {
             suppress_dc: false,
             num_average: 3,
         };
-        let mut proc = FFTProcessor::with_config(config);
+        let proc = FFTProcessor::with_config(config);
         let pool = NDArrayPool::new(0);
 
         // Frame 1: width=8
@@ -1050,7 +1125,7 @@ mod tests {
             }
         }
         let _ = proc.process_array(&arr1, &pool);
-        assert_eq!(proc.avg_count, 1);
+        assert_eq!(proc.state.lock().avg_count, 1);
 
         // Frame 2: width=4 — dimension change should reset
         let mut arr2 = NDArray::new(vec![NDDimension::new(4)], NDDataType::Float64);
@@ -1061,7 +1136,7 @@ mod tests {
         }
         let _ = proc.process_array(&arr2, &pool);
         // After dimension change, avg_count should be 1 (reset + one new frame)
-        assert_eq!(proc.avg_count, 1);
+        assert_eq!(proc.state.lock().avg_count, 1);
     }
 
     #[test]
@@ -1114,7 +1189,7 @@ mod tests {
             suppress_dc: false,
             num_average: 0,
         };
-        let mut proc = FFTProcessor::with_config(config);
+        let proc = FFTProcessor::with_config(config);
         let pool = NDArrayPool::new(0);
 
         let result = proc.process_array(&arr, &pool);
@@ -1190,7 +1265,7 @@ mod tests {
         // C dispatches on ndims (NDPluginFFT.cpp:298-315): a 2-D input drives a
         // full 2-D FFT, NOT per-row 1-D FFTs. The processor must produce 2-D
         // magnitude dims nFreqX x nFreqY ([2,2] for a 4x4 input), not [2,4].
-        let mut proc = FFTProcessor::new();
+        let proc = FFTProcessor::new();
         let pool = NDArrayPool::new(0);
 
         let mut arr = NDArray::new(
@@ -1215,7 +1290,7 @@ mod tests {
     #[test]
     fn test_adp9_processor_keeps_1d_input_1d() {
         // A 1-D input still drives a 1-D FFT (ndims==1): dims [nFreqX].
-        let mut proc = FFTProcessor::new();
+        let proc = FFTProcessor::new();
         let pool = NDArrayPool::new(0);
         let mut arr = NDArray::new(vec![NDDimension::new(8)], NDDataType::Float64);
         if let NDDataBuffer::F64(ref mut v) = arr.data {
@@ -1231,7 +1306,7 @@ mod tests {
     fn test_adp9_processor_rejects_rank_above_2() {
         // ndims>2 is rejected with no NDArray and no waveforms (C error+return
         // before allocate/compute/callbacks).
-        let mut proc = fft_proc_with_params(FFTConfig::default());
+        let proc = fft_proc_with_params(FFTConfig::default());
         let pool = NDArrayPool::new(0);
         let arr = NDArray::new(
             vec![
@@ -1277,7 +1352,7 @@ mod tests {
     fn test_fft_emits_all_waveforms() {
         // A forward FFT must emit FFTTimeSeries, FFTReal, FFTImaginary,
         // FFTAbsValue, FFTTimeAxis and FFTFreqAxis waveforms.
-        let mut proc = fft_proc_with_params(FFTConfig::default());
+        let proc = fft_proc_with_params(FFTConfig::default());
         let pool = NDArrayPool::new(0);
 
         let n = 16;
@@ -1318,7 +1393,7 @@ mod tests {
     fn test_fft_real_imaginary_match_spectrum() {
         // For a cosine at frequency 3 in N=16, the real part peaks at bin 3
         // (cosine -> real, even) and the imaginary part is ~0 everywhere.
-        let mut proc = fft_proc_with_params(FFTConfig::default());
+        let proc = fft_proc_with_params(FFTConfig::default());
         let real_reason = proc.params.real.unwrap();
         let imag_reason = proc.params.imaginary.unwrap();
         let abs_reason = proc.params.abs_value.unwrap();
@@ -1361,7 +1436,7 @@ mod tests {
     #[test]
     fn test_fft_axes_scale_with_time_per_point() {
         // FFTTimeAxis = i*timePerPoint; FFTFreqAxis step = 0.5/tpp/(nFreq-1).
-        let mut proc = fft_proc_with_params(FFTConfig::default());
+        let proc = fft_proc_with_params(FFTConfig::default());
         let time_axis_reason = proc.params.time_axis.unwrap();
         let freq_axis_reason = proc.params.freq_axis.unwrap();
         let tpp_reason = proc.params.time_per_point.unwrap();
@@ -1406,7 +1481,7 @@ mod tests {
         // C posts FFTTimeSeries and FFTTimeAxis at nTimeX = nextPow2(width),
         // zero-extending the series (NDPluginFFT.cpp allocateArrays +
         // doArrayCallbacks/createAxisArrays). width=5 -> padded 8.
-        let mut proc = fft_proc_with_params(FFTConfig::default());
+        let proc = fft_proc_with_params(FFTConfig::default());
         let ts_reason = proc.params.time_series.unwrap();
         let time_axis_reason = proc.params.time_axis.unwrap();
         let real_reason = proc.params.real.unwrap();
@@ -1447,7 +1522,7 @@ mod tests {
             suppress_dc: false,
             num_average: 0,
         };
-        let mut proc = fft_proc_with_params(config);
+        let proc = fft_proc_with_params(config);
         let pool = NDArrayPool::new(0);
         let mut arr = NDArray::new(vec![NDDimension::new(8)], NDDataType::Float64);
         if let NDDataBuffer::F64(ref mut v) = arr.data {
@@ -1483,7 +1558,7 @@ mod tests {
             suppress_dc: false,
             num_average: 0,
         };
-        let mut proc = FFTProcessor::with_config(config);
+        let proc = FFTProcessor::with_config(config);
         let pool = NDArrayPool::new(0);
         let result = proc.process_array(&arr, &pool);
         if let NDDataBuffer::F64(ref v) = result.output_arrays[0].data {

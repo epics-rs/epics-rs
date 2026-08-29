@@ -12,12 +12,12 @@
 //!
 //! **Feature-ON only, and here is why.** A `calcout` with `ODLY > 0` defers
 //! its output through `PvDatabase::schedule_delayed_reprocess`, which is a
-//! `runtime::task::spawn` of a future that `runtime::task::sleep`s. With
-//! `rtems-exec-model` off, that seam routes to tokio and needs a reactor that
-//! a plain `#[test]` thread does not have; with it on, the seam is the
-//! std-thread background executor, which is the point. Every test here shares
-//! the one `background_init()` + `IocBuilder` + `BlockingCaServer` fixture, so
-//! the whole file is gated rather than split. The feature-OFF suite count is
+//! `runtime::task::spawn` of a future that `runtime::task::sleep`s. On
+//! `tokio_backend`, that seam routes to tokio and needs a reactor that a plain
+//! `#[test]` thread does not have; with it on, the seam is the std-thread
+//! background executor, which is the point. Every test here shares the one
+//! `background_init()` + `IocBuilder` + `BlockingCaServer` fixture, so the
+//! whole file is gated rather than split. The tokio-backend suite count is
 //! therefore unchanged by this file.
 //!
 //! Overlap is deliberate and bounded: `async_write_notify_rtems_exec.rs`
@@ -35,7 +35,7 @@
 //! No `CaClient`, no tokio runtime, no `.await` in any test. Ephemeral ports
 //! only — never 5064, per the `build() ⟹ listening` rule.
 
-#![cfg(feature = "rtems-exec-model")]
+#![cfg(exec_backend)]
 
 #[path = "common/raw_ca.rs"]
 mod raw_ca;
@@ -241,21 +241,43 @@ fn writes_and_monitors_work_against_a_real_ao_record() {
         "the write fans out to the subscription"
     );
 
-    // Cancel, then prove the subscription is really gone.
-    c.send(&event_cancel_frame(sid, sub_id));
-    let _ = c.expect_cancel_ack(sub_id);
-    c.send(&write_frame(CA_PROTO_WRITE, sid, 0, 77.0));
-    c.expect_silence(
-        Duration::from_millis(250),
-        "a cancelled subscription on a real record must deliver nothing",
+    // Cancel, then prove the subscription is really gone — against a second,
+    // live subscription rather than against a clock. Both ride the one
+    // per-client event queue (`blocking.rs:1206` `run_event_task`), so an
+    // update the cancelled id leaks from the 77.0 put is strictly ahead of the
+    // live id's update from the 78.0 one.
+    let live_id = 0xAC;
+    c.send(&event_add_frame(sid, live_id));
+    let _ = c.expect_absent_before(
+        |_| false,
+        |f| cmmd_of(f) == CA_PROTO_EVENT_ADD && ioid_of(f) == live_id,
+        "the barrier subscription's initial update",
     );
 
-    // The fire-and-forget write still landed.
+    c.send(&event_cancel_frame(sid, sub_id));
+    let _ = c.expect_cancel_ack(sub_id);
+
+    c.send(&write_frame(CA_PROTO_WRITE, sid, 0, 77.0));
+    let _ = c.expect_absent_before(
+        |f| cmmd_of(f) == CA_PROTO_EVENT_ADD && ioid_of(f) == sub_id,
+        |f| cmmd_of(f) == CA_PROTO_EVENT_ADD && ioid_of(f) == live_id,
+        "the cancelled id must not ride the put that the live id does",
+    );
+    c.send(&write_frame(CA_PROTO_WRITE, sid, 0, 78.0));
+    let _ = c.expect_absent_before(
+        |f| cmmd_of(f) == CA_PROTO_EVENT_ADD && ioid_of(f) == sub_id,
+        |f| cmmd_of(f) == CA_PROTO_EVENT_ADD && ioid_of(f) == live_id && payload_double(f) == 78.0,
+        "a cancelled subscription on a real record must deliver nothing: no \
+         update carrying the cancelled id reaches the circuit before the live \
+         id's update from the following put",
+    );
+
+    // The fire-and-forget writes still landed.
     c.send(&read_notify_frame(sid, 0x12));
     let r = c.expect(CA_PROTO_READ_NOTIFY, "READ_NOTIFY after WRITE");
     assert_eq!(
         payload_double(&r),
-        77.0,
+        78.0,
         "fire-and-forget WRITE took effect"
     );
 

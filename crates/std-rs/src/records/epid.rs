@@ -744,7 +744,7 @@ impl Record for EpidRecord {
     /// that stays inside the limits leaves the record un-alarmed and a
     /// held value does not re-fire.
     fn check_alarms(&mut self, common: &mut CommonFields) {
-        // C `devEpidSoft.c:110-112` / `devEpidSoftCallback.c:115-117`:
+        // C `devEpidSoft.c:110-112` / `devEpidSoftCallback.c:112-114`:
         // a CONSTANT `INP` link means "nothing to control" — raise
         // SOFT_ALARM/INVALID_ALARM. `do_pid` set `inp_constant` and
         // skipped the compute; apply the severity here (the framework
@@ -753,7 +753,7 @@ impl Record for EpidRecord {
             recgbl::rec_gbl_set_sevr(common, alarm_status::SOFT_ALARM, AlarmSeverity::Invalid);
         }
         if let Some((stat, sevr, alev)) = EpidRecord::check_alarms(self) {
-            // C `aiRecord.c:404-406`: `if (recGblSetSevr(...)) prec->lalm = alev;`
+            // C `aiRecord.c:405-406`: `if (recGblSetSevr(...)) prec->lalm = alev;`
             // — the LALM update is gated on `recGblSetSevr` returning TRUE,
             // i.e. on the alarm actually raising the pending severity.
             if recgbl::rec_gbl_set_sevr(common, stat, sevr) {
@@ -765,7 +765,7 @@ impl Record for EpidRecord {
     /// C `epidRecord.c:376` REASSIGNS `monitor_mask = DBE_LOG|DBE_VALUE` after
     /// VAL's own post, so every secondary the rest of `monitor()` posts
     /// (:377-406) carries a LITERAL `DBE_VALUE | DBE_LOG` — this cycle's alarm
-    /// bits are discarded, unlike VAL's post (:371), which keeps them. A
+    /// bits are discarded, unlike VAL's post (:373), which keeps them. A
     /// `DBE_ALARM`-only subscriber on `.OVAL`/`.P`/`.I`/... is therefore
     /// notified on no cycle at all.
     ///
@@ -1130,7 +1130,7 @@ impl Record for EpidRecord {
     ///      (`devEpidSoftCallback.c:121-127`) — a synchronous write that
     ///      processes the triggered source chain;
     ///   2. `dbGetLink(&pepid->inp, DBR_DOUBLE, &pepid->cval, ...)`
-    ///      (`devEpidSoftCallback.c:151`) — read CVAL from INP;
+    ///      (`devEpidSoftCallback.c:149`) — read CVAL from INP;
     ///   3. run the PID.
     ///
     /// So for a DB-type TRIG link the trigger write must land BEFORE

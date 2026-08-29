@@ -1,25 +1,69 @@
 use crate::error::CaResult;
 use crate::server::record::{AlarmSeverity, ProcessAction, Record, RecordInstance, ScanType};
 
-/// Check if a DTYP string represents a soft/built-in device support
-/// that doesn't require an explicit device support registration.
-/// Matches C EPICS built-in soft device support names.
+/// Which of C's three built-in soft-channel dset families a DTYP names.
+///
+/// The question every caller actually asks is *which flavour*, not "is it
+/// soft": each of the three does something different with the link, and a
+/// caller that answers only yes/no has to re-spell the distinction itself.
+/// Three sites did, each with its own two-value expression, and
+/// [`SoftDtyp::Async`] fell out of all three — the attach phase skipped its
+/// device (soft), while the processing cycle and the output path deferred to a
+/// device that therefore did not exist. Input records read 0 instead of the
+/// link value and output records wrote nothing, with no alarm.
+///
+/// Matching on this enum is what keeps that closed: a fourth flavour is a
+/// non-exhaustive `match`, which is a compile error rather than a silent zero.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SoftDtyp {
+    /// `""` or `"Soft Channel"` — C's `devXxxSoft.c`. Puts VAL/OVAL on the
+    /// link; the input `read_xxx` returns 2, "do not convert".
+    Plain,
+    /// `"Raw Soft Channel"` — C's `devXxxSoftRaw.c`, a DIFFERENT dset that
+    /// puts RVAL (`devAoSoftRaw.c:44`) and whose input `read_xxx` returns 0
+    /// so the record DOES run the RVAL→VAL convert.
+    Raw,
+    /// `"Async Soft Channel"` — C's `devXxxSoftCallback.c`. Same VALUES as
+    /// [`SoftDtyp::Plain`], deferred: `write_ao` is `dbPutLinkAsync(out,
+    /// DBR_DOUBLE, &oval, 1)` with a synchronous `dbPutLink` fallback when the
+    /// link has no LSET (`devAoSoftCallback.c:41-54`), and `read_ai` returns 2
+    /// on every terminal path (`devAiSoftCallback.c:167-216`) after
+    /// `dbProcessNotify` has put the link's value straight into VAL. This port
+    /// applies the link synchronously, so the observable difference is PACT
+    /// timing, not the value.
+    Async,
+}
+
+/// The soft-channel flavour `dtyp` names, or `None` when it names device
+/// support that owns the transfer.
+///
+/// Only the four genuine base soft-channel DTYPs. Timestamp-producing DTYPs
+/// are NOT soft channels — they are real device support that writes a resolved
+/// time stamp into VAL, so they must reach the device-lookup path rather than
+/// short-circuit here:
+///  - "Soft Timestamp" (base `devTimestamp.c`) — served by the
+///    pre-registered `builtin_devices::builtin_dynamic_factory`.
+///  - "Sec Past Epoch" / "Time of Day" (epics-modules/std `devTimeOfDay.c`)
+///    — served by `std_rs::std_device_supports()`; if the IOC has not
+///    registered them they correctly warn as "no device support", not
+///    silently no-op as a soft channel. base-rs must not special-case a
+///    std-module DTYP (layering leak).
+pub fn classify_soft(dtyp: &str) -> Option<SoftDtyp> {
+    match dtyp {
+        "" | "Soft Channel" => Some(SoftDtyp::Plain),
+        "Raw Soft Channel" => Some(SoftDtyp::Raw),
+        "Async Soft Channel" => Some(SoftDtyp::Async),
+        _ => None,
+    }
+}
+
+/// Does this DTYP need no explicit device support registration?
+///
+/// The attach phase's question, and the only one that is genuinely yes/no:
+/// all three flavours are served by the framework, so none of them looks up a
+/// registered device.
 pub fn is_soft_dtyp(dtyp: &str) -> bool {
-    // Only the four genuine base soft-channel DTYPs. Timestamp-producing
-    // DTYPs are NOT soft channels — they are real device support that writes
-    // a resolved time stamp into VAL, so they must reach the device-lookup
-    // path rather than short-circuit here:
-    //  - "Soft Timestamp" (base `devTimestamp.c`) — served by the
-    //    pre-registered `builtin_devices::builtin_dynamic_factory`.
-    //  - "Sec Past Epoch" / "Time of Day" (epics-modules/std `devTimeOfDay.c`)
-    //    — served by `std_rs::std_device_supports()`; if the IOC has not
-    //    registered them they correctly warn as "no device support", not
-    //    silently no-op as a soft channel. base-rs must not special-case a
-    //    std-module DTYP (layering leak).
-    dtyp.is_empty()
-        || dtyp == "Soft Channel"
-        || dtyp == "Raw Soft Channel"
-        || dtyp == "Async Soft Channel"
+    classify_soft(dtyp).is_some()
 }
 
 /// Handle for waiting on asynchronous write completion.
@@ -30,72 +74,299 @@ pub trait WriteCompletion: Send + 'static {
     fn wait(&self, timeout: std::time::Duration) -> CaResult<()>;
 }
 
-/// Outcome of a device support read() call.
+/// What a device support `read()` produced.
 ///
-/// Allows device support to return side-effect actions (link writes,
-/// delayed reprocess) and signal that it has already performed the
+/// This is one half of C's dset contract; [`DeviceUdf`] is the other. C's
+/// `read_ai()` return value answers only "what did you write, and did you
+/// write anything":
+///
+/// ```c
+/// if (status==0) convert(prec);
+/// else if (status==2) status=0;
+/// if (status == 0) prec->udf = isnan(prec->val);
+/// ```
+///
+/// What the record does about `prec->udf` afterwards is the record's own rule
+/// and differs per type — `aiRecord.c:158-161` folds `2` into `0` before the
+/// UDF line and so re-derives on both, while `biRecord.c:136-141` keeps its
+/// assignment inside `if (status == 0)` and folds only afterwards, so a `2`
+/// never reaches it. That is not a contradiction: a C dset returning `2` has already
+/// written `prec->udf` itself (`devBiSoft.c:54-59`, `devBiDbState.c:67-70`,
+/// `devMbbiSoft.c:55-60`, `devTimestamp.c:40-41`). Port device support cannot reach
+/// `dbCommon`, so it states that fact through [`DeviceUdf`] instead and the
+/// framework applies it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum DeviceReadStatus {
+    /// C `return 0` — device support wrote RVAL. The record runs its built-in
+    /// conversion (ai: `ROFF → ASLO/AOFF → LINR/ESLO/EOFF → smoothing`).
+    #[default]
+    Converted,
+    /// C `return 2` — device support wrote VAL directly, so the record skips
+    /// its conversion and uses VAL as-is.
+    ///
+    /// **Common mistake:** returning [`Converted`](Self::Converted) when VAL is
+    /// set directly lets the conversion overwrite VAL from RVAL (typically 0),
+    /// making the read appear broken.
+    Computed,
+    /// C `return -1` and `return -2` — the read produced no value, so the
+    /// record's previous VAL stands and no conversion runs.
+    ///
+    /// The two C returns differ only in what the dset wrote to `prec->udf`
+    /// first — `processAiAverage` with `numAverage == 0` writes `prec->udf = 1`
+    /// and returns `-2` (`devAsynInt32.c:900-904`), its transport-error branch
+    /// writes nothing and returns `-1` (`:924-927`) — and at the record both
+    /// miss `if (status == 0)` identically. So the UDF half lives in
+    /// [`DeviceUdf`] and this variant carries only "nothing was produced";
+    /// keeping two value-variants that differed by a UDF fact was what let a
+    /// caller state a value outcome and a UDF outcome that disagreed.
+    NoValue,
+}
+
+impl DeviceReadStatus {
+    /// Whether the record must skip its built-in RVAL→VAL conversion.
+    ///
+    /// C runs `convert()` only for `return 0` (`aiRecord.c:159`).
+    pub fn skips_conversion(self) -> bool {
+        !matches!(self, Self::Converted)
+    }
+
+    /// Whether the read produced no value this cycle (C `-1` / `-2`).
+    pub fn read_failed(self) -> bool {
+        matches!(self, Self::NoValue)
+    }
+}
+
+/// What device support wrote to `prec->udf`, which in C the dset does itself.
+///
+/// Every C dset that returns `2` writes this first — `devBiSoft.c:54-59` and
+/// `devBiDbState.c:67-70` clear it, `devAsynInt32.c:900-904` sets it — and the
+/// record's `process()` may then overwrite it by its own rule. Port device
+/// support holds a `&mut dyn Record` and cannot reach `dbCommon`, so it says
+/// what it meant and the framework stays the single owner of the transition.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum DeviceUdf {
+    /// The dset did not write `prec->udf`; the record's own rule decides.
+    #[default]
+    Untouched,
+    /// C `prec->udf = FALSE` — the value this read left in the record is
+    /// defined.
+    Defined,
+    /// C `prec->udf = TRUE` — the record's value is undefined.
+    Undefined,
+}
+
 /// Result of a device support `read()` call.
 ///
-/// # `ok()` vs `computed()`
-///
-/// This mirrors the C EPICS `read_ai()` return convention:
-///
-/// - **`ok()`** (C return 0): Device support wrote to RVAL. The record's
-///   `process()` will run its built-in conversion (e.g., ai applies
-///   `ROFF → ASLO/AOFF → LINR/ESLO/EOFF → smoothing` to produce VAL
-///   from RVAL).
-///
-/// - **`computed()`** (C return 2): Device support wrote to VAL directly.
-///   The record's `process()` will **skip** its conversion and use the
-///   VAL as-is. Use this when the device support provides engineering
-///   units directly (e.g., soft channel, asyn, custom drivers that
-///   call `record.put_field("VAL", ...)`).
-///
-/// **Common mistake:** returning `ok()` when VAL is set directly causes
-/// the record's conversion to overwrite VAL with a value derived from
-/// RVAL (typically 0), making the read appear broken.
+/// Carries what the read produced ([`DeviceReadStatus`]), what it said about
+/// UDF ([`DeviceUdf`]), and any side-effect actions (link writes, delayed
+/// reprocess) for the framework to execute.
 #[derive(Default)]
 pub struct DeviceReadOutcome {
     /// Actions for the framework to execute (WriteDbLink, ReprocessAfter, etc.)
     pub actions: Vec<ProcessAction>,
-    /// If true, the record's built-in conversion (e.g., ai RVAL→VAL)
-    /// is skipped. Set this when device support writes VAL directly.
-    pub did_compute: bool,
+    /// What the read produced — C's `read_ai()` return value.
+    pub status: DeviceReadStatus,
+    /// What the read said about `prec->udf`. Private so the two facts can only
+    /// be paired through the constructors below, which is what keeps "I wrote
+    /// VAL" from being stated without saying what that meant for UDF.
+    udf: DeviceUdf,
 }
 
 impl DeviceReadOutcome {
-    /// Device support wrote RVAL; record will run its conversion to produce VAL.
+    /// Device support wrote RVAL and said nothing about UDF; the record runs
+    /// its conversion and its own UDF rule.
     ///
-    /// C equivalent: `read_ai()` returns 0.
+    /// C equivalent: `read_ai()` returns 0 without touching `prec->udf`
+    /// (`devAiSoftRaw.c`).
     pub fn ok() -> Self {
         Self::default()
     }
 
-    /// Device support wrote VAL directly; record will skip conversion.
+    /// Device support wrote RVAL *and* wrote `prec->udf`.
     ///
-    /// C equivalent: `read_ai()` returns 2.
-    pub fn computed() -> Self {
+    /// C equivalent: `devTimestamp.c:65-66` — `prec->udf = FALSE; return 0`.
+    pub fn converted(udf: DeviceUdf) -> Self {
         Self {
-            did_compute: true,
+            status: DeviceReadStatus::Converted,
             actions: Vec::new(),
+            udf,
+        }
+    }
+
+    /// Device support wrote VAL directly; the record skips its conversion.
+    ///
+    /// C equivalent: `read_ai()` returns 2. The [`DeviceUdf`] argument is not
+    /// optional because in C it is not: every dset that returns `2` has just
+    /// written `prec->udf`, and the record types whose `process()` leaves UDF
+    /// to the dset (`biRecord.c:136-141` and its mbbi / mbbiDirect / longin /
+    /// int64in twins) have nothing else to go on.
+    pub fn computed(udf: DeviceUdf) -> Self {
+        Self {
+            status: DeviceReadStatus::Computed,
+            actions: Vec::new(),
+            udf,
         }
     }
 
     /// Shorthand for a computed read with actions.
-    pub fn computed_with(actions: Vec<ProcessAction>) -> Self {
+    pub fn computed_with(udf: DeviceUdf, actions: Vec<ProcessAction>) -> Self {
         Self {
-            did_compute: true,
+            status: DeviceReadStatus::Computed,
             actions,
+            udf,
         }
     }
+
+    /// The read produced no value; what happens to UDF is the argument.
+    pub fn no_value(udf: DeviceUdf) -> Self {
+        Self {
+            status: DeviceReadStatus::NoValue,
+            actions: Vec::new(),
+            udf,
+        }
+    }
+
+    /// The read produced no value and said nothing about UDF; the record's
+    /// previous VAL and UDF both stand.
+    ///
+    /// C equivalent: `read_ai()` returns -1.
+    pub fn failed() -> Self {
+        Self::no_value(DeviceUdf::Untouched)
+    }
+
+    /// The read produced no value and the record's value is undefined.
+    ///
+    /// C equivalent: `read_ai()` returns -2, which every reference user pairs
+    /// with `prec->udf = 1`.
+    pub fn undefined() -> Self {
+        Self::no_value(DeviceUdf::Undefined)
+    }
+
+    /// What this read said about `prec->udf`.
+    pub fn udf(&self) -> DeviceUdf {
+        self.udf
+    }
+
+    /// Whether the read declares the record's value undefined (C
+    /// `prec->udf = 1`).
+    pub fn asserts_undefined(&self) -> bool {
+        matches!(self.udf, DeviceUdf::Undefined)
+    }
+
+    /// Whether the record must skip its built-in conversion — true for every
+    /// status but [`DeviceReadStatus::Converted`].
+    pub fn did_compute(&self) -> bool {
+        self.status.skips_conversion()
+    }
+}
+
+/// Whether a device support's `init_record` left the record able to process.
+///
+/// C's `init_record` failure has two shapes and they are not the same record
+/// afterwards:
+///
+/// * `recGblRecordError(status, prec, ...); return status` — the record is
+///   flagged and still processes. `devBiDbState.c:28-31` rejects an illegal INP
+///   this way, `devGeneralTime.c:60-63` an illegal record type, and
+///   `iocInit.c::doInitRecord1` discards the status, so the record scans on.
+///   That is [`Err`] from [`DeviceSupport::init`].
+/// * the `bad:` arm — `pr->pact = 1; return -1`
+///   (`devAsynXXXTimeSeries.h:118-120`, and with a LINK_ALARM in
+///   `devAsynInt32.c:348-351` and its Float64/Int64/UInt32Digital twins). PACT
+///   is set at init and nothing ever clears it, so `dbProcess` takes its
+///   already-active branch (`dbAccess.c:536-556`) on every later entry: the
+///   record is DEAD. That is [`Dead`](Self::Dead).
+///
+/// The distinction is user-visible, which is why it needs a type rather than a
+/// severity: a dead waveform reads PACT=1 and BUSY=0 forever, `caput REC.RARM 1`
+/// sets RPRO and processes nothing (`dbAccess.c:1267-1271`), and a *scanned*
+/// dead record collects SCAN_ALARM/INVALID once `lcnt` passes MAX_LOCK.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum DeviceInitOutcome {
+    /// C `return INIT_OK` / `return 0` — the record processes normally.
+    #[default]
+    Live,
+    /// C's `bad:` arm — `pr->pact = 1`. The framework sets PACT and never
+    /// releases it, so the record never processes again.
+    ///
+    /// Device support prints its own diagnostic before returning this, exactly
+    /// as C `errlogPrintf`s before `goto bad`. The alarm rides along because the
+    /// C arms do not agree on one and none of them can be reconstructed later:
+    /// `devAsynXXXTimeSeries.h:118-120` raises none, while `devAsynInt32.c:348-351`
+    /// and `devAsynOctet.c::initCmdBuffer:632-636` call `recGblSetSevr(precord,
+    /// LINK_ALARM, INVALID_ALARM)` on the record itself, at init, next to the
+    /// `pact = 1`. A dead record never processes, so a per-read alarm channel
+    /// can never deliver it — it has to be applied here or not at all.
+    ///
+    /// Build with [`DeviceInitOutcome::dead`] or
+    /// [`DeviceInitOutcome::dead_with_alarm`].
+    Dead {
+        /// `(STAT, SEVR)` for the `recGblSetSevr` that precedes C's `pact = 1`,
+        /// or `None` for a `bad:` arm that raises nothing.
+        alarm: Option<(u16, AlarmSeverity)>,
+    },
+}
+
+impl DeviceInitOutcome {
+    /// C's bare `bad:` arm — `pr->pact = 1` with no `recGblSetSevr`
+    /// (`devAsynXXXTimeSeries.h:118-120`).
+    pub fn dead() -> Self {
+        Self::Dead { alarm: None }
+    }
+
+    /// C's `bad:` arm with the `recGblSetSevr` that precedes it
+    /// (`devAsynInt32.c:348-351`: `LINK_ALARM` / `INVALID_ALARM`).
+    pub fn dead_with_alarm(stat: u16, sevr: AlarmSeverity) -> Self {
+        Self::Dead {
+            alarm: Some((stat, sevr)),
+        }
+    }
+}
+
+/// One out-of-band PROPERTY post from a device support: the fields it writes
+/// and the one field it posts on.
+///
+/// The two are deliberately different sets. C's enum re-propagation callbacks
+/// (`devAsynInt32.c:712-766`, `devAsynUInt32Digital.c:547-601`, asyn
+/// `e2a281e2`) are three statements under one `dbScanLock`:
+///
+/// ```c
+/// setEnums((char*)&pr->zrst, (int*)&pr->zrvl, &pr->zrsv, ...);
+/// db_post_events(pr, &pr->val, DBE_PROPERTY);
+/// ```
+///
+/// `setEnums` rewrites ZRST/ZRVL/ZRSV… in place and posts on none of them;
+/// the single `db_post_events` names `&pr->val`, so it is the client
+/// monitoring the PV itself that learns the choices moved and re-reads
+/// `DBR_GR_ENUM`. Collapsing the two sets into one field list would post
+/// every state field and nothing on VAL — the opposite of both halves.
+///
+/// Measured end to end against C `libca` clients (R7.0.10 host build), not
+/// just at this layer — the `mbbi_enum_property_ioc` example in `epics-ca-rs`
+/// is the IOC half. On the post, a `DBR_GR_ENUM` + `DBE_PROPERTY`
+/// subscription (base's own attribute-re-read shape, `dbCa.c`) receives a
+/// second event carrying `["OFF","ON","FAULT"]` with `value` unmoved at 1,
+/// and `camonitor -m p` re-renders `One` as `ON`. A `camonitor -m va` on the
+/// same record sees only its initial event, which is the discrimination this
+/// type exists for: re-keyed labels are not a new reading.
+#[derive(Debug, Clone)]
+pub struct PropertyPost {
+    /// Fields to store without posting.
+    pub writes: Vec<(String, crate::types::EpicsValue)>,
+    /// The field `db_post_events` names, posted `DBE_PROPERTY` after the
+    /// writes land, under the same record lock.
+    pub post_field: String,
 }
 
 /// Trait for custom device support implementations.
 /// When DTYP is set to something other than "" or "Soft Channel",
 /// the registered DeviceSupport is used instead of link resolution.
 pub trait DeviceSupport: Send + Sync + 'static {
-    fn init(&mut self, _record: &mut dyn Record) -> CaResult<()> {
-        Ok(())
+    /// C `init_record`. See [`DeviceInitOutcome`] for the two failure shapes:
+    /// `Err` flags the record but leaves it processing, `Ok(Dead)` is C's
+    /// `pr->pact = 1` and stops it for good.
+    fn init(&mut self, _record: &mut dyn Record) -> CaResult<DeviceInitOutcome> {
+        Ok(DeviceInitOutcome::Live)
     }
 
     /// Read from hardware into the record.
@@ -175,7 +446,7 @@ pub trait DeviceSupport: Send + Sync + 'static {
     ///
     /// C parity: `registerInterruptUser(callbackEnum)` (devAsynInt32.c:319)
     /// plus the per-record enum callback
-    /// (`interruptCallbackEnumMbbi`/`…Bi`, devAsynInt32.c:711-762), which
+    /// (`interruptCallbackEnumMbbi`/`…Bi`, devAsynInt32.c:712-766), which
     /// calls `setEnums` to re-key the record's state strings/values/
     /// severities and then `db_post_events(precord, &precord->val,
     /// DBE_PROPERTY)` so CA/PVA clients re-read the enum choices. This is
@@ -183,16 +454,16 @@ pub trait DeviceSupport: Send + Sync + 'static {
     /// record's `SCAN` (it is not a value scan, so it does not process the
     /// record).
     ///
-    /// Each delivered message is the full `(field, value)` set to
-    /// write-and-post (the C `setEnums` field block). The framework drains
-    /// this receiver and calls
-    /// [`crate::server::database::PvDatabase::post_property_fields`].
+    /// Each delivered message is one [`PropertyPost`]: the field block to
+    /// write (the C `setEnums` block) and, separately, the single field
+    /// `db_post_events` names. The framework drains this receiver and calls
+    /// [`crate::server::database::PvDatabase::post_property`].
     /// Mirrors [`io_intr_receiver`](Self::io_intr_receiver): the device owns
     /// the source subscription, the framework owns the post. Default:
     /// `None` (device drives no property posts).
     fn property_post_receiver(
         &mut self,
-    ) -> Option<crate::runtime::sync::mpsc::Receiver<Vec<(String, crate::types::EpicsValue)>>> {
+    ) -> Option<crate::runtime::sync::mpsc::Receiver<PropertyPost>> {
         None
     }
 
@@ -315,6 +586,16 @@ pub trait DeviceSupport: Send + Sync + 'static {
 /// a `SOFT` status and a diagnostic is logged, so the failure is
 /// observable rather than silently attached as healthy.
 ///
+/// On [`DeviceInitOutcome::Dead`] this is also the single owner of
+/// C's `pr->pact = 1` (`devAsynXXXTimeSeries.h:118-120`): the record
+/// enters PACT here and nothing releases it, because the only release
+/// is [`RecordInstance::leave_pact`] at a process-cycle tail and
+/// `dbProcess`'s already-active guard turns every entry away before
+/// the cycle starts. Device support cannot reach `dbCommon` through
+/// the `&mut dyn Record` it holds, so it says *dead* and the framework
+/// performs the transition — the same split as
+/// [`DeviceUdf::Undefined`] and the UDF assertion.
+///
 /// Success clears NOTHING. In C, whether an `init_record` defines the
 /// record is a property of the individual dset, not of the framework:
 /// `devTimestamp.c` declares no `init_record` at all and clears
@@ -330,15 +611,28 @@ pub fn wire_device_to_record(instance: &mut RecordInstance, mut dev: Box<dyn Dev
     let name = instance.name.clone();
     dev.set_record_info(&name, instance.common.scan);
     dev.apply_record_info(&instance.info);
-    if let Err(e) = dev.init(&mut *instance.record) {
-        eprintln!(
-            "device support init failed for record '{name}' (DTYP '{}'): {e}",
-            instance.common.dtyp
-        );
-        // Flag the record so the failure is observable rather
-        // than presenting a healthy-looking record.
-        instance.common.sevr = AlarmSeverity::Invalid;
-        instance.common.stat = crate::server::recgbl::alarm_status::SOFT_ALARM;
+    match dev.init(&mut *instance.record) {
+        Ok(DeviceInitOutcome::Live) => {}
+        Ok(DeviceInitOutcome::Dead { alarm }) => {
+            // C's `bad:` arm. The driver has already printed why. The
+            // `recGblSetSevr` comes first in every C arm that has one, so it
+            // runs before PACT here too — and through the same helper, so a
+            // record already carrying a higher severity keeps it.
+            if let Some((stat, sevr)) = alarm {
+                crate::server::recgbl::rec_gbl_set_sevr(&mut instance.common, stat, sevr);
+            }
+            instance.enter_pact();
+        }
+        Err(e) => {
+            eprintln!(
+                "device support init failed for record '{name}' (DTYP '{}'): {e}",
+                instance.common.dtyp
+            );
+            // Flag the record so the failure is observable rather
+            // than presenting a healthy-looking record.
+            instance.common.sevr = AlarmSeverity::Invalid;
+            instance.common.stat = crate::server::recgbl::alarm_status::SOFT_ALARM;
+        }
     }
     instance.device = Some(dev);
 }
@@ -364,12 +658,24 @@ mod tests {
         init_ran: bool,
     }
 
-    /// Device support that records the wiring order and fails `init`.
+    /// What the probe's `init` returns — the three C shapes.
+    #[derive(Clone, Copy)]
+    enum InitVerdict {
+        /// C `return INIT_OK`.
+        Live,
+        /// C's `bad:` arm — `pr->pact = 1`.
+        Dead,
+        /// C `recGblRecordError(status, ...); return status`, PACT untouched.
+        Fail,
+    }
+
+    /// Device support that records the wiring order and returns `verdict`
+    /// from `init`.
     struct ProbeDev {
         obs: Arc<Mutex<WireObservation>>,
         info: HashMap<String, String>,
         record_info_set: bool,
-        fail_init: bool,
+        verdict: InitVerdict,
     }
     impl DeviceSupport for ProbeDev {
         fn dtyp(&self) -> &str {
@@ -384,17 +690,83 @@ mod tests {
         fn apply_record_info(&mut self, info: &HashMap<String, String>) {
             self.info = info.clone();
         }
-        fn init(&mut self, _record: &mut dyn Record) -> CaResult<()> {
+        fn init(&mut self, _record: &mut dyn Record) -> CaResult<DeviceInitOutcome> {
             let mut o = self.obs.lock().unwrap();
             o.init_ran = true;
             o.record_info_before_init = self.record_info_set;
             o.info_at_init = self.info.keys().cloned().collect();
-            if self.fail_init {
-                Err(CaError::InvalidValue("device init failed".into()))
-            } else {
-                Ok(())
+            match self.verdict {
+                InitVerdict::Live => Ok(DeviceInitOutcome::Live),
+                InitVerdict::Dead => Ok(DeviceInitOutcome::dead()),
+                InitVerdict::Fail => Err(CaError::InvalidValue("device init failed".into())),
             }
         }
+    }
+
+    /// Wire a probe with `verdict` onto a fresh ai and hand back the instance.
+    fn wire(verdict: InitVerdict) -> RecordInstance {
+        let mut instance = RecordInstance::new("TEST:DEAD".to_string(), AiRecord::new(0.0));
+        instance.common.dtyp = "ProbeDev".to_string();
+        wire_device_to_record(
+            &mut instance,
+            Box::new(ProbeDev {
+                obs: Arc::new(Mutex::new(WireObservation::default())),
+                info: HashMap::new(),
+                record_info_set: false,
+                verdict,
+            }),
+        );
+        instance
+    }
+
+    /// C's `bad:` arm sets `pr->pact = 1` and nothing ever clears it, so
+    /// `dbProcess` takes its already-active branch forever
+    /// (`devAsynXXXTimeSeries.h:118-120`, `dbAccess.c:536`). The port had no way
+    /// for device support to reach that state: an invalid FTVL left the driver
+    /// returning an inert `read()` while the record kept processing with PACT=0.
+    #[test]
+    fn wire_device_dead_init_leaves_the_record_in_pact() {
+        let instance = wire(InitVerdict::Dead);
+
+        assert!(
+            instance.is_processing(),
+            "C `bad: pr->pact = 1` — the record must be dead"
+        );
+        assert!(
+            instance.device.is_some(),
+            "a dead record is still addressable; only processing stops"
+        );
+    }
+
+    /// The framework must not invent an alarm for the dead arm: the
+    /// `devAsynXXXTimeSeries.h` `bad:` label raises none (its whole body is
+    /// `pr->pact=1; return -1`), and the arms that do raise one
+    /// (`devAsynInt32.c:349` LINK_ALARM) do it from device support, through the
+    /// driver's own alarm channel.
+    #[test]
+    fn wire_device_dead_init_raises_no_alarm_of_its_own() {
+        let dead = wire(InitVerdict::Dead);
+        let live = wire(InitVerdict::Live);
+
+        assert_eq!(dead.common.sevr, live.common.sevr);
+        assert_eq!(
+            dead.common.stat, live.common.stat,
+            "the dead arm leaves STAT at whatever the record was born with"
+        );
+    }
+
+    /// The other two verdicts leave the record processing. `Err` is C's
+    /// `recGblRecordError(status, prec, ...); return status` with PACT untouched
+    /// (`devBiDbState.c:28-31`, `devGeneralTime.c:60-63`) — a flagged record
+    /// still scans, which is why the dead arm needed a value of its own rather
+    /// than folding into the error channel.
+    #[test]
+    fn wire_device_live_and_failed_inits_leave_the_record_processing() {
+        assert!(!wire(InitVerdict::Live).is_processing());
+        assert!(
+            !wire(InitVerdict::Fail).is_processing(),
+            "an errored init flags the record but must not kill it"
+        );
     }
 
     /// M2 regression: a device support whose `init()` returns `Err`
@@ -410,7 +782,7 @@ mod tests {
             obs: obs.clone(),
             info: HashMap::new(),
             record_info_set: false,
-            fail_init: true,
+            verdict: InitVerdict::Fail,
         });
 
         wire_device_to_record(&mut instance, dev);
@@ -444,7 +816,7 @@ mod tests {
             obs: obs.clone(),
             info: HashMap::new(),
             record_info_set: false,
-            fail_init: false,
+            verdict: InitVerdict::Live,
         });
 
         wire_device_to_record(&mut instance, dev);

@@ -38,7 +38,7 @@ fn a_stream_port_read_notifies_the_octet_interrupt_users() {
     let (rt, _jh) = create_port_runtime(driver, RuntimeConfig::default())
         .expect("the port runtime thread must start");
 
-    let seen: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+    let seen: Arc<Mutex<Vec<Vec<u8>>>> = Arc::new(Mutex::new(Vec::new()));
     let sink = seen.clone();
     let _sub = rt.port_handle().interrupts().register_sync_callback(
         InterruptFilter {
@@ -61,7 +61,7 @@ fn a_stream_port_read_notifies_the_octet_interrupt_users() {
     let got = seen.lock().unwrap().clone();
     assert_eq!(
         got,
-        vec!["READBACK-1".to_string()],
+        vec![b"READBACK-1".to_vec()],
         "a successful octet read on a port with interruptProcess must fan out to the \
          octet interrupt users (C asynOctetBase.c:224-238) — this is what drives \
          SCAN=\"I/O Intr\""

@@ -17,8 +17,7 @@
 //! # Metric names
 //!
 //! All metrics emitted by epics-ca-rs are prefixed with `ca_client_*`
-//! (client side) or `ca_server_*` (server side). See
-//! `doc/10-observability.md` for the full schema.
+//! (client side) or `ca_server_*` (server side).
 
 use std::net::SocketAddr;
 

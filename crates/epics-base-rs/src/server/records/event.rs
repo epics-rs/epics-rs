@@ -114,6 +114,14 @@ impl Record for EventRecord {
         false
     }
 
+    /// The same fact governs a DEVICE read that wrote VAL directly (C
+    /// `return 2`): `eventRecord.c::process` has no `prec->udf` assignment
+    /// outside the `:191` simulation branch, so the dset's own write is final
+    /// and the framework must not re-derive on top of it.
+    fn rederives_udf_on_computed_read(&self) -> bool {
+        false
+    }
+
     /// `eventRecord.c` has NO `checkAlarms` either — an event record with UDF=1
     /// publishes NO_ALARM (softIoc: `record(event,"E2"){}` → UDF 1, SEVR
     /// NO_ALARM, even with the default `UDFS = INVALID`).

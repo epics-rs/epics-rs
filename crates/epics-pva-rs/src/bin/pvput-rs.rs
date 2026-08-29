@@ -44,11 +44,11 @@ struct Args {
     mode: String,
 
     /// Verbose ("make more noise"): print the effective PVA client
-    /// configuration before the PUT. pvxs `tools/put.cpp:56-58,109-110`
+    /// configuration before the PUT. pvxs `tools/put.cpp:58,109-110`
     /// sets `verbose=true` and prints `Effective config` + the client
     /// context config; it does NOT change the value formatter (that is
     /// `-M`). pvxs additionally prints a `Writing fields:` delta of the
-    /// PUT prototype (put.cpp:129) — not reproduced here because the
+    /// PUT prototype (put.cpp:128-131) — not reproduced here because the
     /// prototype is built inside the client, not surfaced to the CLI.
     #[arg(short = 'v', action = clap::ArgAction::Count)]
     verbose: u8,

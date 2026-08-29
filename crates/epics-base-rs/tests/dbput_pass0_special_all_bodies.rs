@@ -4,7 +4,7 @@
 //! external-put one called the record's pass-0 `special()` hook, so a
 //! put-link delivery skipped every pass-0 side effect. The first live
 //! consumer is motor's drive-field DMOV blink (motorRecord.cc:
-//! 2582-2608): without pass-0 on the internal bodies, a same-value
+//! 2591-2620): without pass-0 on the internal bodies, a same-value
 //! put-link into `motor.VAL` refused at the move-block entry gate
 //! instead of pulsing DMOV like C.
 //!

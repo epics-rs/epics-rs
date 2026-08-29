@@ -145,8 +145,9 @@ impl SubscriptionFilter for DeadbandFilter {
     fn apply(&self, event: FilteredMonitorEvent) -> Option<FilteredMonitorEvent> {
         // Non-numeric values (strings, raw byte arrays, etc.) have no
         // deadband semantic — pass unconditionally and don't touch the
-        // state. C reaches this by way of `pfl->type != dbfl_type_val`
-        // and its `send = 1` initialiser (`dbnd.c:69, 75`).
+        // state. C reaches this by way of its `send = 1` initialiser
+        // and the `pfl->type == dbfl_type_val` gate a non-scalar skips
+        // (`dbnd.c:69, 75`).
         let Some(cur) = event.event.snapshot.value.to_f64() else {
             return Some(event);
         };

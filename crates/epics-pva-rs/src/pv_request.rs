@@ -557,8 +557,8 @@ impl PvRequestExpr {
         Ok(out)
     }
 
-    /// Parse using the strict pvxs `PVRParser` grammar
-    /// (`/Users/stevek/codes/epics-modules/pvxs/src/clientreq.cpp:137-283`).
+    /// Parse using the strict pvxs `PVRParser` grammar (pvxs
+    /// `src/clientreq.cpp:137-283` — `PVRParser::{lex,parse_fields,parse_options}`).
     ///
     /// This rejects the lenient pvDataCPP extensions that [`parse`] accepts
     /// — brace member groups (`field(v{a,b})`), per-field option brackets
@@ -930,7 +930,9 @@ struct Parser<'a> {
     input: &'a str,
     pos: usize,
     /// When `true`, restrict the accepted grammar to pvxs `PVRParser`
-    /// (`/Users/stevek/codes/epics-modules/pvxs/src/clientreq.cpp:137-283`):
+    /// (pvxs `src/clientreq.cpp:137-283`, `PVRParser::{lex,parse_fields,`
+    /// `parse_options}`, pin `1.5.1-42-gb568e93` — the file is byte-identical
+    /// at the local worktree `1.5.2-26-gbd2243d`):
     /// names are `[A-Za-z0-9._]+`, the only syntax tokens are `[](),=`,
     /// `field(name,...)` and `record[name=name,...]` are the only shapes,
     /// and option *values* are themselves `name` tokens. That parser has
@@ -1448,9 +1450,8 @@ impl<'a> Parser<'a> {
     }
 
     /// Parse a `record[...]` option list under the strict pvxs grammar
-    /// (`/Users/stevek/codes/epics-modules/pvxs/src/clientreq.cpp:245-283`,
-    /// plus the caller's `lextok==rb` acceptance check at
-    /// clientreq.cpp:211-212).
+    /// (pvxs `src/clientreq.cpp:245-283`, `PVRParser::parse_options`, plus
+    /// the caller's `lextok==rb` acceptance check at `src/clientreq.cpp:213-214`).
     ///
     /// pvxs accepts a list of zero-or-more `key=value` pairs separated by
     /// single commas, with at most one trailing comma. Unlike the lenient
@@ -2258,7 +2259,7 @@ mod tests {
 
     #[test]
     fn builder_record_block_emits_typed_bool() {
-        // pvxs PUT INIT pvRequest carries `bool block` (pvalink_channel.cpp:36).
+        // pvxs PUT INIT pvRequest carries `bool block` (pvxs/ioc/pvalink_channel.cpp:36).
         use crate::pvdata::ScalarType;
         let req = PvRequestBuilder::new().record("block", true).build();
         assert_eq!(

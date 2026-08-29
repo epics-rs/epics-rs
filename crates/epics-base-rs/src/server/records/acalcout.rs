@@ -297,7 +297,7 @@ pub struct AcalcoutRecord {
     /// This cycle's `fetch_values()` outcome, pushed by the framework through
     /// `set_fetch_gate_failed`. C `aCalcoutRecord.c::process` (399) runs
     /// `doCalc` + `afterCalc` only `if (fetch_values(pcalc)==0)`, and
-    /// `fetch_values` (1068-1071) returns at the first failing `dbGetLink`.
+    /// `fetch_values` (1066-1067) returns at the first failing `dbGetLink`.
     fetch_gate_failed: bool,
     cached_should_output: bool,
     /// The output decision captured on an ODLY delaying cycle, restored into
@@ -478,7 +478,7 @@ impl AcalcoutRecord {
     /// if (nRequest<numElements)
     ///     for (j=nRequest; j<numElements; j++) (*pavalue)[j] = 0;
     ///
-    /// /* put_array_info, aCalcoutRecord.c:726-731 — the client dbPut */
+    /// /* put_array_info, aCalcoutRecord.c:729-731 — the client dbPut */
     /// if ( pd && (nNew < numElements) )
     ///     for (i=nNew; i<numElements; i++) pd[i] = 0.;
     /// ```
@@ -518,7 +518,7 @@ impl AcalcoutRecord {
     ///   record's lifetime — nothing ever replaces it, so a write is always INTO it
     ///   and never a swap of it.
     /// * ZERO-FILL: `[nNew, numElements)`, and `numElements` here is always the NUSE
-    ///   window — `acalcGetNumElements` in BOTH writers (`put_array_info:726-731`,
+    ///   window — `acalcGetNumElements` in BOTH writers (`put_array_info:727-731`,
     ///   `fetch_values:1100-1102`), whatever the writer's bound was. See
     ///   [`Self::zero_fill_window`].
     ///
@@ -526,7 +526,7 @@ impl AcalcoutRecord {
     /// not agree:
     ///
     /// * the input link asks `dbGetLink` for `nRequest = acalcGetNumElements(pcalc)`
-    ///   elements (`:1096-1097`), so it can never deliver more than the window;
+    ///   elements (`:1097-1098`), so it can never deliver more than the window;
     /// * a client `dbPut` is clamped at `paddr->no_elements`
     ///   (`dbAccess.c:1361-1362`) — [`Self::dbaddr_no_elements`], which is the whole
     ///   `nelm` buffer under the default SIZE=NELM.
@@ -630,7 +630,7 @@ impl AcalcoutRecord {
     /// bit cannot be set without its store. The caller owns AMASK's accumulation
     /// across the two passes, because C does: the CALC pass is handed `&pcalc->amask`
     /// and resets it (`:326`), and the OCAL pass ORs its own mask in
-    /// (`aCalcoutRecord.c:1289-1291`).
+    /// (`aCalcoutRecord.c:1288-1291`).
     ///
     /// Only the first `n` elements of an array field are written — C's store loops run
     /// `j < arraySize` (`:483-486`), where arraySize is NUSE (or NELM), so elements
@@ -734,8 +734,8 @@ impl AcalcoutRecord {
     }
 
     /// Classify all 25 links and publish INAV..INLV / IAAV..ILLV / OUTV,
-    /// mirroring C `aCalcoutRecord.c::init_record` (209-242) and the
-    /// `special()` re-classification (509-533). No-op without an async context.
+    /// mirroring C `aCalcoutRecord.c::init_record` (209-243) and the
+    /// `special()` re-classification (528-569). No-op without an async context.
     fn refresh_link_status(&self) {
         let mut links: Vec<(&'static str, String, LinkRole)> = Vec::with_capacity(25);
         for i in 0..12 {
@@ -743,7 +743,13 @@ impl AcalcoutRecord {
             links.push((IAAV_NAMES[i], self.ina_links[i].clone(), LinkRole::Input));
         }
         links.push(("OUTV", self.out.clone(), LinkRole::Output));
-        post_link_status(self.async_ctx.as_ref(), &self.link_gen, links);
+        // C `aCalcoutRecord.c:242`, `:569`, `:1157`.
+        post_link_status(
+            self.async_ctx.as_ref(),
+            &self.link_gen,
+            links,
+            crate::server::recgbl::EventMask::VALUE,
+        );
     }
 
     fn pa_index(name: &str) -> Option<usize> {
@@ -812,7 +818,7 @@ impl Record for AcalcoutRecord {
         "acalcout"
     }
 
-    /// C `acalcoutRecord.c::init_record` compiles CALC/OCAL into RPCL/ORPC and
+    /// C `aCalcoutRecord.c::init_record` compiles CALC/OCAL into RPCL/ORPC and
     /// stores the postfix status in CLCV/OCLV (aCalcoutRecord.c:245-261) —
     /// the load-time half of the compile owner. A put goes through
     /// `special()` instead; `put_field` only stores the string, as C's dbPut
@@ -831,7 +837,7 @@ impl Record for AcalcoutRecord {
 
     /// The link-status menus (INAV..INLV, IAAV..ILLV, OUTV) are served read-only
     /// by `get_field`, but the record owns no WRITE path for them — they are
-    /// `SPC_NOMOD`, classified from the link at init (`aCalcoutRecord.c:208-242`)
+    /// `SPC_NOMOD`, classified from the link at init (`aCalcoutRecord.c:209-243`)
     /// and held as the record's `Default` of `Constant`(3) (the port has no
     /// separate init_record seed step). The loader's `.dbd`-initial seed and
     /// `.db field()` apply both key on this predicate to decide whether to WRITE
@@ -890,7 +896,7 @@ impl Record for AcalcoutRecord {
 
     fn set_async_context(&mut self, name: String, db: AsyncDbHandle) {
         self.async_ctx = Some((name, db));
-        // C `init_record` (aCalcoutRecord.c:209-242) classifies all 25 links
+        // C `init_record` (aCalcoutRecord.c:209-243) classifies all 25 links
         // before any process. Every one of them is an acalcout-owned field
         // (OUT included), already applied when `add_record` runs.
         self.refresh_link_status();
@@ -935,7 +941,7 @@ impl Record for AcalcoutRecord {
 
         // C `aCalcoutRecord.c::process` (399-414) wraps BOTH `doCalc` and
         // `afterCalc` in `if (fetch_values(pcalc)==0)`, and `fetch_values`
-        // (1068-1071) returns at the first failing `dbGetLink`. So a failed
+        // (1066-1067) returns at the first failing `dbGetLink`. So a failed
         // input link skips more here than in calc/calcout/sCalcout, whose gate
         // covers only the calc: `afterCalc` (aCalcoutRecord.c:281-345) is where
         // the CALC_ALARM/UDF update, `checkAlarms`, the OOPT decision, the
@@ -988,7 +994,7 @@ impl Record for AcalcoutRecord {
             // record fields — which is why `apply_stores` above must land before this
             // `eval` rebuilds its inputs from them.
             let pass = self.eval(&self.compiled_ocal, n, self.oval, &self.oav);
-            // C `aCalcoutRecord.c:1289-1291` — the OCAL pass gets a LOCAL mask that is
+            // C `aCalcoutRecord.c:1288-1291` — the OCAL pass gets a LOCAL mask that is
             // then OR'd in, so a CALC-pass store stays flagged.
             self.amask |= pass.inputs.amask;
             self.apply_stores(&pass.inputs, n);
@@ -1074,6 +1080,7 @@ impl Record for AcalcoutRecord {
                 )]),
                 actions: vec![ProcessAction::ReprocessAfter(delay)],
                 device_did_compute: false,
+                post_write_fields: Vec::new(),
             });
         }
 
@@ -1133,7 +1140,7 @@ impl Record for AcalcoutRecord {
         let hyst = self.hyst;
         let lalm = self.lalm;
 
-        // Per-level hysteresis (C `aCalcoutRecord.c:865-890`). A zero severity
+        // Per-level hysteresis (C `aCalcoutRecord.c:866-890`). A zero severity
         // disables that level (C `if (hhsv && ...)`), and each level's LALM
         // latch is gated on `recGblSetSevr` actually raising the severity
         // (`:867`, `:873`, `:879`, `:885`) — a level that fires under an
@@ -1208,17 +1215,18 @@ impl Record for AcalcoutRecord {
     /// `set_output_to_ivov` and the module doc.
     ///
     /// The ONLY record-side gate is the output decision: C reaches the IVOA
-    /// switch through `execOutput` (aCalcoutRecord.c:933-937), and `execOutput`
-    /// runs only when `afterCalc`'s OOPT decision says the record outputs
-    /// (:338-352, and the DLYA continuation at :425-428). The severity test
-    /// inside it is `if (pcalc->nsev < INVALID_ALARM)` (:915) — the RECORD's
-    /// severity, from ANY source: a CALC failure, an MS input link, a limit
-    /// alarm at INVALID severity, UDF at UDFS=INVALID. It was gated on
-    /// `calc_alarm` as well, which silently narrowed C's rule to the calc
-    /// failure alone — an acalcout driven INVALID by HIHI/HHSV or by an MS link
-    /// then drove the computed value at IVOA=SetIVOV instead of IVOV. The
-    /// framework already evaluated `nsev` (it is why this hook was called), so
-    /// asking a private flag for the severity is both wrong and redundant.
+    /// switch (aCalcoutRecord.c:912-934) through `execOutput` (`:895-936`),
+    /// which runs only when `afterCalc`'s OOPT decision says the record
+    /// outputs (:338-359, and the DLYA continuation at :421-430). The
+    /// severity test inside it is `if (pcalc->nsev < INVALID_ALARM)` (:904)
+    /// — the RECORD's severity, from ANY source: a CALC failure, an MS input
+    /// link, a limit alarm at INVALID severity, UDF at UDFS=INVALID. It was
+    /// gated on `calc_alarm` as well, which silently narrowed C's rule to the
+    /// calc failure alone — an acalcout driven INVALID by HIHI/HHSV or by an
+    /// MS link then drove the computed value at IVOA=SetIVOV instead of IVOV.
+    /// The framework already evaluated `nsev` (it is why this hook was
+    /// called), so asking a private flag for the severity is both wrong and
+    /// redundant.
     fn apply_invalid_output_value(&mut self, _ivov: EpicsValue) -> CaResult<()> {
         if self.cached_should_output {
             self.set_output_to_ivov();
@@ -1320,7 +1328,7 @@ impl Record for AcalcoutRecord {
     }
 
     /// C `fetch_values` sets NEWM when an INAA..INLL link delivers an array
-    /// DIFFERENT from the one the field held (`aCalcoutRecord.c:1088-1106`):
+    /// DIFFERENT from the one the field held (`aCalcoutRecord.c:1089-1106`):
     ///
     /// ```c
     /// for (j=0; j<numElements; j++) pcalc->paa[j] = (*pavalue)[j];   /* save */
@@ -1349,7 +1357,7 @@ impl Record for AcalcoutRecord {
         let before = self.array_field_value(&self.arr_vals[i]);
         // The LINK's bound, and it is this path's alone: C asks the link for exactly
         // `nRequest = acalcGetNumElements(pcalc)` elements — the NUSE window
-        // (`aCalcoutRecord.c:1096-1097`) — so however long the source array is, no
+        // (`aCalcoutRecord.c:1097-1098`) — so however long the source array is, no
         // more than a window's worth ever arrives. The bound is at the REQUEST, so
         // it belongs here, at the writer, and not in the shared owner: a client
         // `dbPut` reaching that same owner is bounded at `paddr->no_elements`
@@ -1364,7 +1372,7 @@ impl Record for AcalcoutRecord {
         // The write itself — splice into the calloc(nelm) buffer, then zero the
         // rest of the window — is [`Self::write_array_field`], reached through
         // `put_field`. C's two writers do the same two things in the same order
-        // (`fetch_values:1096-1102` and `put_array_info:726-731`); the only thing
+        // (`fetch_values:1097-1102` and `put_array_info:727-731`); the only thing
         // that is this path's alone is NEWM, which only `fetch_values` sets.
         crate::server::record::put_field_internal_default(self, name, value)?;
         if self.array_field_value(&self.arr_vals[i]) != before {
@@ -1805,6 +1813,19 @@ impl Record for AcalcoutRecord {
         InputFetchPolicy::AbortOnFirstFailure
     }
 
+    /// ...but only the SCALAR loop reaches its `dbGetLink` unconditionally. The
+    /// ARRAY loop is wrapped in `if ((*plinkValid==acalcoutINAV_EXT) ||
+    /// (*plinkValid==acalcoutINAV_LOC))` (`aCalcoutRecord.c:1078`), so an array
+    /// link C believes cannot deliver is never read and never gates the cycle —
+    /// which is why a typo'd or not-yet-loaded INAA leaves the record computing
+    /// in C and killed it here. See [`Record::input_link_failure_is_inert`] for
+    /// why this port answers the status question at read time.
+    fn input_link_failure_is_inert(&self, link_field: &str) -> bool {
+        ACALCOUT_INPUT_LINKS[ACALCOUT_NUMERIC_INPUTS..]
+            .iter()
+            .any(|(lf, _)| *lf == link_field)
+    }
+
     fn set_fetch_gate_failed(&mut self, failed: bool) {
         self.fetch_gate_failed = failed;
     }
@@ -1911,7 +1932,7 @@ impl Record for AcalcoutRecord {
     /// mask consults the value — a store that writes the value the field already
     /// held still posts.
     ///
-    /// `afterCalc` (`aCalcoutRecord.c:293-297`), the AMASK half:
+    /// `afterCalc` (`aCalcoutRecord.c:294-298`), the AMASK half:
     ///
     /// ```c
     /// /* post array fields that aCalcPerform wrote to. */
@@ -1983,10 +2004,10 @@ impl Record for AcalcoutRecord {
     }
 
     /// AA..LL post from AMASK/NEWM and from nothing else. C `monitor()` keeps a
-    /// previous copy of every SCALAR input (PA..PL, `aCalcoutRecord.c:1023-1029`)
+    /// previous copy of every SCALAR input (PA..PL, `aCalcoutRecord.c:1024-1029`)
     /// and of OVAL (POVL, `:1039`) and compares them — but it keeps NO previous
     /// copy of an array and compares no array anywhere. The only array
-    /// comparison in the record is inside `fetch_values` (`:1103-1105`), against
+    /// comparison in the record is inside `fetch_values` (`:1104-1106`), against
     /// the link's own previous delivery, and its result IS the NEWM bit.
     ///
     /// (PAA exists, but it is `fetch_values`' scratch buffer for exactly that

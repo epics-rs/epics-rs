@@ -15,7 +15,7 @@
 //! refusing outright (`1/0`, `SQRT(-1)`) — returns from inside the loop, before
 //! the epilogue, and never writes.
 //!
-//! `transformRecord.c:593-597` reads only the status:
+//! `transformRecord.c:593-596` reads only the status:
 //!
 //! ```c
 //! if (sCalcPerform(&ptran->a, 16, NULL, 0, pval, NULL, 0, prpcbuf, ptran->prec)) {
@@ -84,7 +84,7 @@ async fn an_overflowing_result_is_stored_in_the_channel_and_alarms() {
         channel(&db, "A").await,
         f64::INFINITY,
         "C `*presult` is written BEFORE the -1 (sCalcPerform.c:2034-2056), and \
-         transformRecord.c:593-597 never rolls it back"
+         transformRecord.c:593-596 never rolls it back"
     );
     let rec = db.get_record("T").unwrap();
     let g = rec.read();

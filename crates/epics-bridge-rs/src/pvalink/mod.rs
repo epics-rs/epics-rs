@@ -11,9 +11,8 @@
 //! `ParsedLink::Hw` before the scheme arm is ever consulted. `iocInit`
 //! then refuses it — *"can't initialize link type CONSTANT with
 //! \"@pva://UPSTREAM:AI CP\" (type INST_IO)"* — because a soft record's
-//! device support declares CONSTANT. Measured on the target;
-//! `doc/pvalink-rtems-design.md` §12.2, `doc/calink-rtems-design.md`
-//! §10.7. [`config::PvaLinkConfig::parse`] refuses the `@` prefix
+//! device support declares CONSTANT. Measured on the target.
+//! [`config::PvaLinkConfig::parse`] refuses the `@` prefix
 //! outright — one rule with the record loader, not a laxer second one
 //! on a path no record can reach.
 //!
@@ -52,6 +51,8 @@ pub use registry::PvaLinkRegistry;
 
 #[cfg(test)]
 mod seam_guard {
+    use source_guard::{Comments, production};
+
     /// Every timer pvalink arms in production comes from
     /// `epics_base_rs::runtime::task::{sleep, interval, timeout}`, never from
     /// `tokio::time` — the pvalink twin of `epics-pva-rs`'s
@@ -64,7 +65,7 @@ mod seam_guard {
     /// so the scope here is every file, with no host-only exception.
     #[test]
     fn pvalink_scope_timers_go_through_the_runtime_seam() {
-        let files: &[(&str, &str)] = &[
+        let files: &[(&'static str, &'static str)] = &[
             (include_str!("link.rs"), "impl PvaLink"),
             (include_str!("integration.rs"), "impl PvaLinkResolver"),
             (include_str!("registry.rs"), "impl PvaLinkRegistry"),
@@ -72,20 +73,13 @@ mod seam_guard {
         ];
         // Written split so this assertion cannot match its own source text.
         let literal = concat!("tokio", "::time::");
-        for (src, anchor) in files {
-            let prod = match src.find("\n#[cfg(test)]") {
-                Some(i) => &src[..i],
-                None => src,
-            };
+        for &(src, anchor) in files {
+            let prod = production(src, Comments::Strip);
             assert!(
                 prod.contains(anchor),
                 "production slice no longer covers `{anchor}` — the guard would pass vacuously"
             );
-            let hits = prod
-                .lines()
-                .filter(|l| !l.trim_start().starts_with("//"))
-                .filter(|l| l.contains(literal))
-                .count();
+            let hits = prod.lines().filter(|l| l.contains(literal)).count();
             assert_eq!(
                 hits, 0,
                 "pvalink production scope must arm timers through `runtime::task`; \

@@ -1,6 +1,6 @@
 //! R18-22: a CA server that could not get its configured TCP port SAYS SO.
 //!
-//! C `caservertask.c:576-593` compares the port `rsrv_grab_tcp` came back with
+//! C `caservertask.c:578-595` compares the port `rsrv_grab_tcp` came back with
 //! against the configured one and, when they differ, writes five `cas WARNING`
 //! lines — because the consequence is not local: the server keeps the
 //! configured UDP port, so two servers now answer searches on one UDP port and
@@ -18,10 +18,18 @@
 //! cas WARNING: reachable with UDP unicast (a host's IP in EPICS_CA_ADDR_LIST)
 //! ```
 
+// Every case here drives the `softioc-rs` binary as a subprocess, and that
+// binary serves through the async CA front-end, so on `exec_backend` it
+// refuses at startup instead of running. `realtime-ca-ioc` is the entry
+// point that brings a CA IOC up on that backend, through the blocking
+// thread-per-client driver; it is a different binary with a different
+// command line, so these cases follow `softioc-rs` rather than move.
+#![cfg(tokio_backend)]
+
 use std::io::{BufRead, BufReader};
 use std::net::TcpListener;
 use std::process::{Child, Command, Stdio};
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 /// A spawned child that is killed and reaped on every exit path.
 struct Reaped(Child);
@@ -43,7 +51,13 @@ fn a_taken_tcp_port_makes_the_server_print_cs_five_warning_lines() {
 
     let mut ioc = Reaped(
         Command::new(env!("CARGO_BIN_EXE_softioc-rs"))
-            .args(["--port", &port.to_string(), "--pv", "TST:AI:double:1.0"])
+            .args([
+                "-S",
+                "--port",
+                &port.to_string(),
+                "--pv",
+                "TST:AI:double:1.0",
+            ])
             .env("EPICS_CAS_BEACON_ADDR_LIST", "127.0.0.1:1")
             .stdout(Stdio::null())
             .stderr(Stdio::piped())
@@ -53,7 +67,7 @@ fn a_taken_tcp_port_makes_the_server_print_cs_five_warning_lines() {
 
     let stderr = ioc.0.stderr.take().expect("piped stderr");
     let mut reader = BufReader::new(stderr);
-    let deadline = Instant::now() + Duration::from_secs(15);
+    let deadline = Instant::now() + budget::FACT_BUDGET;
     let mut seen: Vec<String> = Vec::new();
     let mut line = String::new();
     // Read until the block under test is complete — NOT until some later
@@ -159,7 +173,13 @@ fn a_free_tcp_port_is_silent() {
 
         let mut ioc = Reaped(
             Command::new(env!("CARGO_BIN_EXE_softioc-rs"))
-                .args(["--port", &port.to_string(), "--pv", "TST:AI:double:1.0"])
+                .args([
+                    "-S",
+                    "--port",
+                    &port.to_string(),
+                    "--pv",
+                    "TST:AI:double:1.0",
+                ])
                 .env("EPICS_CAS_BEACON_ADDR_LIST", "127.0.0.1:1")
                 .stdout(Stdio::null())
                 .stderr(Stdio::piped())
@@ -169,7 +189,7 @@ fn a_free_tcp_port_is_silent() {
 
         let stderr = ioc.0.stderr.take().expect("piped stderr");
         let mut reader = BufReader::new(stderr);
-        let deadline = Instant::now() + Duration::from_secs(15);
+        let deadline = Instant::now() + budget::FACT_BUDGET;
         let mut seen: Vec<String> = Vec::new();
         let mut line = String::new();
         // Outcomes: reached "CA server:" silently (clean pass), or the port was
@@ -210,3 +230,6 @@ fn a_free_tcp_port_is_silent() {
         );
     }
 }
+
+#[path = "common/budget.rs"]
+mod budget;

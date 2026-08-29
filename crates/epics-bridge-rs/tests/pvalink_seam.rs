@@ -26,7 +26,8 @@
 //! installer without the latter.
 #![cfg(all(feature = "qsrv", feature = "pvalink"))]
 
-// RTEMS-EXEC-MODEL-ALLOW(1): checked - these run and pass in the feature-ON suite.
+// RTEMS-EXEC-MODEL-ALLOW(1): checked - these run and pass in the exec-backend
+// suite.
 
 use std::time::Duration;
 

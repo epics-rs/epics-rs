@@ -8,6 +8,15 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
+  # Line tables, not full DWARF. A `cargo nextest run --workspace` target dir
+  # for this workspace measures 91,635 MB here, against the ~86 GB an
+  # ubuntu-latest runner leaves free, and it is nearly all debuginfo: 658 test
+  # binaries at ~300 MB each. Both `checks` and `interop` died writing the
+  # runner's own diagnostic log ("System.IO.IOException: No space left on
+  # device"), which also loses the job log, so the failure arrives with no
+  # output to read. `line-tables-only` keeps the file:line a backtrace is read
+  # with and takes the same target dir to 34,436 MB (measured 2026-08-29).
+  CARGO_PROFILE_DEV_DEBUG: line-tables-only
 
 jobs:
   checks:
@@ -43,47 +52,47 @@ jobs:
       run: cargo nextest run --profile ci --workspace --exclude epics-oracle-rs
     - name: Run doctests
       run: cargo test --doc --workspace
-    # A crate whose IOC binding sits behind a non-default `ioc` feature has
-    # NO tests in the workspace run above: `--all-targets` compiles the
-    # cfg'd-out module away, so a broken call site inside it is invisible and
-    # reads as green. The list below is DERIVED from the manifests rather
-    # than hand-kept, because the hand-kept version silently omitted
-    # `epics-modbus-rs` (167 tests) and `mqtt-rs` (111) — two crates whose
-    # entire record layer went ungated.
-    - name: Test feature-gated code (nextest)
-      run: |
-        set -euo pipefail
-        cargo metadata --no-deps --format-version 1 \
-          | jq -r '.packages[] as $p
-                   | ($p.features | keys[]) as $f
-                   | select($f == "ioc" or $f == "epics")
-                   | select((($p.features.default // []) | index($f)) | not)
-                   | "\($p.name) \($f)"' \
-          | sort -u \
-          | while read -r pkg feat; do
-              echo "::group::$pkg --features $feat"
-              cargo nextest run --profile ci -p "$pkg" --features "$feat" --no-tests=pass
-              echo "::endgroup::"
-            done
 
-  # `rtems-exec-model` is a *different feature resolution*, not an extra file:
-  # it routes the `runtime::task` seam off the tokio reactor onto the std-thread
-  # background executor — the backend the RTEMS build actually runs. The `checks`
-  # job above builds only the default-feature workspace, so nothing there
-  # compiles, let alone exercises, that backend. Every exec-backend regression
-  # found so far (scan ownership, group drain starvation, gateway spawns) was
-  # caught by hand. This job is the standing gate.
+  # Code behind a non-default feature has NO tests in the `checks` job above:
+  # `--all-targets` compiles the cfg'd-out module or test file away, so a
+  # broken call site inside it is invisible and reads as green.
   #
-  # Its own job rather than a step in `checks`: the feature resolution differs,
-  # so the artifacts cannot be shared with the default build anyway, and a
-  # separate job reports the failure under its own name.
+  # ITS OWN JOB, BECAUSE A JOB IS WHAT OWNS A DISK. This used to be a step in
+  # `checks`, looping `cargo nextest run -p <pkg> --features <feat>` over every
+  # (package, feature) pair the manifests declare. Each pair is a distinct
+  # feature resolution of the dependency graph and cargo evicts none of them:
+  # measured at +1,124 MB per pair on top of the 34,436 MB the job's own
+  # workspace resolution already holds, 53 pairs overran the ~86 GB an
+  # ubuntu-latest runner has free and the runner died writing its own log.
+  # Splitting the resolution off gets it a whole runner rather than the
+  # remainder of one.
   #
-  # These are the four crates that declare the feature. `epics-base-rs` forwards
-  # to `epics-ca-rs` (see crates/epics-base-rs/Cargo.toml) and `epics-bridge-rs`
-  # forwards to all three, because Cargo unifies features per package and a
-  # partial forward builds the split state the `HAS_TOKIO_REACTOR` const guard
-  # exists to refuse.
-  rtems-exec-model:
+  # TWO ROWS, BECAUSE THEY ANSWER DIFFERENT QUESTIONS.
+  #
+  # The first RUNS the gated code. `--workspace --all-features` is one
+  # resolution in which every `#[cfg(feature = ...)]` block in the workspace is
+  # compiled and its tests executed — strictly more than the old loop, which
+  # ran only the tests of the one package each pair named.
+  #
+  # The second is `cargo check`, not `nextest`, and that is deliberate: what it
+  # answers is whether a feature resolves ON ITS OWN, which `--all-features`
+  # cannot see (a missing `a = ["b"]` in a manifest is invisible when `b` is on
+  # anyway). Compiling is the whole question there, and `cargo check` costs
+  # +362 MB per pair against nextest's +2,366 MB, so all 53 fit beside the
+  # all-features resolution. This is also the exact form all 53 were verified
+  # in on 2026-08-25.
+  #
+  # The pair list is derived from the manifests, never hand-kept: every feature
+  # a workspace crate declares that its own `default` does not pull in.
+  # `default` itself is excluded because a default feature list never names
+  # itself, so the "not already in default" test would let the literal string
+  # through. A hand-kept list had omitted `epics-modbus-rs` (167 tests) and
+  # `mqtt-rs` (111), and a hand-kept *feature* half enrolled a crate only if
+  # the feature happened to be spelled `ioc` or `epics` — which missed
+  # `epics-base-rs/tests/client_server.rs` (`#![cfg(feature =
+  # "ca-server-tls-test")]`) entirely, letting an `E0308` in it survive from
+  # before 70b4a74b until 0909e7cb.
+  all-features:
     runs-on: ubuntu-latest
 
     steps:
@@ -94,15 +103,101 @@ jobs:
     - uses: taiki-e/install-action@nextest
     - uses: Swatinem/rust-cache@v2
       with:
-        key: rtems-exec-model
-    - name: epics-base-rs (rtems-exec-model)
-      run: cargo nextest run --profile ci -p epics-base-rs --features rtems-exec-model
-    - name: epics-ca-rs (rtems-exec-model)
-      run: cargo nextest run --profile ci -p epics-ca-rs --features rtems-exec-model
-    - name: epics-pva-rs (rtems-exec-model)
-      run: cargo nextest run --profile ci -p epics-pva-rs --features rtems-exec-model
-    - name: epics-bridge-rs (rtems-exec-model)
-      run: cargo nextest run --profile ci -p epics-bridge-rs --features rtems-exec-model
+        key: all-features
+    # epics-oracle-rs boots the compiled C `softIoc` for ground truth and fails
+    # loudly (by design) without the C EPICS tree, which no runner has.
+    - name: Every feature-gated test, compiled and run
+      run: cargo nextest run --profile ci --workspace --all-features --exclude epics-oracle-rs
+    - name: Every feature also resolves on its own
+      run: |
+        set -euo pipefail
+        cargo metadata --no-deps --format-version 1 \
+          | jq -r '.packages[] as $p
+                   | ($p.features | keys[]) as $f
+                   | select($f != "default")
+                   | select((($p.features.default // []) | index($f)) | not)
+                   | "\($p.name) \($f)"' \
+          | sort -u \
+          | while read -r pkg feat; do
+              echo "::group::$pkg --features $feat"
+              cargo check -p "$pkg" --features "$feat" --all-targets
+              echo "::endgroup::"
+            done
+
+  # The exec backend is a different *backend*, not an extra file: it routes the
+  # `runtime::task` seam off the tokio reactor onto the std-thread background
+  # executor — the backend the RTEMS build actually runs. The `checks` job above
+  # builds only the hosted backend, so nothing there compiles, let alone
+  # exercises, this one. Every exec-backend regression found so far (scan
+  # ownership, group drain starvation, gateway spawns) was caught by hand. This
+  # job is the standing gate.
+  #
+  # ONE ROW, NOT FIVE. While the backend was a cargo feature this job listed the
+  # five crates that declared it, one `-p <crate> --features rtems-exec-model`
+  # step each, because a feature is resolved per package: `-p epics-ca-rs` alone
+  # left `epics-libcom-rs`'s own census uncompiled, and a partial forward built
+  # the split state the `HAS_TOKIO_REACTOR` const guard refuses.
+  # `EPICS_RS_BUILD_EXEC_BACKEND` is read by all 23 build scripts directly, so
+  # there is no forwarding graph to get wrong and no reason to name crates: the
+  # whole workspace resolves on one backend, which is the configuration a
+  # deployment actually builds.
+  # THE VARIABLE IS NAMED ONCE, AT JOB SCOPE, AND THE FIRST STEP PROVES IT TOOK
+  #
+  # A misspelled variable NAME is indistinguishable from an unset one — it
+  # selects the hosted backend, silently, which is the exact failure mode this
+  # migration exists to remove and would be worse here than before: a green
+  # job reporting on a backend it never built. So the name appears once, at
+  # `env:` on the job rather than on each step, and the first step is a run
+  # that CANNOT pass on the hosted backend. Every `tests/rtems_exec_model_gate.rs`
+  # is `#![cfg(exec_backend)]`, so on the wrong backend nextest matches no test
+  # and exits non-zero rather than reporting "0 passed".
+  #
+  # The doc row lives here too, for the same one-name reason. It was previously
+  # covered by the `rustdoc` job's `--all-features` row, which turned on
+  # `rtems-exec-model` and was therefore an exec-backend reading that documented
+  # no `#[cfg(tokio_backend)]` item at all. That coverage was real and
+  # accidental; `--all-features` is now the hosted backend like every other row,
+  # so the reading has to be asked for.
+  #
+  # Clippy here is NOT a replacement for anything: no row in this workflow ever
+  # ran clippy at `--all-features`, so the exec backend has never been linted in
+  # CI. The five feature rows this job replaces compiled it at default lint
+  # levels only.
+  exec-backend:
+    runs-on: ubuntu-latest
+
+    env:
+      EPICS_RS_BUILD_EXEC_BACKEND: thread
+
+    steps:
+    - uses: actions/checkout@v4
+    - uses: dtolnay/rust-toolchain@master
+      with:
+        toolchain: 1.94.0
+    - uses: taiki-e/install-action@nextest
+    - uses: Swatinem/rust-cache@v2
+      with:
+        key: exec-backend
+    - name: The exec backend is what this job actually built
+      run: cargo nextest run --profile ci --workspace -E 'binary(rtems_exec_model_gate)'
+    - name: Workspace on the exec backend
+      run: cargo nextest run --profile ci --workspace
+    - name: Clippy on the exec backend
+      run: cargo clippy --workspace --all-targets -- -D warnings
+    - name: rustdoc on the exec backend, private items
+      run: cargo doc --no-deps --keep-going --workspace --document-private-items
+      env:
+        RUSTDOCFLAGS: -D warnings
+    # Two rustdoc rows, because the `rustdoc` job's `--all-features` row used
+    # to be this backend's: while the backend was a cargo feature it rode in
+    # `--all-features`, so that row documented the exec backend and nothing
+    # documented the hosted one. It documents the host now, so without this
+    # step an item that exists only behind a feature would have no rustdoc row
+    # on this backend at all.
+    - name: rustdoc on the exec backend, all features, private items
+      run: cargo doc --no-deps --keep-going --workspace --all-features --document-private-items
+      env:
+        RUSTDOCFLAGS: -D warnings
     # `./scripts/rtems-check.sh` — the RTEMS *target* gate — runs in its own
     # `rtems-closure` job below, not here: it needs a nightly toolchain
     # (`-Zbuild-std`) while this job runs the pinned stable, and its feature
@@ -133,6 +228,16 @@ jobs:
 
     steps:
     - uses: actions/checkout@v4
+    # The C half of the same target, and it runs BEFORE the toolchain install
+    # because it needs none: `cc` and four seconds. `rtems-check.sh` below is a
+    # `cargo check`, which never invokes `cc`, so until this step existed no job
+    # in this repository compiled a single line of `crates/epics-rtems-boot/csrc`
+    # — a change to the boot shim could not turn CI red. POSIX_Init is covered
+    # here too, compiled for the host against the RTEMS declarations recorded in
+    # `csrc/tests/rtems-api/`; what is still outside is `rtems_config.c` and
+    # `rtems_stats.c`, and the script says why.
+    - name: Compile and run the host-reachable boot shim sources
+      run: ./scripts/csrc-check.sh
     - uses: dtolnay/rust-toolchain@master
       with:
         toolchain: nightly
@@ -215,6 +320,14 @@ jobs:
   # `check`, not `build`/`nextest`: the failure mode being gated is compilation
   # under a feature resolution nobody exercises locally, and a type-check catches
   # all three of the breaks b7a6b0ab found at a fraction of the cost.
+  #
+  # `--all-targets` because without it the job sees libraries only, and the same
+  # debt reappeared in `tests/`: three asyn-rs integration tests were
+  # auto-discovered rather than declared with `required-features = ["epics"]`,
+  # so cargo compiled them against an `epics_base_rs` the configuration does not
+  # have. asyn-rs is the crate whose declared embedded configuration IS the
+  # empty feature selection (`scripts/rtems-check.sh`), so that break was real
+  # and this job was the gate that should have held it.
   no-default-features:
     runs-on: ubuntu-latest
 
@@ -227,7 +340,7 @@ jobs:
       with:
         key: no-default-features
     - name: Check (no default features)
-      run: cargo check --workspace --no-default-features
+      run: cargo check --workspace --no-default-features --all-targets
 
   # Every job above runs each test exactly ONCE, and that is the hole two
   # exec-backend defects walked through: `cancel_is_a_sync_point_resource_released`
@@ -269,18 +382,21 @@ jobs:
     - uses: taiki-e/install-action@nextest
     - uses: Swatinem/rust-cache@v2
       with:
-        key: rtems-exec-model-stress
+        key: exec-backend-stress
     # Compile once up front so a build break reports as a build break rather
     # than as "iteration 1 failed".
-    - name: Build test binary (rtems-exec-model)
-      run: cargo build -p epics-pva-rs --features rtems-exec-model --lib --tests
+    - name: Build test binary (exec backend)
+      run: cargo build -p epics-pva-rs --lib --tests
+      env:
+        EPICS_RS_BUILD_EXEC_BACKEND: thread
     - name: Stress cancel/termination tests, 50 iterations (exec backend ON)
       run: |
         set -u
         iterations=50
         for i in $(seq 1 "$iterations"); do
           echo "::group::iteration $i/$iterations"
-          if ! cargo nextest run --profile ci -p epics-pva-rs --features rtems-exec-model \
+          if ! EPICS_RS_BUILD_EXEC_BACKEND=thread \
+               cargo nextest run --profile ci -p epics-pva-rs \
                --lib --retries 0 \
                -E 'test(/^client_native::operation::tests::/)'; then
             echo "::endgroup::"
@@ -312,30 +428,36 @@ jobs:
   # `--no-default-features`, each with and without `--document-private-items`):
   # 353 distinct diagnostic sites in this workspace, and NO single
   # configuration reaches all of them. Exhaustive search over the twelve puts
-  # the smallest covering set at two; the three below cover all 353.
+  # the smallest covering set at two; the rows below cover all 353.
   #
   #   * `--all-features --document-private-items` — every cargo feature on.
-  #     Reports 15 sites the other two rows do not.
+  #     Reports 15 sites the other rows do not.
   #   * `--no-default-features --document-private-items` — every cargo feature
-  #     off. Reports 19 the other two do not: the `epics-bridge-rs` and
+  #     off. Reports 19 the others do not: the `epics-bridge-rs` and
   #     `epics-tools-rs` lib docs are compiled only here.
   #   * `--document-private-items` at default features — reports 0 that the
-  #     other two miss TODAY, and is kept for a class that is not
-  #     hypothetical. `--all-features` turns on `rtems-exec-model`, which is
-  #     `exec_backend`, so every `#[cfg(tokio_backend)]` item is compiled out
-  #     of the first row; `--no-default-features` compiles the whole CA
-  #     `client` module out of the second. `client/transport.rs:394` was a
-  #     `tokio_backend`-only doc that this row and no other of the twelve
-  #     reported; it is closed earlier on this branch, which is why the row
-  #     now reports nothing of its own.
+  #     others miss TODAY, and is kept for a class that is not hypothetical:
+  #     `--no-default-features` compiles the whole CA `client` module out of
+  #     the second row.
   #
-  # DROPPED — 9 of the 12, each measured to contribute zero sites the three
-  # rows above do not already report: `rtems-exec-model`, `linux-rt` and the
-  # two together (with and without `--document-private-items`, 6 rows);
+  # A FOURTH reading — the exec backend — is required and is NOT here: it runs
+  # in the `exec-backend` job, where the variable that selects it is named once
+  # and proven to have taken. `--all-features` used to turn on
+  # `rtems-exec-model`, so the first row was an exec-backend reading that
+  # documented no `#[cfg(tokio_backend)]` item at all; that coverage was real
+  # and accidental, and the axis was invisible in this list. `--all-features` is
+  # now the hosted backend like every other row here.
+  #
+  # DROPPED — 9 of the 12, each measured to contribute zero sites the rows
+  # above do not already report: `rtems-exec-model`, `linux-rt` and the two
+  # together (with and without `--document-private-items`, 6 rows);
   # `--all-features` and `--no-default-features` without private items (2);
   # and plain default features without private items (1). Every named feature
   # is a subset of what `--all-features` turns on, which is why dropping them
-  # is a measurement and not a budget cut.
+  # is a measurement and not a budget cut. The 9 were measured when
+  # `rtems-exec-model` was still a feature and the exec-backend reading came in
+  # through `--all-features`; the new row above restores that reading as its
+  # own axis rather than inheriting it.
   #
   # `--document-private-items` on all three rows: private docs are what a
   # contributor reads, and turning it on takes the population from 191 sites
@@ -377,6 +499,7 @@ jobs:
       run: cargo doc --no-deps --keep-going --workspace --document-private-items
       env:
         RUSTDOCFLAGS: -D warnings
+
 
   # The host job above cannot see a link that only exists on an embedded
   # target, and that is not a small remainder: documenting the RTEMS closure
@@ -429,11 +552,23 @@ jobs:
   # `map_epics_priority`, `map_epics_priority_rtems`, `map_epics_priority_vxworks`
   # and `rtems_core_priority` are each private and each gated to one
   # `target_os`, so a doc under one gate citing an item under another resolves
-  # in no configuration. Measured on `epics-libcom-rs` at this commit: 0 sites
-  # without the flag on either target, 1 (RTEMS) and 3 (VxWorks) with it.
+  # in no configuration. `epics-libcom-rs` was 0 sites without the flag on
+  # either target and 1 (RTEMS) / 3 (VxWorks) with it when this job landed;
+  # those four are closed. The one site the crate reads today is a different
+  # and target-independent one, so the flag still has no live example of the
+  # one-target-only shape that justifies it.
   #
-  # Red the day it lands, like the host job: 233 sites on RTEMS and 234 on
-  # VxWorks at this commit, plus `asyn-rs`, whose row does not reach rustdoc.
+  # Still red, and against a different backlog than the one this comment was
+  # first written for. Measure this on the union of the branch tips in flight,
+  # never on one of them: 6 sites on RTEMS and the same 6 on VxWorks, every one
+  # of them present only on `1976f53b2` — 5 in `epics-base-rs`
+  # (`server/ioc_app.rs`, `server/iocsh/{misc_commands,mod}.rs`) and 1 in
+  # `epics-libcom-rs` (`runtime/log.rs`), split 3 unresolved-link / 3
+  # private-item. The `epics-ca-rs` sites an earlier reading of this comment
+  # named are gone, closed on `1976f53b2` and `332b2b0c5`; that reading was
+  # taken on a single tip and was already false of the union when it was
+  # written. Read-only union tree `e69475a27` (`git merge-tree`), the other
+  # five crates exit 0 on both targets.
   rustdoc-embedded:
     runs-on: ubuntu-latest
     timeout-minutes: 45
@@ -453,12 +588,12 @@ jobs:
     # the same reason those scripts name their target binaries one by one.
     #
     # `asyn-rs` joined that closure in `8ea3459f`, and its `epics` selection is
-    # the scripts' `CRATE_FEATURES[asyn-rs]`. Its row cannot pass yet on any
-    # tree where `asyn-rs` still names `socket2` as a production dependency:
-    # `socket2` does not compile for either triple (20 errors on
-    # `armv7-rtems-eabihf`, 12 on `x86_64-wrs-vxworks`, measured), so the row
-    # dies before rustdoc runs. It goes green with the same `runtime::socket`
-    # swap the two gate scripts already depend on.
+    # the scripts' `CRATE_FEATURES[asyn-rs]`. Its row used to die before
+    # rustdoc ran, because `socket2` was a production dependency and does not
+    # compile for either triple (20 errors on `armv7-rtems-eabihf`, 12 on
+    # `x86_64-wrs-vxworks`, measured). The `runtime::socket` swap the two gate
+    # scripts depend on has landed: `socket2` is now a host-only
+    # `dev-dependency`, and the row documents the crate on both targets.
     - name: rustdoc for armv7-rtems-eabihf
       env:
         RUSTDOCFLAGS: -D warnings

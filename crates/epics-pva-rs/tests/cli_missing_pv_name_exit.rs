@@ -21,7 +21,7 @@
 
 // Host-only: drives the built CLI binaries out of process, and those are
 // the tokio-backend builds.
-#![cfg(not(feature = "rtems-exec-model"))]
+#![cfg(tokio_backend)]
 
 use std::process::Command;
 

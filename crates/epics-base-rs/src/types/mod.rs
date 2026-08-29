@@ -1,6 +1,6 @@
 pub mod c_cast;
 pub mod c_parse;
-mod codec;
+pub(crate) mod codec;
 mod dbr;
 mod pv_string;
 mod value;

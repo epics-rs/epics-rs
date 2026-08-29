@@ -4,9 +4,9 @@
 //! ```c
 //! case scalerRecordCNT:
 //!     if (pscal->cnt && (pscal->us != USER_STATE_IDLE)) return(0);
-//!     status = dbPutLink(&pscal->coutp, DBR_SHORT, &pscal->cnt, 1);   /* :624 */
+//!     status = dbPutLink(&pscal->coutp, DBR_SHORT, &pscal->cnt, 1);   /* :625 */
 //!     ...
-//!     pscal->us = USER_STATE_REQSTART;                                /* :638 */
+//!     pscal->us = USER_STATE_REQSTART;                                /* :639 */
 //! ```
 //!
 //! `dbPutField` runs `dbPut` (→ `special(after=1)` → this `dbPutLink`, target
@@ -24,6 +24,14 @@
 //!
 //! The `COUT` link (`:457`) is the negative control: C writes THAT one from
 //! `process()`, after arming, so its target must still see `SS == COUNTING`.
+
+// RTEMS-EXEC-MODEL-ALLOW(5): checked, not waived — all 5 ran and passed
+// on the exec backend (measured on this tree:
+// `EPICS_RS_BUILD_EXEC_BACKEND=thread cargo nextest run -p scaler-rs
+// --all-features`, 112/112). scaler-rs became a census subject when its
+// `build.rs` began deriving `tokio_backend`; nothing here builds a CA
+// server, and the reactor these obtain comes from `#[tokio::test]`
+// itself, which the backend does not remove.
 
 use std::collections::HashSet;
 
@@ -143,12 +151,11 @@ async fn r10_64_coutp_target_sees_the_scaler_before_it_is_armed() {
 ///
 /// Each COUTP put is a `dbPutLink` → `dbPut` landing CNT in the target's VAL,
 /// and a calc's VAL is NOT `pp(TRUE)` — so C's `dbPut` tail
-/// (`dbAccess.c:1414-1418`) posts the RAW link write (the CNT value, 0)
+/// (`dbAccess.c:1411-1413`) posts the RAW link write (the CNT value, 0)
 /// unconditionally before the `PP` process re-latches SS and the deadband
 /// posts that. Four events per stop, interleaved put/process/put/process.
 /// (An earlier revision expected only the two process posts — that encoded
-/// the port's missing `dbPut` post, `doc/calink-rtems-design.md` §11.7
-/// item 2, not C.)
+/// the port's missing `dbPut` post, not C.)
 #[tokio::test]
 async fn r10_64_a_user_stop_runs_the_two_coutp_puts_in_c_order() {
     let db = db_with_link_targets().await;
@@ -160,7 +167,7 @@ async fn r10_64_a_user_stop_runs_the_two_coutp_puts_in_c_order() {
     assert_eq!(
         drain(&mut trigp),
         vec![
-            // :624 put of CNT=0 into TRIGP.VAL — dbPut's own post…
+            // :625 put of CNT=0 into TRIGP.VAL — dbPut's own post…
             0.0,
             // …then the PP process latches SS, still COUNTING.
             SCALER_STATE_COUNTING,
@@ -169,9 +176,9 @@ async fn r10_64_a_user_stop_runs_the_two_coutp_puts_in_c_order() {
             // …and its process latches the now-IDLE scaler.
             SCALER_STATE_IDLE,
         ],
-        "special()'s put fires first, with the count still running (:624); \
+        "special()'s put fires first, with the count still running (:625); \
          process()'s second put fires after the stop (:463); each put also \
-         posts its raw write per C dbPut:1414-1418 (calc VAL is not pp)"
+         posts its raw write per C dbPut:1411-1413 (calc VAL is not pp)"
     );
 }
 

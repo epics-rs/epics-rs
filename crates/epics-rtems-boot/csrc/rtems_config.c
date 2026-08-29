@@ -94,7 +94,7 @@ extern void *POSIX_Init(void *argument);
  * with "undefined reference to `rtems_bdbuf_configuration'" from
  * librtemscpu.a(bdbuf.c.70.o). RTEMS_BSD_CONFIG_BSP_CONFIG above pulls in this
  * BSP's nexus devices, which include the two Arasan SDHCI controllers, and the
- * SD/MMC stack references bdbuf unconditionally. confdefs/bdbuf.h:54,133 only
+ * SD/MMC stack references bdbuf unconditionally. confdefs/bdbuf.h:54,133 (rtems_6) only
  * defines rtems_bdbuf_configuration under this macro, so on a BSP whose nexus
  * device set contains a block device the directive is not optional.
  */
@@ -124,8 +124,8 @@ extern void *POSIX_Init(void *argument);
  * descriptor however many threads serve it.
  *
  * VERIFIED on the bring-up box: CONFIGURE_MAXIMUM_FILE_DESCRIPTORS is the
- * correct RTEMS 6 spelling. confdefs/libio.h:89 is what reads it, and
- * confdefs/obsolete.h:109-111 turns the older CONFIGURE_LIBIO_MAXIMUM_FILE_-
+ * correct RTEMS 6 spelling. confdefs/libio.h:89 (rtems_6) is what reads it, and
+ * confdefs/obsolete.h:109-111 (rtems_6) turns the older CONFIGURE_LIBIO_MAXIMUM_FILE_-
  * DESCRIPTORS into a #warning that it "has been renamed to
  * CONFIGURE_MAXIMUM_FILE_DESCRIPTORS since RTEMS 5.1".
  *

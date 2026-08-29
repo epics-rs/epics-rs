@@ -1,13 +1,13 @@
 //! A2 — a `RULE(...) { CALC(...) }` applies only when the result lands in
 //! C's `(0.99, 1.01)` band, not merely when it is non-zero.
 //!
-//! `asLibRoutines.c:972`:
+//! `asLibRoutines.c:963`:
 //!
 //! ```c
 //! pasgrule->result = ((result>.99) && (result<1.01)) ? 1 : 0;
 //! ```
 //!
-//! consumed at `:1048` as `pasgrule->result==1`. The open interval is a
+//! consumed at `:1039` as `pasgrule->result==1`. The open interval is a
 //! tolerance for float error around 1; it is deliberately not `== 1.0` and
 //! deliberately not "truthy". A CALC returning 2, -1, 0.5 or 3 does NOT apply
 //! its rule, so `caput` is refused `ECA_NOWTACCESS`.

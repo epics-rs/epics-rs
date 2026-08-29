@@ -222,6 +222,8 @@ struct Parsed {
     /// record-type-major (`dbScan.c:1054-1076`). Distinct from `records`,
     /// which is sorted by name so the generated table has a stable shape.
     order: Vec<String>,
+    /// Every `variable()` declaration, from every `.dbd` in the directory.
+    variables: Vec<parse::Variable>,
 }
 
 fn parse_dir(dbd_dir: &Path, common: &[parse::Field]) -> Result<Parsed, String> {
@@ -241,6 +243,7 @@ fn parse_dir(dbd_dir: &Path, common: &[parse::Field]) -> Result<Parsed, String> 
         records: Vec::new(),
         devices: Vec::new(),
         order: Vec::new(),
+        variables: Vec::new(),
     };
     let mut by_file: Vec<(String, Vec<String>)> = Vec::new();
     for path in &paths {
@@ -253,6 +256,7 @@ fn parse_dir(dbd_dir: &Path, common: &[parse::Field]) -> Result<Parsed, String> 
             dbd.records.iter().map(|r| r.name.clone()).collect(),
         ));
         out.devices.extend(dbd.devices);
+        out.variables.extend(dbd.variables);
         for (name, menu) in dbd.menus {
             if let Some(prev) = out.menus.insert(name.clone(), menu) {
                 // Two `.dbd` files declaring the same menu name with different
@@ -352,8 +356,8 @@ fn generate(
             .flat_map(|r| r.fields.iter())
             .filter(|f| !f.from_common)
     };
-    let internal = own().filter(|f| emit::is_internal(f)).count();
-    let emitted = own().filter(|f| !emit::is_internal(f)).count();
+    let internal = own().filter(|f| emit::is_dropped_internal(f)).count();
+    let emitted = own().filter(|f| !emit::is_dropped_internal(f)).count();
     let dbaddr = own()
         .filter(|f| f.special.as_deref() == Some("SPC_DBADDR"))
         .count();
@@ -375,6 +379,7 @@ fn generate(
         // A downstream target's record types are unknown to it by construction
         // — the same way C's `recordTypeList` holds them behind base's.
         order: if target.is_base() { &parsed.order } else { &[] },
+        variables: &parsed.variables,
         // `dbCommon` is modelled once, by base, and emitted once, into base's
         // table. A downstream module neither re-emits it nor re-declares it.
         common: if target.is_base() { common } else { &[] },

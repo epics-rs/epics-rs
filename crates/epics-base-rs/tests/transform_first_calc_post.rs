@@ -2,7 +2,7 @@
 //! only the ones that moved.
 //!
 //! ```c
-//! /* transformRecord.c:790-808 */
+//! /* transformRecord.c:793-807 */
 //! monitor_mask = recGblResetAlarms(ptran);
 //! monitor_mask = DBE_VALUE | DBE_LOG;
 //! for (i = 0, pnew = &ptran->a, pprev = &ptran->la; i < MAX_FIELDS; i++, pnew++, pprev++) {

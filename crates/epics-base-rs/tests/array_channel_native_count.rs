@@ -22,7 +22,8 @@
 //!
 //! Deliberately NOT in this family:
 //!
-//! * `histogram` — C sets both to `NELM` (`:303`, `:315`); there is no split.
+//! * `histogram` — C sets both to `NELM` (`histogramRecord.c:303`, `:315`);
+//!   there is no split.
 //! * `lsi` / `lso` / `printf` — C's `cvt_dbaddr` sets `no_elements = 1` and
 //!   `field_type = DBF_STRING` (`lsiRecord.c:141-143`): a long string is ONE
 //!   string element on the channel, not a capacity. The CA server already
@@ -122,7 +123,7 @@ fn acalcout_arrays_announce_the_size_gated_capacity() {
         assert_eq!(
             rec.field_native_count(f),
             Some(3),
-            "{f}: SIZE=NUSE narrows the channel to the window (:628)"
+            "{f}: SIZE=NUSE narrows the channel to the window (:624)"
         );
     }
 

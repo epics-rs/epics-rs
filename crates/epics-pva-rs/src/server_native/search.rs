@@ -39,7 +39,7 @@ use super::source::DynSource;
 // It does NOT consult `protocols`, and that is upstream parity rather than an
 // omission: pvxs `serverchan.cpp:185-192` decodes the TCP circuit's protocol
 // list into a local `foundtcp` and then never reads it — `onSearch` is called
-// unconditionally at `:216` and the reply always names "tcp" at `:246`. The
+// unconditionally at `:216` and the reply always names "tcp" at `:242`. The
 // protocol gate is a *broadcast* rule (see the module doc above), so wiring
 // one in here would make us answer strictly fewer TCP-circuit SEARCHes than
 // pvxs does. `tcp.rs` states the same conclusion at its call site.
@@ -73,7 +73,7 @@ pub(crate) struct SearchRequest {
     /// True when the SEARCH header had the `MustReply` flag (`0x01`,
     /// `pva_search_flags::MustReply`) set — pvlist-style discovery
     /// probes set this so every reachable server answers even with
-    /// `nreply==0`. pvxs honours it at `server.cpp:730-732`
+    /// `nreply==0`. pvxs honours it at `src/server.cpp:715-717`
     /// (`if(nreply==0 && !msg.mustReply) return;`).
     pub(crate) must_reply: bool,
     /// the transport protocols the client requested in this
@@ -222,7 +222,7 @@ pub(crate) async fn matched_cids_for_requester(
 
 /// Build a SEARCH_RESPONSE frame with explicit protocol name.
 ///
-/// pvxs `server.cpp:743-746`: when `nreply==0`, the `found` byte is set to
+/// pvxs `src/server.cpp:728-729`: when `nreply==0`, the `found` byte is set to
 /// `0` (clients see "this server has none of those names" rather than
 /// "this server has empty matches"). When `cids` is empty the response is
 /// still a valid frame — used as an answer to `MustReply`-flagged

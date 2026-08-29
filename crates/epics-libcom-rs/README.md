@@ -38,11 +38,23 @@ own copy of the predicate to it with a `const _: () = assert!(…)` —
 
 | feature | what it does |
 |---|---|
-| `rtems-exec-model` | select `exec_backend` on a **hosted** target. For a Linux (e.g. PREEMPT_RT) blocking-front-end deployment that wants the same runtime-free spawn/timer backend the RTEMS build uses, driving async record-processing completion on dedicated OS threads instead of a tokio runtime. Off by default; the hosted default is byte-identical without it. |
 | `linux-rt` | back `runtime::sync::PriorityInheritanceMutex` with a `pthread_mutex_t` carrying `PTHREAD_PRIO_INHERIT` (epics-base 7-E `5a8b6e41`). No-op off Linux. Only enable where threads run `SCHED_FIFO`/`SCHED_RR` and unbounded priority inversion is a real risk. |
 
-Both are forwarded by `epics-base-rs`, so `--features epics-base-rs/linux-rt`
-and `--features epics-base-rs/rtems-exec-model` mean what they always did.
+`epics-base-rs` forwards it, so `--features epics-base-rs/linux-rt` means what
+it always did.
+
+## Backend lever
+
+`EPICS_RS_BUILD_EXEC_BACKEND=thread` selects `exec_backend` on a **hosted**
+target: a Linux (e.g. PREEMPT_RT) blocking-front-end deployment that wants the
+same runtime-free spawn/timer backend the RTEMS build uses, driving async
+record-processing completion on dedicated OS threads instead of a tokio
+runtime. Unset or `tokio` is the hosted default. It is a variable and not a
+cargo feature because a feature that flips a backend is not additive: while it
+was one, `--all-features` turned the reactor *off* and no single invocation
+meant "everything on". Every `build.rs` that reads it also emits
+`cargo::rerun-if-env-changed`, so changing the value rebuilds what depends on
+it.
 
 ## RTEMS
 

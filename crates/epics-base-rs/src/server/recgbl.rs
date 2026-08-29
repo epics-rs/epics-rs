@@ -1,5 +1,5 @@
 use crate::server::record::{AlarmSeverity, CommonFields};
-use crate::types::DbFieldType;
+use crate::types::{DbFieldType, DbfCode};
 
 pub mod simm;
 
@@ -120,7 +120,7 @@ impl std::ops::BitAnd for EventMask {
     }
 }
 
-/// The record fields C `recGblResetAlarms` posts ITSELF (recGbl.c:201-217):
+/// The record fields C `recGblResetAlarms` posts ITSELF (recGbl.c:202-222):
 /// `db_post_events(&sevr, …)`, `db_post_events(&stat, …)`,
 /// `db_post_events(&amsg, …)` and `db_post_events(&acks, DBE_VALUE)`.
 ///
@@ -173,10 +173,10 @@ pub struct AlarmResetResult {
 
 /// Set new alarm severity if it's higher than current nsta/nsev.
 ///
-/// Returns C's `int` result (`recGbl.c:254`/`:256`): TRUE only when
+/// Returns C's `int` result (`recGbl.c:253`/`:255`): TRUE only when
 /// `prec->nsev < new_sevr` actually raised the pending state. That return
 /// is not decoration — it is the gate on every hysteresis latch in the
-/// tree (`if (recGblSetSevr(...)) prec->lalm = alev;`, `aiRecord.c:404-406`
+/// tree (`if (recGblSetSevr(...)) prec->lalm = alev;`, `aiRecord.c:405-406`
 /// and its siblings). A level that fires but LOSES the severity compare
 /// must not move `LALM`, or the next cycle's
 /// `lalm == alev && val >= alev - hyst` clause re-fires an alarm C never
@@ -185,7 +185,7 @@ pub struct AlarmResetResult {
 /// Matches EPICS `recGblSetSevr` (recGbl.c:258-261): `recGblSetSevr`
 /// delegates to `recGblSetSevrMsg(..., NULL)` → `recGblSetSevrVMsg`
 /// with `msg == NULL`. When the new severity raises the pending
-/// state, the `msg == NULL` branch (recGbl.c:248-250) executes
+/// state, the `msg == NULL` branch (recGbl.c:249-251) executes
 /// `prec->namsg[0] = '\0'` — i.e. it **clears** any pending alarm
 /// message. A stale `namsg` written by an earlier MSS link (or
 /// `evaluate_alarms`) must not survive when a later, higher-severity
@@ -220,7 +220,7 @@ pub fn rec_gbl_set_sevr(common: &mut CommonFields, stat: u16, sevr: AlarmSeverit
 /// leave STAT=UDF.
 ///
 /// The DISPLAYED severity stays clamped: C clamps `nsev` to `INVALID_ALARM` in
-/// `recGblResetAlarms` (recGbl.c:188), and this stores the clamped
+/// `recGblResetAlarms` (recGbl.c:188-189), and this stores the clamped
 /// [`AlarmSeverity`] so both sides show `INVALID`. `raw_sevr == 0` is a no-op
 /// (NO_ALARM never raises), matching C's `recGblSetSevr(.., 0)`.
 ///
@@ -279,7 +279,7 @@ pub fn rec_gbl_set_sevr_msg(
 /// decides ties. Callers must reproduce C's ORDER, not just C's set of alarms:
 /// a base record raises `SIMM_ALARM` BEFORE its SIOL read (longinRecord.c:414
 /// then :416), so with `SIMS = INVALID` the equal-severity LINK_ALARM loses and
-/// STAT stays SIMM_ALARM; swait raises it AFTER (swaitRecord.c:416 then :420),
+/// STAT stays SIMM_ALARM; swait raises it AFTER (swaitRecord.c:416 then :421),
 /// so LINK_ALARM wins there.
 ///
 /// NOT used for `dbTryGetLink`, which does not call `setLinkAlarm`:
@@ -348,7 +348,7 @@ pub fn rec_gbl_reset_alarms(common: &mut CommonFields) -> AlarmResetResult {
 
     let alarm_changed = common.sevr != prev_sevr || common.stat != prev_stat;
 
-    // C parity (recGbl.c:209-217): when an alarm-class field moved this cycle
+    // C parity (recGbl.c:209-222): when an alarm-class field moved this cycle
     // (C's `if (stat_mask)`, which is exactly `alarm_changed || amsg_changed`),
     // update the alarm-acknowledge severity `acks`. If `ackt` is false (alarm
     // is transient — automatically resets when the condition clears) OR the new
@@ -416,7 +416,7 @@ pub fn udf_alarm_active(udf: u8, exact_one: bool) -> bool {
 /// `msg` is the record's alarm message ([`crate::server::record::Record::udf_alarm_message`]).
 /// Almost every base record raises UDF via plain
 /// `recGblSetSevr(prec, UDF_ALARM, prec->udfs)`, which forwards a NULL
-/// message and leaves `namsg` EMPTY (`recGbl.c:249-261`) — so `msg` is
+/// message and leaves `namsg` EMPTY (`recGbl.c:249-251,258-261`) — so `msg` is
 /// `""` for them, and PVA then serves the `"UDF"` condition string
 /// (`iocsource.cpp:230-236`). Only `mbboDirectRecord.c:191` passes a
 /// literal (`"UDFS"`).
@@ -456,14 +456,14 @@ pub fn get_time_stamp(
 ) -> Option<std::time::SystemTime> {
     if tse == crate::server::record::EPICS_TIME_EVENT_DEVICE_TIME {
         // `epicsTimeEventDeviceTime` (epicsTime.h:104). Device support has
-        // already written the time; C recGbl.c:323-341 makes this the only
+        // already written the time; C recGbl.c:324-342 makes this the only
         // TSE that does not go through `epicsTimeGetEvent`.
         return Some(device_time);
     }
     // Every other TSE is one C call — `epicsTimeGetEvent(&prec->time,
     // prec->tse)` — including 0 and -1, which it dispatches itself. `None`
     // is C's non-zero status: `prec->time` keeps its old value and
-    // `recGblGetTimeStampSimm` errlogs (recGbl.c:324-328).
+    // `recGblGetTimeStampSimm` errlogs (recGbl.c:325-327).
     crate::runtime::general_time::get_event(tse as i32)
 }
 
@@ -480,6 +480,15 @@ pub fn get_time_stamp(
 /// and control defaults are the same numbers by construction, not by two
 /// copies that happen to agree.
 ///
+/// # The discriminator is the declared DBF, and only that
+///
+/// C passes `pdbFldDes->field_type` (`recGbl.c:151`, `:169`): the `.dbd`
+/// declaration, one value, no second opinion. [`DbfCode`] is that value, so
+/// the two facts a caller used to have to supply separately fall out of it —
+/// `DBF_MENU`/`DBF_DEVICE` are codes of their own with no case in the switch,
+/// and a runtime-retyped field declares `DBF_NOACCESS`, which `cvt_dbaddr`
+/// raises at address-build time but never here.
+///
 /// # `None` is a real answer, not "unknown"
 ///
 /// C's switch has **no `default:` branch**. For `DBF_STRING`, `DBF_MENU`,
@@ -490,68 +499,54 @@ pub fn get_time_stamp(
 /// substitutes a range of its own is wrong, and a caller that treats `None` as
 /// "drop the field" is also wrong (the option bit stays on; only a NULL rset
 /// slot clears it, `dbAccess.c:217-220`).
-fn get_max_range_values(
-    field_type: Option<DbFieldType>,
-    is_menu_field: bool,
-) -> Option<(f64, f64)> {
-    // A `DBF_MENU` field is `DbFieldType::Enum` in this port, because the
-    // generator types it as the `DBR_ENUM` it is SERVED as. C keys this switch
-    // on `pdbFldDes->field_type`, where `DBF_MENU` and `DBF_ENUM` are distinct
-    // codes and only `DBF_ENUM` has a case — so a menu field gets no range at
-    // all. Same conflation, same discriminator, as
-    // `PropertySupport::narrowed_to_field`.
-    if is_menu_field {
-        return None;
-    }
-    // `None` = a `runtime_typed` field (`aSub`'s `A`..`U`, `waveform.VAL`).
-    // Its `.dbd` declaration is `DBF_NOACCESS`, and C reads the STATIC
-    // `pdbFldDes->field_type` here (`recGbl.c:151`, `:169`) — `cvt_dbaddr`'s
-    // runtime retype never reaches this switch. NOACCESS has no case, so
-    // nothing is written. This is why `aSub.A`'s control limits are 0.0 in C
-    // despite `aSubRecord.c:372` calling `recGblGetControlDouble`
-    // unconditionally.
-    let field_type = field_type?;
-    Some(match field_type {
-        // recGbl.c:377-380. C's `CHAR_MAX`/`CHAR_MIN` — plain `char`, which is
+fn get_max_range_values(declared_dbf: DbfCode) -> Option<(f64, f64)> {
+    Some(match declared_dbf {
+        // recGbl.c:376-379. C's `CHAR_MAX`/`CHAR_MIN` — plain `char`, which is
         // SIGNED on every target EPICS builds for, so 127/-128, NOT 255/0.
-        DbFieldType::Char => (f64::from(i8::MAX), f64::from(i8::MIN)),
-        // recGbl.c:381-384
-        DbFieldType::UChar => (f64::from(u8::MAX), 0.0),
-        // recGbl.c:385-388
-        DbFieldType::Short => (f64::from(i16::MAX), f64::from(i16::MIN)),
-        // recGbl.c:389-393 — `DBF_ENUM` and `DBF_USHORT` share one case.
-        DbFieldType::Enum | DbFieldType::UShort => (f64::from(u16::MAX), 0.0),
-        // recGbl.c:394-397 — C writes the literals, not `INT_MAX`/`INT_MIN`.
-        DbFieldType::Long => (2147483647.0, -2147483648.0),
-        // recGbl.c:398-401
-        DbFieldType::ULong => (4294967295.0, 0.0),
-        // recGbl.c:402-405. NOTE the upper is 2^63, i.e. `INT64_MAX + 1` —
+        DbfCode::Char => (f64::from(i8::MAX), f64::from(i8::MIN)),
+        // recGbl.c:380-383
+        DbfCode::UChar => (f64::from(u8::MAX), 0.0),
+        // recGbl.c:384-387
+        DbfCode::Short => (f64::from(i16::MAX), f64::from(i16::MIN)),
+        // recGbl.c:388-392 — `DBF_ENUM` and `DBF_USHORT` share one case.
+        DbfCode::Enum | DbfCode::UShort => (f64::from(u16::MAX), 0.0),
+        // recGbl.c:393-396 — C writes the literals, not `INT_MAX`/`INT_MIN`.
+        DbfCode::Long => (2147483647.0, -2147483648.0),
+        // recGbl.c:397-400
+        DbfCode::ULong => (4294967295.0, 0.0),
+        // recGbl.c:401-404. NOTE the upper is 2^63, i.e. `INT64_MAX + 1` —
         // NOT `INT64_MAX`. C writes `9223372036854775808.0` verbatim. This is
         // not a typo to "fix": it is why QSRV2 puts INT64_MIN on BOTH ends of
         // an int64 field's limits (2^63 is out of int64 range, so the
         // double->int64 conversion lands on INT64_MIN, the same value the
         // exactly-representable lower limit converts to).
-        DbFieldType::Int64 => (9223372036854775808.0, -9223372036854775808.0),
-        // recGbl.c:406-409
-        DbFieldType::UInt64 => (18446744073709551615.0, 0.0),
-        // recGbl.c:410-413 — 1e30, not `FLT_MAX`.
-        DbFieldType::Float => (1e30, -1e30),
-        // recGbl.c:414-417 — 1e300, not `DBL_MAX`.
-        DbFieldType::Double => (1e300, -1e300),
+        DbfCode::Int64 => (9223372036854775808.0, -9223372036854775808.0),
+        // recGbl.c:405-408
+        DbfCode::UInt64 => (18446744073709551615.0, 0.0),
+        // recGbl.c:409-412 — 1e30, not `FLT_MAX`.
+        DbfCode::Float => (1e30, -1e30),
+        // recGbl.c:413-416 — 1e300, not `DBL_MAX`.
+        DbfCode::Double => (1e300, -1e300),
         // No case in C's switch: nothing written, caller's 0.0 pre-init wins.
-        DbFieldType::String => return None,
+        // `Menu`/`Device` are here because C's `DBF_MENU`/`DBF_DEVICE` are
+        // codes the switch does not list, and `NoAccess` because that is what
+        // a runtime-retyped field declares.
+        DbfCode::String
+        | DbfCode::Menu
+        | DbfCode::Device
+        | DbfCode::Inlink
+        | DbfCode::Outlink
+        | DbfCode::Fwdlink
+        | DbfCode::NoAccess => return None,
     })
 }
 
 /// C's `recGblGetGraphicDouble` (`recGbl.c:146-153`) — the display limits for a
 /// field the record's own `get_graphic_double` does not list.
 ///
-/// See `get_max_range_values` for what `None` means.
-pub fn rec_gbl_get_graphic_double(
-    field_type: Option<DbFieldType>,
-    is_menu_field: bool,
-) -> Option<(f64, f64)> {
-    get_max_range_values(field_type, is_menu_field)
+/// See `get_max_range_values` for what the argument is and what `None` means.
+pub fn rec_gbl_get_graphic_double(declared_dbf: DbfCode) -> Option<(f64, f64)> {
+    get_max_range_values(declared_dbf)
 }
 
 /// C's `recGblGetControlDouble` (`recGbl.c:164-171`) — the control limits for a
@@ -560,12 +555,9 @@ pub fn rec_gbl_get_graphic_double(
 /// Identical to [`rec_gbl_get_graphic_double`] by construction, because C's two
 /// helpers are identical bodies over the same `get_max_range_values` table.
 ///
-/// See `get_max_range_values` for what `None` means.
-pub fn rec_gbl_get_control_double(
-    field_type: Option<DbFieldType>,
-    is_menu_field: bool,
-) -> Option<(f64, f64)> {
-    get_max_range_values(field_type, is_menu_field)
+/// See `get_max_range_values` for what the argument is and what `None` means.
+pub fn rec_gbl_get_control_double(declared_dbf: DbfCode) -> Option<(f64, f64)> {
+    get_max_range_values(declared_dbf)
 }
 
 /// C's `recGblGetAlarmDouble` (`recGbl.c:155-162`) — the valueAlarm limits for a
@@ -639,6 +631,42 @@ pub fn rec_gbl_get_prec(field_type: Option<DbFieldType>, seed: i16) -> i16 {
     }
 }
 
+/// C `recGblRecordError` (`recGbl.c:59-71`) — the line a record writes when it
+/// refuses one of its own fields.
+///
+/// This is why a refused `dbpf` still speaks even though `dbpf` itself prints
+/// nothing but the read-back: the *record* is the one talking, from its
+/// `special()`, and it talks through the errlog rather than through the shell's
+/// stdout. A port that logs the same event through `tracing` says nothing at
+/// all — no IOC binary installs a subscriber.
+///
+/// C looks the numeric status up with `errSymLookup` and leaves the slot empty
+/// for `status <= 0`, which is where the doubled space in
+/// `"recGblRecordError: scanAdd detected illegal SCAN value  PV: T:A"` comes
+/// from. The port carries typed errors instead of `long` status codes, so the
+/// caller passes the text that lookup would have produced — `""` for C's
+/// non-positive statuses. C's `precord ? ... : "Unknown"` guard is for a null
+/// record, which this signature cannot express.
+pub fn rec_gbl_record_error(status_text: &str, record_name: &str, message: &str) {
+    crate::runtime::log::errlog_printf(&format!(
+        "recGblRecordError: {message} {status_text} PV: {record_name}\n"
+    ));
+}
+
+/// C `recGblDbaddrError` (`recGbl.c:73-91` @R7.0.10) — the same report keyed
+/// on a field address rather than a record, so the PV it names is
+/// `record.FIELD`.
+///
+/// `status_text` is what `errSymLookup` would have produced, passed in for the
+/// same reason [`rec_gbl_record_error`] takes it. `message` is the caller's
+/// `sprintf`ed prefix and carries no newline of its own — C's format string
+/// owns the only one (`recGbl.c:87-90`), so the report is one console line.
+pub fn rec_gbl_dbaddr_error(status_text: &str, record_name: &str, field_name: &str, message: &str) {
+    crate::runtime::log::errlog_printf(&format!(
+        "recGblDbaddrError: {message} {status_text} PV: {record_name}.{field_name}\n"
+    ));
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -648,23 +676,23 @@ mod tests {
     /// from Rust's `T::MAX` where C does not use the macro.
     #[test]
     fn get_max_range_values_matches_the_c_switch() {
-        let r = |t| get_max_range_values(Some(t), false);
-        // recGbl.c:377-380 — CHAR_MAX/CHAR_MIN, signed char.
-        assert_eq!(r(DbFieldType::Char), Some((127.0, -128.0)));
-        // recGbl.c:381-384
-        assert_eq!(r(DbFieldType::UChar), Some((255.0, 0.0)));
-        // recGbl.c:385-388
-        assert_eq!(r(DbFieldType::Short), Some((32767.0, -32768.0)));
-        // recGbl.c:389-393 — one case, both types.
-        assert_eq!(r(DbFieldType::UShort), Some((65535.0, 0.0)));
-        assert_eq!(r(DbFieldType::Enum), Some((65535.0, 0.0)));
-        // recGbl.c:394-397
-        assert_eq!(r(DbFieldType::Long), Some((2147483647.0, -2147483648.0)));
-        // recGbl.c:398-401
-        assert_eq!(r(DbFieldType::ULong), Some((4294967295.0, 0.0)));
-        // recGbl.c:410-413 / :414-417 — 1e30 and 1e300, not FLT_MAX/DBL_MAX.
-        assert_eq!(r(DbFieldType::Float), Some((1e30, -1e30)));
-        assert_eq!(r(DbFieldType::Double), Some((1e300, -1e300)));
+        let r = get_max_range_values;
+        // recGbl.c:376-379 — CHAR_MAX/CHAR_MIN, signed char.
+        assert_eq!(r(DbfCode::Char), Some((127.0, -128.0)));
+        // recGbl.c:380-383
+        assert_eq!(r(DbfCode::UChar), Some((255.0, 0.0)));
+        // recGbl.c:384-387
+        assert_eq!(r(DbfCode::Short), Some((32767.0, -32768.0)));
+        // recGbl.c:388-392 — one case, both types.
+        assert_eq!(r(DbfCode::UShort), Some((65535.0, 0.0)));
+        assert_eq!(r(DbfCode::Enum), Some((65535.0, 0.0)));
+        // recGbl.c:393-396
+        assert_eq!(r(DbfCode::Long), Some((2147483647.0, -2147483648.0)));
+        // recGbl.c:397-400
+        assert_eq!(r(DbfCode::ULong), Some((4294967295.0, 0.0)));
+        // recGbl.c:409-412 / :413-416 — 1e30 and 1e300, not FLT_MAX/DBL_MAX.
+        assert_eq!(r(DbfCode::Float), Some((1e30, -1e30)));
+        assert_eq!(r(DbfCode::Double), Some((1e300, -1e300)));
     }
 
     /// Every branch of C's `recGblGetPrec` switch (`recGbl.c:119-144`).
@@ -672,7 +700,7 @@ mod tests {
     /// `(seed) -> post-call buffer`.
     #[test]
     fn rec_gbl_get_prec_matches_the_c_switch() {
-        // recGbl.c:123-131 — every integer type forces 0, whatever the seed.
+        // recGbl.c:124-133 — every integer type forces 0, whatever the seed.
         for t in [
             DbFieldType::Char,
             DbFieldType::UChar,
@@ -686,7 +714,7 @@ mod tests {
             assert_eq!(rec_gbl_get_prec(Some(t), 7), 0, "{t:?}");
             assert_eq!(rec_gbl_get_prec(Some(t), 0), 0, "{t:?}");
         }
-        // recGbl.c:133-137 — FLOAT/DOUBLE clamp OUT-OF-RANGE to 15 and keep
+        // recGbl.c:135-139 — FLOAT/DOUBLE clamp OUT-OF-RANGE to 15 and keep
         // an in-range seed. The boundaries are inclusive on both ends.
         for t in [DbFieldType::Float, DbFieldType::Double] {
             assert_eq!(rec_gbl_get_prec(Some(t), 7), 7, "{t:?}");
@@ -697,9 +725,9 @@ mod tests {
         }
     }
 
-    /// C's `default: break` (`recGbl.c:141-143`) and the runtime-retyped
+    /// C's `default: break` (`recGbl.c:141-142`) and the runtime-retyped
     /// field: the seed survives. `recGblGetPrec` reads the STATIC
-    /// `pdbFldDes->field_type` (`recGbl.c:121`), so a `cvt_dbaddr` retype
+    /// `pdbFldDes->field_type` (`recGbl.c:123`), so a `cvt_dbaddr` retype
     /// never reaches the switch — `None` is that field.
     #[test]
     fn rec_gbl_get_prec_leaves_the_seed_where_c_has_no_case() {
@@ -715,20 +743,20 @@ mod tests {
     }
 
     /// `DBF_INT64`'s upper bound is 2^63 — `INT64_MAX + 1`, not `INT64_MAX`
-    /// (recGbl.c:402-405). Pin it against the exact power of two so a future
+    /// (recGbl.c:401-404). Pin it against the exact power of two so a future
     /// "fix" to `i64::MAX` fails here rather than on the wire, where it
     /// silently changes what QSRV2 sends for every int64 field.
     #[test]
     fn int64_upper_range_is_two_to_the_63_not_int64_max() {
-        let (upper, lower) = get_max_range_values(Some(DbFieldType::Int64), false).unwrap();
+        let (upper, lower) = get_max_range_values(DbfCode::Int64).unwrap();
         assert_eq!(upper, 9223372036854775808.0);
         assert_eq!(upper, 2.0f64.powi(63));
         assert!(upper > i64::MAX as f64 || upper == i64::MAX as f64 + 1.0);
         assert_eq!(lower, -9223372036854775808.0);
         assert_eq!(lower, i64::MIN as f64);
 
-        // recGbl.c:406-409
-        let (upper, lower) = get_max_range_values(Some(DbFieldType::UInt64), false).unwrap();
+        // recGbl.c:405-408
+        let (upper, lower) = get_max_range_values(DbfCode::UInt64).unwrap();
         assert_eq!(upper, 18446744073709551615.0);
         assert_eq!(lower, 0.0);
     }
@@ -739,14 +767,22 @@ mod tests {
     #[test]
     fn types_with_no_case_in_the_c_switch_get_no_range() {
         // DBF_STRING — no case.
-        assert_eq!(get_max_range_values(Some(DbFieldType::String), false), None);
+        assert_eq!(get_max_range_values(DbfCode::String), None);
         // A `runtime_typed` field is DBF_NOACCESS in the .dbd, and C reads the
         // static `pdbFldDes->field_type` (recGbl.c:151/:169) — no case.
-        assert_eq!(get_max_range_values(None, false), None);
-        // DBF_MENU is a distinct code from DBF_ENUM in C and has no case,
-        // even though this port types both as `DbFieldType::Enum`. Without
-        // this discriminator every menu field would gain a bogus 65535/0.
-        assert_eq!(get_max_range_values(Some(DbFieldType::Enum), true), None);
+        assert_eq!(get_max_range_values(DbfCode::NoAccess), None);
+        // DBF_MENU and DBF_DEVICE are distinct codes from DBF_ENUM in C and
+        // have no case, even though this port SERVES all three as
+        // `DbFieldType::Enum`. The declared code is what separates them: read
+        // the served type instead and every menu field gains a bogus 65535/0,
+        // which is what `SCAN` and `DTYP` used to report to `gft`.
+        assert_eq!(get_max_range_values(DbfCode::Menu), None);
+        assert_eq!(get_max_range_values(DbfCode::Device), None);
+        assert_eq!(get_max_range_values(DbfCode::Enum), Some((65535.0, 0.0)));
+        // The link codes have no case either.
+        for t in [DbfCode::Inlink, DbfCode::Outlink, DbfCode::Fwdlink] {
+            assert_eq!(get_max_range_values(t), None, "{t:?}");
+        }
     }
 
     /// C's `recGblGetGraphicDouble` and `recGblGetControlDouble` are the same
@@ -755,22 +791,28 @@ mod tests {
     #[test]
     fn graphic_and_control_defaults_are_the_same_table() {
         for t in [
-            DbFieldType::Char,
-            DbFieldType::UChar,
-            DbFieldType::Short,
-            DbFieldType::UShort,
-            DbFieldType::Enum,
-            DbFieldType::Long,
-            DbFieldType::ULong,
-            DbFieldType::Int64,
-            DbFieldType::UInt64,
-            DbFieldType::Float,
-            DbFieldType::Double,
-            DbFieldType::String,
+            DbfCode::Char,
+            DbfCode::UChar,
+            DbfCode::Short,
+            DbfCode::UShort,
+            DbfCode::Enum,
+            DbfCode::Menu,
+            DbfCode::Device,
+            DbfCode::Long,
+            DbfCode::ULong,
+            DbfCode::Int64,
+            DbfCode::UInt64,
+            DbfCode::Float,
+            DbfCode::Double,
+            DbfCode::String,
+            DbfCode::Inlink,
+            DbfCode::Outlink,
+            DbfCode::Fwdlink,
+            DbfCode::NoAccess,
         ] {
             assert_eq!(
-                rec_gbl_get_graphic_double(Some(t), false),
-                rec_gbl_get_control_double(Some(t), false),
+                rec_gbl_get_graphic_double(t),
+                rec_gbl_get_control_double(t),
                 "graphic/control default diverged for {t:?}",
             );
         }
@@ -844,7 +886,7 @@ mod tests {
         let mut common = CommonFields::default();
         // A record is BORN `stat = UDF_ALARM` (dbCommon.dbd `initial("UDF")`),
         // so its FIRST reset is an alarm change: UDF -> NO_ALARM. C posts
-        // DBE_ALARM there (recGbl.c:202-207).
+        // DBE_ALARM there (recGbl.c:202-208).
         let first = rec_gbl_reset_alarms(&mut common);
         assert!(first.alarm_changed);
         assert_eq!(common.stat, alarm_status::NO_ALARM);
@@ -875,7 +917,7 @@ mod tests {
         assert_eq!(common.nsev, AlarmSeverity::Invalid);
         assert_eq!(common.nsta, alarm_status::UDF_ALARM);
         // C's plain `recGblSetSevr(UDF_ALARM)` forwards a NULL message and
-        // leaves `namsg` EMPTY (`recGbl.c:249-261`). The generic message is
+        // leaves `namsg` EMPTY (`recGbl.c:249-251,258-261`). The generic message is
         // "", not the old fabricated "UDF: record not initialized".
         assert_eq!(common.namsg, "");
     }
@@ -1064,7 +1106,7 @@ mod tests {
         assert!(EventMask::NONE.is_empty());
     }
 
-    // ----- ACKS / ACKT auto-raise (recGbl.c:209-217 parity) -----
+    // ----- ACKS / ACKT auto-raise (recGbl.c:209-222 parity) -----
 
     /// C `recGblResetAlarms` raises `acks` to the new severity when the
     /// alarm changes, unless `ackt` is true AND the new severity is

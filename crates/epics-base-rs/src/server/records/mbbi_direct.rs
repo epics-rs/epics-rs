@@ -30,11 +30,6 @@ pub struct MbbiDirectRecord {
     pub sims: i16,
     pub sdly: f64,
     skip_convert: bool,
-    // VAL change gate. C
-    // mbbiDirectRecord.c:228-231 monitor() raises DBE_VALUE|DBE_LOG for VAL
-    // only when `mlst != val`. Captured during process() because the
-    // framework reads monitor_value_changed() after process() commits mlst.
-    value_changed: bool,
 }
 
 impl Default for MbbiDirectRecord {
@@ -55,7 +50,6 @@ impl Default for MbbiDirectRecord {
             sims: 0,
             sdly: -1.0,
             skip_convert: false,
-            value_changed: false,
         }
     }
 }
@@ -76,6 +70,18 @@ pub(crate) const BIT_NAMES: [&str; 32] = [
 ];
 
 impl Record for MbbiDirectRecord {
+    /// UDF belongs to the dset here, not to `process()`. C
+    /// `mbbiDirectRecord.c:152-166` assigns `prec->udf = FALSE` at `:163`,
+    /// INSIDE `if (status == 0)`, and folds `2` into `0` only at `:165-166`,
+    /// so a device support that wrote VAL never reaches the assignment.
+    ///
+    /// That is not a hole: the C dset that returns 2 writes `prec->udf`
+    /// itself first — `devMbbiDirectSoft.c:55-60` — which the port states as
+    /// `DeviceUdf::Defined`.
+    fn rederives_udf_on_computed_read(&self) -> bool {
+        false
+    }
+
     /// C `mbbiDirectRecord.c:128` — `prec->mlst = prec->val`, the whole of this
     /// record's init tail. MLST is `special(SPC_NOMOD)` so it has no `put_field`
     /// arm for the trait default to go through; the record seeds its own cell.
@@ -124,12 +130,15 @@ impl Record for MbbiDirectRecord {
         Some(Ok(()))
     }
 
-    /// VAL posts DBE_VALUE|DBE_LOG
-    /// only when it changed (C mbbiDirectRecord.c:228-231 `mlst != val`), not
-    /// every process cycle. The comparison is captured in process(); see
-    /// `value_changed`.
-    fn monitor_value_changed(&self) -> Option<bool> {
-        Some(self.value_changed)
+    /// C `mbbiDirectRecord.c:228-231` `monitor()`: `if (prec->mlst != prec->val) { events |=
+    /// DBE_VALUE | DBE_LOG; prec->mlst = prec->val; }` — compared and
+    /// committed HERE, at C's position, never captured during `process()`.
+    fn monitor_value_changed(&mut self) -> Option<bool> {
+        let changed = self.mlst != self.val;
+        if changed {
+            self.mlst = self.val;
+        }
+        Some(changed)
     }
 
     /// C `mbbiDirectRecord.c:168-169` raises UDF with the literal `INVALID_ALARM`, not
@@ -179,15 +188,29 @@ impl Record for MbbiDirectRecord {
             // = 0 instead of 15.
             let mut raw = self.rval;
             if self.shft > 0 {
-                // Same defect family as mbbi/mbbo: a CA-written SHFT
-                // >= 32 panics a bare `>>` in debug builds. `checked_shr`
-                // mapped to 0 matches the C UB-but-no-crash result.
+                // DELIBERATE DEVIATION, and the rule for every SHFT site in
+                // this module. `SHFT` is `DBF_USHORT`, so a client can put 40
+                // into it; C shifts with the bare operator under the same
+                // `shft > 0` guard and nothing else, which at or past the
+                // width of the promoted type is undefined. It is not a
+                // no-crash constant either. SHFT is a runtime value, so the
+                // form that matters is a register-controlled shift, and
+                // executed with gcc 13.3.0 -O2 on x86_64 that gives
+                // `15u << 40` == 3840 and `240u >> 40` == 0 -- one rule, the
+                // count masked to five bits (`15 << 8`, `240 >> 8`), not two
+                // directions disagreeing. Written with a literal 40 the same
+                // gcc folds both to 0, and clang 18.1.3 targeting
+                // aarch64-linux-gnu or armv7-none-eabi emits a function that
+                // returns its argument unshifted. Three answers for one
+                // expression, so there is no C behaviour to match and the port
+                // saturates to zero -- the one answer that does not make RVAL
+                // depend on the build target.
                 raw = raw.checked_shr(self.shft as u32).unwrap_or(0);
             }
             self.val = raw;
         }
         self.skip_convert = false;
-        // C `mbbiDirectRecord.c:217-226` monitor() re-derives every bit
+        // C `mbbiDirectRecord.c:218-226` monitor() re-derives every bit
         // B0..B1F FROM VAL each cycle (`*pBn = !!(val & 1)`), whether or not
         // the RVAL->VAL convert ran. In this INPUT record the bit fields are
         // DERIVED from VAL — a `pp(TRUE)` Bx put processes the record but never
@@ -199,13 +222,6 @@ impl Record for MbbiDirectRecord {
         // Opposite direction from mbboDirect, where Bx puts DERIVE VAL.
         self.val_to_bits();
         self.oraw = self.rval;
-        // Capture the VAL-change
-        // gate now (C mbbiDirectRecord.c:228-231 `mlst != val`); the framework
-        // reads monitor_value_changed() after process().
-        self.value_changed = self.mlst != self.val;
-        if self.value_changed {
-            self.mlst = self.val;
-        }
         Ok(ProcessOutcome::complete())
     }
 

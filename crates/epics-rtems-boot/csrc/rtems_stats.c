@@ -12,7 +12,7 @@
  * code, both forced by RTEMS 6 and both measured against this BSP's installed
  * headers rather than assumed:
  *
- *   * `iop->flags` is `Atomic_Uint` in RTEMS 6 (`rtems/libio.h:1403-1406`), so
+ *   * `iop->flags` is `Atomic_Uint` in RTEMS 6 (`rtems/libio.h:1403-1406` (`rtems_6`)), so
  *     upstream's `rtems_libio_iops[i].flags & LIBIO_FLAGS_OPEN` does not
  *     compile here. The public inline accessor `rtems_libio_iop_flags()` is
  *     the RTEMS 6 spelling and is what this uses.
@@ -38,7 +38,7 @@
 #include <rtems.h>
 #include <rtems/libio.h>
 /* Internal header: `rtems_libio_iops` and `rtems_libio_number_iops` are
- * declared here (`rtems/libio_.h:80-81`) and nowhere public. devIocStats
+ * declared here (`rtems/libio_.h:80-81` (both `rtems` pins)) and nowhere public. devIocStats
  * reaches for the same header for the same reason. */
 #include <rtems/libio_.h>
 #include <rtems/malloc.h>
@@ -126,7 +126,7 @@ int epics_rtems_boot_mem_usage(uint64_t *free_total, uint64_t *used_total,
  *     `stackuse` command calls (`rtems_stack_checker_report_usage`,
  *     cpukit/libmisc/stackchk/check.c), which is why the output format below
  *     is the shell's own, not something this file invents. It needs
- *     CONFIGURE_STACK_CHECKER_ENABLED, which rtems_config.c:223 already sets.
+ *     CONFIGURE_STACK_CHECKER_ENABLED, which csrc/rtems_config.c:223 already sets.
  *   * `epics_rtems_boot_dump_tasks` is the task census (the `rt top` half —
  *     thread count, kernel names, effective priorities). It is verbatim the
  *     probe doc/rtems-priority-probe.patch used for the priority measurement,

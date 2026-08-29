@@ -1,3 +1,10 @@
+// RTEMS-EXEC-MODEL-ALLOW(3): checked, not waived — all 3 ran and passed
+// on the exec backend (measured on this tree:
+// `EPICS_RS_BUILD_EXEC_BACKEND=thread cargo nextest run -p ad-plugins-rs
+// --all-features`, 556/556). ad-plugins-rs became a census subject when
+// its `build.rs` began deriving `tokio_backend`; nothing here builds a
+// CA server, and the reactor these obtain comes from `#[tokio::test]`
+// itself, which the backend does not remove.
 use std::sync::Arc;
 
 use ad_core_rs::ndarray::NDArray;
@@ -31,7 +38,7 @@ impl Default for StdArraysProcessor {
 }
 
 impl NDPluginProcess for StdArraysProcessor {
-    fn process_array(&mut self, array: &NDArray, _pool: &NDArrayPool) -> ProcessResult {
+    fn process_array(&self, array: &NDArray, _pool: &NDArrayPool) -> ProcessResult {
         let out = Arc::new(array.clone());
         *self.latest_data.lock() = Some(out.clone());
         ProcessResult::arrays(vec![out])
@@ -111,7 +118,7 @@ mod tests {
 
     #[test]
     fn test_processor_stores_and_passes_through() {
-        let mut proc = StdArraysProcessor::new();
+        let proc = StdArraysProcessor::new();
         let pool = NDArrayPool::new(1_000_000);
 
         let arr = NDArray::new(vec![NDDimension::new(4)], NDDataType::UInt8);
@@ -164,10 +171,10 @@ mod tests {
 
     #[test]
     fn test_terminal_plugins_do_not_do_array_callbacks() {
-        // C disables NDArrayCallbacks in the constructor of NDPluginStdArrays
-        // (:343), NDPluginAttribute (:203), and NDPluginFile (:948, base of
-        // every file writer). Each Rust counterpart overrides
-        // does_array_callbacks() to false so the initial param reflects this.
+        // C disables NDArrayCallbacks in the constructor of `NDPluginStdArrays.cpp` (`:343`),
+        // `NDPluginAttribute.cpp` (`:203`), and `NDPluginFile.cpp` (`:948`, base of every
+        // file writer). Each Rust counterpart overrides `does_array_callbacks()` to false so
+        // the initial param reflects this.
         use crate::attribute::AttributeProcessor;
         use crate::file_hdf5::Hdf5FileProcessor;
         use crate::file_jpeg::JpegFileProcessor;

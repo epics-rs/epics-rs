@@ -15,7 +15,8 @@
 
 /// Authorization identity derived from a verified TLS peer certificate
 /// chain. Mirrors pvxs `PeerCredentials` for the `x509` auth method
-/// (`SSLContext::fill_credentials`, `src/ossl.cpp`):
+/// (`SSLContext::fill_credentials`, `src/ossl.cpp:378`, pvxs `tls` `b3a10bf0` —
+/// an unmerged branch; the file is on no default-branch revision):
 ///
 /// - `account` = the **leaf** (peer) certificate's subject CommonName.
 /// - `authority` = the **root CA**'s subject CommonName, but only when

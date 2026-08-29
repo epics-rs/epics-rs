@@ -1,10 +1,12 @@
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use ad_core_rs::ndarray::NDArray;
 use ad_core_rs::ndarray_pool::NDArrayPool;
 use ad_core_rs::plugin::runtime::{
     NDPluginProcess, ParamChangeResult, ParamUpdate, PluginParamSnapshot, ProcessResult,
 };
+use parking_lot::Mutex;
 
 /// Maximum number of gather input ports.
 pub const MAX_GATHER_PORTS: usize = 8;
@@ -31,26 +33,33 @@ struct GatherPortParams {
 /// introspection and runtime reconfiguration via PVs.
 pub struct GatherProcessor {
     /// Total arrays received across all sources.
-    count: u64,
-    /// Number of configured source ports (set during construction or param change).
-    num_ports: usize,
-    /// Configured source port names (indexed 0..MAX_GATHER_PORTS-1).
-    source_ports: [String; MAX_GATHER_PORTS],
-    /// Configured source addresses (indexed 0..MAX_GATHER_PORTS-1).
-    source_addrs: [i32; MAX_GATHER_PORTS],
+    count: AtomicU64,
+    /// The configured sources, rewritten by a `GATHER_NDARRAY_*` param write
+    /// while the frame path may be running.
+    sources: Mutex<GatherSources>,
     /// Param indices for per-port params.
     port_params: [GatherPortParams; MAX_GATHER_PORTS],
     /// Param index for GATHER_NUM_PORTS.
     num_ports_idx: Option<usize>,
 }
 
+/// The configured source set: the port names, their addresses, and how many
+/// of the names are non-empty.
+#[derive(Default)]
+struct GatherSources {
+    /// Number of configured source ports (set during construction or param change).
+    num_ports: usize,
+    /// Configured source port names (indexed 0..MAX_GATHER_PORTS-1).
+    ports: [String; MAX_GATHER_PORTS],
+    /// Configured source addresses (indexed 0..MAX_GATHER_PORTS-1).
+    addrs: [i32; MAX_GATHER_PORTS],
+}
+
 impl GatherProcessor {
     pub fn new() -> Self {
         Self {
-            count: 0,
-            num_ports: 0,
-            source_ports: Default::default(),
-            source_addrs: [0; MAX_GATHER_PORTS],
+            count: AtomicU64::new(0),
+            sources: Mutex::new(GatherSources::default()),
             port_params: [GatherPortParams::default(); MAX_GATHER_PORTS],
             num_ports_idx: None,
         }
@@ -58,30 +67,33 @@ impl GatherProcessor {
 
     /// Create a GatherProcessor pre-configured with the given source port names.
     pub fn with_ports(ports: &[&str]) -> Self {
-        let mut proc = Self::new();
+        let proc = Self::new();
         let n = ports.len().min(MAX_GATHER_PORTS);
-        proc.num_ports = n;
-        for (i, &name) in ports.iter().take(n).enumerate() {
-            proc.source_ports[i] = name.to_string();
+        {
+            let mut src = proc.sources.lock();
+            src.num_ports = n;
+            for (i, &name) in ports.iter().take(n).enumerate() {
+                src.ports[i] = name.to_string();
+            }
         }
         proc
     }
 
     pub fn total_received(&self) -> u64 {
-        self.count
+        self.count.load(Ordering::Relaxed)
     }
 
     /// Number of configured source ports.
     pub fn num_ports(&self) -> usize {
-        self.num_ports
+        self.sources.lock().num_ports
     }
 
     /// Get the configured source port name for the given index (0-based).
-    pub fn source_port(&self, index: usize) -> &str {
+    pub fn source_port(&self, index: usize) -> String {
         if index < MAX_GATHER_PORTS {
-            &self.source_ports[index]
+            self.sources.lock().ports[index].clone()
         } else {
-            ""
+            String::new()
         }
     }
 }
@@ -93,8 +105,8 @@ impl Default for GatherProcessor {
 }
 
 impl NDPluginProcess for GatherProcessor {
-    fn process_array(&mut self, array: &NDArray, _pool: &NDArrayPool) -> ProcessResult {
-        self.count += 1;
+    fn process_array(&self, array: &NDArray, _pool: &NDArrayPool) -> ProcessResult {
+        self.count.fetch_add(1, Ordering::Relaxed);
         ProcessResult::arrays(vec![Arc::new(array.clone())])
     }
 
@@ -125,29 +137,25 @@ impl NDPluginProcess for GatherProcessor {
         Ok(())
     }
 
-    fn on_param_change(
-        &mut self,
-        reason: usize,
-        params: &PluginParamSnapshot,
-    ) -> ParamChangeResult {
+    fn on_param_change(&self, reason: usize, params: &PluginParamSnapshot) -> ParamChangeResult {
         // Check if this is a GATHER_NDARRAY_PORT_N change
         for i in 0..MAX_GATHER_PORTS {
             if Some(reason) == self.port_params[i].port_idx {
                 if let Some(new_port) = params.value.as_string() {
-                    self.source_ports[i] = new_port.to_string();
+                    let mut src = self.sources.lock();
+                    src.ports[i] = new_port.to_string();
                     // Recount active ports
-                    self.num_ports = self.source_ports.iter().filter(|s| !s.is_empty()).count();
+                    src.num_ports = src.ports.iter().filter(|s| !s.is_empty()).count();
+                    let n = src.num_ports as i32;
+                    drop(src);
                     if let Some(idx) = self.num_ports_idx {
-                        return ParamChangeResult::updates(vec![ParamUpdate::int32(
-                            idx,
-                            self.num_ports as i32,
-                        )]);
+                        return ParamChangeResult::updates(vec![ParamUpdate::int32(idx, n)]);
                     }
                 }
                 return ParamChangeResult::empty();
             }
             if Some(reason) == self.port_params[i].addr_idx {
-                self.source_addrs[i] = params.value.as_i32();
+                self.sources.lock().addrs[i] = params.value.as_i32();
                 return ParamChangeResult::empty();
             }
         }
@@ -163,7 +171,7 @@ mod tests {
 
     #[test]
     fn test_gather_processor_passthrough() {
-        let mut proc = GatherProcessor::new();
+        let proc = GatherProcessor::new();
         let pool = NDArrayPool::new(1_000_000);
 
         let arr1 = NDArray::new(vec![NDDimension::new(4)], NDDataType::UInt8);
@@ -189,7 +197,7 @@ mod tests {
 
     #[test]
     fn test_gather_multi_source_counting() {
-        let mut proc = GatherProcessor::with_ports(&["DRV1", "DRV2"]);
+        let proc = GatherProcessor::with_ports(&["DRV1", "DRV2"]);
         let pool = NDArrayPool::new(1_000_000);
 
         // Simulate arrays arriving from different sources (all arrive on same channel)

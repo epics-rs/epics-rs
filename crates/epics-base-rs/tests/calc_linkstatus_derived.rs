@@ -4,7 +4,7 @@
 //! link (`INAV..INLV`, `IAAV..ILLV`, `OUTV`; transform `IAV..IPV`,
 //! `OAV..OPV`), all `special(SPC_NOMOD)`. C `init_record` classifies the link
 //! and stores `<rec>INAV_CON`(3) for a CONSTANT link
-//! (`aCalcoutRecord.c:208-242`, `sCalcoutRecord.c`, `transformRecord.c:430-471`),
+//! (`aCalcoutRecord.c:209-243`, `sCalcoutRecord.c`, `transformRecord.c:444-473`),
 //! OVERWRITING the `.dbd` `initial("1")`. A default record's links are all
 //! constant, so a `caget` reads `Constant`(3), and a direct `caput` is refused
 //! (`S_db_noMod`) leaving that derived value standing.
@@ -18,6 +18,9 @@
 
 use epics_base_rs::server::database::PvDatabase;
 use epics_base_rs::server::ioc_builder::IocBuilder;
+use epics_base_rs::server::records::acalcout::AcalcoutRecord;
+use epics_base_rs::server::records::scalcout::ScalcoutRecord;
+use epics_base_rs::server::records::transform::TransformRecord;
 use epics_base_rs::types::EpicsValue;
 
 const DB: &str = r#"
@@ -28,6 +31,9 @@ record(transform, "X") {}
 
 async fn build() -> std::sync::Arc<PvDatabase> {
     IocBuilder::new()
+        .register_record_type("acalcout", || Box::new(AcalcoutRecord::default()))
+        .register_record_type("scalcout", || Box::new(ScalcoutRecord::default()))
+        .register_record_type("transform", || Box::new(TransformRecord::default()))
         .db_string(DB, &std::collections::HashMap::new())
         .unwrap()
         .build()

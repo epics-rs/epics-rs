@@ -4,7 +4,7 @@
 //!   * `toDouble` (`sCalcPerform.c:80-83`) — `atof(s)`, i.e. `strtod`: the
 //!     longest numeric PREFIX, 0 when there is none. Every numeric operand
 //!     position coerces this way.
-//!   * `TO_DOUBLE` (the `DBL` operator, `:1505-1514`) — a HUNT: `strpbrk` for
+//!   * `TO_DOUBLE` (the `DBL` operator, `:1504-1513`) — a HUNT: `strpbrk` for
 //!     the first digit, step back over a `.` and then a `-`, `atof` from there.
 //!
 //! Every expectation below is the output of both C fragments compiled and run on
@@ -87,7 +87,7 @@ fn the_coercion_is_atof_not_the_hunt_and_not_a_strict_parse() {
 
 /// The coercion is also what decides whether the perform SUCCEEDS: C ends with
 /// `return((isnan(*presult)||isinf(*presult)) ? -1 : 0)` (`sCalcPerform.c:2056`)
-/// and `*presult` for a string result is `atof(s)` (`:2050`). So a string result
+/// and `*presult` for a string result is `atof(s)` (`:2049`). So a string result
 /// that `atof` reads as NaN or Inf fails the record — a strict parse (0.0) would
 /// have let it through.
 #[test]

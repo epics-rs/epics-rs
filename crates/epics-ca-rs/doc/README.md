@@ -43,8 +43,12 @@ If you're new to the codebase:
 
 ## Conventions
 
-- File / line references use `crate/file.rs:line` so you can navigate
-  in any editor.
+- File / line references inside this crate use `crate/file.rs:line`,
+  read relative to `crates/epics-ca-rs/src/`. Anything outside this
+  crate is spelled repo-relative in full —
+  `crates/epics-base-rs/src/types/codec.rs:538` — because a bare
+  basename there resolves in several crates at once and reads as a
+  valid reference long after it has stopped being one.
 - Wire-protocol byte layouts are shown as `byte offset: field name`
   tables.
 - "libca" refers to the C reference client in

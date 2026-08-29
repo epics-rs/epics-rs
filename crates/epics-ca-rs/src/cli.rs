@@ -2,8 +2,8 @@
 //! command-line binaries.
 
 // RTEMS-EXEC-MODEL-ALLOW(1): the test's subject is arming a *tokio* timer with
-// INDEFINITE_TIMEOUT; the tokio timer is the property under test. These run and pass in the
-// feature-ON suite on the tokio driver.
+// INDEFINITE_TIMEOUT; the tokio timer is the property under test. These run
+// and pass in the exec-backend suite on the tokio driver.
 use epics_base_rs::server::records::printf::format_g;
 use epics_base_rs::server::snapshot::Snapshot;
 use epics_base_rs::types::{DbFieldType, EpicsValue, PvString, WallTime};
@@ -19,7 +19,7 @@ pub const DEFAULT_CLI_TIMEOUT_SECS: f64 = 1.0;
 /// straight to `ca_pend_io` / `ca_pend_event`, where a value of `0.0`
 /// waits forever — `ca_pend_io(0)` calls `pendIO(DBL_MAX)` and
 /// `ca_pend_event(0)` loops `pendEvent(60.0)` without end (EPICS base
-/// `access.cpp:495-499,468-474`). A far-future finite `Duration`
+/// `access.cpp:495-498,468-474`). A far-future finite `Duration`
 /// (≈10 years) reproduces that "0 == forever" without an `Option`,
 /// keeping the `Duration`-typed client API (`wait_connected`,
 /// `get_with_timeout`, `put_with_timeout`) unchanged; it is effectively
@@ -105,7 +105,12 @@ pub fn env_default_timeout() -> f64 {
 ///
 /// `Duration::from_secs_f64` panics on NaN and infinity, and clap hands those
 /// through literally, so the guard against them stays — they resolve to
-/// [`DEFAULT_CLI_TIMEOUT_SECS`].
+/// [`DEFAULT_CLI_TIMEOUT_SECS`]. That guard is NOT the whole panic,
+/// though: `-w 1e300` is finite and positive, passes every check above,
+/// and `from_secs_f64` still panics above `u64::MAX` seconds. Such a value
+/// saturates to [`INDEFINITE_TIMEOUT`], which is what C does with it in
+/// effect — `ca_pend_io(1e300)` returns when the I/O completes, never on
+/// the deadline.
 ///
 /// DEVIATION, deliberate: C's `-w nan` reaches `ca_pend_io(nan)`, where every
 /// deadline comparison is false and the tool HANGS forever. We treat NaN as
@@ -125,7 +130,7 @@ pub fn timeout_duration(secs: f64) -> std::time::Duration {
     } else {
         DEFAULT_CLI_TIMEOUT_SECS
     };
-    std::time::Duration::from_secs_f64(s)
+    std::time::Duration::try_from_secs_f64(s).unwrap_or(INDEFINITE_TIMEOUT)
 }
 
 /// The C `connect_pvs` diagnostic for a connect timeout
@@ -292,7 +297,7 @@ pub fn ca_error_marker(status: u32) -> String {
 }
 
 /// C's marker for a readback that produced NO buffer at all (`value == 0`,
-/// `caget.c:268`). Only the callback get (`caget -c`) can leave one — the
+/// `caget.c:270-271`). Only the callback get (`caget -c`) can leave one — the
 /// synchronous get callocs up front (see [`zero_dbr_value`]).
 pub const NO_DATA_MARKER: &str = "*** no data available (timeout)";
 
@@ -326,7 +331,7 @@ pub fn format_time(ts: WallTime) -> String {
     use chrono::{DateTime, Local, TimeZone};
 
     // C treats an all-zero `epicsTimeStamp` as UNINITIALIZED and prints a
-    // sentinel instead of a date (`epicsTime.cpp:174-179`, W10-B3):
+    // sentinel instead of a date (`epicsTime.cpp:175-179`, W10-B3):
     //
     //     // presume that EPOCH date is an uninitialized time stamp
     //     if ( pTS->secPastEpoch == 0 && pTS->nsec == 0u ) {
@@ -387,7 +392,7 @@ pub fn dbr_value_field_type(dbr_type: u16) -> Option<DbFieldType> {
 ///
 /// Both tools `calloc` the readback buffer BEFORE issuing `ca_array_get`
 /// (`caget.c:207-215`, `caput.c:167`), sized `dbr_size_n(dbrType, nElems)`.
-/// On `ECA_TIMEOUT` they only warn on stderr (`caget.c:224-226`,
+/// On `ECA_TIMEOUT` they only warn on stderr (`caget.c:229-231`,
 /// `caput.c:186-188`): the buffer is neither freed nor is the PV's status
 /// touched, so the print loop still sees `status == ECA_NORMAL` and
 /// `value != 0` (`caget.c:262-268`, `caput.c:201-207`) and renders the
@@ -395,7 +400,7 @@ pub fn dbr_value_field_type(dbr_type: u16) -> Option<DbFieldType> {
 /// ENUM-as-label) field prints an empty value, and an array prints its
 /// element count then that many zeros.
 ///
-/// The `*** no data available (timeout)` branch (`caget.c:268`,
+/// The `*** no data available (timeout)` branch (`caget.c:270-271`,
 /// `caput.c:207`) needs `value == 0`, which ONLY the callback get can leave:
 /// `caget -c` allocates inside its event handler (`caget.c:130`), so a
 /// callback that never arrives leaves no buffer at all. That branch is
@@ -493,7 +498,7 @@ pub enum IntStyle {
 /// C keeps the integer base and the float base in TWO independent globals
 /// (`tool_lib.c:51-52`, `outTypeI` / `outTypeF`), and every tool's getopt
 /// writes exactly one of them: `-0x`/`-0o`/`-0b` sets `outTypeI`,
-/// `-lx`/`-lo`/`-lb` sets `outTypeF` (`caget.c:485-497`,
+/// `-lx`/`-lo`/`-lb` sets `outTypeF` (`caget.c:497-504`,
 /// `camonitor.c:325-340`). Neither flag touches the other's global, so
 /// `int_style` and `float_style` are mirrored as two separate fields — a
 /// single shared base field made `-lx` hex an integer PV (C prints it
@@ -570,7 +575,7 @@ pub enum CountPrefix {
     /// `caput -l` and `camonitor`): the count leads iff
     /// `reqElems || nElems > 1`.
     IfRequestedOrArray,
-    /// The `caget -d` specifiedDbr `Value:` line (`caget.c:328-334`): the
+    /// The `caget -d` specifiedDbr `Value:` line (`caget.c:332-335`): the
     /// elements are joined BARE. That block already printed the count on its
     /// own `Element count:` line (`caget.c:317-319`), so C's loop there
     /// carries no `printf("%lu%c", ...)` gate at all — not even for an array.
@@ -598,7 +603,7 @@ impl CountPrefix {
 ///
 /// * the `-S` long-string branch, gated on every block that has one
 ///   (`charArrAsStr && dbr_type_is_CHAR && (reqElems || nElems > 1)`:
-///   `caget.c:273` for plain/terse AND `caget.c:318` for specifiedDbr). That
+///   `caget.c:274` for plain/terse AND `caget.c:320` for specifiedDbr). That
 ///   branch prints the escaped string and NOTHING else — no count prefix.
 /// * the leading element count. In C this `printf("%lu%c", nElems, ...)` sits
 ///   in the print block BEFORE the element loop (`caget.c:286`), so it fires
@@ -620,7 +625,7 @@ pub fn format_value(
     // C renders a CHAR array as a long-string only when
     // `charArrAsStr && (reqElems || nElems > 1)` — a 1-element CHAR array with
     // `-S` but no `-#` falls through to numeric. This gate reads `reqElems`
-    // DIRECTLY and is present on the specifiedDbr block too (`caget.c:318`),
+    // DIRECTLY and is present on the specifiedDbr block too (`caget.c:320`),
     // so it does NOT follow `count_prefix`, and it returns before C's count
     // printf — a long-string never carries the count.
     if let EpicsValue::CharArray(arr) | EpicsValue::UCharArray(arr) = v
@@ -816,7 +821,7 @@ fn format_enum(idx: i64, fmt: &ValueFormat, enum_strings: Option<&[PvString]>) -
     // (`tool_lib.c:187`) — the `-0x`/`-0o`/`-0b` base (`outTypeI`) is
     // reserved for the DBR_INT / DBR_LONG arms and never reaches here.
     // `caget -n` / `camonitor -n` on a native ENUM field re-request the
-    // value as DBR_TIME_INT (`caget.c:179`, `camonitor.c:159`), so those
+    // value as DBR_TIME_INT (`caget.c:180`, `camonitor.c:159`), so those
     // DO carry the base — but they arrive as a SHORT carrier, not as this
     // one. Only a request that keeps the ENUM type (`caget -d DBR_ENUM`,
     // `-d DBR_GR_ENUM -n`) lands here, and C prints those in decimal.
@@ -1159,7 +1164,7 @@ mod tests {
         assert_eq!(fv(&v2, &fmt_default(), None, false), "2 1 2.5");
     }
 
-    /// C's `caget -d` specifiedDbr Value loop (`caget.c:328-334`) joins the
+    /// C's `caget -d` specifiedDbr Value loop (`caget.c:332-335`) joins the
     /// elements BARE — no `printf("%lu%c", nElems, ...)` gate at all, because
     /// the block already printed `Element count:` on its own line. Only the
     /// plain/terse loop (`:286`) leads with the count.
@@ -1210,7 +1215,7 @@ mod tests {
     }
 
     /// `reqElems` still reaches the `-S` long-string gate on the specifiedDbr
-    /// block (`caget.c:318` repeats `charArrAsStr && dbr_type_is_CHAR &&
+    /// block (`caget.c:320` repeats `charArrAsStr && dbr_type_is_CHAR &&
     /// (reqElems || nElems > 1)` verbatim) — dropping the count prefix must
     /// NOT drop that. Pre-fix the `-d` call hardcoded `false`, so
     /// `caget -d DBR_CHAR -S -# 1` on a 1-element CHAR array fell through to
@@ -1463,6 +1468,14 @@ mod tests {
             timeout_duration(f64::INFINITY).as_secs_f64(),
             DEFAULT_CLI_TIMEOUT_SECS
         );
+        // Finite, positive, and past `u64::MAX` seconds — the case the
+        // `is_finite()` guard above does NOT catch and `from_secs_f64`
+        // panicked on. C's `ca_pend_io(1e300)` never reaches its deadline,
+        // so the saturated INDEFINITE_TIMEOUT is that outcome.
+        assert_eq!(timeout_duration(1e300), INDEFINITE_TIMEOUT);
+        assert_eq!(timeout_duration(u64::MAX as f64), INDEFINITE_TIMEOUT);
+        // The representable edge stays representable.
+        assert_eq!(timeout_duration(9.0e18).as_secs_f64(), 9.0e18);
     }
 
     /// Sane positive values pass through unchanged.

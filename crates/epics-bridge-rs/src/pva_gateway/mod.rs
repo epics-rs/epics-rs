@@ -3,9 +3,12 @@
 //! Mirrors the C++ `pva2pva/p2pApp` gateway at the architectural
 //! level: one upstream [`epics_pva_rs::client::PvaClient`] keeps a
 //! cache of channels (one per upstream PV name), one downstream
-//! [`epics_pva_rs::server_native::PvaServer`] accepts client
+//! `epics_pva_rs::server_native::PvaServer` accepts client
 //! connections and forwards GET / PUT / MONITOR / GET_FIELD ops
-//! through the cache.
+//! through the cache. Named in a code span rather than linked because
+//! this module doc is compiled on the reactor-free backend, where that
+//! type does not exist; the host page still reaches it through
+//! `gateway`.
 //!
 //! ## Topology
 //!
@@ -58,35 +61,32 @@
 //!   credentialed control RPCs (`<prefix>:flush` / `:drop` /
 //!   `:reload`) that flush the channel cache, drop one entry, or
 //!   hot-swap the gateway-side ACF policy.
-//!
-//! ## Quick start
-//!
-//! ```no_run
-//! use std::sync::Arc;
-//! use epics_bridge_rs::pva_gateway::{PvaGateway, PvaGatewayConfig};
-//!
-//! # async fn run() -> epics_bridge_rs::pva_gateway::error::GwResult<()> {
-//! let gw = PvaGateway::start(PvaGatewayConfig::default())?;
-//! gw.run().await?;
-//! # Ok(())
-//! # }
-//! ```
 
 pub mod channel_cache;
 pub mod control;
 pub mod error;
+// The two files that stand a downstream `epics_pva_rs::server_native::PvaServer`,
+// and only those two. `PvaServer` and its `runtime` are the reactor-bound PVA
+// front-end and vanish on the reactor-free backend; the cache, the source, the
+// middleware and the control PVs name only `PvaClient` and the `runtime::task`
+// seam, which are present on both. Gating the whole module on the front-end's
+// predicate is what took all of them out with it.
+#[cfg(tokio_backend)]
 pub mod gateway;
 pub mod middleware;
+#[cfg(tokio_backend)]
 pub mod multi_gateway;
 pub mod source;
 
 pub use channel_cache::{ChannelCache, DEFAULT_CLEANUP_INTERVAL, UpstreamEntry};
 pub use control::ControlSource;
 pub use error::{GwError, GwResult};
+#[cfg(tokio_backend)]
 pub use gateway::{PvaGateway, PvaGatewayConfig};
 pub use middleware::{
     AclConfig, AuditEvent, AuditEventKind, AuditResult, AuditSink, ClosureAudit, MpscAuditSink,
     NoopAudit,
 };
+#[cfg(tokio_backend)]
 pub use multi_gateway::{MultiTenantPvaGateway, MultiTenantPvaGatewayBuilder};
 pub use source::GatewayChannelSource;

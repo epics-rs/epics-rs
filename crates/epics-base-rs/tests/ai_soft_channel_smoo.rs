@@ -3,7 +3,7 @@
 //!
 //! `devAiSoft.c:81-93` (and `devAiSoftCallback.c:180-194`) blend the reading
 //! into the previous `VAL` inside `read_ai`, then `return 2` so `convert()` is
-//! skipped. `aiRecord.c:439-444`, the copy the record body runs, is therefore
+//! skipped. `aiRecord.c:440-444`, the copy the record body runs, is therefore
 //! the RAW dset's — `devAiSoftRaw::read_ai` returns 0. With the filter written
 //! only in the record body, `SMOO` had no effect at any value on the default
 //! `ai` DTYP.
@@ -74,7 +74,7 @@ async fn a_soft_channel_ai_smooths_the_reading_against_its_previous_val() {
 }
 
 /// The RAW dset keeps `convert()`'s copy of the filter: `read_ai` returns 0
-/// there, so `aiRecord.c:439-444` runs and produces the same two values. The
+/// there, so `aiRecord.c:440-444` runs and produces the same two values. The
 /// dset-side filter must not double up on this path.
 #[epics_macros_rs::epics_test]
 async fn a_raw_soft_channel_ai_still_smooths_through_convert() {

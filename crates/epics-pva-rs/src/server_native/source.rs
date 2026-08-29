@@ -148,7 +148,7 @@ pub fn put_denied(checked: &AccessChecked, ctx: &ChannelContext) -> OpError {
 /// sibling of [`MonitorOptions`].
 ///
 /// pvxs reads both terms off the INIT pvRequest inside `onPut`
-/// (`ioc/singlesource.cpp:346-352`), never off the data-phase value, and
+/// (`ioc/singlesource.cpp:347-352`), never off the data-phase value, and
 /// hands them to the same `IOCSource` routing every IOC source shares.
 /// This is that decode, owned once for the native `PvDatabaseSource` and
 /// the QSRV bridge alike; [`ProcessMode`] belongs to the database, whose
@@ -268,7 +268,7 @@ impl PutOptions {
             }
 
             // block option. pvxs reads `record._options.block` via
-            // `Value::as<bool>` (ioc/singlesource.cpp:346-352), which
+            // `Value::as<bool>` (ioc/singlesource.cpp:347-352), which
             // coerces bool / integer / unsigned / real / `"true"` /
             // `"false"` through `copyOutScalar`. The earlier path matched
             // only `Boolean`, silently dropping the integer and string
@@ -365,7 +365,7 @@ pub struct MonitorOptions {
     /// The RESOLVED `DBE_*` value-class mask the value subscription runs
     /// with — `record._options.DBE` reduced through
     /// [`dbe_mask_from_pv_request`], or pvxs's `DBE_VALUE | DBE_ALARM`
-    /// fallback (`singlesource.cpp:141-144`). Never empty and never
+    /// fallback (`singlesource.cpp:142-144`). Never empty and never
     /// carrying `DBE_PROPERTY`: the property subscription is separate and
     /// unconditional (`:161-167`), so a source ORs that bit in itself.
     ///
@@ -452,7 +452,7 @@ pub const DEFAULT_DBE_MASK: u16 = {
 /// (ioc/singlesource.cpp:142-144). PROPERTY and any out-of-class bits
 /// must never reach the value subscription — the property
 /// subscription is opened separately and unconditionally
-/// (singlesource.cpp:161-167). EPICS `DBE_*` bit values coincide with
+/// (singlesource.cpp:162-167). EPICS `DBE_*` bit values coincide with
 /// [`epics_base_rs::server::recgbl::EventMask`] bits (VALUE=1, ARCHIVE/LOG=2, ALARM=4), so the raw
 /// client mask maps straight through.
 fn dbe_value_class_mask(raw: u16) -> u16 {
@@ -476,14 +476,16 @@ fn dbe_value_class_mask(raw: u16) -> u16 {
 /// data.h:140-147) — and then CONVERTS. Exactly two arms read a value:
 ///
 /// * `Kind::String` → `fld.as<std::string>()`, then the sloppy substring scan
-///   (`:119-133`);
-/// * `Kind::Integer` / `Kind::Real` → `dbe = fld.as<uint8_t>()` (`:134-137`).
+///   (`singlesource.cpp:119-133`);
+/// * `Kind::Integer` / `Kind::Real` → `dbe = fld.as<uint8_t>()`
+///   (`singlesource.cpp:134-137`).
 ///
 /// Every other kind — `Kind::Bool` and `Kind::Compound` (struct / union / any)
-/// included — hits `default: break` (`:138-139`) with `dbe` still 0, so the
-/// value class selects nothing and the `DBE_VALUE | DBE_ALARM` fallback applies
-/// (`:141-144`). `as<uint8_t>()` *could* convert bool storage
-/// (data.cpp:428-435); pvxs simply never calls it for a bool.
+/// included — hits `default: break` (`singlesource.cpp:138-139`) with `dbe`
+/// still 0, so the value class selects nothing and the `DBE_VALUE |
+/// DBE_ALARM` fallback applies (`singlesource.cpp:142-144`). `as<uint8_t>()`
+/// *could* convert bool storage (data.cpp:428-435); pvxs simply never calls
+/// it for a bool.
 ///
 /// Both value-reading arms use the THROWING `as<T>()`, and KIND IS NOT STORAGE:
 /// `Int32A` is `Kind::Integer` but stores as an array, and `Value::copyOut` has
@@ -500,11 +502,11 @@ fn dbe_value_class_mask(raw: u16) -> u16 {
 /// (singlesource.cpp:122-127): only `VALUE`, `ARCHIVE`, and `ALARM` are
 /// recognized for the value mask. `LOG` is not a recognized spelling,
 /// and `PROPERTY` is deliberately excluded — the property subscription
-/// is separate and unconditional (singlesource.cpp:161-167).
+/// is separate and unconditional (singlesource.cpp:162-167).
 ///
 /// `log` is the operation's [`RemoteLog`]: a string DBE that selects
 /// NOTHING in the value class still falls back to `VALUE|ALARM`, but pvxs
-/// tells the client so first (singlesource.cpp:128-130) rather than
+/// tells the client so first (singlesource.cpp:128-131) rather than
 /// letting the fallback pass for an honored request.
 pub fn dbe_mask_from_pv_request(
     request: &PvStructure,
@@ -531,7 +533,7 @@ pub fn dbe_mask_from_pv_request(
     // pvxs `switch(fld.type().kind())`, through the shared kind owner
     // (`convert::kind` IS `Value::type().kind()`). Every arm converges on the
     // single value-class mask + `VALUE|ALARM` fallback below
-    // (singlesource.cpp:141-144), so PROPERTY / out-of-class bits are stripped
+    // (singlesource.cpp:142-144), so PROPERTY / out-of-class bits are stripped
     // in one place and cannot leak into the value subscription.
     let raw = match convert::kind(dbe) {
         // `fld.as<std::string>()` — throws on a string ARRAY.
@@ -570,7 +572,7 @@ pub fn dbe_mask_from_pv_request(
     // same EPICS bit) is selected only by the substring `ARCHIVE`. And
     // PROPERTY is deliberately excluded from the value mask
     // (`CASE(PROPERTY)` is commented out): the property subscription is
-    // opened separately and unconditionally (singlesource.cpp:161-167),
+    // opened separately and unconditionally (singlesource.cpp:162-167),
     // so a `PROPERTY` token must never reach the value subscription.
     // Unknown text is ignored (pure substring search). The value-class
     // mask + VALUE|ALARM fallback (singlesource.cpp:142-144) then
@@ -596,7 +598,7 @@ pub fn dbe_mask_from_pv_request(
     if raw.contains("ALARM") {
         raw_mask |= EventMask::ALARM.bits();
     }
-    // pvxs `singlesource.cpp:128-130` — `if(!dbe && !mask.empty())`. The
+    // pvxs `singlesource.cpp:128-131` — `if(!dbe && !mask.empty())`. The
     // client named an event class the substring parse recognized nothing in
     // (`"LOG"`, a lowercase `"value"`, `"PROPERTY"` alone), so the request
     // is honored by the `VALUE|ALARM` fallback below rather than by what was
@@ -648,10 +650,6 @@ pub struct WatermarkEvent {
     pub kind: WatermarkKind,
 }
 
-/// A backend that can answer pvAccess GET / PUT / MONITOR requests for a
-/// set of named PVs.
-// no on_channel_close hook — pvxs serverchan.cpp:57-59 fires onClose("") per channel;
-// this trait has no equivalent. Doc-only; fix requires a semver-minor breaking API change.
 /// Why a [`ChannelSource`] mutating op (`put_value*`, `process*`,
 /// `rpc*`) failed, carried as a typed value so audit / forwarding
 /// layers classify the outcome from a discriminant rather than
@@ -776,7 +774,7 @@ impl From<&str> for OpError {
 /// `DESTROY_CHANNEL`. That is the downstream effect of pva2pva dropping a
 /// `ChannelCacheEntry`: `channel->destroy()` → `channelStateChange(DESTROYED)`
 /// fanout to every interested `GWChannel`
-/// (`p2pApp/chancache.cpp:34-99`, `server.cpp:130-135`).
+/// (`p2pApp/chancache.cpp:34-99`, `src/server.cpp:130-135`).
 ///
 /// **Lossless by construction.** pva2pva's fanout iterates a live
 /// listener vector under lock — there is no queue between removal and
@@ -860,6 +858,8 @@ impl From<crate::pvdata::NoConvert> for OpError {
     }
 }
 
+/// A backend that can answer pvAccess GET / PUT / MONITOR requests for a
+/// set of named PVs.
 pub trait ChannelSource: Send + Sync + 'static {
     /// Per-source access policy. Returns the [`AccessGate`] used by
     /// the wire layer to mint [`AccessChecked`] tokens for the typed
@@ -879,9 +879,9 @@ pub trait ChannelSource: Send + Sync + 'static {
     }
 
     /// Monotonic counter of source-registry topology changes, mirroring
-    /// pvxs `Server::pvt->beaconChange` (server.cpp:90-115). pvxs bumps
+    /// pvxs `Server::pvt->beaconChange` (src/server.cpp:90-115). pvxs bumps
     /// this on every `addSource`/`removeSource`/`addPV`/`removePV` and
-    /// writes it into every BEACON frame (server.cpp:751-767), so a
+    /// writes it into every BEACON frame (src/server.cpp:751-767), so a
     /// client can detect a server-side registry change even when the
     /// enumerated PV-name set is unchanged (a source replaced by another
     /// serving the same names, or a priority change).
@@ -935,7 +935,7 @@ pub trait ChannelSource: Send + Sync + 'static {
     ///
     /// pvxs exposes the requester endpoint to a source's `onSearch` as
     /// `Search::source()` — filled from `msg.replyDest` for UDP
-    /// (server.cpp:674-704) and from the established TCP peer for
+    /// (src/server.cpp:674-704) and from the established TCP peer for
     /// circuit search (serverchan.cpp:197-222) — so a source can scope
     /// advertisement by requester (claim a PV only for a local subnet,
     /// hide private aliases from some peers, pick a redirect policy that
@@ -1033,7 +1033,7 @@ pub trait ChannelSource: Send + Sync + 'static {
     /// `onSubscribe` callbacks into the `ServerChan`
     /// (`serverchan.cpp:295-322`, `serverchan.cpp:70-112`); a later
     /// `Server::removeSource` does not rewrite callbacks already
-    /// installed on existing channels (`server.cpp:100-112`). A
+    /// installed on existing channels (`src/server.cpp:100-112`). A
     /// terminal/leaf source IS its own owner, so the default returns
     /// `None` and the caller binds the top-level source itself.
     /// [`CompositeSource`](crate::server_native::CompositeSource)
@@ -1085,7 +1085,7 @@ pub trait ChannelSource: Send + Sync + 'static {
     /// filled in: `IOCSource::initialize` + `IOCSource::get`
     /// (`singlesource.cpp:283`, `groupsource.cpp:484`) assign a SUBSET of
     /// the structure, so only those leaves carry `valid` and only they reach
-    /// the wire. `getProperties` (`iocsource.cpp:252-310`) never assigns
+    /// the wire. `getProperties` (`iocsource.cpp:253-310`) never assigns
     /// `control.minStep`, `valueAlarm.active`, the four `valueAlarm.*Severity`
     /// leaves or `valueAlarm.hysteresis` — pinned by pvxs's own
     /// `testqsingle.cpp:129-149` delta, where those seven are absent while
@@ -1281,7 +1281,9 @@ pub trait ChannelSource: Send + Sync + 'static {
     ///
     /// The default impl composes the existing primitives: the WRITE-gated
     /// [`Self::put_delta_checked`] followed by the READ-gated
-    /// [`Self::get_value_checked`], reusing the same authenticated
+    /// [`Self::read_checked`] — the readback leg has to carry the assigned
+    /// leaves, so it cannot be the value-only [`Self::get_value_checked`] —
+    /// reusing the same authenticated
     /// `checked` token and `ctx` for both legs (the readback runs under the
     /// identical identity as the write, exactly as `put_delta_checked`'s
     /// own prior-value read does — a `ReadWrite` token allows both). Every
@@ -1293,7 +1295,7 @@ pub trait ChannelSource: Send + Sync + 'static {
     /// upstream PUT_GET, so the put-then-get stays atomic upstream instead
     /// of collapsing to a local put plus a separately-read (possibly
     /// cached) get. The pva-gateway forwards `ctx.pv_request` + value as one
-    /// upstream `ChannelPutGet` (pva2pva `p2pApp/channel.cpp:129-137`) and
+    /// upstream `ChannelPutGet` (pva2pva `p2pApp/channel.cpp:129-138`) and
     /// returns its readback.
     fn put_get_checked(
         &self,
@@ -1937,7 +1939,7 @@ pub trait ChannelSource: Send + Sync + 'static {
 /// dot-separated field paths the source declares changed for this
 /// event, marked whether or not their value differs from the previous
 /// snapshot. A QSRV group monitor uses this to honor `+trigger` target
-/// graphs (pvxs `groupsource.cpp:288` marks each trigger target
+/// graphs (pvxs `groupsource.cpp:328-346` marks each trigger target
 /// assigned-not-changed); the encoder turns the paths into a wire
 /// changed-bitset via [`crate::pvdata::encode::marked_changed_bitset`].
 #[derive(Debug, Clone)]
@@ -1957,7 +1959,7 @@ pub struct MonitorUpdate {
     /// client reopens with a fresh INIT — the decoded-path counterpart of
     /// [`RawMonitorEvent::type_changed`]. pvxs treats reconnect /
     /// type-change as a subscription boundary
-    /// (pvalink_channel.cpp:342-351 `onTypeChange()`). Only the PVA
+    /// (pvxs/ioc/pvalink_channel.cpp:342-351 `onTypeChange()`). Only the PVA
     /// gateway's fanout sets this; sources that own their descriptor
     /// leave it `false`.
     pub type_changed: bool,
@@ -2097,7 +2099,7 @@ pub fn plain_monitor_updates(rx: MonitorStream<PvField>) -> MonitorStream<Monito
 /// was "read from my real stream, push into an mpsc". Six such tasks existed
 /// (two in `shared_pv`, one here, three in `server/native_source`), which put
 /// a db-backed MONITOR at 2–3 tasks instead of 1 — the RTEMS task-count
-/// problem in `doc/rtems-runtime-portability-design.md` §9 phase 6.
+/// problem.
 ///
 /// Widening the trait to this enum removes the reason those tasks existed:
 /// a source hands back whatever it actually has, and the consumer pulls.
@@ -2477,7 +2479,7 @@ pub struct RawMonitorEvent {
     /// the original MONITOR INIT descriptor. The downstream
     /// dispatch path emits `MONITOR FINISH` instead so the client
     /// can reopen with the new descriptor. pvxs treats reconnect /
-    /// type-change as a subscription boundary (pvalink_channel.cpp:
+    /// type-change as a subscription boundary (pvxs/ioc/pvalink_channel.cpp:
     /// 342-351 `onTypeChange()`); the gateway mirrors that here.
     pub type_changed: bool,
 }
@@ -3494,7 +3496,7 @@ mod tests {
     }
 
     /// pvxs reads `record._options.block` via `as<bool>`
-    /// (singlesource.cpp:346-352), coercing bool, integer, unsigned,
+    /// (singlesource.cpp:347-352), coercing bool, integer, unsigned,
     /// real, and the exact strings `"true"`/`"false"` (data.cpp:399-409,
     /// 459-462). The earlier parser accepted only a boolean scalar, so a
     /// client sending `block=1` or `block="true"` lost the put-notify
@@ -3584,7 +3586,7 @@ mod tests {
     /// String DBE substring-matches VALUE and ARCHIVE (the DBE_LOG bit),
     /// but a `PROPERTY` token must NOT enter the value mask — pvxs
     /// comments out `CASE(PROPERTY)` because the property subscription is
-    /// separate (singlesource.cpp:126,161-167). `DBE_`-prefixed spellings
+    /// separate (singlesource.cpp:126,162-167). `DBE_`-prefixed spellings
     /// still match by substring.
     #[test]
     fn dbe_string_archive_selected_property_excluded() {

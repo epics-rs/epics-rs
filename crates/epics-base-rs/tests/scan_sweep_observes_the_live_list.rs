@@ -1,6 +1,6 @@
 //! A scan sweep observes its list; it does not own a copy of it.
 //!
-//! C reference. `scanList` (`dbScan.c:998-1051`) opens with
+//! C reference. `scanList` (`dbScan.c:994-1047`) opens with
 //!
 //!     /* When reading this code remember that the call to dbProcess can
 //!      * result in the SCAN field being changed in an arbitrary number of
@@ -20,7 +20,7 @@
 //! positions a mid-sweep removal can take relative to the cursor.
 //!
 //! `post_event` is the driver here because it is the public one; C reaches the
-//! same `scanList` from `eventCallback` (`dbScan.c:459-465`) as it does from
+//! same `scanList` from `eventCallback` (`dbScan.c:455-461`) as it does from
 //! `periodicTask`, and this port likewise has one sweep for both.
 
 use std::sync::Arc;
@@ -149,7 +149,7 @@ async fn a_record_moved_to_another_list_does_not_process_on_this_one() {
         "M",
         0,
         Some(Box::new(|db: &PvDatabase| {
-            set_scan(db, "V", ScanType::Sec1);
+            set_scan(db, "V", ScanType::SEC1);
         })),
     )
     .await;

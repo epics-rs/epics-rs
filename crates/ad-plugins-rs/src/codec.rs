@@ -1,3 +1,10 @@
+// RTEMS-EXEC-MODEL-ALLOW(1): checked, not waived — all 1 ran and passed
+// on the exec backend (measured on this tree:
+// `EPICS_RS_BUILD_EXEC_BACKEND=thread cargo nextest run -p ad-plugins-rs
+// --all-features`, 556/556). ad-plugins-rs became a census subject when
+// its `build.rs` began deriving `tokio_backend`; nothing here builds a
+// CA server, and the reactor these obtain comes from `#[tokio::test]`
+// itself, which the backend does not remove.
 use std::borrow::Cow;
 use std::io::{Read, Write};
 use std::sync::Arc;
@@ -11,6 +18,7 @@ use flate2::Compression;
 use flate2::read::ZlibDecoder;
 use flate2::write::ZlibEncoder;
 use lz4_flex::block::{compress, decompress};
+use parking_lot::Mutex;
 use rust_hdf5::format::messages::filter::{
     FILTER_BLOSC, Filter, FilterPipeline, apply_filters, reverse_filters,
 };
@@ -450,7 +458,7 @@ const BSHUF_MIN_RECOMMEND_BLOCK: usize = 128;
 
 /// Default bitshuffle block size in elements for a given element size.
 ///
-/// Mirrors `bshuf_default_block_size` (bitshuffle_core.c:2009): `TARGET /
+/// Mirrors `bshuf_default_block_size` (bitshuffle_core.c:1828): `TARGET /
 /// elem_size` rounded down to a multiple of `BSHUF_BLOCKED_MULT`, floored at
 /// `BSHUF_MIN_RECOMMEND_BLOCK`. This value must stay stable across versions or
 /// previously-encoded streams become undecodable.
@@ -461,7 +469,7 @@ pub(crate) fn bshuf_default_block_size(elem_size: usize) -> usize {
 }
 
 /// 8x8 bit-matrix transpose of a quadword, little-endian convention
-/// (library macro `TRANS_BIT_8X8`, bitshuffle_core.c:110).
+/// (library macro `TRANS_BIT_8X8`, bitshuffle_core.c:89).
 #[inline]
 fn trans_bit_8x8(mut x: u64) -> u64 {
     let t = (x ^ (x >> 7)) & 0x00AA_00AA_00AA_00AA;
@@ -480,7 +488,7 @@ fn read_u64_le(b: &[u8], off: usize) -> u64 {
 }
 
 /// Transpose bytes within elements (library `bshuf_trans_byte_elem_scal`,
-/// bitshuffle_core.c:166). `size` is a multiple of 8 for every shuffled block.
+/// bitshuffle_core.c:174). `size` is a multiple of 8 for every shuffled block.
 fn bshuf_trans_byte_elem(input: &[u8], out: &mut [u8], size: usize, elem_size: usize) {
     let mut ii = 0;
     while ii + 7 < size {
@@ -502,7 +510,7 @@ fn bshuf_trans_byte_elem(input: &[u8], out: &mut [u8], size: usize, elem_size: u
 }
 
 /// Transpose bits within bytes (library `bshuf_trans_bit_byte_scal`,
-/// bitshuffle_core.c:205, little-endian path).
+/// bitshuffle_core.c:219, little-endian path).
 fn bshuf_trans_bit_byte(input: &[u8], out: &mut [u8], size: usize, elem_size: usize) {
     let nbyte = elem_size * size;
     let nbyte_bitrow = nbyte / 8;
@@ -529,7 +537,7 @@ fn bshuf_trans_bitrow_eight(input: &[u8], out: &mut [u8], size: usize, elem_size
 }
 
 /// Bit-transpose one block of `size` elements (a multiple of 8) — library
-/// `bshuf_trans_bit_elem_scal` (bitshuffle_core.c:280): byte transpose, then
+/// `bshuf_trans_bit_elem_scal` (bitshuffle_core.c:256): byte transpose, then
 /// bit-within-byte transpose, then bit-row transpose.
 fn bshuf_trans_bit_elem(input: &[u8], size: usize, elem_size: usize) -> Vec<u8> {
     debug_assert_eq!(size % 8, 0);
@@ -544,7 +552,7 @@ fn bshuf_trans_bit_elem(input: &[u8], size: usize, elem_size: usize) -> Vec<u8> 
 }
 
 /// Transpose bytes for data organized as one row per bit (library
-/// `bshuf_trans_byte_bitrow_scal`, bitshuffle_core.c:306).
+/// `bshuf_trans_byte_bitrow_scal`, bitshuffle_core.c:281).
 fn bshuf_trans_byte_bitrow(input: &[u8], out: &mut [u8], size: usize, elem_size: usize) {
     let nbyte_row = size / 8;
     for jj in 0..elem_size {
@@ -557,7 +565,7 @@ fn bshuf_trans_byte_bitrow(input: &[u8], out: &mut [u8], size: usize, elem_size:
 }
 
 /// Shuffle bits within the bytes of eight-element groups (library
-/// `bshuf_shuffle_bit_eightelem_scal`, bitshuffle_core.c:331, LE path).
+/// `bshuf_shuffle_bit_eightelem_scal`, bitshuffle_core.c:308, LE path).
 fn bshuf_shuffle_bit_eightelem(input: &[u8], out: &mut [u8], size: usize, elem_size: usize) {
     let nbyte = elem_size * size;
     let mut jj = 0;
@@ -576,7 +584,7 @@ fn bshuf_shuffle_bit_eightelem(input: &[u8], out: &mut [u8], size: usize, elem_s
 }
 
 /// Inverse of [`bshuf_trans_bit_elem`] — library `bshuf_untrans_bit_elem_scal`
-/// (bitshuffle_core.c:373).
+/// (bitshuffle_core.c:349).
 fn bshuf_untrans_bit_elem(input: &[u8], size: usize, elem_size: usize) -> Vec<u8> {
     debug_assert_eq!(size % 8, 0);
     let nbyte = size * elem_size;
@@ -588,7 +596,7 @@ fn bshuf_untrans_bit_elem(input: &[u8], size: usize, elem_size: usize) -> Vec<u8
 }
 
 /// Bit-transpose and LZ4-block-compress one block, framed `[u32 nbytes_BE][lz4]`
-/// (library `bshuf_compress_lz4_block`, bitshuffle.c:34). `size` is a multiple
+/// (library `bshuf_compress_lz4_block`, bitshuffle.c:32). `size` is a multiple
 /// of 8.
 fn bshuf_compress_lz4_block(
     out: &mut Vec<u8>,
@@ -605,7 +613,7 @@ fn bshuf_compress_lz4_block(
 }
 
 /// Read one `[u32 nbytes_BE][lz4]` frame at `pos`, LZ4-decode and bit-untranspose
-/// it (library `bshuf_decompress_lz4_block`, bitshuffle.c:82). Returns the
+/// it (library `bshuf_decompress_lz4_block`, bitshuffle.c:78). Returns the
 /// unshuffled block bytes and the buffer offset past the frame.
 fn bshuf_decompress_lz4_block(
     buf: &[u8],
@@ -634,8 +642,8 @@ fn bshuf_decompress_lz4_block(
 /// Compress an NDArray with the Bitshuffle + LZ4 (`bslz4`) codec.
 ///
 /// Produces the per-block stream exactly as the bitshuffle library's
-/// `bshuf_compress_lz4` emits it (bitshuffle.c:237, blocked via
-/// `bshuf_blocked_wrap_fun`, bitshuffle_core.c:1852): every full block plus one
+/// `bshuf_compress_lz4` emits it (bitshuffle.c:153, blocked via
+/// `bshuf_blocked_wrap_fun`, bitshuffle_core.c:1667): every full block plus one
 /// trailing partial block (the remainder rounded down to a multiple of 8) is
 /// bit-transposed, LZ4-block-compressed and framed `[u32 nbytes_BE][lz4]`; the
 /// final `size % 8` elements are copied verbatim. There is NO global
@@ -698,7 +706,7 @@ pub fn compress_bslz4(src: &NDArray) -> NDArray {
 /// Decompress a Bitshuffle + LZ4 (`bslz4`) NDArray.
 ///
 /// Inverse of [`compress_bslz4`], mirroring `bshuf_decompress_lz4`
-/// (bitshuffle.c:244). The uncompressed element count comes from the preserved
+/// (bitshuffle.c:160). The uncompressed element count comes from the preserved
 /// array dims (matching C, which passes `nElements` from the NDArray, not from
 /// the payload), so the codec buffer carries no global header. Returns `None`
 /// if the codec is not BSLZ4 or the stream is malformed.
@@ -1101,11 +1109,18 @@ struct CodecParamIndices {
     codec_error: Option<usize>,
 }
 
-pub struct CodecProcessor {
+/// The operator-selected codec settings plus the ratio the last frame
+/// produced. `on_param_change` rebuilds `mode` from `jpeg_quality`, so the two
+/// must move together.
+struct CodecState {
     mode: CodecMode,
     compression_ratio: f64,
     jpeg_quality: u8,
     blosc_config: BloscConfig,
+}
+
+pub struct CodecProcessor {
+    state: Mutex<CodecState>,
     params: CodecParamIndices,
 }
 
@@ -1116,10 +1131,12 @@ impl CodecProcessor {
             _ => 85,
         };
         Self {
-            mode,
-            compression_ratio: 1.0,
-            jpeg_quality: quality,
-            blosc_config: BloscConfig::default(),
+            state: Mutex::new(CodecState {
+                mode,
+                compression_ratio: 1.0,
+                jpeg_quality: quality,
+                blosc_config: BloscConfig::default(),
+            }),
             params: CodecParamIndices::default(),
         }
     }
@@ -1127,12 +1144,12 @@ impl CodecProcessor {
     /// Last computed compression ratio (original_size / compressed_size).
     /// Returns 1.0 if no compression has been performed yet or on decompression.
     pub fn compression_ratio(&self) -> f64 {
-        self.compression_ratio
+        self.state.lock().compression_ratio
     }
 }
 
 /// What the codec plugin decided for one input array, mirroring the exits of C
-/// `NDPluginCodec::processCallbacks` (NDPluginCodec.cpp:670-778).
+/// `NDPluginCodec::processCallbacks` (NDPluginCodec.cpp:649-782).
 ///
 /// C distinguishes "the input *is* the result" (`result = pArray`, no error,
 /// codecStatus untouched) from "the codec produced nothing" (`result = NULL` +
@@ -1188,7 +1205,16 @@ impl CodecOutcome {
 }
 
 impl NDPluginProcess for CodecProcessor {
-    fn process_array(&mut self, array: &NDArray, _pool: &NDArrayPool) -> ProcessResult {
+    fn process_array(&self, array: &NDArray, _pool: &NDArrayPool) -> ProcessResult {
+        // C reads the codec selection under the port lock and releases it
+        // around every codec call (`NDPluginCodec.cpp:556`, `:596`), so the
+        // compression itself never holds it. `mode`, `jpeg_quality` and
+        // `blosc_config` are the selection; `compression_ratio` is this
+        // frame's result and goes back under the lock at the end.
+        let (mode, jpeg_quality, blosc_config) = {
+            let state = self.state.lock();
+            (state.mode, state.jpeg_quality, state.blosc_config)
+        };
         let original_bytes = array.data.as_u8_slice().len();
 
         // C sets NDCodecCompressor from the codec it found on the input on every
@@ -1197,7 +1223,7 @@ impl NDPluginProcess for CodecProcessor {
         // selection.
         let mut compressor: Option<i32> = None;
 
-        let outcome = match self.mode {
+        let outcome = match mode {
             // C: `algo` NONE short-circuits both the already-compressed check
             // (:671, gated on `algo`) and the codec switch (:680-683
             // `case NDCODEC_NONE: default: result = pArray`) — a pass-through,
@@ -1216,14 +1242,12 @@ impl NDPluginProcess for CodecProcessor {
                 // The encoder names its own failure (C writes a different
                 // errorMessage at each rejection, NDPluginCodec.cpp:140, :166,
                 // :201, :235); the caller must not invent one.
-                CodecName::JPEG => match compress_jpeg(array, self.jpeg_quality) {
+                CodecName::JPEG => match compress_jpeg(array, jpeg_quality) {
                     Ok(out) => CodecOutcome::Converted(out),
                     Err(e) => CodecOutcome::Failed(e.message()),
                 },
                 CodecName::Zlib => CodecOutcome::Converted(compress_zlib(array)),
-                CodecName::Blosc => {
-                    CodecOutcome::Converted(compress_blosc(array, &self.blosc_config))
-                }
+                CodecName::Blosc => CodecOutcome::Converted(compress_blosc(array, &blosc_config)),
                 CodecName::LZ4HDF5 => CodecOutcome::Converted(compress_lz4hdf5(array)),
                 CodecName::BSLZ4 => CodecOutcome::Converted(compress_bslz4(array)),
                 // Matched by the first arm above.
@@ -1241,7 +1265,7 @@ impl NDPluginProcess for CodecProcessor {
                     .unwrap_or(CodecName::None);
                 compressor = Some(name.ordinal());
                 match name {
-                    // C :732-735 — uncompressed input: result = pArray,
+                    // C `NDPluginCodec.cpp:732-735` — uncompressed input: result = pArray,
                     // COMPRESSOR = NDCODEC_NONE, codecStatus stays SUCCESS.
                     CodecName::None => CodecOutcome::PassThrough,
                     CodecName::LZ4 => match decompress_lz4(array) {
@@ -1282,10 +1306,11 @@ impl NDPluginProcess for CodecProcessor {
         // C recomputes NDCodecCompFactor only when `result != pArray`
         // (:726-730, :763-767); on any exit that republishes the input it stays
         // at 1.0.
+        let mut compression_ratio = 1.0;
         let output = match outcome {
             CodecOutcome::Converted(out) => {
                 let output_bytes = out.data.as_u8_slice().len();
-                self.compression_ratio = match self.mode {
+                compression_ratio = match mode {
                     CodecMode::Compress { .. } => {
                         original_bytes as f64 / output_bytes.max(1) as f64
                     }
@@ -1294,14 +1319,14 @@ impl NDPluginProcess for CodecProcessor {
                 out
             }
             CodecOutcome::PassThrough | CodecOutcome::Skipped(_) | CodecOutcome::Failed(_) => {
-                self.compression_ratio = 1.0;
                 array.clone()
             }
         };
+        self.state.lock().compression_ratio = compression_ratio;
 
         let mut updates = Vec::new();
         if let Some(idx) = self.params.comp_factor {
-            updates.push(ParamUpdate::float64(idx, self.compression_ratio));
+            updates.push(ParamUpdate::float64(idx, compression_ratio));
         }
         if let (Some(idx), Some(value)) = (self.params.compressor, compressor) {
             updates.push(ParamUpdate::int32(idx, value));
@@ -1368,50 +1393,51 @@ impl NDPluginProcess for CodecProcessor {
     }
 
     fn on_param_change(
-        &mut self,
+        &self,
         reason: usize,
         params: &ad_core_rs::plugin::runtime::PluginParamSnapshot,
     ) -> ad_core_rs::plugin::runtime::ParamChangeResult {
+        let mut state = self.state.lock();
         if Some(reason) == self.params.mode {
             let v = params.value.as_i32();
             if v == 0 {
                 // Compress — keep current codec
-                let codec = match self.mode {
+                let codec = match state.mode {
                     CodecMode::Compress { codec, .. } => codec,
                     _ => CodecName::LZ4,
                 };
-                self.mode = CodecMode::Compress {
+                state.mode = CodecMode::Compress {
                     codec,
-                    quality: self.jpeg_quality,
+                    quality: state.jpeg_quality,
                 };
             } else {
-                self.mode = CodecMode::Decompress;
+                state.mode = CodecMode::Decompress;
             }
         } else if Some(reason) == self.params.compressor {
             // C `NDCodecCompressor_t` (Codec.h:12-18) — the ordinal mapping lives
             // in `CodecName::from_ordinal`, shared with the COMPRESSOR value the
             // decompress path reports back.
             let codec = CodecName::from_ordinal(params.value.as_i32());
-            if let CodecMode::Compress { .. } = self.mode {
-                self.mode = CodecMode::Compress {
+            if let CodecMode::Compress { .. } = state.mode {
+                state.mode = CodecMode::Compress {
                     codec,
-                    quality: self.jpeg_quality,
+                    quality: state.jpeg_quality,
                 };
             }
         } else if Some(reason) == self.params.jpeg_quality {
-            self.jpeg_quality = params.value.as_i32().clamp(1, 100) as u8;
-            if let CodecMode::Compress { codec, .. } = self.mode {
-                self.mode = CodecMode::Compress {
+            state.jpeg_quality = params.value.as_i32().clamp(1, 100) as u8;
+            if let CodecMode::Compress { codec, .. } = state.mode {
+                state.mode = CodecMode::Compress {
                     codec,
-                    quality: self.jpeg_quality,
+                    quality: state.jpeg_quality,
                 };
             }
         } else if Some(reason) == self.params.blosc_compressor {
-            self.blosc_config.compressor = params.value.as_i32().max(0) as u32;
+            state.blosc_config.compressor = params.value.as_i32().max(0) as u32;
         } else if Some(reason) == self.params.blosc_clevel {
-            self.blosc_config.clevel = params.value.as_i32().clamp(0, 9) as u32;
+            state.blosc_config.clevel = params.value.as_i32().clamp(0, 9) as u32;
         } else if Some(reason) == self.params.blosc_shuffle {
-            self.blosc_config.shuffle = params.value.as_i32().max(0) as u32;
+            state.blosc_config.shuffle = params.value.as_i32().max(0) as u32;
         }
 
         ad_core_rs::plugin::runtime::ParamChangeResult::updates(vec![])
@@ -1956,7 +1982,7 @@ mod tests {
         let original = arr.data.as_u8_slice().to_vec();
         let pool = NDArrayPool::new(10_000_000);
 
-        let mut comp = CodecProcessor::new(CodecMode::Compress {
+        let comp = CodecProcessor::new(CodecMode::Compress {
             codec: CodecName::BSLZ4,
             quality: 0,
         });
@@ -1967,7 +1993,7 @@ mod tests {
             CodecName::BSLZ4
         );
 
-        let mut decomp = CodecProcessor::new(CodecMode::Decompress);
+        let decomp = CodecProcessor::new(CodecMode::Decompress);
         let result = decomp.process_array(compressed_arr, &pool);
         assert_eq!(
             result.output_arrays[0].data.as_u8_slice(),
@@ -2097,7 +2123,7 @@ mod tests {
 
     #[test]
     fn test_r8_62_decompressed_jpeg_reports_rgb1_colormode() {
-        // A decoded JPEG is always mono or RGB1 (C :268-272), so C overwrites the
+        // A decoded JPEG is always mono or RGB1 (C's comment at :268-272), so C overwrites the
         // ColorMode attribute on the output (:318-322). An RGB2 source's stale
         // ColorMode=3 on RGB1 data would make every downstream getInfo read the
         // planes in the wrong order.
@@ -2390,7 +2416,7 @@ mod tests {
         let original = arr.data.as_u8_slice().to_vec();
         let pool = NDArrayPool::new(10_000_000);
 
-        let mut comp = CodecProcessor::new(CodecMode::Compress {
+        let comp = CodecProcessor::new(CodecMode::Compress {
             codec: CodecName::Zlib,
             quality: 0,
         });
@@ -2398,7 +2424,7 @@ mod tests {
         let compressed_arr = &compressed.output_arrays[0];
         assert_eq!(compressed_arr.codec.as_ref().unwrap().name, CodecName::Zlib);
 
-        let mut decomp = CodecProcessor::new(CodecMode::Decompress);
+        let decomp = CodecProcessor::new(CodecMode::Decompress);
         let result = decomp.process_array(compressed_arr, &pool);
         assert_eq!(
             result.output_arrays[0].data.as_u8_slice(),
@@ -2519,7 +2545,7 @@ mod tests {
         let original = arr.data.as_u8_slice().to_vec();
         let pool = NDArrayPool::new(10_000_000);
 
-        let mut comp = CodecProcessor::new(CodecMode::Compress {
+        let comp = CodecProcessor::new(CodecMode::Compress {
             codec: CodecName::LZ4HDF5,
             quality: 0,
         });
@@ -2530,7 +2556,7 @@ mod tests {
             CodecName::LZ4HDF5
         );
 
-        let mut decomp = CodecProcessor::new(CodecMode::Decompress);
+        let decomp = CodecProcessor::new(CodecMode::Decompress);
         let result = decomp.process_array(compressed_arr, &pool);
         assert_eq!(
             result.output_arrays[0].data.as_u8_slice(),
@@ -2572,7 +2598,7 @@ mod tests {
                 value: ParamChangeValue::Int32(ordinal),
             };
             proc.on_param_change(0, &snapshot);
-            match proc.mode {
+            match proc.state.lock().mode {
                 CodecMode::Compress { codec, .. } => assert_eq!(
                     codec, expected,
                     "ordinal {ordinal} should select {expected:?}"
@@ -2598,7 +2624,7 @@ mod tests {
     #[test]
     fn test_processor_lz4_compress() {
         let pool = NDArrayPool::new(1_000_000);
-        let mut proc = CodecProcessor::new(CodecMode::Compress {
+        let proc = CodecProcessor::new(CodecMode::Compress {
             codec: CodecName::LZ4,
             quality: 0,
         });
@@ -2615,7 +2641,7 @@ mod tests {
     #[test]
     fn test_processor_jpeg_compress() {
         let pool = NDArrayPool::new(1_000_000);
-        let mut proc = CodecProcessor::new(CodecMode::Compress {
+        let proc = CodecProcessor::new(CodecMode::Compress {
             codec: CodecName::JPEG,
             quality: 80,
         });
@@ -2634,7 +2660,7 @@ mod tests {
         let arr = make_u8_array(16, 16);
         let compressed = compress_lz4(&arr);
 
-        let mut proc = CodecProcessor::new(CodecMode::Decompress);
+        let proc = CodecProcessor::new(CodecMode::Decompress);
         let result = proc.process_array(&compressed, &pool);
         assert_eq!(result.output_arrays.len(), 1);
         assert!(result.output_arrays[0].codec.is_none());
@@ -2651,7 +2677,7 @@ mod tests {
         let arr = make_u8_array(16, 16);
         let compressed = compress_jpeg(&arr, 90).unwrap();
 
-        let mut proc = CodecProcessor::new(CodecMode::Decompress);
+        let proc = CodecProcessor::new(CodecMode::Decompress);
         let result = proc.process_array(&compressed, &pool);
         assert_eq!(result.output_arrays.len(), 1);
         assert!(result.output_arrays[0].codec.is_none());
@@ -2661,7 +2687,7 @@ mod tests {
     fn test_processor_decompress_no_codec() {
         let pool = NDArrayPool::new(1_000_000);
         let arr = make_u8_array(8, 8);
-        let mut proc = CodecProcessor::new(CodecMode::Decompress);
+        let proc = CodecProcessor::new(CodecMode::Decompress);
         let result = proc.process_array(&arr, &pool);
         // C++: on failure, pass through original array unchanged
         assert_eq!(result.output_arrays.len(), 1);
@@ -2707,7 +2733,7 @@ mod tests {
         // "codec operation failed or unsupported" and never wrote COMPRESSOR.
         let pool = NDArrayPool::new(1_000_000);
         let arr = make_u8_array(8, 8);
-        let mut proc = processor_with_params(CodecMode::Decompress);
+        let proc = processor_with_params(CodecMode::Decompress);
         let result = proc.process_array(&arr, &pool);
 
         assert_eq!(
@@ -2745,7 +2771,7 @@ mod tests {
             (compress_bslz4(&src), 4),
             (compress_jpeg(&src, 90).expect("jpeg"), 1),
         ] {
-            let mut proc = processor_with_params(CodecMode::Decompress);
+            let proc = processor_with_params(CodecMode::Decompress);
             let result = proc.process_array(&codec, &pool);
             assert_eq!(
                 int32_update(&result.param_updates, 11),
@@ -2768,7 +2794,7 @@ mod tests {
         // port's catch-all `Compress { .. } => None` sent it to the error branch.
         let pool = NDArrayPool::new(1_000_000);
         let arr = make_u8_array(8, 8);
-        let mut proc = processor_with_params(CodecMode::Compress {
+        let proc = processor_with_params(CodecMode::Compress {
             codec: CodecName::None,
             quality: 85,
         });
@@ -2799,7 +2825,7 @@ mod tests {
         if let NDDataBuffer::U8(ref mut v) = corrupted.data {
             v.truncate(3);
         }
-        let mut proc = processor_with_params(CodecMode::Decompress);
+        let proc = processor_with_params(CodecMode::Decompress);
         let result = proc.process_array(&corrupted, &pool);
 
         assert_ne!(
@@ -2832,12 +2858,12 @@ mod tests {
 
     #[test]
     fn test_r8_63_already_compressed_is_a_warning_not_success() {
-        // C :671-676 — compressing an already-compressed array is benign but not
-        // silent: errorMessage "Array already compressed", codecStatus WARNING,
-        // and the input passes through. The port reported SUCCESS with no error.
+        // C `NDPluginCodec.cpp:671-676` — compressing an already-compressed array is benign
+        // but not silent: errorMessage "Array already compressed", codecStatus WARNING, and
+        // the input passes through. The port reported SUCCESS with no error.
         let pool = NDArrayPool::new(1_000_000);
         let compressed = compress_lz4(&make_u8_array(16, 16));
-        let mut proc = processor_with_params(CodecMode::Compress {
+        let proc = processor_with_params(CodecMode::Compress {
             codec: CodecName::Zlib,
             quality: 85,
         });
@@ -2861,8 +2887,8 @@ mod tests {
 
     #[test]
     fn test_r8_63_genuine_failures_are_error_not_warning() {
-        // C reports ERROR(2) for real failures: a JPEG-unsupported input
-        // (:141/:167/:202/:252) and a codec that fails to decode (:279, :760).
+        // C `NDPluginCodec.cpp` reports ERROR(2) for real failures: a JPEG-unsupported input
+        // (`:141`/`:167`/`:202`/`:252`) and a codec that fails to decode (`:279`, `:760`).
         // The port hardcoded 1 (WARNING) on every failure, making the two levels
         // indistinguishable.
         let pool = NDArrayPool::new(1_000_000);
@@ -2872,7 +2898,7 @@ mod tests {
             vec![NDDimension::new(8), NDDimension::new(8)],
             NDDataType::UInt16,
         );
-        let mut proc = processor_with_params(CodecMode::Compress {
+        let proc = processor_with_params(CodecMode::Compress {
             codec: CodecName::JPEG,
             quality: 85,
         });
@@ -2888,7 +2914,7 @@ mod tests {
         if let NDDataBuffer::U8(ref mut v) = corrupted.data {
             v.truncate(3);
         }
-        let mut proc = processor_with_params(CodecMode::Decompress);
+        let proc = processor_with_params(CodecMode::Decompress);
         let result = proc.process_array(&corrupted, &pool);
         assert_eq!(
             int32_update(&result.param_updates, 12),
@@ -2899,12 +2925,12 @@ mod tests {
 
     #[test]
     fn test_r8_63_successful_and_passthrough_paths_report_success() {
-        // The other two levels must stay at SUCCESS(0): a real compression, and
-        // the pass-through exits (C :659, :680-683, :732-735).
+        // The other two levels must stay at SUCCESS(0): a real compression, and the
+        // pass-through exits (C `NDPluginCodec.cpp:659`, `:680-683`, `:732-735`).
         let pool = NDArrayPool::new(1_000_000);
         let arr = make_u8_array(16, 16);
 
-        let mut proc = processor_with_params(CodecMode::Compress {
+        let proc = processor_with_params(CodecMode::Compress {
             codec: CodecName::LZ4,
             quality: 85,
         });
@@ -2914,7 +2940,7 @@ mod tests {
             Some(CodecStatus::Success.as_i32())
         );
 
-        let mut proc = processor_with_params(CodecMode::Decompress);
+        let proc = processor_with_params(CodecMode::Decompress);
         let passthrough = proc.process_array(&arr, &pool);
         assert_eq!(
             int32_update(&passthrough.param_updates, 12),
@@ -2936,7 +2962,7 @@ mod tests {
             }
         }
 
-        let mut proc = CodecProcessor::new(CodecMode::Compress {
+        let proc = CodecProcessor::new(CodecMode::Compress {
             codec: CodecName::LZ4,
             quality: 0,
         });

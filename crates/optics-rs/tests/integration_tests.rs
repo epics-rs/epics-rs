@@ -1,3 +1,12 @@
+#![cfg(tokio_backend)]
+// Every case here drives the table record through a real CA server's put
+// gate. The reactor-free `exec_backend` — selected on a host build by
+// `EPICS_RS_BUILD_EXEC_BACKEND=thread`, and unconditionally on RTEMS and
+// VxWorks — has no `epics_ca_rs::server::CaServer` to build, so this file
+// has no subject there. `[[test]] required-features` cannot name a
+// build-script cfg, which is why the gate is here and not in
+// `Cargo.toml`.
+
 use epics_base_rs::types::EpicsValue;
 use epics_ca_rs::server::CaServerBuilder;
 use optics_rs::records::table::TableRecord;

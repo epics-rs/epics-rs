@@ -30,3 +30,8 @@ libc = "0.2"
 # needed to say whether it was.
 [target.'cfg(target_os = "vxworks")'.dependencies]
 libc = "0.2"
+
+[dev-dependencies]
+# Dev-only and `path`-only, so `cargo package` drops it from the uploaded
+# manifest: the source guards in this crate share one production-slice rule.
+source-guard = { path = "../source-guard" }

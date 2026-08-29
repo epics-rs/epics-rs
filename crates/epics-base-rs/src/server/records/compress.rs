@@ -30,7 +30,7 @@ pub struct CompressRecord {
     pub balg: i16, // 0=FIFO, 1=LIFO — `menuBufferingALG`
     /// `ILIL` (input low limit). When `ILIL < IHIL`, samples outside
     /// `[ILIL, IHIL]` are dropped before compression (C
-    /// `compress_array` skip loop, compressRecord.c:163-170).
+    /// `compress_array` skip loop, compressRecord.c:164-170).
     pub ilil: f64,
     /// `IHIL` (input high limit). See [`Self::ilil`].
     pub ihil: f64,
@@ -98,7 +98,7 @@ pub struct CompressRecord {
     /// source's capacity and its delivered length both change exactly when the
     /// source array is re-shaped).
     inpn: usize,
-    /// What C `monitor()` (:100-110) decided to post for the SPC_RESET put now
+    /// What C `monitor()` (:101-111) decided to post for the SPC_RESET put now
     /// in flight. Written by [`Self::monitor`] — the only place that makes the
     /// decision, and the only writer of `ouse` — and read back by
     /// `monitor_side_effect_fields`, which the put owner calls immediately
@@ -215,7 +215,7 @@ impl CompressRecord {
         }
     }
 
-    /// C `compressRecord.c::monitor` (:100-110) — **the single owner of the
+    /// C `compressRecord.c::monitor` (:101-111) — **the single owner of the
     /// OUSE latch**:
     ///
     /// ```c
@@ -232,7 +232,7 @@ impl CompressRecord {
     ///
     /// C calls `monitor()` from exactly two places, and so does the port: the
     /// SPC_RESET `special()` ([`Record::special`]) and the publication epilogue
-    /// of `process()` (`:365-372`, skipped on an accumulate-only cycle — which
+    /// of `process()` (`:365-371`, skipped on an accumulate-only cycle — which
     /// is why an accumulating compress does not re-post NUSE).
     ///
     /// Returns the fields to post; `special()` hands them to the framework
@@ -245,6 +245,27 @@ impl CompressRecord {
         } else {
             &["VAL"]
         }
+    }
+
+    /// N, clamped to at least 1 **and written back** — the single owner of
+    /// that clamp.
+    ///
+    /// C `compress_array` (`compressRecord.c:171-172`) and `array_average`
+    /// (`:255-256`) both open with `if (prec->n <= 0) prec->n = 1;`, storing
+    /// into the field and not into a local, so a client that puts `N = 0`
+    /// reads 1 back after the next array cycle. Reading `self.n.max(1)` into a
+    /// local gave the same division but left the field at 0, which is a value
+    /// the record then reports as its own configuration.
+    ///
+    /// Deliberately not used by `compress_scalar`: C's scalar path
+    /// (`:273-304`) has no such line, and with `n == 0` its `inx >= prec->n`
+    /// test at `:296` is already true on the first sample, so it emits every
+    /// sample and never touches the field.
+    fn clamped_n(&mut self) -> i32 {
+        if self.n <= 0 {
+            self.n = 1;
+        }
+        self.n
     }
 
     /// Write one value into the circular buffer, advancing `off`
@@ -368,7 +389,7 @@ impl CompressRecord {
             }
         }
         self.inx += 1;
-        let n = self.n.max(1);
+        let n = self.clamped_n();
         if self.inx < n {
             // C `array_average` `return 1`: still accumulating, no emit
             // (no `put_one`, so the completion gate stays unset this cycle).
@@ -445,7 +466,7 @@ impl CompressRecord {
         }
     }
 
-    /// C `compress_array`'s Low/High scan (`compressRecord.c:183-196`) — the
+    /// C `compress_array`'s Low/High scan (`compressRecord.c:185-200`) — the
     /// shape a fold over a ±INF identity cannot express:
     ///
     /// ```c
@@ -497,7 +518,7 @@ impl CompressRecord {
             }
         }
         let source = &input[start..];
-        let n = self.n.max(1) as usize;
+        let n = self.clamped_n() as usize;
         // C: nnew = min(no_elements, nsam * n).
         let nsam = self.nsam.max(1) as usize;
         let mut remaining = source.len().min(nsam.saturating_mul(n));
@@ -583,7 +604,7 @@ impl Record for CompressRecord {
         "compress"
     }
 
-    /// `compressRecord.c:341-366`: a failed `dbGetLink` on INP raises
+    /// `compressRecord.c:342-366`: a failed `dbGetLink` on INP raises
     /// LINK/INVALID and then FOLDS the failure away — `status = 0` — so the
     /// tail's `if (status != 1) prec->udf = FALSE;` clears UDF on the broken
     /// cycle just as it does on a good one. compress is the one scalar-ish
@@ -682,7 +703,7 @@ impl Record for CompressRecord {
             // included — so OUSE does NOT latch and NUSE is not posted.
             return Ok(ProcessOutcome::complete_no_emit());
         }
-        // C `compressRecord.c:365-372`: the epilogue calls `monitor(prec)`,
+        // C `compressRecord.c:365-371`: the epilogue calls `monitor(prec)`,
         // which is where OUSE latches on a publishing cycle.
         self.monitor_posts = self.monitor();
         Ok(ProcessOutcome::complete())
@@ -868,7 +889,7 @@ impl Record for CompressRecord {
         }
     }
 
-    /// C `compressRecord.c::cvt_dbaddr` (:398-407):
+    /// C `compressRecord.c::cvt_dbaddr` (:395-407):
     ///
     /// ```c
     /// if (prec->balg == bufferingALG_LIFO)
@@ -921,7 +942,7 @@ impl Record for CompressRecord {
         "VAL"
     }
 
-    /// C `compressRecord.c:326-343` — the INP ingest, and the one gate on it:
+    /// C `compressRecord.c:327-343` — the INP ingest, and the one gate on it:
     ///
     /// ```c
     /// if (!dbIsLinkConnected(&prec->inp) || dbGetNelements(...) || nelements <= 0)
@@ -1269,7 +1290,7 @@ mod pbuf_tests {
     }
 
     /// ILIL/IHIL input range filter — C `compress_array`
-    /// (compressRecord.c:163-170) skips only the *leading* run of
+    /// (compressRecord.c:164-170) skips only the *leading* run of
     /// out-of-limit samples; an out-of-limit sample in the middle of
     /// the array is NOT dropped.
     #[test]

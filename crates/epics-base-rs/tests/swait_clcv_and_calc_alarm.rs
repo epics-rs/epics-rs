@@ -70,7 +70,7 @@ async fn r10_67_clcv_carries_the_postfix_status() {
 }
 
 /// The put SUCCEEDS and CLCV reports the verdict — C's `special(SPC_CALC)`
-/// returns 0 (`swaitRecord.c:560-567`), unlike calcRecord's `S_db_badField`.
+/// returns 0 (`swaitRecord.c:560-570`), unlike calcRecord's `S_db_badField`.
 #[epics_macros_rs::epics_test]
 async fn r10_67_a_broken_calc_put_succeeds_and_lands_in_clcv() {
     let db = PvDatabase::new();
@@ -154,7 +154,7 @@ async fn r10_67_a_broken_calc_raises_calc_alarm_every_cycle() {
 
 /// The invariant boundary the `mem::take` closes: CALC_ALARM is a PER-CYCLE
 /// fact. A cycle that runs no `calcPerform` — here because the input fetch
-/// failed (C `swaitRecord.c:407`) — must not re-raise the previous cycle's
+/// failed (C `swaitRecord.c:408`) — must not re-raise the previous cycle's
 /// failure. C raises READ_ALARM instead, and nothing else.
 #[epics_macros_rs::epics_test]
 async fn r10_67_a_gated_cycle_does_not_inherit_the_previous_calc_alarm() {
@@ -193,7 +193,7 @@ async fn r10_67_a_gated_cycle_does_not_inherit_the_previous_calc_alarm() {
 /// But the gate itself is not silent. calc's only route to a failed fetch is a
 /// failed link read (`fetch_values`, `calcRecord.c:439`, is a bare loop of
 /// `dbGetLink`), and `dbGetLink` raises `setLinkAlarm` — LINK/INVALID, AMSG
-/// `field INPA` — on every one of them (`dbLink.c:339`). So a gated calc cycle
+/// `field INPA` — on every one of them (`dbLink.c:337`). So a gated calc cycle
 /// in C is LINK/INVALID, never NO_ALARM: the NO_ALARM this case used to assert
 /// is a state C cannot reach. Because that LINK alarm is raised during the
 /// fetch, before any CALC_ALARM would be, and `recGblSetSevr` is strict-greater,
@@ -230,7 +230,7 @@ async fn r10_67_calc_gated_cycle_clears_the_calc_alarm() {
     assert_eq!(
         inst.read().common.amsg,
         "field INPA",
-        "setLinkAlarm names the link's own field (dbLink.c:318-322)"
+        "setLinkAlarm names the link's own field (dbLink.c:316-320)"
     );
 }
 
@@ -244,21 +244,30 @@ async fn r10_67_calc_gated_cycle_clears_the_calc_alarm() {
 async fn r10_67_calc_alarm_wins_the_stat_over_udf_alarm() {
     let db = PvDatabase::new();
 
-    // A record that is BOTH undefined and calc-failing: VAL is NaN (so
-    // `checkAlarms`'s UDF guard fires at UDFS = INVALID) and the CALC never
+    // A record that is BOTH undefined and calc-failing: it is loaded (UDF 1,
+    // so `checkAlarms`'s UDF guard fires at UDFS = INVALID) and its CALC never
     // compiles (so `calcPerform` fails at INVALID too). Both alarms are INVALID,
     // so the STAT is decided purely by which is raised first.
+    //
+    // The undefined half comes from the LOAD, not from a `caput VAL NaN`: C's
+    // `dbPut` clears UDF on a VAL write, and `calcRecord.c:120-124` writes UDF
+    // only on the `calcPerform` success arm, so a NaN put followed by a failing
+    // calc leaves UDF at 0 and raises no UDF_ALARM to tie-break against.
+    // Measured on the built C `softIoc` (7.0.10.1-DEV) with
+    // `record(calc,"D"){field(CALC,"1+")}`: `dbpf D.PROC 1` then
+    // `D.UDF 1`, `D.STAT CALC`, `D.SEVR INVALID` — and the same `.cmd` with the
+    // `dbpf D.VAL NaN` in front gives `D.UDF 0`.
     let mut c = CalcRecord::default();
     c.calc = "1+".into();
     db.add_record("C", Box::new(c)).await.unwrap();
-    db.put_record_field_from_ca("C", "VAL", EpicsValue::Double(f64::NAN))
-        .await
-        .unwrap();
 
     process(&db, "C").await;
 
     let inst = db.get_record("C").unwrap();
-    assert!(inst.read().common.udf != 0, "a NaN VAL keeps UDF");
+    assert!(
+        inst.read().common.udf != 0,
+        "a never-computed calc stays undefined"
+    );
     assert_eq!(
         alarm(&db, "C").await,
         (AlarmSeverity::Invalid, CALC_ALARM),

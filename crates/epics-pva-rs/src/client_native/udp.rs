@@ -36,9 +36,14 @@
 //! destination, which is all the fan-out predicate needs. This keeps the
 //! receive core independent of the wire codec.
 
-// (1 live-UDP recv_loop test gated out feature-ON below; §4.2 UDP search, stage 3.)
+// (1 live-UDP recv_loop test carries its own feature gate below — now
+// redundant, and kept only so the census marker's count stays the reviewable
+// number it was; §4.2 UDP search, stage 3.)
 
-// RTEMS-EXEC-MODEL-ALLOW(4): checked - these run and pass in the feature-ON suite.
+// RTEMS-EXEC-MODEL-ALLOW(4): this file does not build on the exec backend at
+// all — `client_native/mod.rs` declares it `#[cfg(tokio_backend)]` because its
+// `UdpSocket::readable` waits need a reactor the exec backend has not got. The
+// four are counted, not run.
 use std::collections::{HashMap, HashSet};
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
@@ -235,7 +240,11 @@ impl UdpManager {
     /// and is then cached under its *assigned* port. A unicast, broadcast,
     /// and multicast destination that share one port all resolve to the
     /// same collector — none of them is bound to its own address.
-    pub fn collect(&self, dest: &Endpoint) -> io::Result<UdpCollector> {
+    pub fn collect(
+        &self,
+        reactor: &epics_base_rs::runtime::task::Reactor,
+        dest: &Endpoint,
+    ) -> io::Result<UdpCollector> {
         let is_v6 = matches!(dest.addr, SocketAddr::V6(_));
         let port = dest.addr.port();
 
@@ -252,7 +261,7 @@ impl UdpManager {
             }
         }
 
-        let state = CollectorState::bind_and_spawn(is_v6, port)?;
+        let state = CollectorState::bind_and_spawn(reactor, is_v6, port)?;
         // Cache under the *bound* port so a port-0 request is reusable by a
         // later collect on the assigned port (pvxs keys on `bind_addr.port()`).
         let bound_port = state.bind_addr.port();
@@ -264,7 +273,11 @@ impl UdpManager {
 impl CollectorState {
     /// Bind one wildcard socket for `(family, port)`, enable original-
     /// destination ancillary data, and spawn the receive/fan-out task.
-    fn bind_and_spawn(is_v6: bool, port: u16) -> io::Result<Arc<CollectorState>> {
+    fn bind_and_spawn(
+        reactor: &epics_base_rs::runtime::task::Reactor,
+        is_v6: bool,
+        port: u16,
+    ) -> io::Result<Arc<CollectorState>> {
         let domain = if is_v6 { Domain::IPV6 } else { Domain::IPV4 };
         let sock = Socket::new(domain, Type::DGRAM, Some(Protocol::UDP))?;
 
@@ -315,7 +328,7 @@ impl CollectorState {
         // the state, so it neither keeps the collector alive nor leaks the
         // socket: when the last handle drops, the next idle re-check (or the
         // post-datagram upgrade) fails and the task exits.
-        epics_base_rs::runtime::task::spawn(recv_loop(sock, is_v6, Arc::downgrade(&state)));
+        reactor.spawn(recv_loop(sock, is_v6, Arc::downgrade(&state)));
 
         Ok(state)
     }
@@ -372,7 +385,7 @@ async fn recv_loop(sock: Arc<UdpSocket>, is_v6: bool, weak: Weak<CollectorState>
     loop {
         // Wake on readability, but bound the wait so an idle collector still
         // notices that its last handle was dropped and can exit.
-        match tokio::time::timeout(Duration::from_secs(5), sock.readable()).await {
+        match epics_base_rs::runtime::task::timeout(Duration::from_secs(5), sock.readable()).await {
             Ok(Ok(())) => {}
             Ok(Err(_)) => break,
             Err(_elapsed) => {
@@ -947,13 +960,15 @@ mod tests {
         let mgr = UdpManager::new();
         // A broadcast, a multicast, and a unicast destination that share a
         // port must all resolve to the SAME wildcard collector.
-        let bcast = mgr.collect(&ep("255.255.255.255:0")).expect("bind bcast");
+        let bcast = mgr
+            .collect(&crate::test_reactor(), &ep("255.255.255.255:0"))
+            .expect("bind bcast");
         let port = bcast.local_addr().unwrap().port();
         let unicast = mgr
-            .collect(&ep(&format!("192.168.1.5:{port}")))
+            .collect(&crate::test_reactor(), &ep(&format!("192.168.1.5:{port}")))
             .expect("reuse unicast");
         let mcast = mgr
-            .collect(&ep(&format!("224.0.2.3:{port}")))
+            .collect(&crate::test_reactor(), &ep(&format!("224.0.2.3:{port}")))
             .expect("reuse mcast");
         assert!(
             Arc::ptr_eq(&bcast.state, &unicast.state),
@@ -969,7 +984,9 @@ mod tests {
     async fn collector_binds_wildcard_never_the_destination() {
         let mgr = UdpManager::new();
         // Even a broadcast destination yields a wildcard (unspecified) bind.
-        let c = mgr.collect(&ep("255.255.255.255:0")).expect("bind");
+        let c = mgr
+            .collect(&crate::test_reactor(), &ep("255.255.255.255:0"))
+            .expect("bind");
         assert!(
             c.bind_addr().ip().is_unspecified(),
             "collector must bind the wildcard, not the destination: {}",
@@ -980,7 +997,9 @@ mod tests {
     #[tokio::test]
     async fn multicast_listener_joins_group_unicast_does_not() {
         let mgr = UdpManager::new();
-        let c = mgr.collect(&ep("0.0.0.0:0")).expect("bind");
+        let c = mgr
+            .collect(&crate::test_reactor(), &ep("0.0.0.0:0"))
+            .expect("bind");
         let _u = c.add_listener(&ep("0.0.0.0:0")).expect("wildcard listener");
         assert_eq!(
             c.joined_group_count(),
@@ -1011,19 +1030,18 @@ mod tests {
 
     // Asserts a recovered original destination. Unix uses `recvmsg`/cmsg,
     // Windows uses `WSARecvMsg`/`IP_PKTINFO`; only other targets report
-    // `orig_dest == None` by construction (see `enable_recv_orig_dest`),
-    // so the assertion is gated to the two that actually recover it.
-    // Binds a real `tokio::net` UDP socket and drives `recv_loop`, whose spawn
-    // now lands on the reactor-less callback pool under `rtems-exec-model`
-    // (§4.2 UDP search is deferred). Reactor-dependent — gated out feature-ON
-    // (stage 3).
+    // `orig_dest == None` by construction (see `enable_recv_orig_dest`), so
+    // the assertion is gated to the two that actually recover it. Binds a real
+    // `tokio::net` UDP socket and drives `recv_loop`, whose spawn now lands on
+    // the reactor-less callback pool under `exec_backend` (§4.2 UDP search is
+    // deferred). Reactor-dependent — gated out on the exec backend (stage 3).
     #[cfg(any(unix, windows))]
-    #[cfg(not(feature = "rtems-exec-model"))]
+    #[cfg(tokio_backend)]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn wildcard_listener_receives_with_orig_dest() {
         let mgr = UdpManager::new();
         let collector = mgr
-            .collect(&ep("0.0.0.0:0"))
+            .collect(&crate::test_reactor(), &ep("0.0.0.0:0"))
             .expect("bind wildcard collector");
         let port = collector.local_addr().unwrap().port();
         let mut rx = collector
@@ -1054,7 +1072,9 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn specific_listener_filters_by_orig_dest() {
         let mgr = UdpManager::new();
-        let collector = mgr.collect(&ep("0.0.0.0:0")).expect("bind collector");
+        let collector = mgr
+            .collect(&crate::test_reactor(), &ep("0.0.0.0:0"))
+            .expect("bind collector");
         let port = collector.local_addr().unwrap().port();
         // Listener wants datagrams destined to 10.255.255.255 — loopback
         // traffic must NOT reach it.

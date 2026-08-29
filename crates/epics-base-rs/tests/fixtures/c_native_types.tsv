@@ -14,7 +14,7 @@
 # (DBF_ULONG is served as DBF_DOUBLE, DBF_MENU as DBF_ENUM, and an
 # SPC_DBADDR field's type comes from the record's cvt_dbaddr, not the .dbd).
 #
-# `mbbo.VAL` is the sharpest `cvt_dbaddr` row. `mbboRecord.c:300-312` degenerates
+# `mbbo.VAL` is the sharpest `cvt_dbaddr` row. `mbboRecord.c:300-313` degenerates
 # VAL to DBF_USHORT — DBF_LONG on the wire, CA having no unsigned-16 type — when
 # `!prec->sdef`, i.e. when the record defines no states at all. The bulk sweep's
 # bare `record(mbbo,...)` defines none, so DBF_LONG is the row, measured the same

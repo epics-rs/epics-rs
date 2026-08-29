@@ -1,9 +1,8 @@
 //! ACF hot reload test — server keeps running, ACF file is rewritten,
 //! reload_acf() picks up the change without restart.
 
-// RTEMS-EXEC-MODEL-ALLOW(1): the flavored test runs a live CaServer over
-// tokio::net for the reload round-trip. These run and pass in the
-// feature-ON suite on the tokio driver.
+#![cfg(tokio_backend)]
+
 use epics_ca_rs::server::CaServer;
 use std::time::Duration;
 

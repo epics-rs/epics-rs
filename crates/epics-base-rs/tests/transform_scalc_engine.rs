@@ -18,9 +18,9 @@
 //! port evaluated CLCx with the numeric engine, so `CLCx = "1/0"` produced
 //! `inf` and NO_ALARM.
 //!
-//! **The VAL post.** `monitor()` (`:786-808`) is transform's only
+//! **The VAL post.** `monitor()` (`:786-809`) is transform's only
 //! `db_post_events` caller and it walks A..P — it posts no VAL, ever. VAL is an
-//! inert dummy (`:422`, *"Gotta have a .val field"*). The framework's deadband
+//! inert dummy (`:421`, *"Gotta have a .val field"*). The framework's deadband
 //! post fires on any class, and the alarm bits alone are a class, so a
 //! transform that went INVALID was firing a `.VAL` monitor C never sends.
 
@@ -53,7 +53,7 @@ async fn transform_db() -> PvDatabase {
 ///
 /// That -1 comes from inside the evaluator loop, BEFORE the epilogue, so C
 /// never assigns `*pval` — the channel keeps its previous value. (The other -1,
-/// the non-finite tail at `:2056`, writes the cell first; R16-4 and
+/// the non-finite tail at `:2055`, writes the cell first; R16-4 and
 /// `transform_non_finite_result_is_kept.rs` cover that half.)
 #[epics_macros_rs::epics_test]
 async fn r11_c14_divide_by_zero_is_a_calc_failure() {
@@ -136,7 +136,7 @@ async fn r11_c14_no_process_cycle_posts_val() {
         .expect("A moved 0 -> 7, so C's monitor() posts it");
     assert!(
         val_rx.try_recv().is_err(),
-        "transform monitor() posts A..P only — never VAL (transformRecord.c:786-808)"
+        "transform monitor() posts A..P only — never VAL (transformRecord.c:786-809)"
     );
 
     // The alarm cycle: the calc fails, the record goes INVALID. C still posts no
@@ -161,7 +161,7 @@ async fn r11_c14_no_process_cycle_posts_val() {
 }
 
 /// VAL is still a plain writable dummy: a client put stores it and posts it
-/// (C `dbPut`, dbAccess.c:1414). The closed set gates PROCESS posts, not puts.
+/// (C `dbPut`, dbAccess.c:1409). The closed set gates PROCESS posts, not puts.
 #[epics_macros_rs::epics_test]
 async fn r11_c14_a_put_to_the_val_dummy_still_posts() {
     let db = transform_db().await;

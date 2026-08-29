@@ -1,7 +1,7 @@
 //! Downstream CA server adapter for the gateway.
 //!
-//! Hosts a [`CaServer`] backed by a shadow [`PvDatabase`]. The shadow
-//! database is populated by the [`super::upstream::UpstreamManager`] as upstream
+//! Hosts a `CaServer` backed by a shadow [`PvDatabase`]. The shadow
+//! database is populated by the `super::upstream::UpstreamManager` as upstream
 //! subscriptions establish. Downstream clients see PVs as if they
 //! were normal in-process PVs — the gateway is transparent on the wire.
 //!
@@ -20,14 +20,17 @@
 //! subscribes to a known set of upstream PVs at startup. It is not
 //! required for lazy resolution to work.
 
-// RTEMS-EXEC-MODEL-ALLOW(9): checked - these run and pass in the feature-ON suite.
+// RTEMS-EXEC-MODEL-ALLOW(6): checked - these run and pass in the exec-backend
+// suite.
 
 use std::collections::VecDeque;
 use std::sync::Arc;
 
 use epics_base_rs::error::CaResult;
 use epics_base_rs::server::database::PvDatabase;
-use epics_ca_rs::server::{AccessRightsNotifier, CaServer, ServerConnectionEvent, ServerStats};
+#[cfg(tokio_backend)]
+use epics_ca_rs::server::{AccessRightsNotifier, CaServer};
+use epics_ca_rs::server::{ServerConnectionEvent, ServerStats};
 use tokio::sync::Mutex;
 use tokio::sync::broadcast;
 
@@ -267,9 +270,10 @@ impl ReplayingReceiver {
     }
 }
 
+#[cfg(tokio_backend)]
 /// Downstream CA server adapter.
 ///
-/// Wraps a [`CaServer`] that serves the gateway's shadow [`PvDatabase`].
+/// Wraps a `CaServer` that serves the gateway's shadow [`PvDatabase`].
 /// All actual CA protocol handling (search, connect, get, put, monitor)
 /// is delegated to `epics-ca-rs`.
 ///
@@ -301,6 +305,7 @@ struct ReplayState {
     forwarder: epics_base_rs::runtime::task::TaskHandle<()>,
 }
 
+#[cfg(tokio_backend)]
 impl DownstreamServer {
     /// Create a new downstream server bound to `port`, serving from
     /// the given shadow database.
@@ -377,7 +382,10 @@ impl DownstreamServer {
     /// by the same forwarder + log.
     ///
     /// Returns `None` once [`Self::run`] has consumed the inner server.
-    pub async fn connection_events(&self) -> Option<ReplayingReceiver> {
+    pub async fn connection_events(
+        &self,
+        reactor: &epics_base_rs::runtime::task::Reactor,
+    ) -> Option<ReplayingReceiver> {
         let mut replay_guard = self.replay_state.lock().await;
         if replay_guard.is_none() {
             // First call: install the forwarder. Take the raw
@@ -392,7 +400,7 @@ impl DownstreamServer {
             };
             let (tx, _) = broadcast::channel::<SeqConnEvent>(REPLAY_CHANNEL_CAPACITY);
             let replay = Arc::new(ConnEventReplay::new());
-            let forwarder = spawn_conn_event_forwarder(raw_rx, tx.clone(), replay.clone());
+            let forwarder = spawn_conn_event_forwarder(reactor, raw_rx, tx.clone(), replay.clone());
             *replay_guard = Some(ReplayState {
                 tx,
                 replay,
@@ -481,7 +489,7 @@ impl DownstreamServer {
             .map_err(|e| crate::error::BridgeError::PutRejected(format!("CaServer run: {e}")))
     }
 
-    /// Reinstall the inner [`CaServer`] after a previous [`Self::run`] returned.
+    /// Reinstall the inner `CaServer` after a previous [`Self::run`] returned.
     /// Used by the supervisor when a CA server task crashes — the outer
     /// supervise loop reconstructs a server (with the same shadow DB)
     /// and re-attaches it here so the next [`Self::run`] picks it up.
@@ -510,11 +518,12 @@ impl DownstreamServer {
 /// overflow. It is far less likely than a slow downstream consumer,
 /// which is fully covered.
 fn spawn_conn_event_forwarder(
+    reactor: &epics_base_rs::runtime::task::Reactor,
     mut raw_rx: broadcast::Receiver<ServerConnectionEvent>,
     tx: broadcast::Sender<SeqConnEvent>,
     replay: Arc<ConnEventReplay>,
 ) -> epics_base_rs::runtime::task::TaskHandle<()> {
-    epics_base_rs::runtime::task::spawn(async move {
+    reactor.spawn(async move {
         // Sequence numbers start at 1 so a consumer's initial
         // `last_seq = 0` means "I have seen nothing"; `events_since(0)`
         // then returns the whole log.
@@ -561,6 +570,7 @@ fn spawn_conn_event_forwarder(
 mod tests {
     use super::*;
 
+    #[cfg(tokio_backend)]
     #[tokio::test]
     async fn construct_downstream() {
         let db = Arc::new(PvDatabase::new());
@@ -571,11 +581,12 @@ mod tests {
         assert!(Arc::ptr_eq(downstream.database(), &db));
     }
 
+    #[cfg(tokio_backend)]
     #[tokio::test]
     async fn connection_events_subscribe() {
         let db = Arc::new(PvDatabase::new());
         let downstream = DownstreamServer::new(db, 0).await.expect("bind downstream");
-        let rx = downstream.connection_events().await;
+        let rx = downstream.connection_events(&crate::test_reactor()).await;
         assert!(rx.is_some(), "expected receiver");
         downstream.stop_connection_events().await;
     }
@@ -779,6 +790,7 @@ mod tests {
         assert!(matches!(recv.recv().await, ConnEventRecv::Closed));
     }
 
+    #[cfg(tokio_backend)]
     /// B11: `connection_events()` itself seeds a late receiver's
     /// `last_seq` from the forwarder's high-water mark. Verified by
     /// driving events through the real `DownstreamServer` forwarder
@@ -790,7 +802,7 @@ mod tests {
 
         // First subscriber installs the forwarder + replay state.
         let _first = downstream
-            .connection_events()
+            .connection_events(&crate::test_reactor())
             .await
             .expect("first receiver");
 
@@ -807,7 +819,10 @@ mod tests {
 
         // A receiver created now must start at the high-water mark (7),
         // not 0 — otherwise a later lag replays the 1..7 backlog.
-        let late = downstream.connection_events().await.expect("late receiver");
+        let late = downstream
+            .connection_events(&crate::test_reactor())
+            .await
+            .expect("late receiver");
         assert_eq!(
             late.last_seq, 7,
             "late subscriber must be seeded from the forwarder high-water mark"
@@ -835,7 +850,8 @@ mod tests {
         // lags and must recover from the replay log.
         let (tx, _keepalive) = broadcast::channel::<SeqConnEvent>(4);
         let replay = Arc::new(ConnEventReplay::new());
-        let forwarder = spawn_conn_event_forwarder(raw_rx, tx.clone(), replay.clone());
+        let forwarder =
+            spawn_conn_event_forwarder(&crate::test_reactor(), raw_rx, tx.clone(), replay.clone());
 
         let mut recv = ReplayingReceiver {
             rx: tx.subscribe(),

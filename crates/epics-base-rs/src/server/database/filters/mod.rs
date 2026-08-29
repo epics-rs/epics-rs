@@ -173,18 +173,27 @@ impl FilterChain {
     }
 
     /// Apply the chain to a single value wrapped in a synthetic
-    /// [`FilteredMonitorEvent`] with `EventMask::VALUE`, then return the
-    /// (possibly transformed) value. `None` means a filter dropped the
-    /// synthetic event. `read_context` selects the C field-log context:
-    /// `true` => `dbfl_context_read` (one-shot DB read — `dec`/`sync`
+    /// [`FilteredMonitorEvent`], then return the (possibly transformed)
+    /// value. `None` means a filter dropped the synthetic event.
+    /// `read_context` selects the C field-log context: `true` =>
+    /// `dbfl_context_read` (one-shot DB read — `dec`/`sync`
     /// short-circuit), `false` => `dbfl_context_event` (monitor
     /// single-event post — `dec`/`sync` state machines run). This is the
     /// single owner shared by [`apply_to_read_value`](Self::apply_to_read_value)
     /// and [`apply_to_event_value`](Self::apply_to_event_value).
+    ///
+    /// `mask` is the log's `pLog->mask`, which the two contexts fill
+    /// differently and which three filters branch on: `sync.c:98`,
+    /// `decimate.c:64` and `utag.c:53` pass an event carrying
+    /// `DBE_PROPERTY` straight through, and `dbnd.c:83-85` seeds `send`
+    /// from `mask & ~(DBE_VALUE|DBE_LOG)` and hands
+    /// `mask & (DBE_VALUE|DBE_LOG)` to `recGblCheckDeadband` as the bits
+    /// to add. Both were previously handed a hardcoded `DBE_VALUE`.
     fn apply_single_value(
         &self,
         value: crate::types::EpicsValue,
         read_context: bool,
+        mask: EventMask,
     ) -> Option<crate::types::EpicsValue> {
         if self.filters.is_empty() {
             return Some(value);
@@ -195,7 +204,7 @@ impl FilterChain {
         let event = MonitorEvent {
             snapshot: std::sync::Arc::new(snap),
             origin: 0,
-            mask: EventMask::VALUE,
+            mask,
         };
         let wrapped = if read_context {
             FilteredMonitorEvent::new_read(event)
@@ -221,18 +230,25 @@ impl FilterChain {
     /// read semantics. Operators are responsible for using filters
     /// that match their intent — the framework executes whatever
     /// chain is configured.
+    ///
+    /// `db_create_read_log` sets only `ctx` on the `freeListCalloc`'d log
+    /// (`dbEvent.c:760-770`, `:702`), so a read-context filter sees a mask
+    /// of ZERO — which is why `dbnd` drops every read it is given
+    /// (`send` starts at `0 & ~(DBE_VALUE|DBE_LOG)` and
+    /// `recGblCheckDeadband` adds no bits) and the caller falls back to
+    /// the unfiltered field.
     pub fn apply_to_read_value(
         &self,
         value: crate::types::EpicsValue,
     ) -> Option<crate::types::EpicsValue> {
-        self.apply_single_value(value, true)
+        self.apply_single_value(value, true, EventMask::NONE)
     }
 
     /// epics-base parity for a CA monitor single-event post
     /// (`db_post_single_event`, `rsrv/camessage.c:1117-1122`,
     /// `1851-1853`): the initial monitor event and access-rights
     /// transition events are queued via `db_create_event_log`
-    /// (`dbEvent.c:746-752`, `dbfl_context_event`) then run through
+    /// (`dbEvent.c:746-754`, `dbfl_context_event`) then run through
     /// `dbChannelRunPreChain`, and `db_queue_event_log` fires only when
     /// the filtered log is non-null (`dbEvent.c:922-924`).
     ///
@@ -242,11 +258,21 @@ impl FilterChain {
     /// natural update. `None` means the chain dropped the post — the
     /// caller MUST send no frame (matching `if(pLog)` in C), never fall
     /// back to the unfiltered value.
+    ///
+    /// `select` is the SUBSCRIBER's own `DBE_*` mask, not `DBE_VALUE`:
+    /// `db_create_event_log` seeds `pLog->mask = pevent->select`
+    /// (`dbEvent.c:750`) and `db_post_single_event` runs the pre-chain
+    /// over that log without narrowing it (`:914-927`) — unlike
+    /// `db_post_events`, which overwrites the mask with
+    /// `caEventMask & pevent->select` (`:900`). So a `camonitor -m p`
+    /// subscriber's initial post carries `DBE_PROPERTY` and passes the
+    /// `sync` / `dec` / `utag` gates that a `DBE_VALUE` post does not.
     pub fn apply_to_event_value(
         &self,
         value: crate::types::EpicsValue,
+        select: EventMask,
     ) -> Option<crate::types::EpicsValue> {
-        self.apply_single_value(value, false)
+        self.apply_single_value(value, false, select)
     }
 }
 
@@ -415,11 +441,15 @@ mod tests {
         // 2-window is dropped.
         let event_chain = parse_filter_chain(r#"{"dec":{"n":2}}"#);
         assert!(
-            event_chain.apply_to_event_value(value.clone()).is_some(),
+            event_chain
+                .apply_to_event_value(value.clone(), EventMask::VALUE)
+                .is_some(),
             "first single-event post is the head of the window"
         );
         assert!(
-            event_chain.apply_to_event_value(value).is_none(),
+            event_chain
+                .apply_to_event_value(value, EventMask::VALUE)
+                .is_none(),
             "event context decimates the second single-event post"
         );
     }
@@ -442,8 +472,53 @@ mod tests {
         );
         let event_chain = parse_filter_chain(r#"{"sync":{"while":"BFR7:GATE"}}"#);
         assert!(
-            event_chain.apply_to_event_value(value).is_none(),
+            event_chain
+                .apply_to_event_value(value, EventMask::VALUE)
+                .is_none(),
             "event context gates the initial post on a cleared state"
+        );
+    }
+
+    /// The subscriber's OWN select mask reaches the chain. C's
+    /// `db_post_single_event` seeds the synthetic log with
+    /// `pLog->mask = pevent->select` (`dbEvent.c:750`, `:914-927`)
+    /// and never narrows it the way `db_post_events` does (`:900`), so a
+    /// `camonitor -m p` subscriber's initial post carries `DBE_PROPERTY`
+    /// and takes the bypass in `sync.c:98` / `decimate.c:64` /
+    /// `utag.c:53`. The port hardcoded `DBE_VALUE` here, so every such
+    /// subscriber lost its initial frame on a gated channel.
+    #[test]
+    fn event_post_carries_the_subscribers_select_mask() {
+        use super::parse_filter_chain;
+        super::db_state_registry().get_or_create("BFR7:MASK");
+        let cfg = r#"{"sync":{"while":"BFR7:MASK"}}"#;
+        // The state is clear, so a VALUE-only subscriber is gated …
+        assert!(
+            parse_filter_chain(cfg)
+                .apply_to_event_value(EpicsValue::Double(1.0), EventMask::VALUE)
+                .is_none(),
+            "a DBE_VALUE post is gated by `while` on a cleared state"
+        );
+        // … while a subscriber that selected DBE_PROPERTY is not.
+        for select in [
+            EventMask::PROPERTY,
+            EventMask::VALUE | EventMask::PROPERTY,
+            EventMask::VALUE | EventMask::LOG | EventMask::ALARM | EventMask::PROPERTY,
+        ] {
+            assert!(
+                parse_filter_chain(cfg)
+                    .apply_to_event_value(EpicsValue::Double(1.0), select)
+                    .is_some(),
+                "a select carrying DBE_PROPERTY bypasses the sync gate"
+            );
+        }
+        // `dec` takes the same bypass, so a PROPERTY subscriber's initial
+        // post is not consumed by the decimator either.
+        let dec = r#"{"dec":{"n":3}}"#;
+        assert!(
+            parse_filter_chain(dec)
+                .apply_to_event_value(EpicsValue::Double(1.0), EventMask::PROPERTY)
+                .is_some()
         );
     }
 
@@ -457,7 +532,7 @@ mod tests {
         chain.push(Arc::new(DropAll));
         assert!(
             chain
-                .apply_to_event_value(EpicsValue::Double(42.0))
+                .apply_to_event_value(EpicsValue::Double(42.0), EventMask::VALUE)
                 .is_none(),
             "a dropped post yields None, not the unfiltered value"
         );
@@ -470,7 +545,7 @@ mod tests {
     fn apply_to_event_and_read_value_empty_chain_identity() {
         let chain = FilterChain::new();
         assert!(matches!(
-            chain.apply_to_event_value(EpicsValue::Double(3.0)),
+            chain.apply_to_event_value(EpicsValue::Double(3.0), EventMask::VALUE),
             Some(EpicsValue::Double(v)) if v == 3.0
         ));
         assert!(matches!(
@@ -487,7 +562,10 @@ mod tests {
         use super::parse_filter_chain;
         let chain = parse_filter_chain(r#"{"arr":{"s":1,"e":2}}"#);
         let out = chain
-            .apply_to_event_value(EpicsValue::DoubleArray(vec![10.0, 20.0, 30.0, 40.0]))
+            .apply_to_event_value(
+                EpicsValue::DoubleArray(vec![10.0, 20.0, 30.0, 40.0]),
+                EventMask::VALUE,
+            )
             .expect("arr passes the event through");
         assert!(
             matches!(out, EpicsValue::DoubleArray(v) if v == vec![20.0, 30.0]),

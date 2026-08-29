@@ -29,12 +29,28 @@
 //! Requires the built pvxs tree (`PVXS_BIN`, or the default path). If it is
 //! absent the tests fail loudly rather than skipping — a silently skipped
 //! oracle is exactly the false-clean this project exists to escape.
+//!
+//! # Five of these have no subject on the reactor-free backend
+//!
+//! The Rust side is `oracle-ioc --pva`, and it refuses to start under
+//! `exec_backend` — the reactor-free backend, selected on a host build by
+//! `EPICS_RS_BUILD_EXEC_BACKEND=thread` and unconditionally on RTEMS and
+//! VxWorks. The five that reach `PvaPair::boot`, through `boot` or through
+//! `sweep`'s real phase, cannot pass there under any treatment and are gated
+//! rather than selected and failed. The four that stay assert per-case
+//! accounting that holds over an all-ERROR report. `[[test]]
+//! required-features` cannot name a build-script cfg, which is why the gates
+//! are on the items.
 
+#[cfg(tokio_backend)]
+use std::collections::BTreeMap;
 use std::collections::BTreeSet;
 
 use epics_oracle_rs::dbd::Dbd;
 use epics_oracle_rs::diff::Verdict;
-use epics_oracle_rs::ioc::{CTools, Ioc, PvaPair, PvxTools, Side, alloc_free_port};
+use epics_oracle_rs::ioc::{CTools, PvxTools, Side, alloc_free_port};
+#[cfg(tokio_backend)]
+use epics_oracle_rs::ioc::{Ioc, PvaPair};
 use epics_oracle_rs::pvaread::{self, PvaReport};
 use epics_oracle_rs::pvatool::PvaTools;
 use epics_oracle_rs::runner::workdir;
@@ -89,6 +105,7 @@ fn sweep(record_type: &str) -> (Surface, PvaReport) {
 }
 
 /// Boot the pair on a one-record `.db` and hand back the pair plus its tools.
+#[cfg(tokio_backend)]
 fn boot(record_type: &str, rec: &str) -> (PvxTools, PvaPair) {
     let t = tools();
     let dir = workdir(None).expect("workdir");
@@ -104,6 +121,7 @@ fn boot(record_type: &str, rec: &str) -> (PvxTools, PvaPair) {
 /// one shared port would mean a `pvxget` aimed at one could be answered by the
 /// other — and PVA gives no warning when that happens (the search socket sets
 /// SO_REUSEPORT, so the collision binds silently).
+#[cfg(tokio_backend)]
 #[test]
 fn the_pva_pair_boots_on_distinct_ports() {
     let (_t, pair) = boot("ai", "ORACLE:AI");
@@ -142,7 +160,7 @@ fn concurrent_client_tools_do_not_break_each_other() {
     let tool = PvaTools::new(&t, dead, Side::C);
 
     let results: Vec<_> = std::thread::scope(|s| {
-        let handles: Vec<_> = (0..8).map(|_| s.spawn(|| tool.server_count())).collect();
+        let handles: Vec<_> = (0..8).map(|_| s.spawn(|| tool.servers())).collect();
         handles
             .into_iter()
             .map(|h| h.join().expect("client thread must not panic"))
@@ -165,16 +183,19 @@ fn concurrent_client_tools_do_not_break_each_other() {
 /// `PvaPair::boot` already refuses to return otherwise; this pins the proof
 /// itself, because it is the one guard with no CA analogue and it is invisible
 /// when it silently stops working.
+#[cfg(tokio_backend)]
 #[test]
 fn each_side_is_the_sole_server_on_its_port() {
     let (t, pair) = boot(RT, "ORACLE:BI");
     for (port, side) in [(pair.c.port(), Side::C), (pair.rust.port(), Side::Rust)] {
-        let n = PvaTools::new(&t, port, side)
-            .server_count()
+        let seen = PvaTools::new(&t, port, side)
+            .servers()
             .unwrap_or_else(|e| panic!("counting servers on the {side} side's port {port}: {e}"));
         assert_eq!(
-            n, 1,
-            "exactly one PVA server must answer on the {side} side's port {port}",
+            seen.len(),
+            1,
+            "exactly one PVA server must answer on the {side} side's port {port}, \
+             pvxlist named: {seen:?}",
         );
     }
 }
@@ -255,12 +276,43 @@ fn coverage_counts_only_fully_measured_channels() {
     }
 }
 
+/// The distinct reasons the errored cases give, most-repeated first.
+///
+/// A count of ERRORs says how much was not measured and never why, and the two
+/// causes it conflates need opposite responses. A pair that would not boot
+/// stamps ONE `boot` error onto every channel of the type
+/// (`pvaread::errored_cases`), so ran=56 errored=56 is a single infrastructure
+/// failure; a port that answered wrongly arrives as per-channel
+/// `pvxget`/`pvxinfo` errors. Both print the identical counts. Only this text
+/// separates "the harness could not look" from "the port is broken", and
+/// without it the reader of a failed run has a budget and no cause.
+#[cfg(tokio_backend)]
+fn why_unmeasured(report: &PvaReport) -> String {
+    let mut n: BTreeMap<String, usize> = BTreeMap::new();
+    for case in &report.cases {
+        for e in &case.errors {
+            *n.entry(format!("{} {}: {}", e.side, e.tool, e.message))
+                .or_default() += 1;
+        }
+    }
+    if n.is_empty() {
+        return "  (no channel recorded an error)".to_string();
+    }
+    let mut rows: Vec<(usize, String)> = n.into_iter().map(|(text, c)| (c, text)).collect();
+    rows.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
+    rows.iter()
+        .map(|(c, text)| format!("  {c}x {text}"))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 /// Both contracts are really driven, by their own tool, against the real pair.
 ///
 /// The type contract exists so a type gap cannot hide inside a value diff. If
 /// `pvxinfo` silently stopped being run, every test above would still pass
 /// while the separation quietly became fiction — so the readings are checked to
 /// be what those tools actually print.
+#[cfg(tokio_backend)]
 #[test]
 fn each_measured_channel_carries_a_real_type_and_a_real_value_reading() {
     let (_surface, report) = sweep(RT);
@@ -271,7 +323,9 @@ fn each_measured_channel_carries_a_real_type_and_a_real_value_reading() {
         .collect();
     assert!(
         !measured.is_empty(),
-        "nothing was measured at all — the pair or the tools are broken"
+        "nothing was measured at all — the pair or the tools are broken\nwhy \
+         nothing was measured:\n{}",
+        why_unmeasured(&report),
     );
     for c in &measured {
         let ty = c.c_side.declared_type.as_deref().unwrap_or("");
@@ -336,6 +390,7 @@ fn the_dbd_derived_shape_matches_the_ground_truth_on_every_measured_channel() {
 /// AGREED would pass every other test in this file while being useless. It is a
 /// lower bound on purpose — the port's PVA divergences are being fixed
 /// concurrently, so any exact count would be wrong by the time it was read.
+#[cfg(tokio_backend)]
 #[test]
 fn at_least_one_channel_agrees() {
     let (_surface, report) = sweep(RT);
@@ -343,11 +398,12 @@ fn at_least_one_channel_agrees() {
         report.counts.agreed > 0,
         "no channel of `{RT}` agreed on both contracts, so this harness cannot \
          distinguish a real defect from a broken instrument. counts: ran={} \
-         agreed={} defect={} errored={}",
+         agreed={} defect={} errored={}\nwhy nothing was measured:\n{}",
         report.counts.ran,
         report.counts.agreed,
         report.counts.defect,
         report.counts.errored,
+        why_unmeasured(&report),
     );
 }
 
@@ -358,6 +414,7 @@ fn at_least_one_channel_agrees() {
 /// PV, so a harness that compared *outcomes* rather than *readings* would find
 /// them equal and score AGREED. That is "exit 0 because I could not look", which
 /// is exactly what produced the false-clean verdicts this crate replaced.
+#[cfg(tokio_backend)]
 #[test]
 fn an_unreachable_pv_scores_error_never_agreement() {
     let (t, pair) = boot("ai", "ORACLE:AI");

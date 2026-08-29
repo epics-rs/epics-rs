@@ -14,15 +14,42 @@
 #
 # Conventions
 # ───────────
-# - `pva_listener` — any test that opens a `PvaServer::isolated()` or
-#   binds an ephemeral PVA port. Capped at 4 parallel processes.
-# - `ca_softioc`   — any test that spawns the C `softIoc` binary or
-#   the Rust IOC under test. Capped at 1 because softIoc owns the
-#   `EPICS_CA_SERVER_PORT` env-var scope and racing instances inherit
-#   each other's vars.
-# - `ndarray_io`   — file_magick tests in `ad-plugins-rs` that read /
+# - `pva_listener`    — any test that opens a `PvaServer::isolated()` or
+#   binds an ephemeral PVA port. Capped at 1 parallel process.
+# - `ca_softioc`      — spawns an IOC and is serialised.
+# - `ioc_unthrottled` — spawns an IOC and has been measured not to need
+#   serialising. Uncapped, but *declared*: see below.
+# - `ndarray_io`      — file_magick tests in `ad-plugins-rs` that read /
 #   write tempfile-backed image fixtures. Capped at 1 because
 #   `tempfile` collisions surface as PNG decode errors.
+#
+# The two IOC groups are complete by construction
+# ───────────────────────────────────────────────
+# `ca_softioc` used to be four binary names that somebody remembered to
+# add. `epics-oracle-rs` spawns three kinds of IOC across eighty-odd
+# tests and was never in it; neither were `interop_pvxs` or the six
+# binaries that spawn `softioc-rs`,
+# `realtime-ca-ioc`, `realtime-pva-ioc` and `qsrv-ioc`. Nothing went red
+# when they joined — they just occasionally timed out under load, which
+# reads as flakiness rather than as a missing declaration.
+#
+# `tools/ioc-spawn-gate` now derives the membership from the sources: it
+# scans every workspace crate for a file that both names an IOC
+# executable and spawns a process, maps it to the nextest binary that
+# owns it, and FAILS if that binary is in neither IOC group under
+# `default`, `ci` or `interop`. So a new IOC-spawning test binary is a
+# red test on the commit that adds it. `cargo run -p ioc-spawn-gate
+# --bin ioc-spawn-census` prints what the sources say.
+#
+# Two groups rather than one because "spawns an IOC" is derivable from
+# the source and "needs serialising" is not. Forcing every spawner to
+# `max-threads = 1` was measured, not assumed, and it is worse: capping
+# `package(epics-oracle-rs)` at 4 took its concurrent-run failure rate
+# from 4-of-21 to 6-of-18 and its solo wall time from 12.9 s to 26.5 s.
+# fix-db measured the same for `interop_pvxs`: 3 of 20 failures with a
+# single test alone in the run on an idle 96-CPU host, so its failures
+# are not a concurrency effect either. The gate therefore insists that
+# somebody decided, in this file, not that the cap is applied.
 #
 # Apply via `[[profile.default.overrides]]` blocks below.
 #
@@ -51,17 +78,19 @@ default-filter = """
     binary(interop_rust_client_c_ioc) |
     binary(differential_libca) |
     binary(stress_load) |
-    binary(parity_interop) |
     binary(wire_golden_pvxs) |
     binary(wire_golden_ext) |
     binary(interop_pvxs)
   )
 """
 
-# Opt-in profile for the gated interop / wire-golden suites. Inherits
-# the per-binary parallelism caps below (test-groups apply across
-# profiles), but flips the default-filter so only the gated suites
-# run. Use `cargo nextest run --profile interop`.
+# Opt-in profile for the gated interop / wire-golden suites. Flips the
+# default-filter so only the gated suites run; the per-binary
+# parallelism caps below still apply, because nextest reads a profile's
+# own overrides first and then the default profile's — `cargo nextest
+# show-config test-groups --profile interop` attributes a gated binary
+# to an "override for default profile", which is that rule in action.
+# Use `cargo nextest run --profile interop`.
 [profile.interop]
 fail-fast = false
 slow-timeout = { period = "60s", terminate-after = 4 }
@@ -69,7 +98,6 @@ default-filter = """
   binary(interop_c_client_rust_ioc) |
   binary(interop_rust_client_c_ioc) |
   binary(differential_libca) |
-  binary(parity_interop) |
   binary(wire_golden_pvxs) |
   binary(wire_golden_ext) |
   binary(interop_pvxs)
@@ -83,12 +111,24 @@ default-filter = """
 # without the tree — `epics_base_rs::reference` panics rather than skipping,
 # because a skip reports as a pass — and no cross-platform runner provisions
 # one. Excluded here, not silenced: they still run locally and on any runner
-# where the tree exists. Moving them to profile.interop would not work either;
-# interop.yml provisions epics-base and pvxs but never epics-modules, so
-# `stdsupport_device_parity` could not run there.
+# where the tree exists.
+#
+# `package(epics-oracle-rs)` is in that list for the same reason and belongs
+# here rather than on the command line. The whole crate is a differential
+# harness against a built C EPICS and pvxs: `CTools::discover`,
+# `PvxTools::discover` and `CTools::dbd_path` are its only doors to the
+# reference tree, and each of them errors rather than skipping. Naming it as
+# `--exclude epics-oracle-rs` per workflow row made the rule a flag three rows
+# remembered and a fourth did not, which is how a workspace run on the exec
+# backend came back with ten of these panics. The rows keep the flag — it also
+# skips *building* the crate, which the filter does not — but the guarantee is
+# here, so a new workspace-wide row cannot lose it.
 #
 # Keep the two lists in step: an addition to profile.default's list belongs
-# here too, or CI silently runs a suite the default loop does not.
+# here too, or CI silently runs a suite the default loop does not. (The
+# test-group overrides used to be duplicated here for the same reason and no
+# longer are — a profile inherits the default profile's overrides, so the copy
+# was a second list to keep in step for no gain.)
 #
 # INVARIANT: every `cargo nextest run` in `.github/workflows/` passes
 # `--profile ci` (or `--profile interop`, whose filter is an allow-list of
@@ -110,54 +150,105 @@ default-filter = """
     binary(interop_rust_client_c_ioc) |
     binary(differential_libca) |
     binary(stress_load) |
-    binary(parity_interop) |
     binary(wire_golden_pvxs) |
     binary(wire_golden_ext) |
     binary(interop_pvxs) |
     binary(reference_trees) |
-    binary(dbd_initial_parity) |
-    binary(base_device_parity) |
-    binary(stdsupport_device_parity)
+    package(epics-oracle-rs)
   )
 """
 
 # Test groups — cap per-group parallelism to match the resource the
 # group contends on (network ports, env vars, tempfiles).
-[[profile.default.overrides]]
-filter = 'binary(stability) | binary(tls) | binary(typed_nt) | binary(service_framework) | binary(pva_gateway) | binary(parity_interop) | binary(set_byte_order_renegotiate) | binary(heartbeat_echo)'
-test-group = 'pva_listener'
+#
+# Order matters: nextest resolves per-test overrides first-match-wins, so
+# a binary named by two blocks belongs to whichever comes first.
+# tools/ioc-spawn-gate accepts a `pva_listener` claim as a declaration;
+# what it refuses is a spawner in no group at all.
 
-[[profile.default.overrides]]
-filter = 'binary(interop_rust_client_c_ioc) | binary(interop_c_client_rust_ioc) | binary(stress_load) | binary(differential_libca)'
-test-group = 'ca_softioc'
-
+# Unrelated to the IOC groups below: `ad-plugins-rs` appears in no other
+# filter, so first-match-wins puts nothing else at stake in its position.
+# It used to be pinned last because tools/ioc-spawn-gate could not read a
+# `test()` term and treated the block as possibly claiming any binary; the
+# gate now reads it as narrowing, which no whole-binary declaration is.
 [[profile.default.overrides]]
 filter = 'package(ad-plugins-rs) and test(file_magick::)'
 test-group = 'ndarray_io'
 
-# Same overrides apply under the `ci` profile.
-[[profile.ci.overrides]]
-filter = 'binary(stability) | binary(tls) | binary(typed_nt) | binary(service_framework) | binary(pva_gateway) | binary(parity_interop) | binary(set_byte_order_renegotiate) | binary(heartbeat_echo)'
+[[profile.default.overrides]]
+filter = 'binary(stability) | binary(tls) | binary(typed_nt) | binary(service_framework) | binary(pva_gateway) | binary(set_byte_order_renegotiate) | binary(heartbeat_echo)'
 test-group = 'pva_listener'
 
-[[profile.ci.overrides]]
+# Serialised IOC spawners. These four are the group's original membership
+# and stay capped: removing a cap is a measurement nobody has made, and
+# `interop_rust_client_c_ioc` additionally calls `std::env::set_var` on
+# `EPICS_CA_SERVER_PORT` (tests/interop_rust_client_c_ioc.rs:46-48).
+# Note the group's old stated reason — "softIoc spawns share
+# EPICS_CA_SERVER_PORT globally" — does not hold: every spawn site passes
+# the port per child with `cmd.env(...)` on an ephemeral number, and
+# nextest gives each test its own process, so the `set_var` above is
+# confined to one test too. The cap is retained on the evidence of the
+# runs behind it, not on that reason.
+[[profile.default.overrides]]
 filter = 'binary(interop_rust_client_c_ioc) | binary(interop_c_client_rust_ioc) | binary(stress_load) | binary(differential_libca)'
 test-group = 'ca_softioc'
 
-[[profile.ci.overrides]]
-filter = 'package(ad-plugins-rs) and test(file_magick::)'
-test-group = 'ndarray_io'
+# IOC spawners that have been measured NOT to need serialising. Declared
+# rather than capped, so tools/ioc-spawn-gate can tell "decided" from
+# "nobody noticed". `package()` where the whole package is IOC machinery,
+# so a new binary there is covered by construction; exact `binary()`
+# names elsewhere, so a new IOC-spawning binary in those crates goes red
+# instead of being silently absorbed.
+#
+#   package(epics-oracle-rs)           — the C/Rust/pvxs differential
+#                                        harness; capping it measured
+#                                        worse (see the header).
+#   package(qsrv-ioc)                  — the example IOC's own tests.
+#   binary(realtime_ca_ioc_boots)      — one boot each, ephemeral ports
+#   binary(realtime_pva_ioc_boots)       taken by binding (`--port 0` /
+#   binary(cli_tcp_port_fallback)        `free_*_port`), nothing shared.
+#   binary(cli_monitor_disconnect_stderr)
+#   binary(cli_monitor_separator)
+#   binary(cli_env_double_diagnostics)
+#   binary(softioc_default_is_interactive)
+#   binary(softioc_verbose_brackets_the_script_and_iocinit)
+#                                      — the two arms that load a
+#                                        database take `--port 0`;
+#                                        the third never calls
+#                                        `iocInit`, so it opens no
+#                                        socket at all. Every child
+#                                        ends at stdin EOF.
+#                                      — 0 failures in 20 runs at host load
+#                                        58-62; every child takes an
+#                                        ephemeral port with `--port 0` and
+#                                        the serving arm waits on the
+#                                        server's own announcement rather
+#                                        than on a clock.
+#   binary(interop_pvxs)               — fix-db measured 3 failures in 20
+#                                        runs with ONE test alone in the
+#                                        run on an idle host: not a
+#                                        concurrency effect, so a cap
+#                                        would cost wall time and buy
+#                                        nothing.
+[[profile.default.overrides]]
+filter = 'package(epics-oracle-rs) | package(qsrv-ioc) | binary(realtime_ca_ioc_boots) | binary(realtime_pva_ioc_boots) | binary(cli_tcp_port_fallback) | binary(cli_monitor_disconnect_stderr) | binary(cli_monitor_separator) | binary(cli_env_double_diagnostics) | binary(softioc_default_is_interactive) | binary(softioc_verbose_brackets_the_script_and_iocinit) | binary(interop_pvxs)'
+test-group = 'ioc_unthrottled'
 
 [test-groups]
 # PVA listener-binding tests serialise process-wide. With max-threads
-# higher than 1 we observed flakes in `parity_interop`, `stability`
-# (auto-reconnect, channel-coalescing, pipeline) when several PVA
+# higher than 1 we observed flakes in `stability` (auto-reconnect,
+# channel-coalescing, pipeline) when several PVA
 # servers raced against each other's UDP responder + beacon emitter.
 # Locking to 1 still gives ~3× nextest speedup over `cargo test`
 # because dispatch + per-test setup is faster than the thread-pool
 # variant inside a single binary.
 pva_listener = { max-threads = 1 }
-# softIoc spawns share `EPICS_CA_SERVER_PORT` globally. 1 only.
+# IOC spawners that are serialised. See the override block above for why
+# these four and not the other ten.
 ca_softioc = { max-threads = 1 }
+# IOC spawners that are not. `num-cpus` is the scheduler's own ceiling,
+# so membership here changes no scheduling — it records a decision and
+# gives tools/ioc-spawn-gate something to check against.
+ioc_unthrottled = { max-threads = "num-cpus" }
 # tempfile / PNG fixture collisions surface as decode errors.
 ndarray_io = { max-threads = 1 }

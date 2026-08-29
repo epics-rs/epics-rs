@@ -11,13 +11,19 @@
 //! Tests use 100K elements of f64 (~800KB) — large enough to
 //! cross both the 16K libevent default and any TCP buffer
 //! boundary, small enough to stay quick.
+// The tests that drive a live server are `tokio_backend`-only, so on
+// `exec_backend` the fixtures and imports they share go unreferenced while the
+// rest of this file still runs. The default build lints it in full.
+#![cfg_attr(exec_backend, allow(dead_code, unused_imports))]
 
-// RTEMS-EXEC-MODEL-ALLOW(2): not run by the default nextest profile - this file is a module of the `interop_pvxs` binary, which `.config/nextest.toml`'s default-filter excludes.
+// RTEMS-EXEC-MODEL-ALLOW(1): not run by the default nextest profile - this file is a module of the `interop_pvxs` binary, which `.config/nextest.toml`'s default-filter excludes.
 
 use super::interop_helpers::{PVXGET, pvxs_command, pvxs_lib_dir, require_pvxs};
 
 use epics_pva_rs::pvdata::{FieldDesc, PvField, PvStructure, ScalarType, ScalarValue};
-use epics_pva_rs::server_native::{PvaServer, SharedPV, SharedSource};
+#[cfg(tokio_backend)]
+use epics_pva_rs::server_native::PvaServer;
+use epics_pva_rs::server_native::{SharedPV, SharedSource};
 
 use std::process::Stdio;
 use std::sync::Arc;
@@ -50,6 +56,7 @@ fn build_large_array_pv() -> SharedPV {
     pv
 }
 
+#[cfg(tokio_backend)]
 /// Direction A: Rust server hosts 100K doubles. pvxget reads
 /// the entire array. pvxget by default truncates printing to 20
 /// elements; we pass `-# 0` to print all, then count distinct
@@ -130,36 +137,35 @@ async fn interop_large_array_a_pvxget_reads_huge_rust_array() {
 /// in `client_native/server_conn.rs`).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn interop_large_array_b_rust_client_reads_huge_pvxs_array() {
-    let Some(helper) = super::interop_helpers::cpp_helper("reverse_server") else {
+    // The only absent-prerequisite skip on this path; everything past it
+    // is our own helper, so it panics rather than skipping.
+    if super::interop_helpers::require_cxx().is_none() {
         return;
-    };
+    }
+    let helper = super::interop_helpers::cpp_helper("reverse_server");
 
     let port = {
         let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         l.local_addr().unwrap().port()
     };
-    let ready = std::env::temp_dir().join(format!("large_arr_ready.{port}"));
-    let _ = std::fs::remove_file(&ready);
+    let ready = super::interop_helpers::ReadyFile::new("large_arr_ready");
 
     let mut child = match std::process::Command::new(&helper)
         .arg("--port")
         .arg(port.to_string())
         .arg("--ready")
-        .arg(&ready)
+        .arg(ready.path())
         .env(env_key(), pvxs_lib_dir())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
     {
         Ok(c) => c,
-        Err(e) => {
-            eprintln!("SKIP: failed to spawn reverse_server: {e}");
-            return;
-        }
+        Err(e) => panic!("failed to spawn reverse_server: {e}"),
     };
     let mut up = false;
     for _ in 0..50 {
-        if ready.exists() {
+        if ready.is_up() {
             up = true;
             break;
         }
@@ -168,10 +174,8 @@ async fn interop_large_array_b_rust_client_reads_huge_pvxs_array() {
     if !up {
         let _ = child.kill();
         let _ = child.wait();
-        eprintln!("SKIP: reverse_server not ready");
-        return;
+        panic!("reverse_server not ready");
     }
-    let _ = std::fs::remove_file(&ready);
 
     let addr: std::net::SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
     let client = epics_pva_rs::client_native::PvaClient::builder()

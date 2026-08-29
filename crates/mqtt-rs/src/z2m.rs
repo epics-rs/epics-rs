@@ -81,12 +81,29 @@ fn load_records(
 /// `to_drv_info()` form so it matches the param name the driver registers
 /// (`MqttDriver::new` creates each param under `addr.to_drv_info()`).
 fn add_json(port: &str, type_tag: &str, topic: &str, field: &str) -> String {
-    add_topic_opts(port, &format!("JSON:{type_tag} \"{topic}\" {field}"), false)
+    add_topic_opts(port, &json_drv_info(type_tag, topic, field), false)
+}
+
+/// Build a JSON drvInfo, quoting the topic only when the reference grammar
+/// cannot express it.
+///
+/// MQ18: quoting unconditionally made every space-free Z2M topic go through the
+/// quoted-topic extension. Now that the extension is a strict fallback, quotes
+/// around a space-free topic would be read as part of the topic name — exactly
+/// as C reads them — so they are only emitted when the topic contains
+/// whitespace, which is the one case C's `arguments.find(' ')` split cannot
+/// represent. This is the same rule [`TopicAddress::to_drv_info`] applies.
+fn json_drv_info(type_tag: &str, topic: &str, field: &str) -> String {
+    if topic.contains(char::is_whitespace) {
+        format!("JSON:{type_tag} \"{topic}\" {field}")
+    } else {
+        format!("JSON:{type_tag} {topic} {field}")
+    }
 }
 
 /// Like [`add_json`], with ON/OFF normalization enabled (for `/set` controls).
 fn add_json_normalized(port: &str, type_tag: &str, topic: &str, field: &str) -> String {
-    add_topic_opts(port, &format!("JSON:{type_tag} \"{topic}\" {field}"), true)
+    add_topic_opts(port, &json_drv_info(type_tag, topic, field), true)
 }
 
 /// Parse `drv_info`, register the pending topic, and return the canonical
@@ -132,22 +149,18 @@ fn z2m_arg_defs() -> Vec<ArgDesc> {
         ArgDesc {
             name: "portName",
             arg_type: ArgType::String,
-            optional: false,
         },
         ArgDesc {
             name: "prefix",
             arg_type: ArgType::String,
-            optional: false,
         },
         ArgDesc {
             name: "devName",
             arg_type: ArgType::String,
-            optional: false,
         },
         ArgDesc {
             name: "mqttTopic",
             arg_type: ArgType::String,
-            optional: false,
         },
     ]
 }
@@ -481,6 +494,33 @@ pub fn register_z2m_commands(
 
 #[cfg(test)]
 mod tests {
+    /// MQ18: quoting was unconditional, so every Z2M JSON topic went through
+    /// the quoted-topic extension. The extension is now a strict fallback, so
+    /// quotes around a space-free topic would land *inside* the topic name —
+    /// which is precisely what C does with them (drvMqtt.cpp:86). Quote only
+    /// the topics the reference grammar cannot express.
+    #[test]
+    fn json_drv_info_quotes_only_a_topic_with_whitespace() {
+        use super::json_drv_info;
+        use crate::address::TopicAddress;
+
+        assert_eq!(
+            json_drv_info("INT", "zigbee2mqtt/plug", "state"),
+            "JSON:INT zigbee2mqtt/plug state"
+        );
+        assert_eq!(
+            json_drv_info("INT", "zigbee2mqtt/living room plug", "state"),
+            "JSON:INT \"zigbee2mqtt/living room plug\" state"
+        );
+
+        // Either way the drvInfo names the topic it was built from.
+        for topic in ["zigbee2mqtt/plug", "zigbee2mqtt/living room plug"] {
+            let addr = TopicAddress::parse(&json_drv_info("INT", topic, "state")).unwrap();
+            assert_eq!(addr.topic, topic);
+            assert_eq!(addr.json_field.as_deref(), Some("state"));
+        }
+    }
+
     use std::collections::HashMap;
 
     use epics_base_rs::server::db_loader;
@@ -515,11 +555,12 @@ mod tests {
 
         assert_eq!(defs.len(), 1);
         assert_eq!(defs[0].name, "TEST:MQTT:SWR:Plug:Power");
-        let (_, inp) = defs[0]
+        let inp = &defs[0]
             .fields
             .iter()
-            .find(|(k, _)| k == "INP")
-            .expect("INP field");
+            .find(|f| f.name == "INP")
+            .expect("INP field")
+            .value;
         // The loader must hand the driver back the exact param name the
         // driver registered under `addr.to_drv_info()`.
         assert_eq!(inp.to_string(), format!("@asyn(MQTT1) {drv_info}"));

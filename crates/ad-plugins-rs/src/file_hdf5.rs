@@ -6,11 +6,12 @@ use ad_core_rs::error::{ADError, ADResult};
 use ad_core_rs::finalize::Finalize;
 use ad_core_rs::ndarray::{NDArray, NDDataBuffer, NDDataType, NDDimension};
 use ad_core_rs::ndarray_pool::NDArrayPool;
-use ad_core_rs::plugin::file_base::{NDFileMode, NDFileWriter};
+use ad_core_rs::plugin::file_base::{FileAttributes, NDFileMode, NDFileWriter};
 use ad_core_rs::plugin::file_controller::FilePluginController;
 use ad_core_rs::plugin::runtime::{
     NDPluginProcess, ParamChangeResult, ParamUpdate, PluginParamSnapshot, ProcessResult,
 };
+use parking_lot::Mutex;
 
 use rust_hdf5::H5File;
 use rust_hdf5::format::messages::datatype::{ByteOrder, DatatypeMessage};
@@ -133,6 +134,13 @@ struct AttributeDataset {
     source: String,
     source_type: String,
     data_type: NDAttrDataType,
+    /// C `NDFileHDF5AttributeDataset::isUndefined_`
+    /// (`typeAsHdf`'s `default:` arm, NDFileHDF5AttributeDataset.cpp:366-370).
+    /// Fixed for the dataset's whole life: an attribute carrying no value when
+    /// the file opens gets a float32 dataset whose `epicsNAN` fill no frame
+    /// ever overwrites, because every element write is gated on
+    /// `!isUndefined_` (`:160`).
+    undefined: bool,
     /// Raw little-endian bytes accumulated, one element per frame.
     buffer: Vec<u8>,
     frames: usize,
@@ -153,12 +161,27 @@ fn nd_attr_source_type_string(source: &NDAttrSource) -> &'static str {
 
 impl AttributeDataset {
     fn new(attr: &NDAttribute) -> Self {
+        // C decides the HDF5 datatype and the fill value ONCE, from the
+        // attribute's type at file-open: `createDataset` calls `typeAsHdf`
+        // (NDFileHDF5AttributeDataset.cpp:73-97) and the type came from
+        // `ndAttr->getDataType()` when the node was constructed
+        // (NDFileHDF5.cpp:2797, :2830). Nothing re-runs it, so a concrete
+        // value arriving in a later frame cannot change either. An attribute
+        // with no value takes the `default:` arm — `H5T_NATIVE_FLOAT` with an
+        // `epicsNAN` fill (`:366-370`) — not the type of whichever value
+        // happens to arrive first.
+        let undefined = matches!(attr.value, NDAttrValue::Undefined);
         Self {
             name: attr.name.clone(),
             description: attr.description.clone(),
             source: attr.source.source_string().to_string(),
             source_type: nd_attr_source_type_string(&attr.source).to_string(),
-            data_type: attr.value.data_type(),
+            data_type: if undefined {
+                NDAttrDataType::Float32
+            } else {
+                attr.value.data_type()
+            },
+            undefined,
             buffer: Vec::new(),
             frames: 0,
         }
@@ -180,6 +203,18 @@ impl AttributeDataset {
     fn push(&mut self, value: &NDAttrValue) {
         let es = self.element_size();
         let mut bytes = vec![0u8; es];
+        if self.undefined {
+            // C never writes an element into an undefined dataset, so the
+            // `epicsNAN` fill installed by `H5Pset_fill_value`
+            // (NDFileHDF5AttributeDataset.cpp:106) stands for every frame.
+            // The port materialises the dataset whole at flush rather than
+            // element-by-element, so it emits the fill explicitly; on disk and
+            // to a reader the two are the same bytes.
+            bytes.copy_from_slice(&f32::NAN.to_le_bytes());
+            self.buffer.extend_from_slice(&bytes);
+            self.frames += 1;
+            return;
+        }
         match self.data_type {
             NDAttrDataType::Int8 => bytes[0] = value.as_i64().unwrap_or(0) as i8 as u8,
             NDAttrDataType::UInt8 => bytes[0] = value.as_i64().unwrap_or(0) as u8,
@@ -371,6 +406,9 @@ pub struct Hdf5Writer {
     perf_first: Option<std::time::Instant>,
     /// Open NDAttribute time-series datasets, keyed by attribute name.
     attr_datasets: Vec<AttributeDataset>,
+    /// C `pFileAttributes` (NDFileHDF5.cpp:243, :1437): the writer's own
+    /// attribute list, sticky for the life of the file.
+    file_attributes: FileAttributes,
     /// Layout XML state.
     layout_filename: Option<PathBuf>,
     layout: Option<Hdf5Layout>,
@@ -439,6 +477,7 @@ impl Hdf5Writer {
             perf_prev: None,
             perf_first: None,
             attr_datasets: Vec::new(),
+            file_attributes: FileAttributes::default(),
             layout_filename: None,
             // No user layout XML by default → C's built-in NeXus DEFAULT_LAYOUT.
             layout: Some(Self::default_layout()),
@@ -931,7 +970,7 @@ impl Hdf5Writer {
     /// write) detector dataset. Identical leading-axis structure to
     /// `standard_layout`, but every chunk holds exactly **one whole frame**:
     /// the codec compressed each frame as a single unit, so C
-    /// `NDFileHDF5Dataset::verifyChunking` (NDFileHDF5Dataset.cpp:185-235)
+    /// `NDFileHDF5Dataset::verifyChunking` (NDFileHDF5Dataset.cpp:191-233)
     /// requires the leading frame-axis chunk == 1 and every frame-axis chunk ==
     /// the full frame dimension (no row/column sub-tiling). A pre-compressed
     /// chunk cannot be split, so `HDF5_nRowChunks`/`nColChunks`/`nFramesChunks`
@@ -1173,10 +1212,10 @@ impl Hdf5Writer {
 
     /// Open file in SWMR streaming mode.
     ///
-    /// Ordering mirrors C `NDFileHDF5::openFile` (`NDFileHDF5.cpp:264`-`335`):
+    /// Ordering mirrors C `NDFileHDF5::openFile` (`NDFileHDF5.cpp:173`-`337`):
     /// the file layout tree and datasets are created, then `createHardLinks`
-    /// (`NDFileHDF5.cpp:320`-`321`) runs, and only then `startSWMR`
-    /// (`NDFileHDF5.cpp:324`-`326`). `SwmrFileWriter` exposes `create_group` /
+    /// (`NDFileHDF5.cpp:319`-`320`) runs, and only then `startSWMR`
+    /// (`NDFileHDF5.cpp:323`-`325`). `SwmrFileWriter` exposes `create_group` /
     /// `create_hard_link` callable before `start_swmr()`; a group or link
     /// created before `start_swmr()` is visible to SWMR readers for the whole
     /// streaming window. So here the image dataset is placed at the layout's
@@ -1282,7 +1321,7 @@ impl Hdf5Writer {
         // Materialise the image dataset's constant attributes and the layout
         // `<hardlink>` elements — all BEFORE `start_swmr()` so SWMR readers
         // see the nested paths and aliases for the whole streaming window.
-        // C `NDFileHDF5.cpp:320`-`326`: `createHardLinks` then `startSWMR`.
+        // C `NDFileHDF5.cpp:319`-`325`: `createHardLinks` then `startSWMR`.
         self.write_swmr_layout_dataset_attrs(&mut swmr, ds_index)?;
         self.write_swmr_ndarray_default_attrs(&mut swmr, ds_index, array)?;
         self.build_swmr_layout_hardlinks(&mut swmr)?;
@@ -1388,7 +1427,7 @@ impl Hdf5Writer {
     ///
     /// Uses the rust-hdf5 0.2.17 `SwmrFileWriter::create_hard_link` API. Called
     /// from `open_swmr` after the layout groups and image dataset exist and
-    /// before `start_swmr()` — matching C `NDFileHDF5.cpp:320`-`321`
+    /// before `start_swmr()` — matching C `NDFileHDF5.cpp:319`-`320`
     /// `createHardLinks`, which runs before `startSWMR`. A link created before
     /// `start_swmr()` is visible to SWMR readers for the whole streaming
     /// window. No-op when no layout is loaded.
@@ -1593,7 +1632,7 @@ impl Hdf5Writer {
     ///
     /// `file` is the live `Standard` write-mode HDF5 handle. The SWMR path has
     /// its own counterpart, `build_swmr_layout_hardlinks`, which runs before
-    /// `start_swmr()` (C++ `NDFileHDF5.cpp:320`-`326`: `createHardLinks` then
+    /// `start_swmr()` (C++ `NDFileHDF5.cpp:319`-`325`: `createHardLinks` then
     /// `startSWMR`) so SWMR readers see the links during streaming.
     fn build_layout_hardlinks(&self, file: &H5File) -> ADResult<()> {
         let layout = match self.layout.as_ref() {
@@ -2048,7 +2087,7 @@ impl Hdf5Writer {
     fn write_standard(&mut self, array: &NDArray) -> ADResult<()> {
         if self.frame_count == 0 {
             self.create_detector_datasets(array)?;
-            self.create_attribute_datasets(array);
+            self.create_attribute_datasets();
         }
 
         let frame_dims = self
@@ -2158,15 +2197,21 @@ impl Hdf5Writer {
             det.frame_count += 1;
         }
 
-        // Append NDAttribute values for this frame.
+        // Append NDAttribute values for this frame, read out of the sticky
+        // file list exactly as C does (`pFileAttributes->find`,
+        // NDFileHDF5.cpp:2957). The datasets were built from that same list at
+        // open and the list only grows, so the lookup cannot miss; C treats a
+        // miss as `continue` (:2959-2963) rather than as a value.
         if self.store_attributes {
-            for ad in self.attr_datasets.iter_mut() {
-                let value = array
-                    .attributes
-                    .get(&ad.name)
-                    .map(|a| a.value.clone())
-                    .unwrap_or(NDAttrValue::Undefined);
-                ad.push(&value);
+            let Self {
+                attr_datasets,
+                file_attributes,
+                ..
+            } = self;
+            for ad in attr_datasets.iter_mut() {
+                if let Some(attr) = file_attributes.get(&ad.name) {
+                    ad.push(&attr.value);
+                }
             }
         }
         Ok(())
@@ -2174,14 +2219,16 @@ impl Hdf5Writer {
 
     /// Create one attribute time-series dataset per NDAttribute, preserving
     /// the NDAttrValue numeric type. Mirrors C++ `createAttributeDataset`.
-    fn create_attribute_datasets(&mut self, array: &NDArray) {
+    fn create_attribute_datasets(&mut self) {
         self.attr_datasets.clear();
         if !self.store_attributes {
             return;
         }
-        for attr in array.attributes.iter() {
-            self.attr_datasets.push(AttributeDataset::new(attr));
-        }
+        self.attr_datasets = self
+            .file_attributes
+            .iter()
+            .map(AttributeDataset::new)
+            .collect();
     }
 
     /// Effective chunk depth for the NDAttribute datasets and the performance
@@ -2208,7 +2255,7 @@ impl Hdf5Writer {
     /// per-frame update (`update_ndattr_element_values`) need not re-walk the
     /// layout. No-op unless the layout declares `<attribute source="ndattribute">`
     /// on a group or dataset (the default NeXus layout declares none).
-    fn seed_ndattr_element_values(&mut self, array: &NDArray) {
+    fn seed_ndattr_element_values(&mut self) {
         self.ndattr_first_values.clear();
         self.ndattr_last_values.clear();
         self.ndattr_element_names.clear();
@@ -2222,7 +2269,7 @@ impl Hdf5Writer {
             }
         }
         for name in &names {
-            if let Some(attr) = array.attributes.get(name) {
+            if let Some(attr) = self.file_attributes.get(name) {
                 self.ndattr_first_values
                     .insert(name.clone(), attr.value.clone());
                 self.ndattr_last_values
@@ -2237,14 +2284,19 @@ impl Hdf5Writer {
     /// `when="OnFileClose"` attribute records the final value). First-frame
     /// values are left untouched — an attribute absent at open stays unwritten
     /// for `OnFileOpen`/`OnFrame`, matching C's open-time `find` miss.
-    fn update_ndattr_element_values(&mut self, array: &NDArray) {
+    fn update_ndattr_element_values(&mut self) {
         if self.ndattr_element_names.is_empty() {
             return;
         }
-        for name in &self.ndattr_element_names {
-            if let Some(attr) = array.attributes.get(name) {
-                self.ndattr_last_values
-                    .insert(name.clone(), attr.value.clone());
+        let Self {
+            ndattr_element_names,
+            ndattr_last_values,
+            file_attributes,
+            ..
+        } = self;
+        for name in ndattr_element_names.iter() {
+            if let Some(attr) = file_attributes.get(name) {
+                ndattr_last_values.insert(name.clone(), attr.value.clone());
             }
         }
     }
@@ -3014,12 +3066,16 @@ impl NDFileWriter for Hdf5Writer {
         self.perf_prev = None;
         self.perf_first = None;
         self.attr_datasets.clear();
+        // C `openFile` clears `pFileAttributes` and copies this frame's list
+        // into it (NDFileHDF5.cpp:243-252); every attribute read for the rest
+        // of the file goes through it, not through the frame.
+        self.file_attributes.open(array);
         // Resolve where image/attribute/performance datasets land for this
         // file: the loaded layout XML tree, or the flat root default.
         self.resolve_layout_paths();
         // Seed the open-time NDAttribute values for any layout
         // `<attribute source="ndattribute">` element-attrs (ADP-79).
-        self.seed_ndattr_element_values(array);
+        self.seed_ndattr_element_values();
 
         if self.swmr_mode && mode == NDFileMode::Stream {
             self.open_swmr(path, array)
@@ -3041,6 +3097,10 @@ impl NDFileWriter for Hdf5Writer {
     fn write_file(&mut self, array: &NDArray) -> ADResult<()> {
         let start = std::time::Instant::now();
 
+        // C `writeFile` merges this frame into `pFileAttributes` before it
+        // writes anything (NDFileHDF5.cpp:1420-1437).
+        self.file_attributes.frame(array);
+
         let is_swmr = matches!(self.handle, Some(Hdf5Handle::Swmr { .. }));
         if is_swmr {
             self.write_swmr(array)?;
@@ -3049,7 +3109,7 @@ impl NDFileWriter for Hdf5Writer {
         }
         // Track the latest NDAttribute values for `when="OnFileClose"`
         // element-attrs (ADP-79); no-op unless the layout declares any.
-        self.update_ndattr_element_values(array);
+        self.update_ndattr_element_values();
         self.frame_count += 1;
 
         let elapsed = start.elapsed().as_secs_f64();
@@ -3188,8 +3248,8 @@ impl NDFileWriter for Hdf5Writer {
                 Some(Hdf5Handle::Swmr { .. }) => {
                     // The layout group tree, the nested dataset placement and the
                     // layout `<hardlink>` elements were all materialised in
-                    // `open_swmr` before `start_swmr()` (C `NDFileHDF5.cpp:320`-
-                    // `326`: `createHardLinks` then `startSWMR`), so SWMR readers
+                    // `open_swmr` before `start_swmr()` (C `NDFileHDF5.cpp:319`-
+                    // `325`: `createHardLinks` then `startSWMR`), so SWMR readers
                     // see them for the whole streaming window. Closing the writer
                     // only finalises the streamed frames.
                     if let Some(Hdf5Handle::Swmr { mut writer, .. }) = w.handle.take() {
@@ -3264,20 +3324,20 @@ struct Hdf5ParamIndices {
 
 /// HDF5 file processor wrapping `FilePluginController<Hdf5Writer>`.
 pub struct Hdf5FileProcessor {
-    ctrl: FilePluginController<Hdf5Writer>,
+    ctrl: Mutex<FilePluginController<Hdf5Writer>>,
     hdf5_params: Hdf5ParamIndices,
 }
 
 impl Hdf5FileProcessor {
     pub fn new() -> Self {
         Self {
-            ctrl: FilePluginController::new(Hdf5Writer::new()),
+            ctrl: Mutex::new(FilePluginController::new(Hdf5Writer::new())),
             hdf5_params: Hdf5ParamIndices::default(),
         }
     }
 
     pub fn set_dataset_name(&mut self, name: &str) {
-        self.ctrl.writer.set_dataset_name(name);
+        self.ctrl.lock().writer.set_dataset_name(name);
     }
 }
 
@@ -3414,10 +3474,11 @@ const EXTRA_DIM_NAME_PARAMS: [&str; MAX_EXTRA_DIMS] = [
 ];
 
 impl NDPluginProcess for Hdf5FileProcessor {
-    fn process_array(&mut self, array: &NDArray, _pool: &NDArrayPool) -> ProcessResult {
-        let was_swmr = self.ctrl.writer.is_swmr_active();
-        let mut result = self.ctrl.process_array(array);
-        let is_swmr = self.ctrl.writer.is_swmr_active();
+    fn process_array(&self, array: &NDArray, _pool: &NDArrayPool) -> ProcessResult {
+        let mut ctrl = self.ctrl.lock();
+        let was_swmr = ctrl.writer.is_swmr_active();
+        let mut result = ctrl.process_array(array);
+        let is_swmr = ctrl.writer.is_swmr_active();
 
         // SWMR running status changed
         if was_swmr != is_swmr {
@@ -3431,25 +3492,22 @@ impl NDPluginProcess for Hdf5FileProcessor {
         // SWMR callback counter
         if is_swmr {
             if let Some(idx) = self.hdf5_params.swmr_cb_counter {
-                result.param_updates.push(ParamUpdate::int32(
-                    idx,
-                    self.ctrl.writer.swmr_cb_counter as i32,
-                ));
+                result
+                    .param_updates
+                    .push(ParamUpdate::int32(idx, ctrl.writer.swmr_cb_counter as i32));
             }
         }
 
         // Performance stats
-        if self.ctrl.writer.store_performance {
+        if ctrl.writer.store_performance {
             if let Some(idx) = self.hdf5_params.total_runtime {
                 result
                     .param_updates
-                    .push(ParamUpdate::float64(idx, self.ctrl.writer.total_runtime));
+                    .push(ParamUpdate::float64(idx, ctrl.writer.total_runtime));
             }
             if let Some(idx) = self.hdf5_params.total_io_speed {
-                let speed = if self.ctrl.writer.total_runtime > 0.0 {
-                    self.ctrl.writer.total_bytes as f64
-                        / self.ctrl.writer.total_runtime
-                        / 1_000_000.0
+                let speed = if ctrl.writer.total_runtime > 0.0 {
+                    ctrl.writer.total_bytes as f64 / ctrl.writer.total_runtime / 1_000_000.0
                 } else {
                     0.0
                 };
@@ -3483,7 +3541,7 @@ impl NDPluginProcess for Hdf5FileProcessor {
         &mut self,
         base: &mut asyn_rs::port::PortDriverBase,
     ) -> asyn_rs::error::AsynResult<()> {
-        self.ctrl.register_params(base)?;
+        self.ctrl.lock().register_params(base)?;
         register_hdf5_params(base)?;
         self.hdf5_params.compression_type = base.find_param("HDF5_compressionType");
         self.hdf5_params.z_compress_level = base.find_param("HDF5_zCompressLevel");
@@ -3527,183 +3585,151 @@ impl NDPluginProcess for Hdf5FileProcessor {
         Ok(())
     }
 
-    fn on_param_change(
-        &mut self,
-        reason: usize,
-        params: &PluginParamSnapshot,
-    ) -> ParamChangeResult {
+    fn on_param_change(&self, reason: usize, params: &PluginParamSnapshot) -> ParamChangeResult {
+        let mut ctrl = self.ctrl.lock();
         // -- compression params --
         if Some(reason) == self.hdf5_params.compression_type {
-            self.ctrl.writer.set_compression_type(params.value.as_i32());
+            ctrl.writer.set_compression_type(params.value.as_i32());
             return ParamChangeResult::updates(vec![]);
         }
         if Some(reason) == self.hdf5_params.z_compress_level {
-            self.ctrl
-                .writer
+            ctrl.writer
                 .set_z_compress_level(params.value.as_i32() as u32);
             return ParamChangeResult::updates(vec![]);
         }
         if Some(reason) == self.hdf5_params.szip_num_pixels {
-            self.ctrl
-                .writer
+            ctrl.writer
                 .set_szip_num_pixels(params.value.as_i32() as u32);
             return ParamChangeResult::updates(vec![]);
         }
         if Some(reason) == self.hdf5_params.blosc_shuffle_type {
-            self.ctrl
-                .writer
-                .set_blosc_shuffle_type(params.value.as_i32());
+            ctrl.writer.set_blosc_shuffle_type(params.value.as_i32());
             return ParamChangeResult::updates(vec![]);
         }
         if Some(reason) == self.hdf5_params.blosc_compressor {
-            self.ctrl.writer.set_blosc_compressor(params.value.as_i32());
+            ctrl.writer.set_blosc_compressor(params.value.as_i32());
             return ParamChangeResult::updates(vec![]);
         }
         if Some(reason) == self.hdf5_params.blosc_compress_level {
-            self.ctrl
-                .writer
+            ctrl.writer
                 .set_blosc_compress_level(params.value.as_i32() as u32);
             return ParamChangeResult::updates(vec![]);
         }
         if Some(reason) == self.hdf5_params.nbit_precision {
-            self.ctrl
-                .writer
-                .set_nbit_precision(params.value.as_i32() as u32);
+            ctrl.writer.set_nbit_precision(params.value.as_i32() as u32);
             return ParamChangeResult::updates(vec![]);
         }
         if Some(reason) == self.hdf5_params.nbit_offset {
-            self.ctrl
-                .writer
-                .set_nbit_offset(params.value.as_i32() as u32);
+            ctrl.writer.set_nbit_offset(params.value.as_i32() as u32);
             return ParamChangeResult::updates(vec![]);
         }
         if Some(reason) == self.hdf5_params.jpeg_quality {
-            self.ctrl
-                .writer
-                .set_jpeg_quality(params.value.as_i32() as u32);
+            ctrl.writer.set_jpeg_quality(params.value.as_i32() as u32);
             return ParamChangeResult::updates(vec![]);
         }
         if Some(reason) == self.hdf5_params.store_attributes {
-            self.ctrl
-                .writer
-                .set_store_attributes(params.value.as_i32() != 0);
+            ctrl.writer.set_store_attributes(params.value.as_i32() != 0);
             return ParamChangeResult::updates(vec![]);
         }
         if Some(reason) == self.hdf5_params.store_performance {
-            self.ctrl
-                .writer
+            ctrl.writer
                 .set_store_performance(params.value.as_i32() != 0);
             return ParamChangeResult::updates(vec![]);
         }
         // -- chunking params --
         if Some(reason) == self.hdf5_params.chunk_size_auto {
-            self.ctrl
-                .writer
-                .set_chunk_size_auto(params.value.as_i32() != 0);
+            ctrl.writer.set_chunk_size_auto(params.value.as_i32() != 0);
             return ParamChangeResult::updates(vec![]);
         }
         if Some(reason) == self.hdf5_params.n_row_chunks {
-            self.ctrl
-                .writer
+            ctrl.writer
                 .set_n_row_chunks(params.value.as_i32().max(0) as usize);
             return ParamChangeResult::updates(vec![]);
         }
         if Some(reason) == self.hdf5_params.n_col_chunks {
-            self.ctrl
-                .writer
+            ctrl.writer
                 .set_n_col_chunks(params.value.as_i32().max(0) as usize);
             return ParamChangeResult::updates(vec![]);
         }
         if Some(reason) == self.hdf5_params.n_frames_chunks {
-            self.ctrl
-                .writer
+            ctrl.writer
                 .set_n_frames_chunks(params.value.as_i32().max(0) as usize);
             return ParamChangeResult::updates(vec![]);
         }
         if Some(reason) == self.hdf5_params.ndattr_chunk {
             // `0` (auto) is valid; only negatives are coerced away.
-            self.ctrl
-                .writer
+            ctrl.writer
                 .set_ndattr_chunk(params.value.as_i32().max(0) as usize);
             return ParamChangeResult::updates(vec![]);
         }
         // -- extra dimensions --
         if Some(reason) == self.hdf5_params.n_extra_dims {
-            self.ctrl
-                .writer
+            ctrl.writer
                 .set_n_extra_dims(params.value.as_i32().max(0) as usize);
             return ParamChangeResult::updates(vec![]);
         }
         for i in 0..MAX_EXTRA_DIMS {
             if Some(reason) == self.hdf5_params.extra_dim_size[i] {
-                self.ctrl
-                    .writer
+                ctrl.writer
                     .set_extra_dim_size(i, params.value.as_i32().max(1) as usize);
                 return ParamChangeResult::updates(vec![]);
             }
             if Some(reason) == self.hdf5_params.extra_dim_name[i] {
-                self.ctrl
-                    .writer
+                ctrl.writer
                     .set_extra_dim_name(i, params.value.as_string().unwrap_or(""));
                 return ParamChangeResult::updates(vec![]);
             }
         }
         if Some(reason) == self.hdf5_params.fill_value {
-            self.ctrl.writer.set_fill_value(params.value.as_f64());
+            ctrl.writer.set_fill_value(params.value.as_f64());
             return ParamChangeResult::updates(vec![]);
         }
         if Some(reason) == self.hdf5_params.dim_att_datasets {
-            self.ctrl
-                .writer
-                .set_dim_att_datasets(params.value.as_i32() != 0);
+            ctrl.writer.set_dim_att_datasets(params.value.as_i32() != 0);
             return ParamChangeResult::updates(vec![]);
         }
         // -- layout XML --
         if Some(reason) == self.hdf5_params.layout_filename {
             let path = params.value.as_string().unwrap_or("").to_string();
-            self.ctrl.writer.set_layout_filename(&path);
+            ctrl.writer.set_layout_filename(&path);
             let mut updates = vec![];
             if let Some(idx) = self.hdf5_params.layout_valid {
                 updates.push(ParamUpdate::int32(
                     idx,
-                    if self.ctrl.writer.layout_valid { 1 } else { 0 },
+                    if ctrl.writer.layout_valid { 1 } else { 0 },
                 ));
             }
             if let Some(idx) = self.hdf5_params.layout_error_msg {
                 updates.push(ParamUpdate::Octet {
                     reason: idx,
                     addr: 0,
-                    value: self.ctrl.writer.layout_error.clone(),
+                    value: ctrl.writer.layout_error.clone(),
                 });
             }
             return ParamChangeResult::updates(updates);
         }
         // -- SWMR params --
         if Some(reason) == self.hdf5_params.swmr_mode {
-            self.ctrl.writer.set_swmr_mode(params.value.as_i32() != 0);
+            ctrl.writer.set_swmr_mode(params.value.as_i32() != 0);
             return ParamChangeResult::updates(vec![]);
         }
         if Some(reason) == self.hdf5_params.swmr_flush_now {
             if params.value.as_i32() != 0 {
-                self.ctrl.writer.flush_swmr();
+                ctrl.writer.flush_swmr();
                 let mut updates = vec![];
                 if let Some(idx) = self.hdf5_params.swmr_cb_counter {
-                    updates.push(ParamUpdate::int32(
-                        idx,
-                        self.ctrl.writer.swmr_cb_counter as i32,
-                    ));
+                    updates.push(ParamUpdate::int32(idx, ctrl.writer.swmr_cb_counter as i32));
                 }
                 return ParamChangeResult::updates(updates);
             }
             return ParamChangeResult::updates(vec![]);
         }
         if Some(reason) == self.hdf5_params.flush_nth_frame {
-            self.ctrl
-                .writer
+            ctrl.writer
                 .set_flush_nth_frame(params.value.as_i32().max(0) as usize);
             return ParamChangeResult::updates(vec![]);
         }
-        self.ctrl.on_param_change(reason, params)
+        ctrl.on_param_change(reason, params)
     }
 }
 
@@ -3718,7 +3744,12 @@ mod tests {
 
     fn temp_path(prefix: &str) -> PathBuf {
         let n = TEST_COUNTER.fetch_add(1, Ordering::Relaxed);
-        std::env::temp_dir().join(format!("adcore_test_{}_{}.h5", prefix, n))
+        std::env::temp_dir().join(format!(
+            "adcore_test_{}_{}_{}.h5",
+            std::process::id(),
+            prefix,
+            n
+        ))
     }
 
     #[test]
@@ -4138,6 +4169,154 @@ mod tests {
         std::fs::remove_file(&path).ok();
     }
 
+    /// ADP-102. C's per-frame attribute record comes out of `pFileAttributes`,
+    /// which `openFile` clears (NDFileHDF5.cpp:243) and every `writeFile`
+    /// merges into (`:1437`) through `NDAttributeList::copy`
+    /// (NDAttributeList.cpp:185-205) — a copy that adds and overwrites but
+    /// never removes. An attribute that stops arriving therefore keeps its last
+    /// value for the rest of the file, and C re-writes that value each frame.
+    /// Reading the frame's own list instead turned a drop-out into a 0.
+    #[test]
+    fn attribute_that_drops_out_keeps_its_last_value() {
+        let path = temp_path("hdf5_attr_sticky");
+        let mut writer = Hdf5Writer::new();
+
+        let mk = |exposure: Option<f64>| {
+            let mut arr = NDArray::new(vec![NDDimension::new(4)], NDDataType::UInt8);
+            arr.attributes.add(NDAttribute::new_static(
+                "count",
+                "",
+                NDAttrSource::Driver,
+                NDAttrValue::Int32(7),
+            ));
+            if let Some(v) = exposure {
+                arr.attributes.add(NDAttribute::new_static(
+                    "exposure",
+                    "",
+                    NDAttrSource::Driver,
+                    NDAttrValue::Float64(v),
+                ));
+            }
+            arr
+        };
+
+        let a0 = mk(Some(0.5));
+        writer.open_file(&path, NDFileMode::Stream, &a0).unwrap();
+        writer.write_file(&a0).unwrap();
+        // Present and changed: the new value wins.
+        writer.write_file(&mk(Some(0.75))).unwrap();
+        // Absent: the previous value stands, it does not become 0.
+        writer.write_file(&mk(None)).unwrap();
+        writer.close_file().unwrap();
+
+        let h5 = H5File::open(&path).unwrap();
+        let exp = h5
+            .dataset("entry/instrument/NDAttributes/exposure")
+            .unwrap();
+        assert_eq!(exp.shape(), vec![3]);
+        let exp_vals: Vec<f64> = exp.read_raw().unwrap();
+        assert_eq!(exp_vals, vec![0.5, 0.75, 0.75]);
+
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// ADP-102, the other side: an attribute first seen after open joins the
+    /// sticky list but has no dataset, because C builds `attrList` once from
+    /// `pFileAttributes` at the first frame (`createAttributeDataset`,
+    /// NDFileHDF5.cpp:2782-2857) and never revisits it.
+    #[test]
+    fn attribute_appearing_after_open_creates_no_dataset() {
+        let path = temp_path("hdf5_attr_late");
+        let mut writer = Hdf5Writer::new();
+
+        let mut a0 = NDArray::new(vec![NDDimension::new(4)], NDDataType::UInt8);
+        a0.attributes.add(NDAttribute::new_static(
+            "count",
+            "",
+            NDAttrSource::Driver,
+            NDAttrValue::Int32(7),
+        ));
+        let mut a1 = a0.clone();
+        a1.attributes.add(NDAttribute::new_static(
+            "late",
+            "",
+            NDAttrSource::Driver,
+            NDAttrValue::Int32(1),
+        ));
+
+        writer.open_file(&path, NDFileMode::Stream, &a0).unwrap();
+        writer.write_file(&a0).unwrap();
+        writer.write_file(&a1).unwrap();
+        writer.close_file().unwrap();
+
+        let h5 = H5File::open(&path).unwrap();
+        assert_eq!(
+            h5.dataset("entry/instrument/NDAttributes/count")
+                .unwrap()
+                .shape(),
+            vec![2]
+        );
+        assert!(
+            h5.dataset("entry/instrument/NDAttributes/late").is_err(),
+            "an attribute absent at open gets no dataset"
+        );
+
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn test_adp78_undefined_attribute_dataset_is_float32_nan() {
+        // ADP-78. C fixes an attribute dataset's HDF5 datatype and fill value
+        // once, at file-open, from `ndAttr->getDataType()` (NDFileHDF5.cpp:2797,
+        // :2830 → `typeAsHdf`, NDFileHDF5AttributeDataset.cpp:73-97). An
+        // attribute with no value takes the `default:` arm — `H5T_NATIVE_FLOAT`
+        // with an `epicsNAN` fill (`:366-370`) — and every element write is
+        // gated on `!isUndefined_` (`:160`), so the NaN fill stands for every
+        // frame even after a concrete value shows up. The port used to take
+        // `NDAttrValue::Undefined.data_type()`, which is `Int32`, and wrote a
+        // measured-looking 0 for the frames that carried nothing.
+        let path = temp_path("hdf5_attr_undef");
+        let mut writer = Hdf5Writer::new();
+
+        let mk = |undef_value: NDAttrValue| {
+            let mut arr = NDArray::new(vec![NDDimension::new(4)], NDDataType::UInt8);
+            arr.attributes.add(NDAttribute::new_static(
+                "novalue",
+                "",
+                NDAttrSource::Driver,
+                undef_value,
+            ));
+            arr
+        };
+
+        // The frame that opens the file carries no value for the attribute.
+        let a0 = mk(NDAttrValue::Undefined);
+        writer.open_file(&path, NDFileMode::Stream, &a0).unwrap();
+        writer.write_file(&a0).unwrap();
+        // A concrete value arriving later must not retype the dataset, and must
+        // not land in it: C never re-runs `typeAsHdf` and never lifts the gate.
+        writer.write_file(&mk(NDAttrValue::Int32(7))).unwrap();
+        writer.write_file(&mk(NDAttrValue::Int32(9))).unwrap();
+        writer.close_file().unwrap();
+
+        let h5 = H5File::open(&path).unwrap();
+        let ds = h5.dataset("entry/instrument/NDAttributes/novalue").unwrap();
+        assert_eq!(ds.shape(), vec![3]);
+        // Float32, not the Int32 the first concrete value would imply.
+        let vals: Vec<f32> = ds.read_raw().unwrap();
+        assert_eq!(vals.len(), 3);
+        for (i, v) in vals.iter().enumerate() {
+            assert!(
+                v.is_nan(),
+                "element {} is {} — a reader cannot tell it from a measured value; C leaves epicsNAN",
+                i,
+                v
+            );
+        }
+
+        std::fs::remove_file(&path).ok();
+    }
+
     #[test]
     fn test_attribute_dataset_chunk_matches_capture_target() {
         // C `calculateAttributeChunking` (NDFileHDF5.cpp:2869-2920): with the
@@ -4304,7 +4483,10 @@ mod tests {
         // the first-frame value, `when="OnFileClose"` the last. Cover a group
         // string attribute and a dataset numeric attribute, both phases.
         let dir = std::env::temp_dir();
-        let layout = dir.join("adcore_layout_elem_attr.xml");
+        let layout = dir.join(format!(
+            "adcore_layout_elem_attr_{}.xml",
+            std::process::id()
+        ));
         std::fs::write(
             &layout,
             r#"<hdf5_layout>
@@ -4402,7 +4584,10 @@ mod tests {
         // a `GainTrace` NDAttribute dataset (sourced from Gain) carries two
         // element-attrs sourced from ColorMode (open=first, close=last value).
         let dir = std::env::temp_dir();
-        let layout = dir.join("adcore_layout_lazy_ds_attr.xml");
+        let layout = dir.join(format!(
+            "adcore_layout_lazy_ds_attr_{}.xml",
+            std::process::id()
+        ));
         std::fs::write(
             &layout,
             r#"<hdf5_layout>
@@ -4478,7 +4663,10 @@ mod tests {
         // by index). OnFileClose stays impossible in SWMR (HDF5 forbids
         // post-lock attribute creation; C's close-time H5Acreate2 fails too).
         let dir = std::env::temp_dir();
-        let layout = dir.join("adcore_layout_swmr_ds_attr.xml");
+        let layout = dir.join(format!(
+            "adcore_layout_swmr_ds_attr_{}.xml",
+            std::process::id()
+        ));
         std::fs::write(
             &layout,
             r#"<hdf5_layout>
@@ -5540,7 +5728,7 @@ mod tests {
         // Valid and invalid layout XML drive layout_valid / layout_error.
         let mut writer = Hdf5Writer::new();
         let dir = std::env::temp_dir();
-        let good = dir.join("adcore_layout_good.xml");
+        let good = dir.join(format!("adcore_layout_good_{}.xml", std::process::id()));
         std::fs::write(
             &good,
             r#"<hdf5_layout><group name="entry"><dataset name="data" source="detector" det_default="true"/></group></hdf5_layout>"#,
@@ -5550,7 +5738,7 @@ mod tests {
         assert!(writer.layout_valid);
         assert!(writer.layout_error.is_empty());
 
-        let bad = dir.join("adcore_layout_bad.xml");
+        let bad = dir.join(format!("adcore_layout_bad_{}.xml", std::process::id()));
         std::fs::write(&bad, r#"<not_a_layout/>"#).unwrap();
         assert!(!writer.set_layout_filename(bad.to_str().unwrap()));
         assert!(!writer.layout_valid);
@@ -5568,7 +5756,7 @@ mod tests {
         // dataset under the group holding the `timestamp` dataset — NOT flat
         // at the file root.
         let dir = std::env::temp_dir();
-        let layout = dir.join("adcore_layout_nested.xml");
+        let layout = dir.join(format!("adcore_layout_nested_{}.xml", std::process::id()));
         std::fs::write(
             &layout,
             r#"<hdf5_layout>
@@ -5672,7 +5860,7 @@ mod tests {
     #[test]
     fn test_detector_data_destination_routes_by_attribute() {
         let dir = std::env::temp_dir();
-        let layout = dir.join("adcore_layout_multidet.xml");
+        let layout = dir.join(format!("adcore_layout_multidet_{}.xml", std::process::id()));
         std::fs::write(
             &layout,
             r#"<hdf5_layout>
@@ -5771,7 +5959,10 @@ mod tests {
     #[test]
     fn test_detector_data_destination_non_string_attribute_errors() {
         let dir = std::env::temp_dir();
-        let layout = dir.join("adcore_layout_multidet_err.xml");
+        let layout = dir.join(format!(
+            "adcore_layout_multidet_err_{}.xml",
+            std::process::id()
+        ));
         std::fs::write(
             &layout,
             r#"<hdf5_layout>
@@ -5819,7 +6010,7 @@ mod tests {
         // `H5Lcreate_hard`; without that, files written from a layout with a
         // `<hardlink>` silently lack the link.
         let dir = std::env::temp_dir();
-        let layout = dir.join("adcore_layout_hardlink.xml");
+        let layout = dir.join(format!("adcore_layout_hardlink_{}.xml", std::process::id()));
         std::fs::write(
             &layout,
             r#"<hdf5_layout>
@@ -5880,7 +6071,10 @@ mod tests {
     #[test]
     fn close_file_releases_the_handle_when_finalisation_fails() {
         let dir = std::env::temp_dir();
-        let layout = dir.join("adcore_layout_broken_hardlink.xml");
+        let layout = dir.join(format!(
+            "adcore_layout_broken_hardlink_{}.xml",
+            std::process::id()
+        ));
         std::fs::write(
             &layout,
             r#"<hdf5_layout>
@@ -5929,7 +6123,7 @@ mod tests {
     #[test]
     fn test_swmr_layout_hardlink_is_materialised() {
         // A `<hardlink>` declared in the layout XML must also be materialised
-        // for SWMR-mode files. C ADCore `NDFileHDF5.cpp:320`-`326` calls
+        // for SWMR-mode files. C ADCore `NDFileHDF5.cpp:319`-`325` calls
         // `createHardLinks` before `startSWMR()`, so the link is committed by
         // `start_swmr()` and visible to SWMR readers for the whole streaming
         // window. The rust-hdf5 0.2.17 `SwmrFileWriter::create_hard_link` API
@@ -5940,7 +6134,10 @@ mod tests {
         // `det_default` path (`/entry/data/data`), exactly like standard mode;
         // the layout hardlink targets that nested path.
         let dir = std::env::temp_dir();
-        let layout = dir.join("adcore_swmr_layout_hardlink.xml");
+        let layout = dir.join(format!(
+            "adcore_swmr_layout_hardlink_{}.xml",
+            std::process::id()
+        ));
         std::fs::write(
             &layout,
             r#"<hdf5_layout>
@@ -6015,7 +6212,10 @@ mod tests {
         // `<hardlink>`, and a constant dataset attribute must all be visible
         // to a `SwmrFileReader` reading the file back.
         let dir = std::env::temp_dir();
-        let layout = dir.join("adcore_swmr_layout_nested.xml");
+        let layout = dir.join(format!(
+            "adcore_swmr_layout_nested_{}.xml",
+            std::process::id()
+        ));
         std::fs::write(
             &layout,
             r#"<hdf5_layout>
@@ -6456,10 +6656,10 @@ mod tests {
 
     #[test]
     fn test_codec_chunk_bytes_bslz4_header() {
-        // The HDF5 bitshuffle filter expects a 12-byte big-endian chunk header
-        // ahead of the canonical stream: uncompressed total bytes (u64) and the
-        // block size in bytes (u32 = block_elems * elem_size, C hardcodes the
-        // 8192 default), per NDFileHDF5Dataset::writeFile (cpp:316-328).
+        // The HDF5 bitshuffle filter expects a 12-byte big-endian chunk header ahead of the
+        // canonical stream: uncompressed total bytes (u64) and the block size in bytes (u32 =
+        // block_elems * elem_size, C hardcodes the 8192 default), per
+        // `NDFileHDF5Dataset::writeFile` (`NDFileHDF5Dataset.cpp:316-328`).
         let codec = Codec {
             name: CodecName::BSLZ4,
             compressed_size: 0,

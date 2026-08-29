@@ -83,7 +83,7 @@ impl Args {
     /// Resolve the active/passive discovery flag the way pvxs does:
     /// active by default, `-A` keeps it active, `-p` clears it. pvxs
     /// `tools/list.cpp:71` initializes `active = true` and passes it to
-    /// `.pingAll(active)` (`:151`); only `-p` flips it off (`:86-88`).
+    /// `.pingAll(active)` (`:153`); only `-p` flips it off (`:86-88`).
     fn active_discovery(&self) -> bool {
         !self.passive
     }
@@ -178,7 +178,7 @@ fn parse_server_addr(s: &str, default_port: u16) -> Result<SocketAddr, String> {
 /// Delegates to the shared [`epics_pva_rs::nt::NTURI::request`] builder
 /// so the request carries **all four** normative members — `scheme`,
 /// `authority`, `path`, `query` — that pvxs `NTURI::NTURI()` defines
-/// (`src/nt.cpp:253-262`). The previous hand-rolled descriptor omitted
+/// (`src/nt.cpp:253-263`). The previous hand-rolled descriptor omitted
 /// `authority`.
 fn build_server_query(op: &str) -> (FieldDesc, PvField) {
     epics_pva_rs::nt::NTURI::request(
@@ -280,7 +280,7 @@ async fn query_server(client: &PvaClient, raw: &str, addr: SocketAddr, info: boo
 /// feeds straight back into query mode), prints one address per
 /// `(guid, proto)` even when a server is reachable through several
 /// interfaces (`:139-147`), and suppresses Timeout/offline events
-/// (`:136`). Verbose mode keeps the detailed `ONLINE`/`OFFLINE` status
+/// (`:138-139`). Verbose mode keeps the detailed `ONLINE`/`OFFLINE` status
 /// lines.
 struct DiscoveryPrinter {
     verbose: bool,
@@ -361,7 +361,9 @@ impl DiscoveryPrinter {
 /// Discovery mode — active by default (broadcast ping + beacon
 /// listen); `-p` makes it passive (beacon listen only).
 async fn discover_mode(args: &Args) {
-    let engine = match SearchEngine::spawn(Vec::new(), Vec::new()).await {
+    let reactor = epics_base_rs::runtime::task::Reactor::current()
+        .expect("discover_mode is awaited on the tool's runtime");
+    let engine = match SearchEngine::spawn(&reactor, Vec::new(), Vec::new()).await {
         Ok(e) => e,
         Err(e) => {
             eprintln!("pvlist-rs: failed to spawn search engine: {e}");
@@ -377,7 +379,7 @@ async fn discover_mode(args: &Args) {
     };
     // pvxs always calls `.pingAll(active)`; with active=false it skips
     // the broadcast probe. We gate the equivalent `ping_all()` on the
-    // resolved flag, which is active by default (tools/list.cpp:151).
+    // resolved flag, which is active by default (tools/list.cpp:71,151).
     if args.active_discovery() {
         engine.ping_all().await;
     }
@@ -389,12 +391,15 @@ async fn discover_mode(args: &Args) {
     // means; `Forever` → no deadline → unbounded receive wait.
     let deadline = epics_pva_rs::cli::TimeoutPolicy::wait_or_forever(args.timeout)
         .finite_duration()
-        .map(|d| tokio::time::Instant::now() + d);
+        // The seam's clock, not `tokio::time::Instant`: the deadline is read
+        // back by `task::timeout_at`, and naming tokio's type here pins the
+        // deadline to the tokio clock on a backend that has none.
+        .map(|d| epics_base_rs::runtime::task::Instant::now() + d);
 
     loop {
         let recv_fut = rx.recv();
         let evt = match deadline {
-            Some(d) => match tokio::time::timeout_at(d, recv_fut).await {
+            Some(d) => match epics_base_rs::runtime::task::timeout_at(d, recv_fut).await {
                 Ok(opt) => opt,
                 Err(_) => break,
             },
@@ -580,7 +585,7 @@ mod tests {
 
     /// The `server` RPC request advertises all four normative NTURI
     /// members, including `authority` (pvxs `NTURI::NTURI()`,
-    /// `src/nt.cpp:253-262`). The pre-fix hand-rolled descriptor omitted
+    /// `src/nt.cpp:253-263`). The pre-fix hand-rolled descriptor omitted
     /// `authority`.
     #[test]
     fn server_query_nturi_includes_authority() {

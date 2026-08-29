@@ -1,7 +1,7 @@
 //! R11-C5 — an aCalcout array field posts because the expression STORED into it,
 //! not because its value changed.
 //!
-//! `afterCalc` (`aCalcoutRecord.c:293-297`) posts exactly the AMASK-flagged array
+//! `afterCalc` (`aCalcoutRecord.c:294-298`) posts exactly the AMASK-flagged array
 //! fields, with no value comparison anywhere in the loop:
 //!
 //! ```c
@@ -83,7 +83,7 @@ async fn r11_c5_a_stored_array_posts_even_when_the_value_did_not_change() {
 
     let second = aa_rx
         .try_recv()
-        .expect("AMASK bit 0 is set again, so afterCalc posts AA again (:293-297)");
+        .expect("AMASK bit 0 is set again, so afterCalc posts AA again (:294-298)");
     assert_eq!(
         second.snapshot.value,
         EpicsValue::DoubleArray(vec![2.0, 4.0, 6.0, 8.0])

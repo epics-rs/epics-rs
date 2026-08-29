@@ -26,6 +26,8 @@ use epics_base_rs::server::record::RecordInstance;
 use epics_base_rs::server::record::dbd_generated::{RECORD_TYPES, record_fields};
 use epics_base_rs::types::EpicsValue;
 
+mod module_records;
+
 /// The gaps that exist TODAY. SDEF was one of them; the sweep below is what
 /// found the other 290, and they are defects, not exemptions — each is a channel
 /// the C IOC serves and the port does not.
@@ -335,9 +337,10 @@ fn every_declared_field_is_served() {
     let mut unserved: Vec<String> = Vec::new();
 
     for &record_type in RECORD_TYPES {
-        let Ok(rec) = create_record(record_type) else {
-            continue;
-        };
+        // Through the module-record fixture: a `continue` here silently
+        // dropped the seven types outside `stdRecords.dbd` from the sweep.
+        let rec = module_records::create_any(record_type)
+            .unwrap_or_else(|e| panic!("{record_type}: create_record failed: {e}"));
         let Some(fields) = record_fields(record_type) else {
             panic!("{record_type} is instantiable but has no declared field table");
         };

@@ -49,12 +49,12 @@ use super::wait_millis;
 ///
 /// # VxWorks: why the POSIX path and not C's
 ///
-/// C's vxWorks branch drives the line through `ioctl(SIO_HW_OPTS_SET)` on a
-/// *fake* `struct termios { int c_cflag; }` (`drvAsynSerialPort.c:43-62`),
-/// because it predates VxWorks 7's POSIX termios. Consequences C then has to
+/// C's vxWorks branch drives the line through `ioctl(SIO_HW_OPTS_SET)`
+/// (`drvAsynSerialPort.c:114`) on a *fake* `struct termios { int c_cflag; }`
+/// (`:55-62`), because it predates VxWorks 7's POSIX termios. Consequences C then has to
 /// live with: `crtscts` is aliased onto `CLOCAL` ("vxWorks uses CLOCAL when
-/// it should use CRTSCTS", `:425-431`) since `sioLibCommon.h` has no
-/// flow-control bit, and `ixoff` is refused outright (`:488-490`).
+/// it should use CRTSCTS", `:425-430`) since `sioLibCommon.h` has no
+/// flow-control bit, and `ixoff` is refused outright (`drvAsynSerialPort.c:489-491`).
 ///
 /// This driver takes VxWorks 7's real `<termios.h>` instead, which the RTP
 /// sysroot exposes and `libc` binds ABI-correctly (`struct termios` field for
@@ -137,6 +137,19 @@ mod platform {
     /// RTEMS 6, declared against `arm-rtems6/include/sys/_termios.h` and
     /// `.../termios.h` in the BSP sysroot. Every line below cites the header
     /// it was read from; nothing here is inferred from another platform.
+    ///
+    /// Those citations are **not re-checkable on a host without the RTEMS
+    /// toolchain**, and this machine is one: `find / -name '_termios.h'` and
+    /// `find / -type d -name 'arm-rtems*'` both come back empty of any
+    /// toolchain (the only `arm-rtems*` hits are unrelated test fixtures under
+    /// `/tmp`), as does `find / -type d -name 'rtems-libbsd'`. Install the BSP
+    /// sysroot before re-pinning any `_termios.h` / `_default_fcntl.h` line
+    /// number here; do not "verify" them against glibc's `termios.h`, whose
+    /// numbering is unrelated. The VxWorks half below has no such problem —
+    /// its sysroot *is* on this machine, under
+    /// `wrsdk-vxworks7-qemu-1.17.0/vxsdk/sysroot/{usr,krnl}/h/`, so
+    /// `sioLibCommon.h`, `sys/fcntlcom.h` and `UTILS_UNIX/termios.h` are
+    /// readable and were re-verified.
     #[cfg(target_os = "rtems")]
     mod imp {
         /// `_termios.h:226`: `typedef unsigned int speed_t;`. Its two
@@ -294,7 +307,7 @@ mod platform {
         pub const FLUSH_IO: libc::c_int = libc::TCIFLUSH;
         /// No `IXANY` bit exists on VxWorks — the SDK's input-flag block
         /// (`termios.h:70-81`) goes straight from `IXON` to `IXOFF`. C refuses
-        /// the option here too (`drvAsynSerialPort.c:469-471`).
+        /// the option here too (`drvAsynSerialPort.c:470-472`).
         pub const IXANY: Option<libc::tcflag_t> = None;
         /// No `VSTART`/`VSTOP` indices exist: VxWorks `c_cc` runs `VINTR`,
         /// `VQUIT`, `VERASE`, `VKILL`, `VEOF`, `VMIN`, `VTIME` and nothing
@@ -314,8 +327,8 @@ mod platform {
 }
 
 /// C's refusal for an asyn option the platform's termios has no bit for:
-/// `"Option ixany not supported on vxWorks"` (`drvAsynSerialPort.c:469-471`,
-/// and `:488-490` for `ixoff`). Refusing is what C does, and it is the only
+/// `"Option ixany not supported on vxWorks"` (`drvAsynSerialPort.c:470-472`,
+/// and `:489-491` for `ixoff`). Refusing is what C does, and it is the only
 /// honest answer — accepting the key and dropping it would let `getOption`
 /// report a line state the hardware was never told about.
 fn option_unsupported_here(key: &str) -> AsynError {
@@ -423,7 +436,7 @@ impl SerialConfig {
 /// Map a baud rate to its termios speed code, or `None` if the rate is not
 /// settable on this platform.
 ///
-/// C parity (drvAsynSerialPort.c:271-345): on systems where the termios `Bxxx`
+/// C parity (drvAsynSerialPort.c:273-345): on systems where the termios `Bxxx`
 /// constants equal the literal baud rate — macOS and the BSDs, where
 /// `B9600 == 9600` — C uses the baud value itself as the speed code
 /// (`baudCode = baud`, line 274), so *any* rate is accepted including
@@ -519,7 +532,7 @@ fn baud_to_speed(baud: u32) -> Option<platform::Speed> {
 /// `asyn_baud_code_is_rate` selects *code*, but the question it answers is a
 /// property of the platform's constants, and C asks it as exactly that — a
 /// preprocessor test rather than a platform list
-/// (`drvAsynSerialPort.c:272-273`):
+/// (`drvAsynSerialPort.c:273`):
 ///
 /// ```c
 /// #if (defined(B300) && (B300 == 300) && defined(B9600) && (B9600 == 9600))
@@ -724,14 +737,28 @@ enum Wake {
 /// `writeTimeout == 0` behaviour — one non-blocking attempt, then bail — and
 /// keeping it here is why a `timeout == 0` write of a writable port still
 /// sends.
-fn wait_until(fd: &impl SerialFd, events: libc::c_short, deadline: Instant) -> AsynResult<Wake> {
+///
+/// `None` is the other end of the same rule: C starts no timer at all for a
+/// negative `pasynUser->timeout` (`if (tty->writeTimeout > 0)`,
+/// drvAsynSerialPort.c:809-816, and `VMIN = 1` for the read,
+/// :906-909), so the wait is unbounded and cannot expire.
+fn wait_until(
+    fd: &impl SerialFd,
+    events: libc::c_short,
+    deadline: Option<Instant>,
+) -> AsynResult<Wake> {
     loop {
-        let remaining = deadline.saturating_duration_since(Instant::now());
-        match fd.poll_ready(events, duration_to_poll_ms(remaining)) {
+        let ms = match deadline {
+            Some(deadline) => {
+                duration_to_poll_ms(deadline.saturating_duration_since(Instant::now()))
+            }
+            None => -1,
+        };
+        match fd.poll_ready(events, ms) {
             Ok(Some(revents)) => return Ok(Wake::Ready(revents)),
             Ok(None) => return Ok(Wake::Expired),
             Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {
-                if Instant::now() >= deadline {
+                if deadline.is_some_and(|d| Instant::now() >= d) {
                     return Ok(Wake::Expired);
                 }
             }
@@ -764,7 +791,7 @@ fn wake_error(revents: libc::c_short, ready: libc::c_short) -> Option<AsynError>
 }
 
 /// C `readIt`'s poll/read loop, bounded by one deadline.
-fn read_until(fd: &impl SerialFd, buf: &mut [u8], deadline: Instant) -> AsynResult<usize> {
+fn read_until(fd: &impl SerialFd, buf: &mut [u8], deadline: Option<Instant>) -> AsynResult<usize> {
     loop {
         let revents = match wait_until(fd, libc::POLLIN, deadline)? {
             Wake::Ready(revents) => revents,
@@ -790,7 +817,7 @@ fn read_until(fd: &impl SerialFd, buf: &mut [u8], deadline: Instant) -> AsynResu
                 if let Some(err) = wake_error(revents, libc::POLLIN) {
                     return Err(err);
                 }
-                if Instant::now() >= deadline {
+                if deadline.is_some_and(|d| Instant::now() >= d) {
                     return Err(timeout_err("serial read timeout"));
                 }
             }
@@ -801,13 +828,13 @@ fn read_until(fd: &impl SerialFd, buf: &mut [u8], deadline: Instant) -> AsynResu
 
 /// C `writeIt`'s poll/write loop on the same deadline.
 ///
-/// `transferred` is C's `*nbytesTransfered` (drvAsynSerialPort.c:849): it is
+/// `transferred` is C's `*nbytesTransfered` (drvAsynSerialPort.c:843): it is
 /// advanced in place so the count the port took survives every exit — timeout
 /// and fatal errno alike — instead of being dropped by the error.
 fn write_until(
     fd: &impl SerialFd,
     data: &[u8],
-    deadline: Instant,
+    deadline: Option<Instant>,
     transferred: &mut usize,
 ) -> AsynResult<()> {
     while *transferred < data.len() {
@@ -824,7 +851,7 @@ fn write_until(
                 // some bytes went out. A non-blocking poll that finds free
                 // space (a slow peer that drains a little each gap) would
                 // otherwise let the write run past the deadline.
-                if *transferred < data.len() && Instant::now() >= deadline {
+                if *transferred < data.len() && deadline.is_some_and(|d| Instant::now() >= d) {
                     return Err(timeout_err("serial write timeout"));
                 }
             }
@@ -836,7 +863,7 @@ fn write_until(
                 if let Some(err) = wake_error(revents, libc::POLLOUT) {
                     return Err(err);
                 }
-                if Instant::now() >= deadline {
+                if deadline.is_some_and(|d| Instant::now() >= d) {
                     return Err(timeout_err("serial write timeout"));
                 }
             }
@@ -862,7 +889,7 @@ impl OctetNext for SerialIoState {
             });
         }
 
-        let n = read_until(&fd, buf, Instant::now() + user.timeout)?;
+        let n = read_until(&fd, buf, user.timeout.map(|t| Instant::now() + t))?;
         self.n_read += n as u64; // C parity: tty->nRead += thisRead
         Ok(OctetReadResult {
             nbytes_transferred: n,
@@ -888,7 +915,12 @@ impl OctetNext for SerialIoState {
         // replaces it, so each `write` returns immediately with what fit (or
         // EAGAIN) and the poll/deadline loop bounds the whole write.
         let mut total = 0usize;
-        let result = write_until(&fd, data, Instant::now() + user.timeout, &mut total);
+        let result = write_until(
+            &fd,
+            data,
+            user.timeout.map(|t| Instant::now() + t),
+            &mut total,
+        );
         self.n_written += total as u64; // C parity: tty->nWritten += thisWrite
 
         match result {
@@ -928,9 +960,9 @@ pub struct DrvAsynSerialPort {
     ///
     /// C seeds it at configure (`CS8|CLOCAL|CREAD`, `IGNBRK|IGNPAR`, B9600 —
     /// :1077-1089), `setOption` mutates it unconditionally (whether or not
-    /// the port is open, :350-592), `applyOptions` pushes it to the device on
+    /// the port is open, :261-598), `applyOptions` pushes it to the device on
     /// every connect and after every successful option change (:105-130), and
-    /// `getOption` reads it back (:135-207). Options therefore survive a
+    /// `getOption` reads it back (:135-237). Options therefore survive a
     /// disconnect/reconnect and can be set while the port is down.
     ///
     /// The port previously had no cache: options were written straight to the
@@ -1018,7 +1050,7 @@ impl DrvAsynSerialPort {
             PortFlags {
                 multi_device: false,
                 can_block: true,
-                destructible: true,
+                ..PortFlags::default()
             },
         );
         base.init_connected(false);
@@ -1040,7 +1072,7 @@ impl DrvAsynSerialPort {
     }
 
     /// Configure a serial port the way C `drvAsynSerialPortConfigure`
-    /// does (`drvAsynSerialPort.c:1031-1126`): parse the device, honor
+    /// does (`drvAsynSerialPort.c:1032-1140`): parse the device, honor
     /// `noAutoConnect`, and enable EOS processing by default unless
     /// `noProcessEos`. C does this by passing `(noProcessEos ? 0 : 1)` to
     /// `pasynOctetBase->initialize`; the Rust octet stack expresses EOS
@@ -1153,7 +1185,7 @@ impl PortDriver for DrvAsynSerialPort {
     }
 
     /// C drvAsynSerialPort registers asynCommon, asynOption and asynOctet
-    /// (drvAsynSerialPort.c:1090-1110).
+    /// (drvAsynSerialPort.c:1095-1126).
     fn capabilities(&self) -> Vec<crate::interfaces::Capability> {
         crate::interfaces::octet_transport_capabilities()
     }
@@ -1300,7 +1332,7 @@ impl PortDriver for DrvAsynSerialPort {
             let _ = writeln!(out, "    Characters written: {}", self.io.n_written);
             let _ = writeln!(out, "       Characters read: {}", self.io.n_read);
             // The level is passed through, as C's `asynPortDriver::report`
-            // passes it to `reportParams` (asynPortDriver.cpp:3692).
+            // passes it to `reportParams` (asynPortDriver.cpp:3693).
             self.base.report_params(out, level);
         }
     }
@@ -1431,7 +1463,7 @@ impl PortDriver for DrvAsynSerialPort {
                 self.baud = baud as u32;
             }
             "bits" => {
-                // C compares the value string (drvAsynSerialPort.c:359-377), so
+                // C compares the value string (drvAsynSerialPort.c:360-378), so
                 // 5/6/7/8 and nothing else; the miss is "Invalid number of bits."
                 let bits = match value {
                     "5" => DataBits::Five,
@@ -1519,7 +1551,7 @@ impl PortDriver for DrvAsynSerialPort {
             "ixany" => {
                 // C validates the value before the platform check on POSIX,
                 // but refuses `ixany` on vxWorks without looking at it at all
-                // (drvAsynSerialPort.c:466-471) — the refusal is about the
+                // (drvAsynSerialPort.c:469-472) — the refusal is about the
                 // key, not the value, so it comes first.
                 let bit = platform::IXANY.ok_or_else(|| option_unsupported_here("ixany"))?;
                 if parse_yn_option(&key, value)? {
@@ -1551,7 +1583,7 @@ impl PortDriver for DrvAsynSerialPort {
                     // Where the platform has no drain the BREAK still goes out
                     // — only the guarantee that queued bytes precede it is
                     // lost. C weighs it the same way, ignoring tcdrain's return
-                    // entirely (drvAsynSerialPort.c:526), so a missing drain is
+                    // entirely (drvAsynSerialPort.c:519), so a missing drain is
                     // not grounds to refuse the break.
                     if let Some(res) = platform::drain(fd) {
                         res.map_err(AsynError::Io)?;
@@ -1580,7 +1612,7 @@ impl PortDriver for DrvAsynSerialPort {
                     return Err(AsynError::OptionNotFound(other.to_string()));
                 }
                 // The empty key is not an error: it means "re-apply", and the
-                // tail below does exactly that (C :609-615 runs applyOptions
+                // tail below does exactly that (C :599-616 runs applyOptions
                 // for it like any other key) — restoring the configured line
                 // state if another process changed the port underneath us.
             }
@@ -1601,11 +1633,11 @@ impl PortDriver for DrvAsynSerialPort {
 
     fn get_option(&self, key: &str) -> AsynResult<String> {
         // C `getOption` dispatches with `epicsStrCaseCmp` exactly as `setOption`
-        // does (:143-587), so both halves enter through the same normalisation
+        // does (:143-230), so both halves enter through the same normalisation
         // and a key set under any spelling reads back.
         let key = option_key(key);
         match key.as_str() {
-            // C `getOption` (drvAsynSerialPort.c:135-207) answers every key
+            // C `getOption` (drvAsynSerialPort.c:135-237) answers every key
             // from the cache — it never calls tcgetattr. So the readback is
             // the *configured* state whether or not the port is open, and it
             // agrees with what the next connect will push. Reading the live
@@ -1648,7 +1680,7 @@ impl PortDriver for DrvAsynSerialPort {
             }
             .to_string()),
             // The iflag family reads back from the same cache as the cflags —
-            // C getOption (drvAsynSerialPort.c:181-201) answers ixon/ixany/
+            // C getOption (drvAsynSerialPort.c:182-202) answers ixon/ixany/
             // ixoff from `tty->termios.c_iflag` on every POSIX target; the
             // hard-coded 'N' for ixany/ixoff there is inside `#ifdef vxWorks`,
             // where the flags genuinely have no termios home.
@@ -1666,8 +1698,8 @@ impl PortDriver for DrvAsynSerialPort {
             .to_string()),
             // Asymmetric with `set_option` on purpose, and C is asymmetric the
             // same way: `setOption` refuses `ixany` on vxWorks
-            // (drvAsynSerialPort.c:466-471) while `getOption` answers a
-            // hard-coded 'N' (:189-190) rather than erroring. Both are true
+            // (drvAsynSerialPort.c:469-472) while `getOption` answers a
+            // hard-coded 'N' (:191) rather than erroring. Both are true
             // statements about a line that has no such bit — the option cannot
             // be turned on, and it is not on.
             "ixany" => Ok(match platform::IXANY {
@@ -1697,7 +1729,7 @@ impl PortDriver for DrvAsynSerialPort {
 // --- RS485 support (Linux only) ---
 //
 // Mirror of `<linux/serial.h>` `struct serial_rs485` — same layout
-// used by `drvAsynSerialPort.c:76-77` (`struct serial_rs485 rs485`).
+// used by `drvAsynSerialPort.c:77` (`struct serial_rs485 rs485`).
 // Layout: 4 + 4 + 4 + 5*4 = 32 bytes. Pre-Linux-4.20 kernels read the
 // full 32-byte buffer in TIOCGRS485 / TIOCSRS485 even though only the
 // first three u32 fields carry data; the 5-word padding tail MUST be
@@ -2014,7 +2046,7 @@ mod tests {
     #[test]
     fn baud_arbitrary_on_bsd_mapped_set_on_linux() {
         // DRV-34: baud_to_speed is the single source of truth for which rates
-        // are settable. C (drvAsynSerialPort.c:271-345) accepts arbitrary rates
+        // are settable. C (drvAsynSerialPort.c:273-345) accepts arbitrary rates
         // where Bxxx == literal rate (macOS/BSD) and a fixed mapped set
         // elsewhere (Linux), erroring on the rest.
         assert!(baud_to_speed(9600).is_some(), "9600 is standard everywhere");
@@ -2410,7 +2442,7 @@ mod tests {
 
     /// DRV-36: the empty `set_option` key is not an error and, when the port is
     /// open, re-applies the configured line state to the device (C
-    /// drvAsynSerialPort.c setOption :609-615 → applyOptions :119-126, which
+    /// drvAsynSerialPort.c setOption :599-616 → applyOptions :121-126, which
     /// re-pushes the cached termios). Simulate another process clobbering the
     /// port's line settings and confirm the empty key restores the driver's
     /// configured state. CSTOPB is used as the observable: a single c_cflag bit
@@ -2783,7 +2815,7 @@ mod tests {
         assert_ne!(
             live.c_cflag & libc::CREAD,
             0,
-            "applyOptions still forces CREAD (C :119)"
+            "applyOptions still forces CREAD (C :121)"
         );
 
         // Disconnect/reconnect (the actor's auto-reconnect path): the cache is
@@ -2810,7 +2842,7 @@ mod tests {
     /// flag, exactly like the cflag family.
     ///
     /// C `getOption` answers all three from `tty->termios.c_iflag`
-    /// (drvAsynSerialPort.c:181-201) — the hard-coded 'N' for ixany/ixoff
+    /// (drvAsynSerialPort.c:182-202) — the hard-coded 'N' for ixany/ixoff
     /// lives inside `#ifdef vxWorks`. This port read the *live* termios when
     /// connected and returned a flat "N" when not, so on a closed port every
     /// one of them read "N" no matter what had been set, and there was no
@@ -3177,7 +3209,7 @@ mod tests {
         nonblocking("after connect");
 
         let mut user = AsynUser {
-            timeout: Duration::from_millis(200),
+            timeout: Some(Duration::from_millis(200)),
             ..Default::default()
         };
         drv.write_octet(&mut user, b"probe\n").unwrap();
@@ -3300,7 +3332,7 @@ mod tests {
 
     /// The refusal `platform`'s `None` arms lean on, checked for shape here
     /// since the arms themselves only compile on VxWorks. C's wording is
-    /// "Option ixany not supported on vxWorks" (drvAsynSerialPort.c:469-471).
+    /// "Option ixany not supported on vxWorks" (drvAsynSerialPort.c:470-472).
     #[test]
     fn unsupported_option_names_the_key_and_the_platform() {
         let msg = match option_unsupported_here("ixany") {
@@ -3317,7 +3349,7 @@ mod tests {
         );
     }
 
-    /// DRV-35: C setOption (drvAsynSerialPort.c:601-604) restores the previous
+    /// DRV-35: C setOption (drvAsynSerialPort.c:602-604) restores the previous
     /// baud/termios if applyOptions fails. The Rust driver must not leave the
     /// cached config reporting a value the device rejected. Point the driver at
     /// a non-tty fd so the apply path (tcgetattr/tcsetattr) fails, then assert
@@ -3407,7 +3439,7 @@ mod tests {
         };
         assert_eq!(err.status(), AsynStatus::Timeout, "got {err:?}");
         // R8-48: C `writeIt` publishes `*nbytesTransfered = numchars - nleft`
-        // on the timeout break (drvAsynSerialPort.c:849) — the bytes the port
+        // on the timeout break (drvAsynSerialPort.c:843) — the bytes the port
         // already took ride out *with* the timeout instead of being dropped.
         // This write drained part of the payload into the pty before the
         // deadline, so the count must be a real partial: neither 0 nor the
@@ -3547,8 +3579,12 @@ mod tests {
     fn read_reports_a_latched_poll_error_instead_of_retrying() {
         let fd = FakeFd::new(libc::POLLERR, 1000);
         let mut buf = [0u8; 8];
-        let err = read_until(&fd, &mut buf, Instant::now() + Duration::from_secs(30))
-            .expect_err("a latched POLLERR with EAGAIN must not read successfully");
+        let err = read_until(
+            &fd,
+            &mut buf,
+            Some(Instant::now() + Duration::from_secs(30)),
+        )
+        .expect_err("a latched POLLERR with EAGAIN must not read successfully");
         assert_eq!(err.status(), AsynStatus::Disconnected, "got {err:?}");
         assert_eq!(
             fd.polls.get(),
@@ -3568,7 +3604,7 @@ mod tests {
         let err = write_until(
             &fd,
             b"hello",
-            Instant::now() + Duration::from_secs(30),
+            Some(Instant::now() + Duration::from_secs(30)),
             &mut sent,
         )
         .expect_err("a latched POLLERR with EAGAIN must not write successfully");
@@ -3590,7 +3626,7 @@ mod tests {
         let fd = FakeFd::new(libc::POLLIN, u32::MAX);
         let mut buf = [0u8; 8];
         let start = Instant::now();
-        let err = read_until(&fd, &mut buf, start + Duration::from_millis(50))
+        let err = read_until(&fd, &mut buf, Some(start + Duration::from_millis(50)))
             .expect_err("a descriptor that never delivers must time out");
         assert_eq!(err.status(), AsynStatus::Timeout, "got {err:?}");
         assert!(
@@ -3616,8 +3652,12 @@ mod tests {
     fn a_sub_millisecond_budget_waits_a_whole_tick() {
         let fd = FakeFd::new(libc::POLLIN, u32::MAX);
         let mut buf = [0u8; 8];
-        let err = read_until(&fd, &mut buf, Instant::now() + Duration::from_micros(500))
-            .expect_err("the fake never delivers, so the read must time out");
+        let err = read_until(
+            &fd,
+            &mut buf,
+            Some(Instant::now() + Duration::from_micros(500)),
+        )
+        .expect_err("the fake never delivers, so the read must time out");
         assert_eq!(err.status(), AsynStatus::Timeout, "got {err:?}");
         assert_eq!(
             fd.first_ms.get(),
@@ -3637,7 +3677,7 @@ mod tests {
         let past = Instant::now()
             .checked_sub(Duration::from_millis(5))
             .expect("the monotonic clock is older than 5 ms");
-        let err = read_until(&fd, &mut buf, past)
+        let err = read_until(&fd, &mut buf, Some(past))
             .expect_err("an expired deadline cannot produce a successful read");
         assert_eq!(err.status(), AsynStatus::Timeout, "got {err:?}");
         assert_eq!(
@@ -3750,7 +3790,7 @@ mod tests {
     }
 
     /// C dispatches every option key through `epicsStrCaseCmp` on both halves —
-    /// `getOption` at `drvAsynSerialPort.c:143-587`, `setOption` at `:262-594` —
+    /// `getOption` at `drvAsynSerialPort.c:143-230`, `setOption` at `:261-598` —
     /// so a key the operator wrote as `BAUD`, which `set_option` already
     /// accepted, has to read back through `get_option` too. It used to fall
     /// past the lowercase literals into the generic option map and report

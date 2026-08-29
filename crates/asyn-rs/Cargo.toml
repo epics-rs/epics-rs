@@ -71,6 +71,21 @@ windows-sys = { version = "0.61", features = [
 ] }
 
 [dev-dependencies]
+# Dev-only and `path`-only, so `cargo package` drops it from the uploaded
+# manifest: the source guards in this crate share one production-slice rule.
+source-guard = { path = "../source-guard" }
+# Dev-only and `path`-only: the shared rule for a test that must NAME the port
+# its subject binds, so a number lost between the probe and the bind is a retry
+# and not a red test. Shared rather than copied because asyn-rs and epics-ca-rs
+# cannot see each other's `tests/`, and two copies of a retry rule are two
+# chances to retry on the wrong evidence.
+named-port = { path = "../named-port" }
+tempfile = "3"
+# The `#[epics_test]` attribute itself. Named directly rather than through
+# `epics_base_rs`, which re-exports it but is optional here: the lib's own
+# `#[cfg(test)]` bodies must build under `--no-default-features`, this crate's
+# declared embedded configuration.
+epics-macros-rs = { workspace = true }
 record-seam-gate = { path = "../../tools/record-seam-gate" }
 tokio = { version = "1", features = ["full", "test-util"] }
 # Tests only, and host-only. Production code reaches sockets through
@@ -95,8 +110,13 @@ harness = false
 # surface does. Declared as `required-features` rather than `#![cfg(feature =
 # "epics")]` inside each file: cargo then SKIPS the target, instead of
 # compiling a file whose contents have been cfg'd away to nothing, which reads
-# as a passing test that never ran. The other six files in `tests/` name only
-# the framework and are auto-discovered unchanged.
+# as a passing test that never ran. The other eight files in `tests/` name only
+# the framework and are auto-discovered unchanged; `tools/target-cfg-gate`
+# holds the two lists to each other, for every crate rather than this one.
+[[test]]
+name = "enum_property_post_mask"
+required-features = ["epics"]
+
 [[test]]
 name = "iocsh_port_is_traceable"
 required-features = ["epics"]
@@ -111,4 +131,12 @@ required-features = ["epics"]
 
 [[test]]
 name = "process_gate_tests"
+required-features = ["epics"]
+
+[[test]]
+name = "spc_nomod_fields_refuse_every_runtime_write"
+required-features = ["epics"]
+
+[[test]]
+name = "time_series_busy_post_mask"
 required-features = ["epics"]

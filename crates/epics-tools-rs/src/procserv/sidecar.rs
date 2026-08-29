@@ -115,7 +115,7 @@ pub struct LogFile {
     stamp_format: String,
     /// Tracks whether we're mid-line (no newline since last write).
     /// Matches the C `_log_stamp_sent` per-connection flag at
-    /// clientFactory.cc:138 — a stamp only fires at the start of
+    /// procServ.h:138 — a stamp only fires at the start of
     /// each new line, even when the PTY writes partial chunks.
     /// Sync mutex (parking_lot) because the critical section is
     /// pure CPU — no .await held while inspecting / mutating.
@@ -322,7 +322,7 @@ impl ListenAddress {
     /// token (`acceptFactory.cc:45-99`): `tcp:<ip>:<port>` (bare, no `[]`),
     /// `unix:<path>` for a filesystem socket, or `unix:@<name>` for an
     /// abstract socket. The TCP address is the one the kernel reported at
-    /// bind time (C `getsockname`, `acceptFactory.cc:184`), so a config
+    /// bind time (C `getsockname`, `acceptFactory.cc:222`), so a config
     /// that asked for port `0` publishes the real assigned port here.
     pub fn from_bound(pl: &PreboundListener) -> Self {
         let addr = match pl.bound_addr() {
@@ -393,7 +393,7 @@ pub fn render_procserv_info_env(info: &InfoSnapshot) -> String {
 ///
 /// Deriving from the bound listeners rather than the config is itself the
 /// C behavior: every acceptItem refreshes its address from the kernel
-/// after binding (`getsockname`, `acceptFactory.cc:184`), so with port `0`
+/// after binding (`getsockname`, `acceptFactory.cc:222`), so with port `0`
 /// C's info file carries the real assigned port — a config-derived render
 /// would publish the unusable `:0` placeholder instead.
 pub fn bound_addresses(listeners: &[PreboundListener]) -> Vec<ListenAddress> {
@@ -494,7 +494,7 @@ mod tests {
         // Control specs in CLI order: a TCP `:0` then a UNIX socket; the
         // log endpoint is another TCP `:0`. C head order is log first,
         // then control reversed — and every TCP token must carry the
-        // kernel-assigned port (C getsockname, acceptFactory.cc:184),
+        // kernel-assigned port (C getsockname, acceptFactory.cc:222),
         // never the `:0` placeholder from the config.
         let dir = tempfile::tempdir().unwrap();
         let sock = dir.path().join("ioc.sock");

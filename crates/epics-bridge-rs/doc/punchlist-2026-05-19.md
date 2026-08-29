@@ -6,8 +6,8 @@ Driver-managed punchlist. **Worker contract:**
 2. Before editing the cited line, run the **Anchor / Sites / Same defect / Distinct** audit per the global rule (see ~/.claude/CLAUDE.md "Fixes from reported defects"). Mandatory report header before edits.
 3. NEVER emit: `TODO`, `FIXME`, `unimplemented!()`, `#[allow(...)]` (to silence), `// later`, "next session", "out of scope" (unless user-scoped this round), "scope이 크다", "위험합니다", "다음에", "defer".
 4. **Upstream parity is the bar — no inventing semantics.** Every design decision (values, edge cases, where behaviour applies, defaults) MUST be grounded in the upstream C++ reference:
-   - pvxs:       `/Users/stevek/codes/pvxs`
-   - epics-base: `/Users/stevek/codes/epics-base`
+   - pvxs:       `$PVXS_HOME`
+   - epics-base: `$EPICS_BASE`
    Use `rg` in those trees BEFORE making decisions. Commit message and end-of-task report MUST include an **Upstream parity** section listing `pvxs:file:line` and/or `epics-base:file:line` your implementation mirrors for each behaviour. If you cannot find the upstream reference for a sub-behaviour, STOP and report — do NOT invent.
 5. Root cause fix at source. Comment-only "fix" = rejected. Type/API closure preferred over local patches when the global rule's "Invariant-driven fixes" section applies.
 5. After edits: `cargo fmt --all` → `cargo clippy -p epics-bridge-rs --all-targets -- -D warnings` → `cargo nextest run -p epics-bridge-rs`. If your change crosses crate boundaries, escalate to `--workspace`. Doctest changes → `cargo test --doc -p epics-bridge-rs`.
@@ -25,13 +25,39 @@ When all items checked, run full-workspace `cargo clippy --workspace --all-targe
 
 ---
 
+## C reference pins
+
+Every C/C++ citation in this file resolves at the tree and revision below,
+not at whatever the env-var checkout holds today — those checkouts run ahead
+of their pins, so a citation checked against one can be graded wrong while
+being right, or graded right after drifting into a neighbouring construct.
+The resolve-by-symbol rule, the shared-basename rule and the verification of
+each pin are in `c-reference-pins.md`.
+
+| tree | pinned revision | cited here |
+| --- | --- | --- |
+| `pvxs` | `1.5.1-42-gb568e93` | `clientconn.cpp`, `credentials.cpp`, `dataencode.cpp`, `groupconfigprocessor.cpp`, `groupsource.cpp`, `securityclient.cpp`, `servermon.cpp`, and the `ioc/pvalink*.cpp` set |
+| `epics-base` | `R7.0.10` | `asLibRoutines.c`, `asLib_lex.l`, `dbLock.c` |
+
+Every `pvalink*.cpp` exists in both `pvxs` and `pva2pva`, so the basename
+alone resolves in the wrong file without failing. The pvalink items here mean
+the pvxs copies under `ioc/` — `pvaGetDBFtype` and `pvaGetElements` land
+exactly at `ioc/pvalink_lset.cpp:199,242` at the pin, and pva2pva's `pdbApp`
+copy has no `ioc::DBManyLock` at all.
+
+Rust `*.rs` citations are in-repo and carry no pin: they resolve at the
+current worktree, not at the commit this review was written on. Where the
+reviewed code has since been fixed, moved or replaced, the line names the
+construct that now carries the behaviour and the sentence says so.
+
+
 ## Items (ordered by review-doc priority block)
 
 ### Priority 1 — ACF/identity/RPC protection
 
 - [x] **BR-R4** — QSRV ACF adapter collapses method/authority/roles and field ASL.
   - Spec: `crates/epics-bridge-rs/doc/pvxs-functional-security-review-2026-05-18.md:153-176`
-  - Done: worker B, commit `db9a79e4` on `caucus/HJB9ABPH/backend` (+ doc tracker commit `2a58c9d9` on main); regression `br_r4_acf_method_authority_roles_field_asl`. Cross-crate: also touched `epics-base-rs/src/server/access_security.rs` (quoted-string support in `read_brace_list`). Upstream parity: pvxs credentials.cpp:31-45; securityclient.cpp:25,42-45; epics-base asLibRoutines.c:1006; asLib_lex.l.
+  - Done: worker B, commit `db9a79e4` on `caucus/HJB9ABPH/backend` (+ doc tracker commit `2a58c9d9` on main); regression `br_r4_acf_method_authority_roles_field_asl`. Cross-crate: also touched `epics-base-rs/src/server/access_security.rs` (quoted-string support in `read_brace_list`). Upstream parity: pvxs credentials.cpp:31-45; securityclient.cpp:25-30,42-46; epics-base asLibRoutines.c:1006; asLib_lex.l.
 
 - [x] **BR-R21** — PVA gateway READ/MONITOR upstream authorization uses the shared cache client.
   - Spec: `crates/epics-bridge-rs/doc/pvxs-functional-security-review-2026-05-18.md:604-632`
@@ -41,7 +67,7 @@ When all items checked, run full-workspace `cargo clippy --workspace --all-targe
 
 - [x] **BR-R11** — pvalink OUT writes do not preserve `field`, `proc`, `block`, or deferred option semantics from the DB link.
   - Spec: `crates/epics-bridge-rs/doc/pvxs-functional-security-review-2026-05-18.md:327-357`
-  - Done: worker B, commit `a198da48` on `caucus/HJB9ABPH/backend`; regression `br_r11_pvalink_out_options_preserved`. Cross-crate: also touched `epics-pva-rs` (added `op_put_field_with_request`, `op_put_value_raw`, `pvput_field_with_request`, `pvput_pv_field_with_request`). Upstream parity: pvxs pvalink_channel.cpp:28-47 (putReq template), :138 (field targeting), :220-263 (process computation), :223 (block), :268 (PUT); pvalink_lset.cpp:647 (defer/wait).
+  - Done: worker B, commit `a198da48` on `caucus/HJB9ABPH/backend`; regression `br_r11_pvalink_out_options_preserved`. Cross-crate: also touched `epics-pva-rs` (added `op_put_field_with_request`, `op_put_value_raw`, `pvput_field_with_request`, `pvput_pv_field_with_request`). Upstream parity: pvxs ioc/pvalink_channel.cpp:28-47 (putReq template), :138 (field targeting), :220-263 (process computation), :223 (block), :268 (PUT); ioc/pvalink_lset.cpp:650-653 (defer/wait).
 
 ### Priority 4 — DB pvalink / group syntax/options
 
@@ -87,27 +113,27 @@ When all items checked, run full-workspace `cargo clippy --workspace --all-targe
 
 - [x] **BR-R15** — QSRV atomic group PUT is not DBManyLock-equivalent.
   - Spec: `crates/epics-bridge-rs/doc/pvxs-functional-security-review-2026-05-18.md:444-469`
-  - Done: Track C, commit `b093d49e`; regression `br_r15_atomic_group_excludes_direct_member_write` + `br_r15_atomic_put_blocks_on_member_record_gates`. Uses the unified `epics-base-rs` `record_lock` registry (`PvDatabase::lock_record` / `lock_records`). Upstream parity: pvxs `groupconfigprocessor.cpp:1165`, `groupsource.cpp:444,569`; epics-base `dbScanLock`.
+  - Done: Track C, commit `b093d49e`; regression `br_r15_atomic_group_excludes_direct_member_write` + `br_r15_atomic_put_blocks_on_member_record_gates`. Uses the unified `epics-base-rs` `record_lock` registry (`PvDatabase::lock_record` / `lock_records`). Upstream parity: pvxs `groupconfigprocessor.cpp:1165`, `groupsource.cpp:621,645`; epics-base `dbScanLock`.
 
 - [x] **BR-R18** — pvalink `atomic` scan-on-update lacks a multi-record lock epoch.
   - Spec: `crates/epics-bridge-rs/doc/pvxs-functional-security-review-2026-05-18.md:524-548`
-  - Done: Track D, commit `eff1848f`; regression `br_r18_atomic_scan_holds_multi_record_lock_epoch`. pvalink atomic scan holds the unified `record_lock` epoch (`PvDatabase::lock_records`) across the atomic target loop, released at the atomic→non-atomic boundary. Upstream parity: pvxs `pvalink_channel.cpp:386,422`; epics-base `dbLock.c:349,384`.
+  - Done: Track D, commit `eff1848f`; regression `br_r18_atomic_scan_holds_multi_record_lock_epoch`. pvalink atomic scan holds the unified `record_lock` epoch (`PvDatabase::lock_records`) across the atomic target loop, released at the atomic→non-atomic boundary. Upstream parity: pvxs `ioc/pvalink_channel.cpp:409,422-427`; epics-base `dbLock.c:384,448`.
 
 ### Priority 9 — Group monitor metadata / archive events (residuals)
 
 - [x] **BR-R29-RESIDUAL** — Group default `+trigger` SelfOnly variant exists but wire BitSet narrowing for SelfOnly is the residual gap.
   - Spec: `crates/epics-bridge-rs/doc/pvxs-functional-security-review-2026-05-18.md:819-844` and Cleared note `:58`
-  - Done: Track C, commit `ee250057`; regressions `br_r29_diff_changed_bitset_marks_only_changed_leaves`, `br_r29_partial_monitor_payload_narrows_changed_bitset`, `br_r29_pure_self_trigger_predicate`. New `ChannelSource::monitor_emits_partial`, `encode::diff_changed_bitset`, `build_monitor_payload_partial`. Upstream parity: pvxs `groupsource.cpp:235,288,303`, `dataencode.cpp:414-437`.
+  - Done: Track C, commit `ee250057`; regressions `br_r29_diff_changed_bitset_marks_only_changed_leaves`, `br_r29_partial_monitor_payload_narrows_changed_bitset`, `br_r29_pure_self_trigger_predicate`. New `ChannelSource::monitor_emits_partial`, `encode::diff_changed_bitset`, `build_monitor_payload_partial`. Upstream parity: pvxs `groupsource.cpp:268,279,280`, `dataencode.cpp:414-437`.
 
 - [x] **BR-R33-RESIDUAL** — Per-op queueSize negotiation is the residual gap (group GET/MONITOR carries root options already).
   - Spec: `crates/epics-bridge-rs/doc/pvxs-functional-security-review-2026-05-18.md:920-944` and Cleared note `:59`
-  - Done: Track C, commit `16309573`; regression `br_r33_group_monitor_stamps_negotiated_queue_size`. `negotiated_queue_size(pvRequest)` threaded through `GroupMonitor::with_queue_size`. Upstream parity: pvxs `servermon.cpp:66,313,533-540`.
+  - Done: Track C, commit `16309573`; regression `br_r33_group_monitor_stamps_negotiated_queue_size`. `negotiated_queue_size(pvRequest)` threaded through `GroupMonitor::with_queue_size`. Upstream parity: pvxs `servermon.cpp:66,313,533-544`.
 
 ### Priority 10 — pvalink value conversion / metadata hooks
 
 - [x] **BR-R24** — pvalink DB link metadata hooks are mostly absent.
   - Spec: `crates/epics-bridge-rs/doc/pvxs-functional-security-review-2026-05-18.md:686-712`
-  - Done: Track D, commit `142aa474`; regressions `br_r24_link_metadata_surfaces_remote_display_control_valuealarm`, `br_r24_link_metadata_none_when_disconnected_and_enum_maps_to_dbf_enum`. New `LinkDbfType` + `LinkMetadata` + `LinkSet::link_metadata` hook in epics-base-rs; `PvaLinkResolver` impl. Upstream parity: pvxs `pvalink_lset.cpp:199,242,437,454,474,499,516,700`.
+  - Done: Track D, commit `142aa474`; regressions `br_r24_link_metadata_surfaces_remote_display_control_valuealarm`, `br_r24_link_metadata_none_when_disconnected_and_enum_maps_to_dbf_enum`. New `LinkDbfType` + `LinkMetadata` + `LinkSet::link_metadata` hook in epics-base-rs; `PvaLinkResolver` impl. Upstream parity: pvxs `ioc/pvalink_lset.cpp:199,242,444,462,480,505,522,706`.
 
 ### Priority 12 — Gateway monitor fanout
 

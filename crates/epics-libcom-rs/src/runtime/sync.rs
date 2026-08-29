@@ -26,7 +26,7 @@ pub use tokio::sync::{Mutex, Notify, RwLock, broadcast, mpsc, oneshot};
 /// tracing sinks) where we hold a mutex while running with
 /// SCHED_FIFO / SCHED_RR.
 #[cfg(all(target_os = "linux", feature = "linux-rt"))]
-pub type PriorityInheritanceMutex<T> = pi_mutex::PiMutex<T>;
+type MutexBackend<T> = pi_mutex::PiMutex<T>;
 
 /// The RTEMS arm, and it is **not** behind a Cargo feature.
 ///
@@ -45,13 +45,41 @@ pub type PriorityInheritanceMutex<T> = pi_mutex::PiMutex<T>;
 /// So this is the same construction on the same API as C — including C's
 /// probe-and-fall-back, see `pi_mutex::protocol` below.
 #[cfg(target_os = "rtems")]
-pub type PriorityInheritanceMutex<T> = pi_mutex::PiMutex<T>;
+type MutexBackend<T> = pi_mutex::PiMutex<T>;
 
 /// Non-RT fallback — uses `parking_lot::Mutex` for the common case.
 /// PI semantics are not needed because the scheduler does not
 /// preempt the lock holder by priority.
 #[cfg(not(any(all(target_os = "linux", feature = "linux-rt"), target_os = "rtems")))]
-pub type PriorityInheritanceMutex<T> = parking_lot::Mutex<T>;
+type MutexBackend<T> = parking_lot::Mutex<T>;
+
+/// C `epicsMutexId` — the mutex every EPICS lock in this port is built from,
+/// and the only one `epicsMutexShowAll` can see.
+///
+/// A newtype over `MutexBackend` rather than a bare alias to it, for the
+/// same reason C wraps a `pthread_mutex_t` in an `epicsMutexParm`: the mutex
+/// has to be *findable*. C `calloc`s a node carrying the creation site,
+/// `ellAdd`s it to a process-global `mutexList` under `epicsMutexGlobalLock`
+/// (`epicsMutex.cpp:72-93`), and `ellDelete`s it in `epicsMutexDestroy`
+/// (`:105-113`); `epicsMutexShowAll` then walks that list, and — this is what
+/// forces the shape — *try-locks each entry* to answer `onlyLocked`
+/// (`:129-146`).
+///
+/// Try-locking from the list means the list must hold something addressable,
+/// so the backend goes in a `Box` allocated before registration and freed
+/// after deregistration. That is C's node, exactly: a value that never moves
+/// for its whole life. The public type moving is then a pointer move, which
+/// is why the twenty call sites — struct fields, `Box<[_]>` elements,
+/// `Box::leak`ed gates — need no change and cannot invalidate an entry.
+/// Registering the value itself instead would leave a dangling address the
+/// first time a caller moved one, and `PvDatabase::new` moves two into an
+/// `Arc` at IOC init.
+///
+/// The creation site is [`std::panic::Location::caller`], which is C's
+/// `__FILE__`/`__LINE__` reached without a macro: `epicsMutexCreate` is
+/// `epicsMutexOsiCreate(__FILE__, __LINE__)` and `#[track_caller]` records the
+/// same two facts at the same place.
+pub type PriorityInheritanceMutex<T> = epics_mutex::EpicsMutex<T>;
 
 /// The guard `PriorityInheritanceMutex::lock` hands out, nameable so a
 /// caller can *store* one — the per-record write gate
@@ -244,7 +272,7 @@ mod pi_mutex {
     /// RTEMS 6 binds a POSIX mutex to **its own address**: `pthread_mutex_init`
     /// stores `flags = ((uintptr_t) mutex ^ POSIX_MUTEX_MAGIC) | protocol`, and
     /// every later operation recomputes that from the address it is handed —
-    /// `POSIX_MUTEX_VALIDATE_OBJECT` (`rtems/posix/muteximpl.h:445-459`,
+    /// `POSIX_MUTEX_VALIDATE_OBJECT` (`rtems/posix/muteximpl.h:445-459` (`rtems_6`),
     /// magic at `:64`) returns **`EINVAL`** when they disagree. So a
     /// `pthread_mutex_t` that is *relocated* after being initialised is dead:
     /// not slow, not unordered — every `lock` fails.
@@ -253,9 +281,8 @@ mod pi_mutex {
     /// in a stack local and then moved the struct out by value (and callers
     /// move it again — `record_lock`'s gates are `Box::leak(Box::new(…))`), so
     /// on target the first `lock()` returned 22 and the assertion below took
-    /// the IOC down at boot. Measured, `doc/rtems-priority-locks-design.md`
-    /// §5 step 7; invisible on Linux because glibc's mutex carries no address
-    /// in its state and survives the move.
+    /// the IOC down at boot. Measured; invisible on Linux because glibc's
+    /// mutex carries no address in its state and survives the move.
     ///
     /// Boxing makes the invariant hold **by construction**: the mutex is
     /// allocated first and initialised at the address it will keep for its
@@ -308,10 +335,25 @@ mod pi_mutex {
         }
 
         /// The address `pthread_mutex_init` was called with — the one RTEMS
-        /// validates every later operation against.
-        #[cfg(test)]
+        /// validates every later operation against, and the one
+        /// `epicsMutexOsdShow` prints as `uaddr`.
         pub fn raw_addr(&self) -> usize {
             self.inner.get() as usize
+        }
+
+        /// `pthread_mutex_trylock`, the call C's `onlyLocked` filter makes on
+        /// every list entry (`epicsMutex.cpp:137-142`).
+        pub fn try_lock(&self) -> Option<PiMutexGuard<'_, T>> {
+            // SAFETY: `trylock` never blocks, and the guard returned here
+            // unlocks from this same thread, so POSIX's unlock-by-owner rule
+            // holds.
+            if unsafe { libc::pthread_mutex_trylock(self.inner.get()) } != 0 {
+                return None;
+            }
+            Some(PiMutexGuard {
+                mutex: self,
+                _not_send: std::marker::PhantomData,
+            })
         }
 
         pub fn lock(&self) -> PiMutexGuard<'_, T> {
@@ -409,9 +451,413 @@ mod pi_mutex {
     }
 }
 
+/// C `epicsMutex.cpp`'s `mutexList` and the node on it.
+///
+/// The whole module exists so `epicsMutexShowAll` can answer the question it
+/// is run to answer — *which lock is held right now* — rather than only how
+/// many exist. That answer needs a try-lock through a stable address, which is
+/// what pins the `Box` and the `Drop`.
+mod epics_mutex {
+    use std::sync::Mutex;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    use super::MutexBackend;
+
+    /// One entry of C's `mutexList` (`epicsMutex.cpp:39`).
+    ///
+    /// `probe` is the entry's own `try_lock`, monomorphised for the `T` that
+    /// registered it and then type-erased to a plain function pointer. C needs
+    /// no equivalent because its node's payload is opaque bytes; here the
+    /// backend is generic, and the list must be one list.
+    struct Entry {
+        id: u64,
+        file: &'static str,
+        line: u32,
+        addr: usize,
+        osd_addr: usize,
+        probe: unsafe fn(usize) -> bool,
+    }
+
+    /// Creation order, as C's `ellAdd` appends.
+    static MUTEXES: Mutex<Vec<Entry>> = Mutex::new(Vec::new());
+    static NEXT_ID: AtomicU64 = AtomicU64::new(1);
+
+    /// A poisoned list is still a readable list — the same reasoning as the
+    /// thread registry's: a panic while formatting one row must not make the
+    /// IOC's lock report permanently unavailable.
+    fn lock() -> std::sync::MutexGuard<'static, Vec<Entry>> {
+        MUTEXES.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// C `epicsMutexId` (`epicsMutex.cpp:72-93`) — see
+    /// [`PriorityInheritanceMutex`](super::PriorityInheritanceMutex) for why
+    /// this is a newtype and not an alias.
+    pub struct EpicsMutex<T> {
+        /// Allocated before registration and freed after deregistration, so
+        /// the address in the list is valid for exactly as long as the list
+        /// holds it.
+        inner: Box<MutexBackend<T>>,
+        id: u64,
+    }
+
+    impl<T> EpicsMutex<T> {
+        /// C `epicsMutexCreate()` — `epicsMutexOsiCreate(__FILE__, __LINE__)`.
+        #[track_caller]
+        pub fn new(value: T) -> Self {
+            let inner = Box::new(MutexBackend::new(value));
+            let caller = std::panic::Location::caller();
+            let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
+            lock().push(Entry {
+                id,
+                file: caller.file(),
+                line: caller.line(),
+                addr: &*inner as *const MutexBackend<T> as usize,
+                osd_addr: osd_addr(&inner),
+                probe: probe_locked::<T>,
+            });
+            Self { inner, id }
+        }
+
+        pub fn lock(&self) -> super::PriorityInheritanceMutexGuard<'_, T> {
+            self.inner.lock()
+        }
+
+        /// C `epicsMutexTryLock`. Also what [`report`] calls through `probe`.
+        pub fn try_lock(&self) -> Option<super::PriorityInheritanceMutexGuard<'_, T>> {
+            self.inner.try_lock()
+        }
+
+        /// The address `pthread_mutex_init` was called with — the one RTEMS
+        /// validates every later operation against, and the one C's
+        /// `epicsMutexOsdShow` prints as `uaddr`.
+        #[cfg(any(all(target_os = "linux", feature = "linux-rt"), target_os = "rtems"))]
+        pub fn raw_addr(&self) -> usize {
+            self.inner.raw_addr()
+        }
+    }
+
+    /// C `epicsMutexDestroy` (`epicsMutex.cpp:105-113`): off the list first,
+    /// under the list lock, and only then freed. A walk holding that lock can
+    /// therefore dereference every address it is looking at.
+    impl<T> Drop for EpicsMutex<T> {
+        fn drop(&mut self) {
+            let id = self.id;
+            lock().retain(|entry| entry.id != id);
+        }
+    }
+
+    /// `parking_lot::Mutex` has `Debug`, so this must too — a `#[derive(Debug)]`
+    /// on a struct holding one would otherwise break on whichever arm lacked it.
+    impl<T: std::fmt::Debug> std::fmt::Debug for EpicsMutex<T> {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            self.inner.fmt(f)
+        }
+    }
+
+    #[cfg(any(all(target_os = "linux", feature = "linux-rt"), target_os = "rtems"))]
+    fn osd_addr<T>(inner: &MutexBackend<T>) -> usize {
+        inner.raw_addr()
+    }
+
+    /// The fallback backend has no OS object under it, so the address that
+    /// stands in for C's `uaddr` is the lock's own — see [`super::MUTEX_OSD_LABEL`],
+    /// which says which of the two this build printed.
+    #[cfg(not(any(all(target_os = "linux", feature = "linux-rt"), target_os = "rtems")))]
+    fn osd_addr<T>(inner: &MutexBackend<T>) -> usize {
+        inner as *const MutexBackend<T> as usize
+    }
+
+    /// # Safety
+    ///
+    /// `addr` must be the address a live `Box<MutexBackend<T>>` was registered
+    /// with, for the same `T`. [`report`] calls this only while holding the
+    /// list lock, and [`EpicsMutex::drop`] removes the entry under that same
+    /// lock before the box is freed, so an address reachable here is live.
+    unsafe fn probe_locked<T>(addr: usize) -> bool {
+        let backend = unsafe { &*(addr as *const MutexBackend<T>) };
+        match backend.try_lock() {
+            Some(guard) => {
+                drop(guard);
+                false
+            }
+            None => true,
+        }
+    }
+
+    /// One row of C's `epicsMutexShow` (`epicsMutex.cpp:118-127`).
+    #[derive(Clone, Debug)]
+    pub struct MutexInfo {
+        addr: usize,
+        osd_addr: usize,
+        file: &'static str,
+        line: u32,
+    }
+
+    impl MutexInfo {
+        /// C prints the node address as the mutex's identity; this is that
+        /// address, and it is stable for the mutex's whole life.
+        pub fn addr(&self) -> usize {
+            self.addr
+        }
+
+        /// Where the mutex was created — C's `pFileName` and `lineno`.
+        pub fn file(&self) -> &'static str {
+            self.file
+        }
+
+        pub fn line(&self) -> u32 {
+            self.line
+        }
+
+        /// C `epicsMutexShow` plus, above `level` 0, `epicsMutexOsdShow`
+        /// (`os/posix/osdMutex.c:188-195`).
+        pub fn show_lines(&self, level: u32) -> Vec<String> {
+            let mut lines = vec![format!(
+                "epicsMutexId {:#x} source {} line {}",
+                self.addr, self.file, self.line
+            )];
+            if level > 0 {
+                lines.push(format!(
+                    "    {} uaddr={:#x}",
+                    super::MUTEX_OSD_LABEL,
+                    self.osd_addr
+                ));
+            }
+            lines
+        }
+    }
+
+    /// What C prints from one `epicsMutexShowAll` call: the whole list's
+    /// length, then the rows that passed `onlyLocked`.
+    ///
+    /// Both come out of one lock acquisition. C reads `ellCount` outside the
+    /// list lock and walks inside it (`epicsMutex.cpp:133-136`), so its count
+    /// and its rows can disagree by a mutex created in between; there is no
+    /// reason to reproduce that.
+    pub struct MutexReport {
+        pub total: usize,
+        pub shown: Vec<MutexInfo>,
+    }
+
+    /// C `epicsMutexShowAll`'s list walk (`epicsMutex.cpp:129-146`).
+    ///
+    /// `only_locked` is C's try-lock filter. C's mutexes are recursive, so its
+    /// filter reads "held by another thread"; this port's are not reentrant
+    /// (see `server::database::record_lock`), so the filter reads "cannot be
+    /// acquired right now". The two agree for every caller that matters — the
+    /// iocsh thread holds none of these locks while running the command — and
+    /// the second is the honest phrasing of a non-recursive lock's try-lock.
+    pub fn report(only_locked: bool) -> MutexReport {
+        let entries = lock();
+        let mut shown = Vec::new();
+        for entry in entries.iter() {
+            if only_locked {
+                // SAFETY: see `probe_locked`. The list lock is held here, and
+                // deregistration takes it before freeing.
+                if !unsafe { (entry.probe)(entry.addr) } {
+                    continue;
+                }
+            }
+            shown.push(MutexInfo {
+                addr: entry.addr,
+                osd_addr: entry.osd_addr,
+                file: entry.file,
+                line: entry.line,
+            });
+        }
+        MutexReport {
+            total: entries.len(),
+            shown,
+        }
+    }
+}
+
+pub use epics_mutex::{MutexInfo, MutexReport};
+
+/// What this build's mutex actually is, for the `uaddr` line C prints from
+/// `epicsMutexOsdShow`. Naming it `pthread_mutex_t*` on the fallback arm would
+/// claim an OS object that arm does not create.
+#[cfg(any(all(target_os = "linux", feature = "linux-rt"), target_os = "rtems"))]
+pub const MUTEX_OSD_LABEL: &str = "pthread_mutex_t*";
+
+/// See [`MUTEX_OSD_LABEL`].
+#[cfg(not(any(all(target_os = "linux", feature = "linux-rt"), target_os = "rtems")))]
+pub const MUTEX_OSD_LABEL: &str = "parking_lot::Mutex*";
+
+/// Every EPICS mutex in the process, filtered as C's `onlyLocked` filters —
+/// `epicsMutexShowAll`'s list walk.
+pub fn mutex_report(only_locked: bool) -> MutexReport {
+    epics_mutex::report(only_locked)
+}
+
+/// C `epicsMutexOsdShowAll` (`os/posix/osdMutex.c:197-210`), the line
+/// `epicsMutexShowAll` prints between the count and the rows.
+///
+/// C has a third answer, `PI not supported`, for a build where
+/// `_POSIX_THREAD_PRIO_INHERIT` is undefined. There is no such build here: the
+/// fallback arm is a deliberate choice not to use a pthread mutex at all, so
+/// the honest report is that PI is not enabled, which is what
+/// [`is_pi_mutex_active`] already answers.
+pub fn osd_show_all_line() -> &'static str {
+    if is_pi_mutex_active() {
+        "PI is enabled"
+    } else {
+        "PI is not enabled"
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The creation site C records as `__FILE__`/`__LINE__`, and the two
+    /// moments the entry exists between: C `ellAdd` in `epicsMutexOsiCreate`
+    /// and `ellDelete` in `epicsMutexDestroy`.
+    #[test]
+    fn an_entry_lasts_exactly_as_long_as_its_mutex() {
+        let expected_line = line!() + 1;
+        let m: PriorityInheritanceMutex<i32> = PriorityInheritanceMutex::new(5);
+        let addr = find_entry(&m).expect("registered at construction").addr();
+
+        let entry = find_entry(&m).unwrap();
+        assert_eq!(entry.file(), file!(), "C's `pFileName` is the caller's");
+        assert_eq!(entry.line(), expected_line, "C's `lineno` is the caller's");
+
+        drop(m);
+        assert!(
+            !mutex_report(false).shown.iter().any(|e| e.addr() == addr),
+            "the entry must come off the list before the mutex is freed"
+        );
+    }
+
+    /// Locate `m`'s own row, which is the only way to test a process-global
+    /// list that other code also registers into.
+    fn find_entry<T>(m: &PriorityInheritanceMutex<T>) -> Option<MutexInfo> {
+        let want = mutex_addr(m);
+        mutex_report(false)
+            .shown
+            .into_iter()
+            .find(|e| e.addr() == want)
+    }
+
+    /// The address the list holds, reached the same way `new` computed it.
+    fn mutex_addr<T>(m: &PriorityInheritanceMutex<T>) -> usize {
+        // One row per mutex, so the row that reports this file and this
+        // mutex's line is this mutex — except that two mutexes can share a
+        // line, which is why the tests that need identity capture the addr
+        // once and compare against it afterwards.
+        let guard = m.try_lock();
+        let held = guard.is_none();
+        drop(guard);
+        assert!(!held, "helper must not be called on a held mutex");
+        // The registered address is the boxed backend's, and `try_lock`
+        // proved this mutex is the free one; find it by elimination on the
+        // locked probe.
+        let before: Vec<usize> = mutex_report(true).shown.iter().map(|e| e.addr()).collect();
+        let _g = m.lock();
+        let after: Vec<usize> = mutex_report(true).shown.iter().map(|e| e.addr()).collect();
+        after.into_iter().find(|a| !before.contains(a)).unwrap()
+    }
+
+    /// C's `onlyLocked` boundary, both sides of it: the filter try-locks every
+    /// entry and keeps the ones it could not take.
+    #[test]
+    fn only_locked_keeps_exactly_the_held_mutexes() {
+        let m: PriorityInheritanceMutex<i32> = PriorityInheritanceMutex::new(0);
+        let addr = mutex_addr(&m);
+        // A second, never-held mutex, so "the filter excludes something" is a
+        // property of this test and not of whatever else the process created.
+        let other: PriorityInheritanceMutex<i32> = PriorityInheritanceMutex::new(0);
+        let other_addr = mutex_addr(&other);
+
+        let free = mutex_report(true);
+        assert!(
+            !free.shown.iter().any(|e| e.addr() == addr),
+            "an unheld mutex must not be listed under onlyLocked"
+        );
+
+        let guard = m.lock();
+        let held = mutex_report(true);
+        assert!(
+            held.shown.iter().any(|e| e.addr() == addr),
+            "a held mutex must be listed under onlyLocked"
+        );
+        assert_eq!(
+            held.total, free.total,
+            "the count is the whole list, not the filtered rows — C prints \
+             `ellCount(&mutexList)` before it filters"
+        );
+        assert!(
+            !held.shown.iter().any(|e| e.addr() == other_addr),
+            "the filter must exclude the mutex nobody holds"
+        );
+        assert!(
+            held.shown.len() < held.total,
+            "{} of {}",
+            held.shown.len(),
+            held.total
+        );
+        drop(guard);
+
+        assert!(!mutex_report(true).shown.iter().any(|e| e.addr() == addr));
+    }
+
+    /// The address in the list is the boxed backend's, so it survives moving
+    /// the mutex — the property that makes the `onlyLocked` probe sound. A
+    /// registry of addresses of the values themselves would dangle here.
+    #[test]
+    fn the_registered_address_survives_moving_the_mutex() {
+        let m: PriorityInheritanceMutex<i32> = PriorityInheritanceMutex::new(1);
+        let addr = mutex_addr(&m);
+        let moved = Box::new(m);
+        assert_eq!(mutex_addr(&moved), addr);
+        assert!(mutex_report(false).shown.iter().any(|e| e.addr() == addr));
+        drop(moved);
+        assert!(!mutex_report(false).shown.iter().any(|e| e.addr() == addr));
+    }
+
+    /// C `epicsMutexShow` prints one line; `epicsMutexOsdShow` adds the second
+    /// only above level 0.
+    #[test]
+    fn show_lines_adds_the_osd_line_only_above_level_zero() {
+        let m: PriorityInheritanceMutex<i32> = PriorityInheritanceMutex::new(0);
+        let entry = find_entry(&m).unwrap();
+
+        let plain = entry.show_lines(0);
+        assert_eq!(plain.len(), 1);
+        assert_eq!(
+            plain[0],
+            format!(
+                "epicsMutexId {:#x} source {} line {}",
+                entry.addr(),
+                entry.file(),
+                entry.line()
+            )
+        );
+
+        let detailed = entry.show_lines(1);
+        assert_eq!(detailed.len(), 2);
+        assert_eq!(detailed[0], plain[0]);
+        assert!(
+            detailed[1].starts_with(&format!("    {MUTEX_OSD_LABEL} uaddr=0x")),
+            "{}",
+            detailed[1]
+        );
+    }
+
+    /// The PI line and the PI fact are one fact, as C's are: both come from
+    /// what the process actually obtained.
+    #[test]
+    fn the_osd_show_all_line_is_the_pi_report() {
+        assert_eq!(
+            osd_show_all_line(),
+            if is_pi_mutex_active() {
+                "PI is enabled"
+            } else {
+                "PI is not enabled"
+            }
+        );
+    }
 
     /// PI mutex API surface — works on both feature gates. Build path:
     /// confirms the type is constructible and the lock guard derefs.

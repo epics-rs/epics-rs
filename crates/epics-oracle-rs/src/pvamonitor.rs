@@ -119,7 +119,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use crate::allowlist::{Allowlist, MatchContext};
-use crate::catool::ToolError;
+use crate::catool::{ToolError, unattributed};
 use crate::dbd::DbfType;
 use crate::diff::Verdict;
 use crate::ioc::{Ioc, PvaPair, PvxTools, Side};
@@ -452,7 +452,7 @@ impl MonReport {
         let _ = writeln!(s, "  agreed             : {}", c.agreed);
         let _ = writeln!(
             s,
-            "  expected deviation : {}  (allowlisted against doc/upstream-c-bugs.md)",
+            "  expected deviation : {}  (allowlisted against expected-deviations.toml)",
             c.expected_deviation
         );
         let _ = writeln!(s, "  DEFECT             : {}", c.defect);
@@ -469,7 +469,7 @@ impl MonReport {
         }
 
         if !self.fired_allowlist_rows.is_empty() || !self.stale_allowlist_rows.is_empty() {
-            s.push_str("ALLOWLIST (doc/upstream-c-bugs.md, transcribed)\n");
+            s.push_str("ALLOWLIST (expected-deviations.toml)\n");
             if !self.fired_allowlist_rows.is_empty() {
                 let mut fired: Vec<&String> = self.fired_allowlist_rows.iter().collect();
                 fired.sort();
@@ -518,31 +518,14 @@ impl MonReport {
             s.push('\n');
         }
 
-        let errs: Vec<_> = self
-            .cases
-            .iter()
-            .filter(|c| c.verdict == Verdict::Errored)
-            .collect();
-        if !errs.is_empty() {
-            let _ = writeln!(
-                s,
-                "ERRORS ({}) — cases that could NOT be measured",
-                errs.len()
-            );
-            let mut by_msg: std::collections::BTreeMap<String, usize> = Default::default();
-            for e in &errs {
-                let m = e
-                    .errors
-                    .first()
-                    .map(|x| x.to_string())
-                    .unwrap_or_else(|| "(unknown)".into());
-                *by_msg.entry(m).or_default() += 1;
-            }
-            for (msg, n) in by_msg.iter().take(20) {
-                let _ = writeln!(s, "  {n:>5}x  {}", crate::pvaread::truncate(msg, 110));
-            }
-            s.push('\n');
-        }
+        s.push_str(&crate::report::errors_section(
+            "cases",
+            self.cases
+                .iter()
+                .filter(|c| c.verdict == Verdict::Errored)
+                .map(|c| c.errors.as_slice())
+                .collect(),
+        ));
 
         s.push_str(
             "NOT MEASURED: non-VAL channels' monitors, and QSRV2 group PVs. A clean run\n\
@@ -716,11 +699,11 @@ fn probe_type(
 
     let db = match write_db(workdir, &format!("pva_mon_{record_type}"), &db_text) {
         Ok(p) => p,
-        Err(e) => return errored_cases(&refs, &e),
+        Err(e) => return errored_cases(&refs, &unattributed("write-db", &e)),
     };
     let pair = match PvaPair::boot(tools, &db, &pvs[0]) {
         Ok(p) => p,
-        Err(e) => return errored_cases(&refs, &e.to_string()),
+        Err(e) => return errored_cases(&refs, &e.tool_errors("boot")),
     };
 
     let c = PvaTools::new(tools, pair.c.port(), Side::C);
@@ -738,10 +721,14 @@ fn probe_type(
         Ok(None) => {
             return errored_cases(
                 &refs,
-                "ground truth's pvxinfo declared no parseable NT shape",
+                &[ToolError {
+                    side: Side::C,
+                    tool: "pvxinfo".into(),
+                    message: "ground truth's pvxinfo declared no parseable NT shape".into(),
+                }],
             );
         }
-        Err(e) => return errored_cases(&refs, &e.to_string()),
+        Err(e) => return errored_cases(&refs, &[e]),
     };
 
     // Two independent servers on two ports with no shared state: observing them
@@ -876,27 +863,20 @@ fn normalize(body: &str) -> String {
         .join("\n")
 }
 
-fn errored_cases(refs: &[CaseRef], message: &str) -> Vec<MonCase> {
+fn errored_cases(refs: &[CaseRef], errors: &[ToolError]) -> Vec<MonCase> {
     refs.iter()
-        .map(|cr| {
-            let e = ToolError {
-                side: Side::C,
-                tool: "pva-monitor".into(),
-                message: message.to_string(),
-            };
-            MonCase {
-                record_type: cr.record_type.clone(),
-                field: "VAL".into(),
-                pv: cr.pv.clone(),
-                drive: cr.drive,
-                verdict: Verdict::Errored,
-                c_side: MonObservation::default(),
-                rust_side: MonObservation::default(),
-                differences: Vec::new(),
-                allowlisted: Vec::new(),
-                errors: vec![e],
-                db: cr.db.clone(),
-            }
+        .map(|cr| MonCase {
+            record_type: cr.record_type.clone(),
+            field: "VAL".into(),
+            pv: cr.pv.clone(),
+            drive: cr.drive,
+            verdict: Verdict::Errored,
+            c_side: MonObservation::default(),
+            rust_side: MonObservation::default(),
+            differences: Vec::new(),
+            allowlisted: Vec::new(),
+            errors: errors.to_vec(),
+            db: cr.db.clone(),
         })
         .collect()
 }
@@ -1038,12 +1018,7 @@ pub fn report(
         .filter(|c| c.verdict != Verdict::Errored)
         .count();
     let stale = |rows: Vec<&crate::allowlist::Deviation>| -> Vec<StaleRow> {
-        rows.into_iter()
-            .map(|d| StaleRow {
-                id: d.id.clone(),
-                why: d.why.clone(),
-            })
-            .collect()
+        rows.into_iter().map(StaleRow::of).collect()
     };
 
     let of_status = |want: ValStatus| -> Vec<String> {

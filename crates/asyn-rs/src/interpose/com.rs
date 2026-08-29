@@ -27,15 +27,23 @@
 //! [`OctetNext`] link directly; it is not reachable through the interpose
 //! stack, exactly as in C.
 //!
-//! One consequence in C is a real defect, and this port does NOT reproduce it
-//! (CBUG-B8): because the negotiation bypasses `writeIt`, C never IAC-stuffs the
-//! subnegotiation PAYLOAD, so a payload byte that happens to equal 0xFF — a baud
-//! rate whose big-endian encoding contains 0xFF, e.g. `baud=255`; a line state of
-//! 0xFF — goes out raw and a compliant RFC-2217 server reads it as a command
-//! byte and desynchronises. Here the payload is escaped on the way out
-//! (`write_subnegotiation`) and un-escaped on the way in (`next_payload_char`),
-//! which is RFC 2217 §3. The IAC bytes of the FRAMING (`IAC SB … IAC SE`) are
-//! commands and stay raw, in C and here alike.
+//! One consequence in C was a real defect (CBUG-B8), and upstream has since
+//! fixed HALF of it. At the `R4-45-19-ge2a281e2` pin the catalogue was read
+//! against, C IAC-stuffed the subnegotiation PAYLOAD in neither direction, so a
+//! payload byte equal to 0xFF — a baud rate whose big-endian encoding contains
+//! 0xFF, e.g. `baud=255`; a line state of 0xFF — went out raw and a compliant
+//! RFC-2217 server read it as a command byte and desynchronised. asyn **#236**
+//! merged (`9a4c3185`, the tip of `origin/master` here on 2026-07-20), and at
+//! that revision `sbComPortOption` stuffs the OUTGOING payload at `:435-442`
+//! under an RFC 2217 comment at `:428-434`. The write half is therefore no
+//! longer a deviation: C now does what `write_subnegotiation` does.
+//!
+//! The READ half is still raw upstream — the reply-payload loop at `:464-468`
+//! and the line/modem-state byte at `:458` both take the bare `nextChar` — so a
+//! compliant server's escaped 0xFF still reaches C as two bytes and mis-frames
+//! the reply. `next_payload_char` un-escapes it here; that half remains a live
+//! deviation. The IAC bytes of the FRAMING (`IAC SB … IAC SE`) are commands and
+//! stay raw, in C and here alike.
 
 use std::time::Duration;
 
@@ -241,9 +249,12 @@ impl Default for ComInterpose {
 /// the user's message slot (C's buffer), while `readIt` discards it and reports
 /// "Missing IAC" instead (:226-230).
 ///
-/// Deviation: C does not check `nbytes`, so a lower read that reports success
-/// having transferred nothing leaves `char c` uninitialized and C reads garbage.
-/// That is treated as EOF here.
+/// CBUG-B7 — now matches upstream. At the `R4-45-19-ge2a281e2` pin, C tested
+/// only `status`, so a lower read that reported success having transferred
+/// nothing left `char c` uninitialized and C returned garbage. asyn #236 merged,
+/// and at `origin/master` `9a4c3185` the guard reads
+/// `if (status != asynSuccess || nbytes == 0) return EOF;` (:104-105) — the same
+/// 0-byte-is-EOF rule this has. Not a deviation any more.
 fn next_char(next: &mut dyn OctetNext, user: &AsynUser) -> Result<u8, String> {
     let mut c = [0u8; 1];
     match next.read(user, &mut c) {
@@ -343,6 +354,8 @@ impl OctetInterpose for ComInterpose {
                 TraceMask::IO_FILTER,
                 &buf[..n_read],
                 &format!("nRead {n_read} after IAC unstuffing"),
+                file!(),
+                line!(),
             );
         }
 
@@ -465,12 +478,14 @@ impl<'a> TelnetLink<'a> {
     /// One PAYLOAD byte of a subnegotiation, with RFC 2217's IAC escape undone:
     /// a data byte equal to 0xFF travels as `IAC IAC`.
     ///
-    /// DEVIATION from C, deliberate — CBUG-B8. See [`Self::write_subnegotiation`]
-    /// for the write half. C reads every negotiation byte with a bare `nextChar`
-    /// (:103), so a compliant server's escaped 0xFF is read as two bytes: the
-    /// value byte comes out right but the frame is one byte long and the trailing
-    /// `IAC SE` check fails. Reading the payload through this — the same escape
-    /// rule the write half applies — is what makes a 0xFF round-trip at all.
+    /// DEVIATION from C, deliberate — CBUG-B8, READ half, still live. asyn #236
+    /// took the write half only (see [`Self::write_subnegotiation`]); at
+    /// `origin/master` `9a4c3185` C still reads every negotiation byte with a
+    /// bare `nextChar` (:103), reached from :458 and :465, so a compliant
+    /// server's escaped 0xFF is read as two bytes: the value byte comes out right
+    /// but the frame is one byte long and the trailing `IAC SE` check fails.
+    /// Reading the payload through this — the same escape rule C now applies on
+    /// the way out — is what makes a 0xFF round-trip at all.
     ///
     /// An IAC followed by anything else is a command in the middle of a payload:
     /// a framing error, reported as such rather than silently taken as data.
@@ -500,15 +515,19 @@ impl<'a> TelnetLink<'a> {
 
     /// `IAC SB 44 <payload, IAC-stuffed> IAC SE` — RFC 2217 §3 framing.
     ///
-    /// DEVIATION from C, deliberate — CBUG-B8. C builds this frame at :424-431
-    /// and hands it to `pasynOctetDrv->write`, the driver BELOW the interpose,
-    /// so it never passes through the interpose's own `writeIt` (:146-182) —
+    /// **CBUG-B8, write half — now matches upstream.** At the
+    /// `R4-45-19-ge2a281e2` pin C built this frame at :424-431 by copying `xBuf`
+    /// straight in, then handed it to `pasynOctetDrv->write`, the driver BELOW
+    /// the interpose, so it never passed through the interpose's own `writeIt` —
     /// the function that doubles IAC bytes. The payload is exactly where a 0xFF
-    /// can occur: `CPO_SET_BAUDRATE` sends the rate as four big-endian bytes
-    /// (:491), so `asynSetOption(port, 0, "baud", "255")` puts a raw 0xFF into
-    /// the payload and a compliant terminal server reads it as a command byte
-    /// and desynchronises. Only the payload is stuffed here; the IAC bytes of
-    /// the framing itself are commands and must stay raw.
+    /// can occur: `CPO_SET_BAUDRATE` sends the rate as four big-endian bytes, so
+    /// `asynSetOption(port, 0, "baud", "255")` put a raw 0xFF into the payload
+    /// and a compliant terminal server read it as a command byte and
+    /// desynchronised. asyn **#236** merged, and at `origin/master` `9a4c3185`
+    /// `sbComPortOption` runs this same stuffing loop at :435-442 (baud is now
+    /// :504, `writeIt` :146-189): the port said it first and C has since agreed.
+    /// Only the payload is stuffed; the IAC bytes of the framing itself are
+    /// commands and must stay raw, in C and here alike.
     fn write_subnegotiation(&mut self, payload: &[u8]) -> AsynResult<usize> {
         let mut cbuf = Vec::with_capacity(5 + payload.len());
         cbuf.extend_from_slice(&[IAC, SB, SB_COM_PORT_OPTION]);
@@ -626,9 +645,10 @@ impl<'a> TelnetLink<'a> {
                         }
                         continue;
                     }
-                    // The state byte — payload, so IAC-escaped (CBUG-B8; a line
-                    // state of 0xFF is a legal value). C consumes exactly one
-                    // raw byte and does *not* consume the trailing IAC SE here —
+                    // The state byte — payload, so IAC-escaped (CBUG-B8 read
+                    // half; a line state of 0xFF is a legal value). C still
+                    // consumes exactly one raw byte (:458 at `9a4c3185`) and does
+                    // *not* consume the trailing IAC SE here —
                     // it lets the scan loop step over them (the IAC is found, and
                     // SE hits the `case C_SE: break` arm).
                     if self.next_payload_char() == EOF {
@@ -655,7 +675,8 @@ impl<'a> TelnetLink<'a> {
     /// code is an error.
     ///
     /// The payload `x` is IAC-stuffed and the reply payload is un-stuffed —
-    /// CBUG-B8, a deliberate deviation from C, which does neither. See
+    /// CBUG-B8. Since asyn #236 C stuffs the outgoing payload too (:435-442), so
+    /// only the un-stuffing on the way in is still a deviation. See
     /// [`Self::write_subnegotiation`] and [`Self::next_payload_char`].
     fn sb_com_port_option(&mut self, x: &[u8], r: &mut [u8]) -> AsynResult<()> {
         debug_assert!(!x.is_empty() && r.len() >= x.len() - 1);
@@ -693,7 +714,7 @@ impl<'a> TelnetLink<'a> {
             } else if c == i32::from(x[0]) + CPO_REPLY_OFFSET {
                 // :450-459 — `while (--xLen > 0)`: one reply byte per payload
                 // byte after the subcommand. These are DATA, so they carry the
-                // IAC escape (CBUG-B8) — C reads them raw.
+                // IAC escape (CBUG-B8) — C still reads them raw (:464-468).
                 for slot in r.iter_mut().take(x.len() - 1) {
                     let b = self.next_payload_char();
                     if b == EOF {
@@ -818,25 +839,36 @@ impl ComPortOptions {
 
     /// The SET-CONTROL byte to transmit when `key_mode` is being turned OFF.
     ///
-    /// **DEVIATION from C, deliberate — CBUG-B6.** C's `crtscts` and `ixon`
-    /// branches both implement "n" as `xBuf[1] = pinterposePvt->flow`
+    /// **CBUG-B6 — the defect is fixed upstream; only the SCOPE of "off" still
+    /// differs.** At the `R4-45-19-ge2a281e2` pin, C's `crtscts` and `ixon`
+    /// branches both implemented "n" as `xBuf[1] = pinterposePvt->flow`
     /// (`asynInterposeCom.c:575`, `:591`) — the value transmitted for "turn this
-    /// off" is the port's **current** flow-control mode. So if RTS/CTS is on and
-    /// you send `crtscts N`, C re-transmits SET-CONTROL HWFLOW, the server
-    /// confirms HWFLOW, `:578` writes it back into `flow`, and `getOption` still
-    /// answers "Y". Flow control can be turned on and never off; recovery needs
-    /// an IOC restart or a terminal-server power cycle.
+    /// off" was the port's **current** flow-control mode. So with RTS/CTS on,
+    /// `crtscts N` re-transmitted SET-CONTROL HWFLOW, the server confirmed
+    /// HWFLOW, `:583` wrote it back into `flow`, and `getOption` still answered
+    /// "Y": flow control could be turned on and never off. `CPO_CONTROL_NOFLOW`
+    /// ("No flow control", `:53`) was defined and decoded in `getOption` but
+    /// assigned to `xBuf[1]` nowhere in the file.
     ///
-    /// `CPO_CONTROL_NOFLOW` ("No flow control", `:53`) is defined and is decoded
-    /// in `getOption` (`:684`, `:695`) — it is simply never assigned to
-    /// `xBuf[1]` anywhere in the file. Transmitting it is the intended
-    /// behaviour, and it is what this does.
+    /// The pin PREDATES the fix — `e2a281e2` is 2025-08-04 and is an ancestor
+    /// of the merge — so the C this port is pinned to still has the defect, and
+    /// the paragraph above is a description of that C, not history.
     ///
-    /// The mode byte carries ONE flow-control mode, so the modes are mutually
-    /// exclusive (which is why C advises "XON/XOFF already set. Now using
-    /// RTS/CTS."). Disabling therefore means: if `key_mode` is what is currently
-    /// in effect, turn flow control off; if some other mode is in effect, this
-    /// key's mode is already off and the other one is not ours to touch.
+    /// asyn **#236** merged (`9a4c3185`, 2026-07-20), and there both branches read
+    /// `if (epicsStrCaseCmp(val, "n") == 0) xBuf[1] = CPO_CONTROL_NOFLOW;`
+    /// (`:588` crtscts, `:604` ixon; `getOption` decodes NOFLOW at `:698` and
+    /// `:709`). Transmitting NOFLOW is now C's behaviour as well as this one's,
+    /// so "can be enabled and never disabled" no longer describes C.
+    ///
+    /// What is left is narrower and is a live parity question, not a defect on
+    /// either side. C's fixed "n" sends NOFLOW **unconditionally**, so `ixon N`
+    /// under live RTS/CTS turns RTS/CTS off too. The mode byte carries ONE
+    /// flow-control mode, so the modes are mutually exclusive (which is why C
+    /// advises "XON/XOFF already set. Now using RTS/CTS."), and this reads that
+    /// as: if `key_mode` is what is currently in effect, turn flow control off;
+    /// if some other mode is in effect, this key's mode is already off and the
+    /// other one is not ours to touch. The two agree on every same-key sequence
+    /// and differ only on cross-key `N`.
     fn flow_mode_off(&self, key_mode: u8) -> u8 {
         if self.flow == key_mode {
             CPO_CONTROL_NOFLOW
@@ -985,8 +1017,10 @@ impl ComPortOptions {
             }
             Ok(())
         } else if key.eq_ignore_ascii_case("crtscts") {
-            // :569-584 — "y" turns hardware flow control on. C's "n" re-sends the
-            // *current* flow mode; see `flow_mode_for` — CBUG-B6.
+            // :569-584 — "y" turns hardware flow control on. Since asyn #236
+            // C's "n" sends NOFLOW as this does (`9a4c3185:588`); see
+            // `flow_mode_off` for the cross-key scope that still differs
+            // — CBUG-B6.
             //
             // :571-573 — switching to RTS/CTS over a live XON/XOFF setting is
             // announced in the message slot and does *not* fail the call.
@@ -1014,12 +1048,14 @@ impl ComPortOptions {
             } else if val.eq_ignore_ascii_case("y") {
                 CPO_CONTROL_IXON
             } else {
-                // DEVIATION. C writes "Bad option value" into the message and
-                // then *falls through* without returning (:593-596), sending a
-                // subnegotiation whose payload byte is the uninitialized
-                // `xBuf[1]` — undefined behaviour, and an arbitrary flow-control
-                // mode on the wire. Refusing the value is the only behaviour that
-                // is both defined and safe; there is nothing to be faithful to.
+                // CBUG-B5 — now matches upstream. At the pin C wrote "Bad option
+                // value" into the message and then *fell through* without
+                // returning (:593-596), sending a subnegotiation whose payload
+                // byte was the uninitialized `xBuf[1]` — undefined behaviour, and
+                // an arbitrary flow-control mode on the wire. asyn #236 merged:
+                // at `9a4c3185` the same arm ends `return asynError;` (:609), as
+                // this does. Refusing the value was the only defined and safe
+                // behaviour, and C has since agreed.
                 return Err(asyn_error("Bad option value"));
             };
             let mut r = [0u8; 1];
@@ -1428,10 +1464,13 @@ mod tests {
 
     /// CBUG-B8 — a payload byte of 0xFF is IAC-escaped, in both directions.
     ///
-    /// DEVIATION from C, deliberate. C writes the subnegotiation straight to the
+    /// At the `R4-45-19-ge2a281e2` pin C wrote the subnegotiation straight to the
     /// driver below the interpose (:430), skipping the `writeIt` that doubles
-    /// IACs, so `baud=255` (0x000000FF) puts a raw IAC into the payload and a
-    /// compliant RFC-2217 server mis-frames the rest of the negotiation.
+    /// IACs, so `baud=255` (0x000000FF) put a raw IAC into the payload and a
+    /// compliant RFC-2217 server mis-framed the rest of the negotiation. asyn
+    /// #236 merged the write half (`9a4c3185:435-442`); the read half is still
+    /// raw there (:458, :464-468), so the un-escape this asserts on the way in
+    /// remains a deviation while the escape on the way out no longer is.
     #[test]
     fn b8_a_payload_byte_of_0xff_is_escaped_both_ways() {
         // The compliant server escapes its echo of 0xFF as well.
@@ -1587,12 +1626,16 @@ mod tests {
     /// Turning OFF the mode that is *not* the one in effect leaves the other one
     /// alone: XON/XOFF is on, `crtscts n` says "hardware flow control off", and
     /// hardware flow control is already off — so the cached mode is re-sent and
-    /// XON/XOFF keeps running. This is C's byte for this case too (:575) and it
-    /// is the right one; the mode byte carries a single mutually-exclusive mode,
-    /// so disabling RTS/CTS is not a licence to disable XON/XOFF.
+    /// XON/XOFF keeps running.
     ///
-    /// The case C gets WRONG is the other one — see
-    /// [`each_key_can_turn_its_own_flow_control_back_off`].
+    /// CBUG-B6 — this is the cross-key case, and it is the half of B6 that asyn
+    /// #236 did NOT settle in C's favour. At the `R4-45-19-ge2a281e2` pin this
+    /// byte is C's byte too (`asynInterposeCom.c:575` sends the cached mode), but
+    /// #236 made "n" send `CPO_CONTROL_NOFLOW` unconditionally (`9a4c3185:588`),
+    /// so post-merge C turns XON/XOFF off here and this does not. That is a live
+    /// parity question about the SCOPE of "off", not a defect on either side —
+    /// see [`ComPortOptions::flow_mode_off`] for why the mode byte's single
+    /// mutually-exclusive slot makes this reading the defensible one.
     #[test]
     fn turning_off_the_mode_that_is_not_in_effect_leaves_the_other_running() {
         let mut server = FakeServer::new(&ack(CPO_SET_CONTROL, &[CPO_CONTROL_IXON]));
@@ -1623,11 +1666,13 @@ mod tests {
     /// CBUG-B6 — each key can turn ITS OWN flow control back off, by
     /// transmitting `CPO_CONTROL_NOFLOW`.
     ///
-    /// In C, `xBuf[1] = pinterposePvt->flow` on both "n" branches (:575, :591),
-    /// so `crtscts N` with RTS/CTS on re-transmits HWFLOW, the server confirms
-    /// it, `:578` caches it back, and `getOption` still answers "Y" — flow
-    /// control can be enabled and never disabled. `CPO_CONTROL_NOFLOW` is
-    /// defined and decoded but assigned to `xBuf[1]` nowhere in the file.
+    /// At the `R4-45-19-ge2a281e2` pin, `xBuf[1] = pinterposePvt->flow` on both
+    /// "n" branches (:575, :591), so `crtscts N` with RTS/CTS on re-transmitted
+    /// HWFLOW, the server confirmed it, `:583`/`:599` cached it back, and `getOption`
+    /// still answered "Y" — flow control could be enabled and never disabled.
+    /// asyn #236 merged: at `9a4c3185` both branches send `CPO_CONTROL_NOFLOW`
+    /// (:588, :604), so this case is now parity, not deviation. The sequences
+    /// asserted below are same-key, where C and this agree byte for byte.
     #[test]
     fn each_key_can_turn_its_own_flow_control_back_off() {
         for (key, on_mode) in [("crtscts", CPO_CONTROL_HWFLOW), ("ixon", CPO_CONTROL_IXON)] {
@@ -1637,7 +1682,7 @@ mod tests {
                 .unwrap();
             assert_eq!(com.get_option(key).unwrap(), "Y", "{key} on");
 
-            // C would re-send `on_mode` here and stay "Y" forever.
+            // At the pin C would re-send `on_mode` here and stay "Y" forever.
             let mut server = FakeServer::new(&ack(CPO_SET_CONTROL, &[CPO_CONTROL_NOFLOW]));
             com.set_option(&mut AsynUser::default(), &mut server, key, "n")
                 .unwrap();
@@ -1945,7 +1990,7 @@ mod tests {
         /// Records the timeout on the asynUser every wire operation is given.
         struct TimeoutSpy {
             inner: FakeServer,
-            seen: Vec<Duration>,
+            seen: Vec<Option<Duration>>,
         }
         impl OctetNext for TimeoutSpy {
             fn read(&mut self, user: &AsynUser, buf: &mut [u8]) -> AsynResult<OctetReadResult> {
@@ -1977,7 +2022,7 @@ mod tests {
         .unwrap();
         assert!(!spy.seen.is_empty(), "the negotiation reached the wire");
         assert!(
-            spy.seen.iter().all(|t| *t == caller),
+            spy.seen.iter().all(|t| *t == Some(caller)),
             "every wire operation runs under the caller's timeout, got {:?}",
             spy.seen
         );
@@ -2003,7 +2048,7 @@ mod tests {
         com.restore_settings(&mut spy).unwrap();
         assert!(!spy.seen.is_empty());
         assert!(
-            spy.seen.iter().all(|t| *t == INTERPOSE_USER_TIMEOUT),
+            spy.seen.iter().all(|t| *t == Some(INTERPOSE_USER_TIMEOUT)),
             "restoreSettings runs on the interpose's own 2 s asynUser, got {:?}",
             spy.seen
         );
@@ -2024,7 +2069,8 @@ mod tests {
         mgr.set_trace_mask(Some("comtrace"), TraceMask::IO_FILTER);
         mgr.set_trace_info_mask(Some("comtrace"), TraceInfoMask::PORT);
         mgr.set_trace_io_mask(Some("comtrace"), TraceIoMask::ESCAPE);
-        let temp = std::env::temp_dir().join("asyn_com_filter_trace.txt");
+        let dir = tempfile::tempdir().expect("fixture root");
+        let temp = dir.path().join("asyn_com_filter_trace.txt");
         let file = std::fs::File::create(&temp).unwrap();
         mgr.set_trace_file(
             Some("comtrace"),
@@ -2051,11 +2097,16 @@ mod tests {
             contents.contains("nRead 3 after IAC unstuffing"),
             "C :238 label, got {contents:?}"
         );
-        assert!(contents.contains("IO_FILTER"), "at ASYN_TRACEIO_FILTER");
+        // The line carries C's `[port,addr,reason]` prefix and no mask
+        // label — C prints no severity token (asynManager.c:3005-3023).
+        assert!(
+            contents.contains("[comtrace,-1,0] "),
+            "C printPort triple, got {contents:?}"
+        );
         let _ = std::fs::remove_file(&temp);
 
         // A read with nothing to unstuff prints nothing (C tests `unstuffed`).
-        let temp2 = std::env::temp_dir().join("asyn_com_filter_trace_quiet.txt");
+        let temp2 = dir.path().join("asyn_com_filter_trace_quiet.txt");
         let file = std::fs::File::create(&temp2).unwrap();
         mgr.set_trace_file(
             Some("comtrace"),

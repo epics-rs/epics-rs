@@ -30,7 +30,7 @@ use std::time::SystemTime;
 /// pvxs accumulates `chan->statTx`/`chan->statRx` at each op's send/recv
 /// (`serverget.cpp:124/386`, `servermon.cpp:186/513`, `serverchan.cpp:151`,
 /// `serverintrospect.cpp:45/164`) and copies them into the report at
-/// `server.cpp:260-268`, zeroing per-channel when `report(true)`.
+/// `src/server.cpp:260-268`, zeroing per-channel when `report(true)`.
 #[derive(Debug)]
 pub struct ChannelStat {
     /// Served PV name (aka channel name).
@@ -133,7 +133,7 @@ pub struct PeerEntry {
     /// connection task holds in its channel table, so the report reads the
     /// live per-channel tx/rx counters the handlers mutate. Inserted on
     /// CREATE_CHANNEL success, removed on DESTROY_CHANNEL / teardown
-    /// (pvxs iterates `conn->chanBySID`, server.cpp:260).
+    /// (pvxs iterates `conn->chanBySID`, src/server.cpp:260).
     pub(crate) channels_by_sid: parking_lot::Mutex<HashMap<u32, Arc<ChannelStat>>>,
 }
 
@@ -240,7 +240,7 @@ impl PeerRegistry {
                     snap.bytes_in = e.bytes_in.swap(0, Ordering::Relaxed);
                     snap.bytes_out = e.bytes_out.swap(0, Ordering::Relaxed);
                     // Per-channel counters reset under the SAME report path
-                    // as the connection counters (pvxs `server.cpp:270-271`
+                    // as the connection counters (pvxs `src/server.cpp:270-271`
                     // zeroes `chan->statTx`/`statRx` when `zero`). Rebuild the
                     // per-channel snapshot from the swapped (pre-reset) values
                     // so per-PV deltas are neither lost nor double-counted.
@@ -302,7 +302,7 @@ pub struct PeerSnapshot {
     pub credentials: Option<(String, String)>,
     /// Per-channel report entries for the channels currently open on this
     /// peer — name + per-channel tx/rx counters + optional `ReportInfo`
-    /// (pvxs `Report::Connection::channels`, server.cpp:260-268).
+    /// (pvxs `Report::Connection::channels`, src/server.cpp:260-268).
     pub channels_detail: Vec<ChannelReport>,
 }
 
@@ -367,7 +367,7 @@ mod tests {
     /// per-channel entries with their own tx/rx counters, and
     /// `snapshot_zeroed(true)` resets BOTH the connection AND the
     /// per-channel byte counters (not channels/credentials) so the next
-    /// report is a delta — pvxs `server.cpp:256-271`.
+    /// report is a delta — pvxs `src/server.cpp:256-271`.
     #[test]
     fn snapshot_carries_credentials_per_channel_counters_and_zeroes_bytes() {
         let reg = PeerRegistry::new();

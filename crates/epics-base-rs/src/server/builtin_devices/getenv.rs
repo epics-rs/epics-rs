@@ -30,7 +30,7 @@
 //! `ctx.inp` at construction — not registered as a context-free static factory.
 
 use crate::error::{CaError, CaResult};
-use crate::server::device_support::{DeviceReadOutcome, DeviceSupport};
+use crate::server::device_support::{DeviceInitOutcome, DeviceReadOutcome, DeviceSupport};
 use crate::server::recgbl::alarm_status;
 use crate::server::record::{AlarmSeverity, ProcessContext, Record};
 use crate::types::EpicsValue;
@@ -77,7 +77,7 @@ impl DeviceSupport for GetenvDeviceSupport {
         "getenv"
     }
 
-    fn init(&mut self, record: &mut dyn Record) -> CaResult<()> {
+    fn init(&mut self, record: &mut dyn Record) -> CaResult<DeviceInitOutcome> {
         // C's getenv dset has a NULL `init_record` slot ({5, NULL, init_lsi,
         // NULL, NULL}); per-record setup is the dsxt `add_lsi` / `add_stringin`
         // (devEnviron.c), which only validate `inp.type == INST_IO` and write
@@ -91,7 +91,7 @@ impl DeviceSupport for GetenvDeviceSupport {
                 "DTYP=getenv: unsupported record type '{rtype}' (use stringin or lsi)"
             )));
         }
-        Ok(())
+        Ok(DeviceInitOutcome::Live)
     }
 
     fn read(&mut self, record: &mut dyn Record) -> CaResult<DeviceReadOutcome> {

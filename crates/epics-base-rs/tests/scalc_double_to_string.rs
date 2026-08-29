@@ -67,7 +67,7 @@ fn the_conversion_stays_inside_the_forty_byte_element() {
 fn nan_is_spelled_nan() {
     // ACOS(2) is C's NaN source with no domain check of its own (`x/0` is not:
     // DIV returns -1, `sCalcPerform.c:1026`). LEN keeps the perform finite — a
-    // NaN result would fail it (`:2056`) before the string could be seen.
+    // NaN result would fail it (`:2055`) before the string could be seen.
     let mut inp = StringInputs::new();
     match scalc("LEN(STR(ACOS(2)))", &mut inp).expect("st=0") {
         StackValue::Double(d) => assert_eq!(d, 3.0, "\"NaN\" is 3 bytes"),
@@ -136,7 +136,7 @@ fn the_record_sval_is_rendered_at_prec() {
 
 /// The STRING evaluator's epilogue (`sCalcPerform.c:2036-2043`) never sees
 /// `precision`: its `to_string` is `cvtDoubleToString(d, s, 8)`, hardcoded
-/// (`:90-96`). So the same VAL renders differently depending on which evaluator
+/// (`:89-95`). So the same VAL renders differently depending on which evaluator
 /// the program selected, and THAT is C. Compiled sCalc: `A+0.5` is "3" at
 /// PREC=0 while `AA+0.5` — string-marked by the `AA` fetch — is "3.14159265"...
 /// or here, "2.50000000", whatever the PREC.
@@ -157,7 +157,7 @@ fn a_string_marked_program_ignores_prec() {
 }
 
 /// OSV is the OCAL-side mirror (`sCalcoutRecord.c:768-769`), and DOPT=Use VAL
-/// copies SVAL into it (`:764`), so both routes give the same text.
+/// copies SVAL into it (`:760`), so both routes give the same text.
 #[test]
 fn the_record_osv_is_the_c_conversion_of_oval() {
     let mut rec = ScalcoutRecord::new();

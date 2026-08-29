@@ -1,10 +1,10 @@
 //! R9-2 — aCalc's scalar->array promotion is not a plain broadcast: C's
 //! `to_array(..., setValues=1)` (`aCalcPerform.c:124-143`) fills the array with
-//! **0** when the scalar is NaN (`:135-138`), and with the scalar otherwise.
+//! **0** when the scalar is NaN (`:134-137`), and with the scalar otherwise.
 //!
-//! C's binary arms promote the LEFT operand only (`toArray(ps,1)` at `:630` and
-//! `:1338`) and then read the right operand as the plain double `ps1->d`
-//! (`:659-684`). So the two mixed shapes are deliberately NOT mirror images, and
+//! C's binary arms promote the LEFT operand only (`toArray(ps,1)` at `:625` and
+//! `:1327`) and then read the right operand as the plain double `ps1->d`
+//! (`:654-679`). So the two mixed shapes are deliberately NOT mirror images, and
 //! the port — which broadcast the NaN verbatim in both — has to reproduce the
 //! asymmetry, not smooth it over.
 //!

@@ -4,7 +4,7 @@ use std::time::Duration;
 use asyn_rs::interfaces::motor::AsynMotor;
 use asyn_rs::user::AsynUser;
 use epics_base_rs::error::CaResult;
-use epics_base_rs::server::device_support::{DeviceReadOutcome, DeviceSupport};
+use epics_base_rs::server::device_support::{DeviceInitOutcome, DeviceReadOutcome, DeviceSupport};
 use epics_base_rs::server::record::{Record, ScanType};
 use epics_base_rs::types::EpicsValue;
 use tokio::sync::mpsc;
@@ -232,7 +232,7 @@ impl MotorDeviceSupport {
 }
 
 impl DeviceSupport for MotorDeviceSupport {
-    fn init(&mut self, record: &mut dyn Record) -> CaResult<()> {
+    fn init(&mut self, record: &mut dyn Record) -> CaResult<DeviceInitOutcome> {
         // Inject device_state into MotorRecord (for template-created records)
         let motor_rec = record
             .as_any_mut()
@@ -294,7 +294,7 @@ impl DeviceSupport for MotorDeviceSupport {
             motor_rec.clear_last_write();
         }
 
-        // C init_record 716-718 ("Reset limits in case database values
+        // C init_record 717-718 ("Reset limits in case database values
         // are invalid"): both dial limits are forwarded to the driver
         // unconditionally after the initial readback, high first.
         let dial_limits = record
@@ -319,7 +319,7 @@ impl DeviceSupport for MotorDeviceSupport {
         }
 
         self.initialized = true;
-        Ok(())
+        Ok(DeviceInitOutcome::Live)
     }
 
     fn read(&mut self, _record: &mut dyn Record) -> CaResult<DeviceReadOutcome> {

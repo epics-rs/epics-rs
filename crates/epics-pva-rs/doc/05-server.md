@@ -126,7 +126,7 @@ ad-hoc PV servers and tests.
 
 `CompositeSource`: `(order, name) -> Arc<dyn ChannelSourceObj>` map,
 consulted in ascending key order (pvxs `serverconn.h:267`,
-`server.cpp:91`), so equal orders tie-break by source name.
+`src/server.cpp:91`), so equal orders tie-break by source name.
 `has_pv` returns true if any source has it; `get_value` returns the
 first match. Used by the bridge crate's dual-protocol IOC mode and by
 sites that mix QSRV-served records with hand-built SharedPVs.

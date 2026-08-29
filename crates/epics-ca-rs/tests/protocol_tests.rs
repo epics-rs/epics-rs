@@ -1,16 +1,18 @@
 //! Integration tests for epics-ca-rs: protocol encoding/decoding and server API.
 
+#![cfg(feature = "client-core")]
+
 // Used only by the async `CaServer` tests below, which are gated off under
-// `rtems-exec-model`; the pure wire-format tests need only `protocol::*`.
-#[cfg(not(feature = "rtems-exec-model"))]
+// `exec_backend`; the pure wire-format tests need only `protocol::*`.
+#[cfg(tokio_backend)]
 use std::collections::HashMap;
 
-#[cfg(not(feature = "rtems-exec-model"))]
+#[cfg(tokio_backend)]
 use epics_ca_rs::EpicsValue;
 use epics_ca_rs::protocol::*;
-#[cfg(not(feature = "rtems-exec-model"))]
+#[cfg(tokio_backend)]
 use epics_ca_rs::server::CaServer;
-#[cfg(not(feature = "rtems-exec-model"))]
+#[cfg(tokio_backend)]
 use serial_test::serial;
 
 // ---------------------------------------------------------------------------
@@ -208,8 +210,8 @@ fn header_set_payload_count_boundary_at_0xffff() {
 // CaServer builder pattern — basic construction with simple PVs
 // ---------------------------------------------------------------------------
 
-// Async `CaServer` path: no tokio reactor under `rtems-exec-model`.
-#[cfg(not(feature = "rtems-exec-model"))]
+// Async `CaServer` path: no tokio reactor under `exec_backend`.
+#[cfg(tokio_backend)]
 #[tokio::test]
 async fn server_builder_with_simple_pvs() {
     let server = CaServer::builder()
@@ -242,8 +244,8 @@ async fn server_builder_with_simple_pvs() {
 // CaServer get/put with different value types
 // ---------------------------------------------------------------------------
 
-// Async `CaServer` path: no tokio reactor under `rtems-exec-model`.
-#[cfg(not(feature = "rtems-exec-model"))]
+// Async `CaServer` path: no tokio reactor under `exec_backend`.
+#[cfg(tokio_backend)]
 #[tokio::test]
 async fn server_put_and_get_double() {
     let server = CaServer::builder()
@@ -257,8 +259,8 @@ async fn server_put_and_get_double() {
     assert_eq!(server.get("SRV:D").await.unwrap(), EpicsValue::Double(99.9));
 }
 
-// Async `CaServer` path: no tokio reactor under `rtems-exec-model`.
-#[cfg(not(feature = "rtems-exec-model"))]
+// Async `CaServer` path: no tokio reactor under `exec_backend`.
+#[cfg(tokio_backend)]
 #[tokio::test]
 async fn server_put_and_get_string() {
     let server = CaServer::builder()
@@ -278,8 +280,8 @@ async fn server_put_and_get_string() {
     );
 }
 
-// Async `CaServer` path: no tokio reactor under `rtems-exec-model`.
-#[cfg(not(feature = "rtems-exec-model"))]
+// Async `CaServer` path: no tokio reactor under `exec_backend`.
+#[cfg(tokio_backend)]
 #[tokio::test]
 async fn server_put_and_get_short() {
     let server = CaServer::builder()
@@ -293,8 +295,8 @@ async fn server_put_and_get_short() {
     assert_eq!(server.get("SRV:I").await.unwrap(), EpicsValue::Short(-123));
 }
 
-// Async `CaServer` path: no tokio reactor under `rtems-exec-model`.
-#[cfg(not(feature = "rtems-exec-model"))]
+// Async `CaServer` path: no tokio reactor under `exec_backend`.
+#[cfg(tokio_backend)]
 #[tokio::test]
 async fn server_put_and_get_enum() {
     let server = CaServer::builder()
@@ -308,8 +310,8 @@ async fn server_put_and_get_enum() {
     assert_eq!(server.get("SRV:E").await.unwrap(), EpicsValue::Enum(5));
 }
 
-// Async `CaServer` path: no tokio reactor under `rtems-exec-model`.
-#[cfg(not(feature = "rtems-exec-model"))]
+// Async `CaServer` path: no tokio reactor under `exec_backend`.
+#[cfg(tokio_backend)]
 #[tokio::test]
 async fn server_put_and_get_float() {
     let server = CaServer::builder()
@@ -323,8 +325,8 @@ async fn server_put_and_get_float() {
     assert_eq!(server.get("SRV:F").await.unwrap(), EpicsValue::Float(2.5));
 }
 
-// Async `CaServer` path: no tokio reactor under `rtems-exec-model`.
-#[cfg(not(feature = "rtems-exec-model"))]
+// Async `CaServer` path: no tokio reactor under `exec_backend`.
+#[cfg(tokio_backend)]
 #[tokio::test]
 async fn server_put_and_get_long() {
     let server = CaServer::builder()
@@ -344,8 +346,8 @@ async fn server_put_and_get_long() {
     );
 }
 
-// Async `CaServer` path: no tokio reactor under `rtems-exec-model`.
-#[cfg(not(feature = "rtems-exec-model"))]
+// Async `CaServer` path: no tokio reactor under `exec_backend`.
+#[cfg(tokio_backend)]
 #[tokio::test]
 async fn server_put_and_get_char() {
     let server = CaServer::builder()
@@ -363,8 +365,8 @@ async fn server_put_and_get_char() {
 // CaServer get nonexistent PV returns error
 // ---------------------------------------------------------------------------
 
-// Async `CaServer` path: no tokio reactor under `rtems-exec-model`.
-#[cfg(not(feature = "rtems-exec-model"))]
+// Async `CaServer` path: no tokio reactor under `exec_backend`.
+#[cfg(tokio_backend)]
 #[tokio::test]
 async fn server_get_nonexistent_pv_returns_error() {
     let server = CaServer::builder()
@@ -387,13 +389,11 @@ async fn server_get_nonexistent_pv_returns_error() {
 /// these counters were declared and exposed via `casr` but never
 /// updated by the read/flush hot path — operators saw `bytes in=0,
 /// out=0` no matter how much traffic flowed.
-// Async `CaServer` path: no tokio reactor under `rtems-exec-model`.
-#[cfg(not(feature = "rtems-exec-model"))]
+// Async `CaServer` path: no tokio reactor under `exec_backend`.
+#[cfg(tokio_backend)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[serial]
 async fn server_stats_bytes_in_out_track_real_traffic() {
-    use std::time::Duration;
-
     let server = CaServer::builder()
         .port(0)
         .pv("STATS:BYTES", EpicsValue::Double(7.5))
@@ -415,7 +415,7 @@ async fn server_stats_bytes_in_out_track_real_traffic() {
     }
 
     let client = epics_ca_rs::client::CaClient::new().await.expect("client");
-    let (_ty, val) = tokio::time::timeout(Duration::from_secs(5), client.caget("STATS:BYTES"))
+    let (_ty, val) = tokio::time::timeout(budget::FACT_BUDGET, client.caget("STATS:BYTES"))
         .await
         .expect("caget did not complete within 5s")
         .expect("caget should succeed against local server");
@@ -453,8 +453,8 @@ async fn server_stats_bytes_in_out_track_real_traffic() {
 /// declared and printed by `casr` but never incremented. Asserts
 /// that `subscriptions_opened_total` and `subscriptions_closed_total`
 /// both increment for a normal monitor lifecycle.
-// Async `CaServer` path: no tokio reactor under `rtems-exec-model`.
-#[cfg(not(feature = "rtems-exec-model"))]
+// Async `CaServer` path: no tokio reactor under `exec_backend`.
+#[cfg(tokio_backend)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[serial]
 async fn server_stats_subscription_counters_track_camonitor_lifecycle() {
@@ -481,7 +481,7 @@ async fn server_stats_subscription_counters_track_camonitor_lifecycle() {
     let mut monitor = channel.subscribe().await.expect("subscribe");
     // Wait for the initial monitor frame so we know EVENT_ADD has
     // been accepted server-side.
-    let _initial = tokio::time::timeout(Duration::from_secs(2), monitor.recv())
+    let _initial = tokio::time::timeout(budget::FACT_BUDGET, monitor.recv())
         .await
         .expect("initial monitor frame did not arrive")
         .expect("monitor stream yielded no value");
@@ -514,8 +514,8 @@ async fn server_stats_subscription_counters_track_camonitor_lifecycle() {
     );
 }
 
-// Async `CaServer` path: no tokio reactor under `rtems-exec-model`.
-#[cfg(not(feature = "rtems-exec-model"))]
+// Async `CaServer` path: no tokio reactor under `exec_backend`.
+#[cfg(tokio_backend)]
 #[tokio::test]
 async fn server_put_nonexistent_pv_returns_error() {
     let server = CaServer::builder()
@@ -533,8 +533,8 @@ async fn server_put_nonexistent_pv_returns_error() {
 // CaServer add_pv at runtime
 // ---------------------------------------------------------------------------
 
-// Async `CaServer` path: no tokio reactor under `rtems-exec-model`.
-#[cfg(not(feature = "rtems-exec-model"))]
+// Async `CaServer` path: no tokio reactor under `exec_backend`.
+#[cfg(tokio_backend)]
 #[tokio::test]
 async fn server_add_pv_at_runtime() {
     let server = CaServer::builder().port(0).build().await.unwrap();
@@ -559,8 +559,8 @@ async fn server_add_pv_at_runtime() {
 // CaServer with multiple PVs of different types
 // ---------------------------------------------------------------------------
 
-// Async `CaServer` path: no tokio reactor under `rtems-exec-model`.
-#[cfg(not(feature = "rtems-exec-model"))]
+// Async `CaServer` path: no tokio reactor under `exec_backend`.
+#[cfg(tokio_backend)]
 #[tokio::test]
 async fn server_multiple_pv_types_coexist() {
     let server = CaServer::builder()
@@ -595,8 +595,8 @@ async fn server_multiple_pv_types_coexist() {
 // CaServer with db_string — load records from EPICS .db text
 // ---------------------------------------------------------------------------
 
-// Async `CaServer` path: no tokio reactor under `rtems-exec-model`.
-#[cfg(not(feature = "rtems-exec-model"))]
+// Async `CaServer` path: no tokio reactor under `exec_backend`.
+#[cfg(tokio_backend)]
 #[tokio::test]
 async fn server_builder_db_string_ai_record() {
     let db_text = r#"
@@ -617,8 +617,8 @@ record(ai, "TEMP:READING") {
     assert_eq!(val, EpicsValue::Double(25.0));
 }
 
-// Async `CaServer` path: no tokio reactor under `rtems-exec-model`.
-#[cfg(not(feature = "rtems-exec-model"))]
+// Async `CaServer` path: no tokio reactor under `exec_backend`.
+#[cfg(tokio_backend)]
 #[tokio::test]
 async fn server_builder_db_string_with_macros() {
     let db_text = r#"
@@ -644,8 +644,8 @@ record(ai, "$(PREFIX):SETPOINT") {
 // Record field access via "PV.FIELD" syntax
 // ---------------------------------------------------------------------------
 
-// Async `CaServer` path: no tokio reactor under `rtems-exec-model`.
-#[cfg(not(feature = "rtems-exec-model"))]
+// Async `CaServer` path: no tokio reactor under `exec_backend`.
+#[cfg(tokio_backend)]
 #[tokio::test]
 async fn server_record_field_access_dot_syntax() {
     let db_text = r#"
@@ -685,8 +685,8 @@ record(ai, "SENSOR:TEMP") {
 // Server with multiple record types
 // ---------------------------------------------------------------------------
 
-// Async `CaServer` path: no tokio reactor under `rtems-exec-model`.
-#[cfg(not(feature = "rtems-exec-model"))]
+// Async `CaServer` path: no tokio reactor under `exec_backend`.
+#[cfg(tokio_backend)]
 #[tokio::test]
 async fn server_multiple_record_types() {
     let db_text = r#"
@@ -742,8 +742,8 @@ record(stringout, "SO:VAL") {
 // Put to a record field via CaServer::put
 // ---------------------------------------------------------------------------
 
-// Async `CaServer` path: no tokio reactor under `rtems-exec-model`.
-#[cfg(not(feature = "rtems-exec-model"))]
+// Async `CaServer` path: no tokio reactor under `exec_backend`.
+#[cfg(tokio_backend)]
 #[tokio::test]
 async fn server_put_to_record() {
     let db_text = r#"
@@ -781,8 +781,8 @@ record(ao, "CTRL:SP") {
 // Mixed: builder PVs + db_string records
 // ---------------------------------------------------------------------------
 
-// Async `CaServer` path: no tokio reactor under `rtems-exec-model`.
-#[cfg(not(feature = "rtems-exec-model"))]
+// Async `CaServer` path: no tokio reactor under `exec_backend`.
+#[cfg(tokio_backend)]
 #[tokio::test]
 async fn server_mixed_simple_pvs_and_records() {
     let db_text = r#"
@@ -814,8 +814,8 @@ record(ai, "REC:AI") {
 // Server builder with custom port
 // ---------------------------------------------------------------------------
 
-// Async `CaServer` path: no tokio reactor under `rtems-exec-model`.
-#[cfg(not(feature = "rtems-exec-model"))]
+// Async `CaServer` path: no tokio reactor under `exec_backend`.
+#[cfg(tokio_backend)]
 #[tokio::test]
 async fn server_builder_custom_port() {
     // This just verifies the builder accepts port() without error.
@@ -837,8 +837,8 @@ async fn server_builder_custom_port() {
 // Server database() accessor
 // ---------------------------------------------------------------------------
 
-// Async `CaServer` path: no tokio reactor under `rtems-exec-model`.
-#[cfg(not(feature = "rtems-exec-model"))]
+// Async `CaServer` path: no tokio reactor under `exec_backend`.
+#[cfg(tokio_backend)]
 #[tokio::test]
 async fn server_database_accessor() {
     let server = CaServer::builder()
@@ -854,7 +854,7 @@ async fn server_database_accessor() {
     assert!(!db.has_name("NONEXISTENT").await);
 }
 
-/// C `tcp_echo_action` (`rsrv/camessage.c:410-425`) echoes the full
+/// C `tcp_echo_action` (`rsrv/camessage.c:405-420`) echoes the full
 /// request header AND payload back to the client. The previous Rust
 /// behaviour replied with an all-zero CA_PROTO_ECHO header, dropping
 /// the request fields and any payload. Real clients (libca
@@ -862,12 +862,11 @@ async fn server_database_accessor() {
 /// difference was masked in practice, but a diagnostic / probe client
 /// that puts a marker payload (e.g. RTT measurement, transparent-
 /// proxy detection) saw a stripped reply — a wire-level divergence.
-// Async `CaServer` path: no tokio reactor under `rtems-exec-model`.
-#[cfg(not(feature = "rtems-exec-model"))]
+// Async `CaServer` path: no tokio reactor under `exec_backend`.
+#[cfg(tokio_backend)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[serial]
 async fn server_echo_round_trips_request_header_and_payload() {
-    use std::time::Duration;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpStream;
 
@@ -892,7 +891,7 @@ async fn server_echo_round_trips_request_header_and_payload() {
     let mut buf = [0u8; 64];
     let mut drained = 0;
     while drained < 32 {
-        let n = tokio::time::timeout(Duration::from_secs(2), sock.read(&mut buf[drained..]))
+        let n = tokio::time::timeout(budget::FACT_BUDGET, sock.read(&mut buf[drained..]))
             .await
             .expect("server VERSION drain timed out")
             .expect("read VERSION");
@@ -926,7 +925,7 @@ async fn server_echo_round_trips_request_header_and_payload() {
     let mut resp = [0u8; 64];
     let mut total = 0;
     while total < 24 {
-        let n = tokio::time::timeout(Duration::from_secs(2), sock.read(&mut resp[total..]))
+        let n = tokio::time::timeout(budget::FACT_BUDGET, sock.read(&mut resp[total..]))
             .await
             .expect("ECHO reply timed out")
             .expect("read ECHO reply");
@@ -967,12 +966,12 @@ async fn server_echo_round_trips_request_header_and_payload() {
     );
 }
 
-/// C `event_cancel_reply` (`rsrv/camessage.c:2046-2050`)
+/// C `event_cancel_reply` (`rsrv/camessage.c:1992-1996`)
 /// calls `MPTOPCIU(mp)` first. If the request's channel id is
 /// unknown or belongs to another client, rsrv calls `logBadId` —
 /// which sends `send_err(ECA_INTERNAL, "Bad Resource ID")` with the
-/// cid=0xFFFFFFFF sentinel (`camessage.c:312-325`), flushed by
-/// `camsgtask.c:142` before the disconnect — and returns RSRV_ERROR.
+/// cid=0xFFFFFFFF sentinel (`camessage.c:307-320`), flushed by
+/// `camsgtask.c:142-143` before the disconnect — and returns RSRV_ERROR.
 /// Only after a valid channel resolves does rsrv walk that channel's
 /// event queue and emit ECA_BADMONID for an unknown monitor id.
 ///
@@ -982,8 +981,8 @@ async fn server_echo_round_trips_request_header_and_payload() {
 /// then disconnects (matches C `logBadId`); the valid-SID +
 /// bad-sub_id case is covered by
 /// `server_event_cancel_bad_subid_on_valid_sid_replies_eca_badmonid`.
-// Async `CaServer` path: no tokio reactor under `rtems-exec-model`.
-#[cfg(not(feature = "rtems-exec-model"))]
+// Async `CaServer` path: no tokio reactor under `exec_backend`.
+#[cfg(tokio_backend)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[serial]
 async fn server_event_cancel_unknown_sid_replies_eca_internal_and_disconnects() {
@@ -1018,7 +1017,7 @@ async fn server_event_cancel_unknown_sid_replies_eca_internal_and_disconnects() 
     let mut buf = [0u8; 64];
     let mut drained = 0usize;
     while drained < 32 {
-        let n = tokio::time::timeout(Duration::from_secs(2), sock.read(&mut buf[drained..]))
+        let n = tokio::time::timeout(budget::FACT_BUDGET, sock.read(&mut buf[drained..]))
             .await
             .expect("server VERSION reply timed out")
             .expect("read VERSION");
@@ -1047,7 +1046,7 @@ async fn server_event_cancel_unknown_sid_replies_eca_internal_and_disconnects() 
     let mut resp = [0u8; 256];
     let mut total = 0;
     while total < 16 {
-        let n = tokio::time::timeout(Duration::from_secs(2), sock.read(&mut resp[total..]))
+        let n = tokio::time::timeout(budget::FACT_BUDGET, sock.read(&mut resp[total..]))
             .await
             .expect("server error-reply timed out")
             .expect("read error reply");
@@ -1081,7 +1080,7 @@ async fn server_event_cancel_unknown_sid_replies_eca_internal_and_disconnects() 
 
     // Server must close the connection: a subsequent read returns EOF.
     let mut tail = [0u8; 16];
-    let n = tokio::time::timeout(Duration::from_secs(2), sock.read(&mut tail))
+    let n = tokio::time::timeout(budget::FACT_BUDGET, sock.read(&mut tail))
         .await
         .expect("server did not close after EVENT_CANCEL bad-SID")
         .expect("read after bad-SID cancel");
@@ -1095,11 +1094,11 @@ async fn server_event_cancel_unknown_sid_replies_eca_internal_and_disconnects() 
     );
 }
 
-/// C `bad_tcp_cmd_action` (`rsrv/camessage.c:342-357`) on an unknown
+/// C `bad_tcp_cmd_action` (`rsrv/camessage.c:337-352`) on an unknown
 /// TCP command: (1) emit `CA_PROTO_ERROR` with `ECA_INTERNAL` and the
 /// channel-cid 0xFFFFFFFF sentinel (per `vsend_err` non-channel-scoped
 /// convention), then (2) return `RSRV_ERROR` so the dispatcher
-/// (`camessage`, `camessage.c:2589-2592`) breaks out of the message loop, which
+/// (`camessage`, `camessage.c:2521-2524`) breaks out of the message loop, which
 /// tears down the connection. The C source comment is explicit:
 /// "by default, clients don't recover from this".
 ///
@@ -1108,8 +1107,8 @@ async fn server_event_cancel_unknown_sid_replies_eca_internal_and_disconnects() 
 /// unknown commands and force one reply per frame indefinitely. This
 /// test verifies the server now drops the TCP connection after the
 /// error reply.
-// Async `CaServer` path: no tokio reactor under `rtems-exec-model`.
-#[cfg(not(feature = "rtems-exec-model"))]
+// Async `CaServer` path: no tokio reactor under `exec_backend`.
+#[cfg(tokio_backend)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[serial]
 async fn server_unknown_tcp_command_replies_error_and_disconnects() {
@@ -1142,7 +1141,7 @@ async fn server_unknown_tcp_command_replies_error_and_disconnects() {
     let mut buf = [0u8; 64];
     let mut got = 0;
     while got < 32 {
-        let n = tokio::time::timeout(Duration::from_secs(2), sock.read(&mut buf[got..]))
+        let n = tokio::time::timeout(budget::FACT_BUDGET, sock.read(&mut buf[got..]))
             .await
             .expect("server VERSION drain timed out")
             .expect("read VERSION");
@@ -1167,7 +1166,7 @@ async fn server_unknown_tcp_command_replies_error_and_disconnects() {
     let mut resp = [0u8; 256];
     let mut total = 0;
     while total < 16 {
-        let n = tokio::time::timeout(Duration::from_secs(2), sock.read(&mut resp[total..]))
+        let n = tokio::time::timeout(budget::FACT_BUDGET, sock.read(&mut resp[total..]))
             .await
             .expect("server error-reply timed out")
             .expect("read error reply");
@@ -1197,7 +1196,7 @@ async fn server_unknown_tcp_command_replies_error_and_disconnects() {
     // Server must close the connection: a subsequent read returns 0
     // (EOF) within a reasonable timeout.
     let mut tail = [0u8; 16];
-    let n = tokio::time::timeout(Duration::from_secs(2), sock.read(&mut tail))
+    let n = tokio::time::timeout(budget::FACT_BUDGET, sock.read(&mut tail))
         .await
         .expect("server did not close TCP connection after unknown command")
         .expect("read after error");
@@ -1214,12 +1213,11 @@ async fn server_unknown_tcp_command_replies_error_and_disconnects() {
 /// connection. Without this gate an ancient peer could complete
 /// VERSION and proceed to CREATE_CHAN with a wire format the modern
 /// server no longer fully supports.
-// Async `CaServer` path: no tokio reactor under `rtems-exec-model`.
-#[cfg(not(feature = "rtems-exec-model"))]
+// Async `CaServer` path: no tokio reactor under `exec_backend`.
+#[cfg(tokio_backend)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[serial]
 async fn server_tcp_version_below_minimum_drops_connection() {
-    use std::time::Duration;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpStream;
 
@@ -1243,7 +1241,7 @@ async fn server_tcp_version_below_minimum_drops_connection() {
     // returns RSRV_ERROR which tears down with no reply).
     let mut buf = [0u8; 64];
     let mut greeting = [0u8; 16];
-    tokio::time::timeout(Duration::from_secs(2), async {
+    tokio::time::timeout(budget::FACT_BUDGET, async {
         let mut got = 0;
         while got < 16 {
             let n = sock.read(&mut greeting[got..]).await?;
@@ -1265,7 +1263,7 @@ async fn server_tcp_version_below_minimum_drops_connection() {
 
     // Server must drop the connection — no further VERSION reply,
     // just EOF.
-    let n = tokio::time::timeout(Duration::from_secs(2), sock.read(&mut buf))
+    let n = tokio::time::timeout(budget::FACT_BUDGET, sock.read(&mut buf))
         .await
         .expect("server did not close TCP after unsupported VERSION")
         .expect("read");
@@ -1283,8 +1281,8 @@ async fn server_tcp_version_below_minimum_drops_connection() {
 /// `RSRV_ERROR` which tears the connection down. Pre-fix Rust sent
 /// the error reply but kept the connection open, letting a peer
 /// flood the server with bad-type WRITE_NOTIFYs.
-// Async `CaServer` path: no tokio reactor under `rtems-exec-model`.
-#[cfg(not(feature = "rtems-exec-model"))]
+// Async `CaServer` path: no tokio reactor under `exec_backend`.
+#[cfg(tokio_backend)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[serial]
 async fn server_write_notify_bad_type_replies_error_and_disconnects() {
@@ -1310,7 +1308,7 @@ async fn server_write_notify_bad_type_replies_error_and_disconnects() {
     ver.count = CA_MINOR_VERSION;
     sock.write_all(&ver.to_bytes()).await.unwrap();
     let mut hello = [0u8; 64];
-    tokio::time::timeout(Duration::from_secs(2), sock.read(&mut hello))
+    tokio::time::timeout(budget::FACT_BUDGET, sock.read(&mut hello))
         .await
         .expect("VERSION reply timed out")
         .expect("read VERSION");
@@ -1406,7 +1404,7 @@ async fn server_write_notify_bad_type_replies_error_and_disconnects() {
     let mut resp = [0u8; 64];
     let mut total = 0;
     while total < 16 {
-        let n = tokio::time::timeout(Duration::from_secs(2), sock.read(&mut resp[total..]))
+        let n = tokio::time::timeout(budget::FACT_BUDGET, sock.read(&mut resp[total..]))
             .await
             .expect("error reply timed out")
             .expect("read error reply");
@@ -1426,7 +1424,7 @@ async fn server_write_notify_bad_type_replies_error_and_disconnects() {
 
     // Server must disconnect after the error reply.
     let mut tail = [0u8; 16];
-    let n = tokio::time::timeout(Duration::from_secs(2), sock.read(&mut tail))
+    let n = tokio::time::timeout(budget::FACT_BUDGET, sock.read(&mut tail))
         .await
         .expect("server did not close after WRITE_NOTIFY bad type")
         .expect("read after error");
@@ -1442,7 +1440,7 @@ async fn server_write_notify_bad_type_replies_error_and_disconnects() {
 /// `m_count` VERBATIM — there is NO DBR_CLASS_NAME special case in C
 /// `read_action` (`rsrv/camessage.c:622-624`). For DBR_CLASS_NAME (38)
 /// with `m_count == 0`, `dbr_size_n(38, 0) = dbr_size[38] -
-/// dbr_value_size[38] = 40 - 40 = 0` (`access.cpp:906`/`:955`,
+/// dbr_value_size[38] = 40 - 40 = 0` (`access.cpp:894`/`:943`,
 /// `db_access.h:533`), so the reply ships `count = 0` and a 0-byte
 /// payload. Only the READ_NOTIFY / EVENT_ADD path (C `read_reply`,
 /// `camessage.c:507-575`) treats `m_count == 0` as autosize and forces
@@ -1459,8 +1457,8 @@ async fn server_write_notify_bad_type_replies_error_and_disconnects() {
 ///   C. READ_NOTIFY,     CLASS_NAME, count 0  -> count 1, 40-byte body
 /// B and C pin that the reorder preserves ordinary class-name reads and
 /// the notify autosize path.
-// Async `CaServer` path: no tokio reactor under `rtems-exec-model`.
-#[cfg(not(feature = "rtems-exec-model"))]
+// Async `CaServer` path: no tokio reactor under `exec_backend`.
+#[cfg(tokio_backend)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[serial]
 async fn server_deprecated_read_class_name_count0_follows_c_m_count() {
@@ -1491,7 +1489,7 @@ async fn server_deprecated_read_class_name_count0_follows_c_m_count() {
     ver.count = CA_MINOR_VERSION;
     sock.write_all(&ver.to_bytes()).await.unwrap();
     let mut hello = [0u8; 64];
-    tokio::time::timeout(Duration::from_secs(2), sock.read(&mut hello))
+    tokio::time::timeout(budget::FACT_BUDGET, sock.read(&mut hello))
         .await
         .expect("VERSION reply timed out")
         .expect("read VERSION");
@@ -1590,7 +1588,7 @@ async fn server_deprecated_read_class_name_count0_follows_c_m_count() {
     let mut acc: Vec<u8> = Vec::new();
     let mut replies: Map<u32, CaHeader> = Map::new();
     let mut rbuf = [0u8; 256];
-    let deadline = Duration::from_secs(3);
+    let deadline = budget::FACT_BUDGET;
     while replies.len() < 3 {
         let n = tokio::time::timeout(deadline, sock.read(&mut rbuf))
             .await
@@ -1671,7 +1669,7 @@ async fn server_deprecated_read_class_name_count0_follows_c_m_count() {
 /// `DBR_STRING` payload to its NUL-terminated length. C `read_action`
 /// (`rsrv/camessage.c:666-680`) recomputes `payloadSize =
 /// epicsStrnLen(pStr, 40) + 1` for `DBR_STRING && m_count == 1`, then
-/// `cas_commit_msg` (`caserverio.c:350-365`) aligns to 8 and rewrites
+/// `cas_commit_msg` (`caserverio.c:350-366`) aligns to 8 and rewrites
 /// `m_postsize` (header count stays 1). So `"OK"` commits an 8-byte
 /// payload, not the fixed 40-byte slot. READ_NOTIFY / EVENT_ADD never
 /// run this branch (C `read_reply` keeps the full slot).
@@ -1682,8 +1680,8 @@ async fn server_deprecated_read_class_name_count0_follows_c_m_count() {
 ///   C. READ_NOTIFY,     "OK"           -> count 1, postsize 40 (full slot)
 /// B pins that a near-full string is not over-trimmed; C pins that the
 /// notify path keeps the C `read_reply` 40-byte slot.
-// Async `CaServer` path: no tokio reactor under `rtems-exec-model`.
-#[cfg(not(feature = "rtems-exec-model"))]
+// Async `CaServer` path: no tokio reactor under `exec_backend`.
+#[cfg(tokio_backend)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[serial]
 async fn server_deprecated_read_string_shortens_to_nul_length() {
@@ -1716,7 +1714,7 @@ async fn server_deprecated_read_string_shortens_to_nul_length() {
     ver.count = CA_MINOR_VERSION;
     sock.write_all(&ver.to_bytes()).await.unwrap();
     let mut hello = [0u8; 64];
-    tokio::time::timeout(Duration::from_secs(2), sock.read(&mut hello))
+    tokio::time::timeout(budget::FACT_BUDGET, sock.read(&mut hello))
         .await
         .expect("VERSION reply timed out")
         .expect("read VERSION");
@@ -1808,7 +1806,7 @@ async fn server_deprecated_read_string_shortens_to_nul_length() {
     let mut replies: Map<u32, CaHeader> = Map::new();
     let mut rbuf = [0u8; 512];
     while replies.len() < 3 {
-        let n = tokio::time::timeout(Duration::from_secs(3), sock.read(&mut rbuf))
+        let n = tokio::time::timeout(budget::FACT_BUDGET, sock.read(&mut rbuf))
             .await
             .unwrap_or_else(|_| panic!("timed out; got {:?}", replies.keys()))
             .expect("read replies");
@@ -1883,8 +1881,8 @@ async fn server_deprecated_read_string_shortens_to_nul_length() {
 /// the prior SEARCH is still in `current_buf`. Every cid must be
 /// answered exactly once; pre-fix a re-parse duplicates a cid's
 /// SEARCH reply.
-// Async `CaServer` path: no tokio reactor under `rtems-exec-model`.
-#[cfg(not(feature = "rtems-exec-model"))]
+// Async `CaServer` path: no tokio reactor under `exec_backend`.
+#[cfg(tokio_backend)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[serial]
 async fn mr_r7_rejected_queued_datagram_does_not_reparse_stale_buffer() {
@@ -1989,7 +1987,7 @@ async fn mr_r7_rejected_queued_datagram_does_not_reparse_stale_buffer() {
                         off += CaHeader::SIZE + ((h.postsize as usize + 7) & !7);
                     }
                 }
-                // C client parity (`udpiiu.cpp:420-426`): UDP recv errors
+                // C client parity (`udpiiu.cpp:417-426`): UDP recv errors
                 // `ECONNRESET` (Windows KB263823 — an earlier send drew an
                 // ICMP port-unreachable) and `ECONNREFUSED` (Linux
                 // equivalent) are ignored and receiving continues; libca
@@ -2051,8 +2049,8 @@ async fn mr_r7_rejected_queued_datagram_does_not_reparse_stale_buffer() {
 /// the notify path too, an extra wire frame before EOF that rsrv
 /// never produces. Test asserts the silent-close behaviour: no
 /// wire frame, just connection drop.
-// Async `CaServer` path: no tokio reactor under `rtems-exec-model`.
-#[cfg(not(feature = "rtems-exec-model"))]
+// Async `CaServer` path: no tokio reactor under `exec_backend`.
+#[cfg(tokio_backend)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[serial]
 async fn server_read_notify_bad_type_closes_silently() {
@@ -2081,7 +2079,7 @@ async fn server_read_notify_bad_type_closes_silently() {
     let mut hello = [0u8; 64];
     let mut got_hello = 0;
     while got_hello < 32 {
-        let n = tokio::time::timeout(Duration::from_secs(2), sock.read(&mut hello[got_hello..]))
+        let n = tokio::time::timeout(budget::FACT_BUDGET, sock.read(&mut hello[got_hello..]))
             .await
             .expect("VERSION drain timed out")
             .expect("read VERSION");
@@ -2167,7 +2165,7 @@ async fn server_read_notify_bad_type_closes_silently() {
     // silently on INVALID_DB_REQ. Reading should observe EOF
     // (n=0) directly, never any header bytes.
     let mut resp = [0u8; 64];
-    let n = tokio::time::timeout(Duration::from_secs(2), sock.read(&mut resp))
+    let n = tokio::time::timeout(budget::FACT_BUDGET, sock.read(&mut resp))
         .await
         .expect("server did not close after READ_NOTIFY bad type")
         .expect("read after bad type");
@@ -2180,18 +2178,17 @@ async fn server_read_notify_bad_type_closes_silently() {
     );
 }
 
-/// C `read_sync_reply` (`rsrv/camessage.c:2107-2121`) echoes the
+/// C `read_sync_reply` (`rsrv/camessage.c:2053-2067`) echoes the
 /// request header back with cmmd=CA_PROTO_READ_SYNC, m_postsize=0,
 /// and the request's m_dataType / m_count / m_cid / m_available
 /// preserved. libca client treats this as ECHO (`cac.cpp:72-73`).
 /// Pre-fix Rust silently no-op-ed; this regression test ensures the
 /// echo reply now arrives with the expected fields.
-// Async `CaServer` path: no tokio reactor under `rtems-exec-model`.
-#[cfg(not(feature = "rtems-exec-model"))]
+// Async `CaServer` path: no tokio reactor under `exec_backend`.
+#[cfg(tokio_backend)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[serial]
 async fn server_read_sync_echoes_request_header() {
-    use std::time::Duration;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpStream;
 
@@ -2215,7 +2212,7 @@ async fn server_read_sync_echoes_request_header() {
     let mut hello = [0u8; 64];
     let mut got_hello = 0;
     while got_hello < 32 {
-        let n = tokio::time::timeout(Duration::from_secs(2), sock.read(&mut hello[got_hello..]))
+        let n = tokio::time::timeout(budget::FACT_BUDGET, sock.read(&mut hello[got_hello..]))
             .await
             .expect("VERSION drain timed out")
             .expect("read VERSION");
@@ -2241,7 +2238,7 @@ async fn server_read_sync_echoes_request_header() {
     let mut resp = [0u8; 32];
     let mut total = 0;
     while total < 16 {
-        let n = tokio::time::timeout(Duration::from_secs(2), sock.read(&mut resp[total..]))
+        let n = tokio::time::timeout(budget::FACT_BUDGET, sock.read(&mut resp[total..]))
             .await
             .expect("READ_SYNC echo timed out")
             .expect("read echo");
@@ -2272,22 +2269,38 @@ async fn server_read_sync_echoes_request_header() {
 /// duplicate initial value). `NativeTypeChanged` is reserved for a genuine
 /// transition from a known prior type (an IOC redefining the record, or a
 /// reconnect to a differently-typed record).
-// Async `CaServer` path: no tokio reactor under `rtems-exec-model`.
-#[cfg(not(feature = "rtems-exec-model"))]
+// Async `CaServer` path: no tokio reactor under `exec_backend`.
+#[cfg(tokio_backend)]
 #[tokio::test]
 async fn first_connect_does_not_emit_native_type_changed() {
-    use std::time::Duration;
-
     use epics_ca_rs::client::{CaClient, ConnectionEvent};
+
+    // Two ACFs differing only in the level DEFAULT grants, so reloading the
+    // second over the first is a genuine ReadWrite→Read transition. That is
+    // what it takes to get a frame: C `asLibRoutines.c:1047-1051` fires the
+    // COAR callback only when `oldaccess != access`, and `reeval_access_rights`
+    // (server/tcp.rs) mirrors it, so reloading an unchanged file — or firing a
+    // bare `notify_access_change()` — pushes nothing and cannot be a barrier.
+    let dir = tempfile::tempdir().expect("temp dir for the ACF pair");
+    let rw_acf = dir.path().join("rw.acf");
+    let ro_acf = dir.path().join("ro.acf");
+    std::fs::write(&rw_acf, "ASG(DEFAULT) { RULE(1, WRITE) }").expect("write the read-write acf");
+    std::fs::write(&ro_acf, "ASG(DEFAULT) { RULE(1, READ) }").expect("write the read-only acf");
 
     let server = CaServer::builder()
         .port(0)
         .pv("NTC:FIRST:PV", EpicsValue::Double(1.0))
+        .acf_file(rw_acf.to_str().unwrap())
+        .expect("load the read-write ACF")
         .build()
         .await
         .expect("build CA server");
     let port = server.udp_port();
-    let _server_handle = tokio::spawn(async move { server.run().await });
+    // `run` borrows rather than consumes, so the server stays reachable for the
+    // reload that supplies this test's barrier.
+    let server = std::sync::Arc::new(server);
+    let run_server = server.clone();
+    let _server_handle = tokio::spawn(async move { run_server.run().await });
 
     // Target the in-process server directly (no process-global env mutation),
     // so this test needs no `#[serial]` and cannot race the env other tests set.
@@ -2302,37 +2315,68 @@ async fn first_connect_does_not_emit_native_type_changed() {
     let mut events = channel.connection_events();
 
     channel
-        .wait_connected(Duration::from_secs(5))
+        .wait_connected(budget::FACT_BUDGET)
         .await
         .expect("channel connects to the in-process server");
 
-    // Drain events up to and just past connect. `Connected` (and
-    // `AccessRightsChanged`) are expected; `NativeTypeChanged` is not. If the
-    // client wrongly emitted it, it lands right after `Connected` in the same
-    // burst, well within this idle window.
-    let mut saw_connected = false;
-    loop {
-        match tokio::time::timeout(Duration::from_millis(300), events.recv()).await {
-            Ok(Ok(ev)) => {
-                if matches!(ev, ConnectionEvent::Connected) {
-                    saw_connected = true;
-                }
-                assert!(
-                    !matches!(ev, ConnectionEvent::NativeTypeChanged { .. }),
-                    "first connect must not emit NativeTypeChanged: the native \
-                     type was discovered, not changed"
-                );
-            }
-            // Lagged or closed: no more meaningful events to inspect.
-            Ok(Err(_)) => break,
-            // Idle window elapsed with no further event — the burst is over.
-            Err(_) => break,
-        }
+    // `Connected` (and `AccessRightsChanged`) are expected on this stream;
+    // `NativeTypeChanged` is not. A wrong one lands right beside `Connected`,
+    // both emitted from the one CREATE_CHAN_RESPONSE with no await between the
+    // sends — so neither of them can order the other, and draining a window
+    // only ever proved the burst was faster than the number. Dropping DEFAULT
+    // to READ makes `reeval_access_rights` push one CA_PROTO_ACCESS_RIGHTS per
+    // open channel: a server frame that reaches the client on a later pass of
+    // the coordinator loop, so nothing the burst produced can follow it.
+    server
+        .reload_acf_from(ro_acf.to_str().unwrap())
+        .await
+        .expect("reload the read-only ACF");
+
+    #[derive(Debug)]
+    enum Ev {
+        Connected,
+        NativeTypeChanged,
+        Rights { write: bool },
+        Other,
     }
+    let seen = budget::barrier::until_async(
+        "first connect must not emit NativeTypeChanged: the native type was \
+         discovered, not changed",
+        |e: &Ev| matches!(e, Ev::NativeTypeChanged),
+        |e: &Ev| matches!(e, Ev::Rights { write: false }),
+        async |remaining| {
+            let ev = tokio::time::timeout(remaining, events.recv()).await.ok()?;
+            Some(match ev {
+                Ok(ConnectionEvent::Connected) => Ev::Connected,
+                Ok(ConnectionEvent::NativeTypeChanged { .. }) => Ev::NativeTypeChanged,
+                Ok(ConnectionEvent::AccessRightsChanged { write, .. }) => Ev::Rights { write },
+                Ok(_) => Ev::Other,
+                // Lagged or closed: the stream can no longer answer the claim.
+                Err(_) => return None,
+            })
+        },
+    )
+    .await;
 
     assert!(
-        saw_connected,
-        "expected a Connected event on first connect (else the event window was \
-         missed and the NativeTypeChanged check is meaningless)"
+        seen.iter().any(|e| matches!(e, Ev::Connected)),
+        "expected a Connected event on first connect (else the subscription was \
+         late and the NativeTypeChanged check is meaningless); saw {seen:?}"
     );
+    // The barrier is the *reloaded* level, so the burst's own rights event has
+    // to be the read-write one. Were the read-write ACF not in force, the burst
+    // would satisfy the barrier itself and order nothing — assert it loudly
+    // rather than let the claim go quietly vacuous.
+    assert!(
+        matches!(
+            seen.iter().find(|e| matches!(e, Ev::Rights { .. })),
+            Some(Ev::Rights { write: true })
+        ),
+        "the connect burst must report write access under the read-write ACF, \
+         else the read-only barrier orders nothing; saw {seen:?}"
+    );
+    drop(dir);
 }
+
+#[path = "common/budget.rs"]
+mod budget;

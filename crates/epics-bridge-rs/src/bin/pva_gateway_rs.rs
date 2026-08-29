@@ -32,7 +32,7 @@
 //! each server must resolve every referenced client). `-C` /
 //! `--check-config` parses and validates without binding any socket,
 //! mirroring `gwmain.cpp`'s `-C` preflight. Named clients/servers are
-//! wired through [`MultiTenantPvaGatewayBuilder`], so one downstream can
+//! wired through `MultiTenantPvaGatewayBuilder`, so one downstream can
 //! be backed by a selected subset of named upstream providers
 //! (`gwmain.cpp:133-188`), instead of collapsing to one client/server
 //! pair.
@@ -53,6 +53,12 @@
 //! (`EPICS_PVAS_INTF_ADDR_LIST`, `gwmain.cpp:164`), binding every listed
 //! NIC.
 
+// On `exec_backend` this program's `main` refuses instead of running, so
+// everything below it is unreachable in that configuration by construction.
+// The lint is reporting the intent, not dead code: the default build still
+// lints this file in full.
+#![cfg_attr(exec_backend, allow(dead_code, unused_imports))]
+
 use std::fs;
 use std::net::{IpAddr, Ipv4Addr};
 use std::path::{Path, PathBuf};
@@ -63,6 +69,7 @@ use std::time::Duration;
 use clap::Parser;
 use serde::Deserialize;
 
+#[cfg(tokio_backend)]
 use epics_bridge_rs::pva_gateway::{
     MultiTenantPvaGateway, MultiTenantPvaGatewayBuilder, PvaGateway, PvaGatewayConfig,
 };
@@ -133,7 +140,7 @@ struct Args {
 // ── pva2pva JSON config schema (gwmain.cpp:39-59) ──────────────────────
 
 /// Top-level config object. `version` defaults to 0 so a missing key is
-/// distinguishable from an explicit `1` (gwmain.cpp:118-122 warns on a
+/// distinguishable from an explicit `1` (gwmain.cpp:112-113 warns on a
 /// missing version and assumes 1).
 #[derive(Debug, Deserialize)]
 struct GatewayConfigFile {
@@ -279,8 +286,8 @@ fn parse_config(text: &str) -> Result<GatewayConfigFile, String> {
 }
 
 /// Validate a parsed config without touching the network. Mirrors the
-/// gwmain.cpp checks: version (`:118-127`), non-empty clients/servers
-/// (`:128-135`), unique names + server→client resolution (`:291-322`),
+/// gwmain.cpp checks: version (`:111-117`), non-empty clients/servers
+/// (`:118-125`), unique names + server→client resolution (`:291-322`),
 /// plus the PVA-only-provider constraint specific to this binary.
 fn validate(cfg: &GatewayConfigFile) -> Result<(), String> {
     if cfg.version != 0 && cfg.version != 1 {
@@ -387,7 +394,9 @@ fn resolve_server_bind(intf_ips: Vec<IpAddr>) -> (IpAddr, Vec<IpAddr>) {
 /// gateway-rs knobs absent from the pva2pva JSON schema; they arrive already
 /// resolved against `EPICS_PVA_GW_*` env. The schema's `readOnly` /
 /// `control_prefix` stay file-authoritative and are read from `cfg`.
+#[cfg(tokio_backend)]
 fn build_gateway(
+    reactor: &epics_base_rs::runtime::task::Reactor,
     cfg: &GatewayConfigFile,
     cleanup: Duration,
     connect: Duration,
@@ -468,9 +477,10 @@ fn build_gateway(
             .downstream_control_acf(control_acf, control_reload_acf);
     }
 
-    builder.start().map_err(|e| e.to_string())
+    builder.start(reactor).map_err(|e| e.to_string())
 }
 
+#[cfg(tokio_backend)]
 async fn run_from_config(
     path: &Path,
     check_only: bool,
@@ -508,7 +518,16 @@ async fn run_from_config(
         return ExitCode::SUCCESS;
     }
 
-    let gw = match build_gateway(&cfg, cleanup, connect, max_cache_entries, max_subscribers) {
+    let reactor = epics_base_rs::runtime::task::Reactor::current()
+        .expect("run_from_config is awaited on the daemon's runtime");
+    let gw = match build_gateway(
+        &reactor,
+        &cfg,
+        cleanup,
+        connect,
+        max_cache_entries,
+        max_subscribers,
+    ) {
         Ok(g) => g,
         Err(e) => {
             eprintln!("pva-gateway-rs: failed to start: {e}");
@@ -551,12 +570,14 @@ fn init_tracing(verbose: u8) {
 /// rather than by a runtime "was it the default?" check.
 ///
 /// [`with_env`]: PvaGatewayConfig::with_env
+#[cfg(tokio_backend)]
 struct ResolvedConfig {
     base: PvaGatewayConfig,
     cleanup: Duration,
     connect: Duration,
 }
 
+#[cfg(tokio_backend)]
 impl ResolvedConfig {
     fn from_args(args: &Args) -> Self {
         let base = PvaGatewayConfig::default().with_env();
@@ -609,8 +630,9 @@ impl ResolvedConfig {
 // One worker, reactor-style — the shape pva2pva forwards from (a single
 // event loop). The default per-CPU pool migrates the mostly-serial
 // serving work across idle workers, costing ~35 µs of extra CPU per op
-// on a 96-core host (doc/qsrv-put-perf.md). Multi-thread flavor is kept
-// so `block_on_sync` works from runtime tasks.
+// on a 96-core host. Multi-thread flavor is kept so `block_on_sync`
+// works from runtime tasks.
+#[cfg(tokio_backend)]
 #[tokio::main(worker_threads = 1)]
 async fn main() -> ExitCode {
     let args = Args::parse();
@@ -644,7 +666,9 @@ async fn main() -> ExitCode {
     // Flag mode: one upstream client, one downstream server.
     let cfg = resolved.into_flag_config(&args);
 
-    let gateway = match PvaGateway::start(cfg) {
+    let reactor = epics_base_rs::runtime::task::Reactor::current()
+        .expect("main is awaited on the daemon's runtime");
+    let gateway = match PvaGateway::start(&reactor, cfg) {
         Ok(g) => g,
         Err(e) => {
             eprintln!("pva-gateway-rs: failed to start: {e}");
@@ -671,6 +695,20 @@ async fn main() -> ExitCode {
             ExitCode::FAILURE
         }
     }
+}
+
+/// The `exec_backend` arm. The gateway is a PVA client *and* a PVA server, both
+/// through the reactor-bound front-end, so on the reactor-free backend neither
+/// half exists. Nothing replaces it: an RTEMS image runs an IOC, not a gateway.
+#[cfg(exec_backend)]
+fn main() -> ExitCode {
+    eprintln!(
+        "pva-gateway-rs: this build selects the reactor-free execution backend \
+         (EPICS_RS_BUILD_EXEC_BACKEND=thread), and both the upstream PVA client \
+         and the downstream PVA server need a tokio reactor. Unset that variable \
+         and rebuild to run the gateway."
+    );
+    ExitCode::FAILURE
 }
 
 #[cfg(test)]
@@ -826,6 +864,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(tokio_backend)]
     fn flag_config_applies_env_with_cli_precedence() {
         // The defect this guards: flag mode used to build the config with
         // `..PvaGatewayConfig::default()`, so the documented EPICS_PVA_GW_*

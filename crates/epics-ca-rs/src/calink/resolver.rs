@@ -5,12 +5,12 @@
 //! subscription, and a monitor task that keeps an [`arc_swap::ArcSwap`]
 //! snapshot current. The [`LinkSet`] read methods serve from that
 //! cache — never a synchronous per-read network fetch. This is the
-//! C `dbCa.c` model: `dbCaGetLink` (`dbCa.c:448`) reads the value
-//! cached by the monitor `eventCallback` (`dbCa.c:925`).
+//! C `dbCa.c` model: `dbCaGetLink` (`dbCa.c:419`) reads the value
+//! cached by the monitor `eventCallback` (`dbCa.c:891`).
 
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use crate::DbFieldType;
 use crate::client::{CaChannel, CaClient};
@@ -18,7 +18,7 @@ use crate::protocol::{DBE_ALARM, DBE_VALUE};
 use arc_swap::ArcSwap;
 use epics_base_rs::runtime::task;
 use epics_base_rs::server::database::{
-    LinkDbfType, LinkMetadata, LinkPutOp, LinkSet, PutAdmission, PvDatabase,
+    LinkDbfType, LinkDiagnostics, LinkMetadata, LinkPutOp, LinkSet, PutAdmission, PvDatabase,
 };
 use epics_base_rs::server::snapshot::{DbrClass, Snapshot};
 use epics_base_rs::types::DBR_CTRL_DOUBLE;
@@ -26,7 +26,7 @@ use epics_base_rs::types::EpicsValue;
 use parking_lot::RwLock;
 
 /// CA record-link monitor event mask — `DBE_VALUE | DBE_ALARM`, matching
-/// C `dbCa`'s `ca_add_array_event` (`dbCa.c:1258-1269`), whose libca macro
+/// C `dbCa`'s `ca_add_array_event` (`dbCa.c:1225-1229`), whose libca macro
 /// expands to `ca_add_masked_array_event(..., DBE_VALUE | DBE_ALARM)`
 /// (`cadef.h:2004-2012`). Deliberately excludes `DBE_LOG` / `DBE_ARCHIVE`
 /// (a separate event-trigger class, `cadef.h:1148-1158`) that `dbCa` never
@@ -43,7 +43,7 @@ const CALINK_EVENT_MASK: u16 = DBE_VALUE | DBE_ALARM;
 /// is not recoverable from a possibly-partial waveform payload, so it is
 /// captured here at store time. [`CaLink`]'s read accessors serve this only
 /// while both still match the channel's current native description — see
-/// [`CaLink::with_servable`] / C `dbCa.c:865-889`.
+/// [`CaLink::with_servable`] / C `dbCa.c:835-859`.
 struct CachedSnapshot {
     snapshot: Snapshot,
     native_count: u32,
@@ -52,9 +52,9 @@ struct CachedSnapshot {
 /// True iff a cached snapshot remains servable: the value's CA-wire DBR
 /// type and the channel native element count it was taken under both still
 /// equal the channel's current native description. Mirrors C
-/// `dbCa.c:865-889`, which refuses the old cache once a reconnect changes
+/// `dbCa.c:835-859`, which refuses the old cache once a reconnect changes
 /// the element count or DBR type, until a matching monitor event
-/// repopulates it (`dbCaGetLink` invalid-cache path `dbCa.c:484-492`).
+/// repopulates it (`dbCaGetLink` invalid-cache path `dbCa.c:455-464`).
 ///
 /// Pure (no `self`) so the type/count gate is unit-testable without a live
 /// CA channel — the same factoring as [`note_conn_event`].
@@ -105,7 +105,7 @@ pub struct CaLink {
     /// Owned by [`LinkConnState`], not a bare flag: C's
     /// `connectionCallback` does two things on a disconnect — clears the
     /// flag AND adds `CA_DBPROCESS` for the link's CP holders
-    /// (`dbCa.c:862-873`) — and a bare `AtomicBool` let three call sites
+    /// (`dbCa.c:818-830`) — and a bare `AtomicBool` let three call sites
     /// do the first without the second (stage C6 criterion 4).
     connected: Arc<LinkConnState>,
     /// Cached remote CTRL attributes (display/control/alarm limits,
@@ -113,10 +113,10 @@ pub struct CaLink {
     /// count. `None` until the first attribute fetch completes; the
     /// connection-event watcher re-fetches on every (re)connection.
     /// Mirrors C `dbCa.c`: `connectionCallback`
-    /// (`dbCa.c:833`) schedules `CA_GET_ATTRIBUTES` on connect, and
-    /// `getAttribEventCallback` (`dbCa.c:1080`) caches the
+    /// (`dbCa.c:880`) schedules `CA_GET_ATTRIBUTES` on connect, and
+    /// `getAttribEventCallback` (`dbCa.c:1042-1091`) caches the
     /// `DBR_CTRL_DOUBLE` reply that `getControlLimits`/`getGraphicLimits`
-    /// /`getAlarmLimits`/`getPrecision`/`getUnits` (`dbCa.c:726`) later
+    /// /`getAlarmLimits`/`getPrecision`/`getUnits` (`dbCa.c:697-772`) later
     /// serve.
     meta: Arc<ArcSwap<Option<LinkMetadata>>>,
     /// The CA channel — kept alive so the monitor stays subscribed.
@@ -136,11 +136,11 @@ pub struct CaLink {
 ///
 /// **Invariant.** A `ca://` link's servability flag MUST NOT go from
 /// connected to disconnected without dispatching that PV's CP/CPP holders.
-/// C `connectionCallback` (`dbCa.c:861-873`) clears `pca->isConnected` and,
+/// C `connectionCallback` (`dbCa.c:817-830`) clears `pca->isConnected` and,
 /// in the same critical section, sets `CA_DBPROCESS` for a `pvlOptCP` link
 /// (or a `pvlOptCPP` link whose holder is Passive), so the holder processes,
 /// its `dbCaGetLink` returns `-1` with `LINK_ALARM`/`INVALID_ALARM`
-/// (`dbCa.c:459-463`), and the record lands in LINK/INVALID. Without the
+/// (`dbCa.c:430-435`), and the record lands in LINK/INVALID. Without the
 /// dispatch a Passive CP holder is never processed again and keeps serving
 /// its last good value with `SEVR=NO_ALARM` for the whole outage — measured
 /// on target, stage C6 criterion 4 (§11.4).
@@ -162,25 +162,25 @@ pub struct CaLink {
 /// event that drives processing — which [`run_monitor`] already does.
 ///
 /// The same owner also carries the read half of C's cached access rights
-/// (`pca->hasReadAccess`, `dbCa.c:875`/`:1089`). [`Self::note_access_rights`]
+/// (`pca->hasReadAccess`, `dbCa.c:831`/`:1027`). [`Self::note_access_rights`]
 /// is its only writer, and it performs C `accessRightsCallback`'s two steps
-/// (`dbCa.c:1076-1102`) — cache the new rights, then dispatch the CP/CPP
+/// (`dbCa.c:1014-1040`) — cache the new rights, then dispatch the CP/CPP
 /// holders when a right is lost while connected — as one owned transition,
 /// for the same reason the disconnect dispatch lives inside
 /// [`Self::mark_disconnected`]: a second site that stored the rights without
 /// dispatching would be the §11.4 defect again on the access axis.
 struct LinkConnState {
     flag: AtomicBool,
-    /// C `pca->hasReadAccess` (`dbCa.c:875`, `:1089`) — the read half of the
+    /// C `pca->hasReadAccess` (`dbCa.c:831`, `:1027`) — the read half of the
     /// last server-granted access rights. Consulted ONLY by the value read
     /// ([`CaLink::value`]), exactly as C consults it only in `dbCaGetLink`
-    /// (`dbCa.c:459`); the severity/timestamp/metadata getters (`pcaGetCheck`,
-    /// `dbCa.c:650-660`) and the lset `isConnected` (`dbCa.c:633-641`) check
+    /// (`dbCa.c:430`); the severity/timestamp/metadata getters (`pcaGetCheck`,
+    /// `dbCa.c:621-631`) and the lset `isConnected` (`dbCa.c:604-612`) check
     /// `isConnected` alone.
     ///
     /// `true` at rest, NOT C's calloc-FALSE. C sets `isConnected` and both
     /// access flags inside one `pca->lock` critical section
-    /// (`dbCa.c:861-876`), so a connected link never shows the calloc
+    /// (`dbCa.c:817-832`), so a connected link never shows the calloc
     /// default. Here `Connected` and the rights that follow it are two
     /// broadcast events, and [`run_monitor`] may open the connected gate
     /// first (a delivered event is proof of liveness), so a `false` default
@@ -189,10 +189,10 @@ struct LinkConnState {
     /// never shows. The coordinator broadcasts the real rights immediately
     /// after every `Connected`, so the default only lives for that gap.
     read_access: AtomicBool,
-    /// C `pca->hasWriteAccess` (`dbCa.c:876`, `:1090`) — the write half of
+    /// C `pca->hasWriteAccess` (`dbCa.c:832`, `:1028`) — the write half of
     /// the same rights event, consulted by `CaResolver::put_admission`
     /// because `dbCaPutLinkCallback`'s gate is
-    /// `if (!pca->isConnected || !pca->hasWriteAccess)` (`dbCa.c:558-561`):
+    /// `if (!pca->isConnected || !pca->hasWriteAccess)` (`dbCa.c:529-532`):
     /// BOTH operands, tested before anything is staged. The client's own
     /// put path also refuses a write-denied channel (libca `nciu::write`
     /// ECA_NOWTACCESS parity), but that refusal happens on the link work
@@ -207,6 +207,21 @@ struct LinkConnState {
     /// disconnect. Attached after the resolver is mounted, hence the lock and
     /// the `Option`; a `None` here is a link opened with no database, which
     /// has no holders to process.
+    /// C `pca->nDisconnect` (`dbCa.c:822`), which `dbcar` prints per link
+    /// and sums into its trailing `(%lu disconnects, ...)` total
+    /// (`dbCaTest.c:99`, `:115`, `:153`). Counted HERE and not at the
+    /// watcher, for the reason the CP dispatch is: `mark_disconnected` is
+    /// the only true→false edge, so the count cannot double under a
+    /// `Disconnected` that arrives twice.
+    n_disconnect: AtomicU64,
+    /// C `pvlOptInpNative` (`dbCa.c:456`) — the link has served a native
+    /// input transfer. Set by [`CaLink::value`], the port's `dbCaGetLink`.
+    ///
+    /// C additionally CLEARS this (with its three siblings) when a reconnect
+    /// changes the channel's native type or element count
+    /// (`dbCa.c:847-849`), and the next `dbCaGetLink` re-sets it; this port
+    /// leaves it set, so the two disagree only inside that window.
+    used_input_native: AtomicBool,
     db: Arc<RwLock<Option<PvDatabase>>>,
     pv_name: String,
 }
@@ -217,6 +232,8 @@ impl LinkConnState {
             flag: AtomicBool::new(false),
             read_access: AtomicBool::new(true),
             write_access: AtomicBool::new(true),
+            n_disconnect: AtomicU64::new(0),
+            used_input_native: AtomicBool::new(false),
             db,
             pv_name,
         }
@@ -238,6 +255,10 @@ impl LinkConnState {
         if !self.flag.swap(false, Ordering::AcqRel) {
             return false;
         }
+        // C `connectionCallback` bumps `pca->nDisconnect` in the same
+        // critical section that clears `isConnected` and queues the CP
+        // dispatch (`dbCa.c:820-826`) — one edge, one count, one owner.
+        self.n_disconnect.fetch_add(1, Ordering::Relaxed);
         // Drop the read guard before dispatching: the dispatch runs record
         // processing, and holding a lock across it is the deadlock shape
         // `run_monitor` already avoids on the value path.
@@ -249,22 +270,38 @@ impl LinkConnState {
     }
 
     /// The read half of the cached access rights — C `dbCaGetLink`'s
-    /// `!pca->hasReadAccess` operand (`dbCa.c:459`).
+    /// `!pca->hasReadAccess` operand (`dbCa.c:430`).
     fn has_read_access(&self) -> bool {
         self.read_access.load(Ordering::Acquire)
     }
 
     /// The write half — `dbCaPutLinkCallback`'s `!pca->hasWriteAccess`
-    /// operand (`dbCa.c:558`).
+    /// operand (`dbCa.c:529`).
     fn has_write_access(&self) -> bool {
         self.write_access.load(Ordering::Acquire)
     }
 
-    /// C `accessRightsCallback` (`dbCa.c:1076-1102`) as one owned
+    /// C `pca->nDisconnect` (`dbCa.c:822`).
+    fn disconnect_count(&self) -> u64 {
+        self.n_disconnect.load(Ordering::Relaxed)
+    }
+
+    /// Record that the link served a native input transfer — C setting
+    /// `pvlOptInpNative` on the `dbCaGetLink` that needs the native monitor
+    /// (`dbCa.c:455-457`).
+    fn note_input_native(&self) {
+        self.used_input_native.store(true, Ordering::Relaxed);
+    }
+
+    fn used_input_native(&self) -> bool {
+        self.used_input_native.load(Ordering::Relaxed)
+    }
+
+    /// C `accessRightsCallback` (`dbCa.c:1014-1040`) as one owned
     /// transition. Returns `true` iff the CP/CPP holders were dispatched.
     ///
     /// * **Not connected:** do nothing at all — C returns before touching
-    ///   the cached flags (`dbCa.c:1084-1085`, "connectionCallback will
+    ///   the cached flags (`dbCa.c:1022-1023`, "connectionCallback will
     ///   handle"). Safe here for the same reason it is in C: the
     ///   coordinator re-broadcasts the current rights immediately after
     ///   `Connected` on every (re)connect, so a skipped event is always
@@ -272,7 +309,7 @@ impl LinkConnState {
     ///   queued behind a `Disconnected` from double-dispatching an outage
     ///   the disconnect edge already dispatched.
     /// * **Connected:** cache both new rights, then dispatch the
-    ///   holders UNLESS both read and write are held (`dbCa.c:1091`
+    ///   holders UNLESS both read and write are held (`dbCa.c:1029`
     ///   `if (hasReadAccess && hasWriteAccess) goto done`). C processes on
     ///   the loss of EITHER right — not read loss alone — and processes
     ///   NOTHING on a full regain: the holder's alarm clears on the next
@@ -281,7 +318,7 @@ impl LinkConnState {
     ///
     /// A dispatched holder whose link lost READ access fails its value
     /// read ([`CaLink::value`] gates on [`Self::has_read_access`]) and
-    /// commits LINK/INVALID — `dbCa.c:459-463`. A holder whose link lost
+    /// commits LINK/INVALID — `dbCa.c:430-435`. A holder whose link lost
     /// only WRITE access still reads a good value and lands no alarm,
     /// which is C's outcome too (`dbCaGetLink` does not consult
     /// `hasWriteAccess`).
@@ -309,7 +346,7 @@ impl LinkConnState {
 /// Abort the wrapped task when dropped. A bare handle detaches on drop
 /// and would leak the monitor task. Typed on the `runtime::task` spawn
 /// seam ([`task::TaskHandle`]) so the monitor/watcher tasks route through
-/// the same executor on both backends — `tokio::spawn` on the host, the
+/// the same executor on both backends — the tokio reactor on the host, the
 /// callback-band future executor on RTEMS — rather than a bare
 /// `tokio::task::JoinHandle` that pins calink to the tokio runtime.
 struct AbortOnDrop(task::TaskHandle<()>);
@@ -323,7 +360,7 @@ impl Drop for AbortOnDrop {
 impl CaLink {
     /// Run `f` over the currently-servable cached snapshot, or return
     /// `None`. The single gate every value-derived accessor shares — the C
-    /// `dbCaGetLink` readable-cache check (`dbCa.c:448`, `:484-492`):
+    /// `dbCaGetLink` readable-cache check (`dbCa.c:419`, `:455-463`):
     ///
     /// 1. the circuit is up (`connected`, driven by
     ///    `CaChannel::connection_events()`);
@@ -333,7 +370,7 @@ impl CaLink {
     ///    still matches the channel's CURRENT native description.
     ///
     /// (3) is the BRIDGE-106 fix: after an upstream reconnect changes the
-    /// type or element count (C `dbCa.c:865-889`), the snapshot cached
+    /// type or element count (C `dbCa.c:835-859`), the snapshot cached
     /// under the old description stops being servable until a new monitor
     /// event repopulates a matching cache. The check is read-side and
     /// value-intrinsic, so it has no dependence on the ordering between the
@@ -370,10 +407,10 @@ impl CaLink {
 
     /// True when the CA circuit is currently up AND a monitor event whose
     /// native description still matches the channel has been cached. C
-    /// `dbCaGetLink` (`dbCa.c:448`) treats a CA link as readable only when
+    /// `dbCaGetLink` (`dbCa.c:419`) treats a CA link as readable only when
     /// `pca->connected` is set (the `connectionCallback` clears it on
     /// disconnect) *and* the monitor callback has populated a matching
-    /// `pca->pgetNative` (cleared by `dbCa.c:865-889` on a type/count
+    /// `pca->pgetNative` (cleared by `dbCa.c:835-859` on a type/count
     /// change).
     ///
     /// Pre-fix this keyed off cache presence alone, so an upstream IOC
@@ -385,7 +422,7 @@ impl CaLink {
     }
 
     /// The cached write right — `dbCaPutLinkCallback`'s second operand
-    /// (`dbCa.c:558`). Separate from [`Self::is_connected`] because C tests
+    /// (`dbCa.c:529`). Separate from [`Self::is_connected`] because C tests
     /// them separately and a write-denied link is still connected: it keeps
     /// serving values to `dbCaGetLink`, which does not consult this.
     pub fn has_write_access(&self) -> bool {
@@ -393,8 +430,10 @@ impl CaLink {
     }
 
     /// The iocInit wait's all-conditions gate for this link — C
-    /// `testInitReady` (dbCa.c:835-845, epics-base #856 "dbCa: iocInit
-    /// wait for all conditions"): servable (connected with the first
+    /// `testInitReady` (`dbCa.c:835-845` at `ef4829829`, epics-base #856
+    /// "dbCa: iocInit wait for all conditions" — post-`R7.0.10` and in no
+    /// tag, so this is the one dbCa.c citation here that is not
+    /// pin-relative): servable (connected with the first
     /// monitor event cached — C's NATIVE wait bit) AND the attribute
     /// fetch complete (the ATTRIB bit; `fetch_link_metadata` stores
     /// `Some` even when the CTRL get failed, exactly the
@@ -414,11 +453,11 @@ impl CaLink {
     /// mis-shaped value into the owning record.
     pub fn value(&self) -> Option<EpicsValue> {
         // C `dbCaGetLink`'s full gate is `!pca->isConnected ||
-        // !pca->hasReadAccess` (`dbCa.c:459-463`). The read-access half
+        // !pca->hasReadAccess` (`dbCa.c:430-435`). The read-access half
         // lives HERE and not in `with_servable`, because C consults
         // `hasReadAccess` only for the value read — `pcaGetCheck`
-        // (severity/timestamp/DBF getters, `dbCa.c:650-660`) and the lset
-        // `isConnected` (`dbCa.c:633-641`) check `isConnected` alone. A
+        // (severity/timestamp/DBF getters, `dbCa.c:621-631`) and the lset
+        // `isConnected` (`dbCa.c:604-612`) check `isConnected` alone. A
         // read-denied link therefore still reports connected (its circuit
         // is up; writes may proceed) but serves no value, so a dispatched
         // CP holder's link read fails and commits LINK/INVALID exactly as
@@ -427,6 +466,59 @@ impl CaLink {
             return None;
         }
         self.with_servable(|s| s.value.clone())
+    }
+
+    /// Mark that the LINK SET was asked for this link's value — C setting
+    /// `pvlOptInpNative` inside `dbCaGetLink` (`dbCa.c:455-457`), which runs
+    /// ahead of the `!pca->gotInNative` bail at `:459`, so a read of a
+    /// connected but still-empty link already marks the link as a native
+    /// input.
+    ///
+    /// Deliberately NOT inside [`Self::value`]: that is the shared cache
+    /// accessor, which `wait_for_link_connected` and other in-crate helpers
+    /// also poll. Hooking it there would make the flag mean "somebody looked
+    /// at the cache" rather than C's "a link read happened", and every
+    /// diagnostic that polls a link would set it.
+    fn note_read(&self) {
+        self.connected.note_input_native();
+    }
+
+    /// This link's `dbcar` report state — C reading the `caLink` fields
+    /// `dbCaTest.c:95-123` prints, minus the staged-write count, which in
+    /// this port belongs to the database's link-put queue rather than to the
+    /// link.
+    ///
+    /// `connected` is the connection-state owner's flag, C's
+    /// `ca_field_type(pca->chid) != TYPENOTCONN` (`dbCaTest.c:97`) — NOT
+    /// [`Self::is_connected`], which additionally requires a servable cache
+    /// because it answers the lset's readable question.
+    pub async fn diagnostics(&self) -> LinkDiagnostics {
+        LinkDiagnostics {
+            connected: self.connected.is_set(),
+            host: self
+                .channel
+                .host_name()
+                .await
+                // C prints whatever `ca_host_name` returns, and for an
+                // unconnected chid libca answers the literal
+                // `"<disconnected>"` (`oldChannelNotify.cpp:189-196`).
+                .unwrap_or_else(|_| "<disconnected>".to_string()),
+            read_access: self.connected.has_read_access(),
+            write_access: self.connected.has_write_access(),
+            n_disconnect: self.connected.disconnect_count(),
+            input_native: self.connected.used_input_native(),
+            // C reaches `pvlOptInpString` only for a `DBR_ENUM` channel read
+            // as `DBR_STRING` (`dbCa.c:439-442`). This port keeps one native
+            // monitor per link and renders strings from it — `LinkSet` has no
+            // typed read for the lset to distinguish — so the column is never
+            // set here.
+            input_string: false,
+            // Both OUT bits are dead at the pin: `dbCa.c:541` and `:557` are
+            // inside `/* Disabled by ANJ ... */`, so C never sets them and
+            // `dbcar` always prints these two columns blank.
+            output_native: false,
+            output_string: false,
+        }
     }
 
     /// Current cached alarm severity (0..3), or `None` when the link
@@ -461,7 +553,7 @@ impl CaLink {
     /// units, DBF type, element count), or `None` when the link is not
     /// connected. Gated on `connected` exactly like
     /// [`Self::value`]/[`Self::alarm_severity`] — C `pcaGetCheck`
-    /// (`dbCa.c:650`) returns `-1` from every metadata getter while the
+    /// (`dbCa.c:621`) returns `-1` from every metadata getter while the
     /// CA link is disconnected, so the owning record keeps its local
     /// default rather than adopting stale remote limits.
     pub fn link_metadata(&self) -> Option<LinkMetadata> {
@@ -580,7 +672,7 @@ impl CaLinkResolver {
         // `meta` permanently empty until the next reconnect.
         let conn_rx = channel.connection_events();
         // C `dbCa` opens the record-link monitor with `ca_add_array_event`
-        // (`dbCa.c:1258-1269`), whose libca macro expands to
+        // (`dbCa.c:1225-1229`), whose libca macro expands to
         // `ca_add_masked_array_event(..., DBE_VALUE | DBE_ALARM)`
         // (`cadef.h:2004-2012`). DBE_LOG / DBE_ARCHIVE is a separate
         // event-trigger class (`cadef.h:1148-1158`) that `dbCa` never
@@ -603,14 +695,16 @@ impl CaLinkResolver {
         // disconnects (mirrors `pvalink`'s `monitor_connected` flag), and
         // re-fetches the remote CTRL attributes into `meta` on each
         // connect.
-        let conn_task = task::spawn(run_connection_watcher(
+        let reactor = self.client().await?.reactor().clone();
+        let conn_task = reactor.spawn(run_connection_watcher(
+            reactor.clone(),
             conn_rx,
             connected.clone(),
             channel.clone(),
             meta.clone(),
             pv_name.to_string(),
         ));
-        let monitor_task = task::spawn(run_monitor(
+        let monitor_task = reactor.spawn(run_monitor(
             monitor,
             cache.clone(),
             connected.clone(),
@@ -651,7 +745,7 @@ impl CaLinkResolver {
             Ok(l) => l,
             Err(_) => return false,
         };
-        let deadline = std::time::Instant::now() + timeout;
+        let deadline = epics_base_rs::runtime::time::deadline_from_now(timeout);
         loop {
             if link.value().is_some() {
                 return true;
@@ -716,7 +810,7 @@ impl CaLinkResolver {
     /// The registry read with NO lazy open — the record-processing half of
     /// [`Self::link_for`]. C `dbCaGetLink` and the `getAttributes` family
     /// read `pca->...` under `pca->lock` and never create a channel
-    /// (`dbCa.c:448-535`, `:662-704`); the open is `dbCaAddLink`'s
+    /// (`dbCa.c:419-506`, `:633-675`); the open is `dbCaAddLink`'s
     /// `CA_CONNECT` on the `dbCaTask`, reached here through
     /// [`LinkSet::connect_link`]. Every synchronous `LinkSet` accessor goes
     /// through this, so none of them can suspend the record thread.
@@ -728,7 +822,7 @@ impl CaLinkResolver {
 /// Monitor task: drain the subscription, refresh the cache on every
 /// event. Ends when the channel is dropped (`recv` returns `None`).
 ///
-/// Mirrors C `dbCa.c` `eventCallback` (`dbCa.c:925`) — every CA
+/// Mirrors C `dbCa.c` `eventCallback` (`dbCa.c:891`) — every CA
 /// monitor event overwrites the cached value/severity/timestamp that
 /// `dbCaGetLink` later serves.
 async fn run_monitor(
@@ -763,8 +857,8 @@ async fn run_monitor(
                 })));
                 // C `dbCa.c eventCallback` refreshes the cached value, then
                 // adds `CA_DBPROCESS` for every CP link (and Passive CPP
-                // link) on this PV (`dbCa.c:925,993-994`); the worker thread
-                // later runs `db_process(prec)` (`dbCa.c:1295`). Drive the
+                // link) on this PV (`dbCa.c:891`, `:958-962`); the worker thread
+                // later runs `db_process(prec)` (`dbCa.c:1255`). Drive the
                 // Rust twin: process every local holder of an external
                 // CP/CPP link to this PV. The cache is stored ABOVE first,
                 // so the holder's INP read sees the fresh value — matching
@@ -804,11 +898,12 @@ async fn run_monitor(
 ///
 /// on every `Connected` the watcher also (re)fetches the
 /// remote CTRL attributes into `meta`, mirroring `connectionCallback`
-/// scheduling `CA_GET_ATTRIBUTES` (`dbCa.c:910`). The fetch is detached
+/// scheduling `CA_GET_ATTRIBUTES` (`dbCa.c:880`). The fetch is detached
 /// so a slow or hung CTRL get never delays the watcher from observing a
 /// later disconnect — the metadata is best-effort and the read path
 /// gates on `connected` regardless.
 async fn run_connection_watcher(
+    reactor: epics_base_rs::runtime::task::Reactor,
     mut conn_rx: epics_base_rs::runtime::sync::broadcast::Receiver<crate::client::ConnectionEvent>,
     connected: Arc<LinkConnState>,
     channel: Arc<CaChannel>,
@@ -822,7 +917,7 @@ async fn run_connection_watcher(
             // the watcher from seeing a later disconnect.
             Ok(evt) => {
                 if note_conn_event(&evt, &connected) {
-                    task::spawn(fetch_link_metadata(
+                    reactor.spawn(fetch_link_metadata(
                         channel.clone(),
                         meta.clone(),
                         pv_name.clone(),
@@ -844,7 +939,7 @@ async fn run_connection_watcher(
 /// timeout arrives as `Disconnected` too, exactly as `CA_OP_CONN_DOWN`
 /// does in C. `AccessRightsChanged` never touches the flag; it routes
 /// into [`LinkConnState::note_access_rights`] — the C
-/// `accessRightsCallback` (`dbCa.c:1076-1102`), which caches the read
+/// `accessRightsCallback` (`dbCa.c:1014-1040`), which caches the read
 /// right and dispatches the CP/CPP holders on a rights loss while
 /// connected. `NativeTypeChanged` leaves the state untouched.
 /// Factored out of [`run_connection_watcher`] so the transition logic —
@@ -870,8 +965,8 @@ fn note_conn_event(evt: &crate::client::ConnectionEvent, state: &LinkConnState) 
 }
 
 /// One-shot CTRL attribute fetch for a CA link, mirroring C `dbCa.c`'s
-/// `CA_GET_ATTRIBUTES` → `getAttribEventCallback` (`dbCa.c:1249`,
-/// `:1080`): a `DBR_CTRL` get whose reply fills the cached
+/// `CA_GET_ATTRIBUTES` → `getAttribEventCallback` (`dbCa.c:1209-1217`,
+/// `:1042-1091`): a `DBR_CTRL` get whose reply fills the cached
 /// control/display/alarm limits, precision and units. The channel's
 /// native DBF type and element count come from the channel info (C
 /// `getDBFtype`/`getElements` read `pca->dbrType`/`nelements`, not the
@@ -889,8 +984,8 @@ async fn fetch_link_metadata(
     };
     // Limits/precision/units from a single DBR_CTRL get, at a FIXED
     // `DBR_CTRL_DOUBLE` and gated on the native type — both straight from C.
-    // `dbCa.c:926-928` asks for attributes for every channel whose
-    // `pca->dbrType` is not `DBR_STRING`, and `:1275` issues that get as
+    // `dbCa.c:878-880` asks for attributes for every channel whose
+    // `pca->dbrType` is not `DBR_STRING`, and `:1210` issues that get as
     // `ca_get_callback(DBR_CTRL_DOUBLE, ...)` whatever the native type is, so
     // the server converts and `gotAttributes` goes TRUE for an ENUM target
     // too. Requesting the NATIVE CTRL type instead put a `DBR_CTRL_ENUM` on
@@ -957,13 +1052,13 @@ async fn fetch_link_metadata(
 ///
 /// A `None` attribute field means the source carried nothing, and only a
 /// DBR_STRING channel reaches that state for the whole set: C never issues
-/// the get for one (`dbCa.c:926-928`), `pca->gotAttributes` stays FALSE and
+/// the get for one (`dbCa.c:878-880`), `pca->gotAttributes` stays FALSE and
 /// `getPrecision`/`getUnits`/the limit getters return -1 with the caller's
 /// buffer untouched. An ENUM channel is NOT that case — C's get is a fixed
-/// `DBR_CTRL_DOUBLE` (`:1275`), the server converts, `gotAttributes` goes
+/// `DBR_CTRL_DOUBLE` (`:1210`), the server converts, `gotAttributes` goes
 /// TRUE, and the getters SUCCEED with precision 0, empty units and zeroed
 /// limits. Alarm-limit order is `(lolo, lo, hi, hihi)`, matching C
-/// `getAlarmLimits` (`dbCa.c:758`).
+/// `getAlarmLimits` (`dbCa.c:729`).
 fn build_link_metadata(
     dbf: Option<DbFieldType>,
     element_count: Option<u32>,
@@ -1022,7 +1117,7 @@ fn build_link_metadata(
 
 /// Map a CA native [`DbFieldType`] to the link-metadata
 /// [`LinkDbfType`]. Mirrors C `getDBFtype` returning
-/// `dbDBRoldToDBFnew[pca->dbrType]` (`dbCa.c:695`). The CA wire protocol
+/// `dbDBRoldToDBFnew[pca->dbrType]` (`dbCa.c:666`). The CA wire protocol
 /// carries only the seven base types; `Int64`/`UInt64` are internal and
 /// never appear over CA (such PVs present as `Double`), but are mapped
 /// for completeness.
@@ -1069,13 +1164,15 @@ impl LinkSet for CaLinkResolver {
 
     async fn get_value(&self, name: &str) -> Option<EpicsValue> {
         let name = strip_ca_scheme(name);
-        self.link_for(name).await?.value()
+        let link = self.link_for(name).await?;
+        link.note_read();
+        link.value()
     }
 
-    /// C `dbCaGetLink` (`dbCa.c:448-535`): copy out of the buffer the CA
+    /// C `dbCaGetLink` (`dbCa.c:419-506`): copy out of the buffer the CA
     /// monitor keeps fresh, never open and never wait. Here that buffer is
     /// [`CaLink::value`], refreshed by `run_monitor` on every subscription
-    /// event (the `eventCallback` analogue, `dbCa.c:925`).
+    /// event (the `eventCallback` analogue, `dbCa.c:891`).
     ///
     /// The difference from [`Self::get_value`] is the missing
     /// `Self::link_for` fallback (`resolver.rs:452-457`), which opens the
@@ -1084,19 +1181,25 @@ impl LinkSet for CaLinkResolver {
     fn get_cached_value(&self, name: &str) -> Option<EpicsValue> {
         let name = strip_ca_scheme(name);
         let link = self.links.read().get(name).cloned()?;
+        link.note_read();
         link.value()
     }
 
-    /// C `dbCaAddLink`'s `CA_CONNECT` work (`dbCa.c:735-800`): create the
-    /// channel and its monitor. Runs on the link work owner, so the
-    /// `subscribe` round trip inside `open` is off the record thread.
+    /// C `dbCaAddLink`'s `CA_CONNECT` work (`dbCa.c:1140-1159`): create the
+    /// channel, and only that — the branch ends `continue; /*Other options
+    /// must wait until connect*/`, so the monitor is NOT added here. C adds
+    /// it on a later `dbCaTask` pass under `CA_MONITOR_NATIVE`
+    /// (`dbCa.c:1218-1235`), which `connectionCallback` schedules at
+    /// `dbCa.c:866` once the channel is up. This port does both in one
+    /// call; it runs on the link work owner, so the `subscribe` round trip
+    /// inside `open` is off the record thread either way.
     async fn connect_link(&self, name: &str) {
         let name = strip_ca_scheme(name);
         let _ = self.open(name).await;
     }
 
     /// C `dbCaPutLinkCallback`'s `if (!pca->isConnected || !pca->hasWriteAccess)
-    /// return -1;` (`dbCa.c:558-561`), answered from cached state: the links
+    /// return -1;` (`dbCa.c:529-532`), answered from cached state: the links
     /// map plus the `CaLink::connected` owner, which carries both the
     /// connection flag (`note_conn_event`) and the cached rights
     /// (`note_access_rights`). No I/O — the database asks this on the
@@ -1133,7 +1236,7 @@ impl LinkSet for CaLinkResolver {
         // `putType = CA_PUT`, and the CA task later issues a
         // fire-and-forget `ca_array_put` — the source record's
         // processing does NOT block on the remote put completing
-        // (dbCa.c:627-633 `dbCaPutLink`, dbCa.c:1201-1206 the
+        // (dbCa.c:598-602 `dbCaPutLink`, dbCa.c:1163-1166 the
         // `CA_PUT` dispatch). Only `dbCaPutLinkCallback`
         // (`putType = CA_PUT_CALLBACK`) issues `ca_array_put_callback`
         // and parks the originating record until completion. The
@@ -1156,10 +1259,10 @@ impl LinkSet for CaLinkResolver {
         // channel's native type and bounds the request to the channel's
         // element count in the same step — `if(nRequest>pca->nelements)
         // nRequest = pca->nelements;` then `aConvert(..., nRequest,
-        // pca->nelements, 0)` (`dbCa.c:604-606`), against
-        // `pca->nelements = ca_element_count(chid)` (`:906`). The surplus
+        // pca->nelements, 0)` (`dbCa.c:575-577`), against
+        // `pca->nelements = ca_element_count(chid)` (`:862`). The surplus
         // elements are DROPPED and the put succeeds; the same rule holds
-        // for a DB target (`dbAccess.c:1365`), so an oversized array put
+        // for a DB target (`dbAccess.c:1360-1361`), so an oversized array put
         // behaves identically whether the link is CA or DB.
         //
         // It has to happen HERE and not in `CaChannel::put`, because
@@ -1226,6 +1329,17 @@ impl LinkSet for CaLinkResolver {
     fn link_names(&self) -> Vec<String> {
         self.links.read().keys().cloned().collect()
     }
+
+    /// `None` for a name this resolver has never opened — C's `pca == NULL`,
+    /// which `dbcar` renders as a not-connected link with zero counters
+    /// (`dbCaTest.c:127-132`). Never opens the link itself: `dbcar` is a
+    /// report, and C's walk reads `plink->value.pv_link.pvt` without
+    /// touching CA.
+    async fn link_diagnostics(&self, name: &str) -> Option<LinkDiagnostics> {
+        let name = strip_ca_scheme(name);
+        let link = self.cached_link(name)?;
+        Some(link.diagnostics().await)
+    }
 }
 
 /// Strip a leading `ca://` scheme prefix. `epics-base-rs` stores both
@@ -1266,6 +1380,7 @@ pub async fn install_calink_resolver(db: &PvDatabase) -> CaLinkResolver {
 mod tests {
     use super::*;
     use crate::client::ConnectionEvent;
+    use source_guard::{Comments, production};
 
     #[test]
     fn strip_ca_scheme_handles_both_forms() {
@@ -1292,6 +1407,34 @@ mod tests {
             0,
             "calink must not request DBE_LOG — dbCa.c never does"
         );
+    }
+
+    /// C `pca->nDisconnect` counts EDGES, not events: `connectionCallback`
+    /// bumps it inside `if (!pca->isConnected)` after the flag was
+    /// recomputed (`dbCa.c:817-822`), so a repeated `Disconnected` — the
+    /// watcher's, then the subscription-ended tail's — adds nothing, and a
+    /// reconnect followed by a second drop adds one more.
+    #[test]
+    fn the_disconnect_count_moves_once_per_edge() {
+        let connected = LinkConnState::new(Arc::new(RwLock::new(None)), "UP:PV".to_string());
+        assert_eq!(connected.disconnect_count(), 0);
+
+        // Never connected: a disconnect that is not an edge counts nothing,
+        // which is C's `caLink` still at its calloc zero before the first
+        // `connectionCallback`.
+        note_conn_event(&ConnectionEvent::Disconnected, &connected);
+        assert_eq!(connected.disconnect_count(), 0);
+
+        note_conn_event(&ConnectionEvent::Connected, &connected);
+        note_conn_event(&ConnectionEvent::Disconnected, &connected);
+        assert_eq!(connected.disconnect_count(), 1);
+        // The subscription-ended tail arrives behind the watcher's event.
+        note_conn_event(&ConnectionEvent::Disconnected, &connected);
+        assert_eq!(connected.disconnect_count(), 1, "one edge, one count");
+
+        note_conn_event(&ConnectionEvent::Connected, &connected);
+        note_conn_event(&ConnectionEvent::Disconnected, &connected);
+        assert_eq!(connected.disconnect_count(), 2);
     }
 
     /// BUG 1 regression: the connection-event → `connected` flag
@@ -1349,20 +1492,20 @@ mod tests {
         );
     }
 
-    /// §11.7 item 1: C `accessRightsCallback` (`dbCa.c:1076-1102`) as the
+    /// §11.7 item 1: C `accessRightsCallback` (`dbCa.c:1014-1040`) as the
     /// owner decides it, per invariant boundary — not per narrative:
     ///
     /// * rights event while DISCONNECTED → no dispatch AND no flag update
-    ///   (`dbCa.c:1084-1085` returns before touching the cache;
+    ///   (`dbCa.c:1022-1023` returns before touching the cache;
     ///   "connectionCallback will handle"), so a stale rights event queued
     ///   behind a `Disconnected` cannot double-dispatch the outage;
     /// * read lost while connected → dispatch, read gate closes;
     /// * write lost ALONE while connected → dispatch too: the C gate is
-    ///   `if (hasReadAccess && hasWriteAccess) goto done` (`dbCa.c:1091`),
+    ///   `if (hasReadAccess && hasWriteAccess) goto done` (`dbCa.c:1029`),
     ///   i.e. C processes on the loss of EITHER right, not read alone —
     ///   but the read gate stays open, so the dispatched holder reads a
     ///   good value and lands no alarm;
-    /// * full regain → NO dispatch (`dbCa.c:1091`): the holder's alarm
+    /// * full regain → NO dispatch (`dbCa.c:1029`): the holder's alarm
     ///   clears on the next monitor event, not on the rights edge.
     #[test]
     fn access_rights_transitions_follow_dbca() {
@@ -1392,7 +1535,7 @@ mod tests {
         assert!(!state.note_access_rights(true, true));
         assert!(state.has_read_access());
 
-        // Write lost alone: dispatch (dbCa.c:1091), read gate stays open.
+        // Write lost alone: dispatch (dbCa.c:1029), read gate stays open.
         assert!(state.note_access_rights(true, false));
         assert!(state.has_read_access());
 
@@ -1485,8 +1628,8 @@ mod tests {
     /// type or element count, the snapshot cached under the old description
     /// is no longer servable (so `value()`/`is_connected()` report nothing
     /// until a new monitor event repopulates a matching cache). Mirrors C
-    /// `dbCa.c:865-889` / the `dbCaGetLink` invalid-cache path
-    /// (`dbCa.c:484-492`). Tests the type/count gate directly — the
+    /// `dbCa.c:835-859` / the `dbCaGetLink` invalid-cache path
+    /// (`dbCa.c:455-464`). Tests the type/count gate directly — the
     /// live-channel `cache_matches_channel` is a thin wrapper. By invariant
     /// boundary: unchanged, DBR-type-changed, element-count-changed.
     #[test]
@@ -1560,7 +1703,7 @@ mod tests {
     }
 
     /// a String channel gets no attribute request at all — C
-    /// `dbCa.c:926-928` sets `CA_GET_ATTRIBUTES` only when
+    /// `dbCa.c:878-880` sets `CA_GET_ATTRIBUTES` only when
     /// `pca->dbrType != DBR_STRING`, so `gotAttributes` stays FALSE and
     /// every getter returns -1 with the caller's buffer untouched. Here
     /// that is `attrs = None`, and every limit stays `None` so the owning
@@ -1666,15 +1809,22 @@ mod tests {
     /// Stage C3 guard, mirroring the PVA connection-scope guard
     /// (`epics-pva-rs/src/server_native/tcp.rs`
     /// `connection_scope_spawns_go_through_the_runtime_seam`): every task
-    /// the `calink` production surface spawns must go through
-    /// `runtime::task::spawn`, never a bare `tokio::spawn`, a
-    /// `tokio::runtime::Handle::spawn`, or a `tokio::runtime::Handle`
+    /// the `calink` production surface spawns must go through a
+    /// [`task::Reactor`] the caller handed in, never a bare `tokio::spawn`,
+    /// a `tokio::runtime::Handle::spawn`, or a `tokio::runtime::Handle`
     /// field pinned into a production type. A bare `tokio::spawn` panics
     /// on a thread with no tokio runtime — which is exactly the
     /// callback-band worker the RTEMS exec backend runs these tasks on —
     /// and it panics at *runtime*, on the target, not here. So pin it as
     /// source inspection over the whole calink module (`resolver.rs`,
     /// `mod.rs`, `iocsh.rs`).
+    ///
+    /// The needle moved with the seam: it used to be the free
+    /// `runtime::task::spawn(`, which is gone — a spawn now goes through a
+    /// `Reactor` value, so the positive check is `reactor.spawn(` and
+    /// `Reactor::current(` is banned outright, calink taking its executor
+    /// from `PvaLinkResolver`'s owner rather than reading one out of the
+    /// calling thread.
     ///
     /// Before Stage C3 the CA client passed this guard and calink did
     /// not (design doc §5.1, §6 Stage C3); that asymmetry is what the
@@ -1684,18 +1834,9 @@ mod tests {
     /// text cannot satisfy the check it performs.
     #[test]
     fn calink_production_spawns_go_through_the_runtime_seam() {
-        // Production scope of a calink file ends at its first column-0
-        // `#[cfg(test)]` (whole file when there is none — `mod.rs`).
-        fn prod(src: &str) -> &str {
-            match src.find("\n#[cfg(test)]") {
-                Some(i) => &src[..i],
-                None => src,
-            }
-        }
-
-        let resolver = prod(include_str!("resolver.rs"));
-        let module = prod(include_str!("mod.rs"));
-        let iocsh = prod(include_str!("iocsh.rs"));
+        let resolver = production(include_str!("resolver.rs"), Comments::Strip);
+        let module = production(include_str!("mod.rs"), Comments::Strip);
+        let iocsh = production(include_str!("iocsh.rs"), Comments::Strip);
 
         // Fail closed: an earlier `#[cfg(test)]` helper must not shrink a
         // slice past the code this guard is meant to cover.
@@ -1712,17 +1853,21 @@ mod tests {
             "iocsh production slice no longer covers the caxr command"
         );
 
-        // Positive: calink production actually spawns through the seam.
+        // Positive: calink production actually spawns through a held
+        // capability.
         assert!(
-            resolver.contains(concat!("task", "::spawn(")),
-            "resolver production must spawn through `runtime::task::spawn`"
+            resolver.contains(concat!("reactor", ".spawn(")),
+            "resolver production must spawn through a held `Reactor`"
         );
 
-        // Negative: none of the three forbidden spawn shapes appear in any
-        // calink production slice.
+        // Negative: none of the four forbidden shapes appear in any calink
+        // production slice. `Reactor::current(` joins the list because a
+        // mint inside calink would re-create the ambient read the capability
+        // exists to remove — calink's executor comes from its owner.
         let bare_spawn = concat!("tokio", "::spawn(");
         let handle_spawn = concat!("handle", ".spawn(");
         let handle_type = concat!("tokio::runtime", "::Handle");
+        let ambient_mint = concat!("Reactor", "::current(");
         for (name, src) in [
             ("resolver.rs", resolver),
             ("mod.rs", module),
@@ -1743,6 +1888,12 @@ mod tests {
                 src.matches(handle_type).count(),
                 0,
                 "{name}: production must hold no `{handle_type}` field or call"
+            );
+            assert_eq!(
+                src.matches(ambient_mint).count(),
+                0,
+                "{name}: production must take its executor from its owner, not \
+                 mint one with `{ambient_mint}`"
             );
         }
     }

@@ -3,6 +3,14 @@
 //! Promoted from motor-rs/src/axis_runtime.rs with added event emission
 //! and shutdown support.
 
+// RTEMS-EXEC-MODEL-ALLOW(5): checked, not waived — all 5 ran and passed
+// on the exec backend (measured on this tree:
+// `EPICS_RS_BUILD_EXEC_BACKEND=thread cargo nextest run -p asyn-rs
+// --all-features`, 1081/1081). asyn-rs became a census subject when its
+// `build.rs` began deriving `tokio_backend`; nothing here builds a CA
+// server, and the reactor these obtain comes from `#[tokio::test]`
+// itself, which the backend does not remove.
+
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -217,7 +225,11 @@ impl AxisRuntime {
                             None => break,
                         }
                     }
-                    _ = tokio::time::sleep(self.poll_interval) => {
+                    // Through the seam like the deferred wakeups below: the
+                    // poll timer is on the *same* task that reaches them, so a
+                    // routed spawn under a tokio poll timer would panic here
+                    // first.
+                    _ = crate::runtime::task::sleep(self.poll_interval) => {
                         self.poll_motor().await;
                     }
                 }
@@ -246,8 +258,12 @@ impl AxisRuntime {
                 if let Some(ref delay) = actions.schedule_delay {
                     let dur = delay.duration;
                     let tx = self.io_intr_tx.clone();
-                    tokio::spawn(async move {
-                        tokio::time::sleep(dur).await;
+                    // Both halves move together: on the exec backend the task
+                    // lands on a callback band, where `tokio::time` has no
+                    // driver, so a routed spawn over a tokio sleep would only
+                    // move the panic one await deeper.
+                    crate::runtime::task::spawn(async move {
+                        crate::runtime::task::sleep(dur).await;
                         let _ = tx.send(()).await;
                     });
                 }
@@ -269,8 +285,8 @@ impl AxisRuntime {
             AxisCommand::ScheduleDelay { id: _, duration } => {
                 self.active_polling = false;
                 let tx = self.io_intr_tx.clone();
-                tokio::spawn(async move {
-                    tokio::time::sleep(duration).await;
+                crate::runtime::task::spawn(async move {
+                    crate::runtime::task::sleep(duration).await;
                     let _ = tx.send(()).await;
                 });
                 false

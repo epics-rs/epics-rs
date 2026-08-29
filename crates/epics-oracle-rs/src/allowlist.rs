@@ -1,10 +1,10 @@
-//! The expected-deviation allowlist: `doc/upstream-c-bugs.md`, made executable.
+//! The expected-deviation allowlist, made executable.
 //!
-//! Under the product policy (`doc/strategy-2026-07-13.md` §2) a C-vs-port
-//! difference is not automatically a port bug — the port deliberately refuses
-//! to reproduce C's bugs. So the oracle needs to know which differences are
-//! *justified*, and the justification already exists as a catalogue. This
-//! module turns the NOT-REPRODUCED entries into matchable rules.
+//! Under the product policy a C-vs-port difference is not automatically a port
+//! bug — the port deliberately refuses to reproduce C's bugs. So the oracle
+//! needs to know which differences are *justified*, and the justification
+//! already exists as a catalogue. This module turns the NOT-REPRODUCED entries
+//! into matchable rules.
 //!
 //! The rules live in `allowlist/expected-deviations.toml`, not inline in this
 //! file, so the data is reviewable next to the catalogue it transcribes and can
@@ -13,9 +13,9 @@
 //! # Four buckets, three justification bases
 //!
 //! Most rows are C-bug refusals: a `NOT-REPRODUCED` (or, disabled, `REPRODUCED`)
-//! entry transcribed from `doc/upstream-c-bugs.md`, and each such row MUST cite
-//! the `CBUG-…` id that justifies it. Two further buckets are justified by their
-//! `why` rather than by a catalogue entry, and cite no CBUG:
+//! entry, and each such row MUST cite the `CBUG-…` id that justifies it. Two
+//! further buckets are justified by their `why` rather than by a catalogue
+//! entry, and cite no CBUG:
 //!
 //! - `DESIGN-DIVERGENCE` — an *intentional port design choice* that is neither a
 //!   C-bug refusal nor a port defect (the port deliberately does something other
@@ -58,8 +58,7 @@ use std::path::Path;
 use crate::dbd::DbfType;
 use crate::diff::{Difference, Surface};
 
-/// A C-bug refusal transcribed from `doc/upstream-c-bugs.md` and expected to
-/// fire today. Requires a `CBUG-…` `id`.
+/// A C-bug refusal expected to fire today. Requires a `CBUG-…` `id`.
 pub const BUCKET_NOT_REPRODUCED: &str = "NOT-REPRODUCED";
 /// A C bug the port still reproduces on purpose (carried disabled for
 /// traceability; see `enabled`). Requires a `CBUG-…` `id`.
@@ -73,8 +72,8 @@ pub const BUCKET_DESIGN_DIVERGENCE: &str = "DESIGN-DIVERGENCE";
 /// serves more. Justified by its `why`; no `CBUG-…` `id` required.
 pub const BUCKET_INSTRUMENT_SUPERSET: &str = "INSTRUMENT-SUPERSET";
 
-/// One expected-deviation rule: a C-bug refusal transcribed from
-/// `doc/upstream-c-bugs.md`, or an intentional port design divergence.
+/// One expected-deviation rule: a C-bug refusal, or an intentional port
+/// design divergence.
 ///
 /// Every constraint is optional and every omitted constraint is a wildcard, so
 /// a row is exactly as narrow as it was written. That is deliberate: a row that
@@ -83,7 +82,7 @@ pub const BUCKET_INSTRUMENT_SUPERSET: &str = "INSTRUMENT-SUPERSET";
 #[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
 pub struct Deviation {
     /// The row's identifier and ledger key. For a `NOT-REPRODUCED`/`REPRODUCED`
-    /// row this is the `CBUG-…` id in `doc/upstream-c-bugs.md` that justifies it;
+    /// row this is the `CBUG-…` id that justifies it;
     /// for a `DESIGN-DIVERGENCE` row it is a design tag that cites no CBUG. Always
     /// non-empty and unique — it keys the fired/exercised/stale sets.
     pub id: String,
@@ -227,8 +226,7 @@ impl Allowlist {
                     if !d.id.starts_with("CBUG-") {
                         return Err(format!(
                             "allowlist row {} is bucket {} but does not cite a CBUG id — \
-                             a {}/{} row transcribes a bug from doc/upstream-c-bugs.md \
-                             and must name it",
+                             a {}/{} row transcribes a bug and must name it",
                             d.id, d.bucket, BUCKET_NOT_REPRODUCED, BUCKET_REPRODUCED
                         ));
                     }

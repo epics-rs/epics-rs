@@ -1,13 +1,15 @@
-//! Reactor-dependent in full: its mock source delays `slow` with `tokio::time::sleep` inside
-//! `get_introspection`/`get_value`, and under `rtems-exec-model` the
-//! `runtime::task` seam drives that future on a `cbMedium` executor worker
-//! with no tokio reactor, so the fixture panics with "there is no reactor
-//! running". Gated at file scope because every test here shares that source.
-#![cfg(not(feature = "rtems-exec-model"))]
+//! Reactor-dependent in full: its mock source delays `slow` with
+//! `tokio::time::sleep` inside `get_introspection`/`get_value`, and under
+//! `exec_backend` the `runtime::task` seam drives that future on a `cbMedium`
+//! executor worker with no tokio reactor, so the fixture panics with "there is
+//! no reactor running". Gated at file scope because every test here shares
+//! that source.
+#![cfg(tokio_backend)]
+#![cfg(feature = "client")]
 
 //! pvxs `pvxget` / `pvxinfo` install a per-operation `.result()` callback
 //! that fires the instant *that* op completes (tools/get.cpp:107-119,
-//! tools/info.cpp:86-99), so a fast PV is visible before a slow or missing
+//! tools/info.cpp:86-94), so a fast PV is visible before a slow or missing
 //! sibling's timeout expires. The Rust multi-PV helpers used to drain the
 //! whole `JoinSet` and only then return an ordered `Vec`, so every
 //! completed PV was buffered behind the slowest sibling.

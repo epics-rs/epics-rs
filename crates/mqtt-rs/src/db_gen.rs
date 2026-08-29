@@ -149,12 +149,12 @@ mod tests {
         w.end();
         let defs = db_loader::parse_db(&db, &std::collections::HashMap::new())
             .unwrap_or_else(|e| panic!("parse failed for {value:?}: {e}\n{db}"));
-        let (_, v) = defs[0]
+        let v = defs[0]
             .fields
             .iter()
-            .find(|(k, _)| k == "INP")
+            .find(|f| f.name == "INP")
             .expect("INP field");
-        v.to_string()
+        v.value.to_string()
     }
 
     fn make_ctx() -> (tokio::runtime::Runtime, CommandContext) {

@@ -100,7 +100,7 @@ async fn r9_61_ivla_do_nothing_skips_calc_and_every_output_link() {
         db.get_pv("TGT").unwrap().to_f64(),
         Some(0.0),
         "OUTB must NOT be written: C returns before the output loop \
-         (transformRecord.c:608-619)"
+         (transformRecord.c:605-613)"
     );
     // The alarm commit is the one thing C still runs on this cycle.
     assert_eq!(

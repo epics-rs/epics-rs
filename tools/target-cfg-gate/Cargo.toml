@@ -1,0 +1,10 @@
+[package]
+name = "target-cfg-gate"
+version = "0.0.0"
+edition = "2024"
+publish = false
+license = "EPICS"
+description = "Dev-only: checks every test/bench/example/bin target declares the cfg its own imports require"
+
+[dependencies]
+rtems-exec-gate = { path = "../rtems-exec-gate" }

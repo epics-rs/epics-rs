@@ -14,7 +14,7 @@
 //! the two points where C's control flow crosses into the driver, and each half
 //! is a method ON THE RECORD:
 //!
-//! - C `:509-659` (clear NACK, drain NEWV, ERAS/ERST, STRT, STOP) is
+//! - C `:510-659` (clear NACK, drain NEWV, ERAS/ERST, STRT, STOP) is
 //!   [`McaRecord::take_device_requests`]: the record applies its own state
 //!   changes and returns the commands to send, in C's order.
 //! - C `:666-742` (status read, ERTM/ELTM/ACT/DWEL, dead time, force a read when
@@ -23,7 +23,7 @@
 //!   must now be read.
 //! - C `:744-790` (the data read) is device support's, landing through
 //!   [`McaRecord::land_spectrum_read`].
-//! - C `:792-841` (ROI sums, preset stop, commit ACQG, UDF, STIM, alarms,
+//! - C `:793-841` (ROI sums, preset stop, commit ACQG, UDF, STIM, alarms,
 //!   forward link) is the record's `process()`.
 //!
 //! The record therefore remains the only writer of its own state, and device
@@ -94,20 +94,21 @@ pub struct McaStatus {
 }
 
 impl McaRecord {
-    /// C `process` `:509-659` — everything the record does BEFORE the status
+    /// C `process` `mcaRecord.c:510-659` — everything the record does BEFORE the status
     /// read, and the commands that must reach the device ahead of it.
     ///
     /// The record's own state changes are applied here, not by the caller:
-    /// `ERAS` zeroes the spectrum inside the record (C does this rather than
-    /// force a read back from the device, `:612-614`), `STRT` forces `ACQG` to 1
-    /// (`:640-644`), and every consumed `NEWV` bit is cleared. So this is the
-    /// SOLE consumer of `NEWV`/`STRT`/`STOP`/`ERAS`/`ERST`: calling it twice for
-    /// one cycle cannot double-send, because the flags are already gone.
+    /// `ERAS` zeroes the spectrum inside the record (`:614`; C's comment at
+    /// `:612-613` gives the reason — cheaper than forcing a read back from
+    /// device support), `STRT` forces `ACQG` to 1 (`:644`), and every consumed
+    /// `NEWV` bit is cleared. So this is the SOLE consumer of
+    /// `NEWV`/`STRT`/`STOP`/`ERAS`/`ERST`: calling it twice for one cycle cannot
+    /// double-send, because the flags are already gone.
     pub fn take_device_requests(&mut self) -> Vec<McaCommand> {
         let mut cmds = Vec::new();
         self.nack = 0;
 
-        // C's NEWV block, in C's field order (`:534-634`). `special()` sets one
+        // C's NEWV block, in C's field order (`:525-634`). `special()` sets one
         // bit per setup field written; `process` then sends that field's CURRENT
         // value, not the value that was written.
         for (bit, cmd) in [
@@ -133,8 +134,8 @@ impl McaRecord {
         }
 
         // ERAS and ERST both erase; only ERAS re-sums the regions. C's comment
-        // (`:616-621`): under ERST new data are coming in anyway, so posting the
-        // zeroed array is not worth the cost.
+        // (`:615-619`): under ERST new data are coming in anyway, so posting the
+        // zeroed array is not worth the cost. The ERAS-only arm is `:620-626`.
         if self.newv & (NEWV_ERAS | NEWV_ERST) != 0 {
             cmds.push(McaCommand::Erase);
             self.nord = 0;
@@ -152,8 +153,8 @@ impl McaRecord {
             self.newv &= !NEWV_MODE;
         }
 
-        // Start and stop go last, so the status read that follows sees them
-        // (`:636`).
+        // Start and stop go last, so the status read that follows sees them —
+        // C's comment at `:636` says so; the start block is `:637-654`.
         if self.strt != 0 || self.newv & NEWV_ERST != 0 {
             cmds.push(McaCommand::StartAcquire);
             self.acqg = 1;
@@ -205,7 +206,7 @@ impl McaRecord {
         }
         self.read = 0;
         // C records the time the read BEGAN, for clients computing counts per
-        // second across it (`:761-764`).
+        // second across it (`:762-764`).
         self.rtim = epics_seconds(SystemTime::now());
         true
     }
@@ -231,13 +232,16 @@ impl McaRecord {
     }
 
     /// C `readValue`'s first statement: EVERY read marks every region for
-    /// recomputation (`:1103`) — the spectrum under them has just changed.
+    /// recomputation (`mcaRecord.c:1104`) — the spectrum under them has just
+    /// changed. Qualified, not bare: the nearest preceding file mention in this
+    /// module is `devMCA_soft.c`, which is 162 lines long, so a bare `:1104`
+    /// here reads as a past-EOF error while naming a line that exists.
     fn read_completed(&mut self) {
         self.newr = NEWR_ALL;
         self.rdng = 0;
     }
 
-    /// C `:710-732`. `DTIM` is the average dead time over the whole acquisition;
+    /// C `mcaRecord.c:710-732`. `DTIM` is the average dead time over the whole acquisition;
     /// `IDTIM` is the dead time over the interval since the previous status read,
     /// and is the field the record ALARMS on.
     ///
@@ -316,7 +320,7 @@ impl McaRecord {
                 return;
             }
         }
-        // Out of every alarm band by at least HYST (`:1000-1001`).
+        // Out of every alarm band by at least HYST (`:1001`).
         self.lalm = idtim;
     }
 }
@@ -331,7 +335,7 @@ pub(crate) fn epics_seconds(t: SystemTime) -> f64 {
     unix - epics_base_rs::runtime::general_time::EPICS_EPOCH_UNIX_SECS as f64
 }
 
-/// C `:816-822` — the wall-clock time acquisition stopped, to millisecond
+/// C `:809-816` — the wall-clock time acquisition stopped, to millisecond
 /// precision.
 ///
 /// **Tier-2 deviation — C truncates its own output.** C renders `"%b %d, %Y

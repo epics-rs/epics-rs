@@ -2,6 +2,10 @@
 //!
 //! Usage:
 //!   cargo run --release -p mqtt-ioc --bin mqtt_ioc -- ioc/st.cmd
+// On `exec_backend` this program's `main` refuses instead of running, so
+// everything below is unreachable in that configuration by construction.
+// The default build still lints the file in full.
+#![cfg_attr(exec_backend, allow(dead_code, unused_imports))]
 
 use std::sync::Arc;
 
@@ -9,6 +13,7 @@ use asyn_rs::trace::TraceManager;
 use epics_base_rs::error::CaResult;
 use epics_ca_rs::server::ioc_app::IocApplication;
 
+#[cfg(tokio_backend)]
 #[epics_base_rs::epics_main]
 async fn main() -> CaResult<()> {
     // Install a tracing subscriber so mqtt-rs log lines (e.g.,
@@ -49,13 +54,28 @@ async fn main() -> CaResult<()> {
     // Register Z2M device type builders
     app = mqtt_rs::z2m::register_z2m_commands(app);
 
-    app.startup_script(&script)
-        // External links resolve with zero further setup: both link sets
-        // install at the base `AfterCaLinkInit` hook — before
-        // `setup_cp_links` warms Passive CP holders and before the iocInit
-        // external-link wait — the `ca` and `pva` link sets.
-        .register_link_set_installer(epics_ca_rs::calink::calink_link_set_install)
-        .register_link_set_installer(epics_bridge_rs::qsrv::pvalink_link_set_install)
-        .run(epics_bridge_rs::qsrv::run_ca_pva_qsrv_ioc)
-        .await
+    // The runner paired with the two protocol registrars, because `casr` and
+    // `pvxsr` have to answer from the script's first line and `.run(runner)`
+    // reaches only the interactive shell.
+    epics_bridge_rs::qsrv::run_ca_pva_qsrv_ioc_app(
+        app.startup_script(&script)
+            // External links resolve with zero further setup: both link sets
+            // install at the base `AfterCaLinkInit` hook — before
+            // `setup_cp_links` warms Passive CP holders and before the iocInit
+            // external-link wait — the `ca` and `pva` link sets.
+            .register_link_set_installer(epics_ca_rs::calink::calink_link_set_install)
+            .register_link_set_installer(epics_bridge_rs::qsrv::pvalink_link_set_install),
+    )
+    .await
+}
+
+/// The `exec_backend` arm: the dual-protocol runner this IOC hands its
+/// `IocApplication` to is compiled only on the tokio backend.
+#[cfg(exec_backend)]
+fn main() -> CaResult<()> {
+    eprintln!(
+        "mqtt_ioc needs the tokio backend; this build selects the \
+         reactor-free execution model (EPICS_RS_BUILD_EXEC_BACKEND=thread)."
+    );
+    Ok(())
 }

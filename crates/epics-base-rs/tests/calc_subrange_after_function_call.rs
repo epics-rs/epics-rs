@@ -102,7 +102,7 @@ fn the_function_is_emitted_after_the_subrange() {
 
 /// A vararg function defers the same way, and the `,` inside the BRACKET must NOT
 /// be charged to it — C's `SEPARATOR` (`sCalcPostfix.c:612-631`) stops at `(`,
-/// `[` and `{` alike, but only `CLOSE_PAREN` (`:651-662`) hands the accumulated
+/// `[` and `{` alike, but only `CLOSE_PAREN` (`:647-658`) hands the accumulated
 /// count to a vararg below the `(`. This is why `[` / `{` are a stack entry of
 /// their own rather than a second `LParen`: sharing one variant let the bracket's
 /// `,` bump `MAX`'s argument count from 2 to 3.

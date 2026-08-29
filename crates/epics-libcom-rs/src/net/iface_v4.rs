@@ -576,19 +576,28 @@ mod tests {
         }
     }
 
-    /// Loopback-only machines exist (CI containers), so this asserts the
-    /// fallback rather than a real address.
+    /// Loopback-only machines exist (CI containers), so a loopback answer is
+    /// a legal result — but only when enumeration really found nothing
+    /// eligible. `local_addr` returns `LOCALHOST` for that reason *and* when
+    /// `enumerate()` itself fails (`:225-227`), so returning early on
+    /// `addr.is_loopback()` would hide our own fallback behind a host fact.
+    /// Enumerate first, then assert in whichever branch the host lands in.
     #[test]
     fn local_addr_is_an_eligible_interface_or_loopback() {
         let addr = local_addr();
-        if addr.is_loopback() {
-            return;
-        }
         let ifaces = enumerate().expect("getifaddrs must succeed on the host");
-        assert!(
-            ifaces.iter().any(|i| i.is_eligible() && i.ip == addr),
-            "local_addr returned {addr}, which is not an eligible interface"
-        );
+        let eligible: Vec<_> = ifaces.iter().filter(|i| i.is_eligible()).collect();
+        if addr.is_loopback() {
+            assert!(
+                eligible.is_empty(),
+                "local_addr fell back to loopback while eligible interfaces exist: {eligible:?}"
+            );
+        } else {
+            assert!(
+                eligible.iter().any(|i| i.ip == addr),
+                "local_addr returned {addr}, which is not an eligible interface"
+            );
+        }
     }
 
     /// Every address `broadcast_addrs` reports must be some eligible

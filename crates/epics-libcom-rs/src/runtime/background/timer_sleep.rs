@@ -51,8 +51,7 @@
 //! and drops it when another arm wins, so an uncancellable entry accumulates at
 //! the loop's iteration rate for the whole period. Measured on VxWorks 7 against
 //! the PVA search engine's 180 s `BEACON_CLEAN_INTERVAL` tick: ~124 live entries
-//! at ~184 B each, released in one batch every 180 s
-//! (`doc/vxworks-dial-attempt-residue-on-target-measurement.md`).
+//! at ~184 B each, released in one batch every 180 s.
 //!
 //! Cancellation is a property of the *wake* path only.
 //! [`TimerHandle::schedule`] — C `callbackRequestDelayed`

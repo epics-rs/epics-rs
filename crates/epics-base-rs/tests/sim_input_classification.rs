@@ -1,7 +1,7 @@
 //! `waveform` and `histogram` are `readValue` INPUT records — both call
 //! `readValue` at the START of `process()` and read SIOL inward in SIMM mode
 //! (`waveformRecord.c:139`->`:351` `dbGetLink(&siol, ftvl, bptr)`;
-//! `histogramRecord.c:209`->`:384` `dbGetLink(&siol, DBR_DOUBLE, &sval)`). They
+//! `histogramRecord.c:209`->`:383` `dbGetLink(&siol, DBR_DOUBLE, &sval)`). They
 //! were omitted from the simulation `is_input` classification, so a simulated
 //! waveform/histogram took the OUTPUT redirect: it ran the real device read and
 //! wrote VAL OUT to SIOL (direction inverted, simulation defeated). These tests
@@ -57,7 +57,7 @@ async fn sim_waveform_reads_siol_array_into_val() {
 }
 
 /// W10-E8 — a simulated `histogram` reads SIOL INWARD, lands the scalar in
-/// SGNL (`histogramRecord.c:384-387` `dbGetLink(&siol, DBR_DOUBLE, &sval)`;
+/// SGNL (`histogramRecord.c:383-386` `dbGetLink(&siol, DBR_DOUBLE, &sval)`;
 /// `sgnl = sval`) and bins it (`:218-219` `if (status == 0) add_count(prec)`).
 /// It must not write its VAL array out to the SIOL target.
 ///
@@ -91,12 +91,12 @@ async fn sim_histogram_lands_siol_in_sgnl_and_bins_it() {
         matches!(src, EpicsValue::Double(v) if (v - 42.0).abs() < 1e-10),
         "simulated histogram did NOT write VAL out to SIOL (input direction), got {src:?}"
     );
-    // C `:385-386`: the SIOL scalar lands in SVAL, then in SGNL.
+    // C `:384-385`: the SIOL scalar lands in SVAL, then in SGNL.
     assert_eq!(db.get_pv("HGIN.SVAL").unwrap(), EpicsValue::Double(42.0));
     assert_eq!(
         db.get_pv("HGIN.SGNL").unwrap(),
         EpicsValue::Double(42.0),
-        "C `prec->sgnl = prec->sval` (histogramRecord.c:385)"
+        "C `prec->sgnl = prec->sval` (histogramRecord.c:384)"
     );
 
     // C `:219` `add_count(prec)`: 42.0 with WDTH=25 falls in bin 1.
@@ -108,7 +108,7 @@ async fn sim_histogram_lands_siol_in_sgnl_and_bins_it() {
 }
 
 /// A FAILED SIOL read leaves C's `status != 0`, so `readValue` never runs
-/// `prec->sgnl = prec->sval` (`:385`, gated on `status == 0`) and `process`
+/// `prec->sgnl = prec->sval` (`:384`, gated on `status == 0`) and `process`
 /// never runs `add_count` (`:218-219`, the same gate). No bin moves.
 #[epics_macros_rs::epics_test]
 async fn sim_histogram_with_a_failed_siol_read_bins_nothing() {

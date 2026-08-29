@@ -141,7 +141,7 @@ impl PvaTools {
     /// [`Self::run_raw`].
     fn env(&self, beacon: u16) -> HashMap<&'static str, String> {
         HashMap::from([
-            // Explicit `addr:port` — `split_addr_into` (config.cpp:580) takes
+            // Explicit `addr:port` — `split_addr_into` (config.cpp:581) takes
             // the port from the entry, so no default-port var is consulted.
             ("EPICS_PVA_ADDR_LIST", format!("127.0.0.1:{}", self.port)),
             // Never let a search escape to a real subnet, or be answered by
@@ -161,7 +161,7 @@ impl PvaTools {
     /// (`client.cpp:641`); it must be a quiet port, or `pvxlist` hears every PVA
     /// server on this host and `verify_sole_server` reports a
     /// foreign one as a second server on our port. It also cannot be 0 —
-    /// `config.cpp:561` rejects that and silently substitutes pvxs's real
+    /// `config.cpp:563-566` rejects that and silently substitutes pvxs's real
     /// default, 5076, which is the very port being avoided.
     ///
     /// # Why it is allocated here and not once per run
@@ -593,14 +593,18 @@ impl PvaTools {
     /// by `run_raw`'s per-invocation beacon port: without that, `pvxlist` also reports
     /// beacon-discovered servers, and a foreign IOC elsewhere on the host
     /// would be miscounted as a second server here.
-    pub fn server_count(&self) -> Result<usize, ToolError> {
+    /// Returns the lines themselves rather than their count, because the count
+    /// alone cannot be read: "2 servers answer here" is unactionable without
+    /// the two addresses that answered, and the caller that reports the
+    /// failure has no other way to get them.
+    pub fn servers(&self) -> Result<Vec<String>, ToolError> {
         let out = self.run("pvxlist", &["-w".into(), PVA_TIMEOUT_SECS.into()])?;
         let distinct: std::collections::BTreeSet<&str> = out
             .lines()
             .map(str::trim)
             .filter(|l| !l.is_empty())
             .collect();
-        Ok(distinct.len())
+        Ok(distinct.into_iter().map(str::to_string).collect())
     }
 }
 
@@ -631,7 +635,7 @@ impl Subscription {
         // survived, not of what the server posted. That is an ERROR, not a
         // reading. Checked against the whole stderr because `pvxmonitor` reports
         // both a drop and a subscription error there, never on stdout
-        // (`pvxs/tools/monitor.cpp:180-185`).
+        // (`pvxs/tools/monitor.cpp:162-167`).
         let stderr = self.erx.recv_timeout(STDERR_DRAIN).unwrap_or_default();
         if let Some(bad) = stderr
             .lines()
@@ -646,7 +650,7 @@ impl Subscription {
 /// Which requested PV a line is the header of, if any.
 ///
 /// `pvxmonitor` prints the subscription's name verbatim on its own line and
-/// indents the body under it (`monitor.cpp:159-161`), so a header is an exact
+/// indents the body under it (`monitor.cpp:142-146`), so a header is an exact
 /// match against a name we asked for. Matching exactly, rather than "an
 /// unindented line", is what keeps a body line that happens to start at column 0
 /// from being read as the start of a new event.

@@ -17,16 +17,27 @@
 //! disappearing downstream subscribers don't abort the upstream
 //! monitor task.
 
-#![cfg(feature = "pva-gateway")]
+#![cfg(all(feature = "pva-gateway", tokio_backend))]
 
-// RTEMS-EXEC-MODEL-ALLOW(25): checked to pass feature-ON — all 25 run green under
-// --features rtems-exec-model,pva-gateway (the gateway's spawns/timers ride the
-// runtime::task seam). The default feature-ON gate omits `pva-gateway`, so re-run
-// that combo when touching this file.
+// The 25 cases below used to run under `EPICS_RS_BUILD_EXEC_BACKEND=thread
+// --features pva-gateway` and passed there, which is what the census marker
+// they carried recorded. They no longer compile in that combination:
+// `PvaServer` moved from the target gate to `tokio_backend`, so the gateway
+// this file stands does not exist on the reactor-free backend at all. The
+// coverage they gave that combination is gone with it, not merely unaccounted
+// for.
 
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
+
+/// The executor a test body spawns on. Every `#[tokio::test]` here is
+/// already inside one; the gateway constructors now take it by value
+/// instead of looking it up behind the caller's back.
+fn test_reactor() -> epics_base_rs::runtime::task::Reactor {
+    epics_base_rs::runtime::task::Reactor::current()
+        .expect("this test body runs inside an executor")
+}
 
 use epics_bridge_rs::pva_gateway::{
     ChannelCache, GatewayChannelSource, MultiTenantPvaGatewayBuilder, PvaGateway, PvaGatewayConfig,
@@ -135,7 +146,7 @@ async fn gateway_get_forwards_upstream_value() {
         control_acf_path: None,
         control_reload_acf_path: None,
     };
-    let gw = PvaGateway::start(cfg).expect("gateway start");
+    let gw = PvaGateway::start(&test_reactor(), cfg).expect("gateway start");
 
     // Downstream client pinned at the gateway.
     let ds = gw.client_config();
@@ -194,7 +205,7 @@ async fn gateway_monitor_fans_out_to_two_clients() {
         control_acf_path: None,
         control_reload_acf_path: None,
     };
-    let gw = PvaGateway::start(cfg).expect("gateway start");
+    let gw = PvaGateway::start(&test_reactor(), cfg).expect("gateway start");
 
     // Two independent downstream clients, both pointed at gateway.
     let c1 = gw.client_config();
@@ -315,7 +326,7 @@ async fn gateway_155_monitor_seeds_current_value_once() {
         control_acf_path: None,
         control_reload_acf_path: None,
     };
-    let gw = PvaGateway::start(cfg).expect("gateway start");
+    let gw = PvaGateway::start(&test_reactor(), cfg).expect("gateway start");
     let client = gw.client_config();
 
     let received = Arc::new(std::sync::Mutex::new(Vec::<f64>::new()));
@@ -443,7 +454,7 @@ async fn gateway_control_prefix_cache_size() {
         control_acf_path: None,
         control_reload_acf_path: None,
     };
-    let gw = PvaGateway::start(cfg).expect("gateway start");
+    let gw = PvaGateway::start(&test_reactor(), cfg).expect("gateway start");
 
     let ds = gw.client_config();
 
@@ -540,7 +551,7 @@ async fn multi_tenant_gateway_routes_to_correct_upstream() {
         .add_upstream("B", client_b)
         .add_downstream("merged", server_config, &["A", "B"], None)
         .connect_timeout(Duration::from_secs(2))
-        .start()
+        .start(&test_reactor())
         .expect("multi-tenant start");
 
     assert_eq!(gw.upstream_count(), 2);
@@ -630,7 +641,7 @@ async fn multi_tenant_downstream_acl_denies_pv() {
         .add_downstream("restricted", server_config, &["S", "O"], None)
         .downstream_access(Some(acl), false, None)
         .connect_timeout(Duration::from_secs(2))
-        .start()
+        .start(&test_reactor())
         .expect("multi-tenant start");
 
     let server = gw
@@ -698,7 +709,7 @@ async fn multi_tenant_downstream_read_only_rejects_put() {
         .add_downstream("ro", server_config, &["U"], None)
         .downstream_access(None, true, None)
         .connect_timeout(Duration::from_secs(2))
-        .start()
+        .start(&test_reactor())
         .expect("multi-tenant start");
 
     let server = gw.downstream("ro").expect("ro server present");
@@ -773,7 +784,7 @@ async fn critical1_read_only_gateway_rejects_put() {
     );
     let mut cfg = gateway_cfg(upstream);
     cfg.read_only = true;
-    let gw = PvaGateway::start(cfg).expect("read-only gateway start");
+    let gw = PvaGateway::start(&test_reactor(), cfg).expect("read-only gateway start");
 
     let ds = gw.client_config();
     let err = ds
@@ -814,7 +825,7 @@ async fn critical1_acl_layer_denies_pv() {
             .deny_regex(r"SECRET:.*")
             .unwrap(),
     );
-    let gw = PvaGateway::start(cfg).expect("acl gateway start");
+    let gw = PvaGateway::start(&test_reactor(), cfg).expect("acl gateway start");
 
     let ds = gw.client_config();
     // The ACL-denied PV must not resolve through the gateway.
@@ -854,7 +865,7 @@ async fn critical1_audit_layer_records_put() {
             .unwrap()
             .push((ev.pv, ev.event, ev.result));
     })));
-    let gw = PvaGateway::start(cfg).expect("audit gateway start");
+    let gw = PvaGateway::start(&test_reactor(), cfg).expect("audit gateway start");
 
     let ds = gw.client_config();
     // PUT is rejected by the inner ReadOnly layer; the outer Audit
@@ -954,7 +965,7 @@ async fn br_r6_gateway_typed_put_passthrough() {
     );
     // Use GatewayChannelSource directly — same put_value code path, no
     // downstream auth layer that would route to a per-credential client.
-    let cache = ChannelCache::new(upstream_client, Duration::from_secs(60));
+    let cache = ChannelCache::new(test_reactor(), upstream_client, Duration::from_secs(60));
     let mut src = GatewayChannelSource::new(cache);
     src.connect_timeout = Duration::from_secs(2);
 
@@ -1009,11 +1020,11 @@ async fn br_r6_gateway_typed_put_passthrough() {
 }
 
 /// `is_writable` must proxy the UPSTREAM channel's connection state, not the
-/// gateway's local monitor-cache presence. pva2pva `GWChannel::getAccessRights`
-/// delegates to the connected upstream channel (channel.cpp:92-96), so a
-/// connectable PV is "writable" even before any prior op populated the cache —
-/// the pre-fix peek-only impl returned `false` here. A PV the gateway cannot
-/// connect to is not writable.
+/// gateway's local monitor-cache presence. pva2pva
+/// `GWChannel::getAccessRights` delegates to the connected upstream channel
+/// (p2pApp/channel.cpp:92-96), so a connectable PV is "writable" even before
+/// any prior op populated the cache — the pre-fix peek-only impl returned
+/// `false` here. A PV the gateway cannot connect to is not writable.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn gateway_is_writable_proxies_upstream_connection_not_cache_presence() {
     let (_us_server, us_addr, _us_pv) = spawn_upstream("GW:WR:PV", 1.0);
@@ -1023,7 +1034,7 @@ async fn gateway_is_writable_proxies_upstream_connection_not_cache_presence() {
             .timeout(Duration::from_secs(2))
             .build(),
     );
-    let cache = ChannelCache::new(upstream_client, Duration::from_secs(60));
+    let cache = ChannelCache::new(test_reactor(), upstream_client, Duration::from_secs(60));
     let mut src = GatewayChannelSource::new(cache);
     src.connect_timeout = Duration::from_millis(400);
 
@@ -1105,7 +1116,7 @@ async fn br_r41_typed_subscribe_delivers_updates() {
             .timeout(Duration::from_secs(2))
             .build(),
     );
-    let cache = ChannelCache::new(upstream_client, Duration::from_secs(60));
+    let cache = ChannelCache::new(test_reactor(), upstream_client, Duration::from_secs(60));
     let mut src = GatewayChannelSource::new(cache);
     src.connect_timeout = Duration::from_secs(2);
 
@@ -1171,7 +1182,7 @@ async fn br_r41_typed_subscribe_delivers_updates() {
 /// Upstream parity: pva2pva stops a monitor on a new upstream type
 /// (`moncache.cpp:56-83`) and surfaces a lost upstream as downstream
 /// *unlisten* (`moncache.cpp:212-235`); pvxs treats reconnect / type-change
-/// as a subscription boundary (`pvalink_channel.cpp:342-351 onTypeChange()`).
+/// as a subscription boundary (`ioc/pvalink_channel.cpp:342-351 onTypeChange()`).
 ///
 /// Topology: two downstream clients on the SAME gateway PV. The raw-vs-
 /// decoded split is driven entirely by the pvRequest's pipeline option,
@@ -1199,7 +1210,8 @@ async fn br_99_decoded_monitor_gets_finish_on_upstream_descriptor_change() {
             .timeout(Duration::from_secs(2))
             .build(),
     );
-    let gw = PvaGateway::start(gateway_cfg(upstream_client)).expect("gateway start");
+    let gw =
+        PvaGateway::start(&test_reactor(), gateway_cfg(upstream_client)).expect("gateway start");
 
     let c_raw = gw.client_config();
     let c_pipe = gw.client_config();
@@ -1277,10 +1289,10 @@ async fn br_99_decoded_monitor_gets_finish_on_upstream_descriptor_change() {
 /// monitor-unlisten boundary.
 ///
 /// This is the third site of the "disconnect inferred from the subscription
-/// future returning" family (doc/pvalink-rtems-design.md §12.8, §12.10;
-/// commit f75f1e56 closed the two pvalink sites). The gateway's upstream task
-/// learned about the upstream ONLY from `handle.wait()` returning — and the
-/// client's raw-frames handle re-subscribes INTERNALLY on
+/// future returning" family (commit f75f1e56 closed the two pvalink sites).
+/// The gateway's upstream task learned about the upstream ONLY from
+/// `handle.wait()` returning — and the client's raw-frames handle
+/// re-subscribes INTERNALLY on
 /// `MonitorEnd::ConnectionLost` (announce, sleep 200 ms, loop), so on a plain
 /// upstream loss it never returns. `signal_disconnect_boundary` therefore
 /// never fired, and every downstream monitor kept being served the dead IOC's
@@ -1312,7 +1324,8 @@ async fn gw_plain_upstream_loss_fires_the_disconnect_boundary() {
             .timeout(Duration::from_secs(2))
             .build(),
     );
-    let gw = PvaGateway::start(gateway_cfg(upstream_client)).expect("gateway start");
+    let gw =
+        PvaGateway::start(&test_reactor(), gateway_cfg(upstream_client)).expect("gateway start");
     let c = gw.client_config();
 
     let (boundary_tx, mut boundary_rx) = tokio::sync::mpsc::channel::<()>(1);
@@ -1411,7 +1424,8 @@ async fn gw60_slow_pipelined_downstream_converges_to_latest_under_overflow() {
             .timeout(Duration::from_secs(2))
             .build(),
     );
-    let gw = PvaGateway::start(gateway_cfg(upstream_client)).expect("gateway start");
+    let gw =
+        PvaGateway::start(&test_reactor(), gateway_cfg(upstream_client)).expect("gateway start");
     let c = gw.client_config();
 
     let seen = Arc::new(std::sync::Mutex::new(Vec::<f64>::new()));
@@ -1526,7 +1540,8 @@ async fn r18_25_slow_pipelined_downstream_does_not_starve_co_subscribers() {
             .timeout(Duration::from_secs(2))
             .build(),
     );
-    let gw = PvaGateway::start(gateway_cfg(upstream_client)).expect("gateway start");
+    let gw =
+        PvaGateway::start(&test_reactor(), gateway_cfg(upstream_client)).expect("gateway start");
 
     // The slow one: pipelined with a tiny window, and it never returns from its
     // callback quickly enough to ACK. Its window closes and stays closed.
@@ -1823,7 +1838,7 @@ async fn bridge31_gateway_array_round_trip_forwards_upstream() {
             .timeout(Duration::from_secs(2))
             .build(),
     );
-    let gw = PvaGateway::start(gateway_cfg(upstream)).expect("gateway start");
+    let gw = PvaGateway::start(&test_reactor(), gateway_cfg(upstream)).expect("gateway start");
     let ds = gw.client_config();
 
     // getLength
@@ -1897,7 +1912,7 @@ async fn bridge31_read_only_gateway_rejects_array_write() {
     );
     let mut cfg = gateway_cfg(upstream);
     cfg.read_only = true;
-    let gw = PvaGateway::start(cfg).expect("read-only gateway start");
+    let gw = PvaGateway::start(&test_reactor(), cfg).expect("read-only gateway start");
     let ds = gw.client_config();
 
     // Read-class sub-ops still pass through.
@@ -1957,7 +1972,7 @@ async fn bridge31_gateway_array_through_composite_control_prefix() {
         control_prefix: Some("gw".into()),
         ..gateway_cfg(upstream)
     };
-    let gw = PvaGateway::start(cfg).expect("control-prefix gateway start");
+    let gw = PvaGateway::start(&test_reactor(), cfg).expect("control-prefix gateway start");
     let ds = gw.client_config();
 
     let len = tokio::time::timeout(
@@ -2122,7 +2137,7 @@ async fn gateway_put_get_forwards_pvrequest_and_returns_upstream_readback() {
             .build(),
     );
     let cfg = gateway_cfg(upstream_client);
-    let gw = PvaGateway::start(cfg).expect("gateway start");
+    let gw = PvaGateway::start(&test_reactor(), cfg).expect("gateway start");
 
     let ds = gw.client_config();
 
@@ -2186,7 +2201,7 @@ async fn gateway_put_get_forwards_through_composite_with_control_prefix() {
         control_prefix: Some("gw".into()),
         ..gateway_cfg(upstream_client)
     };
-    let gw = PvaGateway::start(cfg).expect("gateway start");
+    let gw = PvaGateway::start(&test_reactor(), cfg).expect("gateway start");
 
     let ds = gw.client_config();
     let req = epics_pva_rs::pv_request::PvRequestBuilder::new()
@@ -2298,7 +2313,7 @@ impl ChannelSource for PartialReadSource {
 /// — the decoder zero-fills every leaf the upstream did not send — so
 /// re-framing "everything" downstream would ship a `spare` the upstream
 /// never assigned (pva2pva forwards the upstream reply's own bitset,
-/// `p2pApp/channel.cpp:109-114`). The downstream changed-bitset must carry
+/// `p2pApp/channel.cpp:109-115`). The downstream changed-bitset must carry
 /// `value` and NOT `spare`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn gateway_get_frames_upstream_marks_not_a_full_mask() {
@@ -2339,24 +2354,27 @@ async fn gateway_get_frames_upstream_marks_not_a_full_mask() {
             .timeout(Duration::from_secs(2))
             .build(),
     );
-    let gw = PvaGateway::start(PvaGatewayConfig {
-        upstream_client: Some(upstream_client.clone()),
-        server_config: PvaServerConfig {
-            tcp_port: pick(),
-            udp_port: pick_udp(),
-            ..PvaServerConfig::isolated()
+    let gw = PvaGateway::start(
+        &test_reactor(),
+        PvaGatewayConfig {
+            upstream_client: Some(upstream_client.clone()),
+            server_config: PvaServerConfig {
+                tcp_port: pick(),
+                udp_port: pick_udp(),
+                ..PvaServerConfig::isolated()
+            },
+            cleanup_interval: Duration::from_secs(60),
+            connect_timeout: Duration::from_secs(2),
+            max_cache_entries: 1024,
+            max_subscribers: 1024,
+            control_prefix: None,
+            read_only: false,
+            acl: None,
+            audit: None,
+            control_acf_path: None,
+            control_reload_acf_path: None,
         },
-        cleanup_interval: Duration::from_secs(60),
-        connect_timeout: Duration::from_secs(2),
-        max_cache_entries: 1024,
-        max_subscribers: 1024,
-        control_prefix: None,
-        read_only: false,
-        acl: None,
-        audit: None,
-        control_acf_path: None,
-        control_reload_acf_path: None,
-    })
+    )
     .expect("gateway start");
 
     // The upstream itself frames only `value` — the fact the gateway has to
@@ -2480,7 +2498,7 @@ async fn r18_28_gateway_monitor_seed_declares_whole_structure() {
             .timeout(Duration::from_secs(2))
             .build(),
     );
-    let cache = ChannelCache::new(upstream_client, Duration::from_secs(60));
+    let cache = ChannelCache::new(test_reactor(), upstream_client, Duration::from_secs(60));
     let mut src = GatewayChannelSource::new(cache);
     src.connect_timeout = Duration::from_secs(5);
 
@@ -2590,7 +2608,8 @@ async fn r18_27_gateway_forwards_the_upstream_status_verbatim() {
             .timeout(Duration::from_secs(2))
             .build(),
     );
-    let gw = PvaGateway::start(gateway_cfg(upstream_client)).expect("gateway start");
+    let gw =
+        PvaGateway::start(&test_reactor(), gateway_cfg(upstream_client)).expect("gateway start");
     let client = gw.client_config();
 
     let err = client

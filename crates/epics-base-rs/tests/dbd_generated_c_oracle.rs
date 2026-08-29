@@ -109,6 +109,15 @@ fn choices_are_runtime_state(record: &str, field: &str) -> bool {
 /// A `menu()` field is served as `DBR_ENUM` *with its choices*: a client asking
 /// for `ai.LINR` must get `"NO CONVERSION"`, not `0`. Being typed Enum without
 /// choices to serve `get_enum_strs` is the half-migration this guards against.
+///
+/// "Carries" means *resolves to*, not "has a table in its own descriptor".
+/// `menu_choices_of` asks the descriptor first and the shared by-name registry
+/// second, and one menu can only be answered by the second: `menuScan` is
+/// site data that C re-reads at run time (`initPeriodic`, `dbScan.c:858`), so
+/// `SCAN`/`SSCN` resolve through the loaded menu and carry no static table.
+/// Asserting on `desc.menu` alone would have made a field that serves the
+/// RIGHT labels look naked, and a field pinned to the WRONG (stock) labels
+/// look correct.
 #[test]
 fn every_generated_menu_field_carries_its_choices() {
     let mut naked = Vec::new();
@@ -122,7 +131,10 @@ fn every_generated_menu_field_carries_its_choices() {
         if choices_are_runtime_state(record, field) {
             continue;
         }
-        if desc.menu.is_none_or(|m| m.is_empty()) {
+        let choices = desc
+            .menu
+            .or_else(|| epics_base_rs::server::record::shared_menu_choices(field));
+        if choices.is_none_or(|m| m.is_empty()) {
             naked.push(format!("{record}.{field}"));
         }
     }

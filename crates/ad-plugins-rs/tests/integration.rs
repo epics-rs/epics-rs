@@ -1,3 +1,10 @@
+// RTEMS-EXEC-MODEL-ALLOW(6): checked, not waived — all 6 ran and passed
+// on the exec backend (measured on this tree:
+// `EPICS_RS_BUILD_EXEC_BACKEND=thread cargo nextest run -p ad-plugins-rs
+// --all-features`, 556/556). ad-plugins-rs became a census subject when
+// its `build.rs` began deriving `tokio_backend`; nothing here builds a
+// CA server, and the reactor these obtain comes from `#[tokio::test]`
+// itself, which the backend does not remove.
 #![allow(clippy::needless_range_loop)]
 
 use std::collections::HashMap;
@@ -181,7 +188,7 @@ fn test_rewire_ndarray_port_at_runtime() {
     }
     impl NDPluginProcess for TrackingProcessor {
         fn process_array(
-            &mut self,
+            &self,
             array: &ad_core_rs::ndarray::NDArray,
             _pool: &NDArrayPool,
         ) -> ProcessResult {
@@ -319,7 +326,7 @@ fn test_rewire_through_real_roi_plugin() {
     }
     impl NDPluginProcess for TrackingProcessor {
         fn process_array(
-            &mut self,
+            &self,
             array: &ad_core_rs::ndarray::NDArray,
             _pool: &NDArrayPool,
         ) -> ProcessResult {
@@ -429,7 +436,7 @@ fn test_roi_param_change_enables_output() {
     }
     impl NDPluginProcess for TrackingProcessor {
         fn process_array(
-            &mut self,
+            &self,
             array: &ad_core_rs::ndarray::NDArray,
             _pool: &NDArrayPool,
         ) -> ProcessResult {
@@ -536,14 +543,14 @@ fn test_roi_then_stats_chain() {
         auto_size: false,
     };
 
-    let mut roi_proc = ROIProcessor::new(roi_config);
+    let roi_proc = ROIProcessor::new(roi_config);
     let roi_result = roi_proc.process_array(&arr, &pool);
     assert_eq!(roi_result.output_arrays.len(), 1);
     assert_eq!(roi_result.output_arrays[0].dims[0].size, 4);
     assert_eq!(roi_result.output_arrays[0].dims[1].size, 4);
 
     // Feed ROI output to Stats
-    let mut stats_proc = StatsProcessor::new();
+    let stats_proc = StatsProcessor::new();
     let stats_result = stats_proc.process_array(&roi_result.output_arrays[0], &pool);
 
     // Stats should be computed on the 4x4 ROI, not the full 16x16
@@ -564,7 +571,7 @@ fn test_process_then_file_tiff_pipeline() {
     let arr = make_2d_u8(8, 8);
 
     // Process: scale by 2
-    let mut proc = ProcessProcessor::new(ProcessConfig {
+    let proc = ProcessProcessor::new(ProcessConfig {
         enable_offset_scale: true,
         scale: 2.0,
         offset: 0.0,
@@ -574,11 +581,14 @@ fn test_process_then_file_tiff_pipeline() {
     assert_eq!(proc_result.output_arrays.len(), 1);
 
     // Write to TIFF
-    let path = std::env::temp_dir().join("integration_process_tiff.tif");
-    let mut tiff_proc = TiffFileProcessor::new();
-    tiff_proc.ctrl.file_base.file_path = path.parent().unwrap().to_str().unwrap().into();
-    tiff_proc.ctrl.file_base.file_name = path.file_name().unwrap().to_str().unwrap().into();
-    tiff_proc.ctrl.file_base.set_mode(NDFileMode::Single);
+    let path = std::env::temp_dir().join(format!(
+        "integration_process_tiff_{}.tif",
+        std::process::id()
+    ));
+    let tiff_proc = TiffFileProcessor::new();
+    tiff_proc.ctrl.lock().file_base.file_path = path.parent().unwrap().to_str().unwrap().into();
+    tiff_proc.ctrl.lock().file_base.file_name = path.file_name().unwrap().to_str().unwrap().into();
+    tiff_proc.ctrl.lock().file_base.set_mode(NDFileMode::Single);
 
     // Use the writer directly for this test
     use ad_core_rs::plugin::file_base::NDFileWriter;
@@ -602,7 +612,7 @@ fn test_circular_buff_trigger_flow() {
     use ad_plugins_rs::circular_buff::{CircularBuffProcessor, TriggerCondition};
 
     let pool = NDArrayPool::new(1_000_000);
-    let mut proc = CircularBuffProcessor::new(
+    let proc = CircularBuffProcessor::new(
         2, // pre_count
         1, // post_count
         TriggerCondition::External,
@@ -666,7 +676,7 @@ fn test_attribute_plugin_value_extraction() {
     use ad_plugins_rs::attribute::AttributeProcessor;
 
     let pool = NDArrayPool::new(1_000_000);
-    let mut proc = AttributeProcessor::new("exposure", 8);
+    let proc = AttributeProcessor::new("exposure", 8);
 
     let mut arr = NDArray::new(vec![NDDimension::new(4)], NDDataType::UInt8);
     arr.attributes.add(NDAttribute::new_static(
@@ -688,7 +698,7 @@ fn test_pos_plugin_position_attachment() {
     use ad_plugins_rs::pos_plugin::{PosMode, PosPluginProcessor};
 
     let pool = NDArrayPool::new(1_000_000);
-    let mut proc = PosPluginProcessor::new(PosMode::Discard);
+    let proc = PosPluginProcessor::new(PosMode::Discard);
 
     let mut pos = HashMap::new();
     pos.insert("MotorX".into(), 42.5);

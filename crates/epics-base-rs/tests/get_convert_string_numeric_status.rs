@@ -4,7 +4,7 @@
 //! `cvt_st_d` (`dbFastLinkConv.c:233-244`) and the array twin `getStringDouble`
 //! (`dbConvert.c:392-414`) both end in `epicsParseFloat64`'s status, which
 //! `dbChannel_get` turns into -1 (`db_access.c:816`); rsrv then zeroes the
-//! payload, stamps `m_cid = ECA_GETFAIL` and commits (`camessage.c:544-560`).
+//! payload, stamps `m_cid = ECA_GETFAIL` and commits (`camessage.c:534-550`).
 //! So `stringin` VAL="hello" read as `DBR_DOUBLE` is a failed get — a CA-linked
 //! calc goes LINK/INVALID — where a substituted `0.0` at NO_ALARM had the calc
 //! quietly computing with A=0.
@@ -12,7 +12,7 @@
 //! The empty string keeps its carve-out: `if (*from == 0) { *to = 0; return 0; }`
 //! runs first in every row, so an empty field reads as a successful zero.
 
-use epics_base_rs::error::CaError;
+use epics_base_rs::error::{CaError, CaOp};
 use epics_base_rs::types::{DbFieldType, EpicsValue, PvString, encode_dbr};
 
 const DBR_DOUBLE: u16 = 6;
@@ -110,7 +110,7 @@ fn the_dbr_encoder_reports_the_failure_instead_of_encoding_a_zero() {
         Err(CaError::GetConvertFailed(_))
     ));
     assert_eq!(
-        CaError::GetConvertFailed(String::new()).to_eca_status(),
+        CaError::GetConvertFailed(String::new()).to_eca_status(CaOp::Read),
         152,
         "ECA_GETFAIL = DEFMSG(CA_K_WARNING, 19)"
     );

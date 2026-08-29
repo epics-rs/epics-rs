@@ -177,7 +177,7 @@ pub fn decode_search_response(frame: &Frame) -> PvaResult<SearchResponse> {
     }
 
     // a wildcard/unspecified server address means "use the
-    // datagram source IP". pvxs `client.cpp:841-843` does the
+    // datagram source IP". pvxs `src/client.cpp:841-843` does the
     // substitution; we carry the raw advertised address through here
     // and let the search engine apply the substitution on receipt
     // (where the source addr is available). `ip_from_bytes_allow_unspec`

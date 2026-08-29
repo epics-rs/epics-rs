@@ -27,12 +27,8 @@
 //! -56 for the same byte. That narrowing now lives in the formatter, where
 //! C puts it, instead of in the carrier.
 
-// Host/tokio-only: builds the async `CaClient`/`CaServer` stack in process.
-// Under `rtems-exec-model` their `spawn` seam routes to a worker with no
-// tokio reactor, so the listener/transport tasks panic there.
-#![cfg(not(feature = "rtems-exec-model"))]
-
-use std::time::Duration;
+#![cfg(tokio_backend)]
+#![cfg(all(feature = "client-core", not(epics_embedded_target)))]
 
 use epics_base_rs::server::records::waveform::WaveformRecord;
 use epics_base_rs::server::snapshot::DbrClass;
@@ -83,7 +79,7 @@ async fn pair() -> (CaClient, CaChannel, CaChannel) {
     let src = client.create_channel(BYTES_PV);
     let dst = client.create_channel(LONGS_PV);
     for ch in [&src, &dst] {
-        ch.wait_connected(Duration::from_secs(3))
+        ch.wait_connected(budget::FACT_BUDGET)
             .await
             .expect("connect");
     }
@@ -125,7 +121,7 @@ async fn a_plain_get_of_a_char_waveform_re_puts_unsigned() {
 async fn a_single_element_get_takes_the_same_carrier() {
     let (_client, src, _dst) = pair().await;
     let (_, value) = src
-        .get_with_timeout_count(Duration::from_secs(3), 1u32)
+        .get_with_timeout_count(budget::FACT_BUDGET, 1u32)
         .await
         .expect("one-element get");
     assert_eq!(
@@ -140,7 +136,7 @@ async fn a_single_element_get_takes_the_same_carrier() {
 async fn a_monitor_of_a_char_waveform_re_puts_unsigned() {
     let (_client, src, dst) = pair().await;
     let mut mon = src.subscribe().await.expect("subscribe");
-    let snap = tokio::time::timeout(Duration::from_secs(3), mon.recv())
+    let snap = tokio::time::timeout(budget::FACT_BUDGET, mon.recv())
         .await
         .expect("monitor event within 3s")
         .expect("monitor stream open")
@@ -195,3 +191,6 @@ async fn caget_still_renders_the_signed_reading() {
         "the -S long-string form still recognises the wire byte carrier"
     );
 }
+
+#[path = "common/budget.rs"]
+mod budget;

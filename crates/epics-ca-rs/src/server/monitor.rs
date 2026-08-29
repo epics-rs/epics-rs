@@ -3,7 +3,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use super::LongStringMode;
 use super::frame::{FrameBuf, size_dbr_reply};
-use super::outbox::{Credit, Outbox};
+use super::outbox::{Credit, MonitorGate, Outbox};
 use super::stats::ServerStats;
 use crate::protocol::*;
 use epics_base_rs::server::event_queue::EventReader;
@@ -26,10 +26,15 @@ use epics_base_rs::types::encode_dbr_into;
 // `long_string_mode` propagated from `ChannelEntry`; monitor events are
 // converted inside `send_event` per the channel's mode — `$`-suffix
 // channels `EpicsValue::String` → `EpicsValue::CharArray[40]` (C
-// dbChannel.c:483-507), long-string record fields `EpicsValue::CharArray`
+// dbChannel.c:486-505), long-string record fields `EpicsValue::CharArray`
 // → scalar `EpicsValue::String` (C cvt_dbaddr).
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn spawn_monitor_sender(
+    // The producer opens no socket of its own, but every delivery it frames is
+    // written through the connection's outbox, whose writer lives on the
+    // reactor — so the producer belongs there too, and says so here rather
+    // than inheriting whatever executor its caller happened to run on.
+    reactor: &epics_base_rs::runtime::task::Reactor,
     sub_id: u32,
     data_type: u16,
     data_count: u32,
@@ -40,6 +45,10 @@ pub(crate) fn spawn_monitor_sender(
     outbox: Outbox,
     mut reader: EventReader,
     denied: Arc<AtomicBool>,
+    // Revoked by the teardown that queues this subscription's cancel
+    // confirmation, so a delivery still in flight is dropped rather than
+    // written after it — see `MonitorGate`.
+    gate: MonitorGate,
     long_string_mode: LongStringMode,
     stats: Option<Arc<ServerStats>>,
     // The EVENT_ADD request header (C `pevext->msg`) plus the client's
@@ -48,7 +57,7 @@ pub(crate) fn spawn_monitor_sender(
     // a 24-byte extended header it cannot parse (`caserverio.c:266-270`).
     reply: super::tcp::ReplyContext,
 ) -> epics_base_rs::runtime::task::TaskHandle<()> {
-    epics_base_rs::runtime::task::spawn(async move {
+    reactor.spawn(async move {
         loop {
             // C `event_read`: take this monitor's next queued entry, suspending
             // under EVENTS_OFF exactly where C does (`flowCtrlMode &&
@@ -69,7 +78,7 @@ pub(crate) fn spawn_monitor_sender(
             if let Some(ref s) = stats {
                 s.subscription_events_posted.fetch_add(1, Ordering::Relaxed);
             }
-            // C `casAccessRightsCB` (`rsrv/camessage.c:1116-1124`)
+            // C `casAccessRightsCB` (`rsrv/camessage.c:1085-1093`)
             // suppresses event deliveries with `db_event_disable`
             // while read access is denied (without tearing the
             // subscription down). Producer keeps running so a
@@ -86,19 +95,27 @@ pub(crate) fn spawn_monitor_sender(
             // instead of queueing — which is what stops a client that has
             // stopped reading from growing the server without limit.
             let credit = outbox.reserve().await;
-            if send_event(
-                data_type,
-                data_count,
-                sub_id,
-                &event,
-                &outbox,
-                credit,
-                long_string_mode,
-                reply,
-            )
-            .is_err()
-            {
-                break;
+            // C `db_cancel_event` nulls `user_sub` under LOCKEVQUE before
+            // `event_cancel_reply` writes the delete-confirmed echo, so this
+            // frame either precedes the echo or never exists. `deliver` is
+            // that decision: the enqueue happens inside it, and the teardown
+            // revokes before it queues the echo. `None` = cancelled while this
+            // delivery was between its ring and the outbox.
+            match gate.deliver(|| {
+                send_event(
+                    data_type,
+                    data_count,
+                    sub_id,
+                    &event,
+                    &outbox,
+                    credit,
+                    long_string_mode,
+                    reply,
+                )
+            }) {
+                Some(Ok(())) => {}
+                Some(Err(_)) => break,
+                None => break,
             }
             // Successfully written to the client — PCAS
             // `subscriptionEventsProcessed` parity (gateway
@@ -144,7 +161,7 @@ pub(crate) fn send_event(
     // One buffer with the header space reserved at the front, and the payload
     // encoded straight into it — C `cas_copy_in_header` reserving inside the
     // client's send buffer and `dbGet` converting into that space
-    // (`camessage.c:516` → `dbAccess.c:1020`). See `server::frame`.
+    // (`camessage.c:511` → `dbAccess.c:1017-1018`). See `server::frame`.
     let mut frame = FrameBuf::acquire(outbox.pool(), 0);
     encode_dbr_into(frame.dst(), data_type, snapshot)
         .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidData, "encode"))?;
@@ -349,13 +366,17 @@ mod tests {
                 .expect("subscriber added");
             let stats = Arc::new(ServerStats::default());
             let (outbox, _drain) = live_outbox();
+            let reactor = epics_base_rs::runtime::task::Reactor::current()
+                .expect("the test driver enters an executor");
             let task = spawn_monitor_sender(
+                &reactor,
                 1,
                 DBR_DOUBLE,
                 0,
                 outbox,
                 reader,
                 Arc::new(AtomicBool::new(false)),
+                crate::server::outbox::MonitorGate::open(),
                 LongStringMode::Plain,
                 Some(stats.clone()),
                 crate::server::tcp::ReplyContext {
@@ -395,13 +416,17 @@ mod tests {
                 .expect("subscriber added");
             let stats = Arc::new(ServerStats::default());
             let (outbox, _drain) = live_outbox();
+            let reactor = epics_base_rs::runtime::task::Reactor::current()
+                .expect("the test driver enters an executor");
             let task = spawn_monitor_sender(
+                &reactor,
                 1,
                 DBR_DOUBLE,
                 0,
                 outbox,
                 reader,
                 Arc::new(AtomicBool::new(true)), // read access denied
+                crate::server::outbox::MonitorGate::open(),
                 LongStringMode::Plain,
                 Some(stats.clone()),
                 crate::server::tcp::ReplyContext {

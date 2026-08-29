@@ -162,7 +162,7 @@ fn stringout_monitor_gate_only_on_change() {
 /// before the next scan. It matters for a string field — `dbChannelFieldSize`
 /// 40 exceeds `sizeof(union native_value)` 8, so C queues a stringin monitor
 /// BY REFERENCE and an undrained one holds a single entry however many posts
-/// arrive (`dbEvent.c:492-500`, `:786-799`). Counting an undrained queue would
+/// arrive (`dbEvent.c:493-500`, `:794-800`). Counting an undrained queue would
 /// measure the queue's early-drop, not the record's posting, which is what
 /// these two cases are about.
 async fn cycles_posted(mpst: i16, name: &str) -> usize {

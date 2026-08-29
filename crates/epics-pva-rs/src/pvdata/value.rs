@@ -469,7 +469,7 @@ impl Value {
     /// Iterate every field path — structure nodes AND leaves — in
     /// pvData bit order, excluding the root.
     ///
-    /// Mirrors pvxs `Value::iall()` (testdata.cpp:159-178): an
+    /// Mirrors pvxs `Value::iall()` (testdata.cpp:167-171): an
     /// `NTScalar` yields 9 descendants, including the `alarm` and
     /// `timeStamp` structure nodes, not only scalar leaves. Use
     /// [`Self::iter_all_leaves`] for leaf-only iteration.
@@ -494,7 +494,7 @@ impl Value {
     /// included, in bit order.
     ///
     /// pvxs `imarked()` reports a marked structure node alongside its
-    /// leaves (testdata.cpp:180-209): marking `alarm` makes `imarked()`
+    /// leaves (testdata.cpp:180-198): marking `alarm` makes `imarked()`
     /// see the `alarm` node plus its three leaves. A bare structure-node
     /// mark is therefore visible here and flows through
     /// [`Self::assign`], where the previous leaf-only walk dropped it.

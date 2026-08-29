@@ -17,14 +17,16 @@
 //! unconditionally decoded a descriptor, so a pvxs server replying with the
 //! no-value form failed the decode. `RpcReply` now models both overloads.
 
-// RTEMS-EXEC-MODEL-ALLOW(2): checked - these run and pass in the feature-ON suite.
+#![cfg(tokio_backend)]
 #![cfg(test)]
+#![cfg(feature = "client")]
 
 use std::sync::Arc;
 use std::time::Duration;
 
 use epics_pva_rs::pvdata::{FieldDesc, PvField, PvStructure, RpcReply, ScalarType, ScalarValue};
-use epics_pva_rs::server_native::{PvaServer, SharedPV, SharedSource};
+use epics_pva_rs::server_native::PvaServer;
+use epics_pva_rs::server_native::{SharedPV, SharedSource};
 
 /// An RPC argument that carries nothing the handlers below care about.
 fn empty_arg() -> (FieldDesc, PvField) {

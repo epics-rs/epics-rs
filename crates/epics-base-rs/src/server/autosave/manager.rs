@@ -82,7 +82,7 @@ impl AutosaveBuilder {
                 }
                 Err(e) => {
                     crate::runtime::log::errlog_printf(&format!(
-                        "autosave: save set '{name}' not built: {e} - its PVs are not saved"
+                        "autosave: save set '{name}' not built: {e} - its PVs are not saved\n"
                     ));
                     failed.push((name, e.to_string()));
                 }
@@ -129,14 +129,32 @@ impl AutosaveManager {
 
     /// Start all periodic/triggered/onchange tasks. Returns a join handle.
     ///
-    /// The *ambient* seam, unlike every deferred record tail: a save writes
-    /// through `runtime::fs`, whose hosted implementation is
-    /// `tokio::task::spawn_blocking` and panics off a runtime thread. Autosave
-    /// is started from `IocApplication::run`, which is async, so the ambient
-    /// runtime is the right one — this is not on the synchronous record-
-    /// processing chain that reaches a runtime-less connection thread.
-    pub fn start(self: Arc<Self>, db: Arc<PvDatabase>) -> TaskHandle<()> {
-        crate::runtime::task::spawn(async move {
+    /// Takes the [`Reactor`](crate::runtime::task::Reactor), unlike every
+    /// deferred record tail: a save writes through `runtime::fs`, whose hosted
+    /// implementation is `tokio::task::spawn_blocking` and panics off a runtime
+    /// thread, and each strategy is a poller on `runtime::task::interval`,
+    /// which is `tokio::time` there. Autosave is started from
+    /// `IocApplication::run`, which owns that runtime; it is not on the
+    /// synchronous record-processing chain that reaches a runtime-less
+    /// connection thread. The parameter is what says so for the *spawns*,
+    /// which used to rest on this paragraph alone and which a caller could
+    /// not be stopped from ignoring.
+    ///
+    /// It does not retire the census waiver, and this comment claimed
+    /// otherwise until it was checked. The three `runtime::task::interval`
+    /// tickers below (`:161`, `:191`, `:221`) still name the ambient seam,
+    /// `interval` is on `record_seam_gate::BANNED`, and `EXEMPT` in
+    /// `server/mod.rs` is still what lets this file past
+    /// `a_deferred_record_tail_never_uses_the_ambient_seam`. Retiring it
+    /// needs the delay half carried on the capability too, not another
+    /// sentence here.
+    pub fn start(
+        self: Arc<Self>,
+        reactor: &crate::runtime::task::Reactor,
+        db: Arc<PvDatabase>,
+    ) -> TaskHandle<()> {
+        let outer = reactor.clone();
+        reactor.spawn(async move {
             let mut handles = Vec::new();
 
             for (set, lock) in &self.sets {
@@ -148,7 +166,7 @@ impl AutosaveManager {
 
                 let handle = match set.config().strategy.clone() {
                     SaveStrategy::Periodic { interval } => {
-                        crate::runtime::task::spawn(async move {
+                        outer.spawn(async move {
                             let mut ticker = crate::runtime::task::interval(interval);
                             ticker.tick().await; // first tick is immediate, skip it
                             loop {
@@ -178,7 +196,7 @@ impl AutosaveManager {
                         mode,
                         poll_interval,
                     } => {
-                        crate::runtime::task::spawn(async move {
+                        outer.spawn(async move {
                             let mut ticker = crate::runtime::task::interval(poll_interval);
                             let mut watermark = ChangeWatermark::new(
                                 TriggerState {
@@ -208,7 +226,7 @@ impl AutosaveManager {
                     SaveStrategy::OnChange {
                         min_interval,
                         float_epsilon,
-                    } => crate::runtime::task::spawn(async move {
+                    } => outer.spawn(async move {
                         let mut ticker = crate::runtime::task::interval(min_interval);
                         let mut watermark =
                             ChangeWatermark::new(HashMap::new(), set, lock, db, status_prefix);

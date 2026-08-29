@@ -188,6 +188,21 @@ fn mbap_frame_len(header: &MbapHeader) -> ModbusResult<usize> {
 /// UDP needs none of this: a datagram is delivered whole or not at all, and
 /// carrying leftovers between datagrams would desynchronise a link that cannot
 /// otherwise lose framing.
+///
+/// # This is a deliberate divergence: C does not reassemble
+///
+/// C's `readIt` TCP/UDP arm reads into `pPvt->rxBuffer` from offset 0 on every
+/// iteration of its loop (`modbusInterpose.c:346-349`) and breaks as soon as
+/// two bytes have arrived whose transaction ID matches (`:366-368`) — it never
+/// keeps what a previous read returned. It then hands up
+/// `nbytesActual - mbapSize - 1` bytes (`:372-378`), so a reply split across
+/// TCP segments is delivered **truncated and reported as success**, with the
+/// tail left on the socket to be parsed as the next transaction's MBAP header.
+/// Only a chunk shorter than 2 bytes makes C loop and re-read.
+///
+/// This port reads to the length the header declares before returning a frame,
+/// so a split reply is served whole. Reassembling is the divergence; do not
+/// "restore parity" by reading one chunk per frame.
 #[derive(Debug, Default)]
 pub struct MbapAccumulator {
     buf: Vec<u8>,

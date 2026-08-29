@@ -1,7 +1,7 @@
 //! Cause A: a put to the `dbCommon` `UDF` field must drive processing.
 //!
 //! C `processNotifyCommon` (dbNotify.c:243-246) and `dbPutField`
-//! (dbAccess.c:1263-1268) process a record on a put when the field is `PROC`
+//! (dbAccess.c:1260-1265) process a record on a put when the field is `PROC`
 //! **or** it is `pp(TRUE)` and `SCAN == Passive`. `PROC` and `UDF` are the ONLY
 //! two `dbCommon` `pp(TRUE)` fields (`dbCommon.dbd.pod`: PROC line 243, UDF line
 //! 552). `UDF` is an ordinary `pp` field — it processes only on a Passive

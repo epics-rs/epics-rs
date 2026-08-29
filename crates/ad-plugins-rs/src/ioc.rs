@@ -9,8 +9,8 @@
 use std::sync::{Arc, Mutex};
 
 use ad_core_rs::ioc::{
-    PluginManager, attr_arg_defs, dtyp_from_port, extract_plugin_args, plugin_arg_defs,
-    register_noop_commands,
+    PluginManager, attr_arg_defs, dtyp_from_port, extract_plugin_args, max_threads_arg,
+    plugin_arg_defs, plugin_arg_defs_with_count, register_noop_commands,
 };
 use ad_core_rs::plugin::runtime::{create_plugin_runtime, create_plugin_runtime_multi_addr};
 use ad_core_rs::plugin::wiring::WiringRegistry;
@@ -20,6 +20,8 @@ use epics_base_rs::error::CaResult;
 use epics_base_rs::server::autosave::AutosaveStartupConfig;
 use epics_base_rs::server::iocsh::registry::*;
 use epics_ca_rs::server::ioc_app::IocApplication;
+
+use crate::attr_plot_args::{AttrPlotArgs, parse_attr_plot_args};
 
 /// Register all standard areaDetector plugin configure commands.
 ///
@@ -46,6 +48,7 @@ pub fn register_all_plugins(mut app: IocApplication, mgr: &Arc<PluginManager>) -
                     &ndarray_port,
                     m.wiring().clone(),
                 );
+                handle.set_max_threads(max_threads_arg(args, 9));
                 if let Err(e) = m.add_plugin(&dtyp, &handle) {
                     eprintln!("NDStdArraysConfigure: {e}");
                     return Ok(CommandOutcome::Continue);
@@ -80,6 +83,7 @@ pub fn register_all_plugins(mut app: IocApplication, mgr: &Arc<PluginManager>) -
                     m.wiring().clone(),
                     &tsr,
                 );
+                handle.set_max_threads(max_threads_arg(args, 9));
 
                 if let Err(e) = m.add_plugin(&dtyp, &handle) {
                     eprintln!("NDStatsConfigure: {e}");
@@ -114,6 +118,7 @@ pub fn register_all_plugins(mut app: IocApplication, mgr: &Arc<PluginManager>) -
                     &ndarray_port,
                     m.wiring().clone(),
                 );
+                handle.set_max_threads(max_threads_arg(args, 9));
                 if let Err(e) = m.add_plugin(&dtyp, &handle) {
                     eprintln!("NDROIConfigure: {e}");
                     return Ok(CommandOutcome::Continue);
@@ -130,6 +135,8 @@ pub fn register_all_plugins(mut app: IocApplication, mgr: &Arc<PluginManager>) -
         &mut app,
         mgr,
         "NDProcessConfigure",
+        plugin_arg_defs(),
+        None,
         |port_name, queue_size, ndarray_port, pool, wiring| {
             use crate::process::{ProcessConfig, ProcessProcessor};
             create_plugin_runtime(
@@ -146,6 +153,8 @@ pub fn register_all_plugins(mut app: IocApplication, mgr: &Arc<PluginManager>) -
         &mut app,
         mgr,
         "NDTransformConfigure",
+        plugin_arg_defs(),
+        Some(9),
         |port_name, queue_size, ndarray_port, pool, wiring| {
             use crate::transform::{TransformProcessor, TransformType};
             create_plugin_runtime(
@@ -162,6 +171,8 @@ pub fn register_all_plugins(mut app: IocApplication, mgr: &Arc<PluginManager>) -
         &mut app,
         mgr,
         "NDColorConvertConfigure",
+        plugin_arg_defs(),
+        Some(9),
         |port_name, queue_size, ndarray_port, pool, wiring| {
             use crate::color_convert::{ColorConvertConfig, ColorConvertProcessor};
             use ad_core_rs::color::{NDBayerPattern, NDColorMode};
@@ -184,6 +195,8 @@ pub fn register_all_plugins(mut app: IocApplication, mgr: &Arc<PluginManager>) -
         &mut app,
         mgr,
         "NDOverlayConfigure",
+        plugin_arg_defs_with_count("maxOverlays"),
+        Some(10),
         |port_name, queue_size, ndarray_port, pool, wiring| {
             use crate::overlay::OverlayProcessor;
             create_plugin_runtime(
@@ -200,6 +213,8 @@ pub fn register_all_plugins(mut app: IocApplication, mgr: &Arc<PluginManager>) -
         &mut app,
         mgr,
         "NDFFTConfigure",
+        plugin_arg_defs(),
+        Some(9),
         |port_name, queue_size, ndarray_port, pool, wiring| {
             use crate::fft::FFTProcessor;
             create_plugin_runtime(
@@ -216,6 +231,8 @@ pub fn register_all_plugins(mut app: IocApplication, mgr: &Arc<PluginManager>) -
         &mut app,
         mgr,
         "NDCircularBuffConfigure",
+        plugin_arg_defs(),
+        None,
         |port_name, queue_size, ndarray_port, pool, wiring| {
             use crate::circular_buff::{CircularBuffProcessor, TriggerCondition};
             create_plugin_runtime(
@@ -234,6 +251,8 @@ pub fn register_all_plugins(mut app: IocApplication, mgr: &Arc<PluginManager>) -
         &mut app,
         mgr,
         "NDCodecConfigure",
+        plugin_arg_defs(),
+        Some(9),
         |port_name, queue_size, ndarray_port, pool, wiring| {
             use crate::codec::{CodecMode, CodecProcessor};
             use ad_core_rs::codec::CodecName;
@@ -254,6 +273,8 @@ pub fn register_all_plugins(mut app: IocApplication, mgr: &Arc<PluginManager>) -
         &mut app,
         mgr,
         "NDScatterConfigure",
+        plugin_arg_defs(),
+        None,
         |port_name, queue_size, ndarray_port, pool, wiring| {
             use crate::scatter::ScatterProcessor;
             create_plugin_runtime(
@@ -341,13 +362,11 @@ pub fn register_all_plugins(mut app: IocApplication, mgr: &Arc<PluginManager>) -
         let int = |name| ArgDesc {
             name,
             arg_type: ArgType::Int,
-            optional: true,
         };
         let arg_defs = vec![
             ArgDesc {
                 name: "portName",
                 arg_type: ArgType::String,
-                optional: false,
             },
             int("nAttributes"),
             int("cacheSize"),
@@ -355,7 +374,6 @@ pub fn register_all_plugins(mut app: IocApplication, mgr: &Arc<PluginManager>) -
             ArgDesc {
                 name: "NDArrayPort",
                 arg_type: ArgType::String,
-                optional: true,
             },
             int("NDArrayAddr"),
             int("queueSize"),
@@ -419,6 +437,8 @@ pub fn register_all_plugins(mut app: IocApplication, mgr: &Arc<PluginManager>) -
         &mut app,
         mgr,
         "NDFileTIFFConfigure",
+        plugin_arg_defs(),
+        None,
         |port_name, queue_size, ndarray_port, pool, wiring| {
             use crate::file_tiff::TiffFileProcessor;
             create_plugin_runtime(
@@ -435,6 +455,8 @@ pub fn register_all_plugins(mut app: IocApplication, mgr: &Arc<PluginManager>) -
         &mut app,
         mgr,
         "NDFileJPEGConfigure",
+        plugin_arg_defs(),
+        None,
         |port_name, queue_size, ndarray_port, pool, wiring| {
             use crate::file_jpeg::JpegFileProcessor;
             create_plugin_runtime(
@@ -451,6 +473,8 @@ pub fn register_all_plugins(mut app: IocApplication, mgr: &Arc<PluginManager>) -
         &mut app,
         mgr,
         "NDFileHDF5Configure",
+        plugin_arg_defs(),
+        None,
         |port_name, queue_size, ndarray_port, pool, wiring| {
             use crate::file_hdf5::Hdf5FileProcessor;
             create_plugin_runtime(
@@ -467,6 +491,8 @@ pub fn register_all_plugins(mut app: IocApplication, mgr: &Arc<PluginManager>) -
         &mut app,
         mgr,
         "NDFileNetCDFConfigure",
+        plugin_arg_defs(),
+        None,
         |port_name, queue_size, ndarray_port, pool, wiring| {
             use crate::file_netcdf::NetcdfFileProcessor;
             create_plugin_runtime(
@@ -483,6 +509,8 @@ pub fn register_all_plugins(mut app: IocApplication, mgr: &Arc<PluginManager>) -
         &mut app,
         mgr,
         "NDFileMagickConfigure",
+        plugin_arg_defs(),
+        None,
         |port_name, queue_size, ndarray_port, pool, wiring| {
             use crate::file_magick::MagickFileProcessor;
             create_plugin_runtime(
@@ -545,7 +573,7 @@ pub fn register_all_plugins(mut app: IocApplication, mgr: &Arc<PluginManager>) -
         let tsr = ts_registry.clone();
         app = app.register_startup_command(CommandDef::new(
             "NDROIStatConfigure",
-            plugin_arg_defs(),
+            plugin_arg_defs_with_count("maxROIs"),
             "NDROIStatConfigure portName [queueSize] ...",
             move |args: &[ArgValue], _ctx: &CommandContext| {
                 let (port_name, queue_size, ndarray_port) = extract_plugin_args(args)?;
@@ -561,6 +589,7 @@ pub fn register_all_plugins(mut app: IocApplication, mgr: &Arc<PluginManager>) -
                     32,
                     &tsr,
                 );
+                handle.set_max_threads(max_threads_arg(args, 10));
                 if let Err(e) = m.add_plugin(&dtyp, &handle) {
                     eprintln!("NDROIStatConfigure: {e}");
                     return Ok(CommandOutcome::Continue);
@@ -579,6 +608,8 @@ pub fn register_all_plugins(mut app: IocApplication, mgr: &Arc<PluginManager>) -
         &mut app,
         mgr,
         "NDBadPixelConfigure",
+        plugin_arg_defs(),
+        Some(9),
         |port_name, queue_size, ndarray_port, pool, wiring| {
             use crate::bad_pixel::BadPixelProcessor;
             create_plugin_runtime(
@@ -596,6 +627,8 @@ pub fn register_all_plugins(mut app: IocApplication, mgr: &Arc<PluginManager>) -
         &mut app,
         mgr,
         "NDFileNexusConfigure",
+        plugin_arg_defs(),
+        None,
         |port_name, queue_size, ndarray_port, pool, wiring| {
             use crate::file_nexus::NexusFileProcessor;
             create_plugin_runtime(
@@ -705,7 +738,6 @@ pub fn register_all_plugins(mut app: IocApplication, mgr: &Arc<PluginManager>) -
                 defs[5] = ArgDesc {
                     name: "pvName",
                     arg_type: ArgType::String,
-                    optional: true,
                 };
             }
             defs
@@ -777,52 +809,21 @@ pub fn register_all_plugins(mut app: IocApplication, mgr: &Arc<PluginManager>) -
     app
 }
 
-/// Helper: register a generic plugin configure command that follows the standard pattern.
-/// Parsed `NDAttrPlotConfig` arguments.
-struct AttrPlotArgs {
-    port_name: String,
-    n_attributes: usize,
-    cache_size: usize,
-    n_data_blocks: usize,
-    in_port: String,
-    queue_size: usize,
-}
-
-/// Parse `NDAttrPlotConfig` positional args in C order
-/// (`NDPluginAttrPlot.cpp:308`): `port, n_attributes, cache_size,
-/// n_selected_blocks, in_port, in_addr, queue_size, ...`.
+/// Register one plugin `*Configure` command whose only arguments this crate
+/// reads are `portName`, `queueSize` and `NDArrayPort`.
 ///
-/// A present integer is honoured exactly — including an explicit `0`, which is
-/// meaningful for `cache_size` (`0` = unlimited per-buffer cache). Fallbacks
-/// apply only when an arg is absent; a real st.cmd always passes them, so the
-/// fallbacks only affect malformed calls.
-fn parse_attr_plot_args(args: &[ArgValue]) -> Result<AttrPlotArgs, String> {
-    let port_name = match args.first() {
-        Some(ArgValue::String(s)) if !s.is_empty() => s.clone(),
-        _ => return Err("NDAttrPlotConfig: portName required".into()),
-    };
-    let usize_arg = |i: usize, default: usize| match args.get(i) {
-        Some(ArgValue::Int(n)) => (*n).max(0) as usize,
-        _ => default,
-    };
-    let in_port = match args.get(4) {
-        Some(ArgValue::String(s)) => s.clone(),
-        _ => String::new(),
-    };
-    Ok(AttrPlotArgs {
-        port_name,
-        n_attributes: usize_arg(1, 8),
-        cache_size: usize_arg(2, 1000),
-        n_data_blocks: usize_arg(3, 4),
-        in_port,
-        queue_size: usize_arg(6, 20),
-    })
-}
-
+/// `arg_defs` and `max_threads_idx` describe one C signature between them and
+/// have to be given together: the index is only reachable if `arg_defs` is
+/// long enough to accept an argument there, so a command carrying
+/// [`plugin_arg_defs_with_count`] is exactly a command whose `maxThreads` is
+/// at 10. `None` is for a C signature with no `maxThreads` at all — argument 9
+/// is `stackSize` there, and [`max_threads_arg`] must not be pointed at it.
 fn register_generic_plugin<F>(
     app: &mut IocApplication,
     mgr: &Arc<PluginManager>,
     cmd_name: &'static str,
+    arg_defs: Vec<ArgDesc>,
+    max_threads_idx: Option<usize>,
     factory: F,
 ) -> IocApplication
 where
@@ -844,7 +845,7 @@ where
     let taken = std::mem::replace(app, IocApplication::new());
     taken.register_startup_command(CommandDef::new(
         cmd_name,
-        plugin_arg_defs(),
+        arg_defs,
         format!("{cmd_name} portName [queueSize] ..."),
         move |args: &[ArgValue], _ctx: &CommandContext| {
             let (port_name, queue_size, ndarray_port) = extract_plugin_args(args)?;
@@ -864,6 +865,9 @@ where
                 pool,
                 m.wiring().clone(),
             );
+            if let Some(idx) = max_threads_idx {
+                handle.set_max_threads(max_threads_arg(args, idx));
+            }
             if let Err(e) = m.add_plugin(&dtyp, &handle) {
                 eprintln!("{cmd_name}: {e}");
                 return Ok(CommandOutcome::Continue);
@@ -1080,18 +1084,25 @@ impl AdIoc {
     pub async fn run(self, script: &str) -> CaResult<()> {
         let app = self.app.unwrap();
 
-        app.startup_script(script)
-            // CA links resolve with zero further setup: the `ca` link set
-            // installs at the base `AfterCaLinkInit` hook, before
-            // `setup_cp_links` warms Passive CP holders.
-            .register_link_set_installer(epics_ca_rs::calink::calink_link_set_install)
-            .run(epics_ca_rs::server::run_ca_ioc)
-            .await
+        // The runner paired with C's `rsrvRegistrar`, because `casr` has to
+        // answer from the script's first line and `.run(runner)` reaches only
+        // the interactive shell.
+        epics_ca_rs::server::run_ca_ioc_app(
+            app.startup_script(script)
+                // CA links resolve with zero further setup: the `ca` link set
+                // installs at the base `AfterCaLinkInit` hook, before
+                // `setup_cp_links` warms Passive CP holders.
+                .register_link_set_installer(epics_ca_rs::calink::calink_link_set_install),
+        )
+        .await
     }
 
     /// Run the IOC with both CA and PVA protocols (QSRV bridge).
     ///
-    /// Same as [`Self::run`] but uses [`epics_bridge_rs::qsrv::run_ca_pva_qsrv_ioc`]
+    /// Same as [`Self::run`] but uses
+    /// `epics_bridge_rs::qsrv::run_ca_pva_qsrv_ioc_app` — named in a code span
+    /// rather than linked because it is `tokio_backend`-only and this doc is
+    /// rendered in configurations that do not have it —
     /// as the protocol runner, serving records over CA (default port 5064) and
     /// pvAccess (default port 5075) simultaneously. PVA plugin PVs (NTNDArray)
     /// registered during st.cmd are wired into the PVA server automatically.
@@ -1099,15 +1110,17 @@ impl AdIoc {
     pub async fn run_with_pva(self, script: &str) -> CaResult<()> {
         let app = self.app.unwrap();
 
-        app.startup_script(script)
-            // External links resolve with zero further setup: both link
-            // sets install at the base `AfterCaLinkInit` hook — before
-            // `setup_cp_links` warms Passive CP holders and before the
-            // iocInit external-link wait, both `ca` and `pva`.
-            .register_link_set_installer(epics_ca_rs::calink::calink_link_set_install)
-            .register_link_set_installer(epics_bridge_rs::qsrv::pvalink_link_set_install)
-            .run(epics_bridge_rs::qsrv::run_ca_pva_qsrv_ioc)
-            .await
+        // Runner plus both protocol registrars — see [`Self::run`].
+        epics_bridge_rs::qsrv::run_ca_pva_qsrv_ioc_app(
+            app.startup_script(script)
+                // External links resolve with zero further setup: both link
+                // sets install at the base `AfterCaLinkInit` hook — before
+                // `setup_cp_links` warms Passive CP holders and before the
+                // iocInit external-link wait, both `ca` and `pva`.
+                .register_link_set_installer(epics_ca_rs::calink::calink_link_set_install)
+                .register_link_set_installer(epics_bridge_rs::qsrv::pvalink_link_set_install),
+        )
+        .await
     }
 
     /// Run the IOC with PVA from command-line args.
@@ -1122,62 +1135,5 @@ impl AdIoc {
             std::process::exit(1);
         };
         self.run_with_pva(&script).await
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn parse_attr_plot_args_maps_c_positional_order() {
-        // C NDAttrPlotConfig(port, n_attributes, cache_size, n_selected_blocks,
-        // in_port, in_addr, queue_size, ...) — NDPluginAttrPlot.cpp:308. The
-        // distinct order (n_attributes/cache/blocks before in_port, queue at
-        // index 6) is the parity-critical mapping this guards.
-        let args = vec![
-            ArgValue::String("AP1".to_string()),
-            ArgValue::Int(10),                    // n_attributes
-            ArgValue::Int(500),                   // cache_size
-            ArgValue::Int(3),                     // n_selected_blocks
-            ArgValue::String("DET1".to_string()), // in_port
-            ArgValue::Int(0),                     // in_addr
-            ArgValue::Int(50),                    // queue_size
-            ArgValue::Int(0),                     // blocking_callbacks
-        ];
-        let p = parse_attr_plot_args(&args).unwrap();
-        assert_eq!(p.port_name, "AP1");
-        assert_eq!(p.n_attributes, 10);
-        assert_eq!(p.cache_size, 500);
-        assert_eq!(p.n_data_blocks, 3);
-        assert_eq!(p.in_port, "DET1");
-        assert_eq!(p.queue_size, 50);
-    }
-
-    #[test]
-    fn parse_attr_plot_args_requires_port_name() {
-        assert!(parse_attr_plot_args(&[]).is_err());
-        assert!(parse_attr_plot_args(&[ArgValue::String(String::new())]).is_err());
-        assert!(parse_attr_plot_args(&[ArgValue::Int(1)]).is_err());
-    }
-
-    #[test]
-    fn parse_attr_plot_args_honours_explicit_zero_and_defaults_absent() {
-        // Boundary: an explicit cache_size=0 is meaningful (unlimited) and must be
-        // honoured; absent n_attributes/n_data_blocks/queue_size fall back.
-        let args = vec![
-            ArgValue::String("AP2".to_string()),
-            ArgValue::Missing, // n_attributes absent
-            ArgValue::Int(0),  // cache_size = unlimited (explicit 0, not a fallback)
-        ];
-        let p = parse_attr_plot_args(&args).unwrap();
-        assert_eq!(p.n_attributes, 8, "absent n_attributes -> fallback");
-        assert_eq!(
-            p.cache_size, 0,
-            "explicit 0 cache_size honoured (unlimited)"
-        );
-        assert_eq!(p.n_data_blocks, 4, "absent n_data_blocks -> fallback");
-        assert_eq!(p.in_port, "", "absent in_port -> empty");
-        assert_eq!(p.queue_size, 20, "absent queue_size -> fallback");
     }
 }

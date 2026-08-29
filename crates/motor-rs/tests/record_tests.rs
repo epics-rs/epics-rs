@@ -381,7 +381,7 @@ fn test_stop_during_move() {
     assert_eq!(effects.commands.len(), 1);
     assert!(matches!(effects.commands[0], MotorCommand::Stop { .. }));
     // C parity: drive fields are NOT synced at stop-put time (C only sets
-    // pp=TRUE while the axis decelerates, motorRecord.cc:1891-1893)...
+    // pp=TRUE while the axis decelerates, motorRecord.cc:1890-1894)...
     assert_eq!(rec.pos.val, 0.0);
 
     // ...the VAL<-RBV sync happens when the axis has actually stopped.
@@ -490,7 +490,7 @@ fn test_set_foff_variable_val_completes_without_command() {
 fn test_set_dval_load_pos_pulses_dmov_and_refreshes_status() {
     // C load_pos (motorRecord.cc:3771-3817): SET-mode DVAL re-anchors
     // the controller — LOAD_POS then GET_INFO, mip = MIP_LOAD_P, DMOV
-    // pulses low; the status callback completes it (1404-1409).
+    // pulses low; the status callback completes it (1405-1409).
     let mut rec = MotorRecord::new();
     rec.conv.mres = 1.0;
     rec.stat.msta = MstaFlags::DONE;
@@ -499,7 +499,7 @@ fn test_set_dval_load_pos_pulses_dmov_and_refreshes_status() {
     rec.pos.drbv = 5.0;
     // The lasts track the established position (C: synced at the
     // dispatch that reached 5.0) — the redefinition below must differ
-    // from them to pass the move-block entry gate (2240).
+    // from them to pass the move-block entry gate (2241).
     rec.internal.lval = 5.0;
     rec.internal.ldvl = 5.0;
     rec.put_field("SET", EpicsValue::Short(1)).unwrap();
@@ -525,7 +525,7 @@ fn test_set_dval_load_pos_pulses_dmov_and_refreshes_status() {
     };
     rec.process_motor_info(&status);
     let _ = rec.check_completion();
-    assert!(rec.stat.mip.is_empty(), "C 1404-1409: LOAD_P -> DONE");
+    assert!(rec.stat.mip.is_empty(), "C 1405-1409: LOAD_P -> DONE");
     assert!(rec.stat.dmov, "DMOV returns TRUE on the status callback");
 }
 
@@ -683,7 +683,7 @@ fn test_sset_suse_fof_vof_momentary_commands() {
 
 #[test]
 fn test_runtime_mres_change_use_mode_reanchors_with_load_pos() {
-    // C do_work (motorRecord.cc:1936-1991): the pp(TRUE) process pass
+    // C do_work (motorRecord.cc:1937-1991): the pp(TRUE) process pass
     // after a runtime MRES write re-anchors a USE-mode record via
     // load_pos — LOAD_POS at the current DVAL, MIP_LOAD_P, DMOV low,
     // GET_INFO.
@@ -711,9 +711,9 @@ fn test_runtime_mres_change_use_mode_reanchors_with_load_pos() {
 
 #[test]
 fn test_runtime_mres_change_set_mode_resyncs_drive_values() {
-    // C do_work 1980-1986: in SET mode the resolution change arms pp
+    // C do_work 1981-1987: in SET mode the resolution change arms pp
     // and sends GET_INFO — no LOAD_POS. The status callback then runs
-    // postProcess (process 1396-1402 -> 826-849), re-deriving the
+    // postProcess (process 1382-1402 -> 827-849), re-deriving the
     // drive values from the readback at the new resolution.
     let mut rec = MotorRecord::new();
     rec.stat.msta = MstaFlags::DONE;
@@ -985,7 +985,7 @@ fn test_pause_during_active_home_clears_buttons() {
 
 #[test]
 fn test_homf_while_paused_drops_dmov_and_stays_latched() {
-    // C home section under stop_or_pause (motorRecord.cc:2015-2020): a
+    // C home section under stop_or_pause (motorRecord.cc:2016-2021): a
     // home button latched while SPMG is Stop/Pause only drops DMOV —
     // no MIP change, no dispatch, button stays latched.
     let mut rec = MotorRecord::new();
@@ -1011,7 +1011,7 @@ fn test_homf_while_paused_drops_dmov_and_stays_latched() {
 #[test]
 fn test_paused_homf_dispatches_at_go() {
     // C: the Go pass falls through the top block into the home section
-    // (2010-2076), which fires the still-latched button.
+    // (2013-2076), which fires the still-latched button.
     let mut rec = MotorRecord::new();
     rec.stat.msta = MstaFlags::DONE;
     rec.ctrl.spmg = SpmgMode::Pause;
@@ -1317,11 +1317,9 @@ fn test_field_list_coverage() {
 /// now, so the gap is a list — and it is a RATCHET: a new unimplemented field
 /// has to be added here, and implementing one has to remove it.
 ///
-/// What remains is the set `motorRecord.cc` never assigns outside
-/// `init_record`, so serving one from record state would give it nothing to
-/// track: `CARD` (set once from the OUT link type, `motorRecord.cc:650-665`),
+/// What remains is the set `motorRecord.cc` never assigns at all:
 /// `HSV`/`LSV` (declared but read by nothing in `motorRecord.cc` — `alarm_sub`
-/// raises both limit alarms at `HLSV`, `:3401-3407`), `INIT` (startup command
+/// raises both limit alarms at `HLSV`, `:3379-3386`), `INIT` (startup command
 /// string, consumed by device support at `motordevCom.cc:310`), `PREM`
 /// (pre-move command, consumed by vendor device support, e.g.
 /// `devPM304.cc:209-211`) and `LOCK` (soft-channel position lock, read at
@@ -1335,7 +1333,10 @@ fn test_field_list_coverage() {
 /// why the list has to stay honest — `LSPG` and `PP` sat here while the record
 /// was writing them all along, and the fallback answered `3` and `0` forever
 /// with nothing to show anything was wrong.
-const UNIMPLEMENTED: &[&str] = &["CARD", "HSV", "LSV", "INIT", "PREM", "LOCK"];
+/// `CARD` left this list when the OUT-link derivation landed
+/// (`motorRecord.cc:653-670`); `card_is_derived_from_the_out_link.rs` is what
+/// it turned into.
+const UNIMPLEMENTED: &[&str] = &["HSV", "LSV", "INIT", "PREM", "LOCK"];
 
 #[test]
 fn test_dly_delays_finalization() {
@@ -1396,7 +1397,7 @@ fn test_miss_when_retries_exhausted() {
 
 #[test]
 fn test_ls_stop_syncs_drive_values_to_readback() {
-    // C motorRecord.cc:1366-1380 → postProcess (826-849): a positional
+    // C motorRecord.cc:1368-1380 → postProcess (827-849): a positional
     // move halted by a hardware limit switch in the travel direction
     // forces pp=TRUE and re-arms GET_INFO, and the next callback adopts
     // the limit readback into VAL/DVAL/RVAL (DIFF/RDIF zeroed). Without
@@ -1431,6 +1432,82 @@ fn test_ls_stop_syncs_drive_values_to_readback() {
     assert_eq!(rec.pos.rval, 9, "RVAL = NINT(DVAL/MRES) at the limit");
     assert_eq!(rec.pos.diff, 0.0, "DIFF zeroed at the limit");
     assert_eq!(rec.pos.rdif, 0, "RDIF zeroed at the limit");
+}
+
+#[test]
+fn test_pause_onto_limit_switch_syncs_drive_values_to_readback() {
+    // R64. C motorRecord.cc:1367-1380 fires on ANY motor-stopped callback
+    // with `mip != MIP_DONE` and a struck raw limit in the raw commanded
+    // direction — the test precedes the `pp` test (1382) and the retry gate
+    // (1405), and `goto process_exit` means maybeRetry is never reached on
+    // that pass. So a Pause is NOT exempt: it forces pp=TRUE + GET_INFO and
+    // mip=MIP_DONE, and the next callback's postProcess (827-849) adopts the
+    // limit readback into VAL/DVAL/RVAL. Driven end-to-end through the put
+    // and poll API so the reachability of the path is what is asserted, not
+    // a hand-set MIP.
+    let mut rec = MotorRecord::new();
+    rec.conv.mres = 1.0;
+    rec.limits.dhlm = 100.0;
+    rec.limits.dllm = -100.0;
+    rec.retry.rtry = 3;
+
+    // Idle at 0, no limit struck.
+    let idle = asyn_rs::interfaces::motor::MotorStatus {
+        position: 0.0,
+        done: true,
+        ..Default::default()
+    };
+    rec.process_motor_info(&idle);
+
+    // Commanded +10; the axis runs toward the high limit.
+    rec.put_field("VAL", EpicsValue::Double(10.0)).unwrap();
+    rec.plan_motion(CommandSource::Val);
+    assert!(rec.stat.mip.contains(MipFlags::MOVE));
+    assert!(rec.stat.cdir, "the move commands the + direction");
+
+    let in_flight = asyn_rs::interfaces::motor::MotorStatus {
+        position: 5.0,
+        done: false,
+        moving: true,
+        direction: true,
+        ..Default::default()
+    };
+    rec.process_motor_info(&in_flight);
+
+    // SPMG=Pause while it is running: mip = MIP_STOP with pp unset, so the
+    // stop completion skips postProcess and falls into the inline maybeRetry.
+    rec.ctrl.spmg = SpmgMode::Pause;
+    rec.plan_motion(CommandSource::Spmg);
+    assert_eq!(rec.stat.mip, MipFlags::STOP);
+
+    // It coasts onto the high limit and rests at 9.0, one EGU short.
+    let on_limit = asyn_rs::interfaces::motor::MotorStatus {
+        position: 9.0,
+        done: true,
+        moving: false,
+        direction: true,
+        high_limit: true,
+        ..Default::default()
+    };
+    rec.process_motor_info(&on_limit);
+    assert!(rec.limits.hls, "the poll carries the struck limit");
+    assert!(!rec.stat.movn, "the axis has stopped");
+
+    rec.check_completion();
+
+    assert_eq!(
+        rec.pos.val, 9.0,
+        "VAL adopts the limit readback: C treats a stop that ends on a \
+         limit in the commanded direction as terminal, whatever pp was"
+    );
+    assert_eq!(rec.pos.dval, 9.0, "DVAL adopts the dial limit readback");
+    assert_eq!(rec.pos.rval, 9, "RVAL = NINT(DVAL/MRES) at the limit");
+    assert_eq!(rec.pos.diff, 0.0, "DIFF zeroed at the limit");
+    assert_eq!(rec.pos.rdif, 0, "RDIF zeroed at the limit");
+    assert!(
+        !rec.stat.mip.contains(MipFlags::RETRY),
+        "the limit suppresses the retry"
+    );
 }
 
 #[test]
@@ -1848,7 +1925,7 @@ fn test_cnen_put_pass_fires_implicit_get_info() {
 #[test]
 fn test_spmg_noop_go_flip_fires_implicit_get_info() {
     // C: SPMG is pp(TRUE). A Pause pass returns inside the top block
-    // (1898-1911) — consumed, no implicit GET_INFO. A Go written back
+    // (1899-1911) — consumed, no implicit GET_INFO. A Go written back
     // on an idle in-position axis collapses the bare MIP_STOP, fails
     // the move-block entry (2241: dval == ldvl && dmov) and falls to
     // the chain end — the implicit GET_INFO fires.
@@ -2607,7 +2684,7 @@ fn test_queued_home_button_clears_at_home_completion() {
 fn test_latent_homf_fires_on_move_block_pass() {
     // A bare HOMF put overtaken in last_write must still fire: C's home
     // section evaluates the latched button state on every do_work pass
-    // (motorRecord.cc:2010-2013) BEFORE the val move block, and returns
+    // (motorRecord.cc:2013-2014) BEFORE the val move block, and returns
     // — the position write is overtaken.
     let mut rec = MotorRecord::new();
     rec.put_field("HLM", EpicsValue::Double(1000.0)).unwrap();
@@ -2834,7 +2911,7 @@ fn test_latent_spmg_stop_halts_in_flight_motion() {
     // A bare SPMG=Stop put (dbPut, no process) overtaken in last_write
     // by a VAL write must still halt the axis on that pass — C compares
     // SPMG to LSPG by state at the top of every do_work pass
-    // (motorRecord.cc:1855-1932) and returns, discarding the position
+    // (motorRecord.cc:1854-1934) and returns, discarding the position
     // write.
     let mut rec = MotorRecord::new();
     rec.put_field("HLM", EpicsValue::Double(1000.0)).unwrap();
@@ -3009,7 +3086,7 @@ fn test_latent_stop_consumes_latent_spmg_go() {
 
 #[test]
 fn test_stop_field_clears_latched_buttons_while_moving() {
-    // C 1891-1893: the stop-while-moving branch calls clear_buttons() —
+    // C 1890-1894: the stop-while-moving branch calls clear_buttons() —
     // a latched jog/home button must not survive an explicit stop and
     // re-fire later.
     let mut rec = MotorRecord::new();
@@ -3306,7 +3383,7 @@ fn test_rdbd_below_mres_raised_at_init() {
 
 #[test]
 fn test_bdst_put_enforces_min_retry_deadband() {
-    // C special BDST (2986-2989): a runtime BDST put re-runs
+    // C special BDST (2987-2989): a runtime BDST put re-runs
     // enforceMinRetryDeadband.
     let mut rec = MotorRecord::new();
     rec.conv.mres = 0.5;
@@ -4783,11 +4860,11 @@ fn test_closed_loop_latent_tweak_skipped_on_val_pass() {
     assert!(rec.ctrl.twf, "button stays latched");
 }
 
-// --- Level-triggered latent collection (C do_work gate, 1486-1492) ---
+// --- Level-triggered latent collection (C do_work gate, 1487-1492) ---
 
 #[test]
 fn test_latent_jog_fires_on_no_event_pass_after_omsl_flip() {
-    // C do_work runs on every put pass (1486-1492) and its jog section
+    // C do_work runs on every put pass (1487-1492) and its jog section
     // (2079) acts on latched button STATE: a JOGF latched under the
     // closed-loop bypass dispatches on the first supervisory pass —
     // here the no-event process pass after the OMSL flip — without
@@ -4845,7 +4922,7 @@ fn test_limit_blocked_homf_fires_on_idle_poll_when_limit_clears() {
     // C home-section gate (2013-2014): a HOMF blocked by the high-limit
     // switch stays latched; the section re-evaluates the STATE on every
     // do_work pass, so the done-record callback reporting the switch
-    // released (the dmov arm of the 1486-1492 gate) dispatches the home.
+    // released (the dmov arm of the 1487-1492 gate) dispatches the home.
     let mut rec = MotorRecord::new();
     rec.conv.mres = 0.01;
     rec.limits.hls = true;
@@ -4875,7 +4952,7 @@ fn test_limit_blocked_homf_fires_on_idle_poll_when_limit_clears() {
 #[test]
 fn test_stup_ack_pass_runs_latent_collection() {
     use asyn_rs::interfaces::motor::MotorStatus;
-    // C 1345 + 1486-1492: the GET_INFO ack callback skips the
+    // C 1345 + 1487-1492: the GET_INFO ack callback skips the
     // motor-stopped branch but still falls into do_work via the dmov
     // arm, so a home latched behind a limit switch dispatches on the
     // ack pass that reports the switch released.
@@ -5352,7 +5429,7 @@ fn test_rhlm_rllm_registry_read_only() {
 #[test]
 fn test_init_negative_mres_loaded_rllm_drives_dhlm() {
     // C check_speed_and_resolution (3993-4017): under MRES < 0 a loaded
-    // RLLM seeds DHLM through fabs(mres). Then init_record 716-718 runs
+    // RLLM seeds DHLM through fabs(mres). Then init_record 717-718 runs
     // set_dial_high/lowlimit, whose SIGNED re-derivation lands
     // dhlm/mres in the LOW raw register — flipping the sign of the
     // fabs-seeded raw value (C verbatim quirk).
@@ -5466,9 +5543,30 @@ fn test_field_metadata_units() {
     }
     assert_eq!(units("SREV").unwrap(), "steps/rev");
     assert_eq!(units("UREV").unwrap(), "deg/rev");
-    // C default branch: bare EGU — the record-level metadata serves it.
-    assert!(units("VAL").is_none());
-    assert!(units("RBV").is_none());
+    // C default branch: the bare EGU, from the same switch and under the
+    // same truncation (the default arm is motorRecord.cc:3201-3203; the
+    // truncation `s[siz] = '\0'` that covers it is at :3205).
+    assert_eq!(units("VAL").unwrap(), "deg");
+    assert_eq!(units("RBV").unwrap(), "deg");
+}
+
+/// C bounds every `get_units` answer at `dbr_units_size - 1` = 15 bytes
+/// (`motorRecord.cc:3159`, `:3205`), and it applies that bound after the
+/// switch, so a decorated EGU is cut just like a bare one. `EGU` is
+/// `size(16)`, so "12345678901234" + "/sec" is 18 bytes on the port and 15
+/// on C.
+#[test]
+fn units_are_cut_at_the_c_dbr_units_bound() {
+    let mut rec = MotorRecord::new();
+    rec.put_field("EGU", EpicsValue::String("12345678901234".into()))
+        .unwrap();
+    let units = |f: &str| rec.field_metadata_override(f).unwrap().units.unwrap();
+    assert_eq!(units("VELO"), "12345678901234/");
+    assert_eq!(units("JAR"), "12345678901234/");
+    assert_eq!(units("UREV"), "12345678901234/");
+    // Undecorated arms are already inside the bound and must not move.
+    assert_eq!(units("SREV"), "steps/rev");
+    assert_eq!(units("VAL"), "12345678901234");
 }
 
 #[test]
@@ -5485,7 +5583,7 @@ fn test_field_metadata_precision() {
     assert_eq!(prec("RCNT"), Some(0));
     // Double field with in-range PREC keeps the record-level value.
     assert_eq!(prec("VAL"), None);
-    // Out-of-range PREC clamps to 15 (recGbl.c:135-138).
+    // Out-of-range PREC clamps to 15 (recGbl.c:135-139).
     rec.put_field("PREC", EpicsValue::Short(99)).unwrap();
     assert_eq!(
         rec.field_metadata_override("VAL").unwrap().precision,
@@ -5615,7 +5713,7 @@ fn test_load_s_specified_wins_over_velo_at_init() {
     assert!((rec.vel.velo - 0.5).abs() < 1e-9, "VELO={}", rec.vel.velo);
 }
 
-// --- ACCS/ACCL at init (C check_speed_and_resolution, motorRecord.cc:4033-4047)
+// --- ACCS/ACCL at init (C check_speed_and_resolution, motorRecord.cc:4034-4047)
 //
 // C keys the accel reconcile on the LOADED ACCS (`accs > 0.0`), not on ACCU.
 // The boundaries are: ACCS loaded nonzero / ACCS zero / ACCL also zero, times
@@ -5727,7 +5825,7 @@ fn test_runtime_mres_change_rederives_velo_from_s() {
     assert!((rec.vel.velo - 100.0).abs() < 1e-9, "VELO={}", rec.vel.velo);
 }
 
-// --- Resolution triple at init (C check_speed_and_resolution, motorRecord.cc:3904-3927) ---
+// --- Resolution triple at init (C check_speed_and_resolution, motorRecord.cc:3905-3927) ---
 
 #[test]
 fn test_resolution_triple_default_init() {
@@ -5752,7 +5850,7 @@ fn test_resolution_triple_default_init() {
 
 #[test]
 fn test_resolution_init_urev_wins_over_loaded_mres() {
-    // C 3911-3916: a nonzero loaded UREV derives MRES — regardless of the
+    // C 3912-3916: a nonzero loaded UREV derives MRES — regardless of the
     // order the .db listed the two fields (raw struct writes at load).
     for mres_first in [true, false] {
         let mut rec = MotorRecord::new();
@@ -5813,7 +5911,7 @@ fn test_resolution_init_loaded_mres_and_srev_any_order() {
 
 #[test]
 fn test_resolution_init_nonpositive_srev_clamped() {
-    // C 3904-3909: a loaded SREV <= 0 lands raw and init clamps it to 200.
+    // C 3905-3909: a loaded SREV <= 0 lands raw and init clamps it to 200.
     let mut rec = MotorRecord::new();
     rec.put_field("SREV", EpicsValue::Long(-5)).unwrap();
     rec.put_field("MRES", EpicsValue::Double(0.5)).unwrap();
@@ -6090,7 +6188,7 @@ fn test_monitor_deadband_value_is_rbv_not_val() {
 }
 
 // --- Pause/Go resume semantics (C pp + maybeRetry, motorRecord.cc
-// 1383-1402, 1040-1100, 2241) ---
+// 1382-1402, 1040-1100, 2241) ---
 
 /// Shared setup: move 0 → 50, axis reported moving.
 fn paused_move_setup() -> MotorRecord {
@@ -6178,7 +6276,7 @@ fn test_pause_stop_with_rtry_zero_does_not_arm_resume() {
 
 #[test]
 fn test_pause_stop_retry_exhaustion_latches_miss() {
-    // Boundary ++rcnt > rtry at the pause stop: C 1060-1075 gives up —
+    // Boundary ++rcnt > rtry at the pause stop: C 1059-1074 gives up —
     // MIP_DONE, MISS latched, lasts adopt the unreached target.
     let mut rec = paused_move_setup();
     rec.retry.rtry = 2;
@@ -6356,7 +6454,7 @@ fn test_idle_pause_sends_stop_axis_and_converges() {
 
 #[test]
 fn test_sub_step_move_quiesces_lasts() {
-    // C 2343-2347: the too-small suppress path updates the previous-target
+    // C 2345-2347: the too-small suppress path updates the previous-target
     // registers so the divergence is not re-detected on later passes.
     let mut rec = MotorRecord::new();
     rec.put_field("HLM", EpicsValue::Double(1000.0)).unwrap();
@@ -6597,7 +6695,7 @@ fn test_sub_step_replay_quiesces_without_loop() {
     assert!(effects.commands.is_empty(), "no replay loop");
 }
 
-// --- LVIO re-evaluation during an active jog (C 1462-1483) ---
+// --- LVIO re-evaluation during an active jog (C 1463-1484) ---
 
 /// Start a forward jog from rest with HLM=100/LLM=-100, JVEL=1, then
 /// report the axis moving.
@@ -6627,7 +6725,7 @@ fn poll_moving_at(rec: &mut MotorRecord, pos: f64) -> ProcessEffects {
 #[test]
 fn test_jog_into_soft_limit_window_stops_axis() {
     // C 1466-1468: jogf && rbv > hlm - jvel raises LVIO from the live
-    // readback; 1476-1482 stops the axis and releases the buttons.
+    // readback; 1475-1484 stops the axis and releases the buttons.
     let mut rec = jogging_record();
 
     let effects = poll_moving_at(&mut rec, 50.0);
@@ -6973,7 +7071,7 @@ fn test_commanded_jog_stop_still_corrects_backlash() {
     );
 }
 
-// --- LVIO re-evaluation on the write pass (C 1462-1483 + pp(TRUE) limits) ---
+// --- LVIO re-evaluation on the write pass (C 1463-1484 + pp(TRUE) limits) ---
 
 #[test]
 fn test_hlm_put_during_jog_stops_on_write_pass() {
@@ -7045,7 +7143,7 @@ fn test_hlm_put_while_idle_does_not_stop() {
 // the direction bit), top block 1901-1922 (wholesale STOP / Go re-arm).
 
 /// Settle an idle record into SPMG=Pause: the Pause transition parks
-/// mip = MIP_STOP (C 1901-1905); the stop completion collapses it back
+/// mip = MIP_STOP (C 1902-1907); the stop completion collapses it back
 /// to DONE via maybeRetry's close-enough branch.
 fn paused_idle_record() -> MotorRecord {
     let mut rec = MotorRecord::new();
@@ -7123,7 +7221,7 @@ fn test_jogf_put_at_limit_switch_does_not_arm_jog_req() {
 fn test_stop_kills_parked_jog_req_but_keeps_button() {
     // C's stop branch early-returns only for mip DONE/STOP/RETRY
     // (1874-1888); a parked MIP_JOG_REQ falls through to the wholesale
-    // `mip = MIP_STOP` (1901-1905). clear_buttons runs only in the movn
+    // `mip = MIP_STOP` (1902-1907). clear_buttons runs only in the movn
     // branch (1893), so the button itself survives.
     let mut rec = paused_idle_record();
     rec.put_field("JOGF", EpicsValue::Short(1)).unwrap();
@@ -7345,7 +7443,7 @@ fn test_jog_direction_folds_dir_into_dial_command() {
 
 #[test]
 fn test_queued_jog_replay_folds_dir_and_updates_cdir() {
-    // The queued-jog replay re-enters the C jog section (2118-2143) on
+    // The queued-jog replay re-enters the C jog section (2117-2144) on
     // re-fire, re-deriving the commanded direction and CDIR — the
     // replay must match a fresh dispatch on a DIR=Neg axis.
     let mut rec = MotorRecord::new();
@@ -8077,7 +8175,7 @@ mod one_sided_limit_writes {
 
 // =============================================================================
 // Runtime velocity clamps — C special() range_check and the VBAS/VMAX
-// coupling tail (motorRecord.cc:2627-2732, 3056-3082, 3107-3148)
+// coupling tail (motorRecord.cc:2627-2732, 3056-3082, 3106-3147)
 // =============================================================================
 
 mod velocity_clamps {
@@ -8194,7 +8292,7 @@ mod velocity_clamps {
 
 // =============================================================================
 // Init-time JVEL/JAR/HVEL derivation — C check_speed_and_resolution
-// (motorRecord.cc:4054-4067)
+// (motorRecord.cc:4055-4067)
 // =============================================================================
 
 mod init_jog_home_velocity_defaults {
@@ -8506,7 +8604,7 @@ mod retry_after_dly_settle {
         assert_eq!(rec.retry.rcnt, 0);
     }
 
-    // Same key for a commanded stop: C postProcess (826-849) cleared
+    // Same key for a commanded stop: C postProcess (827-849) cleared
     // MIP_STOP before the delay, so the post-delay pass never runs
     // maybeRetry — no retry dispatch, MISS untouched.
     #[test]
@@ -8755,7 +8853,7 @@ fn test_toward_valid_exception_applies_to_non_preferred_move() {
 
 #[test]
 fn test_lvio_refused_fresh_move_still_resets_rcnt() {
-    // C resets the retry counter (2351-2356) BEFORE the LVIO refusal
+    // C resets the retry counter (2352-2357) BEFORE the LVIO refusal
     // (2434-2452): a refused fresh move zeroes a latched RCNT.
     let mut rec = MotorRecord::new();
     rec.conv.mres = 0.001;
@@ -8918,7 +9016,7 @@ fn test_jog_refusal_clears_both_buttons() {
 
 #[test]
 fn test_alarm_cycle_fans_out_alarm_mask_to_monitored_fields() {
-    // C `monitor()` (motorRecord.cc:3513-3645): on a cycle whose alarm
+    // C `monitor()` (motorRecord.cc:3456-3646): on a cycle whose alarm
     // transition fired, every field in the posting list goes out even
     // when unmarked — `local_mask = monitor_mask | (MARKED(x) ?
     // DBE_VAL_LOG : 0)` is non-zero for unmarked fields once
@@ -8981,10 +9079,10 @@ fn test_alarm_cycle_fans_out_alarm_mask_to_monitored_fields() {
 
 #[test]
 fn test_same_value_unblinked_pass_after_miss_giveup_refuses_with_get_info() {
-    // C do_work entry gates (motorRecord.cc:2204, 2240) refuse a pass
+    // C do_work entry gates (motorRecord.cc:2204, 2241) refuse a pass
     // that arrives WITHOUT the special() pass-0 blink — the closed-loop
     // DOL collection (a bare dbGetLink into VAL, 1994, no special) and
-    // housekeeping passes. After a retry give-up (maybeRetry 1060-1075
+    // housekeeping passes. After a retry give-up (maybeRetry 1059-1074
     // adopts the unreached target into lval/ldvl/lrvl with MISS
     // latched), a same-value unblinked delivery fails `val != lval` and
     // `dval != ldvl || !dmov` — no new move dispatches; the pass falls
@@ -9011,7 +9109,7 @@ fn test_same_value_unblinked_pass_after_miss_giveup_refuses_with_get_info() {
     let effects = rec.plan_motion(CommandSource::Val);
     assert!(
         effects.commands.is_empty(),
-        "C 2240: same-value unblinked pass does not re-dispatch the move"
+        "C 2241: same-value unblinked pass does not re-dispatch the move"
     );
     assert!(
         rec.retry.miss,
@@ -9028,8 +9126,8 @@ fn test_same_value_unblinked_pass_after_miss_giveup_refuses_with_get_info() {
 #[test]
 fn test_same_value_dbput_after_miss_giveup_redispatches() {
     // A database put is preceded by the special() pass-0 blink
-    // (motorRecord.cc:2582-2608): DMOV drops before the record
-    // processes, the entry gate (2240) passes via `!dmov`, the target
+    // (motorRecord.cc:2591-2620): DMOV drops before the record
+    // processes, the entry gate (2241) passes via `!dmov`, the target
     // sits 500 steps out (not too_small), and the dispatch gate (2455,
     // `mip == MIP_DONE`) sends the move again — C retries a missed
     // target on an operator re-put of the same value. Anchored first:
@@ -9080,7 +9178,7 @@ fn test_same_value_dbput_after_miss_giveup_redispatches() {
 #[test]
 fn test_new_target_after_miss_giveup_dispatches() {
     // The give-up only adopts the OLD target into the lasts — a fresh
-    // target re-enters the move block via `dval != ldvl` (C 2240).
+    // target re-enters the move block via `dval != ldvl` (C 2241).
     let mut rec = MotorRecord::new();
     rec.stat.msta = MstaFlags::DONE;
     rec.stat.phase = MotionPhase::MainMove;
@@ -9113,8 +9211,8 @@ fn test_new_target_after_miss_giveup_dispatches() {
 #[test]
 fn test_same_value_set_redefinition_resends_load_pos_when_blinked() {
     // C: a dbPut to DVAL is preceded by the special() pass-0 blink
-    // (2582-2608) even in SET mode, so a same-value redefinition re-put
-    // re-enters the move block via `!dmov` (2240) and the set test
+    // (2591-2620) even in SET mode, so a same-value redefinition re-put
+    // re-enters the move block via `!dmov` (2241) and the set test
     // (2257-2263) routes it to load_pos again — the redefinition is a
     // command, not a value change, and C re-sends LOAD_POS for it.
     // Without the blink (no fresh drive write) the entry gate refuses
@@ -9162,7 +9260,7 @@ fn test_same_value_set_redefinition_resends_load_pos_when_blinked() {
     );
 
     // Unblinked same-value pass (no fresh drive write): entry gate
-    // (2240) refuses — chain end, implicit GET_INFO.
+    // (2241) refuses — chain end, implicit GET_INFO.
     let status = asyn_rs::interfaces::motor::MotorStatus {
         position: 0.0,
         done: true,
@@ -9186,7 +9284,7 @@ fn test_same_value_set_redefinition_resends_load_pos_when_blinked() {
 fn test_unblinked_zero_tweak_refuses_and_falls_to_chain_end() {
     // An UNBLINKED zero fold (TWV = 0, no dbPut ran): the fold leaves
     // VAL unchanged, the collection gate (2204) and the move-block
-    // entry (2240) both refuse, and the pass ends at the chain end
+    // entry (2241) both refuse, and the pass ends at the chain end
     // (implicit GET_INFO, 2546-2557) — no move, no DMOV pulse.
     let mut rec = MotorRecord::new();
     rec.set_device_state(motor_rs::device_state::new_shared_state());
@@ -9212,10 +9310,10 @@ fn test_unblinked_zero_tweak_refuses_and_falls_to_chain_end() {
 #[test]
 fn test_blinked_zero_tweak_pulses_dmov() {
     // A dbPut to TWF is preceded by the special() pass-0 blink
-    // (2582-2608, TWF is in the blink list), so even a zero fold
-    // (TWV = 0) enters the move block via `!dmov` (2240); at position
+    // (2591-2620, TWF is in the blink list), so even a zero fold
+    // (TWV = 0) enters the move block via `!dmov` (2241); at position
     // the request is too_small and the sub-step pulse runs — DMOV
-    // 1→0→1, no controller command (C 2333-2342 restores DMOV=TRUE on
+    // 1→0→1, no controller command (C 2334-2343 restores DMOV=TRUE on
     // the same pass; the Rust pulse posts the low half and the
     // recovery pass restores it). Anchored first: in C a TWF put can
     // only exist after init_record, and an unanchored mailbox-wired
@@ -9251,7 +9349,7 @@ fn test_blinked_zero_tweak_pulses_dmov() {
 
 #[test]
 fn test_special_pass0_blinks_dmov_for_drive_fields_only() {
-    // C special() pass-0 (motorRecord.cc:2582-2608): exactly the six
+    // C special() pass-0 (motorRecord.cc:2591-2620): exactly the six
     // drive fields blink DMOV; nothing else does, and the after-put
     // pass (pass 1) never blinks.
     for f in ["VAL", "DVAL", "RVAL", "RLV", "TWF", "TWR"] {

@@ -5,7 +5,7 @@
 //! but callers can override via `client_native::PvaClientBuilder`
 //! or the `EPICS_PVA_AUTH_USER` / `EPICS_PVA_AUTH_HOST` environment variables.
 
-/// pvxs `buildCAMethod` (client.cpp:519-532) sends these literals in the
+/// pvxs `buildCAMethod` (src/client.cpp:519-532) sends these literals in the
 /// `ca` credential when the OS user / hostname lookup fails — `nobody`
 /// for an unresolved user, `invalidhost.` for an unresolved host. PVA ACF
 /// rules can match on user and host, so the degraded identity must match
@@ -278,16 +278,7 @@ pub fn authnz_default_host() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// Everything before the first column-0 `#[cfg(test)]` — the same helper
-    /// `server_native::search_engine` uses, so a guard can scan production
-    /// source without matching the guard's own assertions.
-    fn production_scope(src: &str) -> &str {
-        match src.find("\n#[cfg(test)]") {
-            Some(i) => &src[..i],
-            None => src,
-        }
-    }
+    use source_guard::{Comments, production};
 
     /// **The mechanical defence for this file.** Modelled on
     /// `server_native::search_engine`'s `rtems_selects_entropy_by_target_not_by_family`,
@@ -302,7 +293,7 @@ mod tests {
     /// fail here rather than on a board nobody can attach a debugger to.
     #[test]
     fn the_account_database_arms_select_on_the_capability_not_the_family() {
-        let prod = production_scope(include_str!("plain.rs"));
+        let prod = production(include_str!("plain.rs"), Comments::Strip);
         assert_eq!(
             prod.matches("#[cfg(unix)]").count(),
             0,
@@ -334,7 +325,8 @@ mod tests {
     /// script may name RTEMS. `build.rs` has since acquired a second, unrelated
     /// rule — the `exec_backend` / `tokio_backend` task-backend decision, which
     /// is `epics_embedded_target` (`target_os` in `{"rtems", "vxworks"}`) or
-    /// feature `"rtems-exec-model"`, and therefore *must* name the target,
+    /// `EPICS_RS_BUILD_EXEC_BACKEND=thread`, and therefore *must* name the
+    /// target,
     /// exactly as `epics-base-rs`'s own `build.rs` does. A whole-file scan
     /// rejected that correct rule.
     ///
@@ -403,7 +395,7 @@ mod tests {
 
     #[test]
     fn user_fallback_is_pvxs_ca_literal() {
-        // pvxs buildCAMethod (client.cpp:519-526) sends "nobody" when the
+        // pvxs buildCAMethod (src/client.cpp:519-526) sends "nobody" when the
         // OS user lookup fails. A resolved name passes through unchanged;
         // an absent one degrades to exactly that literal (not "anonymous").
         assert_eq!(user_or_ca_fallback(Some("alice".to_string())), "alice");
@@ -412,7 +404,7 @@ mod tests {
 
     #[test]
     fn host_fallback_is_pvxs_ca_literal() {
-        // pvxs buildCAMethod (client.cpp:528-532) sends "invalidhost."
+        // pvxs buildCAMethod (src/client.cpp:528-532) sends "invalidhost."
         // when gethostname() fails. gethostname() cannot be forced to fail
         // from a test, so the fallback literal is exercised through the
         // pure helper; a resolved host passes through unchanged.

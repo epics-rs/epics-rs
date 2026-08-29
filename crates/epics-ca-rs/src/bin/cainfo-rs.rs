@@ -60,7 +60,7 @@ struct Args {
     timeout: Vec<String>,
 
     /// `ca_client_status` interest level. A non-zero level prints the
-    /// client status dump *instead of* per-PV info (C `cainfo.c:77-79`,
+    /// client status dump *instead of* per-PV info (C `cainfo.c:77-78`,
     /// `:202-205`); `-s 0` (and an unparseable value, C `:167-173`) is
     /// normal per-PV mode. Kept as a raw string so the C "invalid →
     /// ignored, reset to 0" rule is reproduced rather than clap erroring.
@@ -125,7 +125,7 @@ async fn main() {
 
     let client = CaClient::new().await.expect("failed to create CA client");
 
-    // C `cainfo.c:77-79`: in `ca_client_status` mode, print only the
+    // C `cainfo.c:77-78`: in `ca_client_status` mode, print only the
     // client status dump (the Rust equivalent is `diagnostics()`) and
     // skip the per-PV block entirely.
     if stat_mode {

@@ -1,3 +1,10 @@
+// RTEMS-EXEC-MODEL-ALLOW(14): checked, not waived — all 14 ran and passed
+// on the exec backend (measured on this tree:
+// `EPICS_RS_BUILD_EXEC_BACKEND=thread cargo nextest run -p asyn-rs
+// --all-features`, 1081/1081). asyn-rs became a census subject when its
+// `build.rs` began deriving `tokio_backend`; nothing here builds a CA
+// server, and the reactor these obtain comes from `#[tokio::test]`
+// itself, which the backend does not remove.
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::SystemTime;
@@ -129,7 +136,7 @@ impl InterruptFilter {
 ///   (asynOctetBase.c:203-215): deliver to every registered octet user whose
 ///   `addr` equals the read's. This is the rule for a device read.
 /// - [`EveryUser`](Self::EveryUser) — `drvAsynIPServerPort`'s listener thread
-///   (drvAsynIPServerPort.c:372-383 for a new connection, :309-322 for a UDP
+///   (drvAsynIPServerPort.c:374-383 for a new connection, :312-320 for a UDP
 ///   datagram): walk the interrupt list and call EVERY node, with no test at
 ///   all.
 ///
@@ -154,7 +161,7 @@ pub enum OctetFanOut {
 /// before invoking each subscriber callback writes
 /// `pInterrupt->pasynUser->auxStatus` / `alarmStatus` /
 /// `alarmSeverity` / `timestamp` from the param's stored status
-/// (`asynPortDriver.cpp:631-642,675-678,721-723,765-767,810-812`).
+/// (`asynPortDriver.cpp:633-637,677-681,722-726,766-770,811-815`).
 /// Drivers / records read these on the consumer side to escalate
 /// alarms and report I/O status. The Rust port carries the same
 /// fields on `InterruptValue` so subscribers see what C would set on
@@ -547,7 +554,7 @@ impl InterruptManager {
     /// A polling driver (e.g. Modbus `readPoller`) uses this to skip the cost of
     /// decoding+firing an interface that no record is bound to — mirroring C,
     /// where an empty interrupt list means the per-element `readPlcInt32` /
-    /// `readPlcFloat` loop never runs (drvModbusAsyn.cpp:1822-1854). This gates
+    /// `readPlcFloat` loop never runs (drvModbusAsyn.cpp:1825-1854). This gates
     /// only the expensive whole-block ARRAY decode, and array interfaces are
     /// bound exclusively through coalescing mailbox subscriptions — so only
     /// `mailboxes` are consulted. Sync-callback bindings (averaging /
@@ -1058,7 +1065,7 @@ mod tests {
     /// The two octet fan-out rules, at their boundaries. C's octet interrupt
     /// list is keyed by `addr` alone (asynOctetBase.c:203-215) — `reason` is
     /// never consulted — and the IP-server listener applies no key at all
-    /// (drvAsynIPServerPort.c:372-383).
+    /// (drvAsynIPServerPort.c:374-383).
     ///
     /// Boundaries: reason-matches vs reason-differs (must not decide anything);
     /// addr-matches vs addr-differs under each rule; and a subscriber bound to a
@@ -1094,7 +1101,7 @@ mod tests {
         let octet = |addr: i32, s: &str| InterruptValue {
             reason: 0,
             addr,
-            value: ParamValue::Octet(s.to_string()),
+            value: ParamValue::Octet(s.as_bytes().to_vec()),
             iface: Some(InterfaceType::Octet),
             ..Default::default()
         };
@@ -1105,7 +1112,7 @@ mod tests {
         im.notify_octet(OctetFanOut::ByAddr(0), octet(0, "read"));
         for rx in [&mut rx_same, &mut rx_other_reason] {
             let v = tokio::time::timeout(dur, rx.recv()).await.unwrap().unwrap();
-            assert!(matches!(v.value, ParamValue::Octet(ref s) if s == "read"));
+            assert!(matches!(v.value, ParamValue::Octet(ref s) if s == b"read"));
         }
         assert!(
             tokio::time::timeout(short, rx_other_addr.recv())
@@ -1124,7 +1131,7 @@ mod tests {
         im.notify_octet(OctetFanOut::EveryUser, octet(3, "srv:3"));
         for rx in [&mut rx_same, &mut rx_other_reason, &mut rx_other_addr] {
             let v = tokio::time::timeout(dur, rx.recv()).await.unwrap().unwrap();
-            assert!(matches!(v.value, ParamValue::Octet(ref s) if s == "srv:3"));
+            assert!(matches!(v.value, ParamValue::Octet(ref s) if s == b"srv:3"));
         }
         assert!(
             tokio::time::timeout(short, rx_int32.recv()).await.is_err(),

@@ -115,11 +115,25 @@ pub trait OctetInterpose: Send + Sync {
     /// every interpose via `pasynOctet->setInputEos`, `asynUser` and all
     /// (asynInterposeEos.c:288); this is the Rust equivalent so a runtime IEOS
     /// change reaches the installed EOS interpose on the right device.
-    fn set_input_eos(&mut self, _addr: i32, _eos: &[u8]) {}
+    ///
+    /// Returns whether **this layer** took the terminator. C's interpose does
+    /// not answer with a flag — it either stores the value and returns
+    /// `asynSuccess`, or delegates *downwards* to the next `setInputEos`
+    /// (:293-295) and ultimately to the driver's, which `initOverride` has
+    /// replaced with `setInputEosFail` when the driver has none
+    /// (asynOctetBase.c:115, :401-403). The bool is that delegation made
+    /// explicit, so [`crate::port::PortDriver::set_input_eos`]'s default can
+    /// be the Fail stub without having to guess whether a layer above it
+    /// answered first.
+    fn set_input_eos(&mut self, _addr: i32, _eos: &[u8]) -> bool {
+        false
+    }
 
     /// Notify the layer of an output end-of-string change (see
-    /// [`Self::set_input_eos`]). Default no-op.
-    fn set_output_eos(&mut self, _addr: i32, _eos: &[u8]) {}
+    /// [`Self::set_input_eos`]). Default: not taken.
+    fn set_output_eos(&mut self, _addr: i32, _eos: &[u8]) -> bool {
+        false
+    }
 
     /// Drop every piece of state scoped to the *current* link, because the
     /// port's connection state just changed (connected → disconnected or
@@ -236,21 +250,27 @@ impl OctetInterposeStack {
     /// default). C routes `setInputEos` through the `asynOctet` interface
     /// `findInterface` returned for that `asynUser`, so it reaches exactly the
     /// layers that will serve the device's reads.
-    pub fn set_input_eos(&mut self, addr: i32, eos: &[u8]) {
+    /// Returns whether any layer took it — C's chain either terminates in a
+    /// layer that stores the value or falls through to the driver's method.
+    pub fn set_input_eos(&mut self, addr: i32, eos: &[u8]) -> bool {
+        let mut taken = false;
         if let Some(chain) = self.chain_mut(addr) {
             for layer in chain {
-                layer.set_input_eos(addr, eos);
+                taken |= layer.set_input_eos(addr, eos);
             }
         }
+        taken
     }
 
     /// Forward an output EOS change (see [`Self::set_input_eos`]).
-    pub fn set_output_eos(&mut self, addr: i32, eos: &[u8]) {
+    pub fn set_output_eos(&mut self, addr: i32, eos: &[u8]) -> bool {
+        let mut taken = false;
         if let Some(chain) = self.chain_mut(addr) {
             for layer in chain {
-                layer.set_output_eos(addr, eos);
+                taken |= layer.set_output_eos(addr, eos);
             }
         }
+        taken
     }
 
     /// Tell every layer, on every device's chain, that the port's connection

@@ -12,10 +12,9 @@
 //!
 //! [`DialPool`](super::blocking_io::DialPool) closed the client *dial* path by
 //! this argument. This is the same argument on the *serve* side, and the two
-//! are separate primitives on purpose (`doc/rtems-connection-worker-pool-design.md`
-//! §3): a dial borrows one worker for a short job and *queues* over capacity; a
-//! connection borrows a **set** of workers for its whole life and is *refused*
-//! over capacity.
+//! are separate primitives on purpose: a dial borrows one worker for a short
+//! job and *queues* over capacity; a connection borrows a **set** of workers
+//! for its whole life and is *refused* over capacity.
 //!
 //! # The unit of borrow is a set, not a worker
 //!
@@ -352,7 +351,7 @@ impl Worker {
             errlog_sev_printf(
                 ErrlogSevEnum::Major,
                 &format!(
-                    "{} worker pool: set {} took no job — {NEVER_DISPATCHED}.",
+                    "{} worker pool: set {} took no job — {NEVER_DISPATCHED}.\n",
                     self.inner.name_prefix, self.set.index
                 ),
             );
@@ -384,7 +383,7 @@ impl Worker {
             // can be told; silence here is the loss this pool exists to stop.
             errlog_sev_printf(
                 ErrlogSevEnum::Major,
-                &format!("{label}: {NEVER_DISPATCHED}. This connection is being torn down."),
+                &format!("{label}: {NEVER_DISPATCHED}. This connection is being torn down.\n"),
             );
         }
     }
@@ -425,7 +424,7 @@ fn announce_panic(label: &str) {
         ErrlogSevEnum::Major,
         &format!(
             "{label}: the connection thread panicked; this connection is being \
-             torn down. Other connections are unaffected."
+             torn down. Other connections are unaffected.\n"
         ),
     );
 }
@@ -438,7 +437,7 @@ fn announce_worker_death(prefix: &str, index: usize, roles: usize) {
         &format!(
             "{prefix} worker pool: a thread of set {index} exited unexpectedly. \
              The set's {roles} threads are being retired and its slot returned; \
-             other connections are unaffected."
+             other connections are unaffected.\n"
         ),
     );
 }
@@ -627,9 +626,9 @@ impl ThreadMemoryTarget {
 /// clients as the declared per-connection stack fell 3,145,728 → 2,097,152 →
 /// 1,048,576 B. Charging each thread its declared stack *plus a flat 1 MiB*
 /// puts all three walls at 246.4 / 247.5 / 251.7 MB — a 2.1 % spread — while
-/// charging the declared stack alone predicts a wall that never happened
-/// (`doc/vxworks-ca-refusal-fidelity.md` §8; the three-arm measurement is E8's,
-/// `caucus/58EWEJWV91/e8-poolprobe-0548dc61-1` §10).
+/// charging the declared stack alone predicts a wall that never happened (the
+/// three-arm measurement is E8's, `caucus/58EWEJWV91/e8-poolprobe-0548dc61-1`
+/// §10).
 ///
 /// It is **not** what the OS charges for a thread. A C RTP laddering bare
 /// pthreads on the same guest walls at exactly `n × declared stack` — 127 × 2
@@ -646,8 +645,7 @@ impl ThreadMemoryTarget {
 /// declared stack for the pair. The target spends *less* than the stacks it was
 /// asked for; there is no flat term to find, and adding VxWorks' one charged
 /// 3,670,016 B per client — 3.1× — which is why the 160 MiB budget refused at
-/// 30 clients on a target whose count cap is 141
-/// (`doc/vxworks-ca-refusal-fidelity.md` §11.8). "Conservative" was the wrong
+/// 30 clients on a target whose count cap is 141. "Conservative" was the wrong
 /// reading of that: over-charging by 3× is not one connection of margin, it is
 /// three quarters of the target's capacity.
 ///
@@ -699,10 +697,9 @@ const PER_THREAD_OBJECT_ARENA: usize = 0;
 /// refusal is delivered at all. That figure is measured on this exact code, not
 /// inherited: with the budget raised to 320 MiB the same image on the same
 /// guest walks to set 46 and dies there, and with the default it refuses at set
-/// 32 and keeps serving (`doc/vxworks-ca-refusal-fidelity.md` §9). 160 MiB is
-/// 14 sets of headroom below that — what the margin buys is that the allocator
-/// and the object arena still work while the refusal is being written to the
-/// socket and the console.
+/// 32 and keeps serving. 160 MiB is 14 sets of headroom below that — what the
+/// margin buys is that the allocator and the object arena still work while the
+/// refusal is being written to the socket and the console.
 ///
 /// The ceiling itself moves with the target's RAM, 1:1: an RTP is handed
 /// whatever is left after a fixed ~705 MB, measured as 254 MiB of usable address
@@ -714,9 +711,9 @@ const PER_THREAD_OBJECT_ARENA: usize = 0;
 /// a gigabyte, `getrlimit` is in no RTP library, and `_SC_PHYS_PAGES` is not a
 /// constant the RTP `unistd.h` defines. An `mmap` ladder does find the ceiling
 /// exactly, but only by taking it, which in this process means another thread's
-/// allocation aborts (`doc/vxworks-ca-refusal-fidelity.md` §10). Hence the
-/// operator switch, and the arithmetic an operator needs for it: usable address
-/// space ≈ OS memory − 705 MB, and a CA set costs 5 MiB.
+/// allocation aborts. Hence the operator switch, and the arithmetic an
+/// operator needs for it: usable address space ≈ OS memory − 705 MB, and a CA
+/// set costs 5 MiB.
 ///
 /// RTEMS takes the same 160 MiB, and there it is not a constant standing in for
 /// a measurement it cannot make: `malloc_free_space` answers on that target, so
@@ -747,7 +744,7 @@ fn resolve_reservation_budget(raw: Option<&str>, default: usize) -> usize {
                 ErrlogSevEnum::Minor,
                 &format!(
                     "{POOL_RESERVATION_ENV}={raw:?} is not a positive whole number of MiB; \
-                     keeping the built-in worker-pool reservation budget"
+                     keeping the built-in worker-pool reservation budget\n"
                 ),
             );
             default
@@ -770,9 +767,7 @@ const RESERVATION_PROBE_FLOOR: usize = 8 << 20;
 /// VxWorks and false on RTEMS, where the same refusal comes from the malloc
 /// heap's free total. Two `cfg` cascades — one choosing the probe, one choosing
 /// the words — can drift apart and did, on target: the RTEMS guest was told
-/// about a mapping it had not made
-/// (`doc/vxworks-ca-refusal-fidelity.md` §11.12). One cascade returning both
-/// cannot drift.
+/// about a mapping it had not made. One cascade returning both cannot drift.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct TargetAnswer {
     /// Whether the target would give the size it was asked about.
@@ -795,12 +790,11 @@ struct TargetAnswer {
 /// budget exists to stay under: an `mmap` ladder run at three stack classes and
 /// two guest sizes reports a ceiling equal to the `pthread_create` wall **to the
 /// byte**, while `memFindMax`, `memInfoGet`, `sysctl` `HW_PHYSMEM`,
-/// `sysconf(_SC_PHYS_PAGES)`, `getrlimit` and `rtpInfoGet` are each blind to it
-/// (`doc/vxworks-ca-refusal-fidelity.md` §10.1–§10.2). One mapping under-reads
-/// that ceiling — 192 MiB confirms on a guest whose chunked ceiling is 254 MiB —
-/// so it is a *lower* bound, which is the safe direction for a veto: it can
-/// refuse a budget the target would in fact have honoured, never admit one it
-/// would not.
+/// `sysconf(_SC_PHYS_PAGES)`, `getrlimit` and `rtpInfoGet` are each blind to
+/// it. One mapping under-reads that ceiling — 192 MiB confirms on a guest
+/// whose chunked ceiling is 254 MiB — so it is a *lower* bound, which is the
+/// safe direction for a veto: it can refuse a budget the target would in fact
+/// have honoured, never admit one it would not.
 ///
 /// On RTEMS the basis is a *query*, not a taking: `malloc_free_space` reports
 /// the free total of the same heap RTEMS pthread stacks are allocated from, and
@@ -813,7 +807,7 @@ struct TargetAnswer {
 /// boot glue — while the symbol itself is in `librtemscpu`, which every RTEMS
 /// image links.
 ///
-/// RTEMS needs this *more* than VxWorks, not less: `rtems_init.c:195` hands
+/// RTEMS needs this *more* than VxWorks, not less: `csrc/rtems_init.c:331` hands
 /// `main` a fixed argv and `POSIX_Init` never calls `setenv`, so
 /// [`POOL_RESERVATION_ENV`] cannot be set on that target at all and the built-in
 /// default is the only budget it will ever run. A default nobody can override is
@@ -976,9 +970,8 @@ impl BudgetVerdict {
 /// operator at their word. Raised past what the address space can honour it does
 /// not raise the ceiling — it removes the refusal that was keeping the process
 /// under it: on the ~958 MB guest, `320` walks the CA pool to set 46 and the RTP
-/// takes signal 6 with no refusal delivered to anyone
-/// (`doc/vxworks-ca-refusal-fidelity.md` §9, §11.2). A switch that can kill the
-/// IOC silently is worse than no switch.
+/// takes signal 6 with no refusal delivered to anyone. A switch that can kill
+/// the IOC silently is worse than no switch.
 ///
 /// # The rule
 ///
@@ -1030,7 +1023,7 @@ fn decide_reservation_budget(
 /// Say what the boot-time check concluded, and hand back the budget it adopts.
 fn announce_reservation_budget(verdict: BudgetVerdict) -> usize {
     if let Some((severity, message)) = verdict.notice() {
-        errlog_sev_printf(severity, &message);
+        errlog_sev_printf(severity, &format!("{message}\n"));
     }
     verdict.budget()
 }
@@ -1275,11 +1268,10 @@ impl Drop for ThreadCharge {
 /// consumer that branched on `kind()` silently answered the wrong question.
 /// Both server drivers did: the CA server reported both as one status on the
 /// wire — measured on VxWorks 7, where both gates were reached on one image
-/// with `available=48` on each (`doc/vxworks-ca-refusal-fidelity.md` §6) — and
-/// the PVA server's `kind() == WouldBlock` arm reports an out-of-threads target
-/// as `max_connections reached`, naming a bound that never fired. That second
-/// one is by construction, not measured: the blocking PVA server has not been
-/// driven to its wall on this target.
+/// with `available=48` on each — and the PVA server's `kind() == WouldBlock`
+/// arm reports an out-of-threads target as `max_connections reached`, naming a
+/// bound that never fired. That second one is by construction, not measured:
+/// the blocking PVA server has not been driven to its wall on this target.
 ///
 /// Naming the gate in the type is what makes that class of mistake unwritable:
 /// a consumer that wants "is this the connection limit" must now say so, and
@@ -1319,8 +1311,8 @@ impl std::fmt::Display for AcquireError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             // The leading words are load-bearing: they are what the on-target
-            // consoles and `doc/vxworks-ca-refusal-fidelity.md` already carry,
-            // so an operator's existing grep keeps working.
+            // consoles already carry, so an operator's existing grep keeps
+            // working.
             AcquireError::AtCapacity { capacity } => {
                 write!(f, "worker pool at capacity ({capacity} sets)")
             }
@@ -1974,8 +1966,7 @@ mod tests {
     /// WORKERS=100 CONNS=0` — two sets leased forever with no client attached,
     /// so the connection bound was permanently 139 instead of 141 and every
     /// further death cost another set
-    /// (`doc/vxworks-ca-worker-pool-on-target-measurement.md` §14, on
-    /// `caucus/58EWEJWV91/e8-poolprobe-0548dc61-1`).
+    /// (on `caucus/58EWEJWV91/e8-poolprobe-0548dc61-1`).
     ///
     /// The target's mechanism was a `std` mutex lock returning `EINVAL` inside
     /// the loop's return path, which is not reproducible on demand. This
@@ -2112,9 +2103,8 @@ mod tests {
     /// The defect: the pool's only bound was a *count*, so on
     /// `x86_64-wrs-vxworks` the CA server walked to 41 concurrent clients and
     /// the RTP died — a 64-byte allocation failed, `signal 6`, whole process
-    /// gone — with its count bound of 141 nowhere in sight
-    /// (`doc/vxworks-ca-refusal-fidelity.md` §6.3). A bound reached after the
-    /// target has run out is not an admission gate.
+    /// gone — with its count bound of 141 nowhere in sight. A bound reached
+    /// after the target has run out is not an admission gate.
     ///
     /// The boundary is exact rather than narrative: a budget of two sets admits
     /// two and refuses the third, and the refusal costs no thread.
@@ -2270,8 +2260,7 @@ mod tests {
     /// a host" where the numbers mean "this target". VxWorks' flat 1 MiB per
     /// thread was therefore charged on RTEMS, where a 30-client ramp spends
     /// 1,167,383 B per client against 3,670,016 B charged — 3.1× — so the
-    /// 160 MiB budget refused at 30 clients on a target whose count cap is 141
-    /// (`doc/vxworks-ca-refusal-fidelity.md` §11.8).
+    /// 160 MiB budget refused at 30 clients on a target whose count cap is 141.
     ///
     /// The `match` on each figure is exhaustive, so a fourth target cannot
     /// compile until someone decides what it costs.
@@ -2356,8 +2345,7 @@ mod tests {
     /// hatch and was taken at face value. Raised past what the address space can
     /// honour it does not add memory, it deletes the refusal that was keeping the
     /// process below the wall — 320 MiB on the ~958 MB guest walks the CA pool to
-    /// set 46, and the RTP takes `signal 6` with no refusal delivered
-    /// (`doc/vxworks-ca-refusal-fidelity.md` §9, §11.2).
+    /// set 46, and the RTP takes `signal 6` with no refusal delivered.
     ///
     /// One case per boundary of the descent, not per story.
     #[test]

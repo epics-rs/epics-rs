@@ -9,6 +9,7 @@
 //! `DBF_STRING` type win over the name-based menu.
 
 use epics_base_rs::server::ioc_builder::IocBuilder;
+use epics_base_rs::server::records::scalcout::ScalcoutRecord;
 use epics_base_rs::types::EpicsValue;
 
 const DB: &str = r#"record(scalcout, "S") {}"#;
@@ -18,6 +19,7 @@ const DB: &str = r#"record(scalcout, "S") {}"#;
 #[epics_macros_rs::epics_test]
 async fn scalcout_osv_accepts_string_and_numeric_puts() {
     let db = IocBuilder::new()
+        .register_record_type("scalcout", || Box::new(ScalcoutRecord::default()))
         .db_string(DB, &std::collections::HashMap::new())
         .unwrap()
         .build()

@@ -65,12 +65,12 @@ pub enum AsynError {
     ///
     /// C parity: `asynOctet::write` reports `*nbytesTransfered` **together
     /// with** a failing `asynStatus`, at every layer of the write chain —
-    /// `drvAsynSerialPort.c::writeIt` (`:849`) assigns
+    /// `drvAsynSerialPort.c::writeIt` (`:843`) assigns
     /// `*nbytesTransfered = numchars - nleft` on the way out of the loop no
     /// matter whether it broke on `asynTimeout` or on a fatal `write()` errno;
-    /// `asynInterposeEcho.c::writeIt` (`:88`) and `asynInterposeDelay.c` (`:52`)
+    /// `asynInterposeEcho.c::writeIt` (`:83`) and `asynInterposeDelay.c` (`:51`)
     /// assign `*nbytesTransfered = transfered` on every break; and
-    /// `asynInterposeEos.c::writeIt` (`:196`) clamps the lower layer's count to
+    /// `asynInterposeEos.c::writeIt` (`:179`) clamps the lower layer's count to
     /// the caller's `numchars` and returns it beside the status. `asynRecord`
     /// commits the result unconditionally — `nawt = nbytesTransfered`
     /// (asynRecord.c:1547) runs *before* the status check at `:1551` — so a
@@ -112,7 +112,7 @@ pub enum AsynError {
     ///
     /// Distinct from `AsynStatus::Timeout`, which means the driver *did* run and
     /// the device did not answer in time. C reports this one as plain
-    /// `asynError` (asynRecord.c:919-926), which is what [`AsynError::status`]'s
+    /// `asynError` (asynRecord.c:919-927), which is what [`AsynError::status`]'s
     /// default branch gives it.
     #[error("queueRequest timeout on port {port}")]
     QueueTimeout { port: String },
@@ -149,7 +149,7 @@ pub enum AsynError {
     /// `paramList::createParam` (`asynPortDriver.cpp:126-138`) returns
     /// this status when a second `createParam(name, ...)` arrives with
     /// the same name. The `asynPortDriver::createParam` wrapper
-    /// (`asynPortDriver.cpp:991-1011`) translates it to `asynError`
+    /// (`asynPortDriver.cpp:991-1012`) translates it to `asynError`
     /// with an `asynPrint(ASYN_TRACE_ERROR, ...)` log line. The lax
     /// Rust [`ParamList::create_param`](crate::param::ParamList::create_param) silently returns the existing
     /// index to match the idempotent build pattern used by
@@ -167,7 +167,7 @@ pub enum AsynError {
     /// `paramVal::getInteger/getInteger64/getDouble/getUInt32/getString`
     /// throws `ParamValNotDefined` when the value has never been set, and
     /// `paramList::getInteger/...` translates that to `asynParamUndefined`
-    /// (`asynPortDriver/asynPortDriver.cpp:301-401,543-566`). The lax Rust
+    /// (`asynPortDriver/asynPortDriver.cpp:301-403,543-565`). The lax Rust
     /// getters (`ParamList::get_int32` etc.) return the type default
     /// (`0`, `0.0`, `""`) silently — that mirrors many existing call sites
     /// that use `.unwrap_or(...)`. Use the `_strict` variants
@@ -315,7 +315,7 @@ impl AsynError {
     /// on the fd/socket, not a timeout and not a higher-layer complaint.
     ///
     /// C's drivers decide this at the errno itself, calling `closeConnection`
-    /// right where `read`/`write` failed (drvAsynIPPort.c:642-651,
+    /// right where `read`/`write` failed (drvAsynIPPort.c:692-698,
     /// drvAsynSerialPort.c:836-845) while returning `asynTimeout` with the link
     /// intact on a poll expiry. Rust re-derives the decision one layer up, in
     /// [`AsynError::is_fatal_transport`], so the errno has to survive the trip:
@@ -381,7 +381,7 @@ impl AsynError {
     /// The bytes the device accepted before this write failed — C's
     /// `*nbytesTransfered` on a failing `asynOctet::write`. `None` means the
     /// layer reported no transfer, which is C's pre-call
-    /// `nbytesTransfered = 0` (asynRecord.c:1526) left untouched: zero bytes.
+    /// `nbytesTransfered = 0` (asynRecord.c:1527) left untouched: zero bytes.
     ///
     /// Every consumer of an octet write MUST consult this on the error path:
     /// C `asynRecord::performOctetIO` publishes `nawt = nbytesTransfered`

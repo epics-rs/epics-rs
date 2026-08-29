@@ -24,7 +24,9 @@ use std::sync::Arc;
 use crate::error::{CaError, CaResult};
 use crate::runtime::log::{ErrlogSevEnum, errlog_sev_printf};
 use crate::server::database::filters::sync::{DbState, db_state_registry};
-use crate::server::device_support::{DeviceReadOutcome, DeviceSupport};
+use crate::server::device_support::{
+    DeviceInitOutcome, DeviceReadOutcome, DeviceSupport, DeviceUdf,
+};
 use crate::server::record::Record;
 use crate::types::EpicsValue;
 
@@ -58,7 +60,7 @@ impl DeviceSupport for DbStateDeviceSupport {
         "Db State"
     }
 
-    fn init(&mut self, record: &mut dyn Record) -> CaResult<()> {
+    fn init(&mut self, record: &mut dyn Record) -> CaResult<DeviceInitOutcome> {
         // C registers a SEPARATE dset per record type (devBiDbState for bi,
         // devBoDbState for bo); both carry DTYP "Db State". The bi dset reads
         // the state name from INP, the bo dset from OUT. The Rust dynamic
@@ -81,7 +83,7 @@ impl DeviceSupport for DbStateDeviceSupport {
         let name = raw.strip_prefix('@').unwrap_or(raw);
         if name.is_empty() {
             self.state = None;
-            return Ok(());
+            return Ok(DeviceInitOutcome::Live);
         }
 
         // C `add_record`: `dbStateFind`, and if absent AND non-empty, log an
@@ -99,37 +101,35 @@ impl DeviceSupport for DbStateDeviceSupport {
                 };
                 errlog_sev_printf(
                     ErrlogSevEnum::Info,
-                    &format!("{devsup}: Creating new db state '{name}'"),
+                    &format!("{devsup}: Creating new db state '{name}'\n"),
                 );
                 registry.get_or_create(name)
             }
         });
-        Ok(())
+        Ok(DeviceInitOutcome::Live)
     }
 
     fn read(&mut self, record: &mut dyn Record) -> CaResult<DeviceReadOutcome> {
         // C `read_bi` (devBiDbState.c:63-71): `if (dpvt) { prec->val =
-        // dbStateGet(dpvt); prec->udf = FALSE; } return 2`. Writing VAL
-        // directly + returning `computed()` skips the bi conversion (C return
-        // 2); the framework then derives `udf` from the now-defined VAL
-        // (`clears_udf()` → `value_is_undefined()` is false for an Enum) —
-        // matching C clearing `udf = FALSE` on the configured path.
+        // dbStateGet(dpvt); prec->udf = FALSE; } return 2`. Both halves are
+        // stated here — VAL written directly (`computed`, C return 2) and the
+        // record thereby defined (`DeviceUdf::Defined`, C's `prec->udf =
+        // FALSE`) — because bi's `process()` re-derives neither: the fold sits
+        // after the UDF assignment (biRecord.c:136-141), so the dset's write
+        // is the only one there is.
         //
-        // With no state (empty instio name) VAL is left untouched, matching C's
-        // `if (dpvt)` guard for VAL — but `udf` DIVERGES on this misconfig:
-        // C leaves `udf` untouched, so an unconfigured bi stays `udf = TRUE`
-        // (UDF_ALARM), whereas base-rs's framework recomputes `udf` from the
-        // (always-defined) Enum VAL every cycle and clears it. This is the
-        // framework's `value_is_undefined()`-derived udf model vs C's sticky
-        // flag — pre-existing and workspace-wide, not specific to Db State, and
-        // not cleanly special-caseable here (the recompute at processing.rs is
-        // gated on `clears_udf()`, not the read outcome). Surfaces only on the
-        // empty-INP misconfiguration.
-        if let Some(state) = &self.state {
-            let bit = u16::from(state.get());
-            record.put_field("VAL", EpicsValue::Enum(bit))?;
-        }
-        Ok(DeviceReadOutcome::computed())
+        // With no state (empty instio name) C's `if (dpvt)` guard skips BOTH the
+        // VAL write and the `udf = FALSE`, so an unconfigured bi keeps
+        // `udf = TRUE` and raises UDF_ALARM/INVALID on every cycle. That arm
+        // reports the read for what it is: nothing was produced, VAL and UDF
+        // both stand. C's literal `return 2` and a `-1` are indistinguishable
+        // to a bi for the same reason.
+        let Some(state) = &self.state else {
+            return Ok(DeviceReadOutcome::failed());
+        };
+        let bit = u16::from(state.get());
+        record.put_field("VAL", EpicsValue::Enum(bit))?;
+        Ok(DeviceReadOutcome::computed(DeviceUdf::Defined))
     }
 
     fn write(&mut self, record: &mut dyn Record) -> CaResult<()> {
@@ -181,7 +181,7 @@ mod tests {
         let mut rec = BiRecord::new(0);
         dev.init(&mut rec).unwrap();
         let outcome = dev.read(&mut rec).unwrap();
-        assert!(outcome.did_compute);
+        assert!(outcome.did_compute());
         assert_eq!(rec.get_field("VAL"), Some(EpicsValue::Enum(1)));
     }
 
@@ -195,14 +195,25 @@ mod tests {
     }
 
     /// An empty instio name leaves `state = None` (C `dpvt == NULL`): read is a
-    /// no-op (VAL unchanged) and write is a no-op (no state touched).
+    /// no-op (VAL unchanged) and write is a no-op (no state touched). C's guard
+    /// skips `prec->udf = FALSE` as well as the VAL write, so the read must
+    /// report that it produced nothing — otherwise the framework re-derives UDF
+    /// from the always-defined Enum VAL and clears an alarm C keeps raised.
     #[test]
     fn empty_instio_name_is_noop() {
         let mut dev = DbStateDeviceSupport::new("@", "");
         let mut rec = BiRecord::new(7);
         dev.init(&mut rec).unwrap();
         assert!(dev.state.is_none());
-        dev.read(&mut rec).unwrap();
+        let outcome = dev.read(&mut rec).unwrap();
+        assert!(
+            outcome.status.read_failed(),
+            "no state: C touches neither VAL nor udf"
+        );
+        assert!(
+            !outcome.asserts_undefined(),
+            "C does not set udf either — it leaves the record's own flag alone"
+        );
         assert_eq!(rec.get_field("VAL"), Some(EpicsValue::Enum(7)));
     }
 }

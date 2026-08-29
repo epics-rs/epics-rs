@@ -6,12 +6,14 @@
 //! what it got, so nothing can take the port in between and no number is ever
 //! hard-coded.
 //!
-//! Two protocols, selected by `--pva`:
+//! Two protocols, selected by `--pva`. The two server types are named in code
+//! spans rather than linked: both are `tokio_backend`-only and this doc block
+//! is rendered in every configuration, so a link out of it resolves in none.
 //!
 //! | mode | server | port line |
 //! |---|---|---|
-//! | default | [`CaServer`] | `ORACLE_IOC_PORT <n>` |
-//! | `--pva` | [`PvaServer`] | `ORACLE_IOC_PVA_PORT <n>` (the UDP search port) |
+//! | default | `CaServer` | `ORACLE_IOC_PORT <n>` |
+//! | `--pva` | `PvaServer` | `ORACLE_IOC_PVA_PORT <n>` (the UDP search port) |
 //!
 //! The two lines are deliberately distinct rather than one reused name: a CA
 //! port and a PVA search port are not interchangeable, and a harness that
@@ -25,13 +27,20 @@
 //! an in-process path the C side cannot have would be a difference in the
 //! instrument rather than in the thing being measured.
 
+// On `exec_backend` this program's `main` refuses instead of running, so the
+// argument parsing and the port announcement below are unreachable in that
+// configuration by construction. The default build still lints them in full.
+#![cfg_attr(exec_backend, allow(dead_code, unused_imports))]
+
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 
 use clap::Parser;
+#[cfg(tokio_backend)]
 use epics_ca_rs::server::CaServer;
 use epics_oracle_rs::{port_ioc_builder, register_port_ioc_devices};
+#[cfg(tokio_backend)]
 use epics_pva_rs::server::PvaServer;
 
 #[derive(Parser)]
@@ -50,6 +59,7 @@ struct Args {
     pva: bool,
 }
 
+#[cfg(tokio_backend)]
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = Args::parse();
@@ -135,6 +145,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 /// least prints `cas WARNING: two or more servers share the same UDP port` —
 /// would here produce a silently misattributed reading, which is the one
 /// outcome this harness exists to never produce.
+#[cfg(tokio_backend)]
 async fn serve_pva(
     db: Arc<epics_base_rs::server::database::PvDatabase>,
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -193,4 +204,15 @@ fn announce(key: &str, port: u16) -> std::io::Result<()> {
     println!("{key} {port}");
     println!("ORACLE_IOC_READY");
     std::io::stdout().flush()
+}
+
+/// The `exec_backend` arm: the oracle binds its port with `CaServer` /
+/// `PvaServer`, and the reactor-free backend compiles neither. It refuses
+/// rather than announcing a port it never bound — a silent half-start here
+/// would be read by the harness as a Rust-side deviation.
+#[cfg(exec_backend)]
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    Err("oracle-ioc needs the tokio backend; this build selects \
+         EPICS_RS_BUILD_EXEC_BACKEND=thread"
+        .into())
 }

@@ -1,8 +1,7 @@
-// RTEMS-EXEC-MODEL-ALLOW(4): multi-thread-flavored tokio tests (the gate contention needs real parallel workers); run and pass in the feature-ON suite.
 //! H6 boundaries: the L1 record gate is NOT held across an asynchronous wait.
 //!
 //! C `dbProcess` never blocks under `dbScanLock`. On async device support it
-//! sets `pact` and RETURNS (`dbAccess.c:537-700`), releasing the lock; the
+//! sets `pact` and RETURNS (`dbAccess.c:536-699`), releasing the lock; the
 //! completion runs on the callback task, which takes the lock again for the
 //! epilogue (`callback.c:379-388` `ProcessCallback`). The seq record's `DLYn`
 //! chain is the same shape spelt out inside one record type: `process` sets
@@ -79,6 +78,8 @@ impl Record for NeverFinishes {
 /// nested locks, the delayed re-process) meant the gate could be held across a
 /// suspension — a second taker would then wait on it. Here the gate must be
 /// free the instant `process_record_with_links` returns.
+// RTEMS-EXEC-MODEL-ALLOW(1): multi-thread flavored — the gate contention needs
+// real parallel workers; checked to run and pass in the exec-backend suite.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn async_pending_record_does_not_hold_the_gate() {
     let db = PvDatabase::new();
@@ -126,6 +127,8 @@ async fn probe_gate_is_free(db: &PvDatabase, record: &'static str) -> Result<(),
 /// Boundary 1b — the same property through a real put. A CA-route put to an
 /// async-pending record must reach its PACT/RPRO decision instead of blocking
 /// on a gate the async cycle never released.
+// RTEMS-EXEC-MODEL-ALLOW(1): multi-thread flavored — the gate contention needs
+// real parallel workers; checked to run and pass in the exec-backend suite.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_put_during_the_async_window_is_not_gate_blocked() {
     let db = PvDatabase::new();
@@ -150,13 +153,14 @@ async fn a_put_during_the_async_window_is_not_gate_blocked() {
     .expect("the put itself is accepted (C defers the process via RPRO)");
 
     // C `dbPutField` on a PACT record sets RPRO and returns success
-    // (`dbAccess.c:1290-1297`); the value is written either way.
+    // (`dbAccess.c:1260-1276`, `rpro = TRUE` at :1269); the value is written
+    // either way — `dbPut` already ran at :1259.
     let rec = db.get_record("H6:ASYNC2").unwrap();
     let inst = rec.read();
     assert_eq!(inst.record.get_field("VAL"), Some(EpicsValue::Double(3.0)));
     assert_eq!(
         inst.common.rpro, 1,
-        "a put to a PACT record must request a reprocess, C dbAccess.c:1290-1297"
+        "a put to a PACT record must request a reprocess, C dbAccess.c:1260-1276"
     );
 }
 
@@ -166,6 +170,8 @@ async fn a_put_during_the_async_window_is_not_gate_blocked() {
 ///
 /// Pre-H6 this slept inside the gate window: `process` did not return until
 /// every group's `DLYn` had elapsed, and the gate was held throughout.
+// RTEMS-EXEC-MODEL-ALLOW(1): multi-thread flavored — the gate contention needs
+// real parallel workers; checked to run and pass in the exec-backend suite.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn seq_delay_runs_outside_the_gate_and_fires_after_release() {
     let db = PvDatabase::new();
@@ -261,6 +267,128 @@ async fn seq_delay_runs_outside_the_gate_and_fires_after_release() {
     );
 }
 
+/// A `LNKn` target whose put parks the thread that is driving it. Which
+/// thread that is, is the whole question of UI-81 — so the test needs a put it
+/// can still be standing inside while it asks.
+struct ParkingTarget {
+    val: f64,
+}
+
+impl Record for ParkingTarget {
+    fn record_type(&self) -> &'static str {
+        "ui81_parking_target"
+    }
+    fn process(&mut self) -> CaResult<ProcessOutcome> {
+        Ok(ProcessOutcome::complete())
+    }
+    fn get_field(&self, name: &str) -> Option<EpicsValue> {
+        match name {
+            "VAL" => Some(EpicsValue::Double(self.val)),
+            _ => None,
+        }
+    }
+    fn put_field(&mut self, name: &str, value: EpicsValue) -> CaResult<()> {
+        match name {
+            "VAL" => {
+                std::thread::sleep(Duration::from_millis(300));
+                self.val = value.to_f64().ok_or(CaError::InvalidValue("bad".into()))?;
+                Ok(())
+            }
+            _ => Err(CaError::FieldNotFound(name.into())),
+        }
+    }
+    fn declared_fields(&self) -> &'static [FieldDesc] {
+        &[]
+    }
+}
+
+/// Boundary 2b (UI-81) — a seq whose selected groups are ALL `DLYn == 0` is
+/// async too.
+///
+/// C `processNextLink` is unconditional about this: "Always use the callback
+/// task to avoid recursion" (`seqRecord.c:210-215`). `DLY` only chooses
+/// between `callbackRequestDelayed` and `callbackRequest`; it never chooses
+/// between the callback task and the caller. So `process` returns at once with
+/// `pact` set for a zero-delay group exactly as it does for a delayed one, and
+/// the group walk, its per-group `dbScanLock` and `asyncFinish` all run on the
+/// callback task. The port used to walk a zero-delay group inline, which held
+/// the caller for the whole chain and never made the record active.
+///
+/// The parking target puts the boundary beyond a race: the walk is provably
+/// still inside the first group's put while this test asks its questions.
+// RTEMS-EXEC-MODEL-ALLOW(1): multi-thread flavored — the gate contention needs
+// real parallel workers; checked to run and pass in the exec-backend suite.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn seq_with_every_delay_zero_still_runs_on_the_callback_task() {
+    let db = PvDatabase::new();
+    db.add_record("UI81:SEQ", Box::new(SeqRecord::new()))
+        .await
+        .unwrap();
+    db.add_record("UI81:TGT", Box::new(ParkingTarget { val: 0.0 }))
+        .await
+        .unwrap();
+    {
+        let rec = db.get_record("UI81:SEQ").unwrap();
+        let mut inst = rec.write();
+        // DLY0 stays 0.0 — the case under test.
+        inst.record
+            .put_field("DOL0", EpicsValue::String("5.0".into()))
+            .unwrap();
+        inst.record
+            .put_field("DO0", EpicsValue::Double(5.0))
+            .unwrap();
+        inst.record
+            .put_field("LNK0", EpicsValue::String("UI81:TGT".into()))
+            .unwrap();
+    }
+
+    let start = std::time::Instant::now();
+    let mut visited = HashSet::new();
+    db.process_record_with_links("UI81:SEQ", &mut visited, 0)
+        .await
+        .unwrap();
+    let returned_after = start.elapsed();
+
+    // C returns through `processNextLink` without running a single group.
+    assert!(
+        returned_after < Duration::from_millis(150),
+        "a zero-delay seq must return before its group's put completes, took \
+         {returned_after:?}"
+    );
+    // `prec->pact = TRUE` (`seqRecord.c:143`) — the record is ACTIVE, which is
+    // what makes it visible as busy and what `asyncFinish` later clears.
+    assert!(
+        db.get_record("UI81:SEQ").unwrap().read().is_processing(),
+        "a zero-delay seq must be PACT across its group chain"
+    );
+    // And the caller is not the walker: the gate the walk re-takes per group
+    // (`processCallback`'s `dbScanLock`, `:252`) is not held by this thread.
+    probe_gate_is_free(&db, "UI81:SEQ")
+        .await
+        .expect("the seq gate must be free while the group chain runs");
+
+    // The chain finishes on its own and `asyncFinish` clears PACT (`:238`).
+    for _ in 0..100 {
+        if !db.get_record("UI81:SEQ").unwrap().read().is_processing() {
+            break;
+        }
+        epics_base_rs::runtime::task::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(
+        !db.get_record("UI81:SEQ").unwrap().read().is_processing(),
+        "the exhausted zero-delay chain must clear PACT"
+    );
+    assert_eq!(
+        db.get_record("UI81:TGT")
+            .unwrap()
+            .read()
+            .record
+            .get_field("VAL"),
+        Some(EpicsValue::Double(5.0)),
+        "LNK0 is still driven — going async must not drop the write"
+    );
+}
+
 /// Boundary 3 — the completion re-entry takes the gate.
 ///
 /// C `ProcessCallback` brackets the completion in `dbScanLock` /
@@ -268,6 +396,8 @@ async fn seq_delay_runs_outside_the_gate_and_fires_after_release() {
 /// snapshot, OUT, FLNK — is serialised against any other holder. A
 /// `complete_async_record` that ran gate-free would interleave with a
 /// concurrent put on the record it is completing.
+// RTEMS-EXEC-MODEL-ALLOW(1): multi-thread flavored — the gate contention needs
+// real parallel workers; checked to run and pass in the exec-backend suite.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_async_completion_waits_for_the_gate() {
     let db = PvDatabase::new();
@@ -298,10 +428,12 @@ async fn the_async_completion_waits_for_the_gate() {
     let db2 = db.clone();
     let completed = Arc::new(AtomicU32::new(0));
     let completed2 = completed.clone();
-    let h = epics_base_rs::runtime::task::spawn(async move {
-        db2.complete_async_record("H6:CMPL").await.unwrap();
-        completed2.store(1, Ordering::SeqCst);
-    });
+    let h = epics_base_rs::runtime::task::Reactor::current()
+        .expect("the test driver enters an executor")
+        .spawn(async move {
+            db2.complete_async_record("H6:CMPL").await.unwrap();
+            completed2.store(1, Ordering::SeqCst);
+        });
 
     epics_base_rs::runtime::task::sleep(Duration::from_millis(100)).await;
     assert_eq!(

@@ -1,6 +1,0 @@
----
-short_sha: 6ffc9e1
-status: not-applicable
-files_changed: []
----
-The C bug was in `logClient.c::logClientFlush` where `nSent` started from 0 instead of `pClient->backlog` (the OS send-queue byte count from `epicsSocketCountUnsentBytes`), causing already-buffered messages to be silently discarded on connection drop and double-counting on reconnect. The audit target `crates/epics-base-rs/src/log/log_client.rs` does not exist in base-rs. The only logging infrastructure in this crate is `crates/epics-base-rs/src/runtime/log.rs` — four `eprintln!`-based macros (`rt_debug!`/`rt_info!`/`rt_warn!`/`rt_error!`) that write directly to stderr, with no remote-log-server client, no TCP send loop, no reconnect logic and no application-level retry buffer. A workspace grep for `log_client`, `LogClient`, `logClientFlush`, `backlog` and `epicsSocketCountUnsentBytes` finds zero hits in src (only this archaeology MD). There is no flush() routine that could miscount bytes. Closing as not-applicable; if a future commit adds a remote `iocLogServer`-style TCP log client, this finding should be revisited then to ensure on-error message retention rather than relying on `tokio::AsyncWriteExt::write` success as proof of delivery.

@@ -52,9 +52,9 @@ pub use pva_adapter::{
 };
 // The host dual-protocol runner: gated with its definition, and the predicate
 // must match it exactly — `qsrv` (not `qsrv-core`) because it needs
-// `epics-ca-rs`, and `not(epics_embedded_target)` because both servers it
-// starts are embedded-target-gated in their own crates. See the definition
-// for the full reasoning.
-#[cfg(all(feature = "qsrv", not(epics_embedded_target)))]
-pub use pva_adapter::run_ca_pva_qsrv_ioc;
+// `epics-ca-rs`, and `tokio_backend` because both servers it starts are
+// reactor-gated in their own crates. See the definition for the full
+// reasoning.
+#[cfg(all(feature = "qsrv", tokio_backend))]
+pub use pva_adapter::{run_ca_pva_qsrv_ioc, run_ca_pva_qsrv_ioc_app};
 pub use pvif::{FieldMapping, NtType};

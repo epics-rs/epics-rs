@@ -3,6 +3,7 @@ use std::sync::Arc;
 use ad_core_rs::ndarray::NDArray;
 use ad_core_rs::ndarray_pool::NDArrayPool;
 use ad_core_rs::plugin::runtime::{NDPluginProcess, ProcessResult};
+use parking_lot::Mutex;
 
 /// Scatter method.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -27,14 +28,16 @@ impl ScatterMethod {
 /// which keeps no per-frame index of its own (the cursor lives entirely in
 /// `nextClient_`).
 pub struct ScatterProcessor {
-    method: ScatterMethod,
+    /// C `NDPluginScatter` has no per-frame method state; the PV write and the
+    /// frame path can run on different threads, so the cached value is locked.
+    method: Mutex<ScatterMethod>,
     method_idx: Option<usize>,
 }
 
 impl ScatterProcessor {
     pub fn new() -> Self {
         Self {
-            method: ScatterMethod::RoundRobin,
+            method: Mutex::new(ScatterMethod::RoundRobin),
             method_idx: None,
         }
     }
@@ -47,7 +50,7 @@ impl Default for ScatterProcessor {
 }
 
 impl NDPluginProcess for ScatterProcessor {
-    fn process_array(&mut self, array: &NDArray, _pool: &NDArrayPool) -> ProcessResult {
+    fn process_array(&self, array: &NDArray, _pool: &NDArrayPool) -> ProcessResult {
         ProcessResult::scatter(vec![Arc::new(array.clone())])
     }
 
@@ -66,12 +69,12 @@ impl NDPluginProcess for ScatterProcessor {
     }
 
     fn on_param_change(
-        &mut self,
+        &self,
         reason: usize,
         params: &ad_core_rs::plugin::runtime::PluginParamSnapshot,
     ) -> ad_core_rs::plugin::runtime::ParamChangeResult {
         if Some(reason) == self.method_idx {
-            self.method = ScatterMethod::from_i32(params.value.as_i32());
+            *self.method.lock() = ScatterMethod::from_i32(params.value.as_i32());
         }
         ad_core_rs::plugin::runtime::ParamChangeResult::updates(vec![])
     }
@@ -88,7 +91,7 @@ mod tests {
         // array through unchanged; the runtime owns the round-robin cursor and
         // the reroute/drop decisions (see ad_core_rs runtime scatter_publish
         // tests for the routing behavior itself).
-        let mut proc = ScatterProcessor::new();
+        let proc = ScatterProcessor::new();
         let pool = NDArrayPool::new(1_000_000);
 
         let mut arr = NDArray::new(vec![NDDimension::new(4)], NDDataType::UInt8);

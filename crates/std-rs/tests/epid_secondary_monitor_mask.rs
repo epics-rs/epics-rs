@@ -25,6 +25,14 @@
 //! declaration, `Record::fields_posted_without_alarm_bits`, resolved by the same
 //! single owner (`AuxPostMask`) as the other two.
 
+// RTEMS-EXEC-MODEL-ALLOW(3): checked, not waived — all 3 ran and passed
+// on the exec backend (measured on this tree:
+// `EPICS_RS_BUILD_EXEC_BACKEND=thread cargo nextest run -p std-rs
+// --all-features`, 189/189). std-rs became a census subject when its
+// `build.rs` began deriving `tokio_backend`; nothing here builds a CA
+// server, and the reactor these obtain comes from `#[tokio::test]`
+// itself, which the backend does not remove.
+
 use std::collections::HashSet;
 
 use epics_base_rs::server::database::PvDatabase;
@@ -89,7 +97,7 @@ async fn set(db: &PvDatabase, rec: &str, v: f64) {
 
 /// The finding. On the alarm-transition cycle every secondary posts with a
 /// LITERAL `DBE_VALUE|DBE_LOG` — no `DBE_ALARM`, even though the cycle raised
-/// one. The negative control is VAL, whose own post (`epidRecord.c:371`) keeps
+/// one. The negative control is VAL, whose own post (`epidRecord.c:373`) keeps
 /// the alarm bits.
 #[tokio::test]
 async fn r11_64_epid_secondaries_post_without_the_cycles_alarm_bits() {
@@ -154,7 +162,7 @@ async fn r11_64_epid_secondaries_post_without_the_cycles_alarm_bits() {
     }
     assert!(
         val_masks.iter().any(|m| m.contains(EventMask::ALARM)),
-        "negative control: VAL's own post (epidRecord.c:371) keeps the cycle's \
+        "negative control: VAL's own post (epidRecord.c:373) keeps the cycle's \
          alarm bits — it is posted with `monitor_mask`, not with the literal \
          reassigned at :376. Got {val_masks:?}"
     );

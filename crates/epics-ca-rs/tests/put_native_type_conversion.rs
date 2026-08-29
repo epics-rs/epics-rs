@@ -16,9 +16,8 @@
 //! type. The Rust native-typed API's equivalent obligation is client-
 //! side conversion through `convert_to`, the value-coercion owner.
 
-// Host/tokio-only: builds the async `CaClient`/`CaServer` stack in
-// process, which needs a tokio reactor (see caget_dbr_type.rs).
-#![cfg(not(feature = "rtems-exec-model"))]
+#![cfg(tokio_backend)]
+#![cfg(feature = "client-core")]
 
 use std::time::{Duration, Instant};
 
@@ -60,7 +59,7 @@ async fn server_with_bi(pv: &'static str) -> (CaClient, epics_ca_rs::client::CaC
     point_client_at(port);
     let client = CaClient::new().await.expect("client");
     let ch = client.create_channel(pv);
-    ch.wait_connected(Duration::from_secs(3))
+    ch.wait_connected(budget::FACT_BUDGET)
         .await
         .expect("connect");
     (client, ch)
@@ -92,7 +91,7 @@ async fn matching_enum_put_lands_index() {
 #[serial]
 async fn long_put_on_enum_native_converts() {
     let (_client, ch) = server_with_bi("PNC:BI:LONG").await;
-    ch.put_with_timeout(&EpicsValue::Long(1), Duration::from_secs(3))
+    ch.put_with_timeout(&EpicsValue::Long(1), budget::FACT_BUDGET)
         .await
         .expect("put");
     assert_eq!(read_index(&ch).await, 1);
@@ -117,7 +116,7 @@ async fn nowait_long_put_on_enum_native_converts() {
     let (_client, ch) = server_with_bi("PNC:BI:NOWAIT").await;
     ch.put_nowait(&EpicsValue::Long(1)).await.expect("put");
 
-    let deadline = Instant::now() + Duration::from_secs(3);
+    let deadline = Instant::now() + budget::FACT_BUDGET;
     loop {
         if read_index(&ch).await == 1 {
             break;
@@ -126,3 +125,6 @@ async fn nowait_long_put_on_enum_native_converts() {
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
 }
+
+#[path = "common/budget.rs"]
+mod budget;

@@ -45,8 +45,8 @@ pub enum ParamSetValue {
     /// from a background thread — the alarm-push half of the C pattern
     /// `lock(); setParamStatus(..); callParamCallbacks(); unlock()`. The
     /// value is untouched; a status/alarm transition alone marks the param
-    /// changed so the flush delivers it (paramVal.cpp:71-104), and the
-    /// devEpics fill-in maps a non-Success `status` to the EPICS alarm
+    /// changed so the flush delivers it (paramVal.cpp:71-78,84-91,97-104),
+    /// and the devEpics fill-in maps a non-Success `status` to the EPICS alarm
     /// (asynDisconnected → COMM/INVALID) when `alarm_status`/`alarm_severity`
     /// are left 0 (asynEpicsUtils.c:238-265).
     Status {
@@ -174,6 +174,17 @@ pub enum RequestOp {
         mask: u32,
     },
     Flush,
+    /// A queued request that performs no transfer — C `asynCallbackProcess`
+    /// (asynRecord.c:808-831) reached with `tmod == asynTMOD_NoIO` and no
+    /// pending UCMD/ACMD: it resets ERRS, sets the user's timeout, and calls
+    /// nothing.
+    ///
+    /// The point is the queue entry itself. `process()` queues unconditionally
+    /// (`:342-353`), so a NoI/O cycle still wakes the port thread — which is how
+    /// the reconnect-nudge idiom pokes auto-connect — and still meets the queue
+    /// gate, so a disconnected port answers it with the refusal the record turns
+    /// into ERRS and STATE/MINOR.
+    NoIo,
     /// Connect to the port (bypass enabled/connected checks).
     Connect,
     /// Disconnect from the port (bypass enabled/connected checks).
@@ -210,7 +221,7 @@ pub enum RequestOp {
     /// the `user.addr` variant of [`RequestOp::SetAutoConnect`], symmetric with
     /// [`RequestOp::EnableAddr`]. C reaches both through a single
     /// `pasynManager->autoConnect`, which picks device-vs-port state via
-    /// `findDpCommon` (asynManager.c:496-509, 2314); the caller of the shell
+    /// `findDpCommon` (asynManager.c:536-544, 2314); the caller of the shell
     /// command `asynAutoConnect portName addr yesNo` is what supplies the addr.
     SetAutoConnectAddr {
         yes: bool,
@@ -225,10 +236,22 @@ pub enum RequestOp {
     /// Query whether auto-connect is enabled for the port. C parity:
     /// `pasynManager->isAutoConnect` (`asynManager.c`).
     GetAutoConnect,
-    /// Block the port: only this user's requests will be dequeued until unblocked.
-    BlockProcess,
-    /// Unblock the port.
-    UnblockProcess,
+    /// C `pasynManager->blockProcessCallback(pasynUser, allDevices)`
+    /// (asynManager.c:1692-1723). `all_devices` is C's own argument, and it
+    /// picks which of the **two** holders this block takes: the port-wide
+    /// `pport->pblockProcessHolder`, or the `pblockProcessHolder` of the one
+    /// `dpCommon` the user's own `addr` resolves to (`findDpCommon`, :1765).
+    /// devGpib takes the device form for an SRQ transaction
+    /// (devSupportGpib.c:1216), which must not stall the port's other
+    /// addresses.
+    BlockProcess {
+        all_devices: bool,
+    },
+    /// C `pasynManager->unblockProcessCallback(pasynUser, allDevices)`
+    /// (asynManager.c:1725-1774) — releases the holder at the same scope.
+    UnblockProcess {
+        all_devices: bool,
+    },
     /// Resolve a record's bind request to a parameter reason index. Carries the
     /// full [`DrvUserRequest`](crate::port::DrvUserRequest) — drvInfo, asyn `addr`, and the record's asyn
     /// interface — so an on-demand driver can create the parameter with the type
@@ -328,7 +351,7 @@ pub enum RequestOp {
         eos: Vec<u8>,
     },
     /// Read back the port's input EOS bytes — C `pasynOctet->getInputEos`.
-    /// asynRecord's `getEos` (asynRecord.c:1985-2026) calls it after every
+    /// asynRecord's `getEos` (asynRecord.c:1987-2025) calls it after every
     /// IEOS/OEOS put so the record shows what the driver actually holds, not
     /// what was requested. Returns the bytes in [`RequestResult::data`].
     GetInputEos,
@@ -343,7 +366,7 @@ pub enum RequestOp {
     GetConnected,
     /// Install the echo interpose on top of the port's octet stack. C parity:
     /// `asynInterposeEcho(portName, addr)`
-    /// (`asynInterposeEcho.c:165-190`), the iocsh command a startup script
+    /// (`asynInterposeEcho.c:165-186`), the iocsh command a startup script
     /// runs *after* the port is configured.
     ///
     /// It is a request rather than a direct `install_interpose` because the actor
@@ -427,7 +450,7 @@ pub struct RequestResult {
     /// Driver enum string/value/severity table (from EnumRead). C asyn
     /// device support reads this via `asynEnum->read` and pushes it onto
     /// the record's state fields (ZRST/ZRVL/ZRSV…, ZNAM/ONAM…) at init —
-    /// see `devAsynInt32.c::initCommon` (297-324) / `setEnums` (415-435).
+    /// see `devAsynInt32.c::initCommon` (298-324) / `setEnums` (415-435).
     pub enum_entries: Option<Arc<[crate::param::EnumEntry]>>,
     /// i32 array data (from Int32ArrayRead).
     pub int32_array: Option<Vec<i32>>,
@@ -665,7 +688,7 @@ impl RequestResult {
 
 /// Lifecycle of a queued request, mirroring C `asynManager` queue/callback
 /// state so that `AQR` cancellation reproduces the `cancelRequest` `wasQueued`
-/// split (asynManager.c:1632-1692) by construction rather than by a runtime
+/// split (asynManager.c:1630-1690) by construction rather than by a runtime
 /// guard.
 ///
 /// `cancelRequest` removes the request and reports `wasQueued==1` ONLY while it

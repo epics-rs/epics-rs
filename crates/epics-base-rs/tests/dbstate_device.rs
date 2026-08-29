@@ -120,3 +120,50 @@ record(ai, "DBST_AI") {
         "ai with DTYP=Db State must be INVALID (no Db State device support for ai)"
     );
 }
+
+/// An INST_IO link with no state name leaves C's `dpvt` NULL, and `read_bi`'s
+/// `if (dpvt)` guard then skips `prec->udf = FALSE` along with the VAL write
+/// (`devBiDbState.c:63-71`). So the record stays undefined and keeps raising
+/// UDF_ALARM/INVALID on every cycle — it does not quietly become a defined
+/// zero because the Enum VAL happens to be representable.
+#[epics_macros_rs::epics_test]
+async fn db_state_bi_without_a_state_name_stays_undefined() {
+    let (db, _) = IocBuilder::new()
+        .db_string(
+            r#"
+record(bi, "DBST_NONAME") {
+    field(DTYP, "Db State")
+    field(INP, "@")
+}
+"#,
+            &HashMap::new(),
+        )
+        .unwrap()
+        .build()
+        .await
+        .unwrap();
+
+    for _ in 0..3 {
+        let mut v = HashSet::new();
+        db.process_record_with_links("DBST_NONAME", &mut v, 0)
+            .await
+            .unwrap();
+    }
+
+    let bi = db.get_record("DBST_NONAME").expect("bi exists");
+    let inst = bi.read();
+    assert_eq!(
+        inst.common.udf, 1,
+        "C never clears udf on the dpvt==NULL arm"
+    );
+    assert_eq!(
+        inst.common.sevr,
+        AlarmSeverity::Invalid,
+        "an undefined bi raises UDF_ALARM/INVALID (biRecord.c checkAlarms)"
+    );
+    assert_eq!(
+        inst.common.stat,
+        epics_base_rs::server::recgbl::alarm_status::UDF_ALARM,
+        "the alarm is UDF, not READ — the read reported no value, not a failure"
+    );
+}

@@ -29,6 +29,14 @@
 //! `DOUBLE`, `VAL` written short before a device support reports more channels
 //! than it holds, and the capacity floor itself at `NMAX <= 0`.
 
+// RTEMS-EXEC-MODEL-ALLOW(3): checked, not waived — all 3 ran and passed
+// on the exec backend (measured on this tree:
+// `EPICS_RS_BUILD_EXEC_BACKEND=thread cargo nextest run -p mca-rs
+// --all-features`, 62/62). mca-rs became a census subject when its
+// `build.rs` began deriving `tokio_backend`; nothing here builds a CA
+// server, and the reactor these obtain comes from `#[tokio::test]`
+// itself, which the backend does not remove.
+
 use std::collections::HashMap;
 
 use epics_base_rs::server::database::{PvDatabase, RecordLoad};

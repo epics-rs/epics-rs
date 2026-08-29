@@ -9,8 +9,12 @@
 //! builders (which mirror pvxs `nt.cpp`). A derive that emits only
 //! `value` (+ one user meta) under a normative ID is the bug those
 //! tests guard against.
+// The tests that drive a live server are `tokio_backend`-only, so on
+// `exec_backend` the fixtures and imports they share go unreferenced while the
+// rest of this file still runs. The default build lints it in full.
+#![cfg_attr(exec_backend, allow(dead_code, unused_imports))]
+#![cfg(feature = "client")]
 
-// RTEMS-EXEC-MODEL-ALLOW(2): checked - these run and pass in the feature-ON suite.
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -18,7 +22,9 @@ use epics_pva_rs::nt::derive::{NTScalar, NTTable};
 use epics_pva_rs::nt::typed::EnumValue;
 use epics_pva_rs::nt::{Alarm, NTScalar as NTScalarBuilder, TypedNT, meta};
 use epics_pva_rs::pvdata::{FieldDesc, ScalarType};
-use epics_pva_rs::server_native::{PvaServer, SharedPV, SharedSource};
+#[cfg(tokio_backend)]
+use epics_pva_rs::server_native::PvaServer;
+use epics_pva_rs::server_native::{SharedPV, SharedSource};
 // PVA listener tests run in parallel: PvaServer::start now binds
 // the TCP listener synchronously inside `start()` so the
 // pick-and-drop race that motivated file_serial is gone. CA-side
@@ -119,6 +125,7 @@ fn typed_nt_round_trip_local() {
     assert_eq!(pos, back);
 }
 
+#[cfg(tokio_backend)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn pvget_typed_against_local_server() {
     // Build a SharedPV holding the derived NTScalar. The descriptor we
@@ -248,6 +255,7 @@ fn typed_nt_enum_round_trip() {
     assert_eq!(v, back);
 }
 
+#[cfg(tokio_backend)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn pvget_typed_primitive_f64() {
     // Bare f64 against a plain NTScalar<double> source.

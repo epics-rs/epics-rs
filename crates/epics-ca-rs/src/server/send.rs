@@ -12,7 +12,7 @@
 //! disconnects the client.**
 //!
 //! C states the same rule as a loop rather than a type. `cas_send_bs_msg`
-//! (`rsrv/caserverio.c:65-101`) keeps `send()`ing from `pclient->send.buf`
+//! (`rsrv/caserverio.c:66-101`) keeps `send()`ing from `pclient->send.buf`
 //! until the frame is gone, and inside that loop exactly two errno values are
 //! *not* failures:
 //!
@@ -48,8 +48,8 @@
 //! the kernel did not take.
 //!
 //! (`RetryTransientAsync` is deliberately not an intra-doc link: it is
-//! `cfg(not(epics_embedded_target))`, so on an embedded target the link has no
-//! target and `rustdoc -D warnings` fails the build.)
+//! `cfg(tokio_backend)`, so in a reactor-free build the link has no target and
+//! `rustdoc -D warnings` fails the build.)
 
 use std::io;
 use std::time::Duration;
@@ -80,7 +80,7 @@ fn is_out_of_buffers(e: &io::Error) -> bool {
 fn announce_out_of_buffers() {
     epics_base_rs::runtime::log::errlog_sev_printf(
         epics_base_rs::runtime::log::ErrlogSevEnum::Major,
-        "CAS: Out of network buffers, retrying send in 15 seconds",
+        "CAS: Out of network buffers, retrying send in 15 seconds\n",
     );
 }
 
@@ -115,13 +115,13 @@ impl<W: io::Write> io::Write for RetryTransient<W> {
 ///
 /// `Poll::Pending` is the whole trick: it consumes no bytes, so `BufWriter`
 /// and `write_all` above resume from exactly where the kernel stopped.
-#[cfg(not(epics_embedded_target))]
+#[cfg(tokio_backend)]
 pub(crate) struct RetryTransientAsync<W> {
     inner: W,
     backoff: Option<std::pin::Pin<Box<tokio::time::Sleep>>>,
 }
 
-#[cfg(not(epics_embedded_target))]
+#[cfg(tokio_backend)]
 impl<W> RetryTransientAsync<W> {
     pub(crate) fn new(inner: W) -> Self {
         Self {
@@ -131,7 +131,7 @@ impl<W> RetryTransientAsync<W> {
     }
 }
 
-#[cfg(not(epics_embedded_target))]
+#[cfg(tokio_backend)]
 impl<W: tokio::io::AsyncWrite + Unpin> tokio::io::AsyncWrite for RetryTransientAsync<W> {
     fn poll_write(
         self: std::pin::Pin<&mut Self>,

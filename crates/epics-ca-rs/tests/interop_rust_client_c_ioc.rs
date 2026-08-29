@@ -6,20 +6,22 @@
 //!
 //! Run with: `cargo test -p epics-ca-rs --test interop_rust_client_c_ioc`
 //!
-//! Host/tokio-only. The client side is the async `CaClient`, which needs a
-//! tokio reactor that `rtems-exec-model` deliberately does not start; measured
-//! under `--profile interop`, all four tests fail there with "there is no
-//! reactor running". The C `softIoc` side is fine — this is the same
-//! by-design async-client exclusion as the rest of the gated client suites,
-//! not an interop defect.
+//! Both backends: the "no reactor running" this file used to record came from
+//! the CA stack minting its spawn capability from the seam `Reactor` on a
+//! build whose listeners are tokio's, not from anything the C `softIoc` side
+//! does.
 
-#![cfg(not(feature = "rtems-exec-model"))]
+#![cfg(feature = "client-core")]
+
+// RTEMS-EXEC-MODEL-ALLOW(4): measured, not argued — every case here is
+// `#[ignore]`d, and all four pass under `EPICS_RS_BUILD_EXEC_BACKEND=thread
+// cargo nextest run --profile interop -p epics-ca-rs --run-ignored all`.
 
 mod common;
 
 use std::time::Duration;
 
-use common::{require_tool, spawn_softioc};
+use common::{require_tool, spawn_softioc, spawn_softioc_on};
 use epics_base_rs::types::EpicsValue;
 use serial_test::serial;
 
@@ -56,21 +58,18 @@ async fn rust_client_can_caget_from_softioc() {
     if !require_tool("softIoc") {
         return;
     }
-    let Some(ioc) = spawn_softioc(TEST_DB) else {
-        eprintln!("SKIP: spawn_softioc failed");
-        return;
-    };
+    let ioc = spawn_softioc(TEST_DB);
     set_client_env(&ioc.ca_addr_list(), ioc.udp_port);
 
     let client = epics_ca_rs::client::CaClient::new()
         .await
         .expect("CaClient");
     let ch = client.create_channel("TEST:AI");
-    ch.wait_connected(Duration::from_secs(5))
+    ch.wait_connected(budget::FACT_BUDGET)
         .await
         .expect("connect");
     let (_, value) = ch
-        .get_with_timeout(Duration::from_secs(3))
+        .get_with_timeout(budget::FACT_BUDGET)
         .await
         .expect("caget");
     let v = value.to_f64().expect("scalar");
@@ -84,16 +83,14 @@ async fn rust_client_can_caput_to_softioc() {
     if !require_tool("softIoc") {
         return;
     }
-    let Some(ioc) = spawn_softioc(TEST_DB) else {
-        return;
-    };
+    let ioc = spawn_softioc(TEST_DB);
     set_client_env(&ioc.ca_addr_list(), ioc.udp_port);
 
     let client = epics_ca_rs::client::CaClient::new()
         .await
         .expect("CaClient");
     let ch = client.create_channel("TEST:LOUT");
-    ch.wait_connected(Duration::from_secs(5))
+    ch.wait_connected(budget::FACT_BUDGET)
         .await
         .expect("connect");
     eprintln!("test: connected, calling put");
@@ -103,7 +100,7 @@ async fn rust_client_can_caput_to_softioc() {
 
     // Read back via Rust client to verify the IOC accepted the value.
     let (_, value) = ch
-        .get_with_timeout(Duration::from_secs(3))
+        .get_with_timeout(budget::FACT_BUDGET)
         .await
         .expect("readback");
     assert_eq!(value.to_f64().unwrap_or(0.0) as i64, 1234);
@@ -116,16 +113,14 @@ async fn rust_client_monitors_softioc_changes() {
     if !require_tool("softIoc") {
         return;
     }
-    let Some(ioc) = spawn_softioc(TEST_DB) else {
-        return;
-    };
+    let ioc = spawn_softioc(TEST_DB);
     set_client_env(&ioc.ca_addr_list(), ioc.udp_port);
 
     let client = epics_ca_rs::client::CaClient::new()
         .await
         .expect("CaClient");
     let ch = client.create_channel("TEST:LOUT");
-    ch.wait_connected(Duration::from_secs(5))
+    ch.wait_connected(budget::FACT_BUDGET)
         .await
         .expect("connect");
 
@@ -145,7 +140,7 @@ async fn rust_client_monitors_softioc_changes() {
     });
 
     let mut last_seen = 0;
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    let deadline = tokio::time::Instant::now() + budget::FACT_BUDGET;
     while tokio::time::Instant::now() < deadline {
         match tokio::time::timeout(Duration::from_millis(500), monitor.recv()).await {
             Ok(Some(Ok(snap))) => {
@@ -169,9 +164,7 @@ async fn rust_client_handles_softioc_restart() {
     }
 
     // First IOC instance.
-    let Some(ioc1) = spawn_softioc(TEST_DB) else {
-        return;
-    };
+    let ioc1 = spawn_softioc(TEST_DB);
     let addr = ioc1.ca_addr_list();
     let port = ioc1.udp_port;
     set_client_env(&addr, port);
@@ -180,7 +173,7 @@ async fn rust_client_handles_softioc_restart() {
         .await
         .expect("CaClient");
     let ch = client.create_channel("TEST:AI");
-    ch.wait_connected(Duration::from_secs(5))
+    ch.wait_connected(budget::FACT_BUDGET)
         .await
         .expect("first connect");
 
@@ -190,32 +183,15 @@ async fn rust_client_handles_softioc_restart() {
     drop(ioc1);
     std::thread::sleep(Duration::from_secs(1));
 
-    // Spawning a *new* IOC on the same port simulates a process restart.
-    // We can't reuse spawn_softioc because it picks fresh ports each time;
-    // re-bind via direct softIoc invocation with the same port.
-    let dir = tempfile::tempdir().expect("temp");
-    let db = dir.path().join("test.db");
-    std::fs::write(&db, TEST_DB).expect("db");
-    let mut child = std::process::Command::new("softIoc")
-        .arg("-S")
-        .arg("-d")
-        .arg(&db)
-        .env("EPICS_CAS_INTF_ADDR_LIST", "127.0.0.1")
-        .env("EPICS_CAS_BEACON_ADDR_LIST", "127.0.0.1")
-        .env("EPICS_CA_ADDR_LIST", "127.0.0.1")
-        .env("EPICS_CA_AUTO_ADDR_LIST", "NO")
-        .env("EPICS_CA_SERVER_PORT", port.to_string())
-        .env("EPICS_CAS_SERVER_PORT", port.to_string())
-        .env("EPICS_CA_REPEATER_PORT", "5165")
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .spawn()
-        .expect("spawn second IOC");
-    std::mem::forget(dir);
+    // Spawning a *new* IOC on the same port simulates a process restart, so
+    // the number IS the subject here and a fresh candidate would be a
+    // different test. `spawn_softioc_on` therefore fails on a steal rather
+    // than retrying — and it waits for the IOC's own "up" line, where this
+    // used to hand the reconnect budget a child that might never have bound.
+    let ioc2 = spawn_softioc_on(TEST_DB, port);
 
     // Reconnection should complete within ~10s (reconnect lane backoff).
-    let result = tokio::time::timeout(Duration::from_secs(15), async {
+    let result = tokio::time::timeout(budget::FACT_BUDGET, async {
         loop {
             if let Ok((_, value)) = ch.get_with_timeout(Duration::from_secs(2)).await
                 && (value.to_f64().unwrap_or(0.0) - 42.0).abs() < 0.001
@@ -227,8 +203,13 @@ async fn rust_client_handles_softioc_restart() {
     })
     .await;
 
-    let _ = child.kill();
-    let _ = child.wait();
+    let console = ioc2.console();
+    drop(ioc2);
 
-    assert!(result.is_ok(), "did not reconnect after IOC restart");
+    assert!(
+        result.is_ok(),
+        "did not reconnect after IOC restart; the second IOC said:\n{console}"
+    );
 }
+
+use common::budget;

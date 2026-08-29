@@ -146,7 +146,7 @@ impl MotorRecord {
     /// Update readback positions from driver status. The runtime poll path
     /// uses this (`initcall = false`).
     ///
-    /// C `process_motor_info(pmr, initcall)` (motorRecord.cc:3650+) takes the
+    /// C `process_motor_info(pmr, initcall)` (motorRecord.cc:3652+) takes the
     /// init flag explicitly; the URIP RDBL scaling is gated `else if
     /// (urip==Yes && initcall==false)` (3682), so the init readback seeds RRBV
     /// from the motor position rather than the external link. The init path
@@ -385,7 +385,7 @@ impl MotorRecord {
         };
 
         // LVIO is NOT recomputed here. C re-evaluates it only at
-        // enter_do_work (1462-1483: jog from live RBV, home disabled,
+        // enter_do_work (1463-1484: jog from live RBV, home disabled,
         // everything else preserves the latched value) — ported in
         // check_completion's still-moving path — and in the do_work move
         // block / soft-limit puts, ported in plan_absolute_move and
@@ -408,7 +408,7 @@ impl MotorRecord {
         self.internal.lrvl = self.pos.rval;
     }
 
-    /// Motion-completion drive resync (C postProcess 826-849).
+    /// Motion-completion drive resync (C postProcess 827-849).
     ///
     /// C gates the resync on `omsl != menuOmslclosed_loop` (827): under
     /// closed-loop OMSL the drive values belong to the DOL cascade, and a

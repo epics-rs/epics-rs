@@ -1,7 +1,7 @@
 //! A7 — an ACF whose `RULE(...) { CALC(...) }` assigns into an argument is
 //! rejected outright, and the IOC keeps the rule set it was running.
 //!
-//! C `asAsgRuleCalc` (`asLibRoutines.c:1416-1425`) checks the `stores` bitmap
+//! C `asAsgRuleCalc` (`asLibRoutines.c:1407-1416`) checks the `stores` bitmap
 //! `calcArgUsage` returns:
 //!
 //! ```c

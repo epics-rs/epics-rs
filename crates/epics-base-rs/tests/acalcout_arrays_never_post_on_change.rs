@@ -1,6 +1,6 @@
 //! W10-A6 — an aCalcout array posts from AMASK/NEWM and from nothing else.
 //!
-//! C `monitor()` (`aCalcoutRecord.c:1022-1036`) change-detects the SCALAR inputs
+//! C `monitor()` (`aCalcoutRecord.c:1024-1029`) change-detects the SCALAR inputs
 //! against their previous copies:
 //!
 //! ```c
@@ -21,7 +21,7 @@
 //! Note what the array loop does NOT do: it holds no `pprev`, it compares no
 //! value. There is no PAA..PLL — the record keeps no previous copy of an array,
 //! so it cannot post one "because it changed". The only array comparison in the
-//! whole record lives in `fetch_values` (`:1103-1105`), against the link's own
+//! whole record lives in `fetch_values` (`:1099-1101`), against the link's own
 //! previous delivery, and its result IS the NEWM bit.
 //!
 //! The port ran AA..LL through the generic change-detection loop, which posts

@@ -1,4 +1,4 @@
-//! C `subRecord.c::special` (`:180-200`) is a two-pass state machine over the
+//! C `subRecord.c::special` (`:170-194`) is a two-pass state machine over the
 //! PACT park, and its whole point is that the park is REVERSIBLE:
 //!
 //! ```c
@@ -97,7 +97,7 @@ async fn proc(db: &epics_base_rs::server::database::PvDatabase, rec: &str) {
 
 /// Plain `caput REC.SNAM <name>` — the external put boundary, which is where C
 /// runs `dbPut`'s two `special()` passes. Deliberately the NO-NOTIFY entry:
-/// `dbNotify.c:225-231` defers a put-notify in front of a PACT-active record
+/// `dbNotify.c:225-232` defers a put-notify in front of a PACT-active record
 /// (`notifyRestartInProgress`, before `putCallback`), so `caput -c` on a parked
 /// `sub` waits for a restart that a permanently parked record never delivers,
 /// in C exactly as here. Plain `dbPutField` has no such gate.

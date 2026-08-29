@@ -5,7 +5,7 @@
 //! PROCESSES the record. On `bo`/`stringout` the record does not re-derive
 //! `udf` from VAL (`clears_udf() == false`), so the put byte survives to
 //! `checkAlarms`. There C tests `if (prec->udf == TRUE)` — exact-one, `TRUE`
-//! is `1` (`boRecord.c:371`, `stringoutRecord.c:146`). A byte of `255` (what
+//! is `1` (`boRecord.c:366`, `stringoutRecord.c:146`). A byte of `255` (what
 //! `caput 255` stores, and what `-1` stores in the signed-served `DBF_UCHAR`
 //! field) satisfies `255 != 1`, so NO UDF_ALARM is raised; processing then
 //! moves STAT from its `initial("UDF")` down to `NO_ALARM`.

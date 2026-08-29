@@ -17,7 +17,7 @@ impl MotorRecord {
         // it exactly like C's early return(OK) before line 1938.
         let res_reanchor = std::mem::take(&mut self.internal.res_reanchor);
 
-        // C enter_do_work (1462-1483) re-evaluates LVIO on EVERY process
+        // C enter_do_work (1463-1484) re-evaluates LVIO on EVERY process
         // pass before do_work — including put-processing passes, since
         // HLM/LLM/DHLM/DLLM are pp(TRUE). A rising violation sets
         // stop = 1 (1480), which the latent-stop gate below consumes in
@@ -28,7 +28,7 @@ impl MotorRecord {
 
         // C do_work evaluates `pmr->stop` and `spmg != lspg` at the TOP
         // of every put-processing pass, before any other work
-        // (motorRecord.cc:1855-1932). A latent stop or SPMG change — a
+        // (motorRecord.cc:1854-1934). A latent stop or SPMG change — a
         // bare dbPut that never processed the record, later overtaken in
         // `last_write` by another field's write — therefore wins over
         // whatever src triggered this pass. The overtaken position write
@@ -147,7 +147,7 @@ impl MotorRecord {
                     return effects;
                 }
                 if !self.can_accept_command() {
-                    // C home section under stop_or_pause (2015-2020): a
+                    // C home section under stop_or_pause (2016-2021): a
                     // latched home button only drops DMOV and returns —
                     // no MIP change, no dispatch, button stays latched.
                     // The Go pass falls through the top block into the
@@ -360,7 +360,7 @@ impl MotorRecord {
                             // Deliberate divergence from C. C never sends a
                             // move while one is in flight: do_work's move
                             // block is *entered* on every in-flight write
-                            // (motorRecord.cc:2240, `dval != ldvl || !dmov`)
+                            // (motorRecord.cc:2241, `dval != ldvl || !dmov`)
                             // and val/dval/rval take the new target, but the
                             // command dispatch is gated at 2455 on
                             // `mip == MIP_DONE || mip == MIP_RETRY` — the
@@ -394,9 +394,9 @@ impl MotorRecord {
                         }
                     }
                 }
-                // C move-block entry (2240): `dval != ldvl || !dmov`.
+                // C move-block entry (2241): `dval != ldvl || !dmov`.
                 // A database put never fails this gate — the special()
-                // pass-0 blink (2582-2608) dropped DMOV before the pass
+                // pass-0 blink (2591-2620) dropped DMOV before the pass
                 // — so a same-value dbPut re-put re-enters and the
                 // dispatch gate (2455, `mip == MIP_DONE || MIP_RETRY`)
                 // re-sends the move: C retries a missed target on an
@@ -483,10 +483,10 @@ impl MotorRecord {
                 // The fold already ran in the collection above (SET-mode
                 // redefinition included); dispatch the pending move (C
                 // move block firing on the folded val change). A dbPut
-                // to TWF/TWR is blinked (special pass-0, 2582-2608), so
+                // to TWF/TWR is blinked (special pass-0, 2591-2620), so
                 // even a zero fold (TWV = 0) enters via `!dmov` and
                 // too_small pulses DMOV like C; only an unblinked zero
-                // fold refuses at the entry gate (2240) — chain end.
+                // fold refuses at the entry gate (2241) — chain end.
                 if tweak_pending {
                     if !self.stat.dmov || self.pos.dval != self.internal.ldvl {
                         self.plan_absolute_move(&mut effects);
@@ -506,10 +506,10 @@ impl MotorRecord {
             }
             CommandSource::Set => {
                 // C: the SET-mode redefinition dispatches through the
-                // move block (2240-2263) — plan_absolute_move recomputes
+                // move block (2241-2263) — plan_absolute_move recomputes
                 // DIFF/RDIF and its set test routes to load_pos. The
-                // entry gate (2240) applies first, but a dbPut to a
-                // drive field is blinked (special pass-0, 2582-2608) and
+                // entry gate (2241) applies first, but a dbPut to a
+                // drive field is blinked (special pass-0, 2591-2620) and
                 // always re-enters — C re-sends LOAD_POS on a same-value
                 // redefinition re-put. Only an unblinked same-value pass
                 // (no fresh drive write) falls to the chain end.
@@ -583,7 +583,7 @@ impl MotorRecord {
                         && (self.pos.dval + self.retry.spdb) > self.pos.drbv)
             };
             if too_small {
-                // C 2333-2342: a pending non-move (paused-RETRY resume
+                // C 2334-2343: a pending non-move (paused-RETRY resume
                 // whose error drifted under RDBD) completes here with
                 // mip = DONE; the quiesce below plus the DMOV pulse
                 // recovery in do_process_inner restore DMOV=1.
@@ -593,7 +593,7 @@ impl MotorRecord {
                 {
                     self.stat.mip = MipFlags::empty();
                 }
-                // C 2343-2347: update the previous-target registers so the
+                // C 2345-2347: update the previous-target registers so the
                 // suppressed divergence is not re-detected on every later
                 // pass (move-block gate, overtaken-target replay).
                 self.internal.ldvl = self.pos.dval;
@@ -616,7 +616,7 @@ impl MotorRecord {
             }
         }
 
-        // C 2351-2356: the retry counter resets only when this dispatch is
+        // C 2352-2357: the retry counter resets only when this dispatch is
         // NOT a retry — and BEFORE the LVIO check, so a refused fresh move
         // still zeroes it. A Go resume of a paused move re-enters here
         // with mip = MIP_RETRY (maybeRetry armed it at the pause stop),
@@ -756,7 +756,7 @@ impl MotorRecord {
             // C, and no dangling `dval != ldvl` re-dispatches on a
             // later SPMG pass), an armed retry collapsed, and a
             // pending pulse completed — a blinked put (special pass-0,
-            // 2582-2608) must not leave DMOV latched low with nothing
+            // 2591-2620) must not leave DMOV latched low with nothing
             // in flight to restore it.
             self.internal.ldvl = self.pos.dval;
             self.internal.lval = self.pos.val;
@@ -814,7 +814,9 @@ impl MotorRecord {
         // Captured before the load_pos update below overwrites ldvl.
         let currpos = self.internal.ldvl;
 
-        // C parity (motorRecord.cc:2469 load_pos): ldvl/lval/lrvl reflect
+        // C parity (motorRecord.cc:2469-2471, in do_work's move dispatch —
+        // load_pos latches the same three at 3776-3780, but on the LOAD_POS
+        // path, not this one): ldvl/lval/lrvl reflect
         // the target being dispatched. For in-flight same-direction retarget,
         // this keeps (dval - ldvl) in the next is_preferred_direction call
         // tracking each successive target, not only the original one.
@@ -867,7 +869,7 @@ impl MotorRecord {
 
     /// The C do_work top-block stop path, shared by the STOP field pulse,
     /// SPMG=Stop (motorRecord.cc:1871: `spmg == motorSPMG_Stop ||
-    /// stop == true`) and the rising-LVIO stop (1476-1482). Single owner
+    /// stop == true`) and the rising-LVIO stop (1475-1484). Single owner
     /// so the entries cannot drift.
     pub(super) fn stop_axis(&mut self, effects: &mut ProcessEffects) {
         let in_motion =
@@ -883,14 +885,14 @@ impl MotorRecord {
             // clear_buttons(), mip = MIP_STOP (replaced wholesale,
             // erasing MOVE/JOG/HOME/EXTERNAL bits). The VAL/DVAL/RVAL <-
             // readback sync and DMOV happen once the axis has actually
-            // stopped (postProcess, 826-849), mirrored by
+            // stopped (postProcess, 827-849), mirrored by
             // check_completion's MIP_STOP branch via postprocess_sync().
             // Syncing or finalizing eagerly here would post a transient
             // mid-deceleration snapshot before the rest position is known.
             self.internal.pp = true;
             self.internal.backlash_pending = false;
             self.clear_buttons();
-            // C 1901-1905: "When we wait for DLY, keep it. Otherwise the
+            // C 1902-1907: "When we wait for DLY, keep it. Otherwise the
             // record may lock up."
             if !self.stat.mip.contains(MipFlags::DELAY_REQ) {
                 self.stat.mip = MipFlags::STOP;
@@ -908,7 +910,7 @@ impl MotorRecord {
             // Idle with a parked jog request. C's stop branch early-
             // returns only for mip DONE/STOP/RETRY (1874-1888); a parked
             // MIP_JOG_REQ falls through to the wholesale `mip = MIP_STOP`
-            // (1901-1905) — an explicit stop kills the parked request.
+            // (1902-1907) — an explicit stop kills the parked request.
             // The button itself survives (clear_buttons runs only in the
             // movn branch, 1893), so Go can still re-arm from it.
             self.stat.mip = MipFlags::STOP;
@@ -937,7 +939,7 @@ impl MotorRecord {
         // MIP_JOGF/JOGR) and the movn branch ORs in MIP_STOP, so a queued
         // jog reads back as JOGF|STOP. The replay discriminator stays
         // internal.queued_motion — a plain STOP wholesale-replaces MIP and
-        // clears the buttons (C 1893/1903), so it never resembles this
+        // clears the buttons (C 1893/1905), so it never resembles this
         // state, and only an explicit queued request is re-fired.
         if self.stat.phase != MotionPhase::Idle && self.stat.movn {
             self.stat.mip = if forward {
@@ -1048,7 +1050,7 @@ impl MotorRecord {
 
     /// Whether the limit switch in the (user-direction-adjusted) home
     /// direction blocks a home command. C's home-section entry gate and
-    /// start check (motorRecord.cc:2010-2013): HOMF blocked by HLS when
+    /// start check (motorRecord.cc:2013-2014): HOMF blocked by HLS when
     /// DIR=Pos, by LLS when DIR=Neg; HOMR mirrored.
     fn home_blocked_by_limit(&self, forward: bool) -> bool {
         if forward == (self.conv.dir == MotorDir::Pos) {
@@ -1146,9 +1148,9 @@ impl MotorRecord {
         false
     }
 
-    /// C do_work gate (motorRecord.cc:1486-1492): do_work runs on every
+    /// C do_work gate (motorRecord.cc:1487-1492): do_work runs on every
     /// put pass (`process_reason != CALLBACK_DATA`) and on done-record
-    /// callbacks (the `dmov` arm), and its home (2010), jog (2079), and
+    /// callbacks (the `dmov` arm), and its home (2013), jog (2081), and
     /// tweak (2167-2181) sections act on latched button STATE — not on
     /// which write triggered the pass. plan_motion covers the move-block
     /// srcs and the SPMG=Go resume; this runs the same collection on the
@@ -1166,7 +1168,7 @@ impl MotorRecord {
     /// the explicit Val-arm path.
     ///
     /// After the sections, the C else-if chain end runs: the move block
-    /// (2240) whose set test replays a parked SET redefinition, the
+    /// (2241) whose set test replays a parked SET redefinition, the
     /// latent SYNC arm (2540-2544), and the implicit GET_INFO arm
     /// (2546-2557). `put_pass` is C's `proc_ind == NOTHING_DONE`: only
     /// a put/scan pass may fire the implicit GET_INFO — a CALLBACK_DATA
@@ -1181,7 +1183,7 @@ impl MotorRecord {
             return;
         }
         // C closed-loop bypass (1994-2008): its else covers only the
-        // home/jog/tweak sections (2010-2198) — the chain end below
+        // home/jog/tweak sections (2013-2197) — the chain end below
         // still runs on a closed-loop pass.
         if !self.closed_loop_dol_collection() {
             if self.dispatch_latent_buttons(effects) {
@@ -1195,7 +1197,7 @@ impl MotorRecord {
             // returns inside the section, never reaching the chain end.
             let had_tweak = self.ctrl.twf || self.ctrl.twr;
             if self.collect_tweak() {
-                // C move-block entry (2240): a zero fold (TWV = 0)
+                // C move-block entry (2241): a zero fold (TWV = 0)
                 // leaves DVAL at the lasts and the gate refuses — the
                 // pass continues to the chain end below instead.
                 if self.pos.dval != self.internal.ldvl {
@@ -1206,7 +1208,7 @@ impl MotorRecord {
                 return;
             }
         }
-        // C move block entry (2240): `dval != ldvl || !dmov` — dmov is
+        // C move block entry (2241): `dval != ldvl || !dmov` — dmov is
         // true past the gate above, so only a diverged DVAL enters.
         // Its set test (2257-2263) replays a SET redefinition parked
         // while a LOAD_POS was in flight (plan_absolute_move routes it
@@ -1402,12 +1404,12 @@ impl MotorRecord {
                 self.stop_axis(effects);
             }
             SpmgMode::Pause => {
-                // C (1898-1911): the Pause pass runs unconditionally —
+                // C (1899-1911): the Pause pass runs unconditionally —
                 // even on an idle axis it sets mip = MIP_STOP and sends
                 // STOP_AXIS ("just in case" the driver is still settling);
                 // the next completion pass collapses the bare MIP_STOP via
                 // maybeRetry's close-enough path, and Go round-trips it to
-                // DONE (1922-1925). Pause does NOT set pp — the drive
+                // DONE (1921-1925). Pause does NOT set pp — the drive
                 // fields keep the target so Go can resume. `mip =
                 // MIP_STOP` erases a queued jog (MIP_JOG_REQ) and a
                 // queued/active home (MIP_HOMF|HOMR).
@@ -1422,7 +1424,7 @@ impl MotorRecord {
                 }
                 self.internal.queued_motion = None;
                 self.internal.pending_retarget = None;
-                // C 1901-1905: `mip = MIP_STOP` — wholesale, erasing a
+                // C 1902-1907: `mip = MIP_STOP` — wholesale, erasing a
                 // parked MIP_JOG_REQ and the JOGF/HOMF bits of a queued
                 // request — except while waiting on DLY ("keep it,
                 // otherwise the record may lock up").
@@ -1453,9 +1455,9 @@ impl MotorRecord {
                 // record stuck in MIP_STOP.
                 //
                 // The Go pass FALLS THROUGH the top block into do_work's
-                // home section (2010-2076), which precedes the jog
+                // home section (2013-2076), which precedes the jog
                 // dispatch and overwrites MIP wholesale (2023) — a home
-                // button latched while paused (its 2015-2020 return kept
+                // button latched while paused (its 2016-2021 return kept
                 // it) fires here and wins over a latched jog.
                 if let Some(forward) = self.latent_home_request() {
                     self.start_home(forward, effects);
@@ -1498,7 +1500,7 @@ impl MotorRecord {
                 self.retry.rcnt = 0;
                 self.internal.queued_motion = None;
                 // Like Go, the Move pass falls through to the home
-                // section (2010-2076) before the move block — a latched
+                // section (2013-2076) before the move block — a latched
                 // home button fires instead of the move replan.
                 if let Some(forward) = self.latent_home_request() {
                     self.start_home(forward, effects);
@@ -1678,7 +1680,7 @@ impl MotorRecord {
     /// or the offset (Frozen: VAL retranslated), MIP becomes LOAD_P
     /// wholesale and DMOV pulses low (3802-3808). LOAD_POS is followed
     /// by GET_INFO — `request_poll` — and the status callback completes
-    /// the cycle (process 1404-1409: MIP_LOAD_P -> MIP_DONE, DMOV ->
+    /// the cycle (process 1405-1409: MIP_LOAD_P -> MIP_DONE, DMOV ->
     /// TRUE, no DLY and no retry evaluation).
     pub(crate) fn load_pos(&mut self, effects: &mut ProcessEffects) {
         self.internal.ldvl = self.pos.dval;
@@ -1712,22 +1714,22 @@ impl MotorRecord {
         effects.request_poll = true;
     }
 
-    /// C do_work resolution block (motorRecord.cc:1936-1991): a runtime
+    /// C do_work resolution block (motorRecord.cc:1937-1991): a runtime
     /// MRES/ERES/UEIP change re-anchors the record. USE mode loads the
     /// controller position at the redefined DVAL (load_pos, 1988-1989);
     /// SET mode arms post-process and re-reads the controller
-    /// (1980-1986), so the status callback re-derives the drive values
+    /// (1981-1987), so the status callback re-derives the drive values
     /// at the new resolution. Runs ungated by stop_or_pause — a steady
     /// SPMG Stop/Pause does not suppress it in C.
     ///
-    /// Deviation from C: SET_ENC_RATIO (1944-1968, 1973-1978) is not
+    /// Deviation from C: SET_ENC_RATIO (1946-1970, 1973-1978) is not
     /// ported — motor-rs drivers take the encoder scale from ERES at
     /// readback time, there is no per-axis ratio download. The
     /// mres/eres normalization C performs around that ratio math is
     /// kept: it is observable field state.
     pub(crate) fn dispatch_res_reanchor(&mut self, effects: &mut ProcessEffects) {
         if self.stat.msta.contains(MstaFlags::ENCODER_PRESENT) {
-            // C 1949-1958: defend the ratio math against MRES ~ 0 and
+            // C 1950-1959: defend the ratio math against MRES ~ 0 and
             // an unset ERES.
             if self.conv.mres.abs() < 1e-9 {
                 self.conv.mres = 1.0;
@@ -1824,7 +1826,7 @@ impl MotorRecord {
     /// - A put-initiated process always reaches `do_work`, even while the
     ///   axis is moving (gate at 1487-1491, `process_reason !=
     ///   CALLBACK_DATA`). The move block is *entered* on every
-    ///   `dval != ldvl || !dmov` (2240) — independent of NTM — and
+    ///   `dval != ldvl || !dmov` (2241) — independent of NTM — and
     ///   val/dval/rval take the new target, but the command dispatch
     ///   inside is gated at 2455 on `mip == MIP_DONE || mip == MIP_RETRY`,
     ///   so C never sends a new move while MIP_MOVE or MIP_STOP is
@@ -1856,7 +1858,7 @@ impl MotorRecord {
         // Only retarget during an active move, retry, or stop
         // deceleration. MIP_STOP counts as in-flight because the C stop
         // path replaces MIP wholesale (`mip = MIP_STOP`,
-        // motorRecord.cc:1903) while the axis keeps decelerating.
+        // motorRecord.cc:1905) while the axis keeps decelerating.
         let in_move = self
             .stat
             .mip
@@ -1866,7 +1868,7 @@ impl MotorRecord {
         }
         // Deliberate divergence from C: a target written during a
         // commanded stop deceleration is honored here. In C the write
-        // reaches the do_work move block (entry 2240) but the 2455
+        // reaches the do_work move block (entry 2241) but the 2455
         // dispatch gate refuses while MIP_STOP, and the completion
         // replay (motorRecord.cc:1384-1386) excludes MIP_STOP /
         // MIP_JOG_STOP, so postProcess (827-849) syncs VAL/DVAL back to
@@ -1931,7 +1933,7 @@ impl MotorRecord {
         matches!(self.ctrl.spmg, SpmgMode::Go | SpmgMode::Move)
     }
 
-    /// C clear_buttons (motorRecord.cc:4386-4413): release all four
+    /// C clear_buttons (motorRecord.cc:4386-4408): release all four
     /// latched motion buttons (JOGF/JOGR/HOMF/HOMR).
     pub(crate) fn clear_buttons(&mut self) {
         self.ctrl.jogf = false;
@@ -2069,7 +2071,7 @@ impl MotorRecord {
         if matches!(self.pending_event, Some(MotorEvent::Startup)) {
             self.pending_event = None;
             self.initialized = true;
-            // C init_record (motorRecord.cc:687-733): the first device
+            // C init_record (motorRecord.cc:690-733): the first device
             // readback runs process_motor_info(initcall), the RSTM
             // restore decision (devMotorAsyn.c init_controller), and
             // the OMSL-gated drive-triplet sync. determine_event()
@@ -2106,7 +2108,7 @@ impl MotorRecord {
         // existing latent handling owns the pass.
         if self.internal.res_reanchor && self.last_write.is_none() {
             self.internal.res_reanchor = false;
-            // C enter_do_work LVIO (1462-1483) precedes do_work.
+            // C enter_do_work LVIO (1463-1484) precedes do_work.
             if self.recompute_lvio_during_motion() {
                 let mut effects = ProcessEffects::default();
                 self.stop_axis(&mut effects);
@@ -2130,10 +2132,10 @@ impl MotorRecord {
         // what marks the pulse as started. Two states share the DMOV-
         // low/Idle/MIP-empty shape and must NOT be finalized:
         //
-        // - A put-owned pass: the C special() pass-0 blink (2582-2608)
+        // - A put-owned pass: the C special() pass-0 blink (2591-2620)
         //   drops DMOV before the record processes, so a pending
         //   last_write/UserWrite arrives here with DMOV already low —
-        //   the blink is the pass's move-block entry ticket (2240), not
+        //   the blink is the pass's move-block entry ticket (2241), not
         //   a completed pulse, and the pass must reach its dispatch arm.
         // - A parked blinked put (dval != ldvl): written under
         //   SPMG=Pause/Stop, waiting for the Go pass to dispatch — C
@@ -2183,7 +2185,7 @@ impl MotorRecord {
                 // C also runs: the gate only covers the stopped case),
                 // and the next poll evaluates completion.
                 if stup_ack && !self.stat.movn {
-                    // C do_work gate (1486-1492): the GET_INFO ack pass
+                    // C do_work gate (1487-1492): the GET_INFO ack pass
                     // still reaches do_work through the dmov arm, so a
                     // button/tweak latched while the STUP was in flight
                     // dispatches here even though completion is skipped.
@@ -2216,7 +2218,7 @@ impl MotorRecord {
                 // the live IOC this is the process cycle a put to a field
                 // that sets no last_write triggers (HLM/LLM/DHLM/DLLM are
                 // pp(TRUE) in C). C still runs the enter_do_work LVIO
-                // re-evaluation (1462-1483) on it: a limit lowered onto a
+                // re-evaluation (1463-1484) on it: a limit lowered onto a
                 // running jog must stop the axis on the write pass.
                 if self.recompute_lvio_during_motion() {
                     let mut effects = ProcessEffects::default();
@@ -2225,7 +2227,7 @@ impl MotorRecord {
                 }
                 // C process (1301-1409): a CALLBACK_DATA pass on an idle
                 // record runs the stopped branch — LOAD_P collapse
-                // (1404-1409), the pp re-sync (1396-1402), the EXTERNAL
+                // (1405-1409), the pp re-sync (1382-1402), the EXTERNAL
                 // close — before falling into do_work. determine_event
                 // consumed the status in place and left the one-pass
                 // mark; route it through check_completion so the live
@@ -2234,7 +2236,7 @@ impl MotorRecord {
                 if idle_status_pass || self.stat.mip.contains(MipFlags::EXTERNAL) {
                     self.check_completion()
                 } else {
-                    // C do_work gate (1486-1492): the put pass continues
+                    // C do_work gate (1487-1492): the put pass continues
                     // into do_work, whose home/jog/tweak sections act on
                     // latched button state and whose chain end may fire
                     // the implicit GET_INFO (2546-2557, NOTHING_DONE

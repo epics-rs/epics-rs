@@ -8,10 +8,11 @@
 //! through a per-entry tokio broadcast channel so multiple downstream
 //! clients share one upstream subscription.
 
-// RTEMS-EXEC-MODEL-ALLOW(24): checked to pass feature-ON under
-// --features rtems-exec-model,pva-gateway (the gateway's spawns/timers ride the
-// runtime::task seam). The default feature-ON gate omits `pva-gateway`, so re-run
-// that combo when touching this module.
+// RTEMS-EXEC-MODEL-ALLOW(24): checked to pass on the exec backend under
+// `EPICS_RS_BUILD_EXEC_BACKEND=thread cargo nextest run -p epics-bridge-rs
+// --features pva-gateway` (the gateway's spawns/timers ride the runtime::task
+// seam; 739 run, 739 passed on this tree). The default exec-backend gate omits
+// `pva-gateway`, so re-run that combo when touching this module.
 
 use std::collections::HashMap;
 use std::hash::Hash;
@@ -24,6 +25,7 @@ use parking_lot::Mutex;
 use tokio::sync::RwLock;
 use tokio::sync::mpsc;
 
+use epics_base_rs::runtime::task::Reactor;
 use epics_base_rs::server::access_security::AccessSecurityConfig;
 // `AccessLevel` is referenced only by the `#[cfg(test)]` `acl_level`
 // introspection helper, so the import is gated to match.
@@ -620,6 +622,7 @@ impl GatewayChannelSource {
         // each named client's `ChannelCache` by the configured cap
         // (`p2pApp/server.h:9-16`).
         let new_cache = ChannelCache::with_max_entries(
+            self.cache.reactor().clone(),
             client,
             self.cleanup_interval,
             self.per_credential_max_entries,
@@ -639,6 +642,13 @@ impl GatewayChannelSource {
         }
         pool.insert(key, new_cache.clone());
         new_cache
+    }
+
+    /// The executor this source's subscribe-bridge tasks are spawned
+    /// through. Taken from the cache the source was built over, so a
+    /// source and every cache it administers share one executor.
+    pub fn reactor(&self) -> &Reactor {
+        self.cache.reactor()
     }
 
     /// Cache handle — useful for the gateway's own diagnostics.
@@ -838,7 +848,7 @@ impl GatewayChannelSource {
         let (mpsc_tx, mpsc_rx) =
             mpsc::channel::<epics_pva_rs::server_native::RawMonitorEvent>(self.subscriber_queue);
         let counter = self.subscriber_count.clone();
-        epics_base_rs::runtime::task::spawn(async move {
+        cache.reactor().spawn(async move {
             struct CounterGuard(std::sync::Arc<std::sync::atomic::AtomicUsize>);
             impl Drop for CounterGuard {
                 fn drop(&mut self) {
@@ -953,7 +963,7 @@ impl GatewayChannelSource {
         let initial = entry.snapshot();
         let (mpsc_tx, mpsc_rx) = mpsc::channel(self.subscriber_queue);
         let counter = self.subscriber_count.clone();
-        epics_base_rs::runtime::task::spawn(async move {
+        cache.reactor().spawn(async move {
             struct CounterGuard(Arc<AtomicUsize>);
             impl Drop for CounterGuard {
                 fn drop(&mut self) {
@@ -1025,10 +1035,11 @@ impl GatewayChannelSource {
 /// path keeps the `MonitorUpdate` stream and turns the boundary into
 /// MONITOR FINISH.
 fn monitor_updates_to_values(
+    reactor: &Reactor,
     mut rx: mpsc::Receiver<epics_pva_rs::server_native::MonitorUpdate>,
 ) -> MonitorStream<PvField> {
     let (tx, out) = mpsc::channel(64);
-    epics_base_rs::runtime::task::spawn(async move {
+    reactor.spawn(async move {
         while let Some(update) = rx.recv().await {
             if update.type_changed {
                 continue;
@@ -1054,7 +1065,8 @@ impl ChannelSource for GatewayChannelSource {
         // `<prefix>:drop` / `:flush` then disconnects the live downstream
         // channels (server-initiated DESTROY_CHANNEL) instead of merely
         // ending their monitors — the downstream effect of pva2pva dropping a
-        // `ChannelCacheEntry` (`channel->destroy()` fanout, server.cpp:133).
+        // `ChannelCacheEntry` (`channel->destroy()` fanout,
+        // p2pApp/server.cpp:135).
         if self.channel_invalidator.set(invalidator.clone()).is_err() {
             // Already wired (a second attach, e.g. the same source bound to
             // two servers). The caches hold idempotent `OnceLock`s of their
@@ -1089,7 +1101,7 @@ impl ChannelSource for GatewayChannelSource {
 
     async fn has_pv(&self, name: &str) -> bool {
         // Admit a channel on upstream CONNECTION, not on a first MONITOR
-        // event. pva2pva `p2pApp/server.cpp:36-56` answers `channelFind`
+        // event. pva2pva `p2pApp/server.cpp:35-57` answers `channelFind`
         // from `ChannelCache::lookup`, which returns an entry only once
         // `channel->isConnected()` (`chancache.cpp:166-199`) — it never
         // creates a monitor. Gating admission on the monitor cache made a
@@ -1115,7 +1127,7 @@ impl ChannelSource for GatewayChannelSource {
         // Forward a real upstream GET_FIELD rather than reading the monitor
         // cache descriptor. pva2pva forwards introspection through the
         // connected channel independently of monitor setup
-        // (`p2pApp/channel.cpp:99-148`); `pvinfo` issues a one-shot
+        // (`p2pApp/channel.cpp:98-149`); `pvinfo` issues a one-shot
         // GET_FIELD that reuses the client's connection pool and no longer
         // waits on a first monitor event (see `has_pv`).
         epics_base_rs::runtime::task::timeout(
@@ -1132,8 +1144,9 @@ impl ChannelSource for GatewayChannelSource {
     /// by waiting on a monitor event, so channel setup never opens upstream
     /// monitor state under the shared identity and a connectable-but-not-
     /// monitorable PV still resolves (see `has_pv` for the pva2pva
-    /// `server.cpp:36-56` / `chancache.cpp:166-199` rationale). Anonymous
-    /// peers fall back to the shared client (`upstream_client_for` returns
+    /// `p2pApp/server.cpp:35-57` / `chancache.cpp:166-199` rationale).
+    /// Anonymous peers fall back to the shared client
+    /// (`upstream_client_for` returns
     /// `self.cache.client()`). The credential-free `has_pv` is kept for the
     /// connectionless UDP SEARCH path, which carries no identity.
     ///
@@ -1205,7 +1218,7 @@ impl ChannelSource for GatewayChannelSource {
         // client, which connects on demand and surfaces the upstream error
         // itself — exactly as `put_value_checked` does. pva2pva forwards
         // PUT through the connected upstream channel independently of
-        // monitor setup (`p2pApp/channel.cpp:99-148`); a monitor-cache
+        // monitor setup (`p2pApp/channel.cpp:98-149`); a monitor-cache
         // lookup here made a write wait on a first monitor event (see
         // `has_pv`).
         // typed pass-through — forward the PvField as-is without
@@ -1270,13 +1283,13 @@ impl ChannelSource for GatewayChannelSource {
         // Forward the downstream PUT INIT pvRequest — preserved into
         // `ctx.pv_request` (PUT INIT stash) — so upstream
         // `record._options.process`/`block` are honored. pva2pva forwards
-        // `createChannelPut(..., pvRequest)` verbatim (channel.cpp:117-127);
-        // the prior `pvput_pv_field` reissued the gateway default request,
-        // dropping process/block. The data leg still targets the `value`
-        // bit (typed pass-through, see put_value). Atomic single-upstream
-        // PUT_GET / delta forwarding (one upstream op carrying the
-        // readback) is a separate, larger change. Falls back to the
-        // default request when the downstream sent none.
+        // `createChannelPut(..., pvRequest)` verbatim
+        // (p2pApp/channel.cpp:117-127); the prior `pvput_pv_field` reissued
+        // the gateway default request, dropping process/block. The data leg
+        // still targets the `value` bit (typed pass-through, see put_value).
+        // Atomic single-upstream PUT_GET / delta forwarding (one upstream op
+        // carrying the readback) is a separate, larger change. Falls back to
+        // the default request when the downstream sent none.
         let result = match ctx.pv_request.as_ref() {
             Some(req) => {
                 client
@@ -1290,22 +1303,24 @@ impl ChannelSource for GatewayChannelSource {
 
     /// Credential-aware atomic **PUT_GET** — forward the whole operation
     /// as ONE upstream PVA `ChannelPutGet` and return its upstream
-    /// readback, instead of the default local put-then-(cached)-get.
+    /// readback, instead of the default's separate upstream round trips.
     ///
-    /// pva2pva `p2pApp/channel.cpp:129-137` implements
+    /// pva2pva `p2pApp/channel.cpp:129-138` implements
     /// `GWChannel::createChannelPutGet` by forwarding
     /// `createChannelPutGet(..., pvRequest)` verbatim to the upstream
     /// channel: the upstream IOC applies the put and produces the readback
     /// atomically under the downstream's own pvRequest
-    /// (`record._options.process`/`block`). The default
-    /// `put_delta_checked` + `get_value_checked` composition instead merged
-    /// the delta against this gateway's cached monitor snapshot and read the
-    /// post-put value back from that same cache, losing upstream atomicity
-    /// and the original request. Routing through the per-(account, method)
-    /// `upstream_client_for` keeps the downstream identity, exactly as
-    /// `put_value_checked`/`get_value_checked`/`rpc_checked` do. Plain GET
-    /// still returns the cached snapshot — this override is the only place
-    /// the PUT_GET readback diverges from that cache.
+    /// (`record._options.process`/`block`). The default composes
+    /// `put_delta_checked` with `read_checked`, and neither leg of that is
+    /// local here: the merge reads the prior through this gateway's
+    /// `get_value_checked` and the readback through its `read_checked`, both
+    /// of which forward a fresh upstream ChannelGet. So the default costs
+    /// three upstream round trips and still loses the atomicity and the
+    /// original pvRequest that one `ChannelPutGet` keeps. Routing through the
+    /// per-(account, method) `upstream_client_for` keeps the downstream
+    /// identity, exactly as
+    /// `put_value_checked`/`get_value_checked`/`rpc_checked` do. The cached
+    /// monitor snapshot backs the MONITOR seed, not this path.
     async fn put_get_checked(
         &self,
         checked: AccessChecked,
@@ -1346,7 +1361,7 @@ impl ChannelSource for GatewayChannelSource {
         // leaves the upstream marked in it (`MarkedRead::marked`), so the
         // downstream reply frames the upstream's changed-bitset rather than a
         // full mask over decoder-zero-filled leaves (pva2pva forwards the
-        // upstream readback's bitset, `p2pApp/channel.cpp:129-137`). Falls
+        // upstream readback's bitset, `p2pApp/channel.cpp:129-138`). Falls
         // back to the default request when the downstream sent none.
         let read = match ctx.pv_request.as_ref() {
             Some(req) => {
@@ -1421,7 +1436,7 @@ impl ChannelSource for GatewayChannelSource {
     /// trigger archiver-control / state-change RPCs on the upstream
     /// IOC). pva2pva classifies `createChannelRPC` write-class — it
     /// blocks RPC under `p2pReadOnly` alongside Put/Process
-    /// (`channel.cpp:140-150`) — and pvxs `sharedpv.cpp:162-179` has no
+    /// (`p2pApp/channel.cpp:140-149`) — and pvxs `sharedpv.cpp:162-179` has no
     /// built-in read-class RPC gate, so the prior READ-class gating let
     /// a read-only peer drive state-changing RPCs. On allow, the request
     /// is forwarded through the per-(account, method) upstream client
@@ -1461,10 +1476,10 @@ impl ChannelSource for GatewayChannelSource {
         // create-time pvRequest, distinct from the EXEC argument
         // (`request_desc`/`request_value`). pva2pva forwards the original
         // create-time pvRequest into `createChannelRPC(..., pvRequest)`
-        // (channel.cpp:140-148); the prior code reissued the argument as
-        // the upstream INIT pvRequest, so a provider that interprets
-        // create-time fields saw the wrong request shape. Fall back to the
-        // default empty pvRequest when the downstream sent none.
+        // (p2pApp/channel.cpp:140-149); the prior code reissued the
+        // argument as the upstream INIT pvRequest, so a provider that
+        // interprets create-time fields saw the wrong request shape. Fall
+        // back to the default empty pvRequest when the downstream sent none.
         let call = async {
             match ctx.pv_request.as_ref() {
                 Some(req) => {
@@ -1534,12 +1549,24 @@ impl ChannelSource for GatewayChannelSource {
         // existence and returns the upstream error itself.
         let client = self.upstream_client_for(&ctx);
         // Forward the downstream PROCESS INIT pvRequest — captured into
-        // `ctx.pv_request` at PROCESS INIT — upstream, matching
-        // pva2pva createChannelProcess(..., pvRequest) (channel.cpp:98-106).
+        // `ctx.pv_request` at PROCESS INIT — upstream, matching pva2pva
+        // createChannelProcess(..., pvRequest) (p2pApp/channel.cpp:98-107).
         // The prior code validated but discarded it, so an upstream
         // provider that interprets PROCESS `record._options` saw the
         // gateway's default request. Fall back to the default empty
         // pvRequest when the downstream sent none.
+        //
+        // The relay sends cmd 16, not the empty-PUT spelling that
+        // originating paths use (`Context::pvput_empty_with_request`,
+        // `pvalink/link.rs:947`), even though pvxs has no PROCESS handler
+        // and an upstream pvxs IOC drains the frame at `conn.cpp:249-253`'s
+        // `default:` without replying. pva2pva forwards the request
+        // unchanged (`p2pApp/channel.cpp:98-107`), and translating it here
+        // would show the upstream ACF and put-log a PUT where the client
+        // asked for PROCESS. The upstream silence is bounded rather than
+        // rewritten: the client's op timeout turns it into
+        // `PvaError::Timeout`, which `upstream_op_error` reports downstream.
+        // Measured in `epics-pva-rs/tests/process_drained_by_pvxs_peer.rs`.
         let result = match ctx.pv_request.as_ref() {
             Some(req) => client.pvprocess_with_request_value(name, req).await,
             None => client.pvprocess(name).await,
@@ -1549,7 +1576,7 @@ impl ChannelSource for GatewayChannelSource {
 
     // ── ChannelArray (cmd 14) — forward to the per-credential upstream ──
     //
-    // pva2pva `GWChannel::createChannelArray` (`channel.cpp:227-232`)
+    // pva2pva `GWChannel::createChannelArray` (`p2pApp/channel.cpp:226-232`)
     // forwards the array op to the upstream channel with the downstream's
     // pvRequest unchanged. We mirror that: every sub-op runs through the
     // per-credential client (so the upstream IOC sees the real downstream
@@ -1719,16 +1746,16 @@ impl ChannelSource for GatewayChannelSource {
         // legacy signature (boundary dropped — not a wire-dispatch path).
         self.subscribe_inner(self.cache.clone(), name, None)
             .await
-            .map(|(_initial, updates)| monitor_updates_to_values(updates))
+            .map(|(_initial, updates)| monitor_updates_to_values(self.reactor(), updates))
     }
 
     /// route GET through the per-credential upstream client so the
     /// upstream IOC sees the real downstream identity. Pre-fix this
     /// served `entry.snapshot()` from the monitor cache, which returned
     /// stale cached state instead of forwarding a real upstream ChannelGet
-    /// (see `get_value` for the pva2pva `channel.cpp:109-115` rationale).
-    /// The GET / PUT_GET-readback framing path: forward the upstream read
-    /// AND the leaves the upstream marked in it.
+    /// (see `get_value` for the pva2pva `p2pApp/channel.cpp:109-115`
+    /// rationale). The GET / PUT_GET-readback framing path: forward the
+    /// upstream read AND the leaves the upstream marked in it.
     ///
     /// The trait default wraps [`Self::get_value_checked`] as
     /// `marked: None` — "the source assigned everything" — which for a
@@ -1737,7 +1764,7 @@ impl ChannelSource for GatewayChannelSource {
     /// rest. Re-framing a full mask downstream would put those fabricated
     /// zeros on the wire (e.g. the seven `getProperties` never assigns).
     /// pva2pva forwards the upstream reply's own bitset
-    /// (`p2pApp/channel.cpp:109-114`), which is what the upstream marks
+    /// (`p2pApp/channel.cpp:109-115`), which is what the upstream marks
     /// carried here reproduce. A root-bit reply (upstream said "whole
     /// structure") arrives as `None` and stays `None`.
     async fn read_checked(
@@ -1772,16 +1799,17 @@ impl ChannelSource for GatewayChannelSource {
         // client so the upstream IOC sees the real downstream identity and
         // owns GET freshness — the same identity-preserving routing
         // `put_value_checked` / `rpc_checked` / `process_checked` already use.
-        // pva2pva `channel.cpp:109-115` forwards createChannelGet rather than
-        // replaying the monitor cache; the snapshot path returned stale cache
-        // state and never ran the upstream GET-side handler.
+        // pva2pva `p2pApp/channel.cpp:109-115` forwards createChannelGet
+        // rather than replaying the monitor cache; the snapshot path
+        // returned stale cache state and never ran the upstream GET-side
+        // handler.
         //
         // Carry the downstream's preserved pvRequest upstream when one was
         // sent, so a `field(...)` projection or `record._options` set on the
         // downstream GET reaches the upstream IOC verbatim — exactly what
         // `GWChannel::createChannelGet` does, forwarding the requester's
         // pvRequest to the upstream `createChannelGet`
-        // (epics-base/modules/pva2pva/p2pApp/channel.cpp:110-114). Falls back
+        // (epics-base/modules/pva2pva/p2pApp/channel.cpp:109-115). Falls back
         // to the default request when the downstream sent none, matching the
         // PUT_GET readback path above.
         let client = self.upstream_client_for(&ctx);
@@ -1810,7 +1838,7 @@ impl ChannelSource for GatewayChannelSource {
             ctx.pv_request.as_ref(),
         )
         .await
-        .map(|(_initial, updates)| monitor_updates_to_values(updates))
+        .map(|(_initial, updates)| monitor_updates_to_values(self.reactor(), updates))
     }
 
     /// route raw MONITOR through per-credential upstream cache.
@@ -1836,7 +1864,7 @@ impl ChannelSource for GatewayChannelSource {
     ///
     /// The gateway no longer fans a single default-pvRequest upstream
     /// monitor out to every subscriber for a PV name. Following pva2pva
-    /// (`p2pApp/channel.cpp:157-193`, `p2pApp/moncache.cpp:34-37,56-81`),
+    /// (`p2pApp/channel.cpp:157-224`, `p2pApp/moncache.cpp:34-43,56-102`),
     /// the upstream monitor cache is keyed by `(pv_name, serialized
     /// pvRequest)`: each distinct downstream pvRequest opens — and shares
     /// — its own upstream monitor, opened with that exact pvRequest. A
@@ -1884,8 +1912,8 @@ impl ChannelSource for GatewayChannelSource {
     /// CACHED snapshot, captured atomically with subscriber registration
     /// inside `subscribe_inner` — matching pvxs/pva2pva, which copy one
     /// cached `lastelem` per `start()` (`moncache.cpp:270-320`). The
-    /// trait default would instead seed via `get_value_checked`, which
-    /// for the gateway forwards a FRESH upstream ChannelGet (see
+    /// trait default would instead seed via `read_checked`, which for the
+    /// gateway forwards a FRESH upstream ChannelGet (like its
     /// `get_value_checked` — correct for a standalone GET, wrong for a
     /// monitor seed) AND would double-seed against this stream. `_opts`
     /// is redundant: the full request travels upstream via
@@ -1974,11 +2002,11 @@ impl ChannelSource for GatewayChannelSource {
     /// A downstream monitor must not throttle the upstream: that upstream is
     /// shared with every co-subscriber of the same (PV, credential), and a
     /// pause is not divisible. pva2pva does not throttle either — its
-    /// `MonitorCacheEntry::notify` polls the upstream dry with a bare
+    /// `MonitorCacheEntry::monitorEvent` polls the upstream dry with a bare
     /// `//TODO: flow control` where an upstream throttle would go
     /// (`moncache.cpp:133-137`) and absorbs a slow downstream in that
     /// downstream's OWN `overflowElement`, counting the coalesced updates in
-    /// `ndropped` (`:151-174`).
+    /// `ndropped` (`:157-174`).
     ///
     /// Declaring `Some((0, 0))` here is what made the R18-25 starvation
     /// reachable: it turned every downstream DATA emission into a pause vote
@@ -2018,7 +2046,7 @@ mod tests {
 
     fn make_source() -> GatewayChannelSource {
         let client = Arc::new(PvaClient::builder().build());
-        let cache = ChannelCache::new(client, Duration::from_secs(60));
+        let cache = ChannelCache::new(crate::test_reactor(), client, Duration::from_secs(60));
         GatewayChannelSource::new(cache)
     }
 
@@ -2661,8 +2689,7 @@ ASG(DEFAULT) {
     /// the single shared cache regardless of credentials.
     ///
     /// Upstream parity: pvxs p2pApp gateway source files (gw.cpp,
-    /// gwserver.cpp, gwprov.cpp) are not present in this pvxs checkout
-    /// (noted in doc/pvxs-functional-security-review-2026-05-18.md:27),
+    /// gwserver.cpp, gwprov.cpp) are not present in this pvxs checkout,
     /// but the wire-compatible expectation is stated in the spec:
     /// "the chosen trust boundary must be explicit" — the gateway must
     /// not silently conflate per-client upstream authorization into a

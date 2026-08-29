@@ -12,8 +12,8 @@
 //! a 20-member group at a 10 Hz posting rate put ~400 task wakes/second on
 //! the band every other PV's monitor delivery uses, collapsing group
 //! delivery to ~0.35 Hz and stalling an unrelated scalar monitor for up to
-//! 16.9 s on the RTEMS target (doc/qsrv-rtems-design.md §9.14). This module
-//! is the structural fix: member events stay queued in their own
+//! 16.9 s on the RTEMS target. This module is the structural fix: member
+//! events stay queued in their own
 //! [`EvQue`](epics_base_rs::server::event_queue::EvQue)s and ONE drain —
 //! shared by every group subscription on the server — consumes them,
 //! assembles the atomic snapshot and posts the group update. Tasks woken
@@ -33,8 +33,8 @@
 //! Medium task (all per-PV monitor forwarding dead) and never slept
 //! (SCHED_FIFO 64 busy on a single core — every thread below it starved,
 //! protocol echo included). One group subscription wedged the whole server,
-//! permanently (doc/qsrv-rtems-design.md §9.15). A dedicated thread removes
-//! the failure class instead of relocating it: the drain parks on its own
+//! permanently. A dedicated thread removes the failure class instead of
+//! relocating it: the drain parks on its own
 //! stack, occupies no shared worker, and runs BELOW the connection threads
 //! so even a saturated drain cannot preempt protocol traffic — see
 //! [`QSRV_GROUP_PUMP_PRIORITY`].
@@ -95,7 +95,8 @@
 //! sets unioned (pvxs's monitor FIFO squash). Push therefore never blocks,
 //! so one slow subscriber cannot stall the drain for other groups.
 
-// RTEMS-EXEC-MODEL-ALLOW(7): checked - these run and pass in the feature-ON suite.
+// RTEMS-EXEC-MODEL-ALLOW(7): checked - these run and pass in the exec-backend
+// suite.
 
 use std::collections::BTreeMap;
 use std::collections::VecDeque;
@@ -926,7 +927,7 @@ mod tests {
     /// thread, `db_start_events` at `groupsource.cpp:96`) it passes without
     /// the band ever becoming free. Exec backend only: on the tokio backend
     /// `spawn_blocking` goes to a large pool and pins nothing.
-    #[cfg(feature = "rtems-exec-model")]
+    #[cfg(exec_backend)]
     #[tokio::test]
     async fn drain_delivers_while_the_medium_band_worker_is_occupied() {
         // Pin the Medium band's ONLY worker (DEFAULT_THREADS_PER_PRIORITY

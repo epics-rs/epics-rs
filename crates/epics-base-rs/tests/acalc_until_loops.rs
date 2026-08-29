@@ -4,7 +4,7 @@
 //!
 //! aCalc carries its own copy of sCalc's UNTIL machinery: the element table
 //! compiles `UNTIL` (`aCalcPostfix.c:200`), `aCalcPerform` pre-scans the postfix
-//! for UNTIL locations (`:349-390`), and the evaluator implements both halves:
+//! for UNTIL locations (`:345-386`), and the evaluator implements both halves:
 //!
 //! ```c
 //! case UNTIL:

@@ -1,5 +1,13 @@
 //! InProcessClient: direct enum pass-through to PortHandle (no serialization).
 
+// RTEMS-EXEC-MODEL-ALLOW(6): checked, not waived — all 6 ran and passed
+// on the exec backend (measured on this tree:
+// `EPICS_RS_BUILD_EXEC_BACKEND=thread cargo nextest run -p asyn-rs
+// --all-features`, 1081/1081). asyn-rs became a census subject when its
+// `build.rs` began deriving `tokio_backend`; nothing here builds a CA
+// server, and the reactor these obtain comes from `#[tokio::test]`
+// itself, which the backend does not remove.
+
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -96,7 +104,7 @@ impl RuntimeClient for InProcessClient {
         Box::pin(async move {
             let (tx, rx) = tokio::sync::mpsc::channel(256);
 
-            tokio::spawn(async move {
+            crate::runtime::task::spawn(async move {
                 loop {
                     // Exit promptly when the consumer drops its receiver,
                     // rather than parking on `recv()` until the broadcast

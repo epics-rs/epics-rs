@@ -4,8 +4,8 @@ DBR (DataBase Request) types are the typed payload format for CA
 operations. This document is a reference for what each DBR type looks
 like on the wire and how `epics-ca-rs` encodes/decodes them.
 
-The codec lives in `epics-base-rs/src/types/codec.rs` and the type
-table in `epics-base-rs/src/types/dbr.rs`.
+The codec lives in `crates/epics-base-rs/src/types/codec.rs` and the
+type table in `crates/epics-base-rs/src/types/dbr.rs`.
 
 ## Native types
 
@@ -47,7 +47,8 @@ dbr_type = family_offset + native_index
 | Alarm | 35..37 | – | special, see below | – |
 
 `native_type_for_dbr(code)` maps any DBR code back to its
-`DbFieldType` for codec dispatch (`dbr.rs:121`).
+`DbFieldType` for codec dispatch
+(`crates/epics-base-rs/src/types/dbr.rs:449`).
 
 ## Wire format per family
 
@@ -137,8 +138,9 @@ lower_warning_limit
 lower_alarm_limit
 ```
 
-Source: `epics-base-rs/src/types/codec.rs::encode_gr` plus its
-helpers (`encode_units_limits_*`, `encode_prec_units_limits_*`).
+Source: `crates/epics-base-rs/src/types/codec.rs::write_gr_meta`
+(`:633`) plus its helpers (`encode_units_limits_*`,
+`encode_prec_units_limits_*`).
 
 ### CTRL (28..34)
 
@@ -193,7 +195,8 @@ acks:      u16 BE  (2 B)   ← from record's ACKS field, 0 if SimplePv
 value:     40 B (string)
 ```
 
-Total = 48 B. `AlarmInfo` (`epics-base-rs/src/server/snapshot.rs`)
+Total = 48 B. `AlarmInfo`
+(`crates/epics-base-rs/src/server/snapshot.rs`)
 gained `ackt: Option<u16>` and `acks: Option<u16>` fields to carry
 this through. The TCP read handler populates them from the record
 just before encoding:
@@ -215,10 +218,13 @@ substitutes 0.
 
 ## Codec internals
 
-### `encode_dbr(dbr_type, snapshot)` (`codec.rs:173`)
+### `encode_dbr(dbr_type, snapshot)`
+(`crates/epics-base-rs/src/types/codec.rs:538`)
 
 The single entry point used by every server-side READ_NOTIFY /
-EVENT_ADD path:
+EVENT_ADD path. It is a thin wrapper over `encode_dbr_into` (`:565`),
+which is where the dispatch sketched below actually lives — callers that
+already own the destination buffer encode into it directly:
 
 ```rust
 pub fn encode_dbr(
@@ -233,8 +239,8 @@ pub fn encode_dbr(
         0..=6   => Ok(val_bytes),
         7..=13  => serialize_sts(...),
         14..=20 => serialize_time(...),
-        21..=27 => encode_gr(...),
-        28..=34 => encode_ctrl(...),
+        21..=27 => write_gr_meta(...),
+        28..=34 => write_ctrl_meta(...),
         DBR_PUT_ACKT | DBR_PUT_ACKS => Ok(val_bytes),       // write-only, no-op encode
         DBR_STSACK_STRING => /* 48-byte layout above */,
         _       => Err(CaError::UnsupportedType(dbr_type)),
@@ -280,7 +286,7 @@ configured large enough on both ends; default is 16 MB
 
 To add support for a new DBR type code:
 
-1. Define the constant in `epics-base-rs/src/types/dbr.rs`.
+1. Define the constant in `crates/epics-base-rs/src/types/dbr.rs`.
 2. Add a branch in `dbr_native_index` so it maps to a sensible native
    type for codec dispatch.
 3. Add an arm in `encode_dbr` (and `decode_dbr` if it's read-back).
@@ -288,7 +294,8 @@ To add support for a new DBR type code:
 5. Update server `tcp.rs` handlers (`CA_PROTO_READ_NOTIFY`,
    `CA_PROTO_WRITE_NOTIFY`, `CA_PROTO_EVENT_ADD`) to special-case the
    new type if it doesn't follow the family pattern.
-6. Add a wire-layout test in `epics-base-rs/tests/types_tests.rs`
+6. Add a wire-layout test in
+   `crates/epics-base-rs/tests/types_tests.rs`
    asserting the byte layout matches the C reference.
 
 ## Common pitfalls

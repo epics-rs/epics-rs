@@ -10,6 +10,13 @@
 //!
 //! Needs the `ioc` feature — without it there is no CA client to build a
 //! feeder from, and the file is compiled away.
+#![cfg_attr(exec_backend, allow(unused_imports))]
+// This file's other cases are pure record-layer `#[test]`s; only the one
+// gated below builds a real CA server, which the reactor-free
+// `exec_backend` — selected on a host build by
+// `EPICS_RS_BUILD_EXEC_BACKEND=thread`, and unconditionally on RTEMS and
+// VxWorks — does not have. Gated per item rather than per file so the
+// record-layer cases keep compiling in that configuration.
 #![cfg(feature = "ioc")]
 
 use std::sync::Arc;
@@ -20,7 +27,9 @@ use ad_core_rs::driver::ndarray_driver::{
     ATTR_STATUS_OK, ATTR_STATUS_XML_SYNTAX_ERROR, NDArrayDriverBase,
 };
 use epics_base_rs::server::records::ai::AiRecord;
+#[cfg(tokio_backend)]
 use epics_ca_rs::client::CaClient;
+#[cfg(tokio_backend)]
 use epics_ca_rs::server::CaServer;
 
 const PV: &str = "ADATTR:Temp";
@@ -69,6 +78,7 @@ fn an_epics_pv_attribute_with_no_ca_client_stays_undefined_and_says_so() {
 }
 
 /// The dispatched defect: with a client installed, the attribute tracks its PV.
+#[cfg(tokio_backend)]
 #[tokio::test]
 async fn an_epics_pv_attribute_is_fed_from_the_installed_ca_client() {
     let server = CaServer::builder()

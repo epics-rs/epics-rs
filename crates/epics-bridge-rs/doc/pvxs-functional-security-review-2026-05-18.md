@@ -6,7 +6,7 @@
 
 - Rust: `crates/epics-bridge-rs`
 - Rust PVA runtime: `crates/epics-pva-rs`
-- C++ 기준: `/Users/stevek/codes/pvxs`
+- C++ 기준: `$PVXS_HOME`
 
 ## 기준
 
@@ -24,7 +24,31 @@
 - 로그 문구, 내부 통계 이름, 내부 helper/API 배치
 - pvxs보다 엄격한 에러 반환. 단, 정상 클라이언트의 표준 요청을 깨지 않아야 한다.
 
-참고: 이 checkout의 `/Users/stevek/codes/pvxs`에는 `p2pApp`/`pva2pva` gateway 소스가 보이지 않는다. 그래서 PVA gateway 항목은 pvxs PVA client/server wire 동작과 Rust gateway 구현을 비교했다.
+참고: 이 checkout의 `$PVXS_HOME`에는 `p2pApp`/`pva2pva` gateway 소스가 보이지 않는다. 그래서 PVA gateway 항목은 pvxs PVA client/server wire 동작과 Rust gateway 구현을 비교했다.
+
+## C reference pins
+
+Every C/C++ citation in this file resolves at the tree and revision below,
+not at whatever the env-var checkout holds today — those checkouts run ahead
+of their pins, so a citation checked against one can be graded wrong while
+being right, or graded right after drifting into a neighbouring construct.
+The resolve-by-symbol rule, the shared-basename rule and the verification of
+each pin are in `c-reference-pins.md`.
+
+| tree | pinned revision | cited here |
+| --- | --- | --- |
+| `pvxs` | `1.5.1-42-gb568e93` | `clientget.cpp`, `credentials.cpp`, `fieldconfig.h`, `groupconfigprocessor.cpp`, `groupsource.cpp`, `iocsource.cpp`, `securityclient.cpp`, `serverget.cpp`, `servermon.cpp`, `singlesource.cpp`, `typeutils.cpp`, `test/testqgroup.cpp`, `test/testqsingle.cpp`, `test/testpvalink.cpp`, and the `ioc/pvalink*` set |
+
+`pvalink.h`, every `pvalink_*.cpp` and `testpvalink.cpp` also exist in
+`pva2pva`, so the basename alone resolves in the wrong file without failing.
+This review is pvxs-only (`비교 대상: C++ 기준 $PVXS_HOME`), so every one of
+them means the pvxs copy; each already carries its in-tree path.
+
+Rust `*.rs` citations are in-repo and carry no pin: they resolve at the
+current worktree, not at the commit this review was written on. Where the
+reviewed code has since been fixed, moved or replaced, the line names the
+construct that now carries the behaviour and the sentence says so.
+
 
 ## Cleared (this round, 2026-05-19)
 
@@ -33,40 +57,57 @@ they are kept in `## Findings` below for historical context. Every
 cleared item ships with a regression test referenced in the commit
 message.
 
-- BR-R1 (commit 4068559) — QSRV native PVA path preserves client identity (channel cache removed; `_checked` overrides thread `ctx.account`/`ctx.host`).
-- BR-R2 (commit 399d81c) — single-record channels honor `record.FIELD`; field DBF type drives DBR/NT shape.
-- BR-R3 (commit 183fce3) — PUT honors INIT pvRequest `record._options.process` / `block` via `ChannelContext.pv_request`.
-- BR-R5 (commit 9d3b4cc) — MONITOR honors `record._options.DBE` via the same pvRequest channel.
-- BR-R9 (commit 3609a18) — IOC launcher installs `AcfAccessControl` on the QSRV `BridgeProvider`.
-- BR-R16 (commit baabe20) — group GET/PUT honor pvRequest `record._options.atomic`.
-- BR-R17 (commit baabe20) — group PUT performs per-member ACF check; any denial fails the whole PUT.
-- BR-R20 (commit 0eb62a8) — process=passive vs force vs inhibit routed faithfully (`put_pv` vs `put_record_field_from_ca` vs `put_pv + process_record`).
-- BR-R22 (commit 24aca4c) — NTEnum uses `int32` index + `display.description`.
-- BR-R25 (commit c14e17d) — group root meta member `""` flattens `alarm`/`timeStamp` into the group root.
-- BR-R26 (commit 0eb62a8) — group `+const` accepted (with `+value` legacy fallback).
-- BR-R30 (commit 9513a56) — group members without `+putorder` are non-writable (pvxs sentinel).
-- BR-R31 (commit 0eb62a8) — group PUT rejects link-class field targets before any write fires.
-- BR-R32 (commit a1e8bb3) — ACF CALC-gated rule disable surfaces a `WARN` at parse time (still fails closed; loud divergence).
-- BR-R35 (commit 8e898b3) — `Snapshot` honors `info(Q:time:tag, "nsec:lsb:N")`; low N nanosecond bits split into `timeStamp.userTag`.
-- BR-R36 (commit 21dde24) — single-record monitor uses VALUE|ALARM + separate PROPERTY subscription.
-- BR-R37 (commit 7c87eb1) — RPC with query args requires WRITE access.
-- BR-R38 (commit 5687a6e) — PVA `PROCESS` actually runs the record's processing chain (rejects on group/native PVA PV).
-- BR-R39 (commit 2b9316a) — decoded MONITOR initial event encodes with pvRequest mask, not `BitSet::all_set`.
-- BR-R19 (commit c455586) — pvalink `time=true` adopts upstream NT timestamp; new `external_link_time` consumer in `process_record_with_links_inner`.
-- BR-R23 (commit 1fcef4c) — pvalink INP conversion covers every pvData scalar-array variant (Float / Short / UByte / Byte / String / Long / UInt / ULong / Boolean), including `ScalarArrayTyped` from the typed-fast-path decoder.
-- BR-R28 (commit 27f9a59) — pvalink `proc=CPP` (scanOnUpdatePassive) skips processing when owning record SCAN is not Passive.
-- BR-R29 (commit 2688162) — group default `+trigger` is SelfOnly (new `TriggerDef` variant), not All. Wire BitSet narrowing for SelfOnly is the residual gap.
-- BR-R33 (commit 552957f) — group GET/MONITOR carries `record._options.queueSize` + `atomic` at root; per-op queueSize negotiation is the residual gap.
-- BR-R34 (commit 46a3e24) — group monitors include `DBE_LOG` (archive-class) in the per-member value mask; LOG-only posts now wake the group `poll()`.
-- BR-R40 (commit eb88b3b) — QSRV accepts pvxs channel-filter syntax `PV.VAL{...}`; chain attaches per-subscription via new `subscribe_with_mask_and_filters`.
-- BR-R42 (commit fad743a) — gateway raw monitor signals upstream descriptor change as a subscription boundary; downstream gets MONITOR FINISH instead of bytes encoded for the new (incompatible) descriptor.
-- BR-R43 (commit fc59c1f) — pvalink monitor pvRequest always sends `pipeline` + `atomic=true` + `queueSize` (matches pvxs `pvaLink::makeRequest`).
-- BR-R44 (commit 8e67167) — gateway raw monitor reencodes on byte-order mismatch instead of silently dropping every event.
-- BR-R4 (commit db9a79e4) — QSRV ACF adapter carries method/authority/roles/field ASL; `AcfAccessControl` builds pvxs-style credential list; `read_brace_list` extended with quoted-string support for `"role/groupname"` UAG entries.
+- BR-R1 **CLEARED** (`40685592`) — QSRV native PVA path preserves client identity (channel cache removed; `_checked` overrides thread `ctx.account`/`ctx.host`).
+- BR-R2 **CLEARED** (`399d81c4`) — single-record channels honor `record.FIELD`; field DBF type drives DBR/NT shape.
+- BR-R3 **CLEARED** (`183fce3e`) — PUT honors INIT pvRequest `record._options.process` / `block` via `ChannelContext.pv_request`.
+- BR-R5 **CLEARED** (`9d3b4cc7`) — MONITOR honors `record._options.DBE` via the same pvRequest channel.
+- BR-R9 **CLEARED** (`3609a18f`) — IOC launcher installs `AcfAccessControl` on the QSRV `BridgeProvider`.
+- BR-R16 **CLEARED** (`baabe200`) — group GET/PUT honor pvRequest `record._options.atomic`.
+- BR-R17 **CLEARED** (`baabe200`) — group PUT performs per-member ACF check; any denial fails the whole PUT.
+- BR-R20 **CLEARED** (`0eb62a8a`) — process=passive vs force vs inhibit routed faithfully (`put_pv` vs `put_record_field_from_ca` vs `put_pv + process_record`).
+- BR-R22 **CLEARED** (`24aca4cf`) — NTEnum uses `int32` index + `display.description`.
+- BR-R25 **CLEARED** (`c14e17db`) — group root meta member `""` flattens `alarm`/`timeStamp` into the group root.
+- BR-R26 **CLEARED** (`0eb62a8a`) — group `+const` accepted (with `+value` legacy fallback).
+- BR-R30 **CLEARED** (`9513a564`) — group members without `+putorder` are non-writable (pvxs sentinel).
+- BR-R31 **CLEARED** (`0eb62a8a`) — group PUT rejects link-class field targets before any write fires.
+- BR-R32 **CLEARED** (`a1e8bb3a`) — ACF CALC-gated rule disable surfaces a `WARN` at parse time (still fails closed; loud divergence).
+- BR-R35 **CLEARED** (`8e898b36`) — `Snapshot` honors `info(Q:time:tag, "nsec:lsb:N")`; low N nanosecond bits split into `timeStamp.userTag`.
+- BR-R36 **CLEARED** (`21dde249`) — single-record monitor uses VALUE|ALARM + separate PROPERTY subscription.
+- BR-R37 **CLEARED** (`7c87eb10`) — RPC with query args requires WRITE access.
+- BR-R38 **CLEARED** (`5687a6e4`) — PVA `PROCESS` actually runs the record's processing chain (rejects on group/native PVA PV).
+- BR-R39 **CLEARED** (`2b9316aa`) — decoded MONITOR initial event encodes with pvRequest mask, not `BitSet::all_set`.
+- BR-R19 **CLEARED** (`c455586a`) — pvalink `time=true` adopts upstream NT timestamp; new `external_link_time` consumer in `process_record_with_links_inner`.
+- BR-R23 **CLEARED** (`1fcef4ce`) — pvalink INP conversion covers every pvData scalar-array variant (Float / Short / UByte / Byte / String / Long / UInt / ULong / Boolean), including `ScalarArrayTyped` from the typed-fast-path decoder.
+- BR-R28 **CLEARED** (`27f9a596`) — pvalink `proc=CPP` (scanOnUpdatePassive) skips processing when owning record SCAN is not Passive.
+- BR-R29 **CLEARED** (`26881621`) — group default `+trigger` is SelfOnly (new `TriggerDef` variant), not All. Wire BitSet narrowing for SelfOnly is the residual gap. The residual wire BitSet narrowing for SelfOnly landed later in `ee250057`.
+- BR-R33 **CLEARED** (`552957fc`) — group GET/MONITOR carries `record._options.queueSize` + `atomic` at root; per-op queueSize negotiation is the residual gap. The residual per-op queueSize negotiation landed later in `16309573`.
+- BR-R34 **CLEARED** (`46a3e247`) — group monitors include `DBE_LOG` (archive-class) in the per-member value mask; LOG-only posts now wake the group `poll()`.
+- BR-R40 **CLEARED** (`eb88b3b7`) — QSRV accepts pvxs channel-filter syntax `PV.VAL{...}`; chain attaches per-subscription via new `subscribe_with_mask_and_filters`.
+- BR-R42 **CLEARED** (`fad743a2`) — gateway raw monitor signals upstream descriptor change as a subscription boundary; downstream gets MONITOR FINISH instead of bytes encoded for the new (incompatible) descriptor.
+- BR-R43 **CLEARED** (`fc59c1f6`) — pvalink monitor pvRequest always sends `pipeline` + `atomic=true` + `queueSize` (matches pvxs `pvaLink::makeRequest`).
+- BR-R44 **CLEARED** (`8e671674`) — gateway raw monitor reencodes on byte-order mismatch instead of silently dropping every event.
+- BR-R4 **CLEARED** (`db9a79e4`) — QSRV ACF adapter carries method/authority/roles/field ASL; `AcfAccessControl` builds pvxs-style credential list; `read_brace_list` extended with quoted-string support for `"role/groupname"` UAG entries.
 
-Remaining open: R6, R7, R8, R10, R11, R12, R13, R14, R15,
-R18, R21, R24, R27, R41, the BR-R29 wire BitSet narrowing for
-SelfOnly, the BR-R33 per-op queueSize negotiation (14 findings).
+## Cleared on the 2026-05-19 driver punchlist
+
+The fourteen this file listed as remaining were taken up on
+`punchlist-2026-05-19.md` and are all closed there, each with a named
+regression; the two residual gaps noted above closed on the same list.
+
+- BR-R6 **CLEARED** (`4b7c87eb`) — gateway typed PUT pass-through replaces the string `pvput` round-trip; regression `br_r6_gateway_typed_put_passthrough`.
+- BR-R7 **CLEARED** (`52308402`) — bounded LRU upstream credential pool, cap 256, with `set_max_upstream_identities`; regression `br_r7_gateway_credential_pool_bounded`.
+- BR-R8 **CLEARED** (`273d9a1d`) — the gateway records the downstream method and authority as an `AssertedIdentity` on its upstream client; regressions `br_r8_x509_downstream_recorded_as_asserted_identity` and `br_r8_ca_downstream_records_ca_method`.
+- BR-R10 **CLEARED** (`dd80cdcd`) — DB JSON pvalink options survive on the parsed link as a query string; regressions `br_r10_json_pva_options_preserved_in_parsed_link` and two siblings.
+- BR-R11 **CLEARED** (`a198da48`) — pvalink OUT preserves `field`, `proc`, `block` and the deferred-write option; regression `br_r11_pvalink_out_options_preserved`.
+- BR-R12 **CLEARED** (`ad6331ed`) — NTScalar and NTScalarArray metadata shape matches pvxs; regressions `br_r12_array_metadata_shape_matches_pvxs` and `br_r12_string_value_omits_numeric_metadata`.
+- BR-R13 **CLEARED** (`21ec21dc`) — unsigned 64-bit fields reach PVA as `ulong` through a new `DbFieldType::UInt64`; four `br_r13_` regressions.
+- BR-R14 **CLEARED** (`15cc8be4`) — event-affecting monitor options are rejected at the gateway while field projection stays transparent, extended by `107bda3a`; regression `br_r14_field_projection_is_not_event_affecting`.
+- BR-R15 **CLEARED** (`b093d49e`) — atomic group PUT runs under the unified `record_lock` registry; regressions `br_r15_atomic_group_excludes_direct_member_write` and `br_r15_atomic_put_blocks_on_member_record_gates`.
+- BR-R18 **CLEARED** (`eff1848f`) — the pvalink atomic scan holds one multi-record lock epoch across the target loop; regression `br_r18_atomic_scan_holds_multi_record_lock_epoch`.
+- BR-R21 **CLEARED** (`6f9d26c6`) — gateway GET and MONITOR route through the per-credential upstream cache; regression `br_r21_gateway_monitor_credential_scoping`.
+- BR-R24 **CLEARED** (`142aa474`) — the `LinkSet` metadata hook exposes remote display, control and valueAlarm; regressions `br_r24_link_metadata_surfaces_remote_display_control_valuealarm` and one sibling.
+- BR-R27 **CLEARED** (`285a24e1`) — the pvalink cache key carries per-link `field` and option state; regression `br_r27_pvalink_cache_separates_per_link_options`.
+- BR-R41 **CLEARED** (`e314bb8a`) — the decoded monitor fallback fans out past the initial snapshot; regression `br_r41_typed_subscribe_delivers_updates`.
 
 ## Findings
 
@@ -83,7 +124,7 @@ Evidence:
 - `crates/epics-pva-rs/src/server_native/source.rs:55` default `ChannelSource::access()` returns an open gate.
 - `crates/epics-pva-rs/src/server/pva_server.rs:86` says custom `ChannelSource` users must install ACF themselves.
 - `crates/epics-bridge-rs/src/qsrv/pva_adapter.rs:611` constructs `PvaServer::from_parts(... config.acf ...)`, but `:620` runs with the custom `QsrvPvStore`.
-- pvxs preserves per-client credentials in `/Users/stevek/codes/pvxs/ioc/credentials.cpp:26` and checks them with AS in `/Users/stevek/codes/pvxs/ioc/securityclient.cpp:19`.
+- pvxs preserves per-client credentials in `$PVXS_HOME/ioc/credentials.cpp:26` and checks them with AS in `$PVXS_HOME/ioc/securityclient.cpp:19`.
 
 Impact:
 
@@ -109,8 +150,8 @@ Evidence:
 - `crates/epics-bridge-rs/src/qsrv/channel.rs:203` reads `snapshot_for_field("VAL")`.
 - `crates/epics-bridge-rs/src/qsrv/channel.rs:251` writes `record.VAL` for process=false.
 - `crates/epics-bridge-rs/src/qsrv/channel.rs:260` writes field `"VAL"` for process/default PUT.
-- pvxs opens the exact requested dbChannel in `/Users/stevek/codes/pvxs/ioc/singlesource.cpp:421`.
-- pvxs tests field PVs such as `test:ai.DESC`, `test:ai.SCAN`, and `test:ai.RVAL` in `/Users/stevek/codes/pvxs/test/testqsingle.cpp:151`.
+- pvxs opens the exact requested dbChannel in `$PVXS_HOME/ioc/singlesource.cpp:431`.
+- pvxs tests field PVs such as `test:ai.DESC`, `test:ai.SCAN`, and `test:ai.RVAL` in `$PVXS_HOME/test/testqsingle.cpp:151`.
 
 Impact:
 
@@ -136,8 +177,8 @@ Evidence:
 - `crates/epics-pva-rs/src/server_native/tcp.rs:2313` decodes PUT INIT pvRequest.
 - `crates/epics-pva-rs/src/server_native/tcp.rs:2443` stores `OpState`, but only keeps mask/filter/pipeline/autoExec-like state.
 - `crates/epics-pva-rs/src/server_native/tcp.rs:2677` decodes the data-phase PUT value and calls `put_delta_checked(...)` at `:2713`.
-- pvxs reads `record._options.process` from the INIT pvRequest in `/Users/stevek/codes/pvxs/ioc/iocsource.cpp:429`.
-- pvxs tests `record[process=true|false|passive]` in `/Users/stevek/codes/pvxs/test/testqsingle.cpp:572` and `record[block=true]` in `:645`.
+- pvxs reads `record._options.process` from the INIT pvRequest in `$PVXS_HOME/ioc/iocsource.cpp:430`.
+- pvxs tests `record[process=true|false|passive]` in `$PVXS_HOME/test/testqsingle.cpp:572` and `record[block=true]` in `:645`.
 
 Impact:
 
@@ -160,8 +201,8 @@ Evidence:
 - `crates/epics-bridge-rs/src/qsrv/provider.rs:71` receives only `(channel, user, host)`.
 - `crates/epics-bridge-rs/src/qsrv/provider.rs:79` calls `check_access_method(..., 0, "anonymous", "")`.
 - `crates/epics-bridge-rs/src/qsrv/provider.rs:89` resolves only the record ASG and ignores final field ASL.
-- pvxs preserves method-specific credentials and roles in `/Users/stevek/codes/pvxs/ioc/credentials.cpp:31`.
-- pvxs supplies field ASL to access security through `dbChannelFldDes(ch)->as_level` in `/Users/stevek/codes/pvxs/ioc/securityclient.cpp:25`.
+- pvxs preserves method-specific credentials and roles in `$PVXS_HOME/ioc/credentials.cpp:31`.
+- pvxs supplies field ASL to access security through `dbChannelFldDes(ch)->as_level` in `$PVXS_HOME/ioc/securityclient.cpp:25`.
 
 Impact:
 
@@ -184,8 +225,8 @@ Evidence:
 - `crates/epics-bridge-rs/src/qsrv/monitor.rs:91` subscribes with `DbSubscription::subscribe(&self.db, &self.record_name)`.
 - `crates/epics-bridge-rs/src/qsrv/pva_adapter.rs:486` creates monitor subscriptions without passing monitor pvRequest options.
 - `crates/epics-pva-rs/src/server_native/source.rs:645` `subscribe()` takes only a PV name.
-- pvxs parses `record._options.DBE` in `/Users/stevek/codes/pvxs/ioc/singlesource.cpp:115`.
-- pvxs uses the selected DBE mask for the value subscription in `/Users/stevek/codes/pvxs/ioc/singlesource.cpp:155`.
+- pvxs parses `record._options.DBE` in `$PVXS_HOME/ioc/singlesource.cpp:115`.
+- pvxs uses the selected DBE mask for the value subscription in `$PVXS_HOME/ioc/singlesource.cpp:155`.
 
 Impact:
 
@@ -210,7 +251,7 @@ Evidence:
 - `crates/epics-bridge-rs/src/pva_gateway/source.rs:376` repeats the string conversion for credential-aware PUT.
 - `crates/epics-bridge-rs/src/pva_gateway/source.rs:753` supports only scalar/scalar-array and structures with a field literally named `value`.
 - `crates/epics-pva-rs/src/client_native/context.rs:432` already exposes `pvput_pv_field()` for typed PUT.
-- pvxs client PUT sends typed wire value through `to_wire_valid(R, temp)` in `/Users/stevek/codes/pvxs/src/clientget.cpp:297`.
+- pvxs client PUT sends typed wire value through `to_wire_valid(R, temp)` in `$PVXS_HOME/src/clientget.cpp:297`.
 
 Impact:
 
@@ -310,8 +351,8 @@ Evidence:
 - `crates/epics-bridge-rs/src/pvalink/config.rs:148` parses Rust-specific query-style `pva://PV?...` options, but the DB JSON object has already been reduced before this config parser can see it.
 - `crates/epics-bridge-rs/src/pvalink/integration.rs:233` has `open_link_for_record()`, but `rg open_link_for_record` shows only tests and no DB-loader/record-init caller.
 - `crates/epics-bridge-rs/src/qsrv/pva_adapter.rs:590` installs the pvalink resolver, but does not scan loaded records and register the full DB link object.
-- pvxs parses the JSON pvalink option set in `/Users/stevek/codes/pvxs/ioc/pvalink_jlif.cpp:24`.
-- pvxs test coverage requires JSON `field` in `/Users/stevek/codes/pvxs/test/testpvalink.cpp:88`, JSON `proc` in `:111`, and JSON `sevr` in `:137`.
+- pvxs parses the JSON pvalink option set in `$PVXS_HOME/ioc/pvalink_jlif.cpp:24`.
+- pvxs test coverage requires JSON `field` in `$PVXS_HOME/test/testpvalink.cpp:89`, JSON `proc` in `:112`, and JSON `sevr` in `:138`.
 
 Impact:
 
@@ -339,10 +380,10 @@ Evidence:
 - `crates/epics-bridge-rs/src/pvalink/link.rs:318` sends array OUT values via `client.pvput_pv_field(&self.config.pv_name, value)`.
 - `crates/epics-pva-rs/src/client_native/ops_v2.rs:427` makes default `op_put()` call `op_put_inner(..., None, ...)`.
 - `crates/epics-pva-rs/src/client_native/ops_v2.rs:646` turns a missing raw pvRequest into `build_pv_request_value_only()`, so no `record._options.process` or `block` reaches the upstream server.
-- pvxs builds a PUT pvRequest containing `record._options.block` and `record._options.process` in `/Users/stevek/codes/pvxs/ioc/pvalink_channel.cpp:31`.
-- pvxs computes `process` from each link's `proc` option in `/Users/stevek/codes/pvxs/ioc/pvalink_channel.cpp:237`.
-- pvxs sends the raw request on the upstream PUT in `/Users/stevek/codes/pvxs/ioc/pvalink_channel.cpp:268`.
-- pvxs queues and waits for OUT puts through `/Users/stevek/codes/pvxs/ioc/pvalink_lset.cpp:594`.
+- pvxs builds a PUT pvRequest containing `record._options.block` and `record._options.process` in `$PVXS_HOME/ioc/pvalink_channel.cpp:31`.
+- pvxs computes `process` from each link's `proc` option in `$PVXS_HOME/ioc/pvalink_channel.cpp:237`.
+- pvxs sends the raw request on the upstream PUT in `$PVXS_HOME/ioc/pvalink_channel.cpp:268`.
+- pvxs queues and waits for OUT puts through `$PVXS_HOME/ioc/pvalink_lset.cpp:594`.
 
 Impact:
 
@@ -368,11 +409,11 @@ Evidence:
 - `crates/epics-bridge-rs/src/qsrv/pvif.rs:495` represents `display.form` as scalar `int`, not `enum_t`.
 - `crates/epics-bridge-rs/src/qsrv/pvif.rs:501` builds `control` limits as `double`.
 - `crates/epics-bridge-rs/src/qsrv/pvif.rs:566` builds `valueAlarm` with only four double limit fields.
-- pvxs expects scalar `display.form` to be `enum_t` with `index` and `choices` in `/Users/stevek/codes/pvxs/test/testqsingle.cpp:100`.
-- pvxs expects scalar `valueAlarm` fields including `active`, alarm severities, and `hysteresis` in `/Users/stevek/codes/pvxs/test/testqsingle.cpp:116`.
-- pvxs expects NTScalarArray `display`, `control`, and `valueAlarm` in `/Users/stevek/codes/pvxs/test/testqsingle.cpp:354`.
-- pvxs expects integer array metadata limits to use integer scalar types, for example `int32_t` in `/Users/stevek/codes/pvxs/test/testqsingle.cpp:399`.
-- pvxs expects unsigned 64-bit array metadata limits to use `uint64_t` in `/Users/stevek/codes/pvxs/test/testqsingle.cpp:530`.
+- pvxs expects scalar `display.form` to be `enum_t` with `index` and `choices` in `$PVXS_HOME/test/testqsingle.cpp:100`.
+- pvxs expects scalar `valueAlarm` fields including `active`, alarm severities, and `hysteresis` in `$PVXS_HOME/test/testqsingle.cpp:116`.
+- pvxs expects NTScalarArray `display`, `control`, and `valueAlarm` in `$PVXS_HOME/test/testqsingle.cpp:354`.
+- pvxs expects integer array metadata limits to use integer scalar types, for example `int32_t` in `$PVXS_HOME/test/testqsingle.cpp:399`.
+- pvxs expects unsigned 64-bit array metadata limits to use `uint64_t` in `$PVXS_HOME/test/testqsingle.cpp:530`.
 
 Impact:
 
@@ -399,8 +440,8 @@ Evidence:
 - `crates/epics-base-rs/src/server/records/waveform.rs:133` documents waveform menu indices including `UINT64=8`.
 - `crates/epics-base-rs/src/server/records/waveform.rs:137` maps FTVL `1|2`, `3|4`, `5|6`, and `9`; FTVL `7` / `8` fall through to `DoubleArray`.
 - `crates/epics-base-rs/src/server/record/record_instance.rs:642` documents `UTAG` as C `DBF_UINT64` but models it as signed `Int64`.
-- pvxs tests `uint64_t` scalar/array behavior in `/Users/stevek/codes/pvxs/test/testqsingle.cpp:511`.
-- pvxs expects `test:wf:u64` to return `uint64_t[]` and `uint64_t` metadata in `/Users/stevek/codes/pvxs/test/testqsingle.cpp:530`.
+- pvxs tests `uint64_t` scalar/array behavior in `$PVXS_HOME/test/testqsingle.cpp:511`.
+- pvxs expects `test:wf:u64` to return `uint64_t[]` and `uint64_t` metadata in `$PVXS_HOME/test/testqsingle.cpp:530`.
 
 Impact:
 
@@ -452,9 +493,9 @@ Evidence:
 - `crates/epics-bridge-rs/src/qsrv/group.rs:650` serializes only same-group Rust PUTs with `atomic_write_lock`.
 - `crates/epics-bridge-rs/src/qsrv/group.rs:657` documents that plain CA/PVA writes to backing records are not gated by that lock.
 - `crates/epics-bridge-rs/src/qsrv/group.rs:694` applies member writes one at a time after conversion.
-- pvxs creates DBManyLock objects for group value/properties channels in `/Users/stevek/codes/pvxs/ioc/groupconfigprocessor.cpp:1165`.
-- pvxs atomic GET holds `DBManyLocker` over the group value lock in `/Users/stevek/codes/pvxs/ioc/groupsource.cpp:444`.
-- pvxs atomic PUT holds `DBManyLocker` over the group value lock in `/Users/stevek/codes/pvxs/ioc/groupsource.cpp:569`.
+- pvxs creates DBManyLock objects for group value/properties channels in `$PVXS_HOME/ioc/groupconfigprocessor.cpp:1165`.
+- pvxs atomic GET holds `DBManyLocker` over the group value lock in `$PVXS_HOME/ioc/groupsource.cpp:492`.
+- pvxs atomic PUT holds `DBManyLocker` over the group value lock in `$PVXS_HOME/ioc/groupsource.cpp:621`.
 
 Impact:
 
@@ -479,8 +520,8 @@ Evidence:
 - `crates/epics-bridge-rs/src/qsrv/group.rs:634` parses PUT options through `PutOptions::from_pv_request()`.
 - `crates/epics-bridge-rs/src/qsrv/channel.rs:41` defines `PutOptions` with only `process` and `block`.
 - `crates/epics-bridge-rs/src/qsrv/group.rs:640` chooses PUT atomicity from `self.def.atomic`, not the operation pvRequest.
-- pvxs GET starts with the group default and lets `record._options.atomic` override it in `/Users/stevek/codes/pvxs/ioc/groupsource.cpp:433`.
-- pvxs PUT does the same in `/Users/stevek/codes/pvxs/ioc/groupsource.cpp:539`.
+- pvxs GET starts with the group default and lets `record._options.atomic` override it in `$PVXS_HOME/ioc/groupsource.cpp:480-481`.
+- pvxs PUT does the same in `$PVXS_HOME/ioc/groupsource.cpp:203-204`.
 
 Impact:
 
@@ -505,10 +546,10 @@ Evidence:
 - `crates/epics-bridge-rs/src/qsrv/group.rs:705` calls `put_record_field_from_ca(record_name, field_name, epics_val)`.
 - `crates/epics-bridge-rs/src/qsrv/group.rs:710` calls `put_pv(&format!("{record_name}.{field_name}"), epics_val)`.
 - There is no per-member ACF check between the group-level `can_write()` and the backing record writes.
-- pvxs creates per-field security clients for the caller credentials in `/Users/stevek/codes/pvxs/ioc/groupsource.cpp:161`.
-- pvxs initializes each security client from the member `dbChannel` in `/Users/stevek/codes/pvxs/ioc/groupsource.cpp:174`.
-- pvxs performs field pre-processing through the per-member `SecurityClient` before the write in `/Users/stevek/codes/pvxs/ioc/groupsource.cpp:515`.
-- pvxs also runs `IOCSource::doPreProcessing()` for each member before group PUT in `/Users/stevek/codes/pvxs/ioc/groupsource.cpp:550`.
+- pvxs creates per-field security clients for the caller credentials in `$PVXS_HOME/ioc/groupsource.cpp:215-216`.
+- pvxs initializes each security client from the member `dbChannel` in `$PVXS_HOME/ioc/groupsource.cpp:219-221`.
+- pvxs performs field pre-processing through the per-member `SecurityClient` before the write in `$PVXS_HOME/ioc/groupsource.cpp:565`.
+- pvxs also runs `IOCSource::doPreProcessing()` for each member before group PUT in `$PVXS_HOME/ioc/groupsource.cpp:600`.
 
 Impact:
 
@@ -532,8 +573,8 @@ Evidence:
 - `crates/epics-bridge-rs/src/pvalink/integration.rs:551` sorts scan targets so atomic targets run first.
 - `crates/epics-bridge-rs/src/pvalink/integration.rs:566` processes each target record one by one.
 - `crates/epics-bridge-rs/src/pvalink/integration.rs:581` calls `process_record_with_links()` per record with no multi-record lock.
-- pvxs groups atomic pvalink scan targets and builds `DBManyLock` over their records in `/Users/stevek/codes/pvxs/ioc/pvalink_channel.cpp:386`.
-- pvxs holds `DBManyLocker` while scanning atomic targets in `/Users/stevek/codes/pvxs/ioc/pvalink_channel.cpp:422`.
+- pvxs groups atomic pvalink scan targets and builds `DBManyLock` over their records in `$PVXS_HOME/ioc/pvalink_channel.cpp:386`.
+- pvxs holds `DBManyLocker` while scanning atomic targets in `$PVXS_HOME/ioc/pvalink_channel.cpp:422`.
 
 Impact:
 
@@ -553,11 +594,11 @@ Severity: Medium functional
 
 Evidence:
 
-- pvxs documents the pvalink `time` option in `/Users/stevek/codes/pvxs/ioc/pvalink_jlif.cpp:35`.
-- pvxs parses `time` as a boolean in `/Users/stevek/codes/pvxs/ioc/pvalink_jlif.cpp:104`.
-- pvxs latches the remote NT timestamp during `pvaGetValue()` in `/Users/stevek/codes/pvxs/ioc/pvalink_lset.cpp:394`.
-- pvxs copies the latched remote timestamp into the owning record when `time` is set in `/Users/stevek/codes/pvxs/ioc/pvalink_lset.cpp:427`.
-- pvxs tests the link timestamp contract in `/Users/stevek/codes/pvxs/test/testpvalink.cpp:387` and `/Users/stevek/codes/pvxs/test/testpvalink.cpp:412`.
+- pvxs documents the pvalink `time` option in `$PVXS_HOME/ioc/pvalink_jlif.cpp:35`.
+- pvxs parses `time` as a boolean in `$PVXS_HOME/ioc/pvalink_jlif.cpp:104`.
+- pvxs latches the remote NT timestamp during `pvaGetValue()` in `$PVXS_HOME/ioc/pvalink_lset.cpp:394`.
+- pvxs copies the latched remote timestamp into the owning record when `time` is set in `$PVXS_HOME/ioc/pvalink_lset.cpp:427`.
+- pvxs tests the link timestamp contract in `$PVXS_HOME/test/testpvalink.cpp:387` and `$PVXS_HOME/test/testpvalink.cpp:412`.
 - `crates/epics-bridge-rs/src/pvalink/config.rs:70` defines `PvaLinkConfig` without a `time` field.
 - `crates/epics-bridge-rs/src/pvalink/config.rs:176` parses `field`, then later options, but no `time` option.
 - `crates/epics-base-rs/src/server/database/link_set.rs:87` has a `time_stamp()` hook.
@@ -586,9 +627,9 @@ Evidence:
 - `crates/epics-bridge-rs/src/qsrv/channel.rs:78` maps unsupported strings and `"passive"` to `ProcessMode::Passive`.
 - `crates/epics-bridge-rs/src/qsrv/channel.rs:247` handles `ProcessMode::Force | ProcessMode::Passive` through the same write path.
 - `crates/epics-base-rs/src/server/database/field_io.rs:653` always calls `process_record_with_links()` after `put_record_field_from_ca()`.
-- pvxs reads PUT pvRequest options in `/Users/stevek/codes/pvxs/ioc/singlesource.cpp:339` and calls `IOCSource::setForceProcessingFlag()`.
-- pvxs maps `record._options.process == "passive"` to the unset force-processing state in `/Users/stevek/codes/pvxs/ioc/iocsource.cpp:429`.
-- pvxs only post-processes passive PUTs when the target field has `process_passive`, the record `SCAN` is Passive, the final DBR type is below `DBR_PUT_ACKT`, or the target is `PROC`, in `/Users/stevek/codes/pvxs/ioc/iocsource.cpp:397`.
+- pvxs reads PUT pvRequest options in `$PVXS_HOME/ioc/singlesource.cpp:339` and calls `IOCSource::setForceProcessingFlag()`.
+- pvxs maps `record._options.process == "passive"` to the unset force-processing state in `$PVXS_HOME/ioc/iocsource.cpp:440-443`.
+- pvxs only post-processes passive PUTs when the target field has `process_passive`, the record `SCAN` is Passive, the final DBR type is below `DBR_PUT_ACKT`, or the target is `PROC`, in `$PVXS_HOME/ioc/iocsource.cpp:397`.
 
 Impact:
 
@@ -643,8 +684,8 @@ Evidence:
 - `crates/epics-bridge-rs/src/qsrv/pvif.rs:330` builds the QSRV NTEnum descriptor.
 - `crates/epics-bridge-rs/src/qsrv/pvif.rs:339` declares `value.index` as `ScalarType::UShort`.
 - `crates/epics-pva-rs/src/nt/enum_t.rs:29` builds NTEnum with `value.index` as `ScalarType::Int` and includes `display.description`.
-- pvxs QSRV single-record tests expect `value.index int32_t` and `display.description` in `/Users/stevek/codes/pvxs/test/testqsingle.cpp:174`.
-- pvxs monitor tests expect enum monitor deltas with `value.index int32_t` and `display.description` in `/Users/stevek/codes/pvxs/test/testqsingle.cpp:790`.
+- pvxs QSRV single-record tests expect `value.index int32_t` and `display.description` in `$PVXS_HOME/test/testqsingle.cpp:174`.
+- pvxs monitor tests expect enum monitor deltas with `value.index int32_t` and `display.description` in `$PVXS_HOME/test/testqsingle.cpp:790`.
 
 Impact:
 
@@ -668,9 +709,9 @@ Evidence:
 - `crates/epics-bridge-rs/src/pvalink/integration.rs:783` supports scalar arrays only when the first element is `Double` or `Int`.
 - `crates/epics-bridge-rs/src/pvalink/integration.rs:815` rejects other array element types.
 - `crates/epics-bridge-rs/src/pvalink/integration.rs:822` converts unsigned scalar values by narrowing to signed `Long` or `Short`.
-- pvxs pvalink handles string arrays and numeric array DBR types including signed/unsigned 8/16/32/64-bit, float32, and float64 in `/Users/stevek/codes/pvxs/ioc/pvalink_lset.cpp:287`.
-- pvxs tests cover numeric array conversion in `/Users/stevek/codes/pvxs/test/testpvalink.cpp:235`.
-- pvxs tests cover string array pvalink reads in `/Users/stevek/codes/pvxs/test/testpvalink.cpp:260`.
+- pvxs pvalink handles string arrays and numeric array DBR types including signed/unsigned 8/16/32/64-bit, float32, and float64 in `$PVXS_HOME/ioc/pvalink_lset.cpp:287`.
+- pvxs tests cover numeric array conversion in `$PVXS_HOME/test/testpvalink.cpp:235`.
+- pvxs tests cover string array pvalink reads in `$PVXS_HOME/test/testpvalink.cpp:260`.
 
 Impact:
 
@@ -696,8 +737,8 @@ Evidence:
 - `crates/epics-bridge-rs/src/pvalink/integration.rs:711` implements alarm-severity propagation.
 - `crates/epics-bridge-rs/src/pvalink/integration.rs:727` implements timestamp access.
 - `rg "GraphicLimits|ControlLimits|AlarmLimits|Precision|Units|Nelements|DBFtype" crates/epics-base-rs/src/server/database crates/epics-base-rs/src/server/record crates/epics-bridge-rs/src/pvalink` finds no lset-style metadata hooks.
-- pvxs installs `pvaGetDBFtype`, `pvaGetElements`, `pvaGetControlLimits`, `pvaGetGraphicLimits`, `pvaGetAlarmLimits`, `pvaGetPrecision`, and `pvaGetUnits` in `/Users/stevek/codes/pvxs/ioc/pvalink_lset.cpp:700`.
-- pvxs tests require linked graphic/control/alarm limits, precision, units, and element count in `/Users/stevek/codes/pvxs/test/testpvalink.cpp:416`.
+- pvxs installs `pvaGetDBFtype`, `pvaGetElements`, `pvaGetControlLimits`, `pvaGetGraphicLimits`, `pvaGetAlarmLimits`, `pvaGetPrecision`, and `pvaGetUnits` in `$PVXS_HOME/ioc/pvalink_lset.cpp:700`.
+- pvxs tests require linked graphic/control/alarm limits, precision, units, and element count in `$PVXS_HOME/test/testpvalink.cpp:416`.
 
 Impact:
 
@@ -724,8 +765,8 @@ Evidence:
 - `crates/epics-bridge-rs/src/qsrv/group.rs:195` returns immediately when `set_nested_field_desc()` receives an empty path.
 - `crates/epics-bridge-rs/src/qsrv/group.rs:357` reads each member and calls `set_nested_field(&mut pv, &member.field_name, field)`.
 - `crates/epics-bridge-rs/src/qsrv/group.rs:811` builds descriptors through `set_nested_field_desc()`.
-- pvxs uses root meta mapping in `/Users/stevek/codes/pvxs/test/ntenum.db:6` with `"":{+type:"meta", +channel:"VAL"}`.
-- pvxs group tests expect root `alarm` and `timeStamp` for that NTEnum in `/Users/stevek/codes/pvxs/test/testqgroup.cpp:168` and monitor updates in `:201`.
+- pvxs uses root meta mapping in `$PVXS_HOME/test/ntenum.db:6` with `"":{+type:"meta", +channel:"VAL"}`.
+- pvxs group tests expect root `alarm` and `timeStamp` for that NTEnum in `$PVXS_HOME/test/testqgroup.cpp:168` and monitor updates in `:201`.
 
 Impact:
 
@@ -737,7 +778,7 @@ An empty-path `+type:"meta"` member should merge its metadata fields into the gr
 
 Fix direction:
 
-Teach empty-path meta to merge `alarm` and `timeStamp` into the root value and descriptor instead of no-oping. Do not generalize that behavior blindly to root `+type:"const"`; pvxs currently rejects root const in `/Users/stevek/codes/pvxs/ioc/groupconfigprocessor.cpp:596`.
+Teach empty-path meta to merge `alarm` and `timeStamp` into the root value and descriptor instead of no-oping. Do not generalize that behavior blindly to root `+type:"const"`; pvxs currently rejects root const in `$PVXS_HOME/ioc/groupconfigprocessor.cpp:596`.
 
 ### BR-R26. QSRV group constant syntax uses `+value`, not pvxs `+const`
 
@@ -748,9 +789,9 @@ Evidence:
 - `crates/epics-bridge-rs/src/qsrv/group_config.rs:70` documents constant values as coming from `+value`.
 - `crates/epics-bridge-rs/src/qsrv/group_config.rs:290` requires `+value` for `+type=const`.
 - `crates/epics-bridge-rs/src/qsrv/group_config.rs:713` tests the Rust-only `+value` spelling.
-- pvxs JSON group config uses `{"+type":"const", "+const":3}` in `/Users/stevek/codes/pvxs/test/qgroup.json:1`.
-- pvxs DB group config uses `+const` in `/Users/stevek/codes/pvxs/test/const.db:2`.
-- pvxs tests exercise constant group output in `/Users/stevek/codes/pvxs/test/testqgroup.cpp:682`.
+- pvxs JSON group config uses `{"+type":"const", "+const":3}` in `$PVXS_HOME/test/qgroup.json:1`.
+- pvxs DB group config uses `+const` in `$PVXS_HOME/test/const.db:2`.
+- pvxs tests exercise constant group output in `$PVXS_HOME/test/testqgroup.cpp:682`.
 
 Impact:
 
@@ -776,10 +817,10 @@ Evidence:
 - `crates/epics-bridge-rs/src/pvalink/integration.rs:294` overwrites that per-PV config when another link to the same PV is opened.
 - `crates/epics-bridge-rs/src/pvalink/integration.rs:340` starts the notification forwarder with `link.config().field`, so the first cached link's field selector drives change detection for all scan targets on that PV.
 - `crates/epics-bridge-rs/src/pvalink/link.rs:242` and `:260` extract the cached link's configured field from read paths.
-- pvxs keeps per-link options in `pvaLinkConfig` fields including `fieldName`, `queueSize`, `proc`, `sevr`, `time`, `retry`, `atomic`, and `monorder` in `/Users/stevek/codes/pvxs/ioc/pvalink.h:65`.
-- pvxs shares an upstream channel by `(channelName, pvRequest)` in `/Users/stevek/codes/pvxs/ioc/pvalink_lset.cpp:99`, while each attached `pvaLink` still keeps its own `fieldName`.
-- pvxs resolves each link's own `fieldName` from the shared root in `/Users/stevek/codes/pvxs/ioc/pvalink_link.cpp:91`.
-- pvxs tests use two pvalinks to the same PV with different fields `a` and `b` in `/Users/stevek/codes/pvxs/test/testpvalink.db:174`.
+- pvxs keeps per-link options in `pvaLinkConfig` fields including `fieldName`, `queueSize`, `proc`, `sevr`, `time`, `retry`, `atomic`, and `monorder` in `$PVXS_HOME/ioc/pvalink.h:65`.
+- pvxs shares an upstream channel by `(channelName, pvRequest)` in `$PVXS_HOME/ioc/pvalink_lset.cpp:99`, while each attached `pvaLink` still keeps its own `fieldName`.
+- pvxs resolves each link's own `fieldName` from the shared root in `$PVXS_HOME/ioc/pvalink_link.cpp:91`.
+- pvxs tests use two pvalinks to the same PV with different fields `a` and `b` in `$PVXS_HOME/test/testpvalink.db:174`.
 
 Impact:
 
@@ -802,8 +843,8 @@ Evidence:
 - `crates/epics-bridge-rs/src/pvalink/config.rs:189` and `:193` parse `CP` and `CPP` into the same `monitor=true` / `scan_on_update=true` state.
 - `crates/epics-bridge-rs/src/pvalink/integration.rs:115` stores scan targets with `always`, `monorder`, and `atomic`, but no `CP` vs `CPP` passive flag.
 - `crates/epics-bridge-rs/src/pvalink/integration.rs:566` processes every selected target after a changed monitor event, with no `SCAN=Passive` check.
-- pvxs distinguishes `CP` from `CPP` in `/Users/stevek/codes/pvxs/ioc/pvalink_link.cpp:122`: `CP` returns `scanOnUpdateYes`, while `CPP` returns `scanOnUpdatePassive`.
-- pvxs applies the passive check in `/Users/stevek/codes/pvxs/ioc/pvalink_channel.cpp:313`: `CPP` skips processing when `prec->scan != 0`.
+- pvxs distinguishes `CP` from `CPP` in `$PVXS_HOME/ioc/pvalink_link.cpp:122`: `CP` returns `scanOnUpdateYes`, while `CPP` returns `scanOnUpdatePassive`.
+- pvxs applies the passive check in `$PVXS_HOME/ioc/pvalink_channel.cpp:313`: `CPP` skips processing when `prec->scan != 0`.
 
 Impact:
 
@@ -826,10 +867,10 @@ Evidence:
 - `crates/epics-bridge-rs/src/qsrv/group_config.rs:309` maps a missing `+trigger` to `TriggerDef::All`.
 - `crates/epics-bridge-rs/src/qsrv/group_config.rs:475` tests that missing `+trigger` means `All`.
 - `crates/epics-bridge-rs/src/qsrv/group.rs:1146` treats `TriggerDef::All` and `TriggerDef::Fields(_)` the same.
-- pvxs defaults groups with no trigger mappings to individual self-trigger updates in `/Users/stevek/codes/pvxs/ioc/groupconfigprocessor.cpp:323`.
-- pvxs expands explicit trigger targets in `/Users/stevek/codes/pvxs/ioc/groupconfigprocessor.cpp:381`.
-- pvxs monitor callbacks update the triggered field list, not all fields unconditionally, in `/Users/stevek/codes/pvxs/ioc/groupsource.cpp:280`.
-- pvxs tests require the no-`+trigger` NTEnum group update to contain only `value.index`, not `timeStamp`, in `/Users/stevek/codes/pvxs/test/testqgroup.cpp:220`.
+- pvxs defaults groups with no trigger mappings to individual self-trigger updates in `$PVXS_HOME/ioc/groupconfigprocessor.cpp:327-338`.
+- pvxs expands explicit trigger targets in `$PVXS_HOME/ioc/groupconfigprocessor.cpp:381`.
+- pvxs monitor callbacks update the triggered field list, not all fields unconditionally, in `$PVXS_HOME/ioc/groupsource.cpp:328-346`.
+- pvxs tests require the no-`+trigger` NTEnum group update to contain only `value.index`, not `timeStamp`, in `$PVXS_HOME/test/testqgroup.cpp:220`.
 
 Impact:
 
@@ -852,10 +893,10 @@ Evidence:
 - `crates/epics-bridge-rs/src/qsrv/group_config.rs:316` defaults missing `+putorder` to `0`.
 - `crates/epics-bridge-rs/src/qsrv/group.rs:637` orders every member by `put_order`.
 - `crates/epics-bridge-rs/src/qsrv/group.rs:670` and `:723` write any present non-const/non-structure member; there is no "no putorder" sentinel.
-- pvxs defaults `MappingInfo::putOrder` to `std::numeric_limits<int64_t>::min()` in `/Users/stevek/codes/pvxs/ioc/fieldconfig.h:37`.
-- pvxs treats that sentinel as not putable in `/Users/stevek/codes/pvxs/ioc/groupsource.cpp:503`; marked writes without putorder are ignored with a warning.
-- pvxs `batch.db` deliberately omits `+putorder` from field `C` to prevent writes in `/Users/stevek/codes/pvxs/test/batch.db:19`.
-- pvxs tests PUT `C.value=4.0` and expect the group sum to ignore it in `/Users/stevek/codes/pvxs/test/testqgroup.cpp:725`.
+- pvxs defaults `MappingInfo::putOrder` to `std::numeric_limits<int64_t>::min()` in `$PVXS_HOME/ioc/fieldconfig.h:37`.
+- pvxs treats that sentinel as not putable in `$PVXS_HOME/ioc/groupsource.cpp:555,559-560`; marked writes without putorder are ignored with a warning.
+- pvxs `batch.db` deliberately omits `+putorder` from field `C` to prevent writes in `$PVXS_HOME/test/batch.db:19`.
+- pvxs tests PUT `C.value=4.0` and expect the group sum to ignore it in `$PVXS_HOME/test/testqgroup.cpp:725`.
 
 Impact:
 
@@ -879,7 +920,7 @@ Evidence:
 - `crates/epics-base-rs/src/types/dbr.rs:73` has only native scalar DBF types; link DBF classes are not represented as distinct `DbFieldType` variants.
 - `crates/epics-bridge-rs/src/qsrv/group.rs:564` falls back to a member DBF type and `:597` converts scalar input for that type.
 - `crates/epics-bridge-rs/src/qsrv/group.rs:703` and `:752` write group members through `put_record_field_from_ca()` without a link-field guard.
-- pvxs rejects group PUT preparation for `DBF_INLINK..DBF_FWDLINK` fields in `/Users/stevek/codes/pvxs/ioc/groupsource.cpp:548`.
+- pvxs rejects group PUT preparation for `DBF_INLINK..DBF_FWDLINK` fields in `$PVXS_HOME/ioc/groupsource.cpp:603-605`.
 
 Impact:
 
@@ -903,8 +944,8 @@ Evidence:
 - `crates/epics-base-rs/src/server/access_security.rs:368` marks unevaluable rules inert, and notes that `CALC` clauses cannot be evaluated because this crate has no `INP*` link resolution.
 - `crates/epics-base-rs/src/server/access_security.rs:404` stores `INP(A..U)` declarations but does not resolve their values.
 - `crates/epics-base-rs/src/server/access_security.rs:2164` tests that a `CALC("A=1")` rule is disabled and grants no access.
-- pvxs QSRV installs EPICS Base access-security clients through `asAddClient()` in `/Users/stevek/codes/pvxs/ioc/securityclient.cpp:19`.
-- pvxs QSRV write checks delegate to EPICS Base `asCheckPut()` in `/Users/stevek/codes/pvxs/ioc/securityclient.cpp:42`, so EPICS Base conditional ASG rules are part of the observed access decision.
+- pvxs QSRV installs EPICS Base access-security clients through `asAddClient()` in `$PVXS_HOME/ioc/securityclient.cpp:19`.
+- pvxs QSRV write checks delegate to EPICS Base `asCheckPut()` in `$PVXS_HOME/ioc/securityclient.cpp:42`, so EPICS Base conditional ASG rules are part of the observed access decision.
 
 Impact:
 
@@ -927,9 +968,9 @@ Evidence:
 - `crates/epics-bridge-rs/src/qsrv/group.rs:333` creates a group value with only the configured group `struct_id`.
 - `crates/epics-bridge-rs/src/qsrv/group.rs:357` and `:366` add member fields directly; no `record._options` branch is added by `read_group()`.
 - `crates/epics-bridge-rs/src/qsrv/group.rs:1082`, `:1126`, `:1143`, and `:1153` use `read_group()` for monitor snapshots, so monitor events have the same omission.
-- pvxs obtains the negotiated monitor queue stats in `/Users/stevek/codes/pvxs/ioc/groupsource.cpp:356`.
-- pvxs writes `record._options.queueSize` and `record._options.atomic` into the group monitor value in `/Users/stevek/codes/pvxs/ioc/groupsource.cpp:359`.
-- pvxs posts that value through `subscriptionControl->post(currentValue.clone())` in `/Users/stevek/codes/pvxs/ioc/groupsource.cpp:235`.
+- pvxs obtains the negotiated monitor queue stats in `$PVXS_HOME/ioc/groupsource.cpp:401-402`.
+- pvxs writes `record._options.queueSize` and `record._options.atomic` into the group monitor value in `$PVXS_HOME/ioc/groupsource.cpp:404-405`.
+- pvxs posts that value through `subscriptionControl->post(currentValue.clone())` in `$PVXS_HOME/ioc/groupsource.cpp:279`.
 
 Impact:
 
@@ -952,8 +993,8 @@ Evidence:
 - `crates/epics-bridge-rs/src/qsrv/group.rs:1006` builds the group value subscription mask.
 - `crates/epics-bridge-rs/src/qsrv/group.rs:1007` subscribes to `EventMask::VALUE | EventMask::ALARM` only.
 - `crates/epics-base-rs/src/server/recgbl.rs:39` defines `EventMask::VALUE`, and `:40` defines `EventMask::LOG`, the Rust DBE_LOG/DBE_ARCHIVE equivalent.
-- pvxs subscribes group value events with `DBE_VALUE | DBE_ALARM | DBE_ARCHIVE` in `/Users/stevek/codes/pvxs/ioc/groupsource.cpp:389`.
-- pvxs single-source logic explicitly treats archive events as value updates in `/Users/stevek/codes/pvxs/ioc/singlesource.cpp:85`.
+- pvxs subscribes group value events with `DBE_VALUE | DBE_ALARM | DBE_ARCHIVE` in `$PVXS_HOME/ioc/groupsource.cpp:433-434`.
+- pvxs single-source logic explicitly treats archive events as value updates in `$PVXS_HOME/ioc/singlesource.cpp:86-87`.
 
 Impact:
 
@@ -977,9 +1018,9 @@ Evidence:
 - `crates/epics-base-rs/src/server/record/record_instance.rs:322` builds snapshots from the record value and common timestamp.
 - `crates/epics-base-rs/src/server/snapshot.rs:89` defaults `Snapshot::user_tag` to zero, and the snapshot path does not read `Q:time:tag`.
 - `crates/epics-bridge-rs/src/qsrv/pvif.rs:447` encodes `timeStamp.userTag` directly from `Snapshot::user_tag`.
-- pvxs parses `info(Q:time:tag)` into `MappingInfo::nsecMask` in `/Users/stevek/codes/pvxs/ioc/typeutils.cpp:79`.
-- pvxs masks nanoseconds and extracts the low bits into `timeStamp.userTag` in `/Users/stevek/codes/pvxs/ioc/iocsource.cpp:240`.
-- pvxs tests the single-record behavior with `test:nsec` in `/Users/stevek/codes/pvxs/test/testqsingle.cpp:277`.
+- pvxs parses `info(Q:time:tag)` into `MappingInfo::nsecMask` in `$PVXS_HOME/ioc/typeutils.cpp:79`.
+- pvxs masks nanoseconds and extracts the low bits into `timeStamp.userTag` in `$PVXS_HOME/ioc/iocsource.cpp:240`.
+- pvxs tests the single-record behavior with `test:nsec` in `$PVXS_HOME/test/testqsingle.cpp:277`.
 
 Impact:
 
@@ -1001,10 +1042,10 @@ Evidence:
 
 - `crates/epics-bridge-rs/src/qsrv/monitor.rs:91` starts a single-record monitor with `DbSubscription::subscribe(&self.db, &self.record_name)`.
 - `crates/epics-base-rs/src/server/database/db_access.rs:250` maps that default subscription to `EventMask::VALUE | EventMask::LOG`.
-- pvxs parses requested `record._options.DBE` in `/Users/stevek/codes/pvxs/ioc/singlesource.cpp:117`.
-- pvxs defaults an empty DBE selection to `DBE_VALUE | DBE_ALARM` in `/Users/stevek/codes/pvxs/ioc/singlesource.cpp:142`.
-- pvxs then creates a value subscription with that mask in `/Users/stevek/codes/pvxs/ioc/singlesource.cpp:155`.
-- pvxs also creates a separate `DBE_PROPERTY` subscription in `/Users/stevek/codes/pvxs/ioc/singlesource.cpp:161`.
+- pvxs parses requested `record._options.DBE` in `$PVXS_HOME/ioc/singlesource.cpp:117`.
+- pvxs defaults an empty DBE selection to `DBE_VALUE | DBE_ALARM` in `$PVXS_HOME/ioc/singlesource.cpp:142`.
+- pvxs then creates a value subscription with that mask in `$PVXS_HOME/ioc/singlesource.cpp:155`.
+- pvxs also creates a separate `DBE_PROPERTY` subscription in `$PVXS_HOME/ioc/singlesource.cpp:162-167`.
 
 Impact:
 
@@ -1029,9 +1070,9 @@ Evidence:
 - `crates/epics-bridge-rs/src/qsrv/pva_adapter.rs:431` enters the write path when the query is non-empty.
 - `crates/epics-bridge-rs/src/qsrv/pva_adapter.rs:447` calls `channel.put(&put)` from the RPC handler.
 - `crates/epics-pva-rs/src/server_native/source.rs:326` allows RPC when `checked.allows_read()` is true, and `:335` delegates to `self.rpc(...)`.
-- pvxs single-record QSRV registers `onGet` and `onPut` in `/Users/stevek/codes/pvxs/ioc/singlesource.cpp:315` and `:325`, but no `onRPC`.
-- pvxs group QSRV registers `onGet` and `onPut` in `/Users/stevek/codes/pvxs/ioc/groupsource.cpp:157` and `:167`, but no `onRPC`.
-- pvxs returns `RPC Not Implemented` when a channel has no RPC handler in `/Users/stevek/codes/pvxs/src/serverget.cpp:482`.
+- pvxs single-record QSRV registers `onGet` and `onPut` in `$PVXS_HOME/ioc/singlesource.cpp:315` and `:334`, but no `onRPC`.
+- pvxs group QSRV registers `onGet` and `onPut` in `$PVXS_HOME/ioc/groupsource.cpp:194` and `:211`, but no `onRPC`.
+- pvxs returns `RPC Not Implemented` when a channel has no RPC handler in `$PVXS_HOME/src/serverget.cpp:482`.
 
 Impact:
 
@@ -1055,7 +1096,7 @@ Evidence:
 - `crates/epics-pva-rs/src/server_native/source.rs:352` defines the default `ChannelSource::process()` implementation.
 - `crates/epics-pva-rs/src/server_native/source.rs:354` returns `Ok(())` from that default implementation.
 - `crates/epics-bridge-rs/src/qsrv/pva_adapter.rs:229` implements `ChannelSource` for `QsrvPvStore`, but the implementation does not override `process()`.
-- pvxs QSRV exposes processing through PUT options and record fields, not a QSRV `onProcess` handler; single-record operation setup installs only GET and PUT handlers in `/Users/stevek/codes/pvxs/ioc/singlesource.cpp:315` and `:325`.
+- pvxs QSRV exposes processing through PUT options and record fields, not a QSRV `onProcess` handler; single-record operation setup installs only GET and PUT handlers in `$PVXS_HOME/ioc/singlesource.cpp:315` and `:334`.
 
 Impact:
 
@@ -1077,9 +1118,9 @@ Evidence:
 
 - `crates/epics-pva-rs/src/server_native/tcp.rs:3123` builds `full_mask = BitSet::all_set(...)` for the decoded monitor initial snapshot.
 - `crates/epics-pva-rs/src/server_native/tcp.rs:3125` sends that initial snapshot with the full mask instead of the `mask_clone` derived from pvRequest.
-- pvxs computes the monitor `pvMask` from the pvRequest in `/Users/stevek/codes/pvxs/src/servermon.cpp:402`.
-- pvxs stores that mask on the monitor operation in `/Users/stevek/codes/pvxs/src/servermon.cpp:414`.
-- pvxs always lets the first update enter the queue in `/Users/stevek/codes/pvxs/src/servermon.cpp:261`, but encodes queued monitor values with `self->pvMask` in `/Users/stevek/codes/pvxs/src/servermon.cpp:174`.
+- pvxs computes the monitor `pvMask` from the pvRequest in `$PVXS_HOME/src/servermon.cpp:402`.
+- pvxs stores that mask on the monitor operation in `$PVXS_HOME/src/servermon.cpp:414`.
+- pvxs always lets the first update enter the queue in `$PVXS_HOME/src/servermon.cpp:261`, but encodes queued monitor values with `self->pvMask` in `$PVXS_HOME/src/servermon.cpp:174`.
 
 Impact:
 
@@ -1099,7 +1140,7 @@ Severity: Medium functional
 
 Evidence:
 
-- pvxs tests QSRV monitor filters with channel names such as `test:ai.VAL{"dbnd":{"d":0.0}}` in `/Users/stevek/codes/pvxs/test/testqsingle.cpp:831`.
+- pvxs tests QSRV monitor filters with channel names such as `test:ai.VAL{"dbnd":{"d":0.0}}` in `$PVXS_HOME/test/testqsingle.cpp:831`.
 - `crates/epics-bridge-rs/src/qsrv/channel.rs:143` parses QSRV channel names with `parse_pv_name(name)`.
 - `crates/epics-base-rs/src/server/database/mod.rs:23` implements `parse_pv_name()` as a simple last-dot split; it does not parse a trailing JSON channel-filter suffix.
 - `crates/epics-pva-rs/src/server_native/tcp.rs:110` documents the Rust PVA monitor filter carrier as `record._options._filter`.
@@ -1153,7 +1194,7 @@ Evidence:
 - `crates/epics-pva-rs/src/server_native/tcp.rs:2459` builds MONITOR INIT from that descriptor, and the raw fast path later writes raw monitor data with only the downstream IOID rewritten.
 - `crates/epics-pva-rs/src/server_native/tcp.rs:3063` sends `build_monitor_payload_raw(ioid, &ev, order)` without checking that the raw event's upstream descriptor still matches `intro_clone`.
 - `crates/epics-bridge-rs/src/pva_gateway/channel_cache.rs:536` detects an upstream descriptor change, `:537`-`:542` logs it as a warning, then `:547`-`:552` still broadcasts the raw body bytes.
-- pvxs pvalink treats reconnect as a type-change boundary: `/Users/stevek/codes/pvxs/ioc/pvalink_channel.cpp:342` says reconnect implies type change and `:350`-`:351` calls `link->onTypeChange()`.
+- pvxs pvalink treats reconnect as a type-change boundary: `$PVXS_HOME/ioc/pvalink_channel.cpp:342` says reconnect implies type change and `:350`-`:351` calls `link->onTypeChange()`.
 
 Impact:
 
@@ -1173,9 +1214,9 @@ Severity: Medium functional
 
 Evidence:
 
-- pvxs always builds pvalink monitor requests with `record._options.pipeline`, `record._options.atomic`, and `record._options.queueSize`: `/Users/stevek/codes/pvxs/ioc/pvalink_link.cpp:53`-`:65`.
-- pvxs hard-codes `record._options.atomic` to true for the remote monitor request at `/Users/stevek/codes/pvxs/ioc/pvalink_link.cpp:64`, independent of the local pvalink `atomic` scan option.
-- pvxs pvalink default queue depth is 4 at `/Users/stevek/codes/pvxs/ioc/pvalink.h:73`, and `makeRequest()` sends that value at `/Users/stevek/codes/pvxs/ioc/pvalink_link.cpp:65`.
+- pvxs always builds pvalink monitor requests with `record._options.pipeline`, `record._options.atomic`, and `record._options.queueSize`: `$PVXS_HOME/ioc/pvalink_link.cpp:53`-`:65`.
+- pvxs hard-codes `record._options.atomic` to true for the remote monitor request at `$PVXS_HOME/ioc/pvalink_link.cpp:64`, independent of the local pvalink `atomic` scan option.
+- pvxs pvalink default queue depth is 4 at `$PVXS_HOME/ioc/pvalink.h:73`, and `makeRequest()` sends that value at `$PVXS_HOME/ioc/pvalink_link.cpp:65`.
 - `crates/epics-bridge-rs/src/pvalink/link.rs:609` builds a request only when `pipeline` or a non-default queue is requested.
 - `crates/epics-bridge-rs/src/pvalink/link.rs:613` returns `None` for the default monitor, so no `record._options.atomic=true` or `queueSize=4` reaches the server.
 - `crates/epics-bridge-rs/src/pvalink/link.rs:617`-`:627` sends only `pipeline` and `queueSize` when a request is built; it never sends `atomic=true`.
@@ -1202,7 +1243,7 @@ Evidence:
 - `crates/epics-pva-rs/src/server_native/tcp.rs:3045` detects that a raw event's byte order differs from the downstream connection's byte order.
 - `crates/epics-pva-rs/src/server_native/tcp.rs:3047` says the fallback is to decode and re-encode, but `:3055`-`:3061` drops the event with `continue`.
 - `crates/epics-pva-rs/src/server_native/tcp.rs:3063` forwards raw bytes only when byte order already matches.
-- pvxs encodes each monitor response with the downstream connection's `sendBE`: `/Users/stevek/codes/pvxs/src/servermon.cpp:159`, then serializes the value at `:174`.
+- pvxs encodes each monitor response with the downstream connection's `sendBE`: `$PVXS_HOME/src/servermon.cpp:159`, then serializes the value at `:174`.
 
 Impact:
 

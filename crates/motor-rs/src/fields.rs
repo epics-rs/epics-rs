@@ -94,7 +94,7 @@ impl Default for ConversionFields {
             srev: 200,
             // dbd-true default — UREV has no initial(). The init-time
             // resolution reconcile (C check_speed_and_resolution,
-            // motorRecord.cc:3911-3916) treats a nonzero UREV as
+            // motorRecord.cc:3912-3916) treats a nonzero UREV as
             // "configured by the .db" and derives MRES from it; a
             // nonzero default here would clobber every loaded MRES.
             urev: 0.0,
@@ -155,7 +155,7 @@ impl Default for VelocityFields {
             bacc: 0.5,
             // JVEL/HVEL have no initial() in motorRecord.dbd — 0.0 means
             // "not configured"; init derives JVEL from VELO and HVEL from
-            // VBAS (C check_speed_and_resolution, motorRecord.cc:4054-4067,
+            // VBAS (C check_speed_and_resolution, motorRecord.cc:4055-4067,
             // ported in motor_sync_speed_at_init).
             hvel: 0.0,
             jvel: 0.0,
@@ -350,6 +350,12 @@ impl Default for DisplayFields {
 #[derive(Debug, Clone, Default)]
 pub struct LinkFields {
     pub out: String,
+    /// `field(CARD,DBF_SHORT)` (motorRecord.dbd:239-243), the one field that is
+    /// a pure function of [`Self::out`]: `init_record` switches on the OUT link
+    /// TYPE and stores the card number, -1, or 0 (`motorRecord.cc:653-670`).
+    /// It lives beside the link it is derived from; `motor_derive_card` is the
+    /// only writer.
+    pub card: i16,
     pub rdbl: String,
     pub dol: String,
     pub rlnk: String,
@@ -456,7 +462,7 @@ pub struct InternalFields {
     pub init_invariants_synced: bool,
     /// C `MARK(M_MRES)` / `M_ERES` / `M_UEIP` — a runtime resolution (or
     /// encoder-use) change is pending its do_work re-anchor pass
-    /// (motorRecord.cc:1936-1991). Armed by the MRES/SREV/UREV/ERES put
+    /// (motorRecord.cc:1937-1991). Armed by the MRES/SREV/UREV/ERES put
     /// arms (and the UEIP/URIP override paths) once init has completed;
     /// consumed — or dropped, when the pass takes a C top-block stop
     /// return — by the next process pass. Like C's mmap marks, it never

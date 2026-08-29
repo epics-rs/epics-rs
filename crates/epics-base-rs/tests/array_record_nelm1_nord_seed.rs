@@ -16,7 +16,7 @@
 //!
 //! * `devWfSoft.c:39-51` runs `dbLoadLinkArray` on the INP unconditionally and
 //!   sets `prec->nord = 0` when it fails — which it does for anything but a
-//!   constant (`dbLink.c:255-264`: no `loadArray` lset ⇒ `S_db_noLSET`).
+//!   constant (`dbLink.c:253-262`: no `loadArray` lset ⇒ `S_db_noLSET`).
 //! * `devAaiSoft.c:55` loads only `if (dbLinkIsConstant(plink))`, so a waveform-
 //!   shaped aai keeps the record's seed.
 //! * `devAaoSoft.c:43-51` is `if (dbLinkIsConstant(&prec->out)) prec->nord = 0;`

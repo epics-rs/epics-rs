@@ -86,7 +86,7 @@ pub fn eval(expr: &CompiledExpr, inputs: &mut ArrayInputs) -> Result<ArrayStackV
     let mut status = Status::default();
 
     // C's `until_scratch[MAX_UNTIL_OP]` (`aCalcPerform.c:307`): for each UNTIL, the
-    // stack pointer it last saw. `loopsDone` (`:311`) is shared by all of them.
+    // stack pointer it last saw. `loopsDone` (`:308`) is shared by all of them.
     let mut until_marks: Vec<(usize, usize)> = Vec::new();
     let mut loops_done: i32 = 0;
 
@@ -1017,14 +1017,15 @@ pub fn eval(expr: &CompiledExpr, inputs: &mut ArrayInputs) -> Result<ArrayStackV
             },
 
             // aCalc has its own copy of sCalc's UNTIL machinery — the pre-scan at
-            // `aCalcPerform.c:349-390` and these two cases at `:1551-1590` — and it
+            // `aCalcPerform.c:349-390` and these two cases at `:1551-1591` — and it
             // is the same code with `ps` walking cells instead of doubles. The
             // element table compiles `UNTIL` (`aCalcPostfix.c:200`), so an aCalc
             // program can reach these opcodes; the port had no `Opcode::Control`
             // arm at all and fell into the `_` catch-all, failing every aCalc
             // expression that contained an UNTIL loop.
             Opcode::Control(ctrl) => match ctrl {
-                // C `:1551-1567` — UNTIL only records where the stack was, so that
+                // C `aCalcPerform.c:1551-1567` — UNTIL only records where the
+                // stack was, so that
                 // UNTIL_END can wind it back before re-running the body. `until_loc`
                 // is the key C matches on, and `pc - 1` is that key here.
                 ControlOp::Until(_end_pc) => {
@@ -1160,8 +1161,8 @@ impl Status {
     }
 }
 
-/// C's `fitpoly` call shared by all four FIT operators (`:1020`, `:1027`, `:1221`,
-/// `:1271`): fit `y = c + b*x + a*x*x` over the WINDOW with `x[i] = i` (C fills a
+/// C's `fitpoly` call shared by all four FIT operators (`aCalcPerform.c:1008`,
+/// `:1029`, `:1221`, `:1270`): fit `y = c + b*x + a*x*x` over the WINDOW with `x[i] = i` (C fills a
 /// scratch array with `ps2->a[i] = i`), write the FITTED CURVE back into the
 /// window, and zero everything outside it.
 ///
@@ -1171,7 +1172,8 @@ impl Status {
 ///
 /// A failed fit — fewer than 3 points in the window, or a singular normal matrix
 /// (`calcUtil.c:271`, `:297`) — is C's `fitpoly` returning -1, and every one of the
-/// four call sites ASSIGNS that to `status` (`:1008`, `:1029`, `:1221`, `:1270`). The
+/// four call sites ASSIGNS that to `status` (`aCalcPerform.c:1008`, `:1029`,
+/// `:1221`, `:1270`). The
 /// assignment lives HERE, in the one helper they all go through, so a FIT operator
 /// cannot be written that forgets it. Compiled C, arraySize 6:
 /// `FITPOLY(BB[0,1])` (a two-point window) is status -1.
@@ -1179,7 +1181,8 @@ impl Status {
 /// The curve then comes out all-zero. C's is not: `d`/`e`/`f` are aCalcPerform's
 /// general-purpose scratch doubles, so a failed fit leaves whatever the previous
 /// operator put there. It is unobservable either way — a non-zero status suppresses
-/// the result write entirely (`:1602-1605`) — and zeros are the deterministic choice.
+/// the result write entirely (`aCalcPerform.c:1602-1605`) — and zeros are the
+/// deterministic choice.
 fn fit_into_window(
     cell: &mut ArrayCell,
     mask: Option<&ArrayCell>,
@@ -1200,10 +1203,12 @@ fn fit_into_window(
     coeffs
 }
 
-/// C's DERIV (`:976-989`) and NDERIV (`:594-617`) are one kernel: `deriv()` is
+/// C's DERIV (`aCalcPerform.c:976-989`) and NDERIV (`:594-617`) are one kernel:
+/// `deriv()` is
 /// literally `nderiv(x, y, n, d, 2, work)` (`calcUtil.c:71-75`). Both take the
 /// derivative over the WINDOW, write it back into the window, zero everything outside
-/// it (`:985-987`, `:614-616`), and ASSIGN the return value to `status` — so they
+/// it (`aCalcPerform.c:985-988`, `:613-616`), and ASSIGN the return value to
+/// `status` — so they
 /// share this helper, and the status write is not something a caller can omit.
 ///
 /// A failed fit leaves C copying from a scratch cell it never wrote (a recycled

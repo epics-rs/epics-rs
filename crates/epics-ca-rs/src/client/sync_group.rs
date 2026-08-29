@@ -36,10 +36,9 @@
 use std::time::Duration;
 
 use epics_base_rs::error::{CaError, CaResult};
-use epics_base_rs::runtime::task::spawn;
-// The seam handle, not a bare `tokio::task::JoinHandle`: `spawn` (imported
-// below) returns this, and under `rtems-exec-model` it is the executor's
-// `JoinFuture`. Byte-identical to `tokio::task::JoinHandle` under the default.
+// The seam handle, not a bare `tokio::task::JoinHandle`: `Reactor::spawn`
+// returns this, and under `exec_backend` it is the executor's `JoinFuture`.
+// Byte-identical to `tokio::task::JoinHandle` under the default.
 use epics_base_rs::runtime::task::TaskHandle as JoinHandle;
 use epics_base_rs::types::{DbFieldType, EpicsValue};
 
@@ -132,8 +131,9 @@ impl SyncGroup {
     /// Schedule a get. The op is issued (spawned) immediately and runs
     /// concurrently; the group tracks it until [`Self::block`].
     pub fn get(&mut self, ch: &CaChannel) {
+        let reactor = ch.reactor().clone();
         let ch = ch.clone();
-        let handle = spawn(async move { Outcome::Get(ch.get().await) });
+        let handle = reactor.spawn(async move { Outcome::Get(ch.get().await) });
         self.ops.push(SyncOp {
             kind: OpKind::Get,
             handle,
@@ -143,8 +143,9 @@ impl SyncGroup {
 
     /// Schedule a put. Same in-flight semantics as [`Self::get`].
     pub fn put(&mut self, ch: &CaChannel, value: EpicsValue) {
+        let reactor = ch.reactor().clone();
         let ch = ch.clone();
-        let handle = spawn(async move { Outcome::Put(ch.put(&value).await) });
+        let handle = reactor.spawn(async move { Outcome::Put(ch.put(&value).await) });
         self.ops.push(SyncOp {
             kind: OpKind::Put,
             handle,
@@ -283,11 +284,11 @@ impl SyncGroup {
 
 // Host/tokio-only: the shared `push_delayed_get` harness spawns
 // `tokio::time::sleep` through the `runtime::task` seam, which under
-// `rtems-exec-model` lands on a background-executor worker with no tokio
+// `exec_backend` lands on a background-executor worker with no tokio
 // reactor. Three of the four tests here build their batch with it. Module
 // granularity follows `server_connection_drop_tests`; only
-// `empty_group_blocks_immediately` would stand alone under the feature.
-#[cfg(all(test, not(feature = "rtems-exec-model")))]
+// `empty_group_blocks_immediately` would stand alone on the exec backend.
+#[cfg(all(test, tokio_backend))]
 mod tests {
     use super::*;
 
@@ -296,7 +297,9 @@ mod tests {
     /// deterministically without a live IOC.
     impl SyncGroup {
         fn push_delayed_get(&mut self, ms: u64, val: i32) {
-            let handle = spawn(async move {
+            let reactor = epics_base_rs::runtime::task::Reactor::current()
+                .expect("the test driver enters an executor");
+            let handle = reactor.spawn(async move {
                 tokio::time::sleep(Duration::from_millis(ms)).await;
                 Outcome::Get(Ok((DbFieldType::Long, EpicsValue::Long(val))))
             });

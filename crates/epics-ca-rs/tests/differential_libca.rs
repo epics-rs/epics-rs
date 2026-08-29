@@ -22,14 +22,12 @@
 //! returns `false` if `softIoc` / `caget` / `caput` aren't on PATH —
 //! the test then becomes a noisy no-op rather than a hard failure.
 //!
-//! Host/tokio-only. The Rust half of each differential pair is the in-process
-//! async `CaServer`, which under `rtems-exec-model` panics with "there is no
-//! reactor running" (`server/tcp.rs:1338`, `server/ca_server.rs:1101`) before
-//! the C `caget` can connect — measured under `--profile interop`. The C half
-//! is unaffected, so this is the by-design async-server exclusion rather than
-//! a wire-compatibility difference between the two backends.
+//! Both backends. The Rust half of each differential pair is the in-process
+//! async `CaServer`, which now takes its listener capability from the tokio
+//! runtime the test entered rather than from the seam `Reactor`, so the C
+//! `caget` reaches it under the exec backend too.
 
-#![cfg(not(feature = "rtems-exec-model"))]
+#![cfg(tokio_backend)]
 
 use std::process::{Command, Stdio};
 use std::time::Duration;
@@ -52,12 +50,19 @@ fn which(name: &str) -> Option<String> {
     if s.is_empty() { None } else { Some(s) }
 }
 
-/// Start the C softIoc with one PV. Returns child + port. softIoc
-/// reads its config from stdin.
-fn start_c_softioc(port: u16, db_content: &str) -> std::process::Child {
+/// Start the C softIoc with one PV. Returns the child and the temp root
+/// holding its database — the caller must keep the root alive for the life of
+/// the child. softIoc reads its config from stdin.
+///
+/// The database used to be `<tmp>/ca-rs-diff-<port>.db`, distinguished only by
+/// an ephemeral port the OS is free to hand to another process a moment later,
+/// on a directory shared by every checkout on the host, and nothing ever
+/// removed it. An `O_EXCL` root is private to this call, and dropping it takes
+/// the database with it on every exit path including a panicking one.
+fn start_c_softioc(port: u16, db_content: &str) -> (std::process::Child, tempfile::TempDir) {
     let (softioc, _, _) = libca_paths().expect("softIoc on PATH");
-    let mut tmp = std::env::temp_dir();
-    tmp.push(format!("ca-rs-diff-{}.db", port));
+    let dir = tempfile::tempdir().expect("fixture root");
+    let tmp = dir.path().join(format!("ca-rs-diff-{port}.db"));
     std::fs::write(&tmp, db_content).expect("write db");
     let child = Command::new(softioc)
         .env("EPICS_CA_SERVER_PORT", port.to_string())
@@ -71,7 +76,7 @@ fn start_c_softioc(port: u16, db_content: &str) -> std::process::Child {
         .expect("spawn softIoc");
     // Give it time to initialize.
     std::thread::sleep(Duration::from_millis(800));
-    child
+    (child, dir)
 }
 
 /// Run caget against the given port and return the parsed value as
@@ -173,7 +178,7 @@ async fn caget_double_matches_libca() {
     let _rs_handle = tokio::spawn(async move { server.run().await });
 
     // C side
-    let mut c_child = start_c_softioc(
+    let (mut c_child, _db_root) = start_c_softioc(
         c_port,
         "record(ai, \"DIFF:VAL\") { field(VAL, \"3.14\") }\n",
     );
@@ -213,7 +218,7 @@ async fn caput_then_caget_matches_libca() {
     let rs_port = server.udp_port();
     let _rs_handle = tokio::spawn(async move { server.run().await });
 
-    let mut c_child = start_c_softioc(
+    let (mut c_child, _db_root) = start_c_softioc(
         c_port,
         "record(ao, \"DIFF:WRITE\") { field(VAL, \"0.0\") }\n",
     );

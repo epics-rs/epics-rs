@@ -1,0 +1,12 @@
+[package]
+name = "named-port"
+version.workspace = true
+edition.workspace = true
+description = "Test-only: retry a test that must NAME a port when the number it named was taken between the probe and the bind"
+license-file = "LICENSE"
+authors.workspace = true
+repository.workspace = true
+# Never published. Every consumer takes it as a `path`-only dev-dependency,
+# which `cargo package` drops from the uploaded manifest, so this crate's
+# absence from crates.io is not a hole in anyone's dependency graph.
+publish = false

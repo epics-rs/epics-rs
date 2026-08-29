@@ -13,8 +13,8 @@
 //! dfanoutRecord.c:197-213   VAL + LALM/ALST/MLST — but NOT the four bands
 //! selRecord.c:203-235       the eight + A..L + LA..LL
 //! waveformRecord.c:268-289  VAL + BUSY + NORD
-//! aaiRecord.c:293-310       VAL + NORD
-//! aaoRecord.c:296-313       VAL + NORD
+//! aaiRecord.c:287-304       VAL + NORD
+//! aaoRecord.c:292-309       VAL + NORD
 //! ```
 //!
 //! Every case is written at the boundary where membership DECIDES the answer:

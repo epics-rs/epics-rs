@@ -1,4 +1,4 @@
-//! `busyRecord.c:175-179` is the last statement of `init_record`, and it is
+//! `busyRecord.c:176-179` is the last statement of `init_record`, and it is
 //! the whole of busy's init tail:
 //!
 //! ```c
@@ -24,11 +24,12 @@
 //! `Record::init_record_tail`, called by the init-seed owner right where C's
 //! line sits.
 //!
-//! Separately, `busyRecord.c:140-181` assigns neither `mlst` nor `lalm` where
+//! Separately, `busyRecord.c:127-181` assigns neither `mlst` nor `lalm` where
 //! `boRecord.c:172-173` seeds both — the reason busy overrides
 //! `seed_deadband_tracking` with an empty body.
 
 use epics_base_rs::server::ioc_builder::IocBuilder;
+use epics_base_rs::server::records::busy::BusyRecord;
 use epics_base_rs::types::EpicsValue;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -37,6 +38,7 @@ type Db = Arc<epics_base_rs::server::database::PvDatabase>;
 
 async fn build(db_text: &str) -> Db {
     IocBuilder::new()
+        .register_record_type("busy", || Box::new(BusyRecord::default()))
         .db_string(db_text, &HashMap::new())
         .unwrap()
         .build()
@@ -113,7 +115,7 @@ async fn busy_init_seeds_neither_mlst_nor_lalm() {
     assert_eq!(
         field(&db, "B", "MLST"),
         Some(EpicsValue::Enum(0)),
-        "busyRecord.c:140-181 never assigns mlst, unlike boRecord.c:172"
+        "busyRecord.c:127-181 never assigns mlst, unlike boRecord.c:172"
     );
     assert_eq!(
         field(&db, "B", "LALM"),

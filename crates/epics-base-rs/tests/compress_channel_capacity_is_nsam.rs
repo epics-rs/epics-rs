@@ -3,7 +3,7 @@
 //! C keeps the capacity and the current length in two hooks:
 //!
 //! ```c
-//! /* cvt_dbaddr, compressRecord.c:398-407 — the CHANNEL's capacity */
+//! /* cvt_dbaddr, compressRecord.c:395-407 — the CHANNEL's capacity */
 //! paddr->no_elements = prec->nsam;
 //! ...
 //! if (prec->balg == bufferingALG_LIFO)

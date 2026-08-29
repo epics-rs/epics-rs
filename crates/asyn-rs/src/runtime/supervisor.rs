@@ -1,3 +1,10 @@
+// RTEMS-EXEC-MODEL-ALLOW(2): checked, not waived — all 2 ran and passed
+// on the exec backend (measured on this tree:
+// `EPICS_RS_BUILD_EXEC_BACKEND=thread cargo nextest run -p asyn-rs
+// --all-features`, 1081/1081). asyn-rs became a census subject when its
+// `build.rs` began deriving `tokio_backend`; nothing here builds a CA
+// server, and the reactor these obtain comes from `#[tokio::test]`
+// itself, which the backend does not remove.
 use std::time::Instant;
 
 use super::config::SupervisionPolicy;
@@ -29,7 +36,11 @@ where
 
     loop {
         let fut = factory();
-        let result = tokio::spawn(fut).await;
+        // Spawned rather than awaited in place so a panic in the supervised
+        // future arrives as a join error instead of unwinding the supervisor.
+        // The seam's task handle carries the same `Result<_, JoinError>` on
+        // both backends, so the restart policy below reads identically.
+        let result = crate::runtime::task::spawn(fut).await;
 
         match result {
             Ok(()) => {

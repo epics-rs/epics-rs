@@ -734,7 +734,7 @@ impl Record for WaveformRecord {
     /// than from the field's type range — so they cannot take the routed
     /// `default:` arm, and cannot keep the VAL cache either.
     ///
-    /// `subArrayRecord.c:262-291` `get_control_double` lists four fields beyond
+    /// `subArrayRecord.c:258-287` `get_control_double` lists four fields beyond
     /// `VAL`, each bounded by the record's maximum array length `MALM`: `INDX`
     /// (a 0-based offset, so `MALM - 1` up), `NELM` (a length, so `MALM` up and
     /// **1** down — C's control lower differs from its graphic lower of 0,
@@ -746,7 +746,7 @@ impl Record for WaveformRecord {
     /// * `waveformRecord.c:268-289` — `BUSY` (a flag: 1/0) and `NORD` (`NELM`
     ///   up, 0 down); it does NOT list `NELM`, which is why `NELM` takes the
     ///   routed type range for a waveform and `MALM` for a subArray.
-    /// * `aaiRecord.c:293-310` / `aaoRecord.c:296-313` — only `NORD`.
+    /// * `aaiRecord.c:287-304` / `aaoRecord.c:292-309` — only `NORD`.
     ///
     /// `get_graphic_double` is a DIFFERENT list per kind, so the two slots are
     /// answered separately here:
@@ -1126,7 +1126,17 @@ impl Record for WaveformRecord {
                 // already as a `CharArray` and is untouched by this branch.
                 let value = match (&value, c_parse::NumericField::of(self.ftvl_element_type())) {
                     (EpicsValue::String(s), Some(numeric)) => {
-                        c_parse::put_string(name, numeric, &s.as_str_lossy())?
+                        // The ARRAY row, `put_string_element`: VAL is
+                        // `special(SPC_DBADDR)`, so `dbAccess.c:1350` sends
+                        // even a one-element string put to `putString*`, which
+                        // — alone among the four conversion rows — has no
+                        // empty-string carve-out. `caput WF ""` is refused.
+                        match c_parse::put_string_element(name, numeric, &s.as_str_lossy())? {
+                            c_parse::Converted::Stored(v) => v,
+                            // C skipped the element store, so the buffer keeps
+                            // the element it held and the put still succeeds.
+                            c_parse::Converted::Unchanged => return Ok(()),
+                        }
                     }
                     // FTVL=STRING is `putStringString`, a text copy, not a
                     // parse — `NumericField::of` reports None for it.
@@ -1546,6 +1556,44 @@ impl Record for WaveformRecord {
             return self.inp_read_failed || self.nord <= 0;
         }
         false
+    }
+
+    /// The two auxiliary fields C posts with a LITERAL `DBE_VALUE | DBE_LOG`,
+    /// never with `monitor_mask`.
+    ///
+    /// NORD is the record's own, and it is written the same way in all four
+    /// kinds — `waveformRecord.c:148` (process) and `:213` (`put_array_info`),
+    /// `aaiRecord.c:237`, `aaoRecord.c:242`, `subArrayRecord.c:196`. BUSY is
+    /// the time-series device support's, `devAsynXXXTimeSeries.h:154-156` (asyn
+    /// e2a281e2), and the record posts it nowhere at all.
+    ///
+    /// Without this the framework's default aux mask
+    /// (`alarm_bits | DBE_VALUE | DBE_LOG`) added a `DBE_ALARM` bit on any
+    /// cycle whose alarm moved — the first process of a record always does,
+    /// born-UDF to NO_ALARM — so a `DBE_ALARM`-only subscriber to `.BUSY` woke
+    /// on arming where the C IOC sends it nothing. VAL is deliberately absent:
+    /// its post IS `monitor_mask` (`waveformRecord.c:324`).
+    fn fields_posted_without_alarm_bits(&self) -> &'static [&'static str] {
+        &["NORD", "BUSY"]
+    }
+
+    /// The closed set a process cycle may post, for all four array kinds.
+    ///
+    /// C's posting is enumerable: `waveformRecord.c` has exactly four
+    /// `db_post_events` (NORD `:148` and `:213`, HASH `:319`, VAL `:324`), and
+    /// its aai/aao/subArray twins the same less HASH for subArray. The
+    /// time-series device support adds NORD and BUSY
+    /// (`devAsynXXXTimeSeries.h:150-156`) and nothing else.
+    ///
+    /// Declaring the set is what stops the generic change-detecting walk from
+    /// inventing an event for a field the DEVICE SUPPORT writes silently:
+    /// `devAsynXXXTimeSeries.h:179` resets `pwf->rarm = 0` with no post at
+    /// all, so C's `camonitor .RARM` shows the client's own 1 (from `dbPut`'s
+    /// field tail) and never returns to 0. The port was posting that reset.
+    /// `pwf->udf = 0` on the next line is the same shape; the walk already
+    /// excludes UDF for every record type.
+    fn process_posted_fields(&self) -> Option<&'static [&'static str]> {
+        Some(&["VAL", "NORD", "BUSY", "HASH"])
     }
 
     /// C `devSASoft.c::read_sa` (118-120) runs `subset()` only when the

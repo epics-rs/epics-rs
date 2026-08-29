@@ -7,18 +7,20 @@
 //
 // `ca_beacon_monitor` is `feature = "client"` AND `tokio_backend`, emitted as
 // one name by `build.rs` because it is one fact — "this build has a UDP beacon
-// listener" — and the fifteen sites below would otherwise each restate a
-// two-term conjunction. The second term is not redundant: the monitor's socket
+// listener" — and the sites below would otherwise each restate a two-term
+// conjunction. That one fact is also its whole meaning: it says nothing about
+// whether the client has a repeater port, a name-server list or an address
+// list, and a site that needs one of those takes `feature = "client"` instead.
+// The second term is not redundant: the monitor's socket
 // (`AsyncUdpV4::bind_ephemeral_same_port`) and its repeater registration
 // (`repeater::try_register`, a `tokio::net::UdpSocket`) both need a reactor,
 // and `run_beacon_monitor` is started through `runtime::task::spawn`, which on
 // `exec_backend` lands it on a callback-pool worker that has none. A hosted
-// `--features rtems-exec-model` build had `feature = "client"` on and panicked
-// on both of those sockets at `realtime-ca-ioc` boot, measured — two of the three
-// panics in `doc/calink-rtems-design.md` §10.10 item 2.
+// `EPICS_RS_BUILD_EXEC_BACKEND=thread` build had `feature = "client"` on and
+// panicked on both of those sockets at `realtime-ca-ioc` boot, measured.
 // RTEMS-EXEC-MODEL-ALLOW(11): the flavored tests drive the full CA client over
 // tokio::net or pin a specific tokio runtime flavor. These run and pass in the
-// feature-ON suite on the tokio driver.
+// exec-backend suite on the tokio driver.
 #[cfg(ca_beacon_monitor)]
 mod beacon_monitor;
 mod circuit_breaker;
@@ -462,17 +464,27 @@ pub struct CaClient {
     /// [`types::dispatch_exception`] for OOB / unrecoverable errors;
     /// callers register via [`CaClient::set_exception_handler`].
     exception_slot: types::CaExceptionSlot,
+    /// The reactor this client was created on.
+    ///
+    /// Every task the client owns — search engine, transport manager,
+    /// coordinator, beacon monitor, the graceful drain in `Drop` — opens a
+    /// socket or arms a timer, and several of them are started from plain
+    /// `fn`s (`Drop::drop`, `CaChannel::on_connection_change`) where no
+    /// runtime is entered. Carrying the capability is what makes those sites
+    /// legal by construction instead of by the caller happening to be on a
+    /// runtime thread.
+    reactor: epics_base_rs::runtime::task::Reactor,
     /// Runtime-mutable client identity (user + host) advertised on every
     /// CA virtual-circuit handshake. Cloned into the transport manager so
     /// new circuits handshake with the current value;
     /// [`CaClient::set_user_name`] / [`CaClient::set_host_name`] mutate it
     /// and notify already-connected circuits out of band.
     client_identity: types::ClientIdentitySlot,
-    // The spawned client background tasks. Typed as the `runtime::task`
-    // seam handle (not a bare `tokio::JoinHandle`) because they are spawned
+    // The spawned client background tasks. Typed as the `runtime::task` seam
+    // handle (not a bare `tokio::JoinHandle`) because they are spawned
     // through `runtime::task::spawn`; under the hosted default this alias IS
-    // `tokio::task::JoinHandle`, and under the `rtems-exec-model` backend it
-    // is the executor's `JoinFuture`, so the field type follows the seam.
+    // `tokio::task::JoinHandle`, and under `exec_backend` it is
+    // the executor's `JoinFuture`, so the field type follows the seam.
     _coordinator: epics_base_rs::runtime::task::TaskHandle<()>,
     _search_task: epics_base_rs::runtime::task::TaskHandle<()>,
     _transport_task: epics_base_rs::runtime::task::TaskHandle<()>,
@@ -482,13 +494,13 @@ pub struct CaClient {
     /// `MdnsBackend` owns an `mdns-sd` `ServiceDaemon` whose browse
     /// runs only while the backend is alive — dropping it kills live
     /// discovery. Held here so post-startup IOCs keep being found.
-    #[cfg(feature = "client")]
+    #[cfg(all(feature = "client", tokio_backend))]
     _discovery_backends: Vec<Box<dyn crate::discovery::Backend>>,
     /// Per-backend forwarder tasks: drain each backend's
     /// `subscribe()` stream and feed `DiscoveryEvent`s into the
     /// search engine as `AddAddress` / `RemoveAddress`. Aborted on
     /// drop so they don't outlive the client.
-    #[cfg(feature = "client")]
+    #[cfg(all(feature = "client", tokio_backend))]
     _discovery_forwarders: Vec<epics_base_rs::runtime::task::TaskHandle<()>>,
 }
 
@@ -591,7 +603,7 @@ enum CoordRequest {
     },
     /// Server's CA minor protocol version for the channel's circuit.
     /// `None` if disconnected or no VERSION reply yet. Mirrors libca
-    /// `ca_host_minor_protocol` (BUG_ARCHAEOLOGY d763541).
+    /// `ca_host_minor_protocol` (d763541).
     GetHostMinorProtocol {
         cid: u32,
         reply: oneshot::Sender<Option<u16>>,
@@ -611,7 +623,7 @@ pub struct CaClientConfig {
     /// Enable CA-over-TLS. When `Some`, every TCP virtual circuit
     /// negotiated by the transport manager is wrapped in a
     /// `tokio_rustls::TlsStream` before the CA handshake. UDP search
-    /// remains plaintext. Requires the `tls` cargo feature.
+    /// remains plaintext. Requires the `experimental-rust-tls` cargo feature.
     #[cfg(feature = "experimental-rust-tls")]
     pub tls: Option<crate::tls::TlsConfig>,
 
@@ -628,7 +640,7 @@ pub struct CaClientConfig {
     /// merges the addresses returned by every active backend into
     /// its `EPICS_CA_ADDR_LIST` at startup. Falls back to the
     /// `EPICS_CA_DISCOVERY` env var when `None`.
-    #[cfg(feature = "client")]
+    #[cfg(all(feature = "client", tokio_backend))]
     pub discovery: Option<crate::discovery::DiscoveryConfig>,
 
     /// Pre-built discovery backends to consult in addition to whatever
@@ -637,7 +649,7 @@ pub struct CaClientConfig {
     /// ...) without having to extend `DiscoveryConfig`. Each backend's
     /// `discover()` is called once at startup; addresses are deduped
     /// against `EPICS_CA_ADDR_LIST` and `discovery`-provided sources.
-    #[cfg(feature = "client")]
+    #[cfg(all(feature = "client", tokio_backend))]
     pub extra_backends: Vec<Box<dyn crate::discovery::Backend>>,
 }
 
@@ -672,12 +684,18 @@ impl CaClient {
     /// Create a client with explicit configuration. Currently the only
     /// knob is `tls`; future fields will follow the same pattern.
     pub async fn new_with_config(config: CaClientConfig) -> CaResult<Self> {
-        // Every field of this struct belongs to a feature (`client`'s
-        // discovery pair, `experimental-rust-tls`'s two), so in the
-        // `client-core` build with TLS off it has none left. Destructured
-        // rather than ignored: a field added unconditionally later fails to
-        // compile here until someone states which configuration reads it.
-        #[cfg(not(any(feature = "client", feature = "experimental-rust-tls")))]
+        // Every field of this struct belongs to a configuration (the
+        // discovery pair, which needs `client` AND a reactor to await its
+        // backends on; `experimental-rust-tls`'s two), so a `client-core`
+        // build with TLS off — or a reactor-free one — has none left.
+        // Destructured rather than ignored: a field added unconditionally
+        // later fails to compile here until someone states which
+        // configuration reads it. The predicate is the disjunction of the
+        // field gates, so it has to move whenever one of them does.
+        #[cfg(not(any(
+            all(feature = "client", tokio_backend),
+            feature = "experimental-rust-tls"
+        )))]
         let CaClientConfig {} = config;
         #[cfg(feature = "experimental-rust-tls")]
         if config.tls.is_some() {
@@ -685,7 +703,6 @@ impl CaClient {
                 "═══════════════════════════════════════════════════════════════════════\n  \
                  CA client TLS ENABLED — non-standard, Rust-only extension.\n  \
                  Cannot connect to C softIoc, EDM, MEDM, CSS, or pyepics-based tools.\n  \
-                 See doc/11-tls-design.md for rationale.\n  \
                  ═══════════════════════════════════════════════════════════════════════"
             );
         }
@@ -695,6 +712,12 @@ impl CaClient {
         // same reason — lazily resolving on the first circuit would swallow
         // the diagnostic for a client that never connects to anything.
         transport::prime_connection_timeout();
+
+        // The one mint on the client side. `new_with_config` is `async`, so
+        // the caller has already entered the runtime whose reactor every task
+        // below needs; from here the capability is carried, not re-read.
+        let reactor = epics_base_rs::runtime::task::Reactor::current()
+            .expect("CaClient::new_with_config is awaited on the runtime its sockets bind to");
 
         // C `udpiiu` resolves EPICS_CA_REPEATER_PORT once, in its constructor
         // (`udpiiu.cpp:168`), and hands the stored `repeaterPort` to every
@@ -706,14 +729,27 @@ impl CaClient {
         // Both are the beacon path, so both belong to the full `client`: the
         // repeater exists to fan beacons out to every client on the host, and
         // `client-core` binds no UDP socket to receive them on.
-        #[cfg(ca_beacon_monitor)]
+        //
+        // `feature = "client"`, not `ca_beacon_monitor`: the resolution and
+        // the registration are two facts, and gating the first on the second
+        // made the second stand in for it. `ca_beacon_monitor` additionally
+        // says "this build can open a `tokio::net` UDP socket", which is a
+        // statement about the executor, not about whether an operator
+        // configured a repeater port — so an exec-backend client resolved
+        // nothing and C's rejected-value diagnostic went missing on the one
+        // target where a misconfigured port is hardest to notice.
+        #[cfg(feature = "client")]
         let repeater_port = crate::protocol::repeater_port();
 
         // Run repeater registration in background — don't block client startup.
         #[cfg(ca_beacon_monitor)]
-        epics_base_rs::runtime::task::spawn(async move {
-            repeater::ensure_repeater(repeater_port).await
-        });
+        reactor.spawn(async move { repeater::ensure_repeater(repeater_port).await });
+
+        // No UDP beacon socket on this build, so nothing registers; the port
+        // was resolved above for its diagnostic alone, as C's `udpiiu`
+        // constructor resolves it before any registration is attempted.
+        #[cfg(all(feature = "client", not(ca_beacon_monitor)))]
+        let _ = repeater_port;
 
         // Build the address list with hostname
         // info preserved so the search-engine refresh task can
@@ -721,33 +757,37 @@ impl CaClient {
         // after IOC migration. Pre-fix `parse_addr_list()` returned
         // bare `Vec<SocketAddr>` resolved exactly once at startup,
         // permanently pinning the client to the first-resolved IPs.
-        // `mut` only for the discovery merge below, which `client-core` does
-        // not have — stated as two bindings rather than one binding and a
-        // silenced lint.
-        #[cfg(feature = "client")]
+        // `mut` only for the discovery merge below, which a `client-core` or
+        // reactor-free build does not have — stated as two bindings rather
+        // than one binding and a silenced lint.
+        #[cfg(all(feature = "client", tokio_backend))]
         let mut addr_list = parse_addr_list_with_hostnames()?;
-        #[cfg(not(feature = "client"))]
+        #[cfg(not(all(feature = "client", tokio_backend)))]
         let addr_list = parse_addr_list_with_hostnames()?;
 
         // Service discovery: explicit config wins; otherwise honour
         // EPICS_CA_DISCOVERY env var. Custom `extra_backends` are then
         // appended. Results are merged with addr_list (deduped by
         // SocketAddr).
-        #[cfg(feature = "client")]
+        #[cfg(all(feature = "client", tokio_backend))]
         let discovery_cfg = config.discovery.clone().or_else(crate::discovery::from_env);
-        #[cfg(feature = "client")]
+        #[cfg(all(feature = "client", tokio_backend))]
         let mut backends: Vec<Box<dyn crate::discovery::Backend>> = match discovery_cfg {
             Some(cfg) => crate::discovery::build_backends(cfg),
             None => Vec::new(),
         };
-        #[cfg(feature = "client")]
+        #[cfg(all(feature = "client", tokio_backend))]
         backends.extend(config.extra_backends);
         // The one-shot scan merges into `addr_list`, the UDP SEARCH
-        // destination list. The `subscribe()` wiring below is *not* gated with
-        // it: its deltas go to the search engine, which absorbs them on either
-        // transport (`SearchTransport::add_address` logs and drops them once,
-        // through `log_dropped_udp_mutation`, when no UDP socket is bound).
-        #[cfg(feature = "client")]
+        // destination list. The `subscribe()` wiring below carries this same
+        // gate — it names `backends` and `DiscoveryEvent`, so it cannot
+        // outlive the module. What it does *not* carry is the TRANSPORT
+        // predicate: its deltas go to the search engine, which absorbs them
+        // on either transport (`SearchTransport::add_address` logs and drops
+        // them once, through `log_dropped_udp_mutation`, when no UDP socket
+        // is bound). That distinction survives the move — there is simply no
+        // delta to absorb in a build with no discovery backends.
+        #[cfg(all(feature = "client", tokio_backend))]
         if !backends.is_empty() {
             let mut discovered: Vec<SocketAddr> = Vec::new();
             for b in &backends {
@@ -834,7 +874,8 @@ impl CaClient {
         // an IOC that was itself discoverable but could not discover.
         // `epics_base_rs::net::search_udp` removed the reason, and with it the
         // gate — a target IOC's `ca://` links now resolve the way a C IOC's do.
-        let search_task = epics_base_rs::runtime::task::spawn(search::run_search_engine(
+        let search_task = reactor.spawn(search::run_search_engine(
+            reactor.clone(),
             addr_list,
             nameserver_entries,
             search_rx,
@@ -849,14 +890,14 @@ impl CaClient {
         // never discovered. The `backends` Vec — and the `ServiceDaemon`
         // an `MdnsBackend` owns — is retained on `CaClient` so the
         // browse keeps running for the client's lifetime.
-        #[cfg(feature = "client")]
+        #[cfg(all(feature = "client", tokio_backend))]
         let mut discovery_forwarders: Vec<epics_base_rs::runtime::task::TaskHandle<()>> =
             Vec::new();
-        #[cfg(feature = "client")]
+        #[cfg(all(feature = "client", tokio_backend))]
         for backend in &backends {
             if let Some(mut rx) = backend.subscribe() {
                 let fwd_search_tx = search_tx.clone();
-                discovery_forwarders.push(epics_base_rs::runtime::task::spawn(async move {
+                discovery_forwarders.push(reactor.spawn(async move {
                     // Ref-count each address by how many discovery deltas
                     // currently back it. A backend emits one `Added` per
                     // `(instance, address)` pair and a matching `Removed`
@@ -924,14 +965,15 @@ impl CaClient {
             Arc::new(parking_lot::RwLock::new(types::ClientIdentity::from_env()));
         // Built before the transport, because the circuit's receive path — not
         // the coordinator — is what raises server exceptions (C ref:
-        // `cac::exceptionRespAction`, `cac.cpp:1082-1120`, runs inside
+        // `cac::exceptionRespAction`, `cac.cpp:1079-1117`, runs inside
         // `executeResponse` on the receive thread).
         let exception_slot: types::CaExceptionSlot = Arc::new(parking_lot::RwLock::new(None));
 
         let transport_task = {
             #[cfg(feature = "experimental-rust-tls")]
             {
-                epics_base_rs::runtime::task::spawn(transport::run_transport_manager(
+                reactor.spawn(transport::run_transport_manager(
+                    reactor.clone(),
                     transport_rx,
                     transport_evt_tx,
                     in_flight.clone(),
@@ -946,7 +988,8 @@ impl CaClient {
             }
             #[cfg(not(feature = "experimental-rust-tls"))]
             {
-                epics_base_rs::runtime::task::spawn(transport::run_transport_manager(
+                reactor.spawn(transport::run_transport_manager(
+                    reactor.clone(),
                     transport_rx,
                     transport_evt_tx,
                     in_flight.clone(),
@@ -964,7 +1007,7 @@ impl CaClient {
         let (beacon_ctrl_tx, beacon_ctrl_rx) =
             mpsc::unbounded_channel::<beacon_monitor::BeaconControl>();
 
-        let coordinator = epics_base_rs::runtime::task::spawn(run_coordinator(
+        let coordinator = reactor.spawn(run_coordinator(
             coord_rx,
             search_resp_rx,
             transport_evt_rx,
@@ -982,7 +1025,7 @@ impl CaClient {
         ));
 
         #[cfg(ca_beacon_monitor)]
-        let beacon_task = epics_base_rs::runtime::task::spawn(beacon_monitor::run_beacon_monitor(
+        let beacon_task = reactor.spawn(beacon_monitor::run_beacon_monitor(
             coord_tx.clone(),
             beacon_ctrl_rx,
             repeater_port,
@@ -1001,14 +1044,15 @@ impl CaClient {
             search_attempts,
             exception_slot,
             client_identity,
+            reactor,
             _coordinator: coordinator,
             _search_task: search_task,
             _transport_task: transport_task,
             #[cfg(ca_beacon_monitor)]
             _beacon_task: beacon_task,
-            #[cfg(feature = "client")]
+            #[cfg(all(feature = "client", tokio_backend))]
             _discovery_backends: backends,
-            #[cfg(feature = "client")]
+            #[cfg(all(feature = "client", tokio_backend))]
             _discovery_forwarders: discovery_forwarders,
         })
     }
@@ -1084,7 +1128,7 @@ impl CaClient {
     /// `caServerID.h:47-55`), so two channels to the same IOC at
     /// different priorities are two circuits. Mirrors libca
     /// `ca_get_ioc_connection_count()` (`cac::circuitCount` returns
-    /// `circuitList.count`, `cac.cpp:403` / `access.cpp:671`) — a
+    /// `circuitList.count`, `cac.cpp:401-406` / `access.cpp:671`) — a
     /// circuit-level (not channel-level) count, useful for sizing
     /// reconnect storms after an IOC restart.
     pub async fn ioc_connection_count(&self) -> usize {
@@ -1203,6 +1247,7 @@ impl CaClient {
             search_attempts: self.search_attempts.clone(),
             user_data: Arc::new(Mutex::new(None)),
             _lifecycle: lifecycle,
+            reactor: self.reactor.clone(),
         }
     }
 
@@ -1212,6 +1257,12 @@ impl CaClient {
     }
 
     // --- Legacy one-shot API (backwards-compatible) ---
+
+    /// The reactor this client was created on — the capability every task
+    /// the client or one of its channels starts is spawned through.
+    pub(crate) fn reactor(&self) -> &epics_base_rs::runtime::task::Reactor {
+        &self.reactor
+    }
 
     /// Append `addr` to the search engine's working address list at
     /// runtime. Mirrors libca `addAddrToChannelAccessAddressList`
@@ -1471,7 +1522,7 @@ impl Drop for CaClient {
         // Discovery forwarders hold a `search_tx` clone — abort them
         // so they don't outlive the client. The `_discovery_backends`
         // Vec drops with `self`, tearing down any `ServiceDaemon`.
-        #[cfg(feature = "client")]
+        #[cfg(all(feature = "client", tokio_backend))]
         for fwd in &self._discovery_forwarders {
             fwd.abort();
         }
@@ -1505,7 +1556,7 @@ impl Drop for CaClient {
         // runs on the RTEMS exec backend too — a bare `tokio::spawn`
         // behind a `Handle::try_current()` guard silently skipped it on
         // target (design doc §5.1).
-        epics_base_rs::runtime::task::spawn(async move {
+        self.reactor.spawn(async move {
             let (tx, rx) = oneshot::channel();
             if coord_tx.send(CoordRequest::Shutdown { reply: tx }).is_ok() {
                 // Bounded so a wedged coordinator doesn't keep
@@ -1685,6 +1736,11 @@ pub struct CaChannel {
     user_data: Arc<Mutex<Option<Arc<dyn std::any::Any + Send + Sync>>>>,
     /// Refcounted lifecycle guard — see [`ChannelLifecycle`].
     _lifecycle: Arc<ChannelLifecycle>,
+    /// The reactor the owning [`CaClient`] was created on, carried so the
+    /// plain-`fn` watcher registrations ([`Self::on_connection_change`],
+    /// [`Self::on_access_rights_change`]) can start their tasks from a thread
+    /// that has entered no runtime.
+    reactor: epics_base_rs::runtime::task::Reactor,
 }
 
 #[cfg(test)]
@@ -1715,6 +1771,13 @@ impl CaChannel {
             search_attempts: types::SearchAttempts::default(),
             user_data: Arc::new(Mutex::new(None)),
             _lifecycle: lifecycle,
+            // Every real `CaChannel` is built on the executor its
+            // subscription and put-callback tasks will run on, so the
+            // fixture reads one too: a `CaChannel` that holds no executor
+            // is not a shape production can produce, and a test built on
+            // one would be testing an object that cannot exist.
+            reactor: epics_base_rs::runtime::task::Reactor::current()
+                .expect("`CaChannel::for_test` must be called from an async test body"),
         }
     }
 }
@@ -2358,7 +2421,7 @@ impl CaChannel {
         // Phase 2: scalar plain reads are decoded in the read loop, so
         // the hot path avoids allocating/copying one payload Vec per PV.
 
-        let deadline = epics_base_rs::runtime::task::Instant::now() + timeout;
+        let deadline = epics_base_rs::runtime::task::deadline_from_now(timeout);
         for p in pending {
             let Pending {
                 index,
@@ -2840,7 +2903,7 @@ impl CaChannel {
     /// regardless of the channel's native type, and wait for the
     /// completion callback.
     ///
-    /// This mirrors C `caput`'s ENUM handling (`caput.c:485-510`): a
+    /// This mirrors C `caput`'s ENUM handling (`caput.c:486-510`): a
     /// `DBR_ENUM` channel is written with the value as a `DBR_STRING`
     /// and the **server** resolves the menu string. That is the only
     /// way to write a site-custom ENUM by name — the client has no
@@ -2975,7 +3038,7 @@ impl CaChannel {
     ///
     /// The server reports the record's CURRENT element count in every
     /// event's response header and sends only that many elements
-    /// (`rsrv/camessage.c:509-514,563-573`), so a dynamic waveform
+    /// (`rsrv/camessage.c:504-509,563-573`), so a dynamic waveform
     /// (`NORD < NELM`) delivers `NORD` elements per event instead of a
     /// max-capacity array with a padded/stale tail. Identical wire
     /// behaviour to [`Self::subscribe_with_mask`] (which also requests no
@@ -3108,6 +3171,11 @@ impl CaChannel {
         self.conn_tx.subscribe()
     }
 
+    /// The reactor the owning client was created on.
+    pub(crate) fn reactor(&self) -> &epics_base_rs::runtime::task::Reactor {
+        &self.reactor
+    }
+
     /// Convenience wrapper around [`Self::connection_events`] that
     /// invokes `cb` on every `AccessRightsChanged`. Returns an
     /// [`EventWatcher`] guard — drop it (or call `.abort()`) to stop
@@ -3119,7 +3187,7 @@ impl CaChannel {
         F: FnMut(AccessRights) + Send + 'static,
     {
         let mut rx = self.conn_tx.subscribe();
-        let handle = epics_base_rs::runtime::task::spawn(async move {
+        let handle = self.reactor.spawn(async move {
             while let Ok(evt) = rx.recv().await {
                 if let ConnectionEvent::AccessRightsChanged { read, write } = evt {
                     cb(AccessRights { read, write });
@@ -3140,7 +3208,7 @@ impl CaChannel {
         F: FnMut(bool) + Send + 'static,
     {
         let mut rx = self.conn_tx.subscribe();
-        let handle = epics_base_rs::runtime::task::spawn(async move {
+        let handle = self.reactor.spawn(async move {
             while let Ok(evt) = rx.recv().await {
                 match evt {
                     ConnectionEvent::Connected => cb(true),
@@ -3175,12 +3243,10 @@ impl CaChannel {
         Ok(types::peer_resolved_name(addr).await)
     }
 
-    /// Server's CA minor protocol version, parsed from the
-    /// `CA_PROTO_VERSION` reply on the TCP virtual circuit.
-    /// Returns `None` when the channel isn't operational or no
-    /// VERSION reply has been processed yet. Mirrors libca
-    /// `ca_host_minor_protocol(chid)` (oldChannelNotify.cpp,
-    /// BUG_ARCHAEOLOGY d763541).
+    /// Server's CA minor protocol version, parsed from the `CA_PROTO_VERSION`
+    /// reply on the TCP virtual circuit. Returns `None` when the channel isn't
+    /// operational or no VERSION reply has been processed yet. Mirrors libca
+    /// `ca_host_minor_protocol(chid)` (oldChannelNotify.cpp, d763541).
     pub async fn host_minor_protocol(&self) -> Option<u16> {
         let (reply_tx, reply_rx) = oneshot::channel();
         let _ = self.coord_tx.send(CoordRequest::GetHostMinorProtocol {
@@ -3792,7 +3858,7 @@ async fn run_coordinator(
                         // would over-promote a benign condition.
                         // Reserve the warn-level message for the
                         // classifications libca counts as anomalies
-                        // (`cac.cpp:498` `beaconAnomalyCount++`).
+                        // (`cac.cpp:497` `beaconAnomalyCount++`).
                         let anomaly_msg = match kind {
                             beacon_monitor::BeaconAnomalyKind::FirstSighting => None,
                             beacon_monitor::BeaconAnomalyKind::IdMismatch => {
@@ -4146,7 +4212,7 @@ async fn run_coordinator(
                     }
                     TransportEvent::MonitorStatusError { subid, eca_status } => {
                         // libca `cac::eventAddRespAction`
-                        // (`cac.cpp:973-977`) routes a monitor frame
+                        // (`cac.cpp:971-975`) routes a monitor frame
                         // whose `m_cid` is non-NORMAL through the
                         // per-subscription exception callback. The
                         // SubscriptionRegistry helper performs the
@@ -4368,10 +4434,10 @@ async fn run_coordinator(
                     }
                     TransportEvent::ServerVersion { server_addr, priority, minor_version } => {
                         // libca exposes this via `ca_host_minor_protocol`
-                        // (BUG_ARCHAEOLOGY d763541): used by gateways /
-                        // nameservers to report the connected server's
-                        // CA wire version. Read from CA_PROTO_VERSION
-                        // during TCP handshake; cleared on TcpClosed.
+                        // (d763541): used by gateways / nameservers to report
+                        // the connected server's CA wire version. Read from
+                        // CA_PROTO_VERSION during TCP handshake; cleared on
+                        // TcpClosed.
                         server_minor_version.insert((server_addr, priority), minor_version);
                     }
                     #[cfg(feature = "client")]
@@ -4441,8 +4507,8 @@ impl DisconnectKind {
 ///
 /// In C all three paths converge on `nciu::unresponsiveCircuitNotify`
 /// (`nciu.cpp:161-182`), reached from `tcpiiu::disconnectAllChannels`
-/// (`tcpiiu.cpp:1848-1855`), from `cac::disconnectChannel`
-/// (`cac.cpp:1185-1195`) and from the echo-timeout path — so they cannot
+/// (`tcpiiu.cpp:1848-1854`), from `cac::disconnectChannel`
+/// (`cac.cpp:1183-1193`) and from the echo-timeout path — so they cannot
 /// disagree. Rust hand-rolled the transition three times and did disagree:
 /// only the echo-timeout path reset access rights, so after a socket close
 /// the cached rights stayed at their last value (possibly read+write) until
@@ -4490,7 +4556,7 @@ fn disconnect_channels(
         let Some(ch) = channels.get_mut(cid) else {
             continue;
         };
-        // Step 2 — C `nciu::setServerAddressUnknown` (`nciu.cpp:183-195`)
+        // Step 2 — C `nciu::setServerAddressUnknown` (`nciu.cpp:184-195`)
         // clears both permits as the channel leaves the circuit, before any
         // callback runs, so a handler that reads the rights sees no-rights.
         ch.state = kind.terminal_state();
@@ -4525,7 +4591,7 @@ fn disconnect_channels(
 /// `CA_PROTO_SERVER_DISCONN`: the server retired one cid.
 ///
 /// C `cac::verifyAndDisconnectChan` → `cac::disconnectChannel`
-/// (`cac.cpp:1172-1195`) runs the SAME transition as a circuit close —
+/// (`cac.cpp:1170-1193`) runs the SAME transition as a circuit close —
 /// `disconnectAllIO`, no-rights, `disconnectNotify`, `accessRightsNotify` —
 /// only scoped to one channel. It therefore crosses the same owner
 /// ([`disconnect_channels`]) as `TcpClosed` and the echo timeout.
@@ -4598,7 +4664,7 @@ fn handle_disconnect(
 
     // C `cac::destroyIIU` (`cac.cpp:1236-1240`): a circuit that still carried
     // channels when it died raises ECA_DISCONN on the global exception hook —
-    // and raises it *before* `disconnectAllChannels` (`cac.cpp:1251`), so a
+    // and raises it *before* `disconnectAllChannels` (`cac.cpp:1250`), so a
     // handler learns the circuit is gone ahead of the per-channel callbacks.
     // It belongs here, in the circuit-gone owner, not at one call site: every
     // path that destroys a circuit is a path C raises this on.
@@ -4774,7 +4840,7 @@ where
 /// `ca_get_ioc_connection_count`. libca keys its circuit table on
 /// `(address, CA priority)` (`caServerID::operator==`,
 /// `caServerID.h:47-55`) and the count is `circuitList.count`
-/// (`cac::circuitCount`, `cac.cpp:403`), i.e. the number of `tcpiiu`
+/// (`cac::circuitCount`, `cac.cpp:401-406`), i.e. the number of `tcpiiu`
 /// circuits — so two channels to the same IOC at different CA
 /// priorities are two circuits. We therefore dedup on the full
 /// [`types::CircuitKey`] `(addr, priority)`, not the address alone
@@ -4904,8 +4970,7 @@ impl AddrEntry {
 /// `EPICS_CA_ADDR_LIST` hostname whose DNS resolution changes
 /// (e.g. an IOC migrates between hosts) is picked up at runtime
 /// instead of permanently pinning the client to the first-resolved
-/// IP. Closes the long-standing upstream-tracking item for
-/// epics-base#488.
+/// IP. Closes upstream epics-base#488.
 pub(crate) fn parse_addr_list_with_hostnames() -> CaResult<Vec<AddrEntry>> {
     let mut addrs: Vec<AddrEntry> = Vec::new();
     let default_port = epics_base_rs::runtime::net::ca_server_port();
@@ -5985,10 +6050,10 @@ mod event_watcher_tests {
     /// These tests run on a `current_thread` tokio runtime but the watcher
     /// task runs on whatever backend the `runtime::task` seam selects — a
     /// tokio worker by default, a background-executor band worker under
-    /// `rtems-exec-model`. `yield_now()` only reschedules on *this*
-    /// runtime, so it establishes no happens-before edge with the other
-    /// executor: spinning on it is a race, not a wait. Poll with a real
-    /// time budget instead, which is a correct wait on either backend.
+    /// `exec_backend`. `yield_now()` only reschedules on *this* runtime,
+    /// so it establishes no happens-before edge with the other executor:
+    /// spinning on it is a race, not a wait. Poll with a real time budget
+    /// instead, which is a correct wait on either backend.
     async fn wait_for(label: &str, mut cond: impl FnMut() -> bool) {
         for _ in 0..2_000 {
             if cond() {
@@ -6007,12 +6072,14 @@ mod event_watcher_tests {
     async fn drop_aborts_watcher_task() {
         let ran = Arc::new(AtomicBool::new(false));
         let ran_in_task = ran.clone();
-        let handle = epics_base_rs::runtime::task::spawn(async move {
-            ran_in_task.store(true, Ordering::SeqCst);
-            loop {
-                tokio::task::yield_now().await;
-            }
-        });
+        let handle = epics_base_rs::runtime::task::Reactor::current()
+            .expect("the test driver enters an executor")
+            .spawn(async move {
+                ran_in_task.store(true, Ordering::SeqCst);
+                loop {
+                    tokio::task::yield_now().await;
+                }
+            });
         let abort_handle = handle.abort_handle();
         let watcher = EventWatcher { handle };
         wait_for("watcher task should have started", || {
@@ -6034,11 +6101,13 @@ mod event_watcher_tests {
     /// behaves identically to dropping the guard.
     #[tokio::test(flavor = "current_thread")]
     async fn explicit_abort_stops_watcher_task() {
-        let handle = epics_base_rs::runtime::task::spawn(async move {
-            loop {
-                tokio::task::yield_now().await;
-            }
-        });
+        let handle = epics_base_rs::runtime::task::Reactor::current()
+            .expect("the test driver enters an executor")
+            .spawn(async move {
+                loop {
+                    tokio::task::yield_now().await;
+                }
+            });
         let abort_handle = handle.abort_handle();
         let watcher = EventWatcher { handle };
         watcher.abort();
@@ -6151,8 +6220,10 @@ mod typed_string_put_tests {
 mod user_data_tests {
     use super::*;
 
-    #[test]
-    fn set_get_downcast_clone_share_and_clear() {
+    // `async` only because `CaChannel::for_test` now reads the executor the
+    // channel will spawn on; the `user_data` slot itself is synchronous.
+    #[epics_macros_rs::epics_test]
+    async fn set_get_downcast_clone_share_and_clear() {
         let (coord_tx, _rx) = mpsc::unbounded_channel();
         let ch = CaChannel::for_test(coord_tx);
 
@@ -6225,22 +6296,30 @@ mod monitor_pause_tests {
             .expect("Ok");
         assert_eq!(v1.value, EpicsValue::Long(1), "pre-pause backlog (1)");
 
-        // (2a) The held value (2) must NOT be delivered while paused —
-        // recv blocks.
-        let blocked =
-            epics_base_rs::runtime::task::timeout(Duration::from_millis(150), handle.recv()).await;
+        // (2a) The held value (2) must NOT be delivered while paused.
+        // Everything `recv` does before it can park is synchronous —
+        // `try_recv` on the (now empty) channel, then `take_deliverable`,
+        // which by I3 has no `gated` branch to read — so ONE poll reaches
+        // the `notified()` park, and `Pending` is the observation itself: a
+        // leak would have completed this very poll with value 2. No real
+        // time is involved, so there is no window for a slow machine to
+        // widen or a fast producer to slip through, which is what the
+        // 150 ms drain this replaces was really measuring.
+        let mut held = std::pin::pin!(handle.recv());
+        let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
         assert!(
-            blocked.is_err(),
+            std::future::Future::poll(held.as_mut(), &mut cx).is_pending(),
             "held value must stay withheld while paused (recv-side gate)"
         );
 
-        // resume → the held latest is released.
-        handle.resume();
-        let v2 = epics_base_rs::runtime::task::timeout(Duration::from_millis(200), handle.recv())
-            .await
-            .expect("held value should deliver after resume")
-            .expect("Some")
-            .expect("Ok");
+        // resume → the held latest is released. Driven through the test's
+        // own `Arc<CoalesceSlot>` because `handle` is mutably borrowed by
+        // the parked `recv` above; `MonitorHandle::resume` is exactly this
+        // `set_paused(false)` call. Awaiting the SAME future is what makes
+        // the release observable: `set_paused` notifies the `Notified` that
+        // poll registered, so the next poll returns the value with no wait.
+        coalesce_slot.set_paused(false);
+        let v2 = held.await.expect("Some").expect("Ok");
         assert_eq!(v2.value, EpicsValue::Long(2), "held latest after resume");
     }
 
@@ -6418,7 +6497,7 @@ mod disconnect_transition_tests {
     }
 
     /// TCP circuit close (C `tcpiiu::disconnectAllChannels`,
-    /// `tcpiiu.cpp:1848-1855`): the channel must drop to no-rights and the
+    /// `tcpiiu.cpp:1848-1854`): the channel must drop to no-rights and the
     /// subscriber must see `AccessRightsChanged { false, false }` after
     /// `Disconnected`. Pre-fix the cached rights stayed read+write until
     /// reconnect and no rights event was emitted at all.
@@ -6466,7 +6545,7 @@ mod disconnect_transition_tests {
     }
 
     /// `CA_PROTO_SERVER_DISCONN` (C `cac::disconnectChannel`,
-    /// `cac.cpp:1185-1195`) runs the identical transition, scoped to one
+    /// `cac.cpp:1183-1193`) runs the identical transition, scoped to one
     /// cid — and must not touch a sibling channel on the same circuit.
     #[tokio::test(flavor = "current_thread")]
     async fn r8_17_server_disconnect_drops_only_that_channel_to_no_rights() {

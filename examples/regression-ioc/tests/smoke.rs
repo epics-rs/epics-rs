@@ -1,5 +1,8 @@
 //! Harness smoke test: prove the in-process CA+PVA regression IOC boots and is
 //! reachable over both protocols before the family-specific tests rely on it.
+// The harness crate is `tokio_backend`-only, so this file is too:
+// `regression_ioc::RegressionIoc` does not exist on the reactor-free backend.
+#![cfg(tokio_backend)]
 
 use std::time::Duration;
 

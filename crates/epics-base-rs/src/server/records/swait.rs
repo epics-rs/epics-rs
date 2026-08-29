@@ -118,7 +118,7 @@ pub struct SwaitRecord {
     pub num_vals: [f64; 12],
     // LA..LL ("Last Val of Input x", C `swaitRecord.dbd:298-331`, DBF_DOUBLE,
     // no SPC_NOMOD so a client may write them). C `monitor()`
-    // (swaitRecord.c:646-653) is the single writer during processing: for each
+    // (swaitRecord.c:647-654) is the single writer during processing: for each
     // input it changed, it posts the input, advances `*pprev = *pnew`, and
     // posts the previous-value field too — both with `monitor_mask | DBE_VALUE`
     // (see `fields_posted_with_monitor_mask`). The record had no LA..LL at all,
@@ -144,11 +144,11 @@ pub struct SwaitRecord {
     // ```
     //
     // — so unlike the calc family, a failed input ALSO raises READ_ALARM at
-    // INVALID severity. The OOPT switch that follows (:424) is outside the
+    // INVALID severity. The OOPT switch that follows (:425) is outside the
     // gate and runs against the frozen VAL.
     fetch_gate_failed: bool,
     // Simulation mode — C `swaitRecord.dbd:497-517` (SIOL, SVAL, SIML, SIMM,
-    // SIMS) and `swaitRecord.c:401-421`. The record had none of these fields, so
+    // SIMS) and `swaitRecord.c:402-422`. The record had none of these fields, so
     // a swait could not be put into simulation at all: SIMM was unreadable and
     // unwritable, a SIML/SIOL link could not be configured, and every cycle ran
     // the real input fetch + calc.
@@ -361,7 +361,7 @@ impl SwaitRecord {
     }
 
     /// True for the link-NAME fields whose put re-classifies the PV status —
-    /// C `special()` (swaitRecord.c:507-553) re-runs the search for any name in
+    /// C `special()` (swaitRecord.c:507-559) re-runs the search for any name in
     /// `INAN`..`INLN`, `DOLN`, `OUTN`. `OUTN` is a common field, so its put is
     /// not visible in `special()`; it is caught by `check_alarms` instead, the
     /// same split calcout uses.
@@ -399,8 +399,14 @@ impl SwaitRecord {
                     EpicsValue::Enum(status as u16),
                 ));
             }
+            // `DBE_VALUE` alone, as C posts every `pPvStat`:
+            // `swaitRecord.c:527`, `:550`, `:923`.
             if link_gen.is_current(token) {
-                let _ = handle.post_fields(&rec_name, fields);
+                let _ = handle.post_fields_with_mask(
+                    &rec_name,
+                    fields,
+                    crate::server::recgbl::EventMask::VALUE,
+                );
             }
         });
     }
@@ -495,7 +501,7 @@ impl Record for SwaitRecord {
     }
 
     /// A put to a PV-name field re-runs the search — C `special()`
-    /// (swaitRecord.c:507-553) sets the status to `PV_NC` and re-issues
+    /// (swaitRecord.c:507-559) sets the status to `PV_NC` and re-issues
     /// `recDynLinkAddInput`/`AddOutput`, or to `NO_PV` when the name was
     /// cleared. `refresh_link_status` re-reads the name the put just stored.
     fn special(&mut self, field: &str, after: bool) -> CaResult<()> {
@@ -585,17 +591,17 @@ impl Record for SwaitRecord {
     /// (`swaitRecord.c:686-705`) reads INAA..INPL with `recDynLinkGet`, a
     /// CA-style get that has no `setLinkAlarm`; the failure is answered by
     /// `process` with `recGblSetSevr(pwait, READ_ALARM, INVALID_ALARM)`
-    /// (`swaitRecord.c:412`). Its SIML/SIOL reads ARE `dbGetLink`
-    /// (`:401`, `:415`) and keep the framework's uniform rule.
+    /// (`swaitRecord.c:413`). Its SIML/SIOL reads ARE `dbGetLink`
+    /// (`:402`, `:416`) and keep the framework's uniform rule.
     fn multi_input_fetch_is_db_get_link(&self) -> bool {
         false
     }
 
-    /// C `swaitRecord.c:401-421` — swait's simulation replaces `fetch_values()`
-    /// and `calcPerform()`, and nothing else: the OOPT switch (`:424`),
+    /// C `swaitRecord.c:402-422` — swait's simulation replaces `fetch_values()`
+    /// and `calcPerform()`, and nothing else: the OOPT switch (`:425`),
     /// `execOutput`, the monitors and the forward link all still run. So it is
     /// the input-STAGE shape, not the whole-cycle `readValue` of ai/bi.
-    /// `swaitRecord.c:407-421` has no `default:` arm — the simulation test is a
+    /// `swaitRecord.c:407-422` has no `default:` arm — the simulation test is a
     /// plain `if (pwait->simm == menuYesNoNO) { … } else { /* SIMULATION MODE */
     /// … }`, so ANY non-NO SIMM (including the 2 that every other menuYesNo
     /// record rejects with SOFT_ALARM/INVALID) simulates from SIOL.
@@ -648,13 +654,13 @@ impl Record for SwaitRecord {
         // the OOPT decision.
         let old_val = self.oval;
 
-        // C `swaitRecord.c:407-414` runs the calc only `if (fetch_values(pwait)
+        // C `swaitRecord.c:408-414` runs the calc only `if (fetch_values(pwait)
         // ==0)`; its `fetch_values` (686-705) returns at the first input that is
         // PV_NC or whose get fails. A failed input freezes VAL and UDF and
         // raises READ_ALARM/INVALID instead (see `check_alarms`). The OOPT
         // decision below stays outside the gate, as in C — it runs against the
         // frozen VAL.
-        // C `swaitRecord.c:415-421` — a SIMULATED cycle takes the `else` branch,
+        // C `swaitRecord.c:415-422` — a SIMULATED cycle takes the `else` branch,
         // which runs neither `fetch_values()` nor `calcPerform()`: VAL already
         // holds SVAL and SIMM_ALARM is already raised (both by the framework's
         // simulation owner). No calc runs, so no CALC_ALARM — and none can leak
@@ -691,7 +697,7 @@ impl Record for SwaitRecord {
         // (see `output_link_value`).
         self.oval = self.val;
 
-        // C `swaitRecord.c::monitor` (646-653) advances each previous-input
+        // C `swaitRecord.c::monitor` (647-654) advances each previous-input
         // field to the input it just posted (`*pprev = *pnew`) — so LA..LL is
         // "the value of input A..L as of the last cycle that posted it", which
         // for these fields is every cycle the input changed. Assigning
@@ -722,8 +728,9 @@ impl Record for SwaitRecord {
             // (VAL with MDEL/ADEL deadband + alarm mask, changed inputs) and
             // defers only the OUT/OEVT/FLNK tail, holding PACT for the watchdog
             // window via the `ReprocessAfter` continuation that releases it —
-            // matching C `swaitRecord.c:716` "THE RECORD REMAINS ACTIVE WHILE
-            // WAITING ON THE WATCHDOG". A bare `AsyncPending` would have deferred
+            // matching the C comment (not a statement) at `swaitRecord.c:716`,
+            // "THE RECORD REMAINS ACTIVE WHILE WAITING ON THE WATCHDOG". A bare
+            // `AsyncPending` would have deferred
             // the value side to delay-end too (the calcout/scalcout/acalcout
             // shape, whose C `process` returns BEFORE `monitor()`); swait's C
             // does not, so VAL must post now.
@@ -731,6 +738,7 @@ impl Record for SwaitRecord {
                 result: RecordProcessResult::CompleteDeferOutput,
                 actions: vec![ProcessAction::ReprocessAfter(delay)],
                 device_did_compute: false,
+                post_write_fields: Vec::new(),
             });
         }
 
@@ -791,7 +799,7 @@ impl Record for SwaitRecord {
         &["DOLD", "CLCV"]
     }
 
-    /// C `swaitRecord.c::monitor` (646-653) posts a changed input A..L with
+    /// C `swaitRecord.c::monitor` (647-654) posts a changed input A..L with
     /// `monitor_mask | DBE_VALUE` — no forced `DBE_LOG`:
     ///
     /// ```c

@@ -1,8 +1,8 @@
 //! End-to-end proof that [`BlockingCaServer`] serves a **real CA client over
 //! real sockets** with no async client anywhere — the coverage gap left when
-//! `blocking_rtems_e2e` had to be gated off under `rtems-exec-model` (its
-//! client side is the async `CaClient`, which needs a tokio reactor the
-//! executor backend does not start).
+//! `blocking_rtems_e2e` had to be gated off under `exec_backend` (its client
+//! side is the async `CaClient`, which needs a tokio reactor the executor
+//! backend does not start).
 //!
 //! The client here is hand-rolled wire frames on a `std::net::TcpStream` /
 //! `UdpSocket`. That is exactly the shape an RTEMS deployment faces: the
@@ -11,10 +11,10 @@
 //!
 //! **Feature-neutral by design.** Every test is a plain `#[test]` with no
 //! runtime of any kind, and `BlockingCaServer` is compiled in both feature
-//! states, so this file runs identically with `rtems-exec-model` on and off.
-//! It therefore raises BOTH suite counts rather than only the feature-ON one:
-//! the feature-OFF suite gains the same tests. That is deliberate — it means
-//! the blocking front-end is guarded on the hosted default too, and any
+//! states, so this file runs identically on both backends. It therefore
+//! raises BOTH suite counts rather than only the exec-backend one: the
+//! tokio-backend suite gains the same tests. That is deliberate — it means the
+//! blocking front-end is guarded on the hosted default too, and any
 //! divergence between the two execution backends shows up as this file
 //! passing in one state and failing in the other.
 //!
@@ -40,7 +40,6 @@ use std::io::{Read, Write};
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4, TcpListener, TcpStream, UdpSocket};
 use std::sync::Arc;
 use std::thread;
-use std::time::Duration;
 
 use epics_base_rs::runtime::task::block_on_sync;
 use epics_base_rs::server::database::PvDatabase;
@@ -92,14 +91,17 @@ fn blocking_server_serves_a_raw_socket_client_end_to_end() {
         "READ_NOTIFY returns the seeded VAL"
     );
 
-    // Fire-and-forget WRITE: no reply frame, but the value must land.
+    // Fire-and-forget WRITE: no reply frame, but the value must land. Both
+    // messages are served by the one message thread in arrival order, so the
+    // READ_NOTIFY reply is a barrier for any reply the WRITE was not supposed
+    // to draw — it cannot overtake one.
     c.send(&write_frame(CA_PROTO_WRITE, sid, 0, 4.25));
-    c.expect_silence(
-        Duration::from_millis(250),
-        "fire-and-forget WRITE must draw no reply",
-    );
     c.send(&read_notify_frame(sid, 0x02));
-    let r = c.expect(CA_PROTO_READ_NOTIFY, "READ_NOTIFY after WRITE");
+    let r = c.expect_only(
+        CA_PROTO_READ_NOTIFY,
+        "fire-and-forget WRITE must draw no reply: the READ_NOTIFY probe's \
+         reply is the next frame on the circuit",
+    );
     assert_eq!(
         payload_double(&r),
         4.25,
@@ -149,13 +151,40 @@ fn blocking_server_serves_a_raw_socket_client_end_to_end() {
         "a write fans out to the subscription as a monitor update"
     );
 
-    // EVENT_CANCEL: the subscription stops delivering.
+    // EVENT_CANCEL: the subscription stops delivering. A second, live
+    // subscription is what makes that checkable — both ride the one per-client
+    // event queue (`blocking.rs:1206` `run_event_task`), so an update the
+    // cancelled id leaks from the earlier put is strictly ahead of the live
+    // id's update from the later one.
+    let live_id = 0xAC;
+    c.send(&event_add_frame(sid, live_id));
+    let live_initial = c.expect_absent_before(
+        |_| false,
+        |f| cmmd_of(f) == CA_PROTO_EVENT_ADD && ioid_of(f) == live_id,
+        "the barrier subscription's initial update",
+    );
+    assert_eq!(
+        payload_double(&live_initial),
+        99.0,
+        "the barrier subscription starts from the current VAL"
+    );
+
     c.send(&event_cancel_frame(sid, sub_id));
     let _ = c.expect_cancel_ack(sub_id);
+
     c.send(&write_frame(CA_PROTO_WRITE, sid, 0, 123.0));
-    c.expect_silence(
-        Duration::from_millis(250),
-        "a cancelled subscription must deliver nothing",
+    let _ = c.expect_absent_before(
+        |f| cmmd_of(f) == CA_PROTO_EVENT_ADD && ioid_of(f) == sub_id,
+        |f| cmmd_of(f) == CA_PROTO_EVENT_ADD && ioid_of(f) == live_id,
+        "the cancelled id must not ride the put that the live id does",
+    );
+    c.send(&write_frame(CA_PROTO_WRITE, sid, 0, 124.0));
+    let _ = c.expect_absent_before(
+        |f| cmmd_of(f) == CA_PROTO_EVENT_ADD && ioid_of(f) == sub_id,
+        |f| cmmd_of(f) == CA_PROTO_EVENT_ADD && ioid_of(f) == live_id && payload_double(f) == 124.0,
+        "a cancelled subscription must deliver nothing: no update carrying the \
+         cancelled id reaches the circuit before the live id's update from the \
+         following put",
     );
 
     // CLEAR_CHANNEL closes the channel; the circuit itself stays up.
@@ -206,6 +235,12 @@ fn a_racing_reply_pair_is_delivered_whichever_order_it_arrives_in() {
             .unwrap();
         s.write_all(&ack_frame(CA_PROTO_WRITE_NOTIFY, 1, 0x05))
             .unwrap();
+        // A sentinel behind the pair: the client claims both, then requires
+        // this to be the next frame it sees. On one socket written by one
+        // thread that is an order, where "read for 100 ms and hope" was only
+        // ever a guess about scheduling.
+        s.write_all(&ack_frame(CA_PROTO_CLEAR_CHANNEL, 1, 0x06))
+            .unwrap();
         // Hold the connection open until the client hangs up, so the reads
         // above cannot succeed merely because the socket closed.
         let mut sink = [0u8; 1];
@@ -221,10 +256,11 @@ fn a_racing_reply_pair_is_delivered_whichever_order_it_arrives_in() {
         99.0,
         "the update survived a wait that was looking for the acknowledgement"
     );
-    c.expect_silence(
-        Duration::from_millis(100),
-        "both frames were claimed, so nothing is left queued",
+    let sentinel = c.expect_only(
+        CA_PROTO_CLEAR_CHANNEL,
+        "both frames were claimed, so the sentinel is the next frame left",
     );
+    assert_eq!(ioid_of(&sentinel), 0x06, "the sentinel echoes its own ioid");
 
     drop(c);
     peer.join().unwrap();
@@ -259,6 +295,28 @@ fn blocking_server_accepts_a_second_circuit_after_the_first_closes() {
     accept.join().unwrap();
 }
 
+/// The SEARCH-reply cids a reply datagram carries. One datagram can hold
+/// several — that is what the responder's batch-up coalescing does — so this
+/// walks the whole datagram rather than reading a single header.
+fn search_reply_cids(dg: &[u8]) -> Vec<u32> {
+    let mut cids = Vec::new();
+    let mut off = 0usize;
+    while off + CaHeader::SIZE <= dg.len() {
+        let cmmd = u16::from_be_bytes([dg[off], dg[off + 1]]);
+        let postsize = u16::from_be_bytes([dg[off + 2], dg[off + 3]]) as usize;
+        if cmmd == CA_PROTO_SEARCH {
+            cids.push(u32::from_be_bytes([
+                dg[off + 12],
+                dg[off + 13],
+                dg[off + 14],
+                dg[off + 15],
+            ]));
+        }
+        off += CaHeader::SIZE + postsize;
+    }
+    cids
+}
+
 /// The UDP name-search responder over a real datagram socket: a
 /// VERSION+SEARCH datagram for a seeded PV draws a reply advertising the
 /// server's TCP port, and an unknown PV draws nothing.
@@ -282,9 +340,7 @@ fn blocking_server_answers_a_raw_udp_search() {
     let udp_thread = thread::spawn(move || srv.serve_udp_search(resp));
 
     let client = UdpSocket::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)).unwrap();
-    client
-        .set_read_timeout(Some(Duration::from_secs(5)))
-        .unwrap();
+    client.set_read_timeout(Some(budget::FACT_BUDGET)).unwrap();
 
     // VERSION prelude + SEARCH, the shape a real CA client broadcasts.
     let mut dg = {
@@ -356,13 +412,49 @@ fn blocking_server_answers_a_raw_udp_search() {
         f
     });
     client.send_to(&miss, resp_addr).unwrap();
-    client
-        .set_read_timeout(Some(Duration::from_millis(400)))
-        .unwrap();
-    let mut buf = [0u8; 1024];
-    assert!(
-        client.recv_from(&mut buf).is_err(),
-        "an unknown PV must draw no UDP reply"
+    // The barrier is a name the responder MUST answer, sent after the one it
+    // must not. One responder thread reads both from one socket in arrival
+    // order, so a reply for cid 0x43 cannot overtake this one — which is what
+    // a read window could never establish.
+    let mut probe = {
+        let mut h = CaHeader::new(CA_PROTO_VERSION);
+        h.count = CA_MINOR_VERSION;
+        h.data_type = 1;
+        h.cid = 1;
+        h.to_bytes().to_vec()
+    };
+    probe.extend_from_slice(&{
+        let padded = pad_string("RAW:UDP");
+        let mut h = CaHeader::new(CA_PROTO_SEARCH);
+        h.data_type = 5;
+        h.cid = 0x44;
+        h.available = 0x44;
+        h.set_payload_size(padded.len(), CA_MINOR_VERSION as u32, CA_MINOR_VERSION)
+            .expect("modern peer");
+        let mut f = h.to_bytes().to_vec();
+        f.extend_from_slice(&padded);
+        f
+    });
+    client.send_to(&probe, resp_addr).unwrap();
+
+    budget::barrier::until(
+        "an unknown PV must draw no UDP reply",
+        // Nothing may precede the barrier datagram, and the batch-up path can
+        // coalesce replies, so a datagram carrying cid 0x43 is denied even
+        // when it also carries the barrier.
+        |dg: &Vec<u8>| {
+            search_reply_cids(dg).contains(&0x43) || !search_reply_cids(dg).contains(&0x44)
+        },
+        |dg: &Vec<u8>| search_reply_cids(dg).contains(&0x44),
+        |remaining| {
+            client.set_read_timeout(Some(remaining)).ok()?;
+            let mut buf = vec![0u8; 64 * 1024];
+            match client.recv_from(&mut buf) {
+                Ok((n, _)) => Some(buf[..n].to_vec()),
+                Err(e) if epics_base_rs::runtime::blocking_io::is_socket_timeout(e.kind()) => None,
+                Err(e) => panic!("recv_from on the search socket: {e}"),
+            }
+        },
     );
 
     server.shutdown();
@@ -392,9 +484,7 @@ fn a_udp_search_leads_to_a_working_tcp_circuit() {
     let accept = thread::spawn(move || srv_tcp.serve());
 
     let client = UdpSocket::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)).unwrap();
-    client
-        .set_read_timeout(Some(Duration::from_secs(5)))
-        .unwrap();
+    client.set_read_timeout(Some(budget::FACT_BUDGET)).unwrap();
     let mut dg = {
         let mut h = CaHeader::new(CA_PROTO_VERSION);
         h.count = CA_MINOR_VERSION;

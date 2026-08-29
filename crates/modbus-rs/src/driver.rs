@@ -536,12 +536,11 @@ impl ModbusEngine {
         // intent as an unimplemented question — `drvModbusAsyn.cpp:2248-2249`
         // reads `/* Make sure the function code in the response is the same as
         // the one in the request? */` and `:2251` then switches on the
-        // REQUEST's code regardless — so this is a deliberate deviation, filed
-        // as CBUG-B28 in `doc/upstream-c-bugs.md`. Without it a reply
-        // belonging to a different exchange decodes under this request's
-        // function: a `WriteMultipleRegisters` acknowledgement read as a
-        // 2-register response passes the word-count check and yields two
-        // registers of garbage reported as good data.
+        // REQUEST's code regardless — so this is a deliberate deviation.
+        // Without it a reply belonging to a different exchange decodes under
+        // this request's function: a `WriteMultipleRegisters` acknowledgement
+        // read as a 2-register response passes the word-count check and yields
+        // two registers of garbage reported as good data.
         let expected = function.wire_code();
         if resp.function != expected {
             return Err(ModbusError::FunctionMismatch {

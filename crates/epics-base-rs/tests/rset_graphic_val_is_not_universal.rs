@@ -23,6 +23,7 @@
 //! The port served 0/0 there — seq's empty VAL cache — because the routing owner
 //! asked `is_value_field(field)` before it asked which type it was holding.
 
+use epics_base_rs::server::database::LinkBacking;
 use epics_base_rs::server::record::{Record, RecordInstance};
 use epics_base_rs::server::records::asub_record::ASubRecord;
 use epics_base_rs::server::records::calc::CalcRecord;
@@ -30,7 +31,7 @@ use epics_base_rs::server::records::seq::SeqRecord;
 use epics_base_rs::server::snapshot::Snapshot;
 
 fn snap(inst: &RecordInstance, field: &str) -> Snapshot {
-    inst.snapshot_for_field(field)
+    inst.snapshot_for_field_with(field, LinkBacking::none())
         .unwrap_or_else(|| panic!("{field} has no snapshot"))
 }
 
@@ -60,8 +61,8 @@ fn seq_does_not_list_val_so_it_takes_the_long_range() {
 }
 
 /// The boundary the fix must not cross: seq's OTHER graphic answers are
-/// unchanged. DLYn is listed on a literal 0..10 (`:286-288`) and DOn is
-/// link-backed (`:289-293`) — both reached through the same predicate that now
+/// unchanged. DLYn is listed on a literal 0..10 (`:328-331`) and DOn is
+/// link-backed (`:332-336`) — both reached through the same predicate that now
 /// answers `false` for every seq field.
 #[test]
 fn seqs_dlyn_literal_and_don_link_arms_still_stand() {

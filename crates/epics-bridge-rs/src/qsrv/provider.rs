@@ -5,7 +5,8 @@
 //! The trait definitions here are temporary — they will move to `epics-pva-rs`
 //! once that crate's native PVA server exposes them directly.
 
-// RTEMS-EXEC-MODEL-ALLOW(21): checked - these run and pass in the feature-ON suite.
+// RTEMS-EXEC-MODEL-ALLOW(21): checked - these run and pass in the exec-backend
+// suite.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -591,7 +592,7 @@ pub trait Channel: Send + Sync {
 ///
 /// `marked == Some(paths)`: the dot-separated group field paths the
 /// resolved `+trigger` graph marks for this event. pvxs
-/// `groupsource.cpp:283-300` iterates `field.triggers` on a member
+/// `groupsource.cpp:328-346` iterates `field.triggers` on a member
 /// event and marks each target field assigned-not-changed; the PVA
 /// layer turns the paths into the wire changed-bitset
 /// (`build_monitor_payload_marked`). Carrying the set here — rather
@@ -694,7 +695,7 @@ pub struct BridgeProvider {
     /// The server-wide QSRV group drain — pvxs's one `qsrvGroup` event pump
     /// per `GroupSource` (`ioc/groupsource.cpp:96`). Every group channel
     /// this provider vends shares it, so ALL group subscriptions on the
-    /// served IOC drain through ONE task (doc/qsrv-rtems-design.md §9.15).
+    /// served IOC drain through ONE task.
     group_pump: Arc<super::group_pump::GroupPump>,
     /// Group PV registry. Wrapped in [`parking_lot::RwLock`] so iocsh
     /// commands (`dbLoadGroup`, `processGroups`) can mutate the
@@ -719,8 +720,8 @@ pub struct BridgeProvider {
     /// [`parking_lot::RwLock`], like every other lock in this struct: the
     /// critical section is a `HashMap` get/insert with no I/O in it, so an
     /// async lock bought nothing and cost a PI-invisible wait on the
-    /// GET/PUT hot path (doc/qsrv-rtems-design.md §5, L-A). The guard is
-    /// `!Send`, so a future that held one across an `.await` would fail the
+    /// GET/PUT hot path (L-A). The guard is `!Send`, so a future that held
+    /// one across an `.await` would fail the
     /// `+ Send` bound the `QsrvPvStore` source methods impose on every
     /// caller of this provider — the rule is enforced by construction, not
     /// by review.
@@ -745,7 +746,7 @@ pub struct BridgeProvider {
     /// file's contribution and `dbLoadGroup("-*")` clears them all
     /// (ioc/groupsourcehooks.cpp:133-183), then `processGroups` rebuilds the
     /// live group map from the remaining files plus the DB-info fragments
-    /// (groupsourcehooks.cpp:200-207). Each entry stores its source identity
+    /// (groupsourcehooks.cpp:192-214). Each entry stores its source identity
     /// `(filename, raw-macros)` AND the parsed `GroupPvDef` fragments so the
     /// live [`Self::groups`] map can be rebuilt field-by-field from the
     /// surviving sources — removal is NOT a whole-group-name delete, which
@@ -878,7 +879,7 @@ impl BridgeProvider {
     /// Which NT property leaves the channel `name` (`REC`, `REC.FIELD`, or a
     /// group member's channel) actually SUPPLIES — the record type's rset
     /// slots narrowed to the addressed field, as `dbChannelGet` narrows
-    /// `getProperties`'s option mask (`dbAccess.c:336-427`).
+    /// `getProperties`'s option mask (`dbAccess.c:336-426`).
     ///
     /// This is the same mask every [`Snapshot`](epics_base_rs::server::snapshot::Snapshot)
     /// carries; it is exposed separately for the paths that must decide which
@@ -1044,7 +1045,7 @@ impl BridgeProvider {
         // Rebuild the live map from all surviving sources, accumulating
         // field-by-field — a second file contributing distinct fields to
         // the same group name adds them rather than replacing the first
-        // file's group (groupsourcehooks.cpp:192-207, fieldConfigMap).
+        // file's group (groupsourcehooks.cpp:192-214, fieldConfigMap).
         self.rebuild_groups();
         Ok(())
     }
@@ -1064,7 +1065,7 @@ impl BridgeProvider {
         // removed file's group names: a group name shared with another file
         // or an `info(Q:group)` tag keeps the fields those sources
         // contributed (pvxs re-runs `processGroups` over the remaining file
-        // list, groupsourcehooks.cpp:200-207). The reported count is the
+        // list, groupsourcehooks.cpp:192-214). The reported count is the
         // number of group names that fully disappeared.
         self.rebuild_groups();
         let after = self.groups.read().len();
@@ -1176,7 +1177,7 @@ impl BridgeProvider {
     /// of `Field::Field` (ioc/field.cpp:23-25 → ioc/channel.cpp:37) and
     /// `createGroups` drops the WHOLE group. Building the group's value
     /// template throws for the same reason on a link-class member, and from
-    /// the same `try` block (groupconfigprocessor.cpp:461-465), so both
+    /// the same `try` block (groupconfigprocessor.cpp:453-465), so both
     /// refusals belong to this one gate. This is the port's single
     /// creation gate: the same answer feeds the `processGroups` report and
     /// [`Self::servable_group`], so a group with an unresolvable member can
@@ -1184,13 +1185,13 @@ impl BridgeProvider {
     /// group that fails every operation" state is not representable behind
     /// the gate.
     async fn group_creation_error(&self, def: &GroupPvDef) -> Option<String> {
-        for member in &def.members {
-            if member.channel.is_empty() {
+        for member in def.channels.iter() {
+            if !member.has_channel() {
                 // Channel-less members (Structure / Const / Proc mappings) never
                 // bind a dbChannel — pvxs skips them (`if(!def.channel.empty())`).
                 continue;
             }
-            if let Err(e) = super::channel::resolve_db_channel(&self.db, &member.channel).await {
+            if let Err(e) = super::channel::resolve_db_channel(&self.db, member).await {
                 return Some(e);
             }
             // A group member bound to an input or output link is refused
@@ -1202,7 +1203,7 @@ impl BridgeProvider {
             // `DBF_FWDLINK` is deliberately outside that range and builds.
             // The single-record path passes `errOnLinks = false`
             // (singlesource.cpp:192), so `REC.INP` stays servable on its own.
-            if let Some(class) = super::channel::channel_link_class(&self.db, &member.channel)
+            if let Some(class) = super::channel::channel_link_class(&self.db, member)
                 && class != epics_base_rs::types::DbfLinkClass::FwdLink
             {
                 return Some("Link fields not allowed in this context".to_string());
@@ -1266,7 +1267,7 @@ impl BridgeProvider {
     /// collides with a real record name — the record wins and the
     /// group is dropped at `defineGroups`
     /// (ioc/groupconfigprocessor.cpp:170-181), so the surviving
-    /// group map (ioc/groupsource.cpp:75-89) never contains a
+    /// group map (ioc/groupsource.cpp:76-89) never contains a
     /// shadowed name. The Rust daemon (`bin/qsrv_rs.rs`) never runs
     /// the `processGroups` finalize, so the same invariant — a name
     /// is a record OR a group, never both — is enforced here at the
@@ -1301,7 +1302,7 @@ impl BridgeProvider {
     /// The single shadow-aware predicate every group-specific helper
     /// consults so the "a name is a record XOR a group" invariant pvxs
     /// enforces in `defineGroups` (ioc/groupconfigprocessor.cpp:170-181,
-    /// live `groupMap` ioc/groupsource.cpp:75-89) holds on every path, not
+    /// live `groupMap` ioc/groupsource.cpp:76-89) holds on every path, not
     /// only the find/list/create serve path. Avoids cloning the
     /// `GroupPvDef` when only the existence answer is needed (e.g. the
     /// `is_writable` / `PROCESS` admission checks).
@@ -1333,7 +1334,7 @@ impl BridgeProvider {
     /// member's [`super::pvif::FieldMapping`] so callers can
     /// route a get/put through the existing single-record path.
     /// Mirrors pvxs `getGroupField` / `putGroupField`
-    /// (groupsource.cpp:408/497) at the lookup level — the actual
+    /// (groupsource.cpp:453-470 / :546-574) at the lookup level — the actual
     /// db_get / db_put is delegated to the caller.
     pub fn group_member(
         &self,
@@ -1342,8 +1343,11 @@ impl BridgeProvider {
     ) -> Option<(String, super::pvif::FieldMapping)> {
         let g = self.groups.read();
         let def = g.get(group)?;
-        let m = def.members.iter().find(|m| m.field_name == field)?;
-        Some((m.channel.clone(), m.mapping))
+        // The PEELED `record.FIELD`, off the channel the member already
+        // bound: callers hand it to `get_pv` / `put_pv`, which do not peel
+        // a `{json}` suffix.
+        let m = def.channels.iter().find(|m| m.def.field_name == field)?;
+        Some((m.pv_name.clone(), m.def.mapping))
     }
 
     /// Read a single field of a group as an [`epics_base_rs::types::EpicsValue`]. Mirrors
@@ -1606,11 +1610,29 @@ pub async fn channel_property_support(
     name: &str,
 ) -> epics_base_rs::server::snapshot::PropertySupport {
     let cn = epics_base_rs::server::database::filters::parse_channel_name(name);
-    let Some(rec_arc) = db.get_record(&cn.record) else {
+    property_support_for(db, &cn.record, &cn.field).await
+}
+
+/// The same answer for a group member, taken off the channel it already
+/// bound instead of re-parsing `+channel` per call.
+pub async fn member_property_support(
+    db: &PvDatabase,
+    member: &super::channel::MemberChannel,
+) -> epics_base_rs::server::snapshot::PropertySupport {
+    let (record, field) = member.names();
+    property_support_for(db, record, field).await
+}
+
+async fn property_support_for(
+    db: &PvDatabase,
+    record: &str,
+    field: &str,
+) -> epics_base_rs::server::snapshot::PropertySupport {
+    let Some(rec_arc) = db.get_record(record) else {
         return epics_base_rs::server::snapshot::PropertySupport::NONE;
     };
     let inst = rec_arc.read();
-    inst.property_support_for_field(&cn.field)
+    inst.property_support_for_field(field)
 }
 
 #[cfg(test)]
@@ -1626,15 +1648,22 @@ mod tests {
     /// - `$` on a `DBF_CHAR` waveform       → group NOT created
     ///   (`dbChannel.c:500-503` `S_dbLib_fieldNotFound`; the port used to
     ///   fabricate a `double` leaf for the unresolvable `VAL$` field)
-    /// - `$` on a `DBF_STRING` field        → group NOT created (deviation,
-    ///   see `channel::resolve_db_channel`: the group path has no `$` view,
-    ///   so admitting it yields a group that answers `FieldNotFound` to every
-    ///   GET — refused with a named reason instead)
+    /// - `$` on a `DBF_STRING` field        → group created; the eligible
+    ///   branch of `dbChannel.c:488-493`, served through the same
+    ///   char-array view the single-record path uses
+    ///   (`IOCSource::get` iocsource.cpp:133-136, reached from both
+    ///   `groupsource.cpp:344,377` and `singlesource.cpp:59,289`)
     /// - member bound to a DBF_INLINK field → group NOT created
     ///   (`IOCSource::getChannelValueType(chan, true)` throws
     ///   "Link fields not allowed in this context", iocsource.cpp:629-630)
     /// - member bound to the DBF_FWDLINK FLNK → group created; that class
     ///   is outside the range the type builder refuses
+    /// - a PARSEABLE `{json}` filter suffix → group created; `MemberChannel`
+    ///   binds the member's two chains once, so the suffix has somewhere to
+    ///   live and pvxs's `dbChannelCreate` per member channel succeeds
+    ///   (`ioc/channel.cpp:29-38`)
+    /// - an UNPARSEABLE filter suffix       → group NOT created
+    ///   (`dbChannel.c:513-529`)
     /// - every member resolves              → group created
     ///
     /// "Not created" is asserted at the client boundary, not just in the
@@ -1673,25 +1702,28 @@ mod tests {
                     "G:dollarstr":    { "value": { "+channel": "G:si.VAL$",    "+type": "plain" } },
                     "G:inlink":       { "value": { "+channel": "G:calc.INPA",  "+type": "plain" } },
                     "G:fwdlink":      { "value": { "+channel": "G:calc.FLNK",  "+type": "plain" } },
+                    "G:filtered":     { "value": { "+channel": "G:ai.VAL{\"dbnd\":{\"d\":0.5}}", "+type": "plain" } },
+                    "G:badfilter":    { "value": { "+channel": "G:ai.VAL{\"nosuch\":{}}", "+type": "plain" } },
                     "G:ok":           { "value": { "+channel": "G:ai.VAL",     "+type": "plain" } }
                 }"#,
             )
             .unwrap();
 
         // All seven are configured; only the creatable ones are created.
-        assert_eq!(provider.group_count(), 7, "all seven parse into the config");
+        assert_eq!(provider.group_count(), 9, "all nine parse into the config");
         assert_eq!(
             provider.process_groups().await,
-            2,
-            "`G:ok` and `G:fwdlink` bind a channel this server can serve"
+            4,
+            "`G:ok`, `G:dollarstr`, `G:fwdlink` and `G:filtered` bind a channel \
+             this server can serve"
         );
 
         for refused in [
             "G:missingrec",
             "G:missingfield",
             "G:dollarchar",
-            "G:dollarstr",
             "G:inlink",
+            "G:badfilter",
         ] {
             assert!(
                 !provider.channel_find(refused).await,
@@ -1706,6 +1738,14 @@ mod tests {
             provider.channel_find("G:ok").await,
             "G:ok: every member resolves; the group is served"
         );
+        assert!(
+            provider.channel_find("G:filtered").await,
+            "G:filtered: a parseable filter suffix is admitted, not refused"
+        );
+        assert!(
+            provider.channel_find("G:dollarstr").await,
+            "G:dollarstr: `$` on a DBF_STRING VAL is C's eligible branch"
+        );
         match provider.create_channel("G:ok").await.unwrap() {
             AnyChannel::Group(_) => {}
             AnyChannel::Single(_) => panic!("G:ok must build as a group"),
@@ -1713,6 +1753,10 @@ mod tests {
         match provider.create_channel("G:fwdlink").await.unwrap() {
             AnyChannel::Group(_) => {}
             AnyChannel::Single(_) => panic!("G:fwdlink must build as a group"),
+        }
+        match provider.create_channel("G:dollarstr").await.unwrap() {
+            AnyChannel::Group(_) => {}
+            AnyChannel::Single(_) => panic!("G:dollarstr must build as a group"),
         }
         // The refusal is the GROUP path's alone: `getValuePrototype` asks
         // the same function with `errOnLinks = false` (singlesource.cpp:192),
@@ -1725,8 +1769,8 @@ mod tests {
         let listed = provider.channel_list().await;
         assert_eq!(
             listed.iter().filter(|n| n.starts_with("G:")).count(),
-            6,
-            "the four records and the two created groups, nothing else: {listed:?}"
+            8,
+            "the four records and the four created groups, nothing else: {listed:?}"
         );
         assert!(
             listed.contains(&"G:ok".to_string()),
@@ -1892,7 +1936,7 @@ mod tests {
     /// Two `dbLoadGroup` files each contribute a distinct field to the
     /// SAME group name; pvxs accumulates both into one runtime group
     /// (all files loaded into one GroupConfigProcessor,
-    /// groupsourcehooks.cpp:192-207). Before the fix the second file's
+    /// groupsourcehooks.cpp:192-214). Before the fix the second file's
     /// load did a bare `insert` that replaced the first, dropping file
     /// A's field and making the group order-dependent and partial.
     #[tokio::test]
@@ -1928,9 +1972,9 @@ mod tests {
     /// when another file (or an `info(Q:group)` tag) contributed fields to
     /// the same group. pvxs erases only the removed file entry and re-runs
     /// `processGroups` over the remaining sources
-    /// (groupsourcehooks.cpp:174-207), so the surviving fields persist. The
-    /// prior Rust path tracked only group *names* per file and removed the
-    /// whole group on `-file`, losing the other sources' fields.
+    /// (groupsourcehooks.cpp:174-179,192-214), so the surviving fields
+    /// persist. The prior Rust path tracked only group *names* per file and
+    /// removed the whole group on `-file`, losing the other sources' fields.
     #[tokio::test]
     async fn group_file_remove_keeps_other_sources_fields_for_shared_group() {
         use epics_base_rs::server::database::PvDatabase;

@@ -9,7 +9,9 @@
 //! ## Read-only diagnostic PVs
 //!
 //! All names use the configurable prefix (no default — the feature is
-//! opt-in via [`super::gateway::PvaGatewayConfig::control_prefix`]):
+//! opt-in via `super::gateway::PvaGatewayConfig::control_prefix`, in a
+//! code span because `gateway` is not compiled on the reactor-free
+//! backend and this module is):
 //!
 //! | PV | Type | Description |
 //! |----|------|-------------|
@@ -48,10 +50,11 @@
 //! `rpc_checked` evaluates the control ACF against the peer's
 //! `(host, account, method, roles)`.
 
-// RTEMS-EXEC-MODEL-ALLOW(16): checked to pass feature-ON under
-// --features rtems-exec-model,pva-gateway (the gateway's spawns/timers ride the
-// runtime::task seam). The default feature-ON gate omits `pva-gateway`, so re-run
-// that combo when touching this module.
+// RTEMS-EXEC-MODEL-ALLOW(16): checked to pass on the exec backend under
+// `EPICS_RS_BUILD_EXEC_BACKEND=thread cargo nextest run -p epics-bridge-rs
+// --features pva-gateway` (the gateway's spawns/timers ride the runtime::task
+// seam; 739 run, 739 passed on this tree). The default exec-backend gate omits
+// `pva-gateway`, so re-run that combo when touching this module.
 
 use std::sync::Arc;
 
@@ -104,6 +107,12 @@ pub struct ControlSource {
     /// means "no default path configured" — `reload` then requires
     /// the `path` argument or fails with a clear error.
     acf_path: Option<String>,
+    /// The executor the diagnostic-refresh task in `subscribe` is spawned
+    /// through. Taken from the first registered `GatewayChannelSource`, so
+    /// the control surface and the namespace it administers spawn on one
+    /// executor; held as a value because `subscribe` is a trait method and
+    /// cannot take the capability as a parameter.
+    reactor: epics_base_rs::runtime::task::Reactor,
 }
 
 /// ASG every writable control PV resolves to under the control gate.
@@ -117,6 +126,7 @@ impl ControlSource {
     pub fn new(prefix: impl Into<String>, gateway_source: GatewayChannelSource) -> Self {
         Self {
             prefix: prefix.into(),
+            reactor: gateway_source.reactor().clone(),
             gateway_sources: vec![gateway_source],
             // Closed-by-default: with no control ACF the writable
             // surface denies every caller (see `control_gate`).
@@ -651,7 +661,7 @@ impl ChannelSource for ControlSource {
         let (tx, rx) = mpsc::channel::<PvField>(4);
         let me = self.clone();
         let pv_name = name.to_string();
-        epics_base_rs::runtime::task::spawn(async move {
+        self.reactor.spawn(async move {
             let mut tick =
                 epics_base_rs::runtime::task::interval(std::time::Duration::from_secs(1));
             tick.tick().await; // skip the immediate fire — server emits
@@ -688,7 +698,7 @@ mod tests {
 
     fn make_source() -> GatewayChannelSource {
         let client = Arc::new(PvaClient::builder().build());
-        let cache = ChannelCache::new(client, DEFAULT_CLEANUP_INTERVAL);
+        let cache = ChannelCache::new(crate::test_reactor(), client, DEFAULT_CLEANUP_INTERVAL);
         GatewayChannelSource::new(cache)
     }
 

@@ -15,11 +15,10 @@
 //! the obvious next move was to promote it within that crate so the PVA client
 //! could reach it too. Measured, that destination is wrong:
 //! `epics-ca-rs` does not depend on `epics-pva-rs` and must not — the only
-//! crate that depends on both is `epics-bridge-rs`, which sits *above* them
-//! (`doc/calink-rtems-design.md` §3.3). A primitive promoted inside
-//! `epics-pva-rs` is one the CA client structurally cannot call, so the next CA
-//! increment writes a third copy — exactly the outcome "one seam, two callers"
-//! exists to prevent.
+//! crate that depends on both is `epics-bridge-rs`, which sits *above* them.
+//! A primitive promoted inside `epics-pva-rs` is one the CA client
+//! structurally cannot call, so the next CA increment writes a third copy —
+//! exactly the outcome "one seam, two callers" exists to prevent.
 //!
 //! So it lands here, beside the rest of its family: `runtime::task::spawn`,
 //! `block_on_sync`/`park_on`, `StackSizeClass`, `spawn_dedicated_thread`,
@@ -42,13 +41,19 @@
 //!   `impl Write for &TcpStream` — never `try_clone`. `try_clone` is
 //!   `fcntl(F_DUPFD_CLOEXEC)`, and on RTEMS 6 that cannot work for a socket:
 //!   RTEMS's `fcntl` has no `F_DUPFD_CLOEXEC` case at all
-//!   (`cpukit/libcsupport/src/fcntl.c:146-220` falls to
-//!   `default: errno = EINVAL`), and even plain `F_DUPFD` fails because
-//!   `duplicate_iop` calls the file's `open_h` while rtems-libbsd installs
-//!   `rtems_bsd_sysgen_nodeops` on every socket. Measured on the target: `dup`,
-//!   `F_DUPFD` and `F_DUPFD_CLOEXEC` all fail on a socket while `F_DUPFD` on
-//!   `/dev/console` succeeds. A caller that reaches for `try_clone` compiles
-//!   and fails at runtime on target only.
+//!   (`cpukit/libcsupport/src/fcntl.c:146-220` (`rtems_6`) falls to
+//!   `default: errno = EINVAL`); RTEMS 7 handles it, so the ban is the series
+//!   we ship rather than RTEMS as such. The second half of this rationale --
+//!   that plain `F_DUPFD` fails too, because `duplicate_iop` reaches a socket
+//!   `open_h` that refuses -- is WITHDRAWN: at both declared libbsd pins
+//!   `rtems_bsd_sysgen_nodeops.open_h` is `rtems_bsd_sysgen_dup`
+//!   (`rtems-bsd-syscall-api.c:139-140` (both `rtems-libbsd` pins)), a real
+//!   dup. The measurement predates that change (libbsd `c86cbc57` /
+//!   `08d8e275`, 2026-07-28): `dup`, `F_DUPFD` and `F_DUPFD_CLOEXEC` all fail
+//!   on a socket while `F_DUPFD` on `/dev/console` succeeds. Sharing stands
+//!   whatever the stack does about dup, because it works on every target and
+//!   every series; a caller that reaches for `try_clone` compiles and fails at
+//!   runtime on target only.
 //! * **A blocking write needs a deadline, not a per-syscall timeout.**
 //!   `SO_SNDTIMEO` bounds each `write` syscall, so a peer that accepts one byte
 //!   per tick never trips it and holds the pump thread indefinitely — and a
@@ -102,8 +107,8 @@
 
 // RTEMS-EXEC-MODEL-ALLOW(1): `one_descriptor_serves_both_pumps` asserts both
 // pump directions concurrently from the async side, which needs the
-// multi-thread tokio flavor; it runs and passes in the feature-ON suite (the
-// pumps themselves are std threads, the tokio runtime only hosts the
+// multi-thread tokio flavor; it runs and passes in the exec-backend suite
+// (the pumps themselves are std threads, the tokio runtime only hosts the
 // assertions).
 
 use std::collections::VecDeque;
@@ -138,12 +143,24 @@ pub const DEFAULT_READ_CHUNK: usize = 4096;
 /// `IOC_OUT = 0x40000000`. For a 4-byte `int` that is
 /// `0x40000000 | (4 << 16) | ('f' << 8) | 127 = 0x4004_667F` — the same value
 /// the `libc` crate hardcodes for the whole BSD family (`unix/bsd/mod.rs`),
-/// which C `rsrv` runs on RTEMS in production. Pending on-target runtime
-/// verification at the QEMU/BSP phase; a wrong value only makes the `ioctl`
-/// error, and every caller then flushes (C's own `status < 0` branch),
-/// degrading to per-datagram / per-iteration flushing — never a hang or a
-/// crash. (Candidate for an upstream `libc` newlib/rtems binding so this
-/// local definition can later be dropped.)
+/// which C `rsrv` runs on RTEMS in production.
+///
+/// **MEASURED, not derived** (2026-08-26, `rtems-cfg-unix-trap-audit.md` U3).
+/// Compiling `const uint32_t v = FIONREAD;` with the target toolchains for
+/// `arm-rtems6` (gcc 13.3.0, newlib `1b3dcfd`) and `arm-rtems7` (gcc 15.2.0,
+/// newlib `7d4336cf`) emits `.word 1074030207` = `0x4004667F` on both. There
+/// is only one definition in the whole stack to agree with: rtems-libbsd
+/// defines no `FIONREAD` of its own and its socket handler
+/// (`freebsd/sys/kern/sys_socket.c:207-215` (both `rtems-libbsd` pins), `soo_ioctl`) compares against
+/// the same newlib macro, then writes
+/// `sbavail(&so->so_rcv) - so->so_rcv.sb_ctl`. It answers `EINVAL` for a
+/// LISTENING socket, which no caller here passes.
+///
+/// A wrong value would only make the `ioctl` error, and every caller then
+/// flushes (C's own `status < 0` branch), degrading to per-datagram /
+/// per-iteration flushing — never a hang or a crash. (Candidate for an
+/// upstream `libc` newlib/rtems binding so this local definition can later be
+/// dropped.)
 #[cfg(all(unix, not(target_os = "rtems")))]
 const FIONREAD_REQUEST: libc::c_ulong = libc::FIONREAD as libc::c_ulong;
 #[cfg(target_os = "rtems")]
@@ -218,7 +235,7 @@ fn pump_thread_lost(role: &str, label: &str, what: &str) {
         crate::runtime::log::ErrlogSevEnum::Major,
         &format!(
             "{label}: the {role} thread {what}; this connection is being torn \
-             down. Other connections are unaffected."
+             down. Other connections are unaffected.\n"
         ),
     );
     warn!(label, role, what, "blocking socket pump: a thread was lost");
@@ -828,7 +845,7 @@ const SEND_DONTWAIT: libc::c_int = libc::MSG_DONTWAIT;
 /// happens to be implemented.
 ///
 /// C reaches the same place the same way: `setNonBlock(fd, 1)` at connect under
-/// `USE_POLL` (`drvAsynIPPort.c:511`), with a poll on reads as well as writes.
+/// `USE_POLL` (`drvAsynIPPort.c:536`), with a poll on reads as well as writes.
 /// Which is also the evidence that the call is available on the embedded
 /// targets — it is `ioctl(FIONBIO)`, the one socket control C already relies on
 /// there, not one of the options VxWorks answers `ENOPROTOOPT` to.
@@ -989,10 +1006,9 @@ fn wait_writable(sock: &TcpStream, deadline: Instant) -> io::Result<bool> {
 /// `MSG_NBIO`, and `MSG_DONTWAIT` reaches it only as the sockbuf-lock wait
 /// hint, so on Darwin the send parked and the deadline was left riding on
 /// whatever `SO_SNDTIMEO` the caller had armed — measured, macOS CI
-/// 2026-07-27, `doc/darwin-send-dontwait-gap.md`. What makes the send return
-/// on every target is [`own_blocking_mode`]. The flag stays because where it
-/// *is* honoured it saves the loop a `poll` on the common path where the
-/// socket has room.
+/// 2026-07-27. What makes the send return on every target is
+/// [`own_blocking_mode`]. The flag stays because where it *is* honoured it
+/// saves the loop a `poll` on the common path where the socket has room.
 #[cfg(unix)]
 fn write_some(sock: &TcpStream, buf: &[u8]) -> io::Result<usize> {
     use std::os::fd::AsRawFd;
@@ -1073,10 +1089,9 @@ fn write_some(sock: &TcpStream, buf: &[u8]) -> io::Result<usize> {
 /// a socket option, and VxWorks 7 does not implement it — `setsockopt` returns
 /// `ENOPROTOOPT`, so on that target the deadline was silently absent and a peer
 /// that accepted the connection and then stopped reading parked the pump with
-/// nothing entitled to reclaim it
-/// (`doc/vxworks-circuit-wedge-on-target-measurement.md` §5). An invariant that
-/// one target can switch off is not an invariant; the wait is the caller's own
-/// now, and `SO_SNDTIMEO` is not set anywhere in this module.
+/// nothing entitled to reclaim it. An invariant that one target can switch off
+/// is not an invariant; the wait is the caller's own now, and `SO_SNDTIMEO` is
+/// not set anywhere in this module.
 ///
 /// A partial write on expiry needs no repair: the caller ends the pump and the
 /// connection is torn down, so nothing is ever written to this socket again.
@@ -1435,33 +1450,10 @@ mod tests {
     use std::net::{TcpListener, TcpStream as StdTcpStream};
     use std::thread;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
-
-    /// Production scope of this file: everything before the first column-0
-    /// `#[cfg(test)]`.
-    fn production_scope(src: &str) -> &str {
-        match src.find("\n#[cfg(test)]") {
-            Some(i) => &src[..i],
-            None => src,
-        }
-    }
-
-    /// The production scope with every comment removed.
-    ///
-    /// Both guards below forbid *code* from naming something, and this module's
-    /// docs name several of those things at length precisely because explaining
-    /// why they are forbidden is the point. Matching raw source made the
-    /// `try_clone` guard fail on its own rationale — five prose hits, zero code
-    /// hits — which is a guard that punishes documentation. Stripping comments
-    /// first is what makes the assertion mean what it says.
-    fn code_only(src: &str) -> String {
-        src.lines()
-            .map(|line| match line.find("//") {
-                Some(i) => &line[..i],
-                None => line,
-            })
-            .collect::<Vec<_>>()
-            .join("\n")
-    }
+    // The workspace's one production-slice rule. `Strip` because both guards
+    // below forbid *code* from naming something, and this module's docs name
+    // those things at length — explaining why they are forbidden is the point.
+    use source_guard::{Comments, production};
 
     /// The RTEMS constraint this module exists to satisfy: it must not reach
     /// for tokio's async net/timer/spawn machinery, none of which builds for
@@ -1474,7 +1466,7 @@ mod tests {
     /// itself under `include_str!`.
     #[test]
     fn the_blocking_io_seam_has_no_async_runtime_symbols() {
-        let prod = code_only(production_scope(include_str!("blocking_io.rs")));
+        let prod = production(include_str!("blocking_io.rs"), Comments::Strip);
         // Fail closed: if the seam is no longer in the slice, the slice is
         // wrong and every assertion below would pass vacuously.
         assert!(
@@ -1505,7 +1497,7 @@ mod tests {
     /// wrong. This gives them one.
     #[test]
     fn the_seam_never_duplicates_a_descriptor() {
-        let prod = code_only(production_scope(include_str!("blocking_io.rs")));
+        let prod = production(include_str!("blocking_io.rs"), Comments::Strip);
         assert!(
             prod.contains("fn drive_socket_blocking"),
             "production slice no longer covers the seam"
@@ -1682,10 +1674,9 @@ mod tests {
     ///
     /// This is the VxWorks 7 boundary: `setsockopt(SO_SNDTIMEO)` is
     /// unimplemented there and returns `ENOPROTOOPT`, so no caller can arm the
-    /// option however hard it tries
-    /// (`doc/vxworks-circuit-wedge-on-target-measurement.md` §5). The two cases
-    /// above cover "the option took"; this one covers "it did not", which is
-    /// the only case where the deadline had nothing to regain control on.
+    /// option however hard it tries. The two cases above cover "the option
+    /// took"; this one covers "it did not", which is the only case where the
+    /// deadline had nothing to regain control on.
     ///
     /// The write runs on its own thread and the assertion is on a bounded
     /// `recv`, because the failure being excluded is a park with no end: a
@@ -1952,11 +1943,9 @@ mod tests {
     /// worker is borrowed, never created per connection.
     #[test]
     fn every_pump_loss_goes_through_the_announcement() {
-        let prod = production_scope(include_str!("blocking_io.rs"));
+        let prod = production(include_str!("blocking_io.rs"), Comments::Strip);
         assert_eq!(
-            code_only(prod)
-                .matches(concat!("let _ = jo", "b.join()"))
-                .count(),
+            prod.matches(concat!("let _ = jo", "b.join()")).count(),
             0,
             "a discarded join result is a panicked pump nobody hears about"
         );

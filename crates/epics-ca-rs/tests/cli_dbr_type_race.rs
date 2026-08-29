@@ -26,12 +26,7 @@
 //! These drive the REAL `caget-rs` binary against an in-process `CaServer`, so
 //! they pin the tool's printed bytes rather than any internal resolver.
 
-// Host/tokio-only: drives the async `caget`/`caput` CLI binaries out of
-// process. Those binaries are built with this feature too, so their
-// `CaClient` stack routes `spawn` to the background executor and then
-// reaches tokio I/O with no reactor. Inapplicable under the executor
-// backend; the RTEMS model has no async CLI client.
-#![cfg(not(feature = "rtems-exec-model"))]
+#![cfg(tokio_backend)]
 
 use std::process::Command;
 

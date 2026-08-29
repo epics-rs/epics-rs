@@ -24,8 +24,8 @@
 //! * `[0, nNew)` — what the writer delivered.
 //! * `[nNew, numElements)` — ZEROED, on BOTH paths. The link's zero-fill is the
 //!   `fetch_values` code above; the client's is `put_array_info`
-//!   (`aCalcoutRecord.c:726-731`), which `dbPut` calls for every SPC_DBADDR field
-//!   it writes (`dbAccess.c:1366-1369`):
+//!   (`aCalcoutRecord.c:729-731`), which `dbPut` calls for every SPC_DBADDR field
+//!   it writes (`dbAccess.c:1365-1368`):
 //!
 //!   ```c
 //!   if ( pd && (nNew < numElements) )
@@ -40,9 +40,10 @@
 //!   corrects what R14-7 wrote here — the two writers do not agree:
 //!
 //!   - the LINK cannot. It asks for `nRequest = acalcGetNumElements(pcalc)`
-//!     elements (`:1096-1097`), so the window is all that ever arrives.
-//!   - a CLIENT can. `dbPut` clamps at `paddr->no_elements` (`dbAccess.c:1322`,
-//!     `:1361-1362`), and `cvt_dbaddr` (`:627-631`) sets that to `pcalc->nelm`
+//!     elements (`:1097-1098`), so the window is all that ever arrives.
+//!   - a CLIENT can. `dbPut` clamps at `paddr->no_elements` (`dbAccess.c:1321`,
+//!     `:1360-1361`), and `cvt_dbaddr` (`aCalcoutRecord.c:627-631`) sets that
+//!     to `pcalc->nelm`
 //!     unless SIZE is NUSE — and SIZE DEFAULTS to NELM, the first choice of the
 //!     menu (`aCalcoutRecord.dbd:32-35`). So by default a caput may fill the whole
 //!     buffer, hidden tail included.
@@ -159,7 +160,7 @@ fn aval_and_oav_take_the_same_client_put_rule() {
 }
 
 /// R14-7 — the write is BOUNDED at the window, not at NELM. C asks the link for
-/// exactly `nRequest = acalcGetNumElements(pcalc)` elements (`:1096-1097`), so a
+/// exactly `nRequest = acalcGetNumElements(pcalc)` elements (`:1097-1098`), so a
 /// source longer than the NUSE window is truncated at it and CANNOT reach the
 /// hidden `[numElements, nelm)` — the region the splice exists to preserve. The
 /// port spliced up to NELM, so an over-long INAA source overwrote the tail.
@@ -186,8 +187,9 @@ fn an_over_long_link_fetch_stops_at_the_window() {
 }
 
 /// R15-2 — the CLIENT's bound is NOT the link's. `dbPut` clamps at
-/// `paddr->no_elements` (`dbAccess.c:1322`, `:1361-1362`), which `cvt_dbaddr`
-/// sets to `pcalc->nelm` under the default SIZE=NELM (`:627-631`). So a caput of
+/// `paddr->no_elements` (`dbAccess.c:1321`, `:1360-1361`), which `cvt_dbaddr`
+/// sets to `pcalc->nelm` under the default SIZE=NELM
+/// (`aCalcoutRecord.c:627-631`). So a caput of
 /// ten elements into a NUSE=4 window lands ALL TEN — the six past the window are
 /// written, they are just hidden until NUSE grows.
 ///
@@ -212,7 +214,7 @@ fn a_client_put_may_fill_the_whole_nelm_buffer_past_the_nuse_window() {
 }
 
 /// A client put SHORTER than the window still zero-fills `[nNew, numElements)` —
-/// `put_array_info`'s loop is bounded by `acalcGetNumElements` (`:724-731`), the
+/// `put_array_info`'s loop is bounded by `acalcGetNumElements` (`:727-731`), the
 /// window, whatever the request was allowed to be. The hidden tail is untouched:
 /// no writer ever zeroes it.
 #[test]
@@ -235,7 +237,7 @@ fn a_short_client_put_zero_fills_the_window_and_leaves_the_hidden_tail() {
 }
 
 /// NELM is the client's ceiling — `no_elements` is `pcalc->nelm` and `dbPut`
-/// clamps there (`dbAccess.c:1361-1362`). The surplus is dropped, not an error.
+/// clamps there (`dbAccess.c:1360-1361`). The surplus is dropped, not an error.
 #[test]
 fn a_client_put_longer_than_nelm_is_clamped_at_nelm() {
     let mut rec = record_with_full_aa();
@@ -248,7 +250,8 @@ fn a_client_put_longer_than_nelm_is_clamped_at_nelm() {
     );
 }
 
-/// SIZE=NUSE is the OTHER branch of `cvt_dbaddr` (`:627-628`): the record reports
+/// SIZE=NUSE is the OTHER branch of `cvt_dbaddr` (`aCalcoutRecord.c:627-628`):
+/// the record reports
 /// the window as its element count, so `dbPut` clamps the client there too. This
 /// is the case R14-7 mistook for the default.
 #[test]

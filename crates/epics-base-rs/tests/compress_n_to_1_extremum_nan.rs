@@ -1,6 +1,6 @@
 //! compress `N to 1 Low/High Value` seeds from the chunk's first sample.
 //!
-//! C `compress_array` (`compressRecord.c:183-196`):
+//! C `compress_array` (`compressRecord.c:185-200`):
 //!
 //! ```c
 //!     value = *psource++;
@@ -16,7 +16,7 @@
 //! as the identity itself.
 //!
 //! `selRecord.c:361-377` really does seed `±epicsINF` and guard `!isnan`, and
-//! `calcPerform.c:191-207` lets a NaN ARGUMENT win via `isnan(d)`. Those are
+//! `calcPerform.c:190-206` lets a NaN ARGUMENT win via `isnan(d)`. Those are
 //! three different rules in C; this file pins compress's.
 //!
 //! Ground truth is the C source above; the scalar arm (`compress_scalar`,

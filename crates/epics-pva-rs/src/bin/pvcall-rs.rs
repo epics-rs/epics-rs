@@ -105,7 +105,7 @@ fn collect_args(tokens: &[String]) -> Result<Vec<(String, ScalarValue)>, String>
 /// Delegates to the shared [`epics_pva_rs::nt::NTURI::request`] builder
 /// so the request carries **all four** normative members — `scheme`,
 /// `authority`, `path`, `query` — that pvxs `NTURI::NTURI()` defines
-/// (`src/nt.cpp:253-262`). The previous hand-rolled descriptor omitted
+/// (`src/nt.cpp:253-263`). The previous hand-rolled descriptor omitted
 /// `authority`, so a strict NTURI receiver keying off
 /// `struct_id="epics:nt/NTURI:1.0"` saw a non-pvxs shape.
 fn build_nturi(pv_name: &str, args: &[(String, ScalarValue)]) -> (FieldDesc, PvField) {
@@ -155,7 +155,7 @@ async fn main() {
     // `tryWait`, `epicsEvent.h:101-107`), not a 5 s wait. Route `-w`
     // through `wait_timeout_duration` so a non-positive value maps to an
     // immediate (zero) operation timeout rather than the generic
-    // `timeout_duration` 5 s clamp (tools/call.cpp:44-65,125-154).
+    // `timeout_duration` 5 s clamp (tools/call.cpp:44-65,150-155).
     let client = PvaClient::builder()
         .timeout(epics_pva_rs::cli::wait_timeout_duration(args.timeout))
         .build();
@@ -221,7 +221,7 @@ mod tests {
     }
 
     /// The built NTURI advertises all four normative members, including
-    /// `authority` (pvxs `NTURI::NTURI()`, `src/nt.cpp:253-262`). The
+    /// `authority` (pvxs `NTURI::NTURI()`, `src/nt.cpp:253-263`). The
     /// pre-fix hand-rolled descriptor omitted `authority`.
     #[test]
     fn nturi_descriptor_includes_authority() {
@@ -306,7 +306,7 @@ mod tests {
     }
 
     /// `pvcall-rs -w 0` is an immediate completion poll (pvxs `pvxcall`
-    /// inherits epicsEvent `tryWait`, `tools/call.cpp:125-154`,
+    /// inherits epicsEvent `tryWait`, `tools/call.cpp:150-155`,
     /// `epicsEvent.h:101-107`): the parsed `-w 0` maps to a zero
     /// operation timeout, NOT the prior 5 s clamp.
     #[test]

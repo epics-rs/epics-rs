@@ -257,7 +257,7 @@ impl DrvVxi11Port {
         //     if(!pvxiPort->isSingleLink) attributes |= ASYN_MULTIDEVICE;
         //
         // `isGpibLink` never enters that test, so an unrecognized — or EMPTY —
-        // `vxiName` leaves `isSingleLink` clear and IS a 31-address gateway.
+        // `vxiName` leaves `isSingleLink` clear and IS a 32-address gateway.
         // The empty name is the common older-`st.cmd` form
         // `vxi11Configure("L0","host",0,"1.0","",0,0)`; deriving the flag from
         // the GPIB arm instead capped that port at address 0 and lost every
@@ -268,8 +268,10 @@ impl DrvVxi11Port {
         // later is multi-device by construction, as it is in C.
         let single_link = matches!(config.link_kind, VxiLinkKind::Single);
         let multi_device = !single_link;
-        // GPIB addresses 0..30 (NUM_GPIB_ADDRESSES = 31, drvVxi11.c).
-        let max_addr = if multi_device { 31 } else { 1 };
+        // GPIB addresses 0..31 (NUM_GPIB_ADDRESSES = 32, asynGpibDriver.h:37;
+        // drvVxi11.c uses it, e.g. the `addr < NUM_GPIB_ADDRESSES` scan loops
+        // at :1016 and :1738, but does not define it).
+        let max_addr = if multi_device { 32 } else { 1 };
 
         let mut base = PortDriverBase::new(
             port_name,
@@ -277,7 +279,7 @@ impl DrvVxi11Port {
             PortFlags {
                 multi_device,
                 can_block: true,
-                destructible: true,
+                ..PortFlags::default()
             },
         );
         base.init_connected(false);
@@ -337,7 +339,8 @@ impl PortDriver for DrvVxi11Port {
     /// asynInt32 on a GPIB port is asynGpib's SRQ interrupt source, not a
     /// readable register: `read`/`write` are the asynInt32Base defaults and
     /// fail. See [`crate::interfaces::gpib::int32_read_not_supported`], which
-    /// documents why the read reports the READ (CBUG-B10 — C says "write").
+    /// documents why the read reports the READ (CBUG-B10 — C said "write"
+    /// until asyn #237; it says "read" too now).
     fn read_int32(&mut self, _user: &AsynUser) -> AsynResult<i32> {
         Err(crate::interfaces::gpib::int32_read_not_supported())
     }
@@ -391,7 +394,7 @@ impl PortDriver for DrvVxi11Port {
     /// has none — `asynGpib.c:601` registers the octet interface with
     /// `processEosIn = 0` because the terminator belongs in the `device_read`
     /// request. Its two-byte allowance is wrong here too; `vxiSetEos`'s
-    /// `default:` arm and `asynGpib::setInputEos` (`asynGpib.c:440-446`) both
+    /// `default:` arm and `asynGpib::setInputEos` (`asynGpib.c:441-446`) both
     /// refuse anything past one character.
     fn set_input_eos(&mut self, user: &AsynUser, eos: &[u8]) -> AsynResult<()> {
         match eos.len() {
@@ -481,9 +484,9 @@ mod tests {
 
         let mut drv = drv;
         let mut user = AsynUser::default();
-        // CBUG-B10: C's asynInt32Base `readDefault` reports "write is not
-        // supported" (a copy-paste from `writeDefault`); the read path here
-        // names the read.
+        // CBUG-B10: C's asynInt32Base `readDefault` reported "write is not
+        // supported" (a copy-paste from `writeDefault`) until asyn #237
+        // merged; the read path here named the read first, and now agrees.
         assert_eq!(
             drv.read_int32(&user).unwrap_err().message(),
             "read is not supported"
@@ -551,8 +554,8 @@ mod tests {
     fn gateway_link_is_multi_device() {
         let drv = DrvVxi11Port::configure("vxi0", "10.0.0.1", 0, "", "gpib0", 0, false).unwrap();
         assert!(drv.base().flags.multi_device);
-        // C NUM_GPIB_ADDRESSES = 31 → max_addr 31.
-        assert_eq!(drv.base().max_addr, 31);
+        // C NUM_GPIB_ADDRESSES = 32 (asynGpibDriver.h:37) → max_addr 32.
+        assert_eq!(drv.base().max_addr, 32);
     }
 
     #[test]
@@ -566,7 +569,7 @@ mod tests {
     /// `isGpibLink` prefixes, the two `isSingleLink` prefixes, an unrecognized
     /// name, and the empty name that older `st.cmd` files pass. MULTIDEVICE is
     /// the default and only `inst*`/`com*` opt out, so four of the six are
-    /// 31-address gateways.
+    /// 32-address gateways.
     #[test]
     fn multi_device_is_the_default_and_only_a_single_link_opts_out() {
         for (vxi_name, kind, multi) in [
@@ -591,7 +594,7 @@ mod tests {
             );
             assert_eq!(
                 drv.base().max_addr,
-                if multi { 31 } else { 1 },
+                if multi { 32 } else { 1 },
                 "max_addr for {vxi_name:?}"
             );
         }

@@ -15,7 +15,7 @@
 //! socket. That gives us byte-exact validation of the handler
 //! without pulling in pvxs as a build dep.
 
-// RTEMS-EXEC-MODEL-ALLOW(3): not run by the default nextest profile - this file is a module of the `interop_pvxs` binary, which `.config/nextest.toml`'s default-filter excludes.
+#![cfg(tokio_backend)]
 
 use std::io::Read;
 use std::time::Duration;
@@ -23,7 +23,8 @@ use std::time::Duration;
 use epics_pva_rs::proto::{ByteOrder, Command, PvaHeader, ReadExt, WriteExt};
 
 /// Build a TCP-circuit SEARCH frame for one PV name.
-/// Wire layout (pvxs `clientdiscover.cpp:121-188` / Rust UDP
+/// Wire layout (pvxs `ContextImpl::tickSearch`, `src/client.cpp:1067-1096`
+/// for the body and `src/client.cpp:1216-1219` for the TCP fixups / Rust UDP
 /// builder, identical body shape):
 ///
 /// ```text
@@ -126,7 +127,8 @@ fn complete_handshake(stream: &mut std::net::TcpStream) -> ByteOrder {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn interop_r11_tcp_circuit_search_returns_matching_cid() {
     use epics_pva_rs::pvdata::{FieldDesc, PvField, ScalarType, ScalarValue};
-    use epics_pva_rs::server_native::{PvaServer, SharedPV, SharedSource};
+    use epics_pva_rs::server_native::PvaServer;
+    use epics_pva_rs::server_native::{SharedPV, SharedSource};
 
     // Set up a Rust PVA server hosting one PV.
     let pv = SharedPV::new();
@@ -236,7 +238,8 @@ async fn interop_r11_tcp_circuit_search_returns_matching_cid() {
 async fn interop_r11_pvxget_via_name_server_resolves_pv_on_rust_server() {
     use super::interop_helpers::{PVXGET, pvxs_command, require_pvxs};
     use epics_pva_rs::pvdata::{FieldDesc, PvField, PvStructure, ScalarType, ScalarValue};
-    use epics_pva_rs::server_native::{PvaServer, SharedPV, SharedSource};
+    use epics_pva_rs::server_native::PvaServer;
+    use epics_pva_rs::server_native::{SharedPV, SharedSource};
     use std::sync::Arc;
     use std::time::Duration;
 
@@ -287,10 +290,7 @@ async fn interop_r11_pvxget_via_name_server_resolves_pv_on_rust_server() {
 
     let output = match output {
         Ok(o) => o,
-        Err(e) => {
-            eprintln!("SKIP: failed to spawn pvxget: {e}");
-            return;
-        }
+        Err(e) => panic!("failed to spawn pvxget: {e}"),
     };
 
     let stdout = String::from_utf8_lossy(&output.stdout).to_string();
@@ -353,7 +353,8 @@ fn build_truncated_tcp_search_frame(order: ByteOrder) -> Vec<u8> {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn interop_r11_malformed_tcp_search_closes_circuit() {
     use epics_pva_rs::pvdata::{FieldDesc, PvField, PvStructure, ScalarType, ScalarValue};
-    use epics_pva_rs::server_native::{PvaServer, SharedPV, SharedSource};
+    use epics_pva_rs::server_native::PvaServer;
+    use epics_pva_rs::server_native::{SharedPV, SharedSource};
 
     let pv = SharedPV::new();
     pv.open(

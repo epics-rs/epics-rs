@@ -122,9 +122,10 @@ This crate owns the two real-time levers a Linux RT deployment uses:
   is the operator's side: an `RTPRIO` rlimit, `CAP_SYS_NICE`, or launching
   under `chrt`.
 
-The `rtems-exec-model` feature is the matching execution-model switch for a
-blocking-front-end deployment (dedicated OS threads, no tokio reactor) — its
-comment in `Cargo.toml` states the intended Linux PREEMPT_RT use.
+`EPICS_RS_BUILD_EXEC_BACKEND=thread` is the matching execution-model switch
+for a blocking-front-end deployment (dedicated OS threads, no tokio reactor) —
+`crates/epics-libcom-rs/build.rs` states the intended Linux PREEMPT_RT use, and
+why the switch is an environment variable rather than a cargo feature.
 
 Measured on a PREEMPT_RT kernel in `doc/rtlinux-rt-measurement.md`: with PI on,
 the record-gate priority inversion the mutex was built to kill collapses to the

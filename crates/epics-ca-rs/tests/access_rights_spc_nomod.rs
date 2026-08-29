@@ -4,9 +4,9 @@
 //! only the first:
 //!
 //! * `dbPut` (`dbAccess.c:123-126`) — refuses the write. The port's gate.
-//! * `rsrvCheckPut` (`rsrv/camessage.c:2608-2619`) —
+//! * `rsrvCheckPut` (`rsrv/camessage.c:2540-2551`) —
 //!   `if (dbChannelSpecial(pciu->dbch) == SPC_NOMOD) return 0;` — which feeds
-//!   the `CA_PROTO_ACCESS_RIGHTS` write bit (`camessage.c:1154-1156`). Missing
+//!   the `CA_PROTO_ACCESS_RIGHTS` write bit (`camessage.c:1123-1125`). Missing
 //!   here, so the server advertised WRITE on ~15 dbCommon fields of every
 //!   record; medm/CSS enable the write widget, the client sends the put, and
 //!   the server-side gate refuses it with an async exception instead of C's
@@ -20,7 +20,7 @@
 //! cainfo N1.SEVR   Access: read, no write
 //! cainfo N1.NAME   Access: read, no write
 //! cainfo N1.PACT   Access: read, no write
-//! cainfo CMP       Access: read, no write     <- compressRecord.c:403-404,
+//! cainfo CMP       Access: read, no write     <- compressRecord.c:404,
 //!                                                cvt_dbaddr raises SPC_NOMOD
 //!                                                from record STATE
 //! caput N1.SEVR 2  ERROR: Write access denied
@@ -30,14 +30,8 @@
 //! Both halves of the declaration are covered: the dbCommon set (which no
 //! record's `field_list` declares) and the state-raised `field_no_mod`.
 
-// Host/tokio-only: builds the async `CaClient`/`CaServer` stack in process.
-// Under `rtems-exec-model` the `runtime::task` seam routes their `spawn`
-// to the background executor, whose worker has no tokio reactor, so the
-// listener/transport tasks panic. The RTEMS model serves from
-// `BlockingCaServer` instead, so this path is inapplicable there.
-#![cfg(not(feature = "rtems-exec-model"))]
-
-use std::time::Duration;
+#![cfg(tokio_backend)]
+#![cfg(feature = "client-core")]
 
 use epics_ca_rs::client::CaClient;
 use epics_ca_rs::server::CaServer;
@@ -79,7 +73,7 @@ async fn serve() -> u16 {
 /// `(read, write)` as the connected channel's ACCESS_RIGHTS reports them.
 async fn access(client: &CaClient, pv: &str) -> (bool, bool) {
     let ch = client.create_channel(pv);
-    ch.wait_connected(Duration::from_secs(3))
+    ch.wait_connected(budget::FACT_BUDGET)
         .await
         .unwrap_or_else(|e| panic!("{pv} must connect: {e:?}"));
     let info = ch.info().await.expect("channel info");
@@ -114,7 +108,7 @@ async fn dbcommon_nomod_fields_advertise_no_write() {
 }
 
 /// The other half of the declaration: an SPC_NOMOD a record raises from its own
-/// state (`compressRecord.c:403-404` — `if (prec->balg == bufferingALG_LIFO)
+/// state (`compressRecord.c:404` — `if (prec->balg == bufferingALG_LIFO)
 /// paddr->special = SPC_NOMOD;`), which no static field table can express.
 #[tokio::test(flavor = "multi_thread")]
 #[serial]
@@ -141,7 +135,7 @@ async fn a_put_to_a_nomod_field_is_still_refused() {
     let client = CaClient::new().await.expect("client");
 
     let ch = client.create_channel("N1.SEVR");
-    ch.wait_connected(Duration::from_secs(3))
+    ch.wait_connected(budget::FACT_BUDGET)
         .await
         .expect("connect");
 
@@ -151,3 +145,6 @@ async fn a_put_to_a_nomod_field_is_still_refused() {
         "SPC_NOMOD refuses the write on every route; got {put:?}"
     );
 }
+
+#[path = "common/budget.rs"]
+mod budget;

@@ -1000,8 +1000,8 @@ fn successful_out_put_sets_sts_success_and_advances_sent() {
     rec.val = 5.0;
     let first = rec.process().unwrap();
     report_put(&mut rec, &first.actions, false);
-    assert_eq!(rec.sts, 2, "STS=Success (C :567)");
-    assert_eq!(rec.sent, 5.0, "SENT takes the value that landed (C :568)");
+    assert_eq!(rec.sts, 2, "STS=Success (C :565)");
+    assert_eq!(rec.sent, 5.0, "SENT takes the value that landed (C :566)");
     assert_eq!(rec.osent, 0.0);
 
     rec.val = 7.0;
@@ -1019,7 +1019,7 @@ fn failed_out_put_sets_sts_error_and_leaves_sent() {
     let outcome = rec.process().unwrap();
     report_put(&mut rec, &outcome.actions, true);
 
-    assert_eq!(rec.sts, 1, "STS=Error (C :574-575)");
+    assert_eq!(rec.sts, 1, "STS=Error (C :572-573)");
     assert_eq!(rec.sent, 0.0, "a put that failed must not advance SENT");
     assert_eq!(rec.osent, 0.0);
 }
@@ -1055,4 +1055,31 @@ fn a_failed_put_after_a_successful_one_reports_error() {
         "STS follows the latest put, not the last good one"
     );
     assert_eq!(rec.sent, 5.0, "SENT still reads the value that landed");
+}
+
+/// `throttleRecord.c:451-464` — `get_precision` answers `prec->dprec` for the
+/// DLY field and `prec->prec` for every other. DLY is the delay in seconds and
+/// carries its own display precision precisely because the two are unrelated:
+/// a value read to 3 digits does not make its cooldown a 3-digit number.
+#[test]
+fn dly_serves_dprec_and_every_other_double_field_serves_prec() {
+    use epics_base_rs::server::record::RecordInstance;
+
+    let mut rec = ThrottleRecord::default();
+    rec.put_field("PREC", EpicsValue::Short(3)).unwrap();
+    rec.put_field("DPREC", EpicsValue::Short(1)).unwrap();
+    let inst = RecordInstance::new("THR:PREC".into(), rec);
+
+    assert_eq!(
+        inst.snapshot_for_field("DLY").unwrap().precision(),
+        Some(1),
+        "DLY takes DPREC"
+    );
+    for field in ["VAL", "SENT", "OVAL", "DRVLH", "DRVLL"] {
+        assert_eq!(
+            inst.snapshot_for_field(field).unwrap().precision(),
+            Some(3),
+            "{field} takes PREC"
+        );
+    }
 }

@@ -5,7 +5,7 @@
 //! Sources are keyed by `(order, name)` and consulted in ascending key
 //! order — the same key pvxs uses for its registry
 //! (`std::map<std::pair<int, std::string>, ...>`, `serverconn.h:267`,
-//! inserted at `server.cpp:91`, iterated at `server.cpp:696` and
+//! inserted at `src/server.cpp:91`, iterated at `src/server.cpp:696` and
 //! `serverchan.cpp:304`). Lower `order` is tried first (`order=0` is the
 //! default) and an equal-`order` tie is broken by byte-wise source NAME,
 //! never by registration order. Source names beginning with "__" are
@@ -54,7 +54,7 @@ pub struct CompositeSource {
     /// reload path).
     access_gate: epics_base_rs::server::access_security::AccessGate,
     /// Monotonic registry-topology counter, mirroring pvxs
-    /// `Server::pvt->beaconChange` (server.cpp:90-115). Bumped on every
+    /// `Server::pvt->beaconChange` (src/server.cpp:90-115). Bumped on every
     /// [`Self::add_source`] / [`Self::remove_source`] and surfaced
     /// through [`ChannelSource::beacon_change`] so the UDP beacon task
     /// advances the beacon `change_count` on a registry mutation even
@@ -106,11 +106,11 @@ impl CompositeSource {
 
     /// Add a source under the key `(order, name)`. Errors when that key
     /// is already present — pvxs convention so callers notice
-    /// double-registration (`server.cpp:91-93`). Higher priority = lower
+    /// double-registration (`src/server.cpp:91-93`). Higher priority = lower
     /// `order`; two sources sharing an `order` are consulted in byte-wise
     /// name order, exactly as pvxs's `std::map<std::pair<int,
     /// std::string>, ...>` does (`serverconn.h:268`). pvxs keeps its own
-    /// internals at `order = -1` (`server.cpp:542-546`) and application
+    /// internals at `order = -1` (`src/server.cpp:542-546`) and application
     /// sources default to `order = 0` (`pvxs/server.h:116-118`).
     pub fn add_source(&self, name: &str, source: DynSource, order: i32) -> Result<(), String> {
         let mut e = self.entries.write();
@@ -123,7 +123,7 @@ impl CompositeSource {
             }
         }
         // pvxs `Server::addSource` bumps `beaconChange` unconditionally
-        // (server.cpp:90-96) so the next BEACON signals the topology
+        // (src/server.cpp:90-96) so the next BEACON signals the topology
         // change. Bump after the successful insert only.
         self.beacon_change.fetch_add(1, Ordering::Relaxed);
         Ok(())
@@ -133,20 +133,24 @@ impl CompositeSource {
     /// (`name`, `order`) tuple. Returns `None` when not found.
     pub fn remove_source(&self, name: &str, order: i32) -> Option<DynSource> {
         let mut e = self.entries.write();
-        let removed = e.remove(&(order, name.to_string()))?;
-        // pvxs `Server::removeSource` bumps `beaconChange` on a real
-        // erase (server.cpp:100-115). Bump only when something was
-        // removed (the `?` above already returned on a miss).
+        let removed = e.remove(&(order, name.to_string()));
+        // pvxs `Server::removeSource` bumps `beaconChange` OUTSIDE the
+        // `if(it!=pvt->sources.end())` that performs the erase
+        // (src/server.cpp:109-113), so a remove naming an absent
+        // (`name`, `order`) still advances the counter. Unconditional
+        // here for the same reason: the caller asked for a topology
+        // change, and pvxs lets the next BEACON carry a new change count
+        // either way.
         self.beacon_change.fetch_add(1, Ordering::Relaxed);
-        Some(removed)
+        removed
     }
 
     /// Current registry beacon-change counter. Mirrors pvxs
-    /// `Server::pvt->beaconChange` (server.cpp:90-115).
+    /// `Server::pvt->beaconChange` (src/server.cpp:90-115).
     ///
     /// pvxs keeps a SINGLE counter that both `addSource` / `removeSource`
     /// AND the built-in `StaticSource` registry (`addPV` / `removePV`)
-    /// bump (`server.cpp:95,113,180,189`). To reproduce that single-counter
+    /// bump (`src/server.cpp:95,113,180,189`). To reproduce that single-counter
     /// view across the Rust source tree, fold every inner source's own
     /// [`ChannelSource::beacon_change`] into this composite's local
     /// add/remove counter. Otherwise a built-in
@@ -235,7 +239,7 @@ impl ChannelSource for CompositeSource {
     /// Surface the aggregated registry beacon-change counter so the UDP
     /// beacon task advances its `change_count` on a source add/remove AND
     /// on a built-in `SharedSource` PV add/remove (pvxs `beaconChange`,
-    /// server.cpp:90-115). Delegates to the inherent
+    /// src/server.cpp:90-115). Delegates to the inherent
     /// [`CompositeSource::beacon_change`], which folds inner sources.
     fn beacon_change(&self) -> u64 {
         CompositeSource::beacon_change(self)
@@ -330,7 +334,7 @@ impl ChannelSource for CompositeSource {
     /// SEARCH aggregation is separate from CREATE/GET/PUT/RPC ownership.
     /// pvxs runs `Source::onSearch` on every registered source and lets
     /// each independently mark its claim in the shared `Search` object
-    /// (`server.cpp:694-712`, `serverchan.cpp:212-221`); a name is
+    /// (`src/server.cpp:694-712`, `serverchan.cpp:212-221`); a name is
     /// answered when at least one source claims it. The built-in
     /// `ServerSource::onSearch` is empty (`serversource.cpp:25-28`), so
     /// the diagnostic `server` PV claims nothing and never *suppresses*
@@ -369,7 +373,7 @@ impl ChannelSource for CompositeSource {
     /// `searchable_from` across every source, so a
     /// source can claim a PV only for some requesters (pvxs
     /// `Search::source()`, filled from the UDP reply dest /
-    /// `server.cpp:674-704` or the TCP peer / `serverchan.cpp:197-222`).
+    /// `src/server.cpp:674-704` or the TCP peer / `serverchan.cpp:197-222`).
     /// Same "any source may claim" rule as [`Self::searchable`] — a
     /// non-searchable hosting source must not veto a later source's
     /// claim, matching pvxs's per-source independent `onSearch`, and
@@ -483,7 +487,7 @@ impl ChannelSource for CompositeSource {
     /// pvxs binds the accepting source's callbacks into the `ServerChan`
     /// at CREATE_CHANNEL (`serverchan.cpp:295-322`, `serverchan.cpp:70-112`)
     /// and a later `removeSource` does not rewrite them
-    /// (`server.cpp:100-112`).
+    /// (`src/server.cpp:100-112`).
     fn resolve_owner(
         &self,
         name: &str,
@@ -672,7 +676,7 @@ impl ChannelSource for CompositeSource {
 
     /// Atomic PUT_GET routed to the resolving owner's `put_get_checked`.
     /// Without this override the trait default would decompose the op into
-    /// `put_delta_checked` + `get_value_checked` on the composite itself,
+    /// `put_delta_checked` + `read_checked` on the composite itself,
     /// bypassing an owner source's single-op PUT_GET (e.g. the pva-gateway's
     /// one-upstream-PUT_GET forward). Re-mints the inner token through the
     /// owner's gate exactly as the other `_checked` forwarders do.
@@ -1439,7 +1443,7 @@ mod tests {
     /// add/remove — including the two cases the PV-set hash cannot
     /// detect: replacing a source with another serving the SAME
     /// `list_pvs()` output, and changing a source's priority for the
-    /// same PV name. Mirrors pvxs `beaconChange` (server.cpp:90-115).
+    /// same PV name. Mirrors pvxs `beaconChange` (src/server.cpp:90-115).
     #[epics_macros_rs::epics_test]
     async fn beacon_change_advances_on_registry_mutations() {
         let comp = CompositeSource::new();
@@ -1501,16 +1505,18 @@ mod tests {
             "a priority change for the same PV must bump beacon_change: {v3} -> {v4}"
         );
 
-        // A failed remove (no such entry) must NOT bump the counter.
+        // A remove naming no entry STILL bumps: pvxs puts
+        // `pvt->beaconChange++` outside the `if(it!=end())` that erases
+        // (src/server.cpp:109-113), so the miss path reaches it too.
         assert!(comp.remove_source("nope", 0).is_none());
-        assert_eq!(
-            comp.beacon_change(),
-            v4,
-            "a no-op remove must not advance beacon_change"
+        let v5 = comp.beacon_change();
+        assert!(
+            v5 > v4,
+            "a remove of an absent source must still advance beacon_change: {v4} -> {v5}"
         );
 
         // The trait-level accessor reports the same value.
-        assert_eq!(<CompositeSource as ChannelSource>::beacon_change(&comp), v4);
+        assert_eq!(<CompositeSource as ChannelSource>::beacon_change(&comp), v5);
     }
 
     /// The composite must fold an
@@ -1519,7 +1525,7 @@ mod tests {
     /// when the composite's OWN add/remove counter is unchanged. pvxs
     /// keeps a single `beaconChange` bumped by both
     /// `addSource`/`removeSource` AND `addPV`/`removePV`
-    /// (server.cpp:95,113,180,189).
+    /// (src/server.cpp:95,113,180,189).
     #[epics_macros_rs::epics_test]
     async fn beacon_change_aggregates_inner_shared_source_mutations() {
         use crate::server_native::{SharedPV, SharedSource};
@@ -1585,11 +1591,11 @@ mod tests {
 
     /// pvxs keys its registry `std::map<std::pair<int, std::string>, ...>`
     /// (`serverconn.h:267`), inserts at `std::make_pair(order, name)`
-    /// (`server.cpp:91`) and iterates it ascending (`server.cpp:696`,
+    /// (`src/server.cpp:91`) and iterates it ascending (`src/server.cpp:696`,
     /// `serverchan.cpp:304`), so two sources sharing an `order` are
     /// consulted in byte-wise NAME order — that is what puts `__builtin`
     /// ahead of `__server` at pvxs's internal order -1
-    /// (`server.cpp:542-546`). Registering the later-sorting name FIRST
+    /// (`src/server.cpp:542-546`). Registering the later-sorting name FIRST
     /// must not give it priority.
     #[epics_macros_rs::epics_test]
     async fn equal_order_ties_break_by_source_name_not_by_insertion() {
@@ -1770,7 +1776,7 @@ mod tests {
     /// silently re-route to a different source when the registry changes.
     /// pvxs installs the accepting source's callbacks into the
     /// `ServerChan` (`serverchan.cpp:70-112`) and a later `removeSource`
-    /// does not rewrite them (`server.cpp:100-112`).
+    /// does not rewrite them (`src/server.cpp:100-112`).
     ///
     /// `resolve_owner` returns the matched inner source; a held clone of
     /// that owner keeps serving the original source even after the same
@@ -1855,7 +1861,7 @@ mod tests {
     /// A front-ordered, non-searchable source that *hosts* a name must
     /// not veto a later source's SEARCH claim for that same name. pvxs
     /// runs `onSearch` on every source and ORs the claims
-    /// (`server.cpp:694-712`); its built-in `ServerSource::onSearch` is
+    /// (`src/server.cpp:694-712`); its built-in `ServerSource::onSearch` is
     /// empty (`serversource.cpp:25-28`), so the diagnostic `server` PV
     /// never suppresses a user PV named `server`. Mirrors the built-in
     /// `__server` (order -1, non-searchable) sitting in front of a

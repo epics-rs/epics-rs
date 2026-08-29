@@ -17,6 +17,14 @@
 //! without the `scanOnce` the count does not start until the next periodic
 //! scan, up to a full scan period late.
 
+// RTEMS-EXEC-MODEL-ALLOW(3): checked, not waived — all 3 ran and passed
+// on the exec backend (measured on this tree:
+// `EPICS_RS_BUILD_EXEC_BACKEND=thread cargo nextest run -p scaler-rs
+// --all-features`, 112/112). scaler-rs became a census subject when its
+// `build.rs` began deriving `tokio_backend`; nothing here builds a CA
+// server, and the reactor these obtain comes from `#[tokio::test]`
+// itself, which the backend does not remove.
+
 use epics_base_rs::server::database::PvDatabase;
 use epics_base_rs::server::record::{Record, ScanType};
 use epics_base_rs::types::EpicsValue;
@@ -62,7 +70,7 @@ async fn settle() {
 
 #[tokio::test]
 async fn r11_c11_cnt_put_on_a_non_passive_scaler_scans_once() {
-    let db = scaler_db(ScanType::Sec1).await;
+    let db = scaler_db(ScanType::SEC1).await;
     assert_eq!(ss(&db).await, SCALER_STATE_IDLE, "starts idle");
 
     db.put_record_field_from_ca("SCAL", "CNT", EpicsValue::Short(1))
@@ -113,7 +121,7 @@ async fn r11_c11_passive_scaler_is_processed_once_by_the_put_itself() {
 /// `CONT` (auto-count mode) takes the same rescan — C `:664-668`.
 #[tokio::test]
 async fn r11_c11_cont_put_on_a_non_passive_scaler_scans_once() {
-    let db = scaler_db(ScanType::Sec1).await;
+    let db = scaler_db(ScanType::SEC1).await;
 
     // CONT=1 (auto-count) with no user count in progress: the process cycle
     // C's scanOnce forces is what enters the auto-count restart arm

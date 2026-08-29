@@ -15,8 +15,9 @@
 # dynamically-typed field without this file gaining a line.
 #
 # The `special` column matters as much as the type, and is why this file cannot
-# be derived from the `.dbd` at all. `lsiRecord.c:131-134` raises
-# `paddr->special = SPC_NOMOD` on OVAL (and SPC_MOD on VAL) inside `cvt_dbaddr`,
+# be derived from the `.dbd` at all. `lsiRecord.c:127-134` raises
+# `paddr->special = SPC_MOD` on VAL (`:129`) and `SPC_NOMOD` on OVAL (`:133`)
+# inside `cvt_dbaddr`,
 # and `rsrv/camessage.c:2543-2545` — "SPC_NOMOD fields are always unwritable" —
 # turns that into a CA write-access denial. Taking `read_only` from the `.dbd`
 # alone would have made `lsi.OVAL` writable, which the C IOC refuses. Measured,
@@ -30,7 +31,7 @@
 # `.dbd` default.
 #
 # One special is NOT expressible here, because it is state-dependent rather than
-# per-field: `compressRecord.c:43` raises SPC_NOMOD on VAL only while
+# per-field: `compressRecord.c:404-405` raises SPC_NOMOD on VAL only while
 # `BALG == LIFO`. That is the dynamic half of no-modify and belongs to
 # `Record::field_no_mod`, which already owns it; the static entry below is the
 # FIFO default.
@@ -39,36 +40,43 @@
 # ---------------------------------------------------------------------------
 
 # waveform/aai/aao: the VAL array's element type IS `FTVL`, its count `NELM`.
-waveform.VAL            DBF_DOUBLE      SPC_DBADDR  FTVL        waveformRecord.c:150-156
-aai.VAL                 DBF_DOUBLE      SPC_DBADDR  FTVL        aaiRecord.c:161-167
-aao.VAL                 DBF_DOUBLE      SPC_DBADDR  FTVL        aaoRecord.c:172-178
+waveform.VAL            DBF_DOUBLE      SPC_DBADDR  FTVL        waveformRecord.c:179-189
+aai.VAL                 DBF_DOUBLE      SPC_DBADDR  FTVL        aaiRecord.c:206-215
+aao.VAL                 DBF_DOUBLE      SPC_DBADDR  FTVL        aaoRecord.c:211-220
 
 # subArray: same shape — element type `FTVL`, but the count is `MALM` (the
 # allocated array), not `NELM` (the sub-array the record extracts from it).
-subArray.VAL            DBF_DOUBLE      SPC_DBADDR  FTVL        subArrayRecord.c:229-238
+subArray.VAL            DBF_DOUBLE      SPC_DBADDR  FTVL        subArrayRecord.c:160-170
 
 # mbbo: VAL is DBF_ENUM only when state strings are defined. With no ZRST..FFST,
 # `sdef` is false and C re-types VAL to DBF_USHORT — which CA promotes to
 # DBR_LONG, so a default mbbo's VAL is served as a LONG, not an ENUM.
-mbbo.VAL                DBF_USHORT      SPC_DBADDR  SDEF        mbboRecord.c:300-312
+mbbo.VAL                DBF_USHORT      SPC_DBADDR  SDEF        mbboRecord.c:300-313
 
 # compress: the circular buffer is always doubles, `NSAM` deep.
-compress.VAL            DBF_DOUBLE      SPC_DBADDR  -           compressRecord.c:398-410
+compress.VAL            DBF_DOUBLE      SPC_DBADDR  -           compressRecord.c:395-407
 
-# histogram: the bin counts are epicsUInt32, `NBINS` deep. CA has no unsigned
-# long, so C serves them as DBR_DOUBLE — `DbFieldType::ULong` reproduces that
-# via `ca_wire_type`.
-histogram.VAL           DBF_ULONG       SPC_DBADDR  -           histogramRecord.c:378-386
+# histogram: the bin counts are epicsUInt32, `NELM` deep
+# (`histogramRecord.c:303`). CA has no unsigned long, so C serves them as
+# DBR_DOUBLE — `DbFieldType::ULong` reproduces that via `ca_wire_type`.
+histogram.VAL           DBF_ULONG       SPC_DBADDR  -           histogramRecord.c:299-308
 
 # lsi/lso/printf: a long string is a `char *` of `SIZV` bytes. Over plain CA the
 # field is served as a single DBF_STRING (truncated to MAX_STRING_SIZE); the
 # full value needs the `$` char-array channel view, which `dbChannel` builds
 # from the same field.
-lsi.VAL                 DBF_STRING      SPC_MOD     -           lsiRecord.c:214-222
-lsi.OVAL                DBF_STRING      SPC_NOMOD   -           lsiRecord.c:214-222
-lso.VAL                 DBF_STRING      SPC_MOD     -           lsoRecord.c:227-235
-lso.OVAL                DBF_STRING      SPC_NOMOD   -           lsoRecord.c:227-235
-printf.VAL              DBF_STRING      SPC_DBADDR  -           printfRecord.c:161-169
+#
+# Five rows, but only FOUR carry a `cvt_dbaddr` special: lsi and lso assign
+# `paddr->special` on both arms (`lsiRecord.c:129`, `:133`; `lsoRecord.c:171`,
+# `:175`), while printf's `cvt_dbaddr` (`printfRecord.c:408-424`) sets `pfield`,
+# `no_elements`, `field_type` and `field_size` and never touches `special` — so
+# `printf.VAL` keeps the SPC_DBADDR its declaration gave it, and is writable
+# where `lsi.OVAL`/`lso.OVAL` are not.
+lsi.VAL                 DBF_STRING      SPC_MOD     -           lsiRecord.c:122-146
+lsi.OVAL                DBF_STRING      SPC_NOMOD   -           lsiRecord.c:122-146
+lso.VAL                 DBF_STRING      SPC_MOD     -           lsoRecord.c:164-188
+lso.OVAL                DBF_STRING      SPC_NOMOD   -           lsoRecord.c:164-188
+printf.VAL              DBF_STRING      SPC_DBADDR  -           printfRecord.c:408-424
 
 # aSub: every input A..U and output VALA..VALU is a `void *` whose element type
 # is the matching `FTA`..`FTU` / `FTVA`..`FTVU` menu and whose count is

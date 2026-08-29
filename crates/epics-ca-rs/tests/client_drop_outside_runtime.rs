@@ -10,9 +10,12 @@
 //! real bring-up failure). Post-fix the drop degrades to a sync
 //! shutdown send plus task aborts; the panic-free property is the test.
 
-// Host/tokio-only: constructs the async `CaClient`, which needs a tokio
-// reactor at build time (see caget_dbr_type.rs).
-#![cfg(not(feature = "rtems-exec-model"))]
+#![cfg(feature = "client-core")]
+
+// RTEMS-EXEC-MODEL-ALLOW(1): measured, not argued — all 1 case(s) here run and
+// pass under `EPICS_RS_BUILD_EXEC_BACKEND=thread`. The file-level gate removed
+// with this marker asserted a reactor panic the exec backend does not produce,
+// and while it stood the exec-backend suite could not see this file at all.
 
 use epics_ca_rs::client::CaClient;
 use serial_test::serial;

@@ -11,7 +11,8 @@
 //! Tracks overflow events via a counter, corresponding to C++ BaseMonitor's
 //! `inoverflow` flag and overflow BitSet.
 
-// RTEMS-EXEC-MODEL-ALLOW(5): checked - these run and pass in the feature-ON suite.
+// RTEMS-EXEC-MODEL-ALLOW(5): checked - these run and pass in the exec-backend
+// suite.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -46,7 +47,7 @@ pub struct BridgeMonitor {
     /// archive-only LOG events that PVA clients never asked for.
     subscription: Option<DbSubscription>,
     /// Separate PROPERTY-only subscription — pvxs QSRV creates two
-    /// `dbChannel`s per single-record monitor (singlesource.cpp:161): one
+    /// `dbChannel`s per single-record monitor (singlesource.cpp:162-167): one
     /// for value/alarm and one for display/control/enum metadata changes.
     /// Without the second subscription, downstream PVA clients never see
     /// EGU / HOPR / LOPR / enum-string updates pushed through a monitor.
@@ -64,7 +65,7 @@ pub struct BridgeMonitor {
     /// filter chain to install on the PROPERTY subscription — an
     /// INDEPENDENT re-parse of the same `PV.VAL{...}` suffix (pvxs builds
     /// the property `dbChannel` from the same filtered name,
-    /// singlesource.cpp:161 + singlesrcsubscriptionctx.cpp:24). Held apart
+    /// singlesource.cpp:162-167 + singlesrcsubscriptionctx.cpp:24). Held apart
     /// from `filters` so a stateful `dbnd`/`dec` on the value stream never
     /// shares state with a DBE_PROPERTY event on the property stream.
     /// Without it, a filtered array (`arr`-sliced) monitor rebuilt the NT
@@ -156,7 +157,7 @@ impl BridgeMonitor {
 
     /// The DBE mask the value subscription runs with: the client's
     /// `record._options.DBE` override, else pvxs QSRV's default
-    /// `VALUE | ALARM` (`singlesource.cpp:141-143`). One owner, so the
+    /// `VALUE | ALARM` (`singlesource.cpp:142-144`). One owner, so the
     /// mask [`PvaMonitor::start`] subscribes with and the no-field-log
     /// fallback [`PvaMonitor::poll`] classifies with cannot diverge.
     fn value_mask(&self) -> EventMask {
@@ -185,7 +186,7 @@ impl BridgeMonitor {
 }
 
 /// The `UpdateType` a *value* subscription event carries, porting pvxs
-/// `subscriptionValueCallback` (`singlesource.cpp:73-95`):
+/// `subscriptionValueCallback` (`singlesource.cpp:74-95`):
 ///
 /// ```text
 /// change = pValueEventSubscription.mask;      // no field log (pre-7.0.6)
@@ -261,7 +262,7 @@ impl PvaMonitor for BridgeMonitor {
         .ok_or_else(|| BridgeError::RecordNotFound(self.record_name.clone()))?;
 
         // pvxs QSRV opens a second subscription with the
-        // PROPERTY mask (singlesource.cpp:161) so a PVA monitor
+        // PROPERTY mask (singlesource.cpp:162-167) so a PVA monitor
         // is woken when EGU / HOPR / LOPR / enum-string change,
         // not just when VAL changes. The full snapshot is rebuilt
         // on every wake so the property-channel firing alone is
@@ -292,7 +293,7 @@ impl PvaMonitor for BridgeMonitor {
         .ok_or_else(|| BridgeError::RecordNotFound(self.record_name.clone()))?;
 
         // The native PVA server emits the initial snapshot via
-        // ChannelSource::get_value() at MONITOR INIT time (server_native/
+        // ChannelSource::read_checked() at MONITOR INIT time (server_native/
         // tcp.rs build_monitor_payload). Caching another initial snapshot
         // here would deliver it twice — visible to clients tracking
         // event counts (archiver appliance) and surfaced in `pvmonitor`
@@ -399,7 +400,7 @@ mod tests {
 
     /// Lifecycle invariants:
     /// - `start()` opens a subscription. The native PVA server emits
-    ///   the initial snapshot via ChannelSource::get_value() at
+    ///   the initial snapshot via ChannelSource::read_checked() at
     ///   MONITOR INIT — BridgeMonitor::poll() only surfaces fresh
     ///   record updates so the client doesn't see a duplicate
     ///   initial event.
@@ -497,9 +498,9 @@ mod tests {
         // The posted value is the full NT structure (pvxs merges into its
         // persistent `currentValue`), but the MARKED set is the property
         // leaves alone — `IOCSource::get` under `UpdateType::Property` runs
-        // getProperties and nothing else (`iocsource.cpp:327-334`). The set
+        // getProperties and nothing else (`iocsource.cpp:327-351`). The set
         // is the exact leaf list `getProperties` assigns
-        // (`iocsource.cpp:252-310`), not the `display` / `control` /
+        // (`iocsource.cpp:253-310`), not the `display` / `control` /
         // `valueAlarm` parent structures: those carry `display.form`,
         // `control.minStep`, `valueAlarm.active`, the four `*Severity`
         // fields and `valueAlarm.hysteresis`, none of which pvxs touches.
@@ -659,7 +660,7 @@ mod tests {
             "a DBE_VALUE event marks timeStamp + value only"
         );
 
-        // A DBE_ALARM post promotes to VALUE|ALARM (`singlesource.cpp:90-92`)
+        // A DBE_ALARM post promotes to VALUE|ALARM (`singlesource.cpp:90-91`)
         // and so additionally marks `alarm` — still no display/control.
         {
             let rec = db.get_record("MON_MARK").expect("rec exists");

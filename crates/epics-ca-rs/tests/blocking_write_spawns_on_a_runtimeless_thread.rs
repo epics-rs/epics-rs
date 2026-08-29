@@ -31,11 +31,11 @@
 //! stand-in for any of them; the SDLY `SimOutcome::DeferRead` path reaches the
 //! same `schedule_delayed_reprocess` owner.
 //!
-//! **Backend asymmetry, deliberate.** Under `rtems-exec-model` (exec_backend)
-//! the ambient `task::spawn` is itself the background executor, so these cases
+//! **Backend asymmetry, deliberate.** Under `exec_backend` the
+//! ambient `task::spawn` is itself the background executor, so these cases
 //! pass there for a weaker reason than they do on the hosted build. They are
 //! left ungated so both suites carry them, but a green run under
-//! `rtems-exec-model` is NOT evidence about the hosted build.
+//! `exec_backend` is NOT evidence about the hosted build.
 //!
 //! Ports are always ephemeral (`:0`) — never the real 5064, per the
 //! `build() ⟹ listening` port-ownership rule.
@@ -110,6 +110,7 @@ impl Record for ReprocessRecord {
                     Deferral::OutputEvent => vec![],
                 },
                 device_did_compute: false,
+                post_write_fields: Vec::new(),
             })
         } else {
             Ok(ProcessOutcome::complete())
@@ -190,7 +191,7 @@ fn put_and_await_reentry(db: &Arc<PvDatabase>, processes: &Arc<AtomicUsize>) {
         1,
         "the put must have processed the record once"
     );
-    let deadline = std::time::Instant::now() + Duration::from_secs(2);
+    let deadline = std::time::Instant::now() + budget::FACT_BUDGET;
     while processes.load(Ordering::SeqCst) < 2 && std::time::Instant::now() < deadline {
         std::thread::sleep(Duration::from_millis(5));
     }
@@ -359,7 +360,7 @@ fn blocking_write_notify_to_a_reprocessing_record_answers_the_client() {
     );
 
     // The delayed re-process must land, which is the half `task::spawn` owns.
-    let deadline = std::time::Instant::now() + Duration::from_secs(2);
+    let deadline = std::time::Instant::now() + budget::FACT_BUDGET;
     while processes.load(Ordering::SeqCst) < 2 && std::time::Instant::now() < deadline {
         std::thread::sleep(Duration::from_millis(5));
     }
@@ -407,14 +408,14 @@ fn a_ca_put_that_posts_an_output_event_survives_a_runtimeless_thread() {
 /// The control: the identical put with a runtime entered. It separates "the
 /// record or the action is broken" from "the calling thread has no runtime to
 /// spawn onto", which is the whole claim.
-#[cfg(not(feature = "rtems-exec-model"))]
+#[cfg(tokio_backend)]
 #[tokio::test(flavor = "multi_thread")]
 async fn the_same_put_under_a_runtime_reprocesses() {
     let (db, processes) = seed_db();
     db.put_record_field_from_ca(PV, "VAL", EpicsValue::Double(2.5))
         .await
         .expect("the put itself must not error");
-    let deadline = std::time::Instant::now() + Duration::from_secs(2);
+    let deadline = std::time::Instant::now() + budget::FACT_BUDGET;
     while processes.load(Ordering::SeqCst) < 2 && std::time::Instant::now() < deadline {
         tokio::time::sleep(Duration::from_millis(5)).await;
     }
@@ -423,3 +424,6 @@ async fn the_same_put_under_a_runtime_reprocesses() {
         "with a runtime entered the ReprocessAfter re-entry must fire"
     );
 }
+
+#[path = "common/budget.rs"]
+mod budget;

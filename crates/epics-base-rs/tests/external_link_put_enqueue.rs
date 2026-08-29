@@ -5,20 +5,20 @@
 //!
 //! C reference, both flavours:
 //!
-//! * fire-and-forget — `dbCaPutLink` (`dbCa.c:627-631`) delegates to
+//! * fire-and-forget — `dbCaPutLink` (`dbCa.c:598-602`) delegates to
 //!   `dbCaPutLinkCallback` with a NULL callback. That copies the value into
 //!   the per-link `pputNative` cell, sets `link_action`, `addAction`s the link
-//!   onto `workList`, signals `workListEvent` and RETURNS (`dbCa.c:596-624`).
+//!   onto `workList`, signals `workListEvent` and RETURNS (`dbCa.c:567-595`).
 //!   `ca_array_put` runs later, on the `dbCaTask` (`dbCa.c:1228-1231`); its
 //!   failure reaches the operator through `errlogPrintf` (`dbCa.c:1240-1244`),
 //!   never through the caller's status.
-//! * completion — `dbCaPutLinkCallback` / `dbCaPutAsync` (`dbCa.c:537-542`)
+//! * completion — `dbCaPutLinkCallback` / `dbCaPutAsync` (`dbCa.c:508-513`)
 //!   stage identically but carry `putCallback`; the task issues
 //!   `ca_array_put_callback` (`dbCa.c:1233-1236`) and `putComplete`
-//!   (`dbCa.c:1056-1074`) later drives the originating record's completion.
+//!   (`dbCa.c:994-1012`) later drives the originating record's completion.
 //!
 //! The status C returns from either entry point is the STAGING status: -1 only
-//! when the link is down or read-only (`dbCa.c:558-561`).
+//! when the link is down or read-only (`dbCa.c:529-532`).
 //!
 //! Each test below is one boundary of that queue, not one narrative.
 
@@ -27,7 +27,7 @@ use std::sync::{Arc, Mutex};
 
 use epics_base_rs::server::database::{LinkPutOp, LinkSet, PutAdmission, PvDatabase};
 use epics_base_rs::server::recgbl::alarm_status;
-use epics_base_rs::server::record::{AlarmSeverity, NotifyWaitSet};
+use epics_base_rs::server::record::AlarmSeverity;
 use epics_base_rs::server::records::ao::AoRecord;
 use epics_base_rs::types::EpicsValue;
 
@@ -72,7 +72,7 @@ impl LinkSet for GateLset {
 
 /// An lset that records every completed write immediately, and answers a
 /// configurable put status. `admission` models C's `pca->isConnected &&
-/// pca->hasWriteAccess` gate (`dbCa.c:558-561`).
+/// pca->hasWriteAccess` gate (`dbCa.c:529-532`).
 struct RecordingLset {
     writes: Arc<Mutex<Vec<(f64, LinkPutOp)>>>,
     admission: PutAdmission,
@@ -133,7 +133,8 @@ async fn add_ao(db: &PvDatabase, name: &str, out: &str, val: f64, notify: bool) 
         // closed channel.
         let (tx, rx) = epics_base_rs::runtime::sync::oneshot::channel();
         std::mem::forget(rx);
-        inst.notify = Some(NotifyWaitSet::new(tx));
+        inst.install_or_queue_notify(tx)
+            .expect("the record is free, so the wait-set installs");
     }
 }
 
@@ -149,7 +150,9 @@ async fn add_ao_notify(
     add_ao(db, name, out, val, false).await;
     let (tx, rx) = epics_base_rs::runtime::sync::oneshot::channel();
     let rec = db.get_record(name).expect("just added");
-    rec.write().notify = Some(NotifyWaitSet::new(tx));
+    rec.write()
+        .install_or_queue_notify(tx)
+        .expect("the record is free, so the wait-set installs");
     rx
 }
 
@@ -176,7 +179,7 @@ async fn alarm_of(db: &PvDatabase, name: &str) -> (u16, AlarmSeverity) {
 
 /// Boundary — enqueue-and-return. Record processing must complete while the
 /// lset's `put_value` is still in flight. C: `dbCaPutLink` returns after
-/// `addAction` (`dbCa.c:622-624`); `ca_array_put` runs on the `dbCaTask`.
+/// `addAction` (`dbCa.c:593-595`); `ca_array_put` runs on the `dbCaTask`.
 ///
 /// This is the property the whole change exists for: the last network
 /// suspension inside the record's advisory write gate is gone.
@@ -207,13 +210,13 @@ async fn plain_put_returns_before_the_wire_write_completes() {
     assert!(
         completed.lock().unwrap().is_empty(),
         "...and has NOT completed — so record processing did not wait for the \
-         network write (C dbCa.c:622-624)"
+         network write (C dbCa.c:593-595)"
     );
     assert_eq!(
         alarm_of(&db, "AO_ENQ").await,
         (alarm_status::NO_ALARM, AlarmSeverity::NoAlarm),
         "a successfully STAGED put raises nothing; C's return status is the \
-         staging status (dbCa.c:558-561), not the wire status"
+         staging status (dbCa.c:529-532), not the wire status"
     );
 
     release.add_permits(1);
@@ -221,14 +224,14 @@ async fn plain_put_returns_before_the_wire_write_completes() {
     assert_eq!(
         completed.lock().unwrap().as_slice(),
         [3.5],
-        "the dbCaSync barrier (dbCa.c:1191-1194) makes the write observable"
+        "the dbCaSync barrier (dbCa.c:1126-1129) makes the write observable"
     );
 }
 
 /// Boundary — enqueue while disconnected. C refuses BEFORE staging anything
-/// (`dbCa.c:558-561`: `if (!pca->isConnected || !pca->hasWriteAccess) return
+/// (`dbCa.c:529-532`: `if (!pca->isConnected || !pca->hasWriteAccess) return
 /// -1`), so `put_value` must never run and the writing record must alarm in
-/// this cycle (`dbLink.c:434-448` `setLinkAlarm`).
+/// this cycle (`dbLink.c:432-446` `setLinkAlarm`).
 #[epics_macros_rs::epics_test]
 async fn disconnected_link_stages_nothing_and_alarms() {
     let writes = Arc::new(Mutex::new(Vec::new()));
@@ -250,7 +253,7 @@ async fn disconnected_link_stages_nothing_and_alarms() {
     assert!(
         writes.lock().unwrap().is_empty(),
         "a put on a down link must not reach put_value at all — C refuses \
-         before addAction (dbCa.c:558-561)"
+         before addAction (dbCa.c:529-532)"
     );
     assert_eq!(
         db.external_link_puts_completed(),
@@ -266,7 +269,7 @@ async fn disconnected_link_stages_nothing_and_alarms() {
 
 /// Boundary — "queue full". C has no queue depth per link: one `pputNative`
 /// cell per link, and a put that arrives while one is pending overwrites it
-/// and bumps `pca->nNoWrite` (`dbCa.c:611-612`). Latest-wins, never a backlog.
+/// and bumps `pca->nNoWrite` (`dbCa.c:582-583`). Latest-wins, never a backlog.
 ///
 /// Here: put 1.0 goes in flight (gated), 2.0 is staged behind it, 3.0
 /// overwrites 2.0. Exactly two writes reach the wire, in order, and the
@@ -305,7 +308,7 @@ async fn pending_put_is_overwritten_latest_wins() {
     assert_eq!(
         db.external_link_puts_coalesced(),
         1,
-        "3.0 overwrote the pending 2.0 — C's pca->nNoWrite++ (dbCa.c:611-612)"
+        "3.0 overwrote the pending 2.0 — C's pca->nNoWrite++ (dbCa.c:582-583)"
     );
 
     release.add_permits(2);
@@ -321,7 +324,7 @@ async fn pending_put_is_overwritten_latest_wins() {
 /// Boundary — put ordering per link. Successive writes on ONE link, none of
 /// them coalescing, must reach the wire in the order the records issued them.
 /// C guarantees this by having a single `dbCaTask` service `workList` FIFO
-/// (`dbCa.c:1180-1197`); ours by keeping at most one write in flight per link
+/// (`dbCa.c:1115-1132`); ours by keeping at most one write in flight per link
 /// and re-queueing a restaged value at its tail (`link_put_queue::finish`).
 #[epics_macros_rs::epics_test]
 async fn per_link_put_ordering_is_preserved() {
@@ -351,11 +354,11 @@ async fn per_link_put_ordering_is_preserved() {
 /// Boundary — the completion flavour does NOT hold the record thread either.
 ///
 /// C `dbCaPutLinkCallback` stores `pca->putCallback`, calls `addAction` and
-/// RETURNS (`dbCa.c:614-624`), identically to the plain flavour; what keeps a
+/// RETURNS (`dbCa.c:585-595`), identically to the plain flavour; what keeps a
 /// put-notify chain outstanding is the RECORD staying active, not the record
-/// thread parking on the wire. `putComplete` (`dbCa.c:1056-1074`) later fires
+/// thread parking on the wire. `putComplete` (`dbCa.c:994-1012`) later fires
 /// the callback — `dbCaCallbackProcess` → `dbLinkAsyncComplete`
-/// (`dbCa.c:317-322`) — which is what settles the chain.
+/// (`dbCa.c:304-309`) — which is what settles the chain.
 ///
 /// So: `process()` must return while `put_value` is still blocked, and the
 /// source record's `NotifyWaitSet` must stay unsettled until the completion
@@ -391,7 +394,7 @@ async fn async_put_completion_is_reported_through_the_notify_chain() {
     assert!(
         completed.lock().unwrap().is_empty(),
         "the wire write has NOT completed, yet process() already returned — \
-         C `dbCaPutLinkCallback` stages and returns (dbCa.c:614-624)"
+         C `dbCaPutLinkCallback` stages and returns (dbCa.c:585-595)"
     );
     assert!(
         notify_rx.try_recv().is_err(),
@@ -417,12 +420,12 @@ async fn async_put_completion_is_reported_through_the_notify_chain() {
 /// the source record; it settles the chain and goes to errlog.
 ///
 /// C's `putComplete` reads `pca->putCallback` and calls it, discarding
-/// `arg.status` entirely (`dbCa.c:1056-1074`) — the callback runs whether the
+/// `arg.status` entirely (`dbCa.c:994-1012`) — the callback runs whether the
 /// remote accepted the put or not. The wire status reaches the operator on the
 /// task instead (`errlogPrintf`, `dbCa.c:1238-1244`, below the
 /// `CA_PUT`/`CA_PUT_CALLBACK` fork so it covers both flavours). The record's
-/// own alarm comes from the STAGING gate (`dbCa.c:558-561` →
-/// `dbLink.c:434-448` `setLinkAlarm`), which this write passed.
+/// own alarm comes from the STAGING gate (`dbCa.c:529-532` →
+/// `dbLink.c:432-446` `setLinkAlarm`), which this write passed.
 ///
 /// If the queue owner ever dropped a completion instead of resolving it, this
 /// test would hang rather than fail — which is why `PutCompletion` resolves on
@@ -458,7 +461,7 @@ async fn async_put_wire_failure_settles_the_chain_without_alarming() {
         alarm_of(&db, "AO_NOTIFY_ERR").await,
         (alarm_status::NO_ALARM, AlarmSeverity::NoAlarm),
         "the record's alarm comes from the staging gate, not the wire status \
-         (dbCa.c:558-561 / dbLink.c:434-448)"
+         (dbCa.c:529-532 / dbLink.c:432-446)"
     );
 }
 

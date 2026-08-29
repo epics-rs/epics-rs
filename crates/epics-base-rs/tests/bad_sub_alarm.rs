@@ -127,7 +127,7 @@ async fn sub_unregistered_snam_raises_bad_sub_and_leaves_val_alone() {
     assert_eq!(
         alarm(&db, "Y").await,
         (alarm_status::BAD_SUB_ALARM, AlarmSeverity::Invalid),
-        "subRecord.c:424-427: recGblSetSevr(prec, BAD_SUB_ALARM, INVALID_ALARM)"
+        "subRecord.c:425-428: recGblSetSevr(prec, BAD_SUB_ALARM, INVALID_ALARM)"
     );
     let rec = db.get_record("Y").unwrap();
     assert_eq!(

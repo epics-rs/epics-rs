@@ -114,7 +114,7 @@ pub fn mono_to_rgb1(src: &NDArray) -> ADResult<NDArray> {
 /// C `NDPluginColorConvert::convertColor` uses the unweighted mean
 /// `value = (R + G + B) / 3.` cast to the output type — a C cast that
 /// truncates toward zero, not luminance weighting and not rounding
-/// (`NDPluginColorConvert.cpp:392-395`; the RGB2/RGB3 mono paths `:462`/`:`
+/// (`NDPluginColorConvert.cpp:392-395`; the RGB2/RGB3 mono paths `:462`/`:533`
 /// and the Bayer mono path `:331` use the same `(R+G+B)/3`). This is the
 /// single chokepoint: ad-plugins routes RGB2/RGB3/Bayer→mono through here
 /// after converting to RGB1 (`color_convert.rs:437`).

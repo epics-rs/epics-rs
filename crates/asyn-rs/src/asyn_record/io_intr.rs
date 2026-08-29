@@ -94,7 +94,7 @@ impl IoIntrSample {
             // ...)` (:725) — the same escaping, under the same 40-byte TINP
             // bound, that the polled octet read applies.
             (InterfaceType::Octet, ParamValue::Octet(s)) => Some(Self::Octet(
-                crate::escape::escaped_from_raw(s.as_bytes(), super::TINP_SIZE),
+                crate::escape::escaped_from_raw(s, super::TINP_SIZE),
             )),
             (InterfaceType::Int32, ParamValue::Int32(v)) => Some(Self::Int32(*v)),
             (InterfaceType::UInt32Digital, ParamValue::UInt32Digital(v)) => Some(Self::UInt32(*v)),

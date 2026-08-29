@@ -102,7 +102,7 @@ pub fn seed_env_overrides(map: &HashMap<String, String>, replace_existing: bool)
 ///
 /// This is the Rust analogue of pvxs `Config::applyDefs(defs)`
 /// (`src/pvxs/server.h:197-203`, `src/pvxs/client.h:1053-1059`,
-/// implemented in `src/config.cpp:468-471` / `:607-610`): it captures the
+/// implemented in `src/config.cpp:468-472` / `:607-611`): it captures the
 /// supplied definitions **into this object** and leaves the process
 /// environment unchanged. Two `PvaConfigDefs` built from two different
 /// maps are fully independent — building one does not affect the other or
@@ -111,7 +111,7 @@ pub fn seed_env_overrides(map: &HashMap<String, String>, replace_existing: bool)
 /// cross-contamination.
 ///
 /// Scoped definitions and the ambient environment are two SEPARATE
-/// sources, mirroring pvxs's `PickOne{useenv}` (config.cpp:228-249):
+/// sources, mirroring pvxs's `PickOne{useenv}` (config.cpp:229-255):
 /// [`PvaConfigDefs::get`] reads only this config's definitions
 /// (pvxs `useenv=false`), while the ambient process environment is read
 /// through this module's `*_from_env` helpers / `std::env::var`
@@ -138,7 +138,7 @@ impl PvaConfigDefs {
     ///
     /// pvxs `applyDefs(defs)` runs `_fromDefs(..., useenv=false)`, whose
     /// `PickOne` searches only the supplied `defs` map and NEVER calls
-    /// `getenv()` (config.cpp:228-249, :468-470, :607-609); an absent key
+    /// `getenv()` (config.cpp:229-255, :468-472, :607-611); an absent key
     /// leaves the config field at its current/default value. So a key this
     /// config does not define returns `None` — it does **not** fall back to
     /// the ambient environment. The earlier fallback re-introduced exactly
@@ -179,7 +179,7 @@ fn pick_v4_preferred(iter: impl Iterator<Item = SocketAddr>) -> Option<SocketAdd
 
 /// Parse a `EPICS_PVA_ADDR_LIST`-style string into a list of
 /// `SocketAddr`, discarding any per-entry multicast modifiers. Entries are
-/// **whitespace-separated** (pvxs `split_addr_into`, `config.cpp:151-169`);
+/// **whitespace-separated** (pvxs `split_addr_into`, `config.cpp:151-183`);
 /// each is an `<addr>[,ttl][@iface]` [`Endpoint`] whose address is kept.
 /// Accepts plain IPs (gets `default_port` appended), `ip:port`, DNS
 /// hostnames, and `hostname:port`; unresolvable entries are dropped with a
@@ -211,7 +211,7 @@ pub fn parse_addr_list_with_port(env: &str, default_port: u16) -> Vec<SocketAddr
 /// `ttl`/`iface` are only meaningful for multicast destinations: pvxs's
 /// `operator<<` re-prints them only when `addr.isMCast()`, and the send
 /// path applies `IP_MULTICAST_TTL` / `IP_MULTICAST_IF` only for multicast
-/// (`evhelper.cpp:556-577`).
+/// (`evhelper.cpp:556-592`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Endpoint {
     /// Resolved destination (IP + port).
@@ -311,7 +311,7 @@ impl From<SocketAddr> for Endpoint {
 /// `IfaceMap::address_of` (`evhelper.cpp:872-879`): a name is looked up in
 /// the live interface table; a dotted IPv4 address is accepted verbatim
 /// (pvxs normalises a dotted iface address back to a name in the
-/// `SockEndpoint` ctor, `config.cpp:76-79`, but the address itself is a
+/// `SockEndpoint` ctor, `config.cpp:76-80`, but the address itself is a
 /// valid spec). Errs when the name has no IPv4 address so the caller can
 /// fall back (best-effort) rather than silently mis-route.
 ///
@@ -349,7 +349,7 @@ pub fn resolve_iface_v4(spec: &str) -> Result<Ipv4Addr, String> {
 /// caller passes `default_port == 0` (e.g. a server bind list that allows an
 /// ephemeral port), `setPort(0)` is a no-op, also matching pvxs.
 ///
-/// P-6 (BUG_ARCHAEOLOGY libca a8e8d22c3): the previous parser only
+/// P-6 (libca a8e8d22c3): the previous parser only
 /// accepted literal IPs, silently dropping every DNS hostname. C libca had
 /// a 32-byte buffer truncation bug; we had a stricter "drop the whole
 /// token" bug — same operator-visible symptom of "Empty PV search address
@@ -398,7 +398,7 @@ fn resolve_token_addr(s: &str, default_port: u16) -> Option<SocketAddr> {
 }
 
 /// Endpoint-preserving variant of [`parse_addr_list_with_port`]: splits on
-/// WHITESPACE only (pvxs `split_addr_into`, `config.cpp:151-169` — the
+/// WHITESPACE only (pvxs `split_addr_into`, `config.cpp:151-183` — the
 /// comma is multicast-TTL syntax, never a list separator) and keeps each
 /// entry's multicast TTL / interface modifiers for the UDP send path.
 pub fn parse_endpoints_with_port(env: &str, default_port: u16) -> Vec<Endpoint> {
@@ -584,9 +584,9 @@ pub fn parse_timeout_env(name: &str, raw: &str) -> Option<f64> {
 /// every `EPICS_PVA*_{SERVER,BROADCAST}_PORT` with `parseTo<uint64_t>`
 /// (`util.cpp:786-800` — `std::stoull` with leading/trailing whitespace
 /// tolerance) and then ASSIGNS the `uint64_t` into the `unsigned short`
-/// port field (`server.h:168/170`, `client.h:1030/1033`), truncating to
+/// port field (`src/pvxs/server.h:168/170`, `src/pvxs/client.h:1030/1033`), truncating to
 /// the low 16 bits; a parse error logs and leaves the port at its
-/// prior/default value (`config.cpp:402-414, 556-570`).
+/// prior/default value (`config.cpp:402-416, 556-570`).
 ///
 /// So `EPICS_PVAS_SERVER_PORT=70000` becomes TCP port `4464`
 /// (`70000 & 0xFFFF`) under pvxs, and `" 5076 "` is accepted. A direct
@@ -660,7 +660,7 @@ pub fn server_broadcast_port() -> u16 {
 /// `EPICS_PVAS_SERVER_PORT` when `EPICS_PVA_SERVER_PORT` is not set, so a
 /// site that only configured the server-specific var still has a coherent
 /// default. `Config::expand()` then normalizes an effective client TCP
-/// port of zero back to the protocol default 5075 (`config.cpp:624-632`):
+/// port of zero back to the protocol default 5075 (`config.cpp:631-632`):
 /// zero is a valid *server* ephemeral-bind request but never a usable
 /// client destination, so `EPICS_PVA_SERVER_PORT=0` must not rewrite every
 /// bare name-server token to `host:0`. The server bind port keeps zero —
@@ -705,12 +705,12 @@ pub fn pvas_server_port_opt() -> Option<u16> {
 /// preserves a caller-supplied `tls_port`.
 ///
 /// Mirrors pvxs `server::Config::_fromDefs` `PickOne` precedence
-/// (`config.cpp:513-519`): the server reads the server-specific
-/// `EPICS_PVAS_TLS_PORT` first and falls back to the shared
+/// (`config.cpp:495-501`, `tls` `b3a10bf0`): the server reads the
+/// server-specific `EPICS_PVAS_TLS_PORT` first and falls back to the shared
 /// `EPICS_PVA_TLS_PORT`. The compiled default (pvxs `netcommon.h:133`,
 /// `tls_port = 5076`) lives on
-/// [`crate::server_native::PvaServerConfig::default`], not here, so an
-/// absent variable never overwrites the caller value.
+/// [`crate::server_native::PvaServerConfig::default`], not here, so an absent
+/// variable never overwrites the caller value.
 pub fn pvas_tls_port_opt() -> Option<u16> {
     std::env::var("EPICS_PVAS_TLS_PORT")
         .ok()
@@ -733,7 +733,7 @@ pub fn auto_addr_list_enabled() -> bool {
 /// beacons fan out to each interface's limited broadcast (255.255.255.255
 /// scoped to the NIC).
 ///
-/// pvxs `config.cpp:426-431` falls back to
+/// pvxs `config.cpp:426-432` falls back to
 /// `EPICS_PVA_AUTO_ADDR_LIST` when the server-specific var is unset
 /// so shared deployment config still drives the server's beacon
 /// auto-discovery.
@@ -763,7 +763,7 @@ pub fn auto_beacon_addr_list_enabled_opt() -> Option<bool> {
 /// `EPICS_PVAS_BEACON_PERIOD` — default 15s. Controls the *short*
 /// burst-interval; see [`crate::server_native::PvaServerConfig`]
 /// for the burst-then-slowdown semantics. Rust extension — pvxs has no
-/// configurable beacon interval (fixed 15s/180s, `server.cpp:45-46`).
+/// configurable beacon interval (fixed 15s/180s, `src/server.cpp:45-46`).
 ///
 /// Returns a [`Duration`] built with [`Duration::from_secs_f64`] so a
 /// sub-second positive request (`0.5`) is honored as 500ms rather than
@@ -915,8 +915,9 @@ pub fn tls_handshake_timeout_secs_opt() -> Option<f64> {
 ///
 /// pvxs has no `*_TLS_KEYCHAIN_PASSWORD` variable: it sources the
 /// PKCS#12 password solely from the `;password` suffix of the keychain
-/// spec (`ossl.cpp:232-238`, see [`split_keychain_spec`]). This helper
-/// is a Rust-only convenience consulted ONLY when the keychain spec
+/// spec (`ossl.cpp:223-229` on pvxs `tls` `b3a10bf0`, see
+/// [`split_keychain_spec`]). This helper is a Rust-only convenience
+/// consulted ONLY when the keychain spec
 /// carries no inline `;` suffix. It reads
 /// `EPICS_PVAS_TLS_KEYCHAIN_PASSWORD`, falling back to
 /// `EPICS_PVA_TLS_KEYCHAIN_PASSWORD`. `$(VAR)` / `${VAR}` refs are
@@ -937,13 +938,13 @@ pub fn server_tls_keychain_password() -> Option<String> {
 /// Reads `EPICS_PVAS_TLS_KEYCHAIN`, falling back to `EPICS_PVA_TLS_KEYCHAIN`
 /// when the server-specific form is unset — matching pvxs `Config::server()`
 /// `pickone({"EPICS_PVAS_TLS_KEYCHAIN", "EPICS_PVA_TLS_KEYCHAIN"})`
-/// (`config.cpp:497`), which takes the first variable present. A server
-/// configured with only the shared `EPICS_PVA_TLS_KEYCHAIN` must still
-/// enable TLS (pvxs does); reading the server-specific form alone left such
-/// a server with TLS silently disabled. The client path stays
-/// `EPICS_PVA_TLS_KEYCHAIN`-only (pvxs `config.cpp:672`). `$(VAR)` /
-/// `${VAR}` refs are expanded (PVA-466 parity). Returns `None` when neither
-/// variable is set.
+/// (`config.cpp:479`, `tls` `b3a10bf0`), which takes the first variable
+/// present. A server configured with only the shared `EPICS_PVA_TLS_KEYCHAIN`
+/// must still enable TLS (pvxs does); reading the server-specific form alone
+/// left such a server with TLS silently disabled. The client path stays
+/// `EPICS_PVA_TLS_KEYCHAIN`-only (pvxs `config.cpp:654`, `tls` `b3a10bf0`).
+/// `$(VAR)` / `${VAR}` refs are expanded (PVA-466 parity). Returns `None`
+/// when neither variable is set.
 pub fn server_tls_keychain() -> Option<String> {
     std::env::var("EPICS_PVAS_TLS_KEYCHAIN")
         .or_else(|_| std::env::var("EPICS_PVA_TLS_KEYCHAIN"))
@@ -956,13 +957,14 @@ pub fn server_tls_keychain() -> Option<String> {
 /// Reads `EPICS_PVAS_TLS_OPTIONS`, falling back to `EPICS_PVA_TLS_OPTIONS`
 /// when the server-specific form is unset — matching pvxs `Config::server()`
 /// `pickone({"EPICS_PVAS_TLS_OPTIONS", "EPICS_PVA_TLS_OPTIONS"})`
-/// (`config.cpp:501`), which takes the first variable present and ignores
-/// the other (no merge). An operator who sets only the server form (e.g.
-/// `EPICS_PVAS_TLS_OPTIONS=client_cert=require`) must see it honoured;
-/// reading the shared `EPICS_PVA_TLS_OPTIONS` alone silently dropped the
-/// requirement and let the server accept certless clients (fail-open).
-/// Options are not `$(VAR)`-expanded (pvxs parity; the string is option
-/// tokens like `client_cert=require`, not a path). Empty when neither set.
+/// (`config.cpp:483`, `tls` `b3a10bf0`), which takes the first variable
+/// present and ignores the other (no merge). An operator who sets only the
+/// server form (e.g. `EPICS_PVAS_TLS_OPTIONS=client_cert=require`) must see
+/// it honoured; reading the shared `EPICS_PVA_TLS_OPTIONS` alone silently
+/// dropped the requirement and let the server accept certless clients
+/// (fail-open). Options are not `$(VAR)`-expanded (pvxs parity; the string is
+/// option tokens like `client_cert=require`, not a path). Empty when neither
+/// set.
 pub fn server_tls_options() -> String {
     std::env::var("EPICS_PVAS_TLS_OPTIONS")
         .or_else(|_| std::env::var("EPICS_PVA_TLS_OPTIONS"))
@@ -973,14 +975,17 @@ pub fn server_tls_options() -> String {
 /// options (`EPICS_PVAS_TLS_OPTIONS` → `EPICS_PVA_TLS_OPTIONS`, see
 /// [`server_tls_options`]).
 ///
-/// Mirrors pvxs `parseTLSOptions` (`config.cpp:435-464`): the option
-/// string is whitespace-split into `key=value` tokens (`split_into`,
-/// `config.cpp:224-239`) and the flag is set ONLY for the exact value
-/// `true` / `false`; an unknown value is ignored and a later token wins
-/// over an earlier one. Returns `None` when no `disable_plaintext=` token
-/// is present, so [`crate::server_native::PvaServerConfig::with_env`]
-/// preserves a caller-supplied value rather than forcing it to the
-/// default — the same `PickOne`-style presence rule the port helpers use.
+/// Mirrors `parseTLSOptions` (`config.cpp:435-465` on the personal fork
+/// branch `fork/fix/tls-peer-identity-and-downgrade` `6547f25`, the only tree
+/// that has `disable_plaintext` at all): the option string is
+/// whitespace-split into `key=value` tokens (`split_into`,
+/// `config.cpp:224-239`, `tls` `b3a10bf0`) and the flag is set ONLY for the
+/// exact value `true` / `false`; an unknown value is ignored and a later
+/// token wins over an earlier one. Returns `None` when no
+/// `disable_plaintext=` token is present, so
+/// [`crate::server_native::PvaServerConfig::with_env`] preserves a
+/// caller-supplied value rather than forcing it to the default — the same
+/// `PickOne`-style presence rule the port helpers use.
 pub fn server_tls_disable_plaintext_opt() -> Option<bool> {
     let mut out = None;
     for tok in server_tls_options().split_ascii_whitespace() {
@@ -998,8 +1003,9 @@ pub fn server_tls_disable_plaintext_opt() -> Option<bool> {
 /// Non-pvxs fallback password for a client-side TLS keychain.
 ///
 /// pvxs sources the PKCS#12 password from the `;password` suffix of the
-/// keychain spec (`ossl.cpp:232-238`, see [`split_keychain_spec`]), not
-/// from a dedicated env var. This Rust-only convenience is consulted
+/// keychain spec (`ossl.cpp:223-229` on pvxs `tls` `b3a10bf0`, see
+/// [`split_keychain_spec`]), not from a dedicated env var. This Rust-only
+/// convenience is consulted
 /// ONLY when the keychain spec carries no inline `;` suffix. Reads
 /// `EPICS_PVA_TLS_KEYCHAIN_PASSWORD`; `$(VAR)` / `${VAR}` refs are
 /// expanded. Returns `None` when unset.
@@ -1010,8 +1016,13 @@ pub fn client_tls_keychain_password() -> Option<String> {
 }
 
 /// Split a TLS keychain spec into `(path, inline_password)` the way pvxs
-/// `ossl.cpp:232-238` does: text before the FIRST `;` is the keychain
+/// `ossl.cpp:223-229` does: text before the FIRST `;` is the keychain
 /// path, text after it (when a `;` is present) is the PKCS#12 password.
+///
+/// The `ossl.cpp` citations here and in `crate::auth::tls` name pvxs `tls`
+/// `b3a10bf0`: `src/ossl.cpp` is on no default-branch revision of pvxs, so the
+/// crate's pin table — *no settled pin* for `pvxs` — cannot resolve them.
+/// `tls` is the unmerged upstream x509 branch on `epics-base/pvxs`.
 ///
 /// - `"cert.p12"`        → `("cert.p12", None)`     (no inline password)
 /// - `"cert.p12;secret"` → `("cert.p12", Some("secret"))`
@@ -1051,7 +1062,7 @@ pub fn server_addr_list() -> Vec<SocketAddr> {
 /// bind `IpAddr`s.
 ///
 /// pvxs parses interface lists through the SAME `split_addr_into` /
-/// `SockEndpoint` path as every other address list (config.cpp:151-169,
+/// `SockEndpoint` path as every other address list (config.cpp:151-183,
 /// 418-419, 592-593), so a DNS hostname is resolved before it constrains
 /// the bind/search interfaces: `SockEndpoint` calls `SockAddr::setAddress`
 /// (util.cpp:523-540), which falls back to a synchronous DNS lookup,
@@ -1127,7 +1138,7 @@ pub fn server_intf_addr_list() -> Vec<IpAddr> {
 
 /// PVX-82: presence-and-validity-aware server INTF resolver. pvxs parses
 /// `EPICS_PVAS_INTF_ADDR_LIST` with `required=true` (`config.cpp:418-424`
-/// → `151-176`, throwing at `172-174`), so a malformed endpoint aborts
+/// → `151-183`, throwing at `172-174`), so a malformed endpoint aborts
 /// server config. The Rust resolver is intentionally lenient — it warns
 /// and drops an unresolvable token, which is fine for a *partially* valid
 /// list — but a list whose tokens **all** drop must NOT silently become an
@@ -1190,8 +1201,8 @@ pub fn server_ignore_addr_list_opt() -> Option<Vec<(IpAddr, u16)>> {
 
 /// PVX-82 (IGNORE sibling of [`server_intf_addr_list_checked`]):
 /// presence-and-validity-aware server blocklist resolver. pvxs parses
-/// `EPICS_PVAS_IGNORE_ADDR_LIST` with `required=true` (`config.cpp:422-423`
-/// → `151-176`, throwing at `172-174`) exactly as it does the INTF list, so
+/// `EPICS_PVAS_IGNORE_ADDR_LIST` with `required=true` (`config.cpp:422-424`
+/// → `151-183`, throwing at `172-174`) exactly as it does the INTF list, so
 /// a malformed token aborts server config. Mirror the INTF treatment: a
 /// non-blank list whose tokens **all** fail to resolve is a misconfiguration
 /// — the operator named peers to block but none were understood, so the
@@ -1232,7 +1243,7 @@ pub fn server_ignore_addr_list() -> Vec<(IpAddr, u16)> {
     };
     // PVA-466: expand $(VAR) refs before tokenising.
     let raw = expand_dollar_vars(&raw);
-    // Whitespace-only split (pvxs `split_addr_into`, config.cpp:151-169):
+    // Whitespace-only split (pvxs `split_addr_into`, config.cpp:151-183):
     // the comma is endpoint syntax, not a list separator.
     raw.split_whitespace()
         .filter_map(|s| {
@@ -1297,7 +1308,7 @@ fn resolve_ignore_entry(token: &str) -> Option<(IpAddr, u16)> {
 /// (default port = `EPICS_PVAS_BROADCAST_PORT`). Falls back to empty
 /// when unset (caller should auto-discover NIC broadcasts).
 ///
-/// pvxs `config.cpp:426-431` falls back to
+/// pvxs `config.cpp:426-432` falls back to
 /// `EPICS_PVA_ADDR_LIST` when the server-specific list isn't set
 /// (shared deployment config). Pre-fix Rust read only the
 /// `EPICS_PVAS_*` var, so a site that listed beacon targets in
@@ -1317,8 +1328,8 @@ pub fn server_beacon_addr_list_opt() -> Option<Vec<SocketAddr>> {
 /// Endpoint-preserving variant of [`server_beacon_addr_list_opt`]: keeps each
 /// beacon destination's multicast TTL / interface modifiers so the UDP send
 /// path can apply `IP_MULTICAST_TTL` / outgoing-interface selection per pvxs
-/// (`evhelper.cpp:556-577`). Same env source + fallback
-/// (`EPICS_PVAS_BEACON_ADDR_LIST` → `EPICS_PVA_ADDR_LIST`, `config.cpp:426-431`).
+/// (`evhelper.cpp:556-592`). Same env source + fallback
+/// (`EPICS_PVAS_BEACON_ADDR_LIST` → `EPICS_PVA_ADDR_LIST`, `config.cpp:426-432`).
 pub fn server_beacon_endpoints_opt() -> Option<Vec<Endpoint>> {
     std::env::var("EPICS_PVAS_BEACON_ADDR_LIST")
         .ok()
@@ -1353,7 +1364,7 @@ pub fn list_broadcast_addresses(port: u16) -> Vec<SocketAddr> {
 ///
 /// This is the `EPICS_PVA*_INTF_ADDR_LIST` constraint on auto address
 /// expansion: pvxs runs `expandAddrList` over `Config::interfaces`
-/// (`config.cpp:624-648`), so a client constrained to a subset of
+/// (`config.cpp:624-651`), so a client constrained to a subset of
 /// interfaces broadcasts only on those subnets. Rules:
 ///
 /// * Empty `interfaces` → delegate to [`list_broadcast_addresses`] (the
@@ -1536,7 +1547,7 @@ pub struct Config {
     pub tcp_port: u16,
     /// `EPICS_PVA_AUTO_ADDR_LIST` — when set, `expand()` appends each
     /// interface's directed broadcast to [`Self::address_list`] and then
-    /// clears the flag (pvxs `autoAddrList`, `config.cpp:640-643`).
+    /// clears the flag (pvxs `autoAddrList`, `config.cpp:640-644`).
     pub auto_addr_list: bool,
     /// `EPICS_PVAS_AUTO_BEACON_ADDR_LIST` — server analogue of
     /// `auto_addr_list` for [`Self::beacon_destinations`] (pvxs
@@ -1592,7 +1603,7 @@ impl Config {
 
     /// Seed a server-role config from the `EPICS_PVAS_*` environment
     /// (falling back to `EPICS_PVA_*`). Mirrors `server::Config::fromEnv`
-    /// (`config.cpp:397-445`). Call [`Self::expand`] before use.
+    /// (`config.cpp:397-443`). Call [`Self::expand`] before use.
     pub fn from_server_env() -> Self {
         Self {
             udp_port: server_broadcast_port(),
@@ -1635,7 +1646,7 @@ impl Config {
 
         let v4_ifaces = self.interface_v4_addrs();
 
-        // Auto address-list expansion (client, config.cpp:640-643): append
+        // Auto address-list expansion (client, config.cpp:640-644): append
         // each interface's directed broadcast to the SEARCH targets, then
         // clear the flag so a re-`expand()` does not duplicate them.
         if self.auto_addr_list {
@@ -1776,7 +1787,7 @@ mod tests {
 
     /// pvxs `applyDefs(defs)` -> `_fromDefs(useenv=false)`: `PickOne`
     /// searches only the defs map and never calls `getenv()`
-    /// (config.cpp:228-249, :468-470). A key present in the process
+    /// (config.cpp:229-255, :468-472). A key present in the process
     /// environment but absent from the scoped defs must NOT leak into the
     /// scoped config — that ambient fallback was the contamination this
     /// primitive exists to prevent.
@@ -2490,7 +2501,7 @@ mod tests {
 
     /// server TLS options resolve PVAS-first, then shared PVA (pvxs
     /// `pickone({EPICS_PVAS_TLS_OPTIONS, EPICS_PVA_TLS_OPTIONS})`,
-    /// config.cpp:501) — first present wins, no merge.
+    /// config.cpp:483, `tls` `b3a10bf0`) — first present wins, no merge.
     #[test]
     #[serial_test::serial(epics_env)]
     fn server_tls_options_prefers_pvas_then_pva() {
@@ -2525,10 +2536,11 @@ mod tests {
         }
     }
 
-    /// `disable_plaintext` is parsed out of the server TLS options the
-    /// way pvxs `parseTLSOptions` does (config.cpp:453-460): `true` /
-    /// `false` set the flag, an unknown value is ignored, and an absent
-    /// key yields `None` so `with_env` preserves the caller value.
+    /// `disable_plaintext` is parsed out of the server TLS options the way
+    /// `parseTLSOptions` does (config.cpp:453-460 on the fork branch
+    /// `fork/fix/tls-peer-identity-and-downgrade` `6547f25`): `true` /
+    /// `false` set the flag, an unknown value is ignored, and an absent key
+    /// yields `None` so `with_env` preserves the caller value.
     #[test]
     #[serial_test::serial(epics_env)]
     fn server_tls_disable_plaintext_parses_like_pvxs() {
@@ -2573,7 +2585,8 @@ mod tests {
 
     /// server TLS keychain resolves PVAS-first, then shared PVA (pvxs
     /// `pickone({EPICS_PVAS_TLS_KEYCHAIN, EPICS_PVA_TLS_KEYCHAIN})`,
-    /// config.cpp:497). The client path stays PVA-only (config.cpp:672).
+    /// config.cpp:479, `tls` `b3a10bf0`). The client path stays PVA-only
+    /// (config.cpp:654).
     #[test]
     #[serial_test::serial(epics_env)]
     fn server_tls_keychain_prefers_pvas_then_pva() {
@@ -2604,8 +2617,9 @@ mod tests {
         }
     }
 
-    /// `split_keychain_spec` matches pvxs `ossl.cpp:232-238`: split at the
-    /// FIRST `;`, path before, password after; no `;` → no inline password;
+    /// `split_keychain_spec` matches pvxs `ossl.cpp:223-229` (`tls`
+    /// `b3a10bf0`): split at the FIRST `;`, path before, password after;
+    /// no `;` → no inline password;
     /// trailing `;` → explicit empty password. One case per boundary.
     #[test]
     fn split_keychain_spec_matches_pvxs_first_semicolon() {
@@ -2784,7 +2798,7 @@ mod tests {
     /// `EPICS_PVA_SERVER_PORT=0` is a valid server ephemeral-bind request
     /// but never a usable client TCP destination, so the client default
     /// port expands a zero back to 5075 (pvxs `Config::expand()`,
-    /// config.cpp:624-632). An explicit non-zero value and the unset
+    /// config.cpp:631-632). An explicit non-zero value and the unset
     /// default are unchanged.
     #[test]
     #[serial_test::serial(epics_env)]
@@ -2992,7 +3006,7 @@ mod tests {
 
     /// `auto_addr_list` appends the limited broadcast to the SEARCH targets
     /// and then clears the flag — pvxs `autoAddrList` consumption
-    /// (`config.cpp:640-643`). The flag is idempotent: a second `expand()`
+    /// (`config.cpp:640-644`). The flag is idempotent: a second `expand()`
     /// adds nothing.
     #[test]
     fn config_expand_consumes_auto_addr_list() {

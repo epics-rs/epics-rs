@@ -117,7 +117,11 @@ async fn onchange_successful_save_advances_the_watermark() {
     let dir = tempfile::tempdir().unwrap();
     let mgr = build(dir.path().join("oc.sav"), onchange()).await;
     let db = setup_db().await;
-    let handle = mgr.clone().start(db.clone());
+    let handle = mgr.clone().start(
+        &epics_base_rs::runtime::task::Reactor::current()
+            .expect("the test driver enters an executor"),
+        db.clone(),
+    );
 
     sleep(QUIET).await; // baseline poll, nothing changed yet
     assert_eq!(saves(&mgr), 0, "an unchanged set must not be saved");
@@ -144,7 +148,11 @@ async fn onchange_failed_save_keeps_the_watermark_and_retries() {
     // Parent directory absent -> every write_save_file_with_mode fails.
     let mgr = build(dir.path().join("absent/oc.sav"), onchange()).await;
     let db = setup_db().await;
-    let handle = mgr.clone().start(db.clone());
+    let handle = mgr.clone().start(
+        &epics_base_rs::runtime::task::Reactor::current()
+            .expect("the test driver enters an executor"),
+        db.clone(),
+    );
 
     sleep(QUIET).await;
     db.put_pv_no_process("TEMP", EpicsValue::Double(30.0))
@@ -173,7 +181,11 @@ async fn onchange_change_survives_a_failed_save_and_lands_on_disk() {
     let sav = dir.path().join("absent/oc.sav");
     let mgr = build(sav.clone(), onchange()).await;
     let db = setup_db().await;
-    let handle = mgr.clone().start(db.clone());
+    let handle = mgr.clone().start(
+        &epics_base_rs::runtime::task::Reactor::current()
+            .expect("the test driver enters an executor"),
+        db.clone(),
+    );
 
     sleep(QUIET).await;
     db.put_pv_no_process("TEMP", EpicsValue::Double(30.0))
@@ -209,7 +221,11 @@ async fn triggered_any_change_retries_after_a_failed_save() {
     let sav = dir.path().join("absent/trig.sav");
     let mgr = build(sav.clone(), triggered(TriggerMode::AnyChange)).await;
     let db = setup_db().await;
-    let handle = mgr.clone().start(db.clone());
+    let handle = mgr.clone().start(
+        &epics_base_rs::runtime::task::Reactor::current()
+            .expect("the test driver enters an executor"),
+        db.clone(),
+    );
 
     sleep(QUIET).await; // baseline poll of TRIG
     db.put_pv_no_process("TRIG", EpicsValue::Double(1.0))
@@ -240,7 +256,11 @@ async fn triggered_non_zero_stays_armed_after_a_failed_save() {
     let sav = dir.path().join("absent/nz.sav");
     let mgr = build(sav.clone(), triggered(TriggerMode::NonZero)).await;
     let db = setup_db().await;
-    let handle = mgr.clone().start(db.clone());
+    let handle = mgr.clone().start(
+        &epics_base_rs::runtime::task::Reactor::current()
+            .expect("the test driver enters an executor"),
+        db.clone(),
+    );
 
     sleep(QUIET).await; // baseline poll: TRIG is 0, armed
     db.put_pv_no_process("TRIG", EpicsValue::Double(1.0))

@@ -224,7 +224,7 @@ pub struct NdDimension {
 #[derive(Debug, Clone)]
 pub struct NdAttribute {
     pub name: String,
-    /// pvxs advertises this member as `Any("value")` (`nt.cpp:240-247`):
+    /// pvxs advertises this member as `Any("value")` (`nt.cpp:240`):
     /// the attribute value is a variant that may carry a scalar, scalar
     /// array, structure, union, or be null. It is stored as a
     /// [`VariantValue`] — the same `any` modeling [`NdCodec::parameters`]
@@ -363,7 +363,7 @@ fn dimension_desc() -> FieldDesc {
 }
 
 fn attribute_desc() -> FieldDesc {
-    // pvxs `nt.cpp:240-249` field order. Pre-fix Rust omitted
+    // pvxs `nt.cpp:238-247` field order. Pre-fix Rust omitted
     // `tags`, `alarm`, `timeStamp`.
     FieldDesc::StructureArray {
         struct_id: "epics:nt/NTAttribute:1.0".into(),
@@ -535,7 +535,7 @@ fn attribute_value(attrs: &[NdAttribute]) -> PvField {
                 // The attribute `value` is the advertised `any` slot: emit
                 // the caller's variant verbatim so a scalar-array,
                 // structure, union, or null value reaches the wire intact
-                // (pvxs `Any("value")`, nt.cpp:240-247).
+                // (pvxs `Any("value")`, nt.cpp:240).
                 s.fields
                     .push(("value".into(), PvField::Variant(Box::new(a.value.clone()))));
                 s.fields.push((
@@ -689,7 +689,7 @@ mod tests {
 
     #[test]
     fn attribute_value_carries_non_scalar_variants() {
-        // pvxs advertises NTAttribute.value as `Any` (nt.cpp:240-247).
+        // pvxs advertises NTAttribute.value as `Any` (nt.cpp:240).
         // The builder must be able to populate scalar-array, structure,
         // and null attribute values — not just scalars — and they must
         // survive an encode/decode/re-encode round trip against the

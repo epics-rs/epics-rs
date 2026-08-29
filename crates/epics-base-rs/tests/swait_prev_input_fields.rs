@@ -1,7 +1,7 @@
 //! R9-75 — swait publishes LA..LL, the previous value of each input A..L.
 //!
 //! C `swaitRecord.dbd:298-331` declares twelve `DBF_DOUBLE` "Last Val of Input
-//! x" fields, and C `swaitRecord.c::monitor` (646-653) is their writer:
+//! x" fields, and C `swaitRecord.c::monitor` (647-654) is their writer:
 //!
 //! ```c
 //! for (i=0, pnew=&pwait->a, pprev=&pwait->la; i<MAX_FIELDS; i++, pnew++, pprev++) {

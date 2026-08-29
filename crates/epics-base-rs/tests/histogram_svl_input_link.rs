@@ -154,12 +154,38 @@ async fn sgnl_caput_still_counts_through_special() {
 /// record from a field the C record type does not have.
 #[epics_macros_rs::epics_test]
 async fn field_inp_is_refused_on_a_histogram() {
+    const WITH_INP: &str = r#"
+record(ai, "SRC2") { field(VAL, "1.5") }
+record(histogram, "H:INP") {
+    field(INP, "SRC2")
+    field(NELM, "4")
+    field(LLIM, "0")
+    field(ULIM, "4")
+}
+"#;
+    // Refusing the field also fails the load's status, which is what C's
+    // `dbLoadRecords` returns (`dbAccess.c:795-813`) and what makes
+    // `softIoc -d` exit 2 (`softMain.cpp:198,274-278`).
+    let Err(err) = IocBuilder::new()
+        .db_string(WITH_INP, &std::collections::HashMap::new())
+        .expect("the refusal is recoverable; the load's status settles at build")
+        .build()
+        .await
+    else {
+        panic!("field(INP) on a histogram must fail the load");
+    };
+    assert!(
+        matches!(err, CaError::DbLoadFailed(_)),
+        "expected a failed load status, got {err:?}"
+    );
+
+    // C's iocsh keeps the record and drops only the offending field, so the
+    // record that survives such a load is the one below: no INP anywhere.
     let db = IocBuilder::new()
         .db_string(
             r#"
 record(ai, "SRC2") { field(VAL, "1.5") }
 record(histogram, "H:INP") {
-    field(INP, "SRC2")
     field(NELM, "4")
     field(LLIM, "0")
     field(ULIM, "4")

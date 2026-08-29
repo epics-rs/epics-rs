@@ -14,7 +14,7 @@
 //! `mode` is a bit-field: bit 0 (`UART_SPI_BIT = 0x01`) selects SPI
 //! when set, UART when clear (`drvAsynFTDIPort.cpp:520`,
 //! `drvAsynFTDIPort.h:11`). `latency` is clamped to `1..=255`
-//! (`drvAsynFTDIPort.cpp:534-538`). When `noProcessEos` is zero the C
+//! (`drvAsynFTDIPort.cpp:535-538`). When `noProcessEos` is zero the C
 //! driver auto-installs `asynInterposeEos`
 //! (`drvAsynFTDIPort.cpp:622-623`).
 //!
@@ -76,7 +76,7 @@ pub struct FtdiConfig {
 impl FtdiConfig {
     /// Build a config from the same positional arguments the C
     /// `drvAsynFTDIPortConfigure` accepts. Latency is clamped to
-    /// `1..=255` to match `drvAsynFTDIPort.cpp:534-538`.
+    /// `1..=255` to match `drvAsynFTDIPort.cpp:535-538`.
     pub fn from_positional(
         vendor: i32,
         product: i32,
@@ -143,7 +143,7 @@ impl DrvAsynFtdiPort {
             PortFlags {
                 multi_device: false,
                 can_block: true,
-                destructible: true,
+                ..PortFlags::default()
             },
         );
         base.init_connected(false);

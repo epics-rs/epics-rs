@@ -1,7 +1,7 @@
 //! R18-106: compress samples INP only when INP is a CONNECTED link; every
 //! other cycle raises LINK/INVALID and ingests nothing.
 //!
-//! `compressRecord.c:326-343`:
+//! `compressRecord.c:327-343`:
 //!
 //! ```c
 //! prec->pact = TRUE;
@@ -143,7 +143,9 @@ async fn a_connected_db_link_ingests_and_stays_no_alarm() {
 
 /// INP has ONE source. `COMPRESS_FIELDS` declares no INP (nor does
 /// `compressRecord.dbd.pod`), so the link is a dbCommon field and `.INP` reads
-/// the link text softIoc reads: `dbgf C:LINK.INP` → `"SRC"`. The record used to
+/// what softIoc reads: `dbgf C:LINK.INP` → `"SRC NPP NMS"`, C `dbGetString`'s
+/// rendering of the parsed link rather than the text the `.db` carried. The
+/// record used to
 /// carry a private `inp` field that the loader never wrote and that shadowed
 /// the common one — the port answered `""`.
 #[epics_macros_rs::epics_test]
@@ -152,7 +154,7 @@ async fn inp_reads_back_the_link_text() {
 
     assert_eq!(
         db.get_pv("C:LINK.INP").unwrap(),
-        EpicsValue::String("SRC".into())
+        EpicsValue::String("SRC NPP NMS".into())
     );
     assert_eq!(
         db.get_pv("C:CONST.INP").unwrap(),

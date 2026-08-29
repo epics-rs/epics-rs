@@ -43,9 +43,9 @@ enum StackEntry {
     /// REPLACE result rather than to its own argument (R13-2).
     ///
     /// This is a stack entry of its own rather than a second `LParen` because the
-    /// two are barriers for DIFFERENT things: C's `SEPARATOR` (`:614`) stops at
-    /// `(`, `[` and `{` alike, but only `CLOSE_PAREN` (`:653`) hands the argument
-    /// count to a vararg function below it. Sharing one variant let a `,` inside
+    /// two are barriers for DIFFERENT things: C's `SEPARATOR` (`:614-615`) stops
+    /// at `(`, `[` and `{` alike, but only `CLOSE_PAREN` (`:652-656`) hands the
+    /// argument count to a vararg function below it. Sharing one variant let a `,` inside
     /// `MAX(4,7)[0,0]`'s bracket bump `MAX`'s argument count.
     Subrange {
         /// `{` (sCalc `REPLACE`, aCalc `SUBRANGE_IP`) rather than `[` (`SUBRANGE`
@@ -732,7 +732,7 @@ pub fn compile(tokens: &[Token], kind: ExprKind) -> Result<CompiledExpr, CalcErr
                 //     (`A_ASTORE` in aCalc). Nothing is retracted from the output:
                 //     the index stays, the value follows it, and the store opcode
                 //     pops both. Operators sitting ABOVE the rewritten entry are
-                //     flushed (`:531-546`), since `:=` has in_coming_pri 0.
+                //     flushed (`:500-511`), since `:=` has in_coming_pri 0.
                 //
                 //  2. Otherwise the STATIC store: retract the fetch just emitted
                 //     (FETCH_A..FETCH_P or FETCH_AA..FETCH_LL) and park a STORE on

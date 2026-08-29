@@ -6,7 +6,7 @@ use asyn_rs::error::{AsynError, AsynResult};
 use asyn_rs::param::ParamType;
 use asyn_rs::port::{DrvUserInfo, DrvUserRequest, PortDriver, PortDriverBase, PortFlags};
 use asyn_rs::user::AsynUser;
-use tokio::sync::mpsc;
+use tokio::sync::{Notify, mpsc};
 
 use crate::address::{PayloadFormat, TopicAddress};
 use crate::config::{MqttConfig, QoS};
@@ -77,6 +77,80 @@ pub struct MqttDriver {
     /// flag to fail a publish while the broker is down instead of silently
     /// buffering it on the unbounded channel.
     connected: Arc<AtomicBool>,
+    /// Signalled when this driver is dropped, so the event loop can send a
+    /// DISCONNECT before it exits.
+    ///
+    /// C parity (MQ4): `~MqttClient` calls `disconnect()`
+    /// (mqttClient.cpp:37-41), which sends a DISCONNECT and waits for it
+    /// whenever the session is up (`client_.disconnect()->wait()`,
+    /// mqttClient.cpp:51-55). The port actor owns this driver, so dropping it
+    /// is the same teardown point C destructs at.
+    shutdown: Arc<Notify>,
+    /// The event loop's half of the teardown rendezvous, until
+    /// [`Self::teardown_ack`] hands it over. While it is still here no event
+    /// loop exists, which is exactly when `Drop` has nothing to wait for.
+    teardown_tx: Option<std::sync::mpsc::Sender<()>>,
+    /// This side of it. `Mutex` only because [`PortDriver`] is `Sync` and a
+    /// `Receiver` is not; the port actor owns the driver exclusively, so it is
+    /// never contended and `Drop` reads it through `get_mut`.
+    teardown_rx: Mutex<std::sync::mpsc::Receiver<()>>,
+}
+
+/// How long `Drop` waits for the event loop to finish the teardown it just
+/// asked for.
+///
+/// C does not bound this at all — `client_.disconnect()->wait()`
+/// (mqttClient.cpp:51-55) — because paho's own I/O thread writes the packet and
+/// needs nothing from the caller. Ours needs the event-loop task to be
+/// scheduled and to get its param updates into the port actor's inbox, and the
+/// actor is this very thread; a full inbox would therefore never drain. So the
+/// wait is bounded, and it sits under asyn's five-second
+/// `PORT_EXIT_STOP_TIMEOUT` so the driver reports its own failure rather than
+/// being cut off mid-wait by the port-level one.
+const TEARDOWN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
+
+/// C parity (MQ4): `~MqttClient` disconnects (mqttClient.cpp:37-41). The port
+/// actor owns the driver, so this is the teardown point; the event loop turns
+/// the signal into the DISCONNECT packet because it owns the rumqttc client.
+///
+/// Raising the signal is not the teardown — C's `disconnect()` *waits* for the
+/// packet (`->wait()`, mqttClient.cpp:51-55), on the thread that is exiting.
+/// Without that wait this `Drop` returns the instant it has asked, asyn's
+/// `stop_port_actor` sees the actor stop, `call_at_exits` returns and the
+/// process exits out from under the event-loop task that was going to write the
+/// packet: measured on this box, the DISCONNECT reached the broker 22 times out
+/// of 30. So `Drop` returning must mean the broker has been told, which is what
+/// it means for every other asyn driver — `DrvAsynSerialPort::drop` calls
+/// `disconnect` and it completes before `drop` returns.
+impl Drop for MqttDriver {
+    fn drop(&mut self) {
+        self.shutdown.notify_one();
+        if self.teardown_tx.is_some() {
+            // Nobody took the event loop's half, so no event loop exists: a
+            // unit-test driver, or a `mqttDriverConfigure` that failed before
+            // it could spawn one. Nothing is coming.
+            return;
+        }
+        let rx = self
+            .teardown_rx
+            .get_mut()
+            .unwrap_or_else(|e| e.into_inner());
+        match rx.recv_timeout(TEARDOWN_TIMEOUT) {
+            // The loop ended properly (`Ok`), or its task died with the runtime
+            // before it could say so (`Disconnected`). Either way nothing more
+            // is coming and there is nothing left to wait for.
+            Ok(()) | Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {}
+            // Loud, and on stderr, for the reason asyn's own timeout is: this
+            // is the report that the broker was NOT told, and it happens on the
+            // way out of a process whose `tracing` subscriber may already be
+            // gone.
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => eprintln!(
+                "mqtt: port '{}' did not get its DISCONNECT out within \
+                 {TEARDOWN_TIMEOUT:?}; the broker was not told",
+                self.base.port_name
+            ),
+        }
+    }
 }
 
 impl MqttDriver {
@@ -98,6 +172,7 @@ impl MqttDriver {
         publish_tx: mpsc::UnboundedSender<PublishRequest>,
         connected: Arc<AtomicBool>,
     ) -> Self {
+        let (teardown_tx, teardown_rx) = std::sync::mpsc::channel();
         // C parity: drvMqtt sets `.setBlocking(false)` (drvMqtt.cpp:122) — the
         // MQTT port is non-blocking. The Rust write path only `send`s on an
         // mpsc channel (publish_value) and reads serve from the param cache, so
@@ -130,7 +205,35 @@ impl MqttDriver {
             default_qos: config.qos,
             connected_param,
             connected,
+            shutdown: Arc::new(Notify::new()),
+            teardown_tx: Some(teardown_tx),
+            teardown_rx: Mutex::new(teardown_rx),
         }
+    }
+
+    /// The teardown signal the event loop waits on — see the `shutdown` field.
+    /// Take a clone before handing the driver to the port runtime, exactly as
+    /// [`Self::topic_map`] is taken.
+    pub fn shutdown_signal(&self) -> Arc<Notify> {
+        self.shutdown.clone()
+    }
+
+    /// Take the event loop's half of the teardown rendezvous.
+    ///
+    /// The event loop owns this sender for its whole life, so *every* way that
+    /// task can end — returning after the DISCONNECT, returning because there
+    /// was no session to close, or being dropped with the tokio runtime —
+    /// releases the `Drop` waiting on the other end. That is what keeps the
+    /// wait bounded by the loop's own lifetime rather than by
+    /// `TEARDOWN_TIMEOUT`, and it is why no exit path added to the loop later
+    /// can leave a shutting-down IOC waiting out the full timeout.
+    ///
+    /// Handed over exactly once, before the port actor takes the driver.
+    pub fn teardown_ack(&mut self) -> std::sync::mpsc::Sender<()> {
+        self.teardown_tx.take().expect(
+            "the event loop's teardown half is handed over exactly once, \
+             before the port actor takes the driver",
+        )
     }
 
     /// Get the set of MQTT topics created so far (those a record has bound).
@@ -288,9 +391,15 @@ impl PortDriver for MqttDriver {
         // std::string(stringData.data()), terminating the payload at the first
         // NUL (drvMqtt.cpp:714-716). Take the raw bytes up to that NUL.
         let raw = octet_bytes_cstr(data);
-        // Bytes transferred = bytes actually published to the wire (the
-        // payload up to the NUL), C `asynOctet::write`'s *nbytesTransfered.
-        let nbytes = raw.len();
+        // Bytes transferred = the caller's full byte count, not the published
+        // length. `Autoparam::Driver::writeOctet` sets `*nActual = nChars`
+        // unconditionally (autoparamDriver.cpp:1495, v2.1.0 `2159559`) — commented
+        // "Only complete writes are supported" (:1494) — before it ever dispatches
+        // to `writeOctetData` (:1496), so the handler cannot influence the count.
+        // The payload still stops at the NUL above; only the count is the whole
+        // buffer. (Contrast modbus, whose writeOctet derives *nActual from what
+        // fit the register buffer, drvModbusAsyn.cpp:1548-1552.)
+        let nbytes = data.len();
         // Copy the format (Copy enum) so the immutable reason_to_addr borrow is
         // dropped before the mutable cache store below.
         let format = self
@@ -641,6 +750,51 @@ mod tests {
         let req = rx.try_recv().unwrap();
         assert_eq!(req.topic, "test/str_topic");
         assert_eq!(req.payload, b"hi");
+    }
+    /// `*nbytesTransfered` for an embedded-NUL octet write.
+    ///
+    /// C, at the declared autoparam pin (`v2.1.0`, `2159559`,
+    /// `/home/stevek/work/epics-modules/autoparamDriver`):
+    /// `Autoparam::Driver::writeOctet` (`autoparamDriver.cpp:1484-1500`) sets
+    /// `*nActual = nChars` **unconditionally** at `:1495`, commented "Only
+    /// complete writes are supported" (`:1494`), *before* it dispatches to the
+    /// handler via `writeOctetData` (`:1496`). So C reports the full count asyn
+    /// handed down — 8 for `b"hi\0there"` — whatever the payload contains, and
+    /// `stringWrite` never gets to influence it.
+    ///
+    /// `write_octet` returned `raw.len()` — the length up to the first NUL, 2 —
+    /// until this was corrected to the caller's count. `raw.len()` is the
+    /// semantically defensible number, being what actually reached the wire, but
+    /// it is not what C reports and asyn callers read the count, not the wire.
+    ///
+    /// The wire payload is *not* in dispute: both sides publish `b"hi"` only
+    /// (`drvMqtt.cpp:714-716`, covered by
+    /// `write_octet_truncates_published_payload_at_first_nul` above). Whoever
+    /// takes this decision must move the count without moving the payload,
+    /// which is why this test asserts both.
+    ///
+    /// Both halves are asserted here because they move independently: the count
+    /// is the caller's buffer, the payload stops at the NUL.
+    #[test]
+    fn write_octet_reports_c_s_full_nbytes_transfered() {
+        let (mut driver, mut rx) = make_driver(&["FLAT:STRING test/str_topic"]);
+        let reason = driver
+            .drv_user_create(&DrvUserRequest::new("FLAT:STRING test/str_topic", 0))
+            .unwrap()
+            .reason;
+        let mut user = AsynUser::new(reason);
+
+        let buf = b"hi\0there";
+        let nbytes = driver.write_octet(&mut user, buf).unwrap();
+
+        // C: *nActual = nChars (autoparamDriver.cpp:1495).
+        assert_eq!(
+            nbytes,
+            buf.len(),
+            "C reports the full nChars it was handed, not the pre-NUL length"
+        );
+        // ... while the published payload stays truncated on both sides.
+        assert_eq!(rx.try_recv().unwrap().payload, b"hi");
     }
 
     /// MQ39: a non-UTF-8 FLAT octet write reaches the wire byte-for-byte. C

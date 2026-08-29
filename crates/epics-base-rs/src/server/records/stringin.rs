@@ -36,10 +36,6 @@ pub struct StringinRecord {
     pub mpst: i16,
     /// `menu(stringinPOST)` Post Archive Monitors (0=On Change, 1=Always).
     pub apst: i16,
-    /// C `monitor()`'s `strncmp(oval, val)` verdict for THIS cycle, captured
-    /// in `process()` before OVAL is committed — the framework reads it
-    /// afterwards, by which time `oval == val`.
-    value_changed: bool,
 }
 
 /// `menu(stringinPOST)` — `stringinRecord.dbd.pod`: 0 = On Change, 1 = Always.
@@ -57,7 +53,6 @@ impl Default for StringinRecord {
             sdly: -1.0,
             mpst: 0,
             apst: 0,
-            value_changed: false,
         }
     }
 }
@@ -115,8 +110,15 @@ impl Record for StringinRecord {
         false
     }
 
-    fn monitor_value_changed(&self) -> Option<bool> {
-        Some(self.value_changed)
+    /// C `stringinRecord.c:176-179` `monitor()`: the `strncmp(oval, val)` mismatch both
+    /// raises `DBE_VALUE | DBE_LOG` and copies VAL into OVAL. Compared and
+    /// committed HERE, at C's position, never captured during `process()`.
+    fn monitor_value_changed(&mut self) -> Option<bool> {
+        let changed = self.oval != self.val;
+        if changed {
+            self.oval = self.val.clone();
+        }
+        Some(changed)
     }
 
     /// C: `if (mpst == stringinPOST_Always) monitor_mask |= DBE_VALUE;`
@@ -139,6 +141,18 @@ impl Record for StringinRecord {
         false
     }
 
+    /// `stringinRecord.c::process` likewise never re-derives UDF after a
+    /// DEVICE read that wrote VAL directly (C `return 2`): its one
+    /// `prec->udf = FALSE` is the simulated SIOL branch at `:211`. The dset
+    /// owns the decision, and `devAsynOctet.c::callbackSiRead:918-932` shows
+    /// why that matters — `readIt` stores into `psi->val` unconditionally but
+    /// `psi->udf = 0` runs only inside `if (status == asynSuccess)`, so a
+    /// partial read on a transport error leaves the record undefined with a
+    /// truncated VAL. Re-deriving here would declare it defined.
+    fn rederives_udf_on_computed_read(&self) -> bool {
+        false
+    }
+
     /// `stringinRecord.c` has NO `recGblCheckUdf` / `UDF_ALARM` (unlike
     /// `stringoutRecord.c:147`): an undefined stringin raises no alarm from UDF
     /// (softIoc: `record(stringin,"X"){}` → UDF 1, STAT/SEVR = NO_ALARM). With
@@ -149,15 +163,6 @@ impl Record for StringinRecord {
     }
 
     fn process(&mut self) -> CaResult<ProcessOutcome> {
-        // C `stringinRecord.c::monitor` copies VAL into OVAL — but only on the
-        // `strncmp` mismatch that also raises DBE_VALUE|DBE_LOG. Capture the
-        // verdict here: the framework's monitor gate reads
-        // `monitor_value_changed()` after `process()` returns, by which point
-        // an unconditional copy would have erased it.
-        self.value_changed = self.oval != self.val;
-        if self.value_changed {
-            self.oval = self.val.clone();
-        }
         Ok(ProcessOutcome::complete())
     }
 

@@ -38,11 +38,11 @@ pub fn ip_from_bytes(addr: &[u8; 16]) -> Option<IpAddr> {
 
 /// decode a 16-byte PVA address treating the all-zero
 /// pattern as the unspecified IPv6 address (`::`) rather than as
-/// "decode failed". pvxs `evhelper.cpp:911-937` accepts it as
+/// "decode failed". pvxs `evhelper.cpp:911-938` accepts it as
 /// `SockAddr::isAny()` and `util.cpp:552-558` classifies IPv6
 /// unspecified as wildcard; downstream code substitutes the UDP
 /// packet's source address for any wildcard SEARCH_RESPONSE /
-/// BEACON (pvxs `client.cpp:841-843`, `udp_collector.cpp:471-476`).
+/// BEACON (pvxs `src/client.cpp:841-843`, `udp_collector.cpp:471-476`).
 /// Pre-fix Rust mapped all-zero to `None` and rejected the frame
 /// — so an IPv6-capable peer advertising wildcard via the raw-zero
 /// encoding was ignored by the Rust client.

@@ -7,6 +7,14 @@
 //! test wires a real `bo` record + `asyn:READBACK` device support on top of
 //! the real SimDetector driver and acquisition task, and replicates the
 //! `setup_io_intr` consumer, so it exercises the full record-callback path.
+// RTEMS-EXEC-MODEL-ALLOW(1): checked, not waived — all 1 ran and passed
+// on the exec backend (measured on this tree:
+// `EPICS_RS_BUILD_EXEC_BACKEND=thread cargo nextest run -p sim-detector
+// --all-features`, 27/27). sim-detector became a census subject when its
+// `build.rs` began deriving `tokio_backend`; nothing here builds a CA
+// server, and the reactor these obtain comes from `#[tokio::test]`
+// itself, which the backend does not remove.
+
 #![cfg(feature = "ioc")]
 
 use std::collections::HashSet;
@@ -52,7 +60,7 @@ async fn acquire_bo_returns_to_zero_after_single() {
     let link = AsynLink {
         port_name: "RBK_TEST".into(),
         addr: 0,
-        timeout: Duration::from_secs(1),
+        timeout: Some(Duration::from_secs(1)),
         drv_info: "ACQUIRE".into(),
     };
     let mut ads = AsynDeviceSupport::from_handle(handle.clone(), link, "asynInt32");

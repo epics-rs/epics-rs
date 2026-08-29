@@ -24,6 +24,15 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
+  # Line tables, not full DWARF. A `cargo nextest run --workspace` target dir
+  # for this workspace measures 91,635 MB here, against the ~86 GB an
+  # ubuntu-latest runner leaves free, and it is nearly all debuginfo: 658 test
+  # binaries at ~300 MB each. Both `checks` and `interop` died writing the
+  # runner's own diagnostic log ("System.IO.IOException: No space left on
+  # device"), which also loses the job log, so the failure arrives with no
+  # output to read. `line-tables-only` keeps the file:line a backtrace is read
+  # with and takes the same target dir to 34,436 MB (measured 2026-08-29).
+  CARGO_PROFILE_DEV_DEBUG: line-tables-only
   # R7.0.9 is the floor, not a preference: before base 3d70e7064
   # `dbAllocRecord()` reaches every field through `&ppvt->common`, so
   # `__builtin_object_size()` bounds the write to `sizeof(dbCommon)` and
@@ -225,7 +234,7 @@ jobs:
     - name: Run wire-golden + interop suites
       # The `interop` profile in .config/nextest.toml filters to
       # the gated binaries (wire_golden_ext, wire_golden_pvxs,
-      # interop_*_rust_*, differential_libca, parity_interop,
-      # interop_pvxs). Skips wrapped in `require_tool` print a
+      # interop_*_rust_*, differential_libca, interop_pvxs).
+      # Skips wrapped in `require_tool` print a
       # SKIP line + exit 0 when binaries are still missing.
       run: cargo nextest run --profile interop --no-fail-fast

@@ -154,6 +154,6 @@ fn an_interpose_pushed_after_configure_serves_the_write_path() {
         got,
         vec![b"C".to_vec(), b"M".to_vec(), b"D".to_vec()],
         "the delay interpose must sit above the driver and hand it one character \
-         per write (C asynInterposeDelay.c:99-121)"
+         per write (C asynInterposeDelay.c:33-53)"
     );
 }

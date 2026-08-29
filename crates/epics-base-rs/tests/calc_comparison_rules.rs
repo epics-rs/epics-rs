@@ -1,12 +1,12 @@
 //! R9-1 — each engine's comparison rule, and they are not the same rule.
 //!
-//! * base `calcPerform.c:369-393` — the bare C operators, exact.
+//! * base `calcPerform.c:368-392` — the bare C operators, exact.
 //! * aCalc `aCalcPerform.c:1345-1350` (array/array), `:1370-1375`
-//!   (array/scalar), `:1397-1402` (scalar/scalar) — also the bare C operators,
+//!   (array/scalar), `:1386-1391` (scalar/scalar) — also the bare C operators,
 //!   exact. `aCalcPerform` contains no epsilon at all.
 //! * sCalc `sCalcPerform.c:595-620` (no-string path) and `:1161-1255` (string
 //!   path) — every numeric comparison is written around `SMALL` = 1e-11
-//!   (`:46`): `a == b` is `fabs(a-b) < SMALL`, `a > b` is `(a-b) > SMALL`, and
+//!   (`:45`): `a == b` is `fabs(a-b) < SMALL`, `a > b` is `(a-b) > SMALL`, and
 //!   so on. Two strings go through `strcmp`.
 //!
 //! The port had these two SWAPPED: the array engine applied a 1e-11 epsilon
@@ -100,7 +100,7 @@ fn scalc_string_comparison_is_strcmp() {
     assert_eq!(sc(r#""abc" < "abd""#), 1.0);
 }
 
-/// base has no epsilon (`calcPerform.c:369-393`) — the numeric engine must not
+/// base has no epsilon (`calcPerform.c:368-392`) — the numeric engine must not
 /// pick up sCalc's.
 #[test]
 fn base_compares_exactly() {

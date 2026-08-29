@@ -1,5 +1,5 @@
 //! iocsh commands for pvalink — `pvxr`, `pvalinkrefdiff`, `dbpvar`,
-//! `dbpvxr`, `pvaLinkNWorkers`.
+//! `dbpvxr`, and the `pvaLinkNWorkers` variable.
 //!
 //! Mirrors pvxs `ioc/pvalink.cpp` (`dbpvxr` registered under the IOC
 //! shell name `dbpvar`, `testqsrvWaitForLinkConnected`, and the
@@ -13,11 +13,13 @@
 //! reference-leak diagnostic (`pvxs/ioc/iochooks.cpp:479-484`), not a
 //! pvalink command.
 
-// RTEMS-EXEC-MODEL-ALLOW(2): checked - these run and pass in the feature-ON suite.
+// RTEMS-EXEC-MODEL-ALLOW(2): checked - these run and pass in the exec-backend
+// suite.
 
 use epics_base_rs::server::iocsh::registry::{
     ArgDesc, ArgType, ArgValue, CommandContext, CommandDef, CommandOutcome,
 };
+use epics_base_rs::server::iocsh::vars::{VarAccess, VarDef};
 
 use super::config::{LinkDirection, ProcMode, SevrMode};
 use super::integration::PvaLinkResolver;
@@ -25,14 +27,13 @@ use super::registry::ChannelDiag;
 
 /// `pvxr <pv_name>` — pre-open a link in INP+monitor mode so the
 /// resolver returns cached values for that PV without a blocking GET
-/// on first access. Mirrors pvxs `pvalinkOpen` (pvalink_channel.cpp).
+/// on first access. Mirrors pvxs `pvalinkOpen` (pvxs/ioc/pvalink_channel.cpp).
 pub fn db_pvxr_command(resolver: PvaLinkResolver) -> CommandDef {
     CommandDef::new(
         "pvxr",
         vec![ArgDesc {
             name: "pv_name",
             arg_type: ArgType::String,
-            optional: false,
         }],
         "pvxr <pv_name>",
         move |args: &[ArgValue], ctx: &CommandContext| {
@@ -65,7 +66,7 @@ pub fn db_pvxr_command(resolver: PvaLinkResolver) -> CommandDef {
 /// registered under that name. pvxs `pvxrefshow` / `pvxrefsave` /
 /// `pvxrefdiff` are a matched library-wide diagnostic set over
 /// `instanceSnapshot()` per-class object counts, registered by
-/// `pvxsBaseRegistrar` (`pvxs/ioc/iochooks.cpp:247-310,479-484`) — a
+/// `pvxsBaseRegistrar` (`pvxs/ioc/iochooks.cpp:247-312,479-484`) — a
 /// PVA-library reference-leak facility, not a pvalink concern. Squatting
 /// the `pvxrefdiff` name here gave operators running the known pvxs
 /// command unrelated pvalink read totals and silently broke log checks
@@ -120,7 +121,7 @@ fn sevr_label(s: SevrMode) -> &'static str {
 /// Port of EPICS Base `epicsStrGlobMatch` (`misc/epicsString.c`), the
 /// matcher pvxs's `dbpvxr` applies to each attached link's record name
 /// (`epicsStrGlobMatch(pval->plink->precord->name, precordname)`,
-/// `pvxs/ioc/pvalink.cpp:224,233`): `*` matches any run of characters,
+/// `pvxs/ioc/pvalink.cpp:224,269`): `*` matches any run of characters,
 /// `?` matches exactly one, every other character is literal.
 fn glob_match(s: &str, pattern: &str) -> bool {
     let text: Vec<char> = s.chars().collect();
@@ -165,7 +166,7 @@ fn glob_match(s: &str, pattern: &str) -> bool {
 /// Print one channel row + (at `level >= 5`) its per-link config detail,
 /// mirroring pvxs `dbpvxr`'s per-channel block
 /// (`pvxs/ioc/pvalink.cpp:243-306`). When `glob` is set, only attached
-/// records whose name matches it are printed (pvxs `pvalink.cpp:269`).
+/// records whose name matches it are printed (`pvxs/ioc/pvalink.cpp:269`).
 fn print_channel_row(ctx: &CommandContext, d: &ChannelDiag, level: i64, glob: Option<&str>) {
     // pvxs right-justifies the channel name in a 28-wide column.
     ctx.println(&format!(
@@ -223,11 +224,11 @@ fn print_channel_row(ctx: &CommandContext, d: &ChannelDiag, level: i64, glob: Op
 /// it snapshots the cached channel map and, for both the all-records
 /// and the record-filtered call, filters channels by glob-matching the
 /// names of the records whose links attached to each channel
-/// (`epicsStrGlobMatch`, `pvalink.cpp:224,233,269`). The first argument
+/// (`epicsStrGlobMatch`, `pvxs/ioc/pvalink.cpp:224,229-230,269`). The first argument
 /// is therefore a record-name GLOB (`REC:*`, `IOC:AI?`), not an exact
 /// record name; empty / missing / `"*"` selects every channel.
 ///
-/// Level semantics follow pvxs (`pvalink.cpp:240-311`):
+/// Level semantics follow pvxs (`pvxs/ioc/pvalink.cpp:240-311`):
 ///
 /// - `level <= 0` — summary only (connected/total channel counts).
 /// - `level == 1` — additionally list disconnected matching channels.
@@ -253,12 +254,10 @@ fn dbpvar_like(name: &'static str, resolver: PvaLinkResolver) -> CommandDef {
             ArgDesc {
                 name: "recordNameGlob",
                 arg_type: ArgType::String,
-                optional: true,
             },
             ArgDesc {
                 name: "level",
                 arg_type: ArgType::Int,
-                optional: true,
             },
         ],
         // pvxs usage is "record name" (a glob), "level".
@@ -268,7 +267,7 @@ fn dbpvar_like(name: &'static str, resolver: PvaLinkResolver) -> CommandDef {
         },
         move |args: &[ArgValue], ctx: &CommandContext| {
             // First arg is a record-name GLOB; empty / missing / "*" =>
-            // every channel (pvxs `pvalink.cpp:193`).
+            // every channel (`pvxs/ioc/pvalink.cpp:193`).
             let glob = match args.first() {
                 Some(ArgValue::String(s)) if !s.is_empty() && s != "*" => Some(s.clone()),
                 _ => None,
@@ -287,7 +286,7 @@ fn dbpvar_like(name: &'static str, resolver: PvaLinkResolver) -> CommandDef {
             // record-filtered calls, mirroring pvxs `dbpvxr`: snapshot
             // the channel map, filter each channel by glob-matching the
             // names of the records whose links attached to it, then apply
-            // the level gates (`pvalink.cpp:208-311`).
+            // the level gates (`pvxs/ioc/pvalink.cpp:208-311`).
             let diags = resolver.channel_diagnostics();
             let mut nchans = 0usize;
             let mut nconn = 0usize;
@@ -298,7 +297,7 @@ fn dbpvar_like(name: &'static str, resolver: PvaLinkResolver) -> CommandDef {
                     None => d.records.len(),
                 };
                 // A glob-filtered call skips channels no matching record
-                // uses (pvxs `pvalink.cpp:229-231`).
+                // uses (`pvxs/ioc/pvalink.cpp:229-231`).
                 if glob.is_some() && nmatched == 0 {
                     continue;
                 }
@@ -311,7 +310,7 @@ fn dbpvar_like(name: &'static str, resolver: PvaLinkResolver) -> CommandDef {
                     continue;
                 }
                 // level 1 lists only disconnected channels; level >= 2
-                // lists every matching channel (pvxs `pvalink.cpp:243`).
+                // lists every matching channel (`pvxs/ioc/pvalink.cpp:243`).
                 if level >= 2 || !d.connected {
                     print_channel_row(ctx, d, level, glob.as_deref());
                 }
@@ -332,39 +331,33 @@ fn dbpvar_like(name: &'static str, resolver: PvaLinkResolver) -> CommandDef {
     )
 }
 
-/// `pvaLinkNWorkers [<n>]` — pvxs registers `pvaLinkNWorkers` as an IOC
-/// shell *variable* tuning the size of its shared pvalink worker pool
-/// (`pvxs/ioc/pvalink.cpp:318-333`). The Rust pvalink implementation has
-/// no fixed worker pool — each link drives its own async monitor task on
-/// the shared tokio runtime — so there is no equivalent to tune. Rather
-/// than silently accept a setting that does nothing, this command
-/// rejects it with an explicit diagnostic (the
-/// `iocshRegisterVariable` fallback called for in the review's fix
-/// direction; the base iocsh layer registers commands, not variables).
-pub fn pvalink_nworkers_command() -> CommandDef {
-    CommandDef::new(
-        "pvaLinkNWorkers",
-        vec![ArgDesc {
-            name: "n",
-            arg_type: ArgType::Int,
-            optional: true,
-        }],
-        "pvaLinkNWorkers [<n>]",
-        move |_args: &[ArgValue], ctx: &CommandContext| {
-            ctx.println(
-                "pvaLinkNWorkers: no effect — the Rust pvalink uses one async \
-                 monitor task per link on the shared runtime, not a fixed \
-                 worker pool, so there is no worker count to tune.",
-            );
-            Ok(CommandOutcome::Continue)
+/// pvxs keeps `pvaLinkNWorkers` in the iocsh *variable* table, not the
+/// command table: `pvalink_enable` calls `iocshRegisterVariable` on a
+/// `iocshVarDef` pointing straight at the `int pvxLinkNWorkers` global
+/// (`pvxs/ioc/pvalink.cpp:318-334`), so a startup script spells it
+/// `var pvaLinkNWorkers 4` and `var` alone prints it. Registering it as a command made that spelling fail.
+///
+/// The value is inert here, as it is in pvxs: `pvxLinkNWorkers` starts
+/// at 1 (`ioc/pvalink_channel.cpp:20`) and the only place that would
+/// consume it carries pvxs's own `// TODO respect pvxLinkNWorkers?`
+/// (`ioc/pvalink_channel.cpp:45`). The Rust pvalink likewise drives one
+/// async monitor task per link rather than a fixed pool.
+static NWORKERS: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(1);
+
+fn pvalink_nworkers_var() -> VarDef {
+    VarDef {
+        name: "pvaLinkNWorkers",
+        access: VarAccess::Int {
+            get: || NWORKERS.load(std::sync::atomic::Ordering::Relaxed),
+            set: |v| NWORKERS.store(v, std::sync::atomic::Ordering::Relaxed),
         },
-    )
+    }
 }
 
 /// `pvalink_enable` / `pvalink_disable` — master switch for pvalink
 /// resolution. When disabled, the resolver returns None for every
-/// lookup. Mirrors pvxs `pvalink_enable` / `pvalink_disable`
-/// (pvalink.cpp:328).
+/// lookup. An epics-rs addition: pvxs has no `pvalink_disable`, and
+/// its `pvalink_enable` (`pvxs/ioc/pvalink.cpp:328`) registers `dbpvar`.
 pub fn pvalink_enable_command(resolver: PvaLinkResolver) -> CommandDef {
     CommandDef::new(
         "pvalink_enable",
@@ -394,12 +387,15 @@ pub fn pvalink_disable_command(resolver: PvaLinkResolver) -> CommandDef {
 /// Convenience: build the full pvalink iocsh command set bound to
 /// `resolver`. Drop the result into [`epics_base_rs::server::ioc_app::IocRunConfig::shell_commands`].
 pub fn register_pvalink_commands(resolver: PvaLinkResolver) -> Vec<CommandDef> {
+    // pvxs's `pvalink_enable` registers the `dbpvar` command and the
+    // `pvaLinkNWorkers` variable from the one entry point
+    // (`pvxs/ioc/pvalink.cpp:328-334`); so does this.
+    epics_base_rs::server::iocsh::vars::register_variable(pvalink_nworkers_var());
     vec![
         db_pvxr_command(resolver.clone()),
         pvalinkrefdiff_command(resolver.clone()),
         dbpvar_command(resolver.clone()),
         dbpvxr_command(resolver.clone()),
-        pvalink_nworkers_command(),
         pvalink_enable_command(resolver.clone()),
         pvalink_disable_command(resolver),
     ]
@@ -410,7 +406,7 @@ mod tests {
     use super::*;
 
     fn dummy_resolver() -> PvaLinkResolver {
-        PvaLinkResolver::new()
+        PvaLinkResolver::new(crate::test_reactor())
     }
 
     #[tokio::test]
@@ -419,16 +415,26 @@ mod tests {
         let cmds = register_pvalink_commands(r);
         let names: Vec<&str> = cmds.iter().map(|c| c.name.as_str()).collect();
         // pvxs registers the diagnostic under the name `dbpvar` and the
-        // `pvaLinkNWorkers` variable (`pvxs/ioc/pvalink.cpp:328-333`);
+        // `pvaLinkNWorkers` variable (`pvxs/ioc/pvalink.cpp:328-334`);
         // `dbpvxr` is kept as a Rust back-compat alias.
         assert!(names.contains(&"pvxr"));
         assert!(names.contains(&"pvalinkrefdiff"));
         assert!(names.contains(&"dbpvar"));
         assert!(names.contains(&"dbpvxr"));
-        assert!(names.contains(&"pvaLinkNWorkers"));
+        // `pvaLinkNWorkers` is NOT among them: pvxs puts it in the
+        // variable table (`pvxs/ioc/pvalink.cpp:318-334`), which is
+        // what `var pvaLinkNWorkers` reads.
+        assert!(!names.contains(&"pvaLinkNWorkers"));
+        assert!(
+            epics_base_rs::server::iocsh::vars::variable_names().contains(&"pvaLinkNWorkers"),
+            "register_pvalink_commands must publish the variable"
+        );
+        // pvxs starts `pvxLinkNWorkers` at 1
+        // (`pvxs/ioc/pvalink_channel.cpp:20`).
+        assert_eq!(NWORKERS.load(std::sync::atomic::Ordering::Relaxed), 1);
         assert!(names.contains(&"pvalink_enable"));
         assert!(names.contains(&"pvalink_disable"));
-        assert_eq!(cmds.len(), 7);
+        assert_eq!(cmds.len(), 6);
 
         // The pvxs `pvxrefshow`/`pvxrefsave`/`pvxrefdiff` reference-leak
         // diagnostic family belongs to the PVA library, not pvalink:
@@ -443,13 +449,12 @@ mod tests {
             let cmd = cmds.iter().find(|c| c.name == cmd_name).unwrap();
             assert_eq!(cmd.args.len(), 2, "{cmd_name} takes (record, level)");
             assert!(matches!(cmd.args[1].arg_type, ArgType::Int));
-            assert!(cmd.args[1].optional);
         }
     }
 
     /// `dbpvar`'s record-name filter is an `epicsStrGlobMatch` glob, not
     /// an exact match: `*` spans any run, `?` one char, the rest literal
-    /// (pvxs `pvalink.cpp:224,233,269`).
+    /// (`pvxs/ioc/pvalink.cpp:224,269`).
     #[test]
     fn dbpvar_glob_match_semantics() {
         assert!(glob_match("TST:AI1", "TST:*"));

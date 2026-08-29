@@ -176,10 +176,10 @@ impl std::future::Future for Terminating {
 impl<T: Send + 'static> PvaOperation<T> {
     /// Spawn `fut` and return a handle. Dropping the handle aborts the
     /// spawned task — pvxs RAII `~Operation` performs the same implied
-    /// cancel (client.cpp:314-320). [`Self::cancel`] is the explicit,
+    /// cancel (src/client.cpp:314-320). [`Self::cancel`] is the explicit,
     /// awaitable form that also reports whether the operation was still
     /// active and blocks until the task has terminated.
-    pub fn spawn<F>(fut: F) -> Self
+    pub fn spawn<F>(reactor: &epics_base_rs::runtime::task::Reactor, fut: F) -> Self
     where
         F: std::future::Future<Output = PvaResult<T>> + Send + 'static,
     {
@@ -196,7 +196,7 @@ impl<T: Send + 'static> PvaOperation<T> {
             tx,
             completed: completed.clone(),
         };
-        let join = epics_base_rs::runtime::task::spawn(Terminating {
+        let join = reactor.spawn(Terminating {
             // The result publish stays *inside* the guarded future, so a
             // normal completion still publishes strictly before the channel
             // closes — the ordering the `Terminating` fix established, and
@@ -396,7 +396,7 @@ mod tests {
 
     #[epics_macros_rs::epics_test]
     async fn wait_returns_value() {
-        let mut op = PvaOperation::spawn(async { Ok::<i32, _>(42) });
+        let mut op = PvaOperation::spawn(&crate::test_reactor(), async { Ok::<i32, _>(42) });
         let v = op.wait(Some(Duration::from_secs(1))).await.unwrap();
         assert_eq!(v, 42);
         assert!(op.is_done());
@@ -404,7 +404,7 @@ mod tests {
 
     #[epics_macros_rs::epics_test]
     async fn wait_times_out() {
-        let mut op = PvaOperation::<()>::spawn(async {
+        let mut op = PvaOperation::<()>::spawn(&crate::test_reactor(), async {
             epics_base_rs::runtime::task::sleep(Duration::from_secs(60)).await;
             Ok(())
         });
@@ -414,12 +414,12 @@ mod tests {
 
     #[epics_macros_rs::epics_test]
     async fn interrupt_wakes_waiter_op_continues() {
-        let mut op = PvaOperation::<i32>::spawn(async {
+        let mut op = PvaOperation::<i32>::spawn(&crate::test_reactor(), async {
             epics_base_rs::runtime::task::sleep(Duration::from_millis(200)).await;
             Ok(7)
         });
         let interrupter = op.interrupt.clone();
-        epics_base_rs::runtime::task::spawn(async move {
+        crate::test_reactor().spawn(async move {
             epics_base_rs::runtime::task::sleep(Duration::from_millis(20)).await;
             interrupter.notify_waiters();
         });
@@ -443,7 +443,7 @@ mod tests {
     #[epics_macros_rs::epics_test]
     async fn timeout_and_interrupt_are_distinct_variants() {
         // Real deadline: op never completes within the window.
-        let mut slow = PvaOperation::<()>::spawn(async {
+        let mut slow = PvaOperation::<()>::spawn(&crate::test_reactor(), async {
             epics_base_rs::runtime::task::sleep(Duration::from_secs(60)).await;
             Ok(())
         });
@@ -452,12 +452,12 @@ mod tests {
         assert!(!matches!(deadline, Err(PvaError::Interrupted)));
 
         // Interrupt path: woken before completion.
-        let mut op = PvaOperation::<i32>::spawn(async {
+        let mut op = PvaOperation::<i32>::spawn(&crate::test_reactor(), async {
             epics_base_rs::runtime::task::sleep(Duration::from_millis(200)).await;
             Ok(1)
         });
         let interrupter = op.interrupt.clone();
-        epics_base_rs::runtime::task::spawn(async move {
+        crate::test_reactor().spawn(async move {
             epics_base_rs::runtime::task::sleep(Duration::from_millis(20)).await;
             interrupter.notify_waiters();
         });
@@ -468,7 +468,7 @@ mod tests {
 
     #[epics_macros_rs::epics_test]
     async fn cancel_aborts_op() {
-        let mut op = PvaOperation::<i32>::spawn(async {
+        let mut op = PvaOperation::<i32>::spawn(&crate::test_reactor(), async {
             epics_base_rs::runtime::task::sleep(Duration::from_secs(60)).await;
             Ok(0)
         });
@@ -492,7 +492,7 @@ mod tests {
     /// state). A second cancel is also `false` (idempotent).
     #[epics_macros_rs::epics_test]
     async fn cancel_after_completion_reports_not_active() {
-        let mut op = PvaOperation::spawn(async { Ok::<i32, _>(11) });
+        let mut op = PvaOperation::spawn(&crate::test_reactor(), async { Ok::<i32, _>(11) });
         assert_eq!(op.wait(Some(Duration::from_secs(1))).await.unwrap(), 11);
         // Already completed → not active.
         assert!(
@@ -512,9 +512,9 @@ mod tests {
     /// operation is finished from every caller-visible angle while its
     /// channel is still open. Deciding activeness from the guard there
     /// reported "still active" for a completed operation, which is what made
-    /// `cancel_after_completion_reports_not_active` fail intermittently
-    /// feature-ON. The state is built by hand so the window is held open for
-    /// as long as the assertions need, rather than raced for.
+    /// `cancel_after_completion_reports_not_active` fail intermittently on
+    /// the exec backend. The state is built by hand so the window is held
+    /// open for as long as the assertions need, rather than raced for.
     #[epics_macros_rs::epics_test]
     async fn a_published_result_is_terminal_while_the_guard_is_still_open() {
         use std::sync::atomic::AtomicBool;
@@ -527,7 +527,7 @@ mod tests {
             completed: completed.clone(),
         };
         let op = PvaOperation::<i32> {
-            join: epics_base_rs::runtime::task::spawn(std::future::pending::<()>()),
+            join: crate::test_reactor().spawn(std::future::pending::<()>()),
             result_rx,
             done: false,
             interrupt: Arc::new(Notify::new()),
@@ -578,7 +578,7 @@ mod tests {
         use std::sync::Arc as StdArc;
         let held = StdArc::new(());
         let inner = held.clone();
-        let op = PvaOperation::<()>::spawn(async move {
+        let op = PvaOperation::<()>::spawn(&crate::test_reactor(), async move {
             // Keep the Arc alive until the task is dropped/aborted.
             let _inner = inner;
             epics_base_rs::runtime::task::sleep(Duration::from_secs(60)).await;
@@ -680,7 +680,7 @@ mod tests {
         use std::sync::Arc as StdArc;
         let held = StdArc::new(());
         let inner = held.clone();
-        let op = PvaOperation::<()>::spawn(async move {
+        let op = PvaOperation::<()>::spawn(&crate::test_reactor(), async move {
             let _inner = inner;
             epics_base_rs::runtime::task::sleep(Duration::from_secs(60)).await;
             Ok(())
@@ -706,7 +706,7 @@ mod tests {
     /// `wait` (pvxs `Operation::wait` is retriable after a timeout).
     #[epics_macros_rs::epics_test]
     async fn timeout_then_wait_again_recovers_result() {
-        let mut op = PvaOperation::<i32>::spawn(async {
+        let mut op = PvaOperation::<i32>::spawn(&crate::test_reactor(), async {
             epics_base_rs::runtime::task::sleep(Duration::from_millis(120)).await;
             Ok(99)
         });
@@ -722,7 +722,7 @@ mod tests {
     /// result; only actual completion does.
     #[epics_macros_rs::epics_test]
     async fn repeated_timeouts_do_not_consume() {
-        let mut op = PvaOperation::<i32>::spawn(async {
+        let mut op = PvaOperation::<i32>::spawn(&crate::test_reactor(), async {
             epics_base_rs::runtime::task::sleep(Duration::from_millis(150)).await;
             Ok(5)
         });
@@ -741,7 +741,7 @@ mod tests {
     /// and must NOT poison the buffered `Ok` result for a later `wait()`.
     #[epics_macros_rs::epics_test]
     async fn cancel_after_complete_preserves_ok_result() {
-        let mut op = PvaOperation::spawn(async { Ok::<i32, _>(42) });
+        let mut op = PvaOperation::spawn(&crate::test_reactor(), async { Ok::<i32, _>(42) });
         // Let the task fully terminate without consuming the result: once
         // it is finished the result has been sent and is buffered.
         while !op.is_done() {
@@ -763,7 +763,9 @@ mod tests {
     /// `Err`: the real error survives a post-completion `cancel()`.
     #[epics_macros_rs::epics_test]
     async fn cancel_after_complete_preserves_err_result() {
-        let mut op = PvaOperation::<i32>::spawn(async { Err(PvaError::Protocol("boom".into())) });
+        let mut op = PvaOperation::<i32>::spawn(&crate::test_reactor(), async {
+            Err(PvaError::Protocol("boom".into()))
+        });
         while !op.is_done() {
             epics_base_rs::runtime::task::sleep(Duration::from_millis(2)).await;
         }
@@ -779,7 +781,7 @@ mod tests {
     /// holds: a second `wait` reports the result already consumed.
     #[epics_macros_rs::epics_test]
     async fn second_wait_after_success_is_already_consumed() {
-        let mut op = PvaOperation::spawn(async { Ok::<i32, _>(1) });
+        let mut op = PvaOperation::spawn(&crate::test_reactor(), async { Ok::<i32, _>(1) });
         assert_eq!(op.wait(Some(Duration::from_secs(1))).await.unwrap(), 1);
         let r2 = op.wait(Some(Duration::from_secs(1))).await;
         assert!(

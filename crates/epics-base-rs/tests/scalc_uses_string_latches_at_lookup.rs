@@ -5,7 +5,7 @@
 //! moment `get_element` hands back a string-typed element. `AA` is looked up as
 //! `FETCH_AA` — which IS in the list — and only afterwards, when `:=` arrives,
 //! is that fetch retracted from the postfix and rewritten as `STORE_AA`
-//! (`:552-557`), which is NOT in the list. So `AA:="x";1` is USES_STRING even
+//! (`:548-553`), which is NOT in the list. So `AA:="x";1` is USES_STRING even
 //! though its finished postfix holds no string-typed opcode at all, and C runs
 //! the string evaluator — the one whose STORE_AA writes the record's string
 //! args and whose `<<`/`>>` shift at 32 bits rather than 64.

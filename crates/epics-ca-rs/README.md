@@ -109,14 +109,13 @@ camonitor TEMP
 ```rust
 use epics_base_rs::server::ioc_app::IocApplication;
 use epics_base_rs::server::records::ai::AiRecord;
-use epics_ca_rs::server::run_ca_ioc;
+use epics_ca_rs::server::run_ca_ioc_app;
 
 #[epics_base_rs::epics_main]
 async fn main() -> epics_base_rs::error::CaResult<()> {
-    IocApplication::new()
-        .record("TEMP", AiRecord::new())
-        .run(run_ca_ioc)
-        .await
+    // `run_ca_ioc_app` runs C's `rsrvRegistrar` before the startup script,
+    // which `IocApplication::run(run_ca_ioc)` cannot: it is dispatched after.
+    run_ca_ioc_app(IocApplication::new().record("TEMP", AiRecord::new())).await
 }
 ```
 

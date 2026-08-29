@@ -1,12 +1,12 @@
 //! acalcout IVOA=Set_output_to_IVOV fires on the RECORD's severity, whatever
 //! raised it — not only on a CALC failure (R11-C15).
 //!
-//! C `aCalcoutRecord.c::execOutput` (:913-940) is reached from `afterCalc`
-//! whenever the OOPT decision says the record outputs (:338-352) and from the
-//! DLYA continuation (:425-428). Its one severity test is
-//! `if (pcalc->nsev < INVALID_ALARM)` (:915) — the record's pending severity,
+//! C `aCalcoutRecord.c::execOutput` (:895-936) is reached from `afterCalc`
+//! whenever the OOPT decision says the record outputs (:338-359) and from the
+//! DLYA continuation (:421-430). Its one severity test is
+//! `if (pcalc->nsev < INVALID_ALARM)` (:904) — the record's pending severity,
 //! from ANY source: `recGblSetSevr(CALC_ALARM,...)` in `afterCalc` (:305), a
-//! HIHI/LOLO limit at INVALID severity in `checkAlarms` (:868-880), UDF_ALARM
+//! HIHI/LOLO limit at INVALID severity in `checkAlarms` (:866-875), UDF_ALARM
 //! at UDFS=INVALID (:845-852), or an MS input link raising `nsev` inside
 //! `fetch_values`/`dbGetLink`. Any of those with IVOA=Set_output_to_IVOV takes
 //! `case menuIvoaSet_output_to_IVOV` and drives IVOV.
@@ -119,7 +119,7 @@ async fn r11_c15_a_limit_driven_invalid_still_substitutes_ivov() {
     assert_eq!(
         *last.lock().unwrap(),
         Some(vec![42.0]),
-        "C execOutput:915 tests nsev, not the calc status — a limit-driven INVALID \
+        "C execOutput:904 tests nsev, not the calc status — a limit-driven INVALID \
          with IVOA=Set_output_to_IVOV drives IVOV=42 (via OVAL), not OCAL's 7"
     );
 }

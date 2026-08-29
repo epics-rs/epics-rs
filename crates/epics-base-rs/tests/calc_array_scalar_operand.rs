@@ -73,7 +73,7 @@ fn no_unary_array_operator_errors_on_a_scalar() {
 }
 
 /// R10-10 — NDERIV is NOT in that unary switch (`aCalcPerform.c:594-617`), so it has
-/// no `ps->d = 0` arm: its own case PROMOTES the operand with `toArray(ps,1)` (`:599`)
+/// no `ps->d = 0` arm: its own case PROMOTES the operand with `toArray(ps,1)` (`:594`)
 /// and differentiates the broadcast buffer. A constant's derivative is zero, so the
 /// answer is an ARRAY of (floating-point) zeros, not a scalar and not an error.
 /// Compiled C, arraySize 5, A=3, `NDERIV(A,2)`: status 0,
@@ -98,7 +98,7 @@ fn r10_10_nderiv_promotes_a_scalar_operand() {
 
 /// The negative control for that promotion: NSMOOTH is the other operator outside the
 /// unary switch, and it does NOT promote — it indexes `ps->a[]` straight after
-/// `DEC(ps)` (`:583`), so a scalar operand dereferences a NULL array. Compiled C,
+/// `DEC(ps)` (`:578`), so a scalar operand dereferences a NULL array. Compiled C,
 /// `NSMOO(A,2)` with A=3: SIGSEGV. There is no C answer to match, so refusing it is
 /// the deliberate deviation, and NDERIV's promotion must not be generalised to it.
 #[test]

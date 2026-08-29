@@ -13,7 +13,7 @@
 //!    That is false on both.
 //!
 //! Measured 2026-07-27. RTEMS's `fork()` is an inoperable stub that sets
-//! `ENOSYS` (`rtems/cpukit/posix/src/fork.c:48-50`), and its BSP archive
+//! `ENOSYS` (`rtems/cpukit/posix/src/fork.c:48-50` (both `rtems` pins)), and its BSP archive
 //! `librtemscpu.a` defines `forkpty`, `openpty`, `execvp` and `posix_spawn`
 //! zero times each (control: `fork` and `tcgetattr` once each, 2360 `T`
 //! symbols in the archive). The whole VxWorks 7 SDK header tree

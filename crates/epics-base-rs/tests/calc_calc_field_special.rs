@@ -2,7 +2,7 @@
 //!
 //! C `calcRecord.c::special` (lines 144-155) runs `postfix()` on the CALC
 //! string `dbPut` has already stored and returns `S_db_badField` when it does
-//! not compile. `dbPut` (dbAccess.c:1399-1405) keeps the stored string but
+//! not compile. `dbPut` (dbAccess.c:1394-1400) keeps the stored string but
 //! `goto done`s past the field's monitor post, and `dbPutField` skips the
 //! `pp(TRUE)` process, so rsrv answers the client `ECA_PUTFAIL`.
 //!
@@ -10,7 +10,7 @@
 //! return `Ok(())` — the client saw a successful write and the record silently
 //! kept an uncompilable expression.
 
-use epics_base_rs::error::CaError;
+use epics_base_rs::error::{CaError, CaOp};
 use epics_base_rs::server::database::PvDatabase;
 use epics_base_rs::server::records::calc::CalcRecord;
 use epics_base_rs::types::EpicsValue;
@@ -31,7 +31,7 @@ async fn bad_calc_put_is_rejected_but_the_string_is_stored() {
     assert!(matches!(err, CaError::BadField(_)), "got {err:?}");
     // rsrv `write_action` answers any non-zero db_put_field status with
     // ECA_PUTFAIL.
-    assert_eq!(err.to_eca_status(), ECA_PUTFAIL);
+    assert_eq!(err.to_eca_status(CaOp::Write), ECA_PUTFAIL);
 
     // C `dbPut` wrote the string BEFORE special() ran and does not roll it
     // back — `caget CALCREC.CALC` reads back what the client sent.

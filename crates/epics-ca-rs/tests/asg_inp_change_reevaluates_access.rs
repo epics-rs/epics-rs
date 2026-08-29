@@ -25,12 +25,8 @@
 //! (`client/transport.rs:2781`), so this is the wire and not the server's own
 //! cache.
 
-// Host/tokio-only: builds the async `CaClient`/`CaServer` stack in process.
-// Under `rtems-exec-model` the `runtime::task` seam routes their `spawn` to
-// the background executor, whose worker has no tokio reactor, so the
-// listener/transport tasks panic. The RTEMS model serves from
-// `BlockingCaServer` instead, so this path is inapplicable there.
-#![cfg(not(feature = "rtems-exec-model"))]
+#![cfg(tokio_backend)]
+#![cfg(feature = "client-core")]
 
 use std::time::Duration;
 
@@ -101,7 +97,7 @@ async fn serve(gate: i32) -> u16 {
 
 async fn connect(client: &CaClient, pv: &str) -> CaChannel {
     let ch = client.create_channel(pv);
-    ch.wait_connected(Duration::from_secs(5))
+    ch.wait_connected(budget::FACT_BUDGET)
         .await
         .unwrap_or_else(|e| panic!("{pv} must connect: {e:?}"));
     ch
@@ -114,7 +110,7 @@ async fn write_bit(ch: &CaChannel) -> bool {
 
 /// Wait for the wire to carry the expected transition.
 async fn await_write_bit(ch: &CaChannel, want: bool, what: &str) {
-    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    let deadline = std::time::Instant::now() + budget::FACT_BUDGET;
     loop {
         if write_bit(ch).await == want {
             return;
@@ -184,3 +180,6 @@ async fn opening_the_gate_grants_write_to_a_connected_client() {
         .await
         .expect("the write must be granted once the gate is open");
 }
+
+#[path = "common/budget.rs"]
+mod budget;

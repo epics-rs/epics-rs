@@ -22,6 +22,7 @@ use ad_core_rs::plugin::file_controller::FilePluginController;
 use ad_core_rs::plugin::runtime::{
     NDPluginProcess, ParamChangeResult, PluginParamSnapshot, ProcessResult,
 };
+use parking_lot::Mutex;
 
 use rust_hdf5::{H5Dataset, H5File};
 
@@ -945,23 +946,31 @@ impl NDFileWriter for NexusWriter {
 // ============================================================
 
 pub struct NexusFileProcessor {
-    ctrl: FilePluginController<NexusWriter>,
+    ctrl: Mutex<FilePluginController<NexusWriter>>,
     template_path_idx: Option<usize>,
     template_file_idx: Option<usize>,
     template_valid_idx: Option<usize>,
-    template_path: String,
-    template_file: String,
+    /// The template path/file pair a `NEXUS_TEMPLATE_*` write updates. Held
+    /// under its own lock, always taken before `ctrl`.
+    template: Mutex<NexusTemplateSource>,
+}
+
+/// The `NEXUS_TEMPLATE_PATH` / `NEXUS_TEMPLATE_FILE` pair, which
+/// `reload_template` concatenates.
+#[derive(Default)]
+struct NexusTemplateSource {
+    path: String,
+    file: String,
 }
 
 impl NexusFileProcessor {
     pub fn new() -> Self {
         Self {
-            ctrl: FilePluginController::new(NexusWriter::new()),
+            ctrl: Mutex::new(FilePluginController::new(NexusWriter::new())),
             template_path_idx: None,
             template_file_idx: None,
             template_valid_idx: None,
-            template_path: String::new(),
-            template_file: String::new(),
+            template: Mutex::new(NexusTemplateSource::default()),
         }
     }
 
@@ -969,22 +978,25 @@ impl NexusFileProcessor {
     /// (C++ NDFileNexus::loadTemplateFile). Returns the validity flag value
     /// for `NEXUS_TEMPLATE_VALID`: 1 if a template was loaded and parsed,
     /// 0 if the file is unset, missing, or fails to parse.
-    fn reload_template(&mut self) -> i32 {
-        if self.template_file.is_empty() {
-            self.ctrl.writer.clear_template();
-            return 0;
-        }
-        let full = format!("{}{}", self.template_path, self.template_file);
+    fn reload_template(&self) -> i32 {
+        let full = {
+            let t = self.template.lock();
+            if t.file.is_empty() {
+                self.ctrl.lock().writer.clear_template();
+                return 0;
+            }
+            format!("{}{}", t.path, t.file)
+        };
         match std::fs::read_to_string(&full) {
             Ok(xml) => {
-                if self.ctrl.writer.load_template(&xml) {
+                if self.ctrl.lock().writer.load_template(&xml) {
                     1
                 } else {
                     0
                 }
             }
             Err(_) => {
-                self.ctrl.writer.clear_template();
+                self.ctrl.lock().writer.clear_template();
                 0
             }
         }
@@ -998,8 +1010,8 @@ impl Default for NexusFileProcessor {
 }
 
 impl NDPluginProcess for NexusFileProcessor {
-    fn process_array(&mut self, array: &NDArray, _pool: &NDArrayPool) -> ProcessResult {
-        self.ctrl.process_array(array)
+    fn process_array(&self, array: &NDArray, _pool: &NDArrayPool) -> ProcessResult {
+        self.ctrl.lock().process_array(array)
     }
 
     fn plugin_type(&self) -> &str {
@@ -1016,7 +1028,7 @@ impl NDPluginProcess for NexusFileProcessor {
         &mut self,
         base: &mut asyn_rs::port::PortDriverBase,
     ) -> asyn_rs::error::AsynResult<()> {
-        self.ctrl.register_params(base)?;
+        self.ctrl.lock().register_params(base)?;
         use asyn_rs::param::ParamType;
         let path_idx = base.create_param("NEXUS_TEMPLATE_PATH", ParamType::Octet)?;
         let file_idx = base.create_param("NEXUS_TEMPLATE_FILE", ParamType::Octet)?;
@@ -1032,30 +1044,26 @@ impl NDPluginProcess for NexusFileProcessor {
         Ok(())
     }
 
-    fn on_param_change(
-        &mut self,
-        reason: usize,
-        params: &PluginParamSnapshot,
-    ) -> ParamChangeResult {
+    fn on_param_change(&self, reason: usize, params: &PluginParamSnapshot) -> ParamChangeResult {
         use ad_core_rs::plugin::runtime::ParamChangeValue;
 
         // NeXus XML template path / file changes trigger a template reload
         // (C++ NDFileNexus::writeInt32 / writeOctet → loadTemplateFile).
         if Some(reason) == self.template_path_idx {
             if let ParamChangeValue::Octet(s) = &params.value {
-                self.template_path = s.clone();
+                self.template.lock().path = s.clone();
             }
             let valid = self.reload_template();
             return self.template_valid_result(valid);
         }
         if Some(reason) == self.template_file_idx {
             if let ParamChangeValue::Octet(s) = &params.value {
-                self.template_file = s.clone();
+                self.template.lock().file = s.clone();
             }
             let valid = self.reload_template();
             return self.template_valid_result(valid);
         }
-        self.ctrl.on_param_change(reason, params)
+        self.ctrl.lock().on_param_change(reason, params)
     }
 }
 
@@ -1082,7 +1090,12 @@ mod tests {
         use std::sync::atomic::{AtomicU32, Ordering};
         static COUNTER: AtomicU32 = AtomicU32::new(0);
         let n = COUNTER.fetch_add(1, Ordering::Relaxed);
-        std::env::temp_dir().join(format!("adcore_test_{}_{}.nxs", prefix, n))
+        std::env::temp_dir().join(format!(
+            "adcore_test_{}_{}_{}.nxs",
+            std::process::id(),
+            prefix,
+            n
+        ))
     }
 
     #[test]
@@ -1289,7 +1302,10 @@ mod tests {
         use asyn_rs::port::{PortDriverBase, PortFlags};
 
         let dir = std::env::temp_dir();
-        let tmpl_path = dir.join("adcore_nexus_template_test.xml");
+        let tmpl_path = dir.join(format!(
+            "adcore_nexus_template_test_{}.xml",
+            std::process::id()
+        ));
         std::fs::write(
             &tmpl_path,
             r#"<NXroot><NXentry name="e"><NXdata name="d"><x type="pArray"/></NXdata></NXentry></NXroot>"#,
@@ -1316,7 +1332,7 @@ mod tests {
             u,
             ParamUpdate::Int32 { reason, value: 1, .. } if *reason == valid_idx
         )));
-        assert!(proc.ctrl.writer.has_template());
+        assert!(proc.ctrl.lock().writer.has_template());
 
         std::fs::remove_file(&tmpl_path).ok();
     }

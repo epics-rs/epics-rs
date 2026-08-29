@@ -1,6 +1,7 @@
 //! Host proof that an **asynchronous** record's `WRITE_NOTIFY` completion runs
 //! on the std-thread background executor — the RTEMS execution model — with
-//! **zero tokio**, selected on a hosted target by the `rtems-exec-model` feature.
+//! **zero tokio**, selected on a hosted target by
+//! `EPICS_RS_BUILD_EXEC_BACKEND=thread`.
 //!
 //! This is the follow-up that closes the gap the synchronous e2e
 //! (`blocking_rtems_e2e.rs`) documents: there, `WRITE_NOTIFY` on an `ao`
@@ -19,15 +20,23 @@
 //!   `block_on_sync` → `park_on`. No tokio runtime, no `runtime::task::spawn`.
 //!   The per-client thread that handles the `WRITE_NOTIFY` *parks* on the
 //!   put-notify completion oneshot while the record is async.
-//! * **Async completion** — under the `rtems-exec-model` feature, `build.rs`
-//!   sets the `exec_backend` cfg, so the `runtime::task` seam
+//! * **Async completion** — with `EPICS_RS_BUILD_EXEC_BACKEND=thread`,
+//!   `build.rs` sets the `exec_backend` cfg, so the `runtime::task` seam
 //!   (`spawn`/`sleep`) routes into the process-global `BackgroundExecutor`
 //!   (callback pool `cbLow`/`cbMedium`/`cbHigh` + delayed timer + scanOnce),
-//!   *not* tokio. `spawn` lands on the callback pool at the default `Medium`
-//!   band, so the ODLY continuation — the `calcout` re-process that finally
-//!   writes the OUT link — runs on the **`cbMedium`** worker thread. When it
-//!   clears PACT the parked server thread wakes and sends the `WRITE_NOTIFY`
-//!   reply.
+//!   *not* tokio. The band is the record's own, not the seam's default: C
+//!   defers ODLY with `callbackRequestProcessCallbackDelayed(&prpvt->doOutCb,
+//!   prec->prio, ...)` (`calcoutRecord.c:277-281`), `menuPriority` lists
+//!   `LOW` first so a record with no PRIO field is `menuPriorityLOW`, and
+//!   `callback.c:86-87` names band 0 `cbLow`. `RTEMS:NOTIFY` sets no PRIO, so
+//!   the ODLY continuation — the `calcout` re-process that finally writes the
+//!   OUT link — runs on the **`cbLow`** worker thread. When it clears PACT the
+//!   parked server thread wakes and sends the `WRITE_NOTIFY` reply.
+//!
+//!   The completion callback C posts after that, `dbNotify.c:131`'s
+//!   `callbackSetPriority(priorityLow, ...)` in `notifyInit`, is `cbLow` for
+//!   every put-notify regardless of PRIO — so both halves of this chain are
+//!   `cbLow` here and the one band name proves both.
 //! * **Client** — a raw `std::net::TcpStream` speaking CA by hand. The async
 //!   `CaClient` cannot be the driver here: its `tokio::net` search/circuit
 //!   tasks are spawned through the same seam, so under `exec_backend` they land
@@ -43,23 +52,22 @@
 //! `process()` records `std::thread::current().name()`. Because the OUT write
 //! happens *only* in the deferred continuation, the capture can only fire on
 //! the thread that runs that continuation. The test asserts that thread is
-//! **`cbMedium`** — a background-executor worker — proving the async completion
-//! did not silently regress to a tokio worker.
+//! **`cbLow`** — a background-executor worker at the record's own PRIO band —
+//! proving the async completion did not silently regress to a tokio worker.
 //!
-//! The whole file is `#[cfg(feature = "rtems-exec-model")]`: with the feature
-//! off it compiles to nothing, so the hosted default test set is unchanged.
-// RTEMS-EXEC-MODEL-ALLOW(1): the flavored e2e drives a live
-// client/server pair over tokio::net; the exec-model behavior it proves is in
-// the server task it spawns. These run and pass in the
-// feature-ON suite on the tokio driver.
-#![cfg(feature = "rtems-exec-model")]
+//! The whole file is `#[cfg(exec_backend)]`: on the tokio backend it
+//! compiles to nothing, so the hosted default test set is unchanged.
+// RTEMS-EXEC-MODEL-ALLOW(1): the flavored e2e drives a live client/server
+// pair over tokio::net; the exec-model behavior it proves is in the server
+// task it spawns. These run and pass in the exec-backend suite on the tokio
+// driver.
+#![cfg(exec_backend)]
 
 use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::net::{Ipv4Addr, SocketAddrV4, TcpStream};
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::Duration;
 
 use epics_base_rs::error::CaResult;
 use epics_base_rs::server::database::PvDatabase;
@@ -204,8 +212,9 @@ fn read_frame(stream: &mut TcpStream) -> CaResult<(CaHeader, Vec<u8>)> {
 #[serial(epics_env)]
 async fn async_write_notify_completion_runs_on_background_executor() {
     // Eagerly start the process-global background executor — C `callbackInit`
-    // parity, and under `exec_backend` this is the facility the seam routes to.
-    // Reachable here only because the `rtems-exec-model` feature is on.
+    // parity, and under `exec_backend` this is the facility the seam routes
+    // to. Reachable here only because `EPICS_RS_BUILD_EXEC_BACKEND=thread` is
+    // on.
     epics_base_rs::runtime::task::background_init();
 
     let capture = ThreadCapture::default();
@@ -227,9 +236,7 @@ async fn async_write_notify_completion_runs_on_background_executor() {
     // (3) Raw CA client on a real socket. Blocking, with a read timeout so a
     //     stalled completion surfaces as a test failure, not an infinite hang.
     let mut stream = TcpStream::connect(("127.0.0.1", tcp_port)).expect("connect to CA server");
-    stream
-        .set_read_timeout(Some(Duration::from_secs(10)))
-        .unwrap();
+    stream.set_read_timeout(Some(budget::FACT_BUDGET)).unwrap();
 
     // Handshake: VERSION (carrying our minor version), CLIENT_NAME, HOST_NAME.
     let mut version = CaHeader::new(CA_PROTO_VERSION);
@@ -310,8 +317,11 @@ async fn async_write_notify_completion_runs_on_background_executor() {
 
     // The core assertion: the deferred completion — the calcout ODLY
     // continuation that wrote the OUT link and thereby processed RTEMS:CAP — ran
-    // on the std-thread background executor's cbMedium worker, NOT a tokio
-    // worker. This is what proves the RTEMS async execution model on the host.
+    // on a std-thread background executor worker, NOT a tokio worker. The band
+    // is the record's, not the seam's: RTEMS:NOTIFY declares no PRIO, C's
+    // menuPriority makes that menuPriorityLOW, and calcoutRecord.c passes
+    // prec->prio to callbackRequestProcessCallbackDelayed — so C runs this
+    // continuation on cbLow and so must the port.
     let captured = capture.names.lock().unwrap().clone();
     assert!(
         !captured.is_empty(),
@@ -319,9 +329,10 @@ async fn async_write_notify_completion_runs_on_background_executor() {
     );
     for name in &captured {
         assert_eq!(
-            name, "cbMedium",
+            name, "cbLow",
             "async WRITE_NOTIFY completion must run on the background-executor \
-             cbMedium worker, not a tokio runtime worker; captured threads: {captured:?}"
+             worker for the record's PRIO band (LOW by default), not a tokio \
+             runtime worker; captured threads: {captured:?}"
         );
     }
 
@@ -334,3 +345,6 @@ async fn async_write_notify_completion_runs_on_background_executor() {
         .expect("udp thread joins")
         .expect("udp responder exits cleanly");
 }
+
+#[path = "common/budget.rs"]
+mod budget;

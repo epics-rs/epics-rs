@@ -3,6 +3,7 @@
 
 pub(crate) mod cpp_cast;
 mod field;
+pub(crate) mod monitor_squash;
 mod rpc_reply;
 mod scalar;
 mod shared_array;

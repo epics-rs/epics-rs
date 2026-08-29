@@ -4,7 +4,7 @@
 //!
 //! - scalar: a negative operand becomes 0, **no error** — C only prints a line.
 //! - array:  negative elements become 0 **and** `status` = -1, so aCalcPerform
-//!   returns -1 (`:1602`) without writing p_dresult/p_aresult.
+//!   returns -1 (`:1591`) without writing p_dresult/p_aresult.
 //!
 //! Ground truth is the compiled synApps `aCalcPerform` (arraySize 8).
 

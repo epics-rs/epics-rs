@@ -102,7 +102,7 @@ impl LinkSet for CaHoldLset {
             //
             // `runtime::task::sleep`, not `tokio::time::sleep`: this body is
             // an lset callback, so the framework runs it wherever it runs
-            // callbacks. Under `rtems-exec-model` that is the background
+            // callbacks. Under `exec_backend` that is the background
             // executor's `cbMedium` thread, which has no tokio reactor, and
             // a `tokio::time` timer there panics rather than sleeping —
             // taking the whole test's sequence down with it.
@@ -276,6 +276,21 @@ async fn poll_double(db: &PvDatabase, pv: &str, want: f64, label: &str) {
     );
 }
 
+/// Wait for a `CountingTarget` to have been processed `want` times — the fact
+/// a dispatch-count assertion needs, as [`poll_double`] is for a target value.
+async fn poll_count(counter: &Arc<AtomicU32>, want: u32, label: &str) {
+    for _ in 0..400 {
+        if counter.load(Ordering::SeqCst) >= want {
+            return;
+        }
+        epics_base_rs::runtime::task::sleep(Duration::from_millis(5)).await;
+    }
+    panic!(
+        "{label}: count did not reach {want} before timeout (last {})",
+        counter.load(Ordering::SeqCst)
+    );
+}
+
 fn read_short(db_value: Option<EpicsValue>) -> i16 {
     match db_value {
         Some(EpicsValue::Short(v)) => v,
@@ -417,9 +432,16 @@ async fn sseq_each_lnkn_dispatched_exactly_once_and_clears_busy() {
 
     kick(&db, "SSEQ_ONCE").await;
 
-    // Wait for the last step's target, then settle so any erroneous extra
+    // Wait for each dispatch the assertions below count — `BUSY == 0` is a
+    // different fact and does not imply them: `finish` clears `busy` inside
+    // `process()` (`sseq.rs:937-940`) while each no-wait step's write is a
+    // queued `ProcessAction::WriteDbLink` (`sseq.rs:772-780`) the framework
+    // runs after `process()` returns. Then settle, so any erroneous EXTRA
     // dispatch (a leftover all-at-once path) would also have landed.
     poll_short(&db, "SSEQ_ONCE.BUSY", 0, "sequence finishes").await;
+    poll_count(&c1, 1, "step 1 must have dispatched").await;
+    poll_count(&c2, 1, "step 2 must have dispatched").await;
+    poll_count(&c3, 1, "step 3 must have dispatched").await;
     epics_base_rs::runtime::task::sleep(Duration::from_millis(40)).await;
 
     assert_eq!(
@@ -630,8 +652,8 @@ async fn sseq_seln_out_of_range_raises_invalid_alarm_and_no_dispatch() {
 }
 
 /// Boundary — `DOLnV`/`LNKnV` connection status and `DTn`/`LTn` target
-/// field type, classified by `checkLinks` (C `sseqRecord.c:862-941` /
-/// `init_record` 202-250). A LOCAL DB link → `LOC` (2) + the resolved
+/// field type, classified by `checkLinks` (C `sseqRecord.c:863-950` /
+/// `init_record` 203-240). A LOCAL DB link → `LOC` (2) + the resolved
 /// target field type; an empty (constant) link → `CON` (3) + the unknown
 /// (-1) field type. The refresh runs at record init (`set_async_context`).
 #[epics_macros_rs::epics_test]
@@ -691,7 +713,7 @@ async fn sseq_link_status_loc_vs_con() {
 }
 
 /// Boundary — a runtime `DOLn`/`LNKn` re-point (`special()` → `checkLinks`,
-/// sseqRecord.c:862-941) must not be clobbered by a *stale* concurrent
+/// sseqRecord.c:863-950) must not be clobbered by a *stale* concurrent
 /// refresh. `refresh_link_status` classifies a snapshot of the link strings
 /// off-thread; the init-time refresh (empty link → `CON`) can finish *after*
 /// the runtime re-point refresh (local link → `LOC`). The monotonic

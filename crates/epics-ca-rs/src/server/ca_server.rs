@@ -6,7 +6,7 @@
 
 // RTEMS-EXEC-MODEL-ALLOW(2): both tests bind the server's tokio::net TCP
 // listener, which needs the reactor. These run and pass in the
-// feature-ON suite on the tokio driver.
+// exec-backend suite on the tokio driver.
 use std::sync::Arc;
 
 use epics_base_rs::error::{CaError, CaResult};
@@ -26,6 +26,9 @@ use epics_base_rs::server::{access_security, autosave, device_support, ioc_build
 /// `acf()`, and `acf_file()` are CA-specific.
 pub struct CaServerBuilder {
     ioc: ioc_builder::IocBuilder,
+    /// The database this server will serve when someone else already
+    /// built it — see [`AdoptedDatabase`]. `None` builds one from `ioc`.
+    served: Option<AdoptedDatabase>,
     /// UDP discovery port — clients send SEARCH packets here. Defaults
     /// to `EPICS_CA_SERVER_PORT` or 5064.
     port: u16,
@@ -70,12 +73,34 @@ pub struct CaServerBuilder {
     cap_token_verifier: Option<Arc<crate::cap_token::TokenVerifier>>,
 }
 
+/// A database a lifecycle already loaded and carried through `iocInit`,
+/// with the live cells that lifecycle owns.
+///
+/// C separates `iocBuild` from `iocRun`, so an application may load its
+/// records, run its `st.cmd` against them and only then hand the finished
+/// database to a server. This port expressed that as a second CONSTRUCTOR
+/// rather than a second SOURCE: `CaServer::from_parts` wrote its own
+/// `CaServer` literal, which is why TLS, mDNS and DNS-UPDATE were absent
+/// from it — not by decision, but because that literal never mentioned them
+/// — and why `softioc-rs` had to refuse those flags by name as soon as a
+/// startup script was given. Absent from the builder, the database is built
+/// from the builder's own [`ioc_builder::IocBuilder`] instead; either way
+/// there is one constructor, so a server option cannot go missing on one
+/// route again.
+struct AdoptedDatabase {
+    db: Arc<PvDatabase>,
+    acf: epics_base_rs::server::access_security::AcfCell,
+    autosave_config: Option<autosave::SaveSetConfig>,
+    autosave_manager: Option<Arc<autosave::AutosaveManager>>,
+}
+
 impl CaServerBuilder {
     pub fn new() -> Self {
         Self {
             ioc: ioc_builder::IocBuilder::new(),
+            served: None,
             // SERVER-side port reader honours EPICS_CAS_SERVER_PORT >
-            // EPICS_CA_SERVER_PORT > 5064 (caservertask.c:491-498).
+            // EPICS_CA_SERVER_PORT > 5064 (caservertask.c:492-499).
             port: cas_server_port(),
             tcp_port: None,
             acf: None,
@@ -86,7 +111,11 @@ impl CaServerBuilder {
             mdns_txt: Vec::new(),
             #[cfg(feature = "discovery-dns-update")]
             dns_update: None,
-            audit: audit_from_env(),
+            // Resolved in `build`, not here: constructing the logger starts
+            // its writer task, and `CaServerBuilder::new` is a plain `fn` that
+            // a caller may run before any runtime exists. An explicit
+            // `.audit(..)` still wins over the environment.
+            audit: None,
             introspection_addr: introspection_from_env(),
             drain_grace_secs: drain_grace_from_env(),
             #[cfg(feature = "cap-tokens")]
@@ -140,7 +169,7 @@ impl CaServerBuilder {
     }
 
     /// Enable CA over TLS using the supplied server-side configuration.
-    /// Built with the `tls` cargo feature.
+    /// Built with the `experimental-rust-tls` cargo feature.
     #[cfg(feature = "experimental-rust-tls")]
     pub fn with_tls(mut self, tls: crate::tls::TlsConfig) -> Self {
         self.tls = Some(tls);
@@ -277,8 +306,27 @@ impl CaServerBuilder {
     /// never need to sleep for a startup window — see
     /// [`CaServer::tcp_port`] for the port actually bound.
     pub async fn build(self) -> CaResult<CaServer> {
-        let (db, autosave_config) = self.ioc.build().await?;
-        let acf = epics_base_rs::server::access_security::new_acf_cell_watching(self.acf, &db);
+        // The audit logger owns a writer task, so building one needs the
+        // reactor. `build` is `async`; `CaServerBuilder::new` is not, which is
+        // why the environment default moved down here.
+        let build_reactor = epics_base_rs::runtime::task::Reactor::current()
+            .expect("CaServerBuilder::build is awaited on a runtime");
+        // The one place a database becomes a served database, whichever
+        // side it came from.
+        let (db, acf, autosave_config, autosave_manager) = match self.served {
+            None => {
+                let (db, autosave_config) = self.ioc.build().await?;
+                let acf =
+                    epics_base_rs::server::access_security::new_acf_cell_watching(self.acf, &db);
+                (db, acf, autosave_config, None)
+            }
+            Some(AdoptedDatabase {
+                db,
+                acf,
+                autosave_config,
+                autosave_manager,
+            }) => (db, acf, autosave_config, autosave_manager),
+        };
         #[cfg(feature = "experimental-rust-tls")]
         let tls = self.tls.and_then(|t| match t {
             crate::tls::TlsConfig::Server(arc) => Some(Arc::new(std::sync::RwLock::new(arc))),
@@ -289,7 +337,7 @@ impl CaServerBuilder {
         });
         let (conn_tx, _) = tokio::sync::broadcast::channel(64);
         let (acf_reload_tx, _) = tokio::sync::broadcast::channel(16);
-        // C parity (caservertask.c:491-499): `ca_udp_port =
+        // C parity (caservertask.c:492-500): `ca_udp_port =
         // ca_server_port` — UDP and TCP bind the same value unless
         // the Rust-extension `.tcp_port(...)` was used to split. The
         // `self.port` field already incorporates the
@@ -297,7 +345,7 @@ impl CaServerBuilder {
         // via cas_server_port() at builder construction.
         let tcp_port = self.tcp_port.unwrap_or(self.port);
         let (tcp, udp) = bind_sockets(self.port, tcp_port).await?;
-        Ok(CaServer {
+        let server = CaServer {
             db,
             port: udp.port(),
             tcp_port: tcp.port(),
@@ -308,7 +356,7 @@ impl CaServerBuilder {
             acf_source_path: std::sync::Mutex::new(self.acf_path),
             acf_reload_tx,
             autosave_config,
-            autosave_manager: None,
+            autosave_manager,
             conn_events: Some(conn_tx),
             #[cfg(feature = "experimental-rust-tls")]
             tls,
@@ -318,13 +366,24 @@ impl CaServerBuilder {
             mdns_txt: self.mdns_txt,
             #[cfg(feature = "discovery-dns-update")]
             dns_update: self.dns_update,
-            audit: self.audit,
+            audit: self.audit.or_else(|| audit_from_env(&build_reactor)),
             introspection_addr: self.introspection_addr,
             drain_grace_secs: self.drain_grace_secs,
             #[cfg(feature = "cap-tokens")]
             cap_token_verifier: self.cap_token_verifier,
             beacon_reset: Arc::new(tokio::sync::Notify::new()),
-        })
+        };
+        // C `rsrv_init` fills the statics `casr` reads at the moment RSRV's
+        // sockets are bound (`caservertask.c:1519-1560`), not when a shell is
+        // started. Here for the same reason: the dual-protocol runner stands
+        // its CA server up with a bare `run()` and puts the iocsh on the PVA
+        // side, so a publication inside `run_with_shell` left `casr` and the
+        // `dbsr` layer report empty on every `scope_ioc`-shaped IOC.
+        crate::server::iocsh::publish_casr_source(
+            server.stats(),
+            crate::server::casr_addrs(&server).unwrap_or_default(),
+        );
+        Ok(server)
     }
 
     /// Install a capability-token verifier. When set, CLIENT_NAME
@@ -339,6 +398,32 @@ impl CaServerBuilder {
     ) -> Self {
         self.cap_token_verifier = Some(verifier);
         self
+    }
+
+    /// A builder that serves a database someone else already built —
+    /// `IocApplication`'s, after its startup script and its `iocInit`.
+    ///
+    /// The `acf` cell is ADOPTED, not re-created, so this server, the
+    /// sibling PVA/QSRV servers and the iocsh `asInit` command all gate on
+    /// one cell. The database-building methods (`pv`, `record`, `db_file`,
+    /// `register_*`) belong to [`Self::new`]'s route and do nothing here;
+    /// every SERVER-side option — port, TLS, mDNS, DNS-UPDATE, audit,
+    /// introspection, drain — applies to both.
+    pub fn serving(
+        db: Arc<PvDatabase>,
+        acf: epics_base_rs::server::access_security::AcfCell,
+        autosave_config: Option<autosave::SaveSetConfig>,
+        autosave_manager: Option<Arc<autosave::AutosaveManager>>,
+    ) -> Self {
+        Self {
+            served: Some(AdoptedDatabase {
+                db,
+                acf,
+                autosave_config,
+                autosave_manager,
+            }),
+            ..Self::new()
+        }
     }
 }
 
@@ -422,7 +507,7 @@ pub struct CaServer {
     /// subscribes; on `reload_acf*()` we send `()` so every active
     /// connection re-evaluates and re-pushes `CA_PROTO_ACCESS_RIGHTS`
     /// for its open channels. Mirrors RSRV `sendAllUpdateAS`
-    /// (caservertask.c:1224) — the broadcast that keeps already-open
+    /// (caservertask.c:1225) — the broadcast that keeps already-open
     /// channels in sync with rule changes. Fired by `reload_acf*()`
     /// after a config swap and by [`Self::notify_access_change`] for
     /// programmatic access-state changes the server cannot detect.
@@ -518,10 +603,15 @@ impl CaServer {
     /// gate on one cell. A standalone caller creates its own with
     /// [`epics_base_rs::server::access_security::new_acf_cell`].
     ///
-    /// Binds the TCP and UDP sockets, exactly as
-    /// [`CaServerBuilder::build`] does — the returned server is already
+    /// Binds the TCP and UDP sockets, because it IS
+    /// [`CaServerBuilder::build`] — the returned server is already
     /// listening, and a bind failure is reported here rather than from
     /// inside a spawned [`Self::run`] task.
+    ///
+    /// Kept as the short spelling of [`CaServerBuilder::serving`] for the
+    /// callers that want nothing but a database and a port. A caller that
+    /// also wants TLS, mDNS or DNS-UPDATE on this route uses the builder,
+    /// which is now the only thing that constructs a `CaServer`.
     pub async fn from_parts(
         db: Arc<PvDatabase>,
         port: u16,
@@ -530,43 +620,12 @@ impl CaServer {
         autosave_config: Option<autosave::SaveSetConfig>,
         autosave_manager: Option<Arc<autosave::AutosaveManager>>,
     ) -> CaResult<Self> {
-        let stats = Arc::new(ServerStats::default());
-        // Always-on connection broadcast so the stats counter task in
-        // `run()` (and any external `connection_events()` subscriber)
-        // can attach without requiring a `&mut self` mutation. Capacity
-        // 64 matches the previous lazy default.
-        let (conn_tx, _) = tokio::sync::broadcast::channel(64);
-        let (acf_reload_tx, _) = tokio::sync::broadcast::channel(16);
-        let tcp_port = tcp_port.unwrap_or(port);
-        let (tcp, udp) = bind_sockets(port, tcp_port).await?;
-        Ok(Self {
-            db,
-            port: udp.port(),
-            tcp_port: tcp.port(),
-            tcp,
-            udp,
-            stats,
-            acf,
-            acf_source_path: std::sync::Mutex::new(None),
-            acf_reload_tx,
-            autosave_config,
-            autosave_manager,
-            conn_events: Some(conn_tx),
-            #[cfg(feature = "experimental-rust-tls")]
-            tls: None,
-            #[cfg(feature = "experimental-rust-tls")]
-            tls_paths: std::sync::Mutex::new(tls_paths_from_env()),
-            mdns_instance: None,
-            mdns_txt: Vec::new(),
-            #[cfg(feature = "discovery-dns-update")]
-            dns_update: None,
-            audit: audit_from_env(),
-            introspection_addr: introspection_from_env(),
-            drain_grace_secs: drain_grace_from_env(),
-            #[cfg(feature = "cap-tokens")]
-            cap_token_verifier: None,
-            beacon_reset: Arc::new(tokio::sync::Notify::new()),
-        })
+        let mut builder =
+            CaServerBuilder::serving(db, acf, autosave_config, autosave_manager).port(port);
+        if let Some(tcp_port) = tcp_port {
+            builder = builder.tcp_port(tcp_port);
+        }
+        builder.build().await
     }
 
     /// The TCP port the server is listening on.
@@ -625,15 +684,26 @@ impl CaServer {
         acf: &epics_base_rs::server::access_security::AcfCell,
         reload_tx: &tokio::sync::broadcast::Sender<()>,
     ) -> CaResult<()> {
-        // std::fs::read_to_string blocks the worker thread on slow
-        // NFS / FUSE / network FS. Run it on the blocking pool so
-        // concurrent CA TCP traffic on the same worker doesn't stall
-        // for the duration of the read.
+        // C never reads an ACF on a thread that is serving a CA client: RSRV
+        // is thread-per-client (`caservertask.c` `create_tcp_client`), and
+        // `asInit` parses inline on the iocsh thread. This front-end
+        // multiplexes every client onto a few workers, so an inline read here
+        // would stall clients on a slow NFS / FUSE mount — the offload is what
+        // preserves C's property, not a departure from it.
+        //
+        // Through the seam, not `tokio::task::spawn_blocking`: the file read is
+        // reactor-free by nature, which is the case `runtime::task::
+        // spawn_blocking` documents itself as being for, and it is the half
+        // that needs no runtime under `exec_backend`. Naming tokio's directly
+        // made this panic for any caller reaching `reload_acf_from` off a
+        // runtime — an iocsh `asInit` on the blocking driver.
         let path_owned = path.to_string();
-        let content = tokio::task::spawn_blocking(move || std::fs::read_to_string(path_owned))
-            .await
-            .map_err(|e| CaError::Io(std::io::Error::other(e)))?
-            .map_err(CaError::Io)?;
+        let content = epics_base_rs::runtime::task::spawn_blocking(move || {
+            std::fs::read_to_string(path_owned)
+        })
+        .await
+        .map_err(|e| CaError::Io(std::io::Error::other(e)))?
+        .map_err(CaError::Io)?;
         let parsed = access_security::parse_acf(&content)?;
         acf.store(Some(Arc::new(parsed)));
         // Notify every active TCP client to recompute and push fresh
@@ -681,7 +751,7 @@ impl CaServer {
     /// snapshots this before `run` and fires it whenever a programmatic
     /// access-state change — such as an upstream IOC write-access flip or an
     /// `.acf`/`.pvlist` reload — should re-push `CA_PROTO_ACCESS_RIGHTS` to
-    /// already-connected clients (RSRV `sendAllUpdateAS`, caservertask.c:1224).
+    /// already-connected clients (RSRV `sendAllUpdateAS`, caservertask.c:1225).
     pub fn access_rights_notifier(&self) -> AccessRightsNotifier {
         AccessRightsNotifier {
             tx: self.acf_reload_tx.clone(),
@@ -803,15 +873,70 @@ impl CaServer {
 
         let server = Arc::new(self);
 
+        // C `rsrv_register_server` joins the `dbServer` list (`dbServer.c:30`)
+        // and `iocRun` then flips the set to `running` (`:157-169`), which is
+        // the phase `dbsr` needs before it will call any layer's report. Both
+        // belong HERE and not in `run_ca_ioc`: this is the one function every
+        // path that stands a CA server behind an iocsh goes through, and
+        // `softioc-rs` reaches it without `run_ca_ioc`.
+        // Same address lists the `casr` command gets — `dbsr` reaches this
+        // layer's report through the same renderer, so the two must not read
+        // different lists. A binder failure here costs the address block, not
+        // the registration.
+        // Built ONCE and handed to both entry points. C's `casr` command and
+        // its `dbServer.report` are one function reading one set of lists
+        // (`caservertask.c:907`, `:1561-1569`); two derivations here could
+        // disagree the moment a binder failure changed one of them.
+        // A second call to C's `rsrv_register_server`, for the callers that
+        // reach this function without an `IocApplication` (a bare
+        // `CaServer::run_with_shell`, and this crate's own tests): they have
+        // no head to run the registrar from, and the `dbServer` phase is
+        // still `registering` for them. Behind `IocApplication` the head hook
+        // has already joined the list and `ioc_run` has moved the phase on,
+        // so this one is refused — silently, which is what C's
+        // `dbRegisterServer` does outside `registering` too.
+        crate::server::iocsh::register_ca_db_server();
+        epics_base_rs::server::db_server::db_run_servers();
+
+        // `casr` belongs to the server, not to the caller. C registers it from
+        // RSRV's own `iocshRegister` (`caservertask.c:907` via `rsrv_register`),
+        // so every `softIoc` has it; the port made it an opt-in the caller had
+        // to push into `shell_commands`, and `softioc-rs` — which reaches this
+        // function without `run_ca_ioc` — did not, so `casr` answered "Command
+        // 'casr' not registered." on the very IOC whose statistics it reports.
+        // Registered HERE for the same reason the `dbServer` join above is:
+        // this is the one function every CA-server-behind-an-iocsh path goes
+        // through. It reaches the INTERACTIVE shell only — this runs after the
+        // startup script, so the `st.cmd` half is `iocsh::register_rsrv_commands`,
+        // called at the application's head the way C's registrar is.
+        let ca_cmds = crate::server::iocsh::ca_server_commands();
+
         let server_clone = server.clone();
-        let server_handle =
-            epics_base_rs::runtime::task::spawn(async move { server_clone.run().await });
+        // `run` drives `tokio::net` listeners, so it belongs on the tokio
+        // runtime and nowhere else. `bridge.reactor()` used to place it, and
+        // under `exec_backend` that is a callback band with no reactor at all:
+        // the server bound its sockets at construction and then panicked
+        // inside `tokio::net` on the first accepted client, which reads from
+        // the outside as an IOC that announces its port and never answers.
+        // The bridge itself stays — the shell thread below still needs it to
+        // re-enter this runtime.
+        let server_handle = tokio::runtime::Handle::try_current()
+            .expect(
+                "CaServer::run_with_shell is awaited on the runtime its listeners bind sockets to",
+            )
+            .spawn(async move { server_clone.run().await });
 
         let (tx, rx) = epics_base_rs::runtime::sync::oneshot::channel();
         std::thread::spawn(move || {
+            // C runs `iocsh()` on the thread `epicsThreadInit` listed as
+            // `_main_` (`osdThread.c:406-412`); this driver runs it here.
+            epics_base_rs::runtime::task::register_main_thread();
             // The shell administers this server's live policy cell so an
             // interactive `asInit` is a real ACF (re)load, not a dead-end.
             let shell = iocsh::IocShell::new_with_acf(db, bridge, acf);
+            for cmd in ca_cmds {
+                shell.register(cmd);
+            }
             register_fn(&shell);
             if let Some(cmds) = autosave_cmds {
                 for cmd in cmds {
@@ -864,6 +989,36 @@ impl CaServer {
     /// Run the server (UDP + TCP + beacon + scan scheduler).
     /// This function runs indefinitely.
     pub async fn run(&self) -> CaResult<()> {
+        // Every listener, poller and signal task below opens a socket or arms
+        // a timer, so all of them are reactor-bound. `run` is the entry the
+        // caller awaits on the runtime that owns them, which makes this the
+        // one place in the server that has to state the requirement — the
+        // sites themselves now take the capability instead of reading a
+        // thread-local each.
+        //
+        // That runtime is tokio's, not the exec model's. `CaServer` is
+        // `#[cfg(not(epics_embedded_target))]`, so nothing below ever compiles
+        // for RTEMS or VxWorks — the target reaches the network through
+        // `server::blocking` — and `runtime::task::Reactor` says in its own
+        // docs that its exec-backend arm is the callback band and does not
+        // make `tokio::net` work. Because that arm is a ZST whose `current()`
+        // never fails, minting the capability from it turned the `expect`
+        // below into a check that could not fail and handed the accept loop to
+        // a `cbMedium` worker, where `JoinSet::spawn`, `tokio::signal::unix::
+        // signal` and the `TcpStream` minted by the first accepted client each
+        // panic with "there is no reactor running". Reading the ambient
+        // runtime is sound here for the reason
+        // `introspection::spawn_on_the_listeners_runtime` gives for its own
+        // site: whatever runtime polls `run` is by definition the one that
+        // will drive the sockets `run` starts.
+        let reactor = tokio::runtime::Handle::try_current()
+            .expect("CaServer::run is awaited on the runtime its listeners bind sockets to");
+        // Autosave and the UDP responder take the backend-agnostic capability
+        // by signature. Neither is this file's to re-shape, and the tasks they
+        // start are the exec model's to place.
+        let seam_reactor = epics_base_rs::runtime::task::Reactor::current()
+            .expect("CaServer::run is awaited on an executor");
+
         // Pin the started_at timestamp on first run() so subsequent
         // re-entries don't reset uptime accounting.
         let _ = self.stats.started_at.set(std::time::Instant::now());
@@ -876,7 +1031,7 @@ impl CaServer {
         if let Some(tx) = &self.conn_events {
             let mut rx = tx.subscribe();
             let stats_for_task = self.stats.clone();
-            tokio::spawn(async move {
+            reactor.spawn(async move {
                 while let Ok(evt) = rx.recv().await {
                     use std::sync::atomic::Ordering::Relaxed;
                     // ServerConnectionEvent is `#[non_exhaustive]`, so
@@ -944,7 +1099,7 @@ impl CaServer {
         let autosave_handle = if let Some(ref mgr) = self.autosave_manager {
             let mgr = mgr.clone();
             let db_save = self.db.clone();
-            Some(mgr.start(db_save))
+            Some(mgr.start(&seam_reactor, db_save))
         } else if let Some(ref cfg) = self.autosave_config {
             let builder = autosave::AutosaveBuilder::new().add_set(cfg.clone());
             // `build` cannot fail: a set it could not construct is reported
@@ -952,7 +1107,7 @@ impl CaServer {
             // there is nothing left here to abandon the autosave task for.
             let mgr = Arc::new(builder.build().await);
             let db_save = self.db.clone();
-            Some(mgr.start(db_save))
+            Some(mgr.start(&seam_reactor, db_save))
         } else {
             None
         };
@@ -991,7 +1146,6 @@ impl CaServer {
                  CA-over-TLS ENABLED — non-standard, Rust-only extension.\n  \
                  C tools (caget/caput/camonitor/EDM/MEDM/CSS) and pyepics CANNOT connect.\n  \
                  For interoperable encryption use network-layer (IPSec/WireGuard/VPN).\n  \
-                 See doc/11-tls-design.md for rationale.\n  \
                  ═══════════════════════════════════════════════════════════════════════"
             );
             metrics::counter!("ca_server_tls_enabled_total").increment(1);
@@ -1005,7 +1159,7 @@ impl CaServer {
         #[cfg(feature = "cap-tokens")]
         let cap_token_verifier_for_tcp = self.cap_token_verifier.clone();
         let stats_for_tcp = Some(self.stats.clone());
-        let tcp_handle = epics_base_rs::runtime::task::spawn(async move {
+        let tcp_handle = reactor.spawn(async move {
             #[cfg(feature = "experimental-rust-tls")]
             {
                 tcp::run_tcp_listener(
@@ -1064,7 +1218,7 @@ impl CaServer {
             if let (true, Some(path)) = (secs > 0, path) {
                 let acf = self.acf.clone();
                 let reload_tx = self.acf_reload_tx.clone();
-                Some(epics_base_rs::runtime::task::spawn(async move {
+                Some(reactor.spawn(async move {
                     let mut tick = tokio::time::interval(std::time::Duration::from_secs(secs));
                     tick.tick().await; // skip immediate fire
                     loop {
@@ -1095,7 +1249,7 @@ impl CaServer {
         let signal_handle = {
             let drain = drain.clone();
             let grace = self.drain_grace_secs;
-            Some(epics_base_rs::runtime::task::spawn(async move {
+            Some(reactor.spawn(async move {
                 let mut sigterm =
                     match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
                     {
@@ -1111,7 +1265,14 @@ impl CaServer {
                     metrics::counter!("ca_server_drain_total").increment(1);
                     tokio::time::sleep(std::time::Duration::from_secs(grace)).await;
                     tracing::info!("drain grace expired; exiting");
-                    std::process::exit(0);
+                    // The one exit that leaves the process from inside a
+                    // running IOC, so it is the one that would otherwise skip
+                    // the shutdown callbacks `IocApplication::run` owns —
+                    // ports would never stop and no driver's `Drop` would run.
+                    // C reaches `exit()` the same way everywhere, through
+                    // `epicsExit` (`epicsExit.c:172-177`), never through a bare
+                    // `exit()`.
+                    epics_base_rs::runtime::exit::exit(0);
                 }
             }))
         };
@@ -1188,6 +1349,17 @@ impl CaServer {
         // configured via `with_introspection()` or
         // EPICS_CAS_INTROSPECTION_ADDR. Failures are logged and the CA
         // server keeps running — introspection is non-essential.
+        //
+        // This used to be split in two by `cfg(tokio_backend)`, the exec-backend
+        // arm logging "needs a tokio reactor; not started". The premise of that
+        // split was that every *other* socket here was bound at construction,
+        // so its task "only polls a resource that is already registered" and is
+        // sound on whichever executor the capability names. That is not true of
+        // an accept loop: each accepted client mints a fresh `TcpStream`, which
+        // has to register with a reactor of its own, so the CA listener panicked
+        // on the first connection exactly as introspection did on its first
+        // read. With the capability above now the tokio runtime on both
+        // backends, neither does, and the endpoint needs no arm of its own.
         let introspection_handle = if let Some(addr) = self.introspection_addr {
             let state = crate::server::introspection::IntrospectionState::new(tcp_port);
             // Share the drain flag so POST /drain triggers the same
@@ -1198,6 +1370,11 @@ impl CaServer {
             let acf_clone = self.acf.clone();
             let acf_path_clone = self.acf_source_path.lock().ok().and_then(|g| g.clone());
             let acf_reload_tx_clone = self.acf_reload_tx.clone();
+            // The closure outlives this scope inside `IntrospectionState`, and
+            // it is called from an introspection handler task, not from here —
+            // so it has to carry the executor rather than read one off whatever
+            // thread happens to invoke it.
+            let acf_reload_reactor = reactor.clone();
             let reload_fn: Arc<dyn Fn() -> Result<(), String> + Send + Sync> =
                 Arc::new(move || -> Result<(), String> {
                     let path = acf_path_clone
@@ -1211,7 +1388,7 @@ impl CaServer {
                     // task to swap the RwLock contents and notify clients.
                     let acf = acf_clone.clone();
                     let reload_tx = acf_reload_tx_clone.clone();
-                    tokio::spawn(async move {
+                    acf_reload_reactor.spawn(async move {
                         acf.store(Some(Arc::new(cfg)));
                         let _ = reload_tx.send(());
                     });
@@ -1263,7 +1440,7 @@ impl CaServer {
             };
 
             let st = state.clone();
-            Some(epics_base_rs::runtime::task::spawn(async move {
+            Some(reactor.spawn(async move {
                 if let Err(e) = crate::server::introspection::run_introspection(addr, st).await {
                     tracing::warn!(error = %e, "introspection HTTP exited");
                 }
@@ -1276,10 +1453,21 @@ impl CaServer {
         // through a select! branch (which can drop/replace wakers between polls
         // and miss edge-triggered epoll events).
         let ignore_addrs = udp_cfg.ignore_addrs.clone();
-        let udp_handle = epics_base_rs::runtime::task::spawn(async move {
-            udp::run_udp_search_responder(db_udp, bound_udp, tcp_port, ignore_addrs).await
+        let udp_reactor = seam_reactor.clone();
+        let udp_handle = reactor.spawn(async move {
+            udp::run_udp_search_responder(&udp_reactor, db_udp, bound_udp, tcp_port, ignore_addrs)
+                .await
         });
         let udp_abort = udp_handle.abort_handle();
+
+        // C's `rsrv_run` returns having started the accept loop, so `iocRun`
+        // — and with it the `iocInit` line of the startup script — cannot
+        // return before RSRV is serving (`caservertask.c:766-771`,
+        // `iocInit.c:265`). The port spawns this future instead of calling
+        // into it, so the fact has to travel back: everything above this
+        // point is bound and published, everything below it is the serving
+        // loop, and `BuiltIoc::run` holds `iocInit` here.
+        epics_base_rs::server::db_server::announce_serving();
 
         let result = tokio::select! {
             r = udp_handle => {
@@ -1361,7 +1549,9 @@ fn tls_paths_from_env() -> Option<TlsPaths> {
 /// - `EPICS_CAS_AUDIT_FILE=<path>` writes JSON-Lines to the path
 /// - `EPICS_CAS_AUDIT=stderr`      writes to stderr
 /// - unset / empty                 disables audit
-fn audit_from_env() -> Option<crate::audit::AuditLogger> {
+fn audit_from_env(
+    reactor: &epics_base_rs::runtime::task::Reactor,
+) -> Option<crate::audit::AuditLogger> {
     if let Some(path) = epics_base_rs::runtime::env::get("EPICS_CAS_AUDIT_FILE") {
         if !path.is_empty() {
             // Opened synchronously because this runs during server
@@ -1375,7 +1565,7 @@ fn audit_from_env() -> Option<crate::audit::AuditLogger> {
             {
                 Ok(f) => {
                     let sink = crate::audit::AuditSink::File(crate::audit::AuditFile::from_std(f));
-                    return Some(crate::audit::AuditLogger::new(sink));
+                    return Some(crate::audit::AuditLogger::new(reactor, sink));
                 }
                 Err(e) => {
                     tracing::warn!(error = %e, path = %path,
@@ -1387,6 +1577,7 @@ fn audit_from_env() -> Option<crate::audit::AuditLogger> {
     if let Some(val) = epics_base_rs::runtime::env::get("EPICS_CAS_AUDIT") {
         if val.eq_ignore_ascii_case("stderr") {
             return Some(crate::audit::AuditLogger::new(
+                reactor,
                 crate::audit::AuditSink::Stderr,
             ));
         }
@@ -1458,5 +1649,115 @@ mod access_notifier_tests {
             rx.try_recv().is_ok(),
             "handle must send on the same channel"
         );
+    }
+}
+
+#[cfg(all(test, exec_backend))]
+mod acf_reload_needs_no_runtime {
+    //! The measurement behind `reload_acf_inner`'s seam routing.
+    //!
+    //! `reload_acf_from` is public and `reload_acf_inner` is reached from
+    //! iocsh as well as from `run`, so it has to work on a thread that is not
+    //! inside any runtime — which on the RTEMS execution model is every thread
+    //! the blocking driver and the shell own. `tokio::task::spawn_blocking`
+    //! panics there; the seam's `spawn_blocking` is the callback pool and does
+    //! not. This test is `exec_backend`-only because that is the backend where
+    //! the difference exists: under `tokio_backend` both spellings are the same
+    //! call and neither works off a runtime.
+
+    #[test]
+    fn reload_acf_inner_completes_on_a_thread_with_no_runtime() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("policy.acf");
+        std::fs::write(&path, "ASG(DEFAULT) { RULE(1, WRITE) }").expect("write acf");
+        let path = path.to_string_lossy().to_string();
+
+        let cell = epics_base_rs::server::access_security::new_acf_cell(None);
+        let (tx, _rx) = tokio::sync::broadcast::channel(4);
+
+        let loaded = std::thread::spawn(move || {
+            epics_base_rs::runtime::task::block_on_sync(super::CaServer::reload_acf_inner(
+                &path, &cell, &tx,
+            ))
+            .expect("a plain std::thread may block on async work")
+            .expect("the ACF parses");
+            cell.load_full().is_some()
+        })
+        .join()
+        .expect("the reload thread joins");
+
+        assert!(
+            loaded,
+            "an off-runtime reload must reach the cell, not panic in the pool"
+        );
+    }
+}
+
+#[cfg(test)]
+mod listeners_need_the_tokio_runtime {
+    //! The measurement behind `run`'s capability mint.
+    //!
+    //! Under `exec_backend`, `runtime::task::Reactor::current()` is a ZST that
+    //! never fails and whose `spawn` is a callback band. Minting `run`'s
+    //! listener capability from it therefore compiled, passed its own
+    //! `expect`, and put the accept loop on `cbMedium` — where the
+    //! `tokio::net::TcpStream` minted for the first accepted client panics
+    //! with *"there is no reactor running"*. Nothing on the default backend
+    //! can see it: there the same capability already *is* the tokio handle.
+    //!
+    //! The case is `exec_backend`-only for that reason, and deliberately
+    //! end-to-end: the
+    //! defect lives between binding a socket (which succeeds on either
+    //! backend, at construction) and answering on it, so only a client that
+    //! actually connects can tell the two apart.
+
+    // RTEMS-EXEC-MODEL-ALLOW(1): the case exists to prove the CA server serves
+    // a client with the exec backend selected, so this site is ungated on
+    // purpose and is measured green in the exec-backend suite.
+    #[cfg(exec_backend)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn an_accepted_client_reads_a_value_on_the_exec_backend() {
+        let server = super::CaServer::builder()
+            .port(0)
+            .pv("EXEC:VAL", epics_base_rs::types::EpicsValue::Long(4242))
+            .build()
+            .await
+            .expect("build");
+
+        // `build()` bound both sockets, so there is no start-up race to wait
+        // out — the port below is already final.
+        //
+        // Reached over `EPICS_CA_NAME_SERVERS` rather than a UDP search, and
+        // not for speed: this host runs other IOCs, and a broadcast search on
+        // 127.0.0.1 can be answered — or drowned — by any of them. A
+        // name-server entry dials one `host:port`, so the circuit under test
+        // is the one this test built.
+        let tcp_port = server.tcp_port();
+        let server = std::sync::Arc::new(server);
+        let serving = server.clone();
+        let server_task = tokio::spawn(async move {
+            let _ = serving.run().await;
+        });
+
+        unsafe {
+            std::env::set_var("EPICS_CA_AUTO_ADDR_LIST", "NO");
+            std::env::set_var("EPICS_CA_ADDR_LIST", "");
+            std::env::set_var("EPICS_CA_NAME_SERVERS", format!("127.0.0.1:{tcp_port}"));
+        }
+
+        let client = crate::client::CaClient::new()
+            .await
+            .expect("a client on this runtime");
+        let ch = client.create_channel("EXEC:VAL");
+        ch.wait_connected(std::time::Duration::from_secs(10))
+            .await
+            .expect("the accept loop answers on the exec backend");
+        let (_, value) = ch
+            .get_with_timeout(std::time::Duration::from_secs(10))
+            .await
+            .expect("a read completes over the accepted circuit");
+        assert_eq!(value.to_f64().unwrap_or(0.0) as i64, 4242);
+
+        server_task.abort();
     }
 }

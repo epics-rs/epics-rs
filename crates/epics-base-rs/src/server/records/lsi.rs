@@ -45,11 +45,6 @@ pub struct LsiRecord {
     /// DBE_LOG (archive) mask (C `lsiRecord.dbd.pod` APST, monitor:
     /// `if (apst == menuPost_Always) events |= DBE_LOG;`).
     pub apst: i16,
-    /// Per-cycle scratch: did VAL change on the most recent `process()`?
-    /// Captured BEFORE `process()` commits `oval`/`olen` so the
-    /// framework's post-process monitor gate can see it. C
-    /// `lsiRecord.c::monitor`: `len != olen || memcmp(oval, val, len)`.
-    value_changed: bool,
 }
 
 impl Default for LsiRecord {
@@ -75,7 +70,6 @@ impl Default for LsiRecord {
             sdly: -1.0,
             mpst: 0,
             apst: 0,
-            value_changed: false,
         }
     }
 }
@@ -172,6 +166,16 @@ impl Record for LsiRecord {
         false
     }
 
+    /// `lsiRecord.c::process` never re-derives UDF after a DEVICE read that
+    /// wrote VAL directly (C `return 2`): its two `prec->udf = FALSE` sites
+    /// are `init_record` (`:88`) and the simulated SIOL read (`:245`). Same
+    /// asyn octet consequence as `stringin` — a partial read on a transport
+    /// error stores VAL but must leave UDF alone
+    /// (`devAsynOctet.c::callbackSiRead:918-932`).
+    fn rederives_udf_on_computed_read(&self) -> bool {
+        false
+    }
+
     /// `lsiRecord.c` has NO `recGblCheckUdf` / `UDF_ALARM` (unlike
     /// `lsoRecord.c:118`): an undefined lsi raises no alarm from UDF (softIoc:
     /// `record(lsi,"X"){}` → UDF 1, STAT/SEVR = NO_ALARM). With `clears_udf`
@@ -205,8 +209,23 @@ impl Record for LsiRecord {
         self.len
     }
 
-    fn monitor_value_changed(&self) -> Option<bool> {
-        Some(self.value_changed)
+    /// C `lsiRecord.c:206-210` `monitor()`: `if (prec->len != prec->olen ||
+    /// memcmp(prec->oval, prec->val, prec->len)) { events |= DBE_VALUE |
+    /// DBE_LOG; memcpy(prec->oval, prec->val, prec->len); }` — compared and
+    /// committed HERE, at C's position. (`olen` follows from the separate
+    /// `if (prec->len != prec->olen)` two lines down, which also posts LEN.)
+    ///
+    /// For `lso` this is what makes the IVOA = Set_output_to_IVOV write post
+    /// on its OWN cycle: the framework's IVOA owner runs after
+    /// `process()` returns, so a flag captured in `process()` would be the
+    /// verdict on the PRE-arm value.
+    fn monitor_value_changed(&mut self) -> Option<bool> {
+        let changed = self.len != self.olen || self.oval != self.val;
+        if changed {
+            self.oval = self.val.clone();
+            self.olen = self.len;
+        }
+        Some(changed)
     }
 
     fn monitor_always_post(&self) -> (bool, bool) {
@@ -216,22 +235,6 @@ impl Record for LsiRecord {
     }
 
     fn process(&mut self) -> CaResult<ProcessOutcome> {
-        // C `lsiRecord.c::monitor` (lines 202-224) copies OVAL and
-        // bumps OLEN *only when the value actually changed* —
-        // `len != olen || memcmp(oval, val, len)` — and raises
-        // `DBE_VALUE | DBE_LOG` on that same condition. `process()`
-        // itself does not recompute LEN; LEN is set when VAL is written
-        // (C `special`, Rust `put_field`). Recomputing it here would
-        // make OLEN report the previous LEN after a no-op cycle.
-        //
-        // Capture the change BEFORE committing oval/olen, because the
-        // framework's monitor gate reads `monitor_value_changed()`
-        // *after* this returns — by then oval == val and olen == len.
-        self.value_changed = self.len != self.olen || self.oval != self.val;
-        if self.value_changed {
-            self.oval = self.val.clone();
-            self.olen = self.len;
-        }
         Ok(ProcessOutcome::complete())
     }
 

@@ -42,12 +42,34 @@ impl std::fmt::Display for ToolError {
     }
 }
 
+/// The two entries a failure that belongs to NEITHER side is recorded as — a
+/// workdir write, a host that would not hand out a port, a refusal to run at
+/// all. Every other failure names the one side that produced it
+/// (`BootError::tool_errors`, or the tool's own `ToolError`); recording a
+/// working side as failed is a wrong reading, not a cautious one, so this is
+/// the only door to a two-entry error list.
+pub fn unattributed(tool: &str, message: &str) -> Vec<ToolError> {
+    [Side::C, Side::Rust]
+        .into_iter()
+        .map(|side| ToolError {
+            side,
+            tool: tool.to_string(),
+            message: message.to_string(),
+        })
+        .collect()
+}
+
 /// Wall-clock cap on any single tool invocation. The tools take `-w` (CA
 /// timeout) but that governs the CA search, not the process, so we bound the
 /// process too and treat an overrun as an error.
 const TOOL_TIMEOUT: Duration = Duration::from_secs(8);
 /// CA connect/read timeout handed to the tools via `-w`.
 const CA_TIMEOUT_SECS: &str = "2";
+/// The `-w` a *retried* liveness probe gets: C's own default for the CA tools
+/// (`tool_lib.h:51` `#define DEFAULT_TIMEOUT 1.0`). A measurement is taken once
+/// and wants the longer budget; a probe is taken many times and wants C's short
+/// one, so the two must not share a constant.
+const CA_PROBE_TIMEOUT_SECS: &str = "1";
 
 /// The `caput` flags every put probe must carry. `-c` is the load-bearing one.
 ///
@@ -379,10 +401,17 @@ impl CaTools {
 
     /// `cainfo` — native DBF type, element count, and access rights.
     pub fn cainfo(&self, pv: &str) -> Result<CaInfo, ToolError> {
-        let out = self.run(
-            "cainfo",
-            &["-w".into(), CA_TIMEOUT_SECS.into(), pv.to_string()],
-        )?;
+        self.cainfo_waiting(pv, CA_TIMEOUT_SECS)
+    }
+
+    /// `cainfo` as a retried liveness probe: C's own `-w`, not the measurement
+    /// budget. See `CA_PROBE_TIMEOUT_SECS`.
+    pub fn cainfo_probe(&self, pv: &str) -> Result<CaInfo, ToolError> {
+        self.cainfo_waiting(pv, CA_PROBE_TIMEOUT_SECS)
+    }
+
+    fn cainfo_waiting(&self, pv: &str, wait_secs: &str) -> Result<CaInfo, ToolError> {
+        let out = self.run("cainfo", &["-w".into(), wait_secs.into(), pv.to_string()])?;
         parse_cainfo(&out).ok_or_else(|| self.err("cainfo", format!("unparseable cainfo: {out:?}")))
     }
 }
@@ -673,15 +702,31 @@ fn parse_cainfo(out: &str) -> Option<CaInfo> {
 ///   [`CaTools::run_with_stderr`] and [`wait_bounded`]: the child never ran, was
 ///   killed at [`TOOL_TIMEOUT`], or could not be reaped.
 fn is_measurement_failure(msg: &str) -> bool {
-    const MARKERS: [&str; 6] = [
+    const MARKERS: [&str; 5] = [
         "Channel connect timed out",
         "Write operation timed out",
-        "Write callback operation timed out",
         "spawn:",
         "timed out after",
         "wait:",
     ];
-    MARKERS.iter().any(|m| msg.contains(m))
+    MARKERS.iter().any(|m| msg.contains(m)) || is_no_completion(msg)
+}
+
+/// `caput.c:567` — the write was accepted and the completion never came.
+///
+/// The one marker in `is_measurement_failure`'s list that describes the
+/// SERVER rather than the road to it. The other five say we never got to ask:
+/// the channel never connected, the child never spawned, the tool was killed at
+/// `TOOL_TIMEOUT`. This one says both ends of the conversation worked and the
+/// IOC chose never to finish — C's `subRecord.c:119-122` latches `pact = TRUE`
+/// on an empty `SNAM`, `dbProcess` (`dbAccess.c:537`) then returns early for
+/// every later cycle, and no `ca_put_callback` can ever complete.
+///
+/// That distinction is what [`crate::diff::Verdict::NeitherCompleted`] rests
+/// on, so the marker is named once and both readers share it: a bucket that
+/// admitted "spawn:" would be scoring the harness's own crash as a reading.
+pub fn is_no_completion(msg: &str) -> bool {
+    msg.contains("Write callback operation timed out")
 }
 
 fn normalize_ca_error(msg: &str) -> String {

@@ -1,7 +1,7 @@
 use std::time::Instant;
 
 use epics_base_rs::error::CaResult;
-use epics_base_rs::server::device_support::{DeviceReadOutcome, DeviceSupport};
+use epics_base_rs::server::device_support::{DeviceReadOutcome, DeviceSupport, DeviceUdf};
 use epics_base_rs::server::record::Record;
 
 use crate::records::epid::EpidRecord;
@@ -239,7 +239,12 @@ impl DeviceSupport for EpidSoftDeviceSupport {
             .expect("EpidSoftDeviceSupport requires an EpidRecord");
 
         Self::do_pid(epid);
-        Ok(DeviceReadOutcome::computed())
+        // C `devEpidSoft.c::read_epid` never touches `pepid->udf` on any of
+        // its return paths (`:85`, `:111-115`, `:225`) — the only clears are
+        // `epidRecord.c:163` at init and `:193` on a successful closed-loop
+        // STPL fetch. `Untouched` says exactly that, and epid keeps the
+        // framework's default re-derive, so the observable is unchanged.
+        Ok(DeviceReadOutcome::computed(DeviceUdf::Untouched))
     }
 
     fn write(&mut self, _record: &mut dyn Record) -> CaResult<()> {

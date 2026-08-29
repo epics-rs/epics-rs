@@ -16,12 +16,8 @@
 //! first element is checked rather than the exact length so the
 //! assertion is robust to any requested-count padding on the wire.
 
-// Host/tokio-only: builds the async `CaClient`/`CaServer` stack in process.
-// Under `rtems-exec-model` the `runtime::task` seam routes their `spawn`
-// to the background executor, whose worker has no tokio reactor, so the
-// listener/transport tasks panic. The RTEMS model serves from
-// `BlockingCaServer` instead, so this path is inapplicable there.
-#![cfg(not(feature = "rtems-exec-model"))]
+#![cfg(tokio_backend)]
+#![cfg(feature = "client-core")]
 
 use std::time::Duration;
 
@@ -80,7 +76,7 @@ fn doubles(v: &EpicsValue) -> &[f64] {
 /// Receive the next monitor value within 3s, unwrapping the
 /// `Option<CaResult<Snapshot>>` to the `EpicsValue`.
 async fn recv_value(mon: &mut MonitorHandle) -> EpicsValue {
-    tokio::time::timeout(Duration::from_secs(3), mon.recv())
+    tokio::time::timeout(budget::FACT_BUDGET, mon.recv())
         .await
         .expect("monitor recv timed out")
         .expect("monitor stream closed before a value arrived")
@@ -112,7 +108,7 @@ async fn ca_fr_8_record_field_read_notify_applies_arr() {
     // The server is spawned by value above; drive seeding through a
     // CA WRITE so we don't need a second handle to the server.
     let ch = client.create_channel("CAFR8:WF:R1");
-    ch.wait_connected(Duration::from_secs(3))
+    ch.wait_connected(budget::FACT_BUDGET)
         .await
         .expect("connect for seed write");
     ch.put(&EpicsValue::DoubleArray(ramp(0.0, 10)))
@@ -120,7 +116,7 @@ async fn ca_fr_8_record_field_read_notify_applies_arr() {
         .expect("seed VAL with [0..9]");
 
     // Baseline: unfiltered read returns the full ramp, first element 0.0.
-    let (_t, base) = tokio::time::timeout(Duration::from_secs(5), client.caget("CAFR8:WF:R1"))
+    let (_t, base) = tokio::time::timeout(budget::FACT_BUDGET, client.caget("CAFR8:WF:R1"))
         .await
         .expect("baseline caget did not complete")
         .expect("baseline caget should succeed");
@@ -137,7 +133,7 @@ async fn ca_fr_8_record_field_read_notify_applies_arr() {
 
     // Filtered read: arr {s:5,e:7} slices [5,6,7]; first element 5.0.
     let (_t, filtered) = tokio::time::timeout(
-        Duration::from_secs(5),
+        budget::FACT_BUDGET,
         client.caget(r#"CAFR8:WF:R1.{"arr":{"s":5,"e":7}}"#),
     )
     .await
@@ -173,7 +169,7 @@ async fn ca_fr_8_record_field_monitor_applies_arr_on_updates() {
 
     // Seed [0..9] before subscribing so the initial frame is known.
     let seed = client.create_channel("CAFR8:WF:R2");
-    seed.wait_connected(Duration::from_secs(3))
+    seed.wait_connected(budget::FACT_BUDGET)
         .await
         .expect("connect for seed");
     seed.put(&EpicsValue::DoubleArray(ramp(0.0, 10)))
@@ -242,7 +238,7 @@ async fn ca_fr_8_simplepv_monitor_applies_arr() {
     // 105.0.
     let writer = client.create_channel("CAFR8:SP:R3");
     writer
-        .wait_connected(Duration::from_secs(3))
+        .wait_connected(budget::FACT_BUDGET)
         .await
         .expect("connect writer channel");
     writer
@@ -287,7 +283,7 @@ async fn ca_fr_8_arr_on_scalar_channel_is_noop() {
     // and the read could not return the scalar. The filter must instead
     // be a no-op: the scalar passes through unchanged.
     let (_t, filtered) = tokio::time::timeout(
-        Duration::from_secs(5),
+        budget::FACT_BUDGET,
         client.caget(r#"CAFR8:SP:SCALAR.{"arr":{"s":5,"e":7}}"#),
     )
     .await
@@ -325,7 +321,7 @@ async fn ca_fr_8_malformed_suffix_rejects_channel_create() {
     let client = CaClient::new().await.expect("client");
 
     let seed = client.create_channel("CAFR8:WF:R4");
-    seed.wait_connected(Duration::from_secs(3))
+    seed.wait_connected(budget::FACT_BUDGET)
         .await
         .expect("connect for seed");
     seed.put(&EpicsValue::DoubleArray(ramp(0.0, 10)))
@@ -333,7 +329,7 @@ async fn ca_fr_8_malformed_suffix_rejects_channel_create() {
         .expect("seed VAL");
 
     // Sanity: the bare record (no suffix) still connects and reads.
-    let (_t, ok) = tokio::time::timeout(Duration::from_secs(5), client.caget("CAFR8:WF:R4"))
+    let (_t, ok) = tokio::time::timeout(budget::FACT_BUDGET, client.caget("CAFR8:WF:R4"))
         .await
         .expect("bare caget did not complete")
         .expect("bare record must still connect");
@@ -390,7 +386,7 @@ async fn ca_fr_8_dotted_filter_suffix_resolves_at_search() {
     let client = CaClient::new().await.expect("client");
 
     let seed = client.create_channel("CAFR8:DOT:R5");
-    seed.wait_connected(Duration::from_secs(3))
+    seed.wait_connected(budget::FACT_BUDGET)
         .await
         .expect("connect for seed");
     seed.put(&EpicsValue::DoubleArray(ramp(0.0, 10)))
@@ -400,7 +396,7 @@ async fn ca_fr_8_dotted_filter_suffix_resolves_at_search() {
     // The `0.5` inside the suffix is the trap for a naive last-dot
     // split. Post-fix the channel resolves and the read succeeds.
     let (_t, val) = tokio::time::timeout(
-        Duration::from_secs(5),
+        budget::FACT_BUDGET,
         client.caget(r#"CAFR8:DOT:R5.{"dbnd":{"d":0.5}}"#),
     )
     .await
@@ -417,3 +413,6 @@ async fn ca_fr_8_dotted_filter_suffix_resolves_at_search() {
         "dbnd read context leaves the full waveform intact"
     );
 }
+
+#[path = "common/budget.rs"]
+mod budget;

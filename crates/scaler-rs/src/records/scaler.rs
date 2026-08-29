@@ -565,7 +565,7 @@ impl ScalerRecord {
 }
 
 /// `S1..S{MAX_SCALER_CHANNELS}` field names, in channel order, for
-/// [`ScalerRecord::log_swept_fields`]. C `scalerRecord.c:770-787`
+/// [`ScalerRecord::log_swept_fields`]. C `scalerRecord.c:770-772`
 /// `monitor()` sweeps each active channel `S1..Snch` with a literal
 /// `DBE_LOG` on every idle process; this static is sliced to `nch` so
 /// the record can return the exact set without per-call allocation.
@@ -588,7 +588,7 @@ static DG_PAIR_BY_CHANNEL: LazyLock<Vec<&'static [&'static str]>> = LazyLock::ne
 });
 
 /// `[PR{n}]` per channel (0-based), the preset C's `special()` posts when a
-/// `G{n}` write defaults it to 1000 (`scalerRecord.c:715-718`).
+/// `G{n}` write defaults it to 1000 (`scalerRecord.c:717-719`).
 static PR_BY_CHANNEL: LazyLock<Vec<&'static [&'static str]>> = LazyLock::new(|| {
     (1..=MAX_SCALER_CHANNELS)
         .map(|i| {
@@ -602,7 +602,7 @@ static PR_BY_CHANNEL: LazyLock<Vec<&'static [&'static str]>> = LazyLock::new(|| 
 /// `DBE_VALUE` in C: the process/updateCounts posts
 /// (scalerRecord.c:316/322/329/334/372/425/427/430/478/530/582/588) and the
 /// `special()` posts (`:673-676` PR1/D1/G1, `:682-687` TP/D1/G1, `:692` TP,
-/// `:703-705` Dn/Gn, `:716` PRn). `DBE_LOG` appears ONLY in the `monitor()`
+/// `:705-706` Dn/Gn, `:719` PRn). `DBE_LOG` appears ONLY in the `monitor()`
 /// sweep of `S1..Snch` (line 771, [`SN_FIELD_NAMES`]).
 ///
 /// Returning a field here makes the framework strip the LOG bit from its
@@ -830,6 +830,12 @@ impl Record for ScalerRecord {
         // COUTP again, so the link is written TWICE and a record wired to it is
         // processed twice. A user start reaches only special()'s put, because
         // :463 is guarded by justFinishedUserCount.
+        //
+        // The buffer is the POST-clear `cnt`: C reads `&pscal->cnt` at `:457`
+        // and `:463` after its `:371` store, so a `COUT`/`COUTP` target
+        // processed inside the put sees the count already cleared. That is why
+        // the `:371` store is NOT deferred the way `sseq`'s `busy` clear is —
+        // C makes it BEFORE these puts, not after them.
         if just_started_user_count || just_finished_user_count {
             actions.push(ProcessAction::WriteDbLink {
                 link_field: "COUT",
@@ -1050,7 +1056,7 @@ impl Record for ScalerRecord {
                 // (`:672-676` TP→PR1/D1/G1, `:681-686`, `:703-706`, `:717-719`).
                 // The clamp changes RATE and nothing else, and the written field
                 // is already posted by `dbPut` itself — `db_post_events(precord,
-                // pfieldsave, DBE_VALUE|DBE_LOG)` at dbAccess.c:1455-1459, which
+                // pfieldsave, DBE_VALUE|DBE_LOG)` at dbAccess.c:1411-1413, which
                 // runs AFTER `dbPutSpecial(paddr, 1)` and so carries the CLAMPED
                 // value. So the correct side-effect list is empty, and C's post
                 // is pure noise: a no-change TP event on every RATE write.
@@ -1071,13 +1077,13 @@ impl Record for ScalerRecord {
                     if self.pr[i] > 0 {
                         self.d[i] = 1;
                         self.g[i] = 1;
-                        // C:703-705 — the forced-on channel's Dn and Gn.
+                        // C:705-706 — the forced-on channel's Dn and Gn.
                         self.side_effect_posts = DG_PAIR_BY_CHANNEL[i];
                     }
                 } else if let Some(i) = parse_indexed_field(field, "G") {
                     if self.g[i] != 0 && self.pr[i] == 0 {
                         self.pr[i] = 1000;
-                        // C:716-717 — the preset this write just defaulted.
+                        // C:717-718 — the preset this write just defaulted.
                         self.side_effect_posts = PR_BY_CHANNEL[i];
                     }
                 }
@@ -1325,7 +1331,7 @@ impl Record for ScalerRecord {
         dbd_generated::SCALER_NOACCESS
     }
 
-    /// C `scalerRecord.c:471,770-787`: `process()` calls `monitor()` only
+    /// C `scalerRecord.c:471,770-772`: `process()` calls `monitor()` only
     /// while `ss == SCALER_STATE_IDLE`, and `monitor()` re-posts every
     /// active channel `S1..Snch` with a literal `DBE_LOG` regardless of
     /// change — so an archiver `camonitor SCALER:Sn` receives an event on
@@ -1379,7 +1385,7 @@ impl Record for ScalerRecord {
     ///
     /// * `D1..Dnch` — `process()` copies the gates into them on every count
     ///   start (`scalerRecord.c:413-414`, `:525-526`) and posts NOTHING; C's
-    ///   only `Dn` posts are in `special()` (`:675`, `:685`, `:704`). The port
+    ///   only `Dn` posts are in `special()` (`:675`, `:685`, `:705`). The port
     ///   change-detected the copy and fired a `Dn` monitor C never sends.
     ///
     /// `G1..Gnch` and `PR2..PRnch` stay outside the set for the same C reason —
@@ -1402,7 +1408,7 @@ impl Record for ScalerRecord {
     /// defaulted it to 1000, which the post-put state no longer distinguishes.
     ///
     /// These lists carry the OTHER fields a case changed — the written field is
-    /// posted by the put itself (C `dbPut`, dbAccess.c:1455-1459). So `RATE`,
+    /// posted by the put itself (C `dbPut`, dbAccess.c:1411-1413). So `RATE`,
     /// whose clamp changes only `RATE`, contributes nothing; C posts an untouched
     /// `TP` there, which is CBUG-B18 (see the deviation note at that case).
     fn monitor_side_effect_fields(&self, _put_field: &str) -> &'static [&'static str] {

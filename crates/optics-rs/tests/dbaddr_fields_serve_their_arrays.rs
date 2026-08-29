@@ -29,6 +29,12 @@
 //! on it because `DoubleArray::db_field_type()` is `Double`. The redirect is
 //! the record's own `get_field` arm, which is where every other `SPC_DBADDR`
 //! field in the workspace already does it (`acalcout.AVAL`, `asyn.BOUT`).
+//!
+//! `cvt_dbaddr` runs in `dbNameToAddr`, so the redirect it installs is the
+//! channel — it is not read-only. The port had the read arms and no write arms,
+//! so all eight fields the `.dbd` declares writable (`read_only: false` in
+//! `dbd_generated.rs`) rejected every put with `FieldNotFound`. The second
+//! group below is the write half.
 
 use epics_base_rs::server::record::{Record, RecordInstance};
 use epics_base_rs::types::EpicsValue;
@@ -132,4 +138,77 @@ fn the_scalar_declaration_does_not_collapse_the_served_array() {
             other => panic!("{f} reached the client as {other:?}"),
         }
     }
+}
+
+/// Every one of the eight accepts a put and stores it where `get_field` reads
+/// it back from. All eight rejected the put with `FieldNotFound` before the
+/// write arms existed.
+#[test]
+fn all_eight_dbaddr_channels_take_a_put() {
+    let mut t = initialised();
+    for (f, n) in [
+        ("A", 9),
+        ("B", 9),
+        ("PP0", 3),
+        ("PP1", 3),
+        ("PP2", 3),
+        ("PPO0", 3),
+        ("PPO1", 3),
+        ("PPO2", 3),
+    ] {
+        let want: Vec<f64> = (0..n).map(|i| i as f64 + 0.5).collect();
+        t.put_field(f, EpicsValue::DoubleArray(want.clone()))
+            .unwrap_or_else(|e| panic!("{f}: {e:?}"));
+        assert_eq!(doubles(&t, f), want, "{f}");
+    }
+}
+
+/// The matrix put is row-major, the same flatten `get_field` serves: C hands
+/// the client `ptbl->a[0]` and `a[i] = a[i-1] + 3` (`tableRecord.c:358-361`),
+/// so flat index `3*r + c` is `a[r][c]` on the way in as well as out.
+#[test]
+fn a_matrix_put_lands_row_major() {
+    let mut t = initialised();
+    let flat: Vec<f64> = (1..=9).map(f64::from).collect();
+    t.put_field("A", EpicsValue::DoubleArray(flat.clone()))
+        .unwrap();
+    assert_eq!(doubles(&t, "A"), flat);
+    // The `else` arm of `cvt_dbaddr` must not have been touched: a put to one
+    // channel writes only that channel's memory.
+    assert_eq!(doubles(&t, "B"), doubles(&initialised(), "B"));
+}
+
+/// `dbAccess.c:1360` — `if (no_elements < nRequest) nRequest = no_elements;`.
+/// A put longer than the channel writes the first `no_elements` and drops the
+/// rest; it is not an error.
+#[test]
+fn a_put_longer_than_the_channel_is_truncated() {
+    let mut t = initialised();
+    let long: Vec<f64> = (1..=12).map(f64::from).collect();
+    t.put_field("A", EpicsValue::DoubleArray(long)).unwrap();
+    assert_eq!(doubles(&t, "A"), (1..=9).map(f64::from).collect::<Vec<_>>());
+}
+
+/// The other end of the same copy: C writes `nRequest` elements from index 0
+/// and leaves the tail of the field alone — there is no `put_array_info`
+/// (`tableRecord.c:172`) to shorten the channel, so element 2 keeps the value
+/// `init_record` computed.
+#[test]
+fn a_put_shorter_than_the_channel_leaves_the_tail_standing() {
+    let mut t = initialised();
+    let before = doubles(&t, "PP1");
+    t.put_field("PP1", EpicsValue::DoubleArray(vec![7.0, 8.0]))
+        .unwrap();
+    assert_eq!(doubles(&t, "PP1"), vec![7.0, 8.0, before[2]]);
+}
+
+/// `dbAccess.c:1350` — `if (nRequest > 1 || special == SPC_DBADDR)`. A
+/// one-element put to an `SPC_DBADDR` field takes the ARRAY row, so it writes
+/// element 0 rather than being handled as a scalar store.
+#[test]
+fn a_one_element_put_writes_element_zero() {
+    let mut t = initialised();
+    let before = doubles(&t, "PP2");
+    t.put_field("PP2", EpicsValue::Double(42.0)).unwrap();
+    assert_eq!(doubles(&t, "PP2"), vec![42.0, before[1], before[2]]);
 }

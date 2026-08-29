@@ -6,7 +6,7 @@ use std::time::Duration;
 use crate::server::database::PvDatabase;
 use tokio::sync::RwLock;
 
-use super::backup::{BackupConfig, BackupState, find_best_save_file, publish_copy, rotate_backups};
+use super::backup::{BackupConfig, BackupState, find_best_save_file, publish_savb, rotate_backups};
 use super::error::{AutosaveError, AutosaveResult};
 use super::format::CompatMode;
 use super::macros::MacroContext;
@@ -98,6 +98,11 @@ pub struct RestoreResult {
     pub parse_failed: Vec<String>,
     pub not_found: Vec<String>,
     pub disconnected_skipped: Vec<String>,
+    /// The count the file's own `!` line declared, which for a C-written
+    /// `.sav` is the only record that the save set was incomplete —
+    /// `disconnected_skipped` can only list the PVs a per-PV marker
+    /// named. 0 when the file carried no such line.
+    pub not_connected_at_save: usize,
     /// Lines of the save file that named no PV at all. Distinct from
     /// `parse_failed`, which is per-PV: these lines never became an
     /// entry, so nothing else in this result can account for them.
@@ -144,9 +149,10 @@ impl SaveSet {
     /// refused.
     ///
     /// A set with no members cannot save anything, but `save_once` would
-    /// still run for it: `rotate_backups` copies the previous `.sav` into
-    /// `.savB` and the sequence slots, and `write_save_file_with_mode`
-    /// then renames a header-plus-`<END>` file over the `.sav` itself, so
+    /// still run for it: the backup rotation copies the previous `.sav`
+    /// into the sequence slots and then on to `.savB`, and
+    /// `write_save_file_with_mode` renames a header-plus-`<END>` file
+    /// over the `.sav` itself, so
     /// within `num_seq_files` periods every generation of a real save set
     /// is gone and the next boot restores nothing while reporting
     /// success. Refusing the set here keeps it out of `SaveSet` entirely,
@@ -191,27 +197,17 @@ impl SaveSet {
         Ok(entries)
     }
 
-    /// Perform one save cycle: rotate backups -> collect PV values -> write file.
+    /// Perform one save cycle: collect PV values -> guarantee `.savB` ->
+    /// write `.sav` -> advance `.savB`.
     pub async fn save_once(&self, db: &PvDatabase) -> AutosaveResult<usize> {
         {
             let mut s = self.status.write().await;
             *s = SaveSetStatus::Saving;
         }
 
-        // Rotate backups. A rotation that could not preserve the current
-        // `.sav` aborts the cycle instead of overwriting the generation it
-        // failed to copy, and it lands in the same bookkeeping a failed
-        // write does — an early `?` here left the set stuck in `Saving`
-        // with the error counter untouched.
-        let rotated = {
-            let mut bs = self.backup_state.write().await;
-            rotate_backups(&self.config.save_path, &self.config.backup, &mut bs).await
-        };
-        if let Err(e) = rotated {
-            return Err(self.record_save_failure(e).await);
-        }
-
-        // Collect PV values
+        // Collect PV values. Read before the rotation because the `.savB`
+        // that C writes when the old one is unusable is written from the
+        // values about to be saved, not copied from a file.
         let pv_names = self.pv_names();
         let mut save_entries = Vec::with_capacity(pv_names.len());
 
@@ -243,6 +239,28 @@ impl SaveSet {
 
         let saved_count = save_entries.iter().filter(|e| e.connected).count();
 
+        // Rotate backups. A rotation that could not preserve the current
+        // `.sav`, or could not put a usable `.savB` in place first, aborts
+        // the cycle instead of overwriting the generation it failed to
+        // copy, and it lands in the same bookkeeping a failed write does —
+        // an early `?` here left the set stuck in `Saving` with the error
+        // counter untouched.
+        let rotated = {
+            let mut bs = self.backup_state.write().await;
+            rotate_backups(
+                &self.config.save_path,
+                &self.config.backup,
+                &mut bs,
+                &save_entries,
+                self.compat,
+            )
+            .await
+        };
+        let savb_state = match rotated {
+            Ok(state) => state,
+            Err(e) => return Err(self.record_save_failure(e).await),
+        };
+
         match write_save_file_with_mode(&self.config.save_path, &save_entries, self.compat).await {
             Ok(()) => {
                 self.stats.save_count.fetch_add(1, Ordering::Relaxed);
@@ -251,28 +269,17 @@ impl SaveSet {
                     .store(saved_count as u64, Ordering::Relaxed);
                 let now = chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
                 *self.stats.last_save_time.write().await = Some(now);
-                *self.status.write().await = SaveSetStatus::Idle;
 
-                // M5: seed `.savB` on the FIRST save. `rotate_backups`
-                // runs before the write and early-returns when no
-                // prior `.sav` exists, so on a fresh IOC the very
-                // first cycle leaves only one usable file — a crash
-                // during the 2nd-ever write would have no backup.
-                // Copy the freshly-written `.sav` to `.savB` when the
-                // backup file does not yet exist, so backup depth
-                // matches C autosave (one cycle behind) from the
-                // first save onward.
-                //
-                // Through `publish_copy` like every other backup write, and
-                // non-fatal: the `.sav` is already on disk, and a seed that
-                // did not land simply leaves `.savB` absent for the next
-                // cycle's `rotate_backups` to create.
-                if self.config.backup.enable_savb {
-                    let savb_path = self.config.save_path.with_extension("savB");
-                    if !savb_path.exists() {
-                        let _ = publish_copy(&self.config.save_path, &savb_path).await;
-                    }
+                // The other half of the backup rule: `.savB` follows the
+                // `.sav` that just landed unless the rotation already
+                // wrote this generation into it. C reports a backup it
+                // could not make as a failed cycle even though the `.sav`
+                // is on disk, so the save stats above stand and the cycle
+                // still fails.
+                if let Err(e) = publish_savb(&self.config.save_path, savb_state).await {
+                    return Err(self.record_save_failure(e).await);
                 }
+                *self.status.write().await = SaveSetStatus::Idle;
 
                 Ok(saved_count)
             }
@@ -334,16 +341,21 @@ impl SaveSet {
 pub enum RestoreMode {
     /// Write each PV with `put_pv_no_process` — the value is set but
     /// the record is NOT processed, OUT links do not fire, FLNK
-    /// chains do not run. This is the autosave-rs default and is the
-    /// desired behaviour for the common "restore a setpoint AO at
-    /// boot" case (it avoids a spurious hardware write at startup).
+    /// chains do not run.
     ///
-    /// This is a deliberate divergence from C-autosave's
-    /// `reboot_restore`, which uses `dbPutField` (honours `PP`,
-    /// processes the record, lets PINI/FLNK chains run). Restoring a
-    /// `.VAL` that must ripple to OUT links, or a `.SCAN`/`.DOL`
-    /// that downstream re-evaluation depends on, will NOT propagate
-    /// in this mode — use [`RestoreMode::Process`] for those.
+    /// This is C's behaviour, not a divergence from it: C-autosave
+    /// restores with `dbPut` (`dbrestore.c:299-301`, pass 1) and with
+    /// `dbPutString` / `dbPutMenuIndex` through static database access
+    /// (pass 0) at `R6-0-20-g186f467`. `dbPutField` — the entry point
+    /// that takes the lock, honours `PP` and calls `dbProcess`
+    /// (`dbAccess.c` at `R7.0.10`) — appears nowhere in the module, and
+    /// neither does `dbPutLink`. So a restored `.VAL` does not ripple
+    /// to OUT links in C either, which is also what the common "restore
+    /// a setpoint AO at boot" case wants: no spurious hardware write at
+    /// startup.
+    ///
+    /// [`RestoreMode::Process`] is the port's own extension for the
+    /// cases where restore correctness depends on processing.
     #[default]
     NoProcess,
     /// Write each PV with `put_pv` — the record IS processed after
@@ -385,8 +397,19 @@ pub async fn restore_from_entries_with_mode(
         parse_failed: Vec::new(),
         not_found: Vec::new(),
         disconnected_skipped: Vec::new(),
+        not_connected_at_save: contents.not_connected,
         malformed_lines: contents.malformed,
     };
+    if result.not_connected_at_save > 0 {
+        // C logs this and marks the set WARN
+        // (`dbrestore.c:998-1001`); it aborts only when the site has
+        // cleared `save_restoreIncompleteSetsOk`, which defaults to 1.
+        let n = result.not_connected_at_save;
+        crate::runtime::log::errlog_printf(&format!(
+            "autosave: {n} {} had no saved value.\n",
+            if n == 1 { "PV" } else { "PVs" }
+        ));
+    }
 
     for entry in &contents.entries {
         if !entry.connected {
@@ -430,6 +453,14 @@ pub async fn restore_from_entries_with_mode(
                 result.restored += 1;
             }
             Err(e) => {
+                // Name the record and the status here, at the one site every
+                // restore route reaches. `put_pv_no_process` now adopts the
+                // after-put `special()` status the way C's `dbPut` does
+                // (`dbAccess.c:1398-1404`), so a restore of an unresolvable
+                // SNAM or an illegal CALC FAILS where it used to be accepted
+                // silently — that must not become a silently DROPPED restore.
+                // The iocsh summary prints only a count.
+                eprintln!("autosave restore: {} put failed: {e}", entry.pv_name);
                 result.failed_puts.push(PvRestoreError {
                     pv_name: entry.pv_name.clone(),
                     error: e.to_string(),

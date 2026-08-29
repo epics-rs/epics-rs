@@ -188,7 +188,8 @@ when `postsize == 0xFFFF` (large arrays). See `02-wire-protocol.md`.
 
 ### Error model
 
-`CaError` (`epics-base-rs/src/error.rs`) is the unified result type.
+`CaError` (`crates/epics-base-rs/src/error.rs`) is the unified result
+type.
 Wire-level errors carry an ECA code (61 codes total, see
 `protocol.rs::ECA_*`). `CaError::WriteFailed(eca)` is the common
 "server replied with an ECA error" case.

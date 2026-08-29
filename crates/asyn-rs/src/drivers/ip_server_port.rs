@@ -246,7 +246,7 @@ impl IpServerConfig {
 /// The `closed` half is not advice: [`ClientSlot::read_or_close`] /
 /// [`ClientSlot::write_or_close`] have *already* dropped the socket when it is
 /// set — C decides the teardown and the reported status in one statement
-/// (drvAsynIPPort.c:797-806), so no caller can take the error and forget the
+/// (drvAsynIPPort.c:798-806), so no caller can take the error and forget the
 /// `closeConnection`. What is left to the owner is the disconnect exception
 /// fan-out, which differs by port shape: the parent announces on the client's
 /// `addr`, the child port announces on its own single device and drops its
@@ -280,7 +280,7 @@ impl SlotFailure {
 ///
 /// Each slot is pre-allocated and shared between the parent server
 /// port and an optional [`DrvAsynIPSubport`] (registered as
-/// `parent:N`) — C asyn `drvAsynIPServerPort.c:681-708` does the
+/// `parent:N`) — C asyn `drvAsynIPServerPort.c:682-708` does the
 /// same, creating `maxClients` child asyn ports up-front so external
 /// device support can address a specific client by port name.
 pub struct ClientSlot {
@@ -293,8 +293,8 @@ pub struct ClientSlot {
     ///
     /// C reaches the same invariant by message: on slot reuse the listener sets
     /// `pl->fd = clientFd` and calls `pasynCommonSyncIO->connectDevice(pl->pasynUser)`
-    /// on the child (drvAsynIPServerPort.c:357-367), and it is the child's own
-    /// `isConnected` that the listener's free-slot scan then reads (:342-350).
+    /// on the child (drvAsynIPServerPort.c:358-360), and it is the child's own
+    /// `isConnected` that the listener's free-slot scan then reads (:343-350).
     /// Assignment and connectivity are not allowed to disagree in C either.
     occupied: Arc<AtomicBool>,
     /// C `tty->disconnectOnReadTimeout` on this slot's child port
@@ -339,10 +339,10 @@ impl ClientSlot {
     /// The one point at which a socket becomes a slot socket, so it is where
     /// the socket takes the mode this crate owns ([`OWNED_NONBLOCKING`]).
     /// C reaches the same mode by the same single point: the accept hands the
-    /// fd to a full `drvAsynIPPort` child (drvAsynIPServerPort.c:369-371 sets
+    /// fd to a full `drvAsynIPPort` child (drvAsynIPServerPort.c:358-360 sets
     /// `pasynUser->reason = clientFd` and calls `connectDevice`), whose
-    /// `connectIt` takes the fd from `reason` (drvAsynIPPort.c:434-436) and
-    /// then runs `setNonBlock(fd, 1)` under USE_POLL (:510-517) — the same
+    /// `connectIt` takes the fd from `reason` (drvAsynIPPort.c:435-436) and
+    /// then runs `setNonBlock(fd, 1)` under USE_POLL (:535-543) — the same
     /// statement the client path runs, ahead of the branch that connects. A
     /// served connection is therefore non-blocking on every target that is not
     /// RTEMS (`USE_SOCKTIMEOUT` is `#if defined(__rtems__)`, :71-72), with both
@@ -354,7 +354,7 @@ impl ClientSlot {
     /// slot socket was the one socket in the driver left blocking, and `send`'s
     /// `MSG_DONTWAIT` was the only thing holding a slot write out of a park — a
     /// flag Darwin's `sosend` does not consult
-    /// (`doc/darwin-send-dontwait-gap.md`), so a write to a peer that had
+    /// so a write to a peer that had
     /// stopped reading outlived its deadline there and took the parent
     /// broadcast with it.
     ///
@@ -363,7 +363,7 @@ impl ClientSlot {
     /// listener is non-blocking because the poll loop needs it to be.
     ///
     /// A failure drops the stream on the way out, which is C's
-    /// `epicsSocketDestroy(fd)` on the same failure (drvAsynIPPort.c:511-516).
+    /// `epicsSocketDestroy(fd)` on the same failure (drvAsynIPPort.c:536-542).
     fn assign(&self, stream: TcpStream, peer: SocketAddr) -> AsynResult<()> {
         stream
             .set_nonblocking(OWNED_NONBLOCKING)
@@ -397,10 +397,10 @@ impl ClientSlot {
     /// ([`DrvAsynIPSubport::read_octet`]).
     ///
     /// C serves each accepted connection with a full `drvAsynIPPort` child
-    /// (drvAsynIPServerPort.c:681-708), so the read that runs is
+    /// (drvAsynIPServerPort.c:682-708), so the read that runs is
     /// `drvAsynIPPort`'s `readIt`: it calls `closeConnection` on a TCP EOF
     /// (:815-820) **and** on every errno that is not `EWOULDBLOCK`/`EINTR`
-    /// (:797-806), and `closeConnection` destroys the socket and issues
+    /// (:798-806), and `closeConnection` destroys the socket and issues
     /// `exceptionDisconnect` (:206-217).
     ///
     /// That teardown is what frees the slot: the listener reuses a slot exactly
@@ -412,10 +412,10 @@ impl ClientSlot {
     fn read_or_close(
         &self,
         buf: &mut [u8],
-        timeout: Duration,
+        timeout: Option<Duration>,
         device: &str,
     ) -> Result<usize, SlotFailure> {
-        // C readRaw (drvAsynIPPort.c:736-740): reject maxchars == 0 before
+        // C readIt (drvAsynIPPort.c:736-740): reject maxchars == 0 before
         // touching the socket; an empty buffer would otherwise read Ok(0) and be
         // misclassified as a peer EOF, tearing down a healthy connection.
         if buf.is_empty() {
@@ -429,7 +429,7 @@ impl ClientSlot {
             }));
         };
         // C parity: the child `drvAsynIPPort`'s `readIt` floors a zero request
-        // timeout to a 1 ms poll (drvAsynIPPort.c:775-777) and re-applies it on
+        // timeout to a 1 ms poll (drvAsynIPPort.c:741-743) and re-applies it on
         // every read. `socket_poll_timeout` is the shared owner of that mapping;
         // arming it unconditionally (rather than skipping on `timeout == 0`)
         // keeps a poll request a 1 ms poll instead of blocking on the accept-time
@@ -437,14 +437,14 @@ impl ClientSlot {
         //
         // Through `BoundNextRead`, not `SO_RCVTIMEO`: the slot socket is in the
         // mode this crate owns ([`OWNED_NONBLOCKING`]), which is C's
-        // `setNonBlock(fd, 1)` under USE_POLL (drvAsynIPPort.c:510-517), and on
+        // `setNonBlock(fd, 1)` under USE_POLL (drvAsynIPPort.c:535-543), and on
         // a non-blocking socket the option governs nothing. `BoundNextRead` is
         // the same POLLIN wait the client port uses and the same one C's
-        // `readIt` uses (:792-806) — one bound for both drivers, on whichever
+        // `readIt` uses (:758-774) — one bound for both drivers, on whichever
         // mechanism the platform's mode makes real.
         //
         // It also keeps C's fall-through: a failed bound taints nothing and the
-        // read below still runs (C `readRaw` records a failed
+        // read below still runs (C `readIt` records a failed
         // setsockopt(SO_RCVTIMEO) and recv()s anyway, :744-756 then :791), which
         // is load-bearing on macOS — setsockopt(SO_RCVTIMEO) returns EINVAL on a
         // socket whose peer sent RST, and returning early there skipped the recv
@@ -475,7 +475,7 @@ impl ClientSlot {
     /// broadcast writes and the child port's.
     /// Bounded by `timeout` through [`write_with_retry`] — the same owner the
     /// client port writes through, so the accepted-byte count rides out on the
-    /// failure as C's `*nbytesTransfered` (drvAsynIPPort.c:718-733). This used
+    /// failure as C's `*nbytesTransfered` (drvAsynIPPort.c:678-699). This used
     /// to be a bare `write_all`, which parks forever against a peer that has
     /// stopped reading: no `asynTimeout`, no record alarm, and a parent
     /// broadcast wedged on whichever slot went silent first.
@@ -485,16 +485,18 @@ impl ClientSlot {
     /// twin already holds it for its own timeout, and the hold is now bounded
     /// by the caller's deadline — where before it had no bound at all.
     ///
-    /// Takes the caller's `deadline`, not a `Duration`, because the broadcast
-    /// write fans one `pasynUser->timeout` out over every occupied slot: a
-    /// per-slot `Instant::now() + timeout` would let N silent peers stretch a
-    /// TMOT of 1.0 into N seconds of PACT=1 with the port queue behind it.
-    /// The budget belongs to the call, so the instant it expires is computed
-    /// once by whoever owns that call and cannot be restarted here.
+    /// `poll` is C's per-wait bound, re-armed on every pass inside
+    /// [`write_with_retry`]; `cap` is the optional budget for the whole call,
+    /// which the broadcast owns and an addressed write does not. The broadcast
+    /// fans one `pasynUser->timeout` out over every occupied slot, so a
+    /// per-slot restart of the clock would let N silent peers stretch a TMOT of
+    /// 1.0 into N seconds of PACT=1 with the port queue behind it: that budget
+    /// belongs to the call and is computed once by whoever owns it.
     fn write_or_close(
         &self,
         data: &[u8],
-        deadline: Instant,
+        poll: Option<Duration>,
+        cap: Option<Instant>,
         device: &str,
     ) -> Result<usize, SlotFailure> {
         let mut guard = self.stream.lock();
@@ -504,7 +506,7 @@ impl ClientSlot {
                 message: format!("{device} has no client"),
             }));
         };
-        let res = write_with_retry(&*stream, data, deadline);
+        let res = write_with_retry(&*stream, data, poll, cap);
         // `clear()` re-locks the stream, so the write guard must go first.
         drop(guard);
         match res {
@@ -514,7 +516,7 @@ impl ClientSlot {
     }
 
     /// C's `should_disconnect` for a failed *read* on a slot, both disjuncts
-    /// (drvAsynIPPort.c:797-799):
+    /// (drvAsynIPPort.c:799-800):
     ///
     /// ```c
     /// int should_disconnect = (((tty->disconnectOnReadTimeout) && (pasynUser->timeout > 0)) ||
@@ -536,10 +538,13 @@ impl ClientSlot {
         &self,
         e: std::io::Error,
         device: &str,
-        timeout: Duration,
+        timeout: Option<Duration>,
     ) -> SlotFailure {
+        // C's sign test: `(tty->disconnectOnReadTimeout) && (pasynUser->timeout
+        // > 0)` (drvAsynIPPort.c:799). `None` is C's negative timeout and is
+        // not `> 0`, so a forever-wait keeps its slot.
         if is_nonfatal_read_timeout(e.kind())
-            && !(self.disconnect_on_read_timeout() && timeout > Duration::ZERO)
+            && !(self.disconnect_on_read_timeout() && timeout.is_some_and(|t| t > Duration::ZERO))
         {
             return SlotFailure::kept(AsynError::Status {
                 status: AsynStatus::Timeout,
@@ -650,7 +655,7 @@ struct Acceptor {
 
 impl Acceptor {
     /// Copy the parent's trace masks onto the child port that just took a
-    /// connection — C `drvAsynIPServerPort.c:367-369`.
+    /// connection — C `drvAsynIPServerPort.c:370-371`.
     fn seed_child_trace(&self, child: &str) {
         let Some(trace) = &self.trace else { return };
         trace.set_trace_mask(Some(child), trace.get_trace_mask(Some(&self.port_name)));
@@ -719,7 +724,7 @@ impl Acceptor {
                     InterruptValue {
                         reason: 0,
                         addr: i as i32,
-                        value: ParamValue::Octet(child),
+                        value: ParamValue::Octet(child.into_bytes()),
                         timestamp: SystemTime::now(),
                         iface: Some(InterfaceType::Octet),
                         ..Default::default()
@@ -785,7 +790,7 @@ pub struct DrvAsynIPServerPort {
     /// lifetime of the server port, so child subports (registered
     /// `parent:N`, see [`Self::make_subport`]) can hold an Arc to
     /// their slot for the long term — mirrors C
-    /// `drvAsynIPServerPort.c:681-708` pre-creating child ports.
+    /// `drvAsynIPServerPort.c:682-708` pre-creating child ports.
     /// Unused in UDP mode.
     slots: Vec<Arc<ClientSlot>>,
 
@@ -875,9 +880,23 @@ impl DrvAsynIPServerPort {
             port_name,
             max,
             PortFlags {
-                multi_device: true,
+                // Single-device, like C: the listener registers plain
+                // `ASYN_CANBLOCK` (drvAsynIPServerPort.c:625-626) and its whole
+                // asynOctet method table is NULL (:118-122) — it is an interrupt
+                // source, not an I/O port. The per-client ports are separate
+                // single-device `drvAsynIPPortConfigure`d registrations
+                // (:688-694), which `make_subport` mirrors.
+                //
+                // This flag is the framework's device model, not this driver's
+                // slot table: `is_device_addr` and `device()` consult it to
+                // decide whether C's `findDpCommon` would resolve to a device's
+                // own `dpCommon` or the port's (asynManager.c:536-544), and
+                // `asynReport` prints it verbatim (:1042-1046). Slot selection
+                // from `user.addr` and the per-slot `announce_exception` fan-out
+                // are ours and read the addr directly, so neither depends on it.
+                multi_device: false,
                 can_block: true,
-                destructible: true,
+                ..PortFlags::default()
             },
         );
         base.init_connected(false);
@@ -927,7 +946,7 @@ impl DrvAsynIPServerPort {
     /// accepting on it" true by construction — in C the two are equally
     /// inseparable, `drvAsynIPServerPortConfigure` creating the socket and
     /// starting `connectionListener` in the same breath
-    /// (drvAsynIPServerPort.c:640-714). The port used to bind and then never
+    /// (drvAsynIPServerPort.c:605-714). The port used to bind and then never
     /// accept: a client sat in the backlog until it timed out while the port
     /// reported Connected.
     fn start_accept_loop(&mut self, listener: &TcpListener) -> AsynResult<()> {
@@ -1084,13 +1103,17 @@ impl DrvAsynIPServerPort {
         // Unconditional SO_REUSEADDR and no SO_REUSEPORT
         // (drvAsynIPServerPort.c:430) — that is `SocketOptions::REUSE_ADDRESS`.
         //
-        // Backlog independent of `max_clients` — the slot cap bounds
-        // *concurrent* accepted clients, not the kernel's pending-
-        // connection queue. A small backlog (= max_clients) caused
-        // third-party connect() to block in tests when 2 prior
-        // connections were already queued. 128 mirrors the typical
-        // SOMAXCONN on Linux/macOS while staying portable.
-        socket::tcp_listener(addr, socket::SocketOptions::REUSE_ADDRESS, 128).map_err(|e| {
+        // Backlog is `max_clients`, as C passes it (`listen(tty->fd,
+        // tty->maxClients)`, drvAsynIPServerPort.c:447). The two agree on how
+        // many clients are served; they differ only in what the connect beyond
+        // the cap sees on the wire. With C's queue depth the surplus SYN is
+        // dropped and the peer retries to its own timeout; with a deep backlog
+        // the handshake completes and the accept loop closes the connection,
+        // which an instrument that reconnects on EOF reads as a live server
+        // hanging up. `max_clients` is rejected at zero (`with_config`), so the
+        // backlog is always at least one (DRV-21).
+        let backlog = i32::try_from(self.config.max_clients).unwrap_or(i32::MAX);
+        socket::tcp_listener(addr, socket::SocketOptions::REUSE_ADDRESS, backlog).map_err(|e| {
             AsynError::Status {
                 status: AsynStatus::Error,
                 message: format!("bind '{addr}' failed: {e}"),
@@ -1206,7 +1229,7 @@ impl PortDriver for DrvAsynIPServerPort {
     }
 
     /// C drvAsynIPServerPort registers asynCommon and asynOctet, plus asynInt32
-    /// only when the socket is not SOCK_DGRAM (drvAsynIPServerPort.c:621-661) —
+    /// only when the socket is not SOCK_DGRAM (drvAsynIPServerPort.c:622-664) —
     /// the Int32 interface carries the per-connection file descriptor. It
     /// registers no asynOption.
     fn capabilities(&self) -> Vec<crate::interfaces::Capability> {
@@ -1323,15 +1346,20 @@ impl PortDriver for DrvAsynIPServerPort {
             // Broadcast: send to every connected slot. Errors per
             // slot are logged but never abort the broadcast — a dead
             // peer mustn't take out the rest.
-            // One deadline for the whole broadcast: the caller stated a single
-            // budget for the operation, so slot N+1 inherits what slot N left
-            // of it rather than starting the clock again.
-            let deadline = Instant::now() + user.timeout;
+            // One budget for the whole broadcast: the caller stated a single
+            // timeout for the operation, so slot N+1 inherits what slot N left
+            // of it rather than starting the clock again. Within a slot the
+            // wait is still C's per-pass `writePollmsec`, whichever expires
+            // first.
+            let poll = socket_poll_timeout(user.timeout);
+            // A caller that asked to wait forever gets no budget either — its
+            // slots are bounded by nothing, exactly as C's negative timeout is.
+            let cap = user.timeout.map(|t| Instant::now() + t);
             for (i, slot) in self.slots.iter().enumerate() {
                 if !slot.is_occupied() {
                     continue;
                 }
-                if let Err(f) = self.write_to_slot(slot, i as i32, data, deadline) {
+                if let Err(f) = self.write_to_slot(slot, i as i32, data, poll, cap) {
                     tracing::debug!(
                         target: "asyn_rs::ip_server_port",
                         addr = i,
@@ -1351,7 +1379,15 @@ impl PortDriver for DrvAsynIPServerPort {
             return Ok(data.len());
         }
         let arc = self.slot_arc(user.addr)?;
-        match self.write_to_slot(&arc, user.addr, data, Instant::now() + user.timeout) {
+        // An addressed write is one client's transfer and C bounds only its
+        // individual `poll(POLLOUT)`, so there is no outer budget here.
+        match self.write_to_slot(
+            &arc,
+            user.addr,
+            data,
+            socket_poll_timeout(user.timeout),
+            None,
+        ) {
             Ok(n) => Ok(n),
             Err(f) => Err(self.finish_slot_failure(user.addr, f)),
         }
@@ -1431,9 +1467,10 @@ impl DrvAsynIPServerPort {
         slot: &ClientSlot,
         addr: i32,
         data: &[u8],
-        deadline: Instant,
+        poll: Option<Duration>,
+        cap: Option<Instant>,
     ) -> Result<usize, SlotFailure> {
-        slot.write_or_close(data, deadline, &self.slot_device_name(addr))
+        slot.write_or_close(data, poll, cap, &self.slot_device_name(addr))
     }
 
     /// UDP-mode read: copy at most `buf.len()` bytes from the cache,
@@ -1548,7 +1585,7 @@ fn udp_recv_loop(
                 // TCP announcement at :372-383). A datagram is a whole message,
                 // so C passes ASYN_EOM_END; InterruptValue carries no eom
                 // because no consumer reads one (C's own octet consumer,
-                // devAsynOctet.c:476-478, ignores the eomReason argument).
+                // devAsynOctet.c:477-478, ignores the eomReason argument).
                 //
                 // Fired with the cache lock released: a subscriber's callback
                 // runs inline here, and a callback that reads the port back
@@ -1558,7 +1595,7 @@ fn udp_recv_loop(
                     InterruptValue {
                         reason: 0,
                         addr: 0,
-                        value: ParamValue::Octet(String::from_utf8_lossy(&buf[..n]).into_owned()),
+                        value: ParamValue::Octet(buf[..n].to_vec()),
                         timestamp: SystemTime::now(),
                         iface: Some(InterfaceType::Octet),
                         ..Default::default()
@@ -1599,7 +1636,7 @@ fn udp_recv_loop(
 /// of a [`DrvAsynIPServerPort`] as its own asyn port.
 ///
 /// Mirrors C asyn's `drvAsynIPServerPortConfigure` child port model
-/// (`drvAsynIPServerPort.c:681-708`): the parent server port
+/// (`drvAsynIPServerPort.c:682-708`): the parent server port
 /// pre-creates `maxClients` child asyn ports named `parent:0`,
 /// `parent:1`, … so external device support can target a specific
 /// client by port name. Each child shares a [`ClientSlot`] handle
@@ -1624,7 +1661,7 @@ impl DrvAsynIPSubport {
             PortFlags {
                 multi_device: false,
                 can_block: true,
-                destructible: true,
+                ..PortFlags::default()
             },
         );
         // The child does not own its link — the slot does, and the parent's accept
@@ -1633,7 +1670,7 @@ impl DrvAsynIPSubport {
         // a reused slot cannot leave the child stuck at `asynDisconnected`
         // (R13-50). C keeps the same two facts in agreement by having the listener
         // call `connectDevice` on the child the moment it hands it the socket
-        // (drvAsynIPServerPort.c:357-367).
+        // (drvAsynIPServerPort.c:358-360).
         base.share_connection(slot.connection_cell());
         // C's child IS a `drvAsynIPPortConfigure`d port — the listener creates it
         // with exactly that call (drvAsynIPServerPort.c:688-694), passing
@@ -1694,7 +1731,7 @@ impl PortDriver for DrvAsynIPSubport {
         // The child has no link of its own to dial: its socket is the slot's, and
         // the parent's accept loop is what puts one there. C's child `connectIt`
         // is likewise driven by the listener (`connectDevice`,
-        // drvAsynIPServerPort.c:357-367) and does no dialling either. So this
+        // drvAsynIPServerPort.c:358-360) and does no dialling either. So this
         // publishes the slot's state — it cannot change it.
         self.base.sync_connection_edge();
         if !self.base.is_connected() {
@@ -1710,7 +1747,7 @@ impl PortDriver for DrvAsynIPSubport {
     /// `asynSetOption("<parent>:<n>", 0, "disconnectOnReadTimeout", "Y")` lands in
     /// `drvAsynIPPort::setOption` (:924-935), which accepts only `"Y"`/`"N"`
     /// (case-insensitive) and errors on anything else. The option then arms the
-    /// first disjunct of `readIt`'s `should_disconnect` (:797-799) — see
+    /// first disjunct of `readIt`'s `should_disconnect` (:799-800) — see
     /// `ClientSlot::classify_read_error`.
     ///
     /// The other key C's `setOption` takes, `hostInfo`, re-dials an outbound
@@ -1727,7 +1764,7 @@ impl PortDriver for DrvAsynIPSubport {
 
     fn get_option(&self, key: &str) -> AsynResult<String> {
         if key.eq_ignore_ascii_case("disconnectOnReadTimeout") {
-            // C prints the flag as "Y"/"N" (drvAsynIPPort.c:906-910).
+            // C prints the flag as "Y"/"N" (drvAsynIPPort.c:896-898).
             return Ok(if self.slot.disconnect_on_read_timeout() {
                 "Y".to_string()
             } else {
@@ -1762,7 +1799,7 @@ impl PortDriver for DrvAsynIPSubport {
         let device = self.base.port_name.clone();
         match self
             .slot
-            .write_or_close(data, Instant::now() + user.timeout, &device)
+            .write_or_close(data, socket_poll_timeout(user.timeout), None, &device)
         {
             Ok(n) => Ok(n),
             Err(f) => Err(self.finish_slot_failure(f)),
@@ -1839,7 +1876,7 @@ mod tests {
             match res {
                 Ok(n) => panic!("a reset peer cannot deliver {n} bytes"),
                 // A retryable asynTimeout means the RST is not yet visible and the
-                // socket is still intact (C readRaw :807-811). Never teardown.
+                // socket is still intact (C readIt :807-811). Never teardown.
                 Err(e) if e.status() == AsynStatus::Timeout => {}
                 // Any other status is C's teardown — fatal-errno asynError, or a
                 // recv()==0 EOF asynDisconnected. `read_or_close` clears the slot
@@ -2103,8 +2140,8 @@ mod tests {
     /// R11-C9: a client whose socket dies mid-read must lose its slot.
     ///
     /// C serves each accepted connection with a full `drvAsynIPPort` child
-    /// (drvAsynIPServerPort.c:681-708), whose `readIt` calls `closeConnection` on
-    /// *any* errno outside `EWOULDBLOCK`/`EINTR` (drvAsynIPPort.c:797-806), not
+    /// (drvAsynIPServerPort.c:682-708), whose `readIt` calls `closeConnection` on
+    /// *any* errno outside `EWOULDBLOCK`/`EINTR` (drvAsynIPPort.c:798-806), not
     /// just on EOF — and `closeConnection`'s `exceptionDisconnect` (:216) is
     /// exactly what makes the listener's `isConnected` scan hand the slot to the
     /// next client (drvAsynIPServerPort.c:344-350).
@@ -2176,7 +2213,7 @@ mod tests {
     /// (drvAsynIPServerPort.c:690), so `asynSetOption("<parent>:<n>", 0,
     /// "disconnectOnReadTimeout", "Y")` reaches `drvAsynIPPort::setOption`
     /// (:924-935) and arms the *first* disjunct of `readIt`'s `should_disconnect`
-    /// (:797-799): a read that merely times out closes the connection. The port
+    /// (:799-800): a read that merely times out closes the connection. The port
     /// modelled only the second (fatal-errno) disjunct, so a silent peer held its
     /// slot forever and the server could not reclaim it.
     ///
@@ -2217,17 +2254,17 @@ mod tests {
         assert_eq!(err.status(), AsynStatus::Timeout, "got {err:?}");
         assert!(
             srv.slots[0].is_occupied(),
-            "a zero-timeout poll is not a read timeout C tears down on (:797)"
+            "a zero-timeout poll is not a read timeout C tears down on (:799)"
         );
 
         // …but a real timed read now closes the connection, and C reports that
-        // branch as asynError, never as a retryable asynTimeout (:801-805).
+        // branch as asynError, never as a retryable asynTimeout (:801-806).
         let err = child.read_octet(&user, &mut buf).unwrap_err();
         assert_eq!(err.status(), AsynStatus::Error, "got {err:?}");
         assert!(
             !srv.slots[0].is_occupied(),
             "disconnectOnReadTimeout=Y frees the slot on a read timeout \
-             (drvAsynIPPort.c:797-799, first disjunct)"
+             (drvAsynIPPort.c:799-800, first disjunct)"
         );
         assert!(!child.base().is_connected());
 
@@ -2246,9 +2283,9 @@ mod tests {
     /// C's listener does it explicitly: when the free-slot scan hands slot `i` to
     /// a new client it sets `pl->fd = clientFd` and calls
     /// `pasynCommonSyncIO->connectDevice(pl->pasynUser)` on the child port
-    /// (drvAsynIPServerPort.c:357-367), which drives the child's `connectIt` and
+    /// (drvAsynIPServerPort.c:358-360), which drives the child's `connectIt` and
     /// its `exceptionConnect`. It has to: the child's own `isConnected` is what
-    /// the *next* free-slot scan reads (:342-350), so C cannot leave a child
+    /// the *next* free-slot scan reads (:343-350), so C cannot leave a child
     /// disconnected while its slot holds a live socket.
     ///
     /// The port cached the child's `connected` in its own `PortDriverBase`, which
@@ -2269,7 +2306,7 @@ mod tests {
         let mut child = srv.make_subport(0).unwrap();
 
         // First client, killed with an RST so the read tears the slot down through
-        // the fatal-errno path (C drvAsynIPPort.c:797-806).
+        // the fatal-errno path (C drvAsynIPPort.c:798-806).
         let addr: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
         let victim = Socket::new(Domain::IPV4, Type::STREAM, None).unwrap();
         victim.connect(&addr.into()).unwrap();
@@ -2319,7 +2356,7 @@ mod tests {
         assert!(
             child.base().is_connected(),
             "a reused slot revives the child: C calls connectDevice on it \
-             (drvAsynIPServerPort.c:357-367)"
+             (drvAsynIPServerPort.c:358-360)"
         );
 
         // …and the revival is real I/O, not just a flag: the child must talk to the
@@ -2387,7 +2424,10 @@ mod tests {
             InterruptFilter::default(),
             move |iv: &InterruptValue| {
                 if let ParamValue::Octet(s) = &iv.value {
-                    seen_cb.lock().unwrap().push(s.clone());
+                    seen_cb
+                        .lock()
+                        .unwrap()
+                        .push(String::from_utf8_lossy(s).into_owned());
                 }
             },
         );
@@ -2423,7 +2463,7 @@ mod tests {
     /// R19-109 boundary: the new-connection announcement reaches EVERY octet
     /// interrupt user, whatever addr it registered on.
     ///
-    /// C `connectionListener` (drvAsynIPServerPort.c:372-383) walks the octet
+    /// C `connectionListener` (drvAsynIPServerPort.c:374-383) walks the octet
     /// interrupt list and calls every node with the child port's name — there
     /// is no addr test, unlike `asynOctetBase.c:203-215`. The boundary is
     /// "announcement addr == subscriber addr" (slot 0) vs "announcement addr !=
@@ -2457,7 +2497,10 @@ mod tests {
             },
             move |iv: &InterruptValue| {
                 if let ParamValue::Octet(s) = &iv.value {
-                    seen_cb.lock().unwrap().push(s.clone());
+                    seen_cb
+                        .lock()
+                        .unwrap()
+                        .push(String::from_utf8_lossy(s).into_owned());
                 }
             },
         );
@@ -2480,7 +2523,7 @@ mod tests {
     /// R19-121 boundary: a child port inherits the parent's trace masks at the
     /// accept, and only at the accept.
     ///
-    /// C `drvAsynIPServerPort.c:367-369` copies both masks onto the child when
+    /// C `drvAsynIPServerPort.c:369-371` copies both masks onto the child when
     /// the connection lands — *"Set the new port to initially have the same
     /// trace mask that we have"*. The two boundaries: a mask set on the parent
     /// BEFORE the client connects (the st.cmd case: `asynSetTraceMask SERVER -1
@@ -2558,7 +2601,7 @@ mod tests {
     /// R19-110 boundary: a datagram fans out to every octet interrupt user,
     /// with no consumer polling `read_octet`.
     ///
-    /// C's UDP branch (drvAsynIPServerPort.c:309-322) calls every registered
+    /// C's UDP branch (drvAsynIPServerPort.c:311-320) calls every registered
     /// octet callback with the payload straight from `recvfrom` — that is the
     /// only delivery path a UDP server port has for an I/O-Intr scanned record.
     /// The boundary that matters is the same one as R19-109: the subscriber's
@@ -2588,7 +2631,10 @@ mod tests {
             },
             move |iv: &InterruptValue| {
                 if let ParamValue::Octet(s) = &iv.value {
-                    seen_cb.lock().unwrap().push(s.clone());
+                    seen_cb
+                        .lock()
+                        .unwrap()
+                        .push(String::from_utf8_lossy(s).into_owned());
                 }
             },
         );
@@ -2925,7 +2971,11 @@ mod tests {
 
         // Server side: the listener thread accepts; read, write reply.
         wait_for_slot(&srv, 0);
-        let mut user = AsynUser::new(0).with_timeout(Duration::from_secs(2));
+        // Slot 0 explicitly: this port is multi-device, so a defaulted user is
+        // port-level (addr -1) and addresses no single client.
+        let mut user = AsynUser::new(0)
+            .with_addr(0)
+            .with_timeout(Duration::from_secs(2));
         let mut buf = [0u8; 32];
         let n = srv.read_octet(&user, &mut buf).unwrap();
         assert_eq!(&buf[..n], b"hello-server");
@@ -3128,7 +3178,7 @@ mod tests {
     /// Subport shares the slot with the parent: parent.accept_one
     /// fills slot 0, subport's connect() then succeeds and its
     /// read_octet/write_octet operate on the same TCP stream as the
-    /// parent's addr=0 path. Mirrors C drvAsynIPServerPort.c:357-360
+    /// parent's addr=0 path. Mirrors C drvAsynIPServerPort.c:358-360
     /// where the parent assigns the FD to the child port and triggers
     /// its connectDevice.
     #[test]
@@ -3220,58 +3270,135 @@ mod tests {
         );
     }
 
+    /// Ask for the smallest socket buffer the kernel will give, and stop it
+    /// growing again.
+    ///
+    /// The size is a request, not a setting — every kernel clamps it to its own
+    /// minimum. What the call is really for is the side effect both `SO_SNDBUF`
+    /// and `SO_RCVBUF` share: an explicit size turns auto-tuning off, so the
+    /// window a [`fill_until_refused`] measured stays the window.
+    #[cfg(unix)]
+    fn pin_buffer(fd: std::os::fd::RawFd, opt: libc::c_int) {
+        let size: libc::c_int = 1;
+        // SAFETY: `opt` is a `SOL_SOCKET` size option taking the `c_int` passed
+        // here; the kernel clamps upward to its own minimum.
+        unsafe {
+            libc::setsockopt(
+                fd,
+                libc::SOL_SOCKET,
+                opt,
+                std::ptr::addr_of!(size).cast(),
+                std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+            );
+        }
+    }
+
+    /// Write to `sock` until the kernel refuses, leaving it stalled.
+    ///
+    /// Both slot-write tests below need a peer whose pipe cannot take another
+    /// byte, and they used to infer one from a size — a fixed 1 MiB payload
+    /// against buffers pinned to the minimum, later the measured capacity of a
+    /// throwaway connection. Neither inference holds: how much a "minimum"
+    /// buffer accepts is the kernel's own business, and on Darwin it is not
+    /// even the same answer for two sockets set up the same way. The fixed
+    /// 1 MiB fitted, and so did four times a sibling socket's measured
+    /// capacity — the slot write returned in 156 µs against the 200 ms
+    /// deadline it was supposed to spend.
+    ///
+    /// "Until this socket says `WouldBlock`" needs no size and is the same
+    /// statement on every kernel, so both tests stall the socket they are
+    /// about to write to and none of them names a byte count.
+    #[cfg(unix)]
+    fn fill_until_refused(sock: &TcpStream) {
+        use std::io::Write;
+
+        sock.set_nonblocking(true)
+            .expect("nonblocking for the fill");
+        let block = vec![0xa5u8; 64 * 1024];
+        let mut total = 0usize;
+        // Only a runaway guard: 256 MiB is far past any socket buffer, and a
+        // kernel that never refused would otherwise hang the suite.
+        while total < 256 << 20 {
+            let taken = match (&*sock).write(&block) {
+                Ok(n) => n,
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                // A socket that will not take another byte is refusing, which
+                // is the condition this function exists to find. `Ok(0)` says
+                // the same thing without an error, so both leave the same way.
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => 0,
+                Err(e) => panic!("filling the pipe failed: {e}"),
+            };
+            if taken == 0 {
+                assert!(total > 0, "the socket refused the very first byte");
+                return;
+            }
+            total += taken;
+        }
+        panic!("the socket accepted {total} bytes without ever refusing");
+    }
+
     /// F1 regression: a slot write against a peer that has stopped reading.
     ///
-    /// Both socket buffers are pinned to the kernel minimum, so a 1 MiB
-    /// payload cannot fit in the pipe and the write must genuinely block —
-    /// the condition a sleep can only approximate. Before the bound, this
+    /// The pipe is stalled before the slot ever sees it, so no size decides
+    /// whether this test measures anything: the socket the slot writes to is
+    /// the socket that was filled until it refused. Before the bound, this
     /// wedged the calling actor forever, taking a parent broadcast with it.
+    ///
+    /// The bound under test is the caller budget, because it is the only one
+    /// that bounds a whole transfer. C's per-pass `writePollmsec` is re-armed
+    /// every pass (DRV-58, and deliberately reproduced), so a peer that keeps
+    /// taking bytes never times out however slowly it takes them — and "a peer
+    /// that has stopped reading" is not the same thing as "a peer that has
+    /// stopped accepting". Darwin proves the gap: with both buffers pinned to
+    /// the minimum, a filled pipe still trickles, each pass costs its whole
+    /// 200 ms in `poll` and then accepts a few bytes, the cumulative
+    /// `retry_since` bound never arms because no `send` ever refuses, and this
+    /// write ran past 30 s (macos-arm64, measured 2026-08-29). The budget the
+    /// server port states for a broadcast is what stops that, and this is the
+    /// slot path that carries it.
+    ///
+    /// The accepted-count half is not asserted here. A real socket cannot be
+    /// brought to "full, but with room for a known partial write" on every
+    /// kernel — Linux reports zero accepted, Darwin some — so
+    /// `a_caller_budget_still_caps_a_progressing_transfer` pins a non-zero
+    /// count against a stream whose acceptance this process decides.
     #[cfg(unix)]
     #[test]
-    fn a_slot_write_to_a_peer_that_never_reads_expires_and_reports_what_it_sent() {
+    fn a_slot_write_to_a_peer_that_never_reads_expires_without_closing_the_slot() {
         use std::os::fd::AsRawFd;
 
-        fn pin_buffer(fd: std::os::fd::RawFd, opt: libc::c_int) {
-            let size: libc::c_int = 1;
-            // SAFETY: `opt` is a `SOL_SOCKET` size option taking the `c_int`
-            // passed here; the kernel clamps upward to its own minimum.
-            unsafe {
-                libc::setsockopt(
-                    fd,
-                    libc::SOL_SOCKET,
-                    opt,
-                    std::ptr::addr_of!(size).cast(),
-                    std::mem::size_of::<libc::c_int>() as libc::socklen_t,
-                );
-            }
-        }
-
-        const PAYLOAD: usize = 1 << 20;
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
         pin_buffer(client.as_raw_fd(), libc::SO_RCVBUF);
         let (server_side, peer) = listener.accept().unwrap();
         pin_buffer(server_side.as_raw_fd(), libc::SO_SNDBUF);
 
+        // `client` is never read from, so nothing reopens the window inside
+        // the deadline and the payload only has to be non-empty.
+        fill_until_refused(&server_side);
+        const PAYLOAD: usize = 64 << 10;
+        let payload = vec![0x5au8; PAYLOAD];
+
         let slot = Arc::new(ClientSlot::new_empty());
         slot.assign(server_side, peer).unwrap();
 
         // The wait runs on its own thread and reports through a channel, so an
         // unbounded write fails this test in seconds instead of hanging it.
+        const TMOT: Duration = Duration::from_millis(200);
         let writer = Arc::clone(&slot);
         let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let started = Instant::now();
+        let cap = started + TMOT;
         std::thread::spawn(move || {
-            let started = Instant::now();
-            let res = writer.write_or_close(
-                &vec![0x5a; PAYLOAD],
-                Instant::now() + Duration::from_millis(200),
-                "srv:0",
-            );
+            let res = writer.write_or_close(&payload, Some(TMOT), Some(cap), "srv:0");
             let _ = done_tx.send((started.elapsed(), res));
         });
 
+        // Wider than the bound by two orders of magnitude, so a write that is
+        // merely slow reports the number it took instead of being
+        // indistinguishable from one that never returns.
         let (elapsed, res) = done_rx
-            .recv_timeout(Duration::from_secs(5))
+            .recv_timeout(Duration::from_secs(30))
             .expect("the slot write never returned: it is running with no deadline");
         // Held until here so the peer stays connected and silent for the whole
         // write; dropping it earlier would end the write as a reset instead.
@@ -3287,10 +3414,21 @@ mod tests {
         // rather than polling non-blocking — survives it.
         const TICK: Duration = Duration::from_millis(1);
         assert!(
-            elapsed + TICK >= Duration::from_millis(200),
+            elapsed + TICK >= TMOT,
             "returned a tick or more before the deadline it was given: {elapsed:?}"
         );
-        let failure = res.expect_err("a 1 MiB write cannot fit in a pinned socket buffer");
+        // The other side of the same claim, and the one that names what a
+        // failure was: a write outside this is not bounded by the deadline at
+        // all, and the outcome says which branch it came back on.
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "the deadline did not bound the write: {elapsed:?}, ending {}",
+            match &res {
+                Ok(n) => format!("Ok({n})"),
+                Err(f) => format!("Err(closed={}, {})", f.closed, f.error),
+            }
+        );
+        let failure = res.expect_err("a pipe that is already refusing takes no more");
         assert_eq!(
             failure.error.status(),
             AsynStatus::Timeout,
@@ -3309,38 +3447,23 @@ mod tests {
             .partial_write()
             .expect("C reports *nbytesTransfered beside the asynTimeout");
         assert!(
-            (1..PAYLOAD).contains(&sent),
-            "the caller cannot resync without a real accepted count, got {sent}"
+            sent < PAYLOAD,
+            "a write that timed out cannot have transferred all {PAYLOAD} bytes, got {sent}"
         );
     }
 
     /// R-3 regression: a broadcast write must spend the caller's budget once,
     /// not once per slot.
     ///
-    /// Eight peers that have stopped reading, each with its send buffer pinned
-    /// to the kernel minimum so a 1 MiB payload genuinely blocks. With a
-    /// per-slot `Instant::now() + timeout` a TMOT of 200 ms became 1.6 s of
-    /// PACT=1 with the port queue stalled behind it; with one deadline for the
-    /// whole fan-out the eighth slot inherits what the first left of it.
+    /// Eight peers that have stopped reading, each pipe filled until the socket
+    /// refuses so every slot write starts stalled. With a per-slot
+    /// `Instant::now() + timeout` a TMOT of 200 ms became 1.6 s of PACT=1 with
+    /// the port queue stalled behind it; with one deadline for the whole
+    /// fan-out the eighth slot inherits what the first left of it.
     #[cfg(unix)]
     #[test]
     fn a_broadcast_write_spends_the_caller_budget_once_not_once_per_slot() {
         use std::os::fd::AsRawFd;
-
-        fn pin_buffer(fd: std::os::fd::RawFd, opt: libc::c_int) {
-            let size: libc::c_int = 1;
-            // SAFETY: `opt` is a `SOL_SOCKET` size option taking the `c_int`
-            // passed here; the kernel clamps upward to its own minimum.
-            unsafe {
-                libc::setsockopt(
-                    fd,
-                    libc::SOL_SOCKET,
-                    opt,
-                    std::ptr::addr_of!(size).cast(),
-                    std::mem::size_of::<libc::c_int>() as libc::socklen_t,
-                );
-            }
-        }
 
         const SLOTS: usize = 8;
         const PAYLOAD: usize = 1 << 20;
@@ -3366,6 +3489,7 @@ mod tests {
             pin_buffer(client.as_raw_fd(), libc::SO_RCVBUF);
             let (server_side, peer) = listener.accept().unwrap();
             pin_buffer(server_side.as_raw_fd(), libc::SO_SNDBUF);
+            fill_until_refused(&server_side);
             slot.assign(server_side, peer).unwrap();
             clients.push(client);
         }
@@ -3376,7 +3500,7 @@ mod tests {
         std::thread::spawn(move || {
             let mut user = AsynUser {
                 addr: -1,
-                timeout: BUDGET,
+                timeout: Some(BUDGET),
                 ..AsynUser::default()
             };
             let started = Instant::now();

@@ -17,17 +17,31 @@
 //! pvxvct-rs -B 224.0.0.1@10.0.0.2 # join a multicast group on an iface
 //! ```
 
+// The sniffer half of this tool is `tokio_backend`-only, because
+// `client_native::udp` is: its collector waits on `UdpSocket::readable` inside
+// a future started through `runtime::task`, and `exec_backend` — selected on a
+// host build by `EPICS_RS_BUILD_EXEC_BACKEND=thread` — starts it on a worker
+// with no reactor. Cargo's `required-features` cannot name a build-script cfg,
+// so the gate is here instead of in `Cargo.toml`. Everything above the socket
+// — the `-H`/`-B`/`-P` grammars and their tests — is backend-neutral and stays
+// compiled, so this file is linted and tested in both configurations.
+#[cfg(tokio_backend)]
 use std::io::Cursor;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::Arc;
+#[cfg(tokio_backend)]
 use std::time::SystemTime;
 
 use clap::Parser;
+#[cfg(tokio_backend)]
 use tokio::sync::mpsc::Receiver;
 
+#[cfg(tokio_backend)]
 use epics_pva_rs::client_native::udp::{CollectedDatagram, UdpManager};
 use epics_pva_rs::config::Endpoint;
+#[cfg(tokio_backend)]
 use epics_pva_rs::decode::try_parse_frame;
+#[cfg(tokio_backend)]
 use epics_pva_rs::proto::{Command, ReadExt, decode_size_nonnull, decode_string, ip_from_bytes};
 
 #[derive(Parser)]
@@ -123,6 +137,10 @@ struct Filters {
     pvnames: Vec<String>,
 }
 
+// `allow_peer` and `pv_filter_allows` are the display filters `run_listener`
+// applies to each decoded frame, so they carry its gate rather than a second
+// copy of the reasoning. Their unit tests below carry it for the same reason.
+#[cfg(tokio_backend)]
 impl Filters {
     /// pvxs `allowPeer` (`tools/pvxvct.cpp:115-126`): no filters → allow
     /// all; otherwise the peer must be IPv4 and match one stored
@@ -148,6 +166,7 @@ impl Filters {
 /// `false` (no name can match) and is hidden — it does NOT bypass the
 /// filter. This is the structural rule, not a special case for the
 /// empty-name frame.
+#[cfg(tokio_backend)]
 fn pv_filter_allows(pvnames: &[String], names: &[String]) -> bool {
     if pvnames.is_empty() {
         return true;
@@ -220,8 +239,8 @@ fn parse_peer(spec: &str) -> Result<PeerFilter, String> {
 /// the multicast `@iface` are resolved through the shared PVA-tool
 /// resolvers: the body via DNS (IPv4-preferred), and `@iface` accepting
 /// **either** an interface IPv4 address **or** an OS interface name
-/// (`en0`, `lo0`) — the dual form pvxs `IfaceMap` accepts
-/// (`evhelper.cpp:556-575`), so `-B 224.0.1.1@en0` works as it does under
+/// (`en0`, `lo0`) — the dual form pvxs's `SockEndpoint` ctor accepts
+/// (`config.cpp:76-80`), so `-B 224.0.1.1@en0` works as it does under
 /// pvxs instead of being misresolved as a DNS host.
 fn parse_bind(spec: &str, default_port: u16) -> Result<BindEndpoint, String> {
     let mut rest = spec;
@@ -252,7 +271,7 @@ fn parse_bind(spec: &str, default_port: u16) -> Result<BindEndpoint, String> {
 impl BindEndpoint {
     /// The collector destination this `-B` requests. pvxvct never binds the
     /// destination address itself: it hands the address to the shared
-    /// wildcard collector ([`UdpManager`]), which binds `0.0.0.0:port` and
+    /// wildcard collector (`UdpManager`), which binds `0.0.0.0:port` and
     /// fans datagrams out by their recovered original destination. This is
     /// pvxs's rule — "Always bind to wildcard to receive all
     /// uni/broad/multicast" (`src/udp_collector.cpp:140-151`) — so a
@@ -275,6 +294,7 @@ impl BindEndpoint {
     }
 }
 
+#[cfg(tokio_backend)]
 fn now_iso() -> String {
     let secs = SystemTime::now()
         .duration_since(SystemTime::UNIX_EPOCH)
@@ -288,6 +308,7 @@ fn now_iso() -> String {
     format!("T{secs}.{frac_us:06}")
 }
 
+#[cfg(tokio_backend)]
 fn fmt_guid(g: &[u8]) -> String {
     let mut s = String::with_capacity(24);
     for b in g {
@@ -303,6 +324,7 @@ fn fmt_guid(g: &[u8]) -> String {
 /// fan-out (pvxs starts one search/beacon listener pair per bind,
 /// `tools/pvxvct.cpp:235-241`; the collector routes each datagram by its
 /// original destination, `src/udp_collector.cpp:451`).
+#[cfg(tokio_backend)]
 async fn run_listener(mut rx: Receiver<CollectedDatagram>, filters: Arc<Filters>) {
     while let Some(datagram) = rx.recv().await {
         let peer = datagram.src;
@@ -410,7 +432,10 @@ async fn run_listener(mut rx: Receiver<CollectedDatagram>, filters: Arc<Filters>
 
 #[tokio::main]
 async fn main() {
-    let args = Args::parse();
+    // pvxs's pvxvct returns 1 from its bad-option arm (`tools/pvxvct.cpp`);
+    // `Args::parse()` would exit with clap's 2.
+    let args: Args =
+        epics_pva_rs::cli::parse_or_exit_styled(epics_pva_rs::cli::UsageErrorStyle::Pvxs);
 
     // pvxs `-V` prints version_information and exits before binding any
     // sniffer socket (pvxvct `case 'V'`).
@@ -473,18 +498,71 @@ async fn main() {
         }
     }
 
+    #[cfg(exec_backend)]
+    refuse_without_a_reactor(endpoints, filters);
+
+    #[cfg(tokio_backend)]
+    sniff(endpoints, filters).await;
+}
+
+/// The `exec_backend` arm: everything up to here is backend-neutral, and this
+/// is the first step that is not.
+///
+/// It refuses rather than proceeding because the failure would otherwise be a
+/// panic from inside a background worker: `UdpManager::collect` starts its
+/// receive loop through `runtime::task`, which on this backend is a
+/// callback-pool thread with no tokio reactor entered, and the first
+/// `UdpSocket::readable` there aborts the task with *"there is no reactor
+/// running"*. Same shape as `realtime-ca-ioc`'s hosted arm: the binary is
+/// still built and linted in this configuration, and says why it will not run.
+#[cfg(exec_backend)]
+fn refuse_without_a_reactor(endpoints: Vec<BindEndpoint>, filters: Arc<Filters>) -> ! {
+    // A dry run of everything that did resolve, so an operator who reached
+    // this arm by accident still learns whether their `-B`/`-H`/`-P` spellings
+    // parsed the way they meant. Only the socket is missing.
+    for ep in endpoints {
+        let dest = ep.to_endpoint();
+        match dest.iface {
+            Some(iface) => eprintln!("pvxvct-rs: would collect {} on {iface}", dest.addr),
+            None => eprintln!("pvxvct-rs: would collect {}", dest.addr),
+        }
+    }
+    let shown = match (filters.client_only, filters.server_only) {
+        (true, _) => "SEARCH only",
+        (_, true) => "BEACON only",
+        _ => "SEARCH and BEACON",
+    };
+    eprintln!(
+        "pvxvct-rs: would show {shown}, {} peer filter(s), {} PV filter(s)",
+        filters.peers.len(),
+        filters.pvnames.len()
+    );
+    eprintln!(
+        "pvxvct-rs: this build selects the reactor-free execution backend \
+         (EPICS_RS_BUILD_EXEC_BACKEND=thread); the UDP collector needs a tokio reactor, so \
+         there is nothing to sniff with. Rebuild without that feature."
+    );
+    std::process::exit(1);
+}
+
+/// The `tokio_backend` arm: bind one collector per `-B` endpoint and print
+/// what arrives until every listener ends.
+#[cfg(tokio_backend)]
+async fn sniff(endpoints: Vec<BindEndpoint>, filters: Arc<Filters>) {
     // One shared wildcard collector per (family, port): it binds
     // `0.0.0.0:port` and fans each datagram out to the listeners whose `-B`
     // destination matches its recovered original destination — pvxs
     // `UDPManager` (`src/udp_collector.cpp:102-151`). The collector handles
     // must outlive their listeners: the background receive task runs only
     // while a handle (or another listener) keeps the collector alive.
+    let reactor = epics_base_rs::runtime::task::Reactor::current()
+        .expect("the collector loop is armed on the tool's runtime");
     let manager = UdpManager::new();
     let mut collectors = Vec::with_capacity(endpoints.len());
     let mut handles = Vec::with_capacity(endpoints.len());
     for ep in endpoints {
         let dest = ep.to_endpoint();
-        let collector = match manager.collect(&dest) {
+        let collector = match manager.collect(&reactor, &dest) {
             Ok(c) => c,
             Err(e) => {
                 eprintln!("pvxvct-rs: bind {}:{}: {e}", ep.addr, ep.port);
@@ -564,6 +642,7 @@ mod tests {
 
     /// `allow_peer` mirrors pvxs masked matching, and drops non-IPv4
     /// peers only when a filter is present.
+    #[cfg(tokio_backend)]
     #[test]
     fn allow_peer_subnet_match() {
         let filters = Filters {
@@ -590,6 +669,7 @@ mod tests {
 
     /// The `-P` gate hides zero-name discovery SEARCH frames when a
     /// filter is active — the core finding-19 correctness fix.
+    #[cfg(tokio_backend)]
     #[test]
     fn pv_filter_hides_zero_name_discovery_when_set() {
         // No filter → show everything, including the discovery frame.
@@ -641,10 +721,11 @@ mod tests {
     }
 
     /// The multicast `@iface` suffix accepts an OS interface *name*, not
-    /// just an interface IPv4 address — the dual form pvxs `IfaceMap`
-    /// accepts (`evhelper.cpp:556-575`). The loopback interface is `lo`
-    /// on Linux and `lo0` on macOS/BSD; binding `224.0.1.1@<loopback>`
-    /// must resolve the name to that interface's loopback IPv4 address.
+    /// just an interface IPv4 address — the dual form pvxs's
+    /// `SockEndpoint` ctor accepts (`config.cpp:76-80`). The loopback
+    /// interface is `lo` on Linux and `lo0` on macOS/BSD; binding
+    /// `224.0.1.1@<loopback>` must resolve the name to that interface's
+    /// loopback IPv4 address.
     #[cfg(unix)]
     #[test]
     fn parse_bind_iface_accepts_interface_name() {

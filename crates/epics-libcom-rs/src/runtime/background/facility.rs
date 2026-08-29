@@ -55,7 +55,7 @@ thread_local! {
 /// enqueued *for that worker*. A worker that parks waiting for async progress
 /// is therefore waiting for something only it could have run: the deferred
 /// callbacks, the FLNK tails, the monitor tails and — on RTEMS, where
-/// [`crate::runtime::task::spawn`] routes here — every other spawned future on
+/// [`crate::runtime::task::Reactor::spawn`] routes here — every other spawned future on
 /// that band. Parking the delayed timer is worse still: it stops every `sleep`,
 /// `interval` and scan period in the process, so a future waiting on a timeout
 /// waits forever.
@@ -117,7 +117,7 @@ pub fn recover<T>(facility: &str, result: std::sync::LockResult<T>) -> T {
                     &format!(
                         "{facility}: recovered a lock poisoned by a panic elsewhere; \
                          the queued work is intact and the facility continues. Later \
-                         recoveries are not repeated."
+                         recoveries are not repeated.\n"
                     ),
                 );
             }
@@ -138,7 +138,7 @@ pub fn run_isolated(facility: &str, cb: impl FnOnce()) -> bool {
                 ErrlogSevEnum::Major,
                 &format!(
                     "{facility}: a callback panicked ({}); the callback was abandoned, \
-                     the facility continues",
+                     the facility continues\n",
                     panic_text(&*payload)
                 ),
             );
@@ -170,7 +170,7 @@ pub(super) fn run_facility_loop(facility: &str, body: impl FnOnce(), on_lost: im
             ErrlogSevEnum::Fatal,
             &format!(
                 "{facility}: the worker thread has STOPPED ({}). Every operation this \
-                 facility carries has stopped with it; the IOC keeps serving requests.",
+                 facility carries has stopped with it; the IOC keeps serving requests.\n",
                 panic_text(&*payload)
             ),
         );
@@ -192,6 +192,7 @@ fn panic_text(payload: &(dyn Any + Send)) -> &str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use source_guard::{Comments, production};
     use std::sync::atomic::{AtomicBool, Ordering};
 
     #[test]
@@ -275,14 +276,8 @@ mod tests {
 
         let mut offences = Vec::new();
         for (label, src, facility) in files {
-            let prod = match src.find("\n#[cfg(test)]") {
-                Some(i) => &src[..i],
-                None => src,
-            };
+            let prod = production(src, Comments::Strip);
             for (n, line) in prod.lines().enumerate() {
-                if line.trim_start().starts_with("//") {
-                    continue;
-                }
                 if line.contains(poison) || line.contains(wait_poison) {
                     offences.push(format!("{label}:{}", n + 1));
                 }

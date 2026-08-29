@@ -11,7 +11,8 @@
 //! - `forkpty` + `execvp`
 //! - `setsid()` so signals to `-pid` reach the whole process group
 //! - per-line PTY-master read with EIO/EOF → child-died detection
-//! - `kill(-pid, sig)` for signal forwarding to the entire group
+//! - `kill(-pid, sig)` for signal forwarding to the entire group, with a
+//!   bare-pid fallback C lacks (see [`ChildHandle::signal`])
 //! - SIGCHLD-style reap via blocking `waitpid` on a side task
 
 use std::ffi::CString;
@@ -21,6 +22,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
+use nix::errno::Errno;
 use nix::pty::ForkptyResult;
 use nix::sys::resource::{Resource, getrlimit, setrlimit};
 use nix::sys::signal::Signal;
@@ -210,16 +212,26 @@ impl ChildHandle {
         Ok(())
     }
 
-    /// Send a signal to the child process group. Negative pid means
+    /// Send a signal to the child's process tree. Negative pid means
     /// "all processes in pgid", which is what we want — `setsid`
     /// makes the child its own group leader so we can signal the
     /// whole tree of grandchildren too.
+    ///
+    /// Falling back to the bare pid on `ESRCH` is the one place this port
+    /// diverges from C. `forkpty` returns in the parent the moment `fork`
+    /// does, but the child becomes a group leader only when it reaches
+    /// `setsid` inside `login_tty`; a signal sent in that window addresses a
+    /// group of nobody, and the busier the run queue the wider the window. C
+    /// has the identical race — `kill(-_pid, signal)`
+    /// (`processFactory.cc:284`) against `setsid()` in the forked child
+    /// (`processFactory.cc:204`) — and ignores the return, so an operator's
+    /// `^X` there is simply lost. A child that has not reached `setsid` has
+    /// not `exec`ed either, so it can have no grandchildren: signalling it
+    /// directly reaches exactly the set the group would have.
     pub fn signal(&self, signo: i32) -> ProcServResult<()> {
         let sig = Signal::try_from(signo)
             .map_err(|e| ProcServError::Config(format!("invalid signal {signo}: {e}")))?;
-        // Negative pid → process group.
-        let pgid = Pid::from_raw(-self.pid.as_raw());
-        nix::sys::signal::kill(pgid, sig)
+        signal_process_tree(self.pid, sig)
             .map_err(|e| ProcServError::Io(io::Error::other(e.to_string())))?;
         Ok(())
     }
@@ -234,6 +246,20 @@ impl ChildHandle {
     /// PID of the child (for info-file rendering).
     pub fn pid(&self) -> i32 {
         self.pid.as_raw()
+    }
+}
+
+/// Signal the process tree rooted at `pid`: its process group if it has one,
+/// otherwise the process itself.
+///
+/// The single owner of that rule — every signal any caller sends to a child
+/// goes through here, so the pre-`setsid` window cannot be got wrong at one
+/// call site and right at another.
+fn signal_process_tree(pid: Pid, sig: Signal) -> nix::Result<()> {
+    let pgid = Pid::from_raw(-pid.as_raw());
+    match nix::sys::signal::kill(pgid, sig) {
+        Err(Errno::ESRCH) => nix::sys::signal::kill(pid, sig),
+        other => other,
     }
 }
 
@@ -652,6 +678,42 @@ mod tests {
             blocked & bit(libc::SIGINT),
             0,
             "SIGINT must stay deliverable (SigBlk={blocked:#x})"
+        );
+    }
+
+    /// The pre-`setsid` window: a child that is not (yet) its own process
+    /// group leader must still be reachable.
+    ///
+    /// `std::process::Command` gives us that state deterministically — its
+    /// child inherits our process group, so it is a group member and not a
+    /// leader, exactly as a `forkpty` child is between `fork` returning in
+    /// the parent and `setsid` running in the child. `kill(-pid)` alone
+    /// therefore fails with `ESRCH` and the signal is lost, which is how an
+    /// operator's `^X` went missing under load; `signal_process_tree` must
+    /// deliver it.
+    #[test]
+    fn signal_reaches_a_child_that_is_not_yet_a_group_leader() {
+        let mut child = std::process::Command::new("/bin/sleep")
+            .arg("30")
+            .spawn()
+            .expect("spawn");
+        let pid = Pid::from_raw(child.id() as i32);
+
+        // Precondition: no such process group, so the group-only signal that
+        // C sends (`kill(-_pid, sig)`, processFactory.cc:284) is dropped.
+        assert_eq!(
+            nix::sys::signal::kill(Pid::from_raw(-pid.as_raw()), Signal::SIGKILL),
+            Err(Errno::ESRCH),
+            "a Command child must not be a process-group leader"
+        );
+
+        signal_process_tree(pid, Signal::SIGKILL).expect("signal must reach the child");
+
+        let status = child.wait().expect("wait");
+        assert_eq!(
+            std::os::unix::process::ExitStatusExt::signal(&status),
+            Some(9),
+            "the child must have died of the signal we sent, got: {status:?}"
         );
     }
 

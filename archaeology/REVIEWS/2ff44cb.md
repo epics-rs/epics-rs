@@ -1,6 +1,0 @@
----
-short_sha: 2ff44cb
-status: not-applicable
-files_changed: []
----
-The C bug was in `callback.c::callbackStop` where, after the busy-wait for `threadsRunning == 0`, callback worker threads were never joined (they were created with `joinable = 0` and their tids were discarded by `callbackInit`), so `callbackCleanup` could free the ring/mutex while a thread was still running stack-cleanup code, producing UAF crashes under ASan/Valgrind during IOC shutdown. The audit target `crates/epics-base-rs/src/server/database/callback.rs` does not exist. base-rs has no priority-keyed callback queue / worker-pool subsystem analogous to libCom `callback.c`: there is no `callbackInit`, `callbackRequest`, `callbackStop`, `cbQueueSet`, `threadsConfigured` or `epicsRingPointer`. Worker tasks in this crate live elsewhere (e.g. `ScanScheduler`, `IocApp`, `AutosaveManager`) and are bounded by their owning futures' lifetimes, not by a manually-joined detached-thread pool. The `tokio::task::JoinHandle` pattern recommended in the audit (await-on-shutdown) would be the right fix if such a pool were ever added, but there is currently nothing to retrofit. Closing as not-applicable; if a future commit introduces a priority-callback worker pool in base-rs, the audit recommendation about storing and awaiting per-priority `JoinHandle`s should be revisited at that time.

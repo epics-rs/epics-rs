@@ -95,7 +95,20 @@ pub fn split_channel_name(raw: &str) -> ParsedChannelName {
     //    fold it into the filter chain as a leading `arr` entry. Array
     //    range is channel syntax (base parses it after field modifiers,
     //    before JSON filters), not part of the field name.
+    //
+    //    The separating `.` of `RECORD.[range]` goes with it, exactly as
+    //    step 1 drops the one in `RECORD.{json}`: C consumes that dot in
+    //    `pvNameLookup` before the field lookup (`if (**ppname == '.')
+    //    ++*ppname`, `dbChannel.c:321-322`), so `dbFindFieldPart` sees
+    //    `[2]`, takes the absent-field-name branch and binds `VAL`. Left
+    //    on the record path it makes the field the EMPTY string, which
+    //    resolves nowhere — `src.[2]` then fails every existence and
+    //    locality test in the port while C answers all of them.
     if let Some((record_path, arr_inner)) = peel_array_range(name_part) {
+        let record_path = record_path
+            .strip_suffix('.')
+            .map(str::to_string)
+            .unwrap_or(record_path);
         let json_suffix = Some(match json_suffix {
             Some(existing) => merge_arr_into_json(&arr_inner, &existing),
             None => format!("{{{arr_inner}}}"),
@@ -544,45 +557,19 @@ fn epics_parse_int32(s: &str) -> Option<i32> {
     i32::try_from(if neg { -mag } else { mag }).ok()
 }
 
-/// C `epicsParseDouble(val, dval, &end)` (`chfPlugin.c:273`): the longest
-/// numeric prefix wins and the remainder lands in the ignored `units`
-/// pointer, so `"0.5 V"` stores 0.5 exactly as `"0.5"` does.
+/// C `epicsParseDouble(val, dval, &end)` (`chfPlugin.c:273`): the numeric
+/// prefix wins and the remainder lands in the ignored `units` pointer, so
+/// `"0.5 V"` stores 0.5 exactly as `"0.5"` does, while an `ERANGE` result
+/// is an error return that refuses the channel.
 ///
-/// `strtod` reports an out-of-range result through `errno`, and
-/// `epicsParseDouble` turns that into `S_stdlib_overflow` /
-/// `S_stdlib_underflow` (`epicsStdlib.c:159-165`) — an error return, so
-/// the store fails and the channel is refused. Rust's `f64::from_str`
-/// saturates instead, silently storing `inf` for `"1e400"` and `0` for
-/// `"1e-400"`, which is the class of silent wrong value this whole
-/// convert stage exists to prevent. `"inf"` / `"nan"` are word forms
-/// `strtod` accepts without setting `errno`, so they still store.
+/// `runtime::stdlib` owns C's `strtod` grammar — hex floats, the `inf` /
+/// `nan` words, and the exactness rule that decides ERANGE on a subnormal.
+/// This is the same function C reaches from `store_double_value`, so
+/// `{"dbnd":{"d":"0x1p-2"}}` is a quarter here as it is there.
 fn epics_parse_double(s: &str) -> Option<f64> {
-    let s = s.trim_start();
-    let (v, token) = longest_f64_prefix(s)?;
-    let digits = token.trim_start_matches(['+', '-']);
-    if digits.starts_with(|c: char| c.is_ascii_alphabetic()) {
-        return Some(v);
-    }
-    let mantissa = digits.split(['e', 'E']).next().unwrap_or("");
-    let significant = mantissa.chars().any(|c| c.is_ascii_digit() && c != '0');
-    if v.is_infinite() || (significant && v == 0.0) {
-        return None;
-    }
-    Some(v)
-}
-
-/// The prefix of `s` that `strtod` would consume, and its value.
-fn longest_f64_prefix(s: &str) -> Option<(f64, &str)> {
-    let mut longest = None;
-    for (i, _) in s.char_indices().skip(1) {
-        if let Ok(v) = s[..i].parse::<f64>() {
-            longest = Some((v, &s[..i]));
-        }
-    }
-    if let Ok(v) = s.parse::<f64>() {
-        longest = Some((v, s));
-    }
-    longest
+    crate::runtime::stdlib::epics_parse_double_units(s)
+        .ok()
+        .map(|(v, _units)| v)
 }
 
 /// C `store_integer_value` (`chfPlugin.c:64-121`).
@@ -637,7 +624,7 @@ fn store_string(def: &ArgDef, val: &str) -> Option<ArgValue> {
         ArgType::Double => ArgValue::Double(epics_parse_double(val)?),
         ArgType::Str => ArgValue::Str(val.to_string()),
         ArgType::Enum(map) => {
-            let (_, choice) = map.iter().find(|(n, _)| *n == val)?;
+            let (_, choice) = map.iter().find(|(n, _)| chf_prefix_match(val, n))?;
             ArgValue::Enum(*choice)
         }
     })
@@ -679,8 +666,12 @@ fn store(def: &ArgDef, value: &serde_json::Value) -> Option<ArgValue> {
         }
         Value::String(s) => store_string(def, s),
         Value::Bool(b) => store_boolean(def, *b),
-        // yajl registers no null callback, and a nested map or array is
-        // not an option value; all three end the parse.
+        // A JSON `null` ends the parse in C too, by a different route:
+        // `dbChannel.c:245` DOES register `chf_null`, but `chfPlugin`
+        // leaves its own `parse_null` slot NULL (`chfPlugin.c:571`) and
+        // `CALLIF` turns a NULL handler into `parse_stop`
+        // (`dbChannel.c:50`). A nested map or array is not an option value
+        // either; all three end the parse.
         _ => None,
     }
 }
@@ -691,7 +682,7 @@ fn store(def: &ArgDef, value: &serde_json::Value) -> Option<ArgValue> {
 ///
 /// Keeping the two together is what makes C's `parse_map_key` rejection
 /// (`chfPlugin.c:472-474`) and its `store_*_value` conversion rules
-/// (`:64-290`) unforgettable when a filter is added. The port previously
+/// (`:65-290`) unforgettable when a filter is added. The port previously
 /// had a bare key list and no types at all: every `build_*` read raw JSON
 /// with `as_i64`/`as_str`/`as_f64`, so a value of the wrong kind became
 /// the option's default instead of failing the channel.
@@ -757,11 +748,25 @@ const PLUGINS: &[(&str, &[ArgDef], FilterBuilder)] = &[
     ),
 ];
 
+/// C's option-name match `strncmp(key, cur->name, stringLen)`
+/// (`chfPlugin.c:467`) and its enum twin `strncmp(emap->name, val, len)`
+/// (`:285`), where the length is always the INCOMING string's.
+///
+/// Both therefore compare only as many bytes as arrived, so a truncated
+/// spelling selects the first table entry it is a prefix of —
+/// `{"dbnd":{"a":1}}` is `abs`, `{"dbnd":{"m":"r"}}` is `rel` — while a
+/// longer spelling matches nothing, because the comparison then runs past
+/// the table entry's NUL. The empty string is a prefix of everything and
+/// so picks the first entry, exactly as `strncmp(x, y, 0) == 0` does.
+fn chf_prefix_match(incoming: &str, table_name: &str) -> bool {
+    table_name.as_bytes().starts_with(incoming.as_bytes())
+}
+
 type FilterBuilder = fn(&Opts) -> Option<Arc<dyn SubscriptionFilter>>;
 
 /// Build one filter from its name + config, running the three stages C
 /// has: `parse_map_key`'s unknown-key stop (`chfPlugin.c:472-474`), the
-/// `store_*_value` conversion its `convert` flag governs (`:64-290`), and
+/// `store_*_value` conversion its `convert` flag governs (`:65-290`), and
 /// the plugin's own `parse_ok` (each `build_*` answering `None`).
 /// Distinguishing an unknown filter name from a rejected configuration
 /// mirrors EPICS `S_db_notFound` vs `parse_stop`.
@@ -781,13 +786,13 @@ fn build_filter(
     let obj = cfg.as_object().ok_or_else(bad_config)?;
     let mut stored = Vec::with_capacity(obj.len());
     for (key, value) in obj {
-        let def =
-            defs.iter()
-                .find(|d| d.name == key)
-                .ok_or_else(|| FilterParseError::UnknownOption {
-                    filter: name.to_string(),
-                    key: key.clone(),
-                })?;
+        let def = defs
+            .iter()
+            .find(|d| chf_prefix_match(key, d.name))
+            .ok_or_else(|| FilterParseError::UnknownOption {
+                filter: name.to_string(),
+                key: key.clone(),
+            })?;
         stored.push((def.name, store(def, value).ok_or_else(bad_config)?));
     }
     build(&Opts(stored)).ok_or_else(bad_config)
@@ -831,8 +836,9 @@ fn build_ts(opts: &Opts) -> Option<Arc<dyn SubscriptionFilter>> {
 
 /// C `dbnd.c:36-45` schema: `modeEnum {"abs"=>0,"rel"=>1}`; `d` sets the
 /// delta and `m` the mode, while the tagged `abs`/`rel` keys set both at
-/// once. There is NO `r` key. The delta reaches [`DeadbandFilter`] in C's
-/// own wire units — a percent in `rel` mode — because C's band refresh is
+/// once. `r` is not a table entry of its own but reaches `rel` through
+/// [`chf_prefix_match`], as `a` reaches `abs`. The delta arrives in C's own
+/// wire units — a percent in `rel` mode — because C's band refresh is
 /// written in them (`my->hyst = val * my->cval/100.`, `dbnd.c:87`).
 fn build_dbnd(opts: &Opts) -> Option<Arc<dyn SubscriptionFilter>> {
     let mut cval = None;
@@ -855,7 +861,12 @@ fn build_dbnd(opts: &Opts) -> Option<Arc<dyn SubscriptionFilter>> {
             }
         }
     }
-    Some(Arc::new(DeadbandFilter::new(cval?, mode)))
+    // `chfDouble(myStruct, cval, "d", 0, 1)` and `chfEnum(…, "m", 0, 1, …)`
+    // are both OPTIONAL (`dbnd.c:40-41`, 4th macro argument), and `allocPvt`
+    // is `freeListCalloc` (`:49`), so an absent `d` is a zero deadband, not a
+    // refusal: `{"dbnd":{}}` and `{"dbnd":{"m":"rel"}}` are legal filters that
+    // pass every strict change.
+    Some(Arc::new(DeadbandFilter::new(cval.unwrap_or(0.0), mode)))
 }
 
 fn dbnd_mode(choice: i32) -> DeadbandMode {
@@ -1113,15 +1124,53 @@ mod tests {
         );
     }
 
+    /// `parse_map_key` compares `strncmp(key, cur->name, stringLen)` with
+    /// the INCOMING key's length (`chfPlugin.c:467`), and the enum arm of
+    /// `store_string_value` compares `strncmp(emap->name, val, len)` the
+    /// same way (`:285`), so a truncated spelling selects the first table
+    /// entry it prefixes. This test asserts the resulting MODE, not just
+    /// that a chain was built, because `r`/`a` differ from `d` only there.
     #[test]
-    fn parse_dbnd_rejects_fabricated_r_key_and_bad_mode() {
-        // The fabricated `r` key C never had now matches nothing — the
-        // filter is dropped (empty chain).
-        assert_eq!(parse_filter_chain(r#"{"dbnd":{"r":0.01}}"#).len(), 0);
-        // An `m` value outside modeEnum fails the parse like C chfEnum.
+    fn parse_dbnd_truncated_keys_reach_their_tagged_entry() {
+        use crate::types::EpicsValue;
+        // `r` prefixes the tagged `rel` (`dbnd.c:43`): hyst refreshes to
+        // 10 * 50/100 = 5, and 20 - 10 > 5, so the second event passes.
+        let rel = try_parse_filter_chain(r#"{"dbnd":{"r":50}}"#).expect("`r` is `rel`");
+        assert!(rel.apply(conv_ev(EpicsValue::Double(10.0))).is_some());
+        assert!(rel.apply(conv_ev(EpicsValue::Double(20.0))).is_some());
+        // `a` prefixes the tagged `abs` (`:42`), where a band of 50
+        // swallows the same step.
+        let abs = try_parse_filter_chain(r#"{"dbnd":{"a":50}}"#).expect("`a` is `abs`");
+        assert!(abs.apply(conv_ev(EpicsValue::Double(10.0))).is_some());
+        assert!(abs.apply(conv_ev(EpicsValue::Double(20.0))).is_none());
+        // The enum arm truncates too: `"r"` is `rel` in `modeEnum` (`:35`).
+        let m = try_parse_filter_chain(r#"{"dbnd":{"d":50,"m":"r"}}"#).expect("`m:\"r\"` is `rel`");
+        assert!(m.apply(conv_ev(EpicsValue::Double(10.0))).is_some());
+        assert!(m.apply(conv_ev(EpicsValue::Double(20.0))).is_some());
+        // An `m` value that prefixes no entry still fails the parse.
         assert_eq!(
             parse_filter_chain(r#"{"dbnd":{"d":1.0,"m":"nope"}}"#).len(),
             0
+        );
+    }
+
+    /// Every `dbnd` option is optional (`dbnd.c:40-43`, 4th macro argument
+    /// = 0) and `allocPvt` is `freeListCalloc` (`:49`), so `parse_end`'s
+    /// required-bit check (`chfPlugin.c:370-377`) passes an empty object
+    /// and leaves a zero absolute band. The port's `cval?` refused it.
+    #[test]
+    fn parse_dbnd_with_no_options_is_a_zero_band_not_a_refusal() {
+        use crate::types::EpicsValue;
+        let chain = try_parse_filter_chain(r#"{"dbnd":{}}"#).expect("no option is required");
+        assert_eq!(chain.len(), 1);
+        assert!(chain.apply(conv_ev(EpicsValue::Double(10.0))).is_some());
+        assert!(chain.apply(conv_ev(EpicsValue::Double(20.0))).is_some());
+        // `m` alone is legal for the same reason — mode without a delta.
+        assert_eq!(
+            try_parse_filter_chain(r#"{"dbnd":{"m":"rel"}}"#)
+                .unwrap()
+                .len(),
+            1
         );
     }
 
@@ -1239,7 +1288,11 @@ mod tests {
         for (json, filter, key) in [
             (r#"{"dec":{"n":2,"offset":1}}"#, "dec", "offset"),
             (r#"{"arr":{"s":1,"stride":2}}"#, "arr", "stride"),
-            (r#"{"dbnd":{"d":1,"r":2}}"#, "dbnd", "r"),
+            // Not `{"dbnd":{"r":…}}` — `r` is a prefix of the tagged `rel`
+            // key, so `strncmp(key, "rel", 1)` accepts it (`chfPlugin.c:467`).
+            // A spelling LONGER than the table entry is what gets refused,
+            // because the comparison then runs past that entry's NUL.
+            (r#"{"dbnd":{"d":1,"relative":2}}"#, "dbnd", "relative"),
             (r#"{"ts":{"fmt":"iso"}}"#, "ts", "fmt"),
             (r#"{"sync":{"m":"after","state":"S"}}"#, "sync", "state"),
         ] {
@@ -1363,6 +1416,94 @@ mod tests {
         assert_eq!(chain.len(), 1);
     }
 
+    /// Every yajl handle base allocates is in JSON5 mode: `yajl_alloc`
+    /// sets `hand->flags = yajl_allow_json5 | yajl_allow_comments`
+    /// outright (`yajl.c:77`), and `chf_parse` allocates the
+    /// channel-filter handle through it (`dbChannel.c:270`). So the
+    /// numeric spellings the JSON5 lexer accepts reach a filter option in
+    /// C — hex (`yajl_lex.c:467-468`, converted base-16 by
+    /// `yajl_parse_integer`, `yajl_parser.c:57-62`), a leading `+`
+    /// (`yajl_lex.c:438`), and a leading or trailing `.` (`:478`, `:491`).
+    ///
+    /// What this pins is the ROUTING: that `try_parse_filter_chain` still
+    /// reads its suffix through [`crate::json5::relaxed_to_strict`]. The
+    /// conversions themselves are pinned in `json5.rs`'s own tests, and a
+    /// path that stopped going through it fails here with `InvalidJson`.
+    #[test]
+    fn try_parse_accepts_the_json5_numeric_literals_yajl_lexes() {
+        for json in [
+            r#"{"dec":{"n":0xA}}"#,
+            r#"{"dec":{"n":0XA}}"#,
+            r#"{"dbnd":{"d":+1}}"#,
+            r#"{"dbnd":{"d":.5}}"#,
+            r#"{"dbnd":{"d":1.}}"#,
+            r#"{"arr":{"s":+1,"i":0x2,"e":-1}}"#,
+        ] {
+            try_parse_filter_chain(json)
+                .unwrap_or_else(|e| panic!("yajl lexes {json} in JSON5 mode; parser said {e}"));
+        }
+    }
+
+    /// ...and the converted VALUE reaches the filter, not merely the
+    /// acceptance. `arr`'s advertised element count is a function of its
+    /// `s`/`i`/`e`, so a hex- and `+`-spelled slice must advertise exactly
+    /// what the decimal spelling of the same slice advertises.
+    #[test]
+    fn a_json5_spelled_slice_is_the_same_slice() {
+        let decimal = try_parse_filter_chain(r#"{"arr":{"s":2,"i":3,"e":17}}"#).unwrap();
+        let json5 = try_parse_filter_chain(r#"{"arr":{"s":+2,"i":0x3,"e":0x11}}"#).unwrap();
+        let (a, b) = (decimal.iter().next().unwrap(), json5.iter().next().unwrap());
+        assert_eq!(
+            a.final_element_count(64),
+            b.final_element_count(64),
+            "the two spellings must build the same slice"
+        );
+        assert_ne!(
+            a.final_element_count(64),
+            64,
+            "the probe is only discriminating if the slice actually reshapes"
+        );
+    }
+
+    /// DELIBERATE deviation, recorded rather than fixed. C accepts a
+    /// non-finite filter argument: `Infinity`/`NaN` lex as
+    /// `yajl_tok_double` under JSON5 (`yajl_lex.c:673-682`, `:684-693`),
+    /// `epicsStrtod` converts them without setting `ERANGE` so the
+    /// overflow guard does not fire (`yajl_parser.c:329-353`),
+    /// `chfPlugin`'s `parse_double` forwards them (`chfPlugin.c:423-434`)
+    /// and `store_double_value` writes the raw double with no finite check
+    /// (`chfPlugin.c:206-209`) — `{"dbnd":{"d":Infinity}}` builds a channel
+    /// whose deadband suppresses every update.
+    ///
+    /// The port refuses it. `relaxed_to_strict` is the dialect's single
+    /// reader and its output alphabet is strict JSON, which has no
+    /// spelling for a non-finite, so the value arrives as `null` and
+    /// `store` stops the parse. Accepting it needs either a second reader
+    /// for this path — the two-reader split `json5.rs` exists to prevent —
+    /// or a per-consumer re-spelling that trades this deviation for a
+    /// narrower one elsewhere (`Infinity` as the string `"Infinity"` is
+    /// what C's `store_string_value` wants for a double option, but C's
+    /// `store_double_value` writes `"inf"` into a STRING option, so the
+    /// re-spelling would diverge on `sync`'s `s`). The refusal is narrower
+    /// than C, never a wrong answer: C's own outcome is a degenerate
+    /// filter.
+    #[test]
+    fn a_non_finite_filter_argument_is_refused_where_c_accepts_it() {
+        for json in [
+            r#"{"dbnd":{"d":Infinity}}"#,
+            r#"{"dbnd":{"d":-Infinity}}"#,
+            r#"{"dbnd":{"d":NaN}}"#,
+            r#"{"dbnd":{"abs":Infinity}}"#,
+        ] {
+            let err = try_parse_filter_chain(json)
+                .expect_err("the port refuses a non-finite filter argument");
+            assert!(
+                matches!(err, FilterParseError::BadConfig { .. }),
+                "{json}: {err}"
+            );
+        }
+    }
+
     #[test]
     fn try_parse_chained_filters_preserve_order() {
         let chain = try_parse_filter_chain(r#"{"dec":{"n":2},"dbnd":{"d":0.1},"ts":{}}"#).unwrap();
@@ -1462,6 +1603,30 @@ mod tests {
         assert_eq!(c.json_suffix.as_deref(), Some(r#"{"arr":{"e":2}}"#));
     }
 
+    /// `REC.[range]` — the range with NO field before it. The `.` is the
+    /// separator C consumes in `pvNameLookup` (`dbChannel.c:321-322`), so
+    /// the field it leaves is absent, not empty, and binds `VAL`.
+    ///
+    /// `linkFilterTest.db` writes both shapes (`src.[2]`, `src.[2:4]`).
+    /// Keeping the dot made the field the empty string, which resolves
+    /// against no record: the existence test said the channel did not
+    /// exist and `db_init_link_locality` rewrote the link as CA.
+    #[test]
+    fn channel_name_drops_the_separator_before_a_bare_range() {
+        for (raw, expect_json) in [
+            ("src.[2]", r#"{"arr":{"s":2,"e":2}}"#),
+            ("src.[2:4]", r#"{"arr":{"s":2,"e":4}}"#),
+        ] {
+            let c = parse_channel_name(raw);
+            assert_eq!(
+                (c.record.as_str(), c.field.as_str(), c.record_path.as_str()),
+                ("src", "VAL", "src"),
+                "{raw}"
+            );
+            assert_eq!(c.json_suffix.as_deref(), Some(expect_json), "{raw}");
+        }
+    }
+
     /// All three modifiers at once, in the order the name carries them.
     #[test]
     fn channel_name_peels_all_three_modifiers() {
@@ -1473,7 +1638,7 @@ mod tests {
         assert!(c.json_suffix.as_deref().unwrap().contains("\"dbnd\""));
     }
 
-    // ── chfPluginArgDef `convert` (chfPlugin.c:64-290) ─────────────
+    // ── chfPluginArgDef `convert` (chfPlugin.c:65-290) ─────────────
 
     fn conv_ev(v: crate::types::EpicsValue) -> super::super::FilteredMonitorEvent {
         use super::super::FilteredMonitorEvent;
@@ -1671,6 +1836,50 @@ mod tests {
         }
         // `strtod` sets no `errno` for the word forms, so they store.
         assert!(try_parse_filter_chain(r#"{"dbnd":{"abs":"inf"}}"#).is_ok());
+    }
+
+    /// Every status below is what a probe linked against this checkout's
+    /// `libCom` returns from `epicsParseDouble(str, &v, &units)`, the call
+    /// `store_double_value` makes (`chfPlugin.c:273`). The option parser
+    /// used to run its own `f64::from_str` scan, which knows no hex float
+    /// and cannot tell an exactly representable subnormal from a rounded
+    /// one; it now goes through `runtime::stdlib`, which owns that grammar.
+    #[test]
+    fn dbnd_double_options_follow_c_strtod_including_hex_and_subnormals() {
+        use crate::types::EpicsValue;
+        // `0x10` is 16 — measured `st=0 v=16`. A 16-wide absolute band
+        // swallows a step of 10 and passes one of 20.
+        let hex = try_parse_filter_chain(r#"{"dbnd":{"abs":"0x10"}}"#).expect("`0x10` is 16");
+        assert!(hex.apply(conv_ev(EpicsValue::Double(10.0))).is_some());
+        assert!(hex.apply(conv_ev(EpicsValue::Double(20.0))).is_none());
+        assert!(hex.apply(conv_ev(EpicsValue::Double(30.0))).is_some());
+        // `0x1.8p1` is 3 — measured `st=0 v=3`.
+        let p = try_parse_filter_chain(r#"{"dbnd":{"abs":"0x1.8p1"}}"#).expect("`0x1.8p1` is 3");
+        assert!(p.apply(conv_ev(EpicsValue::Double(10.0))).is_some());
+        assert!(p.apply(conv_ev(EpicsValue::Double(12.0))).is_none());
+        assert!(p.apply(conv_ev(EpicsValue::Double(16.0))).is_some());
+        // glibc raises ERANGE on a subnormal only when the conversion is
+        // INEXACT, and `epicsParseDouble` maps a non-zero ERANGE to
+        // `S_stdlib_overflow`. Measured: `0x1p-1074` and `0x3p-1074` are
+        // `st=0`, `0x1.8p-1074` and `1e-320` are `st=overflow`.
+        assert!(try_parse_filter_chain(r#"{"dbnd":{"d":"0x1p-1074"}}"#).is_ok());
+        assert!(try_parse_filter_chain(r#"{"dbnd":{"d":"0x3p-1074"}}"#).is_ok());
+        for json in [
+            r#"{"dbnd":{"d":"0x1.8p-1074"}}"#,
+            r#"{"dbnd":{"d":"1e-320"}}"#,
+            r#"{"dbnd":{"d":"4.9e-324"}}"#,
+            r#"{"dbnd":{"d":"0x1p1024"}}"#,
+        ] {
+            assert!(
+                try_parse_filter_chain(json).is_err(),
+                "{json} is an ERANGE return in C"
+            );
+        }
+        // The `units` pointer is non-NULL at this call site, so a trailing
+        // word is not `S_stdlib_extraneous` — measured `v=16 units=[mA]`.
+        let u = try_parse_filter_chain(r#"{"dbnd":{"abs":"0x10 mA"}}"#).expect("units are kept");
+        assert!(u.apply(conv_ev(EpicsValue::Double(10.0))).is_some());
+        assert!(u.apply(conv_ev(EpicsValue::Double(20.0))).is_none());
     }
 
     /// `sync`'s `s` and `decimate`'s `n` are the two `Conv = 0` options

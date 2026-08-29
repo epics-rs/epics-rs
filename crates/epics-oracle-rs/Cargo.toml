@@ -23,6 +23,8 @@ serde_json = { version = "1", features = ["preserve_order"] }
 toml = "0.8"
 clap = { version = "4", features = ["derive"] }
 
+[features]
+
 [[bin]]
 name = "oracle"
 path = "src/bin/oracle.rs"

@@ -1,9 +1,9 @@
-//! Reactor-dependent in full: its mock source drives the monitor stream from a bare
-//! `tokio::spawn` that sleeps between posts, and under `rtems-exec-model` the
+//! Reactor-dependent in full: its mock source drives the monitor stream from a
+//! bare `tokio::spawn` that sleeps between posts, and under `exec_backend` the
 //! `runtime::task` seam drives that future on a `cbMedium` executor worker
 //! with no tokio reactor, so the fixture panics with "there is no reactor
 //! running". Gated at file scope because every test here shares that source.
-#![cfg(not(feature = "rtems-exec-model"))]
+#![cfg(tokio_backend)]
 
 //! Server-side regression: a mid-stream SET_BYTE_ORDER must re-latch the
 //! outbound order for an ALREADY-RUNNING monitor task, not only for the

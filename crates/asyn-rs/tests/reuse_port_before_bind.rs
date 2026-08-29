@@ -1,8 +1,8 @@
 //! R18-62: `SO_REUSEPORT` is set on the fresh socket, before bind/connect.
 //!
 //! C `connectIt` creates the socket (drvAsynIPPort.c:442), sets `SO_BROADCAST`
-//! (:448-459) and `SO_REUSEPORT` (:461-477) on it, and only then binds the local
-//! address (:495-506) and connects (:508-540). The kernel honours `SO_REUSEPORT`
+//! (:451-459) and `SO_REUSEPORT` (:464-477) on it, and only then binds the local
+//! address (:499-506) and connects (:513-523). The kernel honours `SO_REUSEPORT`
 //! only on an unbound socket, so the order is the feature: `udp&` exists so two
 //! ports can share one local port.
 //!
@@ -81,7 +81,7 @@ fn two_udp_reuseport_ports_share_one_local_port() {
     let mut second = DrvAsynIPPort::new("R1862B", &spec).unwrap();
     second.connect(&AsynUser::default()).expect(
         "a second udp& port must bind the SAME local port — SO_REUSEPORT has to be \
-         set before the bind (C drvAsynIPPort.c:461-477 then :495-506). Setting it \
+         set before the bind (C drvAsynIPPort.c:464-477 then :499-506). Setting it \
          on the already-bound socket leaves this EADDRINUSE.",
     );
 

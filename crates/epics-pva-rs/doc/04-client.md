@@ -14,7 +14,7 @@ of `Channel`s.
 | `client_native/beacon_throttle.rs` | Beacon dedup + GUID-restart detection. |
 | `client_native/channel.rs` | Per-PV state machine + `ConnectionPool`. |
 | `client_native/ops_v2.rs` | GET / PUT / MONITOR / RPC implementations with auto-reconnect. |
-| `client_native/decode.rs` | Frame parser used by the server-conn reader task. |
+| `decode.rs` (crate root, re-exported as `client_native::decode`) | Frame parser used by the server-conn reader task. |
 | `client_native/context.rs` | Public `PvaClient` + `PvaClientBuilder`. |
 
 ## Task topology
@@ -56,7 +56,7 @@ Holdoff: after a full pass where every candidate failed to reach Active,
 class *and* the resolver kind, because pvxs paces the two kinds through
 different machinery. A searched channel is paced by where it re-enters the
 search ring — 10 buckets out for a pre-`CREATE_CHANNEL` TCP failure
-(`SEARCH_RING_HOLDOFF`, ~10s at the 1Hz tick, `client.cpp:156-165`), the
+(`SEARCH_RING_HOLDOFF`, ~10s at the 1Hz tick, `src/client.cpp:156-165`), the
 current bucket for a `Creating`/`Active` disconnect (no holdoff), a full
 revolution for a `CREATE_CHANNEL` refusal. A forced-server channel has no
 ring: pvxs rebuilds its circuit and the `reconn` flag arms a flat 2s timer

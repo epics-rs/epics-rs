@@ -4,9 +4,9 @@
 //! individual dset. `devTimestamp.c` declares NO `init_record` in either dset
 //! (`:44` `devTimestampAI`, `:69` `devTimestampSI` — slot 4 is NULL), and its
 //! only two `prec->udf = FALSE` sites are `:40` and `:65`, both inside
-//! `read_ai`/`read_stringin`. `iocInit.c::doInitRecord0` (`:508-533`) never
+//! `read_ai`/`read_stringin`. `iocInit.c::doInitRecord0` (`:507-532`) never
 //! writes `udf`; it only reads it, to derive the initial severity
-//! (`:524-525`).
+//! (`:523-524`).
 //!
 //! The port cleared UDF in the framework, at the device-wiring boundary, under
 //! a `Record::val().is_some()` gate that is vacuous — `val()` is

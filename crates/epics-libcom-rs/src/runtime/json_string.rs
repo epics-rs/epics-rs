@@ -127,12 +127,14 @@ pub fn decode_json_string(src: &str) -> String {
 ///
 /// This is the ONE place a `.db` JSON string is turned into text. Every site
 /// that used to strip the quotes by hand went through the escapes untranslated.
+///
+/// The token is DOUBLE-quoted, always. The dialect's single-quoted spelling
+/// (`yajl_lex.c:695-699`) is rewritten by `epics_base_rs::json5`, which owns
+/// every dialect form; accepting it a second time here would put two owners
+/// back on the same grammar.
 pub fn decode_json_string_token(tok: &str) -> Option<String> {
     let t = tok.trim();
-    let inner = t
-        .strip_prefix('"')
-        .and_then(|r| r.strip_suffix('"'))
-        .or_else(|| t.strip_prefix('\'').and_then(|r| r.strip_suffix('\'')))?;
+    let inner = t.strip_prefix('"').and_then(|r| r.strip_suffix('"'))?;
     Some(decode_json_string(inner))
 }
 
@@ -198,7 +200,9 @@ mod tests {
             decode_json_string_token(r#""a\tb""#).as_deref(),
             Some("a\tb")
         );
-        assert_eq!(decode_json_string_token(r"'a\tb'").as_deref(), Some("a\tb"));
+        // Single-quoted text never reaches here: `json5::relaxed_to_strict`
+        // has already rewritten it to the double-quoted spelling.
+        assert_eq!(decode_json_string_token(r"'a\tb'"), None);
         assert_eq!(decode_json_string_token("5"), None);
         assert_eq!(decode_json_string_token("true"), None);
         assert_eq!(decode_json_string_token("{a:1}"), None);

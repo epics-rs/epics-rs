@@ -1,8 +1,17 @@
+// RTEMS-EXEC-MODEL-ALLOW(44): checked, not waived — all 44 ran and passed
+// on the exec backend (measured on this tree:
+// `EPICS_RS_BUILD_EXEC_BACKEND=thread cargo nextest run -p asyn-rs
+// --all-features`, 1081/1081). asyn-rs became a census subject when its
+// `build.rs` began deriving `tokio_backend`; nothing here builds a CA
+// server, and the reactor these obtain comes from `#[tokio::test]`
+// itself, which the backend does not remove.
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
 use epics_base_rs::error::{CaError, CaResult};
-use epics_base_rs::server::device_support::{DeviceReadOutcome, DeviceSupport, WriteCompletion};
+use epics_base_rs::server::device_support::{
+    DeviceInitOutcome, DeviceReadOutcome, DeviceSupport, DeviceUdf, PropertyPost, WriteCompletion,
+};
 use epics_base_rs::server::record::{Record, ScanType};
 use epics_base_rs::types::EpicsValue;
 
@@ -19,7 +28,10 @@ use crate::user::{AsynUser, DEFAULT_TIMEOUT, timeout_from_secs};
 pub struct AsynLink {
     pub port_name: String,
     pub addr: i32,
-    pub timeout: Duration,
+    /// `None` is the link's negative timeout — C's "wait forever"
+    /// (`@asyn(PORT,0,-1)`, asynEpicsUtils.c:125). See
+    /// [`crate::user::AsynUser::timeout`].
+    pub timeout: Option<Duration>,
     pub drv_info: String,
 }
 
@@ -34,6 +46,24 @@ pub struct AsynLink {
 /// so there is no trailing remainder for C's `endp` walk to pick up;
 /// rejecting a partly-numeric field is closer to the link parser's intent
 /// than silently binding its leading digits.
+/// The outcome of a store that landed a value.
+///
+/// `wrote_val` is `store_read_value`'s answer: `true` when the adapter
+/// produced the finished VAL (C `return 2`), `false` when it left the raw
+/// reading in RVAL for the record to convert (C `return 0`). Either way the
+/// record is DEFINED, because every asyn dset pairs its success arm with
+/// `pr->udf = 0` before returning — `processAi:850-852`, `processBi:1161-1164`,
+/// `processMbbi:1268-1270`, `processLi:1057-1060` (devAsynInt32.c). Kept here
+/// rather than on `DeviceReadOutcome` so the framework's constructors never
+/// grow a form that infers UDF from the value half.
+fn stored(wrote_val: bool) -> DeviceReadOutcome {
+    if wrote_val {
+        DeviceReadOutcome::computed(DeviceUdf::Defined)
+    } else {
+        DeviceReadOutcome::converted(DeviceUdf::Defined)
+    }
+}
+
 fn split_base0(tok: &str) -> Option<(bool, &str, u32)> {
     let tok = tok.trim();
     let (neg, rest) = match tok.strip_prefix('-') {
@@ -117,15 +147,15 @@ pub fn parse_asyn_link(s: &str) -> Result<AsynLink, AsynError> {
     };
     let timeout = if parts.len() > 2 {
         // C asynEpicsUtils.c:125 `strtod(pnext, &endp)` into `pasynUser->timeout`.
-        // A negative value ("wait forever" in C) is accepted there and bounded
-        // here; `timeout_from_secs` owns that substitution under DRV-42.
+        // A negative value is C's "wait forever" and reaches the drivers as one;
+        // `timeout_from_secs` owns that mapping (DRV-42).
         let secs: f64 = parts[2]
             .parse()
             .map_err(|_| AsynError::InvalidLinkSyntax(format!("invalid timeout: {}", parts[2])))?;
         timeout_from_secs(secs)
     } else {
         // C asynEpicsUtils.c:109,121 — `pasynUser->timeout = 1.0`.
-        DEFAULT_TIMEOUT
+        Some(DEFAULT_TIMEOUT)
     };
 
     Ok(AsynLink {
@@ -142,7 +172,8 @@ pub struct AsynMaskLink {
     pub port_name: String,
     pub addr: i32,
     pub mask: u32,
-    pub timeout: Duration,
+    /// `None` is C's "wait forever" — see [`AsynLink::timeout`].
+    pub timeout: Option<Duration>,
     pub drv_info: String,
 }
 
@@ -191,7 +222,7 @@ pub fn parse_asyn_mask_link(s: &str) -> Result<AsynMaskLink, AsynError> {
             .map_err(|_| AsynError::InvalidLinkSyntax(format!("invalid timeout: {}", parts[3])))?;
         timeout_from_secs(secs)
     } else {
-        DEFAULT_TIMEOUT
+        Some(DEFAULT_TIMEOUT)
     };
 
     Ok(AsynMaskLink {
@@ -206,13 +237,13 @@ pub fn parse_asyn_mask_link(s: &str) -> Result<AsynMaskLink, AsynError> {
 /// asynInt32 `@asynMask` bit-count (nbits) configuration.
 ///
 /// For the **asynInt32** interface the third `@asynMask` argument is a
-/// signed bit COUNT, not a raw bitmask (C devAsynInt32.c:232-247):
+/// signed bit COUNT, not a raw bitmask (C devAsynInt32.c:233-248):
 /// a negative count selects *bipolar* handling (sign-extend on read),
 /// a positive count *unipolar* (plain low-bit mask). The derived `mask`
 /// keeps the low `|nbits|` bits; `sign_bit` is the top of that field;
 /// `device_low`/`device_high` are the raw device range used for the
 /// LINEAR ESLO/EOFF slope (convertAi:444-451), and they take precedence
-/// over the driver's `getBounds` (initAi:822-826).
+/// over the driver's `getBounds` (initAi:824-827).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct Int32Mask {
     mask: u32,
@@ -276,7 +307,8 @@ impl Int32Mask {
 pub struct AsynDeviceSupport {
     handle: PortHandle,
     addr: i32,
-    timeout: Duration,
+    /// `None` is the link's "wait forever" — see [`AsynLink::timeout`].
+    timeout: Option<Duration>,
     drv_info: String,
     reason: usize,
     reason_set: bool,
@@ -339,9 +371,9 @@ pub struct AsynDeviceSupport {
     /// `asynFloat64Average`, both ai-only). The always-on interrupt callback
     /// accumulates samples into the [`SumAverager`](crate::interfaces::average::SumAverager);
     /// the periodic record process drains the arithmetic mean — C
-    /// `interruptCallbackAverage` (devAsynInt32.c:870-872 /
-    /// devAsynFloat64.c:687-694) + `processAiAverage` (devAsynInt32.c:895-918 /
-    /// devAsynFloat64.c:716-735). Only the periodic-SCAN model (mean of all
+    /// `interruptCallbackAverage` (devAsynInt32.c:647-710 /
+    /// devAsynFloat64.c:464-521) + `processAiAverage` (devAsynInt32.c:887-928 /
+    /// devAsynFloat64.c:708-755). Only the periodic-SCAN model (mean of all
     /// samples since the last process) is ported; the I/O Intr SVAL-decimation
     /// model is a documented residual.
     average: Option<Arc<AverageState>>,
@@ -540,8 +572,9 @@ struct TimeSeriesInner {
     busy: bool,
     /// Buffer capacity = record NELM, captured at init.
     nelm: usize,
-    /// Accumulated samples, typed to FTVL (set at init; `None` until then or if
-    /// FTVL is invalid — the record then never acquires, matching C's dead record).
+    /// Accumulated samples, typed to FTVL. `None` only before init has run: an
+    /// invalid FTVL kills the record instead (`DeviceInitOutcome::Dead`), so a
+    /// record that ever processes has a typed buffer.
     buf: Option<TsBuf>,
     /// Transport status of the most recent erroring sample (C `pPvt->status =
     /// pasynUser->auxStatus`), applied as a READ_ALARM and cleared by the next
@@ -685,7 +718,7 @@ impl AsynDeviceSupport {
     ///
     /// For the `asynInt32` interface the same `@asynMask` 3rd arg is a
     /// signed bit COUNT (nbits), not a raw bitmask (C devAsynInt32.c:
-    /// 232-247): reinterpret the stored 32-bit pattern as `i32` and derive
+    /// 233-248): reinterpret the stored 32-bit pattern as `i32` and derive
     /// the mask + sign-extend + device-bounds config from it.
     pub fn with_mask(mut self, mask: u32) -> Self {
         self.mask = mask;
@@ -930,7 +963,7 @@ fn asyn_error_to_alarm(e: &AsynError) -> (u16, u16) {
 /// C `NDPluginStdArrays::processCallbacks` fires an interrupt on every one of
 /// the six array interfaces, each running `pNDArrayPool->convert(pArray, ...,
 /// signedType)` so a record on any interface receives its own type-converted
-/// copy (NDPluginStdArrays.cpp:169-197). The Rust runtime carries a single
+/// copy (NDPluginStdArrays.cpp:170-197). The Rust runtime carries a single
 /// native-typed array per param; this routes it through the same per-interface
 /// `convert` the polled `readArray` path uses ([`AsynDeviceSupport::result_to_value`]),
 /// so an I/O Intr waveform whose FTVL differs from the array's native element
@@ -1108,7 +1141,7 @@ impl AsynDeviceSupport {
     /// them on the record. Caller has already verified the record
     /// exposes ESLO and the interface is `asynInt32` / `asynInt64`.
     fn apply_linear_eslo_eoff(&self, record: &mut dyn Record) {
-        // C devAsynInt32.c:822-826 — the nbits-derived deviceLow/High (set
+        // C devAsynInt32.c:824-827 — the nbits-derived deviceLow/High (set
         // when @asynMask gives a bit count) take precedence; `getBounds` is
         // the fallback only when no nbits was specified.
         let (low, high) = if let Some(m) = self.int32_mask {
@@ -1121,7 +1154,7 @@ impl AsynDeviceSupport {
             };
             let user = AsynUser::new(self.reason)
                 .with_addr(self.addr)
-                .with_timeout(self.timeout);
+                .with_timeout_opt(self.timeout);
             let result = match self.handle.submit_blocking(op, user) {
                 Ok(r) => r,
                 Err(_) => return,
@@ -1480,7 +1513,7 @@ impl AsynDeviceSupport {
                 // ASLO/AOFF scaling (`VAL = value*ASLO + AOFF`), the float64
                 // twin of `apply_raw_readback`. ai is caught above (it carries
                 // SMOO); ao has ASLO/AOFF but no SMOO so it lands here. C
-                // `processAo` (devAsynFloat64.c:646-649). Returning `true`
+                // `processAo` (devAsynFloat64.c:647-649). Returning `true`
                 // skips the forward convert, matching INIT_DO_NOT_CONVERT.
                 if record.apply_float64_readback(raw) {
                     return true;
@@ -1547,7 +1580,7 @@ impl AsynDeviceSupport {
     }
 
     /// The ASLO/AOFF/SMOO arithmetic of C `devAsynFloat64::processAi`
-    /// (devAsynFloat64.c:595-602). `ASLO`/`AOFF`/`SMOO` are read live so a
+    /// (devAsynFloat64.c:596-602). `ASLO`/`AOFF`/`SMOO` are read live so a
     /// runtime change takes effect on the next read. SMOO primes on the first
     /// read (C skips smoothing while `pr->udf`); `smoo_primed` is the
     /// adapter-side `!udf` for the float64 path (the adapter is the sole VAL
@@ -1672,7 +1705,7 @@ impl AsynDeviceSupport {
 }
 
 impl DeviceSupport for AsynDeviceSupport {
-    fn init(&mut self, record: &mut dyn Record) -> CaResult<()> {
+    fn init(&mut self, record: &mut dyn Record) -> CaResult<DeviceInitOutcome> {
         // busy is the driver-clearable output: the busy module's devBusyAsyn
         // registers the output interrupt callback UNCONDITIONALLY (`if
         // (interruptCallback)` with no `asyn:READBACK` info gate,
@@ -1709,18 +1742,47 @@ impl DeviceSupport for AsynDeviceSupport {
                     Err(e) => {
                         // Param not found, or the driver rejected the bind (e.g. an
                         // out-of-range offset) — this record cannot bind to a param.
-                        // C prints and `goto bad` (devAsynInt32.c:272-276).
+                        // C prints and `goto bad` (devAsynInt32.c:272-276), whose
+                        // body raises LINK_ALARM/INVALID and sets `pr->pact = 1`
+                        // (:348-351). Leaving the record live would let it keep
+                        // processing against reason 0 — a different parameter —
+                        // and report whatever that one holds.
                         eprintln!(
                             "[asyn] init FAILED: port='{}' drv_info='{}' err={e}",
                             self.handle.port_name(),
                             self.drv_info
                         );
                         self.reason_set = false;
-                        return Ok(());
+                        return Ok(DeviceInitOutcome::dead_with_alarm(
+                            epics_base_rs::server::recgbl::alarm_status::LINK_ALARM,
+                            epics_base_rs::server::record::AlarmSeverity::Invalid,
+                        ));
                     }
                 }
             }
             self.reason_set = true;
+        }
+
+        // asynOctetCmdResponse misconfiguration: C initCmdBuffer
+        // (devAsynOctet.c:631-637) rejects the command outright — `precord->pact
+        // = 1`, recGblSetSevr(LINK_ALARM, INVALID_ALARM), INIT_ERROR — when, and
+        // ONLY when, the RAW userParam (the pre-escape DRVINFO) is empty:
+        // `strlen(pPvt->userParam) == 0`. The translated byte length (bufLen) is
+        // computed later (:641) and may be 0 for a non-empty DRVINFO that escapes
+        // to a leading NUL — that case is NOT rejected; C does a 0-byte
+        // writeIt+readIt. So gate the reject on the raw DRVINFO, not on the
+        // post-truncation command: a Some(empty) octet_cmd from a leading-NUL
+        // command falls through to a 0-byte OctetWriteRead. octet_cmd is None for
+        // a plain asynOctetRead, so this only fires for a CmdResponse record.
+        if self.octet_cmd.is_some() && self.drv_info.is_empty() {
+            eprintln!(
+                "[asyn] asynOctetCmdResponse port='{}': no userParam (empty command)",
+                self.handle.port_name()
+            );
+            return Ok(DeviceInitOutcome::dead_with_alarm(
+                epics_base_rs::server::recgbl::alarm_status::LINK_ALARM,
+                epics_base_rs::server::record::AlarmSeverity::Invalid,
+            ));
         }
 
         // Read NELM from the record to set max_array_elements for array reads.
@@ -1734,10 +1796,14 @@ impl DeviceSupport for AsynDeviceSupport {
 
         // Time-series FTVL validation + buffer sizing. C `initRecord`
         // (devAsynXXXTimeSeries.h:73-77) requires FTVL be the signed or unsigned
-        // EPICS type of the interface, else errlogPrintf + pact=1 (dead record).
-        // Mirror that: on an invalid FTVL the buffer stays `None`, so the record
-        // never accumulates or commits. menuFtype indices: LONG=5, ULONG=6,
-        // INT64=7, UINT64=8, DOUBLE=10.
+        // EPICS type of the interface, else `errlogPrintf` + `goto bad`, whose
+        // whole body is `pr->pact = 1; return -1` (:118-120). Mirror that
+        // literally: print, then return `Dead` so the framework leaves the record
+        // in PACT and `dbProcess` refuses every later entry — PACT reads 1
+        // forever, BUSY stays 0 and `caput REC.RARM 1` sets RPRO and processes
+        // nothing. The early return is C's `goto bad` skipping the rest of
+        // initRecord. menuFtype indices: LONG=5, ULONG=6, INT64=7, UINT64=8,
+        // DOUBLE=10.
         if let Some(ts) = self.time_series.clone() {
             let ftvl = match record.get_field("FTVL") {
                 Some(EpicsValue::Short(v)) => v,
@@ -1768,11 +1834,12 @@ impl DeviceSupport for AsynDeviceSupport {
                 None => {
                     eprintln!(
                         "[asyn] TimeSeries port='{}' drv_info='{}': FTVL must be the \
-                         signed/unsigned EPICS type of {} — record will not acquire",
+                         signed/unsigned EPICS type of {}",
                         self.handle.port_name(),
                         self.drv_info,
                         self.iface_type
                     );
+                    return Ok(DeviceInitOutcome::dead());
                 }
             }
         }
@@ -1835,7 +1902,7 @@ impl DeviceSupport for AsynDeviceSupport {
         // mbboDirect are uint32digital-only), so NOBT presence selects them.
         //
         // C shifts the record's CURRENT mask, overriding to 0xffffffff only
-        // when NOBT==0. mbbiRecord/mbboRecord init (mbbiRecord.c:128-130) sets
+        // when NOBT==0. mbbiRecord/mbboRecord init (mbbiRecord.c:129-130) sets
         // that current mask to a `.db`-loaded MASK, or to `(1<<NOBT)-1` only
         // when MASK was 0 — so mirroring `current << SHFT` here (rather than
         // rebuilding `(1<<NOBT)-1`) preserves a `.db`-set custom MASK and
@@ -1864,7 +1931,7 @@ impl DeviceSupport for AsynDeviceSupport {
 
         // ai/ao LINEAR ESLO/EOFF wiring.
         //
-        // C devAsynInt32.c::initAi (line 822-828) / initAo / initAiAverage:
+        // C devAsynInt32.c::initAi (line 824-828) / initAo / initAiAverage:
         //
         //     if (deviceLow == 0 && deviceHigh == 0) {
         //         pasynInt32SyncIO->getBounds(..., &deviceLow, &deviceHigh);
@@ -1884,7 +1951,7 @@ impl DeviceSupport for AsynDeviceSupport {
         }
 
         // Driver enum-string table -> record state fields. C asyn int32/uint32
-        // device support (devAsynInt32.c::initCommon:297-324,
+        // device support (devAsynInt32.c::initCommon:298-324,
         // devAsynUInt32Digital.c:547-601) queries the driver's asynEnum
         // interface and `setEnums` the strings/values/severities onto the
         // record (ZRST/ZRVL/ZRSV… for mbbi/mbbo, ZNAM/ONAM… for bi/bo). The
@@ -1897,7 +1964,7 @@ impl DeviceSupport for AsynDeviceSupport {
         if let Some(shape) = EnumRecordShape::of_record(record) {
             let user = AsynUser::new(self.reason)
                 .with_addr(self.addr)
-                .with_timeout(self.timeout);
+                .with_timeout_opt(self.timeout);
             if let Ok(result) = self.handle.submit_blocking(RequestOp::EnumRead, user) {
                 if let Some(entries) = result.enum_entries {
                     self.apply_enum_table(record, &entries);
@@ -1916,7 +1983,7 @@ impl DeviceSupport for AsynDeviceSupport {
             if let Some(op) = self.read_op() {
                 let user = AsynUser::new(self.reason)
                     .with_addr(self.addr)
-                    .with_timeout(self.timeout);
+                    .with_timeout_opt(self.timeout);
                 if let Ok(result) = self.handle.submit_blocking(op, user) {
                     // Seed the output record's value only on a successful read,
                     // mirroring C initAo/initLongout/initMbbo: `if (status ==
@@ -1935,7 +2002,7 @@ impl DeviceSupport for AsynDeviceSupport {
                             // have no such inverse (VAL == raw / state-map) and
                             // decline the hook (default `false`). An asynFloat64
                             // ao seeds VAL with the forward ASLO/AOFF scaling
-                            // (C `initAo`, devAsynFloat64.c:627-629) via the
+                            // (C `initAo`, devAsynFloat64.c:628-630) via the
                             // float64 readback hook.
                             let seeded = match val {
                                 EpicsValue::Long(raw) => record.apply_raw_readback(raw),
@@ -1957,7 +2024,7 @@ impl DeviceSupport for AsynDeviceSupport {
         if self.scan == ScanType::IoIntr {
             self.refresh_average_decimation_threshold(record);
         }
-        Ok(())
+        Ok(DeviceInitOutcome::Live)
     }
 
     fn read(&mut self, record: &mut dyn Record) -> CaResult<DeviceReadOutcome> {
@@ -1983,15 +2050,9 @@ impl DeviceSupport for AsynDeviceSupport {
                 // cannot carry RARM/BUSY — nothing to commit.
                 return Ok(DeviceReadOutcome::ok());
             };
-            // Invalid FTVL leaves `buf` None: the record cannot acquire. C makes
-            // it DEAD at init (`goto bad; pr->pact=1`, devAsynXXXTimeSeries.h:73-77,
-            // 118-120) so it never processes and BUSY stays 0. The port has no
-            // device-driven dead-record, so read() is inert here — leaving BUSY,
-            // NORD, VAL and RARM untouched — so a stray `caput RARM` cannot flip
-            // BUSY or emit completion traffic on a misconfigured record.
-            if ts.inner.lock().unwrap().buf.is_none() {
-                return Ok(DeviceReadOutcome::computed());
-            }
+            // `buf` is Some here by construction: init returns
+            // `DeviceInitOutcome::Dead` on an invalid FTVL, so a record that
+            // reached process has a typed buffer.
             let rarm = wf.rarm;
             let (arr, busy, status) = {
                 let mut st = ts.inner.lock().unwrap();
@@ -2038,24 +2099,9 @@ impl DeviceSupport for AsynDeviceSupport {
             self.last_alarm_status = a_status;
             self.last_alarm_severity = a_sev;
             // VAL written directly → skip the record's RVAL→VAL convert.
-            return Ok(DeviceReadOutcome::computed());
-        }
-
-        // asynOctetCmdResponse misconfiguration: C initCmdBuffer
-        // (devAsynOctet.c:631-637) rejects the command outright —
-        // recGblSetSevr(prec, LINK_ALARM, INVALID_ALARM) + INIT_ERROR — when, and
-        // ONLY when, the RAW userParam (the pre-escape DRVINFO) is empty:
-        // `strlen(pPvt->userParam) == 0`. The translated byte length (bufLen) is
-        // computed later (:641) and may be 0 for a non-empty DRVINFO that escapes
-        // to a leading NUL — that case is NOT rejected; C does a 0-byte
-        // writeIt+readIt. So gate the reject on the raw DRVINFO, not on the
-        // post-truncation command: a Some(empty) octet_cmd from a leading-NUL
-        // command falls through to a 0-byte OctetWriteRead. octet_cmd is None for
-        // a plain asynOctetRead, so this only fires for a CmdResponse record.
-        if self.octet_cmd.is_some() && self.drv_info.is_empty() {
-            self.last_alarm_status = epics_base_rs::server::recgbl::alarm_status::LINK_ALARM;
-            self.last_alarm_severity = epics_base_rs::server::record::AlarmSeverity::Invalid as u16;
-            return Ok(DeviceReadOutcome::ok());
+            // C `devAsynXXXTimeSeries.h::processCommon` commits the array and
+            // the record is defined by it; `Defined` is that fact.
+            return Ok(DeviceReadOutcome::computed(DeviceUdf::Defined));
         }
 
         // Write-only (asynOctetWrite / asynOctetWriteBinary): waveform is an input
@@ -2078,7 +2124,7 @@ impl DeviceSupport for AsynDeviceSupport {
                 if let Some(op) = op {
                     let user = AsynUser::new(self.reason)
                         .with_addr(self.addr)
-                        .with_timeout(self.timeout);
+                        .with_timeout_opt(self.timeout);
                     // Apply the write result's alarm, mirroring the read path
                     // (and C callbackWfWrite/WriteBinary: writeIt -> result.status
                     // -> finish recGblSetSevr, devAsynOctet.c:1071-1076,1086-1091).
@@ -2124,7 +2170,7 @@ impl DeviceSupport for AsynDeviceSupport {
         // (io_intr_receiver) has been accumulating samples into the SumAverager
         // since iocInit. On each periodic record process, drain the arithmetic
         // mean since the last process and reset — C `processAiAverage`
-        // (devAsynInt32.c:895-918, devAsynFloat64.c:716-735). Reuses the normal
+        // (devAsynInt32.c:887-928, devAsynFloat64.c:708-755). Reuses the normal
         // ai store paths: int32 routes the rounded mean to RVAL (the ai record's
         // convert applies ESLO/EOFF), float64 sets VAL directly (ASLO/AOFF/SMOO
         // applied in-dset) — averaging only changes the *source* of the raw
@@ -2174,32 +2220,34 @@ impl DeviceSupport for AsynDeviceSupport {
                         // the averaged value — `if (result.status ==
                         // asynSuccess) { store } else { result.status =
                         // asynSuccess; return -1 }` (devAsynInt32.c:919-927,
-                        // devAsynFloat64.c:736-754). `computed()` skips the
-                        // store so RVAL/VAL keep their previous value; the
+                        // devAsynFloat64.c:736-754). `failed()` is that -1:
+                        // no store, so RVAL/VAL keep their previous value, and
+                        // no UDF re-derive either — C reaches the same place by
+                        // missing `aiRecord.c:161`'s `status == 0` gate. The
                         // mapped READ/TIMEOUT/...@INVALID alarm above stands.
-                        return Ok(DeviceReadOutcome::computed());
+                        return Ok(DeviceReadOutcome::failed());
                     }
-                    // Transport success: store the mean (C return 0/2).
-                    let skip_convert = self.store_read_value(record, val);
-                    return Ok(if skip_convert {
-                        DeviceReadOutcome::computed()
-                    } else {
-                        DeviceReadOutcome::ok()
-                    });
+                    // Transport success: store the mean and define the
+                    // record — C `processAiAverage` ends `pr->rval = rval;
+                    // pr->udf = 0; return 0` (devAsynInt32.c:1082-1085).
+                    let wrote_val = self.store_read_value(record, val);
+                    return Ok(stored(wrote_val));
                 }
                 None => {
                     // No samples since the last process. C `processAiAverage`
-                    // sets UDF_ALARM/INVALID and returns -2 (VAL untouched) —
-                    // devAsynInt32.c:900-904, devAsynFloat64.c:721-725.
-                    // `computed()` skips the RVAL→VAL convert so VAL keeps its
-                    // previous value (no store_read_value call). NOTE: C also
-                    // sets the record's `udf=1` boolean; device support has no
-                    // channel to set that field here — the UDF_ALARM/INVALID
-                    // alarm is raised, the `udf` boolean is the documented gap.
+                    // sets UDF_ALARM/INVALID, sets the record's `udf = 1` and
+                    // returns -2 with VAL untouched — devAsynInt32.c:900-904,
+                    // devAsynFloat64.c:721-725, devAsynInt64.c:829-833.
+                    // `undefined()` is that -2: it skips the RVAL→VAL convert
+                    // so VAL keeps its previous value, suppresses the framework's
+                    // per-cycle UDF re-derive (which `aiRecord.c:161` gates on
+                    // `status == 0`), and carries the `udf = 1` assertion for the
+                    // framework to apply — device support holds a `&mut dyn
+                    // Record` and cannot reach `RecordInstance.common` itself.
                     self.last_alarm_status = epics_base_rs::server::recgbl::alarm_status::UDF_ALARM;
                     self.last_alarm_severity =
                         epics_base_rs::server::record::AlarmSeverity::Invalid as u16;
-                    return Ok(DeviceReadOutcome::computed());
+                    return Ok(DeviceReadOutcome::undefined());
                 }
             }
         }
@@ -2232,7 +2280,13 @@ impl DeviceSupport for AsynDeviceSupport {
                     "ring buffer overflows (C asyn ASYN_TRACE_WARNING)"
                 );
             }
-            let mut skip_convert = true;
+            // C's negative-status default: nothing has been stored yet, so
+            // unless a store below lands a value this cycle sourced none
+            // (`return -1`) — an empty ring, a transport error, or a value
+            // this record's interface cannot read. Starting here rather than
+            // at `computed()` is what keeps a store-nothing path from
+            // declaring the record defined.
+            let mut read_outcome = DeviceReadOutcome::failed();
             if let Some(ci) = entry {
                 // Direction-aware default for the transport-status mapping: C
                 // `asynStatusToEpicsAlarm` takes READ_ALARM for input device
@@ -2270,18 +2324,20 @@ impl DeviceSupport for AsynDeviceSupport {
                 // :1201-1204), and the array process() copies bptr/nord only
                 // `if (rp->status == asynSuccess)` (devAsynXXXArray.cpp:317).
                 // On a transport error keep the prior value (skip the store);
-                // `skip_convert` stays true so the record skips the RVAL→VAL
-                // convert and keeps its previous value = C return -1.
+                // `read_outcome` stays `failed()` so the record skips the
+                // RVAL→VAL convert, keeps its previous value and re-derives no
+                // UDF = C return -1.
                 if ci.aux_status == crate::error::AsynStatus::Success {
                     // Derive the value through THIS record's interface, the same
                     // way the polled path does (`result_to_value`): an array
                     // interrupt gets the per-interface `convert` (C fires all six
-                    // array interfaces, NDPluginStdArrays.cpp:169-197) and a
+                    // array interfaces, NDPluginStdArrays.cpp:170-197) and a
                     // scalar gets its interface's read rule.
                     match self.param_value_for_iface(&ci.value) {
                         Ok(Some(val)) => {
                             let val = self.cap_octet_read_value(val);
-                            skip_convert = self.store_read_value(record, val);
+                            let wrote_val = self.store_read_value(record, val);
+                            read_outcome = stored(wrote_val);
                         }
                         Ok(None) => {}
                         // The driver fired a value this record's interface cannot
@@ -2301,22 +2357,20 @@ impl DeviceSupport for AsynDeviceSupport {
                     }
                 }
             }
-            // Honor store_read_value's skip-convert decision: computed()
-            // (skip RVAL→VAL convert, C return 2) for paths that produced
-            // the final VAL themselves, ok() (run the record convert, C
-            // return 0) for the asynInt32 ai path that routed raw to RVAL.
-            return Ok(if skip_convert {
-                DeviceReadOutcome::computed()
-            } else {
-                DeviceReadOutcome::ok()
-            });
+            // Whatever the store decided, or the `failed()` this started as
+            // when no store ran at all.
+            return Ok(read_outcome);
         }
 
-        let mut skip_convert = true;
+        // Same negative-status default as the I/O Intr branch: a non-success
+        // `processAi` read stores nothing and returns -1
+        // (devAsynInt32.c:848-855), so the record neither converts nor
+        // re-derives UDF.
+        let mut read_outcome = DeviceReadOutcome::failed();
         if let Some(op) = self.read_op() {
             let user = AsynUser::new(self.reason)
                 .with_addr(self.addr)
-                .with_timeout(self.timeout);
+                .with_timeout_opt(self.timeout);
             match self.handle.submit_blocking(op, user) {
                 Ok(result) => {
                     // Gate the value store on the device read status, mirroring
@@ -2328,7 +2382,8 @@ impl DeviceSupport for AsynDeviceSupport {
                     // store-only gate as the I/O Intr ring.
                     if result.aux_status == crate::error::AsynStatus::Success {
                         if let Some(val) = self.result_to_value(&result) {
-                            skip_convert = self.store_read_value(record, val);
+                            let wrote_val = self.store_read_value(record, val);
+                            read_outcome = stored(wrote_val);
                         }
                     }
                     self.last_alarm_status = result.alarm_status;
@@ -2345,8 +2400,8 @@ impl DeviceSupport for AsynDeviceSupport {
                     // `pwf->bptr`; readIt returns the failing status but the
                     // data is in the record. Only the success-gated fields
                     // (UDF, NORD/LEN — callbackSiRead:924-931,
-                    // callbackWfRead:1055-1061) stay untouched, which is what
-                    // the alarm below plus `skip_convert` express here.
+                    // callbackWfRead:1055-1061) stay untouched, which is why
+                    // the store below pairs with `DeviceUdf::Untouched`.
                     // Dropping the value on the error path is what R6-48's
                     // partial never reached.
                     if let Some(partial) = e.partial_read() {
@@ -2356,7 +2411,12 @@ impl DeviceSupport for AsynDeviceSupport {
                             partial.eom_reason.bits(),
                         );
                         if let Some(val) = self.result_to_value(&result) {
-                            skip_convert = self.store_read_value(record, val);
+                            let wrote_val = self.store_read_value(record, val);
+                            read_outcome = if wrote_val {
+                                DeviceReadOutcome::computed(DeviceUdf::Untouched)
+                            } else {
+                                DeviceReadOutcome::ok()
+                            };
                         }
                     }
                     // Convert asyn error to EPICS alarm (C parity: asynStatusToEpicsAlarm)
@@ -2366,12 +2426,8 @@ impl DeviceSupport for AsynDeviceSupport {
                 }
             }
         }
-        // computed()/ok() per store_read_value (see the I/O Intr branch above).
-        Ok(if skip_convert {
-            DeviceReadOutcome::computed()
-        } else {
-            DeviceReadOutcome::ok()
-        })
+        // Whatever the store decided, or the `failed()` this started as.
+        Ok(read_outcome)
     }
 
     fn write(&mut self, record: &mut dyn Record) -> CaResult<()> {
@@ -2382,7 +2438,7 @@ impl DeviceSupport for AsynDeviceSupport {
             if let Some(op) = self.write_op(&val) {
                 let user = AsynUser::new(self.reason)
                     .with_addr(self.addr)
-                    .with_timeout(self.timeout);
+                    .with_timeout_opt(self.timeout);
                 self.handle
                     .submit_blocking(op, user)
                     .map_err(asyn_to_ca_error)?;
@@ -2462,7 +2518,7 @@ impl DeviceSupport for AsynDeviceSupport {
         };
         let user = AsynUser::new(self.reason)
             .with_addr(self.addr)
-            .with_timeout(self.timeout);
+            .with_timeout_opt(self.timeout);
 
         // For non-blocking ports, use synchronous submit to match C EPICS behavior:
         // the write completes within the same dbProcess call, so CP chain targets
@@ -2499,7 +2555,7 @@ impl DeviceSupport for AsynDeviceSupport {
         // coalescing mailbox. The callback appends to the buffer only while BUSY
         // (C `if (pPvt->busy)`) and, when the buffer fills, clears BUSY and wakes
         // the record to process (C `callbackRequestProcessCallback`,
-        // devAsynXXXTimeSeries.h:201-211). Process registration/cancellation by
+        // devAsynXXXTimeSeries.h:202-212). Process registration/cancellation by
         // BUSY (C process) is folded into this always-on callback's BUSY gate —
         // a not-busy sample is a no-op either way, so the observable behaviour is
         // identical without dynamic register/cancel churn.
@@ -2571,7 +2627,7 @@ impl DeviceSupport for AsynDeviceSupport {
 
         // Averaging device support (asynInt32Average / asynFloat64Average):
         // register an ALWAYS-ON accumulating callback regardless of SCAN (C
-        // enables the averaging callback unconditionally, devAsynInt32.c:385-386).
+        // enables the averaging callback unconditionally, devAsynInt32.c:386-394).
         // It is SYNCHRONOUS (register_sync_callback / C registerInterruptUser),
         // not a mailbox subscription: averaging must observe every sample, and
         // the mailbox coalesces rapid updates to the latest — which would drop
@@ -2736,9 +2792,11 @@ impl DeviceSupport for AsynDeviceSupport {
         // updates, so no data is lost even if the record processes slowly.
         let (tx, rx) = tokio::sync::mpsc::channel(16);
         let fifo = self.interrupt_fifo.clone();
-        tokio::spawn(async move {
+        // The pump only moves values between channels, so it places cleanly on
+        // whichever executor `runtime::task` resolves to.
+        crate::runtime::task::spawn(async move {
             while let Some(iv) = intr_rx.recv().await {
-                // C parity (asynPortDriver.cpp:729 + devAsynUInt32Digital.c:464):
+                // C parity (asynPortDriver.cpp:729 + devAsynUInt32Digital.c:463):
                 // deliver `mask & value` for UInt32Digital so the I/O-Intr value
                 // matches the polled read (RequestOp::UInt32DigitalRead { mask }).
                 // interruptCallbackInput stores the already-masked value in the
@@ -2797,7 +2855,7 @@ impl DeviceSupport for AsynDeviceSupport {
     /// Averaging records (`average.is_some()`) also need the driver-callback
     /// path wired regardless of SCAN — the accumulating interrupt must run on
     /// every driver sample while the record scans periodically. C enables the
-    /// averaging callback always, independent of SCAN (devAsynInt32.c:385-386).
+    /// averaging callback always, independent of SCAN (devAsynInt32.c:386-394).
     /// `io_intr_receiver` returns `None` for the average case, so this only
     /// arms the accumulating subscription; it spawns no reprocess task (the
     /// record scans on its own period, not per callback).
@@ -2848,11 +2906,9 @@ impl DeviceSupport for AsynDeviceSupport {
         self.asyn_readback
     }
 
-    fn property_post_receiver(
-        &mut self,
-    ) -> Option<tokio::sync::mpsc::Receiver<Vec<(String, EpicsValue)>>> {
+    fn property_post_receiver(&mut self) -> Option<tokio::sync::mpsc::Receiver<PropertyPost>> {
         // Runtime asynEnum table re-propagation. C devAsynInt32.c registers a
-        // per-record enum callback (callbackEnum, :711-762) that re-applies
+        // per-record enum callback (callbackEnum, :712-766) that re-applies
         // `setEnums` + `db_post_events(DBE_PROPERTY)` whenever the driver
         // changes the table via `doCallbacksEnum`. Gate exactly as C's
         // `findInterface(asynEnumType) && maxEnums>0`: only a record that
@@ -2887,7 +2943,7 @@ impl DeviceSupport for AsynDeviceSupport {
 
         let (tx, rx) = tokio::sync::mpsc::channel(16);
         let mut last_choices = self.enum_choices.clone();
-        tokio::spawn(async move {
+        crate::runtime::task::spawn(async move {
             while let Some(iv) = intr_rx.recv().await {
                 let crate::param::ParamValue::Enum { choices, .. } = &iv.value else {
                     continue;
@@ -2900,8 +2956,15 @@ impl DeviceSupport for AsynDeviceSupport {
                     continue;
                 }
                 last_choices = Some(choices.clone());
-                let fields = enum_table_fields(shape, choices);
-                if tx.send(fields).await.is_err() {
+                // C posts on VAL for every one of the eight callbacks —
+                // mbbi/mbbo (`&pr->val` after a 16-state setEnums) and bi/bo
+                // (2-state) alike — so the target is uniform across both
+                // `EnumRecordShape`s and needs no per-shape branch.
+                let post = PropertyPost {
+                    writes: enum_table_fields(shape, choices),
+                    post_field: "VAL".to_string(),
+                };
+                if tx.send(post).await.is_err() {
                     break;
                 }
             }
@@ -3062,7 +3125,7 @@ pub fn universal_asyn_factory(
     }
 
     // asynInt32Average / asynFloat64Average: averaging device support. C
-    // `initAiAverage` (devAsynInt32.c:760+, devAsynFloat64.c) registers an
+    // `initAiAverage` (devAsynInt32.c:858-885, devAsynFloat64.c:687-706) registers an
     // always-on accumulating interrupt; the periodic record process drains
     // the mean. The DRVINFO is a real param (useDrvUser=1), so `reason_set`
     // is left false and `init()` runs `drv_user_create` as for a plain
@@ -3349,7 +3412,7 @@ mod tests {
         let link = parse_asyn_link("@asyn(myPort, 0, 1.0) TEMPERATURE").unwrap();
         assert_eq!(link.port_name, "myPort");
         assert_eq!(link.addr, 0);
-        assert_eq!(link.timeout, Duration::from_secs_f64(1.0));
+        assert_eq!(link.timeout, Some(Duration::from_secs_f64(1.0)));
         assert_eq!(link.drv_info, "TEMPERATURE");
     }
 
@@ -3358,7 +3421,7 @@ mod tests {
         let link = parse_asyn_link("@asyn(port1) PARAM").unwrap();
         assert_eq!(link.port_name, "port1");
         assert_eq!(link.addr, 0);
-        assert_eq!(link.timeout, Duration::from_secs(1));
+        assert_eq!(link.timeout, Some(Duration::from_secs(1)));
         assert_eq!(link.drv_info, "PARAM");
     }
 
@@ -3373,7 +3436,7 @@ mod tests {
     #[test]
     fn test_parse_fractional_timeout() {
         let link = parse_asyn_link("@asyn(dev, 1, 0.5) CMD").unwrap();
-        assert_eq!(link.timeout, Duration::from_secs_f64(0.5));
+        assert_eq!(link.timeout, Some(Duration::from_secs_f64(0.5)));
     }
 
     #[test]
@@ -3405,32 +3468,42 @@ mod tests {
     /// R9-54: C `strtod` accepts the negative "wait forever" sentinel
     /// (asynEpicsUtils.c:125) and every other double the operator can type.
     /// `Duration::from_secs_f64` panicked on exactly those, aborting the thread
-    /// at record init. They now take the bounded DRV-42 substitution instead.
+    /// at record init. The sentinel is now carried, not substituted.
     #[test]
-    fn test_parse_negative_and_non_finite_timeout_is_bounded_not_a_panic() {
+    fn test_parse_negative_timeout_waits_forever_and_non_finite_is_bounded() {
+        // A negative link timeout is C's "wait forever" and reaches the driver
+        // as one (DRV-42); it used to take the bounded default here.
+        for spec in ["@asyn(PORT, 0, -1) DRV", "@asyn(PORT, 0, -0.5) DRV"] {
+            let link = parse_asyn_link(spec).expect(spec);
+            assert_eq!(link.timeout, None, "{spec}");
+            assert_eq!(link.drv_info, "DRV", "{spec}");
+        }
+        // The values C itself has no defined behaviour for keep the bounded
+        // fallback.
         for spec in [
-            "@asyn(PORT, 0, -1) DRV",
-            "@asyn(PORT, 0, -0.5) DRV",
             "@asyn(PORT, 0, inf) DRV",
             "@asyn(PORT, 0, NaN) DRV",
             "@asyn(PORT, 0, 1e30) DRV",
         ] {
             let link = parse_asyn_link(spec).expect(spec);
-            assert_eq!(link.timeout, DEFAULT_TIMEOUT, "{spec}");
+            assert_eq!(link.timeout, Some(DEFAULT_TIMEOUT), "{spec}");
             assert_eq!(link.drv_info, "DRV", "{spec}");
         }
         // A representable timeout still passes through verbatim.
         assert_eq!(
             parse_asyn_link("@asyn(PORT, 0, 0) DRV").unwrap().timeout,
-            Duration::ZERO
+            Some(Duration::ZERO)
         );
     }
 
     /// R9-54, same field on the `@asynMask` parser.
     #[test]
-    fn test_parse_mask_negative_timeout_is_bounded_not_a_panic() {
+    fn test_parse_mask_negative_timeout_waits_forever() {
         let link = parse_asyn_mask_link("@asynMask(PORT, 0, 0x1F, -1) DRV").unwrap();
-        assert_eq!(link.timeout, DEFAULT_TIMEOUT);
+        assert_eq!(
+            link.timeout, None,
+            "a negative mask-link timeout waits forever"
+        );
         assert_eq!(link.mask, 0x1F);
         assert_eq!(link.drv_info, "DRV");
     }
@@ -3449,7 +3522,7 @@ mod tests {
         let link = parse_asyn_link("@asyn(PORT1 2 1.5) PARAM").unwrap();
         assert_eq!(link.port_name, "PORT1");
         assert_eq!(link.addr, 2);
-        assert_eq!(link.timeout, Duration::from_secs_f64(1.5));
+        assert_eq!(link.timeout, Some(Duration::from_secs_f64(1.5)));
         assert_eq!(link.drv_info, "PARAM");
     }
 
@@ -3486,7 +3559,7 @@ mod tests {
         assert_eq!(link.port_name, "port1");
         assert_eq!(link.addr, 0);
         assert_eq!(link.mask, 0xFF);
-        assert_eq!(link.timeout, Duration::from_secs_f64(2.0));
+        assert_eq!(link.timeout, Some(Duration::from_secs_f64(2.0)));
         assert_eq!(link.drv_info, "BITS");
     }
 
@@ -3494,7 +3567,7 @@ mod tests {
     fn test_parse_mask_link_no_timeout() {
         let link = parse_asyn_mask_link("@asynMask(port1, 0, 255) BITS").unwrap();
         assert_eq!(link.mask, 255);
-        assert_eq!(link.timeout, Duration::from_secs(1));
+        assert_eq!(link.timeout, Some(Duration::from_secs(1)));
     }
 
     #[test]
@@ -3617,7 +3690,7 @@ mod tests {
         let link = |port: &str| AsynLink {
             port_name: port.into(),
             addr: 0,
-            timeout: Duration::from_secs(1),
+            timeout: Some(Duration::from_secs(1)),
             drv_info: String::new(),
         };
 
@@ -3643,7 +3716,7 @@ mod tests {
         let link = AsynLink {
             port_name: "p".into(),
             addr: 0,
-            timeout: Duration::from_secs(1),
+            timeout: Some(Duration::from_secs(1)),
             drv_info: String::new(),
         };
         // bipolar 8-bit (@asynMask ... -8): raw 0xFF reads back as -1.
@@ -3671,7 +3744,7 @@ mod tests {
         let link = AsynLink {
             port_name: "p".into(),
             addr: 0,
-            timeout: Duration::from_secs(1),
+            timeout: Some(Duration::from_secs(1)),
             drv_info: String::new(),
         };
         let ads =
@@ -3700,7 +3773,7 @@ mod tests {
         use crate::param::ParamValue;
         // An F64-native array delivered on the I/O Intr path must be converted to
         // each consuming interface's element type (C fires all six array
-        // interfaces type-converted, NDPluginStdArrays.cpp:169-197).
+        // interfaces type-converted, NDPluginStdArrays.cpp:170-197).
         let f64arr = ParamValue::Float64Array(std::sync::Arc::from([1.7f64, 2.9, -3.1].as_slice()));
 
         assert_eq!(
@@ -3803,7 +3876,7 @@ mod tests {
         let link = AsynLink {
             port_name: "test_bounds".into(),
             addr: 0,
-            timeout: Duration::from_secs(1),
+            timeout: Some(Duration::from_secs(1)),
             drv_info: "VAL".into(),
         };
         let mut ads = AsynDeviceSupport::from_handle(handle, link, iface);
@@ -3826,7 +3899,7 @@ mod tests {
         let link = AsynLink {
             port_name: "test".into(),
             addr: 0,
-            timeout: Duration::from_secs(1),
+            timeout: Some(Duration::from_secs(1)),
             drv_info: "VAL".into(),
         };
         let mut ads = AsynDeviceSupport::from_handle(handle, link, "asynInt32");
@@ -3861,7 +3934,7 @@ mod tests {
         let link = AsynLink {
             port_name: "test".into(),
             addr: 0,
-            timeout: Duration::from_secs(1),
+            timeout: Some(Duration::from_secs(1)),
             drv_info: "VAL".into(),
         };
         let mut ads = AsynDeviceSupport::from_handle(handle, link, "asynInt32");
@@ -3889,7 +3962,7 @@ mod tests {
         let link = AsynLink {
             port_name: "test".into(),
             addr: 0,
-            timeout: Duration::from_secs(1),
+            timeout: Some(Duration::from_secs(1)),
             drv_info: "VAL".into(),
         };
         let mut ads = AsynDeviceSupport::from_handle(handle, link, iface);
@@ -3927,7 +4000,7 @@ mod tests {
         let link = AsynLink {
             port_name: "test".into(),
             addr: 0,
-            timeout: Duration::from_secs(1),
+            timeout: Some(Duration::from_secs(1)),
             drv_info: "VAL".into(),
         };
         let mut ads = AsynDeviceSupport::from_handle(handle, link, iface);
@@ -3996,7 +4069,7 @@ mod tests {
         rec.rarm = 1;
         let outcome = ads.read(&mut rec).unwrap();
         assert!(
-            outcome.did_compute,
+            outcome.did_compute(),
             "VAL written directly → convert skipped"
         );
         assert_eq!(rec.rarm, 0, "process resets RARM to 0");
@@ -4021,7 +4094,7 @@ mod tests {
 
         // The completion process commits the array.
         let outcome = ads.read(&mut rec).unwrap();
-        assert!(outcome.did_compute);
+        assert!(outcome.did_compute());
         assert_eq!(rec.nord, 4, "NORD = samples accumulated");
         assert!(!rec.busy, "BUSY cleared after completion");
         match &rec.val {
@@ -4108,6 +4181,81 @@ mod tests {
         }
     }
 
+    /// A second RARM=1 after a partial acquisition restarts from empty rather
+    /// than appending: NORD returns to 0, the record array is wiped, and the
+    /// samples that follow start at index 0. C does the wipe explicitly with
+    /// `pPvt->nord = 0` plus `memset(pwf->bptr, 0, pwf->nelm*sizeof(EPICS_TYPE))`
+    /// (devAsynXXXTimeSeries.h:139-141); the port clears the accumulator and
+    /// commits it, and waveform's own reallocation zero-fills, so the residue
+    /// a client could reach with a NORD-exceeding request is identical.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn time_series_rearm_discards_the_previous_acquisition() {
+        use epics_base_rs::server::records::waveform::WaveformRecord;
+        use epics_base_rs::types::DbFieldType;
+        let mut ads = make_timeseries_adapter("asynInt32");
+        let mut rec = WaveformRecord::new(4, DbFieldType::Long);
+        ads.init(&mut rec).unwrap();
+        let reason = ads.reason;
+        let interrupts = ads.handle.interrupts().clone();
+        let ts = ads.time_series.clone().unwrap();
+        // Registers the accumulating callback (the port's stand-in for C's
+        // registerInterruptUser), so it must run before any sample is notified.
+        assert!(ads.io_intr_receiver().is_some());
+
+        // First acquisition: 3 of 4 samples, then stop to commit the partial.
+        rec.rarm = 1;
+        ads.read(&mut rec).unwrap();
+        for v in [11, 22, 33] {
+            interrupts.notify(InterruptValue {
+                reason,
+                addr: 0,
+                value: crate::param::ParamValue::Int32(v),
+                timestamp: SystemTime::now(),
+                ..Default::default()
+            });
+        }
+        await_ts_len(&ts, 3).await;
+        rec.rarm = 2;
+        ads.read(&mut rec).unwrap();
+        assert_eq!(rec.nord, 3, "first acquisition committed 3 samples");
+
+        // Re-arm. C zeroes the array and resets nord before anything else in
+        // the switch, so the commit that follows in the SAME process sees an
+        // empty buffer.
+        rec.rarm = 1;
+        ads.read(&mut rec).unwrap();
+        assert!(rec.busy, "re-arm sets BUSY");
+        assert_eq!(rec.nord, 0, "re-arm zeroes NORD in the arming process");
+        match &rec.val {
+            EpicsValue::LongArray(v) => assert_eq!(
+                &v[..3],
+                &[0, 0, 0],
+                "re-arm wipes the previous samples (C memset), got {v:?}"
+            ),
+            other => panic!("VAL should be LongArray, got {other:?}"),
+        }
+
+        // The new samples start at index 0 — they do not extend the old run.
+        for v in [55, 66] {
+            interrupts.notify(InterruptValue {
+                reason,
+                addr: 0,
+                value: crate::param::ParamValue::Int32(v),
+                timestamp: SystemTime::now(),
+                ..Default::default()
+            });
+        }
+        await_ts_len(&ts, 2).await;
+        rec.rarm = 2;
+        ads.read(&mut rec).unwrap();
+        assert_eq!(rec.nord, 2, "NORD counts only the re-armed samples");
+        match &rec.val {
+            EpicsValue::LongArray(v) => {
+                assert_eq!(&v[..2], &[55, 66], "the pre-re-arm samples are gone")
+            }
+            other => panic!("VAL should be LongArray, got {other:?}"),
+        }
+    }
     /// asynFloat64TimeSeries commits a DOUBLE array (FTVL=DOUBLE).
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn time_series_float64_commits_double_array() {
@@ -4177,34 +4325,34 @@ mod tests {
         }
     }
 
-    /// FTVL not the signed/unsigned EPICS type of the interface → C errors the
-    /// record (dead). The port leaves the buffer unset, so the record never
-    /// acquires: no sample is accumulated even after RARM=1.
+    /// FTVL not the signed/unsigned EPICS type of the interface → C's
+    /// `initRecord` prints and takes `goto bad`, whose body is `pr->pact = 1;
+    /// return -1` (devAsynXXXTimeSeries.h:73-77, 118-120). The record is DEAD:
+    /// `dbProcess` refuses every entry, so it never acquires whatever a client
+    /// puts to RARM.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn time_series_invalid_ftvl_never_acquires() {
+    async fn time_series_invalid_ftvl_kills_the_record() {
         use epics_base_rs::server::records::waveform::WaveformRecord;
         use epics_base_rs::types::DbFieldType;
         // asynInt32 requires FTVL LONG/ULONG; DOUBLE is invalid.
         let mut ads = make_timeseries_adapter("asynInt32");
         let mut rec = WaveformRecord::new(4, DbFieldType::Double);
-        ads.init(&mut rec).unwrap();
+        assert_eq!(
+            ads.init(&mut rec).unwrap(),
+            DeviceInitOutcome::dead(),
+            "C `goto bad` — the framework must leave this record in PACT"
+        );
         let reason = ads.reason;
         let interrupts = ads.handle.interrupts().clone();
         let ts = ads.time_series.clone().unwrap();
         assert!(
             ts.inner.lock().unwrap().buf.is_none(),
-            "invalid FTVL leaves the buffer unset (record does not acquire)"
+            "the dead arm returns before the buffer is sized"
         );
-        assert!(ads.io_intr_receiver().is_some());
 
-        // A caput RARM=1 must not bring the misconfigured record to life: C's
-        // record is dead (pact=1) so BUSY stays 0 and it never processes.
-        rec.rarm = 1;
-        ads.read(&mut rec).unwrap();
-        assert!(
-            !rec.busy,
-            "invalid-FTVL record stays inert (BUSY=0) like C's dead record"
-        );
+        // The interrupt callback runs whatever the record's state — C's
+        // `interruptCallback` is registered by process, which a dead record
+        // never reaches, so nothing accumulates.
         interrupts.notify(InterruptValue {
             reason,
             addr: 0,
@@ -4218,9 +4366,27 @@ mod tests {
             "no buffer → nothing accumulates"
         );
         assert_eq!(rec.nord, 0, "NORD untouched when the record cannot acquire");
+        assert!(!rec.busy, "BUSY stays 0");
+    }
+
+    /// The valid-FTVL twin, so the kill is not a blanket refusal: a LONG-FTVL
+    /// waveform on asynInt32 comes back Live and gets its typed buffer.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn time_series_valid_ftvl_leaves_the_record_live() {
+        use epics_base_rs::server::records::waveform::WaveformRecord;
+        use epics_base_rs::types::DbFieldType;
+        let mut ads = make_timeseries_adapter("asynInt32");
+        let mut rec = WaveformRecord::new(4, DbFieldType::Long);
+        assert_eq!(ads.init(&mut rec).unwrap(), DeviceInitOutcome::Live);
         assert!(
-            !rec.busy,
-            "BUSY remains 0 — the inert read() never flips it"
+            ads.time_series
+                .as_ref()
+                .unwrap()
+                .inner
+                .lock()
+                .unwrap()
+                .buf
+                .is_some()
         );
     }
 
@@ -4298,7 +4464,7 @@ mod tests {
         let link = AsynLink {
             port_name: "test".into(),
             addr: 0,
-            timeout: Duration::from_secs(1),
+            timeout: Some(Duration::from_secs(1)),
             drv_info: "VAL".into(),
         };
         let mut ads =
@@ -4671,7 +4837,7 @@ mod tests {
 
         let outcome = ads.read(&mut rec).unwrap();
         assert!(
-            !outcome.did_compute,
+            !outcome.did_compute(),
             "asynInt32 ai routes raw→RVAL and runs the record convert (C return 0)"
         );
         // Framework runs the record convert when did_compute is false.
@@ -4704,7 +4870,7 @@ mod tests {
             .push_with_overflow(intr_entry(1234, 0));
 
         let outcome = ads.read(&mut rec).unwrap();
-        assert!(!outcome.did_compute);
+        assert!(!outcome.did_compute());
         rec.process().unwrap();
         let val = match rec.get_field("VAL").unwrap() {
             EpicsValue::Double(v) => v,
@@ -4735,7 +4901,7 @@ mod tests {
 
         let outcome = ads.read(&mut rec).unwrap();
         assert!(
-            outcome.did_compute,
+            outcome.did_compute(),
             "non-ai (no ESLO) keeps the direct VAL path + computed()"
         );
         let val = match rec.get_field("VAL").unwrap() {
@@ -4783,7 +4949,7 @@ mod tests {
 
         let outcome = ads.read(&mut rec).unwrap();
         assert!(
-            !outcome.did_compute,
+            !outcome.did_compute(),
             "int32 average routes the mean→RVAL and runs the ai convert (C return 0)"
         );
         let rval = match rec.get_field("RVAL").unwrap() {
@@ -4835,7 +5001,7 @@ mod tests {
 
         let outcome = ads.read(&mut rec).unwrap();
         assert!(
-            outcome.did_compute,
+            outcome.did_compute(),
             "float64 average sets VAL directly and skips the convert (C return 2)"
         );
         let val = match rec.get_field("VAL").unwrap() {
@@ -4865,7 +5031,7 @@ mod tests {
         // No samples notified → the accumulator is empty.
         let outcome = ads.read(&mut rec).unwrap();
         assert!(
-            outcome.did_compute,
+            outcome.did_compute(),
             "zero-samples skips the convert so VAL is not overwritten from RVAL"
         );
         assert_eq!(
@@ -4950,7 +5116,7 @@ mod tests {
 
         let outcome = ads.read(&mut rec).unwrap();
         assert!(
-            outcome.did_compute,
+            outcome.did_compute(),
             "transport-error period skips the store (C return -1)"
         );
         let val = match rec.get_field("VAL").unwrap() {
@@ -4975,7 +5141,7 @@ mod tests {
         // The accumulated transport status reset with the period: a subsequent
         // read with no samples is the ordinary zero-samples UDF case.
         let outcome2 = ads.read(&mut rec).unwrap();
-        assert!(outcome2.did_compute);
+        assert!(outcome2.did_compute());
         assert_eq!(
             ads.last_alarm(),
             Some((
@@ -5232,7 +5398,7 @@ mod tests {
         let link = AsynLink {
             port_name: "test_enum".into(),
             addr: 0,
-            timeout: Duration::from_secs(1),
+            timeout: Some(Duration::from_secs(1)),
             drv_info: "MODE".into(),
         };
         let mut ads = AsynDeviceSupport::from_handle(handle, link, "asynEnum");
@@ -5255,7 +5421,7 @@ mod tests {
         }
     }
 
-    /// C `devAsynInt32::initCommon` (297-324) reads the driver's asynEnum
+    /// C `devAsynInt32::initCommon` (298-324) reads the driver's asynEnum
     /// table and `setEnums` (415-435) copies strings/values/severities onto
     /// the mbbi state fields ZRST/ZRVL/ZRSV…. Before the fix the actor
     /// dropped the table (`let (idx, _entries)`) so the record kept its .db
@@ -5440,12 +5606,15 @@ mod tests {
             ..Default::default()
         });
 
-        let fields = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+        let post = tokio::time::timeout(Duration::from_secs(2), rx.recv())
             .await
             .expect("property post must arrive within timeout")
             .expect("channel open");
+        // C names `&pr->val` in all eight callbacks; the setEnums block below
+        // is written, never posted on.
+        assert_eq!(post.post_field, "VAL");
         let get = |name: &str| {
-            fields
+            post.writes
                 .iter()
                 .find(|(f, _)| f == name)
                 .map(|(_, v)| v.clone())
@@ -5537,7 +5706,7 @@ mod tests {
 
     #[test]
     fn fifo_overflow_drops_oldest_and_counts() {
-        // C parity: devAsynInt32.c:566-571 — when ringHead wraps onto
+        // C parity: devAsynInt32.c:565-571 — when ringHead wraps onto
         // ringTail, advance ringTail (drop oldest) + overflows++.
         let mut f = InterruptFifo::new();
         f.ring_size = 3;
@@ -5721,7 +5890,7 @@ mod tests {
             let link = AsynLink {
                 port_name: "capport".into(),
                 addr: 0,
-                timeout: Duration::from_secs(1),
+                timeout: Some(Duration::from_secs(1)),
                 drv_info: "VAL".into(),
             };
             let mut ads = AsynDeviceSupport::from_handle(handle, link, "asynOctet");
@@ -5797,7 +5966,7 @@ mod tests {
         let link = AsynLink {
             port_name: "r11_48_dev".into(),
             addr: 0,
-            timeout: Duration::from_secs(1),
+            timeout: Some(Duration::from_secs(1)),
             // `@asyn(L0,0,1)` with no drvInfo — the ordinary serial/IP link.
             drv_info: String::new(),
         };
@@ -5823,17 +5992,28 @@ mod tests {
     }
 
     /// R11-48 negative control: on a port that DOES register asynDrvUser, an
-    /// unresolvable drvInfo is still a bind failure — C prints and `goto bad`
-    /// (devAsynInt32.c:272-276), leaving the record unbound.
+    /// unresolvable drvInfo is a bind failure — C prints and `goto bad`
+    /// (devAsynInt32.c:272-276), whose body is `recGblSetSevr(pr, LINK_ALARM,
+    /// INVALID_ALARM); pr->pact = 1` (:348-351). Unbound is not enough: reason 0
+    /// is a real parameter, so a record left processing would publish another
+    /// record's value as its own.
     #[test]
     fn a_device_support_with_an_unknown_drv_info_still_fails_to_bind() {
+        use epics_base_rs::server::record::AlarmSeverity;
         use epics_base_rs::server::records::longin::LonginRecord;
 
         let mut ads = make_adapter(ScanType::Passive);
         ads.drv_info = "NO_SUCH_PARAM".to_string();
 
         let mut rec = LonginRecord::default();
-        ads.init(&mut rec).unwrap();
+        assert_eq!(
+            ads.init(&mut rec).unwrap(),
+            DeviceInitOutcome::dead_with_alarm(
+                epics_base_rs::server::recgbl::alarm_status::LINK_ALARM,
+                AlarmSeverity::Invalid
+            ),
+            "C `goto bad` — LINK_ALARM/INVALID, then the record is dead"
+        );
 
         assert!(
             !ads.reason_set,
@@ -5910,7 +6090,7 @@ mod tests {
             let link = AsynLink {
                 port_name: "ondemand".into(),
                 addr: 0,
-                timeout: Duration::from_secs(1),
+                timeout: Some(Duration::from_secs(1)),
                 drv_info: "SYMBOL".into(),
             };
             let mut ads = AsynDeviceSupport::from_handle(handle, link, iface_type);
@@ -6285,7 +6465,7 @@ mod tests {
         let link = AsynLink {
             port_name: "test".into(),
             addr: 0,
-            timeout: Duration::from_secs(1),
+            timeout: Some(Duration::from_secs(1)),
             drv_info: "VAL".into(),
         };
         let mut ads = AsynDeviceSupport::from_handle(handle, link, "asynInt32Array");
@@ -6465,7 +6645,7 @@ mod tests {
             });
         let outcome = ads.read(&mut rec).unwrap();
         assert!(
-            outcome.did_compute,
+            outcome.did_compute(),
             "ao readback produces VAL itself → computed (framework skips the forward convert)"
         );
         assert_eq!(
@@ -6511,7 +6691,7 @@ mod tests {
             });
         let outcome = ads.read(&mut rec).unwrap();
         assert!(
-            outcome.did_compute,
+            outcome.did_compute(),
             "mbbo readback resolves VAL itself → computed (framework skips forward convert)"
         );
         assert_eq!(rec.rval, 0x08, "RVAL keeps the masked (unshifted) raw");
@@ -6546,7 +6726,10 @@ mod tests {
                 aux_status: crate::error::AsynStatus::Success,
             });
         let outcome = ads.read(&mut rec).unwrap();
-        assert!(outcome.did_compute, "uint32digital mbbo readback computed");
+        assert!(
+            outcome.did_compute(),
+            "uint32digital mbbo readback computed"
+        );
         assert_eq!(rec.rval, 0x08, "RVAL keeps the masked raw");
         assert_eq!(rec.val, 2, "VAL resolved through the state map, not raw 8");
     }
@@ -6572,7 +6755,7 @@ mod tests {
                 aux_status: crate::error::AsynStatus::Success,
             });
         let outcome = ads.read(&mut rec).unwrap();
-        assert!(outcome.did_compute, "bo readback computed");
+        assert!(outcome.did_compute(), "bo readback computed");
         assert_eq!(rec.rval, 0x2A, "RVAL keeps the raw");
         assert_eq!(rec.val, 1, "VAL = (raw != 0) = 1, not the raw 42");
     }
@@ -6601,7 +6784,7 @@ mod tests {
             });
         let outcome = ads.read(&mut rec).unwrap();
         assert!(
-            outcome.did_compute,
+            outcome.did_compute(),
             "bi readback resolves VAL itself → computed"
         );
         assert_eq!(rec.rval, 5, "RVAL keeps the unmasked raw");
@@ -6634,7 +6817,7 @@ mod tests {
                 aux_status: crate::error::AsynStatus::Success,
             });
         let outcome = ads.read(&mut rec).unwrap();
-        assert!(outcome.did_compute, "uint32digital bi readback computed");
+        assert!(outcome.did_compute(), "uint32digital bi readback computed");
         assert_eq!(rec.rval, 0x80, "RVAL = raw & mask");
         assert_eq!(rec.val, 1, "high-bit mask hit → val 1, not 128");
         // A raw whose set bits fall entirely outside MASK → masked 0 → val 0.
@@ -6681,7 +6864,7 @@ mod tests {
                 aux_status: crate::error::AsynStatus::Success,
             });
         let outcome = ads.read(&mut rec).unwrap();
-        assert!(outcome.did_compute, "mbbiDirect readback computed");
+        assert!(outcome.did_compute(), "mbbiDirect readback computed");
         assert_eq!(rec.rval, 0x3C, "RVAL keeps the masked (unshifted) raw");
         assert_eq!(
             rec.val, 0x0F,
@@ -6722,7 +6905,7 @@ mod tests {
                 aux_status: crate::error::AsynStatus::Success,
             });
         let outcome = ads.read(&mut rec).unwrap();
-        assert!(outcome.did_compute, "mbbi readback computed");
+        assert!(outcome.did_compute(), "mbbi readback computed");
         assert_eq!(
             rec.rval, 0x08,
             "RVAL = raw & mask (out-of-mask 0x80 stripped)"
@@ -6767,7 +6950,7 @@ mod tests {
                 aux_status: crate::error::AsynStatus::Success,
             });
         let outcome = ads.read(&mut rec).unwrap();
-        assert!(outcome.did_compute, "mbbi readback computed");
+        assert!(outcome.did_compute(), "mbbi readback computed");
         assert_eq!(rec.rval, 0x30, "RVAL = value & positioned mask");
         assert_eq!(rec.val, 3, "field 3 at bits 4-7 -> state index 3 (THVL)");
     }
@@ -6814,7 +6997,7 @@ mod tests {
     /// Positioning shifts the record's CURRENT mask, so a `.db`-set custom
     /// MASK (≠ (1<<NOBT)-1) is preserved and shifted — exactly C initMbbi,
     /// which does `pr->mask <<= shft` over the .db-loaded mask (mbbiRecord
-    /// init only recomputes (1<<NOBT)-1 when MASK==0, mbbiRecord.c:128-130).
+    /// init only recomputes (1<<NOBT)-1 when MASK==0, mbbiRecord.c:129-130).
     /// Rebuilding from NOBT would clobber it (the Round 27 divergence).
     #[test]
     fn mbbi_asynint32_preserves_db_set_mask() {
@@ -6869,7 +7052,7 @@ mod tests {
         let link = AsynLink {
             port_name: "test_f64".into(),
             addr: 0,
-            timeout: Duration::from_secs(1),
+            timeout: Some(Duration::from_secs(1)),
             drv_info: "VAL".into(),
         };
         let mut ads = AsynDeviceSupport::from_handle(handle, link, "asynFloat64");
@@ -6955,7 +7138,7 @@ mod tests {
     /// routes the raw double through `apply_float64_readback`, which applies the
     /// forward `ASLO`/`AOFF` scaling (`VAL = value*ASLO + AOFF`) and the outcome
     /// is `computed` (the framework skips ao's forward convert). C `processAo`
-    /// (devAsynFloat64.c:646-649). ao carries no SMOO so it never enters the ai
+    /// (devAsynFloat64.c:647-649). ao carries no SMOO so it never enters the ai
     /// branch above.
     #[test]
     fn io_intr_readback_float64_ao_applies_aslo_aoff() {
@@ -6969,7 +7152,7 @@ mod tests {
         push_f64(&ads, 10.0);
         let outcome = ads.read(&mut rec).unwrap();
         assert!(
-            outcome.did_compute,
+            outcome.did_compute(),
             "float64 ao readback produces VAL itself → computed"
         );
         assert_eq!(
@@ -7145,7 +7328,7 @@ mod tests {
     }
 
     /// An asynInt32 mbbo writes its state-mapped RVAL, not the VAL index. C
-    /// `processMbbo` writes `pr->rval` (devAsynInt32.c:1332). RVAL is ULong and
+    /// `processMbbo` writes `pr->rval` (devAsynInt32.c:1334). RVAL is ULong and
     /// must be coerced to the Int32 write type.
     #[test]
     fn int32_mbbo_write_sends_state_rval_not_index() {
@@ -7388,7 +7571,7 @@ mod tests {
         let link = AsynLink {
             port_name: "binwrite_op".into(),
             addr: 0,
-            timeout: Duration::from_secs(1),
+            timeout: Some(Duration::from_secs(1)),
             drv_info: "REG".into(),
         };
         let ads = AsynDeviceSupport::from_handle(handle, link, "asynOctet");
@@ -7425,7 +7608,7 @@ mod tests {
         let link = AsynLink {
             port_name: "binwrite_fail".into(),
             addr: 0,
-            timeout: Duration::from_secs(1),
+            timeout: Some(Duration::from_secs(1)),
             drv_info: "REG".into(),
         };
         let mut ads = AsynDeviceSupport::from_handle(handle, link, "asynOctet");
@@ -7520,7 +7703,7 @@ mod tests {
         let link = AsynLink {
             port_name: "cmdresp_readop".into(),
             addr: 0,
-            timeout: Duration::from_secs(1),
+            timeout: Some(Duration::from_secs(1)),
             drv_info: String::new(),
         };
         let mut ads = AsynDeviceSupport::from_handle(handle, link, "asynOctet");
@@ -7562,7 +7745,7 @@ mod tests {
         let link = AsynLink {
             port_name: "octetcap_write".into(),
             addr: 0,
-            timeout: Duration::from_secs(1),
+            timeout: Some(Duration::from_secs(1)),
             drv_info: String::new(),
         };
         let mut ads = AsynDeviceSupport::from_handle(handle, link, "asynOctet");
@@ -7609,7 +7792,7 @@ mod tests {
         let link = AsynLink {
             port_name: "octetcap_read".into(),
             addr: 0,
-            timeout: Duration::from_secs(1),
+            timeout: Some(Duration::from_secs(1)),
             drv_info: String::new(),
         };
         let mut ads = AsynDeviceSupport::from_handle(handle, link, "asynOctet");
@@ -7638,7 +7821,7 @@ mod tests {
     /// record's own value buffer to `pasynOctet->read`, so a partial line
     /// followed by a timeout leaves those bytes *in the record* (`psi->val`)
     /// and returns the failing status; `processCommon` maps it to
-    /// TIMEOUT_ALARM/INVALID (:805-808). The port's error branch mapped the
+    /// TIMEOUT_ALARM/INVALID (:806-808). The port's error branch mapped the
     /// alarm but dropped the bytes, because the transfer never left the
     /// driver's buffer.
     #[test]
@@ -7690,7 +7873,7 @@ mod tests {
         let link = AsynLink {
             port_name: "octet_partial".into(),
             addr: 0,
-            timeout: Duration::from_secs(1),
+            timeout: Some(Duration::from_secs(1)),
             drv_info: String::new(),
         };
         let mut ads = AsynDeviceSupport::from_handle(handle, link, "asynOctet");
@@ -7878,7 +8061,7 @@ mod tests {
         let link = AsynLink {
             port_name: "cmdresp_wf".into(),
             addr: 0,
-            timeout: Duration::from_secs(1),
+            timeout: Some(Duration::from_secs(1)),
             // Raw DRVINFO must match the cached command: the empty-reject guard
             // keys on a non-empty raw drv_info (C strlen(userParam)).
             drv_info: "PING\\r".to_string(),
@@ -7911,7 +8094,7 @@ mod tests {
         let link = AsynLink {
             port_name: "cmdresp_lsi".into(),
             addr: 0,
-            timeout: Duration::from_secs(1),
+            timeout: Some(Duration::from_secs(1)),
             // Raw DRVINFO must match the cached command (see the waveform case).
             drv_info: "READ?\\n".to_string(),
         };
@@ -7950,7 +8133,7 @@ mod tests {
         let link = AsynLink {
             port_name: "cmdresp_lsi_long".into(),
             addr: 0,
-            timeout: Duration::from_secs(1),
+            timeout: Some(Duration::from_secs(1)),
             drv_info: "READ?\\n".to_string(),
         };
         let mut ads = AsynDeviceSupport::from_handle(handle, link, "asynOctet");
@@ -7974,11 +8157,12 @@ mod tests {
     }
 
     /// An asynOctetCmdResponse record with an EMPTY command (DRVINFO escaped to
-    /// nothing) is a misconfiguration: C initCmdBuffer (devAsynOctet.c:632-637)
-    /// rejects it with LINK_ALARM/INVALID + INIT_ERROR. base-rs holds the record
-    /// at LINK_ALARM/INVALID and performs NO I/O (no empty command is written).
+    /// nothing) is a misconfiguration C rejects at INIT, not at read:
+    /// `initCmdBuffer` (devAsynOctet.c:632-637) sets `precord->pact = 1`,
+    /// raises LINK_ALARM/INVALID and returns INIT_ERROR. The record is dead —
+    /// it performs no I/O because it never processes at all.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn cmd_response_empty_command_holds_link_alarm_and_writes_nothing() {
+    async fn cmd_response_empty_command_kills_the_record_at_init() {
         use epics_base_rs::server::record::AlarmSeverity;
         use epics_base_rs::server::records::stringin::StringinRecord;
 
@@ -7986,7 +8170,7 @@ mod tests {
         let link = AsynLink {
             port_name: "cmdresp_empty".into(),
             addr: 0,
-            timeout: Duration::from_secs(1),
+            timeout: Some(Duration::from_secs(1)),
             drv_info: String::new(),
         };
         let mut ads = AsynDeviceSupport::from_handle(handle, link, "asynOctet");
@@ -7996,7 +8180,14 @@ mod tests {
         ads.set_record_info("TEST:EMPTY", ScanType::Passive);
 
         let mut rec = StringinRecord::new("");
-        ads.read(&mut rec).unwrap();
+        assert_eq!(
+            ads.init(&mut rec).unwrap(),
+            DeviceInitOutcome::dead_with_alarm(
+                epics_base_rs::server::recgbl::alarm_status::LINK_ALARM,
+                AlarmSeverity::Invalid
+            ),
+            "C initCmdBuffer: recGblSetSevr(LINK_ALARM, INVALID) then pact = 1"
+        );
 
         // No I/O at all — not even an empty write.
         assert!(
@@ -8006,15 +8197,6 @@ mod tests {
         assert!(
             sequence.lock().unwrap().is_empty(),
             "empty command must perform no driver I/O"
-        );
-        // Held at LINK_ALARM / INVALID (C recGblSetSevr(LINK_ALARM, INVALID)).
-        assert_eq!(
-            ads.last_alarm(),
-            Some((
-                epics_base_rs::server::recgbl::alarm_status::LINK_ALARM,
-                AlarmSeverity::Invalid as u16
-            )),
-            "empty command must hold the record at LINK_ALARM/INVALID"
         );
     }
 }

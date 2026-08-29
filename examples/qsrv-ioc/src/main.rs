@@ -25,6 +25,11 @@
 //! pvput  DEMO:AO 42.5
 //! ```
 
+// On `exec_backend` this program's `main` refuses instead of running, so the
+// script parser and the simulator below are unreachable in that configuration
+// by construction. The default build still lints the file in full.
+#![cfg_attr(exec_backend, allow(dead_code, unused_imports))]
+
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
@@ -34,13 +39,21 @@ use epics_base_rs::server::database::PvDatabase;
 use epics_base_rs::server::ioc_builder::IocBuilder;
 use epics_base_rs::types::EpicsValue;
 use epics_bridge_rs::qsrv::{BridgeProvider, QsrvPvStore};
+#[cfg(tokio_backend)]
 use epics_ca_rs::server::CaServer;
+#[cfg(tokio_backend)]
 use epics_pva_rs::server::PvaServer;
 use epics_pva_rs::server_native::ChannelSource;
 
+#[cfg(tokio_backend)]
 #[epics_base_rs::epics_main]
 async fn main() -> CaResult<()> {
     let args: Vec<String> = std::env::args().collect();
+
+    // The IOC entry point owns every task started below, so it is where the
+    // reactor capability is taken.
+    let reactor = epics_base_rs::runtime::task::Reactor::current()
+        .expect("epics_main enters the IOC runtime");
 
     // C `envGetInetPortConfigParam` semantics (5000 floor, sscanf leniency,
     // diagnostics) — a strict `parse()` here diverged from a C IOC.
@@ -76,7 +89,7 @@ async fn main() -> CaResult<()> {
             .unwrap_or_else(|e| panic!("failed to load group config {path}: {e}"));
     }
     let provider = Arc::new(provider);
-    let store = Arc::new(QsrvPvStore::new(provider));
+    let store = Arc::new(QsrvPvStore::new(reactor.clone(), provider));
 
     let pv_list = store.list_pvs().await;
     eprintln!("qsrv-ioc: dual-protocol IOC");
@@ -88,7 +101,7 @@ async fn main() -> CaResult<()> {
     }
 
     // ── Simulator ──
-    spawn_simulator(db.clone());
+    spawn_simulator(&reactor, db.clone());
 
     // ── Scan start (C iocInit owns it, the servers do not scan) ──
     // One core-owned scan owner covers both front-ends; held to the end
@@ -104,7 +117,7 @@ async fn main() -> CaResult<()> {
     let pva_server = PvaServer::from_parts(db, pva_port, acf, None, None);
 
     // CA runs in background, PVA runs with iocsh (shell exit stops everything)
-    let ca_handle = epics_base_rs::runtime::task::spawn(async move { ca_server.run().await });
+    let ca_handle = reactor.clone().spawn(async move { ca_server.run().await });
 
     let result = pva_server
         .run_with_source_and_shell(store, |_shell| {
@@ -164,8 +177,8 @@ async fn parse_and_build(script: &str) -> CaResult<(Arc<PvDatabase>, Option<Stri
     Ok((db, group_file))
 }
 
-fn spawn_simulator(db: Arc<PvDatabase>) {
-    epics_base_rs::runtime::task::spawn(async move {
+fn spawn_simulator(reactor: &epics_base_rs::runtime::task::Reactor, db: Arc<PvDatabase>) {
+    reactor.spawn(async move {
         let mut tick = 0.0_f64;
         let mut interval = epics_base_rs::runtime::task::interval(Duration::from_millis(500));
         loop {
@@ -224,4 +237,17 @@ fn expand_macros(s: &str, macros: &HashMap<String, String>) -> String {
         }
     }
     result
+}
+
+/// The `exec_backend` arm: the demo stands both protocol servers up itself,
+/// and neither `CaServer` nor `PvaServer` is compiled on the reactor-free
+/// backend.
+#[cfg(exec_backend)]
+fn main() -> CaResult<()> {
+    eprintln!(
+        "qsrv-ioc serves CA and PVA through the async servers; this build \
+         selects the reactor-free backend (EPICS_RS_BUILD_EXEC_BACKEND=thread), \
+         which does not have them."
+    );
+    Ok(())
 }

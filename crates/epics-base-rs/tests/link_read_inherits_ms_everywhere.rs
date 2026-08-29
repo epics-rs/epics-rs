@@ -168,7 +168,7 @@ async fn siml_and_siol_inherit_ms() {
     assert_eq!(v, 5.0, "the SIOL value reaches VAL through SVAL");
 }
 
-/// SDIS (`dbAccess.c:566`) and TSEL (`recGbl.c:315`) are `dbGetLink` reads too,
+/// SDIS (`dbAccess.c:565`) and TSEL (`recGbl.c:322`) are `dbGetLink` reads too,
 /// so they inherit as well — the rule is the read, not the field.
 #[epics_macros_rs::epics_test]
 async fn sdis_and_tsel_inherit_ms() {

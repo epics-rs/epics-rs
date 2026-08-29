@@ -46,7 +46,8 @@
 //!   sees only global (`FROM`-less) DENY rules — a host-targeted deny
 //!   must not remove a PV that is still admissible for other hosts.
 
-// RTEMS-EXEC-MODEL-ALLOW(6): checked - these run and pass in the feature-ON suite.
+// RTEMS-EXEC-MODEL-ALLOW(6): checked - these run and pass in the exec-backend
+// suite.
 
 use std::path::Path;
 
@@ -542,7 +543,7 @@ pub fn parse_pvlist(content: &str) -> BridgeResult<PvList> {
         // ORDER directive. C ca-gateway does not special-case an
         // "EVALUATION ORDER" prefix: it tokenizes every line uniformly into a
         // pattern token + a command token, then matches the command with
-        // `strcasecmp(cmd,"ORDER")` (gateAs.cc:531-535,579). So the leading
+        // `strcasecmp(cmd,"ORDER")` (gateAs.cc:530-536,579). So the leading
         // word ("EVALUATION") is just an ignored pattern token, the command
         // and operands are matched case-insensitively, and the two operands
         // are tokenized with `strtok(NULL,", \t\n")` (gateAs.cc:581-582) —
@@ -1092,7 +1093,8 @@ mod tests {
 
         // Genuinely invalid operands are skipped (logged) and leave the order
         // at its prior value — C logs "invalid"/"missing argument" and
-        // `continue`s WITHOUT reassigning `eval_order` (gateAs.cc:585,593-597).
+        // `continue`s WITHOUT reassigning `eval_order`
+        // (gateAs.cc:581-586,593-597).
         // With no preceding ORDER line the default (AllowDeny) is retained.
         assert_eq!(
             parse_pvlist("EVALUATION ORDER ALLOW ALLOW").unwrap().order,

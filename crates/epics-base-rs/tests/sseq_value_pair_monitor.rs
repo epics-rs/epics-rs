@@ -9,11 +9,11 @@
 //! cvtDoubleToString(plinkGroup->dov, str, pR->prec);
 //! if (strcmp(str, plinkGroup->s)) { strcpy(plinkGroup->s, str);
 //!     db_post_events(pR, &plinkGroup->s, DBE_VALUE); }
-//! /* special(), STRn put (:1136-1140) */
+//! /* special(), STRn put (:1133-1137) */
 //! d = atof(plinkGroup->s);
 //! if (d != plinkGroup->dov) { plinkGroup->dov = d;
 //!     db_post_events(pR, &plinkGroup->dov, DBE_VALUE); }
-//! /* processCallback, numeric DOL arm (:672-683) */
+//! /* processCallback, numeric DOL arm (:668-680) */
 //! if (d != plinkGroup->dov) db_post_events(pR, &plinkGroup->dov, DBE_VALUE|DBE_LOG);
 //! cvtDoubleToString(plinkGroup->dov, str, pR->prec);
 //! if (strcmp(str, plinkGroup->s)) db_post_events(pR, &plinkGroup->s, DBE_VALUE);
@@ -136,7 +136,7 @@ async fn r17_4_a_do_put_that_moves_no_string_posts_no_string_event() {
 }
 
 /// The mirror site: a `STRn` put derives `DOn = atof(s)` and posts it with a
-/// bare `DBE_VALUE`, only when it moved (sseqRecord.c:1136-1140).
+/// bare `DBE_VALUE`, only when it moved (sseqRecord.c:1133-1137).
 #[epics_macros_rs::epics_test]
 async fn r17_4_a_str_put_posts_the_derived_double_with_a_bare_value_mask() {
     let db = sseq_with_prec2().await;

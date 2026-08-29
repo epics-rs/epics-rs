@@ -20,7 +20,7 @@
 //! must NOT push its stale VAL to the device / OUT target as if it were the new
 //! desired output, must not post it, and must not trigger the forward link.
 //! `fetchValue`'s `dbGetLink` has already raised LINK/INVALID
-//! (`dbLink.c:316-323` `setLinkAlarm`), and because the abort also skips the
+//! (`dbLink.c:314-321` `setLinkAlarm`), and because the abort also skips the
 //! `recGblResetAlarms` inside `monitor`, that alarm stays PENDING in nsta/nsev
 //! this cycle — it is not committed to STAT/SEVR.
 //!
@@ -150,7 +150,7 @@ async fn dead_dol_raises_a_pending_link_alarm() {
         AlarmSeverity::Invalid,
         "the abort skips monitor(), so recGblResetAlarms never commits the LINK \
          alarm this cycle — SEVR still carries the INIT-time UDF severity \
-         (iocInit.c:521-523), untouched by this process"
+         (iocInit.c:520-522), untouched by this process"
     );
     assert_eq!(
         common.stat,

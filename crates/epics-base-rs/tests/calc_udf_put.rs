@@ -24,6 +24,8 @@
 use epics_base_rs::server::database::PvDatabase;
 use epics_base_rs::server::ioc_builder::IocBuilder;
 use epics_base_rs::server::record::ProcessCompletion;
+use epics_base_rs::server::records::acalcout::AcalcoutRecord;
+use epics_base_rs::server::records::scalcout::ScalcoutRecord;
 use epics_base_rs::types::EpicsValue;
 
 // "A"/"S": default (empty CALC → fails every cycle, so a put byte survives).
@@ -37,6 +39,8 @@ record(scalcout, "SC") { field(CALC, "1+1") }
 
 async fn build() -> std::sync::Arc<PvDatabase> {
     IocBuilder::new()
+        .register_record_type("acalcout", || Box::new(AcalcoutRecord::default()))
+        .register_record_type("scalcout", || Box::new(ScalcoutRecord::default()))
         .db_string(DB, &std::collections::HashMap::new())
         .unwrap()
         .build()

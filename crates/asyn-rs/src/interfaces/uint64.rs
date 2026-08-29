@@ -3,7 +3,7 @@
 //! **Not in upstream asyn C.** As of 2026-05 the upstream tree only
 //! ships `asynInt64.h` / `asynInt64Array.h`; the proposed `asynUInt64`
 //! addition (upstream issue #231, "asynUInt64 / asynUInt64Array
-//! support") is unmerged. `find ~/codes/epics-modules/asyn -iname
+//! support") is unmerged. `find $EPICS_MODULES/asyn -iname
 //! 'asynUInt64*'` returns nothing.
 //!
 //! This module exists as a forward-looking Rust extension so drivers

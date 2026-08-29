@@ -1,6 +1,6 @@
 //! Top-level gateway server.
 //!
-//! Ties together [`PvCache`], [`UpstreamManager`], [`DownstreamServer`],
+//! Ties together [`PvCache`], `UpstreamManager`, `DownstreamServer`,
 //! [`PvList`], [`AccessConfig`], [`Stats`] into a single async daemon.
 //!
 //! ## Main event loop
@@ -16,11 +16,6 @@
 //!     }
 //! }
 //! ```
-
-// RTEMS-EXEC-MODEL-ALLOW(1): checked - `build_unknown_acf_path_returns_error` runs
-// and passes in the feature-ON suite (it fails on the ACF path, which `build`
-// reads before it reaches the upstream client). The other eight take gate (3);
-// see the comment on `build_with_minimal_config`.
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -38,14 +33,18 @@ use super::cache::{CacheTimeouts, PvCache};
 // `CommandHandler` (the control-PV command owner) is used on all targets;
 // `GatewayCommand` is referenced only by the cfg(unix) signal handler, so
 // importing it unconditionally is an unused import on non-Unix.
+#[cfg(tokio_backend)]
 use super::command::CommandHandler;
 #[cfg(unix)]
 use super::command::GatewayCommand;
+#[cfg(tokio_backend)]
 use super::downstream::DownstreamServer;
 use super::putlog::{PutLog, PutLogScope};
 use super::pvlist::{PolicyHost, PvList};
 use super::stats::Stats;
-use super::upstream::{UpstreamManager, UpstreamManagerConfig};
+#[cfg(tokio_backend)]
+use super::upstream::UpstreamManager;
+use super::upstream::UpstreamManagerConfig;
 
 /// Whether the gateway caches upstream values or forwards each read.
 ///
@@ -85,7 +84,7 @@ impl CacheMode {
     }
 }
 
-/// Configuration for [`GatewayServer`].
+/// Configuration for `GatewayServer`.
 ///
 /// `Debug` is implemented manually (see below) rather than derived:
 /// the `ca-gateway-tls` `upstream_tls` field holds an
@@ -333,6 +332,7 @@ pub fn resolve_event_mask(spec: Option<&str>) -> u16 {
     }
 }
 
+#[cfg(tokio_backend)]
 /// The CA gateway server.
 ///
 /// Construct via [`GatewayServer::build`], then call [`GatewayServer::run`]
@@ -367,6 +367,7 @@ pub struct GatewayServer {
     control_flags: Option<Arc<super::control::ControlFlags>>,
 }
 
+#[cfg(tokio_backend)]
 impl GatewayServer {
     /// Build the gateway from configuration.
     ///
@@ -881,11 +882,17 @@ impl GatewayServer {
         let stats_interval = self.config.stats_interval;
         let heartbeat_interval = self.config.heartbeat_interval;
 
+        // The gateway's run loop owns every long-lived task below, so it is
+        // where the capability is taken; the signal handler gets it by
+        // parameter rather than re-deriving it from its own thread.
+        let reactor = epics_base_rs::runtime::task::Reactor::current()
+            .expect("the CA gateway run loop is awaited on its reactor");
+
         // Cleanup task
         let cache_for_cleanup = cache.clone();
         let upstream_for_cleanup = upstream.clone();
         let stats_for_cleanup = stats.clone();
-        let cleanup_handle = epics_base_rs::runtime::task::spawn(async move {
+        let cleanup_handle = reactor.spawn(async move {
             let mut tick = epics_base_rs::runtime::task::interval(cleanup_interval);
             tick.tick().await; // first tick is immediate, skip
             loop {
@@ -909,7 +916,7 @@ impl GatewayServer {
         let upstream_for_stats = upstream.clone();
         let stats_for_refresh = stats.clone();
         let db_for_stats = shadow_db.clone();
-        let stats_handle = epics_base_rs::runtime::task::spawn(async move {
+        let stats_handle = reactor.spawn(async move {
             let mut tick = epics_base_rs::runtime::task::interval(stats_interval);
             tick.tick().await;
             loop {
@@ -926,7 +933,7 @@ impl GatewayServer {
         let heartbeat_handle = if let Some(period) = heartbeat_interval {
             let stats_hb = stats.clone();
             let db_hb = shadow_db.clone();
-            Some(epics_base_rs::runtime::task::spawn(async move {
+            Some(reactor.spawn(async move {
                 let mut tick = epics_base_rs::runtime::task::interval(period);
                 tick.tick().await;
                 loop {
@@ -939,7 +946,7 @@ impl GatewayServer {
         };
 
         // SIGUSR1 → command file processing (Unix only)
-        let signal_handle = self.spawn_signal_handler();
+        let signal_handle = self.spawn_signal_handler(&reactor);
 
         // Control-PV command owner: drains commandFlag/report*Flag/
         // newAsFlag/quitFlag writes and dispatches each through the SAME
@@ -960,6 +967,7 @@ impl GatewayServer {
                 .with_stats(stats.clone())
                 .with_report_path(self.config.report_path.clone());
                 super::control::spawn_control_owner(
+                    &reactor,
                     flags,
                     handler,
                     self.shadow_db.clone(),
@@ -996,7 +1004,7 @@ impl GatewayServer {
         // Any genuinely unrecoverable hole — a lag that overflows the
         // replay log, or the forwarder skipping a span on its own raw
         // lag — surfaces as `ConnEventRecv::GapTruncated` and is logged.
-        let conn_rx = downstream.connection_events().await;
+        let conn_rx = downstream.connection_events(&reactor).await;
         let conn_handle = if let Some(mut rx) = conn_rx {
             let stats_for_conn = stats.clone();
             let cache_for_conn = self.cache.clone();
@@ -1006,7 +1014,7 @@ impl GatewayServer {
             // downstream monitor. Cached mode never touches these.
             let upstream_for_conn = self.upstream.clone();
             let cache_mode = self.config.cache_mode;
-            Some(epics_base_rs::runtime::task::spawn(async move {
+            Some(reactor.spawn(async move {
                 use super::downstream::ConnEventRecv;
                 use epics_ca_rs::protocol::DBE_PROPERTY;
                 use epics_ca_rs::server::ServerConnectionEvent;
@@ -1276,7 +1284,10 @@ impl GatewayServer {
     /// Returns None only on non-Unix. On Unix the watcher is always armed
     /// (SIGUSR2 needs no command file); the handle is aborted at shutdown.
     #[cfg(unix)]
-    fn spawn_signal_handler(&self) -> Option<epics_base_rs::runtime::task::TaskHandle<()>> {
+    fn spawn_signal_handler(
+        &self,
+        reactor: &epics_base_rs::runtime::task::Reactor,
+    ) -> Option<epics_base_rs::runtime::task::TaskHandle<()>> {
         let cmd_path = self.config.command_path.clone();
         let pvlist_path = self.config.pvlist_path.clone();
         let access_path = self.config.access_path.clone();
@@ -1288,7 +1299,7 @@ impl GatewayServer {
         let beacon_anomaly = self.beacon_anomaly.clone();
         let stats = self.stats.clone();
 
-        Some(epics_base_rs::runtime::task::spawn(async move {
+        Some(reactor.spawn(async move {
             use tokio::signal::unix::{SignalKind, signal};
             let mut sigusr1 = match signal(SignalKind::user_defined1()) {
                 Ok(s) => s,
@@ -1365,7 +1376,10 @@ impl GatewayServer {
 
     /// Stub for non-Unix platforms (no SIGUSR1/SIGUSR2).
     #[cfg(not(unix))]
-    fn spawn_signal_handler(&self) -> Option<epics_base_rs::runtime::task::TaskHandle<()>> {
+    fn spawn_signal_handler(
+        &self,
+        _reactor: &epics_base_rs::runtime::task::Reactor,
+    ) -> Option<epics_base_rs::runtime::task::TaskHandle<()>> {
         None
     }
 }
@@ -1463,7 +1477,7 @@ mod tests {
     // refused at construction — it could reach no server at all. The
     // gateway is a hosted daemon that is never built in the exec model, so
     // the configuration these tests use is not one it has to satisfy.
-    #[cfg(not(feature = "rtems-exec-model"))]
+    #[cfg(tokio_backend)]
     #[tokio::test]
     async fn build_with_minimal_config() {
         let config = GatewayConfig {
@@ -1483,7 +1497,7 @@ mod tests {
 
     // Same reason as `build_with_minimal_config`: the gateway builds a name-servers-only
     // upstream `CaClient` with no name server under this feature.
-    #[cfg(not(feature = "rtems-exec-model"))]
+    #[cfg(tokio_backend)]
     #[tokio::test]
     async fn build_with_inline_pvlist() {
         let config = GatewayConfig {
@@ -1513,7 +1527,7 @@ mod tests {
     #[cfg(feature = "ca-gateway-tls")]
     // Same reason as `build_with_minimal_config`: the gateway builds a name-servers-only
     // upstream `CaClient` with no name server under this feature.
-    #[cfg(not(feature = "rtems-exec-model"))]
+    #[cfg(tokio_backend)]
     #[tokio::test]
     async fn build_with_upstream_tls() {
         use epics_ca_rs::tls::{Roots, TlsConfig};
@@ -1535,7 +1549,7 @@ mod tests {
 
     // Same reason as `build_with_minimal_config`: the gateway builds a name-servers-only
     // upstream `CaClient` with no name server under this feature.
-    #[cfg(not(feature = "rtems-exec-model"))]
+    #[cfg(tokio_backend)]
     #[tokio::test]
     async fn build_no_pvlist_installs_implicit_allow_all() {
         // No pvlist path AND no inline content: C ca-gateway serves every
@@ -1559,7 +1573,7 @@ mod tests {
 
     // Same reason as `build_with_minimal_config`: the gateway builds a name-servers-only
     // upstream `CaClient` with no name server under this feature.
-    #[cfg(not(feature = "rtems-exec-model"))]
+    #[cfg(tokio_backend)]
     #[tokio::test]
     async fn build_empty_inline_content_stays_deny_all() {
         // An explicitly-supplied empty pvlist is the operator's deny-all
@@ -1581,7 +1595,7 @@ mod tests {
 
     // Same reason as `build_with_minimal_config`: the gateway builds a name-servers-only
     // upstream `CaClient` with no name server under this feature.
-    #[cfg(not(feature = "rtems-exec-model"))]
+    #[cfg(tokio_backend)]
     #[tokio::test]
     async fn existence_gate_hides_cached_shadow_pv_from_denied_host() {
         // `PV.*` is allowed in general but denied from 127.0.0.1. Even
@@ -1641,7 +1655,7 @@ mod tests {
 
     // Same reason as `build_with_minimal_config`: the gateway builds a name-servers-only
     // upstream `CaClient` with no name server under this feature.
-    #[cfg(not(feature = "rtems-exec-model"))]
+    #[cfg(tokio_backend)]
     #[tokio::test]
     async fn existence_gate_hides_disconnected_shadow_pv() {
         // A shadow PV whose upstream has disconnected must answer
@@ -1719,7 +1733,7 @@ mod tests {
     /// cache-misses on them and leaked them past a restrictive pvlist.
     // Same reason as `build_with_minimal_config`: the gateway builds a name-servers-only
     // upstream `CaClient` with no name server under this feature.
-    #[cfg(not(feature = "rtems-exec-model"))]
+    #[cfg(tokio_backend)]
     #[tokio::test]
     async fn existence_gate_applies_pvlist_admission_to_stat_pvs() {
         use std::net::SocketAddr;
@@ -1775,6 +1789,7 @@ mod tests {
         );
     }
 
+    #[cfg(tokio_backend)]
     #[tokio::test]
     async fn build_unknown_acf_path_returns_error() {
         let config = GatewayConfig {

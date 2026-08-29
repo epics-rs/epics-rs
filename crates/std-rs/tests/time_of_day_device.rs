@@ -8,6 +8,14 @@
 //! "Sec Past Epoch" removed from `is_soft_dtyp` and `std_device_supports()`
 //! registered, a processed record must have its VAL written by the device.
 
+// RTEMS-EXEC-MODEL-ALLOW(1): checked, not waived — all 1 ran and passed
+// on the exec backend (measured on this tree:
+// `EPICS_RS_BUILD_EXEC_BACKEND=thread cargo nextest run -p std-rs
+// --all-features`, 189/189). std-rs became a census subject when its
+// `build.rs` began deriving `tokio_backend`; nothing here builds a CA
+// server, and the reactor these obtain comes from `#[tokio::test]`
+// itself, which the backend does not remove.
+
 use std::collections::{HashMap, HashSet};
 
 use epics_base_rs::server::database::PvDatabase;

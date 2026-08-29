@@ -1,6 +1,6 @@
 //! Field writability, pinned to what the C IOC actually accepts.
 //!
-//! `read_only` is `special(SPC_NOMOD)`, and `rsrv/camessage.c:2608-2619` is
+//! `read_only` is `special(SPC_NOMOD)`, and `rsrv/camessage.c:2540-2551` is
 //! where it becomes a CA write-access denial. Every expectation below was
 //! measured with `caput` against the compiled softIoc at
 //! `/home/stevek/work/epics-base/bin/linux-x86_64/` — not read off the `.dbd`,

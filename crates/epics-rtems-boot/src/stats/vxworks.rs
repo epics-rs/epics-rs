@@ -447,9 +447,8 @@ fn errno() -> i32 {
 /// `EPICS_RTEMS_DUMP_MAX_TASKS` so the two targets truncated at the same count.
 /// A supported configuration exceeds it: 141 concurrent CA clients need
 /// `CAS_CLIENT_POOL_CAPACITY × 2` = 282 worker slots on their own, so a
-/// saturated IOC censused 192 of 301 tasks and reported `dropped=109`
-/// (`doc/vxworks-ca-worker-pool-on-target-measurement.md` §7.3). A capacity a
-/// supported configuration exceeds is not a capacity, and the truncation landed
+/// saturated IOC censused 192 of 301 tasks and reported `dropped=109`. A
+/// capacity a supported configuration exceeds is not a capacity, and the truncation landed
 /// exactly where the census is most worth reading.
 ///
 /// So the registry grows instead, and this number keeps only its second job:

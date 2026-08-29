@@ -14,7 +14,10 @@ pub mod params;
 pub mod task;
 pub mod types;
 
-#[cfg(feature = "ioc")]
+// `tokio_backend` as well as the feature: this module registers into
+// `ad_plugins_rs::ioc::AdIoc`, which the reactor-free backend does not
+// compile.
+#[cfg(all(feature = "ioc", tokio_backend))]
 pub mod ioc_support;
 
 pub use driver::{SimDetector, SimDetectorRuntime, create_sim_detector};

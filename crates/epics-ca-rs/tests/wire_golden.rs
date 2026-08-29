@@ -6,8 +6,7 @@
 //! anything reaches a real IOC.
 //!
 //! The hex strings below are constructed from first principles
-//! against the CA v4.13 wire format documented in
-//! `crates/epics-ca-rs/doc/02-wire-protocol.md`. They are NOT
+//! against the CA v4.13 wire format. They are NOT
 //! captured from libca/rsrv; that infrastructure (a live capture
 //! harness with a softioc fixture) is a separate project. Any future
 //! captured fixtures supersede these — when they disagree, the
@@ -215,7 +214,7 @@ fn proto_error_field_assignment_matches_c() {
     //                0xFFFFFFFF when the offending command has no
     //                channel scope (case-default branch).
     //   m_available = ECA status (read back by libca's
-    //                `exceptionRespAction` at `cac.cpp:1118` as
+    //                `exceptionRespAction` at `cac.cpp:1116` as
     //                `hdr.m_available`).
     //
     // This test pins the field assignment so the fix of
@@ -239,7 +238,7 @@ fn proto_error_field_assignment_matches_c() {
 
 #[test]
 fn event_cancel_unknown_sub_id_error_shape() {
-    // Per C `event_cancel_reply` (`camessage.c:2035-2102`), when the
+    // Per C `event_cancel_reply` (`camessage.c:1981-2048`), when the
     // sub-id (m_available of the request) doesn't match any active
     // subscription on the addressed channel, the server replies with
     // CA_PROTO_ERROR carrying ECA_BADMONID. The payload echoes the
@@ -301,7 +300,7 @@ fn search_reply_udp_matches_c_sid_sentinel() {
 
 #[test]
 fn search_reply_tcp_matches_c_zero_postsize_sid_sentinel() {
-    // C `search_reply_tcp` (`rsrv/camessage.c:2329-2331`):
+    // C `search_reply_tcp` (`rsrv/camessage.c:2275-2277`):
     //   m_cmmd      = CA_PROTO_SEARCH (6)
     //   m_postsize  = 0  (no payload — TCP search reply carries no
     //                 minor-version trailer, unlike UDP)
@@ -338,7 +337,7 @@ fn create_chan_cap_reached_uses_proto_error_eca_allocmem() {
     // CA_PROTO_CREATE_CHAN falls to `default`, so `m_cid` is the
     // 0xFFFFFFFF "no channel scope" sentinel and `m_available`
     // carries the ECA status. libca `exceptionRespAction`
-    // (`cac.cpp:1118`) reads `m_available` to surface ECA_ALLOCMEM
+    // (`cac.cpp:1116`) reads `m_available` to surface ECA_ALLOCMEM
     // to the user callback, distinguishing "server saturated"
     // from CREATE_CH_FAIL's "no such PV".
     //
@@ -362,7 +361,7 @@ fn create_chan_cap_reached_uses_proto_error_eca_allocmem() {
 
 #[test]
 fn search_fail_reply_tcp_echoes_request_header_fields() {
-    // C `search_fail_reply` (`rsrv/camessage.c:2129-2143`) calls
+    // C `search_fail_reply` (`rsrv/camessage.c:2075-2089`) calls
     // `cas_copy_in_header(CA_PROTO_NOT_FOUND, 0u, mp->m_dataType,
     // mp->m_count, mp->m_cid, mp->m_available, NULL)` — every
     // identifying field of the incoming search request is echoed

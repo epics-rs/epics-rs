@@ -6,9 +6,9 @@
 //! (`dbLink.c:118-122`), so every CP link — including one naming a record in
 //! this very IOC — is a CA link; the `isLocal` at `dbLink.c:128` is computed
 //! only to choose the init-callback hint. That CA subscription is taken with
-//! `DBE_VALUE | DBE_ALARM` (`dbCa.c:1290-1294` → `cadef.h:2010-2011`), and
-//! `CA_DBPROCESS` is added only from its `eventCallback` (`dbCa.c:1005-1012`),
-//! run as a bare `db_process` by the worker (`dbCa.c:1313-1320`). A source
+//! `DBE_VALUE | DBE_ALARM` (`dbCa.c:1225-1229` → `cadef.h:2010-2011`), and
+//! `CA_DBPROCESS` is added only from its `eventCallback` (`dbCa.c:955-963`),
+//! run as a bare `db_process` by the worker (`dbCa.c:1249-1257`). A source
 //! cycle that publishes nothing therefore leaves the holder alone.
 //!
 //! The port keeps a local CP target in the `Db` shape (the `ca` link set lives
@@ -24,7 +24,7 @@ use epics_base_rs::error::CaResult;
 use epics_base_rs::server::database::PvDatabase;
 use epics_base_rs::server::record::{FieldDesc, ProcessOutcome, Record, ScanType};
 use epics_base_rs::server::records::ai::AiRecord;
-use epics_base_rs::types::EpicsValue;
+use epics_base_rs::types::{DbfCode, EpicsValue};
 
 /// A Passive holder that counts its own `process()` calls — the observable
 /// the CP trigger decides.
@@ -60,13 +60,37 @@ impl Record for CountingRecord {
         }
     }
     fn declared_fields(&self) -> &'static [FieldDesc] {
-        &[]
+        COUNTING_FIELDS
     }
 }
+
+/// The holder's `.dbd`, such as it is: a synthetic type still has to DECLARE
+/// its `INP`, because "which fields on a record are links" is answered from
+/// the declaration and nowhere else. `FieldDesc::new` cannot spell it —
+/// it derives `declared_dbf` from the SERVED type, and all three link classes
+/// serve as `DBF_STRING` — so the class is written out.
+const fn inlink(name: &'static str) -> FieldDesc {
+    FieldDesc {
+        declared_dbf: DbfCode::Inlink,
+        ..FieldDesc::new(name, epics_base_rs::types::DbFieldType::String, false)
+    }
+}
+
+static COUNTING_FIELDS: &[FieldDesc] = &[
+    inlink("INP"),
+    FieldDesc::new("VAL", epics_base_rs::types::DbFieldType::Double, false),
+];
 
 /// `SRC` (ai, `MDEL = mdel`) with a Passive holder taking `INP = "SRC <mod>"`.
 /// Returns the holder's process counter.
 async fn cp_pair(db: &PvDatabase, modifier: &str, mdel: f64) -> Arc<AtomicUsize> {
+    // What `register_record_type` does for a real type: publish the table to
+    // the by-name registry `dbf_link_class` reads. `add_record` takes an
+    // instance and no factory, so nothing else does it here.
+    epics_base_rs::server::record::register_declared_fields(
+        "cp_trigger_count_test",
+        COUNTING_FIELDS,
+    );
     let processes = Arc::new(AtomicUsize::new(0));
     let mut src = AiRecord::new(0.0);
     src.mdel = mdel;
@@ -194,7 +218,7 @@ async fn an_alarm_only_transition_processes_the_cp_holder() {
 
 /// BOUNDARY: the CPP passive gate is unchanged by the post gate. A CPP
 /// holder whose SCAN is not Passive is skipped even when the source posts
-/// (C `dbCa.c:1005-1012`: `pvlOptCPP` adds `CA_DBPROCESS` only for
+/// (C `dbCa.c:958-962`: `pvlOptCPP` adds `CA_DBPROCESS` only for
 /// `precord->scan == 0`).
 #[epics_macros_rs::epics_test]
 async fn a_cpp_holder_that_is_not_passive_is_still_skipped_on_a_post() {
@@ -202,7 +226,7 @@ async fn a_cpp_holder_that_is_not_passive_is_still_skipped_on_a_post() {
     let processes = cp_pair(&db, "CPP", 0.0).await;
     {
         let rec = db.get_record("HOLD").unwrap();
-        rec.write().common.scan = ScanType::Sec1;
+        rec.write().common.scan = ScanType::SEC1;
     }
     let settled = settle(&db, &processes).await;
 

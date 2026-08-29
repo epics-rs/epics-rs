@@ -6,12 +6,13 @@
 //! must reach pvxput as a non-zero exit + an error message on
 //! stderr.
 
-// RTEMS-EXEC-MODEL-ALLOW(1): not run by the default nextest profile - this file is a module of the `interop_pvxs` binary, which `.config/nextest.toml`'s default-filter excludes.
+#![cfg(tokio_backend)]
 
 use super::interop_helpers::{PVXPUT, pvxs_command, pvxs_lib_dir, require_pvxs};
 
 use epics_pva_rs::pvdata::{FieldDesc, PvField, PvStructure, ScalarType, ScalarValue};
-use epics_pva_rs::server_native::{PvaServer, SharedPV, SharedSource};
+use epics_pva_rs::server_native::PvaServer;
+use epics_pva_rs::server_native::{SharedPV, SharedSource};
 
 use std::process::Stdio;
 use std::sync::Arc;

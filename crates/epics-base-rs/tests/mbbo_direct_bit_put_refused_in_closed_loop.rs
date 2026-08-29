@@ -13,7 +13,7 @@
 //!     }
 //! ```
 //!
-//! `dbPut` returns that status before storing anything (`dbAccess.c:1350-1352`,
+//! `dbPut` returns that status before storing anything (`dbAccess.c:1345-1347`,
 //! `if (special) { status = dbPutSpecial(paddr, 0); if (status) return status; }`),
 //! so neither the bit nor the VAL it would recompute moves. The port stored the
 //! bit and let `bits_to_val()` overwrite the closed-loop setpoint until the next

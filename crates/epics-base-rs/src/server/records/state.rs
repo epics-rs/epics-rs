@@ -38,10 +38,6 @@ pub struct StateRecord {
     /// ([`Record::set_async_context`]); used to name the deprecation
     /// warning exactly as C does.
     name: Option<String>,
-    /// Per-cycle scratch: did `VAL` change on the most recent `process()`?
-    /// Captured before the `oval` copy so the framework's post-process
-    /// monitor gate reads the C `strncmp(oval, val)` result.
-    value_changed: bool,
 }
 
 impl Default for StateRecord {
@@ -50,7 +46,6 @@ impl Default for StateRecord {
             val: PvString::new(),
             oval: PvString::new(),
             name: None,
-            value_changed: false,
         }
     }
 }
@@ -93,10 +88,6 @@ impl Record for StateRecord {
     /// is captured before the copy so the framework's VAL-post gate reads
     /// the C result.
     fn process(&mut self) -> CaResult<ProcessOutcome> {
-        self.value_changed = self.oval != self.val;
-        if self.value_changed {
-            self.oval = self.val.clone();
-        }
         Ok(ProcessOutcome::complete())
     }
 
@@ -106,8 +97,15 @@ impl Record for StateRecord {
         false
     }
 
-    fn monitor_value_changed(&self) -> Option<bool> {
-        Some(self.value_changed)
+    /// C `stateRecord.c:115-118` `monitor()`: the `strncmp(oval, val)` mismatch both
+    /// raises `DBE_VALUE | DBE_LOG` and copies VAL into OVAL. Compared and
+    /// committed HERE, at C's position, never captured during `process()`.
+    fn monitor_value_changed(&mut self) -> Option<bool> {
+        let changed = self.oval != self.val;
+        if changed {
+            self.oval = self.val.clone();
+        }
+        Some(changed)
     }
 
     /// C `stateRecord.c::monitor` (lines 120-129) posts only `VAL`. `OVAL`

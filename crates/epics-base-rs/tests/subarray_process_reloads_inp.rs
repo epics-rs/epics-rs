@@ -164,7 +164,7 @@ async fn constant_inp_indx_selects_the_window() {
 /// | put   | `20 30 40` | 3    |
 /// | +1    | `30 40`    | 2    |
 /// | +2    | `40`       | 1    |
-/// | +3    | (empty)    | 0    | → UDF/INVALID
+/// | +3    | (empty)    | 0 → UDF/INVALID |
 #[epics_macros_rs::epics_test]
 async fn empty_inp_re_slices_the_client_written_val() {
     let db = build().await;

@@ -380,22 +380,18 @@ impl QxbpmHolder {
                 ArgDesc {
                     name: "port",
                     arg_type: ArgType::String,
-                    optional: false,
                 },
                 ArgDesc {
                     name: "xPos",
                     arg_type: ArgType::Double,
-                    optional: true,
                 },
                 ArgDesc {
                     name: "yPos",
                     arg_type: ArgType::Double,
-                    optional: true,
                 },
                 ArgDesc {
                     name: "pollMs",
                     arg_type: ArgType::Int,
-                    optional: true,
                 },
             ],
             "simQxbpmCreate(port, [xPos], [yPos], [pollMs]) - Create a simulated QXBPM",

@@ -3,7 +3,7 @@ use epics_macros_rs::EpicsRecord;
 use crate::server::record::MENU_YES_NO;
 use crate::types::PvString;
 
-/// `longinRecord.c:206-224` `get_control_double` lists one field the shared
+/// `longinRecord.c:217-238` `get_control_double` lists one field the shared
 /// VAL-class set does not: `SVAL`, which takes the record's own `HOPR`/`LOPR`
 /// like `VAL` does. Without this it falls to the `default:` arm and reports
 /// the DBF_LONG range of ±2147483647.
@@ -20,7 +20,17 @@ fn longin_metadata_override(
 }
 
 #[derive(EpicsRecord)]
-#[record(type = "longin", metadata_override = longin_metadata_override)]
+// `dset_owns_udf_on_computed`: C `longinRecord.c:148` is
+// `if (status==0) prec->udf = FALSE;` with no `status == 2` fold anywhere in
+// `process()`, so a device support that wrote VAL directly leaves `udf`
+// exactly where it was. The soft dset returns 0 rather than 2 for that reason
+// (`devLiSoft.c::readLocked` ends `return status`), and `devAsynInt32.c`'s
+// `processLi:1057-1060` writes `pr->udf = 0` itself before returning 0.
+#[record(
+    type = "longin",
+    metadata_override = longin_metadata_override,
+    dset_owns_udf_on_computed
+)]
 pub struct LonginRecord {
     #[field(type = "Long")]
     pub val: i32,

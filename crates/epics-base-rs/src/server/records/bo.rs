@@ -1,3 +1,5 @@
+use std::sync::atomic::{AtomicI32, AtomicU64, Ordering};
+
 use crate::error::{CaError, CaResult};
 use crate::server::record::{
     DelayedCallbackOutcome, FieldMetadataOverride, MENU_SIMM, ProcessAction, ProcessOutcome, Record,
@@ -39,11 +41,6 @@ pub struct BoRecord {
     pub siol: String,
     pub sims: i16,
     pub sdly: f64,
-    // VAL change gate. C
-    // boRecord.c:394-399 monitor() raises DBE_VALUE|DBE_LOG for VAL only
-    // when `mlst != val`. Captured during process() because the framework
-    // reads monitor_value_changed() after process() has committed mlst.
-    value_changed: bool,
     /// Set by `set_device_did_compute(true)` when a device readback has
     /// already produced both RVAL and VAL (`apply_raw_readback`). One-shot:
     /// `process()` then skips the forward `VAL -> RVAL` `val_to_rval()` that
@@ -79,7 +76,6 @@ impl Default for BoRecord {
             siol: String::new(),
             sims: 0,
             sdly: -1.0,
-            value_changed: false,
             skip_convert: false,
         }
     }
@@ -109,12 +105,32 @@ impl BoRecord {
 
 /// C `boRecord.c:85` `int boHIGHprecision = 2;` — the precision
 /// `get_precision` serves for `HIGH`, the seconds-to-hold-1 field.
-const BO_HIGH_PRECISION: i16 = 2;
+static BO_HIGH_PRECISION: AtomicI32 = AtomicI32::new(2);
+
+/// The iocsh knob `boHIGHprecision`, read and written by `var`.
+pub(crate) fn bo_high_precision() -> i32 {
+    BO_HIGH_PRECISION.load(Ordering::Relaxed)
+}
+
+/// See [`bo_high_precision`].
+pub(crate) fn set_bo_high_precision(value: i32) {
+    BO_HIGH_PRECISION.store(value, Ordering::Relaxed);
+}
 
 /// C `boRecord.c:87` `double boHIGHlimit = 100000;` — the control upper
 /// `get_control_double` (`:310-318`) serves for `HIGH`, over a literal `0.0`
 /// lower.
-const BO_HIGH_LIMIT: f64 = 100000.0;
+static BO_HIGH_LIMIT: AtomicU64 = AtomicU64::new(100000f64.to_bits());
+
+/// The iocsh knob `boHIGHlimit`, read and written by `var`.
+pub(crate) fn bo_high_limit() -> f64 {
+    f64::from_bits(BO_HIGH_LIMIT.load(Ordering::Relaxed))
+}
+
+/// See [`bo_high_limit`].
+pub(crate) fn set_bo_high_limit(value: f64) {
+    BO_HIGH_LIMIT.store(value.to_bits(), Ordering::Relaxed);
+}
 
 impl Record for BoRecord {
     fn record_type(&self) -> &'static str {
@@ -142,7 +158,8 @@ impl Record for BoRecord {
     /// value (2) reaches the wire — a deliberate deviation from `softIocPVX`,
     /// carried on the oracle allowlist.
     ///
-    /// `get_control_double` (`:310-318`) is the same one-field shape and DOES
+    /// `get_control_double` (`boRecord.c:310-318` — the nearer citation above
+    /// is pvxs, so this one names its file) is the same one-field shape and DOES
     /// reach the wire: `HIGH` alone takes `0.0 .. boHIGHlimit`, and every other
     /// field — `LALM` and `MLST` included — falls to `recGblGetControlDouble`.
     /// That is why `bo` lists nothing in
@@ -154,8 +171,8 @@ impl Record for BoRecord {
             .eq_ignore_ascii_case("HIGH")
             .then(|| FieldMetadataOverride {
                 units: Some("s".into()),
-                precision: Some(BO_HIGH_PRECISION),
-                ctrl_limits: Some((BO_HIGH_LIMIT, 0.0)),
+                precision: Some(bo_high_precision() as i16),
+                ctrl_limits: Some((bo_high_limit(), 0.0)),
                 ..Default::default()
             })
     }
@@ -190,18 +207,37 @@ impl Record for BoRecord {
         Some(EpicsValue::Long(self.rval as i32))
     }
 
-    // C recBo.c IVOA=set_to_IVOV: val = ivov; rval = ivov.
+    /// C `boRecord.c:230-238` (R7.0.10) is `prec->val = prec->ivov;` followed
+    /// by the record's OWN `/* convert val to rval */` block, MASK rule and
+    /// all:
+    ///
+    /// ```c
+    ///     prec->val=prec->ivov;
+    ///     if ( prec->mask != 0 ) {
+    ///         if(prec->val==0) prec->rval = 0;
+    ///         else prec->rval = prec->mask;
+    ///     } else prec->rval = (epicsUInt32)prec->val;
+    /// ```
+    ///
+    /// so RVAL is never IVOV itself — it is IVOV run through the same
+    /// conversion an ordinary cycle uses. Writing `RVAL = IVOV` directly
+    /// reproduced only C's `else` branch, so a `bo` with a non-zero MASK drove
+    /// the bare state index onto the wire instead of the mask word. Record
+    /// support never assigns MASK — `boRecord.c` only reads it, at `:167`,
+    /// `:208` and `:234` — device support does
+    /// (`devAsynUInt32Digital.c::initBo:699,710`, asyn `R4-45-74-g731d616e`:
+    /// `pr->mask = pPvt->mask`).
     fn apply_invalid_output_value(&mut self, ivov: EpicsValue) -> CaResult<()> {
-        // IVOV is DBF_USHORT (boRecord.dbd.pod:372); VAL is the binary enum
-        // and RVAL is DBF_ULONG. Route the unsigned IVOV value into both.
+        // IVOV is DBF_USHORT (boRecord.dbd.pod:372); VAL is the binary enum.
         let v: u16 = match &ivov {
             EpicsValue::UShort(e) => *e,
             EpicsValue::Enum(e) => *e,
             EpicsValue::Short(s) => *s as u16,
             other => return Err(CaError::TypeMismatch(format!("bo IVOV: {other:?}"))),
         };
-        self.put_field("RVAL", EpicsValue::ULong(u32::from(v)))?;
-        self.put_field("VAL", EpicsValue::Enum(v))
+        self.put_field("VAL", EpicsValue::Enum(v))?;
+        self.val_to_rval();
+        Ok(())
     }
 
     /// C `boRecord.c:146-149`:
@@ -216,15 +252,21 @@ impl Record for BoRecord {
         )]
     }
 
-    /// C `boRecord.c:163-172` — the init tail, run right after the constant
-    /// load: convert VAL to RVAL through MASK, then
-    /// `mlst = lalm = val; oraw = rval; orbv = rbv`.
-    fn seed_deadband_tracking(&mut self) {
+    /// C `boRecord.c:167-170,174-175` (R7.0.10) — the derived half of the init
+    /// tail: convert VAL to RVAL through MASK, then `oraw = rval; orbv = rbv`.
+    fn init_record_tail(&mut self) {
         self.val_to_rval();
-        self.mlst = self.val;
-        self.lalm = self.val;
         self.oraw = self.rval;
         self.orbv = self.rbv;
+    }
+
+    /// C `boRecord.c:172-173` — `mlst = lalm = val`, the tracker half of the
+    /// same tail. (C assigns `mlst` twice, once on each side of the convert at
+    /// `:165` and `:172`; only the second is reachable.) bo seeds no ALST: it
+    /// has no ADEL.
+    fn seed_deadband_tracking(&mut self) {
+        self.mlst = self.val;
+        self.lalm = self.val;
     }
 
     fn process(&mut self) -> CaResult<ProcessOutcome> {
@@ -261,19 +303,11 @@ impl Record for BoRecord {
             ));
         }
 
-        // Capture the VAL-change
-        // gate now (C boRecord.c:394-399 `mlst != val`); the HIGH toggle does
-        // not alter VAL this cycle, so VAL is final here. The framework reads
-        // monitor_value_changed() after process().
-        self.value_changed = self.mlst != self.val;
-        if self.value_changed {
-            self.mlst = self.val;
-        }
-
         Ok(ProcessOutcome {
             result: crate::server::record::RecordProcessResult::Complete,
             actions,
             device_did_compute: false,
+            post_write_fields: Vec::new(),
         })
     }
 
@@ -612,12 +646,15 @@ impl Record for BoRecord {
         ))
     }
 
-    /// VAL posts DBE_VALUE|DBE_LOG
-    /// only when it changed (C boRecord.c:394-399 `mlst != val`), not every
-    /// process cycle. The comparison is captured in process(); see
-    /// `value_changed`.
-    fn monitor_value_changed(&self) -> Option<bool> {
-        Some(self.value_changed)
+    /// C `boRecord.c:395-400` `monitor()`: `if (prec->mlst != prec->val) { events |=
+    /// DBE_VALUE | DBE_LOG; prec->mlst = prec->val; }` — compared and
+    /// committed HERE, at C's position, never captured during `process()`.
+    fn monitor_value_changed(&mut self) -> Option<bool> {
+        let changed = self.mlst != self.val;
+        if changed {
+            self.mlst = self.val;
+        }
+        Some(changed)
     }
 
     fn uses_monitor_deadband(&self) -> bool {

@@ -1,6 +1,7 @@
 use std::sync::Arc;
 
-#[cfg(feature = "parallel")]
+// Not gated on `parallel`: `should_parallelize` is the whole decision now
+// and this file asks it on both arms.
 use crate::par_util;
 #[cfg(feature = "parallel")]
 use rayon::prelude::*;
@@ -8,6 +9,7 @@ use rayon::prelude::*;
 use ad_core_rs::ndarray::{NDArray, NDDataBuffer, NDDataType};
 use ad_core_rs::ndarray_pool::NDArrayPool;
 use ad_core_rs::plugin::runtime::{NDPluginProcess, ProcessResult};
+use parking_lot::Mutex;
 
 /// Recursive filter configuration matching C++ NDPluginProcess.
 ///
@@ -138,8 +140,13 @@ fn elements_as_f64(array: &NDArray) -> Vec<f64> {
 /// Matches the C++ NDPluginProcess which uses a single `pFilter` array.
 pub struct ProcessState {
     pub config: ProcessConfig,
-    pub background: Option<Vec<f64>>,
-    pub flat_field: Option<Vec<f64>>,
+    /// C's `pBackground`. Behind an `Arc` so a frame can carry it out of the
+    /// state lock for the price of a refcount bump: it is a frame-sized
+    /// `f64` buffer (2 MB at 512x512), so cloning it per frame to escape the
+    /// lock would cost more than the lock did.
+    pub background: Option<Arc<Vec<f64>>>,
+    /// C's `pFlatField`; `Arc` for the same reason as [`ProcessState::background`].
+    pub flat_field: Option<Arc<Vec<f64>>>,
     /// Single filter buffer (equivalent to C++ `pFilter`).
     ///
     /// Invariant (NDPluginProcess.cpp:182-187): this buffer is dropped **only**
@@ -226,7 +233,10 @@ impl ProcessState {
     /// is no array to save from, and the source is the last OUTPUT array — the
     /// one this plugin already emitted, in the output data type.
     pub fn save_background(&mut self) {
-        let saved = self.last_output.as_ref().map(elements_as_f64);
+        let saved = self
+            .last_output
+            .as_ref()
+            .map(|a| Arc::new(elements_as_f64(a)));
         self.config.valid_background = saved.is_some();
         self.background = saved;
     }
@@ -235,7 +245,10 @@ impl ProcessState {
     /// (NDPluginProcess.cpp:299-310) — the SaveBackground sequence above, on the
     /// flat-field buffer.
     pub fn save_flat_field(&mut self) {
-        let saved = self.last_output.as_ref().map(elements_as_f64);
+        let saved = self
+            .last_output
+            .as_ref()
+            .map(|a| Arc::new(elements_as_f64(a)));
         self.config.valid_flat_field = saved.is_some();
         self.flat_field = saved;
     }
@@ -389,7 +402,7 @@ impl ProcessState {
     /// Request a filter reset on the next processed frame.
     ///
     /// This is the `ResetFilter` parameter write. C only clears the PV
-    /// (NDPluginProcess.cpp:91-93) and lets `processCallbacks` act on the local
+    /// (NDPluginProcess.cpp:90-92) and lets `processCallbacks` act on the local
     /// flag; `pFilter` keeps its contents, so the reset formula at :204-209
     /// (`newFilter = rOffset + rc1*filter[i] + rc2*data[i]`) evaluates against
     /// the **previous** filter buffer. Freeing the buffer here would make
@@ -399,28 +412,24 @@ impl ProcessState {
         self.reset_filter_pending = true;
     }
 
-    /// Process an array through the configured pipeline.
-    /// Process one input array.
+    /// Open a frame: consume the one-shot parameter requests, recompute the
+    /// buffer validity flags and snapshot everything the element-wise pass
+    /// reads.
     ///
-    /// Returns `Some(output)` for a normal frame, or `None` when the frame is
-    /// suppressed by the recursive-filter `filter_callbacks` setting (C++ sets
-    /// `doCallbacks = 0` and the frame is dropped — nothing goes downstream).
-    pub fn process(&mut self, src: &NDArray) -> Option<NDArray> {
-        let n = src.data.len();
-        let mut values = vec![0.0f64; n];
-        for i in 0..n {
-            values[i] = src.data.get_as_f64(i).unwrap_or(0.0);
-        }
-
+    /// This is the only part of a frame that must run under the state lock. C
+    /// does the same reads under the port lock and then releases at
+    /// NDPluginProcess.cpp:139 -- "now that we are only doing things that
+    /// don't involve memory other threads cannot access".
+    fn begin_frame(&mut self, n: usize) -> ProcessFrame {
         // C reads the ResetFilter parameter once per frame and clears the PV
-        // immediately (NDPluginProcess.cpp:73, :91-93) — before the EnableFilter
+        // immediately (NDPluginProcess.cpp:73, :91-93) -- before the EnableFilter
         // block, so a reset requested while filtering is disabled is consumed
         // and lost. Take the flag here for the same reason.
         let reset_requested = self.reset_filter_pending;
         self.reset_filter_pending = false;
 
         // Auto offset/scale (one-shot): C MEASURES this frame's min/max and
-        // ARMS scale/offset + clipping for the NEXT frame — the trigger frame
+        // ARMS scale/offset + clipping for the NEXT frame -- the trigger frame
         // itself is emitted with the pre-existing config, NOT the derived scale
         // (NDPluginProcess.cpp:164-178 only updates min/max; 238-250 arms the
         // params after the output array is built). Consume the one-shot here and
@@ -431,11 +440,184 @@ impl ProcessState {
         // Recompute valid background / flat field each frame from the element
         // count (C NDPluginProcess.cpp:120-125): a saved buffer is usable only
         // when its length matches the current frame. A size mismatch
-        // invalidates it — the buffer is dropped entirely, never applied to a
+        // invalidates it -- the buffer is dropped entirely, never applied to a
         // matching prefix.
         self.config.valid_background = self.background.as_ref().is_some_and(|b| b.len() == n);
         self.config.valid_flat_field = self.flat_field.as_ref().is_some_and(|f| f.len() == n);
 
+        ProcessFrame {
+            config: self.config.clone(),
+            background: self.background.clone(),
+            flat_field: self.flat_field.clone(),
+            reset_requested,
+            auto_offset_scale_now,
+        }
+    }
+
+    /// Stage 5, the recursive filter. The one stage that cannot run released:
+    /// `filter_state` and `num_filtered` are shared state that every frame
+    /// advances in order, so two frames running it concurrently would
+    /// interleave into a filter buffer that is neither frame's.
+    ///
+    /// C does run this released -- it unlocks at NDPluginProcess.cpp:139 and
+    /// touches `this->pFilter` and `this->numFiltered` at :181-229 with the
+    /// lock down, which races its own filter state whenever `maxThreads > 1`.
+    /// We keep the lock rather than reproduce that.
+    ///
+    /// Returns `false` when the frame is suppressed by `filter_callbacks`.
+    fn run_filter(&mut self, frame: &ProcessFrame, values: &mut [f64]) -> bool {
+        let n = values.len();
+        // 5. Recursive filter (matching C++ NDPluginProcess algorithm)
+        if frame.config.enable_filter {
+            let fc = &frame.config.filter;
+
+            // C++ NDPluginProcess.cpp:181-201. The filter buffer is released
+            // ONLY on an element-count mismatch (:184); a fresh buffer is then
+            // seeded from the current frame and forces a reset (:198).
+            if let Some(ref f) = self.filter_state {
+                if f.len() != n {
+                    self.filter_state = None;
+                }
+            }
+
+            let mut reset_filter = frame.reset_requested;
+            if self.filter_state.is_none() {
+                // No current filter array: seed it from this frame, reset (:188-199).
+                self.filter_state = Some(values.to_vec());
+                reset_filter = true;
+            }
+            if self.num_filtered >= fc.num_filter && fc.auto_reset {
+                reset_filter = true;
+            }
+
+            let filter = self.filter_state.as_mut().unwrap();
+
+            if reset_filter {
+                // C++ NDPluginProcess.cpp:204-209:
+                //   newFilter = rOffset;
+                //   if (rc1) newFilter += rc1*filter[i];
+                //   if (rc2) newFilter += rc2*data[i];
+                let r_offset = fc.r_offset;
+                let rc1 = fc.rc[0];
+                let rc2 = fc.rc[1];
+                for i in 0..n {
+                    let mut new_filter = accumulate(r_offset, rc1, filter[i]);
+                    new_filter = accumulate(new_filter, rc2, values[i]);
+                    filter[i] = new_filter;
+                }
+                self.num_filtered = 0;
+            }
+
+            // Increment filtered count (C++: if (numFiltered < numFilter) numFiltered++)
+            if self.num_filtered < fc.num_filter {
+                self.num_filtered += 1;
+            }
+
+            // Compute effective coefficients (depend on numFiltered)
+            let nf = self.num_filtered as f64;
+            let o1 = fc.o_scale * (fc.oc[0] + fc.oc[1] / nf);
+            let o2 = fc.o_scale * (fc.oc[2] + fc.oc[3] / nf);
+            let f1 = fc.f_scale * (fc.fc[0] + fc.fc[1] / nf);
+            let f2 = fc.f_scale * (fc.fc[2] + fc.fc[3] / nf);
+            let o_offset = fc.o_offset;
+            let f_offset = fc.f_offset;
+
+            // C++ NDPluginProcess.cpp:219-227 doProcess:
+            //   newData   = oOffset;
+            //   if (O1) newData += O1 * filter[i];
+            //   if (O2) newData += O2 * data[i];
+            //   newFilter = fOffset;
+            //   if (F1) newFilter += F1 * filter[i];
+            //   if (F2) newFilter += F2 * data[i];
+            //   data[i]   = newData;
+            //   filter[i] = newFilter;
+            // Both newData AND newFilter are computed from the ORIGINAL
+            // data[i]; data[i] = newData is assigned only afterward. So the
+            // filter-state update must use the original input, not new_data.
+            for i in 0..n {
+                let mut new_data = accumulate(o_offset, o1, filter[i]);
+                new_data = accumulate(new_data, o2, values[i]);
+                let mut new_filter = accumulate(f_offset, f1, filter[i]);
+                new_filter = accumulate(new_filter, f2, values[i]);
+                values[i] = new_data;
+                filter[i] = new_filter;
+            }
+
+            // Suppress output if filterCallbacks is set and we haven't reached
+            // numFilter. C++ sets doCallbacks = 0 and does NOT call
+            // endProcessCallbacks — the frame is dropped, nothing goes
+            // downstream (the unprocessed input is NOT forwarded).
+            if fc.filter_callbacks > 0 && self.num_filtered != fc.num_filter {
+                return false;
+            }
+        }
+
+        true
+    }
+
+    /// Close a frame: arm auto offset/scale from it and cache the emitted
+    /// array as C's `pArrays[0]`. Runs under the lock, on the emitting path
+    /// only.
+    fn end_frame(&mut self, frame: &ProcessFrame, src: &NDArray, arr: &NDArray) {
+        // Arm auto offset/scale from THIS frame's data for the NEXT frame
+        // (C NDPluginProcess.cpp:238-250 runs after the output array is built).
+        // Only on the emitted-output path: a suppressed frame produces no output
+        // array, so C (pArrayOut == NULL) does not arm either.
+        if frame.auto_offset_scale_now {
+            self.auto_offset_scale(src);
+        }
+
+        // C `endProcessCallbacks` caches the emitted array in pArrays[0]
+        // (NDPluginDriver.cpp:262-277). It runs only on this path — a
+        // filter-suppressed frame returned above and leaves the previous output
+        // in place. This is the ONLY writer of `last_output`.
+        self.last_output = Some(arr.clone());
+    }
+
+    /// Process an array through the configured pipeline.
+    ///
+    /// Returns `Some(output)` for a normal frame, or `None` when the frame is
+    /// suppressed by the recursive-filter `filter_callbacks` setting (C++ sets
+    /// `doCallbacks = 0` and the frame is dropped -- nothing goes downstream).
+    ///
+    /// This is the single-threaded composition. `process_array` drives the
+    /// same steps itself so it can hold the state lock for `begin_frame`,
+    /// `run_filter` and `end_frame` only.
+    pub fn process(&mut self, src: &NDArray) -> Option<NDArray> {
+        let mut values = elements_as_f64(src);
+        let frame = self.begin_frame(values.len());
+        frame.apply_element_ops(&mut values);
+        if !self.run_filter(&frame, &mut values) {
+            return None;
+        }
+        let arr = frame.build_output(src, &values);
+        self.end_frame(&frame, src, &arr);
+        Some(arr)
+    }
+}
+
+/// Everything one frame reads and nothing it writes: the tuning config, the
+/// two correction buffers and the two one-shot requests it consumed.
+///
+/// C assembles exactly this set under the port lock -- the enable flags, the
+/// `background`/`flatField` pointers and the two validity results -- and then
+/// releases at NDPluginProcess.cpp:139 before touching a pixel. The buffers
+/// ride in an `Arc` so carrying them out of the lock costs a refcount bump
+/// rather than a copy of a frame-sized `f64` array.
+struct ProcessFrame {
+    config: ProcessConfig,
+    background: Option<Arc<Vec<f64>>>,
+    flat_field: Option<Arc<Vec<f64>>>,
+    reset_requested: bool,
+    auto_offset_scale_now: bool,
+}
+
+impl ProcessFrame {
+    /// Stages 1-4, the element-wise pass. Reads only this snapshot, so it runs
+    /// with the state lock released -- which is the whole point of taking the
+    /// snapshot, since this is the frame-sized loop.
+    fn apply_element_ops(&self, values: &mut [f64]) {
+        let n = values.len();
         // Stages 1-4: element-wise operations (background, flat field, offset+scale, clipping)
         // These can be combined into a single pass and parallelized.
         let needs_element_ops = self.config.enable_background
@@ -502,10 +684,7 @@ impl ProcessState {
                 }
             };
 
-            #[cfg(feature = "parallel")]
             let use_parallel = par_util::should_parallelize(n);
-            #[cfg(not(feature = "parallel"))]
-            let use_parallel = false;
 
             if use_parallel {
                 #[cfg(feature = "parallel")]
@@ -520,92 +699,13 @@ impl ProcessState {
                 }
             }
         }
+    }
 
-        // 5. Recursive filter (matching C++ NDPluginProcess algorithm)
-        if self.config.enable_filter {
-            let fc = &self.config.filter;
-
-            // C++ NDPluginProcess.cpp:181-201. The filter buffer is released
-            // ONLY on an element-count mismatch (:184); a fresh buffer is then
-            // seeded from the current frame and forces a reset (:198).
-            if let Some(ref f) = self.filter_state {
-                if f.len() != n {
-                    self.filter_state = None;
-                }
-            }
-
-            let mut reset_filter = reset_requested;
-            if self.filter_state.is_none() {
-                // No current filter array: seed it from this frame, reset (:189-199).
-                self.filter_state = Some(values.clone());
-                reset_filter = true;
-            }
-            if self.num_filtered >= fc.num_filter && fc.auto_reset {
-                reset_filter = true;
-            }
-
-            let filter = self.filter_state.as_mut().unwrap();
-
-            if reset_filter {
-                // C++ NDPluginProcess.cpp:204-209:
-                //   newFilter = rOffset;
-                //   if (rc1) newFilter += rc1*filter[i];
-                //   if (rc2) newFilter += rc2*data[i];
-                let r_offset = fc.r_offset;
-                let rc1 = fc.rc[0];
-                let rc2 = fc.rc[1];
-                for i in 0..n {
-                    let mut new_filter = accumulate(r_offset, rc1, filter[i]);
-                    new_filter = accumulate(new_filter, rc2, values[i]);
-                    filter[i] = new_filter;
-                }
-                self.num_filtered = 0;
-            }
-
-            // Increment filtered count (C++: if (numFiltered < numFilter) numFiltered++)
-            if self.num_filtered < fc.num_filter {
-                self.num_filtered += 1;
-            }
-
-            // Compute effective coefficients (depend on numFiltered)
-            let nf = self.num_filtered as f64;
-            let o1 = fc.o_scale * (fc.oc[0] + fc.oc[1] / nf);
-            let o2 = fc.o_scale * (fc.oc[2] + fc.oc[3] / nf);
-            let f1 = fc.f_scale * (fc.fc[0] + fc.fc[1] / nf);
-            let f2 = fc.f_scale * (fc.fc[2] + fc.fc[3] / nf);
-            let o_offset = fc.o_offset;
-            let f_offset = fc.f_offset;
-
-            // C++ NDPluginProcess.cpp:219-227 doProcess:
-            //   newData   = oOffset;
-            //   if (O1) newData += O1 * filter[i];
-            //   if (O2) newData += O2 * data[i];
-            //   newFilter = fOffset;
-            //   if (F1) newFilter += F1 * filter[i];
-            //   if (F2) newFilter += F2 * data[i];
-            //   data[i]   = newData;
-            //   filter[i] = newFilter;
-            // Both newData AND newFilter are computed from the ORIGINAL
-            // data[i]; data[i] = newData is assigned only afterward. So the
-            // filter-state update must use the original input, not new_data.
-            for i in 0..n {
-                let mut new_data = accumulate(o_offset, o1, filter[i]);
-                new_data = accumulate(new_data, o2, values[i]);
-                let mut new_filter = accumulate(f_offset, f1, filter[i]);
-                new_filter = accumulate(new_filter, f2, values[i]);
-                values[i] = new_data;
-                filter[i] = new_filter;
-            }
-
-            // Suppress output if filterCallbacks is set and we haven't reached
-            // numFilter. C++ sets doCallbacks = 0 and does NOT call
-            // endProcessCallbacks — the frame is dropped, nothing goes
-            // downstream (the unprocessed input is NOT forwarded).
-            if fc.filter_callbacks > 0 && self.num_filtered != fc.num_filter {
-                return None;
-            }
-        }
-
+    /// Build the output array. Pure given the snapshot, so it also runs
+    /// released; C likewise converts to the output data type with the lock
+    /// down and only re-takes it at NDPluginProcess.cpp:254.
+    fn build_output(&self, src: &NDArray, values: &[f64]) -> NDArray {
+        let n = values.len();
         // Build output
         let out_type = self.config.output_type.unwrap_or(src.data.data_type());
         let mut out_data = NDDataBuffer::zeros(out_type, n);
@@ -619,21 +719,7 @@ impl ProcessState {
         arr.timestamp = src.timestamp;
         arr.attributes = src.attributes.clone();
 
-        // Arm auto offset/scale from THIS frame's data for the NEXT frame
-        // (C NDPluginProcess.cpp:238-250 runs after the output array is built).
-        // Only on the emitted-output path: a suppressed frame produces no output
-        // array, so C (pArrayOut == NULL) does not arm either.
-        if auto_offset_scale_now {
-            self.auto_offset_scale(src);
-        }
-
-        // C `endProcessCallbacks` caches the emitted array in pArrays[0]
-        // (NDPluginDriver.cpp:262-277). It runs only on this path — a
-        // filter-suppressed frame returned above and leaves the previous output
-        // in place. This is the ONLY writer of `last_output`.
-        self.last_output = Some(arr.clone());
-
-        Some(arr)
+        arr
     }
 }
 
@@ -679,32 +765,51 @@ struct ProcParamIndices {
 
 /// ProcessProcessor wraps existing ProcessState.
 pub struct ProcessProcessor {
-    state: ProcessState,
+    state: Mutex<ProcessState>,
     params: ProcParamIndices,
 }
 
 impl ProcessProcessor {
     pub fn new(config: ProcessConfig) -> Self {
         Self {
-            state: ProcessState::new(config),
+            state: Mutex::new(ProcessState::new(config)),
             params: ProcParamIndices::default(),
         }
     }
 
-    pub fn state(&self) -> &ProcessState {
-        &self.state
-    }
-
-    pub fn state_mut(&mut self) -> &mut ProcessState {
-        &mut self.state
+    /// Run `f` against the processor's state under its lock.
+    pub fn with_state<R>(&self, f: impl FnOnce(&mut ProcessState) -> R) -> R {
+        f(&mut self.state.lock())
     }
 }
 
 impl NDPluginProcess for ProcessProcessor {
-    fn process_array(&mut self, array: &NDArray, _pool: &NDArrayPool) -> ProcessResult {
+    fn process_array(&self, array: &NDArray, _pool: &NDArrayPool) -> ProcessResult {
         use ad_core_rs::plugin::runtime::ParamUpdate;
 
-        let out = self.state.process(array);
+        // C holds the port lock only for the parameter reads and the validity
+        // flags, releases at NDPluginProcess.cpp:139, and re-takes it at :254
+        // to post the readbacks. Drive `ProcessState`'s steps here rather than
+        // calling `process`, so the two frame-sized loops -- the element-wise
+        // pass and the output conversion -- run with the lock down.
+        let mut values = elements_as_f64(array);
+        let frame = self.state.lock().begin_frame(values.len());
+        frame.apply_element_ops(&mut values);
+
+        let (emitted, num_filtered) = {
+            let mut state = self.state.lock();
+            let emitted = state.run_filter(&frame, &mut values);
+            (emitted, state.num_filtered)
+        };
+
+        let out = if emitted {
+            let arr = frame.build_output(array, &values);
+            self.state.lock().end_frame(&frame, array, &arr);
+            Some(arr)
+        } else {
+            None
+        };
+
         // A suppressed frame (filter_callbacks) produces no output array but
         // still publishes readback params.
         let mut result = match out {
@@ -712,31 +817,25 @@ impl NDPluginProcess for ProcessProcessor {
             None => ProcessResult::sink(vec![]),
         };
 
-        // Push readback params
+        // Push readback params. The two validity flags are the frame's own —
+        // `begin_frame` computed them and a param write landing since must not
+        // retro-label this frame.
         if let Some(idx) = self.params.valid_background {
             result.param_updates.push(ParamUpdate::int32(
                 idx,
-                if self.state.config.valid_background {
-                    1
-                } else {
-                    0
-                },
+                if frame.config.valid_background { 1 } else { 0 },
             ));
         }
         if let Some(idx) = self.params.valid_flat_field {
             result.param_updates.push(ParamUpdate::int32(
                 idx,
-                if self.state.config.valid_flat_field {
-                    1
-                } else {
-                    0
-                },
+                if frame.config.valid_flat_field { 1 } else { 0 },
             ));
         }
         if let Some(idx) = self.params.num_filtered {
             result
                 .param_updates
-                .push(ParamUpdate::int32(idx, self.state.num_filtered as i32));
+                .push(ParamUpdate::int32(idx, num_filtered as i32));
         }
         // SaveBackground/SaveFlatField are NOT touched here: C clears those PVs in
         // writeInt32 (:288, :300), where the save itself happens. processCallbacks
@@ -846,13 +945,14 @@ impl NDPluginProcess for ProcessProcessor {
     }
 
     fn on_param_change(
-        &mut self,
+        &self,
         reason: usize,
         params: &ad_core_rs::plugin::runtime::PluginParamSnapshot,
     ) -> ad_core_rs::plugin::runtime::ParamChangeResult {
         use ad_core_rs::plugin::runtime::{ParamChangeResult, ParamUpdate};
 
-        let s = &mut self.state;
+        let mut state = self.state.lock();
+        let s = &mut *state;
         let p = &self.params;
         let mut updates = Vec::new();
 
@@ -955,7 +1055,7 @@ impl NDPluginProcess for ProcessProcessor {
         } else if Some(reason) == p.reset_filter {
             if params.value.as_i32() != 0 {
                 // Arm the reset; the next processed frame consumes it, clears
-                // the PV and zeroes NumFiltered (NDPluginProcess.cpp:91-93,
+                // the PV and zeroes NumFiltered (NDPluginProcess.cpp:90-92,
                 // :204-210). C does neither at parameter-write time.
                 s.reset_filter();
             }
@@ -1249,7 +1349,7 @@ mod tests {
 
     #[test]
     fn test_process_processor() {
-        let mut proc = ProcessProcessor::new(ProcessConfig {
+        let proc = ProcessProcessor::new(ProcessConfig {
             enable_offset_scale: true,
             scale: 2.0,
             offset: 1.0,
@@ -1427,7 +1527,7 @@ mod tests {
         });
 
         // No frame yet: C's pArrays[0] is NULL, so the save leaves the background
-        // empty and ValidBackground at 0 (:291-292 clear unconditionally, :293
+        // empty and ValidBackground at 0 (:289-291 clear unconditionally, :292
         // guards the copy).
         state.save_background();
         assert!(state.background.is_none());
@@ -1521,7 +1621,7 @@ mod tests {
         let result = proc.on_param_change(reason, &snapshot);
 
         assert_eq!(
-            proc.state.background.as_ref().unwrap().as_slice(),
+            proc.state.lock().background.as_ref().unwrap().as_slice(),
             &[4.0, 5.0, 6.0],
             "a 0 write saves the background too"
         );
@@ -1642,7 +1742,7 @@ mod tests {
         assert!(state.filter_state.is_some());
         assert_eq!(state.num_filtered, 2);
 
-        // Manual reset: C only clears the ResetFilter PV (NDPluginProcess.cpp:91-93).
+        // Manual reset: C only clears the ResetFilter PV (NDPluginProcess.cpp:90-92).
         // The buffer stays, and NumFiltered is zeroed by the next frame's reset
         // loop (:210), not by the parameter write.
         state.reset_filter();

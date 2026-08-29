@@ -38,7 +38,7 @@ play nicely with TLS, and treating them as public is a deliberate
 design choice).
 
 This document describes the design. The runtime API is in
-[`tls.rs`](../src/tls.rs) and is gated behind the
+[`crate::tls`](../src/tls/mod.rs) and is gated behind the
 `experimental-rust-tls` cargo feature.
 
 ## Configuration
@@ -332,7 +332,7 @@ For an existing C-based facility:
 
 ## Status in this crate
 
-- `tls.rs` module: ✅ complete (helpers, config types, mTLS builders, identity extraction)
+- `crate::tls` module: ✅ complete (helpers, config types, mTLS builders, identity extraction)
 - `CaServerBuilder::with_tls()`: ✅ complete — stored and threaded through `run()`
 - `CaClient::new_with_config(tls=...)`: ✅ complete
 - Client transport stream wrapping: ✅ complete — `connect_server`

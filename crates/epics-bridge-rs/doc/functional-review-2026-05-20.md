@@ -3,17 +3,53 @@
 Scope:
 
 - Rust bridge code: `ca_gateway`, `pva_gateway`, `qsrv`, `calink`, `pvalink`.
-- Reference code: `/Users/stevek/codes/epics-base`, `/Users/stevek/codes/pvxs`, and `/Users/stevek/codes/epics-modules/ca-gateway`.
+- Reference code: `$EPICS_BASE`, `$PVXS_HOME`, and `$EPICS_MODULES/ca-gateway`.
 - Static review only. Runtime tests were not run by request.
 - The 2026-05-19 punchlist marks the earlier BR-R findings as cleared; this file records additional findings found after that baseline.
 
 Resolution (2026-05-21): BRIDGE-FR-1 through BRIDGE-FR-16 are all implemented in the current workspace and covered by tests. This file is retained as the review record; each finding below documents the gap that was closed and its fix direction.
+
+Recording note (2026-08-26): that resolution sentence was the whole of this
+file's closure record, and no per-row scan could act on it — it names no
+commit and it uses a word outside every verdict vocabulary, so all sixteen
+rows still read open. Each row now carries a `Status:` line naming the
+commit that closed it. Six commits cover the sixteen rows; each of them
+spells out its own per-row claim in its message body.
+
+## C reference pins
+
+Every C/C++ citation in this file resolves at the tree and revision below,
+not at whatever the env-var checkout holds today — those checkouts run ahead
+of their pins, so a citation checked against one can be graded wrong while
+being right, or graded right after drifting into a neighbouring construct.
+The resolve-by-symbol rule, the shared-basename rule and the verification of
+each pin are in `c-reference-pins.md`.
+
+| tree | pinned revision | cited here |
+| --- | --- | --- |
+| `pvxs` | `1.5.1-42-gb568e93` | `clientmon.cpp`, `fieldsubscriptionctx.cpp`, `groupconfigprocessor.cpp`, `groupsource.cpp`, `serverchan.cpp`, `serverconn.cpp`, `serverintrospect.cpp`, `servermon.cpp`, `source.h`, and the `ioc/pvalink*.cpp` set |
+| `ca-gateway` | `R2-1-3-0-54-g0666f21` | `gateAs.cc`, `gateAs.h`, `gateServer.cc`, `gateVc.cc` |
+| `epics-base` | `R7.0.10` | `dbCa.c`, `dbStaticLib.c`, `recGbl.c` |
+
+This review cites no pva2pva source, but `server.cpp` and every
+`pvalink*.cpp` exist there too, so the basename alone would resolve in the
+wrong file without failing. Every such citation here already carries its
+pvxs in-tree path (`$PVXS_HOME/src/server.cpp:252`,
+`$PVXS_HOME/ioc/pvalink_jlif.cpp:24`); keep it that way.
+
+Rust `*.rs` citations are in-repo and carry no pin: they resolve at the
+current worktree, not at the commit this review was written on. Where the
+reviewed code has since been fixed, moved or replaced, the line names the
+construct that now carries the behaviour and the sentence says so.
+
 
 ## Findings
 
 ### BRIDGE-FR-1. CA gateway ACF read and monitor access is not enforced
 
 Severity: high security parity gap.
+
+Status: **CLEARED** `4e9079a4` — the downstream CA server path now takes the ACF read/monitor decision, so a deny-read rule blocks caget and camonitor and not only writes.
 
 Rust evidence:
 
@@ -25,10 +61,10 @@ Rust evidence:
 
 C ca-gateway reference:
 
-- `/Users/stevek/codes/epics-modules/ca-gateway/src/gateVc.cc:315` implements `gateVcChan::readAccess()` using both upstream read access and local `asCheckGet`.
-- `/Users/stevek/codes/epics-modules/ca-gateway/src/gateVc.cc:333` implements the analogous write path.
-- `/Users/stevek/codes/epics-modules/ca-gateway/src/gateAs.h:159` exposes `readAccess()` and `writeAccess()`.
-- `/Users/stevek/codes/epics-modules/ca-gateway/src/gateAs.cc:255` creates `gateAsClient` entries from downstream user/host.
+- `$EPICS_MODULES/ca-gateway/src/gateVc.cc:315` implements `gateVcChan::readAccess()` using both upstream read access and local `asCheckGet`.
+- `$EPICS_MODULES/ca-gateway/src/gateVc.cc:333` implements the analogous write path.
+- `$EPICS_MODULES/ca-gateway/src/gateAs.h:159` exposes `readAccess()` and `writeAccess()`.
+- `$EPICS_MODULES/ca-gateway/src/gateAs.cc:255` creates `gateAsClient` entries from downstream user/host.
 
 Impact:
 
@@ -42,6 +78,8 @@ Route downstream CA search/create/read/monitor access-rights decisions through `
 
 Severity: high functional parity gap.
 
+Status: **CLEARED** `4e9079a4` — the gateway serves the `.pvlist` ALIAS name downstream while subscribing the real upstream PV.
+
 Rust evidence:
 
 - `crates/epics-bridge-rs/src/ca_gateway/pvlist.rs:192` expands an `ALIAS` entry into `resolved_name`.
@@ -51,9 +89,9 @@ Rust evidence:
 
 C ca-gateway reference:
 
-- `/Users/stevek/codes/epics-modules/ca-gateway/src/gateServer.cc:1536` resolves a requested `pvname` through the `.pvlist`.
-- `/Users/stevek/codes/epics-modules/ca-gateway/src/gateServer.cc:1747` attaches the requested alias name to the real `gateVcData`.
-- `/Users/stevek/codes/epics-modules/ca-gateway/src/gateAs.cc:127` performs alias-to-real-name expansion.
+- `$EPICS_MODULES/ca-gateway/src/gateServer.cc:1536` resolves a requested `pvname` through the `.pvlist`.
+- `$EPICS_MODULES/ca-gateway/src/gateServer.cc:1747` attaches the requested alias name to the real `gateVcData`.
+- `$EPICS_MODULES/ca-gateway/src/gateAs.cc:127` performs alias-to-real-name expansion.
 
 Impact:
 
@@ -67,6 +105,8 @@ Represent a shadow PV with both a downstream served name and an upstream real na
 
 Severity: high IOC functional parity gap.
 
+Status: **CLEARED** `6b3d60ea` — MS, NMS, MSI and MSS are parsed and applied at the link fold boundary instead of being dropped.
+
 Rust evidence:
 
 - `crates/epics-base-rs/src/server/record/link.rs:396` returns `ParsedLink::Ca(rest.to_string())` for `ca://...` before legacy link modifiers are stripped, so `ca://PV MS` is treated as PV name `PV MS`.
@@ -77,9 +117,9 @@ Rust evidence:
 
 C EPICS reference:
 
-- `/Users/stevek/codes/epics-base/modules/database/src/ioc/dbStatic/dbStaticLib.c:2375` parses `NMS`, `MSI`, `MSS`, and `MS` into the link option.
-- `/Users/stevek/codes/epics-base/modules/database/src/ioc/db/recGbl.c:264` applies those policies: `NMS` ignores remote alarms, `MSI` inherits only invalid alarms, `MS` raises `LINK_ALARM`, and `MSS` preserves remote status/message.
-- `/Users/stevek/codes/epics-base/modules/database/src/ioc/db/dbCa.c:672` exposes the raw remote alarm through the CA link set; record processing applies the modifier.
+- `$EPICS_BASE/modules/database/src/ioc/dbStatic/dbStaticLib.c:2375` parses `NMS`, `MSI`, `MSS`, and `MS` into the link option.
+- `$EPICS_BASE/modules/database/src/ioc/db/recGbl.c:263-281` applies those policies: `NMS` ignores remote alarms, `MSI` inherits only invalid alarms, `MS` raises `LINK_ALARM`, and `MSS` preserves remote status/message.
+- `$EPICS_BASE/modules/database/src/ioc/db/dbCa.c:672` exposes the raw remote alarm through the CA link set; record processing applies the modifier.
 
 Impact:
 
@@ -93,6 +133,8 @@ Keep CA link alarm policy in the parsed link model, not as discarded syntax. App
 
 Severity: medium functional parity gap.
 
+Status: **CLEARED** `6b3d60ea` — the CA link metadata getters (timestamp, alarm, units, precision, limits) are implemented.
+
 Rust evidence:
 
 - `crates/epics-ca-rs/src/calink/resolver.rs:950` implements `LinkSet` for `CaLinkResolver`.
@@ -102,12 +144,12 @@ Rust evidence:
 
 C EPICS reference:
 
-- `/Users/stevek/codes/epics-base/modules/database/src/ioc/db/dbCa.c:726` implements CA link control limits.
-- `/Users/stevek/codes/epics-base/modules/database/src/ioc/db/dbCa.c:742` implements graphic/display limits.
-- `/Users/stevek/codes/epics-base/modules/database/src/ioc/db/dbCa.c:758` implements alarm limits.
-- `/Users/stevek/codes/epics-base/modules/database/src/ioc/db/dbCa.c:776` implements precision.
-- `/Users/stevek/codes/epics-base/modules/database/src/ioc/db/dbCa.c:788` implements units.
-- `/Users/stevek/codes/epics-base/modules/database/src/ioc/db/dbCa.c:819` registers those getters in `dbCa_lset`.
+- `$EPICS_BASE/modules/database/src/ioc/db/dbCa.c:726` implements CA link control limits.
+- `$EPICS_BASE/modules/database/src/ioc/db/dbCa.c:742` implements graphic/display limits.
+- `$EPICS_BASE/modules/database/src/ioc/db/dbCa.c:758` implements alarm limits.
+- `$EPICS_BASE/modules/database/src/ioc/db/dbCa.c:776` implements precision.
+- `$EPICS_BASE/modules/database/src/ioc/db/dbCa.c:788` implements units.
+- `$EPICS_BASE/modules/database/src/ioc/db/dbCa.c:819` registers those getters in `dbCa_lset`.
 
 Impact:
 
@@ -120,6 +162,8 @@ Extend `CaLink`'s cached snapshot/attribute state with CA metadata and implement
 ### BRIDGE-FR-5. PVA gateway credential-aware PUT/RPC/PROCESS still performs shared-cache preflight
 
 Severity: high security/audit parity gap.
+
+Status: **CLEARED** `ea5a3fa6` — credential-aware PUT, RPC and PROCESS no longer run the shared-cache preflight that ignored downstream credentials.
 
 Rust evidence:
 
@@ -134,9 +178,9 @@ Rust evidence:
 PVA/pvxs reference:
 
 - `crates/epics-pva-rs/src/server_native/source.rs:23` carries downstream `ChannelContext` credentials through the server source API.
-- `/Users/stevek/codes/pvxs/src/serverconn.cpp:217` parses authenticated connection credentials.
-- `/Users/stevek/codes/pvxs/src/servermon.cpp:469` obtains monitor credentials from the operation setup.
-- `/Users/stevek/codes/pvxs/src/server.cpp:252` stores connection credentials on the server connection.
+- `$PVXS_HOME/src/serverconn.cpp:217` parses authenticated connection credentials.
+- `$PVXS_HOME/src/servermon.cpp:469` obtains monitor credentials from the operation setup.
+- `$PVXS_HOME/src/server.cpp:252` stores connection credentials on the server connection.
 
 Impact:
 
@@ -150,6 +194,8 @@ Remove the shared-cache preflight from credential-aware PUT/RPC/PROCESS, or rout
 
 Severity: high functional parity gap.
 
+Status: **CLEARED** `608c6c87` — a group monitor subscribes the configured member field rather than the backing record.
+
 Rust evidence:
 
 - `crates/epics-bridge-rs/src/qsrv/group.rs:1363` parses `member.channel` but discards the field suffix with `let (record_name, _) = parse_pv_name(&member.channel)`.
@@ -159,9 +205,9 @@ Rust evidence:
 
 pvxs reference:
 
-- `/Users/stevek/codes/pvxs/ioc/fieldsubscriptionctx.cpp:25` subscribes a `FieldSubscriptionCtx` against `field->value` for value events and `field->properties` for property events.
-- `/Users/stevek/codes/pvxs/ioc/groupsource.cpp:386` and `:389` call `subscribeField(...)` for each configured field.
-- `/Users/stevek/codes/pvxs/ioc/groupsource.cpp:287` treats the triggering `pChannel` as the actual subscribed dbChannel.
+- `$PVXS_HOME/ioc/fieldsubscriptionctx.cpp:25` subscribes a `FieldSubscriptionCtx` against `field->value` for value events and `field->properties` for property events.
+- `$PVXS_HOME/ioc/groupsource.cpp:431` and `:434` call `subscribeField(...)` for each configured field.
+- `$PVXS_HOME/ioc/groupsource.cpp:331` treats the triggering `pChannel` as the actual subscribed dbChannel.
 
 Impact:
 
@@ -175,6 +221,8 @@ Subscribe using the full `member.channel` for value events. Property subscriptio
 
 Severity: medium functional parity gap.
 
+Status: **CLEARED** `608c6c87` — a `meta` member uses the meta event mask rather than the scalar value-event mask.
+
 Rust evidence:
 
 - `crates/epics-bridge-rs/src/qsrv/group.rs:1366` builds one `VALUE | ALARM | LOG` value mask for every group member with a backing channel.
@@ -183,10 +231,10 @@ Rust evidence:
 
 pvxs reference:
 
-- `/Users/stevek/codes/pvxs/ioc/groupsource.cpp:383` documents two subscriptions for each group channel.
-- `/Users/stevek/codes/pvxs/ioc/groupsource.cpp:386` subscribes `MappingInfo::Meta` value-side events with `DBE_ALARM` only.
-- `/Users/stevek/codes/pvxs/ioc/groupsource.cpp:389` uses `DBE_VALUE | DBE_ALARM | DBE_ARCHIVE` for non-meta value mappings.
-- `/Users/stevek/codes/pvxs/ioc/groupsource.cpp:395` separately subscribes meta/scalar property events with `DBE_PROPERTY`.
+- `$PVXS_HOME/ioc/groupsource.cpp:427` documents two subscriptions for each group channel.
+- `$PVXS_HOME/ioc/groupsource.cpp:429-431` subscribes `MappingInfo::Meta` value-side events with `DBE_ALARM` only.
+- `$PVXS_HOME/ioc/groupsource.cpp:432-434` uses `DBE_VALUE | DBE_ALARM | DBE_ARCHIVE` for non-meta value mappings.
+- `$PVXS_HOME/ioc/groupsource.cpp:437-440` separately subscribes meta/scalar property events with `DBE_PROPERTY`.
 
 Impact:
 
@@ -200,6 +248,8 @@ Choose the value subscription mask per member mapping: `Meta -> ALARM`, non-meta
 
 Severity: high security/audit parity gap.
 
+Status: **CLEARED** `ea5a3fa6`, over the server-native half in `5d9327b0` — CREATE_CHANNEL and GET_FIELD open the upstream cache keyed by downstream credentials; regression `fr8_wrapper_stack_threads_checked_existence_and_introspection`.
+
 Rust evidence:
 
 - `crates/epics-pva-rs/src/server_native/tcp.rs:2361` resolves `CREATE_CHANNEL` by calling `src.get_introspection(&nm).await`.
@@ -210,9 +260,9 @@ Rust evidence:
 
 pvxs/PVA reference:
 
-- `/Users/stevek/codes/pvxs/src/serverchan.cpp:62` constructs `ServerChannelControl` with `conn->cred`.
-- `/Users/stevek/codes/pvxs/src/pvxs/source.h:167` stores credentials on `ChannelControl` through `OpBase`.
-- `/Users/stevek/codes/pvxs/src/serverintrospect.cpp:66` constructs the GET_FIELD `ConnectOp` with `conn->cred`.
+- `$PVXS_HOME/src/serverchan.cpp:62` constructs `ServerChannelControl` with `conn->cred`.
+- `$PVXS_HOME/src/pvxs/source.h:167` stores credentials on `ChannelControl` through `OpBase`.
+- `$PVXS_HOME/src/serverintrospect.cpp:66` constructs the GET_FIELD `ConnectOp` with `conn->cred`.
 
 Impact:
 
@@ -226,6 +276,8 @@ Add credential-aware source methods for channel existence and introspection, or 
 
 Severity: high IOC functional parity gap.
 
+Status: **CLEARED** `8bec248a` — legacy suffix options are parsed as link options instead of being folded into the PV name.
+
 Rust evidence:
 
 - `crates/epics-base-rs/src/server/record/link.rs:398` returns `ParsedLink::Pva(rest.to_string())` for `pva://...` before the generic legacy modifier stripping runs.
@@ -235,10 +287,10 @@ Rust evidence:
 
 pvxs reference:
 
-- `/Users/stevek/codes/pvxs/ioc/pvalink_jlif.cpp:24` documents pvalink option fields.
-- `/Users/stevek/codes/pvxs/ioc/pvalink_jlif.cpp:158` through `:166` parse `proc` modes.
-- `/Users/stevek/codes/pvxs/ioc/pvalink_jlif.cpp:172` through `:183` parse `sevr` modes.
-- `/Users/stevek/codes/pvxs/ioc/pvalink.cpp:285` through `:294` reports the parsed proc/severity modes from the stored pvalink.
+- `$PVXS_HOME/ioc/pvalink_jlif.cpp:24` documents pvalink option fields.
+- `$PVXS_HOME/ioc/pvalink_jlif.cpp:158` through `:166` parse `proc` modes.
+- `$PVXS_HOME/ioc/pvalink_jlif.cpp:172` through `:183` parse `sevr` modes.
+- `$PVXS_HOME/ioc/pvalink.cpp:285` through `:294` reports the parsed proc/severity modes from the stored pvalink.
 
 Impact:
 
@@ -252,6 +304,8 @@ Run pvalink suffix parsing before storing `ParsedLink::Pva`, or make the pvalink
 
 Severity: high access-control parity gap.
 
+Status: **CLEARED** `4e9079a4` — `match_name_for_host` evaluates DENY FROM against the downstream peer at search time; regressions `fr10_host_deny_preempts_allow_in_deny_allow_order` and three siblings.
+
 Rust evidence:
 
 - `crates/epics-bridge-rs/src/ca_gateway/pvlist.rs:146` implements `PvList::is_host_denied(name, host)`, but this is only consulted by the write hook.
@@ -263,10 +317,10 @@ Rust evidence:
 
 C ca-gateway reference:
 
-- `/Users/stevek/codes/epics-modules/ca-gateway/src/gateServer.cc:1526` converts the downstream client's socket address to a host string when `DENY FROM` rules are present.
-- `/Users/stevek/codes/epics-modules/ca-gateway/src/gateServer.cc:1537` calls `getAs()->findEntry(pvname, hostname)` during `pvExistTest`.
-- `/Users/stevek/codes/epics-modules/ca-gateway/src/gateAs.h:257` through `:267` checks `deny_from_table` only when the passed host matches, then applies the normal allow/deny decision.
-- `/Users/stevek/codes/epics-modules/ca-gateway/src/gateAs.cc:455` through `:520` resolves `DENY FROM` host names into IP-address entries before installing the rule table.
+- `$EPICS_MODULES/ca-gateway/src/gateServer.cc:1526` converts the downstream client's socket address to a host string when `DENY FROM` rules are present.
+- `$EPICS_MODULES/ca-gateway/src/gateServer.cc:1537` calls `getAs()->findEntry(pvname, hostname)` during `pvExistTest`.
+- `$EPICS_MODULES/ca-gateway/src/gateAs.h:257` through `:267` checks `deny_from_table` only when the passed host matches, then applies the normal allow/deny decision.
+- `$EPICS_MODULES/ca-gateway/src/gateAs.cc:455` through `:520` resolves `DENY FROM` host names into IP-address entries before installing the rule table.
 
 Impact:
 
@@ -280,6 +334,8 @@ Split name admission into a host-aware path, for example `match_name_for_host(na
 
 Severity: medium functional/resource-control parity gap.
 
+Status: **CLEARED** `ea5a3fa6`, over the hook added in `5d9327b0` — one `PauseControl` owner drives the upstream pause, reconnect reinstalls the standing vote, and the high and low watermark actions are the right way round; regressions `fr11_cross_watermark_is_once_per_crossing_parity_and_monotonic` and two siblings.
+
 Rust evidence:
 
 - `crates/epics-bridge-rs/src/pva_gateway/channel_cache.rs:219` exposes an upstream monitor `Pauser` for the current upstream subscription.
@@ -292,10 +348,10 @@ Rust evidence:
 
 pvxs/PVA reference:
 
-- `/Users/stevek/codes/pvxs/src/pvxs/source.h:120` through `:128` defines watermarks on the outbound pipeline window, and `onHighMark` fires when a client ACK refills the window above the high mark.
-- `/Users/stevek/codes/pvxs/src/servermon.cpp:192` through `:206` fires `onLowMark` after emitting DATA drains the window to or below low.
-- `/Users/stevek/codes/pvxs/src/servermon.cpp:653` through `:666` fires `onHighMark` when ACKs add enough credit.
-- `/Users/stevek/codes/pvxs/src/clientmon.cpp:329` through `:342` sends the client monitor INIT with the pipeline bit and queue-size trailer.
+- `$PVXS_HOME/src/pvxs/source.h:120` through `:128` defines watermarks on the outbound pipeline window, and `onHighMark` fires when a client ACK refills the window above the high mark.
+- `$PVXS_HOME/src/servermon.cpp:192` through `:206` fires `onLowMark` after emitting DATA drains the window to or below low.
+- `$PVXS_HOME/src/servermon.cpp:653` through `:666` fires `onHighMark` when ACKs add enough credit.
+- `$PVXS_HOME/src/clientmon.cpp:329` through `:342` sends the client monitor INIT with the pipeline bit and queue-size trailer.
 
 Impact:
 
@@ -309,6 +365,8 @@ Expose gateway-specific `monitor_watermarks(...)` levels and align callback sema
 
 Severity: high functional parity gap.
 
+Status: **CLEARED** `608c6c87`, over the encode half in `5d9327b0` — an explicit trigger target set survives parsing and reaches the wire as a selection bitset.
+
 Rust evidence:
 
 - `crates/epics-bridge-rs/src/qsrv/group_config.rs:118` through `:132` models four trigger states, including `TriggerDef::Fields(Vec<String>)`.
@@ -319,10 +377,10 @@ Rust evidence:
 
 pvxs reference:
 
-- `/Users/stevek/codes/pvxs/ioc/groupconfigprocessor.cpp:297` through `:309` parses each field's `+trigger` list.
-- `/Users/stevek/codes/pvxs/ioc/groupconfigprocessor.cpp:323` through `:337` defaults groups with no trigger mappings to self-trigger.
-- `/Users/stevek/codes/pvxs/ioc/groupconfigprocessor.cpp:381` through `:409` resolves `*` or named trigger targets into each field's `triggerNames`.
-- `/Users/stevek/codes/pvxs/ioc/groupsource.cpp:283` through `:300` iterates only `field.triggers` on a subscription event and refreshes those target fields before posting the group.
+- `$PVXS_HOME/ioc/groupconfigprocessor.cpp:297` through `:309` parses each field's `+trigger` list.
+- `$PVXS_HOME/ioc/groupconfigprocessor.cpp:327` through `:338` defaults groups with no trigger mappings to self-trigger.
+- `$PVXS_HOME/ioc/groupconfigprocessor.cpp:381` through `:409` resolves `*` or named trigger targets into each field's `triggerNames`.
+- `$PVXS_HOME/ioc/groupsource.cpp:328` through `:346` iterates only `field.triggers` on a subscription event and refreshes those target fields before posting the group.
 
 Impact:
 
@@ -336,6 +394,8 @@ Resolve `TriggerDef::Fields` and `TriggerDef::All` into explicit target member i
 
 Severity: high IOC functional parity gap.
 
+Status: **CLEARED** `8bec248a` — a disconnected monitor read fails with LINK/INVALID through an `is_connected` gate instead of serving the stale cache; regressions `fr13_disconnected_monitor_read_fails_and_reports_invalid` and three siblings.
+
 Rust evidence:
 
 - `crates/epics-bridge-rs/src/pvalink/link.rs:175` through `:178` stores each monitor event in `latest`.
@@ -348,8 +408,8 @@ Rust evidence:
 
 pvxs reference:
 
-- `/Users/stevek/codes/pvxs/ioc/pvalink_lset.cpp:259` through `:272` checks `!self->valid()` in `pvaGetValue(...)`, sets `LINK_ALARM/INVALID_ALARM`, and returns failure while disconnected.
-- `/Users/stevek/codes/pvxs/ioc/pvalink_channel.cpp:370` through `:376` deliberately keeps the previous value on disconnect, but only with the disconnect alarm state.
+- `$PVXS_HOME/ioc/pvalink_lset.cpp:259` through `:272` checks `!self->valid()` in `pvaGetValue(...)`, sets `LINK_ALARM/INVALID_ALARM`, and returns failure while disconnected.
+- `$PVXS_HOME/ioc/pvalink_channel.cpp:370` through `:376` deliberately keeps the previous value on disconnect, but only with the disconnect alarm state.
 
 Impact:
 
@@ -363,6 +423,8 @@ Separate "cached value exists" from "link read is valid". Monitor reads should p
 
 Severity: medium resource-control and operator-control parity gap.
 
+Status: **CLEARED** `ea5a3fa6` — control `flush` and `drop` reach the credential-scoped upstream caches, not just the default-credential one.
+
 Rust evidence:
 
 - `crates/epics-bridge-rs/src/pva_gateway/control.rs:31` documents `<prefix>:flush` as "Drop every cached upstream entry".
@@ -375,7 +437,7 @@ Rust evidence:
 Reference behavior:
 
 - `crates/epics-bridge-rs/src/pva_gateway/control.rs:21` through `:40` states the control PVs mutate gateway state, not just one anonymous/shared identity cache.
-- `/Users/stevek/codes/pvxs/src/server.cpp:252` and `/Users/stevek/codes/pvxs/src/serverchan.cpp:62` keep credentials attached to operations, but gateway operator controls are expected to act on gateway-owned upstream state as a whole.
+- `$PVXS_HOME/src/server.cpp:252` and `$PVXS_HOME/src/serverchan.cpp:62` keep credentials attached to operations, but gateway operator controls are expected to act on gateway-owned upstream state as a whole.
 
 Impact:
 
@@ -389,6 +451,8 @@ Make `GatewayChannelSource` own cache administration for all cache layers. Add a
 
 Severity: medium startup/diagnostic parity gap.
 
+Status: **CLEARED** `8bec248a` — the `LinkSet` enumeration surfaces the opened INP upstream PV names, so iocInit waits for pvalinks; regression `fr15_link_names_reports_opened_inp_pvs_queryable_by_is_connected`.
+
 Rust evidence:
 
 - `crates/epics-base-rs/src/server/database/mod.rs:452` through `:468` defines `wait_for_external_links(...)` as a wait over every registered link set's `link_names()`.
@@ -400,7 +464,7 @@ Rust evidence:
 Reference behavior:
 
 - `crates/epics-base-rs/src/server/database/mod.rs:452` through `:454` explicitly mirrors the EPICS `dbCa` iocInit wait for local CA links to connect.
-- `/Users/stevek/codes/pvxs/ioc/pvalink_lset.cpp:259` through `:272` treats a disconnected pvalink as a link-level failure, which makes startup visibility of disconnected PVA links meaningful for IOC operators.
+- `$PVXS_HOME/ioc/pvalink_lset.cpp:259` through `:272` treats a disconnected pvalink as a link-level failure, which makes startup visibility of disconnected PVA links meaningful for IOC operators.
 
 Impact:
 
@@ -414,6 +478,8 @@ Expose registry iteration from `PvaLinkRegistry` and return the opened PVA link 
 
 Severity: high IOC functional parity gap.
 
+Status: **CLEARED** `8bec248a` — `ProcMode` keeps Default, PP, NPP, CP and CPP distinct through parsing, scan-flag derivation and the PUT request; regressions `fr16_proc_enum_preserved_and_put_request_derived` and three siblings.
+
 Rust evidence:
 
 - `crates/epics-bridge-rs/src/pvalink/config.rs:78` through `:79` stores OUT-side process behavior as a single `bool`.
@@ -424,11 +490,11 @@ Rust evidence:
 
 pvxs reference:
 
-- `/Users/stevek/codes/pvxs/ioc/pvalink_jlif.cpp:69` through `:77` maps null `proc` to `Default`.
-- `/Users/stevek/codes/pvxs/ioc/pvalink_jlif.cpp:90` through `:99` maps boolean `proc` to `PP` or `NPP`.
-- `/Users/stevek/codes/pvxs/ioc/pvalink_jlif.cpp:156` through `:166` maps string `proc` only for `CP`, `CPP`, `PP`, and `NPP`.
-- `/Users/stevek/codes/pvxs/ioc/pvalink_channel.cpp:237` through `:263` preserves the enum at PUT time: `Default -> "passive"`, `NPP -> "false"`, and `PP` / `CP` / `CPP -> "true"`.
-- `/Users/stevek/codes/pvxs/ioc/pvalink_link.cpp:122` through `:132` separately derives INP scan-on-update behavior from `CP` / `CPP`, so scan behavior and PUT process behavior are related but not the same field.
+- `$PVXS_HOME/ioc/pvalink_jlif.cpp:69` through `:77` maps null `proc` to `Default`.
+- `$PVXS_HOME/ioc/pvalink_jlif.cpp:90` through `:99` maps boolean `proc` to `PP` or `NPP`.
+- `$PVXS_HOME/ioc/pvalink_jlif.cpp:156` through `:166` maps string `proc` only for `CP`, `CPP`, `PP`, and `NPP`.
+- `$PVXS_HOME/ioc/pvalink_channel.cpp:237` through `:263` preserves the enum at PUT time: `Default -> "passive"`, `NPP -> "false"`, and `PP` / `CP` / `CPP -> "true"`.
+- `$PVXS_HOME/ioc/pvalink_link.cpp:122` through `:132` separately derives INP scan-on-update behavior from `CP` / `CPP`, so scan behavior and PUT process behavior are related but not the same field.
 
 Impact:
 

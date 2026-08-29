@@ -1,7 +1,9 @@
 use std::sync::Arc;
 
-#[cfg(feature = "parallel")]
+// Not gated on `parallel`: `should_parallelize` is the whole decision now
+// and this file asks it on both arms.
 use crate::par_util;
+use parking_lot::Mutex;
 #[cfg(feature = "parallel")]
 use rayon::prelude::*;
 
@@ -117,10 +119,7 @@ pub fn bayer_to_rgb1(src: &NDArray, pattern: NDBayerPattern) -> Option<NDArray> 
         }
     };
 
-    #[cfg(feature = "parallel")]
     let use_parallel = par_util::should_parallelize(n);
-    #[cfg(not(feature = "parallel"))]
-    let use_parallel = false;
 
     if use_parallel {
         #[cfg(feature = "parallel")]
@@ -805,7 +804,7 @@ pub struct ColorConvertConfig {
 
 /// Pure color conversion processing logic.
 pub struct ColorConvertProcessor {
-    config: ColorConvertConfig,
+    config: Mutex<ColorConvertConfig>,
     color_mode_out_idx: Option<usize>,
     false_color_idx: Option<usize>,
 }
@@ -813,7 +812,7 @@ pub struct ColorConvertProcessor {
 impl ColorConvertProcessor {
     pub fn new(config: ColorConvertConfig) -> Self {
         Self {
-            config,
+            config: Mutex::new(config),
             color_mode_out_idx: None,
             false_color_idx: None,
         }
@@ -834,25 +833,28 @@ impl NDPluginProcess for ColorConvertProcessor {
     }
 
     fn on_param_change(
-        &mut self,
+        &self,
         reason: usize,
         params: &ad_core_rs::plugin::runtime::PluginParamSnapshot,
     ) -> ad_core_rs::plugin::runtime::ParamChangeResult {
         if Some(reason) == self.color_mode_out_idx {
-            self.config.target_mode = NDColorMode::from_i32(params.value.as_i32());
+            self.config.lock().target_mode = NDColorMode::from_i32(params.value.as_i32());
         } else if Some(reason) == self.false_color_idx {
-            self.config.false_color = params.value.as_i32();
+            self.config.lock().false_color = params.value.as_i32();
         }
         ad_core_rs::plugin::runtime::ParamChangeResult::updates(vec![])
     }
 
-    fn process_array(&mut self, array: &NDArray, _pool: &NDArrayPool) -> ProcessResult {
+    fn process_array(&self, array: &NDArray, _pool: &NDArrayPool) -> ProcessResult {
         // C `convertColor` (NDPluginColorConvert.cpp:44,54-55) starts from
         // `int colorMode = NDColorModeMono` and overwrites it only from the
         // `ColorMode` attribute; it never infers a layout from the dimensions.
         // `NDArray::info()` owns that rule for the whole workspace.
         let src_mode = array.info().color_mode;
-        let target = self.config.target_mode;
+        let (target, false_color, bayer_pattern) = {
+            let config = self.config.lock();
+            (config.target_mode, config.false_color, config.bayer_pattern)
+        };
 
         // C:584 — `if (!pArrayOut) pArrayOut = this->pNDArrayPool->copy(pArray, NULL, 1);`
         // Every arm that does not convert (same mode, unsupported pair, or a shape the
@@ -869,14 +871,14 @@ impl NDPluginProcess for ColorConvertProcessor {
         let rgb1 = match src_mode {
             NDColorMode::RGB1 => Some(array.clone()),
             NDColorMode::Mono => {
-                if self.config.false_color != 0 {
-                    false_color_mono_to_rgb1(array, self.config.false_color)
+                if false_color != 0 {
+                    false_color_mono_to_rgb1(array, false_color)
                         .or_else(|| color::mono_to_rgb1(array).ok())
                 } else {
                     color::mono_to_rgb1(array).ok()
                 }
             }
-            NDColorMode::Bayer => bayer_to_rgb1(array, self.config.bayer_pattern),
+            NDColorMode::Bayer => bayer_to_rgb1(array, bayer_pattern),
             NDColorMode::RGB2 | NDColorMode::RGB3 => {
                 color::convert_rgb_layout(array, src_mode, NDColorMode::RGB1).ok()
             }
@@ -1027,7 +1029,7 @@ mod tests {
             bayer_pattern: NDBayerPattern::RGGB,
             false_color: 0,
         };
-        let mut proc = ColorConvertProcessor::new(config);
+        let proc = ColorConvertProcessor::new(config);
         let pool = NDArrayPool::new(1_000_000);
 
         let mut arr = NDArray::new(
@@ -1052,7 +1054,7 @@ mod tests {
             bayer_pattern: NDBayerPattern::RGGB,
             false_color: 1,
         };
-        let mut proc = ColorConvertProcessor::new(config);
+        let proc = ColorConvertProcessor::new(config);
         let pool = NDArrayPool::new(1_000_000);
 
         // Create a 4x4 mono UInt8 image with a gradient
@@ -1094,7 +1096,7 @@ mod tests {
             bayer_pattern: NDBayerPattern::RGGB,
             false_color: 2,
         };
-        let mut proc = ColorConvertProcessor::new(config);
+        let proc = ColorConvertProcessor::new(config);
         let pool = NDArrayPool::new(1_000_000);
 
         // 2x1 mono image with values 0 and 192 to probe distinct Iron entries.
@@ -1133,7 +1135,7 @@ mod tests {
             bayer_pattern: NDBayerPattern::RGGB,
             false_color: 2,
         };
-        let mut proc = ColorConvertProcessor::new(config);
+        let proc = ColorConvertProcessor::new(config);
         let pool = NDArrayPool::new(1_000_000);
 
         let mut arr = NDArray::new(
@@ -1174,7 +1176,7 @@ mod tests {
             bayer_pattern: NDBayerPattern::RGGB,
             false_color: 1,
         };
-        let mut proc = ColorConvertProcessor::new(config);
+        let proc = ColorConvertProcessor::new(config);
         let pool = NDArrayPool::new(1_000_000);
 
         let mut arr = NDArray::new(
@@ -1201,7 +1203,7 @@ mod tests {
             bayer_pattern: NDBayerPattern::RGGB,
             false_color: 0,
         };
-        let mut proc = ColorConvertProcessor::new(config);
+        let proc = ColorConvertProcessor::new(config);
         let pool = NDArrayPool::new(1_000_000);
 
         // Create RGB1 image: dims [3, 4, 4]
@@ -1237,7 +1239,7 @@ mod tests {
             bayer_pattern: NDBayerPattern::RGGB,
             false_color: 0,
         };
-        let mut proc = ColorConvertProcessor::new(config);
+        let proc = ColorConvertProcessor::new(config);
         let pool = NDArrayPool::new(1_000_000);
 
         // Create RGB2 image: dims [4, 3, 4]
@@ -1306,7 +1308,7 @@ mod tests {
             bayer_pattern: NDBayerPattern::RGGB,
             false_color: 0,
         };
-        let mut proc = ColorConvertProcessor::new(config);
+        let proc = ColorConvertProcessor::new(config);
         let pool = NDArrayPool::new(1_000_000);
 
         // 2D mono input with Mono target -> passthrough
@@ -1344,7 +1346,7 @@ mod tests {
             bayer_pattern: NDBayerPattern::RGGB,
             false_color: 0,
         };
-        let mut proc = ColorConvertProcessor::new(config);
+        let proc = ColorConvertProcessor::new(config);
         let pool = NDArrayPool::new(1_000_000);
 
         let mut arr = NDArray::new(
@@ -1370,7 +1372,7 @@ mod tests {
             bayer_pattern: NDBayerPattern::RGGB,
             false_color: 0,
         };
-        let mut proc = ColorConvertProcessor::new(config);
+        let proc = ColorConvertProcessor::new(config);
         let pool = NDArrayPool::new(1_000_000);
 
         let mut arr = NDArray::new(
@@ -1401,7 +1403,7 @@ mod tests {
             bayer_pattern: NDBayerPattern::RGGB,
             false_color: 0,
         };
-        let mut proc = ColorConvertProcessor::new(config);
+        let proc = ColorConvertProcessor::new(config);
         let pool = NDArrayPool::new(1_000_000);
 
         // packed_x=8 means 4 pixels wide, 2 rows
@@ -1433,7 +1435,7 @@ mod tests {
             bayer_pattern: NDBayerPattern::RGGB,
             false_color: 0,
         };
-        let mut proc = ColorConvertProcessor::new(config);
+        let proc = ColorConvertProcessor::new(config);
         let pool = NDArrayPool::new(1_000_000);
 
         let mut arr = NDArray::new(
@@ -1460,7 +1462,7 @@ mod tests {
             bayer_pattern: NDBayerPattern::RGGB,
             false_color: 0,
         };
-        let mut proc = ColorConvertProcessor::new(config);
+        let proc = ColorConvertProcessor::new(config);
         let pool = NDArrayPool::new(1_000_000);
 
         let mut arr = NDArray::new(

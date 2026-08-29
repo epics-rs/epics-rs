@@ -15,7 +15,8 @@
 //! type-cache assignment, etc.), and any of those differences
 //! must round-trip through the Rust decoder.
 //!
-//! SKIPped if either `c++` or the pvxs headers are absent.
+//! FAILS if the C++ helper cannot be built: this suite is opt-in
+//! (`--profile interop`), so getting here means the trees resolved.
 
 // RTEMS-EXEC-MODEL-ALLOW(1): not run by the default nextest profile - this file is a module of the `interop_pvxs` binary, which `.config/nextest.toml`'s default-filter excludes.
 
@@ -57,23 +58,25 @@ fn extract_value(decoded: &PvField, path: &str) -> Option<PvField> {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn interop_reverse_complex_types_rust_client_decodes_pvxs() {
-    let Some(helper) = super::interop_helpers::cpp_helper("reverse_server") else {
+    // The only absent-prerequisite skip on this path; everything past it
+    // is our own helper, so it panics rather than skipping.
+    if super::interop_helpers::require_cxx().is_none() {
         return;
-    };
+    }
+    let helper = super::interop_helpers::cpp_helper("reverse_server");
 
     // Bind a port for the pvxs server.
     let port = {
         let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         l.local_addr().unwrap().port()
     };
-    let ready = std::env::temp_dir().join(format!("reverse_ready.{port}"));
-    let _ = std::fs::remove_file(&ready);
+    let ready = super::interop_helpers::ReadyFile::new("reverse_ready");
 
     let mut cmd = Command::new(&helper);
     cmd.arg("--port")
         .arg(port.to_string())
         .arg("--ready")
-        .arg(&ready)
+        .arg(ready.path())
         .env(
             if cfg!(target_os = "macos") {
                 "DYLD_LIBRARY_PATH"
@@ -86,16 +89,13 @@ async fn interop_reverse_complex_types_rust_client_decodes_pvxs() {
         .stderr(Stdio::piped());
     let mut child = match cmd.spawn() {
         Ok(c) => c,
-        Err(e) => {
-            eprintln!("SKIP: failed to spawn reverse_server: {e}");
-            return;
-        }
+        Err(e) => panic!("failed to spawn reverse_server: {e}"),
     };
 
     // Wait for the readiness file (≤ 5s).
     let mut up = false;
     for _ in 0..50 {
-        if ready.exists() {
+        if ready.is_up() {
             up = true;
             break;
         }
@@ -104,10 +104,8 @@ async fn interop_reverse_complex_types_rust_client_decodes_pvxs() {
     if !up {
         let _ = child.kill();
         let _ = child.wait();
-        eprintln!("SKIP: reverse_server did not become ready");
-        return;
+        panic!("reverse_server did not become ready");
     }
-    let _ = std::fs::remove_file(&ready);
 
     // Drive a Rust client at the pvxs server via TCP-search-only
     // path so we don't depend on EPICS_PVA_BROADCAST_PORT (which

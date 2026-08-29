@@ -28,14 +28,15 @@ use std::process::Command;
 fn run(bin: &str, args: &[&str]) -> (i32, String, String) {
     let mut cmd = Command::new(bin);
     cmd.args(args);
-    // On `exec_backend` (this crate built with `--features rtems-exec-model`,
-    // or for the RTEMS target) the client has no UDP SEARCH transport, so
-    // `CaClient::new` refuses an empty `EPICS_CA_NAME_SERVERS` rather than
-    // spawning an engine that could reach nothing — see
-    // `search::SearchTransport::name_servers_only`. These tests are about
-    // getopt argument consumption, not about reaching a server, so give the
-    // tool a syntactically valid name server it will never connect to. Port
-    // 1 is reserved (`tcpmux`) and nothing in this workspace binds it.
+    // On `exec_backend` (this crate built with
+    // `EPICS_RS_BUILD_EXEC_BACKEND=thread`, or for the RTEMS target) the
+    // client has no UDP SEARCH transport, so `CaClient::new` refuses an empty
+    // `EPICS_CA_NAME_SERVERS` rather than spawning an engine that could reach
+    // nothing — see `search::SearchTransport::name_servers_only`. These tests
+    // are about getopt argument consumption, not about reaching a server, so
+    // give the tool a syntactically valid name server it will never connect
+    // to. Port 1 is reserved (`tcpmux`) and nothing in this workspace binds
+    // it.
     #[cfg(exec_backend)]
     cmd.env("EPICS_CA_NAME_SERVERS", "127.0.0.1:1");
     let out = cmd.output().expect("spawn the CA tool");
@@ -116,7 +117,7 @@ fn cainfo_keeps_a_hyphen_value_with_its_option() {
 /// the load-bearing case, and the one where losing the argument changes the mode
 /// the tool runs in rather than just a warning: `sscanf("-1", "%u")` succeeds
 /// (it wraps to 4294967295), and a non-zero interest level skips the missing-PV
-/// check to print the client status dump instead (`cainfo.c:77-79`, `:202-205`).
+/// check to print the client status dump instead (`cainfo.c:77-78`, `:202-205`).
 ///
 /// When clap owned the `-1` it never reached `case 's'` at all — the tool
 /// reported `Unrecognized option: '-1'.` and exited 1, C's `case '?'` arm, which

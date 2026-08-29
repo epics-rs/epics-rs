@@ -6,74 +6,7 @@ use tokio::net::UdpSocket;
 
 use crate::protocol::*;
 
-/// Per-client connected UDP socket, matching C EPICS repeaterClient.
-/// Using a connected socket lets the OS detect dead clients via
-/// ECONNREFUSED on send().
-struct RepeaterClient {
-    sock: StdUdpSocket,
-    addr: SocketAddr,
-}
-
-impl RepeaterClient {
-    fn new(addr: SocketAddr) -> io::Result<Self> {
-        let sock = StdUdpSocket::bind("0.0.0.0:0")?;
-        sock.connect(addr)?;
-        sock.set_nonblocking(true)?;
-        Ok(Self { sock, addr })
-    }
-
-    fn send_confirm(&self) -> bool {
-        let mut confirm = CaHeader::new(CA_PROTO_REPEATER_CONFIRM);
-        if let SocketAddr::V4(v4) = self.addr {
-            confirm.available = u32::from_be_bytes(v4.ip().octets());
-        }
-        self.sock.send(&confirm.to_bytes()).is_ok()
-    }
-
-    fn send_message(&self, data: &[u8]) -> bool {
-        // distinguish error kinds. The previous version
-        // returned `false` for everything (including transient
-        // WouldBlock on a saturated kernel UDP buffer), causing the
-        // outer loop to drop the client. Now: keep alive on
-        // transient/unknown errors; only treat ECONNREFUSED /
-        // EHOSTUNREACH as "client gone".
-        match self.sock.send(data) {
-            Ok(_) => true,
-            Err(e) => !matches!(
-                e.kind(),
-                io::ErrorKind::ConnectionRefused | io::ErrorKind::HostUnreachable
-            ),
-        }
-    }
-
-    /// Check if client is still alive by trying to bind to its address.
-    /// If bind succeeds, the client has released the port (dead).
-    ///
-    /// C's bind test binds INADDR_ANY:port (`makeSocket(port, false)`,
-    /// `repeater.cpp:94-124`), which works there because C's clients bind
-    /// their UDP socket to INADDR_ANY (`udpiiu.cpp:241-249`) — so the
-    /// wildcard test collides (EADDRINUSE) with the wildcard client. This
-    /// port's clients bind SPECIFIC NIC addresses (the AsyncUdpV4 per-NIC
-    /// bundle, never a wildcard socket), and on Windows a wildcard bind
-    /// test does NOT collide with a socket bound to a specific address —
-    /// so an INADDR_ANY probe would report every live client as departed
-    /// and reap it. Bind the test to the client's OWN registered address
-    /// (`self.addr`, the datagram source the repeater stored) so it
-    /// collides with the client's specific-address socket on every
-    /// platform, preserving C's liveness semantics ("is this client's port
-    /// still held?") against the port's specific-address sockets.
-    fn verify(&self) -> bool {
-        let bind_addr = match self.addr {
-            SocketAddr::V4(v4) => v4,
-            _ => return false,
-        };
-        match StdUdpSocket::bind(bind_addr) {
-            Ok(_) => false,                                         // addr free → client gone
-            Err(e) if e.kind() == io::ErrorKind::AddrInUse => true, // addr in use → alive
-            Err(_) => true,                                         // other error → assume alive
-        }
-    }
-}
+use crate::repeater_clients::*;
 
 /// Run the CA repeater daemon. Equivalent to
 /// `run_repeater_with_debug(0)`.
@@ -84,23 +17,43 @@ pub async fn run_repeater() -> io::Result<()> {
 /// Run the CA repeater daemon with an explicit debug level.
 ///
 /// Mirrors epics-base PR #831 (commit `e2717521` "Added -d option
-/// to caRepeater, sets debug level"):
-/// - level 0: silent (default)
-/// - level 1: print "New client", "Verified N active clients",
-///   "Client refused message", "Deleted client" — high-level
-///   client lifecycle.
-/// - level 2: also print per-beacon "Sent to port N" and per-client
+/// to caRepeater, sets debug level"), i.e. C `ca_repeater(setDebug)`
+/// assigning the file-static `debug` (`repeater.cpp:493-502`):
+/// - level 0: the four `debugPrintf` sites C leaves unguarded still
+///   print — `CA Repeater: Attached and initialized` among them.
+/// - level 1: also "New client", "Verified N active clients",
+///   "Client on port N refused message", "Deleted client on port N" —
+///   high-level client lifecycle.
+/// - level 2: also per-beacon "Sent to port N" and per-client
 ///   "Client on port N is alive" verification.
 ///
-/// Output goes to stderr to match the C repeater's `fprintf(stderr, …)`.
-/// `ca-repeater-rs -v` keeps stderr connected so the messages reach
-/// the operator; without `-v` stderr is `dup2`'d to `/dev/null` and
-/// the messages are discarded (also matches C behaviour).
+/// Which stream a line takes is `Diag`'s business, not this level's:
+/// `debugPrintf` is stdout, `fprintf(stderr, …)` is stderr, and
+/// `errlogPrintf` is the errlog queue. `ca-repeater-rs -v` keeps all
+/// three connected; without `-v` fds 0/1/2 are `dup2`'d to `/dev/null`
+/// and the stream ones are discarded, as C `caRepeater` does.
 ///
 /// Binds to UDP 5065, accepts client registrations, and fans out beacons.
+///
+/// `Ok(())` is C `ca_repeater`'s `return` from a `void` function: the
+/// daemon stopped after saying why. A socket it could not create or bind
+/// is reported here, not handed to the caller to re-interpret.
 pub async fn run_repeater_with_debug(debug: u8) -> io::Result<()> {
     use socket2::{Domain, Protocol, Socket, Type};
-    let sock = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP))?;
+    let diag = Diag::new(debug);
+    // C folds socket creation and bind into one `makeSocket` errno
+    // (`repeater.cpp:94-129`), so a failure at either step reaches the same
+    // pair of diagnostics at `:513-531`.
+    let sock = match Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP)) {
+        Ok(s) => s,
+        Err(e) => {
+            diag.stderr(format_args!(
+                "{C_FILE}: Unable to create repeater socket because \"{}\" - fatal",
+                sock_err_string(&e)
+            ));
+            return Ok(());
+        }
+    };
     // libcom commit 51191e6: Linux defaults IP_MULTICAST_ALL=1, which would
     // give the repeater multicast traffic for groups it never joined.
     // No-op on non-Linux.
@@ -109,15 +62,16 @@ pub async fn run_repeater_with_debug(debug: u8) -> io::Result<()> {
         let _ = sock.set_multicast_all_v4(false);
     }
     sock.set_nonblocking(true)?;
-    // libca `repeater.cpp:511` resolves the bind port through
+    // libca `repeater.cpp:499` resolves the bind port through
     // `envGetInetPortConfigParam(&EPICS_CA_REPEATER_PORT, …)`. Mirror
     // that so sites that override the port via env (e.g. to coexist
     // with a parallel C caRepeater on the default 5065) reach our
     // daemon. The default remains 5065 when the env var is unset.
-    let bind_addr = SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, repeater_port());
+    let port = repeater_port();
+    let bind_addr = SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, port);
     // Singleton-per-host bind. libca `repeater.cpp` makeSocket() binds
     // with NO reuse option set, so a second repeater process gets
-    // EADDRINUSE and exits (`repeater.cpp:513-521`); ca-repeater-rs
+    // EADDRINUSE and exits (`repeater.cpp:505-510`); ca-repeater-rs
     // treats that error as "another repeater is already running". The
     // bind must therefore be exclusive — do not enable SO_REUSEPORT
     // here: `epicsSocketEnableAddressUseForDatagramFanout` (the
@@ -126,7 +80,29 @@ pub async fn run_repeater_with_debug(debug: u8) -> io::Result<()> {
     // group and split client registration / beacon delivery between
     // them. CA server UDP sockets keep fanout (server/udp.rs) so
     // multiple IOCs share the CA port; the repeater daemon port does not.
-    sock.bind(&bind_addr.into())?;
+    //
+    // C `ca_repeater` decides what a bind failure MEANS right here and
+    // returns from its void function either way (`repeater.cpp:513-531`):
+    // EADDRINUSE is the ordinary "someone else got there first" and prints
+    // on stdout, anything else is fatal and prints on stderr. Handing the
+    // bare `io::Error` up made the caller re-derive that — and `caget-rs`,
+    // whose in-process fallback discards the result entirely, derived
+    // nothing. Reporting here and returning `Ok(())` is C's `return`.
+    let bind_sa: socket2::SockAddr = bind_addr.into();
+    if let Err(e) = sock.bind(&bind_sa) {
+        if e.kind() == io::ErrorKind::AddrInUse {
+            diag.printf(
+                0,
+                format_args!("CA Repeater: Exiting, a repeater is already running"),
+            );
+        } else {
+            diag.stderr(format_args!(
+                "{C_FILE}: Unable to create repeater socket because \"{}\" - fatal",
+                sock_err_string(&e)
+            ));
+        }
+        return Ok(());
+    }
     // Only after a successful exclusive bind does C enable SO_REUSEADDR
     // (`epicsSocketEnableAddressReuseDuringTimeWaitState`) so THIS daemon
     // can rebind across a restart. POSIX-only — WINSOCK SO_REUSEADDR has
@@ -138,8 +114,8 @@ pub async fn run_repeater_with_debug(debug: u8) -> io::Result<()> {
     // ca commit 97bf917: join every multicast (224.0.0.0/4) beacon address
     // from EPICS_CAS_BEACON_ADDR_LIST (or EPICS_CA_ADDR_LIST as fallback) so
     // multicast-configured sites actually receive the beacons they fan out.
-    // Errors are logged but non-fatal — broadcast/unicast beacons still work.
-    join_beacon_multicast_groups(&sock);
+    // Errors are reported but non-fatal — broadcast/unicast beacons still work.
+    join_beacon_multicast_groups(&sock, port, diag);
 
     let std_sock: StdUdpSocket = sock.into();
     let socket = UdpSocket::from_std(std_sock)?;
@@ -154,16 +130,20 @@ pub async fn run_repeater_with_debug(debug: u8) -> io::Result<()> {
         );
     }
 
-    if debug > 0 {
-        eprintln!("CA Repeater: Attached and initialized");
-    }
+    // C `repeater.cpp:583`. `debugPrintf` is `::printf` here (`:73`
+    // `#define DEBUG`), so this is stdout and UNGUARDED — a stock C
+    // `caget` whose `caStartRepeaterIfNotInstalled` fell back to the
+    // in-process `caRepeaterThread` prints it on its own stdout. The port
+    // gated it behind `debug > 0` and sent it to stderr, which is the
+    // whole of the observed client-side A/B difference.
+    diag.printf(0, format_args!("CA Repeater: Attached and initialized"));
 
     let mut clients: HashMap<u16, RepeaterClient> = HashMap::new();
     let mut buf = [0u8; 4096];
     let mut prev_drops: u32 = 0;
 
     loop {
-        // C `repeater.cpp:589-605`: a recv error never exits the repeater —
+        // C `repeater.cpp:577-593`: a recv error never exits the repeater —
         // `ECONNREFUSED` (Linux ICMP bug) and `ECONNRESET` (Windows KB263823)
         // are silently skipped, anything else is logged, and the loop always
         // continues. A repeater client that vanished between our fan-out send
@@ -176,10 +156,14 @@ pub async fn run_repeater_with_debug(debug: u8) -> io::Result<()> {
                         e.kind(),
                         std::io::ErrorKind::ConnectionRefused | std::io::ErrorKind::ConnectionReset
                     ) {
-                        tracing::warn!(
-                            target: "epics_ca_rs::repeater",
-                            "CA Repeater: unexpected UDP recv err: {e}"
-                        );
+                        // C `repeater.cpp:602` is `fprintf(stderr, …)`, and
+                        // stderr is where `caRepeater -v` leaves it. A
+                        // `tracing::warn!` reached nobody in a daemon that
+                        // installs no subscriber.
+                        diag.stderr(format_args!(
+                            "CA Repeater: unexpected UDP recv err: {}",
+                            sock_err_string(&e)
+                        ));
                     }
                     continue;
                 }
@@ -197,7 +181,8 @@ pub async fn run_repeater_with_debug(debug: u8) -> io::Result<()> {
         // C CA clients send a zero-length UDP packet for repeater
         // registration (backward compat with pre-3.12 repeaters).
         //
-        // C `register_new_client` (`repeater.cpp:374-424`)
+        // C `register_new_client` (`repeater.cpp:364-366` the
+        // non-AF_INET reject, `:371-414` the non-loopback bind test)
         // applies the same locality gate to BOTH the zero-length
         // legacy form and `CA_PROTO_REPEATER_REGISTER`. Pre-fix
         // Rust registered any zero-length datagram regardless of
@@ -211,7 +196,7 @@ pub async fn run_repeater_with_debug(debug: u8) -> io::Result<()> {
         // legacy client registering from e.g. `192.168.x.y` is
         // accepted, matching C.
         if len == 0 {
-            if !is_local_source(src) {
+            if !is_local_source(src, diag) {
                 tracing::warn!(
                     src = %src,
                     "caRepeater: zero-length registration from non-local source rejected"
@@ -219,11 +204,11 @@ pub async fn run_repeater_with_debug(debug: u8) -> io::Result<()> {
                 metrics::counter!("ca_repeater_register_non_loopback_rejects_total").increment(1);
                 continue;
             }
-            register_client_debug(&mut clients, src, debug);
+            register_client(&mut clients, src, diag);
             continue;
         }
 
-        // Intentional divergence from C: `repeater.cpp:613-637` only
+        // Intentional divergence from C: `repeater.cpp:601-625` only
         // special-cases `size >= sizeof(caHdr)` (16) and `size == 0`, so
         // a 1–15-byte sub-header datagram falls through to `fanOut` and
         // is forwarded verbatim. We drop it instead — a runt datagram
@@ -241,29 +226,28 @@ pub async fn run_repeater_with_debug(debug: u8) -> io::Result<()> {
 
         let action = decode_datagram(&buf[..len], &hdr, src);
         if action.register {
-            // C `register_new_client` (repeater.cpp:374-424) rejects
-            // REPEATER_REGISTER from non-AF_INET peers and, for
+            // C `register_new_client` rejects REPEATER_REGISTER from
+            // non-AF_INET peers (repeater.cpp:364-366) and, for
             // non-loopback sources, requires `bind()` to the source
-            // address to succeed (proving the IP belongs to a local
-            // interface). The intent: the repeater and its clients
-            // must be on the same host — beacon fan-out from a
-            // remote peer would silently expose PV existence to
-            // unauthorised observers via the registered-clients
-            // list.
+            // address to succeed (repeater.cpp:371-414, proving the
+            // IP belongs to a local interface). The intent: the
+            // repeater and its clients must be on the same host —
+            // beacon fan-out from a remote peer would silently
+            // expose PV existence to unauthorised observers via the
+            // registered-clients list.
             //
-            // Rust simplifies the C check to loopback-only. The C
-            // bind-test is a 3.13-era compatibility quirk that
-            // allowed the first non-loopback interface as well
-            // (clients alternated between addresses during the
-            // transition); modern libca always uses 127.0.0.1
-            // (`repeater.cpp:466-478` `caRepeaterRegistrationMessage`
-            // sets the destination to loopback explicitly).
-            // accept loopback OR any source IP that
-            // belongs to a local interface (C bind-test
-            // compatibility, `repeater.cpp::register_new_client`
-            // accepts a non-loopback source if `bind()` to that
-            // address succeeds locally).
-            if !is_local_source(src) {
+            // We accept loopback OR any source IP that belongs to a
+            // local interface (C bind-test compatibility,
+            // `repeater.cpp::register_new_client` accepts a
+            // non-loopback source if `bind()` to that address
+            // succeeds locally). C still needs that second arm: at
+            // R7.0.10 `caRepeaterRegistrationMessage` alternates the
+            // registration destination by attempt number — loopback
+            // on even attempts, `osiLocalAddr` (the first
+            // non-loopback local address) on odd ones
+            // (`udpiiu.cpp:494-515`) — so a registration legitimately
+            // arrives from a non-loopback local address.
+            if !is_local_source(src, diag) {
                 tracing::warn!(
                     src = %src,
                     "caRepeater: REPEATER_REGISTER from non-local source rejected"
@@ -271,252 +255,10 @@ pub async fn run_repeater_with_debug(debug: u8) -> io::Result<()> {
                 metrics::counter!("ca_repeater_register_non_loopback_rejects_total").increment(1);
                 continue;
             }
-            register_client_debug(&mut clients, src, debug);
+            register_client(&mut clients, src, diag);
         }
         if let Some(data) = action.fanout {
-            fan_out(&mut clients, src, &data, debug);
-        }
-    }
-}
-
-/// Outcome of decoding a single incoming repeater datagram. Mirrors
-/// C `ca_repeater()` (`repeater.cpp:613-637`):
-///   * `register = true` when the leading header is REPEATER_REGISTER,
-///     and the registration is performed before fan-out.
-///   * `fanout = Some(bytes)` when there is anything to broadcast to
-///     other registered clients — i.e. either a non-REGISTER datagram,
-///     or the remainder of a REGISTER + payload datagram after stripping
-///     the 16-byte REGISTER header.
-///
-/// The chained REGISTER + payload case is rare in practice (clients
-/// almost never piggy-back other messages on a registration), but
-/// byte-exact parity matters: a beacon-tunnel datagram that prepends
-/// REGISTER would otherwise be silently dropped by us while C still
-/// fans it out to peers.
-///
-/// Note: after stripping REGISTER, C does NOT re-inspect the remainder
-/// for RSRV_IS_UP — the source-IP rewrite only fires when the *outer*
-/// header is RSRV_IS_UP. So the remainder fan-out path here does not
-/// rewrite `m_available` either, to avoid diverging in the other
-/// direction.
-struct DatagramAction {
-    register: bool,
-    fanout: Option<Vec<u8>>,
-}
-
-/// C `repeater.cpp::register_new_client` accepts a registration
-/// when the source IP is loopback OR when `bind()` to that address
-/// succeeds locally (the 3.13-era compatibility quirk that allows
-/// clients which alternate between loopback and the first non-
-/// loopback interface). Pre-fix Rust simplified to loopback-only.
-/// We replicate the C bind-test by trying to bind a fresh UDP socket
-/// to `(src.ip(), 0)`; if the kernel accepts the bind, the address
-/// belongs to a local interface.
-fn is_local_source(src: SocketAddr) -> bool {
-    if src.ip().is_loopback() {
-        return true;
-    }
-    match src {
-        SocketAddr::V4(v4) => StdUdpSocket::bind(SocketAddrV4::new(*v4.ip(), 0)).is_ok(),
-        // C `register_new_client` rejects non-AF_INET (IPv6) explicitly.
-        SocketAddr::V6(_) => false,
-    }
-}
-
-fn decode_datagram(buf: &[u8], hdr: &CaHeader, src: SocketAddr) -> DatagramAction {
-    if hdr.cmmd == CA_PROTO_REPEATER_REGISTER {
-        // Remainder after the stripped REGISTER header.
-        if buf.len() <= CaHeader::SIZE {
-            return DatagramAction {
-                register: true,
-                fanout: None,
-            };
-        }
-        // Per C: no source-IP rewrite on the remainder.
-        DatagramAction {
-            register: true,
-            fanout: Some(buf[CaHeader::SIZE..].to_vec()),
-        }
-    } else {
-        let mut data = buf.to_vec();
-        // Per C `repeater.cpp:626-630`: rewrite m_available on
-        // RSRV_IS_UP only when the caller didn't already fill it in.
-        if hdr.cmmd == CA_PROTO_RSRV_IS_UP && hdr.available == 0 {
-            if let SocketAddr::V4(v4) = src {
-                let avail_offset = 12; // available field at bytes 12..16
-                data[avail_offset..avail_offset + 4].copy_from_slice(&v4.ip().octets());
-            }
-        }
-        DatagramAction {
-            register: false,
-            fanout: Some(data),
-        }
-    }
-}
-
-/// Fan a datagram out to every registered repeater client other than
-/// the sender. Mirrors C `repeater.cpp::fanOut`: per-client `sendMessage`,
-/// and on send failure the client is verified, removed if dead.
-fn fan_out(clients: &mut HashMap<u16, RepeaterClient>, src: SocketAddr, data: &[u8], debug: u8) {
-    let mut dead = Vec::new();
-    for (port, client) in clients.iter() {
-        // Don't reflect back to sender. C `fanOut` (repeater.cpp:340-349)
-        // skips the originating client via `identicalAddress`, which
-        // compares the FULL address (family + port + IP), not just the
-        // port. Matching on port alone wrongly suppresses a beacon to a
-        // local client whose ephemeral registration port happens to
-        // equal the beacon's source (server) port.
-        if client.addr == src {
-            continue;
-        }
-        if !client.send_message(data) {
-            if debug >= 1 {
-                eprintln!("Client on port {port} refused message");
-            }
-            if !client.verify() {
-                dead.push(*port);
-            } else if debug >= 2 {
-                eprintln!("Client on port {port} is alive");
-            }
-        } else if debug >= 2 {
-            eprintln!("Sent to port {port}");
-        }
-    }
-    for p in dead {
-        if debug >= 1 {
-            eprintln!("Deleted client on port {p}");
-        }
-        clients.remove(&p);
-    }
-    if debug >= 1 {
-        eprintln!("Verified {} active clients", clients.len());
-    }
-}
-
-/// Parse `EPICS_CAS_BEACON_ADDR_LIST` (or fall back to `EPICS_CA_ADDR_LIST`)
-/// and join every multicast group (224.0.0.0/4) on `INADDR_ANY`. Any address
-/// that isn't multicast is silently skipped. Logs warnings for join failures
-/// but never aborts: the repeater keeps running for unicast/broadcast beacons.
-fn join_beacon_multicast_groups(sock: &socket2::Socket) {
-    let list = epics_base_rs::runtime::env_table::EPICS_CAS_BEACON_ADDR_LIST
-        .get()
-        .or_else(|| epics_base_rs::runtime::env_table::EPICS_CA_ADDR_LIST.get());
-    let Some(list) = list else {
-        return;
-    };
-    for token in list.split_whitespace() {
-        // Strip optional :port suffix; we only care about the address.
-        let host = token.rsplit_once(':').map(|(h, _)| h).unwrap_or(token);
-        let Ok(addr) = host.parse::<Ipv4Addr>() else {
-            continue;
-        };
-        if !addr.is_multicast() {
-            continue;
-        }
-        if let Err(e) = sock.join_multicast_v4(&addr, &Ipv4Addr::UNSPECIFIED) {
-            tracing::warn!(group = %addr, error = %e,
-                "ca-repeater: IP_ADD_MEMBERSHIP failed");
-        }
-    }
-}
-
-/// Soft cap on simultaneously registered repeater clients. The
-/// in-process repeater is loopback-only, so the practical attacker
-/// is a local process opening many UDP sockets on different source
-/// ports. 1024 is comfortably above any realistic CA-client farm
-/// on a single host (one or two per Phoebus + ~hundred CSS + a
-/// handful of caget/caput) but small enough to bound memory if
-/// abused. C `caRepeater.c` has no cap; we choose to be stricter.
-const MAX_REPEATER_CLIENTS: usize = 1024;
-
-fn register_client_debug(clients: &mut HashMap<u16, RepeaterClient>, src: SocketAddr, debug: u8) {
-    let port = src.port();
-    let was_registered = clients.contains_key(&port);
-    register_client(clients, src, debug);
-    if !was_registered && debug >= 1 && clients.contains_key(&port) {
-        eprintln!("New client on port {port}");
-        eprintln!("Verified {} active clients", clients.len());
-    }
-}
-
-/// C `verifyClients` (`repeater.cpp:317-335`) — bind-test EVERY registered
-/// client and reap the ones whose port is now free.
-///
-/// This is unconditional: it does NOT wait for a send to fail. C's own
-/// comment at the call site (`repeater.cpp:475-479`) gives the reason —
-/// "an ICMP error return does not get through to send(), which returns no
-/// error code" on some platforms — so send-failure reaping alone leaks stale
-/// clients there. Returns the number of clients reaped.
-fn verify_clients(clients: &mut HashMap<u16, RepeaterClient>) -> usize {
-    let dead: Vec<u16> = clients
-        .iter()
-        .filter(|(_, c)| !c.verify())
-        .map(|(p, _)| *p)
-        .collect();
-    let reaped = dead.len();
-    for p in dead {
-        clients.remove(&p);
-    }
-    reaped
-}
-
-/// C `register_new_client` (`repeater.cpp:366-487`), in C's order:
-/// find-or-create → sendConfirm (removing the client on failure, whether it
-/// is new or not) → noop fan-out to every OTHER client (on EVERY
-/// registration, so a repeat registration still exercises their sockets) →
-/// `verifyClients` when this registration created a client.
-fn register_client(clients: &mut HashMap<u16, RepeaterClient>, src: SocketAddr, debug: u8) {
-    let port = src.port();
-
-    let mut new_client = false;
-    if !clients.contains_key(&port) {
-        // Rust-only soft cap (C has none): sweep first so a full table of
-        // departed clients still admits a live one.
-        if clients.len() >= MAX_REPEATER_CLIENTS {
-            verify_clients(clients);
-            if clients.len() >= MAX_REPEATER_CLIENTS {
-                // All slots are alive — refuse the new client. The peer
-                // sees no CONFIRM and retries (every 1 s, per
-                // `repeaterSubscribeTimer`), so it gets in as soon as a
-                // slot frees.
-                return;
-            }
-        }
-        // Per-client connected socket, as C's `repeaterClient::connect`.
-        let client = match RepeaterClient::new(src) {
-            Ok(c) => c,
-            Err(_) => return,
-        };
-        clients.insert(port, client);
-        new_client = true;
-    }
-
-    // C `repeater.cpp:453-467`: a client whose CONFIRM cannot be sent is
-    // removed — including an ALREADY-REGISTERED one, which the pre-fix Rust
-    // kept (it returned early after `send_confirm()`, ignoring the result).
-    let confirmed = clients.get(&port).is_some_and(|c| c.send_confirm());
-    if !confirmed {
-        clients.remove(&port);
-        if debug >= 1 {
-            eprintln!("Deleted repeater client on port {port}, error sending ack");
-        }
-    }
-
-    // C `repeater.cpp:469-474`: "send a noop message to all other clients so
-    // that we don't accumulate sockets when there are no beacons". Sent on
-    // every registration message, not only on the one that created a client
-    // — and clients now re-register once a second until confirmed (R6-22),
-    // so this is the sweep that runs in a beacon-less network.
-    let noop = CaHeader::new(CA_PROTO_VERSION);
-    fan_out(clients, src, &noop.to_bytes(), debug);
-
-    // C `repeater.cpp:476-486`: the bind-test sweep, run whenever a
-    // registration created a client, and deliberately AFTER the confirm above
-    // so the new client is never reaped before it is acknowledged.
-    if new_client {
-        let reaped = verify_clients(clients);
-        if debug >= 1 && reaped > 0 {
-            eprintln!("Reaped {reaped} departed client(s) on new registration");
+            fan_out(&mut clients, src, &data);
         }
     }
 }
@@ -653,6 +395,15 @@ fn spawn_repeater() {
     // Fallback: run repeater in-process on a background thread.
     // This ensures beacon reception works even without the external binary.
     std::thread::spawn(|| {
+        // C's in-process fallback is `caRepeaterThread` (`repeater.cpp:632`),
+        // which registers with the watchdog before entering `ca_repeater()`.
+        // Unbounded: the loop parks on `recv_from`, and a host with no CA
+        // traffic is quiet rather than wedged.
+        let _watched = epics_base_rs::runtime::taskwd::taskwd_insert(
+            "CAC-repeater",
+            epics_base_rs::runtime::taskwd::CheckIn::Unbounded,
+            None,
+        );
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -661,235 +412,289 @@ fn spawn_repeater() {
     });
 }
 
+/// C reports a bind-test socket it cannot create exactly once
+/// (`repeater.cpp:382-398`, the `static bool init`), so an exhausted fd
+/// table gives one line rather than one per registration datagram.
+static BIND_TEST_SOCKET_REPORTED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// C `repeater.cpp::register_new_client` accepts a registration
+/// when the source IP is loopback OR when `bind()` to that address
+/// succeeds locally (the 3.13-era compatibility quirk that allows
+/// clients which alternate between loopback and the first non-
+/// loopback interface). Pre-fix Rust simplified to loopback-only.
+///
+/// C splits the probe into two steps that mean different things: making
+/// the test socket (`makeSocket(PORT_ANY, true, …)` — a failure is
+/// reported on stderr, `:388-393`) and binding it to the source address
+/// (a failure is the answer "not a local address", and is silent,
+/// `:416-419`). The port had one `StdUdpSocket::bind(…).is_ok()`, so a
+/// host out of file descriptors rejected every registration and said
+/// nothing. Keep C's two steps — but a socket per probe, not C's single
+/// re-bound `static testSock`, which cannot take a second distinct
+/// non-loopback source.
+pub(crate) fn is_local_source(src: SocketAddr, diag: Diag) -> bool {
+    use std::sync::atomic::Ordering;
+
+    if src.ip().is_loopback() {
+        return true;
+    }
+    // C `register_new_client` rejects non-AF_INET (IPv6) explicitly.
+    let SocketAddr::V4(v4) = src else {
+        return false;
+    };
+
+    // `makeSocket(PORT_ANY, …)` returns before its `reuseAddr` block, so
+    // C sets no reuse option on this socket either.
+    let sock = match socket2::Socket::new(
+        socket2::Domain::IPV4,
+        socket2::Type::DGRAM,
+        Some(socket2::Protocol::UDP),
+    ) {
+        Ok(sock) => sock,
+        Err(e) => {
+            if !BIND_TEST_SOCKET_REPORTED.swap(true, Ordering::Relaxed) {
+                diag.stderr(format_args!(
+                    "{C_FILE}: Unable to create repeater bind test socket because \"{}\"",
+                    sock_err_string(&e)
+                ));
+            }
+            return false;
+        }
+    };
+    let probe: socket2::SockAddr = SocketAddrV4::new(*v4.ip(), 0).into();
+    sock.bind(&probe).is_ok()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn header_bytes(cmmd: u16, available: u32) -> Vec<u8> {
-        let mut h = CaHeader::new(cmmd);
-        h.available = available;
-        h.to_bytes().to_vec()
-    }
-
-    fn src_v4(a: u8, b: u8, c: u8, d: u8, port: u16) -> SocketAddr {
-        SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::new(a, b, c, d), port))
-    }
-
-    #[test]
-    fn beacon_rewrites_zero_m_available_with_source_ip() {
-        // RSRV_IS_UP with m_available=0 → repeater fills in the
-        // sender's IP (C `repeater.cpp:626-630`).
-        let buf = header_bytes(CA_PROTO_RSRV_IS_UP, 0);
-        let hdr = CaHeader::from_bytes(&buf).unwrap();
-        let src = src_v4(10, 0, 0, 5, 4321);
-        let act = decode_datagram(&buf, &hdr, src);
-        assert!(!act.register);
-        let data = act.fanout.expect("beacon must be fanned out");
-        // m_available is at bytes 12..16.
-        assert_eq!(&data[12..16], &[10, 0, 0, 5]);
-    }
-
-    #[test]
-    fn beacon_with_nonzero_m_available_is_unchanged() {
-        // RSRV_IS_UP with m_available already set → leave it.
-        let buf = header_bytes(CA_PROTO_RSRV_IS_UP, 0x0a00_0006);
-        let hdr = CaHeader::from_bytes(&buf).unwrap();
-        let src = src_v4(192, 168, 1, 99, 5555);
-        let act = decode_datagram(&buf, &hdr, src);
-        assert!(!act.register);
-        let data = act.fanout.expect("beacon must be fanned out");
-        assert_eq!(&data[12..16], &0x0a00_0006u32.to_be_bytes());
-    }
-
-    #[test]
-    fn non_rsrv_non_register_message_is_not_rewritten() {
-        // Previous code rewrote m_available on ANY non-REGISTER
-        // command — C only rewrites RSRV_IS_UP. Verify a different
-        // command (e.g. VERSION) flows through untouched.
-        let buf = header_bytes(CA_PROTO_VERSION, 0);
-        let hdr = CaHeader::from_bytes(&buf).unwrap();
-        let src = src_v4(10, 0, 0, 5, 4321);
-        let act = decode_datagram(&buf, &hdr, src);
-        assert!(!act.register);
-        let data = act.fanout.expect("fan out");
-        // Bytes 12..16 stay zero.
-        assert_eq!(&data[12..16], &[0, 0, 0, 0]);
-    }
-
-    #[test]
-    fn bare_register_returns_register_only_no_fanout() {
-        let buf = header_bytes(CA_PROTO_REPEATER_REGISTER, 0);
-        let hdr = CaHeader::from_bytes(&buf).unwrap();
-        let src = src_v4(127, 0, 0, 1, 9000);
-        let act = decode_datagram(&buf, &hdr, src);
-        assert!(act.register);
-        assert!(
-            act.fanout.is_none(),
-            "bare REGISTER must not fan out anything"
-        );
-    }
-
-    #[test]
-    fn chained_register_plus_payload_strips_then_fans_out_remainder() {
-        // C parity: REGISTER + RSRV_IS_UP in one datagram. Repeater
-        // registers the sender, strips the 16-byte REGISTER header,
-        // and fans out the remainder to other clients. The remainder's
-        // m_available is NOT rewritten (C `repeater.cpp:613-637` only
-        // checks the outer header for the rewrite — once stripped, the
-        // remainder fan-out path is the literal fanOut call).
-        let mut buf = header_bytes(CA_PROTO_REPEATER_REGISTER, 0);
-        let remainder = header_bytes(CA_PROTO_RSRV_IS_UP, 0);
-        buf.extend_from_slice(&remainder);
-
-        let hdr = CaHeader::from_bytes(&buf).unwrap();
-        let src = src_v4(10, 0, 0, 5, 5060);
-        let act = decode_datagram(&buf, &hdr, src);
-        assert!(act.register, "REGISTER must register the sender");
-        let data = act.fanout.expect("chained payload must fan out");
-        assert_eq!(data.len(), CaHeader::SIZE);
-        // Verify the fanned-out bytes are the literal RSRV_IS_UP
-        // header without source-IP rewrite (parity quirk: the rewrite
-        // only fires when the *outer* command is RSRV_IS_UP).
-        assert_eq!(&data, &remainder);
-        // And the m_available stays zero — C does not rewrite it after
-        // the strip.
-        assert_eq!(&data[12..16], &[0, 0, 0, 0]);
-    }
-
-    #[test]
-    fn fan_out_skips_on_full_address_not_port_alone() {
-        // C `fanOut` (repeater.cpp:340-349) skips the originating
-        // client by FULL address (`identicalAddress` = family + port +
-        // IP). A client registered on loopback:P must still receive a
-        // beacon whose SOURCE is a server at a different IP but the same
-        // port P — port-only skip wrongly suppressed it.
-        let recv = StdUdpSocket::bind("127.0.0.1:0").expect("bind recv");
-        recv.set_read_timeout(Some(std::time::Duration::from_millis(750)))
-            .unwrap();
-        let local = recv.local_addr().unwrap();
-        let port = local.port();
-
-        let mut clients: HashMap<u16, RepeaterClient> = HashMap::new();
-        clients.insert(port, RepeaterClient::new(local).expect("client sock"));
-
-        let data = header_bytes(CA_PROTO_RSRV_IS_UP, 0x0a00_0005);
-
-        // (1) Beacon from a DIFFERENT IP but the SAME port → the client
-        // must NOT be skipped; it receives the fanned-out datagram.
-        let server_src = src_v4(10, 0, 0, 5, port);
-        fan_out(&mut clients, server_src, &data, 0);
-        let mut buf = [0u8; 64];
-        let n = recv
-            .recv(&mut buf)
-            .expect("client with a coinciding port must still receive the beacon");
-        assert_eq!(
-            &buf[..n],
-            &data[..],
-            "fanned-out bytes must match the input"
-        );
-
-        // (2) Datagram whose FULL address equals the client → skipped
-        // (no reflect-to-self), so the receive times out.
-        fan_out(&mut clients, local, &data, 0);
-        let err = recv.recv(&mut buf).expect_err(
-            "a datagram from the client's own full address must be skipped, not reflected",
-        );
-        assert!(
-            matches!(
-                err.kind(),
-                std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
-            ),
-            "expected a read timeout for the self-skip case, got {err:?}"
-        );
-    }
-
-    /// R6-27: C runs `verifyClients()` — a bind test on EVERY registered
-    /// client — whenever a registration creates a client
-    /// (`repeater.cpp:476-486`), regardless of whether any send failed. The
-    /// pre-fix Rust reaped only on send failure, and `send_message` treats
-    /// just ECONNREFUSED / EHOSTUNREACH as gone; on a platform that never
-    /// surfaces the ICMP error (C names HP-UX and Solaris) the departed
-    /// client stayed registered until the 1024-entry cap.
+    /// fd 1 / fd 2 capture for the two daemon tests below.
     ///
-    /// Here the departed client's socket is CLOSED but its address is still
-    /// in the table — `send_message` to it succeeds (a connected UDP send to
-    /// a free loopback port does not fail synchronously on the first datagram
-    /// here), so only the bind-test sweep can reap it.
-    #[test]
-    fn new_registration_bind_test_sweeps_departed_clients() {
-        // A departed client: bind to learn a port, then drop the socket so the
-        // port is free — exactly what `verify()`'s bind test detects.
-        let departed_port = {
-            let s = StdUdpSocket::bind("127.0.0.1:0").expect("bind departed");
-            s.local_addr().unwrap().port()
-        };
-        let departed = src_v4(127, 0, 0, 1, departed_port);
+    /// It sits beside its callers.  It lived in `repeater_clients` while both
+    /// modules carried the same target gate; once `repeater` narrowed to
+    /// `tokio_backend` the borrow ran the wrong way — the module that compiles
+    /// away first is this one, so a helper left over there is stranded with no
+    /// caller at all.
+    ///
+    /// Gated once, here. `capture_streams` dups and swaps this process's fds 1
+    /// and 2, so it is unix-only; carrying that `#[cfg]` on the function
+    /// instead left the module inhabited on Windows and an ungated `use` of a
+    /// name that was configured out, which is E0432 rather than a quiet skip.
+    #[cfg(unix)]
+    mod stream_capture {
+        /// Serialises the fd-swapping capture below: fds 1 and 2 are
+        /// process-global, so two of these running at once would cross-read.
+        static STREAM_CAPTURE: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
-        // A live client, still holding its port.
-        let live_sock = StdUdpSocket::bind("127.0.0.1:0").expect("bind live");
-        let live = live_sock.local_addr().unwrap();
+        /// Run `f` with fd 1 and fd 2 redirected to pipes, and return what each
+        /// received.
+        ///
+        /// WHICH stream a `repeater.cpp` diagnostic takes is half of what this
+        /// module got wrong: `debugPrintf` is `::printf` (stdout) because
+        /// `repeater.cpp:73` `#define DEBUG`s before including `iocinf.h`, while
+        /// the port emitted every line on stderr. Asserting the bytes alone
+        /// would not have caught that, so the tests assert the stream too.
+        pub(crate) fn capture_streams<F: FnOnce() -> R, R>(f: F) -> (R, String, String) {
+            use std::io::{Read, Write};
+            use std::os::fd::FromRawFd;
 
-        let mut clients: HashMap<u16, RepeaterClient> = HashMap::new();
-        clients.insert(
-            departed_port,
-            RepeaterClient::new(departed).expect("departed client sock"),
-        );
-        clients.insert(live.port(), RepeaterClient::new(live).expect("live sock"));
-        assert_eq!(clients.len(), 2);
+            let _serial = STREAM_CAPTURE
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
 
-        // A brand-new client registers. C: newClient ⇒ verifyClients().
-        let newcomer_sock = StdUdpSocket::bind("127.0.0.1:0").expect("bind newcomer");
-        let newcomer = newcomer_sock.local_addr().unwrap();
-        register_client(&mut clients, newcomer, 0);
+            // SAFETY: plain fd bookkeeping on this process's own fds 1 and 2.
+            // The lock above makes this the only thread swapping them.
+            let (saved_out, saved_err, mut out_r, mut err_r) = unsafe {
+                let saved_out = libc::dup(1);
+                let saved_err = libc::dup(2);
+                let mut op = [0i32; 2];
+                let mut ep = [0i32; 2];
+                assert_eq!(libc::pipe(op.as_mut_ptr()), 0, "stdout pipe");
+                assert_eq!(libc::pipe(ep.as_mut_ptr()), 0, "stderr pipe");
+                libc::dup2(op[1], 1);
+                libc::dup2(ep[1], 2);
+                libc::close(op[1]);
+                libc::close(ep[1]);
+                (
+                    saved_out,
+                    saved_err,
+                    std::fs::File::from_raw_fd(op[0]),
+                    std::fs::File::from_raw_fd(ep[0]),
+                )
+            };
 
-        assert!(
-            !clients.contains_key(&departed_port),
-            "a client whose port is free must be reaped by the bind-test sweep \
-             on the next new registration, even though no send failed"
-        );
-        assert!(
-            clients.contains_key(&live.port()),
-            "the live client must survive the sweep"
-        );
-        assert!(
-            clients.contains_key(&newcomer.port()),
-            "the registering client must be present and confirmed"
-        );
+            let value = f();
+            let _ = std::io::stdout().flush();
+            let _ = std::io::stderr().flush();
+
+            // SAFETY: restores the two fds saved above and releases the
+            // duplicates; dropping the pipes' write ends is what ends the reads.
+            unsafe {
+                libc::dup2(saved_out, 1);
+                libc::dup2(saved_err, 2);
+                libc::close(saved_out);
+                libc::close(saved_err);
+            }
+
+            let mut out = String::new();
+            let mut err = String::new();
+            out_r.read_to_string(&mut out).expect("captured stdout");
+            err_r.read_to_string(&mut err).expect("captured stderr");
+            (value, out, err)
+        }
     }
 
-    /// A REPEAT registration from an already-registered client re-sends the
-    /// CONFIRM and still fans the noop out to the others
-    /// (`repeater.cpp:469-474`) — the pre-fix Rust returned early after the
-    /// confirm, so with clients re-registering every second (R6-22) the
-    /// "don't accumulate sockets when there are no beacons" sweep never ran.
+    /// C `repeater.cpp:515-521`: a repeater that loses the race for the
+    /// port says so with a `debugPrintf` — stdout, and inside no
+    /// `if (debug)`, so it prints at the stock level 0 — and then returns.
+    /// The port propagated a bare `AddrInUse` instead, which `caget-rs`'s
+    /// in-process fallback discards with `let _ =`.
+    // RTEMS-EXEC-MODEL-ALLOW(1): builds and enters its own current-thread
+    // runtime rather than taking an ambient one; green on the exec
+    // backend.
+    #[cfg(unix)]
     #[test]
-    fn repeat_registration_still_fans_the_noop_to_other_clients() {
-        let other = StdUdpSocket::bind("127.0.0.1:0").expect("bind other");
-        other
-            .set_read_timeout(Some(std::time::Duration::from_millis(750)))
-            .unwrap();
-        let other_addr = other.local_addr().unwrap();
+    fn second_repeater_says_one_is_already_running_on_stdout() {
+        // Hold the port so the daemon's exclusive bind must fail.
+        let held = StdUdpSocket::bind("0.0.0.0:0").expect("hold bind");
+        let port = held.local_addr().expect("hold addr").port();
+        // SAFETY: nextest runs each test in its own process.
+        unsafe { std::env::set_var("EPICS_CA_REPEATER_PORT", port.to_string()) };
 
-        let repeat_sock = StdUdpSocket::bind("127.0.0.1:0").expect("bind repeat");
-        let repeat_addr = repeat_sock.local_addr().unwrap();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("test runtime");
 
-        let mut clients: HashMap<u16, RepeaterClient> = HashMap::new();
-        clients.insert(
-            other_addr.port(),
-            RepeaterClient::new(other_addr).expect("other sock"),
+        let (result, out, err) =
+            stream_capture::capture_streams(|| rt.block_on(run_repeater_with_debug(0)));
+
+        assert!(
+            result.is_ok(),
+            "C returns from its void `ca_repeater` after reporting; the port \
+             must not hand the bind error up instead: {result:?}"
         );
-        clients.insert(
-            repeat_addr.port(),
-            RepeaterClient::new(repeat_addr).expect("repeat sock"),
+        let line = "CA Repeater: Exiting, a repeater is already running";
+        assert!(
+            out.lines().any(|l| l == line),
+            "stdout must carry {line:?} verbatim; got {out:?}"
+        );
+        assert!(
+            !err.contains(line),
+            "the line is a `debugPrintf`, i.e. C `::printf`; got stderr {err:?}"
+        );
+        drop(held);
+    }
+
+    /// The bytes and the stream of three `repeater.cpp` diagnostics, taken
+    /// off a live `run_repeater_with_debug`.
+    ///
+    /// * `CA Repeater: Attached and initialized` — `repeater.cpp:583`, a
+    ///   `debugPrintf` inside NO `if (debug)`, so it prints at the stock
+    ///   level 0. Captured from the C build for comparison: with the
+    ///   `caRepeater` executable off `PATH` (so
+    ///   `caStartRepeaterIfNotInstalled` falls back to the in-process
+    ///   `caRepeaterThread`), `caget NOSUCH:PV` writes exactly this line to
+    ///   its own **stdout** while `Channel connect timed out` goes to
+    ///   stderr. The port gated it behind `debug > 0` and put it on stderr.
+    /// * `New client on port %u` — `repeater.cpp:136`, the `repeaterClient`
+    ///   constructor, inside `if (debug)`.
+    /// * `Verified %u active clients` — `repeater.cpp:332`, and this is the
+    ///   only function in the file that prints it; the port also printed it
+    ///   from `fanOut` and from a registration wrapper.
+    // RTEMS-EXEC-MODEL-ALLOW(1): builds and enters its own multi-thread
+    // runtime rather than taking an ambient one; green on the exec
+    // backend.
+    #[cfg(unix)]
+    #[test]
+    fn repeater_diagnostics_carry_c_bytes_on_c_streams() {
+        use std::time::{Duration, Instant};
+
+        // A port nothing holds: bind, read it back, drop.
+        let free_port = StdUdpSocket::bind("127.0.0.1:0")
+            .expect("probe bind")
+            .local_addr()
+            .expect("probe addr")
+            .port();
+        // `run_repeater_with_debug` binds `repeater_port()`, C
+        // `envGetInetPortConfigParam(&EPICS_CA_REPEATER_PORT, …)`, so this is
+        // the only way to keep the test off a host repeater on 5065.
+        // SAFETY: nextest runs each test in its own process.
+        unsafe { std::env::set_var("EPICS_CA_REPEATER_PORT", free_port.to_string()) };
+
+        // `verifyClients` bind-tests the client's own address, and C's
+        // order is confirm-then-sweep (`repeater.cpp:453-486`) — so the
+        // socket has to stay open past the CONFIRM or the sweep correctly
+        // reaps it. Share it rather than moving it into the blocking task,
+        // whose return would close it.
+        let client = std::sync::Arc::new(StdUdpSocket::bind("127.0.0.1:0").expect("client bind"));
+        client
+            .set_read_timeout(Some(Duration::from_millis(200)))
+            .expect("client read timeout");
+        let client_port = client.local_addr().expect("client addr").port();
+
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .expect("test runtime");
+
+        let (confirmed, out, err) = stream_capture::capture_streams(|| {
+            let held = std::sync::Arc::clone(&client);
+            rt.block_on(async move {
+                let repeater = tokio::spawn(run_repeater_with_debug(1));
+                // Re-send until the CONFIRM arrives: the first REGISTER can
+                // predate the daemon's bind, and a lost datagram must not
+                // turn into a flake.
+                let confirmed = tokio::task::spawn_blocking(move || {
+                    let register = CaHeader::new(CA_PROTO_REPEATER_REGISTER).to_bytes();
+                    let deadline = Instant::now() + Duration::from_secs(5);
+                    let mut buf = [0u8; 64];
+                    while Instant::now() < deadline {
+                        let _ = client.send_to(&register, ("127.0.0.1", free_port));
+                        if let Ok((n, _)) = client.recv_from(&mut buf) {
+                            if n >= CaHeader::SIZE {
+                                if let Ok(h) = CaHeader::from_bytes(&buf[..n]) {
+                                    if h.cmmd == CA_PROTO_REPEATER_CONFIRM {
+                                        return true;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    false
+                })
+                .await
+                .unwrap_or(false);
+                // The sweep runs after the CONFIRM; give it the socket it
+                // bind-tests, and a moment to print its line.
+                tokio::time::sleep(Duration::from_millis(250)).await;
+                repeater.abort();
+                drop(held);
+                confirmed
+            })
+        });
+
+        assert!(
+            confirmed,
+            "the repeater never confirmed the registration; captured stdout {out:?} stderr {err:?}"
         );
 
-        register_client(&mut clients, repeat_addr, 0);
+        let banner = "CA Repeater: Attached and initialized";
+        let new_client = format!("New client on port {client_port}");
+        let verified = "Verified 1 active clients";
 
-        let mut buf = [0u8; 64];
-        let n = other
-            .recv(&mut buf)
-            .expect("a repeat registration must still noop-fan-out to other clients");
-        let hdr = CaHeader::from_bytes(&buf[..n]).expect("noop parses");
-        assert_eq!(hdr.cmmd, CA_PROTO_VERSION, "the noop is a VERSION frame");
+        for line in [banner, new_client.as_str(), verified] {
+            assert!(
+                out.lines().any(|l| l == line),
+                "stdout must carry {line:?} verbatim; got {out:?}"
+            );
+            assert!(
+                !err.contains(line),
+                "{line:?} is a `debugPrintf`, i.e. C `::printf` — it must not \
+                 reach stderr; got {err:?}"
+            );
+        }
     }
 }

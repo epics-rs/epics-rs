@@ -133,6 +133,9 @@ pub(crate) fn motor_get_field(rec: &MotorRecord, name: &str) -> Option<EpicsValu
         "NTMF" => Some(EpicsValue::UShort(rec.timing.ntmf)),
         // Public C motorRecord.dbd link / menu / string surface.
         "OUT" => Some(EpicsValue::String(rec.links.out.clone().into())),
+        // `motorRecord.cc:653-670` — derived from OUT at init by
+        // `motor_derive_card`, SPC_NOMOD so no client can write it.
+        "CARD" => Some(EpicsValue::Short(rec.links.card)),
         "RDBL" => Some(EpicsValue::String(rec.links.rdbl.clone().into())),
         "DOL" => Some(EpicsValue::String(rec.links.dol.clone().into())),
         "RLNK" => Some(EpicsValue::String(rec.links.rlnk.clone().into())),
@@ -479,7 +482,7 @@ pub(crate) fn motor_put_field(
                     // directly — special() never runs at load);
                     // `motor_sync_resolution_at_init` reconciles the
                     // SREV/UREV/MRES triple once loading completes
-                    // (C check_speed_and_resolution, 3904-3927).
+                    // (C check_speed_and_resolution, 3905-3927).
                     rec.conv.mres = v;
                     return Ok(());
                 }
@@ -523,7 +526,7 @@ pub(crate) fn motor_put_field(
             EpicsValue::Long(v) => {
                 if !rec.internal.init_invariants_synced {
                     // Raw store during load (even non-positive — C raw-writes
-                    // it and the init reconcile clamps, 3904-3909).
+                    // it and the init reconcile clamps, 3905-3909).
                     rec.conv.srev = v;
                     return Ok(());
                 }
@@ -682,7 +685,7 @@ pub(crate) fn motor_put_field(
             EpicsValue::Double(v) => {
                 rec.vel.vbas = v;
                 if rec.internal.init_invariants_synced {
-                    // C motorRecord.cc:2629-2633: VBAS is forced non-negative.
+                    // C motorRecord.cc:2628-2632: VBAS is forced non-negative.
                     if rec.vel.vbas < 0.0 {
                         rec.vel.vbas = 0.0;
                     }
@@ -922,7 +925,7 @@ pub(crate) fn motor_put_field(
         "BDST" => match value {
             EpicsValue::Double(v) => {
                 rec.retry.bdst = v;
-                // C special BDST (2986-2989): "New backlash distance.
+                // C special BDST (2987-2989): "New backlash distance.
                 // Make sure retry deadband is achievable." Runtime only,
                 // same load/init split as RDBD.
                 if rec.internal.init_invariants_synced {
@@ -1562,7 +1565,7 @@ fn range_check(parm: &mut f64, min: f64, max: f64) {
     }
 }
 
-/// C special() `velcheckA` tail (motorRecord.cc:3128-3148): after a
+/// C special() `velcheckA` tail (motorRecord.cc:3128-3146): after a
 /// VBAS/SBAS/VMAX/SMAX write changes the velocity window, re-clamp every
 /// dependent velocity into the new [VBAS, VMAX] and re-derive the rev-unit
 /// partners of VELO and BVEL.
@@ -1581,7 +1584,7 @@ fn revalidate_velocities(rec: &mut MotorRecord) {
 }
 
 /// Reconcile the SREV/UREV/MRES resolution triple at IOC init — the head
-/// of C `check_speed_and_resolution` (motorRecord.cc:3904-3927), run once
+/// of C `check_speed_and_resolution` (motorRecord.cc:3905-3927), run once
 /// after `dbLoadRecords` has applied every `field()` as a raw struct
 /// write. A nonzero loaded UREV wins over a loaded MRES; SREV is clamped
 /// sane first so both derivations divide by the final value.
@@ -1591,11 +1594,11 @@ fn revalidate_velocities(rec: &mut MotorRecord) {
 /// and the UREV-wins arm overwrites MRES regardless, so no load scenario
 /// can tell the defaults apart.
 pub(crate) fn motor_sync_resolution_at_init(rec: &mut MotorRecord) {
-    // C 3904-3909: SREV (steps/revolution) must be sane.
+    // C 3905-3909: SREV (steps/revolution) must be sane.
     if rec.conv.srev <= 0 {
         rec.conv.srev = 200;
     }
-    // C 3911-3916: UREV (EGU/revolution) <--> MRES (EGU/step).
+    // C 3912-3916: UREV (EGU/revolution) <--> MRES (EGU/step).
     if rec.conv.urev != 0.0 {
         rec.conv.mres = rec.conv.urev / rec.conv.srev as f64;
     }
@@ -1617,7 +1620,7 @@ pub(crate) fn motor_sync_resolution_at_init(rec: &mut MotorRecord) {
 /// The cross-calcs in `put_field` stay inert during load, so each loaded
 /// field still holds exactly its `field()` value here. A nonzero rev-unit
 /// field (S/SBAS/SMAX/SBAK) therefore means the .db specified it and, as in
-/// C, it wins over its EGU partner (motorRecord.cc:3929-3966, 4019-4029);
+/// C, it wins over its EGU partner (motorRecord.cc:3930-3966, 4020-4029);
 /// otherwise the EGU value is authoritative and the rev value is derived at
 /// the final UREV. Without this split, `field(VELO,…)` applied before
 /// `field(MRES,…)` derives S against the default UREV and the MRES cascade
@@ -1664,7 +1667,7 @@ pub(crate) fn motor_sync_speed_at_init(rec: &mut MotorRecord) {
             rec.vel.sbak = rec.vel.bvel / urev_abs;
         }
     }
-    // ACCS <-> ACCL, C check_speed_and_resolution (motorRecord.cc:4033-4047).
+    // ACCS <-> ACCL, C check_speed_and_resolution (motorRecord.cc:4034-4047).
     // The key is `accs > 0.0` — the loaded ACCS value — NOT ACCU: ACCS's dbd
     // default is 0.0 (as is `VelocityFields::default`), the accel cross-calcs
     // are special()-only and so never fire during dbLoadRecords, and therefore
@@ -1682,7 +1685,7 @@ pub(crate) fn motor_sync_speed_at_init(rec: &mut MotorRecord) {
         update_accs_from_accl(rec);
     }
 
-    // C motorRecord.cc:4054-4067 — jog/home velocity sanity checks, after
+    // C motorRecord.cc:4055-4067 — jog/home velocity sanity checks, after
     // the speed pairs and accelerations settle. A zero field means "not
     // configured" (JVEL/JAR/HVEL have no initial() in the dbd): JVEL
     // defaults to VELO, JAR to VELO/ACCL, HVEL to VBAS; a configured value
@@ -1702,6 +1705,54 @@ pub(crate) fn motor_sync_speed_at_init(rec: &mut MotorRecord) {
     }
 }
 
+/// C `motorRecord.cc:653-670` — CARD is a function of the OUT link's TYPE:
+///
+/// ```c
+/// switch (pmr->out.type) {
+///   case (VME_IO):   pmr->card = pmr->out.value.vmeio.card; break;
+///   case (CONSTANT): case (PV_LINK):
+///   case (DB_LINK):  case (CA_LINK):  pmr->card = -1; break;
+///   case (INST_IO):  pmr->card = 0; break;
+///   default: recGblRecordError(S_db_badField, ...); return(ERROR);
+/// }
+/// ```
+///
+/// The port served the `INST_IO` answer to every motor, so a soft motor
+/// (`OUT` unset, i.e. C's CONSTANT) reported card 0 — a real controller
+/// address — instead of C's -1.
+///
+/// Two places where this is C's shape and not an invention of ours:
+///
+/// - The card number comes from the LINK, parsed by `dbParseLink`
+///   (`dbStaticLib.c:2301-2327`) and stored by `dbSetLinkHW` (`:2463`):
+///   `#C%i S%i` with the two ID letters spelling exactly `CS`. A `#` link
+///   whose letters are anything else is another hardware type in C
+///   (`CAMAC_IO`, `AB_IO`, …) and lands in the `default:` arm, which is what
+///   the catch-all below answers; a `#` link whose letters name no bus at all
+///   is C's `goto fail` and never becomes a link, so it arrives here as the
+///   unset CONSTANT and gets -1 as well.
+/// - C runs the switch only under `if (pdset->base.init_record)`
+///   (`motorRecord.cc:645`) and forces -1 when that dset init fails (`:650`).
+///   Qualified because the bullet above ends on `dbStaticLib.c`, where those
+///   two numbers land in `dbCopyEntry`/`dbCopyEntryContents`. This port has
+///   no dset-less motor record and no dset-init failure at this point, so the
+///   switch runs unconditionally.
+pub(crate) fn motor_derive_card(rec: &mut MotorRecord) {
+    use epics_base_rs::server::record::{HwLink, ParsedLink, parse_link_v2};
+
+    rec.links.card = match parse_link_v2(&rec.links.out) {
+        ParsedLink::Hw(HwLink::InstIo { .. }) => 0,
+        // C reads `out.value.vmeio.card`, the number the parse stored — not
+        // the text, which the store no longer keeps.
+        ParsedLink::Hw(HwLink::VmeIo { card, .. }) => card,
+        // CONSTANT (which is what an unset OUT is), PV_LINK, DB_LINK,
+        // CA_LINK — and the JSON/pva forms, which C reaches as JSON_LINK
+        // resolving to one of those — plus every other hardware bus, C's
+        // `default:` arm.
+        _ => -1,
+    };
+}
+
 /// Establish the limit invariant at IOC init — the load-time counterpart of
 /// [`apply_mres_cascade`].
 ///
@@ -1711,7 +1762,7 @@ pub(crate) fn motor_sync_speed_at_init(rec: &mut MotorRecord) {
 ///    rule — a NONZERO raw limit loaded from the database rescales its dial
 ///    partner; a zero raw is seeded from the dial value. Under MRES < 0 the
 ///    pairs cross (raw low <-> dial high) and scale by |MRES|.
-/// 2. `init_record` 716-718 ("Reset limits in case database values are
+/// 2. `init_record` 717-718 ("Reset limits in case database values are
 ///    invalid"): `set_dial_highlimit`/`set_dial_lowlimit` run last and
 ///    re-derive the raw pair with the SIGNED resolution — under MRES < 0
 ///    the |MRES|-seeded raw value from step 1 flips sign here (C verbatim).
@@ -1745,7 +1796,7 @@ pub(crate) fn motor_sync_limits_at_init(rec: &mut MotorRecord) {
             }
             rec.limits.rhlm = rec.limits.dllm / abs_mres;
         }
-        // Step 2 (C 716-718 via set_dial_high/lowlimit 4243/4294):
+        // Step 2 (C 717-718 via set_dial_high/lowlimit 4243/4294):
         // signed re-derivation, crossed under MRES < 0.
         let (raw_high, raw_low) = (rec.limits.dhlm / mres, rec.limits.dllm / mres);
         if mres < 0.0 {
@@ -1863,28 +1914,42 @@ pub(crate) fn metadata_override(
     }
 }
 
+/// The bound C's `get_units` puts on every answer: `siz = dbr_units_size - 1`
+/// (`motorRecord.cc:3159`), and `dbr_units_size` is `sizeof(struct dbr_units)`
+/// = `DB_UNITS_SIZE` = 16 (`dbAccessDefs.h:108`, `:164`), so 15 bytes plus the
+/// NUL C writes at `s[siz]`.
+const MOTOR_UNITS_MAX: usize = 15;
+
 /// C get_units (motorRecord.cc:3156-3208): velocity-class fields
-/// decorate EGU; acceleration/speed fields carry fixed unit strings.
-/// Default (`None`) is the bare EGU, which the record-level metadata
-/// already serves. Byte-level concat — EGU is not guaranteed UTF-8.
+/// decorate EGU; acceleration/speed fields carry fixed unit strings; the
+/// default arm is the bare EGU. Byte-level concat — EGU is not guaranteed
+/// UTF-8.
+///
+/// C truncates ONCE, after the switch and on every arm alike
+/// (`s[siz] = '\0'`, :3205 — `:3204` is the switch's closing brace), so the
+/// bound belongs to the funnel and not to
+/// the decorating arms: `EGU` is a `size(16)` field, so an EGU of 15 bytes
+/// plus `/sec` overflows by four and the default arm can overflow too as
+/// soon as anything writes an over-long EGU.
 fn units_for(rec: &MotorRecord, field: &str) -> Option<epics_base_rs::types::PvString> {
     use epics_base_rs::types::PvString;
-    let decorate = |suffix: &[u8]| PvString::from_bytes([rec.disp.egu.as_bytes(), suffix].concat());
-    match field {
-        "VELO" | "VMAX" | "BVEL" | "VBAS" | "JVEL" | "HVEL" => Some(decorate(b"/sec")),
-        "JAR" => Some(decorate(b"/s/s")),
-        "ACCL" | "BACC" => Some(PvString::from_bytes(&b"sec"[..])),
-        "S" | "SBAS" | "SBAK" => Some(PvString::from_bytes(&b"rev/sec"[..])),
-        "SREV" => Some(PvString::from_bytes(&b"steps/rev"[..])),
-        "UREV" => Some(decorate(b"/rev")),
-        _ => None,
-    }
+    let decorate = |suffix: &[u8]| [rec.disp.egu.as_bytes(), suffix].concat();
+    let s: Vec<u8> = match field {
+        "VELO" | "VMAX" | "BVEL" | "VBAS" | "JVEL" | "HVEL" => decorate(b"/sec"),
+        "JAR" => decorate(b"/s/s"),
+        "ACCL" | "BACC" => b"sec".to_vec(),
+        "S" | "SBAS" | "SBAK" => b"rev/sec".to_vec(),
+        "SREV" => b"steps/rev".to_vec(),
+        "UREV" => decorate(b"/rev"),
+        _ => rec.disp.egu.as_bytes().to_vec(),
+    };
+    Some(PvString::from_bytes(&s[..s.len().min(MOTOR_UNITS_MAX)]))
 }
 
 /// C get_precision (motorRecord.cc:3313-3337): raw readbacks and the
 /// encoder/motor pulse counts are integers (0), VERS is stamped with
 /// 2 digits; every other field seeds PREC and runs recGblGetPrec
-/// (recGbl.c:119-141) — integer DBF types force 0, float/double clamp
+/// (recGbl.c:119-144) — integer DBF types force 0, float/double clamp
 /// an out-of-range PREC to 15, string fields keep PREC untouched
 /// (`None` keeps the record-level PREC).
 fn precision_for(rec: &MotorRecord, field: &str) -> Option<i16> {
@@ -1924,7 +1989,7 @@ fn precision_for(rec: &MotorRecord, field: &str) -> Option<i16> {
 /// `getMaxRangeValues` table, shared by every record type in C. This used
 /// to be a second copy of those constants here, and it had drifted —
 /// `DBF_CHAR` was mapped to 255/0, where C's `CHAR_MAX`/`CHAR_MIN`
-/// (recGbl.c:377-380) give 127/-128. Delegate to the one owner
+/// (recGbl.c:376-379) give 127/-128. Delegate to the one owner
 /// ([`rec_gbl_get_graphic_double`]) so the constants cannot drift again.
 fn limits_for(rec: &MotorRecord, field: &str) -> Option<(f64, f64)> {
     match field {
@@ -1946,15 +2011,12 @@ fn limits_for(rec: &MotorRecord, field: &str) -> Option<(f64, f64)> {
         "VELO" => Some((rec.vel.vmax, rec.vel.vbas)),
         _ => {
             let desc = MOTOR_FIELDS.iter().find(|f| f.name == field)?;
-            // Same two discriminators C keys on, and the same ones
-            // `PropertySupport::narrowed_to_field` takes: a DBF_MENU field is
-            // `DbFieldType::Enum` in this port but has no case in C's switch,
-            // and a runtime-typed field is DBF_NOACCESS in the .dbd, which C
-            // reads statically (recGbl.c:151/:169) and also has no case.
-            rec_gbl_get_graphic_double(
-                (!desc.runtime_typed).then_some(desc.dbf_type),
-                desc.menu.is_some(),
-            )
+            // C's own discriminator: `pdbFldDes->field_type`, the `.dbd`
+            // declaration (recGbl.c:151/:169). It already says both things
+            // this used to spell out — DBF_MENU/DBF_DEVICE have no case in
+            // the switch, and a runtime-typed field declares DBF_NOACCESS,
+            // which C never sees retyped here.
+            rec_gbl_get_graphic_double(desc.declared_dbf)
         }
     }
 }

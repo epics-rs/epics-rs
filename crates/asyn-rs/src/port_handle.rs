@@ -3,6 +3,14 @@
 //! [`PortHandle`] is a lightweight, cloneable handle that sends requests to the
 //! actor via an mpsc channel and receives replies via oneshot channels.
 
+// RTEMS-EXEC-MODEL-ALLOW(8): checked, not waived — all 8 ran and passed
+// on the exec backend (measured on this tree:
+// `EPICS_RS_BUILD_EXEC_BACKEND=thread cargo nextest run -p asyn-rs
+// --all-features`, 1081/1081). asyn-rs became a census subject when its
+// `build.rs` began deriving `tokio_backend`; nothing here builds a CA
+// server, and the reactor these obtain comes from `#[tokio::test]`
+// itself, which the backend does not remove.
+
 use crate::param::ParamValue;
 use std::future::Future;
 use std::pin::pin;
@@ -167,8 +175,8 @@ impl AsyncCompletionHandle {
     ///
     /// `timeout` bounds the wait, not the request: a request the actor has
     /// already begun keeps running, exactly as C's `queueTimeoutCallback`
-    /// (`asynManager.c:649-703`) leaves a dequeued request alone — it returns
-    /// at once on `!puserPvt->isQueued` (`:657-663`). What expiry
+    /// (`asynManager.c:647-701`) leaves a dequeued request alone — it returns
+    /// at once on `!puserPvt->isQueued` (`:655-661`). What expiry
     /// buys the caller is the ability to report — `WriteCompletion::wait`
     /// (`epics-base-rs/src/server/device_support.rs`) turns the `asynTimeout`
     /// into the record's completion, where an unbounded park left the record
@@ -232,7 +240,7 @@ pub struct PortHandle {
     /// [`crate::port::PortDriver::capabilities`] declaration, recorded when the
     /// port is registered. C's asynManager keeps the same thing as the list of
     /// `registerInterface` calls the driver made, and clients ask for it with
-    /// `findInterface` (asynManager.c:1352-1372); asynRecord uses it to fill
+    /// `findInterface` (asynManager.c:1468-1512); asynRecord uses it to fill
     /// OCTETIV / I32IV / UI32IV / F64IV / OPTIONIV / GPIBIV
     /// (asynRecord.c:1177-1240). Registration-time, not a runtime query: a
     /// driver cannot gain or lose an interface after `registerInterface`.
@@ -269,7 +277,7 @@ impl PortHandle {
     }
 
     /// Does the port implement this interface? The port's `findInterface`
-    /// (asynManager.c:1352-1372).
+    /// (asynManager.c:1468-1512).
     pub fn has_interface(&self, iface: InterfaceType) -> bool {
         self.interfaces
             .iter()
@@ -373,9 +381,9 @@ impl PortHandle {
     fn blocking<T>(&self, what: &str, fut: impl Future<Output = AsynResult<T>>) -> AsynResult<T> {
         guard_reentrant(self.actor, &self.port_name, what)?;
         // `fut` is `submit_cancellable`, which already resolves at the
-        // request's own `AsynUser::queue_timeout` — `await_reply`'s timer
-        // where a reactor exists, the actor's dequeue re-check where it does
-        // not. That satisfies the precondition; see the function's doc.
+        // request's own `AsynUser::queue_timeout` — `await_reply` arms that
+        // deadline on this thread like any other. That satisfies the
+        // precondition; see the function's doc.
         block_on_prebounded_reply(fut)
     }
 
@@ -391,8 +399,8 @@ impl PortHandle {
     ///
     /// The request goes through [`Self::submit_cancellable`], so an
     /// [`AsynUser::queue_timeout`] deadline is enforced on every path: the
-    /// reply wait wakes at the deadline where a timer service exists, and the
-    /// actor refuses to run a request that waited past it
+    /// reply wait wakes at the deadline, and the actor refuses to run a
+    /// request that waited past it
     /// (`PortActor::process_one`), replying [`AsynError::QueueTimeout`].
     pub fn submit_blocking(&self, op: RequestOp, user: AsynUser) -> AsynResult<RequestResult> {
         self.blocking(
@@ -414,7 +422,7 @@ impl PortHandle {
     ///
     /// C parity: `asynManager::queueRequest` (`asynManager.c:1514`) enqueues
     /// the request on the port thread and the caller's callback runs later;
-    /// `asynManager::cancelRequest` (`asynManager.c:1632`) removes a request
+    /// `asynManager::cancelRequest` (`asynManager.c:1630`) removes a request
     /// that is still queued. A caller that may need to abort the request
     /// (asynRecord `AQR`, `asynRecord.c:393-408`) keeps the token and calls
     /// [`CancelToken::cancel`]; the actor drops a still-queued message at its
@@ -444,15 +452,16 @@ impl PortHandle {
     /// *user's* `timeoutUser`, so the deadline is only worth waking for where the
     /// caller has something to do at it — asynRecord's `pact` process request,
     /// which reports "process queueRequest timeout" and forces the record's
-    /// completion 10 s after queueing, whatever the port is doing (:919-926).
+    /// completion 10 s after queueing, whatever the port is doing (:919-927).
     ///
     /// Whether the deadline is honoured is not this timer's call: it hands the
     /// question to [`CancelToken::time_out_if_queued`], C's `if(!isQueued)`
     /// guard. A request the actor has already begun is *never* aborted — the
     /// wait simply resumes — so this timer cannot cut a transfer short, only a
-    /// wait. The actor re-checks the same deadline at dequeue, which is what
-    /// covers the blocking submit paths (a thread parked in `blocking_recv` has
-    /// no earlier action to take anyway: it cannot report until it returns).
+    /// wait. The actor re-checks the same deadline at dequeue as well, which is
+    /// C's own belt-and-braces (`asynManager.c:906` cancels the timer as the
+    /// port thread dequeues) rather than a fallback for a caller this timer
+    /// cannot serve — there is no such caller.
     async fn await_reply(
         &self,
         mut reply_rx: oneshot::Receiver<AsynResult<RequestResult>>,
@@ -463,15 +472,16 @@ impl PortHandle {
             status: AsynStatus::Error,
             message: "actor dropped reply channel".into(),
         };
-        // The caller-side timer needs a Tokio reactor to fire. A blocking
-        // caller polled by `park_on` (plain thread, no runtime) has none —
-        // and nothing to do at the deadline anyway: it cannot report until
-        // it returns. There the deadline is enforced solely by the actor's
-        // dequeue re-check (`PortActor::process_one`), matching C, where a
-        // blocked thread never runs `queueTimeoutCallback` work of its own.
-        let timer_available = tokio::runtime::Handle::try_current().is_ok();
-        if let Some(limit) = queue_timeout.filter(|_| timer_available) {
-            match tokio::time::timeout(limit, &mut reply_rx).await {
+        // No gate on whether a timer exists here: the seam's `timeout` arms
+        // one the calling thread can reach, so `queue_timeout` means the same
+        // thing on every path. It did not always — this used to ask
+        // `Handle::try_current()`, which answers "is tokio the timer here" and
+        // so dropped the deadline for every caller on `exec_backend` (no tokio
+        // runtime exists in that process at all) and for plain-thread
+        // `submit_blocking` on the hosted one. C arms the timer in
+        // `queueRequest` regardless of what the caller is, and so does this.
+        if let Some(limit) = queue_timeout {
+            match epics_libcom_rs::runtime::task::timeout(limit, &mut reply_rx).await {
                 Ok(reply) => return reply.map_err(|_| dropped())?,
                 Err(_elapsed) => {
                     if cancel.time_out_if_queued() {
@@ -962,7 +972,7 @@ impl PortHandle {
     }
 
     /// Read back the driver's input EOS bytes — C `pasynOctet->getInputEos`,
-    /// the read half asynRecord's `getEos` (asynRecord.c:1985-2026) runs after
+    /// the read half asynRecord's `getEos` (asynRecord.c:1987-2025) runs after
     /// every IEOS/OEOS put.
     pub fn get_input_eos_blocking(&self, user: AsynUser) -> AsynResult<Vec<u8>> {
         let result = self.submit_blocking(RequestOp::GetInputEos, user)?;
@@ -1054,7 +1064,7 @@ impl PortHandle {
     /// Enable or disable auto-connect for ONE device of a multi-device port —
     /// the addressed half of [`Self::set_auto_connect_blocking`], symmetric
     /// with [`Self::enable_addr_blocking`]. C picks between the two inside
-    /// `pasynManager->autoConnect` via `findDpCommon` (asynManager.c:496-509).
+    /// `pasynManager->autoConnect` via `findDpCommon` (asynManager.c:536-544).
     pub fn set_auto_connect_addr_blocking(&self, addr: i32, yes: bool) -> AsynResult<()> {
         let user = AsynUser::new(0).with_addr(addr);
         self.submit_blocking(RequestOp::SetAutoConnectAddr { yes }, user)?;
@@ -1230,7 +1240,7 @@ impl PortHandle {
     // that vtable — ask [`Self::has_interface`] first (the `findInterface`), then
     // call. Each takes the caller's `AsynUser` because in C the caller's
     // `pasynUser` is what the command runs under: its `addr` selects the GPIB
-    // device (`vxiAddressedCmd` reads it with `getAddr`, drvVxi11.c:1371) and its
+    // device (`vxiAddressedCmd` reads it with `getAddr`, drvVxi11.c:1372) and its
     // `timeout` bounds the bus traffic.
 
     /// C `pasynGpib->universalCmd` — send one universal command byte
@@ -1673,6 +1683,7 @@ mod tests {
         std::thread::sleep(Duration::from_millis(50));
 
         // Queued behind it, with a deadline it cannot possibly meet.
+        let started = std::time::Instant::now();
         let err = handle
             .submit_blocking(
                 RequestOp::Int32Read,
@@ -1680,6 +1691,17 @@ mod tests {
             )
             .expect_err("the queue wait outlived the deadline");
         assert!(err.is_queue_timeout(), "got {err:?}");
+        // *When* it learns is the point, and it is the same answer on both
+        // backends and on a thread with no runtime at all: the seam's
+        // `timeout` arms a timer this thread can reach. It used to be the
+        // 300 ms jam here and 30 ms of a 600 ms jam in the async test, which
+        // is the actor's dequeue re-check reporting instead of the deadline.
+        let waited = started.elapsed();
+        assert!(
+            waited < Duration::from_millis(150),
+            "the caller wakes at its own deadline, not when the jam clears \
+             (waited {waited:?})"
+        );
 
         jam.join().unwrap();
         assert_eq!(
@@ -1737,7 +1759,7 @@ mod tests {
     /// timer queue, so the caller learns of the timeout **at the deadline** — not
     /// when the port next comes free. That is what lets
     /// `queueTimeoutCallbackProcess` complete a record stuck at `pact = TRUE` 10 s
-    /// after queueing (asynRecord.c:919-926), whatever the port is doing.
+    /// after queueing (asynRecord.c:919-927), whatever the port is doing.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn the_async_waiter_reports_the_queue_timeout_at_the_deadline() {
         let (handle, reads) = slow_port(Duration::from_millis(600));
@@ -1772,6 +1794,44 @@ mod tests {
             1,
             "and the timed-out request is still never executed"
         );
+    }
+
+    /// The same claim, asked of whichever backend this build compiled rather
+    /// than of tokio. The test above pins itself to a tokio runtime, so it
+    /// could not see that `await_reply` armed its deadline only when tokio was
+    /// the timer: on `exec_backend` — where no tokio runtime exists anywhere in
+    /// the process — every caller's deadline was dropped and the timeout was
+    /// reported at 550 ms of a 30 ms deadline, when the port came free.
+    #[epics_macros_rs::epics_test]
+    async fn the_deadline_is_armed_from_the_backend_s_own_timer() {
+        let (handle, reads) = slow_port(Duration::from_millis(600));
+
+        let jammer = handle.clone();
+        let jam = std::thread::spawn(move || {
+            jammer
+                .submit_blocking(RequestOp::Int32Read, AsynUser::new(0))
+                .unwrap()
+        });
+        epics_libcom_rs::runtime::task::sleep(Duration::from_millis(50)).await;
+
+        let started = std::time::Instant::now();
+        let err = handle
+            .submit_async(
+                RequestOp::Int32Read,
+                AsynUser::new(0).with_queue_timeout(Duration::from_millis(30)),
+            )
+            .await
+            .expect_err("the queue wait outlived the deadline");
+        assert!(err.is_queue_timeout(), "got {err:?}");
+        assert!(
+            started.elapsed() < Duration::from_millis(400),
+            "the waiter woke at its own deadline, not when the port came free \
+             (waited {:?})",
+            started.elapsed()
+        );
+
+        jam.join().unwrap();
+        assert_eq!(reads.load(std::sync::atomic::Ordering::SeqCst), 1);
     }
 
     /// Every parameter type the store supports must survive the actor path.

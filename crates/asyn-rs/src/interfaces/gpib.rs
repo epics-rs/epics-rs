@@ -17,10 +17,10 @@
 //! through [`crate::port_handle::PortHandle`] — the port actor is the
 //! `pasynGpib` vtable.
 //!
-//! This module owns the *encoding*: the IEEE-488 command bytes and the exact
-//! bus frames C's asynRecord builds for its UCMD / ACMD menus
-//! (asynRecord.c:1652-1749), so the record only chooses a command and the
-//! driver only writes bytes.
+//! This module owns the *encoding*: the command bytes and the exact bus frames
+//! C's asynRecord builds for UCMD / ACMD — `gpibUniversalCmd`'s `ucmd` switch
+//! (asynRecord.c:1652-1671) and the `acmd[]` frame `gpibAddressedCmd` assembles
+//! (:1698-1747) — so the record only chooses a command and the driver writes bytes.
 
 // --- Addressed commands (asynGpibDriver.h:19-22) ---
 
@@ -246,17 +246,19 @@ pub fn int32_write_not_supported() -> crate::error::AsynError {
 
 /// The same default for a READ.
 ///
-/// DEVIATION from C, deliberate — CBUG-B10. C's `readDefault`
-/// (asynInt32Base.c:70-86) sets `errorMessage` to **"write is not supported"** —
-/// a copy-paste from the `writeDefault` directly above it — while the
-/// `asynPrint` trace two lines down correctly says "read is not supported". The
-/// two adjacent lines contradict each other, which is what makes it a slip
-/// rather than a convention; the same shape appears in all six `asyn*Base.c`
-/// files (asynEnumBase.c:79, asynFloat64Base.c:78, asynGenericPointerBase.c:77,
-/// asynInt32Base.c:82, asynInt64Base.c:82, asynUInt32DigitalBase.c:91). The
-/// string lands in asynRecord's ERRS field, so an operator debugging a failed
-/// read is told the WRITE is unsupported. It is purely diagnostic — no client
-/// parses it, so this is not a wire contract — but it actively misdirects.
+/// **CBUG-B10 — now matches upstream.** At the `R4-45-19-ge2a281e2` pin this
+/// catalogue was read against, C's `readDefault` (asynInt32Base.c:70-86) set
+/// `errorMessage` to **"write is not supported"** — a copy-paste from the
+/// `writeDefault` directly above it — while the `asynPrint` trace two lines
+/// down correctly said "read is not supported", and the same shape stood in
+/// all six `asyn*Base.c` files. asyn **#237** merged, and at the worktree
+/// revision `R4-45-74-g731d616e` every one of those six lines reads "read is
+/// not supported" (asynEnumBase.c:79, asynFloat64Base.c:78,
+/// asynGenericPointerBase.c:77, asynInt32Base.c:82, asynInt64Base.c:82,
+/// asynUInt32DigitalBase.c:91 — the cited lines are now the FIXED lines). So
+/// this is no longer a deviation: the port said "read" first and C has since
+/// agreed. The string lands in asynRecord's ERRS field and is purely
+/// diagnostic — no client parses it, so it was never a wire contract.
 ///
 /// Two functions, not one with a flag: the direction is fixed at the call site,
 /// so a read path cannot reach for the write text.

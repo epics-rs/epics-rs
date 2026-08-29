@@ -28,7 +28,7 @@
 //!
 //! * `devWfSoft.c:39-51` calls `dbLoadLinkArray` unconditionally and sets
 //!   `nord = 0` when it fails — and it fails for anything but a constant
-//!   (`dbLink.c:255-264`: no `loadArray` lset ⇒ `S_db_noLSET`). The seed never
+//!   (`dbLink.c:253-262`: no `loadArray` lset ⇒ `S_db_noLSET`). The seed never
 //!   survives.
 //! * `devAaiSoft.c:55` loads only `if (dbLinkIsConstant(plink))` and leaves the
 //!   record's state alone otherwise. The seed survives.

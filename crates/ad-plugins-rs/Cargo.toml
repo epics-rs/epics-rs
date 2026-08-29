@@ -30,6 +30,10 @@ epics-pva-rs = { workspace = true, optional = true }
 epics-bridge-rs = { workspace = true, features = ["qsrv"], optional = true }
 
 [dev-dependencies]
+# Dev-only and `path`-only, so `cargo package` drops it from the uploaded
+# manifest: the source guards in this crate share one production-slice rule.
+source-guard = { path = "../source-guard" }
+tempfile = "3"
 # Independent TIFF decoder, used only to check the bytes our hand-written
 # encoder produces (src/file_tiff.rs). Not used by the writer itself.
 tiff = "0.9"

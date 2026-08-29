@@ -1,5 +1,0 @@
-# The RTEMS serial console emits CR LF. This transcript is evidence quoted by
-# checksum in ../measurement-c-thread-priority-on-rtems-6.md, so it must be stored
-# byte-for-byte as the target printed it; the repo-wide `* text=auto eol=lf` would
-# strip every CR and break that checksum.
-*.log -text

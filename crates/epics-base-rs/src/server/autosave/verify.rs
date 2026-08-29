@@ -2,8 +2,8 @@ use std::path::Path;
 
 use crate::server::database::PvDatabase;
 
-use super::error::{AutosaveError, AutosaveResult};
-use super::save_file::{self, MalformedLine, SaveEntry, read_save_file};
+use super::error::AutosaveResult;
+use super::save_file::{self, MalformedLine, SaveEntry, read_partial_save_file};
 
 /// Result of comparing one PV.
 #[derive(Debug, Clone)]
@@ -41,16 +41,23 @@ pub struct VerifyEntry {
 pub struct VerifyReport {
     pub entries: Vec<VerifyEntry>,
     pub malformed: Vec<MalformedLine>,
+    /// The file did not end in `<END>`, so what it holds is whatever had
+    /// been written when it was truncated. The comparison below still
+    /// stands for the entries that are there.
+    pub truncated: bool,
 }
 
 /// Compare saved values against live PV values.
 ///
-/// A corrupt/truncated save file (no `<END>` marker) is surfaced as
-/// [`AutosaveError::CorruptSaveFile`] — NOT collapsed into an empty
-/// entry list. Collapsing it would make `format_verify_report` print
-/// `0 match, 0 mismatch` and tell an operator everything is fine,
-/// hiding exactly the corruption `asVerify` exists to catch.
-/// Mirrors `restore_from_entries`'s handling of the same `None`.
+/// A truncated save file (no `<END>` marker) is reported through
+/// [`VerifyReport::truncated`] and still compared, which is what C's
+/// `do_asVerify_fp` does (`verify.c` at `R6-0-20-g186f467`): it warns
+/// that the marker is missing and then verifies every PV line in the
+/// file, because the operator looking at a corrupt save wants to know
+/// which PVs it holds and whether they match. What must never happen is
+/// the third thing — the truncation vanishing into an empty entry list,
+/// which had `format_verify_report` print `0 match, 0 mismatch` and tell
+/// the operator everything was fine.
 ///
 /// Every entry the file declares produces exactly one [`VerifyEntry`],
 /// including the ones written while the PV was unreachable. Skipping
@@ -62,17 +69,12 @@ pub struct VerifyReport {
 /// (`RestoreResult::disconnected_skipped`); verify was the only consumer
 /// that dropped the information.
 pub async fn verify(db: &PvDatabase, save_file_path: &Path) -> AutosaveResult<VerifyReport> {
-    let contents =
-        read_save_file(save_file_path)
-            .await?
-            .ok_or_else(|| AutosaveError::CorruptSaveFile {
-                path: save_file_path.display().to_string(),
-                message: "missing <END> marker (truncated or corrupt save file)".to_string(),
-            })?;
+    let read = read_partial_save_file(save_file_path).await?;
 
     // One push per entry, unconditionally: the classification decides
     // which bucket, never whether there is one.
-    let entries = contents
+    let entries = read
+        .contents
         .entries
         .iter()
         .map(|entry| {
@@ -88,7 +90,8 @@ pub async fn verify(db: &PvDatabase, save_file_path: &Path) -> AutosaveResult<Ve
 
     Ok(VerifyReport {
         entries,
-        malformed: contents.malformed,
+        malformed: read.contents.malformed,
+        truncated: !read.complete,
     })
 }
 
@@ -128,6 +131,12 @@ fn classify(db: &PvDatabase, entry: &SaveEntry) -> (MatchResult, Option<String>)
 /// report covers everything the file contained.
 pub fn format_verify_report(report: &VerifyReport) -> String {
     let mut out = String::new();
+    if report.truncated {
+        // First line and repeated in the summary: a truncation an
+        // operator scrolls past is the same false all-clear as one that
+        // was never reported.
+        out.push_str("asVerify: Can't find <END> marker.  File may be bad.\n");
+    }
     let mut match_count = 0;
     let mut mismatch_count = 0;
     let mut not_found_count = 0;
@@ -176,13 +185,18 @@ pub fn format_verify_report(report: &VerifyReport) -> String {
 
     out.push_str(&format!(
         "\nSummary: {} match, {} mismatch, {} not found, {} parse errors, \
-         {} not checked (disconnected at save), {} malformed lines\n",
+         {} not checked (disconnected at save), {} malformed lines{}\n",
         match_count,
         mismatch_count,
         not_found_count,
         parse_error_count,
         disconnected_count,
-        report.malformed.len()
+        report.malformed.len(),
+        if report.truncated {
+            " -- INCOMPLETE FILE, no <END> marker"
+        } else {
+            ""
+        }
     ));
 
     out
@@ -191,19 +205,19 @@ pub fn format_verify_report(report: &VerifyReport) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::server::autosave::error::AutosaveError;
     use crate::server::database::PvDatabase;
     use crate::server::records::ao::AoRecord;
 
-    /// H4 regression: `verify` against a corrupt save file (no
-    /// `<END>` marker) must surface an error, NOT collapse the file
-    /// into zero entries and report "all match". Pre-fix,
-    /// `read_save_file(...).unwrap_or_default()` turned a truncated
-    /// file into an empty `Vec` and the report claimed everything
-    /// was fine — hiding exactly the corruption `asVerify` exists to
-    /// catch.
+    /// H4 regression, and the C shape of it: `verify` against a
+    /// truncated save file (no `<END>` marker) must report the
+    /// truncation AND compare the entries the file does hold. The
+    /// original defect was `read_save_file(...).unwrap_or_default()`
+    /// collapsing the file into zero entries so the report claimed
+    /// everything was fine; refusing the file outright hid the same
+    /// thing the other way, since C's `do_asVerify_fp` warns and then
+    /// verifies every line.
     #[epics_macros_rs::epics_test]
-    async fn verify_on_corrupt_save_file_is_error() {
+    async fn verify_on_corrupt_save_file_reports_it_and_still_compares() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("corrupt.sav");
         // A file with content but NO `<END>` marker — truncated save.
@@ -216,11 +230,23 @@ mod tests {
             .await
             .unwrap();
 
-        let result = verify(&db, &path).await;
-        match result {
-            Err(AutosaveError::CorruptSaveFile { .. }) => {}
-            other => panic!("expected CorruptSaveFile error, got {other:?}"),
-        }
+        let report = verify(&db, &path)
+            .await
+            .expect("a truncated file is verified, not refused");
+        assert!(report.truncated, "the missing marker must be reported");
+        assert_eq!(report.entries.len(), 2, "both lines must be compared");
+        assert!(matches!(report.entries[0].result, MatchResult::Match));
+        assert!(matches!(report.entries[1].result, MatchResult::PvNotFound));
+
+        let text = format_verify_report(&report);
+        assert!(
+            text.contains("Can't find <END> marker"),
+            "the report must open with the truncation; got: {text:?}"
+        );
+        assert!(
+            text.contains("INCOMPLETE FILE"),
+            "the summary line must carry it too; got: {text:?}"
+        );
     }
 
     /// H4: a well-formed save file (with `<END>`) still verifies

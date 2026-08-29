@@ -1,19 +1,19 @@
 //! A Passive CP holder of an external link goes LINK/INVALID when the
 //! link drops — C `dbCa.c`'s disconnect path, end to end.
 //!
-//! C reference. `connectionCallback` (`dbCa.c:848-873`) clears
+//! C reference. `connectionCallback` (`dbCa.c:804-829`) clears
 //! `pca->isConnected` and, for a `pvlOptCP` link (or a `pvlOptCPP` link
 //! whose holder has `scan == 0`), sets `link_action |= CA_DBPROCESS`. The
-//! `dbCaTask` worker then runs `db_process(prec)` (`dbCa.c:1295`). That
+//! `dbCaTask` worker then runs `db_process(prec)` (`dbCa.c:1255`). That
 //! process calls `dbGetLink` → `dbCaGetLink`, which returns `-1` with
 //! `pca->sevr = INVALID_ALARM; pca->stat = LINK_ALARM` because
-//! `!pca->isConnected` (`dbCa.c:459-463`), and the record commits
+//! `!pca->isConnected` (`dbCa.c:430-434`), and the record commits
 //! LINK/INVALID.
 //!
 //! The half this file pins is the one a unit test on the resolver cannot
 //! see: that a dispatch on a link which has *stopped serving a value*
 //! actually lands the alarm on the holder. Measured missing on target —
-//! stage C6 criterion 4, `doc/calink-rtems-design.md` §11.4: the guest's
+//! stage C6 criterion 4: the guest's
 //! downstream records held their last good value with `SEVR=0 STAT=0` for
 //! the whole 65 s upstream outage.
 

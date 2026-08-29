@@ -184,7 +184,7 @@ async fn simm_transition_swaps_scan_with_sscn() {
     {
         let rec = db.get_record("SWAP").unwrap();
         let inst = rec.read();
-        assert_eq!(inst.common.scan, ScanType::Sec1);
+        assert_eq!(inst.common.scan, ScanType::SEC1);
         assert_eq!(
             inst.get_common_field("SSCN"),
             Some(EpicsValue::Enum(SCAN_PASSIVE))
@@ -216,7 +216,7 @@ async fn unset_sscn_leaves_scan_alone_on_a_simm_transition() {
 
     let rec = db.get_record("NOSSCN").unwrap();
     let inst = rec.read();
-    assert_eq!(inst.common.scan, ScanType::Sec1);
+    assert_eq!(inst.common.scan, ScanType::SEC1);
     assert_eq!(
         inst.get_common_field("SSCN"),
         Some(EpicsValue::Enum(65535)),
@@ -252,7 +252,7 @@ async fn busy_has_no_sscn_so_a_simm_transition_never_swaps_its_scan() {
     let inst = rec.read();
     assert_eq!(
         inst.common.scan,
-        ScanType::Sec1,
+        ScanType::SEC1,
         "busy's C support never reaches recGblCheckSimm"
     );
     assert_eq!(
@@ -279,7 +279,7 @@ async fn busy_has_no_sscn_so_a_simm_transition_never_swaps_its_scan() {
 // NOT `recGblSetSevr`. So `recGblResetAlarms` publishes STAT=LINK_ALARM with
 // SEVR still NO_ALARM — an alarm status with no severity. `busy` and `swait`
 // read SIML with a plain `dbGetLink` (busyRecord.c:399, swaitRecord.c:402),
-// whose failure path DOES go through `setLinkAlarm` (dbLink.c:319-323) →
+// whose failure path DOES go through `setLinkAlarm` (dbLink.c:317-321) →
 // `recGblSetSevrMsg(LINK_ALARM, INVALID_ALARM)`, a full severity raise.
 //
 // The port raised neither.
@@ -349,7 +349,7 @@ async fn busy_failed_siml_read_raises_link_alarm_at_invalid_severity() {
 //
 // A base record reads SIOL with a plain `dbGetLink` (`longinRecord.c:416`,
 // aiRecord, histogramRecord, waveformRecord), whose failure path is
-// `setLinkAlarm` (dbLink.c:322) -> `recGblSetSevrMsg(LINK_ALARM, INVALID_ALARM,
+// `setLinkAlarm` (dbLink.c:320) -> `recGblSetSevrMsg(LINK_ALARM, INVALID_ALARM,
 // "field %s")`. The port raised only SIMM_ALARM, so under the DEFAULT
 // `SIMS = NO_ALARM` a broken simulation link was completely silent.
 //
@@ -364,7 +364,7 @@ async fn busy_failed_siml_read_raises_link_alarm_at_invalid_severity() {
 // longin (SIMM then LINK), SIMS=NO_ALARM:  sevr=3 stat=14 amsg='field SIOL'
 // ```
 //
-// swait reverses the order (`dbGetLink` at :416, `recGblSetSevr` at :420) and so
+// swait reverses the order (`dbGetLink` at :416, `recGblSetSevr` at :421) and so
 // reverses the winner — pinned in `swait_simulation_mode.rs`.
 
 /// The headline: with the DEFAULT `SIMS = NO_ALARM`, a broken SIOL is reported
@@ -457,7 +457,7 @@ async fn failed_siol_read_loses_the_tie_to_simm_alarm_at_sims_invalid() {
 // writes SIMM straight from `dbTryGetLink`, and `dbPut` of a numeric DBR into a
 // DBF_MENU does no menu check — so ANY out-of-menu SIMM lands on this arm.
 //
-// `swait` is the one exception (`swaitRecord.c:407-421` has no `default:`).
+// `swait` is the one exception (`swaitRecord.c:407-422` has no `default:`).
 
 use epics_base_rs::server::records::longout::LongoutRecord;
 
@@ -584,7 +584,7 @@ async fn simm_raw_on_a_menu_simm_record_still_simulates() {
 // W10-E5 — a failed SIML read on `busy` returns BEFORE the output write
 // ---------------------------------------------------------------------------
 //
-// busyRecord.c:388-401 `writeValue`:
+// busyRecord.c:389-417 `writeValue`:
 //
 // ```c
 //     status = dbGetLink(&prec->siml, DBR_USHORT, &prec->simm, 0, 0);

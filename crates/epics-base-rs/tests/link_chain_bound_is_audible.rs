@@ -21,7 +21,7 @@
 //! `eprintln!` that reaches no errlog and no IOC log file.
 //!
 //! The refusal C DOES have shows what a refused cycle must look like
-//! (`dbAccess.c:544-556`):
+//! (`dbAccess.c:543-555`):
 //!
 //! ```c
 //! recGblSetSevrMsg(precord, SCAN_ALARM, INVALID_ALARM, "Async in progress");

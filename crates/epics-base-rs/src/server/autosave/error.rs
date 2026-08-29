@@ -22,6 +22,15 @@ pub enum AutosaveError {
         source: String,
         line: usize,
     },
+    /// A macro whose value resolves back into itself. Distinct from
+    /// [`Self::UndefinedMacro`] because the two faults have different
+    /// causes and different fixes: one name is missing from the
+    /// substitution set, the other is defined in terms of itself.
+    RecursiveMacro {
+        key: String,
+        source: String,
+        line: usize,
+    },
     CorruptSaveFile {
         path: String,
         message: String,
@@ -52,6 +61,9 @@ impl fmt::Display for AutosaveError {
             }
             Self::UndefinedMacro { key, source, line } => {
                 write!(f, "undefined macro '{key}' in {source} at line {line}")
+            }
+            Self::RecursiveMacro { key, source, line } => {
+                write!(f, "recursive macro '{key}' in {source} at line {line}")
             }
             Self::CorruptSaveFile { path, message } => {
                 write!(f, "corrupt save file '{path}': {message}")

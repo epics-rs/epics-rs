@@ -4,6 +4,9 @@
 //! caput to a `SCAN=Passive` motor's VAL (the I/O-Intr-vs-Passive dbPutField
 //! processing gate). These tests pin "a caput to a Passive motor VAL drives the
 //! move: RBV converges on the target and DMOV returns to done".
+// The harness crate is `tokio_backend`-only, so this file is too:
+// `regression_ioc::RegressionIoc` does not exist on the reactor-free backend.
+#![cfg(tokio_backend)]
 
 use std::time::Duration;
 

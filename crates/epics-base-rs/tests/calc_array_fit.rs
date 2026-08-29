@@ -15,7 +15,7 @@
 //! Every expectation below is the output of a driver compiled from
 //! `/home/stevek/work/epics-modules/calc/calcApp/src/{aCalcPerform,aCalcPostfix,calcUtil}.c`.
 
-use epics_base_rs::calc::{ArrayInputs, ArrayStackValue, acalc};
+use epics_base_rs::calc::{ArrayInputs, ArrayStackValue, CalcError, acalc};
 
 /// y = 1 + i + i^2 over 7 points — a quadratic the fit reproduces exactly.
 fn quad7() -> ArrayInputs {
@@ -84,7 +84,7 @@ fn r10_8_fitpoly_fits_the_window_and_zeroes_the_rest() {
 }
 
 /// A scalar operand is not promoted and is not an error: FITPOLY is in C's UNARY
-/// switch, whose scalar branch is `case FITPOLY: ps->d = 0;` (`:1100`). Compiled C:
+/// switch, whose scalar branch is `case FITPOLY: ps->d = 0;` (`:1089`). Compiled C:
 /// `FITPOLY(A)` with A=5 is dresult 0, status 0; `FITPOLY(A)+2` is 2.
 #[test]
 fn r10_8_fitpoly_of_a_scalar_is_zero() {
@@ -100,19 +100,21 @@ fn r10_8_fitpoly_of_a_scalar_is_zero() {
     );
 }
 
-/// Fewer than three points in the window is C's `fitpoly` -1 (`calcUtil.c:270`) with
-/// no linear fallback: the coefficients stay 0, so the curve is all zeros. Compiled C:
-/// `FITPOLY(AA[0,1])` -> aresult all 0 (with status -1 — R10-11's subject).
+/// Fewer than three points in the window is C's `fitpoly` -1 (`calcUtil.c:271`) with
+/// no linear fallback. R10-11 (`b80ef9b3`) settled that status: the engine propagates
+/// it as [`CalcError::FitFailed`], and a non-zero `status` suppresses the result write
+/// entirely (`aCalcPerform.c:1602-1605`), so there is no curve to compare at this
+/// boundary: the engine hands back the status and no array. The zeros a compiled C
+/// driver prints for `aresult` are that driver's untouched output buffer, which is a
+/// record-side observation this test cannot make.
 #[test]
 fn r10_8_fitpoly_under_three_points_yields_no_curve() {
     let mut i = quad7();
-    let got = match acalc("FITPOLY(AA[0,1])", &mut i) {
-        Ok(ArrayStackValue::Array(cell)) => cell.buf().to_vec(),
-        Ok(other) => panic!("expected an Array result, got {other:?}"),
-        // R10-11 will make this the -1 C reports; either way the curve is zeros.
-        Err(_) => return,
-    };
-    assert_eq!(got, vec![0.0; 7], "a failed fit emits no curve, not a line");
+    assert_eq!(
+        acalc("FITPOLY(AA[0,1])", &mut i),
+        Err(CalcError::FitFailed),
+        "a two-point window is C's fitpoly -1, not a silent zero curve"
+    );
 }
 
 /// `FITMPOLY(y, mask)` — two operands, and the mask ADMITS points into the fit.

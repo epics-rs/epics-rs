@@ -2,7 +2,7 @@
 //!
 //! `dbConvert.c` converts a `DBF_DOUBLE` value into an integer field with a
 //! bare C cast — the PUT/GET macros are literally `*pdst = (typeb) *psrc`
-//! (`dbConvert.c:96-113` and the GET twin at `:63-70`), instantiated per
+//! (`dbConvert.c:96-113` and the GET twin at `:63-80`), instantiated per
 //! destination width:
 //!
 //! ```c
@@ -33,13 +33,12 @@
 //! trade agreement-with-ARM for agreement-with-x86 while deliberately adopting
 //! the undefined value.
 //!
-//! Per `doc/strategy-2026-07-13.md` §2 — *C's bugs are not the contract; clean
-//! is the goal* — the port **saturates**: an out-of-range value clamps to the
-//! destination's range and NaN converts to 0. That is Rust's native `as`, and
-//! it is byte-identical to a compiled C IOC on aarch64. This is a Tier 2
-//! (semantics) decision, signed off 2026-07-14; Tier 1 is untouched, because a
-//! `DBF_LONG` field carries 32 bits on the wire regardless of which 32 bits we
-//! chose. Catalogued as CBUG-E2 in `doc/upstream-c-bugs.md`.
+//! *C's bugs are not the contract; clean is the goal* — the port
+//! **saturates**: an out-of-range value clamps to the destination's range and
+//! NaN converts to 0. That is Rust's native `as`, and it is byte-identical to
+//! a compiled C IOC on aarch64. This is a Tier 2 (semantics) decision, signed
+//! off 2026-07-14; Tier 1 is untouched, because a `DBF_LONG` field carries 32
+//! bits on the wire regardless of which 32 bits we chose.
 //!
 //! No alarm is raised: `dbConvert`'s routines run on the put path, outside the
 //! record's own process cycle, so an alarm raised here would be erased by the

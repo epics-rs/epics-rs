@@ -107,7 +107,7 @@ epics-rs = { version = "0.8", features = ["std"] }
 
 ```rust
 use epics_base_rs::server::ioc_app::IocApplication;
-use epics_ca_rs::server::run_ca_ioc;
+use epics_ca_rs::server::run_ca_ioc_app;
 use std_rs::std_record_factories;
 
 #[epics_base_rs::epics_main]
@@ -119,9 +119,9 @@ async fn main() -> epics_base_rs::error::CaResult<()> {
         app = app.register_record_type(name, factory);
     }
 
-    app.db_file("db/sync_pid_control.db", &macros)?
-       .run(run_ca_ioc)
-       .await
+    // `run_ca_ioc_app` runs C's `rsrvRegistrar` first, so `casr` and the
+    // `dbsr` server layer exist before `iocInit` rather than after it.
+    run_ca_ioc_app(app.db_file("db/sync_pid_control.db", &macros)?).await
 }
 ```
 

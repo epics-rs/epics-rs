@@ -11,7 +11,8 @@
 //! the target's own selection for no reason.
 #![cfg(feature = "qsrv-core")]
 
-// RTEMS-EXEC-MODEL-ALLOW(34): checked - these run and pass in the feature-ON suite.
+// RTEMS-EXEC-MODEL-ALLOW(34): checked - these run and pass in the exec-backend
+// suite.
 
 use std::sync::Arc;
 
@@ -27,7 +28,7 @@ use epics_pva_rs::pvdata::{PvField, PvStructure, ScalarValue};
 
 // members need `+putorder` to be writable. pvxs's
 // `MappingInfo::putOrder` default is `i64::MIN` → silently
-// not-putable (fieldconfig.h:37 / groupsource.cpp:503). The
+// not-putable (fieldconfig.h:37 / groupsource.cpp:555). The
 // PUT tests below explicitly opt members in.
 const GROUP_JSON: &str = r#"{
     "TEST:grp": {
@@ -70,7 +71,7 @@ const GROUP_JSON_NAMED_TRIGGER: &str = r#"{
 
 // An *all-const* (channel-less) group: every member is `+type:const`, so
 // no member has a backing DB channel and `GroupMonitor::start()` spawns
-// zero member tasks. pvxs `groupsource.cpp:240-300` posts the single
+// zero member tasks. pvxs `groupsource.cpp:241-298` posts the single
 // initial value and then leaves the subscription OPEN until the client
 // cancels ("maybe post initial here in pathological case with no +channel
 // (eg. all const)").
@@ -206,7 +207,7 @@ async fn group_nonatomic_put_updates_all_members() {
 
 /// a PUT that supplies a member field which is not putable
 /// (no `+putorder`) writes nothing and must return a "No fields changed"
-/// error, matching pvxs `groupsource.cpp:605-608`. An empty PUT (no
+/// error, matching pvxs `groupsource.cpp:656-659`. An empty PUT (no
 /// member field supplied) stays a silent no-op.
 #[tokio::test]
 async fn br_r60_put_with_no_writable_field_errors() {
@@ -242,7 +243,7 @@ async fn br_r60_put_with_no_writable_field_errors() {
 
 /// C-parity for the group PUT preparation pass: pvxs runs
 /// `IOCSource::doPreProcessing` over every channeled member
-/// (`groupsource.cpp:596-609`) BEFORE any marked/putable filtering and
+/// (`groupsource.cpp:597-609`) BEFORE any marked/putable filtering and
 /// in every process mode, throwing `S_db_putDisabled` when a member's
 /// backing record is DISP-disabled. A DISP=1 member therefore rejects
 /// the whole group PUT even when the client did not mark it — the prep
@@ -306,7 +307,7 @@ async fn group_put_rejected_when_unmarked_member_is_disp_disabled() {
 
 /// a `DBE_LOG`-only post against a backing record (archive
 /// deadband fires without a value change) reaches the group monitor,
-/// matching pvxs `groupsource.cpp:389` which subscribes group value
+/// matching pvxs `groupsource.cpp:432-434` which subscribes group value
 /// events with `DBE_VALUE | DBE_ALARM | DBE_ARCHIVE`.
 ///
 /// Regression: the prior Rust mask was `VALUE|ALARM` only, so log
@@ -317,7 +318,7 @@ async fn group_put_rejected_when_unmarked_member_is_disp_disabled() {
 /// outcomes are the boundaries pinned here. pvxs refreshes a *triggered*
 /// target with `Value | Alarm` unconditionally, but the *self*-triggered
 /// field with `pDbFieldLog->mask & UpdateType::Everything`
-/// (`groupsource.cpp:327-337`) — and `Everything` excludes DBE_ARCHIVE, so
+/// (`groupsource.cpp:328-338`) — and `Everything` excludes DBE_ARCHIVE, so
 /// a LOG-only post assigns nothing on itself. `subscriptionPost` then sees
 /// an unmarked value and returns without posting (`if(empty && !first)`,
 /// `groupsource.cpp:266-275`).
@@ -392,7 +393,7 @@ async fn group_monitor_subscribes_archive_log_events() {
 
 /// An all-const (channel-less) group monitor must treat "no member event
 /// sources" as *quiet but open*, not as a closed stream. pvxs keeps such a
-/// subscription open after the initial post (`groupsource.cpp:240-300`),
+/// subscription open after the initial post (`groupsource.cpp:241-298`),
 /// whereas the pre-fix Rust `GroupMonitor::poll()` returned `None` the
 /// instant its member-event channel closed — and the native PVA server
 /// turns that `None` into a premature MONITOR FINISH (`subcmd 0x10`).
@@ -467,7 +468,10 @@ async fn allconst_group_subscribe_stays_open_then_tears_down_on_cancel() {
     provider
         .load_group_config(GROUP_JSON_ALLCONST)
         .expect("all-const group must load");
-    let store = QsrvPvStore::new(provider);
+    let store = QsrvPvStore::new(
+        epics_base_rs::runtime::task::Reactor::current().expect("the test enters a runtime"),
+        provider,
+    );
 
     // Baseline strong count after the provider/store exist but before the
     // monitor opens. The forward task's `GroupMonitor`/`GroupChannel` add
@@ -511,7 +515,7 @@ async fn allconst_group_subscribe_stays_open_then_tears_down_on_cancel() {
 
 /// a group GET / MONITOR value carries
 /// `record._options.queueSize` and `record._options.atomic` at
-/// its root. pvxs `groupsource.cpp:359` stamps these into every
+/// its root. pvxs `groupsource.cpp:404-405` stamps these into every
 /// posted value; strict pvRequest clients and archiver appliances
 /// depend on the branch being present.
 #[tokio::test]
@@ -635,7 +639,10 @@ async fn br_r10_33_group_monitor_stamps_the_servers_negotiated_queue_size() {
         let db = make_db().await;
         let provider = Arc::new(BridgeProvider::new(db.clone()));
         provider.load_group_config(GROUP_JSON).expect("load");
-        let store = QsrvPvStore::new(provider);
+        let store = QsrvPvStore::new(
+            epics_base_rs::runtime::task::Reactor::current().expect("the test enters a runtime"),
+            provider,
+        );
         let checked = AccessGate::open()
             .check("TEST:grp", "host1", "alice", "anonymous", "")
             .await;
@@ -714,10 +721,10 @@ async fn br_r10_33_group_monitor_stamps_the_servers_negotiated_queue_size() {
 /// unconditionally, regardless of the group's `+atomic:false`
 /// default, while a GET on the same group reports the actual
 /// operation atomicity (`false`). pvxs `groupsource.cpp:401-405`
-/// (GroupMonitor::onStart) always sets the monitor value's atomic
+/// (GroupSource::onSubscribe) always sets the monitor value's atomic
 /// flag true — a monitor delivers one consistent snapshot, so it
 /// reports itself atomic — whereas `groupsource.cpp:480-485`
-/// (GroupSource::onOp, the GET path) stamps the per-operation
+/// (the static `onGet`, the GET path) stamps the per-operation
 /// atomicity. Before the fix both paths reported the group default,
 /// so a `+atomic:false` group's monitor wrongly advertised `false`.
 #[tokio::test]
@@ -795,7 +802,7 @@ async fn group_monitor_stamps_atomic_true_while_get_reports_operation_atomicity(
 
 /// a per-member ACF denial fails the group PUT even when the
 /// group PV itself is writable. Mirrors pvxs's per-field
-/// SecurityClient gating (groupsource.cpp:161 + 515) — "any
+/// SecurityClient gating (groupsource.cpp:217-224,564-566) — "any
 /// member denied → operation rejected".
 #[tokio::test]
 async fn group_put_member_acf_denial_rejects_entire_put() {
@@ -1035,7 +1042,7 @@ async fn r14_32_pure_self_trigger_marks_the_self_member() {
 /// every delta until BOTH members posted their initial events, so
 /// `level`'s update was discarded indefinitely. pvxs primes each field
 /// from sampled values at start (db_post_single_event,
-/// `groupsource.cpp:289-297`), so a quiet member never blocks an active
+/// `groupsource.cpp:289-298`), so a quiet member never blocks an active
 /// one. The 500ms timeout is the guard: before the fix poll() never
 /// returned because `count`'s priming flag stayed unset.
 #[tokio::test]
@@ -1119,8 +1126,8 @@ fn find_field<'a>(s: &'a PvStructure, name: &str) -> Option<&'a PvField> {
 /// A `+type:"structure"` member must appear in the GET value as an
 /// empty structure carrying its `+id`, matching the advertised
 /// descriptor. pvxs adds the empty `Struct(id)` to the value template
-/// (groupconfigprocessor.cpp:922-930) and clones it into every GET /
-/// MONITOR snapshot (groupsource.cpp:480-518).
+/// (groupconfigprocessor.cpp:922-931) and clones it into every GET /
+/// MONITOR snapshot (groupsource.cpp:484, :398-399).
 #[tokio::test]
 async fn structure_member_appears_in_atomic_group_value_and_descriptor() {
     use epics_pva_rs::pvdata::FieldDesc;
@@ -1199,7 +1206,7 @@ async fn structure_member_appears_in_nonatomic_group_value() {
 /// GET_FIELD / CREATE_CHANNEL must advertise the built-in
 /// `record._options` branch (queueSize int, atomic boolean) that GET
 /// and MONITOR values carry, matching pvxs `group.valueTemplate`
-/// (groupconfigprocessor.cpp:499-523).
+/// (groupconfigprocessor.cpp:499-524).
 #[tokio::test]
 async fn group_descriptor_advertises_record_options() {
     use epics_pva_rs::pvdata::{FieldDesc, ScalarType};
@@ -1261,9 +1268,9 @@ async fn group_descriptor_advertises_record_options() {
 /// concrete scalar/array payload (tagged with that payload's descriptor),
 /// and a PUT of a Variant payload is dereferenced and written. pvxs builds
 /// the descriptor with `Member(TypeCode::Any,…)`
-/// (groupconfigprocessor.cpp:904-910), fills the slot via
+/// (groupconfigprocessor.cpp:904-911), fills the slot via
 /// `anyType.cloneEmpty()` + `node.from(value)` (iocsource.cpp:335-349),
-/// and dereferences `node["->"]` on PUT (iocsource.cpp:575-586). Before
+/// and dereferences `node["->"]` on PUT (iocsource.cpp:583-585). Before
 /// the fix the member was advertised/served as a fixed scalar and a
 /// Variant PUT was rejected by `pv_field_to_epics`.
 #[tokio::test]
@@ -1378,7 +1385,7 @@ async fn br76_any_member_is_variant_descriptor_value_and_put() {
 /// A group member whose field path uses `[N]` index notation
 /// (`a[0].x`) must build a PVA `StructureArray`, not a plain nested
 /// structure. pvxs wraps each indexed path component in `StructA(...)`
-/// when assembling the group type (groupconfigprocessor.cpp:1005-1035)
+/// when assembling the group type (groupconfigprocessor.cpp:1005-1037)
 /// and lands the runtime value in element `[N]` of that structure array
 /// (groupsource.cpp:414-425). Before the fix the value/descriptor
 /// builders ignored `comp.index` and produced a plain `Structure`, so
@@ -1736,7 +1743,7 @@ async fn r17_31_group_scalar_member_serves_long_string() {
 /// pvxs builds the plain leaf from `getChannelValueType`
 /// (`addMembersForPlainType`, groupconfigprocessor.cpp:886-895), which is
 /// `TypeCode::String` for a `DBR_CHAR` array with `format()=="String"`
-/// (iocsource.cpp:634-636), and `getArrayValue` fills that same leaf by
+/// (iocsource.cpp:635-636), and `getArrayValue` fills that same leaf by
 /// collapsing the buffer at the NUL (:132-137). The port derived the two
 /// independently: `52fe221b` taught the NT owner about long strings but the
 /// plain arm's local `match nt_type` had no `LongString` case, so it fell to
@@ -1883,7 +1890,7 @@ fn nt_enum_put(index: i32) -> PvField {
 /// STRUCTURE, so the client PUTs that wrapper. `convert_member_value` must
 /// de-reference the wrapper's `value` leaf (and, for NTEnum, `value.index`)
 /// exactly as pvxs `IOCSource::put` does before converting to the backing
-/// DBF (iocsource.cpp:576-598). Pre-fix the wrapper itself reached
+/// DBF (iocsource.cpp:576-610). Pre-fix the wrapper itself reached
 /// `pv_field_to_epics`, which cannot convert a Structure — so EVERY
 /// scalar-mapped member PUT was rejected with "value is not convertible to
 /// backing field", numeric and string alike.
@@ -1992,7 +1999,7 @@ async fn r17_35_plain_member_put_is_not_unwrapped() {
 /// R17-35 + R17-31 (group PUT half): with the wrapper de-referenced, a
 /// string PUT to a `Q:form,"String"` `DBF_CHAR` waveform member reaches the
 /// long-string path — pvxs `putLongString`: `dbPut(DBR_CHAR, str,
-/// strlen+1)` (iocsource.cpp:601-606), i.e. the NUL-terminated char image,
+/// strlen+1)` (iocsource.cpp:603-604), i.e. the NUL-terminated char image,
 /// not a parse of the string as one integer. This case was unreachable
 /// while every scalar-member PUT was rejected, which is why R17-31 could
 /// only cover the group GET.
@@ -2174,7 +2181,7 @@ async fn group_flood_does_not_stall_scalar_monitor_delivery() {
 
 /// pvxs pushes the built-in `record` Struct onto `groupMembersToAdd`
 /// BEFORE `addTemplatesForDefinedFields` and appends the vector in that
-/// order (`groupconfigprocessor.cpp:502-518`), so `record` is member 0 of
+/// order (`groupconfigprocessor.cpp:502-519`), so `record` is member 0 of
 /// every group: `record._options.queueSize` is bit 3, `atomic` is bit 4,
 /// and the user members follow. The port appended `record` after the
 /// member loop, which moved every user member's bit index and changed the
@@ -2243,7 +2250,10 @@ async fn group_monitor_seed_marks_the_negotiated_queue_size() {
     let db = make_db().await;
     let provider = Arc::new(BridgeProvider::new(db.clone()));
     provider.load_group_config(GROUP_JSON).expect("load");
-    let store = QsrvPvStore::new(provider);
+    let store = QsrvPvStore::new(
+        epics_base_rs::runtime::task::Reactor::current().expect("the test enters a runtime"),
+        provider,
+    );
     let checked = AccessGate::open()
         .check("TEST:grp", "host1", "alice", "anonymous", "")
         .await;

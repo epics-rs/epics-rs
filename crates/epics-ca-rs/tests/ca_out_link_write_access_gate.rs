@@ -7,7 +7,7 @@
 //!     return -1;
 //! }
 //! ```
-//! (`dbCa.c:558-561`). `dbPutLink` folds that `-1` into the owning record's
+//! (`dbCa.c:529-532`). `dbPutLink` folds that `-1` into the owning record's
 //! LINK/INVALID (`dbLink.c:443-446` → `setLinkAlarm` → `recGblSetSevrMsg`),
 //! so a `record(ao,"HOLD") { field(OUT,"ca://SEC:HOLD") }` pointed at a
 //! server that grants READ and denies WRITE alarms on every cycle.
@@ -24,21 +24,17 @@
 //! loses the alarm, and the completion put ALSO resolves its wait-set as a
 //! success, because the completion channel carries no status back to the
 //! record (that is C's behaviour too for a POST-staging failure —
-//! `dbCa.c:1240-1244` reports those through `errlogPrintf` only — which is
+//! `dbCa.c:1175-1179` reports those through `errlogPrintf` only — which is
 //! precisely why the gate has to be whole before staging).
 //!
 //! The rights are real, not injected: the upstream `CaServer` runs an
 //! `.acf` whose WRITE rule names a HAG this client is not in, so the server
 //! sends `CA_PROTO_ACCESS_RIGHTS` with the write bit clear and the
 //! resolver's connection watcher caches it through `note_access_rights` —
-//! C's `accessRightsCallback` (`dbCa.c:1076-1102`).
+//! C's `accessRightsCallback` (`dbCa.c:1014-1040`).
 
-// Host/tokio-only: builds the async `CaClient`/`CaServer` stack in process.
-// Under `rtems-exec-model` the `runtime::task` seam routes their `spawn`
-// to the background executor, whose worker has no tokio reactor, so the
-// listener/transport tasks panic. The RTEMS model serves from
-// `BlockingCaServer` instead, so this path is inapplicable there.
-#![cfg(not(feature = "rtems-exec-model"))]
+#![cfg(tokio_backend)]
+#![cfg(feature = "client-core")]
 
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -46,7 +42,7 @@ use std::time::{Duration, Instant};
 
 use epics_base_rs::server::database::{LinkSet, PutAdmission, PvDatabase};
 use epics_base_rs::server::recgbl::alarm_status;
-use epics_base_rs::server::record::{AlarmSeverity, NotifyWaitSet};
+use epics_base_rs::server::record::AlarmSeverity;
 use epics_base_rs::server::records::ao::AoRecord;
 use epics_base_rs::types::EpicsValue;
 use epics_ca_rs::calink::CaLinkResolver;
@@ -123,7 +119,7 @@ async fn resolver_claiming(port: u16, host: &str) -> CaLinkResolver {
     let resolver = CaLinkResolver::with_client(Arc::new(client));
     assert!(
         resolver
-            .wait_for_link_connected(PV, Duration::from_secs(5))
+            .wait_for_link_connected(PV, budget::FACT_BUDGET)
             .await,
         "READ is granted to everyone, so the link must connect whatever \
          the write right is"
@@ -134,7 +130,7 @@ async fn resolver_claiming(port: u16, host: &str) -> CaLinkResolver {
 /// The rights frame follows the create-channel reply, so poll rather than
 /// racing it. Returns the admission actually observed at the deadline.
 async fn admission_settling_to(resolver: &CaLinkResolver, want: PutAdmission) -> PutAdmission {
-    let deadline = Instant::now() + Duration::from_secs(5);
+    let deadline = Instant::now() + budget::FACT_BUDGET;
     loop {
         let got = LinkSet::put_admission(resolver, PV);
         if got == want || Instant::now() >= deadline {
@@ -165,7 +161,8 @@ async fn add_ao(db: &PvDatabase, name: &str, val: f64, notify: bool) {
         // observing a closed channel.
         let (tx, rx) = epics_base_rs::runtime::sync::oneshot::channel();
         std::mem::forget(rx);
-        inst.notify = Some(NotifyWaitSet::new(tx));
+        inst.install_or_queue_notify(tx)
+            .expect("the record is free, so the wait-set installs");
     }
 }
 
@@ -213,7 +210,7 @@ async fn a_connected_but_write_denied_link_is_refused() {
     assert_eq!(
         admission_settling_to(&resolver, PutAdmission::Refused).await,
         PutAdmission::Refused,
-        "C refuses on `!pca->hasWriteAccess` alone (dbCa.c:558-561)"
+        "C refuses on `!pca->hasWriteAccess` alone (dbCa.c:529-532)"
     );
     assert!(
         LinkSet::is_connected(&resolver, PV),
@@ -252,7 +249,7 @@ async fn a_fully_granted_link_is_still_admitted_and_written() {
         .await
         .expect("an admitted write must reach the wire");
 
-    let deadline = Instant::now() + Duration::from_secs(5);
+    let deadline = Instant::now() + budget::FACT_BUDGET;
     loop {
         if LinkSet::get_value(&resolver, PV)
             .await
@@ -334,3 +331,6 @@ async fn a_completion_out_write_to_a_write_denied_link_alarms_the_record() {
         "and the upstream PV keeps its value"
     );
 }
+
+#[path = "common/budget.rs"]
+mod budget;

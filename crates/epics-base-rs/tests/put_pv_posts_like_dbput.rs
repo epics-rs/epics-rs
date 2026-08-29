@@ -1,4 +1,4 @@
-//! `put_pv` carries C `dbPut`'s whole monitor tail (`dbAccess.c:1408-1418`):
+//! `put_pv` carries C `dbPut`'s whole monitor tail (`dbAccess.c:1403-1413`):
 //!
 //! ```c
 //! isValueField = dbIsValueField(pfldDes);
@@ -11,10 +11,9 @@
 //! Pre-fix the port's `put_pv` (the `dbPut` analogue under `dbPutLink`, QSRV
 //! Inhibit/Force, autosave restore and every internal driver put) posted no
 //! field monitor at all and never cleared UDF, so camonitor on anything
-//! written through it saw at most the initial snapshot
-//! (`doc/calink-rtems-design.md` §11.7 item 2). The C tail is two independent
-//! predicates — *value field* gates the UDF clear, *value field AND
-//! `pp(TRUE)`* gates the post suppression — so the boundary table below has
+//! written through it saw at most the initial snapshot. The C tail is two
+//! independent predicates — *value field* gates the UDF clear, *value field
+//! AND `pp(TRUE)`* gates the post suppression — so the boundary table below has
 //! one case per predicate combination, not one per story:
 //!
 //! | field            | value field | pp(TRUE) | post | UDF clear |
@@ -94,7 +93,7 @@ async fn a_put_to_a_non_pp_value_field_posts_and_clears_udf() {
     );
     assert!(
         !udf(&db, "C1"),
-        "C `dbPut:1411` clears udf on a value-field put"
+        "C `dbPut:1406` clears udf on a value-field put"
     );
 }
 

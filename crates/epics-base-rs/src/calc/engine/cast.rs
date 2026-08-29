@@ -8,7 +8,7 @@
 //!
 //! | dialect | bit / shift ops | MODULO / NINT |
 //! |---|---|---|
-//! | base `calcPerform.c` | `d2i` / `d2ui` (:324-325, :329-366) | `d2i` (MODULO :176-190, NINT :313-317) since `669a25697` / PR #925 |
+//! | base `calcPerform.c` | `d2i` / `d2ui` (:324-325, :329-366) | `d2i` (MODULO :176-190, NINT :313-317) since unmerged PR #925 |
 //! | sCalc `sCalcPerform.c` | plain `(long)` (:578-631, :725) | `c_long` — `(long)` (MODULO :1121, NINT :730) |
 //! | aCalc `aCalcPerform.c` | plain `(int)` (:907, :1355-1357, :1424-1427) | MODULO `c_int` — `(int)` (:661, :685, :711); NINT `c_long` — `(long)` (:839, :1096) |
 //!
@@ -20,6 +20,14 @@
 //! is `(long)` (64-bit) but its MODULO is `(int)` (32-bit), so the array engine
 //! passes `c_long` to `nint` and `c_int` to `imod`. The zero-divisor
 //! disposition and the `-1 → 0` guard are uniform (CBUG-A2/A1).
+//!
+//! **PR #925 is not merged**, so the MODULO/NINT column above is the PR's
+//! behaviour, not released base's. At `origin/7.0` `d2i` is defined at
+//! `calcPerform.c:325` *inside* the bitwise block, and MODULO (`:162`) and
+//! NINT (`:291`) sit above it and never call it. The port follows the PR, so
+//! it diverges from shipped base. The PR commit is reachable from no
+//! upstream ref — cite it as *unmerged PR #925*, never as a revision — and is
+//! preserved in the reference tree as `refs/parity/2026-08-26/base-pr925-d2i`.
 //!
 //! `d2i`/`d2ui` are *not* general truncating casts: they route a
 //! non-negative double through `epicsUInt32` first, so `3e9` becomes
@@ -33,7 +41,7 @@
 /// A non-negative double goes through `epicsUInt32`, so the full 32-bit
 /// pattern survives and bit 31 lands as the sign bit — `d2i(3e9)` is
 /// `-1294967296`, not an overflow. Base uses this for BIT_OR/AND/XOR/NOT, the
-/// shifts, and — since `669a25697` / PR #925 — NINT and MODULO too.
+/// shifts, and — since unmerged PR #925 — NINT and MODULO too.
 #[inline]
 pub(crate) fn d2i(x: f64) -> i32 {
     if x < 0.0 {
@@ -113,7 +121,7 @@ pub(crate) fn c_long(x: f64) -> i64 {
 
 /// `NINT` — round half away from zero, then narrow with the caller's dialect
 /// cast (`narrow`). One body, per-dialect narrowing: the numeric engine passes
-/// [`d2i`] (base's fixed `calcPerform.c:313-317`, `669a25697`/PR #925), and both
+/// [`d2i`] (`calcPerform.c:313-317` at unmerged PR #925), and both
 /// sCalc (`sCalcPerform.c:730`) and aCalc (`aCalcPerform.c:839,1096`) pass
 /// [`c_long`] — BOTH synApps engines narrow NINT with `(long)`, 64-bit — each
 /// mirroring THAT dialect's own C.

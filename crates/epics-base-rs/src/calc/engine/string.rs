@@ -15,7 +15,7 @@ pub fn eval(expr: &CompiledExpr, inputs: &mut StringInputs) -> Result<StackValue
         return Err(CalcError::EmptyProgram);
     }
 
-    // C's static UNTIL pre-scan (`:341-365`), which runs before any opcode does and
+    // C's static UNTIL pre-scan (`:339-360`), which runs before any opcode does and
     // fails the perform outright when the postfix holds more than nine of them —
     // whether or not they are ever reached.
     expr.check_until_ceiling()?;
@@ -23,7 +23,7 @@ pub fn eval(expr: &CompiledExpr, inputs: &mut StringInputs) -> Result<StackValue
     let mut stack: Vec<StackValue> = Vec::with_capacity(20);
     let code = &expr.code;
     let mut pc = 0;
-    // C's `until_scratch[]` (`sCalcPerform.c:329`) and `loopsDone` (`:330`) —
+    // C's `until_scratch[]` (`sCalcPerform.c:330`) and `loopsDone` (`:331`) —
     // one entry per UNTIL in the program, and ONE iteration budget for all of
     // them together.
     let mut until_marks: Vec<(usize, usize)> = Vec::new();
@@ -46,7 +46,7 @@ pub fn eval(expr: &CompiledExpr, inputs: &mut StringInputs) -> Result<StackValue
                 CoreOp::PushVar(idx) => {
                     // C `FETCH_A..P` (`sCalcPerform.c:858-864`) — bounded by the
                     // CALLER's `numArgs`, not by the size of the engine's array. An
-                    // arg the caller never supplied is 0 (`:426`), not a phantom slot.
+                    // arg the caller never supplied is 0 (`:425`), not a phantom slot.
                     let v = inputs.num_arg(*idx as usize).unwrap_or(0.0);
                     stack.push(StackValue::Double(v));
                 }
@@ -839,7 +839,7 @@ pub fn eval(expr: &CompiledExpr, inputs: &mut StringInputs) -> Result<StackValue
                 }
                 StringOp::DynStore => {
                     // C `A_STORE` — the string path (`sCalcPerform.c:897-906`) and
-                    // the no-string one (`:440-450`) are the same three steps:
+                    // the no-string one (`:440-449`) are the same three steps:
                     //
                     // ```c
                     // toDouble(ps);  ps1 = ps;  DEC(ps);     /* the value  */
@@ -875,7 +875,7 @@ pub fn eval(expr: &CompiledExpr, inputs: &mut StringInputs) -> Result<StackValue
                 // C `UNTIL` (`sCalcPerform.c:1978-1993`) does one thing: it
                 // remembers the stack pointer, so that a later `UNTIL_END` can
                 // wind the stack back to exactly this point before re-running the
-                // body (`ps = until_scratch[i].ps`, `:2003`). `until_loc` is the
+                // body (`ps = until_scratch[i].ps`, `:2004`). `until_loc` is the
                 // key C matches on, and `pc - 1` is that key here.
                 super::opcodes::ControlOp::Until(_end_pc) => {
                     let until_pc = pc - 1;
@@ -993,7 +993,7 @@ pub fn eval(expr: &CompiledExpr, inputs: &mut StringInputs) -> Result<StackValue
         Ok([result]) => result,
         Err(_) => return Err(CalcError::StackLeak),
     };
-    // The non-finite tail (`sCalcPerform.c:833`, `:2056`) is NOT this
+    // The non-finite tail (`sCalcPerform.c:834`, `:2056`) is NOT this
     // function's business: C writes `*presult` FIRST and only then returns -1,
     // so the value survives the failing status and the record decides what to
     // do with it. That pairing lives in [`ScalcResult`] / [`epilogue`]; an
@@ -1070,7 +1070,7 @@ fn checksum_op(
 /// Two things the port had wrong, and compiled sCalc confirms both:
 ///
 ///   * The operand is ESCAPED text, and the CRC is taken over what
-///     `dbTranslateEscape` makes of it (`:198`), not over the operand's own
+///     `dbTranslateEscape` makes of it (`:199`), not over the operand's own
 ///     bytes. `MODBUS("\x01\x03")` checksums TWO bytes, not the eight characters
 ///     that spell them.
 ///   * The digest is handed back as ESCAPED text — a literal
@@ -1813,14 +1813,14 @@ fn raw_from_escaped(s: &[u8]) -> Vec<u8> {
 ///   `1e300*1e300` = +inf, `ACOS(2)` = NaN): the epilogue writes `*presult`
 ///   and the LAST line then returns -1
 ///   (`return(((isnan(*presult)||isinf(*presult)) ? -1 : 0))`,
-///   `sCalcPerform.c:833`, `:2056`). The cells ARE written. That is this
+///   `sCalcPerform.c:834`, `:2056`). The cells ARE written. That is this
 ///   struct with [`ScalcResult::non_finite`] set.
 ///
 /// The two records that consume it read the pair differently, which is why the
 /// value cannot be dropped on the failing status: scalcout replaces it with its
 /// `VAL = -1` / `SVAL = "***ERROR***"` sentinel (sCalcoutRecord.c:361-363),
 /// while transform KEEPS the non-finite value in the channel and merely alarms
-/// (transformRecord.c:593-597) — an `inf` that C then fans out through `OUTA`.
+/// (transformRecord.c:593-596) — an `inf` that C then fans out through `OUTA`.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ScalcResult {
     pub val: f64,
@@ -1834,14 +1834,14 @@ pub struct ScalcResult {
 /// which is why this cannot be a function of the final stack value alone.
 ///
 /// ```c
-/// /* NO_STRING (:826-831) */
+/// /* NO_STRING (:826-832) */
 /// *presult = *pd;
 /// if (psresult && (lenSresult > 15)) {
 ///     if (isnan(*pd)) strcpy(psresult, "NaN");
 ///     else            cvtDoubleToString(*pd, psresult, precision);
 /// }
 ///
-/// /* USES_STRING (:2034-2048) */
+/// /* USES_STRING (:2034-2054) */
 /// if (isDouble(ps)) { *presult = ps->d;  to_string(ps); ...copy ps->s... }
 /// else              { ...copy ps->s...;  to_double(ps); *presult = ps->d; }
 /// ```
@@ -1849,7 +1849,7 @@ pub struct ScalcResult {
 /// The numeric evaluator renders SVAL at the record's **PREC** — the `precision`
 /// argument sCalcoutRecord passes as `pcalc->prec` (`sCalcoutRecord.c:359`,
 /// `:770`). The string evaluator never sees `precision`: its `to_string` is
-/// `cvtDoubleToString(d, s, 8)` (`:90-96`), hardcoded. Compiled sCalc, `PI`:
+/// `cvtDoubleToString(d, s, 8)` (`sCalcPerform.c:90-96`), hardcoded. Compiled sCalc, `PI`:
 ///
 /// ```text
 /// program    PREC=0   PREC=2   PREC=8        PREC=12
@@ -2145,8 +2145,7 @@ fn cond_search(code: &[Opcode], start: usize, find_else: bool) -> Result<usize, 
 
 #[cfg(test)]
 mod parity_tests {
-    //! C-parity regression tests for the string evaluator
-    //! (doc/parity-review/01-calc.md).
+    //! C-parity regression tests for the string evaluator.
     use crate::calc::{StackValue, StringInputs, scalc};
 
     fn run_num(expr: &str) -> f64 {

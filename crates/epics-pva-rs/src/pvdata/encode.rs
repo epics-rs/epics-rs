@@ -20,7 +20,7 @@
 //! | 0x88   | structure array (followed by 0x80 + body)|
 //! | 0x89   | union array     (followed by 0x81 + body)|
 //! | 0x8A   | variant array                            |
-//! | scalar | tag (above) | 0x08 → scalar array        |
+//! | scalar + 0x08 | scalar array of the tag above            |
 
 use std::io::Cursor;
 
@@ -1407,7 +1407,7 @@ pub fn canonical_changed_bitset(
 /// QSRV group monitor they are the triggered target members'
 /// `field_name` paths. Marking a node sets its entire subtree, which
 /// reproduces pvxs's *assigned-not-changed* semantics
-/// (`groupsource.cpp:288` marks each `+trigger` target whether or not
+/// (`groupsource.cpp:328-346` marks each `+trigger` target whether or not
 /// its value changed since the last post). The port has no
 /// value-diffing counterpart — pvxs never reconstructs a marked set by
 /// comparing consecutive values.
@@ -1505,7 +1505,7 @@ pub fn marked_wire_changed_bitset(
 /// denotes "the whole structure changed", which the caller represents as
 /// `marked == None` (full request mask) rather than an empty path list.
 /// Used by the PVA gateway to forward the upstream monitor's real changed
-/// leaves downstream (pva2pva `p2pApp/moncache.cpp:142,189` copy the
+/// leaves downstream (pva2pva `p2pApp/moncache.cpp:142,187` copy the
 /// upstream `changedBitSet` verbatim) instead of a synthesised full mask.
 pub fn changed_bitset_paths(desc: &FieldDesc, changed: &crate::proto::BitSet) -> Vec<String> {
     fn walk(

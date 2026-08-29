@@ -25,4 +25,4 @@ PLC register/coil space through the standard asyn interfaces.
 
 ## Status
 
-Port in progress. See `docs/upstream-tracking.md` in the workspace root.
+Port in progress.

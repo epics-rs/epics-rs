@@ -28,7 +28,7 @@
 
 #![cfg(feature = "cap-tokens")]
 
-// RTEMS-EXEC-MODEL-ALLOW(4): not built feature-ON by default - this module is behind the `cap-tokens` feature.
+// RTEMS-EXEC-MODEL-ALLOW(4): not built on the exec backend by default - this module is behind the `cap-tokens` feature.
 
 use std::net::SocketAddr;
 use std::sync::Arc;

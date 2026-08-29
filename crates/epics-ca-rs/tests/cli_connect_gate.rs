@@ -16,12 +16,7 @@
 //! `CaServer`, so they assert the observable contract: stdout, stderr and
 //! the exit code.
 
-// Host/tokio-only: drives the async `caget`/`caput` CLI binaries out of
-// process. Those binaries are built with this feature too, so their
-// `CaClient` stack routes `spawn` to the background executor and then
-// reaches tokio I/O with no reactor. Inapplicable under the executor
-// backend; the RTEMS model has no async CLI client.
-#![cfg(not(feature = "rtems-exec-model"))]
+#![cfg(tokio_backend)]
 
 use epics_base_rs::server::records::ai::AiRecord;
 use epics_ca_rs::server::CaServer;

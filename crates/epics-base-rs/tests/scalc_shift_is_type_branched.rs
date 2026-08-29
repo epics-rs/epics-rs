@@ -25,8 +25,8 @@
 //! double 0.0 where C answers the STRING `" abc"` — wrong value and wrong type.
 //!
 //! The shift also pins the one place sCalc's two evaluators disagree on cast
-//! WIDTH: `>>`, `<<` and `~` are `(long)` on the double-only path (`:623-631`,
-//! `:725-727`) and `(int)` on the string path (`:1270-1276`, `:1441-1444`).
+//! WIDTH: `>>`, `<<` and `~` are `(long)` on the double-only path (`:622-630`,
+//! `:724-726`) and `(int)` on the string path (`:1270-1276`, `:1440-1443`).
 //! `&`, `|`, `^` are `(long)` on both. Every expected value below is compiled C.
 //!
 //! Boundaries, one case each: count 0, 1, mid, 39, exactly 40, above 40,
@@ -152,7 +152,7 @@ fn a_double_left_operand_is_still_a_bit_shift() {
 fn the_shift_width_follows_the_evaluator() {
     assert_eq!(num("1<<40"), 1099511627776.0);
     assert_eq!(num(r#"1<<40+0*LEN(AA)"#), 256.0);
-    // `~` splits the same way (`:725-727` vs `:1441-1444`); `&` `|` `^` do not
+    // `~` splits the same way (`:724-726` vs `:1440-1443`); `&` `|` `^` do not
     // — they are `(long)` on both paths.
     assert_eq!(num("~8589934592"), -8589934593.0);
     // The string path's `(int)` narrows 2^33 out of range, so what `~` inverts

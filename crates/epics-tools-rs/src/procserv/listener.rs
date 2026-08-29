@@ -55,7 +55,7 @@ impl Drop for UnlinkOnDrop {
 /// (`procServ.cc:513-543,551`).
 enum BoundEndpoint {
     /// The `SocketAddr` is read back from the kernel right after the bind
-    /// (C `getsockname`, `acceptFactory.cc:184`), so a `:0` config carries
+    /// (C `getsockname`, `acceptFactory.cc:222`), so a `:0` config carries
     /// the real assigned port from the moment the listener exists.
     Tcp(StdTcpListener, SocketAddr),
     Unix(StdUnixListener, UnixEndpoint),
@@ -96,7 +96,7 @@ impl PreboundListener {
     /// The bound address for publishing (info file / `PROCSERV_INFO`).
     /// For TCP this is the kernel-reported address captured at bind time
     /// (C refreshes its `addr` member via `getsockname` right after
-    /// `bind`+`listen`, `acceptFactory.cc:184`, and `writeInfoFile` prints
+    /// `bind`+`listen`, `acceptFactory.cc:222`, and `writeInfoFile` prints
     /// that member), so a config that said port `0` publishes the real
     /// assigned port, never the `:0` placeholder.
     pub fn bound_addr(&self) -> BoundAddr<'_> {
@@ -161,7 +161,7 @@ fn bind_one(ep: Endpoint, readonly: bool, role: &'static str) -> ProcServResult<
             let std_listener = tcp_listen(addr)?.into_std().map_err(ProcServError::Io)?;
             // Read the real address back from the kernel while still in the
             // fail-fast bind path (C `getsockname` right after `bind`+`listen`,
-            // `acceptFactory.cc:184`) — with port `0` this is the assigned
+            // `acceptFactory.cc:222`) — with port `0` this is the assigned
             // port, and it is what gets published, not the config placeholder.
             let bound = std_listener.local_addr().map_err(ProcServError::Io)?;
             BoundEndpoint::Tcp(std_listener, bound)

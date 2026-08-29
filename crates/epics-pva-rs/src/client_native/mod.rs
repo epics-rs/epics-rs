@@ -21,23 +21,32 @@
 pub mod beacon_throttle;
 pub mod channel;
 pub mod context;
+pub(crate) mod monitor_queue;
 pub mod operation;
 pub mod ops_v2;
 // The UDP SEARCH modules are compiled out on every embedded target: RTEMS
 // newlib lacks the `recvmsg`/`IP_PKTINFO` receive path and `local_addr()`
-// readback a UDP search needs, and the same module gate excludes VxWorks too
-// (`epics-libcom-rs::net`'s `AsyncUdpV4`/`socket2`/`if-addrs` stack is
-// host-only for both), so an embedded build resolves PVs over TCP name
-// servers alone through `search_engine`'s `SearchTransport::NameServersOnly`
-// seam (doc/pvalink-rtems-design.md §4.2). `search` is the legacy standalone
-// search path and `udp` is the client UDP manager — both are host-only
-// surface (the latter is used by the host-only `pvxvct-rs` tool and the
-// search-engine tests).
-#[cfg(not(epics_embedded_target))]
+// readback a UDP search needs, and VxWorks is excluded for the same reason
+// (`epics-libcom-rs::net`'s `AsyncUdpV4`/`socket2`/`if-addrs` stack builds for
+// neither), so an embedded build resolves PVs over TCP name servers alone
+// through `search_engine`'s `SearchTransport::NameServersOnly` seam. `search`
+// is the legacy standalone search path and `udp` is the client UDP manager.
+//
+// The gate that states that is `tokio_backend`, not
+// `not(epics_embedded_target)` — the predicate `eb873800c` named as wrong
+// while it was fixing the timer half of the same two files. Both modules wait
+// on a reactor: `search.rs` on `AsyncUdpV4::recv_from` and `udp.rs` on
+// `UdpSocket::readable`, each inside a future started through `runtime::task`.
+// `exec_backend` — the backend with no reactor — is selected on a *host* build
+// too, by `EPICS_RS_BUILD_EXEC_BACKEND=thread`, so the target gate let both
+// compile into a build whose workers panic the moment either is driven. The
+// seam's own question is which backend runs the code, never which triple built
+// it.
+#[cfg(tokio_backend)]
 pub mod search;
 pub mod search_engine;
 pub mod server_conn;
-#[cfg(not(epics_embedded_target))]
+#[cfg(tokio_backend)]
 pub mod udp;
 
 pub use context::{AssertedIdentity, CacheAction, PvGetResult, PvaClient, PvaClientBuilder};
@@ -50,56 +59,92 @@ pub use operation::PvaOperation;
 pub use crate::decode;
 
 #[cfg(test)]
-mod spawn_seam_guard {
+mod seam_guard {
+    //! Both halves of the runtime-seam rule for the native client, over one
+    //! covered set that the module derives rather than lists.
+    //!
+    //! The two guards below used to carry a file list each, for one question
+    //! asked twice. They disagreed: the spawn half swept `udp.rs` and not
+    //! `channel.rs`, the timer half swept `channel.rs` and not `udp.rs`, and
+    //! between them they named 7 of this module's 11 files. `search.rs`,
+    //! `beacon_throttle.rs`, `monitor_queue.rs` and `mod.rs` were in neither.
+    //! A hand-written subject list is default-out — a file added to the module
+    //! is invisible to every guard over it, and nothing says so.
+    //!
+    //! [`ANCHORS`] inverts that. The files come from the directory, and a file
+    //! with no entry here fails the sweep by name, so classifying a new file
+    //! is a step someone takes deliberately instead of one that happens by
+    //! omission.
+    //!
+    //! Needles are assembled with `concat!` so this module's own text cannot
+    //! satisfy the checks it performs.
+
+    use source_guard::{Comments, module_dir, production, sweep};
+
+    /// One entry per file of this module: something its production slice must
+    /// still contain, so a slice that stopped covering its subject fails here
+    /// instead of passing vacuously.
+    const ANCHORS: &[(&str, &str)] = &[
+        ("beacon_throttle.rs", "impl BeaconTracker"),
+        ("channel.rs", "impl ConnectionPool"),
+        ("context.rs", "impl PvaClient"),
+        ("mod.rs", "pub mod context;"),
+        ("monitor_queue.rs", "impl MonitorBacklog"),
+        ("operation.rs", "impl<T: Send + 'static> PvaOperation<T>"),
+        ("ops_v2.rs", "impl SubscriptionHandle"),
+        ("search.rs", "pub async fn search"),
+        ("search_engine.rs", "async fn run_engine"),
+        ("server_conn.rs", "impl ServerConn"),
+        ("udp.rs", "async fn recv_loop"),
+    ];
+
+    /// Every file of `client_native`, with its production slice and its
+    /// anchor. Panics on a file `ANCHORS` does not classify.
+    fn client_files() -> Vec<(&'static str, &'static str, &'static str)> {
+        sweep(module_dir!("src/client_native"), &[])
+            .into_iter()
+            .map(|(label, src)| {
+                let anchor = ANCHORS
+                    .iter()
+                    .find(|(f, _)| *f == label)
+                    .unwrap_or_else(|| {
+                        panic!(
+                            "client_native/{label} is new and no guard classifies it. \
+                             Add its production anchor to `ANCHORS`; the two sweeps \
+                             below then cover it, which is what a covered set derived \
+                             from the module is for."
+                        )
+                    })
+                    .1;
+                let prod = production(src, Comments::Strip);
+                assert!(
+                    prod.contains(anchor),
+                    "client_native/{label}: production slice no longer contains \
+                     `{anchor}` — the guards over it would pass vacuously"
+                );
+                (label, prod, anchor)
+            })
+            .collect()
+    }
+
     /// Every task the native client spawns in production goes through
     /// `epics_base_rs::runtime::task::spawn`, not `tokio::spawn` — the
     /// client-side twin of `server_native::tcp`'s
-    /// `connection_scope_spawns_go_through_the_runtime_seam`
-    /// (doc/pvalink-rtems-design.md §4.1, stage 3).
+    /// `connection_scope_spawns_go_through_the_runtime_seam`.
     ///
     /// A bare `tokio::spawn` panics on a thread with no tokio runtime, which is
     /// exactly the thread the blocking client (`ServerConn::connect_blocking`,
     /// stage 2) runs on for the RTEMS target — and it panics at *runtime*, on
-    /// the target, not here. So this pins it as source inspection: the
-    /// production scope of every `client_native` module must contain no
-    /// `tokio::spawn` at all.
-    ///
-    /// The scan covers the whole client rather than one file because, unlike
-    /// the server's single per-connection handler, the client spreads its
-    /// spawns across `context`/`operation`/`ops_v2`/`server_conn`/`udp`/
-    /// `search_engine` (§4.1's table). Each file's production slice ends at its
-    /// first column-0 `#[cfg(test)]`, and each is fenced with a positive anchor
-    /// so a moved `#[cfg(test)]` cannot shrink the slice into a vacuous pass.
+    /// the target, not here.
     #[test]
     fn client_scope_spawns_go_through_the_runtime_seam() {
-        // (file source, an anchor that must survive in the production slice).
-        let files: &[(&str, &str)] = &[
-            (include_str!("context.rs"), "impl PvaClient"),
-            (
-                include_str!("operation.rs"),
-                "impl<T: Send + 'static> PvaOperation<T>",
-            ),
-            (include_str!("ops_v2.rs"), "impl SubscriptionHandle"),
-            (include_str!("server_conn.rs"), "impl ServerConn"),
-            (include_str!("udp.rs"), "async fn recv_loop"),
-            (include_str!("search_engine.rs"), "async fn run_engine"),
-        ];
-        // Written split so this assertion cannot match its own source text.
         let literal = concat!("tokio", "::spawn(");
-        for (src, anchor) in files {
-            let prod = match src.find("\n#[cfg(test)]") {
-                Some(i) => &src[..i],
-                None => src,
-            };
-            assert!(
-                prod.contains(anchor),
-                "production slice no longer covers `{anchor}` — the guard would pass vacuously"
-            );
-            let hits = prod.matches(literal).count();
+        for (label, prod, _) in client_files() {
             assert_eq!(
-                hits, 0,
-                "client production scope must spawn through \
-                 `runtime::task::spawn`; found {hits} bare `{literal}` near `{anchor}`"
+                prod.matches(literal).count(),
+                0,
+                "client_native/{label}: production scope must spawn through \
+                 `runtime::task::spawn`, never `{literal}`"
             );
         }
     }
@@ -118,49 +163,25 @@ mod spawn_seam_guard {
     /// backoff). A task moved onto the callback pool takes its timer calls with
     /// it, so pinning where tasks *start* says nothing about what they wait on.
     ///
-    /// Scope is the files that compile for `armv7-rtems-eabihf` (and the
-    /// `*-wrs-vxworks*` triples). `udp.rs` and `search.rs` are
-    /// `#[cfg(not(epics_embedded_target))]` (see the module list above) —
-    /// they may use `tokio::time` freely, because no embedded-target build
-    /// ever contains them.
+    /// The scope used to be "files that compile for `armv7-rtems-eabihf`",
+    /// which excused `search.rs` and `udp.rs` because both are
+    /// `#[cfg(not(epics_embedded_target))]`. That is the wrong predicate:
+    /// `exec_backend` — the runtime-free backend whose workers have no reactor
+    /// — is also selected on a *host* build by
+    /// `EPICS_RS_BUILD_EXEC_BACKEND=thread` (`epics-libcom-rs/build.rs`), and
+    /// a host build compiles both files. The question is which backend the
+    /// code can run on, not which target it is built for, so every file is
+    /// swept.
     #[test]
     fn client_scope_timers_go_through_the_runtime_seam() {
-        // (file source, an anchor that must survive in the production slice).
-        // The embedded-target-compiled client files only.
-        let files: &[(&str, &str)] = &[
-            (include_str!("context.rs"), "impl PvaClient"),
-            (
-                include_str!("operation.rs"),
-                "impl<T: Send + 'static> PvaOperation<T>",
-            ),
-            (include_str!("ops_v2.rs"), "impl SubscriptionHandle"),
-            (include_str!("server_conn.rs"), "impl ServerConn"),
-            (include_str!("search_engine.rs"), "async fn run_engine"),
-            (include_str!("channel.rs"), "impl ConnectionPool"),
-        ];
-        // Written split so this assertion cannot match its own source text.
         let literal = concat!("tokio", "::time::");
-        for (src, anchor) in files {
-            let prod = match src.find("\n#[cfg(test)]") {
-                Some(i) => &src[..i],
-                None => src,
-            };
-            assert!(
-                prod.contains(anchor),
-                "production slice no longer covers `{anchor}` — the guard would pass vacuously"
-            );
-            // The seam's own doc comments may name the type they replace, so
-            // only code lines count: a `//`-prefixed line is prose.
-            let hits = prod
-                .lines()
-                .filter(|l| !l.trim_start().starts_with("//"))
-                .filter(|l| l.contains(literal))
-                .count();
+        for (label, prod, _) in client_files() {
             assert_eq!(
-                hits, 0,
-                "client production scope must arm timers through \
-                 `runtime::task`; found {hits} bare `{literal}` near `{anchor}` — \
-                 on RTEMS that panics the callback worker at runtime"
+                prod.matches(literal).count(),
+                0,
+                "client_native/{label}: production scope must arm timers through \
+                 `runtime::task`, never `{literal}` — on a callback band that \
+                 panics at runtime, on the target"
             );
         }
     }

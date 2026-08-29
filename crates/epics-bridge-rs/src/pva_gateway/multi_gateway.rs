@@ -40,8 +40,10 @@
 //! use epics_bridge_rs::pva_gateway::multi_gateway::MultiTenantPvaGatewayBuilder;
 //! use epics_pva_rs::client::PvaClient;
 //! use epics_pva_rs::server_native::PvaServerConfig;
+//! use epics_base_rs::runtime::task::Reactor;
 //!
 //! # fn run() -> epics_bridge_rs::pva_gateway::error::GwResult<()> {
+//! let reactor = Reactor::current().expect("started on the daemon's runtime");
 //! let upstream_a = Arc::new(PvaClient::builder().build());
 //! let upstream_b = Arc::new(PvaClient::builder().build());
 //!
@@ -62,14 +64,15 @@
 //!         &["B", "A"],
 //!         Some("gw:ops".to_string()),
 //!     )
-//!     .start()?;
+//!     .start(&reactor)?;
 //! # Ok(()) }
 //! ```
 
-// RTEMS-EXEC-MODEL-ALLOW(1): checked to pass feature-ON under
-// --features rtems-exec-model,pva-gateway (the gateway's spawns/timers ride the
-// runtime::task seam). The default feature-ON gate omits `pva-gateway`, so re-run
-// that combo when touching this module.
+// RTEMS-EXEC-MODEL-ALLOW(1): checked to pass on the exec backend under
+// `EPICS_RS_BUILD_EXEC_BACKEND=thread cargo nextest run -p epics-bridge-rs
+// --features pva-gateway` (the gateway's spawns/timers ride the runtime::task
+// seam; 739 run, 739 passed on this tree). The default exec-backend gate omits
+// `pva-gateway`, so re-run that combo when touching this module.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -251,7 +254,13 @@ impl MultiTenantPvaGatewayBuilder {
     /// Validate + start every downstream. The returned
     /// [`MultiTenantPvaGateway`] owns one [`PvaServer`] per downstream
     /// spec and one [`ChannelCache`] per upstream tenant.
-    pub fn start(self) -> GwResult<MultiTenantPvaGateway> {
+    ///
+    /// `reactor` is the executor every tenant's cache cleanup tick is
+    /// spawned on; those tasks start before this returns.
+    pub fn start(
+        self,
+        reactor: &epics_base_rs::runtime::task::Reactor,
+    ) -> GwResult<MultiTenantPvaGateway> {
         if self.upstreams.is_empty() {
             return Err(GwError::Other(
                 "MultiTenantPvaGatewayBuilder: at least one upstream required".into(),
@@ -301,6 +310,7 @@ impl MultiTenantPvaGatewayBuilder {
         let mut caches: Vec<(String, Arc<ChannelCache>)> = Vec::with_capacity(self.upstreams.len());
         for u in &self.upstreams {
             let c = ChannelCache::with_max_entries(
+                reactor.clone(),
                 u.client.clone(),
                 self.cleanup_interval,
                 self.max_cache_entries,
@@ -485,7 +495,7 @@ mod tests {
                 Some("gw".to_string()),
             )
             .downstream_control_acf(Some("/no/such/pva_gw_control.acf".to_string()), None)
-            .start();
+            .start(&crate::test_reactor());
         assert!(
             res.is_err(),
             "unreadable control ACF must fail the multi-tenant build"

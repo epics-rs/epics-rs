@@ -1,7 +1,7 @@
 //! R18-1: the CALC assignment operator `:=` writes the record's A..U.
 //!
 //! C `calcPerform(&prec->a, &prec->val, rpcl)` is handed a pointer INTO the
-//! record, so the store opcode IS the field write (`calcPerform.c:101-123`):
+//! record, so the store opcode IS the field write (`calcPerform.c:100-122`):
 //!
 //! ```c
 //!     case STORE_A: … case STORE_U:
@@ -25,6 +25,9 @@ use std::collections::HashSet;
 
 use epics_base_rs::server::database::PvDatabase;
 use epics_base_rs::server::ioc_builder::IocBuilder;
+use epics_base_rs::server::records::scalcout::ScalcoutRecord;
+use epics_base_rs::server::records::swait::SwaitRecord;
+use epics_base_rs::server::records::transform::TransformRecord;
 use epics_base_rs::types::EpicsValue;
 
 const DB: &str = r#"
@@ -51,6 +54,9 @@ record(transform, "C:XFORM") {
 
 async fn build() -> std::sync::Arc<PvDatabase> {
     IocBuilder::new()
+        .register_record_type("scalcout", || Box::new(ScalcoutRecord::default()))
+        .register_record_type("swait", || Box::new(SwaitRecord::default()))
+        .register_record_type("transform", || Box::new(TransformRecord::default()))
         .db_string(DB, &std::collections::HashMap::new())
         .unwrap()
         .build()

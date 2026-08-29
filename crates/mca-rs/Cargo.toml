@@ -11,6 +11,8 @@ repository.workspace = true
 chrono = "0.4"
 epics-base-rs = { workspace = true }
 
+[features]
+
 [dev-dependencies]
 epics-ca-rs = { workspace = true }
 tokio = { version = "1", features = ["full", "test-util"] }

@@ -411,6 +411,125 @@ fn show_compound_array(
     out.push_str("]\n");
 }
 
+/// The differential that makes three transcriptions of `%g` safe.
+///
+/// `epics-base-rs` (`printf` record), `epics-pva-rs` (`pvget`/`pvinfo`/
+/// `pvmonitor`) and `asyn-rs` (`paramVal::report`) each carry their own
+/// `format_g`, because sharing one would force a crate dependency none of
+/// the three otherwise needs. What keeps them equal is not review but this
+/// test: each crate runs the SAME sample through its own `format_g` and
+/// through glibc's `snprintf("%.*g")` and requires byte equality. A
+/// transcription that drifts fails here, in its own crate, on the sample
+/// that caught the drift.
+///
+/// Gated on `target_env = "gnu"`: the assertion is glibc's exact output,
+/// and newlib (RTEMS) / musl are not that reference.
+#[cfg(all(test, unix, target_env = "gnu"))]
+mod libc_g_differential {
+    use super::format_g;
+
+    /// glibc `printf("%.*g", prec, v)`.
+    pub(super) fn libc_g(v: f64, prec: usize) -> String {
+        let mut buf = [0u8; 512];
+        // SAFETY: `buf` is 512 bytes and `snprintf` is given that length,
+        // so it always NUL-terminates within bounds. `%.*g` of an f64 with
+        // precision <= 17 never needs more than ~330 bytes.
+        let n = unsafe {
+            libc::snprintf(
+                buf.as_mut_ptr().cast(),
+                buf.len(),
+                c"%.*g".as_ptr(),
+                prec as libc::c_int,
+                v,
+            )
+        };
+        assert!(n >= 0 && (n as usize) < buf.len(), "snprintf overflow");
+        String::from_utf8(buf[..n as usize].to_vec()).expect("glibc writes ASCII")
+    }
+
+    /// xorshift64*, so the sample is identical on every run and every host
+    /// without pulling in a PRNG crate.
+    pub(super) struct XorShift64(u64);
+    impl XorShift64 {
+        pub(super) fn new(seed: u64) -> Self {
+            Self(seed)
+        }
+        pub(super) fn next(&mut self) -> u64 {
+            let mut x = self.0;
+            x ^= x >> 12;
+            x ^= x << 25;
+            x ^= x >> 27;
+            self.0 = x;
+            x.wrapping_mul(0x2545_F491_4F6C_DD1D)
+        }
+    }
+
+    /// Raw bit patterns (so NaN, infinities and subnormals arrive on their
+    /// own), a decade sweep across the whole exponent range, and the
+    /// boundary values `%g`'s style decision turns on.
+    pub(super) fn sample() -> Vec<f64> {
+        let mut out = vec![
+            0.0,
+            -0.0,
+            f64::NAN,
+            -f64::NAN,
+            f64::INFINITY,
+            f64::NEG_INFINITY,
+            f64::MIN_POSITIVE,
+            f64::from_bits(1),
+            f64::MAX,
+            f64::MIN,
+            1.0 / 3.0,
+            0.1 + 0.2,
+            // the rounded-exponent boundary: 9.999995 must print as C does
+            9.999_995,
+            99_999.5,
+            999_999.5,
+            0.000_099_999_95,
+        ];
+        for e in -320i32..=308 {
+            for m in [1.0_f64, 1.5, 3.3333333, 9.999999, 9.9999995] {
+                let v = m * 10f64.powi(e);
+                if v.is_finite() {
+                    out.push(v);
+                    out.push(-v);
+                }
+            }
+        }
+        let mut rng = XorShift64::new(0x5EED_1234_ABCD_0001);
+        for _ in 0..50_000 {
+            out.push(f64::from_bits(rng.next()));
+        }
+        out
+    }
+
+    #[test]
+    fn format_g_is_byte_identical_to_glibc() {
+        let values = sample();
+        let mut checked = 0usize;
+        let mut mismatches: Vec<String> = Vec::new();
+        for prec in [1usize, 3, 6, 17] {
+            for &v in &values {
+                let ours = format_g(v, prec);
+                let theirs = libc_g(v, prec);
+                checked += 1;
+                if ours != theirs && mismatches.len() < 20 {
+                    mismatches.push(format!(
+                        "%.{prec}g of {v:?} (bits {:#018x}): ours {ours:?} != glibc {theirs:?}",
+                        v.to_bits()
+                    ));
+                }
+            }
+        }
+        assert!(
+            mismatches.is_empty(),
+            "{} of {checked} samples disagree with glibc:\n{}",
+            mismatches.len(),
+            mismatches.join("\n")
+        );
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

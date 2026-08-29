@@ -199,7 +199,7 @@ bitflags! {
     /// independent `if` block per set bit (asynManager.c:3146/:3153/:3167), so
     /// `ASCII|HEX` prints the payload twice, in C's order. No bit set
     /// ([`TraceIoMask::NODATA`], `ASYN_TRACEIO_NODATA`) prints no data at all —
-    /// just the bare newline of :3186-3190 — and it is what a port starts with.
+    /// just the bare newline of :3190-3196 — and it is what a port starts with.
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     pub struct TraceIoMask: u32 {
         const ASCII  = 0x0001;
@@ -316,7 +316,7 @@ pub struct TraceConfig {
     pub io_truncate_size: usize,
     /// C `tracePvt.traceBufferSize`. Starts at `DEFAULT_TRACE_BUFFER_SIZE` and
     /// is grown — never shrunk — by `setTraceIOTruncateSize` when the new
-    /// truncate size exceeds it (asynManager.c:2947-2953).
+    /// truncate size exceeds it (asynManager.c:2949-2954).
     pub trace_buffer_size: usize,
     pub file: TraceFile,
 }
@@ -335,7 +335,7 @@ impl Default for TraceConfig {
             // `traceIOMask`, and `callocMustSucceed` zeroed the `tracePvt` —
             // so a port starts with NO I/O-data bit set, and `asynPrintIO`
             // prints its message and a bare newline until `asynSetTraceIOMask`
-            // turns a form on (:3186-3190). ASCII is a value an operator asks
+            // turns a form on (:3190-3196). ASCII is a value an operator asks
             // for, not one a port is born with.
             trace_io_mask: TraceIoMask::NODATA,
             // C `tracePvtInit` (asynManager.c:455) sets
@@ -351,13 +351,76 @@ impl Default for TraceConfig {
     }
 }
 
-/// Global trace manager with per-port and per-device override support.
-/// C parity: 3-level hierarchy: device → port → global.
+/// One port's `dpCommon` trace state — C's `port` struct as the trace
+/// facility sees it (asynManager.c:510-529).
+///
+/// `pport->dpc.trace` and one `pdevice->dpc.trace` per address, plus the
+/// `ASYN_MULTIDEVICE` attribute, because that attribute is what decides
+/// whether an address names a device slot at all: `locateDevice` returns
+/// NULL for a single-device port (:574), so `connectDevice` leaves
+/// `puserPvt->pdevice` NULL there (:1348-1351) and both `findDpCommon`
+/// (:536-543) and every `setTrace*` land on the port.
+struct PortTrace {
+    /// C `pport->dpc.trace`.
+    port: TraceConfig,
+    /// C `pdevice->dpc.trace`, one entry per address a caller has scoped a
+    /// setting to. An address with no entry reads the port's slot, which
+    /// after any port-scoped write holds the pushed-down value — the same
+    /// value C's push-down wrote into the device's own slot.
+    devices: HashMap<i32, TraceConfig>,
+    /// C `pport->attributes & ASYN_MULTIDEVICE`.
+    multi_device: bool,
+}
+
+impl PortTrace {
+    fn new(multi_device: bool) -> Self {
+        Self {
+            // C `dpCommonInit` → `tracePvtInit` (asynManager.c:449-459): a
+            // port is born with the defaults, NOT with a copy of
+            // `pasynBase->trace`.
+            port: TraceConfig::default(),
+            devices: HashMap::new(),
+            multi_device,
+        }
+    }
+}
+
+/// C `locateDevice` (asynManager.c:569-588) and the `findDpCommon` gate it
+/// feeds (:536-543), as one predicate: an address names a device slot only on
+/// an `ASYN_MULTIDEVICE` port, and only when it is non-negative.
+///
+/// One predicate for reads and writes both, because C applies it on both
+/// sides through the same `puserPvt->pdevice`: `asynSetTraceMask P 5 0x3f`
+/// on a single-device port is `asynSetTraceMask P -1 0x3f`.
+fn device_slot(multi_device: bool, addr: Option<i32>) -> Option<i32> {
+    match addr {
+        Some(a) if multi_device && a >= 0 => Some(a),
+        _ => None,
+    }
+}
+
+/// Global trace manager holding C's `dpCommon` tree.
+///
+/// # Invariant
+///
+/// **The configuration a `(port, addr)` reads is exactly one slot, chosen by
+/// `device_slot`, and every port-scoped write pushes down into every device
+/// slot of that port before writing the port's own.** So no device slot can
+/// shadow a later port-level set, and no read walks past the port.
+///
+/// `TraceManager::with_dp_common` is the only resolver and
+/// `TraceManager::write_scoped` the only mutator; the setters below are
+/// thin wrappers that name which field to write.
 pub struct TraceManager {
+    /// C `pasynBase->trace` (asynManager.c:503), written by the
+    /// `pasynUser == NULL` arm of every `setTrace*`. `findTracePvt` reaches
+    /// it only when `findDpCommon` returns NULL — that is, for a user with no
+    /// port (:546-551) — so **no port-attached user reads it** and no output
+    /// path here does either. Kept because C keeps it and because
+    /// `get_trace_*(None)` answers the `asynSetTraceMask ""` readback from it.
     global_config: Mutex<TraceConfig>,
-    port_configs: Mutex<HashMap<String, TraceConfig>>,
-    /// Per-device overrides keyed by (portName, addr).
-    device_configs: Mutex<HashMap<(String, i32), TraceConfig>>,
+    /// C `pasynBase->asynPortList`, from the trace facility's point of view.
+    ports: Mutex<HashMap<String, PortTrace>>,
     /// Optional sink for trace-mutator exceptions. C asyn fires
     /// `asynExceptionTrace{Mask,IOMask,InfoMask,File,IOTruncateSize}`
     /// from every `setTrace*` (asynManager.c:2790/2832/2874/2923/2956).
@@ -371,9 +434,32 @@ impl TraceManager {
     pub fn new() -> Self {
         Self {
             global_config: Mutex::new(TraceConfig::default()),
-            port_configs: Mutex::new(HashMap::new()),
-            device_configs: Mutex::new(HashMap::new()),
+            ports: Mutex::new(HashMap::new()),
             exception_sink: Mutex::new(None),
+        }
+    }
+
+    /// Tell the manager a port exists and whether it is `ASYN_MULTIDEVICE` —
+    /// C `registerPort` (asynManager.c:2045-2095), which builds the port's
+    /// `dpCommon` and records its attributes in the same call that claims the
+    /// name.
+    ///
+    /// Called from [`crate::registry::PortRegistry::register`], the one site
+    /// that claims a port name in this process, so the attribute cannot go
+    /// unrecorded for a port that exists. A port whose registration this
+    /// manager never saw is treated as single-device, which is C's default
+    /// (`attributes` is whatever the driver passed, and `ASYN_MULTIDEVICE` is
+    /// opt-in).
+    ///
+    /// Re-registering a name keeps the slots already configured and only
+    /// updates the attribute: an `st.cmd` may set a trace mask on a port
+    /// before anything registers it.
+    pub fn register_port(&self, port: &str, multi_device: bool) {
+        if let Ok(mut ports) = self.ports.lock() {
+            ports
+                .entry(port.to_string())
+                .or_insert_with(|| PortTrace::new(multi_device))
+                .multi_device = multi_device;
         }
     }
 
@@ -425,95 +511,195 @@ impl TraceManager {
             "is_enabled expects a single trace level, got {:?}",
             mask
         );
-        if let Ok(configs) = self.port_configs.lock() {
-            if let Some(cfg) = configs.get(port) {
-                return cfg.trace_mask.intersects(mask);
-            }
-        }
-        if let Ok(cfg) = self.global_config.lock() {
-            return cfg.trace_mask.intersects(mask);
-        }
-        false
+        self.with_dp_common(port, None, |cfg| cfg.trace_mask.intersects(mask))
+            .unwrap_or(false)
     }
 
-    /// Check if a trace level is enabled for a specific device address.
-    /// Hierarchy: device → port → global (C parity).
+    /// Check if a trace level is enabled for a specific device address —
+    /// the same `findDpCommon` resolution the emit path uses.
     pub fn is_enabled_device(&self, port: &str, addr: i32, mask: TraceMask) -> bool {
-        if let Ok(configs) = self.device_configs.lock() {
-            if let Some(cfg) = configs.get(&(port.to_string(), addr)) {
-                return cfg.trace_mask.intersects(mask);
+        self.with_dp_common(port, Some(addr), |cfg| cfg.trace_mask.intersects(mask))
+            .unwrap_or(false)
+    }
+
+    /// Run `f` with the one `dpCommon` trace slot C's `findDpCommon`
+    /// (asynManager.c:536-543) selects for `(port, addr)`.
+    ///
+    /// There is no chain: C picks one whole struct and reads it. The only
+    /// step this takes that C does not is falling from an unconfigured device
+    /// to the port's slot, and that is not a fallback in the old sense — a
+    /// port-scoped write pushes its value into every device slot, so the port
+    /// slot holds exactly what C's push-down had written into the device's.
+    ///
+    /// A name the manager has never been told about carries C's born-with
+    /// `tracePvtInit` defaults (:449-459), never `pasynBase->trace`:
+    /// `findTracePvt` reaches the global only for a user with no port at all
+    /// (:546-551), which no output path here can produce.
+    fn with_dp_common<R, F>(&self, port: &str, addr: Option<i32>, f: F) -> Option<R>
+    where
+        F: FnOnce(&TraceConfig) -> R,
+    {
+        let ports = self.ports.lock().ok()?;
+        let Some(pt) = ports.get(port) else {
+            return Some(f(&TraceConfig::default()));
+        };
+        match device_slot(pt.multi_device, addr) {
+            Some(a) => Some(f(pt.devices.get(&a).unwrap_or(&pt.port))),
+            None => Some(f(&pt.port)),
+        }
+    }
+
+    /// The one mutator. C `setTraceMask` (asynManager.c:2774-2802) and its
+    /// three siblings share this shape exactly:
+    ///
+    /// - a **device-scoped** write touches that device's slot alone and
+    ///   announces once for it (:2789-2791);
+    /// - a **port-scoped** write **pushes down** — every device slot first,
+    ///   announcing per device, then the port's own with a port announce
+    ///   (:2793-2801).
+    ///
+    /// The push-down is what makes `asynSetTraceMask P -1 0x1` after
+    /// `asynSetTraceMask P 1 0x3f` quiet device 1. Announces fire after the
+    /// map lock is released, because a listener may read back through the
+    /// manager.
+    fn write_scoped<F>(&self, port: &str, addr: Option<i32>, exception: AsynException, mut apply: F)
+    where
+        F: FnMut(&mut TraceConfig),
+    {
+        let mut announced: Vec<i32> = Vec::new();
+        if let Ok(mut ports) = self.ports.lock() {
+            let pt = ports
+                .entry(port.to_string())
+                .or_insert_with(|| PortTrace::new(false));
+            match device_slot(pt.multi_device, addr) {
+                Some(a) => {
+                    apply(pt.devices.entry(a).or_insert_with(TraceConfig::default));
+                    announced.push(a);
+                }
+                None => {
+                    let mut addrs: Vec<i32> = pt.devices.keys().copied().collect();
+                    addrs.sort_unstable();
+                    for a in &addrs {
+                        if let Some(cfg) = pt.devices.get_mut(a) {
+                            apply(cfg);
+                        }
+                    }
+                    apply(&mut pt.port);
+                    announced.extend(addrs);
+                    // C `announceExceptionOccurred(pport, NULL, ...)` — the
+                    // port itself, which this crate renders as addr -1.
+                    announced.push(-1);
+                }
             }
         }
-        self.is_enabled(port, mask)
+        let sink = self.exception_sink.lock().ok().and_then(|g| g.clone());
+        if let Some(sink) = sink {
+            for a in announced {
+                sink.announce(&ExceptionEvent {
+                    port_name: port.to_string(),
+                    exception,
+                    addr: a,
+                });
+            }
+        }
+    }
+
+    /// The single-slot mutator, for the two setters that are **not** a
+    /// push-down.
+    ///
+    /// `setTraceFile` (asynManager.c:2898-2926) and `setTraceIOTruncateSize`
+    /// (:2942-2959) open on `findTracePvt(puserPvt)` and write that one
+    /// `tracePvt`, where the mask family walks the device list instead. So a
+    /// port-scoped trace file does not follow a device that has its own, and
+    /// C does not intend it to: the mask family's push-down is written out
+    /// device by device precisely because these two are not.
+    ///
+    /// The slot is chosen by the same [`device_slot`] predicate, so a device
+    /// address on a single-device port lands on the port here too.
+    fn write_one_slot<F>(
+        &self,
+        port: &str,
+        addr: Option<i32>,
+        exception: Option<AsynException>,
+        apply: F,
+    ) where
+        F: FnOnce(&mut TraceConfig),
+    {
+        let mut announced_at = None;
+        if let Ok(mut ports) = self.ports.lock() {
+            let pt = ports
+                .entry(port.to_string())
+                .or_insert_with(|| PortTrace::new(false));
+            match device_slot(pt.multi_device, addr) {
+                Some(a) => {
+                    apply(pt.devices.entry(a).or_insert_with(TraceConfig::default));
+                    announced_at = Some(a);
+                }
+                None => {
+                    apply(&mut pt.port);
+                    announced_at = Some(-1);
+                }
+            }
+        }
+        let (Some(exception), Some(a)) = (exception, announced_at) else {
+            return;
+        };
+        let sink = self.exception_sink.lock().ok().and_then(|g| g.clone());
+        if let Some(sink) = sink {
+            sink.announce(&ExceptionEvent {
+                port_name: port.to_string(),
+                exception,
+                addr: a,
+            });
+        }
     }
 
     /// Set trace configuration for a specific device address.
     ///
     /// C parity: asynManager.c:2788-2791 fires `asynExceptionTraceMask`
-    /// for the per-device mutation case.
+    /// for the per-device mutation case. On a single-device port the address
+    /// names no device (`locateDevice`, :574) and this is the port-scoped
+    /// write, exactly as it is in C.
     pub fn set_device_trace_mask(&self, port: &str, addr: i32, mask: TraceMask) {
-        if let Ok(mut configs) = self.device_configs.lock() {
-            configs
-                .entry((port.to_string(), addr))
-                .or_insert_with(TraceConfig::default)
-                .trace_mask = mask;
-        }
-        // Per-device announce — addr included.
-        let sink = self.exception_sink.lock().ok().and_then(|g| g.clone());
-        if let Some(sink) = sink {
-            sink.announce(&ExceptionEvent {
-                port_name: port.to_string(),
-                exception: AsynException::TraceMask,
-                addr,
-            });
-        }
-    }
-
-    /// Run `f` with the effective TraceConfig for `(port, addr)`, walking
-    /// device → port → global in C-parity order.
-    ///
-    /// `addr = None` skips the device lookup (port-only callers, e.g.
-    /// global trace from asynShellCommands). C `findTracePvt` →
-    /// `findDpCommon` returns the device-specific `dpCommon` when the
-    /// `pasynUser` carries a `pdevice`, else falls back to the port's
-    /// own `dpc`, else to `pasynBase->trace` (global)
-    /// — asynManager.c:530-550 / 545-549.
-    fn with_effective_config<R, F>(&self, port: &str, addr: Option<i32>, f: F) -> Option<R>
-    where
-        F: FnOnce(&TraceConfig) -> R,
-    {
-        if let Some(addr) = addr {
-            if let Ok(configs) = self.device_configs.lock() {
-                if let Some(cfg) = configs.get(&(port.to_string(), addr)) {
-                    return Some(f(cfg));
-                }
-            }
-        }
-        if let Ok(configs) = self.port_configs.lock() {
-            if let Some(cfg) = configs.get(port) {
-                return Some(f(cfg));
-            }
-        }
-        if let Ok(cfg) = self.global_config.lock() {
-            return Some(f(&cfg));
-        }
-        None
+        self.write_scoped(port, Some(addr), AsynException::TraceMask, |cfg| {
+            cfg.trace_mask = mask
+        });
     }
 
     /// Output a trace message (port-level resolution).
     ///
-    /// Equivalent to [`Self::output_device`] with `addr = None`.
+    /// Equivalent to [`Self::output_device`] with `addr = None` and the
+    /// reason 0 that C's `pasynUserSelf` carries — a port's own diagnostic
+    /// user is created by `createAsynUser(0,0)` and never assigned one.
     pub fn output(&self, port: &str, mask: TraceMask, msg: &str) {
-        self.output_device(port, None, mask, msg);
+        self.output_device(port, None, 0, mask, msg);
     }
 
     /// Output a trace message, resolving config device → port → global.
     /// C parity: `tracePrint` (asynManager.c:3038-3047) →
     /// `traceVprint` resolves the `tracePvt` via `findTracePvt`, which
     /// walks `pasynUser`'s device-pvt first when `pdevice != NULL`.
-    pub fn output_device(&self, port: &str, addr: Option<i32>, mask: TraceMask, msg: &str) {
-        self.with_effective_config(port, addr, |cfg| {
-            let prefix = format_prefix_addr(port, addr, mask, cfg);
+    ///
+    /// `reason` is the user's `pasynUser->reason`, printed in the
+    /// `[port,addr,reason]` triple — see `format_prefix_addr`.
+    pub fn output_device(
+        &self,
+        port: &str,
+        addr: Option<i32>,
+        reason: i32,
+        mask: TraceMask,
+        msg: &str,
+    ) {
+        self.with_dp_common(port, addr, |cfg| {
+            // C `traceVprintSource` re-tests the mask against the *effective*
+            // `ptracePvt` it just resolved (asynManager.c:3073), so the gate
+            // and the config are the same rung by construction.
+            if !cfg.trace_mask.intersects(mask) {
+                return;
+            }
+            // C `traceVprint` (asynManager.c:3060-3063) delegates to the
+            // source form with an empty file and line 0.
+            let prefix = format_prefix_addr(port, addr, reason, ("", 0), cfg);
             let line = format!("{prefix}{msg}\n");
             cfg.file.write_line(&line);
         });
@@ -528,35 +714,48 @@ impl TraceManager {
         line: u32,
         msg: &str,
     ) {
-        self.output_device_with_source(port, None, mask, file, line, msg);
+        self.output_device_with_source(port, None, 0, mask, file, line, msg);
     }
 
     /// Device-aware variant — resolves config device → port → global.
     /// C parity: `tracePrintSource` (asynManager.c:3049-3057).
+    #[allow(clippy::too_many_arguments)]
     pub fn output_device_with_source(
         &self,
         port: &str,
         addr: Option<i32>,
+        reason: i32,
         mask: TraceMask,
         file: &str,
         line: u32,
         msg: &str,
     ) {
-        self.with_effective_config(port, addr, |cfg| {
-            let prefix = format_prefix_addr(port, addr, mask, cfg);
-            let source = if cfg.trace_info_mask.contains(TraceInfoMask::SOURCE) {
-                format!("[{file}:{line}] ")
-            } else {
-                String::new()
-            };
-            let out = format!("{prefix}{source}{msg}\n");
+        self.with_dp_common(port, addr, |cfg| {
+            if !cfg.trace_mask.intersects(mask) {
+                return;
+            }
+            let prefix = format_prefix_addr(port, addr, reason, (file, line), cfg);
+            let out = format!("{prefix}{msg}\n");
             cfg.file.write_line(&out);
         });
     }
 
     /// Output I/O data with formatting according to TraceIoMask.
-    pub fn output_io(&self, port: &str, mask: TraceMask, data: &[u8], label: &str) {
-        self.output_device_io(port, None, mask, data, label);
+    ///
+    /// `file`/`line` are the caller's `__FILE__`/`__LINE__`: C's `asynPrintIO`
+    /// is a macro that captures them (asynDriver.h:296-299) and hands them to
+    /// `printIOSource`, so the SOURCE component is available on this path
+    /// exactly as it is on `asynPrint`'s.
+    pub fn output_io(
+        &self,
+        port: &str,
+        mask: TraceMask,
+        data: &[u8],
+        label: &str,
+        file: &str,
+        line: u32,
+    ) {
+        self.output_device_io(port, None, 0, mask, data, label, file, line);
     }
 
     /// Device-aware variant — resolves config device → port → global.
@@ -568,19 +767,26 @@ impl TraceManager {
     /// pvar)` — whose format string ends in `\n` at every asyn driver call site
     /// — and the *data section* follows it, one block per enabled
     /// [`TraceIoMask`] bit (`append_io_data`).
+    #[allow(clippy::too_many_arguments)]
     pub fn output_device_io(
         &self,
         port: &str,
         addr: Option<i32>,
+        reason: i32,
         mask: TraceMask,
         data: &[u8],
         label: &str,
+        file: &str,
+        line: u32,
     ) {
-        self.with_effective_config(port, addr, |cfg| {
-            let prefix = format_prefix_addr(port, addr, mask, cfg);
-            let mut line = format!("{prefix}{label}\n").into_bytes();
-            append_io_data(&mut line, data, cfg);
-            cfg.file.write_bytes(&line);
+        self.with_dp_common(port, addr, |cfg| {
+            if !cfg.trace_mask.intersects(mask) {
+                return;
+            }
+            let prefix = format_prefix_addr(port, addr, reason, (file, line), cfg);
+            let mut out = format!("{prefix}{label}\n").into_bytes();
+            append_io_data(&mut out, data, cfg);
+            cfg.file.write_bytes(&out);
         });
     }
 
@@ -592,40 +798,34 @@ impl TraceManager {
     pub fn set_trace_mask(&self, port: Option<&str>, mask: TraceMask) {
         match port {
             Some(name) => {
-                if let Ok(mut configs) = self.port_configs.lock() {
-                    configs
-                        .entry(name.to_string())
-                        .or_insert_with(TraceConfig::default)
-                        .trace_mask = mask;
-                }
+                self.write_scoped(name, None, AsynException::TraceMask, |cfg| {
+                    cfg.trace_mask = mask
+                });
             }
             None => {
                 if let Ok(mut cfg) = self.global_config.lock() {
                     cfg.trace_mask = mask;
                 }
+                self.announce(None, AsynException::TraceMask);
             }
         }
-        self.announce(port, AsynException::TraceMask);
     }
 
     /// C parity: asynManager.c:2832/2842 fires `asynExceptionTraceIOMask`.
     pub fn set_trace_io_mask(&self, port: Option<&str>, mask: TraceIoMask) {
         match port {
             Some(name) => {
-                if let Ok(mut configs) = self.port_configs.lock() {
-                    configs
-                        .entry(name.to_string())
-                        .or_insert_with(TraceConfig::default)
-                        .trace_io_mask = mask;
-                }
+                self.write_scoped(name, None, AsynException::TraceIoMask, |cfg| {
+                    cfg.trace_io_mask = mask
+                });
             }
             None => {
                 if let Ok(mut cfg) = self.global_config.lock() {
                     cfg.trace_io_mask = mask;
                 }
+                self.announce(None, AsynException::TraceIoMask);
             }
         }
-        self.announce(port, AsynException::TraceIoMask);
     }
 
     /// Per-device variant of [`Self::set_trace_io_mask`].
@@ -637,42 +837,28 @@ impl TraceManager {
     /// [`Self::set_device_trace_mask`] must mirror that routing so the
     /// `asynSetTraceIOMask MYPORT N "ESCAPE"` iocsh call (and any
     /// programmatic device-scoped trace setup) actually overrides the
-    /// `(port, addr)` slot resolved by `with_effective_config`.
+    /// `(port, addr)` slot resolved by `Self::with_dp_common`.
     pub fn set_device_trace_io_mask(&self, port: &str, addr: i32, mask: TraceIoMask) {
-        if let Ok(mut configs) = self.device_configs.lock() {
-            configs
-                .entry((port.to_string(), addr))
-                .or_insert_with(TraceConfig::default)
-                .trace_io_mask = mask;
-        }
-        let sink = self.exception_sink.lock().ok().and_then(|g| g.clone());
-        if let Some(sink) = sink {
-            sink.announce(&ExceptionEvent {
-                port_name: port.to_string(),
-                exception: AsynException::TraceIoMask,
-                addr,
-            });
-        }
+        self.write_scoped(port, Some(addr), AsynException::TraceIoMask, |cfg| {
+            cfg.trace_io_mask = mask
+        });
     }
 
     /// C parity: asynManager.c:2874/2884 fires `asynExceptionTraceInfoMask`.
     pub fn set_trace_info_mask(&self, port: Option<&str>, mask: TraceInfoMask) {
         match port {
             Some(name) => {
-                if let Ok(mut configs) = self.port_configs.lock() {
-                    configs
-                        .entry(name.to_string())
-                        .or_insert_with(TraceConfig::default)
-                        .trace_info_mask = mask;
-                }
+                self.write_scoped(name, None, AsynException::TraceInfoMask, |cfg| {
+                    cfg.trace_info_mask = mask
+                });
             }
             None => {
                 if let Ok(mut cfg) = self.global_config.lock() {
                     cfg.trace_info_mask = mask;
                 }
+                self.announce(None, AsynException::TraceInfoMask);
             }
         }
-        self.announce(port, AsynException::TraceInfoMask);
     }
 
     /// Per-device variant of [`Self::set_trace_info_mask`].
@@ -681,20 +867,9 @@ impl TraceManager {
     /// the info mask into `pdevice->dpc.trace.traceInfoMask` when
     /// `pdevice != NULL` and announces per-device.
     pub fn set_device_trace_info_mask(&self, port: &str, addr: i32, mask: TraceInfoMask) {
-        if let Ok(mut configs) = self.device_configs.lock() {
-            configs
-                .entry((port.to_string(), addr))
-                .or_insert_with(TraceConfig::default)
-                .trace_info_mask = mask;
-        }
-        let sink = self.exception_sink.lock().ok().and_then(|g| g.clone());
-        if let Some(sink) = sink {
-            sink.announce(&ExceptionEvent {
-                port_name: port.to_string(),
-                exception: AsynException::TraceInfoMask,
-                addr,
-            });
-        }
+        self.write_scoped(port, Some(addr), AsynException::TraceInfoMask, |cfg| {
+            cfg.trace_info_mask = mask
+        });
     }
 
     /// C parity: asynManager.c:2923 fires `asynExceptionTraceFile`
@@ -703,24 +878,16 @@ impl TraceManager {
     /// port name is supplied).
     pub fn set_trace_file(&self, port: Option<&str>, file: TraceFile) {
         match port {
-            Some(name) => {
-                if let Ok(mut configs) = self.port_configs.lock() {
-                    configs
-                        .entry(name.to_string())
-                        .or_insert_with(TraceConfig::default)
-                        .file = file;
-                }
-            }
+            Some(name) => self.write_one_slot(name, None, Some(AsynException::TraceFile), |cfg| {
+                cfg.file = file
+            }),
             None => {
                 if let Ok(mut cfg) = self.global_config.lock() {
                     cfg.file = file;
                 }
+                // C `setTraceFile` announces only when `puserPvt->pport` is
+                // non-null (asynManager.c:2923).
             }
-        }
-        // C `setTraceFile` only announces when `puserPvt->pport` is
-        // non-null (asynManager.c:2923) — port-scoped only.
-        if port.is_some() {
-            self.announce(port, AsynException::TraceFile);
         }
     }
 
@@ -731,105 +898,84 @@ impl TraceManager {
     /// `dpCommon` when the asynUser carries a `pdevice`; writes the
     /// new FP there; fires `asynExceptionTraceFile`.
     pub fn set_device_trace_file(&self, port: &str, addr: i32, file: TraceFile) {
-        if let Ok(mut configs) = self.device_configs.lock() {
-            configs
-                .entry((port.to_string(), addr))
-                .or_insert_with(TraceConfig::default)
-                .file = file;
-        }
-        let sink = self.exception_sink.lock().ok().and_then(|g| g.clone());
-        if let Some(sink) = sink {
-            sink.announce(&ExceptionEvent {
-                port_name: port.to_string(),
-                exception: AsynException::TraceFile,
-                addr,
-            });
-        }
+        self.write_one_slot(port, Some(addr), Some(AsynException::TraceFile), |cfg| {
+            cfg.file = file
+        });
     }
 
     /// C parity: asynManager.c:2956 fires
     /// `asynExceptionTraceIOTruncateSize` after the mutation.
     ///
     /// C also re-allocates `traceBuffer` to `size` when the new truncate size
-    /// exceeds the current buffer (asynManager.c:2947-2953) — see
+    /// exceeds the current buffer (asynManager.c:2949-2954) — see
     /// [`TraceConfig::trace_buffer_size`], which bounds the errlog ESCAPE form.
     pub fn set_io_truncate_size(&self, port: Option<&str>, size: usize) {
         match port {
-            Some(name) => {
-                if let Ok(mut configs) = self.port_configs.lock() {
-                    let cfg = configs
-                        .entry(name.to_string())
-                        .or_insert_with(TraceConfig::default);
+            Some(name) => self.write_one_slot(
+                name,
+                None,
+                Some(AsynException::TraceIoTruncateSize),
+                |cfg| {
                     cfg.io_truncate_size = size;
                     cfg.trace_buffer_size = cfg.trace_buffer_size.max(size);
-                }
-            }
+                },
+            ),
             None => {
                 if let Ok(mut cfg) = self.global_config.lock() {
                     cfg.io_truncate_size = size;
                     cfg.trace_buffer_size = cfg.trace_buffer_size.max(size);
                 }
+                // C announces only when `puserPvt->pport` is non-null
+                // (asynManager.c:2956).
             }
-        }
-        // C `setTraceIOTruncateSize` only announces when
-        // `puserPvt->pport` is non-null (asynManager.c:2956).
-        if port.is_some() {
-            self.announce(port, AsynException::TraceIoTruncateSize);
         }
     }
 
     /// Per-device variant of [`Self::set_io_truncate_size`].
     ///
-    /// C parity: `setTraceIOTruncateSize` (asynManager.c:2929-2957) writes
+    /// C parity: `setTraceIOTruncateSize` (asynManager.c:2945-2959) writes
     /// the truncate size into the device `dpCommon` resolved by
     /// `findTracePvt` when the asynUser carries a device, and announces
     /// `asynExceptionTraceIOTruncateSize` per device.
     pub fn set_device_io_truncate_size(&self, port: &str, addr: i32, size: usize) {
-        if let Ok(mut configs) = self.device_configs.lock() {
-            let cfg = configs
-                .entry((port.to_string(), addr))
-                .or_insert_with(TraceConfig::default);
-            cfg.io_truncate_size = size;
-            cfg.trace_buffer_size = cfg.trace_buffer_size.max(size);
-        }
-        let sink = self.exception_sink.lock().ok().and_then(|g| g.clone());
-        if let Some(sink) = sink {
-            sink.announce(&ExceptionEvent {
-                port_name: port.to_string(),
-                exception: AsynException::TraceIoTruncateSize,
-                addr,
-            });
-        }
+        self.write_one_slot(
+            port,
+            Some(addr),
+            Some(AsynException::TraceIoTruncateSize),
+            |cfg| {
+                cfg.io_truncate_size = size;
+                cfg.trace_buffer_size = cfg.trace_buffer_size.max(size);
+            },
+        );
     }
 
     pub fn get_trace_mask(&self, port: Option<&str>) -> TraceMask {
-        if let Some(name) = port {
-            if let Ok(configs) = self.port_configs.lock() {
-                if let Some(cfg) = configs.get(name) {
-                    return cfg.trace_mask;
-                }
-            }
+        match port {
+            Some(name) => self
+                .with_dp_common(name, None, |cfg| cfg.trace_mask)
+                // C parity: default port mask is ERROR-only
+                // (asynManager.c:454); keep the poisoned-lock fallback in
+                // sync with TraceConfig::default.
+                .unwrap_or(TraceMask::ERROR),
+            None => self
+                .global_config
+                .lock()
+                .map(|c| c.trace_mask)
+                .unwrap_or(TraceMask::ERROR),
         }
-        self.global_config
-            .lock()
-            .map(|c| c.trace_mask)
-            // C parity: default port mask is ERROR-only (asynManager.c:454);
-            // keep the poisoned-lock fallback in sync with TraceConfig::default.
-            .unwrap_or(TraceMask::ERROR)
     }
 
     pub fn get_trace_io_mask(&self, port: Option<&str>) -> TraceIoMask {
-        if let Some(name) = port {
-            if let Ok(configs) = self.port_configs.lock() {
-                if let Some(cfg) = configs.get(name) {
-                    return cfg.trace_io_mask;
-                }
-            }
+        match port {
+            Some(name) => self
+                .with_dp_common(name, None, |cfg| cfg.trace_io_mask)
+                .unwrap_or(TraceIoMask::NODATA),
+            None => self
+                .global_config
+                .lock()
+                .map(|c| c.trace_io_mask)
+                .unwrap_or(TraceIoMask::NODATA),
         }
-        self.global_config
-            .lock()
-            .map(|c| c.trace_io_mask)
-            .unwrap_or(TraceIoMask::ASCII)
     }
 
     /// Every value C's `monitorStatus` reads back from the trace facility, for
@@ -844,7 +990,7 @@ impl TraceManager {
     /// per-device write read back at port level would snap the record's field
     /// back to the port's value on the next refresh.
     pub fn snapshot(&self, port: &str, addr: Option<i32>) -> TraceSnapshot {
-        self.with_effective_config(port, addr, |cfg| TraceSnapshot {
+        self.with_dp_common(port, addr, |cfg| TraceSnapshot {
             trace_mask: cfg.trace_mask,
             io_mask: cfg.trace_io_mask,
             info_mask: cfg.trace_info_mask,
@@ -867,19 +1013,18 @@ impl TraceManager {
     /// info mask, falling back to the global default. Read by
     /// `monitorStatus` (asynRecord.c:1079) to refresh `TINM`/`TINB0..3`.
     pub fn get_trace_info_mask(&self, port: Option<&str>) -> TraceInfoMask {
-        if let Some(name) = port {
-            if let Ok(configs) = self.port_configs.lock() {
-                if let Some(cfg) = configs.get(name) {
-                    return cfg.trace_info_mask;
-                }
-            }
+        match port {
+            Some(name) => self
+                .with_dp_common(name, None, |cfg| cfg.trace_info_mask)
+                // Matches `TraceConfig::default` — a port born with only the
+                // TIME bit (C `tracePvtInit`, asynManager.c:455).
+                .unwrap_or(TraceInfoMask::TIME),
+            None => self
+                .global_config
+                .lock()
+                .map(|c| c.trace_info_mask)
+                .unwrap_or(TraceInfoMask::TIME),
         }
-        self.global_config
-            .lock()
-            .map(|c| c.trace_info_mask)
-            // Matches `TraceConfig::default` — a port born with only the TIME
-            // bit (C `tracePvtInit`, asynManager.c:455).
-            .unwrap_or(TraceInfoMask::TIME)
     }
 }
 
@@ -889,65 +1034,114 @@ impl Default for TraceManager {
     }
 }
 
-/// Device-aware prefix formatter. When `addr` is `Some`, the port token
-/// is emitted as `port:addr` so trace consumers can disambiguate
-/// per-device output — mirroring C `printPort` (asynManager.c:3006-3022)
-/// which writes `[port,addr,reason]`.
-fn format_prefix_addr(port: &str, addr: Option<i32>, mask: TraceMask, cfg: &TraceConfig) -> String {
-    let mut parts = Vec::new();
+/// C `asynStripPath` (asynManager.c:479-487) — the basename after the last
+/// `/`, and after the last `\` as well on the Windows/Cygwin builds. Rust's
+/// `file!()` is a full workspace-relative path, so without this the SOURCE
+/// component prints a path where C prints a bare file name.
+fn strip_path(file: &str) -> &str {
+    let after_slash = match file.rfind('/') {
+        Some(i) => &file[i + 1..],
+        None => file,
+    };
+    #[cfg(windows)]
+    {
+        match after_slash.rfind('\\') {
+            Some(i) => &after_slash[i + 1..],
+            None => after_slash,
+        }
+    }
+    #[cfg(not(windows))]
+    after_slash
+}
+
+/// The four `ASYN_TRACEINFO_*` components of one trace line, in the order
+/// `traceVprintSource` (asynManager.c:3074-3081) and `traceVprintIOSource`
+/// (:3136-3139) test their bits: TIME, PORT, SOURCE, THREAD. Each is an
+/// independent `if` writing its own trailing space, so an unset bit
+/// contributes nothing and an empty info mask yields no prefix at all.
+///
+/// `reason` is `pasynUser->reason` — the asyn *parameter* index the user
+/// carries, not the trace mask this line is printed under. C's `printPort`
+/// (:3005-3023) writes the two side by side in one `[port,addr,reason]`
+/// triple, and `getAddr` (:2004) yields **-1** for a user that was never
+/// connected to a device, which is what `addr = None` means here.
+///
+/// `(file, line)` is `("", 0)` for the entry points that carry no source —
+/// C's `traceVprint` (:3060-3063) and `traceVprintIO` (:3113-3118) call the
+/// `*Source` form with exactly that, so SOURCE-enabled output of a plain
+/// `asynPrint` prints `[:0] ` in C too, and does here.
+///
+/// The mask itself is deliberately absent: C prints no severity token, and
+/// the `ERROR`/`FLOW`/`IO_DRIVER` label this used to append had no C source.
+fn format_prefix_addr(
+    port: &str,
+    addr: Option<i32>,
+    reason: i32,
+    source: (&str, u32),
+    cfg: &TraceConfig,
+) -> String {
+    let mut out = String::new();
 
     if cfg.trace_info_mask.contains(TraceInfoMask::TIME) {
-        use std::time::SystemTime;
-        let now = SystemTime::now()
-            .duration_since(SystemTime::UNIX_EPOCH)
-            .unwrap_or_default();
-        let secs = now.as_secs();
-        let millis = now.subsec_millis();
-        parts.push(format!("{secs}.{millis:03}"));
+        // C `printTime` (asynManager.c:2983-3001): `epicsTimeToStrftime` with
+        // `"%Y/%m/%d %H:%M:%S.%03f"`, which formats **local** time. chrono's
+        // `%.3f` is the same field including its leading dot.
+        let now = chrono::Local::now();
+        out.push_str(&now.format("%Y/%m/%d %H:%M:%S%.3f ").to_string());
     }
 
     if cfg.trace_info_mask.contains(TraceInfoMask::PORT) {
-        if let Some(a) = addr {
-            parts.push(format!("{port}:{a}"));
-        } else {
-            parts.push(port.to_string());
-        }
+        let a = addr.unwrap_or(-1);
+        out.push_str(&format!("[{port},{a},{reason}] "));
+    }
+
+    if cfg.trace_info_mask.contains(TraceInfoMask::SOURCE) {
+        let (file, line) = source;
+        out.push_str(&format!("[{}:{}] ", strip_path(file), line));
     }
 
     if cfg.trace_info_mask.contains(TraceInfoMask::THREAD) {
-        if let Some(name) = std::thread::current().name() {
-            parts.push(name.to_string());
-        } else {
-            parts.push(format!("{:?}", std::thread::current().id()));
-        }
+        let current = std::thread::current();
+        let name = current.name().unwrap_or("").to_string();
+        out.push_str(&format!(
+            "[{name},{},{}] ",
+            thread_token(),
+            thread_epics_priority()
+        ));
     }
 
-    let mask_name = mask_label(mask);
-    parts.push(mask_name.to_string());
-
-    parts.join(" ") + " "
+    out
 }
 
-fn mask_label(mask: TraceMask) -> &'static str {
-    if mask.contains(TraceMask::ERROR) {
-        "ERROR"
-    } else if mask.contains(TraceMask::WARNING) {
-        "WARNING"
-    } else if mask.contains(TraceMask::FLOW) {
-        "FLOW"
-    } else if mask.contains(TraceMask::IO_DEVICE) {
-        "IO_DEVICE"
-    } else if mask.contains(TraceMask::IO_DRIVER) {
-        "IO_DRIVER"
-    } else if mask.contains(TraceMask::IO_FILTER) {
-        "IO_FILTER"
-    } else {
-        "TRACE"
-    }
+/// C prints `epicsThreadGetIdSelf()` with `%p` — an opaque per-thread token,
+/// unique within the process and stable for the thread's life. `ThreadId` is
+/// the portable equivalent and carries no public integer, so hash it to one
+/// and render it pointer-style. Like a pointer, the value differs between
+/// runs; what a reader uses it for — telling two threads apart in one log —
+/// is preserved.
+fn thread_token() -> String {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    std::thread::current().id().hash(&mut h);
+    format!("{:#x}", h.finish())
+}
+
+/// C prints `epicsThreadGetPrioritySelf()`, the EPICS band (0..=99) stored on
+/// the thread at creation — 50 for a `Medium` IOC thread even where the OS
+/// refused `SCHED_FIFO`.
+///
+/// `epics-libcom-rs` bands threads through `runtime::task::enter_ioc_thread`
+/// but exposes no read-back, and adding one is a change to that crate rather
+/// than to this one. Until it does, this reports 0, which is what a C IOC
+/// prints for a thread that took no EPICS band — the tokio worker an asyn
+/// port actor runs on today, and not the banded thread it runs on under the
+/// exec backend.
+fn thread_epics_priority() -> u32 {
+    0
 }
 
 /// The data section of one `asynPrintIO` line — C `traceVprintIOSource`
-/// (asynManager.c:3143-3190), appended to the message line.
+/// (asynManager.c:3145-3196), appended to the message line.
 ///
 /// The I/O mask is a **bitfield** and C tests each bit in its own `if`, so the
 /// blocks are independent and appear in C's order — ASCII (:3146), ESCAPE
@@ -960,7 +1154,7 @@ fn mask_label(mask: TraceMask) -> &'static str {
 /// - ASCII and ESCAPE print only when `nBytes > 0`.
 /// - HEX prints when `traceTruncateSize > 0` — including its trailing newline
 ///   on an empty payload.
-/// - A zero mask *or* a zero truncate size emits the bare newline of :3186-3190.
+/// - A zero mask *or* a zero truncate size emits the bare newline of :3190-3196.
 fn append_io_data(out: &mut Vec<u8>, data: &[u8], cfg: &TraceConfig) {
     use std::fmt::Write as _;
 
@@ -973,7 +1167,19 @@ fn append_io_data(out: &mut Vec<u8>, data: &[u8], cfg: &TraceConfig) {
         // C `fprintf(fp, "%.*s\n", (int)nBytes, buffer)` — the raw bytes, not a
         // printable-only rendering: a control byte reaches the terminal as
         // itself.
-        out.extend_from_slice(data);
+        //
+        // The precision caps a `%s` conversion, and `%s` stops at the first
+        // NUL: it is an upper bound on the bytes taken from the string, not a
+        // count of bytes to copy. So a payload with an embedded NUL prints its
+        // head only, and the tail of it never reaches the trace file. ESCAPE
+        // and HEX below are byte loops and do print the whole payload — that
+        // asymmetry is C's, and is why an operator diagnosing binary traffic
+        // is told to turn ESCAPE on.
+        let ascii = match data.iter().position(|&b| b == 0) {
+            Some(nul) => &data[..nul],
+            None => data,
+        };
+        out.extend_from_slice(ascii);
         out.push(b'\n');
     }
 
@@ -1062,13 +1268,13 @@ macro_rules! asyn_trace_io {
         if let Some(ref __mgr) = $mgr {
             let __mgr: &$crate::trace::TraceManager = __mgr;
             if __mgr.is_enabled($port, $mask) {
-                __mgr.output_io($port, $mask, $data, &format!($($arg)*));
+                __mgr.output_io($port, $mask, $data, &format!($($arg)*), file!(), line!());
             }
         }
     };
     ($mgr:expr, $port:expr, $mask:expr, $data:expr, $($arg:tt)*) => {
         if $mgr.is_enabled($port, $mask) {
-            $mgr.output_io($port, $mask, $data, &format!($($arg)*));
+            $mgr.output_io($port, $mask, $data, &format!($($arg)*), file!(), line!());
         }
     };
 }
@@ -1077,8 +1283,8 @@ macro_rules! asyn_trace_io {
 ///
 /// `$addr` is the device address. Both the enable check and the output
 /// formatter resolve config in C-parity order: device → port → global
-/// (asynManager.c:530-549 / 3038-3047). Use this in drivers that have
-/// distinct addresses on a multi-device port; the addr appears in the
+/// (asynManager.c:538-543 / 548-550 / 3067-3073). Use this in drivers that
+/// have distinct addresses on a multi-device port; the addr appears in the
 /// emitted `[port:addr]` prefix when `TraceInfoMask::PORT` is set.
 #[macro_export]
 macro_rules! asyn_trace_device {
@@ -1089,6 +1295,7 @@ macro_rules! asyn_trace_device {
                 __mgr.output_device_with_source(
                     $port,
                     Some($addr),
+                    0,
                     $mask,
                     file!(),
                     line!(),
@@ -1102,6 +1309,7 @@ macro_rules! asyn_trace_device {
             $mgr.output_device_with_source(
                 $port,
                 Some($addr),
+                0,
                 $mask,
                 file!(),
                 line!(),
@@ -1121,9 +1329,12 @@ macro_rules! asyn_trace_device_io {
                 __mgr.output_device_io(
                     $port,
                     Some($addr),
+                    0,
                     $mask,
                     $data,
                     &format!($($arg)*),
+                    file!(),
+                    line!(),
                 );
             }
         }
@@ -1133,9 +1344,12 @@ macro_rules! asyn_trace_device_io {
             $mgr.output_device_io(
                 $port,
                 Some($addr),
+                0,
                 $mask,
                 $data,
                 &format!($($arg)*),
+                file!(),
+                line!(),
             );
         }
     };
@@ -1159,7 +1373,7 @@ mod tests {
 
     /// C asyn defines 6 trace bits in `asynDriver.h:211-216`. This
     /// test fences that we don't accidentally re-introduce extra
-    /// bits — `grep -rn "ASYN_TRACE_STATE" ~/codes/epics-modules/asyn`
+    /// bits — `grep -rn "ASYN_TRACE_STATE" $EPICS_MODULES/asyn`
     /// returns 0 hits, so any additional bit would be invented.
     #[test]
     fn test_six_bits_match_c_asyn_header() {
@@ -1280,13 +1494,18 @@ mod tests {
         );
     }
 
+    /// `asynSetTraceMask` with no port name passes `pasynUser = NULL`
+    /// (asynShellCommands.c:646-660), so `setTraceMask` writes
+    /// `pasynBase->trace` and nothing else (asynManager.c:2779-2783). The
+    /// global slot is read back by `getTraceMask(NULL)` and by no port.
     #[test]
     fn test_set_global_mask() {
         let mgr = TraceManager::new();
         mgr.set_trace_mask(None, TraceMask::ERROR | TraceMask::FLOW);
+        assert_eq!(mgr.get_trace_mask(None), TraceMask::ERROR | TraceMask::FLOW);
+        // ...and a port keeps its `tracePvtInit` birth mask (:454).
         assert!(mgr.is_enabled("any", TraceMask::ERROR));
-        assert!(mgr.is_enabled("any", TraceMask::FLOW));
-        assert!(!mgr.is_enabled("any", TraceMask::WARNING));
+        assert!(!mgr.is_enabled("any", TraceMask::FLOW));
     }
 
     #[test]
@@ -1349,10 +1568,11 @@ mod tests {
     #[test]
     fn the_ascii_block_is_the_raw_bytes_not_a_printable_rendering() {
         assert_eq!(blocks(b"hi\r\n", TraceIoMask::ASCII, 80), b"hi\r\n\n");
-        assert_eq!(
-            blocks(&[0x00, 0x7f, 0x41], TraceIoMask::ASCII, 80),
-            &[0x00, 0x7f, 0x41, b'\n']
-        );
+        // …but only up to the first NUL: `%.*s` bounds a `%s` conversion and
+        // `%s` stops there, so a leading-NUL payload prints an empty data
+        // line. This case used to assert the whole slice, which was the
+        // R18-67 defect written down as an expectation.
+        assert_eq!(blocks(&[0x00, 0x7f, 0x41], TraceIoMask::ASCII, 80), b"\n");
         // Invalid UTF-8 reaches the sink as itself.
         assert_eq!(
             blocks(&[0xff, 0xfe], TraceIoMask::ASCII, 80),
@@ -1384,7 +1604,7 @@ mod tests {
         assert_eq!(blocks(b"", TraceIoMask::HEX, 80), b"\n");
     }
 
-    /// C's two no-data paths (asynManager.c:3186-3190): a zero mask, or a zero
+    /// C's two no-data paths (asynManager.c:3190-3196): a zero mask, or a zero
     /// truncate size, emits a bare newline and nothing else. The port defaulted
     /// to ASCII on an empty mask and read a zero truncate size as "unlimited".
     #[test]
@@ -1446,7 +1666,7 @@ mod tests {
 
     /// The ESCAPE form's destination is C's `tracePvt.traceBuffer`
     /// (asynManager.c:3159), 80 bytes until `setTraceIOTruncateSize` grows it
-    /// (:2947-2953) — so an escape-heavy errlog line is cut at
+    /// (:2949-2954) — so an escape-heavy errlog line is cut at
     /// `traceBufferSize - 1`. The stream branch has no such buffer.
     #[test]
     fn format_escape_is_bounded_by_the_trace_buffer_on_the_errlog_branch_only() {
@@ -1481,11 +1701,12 @@ mod tests {
         // supplies the missing case (CBUG-D4 refused) so it matches errlog: `\0`.
         assert_eq!(format_escape(data, &TraceFile::Stderr, n), r"a\0b");
         assert_eq!(format_escape(data, &TraceFile::Stdout, n), r"a\0b");
+        let dir = tempfile::tempdir().expect("fixture root");
         let f = TraceFile::File(Arc::new(Mutex::new(
-            std::fs::File::create(std::env::temp_dir().join("asyn_r17_46.txt")).unwrap(),
+            std::fs::File::create(dir.path().join("asyn_r17_46.txt")).unwrap(),
         )));
         assert_eq!(format_escape(data, &f, n), r"a\0b");
-        let _ = std::fs::remove_file(std::env::temp_dir().join("asyn_r17_46.txt"));
+        let _ = std::fs::remove_file(dir.path().join("asyn_r17_46.txt"));
 
         // And the default TraceConfig is one of the FILE* sinks, not errlog.
         assert!(matches!(TraceConfig::default().file, TraceFile::Stderr));
@@ -1493,7 +1714,7 @@ mod tests {
 
     /// C `setTraceIOTruncateSize` reallocates `traceBuffer` to the new size when
     /// it exceeds the current one, and never shrinks it back
-    /// (asynManager.c:2947-2953) — so a bigger truncate size widens the ESCAPE
+    /// (asynManager.c:2949-2954) — so a bigger truncate size widens the ESCAPE
     /// bound, and a smaller one afterwards does not narrow it.
     #[test]
     fn a_bigger_truncate_size_grows_the_trace_buffer_and_a_smaller_one_does_not_shrink_it() {
@@ -1508,20 +1729,30 @@ mod tests {
     #[test]
     fn test_output_to_buffer() {
         let mgr = TraceManager::new();
-        mgr.set_trace_mask(None, TraceMask::ERROR | TraceMask::IO_DRIVER);
-        mgr.set_trace_info_mask(None, TraceInfoMask::PORT); // only port name for predictability
+        // `asynSetTraceMask testport -1 ...` — the port's own dpCommon, which
+        // is the only slot the emit path reads (asynManager.c:536-551).
+        mgr.set_trace_mask(Some("testport"), TraceMask::ERROR | TraceMask::IO_DRIVER);
+        mgr.set_trace_info_mask(Some("testport"), TraceInfoMask::PORT); // only port name for predictability
 
         // Create a shared buffer as a file
-        let temp = std::env::temp_dir().join("asyn_trace_test.txt");
+        let dir = tempfile::tempdir().expect("fixture root");
+        let temp = dir.path().join("asyn_trace_test.txt");
         let file = std::fs::File::create(&temp).unwrap();
-        mgr.set_trace_file(None, TraceFile::File(Arc::new(Mutex::new(file))));
+        mgr.set_trace_file(
+            Some("testport"),
+            TraceFile::File(Arc::new(Mutex::new(file))),
+        );
 
         mgr.output("testport", TraceMask::ERROR, "something broke");
 
         // Read back
         let contents = std::fs::read_to_string(&temp).unwrap();
-        assert!(contents.contains("testport"));
-        assert!(contents.contains("ERROR"));
+        // C `printPort` writes the whole `[port,addr,reason]` triple
+        // (asynManager.c:3018), and `getAddr` (:2004) yields -1 for the
+        // port-level user `output` stands in for. No severity token: C
+        // prints none.
+        assert!(contents.contains("[testport,-1,0] "), "got {contents:?}");
+        assert!(!contents.contains("ERROR"), "C prints no mask label");
         assert!(contents.contains("something broke"));
         let _ = std::fs::remove_file(&temp);
     }
@@ -1529,19 +1760,23 @@ mod tests {
     #[test]
     fn test_output_io_to_buffer() {
         let mgr = TraceManager::new();
-        mgr.set_trace_mask(None, TraceMask::IO_DRIVER);
-        mgr.set_trace_info_mask(None, TraceInfoMask::PORT);
-        mgr.set_trace_io_mask(None, TraceIoMask::ESCAPE);
+        mgr.set_trace_mask(Some("testport"), TraceMask::IO_DRIVER);
+        mgr.set_trace_info_mask(Some("testport"), TraceInfoMask::PORT);
+        mgr.set_trace_io_mask(Some("testport"), TraceIoMask::ESCAPE);
 
-        let temp = std::env::temp_dir().join("asyn_trace_io_test.txt");
+        let dir = tempfile::tempdir().expect("fixture root");
+        let temp = dir.path().join("asyn_trace_io_test.txt");
         let file = std::fs::File::create(&temp).unwrap();
-        mgr.set_trace_file(None, TraceFile::File(Arc::new(Mutex::new(file))));
+        mgr.set_trace_file(
+            Some("testport"),
+            TraceFile::File(Arc::new(Mutex::new(file))),
+        );
 
-        mgr.output_io("testport", TraceMask::IO_DRIVER, b"OK\r\n", "read:");
+        mgr.output_io("testport", TraceMask::IO_DRIVER, b"OK\r\n", "read:", "", 0);
 
         let contents = std::fs::read_to_string(&temp).unwrap();
-        assert!(contents.contains("testport"));
-        assert!(contents.contains("IO_DRIVER"));
+        assert!(contents.contains("[testport,-1,0] "), "got {contents:?}");
+        assert!(!contents.contains("IO_DRIVER"), "C prints no mask label");
         assert!(contents.contains("read:"));
         assert!(contents.contains("OK\\r\\n"));
         let _ = std::fs::remove_file(&temp);
@@ -1572,17 +1807,18 @@ mod tests {
     #[test]
     fn test_io_truncate_integration() {
         let mgr = TraceManager::new();
-        mgr.set_trace_mask(None, TraceMask::IO_DRIVER);
-        mgr.set_trace_info_mask(None, TraceInfoMask::PORT);
+        mgr.set_trace_mask(Some("p"), TraceMask::IO_DRIVER);
+        mgr.set_trace_info_mask(Some("p"), TraceInfoMask::PORT);
         // An I/O form is an operator's choice — a port has none by default.
-        mgr.set_trace_io_mask(None, TraceIoMask::ASCII);
-        mgr.set_io_truncate_size(None, 3);
+        mgr.set_trace_io_mask(Some("p"), TraceIoMask::ASCII);
+        mgr.set_io_truncate_size(Some("p"), 3);
 
-        let temp = std::env::temp_dir().join("asyn_trace_trunc_test.txt");
+        let dir = tempfile::tempdir().expect("fixture root");
+        let temp = dir.path().join("asyn_trace_trunc_test.txt");
         let file = std::fs::File::create(&temp).unwrap();
-        mgr.set_trace_file(None, TraceFile::File(Arc::new(Mutex::new(file))));
+        mgr.set_trace_file(Some("p"), TraceFile::File(Arc::new(Mutex::new(file))));
 
-        mgr.output_io("p", TraceMask::IO_DRIVER, b"hello world", "write:");
+        mgr.output_io("p", TraceMask::IO_DRIVER, b"hello world", "write:", "", 0);
 
         let contents = std::fs::read_to_string(&temp).unwrap();
         // ASCII format, truncated to 3 bytes: "hel"
@@ -1594,7 +1830,8 @@ mod tests {
     #[test]
     fn test_write_line_single_call() {
         // Verify that File variant does a single write_all
-        let temp = std::env::temp_dir().join("asyn_trace_single_write.txt");
+        let dir = tempfile::tempdir().expect("fixture root");
+        let temp = dir.path().join("asyn_trace_single_write.txt");
         let file = std::fs::File::create(&temp).unwrap();
         let tf = TraceFile::File(Arc::new(Mutex::new(file)));
 
@@ -1713,7 +1950,7 @@ mod tests {
     // must resolve config device → port → global. Previously the
     // port-only output_*() walked port→global, ignoring per-device
     // overrides — `is_enabled_device` saw the device level but the
-    // emit path did not. asynManager.c:530-549, 3038-3047, 3090-3099.
+    // emit path did not. asynManager.c:538-543, 548-550, 3067-3073, 3123-3133.
     // ----------------------------------------------------------------
 
     fn read_lines(path: &std::path::Path) -> Vec<String> {
@@ -1727,6 +1964,10 @@ mod tests {
     #[test]
     fn output_device_uses_device_config_when_present() {
         let mgr = TraceManager::new();
+        // A device slot is addressable only on an ASYN_MULTIDEVICE port
+        // (C `locateDevice`, asynManager.c:574), so the port has to say so
+        // before any of the per-device writes below name a device.
+        mgr.register_port("dev_p", true);
         // Port allows ERROR; device allows ERROR | FLOW.
         mgr.set_trace_mask(Some("dev_p"), TraceMask::ERROR);
         mgr.set_device_trace_mask("dev_p", 5, TraceMask::ERROR | TraceMask::FLOW);
@@ -1736,27 +1977,20 @@ mod tests {
         // TIME, so turn PORT on where the emit actually reads it.
         mgr.set_device_trace_info_mask("dev_p", 5, TraceInfoMask::PORT);
 
-        let temp = std::env::temp_dir().join("asyn_trace_device_output.txt");
+        let dir = tempfile::tempdir().expect("fixture root");
+        let temp = dir.path().join("asyn_trace_device_output.txt");
         let file = std::fs::File::create(&temp).unwrap();
         let tf = TraceFile::File(Arc::new(Mutex::new(file)));
         // Install the device-specific file so we can verify the device
         // config is what's used (not the port config).
         let file2 = std::fs::File::create(&temp).unwrap();
         let tf2 = TraceFile::File(Arc::new(Mutex::new(file2)));
-        if let Ok(mut cfgs) = mgr.device_configs.lock() {
-            if let Some(c) = cfgs.get_mut(&("dev_p".to_string(), 5)) {
-                c.file = tf;
-            }
-        }
-        if let Ok(mut cfgs) = mgr.port_configs.lock() {
-            if let Some(c) = cfgs.get_mut("dev_p") {
-                c.file = tf2;
-            }
-        }
+        mgr.set_device_trace_file("dev_p", 5, tf);
+        mgr.set_trace_file(Some("dev_p"), tf2);
 
         // FLOW is enabled at device, disabled at port — output_device
         // must use the device config and emit.
-        mgr.output_device("dev_p", Some(5), TraceMask::FLOW, "device-flow");
+        mgr.output_device("dev_p", Some(5), 0, TraceMask::FLOW, "device-flow");
 
         let lines = read_lines(&temp);
         assert!(
@@ -1765,54 +1999,54 @@ mod tests {
         );
         // Prefix should embed addr.
         assert!(
-            lines.iter().any(|l| l.contains("dev_p:5")),
+            lines.iter().any(|l| l.contains("[dev_p,5,0] ")),
             "device output prefix should embed addr, got {lines:?}"
         );
         let _ = std::fs::remove_file(&temp);
     }
 
+    /// A device address with no device configuration reads the port's own
+    /// `dpCommon`, and that is where the port-scoped writes below landed:
+    /// `findDpCommon` picks one struct with no chain behind it
+    /// (asynManager.c:536-543), and a port-scoped write pushed itself into
+    /// every device slot, so there is nothing for a chain to reach past.
+    /// The prefix still carries the addr the caller named.
     #[test]
-    fn output_device_falls_back_to_port_then_global() {
-        // No device config — must use port; no port — must use global.
+    fn output_device_with_no_device_config_reads_the_port_slot() {
         let mgr = TraceManager::new();
-        mgr.set_trace_info_mask(None, TraceInfoMask::PORT);
-        mgr.set_trace_mask(None, TraceMask::ERROR);
-        let temp = std::env::temp_dir().join("asyn_trace_device_fallback.txt");
+        mgr.register_port("no_overrides", true);
+        mgr.set_trace_info_mask(Some("no_overrides"), TraceInfoMask::PORT);
+        mgr.set_trace_mask(Some("no_overrides"), TraceMask::ERROR);
+        let dir = tempfile::tempdir().expect("fixture root");
+        let temp = dir.path().join("asyn_trace_device_fallback.txt");
         let file = std::fs::File::create(&temp).unwrap();
-        mgr.set_trace_file(None, TraceFile::File(Arc::new(Mutex::new(file))));
+        mgr.set_trace_file(
+            Some("no_overrides"),
+            TraceFile::File(Arc::new(Mutex::new(file))),
+        );
 
-        mgr.output_device("no_overrides", Some(0), TraceMask::ERROR, "global-error");
+        mgr.output_device("no_overrides", Some(0), 0, TraceMask::ERROR, "port-error");
         let lines = read_lines(&temp);
-        assert!(lines.iter().any(|l| l.contains("global-error")));
-        // Prefix still embeds addr even when using global cfg.
-        assert!(lines.iter().any(|l| l.contains("no_overrides:0")));
+        assert!(lines.iter().any(|l| l.contains("port-error")));
+        assert!(lines.iter().any(|l| l.contains("[no_overrides,0,0] ")));
         let _ = std::fs::remove_file(&temp);
     }
 
     #[test]
     fn output_device_with_source_includes_source_when_device_info_mask_has_it() {
         let mgr = TraceManager::new();
+        mgr.register_port("p", true);
         mgr.set_trace_mask(Some("p"), TraceMask::ERROR);
-        // Device config carries the SOURCE info bit; port does not. Use
-        // direct map mutation since per-info-bit/per-truncate device
-        // setters are not part of this commit (Trace device-setter
-        // surface stays narrow; only the output path is fixed here).
+        // Device config carries the SOURCE info bit; port does not.
         mgr.set_device_trace_mask("p", 1, TraceMask::ERROR);
-        if let Ok(mut cfgs) = mgr.device_configs.lock() {
-            if let Some(c) = cfgs.get_mut(&("p".to_string(), 1)) {
-                c.trace_info_mask = TraceInfoMask::PORT | TraceInfoMask::SOURCE;
-            }
-        }
+        mgr.set_device_trace_info_mask("p", 1, TraceInfoMask::PORT | TraceInfoMask::SOURCE);
 
-        let temp = std::env::temp_dir().join("asyn_trace_device_source.txt");
+        let dir = tempfile::tempdir().expect("fixture root");
+        let temp = dir.path().join("asyn_trace_device_source.txt");
         let file = std::fs::File::create(&temp).unwrap();
-        if let Ok(mut cfgs) = mgr.device_configs.lock() {
-            if let Some(c) = cfgs.get_mut(&("p".to_string(), 1)) {
-                c.file = TraceFile::File(Arc::new(Mutex::new(file)));
-            }
-        }
+        mgr.set_device_trace_file("p", 1, TraceFile::File(Arc::new(Mutex::new(file))));
 
-        mgr.output_device_with_source("p", Some(1), TraceMask::ERROR, "src.rs", 42, "msg");
+        mgr.output_device_with_source("p", Some(1), 0, TraceMask::ERROR, "src.rs", 42, "msg");
         let lines = read_lines(&temp);
         assert!(
             lines.iter().any(|l| l.contains("[src.rs:42]")),
@@ -1826,28 +2060,30 @@ mod tests {
         // C parity: per-device traceTruncateSize takes priority — the
         // emit path resolves config device → port → global.
         let mgr = TraceManager::new();
+        mgr.register_port("p", true);
         mgr.set_trace_mask(Some("p"), TraceMask::IO_DRIVER);
         mgr.set_io_truncate_size(Some("p"), 64);
-        // Device override: truncate to 3 bytes (direct map mutation —
-        // see note above on the narrow per-device setter surface).
+        // Device override: truncate to 3 bytes.
         mgr.set_device_trace_mask("p", 0, TraceMask::IO_DRIVER);
-        if let Ok(mut cfgs) = mgr.device_configs.lock() {
-            if let Some(c) = cfgs.get_mut(&("p".to_string(), 0)) {
-                c.io_truncate_size = 3;
-                c.trace_info_mask = TraceInfoMask::PORT;
-                c.trace_io_mask = TraceIoMask::ASCII;
-            }
-        }
+        mgr.set_device_io_truncate_size("p", 0, 3);
+        mgr.set_device_trace_info_mask("p", 0, TraceInfoMask::PORT);
+        mgr.set_device_trace_io_mask("p", 0, TraceIoMask::ASCII);
 
-        let temp = std::env::temp_dir().join("asyn_trace_device_trunc.txt");
+        let dir = tempfile::tempdir().expect("fixture root");
+        let temp = dir.path().join("asyn_trace_device_trunc.txt");
         let file = std::fs::File::create(&temp).unwrap();
-        if let Ok(mut cfgs) = mgr.device_configs.lock() {
-            if let Some(c) = cfgs.get_mut(&("p".to_string(), 0)) {
-                c.file = TraceFile::File(Arc::new(Mutex::new(file)));
-            }
-        }
+        mgr.set_device_trace_file("p", 0, TraceFile::File(Arc::new(Mutex::new(file))));
 
-        mgr.output_device_io("p", Some(0), TraceMask::IO_DRIVER, b"hello world", "rx:");
+        mgr.output_device_io(
+            "p",
+            Some(0),
+            0,
+            TraceMask::IO_DRIVER,
+            b"hello world",
+            "rx:",
+            "",
+            0,
+        );
         let contents = std::fs::read_to_string(&temp).unwrap_or_default();
         assert!(contents.contains("hel"));
         // 4th byte onward must be dropped by device-level truncation.
@@ -1861,6 +2097,7 @@ mod tests {
         // format!() side-effect must not even run (cheap test: ensure
         // it doesn't panic on a closed configuration).
         let mgr = TraceManager::new();
+        mgr.register_port("p", true);
         // Globally only ERROR; device explicitly disables ERROR.
         mgr.set_device_trace_mask("p", 0, TraceMask::empty());
         asyn_trace_device!(mgr, "p", 0, TraceMask::ERROR, "should-not-emit");
@@ -1870,6 +2107,7 @@ mod tests {
     #[test]
     fn asyn_trace_device_macro_emits_when_device_enables_flow() {
         let mgr = TraceManager::new();
+        mgr.register_port("p", true);
         // Port disables FLOW; device enables FLOW.
         mgr.set_trace_mask(Some("p"), TraceMask::ERROR);
         mgr.set_device_trace_mask("p", 7, TraceMask::FLOW);
@@ -1877,18 +2115,155 @@ mod tests {
         // a fresh device carries only TIME, so enable PORT on the device slot.
         mgr.set_device_trace_info_mask("p", 7, TraceInfoMask::PORT);
 
-        let temp = std::env::temp_dir().join("asyn_trace_device_macro.txt");
+        let dir = tempfile::tempdir().expect("fixture root");
+        let temp = dir.path().join("asyn_trace_device_macro.txt");
         let file = std::fs::File::create(&temp).unwrap();
-        if let Ok(mut cfgs) = mgr.device_configs.lock() {
-            if let Some(c) = cfgs.get_mut(&("p".to_string(), 7)) {
-                c.file = TraceFile::File(Arc::new(Mutex::new(file)));
-            }
-        }
+        mgr.set_device_trace_file("p", 7, TraceFile::File(Arc::new(Mutex::new(file))));
 
         asyn_trace_device!(mgr, "p", 7, TraceMask::FLOW, "{}", "device-msg");
         let contents = std::fs::read_to_string(&temp).unwrap_or_default();
         assert!(contents.contains("device-msg"));
-        assert!(contents.contains("p:7"));
+        assert!(contents.contains("[p,7,0] "));
+        let _ = std::fs::remove_file(&temp);
+    }
+
+    /// R18-67. C's ASCII block is `fprintf(fp, "%.*s\n", nBytes, buffer)`
+    /// (asynManager.c:3148). The precision bounds a `%s` conversion, and
+    /// `%s` stops at the first NUL, so the tail after an embedded NUL is
+    /// never printed. ESCAPE and HEX are byte loops (:3153-3165, :3167-3187)
+    /// and do print it — the asymmetry is C's.
+    #[test]
+    fn the_ascii_block_stops_at_an_embedded_nul_where_escape_does_not() {
+        let payload = b"head\0tail";
+
+        let cfg = TraceConfig {
+            trace_io_mask: TraceIoMask::ASCII,
+            io_truncate_size: 80,
+            ..TraceConfig::default()
+        };
+        let mut out = Vec::new();
+        append_io_data(&mut out, payload, &cfg);
+        assert_eq!(
+            out, b"head\n",
+            "the ASCII block stops at the NUL, got {out:?}"
+        );
+
+        // The same payload under ESCAPE renders every byte, NUL included.
+        let cfg = TraceConfig {
+            trace_io_mask: TraceIoMask::ESCAPE,
+            io_truncate_size: 80,
+            ..TraceConfig::default()
+        };
+        let mut out = Vec::new();
+        append_io_data(&mut out, payload, &cfg);
+        assert_eq!(out, b"head\\0tail\n", "ESCAPE is a byte loop, got {out:?}");
+    }
+
+    /// R18-66. `ASYN_TRACEINFO_SOURCE` on the `asynPrintIO` path. C's
+    /// `asynPrintIO` captures `__FILE__`/`__LINE__` (asynDriver.h:296-299)
+    /// and `traceVprintIOSource` prints them through `printSource`
+    /// (asynManager.c:3138), so an I/O trace carries a source component
+    /// exactly as a message trace does.
+    #[test]
+    fn a_source_only_print_io_emits_the_file_and_line() {
+        let mgr = TraceManager::new();
+        mgr.set_trace_mask(Some("p"), TraceMask::IO_DRIVER);
+        mgr.set_trace_info_mask(Some("p"), TraceInfoMask::SOURCE);
+        mgr.set_trace_io_mask(Some("p"), TraceIoMask::ASCII);
+
+        let dir = tempfile::tempdir().expect("fixture root");
+        let temp = dir.path().join("asyn_trace_io_source.txt");
+        let file = std::fs::File::create(&temp).unwrap();
+        mgr.set_trace_file(Some("p"), TraceFile::File(Arc::new(Mutex::new(file))));
+
+        mgr.output_io(
+            "p",
+            TraceMask::IO_DRIVER,
+            b"OK",
+            "read 2 bytes",
+            "crates/asyn-rs/src/drivers/serial_port.rs",
+            1355,
+        );
+
+        let contents = std::fs::read_to_string(&temp).unwrap();
+        assert!(
+            contents.starts_with("[serial_port.rs:1355] read 2 bytes\n"),
+            "SOURCE is the only info bit, so it is the whole prefix: {contents:?}"
+        );
+        let _ = std::fs::remove_file(&temp);
+    }
+
+    /// R18-64. The prefix is C's, component by component: `printTime`
+    /// (asynManager.c:2983-3001), `printPort` (:3005-3023), `printSource`
+    /// (:3025-3036) and `printThread` (:2968-2981), tested in the order
+    /// `traceVprintSource` tests their bits (:3078-3081).
+    #[test]
+    fn the_prefix_is_c_s_four_components_in_c_s_order() {
+        let mgr = TraceManager::new();
+        mgr.set_trace_mask(Some("p"), TraceMask::ERROR);
+        mgr.set_trace_info_mask(
+            Some("p"),
+            TraceInfoMask::TIME
+                | TraceInfoMask::PORT
+                | TraceInfoMask::SOURCE
+                | TraceInfoMask::THREAD,
+        );
+
+        let dir = tempfile::tempdir().expect("fixture root");
+        let temp = dir.path().join("asyn_trace_prefix.txt");
+        let file = std::fs::File::create(&temp).unwrap();
+        mgr.set_trace_file(Some("p"), TraceFile::File(Arc::new(Mutex::new(file))));
+
+        mgr.output_device_with_source(
+            "p",
+            Some(3),
+            7,
+            TraceMask::ERROR,
+            "crates/asyn-rs/src/drivers/ip_port.rs",
+            871,
+            "read 2 bytes",
+        );
+
+        let line = read_lines(&temp).remove(0);
+
+        // TIME: `%Y/%m/%d %H:%M:%S.%03f`, not the raw epoch this used to emit.
+        // `YYYY/MM/DD HH:MM:SS.mmm ` — 23 characters plus the trailing space
+        // C's `fprintf(fp, "%s ", nowText)` writes.
+        let (time, rest) = line.split_at(24);
+        assert!(
+            time.as_bytes()[4] == b'/'
+                && time.as_bytes()[7] == b'/'
+                && time.as_bytes()[10] == b' '
+                && time.as_bytes()[13] == b':'
+                && time.as_bytes()[16] == b':'
+                && time.as_bytes()[19] == b'.'
+                && time.as_bytes()[23] == b' ',
+            "strftime TIME, got {time:?}"
+        );
+        assert!(
+            time[..4].chars().all(|c| c.is_ascii_digit()),
+            "a four-digit year, not an epoch second count: {time:?}"
+        );
+
+        // PORT carries addr AND reason; SOURCE is stripped to a basename and
+        // sits between PORT and THREAD; THREAD carries id and priority.
+        let rest = rest
+            .strip_prefix("[p,3,7] ")
+            .unwrap_or_else(|| panic!("PORT triple, got {rest:?}"));
+        let rest = rest
+            .strip_prefix("[ip_port.rs:871] ")
+            .unwrap_or_else(|| panic!("asynStripPath-ed SOURCE, got {rest:?}"));
+        let (thread, msg) = rest
+            .split_once("] ")
+            .unwrap_or_else(|| panic!("THREAD, got {rest:?}"));
+        assert!(
+            thread.starts_with('[') && thread.matches(',').count() == 2,
+            "THREAD is `[name,id,priority]`, got {thread:?}"
+        );
+        assert_eq!(msg, "read 2 bytes");
+
+        // And no mask label anywhere: C prints none.
+        assert!(!line.contains("ERROR"), "no mask label, got {line:?}");
         let _ = std::fs::remove_file(&temp);
     }
 
@@ -1909,26 +2284,15 @@ mod tests {
             obs.lock().unwrap().push((ev.exception, ev.addr));
         });
 
+        mgr.register_port("p", true);
         mgr.set_trace_io_mask(Some("p"), TraceIoMask::ASCII);
         mgr.set_device_trace_io_mask("p", 4, TraceIoMask::HEX);
 
-        // Device slot exists with the new mask.
-        let stored = mgr
-            .device_configs
-            .lock()
-            .unwrap()
-            .get(&("p".to_string(), 4))
-            .map(|c| c.trace_io_mask);
-        assert_eq!(stored, Some(TraceIoMask::HEX));
+        // Device slot carries the new mask.
+        assert_eq!(mgr.snapshot("p", Some(4)).io_mask, TraceIoMask::HEX);
 
-        // Port mask untouched by the per-device write.
-        let port_mask = mgr
-            .port_configs
-            .lock()
-            .unwrap()
-            .get("p")
-            .map(|c| c.trace_io_mask);
-        assert_eq!(port_mask, Some(TraceIoMask::ASCII));
+        // Port dpCommon untouched by the per-device write.
+        assert_eq!(mgr.snapshot("p", None).io_mask, TraceIoMask::ASCII);
 
         // Per-device announce fires with addr=4.
         let events = observed.lock().unwrap();
@@ -1953,15 +2317,13 @@ mod tests {
             obs.lock().unwrap().push((ev.exception, ev.addr));
         });
 
+        mgr.register_port("p", true);
         mgr.set_device_trace_info_mask("p", 2, TraceInfoMask::SOURCE | TraceInfoMask::TIME);
 
-        let stored = mgr
-            .device_configs
-            .lock()
-            .unwrap()
-            .get(&("p".to_string(), 2))
-            .map(|c| c.trace_info_mask);
-        assert_eq!(stored, Some(TraceInfoMask::SOURCE | TraceInfoMask::TIME));
+        assert_eq!(
+            mgr.snapshot("p", Some(2)).info_mask,
+            TraceInfoMask::SOURCE | TraceInfoMask::TIME
+        );
 
         let events = observed.lock().unwrap();
         assert!(
@@ -1987,19 +2349,21 @@ mod tests {
             obs.lock().unwrap().push((ev.exception, ev.addr));
         });
 
+        mgr.register_port("p", true);
         mgr.set_trace_mask(Some("p"), TraceMask::ERROR);
         mgr.set_trace_info_mask(Some("p"), TraceInfoMask::PORT);
         mgr.set_device_trace_mask("p", 3, TraceMask::ERROR);
         mgr.set_device_trace_info_mask("p", 3, TraceInfoMask::PORT);
 
-        let port_temp = std::env::temp_dir().join("asyn_trace_dev_file_port.txt");
-        let dev_temp = std::env::temp_dir().join("asyn_trace_dev_file_dev.txt");
+        let dir = tempfile::tempdir().expect("fixture root");
+        let port_temp = dir.path().join("asyn_trace_dev_file_port.txt");
+        let dev_temp = dir.path().join("asyn_trace_dev_file_dev.txt");
         let port_f = std::fs::File::create(&port_temp).unwrap();
         let dev_f = std::fs::File::create(&dev_temp).unwrap();
         mgr.set_trace_file(Some("p"), TraceFile::File(Arc::new(Mutex::new(port_f))));
         mgr.set_device_trace_file("p", 3, TraceFile::File(Arc::new(Mutex::new(dev_f))));
 
-        mgr.output_device("p", Some(3), TraceMask::ERROR, "device-only-msg");
+        mgr.output_device("p", Some(3), 0, TraceMask::ERROR, "device-only-msg");
 
         let dev_lines = read_lines(&dev_temp);
         assert!(dev_lines.iter().any(|l| l.contains("device-only-msg")));
@@ -2018,5 +2382,111 @@ mod tests {
 
         let _ = std::fs::remove_file(&port_temp);
         let _ = std::fs::remove_file(&dev_temp);
+    }
+
+    /// R18-63, symptom 1. C `setTraceMask` with `pdevice == NULL` walks
+    /// `pport->deviceList` and writes every device's `dpc.trace.traceMask`
+    /// before the port's own (asynManager.c:2793-2801). So
+    /// `asynSetTraceMask P -1 0x1` after `asynSetTraceMask P 1 0x3f`
+    /// **quiets** device 1 — the port-level set is a push-down, not a
+    /// lower-priority default the device keeps overriding.
+    #[test]
+    fn a_port_level_mask_set_pushes_down_and_quiets_a_louder_device() {
+        let mgr = TraceManager::new();
+        mgr.register_port("P", true);
+
+        // asynSetTraceMask P 1 0x3f
+        mgr.set_device_trace_mask("P", 1, TraceMask::ERROR | TraceMask::FLOW);
+        assert!(mgr.is_enabled_device("P", 1, TraceMask::FLOW));
+
+        // asynSetTraceMask P -1 0x1
+        mgr.set_trace_mask(Some("P"), TraceMask::ERROR);
+
+        assert!(
+            !mgr.is_enabled_device("P", 1, TraceMask::FLOW),
+            "the port-level set must overwrite device 1's slot"
+        );
+        assert!(mgr.is_enabled_device("P", 1, TraceMask::ERROR));
+    }
+
+    /// R18-63, symptom 2. C's `findTracePvt` reaches `pasynBase->trace` only
+    /// for an asynUser with no port at all (asynManager.c:546-551). Every
+    /// output path here names a port, so a global `set_trace_mask(None, ..)`
+    /// must not become the effective mask of a port that never asked for it:
+    /// the port stays on its `tracePvtInit` birth value (:454).
+    #[test]
+    fn a_global_mask_set_does_not_reach_a_port() {
+        let mgr = TraceManager::new();
+        mgr.register_port("Q", false);
+
+        mgr.set_trace_mask(None, TraceMask::ERROR | TraceMask::FLOW);
+
+        assert!(
+            !mgr.is_enabled("Q", TraceMask::FLOW),
+            "a global set must not appear on a port's dpCommon"
+        );
+        assert!(mgr.is_enabled("Q", TraceMask::ERROR), "born with ERROR");
+        // And the global slot really did move — this is a routing test, not
+        // a no-op test.
+        assert!(mgr.get_trace_mask(None).contains(TraceMask::FLOW));
+    }
+
+    /// R18-63, symptom 3. `locateDevice` returns NULL unless the port
+    /// carries `ASYN_MULTIDEVICE` (asynManager.c:574), so `connectDevice`
+    /// leaves `puserPvt->pdevice` NULL on a single-device port and both the
+    /// reads and the writes land on the port's own `dpCommon`. An addr on
+    /// such a port names no device at all.
+    #[test]
+    fn an_address_on_a_single_device_port_names_the_port_not_a_device() {
+        let mgr = TraceManager::new();
+        mgr.register_port("S", false);
+
+        // A device-scoped write on a single-device port IS the port write.
+        mgr.set_device_trace_mask("S", 3, TraceMask::ERROR | TraceMask::FLOW);
+        assert!(
+            mgr.is_enabled("S", TraceMask::FLOW),
+            "the write landed on the port, as C's NULL pdevice makes it"
+        );
+
+        // ...and a later port write is seen at that address, because there
+        // is no device slot holding a stale louder value.
+        mgr.set_trace_mask(Some("S"), TraceMask::ERROR);
+        assert!(!mgr.is_enabled_device("S", 3, TraceMask::FLOW));
+
+        // The same address on a MULTIDEVICE port does name a device.
+        mgr.register_port("M", true);
+        mgr.set_trace_mask(Some("M"), TraceMask::ERROR);
+        mgr.set_device_trace_mask("M", 3, TraceMask::ERROR | TraceMask::FLOW);
+        assert!(mgr.is_enabled_device("M", 3, TraceMask::FLOW));
+        assert!(
+            !mgr.is_enabled("M", TraceMask::FLOW),
+            "and the port's own slot is untouched by it"
+        );
+    }
+
+    /// R18-63, the announce half. C announces once per device it wrote and
+    /// then once for the port (asynManager.c:2795-2800), which is what keeps
+    /// every `asynRecord` attached to a device refreshing its `TMSK` after a
+    /// port-level `asynSetTraceMask`.
+    #[test]
+    fn a_port_level_set_announces_per_device_then_for_the_port() {
+        let mgr = TraceManager::new();
+        let em = Arc::new(ExceptionManager::new());
+        mgr.set_exception_sink(em.clone());
+        mgr.register_port("P", true);
+        mgr.set_device_trace_mask("P", 1, TraceMask::ERROR);
+        mgr.set_device_trace_mask("P", 2, TraceMask::ERROR);
+
+        let observed: Arc<Mutex<Vec<i32>>> = Arc::new(Mutex::new(Vec::new()));
+        let obs = observed.clone();
+        em.add_callback(move |ev| {
+            if matches!(ev.exception, AsynException::TraceMask) {
+                obs.lock().unwrap().push(ev.addr);
+            }
+        });
+
+        mgr.set_trace_mask(Some("P"), TraceMask::ERROR | TraceMask::FLOW);
+
+        assert_eq!(*observed.lock().unwrap(), vec![1, 2, -1]);
     }
 }

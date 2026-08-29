@@ -29,7 +29,7 @@ pub enum EpicsValue {
     Enum(u16),
     /// An NTEnum value that still carries its `choices` labels, so a
     /// later type-aware `put_field` can pick the label-vs-index form
-    /// the target dbrType requires (pvxs `pvalink_lset.cpp:344-356`:
+    /// the target dbrType requires (pvxs `pvxs/ioc/pvalink_lset.cpp:344-356`:
     /// a `DBR_STRING` target copies `choices[index]`, a numeric target
     /// takes the index). This is a TRANSIENT carrier produced only on
     /// the pvalink NTEnum link-resolver path (`pvfield_to_epics_value`);
@@ -188,7 +188,7 @@ impl fmt::Display for EpicsValue {
 impl EpicsValue {
     /// The label for an enum `index` against its `choices`:
     /// `choices[index]` when in range, else the decimal index — pvxs
-    /// `pvalink_lset.cpp:347-354` (`strncpy(choices[index])` with an
+    /// `pvxs/ioc/pvalink_lset.cpp:347-354` (`strncpy(choices[index])` with an
     /// `epicsSnprintf("%u", index)` out-of-range fallback). Used at the
     /// link-write boundary to render an NTEnum onto a string target.
     ///
@@ -502,7 +502,7 @@ impl EpicsValue {
     /// can short-circuit. Cap the allocation at `data.len() / size`
     /// so the capacity tracks the bytes that actually arrived.
     pub fn from_bytes_array(dbr_type: DbFieldType, data: &[u8], count: usize) -> CaResult<Self> {
-        // P-1 (BUG_ARCHAEOLOGY libca 8cc20393f / a7bf59079): count=0
+        // P-1 (libca 8cc20393f / a7bf59079): count=0
         // is a legitimate empty-array round-trip and must NOT collapse
         // to scalar decoding. The previous `count <= 1` short-circuit
         // (a) read garbage scalar from an empty payload on GET (raised
@@ -759,7 +759,7 @@ impl EpicsValue {
         )
     }
 
-    /// C `db_add_event`'s `useValque` test (`dbEvent.c:492-500`): may a monitor
+    /// C `db_add_event`'s `useValque` test (`dbEvent.c:493-500`): may a monitor
     /// event queue hold this value *by value*, or must it keep only the latest?
     ///
     /// ```c
@@ -1017,7 +1017,7 @@ impl EpicsValue {
     /// observable on the wire.
     pub fn convert_to(&self, target: DbFieldType) -> EpicsValue {
         // pvalink NTEnum carrier (pvxs `pvaGetValue` scalar switch,
-        // `pvalink_lset.cpp:330-360`): a DBR_STRING target stores the
+        // `pvxs/ioc/pvalink_lset.cpp:330-360`): a DBR_STRING target stores the
         // label `choices[index]` (with the "%u" index fallback out of
         // range); EVERY other target — char/short/long/int64, the
         // unsigned widths, float/double, enum — takes the numeric index.
@@ -1151,24 +1151,14 @@ impl EpicsValue {
             };
         }
 
-        // Menu string resolution: when converting String to Short/Enum,
-        // try resolve_menu_string first (e.g. "MINOR" -> 1).
-        if let EpicsValue::String(s) = self {
-            let s = s.as_str_lossy();
-            match target {
-                DbFieldType::Short => {
-                    if let Some(idx) = Self::resolve_menu_string(&s) {
-                        return EpicsValue::Short(idx);
-                    }
-                }
-                DbFieldType::Enum => {
-                    if let Some(idx) = Self::resolve_menu_string(&s) {
-                        return EpicsValue::Enum(idx as u16);
-                    }
-                }
-                _ => {}
-            }
-        }
+        // No menu-label resolution happens here. A menu label is
+        // menu-SPECIFIC — "Specified" is index 1 of `menuFanout` but index 0
+        // of `selSELM` — so it has exactly one resolver,
+        // `record::menu_choices::resolve_menu_field_string`, and that resolver
+        // needs the FIELD. `convert_to` is field-blind and total by contract
+        // (see `coerce_put_value`), so any table it consulted here could only
+        // guess which menu was meant, and guessed wrong across menus.
+        //
         // Integer-source narrowing uses the `i64` view (C/pvxs `static_cast`
         // truncation: low N bits) so `uint 0xffffffff -> DBF_LONG` yields
         // `-1`, not the f64 round-trip's saturated `i32::MAX`. Float/double
@@ -1450,81 +1440,27 @@ impl EpicsValue {
         }
     }
 
-    /// Resolve EPICS menu string constants to their integer indices.
+    /// A `DBF_MENU` field's index, whatever numeric carrier the record type
+    /// chose to answer it in.
     ///
-    /// C EPICS base uses a menu system to convert string constants (e.g. "NO_ALARM",
-    /// "MINOR") to integer indices. This provides the same mapping for the most
-    /// commonly used menus.
-    fn resolve_menu_string(s: &str) -> Option<i16> {
-        match s {
-            // menuAlarmSevr
-            "NO_ALARM" => Some(0),
-            "MINOR" => Some(1),
-            "MAJOR" => Some(2),
-            "INVALID" => Some(3),
-            // menuYesNo / menuSimm
-            "NO" => Some(0),
-            "YES" => Some(1),
-            "RAW" => Some(2),
-            // menuPriority (dbCommon PRIO)
-            "LOW" => Some(0),
-            "MEDIUM" => Some(1),
-            "HIGH" => Some(2),
-            // menuOmsl
-            "supervisory" => Some(0),
-            "closed_loop" => Some(1),
-            // menuIvoa
-            "Continue normally" => Some(0),
-            "Don't drive outputs" => Some(1),
-            "Set output to IVOV" => Some(2),
-            // menuFtype (waveform FTVL)
-            "STRING" => Some(0),
-            "CHAR" => Some(1),
-            "UCHAR" => Some(2),
-            "SHORT" => Some(3),
-            "USHORT" => Some(4),
-            "LONG" => Some(5),
-            "ULONG" => Some(6),
-            "INT64" => Some(7),
-            "UINT64" => Some(8),
-            "FLOAT" => Some(9),
-            "DOUBLE" => Some(10),
-            "ENUM" => Some(11),
-            // menuFanout / menuSelect
-            "All" => Some(0),
-            "Specified" => Some(1),
-            "Mask" => Some(2),
-            // calcoutOOPT (Output Option)
-            "Every Time" => Some(0),
-            "On Change" => Some(1),
-            "When Zero" => Some(2),
-            "When Non-zero" => Some(3),
-            "Transition To Zero" => Some(4),
-            "Transition To Non-zero" => Some(5),
-            // calcoutDOPT (Data Option)
-            "Use CALC" => Some(0),
-            "Use OCAL" => Some(1),
-            // menuScan
-            "Passive" => Some(0),
-            "Event" => Some(1),
-            "I/O Intr" => Some(2),
-            "10 second" => Some(3),
-            "5 second" => Some(4),
-            "2 second" => Some(5),
-            "1 second" => Some(6),
-            ".5 second" => Some(7),
-            ".2 second" => Some(8),
-            ".1 second" => Some(9),
-            // menuPini is deliberately absent. Its real choice order is
-            // NO,YES,RUN,RUNNING,PAUSE,PAUSED (`menuPini.dbd.pod:59-65`) — the
-            // entries that used to live here (`RUNNING=2`, `PAUSED=4`, plus two
-            // invented `*_NOT_CA` choices) named the wrong indices. `PINI`
-            // resolves against its own menu via
-            // `crate::server::record::PiniMode::from_str`, which is what this
-            // field-blind table cannot do: the same label names different
-            // indices in different menus.
-            _ => None,
-        }
+    /// The `.dbd` fixes the field as `DBF_MENU`; whether the record struct
+    /// hands it back as [`Self::Short`] — every `epics-base-rs` record type,
+    /// e.g. `records/ai.rs:310` for `SIMS` — or as [`Self::Enum`] — `mca`, at
+    /// `mca-rs/src/record/mod.rs:678-679`, for the same two fields
+    /// `mcaRecord.dbd:386` and `:391` declare `DBF_MENU` — is an
+    /// implementation detail of that record and nothing else. CA does not read
+    /// it either: a menu field is typed and labelled from its NAME, through
+    /// [`shared_menu_choices`](crate::server::record::shared_menu_choices)
+    /// (`SIMS` at `menu_choices.rs:213`) or the record's
+    /// `menu_field_choices` override.
+    ///
+    /// So a framework consumer must not pattern-match the carrier. One that
+    /// does reads every other record's field as its `unwrap_or` default and
+    /// reports nothing — which is how `mca`'s `SIMS` read as `NO_ALARM` no
+    /// matter what the database set, leaving a simulated `mca` unable to raise
+    /// `SIMM_ALARM` at any severity.
+    pub fn to_menu_index(&self) -> Option<i16> {
+        self.to_f64().map(|index| index as i16)
     }
 
     /// Parse a `.db` field value into an EpicsValue of the given type — the
@@ -1572,13 +1508,7 @@ impl EpicsValue {
             DbFieldType::String => Ok(Self::String(s.into())),
             DbFieldType::Short => Self::parse_int(s)
                 .map(|v| Self::Short(v as i16))
-                .or_else(|_| {
-                    Self::resolve_menu_string(s)
-                        .map(Self::Short)
-                        .ok_or_else(|| {
-                            CaError::InvalidValue(format!("invalid short or menu string: {s}"))
-                        })
-                }),
+                .map_err(|_| CaError::InvalidValue(menu_label_hint("short", s))),
             // `dbStaticLib.c:2797` parses a `DBF_FLOAT` field with
             // `epicsParseFloat32`, the same routine `putStringFloat` uses, so
             // the narrowing gate belongs on this path too: without it `1e300`
@@ -1590,13 +1520,7 @@ impl EpicsValue {
                 .ok_or_else(|| CaError::InvalidValue(format!("invalid float literal: {s}"))),
             DbFieldType::Enum => Self::parse_int(s)
                 .map(|v| Self::Enum(v as u16))
-                .or_else(|_| {
-                    Self::resolve_menu_string(s)
-                        .map(|v| Self::Enum(v as u16))
-                        .ok_or_else(|| {
-                            CaError::InvalidValue(format!("invalid enum or menu string: {s}"))
-                        })
-                }),
+                .map_err(|_| CaError::InvalidValue(menu_label_hint("enum", s))),
             DbFieldType::Char => Self::parse_int(s)
                 .map(|v| Self::Char(v as u8))
                 .map_err(|e| CaError::InvalidValue(e.to_string())),
@@ -1691,6 +1615,22 @@ impl EpicsValue {
 /// prefix. A signed `0x`/`0X` prefix means hex; a leading `0` followed by
 /// digits means octal; everything else is parsed as a decimal float so
 /// `"1.5"`, `"1e6"`, `"-3.14"` continue to work.
+/// The error text for a non-numeric token reaching a field-blind
+/// `DBF_SHORT`/`DBF_ENUM` parse.
+///
+/// A menu label does not resolve here and must not: the same label names
+/// different indices in different menus, so the only correct resolver is
+/// [`crate::server::record::resolve_menu_field_string`], which takes the
+/// field's own choices. The hint names that owner so a caller that reached
+/// this path with a label knows where the resolution belongs, rather than
+/// reading "invalid enum" and adding another guess table.
+fn menu_label_hint(kind: &str, s: &str) -> String {
+    format!(
+        "invalid {kind}: '{s}' is not a number; a menu label resolves only \
+         against its own field's menu, never here"
+    )
+}
+
 fn parse_string_to_f64(s: &str) -> Option<f64> {
     // C parity for `epicsParseDouble` → `epicsStrtod`
     // (libcom/src/misc/epicsStdlib.c:347-374):
@@ -2004,7 +1944,7 @@ mod enum_with_choices_tests {
         }
     }
 
-    /// pvxs `pvalink_lset.cpp:330-360`, `case DBR_STRING`: a string target
+    /// pvxs `pvxs/ioc/pvalink_lset.cpp:330-360`, `case DBR_STRING`: a string target
     /// stores the choice LABEL, not the index. Index 2 → "Reset".
     #[test]
     fn string_target_resolves_to_label() {
@@ -2080,7 +2020,7 @@ mod enum_with_choices_tests {
 
     /// An in-range NTEnum choice label with non-UTF-8 bytes must reach
     /// `EpicsValue::String` verbatim — C copies the raw `std::string` choice
-    /// with `strncpy(choice.c_str(), …)` (`pvalink_lset.cpp:349`). A lossy
+    /// with `strncpy(choice.c_str(), …)` (`pvxs/ioc/pvalink_lset.cpp:349`). A lossy
     /// `String`/`as_str_lossy` round-trip would rewrite the `0xFF` byte as the
     /// 3-byte `U+FFFD` replacement before storage. The out-of-range fallback
     /// is ASCII and stays byte-identical.

@@ -1,8 +1,9 @@
 //! The services every asyn port is born with — C's `pasynBase`.
 //!
 //! In C a port cannot exist without a trace configuration and an exception
-//! list: `registerPort` calls `tracePvtInit(&pport->dpc.trace)`
-//! (asynManager.c:503) and `ellInit(&pport->dpc.exceptionUserList)` on the
+//! list: `registerPort` reaches `dpCommonInit` (asynManager.c:2066), which
+//! calls `tracePvtInit(&pdpCommon->trace)` (:528) and
+//! `ellInit(&pdpCommon->exceptionUserList)` (:524) on the
 //! `dpCommon` it is allocating, so `announceExceptionOccurred`
 //! (asynManager.c:611-637) and `asynPrint` always have a list to walk. There
 //! is no reachable state in which a registered port has neither.

@@ -182,7 +182,14 @@ impl CommonFields {
             time: self.time,
             tsel: self.tsel.clone(),
             dtyp: self.dtyp.clone(),
+            callback_priority: self.callback_priority(),
         }
+    }
+
+    /// The callback band this record's `PRIO` selects — C
+    /// `callbackSetPriority(prec->prio, ...)` (`seqRecord.c:146`).
+    pub fn callback_priority(&self) -> crate::runtime::task::CallbackPriority {
+        crate::runtime::task::CallbackPriority::from_record_prio(self.prio)
     }
 }
 

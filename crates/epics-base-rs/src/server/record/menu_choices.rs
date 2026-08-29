@@ -229,7 +229,15 @@ pub fn shared_menu_choices(field: &str) -> Option<&'static [&'static str]> {
         // but the menu is the same shared table every other menu field uses —
         // for the string→index put converter AND for the DBR_ENUM choice
         // labels served with a GET/MONITOR of `.SCAN`.
-        "SCAN" | "SSCN" => Some(MENU_SCAN),
+        //
+        // Unlike every other entry here this one is not a generated constant:
+        // `menuScan` is the one menu C re-reads at run time
+        // (`initPeriodic`, `dbScan.c:858`), because a site may load its own
+        // `menuScan.dbd` with other rates. The labels a client is served must
+        // be the LOADED menu's or they name rates the IOC does not scan at.
+        // `SSCN`'s generated `FieldDesc` carries `menu: None` for the same
+        // reason, so both fields arrive here.
+        "SCAN" | "SSCN" => Some(crate::server::record::menu_scan().choices()),
         // Output mode select (`menuOmsl`).
         "OMSL" => Some(MENU_OMSL),
         // Invalid-output action (`menuIvoa`).
@@ -468,7 +476,7 @@ pub fn binary_enum_string_form(znam: &PvString, onam: &PvString) -> EnumStringFo
 /// C `get_enum_str` for the 16-state records (`mbbi`/`mbbo`): any `val <= 15`
 /// reads its state slot, empty or not; past that, `"Illegal Value"` — with a
 /// SPACE, where the two-state records use an underscore
-/// (`mbbiRecord.c:235-255`, `mbboRecord.c:314-333`). The two spellings are C's,
+/// (`mbbiRecord.c:235-255`, `mbboRecord.c:315-333`). The two spellings are C's,
 /// and both are wire-visible, so neither is normalized here.
 pub fn multibit_enum_string_form(states: [&PvString; 16]) -> EnumStringForm {
     EnumStringForm::states(
@@ -494,7 +502,7 @@ pub fn multibit_enum_string_form(states: [&PvString; 16]) -> EnumStringForm {
 /// `S_db_noRSET`. The caller passes `None` for that case; the put is REJECTED,
 /// never coerced — C stores nothing on either failure path.
 ///
-/// Deviation from C (Tier 2, `doc/strategy-2026-07-13.md`): C's `put_enum_str`
+/// Deviation from C (Tier 2): C's `put_enum_str`
 /// scans all 16 raw state slots, so on a record with states `["a","b"]` a put of
 /// the EMPTY string matches the first undefined slot and stores `VAL=2` — a
 /// state the record's own `get_enum_strs` does not advertise. The port matches
@@ -645,7 +653,21 @@ mod tests {
         assert_eq!(shared_menu_choices("OMSL"), Some(MENU_OMSL));
         assert_eq!(shared_menu_choices("IVOA"), Some(MENU_IVOA));
         assert_eq!(shared_menu_choices("LINR"), Some(MENU_CONVERT));
-        assert_eq!(shared_menu_choices("SSCN"), Some(MENU_SCAN));
+        // SCAN/SSCN are the one pair whose answer is RUNTIME data — the
+        // loaded `menuScan`, which a site `.dbd` may replace — so the
+        // assertion is against `menu_scan()`, not against the generated
+        // constant it happens to equal in a process that loaded no site menu.
+        // Asserting the constant would let a compiled-in list back in without
+        // failing; `tests/menuscan_site_menu_is_runtime_data.rs` is the other
+        // half, in the process that does load one.
+        assert_eq!(
+            shared_menu_choices("SSCN"),
+            Some(crate::server::record::menu_scan().choices())
+        );
+        assert_eq!(
+            shared_menu_choices("SCAN"),
+            Some(crate::server::record::menu_scan().choices())
+        );
         assert_eq!(shared_menu_choices("PRIO"), Some(MENU_PRIORITY));
         assert_eq!(shared_menu_choices("PBUF"), Some(MENU_YES_NO));
     }
@@ -672,7 +694,7 @@ mod tests {
     #[test]
     fn dbcommon_menu_fields_resolve_to_their_menu() {
         // Every `DBF_MENU` field of dbCommon is served as `DBR_ENUM` with its
-        // menu's choice strings (dbAccess.c:1074 `mapDBFToDBR`,
+        // menu's choice strings (dbAccess.c:89 `mapDBFToDBR`,
         // dbAccess.c:167-175 `get_enum_strs`) — not as a bare SHORT/CHAR.
         assert_eq!(shared_menu_choices("SEVR"), Some(MENU_ALARM_SEVR));
         assert_eq!(shared_menu_choices("NSEV"), Some(MENU_ALARM_SEVR));

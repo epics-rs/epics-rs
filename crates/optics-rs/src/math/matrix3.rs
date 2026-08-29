@@ -110,7 +110,7 @@ mod tests {
         }
     }
 
-    // Test data from ~/codes/optics/tests/matrixTest.cpp
+    // Test data from $EPICS_MODULES/optics/tests/matrixTest.cpp
     const ZEROES: Vec3 = [0.0, 0.0, 0.0];
     const ONES: Vec3 = [1.0, 1.0, 1.0];
     const V1: Vec3 = [1.0, 2.0, 3.0];

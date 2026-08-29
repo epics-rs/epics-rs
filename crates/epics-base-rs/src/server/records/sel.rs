@@ -68,12 +68,19 @@ pub struct SelRecord {
     soft_alarm: bool,
     /// Set by the framework (`set_fetch_gate_failed`) when this cycle's
     /// `fetch_values` failed — the LAST input link read, in any SELM, or the
-    /// NVL read in `Specified`. C `selRecord.c::process` (113-115) runs
+    /// NVL read in `Specified`. C `selRecord.c::process` (114-116) runs
     /// `do_sel` only when `fetch_values` succeeds, so on failure VAL/UDF
     /// must freeze. Consumed (reset to false) each `process()` so the
     /// by-name dispatch path — which never reports a fetch outcome —
     /// never freezes spuriously.
     fetch_gate_failed: bool,
+    /// This cycle's `do_sel` reached `prec->val = val; prec->udf =
+    /// isnan(prec->val)` (`selRecord.c:401-402`) — i.e. it did not take one of
+    /// the two `return`s inside the SELM switch. That pair is C's ONLY UDF
+    /// write for `sel`, so a cycle that took a `return`, or whose
+    /// `fetch_values` failed (`:114`), leaves UDF frozen. Consumed by
+    /// `check_alarms`, which owns the write.
+    value_computed: bool,
 }
 
 impl Default for SelRecord {
@@ -122,6 +129,7 @@ impl Default for SelRecord {
             alst: 0.0,
             soft_alarm: false,
             fetch_gate_failed: false,
+            value_computed: false,
         }
     }
 }
@@ -150,7 +158,7 @@ impl Record for SelRecord {
     /// no valid input exists or the selected input is undefined.
     fn process(&mut self) -> CaResult<ProcessOutcome> {
         self.soft_alarm = false;
-        // C `selRecord.c::process` (113-115) wraps the WHOLE of `do_sel` in
+        // C `selRecord.c::process` (114-116) wraps the WHOLE of `do_sel` in
         // `if (RTN_SUCCESS(fetch_values(prec)))` — one gate for every SELM,
         // not a Specified-mode special case. A failed read leaves VAL (and
         // UDF, which derives from it) and SELN at the previous cycle's value,
@@ -160,6 +168,11 @@ impl Record for SelRecord {
             return Ok(ProcessOutcome::complete());
         }
         let vals = self.get_values();
+        // C `do_sel` reaches `prec->val = val; prec->udf = isnan(prec->val)`
+        // (`:401-402`) at the BOTTOM of the switch; the out-of-range Specified
+        // arm and the `default:` arm `return` before it, leaving VAL and UDF
+        // untouched.
+        let mut value_selected = true;
         match self.selm {
             0 => {
                 // Specified: index by SELN. C `do_sel` raises
@@ -169,6 +182,7 @@ impl Record for SelRecord {
                 let idx = self.seln as usize;
                 if idx >= SEL_MAX {
                     self.soft_alarm = true;
+                    value_selected = false;
                 } else {
                     // C: `prec->val = val;` then `udf = isnan(val)`.
                     self.val = vals[idx];
@@ -228,7 +242,11 @@ impl Record for SelRecord {
             _ => {
                 // C `do_sel` default: CALC_ALARM/INVALID, VAL unchanged.
                 self.soft_alarm = true;
+                value_selected = false;
             }
+        }
+        if value_selected {
+            self.value_computed = true;
         }
         Ok(ProcessOutcome::complete())
     }
@@ -240,12 +258,30 @@ impl Record for SelRecord {
         self.val.is_nan()
     }
 
+    /// C writes `prec->udf` in exactly one place for `sel` — `do_sel`'s tail
+    /// (`selRecord.c:402`), which `process` calls only when `fetch_values`
+    /// succeeds (`:114-116`) and which two arms of the SELM switch `return`
+    /// before reaching. The framework's per-cycle blanket re-derived UDF on
+    /// those cycles too and reported a never-selected record as defined; the
+    /// write lives with the selection now — see [`Self::check_alarms`].
+    fn clears_udf(&self) -> bool {
+        false
+    }
+
     /// C `selRecord.c::checkAlarms` — UDF alarm plus the analog limit
     /// alarms (HIHI/HIGH/LOW/LOLO) with per-level hysteresis, and the
     /// SOFT/CALC alarm raised by `do_sel` for a bad SELM/SELN.
     fn check_alarms(&mut self, common: &mut crate::server::record::CommonFields) {
         use crate::server::recgbl::{self, alarm_status};
         use crate::server::record::AlarmSeverity;
+
+        // C `selRecord.c:402` `prec->udf = isnan(prec->val)`, applied here
+        // because `check_alarms` is the record's only hook holding
+        // `CommonFields`. It must run before the UDF read below — C's
+        // `checkAlarms` sees the value `do_sel` just wrote.
+        if std::mem::take(&mut self.value_computed) {
+            common.udf = self.value_is_undefined() as u8;
+        }
 
         // SOFT_ALARM / CALC_ALARM raised by do_sel — C raises this and
         // returns from do_sel; checkAlarms still runs but with UDF
@@ -519,14 +555,14 @@ impl Record for SelRecord {
         ]
     }
 
-    /// C `selRecord.c::fetch_values` (lines 421-431): in `Specified`
+    /// C `selRecord.c::fetch_values` (lines 421-432): in `Specified`
     /// (SELM==0) mode only `INP[SELN]` is read; `High`/`Low`/`Median` read
     /// every input to compare them. `selector` is the NVL-resolved SELN for
     /// this cycle (the framework reads NVL before the input fetch), else the
     /// record's current SELN. A SELN >= SEL_MAX fetches nothing — C
     /// bounds-checks before the input read.
     /// C `selRecord.c::fetch_values` returns the status of its LAST
-    /// `dbGetLink` (`:433-436`), which `process` gates `do_sel` on.
+    /// `dbGetLink` (`:434-437`), which `process` gates `do_sel` on.
     fn input_fetch_policy(&self) -> crate::server::record::InputFetchPolicy {
         crate::server::record::InputFetchPolicy::ReadAllGateOnLastFailure
     }
@@ -548,8 +584,8 @@ impl Record for SelRecord {
         }
     }
 
-    /// C `selRecord.c::process` (113-115) gates `do_sel` on `fetch_values`
-    /// success in EVERY mode. `fetch_values` (`:433-436`) assigns `status`
+    /// C `selRecord.c::process` (114-116) gates `do_sel` on `fetch_values`
+    /// success in EVERY mode. `fetch_values` (`:434-437`) assigns `status`
     /// unguarded on every pass and returns it, so the gate is the LAST link
     /// read: INPL's for High/Low/Median, the selected input's (or a failed
     /// NVL read) for Specified. A failed INPA therefore does NOT gate a High

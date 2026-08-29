@@ -31,7 +31,6 @@
 //! mode just like value events — the 446e0d4a "always pass alarm"
 //! rule is dbnd-specific.
 
-use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -62,7 +61,12 @@ impl DbState {
 /// `Arc<DbState>` for their configured state name; trigger paths use
 /// the same accessor to publish state changes.
 pub struct DbStateRegistry {
-    states: Mutex<HashMap<String, Arc<DbState>>>,
+    /// C `dbState.c` keeps its states in an `ELLLIST` walked linearly by
+    /// `dbStateFind`, and `dbStateShowAll` reports them in that list order,
+    /// i.e. creation order. A map would lose the order the one enumerating
+    /// caller needs, and the list is a handful of entries, so the linear
+    /// scan is C's too.
+    states: Mutex<Vec<(String, Arc<DbState>)>>,
 }
 
 impl Default for DbStateRegistry {
@@ -74,7 +78,7 @@ impl Default for DbStateRegistry {
 impl DbStateRegistry {
     pub fn new() -> Self {
         Self {
-            states: Mutex::new(HashMap::new()),
+            states: Mutex::new(Vec::new()),
         }
     }
 
@@ -82,12 +86,19 @@ impl DbStateRegistry {
     /// returned unchanged — the underlying value is preserved.
     pub fn get_or_create(&self, name: &str) -> Arc<DbState> {
         let mut guard = self.states.lock();
-        if let Some(s) = guard.get(name) {
+        if let Some((_, s)) = guard.iter().find(|(n, _)| n == name) {
             return s.clone();
         }
         let s = Arc::new(DbState::default());
-        guard.insert(name.to_string(), s.clone());
+        guard.push((name.to_string(), s.clone()));
         s
+    }
+
+    /// Every state, in creation order — C's `ellFirst`/`ellNext` walk over
+    /// `dbState.c`'s `states` list, which is what `dbStateShowAll`
+    /// (`dbState.c:106-115`) reports in.
+    pub fn entries(&self) -> Vec<(String, Arc<DbState>)> {
+        self.states.lock().clone()
     }
 
     /// Look up the named state without creating it — C `dbStateFind`
@@ -97,7 +108,11 @@ impl DbStateRegistry {
     /// path, where [`get_or_create`](Self::get_or_create) alone cannot tell a
     /// fresh state from a pre-existing one.
     pub fn find(&self, name: &str) -> Option<Arc<DbState>> {
-        self.states.lock().get(name).cloned()
+        self.states
+            .lock()
+            .iter()
+            .find(|(n, _)| n == name)
+            .map(|(_, s)| s.clone())
     }
 
     /// Convenience: set a named state's value. Creates the state if

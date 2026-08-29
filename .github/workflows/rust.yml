@@ -8,6 +8,15 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
+  # Line tables, not full DWARF. A `cargo nextest run --workspace` target dir
+  # for this workspace measures 91,635 MB here, against the ~86 GB an
+  # ubuntu-latest runner leaves free, and it is nearly all debuginfo: 658 test
+  # binaries at ~300 MB each. Both `checks` and `interop` died writing the
+  # runner's own diagnostic log ("System.IO.IOException: No space left on
+  # device"), which also loses the job log, so the failure arrives with no
+  # output to read. `line-tables-only` keeps the file:line a backtrace is read
+  # with and takes the same target dir to 34,436 MB (measured 2026-08-29).
+  CARGO_PROFILE_DEV_DEBUG: line-tables-only
 
 jobs:
   checks:
@@ -43,45 +52,63 @@ jobs:
       run: cargo nextest run --profile ci --workspace --exclude epics-oracle-rs
     - name: Run doctests
       run: cargo test --doc --workspace
-    # Code behind a non-default feature has NO tests in the workspace run
-    # above: `--all-targets` compiles the cfg'd-out module or test file away,
-    # so a broken call site inside it is invisible and reads as green.
-    #
-    # The crate list has been derived from the manifests since a hand-kept one
-    # omitted `epics-modbus-rs` (167 tests) and `mqtt-rs` (111). The *feature*
-    # side stayed hand-kept, though, and that half had the same defect: it
-    # enrolled a crate only if the feature happened to be spelled `ioc` or
-    # `epics`. `epics-base-rs/tests/client_server.rs` is `#![cfg(feature =
-    # "ca-server-tls-test")]`, so nothing in this workflow ever compiled it,
-    # and an `E0308` in it survived from before 70b4a74b until 0909e7cb —
-    # found by hand, three parity rounds apart. (`epics` was worse than
-    # incomplete: the one crate that declares `epics` is `asyn-rs`, and it
-    # carries `epics` in its own `default`, so the derived loop drops the pair
-    # at the "not already in default" test — the hand-kept half enrolled it as
-    # an extra feature that is not one.)
-    #
-    # So the rule is now uniform: every feature a workspace crate declares
-    # that its own `default` does not pull in. Two exclusions, both because
-    # the pair would not mean what the loop assumes:
-    #
-    #   * `default` itself. A default feature list never names itself, so the
-    #     "not already in default" test lets the literal string through.
-    #
-    # There used to be a second exclusion here, `rtems-exec-model`, because it
-    # was a *backend* rather than extra code and resolving it alongside the
-    # default features built the split state the `HAS_TOKIO_REACTOR` const
-    # guard refuses. It is no longer a feature — the backend is chosen by
-    # `EPICS_RS_BUILD_EXEC_BACKEND`, which is orthogonal to feature resolution
-    # — so this loop enumerates only features, and the exec-backend job below
-    # runs the whole workspace on the other backend rather than five crates.
-    #
-    # That takes the gate from 12 (pkg, feature) pairs to 53. All 53 were run
-    # here on 2026-08-25 as `cargo check -p <pkg> --features <feat>
-    # --all-targets` and all 53 pass, so a red result from this step is new
-    # information rather than a pre-existing backlog. Re-measure the claim
-    # rather than inheriting it: the step runs `nextest`, which is a superset
-    # of what was checked.
-    - name: Test feature-gated code (nextest)
+
+  # Code behind a non-default feature has NO tests in the `checks` job above:
+  # `--all-targets` compiles the cfg'd-out module or test file away, so a
+  # broken call site inside it is invisible and reads as green.
+  #
+  # ITS OWN JOB, BECAUSE A JOB IS WHAT OWNS A DISK. This used to be a step in
+  # `checks`, looping `cargo nextest run -p <pkg> --features <feat>` over every
+  # (package, feature) pair the manifests declare. Each pair is a distinct
+  # feature resolution of the dependency graph and cargo evicts none of them:
+  # measured at +1,124 MB per pair on top of the 34,436 MB the job's own
+  # workspace resolution already holds, 53 pairs overran the ~86 GB an
+  # ubuntu-latest runner has free and the runner died writing its own log.
+  # Splitting the resolution off gets it a whole runner rather than the
+  # remainder of one.
+  #
+  # TWO ROWS, BECAUSE THEY ANSWER DIFFERENT QUESTIONS.
+  #
+  # The first RUNS the gated code. `--workspace --all-features` is one
+  # resolution in which every `#[cfg(feature = ...)]` block in the workspace is
+  # compiled and its tests executed — strictly more than the old loop, which
+  # ran only the tests of the one package each pair named.
+  #
+  # The second is `cargo check`, not `nextest`, and that is deliberate: what it
+  # answers is whether a feature resolves ON ITS OWN, which `--all-features`
+  # cannot see (a missing `a = ["b"]` in a manifest is invisible when `b` is on
+  # anyway). Compiling is the whole question there, and `cargo check` costs
+  # +362 MB per pair against nextest's +2,366 MB, so all 53 fit beside the
+  # all-features resolution. This is also the exact form all 53 were verified
+  # in on 2026-08-25.
+  #
+  # The pair list is derived from the manifests, never hand-kept: every feature
+  # a workspace crate declares that its own `default` does not pull in.
+  # `default` itself is excluded because a default feature list never names
+  # itself, so the "not already in default" test would let the literal string
+  # through. A hand-kept list had omitted `epics-modbus-rs` (167 tests) and
+  # `mqtt-rs` (111), and a hand-kept *feature* half enrolled a crate only if
+  # the feature happened to be spelled `ioc` or `epics` — which missed
+  # `epics-base-rs/tests/client_server.rs` (`#![cfg(feature =
+  # "ca-server-tls-test")]`) entirely, letting an `E0308` in it survive from
+  # before 70b4a74b until 0909e7cb.
+  all-features:
+    runs-on: ubuntu-latest
+
+    steps:
+    - uses: actions/checkout@v4
+    - uses: dtolnay/rust-toolchain@master
+      with:
+        toolchain: 1.94.0
+    - uses: taiki-e/install-action@nextest
+    - uses: Swatinem/rust-cache@v2
+      with:
+        key: all-features
+    # epics-oracle-rs boots the compiled C `softIoc` for ground truth and fails
+    # loudly (by design) without the C EPICS tree, which no runner has.
+    - name: Every feature-gated test, compiled and run
+      run: cargo nextest run --profile ci --workspace --all-features --exclude epics-oracle-rs
+    - name: Every feature also resolves on its own
       run: |
         set -euo pipefail
         cargo metadata --no-deps --format-version 1 \
@@ -93,7 +120,7 @@ jobs:
           | sort -u \
           | while read -r pkg feat; do
               echo "::group::$pkg --features $feat"
-              cargo nextest run --profile ci -p "$pkg" --features "$feat" --no-tests=pass
+              cargo check -p "$pkg" --features "$feat" --all-targets
               echo "::endgroup::"
             done
 

@@ -476,6 +476,12 @@ mod tests {
     /// `tokio_backend` the borrow ran the wrong way — the module that compiles
     /// away first is this one, so a helper left over there is stranded with no
     /// caller at all.
+    ///
+    /// Gated once, here. `capture_streams` dups and swaps this process's fds 1
+    /// and 2, so it is unix-only; carrying that `#[cfg]` on the function
+    /// instead left the module inhabited on Windows and an ungated `use` of a
+    /// name that was configured out, which is E0432 rather than a quiet skip.
+    #[cfg(unix)]
     mod stream_capture {
         /// Serialises the fd-swapping capture below: fds 1 and 2 are
         /// process-global, so two of these running at once would cross-read.
@@ -489,7 +495,6 @@ mod tests {
         /// `repeater.cpp:73` `#define DEBUG`s before including `iocinf.h`, while
         /// the port emitted every line on stderr. Asserting the bytes alone
         /// would not have caught that, so the tests assert the stream too.
-        #[cfg(unix)]
         pub(crate) fn capture_streams<F: FnOnce() -> R, R>(f: F) -> (R, String, String) {
             use std::io::{Read, Write};
             use std::os::fd::FromRawFd;
@@ -539,7 +544,6 @@ mod tests {
             (value, out, err)
         }
     }
-    use stream_capture::capture_streams;
 
     /// C `repeater.cpp:515-521`: a repeater that loses the race for the
     /// port says so with a `debugPrintf` — stdout, and inside no
@@ -563,7 +567,8 @@ mod tests {
             .build()
             .expect("test runtime");
 
-        let (result, out, err) = capture_streams(|| rt.block_on(run_repeater_with_debug(0)));
+        let (result, out, err) =
+            stream_capture::capture_streams(|| rt.block_on(run_repeater_with_debug(0)));
 
         assert!(
             result.is_ok(),
@@ -635,7 +640,7 @@ mod tests {
             .build()
             .expect("test runtime");
 
-        let (confirmed, out, err) = capture_streams(|| {
+        let (confirmed, out, err) = stream_capture::capture_streams(|| {
             let held = std::sync::Arc::clone(&client);
             rt.block_on(async move {
                 let repeater = tokio::spawn(run_repeater_with_debug(1));

@@ -3344,14 +3344,24 @@ mod tests {
     /// the socket that was filled until it refused. Before the bound, this
     /// wedged the calling actor forever, taking a parent broadcast with it.
     ///
-    /// The accepted-count half of the same failure is not asserted here. A real
-    /// socket cannot be brought to "full, but with room for a known partial
-    /// write" on every kernel, and the two attempts to arrange it — a fixed
-    /// 1 MiB payload, then four times a sibling connection's measured capacity
-    /// — both failed on Darwin by fitting entirely. `write_with_retry` carries
-    /// the count, and `a_caller_budget_still_caps_a_progressing_transfer`
-    /// pins a non-zero one against a stream whose acceptance this process
-    /// decides.
+    /// The bound under test is the caller budget, because it is the only one
+    /// that bounds a whole transfer. C's per-pass `writePollmsec` is re-armed
+    /// every pass (DRV-58, and deliberately reproduced), so a peer that keeps
+    /// taking bytes never times out however slowly it takes them — and "a peer
+    /// that has stopped reading" is not the same thing as "a peer that has
+    /// stopped accepting". Darwin proves the gap: with both buffers pinned to
+    /// the minimum, a filled pipe still trickles, each pass costs its whole
+    /// 200 ms in `poll` and then accepts a few bytes, the cumulative
+    /// `retry_since` bound never arms because no `send` ever refuses, and this
+    /// write ran past 30 s (macos-arm64, measured 2026-08-29). The budget the
+    /// server port states for a broadcast is what stops that, and this is the
+    /// slot path that carries it.
+    ///
+    /// The accepted-count half is not asserted here. A real socket cannot be
+    /// brought to "full, but with room for a known partial write" on every
+    /// kernel — Linux reports zero accepted, Darwin some — so
+    /// `a_caller_budget_still_caps_a_progressing_transfer` pins a non-zero
+    /// count against a stream whose acceptance this process decides.
     #[cfg(unix)]
     #[test]
     fn a_slot_write_to_a_peer_that_never_reads_expires_without_closing_the_slot() {
@@ -3374,12 +3384,13 @@ mod tests {
 
         // The wait runs on its own thread and reports through a channel, so an
         // unbounded write fails this test in seconds instead of hanging it.
+        const TMOT: Duration = Duration::from_millis(200);
         let writer = Arc::clone(&slot);
         let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let started = Instant::now();
+        let cap = started + TMOT;
         std::thread::spawn(move || {
-            let started = Instant::now();
-            let res =
-                writer.write_or_close(&payload, Some(Duration::from_millis(200)), None, "srv:0");
+            let res = writer.write_or_close(&payload, Some(TMOT), Some(cap), "srv:0");
             let _ = done_tx.send((started.elapsed(), res));
         });
 
@@ -3403,7 +3414,7 @@ mod tests {
         // rather than polling non-blocking — survives it.
         const TICK: Duration = Duration::from_millis(1);
         assert!(
-            elapsed + TICK >= Duration::from_millis(200),
+            elapsed + TICK >= TMOT,
             "returned a tick or more before the deadline it was given: {elapsed:?}"
         );
         // The other side of the same claim, and the one that names what a

@@ -851,7 +851,10 @@ mod tests {
     /// client among them) ever saw.
     ///
     /// Forced without resource pressure: a second `IP_ADD_MEMBERSHIP` for a
-    /// membership the socket already holds is `EADDRINUSE`, deterministically.
+    /// membership the socket already holds fails deterministically. *Which*
+    /// failure is the platform's — POSIX answers `EADDRINUSE`, Winsock
+    /// answers `WSAEINVAL` — so only C's half of the line is compared on
+    /// every host, and the errno is named where it is knowable.
     #[test]
     fn failed_mcast_join_reaches_the_errlog_with_cs_bytes() {
         use std::sync::{Arc, Mutex};
@@ -891,14 +894,24 @@ mod tests {
         epics_base_rs::runtime::log::errlog_remove_listener(listener);
 
         let lines = seen.lock().expect("errlog sink").clone();
-        let expected = format!(
-            "caR: Socket mcast join to {group}:{port} failed: {}",
-            sock_err_string(&io::Error::from_raw_os_error(libc::EADDRINUSE))
-        );
+        let prefix = format!("caR: Socket mcast join to {group}:{port} failed: ");
         assert_eq!(
-            lines,
-            vec![expected],
-            "the failed join must reach the errlog with C's bytes"
+            lines.len(),
+            1,
+            "one line for one failed join, got {lines:?}"
+        );
+        let reason = lines[0]
+            .strip_prefix(&prefix)
+            .unwrap_or_else(|| panic!("the failed join must carry C's bytes, got {:?}", lines[0]));
+        assert!(!reason.is_empty(), "C interpolates a reason, never nothing");
+
+        // `libc::EADDRINUSE` is the CRT constant on Windows, not the Winsock
+        // one, and `from_raw_os_error` there takes Win32 codes — naming it
+        // would compare this sentence against an unrelated code's.
+        #[cfg(unix)]
+        assert_eq!(
+            reason,
+            sock_err_string(&io::Error::from_raw_os_error(libc::EADDRINUSE))
         );
     }
 }

@@ -131,11 +131,17 @@ fn every_errlog_escape_comes_from_the_console_predicate() {
     for path in &files {
         let text = std::fs::read_to_string(path).expect("read workspace source");
         let text = production_half(&text);
+        // `/`-separated on every host: `Path::display` would spell this
+        // `src\runtime\log.rs` on Windows, so the violation a developer is
+        // told to open would name a file differently depending on where the
+        // guard ran.
         let rel = path
             .strip_prefix(&root)
             .unwrap_or(path)
-            .display()
-            .to_string();
+            .components()
+            .map(|c| c.as_os_str().to_string_lossy())
+            .collect::<Vec<_>>()
+            .join("/");
         for entry in ENTRY_POINTS {
             let mut from = 0usize;
             while let Some(at) = text[from..].find(entry) {

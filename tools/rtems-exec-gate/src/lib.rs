@@ -992,11 +992,7 @@ pub fn audit_crate(manifest_dir: &str) -> CrateCensus {
     let mut claimed: BTreeSet<PathBuf> = BTreeSet::new();
     for path in &files {
         let integration = path.starts_with(root.join("tests"));
-        let rel = path
-            .strip_prefix(root)
-            .unwrap_or(path)
-            .display()
-            .to_string();
+        let rel = repo_path(root, path);
         let text = fs::read_to_string(path).expect("read crate source");
         let audit = audit_source(&rel, &text, integration);
         census.ungated += audit.ungated.len();
@@ -1047,7 +1043,7 @@ pub fn audit_crate(manifest_dir: &str) -> CrateCensus {
                 if !claimed.insert(f.clone()) {
                     continue;
                 }
-                let frel = f.strip_prefix(root).unwrap_or(f).display().to_string();
+                let frel = repo_path(root, f);
                 let ftext = fs::read_to_string(f).expect("read crate source");
                 removes.push(removal_cost(
                     &frel,
@@ -1142,6 +1138,25 @@ pub const CANONICAL_DERIVATION: &str = r#"    // Build-time backend selection, f
     } else {
         println!("cargo::rustc-cfg=tokio_backend");
     }"#;
+
+/// A source file named the way the census and the cost report name it:
+/// relative to the crate root and `/`-separated on every host.
+///
+/// `Path::display` spells the separator the host uses, so the same tree
+/// answered `src\lib.rs` on Windows and `src/lib.rs` everywhere else — two
+/// answers to a question about the tree, which nothing about the host should
+/// reach. `source-guard` builds its labels the same way; the two cannot share
+/// one helper, because this crate sits in every RTEMS-closure crate's build
+/// graph and taking a dependency to save six lines would put `source-guard`
+/// there too.
+fn repo_path(root: &Path, path: &Path) -> String {
+    path.strip_prefix(root)
+        .unwrap_or(path)
+        .components()
+        .map(|c| c.as_os_str().to_string_lossy())
+        .collect::<Vec<_>>()
+        .join("/")
+}
 
 /// The path, from a workspace root, of the file holding the `SCOPE_GATED` pin.
 pub const PIN_FILE: &str =

@@ -3383,8 +3383,11 @@ mod tests {
             let _ = done_tx.send((started.elapsed(), res));
         });
 
+        // Wider than the bound by two orders of magnitude, so a write that is
+        // merely slow reports the number it took instead of being
+        // indistinguishable from one that never returns.
         let (elapsed, res) = done_rx
-            .recv_timeout(Duration::from_secs(5))
+            .recv_timeout(Duration::from_secs(30))
             .expect("the slot write never returned: it is running with no deadline");
         // Held until here so the peer stays connected and silent for the whole
         // write; dropping it earlier would end the write as a reset instead.
@@ -3402,6 +3405,17 @@ mod tests {
         assert!(
             elapsed + TICK >= Duration::from_millis(200),
             "returned a tick or more before the deadline it was given: {elapsed:?}"
+        );
+        // The other side of the same claim, and the one that names what a
+        // failure was: a write outside this is not bounded by the deadline at
+        // all, and the outcome says which branch it came back on.
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "the deadline did not bound the write: {elapsed:?}, ending {}",
+            match &res {
+                Ok(n) => format!("Ok({n})"),
+                Err(f) => format!("Err(closed={}, {})", f.closed, f.error),
+            }
         );
         let failure = res.expect_err("a pipe that is already refusing takes no more");
         assert_eq!(

@@ -35,6 +35,18 @@ served over both Channel Access and pvAccess, so standard C EPICS clients
 > and areaDetector hot paths ~10-30x slower, which causes CA timeouts and
 > dropped monitor updates.
 
+## RTEMS
+
+The RTEMS scripts are documented in
+[`crates/epics-rtems-boot/README.md`](../crates/epics-rtems-boot/README.md);
+one of them is not optional:
+
+| Script | Purpose |
+|--------|---------|
+| [`rtems-bsp.sh`](./rtems-bsp.sh) | **Required.** Build the BSP prefix an RTEMS image links against — RSB cross tools, kernel and libbsd from pinned upstream commits, RTEMS 7 by default (`--series 6` for the 6 branch). No release carries the libbsd/kernel fixes the image relies on, so the prefix is a source build and this is its one recorded recipe; source the `epics-rs-env.sh` it writes before any RTEMS build. |
+| [`rtems-check.sh`](./rtems-check.sh) | Type-check the RTEMS closure on a machine with no toolchain. |
+| [`embedded-image.sh`](./embedded-image.sh) | Build the deployable (`release-embedded`) RTEMS or VxWorks image. |
+
 ## Real-hardware IOCs
 
 The drivers for real devices (Intel RealSense D435i, Measurement Computing

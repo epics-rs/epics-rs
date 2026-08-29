@@ -33,8 +33,7 @@ RTEMS-only; nothing in `csrc/` is compiled for any other target.
 |---|---|---|
 | nightly toolchain + `rust-src` | everything below | `armv7-rtems-eabihf` is tier 3: no prebuilt `std`, so `-Zbuild-std` |
 | `jq` | the target-spec generation | see "The target spec" below |
-| RTEMS 6 toolchain (`arm-rtems6-gcc` on `PATH`) | linking a bootable image | `.cargo/config.toml` names the linker by bare name, resolved from `PATH` |
-| libbsd BSP install, `RTEMS_BSP_PREFIX` env | linking a bootable image | this crate's `build.rs` derives every link flag from it |
+| BSP prefix from `scripts/rtems-bsp.sh` (tools + kernel + libbsd) | linking a bootable image | source its `epics-rs-env.sh`; this crate's `build.rs` derives the compiler and every link flag from `RTEMS_BSP_PREFIX` |
 
 Type-checking needs only the first two rows — no cross-toolchain, no BSP.
 
@@ -48,16 +47,44 @@ This is the portability gate: it compiles every RTEMS crate, binary, and both
 build configurations (`portability` and `image`) for the target, with no
 toolchain present.
 
+## Build the BSP prefix (required)
+
+```bash
+./scripts/rtems-bsp.sh                 # RTEMS 7: kernel main + libbsd 7-freebsd-14 -> ~/rtems-bsp/7
+./scripts/rtems-bsp.sh --series 6      # RTEMS 6: kernel 6 + libbsd 6-freebsd-14 -> ~/rtems-bsp/6
+source ~/rtems-bsp/7/epics-rs-env.sh
+```
+
+An image must link against a prefix this script produced. The reason is not
+convenience: the libbsd and kernel fixes that make a `kqueue`-registered
+socket closable (rtems-libbsd !153/!154/!156/!159, kernel !1383/!1439, merged
+2026-07..08) are on every maintained branch tip and in no release — RTEMS 7 is
+unreleased and 6.3, the first 6-line release to carry them, is not tagged. The
+script builds the RSB cross tools, the kernel and libbsd from pinned commits
+into one prefix, asserts those fixes are ancestors of what it built, and
+records the revisions in the prefix's `epics-rs-env.sh`. A prefix assembled
+by hand matches no upstream tip and cannot be named in a bug report.
+
+Series 7 is the default: a `main` tree reports 7.0.0 in `cpuopts.h`, so the
+version-based driver gate the `kqueue` reactor will use reads it as usable
+with no override. A 6-branch tree reports 6.0.0 until the 6.3 tag exists, so
+the series-6 `epics-rs-env.sh` also exports `EPICS_RTEMS_KQUEUE=1`. The
+toolchain target (`arm-rtems6` / `arm-rtems7`) is read off the prefix's
+directory tree, by `contract::tool_target_in` in this crate and by
+`scripts/rtems-tool-target.sh` in the build scripts; it is never configured.
+
 ## Build a bootable image
 
 ```bash
+source ~/rtems-bsp/7/epics-rs-env.sh
+
 # CA IOC
-RTEMS_BSP_PREFIX=/path/to/bsp cargo +nightly build --release --locked \
+cargo +nightly build --release --locked \
     -Zbuild-std=std,panic_abort --target armv7-rtems-eabihf \
     -p epics-ca-rs --bin realtime-ca-ioc --no-default-features --features client-core
 
 # PVA (QSRV) IOC
-RTEMS_BSP_PREFIX=/path/to/bsp cargo +nightly build --release --locked \
+cargo +nightly build --release --locked \
     -Zbuild-std=std,panic_abort --target armv7-rtems-eabihf \
     -p epics-bridge-rs --bin realtime-pva-ioc --no-default-features --features qsrv-core,pvalink
 ```

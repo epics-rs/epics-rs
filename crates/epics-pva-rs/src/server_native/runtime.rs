@@ -1085,7 +1085,11 @@ mod tcp_fallback_tests {
 
         let intruder = Socket::new(Domain::IPV6, Type::DGRAM, Some(Protocol::UDP)).expect("socket");
         intruder.set_only_v6(true).expect("v6 only");
+        // Asks for everything a sharer could ask for, so the refusal is the
+        // responder's exclusive bind and not the intruder's own half-set.
         intruder.set_reuse_address(true).expect("reuse addr");
+        #[cfg(unix)]
+        intruder.set_reuse_port(true).expect("reuse port");
         let addr = SocketAddrV6::new(Ipv6Addr::UNSPECIFIED, report.udp_port, 0, 0);
         assert!(
             intruder.bind(&addr.into()).is_err(),
@@ -1139,7 +1143,14 @@ mod tcp_fallback_tests {
 
         let peer = Socket::new(Domain::IPV6, Type::DGRAM, Some(Protocol::UDP)).expect("socket");
         peer.set_only_v6(true).expect("v6 only");
+        // What a second IOC really binds with: the whole `PortUse::Shared`
+        // set. `SO_REUSEADDR` alone is enough for this on Linux and is not on
+        // macOS/BSD, where an exact-duplicate datagram bind needs both ends to
+        // carry `SO_REUSEPORT` — so a peer holding half of it measured the
+        // host's kernel rather than the responder's options.
         peer.set_reuse_address(true).expect("reuse addr");
+        #[cfg(unix)]
+        peer.set_reuse_port(true).expect("reuse port");
         let addr = SocketAddrV6::new(Ipv6Addr::UNSPECIFIED, udp_port, 0, 0);
         assert!(
             peer.bind(&addr.into()).is_ok(),

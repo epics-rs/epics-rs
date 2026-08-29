@@ -890,17 +890,15 @@ pub async fn run_udp_responder_v6(
     if let Err(e) = sock.set_only_v6(true) {
         debug!("v6 responder: set_only_v6 failed: {e}");
     }
-    // SO_REUSEADDR so a restart picks up the same port without TIME_WAIT,
-    // and so a second PVA process can co-bind the well-known port. Only for a
-    // number the operator chose: `udp_port` here has already been through
-    // `bind_udp`'s read-back, so on an `EPICS_PVAS_BROADCAST_PORT=0` server it
-    // is the *kernel's* answer, and SO_REUSEADDR alone is enough on Linux for
-    // a stranger's socket to co-bind a wildcard UDP port and take a share of
-    // the datagrams. `PortUse` is what still remembers which it was.
-    if udp_port_use == PortUse::Shared {
-        if let Err(e) = sock.set_reuse_address(true) {
-            debug!("v6 responder: set_reuse_address failed: {e}");
-        }
+    // The reuse set `PortUse::Shared` names, applied by the enum that names it
+    // rather than spelled out again here: a restart picks the same port up
+    // without TIME_WAIT, and a second PVA process co-binds the well-known one.
+    // Only for a number the operator chose — `udp_port` has already been
+    // through `bind_udp`'s read-back, so on an `EPICS_PVAS_BROADCAST_PORT=0`
+    // server it is the *kernel's* answer, and `PortUse` is what still
+    // remembers which it was.
+    if let Err(e) = udp_port_use.apply_reuse(&sock) {
+        debug!("v6 responder: reuse options failed: {e}");
     }
     sock.set_nonblocking(true)
         .map_err(crate::error::PvaError::Io)?;

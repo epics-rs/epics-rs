@@ -1351,6 +1351,24 @@ impl PortUse {
             Self::Shared
         }
     }
+
+    /// Apply this port's reuse options to `sock`, before its `bind`.
+    ///
+    /// The two options are one set, not two decisions — see [`Self::Shared`] —
+    /// and applying them here is what stops a bind site from setting half of
+    /// it. Half reads as working on Linux, where `SO_REUSEADDR` alone already
+    /// lets a stranger co-bind a wildcard UDP port; on macOS and the BSDs an
+    /// exact-duplicate datagram bind needs `SO_REUSEPORT` and `SO_REUSEADDR`
+    /// alone is `EADDRINUSE`. The PVA v6 SEARCH responder set exactly that
+    /// half and lost its co-bind on Darwin only.
+    pub fn apply_reuse(self, sock: &socket2::Socket) -> io::Result<()> {
+        if self == Self::Shared {
+            sock.set_reuse_address(true)?;
+            #[cfg(unix)]
+            sock.set_reuse_port(true)?;
+        }
+        Ok(())
+    }
 }
 
 /// Bind `port` on one NIC and refuse to share it. Used for the second and
@@ -1401,11 +1419,7 @@ fn bind_one_at(
     // socket's search replies can be delivered to the unrelated socket and
     // dropped. With the flags off, bind(0) yields a port this socket
     // exclusively owns.
-    if port_use == PortUse::Shared {
-        sock.set_reuse_address(true)?;
-        #[cfg(unix)]
-        sock.set_reuse_port(true)?;
-    }
+    port_use.apply_reuse(&sock)?;
     if broadcast {
         sock.set_broadcast(true)?;
     }

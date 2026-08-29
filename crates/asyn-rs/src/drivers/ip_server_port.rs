@@ -3293,22 +3293,23 @@ mod tests {
         }
     }
 
-    /// Write to `sock` until the kernel refuses, and report how much it took.
+    /// Write to `sock` until the kernel refuses, leaving it stalled.
     ///
-    /// Both slot-write tests below need a stalled pipe, and they used to infer
-    /// one from arithmetic — a fixed 1 MiB payload against two buffers pinned
-    /// to the minimum. The inference is not sound: how much a "minimum" buffer
-    /// holds is the kernel's own business, and Darwin's clamp, its
-    /// `SO_SNDLOWAT` and its window scaling are none of them Linux's. There the
-    /// 1 MiB fitted, the write made progress the whole time, and the test that
-    /// assumed it must either finish or stall inside five seconds failed on
-    /// both macOS runners.
+    /// Both slot-write tests below need a peer whose pipe cannot take another
+    /// byte, and they used to infer one from a size — a fixed 1 MiB payload
+    /// against buffers pinned to the minimum, later the measured capacity of a
+    /// throwaway connection. Neither inference holds: how much a "minimum"
+    /// buffer accepts is the kernel's own business, and on Darwin it is not
+    /// even the same answer for two sockets set up the same way. The fixed
+    /// 1 MiB fitted, and so did four times a sibling socket's measured
+    /// capacity — the slot write returned in 156 µs against the 200 ms
+    /// deadline it was supposed to spend.
     ///
-    /// "Until the socket itself says `WouldBlock`" is the same statement on
-    /// every kernel. The broadcast test fills the pipe it measures; the slot
-    /// test measures a throwaway pipe and sizes its payload from that.
+    /// "Until this socket says `WouldBlock`" needs no size and is the same
+    /// statement on every kernel, so both tests stall the socket they are
+    /// about to write to and none of them names a byte count.
     #[cfg(unix)]
-    fn fill_until_refused(sock: &TcpStream) -> usize {
+    fn fill_until_refused(sock: &TcpStream) {
         use std::io::Write;
 
         sock.set_nonblocking(true)
@@ -3329,7 +3330,7 @@ mod tests {
             };
             if taken == 0 {
                 assert!(total > 0, "the socket refused the very first byte");
-                return total;
+                return;
             }
             total += taken;
         }
@@ -3338,43 +3339,35 @@ mod tests {
 
     /// F1 regression: a slot write against a peer that has stopped reading.
     ///
-    /// The payload is sized from a measured pipe, not from arithmetic: a
-    /// throwaway connection with the same pinned buffers is filled until the
-    /// socket refuses, and the measured write gets four times that. Before the
-    /// bound, this wedged the calling actor forever, taking a parent broadcast
-    /// with it.
+    /// The pipe is stalled before the slot ever sees it, so no size decides
+    /// whether this test measures anything: the socket the slot writes to is
+    /// the socket that was filled until it refused. Before the bound, this
+    /// wedged the calling actor forever, taking a parent broadcast with it.
+    ///
+    /// The accepted-count half of the same failure is not asserted here. A real
+    /// socket cannot be brought to "full, but with room for a known partial
+    /// write" on every kernel, and the two attempts to arrange it — a fixed
+    /// 1 MiB payload, then four times a sibling connection's measured capacity
+    /// — both failed on Darwin by fitting entirely. `write_with_retry` carries
+    /// the count, and `a_caller_budget_still_caps_a_progressing_transfer`
+    /// pins a non-zero one against a stream whose acceptance this process
+    /// decides.
     #[cfg(unix)]
     #[test]
-    fn a_slot_write_to_a_peer_that_never_reads_expires_and_reports_what_it_sent() {
+    fn a_slot_write_to_a_peer_that_never_reads_expires_without_closing_the_slot() {
         use std::os::fd::AsRawFd;
 
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-
-        // What this kernel's pipe actually holds. `SO_SNDBUF` is a request and
-        // the clamp behind it is the kernel's own: the fixed 1 MiB this test
-        // used to assume "cannot fit in a pinned socket buffer" simply did fit
-        // on Darwin, where the write then neither finished nor stalled inside
-        // five seconds and failed on both macOS runners. The probe connection
-        // is separate so the measured one starts empty — the write has to
-        // accept a real, partial count before it stalls, and 0 would not prove
-        // the count is reported.
-        let capacity = {
-            let probe_peer = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
-            pin_buffer(probe_peer.as_raw_fd(), libc::SO_RCVBUF);
-            let (probe, _) = listener.accept().unwrap();
-            pin_buffer(probe.as_raw_fd(), libc::SO_SNDBUF);
-            fill_until_refused(&probe)
-        };
-        assert!(
-            capacity <= 64 << 20,
-            "a {capacity}-byte pipe is past what this test can outrun"
-        );
-        let payload = vec![0x5au8; capacity * 4];
-
         let client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
         pin_buffer(client.as_raw_fd(), libc::SO_RCVBUF);
         let (server_side, peer) = listener.accept().unwrap();
         pin_buffer(server_side.as_raw_fd(), libc::SO_SNDBUF);
+
+        // `client` is never read from, so nothing reopens the window inside
+        // the deadline and the payload only has to be non-empty.
+        fill_until_refused(&server_side);
+        const PAYLOAD: usize = 64 << 10;
+        let payload = vec![0x5au8; PAYLOAD];
 
         let slot = Arc::new(ClientSlot::new_empty());
         slot.assign(server_side, peer).unwrap();
@@ -3410,7 +3403,7 @@ mod tests {
             elapsed + TICK >= Duration::from_millis(200),
             "returned a tick or more before the deadline it was given: {elapsed:?}"
         );
-        let failure = res.expect_err("four pipes' worth cannot fit in one pipe");
+        let failure = res.expect_err("a pipe that is already refusing takes no more");
         assert_eq!(
             failure.error.status(),
             AsynStatus::Timeout,
@@ -3429,8 +3422,8 @@ mod tests {
             .partial_write()
             .expect("C reports *nbytesTransfered beside the asynTimeout");
         assert!(
-            (1..capacity * 4).contains(&sent),
-            "the caller cannot resync without a real accepted count, got {sent}"
+            sent < PAYLOAD,
+            "a write that timed out cannot have transferred all {PAYLOAD} bytes, got {sent}"
         );
     }
 

@@ -113,6 +113,17 @@ default-filter = """
 # one. Excluded here, not silenced: they still run locally and on any runner
 # where the tree exists.
 #
+# `package(epics-oracle-rs)` is in that list for the same reason and belongs
+# here rather than on the command line. The whole crate is a differential
+# harness against a built C EPICS and pvxs: `CTools::discover`,
+# `PvxTools::discover` and `CTools::dbd_path` are its only doors to the
+# reference tree, and each of them errors rather than skipping. Naming it as
+# `--exclude epics-oracle-rs` per workflow row made the rule a flag three rows
+# remembered and a fourth did not, which is how a workspace run on the exec
+# backend came back with ten of these panics. The rows keep the flag — it also
+# skips *building* the crate, which the filter does not — but the guarantee is
+# here, so a new workspace-wide row cannot lose it.
+#
 # Keep the two lists in step: an addition to profile.default's list belongs
 # here too, or CI silently runs a suite the default loop does not. (The
 # test-group overrides used to be duplicated here for the same reason and no
@@ -142,7 +153,8 @@ default-filter = """
     binary(wire_golden_pvxs) |
     binary(wire_golden_ext) |
     binary(interop_pvxs) |
-    binary(reference_trees)
+    binary(reference_trees) |
+    package(epics-oracle-rs)
   )
 """
 

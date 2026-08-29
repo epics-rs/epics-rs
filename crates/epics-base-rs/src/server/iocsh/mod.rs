@@ -2859,8 +2859,8 @@ mod tests {
     fn an_unopenable_script_prints_cs_open_failure_once() {
         let shell = make_shell();
         let dir = tempfile::tempdir().unwrap();
-        let missing = dir.path().join("no-such.cmd");
-        let missing = script_token(&missing);
+        let missing_path = dir.path().join("no-such.cmd");
+        let missing = script_token(&missing_path);
         let captured = dir.path().join("captured.err");
 
         let result = shell
@@ -2870,12 +2870,18 @@ mod tests {
             });
         assert!(result.is_err(), "an unopenable script is a failure");
 
+        // The reason is whatever this platform says about the open the shell
+        // just tried, taken from the same failure rather than spelled out:
+        // glibc's "No such file or directory" is not what Windows prints for
+        // a file that is not there. C's half of the line — the wording, the
+        // colour, the single unframed line — is what this compares.
+        let reason = c_strerror(&std::fs::File::open(&missing_path).expect_err("no such file"));
         let printed = std::fs::read_to_string(&captured).unwrap();
         assert_eq!(
             printed,
             format!(
                 "{}\n",
-                paint_error(&format!("Can't open {missing}: No such file or directory"))
+                paint_error(&format!("Can't open {missing}: {reason}"))
             ),
             "one line, C's wording, C's `strerror` with no Rust suffix"
         );
@@ -2887,6 +2893,14 @@ mod tests {
     fn c_strerror_drops_rusts_errno_suffix() {
         let enoent = std::io::Error::from_raw_os_error(2);
         assert!(enoent.to_string().ends_with(" (os error 2)"));
+        assert_eq!(
+            c_strerror(&enoent),
+            enoent.to_string().trim_end_matches(" (os error 2)")
+        );
+        // The sentence is the platform's, and only glibc's is the one C
+        // prints here: Windows spells this code "The system cannot find the
+        // file specified."
+        #[cfg(all(unix, target_env = "gnu"))]
         assert_eq!(c_strerror(&enoent), "No such file or directory");
 
         // Not an OS error, so there is no suffix to drop and the message

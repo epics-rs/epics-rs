@@ -3270,34 +3270,103 @@ mod tests {
         );
     }
 
+    /// Ask for the smallest socket buffer the kernel will give, and stop it
+    /// growing again.
+    ///
+    /// The size is a request, not a setting — every kernel clamps it to its own
+    /// minimum. What the call is really for is the side effect both `SO_SNDBUF`
+    /// and `SO_RCVBUF` share: an explicit size turns auto-tuning off, so the
+    /// window a [`fill_until_refused`] measured stays the window.
+    #[cfg(unix)]
+    fn pin_buffer(fd: std::os::fd::RawFd, opt: libc::c_int) {
+        let size: libc::c_int = 1;
+        // SAFETY: `opt` is a `SOL_SOCKET` size option taking the `c_int` passed
+        // here; the kernel clamps upward to its own minimum.
+        unsafe {
+            libc::setsockopt(
+                fd,
+                libc::SOL_SOCKET,
+                opt,
+                std::ptr::addr_of!(size).cast(),
+                std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+            );
+        }
+    }
+
+    /// Write to `sock` until the kernel refuses, and report how much it took.
+    ///
+    /// Both slot-write tests below need a stalled pipe, and they used to infer
+    /// one from arithmetic — a fixed 1 MiB payload against two buffers pinned
+    /// to the minimum. The inference is not sound: how much a "minimum" buffer
+    /// holds is the kernel's own business, and Darwin's clamp, its
+    /// `SO_SNDLOWAT` and its window scaling are none of them Linux's. There the
+    /// 1 MiB fitted, the write made progress the whole time, and the test that
+    /// assumed it must either finish or stall inside five seconds failed on
+    /// both macOS runners.
+    ///
+    /// "Until the socket itself says `WouldBlock`" is the same statement on
+    /// every kernel. The broadcast test fills the pipe it measures; the slot
+    /// test measures a throwaway pipe and sizes its payload from that.
+    #[cfg(unix)]
+    fn fill_until_refused(sock: &TcpStream) -> usize {
+        use std::io::Write;
+
+        sock.set_nonblocking(true)
+            .expect("nonblocking for the fill");
+        let block = vec![0xa5u8; 64 * 1024];
+        let mut total = 0usize;
+        // Only a runaway guard: 256 MiB is far past any socket buffer, and a
+        // kernel that never refused would otherwise hang the suite.
+        while total < 256 << 20 {
+            match (&*sock).write(&block) {
+                Ok(0) => break,
+                Ok(n) => total += n,
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    assert!(total > 0, "the socket refused the very first byte");
+                    return total;
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(e) => panic!("filling the pipe failed: {e}"),
+            }
+        }
+        panic!("the socket accepted {total} bytes without ever refusing");
+    }
+
     /// F1 regression: a slot write against a peer that has stopped reading.
     ///
-    /// Both socket buffers are pinned to the kernel minimum, so a 1 MiB
-    /// payload cannot fit in the pipe and the write must genuinely block —
-    /// the condition a sleep can only approximate. Before the bound, this
-    /// wedged the calling actor forever, taking a parent broadcast with it.
+    /// The payload is sized from a measured pipe, not from arithmetic: a
+    /// throwaway connection with the same pinned buffers is filled until the
+    /// socket refuses, and the measured write gets four times that. Before the
+    /// bound, this wedged the calling actor forever, taking a parent broadcast
+    /// with it.
     #[cfg(unix)]
     #[test]
     fn a_slot_write_to_a_peer_that_never_reads_expires_and_reports_what_it_sent() {
         use std::os::fd::AsRawFd;
 
-        fn pin_buffer(fd: std::os::fd::RawFd, opt: libc::c_int) {
-            let size: libc::c_int = 1;
-            // SAFETY: `opt` is a `SOL_SOCKET` size option taking the `c_int`
-            // passed here; the kernel clamps upward to its own minimum.
-            unsafe {
-                libc::setsockopt(
-                    fd,
-                    libc::SOL_SOCKET,
-                    opt,
-                    std::ptr::addr_of!(size).cast(),
-                    std::mem::size_of::<libc::c_int>() as libc::socklen_t,
-                );
-            }
-        }
-
-        const PAYLOAD: usize = 1 << 20;
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+
+        // What this kernel's pipe actually holds. `SO_SNDBUF` is a request and
+        // the clamp behind it is the kernel's own: the fixed 1 MiB this test
+        // used to assume "cannot fit in a pinned socket buffer" simply did fit
+        // on Darwin, where the write then neither finished nor stalled inside
+        // five seconds and failed on both macOS runners. The probe connection
+        // is separate so the measured one starts empty — the write has to
+        // accept a real, partial count before it stalls, and 0 would not prove
+        // the count is reported.
+        let capacity = {
+            let probe_peer = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+            pin_buffer(probe_peer.as_raw_fd(), libc::SO_RCVBUF);
+            let (probe, _) = listener.accept().unwrap();
+            pin_buffer(probe.as_raw_fd(), libc::SO_SNDBUF);
+            fill_until_refused(&probe)
+        };
+        assert!(
+            capacity <= 64 << 20,
+            "a {capacity}-byte pipe is past what this test can outrun"
+        );
+        let payload = vec![0x5au8; capacity * 4];
+
         let client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
         pin_buffer(client.as_raw_fd(), libc::SO_RCVBUF);
         let (server_side, peer) = listener.accept().unwrap();
@@ -3312,12 +3381,8 @@ mod tests {
         let (done_tx, done_rx) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
             let started = Instant::now();
-            let res = writer.write_or_close(
-                &vec![0x5a; PAYLOAD],
-                Some(Duration::from_millis(200)),
-                None,
-                "srv:0",
-            );
+            let res =
+                writer.write_or_close(&payload, Some(Duration::from_millis(200)), None, "srv:0");
             let _ = done_tx.send((started.elapsed(), res));
         });
 
@@ -3341,7 +3406,7 @@ mod tests {
             elapsed + TICK >= Duration::from_millis(200),
             "returned a tick or more before the deadline it was given: {elapsed:?}"
         );
-        let failure = res.expect_err("a 1 MiB write cannot fit in a pinned socket buffer");
+        let failure = res.expect_err("four pipes' worth cannot fit in one pipe");
         assert_eq!(
             failure.error.status(),
             AsynStatus::Timeout,
@@ -3360,7 +3425,7 @@ mod tests {
             .partial_write()
             .expect("C reports *nbytesTransfered beside the asynTimeout");
         assert!(
-            (1..PAYLOAD).contains(&sent),
+            (1..capacity * 4).contains(&sent),
             "the caller cannot resync without a real accepted count, got {sent}"
         );
     }
@@ -3368,30 +3433,15 @@ mod tests {
     /// R-3 regression: a broadcast write must spend the caller's budget once,
     /// not once per slot.
     ///
-    /// Eight peers that have stopped reading, each with its send buffer pinned
-    /// to the kernel minimum so a 1 MiB payload genuinely blocks. With a
-    /// per-slot `Instant::now() + timeout` a TMOT of 200 ms became 1.6 s of
-    /// PACT=1 with the port queue stalled behind it; with one deadline for the
-    /// whole fan-out the eighth slot inherits what the first left of it.
+    /// Eight peers that have stopped reading, each pipe filled until the socket
+    /// refuses so every slot write starts stalled. With a per-slot
+    /// `Instant::now() + timeout` a TMOT of 200 ms became 1.6 s of PACT=1 with
+    /// the port queue stalled behind it; with one deadline for the whole
+    /// fan-out the eighth slot inherits what the first left of it.
     #[cfg(unix)]
     #[test]
     fn a_broadcast_write_spends_the_caller_budget_once_not_once_per_slot() {
         use std::os::fd::AsRawFd;
-
-        fn pin_buffer(fd: std::os::fd::RawFd, opt: libc::c_int) {
-            let size: libc::c_int = 1;
-            // SAFETY: `opt` is a `SOL_SOCKET` size option taking the `c_int`
-            // passed here; the kernel clamps upward to its own minimum.
-            unsafe {
-                libc::setsockopt(
-                    fd,
-                    libc::SOL_SOCKET,
-                    opt,
-                    std::ptr::addr_of!(size).cast(),
-                    std::mem::size_of::<libc::c_int>() as libc::socklen_t,
-                );
-            }
-        }
 
         const SLOTS: usize = 8;
         const PAYLOAD: usize = 1 << 20;
@@ -3417,6 +3467,7 @@ mod tests {
             pin_buffer(client.as_raw_fd(), libc::SO_RCVBUF);
             let (server_side, peer) = listener.accept().unwrap();
             pin_buffer(server_side.as_raw_fd(), libc::SO_SNDBUF);
+            fill_until_refused(&server_side);
             slot.assign(server_side, peer).unwrap();
             clients.push(client);
         }

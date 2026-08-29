@@ -602,6 +602,16 @@ pub(super) fn write_with_retry(
     cap: Option<std::time::Instant>,
 ) -> AsynResult<usize> {
     let mut offset = 0;
+    // C's `haveStartTime`/`startTime` (drvAsynIPPort.c:665, 694-708): stamped at
+    // the FIRST retryable `send` and never re-armed, not even by a pass that
+    // moved bytes. It is what bounds a `poll` that keeps reporting writable
+    // against a `send` that keeps answering EWOULDBLOCK — a cycle the per-pass
+    // deadline below cannot bound, because that deadline is a fresh
+    // `now + poll` every time round. Darwin runs exactly that cycle: its
+    // `poll(POLLOUT)` reports writable at `SO_SNDLOWAT` rather than at an empty
+    // buffer, so a 1 MiB write to a peer that had stopped reading never
+    // returned at all, on any deadline the caller gave it.
+    let mut retry_since: Option<std::time::Instant> = None;
     while offset < data.len() {
         // `poll == None` is C's negative timeout — an unbounded wait, which
         // only the caller's own budget (`cap`) can cut short.
@@ -631,12 +641,32 @@ pub(super) fn write_with_retry(
             }
             Ok(n) => offset += n,
             // C retries both of these against `pasynUser->timeout`
-            // (`drvAsynIPPort.c:661-676`), whose clock it restarts at the top
-            // of each pass; the wait at the top of this loop is that bound, so
-            // the retry needs no sleep of its own.
+            // (`drvAsynIPPort.c:694-710`) and sleeps `SEND_RETRY_DELAY`
+            // between attempts; the wait at the top of this loop is that
+            // sleep, so the retry needs none of its own — but it is not the
+            // bound, because it re-arms.
             Err(ref e)
                 if e.kind() == std::io::ErrorKind::WouldBlock
-                    || e.kind() == std::io::ErrorKind::Interrupted => {}
+                    || e.kind() == std::io::ErrorKind::Interrupted =>
+            {
+                // C compares against `pasynUser->timeout`; `poll` is that value
+                // with C's own zero-to-1 ms floor already applied
+                // (`socket_poll_timeout`), which is the whole difference.
+                // `None` is C's negative timeout, whose retry burst C leaves
+                // unbounded too (`else if (pasynUser->timeout >= 0)`).
+                match retry_since {
+                    None => retry_since = Some(std::time::Instant::now()),
+                    Some(since) => {
+                        if poll.is_some_and(|p| since.elapsed() > p) {
+                            return Err(AsynError::Status {
+                                status: AsynStatus::Timeout,
+                                message: "write timeout".into(),
+                            }
+                            .with_partial_write(offset));
+                        }
+                    }
+                }
+            }
             Err(e) => return Err(AsynError::Io(e).with_partial_write(offset)),
         }
     }
@@ -798,8 +828,10 @@ impl OctetNext for IpIoState {
         // through. socket_poll_timeout is a no-op for any positive timeout, so
         // this only affects the `timeout == 0` case.
         //
-        // The bound is per wait, not per transfer, and this port imposes no
-        // outer cap — C bounds only the individual `poll(POLLOUT)`.
+        // The wait bound is per pass, and this port imposes no outer cap; the
+        // total is C's own `haveStartTime` retry bound inside
+        // `write_with_retry`, which is what stops a writable-but-EWOULDBLOCK
+        // cycle from running forever.
         let poll = socket_poll_timeout(user.timeout);
         // C writeIt reports what the socket took (`*nbytesTransfered`) on
         // success and on failure alike; return the real count rather than
@@ -3157,6 +3189,49 @@ mod tests {
             .expect_err("a wait longer than the bound is C's asynTimeout");
         assert_eq!(err.status(), AsynStatus::Timeout);
         assert_eq!(err.partial_write(), Some(0));
+    }
+
+    /// A socket `poll` calls writable and `send` then refuses.
+    ///
+    /// Darwin's `poll(POLLOUT)` reports writable at `SO_SNDLOWAT`, not at an
+    /// empty buffer, so this pair is what a real macOS write to a peer that has
+    /// stopped reading does. The per-pass deadline cannot bound it — each pass
+    /// re-arms a fresh `now + poll` and neither the wait nor the send ever
+    /// blocks — so before C's `haveStartTime` retry bound was carried across,
+    /// this call did not return at all, on any timeout the caller gave it.
+    struct WritableButRefusing;
+
+    impl WaitWritable for WritableButRefusing {
+        fn wait_writable(&self, _deadline: Option<std::time::Instant>) -> std::io::Result<bool> {
+            Ok(true)
+        }
+    }
+
+    impl SendWithoutParking for WritableButRefusing {
+        fn send_without_parking(&self, _buf: &[u8]) -> std::io::Result<usize> {
+            Err(std::io::Error::from(std::io::ErrorKind::WouldBlock))
+        }
+    }
+
+    #[test]
+    fn a_writable_socket_that_keeps_refusing_bytes_expires_on_the_retry_bound() {
+        let started = std::time::Instant::now();
+        let err = write_with_retry(
+            &WritableButRefusing,
+            b"abcdef",
+            Some(Duration::from_millis(50)),
+            None,
+        )
+        .expect_err("a send that never accepts a byte is C's asynTimeout");
+        assert_eq!(err.status(), AsynStatus::Timeout);
+        assert_eq!(err.partial_write(), Some(0));
+        // The bound is cumulative from the first refusal, so it expires once
+        // rather than once per pass.
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "the retry bound did not hold: {:?}",
+            started.elapsed()
+        );
     }
 
     /// The caller's own budget still caps the transfer where one exists — the

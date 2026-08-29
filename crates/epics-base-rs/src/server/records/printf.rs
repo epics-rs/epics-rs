@@ -711,7 +711,7 @@ pub fn g_decision_exponent(abs: f64, precision: usize) -> i32 {
 /// for `pvget`/`pvinfo`/`pvmonitor`) and `asyn-rs` (`param::format_g`,
 /// for `paramVal::report`) each carry their own, because sharing one
 /// would force a crate dependency none of the three otherwise needs.
-/// What holds them equal is `libc_g_differential` — the same test
+/// What holds them equal is `libc_differential` — the same test
 /// exists in all three crates and requires byte equality with glibc's
 /// `snprintf("%.*g")` over 56,300 values including NaN, the infinities
 /// and subnormals. It is what caught this copy printing `NaN` where
@@ -725,7 +725,7 @@ pub fn format_g(x: f64, precision: usize) -> String {
     if x.is_nan() {
         // glibc carries the NaN sign bit into the text and spells it
         // lowercase for a lowercase conversion; Rust's `{}` writes `NaN`
-        // and drops the sign. `libc_g_differential` pins the difference.
+        // and drops the sign. `libc_differential` pins the difference.
         return if x.is_sign_negative() { "-nan" } else { "nan" }.to_string();
     }
     if x.is_infinite() {
@@ -980,7 +980,13 @@ impl Record for PrintfRecord {
     }
 }
 
-/// The differential that makes three transcriptions of `%g` safe.
+/// Every assertion in this file whose reference is glibc itself.
+///
+/// One home and one gate: `libc` is a `cfg(unix)` dependency of this
+/// crate, so a glibc differential written anywhere else in the file
+/// fails to build on Windows.
+///
+/// The `%g` half makes three transcriptions of `format_g` safe.
 ///
 /// `epics-base-rs` (`printf` record), `epics-pva-rs` (`pvget`/`pvinfo`/
 /// `pvmonitor`) and `asyn-rs` (`paramVal::report`) each carry their own
@@ -994,7 +1000,7 @@ impl Record for PrintfRecord {
 /// Gated on `target_env = "gnu"`: the assertion is glibc's exact output,
 /// and newlib (RTEMS) / musl are not that reference.
 #[cfg(all(test, unix, target_env = "gnu"))]
-mod libc_g_differential {
+mod libc_differential {
     use super::format_g;
 
     /// glibc `printf("%.*g", prec, v)`.
@@ -1211,6 +1217,31 @@ mod libc_g_differential {
             mismatches.join("\n")
         );
     }
+
+    /// glibc `printf("%u", (unsigned)v)`.
+    fn libc_u32(v: i32) -> String {
+        let mut buf = [0u8; 64];
+        // SAFETY: the spec is NUL-terminated and takes exactly one
+        // `unsigned int`; `buf` is passed with its own length.
+        let n = unsafe {
+            libc::snprintf(
+                buf.as_mut_ptr().cast(),
+                buf.len(),
+                c"%u".as_ptr().cast(),
+                v as libc::c_uint,
+            )
+        };
+        assert!(n >= 0 && (n as usize) < buf.len());
+        String::from_utf8(buf[..n as usize].to_vec()).expect("glibc writes ASCII")
+    }
+
+    /// The literal `%u` of -1 that
+    /// `integer_conversions_narrow_by_dbr_type_not_through_f64` asserts,
+    /// pinned to glibc rather than to arithmetic done by hand.
+    #[test]
+    fn u32_of_minus_one_is_what_glibc_prints() {
+        assert_eq!(libc_u32(-1i32), "4294967295");
+    }
 }
 
 #[cfg(test)]
@@ -1284,7 +1315,6 @@ mod tests {
         rec.set_input(0, EpicsValue::Long(-1));
         rec.process().unwrap();
         assert_eq!(rec.val, "4294967295");
-        assert_eq!(rec.val, libc_u32(-1i32));
 
         let mut rec = rec_with("%hx");
         rec.set_input(0, EpicsValue::Long(-1));
@@ -1338,23 +1368,6 @@ mod tests {
             rec.process().unwrap();
             assert_eq!(rec.val, fmt, "{fmt} must be F_BADFMT, got {:?}", rec.val);
         }
-    }
-
-    /// glibc's own `%u` of a 32-bit -1, for the assertion above.
-    fn libc_u32(v: i32) -> String {
-        let mut buf = [0u8; 64];
-        // SAFETY: the spec is NUL-terminated and takes exactly one
-        // `unsigned int`; `buf` is passed with its own length.
-        let n = unsafe {
-            libc::snprintf(
-                buf.as_mut_ptr().cast(),
-                buf.len(),
-                c"%u".as_ptr().cast(),
-                v as libc::c_uint,
-            )
-        };
-        assert!(n >= 0 && (n as usize) < buf.len());
-        String::from_utf8(buf[..n as usize].to_vec()).expect("glibc writes ASCII")
     }
 
     /// `%s` prints the input link's STRING content, not a number.

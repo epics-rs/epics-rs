@@ -30,6 +30,12 @@
 //! property of the console predicate, which has its own gate
 //! (`errlog_escapes_come_from_the_console_predicate`); what is asserted here is
 //! the text and its position.
+//!
+//! Unix only: what is captured is the process console, and the only way to
+//! capture it is to point fd 2 somewhere else and put it back. There is no
+//! fd 2 on Windows, and `libc` is a `cfg(unix)` dependency of this crate.
+
+#![cfg(unix)]
 
 use std::sync::Arc;
 

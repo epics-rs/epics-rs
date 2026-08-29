@@ -3318,16 +3318,20 @@ mod tests {
         // Only a runaway guard: 256 MiB is far past any socket buffer, and a
         // kernel that never refused would otherwise hang the suite.
         while total < 256 << 20 {
-            match (&*sock).write(&block) {
-                Ok(0) => break,
-                Ok(n) => total += n,
-                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                    assert!(total > 0, "the socket refused the very first byte");
-                    return total;
-                }
-                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+            let taken = match (&*sock).write(&block) {
+                Ok(n) => n,
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                // A socket that will not take another byte is refusing, which
+                // is the condition this function exists to find. `Ok(0)` says
+                // the same thing without an error, so both leave the same way.
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => 0,
                 Err(e) => panic!("filling the pipe failed: {e}"),
+            };
+            if taken == 0 {
+                assert!(total > 0, "the socket refused the very first byte");
+                return total;
             }
+            total += taken;
         }
         panic!("the socket accepted {total} bytes without ever refusing");
     }

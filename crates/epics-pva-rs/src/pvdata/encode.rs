@@ -20,7 +20,7 @@
 //! | 0x88   | structure array (followed by 0x80 + body)|
 //! | 0x89   | union array     (followed by 0x81 + body)|
 //! | 0x8A   | variant array                            |
-//! | scalar | tag (above) | 0x08 → scalar array        |
+//! | scalar + 0x08 | scalar array of the tag above            |
 
 use std::io::Cursor;
 

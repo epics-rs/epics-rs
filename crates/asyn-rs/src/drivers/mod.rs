@@ -104,7 +104,7 @@ mod tests {
     /// | serial | drvAsynSerialPort.c:1101-1102 | `ASYN_CANBLOCK` |
     /// | serial (win32) | drvAsynSerialPortWin32.c:774-775 | `ASYN_CANBLOCK` |
     /// | USBTMC | drvAsynUSBTMC.c:1273-1274 | `ASYN_CANBLOCK` |
-    /// | VXI-11 | drvVxi11.c:1759-1762 | `ASYN_CANBLOCK` (`|ASYN_MULTIDEVICE` unless single-link) |
+    /// | VXI-11 | drvVxi11.c:1759-1762 | `ASYN_CANBLOCK` (`\| ASYN_MULTIDEVICE` unless single-link) |
     /// | Prologix GPIB | drvPrologixGPIB.c:592-593 | `ASYN_CANBLOCK \| ASYN_MULTIDEVICE` |
     ///
     /// `null_port` has no C original; it declares itself a mirror of

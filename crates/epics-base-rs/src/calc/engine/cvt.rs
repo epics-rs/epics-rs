@@ -32,9 +32,9 @@
 /// |------------|-----------------------|
 /// | PI         | `3.14159265`          |
 /// | 1e7        | `10000000.00000000`   |
-/// | 10000000.5 | `10000000.500`        | (the precision-3 clamp)
+/// | 10000000.5 | `10000000.500` (the precision-3 clamp) |
 /// | 1e16       | `10000000000000000.000` |
-/// | 1.0000001e16 | `_1.00000010e+16`   | (leading space: width 15)
+/// | 1.0000001e16 | `_1.00000010e+16` (leading space: width 15) |
 /// | +inf       | `____________inf`     |
 ///
 /// Compiled against the real `cvtFast.c` on this host; the table above is its

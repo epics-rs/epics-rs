@@ -193,7 +193,7 @@ dbLoadRecords("NDTimeSeries.template", "P=$(PREFIX),R=Attr1:TS:,PORT=ATTR1_TS,AD
 # ===== FFT =====
 
 NDFFTConfigure("FFT1", $(QSIZE), 0, "$(PORT)", 0)
-dbLoadRecords("NDFFT.template", "P=$(PREFIX),R=FFT1:,PORT=FFT1,NCHANS=$(NCHANS),NDARRAY_PORT=$(PORT)")
+dbLoadRecords("NDFFT.template", "P=$(PREFIX),R=FFT1:,PORT=FFT1,NAME=FFT1,NCHANS=$(NCHANS),NDARRAY_PORT=$(PORT)")
 
 # ===== Codec plugins (2 instances) =====
 

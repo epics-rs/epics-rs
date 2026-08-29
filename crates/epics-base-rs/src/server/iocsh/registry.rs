@@ -402,6 +402,8 @@ impl CommandRegistry {
 /// Tokenize a command line supporting both C++ EPICS and space-separated syntax.
 ///
 /// C++ syntax: `command("arg1", arg2, $(VAR))` — parens delimit args, commas separate.
+/// Blanks between the name and `(` are insignificant, as in C's uniform
+/// separator set (iocsh.cpp:271).
 /// Legacy syntax: `command "arg1" arg2` — whitespace separates.
 ///
 /// C parity (`iocsh.cpp:1184` `macDefExpand` → `:1215` `tokenize.split`):
@@ -418,20 +420,8 @@ pub(crate) fn tokenize(line: &str) -> Vec<String> {
         return Vec::new();
     }
 
-    // Find the command name: everything up to first '(' or whitespace
-    let mut cmd_end = line.len();
-    let mut has_parens = false;
-    for (i, ch) in line.char_indices() {
-        if ch == '(' {
-            cmd_end = i;
-            has_parens = true;
-            break;
-        } else if ch == ' ' || ch == '\t' {
-            cmd_end = i;
-            break;
-        }
-    }
-
+    // Find the command name: everything up to first '(' or whitespace.
+    let cmd_end = line.find([' ', '\t', '(']).unwrap_or(line.len());
     let cmd_name = &line[..cmd_end];
     if cmd_name.is_empty() {
         return Vec::new();
@@ -441,13 +431,16 @@ pub(crate) fn tokenize(line: &str) -> Vec<String> {
     // pushed verbatim (no per-token substitution).
     let mut tokens = vec![cmd_name.to_string()];
 
-    if has_parens {
+    // C `split()` has one uniform separator set — `strchr(" \t(),\r", c)`
+    // (iocsh.cpp:271) — so blanks between the command name and its `(`
+    // carry no meaning there: `cmd (args)` and `cmd(args)` tokenize
+    // identically. Skip them before deciding which syntax this line uses,
+    // instead of letting a space win the race against the paren.
+    let rest = &line[cmd_end..];
+    if let Some(call_args) = rest.trim_start_matches([' ', '\t']).strip_prefix('(') {
         // C++ syntax: command(arg1, arg2, ...)
-        // Find matching closing paren
-        let args_start = cmd_end + 1; // skip '('
-        let rest = &line[args_start..];
-        let paren_end = find_closing_paren(rest);
-        let args_str = &rest[..paren_end];
+        let paren_end = find_closing_paren(call_args);
+        let args_str = &call_args[..paren_end];
 
         if !args_str.trim().is_empty() {
             for arg in split_comma_args(args_str) {
@@ -456,7 +449,6 @@ pub(crate) fn tokenize(line: &str) -> Vec<String> {
         }
     } else {
         // Legacy space-separated syntax
-        let rest = &line[cmd_end..];
         for arg in split_space_args(rest) {
             tokens.push(arg);
         }
@@ -967,6 +959,20 @@ mod tests {
     #[test]
     fn test_tokenize_cpp_no_args() {
         assert_eq!(tokenize("iocInit()"), vec!["iocInit"]);
+    }
+
+    #[test]
+    fn test_tokenize_blanks_before_paren_still_call_syntax() {
+        // C split() separates on `strchr(" \t(),\r", c)` uniformly
+        // (iocsh.cpp:271), so a blank between the name and `(` changes
+        // nothing there. The port must not fall back to space-separated
+        // syntax and hand the command `("L0",`-shaped tokens.
+        assert_eq!(
+            tokenize(r#"asynOctetSetInputEos ("L0", 0, "\r")"#),
+            tokenize(r#"asynOctetSetInputEos("L0", 0, "\r")"#)
+        );
+        assert_eq!(tokenize("cmd\t(a, b)"), vec!["cmd", "a", "b"]);
+        assert_eq!(tokenize("iocInit ()"), vec!["iocInit"]);
     }
 
     #[test]

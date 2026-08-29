@@ -964,6 +964,20 @@ impl AdIoc {
         // creates its port and sets the EOS before `iocInit`.
         app = asyn_rs::iocsh::register_asyn_commands(app, ports.clone());
 
+        // ad-core-rs's own templates use these record types — NDArrayBase
+        // (so every plugin) declares `busy` fields, NDStats/NDProcess `sseq`
+        // ones — the way every C ADCore IOC links busySupport.dbd and
+        // calcSupport.dbd through commonDriverMakefile:303-310. Both were
+        // dropped from the default registry with the stdRecords.dbd
+        // manifest, so an AdIoc has to bring them back itself; a later
+        // `register_record_type` call with the same name still overrides.
+        app = app.register_record_type("busy", || {
+            Box::new(epics_base_rs::server::records::busy::BusyRecord::default())
+        });
+        app = app.register_record_type("sseq", || {
+            Box::new(epics_base_rs::server::records::sseq::SseqRecord::default())
+        });
+
         Self {
             app: Some(app),
             mgr,

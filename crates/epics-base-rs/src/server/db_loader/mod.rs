@@ -385,7 +385,18 @@ fn suggest_field(record_type: &str, name: &str, value: &str) -> Option<&'static 
 }
 
 /// The `.dbd` name and choice table of the menu `field` resolves its `.db`
-/// value against, or `None` when the field is not `DBF_MENU`.
+/// value against, or `None` when the field is not a menu.
+///
+/// A menu field is one declared `DBF_MENU` — or one that carries its own
+/// choice table, however its `DbfCode` reads. An externally-registered
+/// record type builds its `FieldDesc`s in its own crate, so its tables are
+/// not the generated `MENUS` statics and its `declared_dbf` is whatever
+/// [`FieldDesc::new`] derived from the served type (`Enum`, mostly); C could
+/// only have written such a field as `DBF_MENU` with a named `menu()`, so a
+/// carried table is treated as that declaration. The name half of C's pair
+/// is then unavailable — the `MENUS` lookup is by table identity and the
+/// external static is not in it — which is why the name is an `Option`:
+/// validation does not need it, only the refusal wording does.
 ///
 /// `DBF_DEVICE` is deliberately not answered here. C's device menu is the
 /// record type's `device()` lines, so every DTYP a `.db` may name is in it; the
@@ -397,17 +408,24 @@ fn suggest_field(record_type: &str, name: &str, value: &str) -> Option<&'static 
 /// `menuScan` is why the menu's NAME is looked up rather than carried on the
 /// declaration: its choices are the site's, resolved at run time, so the
 /// generated `FieldDesc` holds `None` and the table is in no generated row.
-fn load_menu_of(desc: &FieldDesc) -> Option<(&'static str, &'static [&'static str])> {
+fn load_menu_of(desc: &FieldDesc) -> Option<(Option<&'static str>, &'static [&'static str])> {
     use crate::server::record::shared_menu_choices;
 
-    if desc.declared_dbf != DbfCode::Menu {
+    // `DBF_DEVICE` stays out even when it carries a table: its channel is
+    // the device menu, and its C refusal is worded differently (see above).
+    if desc.declared_dbf != DbfCode::Menu
+        && (desc.menu.is_none() || desc.declared_dbf == DbfCode::Device)
+    {
         return None;
     }
     let choices = desc
         .menu
         .or_else(|| shared_menu_choices(desc.name))
         .unwrap_or(&[]);
-    menu_name_of(choices).map(|name| (name, choices))
+    if choices.is_empty() {
+        return None;
+    }
+    Some((menu_name_of(choices), choices))
 }
 
 /// The `.dbd` name of the menu whose choice table is `choices`.
@@ -462,9 +480,10 @@ fn cant_set_line(record: &str, field: &str, value: &str, detail: &str, status: &
 /// `65535` through — so this asks it, then asks only whether the value parsed,
 /// to pick which of C's two wordings applies.
 ///
-/// `None` also covers a menu whose name did not resolve, because a refusal C
-/// words with the menu's name must not be printed without it; such a field
-/// falls to the numeric arms, which decline every non-numeric token.
+/// `None` also covers a menu that resolves no choice table at all; such a
+/// field falls to the numeric arms. A menu whose NAME did not resolve — an
+/// externally-registered record type's own table — still validates against
+/// its choices; only the refusal wording loses the name C would print.
 /// DTYP is deliberately NOT judged here, and the omission is a decision
 /// rather than an oversight. C refuses a bad `field(DTYP,…)` during the
 /// `.db` parse, through `dbPutStringNum`'s own `DBF_DEVICE` branch
@@ -512,9 +531,8 @@ pub(crate) fn menu_value_refusal(
     let probe = db_put_string_probe(value);
     let (detail, status, suggestion) = match load_menu_of(desc) {
         Some((menu_name, choices)) => menu_arm(desc, field, menu_name, choices, probe, value)?,
-        // Not a menu — or a menu whose name did not resolve, which must not
-        // reach the menu wording. Either way the numeric arms of the same C
-        // function decide it.
+        // Not a menu — or one that resolves no choice table. Either way the
+        // numeric arms of the same C function decide it.
         None => (
             String::new(),
             numeric_value_refusal(desc.declared_dbf, field, probe)?,
@@ -533,7 +551,7 @@ pub(crate) fn menu_value_refusal(
 fn menu_arm(
     desc: &FieldDesc,
     field: &str,
-    menu_name: &str,
+    menu_name: Option<&str>,
     choices: &[&'static str],
     probe: &str,
     value: &str,
@@ -547,7 +565,13 @@ fn menu_arm(
     let (detail, status) = match c_parse::parse_auto_base_units_null(NumericField::UShort, probe) {
         // `epicsParseUInt16` succeeded, so the bound is what refused it.
         Some(_) => (String::new(), "Bad Field value"),
-        None => (format!("using menu {menu_name}"), "Illegal choice"),
+        // C words this with `pdbMenu->name`; an externally-registered menu
+        // has no `.dbd` name, and the field's own name is the nearest thing
+        // the wording can carry.
+        None => (
+            format!("using menu {}", menu_name.unwrap_or(field)),
+            "Illegal choice",
+        ),
     };
     // C suggests off the value it was GIVEN, not the "0" the numeric arm
     // substituted for an empty one — `dbRecordField` hands
@@ -6308,7 +6332,7 @@ mod menu_refusal_tests {
                 continue;
             }
             assert!(
-                super::load_menu_of(desc).is_some(),
+                super::load_menu_of(desc).is_some_and(|(name, _)| name.is_some()),
                 "{}: menu name did not resolve",
                 desc.name
             );
@@ -6316,9 +6340,45 @@ mod menu_refusal_tests {
         // And a record-own menu field, resolved through the same table.
         let linr = declared_field("ai", "LINR").expect("ai declares LINR");
         assert_eq!(
-            super::load_menu_of(linr).map(|(n, _)| n),
+            super::load_menu_of(linr).and_then(|(n, _)| n),
             Some("menuConvert")
         );
+    }
+
+    /// An externally-registered record type's menu field carries its own
+    /// choice table — a static from its OWN crate, absent from the generated
+    /// `MENUS` — and `FieldDesc::new` derives `declared_dbf` from the served
+    /// type, not from the table. Both halves used to drop the field out of
+    /// the menu path entirely, and its labels then refused through the
+    /// `DBF_ENUM`/`DBF_USHORT` numeric arm as "No digits to convert".
+    #[test]
+    fn an_external_choice_table_is_a_menu_without_a_name() {
+        use crate::server::record::FieldDesc;
+        use crate::types::{DbFieldType, DbfCode};
+
+        static EXT_CHOICES: &[&str] = &["Local", "Remote"];
+        let mut desc = FieldDesc::new("MODE", DbFieldType::Enum, false);
+        desc.menu = Some(EXT_CHOICES);
+        assert_eq!(desc.declared_dbf, DbfCode::Enum);
+        assert_eq!(super::load_menu_of(&desc), Some((None, EXT_CHOICES)));
+
+        // A valid label is not refused; an invalid one gets C's menu
+        // wording, with the field's name standing in for the `.dbd` menu
+        // name the external table does not have.
+        assert_eq!(
+            super::menu_arm(&desc, "MODE", None, EXT_CHOICES, "Remote", "Remote"),
+            None
+        );
+        let (detail, status, _) =
+            super::menu_arm(&desc, "MODE", None, EXT_CHOICES, "Bogus", "Bogus").unwrap();
+        assert_eq!(detail, "using menu MODE");
+        assert_eq!(status, "Illegal choice");
+
+        // `DBF_DEVICE` keeps its own channel even when it carries a table.
+        let mut dtyp = FieldDesc::new("DTYP", DbFieldType::Enum, false);
+        dtyp.declared_dbf = DbfCode::Device;
+        dtyp.menu = Some(EXT_CHOICES);
+        assert_eq!(super::load_menu_of(&dtyp), None);
     }
 }
 

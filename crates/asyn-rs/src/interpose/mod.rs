@@ -78,6 +78,42 @@ pub trait OctetNext: Send + Sync {
     fn flush(&mut self, user: &mut AsynUser) -> AsynResult<()>;
 }
 
+/// The longest terminator C's EOS interpose can hold: `eosIn[2]` / `eosOut[2]`
+/// (asynInterposeEos.c:51-54), which is what its `switch (eoslen)` enforces.
+pub const MAX_EOS_LEN: usize = 2;
+
+/// What one terminator write did as it travelled the interpose chain — the
+/// three answers C's `setInputEos`/`setOutputEos` can give, which a `bool`
+/// could not carry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EosSet {
+    /// No layer stored it, so the call falls through to the driver's own
+    /// method — C's `setInputEosFail`/`setOutputEosFail` on a port that has
+    /// none (asynOctetBase.c:115-118, :401-415).
+    NotTaken,
+    /// A layer validated the length and stored the terminator.
+    Stored,
+    /// A layer owns the terminator but C refuses this length: the `switch
+    /// (eoslen)` in `setInputEos`/`setOutputEos` answers `"<port> illegal
+    /// eoslen <n>"` *before* assigning anything (asynInterposeEos.c:299-310,
+    /// :352-362), so no layer state moved.
+    IllegalLength,
+}
+
+impl EosSet {
+    /// Fold one layer's answer into the chain's. A refusal outranks a store,
+    /// and a store outranks the fall-through — the chain reports the strongest
+    /// thing that happened to the value, and the strongest is the one C would
+    /// have returned from the first layer that owns the terminator.
+    fn merge(self, other: Self) -> Self {
+        match (self, other) {
+            (Self::IllegalLength, _) | (_, Self::IllegalLength) => Self::IllegalLength,
+            (Self::Stored, _) | (_, Self::Stored) => Self::Stored,
+            _ => Self::NotTaken,
+        }
+    }
+}
+
 /// Interpose layer for octet (byte-stream) I/O.
 ///
 /// Each layer receives the `next` handle to delegate to the layer below.
@@ -116,23 +152,22 @@ pub trait OctetInterpose: Send + Sync {
     /// (asynInterposeEos.c:288); this is the Rust equivalent so a runtime IEOS
     /// change reaches the installed EOS interpose on the right device.
     ///
-    /// Returns whether **this layer** took the terminator. C's interpose does
-    /// not answer with a flag — it either stores the value and returns
-    /// `asynSuccess`, or delegates *downwards* to the next `setInputEos`
-    /// (:293-295) and ultimately to the driver's, which `initOverride` has
-    /// replaced with `setInputEosFail` when the driver has none
-    /// (asynOctetBase.c:115, :401-403). The bool is that delegation made
-    /// explicit, so [`crate::port::PortDriver::set_input_eos`]'s default can
-    /// be the Fail stub without having to guess whether a layer above it
-    /// answered first.
-    fn set_input_eos(&mut self, _addr: i32, _eos: &[u8]) -> bool {
-        false
+    /// Returns what **this layer** did with the terminator. C's interpose does
+    /// not answer with a flag — it either validates the length and stores the
+    /// value, or delegates *downwards* to the next `setInputEos` (:293-295)
+    /// and ultimately to the driver's, which `initOverride` has replaced with
+    /// `setInputEosFail` when the driver has none (asynOctetBase.c:115,
+    /// :401-403). [`EosSet`] is that fall-through made explicit, so
+    /// [`crate::port::PortDriver::set_input_eos`]'s default can be the Fail
+    /// stub without having to guess whether a layer above it answered first.
+    fn set_input_eos(&mut self, _addr: i32, _eos: &[u8]) -> EosSet {
+        EosSet::NotTaken
     }
 
     /// Notify the layer of an output end-of-string change (see
     /// [`Self::set_input_eos`]). Default: not taken.
-    fn set_output_eos(&mut self, _addr: i32, _eos: &[u8]) -> bool {
-        false
+    fn set_output_eos(&mut self, _addr: i32, _eos: &[u8]) -> EosSet {
+        EosSet::NotTaken
     }
 
     /// Drop every piece of state scoped to the *current* link, because the
@@ -228,8 +263,9 @@ impl OctetInterposeStack {
     }
 
     /// Total number of interpose layers on the port, across every device's chain
-    /// — what `asynReport` counts (asynManager.c:993-1005 walks each `dpCommon`'s
-    /// list).
+    /// — what `reportPrintInterfaceList` (asynManager.c:993-1005) prints, once
+    /// for the port's own `dpCommon` (:1077) and again for each device's
+    /// (:1105), under the `asynReport` iocsh command.
     pub fn len(&self) -> usize {
         self.chains.values().map(Vec::len).sum()
     }
@@ -250,27 +286,28 @@ impl OctetInterposeStack {
     /// default). C routes `setInputEos` through the `asynOctet` interface
     /// `findInterface` returned for that `asynUser`, so it reaches exactly the
     /// layers that will serve the device's reads.
-    /// Returns whether any layer took it — C's chain either terminates in a
-    /// layer that stores the value or falls through to the driver's method.
-    pub fn set_input_eos(&mut self, addr: i32, eos: &[u8]) -> bool {
-        let mut taken = false;
+    /// Returns what the chain did with it — C's chain either terminates in a
+    /// layer that stores the value, refuses the length, or falls through to
+    /// the driver's method.
+    pub fn set_input_eos(&mut self, addr: i32, eos: &[u8]) -> EosSet {
+        let mut answer = EosSet::NotTaken;
         if let Some(chain) = self.chain_mut(addr) {
             for layer in chain {
-                taken |= layer.set_input_eos(addr, eos);
+                answer = answer.merge(layer.set_input_eos(addr, eos));
             }
         }
-        taken
+        answer
     }
 
     /// Forward an output EOS change (see [`Self::set_input_eos`]).
-    pub fn set_output_eos(&mut self, addr: i32, eos: &[u8]) -> bool {
-        let mut taken = false;
+    pub fn set_output_eos(&mut self, addr: i32, eos: &[u8]) -> EosSet {
+        let mut answer = EosSet::NotTaken;
         if let Some(chain) = self.chain_mut(addr) {
             for layer in chain {
-                taken |= layer.set_output_eos(addr, eos);
+                answer = answer.merge(layer.set_output_eos(addr, eos));
             }
         }
-        taken
+        answer
     }
 
     /// Tell every layer, on every device's chain, that the port's connection

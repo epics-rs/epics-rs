@@ -11,7 +11,9 @@ use crate::error::AsynResult;
 use crate::port::eos_device_key;
 use crate::user::AsynUser;
 
-use super::{EomReason, OctetInterpose, OctetNext, OctetReadResult, PartialOctetRead};
+use super::{
+    EomReason, EosSet, MAX_EOS_LEN, OctetInterpose, OctetNext, OctetReadResult, PartialOctetRead,
+};
 
 /// Fixed internal buffer size matching C asyn's INPUT_SIZE.
 const INPUT_BUFFER_SIZE: usize = 2048;
@@ -93,7 +95,7 @@ pub struct EosInterpose {
     /// C `eosPvt::processEosIn` (asynInterposeEos.c:42, set from the
     /// `asynInterposeEosConfig` argument at :128). When false the layer is not
     /// in the input path at all: `readIt` delegates straight to the driver
-    /// (:191-193) and the terminator setters are the driver's (:260, :293).
+    /// (:191-193) and the terminator accessors are the driver's (:293, :318).
     process_in: bool,
     /// C `eosPvt::processEosOut` (:50, :134) — same, for the write path (:161).
     process_out: bool,
@@ -375,28 +377,39 @@ impl OctetInterpose for EosInterpose {
         next.flush(user)
     }
 
-    fn set_input_eos(&mut self, addr: i32, eos: &[u8]) -> bool {
+    fn set_input_eos(&mut self, addr: i32, eos: &[u8]) -> EosSet {
         // C :293-295 — with `processEosIn == 0` the terminator belongs to the
         // driver, not to this layer, and the call is *delegated downwards*;
         // taking it here would make `read` (which delegates) and the stored
-        // terminator disagree.
+        // terminator disagree. C tests the flag before the length, so a
+        // delegated call is never refused here for its length either.
         if !self.process_in {
-            return false;
+            return EosSet::NotTaken;
+        }
+        if eos.len() > MAX_EOS_LEN {
+            return EosSet::IllegalLength;
         }
         let dev = self.device(addr);
         dev.config.input_eos = eos.to_vec();
         // Reset the resync state machine — a mid-stream terminator change
         // must not carry a partial match from the old terminator.
         dev.eos_in_match = 0;
-        true
+        EosSet::Stored
     }
 
-    fn set_output_eos(&mut self, addr: i32, eos: &[u8]) -> bool {
-        if !self.process_out {
-            return false;
+    fn set_output_eos(&mut self, addr: i32, eos: &[u8]) -> EosSet {
+        // C `setOutputEos` (asynInterposeEos.c:344-363) carries no
+        // `processEosOut` test at all: it validates the length, stores
+        // `eosOut`/`eosOutLen` and answers asynSuccess whatever the flag,
+        // and `getOutputEos` (:365-390) reads it back the same way. The flag
+        // gates `writeIt` alone (:161-163), so with `processOut = 0` the
+        // terminator is held and simply never appended — a set-then-read-back
+        // from a startup script succeeds, which is what refusing it broke.
+        if eos.len() > MAX_EOS_LEN {
+            return EosSet::IllegalLength;
         }
         self.device(addr).config.output_eos = eos.to_vec();
-        true
+        EosSet::Stored
     }
 
     /// C `eosInExceptionHandler` (asynInterposeEos.c:142-151): on
@@ -459,6 +472,53 @@ mod tests {
         fn flush(&mut self, _user: &mut AsynUser) -> AsynResult<()> {
             Ok(())
         }
+    }
+
+    /// C `setOutputEos` (asynInterposeEos.c:344-363) carries no
+    /// `processEosOut` test: it validates the length, stores
+    /// `eosOut`/`eosOutLen` and answers asynSuccess whatever the flag, which
+    /// gates `writeIt` alone (:161-163). So `processOut = 0` means "held but
+    /// never appended", never "refused" — a startup script's set-then-read-back
+    /// succeeds. And the length switch refuses before assigning, so a refusal
+    /// leaves the stored terminator standing.
+    #[test]
+    fn output_eos_stores_whatever_process_out_says() {
+        let mut eos = EosInterpose::with_processing(EosConfig::default(), true, false);
+        assert_eq!(eos.set_output_eos(0, b"\r\n"), EosSet::Stored);
+        assert_eq!(eos.get_output_eos(0), b"\r\n");
+
+        assert_eq!(eos.set_output_eos(0, b"\r\n\0"), EosSet::IllegalLength);
+        assert_eq!(
+            eos.get_output_eos(0),
+            b"\r\n",
+            "a refused length must store nothing"
+        );
+
+        // The flag still gates the write: the stored terminator is not
+        // appended (C `writeIt` :161-163).
+        let mut base = MockOctetBase::new(b"");
+        let mut user = AsynUser::default();
+        eos.write(&mut user, b"CMD", &mut base).unwrap();
+        assert_eq!(base.written, b"CMD".to_vec());
+
+        // With the flag on, the same stored terminator is appended.
+        let mut on = EosInterpose::with_processing(EosConfig::default(), true, true);
+        assert_eq!(on.set_output_eos(0, b"\r\n"), EosSet::Stored);
+        let mut base = MockOctetBase::new(b"");
+        on.write(&mut user, b"CMD", &mut base).unwrap();
+        assert_eq!(base.written, b"CMD\r\n".to_vec());
+    }
+
+    /// The input half is *not* the same shape: C's `setInputEos` tests
+    /// `processEosIn` first and delegates downwards when it is 0 (:293-295),
+    /// as `getInputEos` (:318-320) and `readIt` (:191-193) do.
+    #[test]
+    fn input_eos_delegates_when_process_in_is_off() {
+        let mut eos = EosInterpose::with_processing(EosConfig::default(), false, true);
+        assert_eq!(eos.set_input_eos(0, b"\n"), EosSet::NotTaken);
+        // Refused for the flag, not for the length — C never reaches the
+        // switch on that path.
+        assert_eq!(eos.set_input_eos(0, b"abc"), EosSet::NotTaken);
     }
 
     #[test]

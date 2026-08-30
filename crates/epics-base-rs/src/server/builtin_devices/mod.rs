@@ -13,6 +13,7 @@
 
 pub mod dbstate;
 pub mod getenv;
+pub mod soft_callback;
 pub mod stdio;
 pub mod timestamp;
 

@@ -9603,7 +9603,11 @@ async fn sub_record_mdel_gates_val_monitor() {
     let mut rec = sub_with_snam("noop");
     rec.val = 100.0;
     rec.mdel = 10.0;
-    rec.init_record(0).unwrap(); // MLST seeded to 100
+    // C `subRecord.c:130` seeds MLST from VAL at the END of `init_record`,
+    // past the SNAM resolution, so the port performs it in the resolution
+    // owner (`ioc_app::wire_subroutine`). This record is built by hand and
+    // never goes through it, so the post-init state is set directly.
+    rec.mlst = 100.0;
     db.add_record("SUB_MDEL", Box::new(rec)).await.unwrap();
 
     // Helper: set VAL directly (no subroutine), process, read back MLST.

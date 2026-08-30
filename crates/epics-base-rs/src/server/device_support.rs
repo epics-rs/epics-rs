@@ -607,10 +607,39 @@ pub trait DeviceSupport: Send + Sync + 'static {
 /// The device is attached (`instance.device = Some(dev)`) regardless
 /// of init outcome so the record is addressable; a failed init leaves
 /// the alarm set.
-pub fn wire_device_to_record(instance: &mut RecordInstance, mut dev: Box<dyn DeviceSupport>) {
+pub fn wire_device_to_record(instance: &mut RecordInstance, dev: Box<dyn DeviceSupport>) {
+    attach_device_to_record(instance, dev);
+    init_device_support(instance);
+}
+
+/// The BIND half of [`wire_device_to_record`]: C `iocInit.c::doInitRecord0`'s
+/// `precord->dset = pdevSup ? pdevSup->pdset : NULL` (`:530-533`), which
+/// happens BEFORE `prset->init_record(precord, 0)` and runs no driver code.
+///
+/// Split from the init half because C's two halves sit on opposite sides of
+/// `init_record`: every `<rec>Record.c init_record` opens by testing the dset
+/// this line bound (`if (!pdset) return S_dev_noDSET`) and only later calls
+/// `pdset->common.init_record`. Attaching and initialising in one step is what
+/// put the whole sequence after the record's init passes, so `init_record`
+/// could not see its own dset and ran the tail C's early return skips.
+pub fn attach_device_to_record(instance: &mut RecordInstance, mut dev: Box<dyn DeviceSupport>) {
     let name = instance.name.clone();
     dev.set_record_info(&name, instance.common.scan);
     dev.apply_record_info(&instance.info);
+    instance.device = Some(dev);
+}
+
+/// The INIT half: C `pdset->common.init_record(prec)`, the call every record
+/// type makes from inside its own `init_record` once the dset test above has
+/// passed (`aiRecord.c:115-124`).
+///
+/// No-op for a record that has no device attached — C reaches this line only
+/// past `if (!pdset) return S_dev_noDSET`.
+pub fn init_device_support(instance: &mut RecordInstance) {
+    let Some(mut dev) = instance.device.take() else {
+        return;
+    };
+    let name = instance.name.clone();
     match dev.init(&mut *instance.record) {
         Ok(DeviceInitOutcome::Live) => {}
         Ok(DeviceInitOutcome::Dead { alarm }) => {

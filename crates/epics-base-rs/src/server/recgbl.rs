@@ -653,6 +653,148 @@ pub fn rec_gbl_record_error(status_text: &str, record_name: &str, message: &str)
     ));
 }
 
+/// The two `devSup.h` statuses a record reports when its device support is
+/// not there, and the text `errSymLookup` renders them as.
+///
+/// No IOC links a symbol table for `M_devSup` — the numbers live in
+/// `devSup.h`, not in a generated `*ErrSymTbl.c` — so `errSymLookup` falls
+/// through to its `"Error (%d,%d)"` spelling and *that*, not a phrase, is what
+/// the operator reads and what a site's log filter matches. Deriving the text
+/// from the module and number is what keeps a call site from hard-coding
+/// `"Error (514,3)"` next to a number it no longer agrees with.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DevSupStatus {
+    /// `S_dev_noDSET` — DTYP named device support nobody registered, so
+    /// `dbDTYPtoDevSup` handed the record a NULL dset.
+    NoDset,
+    /// `S_dev_missingSup` — a dset exists but does not implement the transfer
+    /// the record needs. This port cannot construct that state (a device is
+    /// attached or it is not), so only the record's `process()` refusal, which
+    /// C reaches through the same `!pdset` arm, uses it.
+    MissingSup,
+}
+
+impl DevSupStatus {
+    /// `M_devSup` is `(514 << 16)`; the numbers are `devSup.h`'s.
+    #[must_use]
+    pub const fn status(self) -> u32 {
+        match self {
+            Self::NoDset => (514 << 16) | 3,
+            Self::MissingSup => (514 << 16) | 5,
+        }
+    }
+
+    /// `errSymLookup`'s fallback spelling for a status with no symbol table.
+    #[must_use]
+    pub fn text(self) -> String {
+        let status = self.status();
+        format!("Error ({},{})", status >> 16, status & 0xffff)
+    }
+}
+
+/// What a record type calls itself when it refuses to run without device
+/// support: `(init_record message, process message)`, exactly the `pmessage`
+/// its `<rec>Record.c` hands `recGblRecordError`.
+///
+/// One table, because "this record type cannot run without a dset" is one fact
+/// about the type reported at two moments, and splitting it is how the two
+/// halves drift. A record type ABSENT from the table needs no device support —
+/// `calc`, `sub`, `fanout`, `seq` and friends — and must go on processing
+/// normally; the absence is the gate, so no caller repeats the list.
+///
+/// The second element is `None` for a type whose C `process()` has no dset
+/// check at all: `calcout` (and the `calc` module's `scalcout`/`acalcout`,
+/// which copy it) refuse only at init. `printf` is absent from the table
+/// entirely — `printfRecord.c:355` says "Device support is optional" and
+/// returns 0.
+///
+/// The spellings that look like typos are C's and are transcribed as they are,
+/// because the operator greps for the string C emits: `calcout`, `scalcout`
+/// and `acalcout` omit the space after the colon, `subArray` reports as `sa`
+/// and `waveform` as `wf`, and `sCalcoutRecord.c:246` reports its own
+/// missing-support half as `calcout:init_record`.
+#[must_use]
+pub fn dev_sup_refusal(record_type: &str) -> Option<(&'static str, Option<&'static str>)> {
+    Some(match record_type {
+        // base `std/rec` — one row per `<rec>Record.c` that tests `!prec->dset`.
+        "aai" => ("aai: init_record", Some("read_aai")),
+        "aao" => ("aao: init_record", Some("write_aao")),
+        "ai" => ("ai: init_record", Some("read_ai")),
+        "ao" => ("ao: init_record", Some("write_ao")),
+        "bi" => ("bi: init_record", Some("read_bi")),
+        "bo" => ("bo: init_record", Some("write_bo")),
+        "calcout" => ("calcout:init_record", None),
+        "histogram" => ("histogram: init_record", Some("read_histogram")),
+        "int64in" => ("int64in: init_record", Some("read_int64in")),
+        "int64out" => ("int64out: init_record", Some("write_int64out")),
+        "longin" => ("longin: init_record", Some("read_longin")),
+        "longout" => ("longout: init_record", Some("write_longout")),
+        "lsi" => ("lsi: init_record", Some("lsi: read_string")),
+        "lso" => ("lso: init_record", Some("lso: write_string")),
+        // Both mbbi flavours report as `read_mbbi` and both mbbo flavours as
+        // `write_mbbo` — `mbbiDirectRecord.c:142`, `mbboDirectRecord.c:175`.
+        "mbbi" => ("mbbi: init_record", Some("read_mbbi")),
+        "mbbiDirect" => ("mbbiDirect: init_record", Some("read_mbbi")),
+        "mbbo" => ("mbbo: init_record", Some("write_mbbo")),
+        "mbboDirect" => ("mbboDirect: init_record", Some("write_mbbo")),
+        "stringin" => ("stringin: init_record", Some("read_stringin")),
+        "stringout" => ("stringout: init_record", Some("write_stringout")),
+        "subArray" => ("sa: init_record", Some("read_sa")),
+        "waveform" => ("wf: init_record", Some("read_wf")),
+        // Module record types this port also serves.
+        "busy" => ("busy: init_record", Some("write_busy")),
+        "scalcout" => ("scalcout:init_record", None),
+        "acalcout" => ("acalcout:init_record", None),
+        _ => return None,
+    })
+}
+
+/// C `<rec>Record.c init_record`'s `!prec->dset` refusal — the per-RECORD line
+/// an IOC owes for every record whose DTYP named device support nobody
+/// registered.
+///
+/// C reports this once per record and separately reports `device support %s
+/// not found` once per unlinked `device()` line in the DBD. The two are not
+/// alternatives: the DBD line names support nobody registered and leaves the
+/// operator to find which records used it, this one names a record that will
+/// not work. A record type with no dset requirement is silent, which is why
+/// the gate is [`dev_sup_refusal`] and not the caller.
+pub fn rec_gbl_no_device_support(record_type: &str, record_name: &str) {
+    if let Some((init_message, _)) = dev_sup_refusal(record_type) {
+        for _ in 0..init_dset_checks(record_type) {
+            rec_gbl_record_error(&DevSupStatus::NoDset.text(), record_name, init_message);
+        }
+    }
+}
+
+/// How many of `initDatabase`'s two `init_record` calls reach the record type's
+/// `!prec->dset` test — which is how many times a record with no dset is
+/// reported.
+///
+/// Nearly every type opens `init_record` with `if (pass == 0) return 0;` and
+/// tests `dset` below it, so only pass 1 reports. `aai` and `aao` test it
+/// FIRST, above the pass gate (`aaiRecord.c:118-123`, `aaoRecord.c:125-131`),
+/// because their pass 0 has real work to do — the device support may set
+/// `bptr`, and the record allocates the buffer itself if it did not — and that
+/// work cannot start without a dset. Both calls therefore report, and softIoc
+/// R7.0.10 writes their line twice per record; measured over
+/// `scripts/compat-smoke.sh`, 18 of the port's missing lines were the second
+/// copy. Every C record type this port serves was checked for the placement:
+/// these two are the whole set.
+const fn init_dset_checks(record_type: &str) -> u8 {
+    match record_type.as_bytes() {
+        b"aai" | b"aao" => 2,
+        _ => 1,
+    }
+}
+
+/// The message C's `process()` reports before refusing a cycle it has no dset
+/// for, or `None` when this record type's `process()` has no such check.
+#[must_use]
+pub fn dev_sup_process_refusal(record_type: &str) -> Option<&'static str> {
+    dev_sup_refusal(record_type).and_then(|(_, process)| process)
+}
+
 /// C `recGblDbaddrError` (`recGbl.c:73-91` @R7.0.10) — the same report keyed
 /// on a field address rather than a record, so the PV it names is
 /// `record.FIELD`.

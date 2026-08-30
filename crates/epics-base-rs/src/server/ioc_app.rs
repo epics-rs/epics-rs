@@ -991,9 +991,6 @@ struct IocBuild {
     acf: access_security::AcfCell,
     autosave_config: Option<autosave::SaveSetConfig>,
     autosave_startup: Option<Arc<Mutex<AutosaveStartupConfig>>>,
-    device_factories: HashMap<String, DeviceSupportFactory>,
-    dynamic_device_factory: Option<DynamicDeviceSupportFactory>,
-    subroutine_registry: HashMap<String, Arc<SubroutineFn>>,
     link_set_installers: Vec<LinkSetInstaller>,
     after_init_hooks: Vec<Box<dyn FnOnce() + Send>>,
     protocol: ProtocolStart,
@@ -1109,6 +1106,71 @@ pub(crate) fn build_from_shell(bridge: &crate::runtime::task::BlockingBridge) ->
     }
 }
 
+/// C `iocBuild_1`'s refusal (`iocInit.c:117-120`), which every caller of the
+/// build shares because C has one `iocBuild_1` and reaches it from both
+/// `iocBuild()` and `iocInit()` — which is why the sentence names `iocBuild`
+/// even when `iocInit` is the line that failed.
+///
+/// It is a function because the port had three copies of it, one per arm that
+/// could refuse, and a duplicated diagnostic drifts the moment one copy is
+/// touched.
+pub(crate) fn build_refusal() -> String {
+    format!(
+        "iocBuild: {} IOC can only be initialized from uninitialized or \
+         stopped state\n",
+        if crate::runtime::log::errlog_console_paints() {
+            crate::runtime::log::ERL_ERROR
+        } else {
+            "ERROR"
+        }
+    )
+}
+
+/// The build for a shell with no [`IocApplication`] behind it — every
+/// `CaServerBuilder` binary and every bare [`PvDatabase`] shell.
+///
+/// C has no such shell: `iocBuild_1` runs for everyone, so the state cell
+/// advances, `coreRelease()` prints and `Starting iocInit` is said whatever
+/// built the IOC. This arm did none of that. It closed the record load and
+/// returned, leaving `iocState` at [`IocState::Void`], which is why a
+/// measured `iocBuild`/`iocRun` pair answered `iocRun: WARNING IOC not
+/// paused` where C answers `iocRun: All initialization complete`, why a
+/// second `iocBuild` was accepted where C refuses it, and why the five-line
+/// `coreRelease` banner C puts between the two command echoes was missing
+/// from stdout.
+///
+/// `close_record_load` is the caller's half — it needs the shell's database
+/// and its blocking bridge — and it sits exactly where C's record work sits,
+/// after `coreRelease()` and inside [`IocState::Building`]. The transition
+/// itself stays here because [`set_ioc_state`] is private to this module and
+/// must remain the only writer.
+///
+/// The init hooks C announces around this (`initHookAtIocBuild`,
+/// `initHookAtBeginning`, `initHookAfterIocBuilt`) are deliberately not
+/// announced: they produce no output, so nothing measured says what a bare
+/// shell should do with them, and firing hooks nobody has asked for is not
+/// something a byte-parity fix should decide.
+pub(crate) fn build_without_application(close_record_load: impl FnOnce()) -> bool {
+    // C `iocBuild_1` (`iocInit.c:117-120`).
+    if get_ioc_state() != IocState::Void {
+        crate::runtime::log::errlog_printf(&build_refusal());
+        return false;
+    }
+    // C `iocInit.c:129`, before anything the build prints.
+    crate::runtime::log::errlog_printf("Starting iocInit\n");
+    // C `iocInit.c:147`: `coreRelease()` immediately before the state moves,
+    // and its `printf` (`misc/epicsRelease.c:23-27`) is the only stdout write
+    // on the whole path.
+    for line in crate::server::iocsh::misc_commands::core_release_block() {
+        println!("{line}");
+    }
+    set_ioc_state(IocState::Building);
+    close_record_load();
+    // C `iocBuild_3` (`iocInit.c:205`).
+    set_ioc_state(IocState::Built);
+    true
+}
+
 /// The iocsh `iocRun` line, and the run half of `iocInit`.
 ///
 /// `Refused` is not an error the caller should print: it only means this line
@@ -1139,9 +1201,6 @@ impl IocBuild {
             acf,
             autosave_config,
             autosave_startup,
-            device_factories,
-            dynamic_device_factory,
-            subroutine_registry,
             link_set_installers,
             after_init_hooks,
             protocol,
@@ -1367,26 +1426,20 @@ impl IocBuild {
 
         // Phase 2b: iocInit. C order is initDevSup() → initHookAfterInitDevSup
         // (autosave pass 0) → initDatabase() (per-record init_record, where
-        // devMotorAsyn's init_controller runs). Rust's per-record device init
-        // lives in `wire_device_support` — the initDatabase-era half of C's
-        // init, not initDevSup (whose analogue, device-factory registration,
-        // already happened) — so the pass-0 hook fires BEFORE it. A pass0-
-        // restored field must land as a plain pre-init field write (C dbPut
-        // before init_record); `DeviceSupport::init` then anchors/clears any
-        // command state the write armed (motor `clear_last_write`). Firing the
-        // hook after wiring let a restored motor VAL survive as a pending move
-        // command, dispatched as a real move on the first driver-status pass —
-        // and on a fast axis (VELO high) the Startup readback then caught the
-        // move mid-flight and synced the instantaneous position into VAL/DVAL.
+        // devMotorAsyn's init_controller runs).
+        //
+        // Both halves of C's `initDatabase` — the dset bind and the driver's
+        // own `init_record` — now run at the record's creation, from the
+        // database's own init owner, because C binds the dset BEFORE
+        // `init_record(0)` and a whole-database pass here could only bind it
+        // after. A pass0-restored field still lands as a plain pre-init field
+        // write (C dbPut before init_record) for the reason it always did:
+        // this hook fires before the startup script's `iocInit` line, and the
+        // records it restores were loaded before that. What changed is that
+        // `DeviceSupport::init` no longer waits for this point to anchor the
+        // command state such a write armed.
         announce!(InitHookState::AfterInitDevSup);
-        let record_count =
-            wire_device_support(&db, &device_factories, &dynamic_device_factory).await?;
-        // Retain the registry in the database for runtime re-resolution
-        // (aSub LFLG=READ / SUBL); `wire_subroutines` then performs the
-        // static init-time SNAM resolution (C `init_record`).
-        db.install_subroutine_registry(subroutine_registry.clone())
-            .await;
-        wire_subroutines(&db, &subroutine_registry).await;
+        let record_count = db.records_with_device_support().await;
         let io_intr_count = setup_io_intr(db.clone()).await;
         setup_property_posts(db.clone()).await;
         // C `dbInitLink`'s locality decision, committed once for the whole
@@ -1526,9 +1579,15 @@ impl IocBuild {
         };
 
         let total_records = db.all_record_names().await.len();
-        eprintln!(
-            "iocInit: {total_records} records, {record_count} with device support, {io_intr_count} I/O Intr"
-        );
+        // A line C does not have, kept because the three counts are what an
+        // operator checks an `st.cmd` by — but said through the errlog, which
+        // is where C puts everything the boot says. A raw `eprintln!` here
+        // was outside `eltc`'s reach: measured, `eltc 0` then `iocInit`
+        // silenced C's console completely and left this line and the CA
+        // server's on the port's.
+        crate::runtime::log::errlog_printf(&format!(
+            "iocInit: {total_records} records, {record_count} with device support, {io_intr_count} I/O Intr\n"
+        ));
 
         // C: rsrv init / iocBuild end. The Rust CA/PVA listener is
         // owned by the protocol runner, but PINI is already complete
@@ -2131,6 +2190,22 @@ impl IocApplication {
             iocsh::register_command(cmd);
         }
 
+        // C's device support table and its function registry are
+        // process-global and complete BEFORE the first `dbLoadRecords`: the
+        // registrars run from `registerRecordDeviceDriver`, which softMain
+        // calls before `iocsh(st.cmd)` (`softMain.cpp:181-232`). Install both
+        // on the database at that same point, because the record creation sink
+        // now consults them at C's positions — the dset bound ahead of
+        // `init_record(0)`, the SNAM resolved inside pass 1. Applying them
+        // afterwards, in a second whole-database pass, is exactly what let
+        // every record type's `init_record` run the tail C's early returns
+        // skip.
+        db.install_device_support_resolver(device_support_resolver(
+            device_factories,
+            dynamic_device_factory,
+        ));
+        db.install_subroutine_registry(subroutine_registry).await;
+
         // Add inline PVs then inline records — `IocBuilder::build`'s order
         // for the same two sources, and before the script for C's reason:
         // everything argv named is in the database when the script starts.
@@ -2152,9 +2227,6 @@ impl IocApplication {
             acf: acf.clone(),
             autosave_config: autosave_config.clone(),
             autosave_startup,
-            device_factories,
-            dynamic_device_factory,
-            subroutine_registry,
             link_set_installers,
             after_init_hooks,
             // C parity (`caservertask.c:492-500`): the server-side env var
@@ -2438,100 +2510,221 @@ impl IocApplication {
     }
 }
 
-/// Wire device support to all records that have DTYP set.
-pub(crate) async fn wire_device_support(
-    db: &PvDatabase,
-    factories: &HashMap<String, DeviceSupportFactory>,
-    dynamic_factory: &Option<DynamicDeviceSupportFactory>,
-) -> CaResult<usize> {
-    let names = db.all_record_names().await;
-    let mut count = 0;
-    for name in names {
-        if let Some(rec_arc) = db.get_record(&name) {
-            let mut instance = rec_arc.write();
-            let dtyp = instance.common.dtyp.clone();
-            if !crate::server::device_support::is_soft_dtyp(&dtyp) {
-                let ctx = DeviceSupportContext {
-                    dtyp: &dtyp,
-                    inp: &instance.common.inp,
-                    out: &instance.common.out,
-                };
-                let dev_opt = if let Some(factory) = factories.get(&dtyp) {
-                    Some(factory())
-                } else if let Some(dyn_factory) = dynamic_factory {
-                    dyn_factory(&ctx)
-                } else {
-                    None
-                };
-                if let Some(dev) = dev_opt {
-                    // Canonical device-support init order (M1/M2):
-                    // set_record_info → apply_record_info → init,
-                    // with init-failure logged and the record flagged
-                    // INVALID. Single owner of the contract, shared
-                    // with the IocBuilder build path.
-                    crate::server::device_support::wire_device_to_record(&mut instance, dev);
-                    count += 1;
-                } else {
-                    eprintln!(
-                        "warning: no device support registered for DTYP '{dtyp}' (record: {name})"
-                    );
-                }
-            }
+/// The process-wide device support table, seen the way C's `dbDTYPtoDevSup`
+/// sees it: a DTYP plus the record's links in, a dset (or nothing) out.
+///
+/// Held by [`PvDatabase`] rather than by the two builders because C's table is
+/// global and filled by registrars BEFORE any record exists, while the port's
+/// factories used to reach the records only after the whole database had been
+/// built — which is what put dset resolution after `init_record`.
+pub type DeviceSupportResolver =
+    Arc<dyn Fn(&DeviceSupportContext) -> Option<Box<dyn DeviceSupport>> + Send + Sync>;
+
+/// Fold the two registration shapes a builder collects — the DTYP-keyed
+/// context-free factories and the single dynamic factory — into the one
+/// lookup [`PvDatabase`] holds. DTYP-keyed first, dynamic as the fallback:
+/// the priority `attach_device_support` had.
+pub(crate) fn device_support_resolver(
+    factories: HashMap<String, DeviceSupportFactory>,
+    dynamic_factory: Option<DynamicDeviceSupportFactory>,
+) -> DeviceSupportResolver {
+    Arc::new(move |ctx: &DeviceSupportContext| {
+        if let Some(factory) = factories.get(ctx.dtyp) {
+            Some(factory())
+        } else if let Some(dyn_factory) = dynamic_factory.as_ref() {
+            dyn_factory(ctx)
+        } else {
+            None
         }
-    }
-    Ok(count)
+    })
 }
 
-/// Wire subroutine functions to sub records.
-async fn wire_subroutines(db: &PvDatabase, registry: &HashMap<String, Arc<SubroutineFn>>) {
-    if registry.is_empty() {
-        return;
+/// C `iocInit.c::doInitRecord0`'s `precord->dset = pdevSup ? pdevSup->pdset :
+/// NULL` (`:530-533`), and the refusal every `<rec>Record.c init_record` makes
+/// when that comes back NULL, for one record. Returns whether a device
+/// attached.
+///
+/// **The single owner**, for the reason [`wire_subroutine`] is one:
+/// `IocBuilder` wires its records as it installs them and `IocApplication`
+/// wires them from the database afterwards, and the two had already diverged —
+/// the builder route reported a missing DTYP not at all, so an IOC built
+/// through it booted in silence holding records that can never process. A DTYP
+/// nobody registered is the same broken record on both.
+///
+/// Called by [`PvDatabase::add_record`] — the creation sink — BEFORE the
+/// record's init passes, which is the whole point: C binds the dset first and
+/// every record type's `init_record` opens by testing it. It binds only; the
+/// driver's own `init_record` half runs from inside the passes
+/// ([`crate::server::device_support::init_device_support`]).
+pub(crate) fn attach_device_support(
+    instance: &mut record::RecordInstance,
+    name: &str,
+    resolve: Option<&DeviceSupportResolver>,
+) -> bool {
+    let dtyp = instance.common.dtyp.clone();
+    if crate::server::device_support::is_soft_dtyp(&dtyp) {
+        // A soft channel needs no dset. Its `"Async Soft Channel"` variant
+        // still owns an `add_record`, but that is C's `doResolveLinks` moment,
+        // which sits BETWEEN the two init passes — so the init owner runs it,
+        // not this one.
+        return false;
     }
-    let names = db.all_record_names().await;
-    for name in names {
-        if let Some(rec_arc) = db.get_record(&name) {
-            let mut instance = rec_arc.write();
-            // Both `sub` and `aSub` resolve their subroutine from SNAM via the
-            // function registry at init (C `subRecord.c` / `aSubRecord.c`
-            // `init_record` -> `registryFunctionFind`).
-            let rt = instance.record.record_type();
-            if rt == "sub" || rt == "aSub" {
-                // INAM: invoke the init routine exactly once at init, before
-                // SNAM resolution (C `subRecord.c` / `aSubRecord.c`
-                // `init_record`: `registryFunctionFind(inam)` then
-                // `(*psubroutine)(prec)`, return value discarded; a missing
-                // function is an init error -> stderr).
-                if let Some(crate::types::EpicsValue::String(inam)) =
-                    instance.record.get_field("INAM")
-                {
-                    let inam = inam.as_str_lossy();
-                    if !inam.is_empty() {
-                        match registry.get(inam.as_ref()) {
-                            Some(init_fn) => {
-                                let init_fn = init_fn.clone();
-                                if let Err(e) = init_fn(&mut *instance.record) {
-                                    eprintln!(
-                                        "iocInit: {name}.INAM '{inam}' init routine failed: {e}"
-                                    );
-                                }
-                            }
-                            None => eprintln!("iocInit: {name}.INAM function '{inam}' not found"),
-                        }
-                    }
-                }
-                // C `init_record`'s `prec->sadr = registryFunctionFind(...)`,
-                // assigned whatever the lookup returned. Unconditional so the
-                // invariant "`subroutine` is the resolution of the current
-                // SNAM" holds by construction rather than by this field
-                // happening to start out `None`.
-                if let Some(crate::types::EpicsValue::String(snam)) =
-                    instance.record.get_field("SNAM")
-                {
-                    instance.subroutine = registry.get(snam.as_str_lossy().as_ref()).cloned();
-                }
+    let ctx = DeviceSupportContext {
+        dtyp: &dtyp,
+        inp: &instance.common.inp,
+        out: &instance.common.out,
+    };
+    let dev_opt = resolve.and_then(|resolve| resolve(&ctx));
+    let Some(dev) = dev_opt else {
+        // Two reports, because C makes two and they answer different
+        // questions. This one is deliberately per RECORD, where C's `device
+        // support %s not found` is per DBD ENTRY: C's line names a `device()`
+        // line nobody linked and leaves the operator to find which records
+        // used it, while this names the record that will not work.
+        eprintln!("warning: no device support registered for DTYP '{dtyp}' (record: {name})");
+        // C's own per-record line, the one a site greps for by
+        // `recGblRecordError` and the one that carries the status. Silent for
+        // a record type that needs no device support — the table is the gate.
+        crate::server::recgbl::rec_gbl_no_device_support(instance.record.record_type(), name);
+        return false;
+    };
+    // The BIND half only (set_record_info → apply_record_info → attach). The
+    // driver's `init()` is C's `pdset->common.init_record`, which runs from
+    // inside `init_record` — after the dset test this line's outcome answers.
+    crate::server::device_support::attach_device_to_record(instance, dev);
+    true
+}
+
+/// C `subRecord.c`/`aSubRecord.c` `init_record`'s name resolution
+/// (`subRecord.c:107-130`, `aSubRecord.c:139-160`), for one record.
+///
+/// **The single owner**, for the reason [`setup_io_intr`] is one: `IocBuilder`
+/// wires its records as it installs them and `IocApplication` wires them from
+/// the database afterwards, and while each spelt this out for itself a
+/// diagnostic added to one route was missing from the other. A `sub` record
+/// whose SNAM names nothing is exactly the same broken record on both.
+///
+/// Both misses are `fprintf(stderr, "%s.SNAM " ERL_ERROR " function '%s' not
+/// found\n", ...)` in C — the console directly, not the errlog, which is why
+/// this writes `eprintln!` and not [`rec_gbl_record_error`]. The INAM half was
+/// worded `iocInit: <name>.INAM function ... not found` here and the SNAM half
+/// was not written at all, so an IOC that booted with an unresolved SNAM said
+/// nothing and then processed the record as a no-op.
+///
+/// Returns whether C's `init_record` REACHED ITS TAIL — `false` is C's `return
+/// S_db_BadSub` (either miss) and C's `prec->pact = TRUE; return 0` (an empty
+/// `sub` SNAM), both of which skip everything below them. The init owner
+/// ([`record::RecordInstance::run_init_passes`]) calls this from inside pass 1
+/// and honours the answer, so the tail is unreachable by construction rather
+/// than by a per-record-type opt-out.
+///
+/// [`rec_gbl_record_error`]: crate::server::recgbl::rec_gbl_record_error
+pub(crate) fn wire_subroutine(
+    instance: &mut record::RecordInstance,
+    name: &str,
+    registry: &HashMap<String, Arc<SubroutineFn>>,
+) -> bool {
+    // Both `sub` and `aSub` resolve their subroutine from SNAM via the
+    // function registry at init (C `registryFunctionFind`).
+    let rt = instance.record.record_type();
+    if rt != "sub" && rt != "aSub" {
+        return true;
+    }
+    let erl = crate::runtime::log::ERL_ERROR;
+    // INAM: invoke the init routine exactly once at init, before SNAM
+    // resolution (C `init_record`: `registryFunctionFind(inam)` then
+    // `(*psubroutine)(prec)`, return value discarded).
+    //
+    // A name that does not RESOLVE is C's `return S_db_BadSub`
+    // (`subRecord.c:110-114`, `aSubRecord.c:141-146`) — an early return, so
+    // everything below is skipped and the record keeps a null `sadr` however
+    // good its SNAM is. The routine's own status is discarded, so a routine
+    // that ran and failed is not an early return.
+    if let Some(crate::types::EpicsValue::String(inam_field)) = instance.record.get_field("INAM") {
+        let inam = inam_field.as_str_lossy();
+        if !inam.is_empty() {
+            let Some(init_fn) = registry.get(inam.as_ref()) else {
+                eprintln!("{name}.INAM {erl} function '{inam}' not found");
+                return false;
+            };
+            let init_fn = init_fn.clone();
+            if let Err(e) = init_fn(&mut *instance.record) {
+                eprintln!("iocInit: {name}.INAM '{inam}' init routine failed: {e}");
             }
         }
     }
+    // C resolves SNAM at init only for a record that will USE the resolution:
+    // `subRecord.c:123` always, `aSubRecord.c:151-158` only under `LFLG ==
+    // IGNORE`, because an `LFLG == READ` aSub reads its name from SUBL every
+    // cycle and resolves it there (`apply_asub_dynamic_sub`). That rule
+    // already had an owner — the record's own `is_subroutine_name_field`,
+    // which the put path gates on — so this asks it instead of re-deriving
+    // "sub or aSub" and reporting a miss C never went looking for.
+    if instance.record.is_subroutine_name_field("SNAM")
+        && let Some(crate::types::EpicsValue::String(snam_field)) =
+            instance.record.get_field("SNAM")
+    {
+        let snam = snam_field.as_str_lossy();
+        if snam.is_empty() {
+            // C `subRecord.c:118-122` — `epicsPrintf`, which is `errlogPrintf`
+            // (`errlog.h:90`), then `prec->pact = TRUE` and `return 0`. Both
+            // halves are this line's, because both are inside C's
+            // `init_record`: an INAM that failed above returned before them,
+            // so a record whose INAM missed is NOT parked however empty its
+            // SNAM is (softIoc-measured: `PACT: 0`). `aSubRecord.c:152` tests
+            // `snam[0] != 0` and neither reports nor returns, so it falls
+            // through to the tail below.
+            instance.subroutine = None;
+            if rt == "sub" {
+                crate::runtime::log::errlog_printf(&format!("{name}.SNAM is empty\n"));
+                instance.enter_pact();
+                return false;
+            }
+        } else {
+            // C `init_record`'s `prec->sadr = registryFunctionFind(...)`,
+            // assigned whatever the lookup returned, and `return S_db_BadSub`
+            // when that is NULL (`subRecord.c:125-129`, `aSubRecord.c:155-158`)
+            // — the second early return past the tail.
+            instance.subroutine = registry.get(snam.as_ref()).cloned();
+            if instance.subroutine.is_none() {
+                eprintln!("{name}.SNAM {erl} function '{snam}' not found");
+                return false;
+            }
+        }
+    }
+    // C's init tail: the lines BELOW every early return above, reached only by
+    // a record whose INAM and SNAM both resolved. That placement is the whole
+    // point — an unresolved name means C never seeds, and `dbpr REC 4` on
+    // `record(sub,"X"){field(SNAM,"noSuchSub") field(VAL,"5")}` reads back
+    // `MLST: 0 ALST: 0 LALM: 0` on softIoc R7.0.10 while the port read 5.
+    // It lives here rather than in `SubRecord::init_record` / the generic
+    // `seed_deadband_tracking` because both of those run before this function,
+    // where the resolution's outcome is not yet known.
+    match rt {
+        // `subRecord.c:130-132`: `prec->mlst = prec->alst = prec->lalm =
+        // prec->val`, so the first `monitor()` posts nothing for a value that
+        // has not moved since init.
+        "sub" => {
+            if let Some(val) = instance.record.get_field("VAL") {
+                for field in ["MLST", "ALST", "LALM"] {
+                    let _ = instance.record.put_field(field, val.clone());
+                }
+            }
+        }
+        // `aSubRecord.c:162`: `strcpy(prec->onam, prec->snam)`. That seed is
+        // what gives `fetch_values`' `strcmp(prec->snam, prec->onam)` (`:261`)
+        // its meaning — "the SUBL link delivered a name different from the one
+        // this record booted with", not "different from the empty string".
+        // Without it an `LFLG=READ` aSub whose SUBL is a constant re-resolved
+        // its own boot-time SNAM on the first cycle and bound the subroutine C
+        // deliberately leaves NULL.
+        _ => {
+            if let Some(snam_field) = instance.record.get_field("SNAM") {
+                let _ = instance.record.put_field("ONAM", snam_field);
+            }
+        }
+    }
+    true
 }
 
 /// C `scanAdd`'s `menuScanI_O_Intr` failure exit (`dbScan.c:272-293`): a record
@@ -2544,7 +2737,18 @@ async fn wire_subroutines(db: &PvDatabase, registry: &HashMap<String, Arc<Subrou
 /// `scanDelete` → `get_ioint_info(1)` hook and hands back the delta for
 /// `update_scan_index`, so the record also leaves the `IoIntr` scan bucket that
 /// `scanpiol` and `dbla` report from.
-async fn demote_io_intr_to_passive(db: &PvDatabase, name: &str, reason: &str) {
+///
+/// `message` is C's `pmessage` verbatim, trailing space included, and the
+/// report goes through [`rec_gbl_record_error`] rather than being spelt out
+/// here. Both matter to a site: C's line is `recGblRecordError: <message>
+/// <errSym> PV: <name>` and it goes to the *errlog*, so an operator grepping
+/// `recGblRecordError` or reading the IOC log server sees a demoted record.
+/// The port used to print its own sentence straight to `stderr`, which
+/// reaches neither. C names no record's new SCAN and neither does this — the
+/// demotion is `scanAdd`'s documented behaviour, not news.
+///
+/// [`rec_gbl_record_error`]: crate::server::recgbl::rec_gbl_record_error
+async fn demote_io_intr_to_passive(db: &PvDatabase, name: &str, message: &str) {
     let Some(rec_arc) = db.get_record(name) else {
         return;
     };
@@ -2563,7 +2767,9 @@ async fn demote_io_intr_to_passive(db: &PvDatabase, name: &str, reason: &str) {
     {
         db.update_scan_index(name, old_scan, new_scan, phas, phas);
     }
-    eprintln!("scanAdd: I/O Intr not valid ({reason}), {name} set to Passive");
+    // C passes `-1`, for which `errSymLookup` is skipped and the slot is
+    // empty (`recGbl.c:65-70`) — hence the doubled space in C's own output.
+    crate::server::recgbl::rec_gbl_record_error("", name, message);
 }
 
 /// Set up I/O Intr scanning for records with SCAN="I/O Intr".
@@ -2608,9 +2814,10 @@ pub(crate) async fn setup_io_intr(db: Arc<PvDatabase>) -> usize {
             continue;
         }
         let Some(mut dev) = inst.device.take() else {
-            // C `dbScan.c:272-276` — `precord->dset == NULL`.
+            // C `dbScan.c:272-276` — `precord->dset == NULL`. The trailing
+            // space is C's literal (`dbScan.c:275`), not a typo.
             if on_io_intr {
-                demote.push((name, "no DSET"));
+                demote.push((name, "scanAdd: I/O Intr not valid (no DSET) "));
             }
             continue;
         };
@@ -2657,13 +2864,15 @@ pub(crate) async fn setup_io_intr(db: Arc<PvDatabase>) -> usize {
             // C `dbScan.c:278-293` — device support with no `get_ioint_info`,
             // or one whose `get_ioint_info` yields no scan list. The port
             // collapses all three into "the device offers no interrupt
-            // receiver"; the observable is the same demotion.
-            demote.push((name, "no interrupt source from device support"));
+            // receiver"; the observable is the same demotion, and the message
+            // is C's first and dominant case (`dbScan.c:281-282`), the one a
+            // device support that never implemented the hook produces.
+            demote.push((name, "scanAdd: I/O Intr not valid (no get_ioint_info)"));
         }
         inst.device = Some(dev);
     }
-    for (name, reason) in demote {
-        demote_io_intr_to_passive(&db, &name, reason).await;
+    for (name, message) in demote {
+        demote_io_intr_to_passive(&db, &name, message).await;
     }
     count
 }
@@ -3093,9 +3302,7 @@ mod tests {
         // An empty IocApplication with no script or records should start and stop cleanly
         // We can't easily test run() because it blocks on REPL, so test the wiring functions
         let db = Arc::new(PvDatabase::new());
-        let factories = HashMap::new();
-        let count = wire_device_support(&db, &factories, &None).await.unwrap();
-        assert_eq!(count, 0);
+        assert_eq!(db.records_with_device_support().await, 0);
     }
 
     #[epics_macros_rs::epics_test]
@@ -3103,13 +3310,13 @@ mod tests {
         use crate::server::records::ai::AiRecord;
 
         let db = Arc::new(PvDatabase::new());
+        db.install_device_support_resolver(device_support_resolver(HashMap::new(), None));
         db.add_record("TEST", Box::new(AiRecord::new(0.0)))
             .await
             .unwrap();
 
-        let factories = HashMap::new();
-        let count = wire_device_support(&db, &factories, &None).await.unwrap();
-        assert_eq!(count, 0); // No DTYP set, so no wiring
+        // No DTYP set, so the record is a soft channel and binds no dset.
+        assert_eq!(db.records_with_device_support().await, 0);
     }
 
     /// Regression: `wire_device_support` (the IocApplication
@@ -3163,21 +3370,31 @@ mod tests {
         );
 
         let db = Arc::new(PvDatabase::new());
-        db.add_record("AI:WITH:INFO", Box::new(AiRecord::new(0.0)))
-            .await
-            .unwrap();
-        // Populate the record's info map — exactly what
-        // IocBuilder/iocsh now do after loading info(...) directives.
-        let rec = db.get_record("AI:WITH:INFO").unwrap();
-        {
-            let mut inst = rec.write();
-            inst.common.dtyp = "TestRecording".to_string();
-            inst.set_info("asyn:READBACK", "1");
-            inst.set_info("Q:group", "demo");
-        }
-
-        let count = wire_device_support(&db, &factories, &None).await.unwrap();
-        assert_eq!(count, 1, "device support must have attached");
+        db.install_device_support_resolver(device_support_resolver(factories, None));
+        // DTYP and the info(...) tags arrive WITH the record, because the bind
+        // now happens at creation — C's `doInitRecord0`, which reads the field
+        // set `dbLoadRecords` already wrote.
+        db.add_loaded_record(
+            "AI:WITH:INFO",
+            Box::new(AiRecord::new(0.0)),
+            crate::server::database::RecordLoad {
+                common_fields: vec![(
+                    "DTYP".to_string(),
+                    crate::types::EpicsValue::String("TestRecording".into()),
+                )],
+                info_tags: vec![
+                    ("asyn:READBACK".to_string(), "1".to_string()),
+                    ("Q:group".to_string(), "demo".to_string()),
+                ],
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            db.records_with_device_support().await,
+            1,
+            "device support must have attached"
+        );
 
         // The recording driver should have observed both tags via
         // apply_record_info — proves the hook fires from the
@@ -3224,20 +3441,6 @@ mod tests {
             .map(|i: usize| format!("LOAD:{:02}", (i * 7 + 3) % 24))
             .collect();
 
-        let db = Arc::new(PvDatabase::new());
-        for name in &names {
-            db.add_record(name, Box::new(AiRecord::new(0.0)))
-                .await
-                .unwrap();
-            let rec = db.get_record(name).unwrap();
-            let mut inst = rec.write();
-            inst.common.dtyp = "SeqDev".to_string();
-            // `DeviceSupportContext` carries the links, not the record name;
-            // echoing the name through INP is how the test observes which
-            // record is being wired.
-            inst.common.inp = format!("@{name}");
-        }
-
         let wired: StdArc<StdMutex<Vec<String>>> = StdArc::new(StdMutex::new(Vec::new()));
         let captured = wired.clone();
         let dynamic: Option<DynamicDeviceSupportFactory> =
@@ -3249,11 +3452,30 @@ mod tests {
                 Some(Box::new(NoopDev) as Box<dyn DeviceSupport>)
             }));
 
-        let factories: HashMap<String, DeviceSupportFactory> = HashMap::new();
-        let count = wire_device_support(&db, &factories, &dynamic)
+        let db = Arc::new(PvDatabase::new());
+        db.install_device_support_resolver(device_support_resolver(HashMap::new(), dynamic));
+        for name in &names {
+            db.add_loaded_record(
+                name,
+                Box::new(AiRecord::new(0.0)),
+                crate::server::database::RecordLoad::from_common_fields(vec![
+                    (
+                        "DTYP".to_string(),
+                        crate::types::EpicsValue::String("SeqDev".into()),
+                    ),
+                    // `DeviceSupportContext` carries the links, not the record
+                    // name; echoing the name through INP is how the test
+                    // observes which record is being wired.
+                    (
+                        "INP".to_string(),
+                        crate::types::EpicsValue::String(format!("@{name}").into()),
+                    ),
+                ]),
+            )
             .await
             .unwrap();
-        assert_eq!(count, names.len());
+        }
+        assert_eq!(db.records_with_device_support().await, names.len());
 
         let wired = std::mem::take(&mut *wired.lock().unwrap());
         assert_eq!(

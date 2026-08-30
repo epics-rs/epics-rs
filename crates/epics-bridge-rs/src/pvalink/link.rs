@@ -150,8 +150,8 @@ fn enqueue_scan_trigger(tx: &mpsc::Sender<ScanEvent>, overrun: &ScanOverrun, eve
 /// one observer, so its `catch(client::Disconnect&)` arm clears `connected`
 /// and runs every link's `onDisconnect()` unconditionally
 /// (`pvxs/ioc/pvalink_channel.cpp:360-373`, `pvxs/ioc/pvalink_link.cpp:75-81`); its
-/// `if(!connected)` at `:342` is the value-update path's reconnect arm, not
-/// a disconnect gate.
+/// `if(!connected)` at `pvalink_channel.cpp:342` is the value-update path's
+/// reconnect arm, not a disconnect gate.
 fn inp_disconnect_scan(
     connected: &AtomicBool,
     disconnect_time: &Mutex<Option<(i64, i32)>>,

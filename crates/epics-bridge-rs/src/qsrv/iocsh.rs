@@ -133,10 +133,11 @@ pub(crate) fn apply_group_file(
         raw
     } else {
         // pvxs expands each group-config line independently through
-        // `macDefExpand` and, when expansion fails (an undefined or recursive
-        // macro makes `macExpandString` return a negative length, so
-        // `macDefExpand` returns `NULL`), logs an error and skips that line —
-        // the failed line never reaches the JSON buffer
+        // `macDefExpand` and, when expansion fails (any of macLib's three
+        // error arms — an undefined name, a recursive reference, or one
+        // never closed — makes `macExpandString` return a negative length,
+        // so `macDefExpand` returns `NULL`), logs an error and skips that
+        // line — the failed line never reaches the JSON buffer
         // (groupconfigprocessor.cpp:88-106). Expanding line-by-line, rather
         // than the whole file at once, is what stops an undefined reference
         // inside a quoted string (`"+channel": "$(MISSING)"`) or a group name
@@ -150,11 +151,21 @@ pub(crate) fn apply_group_file(
                     buffer.push('\n');
                 }
                 None => {
+                    // The cause is already on the operator's console and is
+                    // not this line's to restate: the expansion runs with
+                    // `suppress_warnings` off, so macLib itself wrote
+                    // `macLib: macro … is undefined` / `… is recursive` /
+                    // `macLib: unterminated macro reference in string …`
+                    // for this very line, naming the macro, before it
+                    // returned. A cause list here is a second copy of that
+                    // knowledge with no way to stay in step with it — it
+                    // already said "undefined or recursive macro" after the
+                    // unterminated arm began reaching this branch. What only
+                    // this layer knows is WHICH line was dropped.
                     tracing::error!(
                         file = %filename,
                         line = idx + 1,
-                        "dbLoadGroup: macro expansion failed (undefined or \
-                         recursive macro); skipping line"
+                        "dbLoadGroup: macro expansion failed; skipping line"
                     );
                 }
             }
@@ -229,379 +240,60 @@ fn parse_macros(s: &str) -> std::collections::HashMap<String, String> {
 ///   - a resolved (macro or env) value is re-scanned for further
 ///     references (chained expansion); a self-referential macro is a
 ///     recursive reference and fails the expansion (`refentry->visited`).
-///   - an undefined name with no default, or a recursive reference, is an
-///     expansion *error* (`refer` sets `entry->error`, errval
-///     `,undefined)`/`,recursive)`). `macExpandString` then returns a
+///   - three arms set `entry->error`: an undefined name with no default
+///     and a recursive reference, which leave the errval placeholders
+///     `,undefined)` / `,recursive)`, and a reference whose closing
+///     delimiter never matched its opener, which writes no placeholder at
+///     all and copies itself and the whole rest of the string through
+///     verbatim (`macCore.c:862-875`). `macExpandString` then returns a
 ///     negative length and `macDefExpand` returns `NULL`
 ///     (macCore.c:210,220,895-896,881-882), so this function returns `None`
 ///     instead of a string. pvxs's group loader skips the whole line on
 ///     `NULL`, so a placeholder can never register as a literal channel or
 ///     group name (groupconfigprocessor.cpp:91-103).
+///   - a fault inside a scoped DEFINITION is the exception that sets no
+///     error: C translates the `,k=v` list through a separate `MAC_ENTRY
+///     subs` whose flag is never merged back (`macCore.c:820-826`), so
+///     `$(P,K=$(UNDEF))` with `P` defined expands to `P`'s value and
+///     succeeds.
 ///
 /// Returns `None` exactly when C `macDefExpand()` would return `NULL` for the
 /// same input + macro set; `Some(expanded)` otherwise.
 fn expand_macros(s: &str, macros: &std::collections::HashMap<String, String>) -> Option<String> {
-    let chars: Vec<char> = s.chars().collect();
-    let mut out = String::with_capacity(s.len());
-    // `error` mirrors C `entry.error`: any undefined or recursive reference
-    // anywhere in the (possibly nested) expansion sets it. The reference name
-    // and an actually-used default value are translated through this same flag
-    // (C uses the outer `entry`, macCore.c:798,890-894), so their errors
-    // propagate; scoped-definition names/values are NOT (separate `subs`,
-    // macCore.c:821-826), handled inside `mac_parse_scoped`.
-    let mut error = false;
-    // The user's source string is translated at level 0 (`discard = false`):
-    // its own quote delimiters and escape backslashes are preserved
-    // (`macExpandString` → `trans(handle, &entry, 0, ...)`, macCore.c:216).
-    // Substituted macro values/names/defaults/scopes are translated at
-    // level+1 inside `mac_refer`, where `discard = true` strips them
-    // (matching C `expand`/`refer`, macCore.c:669-673,798,892).
-    mac_trans(
-        &chars,
+    // The engine is `epics-base-rs`'s, not a copy of it. This used to be a
+    // private fork — `mac_trans`/`mac_refer`/`mac_parse_scoped` plus two
+    // byte-identical `top_level_*` helpers — and the fork is what let C
+    // `refer`'s unterminated arm (`macCore.c:862-875`) stay open here after it
+    // was closed in base: a `$(` with no `)` returned `None`, the caller
+    // emitted a bare `$`, the shared `error` was never set, and pvxs's
+    // skip-the-line path never fired. One owner, one arm.
+    //
+    // The three options are pvxs's, not base's `.db` defaults:
+    //
+    //   * `env_fallback` — pvxs builds the handle with the `{"", "environ"}`
+    //     pair, so an unset name falls through to the process environment
+    //     (`groupsourcehooks.cpp:155-158`, C `lookup` + `FLAG_USE_ENVIRONMENT`);
+    //   * `dollar_escape` off — `$$` is not macLib syntax, it is an autosave
+    //     `.req` convenience;
+    //   * `suppress_warnings` off — `macDefExpand` never calls
+    //     `macSuppressWarning` (`macEnv.c:27-79`) and pvxs does not either, so
+    //     C writes the `macLib:` notice for every bad reference in a group
+    //     file.
+    let expanded = epics_base_rs::server::db_loader::expand_macros(
+        s,
         macros,
-        &mut Vec::new(),
-        &mut Vec::new(),
-        false,
-        &mut error,
-        &mut out,
-    );
-    // macExpandString returns the destination text even on error, but
-    // macDefExpand discards it and returns NULL when the length is negative
-    // (macCore.c:220). Mirror that: a failed expansion yields no string.
-    if error { None } else { Some(out) }
-}
-
-/// Translate `chars` into `out`, expanding macro references.
-///
-/// `scopes` is the stack of scoped-macro frames pushed by enclosing
-/// `$(name,key=val)` references; lookup walks it innermost-first, then
-/// `macros`, then the environment. `visiting` is the stack of macro
-/// names currently being expanded — it guards a self-referential macro
-/// (`A=$(A)`) against infinite recursion, mirroring C `macCore.c`'s
-/// per-entry `visited` flag.
-fn mac_trans(
-    chars: &[char],
-    macros: &std::collections::HashMap<String, String>,
-    scopes: &mut Vec<std::collections::HashMap<String, String>>,
-    visiting: &mut Vec<String>,
-    discard: bool,
-    error: &mut bool,
-    out: &mut String,
-) {
-    let mut quote: Option<char> = None;
-    let mut i = 0;
-    while i < chars.len() {
-        let c = chars[i];
-
-        // Track single/double quote state (C `trans` `quote` var). At a
-        // discard level (`level > 0` — i.e. these are NOT the user's quotes
-        // but a substituted macro value/name/default/scope) the quote
-        // DELIMITERS are dropped: C `continue`s past the opening and the
-        // closing quote without copying them (macCore.c:717-726). The
-        // characters between the quotes are still emitted.
-        if let Some(q) = quote {
-            if c == q {
-                quote = None;
-                if discard {
-                    i += 1;
-                    continue;
-                }
-            }
-        } else if c == '"' || c == '\'' {
-            quote = Some(c);
-            if discard {
-                i += 1;
-                continue;
-            }
-        }
-
-        // `\<char>`: copy the escaped character; the backslash itself is
-        // kept only at level 0 (the user's escape) and dropped at a discard
-        // level (C `if (v < valend && !discard) *v++ = '\\'`,
-        // macCore.c:741-744). Either way the macro detector does not see the
-        // escaped byte.
-        if c == '\\' && i + 1 < chars.len() {
-            if !discard {
-                out.push('\\');
-            }
-            out.push(chars[i + 1]);
-            i += 2;
-            continue;
-        }
-
-        // Macro reference: `$` followed by `(` or `{`, NOT inside single
-        // quotes (C `macRef && quote != '\''`).
-        let mac_ref =
-            c == '$' && i + 1 < chars.len() && (chars[i + 1] == '(' || chars[i + 1] == '{');
-        if mac_ref && quote != Some('\'') {
-            if let Some(next) = mac_refer(chars, i, macros, scopes, visiting, error, out) {
-                i = next;
-                continue;
-            }
-        }
-
-        out.push(c);
-        i += 1;
-    }
-}
-
-/// Expand one macro reference starting at `chars[start]` (`$`). Returns
-/// the index just past the closing bracket, or `None` if the reference
-/// is unterminated (caller then copies `$` raw).
-fn mac_refer(
-    chars: &[char],
-    start: usize,
-    macros: &std::collections::HashMap<String, String>,
-    scopes: &mut Vec<std::collections::HashMap<String, String>>,
-    visiting: &mut Vec<String>,
-    error: &mut bool,
-    out: &mut String,
-) -> Option<usize> {
-    let close = if chars[start + 1] == '(' { ')' } else { '}' };
-    // Find the matching close bracket, honoring nested `$(`/`${`.
-    let body_start = start + 2;
-    let mut depth = 1usize;
-    let mut j = body_start;
-    while j < chars.len() && depth > 0 {
-        if j + 1 < chars.len() && chars[j] == '$' && (chars[j + 1] == '(' || chars[j + 1] == '{') {
-            depth += 1;
-            j += 2;
-            continue;
-        }
-        if depth == 1 && chars[j] == close || depth > 1 && (chars[j] == ')' || chars[j] == '}') {
-            depth -= 1;
-            if depth == 0 {
-                break;
-            }
-        }
-        j += 1;
-    }
-    if depth != 0 {
-        return None; // unterminated — caller emits '$' literally
-    }
-    let body = &chars[body_start..j];
-    let after = j + 1;
-
-    // Split the body at the first top-level `=` or `,` (the C `macEnd`
-    // terminator set). Nested `$(...)` brackets are skipped so a `=`/`,`
-    // inside an inner reference does not terminate.
-    let (name_chars, rest) = match mac_top_level_terminator(body) {
-        Some(k) => (&body[..k], &body[k..]),
-        None => (body, &body[body.len()..]),
-    };
-
-    // the name itself may contain macro references — expand it. The name
-    // is a substituted (level+1) value, so its quotes/escapes are discarded
-    // (C `trans(handle, entry, level+1, macEnd, ...)`, macCore.c:798). C
-    // translates the name through the *outer* `entry`, so an undefined or
-    // recursive reference inside the name fails the whole expansion — pass the
-    // shared `error`.
-    let mut name = String::new();
-    mac_trans(name_chars, macros, scopes, visiting, true, error, &mut name);
-
-    // Default value (`=...`) and scoped definitions (`,k=v`).
-    let mut default: Option<&[char]> = None;
-    let mut scoped: Vec<(String, String)> = Vec::new();
-    if let Some(first) = rest.first() {
-        if *first == '=' {
-            let dflt = &rest[1..];
-            match mac_top_level_comma(dflt) {
-                Some(k) => {
-                    default = Some(&dflt[..k]);
-                    mac_parse_scoped(&dflt[k..], macros, scopes, visiting, &mut scoped);
-                }
-                None => default = Some(dflt),
-            }
-        } else if *first == ',' {
-            mac_parse_scoped(rest, macros, scopes, visiting, &mut scoped);
-        }
-    }
-
-    // Push the scoped frame (visible only inside this expansion).
-    let mut frame: std::collections::HashMap<String, String> = std::collections::HashMap::new();
-    for (k, v) in scoped {
-        frame.insert(k, v);
-    }
-    scopes.push(frame);
-
-    // Look up: innermost scope first, then base macros, then the
-    // environment (pvxs's `{"","environ"}` handle / FLAG_USE_ENVIRONMENT).
-    let resolved = scopes
-        .iter()
-        .rev()
-        .find_map(|s| s.get(&name).cloned())
-        .or_else(|| macros.get(&name).cloned())
-        .or_else(|| {
-            if name.is_empty() {
-                None
-            } else {
-                std::env::var(&name).ok()
-            }
-        });
-
-    match resolved {
-        Some(val) => {
-            if visiting.contains(&name) {
-                // Recursive reference: C `refer` finds `refentry->visited`
-                // already set, sets `entry->error = TRUE`, and writes the
-                // `$(name,recursive)` placeholder (macCore.c:881-882,904-912).
-                // `macExpandString` then reports a negative length so
-                // `macDefExpand` returns `NULL`. Flag the error; the
-                // placeholder text is discarded by `expand_macros` on error,
-                // exactly as `macDefExpand` discards the destination buffer.
-                *error = true;
-                out.push_str("$(");
-                out.push_str(&name);
-                out.push_str(",recursive)");
-            } else {
-                visiting.push(name.clone());
-                let val_chars: Vec<char> = val.chars().collect();
-                // A resolved macro value is a substituted (level+1) value:
-                // its quote delimiters and escape backslashes are stripped
-                // (C `trans(handle, entry, level+1, "", &rv, ...)` /
-                // pre-`expand` at level 1, macCore.c:669-673,875). Errors in
-                // the value (e.g. a chained reference to an undefined macro)
-                // propagate through the shared `entry` (macCore.c:870,875).
-                mac_trans(&val_chars, macros, scopes, visiting, true, error, out);
-                visiting.pop();
-            }
-        }
-        None => match default {
-            Some(def_chars) => {
-                // The default value is also substituted at level+1, so its
-                // quotes/escapes are discarded by the translation itself —
-                // C `trans(handle, entry, level+1, macEnd+1, &defval, ...)`
-                // (macCore.c:892). It is translated through the outer `entry`,
-                // so a default that itself resolves to an undefined/recursive
-                // reference still fails the expansion — pass the shared
-                // `error`. A present, resolvable default is NOT an error.
-                mac_trans(def_chars, macros, scopes, visiting, true, error, out);
-            }
-            None => {
-                // Undefined reference with no default: C `refer` sets
-                // `entry->error = TRUE` and writes the `$(name,undefined)`
-                // placeholder (macCore.c:895-896,904-912), so
-                // `macExpandString` returns a negative length and
-                // `macDefExpand` returns `NULL`. Flag the error; the
-                // placeholder is discarded by `expand_macros` on error.
-                *error = true;
-                out.push_str("$(");
-                out.push_str(&name);
-                out.push_str(",undefined)");
-            }
+        epics_base_rs::server::db_loader::MacroExpandOptions {
+            env_fallback: true,
+            dollar_escape: false,
+            suppress_warnings: false,
         },
-    }
-
-    scopes.pop();
-    Some(after)
-}
-
-/// Parse a `,key=val,key2=val2,...` scoped-definition tail. A bare
-/// `,key` with no `=` defines nothing (C silently skips it).
-fn mac_parse_scoped(
-    rest: &[char],
-    macros: &std::collections::HashMap<String, String>,
-    scopes: &mut Vec<std::collections::HashMap<String, String>>,
-    visiting: &mut Vec<String>,
-    out: &mut Vec<(String, String)>,
-) {
-    // C translates scoped-definition names and values through a SEPARATE
-    // `MAC_ENTRY subs` whose `error` flag is initialized fresh and never
-    // merged back into the enclosing `entry` (macCore.c:821-826,841,849). So
-    // an undefined or recursive reference inside a scoped definition does NOT
-    // fail the surrounding expansion. Route these translations through a
-    // throwaway sink rather than the caller's `error` to match.
-    let mut scoped_err = false;
-    let mut k = 0;
-    while k < rest.len() {
-        if rest[k] != ',' {
-            break;
-        }
-        k += 1; // step over ','
-        let seg = &rest[k..];
-        let (name_part, tail) = match mac_top_level_terminator(seg) {
-            Some(t) => (&seg[..t], &seg[t..]),
-            None => (seg, &seg[seg.len()..]),
-        };
-        let mut sname = String::new();
-        // Scoped macro names/values are substituted at level+1, so their
-        // quotes/escapes are discarded (C `trans(handle, &subs, level+1,
-        // ...)`, macCore.c:841,849).
-        mac_trans(
-            name_part,
-            macros,
-            scopes,
-            visiting,
-            true,
-            &mut scoped_err,
-            &mut sname,
-        );
-        k += name_part.len();
-        if let Some('=') = tail.first() {
-            let valseg = &tail[1..];
-            let (val_part, _) = match mac_top_level_comma(valseg) {
-                Some(t) => (&valseg[..t], &valseg[t..]),
-                None => (valseg, &valseg[valseg.len()..]),
-            };
-            let mut sval = String::new();
-            mac_trans(
-                val_part,
-                macros,
-                scopes,
-                visiting,
-                true,
-                &mut scoped_err,
-                &mut sval,
-            );
-            out.push((sname, sval));
-            k += 1 + val_part.len();
-        }
-        // else: bare `,name` — no value, defines nothing.
-    }
-}
-
-/// Index of the first top-level `=` or `,` in `body`, skipping any
-/// nested `$(...)` / `${...}` reference.
-fn mac_top_level_terminator(body: &[char]) -> Option<usize> {
-    let mut depth = 0usize;
-    let mut i = 0;
-    while i < body.len() {
-        let c = body[i];
-        if c == '$' && i + 1 < body.len() && (body[i + 1] == '(' || body[i + 1] == '{') {
-            depth += 1;
-            i += 2;
-            continue;
-        }
-        if (c == ')' || c == '}') && depth > 0 {
-            depth -= 1;
-        } else if depth == 0 && (c == '=' || c == ',') {
-            return Some(i);
-        }
-        i += 1;
-    }
-    None
-}
-
-/// Index of the first top-level `,` in `body` (splits a default value
-/// from trailing scoped definitions).
-fn mac_top_level_comma(body: &[char]) -> Option<usize> {
-    let mut depth = 0usize;
-    let mut i = 0;
-    while i < body.len() {
-        let c = body[i];
-        if c == '$' && i + 1 < body.len() && (body[i + 1] == '(' || body[i + 1] == '{') {
-            depth += 1;
-            i += 2;
-            continue;
-        }
-        if (c == ')' || c == '}') && depth > 0 {
-            depth -= 1;
-        } else if depth == 0 && c == ',' {
-            return Some(i);
-        }
-        i += 1;
-    }
-    None
+    );
+    // C `macExpandString` returns the destination text even on error, but
+    // `macDefExpand` discards it and returns NULL when the length is negative
+    // (macCore.c:216-224, macEnv.c:58-61). `errored()` is that negative
+    // length: it covers the undefined, recursive AND unterminated arms alike,
+    // which is precisely what the fork could not do.
+    (!expanded.errored()).then_some(expanded.text)
 }
 
 /// `processGroups` — finalize group config after `dbLoadGroup` calls
@@ -1380,14 +1072,84 @@ mod tests {
         assert_eq!(m.len(), 2);
     }
 
+    /// C `refer`'s unterminated arm (`macCore.c:862-875`), which this file
+    /// carried open for as long as it had its own copy of the expander.
+    ///
+    /// A `$(`/`${` whose closing delimiter never arrives is not a reference:
+    /// C copies it and the whole rest of the string through verbatim, sets
+    /// `entry->error`, and writes `macLib: unterminated macro reference in
+    /// string …`. `macExpandString` then returns a negative length, so
+    /// `macDefExpand` returns `NULL` and pvxs skips the line
+    /// (groupconfigprocessor.cpp:91-103). The fork returned `Some` with the
+    /// `$` copied through and the shared `error` untouched, so the line
+    /// survived into the JSON buffer carrying a literal `$(`.
+    ///
+    /// All four shapes, measured against `softIoc R7.0.10`: a plain `$(`, the
+    /// `${` opener, a MISMATCHED `$(A}`, and two openers with no closer. The
+    /// third and fourth matter because the tail after the opener is text — the
+    /// `$(P)` in them is consumed as part of the unterminated reference's name
+    /// and is never expanded, so a fork that rescanned the tail resolved a
+    /// macro C leaves alone.
+    #[test]
+    fn an_unterminated_reference_fails_the_expansion() {
+        let m = std::collections::HashMap::from([("P".to_string(), "IOC:".to_string())]);
+        for s in [
+            r#"  "$(P:grp": {"#,
+            r#"  "${P:grp": {"#,
+            r#"  "x$(A} $(P) y""#,
+            r#"  "$(A$(B z""#,
+        ] {
+            assert_eq!(expand_macros(s, &m), None, "expanding {s:?}");
+        }
+        // The guard: a reference that IS closed still resolves, and the tail
+        // after it is still scanned.
+        assert_eq!(
+            expand_macros(r#"  "$(P)grp": {"#, &m).as_deref(),
+            Some(r#"  "IOC:grp": {"#)
+        );
+    }
+
+    /// End to end: a group whose NAME carries an unterminated `$(` must never
+    /// reach the provider.
+    ///
+    /// This is the hazard the line-by-line expansion exists to prevent, spelled
+    /// out in [`apply_group_file`]'s own comment — pvxs drops the line rather
+    /// than let a half-expanded name register as a real group. With the fork,
+    /// `  "$(P:grp": {` expanded to itself with no error reported, the JSON
+    /// stayed well-formed, and a group literally named `$(P:grp` was created.
+    #[test]
+    fn a_group_name_with_an_unterminated_reference_is_not_created() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("unterm-groups.json");
+        std::fs::write(
+            &path,
+            "{\n  \"$(P:grp\": {\n    \"+id\": \"epics:nt/NTGroup:1.0\"\n  }\n}\n",
+        )
+        .expect("write the group file");
+
+        let db = std::sync::Arc::new(epics_base_rs::server::database::PvDatabase::new());
+        let provider = BridgeProvider::new(db);
+        let loaded = apply_group_file(&provider, path.to_str().expect("utf-8 path"), "P=IOC:");
+
+        assert!(
+            loaded.is_err(),
+            "the skipped line leaves malformed JSON, so the load must fail; got {loaded:?}"
+        );
+        let names: Vec<String> = provider.groups().into_keys().collect();
+        assert!(
+            !names.iter().any(|n| n.contains("$(")),
+            "no group may be created from a half-expanded name: {names:?}"
+        );
+    }
+
     /// libCom `macParseDefns` (macUtil.c:74-196): a comma inside quotes or
     /// backslash-escaped is a literal, not a pair separator. A raw
     /// `split(',')` truncated `DESC="a,b"` to `DESC="a` and dropped `b"`;
     /// the quote-aware splitter keeps `a,b` as one value. The quotes and
     /// escapes themselves stay in the parsed value — macParseDefns removes
-    /// them from names only (macUtil.c:198-200) — and [`mac_trans`]'s
-    /// `discard` takes them off when the macro is substituted, so both
-    /// halves are asserted here.
+    /// them from names only (macUtil.c:198-200) — and the expander's
+    /// `discard` level takes them off when the macro is substituted, so
+    /// both halves are asserted here.
     #[test]
     fn parse_macros_keeps_quoted_or_escaped_comma_in_one_value() {
         let m = parse_macros(r#"DESC="a,b",P=IOC:"#);

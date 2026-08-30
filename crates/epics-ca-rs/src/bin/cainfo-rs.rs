@@ -22,6 +22,36 @@ const TERMINALS: &[(&str, copt::Terminal)] = &[
     ("dead_n", copt::Terminal::Usage(1)),
 ];
 
+/// C `cainfo.c:37-49` `usage()`, byte for byte. C substitutes two
+/// COMPILE-TIME constants, not the running configuration: `%f` of
+/// `DEFAULT_TIMEOUT` and `%u` of `CA_PRIORITY_MAX`, so `cainfo -w 5 -h` still
+/// advertises the 1.000000 s default. Written to stderr by
+/// `copt::Scan::finish` on the `Terminal::Usage` arm (`cainfo.c:148-150`).
+fn usage() -> String {
+    let mut block = format!(
+        r#"
+Usage: cainfo [options] <PV name> ...
+
+  -h: Help: Print this message
+  -V: Version: Show EPICS and CA versions
+Channel Access options:
+  -w <sec>:   Wait time, specifies CA timeout, default is {timeout:.6} second(s)
+  -s <level>: Call ca_client_status with the specified interest level
+  -p <prio>:  CA priority (0-{max}, default 0=lowest)
+
+Example: cainfo my_channel another_channel
+
+"#,
+        timeout = epics_ca_rs::cli::DEFAULT_CLI_TIMEOUT_SECS,
+        max = epics_ca_rs::copt::CA_PRIORITY_MAX,
+    );
+    // C's SECOND `fprintf` in `usage()` (`cainfo.c:49`): the same banner
+    // `-V` prints, but on stderr and appended to the block.
+    block.push_str(&epics_ca_rs::protocol::version_info());
+    block.push('\n');
+    block
+}
+
 #[derive(Parser)]
 #[command(
     name = "cainfo-rs",
@@ -90,8 +120,7 @@ struct Args {
 
 #[tokio::main]
 async fn main() {
-    let cmd = Args::command();
-    let parsed = TOOL.get_matches(cmd.clone());
+    let parsed = TOOL.get_matches(Args::command());
     let matches = parsed.matches();
     let args = Args::from_arg_matches(matches).expect("clap validated the arguments");
 
@@ -113,7 +142,7 @@ async fn main() {
     let priority = scan.priority("priority");
     // End of C's getopt loop: warnings out in command-line order, then `-h` /
     // `-V` if the loop reached one (R13-26).
-    scan.finish(&cmd, &epics_ca_rs::protocol::version_info(), TERMINALS);
+    scan.finish(&usage(), &epics_ca_rs::protocol::version_info(), TERMINALS);
 
     // C `cainfo.c:202-205`: a missing PV list is an error unless a
     // non-zero `-s` level was selected. `--diag` (Rust-only) is an
@@ -246,6 +275,22 @@ fn dbr_name(t: DbFieldType) -> &'static str {
 
 #[cfg(test)]
 mod tests {
+
+    /// Measured against `cainfo -h` from EPICS 7.0.10.1-DEV: 440 bytes on
+    /// stderr, of which the block is 380 and the rest is the version
+    /// banner C appends with a second `fprintf`. The banner carries the
+    /// build's own version string, so only the block's length is pinned.
+    #[test]
+    fn the_usage_block_is_cs_text_not_claps() {
+        let u = super::usage();
+        assert!(u.starts_with("\nUsage: cainfo [options] <PV name> ...\n\n"));
+        // C prints the COMPILE-TIME constants, not the running configuration.
+        assert!(u.contains("default is 1.000000 second(s)"));
+        assert!(u.contains("(0-99, default 0=lowest)"));
+        let banner = format!("{}\n", epics_ca_rs::protocol::version_info());
+        assert!(u.ends_with(&banner), "C appends the -V banner to the block");
+        assert_eq!(u.len() - banner.len(), 380);
+    }
     use super::*;
 
     /// `cainfo -s <arg>`, resolved the way `main` resolves it — through the

@@ -32,6 +32,24 @@
 //! family; and the resolvers here take the whole occurrence list, so
 //! "last wins" is the only shape a caller can express.
 //!
+//! # Long options are a port EXTENSION, and that is a deviation not a defect
+//!
+//! The goal is broad compatibility plus features that are reasonably needed,
+//! not parity: a strict superset keeps everything a site script written for C
+//! depends on, and a script written against our long forms failing on C is
+//! not our compatibility to keep.
+//!
+//! `getopt(3)` (not `getopt_long`) means C has no long options at all: every
+//! `--name` form ends the loop at `case '?'` with `Unrecognized option:
+//! '--'. ('caget -h' for help.)` on stderr and exit 1 — measured for
+//! `--help`, `--version`, `caget --wait`, `caput --timeout`,
+//! `cainfo --wait` and `camonitor --num-enum`. The port declares a long
+//! alias beside every short option and accepts all of them, and the superset
+//! is strict: every argv C accepts behaves identically (the differential
+//! harness is byte-clean on 115 cases against both a C `softIoc` and
+//! `softioc-rs`, `--` and a bare `-` included), so the only divergence is
+//! argv C REFUSES.
+//!
 //! # Order (R13-26)
 //!
 //! getopt processes options STRICTLY in command-line order, and `case 'h'` /
@@ -279,9 +297,10 @@ pub enum Terminal {
     /// `caput.c:60-62`, `cainfo.c:37-39`), and the `-h` case just calls that
     /// same function. One block, one stream, both statuses — the port used to
     /// split it, sending the exit-0 half to stdout because that is where clap
-    /// puts help. The block's WORDING is still clap's, not C's — a standing,
-    /// separate divergence. `-V` keeps stdout: C prints the version banner with
-    /// `printf` (`caget.c:404`).
+    /// puts help. The WORDING is the tool's own `usage()` text, handed to
+    /// [`Scan::finish`]; clap's renderer never reaches a user's terminal.
+    /// `-V` keeps stdout: C prints the version banner with `printf`
+    /// (`caget.c:404`).
     Usage(i32),
     /// C `case 'V'`: the version banner on stdout, `return 0`.
     Version,
@@ -402,8 +421,11 @@ impl<'m> Scan<'m> {
     /// precedes the offending token still wins, because C's loop reaches it
     /// first and `return`s 0 (R14-18).
     ///
-    /// `cmd` renders the usage block; `version_info` is the tool's `-V` banner.
-    pub fn finish(self, cmd: &clap::Command, version_info: &str, terminals: &[(&str, Terminal)]) {
+    /// `usage` is the tool's `usage()` block, byte for byte as its C
+    /// counterpart writes it; `version_info` is the tool's `-V` banner. Both
+    /// are text, not a `clap::Command`, so no help renderer can substitute
+    /// its own wording for C's on the way out.
+    pub fn finish(self, usage: &str, version_info: &str, terminals: &[(&str, Terminal)]) {
         let terminal = self.terminal(terminals);
         // The error sits at the offending token, which is past every option in
         // `matches` — [`Parsed`] parsed only the argv PREFIX before it — so any
@@ -440,7 +462,7 @@ impl<'m> Scan<'m> {
             Some((_, Terminal::Usage(status))) => {
                 // C's `usage()` writes to stderr whatever brought it here —
                 // `-h`, or the `default:` arm's exit-1 path.
-                let _ = cmd.clone().write_help(&mut std::io::stderr());
+                let _ = std::io::stderr().write_all(usage.as_bytes());
                 std::process::exit(status)
             }
         }

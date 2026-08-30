@@ -135,6 +135,48 @@ const TERMINALS: &[(&str, copt::Terminal)] = &[
     ("version", copt::Terminal::Version),
 ];
 
+/// C `caput.c:60-87` `usage()`, byte for byte. C substitutes two
+/// COMPILE-TIME constants, not the running configuration: `%f` of
+/// `DEFAULT_TIMEOUT` and `%u` of `CA_PRIORITY_MAX`, so `caput -w 5 -h` still
+/// advertises the 1.000000 s default. Written to stderr by
+/// `copt::Scan::finish` on the `Terminal::Usage` arm (`caput.c:292-294`).
+fn usage() -> String {
+    format!(
+        r#"
+Usage: caput [options] <PV name> <PV value> ...
+       caput -a [options] <PV name> <no of values> <PV value> ...
+
+  -h: Help: Print this message
+  -V: Version: Show EPICS and CA versions
+Channel Access options:
+  -w <sec>:  Wait time, specifies CA timeout, default is {timeout:.6} second(s)
+  -c: Asynchronous put (use ca_put_callback and wait for completion)
+  -p <prio>: CA priority (0-{max}, default 0=lowest)
+Format options:
+  -t: Terse mode - print only successfully written value, without name
+  -l: Long mode "name timestamp value stat sevr" (read PVs as DBR_TIME_xxx)
+Enum format:
+  Default: Auto - try value as ENUM string, then as index number
+  -n: Force interpretation of values as numbers
+  -s: Force interpretation of values as strings
+Arrays:
+  Default: Put scalar
+      Value format: all value arguments concatenated with spaces
+  -S: Put string as an array of chars (long string)
+  -a: Put array
+      Value format: number of values, then list of values
+Alternate output field separator:
+  -F <ofs>: Use <ofs> as an alternate output field separator
+
+Example: caput my_channel 1.2
+  (puts 1.2 to my_channel)
+
+"#,
+        timeout = epics_ca_rs::cli::DEFAULT_CLI_TIMEOUT_SECS,
+        max = epics_ca_rs::copt::CA_PRIORITY_MAX,
+    )
+}
+
 /// Mirror of C `caput` flag set.
 ///
 /// Note: positional grammar differs in array mode (`-a`):
@@ -306,8 +348,7 @@ fn last_of_pair(matches: &clap::ArgMatches, this_id: &str, that_id: &str) -> (bo
 
 #[tokio::main]
 async fn main() {
-    let cmd = Args::command();
-    let parsed = TOOL.get_matches(cmd.clone());
+    let parsed = TOOL.get_matches(Args::command());
     let matches = parsed.matches();
     let args = Args::from_arg_matches(matches).expect("clap validated the arguments");
 
@@ -327,7 +368,7 @@ async fn main() {
     let field_separator = scan.field_separator("field_separator");
     // End of C's getopt loop: warnings out in command-line order, then `-h` /
     // `-V` if the loop reached one (R13-26).
-    scan.finish(&cmd, &epics_ca_rs::protocol::version_info(), TERMINALS);
+    scan.finish(&usage(), &epics_ca_rs::protocol::version_info(), TERMINALS);
 
     // -n / -s steer ENUM scalar handling below (force_numeric =
     // interpret as index; force_string = always send DBR_STRING for
@@ -1053,6 +1094,21 @@ fn build_enum_array(
 
 #[cfg(test)]
 mod tests {
+
+    /// Measured against `caput -h` from EPICS 7.0.10.1-DEV: 1120 bytes on
+    /// stderr, byte for byte. The length is pinned because the failure this
+    /// guards against — rendering the block through clap instead — changes
+    /// every line of it.
+    #[test]
+    fn the_usage_block_is_cs_text_not_claps() {
+        let u = super::usage();
+        assert!(u.starts_with("\nUsage: caput [options] <PV name> <PV value> ...\n"));
+        // C prints the COMPILE-TIME constants, not the running configuration.
+        assert!(u.contains("default is 1.000000 second(s)"));
+        assert!(u.contains("(0-99, default 0=lowest)"));
+        assert!(u.ends_with("\n\n"), "C's block closes with a blank line");
+        assert_eq!(u.len(), 1120);
+    }
     use super::{
         Args, Readback, ValueFormat, WriteValue, build_write_value, classify_readback,
         last_of_pair, raw_from_escaped, raw_from_escaped_string, readback_line, readback_stderr,

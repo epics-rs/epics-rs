@@ -16,16 +16,21 @@ pub async fn run_repeater() -> io::Result<()> {
 
 /// Run the CA repeater daemon with an explicit debug level.
 ///
-/// Mirrors epics-base PR #831 (commit `e2717521` "Added -d option
-/// to caRepeater, sets debug level"), i.e. C `ca_repeater(setDebug)`
-/// assigning the file-static `debug` (`repeater.cpp:493-502`):
-/// - level 0: the four `debugPrintf` sites C leaves unguarded still
-///   print — `CA Repeater: Attached and initialized` among them.
-/// - level 1: also "New client", "Verified N active clients",
-///   "Client on port N refused message", "Deleted client on port N" —
-///   high-level client lifecycle.
+/// C `ca_repeater` takes no argument at the R7.0.10 pin; the level is
+/// `e271752158dd` ("Added -d option to caRepeater, sets debug level"),
+/// which gives it a `setDebug` parameter assigning a file-static
+/// `debug`:
+/// - level 0: nothing. Every `debugPrintf` in `repeater.cpp` is silent
+///   in a stock C repeater — compiled out at the pin, and post-tag
+///   sent to `/dev/null` by `caRepeater.cpp` unless `-d`/`-v` — so
+///   `DebugGate` has no variant for it.
+/// - level 1: "CA Repeater: Attached and initialized", "New client",
+///   "Verified N active clients", "Client on port N refused message",
+///   "Deleted client on port N" — the sites C guards with `if (debug)`
+///   plus the four it leaves unguarded, which reach a terminal only
+///   with `-d` anyway.
 /// - level 2: also per-beacon "Sent to port N" and per-client
-///   "Client on port N is alive" verification.
+///   "Client on port N is alive" verification, C `if (debug > 1)`.
 ///
 /// Which stream a line takes is `Diag`'s business, not this level's:
 /// `debugPrintf` is stdout, `fprintf(stderr, …)` is stderr, and
@@ -42,7 +47,7 @@ pub async fn run_repeater_with_debug(debug: u8) -> io::Result<()> {
     use socket2::{Domain, Protocol, Socket, Type};
     let diag = Diag::new(debug);
     // C folds socket creation and bind into one `makeSocket` errno
-    // (`repeater.cpp:94-129`), so a failure at either step reaches the same
+    // (`repeater.cpp:91-126`), so a failure at either step reaches the same
     // pair of diagnostics at `:513-531`.
     let sock = match Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP)) {
         Ok(s) => s,
@@ -82,7 +87,7 @@ pub async fn run_repeater_with_debug(debug: u8) -> io::Result<()> {
     // multiple IOCs share the CA port; the repeater daemon port does not.
     //
     // C `ca_repeater` decides what a bind failure MEANS right here and
-    // returns from its void function either way (`repeater.cpp:513-531`):
+    // returns from its void function either way (`repeater.cpp:501-519`):
     // EADDRINUSE is the ordinary "someone else got there first" and prints
     // on stdout, anything else is fatal and prints on stderr. Handing the
     // bare `io::Error` up made the caller re-derive that — and `caget-rs`,
@@ -92,7 +97,7 @@ pub async fn run_repeater_with_debug(debug: u8) -> io::Result<()> {
     if let Err(e) = sock.bind(&bind_sa) {
         if e.kind() == io::ErrorKind::AddrInUse {
             diag.printf(
-                0,
+                DebugGate::Debug,
                 format_args!("CA Repeater: Exiting, a repeater is already running"),
             );
         } else {
@@ -130,13 +135,17 @@ pub async fn run_repeater_with_debug(debug: u8) -> io::Result<()> {
         );
     }
 
-    // C `repeater.cpp:583`. `debugPrintf` is `::printf` here (`:73`
-    // `#define DEBUG`), so this is stdout and UNGUARDED — a stock C
-    // `caget` whose `caStartRepeaterIfNotInstalled` fell back to the
-    // in-process `caRepeaterThread` prints it on its own stdout. The port
-    // gated it behind `debug > 0` and sent it to stderr, which is the
-    // whole of the observed client-side A/B difference.
-    diag.printf(0, format_args!("CA Repeater: Attached and initialized"));
+    // C `repeater.cpp:571`, a `debugPrintf` inside no `if (debug)`.
+    // Unguarded is not the same as printed: at the pin `repeater.cpp`
+    // defines no `DEBUG`, so the macro expands to nothing, and after
+    // `e271752158dd` adds `#define DEBUG` the line still goes to
+    // `caRepeater.cpp`'s `/dev/null` unless `-d`/`-v`. This port ran it
+    // in-process on a CA client's own stdout, so it needs the gate more
+    // than C does, not less.
+    diag.printf(
+        DebugGate::Debug,
+        format_args!("CA Repeater: Attached and initialized"),
+    );
 
     let mut clients: HashMap<u16, RepeaterClient> = HashMap::new();
     let mut buf = [0u8; 4096];
@@ -156,7 +165,7 @@ pub async fn run_repeater_with_debug(debug: u8) -> io::Result<()> {
                         e.kind(),
                         std::io::ErrorKind::ConnectionRefused | std::io::ErrorKind::ConnectionReset
                     ) {
-                        // C `repeater.cpp:602` is `fprintf(stderr, …)`, and
+                        // C `repeater.cpp:590` is `fprintf(stderr, …)`, and
                         // stderr is where `caRepeater -v` leaves it. A
                         // `tracing::warn!` reached nobody in a daemon that
                         // installs no subscriber.
@@ -413,7 +422,7 @@ fn spawn_repeater() {
 }
 
 /// C reports a bind-test socket it cannot create exactly once
-/// (`repeater.cpp:382-398`, the `static bool init`), so an exhausted fd
+/// (`repeater.cpp:372-388`, the `static bool init`), so an exhausted fd
 /// table gives one line rather than one per registration datagram.
 static BIND_TEST_SOCKET_REPORTED: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
@@ -491,10 +500,12 @@ mod tests {
         /// received.
         ///
         /// WHICH stream a `repeater.cpp` diagnostic takes is half of what this
-        /// module got wrong: `debugPrintf` is `::printf` (stdout) because
-        /// `repeater.cpp:73` `#define DEBUG`s before including `iocinf.h`, while
-        /// the port emitted every line on stderr. Asserting the bytes alone
-        /// would not have caught that, so the tests assert the stream too.
+        /// module got wrong: `debugPrintf` is `::printf` (stdout) wherever the
+        /// facility is compiled in — `#define DEBUG` before `iocinf.h`, added
+        /// post-R7.0.10 in `e271752158dd` — while the port emitted every line
+        /// on stderr. Asserting the bytes alone would not have caught that, so
+        /// the tests assert the stream too. The other half was WHETHER it takes
+        /// one at all; `repeater_is_silent_at_debug_zero` covers that.
         pub(crate) fn capture_streams<F: FnOnce() -> R, R>(f: F) -> (R, String, String) {
             use std::io::{Read, Write};
             use std::os::fd::FromRawFd;
@@ -545,11 +556,12 @@ mod tests {
         }
     }
 
-    /// C `repeater.cpp:515-521`: a repeater that loses the race for the
-    /// port says so with a `debugPrintf` — stdout, and inside no
-    /// `if (debug)`, so it prints at the stock level 0 — and then returns.
-    /// The port propagated a bare `AddrInUse` instead, which `caget-rs`'s
-    /// in-process fallback discards with `let _ =`.
+    /// C `repeater.cpp:505-510`: a repeater that loses the race for the
+    /// port says so with a `debugPrintf` — stdout — and then returns. The
+    /// port propagated a bare `AddrInUse` instead, which `caget-rs`'s
+    /// in-process fallback discards with `let _ =`. The line needs `-d`:
+    /// C leaves this site outside any `if (debug)`, but the facility is
+    /// shut at level 0 either way, so the test asserts both halves.
     // RTEMS-EXEC-MODEL-ALLOW(1): builds and enters its own current-thread
     // runtime rather than taking an ambient one; green on the exec
     // backend.
@@ -567,8 +579,18 @@ mod tests {
             .build()
             .expect("test runtime");
 
-        let (result, out, err) =
+        let (quiet, quiet_out, _) =
             stream_capture::capture_streams(|| rt.block_on(run_repeater_with_debug(0)));
+        assert!(quiet.is_ok(), "a lost bind race is not an error: {quiet:?}");
+        assert!(
+            quiet_out.is_empty(),
+            "the `debugPrintf` facility is shut at debug 0 — a CA client tool \
+             runs this repeater in-process, so its stdout must stay clean; \
+             got {quiet_out:?}"
+        );
+
+        let (result, out, err) =
+            stream_capture::capture_streams(|| rt.block_on(run_repeater_with_debug(1)));
 
         assert!(
             result.is_ok(),
@@ -587,22 +609,103 @@ mod tests {
         drop(held);
     }
 
-    /// The bytes and the stream of three `repeater.cpp` diagnostics, taken
-    /// off a live `run_repeater_with_debug`.
+    /// The `debugPrintf` facility is shut at debug 0, on the path where
+    /// that matters: a full registration, which fires the banner, `New
+    /// client on port %u` and `Verified %u active clients` — the three
+    /// lines the sibling test reads at `-d 1`.
     ///
-    /// * `CA Repeater: Attached and initialized` — `repeater.cpp:583`, a
-    ///   `debugPrintf` inside NO `if (debug)`, so it prints at the stock
-    ///   level 0. Captured from the C build for comparison: with the
-    ///   `caRepeater` executable off `PATH` (so
-    ///   `caStartRepeaterIfNotInstalled` falls back to the in-process
-    ///   `caRepeaterThread`), `caget NOSUCH:PV` writes exactly this line to
-    ///   its own **stdout** while `Channel connect timed out` goes to
-    ///   stderr. The port gated it behind `debug > 0` and put it on stderr.
-    /// * `New client on port %u` — `repeater.cpp:136`, the `repeaterClient`
-    ///   constructor, inside `if (debug)`.
-    /// * `Verified %u active clients` — `repeater.cpp:332`, and this is the
-    ///   only function in the file that prints it; the port also printed it
-    ///   from `fanOut` and from a registration wrapper.
+    /// `ensure_repeater` runs this daemon on a background thread inside
+    /// whichever CA client tool could not find a `caRepeater` binary, so
+    /// anything it writes to stdout is written into that tool's data
+    /// channel. C never does: at R7.0.10 `repeater.cpp` defines no
+    /// `DEBUG` and the macro expands to nothing, and after
+    /// `e271752158dd` `caRepeater.cpp` `dup2`s stdout to `/dev/null`
+    /// unless `-d`/`-v`. C's `fprintf(stderr, …)` sites are ungated and
+    /// stay ungated here, so only stdout is asserted.
+    // RTEMS-EXEC-MODEL-ALLOW(1): builds and enters its own multi-thread
+    // runtime rather than taking an ambient one; green on the exec
+    // backend.
+    #[cfg(unix)]
+    #[test]
+    fn repeater_is_silent_at_debug_zero() {
+        use std::time::{Duration, Instant};
+
+        let free_port = StdUdpSocket::bind("127.0.0.1:0")
+            .expect("probe bind")
+            .local_addr()
+            .expect("probe addr")
+            .port();
+        // SAFETY: nextest runs each test in its own process.
+        unsafe { std::env::set_var("EPICS_CA_REPEATER_PORT", free_port.to_string()) };
+
+        let client = std::sync::Arc::new(StdUdpSocket::bind("127.0.0.1:0").expect("client bind"));
+        client
+            .set_read_timeout(Some(Duration::from_millis(200)))
+            .expect("client read timeout");
+
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .expect("test runtime");
+
+        let (confirmed, out, err) = stream_capture::capture_streams(|| {
+            let held = std::sync::Arc::clone(&client);
+            rt.block_on(async move {
+                let repeater = tokio::spawn(run_repeater_with_debug(0));
+                let confirmed = tokio::task::spawn_blocking(move || {
+                    let register = CaHeader::new(CA_PROTO_REPEATER_REGISTER).to_bytes();
+                    let deadline = Instant::now() + Duration::from_secs(5);
+                    let mut buf = [0u8; 64];
+                    while Instant::now() < deadline {
+                        let _ = client.send_to(&register, ("127.0.0.1", free_port));
+                        if let Ok((n, _)) = client.recv_from(&mut buf) {
+                            if n >= CaHeader::SIZE {
+                                if let Ok(h) = CaHeader::from_bytes(&buf[..n]) {
+                                    if h.cmmd == CA_PROTO_REPEATER_CONFIRM {
+                                        return true;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    false
+                })
+                .await
+                .unwrap_or(false);
+                tokio::time::sleep(Duration::from_millis(250)).await;
+                repeater.abort();
+                drop(held);
+                confirmed
+            })
+        });
+
+        assert!(
+            confirmed,
+            "the repeater never confirmed the registration; captured stdout \
+             {out:?} stderr {err:?}"
+        );
+        assert!(
+            out.is_empty(),
+            "a repeater at debug 0 must write nothing to stdout — it shares \
+             one with the CA client tool that started it; got {out:?}"
+        );
+    }
+
+    /// The bytes and the stream of three `repeater.cpp` diagnostics, taken
+    /// off a live `run_repeater_with_debug` at `-d 1` — at level 0 the
+    /// facility is shut, which `repeater_is_silent_at_debug_zero` covers.
+    ///
+    /// * `CA Repeater: Attached and initialized` — `repeater.cpp:571`, a
+    ///   `debugPrintf` inside no `if (debug)`. The port put it on stderr.
+    /// * `New client on port %u` — `repeater.cpp:133`, the `repeaterClient`
+    ///   constructor, `#ifdef DEBUG` at the pin and `if (debug)` after
+    ///   `e271752158dd`.
+    /// * `Verified %u active clients` — post-pin, added by `e271752158dd`
+    ///   at the tail of `verifyClients` (`repeater.cpp:310-325` at
+    ///   R7.0.10), and that is the only function in the file that prints
+    ///   it; the port also printed it from `fanOut` and from a
+    ///   registration wrapper.
     // RTEMS-EXEC-MODEL-ALLOW(1): builds and enters its own multi-thread
     // runtime rather than taking an ambient one; green on the exec
     // backend.
@@ -624,7 +727,7 @@ mod tests {
         unsafe { std::env::set_var("EPICS_CA_REPEATER_PORT", free_port.to_string()) };
 
         // `verifyClients` bind-tests the client's own address, and C's
-        // order is confirm-then-sweep (`repeater.cpp:453-486`) — so the
+        // order is confirm-then-sweep (`repeater.cpp:443-476`) — so the
         // socket has to stay open past the CONFIRM or the sweep correctly
         // reaps it. Share it rather than moving it into the blocking task,
         // whose return would close it.

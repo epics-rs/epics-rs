@@ -23,6 +23,66 @@ const TERMINALS: &[(&str, copt::Terminal)] = &[
     ("version", copt::Terminal::Version),
 ];
 
+/// C `camonitor.c:45-92` `usage()`, byte for byte. C substitutes two
+/// COMPILE-TIME constants, not the running configuration: `%f` of
+/// `DEFAULT_TIMEOUT` and `%u` of `CA_PRIORITY_MAX`, so `camonitor -w 5 -h` still
+/// advertises the 1.000000 s default. Written to stderr by
+/// `copt::Scan::finish` on the `Terminal::Usage` arm (`camonitor.c:226-228`).
+fn usage() -> String {
+    format!(
+        r#"
+Usage: camonitor [options] <PV name> ...
+
+  -h:       Help: Print this message
+  -V:       Version: Show EPICS and CA versions
+Channel Access options:
+  -w <sec>: Wait time, specifies CA timeout, default is {timeout:.6} second(s)
+  -m <msk>: Specify CA event mask to use.  <msk> is any combination of
+            'v' (value), 'a' (alarm), 'l' (log/archive), 'p' (property).
+            Default event mask is 'va'
+  -p <pri>: CA priority (0-{max}, default 0=lowest)
+Timestamps:
+  Default:  Print absolute timestamps (as reported by CA server)
+  -t <key>: Specify timestamp source(s) and type, with <key> containing
+            's' = CA server (remote) timestamps
+            'c' = CA client (local) timestamps (shown in '()'s)
+            'n' = no timestamps
+            'r' = relative timestamps (time elapsed since start of program)
+            'i' = incremental timestamps (time elapsed since last update)
+            'I' = incremental timestamps (time since last update, by channel)
+            'r', 'i' or 'I' require 's' or 'c' to select the time source
+Enum format:
+  -n:       Print DBF_ENUM values as number (default is enum string)
+Array values: Print number of elements, then list of values
+  Default:  Request and print all elements (dynamic arrays supported)
+  -# <num>: Request and print up to <num> elements
+  -S:       Print arrays of char as a string (long string)
+Floating point format:
+  Default:  Use %g format
+  -e <num>: Use %e format, with a precision of <num> digits
+  -f <num>: Use %f format, with a precision of <num> digits
+  -g <num>: Use %g format, with a precision of <num> digits
+  -s:       Get value as string (honors server-side precision)
+  -lx:      Round to long integer and print as hex number
+  -lo:      Round to long integer and print as octal number
+  -lb:      Round to long integer and print as binary number
+Integer number format:
+  Default:  Print as decimal number
+  -0x:      Print as hex number
+  -0o:      Print as octal number
+  -0b:      Print as binary number
+Alternate output field separator:
+  -F <ofs>: Use <ofs> to separate fields in output
+
+Example: camonitor -f8 my_channel another_channel
+  (doubles are printed as %f with precision of 8)
+
+"#,
+        timeout = epics_ca_rs::cli::DEFAULT_CLI_TIMEOUT_SECS,
+        max = epics_ca_rs::copt::CA_PRIORITY_MAX,
+    )
+}
+
 /// Mirror of C `camonitor` flags. The flag set is mostly the same as
 /// `caget` minus `-t`/`-a`/`-d` and plus `-m`/`-t<key>`. We model the
 /// CLI to match — including the parity-only flags so existing scripts
@@ -220,8 +280,7 @@ impl Args {
 async fn main() {
     // Parse via ArgMatches (not the plain derive) so the command-line order of
     // `-e`/`-f`/`-g` is recoverable for C's last-valid-wins rule (W10-B2).
-    let cmd = Args::command();
-    let parsed = TOOL.get_matches(cmd.clone());
+    let parsed = TOOL.get_matches(Args::command());
     let matches = parsed.matches();
     let args = Args::from_arg_matches(matches).expect("clap validated the arguments");
 
@@ -242,7 +301,7 @@ async fn main() {
     let spec = parse_timestamp_spec(&mut scan, "timestamp_key");
     // End of C's getopt loop: warnings out in command-line order, then `-h` /
     // `-V` if the loop reached one (R13-26).
-    scan.finish(&cmd, &epics_ca_rs::protocol::version_info(), TERMINALS);
+    scan.finish(&usage(), &epics_ca_rs::protocol::version_info(), TERMINALS);
 
     if args.pv_names.is_empty() {
         TOOL.no_pv_name();
@@ -280,9 +339,20 @@ async fn main() {
     let prev_all_server = Arc::new(std::sync::Mutex::new(None::<SystemTime>));
     let prev_all_client = Arc::new(std::sync::Mutex::new(None::<SystemTime>));
 
+    // C `camonitor.c:392-395` calls `create_pvs` itself — not the
+    // `connect_pvs` barrier, because camonitor has no all-channels wait —
+    // and returns its code before the event loop starts. The name gate is
+    // the same one, so it lives in the same owner.
+    let channels = match epics_ca_rs::cli::create_pvs(&client, &args.pv_names, priority) {
+        Ok(channels) => channels,
+        Err(e) => {
+            eprintln!("{e}");
+            std::process::exit(1);
+        }
+    };
+
     let mut handles = Vec::new();
-    for (i, pv_name) in args.pv_names.iter().enumerate() {
-        let channel = client.create_channel_with_priority(pv_name, priority);
+    for (i, (pv_name, channel)) in args.pv_names.iter().zip(channels).enumerate() {
         let pv = pv_name.clone();
         let flag = connected_flags[i].clone();
         let fmt = fmt.clone();
@@ -760,6 +830,21 @@ fn render_timestamp(
 
 #[cfg(test)]
 mod tests {
+
+    /// Measured against `camonitor -h` from EPICS 7.0.10.1-DEV: 2193 bytes on
+    /// stderr, byte for byte. The length is pinned because the failure this
+    /// guards against — rendering the block through clap instead — changes
+    /// every line of it.
+    #[test]
+    fn the_usage_block_is_cs_text_not_claps() {
+        let u = super::usage();
+        assert!(u.starts_with("\nUsage: camonitor [options] <PV name> ...\n"));
+        // C prints the COMPILE-TIME constants, not the running configuration.
+        assert!(u.contains("default is 1.000000 second(s)"));
+        assert!(u.contains("(0-99, default 0=lowest)"));
+        assert!(u.ends_with("\n\n"), "C's block closes with a blank line");
+        assert_eq!(u.len(), 2193);
+    }
     use super::{
         Args, TOOL, TimestampKind, TimestampSpec, TimestampState, parse_event_mask,
         parse_timestamp_spec, render_timestamp,

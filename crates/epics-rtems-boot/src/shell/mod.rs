@@ -164,10 +164,12 @@ pub fn log_priority_names() -> Vec<String> {
 /// this is the whole command and it runs — and is tested — on the host.
 ///
 /// `tzset` is declared directly rather than through the `libc` crate, which
-/// this package takes only on the embedded targets. It is POSIX and is defined
-/// by the C library of every target this workspace builds, so the declaration
-/// leaves no undefined symbol anywhere — unlike an `extern` for an RTEMS
-/// symbol, which is why those live behind the backend.
+/// this package takes only on the embedded targets. Every C library this
+/// workspace builds against defines the function, but the MSVC CRT exports it
+/// as `_tzset`, so the declaration carries that spelling on Windows; without it
+/// the link fails with `LNK2019: unresolved external symbol tzset`. The call
+/// itself is one line on every target — unlike an `extern` for an RTEMS symbol,
+/// which is why those live behind the backend.
 ///
 /// # Safety
 ///
@@ -178,6 +180,7 @@ pub fn log_priority_names() -> Vec<String> {
 /// environment for the duration.
 pub unsafe fn zoneset(zone: Option<&str>) -> Result<(), ShellError> {
     unsafe extern "C" {
+        #[cfg_attr(windows, link_name = "_tzset")]
         fn tzset();
     }
 
@@ -343,6 +346,15 @@ mod tests {
             funnel_code().filter(|l| l.contains("mod backend;")).count(),
             "every `#[cfg]` in the funnel must be a backend selection"
         );
+        // A `cfg_attr` that only spells a C symbol is not a second fork: the
+        // call site stays one line on every target. It is still the one place
+        // the funnel names an OS, so the exception is pinned rather than left
+        // open for the next one to slip in beside it.
+        let named: Vec<&str> = funnel_code()
+            .filter(|l| l.contains("#[cfg_attr("))
+            .map(str::trim)
+            .collect();
+        assert_eq!(named, ["#[cfg_attr(windows, link_name = \"_tzset\")]"]);
     }
 
     /// Every backend file, paired with its contents — the census below is only

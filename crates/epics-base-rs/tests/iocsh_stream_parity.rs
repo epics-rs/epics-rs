@@ -13,6 +13,12 @@
 //! The port paints the same escapes only when `use_ansi_color` says so,
 //! a deliberate deviation from C painting unconditionally, so this
 //! compares the stripped streams on both sides.
+//!
+//! Unix only: what is captured is the process console, and the only way to
+//! capture it is to point fds 1 and 2 somewhere else and put them back. There
+//! is no fd 2 on Windows, and `libc` is a `cfg(unix)` dependency of this crate.
+
+#![cfg(unix)]
 
 use std::io::Write;
 use std::os::fd::AsRawFd;

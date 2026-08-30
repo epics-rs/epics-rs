@@ -23,6 +23,12 @@
 //!
 //! `fprintf(stderr, ...)` and not `errlogPrintf`, so this reads the console
 //! rather than a listener.
+//!
+//! Unix only: reading that console means pointing fd 2 somewhere else and
+//! putting it back. There is no fd 2 on Windows, and `libc` is a `cfg(unix)`
+//! dependency of this crate.
+
+#![cfg(unix)]
 
 use std::collections::HashMap;
 

@@ -507,7 +507,7 @@ impl ParamList {
     /// Strict variant — returns [`AsynError::ParamUndefined`] when the
     /// entry has never been set. C parity:
     /// `paramVal::getDouble` (`paramVal.cpp:259-266`) +
-    /// `paramList::getDouble` (`asynPortDriver.cpp:383-401`).
+    /// `paramList::getDouble` (`asynPortDriver.cpp:383-403`).
     pub fn get_float64_strict(&self, index: usize, addr: i32) -> AsynResult<f64> {
         let entry = self.get_entry(index, addr)?;
         let value = entry.value.as_float64()?;
@@ -1204,7 +1204,7 @@ impl ParamList {
     /// C has one `paramList` per address and reports the one it was handed; here
     /// one list holds every address, so the address is the argument. It takes no
     /// detail level because C's does not use it: `paramVal::report` prints the
-    /// same line whatever `details` says (paramVal.cpp:296-330), and the only
+    /// same line whatever `details` says (paramVal.cpp:296-372), and the only
     /// thing the level decides is *how many* lists are printed — which is
     /// [`crate::port::PortDriverBase::report_params`]'s decision, and stays there.
     pub fn report(&self, out: &mut dyn std::fmt::Write, addr: i32) {

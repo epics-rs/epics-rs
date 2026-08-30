@@ -18,8 +18,28 @@
 //! | `epics-base` | `R7.0.10` |
 //! | `modbus` | `R3-4-10-gb1009d0` |
 //! | `motor` | `R7-4-5-g78b474cd` |
+//! | `motor/modules/motorSmarAct` | `843a49d880bcfb0e9a41d4386ae27d2fff12d132` |
+//! | `motor/modules/motorNewport` | `e6416024432ae0384da6e376438f658278a8d036` |
 //! | `ADCore` | `R3-14-111-g6c53844e` |
 //! | `busy` | `R1-7-4-6-g2dfe92d` |
+//!
+//! **A submodule needs its own row; it does not inherit the parent's.**
+//! `motorSmarAct` and `motorNewport` are gitlinks under `motor`, so
+//! `R7-4-5-g78b474cd` says nothing about which revision of
+//! `smarActMCSMotorDriver.cpp` a citation resolves at — the vendor drivers
+//! move on their own release cadence between two `motor` tags. Read a
+//! submodule's pin from the parent's gitlink
+//! (`git ls-tree <motor pin> modules/<name>`), never from the submodule
+//! checkout's `HEAD`, which is free to run ahead exactly as the top-level
+//! trees do. A tree cited here with no row of its own is unanchored, whether
+//! or not something above it in the filesystem has one.
+//!
+//! Those two rows carry a bare SHA where every other row carries a `git
+//! describe` string, because for a gitlink the describe string is not an
+//! anchor: `git submodule status` renders the superproject's view
+//! (`R2-1-19-g843a49d`, `R1-2-1-54-ge641602`) while the submodule's own
+//! `git describe` answers `R2-1-2` and `R1-3`. Neither string resolves
+//! inside the tree the citation is read against, so the SHA is the pin.
 //!
 //! **Resolve by symbol at the pin; the line is a hint.** Find the named
 //! function, struct, macro or field first, and treat the line number as a hint

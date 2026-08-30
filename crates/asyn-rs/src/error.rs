@@ -126,7 +126,7 @@ pub enum AsynError {
     /// routes and mean opposite things. A refusal is `queueRequest`'s *return
     /// value* — the callback never runs, so nothing it implies happened: no
     /// bytes moved, no option was written, no readback, no `monitorStatus`
-    /// (asynRecord.c:571-576 reports `pasynUser->errorMessage` and frees the
+    /// (asynRecord.c:571-578 reports `pasynUser->errorMessage` and frees the
     /// user). A driver error arrives *inside* the callback, which did run and
     /// whose tail C still executes. Collapsing them into one variant made a
     /// refused `special()` report as a callback that ran (R14-46).

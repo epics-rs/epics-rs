@@ -78,7 +78,7 @@ fn an_auto_connect_port_is_up_the_moment_it_is_created() {
 
 /// The `noAutoConnect` port is the negative control: C's `waitConnect` is gated
 /// on `pport->dpc.autoConnect` (asynManager.c:2135) and its timer callback on
-/// the same flag (:3257), so registration must leave this port down and must not
+/// the same flag (:3258), so registration must leave this port down and must not
 /// stall waiting for a connect that is never queued.
 #[test]
 fn a_no_auto_connect_port_stays_down_at_registration() {

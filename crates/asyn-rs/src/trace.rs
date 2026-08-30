@@ -1637,7 +1637,7 @@ mod tests {
 
     /// R17-49 on the trace line. The ESCAPE block runs (C gates it on
     /// `nBytes > 0`, asynManager.c:3153) but `epicsStrPrintEscaped` writes
-    /// nothing for a payload whose first byte is NUL (epicsString.c:236-237),
+    /// nothing for a payload whose first byte is NUL (epicsString.c:237-238),
     /// so a `FILE *` sink gets an *empty* data line — the block's newline and
     /// no bytes. The errlog sink escapes it as `\0…` instead.
     #[test]

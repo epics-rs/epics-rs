@@ -138,18 +138,25 @@ mod platform {
     /// `.../termios.h` in the BSP sysroot. Every line below cites the header
     /// it was read from; nothing here is inferred from another platform.
     ///
-    /// Those citations are **not re-checkable on a host without the RTEMS
-    /// toolchain**, and this machine is one: `find / -name '_termios.h'` and
-    /// `find / -type d -name 'arm-rtems*'` both come back empty of any
-    /// toolchain (the only `arm-rtems*` hits are unrelated test fixtures under
-    /// `/tmp`), as does `find / -type d -name 'rtems-libbsd'`. Install the BSP
-    /// sysroot before re-pinning any `_termios.h` / `_default_fcntl.h` line
-    /// number here; do not "verify" them against glibc's `termios.h`, whose
-    /// numbering is unrelated. The VxWorks half below has no such problem —
-    /// its sysroot *is* on this machine, under
-    /// `wrsdk-vxworks7-qemu-1.17.0/vxsdk/sysroot/{usr,krnl}/h/`, so
-    /// `sioLibCommon.h`, `sys/fcntlcom.h` and `UTILS_UNIX/termios.h` are
-    /// readable and were re-verified.
+    /// A local `find` for `_termios.h` comes back empty on a developer host,
+    /// which proves only that no toolchain is installed *there* — not that
+    /// these lines cannot be re-checked. They are re-checkable wherever
+    /// `RTEMS_BSP_PREFIX` names a BSP install, which `scripts/rtems-bsp.sh`
+    /// leaves at `rtems-bsp/<series>/arm-rtems<series>/include`. Read them
+    /// there, or copy the header out and read the copy; never edit a reference
+    /// tree, and never "verify" a line against glibc's `termios.h`, whose
+    /// numbering is unrelated.
+    ///
+    /// `sys/_termios.h` is byte-identical between series 6 and series 7, so
+    /// every `_termios.h` line cited below holds for both. That is a property
+    /// of this one header, established by reading both — not a general licence
+    /// to let one series stand in for the other.
+    ///
+    /// The VxWorks half below is readable on the developer host itself, under
+    /// `wrsdk-vxworks7-qemu-1.17.0/vxsdk/sysroot/{usr,krnl}/h/`. The RTP
+    /// (`usr/`) and kernel (`krnl/`) copies of `UTILS_UNIX/termios.h` are
+    /// byte-identical, so the `B*` ladder is the same whichever the build
+    /// reaches; `sioLibCommon.h` and `sys/fcntlcom.h` were re-verified there.
     #[cfg(target_os = "rtems")]
     mod imp {
         /// `_termios.h:226`: `typedef unsigned int speed_t;`. Its two
@@ -1056,7 +1063,7 @@ impl DrvAsynSerialPort {
         base.init_connected(false);
         base.auto_connect = true;
         // C passes `interruptProcess = 1` to `pasynOctetBase->initialize`
-        // (drvAsynSerialPort.c:1125): every successful octet read on this port fans out to
+        // (drvAsynSerialPort.c:1125-1126): every successful octet read on this port fans out to
         // its octet interrupt users, which is what drives a SCAN="I/O Intr"
         // record. See `PortDriverBase::octet_interrupt_process`.
         base.octet_interrupt_process = true;
@@ -1235,7 +1242,7 @@ impl PortDriver for DrvAsynSerialPort {
             self.saved_termios = Some(saved);
 
             // 3. Configure: push the cached termios — C `connectIt` calls
-            // `applyOptions(pasynUser, tty)` (drvAsynSerialPort.c:722), which
+            // `applyOptions(pasynUser, tty)` (drvAsynSerialPort.c:723), which
             // tcsetattr's `tty->termios` verbatim. The cache carries every
             // option set since configure, including ones set while the port
             // was down, so they take effect on this connect instead of being
@@ -1414,12 +1421,16 @@ impl PortDriver for DrvAsynSerialPort {
         self.io.flush(user)
     }
 
-    /// C `setOption` (drvAsynSerialPort.c:335-618): every supported key
-    /// mutates the **cached** termios (or `tty->baud`) unconditionally —
-    /// whether or not the port is open — and the single tail then pushes the
-    /// cache to the device when it is, restoring the previous cache if that
-    /// push fails. An option set while the port is down is therefore held and
-    /// applied at the next connect, exactly like one set while it is up.
+    /// C `setOption` (drvAsynSerialPort.c:239-619): every key that carries line
+    /// state mutates the **cached** termios (or `tty->baud`) unconditionally —
+    /// whether or not the port is open — and the single tail (:599-616) then
+    /// pushes the cache to the device when it is, restoring the previous cache
+    /// if that push fails. An option set while the port is down is therefore
+    /// held and applied at the next connect, exactly like one set while it is
+    /// up. The two keys carrying no line state are `break`, a momentary action
+    /// on the fd that returns before ever reaching the tail (:507-528), and the
+    /// `rs485_*` family, cached in `tty->rs485` (:530-592) and pushed by the
+    /// tail's own `TIOCSRS485` ioctl (:606-615).
     ///
     /// The port previously mutated the *live* termios (tcgetattr → modify →
     /// tcsetattr) and skipped the write entirely when disconnected, so
@@ -1436,7 +1447,7 @@ impl PortDriver for DrvAsynSerialPort {
         let value = value.as_str();
 
         // C keeps `baudPrev`/`termiosPrev` for the applyOptions rollback
-        // (:341-346, :599-606). `platform::termios` is Copy, so this is the same
+        // (:254-256, :599-606). `platform::termios` is Copy, so this is the same
         // snapshot-and-restore.
         let baud_prev = self.baud;
         let termios_prev = self.termios;
@@ -2766,7 +2777,7 @@ mod tests {
     ///
     /// C seeds CLOCAL into `tty->termios` (drvAsynSerialPort.c:1077), lets
     /// `setOption` clear it in the cache unconditionally (:410-419), re-pushes
-    /// the cache at every connect via `applyOptions` (:105-130, :722) and reads
+    /// the cache at every connect via `applyOptions` (:105-130, :723) and reads
     /// it back from the cache (:169-170). The port instead mutated the live
     /// termios only when connected, stored nothing, force-set CREAD|CLOCAL at
     /// every connect, and hard-coded "N" for a disconnected readback — so

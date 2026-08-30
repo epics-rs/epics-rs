@@ -124,7 +124,7 @@ fn an_installed_eos_interpose_serves_a_driver_that_never_dispatches_it() {
 }
 
 /// The write side of the same chain: `asynInterposeDelay`, pushed from iocsh
-/// after configure (asynInterposeDelay.c:187,221-234), writes one character at a
+/// after configure (asynInterposeDelay.c:187,215-237), writes one character at a
 /// time on *any* port. The driver below sees three one-byte writes; before the
 /// fix the layer was never entered and it saw one three-byte write.
 #[test]

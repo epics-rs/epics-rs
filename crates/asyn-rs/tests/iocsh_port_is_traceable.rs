@@ -2,7 +2,8 @@
 //! — must come up with a trace configuration and an exception list.
 //!
 //! In C those are properties of the port itself: `registerPort` calls
-//! `tracePvtInit(&pport->dpc.trace)` (asynManager.c:503) and initialises
+//! `dpCommonInit` (asynManager.c:2066), which runs
+//! `tracePvtInit(&pdpCommon->trace)` (:528) and initialises
 //! `dpc.exceptionUserList`, which `announceExceptionOccurred` walks
 //! (asynManager.c:611-637). There is no way to register a port without them.
 //!

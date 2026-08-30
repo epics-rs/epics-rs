@@ -373,9 +373,10 @@ pub struct AsynDeviceSupport {
     /// the periodic record process drains the arithmetic mean — C
     /// `interruptCallbackAverage` (devAsynInt32.c:647-710 /
     /// devAsynFloat64.c:464-521) + `processAiAverage` (devAsynInt32.c:887-928 /
-    /// devAsynFloat64.c:708-755). Only the periodic-SCAN model (mean of all
-    /// samples since the last process) is ported; the I/O Intr SVAL-decimation
-    /// model is a documented residual.
+    /// devAsynFloat64.c:708-755). Both of C's models are ported: the
+    /// periodic-SCAN mean of every sample since the last process, and the
+    /// `SCAN="I/O Intr"` SVAL-decimation model that emits one mean per SVAL
+    /// samples (devAsynInt32.c:673-702, see `AverageState::num_to_average`).
     average: Option<Arc<AverageState>>,
     /// RAII handle for the averaging synchronous interrupt callback — dropping
     /// unregisters it. Distinct from `interrupt_sub` (the mailbox/value path):
@@ -1987,8 +1988,11 @@ impl DeviceSupport for AsynDeviceSupport {
                 if let Ok(result) = self.handle.submit_blocking(op, user) {
                     // Seed the output record's value only on a successful read,
                     // mirroring C initAo/initLongout/initMbbo: `if (status ==
-                    // asynSuccess) { pao->rval = value } return
-                    // INIT_DO_NOT_CONVERT` (devAsynInt32.c:955-959, :1080-1082).
+                    // asynSuccess) { pao->rval = value; return INIT_OK; }` with
+                    // `INIT_DO_NOT_CONVERT` the FAILURE fall-through
+                    // (initAo devAsynInt32.c:955-959, initMbbo :1295-1299;
+                    // initLo, which has no RVAL to convert, stores VAL under the
+                    // same guard and returns INIT_OK either way, :1082-1086).
                     // A non-success initial read leaves the .db default — the
                     // init-time member of the aux_status value-store family
                     // (process-time members gated in the ring/polled/average
@@ -2237,7 +2241,7 @@ impl DeviceSupport for AsynDeviceSupport {
                     // No samples since the last process. C `processAiAverage`
                     // sets UDF_ALARM/INVALID, sets the record's `udf = 1` and
                     // returns -2 with VAL untouched — devAsynInt32.c:900-904,
-                    // devAsynFloat64.c:721-725, devAsynInt64.c:829-833.
+                    // devAsynFloat64.c:721-725, devAsynInt64.c:827-831.
                     // `undefined()` is that -2: it skips the RVAL→VAL convert
                     // so VAL keeps its previous value, suppresses the framework's
                     // per-cycle UDF re-derive (which `aiRecord.c:161` gates on
@@ -2291,7 +2295,7 @@ impl DeviceSupport for AsynDeviceSupport {
                 // Direction-aware default for the transport-status mapping: C
                 // `asynStatusToEpicsAlarm` takes READ_ALARM for input device
                 // support (processAi, devAsynInt32.c:844) and WRITE_ALARM for
-                // scalar output readback (processBo/Lo/Mbbo, :1201). Array dsets
+                // scalar output readback (processBo/Lo/Mbbo, :1219). Array dsets
                 // use READ_ALARM even for aao output (devAsynXXXArray.cpp's
                 // single shared process(), :330-331), so an array iface is
                 // always READ_ALARM; otherwise an asyn:READBACK output is
@@ -2320,8 +2324,9 @@ impl DeviceSupport for AsynDeviceSupport {
                 self.last_ts = Some(ci.timestamp);
                 // C gates the value store on the transport status:
                 // `if (result.status == asynSuccess) { pr->rval = … } else
-                // return -1` (processAi devAsynInt32.c:844-855, processBo
-                // :1201-1204), and the array process() copies bptr/nord only
+                // return -1` (processAi devAsynInt32.c:844-855; processBo
+                // stores at :1201-1204 and returns -1 at :1229-1234), and the
+                // array process() copies bptr/nord only
                 // `if (rp->status == asynSuccess)` (devAsynXXXArray.cpp:317).
                 // On a transport error keep the prior value (skip the store);
                 // `read_outcome` stays `failed()` so the record skips the
@@ -2626,8 +2631,11 @@ impl DeviceSupport for AsynDeviceSupport {
         }
 
         // Averaging device support (asynInt32Average / asynFloat64Average):
-        // register an ALWAYS-ON accumulating callback regardless of SCAN (C
-        // enables the averaging callback unconditionally, devAsynInt32.c:386-394).
+        // register an ALWAYS-ON accumulating callback regardless of SCAN. C
+        // registers it once, in `initAiAverage` (devAsynInt32.c:870-872), and
+        // `getIoIntInfo` then leaves it alone — "for aiAverage we don't enable
+        // callbacks here, because they are always enabled in any scan mode",
+        // `if (!pPvt->isAiAverage)` (:385-394).
         // It is SYNCHRONOUS (register_sync_callback / C registerInterruptUser),
         // not a mailbox subscription: averaging must observe every sample, and
         // the mailbox coalesces rapid updates to the latest — which would drop
@@ -2854,8 +2862,10 @@ impl DeviceSupport for AsynDeviceSupport {
     ///
     /// Averaging records (`average.is_some()`) also need the driver-callback
     /// path wired regardless of SCAN — the accumulating interrupt must run on
-    /// every driver sample while the record scans periodically. C enables the
-    /// averaging callback always, independent of SCAN (devAsynInt32.c:386-394).
+    /// every driver sample while the record scans periodically. C registers that
+    /// callback in `initAiAverage` (devAsynInt32.c:870-872), outside the SCAN
+    /// path entirely; `getIoIntInfo` skips it (`if (!pPvt->isAiAverage)`,
+    /// :385-394), which is what makes it independent of SCAN.
     /// `io_intr_receiver` returns `None` for the average case, so this only
     /// arms the accumulating subscription; it spawns no reprocess task (the
     /// record scans on its own period, not per callback).
@@ -6345,7 +6355,7 @@ mod tests {
 
     /// Contrast with the input case: a scalar `asyn:READBACK` OUTPUT record takes
     /// WRITE_ALARM for the `asynError`/unknown default (processBo, devAsynInt32.c:
-    /// 1201). Same shared ring read, direction picked from `asyn_readback`.
+    /// 1219). Same shared ring read, direction picked from `asyn_readback`.
     #[test]
     fn io_intr_readback_output_error_default_is_write_alarm() {
         use epics_base_rs::server::records::longin::LonginRecord;
@@ -6558,9 +6568,12 @@ mod tests {
 
     /// Init-time output readback (asyn:READBACK) seeds the record's value only on
     /// a successful read, mirroring C initAo/initLongout/initMbbo: `if (status ==
-    /// asynSuccess) { pao->rval = value } return INIT_DO_NOT_CONVERT`
-    /// (devAsynInt32.c:955-959, :1080-1082). A non-success initial read leaves the
-    /// .db default — the init-time member of the aux_status value-store family.
+    /// asynSuccess) { pao->rval = value; return INIT_OK; }`, with
+    /// `INIT_DO_NOT_CONVERT` the FAILURE fall-through (initAo
+    /// devAsynInt32.c:955-959, initMbbo :1295-1299; initLo stores VAL under the
+    /// same guard and returns INIT_OK either way, :1082-1086). A non-success
+    /// initial read leaves the .db default — the init-time member of the
+    /// aux_status value-store family.
     #[test]
     fn init_readback_transport_error_keeps_db_default() {
         use epics_base_rs::server::records::longout::LongoutRecord;
@@ -6838,7 +6851,7 @@ mod tests {
 
     /// An `asynUInt32Digital` I/O Intr `mbbiDirect` input (its only dset,
     /// `asynMbbiDirectUInt32Digital`): `processMbbiDirect` sets
-    /// `rval = value & mask` (devAsynUInt32Digital.c:1031); mbbiDirectRecord
+    /// `rval = value & mask` (devAsynUInt32Digital.c:1032); mbbiDirectRecord
     /// resolves VAL = (masked >> SHFT) and the bit fields. Before the fix the
     /// raw landed in VAL verbatim (no MASK, no SHFT, wrong bits).
     #[test]

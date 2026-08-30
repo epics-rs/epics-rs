@@ -161,9 +161,11 @@ fn stop_port_actor(
 ///
 /// Arming first is the whole point: a connect that lands between "am I
 /// connected?" and "start waiting" would be missed by any caller that checked
-/// the flag first. So [`Self::arm`] registers the callback, the caller may then
-/// short-circuit on an already-connected port (C :3308-3311), and
-/// [`Self::wait`] blocks for the rest. Both waiters in the crate — port
+/// the flag first. C has that race — it reads `pport->dpc.connected` at
+/// :3308-3311 and only arms afterwards, at :3316 — so here [`Self::arm`]
+/// registers the callback first, the caller may then short-circuit on an
+/// already-connected port, and [`Self::wait`] blocks for the rest. That
+/// ordering is a deliberate deviation. Both waiters in the crate — port
 /// registration and the iocsh `asynWaitConnect` — go through it, so neither can
 /// grow its own race.
 pub struct ConnectWaiter {
@@ -232,9 +234,9 @@ pub fn create_port_runtime<D: PortDriver>(
 /// survives anywhere in the process.
 ///
 /// C parity: `registerPort` → `registerDriver` creates the port thread at
-/// `asynManager.c:2081`, and on failure (:2082-2092) prints, unwinds every
+/// `asynManager.c:2079-2080`, and on failure (:2081-2091) prints, unwinds every
 /// resource it had built for the port, and returns `asynError` **before**
-/// `ellAdd(&pasynBase->asynPortList, ...)` (:2095) — the port never enters the
+/// `ellAdd(&pasynBase->asynPortList, ...)` (:2094) — the port never enters the
 /// list. The unwind is this function's `Err` return: the `PortActor` (which
 /// owns the driver) is dropped along with the closure `Builder::spawn`
 /// rejected, and the one resource that is *not* local — the connect-exception
@@ -242,7 +244,7 @@ pub fn create_port_runtime<D: PortDriver>(
 /// by [`ConnectWaiter`]'s `Drop`.
 ///
 /// A caller that can report the failure returns it, as
-/// `drvAsynIPPortConfigure` does (`drvAsynIPPort.c:1062-1069`: print,
+/// `drvAsynIPPortConfigure` does (`drvAsynIPPort.c:1033-1035`: print,
 /// `ttyCleanup`, `return -1`) — the iocsh command fails and the IOC boots on
 /// without that port. A caller with no error channel — one shaped like a C++
 /// constructor, returning the built port by value — uses
@@ -310,7 +312,7 @@ pub fn create_port_runtime_boxed(
     let event_tx_clone = event_tx.clone();
     let name_clone = port_name.clone();
 
-    // C's `waitConnect` (asynManager.c:2135, :3294-3337): registration waits on
+    // C's `waitConnect` (asynManager.c:2135, :3292-3337): registration waits on
     // the port's *connect exception* for at most `autoConnectTimeout`, so the
     // line of st.cmd after `drvAsynIPPortConfigure` already sees a live port.
     // The waiter is armed before the actor thread exists, so the connect it
@@ -367,11 +369,13 @@ pub fn create_port_runtime_boxed(
     };
 
     // C `registerPort` ends by arming the port's own process-exit callback —
-    // `epicsAtExit(destroyPortDriver, (void *)pport->portName)`
-    // (asynManager.c:2097) — so a port is wired into shutdown by the same call
-    // that brings it up, and no port creator has to remember to do it. This is
-    // that line: every port in this process, however it was made, is stopped by
-    // the IOC's shutdown owner (`epics_libcom_rs::runtime::exit`).
+    // `epicsAtExit(destroyPortDriver, (void *)pport->portName)` — but only for
+    // an `ASYN_DESTRUCTIBLE` port (asynManager.c:2096-2098); every other port
+    // in C simply survives to process exit with no teardown at all. This line
+    // arms it for EVERY port, a deliberate widening: the actor owns the driver,
+    // so the teardown a driver owes its device rides its `Drop` (below), and a
+    // port creator that forgot a capability bit would otherwise leak an MQTT
+    // session or leave a serial line open.
     //
     // Stopping the actor is the whole mechanism. The actor owns the driver
     // exclusively, so its thread ending drops the driver, and the driver's
@@ -379,7 +383,7 @@ pub fn create_port_runtime_boxed(
     // serial `disconnect`. Drivers therefore need to know nothing about
     // shutdown, which is C's arrangement too: `shutdownPort` fires
     // `asynExceptionShutdown` and leaves the destruction to the driver
-    // (asynManager.c:2300-2304).
+    // (asynManager.c:2301-2305).
     //
     // The callback holds the two channel ends, not the runtime handle: holding
     // a `PortHandle` would keep the port reachable, and so alive, for the life

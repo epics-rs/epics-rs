@@ -252,7 +252,7 @@ impl Capability {
 ///
 /// This is the parameter-library port's interface set — the analogue of C's
 /// `asynPortDriver`, which registers every standard interface its
-/// `interfaceMask` names (asynPortDriver.cpp:4070). A transport that speaks only
+/// `interfaceMask` names (asynPortDriver.cpp:4056-4071). A transport that speaks only
 /// bytes (an IP socket, a serial line) registers far fewer and must override
 /// [`crate::port::PortDriver::capabilities`] to say so, because asynRecord reads
 /// that declaration into OCTETIV / I32IV / UI32IV / F64IV / OPTIONIV / GPIBIV and
@@ -277,7 +277,7 @@ pub fn default_capabilities() -> Vec<Capability> {
         Capability::Option,
         // A parameter-library port resolves drvInfo → reason, so it registers
         // asynDrvUser, exactly as C `asynPortDriver` does
-        // (asynPortDriver.cpp:4070 `asynDrvUserType`).
+        // (asynPortDriver.cpp:4057, `asynDrvUserMask` -> `ifaceDrvUser`).
         Capability::DrvUser,
         Capability::Flush,
         Capability::Connect,

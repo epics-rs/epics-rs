@@ -451,7 +451,7 @@ mod tests {
         drv.base.create_param("VAL", ParamType::Int32).unwrap();
         // A port that accepts an EOS is one C configured with `processEosIn/
         // Out`, so `asynOctetBase::initialize` installed `asynInterposeEos`
-        // above the driver (asynOctetBase.c:169-171). A driver with no EOS
+        // above the driver (asynOctetBase.c:170-172). A driver with no EOS
         // methods and no such layer answers "not implemented" (R18-71).
         drv.base
             .install_octet_interpose(Box::new(crate::interpose::eos::EosInterpose::default()));

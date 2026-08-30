@@ -624,7 +624,7 @@ impl ClientSlot {
 }
 
 /// The accept half of the server port, detached from the driver so the listener
-/// thread can own it — C's `connectionListener` (drvAsynIPServerPort.c:290-384),
+/// thread can own it — C's `connectionListener` (drvAsynIPServerPort.c:284-386),
 /// which `drvAsynIPServerPortConfigure` starts at configure time (:711-714) and
 /// which is the *only* thing in C that accepts.
 ///
@@ -716,7 +716,7 @@ impl Acceptor {
                 // C :374-383 — the octet callbacks carry the child port name,
                 // not the payload. The listener walks the interrupt list and
                 // calls EVERY node unconditionally: there is no addr test here
-                // (unlike asynOctetBase.c:203-215, which does test addr). A
+                // (unlike asynOctetBase.c:202-210, which does test addr). A
                 // client landing in slot 3 must be announced to a listener that
                 // registered on addr 0, because "which slot" is the news.
                 self.interrupts.notify_octet(
@@ -881,9 +881,11 @@ impl DrvAsynIPServerPort {
             max,
             PortFlags {
                 // Single-device, like C: the listener registers plain
-                // `ASYN_CANBLOCK` (drvAsynIPServerPort.c:625-626) and its whole
-                // asynOctet method table is NULL (:118-122) — it is an interrupt
-                // source, not an I/O port. The per-client ports are separate
+                // `ASYN_CANBLOCK` (drvAsynIPServerPort.c:625-626) and a TCP
+                // listener's asynOctet table stays the all-NULL initializer
+                // (:118-123; C fills read/write/flush in only for SOCK_DGRAM,
+                // :652-656) — it is an interrupt source, not an I/O port.
+                // The per-client ports are separate
                 // single-device `drvAsynIPPortConfigure`d registrations
                 // (:688-694), which `make_subport` mirrors.
                 //
@@ -1822,7 +1824,7 @@ mod tests {
     use super::*;
 
     /// The listener thread is the only acceptor — C `connectionListener`
-    /// (drvAsynIPServerPort.c:290-384) — so a test observes an accept by waiting
+    /// (drvAsynIPServerPort.c:284-386) — so a test observes an accept by waiting
     /// for the slot to fill, not by driving the accept itself. Returns `idx`.
     fn wait_for_slot(srv: &DrvAsynIPServerPort, idx: usize) -> usize {
         let deadline = std::time::Instant::now() + Duration::from_secs(5);
@@ -2465,7 +2467,7 @@ mod tests {
     ///
     /// C `connectionListener` (drvAsynIPServerPort.c:374-383) walks the octet
     /// interrupt list and calls every node with the child port's name — there
-    /// is no addr test, unlike `asynOctetBase.c:203-215`. The boundary is
+    /// is no addr test, unlike `asynOctetBase.c:202-210`. The boundary is
     /// "announcement addr == subscriber addr" (slot 0) vs "announcement addr !=
     /// subscriber addr" (slot 1): both must be delivered. An addr filter here
     /// would silently hide every client after the first.

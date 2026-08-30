@@ -12,8 +12,8 @@
 //! The third argument is a LITERAL `DBE_VALUE | DBE_LOG`. It is not
 //! `monitor_mask`, so it never carries `recGblResetAlarms`'s alarm-transition
 //! bit — and `waveformRecord.c` posts BUSY nowhere at all (its only four
-//! `db_post_events` are NORD at `:148` and `:213`, HASH at `:319`, VAL at
-//! `:324`), so this is the whole of C's BUSY posting.
+//! `db_post_events` are NORD at `waveformRecord.c:148` and `:213`, HASH at
+//! `:319`, VAL at `:324`), so this is the whole of C's BUSY posting.
 //!
 //! The port reaches BUSY through the generic change-detecting subscriber walk,
 //! whose default aux mask is `alarm_bits | DBE_VALUE | DBE_LOG`
@@ -251,9 +251,10 @@ async fn the_first_arm_of_a_one_element_series_posts_nord_with_the_literal_mask(
 ///
 /// `devAsynXXXTimeSeries.h:179` is a bare `pwf->rarm = 0;` — no
 /// `db_post_events` follows it, and `waveformRecord.c`'s four post sites
-/// (NORD `:148`/`:213`, HASH `:319`, VAL `:324`) do not name RARM either. So
+/// (NORD `waveformRecord.c:148`/`:213`, HASH `:319`, VAL `:324`) do not name
+/// RARM either. So
 /// the whole of C's RARM posting is `dbPut`'s own field tail
-/// (`dbAccess.c:1408-1418`), which fires on the client's write and carries
+/// (`dbAccess.c:1406-1413`), which fires on the client's write and carries
 /// `DBE_VALUE | DBE_LOG`: a `camonitor TS:MASK.RARM` shows 1 when the caput
 /// lands and never returns to 0.
 ///

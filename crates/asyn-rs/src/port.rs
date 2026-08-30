@@ -92,7 +92,7 @@ use crate::error::{AsynError, AsynResult, AsynStatus};
 use crate::exception::{AsynException, ExceptionEvent, ExceptionManager};
 use crate::interfaces::InterfaceType;
 use crate::interpose::{
-    EomReason, OctetInterpose, OctetInterposeStack, OctetNext, OctetReadResult,
+    EomReason, EosSet, OctetInterpose, OctetInterposeStack, OctetNext, OctetReadResult,
 };
 use crate::interrupt::{InterruptManager, InterruptValue, OctetFanOut};
 use crate::param::{EnumEntry, InterruptReason, ParamList, ParamType, ParamValue};
@@ -254,8 +254,8 @@ pub struct PortDriverBase {
     /// `pasynOctetBase->initialize` (asynOctetBase.c:161-169). When set, every
     /// successful octet read fans the data out to the port's octet interrupt
     /// users (`readIt` → `callInterruptUsers`, :224-238). The stream drivers set
-    /// it — drvAsynIPPort.c:1055, drvAsynSerialPort.c:1125,
-    /// drvAsynSerialPortWin32.c:798, drvAsynFTDIPort.cpp:616 — and it is what
+    /// it — drvAsynIPPort.c:1055, drvAsynSerialPort.c:1125-1126,
+    /// drvAsynSerialPortWin32.c:798-799, drvAsynFTDIPort.cpp:616 — and it is what
     /// makes a `stringin`/`waveform` with `SCAN="I/O Intr"` on such a port
     /// process at all. Parameter-cache ports (echoDriver, USBTMC, GPIB,
     /// IP-server) pass 0 and are unaffected.
@@ -445,8 +445,10 @@ impl PortDriverBase {
         self.announcer.count()
     }
 
-    /// How many callbacks are registered on this port's exception list — C
-    /// `asynReport`'s `exceptionUsers` count (asynManager.c:1068-1070).
+    /// How many callbacks are registered on this port's exception list — the
+    /// `exceptionUsers` count `reportPrintPort` prints (asynManager.c:1068-1072).
+    /// `asynReport` itself is the iocsh command (asynShellCommands.c:587); it
+    /// reaches this through `asynManager`'s own `report` (:1136).
     pub fn exception_callback_count(&self) -> usize {
         self.announcer
             .sink
@@ -728,11 +730,16 @@ impl PortDriverBase {
     /// (the port is not yet registered, so no listeners exist).
     pub fn set_auto_connect(&mut self, yes: bool) {
         self.auto_connect = yes;
-        // asyn PR #217 (asynManager.c:2322-2324): flipping auto-connect ON
-        // while the port is down starts the connect timer, so the flip
-        // alone brings the port up. Pre-fix, the only autonomous attempt
-        // was the one exception-wake pass — one try, then silence until
-        // traffic or a disconnect edge armed the timer.
+        // A DEVIATION from the pinned C, adopting asyn PR #217
+        // (`87918f5e06b7`, "Queue connect timer on autoconnect enable"):
+        // flipping auto-connect ON while the port is down starts the connect
+        // timer, so the flip alone brings the port up. That PR is UNMERGED —
+        // it is on no upstream branch, so `autoConnectAsyn` at the pin
+        // (asynManager.c:2310-2324) sets `autoConnect` and announces, and
+        // nothing else; its `:2322-2324` are `exceptionOccurred` and the
+        // return. Stock asyn's only autonomous attempt is the one
+        // exception-wake pass — one try, then silence until traffic or a
+        // disconnect edge arms the timer (:2181-2182).
         if yes && !self.connected.get() {
             self.connect_retry_at = Some(Instant::now() + CONNECT_RETRY_INITIAL);
         }
@@ -749,9 +756,9 @@ impl PortDriverBase {
             dev.auto_connect = yes;
             !dev.connected
         };
-        // Same PR #217 arm as `set_auto_connect`: C keys the check on the
-        // dpCommon `findDpCommon` resolved — the DEVICE's — while the
-        // timer it starts is the port's (asynManager.c:2322-2324).
+        // Same PR #217 deviation as `set_auto_connect`, and the PR keys its
+        // check on the dpCommon `findDpCommon` resolved — the DEVICE's —
+        // while the timer it starts is the port's.
         if yes && device_down {
             self.connect_retry_at = Some(Instant::now() + CONNECT_RETRY_INITIAL);
         }
@@ -784,7 +791,7 @@ impl PortDriverBase {
     /// [`Self::check_enabled`]: C's `if(!pport->dpc.enabled) return asynDisabled`
     /// (:1541-1546) sits *above* `checkPortConnect` and is reached by every
     /// request, and its port thread refuses to run anything at all on a disabled
-    /// port (`portThread`, :802-805).
+    /// port (`portThread`, :806-809).
     ///
     /// The `ConnectCheck` can only come from [`AsynUser::connect_check`], so the
     /// waiver is available exactly to the requests C gives it to.
@@ -794,7 +801,7 @@ impl PortDriverBase {
     /// runs and nothing it implies happened. A caller must be able to tell that
     /// from a driver error raised *inside* a callback that did run — the record
     /// writes the refusal to ERRS and stops, where a driver error still gets the
-    /// callback's readback and `monitorStatus` tail (asynRecord.c:571-576 vs
+    /// callback's readback and `monitorStatus` tail (asynRecord.c:571-578 vs
     /// :788-900). This is the only place that stamps it.
     pub fn check_queue(&self, addr: i32, connect: ConnectCheck) -> AsynResult<()> {
         self.check_queue_inner(addr, connect)
@@ -1209,11 +1216,11 @@ impl PortDriverBase {
     /// parameter block of the driver's report.
     ///
     /// `details` is the level `report` was called with, **unshifted**: C hands
-    /// `reportParams` the same number it got (:3692), and the level decides one
+    /// `reportParams` the same number it got (:3693), and the level decides one
     /// thing only — how many address lists are printed (`details >= 2` → all
     /// `maxAddr` of them, else list 0 alone, :1804). The values are *not* a
     /// deeper level: `paramVal::report` prints name, type, value and status for
-    /// every parameter at every level (paramVal.cpp:296-330).
+    /// every parameter at every level (paramVal.cpp:296-372).
     ///
     /// Passing `level - 1` here put the whole block one level late — `asynReport
     /// 1` printed a bare count where C prints every parameter with its value, and
@@ -1364,8 +1371,8 @@ impl PortDriverBase {
     /// simultaneously), that collapse delivers a wrong-typed value to all but one
     /// of them. C's `drvModbusAsyn::readPoller` instead decodes the one register
     /// block **separately per interface** and invokes each interface's own
-    /// interrupt list (`int32`/`uInt32Digital`/`float64`,
-    /// drvModbusAsyn.cpp:1706/1736/1808). This is the analogue: the driver
+    /// interrupt list — `interruptStart` on `uInt32Digital`/`int32`/`float64`
+    /// at drvModbusAsyn.cpp:1674/1716/1788. This is the analogue: the driver
     /// decodes per interface and fires each value tagged with its `iface`, so the
     /// interrupt filter routes it only to records on that interface
     /// ([`InterruptFilter::iface`](crate::interrupt::InterruptFilter::iface)). `uint32_changed_mask` is the changed-bit
@@ -1375,7 +1382,7 @@ impl PortDriverBase {
     ///
     /// `aux_status` is the device I/O status this fire carries (C
     /// `pInterrupt->pasynUser->auxStatus`, set on every callback the poller
-    /// emits — `drvModbusAsyn.cpp:1697/1738/1774/1810/1880/1915`). A driver whose
+    /// emits — `drvModbusAsyn.cpp:1699/1738/1774/1810/1845/1880/1916`). A driver whose
     /// last acquisition failed still fires its interrupt lists, with the failing
     /// status, so I/O-Intr records go to READ/INVALID instead of freezing on the
     /// last good value; pass [`AsynStatus::Success`] on a clean acquisition.
@@ -1547,6 +1554,15 @@ fn eos_not_implemented(port: &str, method: &str) -> AsynError {
     }
 }
 
+/// C's `switch (eoslen)` refusal, verbatim: `"%s illegal eoslen %d"` with the
+/// port name and the length (asynInterposeEos.c:301-302, :354-355).
+fn illegal_eoslen(port: &str, eoslen: usize) -> AsynError {
+    AsynError::Status {
+        status: AsynStatus::Error,
+        message: format!("{port} illegal eoslen {eoslen}"),
+    }
+}
+
 pub trait PortDriver: Send + Sync + 'static {
     fn base(&self) -> &PortDriverBase;
     fn base_mut(&mut self) -> &mut PortDriverBase;
@@ -1668,7 +1684,7 @@ pub trait PortDriver: Send + Sync + 'static {
                     crate::escape::print_escaped(output)
                 );
             }
-            // C hands its own level straight to `reportParams` (:3692).
+            // C hands its own level straight to `reportParams` (:3693).
             base.report_params(out, level);
         }
         // There is no options block: `asynPortDriver::report` never prints one
@@ -2034,25 +2050,26 @@ pub trait PortDriver: Send + Sync + 'static {
     // ## EOS connect-wait policy (C asyn issue #103)
     //
     // C asyn `asynOctetSyncIO::setInputEos` / `setOutputEos`
-    // (`asynOctetSyncIO.c:300-321`, 346-367) call `lockPort` ahead of
-    // the actual `setInputEos` — `lockPort` waits up to the user's
-    // timeout for the port to be connected, by `epicsEventWait`-ing
-    // on the connect event published from `connectIt`. On IOC init
-    // and exit this serialises EOS configuration against the connect
-    // task, but it also means a `setInputEos` issued before the port
-    // has ever connected blocks the calling thread (issue #103
-    // captured the symptom: IOC startup pauses for the full asyn
-    // timeout when the device is off-line).
+    // (`asynOctetSyncIO.c:300-321`, `:346-367`) bracket the driver call in
+    // `lockPort`/`unlockPort`. `lockPort` is a plain mutex take —
+    // `defunct` check, then `synchronousLock` (asynManager.c:1789-1798) —
+    // and waits for no connection, so an EOS set blocks only behind
+    // whoever else holds the port. The connect wait lives elsewhere:
+    // `registerPort` calls `waitConnect(pport->pconnectUser,
+    // pasynBase->autoConnectTimeout)` on an autoConnect port
+    // (asynManager.c:2135), and `waitConnect` `epicsEventWaitWithTimeout`s
+    // on a connect event signalled from an exception handler (:3292-3336).
+    // That is what issue #103 sees: IOC startup pausing for the whole
+    // autoConnect timeout when the device is off-line.
     //
     // The Rust path here is purely in-memory: `set_input_eos` and
     // `set_output_eos` write the bytes into `PortDriverBase` and the
     // EOS interpose stack reads from those fields at next read/write
-    // time. No connect-wait, no lock contention with the connect
-    // task — so issue #103's symptom cannot reproduce. If a future
-    // refactor introduces a connect-gated EOS path (e.g. a driver
-    // that owns the EOS state inside its connect()-allocated
-    // resource), authors MUST keep the wait optional / bounded so
-    // the connect-wait failure mode doesn't return.
+    // time. No port lock, no connect-wait — so neither stall can reach an
+    // EOS call here. If a future refactor introduces a connect-gated EOS
+    // path (e.g. a driver that owns the EOS state inside its
+    // connect()-allocated resource), authors MUST keep the wait optional /
+    // bounded so the connect-wait failure mode doesn't return.
 
     // Every hook takes the `asynUser`, because in C every one of them does
     // (`asynOctet::setInputEos(void *ppvt, asynUser *pasynUser, ...)`,
@@ -2081,18 +2098,15 @@ pub trait PortDriver: Send + Sync + 'static {
         let addr = user.addr;
         let port = self.base().port_name.clone();
         let base = self.base_mut();
-        if !base.interpose_octet.set_input_eos(addr, eos) {
-            return Err(eos_not_implemented(&port, "setInputEos"));
-        }
         // The length rule belongs to the layer that stores the terminator
-        // (asynInterposeEos.c:299-303), so it is applied only once a layer
-        // has taken it — a port with no EOS support answers "not implemented"
-        // for every length, exactly as its Fail stub does.
-        if eos.len() > 2 {
-            return Err(AsynError::Status {
-                status: AsynStatus::Error,
-                message: format!("{port} illegal eoslen {}", eos.len()),
-            });
+        // (asynInterposeEos.c:299-303), so a port with no EOS support answers
+        // "not implemented" for every length, exactly as its Fail stub does,
+        // and a layer that owns the terminator refuses an illegal one without
+        // storing it.
+        match base.interpose_octet.set_input_eos(addr, eos) {
+            EosSet::NotTaken => return Err(eos_not_implemented(&port, "setInputEos")),
+            EosSet::IllegalLength => return Err(illegal_eoslen(&port, eos.len())),
+            EosSet::Stored => {}
         }
         base.eos_entry(addr).input = eos.to_vec();
         Ok(())
@@ -2111,14 +2125,10 @@ pub trait PortDriver: Send + Sync + 'static {
         let addr = user.addr;
         let port = self.base().port_name.clone();
         let base = self.base_mut();
-        if !base.interpose_octet.set_output_eos(addr, eos) {
-            return Err(eos_not_implemented(&port, "setOutputEos"));
-        }
-        if eos.len() > 2 {
-            return Err(AsynError::Status {
-                status: AsynStatus::Error,
-                message: format!("{port} illegal eoslen {}", eos.len()),
-            });
+        match base.interpose_octet.set_output_eos(addr, eos) {
+            EosSet::NotTaken => return Err(eos_not_implemented(&port, "setOutputEos")),
+            EosSet::IllegalLength => return Err(illegal_eoslen(&port, eos.len())),
+            EosSet::Stored => {}
         }
         base.eos_entry(addr).output = eos.to_vec();
         Ok(())
@@ -2269,7 +2279,7 @@ impl OctetNext for DriverOctetLink<'_> {
         if self.driver.base().octet_interrupt_process {
             let raw = &buf[..nbytes_transferred];
             // C's rule for a device read: `addr` decides, `reason` is never
-            // consulted (asynOctetBase.c:203-215). `reason` still rides on the
+            // consulted (asynOctetBase.c:202-210). `reason` still rides on the
             // value — C leaves `pasynUser->reason` on the callback's user — but
             // it selects nobody.
             self.driver.base().interrupts.notify_octet(
@@ -3137,7 +3147,7 @@ mod tests {
         let mut drv = TestDriver::new();
         // A single-device port takes its EOS from `asynInterposeEos`, which C
         // installs above the driver when the port is configured with
-        // `processEosIn/Out` (asynOctetBase.c:169-171); without it the
+        // `processEosIn/Out` (asynOctetBase.c:170-172); without it the
         // driver's own NULL method answers "not implemented" (R18-71).
         drv.base
             .install_octet_interpose(Box::new(crate::interpose::eos::EosInterpose::default()));
@@ -3153,9 +3163,12 @@ mod tests {
     /// `"<port> <method> not implemented"`. A `noProcessEos` port therefore
     /// *refuses* a terminator; it does not accept one and then never
     /// terminate. The two boundaries are the whole rule: no layer at all, and
-    /// a layer that takes only one direction (C installs `asynInterposeEos`
-    /// per flag, :169-171, and the interpose delegates the other direction
-    /// down, asynInterposeEos.c:293-295, :341-344).
+    /// a layer that takes only one direction (`asynInterposeEosConfig` stores
+    /// both flags, asynInterposeEos.c:128-138). C delegates only the *input*
+    /// direction down when `processEosIn == 0` — setInputEos :293-295,
+    /// getInputEos :318-320; its output pair (:344-363, :365-390) has no
+    /// `processEosOut` test and stores unconditionally, that flag gating
+    /// `writeIt` alone (:161-163).
     #[test]
     fn a_port_with_no_eos_layer_refuses_a_terminator() {
         use crate::interpose::eos::{EosConfig, EosInterpose};
@@ -3185,8 +3198,10 @@ mod tests {
         assert!(bare.get_input_eos(&AsynUser::default()).is_empty());
         assert!(bare.get_output_eos(&AsynUser::default()).is_empty());
 
-        // Boundary 2: the layer takes input only. IEOS lands, OEOS is refused
-        // by the same Fail-stub message, because nothing below took it.
+        // Boundary 2: the layer takes input only — and OEOS still lands.
+        // C's `setOutputEos` (:344-363) has no `processEosOut` test; the flag
+        // gates `writeIt` alone (:161-163), so the terminator is stored, read
+        // back, and simply never appended.
         let mut half = TestDriver::new();
         half.base_mut()
             .install_octet_interpose(Box::new(EosInterpose::with_processing(
@@ -3196,14 +3211,34 @@ mod tests {
             )));
         half.set_input_eos(&AsynUser::default(), b"\n").unwrap();
         assert_eq!(half.get_input_eos(&AsynUser::default()), b"\n");
+        half.set_output_eos(&AsynUser::default(), b"\r\n")
+            .expect("processOut = 0 still stores OEOS");
+        assert_eq!(half.get_output_eos(&AsynUser::default()), b"\r\n");
+
+        // Boundary 3: a length the storing layer refuses. C's `switch
+        // (eoslen)` answers `"<port> illegal eoslen <n>"` *before* assigning
+        // (:299-310, :352-362), so the terminator already stored still stands.
         let err = half
-            .set_output_eos(&AsynUser::default(), b"\r\n")
-            .expect_err("processOut = 0 must refuse OEOS");
+            .set_output_eos(&AsynUser::default(), b"\r\n\0")
+            .expect_err("eoslen 3 is past eosOut[2]");
+        assert!(err.to_string().contains("test illegal eoslen 3"), "{err}");
+        assert_eq!(half.get_output_eos(&AsynUser::default()), b"\r\n");
+        let err = half
+            .set_input_eos(&AsynUser::default(), b"abc")
+            .expect_err("eoslen 3 is past eosIn[2]");
+        assert!(err.to_string().contains("test illegal eoslen 3"), "{err}");
+        assert_eq!(half.get_input_eos(&AsynUser::default()), b"\n");
+
+        // Boundary 4: no layer at all refuses every length with the Fail
+        // stub's words, not the length rule's — the rule belongs to the layer
+        // that stores, and there is none.
+        let err = bare
+            .set_output_eos(&AsynUser::default(), b"\r\n\0")
+            .expect_err("a noProcessEos port refuses whatever the length");
         assert!(
             err.to_string().contains("setOutputEos not implemented"),
             "{err}"
         );
-        assert!(half.get_output_eos(&AsynUser::default()).is_empty());
     }
 
     /// R6-46 owner path: `set_connected` is the single transition owner, so
@@ -3990,7 +4025,7 @@ mod tests {
     /// unchanged (asynPortDriver.cpp:3693); `reportParams` prints list 0 at any
     /// level and all `maxAddr` lists at `details >= 2` (:1804); and
     /// `paramVal::report` prints name, type, value and status for every parameter
-    /// at every level (paramVal.cpp:296-330). Passing `level - 1` made
+    /// at every level (paramVal.cpp:296-372). Passing `level - 1` made
     /// `asynReport 1` print a bare count, and values appear only at 3.
     ///
     /// One case per threshold boundary: details 0 (no block), 1 (list 0, with
@@ -4090,7 +4125,7 @@ mod tests {
     ///
     /// C prints the EOS pair with `epicsStrPrintEscaped` (asynPortDriver.cpp:3687,
     /// 3690), whose table is `\a \b \f \n \r \t \v \\ \' \"`, the byte itself
-    /// when `isprint`, and `\xNN` otherwise (epicsString.c:230-262). The report's
+    /// when `isprint`, and `\xNN` otherwise (epicsString.c:230-269). The report's
     /// own two-case table wrote a binary terminator raw into stdout.
     #[test]
     fn report_escapes_the_eos_with_the_c_table() {

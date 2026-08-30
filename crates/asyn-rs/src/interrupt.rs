@@ -81,7 +81,7 @@ impl InterruptFilter {
     ///
     /// C's octet interrupt list is not keyed by `reason` **at all**:
     /// `asynOctetBase::callInterruptUsers` tests `if (addr == pinterrupt->addr)`
-    /// and consults `reason` nowhere (asynOctetBase.c:203-215). The only thing
+    /// and consults `reason` nowhere (asynOctetBase.c:202-210). The only thing
     /// that varies between C's two octet fan-outs is whether the addr test runs
     /// — see [`OctetFanOut`]. So this gate is the addr rule plus the
     /// per-interface routing every path shares; the `reason` and
@@ -133,7 +133,7 @@ impl InterruptFilter {
 /// C has exactly two octet fan-out rules, and they are different on purpose:
 ///
 /// - [`ByAddr`](Self::ByAddr) — `asynOctetBase::callInterruptUsers`
-///   (asynOctetBase.c:203-215): deliver to every registered octet user whose
+///   (asynOctetBase.c:202-210): deliver to every registered octet user whose
 ///   `addr` equals the read's. This is the rule for a device read.
 /// - [`EveryUser`](Self::EveryUser) — `drvAsynIPServerPort`'s listener thread
 ///   (drvAsynIPServerPort.c:374-383 for a new connection, :312-320 for a UDP
@@ -1063,7 +1063,7 @@ mod tests {
     }
 
     /// The two octet fan-out rules, at their boundaries. C's octet interrupt
-    /// list is keyed by `addr` alone (asynOctetBase.c:203-215) — `reason` is
+    /// list is keyed by `addr` alone (asynOctetBase.c:202-210) — `reason` is
     /// never consulted — and the IP-server listener applies no key at all
     /// (drvAsynIPServerPort.c:374-383).
     ///

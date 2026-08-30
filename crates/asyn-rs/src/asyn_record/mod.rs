@@ -209,7 +209,7 @@ fn menu_choice(choices: &'static [&'static str], index: i32) -> &'static str {
 
 /// The `asynBAUD` menu index for the text the driver reported — C `getOptions`'
 /// `for (i…) if (strcmp(optbuff, baud_choices[i]) == 0) pasynRec->baud = i;`
-/// (asynRecord.c:1868-1871), which walks the very array `setOption` writes from.
+/// (asynRecord.c:1866-1870), which walks the very array `setOption` writes from.
 /// Text that matches no choice reads back as index 0, "Unknown", exactly as C's
 /// `pasynRec->baud = 0` before the loop leaves it.
 ///
@@ -711,7 +711,7 @@ struct IoPlan {
     // C `performOctetIO`'s `inlen` (asynRecord.c:1503-1511): the capacity of the
     // IFMT-selected input buffer — `sizeof(ainp)` (= AINP_SIZE) for ASCII, IMAX
     // for Hybrid/Binary, which read into BINP. It is both the default read
-    // length and the overflow threshold (`:1602-1620`); `octet_buf_size` is the
+    // length and the overflow threshold (`:1602-1621`); `octet_buf_size` is the
     // per-request read length (`min(NRRD, inlen)` or `inlen`), so an
     // NRRD-limited short read can never reach `in_len` and never reads as
     // overflow — the same reason C's check is independent of NRRD.
@@ -767,7 +767,7 @@ impl IoOutcome {
     }
 
     /// The AQR-cancel outcome, C `special()`'s `wasQueued` branch
-    /// (asynRecord.c:397-400): `reportError(… "I/O request canceled")` **and**
+    /// (asynRecord.c:397-404): `reportError(… "I/O request canceled")` **and**
     /// `recGblSetSevr(pasynRec, STATE_ALARM, MAJOR_ALARM)`, then the forced
     /// completion callback. The message and the severity are one event in C and
     /// have one owner here, so a cancel cannot land in `ERRS` with the record
@@ -827,8 +827,9 @@ fn c_read_status_word(e: &crate::error::AsynError) -> &'static str {
 
 /// Raise `(stat, sevr)` into an [`IoOutcome`] mirroring `recGblSetSevr`
 /// (recGbl.c:258-261, [`rec_gbl_set_sevr`]): a new severity replaces the pending
-/// alarm only when it is **strictly higher**, so an equal-severity later call
-/// keeps the earlier `stat`. C's `performIO` relies on this when both the
+/// alarm only when it is **strictly higher** — `if (prec->nsev < new_sevr)` in
+/// the `recGblSetSevrVMsg` the wrapper delegates to (recGbl.c:242) — so an
+/// equal-severity later call keeps the earlier `stat`. C's `performIO` relies on this when both the
 /// write and read phase of a `Write_Read` fail at MAJOR — the write's stat is
 /// the one that survives.
 fn raise_io_alarm(out: &mut IoOutcome, stat: u16, sevr: AlarmSeverity) {
@@ -853,8 +854,13 @@ fn io_user(plan: &IoPlan) -> AsynUser {
         .with_queue_timeout(QUEUE_TIMEOUT)
 }
 
-/// Build the `asynUser` for a `Flush` phase. C `asynRecord.c` issues the flush
-/// with the same reason/addr but no transfer timeout.
+/// Build the `asynUser` for a `Flush` phase. C runs the flush on the record's
+/// one queued `pasynUser`, so it carries the same TMOT as the transfers
+/// (`pasynUser->timeout = pasynRec->tmot`, asynRecord.c:818; the flush call at
+/// :1521 does not touch it). The port leaves it unset because nothing reads it:
+/// no driver `flush` consults `user.timeout`, and `InterposeFlush` overwrites
+/// it with its own configured value and restores it (C does the same,
+/// asynInterposeFlush.c:117,122,131) into a per-phase user no later phase sees.
 fn flush_user(plan: &IoPlan) -> AsynUser {
     AsynUser::new(plan.reason)
         .with_addr(plan.addr)
@@ -924,9 +930,11 @@ fn io_phases(plan: &IoPlan) -> Vec<IoPhase> {
             ],
         };
     }
-    // C's `queueRequest` is unconditional: a NoI/O cycle occupies the queue and
-    // wakes the port thread exactly like a transfer, and only the callback body
-    // is empty (asynRecord.c:342-353, :827). Modelling it as "no phases" made
+    // C's `queueRequest` does not consult TMOD: a NoI/O cycle occupies the queue
+    // and wakes the port thread exactly like a transfer, and only the callback
+    // body is empty (asynRecord.c:342-353, :827). The `stateIdle` arm's one skip
+    // is `if(pasynRecPvt->gotValue) goto done` (`:341`), the I/O Intr readback —
+    // never a transfer mode. Modelling it as "no phases" made
     // the cycle touch the port at all — so the reconnect-nudge idiom poked
     // nothing and a down port raised no alarm (R18-87).
     if plan.tmod == TransferMode::NoIo {
@@ -1028,8 +1036,8 @@ fn io_phase_op(plan: &IoPlan, phase: IoPhase) -> RequestOp {
 
 /// The `asynUser` one phase submits with. C gives every transfer the record's
 /// TMOT (`pasynUser->timeout = pasynRec->tmot`, asynRecord.c:818) — including
-/// the GPIB commands, which run under the same queued user — and only the flush
-/// carries no transfer timeout.
+/// the GPIB commands and the flush, which run under that same queued user. The
+/// port carries it on every phase but the flush; see [`flush_user`].
 fn io_phase_user(plan: &IoPlan, phase: IoPhase) -> AsynUser {
     match phase {
         IoPhase::Flush => flush_user(plan),
@@ -1661,7 +1669,7 @@ const TFIL_UNKNOWN: &str = "Unknown";
 /// `Trace*Mask` constants, so the out-of-band trace post and the
 /// `process()`-path re-import (`read_trace_state`) cannot diverge. Field DBF
 /// types match `get_field`: the mask fields are `Long`, the bit fields are
-/// `DBF_MENU` (`menu(asynTRACE)`, asynRecord.dbd:481-577) and so are posted as
+/// `DBF_MENU` (`menu(asynTRACE)`, asynRecord.dbd:481-583) and so are posted as
 /// `Enum` — a post must carry the field's native type or the monitor delivers a
 /// value the client cannot decode against the field's declared type.
 fn trace_readback_fields(rb: &TraceReadback) -> Vec<(String, EpicsValue)> {
@@ -2442,7 +2450,7 @@ impl AsynRecord {
     ///
     /// C `setOption` reports a failing `pasynOption->setOption` as
     /// `"Error setting option, %s"` with `pasynUser->errorMessage`
-    /// (asynRecord.c:1825-1828) — it never names the key, and it raises no
+    /// (asynRecord.c:1828-1831) — it never names the key, and it raises no
     /// record severity. The port invented `"set_option({key}): {e}"`, which
     /// also prefixed the Rust status debug onto the driver text.
     fn write_option(&mut self, key: &str, value: &str) {
@@ -2533,7 +2541,7 @@ impl AsynRecord {
     ///
     /// C's shape, and the whole point of it: write the field, then
     /// `db_post_events(errs, DBE_VALUE|DBE_LOG)` iff the text actually changed
-    /// (:2044-2048). ERRS is not `pp(TRUE)` (asynRecord.dbd:366-370), and the
+    /// (:2044-2048). ERRS is not `pp(TRUE)` (asynRecord.dbd:622-627), and the
     /// record's own writes are not puts, so nothing else posts it — a diagnostic
     /// written straight into the field reached the operator's screen only if some
     /// *other* field happened to be posted for an unrelated reason. Every refusal,
@@ -2622,7 +2630,7 @@ impl AsynRecord {
     ///
     /// - The port's queue gate refused it: C's `queueRequest` returned
     ///   non-success, so `special()` writes `pasynUser->errorMessage` to ERRS and
-    ///   frees the user (asynRecord.c:571-576). `asynCallbackSpecial` never runs
+    ///   frees the user (asynRecord.c:571-578). `asynCallbackSpecial` never runs
     ///   — no option or EOS is written, no connect is attempted, no readback, and
     ///   no `monitorStatus` tail.
     /// - It waited out `QUEUE_TIMEOUT`: `queueTimeoutCallbackSpecial` runs
@@ -3151,7 +3159,7 @@ impl AsynRecord {
     /// field.
     /// The one owner of a client put into an array field — C's `put_array_info`
     /// (asynRecord.c:983-993), which `dbPut` calls for every `SPC_DBADDR` field
-    /// it writes (`dbAccess.c:1366-1369`) with `nNew` = the element count that
+    /// it writes (`dbAccess.c:1365-1368`) with `nNew` = the element count that
     /// arrived:
     ///
     /// ```c
@@ -4194,7 +4202,7 @@ impl Record for AsynRecord {
                             // The gate refused the request, or it timed out in the
                             // queue: `asynCallbackSpecial` never ran, so C's
                             // `special()` reports the refusal and frees the user
-                            // (asynRecord.c:571-576) — no connect was attempted and
+                            // (asynRecord.c:571-578) — no connect was attempted and
                             // there is no callback tail to run. This is the arm the
                             // waiver rules bite on: a device-addressed CNCT put to a
                             // disconnected port is refused `asynDisconnected`
@@ -4662,7 +4670,7 @@ impl AsynRecord {
             // `TMOD = NoI/O` skips it, because C's callback never enters
             // `performIO` at all under that mode (asynRecord.c:827) — the
             // interface it would have dispatched on is never consulted. The cycle
-            // still goes on to queue: `process()` queues unconditionally
+            // still goes on to queue: `process()` queues without consulting TMOD
             // (`:342-353`), which is what makes a NoI/O process poke auto-connect
             // and raise STATE/MINOR on a port that refuses it (R18-87).
             if TransferMode::from_u16(self.tmod as u16) != TransferMode::NoIo {
@@ -5055,7 +5063,7 @@ mod tests {
     }
 
     /// R10-46: the `AQR` cancel of a still-queued request is C's `wasQueued`
-    /// branch (asynRecord.c:397-400) — "I/O request canceled" **and**
+    /// branch (asynRecord.c:397-404) — "I/O request canceled" **and**
     /// `recGblSetSevr(pasynRec, STATE_ALARM, MAJOR_ALARM)`. The message and the
     /// severity are one event, so the outcome that carries the text to the
     /// completion re-entry carries the alarm with it.
@@ -5169,7 +5177,8 @@ mod tests {
         assert_eq!((sized.omax, sized.imax), (256, 512));
     }
 
-    /// R18-87. C's `process()` queues unconditionally (asynRecord.c:342-353) and
+    /// R18-87. C's `process()` queues without consulting TMOD (asynRecord.c:342-353
+    /// — its only skip is the `gotValue` I/O Intr readback at `:341`) and
     /// only the callback body skips the transfer (`:827`). So a `TMOD = NoI/O`
     /// cycle is a real queue entry, and everything that follows from one
     /// follows here: the port-thread wake that runs auto-connect — the
@@ -5502,7 +5511,7 @@ mod tests {
             "a BAUD put on a disconnected port is asynDisconnected in C, not a driver call"
         );
         // The refusal is `queueRequest`'s return value, so C reports
-        // `pasynUserSpecial->errorMessage` (asynRecord.c:571-576) — *not* the
+        // `pasynUserSpecial->errorMessage` (asynRecord.c:571-578) — *not* the
         // "Error setting option, %s" text of a `setOption` that ran (R14-46).
         assert!(
             rec.errs.contains("not connected"),
@@ -7405,7 +7414,7 @@ mod tests {
         // reproduced by decision. The refusal is `queueRequest`'s return value,
         // so `asynCallbackSpecial` never runs: C reports
         // `pasynUserSpecial->errorMessage` and frees the user
-        // (asynRecord.c:571-576), and with no callback there is no `monitorStatus`
+        // (asynRecord.c:571-578), and with no callback there is no `monitorStatus`
         // tail — CNCT keeps the value the operator typed until the next status
         // cycle (R14-46).
         rec.cnct = 1;
@@ -7429,7 +7438,7 @@ mod tests {
         assert_eq!(
             rec.cnct, 1,
             "no callback ran, so no monitorStatus tail snapped CNCT back \
-             (asynRecord.c:571-576 vs :897)"
+             (asynRecord.c:571-578 vs :897)"
         );
 
         // The port-level route (C `connectDevice(port, -1)`) brings the line
@@ -7445,7 +7454,7 @@ mod tests {
         assert_eq!(rec.cnct, 1);
 
         // C's isConnected gate: re-putting the state the port is already in
-        // issues no driver call at all (asynRecord.c:865-882).
+        // issues no driver call at all (asynRecord.c:865-889).
         rec.cnct = 1;
         rec.special("CNCT", true).unwrap();
         assert_eq!(
@@ -7473,7 +7482,7 @@ mod tests {
     /// R14-46: a request the queue gate refuses never ran, and the record must
     /// report it as a refusal — not as a callback that did something.
     ///
-    /// C `special()` (asynRecord.c:571-576): when `queueRequest` returns non-zero
+    /// C `special()` (asynRecord.c:571-578): when `queueRequest` returns non-zero
     /// the record writes `pasynUserSpecial->errorMessage` into ERRS and frees the
     /// user. `asynCallbackSpecial` is never dispatched, so none of the work it
     /// implies happens — no `setOption`, no `setEos`, no `connect`, no
@@ -8319,8 +8328,10 @@ mod tests {
         assert_eq!(plan(TransferMode::Read, Octet), [Read]);
         assert_eq!(plan(TransferMode::Flush, Octet), [Flush]);
         // R18-87: NoI/O is one queue entry with an empty body, not zero queue
-        // entries — C `process()` queues unconditionally (asynRecord.c:342-353)
-        // and only the callback skips `performIO` (`:827`).
+        // entries — C `process()` queues without consulting TMOD
+        // (asynRecord.c:342-353; its one skip is the `gotValue` I/O Intr
+        // readback at `:341`) and the callback is what skips `performIO`
+        // (`:827`).
         assert_eq!(plan(TransferMode::NoIo, Octet), [IoPhase::NoIo]);
         assert_eq!(plan(TransferMode::NoIo, Int32), [IoPhase::NoIo]);
 
@@ -8623,7 +8634,7 @@ mod tests {
 
     /// R18-83: C's `put_array_info` (asynRecord.c:983-993) sets NOWT from the
     /// element count of the BOUT put, and NORD from the count of a BINP put —
-    /// `dbPut` calls it on every array put (`dbAccess.c:1366-1369`). Writing the
+    /// `dbPut` calls it on every array put (`dbAccess.c:1365-1368`). Writing the
     /// array *is* how the count gets set; a client does not put NOWT alongside.
     ///
     /// Without it, a `caput -a` of 120 bytes into BOUT left NOWT at its default
@@ -9308,7 +9319,7 @@ mod tests {
     ///
     /// C `reportError` (asynRecord.c:2028-2049) writes the field and then
     /// `db_post_events(errs, DBE_VALUE|DBE_LOG)` iff the text changed. ERRS is
-    /// not `pp(TRUE)` (asynRecord.dbd:366-370), so nothing else posts it: the
+    /// not `pp(TRUE)` (asynRecord.dbd:622-627), so nothing else posts it: the
     /// record's diagnostics — the queue-gate refusal, an option/EOS error, a
     /// connect error — were written into the field and never reached a CA client
     /// monitoring it. Only `resetError`'s clear posted.
@@ -9400,7 +9411,7 @@ mod tests {
             .expect("subscribe ERRS");
 
         // Boundary 1 — a refused put. C's `special()` writes the gate's own
-        // `pasynUser->errorMessage` to ERRS and frees the user (:571-576); the
+        // `pasynUser->errorMessage` to ERRS and frees the user (:571-578); the
         // operator's ERRS monitor must fire with it.
         {
             let inst = db.get_record(rec_name).unwrap();
@@ -9582,7 +9593,7 @@ mod tests {
         assert_eq!(
             pcnct_sub.recv().await,
             Some(EpicsValue::Enum(1)),
-            "monitorStatus posts PCNCT (asynRecord.c:1128)"
+            "monitorStatus posts PCNCT (asynRecord.c:1127)"
         );
     }
 
@@ -10479,7 +10490,7 @@ mod tests {
             base.init_connected(connected);
             // A port that accepts an EOS at all is one C configured with
             // `processEosIn/Out` set, so `asynOctetBase::initialize` installed
-            // `asynInterposeEos` above the driver (asynOctetBase.c:169-171).
+            // `asynInterposeEos` above the driver (asynOctetBase.c:170-172).
             // Without that layer the driver's own `setInputEos` is NULL and
             // C answers "not implemented" (R18-71).
             base.install_octet_interpose(Box::new(crate::interpose::eos::EosInterpose::default()));
@@ -10555,7 +10566,7 @@ mod tests {
             // The move has to be one the queue gate tolerates: a *disabled* or
             // *disconnected* port refuses the put at `queueRequest`, and then C
             // runs no callback and therefore no `monitorStatus` either
-            // (asynRecord.c:571-576 — that is R14-46's boundary, asserted in
+            // (asynRecord.c:571-578 — that is R14-46's boundary, asserted in
             // `a_gate_refused_request_reports_the_refusal_and_runs_no_callback`).
             // What this test is about is the *other* side of that line: a request
             // that DID run must end in the tail.

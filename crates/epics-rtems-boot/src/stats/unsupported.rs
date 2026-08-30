@@ -11,7 +11,7 @@
 //! support is missing publishes "1000 free" rather than "unknown". An `Option`
 //! says the thing the sentinel cannot.
 
-use super::{FdUsage, MemUsage};
+use super::{FdUsage, HeapSpace, MemUsage};
 
 pub(super) fn fd_usage() -> Option<FdUsage> {
     None
@@ -19,6 +19,10 @@ pub(super) fn fd_usage() -> Option<FdUsage> {
 
 pub(super) fn mem_usage() -> MemUsage {
     MemUsage::default()
+}
+
+pub(super) fn heap_space() -> Option<HeapSpace> {
+    None
 }
 
 /// Silence, not a placeholder line.

@@ -148,20 +148,26 @@ pub fn connect_timeout_message(names: &[String]) -> String {
     }
 }
 
-/// A failed [`connect_pvs`] barrier: carries the exact C diagnostic to
-/// print on stderr before the tool exits 1.
+/// A failed [`connect_pvs`] / [`create_pvs`] barrier: carries the exact C
+/// diagnostic to print on stderr before the tool exits 1.
+///
+/// One type for both failures because C ends them the same way — every
+/// caller does `fprintf(stderr, ...)`-then-`return 1` — and because they are
+/// mutually exclusive: `connect_pvs` reaches its `ca_pend_io` only when
+/// `create_pvs` returned 0 (`tool_lib.c:625-626`), so a run never has both a
+/// rejected name and a connect timeout to report.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ConnectPvsTimeout {
+pub struct ConnectPvsFailure {
     message: String,
 }
 
-impl std::fmt::Display for ConnectPvsTimeout {
+impl std::fmt::Display for ConnectPvsFailure {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(&self.message)
     }
 }
 
-impl std::error::Error for ConnectPvsTimeout {}
+impl std::error::Error for ConnectPvsFailure {}
 
 /// C `tool_lib.c::connect_pvs` (`:623-641`) — the single all-channels
 /// barrier the synchronous CA tools put between channel creation and
@@ -179,20 +185,18 @@ impl std::error::Error for ConnectPvsTimeout {}
 ///
 /// The connect wait runs concurrently across channels, so the whole
 /// barrier fits in one `timeout` window, exactly like C's single
-/// `ca_pend_io`. C's other failure mode — `ca_create_channel` itself
-/// rejecting a name (`create_pvs`, `tool_lib.c:588-594`) — has no port
-/// analogue: [`CaClient::create_channel_with_priority`] is infallible and
-/// defers every failure to the connect wait.
+/// `ca_pend_io`. C's other failure mode — [`create_pvs`] rejecting a name —
+/// comes first and, when it fires, the wait never runs.
 pub async fn connect_pvs(
     client: &CaClient,
     names: &[String],
     priority: u8,
     timeout: std::time::Duration,
-) -> Result<Vec<CaChannel>, ConnectPvsTimeout> {
-    let channels: Vec<CaChannel> = names
-        .iter()
-        .map(|name| client.create_channel_with_priority(name, priority))
-        .collect();
+) -> Result<Vec<CaChannel>, ConnectPvsFailure> {
+    // C `connect_pvs:625-626`: `create_pvs` first, and its non-zero return
+    // is returned WITHOUT entering `ca_pend_io` — so a rejected name costs
+    // no timeout and emits no "Channel connect timed out" line.
+    let channels = create_pvs(client, names, priority)?;
     let all_connected =
         futures_util::future::join_all(channels.iter().map(|ch| ch.wait_connected(timeout)))
             .await
@@ -202,10 +206,70 @@ pub async fn connect_pvs(
     if all_connected {
         Ok(channels)
     } else {
-        Err(ConnectPvsTimeout {
+        Err(ConnectPvsFailure {
             message: connect_timeout_message(names),
         })
     }
+}
+
+/// C `ca_create_channel`'s name gate (`cac.cpp:522-524` plus
+/// `nciu.cpp:53-58`), reported the way C `tool_lib.c::create_pvs`
+/// (`:588-599`) reports it.
+///
+/// # Invariant (CONTRACT)
+///
+/// A channel name that `ca_create_channel` would refuse MUST be refused
+/// here, before any search goes out. **This is the single owner of that
+/// gate** — every CA tool creates its channels through it, so none of them
+/// can spend a timeout window searching for a name the protocol cannot
+/// carry, nor report such a name as "not found".
+///
+/// The rule is C's, in two clauses, and both are measured against C `caget`:
+/// a name that is empty (`pName[0] == '\0'`), or whose length plus its NUL
+/// exceeds the search datagram's room for it (`MAX_UDP_SEND - sizeof(caHdr)`
+/// = 1008, so 1007 characters connect and 1008 are refused). C raises
+/// `badString` for both, `ca_create_channel` maps it to `ECA_BADSTR`, and
+/// `create_pvs` prints `ca_message(ECA_BADSTR)` — "Invalid string".
+///
+/// Every rejected name gets its own line, in argv order, because C's loop
+/// reports each one and only then returns 1.
+pub fn create_pvs(
+    client: &CaClient,
+    names: &[String],
+    priority: u8,
+) -> Result<Vec<CaChannel>, ConnectPvsFailure> {
+    if let Some(message) = uncreatable_names_message(names) {
+        return Err(ConnectPvsFailure { message });
+    }
+    Ok(names
+        .iter()
+        .map(|name| client.create_channel_with_priority(name, priority))
+        .collect())
+}
+
+/// The diagnostic [`create_pvs`] fails with, or `None` when every name is
+/// creatable. Split out so the gate is testable without a live client — it
+/// is pure text over the names, exactly as C's loop is.
+fn uncreatable_names_message(names: &[String]) -> Option<String> {
+    let rejected: Vec<String> = names
+        .iter()
+        .filter(|name| !channel_name_is_creatable(name))
+        .map(|name| {
+            format!("CA error Invalid string occurred while trying to create channel '{name}'.")
+        })
+        .collect();
+    (!rejected.is_empty()).then(|| rejected.join("\n"))
+}
+
+/// C `MAX_UDP_SEND - sizeof(caHdr)` (`caProto.h:66` = 1024, minus the
+/// 16-byte header): the largest `strlen(name) + 1` a search datagram can
+/// carry, and the bound `nciu`'s constructor tests (`nciu.cpp:56`).
+const MAX_CHANNEL_NAME_BYTES: usize = 1024 - 16;
+
+fn channel_name_is_creatable(name: &str) -> bool {
+    // C tests `strlen(name) + 1 > bound` because the NUL travels on the
+    // wire with the name; the same bound without the NUL is `len < bound`.
+    !name.is_empty() && name.len() < MAX_CHANNEL_NAME_BYTES
 }
 
 /// Field width the C tools (`caget` / `camonitor` / `caput -l`) use
@@ -806,16 +870,37 @@ fn join_elements<I: Iterator<Item = String>>(iter: I, total: usize, fmt: &ValueF
         .join(&fmt.field_separator.to_string())
 }
 
+/// C `MAX_ENUM_STATES` (`db_access.h:32`) — the number of string slots a
+/// GR/CTRL enum reply carries on the wire, whatever `no_str` claims.
+const MAX_ENUM_STATES: i64 = 16;
+
+/// C `val2str`'s `DBR_ENUM` arm (`tool_lib.c:169-188`).
+///
+/// `enum_strings` is `Some` exactly when the reply carried a string table,
+/// which is C's `dbr_type_is_GR(type)` / `dbr_type_is_CTRL(type)` test: those
+/// two flavours resolve the index, every other ENUM request (plain, STS,
+/// TIME) prints the raw number, and so does `-n` on any of them.
+///
+/// Resolving is not just a table lookup — C reports the two out-of-range
+/// cases apart, and a `-d DBR_GR_ENUM` against a numeric PV lands on them
+/// immediately, because such a channel answers with `no_str = 0` and the
+/// value cast to an index. Past `MAX_ENUM_STATES` the index cannot name a
+/// state at all (`Illegal Value`); inside it, it names one the server did
+/// not fill in (`Enum Index Overflow`). Falling through both to the bare
+/// number, as this did, made `caget -d 24` on a DOUBLE record print the
+/// index where C prints its diagnosis.
 fn format_enum(idx: i64, fmt: &ValueFormat, enum_strings: Option<&[PvString]>) -> String {
-    if !fmt.enum_as_number
-        && let Some(strs) = enum_strings
-        && idx >= 0
-        && (idx as usize) < strs.len()
-    {
+    if let Some(strs) = enum_strings.filter(|_| !fmt.enum_as_number) {
+        if !(0..MAX_ENUM_STATES).contains(&idx) {
+            return format!("Illegal Value ({idx})");
+        }
+        let Some(label) = strs.get(idx as usize) else {
+            return format!("Enum Index Overflow ({idx})");
+        };
         // Escape the label bytes exactly like a DBR_STRING (line 166):
         // enum choice labels are raw, not-guaranteed-UTF-8 bytes, so a
         // byte-wise escaper renders them faithfully on the CLI.
-        return escape_from_raw(strs[idx as usize].as_bytes());
+        return escape_from_raw(label.as_bytes());
     }
     // C `val2str`'s DBR_ENUM arm prints a bare index with `sprintf("%d")`
     // (`tool_lib.c:187`) — the `-0x`/`-0o`/`-0b` base (`outTypeI`) is
@@ -1255,6 +1340,64 @@ mod tests {
         fmt.enum_as_number = true;
         let s = fv(&v, &fmt, Some(&strs), false);
         assert_eq!(s, "1");
+    }
+
+    /// The two out-of-range arms C keeps apart (`tool_lib.c:172-186`),
+    /// measured against C `caget` on a `softIoc` DOUBLE record read as
+    /// `-d DBR_GR_ENUM`: such a channel answers `no_str = 0` and casts the
+    /// value to an index, so every value lands out of range.
+    ///
+    /// | VAL   | index | C prints                  |
+    /// |-------|-------|---------------------------|
+    /// | 0     | 0     | `Enum Index Overflow (0)` |
+    /// | 1.5   | 1     | `Enum Index Overflow (1)` |
+    /// | 20    | 20    | `Illegal Value (20)`      |
+    /// | 70000 | 4464  | `Illegal Value (4464)`    |
+    #[test]
+    fn an_index_past_the_string_table_is_an_overflow() {
+        let strs: Vec<PvString> = vec!["off".into(), "on".into()];
+        for (idx, want) in [
+            (2, "Enum Index Overflow (2)"),
+            (15, "Enum Index Overflow (15)"),
+            (16, "Illegal Value (16)"),
+            (4464, "Illegal Value (4464)"),
+        ] {
+            assert_eq!(
+                fv(&EpicsValue::Enum(idx), &fmt_default(), Some(&strs), false),
+                want,
+                "index {idx}"
+            );
+        }
+    }
+
+    /// `no_str = 0` is the shape a numeric PV answers a GR/CTRL enum request
+    /// with, and it has no in-range index at all.
+    #[test]
+    fn an_empty_string_table_overflows_at_zero() {
+        let none: Vec<PvString> = vec![];
+        assert_eq!(
+            fv(&EpicsValue::Enum(0), &fmt_default(), Some(&none), false),
+            "Enum Index Overflow (0)"
+        );
+    }
+
+    /// `-n` keeps the bare index on every arm — C tests `!enumAsNr` before
+    /// it looks at the table at all, so neither diagnosis can appear.
+    #[test]
+    fn the_n_flag_suppresses_both_diagnoses() {
+        let strs: Vec<PvString> = vec!["off".into(), "on".into()];
+        let mut fmt = fmt_default();
+        fmt.enum_as_number = true;
+        assert_eq!(fv(&EpicsValue::Enum(2), &fmt, Some(&strs), false), "2");
+        assert_eq!(fv(&EpicsValue::Enum(20), &fmt, Some(&strs), false), "20");
+    }
+
+    /// A request that carries NO string table — plain / STS / TIME `DBR_ENUM`
+    /// — prints the raw number however far out of range it is. C reaches its
+    /// `sprintf("%d")` fall-through without consulting a table it was not sent.
+    #[test]
+    fn an_enum_without_a_string_table_stays_numeric() {
+        assert_eq!(fv(&EpicsValue::Enum(20), &fmt_default(), None, false), "20");
     }
 
     #[test]
@@ -1822,5 +1965,54 @@ mod tests {
         // DBR_CTRL_DOUBLE`), which C prints with its own literal `%g`.
         assert_eq!(format_c_g(f64::NAN), "nan");
         assert_eq!(format_c_g(f64::NEG_INFINITY), "-inf");
+    }
+
+    fn names(v: &[&str]) -> Vec<String> {
+        v.iter().map(|s| s.to_string()).collect()
+    }
+
+    /// Measured against C `caget ''` (rc=1, this exact stderr line, no
+    /// search sent and no timeout spent) — `cac::createChannel` refuses an
+    /// empty name at `cac.cpp:522-524`.
+    #[test]
+    fn an_empty_name_is_refused_before_any_search() {
+        assert_eq!(
+            uncreatable_names_message(&names(&[""])).as_deref(),
+            Some("CA error Invalid string occurred while trying to create channel ''.")
+        );
+    }
+
+    /// The boundary `nciu.cpp:56` tests is `strlen(name) + 1 >
+    /// MAX_UDP_SEND - sizeof(caHdr)`, i.e. 1007 characters fit and 1008 do
+    /// not. Measured: C `caget` spends its full connect timeout on the
+    /// 1007-char name and refuses the 1008-char one instantly.
+    #[test]
+    fn the_name_length_bound_is_the_search_datagrams_room() {
+        assert!(channel_name_is_creatable(&"X".repeat(1007)));
+        assert!(!channel_name_is_creatable(&"X".repeat(1008)));
+    }
+
+    /// C's loop reports EVERY rejected name and only then returns 1, so a
+    /// creatable name beside an uncreatable one does not suppress the line
+    /// — and does not earn a connect wait either.
+    #[test]
+    fn every_rejected_name_gets_its_own_line_in_argv_order() {
+        let msg = uncreatable_names_message(&names(&["", "T:ai", &"X".repeat(1008)]));
+        let long = "X".repeat(1008);
+        assert_eq!(
+            msg.as_deref(),
+            Some(
+                format!(
+                    "CA error Invalid string occurred while trying to create channel ''.\n\
+                     CA error Invalid string occurred while trying to create channel '{long}'."
+                )
+                .as_str()
+            )
+        );
+    }
+
+    #[test]
+    fn creatable_names_produce_no_diagnostic() {
+        assert_eq!(uncreatable_names_message(&names(&["T:ai", "T:ao"])), None);
     }
 }

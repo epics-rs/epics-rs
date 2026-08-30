@@ -89,6 +89,46 @@ fn check_no_mod(instance: &crate::server::record::RecordInstance, field: &str) -
     Ok(())
 }
 
+/// [`check_no_mod`] as `dbPut` runs it — the refusal that also SPEAKS.
+///
+/// C's SPC_NOMOD arm is not a bare `return`: it reports before it returns.
+///
+/// ```c
+/// /* dbAccess.c:122-127, dbPutSpecial(paddr, 0) */
+/// if ((special == SPC_NOMOD) && (pass == 0)) {
+///     status = S_db_noMod;
+///     recGblDbaddrError(status, paddr, "dbPut");
+///     return status;
+/// }
+/// ```
+///
+/// `errSymLookup(S_db_noMod)` is `"Attempt to modify noMod field"`
+/// (`dbAccessDefs.h:179`), so the console line is exactly
+/// `recGblDbaddrError: dbPut Attempt to modify noMod field PV: REC.FIELD` —
+/// measured on softIoc @`R7.0.10` for `dbpf T:SUB.INAM` and `dbpf T:SEL.VAL`,
+/// where stdout still shows the unchanged read-back and the refusal is
+/// announced only here. A port that returns the status and says nothing loses
+/// the whole report, because `dbpf` itself prints no diagnostic of its own.
+///
+/// INVARIANT: every `dbPut`-layer SPC_NOMOD refusal MUST write this line, and
+/// no other layer may. The gate above stays silent so
+/// [`PvDatabase::check_external_put_preconditions`] — pvxs `doPreProcessing`,
+/// which refuses ABOVE `dbPut` and never reaches `dbPutSpecial` — cannot emit
+/// a line C does not write, nor double it on the routes that go on to put.
+fn check_no_mod_in_db_put(
+    instance: &crate::server::record::RecordInstance,
+    field: &str,
+) -> CaResult<()> {
+    check_no_mod(instance, field).inspect_err(|_| {
+        crate::server::recgbl::rec_gbl_dbaddr_error(
+            "Attempt to modify noMod field",
+            &instance.name,
+            field,
+            "dbPut",
+        );
+    })
+}
+
 /// C `dbPut`'s link-field refusal (`field_type > DBF_DEVICE` →
 /// `S_db_badDbrtype`, `dbAccess.c:1340-1347`): only `dbPutField` may change a
 /// DBF_INLINK/OUTLINK/FWDLINK field — it routes them through `dbPutFieldLink`
@@ -338,7 +378,23 @@ fn snam_special_after_put(
         // created. Clearing there too would make `RecordInstance::subroutine`
         // mean either "nothing bound" or "a parked record's retained routine"
         // depending on the record type.
-        if !instance.record.parks_pact() {
+        if instance.record.parks_pact() {
+            // The other half of that same C branch, and the reason a client
+            // can see for the park: `epicsPrintf("%s.SNAM is empty\n",
+            // prec->name)` (`subRecord.c:183`), which is `errlogPrintf`
+            // (`errlog.h:90`) — the errlog, not stderr. It fires on EVERY put
+            // that leaves SNAM empty, including empty -> empty, because pass 0
+            // released the park before the store and this pass re-takes it.
+            //
+            // `parks_pact()` gates the line for the same reason it gates the
+            // retained binding above: in C the print and `pact = TRUE` are one
+            // block, and the only other record whose `special()` reaches an
+            // empty subroutine name is aSub, which is silent AND park-free
+            // (`aSubRecord.c:560-561`). A record that answers `parks_pact()`
+            // therefore owes this line; `enter_pact()` in `special_after_put`
+            // takes the park itself, on the same predicate, straight after.
+            crate::runtime::log::errlog_printf(&format!("{}.SNAM is empty\n", instance.name));
+        } else {
             instance.subroutine = None;
         }
         return Ok(());
@@ -806,6 +862,50 @@ impl NotifyRequest {
     }
 }
 
+/// The teardown owner for a blocking external client PUT — the PVA/QSRV
+/// counterpart of C `rsrvFreePutNotify` (`camessage.c:1630-1638`), the CA
+/// server's own client-teardown call into `dbNotifyCancel`.
+///
+/// # Invariant (CONTRACT)
+///
+/// A blocking external PUT whose awaiting future is dropped before the
+/// completion arrives MUST release the record's put-notify slot before it
+/// goes. Leaving that to the next put's arrival-time sweep is not enough: a
+/// client already parked on `notify_restart_list` is not an arrival, so it
+/// waits behind a completion that can never come.
+///
+/// pvxs has no separate hook to mirror because a blocking put IS the
+/// operation's future there: the native PVA server spawns the PUT EXEC body
+/// and stores its abort handle on the op (`server_native::tcp`,
+/// `finish_exec_data_task`), so DESTROY_CHANNEL and connection teardown alike
+/// drop `ChannelState::ops`, abort the task and drop this future mid-await.
+/// The source's `notify_channel_close` is deliberately NOT the owner: an
+/// abort only *marks* the task, and the future is dropped whenever the
+/// executor next reaches it, so a sweep run from the close callback can find
+/// the receiver still alive and release nothing.
+///
+/// The receiver is owned HERE and closed by hand because `Drop::drop` runs
+/// BEFORE a struct's own fields drop — asking the database first would find
+/// `Sender::is_closed()` still false and sweep nothing.
+struct ClientAwaitingNotify<'a> {
+    db: &'a PvDatabase,
+    record: &'a str,
+    rx: crate::runtime::sync::oneshot::Receiver<()>,
+    /// Set once the await returns, which disarms the release: the completion
+    /// path owns the slot from that point.
+    answered: bool,
+}
+
+impl Drop for ClientAwaitingNotify<'_> {
+    fn drop(&mut self) {
+        if self.answered {
+            return;
+        }
+        self.rx.close();
+        self.db.cancel_unanswerable_notify(self.record);
+    }
+}
+
 /// The one claim on a record's put-notify slot for the whole gate-held CA put
 /// body, and the single finalizer every exit path out of it passes through.
 ///
@@ -1247,7 +1347,7 @@ impl PvDatabase {
                 // stops a record's OUT link from truncating a waveform's NELM.
                 // The refusal is returned to the caller; `write_out_link_value`
                 // (C `dbPutLink`) turns it into the writer's LINK/INVALID alarm.
-                check_no_mod(&instance, &field)?;
+                check_no_mod_in_db_put(&instance, &field)?;
 
                 // C `dbPut` refuses a link-field target the same way, before
                 // conversion (`dbAccess.c:1340`) — see `check_not_link_field`.
@@ -1594,7 +1694,7 @@ impl PvDatabase {
 
                 // Same `dbPut` gate as `put_pv` — this is the third `dbPut` body
                 // (value + monitor post), and C has ONE.
-                check_no_mod(&instance, &field)?;
+                check_no_mod_in_db_put(&instance, &field)?;
                 check_not_link_field(&instance, &field)?;
 
                 let request = dbput_request(&*instance.record, &field, value)?;
@@ -1907,7 +2007,7 @@ impl PvDatabase {
                     let completion = self
                         .put_record_field_from_ca(record_name, field, value)
                         .await?;
-                    Self::await_completion(completion).await;
+                    self.await_completion(record_name, completion).await;
                     Ok(())
                 } else {
                     self.put_record_field_from_ca_no_notify(record_name, field, value)
@@ -1924,7 +2024,7 @@ impl PvDatabase {
                     // bare `process_record_with_links` returns as soon as
                     // the record goes PACT.
                     let completion = self.process_record_with_notify(record_name).await?;
-                    Self::await_completion(completion).await;
+                    self.await_completion(record_name, completion).await;
                     Ok(())
                 } else {
                     // `doPostProcessing(forceProcessing == True)`
@@ -1938,10 +2038,28 @@ impl PvDatabase {
         }
     }
 
-    async fn await_completion(completion: crate::server::record::ProcessCompletion) {
-        if let crate::server::record::ProcessCompletion::Async(rx) = completion {
-            let _ = rx.await;
-        }
+    /// Await a blocking external PUT's completion under
+    /// [`ClientAwaitingNotify`], so a client that goes away mid-put hands the
+    /// record back instead of wedging every put queued behind it.
+    async fn await_completion(
+        &self,
+        record_name: &str,
+        completion: crate::server::record::ProcessCompletion,
+    ) {
+        let crate::server::record::ProcessCompletion::Async(rx) = completion else {
+            return;
+        };
+        let mut pending = ClientAwaitingNotify {
+            db: self,
+            record: record_name,
+            rx,
+            answered: false,
+        };
+        // Either outcome ends the wait. `Err` means the sender was dropped
+        // without sending, and only the completion path does that — it takes
+        // the sender out of the set first, so the sweep would no-op anyway.
+        let _ = (&mut pending.rx).await;
+        pending.answered = true;
     }
 
     /// C `dbPut`'s alarm-acknowledge interception (`dbAccess.c:1331-1335`) —
@@ -2214,6 +2332,7 @@ impl PvDatabase {
         let rec_arc = self
             .get_record(record_name)
             .ok_or_else(|| CaError::ChannelNotFound(record_name.to_string()))?;
+        self.cancel_unanswerable_notify(record_name);
         let notify = {
             let mut guard = rec_arc.write();
             if arrival.defers(&guard) {
@@ -2233,6 +2352,60 @@ impl PvDatabase {
         let mut visited = HashSet::new();
         self.process_record_with_links_already_locked(record_name, &mut visited, 0)?;
         Ok(Some(notify))
+    }
+
+    /// C `dbNotifyCancel` (`dbNotify.c:385-430`) as `rsrvFreePutNotify` reaches
+    /// it (`camessage.c:1630-1638`): a put-notify whose client is gone leaves
+    /// EVERY record it owns, and each record's restart-list head takes it
+    /// (`restartCheck`).
+    ///
+    /// # Invariant (CONTRACT)
+    ///
+    /// A wait-set that can never answer MUST NOT leave any record's put-notify
+    /// slot occupied. **This is the single owner of that release.** Without it
+    /// a record type that legitimately withholds its `ca_put_callback` (`busy`
+    /// at VAL=1, `mca` mid-acquisition) is wedged by the first client that
+    /// gives up: the slot stays taken forever and every later put queues behind
+    /// it unwritten.
+    ///
+    /// The sweep is over the set's own membership
+    /// ([`NotifyWaitSet::joined_records`]), not over the entry record, because
+    /// C's is (`dbNotify.c:428-430` empties the whole wait list, and only then
+    /// does `:433` deal with the entry). An entry-only release left the same
+    /// wedge one hop down the chain, on the record most likely to be holding a
+    /// set it will never leave: an FLNK target that is itself a `busy` at
+    /// VAL=1 declines its own `recGblFwdLink` by contract, so its membership
+    /// outlives the client that started the chain.
+    ///
+    /// Takes no lock of its own on entry, and holds only one record's write
+    /// lock at a time, so it can be called from a client-teardown `Drop` and
+    /// cannot deadlock against a chain that locks records in the other order.
+    ///
+    /// [`NotifyWaitSet::joined_records`]: crate::server::record::NotifyWaitSet
+    pub fn cancel_unanswerable_notify(&self, record_name: &str) {
+        let Some(rec) = self.get_record(record_name) else {
+            return;
+        };
+        let Some(dead) = rec.read().unanswerable_notify() else {
+            return;
+        };
+        // C `dbNotifyCancel`: the whole wait list, then the entry. `joined`
+        // already carries the entry, so one pass covers both arms.
+        for name in dead.joined_records() {
+            let Some(member) = self.get_record(&name) else {
+                continue;
+            };
+            let exit = {
+                let mut guard = member.write();
+                if !guard.release_notify(&dead) {
+                    continue;
+                }
+                guard.pact_exit_without_release()
+            };
+            // `apply_pact_exit` takes no record lock, by construction — the
+            // drain it spawns takes the record's write gate itself.
+            self.apply_pact_exit(&name, &member, exit);
+        }
     }
 
     /// Claim `record_name`'s put-notify slot for this put, in the SAME
@@ -2333,8 +2506,9 @@ impl PvDatabase {
 
             // SPC_NOMOD / read-only fields: rejected inside C's `dbPut`, i.e.
             // after the DISP gate above and before the PROC-driven process
-            // below. One gate owner for every route ([`check_no_mod`]).
-            check_no_mod(&instance, &field)?;
+            // below. One gate owner for every route
+            // ([`check_no_mod_in_db_put`]).
+            check_no_mod_in_db_put(&instance, &field)?;
         }
 
         // C `processNotifyCommon` (dbNotify.c:225-232) tests PACT ABOVE the
@@ -2392,6 +2566,7 @@ impl PvDatabase {
         )> = None;
         if want_notify {
             let is_restart = notify_request.is_restart();
+            self.cancel_unanswerable_notify(record_name);
             let mut guard = rec.write();
             // A restart is already the record's owner, so only PACT can stop it
             // (C skips dbNotify.c:213 for it and falls straight to :225).
@@ -3134,7 +3309,7 @@ impl PvDatabase {
                 )? {
                     value = text;
                 }
-                check_no_mod(&instance, &field)?;
+                check_no_mod_in_db_put(&instance, &field)?;
                 // C `dbPutSpecial(paddr, 0)` — the pre-store pass, which
                 // `dbPut` runs on every entry path including the `dbPutField`
                 // this body models (autosave's `reboot_restore`). A non-zero

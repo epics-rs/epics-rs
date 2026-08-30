@@ -27,7 +27,7 @@ default = ["qsrv", "qsrv-bin", "ca-gateway", "ca-gateway-bin"]
 #
 # It exists because `qsrv = [... "pvalink" ...]` is unsatisfiable on that
 # target: pvalink needs `epics_pva_rs::client_native`, a 23,881-line tree that
-# does not compile for RTEMS (47 errors — doc/qsrv-rtems-design.md §0 probe D).
+# does not compile for RTEMS (47 errors, measured).
 # Deleting the implication instead would silently drop pvalink from every host
 # build that asks for `qsrv`; naming the reduced set keeps `qsrv` a strict
 # superset, so every existing host selection resolves exactly as before.
@@ -38,11 +38,10 @@ default = ["qsrv", "qsrv-bin", "ca-gateway", "ca-gateway-bin"]
 # which is a green that proves nothing.
 qsrv-core = ["dep:epics-pva-rs", "dep:serde", "dep:serde_json"]
 # The RTEMS bring-up measurement rig for `realtime-pva-ioc` (the family twin of
-# `epics-ca-rs/bringup-probes` — doc/calink-rtems-design.md §11.7 item 3): the
-# stage-5 pvalink probe records (doc/pvalink-rtems-design.md §12), the §8 QSRV
-# load-probe group (doc/qsrv-rtems-design.md §9.14: victim `RTEMS:PVA:V0` plus
-# the 20-member `RTEMS:PVA:BIG`), the `stage5-probe` reporter thread and the
-# compiled-in SLIRP name-server default. OFF by default — the default binary
+# `epics-ca-rs/bringup-probes`): the stage-5 pvalink probe records, the QSRV
+# load-probe group (victim `RTEMS:PVA:V0` plus the 20-member `RTEMS:PVA:BIG`),
+# the `stage5-probe` reporter thread and the compiled-in SLIRP name-server
+# default. OFF by default — the default binary
 # is a clean IOC with no probe records, no probe thread and no link fields at
 # all. The bring-up box's build scripts add this flag to get exactly the
 # measured stage-5/§8 image back. NOT forwarded to `epics-ca-rs`: each target
@@ -265,8 +264,8 @@ required-features = ["dual-gateway-bin"]
 # The RTEMS PVA+QSRV IOC entry point — the workspace's one target PVA binary.
 # It lives here rather than in `epics-pva-rs`, where it started, because
 # mounting the QSRV group source needs `epics-bridge-rs` and `epics-pva-rs`
-# cannot depend on the bridge without a cyclic package dependency (measured;
-# doc/qsrv-rtems-design.md §9.7).
+# cannot depend on the bridge without a cyclic package dependency, which cargo
+# rejects outright (measured).
 #
 # `required-features` IS correct here, unlike on `epics-ca-rs`'s `realtime-ca-ioc`
 # — but for a reason worth stating, because the manifest comment this binary

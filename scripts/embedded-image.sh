@@ -21,8 +21,8 @@
 # PROFILE
 #
 # `release-embedded` (root `Cargo.toml`: inherits release, strip=symbols,
-# lto=fat, codegen-units=1) — row 5 of the measured matrix in
-# `doc/vxworks-port.md` §5.5. Override for a comparison build:
+# lto=fat, codegen-units=1) — row 5 of the measured strip/LTO size matrix.
+# Override for a comparison build:
 #
 #   EMBEDDED_PROFILE=release scripts/embedded-image.sh vxworks ca   # row 2
 #

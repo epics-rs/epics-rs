@@ -645,6 +645,23 @@ struct PvDatabaseInner {
     /// tests and a second `iocInit` may call again, and `OnceLock` would
     /// silently drop the second registry instead of replacing it.
     subroutine_registry: ArcSwap<HashMap<String, Arc<crate::server::record::SubroutineFn>>>,
+    /// C's process-global device support table, seen through
+    /// `dbDTYPtoDevSup`: the lookup `doInitRecord0` makes to fill
+    /// `precord->dset` BEFORE it calls `prset->init_record(precord, 0)`
+    /// (`iocInit.c:530-536`).
+    ///
+    /// It lives on the DATABASE, not on the builder that collected the
+    /// factories, because the creation sink is the only place that can bind a
+    /// dset at C's position — ahead of the record's own init passes. While the
+    /// two builders each held their own copy, the bind could only happen after
+    /// the whole database had been built, so every record type's `init_record`
+    /// ran with `dset == NULL` invisible to it and executed the tail C's
+    /// `if (!pdset) return S_dev_noDSET` skips.
+    ///
+    /// `None` until a builder installs one — a database assembled by hand
+    /// (unit tests, `PvDatabase::new`) registers no device support at all,
+    /// which is C's empty `devList` and gives the same answer.
+    device_support_resolver: ArcSwapOption<crate::server::ioc_app::DeviceSupportResolver>,
     /// Breakpoint tables by name (C `bptList`), shared by every db-load path so
     /// `ai`/`ao` records with `LINR >= 3` resolve their linearisation table. An
     /// `Arc` snapshot is installed on each record at creation; the master grows
@@ -1059,6 +1076,7 @@ impl PvDatabase {
                     seeded_record_attributes(),
                 ),
                 subroutine_registry: ArcSwap::from_pointee(HashMap::new()),
+                device_support_resolver: ArcSwapOption::empty(),
                 breaktable_registry: SnapshotCell::new(
                     crate::server::cvt_bpt::BreakTableRegistry::new(),
                 ),
@@ -1199,6 +1217,33 @@ impl PvDatabase {
         registry: HashMap<String, Arc<crate::server::record::SubroutineFn>>,
     ) {
         self.inner.subroutine_registry.store(Arc::new(registry));
+    }
+
+    /// Install the process-wide device support table — C's registrars filling
+    /// `devList` before `iocInit`. Every record created after this line binds
+    /// its dset from it at creation, which is C's `doInitRecord0` order; a
+    /// record created BEFORE it keeps no device support, exactly as a C record
+    /// loaded before its `device()` lines would.
+    pub fn install_device_support_resolver(
+        &self,
+        resolver: crate::server::ioc_app::DeviceSupportResolver,
+    ) {
+        self.inner
+            .device_support_resolver
+            .store(Some(Arc::new(resolver)));
+    }
+
+    /// How many records hold device support — the `iocInit: N records, M with
+    /// device support` count. Derived from the records themselves rather than
+    /// tallied by a wiring pass, because there is no longer a wiring pass:
+    /// the bind happens at each record's creation.
+    pub(crate) async fn records_with_device_support(&self) -> usize {
+        let names = self.all_record_names().await;
+        names
+            .iter()
+            .filter_map(|name| self.get_record(name))
+            .filter(|rec| rec.read().device.is_some())
+            .count()
     }
 
     /// Look up a registered subroutine by name. The processing path uses this
@@ -2636,6 +2681,23 @@ impl PvDatabase {
                 .insert(name.to_string(), empty_links);
         }
 
+        // C `doInitRecord0` (`iocInit.c:530-536`) binds the dset and only then
+        // calls `init_record(pass 0)`. Both lines are here, in that order,
+        // because every `<rec>Record.c init_record` opens by testing the dset
+        // — `ao`'s `prec->init = TRUE`, `sub`'s MLST/ALST/LALM seed and `ai`'s
+        // are all BELOW that test, and running the passes first is what made
+        // them reachable for a record C refuses.
+        crate::server::ioc_app::attach_device_support(
+            &mut instance,
+            name,
+            self.inner.device_support_resolver.load().as_deref(),
+        );
+        // C `registryFunctionFind` reads a process-global registry from inside
+        // `init_record` pass 1, so the record is handed the registry rather
+        // than resolved against it from out here: the lookup's failure is an
+        // early return that the init tail must not run past, and only the init
+        // owner can honour that.
+        instance.arm_init_subroutines(self.inner.subroutine_registry.load_full());
         instance.run_init_passes(name);
 
         // The init-seed owner: every CONSTANT link the record declares
@@ -2723,7 +2785,7 @@ impl PvDatabase {
         if let Some(kind) = kind {
             return Err(CaError::DbParseError {
                 line: 0,
-                column: 0,
+                token: String::new(),
                 message: format!("name '{name}' is already registered as a {kind}"),
             });
         }

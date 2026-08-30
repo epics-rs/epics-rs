@@ -54,8 +54,8 @@
  * the most predictive thing the IOC can publish about how close it is to
  * refusing clients — and MEASURED, it is the *only* one that sees this wall:
  * CA_REFUSED_CNT stayed 0 through the whole ramp, because an accept-time
- * ENFILE happens before a client object exists. Cap, walls and the operator
- * consequences: doc/rtems-fd-ceiling-deviation.md.
+ * ENFILE happens before a client object exists. The cap itself, and every
+ * measured wall behind it, is set and recorded in `rtems_config.c`.
  */
 int epics_rtems_boot_fd_usage(uint32_t *used, uint32_t *max) {
   uint32_t i;
@@ -113,10 +113,53 @@ int epics_rtems_boot_mem_usage(uint64_t *free_total, uint64_t *used_total,
 }
 
 /*
- * STAGE-5 PROBE — MEASUREMENT ONLY (doc/pvalink-rtems-design.md §5 stage 5,
- * pass criterion 6). Not merged; see doc/pvalink-stage5-probe.patch.
+ * The three heap numbers the `heapSpace` iocsh command is written against —
+ * EPICS base `heapSpaceCallFunc` (`libcom/RTEMS/posix/rtems_init.c:560-586`
+ * @R7.0.10), whose RTEMS >= 5 arm prints
  *
- * Criterion 6 asks for `rt stackuse` / `rt top` on the guest. This image
+ *     size - (unsigned long)(lifetime_allocated - lifetime_freed)
+ *
+ * These are `Heap_Information_block::Stats`, a different measurement from the
+ * `Free`/`Used` block walk above and NOT a restatement of it: `Stats.size` is
+ * the allocatable area the heap was given (`heap.c:311`) and the lifetime
+ * counters accumulate `_Heap_Block_size` on both sides (`heapallocate.c:303`,
+ * `heapfree.c:230`), so their difference is bytes held in used blocks
+ * INCLUDING per-block overhead. `Free.total` sums free block sizes, which
+ * excludes the overhead the walk skips. The two agree to within block headers
+ * and are not the same number, so the command gets its own reading rather than
+ * a nearby one.
+ *
+ * Base reaches these through `malloc_info()`, whose whole body is
+ * `_Protected_heap_Get_information(RTEMS_Malloc_Heap, the_info)`
+ * (`libcsupport/src/mallocinfo.c:43-51`) — the call above — so this uses that
+ * directly and stays one include shorter, at the same source of truth.
+ *
+ * Same contract as its neighbours: 0 and three values, or -1 and nothing
+ * written.
+ */
+int epics_rtems_boot_heap_space(uint64_t *size, uint64_t *lifetime_allocated,
+                                uint64_t *lifetime_freed) {
+  Heap_Information_block info;
+
+  if (size == NULL || lifetime_allocated == NULL || lifetime_freed == NULL) {
+    return -1;
+  }
+
+  if (!_Protected_heap_Get_information(RTEMS_Malloc_Heap, &info)) {
+    return -1;
+  }
+
+  *size = (uint64_t)info.Stats.size;
+  *lifetime_allocated = (uint64_t)info.Stats.lifetime_allocated;
+  *lifetime_freed = (uint64_t)info.Stats.lifetime_freed;
+  return 0;
+}
+
+/*
+ * STAGE-5 PROBE — MEASUREMENT ONLY. The wiring that calls these two functions
+ * from an image is not merged; only the functions themselves live here.
+ *
+ * The stage-5 pass criterion asks for `rt stackuse` / `rt top` on the guest. This image
  * configures the shell's commands (CONFIGURE_SHELL_COMMAND_STACKUSE,
  * rtems_config.c) but never starts a shell task, and the target has no
  * console input path at all — so the two readings have to be produced from
@@ -129,9 +172,8 @@ int epics_rtems_boot_mem_usage(uint64_t *free_total, uint64_t *used_total,
  *     CONFIGURE_STACK_CHECKER_ENABLED, which csrc/rtems_config.c:223 already sets.
  *   * `epics_rtems_boot_dump_tasks` is the task census (the `rt top` half —
  *     thread count, kernel names, effective priorities). It is verbatim the
- *     probe doc/rtems-priority-probe.patch used for the priority measurement,
- *     reused here rather than re-invented so both measurements are reading
- *     the same listing.
+ *     probe used for the priority measurement, reused here rather than
+ *     re-invented so both measurements are reading the same listing.
  *
  * The visitor only copies ids: `rtems_task_iterate` runs it with the object
  * allocator mutex held, so every query that could block or take another lock

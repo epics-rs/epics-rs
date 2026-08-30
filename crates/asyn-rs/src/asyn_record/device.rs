@@ -6,7 +6,7 @@
 //! Its **only** job is to hand `dbScan` the record's I/O Intr scan list, which
 //! is why a `record(asyn, ...)` without `field(DTYP, "asynRecordDevice")`
 //! cannot use `SCAN="I/O Intr"` at all: `scanAdd` finds `precord->dset == NULL`
-//! and demotes it to Passive (dbScan.c:272-276). The port reproduces both halves
+//! and demotes it to Passive (dbScan.c:269-274). The port reproduces both halves
 //! — this DSET, and the same demotion in `ioc_app::setup_io_intr`.
 //!
 //! Everything the interrupt mode actually does lives in the record's

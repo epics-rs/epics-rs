@@ -452,7 +452,8 @@ impl PortHandle {
     /// *user's* `timeoutUser`, so the deadline is only worth waking for where the
     /// caller has something to do at it — asynRecord's `pact` process request,
     /// which reports "process queueRequest timeout" and forces the record's
-    /// completion 10 s after queueing, whatever the port is doing (:919-927).
+    /// completion 10 s after queueing, whatever the port is doing
+    /// (asynRecord.c:919-927).
     ///
     /// Whether the deadline is honoured is not this timer's call: it hands the
     /// question to [`CancelToken::time_out_if_queued`], C's `if(!isQueued)`

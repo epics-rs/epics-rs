@@ -151,8 +151,9 @@ The Rust client exposes `CaClient::create_channel(&str)` with no priority
 argument, and the transport key is `SocketAddr`, so all channels to a server
 share one virtual circuit. libca treats priority as part of channel creation
 and creates independent virtual circuits for different priorities to the same
-server. Rust also lacks the C API shape where a thread can attach to an existing
-CA context.
+server, and gives each priority its own OS thread priority; the Rust side has
+no equivalent, since the tokio runtime is pool-shared. Rust also lacks the C
+API shape where a thread can attach to an existing CA context.
 
 Rust evidence:
 
@@ -160,9 +161,6 @@ Rust evidence:
   without priority and immediately allocates only a `cid`.
 - `crates/epics-ca-rs/src/client/transport.rs:246-314` queues and connects by
   `server_addr`.
-- `crates/epics-ca-rs/crates/epics-ca-rs/doc/09-libca-parity.md:111-119` records the missing
-  priority, per-priority virtual circuit, OS-thread priority, and attachable
-  context behavior.
 
 C reference:
 

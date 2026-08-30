@@ -15,7 +15,9 @@ use epics_oracle_rs::allowlist::Allowlist;
 use epics_oracle_rs::dbd::Dbd;
 use epics_oracle_rs::ioc::{CTools, PvxTools};
 use epics_oracle_rs::report::CaseResult;
-use epics_oracle_rs::report::{Counts, Denominator, Report, StaleRow, exit_status, run_failures};
+use epics_oracle_rs::report::{
+    Counts, Denominator, Report, StaleRow, UndrivableVal, exit_status, run_failures,
+};
 use epics_oracle_rs::runner::{Runner, select_types, workdir};
 use epics_oracle_rs::surface::{Surface, probe_supported_record_types};
 use epics_oracle_rs::{pvamonitor, pvaread};
@@ -141,6 +143,12 @@ async fn run() -> Result<ExitCode, String> {
     let runner = Runner::new(tools, dbd, workdir(None)?);
     let mut cases: Vec<CaseResult> = Vec::new();
     let drives_puts = matches!(args.phase, Phase::Put | Phase::Monitor | Phase::All);
+    let runs_monitor = matches!(args.phase, Phase::Monitor | Phase::All);
+    // Record types the monitor phase cannot stimulate at all, because the .dbd
+    // says no client may write their VAL. Collected here so the report states
+    // the exclusion; `Runner::probe_monitor` enforces it, and both read the
+    // same owner (`surface::val_status`) as the PVA monitor phase.
+    let mut monitor_undrivable: Vec<UndrivableVal> = Vec::new();
 
     for (i, rt) in types.iter().enumerate() {
         eprintln!("[{}/{}] {rt}", i + 1, types.len());
@@ -165,8 +173,18 @@ async fn run() -> Result<ExitCode, String> {
         if matches!(args.phase, Phase::Put | Phase::All) && drivable {
             cases.extend(runner.probe_puts(rt, &surface, &mut allowlist, args.max_put_cases));
         }
-        if matches!(args.phase, Phase::Monitor | Phase::All) && drivable {
-            cases.extend(runner.probe_monitor(rt, &surface, &mut allowlist));
+        if runs_monitor {
+            // Loud, and it names the rule: a shrunken drive denominator must
+            // never read as a measured-clean one.
+            if let Some(why) = epics_oracle_rs::surface::val_status(&surface, rt).why() {
+                eprintln!("    monitor phase excluded for {rt}: {why}");
+                monitor_undrivable.push(UndrivableVal {
+                    record_type: rt.to_string(),
+                    why: why.to_string(),
+                });
+            } else if drivable {
+                cases.extend(runner.probe_monitor(rt, &surface, &mut allowlist));
+            }
         }
         if matches!(args.phase, Phase::Array | Phase::All) {
             cases.extend(runner.probe_array(rt, &mut allowlist));
@@ -201,6 +219,7 @@ async fn run() -> Result<ExitCode, String> {
             record_types_unimplemented: surface.unimplemented_types.clone(),
             observable_fields: surface.denominator(),
             excluded_noaccess_fields: surface.excluded_noaccess,
+            excluded_undrivable_val: monitor_undrivable,
         },
         field_coverage,
         counts,

@@ -42,7 +42,7 @@
 use std::io;
 use std::sync::Mutex;
 
-use super::{FdUsage, MemUsage};
+use super::{FdUsage, HeapSpace, MemUsage};
 
 /// Descriptors this RTP holds, and the ceiling it holds them against.
 ///
@@ -150,6 +150,17 @@ pub(super) fn mem_usage() -> MemUsage {
         used: Some(current_commit as u64),
         largest_free: None,
     }
+}
+
+/// No reading. The `heapSpace` command this backs is EPICS base's RTEMS one
+/// (`libcom/RTEMS/posix/rtems_init.c:560-586` @R7.0.10) and its inputs are
+/// `Heap_Information_block::Stats` — an RTEMS allocator's own bookkeeping. An
+/// RTP's heap is mimalloc's, which reports committed bytes and keeps no
+/// lifetime-allocated/freed pair, so there is nothing here to report and a
+/// derived stand-in would be a different measurement wearing this one's name.
+/// Same reason `MemUsage::free` is `None` above.
+pub(super) fn heap_space() -> Option<HeapSpace> {
+    None
 }
 
 /// Note this thread in the census registry. Called once per IOC thread.

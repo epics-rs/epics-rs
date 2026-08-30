@@ -107,17 +107,22 @@ impl Record for SubRecord {
         crate::server::record::calc_class_link_backed_metadata_field(field)
     }
 
-    fn init_record(&mut self, pass: u8) -> CaResult<()> {
-        if pass == 0 {
-            // C `subRecord.c::init_record` (lines 130-132) seeds the
-            // monitor/archive/alarm trackers from the loaded VAL so the
-            // first process does not post or alarm on an unchanged value.
-            self.mlst = self.val;
-            self.alst = self.val;
-            self.lalm = self.val;
-        }
-        Ok(())
-    }
+    // C `subRecord.c::init_record` returns at `:99` for `pass == 0` and does
+    // ALL of its work in pass 1: the constant-link loads, INAM, SNAM, and only
+    // then `prec->mlst = prec->alst = prec->lalm = prec->val` (`:130-132`).
+    // That tail is unreachable for a record whose SNAM is empty (`:122`) or
+    // unregistered (`:128`), so it is performed by the SNAM resolution owner
+    // (`ioc_app::wire_subroutine`) and not from here — this ran in pass 0,
+    // before the resolution existed, and seeded the trackers of records C
+    // leaves at zero.
+
+    /// Empty for the reason the note above `record_type` gives: `sub`'s
+    /// tracker seed is `subRecord.c:130-132`, the tail below `init_record`'s
+    /// two early returns, and only a record whose SNAM actually resolved
+    /// reaches it. The generic tail runs before the resolution and so cannot
+    /// answer that; `ioc_app::wire_subroutine`, which performs the resolution,
+    /// does it there.
+    fn seed_deadband_tracking(&mut self) {}
 
     /// C `subRecord.c:119-123`: an empty `SNAM` names no subroutine, so
     /// `init_record` prints `"%s.SNAM is empty"`, sets `prec->pact = TRUE` and
@@ -334,17 +339,26 @@ mod tests {
         }
     }
 
-    /// `init_record(0)` seeds MLST/ALST/LALM from the loaded VAL so the
-    /// first process does not post or alarm on an unchanged value
-    /// (C `subRecord.c::init_record` lines 130-132).
+    /// Neither init hook seeds MLST/ALST/LALM: C reaches
+    /// `subRecord.c:130-132` only past `init_record`'s INAM and SNAM early
+    /// returns, so the seed belongs to the SNAM resolution owner
+    /// (`ioc_app::wire_subroutine`, covered by
+    /// `tests/snam_is_resolved_only_where_c_resolves_it.rs`). Seeding here
+    /// gave an unresolved-SNAM record `MLST: 5` where softIoc reads `MLST: 0`.
     #[test]
-    fn init_seeds_trackers_from_val() {
+    fn the_record_itself_seeds_no_tracker() {
         let mut rec = SubRecord::default();
         rec.put_field("VAL", EpicsValue::Double(7.0)).unwrap();
         rec.init_record(0).unwrap();
-        assert_eq!(rec.get_field("MLST"), Some(EpicsValue::Double(7.0)));
-        assert_eq!(rec.get_field("ALST"), Some(EpicsValue::Double(7.0)));
-        assert_eq!(rec.get_field("LALM"), Some(EpicsValue::Double(7.0)));
+        rec.init_record(1).unwrap();
+        rec.seed_deadband_tracking();
+        for field in ["MLST", "ALST", "LALM"] {
+            assert_eq!(
+                rec.get_field(field),
+                Some(EpicsValue::Double(0.0)),
+                "{field}"
+            );
+        }
     }
 
     /// BRSV round-trips as a `menuAlarmSevr` index (C `subRecord.c` BRSV,

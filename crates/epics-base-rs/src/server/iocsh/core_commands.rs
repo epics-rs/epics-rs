@@ -515,7 +515,28 @@ fn cmd_echo() -> CommandDef {
 /// agree except on the fractional-second conversions EPICS adds on top
 /// of the C library's (`epicsTime.cpp`): `%f` is nanoseconds and `%0Nf`
 /// is N digits, which chrono spells `%9f` and `%Nf`.
-fn epics_strftime_to_chrono(fmt: &str) -> String {
+///
+/// C's `strftime` cannot fail: an unknown conversion is copied out
+/// literally, so `date "%Q"` prints `%Q`. chrono's `DelayedFormat` instead
+/// makes its `Display` return `Err`, and `to_string()` on that panics — the
+/// measured result of `date "%Q"` was `a Display implementation returned an
+/// error unexpectedly: Error` and a dead shell thread, against C's `%Q`.
+///
+/// A runtime guard around the render cannot fix that, because there is no
+/// answer to fall back TO: the whole line is lost for one bad conversion.
+/// So no specifier chrono rejects is allowed into the format string in the
+/// first place. Each one is rendered on its own against the very timestamp
+/// the line will print, and the ones that fail come out as `%%X` — chrono's
+/// literal per cent — which is glibc's pass-through and makes the result
+/// render by construction. `now` is a parameter for exactly that reason:
+/// the probe has to be the real render, not a guess about one.
+fn epics_strftime_to_chrono(fmt: &str, now: &chrono::DateTime<chrono::Local>) -> String {
+    use std::fmt::Write as _;
+    // chrono renders this specifier for this timestamp without erroring.
+    let renders = |spec: &str| {
+        let mut probe = String::new();
+        write!(probe, "{}", now.format(spec)).is_ok()
+    };
     let c: Vec<char> = fmt.chars().collect();
     let mut out = String::with_capacity(fmt.len());
     let mut i = 0;
@@ -545,8 +566,21 @@ fn epics_strftime_to_chrono(fmt: &str) -> String {
             i = j + 1;
             continue;
         }
-        out.push('%');
-        i += 1;
+        // Not one of EPICS' own conversions, so it is the C library's, and
+        // the only question is whether chrono knows it. A trailing bare `%`
+        // has no following character to ask about and is a literal in C.
+        match c.get(i + 1) {
+            Some(&ch) if renders(&format!("%{ch}")) => {
+                out.push('%');
+                out.push(ch);
+            }
+            Some(&ch) => {
+                out.push_str("%%");
+                out.push(ch);
+            }
+            None => out.push_str("%%"),
+        }
+        i += if i + 1 < c.len() { 2 } else { 1 };
     }
     out
 }
@@ -572,7 +606,7 @@ fn cmd_date() -> CommandDef {
                 _ => "%Y/%m/%d %H:%M:%S.%06f",
             };
             let now = chrono::Local::now();
-            ctx.println(&now.format(&epics_strftime_to_chrono(fmt)).to_string());
+            ctx.println(&now.format(&epics_strftime_to_chrono(fmt, &now)).to_string());
             Ok(CommandOutcome::Continue)
         },
     )
@@ -599,17 +633,43 @@ fn cmd_cd() -> CommandDef {
 /// success — it only calls `updatePWD()`. The cwd line the port used to
 /// echo here has no counterpart in C.
 fn chdir_handler(args: &[ArgValue], ctx: &CommandContext) -> CommandResult {
-    let ArgValue::String(dir) = &args[0] else {
-        // C tests `args[0].sval == NULL` BEFORE it reaches `iocshSetError`
-        // (`libComRegister.c:108-116`), so an absent directory warns on stderr
-        // and leaves the line successful; only a `chdir()` that actually fails
-        // sets the shell's error flag. Refusing the line here made `on error
-        // break` abandon the rest of a script C finishes.
-        ctx.eprintln("Invalid directory path, ignored");
-        return Ok(CommandOutcome::Continue);
+    // C's whole body is one `||` (`libComRegister.c:108-116`):
+    //
+    // ```c
+    // if (args[0].sval == NULL ||
+    //     iocshSetError(chdir(args[0].sval))) {
+    //     fprintf(stderr, "Invalid directory path, ignored\n");
+    // } else {
+    //     updatePWD();
+    // }
+    // ```
+    //
+    // `None` is the NULL arm. It SHORT-CIRCUITS, so `iocshSetError` never
+    // runs and the line stays successful; refusing it made `on error break`
+    // abandon the rest of a script C finishes. `Some(false)` is a `chdir()`
+    // that failed, and that return value IS what `iocshSetError` is handed,
+    // so that line — and only that line — is errored.
+    let changed = match &args[0] {
+        ArgValue::String(dir) => Some(set_working_dir(dir).is_ok()),
+        _ => None,
     };
-    set_working_dir(dir).map_err(|e| format!("chdir: {dir}: {e}"))?;
-    Ok(CommandOutcome::Continue)
+    if changed == Some(true) {
+        // C prints nothing on success; `updatePWD` is inside
+        // `set_working_dir`, the one owner of the cwd.
+        return Ok(CommandOutcome::Continue);
+    }
+    // ONE sentence for both failing arms, because C's `||` writes it once.
+    // It does not name the directory and it does not spell the errno: this
+    // site used to return `Err(format!("chdir: {dir}: {e}"))`, which the
+    // shell then framed, so an operator who typed a missing directory read
+    // `ERROR st.cmd line 11: chdir: topbin: No such file or directory (os
+    // error 2)` where C says six words and no `os error`.
+    ctx.eprintln("Invalid directory path, ignored");
+    Ok(if changed.is_none() {
+        CommandOutcome::Continue
+    } else {
+        CommandOutcome::Failed
+    })
 }
 
 /// `pwd` — print the current working directory. Mirrors C `pwd`.
@@ -638,10 +698,14 @@ fn cmd_epics_env_unset() -> CommandDef {
             arg_type: ArgType::String,
         }],
         "Remove variable name from the environment",
-        |args: &[ArgValue], _ctx: &CommandContext| {
-            let name = match &args[0] {
-                ArgValue::String(s) => s,
-                _ => return Err("epicsEnvUnset: missing name".into()),
+        |args: &[ArgValue], ctx: &CommandContext| {
+            // Same shape and the same sentence as `epicsEnvSet`'s missing
+            // name (`libComRegister.c:164-168`): written by the body, so
+            // unframed, and failing the line through `iocshSetError(-1)`
+            // rather than through a diagnostic of the shell's own.
+            let ArgValue::String(name) = &args[0] else {
+                ctx.eprintln("Missing environment variable name argument.");
+                return Ok(CommandOutcome::Failed);
             };
             // C `epicsEnvUnset` (`osdEnv.c:58-63`) clears the shell
             // macro first, exactly as `epicsEnvSet` does — otherwise an
@@ -854,7 +918,7 @@ fn cmd_epics_thread_show() -> CommandDef {
                 // argument was a name, not a handle.
                 let id = match super::registry::parse_iocsh_int(token) {
                     Ok(value) => value as u64,
-                    Err(()) => match crate::runtime::task::thread_by_name(token) {
+                    Err(_) => match crate::runtime::task::thread_by_name(token) {
                         Some(thread) => thread.id(),
                         None => {
                             ctx.eprintln(&format!("\t'{token}' is not a known thread name"));
@@ -923,7 +987,7 @@ fn cmd_epics_thread_resume() -> CommandDef {
             for token in argv {
                 let (kind, found) = match super::registry::parse_iocsh_int(token) {
                     Ok(id) => ("thread id", crate::runtime::task::thread_by_id(id as u64)),
-                    Err(()) => ("thread name", crate::runtime::task::thread_by_name(token)),
+                    Err(_) => ("thread name", crate::runtime::task::thread_by_name(token)),
                 };
                 let Some(thread) = found else {
                     ctx.eprintln(&format!("'{token}' is not a valid {kind}"));
@@ -1976,12 +2040,36 @@ mod tests {
 
         // The default carries the EPICS `%06f` fraction, which chrono
         // spells `%6f`.
+        let now = chrono::Local::now();
         assert_eq!(
-            epics_strftime_to_chrono("%Y/%m/%d %H:%M:%S.%06f"),
+            epics_strftime_to_chrono("%Y/%m/%d %H:%M:%S.%06f", &now),
             "%Y/%m/%d %H:%M:%S.%6f"
         );
-        assert_eq!(epics_strftime_to_chrono("%f"), "%9f");
-        assert_eq!(epics_strftime_to_chrono("%d%%%H"), "%d%%%H");
+        assert_eq!(epics_strftime_to_chrono("%f", &now), "%9f");
+        assert_eq!(epics_strftime_to_chrono("%d%%%H", &now), "%d%%%H");
+        // C's strftime copies an unknown conversion out literally; chrono
+        // would error on it, so it becomes chrono's literal per cent.
+        assert_eq!(epics_strftime_to_chrono("%Q", &now), "%%Q");
+        assert_eq!(epics_strftime_to_chrono("a%", &now), "a%%");
+    }
+
+    /// C `date "%Q"` prints `%Q`: `strftime` copies an unknown conversion
+    /// out and cannot fail. Measured against
+    /// `~/work/epics-base/bin/linux-x86_64/softIoc`; the port panicked the
+    /// shell thread instead.
+    #[test]
+    fn an_unknown_conversion_prints_itself_instead_of_panicking() {
+        let ctx = make_ctx();
+        let mut reg = CommandRegistry::new();
+        register(&mut reg);
+        let cmd = reg.get("date").unwrap();
+        let args = parse_args(&["%Q".to_string()], &cmd.args).unwrap();
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let path = tmp.path().to_path_buf();
+        ctx.with_output(std::fs::File::create(&path).unwrap(), || {
+            cmd.handler.call(&args, &ctx).unwrap();
+        });
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "%Q\n");
     }
 
     #[test]

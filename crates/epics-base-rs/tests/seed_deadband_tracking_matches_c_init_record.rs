@@ -4,19 +4,22 @@
 //! Most C value records end `init_record` with
 //! `prec->mlst = prec->alst = prec->lalm = prec->val`, but seven of the types
 //! this port implements do not, and nothing in a record's shape predicts which
-//! group it lands in: `sub` seeds and `calc` does not; `calcout` seeds and
-//! `acalcout` does not; `bo` seeds and `busy` does not. Seeding uniformly
-//! suppressed a first-cycle post that C makes whenever such a record is loaded
-//! with a nonzero initial VAL.
+//! group it lands in: `calcout` seeds and `acalcout` does not; `bo` seeds and
+//! `busy` does not. Seeding uniformly suppressed a first-cycle post that C
+//! makes whenever such a record is loaded with a nonzero initial VAL.
 //!
 //! The table below is every record type this port serves MLST, ALST or LALM
-//! for, with the C `init_record` line range behind each verdict.
+//! for, with the C `init_record` line range behind each verdict. The verdict
+//! is about THIS hook, not about C in the abstract: `sub` is a `false` whose C
+//! counterpart does seed, because its seed sits below `init_record`'s early
+//! returns and so belongs to a later owner.
 
 mod module_records;
 
 use epics_base_rs::types::EpicsValue;
 
-/// `(record type, a nonzero VAL in the type's own representation, C seeds?)`
+/// `(record type, a nonzero VAL in the type's own representation, does
+/// `seed_deadband_tracking` seed?)`
 const CASES: &[(&str, EpicsValue, bool)] = &[
     // Seeds — std/rec
     ("ai", EpicsValue::Double(3.0), true), // aiRecord.c:129-131
@@ -32,14 +35,22 @@ const CASES: &[(&str, EpicsValue, bool)] = &[
     ("mbbiDirect", EpicsValue::Long(3), true), // mbbiDirectRecord.c:128
     ("mbbo", EpicsValue::UShort(3), true), // mbboRecord.c:179-180
     ("mbboDirect", EpicsValue::Long(3), true), // mbboDirectRecord.c:160
-    ("sub", EpicsValue::Double(3.0), true), // subRecord.c:130-132
     // Does not seed
+    //
+    // `sub` is the one row whose C counterpart DOES seed: `subRecord.c:130-132`
+    // sits below `init_record`'s empty-SNAM (`:122`) and unregistered-SNAM
+    // (`:128`) early returns, so only a record whose SNAM resolved reaches it.
+    // The generic tail runs before the resolution exists and cannot tell those
+    // apart, so the seed is performed by the resolution owner
+    // (`ioc_app::wire_subroutine`) and this hook is empty. Covered by
+    // `tests/snam_is_resolved_only_where_c_resolves_it.rs`.
+    ("sub", EpicsValue::Double(3.0), false), // subRecord.c:130-132
     ("calc", EpicsValue::Double(3.0), false), // calcRecord.c:90-112
     ("dfanout", EpicsValue::Double(3.0), false), // dfanoutRecord.c:96-109
-    ("sel", EpicsValue::Double(3.0), false),  // selRecord.c:88-108
+    ("sel", EpicsValue::Double(3.0), false), // selRecord.c:88-108
     ("scalcout", EpicsValue::Double(3.0), false), // sCalcoutRecord.c:203-320
     ("acalcout", EpicsValue::Double(3.0), false), // aCalcoutRecord.c:171-277
-    ("busy", EpicsValue::Enum(1), false),     // busyRecord.c:127-181
+    ("busy", EpicsValue::Enum(1), false),    // busyRecord.c:127-181
     ("swait", EpicsValue::Double(3.0), false), // swaitRecord.c:266-
 ];
 
@@ -74,7 +85,8 @@ fn each_type_seeds_its_trackers_exactly_as_its_c_init_record_does() {
                 .unwrap_or_else(|| panic!("{rtype}.{field} is not numeric"));
             if got != want {
                 wrong.push(format!(
-                    "{rtype}.{field}: VAL={val}, C {} seed at init_record, got {got} want {want}",
+                    "{rtype}.{field}: VAL={val}, seed_deadband_tracking {} seed, \
+                     got {got} want {want}",
                     if *seeds { "does" } else { "does not" }
                 ));
             }

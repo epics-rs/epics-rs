@@ -47,36 +47,60 @@ use std::net::{Ipv4Addr, SocketAddr, UdpSocket as StdUdpSocket};
 use crate::protocol::*;
 
 /// C `__FILE__` for `repeater.cpp` as the base build compiles it — the
-/// literal the `fprintf(stderr, "%s: …", __FILE__, …)` sites at `:148`,
-/// `:158` and `:526` put on the terminal. Verified in the built artifact:
+/// literal the `fprintf(stderr, "%s: …", __FILE__, …)` sites at `:145`,
+/// `:155` and `:514` put on the terminal. Verified in the built artifact:
 /// `strings lib/linux-x86_64/libca.so` carries `../repeater.cpp`.
 pub(crate) const C_FILE: &str = "../repeater.cpp";
 
-/// The three diagnostic facilities `repeater.cpp` uses, and the debug
-/// threshold each of its call sites carries.
+/// The three diagnostic facilities `repeater.cpp` uses.
 ///
-/// `repeater.cpp:73` does `#define DEBUG` *before* `#include "iocinf.h"`,
-/// so `debugPrintf` (`iocinf.h:28-32`) expands to `::printf` — **stdout,
-/// and compiled in, in every stock build**. It is not a debug-only macro
-/// in this translation unit: a `debugPrintf` is silent only where the C
-/// call site itself sits inside `if (debug)` / `if (debug > 1)`. Four of
-/// the eleven (`:187`, `:216`, `:519`, `:583`) sit inside nothing and
-/// print always — `CA Repeater: Attached and initialized` among them,
-/// which is why a C `caget` prints it on stdout and this port's did not.
+/// A stock C repeater prints none of the nine `debugPrintf` lines, at
+/// either revision this port has been read against. At R7.0.10 — the pin
+/// — `repeater.cpp` never defines `DEBUG`, so `debugPrintf`
+/// (`iocinf.h:28-32`) expands to nothing and all nine compile out; five
+/// of them are additionally inside `#ifdef DEBUG`. The runtime facility
+/// arrives after the tag, in `e271752158dd` ("Added -d option to
+/// caRepeater, sets debug level"), which adds `#define DEBUG`, a
+/// file-static `int debug`, `ca_repeater(int setDebug)` and an
+/// `if (debug)` / `if (debug > 1)` around most sites — and even there
+/// `caRepeater.cpp` `dup2`s stdout to `/dev/null` unless `-d` or `-v`
+/// was given. The facility is closed at level 0 both ways.
 ///
-/// The port had a bare `eprintln!` per site behind a single `debug > 0`
-/// gate, so `debug` meant two different things — "C gated this site" and
-/// "C did not gate it, we do" — and every line landed on stderr whatever
-/// facility C used. `Diag` removes that dual meaning: a site names the
-/// facility C uses, and [`Diag::printf`] takes the threshold C wrote at
-/// that site, `0` for the unguarded ones. The three facilities are not
-/// interchangeable — `debugPrintf` is stdout, `fprintf(stderr, …)` is
-/// stderr, and `errlogPrintf` is the errlog queue with its listeners.
+/// The port had it open. A threshold of `0` meant two things at once —
+/// "C wrote no `if (debug)` here" and "the facility is compiled in" —
+/// and `0 >= 0` holds, so four lines printed unasked. That is not a
+/// cosmetic difference: [`crate::repeater::ensure_repeater`]
+/// runs the repeater in-process on a background thread when the
+/// `caRepeater` binary is absent, so those lines came out of a CA client
+/// tool's own stdout, its data channel. [`DebugGate`] removes the dual
+/// meaning by having no variant for `0`; the facility opens only at a
+/// level the operator asked for, and `-d` keeps its meaning.
+///
+/// The three facilities are not interchangeable — `debugPrintf` is
+/// stdout, `fprintf(stderr, …)` is stderr, and `errlogPrintf` is the
+/// errlog queue with its listeners.
 #[derive(Clone, Copy)]
 pub(crate) struct Diag {
-    /// C `repeater.cpp:89` `static int debug`, assigned once from
-    /// `ca_repeater`'s `setDebug` argument (`:502`).
+    /// C's file-static `int debug` and the `setDebug` argument that
+    /// assigns it, both from `e271752158dd`; at the R7.0.10 pin
+    /// `ca_repeater` takes no argument and there is no such variable.
     debug: u8,
+}
+
+/// The `if ( debug… )` a C `debugPrintf` site sits inside, and the only
+/// thing that can open the facility.
+///
+/// There is deliberately no variant for `0`. No `debugPrintf` in
+/// `repeater.cpp` reaches a terminal at debug 0 — see [`Diag`] — so a
+/// `0` threshold describes no C site that exists, and it was the value
+/// that put this port's diagnostics on a CA client's stdout.
+#[derive(Clone, Copy)]
+pub(crate) enum DebugGate {
+    /// C `if ( debug )`, and the four sites C leaves unguarded: both are
+    /// silent until `-d 1`.
+    Debug = 1,
+    /// C `if ( debug > 1 )` — the per-datagram and per-client chatter.
+    Verbose = 2,
 }
 
 impl Diag {
@@ -84,12 +108,12 @@ impl Diag {
         Self { debug }
     }
 
-    /// C `debugPrintf` — `::printf`, i.e. **stdout**. `min_debug` is the
-    /// threshold of the `if (debug…)` the C call site sits inside: `0`
-    /// when it sits inside nothing, `1` for `if (debug)`, `2` for
-    /// `if (debug > 1)`.
-    pub(crate) fn printf(self, min_debug: u8, args: fmt::Arguments<'_>) {
-        if self.debug >= min_debug {
+    /// C `debugPrintf` — `::printf`, i.e. **stdout** — once the facility
+    /// is open. `gate` is the `if (debug…)` the C site sits inside;
+    /// the sites C leaves unguarded take [`DebugGate::Debug`], because
+    /// unguarded in C still means "not without `-d`".
+    pub(crate) fn printf(self, gate: DebugGate, args: fmt::Arguments<'_>) {
+        if self.debug >= gate as u8 {
             println!("{args}");
         }
     }
@@ -139,7 +163,7 @@ pub(crate) struct RepeaterClient {
 
 impl RepeaterClient {
     /// C `repeaterClient::repeaterClient` + `repeaterClient::connect`
-    /// (`repeater.cpp:131-164`). The two fallible steps are C's two, and
+    /// (`repeater.cpp:137-161`). The two fallible steps are C's two, and
     /// each has its own stderr diagnostic: a socket that cannot be made,
     /// and a socket that cannot be connected to the client. Collapsing
     /// them into one `io::Result` the caller answered with `Err(_) =>
@@ -147,7 +171,10 @@ impl RepeaterClient {
     pub(crate) fn new(addr: SocketAddr, diag: Diag) -> Option<Self> {
         // The constructor announces the client BEFORE `connect` runs, so
         // the line appears even for a client whose socket then fails.
-        diag.printf(1, format_args!("New client on port {}", addr.port()));
+        diag.printf(
+            DebugGate::Debug,
+            format_args!("New client on port {}", addr.port()),
+        );
         let sock = match StdUdpSocket::bind("0.0.0.0:0") {
             Ok(s) => s,
             Err(e) => {
@@ -171,7 +198,7 @@ impl RepeaterClient {
         Some(Self { sock, addr, diag })
     }
 
-    /// C `repeaterClient::sendConfirm` (`repeater.cpp:166-190`): a refused
+    /// C `repeaterClient::sendConfirm` (`repeater.cpp:163-187`): a refused
     /// confirm is the ordinary "client went away" answer and stays silent;
     /// any other send error is reported. The port's `.is_ok()` reported
     /// neither.
@@ -185,7 +212,7 @@ impl RepeaterClient {
             Err(e) if e.kind() == io::ErrorKind::ConnectionRefused => false,
             Err(e) => {
                 self.diag.printf(
-                    0,
+                    DebugGate::Debug,
                     format_args!(
                         "CA Repeater: confirm req err was \"{}\"",
                         sock_err_string(&e)
@@ -205,29 +232,32 @@ impl RepeaterClient {
         // EHOSTUNREACH as "client gone".
         //
         // The diagnostics are C `repeaterClient::sendMessage`'s own
-        // (`repeater.cpp:192-220`) and belong here, not in the caller:
+        // (`repeater.cpp:189-217`) and belong here, not in the caller:
         // `fanOut` prints nothing, and only this function knows the errno
         // that decides between the two messages.
         match self.sock.send(data) {
             Ok(_) => {
-                self.diag
-                    .printf(2, format_args!("Sent to port {}", self.addr.port()));
+                self.diag.printf(
+                    DebugGate::Verbose,
+                    format_args!("Sent to port {}", self.addr.port()),
+                );
                 true
             }
             Err(e) if e.kind() == io::ErrorKind::ConnectionRefused => {
                 self.diag.printf(
-                    1,
+                    DebugGate::Debug,
                     format_args!("Client on port {} refused message", self.addr.port()),
                 );
                 false
             }
             Err(e) => {
-                // C `repeater.cpp:216` — unguarded, so it prints at the
-                // stock debug level. The RETURN value keeps this port's
-                // rule (a transient error must not reap a live client);
-                // only the diagnostic is C's.
+                // C `repeater.cpp:213` — a `debugPrintf` C leaves
+                // outside any `if (debug)`, which still means "not
+                // without `-d`". The RETURN value keeps this port's rule
+                // (a transient error must not reap a live client); only
+                // the diagnostic is C's.
                 self.diag.printf(
-                    0,
+                    DebugGate::Debug,
                     format_args!("CA Repeater: UDP send err was \"{}\"", sock_err_string(&e)),
                 );
                 !matches!(e.kind(), io::ErrorKind::HostUnreachable)
@@ -259,15 +289,15 @@ impl RepeaterClient {
         match StdUdpSocket::bind(bind_addr) {
             Ok(_) => false, // addr free → client gone
             Err(e) if e.kind() == io::ErrorKind::AddrInUse => {
-                // C `repeaterClient::verify` (`repeater.cpp:290-297`).
+                // C `repeaterClient::verify` (`repeater.cpp:282-304`).
                 self.diag.printf(
-                    2,
+                    DebugGate::Verbose,
                     format_args!("Client on port {} is alive", self.addr.port()),
                 );
                 true
             }
             Err(e) => {
-                // C `repeater.cpp:303-309`: a bind test that fails for any
+                // C `repeater.cpp:296-302`: a bind test that fails for any
                 // reason OTHER than EADDRINUSE is neither "alive" nor a
                 // clean departure, and C says so on stderr before
                 // returning false. This port answers `true` instead —
@@ -284,7 +314,7 @@ impl RepeaterClient {
 }
 
 impl Drop for RepeaterClient {
-    /// C `repeaterClient::~repeaterClient` (`repeater.cpp:222-231`) closes
+    /// C `repeaterClient::~repeaterClient` (`repeater.cpp:219-228`) closes
     /// the socket and announces the departure. Putting it in `Drop` is what
     /// makes the line cover EVERY removal path — `fanOut`'s send-failure
     /// reap, `verifyClients`' bind-test sweep, the confirm-failure removal
@@ -292,7 +322,7 @@ impl Drop for RepeaterClient {
     /// print from.
     fn drop(&mut self) {
         self.diag.printf(
-            1,
+            DebugGate::Debug,
             format_args!("Deleted client on port {}", self.addr.port()),
         );
     }
@@ -390,7 +420,7 @@ pub(crate) fn fan_out(clients: &mut HashMap<u16, RepeaterClient>, src: SocketAdd
 /// never aborts: the repeater keeps running for unicast/broadcast beacons.
 ///
 /// `default_port` is the repeater port C passes to
-/// `addAddrToChannelAccessAddressList` (`repeater.cpp:545-546`) and which
+/// `addAddrToChannelAccessAddressList` (`repeater.cpp:533-534`) and which
 /// therefore appears in the failure line, since C renders the address with
 /// `ipAddrToDottedIP` — `a.b.c.d:port` (`osiSock.c:166-169`).
 pub(crate) fn join_beacon_multicast_groups(sock: &socket2::Socket, default_port: u16, diag: Diag) {
@@ -414,7 +444,7 @@ pub(crate) fn join_beacon_multicast_groups(sock: &socket2::Socket, default_port:
             continue;
         }
         if let Err(e) = sock.join_multicast_v4(&addr, &Ipv4Addr::UNSPECIFIED) {
-            // C `repeater.cpp:575` — `errlogPrintf`, not a stream: the
+            // C `repeater.cpp:563` — `errlogPrintf`, not a stream: the
             // line has to reach `errlogAddListener` consumers (the IOC log
             // client among them), which a `tracing::warn!` with different
             // wording never did.
@@ -435,20 +465,22 @@ pub(crate) fn join_beacon_multicast_groups(sock: &socket2::Socket, default_port:
 /// abused. C `caRepeater.c` has no cap; we choose to be stricter.
 pub(crate) const MAX_REPEATER_CLIENTS: usize = 1024;
 
-/// C `verifyClients` (`repeater.cpp:317-335`) — bind-test EVERY registered
+/// C `verifyClients` (`repeater.cpp:310-325`) — bind-test EVERY registered
 /// client and reap the ones whose port is now free.
 ///
 /// This is unconditional: it does NOT wait for a send to fail. C's own
-/// comment at the call site (`repeater.cpp:473-484`) gives the reason —
+/// comment at the call site (`repeater.cpp:463-474`) gives the reason —
 /// "an ICMP error return does not get through to send(), which returns no
 /// error code" on some platforms — so send-failure reaping alone leaks stale
 /// clients there.
 ///
 /// C closes with `debugPrintf("Verified %u active clients\n",
-/// theClients.count())` (`:331-333`) — the SURVIVOR count, and this is the
-/// only function in `repeater.cpp` that prints it. The port used to print it
-/// from `fanOut` and from the registration wrapper, and to print an invented
-/// "Reaped N departed client(s)" here instead.
+/// theClients.count())` — the SURVIVOR count, and this is the only function
+/// in `repeater.cpp` that prints it. The port used to print it from `fanOut`
+/// and from the registration wrapper, and to print an invented "Reaped N
+/// departed client(s)" here instead. That line is post-pin: it and its
+/// `if (debug)` arrive in `e271752158dd`, so R7.0.10's `verifyClients`
+/// (`:310-325`) prints nothing at all.
 pub(crate) fn verify_clients(clients: &mut HashMap<u16, RepeaterClient>, diag: Diag) {
     let dead: Vec<u16> = clients
         .iter()
@@ -458,7 +490,10 @@ pub(crate) fn verify_clients(clients: &mut HashMap<u16, RepeaterClient>, diag: D
     for p in dead {
         clients.remove(&p);
     }
-    diag.printf(1, format_args!("Verified {} active clients", clients.len()));
+    diag.printf(
+        DebugGate::Debug,
+        format_args!("Verified {} active clients", clients.len()),
+    );
 }
 
 /// C `register_new_client` (`repeater.cpp:358-477`), in C's order:
@@ -502,7 +537,7 @@ pub(crate) fn register_client(
     if !confirmed {
         clients.remove(&port);
         diag.printf(
-            1,
+            DebugGate::Debug,
             format_args!("Deleted repeater client on port {port}, error sending ack"),
         );
     }
@@ -515,7 +550,7 @@ pub(crate) fn register_client(
     let noop = CaHeader::new(CA_PROTO_VERSION);
     fan_out(clients, src, &noop.to_bytes());
 
-    // C `repeater.cpp:473-486`: the bind-test sweep, run whenever a
+    // C `repeater.cpp:463-476`: the bind-test sweep, run whenever a
     // registration created a client, and deliberately AFTER the confirm above
     // so the new client is never reaped before it is acknowledged. It carries
     // its own `Verified %u active clients` line.
@@ -843,7 +878,7 @@ mod tests {
         );
     }
 
-    /// C `repeater.cpp:575` reports a failed `IP_ADD_MEMBERSHIP` through
+    /// C `repeater.cpp:563` reports a failed `IP_ADD_MEMBERSHIP` through
     /// `errlogPrintf` — the message queue with its listeners, not a stream —
     /// and renders the group with `ipAddrToDottedIP`, i.e. `a.b.c.d:port`
     /// (`osiSock.c:166-169`). The port used a `tracing::warn!` carrying

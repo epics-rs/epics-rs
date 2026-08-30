@@ -368,6 +368,25 @@ pub struct Denominator {
     pub observable_fields: usize,
     /// DBF_NOACCESS declarations excluded (no client can reach them).
     pub excluded_noaccess_fields: usize,
+    /// Record types the **monitor** phase left out of its drive denominator,
+    /// each with the `.dbd` rule that removed it
+    /// ([`crate::surface::val_status`]). Empty when this run drove no monitor
+    /// phase — an exclusion that was never in scope is not an exclusion.
+    #[serde(default)]
+    pub excluded_undrivable_val: Vec<UndrivableVal>,
+}
+
+/// One record type the monitor phase could not stimulate, and the rule that
+/// says so.
+///
+/// Named rather than counted: a drive denominator that reports only "10
+/// excluded" cannot be audited back against the `.dbd`, which is the failure
+/// this report exists to prevent.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct UndrivableVal {
+    pub record_type: String,
+    /// The rule, from [`crate::surface::ValStatus::why`].
+    pub why: String,
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -436,9 +455,21 @@ impl Report {
             d.observable_fields
         ));
         s.push_str(&format!(
-            "  excluded (DBF_NOACCESS): {} (no CA client can reach these)\n\n",
+            "  excluded (DBF_NOACCESS): {} (no CA client can reach these)\n",
             d.excluded_noaccess_fields
         ));
+        if !d.excluded_undrivable_val.is_empty() {
+            s.push_str(&format!(
+                "  monitor drive excluded : {}  (the drive is the stimulus, not the reading, so a\n\
+                 {:26}VAL the .dbd says no client may write leaves that denominator)\n",
+                d.excluded_undrivable_val.len(),
+                ""
+            ));
+            for u in &d.excluded_undrivable_val {
+                s.push_str(&format!("      {:14} {}\n", u.record_type, u.why));
+            }
+        }
+        s.push('\n');
 
         let fc = &self.field_coverage;
         s.push_str("COVERAGE\n");
@@ -719,6 +750,7 @@ mod tests {
                 record_types_unimplemented: vec![],
                 observable_fields: 1,
                 excluded_noaccess_fields: 0,
+                excluded_undrivable_val: Vec::new(),
             },
             field_coverage: field_coverage(&cases, 1),
             counts: Counts::tally(&cases),
@@ -843,6 +875,7 @@ mod tests {
                 record_types_unimplemented: vec![],
                 observable_fields: 2,
                 excluded_noaccess_fields: 0,
+                excluded_undrivable_val: Vec::new(),
             },
             field_coverage: field_coverage(&cases, 2),
             counts: Counts::tally(&cases),
@@ -898,6 +931,7 @@ mod tests {
                 record_types_unimplemented: vec![],
                 observable_fields: 1,
                 excluded_noaccess_fields: 0,
+                excluded_undrivable_val: Vec::new(),
             },
             field_coverage: field_coverage(&cases, 1),
             counts: Counts::tally(&cases),
@@ -955,6 +989,7 @@ mod tests {
                 record_types_unimplemented: vec!["aai".into()],
                 observable_fields: 100,
                 excluded_noaccess_fields: 20,
+                excluded_undrivable_val: Vec::new(),
             },
             field_coverage: Coverage {
                 enumerated: 100,
@@ -998,6 +1033,7 @@ mod tests {
                 record_types_unimplemented: vec!["calc".into()],
                 observable_fields: 100,
                 excluded_noaccess_fields: 0,
+                excluded_undrivable_val: Vec::new(),
             },
             field_coverage: Coverage {
                 enumerated: 100,
@@ -1043,6 +1079,7 @@ mod tests {
                 record_types_unimplemented: vec![],
                 observable_fields: 1,
                 excluded_noaccess_fields: 0,
+                excluded_undrivable_val: Vec::new(),
             },
             field_coverage: Coverage::default(),
             counts: Counts::tally(std::slice::from_ref(&c)),
@@ -1139,6 +1176,7 @@ why = "C's special() rejects SPC_MOD; port accepts."
                 record_types_unimplemented: vec![],
                 observable_fields: 10,
                 excluded_noaccess_fields: 0,
+                excluded_undrivable_val: Vec::new(),
             },
             field_coverage: Coverage {
                 enumerated: 10,
@@ -1230,6 +1268,7 @@ why = "One row, both lanes."
                 record_types_unimplemented: vec![],
                 observable_fields: 1,
                 excluded_noaccess_fields: 0,
+                excluded_undrivable_val: Vec::new(),
             },
             field_coverage: Coverage {
                 enumerated: 1,

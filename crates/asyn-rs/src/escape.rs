@@ -32,7 +32,7 @@
 //!   the trace errlog branch (asynManager.c:3159) and every `asynRecord` field
 //!   (asynRecord.c:725,1629,2005) escape through — each with its own buffer size,
 //!   which the caller must state.
-//! - [`print_escaped`] — `epicsStrPrintEscaped` (epicsString.c:230-262), the
+//! - [`print_escaped`] — `epicsStrPrintEscaped` (epicsString.c:230-269), the
 //!   `FILE *` form, has no destination bound, and keeps C's `strlen(s) == 0`
 //!   first-byte-NUL early-return quirk (R17-49). This is what
 //!   `asynPortDriver::report` prints the EOS pair with
@@ -58,7 +58,7 @@ pub(crate) fn escaped_from_raw(src: &[u8], dstlen: usize) -> String {
     escape(src, dstlen.saturating_sub(1))
 }
 
-/// C `epicsStrPrintEscaped` (epicsString.c:230-262) — the `FILE *` form. C's
+/// C `epicsStrPrintEscaped` (epicsString.c:230-269) — the `FILE *` form. C's
 /// `switch` forgot the NUL case, so C prints `\x00`; the port **refuses that
 /// CBUG-D4 divergence** and renders NUL as `\0`, identically to
 /// [`escaped_from_raw`] (both reach the one [`escape`] table). It writes to a
@@ -209,7 +209,7 @@ mod tests {
     }
 
     /// R17-49. `epicsStrPrintEscaped` early-returns on `strlen(s) == 0`
-    /// (epicsString.c:236-237) even though it was handed an explicit length: a
+    /// (epicsString.c:237-238) even though it was handed an explicit length: a
     /// buffer whose first byte is NUL prints nothing at all. Against compiled
     /// libCom:
     ///

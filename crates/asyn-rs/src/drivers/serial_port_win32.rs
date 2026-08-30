@@ -252,7 +252,7 @@ impl SerialIoStateWin32 {
         match timeout {
             // C leaves `SetCommTimeouts` uncalled for a negative timeout
             // (`if (pasynUser->timeout >= 0)`, drvAsynSerialPortWin32.c:577)
-            // and starts no timer (`readTimeout > 0`, :606), so its
+            // and starts no timer (`readTimeout > 0`, :607), so its
             // one-byte `ReadFile` blocks until the device answers. This
             // backend reads into the whole buffer rather than a byte at a
             // time, so the same "return on the first byte, never time out"
@@ -480,7 +480,7 @@ impl DrvAsynSerialPort {
         base.init_connected(false);
         base.auto_connect = true;
         // C passes `interruptProcess = 1` to `pasynOctetBase->initialize`
-        // (drvAsynSerialPortWin32.c:798): every successful octet read on this port fans out to
+        // (drvAsynSerialPortWin32.c:798-799): every successful octet read on this port fans out to
         // its octet interrupt users, which is what drives a SCAN="I/O Intr"
         // record. See `PortDriverBase::octet_interrupt_process`.
         base.octet_interrupt_process = true;
@@ -1268,9 +1268,9 @@ mod tests {
 
     /// C-Win32 `readIt` never closes the handle: the file's only two
     /// `closeConnection` call sites are the explicit disconnect
-    /// (`drvAsynSerialPortWin32.c:470`) and `writeIt` (`:525`), and the read
-    /// error branch at `:596-640` sets `errorMessage`, assigns `asynError` and
-    /// breaks. `writeIt` does close, so the two directions are asserted
+    /// (`drvAsynSerialPortWin32.c:470`) and `writeIt` (`:525`), and `readIt`'s
+    /// `ReadFile` error branch at `:618-625` sets `errorMessage`, assigns
+    /// `asynError` and breaks. `writeIt` does close, so the two directions are asserted
     /// together — the asymmetry is the point.
     ///
     /// The port publishes `connected` with no handle so the failure comes from

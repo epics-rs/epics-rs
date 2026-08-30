@@ -187,7 +187,7 @@ impl IpPortConfig {
 /// (`strchr(cp, ' ')`) and `sscanf(blank+1, "%5s", protocol)` takes the first
 /// whitespace-delimited run, truncated to five characters (`char protocol[6]`);
 /// whatever follows that run is ignored. With no blank at all, `protocol[0]` is
-/// `'\0'` and C defaults to `SOCK_STREAM` (:355-357).
+/// `'\0'` and C defaults to `SOCK_STREAM` (:356-358).
 ///
 /// The token is then classified *exhaustively* — see [`protocol_from_token`].
 /// A whitelist of recognized suffixes is not enough: an unrecognized token has
@@ -602,7 +602,7 @@ pub(super) fn write_with_retry(
     cap: Option<std::time::Instant>,
 ) -> AsynResult<usize> {
     let mut offset = 0;
-    // C's `haveStartTime`/`startTime` (drvAsynIPPort.c:665, 694-708): stamped at
+    // C's `haveStartTime`/`startTime` (drvAsynIPPort.c:631, 662-674): stamped at
     // the FIRST retryable `send` and never re-armed, not even by a pass that
     // moved bytes. It is what bounds a `poll` that keeps reporting writable
     // against a `send` that keeps answering EWOULDBLOCK — a cycle the per-pass
@@ -1383,7 +1383,7 @@ impl DrvAsynIPPort {
     /// hostInfo, priority, noAutoConnect, noProcessEos)` leaves one:
     /// [`Self::new`] plus `Self::apply_ip_port_configure` (the `registerPort`
     /// autoConnect flag and, unless `noProcessEos`, the default EOS interpose —
-    /// drvAsynIPPort.c:1043-1066).
+    /// drvAsynIPPort.c:1028-1066).
     ///
     /// The single public entry for callers outside the iocsh command that need a
     /// fully-configured IP port — e.g. a `noAutoConnect` port registered for a
@@ -1483,7 +1483,7 @@ impl DrvAsynIPPort {
     }
 
     /// Everything `drvAsynIPPortConfigure` gives a port beyond constructing the
-    /// driver (drvAsynIPPort.c:1043-1066):
+    /// driver (drvAsynIPPort.c:1028-1066):
     ///
     /// ```c
     /// pasynManager->registerPort(tty->portName, ASYN_CANBLOCK, !noAutoConnect, ...);
@@ -3290,7 +3290,7 @@ mod tests {
     /// on VxWorks either: `drvAsynIPPort.c` compiles the option only under
     /// `USE_SOCKTIMEOUT`, which is `#if defined(__rtems__)` (`:71-72`), while
     /// vxWorks takes `USE_POLL` (`:74-76`) and bounds `writeIt` with
-    /// `poll(POLLOUT, writePollmsec)` (`:667-686`) instead.
+    /// `poll(POLLOUT, writePollmsec)` (`:636-652`) instead.
     ///
     /// Host proxy for a target-only failure: Linux implements the option, so
     /// the pre-fix code also returned Timeout here. What fails before the fix

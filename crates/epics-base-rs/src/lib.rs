@@ -17,6 +17,9 @@
 //! | `ca-gateway` | `R2-1-3-0-54-g0666f21` |
 //! | `optics` | `R2-14-15-g3def19d` |
 //! | `mca` | `687d563` (tree carries no tags) |
+//! | `autosave` | `R6-0-20-g186f467` |
+//! | `iocStats` | `4.0.1` |
+//! | `opcua` | `75c4f1c` (tree carries no tags) |
 //!
 //! **Resolve by symbol at the pin; the line is a hint.** Find the named
 //! function, struct, macro or field first, and treat the line number as a hint

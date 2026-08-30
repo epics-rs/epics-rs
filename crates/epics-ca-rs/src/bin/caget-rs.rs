@@ -26,6 +26,71 @@ const TERMINALS: &[(&str, copt::Terminal)] = &[
     ("version", copt::Terminal::Version),
 ];
 
+/// C `caget.c:56-105` `usage()`, byte for byte. C substitutes two
+/// COMPILE-TIME constants, not the running configuration: `%f` of
+/// `DEFAULT_TIMEOUT` and `%u` of `CA_PRIORITY_MAX`, so `caget -w 5 -h` still
+/// advertises the 1.000000 s default. Written to stderr by
+/// `copt::Scan::finish` on the `Terminal::Usage` arm (`caget.c:400-402`).
+fn usage() -> String {
+    format!(
+        r#"
+Usage: caget [options] <PV name> ...
+
+  -h: Help: Print this message
+  -V: Version: Show EPICS and CA versions
+Channel Access options:
+  -w <sec>: Wait time, specifies CA timeout, default is {timeout:.6} second(s)
+  -c: Asynchronous get (use ca_get_callback and wait for completion)
+  -p <prio>: CA priority (0-{max}, default 0=lowest)
+Format options:
+      Default output format is "name value"
+  -t: Terse mode - print only value, without name
+  -a: Wide mode "name timestamp value stat sevr" (read PVs as DBR_TIME_xxx)
+  -d <type>: Request specific dbr type; use string (DBR_ prefix may be omitted)
+      or number of one of the following types:
+ DBR_STRING     0  DBR_STS_FLOAT    9  DBR_TIME_LONG   19  DBR_CTRL_SHORT    29
+ DBR_INT        1  DBR_STS_ENUM    10  DBR_TIME_DOUBLE 20  DBR_CTRL_INT      29
+ DBR_SHORT      1  DBR_STS_CHAR    11  DBR_GR_STRING   21  DBR_CTRL_FLOAT    30
+ DBR_FLOAT      2  DBR_STS_LONG    12  DBR_GR_SHORT    22  DBR_CTRL_ENUM     31
+ DBR_ENUM       3  DBR_STS_DOUBLE  13  DBR_GR_INT      22  DBR_CTRL_CHAR     32
+ DBR_CHAR       4  DBR_TIME_STRING 14  DBR_GR_FLOAT    23  DBR_CTRL_LONG     33
+ DBR_LONG       5  DBR_TIME_INT    15  DBR_GR_ENUM     24  DBR_CTRL_DOUBLE   34
+ DBR_DOUBLE     6  DBR_TIME_SHORT  15  DBR_GR_CHAR     25  DBR_STSACK_STRING 37
+ DBR_STS_STRING 7  DBR_TIME_FLOAT  16  DBR_GR_LONG     26  DBR_CLASS_NAME    38
+ DBR_STS_SHORT  8  DBR_TIME_ENUM   17  DBR_GR_DOUBLE   27
+ DBR_STS_INT    8  DBR_TIME_CHAR   18  DBR_CTRL_STRING 28
+Enum format:
+  -n: Print DBF_ENUM value as number (default is enum string)
+Arrays: Value format: print number of requested values, then list of values
+  Default:    Print all values
+  -# <count>: Print first <count> elements of an array
+  -S:         Print array of char as a string (long string)
+Floating point type format:
+  Default: Use %g format
+  -e <nr>: Use %e format, with a precision of <nr> digits
+  -f <nr>: Use %f format, with a precision of <nr> digits
+  -g <nr>: Use %g format, with a precision of <nr> digits
+  -s:      Get value as string (honors server-side precision)
+  -lx:     Round to long integer and print as hex number
+  -lo:     Round to long integer and print as octal number
+  -lb:     Round to long integer and print as binary number
+Integer number format:
+  Default: Print as decimal number
+  -0x: Print as hex number
+  -0o: Print as octal number
+  -0b: Print as binary number
+Alternate output field separator:
+  -F <ofs>: Use <ofs> as an alternate output field separator
+
+Example: caget -a -f8 my_channel another_channel
+  (uses wide output format, doubles are printed as %f with precision of 8)
+
+"#,
+        timeout = epics_ca_rs::cli::DEFAULT_CLI_TIMEOUT_SECS,
+        max = epics_ca_rs::copt::CA_PRIORITY_MAX,
+    )
+}
+
 /// C `caget` output format (`caget.c:45`, `typedef enum { plain, terse,
 /// all, specifiedDbr }`). The request DBR type and the output format are
 /// independent: only `specifiedDbr` carries the `-d` type to the wire;
@@ -749,8 +814,7 @@ async fn main() {
     // Parse via ArgMatches (not the plain derive) so the command-line
     // order of `-t`/`-a`/`-d` is recoverable for the C mutual-exclusion
     // rule (`resolve_format`).
-    let cmd = Args::command();
-    let parsed = TOOL.get_matches(cmd.clone());
+    let parsed = TOOL.get_matches(Args::command());
     let matches = parsed.matches();
     let args = Args::from_arg_matches(matches).expect("clap validated the arguments");
 
@@ -786,7 +850,7 @@ async fn main() {
     // End of C's getopt loop: the warnings above go to stderr in command-line
     // order, and `-h` / `-V` — which C's loop `return`s from where it meets
     // them — run here, AFTER those warnings and never before (R13-26).
-    scan.finish(&cmd, &epics_ca_rs::protocol::version_info(), TERMINALS);
+    scan.finish(&usage(), &epics_ca_rs::protocol::version_info(), TERMINALS);
 
     // C `caget.c:527-531`: the missing-PV check runs after the getopt loop,
     // so `-V` above still wins and a bad option argument has already warned.
@@ -1137,6 +1201,21 @@ fn parse_dbr_type(s: &str) -> Option<u16> {
 
 #[cfg(test)]
 mod tests {
+
+    /// Measured against `caget -h` from EPICS 7.0.10.1-DEV: 2606 bytes on
+    /// stderr, byte for byte. The length is pinned because the failure this
+    /// guards against — rendering the block through clap instead — changes
+    /// every line of it.
+    #[test]
+    fn the_usage_block_is_cs_text_not_claps() {
+        let u = super::usage();
+        assert!(u.starts_with("\nUsage: caget [options] <PV name> ...\n"));
+        // C prints the COMPILE-TIME constants, not the running configuration.
+        assert!(u.contains("default is 1.000000 second(s)"));
+        assert!(u.contains("(0-99, default 0=lowest)"));
+        assert!(u.ends_with("\n\n"), "C's block closes with a blank line");
+        assert_eq!(u.len(), 2606);
+    }
     use super::{
         Args, GetResult, OutputMode, PvRead, ReadError, ReqCount, TOOL, caget_req_count,
         dbr_extended_str, dbr_text, parse_dbr_type, read_error, read_timeout, resolve_dbr_type,

@@ -38,7 +38,7 @@ use std::collections::BTreeSet;
 
 use epics_oracle_rs::allowlist::Allowlist;
 #[cfg(tokio_backend)]
-use epics_oracle_rs::catool::CaTools;
+use epics_oracle_rs::catool::{CaTools, PutOutcome};
 use epics_oracle_rs::dbd::Dbd;
 use epics_oracle_rs::diff::Verdict;
 use epics_oracle_rs::ioc::CTools;
@@ -295,15 +295,51 @@ fn a_server_issued_refusal_is_a_reading_not_a_measurement_failure() {
             .unwrap_or_else(|e| {
                 panic!("{side}: a refusal by the server must be a reading, got ERROR: {e}")
             });
+        let PutOutcome::Refused { error } = &out else {
+            panic!("{side}: NAME is special(SPC_NOMOD); the write must be refused, got {out:?}");
+        };
         assert!(
-            !out.accepted,
-            "{side}: NAME is special(SPC_NOMOD); the write must be refused"
-        );
-        assert!(
-            out.error.is_some(),
+            !error.is_empty(),
             "{side}: a refusal must carry the server's complaint"
         );
     }
+}
+
+/// A completion the server withholds **on purpose** must stay a reading too.
+///
+/// The third put outcome, planted against the real pair on the record type
+/// whose entire contract is to produce it: C's `busy` declines
+/// `recGblFwdLink()` while `VAL` is non-zero (busy `docs/busyRecord.md`), so
+/// `ca_put_callback` is meant to stay open and `caput -c` prints "Write
+/// callback operation timed out" over a channel that connected and a write that
+/// landed. Classifying that as a measurement failure cost four ERROR cases per
+/// `--phase all` run and hid the divergence underneath them.
+///
+/// The readback is asserted alongside, because it is what proves the write
+/// reached the record: a non-completion is not a put that did not happen.
+#[cfg(tokio_backend)]
+#[test]
+fn a_completion_the_server_withholds_is_a_reading_not_a_measurement_failure() {
+    let t = tools();
+    let dir = workdir(None).unwrap();
+    let db = dir.join("put_busy_nocomplete.db");
+    std::fs::write(&db, "record(busy, \"ORACLE:BUSYNC\") {}\n").unwrap();
+    let pair = Pair::boot(&t, &db, "ORACLE:BUSYNC").expect("both IOCs must boot");
+
+    let c = CaTools::new(&t, pair.c.port(), Side::C);
+    let out = c
+        .caput("ORACLE:BUSYNC", "1")
+        .unwrap_or_else(|e| panic!("a withheld completion must be a reading, got ERROR: {e}"));
+    assert_eq!(
+        out,
+        PutOutcome::NeverCompleted,
+        "busy withholds the put completion while VAL is non-zero"
+    );
+    assert_eq!(
+        c.caget_string("ORACLE:BUSYNC").expect("readback"),
+        "Busy",
+        "the write landed; only the completion callback is outstanding"
+    );
 }
 
 /// The outermost contract: the **binary's own exit code**.

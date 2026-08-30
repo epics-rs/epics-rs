@@ -1070,8 +1070,9 @@ impl MonitorFinishGuard {
         Self { tx, fin: Some(fin) }
     }
 
-    /// Queue this subscriber's removal signal, then hand its terminal frame to
-    /// the writer — the [`ExecFinishGuard::reply`] rule, for the same reason.
+    /// Reserve the writer, then queue this subscriber's removal signal and
+    /// push its terminal frame — the [`ExecFinishGuard::reply`] rule, for the
+    /// same two reasons.
     ///
     /// A client may re-INIT the ioid the instant it sees MONITOR FINISH, and
     /// `handle_op`'s duplicate-INIT check is connection-FATAL, so the op has to
@@ -1080,11 +1081,19 @@ impl MonitorFinishGuard {
     /// client's re-INIT racing the OS scheduler for the few instructions
     /// between the two; `biased` in [`handle_connection_io`] orders the two
     /// queues but cannot order a signal that has not been queued yet.
+    ///
+    /// And [`apply_monitor_finish`] removes the op, dropping the
+    /// `OpState::monitor_abort` that cancels this very task — so an await
+    /// between the signal and the push would let the removal destroy the
+    /// FINISH frame it was sent to announce.
     async fn reply(mut self, tx: &ChannelTx, buf: Vec<u8>) {
+        let permit = tx.reserve(buf.len()).await;
         if let Some(fin) = self.fin.take() {
             let _ = self.tx.send(fin);
         }
-        let _ = tx.send(buf).await;
+        if let Ok(permit) = permit {
+            permit.send(buf);
+        }
     }
 }
 
@@ -1219,8 +1228,9 @@ impl ExecFinishGuard {
         }
     }
 
-    /// Queue this task's completion signal, then hand its terminal frame to
-    /// the writer — in that order, and only in that order.
+    /// Reserve the writer, then queue this task's completion signal and push
+    /// its terminal frame — in that order, with no suspension point between
+    /// the last two.
     ///
     /// pvxs commits the op transition inside `ServerGPR::doReply` —
     /// `state = Idle` / `cleanup()` at `serverget.cpp:112-115` — and enqueues
@@ -1233,19 +1243,33 @@ impl ExecFinishGuard {
     /// on `exec_fin_tx`, so the same order has to be built rather than
     /// inherited: queue the transition first, and let the read loop drain that
     /// queue ahead of the socket (`biased` in [`handle_connection_io`]).
-    /// Signalling from `Drop` instead — after the body is already with the
-    /// writer — leaves the client's answer racing the OS scheduler for the few
-    /// instructions between the two.
+    ///
+    /// The reservation is what makes that safe to do from a *spawned* task.
+    /// [`poll_inline_or_spawn`] promotes this body to a task the moment any
+    /// await inside it returns `Pending` — which tokio's cooperative budget
+    /// makes happen on a wide-open writer queue, not only under real
+    /// backpressure — and parks its `AbortHandle` in `OpState::data_task_abort`.
+    /// The owner drops that handle as soon as it applies the signal
+    /// ([`apply_exec_finish`]), so an await *after* the signal is a
+    /// cancellation point the owner is already racing to fire: the task dies
+    /// mid-`send` and the client waits for a reply that no longer exists.
+    /// Taking both writer bounds first leaves the tail await-free, so
+    /// "the signal is queued" implies "the frame is queued" by construction —
+    /// and a cancellation before the reservation completes loses nothing,
+    /// because no signal has been queued yet.
     ///
     /// Taking `self` by value is what closes the family: a data-phase task
     /// reaches the writer through this method or not at all, so no site can
     /// enqueue a body while its own op is still marked `Executing`.
     async fn reply(mut self, tx: &ChannelTx, buf: Vec<u8>, success: bool) {
+        let permit = tx.reserve(buf.len()).await;
         if let Some(mut fin) = self.fin.take() {
             fin.success = success;
             let _ = self.tx.send(fin);
         }
-        let _ = tx.send(buf).await;
+        if let Ok(permit) = permit {
+            permit.send(buf);
+        }
     }
 
     /// [`Self::reply`] for the error frames a data-phase task emits instead of
@@ -3283,19 +3307,40 @@ impl SrvTx {
         )
     }
 
-    async fn send(&self, buf: Vec<u8>) -> Result<(), tokio::sync::mpsc::error::SendError<Vec<u8>>> {
-        if self.budget.acquire(buf.len()).await.is_err() {
-            return Err(tokio::sync::mpsc::error::SendError(buf));
-        }
-        let len = buf.len();
-        match self.tx.send(buf).await {
-            Ok(()) => Ok(()),
-            Err(e) => {
-                // The frame never entered the queue; hand its budget back
+    /// Take both bounds for a frame of `len` bytes up front and hand back
+    /// the reservation, so the push itself is synchronous.
+    ///
+    /// This is what lets a spawned op task pair its completion signal with
+    /// its frame atomically: a task can only be cancelled at an `await`, so
+    /// a producer that has already reserved can queue a signal and push its
+    /// frame with no suspension point in between (see
+    /// [`ExecFinishGuard::reply`]). Awaiting `send` instead puts an await —
+    /// therefore a cancellation point — after the signal, where the owner
+    /// has already dropped the task's `AbortOnDrop`.
+    async fn reserve(&self, len: usize) -> Result<TxPermit<'_>, ()> {
+        self.budget.acquire(len).await?;
+        match self.tx.reserve().await {
+            Ok(permit) => Ok(TxPermit {
+                permit: Some(permit),
+                budget: self.budget.clone(),
+                len,
+            }),
+            Err(_closed) => {
+                // The frame can never enter the queue; hand its budget back
                 // so any producer racing the shutdown is not stuck short.
                 self.budget.release(len);
-                Err(e)
+                Err(())
             }
+        }
+    }
+
+    async fn send(&self, buf: Vec<u8>) -> Result<(), tokio::sync::mpsc::error::SendError<Vec<u8>>> {
+        match self.reserve(buf.len()).await {
+            Ok(permit) => {
+                permit.send(buf);
+                Ok(())
+            }
+            Err(()) => Err(tokio::sync::mpsc::error::SendError(buf)),
         }
     }
 
@@ -3309,6 +3354,35 @@ impl SrvTx {
 
     fn is_closed(&self) -> bool {
         self.tx.is_closed()
+    }
+}
+
+/// Both writer bounds — one queue slot and `len` bytes of [`TxBudget`] —
+/// held for a frame that has not been pushed yet ([`SrvTx::reserve`]).
+///
+/// Consuming it with [`Self::send`] is infallible and synchronous. Dropping
+/// it unused (the producer was cancelled while still holding the
+/// reservation) returns the byte budget; the queue slot is returned by the
+/// inner `Permit`'s own `Drop`.
+struct TxPermit<'a> {
+    permit: Option<tokio::sync::mpsc::Permit<'a, Vec<u8>>>,
+    budget: TxBudget,
+    len: usize,
+}
+
+impl TxPermit<'_> {
+    fn send(mut self, buf: Vec<u8>) {
+        if let Some(permit) = self.permit.take() {
+            permit.send(buf);
+        }
+    }
+}
+
+impl Drop for TxPermit<'_> {
+    fn drop(&mut self) {
+        if self.permit.take().is_some() {
+            self.budget.release(self.len);
+        }
     }
 }
 
@@ -3346,6 +3420,16 @@ impl ChannelTx {
         self.tx.send(buf).await
     }
 
+    /// [`SrvTx::reserve`] for a per-channel frame. The reservation carries
+    /// the channel's stat handle so the `statTx` count is still taken at the
+    /// single owner, at the moment the frame is pushed.
+    async fn reserve(&self, len: usize) -> Result<ChannelTxPermit<'_>, ()> {
+        Ok(ChannelTxPermit {
+            permit: self.tx.reserve(len).await?,
+            stat: self.stat.clone(),
+        })
+    }
+
     /// Current free capacity of the underlying writer channel — used by
     /// the monitor outbound-queue-depth diagnostic. Delegates to the
     /// wrapped `Sender`; carries no byte accounting.
@@ -3357,6 +3441,19 @@ impl ChannelTx {
     /// [`Self::capacity`]).
     fn max_capacity(&self) -> usize {
         self.tx.max_capacity()
+    }
+}
+
+/// [`TxPermit`] plus the channel whose `statTx` the frame counts against.
+struct ChannelTxPermit<'a> {
+    permit: TxPermit<'a>,
+    stat: Arc<crate::server_native::peers::ChannelStat>,
+}
+
+impl ChannelTxPermit<'_> {
+    fn send(self, buf: Vec<u8>) {
+        self.stat.add_tx(buf.len());
+        self.permit.send(buf);
     }
 }
 
@@ -21036,15 +21133,17 @@ mod tests {
     }
 
     /// The removal signal must be QUEUED before the monitor's terminal frame,
-    /// for the same reason [`ExecFinishGuard::reply`] carries: a client may
-    /// re-INIT this ioid the instant it sees MONITOR FINISH, and `handle_op`'s
-    /// duplicate-INIT check is connection-FATAL, so the op has to be gone from
-    /// `channels` before that INIT is dispatched. Park
-    /// [`MonitorFinishGuard::reply`] on a full writer queue: the frame provably
-    /// has not been enqueued, and the signal must already be there. A
-    /// `Drop`-only guard fails this.
+    /// for the reason [`MonitorFinishGuard::reply`] carries — but NOT before
+    /// the frame's writer slot is reserved. Applying that signal removes the
+    /// op, which drops `monitor_abort` and cancels this very task, so any
+    /// suspension point between the signal and the push is a window where the
+    /// FINISH frame is destroyed by the removal it announced.
+    ///
+    /// Boundary: parked on a full writer queue, no signal may be out yet.
+    /// Once the slot frees, both are out. Revert-verify: signal before
+    /// reserving (the pre-fix body) and the first assertion fails.
     #[epics_macros_rs::epics_test]
-    async fn monitor_finish_signal_is_queued_before_its_terminal_frame() {
+    async fn monitor_finish_signal_waits_for_the_writer_reservation() {
         use std::future::Future;
 
         let (srv_tx, mut wire_rx, _budget) = SrvTx::channel(1, 1 << 20);
@@ -21071,14 +21170,19 @@ mod tests {
             reply.as_mut().poll(&mut cx).is_pending(),
             "the writer queue is full, so the frame cannot have been enqueued"
         );
-        let got = rx
-            .try_recv()
-            .expect("the removal signal is queued ahead of the frame");
-        assert_eq!((got.sid, got.ioid, got.op_id), (3, 11, 77));
+        assert!(
+            rx.try_recv().is_err(),
+            "no signal may be queued while the frame is still unreservable — \
+             the owner would answer it by aborting this task mid-send"
+        );
 
-        // Free the slot: the frame still goes out, and the guard signals once.
+        // Free the slot: the signal and the frame both go out, once each.
         assert_eq!(wire_rx.recv().await.as_deref(), Some(&[0u8][..]));
         reply.await;
+        let got = rx
+            .try_recv()
+            .expect("the removal signal rides out with the frame");
+        assert_eq!((got.sid, got.ioid, got.op_id), (3, 11, 77));
         assert_eq!(wire_rx.recv().await.as_deref(), Some(&[1u8][..]));
         assert!(
             rx.try_recv().is_err(),
@@ -23234,12 +23338,16 @@ mod bfr15_tests {
     /// never send a frame the server meets with a still-`Executing` op — and
     /// `begin_exec` answers such a frame by dropping it with no reply at all.
     ///
-    /// Park [`ExecFinishGuard::reply`] on a full writer queue: the frame
-    /// provably has not been enqueued, and the signal must already be there.
-    /// A `Drop`-only guard, which signalled after `tx.send(buf).await`
-    /// returned, fails this.
+    /// It must NOT be queued before the frame's writer slot is reserved,
+    /// though: applying it drops `OpState::data_task_abort`, so a suspension
+    /// point after the signal is a window in which the reply is destroyed
+    /// (see `exec_reply_frame_survives_an_abort_racing_its_signal`).
+    ///
+    /// Boundary: parked on a full writer queue, no signal may be out yet;
+    /// once the slot frees, both are out. Revert-verify: signal before
+    /// reserving (the pre-fix body) and the first assertion fails.
     #[epics_macros_rs::epics_test]
-    async fn exec_finish_signal_is_queued_before_its_reply_frame() {
+    async fn exec_finish_signal_waits_for_the_writer_reservation() {
         use std::future::Future;
 
         let (srv_tx, mut wire_rx, _budget) = SrvTx::channel(1, 1 << 20);
@@ -23268,22 +23376,140 @@ mod bfr15_tests {
             reply.as_mut().poll(&mut cx).is_pending(),
             "the writer queue is full, so the frame cannot have been enqueued"
         );
+        assert!(
+            fin_rx.try_recv().is_err(),
+            "no signal may be queued while the frame is still unreservable — \
+             the owner would answer it by aborting this task mid-send"
+        );
+
+        // Free the slot: the signal and the frame both go out, once each.
+        assert_eq!(wire_rx.recv().await.as_deref(), Some(&[0u8][..]));
+        reply.await;
         let fin = fin_rx
             .try_recv()
-            .expect("the completion signal is queued ahead of the frame");
+            .expect("the completion signal rides out with the frame");
         assert_eq!(
             (fin.sid, fin.ioid, fin.op_id, fin.success),
             (1, 500, 7, true)
         );
-
-        // Free the slot: the frame still goes out, and exactly once.
-        assert_eq!(wire_rx.recv().await.as_deref(), Some(&[0u8][..]));
-        reply.await;
         assert_eq!(wire_rx.recv().await.as_deref(), Some(&[1u8][..]));
         assert!(
             fin_rx.try_recv().is_err(),
             "the guard signals exactly once, not again from Drop"
         );
+    }
+
+    /// The defect this reservation exists to close, end to end: the owner
+    /// applies the completion signal the instant it arrives, and applying it
+    /// drops `OpState::data_task_abort` — aborting the very task that sent it.
+    /// While the reply frame still had to `await` its way into the writer
+    /// after the signal, that abort landed mid-`send` and the frame was
+    /// destroyed; the client then waited out its whole timeout for a reply the
+    /// server believed it had sent.
+    ///
+    /// `poll_inline_or_spawn` makes this reachable on an idle server, not just
+    /// a backpressured one: tokio's cooperative budget returns `Pending` from
+    /// `Semaphore::acquire_many_owned` with the queue wide open, which promotes
+    /// the reply body to a task and installs the abort handle in the first
+    /// place — which is why the loss was load-dependent and hit a different
+    /// channel every run.
+    ///
+    /// Revert-verify: move the signal ahead of `tx.reserve` (the pre-fix body)
+    /// and the frame assertion fails.
+    // A bare `tokio::spawn` handle into `AbortOnDrop`, as in
+    // `cancel_request_returns_non_monitor_exec_to_idle_and_aborts_task`.
+    #[cfg(tokio_backend)]
+    #[epics_macros_rs::epics_test]
+    async fn exec_reply_frame_survives_an_abort_racing_its_signal() {
+        let (sid, ioid) = (5u32, 77u32);
+
+        let (srv_tx, mut wire_rx, _budget) = SrvTx::channel(1, 1 << 20);
+        let chan_tx = ChannelTx::new(
+            srv_tx,
+            crate::server_native::peers::ChannelStat::new(String::new()),
+        );
+        // Hold the only slot so the reply parks in `reserve`, exactly as a
+        // cooperative-budget `Pending` parks it on a live connection.
+        chan_tx.send(vec![0u8]).await.expect("first frame fits");
+
+        let source: DynSource = Arc::new(crate::server_native::SharedSource::new());
+        let mut op = non_monitor_op_state(
+            std::sync::Arc::new(FieldDesc::Variant),
+            OpKind::Get,
+            BitSet::new(),
+        );
+        op.exec_state = ExecState::Executing;
+        let op_id = op.monitor_op_id;
+
+        let (fin_tx, mut fin_rx) = mpsc::unbounded_channel();
+        let guard = ExecFinishGuard::new(
+            fin_tx,
+            ExecFinished {
+                sid,
+                ioid,
+                op_id,
+                success: false,
+                scratch: None,
+            },
+        );
+        let reply_tx = chan_tx.clone();
+        let task = tokio::spawn(async move {
+            guard.reply(&reply_tx, vec![1u8], true).await;
+        });
+        op.data_task_abort = Some(Arc::new(AbortOnDrop(task.abort_handle())));
+
+        let mut channels: HashMap<u32, ChannelState> = HashMap::new();
+        let mut ops = HashMap::new();
+        ops.insert(ioid, op);
+        channels.insert(
+            sid,
+            ChannelState {
+                name: "dut".into(),
+                cid: 0,
+                sid,
+                introspection: Some(std::sync::Arc::new(FieldDesc::Variant)),
+                source,
+                stat: crate::server_native::peers::ChannelStat::new(String::new()),
+                open_cred: Arc::new(ClientCredentials::anonymous(TEST_PEER)),
+                ops,
+                parked: HashMap::new(),
+                put_scratch: None,
+                intro_wire: None,
+            },
+        );
+
+        // The owner does what the read loop's `biased` select does: apply any
+        // completion signal that is available, ahead of anything else. The
+        // reply is still parked on the writer, so a signal here is a signal
+        // sent with the frame not yet queued — and applying it drops the
+        // task's abort guard, cancelling the sender at that parked await.
+        let early = tokio::time::timeout(Duration::from_millis(500), fin_rx.recv()).await;
+        let signalled_before_reserving = matches!(early, Ok(Some(_)));
+        if let Ok(Some(fin)) = early {
+            apply_exec_finish(&mut channels, fin);
+            assert!(
+                channels[&sid]
+                    .ops
+                    .get(&ioid)
+                    .is_none_or(|op| op.data_task_abort.is_none()),
+                "applying the signal must drop the task's abort guard"
+            );
+        }
+
+        // Free the slot. Whatever the owner just did, the client is owed its
+        // reply: pre-fix the task was aborted mid-`send` and this times out.
+        assert_eq!(wire_rx.recv().await.as_deref(), Some(&[0u8][..]));
+        let frame = tokio::time::timeout(Duration::from_secs(5), wire_rx.recv())
+            .await
+            .expect("the reply frame must survive an abort racing its own signal");
+        assert_eq!(frame.as_deref(), Some(&[1u8][..]));
+
+        if !signalled_before_reserving {
+            fin_rx
+                .recv()
+                .await
+                .expect("the completion signal rides out with the frame");
+        }
     }
 
     /// pvxs `ServerGPR::doReply`

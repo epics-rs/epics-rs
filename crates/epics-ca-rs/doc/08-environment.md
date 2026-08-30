@@ -166,9 +166,9 @@ Used by some `softIoc` configurations. `epics-ca-rs` itself uses
 ### `asCheckClientIP` — an iocsh knob, not an environment variable
 
 There is **no** `EPICS_CAS_USE_HOST_NAMES` variable. Earlier revisions of
-this document, `04-server.md` and `09-libca-parity.md` described one and
-claimed it matched C's default; it exists nowhere in epics-base and the
-port no longer reads it (R7-16).
+this document and `04-server.md` described one and claimed it matched C's
+default; it exists nowhere in epics-base and the port no longer reads it
+(R7-16).
 
 What C actually has is the global `asCheckClientIP`
 (`asLibRoutines.c:34`), default `0`, set from the shell:

@@ -7,7 +7,7 @@
 //! write to any of them in ONE place: `dbPut` runs `dbPutSpecial(paddr, 0)`,
 //! whose first act is `if ((special == SPC_NOMOD) && (pass == 0)) return
 //! S_db_noMod` (dbAccess.c:122-127). Every runtime entry lands there —
-//! `dbPutField` calls `dbPut` (dbAccess.c:1265), so a CA put, `dbpf`, an OUT
+//! `dbPutField` calls `dbPut` (dbAccess.c:1262), so a CA put, `dbpf`, an OUT
 //! link and an autosave `reboot_restore` are all refused by the same test.
 //!
 //! The port's gate is `field_io::check_no_mod`, and its `dbPutField`-analogue

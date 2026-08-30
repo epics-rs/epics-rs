@@ -220,8 +220,40 @@ pub(crate) fn ambient_write_origin() -> u64 {
 /// (C `dbNotifyAdd`), and every record [`Self::leave`]s when its
 /// processing completes (C `dbNotifyCompletion`). The oneshot fires on
 /// the `leave` that drops `pending` to zero.
+///
+/// Membership is BOTH counted and named, because the two questions have
+/// different answers here and C only ever has to ask one of them. C keeps
+/// no count at all — `ellCount(&pnotifyPvt->waitList)` (`dbNotify.c:460`)
+/// IS its count, so its list answers "has the chain settled?" and "which
+/// records must a cancel release?" at once. The port cannot merge them:
+/// `pending` also carries contributions that own no record slot (the
+/// initiator's own hold, and a `dbCaPutLinkCallback` awaiting its network
+/// completion — `links.rs`), which C models as `state` rather than as list
+/// entries. So `pending` answers settlement and the `joined` list answers
+/// cancellation, each with one meaning on every path.
 pub struct NotifyWaitSet {
     pending: AtomicUsize,
+    /// C `notifyPvt::waitList` (`dbNotify.c:73`) — every record that took
+    /// this set into its `notify` slot, so a cancel can sweep them the way
+    /// `dbNotifyCancel` walks the wait list (`:428-430`).
+    ///
+    /// Append-only, and deliberately so: C deletes a member on completion
+    /// only because `ellCount` is its settlement count, which `pending`
+    /// already is here. Keeping a completed member listed costs a slot
+    /// re-check and cannot lose one, whereas removing on completion would
+    /// make the list the second thing that has to be right for a cancel to
+    /// reach a record.
+    ///
+    /// Names, not handles: the sweep needs the record's write lock anyway,
+    /// and the authority on membership is the record's own slot — a stale
+    /// name simply fails the `Arc::ptr_eq` and is skipped. That makes
+    /// over-listing harmless and under-listing the only failure, which is
+    /// what the append-only rule then makes unrepresentable.
+    ///
+    /// Written in exactly one place, [`RecordInstance::take_notify_slot`],
+    /// which is also the only writer of the slot itself — so "every record
+    /// holding this set is named here" holds by construction.
+    joined: StdMutex<Vec<Box<str>>>,
     tx: StdMutex<Option<crate::runtime::sync::oneshot::Sender<()>>>,
     /// C `dbChannelRecord(ppn->chan)` — the record the notify was ISSUED
     /// against, as opposed to the records that joined its chain.
@@ -233,10 +265,14 @@ pub struct NotifyWaitSet {
     ///
     /// Set at construction and never afterwards. The only mint of an
     /// entry-bearing set is [`RecordInstance::install_or_queue_notify`],
-    /// which passes its own record, and the only other writer of the slot
+    /// which passes its own record, and the other path into the slot
     /// ([`RecordInstance::join_put_notify`]) clones a set it did not make —
     /// so "the entry names the record whose slot minted it" holds by
     /// construction rather than by a check.
+    ///
+    /// It is NOT the membership test. Every member, entry or joined, is named
+    /// in [`Self::joined`]; this only says which member `dbNotifyDump` prints
+    /// a block for (`dbNotify.c:659-660`).
     ///
     /// [`PvDatabase::new_put_notify`]: crate::server::database::PvDatabase::new_put_notify
     entry: Option<Box<str>>,
@@ -254,6 +290,7 @@ impl NotifyWaitSet {
     pub fn new(tx: crate::runtime::sync::oneshot::Sender<()>) -> Arc<Self> {
         Arc::new(Self {
             pending: AtomicUsize::new(1),
+            joined: StdMutex::new(Vec::new()),
             tx: StdMutex::new(Some(tx)),
             entry: None,
         })
@@ -265,6 +302,7 @@ impl NotifyWaitSet {
     fn for_entry_record(record: &str, tx: crate::runtime::sync::oneshot::Sender<()>) -> Arc<Self> {
         Arc::new(Self {
             pending: AtomicUsize::new(1),
+            joined: StdMutex::new(Vec::new()),
             tx: StdMutex::new(Some(tx)),
             entry: Some(record.into()),
         })
@@ -299,6 +337,43 @@ impl NotifyWaitSet {
     /// vs async-pending ([`ProcessCompletion::Async`]) completion.
     pub fn completed(&self) -> bool {
         self.pending.load(Ordering::Acquire) == 0
+    }
+
+    /// Record `name` took this set into its `notify` slot — C
+    /// `ellSafeAdd(&pnotifyPvt->waitList, &precord->ppnr->waitNode)`
+    /// (`dbNotify.c:227`/`:258`/`:498`).
+    ///
+    /// Private to this module and called from the one slot writer
+    /// ([`RecordInstance::take_notify_slot`]), so joining the list and taking
+    /// the slot are one act and cannot be done separately.
+    fn record_joined(&self, name: &str) {
+        self.joined.lock().unwrap().push(name.into());
+    }
+
+    /// Every record that has held this set — C's wait list as
+    /// `dbNotifyCancel` enumerates it (`dbNotify.c:428`).
+    ///
+    /// A snapshot, because the sweep must take record write locks and cannot
+    /// hold this mutex while it does. Growth after the snapshot is not a
+    /// missed member: a record can only join a set that is still answerable,
+    /// and this is read only of a set that is not.
+    pub(crate) fn joined_records(&self) -> Vec<Box<str>> {
+        self.joined.lock().unwrap().clone()
+    }
+
+    /// Nobody is left to answer: the completion never fired (the sender is
+    /// still here) and the client that would have received it is gone.
+    ///
+    /// This is the condition C detects at client teardown —
+    /// `rsrvFreePutNotify` sees `pNotify->busy` and calls `dbNotifyCancel`
+    /// (`camessage.c:1630-1638`). A set that already fired holds no sender and
+    /// is NOT unanswerable: it completed.
+    pub(crate) fn is_unanswerable(&self) -> bool {
+        self.tx
+            .lock()
+            .unwrap()
+            .as_ref()
+            .is_some_and(|tx| tx.is_closed())
     }
 }
 
@@ -799,6 +874,18 @@ pub struct RecordInstance {
     pub device: Option<Box<dyn super::super::device_support::DeviceSupport>>,
     // Subroutine (for sub records)
     pub subroutine: Option<Arc<SubroutineFn>>,
+    /// The by-name function registry this record's PENDING `init_record` pass
+    /// 1 will resolve INAM/SNAM against — C `registryFunctionFind`, reading a
+    /// process-global table from inside `init_record`.
+    ///
+    /// One meaning on every path: armed by the creation sink immediately
+    /// before [`Self::run_init_passes`], consumed (and cleared) by the pass
+    /// itself. It exists because the lookup's failure is an EARLY RETURN — the
+    /// init tail must not run past it — and only the init owner can honour
+    /// that, while only the database holds the registry. Resolving from
+    /// outside the passes, as both builders used to, put the lookup after the
+    /// tail it is supposed to skip.
+    init_subroutines: Option<Arc<HashMap<String, Arc<SubroutineFn>>>>,
     /// PACT (C `precord->pact`) — the re-entrancy guard, and the record's
     /// "busy" state for every put that lands on it.
     ///
@@ -1273,6 +1360,7 @@ impl RecordInstance {
             parsed_tsel: ParsedLink::None,
             device: None,
             subroutine: None,
+            init_subroutines: None,
             pact: AtomicBool::new(false),
             notify: None,
             notify_restart_list: std::collections::VecDeque::new(),
@@ -1322,6 +1410,52 @@ impl RecordInstance {
     /// [`crate::server::database::PvDatabase::add_loaded_record`], which takes
     /// the load and the record together so no path can init a half-loaded
     /// record.
+    /// Hand the record the function registry its pending init pass 1 resolves
+    /// INAM/SNAM against. The creation sink's line; see [`Self::
+    /// init_subroutines`].
+    pub(crate) fn arm_init_subroutines(
+        &mut self,
+        registry: Arc<HashMap<String, Arc<SubroutineFn>>>,
+    ) {
+        self.init_subroutines = Some(registry);
+    }
+
+    /// C's `if (!pdset) { recGblRecordError(S_dev_noDSET, prec, "init_record");
+    /// return S_dev_noDSET; }` — whether this record's `init_record` gets past
+    /// its own first statement.
+    ///
+    /// Three terms, each one C's:
+    /// * [`crate::server::recgbl::dev_sup_refusal`] IS the set of record types
+    ///   whose `init_record` opens with that test — the same table that
+    ///   supplies the message, so the refusal and the return can never
+    ///   disagree about which types make it.
+    /// * a soft DTYP (`""`, `Soft Channel`, `Raw Soft Channel`, `Async Soft
+    ///   Channel`) resolves to a dset C always links, so the test passes.
+    ///   `""` counts because C's DTYP index 0 is the record type's FIRST
+    ///   `device()` line, which for every soft record type is the soft
+    ///   channel.
+    /// * anything else needs a device the resolver produced. `None` after the
+    ///   creation sink has run its bind is C's `pdevSup == NULL`.
+    pub(crate) fn init_record_reaches_body(&self) -> bool {
+        self.device.is_some()
+            || crate::server::device_support::is_soft_dtyp(&self.common.dtyp)
+            || crate::server::recgbl::dev_sup_refusal(self.record.record_type()).is_none()
+    }
+
+    /// C `registryFunctionFind` inside `init_record` pass 1, for the record
+    /// types that make it. Returns whether the pass reached its tail.
+    ///
+    /// Unarmed (`init_subroutines` is `None`) means no registry was handed
+    /// over — an iocsh `dbLoadRecords` merge re-running the passes on a record
+    /// that already resolved. Nothing to look up again, and C's tail is
+    /// reached.
+    fn resolve_init_subroutine(&mut self, name: &str) -> bool {
+        match self.init_subroutines.take() {
+            Some(registry) => crate::server::ioc_app::wire_subroutine(self, name, &registry),
+            None => true,
+        }
+    }
+
     pub(crate) fn run_init_passes(&mut self, name: &str) {
         // C's `precord->pact = FALSE` — a record cannot be mid-process at init,
         // so this release provably frees nothing: no client put has run, so the
@@ -1336,11 +1470,50 @@ impl RecordInstance {
         {
             self.common.sevr = AlarmSeverity::from_u16(self.common.udfs as u16);
         }
+        // C `<rec>Record.c::init_record`'s FIRST statement, for the 26 record
+        // types that make it: `if (!pdset) { recGblRecordError(S_dev_noDSET,
+        // …); return S_dev_noDSET; }` (`aiRecord.c:105-110`,
+        // `aoRecord.c:107-110`, …). Everything below it — `ao`'s `prec->init =
+        // TRUE`, `ai`'s and `sub`'s MLST/ALST/LALM seed, `mbbo`'s SDEF fold —
+        // is unreachable for a record whose dset is NULL, and running the
+        // passes anyway is what left those cells set where softIoc reads 0.
+        //
+        // It is the OWNER's test, not each record's, for one structural
+        // reason: `Record::init_record` is on the record BODY, which cannot
+        // see `RecordInstance::device`. Asking every record type to re-derive
+        // the answer is the per-cell patch this replaces.
+        if !self.init_record_reaches_body() {
+            return;
+        }
         if let Err(e) = self.record.init_record(0) {
             eprintln!("init_record(0) failed for {name}: {e}");
         }
+        // C `iocInit.c::doResolveLinks` (`:545-570`), the pass BETWEEN the two
+        // `init_record` calls: for each device link the record type declares,
+        // `pdsxt->add_record(precord)` and then `dbInitLink` for that same
+        // link. This is that call, and it keeps C's position — before the link
+        // it complains about is initialised, after pass 0 has run.
+        crate::server::builtin_devices::soft_callback::add_record(self, name);
         if let Err(e) = self.record.init_record(1) {
             eprintln!("init_record(1) failed for {name}: {e}");
+        }
+        // C `pdset->common.init_record(prec)` — the driver's own init, which
+        // every record type calls from INSIDE `init_record` once the dset test
+        // above has passed (`aiRecord.c:115-124`, `aoRecord.c:121-133`). It
+        // ran after both passes and after the constant-link seed while device
+        // support was attached by a whole-database pass; it is here now
+        // because the dset is bound before the passes. Residual difference
+        // from C, not closed by this move: C calls it BEFORE the record's own
+        // tail (`prec->mlst = prec->val`) and the port's tail is inside
+        // `init_record(1)`, so a driver `init` that defines VAL is still not
+        // reflected in the trackers seeded a line earlier.
+        crate::server::device_support::init_device_support(self);
+        // C `subRecord.c:107-129` / `aSubRecord.c:139-160` — the INAM call and
+        // the SNAM lookup, also inside pass 1. `false` is C's early return
+        // (`S_db_BadSub`, or the empty-SNAM `pact = TRUE; return 0`), so the
+        // tail below is skipped exactly where C skips it.
+        if !self.resolve_init_subroutine(name) {
+            return;
         }
         // The UDF tail of pass 1. `init_record` cannot reach UDF (a common
         // field), so the record types whose C `init_record` ends in
@@ -1368,12 +1541,17 @@ impl RecordInstance {
             self.common.udf = 0;
             let _ = crate::server::recgbl::rec_gbl_reset_alarms(&mut self.common);
         }
-        // C `init_record` can END with `prec->pact = TRUE` to disable a record
-        // it cannot process (`subRecord.c:119-123`, an empty SNAM). PACT has one
-        // owner, so the record answers the predicate and the owner parks it —
-        // after the passes, so the `leave_pact()` above cannot undo it. The
-        // release is not lost: a put to a `pact_park_fields()` field re-asks,
-        // the way C's `special()` does.
+        // C `init_record` can park a record it cannot process with `prec->pact
+        // = TRUE`. The only such line in base is `subRecord.c:119-123`, and it
+        // sits WITH the empty-SNAM report and the return, so the resolution
+        // step above performs it: a record whose INAM missed returned before
+        // that line and is not parked however empty its SNAM is (softIoc reads
+        // `PACT: 0`). This asks the record type for the same transition on the
+        // paths that reach the tail — an iocsh `dbLoadRecords` merge re-running
+        // the passes with no registry to resolve against. It is after the
+        // passes so the `leave_pact()` above cannot undo it, and the park is
+        // not permanent: a put to a `pact_park_fields()` field re-asks, the way
+        // C's `special()` does.
         if self.record.parks_pact() {
             self.enter_pact();
         }
@@ -1730,18 +1908,37 @@ impl RecordInstance {
             return None;
         }
         let notify = NotifyWaitSet::for_entry_record(&self.name, completion);
-        self.notify = Some(notify.clone());
+        self.take_notify_slot(notify.clone());
         Some(notify)
+    }
+
+    /// Take `ws` into this record's put-notify slot.
+    ///
+    /// **The only writer of [`Self::notify`] that installs a set** — the other
+    /// two ([`Self::abandon_put_notify`], [`Self::release_notify`]) only clear
+    /// it. Everything that makes a record a member of a wait-set happens here,
+    /// so C's `precord->ppn = ppn` and its `ellSafeAdd(&waitList, ...)`
+    /// (`dbNotify.c:226-227`, `:257-258`, `:497-498`) stay the single act they
+    /// are in C. Split across two call sites, they were what let a member exist
+    /// that no cancel could name.
+    fn take_notify_slot(&mut self, ws: Arc<NotifyWaitSet>) {
+        debug_assert!(
+            self.notify.is_none(),
+            "the slot must be tested free in the same critical section"
+        );
+        ws.record_joined(&self.name);
+        self.notify = Some(ws);
     }
 
     /// C `dbNotifyAdd` (dbNotify.c:477-501): a link target joins the wait-set
     /// of the put-notify driving the chain, so the initiator's completion
     /// waits for this record's cycle too.
     ///
-    /// The second and last writer of `Self::notify`; the first is
-    /// [`Self::install_or_queue_notify`]. Both live here so the slot has no
-    /// assignment site outside this module — an open-coded one elsewhere is
-    /// how a wait-set came to be installed without the record's write gate.
+    /// One of the two callers of `take_notify_slot`, the sole writer; the
+    /// other is [`Self::install_or_queue_notify`]. All three live here so
+    /// the slot has no assignment site outside this module — an open-coded one
+    /// elsewhere is how a wait-set came to be installed without the record's
+    /// write gate.
     ///
     /// A record already carrying a wait-set keeps it (C's `if (!pto->ppn …)`
     /// at `:492`), so this never displaces a live one, and the `enter` is
@@ -1751,8 +1948,8 @@ impl RecordInstance {
             return;
         }
         if let Some(ws) = src {
-            self.notify = Some(ws.clone());
             ws.enter();
+            self.take_notify_slot(ws.clone());
         }
     }
 
@@ -1777,6 +1974,71 @@ impl RecordInstance {
             taken.as_ref().is_some_and(|ws| Arc::ptr_eq(ws, claimed)),
             "only the claim owner may clear the put-notify slot"
         );
+    }
+
+    /// The set in this record's slot if it can never be answered — the test
+    /// half of C `dbNotifyCancel` (`dbNotify.c:385-430`), reached from
+    /// `rsrvFreePutNotify` (`camessage.c:1630-1638`) when a client is torn down
+    /// with its put-callback still busy.
+    ///
+    /// # Invariant (CONTRACT)
+    ///
+    /// A record's put-notify slot MUST NOT stay occupied by a notify nobody
+    /// can be answered from. Without the release such a record is wedged for
+    /// good: every later put-notify queues on `notify_restart_list` behind a
+    /// completion that can never arrive and writes nothing — C
+    /// `processNotifyCommon` tests ownership ABOVE `putCallback` — so the next
+    /// client hangs too, and the one after it.
+    ///
+    /// This is what makes honouring a record type's forward-link gate safe at
+    /// all. `busy` left at VAL=1 withholds the `ca_put_callback` exactly as C
+    /// does (`busyRecord.c:271`); the client then gives up and exits, and that
+    /// exit is the teardown modelled here.
+    ///
+    /// Two triggers reach it, and both are needed. The CA server calls it at
+    /// client teardown, which is C's own moment
+    /// (`rsrvFreePutNotify`, `camessage.c:1630-1638`), and it also runs at
+    /// every ownership test, which catches a set whose client died on a
+    /// transport the teardown hook does not cover. Only the first closes the
+    /// case where a SECOND client is already queued on a record's restart list
+    /// when the first dies: nothing then arrives to test ownership, and C's
+    /// `restartCheck` would have handed that record to the queued client.
+    ///
+    /// The set names its own members ([`NotifyWaitSet::joined_records`]), so
+    /// the sweep reaches a chain target exactly as C's `notifyProcessInProgress`
+    /// arm does (`dbNotify.c:428-430`) rather than stopping at the entry.
+    /// That distinction is not cosmetic: a chain target is the likelier victim,
+    /// because the record whose cycle never ends is precisely the one this
+    /// exists for — a `busy` left at VAL=1 withholds `recGblFwdLink` by
+    /// contract, so its slot would otherwise be held by a dead set forever.
+    ///
+    /// See [`PvDatabase::cancel_unanswerable_notify`], the owner that runs it
+    /// across the whole set.
+    ///
+    /// [`PvDatabase::cancel_unanswerable_notify`]: crate::server::database::PvDatabase::cancel_unanswerable_notify
+    pub(crate) fn unanswerable_notify(&self) -> Option<Arc<NotifyWaitSet>> {
+        self.notify
+            .as_ref()
+            .filter(|ws| ws.is_unanswerable())
+            .cloned()
+    }
+
+    /// Drop this record's claim on `dead` — C `restartCheck`'s
+    /// `precord->ppn = 0` (`dbNotify.c:157`) as `dbNotifyCancel` reaches it.
+    ///
+    /// The record's own slot is the authority on membership, so this is
+    /// `Arc::ptr_eq`-gated: a name the sweep carries for a record that has
+    /// since completed and taken a different notify releases nothing.
+    ///
+    /// Returns whether the slot was freed, so the caller can promote the
+    /// restart-list head (C `restartCheck`) exactly as a completion would.
+    #[must_use = "a freed slot owes the restart list a drain"]
+    pub(crate) fn release_notify(&mut self, dead: &Arc<NotifyWaitSet>) -> bool {
+        if self.notify.as_ref().is_some_and(|ws| Arc::ptr_eq(ws, dead)) {
+            self.notify = None;
+            return true;
+        }
+        false
     }
 
     /// Whether a put-notify owns this record — C `precord->ppn != NULL`.
@@ -8520,5 +8782,119 @@ mod link_field_rendering_tests {
         ] {
             assert_eq!(render_link_field(class, text), want, "{class:?} {text:?}");
         }
+    }
+}
+
+#[cfg(test)]
+mod unanswerable_notify_tests {
+    use super::*;
+    use crate::server::records::calc::CalcRecord;
+
+    fn rec(name: &str) -> RecordInstance {
+        RecordInstance::new(name.into(), CalcRecord::default())
+    }
+
+    /// The ordinary case: the client is still waiting, so the slot is its own.
+    /// C only reaches `dbNotifyCancel` from a teardown.
+    #[test]
+    fn a_waiting_client_keeps_the_slot() {
+        let mut r = rec("A");
+        let (tx, _rx) = crate::runtime::sync::oneshot::channel();
+        r.install_or_queue_notify(tx).expect("slot was free");
+        assert!(r.unanswerable_notify().is_none());
+        assert!(r.has_notify(), "a live put-callback must not be cancelled");
+    }
+
+    /// C `rsrvFreePutNotify` (`camessage.c:1630-1638`): the client went away
+    /// with its put-callback still busy, so the notify leaves the record.
+    #[test]
+    fn a_departed_client_releases_the_slot() {
+        let mut r = rec("A");
+        let (tx, rx) = crate::runtime::sync::oneshot::channel();
+        r.install_or_queue_notify(tx).expect("slot was free");
+        drop(rx);
+        let dead = r.unanswerable_notify().expect("nobody can answer it");
+        assert!(r.release_notify(&dead));
+        assert!(
+            !r.has_notify(),
+            "the record must be free for the next put-notify"
+        );
+    }
+
+    /// A notify that COMPLETED is not unanswerable — it answered. The sender is
+    /// spent, so a receiver dropped afterwards says nothing about the slot.
+    #[test]
+    fn a_completed_notify_is_not_cancelled() {
+        let mut r = rec("A");
+        let (tx, rx) = crate::runtime::sync::oneshot::channel();
+        let set = r.install_or_queue_notify(tx).expect("slot was free");
+        set.leave();
+        drop(rx);
+        assert!(r.unanswerable_notify().is_none());
+    }
+
+    /// The set names every record that holds it, entry and `dbNotifyAdd`
+    /// target alike — C `pnotifyPvt->waitList` (`dbNotify.c:227`/`:498`), which
+    /// `dbNotifyCancel` walks at `:428`.
+    #[test]
+    fn the_set_names_the_entry_and_every_chain_target() {
+        let mut entry = rec("A");
+        let mut target = rec("B");
+        let (tx, _rx) = crate::runtime::sync::oneshot::channel();
+        let set = entry.install_or_queue_notify(tx).expect("slot was free");
+        target.join_put_notify(Some(&set));
+        let members: Vec<String> = set
+            .joined_records()
+            .into_iter()
+            .map(|n| n.to_string())
+            .collect();
+        assert_eq!(members, vec!["A".to_string(), "B".to_string()]);
+    }
+
+    /// A chain target releases too. It holds the same wait-set through
+    /// `dbNotifyAdd`, and the record whose cycle never ends is exactly the one
+    /// that keeps it — a `busy` FLNK target left at VAL=1 declines its own
+    /// `recGblFwdLink` by contract, so nothing else would ever free it. C
+    /// empties the whole wait list (`dbNotify.c:428-430`) before it looks at
+    /// the entry at all.
+    #[test]
+    fn a_chain_target_holding_the_same_set_releases_too() {
+        let mut entry = rec("A");
+        let mut target = rec("B");
+        let (tx, rx) = crate::runtime::sync::oneshot::channel();
+        let set = entry.install_or_queue_notify(tx).expect("slot was free");
+        target.join_put_notify(Some(&set));
+        drop(rx);
+        let dead = target.unanswerable_notify().expect("nobody can answer it");
+        assert!(Arc::ptr_eq(&dead, &set));
+        assert!(target.release_notify(&dead));
+        assert!(!target.has_notify(), "B must be free for the next put");
+        assert!(entry.release_notify(&dead));
+        assert!(!entry.has_notify());
+    }
+
+    /// The record's own slot is the authority, not the name the sweep carries:
+    /// a member that has since completed and taken a LIVE notify keeps it.
+    /// C re-tests `precord->ppn` for the same reason (`restartCheck`'s
+    /// `assert(precord->ppn)`, `dbNotify.c:154`).
+    #[test]
+    fn a_member_that_moved_on_to_a_live_notify_is_left_alone() {
+        let mut entry = rec("A");
+        let mut target = rec("B");
+        let (tx, rx) = crate::runtime::sync::oneshot::channel();
+        let dead = entry.install_or_queue_notify(tx).expect("slot was free");
+        target.join_put_notify(Some(&dead));
+        drop(rx);
+
+        // B finished its contribution and a fresh client took it.
+        assert!(target.release_notify(&dead));
+        let (tx2, _rx2) = crate::runtime::sync::oneshot::channel();
+        target.install_or_queue_notify(tx2).expect("slot was free");
+
+        assert!(
+            !target.release_notify(&dead),
+            "the stale name must not evict the live notify"
+        );
+        assert!(target.has_notify());
     }
 }

@@ -21,7 +21,6 @@ the crate or trying to understand a runtime issue. End-user usage
 | [`06-dbr-types.md`](06-dbr-types.md) | DBR type families and encoding |
 | [`07-flow-control.md`](07-flow-control.md) | Backpressure: client queue, server flow control gate, coalescing |
 | [`08-environment.md`](08-environment.md) | All `EPICS_CA_*` / `EPICS_CAS_*` variables and their effect |
-| [`09-libca-parity.md`](09-libca-parity.md) | Parity matrix vs `epics-base` libca / rsrv |
 | [`functional-review-2026-05-20.md`](functional-review-2026-05-20.md) | Functional-review findings (with resolution status) vs `epics-base` C implementation |
 | [`10-observability.md`](10-observability.md) | tracing events, metrics schema, exporter integrations |
 | [`11-tls-design.md`](11-tls-design.md) | CA over TLS (encryption + mTLS auth), design and migration plan |

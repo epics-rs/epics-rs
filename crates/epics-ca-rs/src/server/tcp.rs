@@ -4421,6 +4421,15 @@ pub(crate) async fn serve_write_head(
             format!("{}.{}", record.read().name, field)
         }
     };
+    // The record a deferred put-callback parks a notify on, captured under the
+    // same `entry` borrow as `audit_pv`. C keeps it as `pciu->pPutNotify`'s
+    // `dbChannel` for exactly one purpose: `rsrvFreePutNotify` needs something
+    // to hand `dbNotifyCancel` when the client dies still busy
+    // (`camessage.c:1630-1638`). See [`PendingWriteNotify`]'s `Drop`.
+    let notify_record = match &entry.target {
+        ChannelTarget::SimplePv(_) => None,
+        ChannelTarget::RecordField { record, .. } => Some(record.read().name.clone()),
+    };
 
     // Post-#934 (epics-base 4128a7c07) BOTH opcodes gate the TYPE first,
     // then clamp `m_count` to `dbChannelFinalElements`, then cross-check
@@ -4895,6 +4904,7 @@ pub(crate) async fn serve_write_head(
                 reply,
                 completion,
                 sid,
+                cancel: notify_record.map(|record| (db.clone(), record)),
             }));
         }
         // Synchronous completion — respond immediately. Same echoed type as
@@ -4988,6 +4998,40 @@ pub(crate) struct PendingWriteNotify {
     pub reply: WriteNotifyReply,
     completion: Arc<PutNotifyCompletion>,
     pub sid: u32,
+    /// What the `Drop` below needs to cancel this notify: the database and the
+    /// record it parked on. `None` for a simple PV, which has no `dbCommon`
+    /// and so no `ppn` slot to release. C carries the equivalent as
+    /// `pciu->pPutNotify`'s `dbChannel`.
+    cancel: Option<(Arc<PvDatabase>, String)>,
+}
+
+/// C `rsrvFreePutNotify` (`rsrv/camessage.c:1630-1638`): a client torn down
+/// with `pNotify->busy` still set has its put-callback cancelled, which frees
+/// every record the notify owns and hands each one to its restart-list head.
+///
+/// A `Drop`, not a call at the teardown site, because this is a strong state
+/// transition — the record's slot is claimed on the client's behalf the moment
+/// the notify installs — and every exit path after it must release: a closed
+/// socket, a read error, a cancelled task, an unwind. One finalizer covers them
+/// all, and the alternative is a release that holds only on the paths someone
+/// remembered.
+///
+/// Ordering matters: `rx.close()` FIRST, because
+/// `PvDatabase::cancel_unanswerable_notify` recognises a dead notify by the
+/// sender having no receiver left, and `Drop::drop` runs before the struct's
+/// own fields are dropped. Without the close, the receiver is still alive at
+/// the moment the database is asked, and the cancel finds nothing to do.
+///
+/// A completion that already `settle`d is a no-op here: its wait-set fired, so
+/// the sender is spent and the record's slot is long since empty.
+impl Drop for PendingWriteNotify {
+    fn drop(&mut self) {
+        let Some((db, record)) = self.cancel.as_ref() else {
+            return;
+        };
+        self.rx.close();
+        db.cancel_unanswerable_notify(record);
+    }
 }
 
 impl PendingWriteNotify {
@@ -7506,6 +7550,8 @@ mod write_notify_queue_tests {
             },
             completion: PutNotifyCompletion::new(None),
             sid,
+            // A simple-PV put: nothing parks a notify, so nothing to cancel.
+            cancel: None,
         };
         (p, tx)
     }

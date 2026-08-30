@@ -624,7 +624,7 @@ pub struct ChannelCache {
     /// variant aging out of its channel's nested map via the cleaner).
     max_entries: usize,
     /// Lifetime count of cleanup-tick sweeps (pva2pva `cleanerRuns`,
-    /// `p2pApp/chancache.cpp:230-262`). Surfaced in the control status
+    /// `p2pApp/chancache.cpp:104-130`). Surfaced in the control status
     /// report so an operator can confirm the idle-eviction loop is live.
     cleaner_runs: AtomicU64,
     /// Lifetime count of entries evicted by the cleanup tick (pva2pva
@@ -1380,7 +1380,7 @@ impl ChannelCache {
             !channel.monitors.is_empty() || connection_retained
         });
         // pva2pva bumps `cleanerRuns` every sweep and `cleanerDust` by the
-        // number of evicted CHANNELS (`chancache.cpp:230-262`,
+        // number of evicted CHANNELS (`chancache.cpp:112-124`,
         // `p2pApp/server.cpp:182-198`); both surface in the operator
         // status report.
         // Relaxed is sufficient — these are monotonic diagnostic counters

@@ -58,24 +58,21 @@ fn cmd_ioc_build() -> CommandDef {
                 // C `iocBuild_1` (`iocInit.c:116-121`) refuses from any state
                 // but `iocVoid`.
                 ShellTransition::Refused => {
-                    crate::runtime::log::errlog_printf(&format!(
-                        "iocBuild: {} IOC can only be initialized from \
-                         uninitialized or stopped state\n",
-                        if crate::runtime::log::errlog_console_paints() {
-                            crate::runtime::log::ERL_ERROR
-                        } else {
-                            "ERROR"
-                        }
-                    ));
+                    crate::runtime::log::errlog_printf(&crate::server::ioc_app::build_refusal());
                     Ok(CommandOutcome::Failed)
                 }
-                // No `IocApplication` lifecycle to drive. On such a shell the
-                // record-load close is the whole of what a build can mean, and
-                // it is what `iocInit` does there too.
+                // No `IocApplication` lifecycle to drive — a bare
+                // `PvDatabase` shell or a `CaServerBuilder` binary. C runs
+                // `iocBuild_1` for those too, so this arm does, and the
+                // record-load close is this shell's contribution to it.
                 ShellTransition::NotOurs => {
-                    ctx.block_on(async { ctx.db().ioc_init().await });
-                    ctx.println("iocBuild: record initialization complete");
-                    Ok(CommandOutcome::Continue)
+                    if crate::server::ioc_app::build_without_application(|| {
+                        ctx.block_on(async { ctx.db().ioc_init().await });
+                    }) {
+                        Ok(CommandOutcome::Continue)
+                    } else {
+                        Ok(CommandOutcome::Failed)
+                    }
                 }
             }
         },

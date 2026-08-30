@@ -1,10 +1,13 @@
 //! Asyn iocsh shell-command registration.
 //!
-//! C parity: `asynShellCommands.c:581-906` registers six shell commands
-//! (`asynReport`, `asynSetOption`, `asynSetTraceMask`, `asynSetTraceIOMask`,
-//! `asynSetTraceInfoMask`, `asynSetTraceFile`) plus the
-//! `asynSetTraceIOTruncateSize` setter. This module exposes the same
-//! surface via [`register_asyn_commands`], which takes an
+//! C parity: `asynRegister` (asynShellCommands.c:1347-1379) registers 27
+//! shell commands — the report/option/trace setters (`asynReport`,
+//! `asynSetOption`, `asynShowOption`, the five `asynSetTrace*`), the ten
+//! octet I/O and EOS commands, `asynEnable`/`asynAutoConnect`/
+//! `asynWaitConnect`/`asynSetAutoConnectTimeout`, the timestamp-source pair
+//! and the timer/queue-lock/shutdown setters. This
+//! module exposes the same surface via [`register_asyn_commands`], which
+//! takes an
 //! `IocApplication` (the public registration carrier on the
 //! `epics-base-rs` side) along with the `PortManager` whose
 //! `TraceManager` is the back-end for the trace mutators.
@@ -183,13 +186,13 @@ const SHOW_EOS_BUF_SIZE: usize = 4 * 10 + 2;
 
 /// The I/O deadline every asyn *shell* command puts on the `asynUser` it
 /// builds: C sets `pasynUser->timeout = 2` in `asynSetOption`
-/// (asynShellCommands.c:119), `asynSetEos` (:239) and `asynShowEos` (:288),
+/// (asynShellCommands.c:119), `asynSetEos` (:238) and `asynShowEos` (:289),
 /// rather than leaving the default. One constant so the shell commands cannot
 /// drift apart again.
 const SHELL_IO_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// The `asynUser` C's `asynSetEos` / `asynShowEos` build
-/// (asynShellCommands.c:239-241, :288-290).
+/// (asynShellCommands.c:238-240, :289-291).
 ///
 /// Three fields matter and all come from C: the device the command names —
 /// `findInterface(portName, addr, ...)` `connectDevice`s the user to it
@@ -631,12 +634,12 @@ pub fn build_asyn_commands(mgr: Arc<PortManager>) -> Vec<CommandDef> {
 
     // asynInterposeDelay portName addr delay(sec) --------------------------
     //
-    // C `asynInterposeDelay.c:221-234` registers this 3-arg command; nothing
+    // C `asynInterposeDelay.c:215-237` registers this 3-arg command; nothing
     // else installs the layer (no driver configure command pushes it), so
     // without the registrar a startup script cannot reach a device that needs
     // an inter-character write delay at all. C prints
     // "%s interposeInterface asynOctetType failed." and returns -1 when the
-    // interposeInterface call fails (:186-190).
+    // interposeInterface call fails (:189-192).
     //
     // As with `asynInterposeEcho`, the `addr` names the device the layer lands on
     // (:187,200) — `asynInterposeDelay("gpib",4,0.01)` slows device 4 and leaves
@@ -1698,7 +1701,7 @@ pub fn drv_asyn_prologix_port_configure_command(services: PortServices) -> Comma
 /// already taken. Both have already printed the diagnostic and torn down
 /// whatever was half-built, so the caller has nothing to clean up and only has
 /// to stop — C's `drvAsynIPPortConfigure: Can't register myself.` / `ttyCleanup`
-/// / `return -1` (drvAsynIPPort.c:1062-1069).
+/// / `return -1` (drvAsynIPPort.c:1033-1035).
 ///
 /// `Some` hands back the runtime handle for the callers that need it (the
 /// server port binds its listening socket through it). Callers that do not may
@@ -2438,18 +2441,21 @@ mod tests {
         handle
             .set_input_eos_blocking(shell_eos_user(0), b"\n")
             .unwrap();
-        // processOut = 0: C's interpose does NOT take the output terminator —
-        // it delegates down to `poctet->setOutputEos` (asynInterposeEos.c:341-344),
-        // and this driver has none, so `setOutputEosFail` answers
-        // "<port> setOutputEos not implemented" (asynOctetBase.c:117, :409-411).
-        // The write below therefore appends nothing for two reasons at once,
-        // and the refusal is the one C reports.
-        let refused = handle
+        // processOut = 0 gates C's `writeIt` alone (asynInterposeEos.c:161-163):
+        // `setOutputEos` (:344-363) and `getOutputEos` (:365-390) carry no
+        // `processEosOut` test at all, so the terminator is stored, answered
+        // asynSuccess and read back — it is simply never appended. A startup
+        // script that sets OEOS and reads it back therefore succeeds, which is
+        // what refusing it broke.
+        handle
             .set_output_eos_blocking(shell_eos_user(0), b"\n")
-            .expect_err("processOut=0 delegates to a driver with no setOutputEos");
-        assert!(
-            refused.to_string().contains("setOutputEos not implemented"),
-            "got {refused}"
+            .expect("processOut=0 still stores the output terminator");
+        assert_eq!(
+            handle
+                .get_output_eos_blocking(shell_eos_user(0))
+                .expect("readback"),
+            b"\n".to_vec(),
+            "C's getOutputEos reads eosOut back whatever processEosOut says"
         );
 
         // processIn = 1: the read stops at the terminator and strips it.
@@ -2646,8 +2652,8 @@ mod tests {
 
     /// The EOS shell commands hand their `asynUser` C's 2 s I/O deadline.
     ///
-    /// C `asynSetEos` sets `pasynUser->timeout = 2` (asynShellCommands.c:239)
-    /// before queueing the `setEos` callback, and `asynShowEos` (:288) and
+    /// C `asynSetEos` sets `pasynUser->timeout = 2` (asynShellCommands.c:238)
+    /// before queueing the `setEos` callback, and `asynShowEos` (:289) and
     /// `asynSetOption` (:119) do the same — the shell never leaves this field at
     /// the default. Rust's EOS handler built its user with the 1 s default while
     /// its `asynSetOption` sibling already set 2 s; [`SHELL_IO_TIMEOUT`] is now
@@ -2658,7 +2664,7 @@ mod tests {
         assert_eq!(
             user.timeout,
             Some(Duration::from_secs(2)),
-            "C asynSetEos sets pasynUser->timeout = 2 (asynShellCommands.c:239)"
+            "C asynSetEos sets pasynUser->timeout = 2 (asynShellCommands.c:238)"
         );
         // The other half C sets on the same user, kept under the same test so a
         // future edit cannot drop the waiver while preserving the timeout.
@@ -3043,7 +3049,7 @@ mod tests {
     }
 
     /// R8-58: C registers `asynInterposeDelay` with iocsh
-    /// (`asynInterposeDelay.c:221-234`); like the echo layer nothing else
+    /// (`asynInterposeDelay.c:215-237`); like the echo layer nothing else
     /// installs it, so without the registrar the ported `DelayInterpose` is
     /// unreachable from a startup script. Drive the command against a
     /// registered port and prove the port's octet write goes from one 3-byte

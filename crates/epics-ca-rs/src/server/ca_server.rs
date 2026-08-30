@@ -1281,10 +1281,14 @@ impl CaServer {
         let tcp_abort = tcp_handle.abort_handle();
 
         let udp_cfg = addr_list::from_env()?;
-        eprintln!(
-            "CA server: UDP search on port {port}, TCP on port {tcp_port}, beacons → {} address(es)",
+        // C's RSRV announces nothing here, so this line is the port's own —
+        // and it goes through the errlog for the same reason every C boot
+        // line does: `eltc 0` must be able to silence the console. As a raw
+        // `eprintln!` it survived `eltc 0` where every C line vanished.
+        epics_base_rs::runtime::log::errlog_printf(&format!(
+            "CA server: UDP search on port {port}, TCP on port {tcp_port}, beacons → {} address(es)\n",
             udp_cfg.beacon_addrs.len()
-        );
+        ));
 
         // mDNS announce: held for the lifetime of run(). Drops when
         // the function returns, deregistering us from the network.

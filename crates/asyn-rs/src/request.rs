@@ -179,8 +179,8 @@ pub enum RequestOp {
     /// pending UCMD/ACMD: it resets ERRS, sets the user's timeout, and calls
     /// nothing.
     ///
-    /// The point is the queue entry itself. `process()` queues unconditionally
-    /// (`:342-353`), so a NoI/O cycle still wakes the port thread — which is how
+    /// The point is the queue entry itself. `process()` queues without consulting
+    /// TMOD (`:342-353`), so a NoI/O cycle still wakes the port thread — as
     /// the reconnect-nudge idiom pokes auto-connect — and still meets the queue
     /// gate, so a disconnected port answers it with the refusal the record turns
     /// into ERRS and STATE/MINOR.
@@ -377,7 +377,7 @@ pub enum RequestOp {
     /// Install the delay interpose on top of the port's octet stack. C parity:
     /// `asynInterposeDelay(portName, addr, delay)`
     /// (`asynInterposeDelay.c:176-215`), registered with iocsh at
-    /// `asynInterposeDelay.c:221-234`. Same actor-ownership reason as
+    /// `asynInterposeDelay.c:215-237`. Same actor-ownership reason as
     /// [`RequestOp::PushEchoInterpose`].
     PushDelayInterpose {
         delay: std::time::Duration,

@@ -34,7 +34,7 @@ use crate::dbd::{Dbd, DbfType};
 use crate::diff::{Comparison, Observation, Verdict, compare};
 use crate::ioc::{CTools, Ioc, Pair, Side};
 use crate::report::{CasePhase, CaseResult, Reproducer};
-use crate::surface::{FieldRef, Surface, is_put_candidate};
+use crate::surface::{FieldRef, Surface, ValStatus, is_put_candidate};
 
 /// How long to let monitor updates settle after driving the puts. A port that
 /// posts *extra* events must be caught, so we cannot stop listening the moment
@@ -274,20 +274,32 @@ impl Runner {
     /// MDEL/ADEL), so a faithful port posts three updates, not four. "Posts an
     /// event per put regardless of change" is exactly the kind of divergence
     /// that a value-only diff cannot see — the final value agrees either way.
+    /// # What the `.dbd` removes before a case exists
+    ///
+    /// The drive here is a *stimulus*, not the observation, so a record type
+    /// whose `VAL` no client may write has nothing to measure: both sides
+    /// refuse, both post nothing, and the identical traces describe an
+    /// experiment that never ran. [`crate::surface::val_status`] is the single
+    /// owner of that question for both protocols, so `sel` leaves the CA drive
+    /// denominator for exactly the reason it already left the PVA one — rather
+    /// than erroring here and being excluded there.
     pub fn probe_monitor(
         &self,
         record_type: &str,
         surface: &Surface,
         allowlist: &mut Allowlist,
     ) -> Option<CaseResult> {
-        // Only meaningful where VAL is a writable scalar the client can drive.
-        let val = surface
-            .fields_of(record_type)
-            .find(|f| f.field.name == "VAL")?;
-        if !is_put_candidate(&val.field) || val.field.dbf.is_link() {
+        // Only meaningful where the .dbd leaves VAL drivable by some client.
+        if crate::surface::val_status(surface, record_type) != ValStatus::Drivable {
             return None;
         }
-        let val_dbf = val.field.dbf;
+        // `Drivable` was just proven, so VAL exists in the surface.
+        let val_dbf = surface
+            .fields_of(record_type)
+            .find(|f| f.field.name == "VAL")
+            .expect("val_status returned Drivable, so VAL is in the surface")
+            .field
+            .dbf;
 
         let rec = format!("ORACLE:MON:{}", record_type.to_uppercase());
         let db_text = crate::record_stmt(record_type, &rec);
@@ -863,28 +875,14 @@ fn adjudicate(
         rust_side: r.clone(),
     };
 
-    // The one place a case may leave the ERROR bucket while carrying errors.
-    //
-    // A completion that never came from EITHER side is a reading: the two IOCs
-    // did the same observable thing, and the rest of the case — native type,
-    // element count, access, stored value, STAT, SEVR — was still read back
-    // from both and is compared below exactly as any other case is. So this
-    // does not suppress a difference; it only stops the shared non-answer from
-    // masking a case the harness fully measured.
-    //
-    // The discriminator, and the whole honesty of the bucket: BOTH sides must
-    // have produced an error, and EVERY error on the case must be the
-    // no-completion marker (`catool::is_no_completion`). A one-sided
-    // no-completion is a divergence between the two servers, which is the
-    // finding this harness exists to make, and it stays ERROR. So does any case
-    // that mixes in a connect failure or one of the harness's own — those say
-    // the measurement never happened, not that the server declined to finish.
-    let both_sides_declined = !c.errors.is_empty()
-        && !r.errors.is_empty()
-        && errors
-            .iter()
-            .all(|e| crate::catool::is_no_completion(&e.message));
-    if !errors.is_empty() && !both_sides_declined {
+    // An error is an absence, with no exceptions left to carve out. A put the
+    // server took and never finished is no longer one: it arrives as
+    // `PutOutcome::NeverCompleted`, a reading, and is compared below like any
+    // other outcome. That is what removed the special case that used to sit
+    // here — an error list that had to be re-read to decide whether the case
+    // was really unmeasured, which could only ever answer for the ONE shape of
+    // non-answer it knew how to spell.
+    if !errors.is_empty() {
         return base;
     }
 
@@ -905,8 +903,19 @@ fn adjudicate(
     allowlist.note_compared(&ctx, &compared);
 
     if differences.is_empty() {
+        // Agreement, sub-classified. Two servers that agreed by both declining
+        // to finish the put agreed about less than two that both finished it,
+        // and the report has always said so rather than folding the two into
+        // one number.
+        let both_declined = matches!(
+            (&c.put, &r.put),
+            (
+                Some(PutOutcome::NeverCompleted),
+                Some(PutOutcome::NeverCompleted)
+            )
+        );
         return CaseResult {
-            verdict: if both_sides_declined {
+            verdict: if both_declined {
                 Verdict::NeitherCompleted
             } else {
                 Verdict::Agreed
@@ -1357,15 +1366,17 @@ mod adjudicate_tests {
         }
     }
 
-    const NO_COMPLETION: &str = "Write callback operation timed out";
+    /// An `Observation` that read back cleanly and carries a put outcome.
+    fn value_with_put(v: &str, put: PutOutcome) -> Observation {
+        Observation {
+            value_string: Some(v.to_string()),
+            put: Some(put),
+            ..Default::default()
+        }
+    }
 
-    /// The bucket. Both IOCs took the write, neither ever said it finished, and
-    /// every other surface agreed — measured on `sub`, whose empty `SNAM`
-    /// latches `pact = TRUE` (`subRecord.c:119-122`) on the C side and whose
-    /// 464 put cases are all of this shape.
-    #[test]
-    fn a_no_completion_from_both_sides_is_a_reading_not_a_measurement_failure() {
-        let case = adjudicate(
+    fn put_case(c: &Observation, r: &Observation) -> CaseResult {
+        adjudicate(
             CaseRef {
                 record_type: "sub",
                 phase: CasePhase::Put,
@@ -1374,44 +1385,63 @@ mod adjudicate_tests {
                 class: Some("zero"),
             },
             repro(),
-            &value_with_error("0", Side::C, NO_COMPLETION),
-            &value_with_error("0", Side::Rust, NO_COMPLETION),
+            c,
+            r,
             &mut shipped(),
+        )
+    }
+
+    /// The bucket. Both IOCs took the write, neither ever said it finished, and
+    /// every other surface agreed — measured on `sub`, whose empty `SNAM`
+    /// latches `pact = TRUE` (`subRecord.c:119-122`) on the C side and whose
+    /// 464 put cases are all of this shape.
+    #[test]
+    fn a_no_completion_from_both_sides_is_a_reading_not_a_measurement_failure() {
+        let case = put_case(
+            &value_with_put("0", PutOutcome::NeverCompleted),
+            &value_with_put("0", PutOutcome::NeverCompleted),
         );
         assert_eq!(case.verdict, Verdict::NeitherCompleted);
-        assert_eq!(
-            case.errors.len(),
-            2,
-            "the bucket must keep both sides' evidence, not swallow it"
+        assert!(
+            case.errors.is_empty(),
+            "a server that declined to finish answered; that is not an error"
         );
     }
 
     /// The discriminator. One side finishing and the other not is a difference
-    /// between the two servers — the finding this harness exists to make — so
-    /// it must not reach the bucket from either direction.
+    /// between the two servers — the finding this harness exists to make — and
+    /// it is now reported as one, from either direction.
+    ///
+    /// It used to score ERROR, because a non-completion could only reach
+    /// `adjudicate` as a `ToolError` and an error meant "no reading". C's `busy`
+    /// record is the case that proves it wrong: it withholds the completion by
+    /// design while `VAL` is non-zero, so a port that completes the put diverges
+    /// on a surface both sides actually reported.
     #[test]
-    fn a_one_sided_no_completion_stays_an_error() {
+    fn a_one_sided_no_completion_is_a_defect_not_an_error() {
         for (c, r) in [
-            (value_with_error("0", Side::C, NO_COMPLETION), value("0")),
-            (value("0"), value_with_error("0", Side::Rust, NO_COMPLETION)),
+            (
+                value_with_put("0", PutOutcome::NeverCompleted),
+                value_with_put("0", PutOutcome::Completed),
+            ),
+            (
+                value_with_put("0", PutOutcome::Completed),
+                value_with_put("0", PutOutcome::NeverCompleted),
+            ),
         ] {
-            let case = adjudicate(
-                CaseRef {
-                    record_type: "sub",
-                    phase: CasePhase::Put,
-                    field: "VAL",
-                    dbf: DbfType::Double,
-                    class: Some("zero"),
-                },
-                repro(),
-                &c,
-                &r,
-                &mut shipped(),
-            );
+            let case = put_case(&c, &r);
             assert_eq!(
                 case.verdict,
-                Verdict::Errored,
+                Verdict::Defect,
                 "a one-sided no-completion is a divergence, not a shared reading"
+            );
+            assert_eq!(
+                case.differences
+                    .iter()
+                    .map(|d| d.surface)
+                    .collect::<Vec<_>>(),
+                [crate::diff::Surface::PutAccepted],
+                "and it lands on the put surface, once"
             );
         }
     }
@@ -1449,18 +1479,9 @@ mod adjudicate_tests {
     /// still a DEFECT.
     #[test]
     fn a_difference_under_a_shared_no_completion_is_still_a_defect() {
-        let case = adjudicate(
-            CaseRef {
-                record_type: "sub",
-                phase: CasePhase::Put,
-                field: "VAL",
-                dbf: DbfType::Double,
-                class: Some("zero"),
-            },
-            repro(),
-            &value_with_error("0", Side::C, NO_COMPLETION),
-            &value_with_error("7", Side::Rust, NO_COMPLETION),
-            &mut shipped(),
+        let case = put_case(
+            &value_with_put("0", PutOutcome::NeverCompleted),
+            &value_with_put("7", PutOutcome::NeverCompleted),
         );
         assert_eq!(case.verdict, Verdict::Defect);
     }
@@ -1524,7 +1545,7 @@ mod adjudicate_tests {
     ///
     /// The measurement failure is planted for real: both `CaTools` are aimed at
     /// a port nothing is listening on, so `caput` cannot connect. Before this,
-    /// every `Err` from the tool became `PutOutcome { accepted: false, … }`, the
+    /// every `Err` from the tool became a not-accepted `PutOutcome`, the
     /// two sides "agreed" the write had been refused, and the case was scored
     /// AGREED and counted as put coverage — an agreement claim about a write
     /// neither IOC ever saw.
@@ -1666,18 +1687,7 @@ mod adjudicate_tests {
             "ORACLE:RB:0.SEVR".to_string(),
             "ORACLE:RB:1.SEVR".to_string(),
         ];
-        let accepted = || {
-            vec![
-                Ok(PutOutcome {
-                    accepted: true,
-                    error: None,
-                }),
-                Ok(PutOutcome {
-                    accepted: true,
-                    error: None,
-                }),
-            ]
-        };
+        let accepted = || vec![Ok(PutOutcome::Completed), Ok(PutOutcome::Completed)];
 
         let side = |port: u16, s: Side| {
             let t = CaTools::new(&tools, port, s);
@@ -1724,6 +1734,45 @@ mod adjudicate_tests {
         assert_eq!(
             crate::report::exit_status(&crate::report::run_failures(&counts, &[], &[])),
             1,
+        );
+    }
+
+    /// The CA monitor probe reads the same drive rule as the PVA one.
+    ///
+    /// `sel.VAL` is `special(SPC_NOMOD)`, so no client can stimulate it and the
+    /// case never existed on the PVA side — while the CA side built it, drove
+    /// it, watched both servers refuse, and scored ERROR every run. The rule now
+    /// has one owner ([`crate::surface::val_status`]); this fails if a second
+    /// predicate is ever inlined here.
+    ///
+    /// No IOC is booted: the exclusion is decided from the `.dbd` before any
+    /// `.db` is written, which is the point of it being static.
+    #[cfg(tokio_backend)]
+    #[test]
+    fn the_monitor_probe_builds_no_case_for_a_val_the_dbd_forbids_writing() {
+        const DBD: &str = r#"
+recordtype(sel) {
+    field(VAL, DBF_DOUBLE) { prompt("Result") special(SPC_NOMOD) }
+}
+recordtype(ai) {
+    field(VAL, DBF_DOUBLE) { pp(TRUE) }
+}
+"#;
+        let dbd = Dbd::parse(DBD).expect("parse");
+        let types: std::collections::BTreeSet<String> =
+            ["sel", "ai"].iter().map(|s| s.to_string()).collect();
+        let surface = Surface::build(&dbd, &types);
+        let tools = CTools::discover().expect(
+            "the C EPICS tree must be built for the oracle to have ground truth; \
+             set EPICS_BASE_BIN if it is not at the default path",
+        );
+        let runner = Runner::new(tools, dbd, workdir(None).expect("workdir"));
+
+        assert!(
+            runner
+                .probe_monitor("sel", &surface, &mut shipped())
+                .is_none(),
+            "the .dbd forbids writing sel.VAL, so there is nothing to stimulate"
         );
     }
 

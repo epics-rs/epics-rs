@@ -4715,6 +4715,104 @@ ASG(PLAIN) {
         );
     }
 
+    /// Drive `f` in place until it parks — poll it, and keep polling for as
+    /// long as it asks to be woken again.
+    fn drive_until_parked<F: std::future::Future + Unpin>(f: &mut F) -> std::task::Poll<F::Output> {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::task::{Context, Poll, Wake, Waker};
+
+        struct Woken(AtomicBool);
+        impl Wake for Woken {
+            fn wake(self: Arc<Self>) {
+                self.0.store(true, Ordering::SeqCst);
+            }
+        }
+
+        let woken = Arc::new(Woken(AtomicBool::new(false)));
+        let waker = Waker::from(woken.clone());
+        let mut cx = Context::from_waker(&waker);
+        for _ in 0..64 {
+            woken.0.store(false, Ordering::SeqCst);
+            match std::pin::Pin::new(&mut *f).poll(&mut cx) {
+                Poll::Ready(v) => return Poll::Ready(v),
+                Poll::Pending if !woken.0.load(Ordering::SeqCst) => return Poll::Pending,
+                Poll::Pending => {}
+            }
+        }
+        panic!("the put never parked");
+    }
+
+    async fn busy_db(name: &str) -> Arc<PvDatabase> {
+        use epics_base_rs::server::records::busy::BusyRecord;
+        let db = Arc::new(PvDatabase::new());
+        db.add_record(name, Box::new(BusyRecord::default()))
+            .await
+            .unwrap();
+        db
+    }
+
+    /// `record[block=true]` is the one PVA operation that can outlive the
+    /// client that asked for it, and the transport already knows how to end
+    /// it: the PUT EXEC body is spawned and its abort handle kept on the op
+    /// (`server_native::tcp::finish_exec_data_task`), so DESTROY_CHANNEL and
+    /// connection teardown alike drop `ChannelState::ops`, abort the task and
+    /// drop this future mid-await. Dropping the future here is that abort.
+    ///
+    /// What the drop must do is release the record. `busy` at VAL=1 withholds
+    /// `recGblFwdLink` by contract (`busyRecord.c:271`), so the completion
+    /// never comes on its own, and a SECOND client is already parked on the
+    /// restart list — nothing arrives afterwards to test ownership, so a
+    /// release that ran only at the next put's arrival would never run and
+    /// the queued client would wait forever. C reaches the same release from
+    /// `rsrvFreePutNotify` -> `dbNotifyCancel` (`rsrv/camessage.c:1630-1638`).
+    #[epics_macros_rs::epics_test]
+    async fn an_aborted_blocking_put_hands_the_record_to_the_queued_client() {
+        use epics_base_rs::types::EpicsValue;
+
+        let db = busy_db("BUSY:ABORT").await;
+        let source = PvDatabaseSource::new(db.clone());
+        let block = [("block", PvField::Scalar(ScalarValue::Boolean(true)))];
+        let val = || {
+            db.get_record("BUSY:ABORT")
+                .unwrap()
+                .read()
+                .record
+                .get_field("VAL")
+        };
+
+        let mut first =
+            Box::pin(source.put_value_ctx("BUSY:ABORT", pv_double(1.0), ctx_with_options(&block)));
+        assert!(
+            drive_until_parked(&mut first).is_pending(),
+            "VAL=1 withholds the callback, so the blocking PUT cannot reply"
+        );
+        assert!(
+            db.get_record("BUSY:ABORT").unwrap().read().has_notify(),
+            "the first client owns the record's put-notify slot"
+        );
+
+        let mut second =
+            Box::pin(source.put_value_ctx("BUSY:ABORT", pv_double(0.0), ctx_with_options(&block)));
+        assert!(
+            drive_until_parked(&mut second).is_pending(),
+            "the second client queues behind the first"
+        );
+        assert_eq!(
+            val(),
+            Some(EpicsValue::Enum(1)),
+            "a queued put-notify writes nothing until it is replayed"
+        );
+
+        drop(first); // the op is aborted: DESTROY_CHANNEL or connection teardown
+
+        second.await.expect("the queued PUT must complete");
+        assert_eq!(
+            val(),
+            Some(EpicsValue::Enum(0)),
+            "restartCheck hands the record over, and the queued client then writes"
+        );
+    }
+
     /// pvxs reports an unusable `record._options.process` to the client
     /// (`ioc/iocsource.cpp:446-447` `logRemote(Warn, "Ignoring unsupported
     /// ...")`) and keeps the passive default. The native source emitted no

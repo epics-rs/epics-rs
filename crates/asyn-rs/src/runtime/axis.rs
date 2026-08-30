@@ -353,12 +353,15 @@ impl AxisRuntime {
     async fn poll_motor(&mut self) {
         let user = AsynUser::new(0);
         // A failed poll must still publish a status. C drivers signal the
-        // failure by setting `motorStatusProblem_` + `motorStatusCommsError_`
-        // and calling `callParamCallbacks()` anyway before returning the error
-        // (smarActMCSMotorDriver.cpp:503-507, XPSAxis.cpp:756); the caller
-        // discards the returned status (asynMotorController.cpp:219-221 forced,
-        // :658 background), so the failure reaches the record only as MSTA
-        // bit 12 (COMM_ERR) → COMM/INVALID alarm (motorRecord.cc:3392-3398).
+        // failure by setting `motorStatusCommsError_` and calling
+        // `callParamCallbacks()` anyway before returning the error, from the
+        // error label the failed read jumped to (XPSAxis.cpp:755-757's `done:`;
+        // smarActMCSMotorDriver.cpp:503-507's `bail:`, which sets
+        // `motorStatusProblem_` as well); the caller
+        // discards the returned status on the background poll
+        // (asynMotorController.cpp:658) — the forced update at :219-222 does keep
+        // it in `writeInt32`'s `status` — so the failure reaches the record as
+        // MSTA bit 12 (COMM_ERR) → COMM/INVALID alarm (motorRecord.cc:3392-3398).
         // Every field the failed poll never wrote keeps its previous value,
         // which is what carrying `latest_status` forward reproduces.
         let status = match self.motor.poll(&user) {
@@ -522,9 +525,10 @@ mod tests {
     /// R6-50: a poll that fails must still publish a status carrying
     /// COMM_ERR, not just log an event — otherwise MSTA never raises bit 12,
     /// the record never processes, and the axis silently freezes on its last
-    /// good readback. C drivers set `motorStatusProblem_` +
-    /// `motorStatusCommsError_` and call `callParamCallbacks()` before
-    /// returning the error (smarActMCSMotorDriver.cpp:503-507, XPSAxis.cpp:756).
+    /// good readback. C drivers set `motorStatusCommsError_` and call
+    /// `callParamCallbacks()` before returning the error
+    /// (XPSAxis.cpp:755-757, smarActMCSMotorDriver.cpp:503-507 — the latter
+    /// sets `motorStatusProblem_` too, XPS sets only the comms bit).
     #[tokio::test]
     async fn failed_poll_publishes_comms_error_status() {
         use std::sync::Arc;

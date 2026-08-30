@@ -1,21 +1,30 @@
 # Expected-deviation allowlist for the differential oracle.
 #
 # WHAT THIS IS
-# Under the product policy adopted 2026-07-13 (doc/strategy-2026-07-13.md §2),
-# "C's bugs are not the contract. Clean is the goal." So a difference between
-# the C softIoc and the Rust port is NOT automatically a port bug. It is one of
-# these things:
+# Under the product policy adopted 2026-07-13 -- "C's bugs are not the contract.
+# Clean is the goal." -- a difference between the C softIoc and the Rust port is
+# NOT automatically a port bug. It is one of these things:
 #
 #   * a deliberate refusal to reproduce a C defect     -> EXPECTED DEVIATION
 #   * an intentional port DESIGN divergence            -> EXPECTED DEVIATION
 #   * a ground-truth INSTRUMENT superset artifact      -> EXPECTED DEVIATION
 #   * anything else                                     -> PORT DEFECT
 #
+# That policy has three tiers. Interoperability -- the CA and PVA wire protocols,
+# DBR/DBF type codes, opcode framing, the .db/.dbd grammar -- admits no deviation
+# at all; a C client must not be able to tell the difference. Semantics (record
+# processing, alarms, monitor posting, link behaviour) match C where C is right
+# and fix C where C is wrong, documenting the deviation and reporting it
+# upstream: that second half is what this file records. Drivers and applications
+# are held to correctness against hardware and simulators, never to parity with
+# C source.
+#
 # THREE JUSTIFICATION BASES, FOUR BUCKETS
-# Most rows are C-bug refusals: for these the allowlist IS doc/upstream-c-bugs.md.
-# Each NOT-REPRODUCED (or, disabled, REPRODUCED) row transcribes an entry from
-# that catalogue and MUST cite the CBUG id that justifies it; if such a row is
-# not backed by an entry there, the row is wrong.
+# Most rows are C-bug refusals. Each NOT-REPRODUCED (or, disabled, REPRODUCED)
+# row MUST cite the CBUG id of the upstream defect it refuses to reproduce, and
+# -- because this file is the record, not a pointer to one -- its `why` MUST
+# itself name the C symbol, state what C does, why that is wrong, and what the
+# port does instead. A row whose `why` does not stand up without the id is wrong.
 #
 # A DESIGN-DIVERGENCE row is different in kind: it records an INTENTIONAL port
 # design choice that is neither a C-bug refusal nor a defect (e.g. lifting a
@@ -65,23 +74,6 @@ schema = 1
 # --------------------------------------------------------------------------
 # Reachable today: base record/field CA surface.
 # --------------------------------------------------------------------------
-
-[[deviation]]
-id = "CBUG-F6"
-bucket = "NOT-REPRODUCED"
-upstream = "epics-base / calc"
-record_types = ["calc", "calcout"]
-fields = ["INPM", "INPN", "INPO", "INPP", "INPQ", "INPR", "INPS", "INPT", "INPU"]
-surface = ["put_accepted"]
-why = """
-C's calcRecord.dbd declares special(SPC_MOD) on the nine link fields INPM..INPU,
-but calcRecord.c's special() implements only SPC_CALC and falls through to
-S_db_badChoice. So on a C IOC every dbPutField to these nine documented fields is
-REJECTED -- they are unwritable over CA. The port implements them as ordinary
-writable links, so the put is ACCEPTED. The deviation is the port refusing to
-reproduce an upstream defect that makes documented fields unusable.
-Expect: C rejects the put, port accepts it.
-"""
 
 [[deviation]]
 id = "CBUG-E1"
@@ -310,9 +302,11 @@ port serves the same menu minus that one instrument-only choice.
 # Entries that were REPRODUCED and have since been re-adjudicated.
 #
 # A REPRODUCED entry is not a deviation: the port deliberately carries C's bug,
-# so the oracle must see AGREEMENT, and the row sits here disabled while
-# doc/strategy-2026-07-13.md §4 schedules it for re-adjudication under the clean
-# policy. When the port STOPS reproducing the bug the row is flipped to
+# so the oracle must see AGREEMENT, and the row sits here disabled until it is
+# re-adjudicated. Adopting the clean policy left the then-18 REPRODUCED entries
+# as exactly that backlog, with a default disposition: implement the intended
+# behaviour, document the deviation, keep the upstream report.
+# When the port STOPS reproducing the bug the row is flipped to
 # NOT-REPRODUCED and enabled, and the diff it then produces is EXPECTED rather
 # than a defect.
 #
@@ -334,7 +328,7 @@ An INVERTED-limits histogram (LLIM > ULIM) cannot bin anything, so the record is
 genuinely misconfigured. C's add_count tries to raise SOFT/INVALID but writes
 stat/sevr DIRECTLY instead of nsta/nsev, so recGblResetAlarms erases it on the
 process path (dead code -> NO_ALARM) while it sticks on the .SGNL special path.
-Per strategy-2026-07-13 §2 (clean is the goal) the port now REFUSES this: it raises
+Per the clean policy -- C's bugs are not the contract -- the port REFUSES this: it raises
 the alarm through the single nsta/nsev owner (recGblSetSevr), so a misconfigured
 histogram reports SOFT/INVALID CONSISTENTLY on both the process and the .SGNL
 special paths (port fix landed 2026-07-20, CBUG-F12 REPRODUCED -> NOT-REPRODUCED;

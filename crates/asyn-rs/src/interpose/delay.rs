@@ -58,15 +58,21 @@ impl OctetInterpose for DelayInterpose {
         data: &[u8],
         next: &mut dyn OctetNext,
     ) -> AsynResult<usize> {
-        if self.delay.is_zero() {
-            return next.write(user, data);
-        }
         // C asynInterposeDelay.c:41-50 writeIt: write one char, then
         // epicsThreadSleep(delay) — AFTER every char, including the last
         // and including a single-char write. On a write error it breaks
         // before sleeping and publishes what it managed to send
         // (`*nbytesTransfered = transfered`, :52), so the count rides out on
         // the error instead of being dropped by `?`.
+        //
+        // The chunking is unconditional in C: `writeIt` has no zero-delay
+        // arm, and `epicsThreadSleep(0)` is a `nanosleep({0,0})` that yields
+        // (osdThread.c:922-933), not an early return. So a port configured
+        // `asynInterposeDelay(port, addr, 0)` still writes one byte per call
+        // to the layer below. Short-circuiting the whole loop on a zero
+        // delay collapsed that into a single N-byte write — a different call
+        // pattern below (one TCP segment where C sends N) and a different
+        // partial count on a failing write.
         let mut total = 0;
         for byte in data.iter() {
             match next.write(user, std::slice::from_ref(byte)) {
@@ -134,8 +140,14 @@ mod tests {
         assert_eq!(base.written[2], b"c");
     }
 
+    /// A zero delay does not turn the layer off. C's `writeIt` (:41-50) has no
+    /// zero-delay arm — it chunks whatever `pvt->delay` holds, and
+    /// `epicsThreadSleep(0)` yields rather than returning early
+    /// (`osdThread.c:922-933`) — so `asynInterposeDelay(port, addr, 0)` still
+    /// hands the layer below one byte per call. Collapsing it to a single
+    /// N-byte write changed what the device sees.
     #[test]
-    fn test_delay_zero_passthrough() {
+    fn zero_delay_still_writes_one_char_at_a_time() {
         let mut stack = OctetInterposeStack::new(false);
         stack.install(-1, Box::new(DelayInterpose::new(Duration::ZERO)));
 
@@ -144,8 +156,11 @@ mod tests {
 
         let n = stack.dispatch_write(&mut user, b"abc", &mut base).unwrap();
         assert_eq!(n, 3);
-        // Zero delay: single write
-        assert_eq!(base.written.len(), 1);
+        assert_eq!(
+            base.written,
+            vec![b"a".to_vec(), b"b".to_vec(), b"c".to_vec()],
+            "C chunks on any delay, zero included"
+        );
     }
 
     #[test]

@@ -98,9 +98,8 @@ image).
 ## The target spec (applied automatically)
 
 Every build of the builtin `armv7-rtems-eabihf` triple in this workspace goes
-through the one-key spec deviation `has-thread-local: true`
-(`doc/rtems-tls-spec-deviation.md` — it takes std's per-thread TLS leak on
-RTEMS from 136 B to 0). You do not pass anything: `.cargo/config.toml` wires
+through the one-key spec deviation `has-thread-local: true`, which takes std's
+per-thread TLS leak on RTEMS from 136 B to 0. You do not pass anything: `.cargo/config.toml` wires
 `build.rustc-wrapper = scripts/rtems-rustc-wrapper.sh`, which rewrites the
 triple to a spec generated from the exact rustc in use and leaves every other
 invocation (host builds included) untouched.

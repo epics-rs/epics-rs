@@ -75,10 +75,7 @@ EPICS Base / pvxs unless a deviation is documented.
 - For a behavioral change, cite the upstream C/C++ source
   (`file.c:line`) in the commit message or a comment.
 - If you believe upstream itself has a bug, do not silently "fix" it in
-  the port — open an issue so the deviation is recorded (see
-  `docs/upstream-c-bugs` for prior art).
-- `archaeology/` preserves the porting review record; it is historical
-  data, not build input — no need to update it in a PR.
+  the port — open an issue so the deviation is recorded.
 
 ## Commit messages
 

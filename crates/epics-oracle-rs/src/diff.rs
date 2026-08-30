@@ -172,18 +172,14 @@ pub fn compare(c: &Observation, rust: &Observation) -> Comparison {
     if let (Some(a), Some(b)) = (&c.put, &rust.put) {
         push(
             Surface::PutAccepted,
-            a.accepted.to_string(),
-            b.accepted.to_string(),
+            a.as_surface().to_string(),
+            b.as_surface().to_string(),
         );
-        // Only compare the *reason* when both refused. If one accepted and the
-        // other refused, PutAccepted already says so and a second finding on
+        // Only compare the *reason* when both refused. If the two outcomes
+        // differ at all, PutAccepted already says so and a second finding on
         // the error text would be double-counting the same divergence.
-        if !a.accepted && !b.accepted {
-            push(
-                Surface::PutError,
-                a.error.clone().unwrap_or_default(),
-                b.error.clone().unwrap_or_default(),
-            );
+        if let (PutOutcome::Refused { error: ea }, PutOutcome::Refused { error: eb }) = (a, b) {
+            push(Surface::PutError, ea.clone(), eb.clone());
         }
     }
     if let (Some(a), Some(b)) = (&c.monitor, &rust.monitor) {
@@ -223,12 +219,12 @@ pub enum Verdict {
     /// behaved alike" and "the operation finished" are two different facts and
     /// a run that folded them together would report a completion it never saw.
     ///
-    /// Not [`Self::Errored`]: the crate already rules that a refusal issued by
-    /// the server is a reading and not a measurement failure
-    /// (`tests/oracle.rs:250-258`), and a completion that never comes from
-    /// EITHER side is the same kind of reading — the two IOCs did the same
-    /// observable thing. A one-sided no-completion is the opposite: it is the
-    /// difference this harness exists to find, so it stays `Errored`.
+    /// Not [`Self::Errored`]: a completion that never comes is a reading of the
+    /// server, [`crate::catool::PutOutcome::NeverCompleted`], exactly as a
+    /// refusal it issued is. A one-sided no-completion is therefore not an
+    /// absence either — it is a difference on
+    /// [`Surface::PutAccepted`], and it scores [`Self::Defect`] unless the
+    /// allowlist justifies it.
     NeitherCompleted,
     Errored,
 }
@@ -317,40 +313,63 @@ mod tests {
         assert!(!r.is_readable(), "...it is an ERROR");
     }
 
+    fn put_obs(o: PutOutcome) -> Observation {
+        Observation {
+            put: Some(o),
+            ..Default::default()
+        }
+    }
+
     #[test]
     fn put_rejection_reason_is_only_compared_when_both_sides_refused() {
-        // One accepted, one refused: exactly one finding (PutAccepted).
-        let c = Observation {
-            put: Some(PutOutcome {
-                accepted: false,
-                error: Some("Invalid value".into()),
+        // One completed, one refused: exactly one finding (PutAccepted).
+        let d = compare(
+            &put_obs(PutOutcome::Refused {
+                error: "Invalid value".into(),
             }),
-            ..Default::default()
-        };
-        let r = Observation {
-            put: Some(PutOutcome {
-                accepted: true,
-                error: None,
-            }),
-            ..Default::default()
-        };
-        let d = compare(&c, &r).differences;
+            &put_obs(PutOutcome::Completed),
+        )
+        .differences;
         assert_eq!(d.len(), 1);
         assert_eq!(d[0].surface, Surface::PutAccepted);
     }
 
     #[test]
     fn both_refusing_for_different_reasons_is_a_difference() {
-        let mk = |e: &str| Observation {
-            put: Some(PutOutcome {
-                accepted: false,
-                error: Some(e.into()),
-            }),
-            ..Default::default()
-        };
+        let mk = |e: &str| put_obs(PutOutcome::Refused { error: e.into() });
         let d = compare(&mk("Invalid value"), &mk("Write access denied")).differences;
         assert_eq!(d.len(), 1);
         assert_eq!(d[0].surface, Surface::PutError);
+    }
+
+    /// The three outcomes are three readings, and every pair of unequal ones is
+    /// a difference on one surface.
+    ///
+    /// A one-sided non-completion is the case this exists for: C's `busy` record
+    /// declines to finish the put while `VAL` is non-zero, a port that finishes
+    /// it diverges, and that used to be unreportable because the non-completion
+    /// left the harness as an absence rather than a reading.
+    #[test]
+    fn a_one_sided_non_completion_is_a_difference_not_an_absence() {
+        let d = compare(
+            &put_obs(PutOutcome::NeverCompleted),
+            &put_obs(PutOutcome::Completed),
+        )
+        .differences;
+        assert_eq!(d.len(), 1);
+        assert_eq!(d[0].surface, Surface::PutAccepted);
+        assert_eq!(d[0].c, "accepted, never completed");
+        assert_eq!(d[0].rust, "completed");
+
+        // Both declining is agreement on the surface, not a difference.
+        assert!(
+            compare(
+                &put_obs(PutOutcome::NeverCompleted),
+                &put_obs(PutOutcome::NeverCompleted),
+            )
+            .differences
+            .is_empty()
+        );
     }
 
     fn trace(vals: &[&str]) -> MonitorTrace {

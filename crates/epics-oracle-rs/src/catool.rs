@@ -343,33 +343,33 @@ impl CaTools {
         self.put(&args)
     }
 
-    /// The single classifier for every `caput` invocation: did the server
-    /// answer, or did the measurement not happen?
+    /// The single classifier for every `caput` invocation: what did the server
+    /// do, or did the measurement not happen at all?
     ///
-    /// Both spellings used to collapse every `Err` into
-    /// `PutOutcome { accepted: false, … }`, so a spawn failure, the 8 s
-    /// [`TOOL_TIMEOUT`] kill and the `-w` CA timeout were the same value as a
-    /// `SPC_NOMOD` refusal. Both sides then "agreed" that the write was refused
-    /// and the case scored AGREED on an experiment that never ran — which is
-    /// why the put phase could report `ERROR 0` across a whole sweep.
+    /// Both spellings used to collapse every `Err` into a not-accepted outcome,
+    /// so a spawn failure, the 8 s [`TOOL_TIMEOUT`] kill and the `-w` CA timeout
+    /// were the same value as a `SPC_NOMOD` refusal. Both sides then "agreed"
+    /// that the write was refused and the case scored AGREED on an experiment
+    /// that never ran — which is why the put phase could report `ERROR 0` across
+    /// a whole sweep.
     ///
-    /// The two meanings are now different types, so no caller can conflate
+    /// Reading and absence are now different types, so no caller can conflate
     /// them by accident. Which failures are absences is decided by
     /// [`is_measurement_failure`] against the C tools' own strings, because
-    /// `caput` exits 1 for a refusal and for a timeout alike.
+    /// `caput` exits 1 for a refusal, a non-completion and a timeout alike; the
+    /// non-completion is pulled out first, because it is the one string of the
+    /// set that describes the *server* rather than the road to it.
     fn put(&self, args: &[String]) -> Result<PutOutcome, ToolError> {
         match self.run_with_stderr("caput", args) {
+            Ok((_, stderr)) if is_no_completion(&stderr) => Ok(PutOutcome::NeverCompleted),
             Ok((_, stderr)) if is_measurement_failure(&stderr) => {
                 Err(self.err("caput", normalize_ca_error(&stderr)))
             }
-            Ok(_) => Ok(PutOutcome {
-                accepted: true,
-                error: None,
-            }),
+            Ok(_) => Ok(PutOutcome::Completed),
+            Err(e) if is_no_completion(&e.message) => Ok(PutOutcome::NeverCompleted),
             Err(e) if is_measurement_failure(&e.message) => Err(e),
-            Err(e) => Ok(PutOutcome {
-                accepted: false,
-                error: Some(normalize_ca_error(&e.message)),
+            Err(e) => Ok(PutOutcome::Refused {
+                error: normalize_ca_error(&e.message),
             }),
         }
     }
@@ -385,18 +385,21 @@ impl CaTools {
     /// PVA. The put phase keeps the opposite rule, because there the refusal
     /// *is* the observable.
     pub fn caput_drive(&self, pv: &str, value: &str) -> Result<(), ToolError> {
-        let out = self.caput(pv, value)?;
-        if out.accepted {
-            return Ok(());
+        match self.caput(pv, value)? {
+            // A write the server took is a stimulus, whether or not it chose to
+            // report the put complete: the value landed and the record
+            // processed. Withholding the completion is C's `busy` record doing
+            // its job, and erroring on it would throw away the very trace the
+            // case exists to compare.
+            PutOutcome::Completed | PutOutcome::NeverCompleted => Ok(()),
+            PutOutcome::Refused { error } => Err(self.err(
+                "caput",
+                format!(
+                    "drive refused: {pv} <- {value}: {error} — nothing was stimulated, \
+                     so the trace proves nothing"
+                ),
+            )),
         }
-        Err(self.err(
-            "caput",
-            format!(
-                "drive refused: {pv} <- {value}: {} — nothing was stimulated, \
-                 so the trace proves nothing",
-                out.error.unwrap_or_default()
-            ),
-        ))
     }
 
     /// `cainfo` — native DBF type, element count, and access rights.
@@ -618,13 +621,44 @@ fn parse_monitor_line(line: &str) -> Option<MonitorEvent> {
     Some(MonitorEvent { pv, value, alarm })
 }
 
-/// Did the server accept the write, and if not, what did it say?
+/// What the server did with a write.
+///
+/// Three outcomes, not two. "Accepted and never finished" is a third thing a
+/// server can do, and it used to have nowhere to live: it was smuggled out
+/// through the `Err` channel, where it meant "no reading" — so a case where one
+/// server finished the put and the other did not could only score ERROR, and
+/// the divergence this harness exists to find was reported as a failure to
+/// look. C's `busy` record makes that outcome its whole purpose: it declines
+/// `recGblFwdLink()` while `VAL` is non-zero (busy `docs/busyRecord.md`), so the
+/// `ca_put_callback` deliberately never completes, and `caput -c` prints
+/// "Write callback operation timed out" over a channel that connected, a write
+/// that landed and a readback that agrees.
+///
+/// Each variant now means exactly one thing on every path, so no caller can
+/// conflate a refusal, a non-completion and an absence by accident.
 #[derive(Debug, Clone, PartialEq, serde::Serialize)]
-pub struct PutOutcome {
-    pub accepted: bool,
-    /// The server's rejection, normalized so that host/port/timing noise does
-    /// not masquerade as a behavioral difference.
-    pub error: Option<String>,
+#[serde(tag = "outcome", rename_all = "snake_case")]
+pub enum PutOutcome {
+    /// The server accepted the write and reported the put complete.
+    Completed,
+    /// The server refused the write. The message is normalized so that
+    /// host/port/timing noise does not masquerade as a behavioral difference.
+    Refused { error: String },
+    /// The server accepted the write and never reported completion. A reading
+    /// of the server, not the absence of one: see [`is_no_completion`].
+    NeverCompleted,
+}
+
+impl PutOutcome {
+    /// The [`crate::diff::Surface::PutAccepted`] rendering — what the two sides
+    /// are compared on.
+    pub fn as_surface(&self) -> &'static str {
+        match self {
+            Self::Completed => "completed",
+            Self::Refused { .. } => "refused",
+            Self::NeverCompleted => "accepted, never completed",
+        }
+    }
 }
 
 /// What `cainfo` reports about a channel — the type/shape/rights surface.
@@ -709,22 +743,25 @@ fn is_measurement_failure(msg: &str) -> bool {
         "timed out after",
         "wait:",
     ];
-    MARKERS.iter().any(|m| msg.contains(m)) || is_no_completion(msg)
+    MARKERS.iter().any(|m| msg.contains(m))
 }
 
 /// `caput.c:567` — the write was accepted and the completion never came.
 ///
-/// The one marker in `is_measurement_failure`'s list that describes the
-/// SERVER rather than the road to it. The other five say we never got to ask:
-/// the channel never connected, the child never spawned, the tool was killed at
-/// `TOOL_TIMEOUT`. This one says both ends of the conversation worked and the
-/// IOC chose never to finish — C's `subRecord.c:119-122` latches `pact = TRUE`
-/// on an empty `SNAM`, `dbProcess` (`dbAccess.c:537`) then returns early for
-/// every later cycle, and no `ca_put_callback` can ever complete.
+/// The one `caput` failure string that describes the SERVER rather than the
+/// road to it, which is why it is NOT in `is_measurement_failure`'s list. The
+/// five markers there say we never got to ask: the channel never connected, the
+/// child never spawned, the tool was killed at `TOOL_TIMEOUT`. This one says
+/// both ends of the conversation worked and the IOC chose never to finish — so
+/// it is a reading, [`PutOutcome::NeverCompleted`], and the case is compared
+/// like any other.
 ///
-/// That distinction is what [`crate::diff::Verdict::NeitherCompleted`] rests
-/// on, so the marker is named once and both readers share it: a bucket that
-/// admitted "spawn:" would be scoring the harness's own crash as a reading.
+/// Two servers do it on purpose. C's `subRecord.c:119-122` latches
+/// `pact = TRUE` on an empty `SNAM` and `dbProcess` (`dbAccess.c:537`) then
+/// returns early for every later cycle; C's `busy` record declines
+/// `recGblFwdLink()` while `VAL` is non-zero, which is the record type's entire
+/// contract (busy `docs/busyRecord.md`) — the caller's `ca_put_callback` is
+/// meant to stay open until something writes "Done".
 pub fn is_no_completion(msg: &str) -> bool {
     msg.contains("Write callback operation timed out")
 }
@@ -865,7 +902,6 @@ mod tests {
         assert!(is_measurement_failure(
             "Write operation timed out: Data was not written."
         ));
-        assert!(is_measurement_failure("Write callback operation timed out"));
         // This harness's own failures.
         assert!(is_measurement_failure("spawn: No such file or directory"));
         assert!(is_measurement_failure("timed out after 8s"));
@@ -877,6 +913,12 @@ mod tests {
         assert!(!is_measurement_failure(
             "ERROR from put operation: Invalid record modification"
         ));
+        // caput.c:567 — the server took the write and declined to finish it.
+        // Also a reading, and the one the `busy` record exists to produce.
+        assert!(!is_measurement_failure(
+            "Write callback operation timed out"
+        ));
+        assert!(is_no_completion("Write callback operation timed out"));
     }
 
     fn sh(script: &str) -> std::process::Child {

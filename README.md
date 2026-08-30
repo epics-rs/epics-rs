@@ -219,8 +219,9 @@ A prefix assembled any other way cannot be named in a bug report. Sourcing
 `PATH` and the cargo linker override come from it.
 
 The custom target spec this workspace deviates on (`has-thread-local: true`,
-`doc/rtems-tls-spec-deviation.md`) is applied automatically by a rustc-wrapper
-wired in `.cargo/config.toml` — plain `cargo build` is the whole interface.
+measured to take std's per-thread TLS leak on RTEMS from 136 B to 0) is applied
+automatically by a rustc-wrapper wired in `.cargo/config.toml` — plain
+`cargo build` is the whole interface.
 `./scripts/embedded-image.sh rtems ca` builds the same binary on the
 `release-embedded` profile (strip + fat LTO), which is what a deployment ships:
 4.6 MB against the dev build's 122.9 MB. The full build manual, including the
@@ -250,9 +251,9 @@ not reach `-Zbuild-std`, which resolves std against rust-src's own lock, so
 line the single source of truth for what libc is compiled. That is what lets
 the closure be type-checked on a stock nightly, CI included. Linking stays on a
 box with the SDK — producing or booting a `.vxe` is the one half no runner can
-do. The target contract, the cfg architecture, and what was measured on target
-(gate rows, CA/PVA round-trips, image sizes) are in
-[`doc/vxworks-port.md`](doc/vxworks-port.md).
+do. What was measured on target: 11/11 gate rows, CA and PVA round-trips over
+the wire, and a five-row strip/LTO size matrix covering both embedded targets
+and both binaries.
 
 ## Run on RT Linux (PREEMPT_RT)
 
@@ -270,9 +271,9 @@ EPICS_RS_ALLOW_RT_PRIORITY=YES ./your-ioc
 
 Both levers are documented in
 [`crates/epics-base-rs/README.md`](crates/epics-base-rs/README.md) ("Real-time
-deployment"); the measured evidence — PI collapsing the record-gate priority
-inversion to its critical-section bound on a real PREEMPT_RT kernel — is in
-`doc/rtlinux-rt-measurement.md`.
+deployment"). Measured on a real PREEMPT_RT kernel, PI collapses the
+record-gate priority inversion to its critical-section bound: worst case
+24.9 ms to 10.1 ms on the measured guest.
 
 ## Architecture
 

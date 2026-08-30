@@ -4,7 +4,7 @@
 //! `callInterruptUsers(pasynUser, pasynPvt, data, nbytesTransfered, eomReason)`
 //! after every successful read, when the port enabled `interruptProcess` — which
 //! both stream drivers do (`pasynOctetBase->initialize(..., 1)`,
-//! drvAsynIPPort.c:1055 and drvAsynSerialPort.c:1125). It is what makes a
+//! drvAsynIPPort.c:1055 and drvAsynSerialPort.c:1125-1126). It is what makes a
 //! `stringin`/`waveform` with `SCAN="I/O Intr"` on a serial or IP port process:
 //! the driver read is the interrupt.
 //!

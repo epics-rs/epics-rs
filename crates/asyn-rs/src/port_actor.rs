@@ -112,7 +112,7 @@ impl ActorMessage {
         // C derives the queue band from the KIND of request, never from a
         // field a caller has to remember to set: `asynRecord` picks
         // `asynQueuePriorityConnect` from `pmsg->callbackType ==
-        // callbackConnect` (asynRecord.c:562-566), and `asynCommonSyncIO`'s
+        // callbackConnect` (asynRecord.c:561-565), and `asynCommonSyncIO`'s
         // connect/disconnect pass the constant literally
         // (asynCommonSyncIO.c:142, :154). `CDispatch::ConnectQueue` is that
         // kind, and it already fixes the connected waiver
@@ -217,7 +217,7 @@ enum CDispatch {
     /// no queue for the block holder to divert it into. These are `pasynManager`'s
     /// own entry points, which take `asynManagerLock`, act and return: `enable`
     /// (asynManager.c:2222-2249), `autoConnectAsyn` (:2310-2324),
-    /// `isConnected`/`isEnabled`/`isAutoConnect` (:2326-2354),
+    /// `isConnected`/`isEnabled`/`isAutoConnect` (:2326-2368),
     /// `blockProcessCallback` (:1692-1723), `shutdownPort`, `interposeInterface`.
     ///
     /// The gate must not run on them: a port disabled with `asynEnable(port,0)`
@@ -291,7 +291,7 @@ impl BlockHolders {
     }
 
     /// C's eligibility test, verbatim: **both** holders must be NULL or this
-    /// user (asynManager.c:889-892). One holder alone is never enough to admit
+    /// user (asynManager.c:887-890). One holder alone is never enough to admit
     /// a request, and never enough to refuse one.
     fn admits(&self, token: Option<u64>, dp: DpKey) -> bool {
         let free = |h: Option<&(u64, u32)>| match h {
@@ -646,7 +646,7 @@ impl PortActor {
     /// What it does *not* run on is a pass C's thread would never have taken. C
     /// waits on `notifyPortThread` and only the five signal sites listed on
     /// [`Self::woken`] reach it; `isConnected` (:2326-2337), `isEnabled` (:2340),
-    /// `isAutoConnect` (:2348) and `report` (:1136) are plain reads under
+    /// `isAutoConnect` (:2356) and `report` (:1136) are plain reads under
     /// `asynManagerLock` and signal nothing. Here every one of them is a message,
     /// and a message wakes the actor — so the wake latch, not the message, is
     /// what gates this tail (R16-46). Without it a status poller dials the
@@ -663,7 +663,7 @@ impl PortActor {
         self.auto_connect_port();
     }
 
-    /// C `epicsEventMustWait(pport->notifyPortThread)` (asynManager.c:805) —
+    /// C `epicsEventMustWait(pport->notifyPortThread)` (asynManager.c:804) —
     /// consume the wake and say whether there was one. The two halves are the
     /// latch the actor sets at C's signal sites ([`Self::woken`]) and the port's
     /// announced-exception count, which catches the announcements C signals for
@@ -741,7 +741,7 @@ impl PortActor {
     /// The gate every connect attempt the actor makes *on its own initiative*
     /// passes — the retry timer and both auto-connect levels. It is the same
     /// gate a request passes, asked on behalf of the connect user C builds for
-    /// the port (`pport->pconnectUser`, asynManager.c:3231): `addr == -1` at
+    /// the port (`pport->pconnectUser`, asynManager.c:3226-3231): `addr == -1` at
     /// Connect priority, so `checkPortConnect` is `FALSE` (:1536-1538) and only
     /// the unconditional enabled/defunct half binds (:1541-1546).
     ///
@@ -987,15 +987,15 @@ impl PortActor {
             // `report` (asynManager.c:1136-1171) spawns a `reportPort` thread and
             // calls `pasynCommon->report(drvPvt, fp, details)` directly (:1121-1123).
             // No queue, no gate: a disabled port reports `enabled:No`, a
-            // disconnected one `connected:No` (:1112-1115). The diagnostic you
+            // disconnected one `connected:No` (:1057-1060). The diagnostic you
             // reach for *because* the port is down must not be the one the down
             // port refuses (W10-D6). The one state C will not report on is a
             // destroyed port, handled in the dispatch arm (:1038-1042).
             | RequestOp::Report { .. } => CDispatch::Direct,
 
             // C reaches `asynCommon->connect`/`disconnect` only from a callback
-            // queued at Connect priority (asynRecord's CNCT/PCNCT put,
-            // asynRecord.c:503-505,562-571) or from the port thread itself.
+            // queued at Connect priority (asynRecord's CNCT put,
+            // asynRecord.c:537-538,561-571) or from the port thread itself.
             RequestOp::Connect
             | RequestOp::Disconnect
             | RequestOp::ConnectAddr
@@ -1485,9 +1485,9 @@ impl PortActor {
                 // owns the bracket atomically under its serial dispatch.
                 //
                 // The bracket runs only when there IS a saved terminator, as
-                // C's `if (saveEosLen)` guard does (:1535, :1540) — a driver
+                // C's `if (saveEosLen)` guard does (:1534, :1539) — a driver
                 // with no EOS methods answers `asynError` to both accessors
-                // (asynOctetBase.c:401-411) and C explicitly tolerates that
+                // (asynOctetBase.c:401-415) and C explicitly tolerates that
                 // (:1531 "getOutputEos can return an error if the driver does
                 // not implement it"). Clearing unconditionally turned every
                 // binary transfer on such a port into that refusal.
@@ -1509,7 +1509,7 @@ impl PortActor {
                 // restore it on every exit path so a configured IEOS does not
                 // stop the read early or strip bytes belonging to the binary
                 // payload. Guarded by `saveEosLen` exactly as C guards it
-                // (:1571, :1576) — see `OctetWriteBinary` above.
+                // (:1570, :1575) — see `OctetWriteBinary` above.
                 let saved = self.driver.get_input_eos(user);
                 let bracket = !saved.is_empty();
                 if bracket {
@@ -1981,7 +1981,7 @@ impl PortActor {
                 // Flush every address list this batch wrote, not just the
                 // request's. C has no bundled set-then-flush: a driver calls
                 // `setXxxParam` per list and then `callParamCallbacks(addr)`
-                // once for each list it touched (asynPortDriver.cpp:820). This
+                // once for each list it touched (asynPortDriver.cpp:1785-1794). This
                 // carrier bundles the two, so it owes a flush for every list it
                 // just wrote — `call_param_callbacks` consumes the changed flags
                 // of one list only, so flushing the request address alone stores
@@ -2158,7 +2158,7 @@ fn combine_read_alarm(status: AsynStatus, alarm_status: u16, alarm_severity: u16
 /// `epics` feature, which is why `--no-default-features` never compiled.
 ///
 /// The values are the `menuAlarmStat.dbd` / `menuAlarmSevr.dbd` ordinals, fixed
-/// by `libcom/src/misc/alarm.h:62-85` and part of the EPICS record ABI.
+/// by `libcom/src/misc/alarm.h:39-45,62-85` and part of the EPICS record ABI.
 /// `tests::asyn_alarm_codes_match_epics_base` holds them to
 /// `epics_base_rs`'s under the `epics` feature, so a drift on either side is a
 /// test failure rather than a silently wrong ALARM/SEVR field.
@@ -2679,7 +2679,7 @@ mod tests {
     /// asynManager.c:811-855), and every C caller of connect/disconnect
     /// queues there — `asynCommonSyncIO` passes the constant
     /// (asynCommonSyncIO.c:142, :154), `asynRecord` derives it from the
-    /// callback type (asynRecord.c:562-566). Here the band comes from
+    /// callback type (asynRecord.c:561-565). Here the band comes from
     /// [`PortActor::c_dispatch`] for the same reason, so a `CNCT` put built
     /// on a `#[default]` Medium user still overtakes a sustained High stream
     /// instead of starving behind it.
@@ -3839,7 +3839,7 @@ mod tests {
         };
 
         // Boundary 1 — disabled: the wake finds the queue gate refusing, so no
-        // attempt reaches the hardware (C `portThread` :802-805; R14-50).
+        // attempt reaches the hardware (C `portThread` :806-809; R14-50).
         let (tx, calls) = spawn(true, false, true);
         send_and_wait(
             &tx,
@@ -3893,7 +3893,7 @@ mod tests {
     ///
     /// C's `portThread` runs a pass only when `notifyPortThread` is signalled, and
     /// `isConnected` (asynManager.c:2326-2337), `isEnabled` (:2340),
-    /// `isAutoConnect` (:2348) and `report` (:1136) signal nothing — they take
+    /// `isAutoConnect` (:2356) and `report` (:1136) signal nothing — they take
     /// `asynManagerLock`, read a flag and return. Here every one of them is a
     /// message that wakes the actor, so before the wake latch each of them ended
     /// in `autoConnectDevice(pport,0)`: a status poller pulled a dead port's
@@ -4143,7 +4143,7 @@ mod tests {
 
     /// `callParamCallbacks(addr)` consumes the changed flags of **one** address
     /// list (`ParamList::take_changed`), and C drivers call it once per list
-    /// they wrote (asynPortDriver.cpp:820). This carrier bundles the sets and
+    /// they wrote (asynPortDriver.cpp:1785-1794). This carrier bundles the sets and
     /// the flush, so it owes a flush for every list the batch wrote: flushing
     /// only the request address stored the other lists' values and fired no
     /// interrupt for them, so a multi-device driver publishing six joint angles
@@ -4325,8 +4325,10 @@ mod tests {
     /// C's `asynReport` header prints `multiDevice:` straight off
     /// `pport->attributes & ASYN_MULTIDEVICE` (asynManager.c:1043-1047), and the
     /// IP server listener is registered with plain `ASYN_CANBLOCK`
-    /// (drvAsynIPServerPort.c:625-626) — its asynOctet table is all NULL
-    /// (:118-122), so it is an interrupt source, not an addressable port. The
+    /// (drvAsynIPServerPort.c:625-626) — a TCP listener's asynOctet table stays
+    /// the all-NULL initializer (:118-123; C fills read/write/flush in only for
+    /// SOCK_DGRAM, :652-656), so it is an interrupt source, not an addressable
+    /// port. The
     /// per-client ports are separate single-device registrations (:688-694).
     #[test]
     fn the_ip_server_listener_reports_multidevice_no_like_c() {
@@ -4458,7 +4460,7 @@ mod tests {
     /// W10-D6: C's `report` (asynManager.c:1136-1171) spawns a `reportPort` thread
     /// and calls `pasynCommon->report(drvPvt, fp, details)` directly (:1121-1123).
     /// It never queues, so no gate runs: a disabled port reports `enabled:No` and
-    /// a disconnected one `connected:No` (:1112-1115). Queue-gating it made
+    /// a disconnected one `connected:No` (:1057-1060). Queue-gating it made
     /// `asynReport` on a down port print a refusal instead of the diagnostic the
     /// operator opened it for.
     ///
@@ -4624,10 +4626,10 @@ mod tests {
             !out.contains("EOS["),
             "a port with no octet interface has no EOS to report: {out}"
         );
-        // C `reportParams(fp, details)` with the level unshifted (:3692): at
+        // C `reportParams(fp, details)` with the level unshifted (:3693): at
         // details 1 the whole parameter block is already there — list 0, the
         // count, and every parameter with its value (:1804-1807,
-        // paramVal.cpp:296-330).
+        // paramVal.cpp:296-372).
         assert!(
             out.contains("Parameter list 0\nNumber of parameters is: 1\n")
                 && out.contains("Parameter 0 type=asynInt32, name=VAL, value is undefined\n"),

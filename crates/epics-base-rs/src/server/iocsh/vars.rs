@@ -12,7 +12,7 @@
 //! # What a softIoc has here that this table does not
 //!
 //! Measured on `softIoc` R7.0.10: a bare `var` lists 24 names, and the
-//! same command here lists one. The 24 arrive by two routes —
+//! same command here lists 12. The 24 arrive by two routes —
 //! `registerAllRecordDeviceDrivers.cpp` copies the 22 `variable()` lines
 //! of `softIoc.dbd` into the iocsh table, and `libComRegister.c:518-520`
 //! adds `asCheckClientIP` and `freeListBypass` directly. The gap is not a
@@ -21,16 +21,17 @@
 //! either implements with the default hard-wired or does not have at all.
 //! Each of the 24, with its reason:
 //!
-//! **Registered here (11).** `asCheckClientIP`, from
+//! **Registered here (12).** `asCheckClientIP`, from
 //! `access_commands`; `dbRecordsOnceOnly` and `dbQuietMacroWarnings`,
-//! from `commands`; and the eight knobs `seeded_knobs` seeds:
+//! from `commands`; and the nine knobs `seeded_knobs` seeds:
 //! `boHIGHlimit`, `boHIGHprecision`, `calcoutODLYlimit`,
 //! `calcoutODLYprecision`, `histogramSDELprecision`, `seqDLYlimit`,
-//! `seqDLYprecision` and `callbackParallelThreadsDefault`. All eight were
-//! a `const` or a computing function until they were registered; a name
-//! in this table has to reach a global something actually reads, or `var
-//! seqDLYlimit 5000` lists and echoes a value nothing uses, which looks
-//! like it worked. Three of them are C `double`s, which is what
+//! `seqDLYprecision`, `callbackParallelThreadsDefault` and
+//! `dbTemplateMaxVars`. All nine were a `const` or a computing function
+//! until they were registered; a name in this table has to reach a global
+//! something actually reads, or `var seqDLYlimit 5000` lists and echoes a
+//! value nothing uses, which looks like it worked. Three of them are C
+//! `double`s, which is what
 //! [`crate::server::iocsh::vars::VarAccess::Double`] is for.
 //!
 //! **C `printf` debug switches with no counterpart here (7).**
@@ -41,15 +42,14 @@
 //! guards `printf`/`errlogPrintf` statements in its own C file, and this
 //! port carries no equivalent statements for the knob to switch on.
 //!
-//! **Behaviour this port does not have (6).** `dbBptNotMonotonic` — the
+//! **Behaviour this port does not have (5).** `dbBptNotMonotonic` — the
 //! lax breakpoint-table rules it opts into are not modelled, so the
 //! strict ones always apply ([`crate::server::cvt_bpt`]).
 //! `dbConvertStrict` — it picks between two string→field parsers
 //! (`dbStaticRun.c:409-430`) and there is only one here.
 //! `dbRecordsAbcSorted` — it sorts the record list
-//! as the database loads (`dbLexRoutines.c:334`). `dbTemplateMaxVars` —
-//! it bounds a fixed-size array in `dbLoadTemplate.y:159`, and the
-//! substitution loader here has no such array. `dbThreadRealtimeLock` —
+//! as the database loads (`dbLexRoutines.c:334`).
+//! `dbThreadRealtimeLock` —
 //! it gates the `mlockall` at `iocInit.c:225`, and nothing in this
 //! workspace calls `mlockall`. `freeListBypass` — it turns off the
 //! recycling pool in `freeListLib.c:61`, which Rust allocation replaces.
@@ -130,6 +130,18 @@ fn seeded_knobs() -> Vec<VarDef> {
                         value as i32,
                     )
                 },
+            },
+        },
+        // C `dbTemplateMaxVars` — `dbCore.dbd:29`, like
+        // `callbackParallelThreadsDefault` above: an `int` global in
+        // `dbLoadTemplate.y:45` that `pattern_name` reads at the point of
+        // use (`:159`), so `var dbTemplateMaxVars 200` raises the ceiling
+        // for the next `dbLoadTemplate` and not only for the next IOC.
+        VarDef {
+            name: "dbTemplateMaxVars",
+            access: VarAccess::Int {
+                get: || crate::server::db_loader::db_template_max_vars() as i64,
+                set: |value| crate::server::db_loader::set_db_template_max_vars(value as i32),
             },
         },
         VarDef {
@@ -249,22 +261,6 @@ fn strtol_base0(s: &str) -> Option<i64> {
     Some(if neg { -magnitude } else { magnitude })
 }
 
-/// C `epicsStrtod(s, &endp)` under the same whole-string check
-/// (`iocsh.cpp:1426-1435`), so the leading-whitespace rule is
-/// [`strtol_base0`]'s and not a second one.
-///
-/// Rust's `f64` parser takes the decimal, exponent and `inf`/`nan`
-/// spellings C's does. It does not take glibc's hex-float form
-/// (`0x1p3`), which is the one input C would accept and this rejects as
-/// `Invalid double`.
-fn strtod_whole(s: &str) -> Option<f64> {
-    let s = s.trim_start();
-    if s.is_empty() {
-        return None;
-    }
-    s.parse::<f64>().ok()
-}
-
 /// C `varHandler(v, NULL)` — `int %s = %d` / `double %s = %g` on stdout
 /// (`iocsh.cpp:1400-1408`). The `%g` is a bare one, so six significant
 /// digits, and [`crate::server::records::printf::format_g`] is the port's glibc-differenced printer for
@@ -330,14 +326,24 @@ fn cmd_var() -> CommandDef {
                     }
                 }
                 if !found && let Some(name) = name {
-                    return Err(format!("No known vars match '{name}'."));
+                    // C `varCallFunc` writes both of its refusals straight
+                    // to `epicsGetStderr()` and fails the line with a bare
+                    // `iocshSetError(1)` (`iocsh.cpp:1460-1464`,
+                    // `:1468-1472`) — no `showError`, so no `ERROR <file>
+                    // line <n>: ` frame around either sentence. Returning
+                    // `Err` here added one.
+                    ctx.eprintln(&format!("No known vars match '{name}'."));
+                    return Ok(CommandOutcome::Failed);
                 }
                 return Ok(CommandOutcome::Continue);
             };
 
             // With a value the name is looked up exactly, not globbed.
             let Some(def) = name.and_then(|name| table.get(name)) else {
-                return Err(format!("No known var '{}'.", name.unwrap_or_default()));
+                // The set path's own sentence, unframed for the same
+                // reason (`iocsh.cpp:1468-1472`).
+                ctx.eprintln(&format!("No known var '{}'.", name.unwrap_or_default()));
+                return Ok(CommandOutcome::Failed);
             };
             match &def.access {
                 VarAccess::Int { set, .. } => match strtol_base0(value) {
@@ -349,7 +355,9 @@ fn cmd_var() -> CommandDef {
                         ctx.eprintln(&format!("Invalid integer, var '{}' not changed.", def.name))
                     }
                 },
-                VarAccess::Double { set, .. } => match strtod_whole(value) {
+                // C reaches `epicsStrtod` from here and from `cvtArg`
+                // alike, so both go through the one port of it.
+                VarAccess::Double { set, .. } => match super::registry::epics_strtod_whole(value) {
                     Some(parsed) => set(parsed),
                     None => {
                         ctx.eprintln(&format!("Invalid double, var '{}' not changed.", def.name))
@@ -380,24 +388,65 @@ mod tests {
         ctx
     }
 
+    /// The command's stdout when the line succeeds, and the bytes it put
+    /// on the DIAGNOSTIC stream when the line fails — C's `var` refusals
+    /// are written there and the line is failed by a bare
+    /// `iocshSetError(1)`, so the stream is the only place the sentence
+    /// exists and there is no shell diagnostic to read instead.
     fn run_var(ctx: &CommandContext, tokens: &[&str]) -> Result<String, String> {
         let mut reg = CommandRegistry::new();
         super::super::commands::register_builtins(&mut reg);
         let cmd = reg.get("var").expect("`var` must be registered").clone();
         let tokens: Vec<String> = tokens.iter().map(|t| (*t).to_string()).collect();
         let args = parse_args(&tokens, &cmd.args).unwrap();
-        let tmp = tempfile::NamedTempFile::new().unwrap();
-        let path = tmp.path().to_path_buf();
-        let mut failure = None;
-        ctx.with_output(std::fs::File::create(&path).unwrap(), || {
-            if let Err(e) = cmd.handler.call(&args, ctx) {
-                failure = Some(e);
-            }
+        let out_tmp = tempfile::NamedTempFile::new().unwrap();
+        let err_tmp = tempfile::NamedTempFile::new().unwrap();
+        let (out_path, err_path) = (out_tmp.path().to_path_buf(), err_tmp.path().to_path_buf());
+        let mut failed = false;
+        ctx.with_error(std::fs::File::create(&err_path).unwrap(), || {
+            ctx.with_output(std::fs::File::create(&out_path).unwrap(), || {
+                failed = matches!(
+                    cmd.handler.call(&args, ctx),
+                    Ok(CommandOutcome::Failed) | Err(_)
+                );
+            });
         });
-        match failure {
-            Some(e) => Err(e),
-            None => Ok(std::fs::read_to_string(&path).unwrap()),
+        if failed {
+            Err(std::fs::read_to_string(&err_path).unwrap())
+        } else {
+            Ok(std::fs::read_to_string(&out_path).unwrap())
         }
+    }
+
+    /// `dbTemplateMaxVars` is a `.dbd` `variable()` knob (`dbCore.dbd:29`)
+    /// over the `int` at `dbLoadTemplate.y:45`, so C reaches it with `var`
+    /// and the substitution parser reads the global at the point of use.
+    ///
+    /// Measured on softIoc: `var dbTemplateMaxVars 200` then
+    /// `var dbTemplateMaxVars` prints `int dbTemplateMaxVars = 200`, and
+    /// the next `dbLoadTemplate` accepts 200 pattern names.
+    #[test]
+    fn var_reads_and_writes_db_template_max_vars() {
+        use crate::server::db_loader::{db_template_max_vars, set_db_template_max_vars};
+
+        let ctx = make_ctx();
+        let restore = db_template_max_vars();
+        assert_eq!(restore, 100, "C `int dbTemplateMaxVars = 100`");
+        assert_eq!(
+            run_var(&ctx, &["dbTemplateMaxVars"]).unwrap(),
+            "int dbTemplateMaxVars = 100\n"
+        );
+        assert_eq!(run_var(&ctx, &["dbTemplateMaxVars", "200"]).unwrap(), "");
+        assert_eq!(
+            db_template_max_vars(),
+            200,
+            "`var` must reach the global the parser reads, not a copy"
+        );
+        assert_eq!(
+            run_var(&ctx, &["dbTemplateMaxVars"]).unwrap(),
+            "int dbTemplateMaxVars = 200\n"
+        );
+        set_db_template_max_vars(restore);
     }
 
     /// C keeps `asCheckClientIP` in the iocsh *variable* table
@@ -441,13 +490,20 @@ mod tests {
                 .contains("int asCheckClientIP = 1")
         );
 
+        // Measured on `bin/linux-x86_64/softIoc`
+        // (R7.0.10-146-g8f5015b663d764ad75df), script `w3.cmd` holding
+        // `var nosuchvar 5` then `var nosuchvar`: stderr carried
+        // `No known var \'nosuchvar\'.` and `No known vars match
+        // \'nosuchvar\'.` and nothing else — neither line wore the
+        // `ERROR w3.cmd line <n>: ` frame the shell puts on its own
+        // diagnostics.
         assert_eq!(
             run_var(&ctx, &["noSuchVar"]).unwrap_err(),
-            "No known vars match 'noSuchVar'."
+            "No known vars match 'noSuchVar'.\n"
         );
         assert_eq!(
             run_var(&ctx, &["noSuchVar", "1"]).unwrap_err(),
-            "No known var 'noSuchVar'."
+            "No known var 'noSuchVar'.\n"
         );
 
         // C parses with `strtol(s, &endp, 0)`, and an unparsable value
@@ -608,10 +664,15 @@ mod tests {
     /// C's double arm rejects the same shapes its int arm does and says
     /// so in its own words (`iocsh.cpp:1431-1434`), leaving the value
     /// alone without failing the command.
+    ///
+    /// `0x1p3` is NOT one of them: `epicsStrtod` is glibc's `strtod`
+    /// here, so C takes the C99 hex form — measured, `var seqDLYlimit
+    /// 0x1p3` then `var seqDLYlimit` prints `double seqDLYlimit = 8`,
+    /// and `0x10` prints `16`.
     #[test]
     fn an_unparsable_double_leaves_the_knob_alone() {
         let ctx = make_ctx();
-        for token in ["nope", "1.0 ", "", "0x1p3"] {
+        for token in ["nope", "1.0 ", ""] {
             assert_eq!(run_var(&ctx, &["seqDLYlimit", token]).unwrap(), "");
             assert_eq!(
                 run_var(&ctx, &["seqDLYlimit"]).unwrap(),
@@ -620,7 +681,13 @@ mod tests {
             );
         }
         // The shapes it does take, including C's leading-whitespace skip.
-        for (token, want) in [("1e3", "1000"), (" 2.5", "2.5"), ("-0.5", "-0.5")] {
+        for (token, want) in [
+            ("1e3", "1000"),
+            (" 2.5", "2.5"),
+            ("-0.5", "-0.5"),
+            ("0x1p3", "8"),
+            ("0x10", "16"),
+        ] {
             assert_eq!(run_var(&ctx, &["seqDLYlimit", token]).unwrap(), "");
             assert_eq!(
                 run_var(&ctx, &["seqDLYlimit"]).unwrap(),

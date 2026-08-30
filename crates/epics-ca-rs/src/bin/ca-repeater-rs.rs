@@ -83,7 +83,7 @@ fn main() {
         if let Err(e) = run_repeater_with_debug(debug).await {
             // A socket the daemon could not make or bind never reaches here:
             // C `ca_repeater` names both outcomes at the bind and returns
-            // from its void function either way (`repeater.cpp:513-531`), and
+            // from its void function either way (`repeater.cpp:501-519`), and
             // `run_repeater_with_debug` does the same, printing "CA Repeater:
             // Exiting, a repeater is already running" or the fatal stderr
             // line and answering `Ok(())`. Anything left is a failure C's

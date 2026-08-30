@@ -373,17 +373,18 @@ impl Record for BusyRecord {
         true
     }
 
-    // NO `is_put_complete` override — busy completes its put-callback
-    // synchronously, like bo. C `busyRecord.c:273` clears `pact = FALSE` at the
-    // tail of every process cycle; only async device support that set `pact`
-    // itself (`:254`) holds the callback, and the soft support this port models
-    // (`devBusySoft.c::write_busy` is a bare `dbPutLink`, never touching `pact`)
-    // does not. A prior `is_put_complete() == self.val == 0` modelled the
-    // asynBusy hold, but this record's `process()` is synchronous (never returns
-    // `AsyncPendingNotify`), so the phantom hold only wedged the put-notify:
-    // once VAL was driven to 1 the callback never completed, and every following
-    // `ca_put_callback` was refused, so the
-    // out-of-range VAL puts C posts (2, 3 → "Illegal_Value") never processed.
+    // NO `is_put_complete` override, and none is wanted: the gate above is the
+    // whole of it. `is_put_complete` answers a different C question — did
+    // device support take the cycle async (`busyRecord.c:254`) — and busy's
+    // `process()` is synchronous, so the answer is always yes.
+    //
+    // Withholding the client's `ca_put_callback` while VAL stays 1 is
+    // `should_fire_forward_link` alone: `dbNotifyCompletion` lives inside the
+    // `recGblFwdLink` the line above declines to call, and the framework reads
+    // the two together in `complete_put_notify`. A second override saying
+    // `val == 0` here would be the same C fact written twice, which is how the
+    // deleted `is_put_complete() == (self.val == 0)` came to say it in the one
+    // place the framework then honoured without the forward-link half.
     fn get_field(&self, name: &str) -> Option<EpicsValue> {
         match name {
             "VAL" => Some(EpicsValue::Enum(self.val)),

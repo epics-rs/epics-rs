@@ -7,7 +7,7 @@
 //! wrote 9, and all 21 missing ones were position:
 //!
 //! 1. macLib's own notice, `macLib: macro INP is undefined (expanding string
-//!    …)` — `errlogPrintf` in `macCore.c:913-917`, raised inside the expander
+//!    …)` — `errlogPrintf` in `macCore.c:897-900`, raised inside the expander
 //!    for every unresolved reference;
 //! 2. the loader's per-line warning, `WARNING: '<file>' line <N> has undefined
 //!    macros` — `db_yyinput` (`dbLexRoutines.c:384-387`), raised where the line
@@ -279,7 +279,7 @@ async fn var_reaches_the_quiet_knob_the_loader_reads() {
 /// genuine syntax error in a real `.db`.
 ///
 /// C reaches it through the SAME `yyerror` as every recovered fault, only
-/// through the arm that carries a message (`dbYacc.y:373-374`) — `yyparse`
+/// through the arm that carries a message (`dbYacc.y:372-373`) — `yyparse`
 /// calls it with `"syntax error"`, `dbLex.l` with `"Invalid character '%c'"`
 /// — so an abort names its file, its line and its source exactly as a
 /// recovered fault does. Measured on this file, `softIoc` writes:
@@ -298,16 +298,14 @@ async fn var_reaches_the_quiet_knob_the_loader_reads() {
 /// expected 'field', got 'qqq'`, and it named neither the file nor the source
 /// — the harm this whole gate exists for, on the input an operator hits most.
 ///
-/// Three deviations, all deliberate, none of them position:
+/// Two of the three deviations it then had are gone. The message is bison's
+/// own `syntax error` — `dbYacc.y` declares no `%error-verbose`, so every
+/// grammar rejection prints those three words and the token is what tells
+/// them apart — and the ` at or before` clause quotes that token rather than
+/// a column of this port's invention.
 ///
-/// * the message is this parser's own sentence rather than yacc's
-///   `syntax error`. It names the token C leaves to the ` at or before`
-///   clause, and `ERROR: <sentence>` is the shape C's own lexer diagnostics
-///   already have.
-/// * the clause reads ` at or before column 6` where C reads ` at or before
-///   'qqq'`. C's lexer always holds a `yytext`; this recursive-descent parser
-///   holds a column instead, and naming the column it has is true where
-///   quoting a token it never recorded would be a guess.
+/// One deviation is left:
+///
 /// * `WARNING: dbReadCOM: Parser stack dirty w/o error. 1` is absent. It
 ///   counts the half-built objects left on C's `tempList`
 ///   (`dbLexRoutines.c:303-305`); this parser has no such list.
@@ -329,8 +327,8 @@ async fn a_syntax_error_names_its_file_line_and_source() {
 
     let want = format!(
         "\
-ERROR: expected 'field', got 'qqq'
- at or before column 6 in path \"{found_under}\"  file \"syn.db\" line 3
+ERROR: syntax error
+ at or before 'qqq' in path \"{found_under}\"  file \"syn.db\" line 3
 
  3 |   qqq
 
@@ -392,12 +390,45 @@ ERROR: Failed to load 'a.db'
 /// said why, and `MacroExpansion` recorded nothing for the per-line warning
 /// to fire on.
 ///
-/// Two deviations, both from the engine and not the wording. C detects a
-/// cycle once per macro TABLE entry, in the `expand()` pass it runs while the
-/// table is dirty (`macCore.c:646-679`), so it names both ends and this
-/// lazily-expanding one names the end it reached first. And because C's
-/// pre-expansion resolves `A` before the `.db` line asks for it, C's
-/// placeholder is the other member of the pair.
+/// Both notices, their order and the placeholder are now the engine's own:
+/// it runs C's `expand()` pass over the macro table before it looks at the
+/// caller's string (`macCore.c:646-679`), so the cycle is found once per
+/// table ENTRY — naming both ends, seated on the entry and not on the
+/// string — and `$(A)` copies the value that pass built, which is
+/// `$(B,recursive)`.
+///
+/// The COUNT is the assertion. C creates one `MAC_HANDLE` per `.db` and
+/// expands the table on first use (`dbReadCOM`,
+/// `dbLexRoutines.c:256-300`), so the pair is printed once for the whole
+/// file however many lines mention the cycle; measured on `softIoc
+/// R7.0.10` with these exact two files, C's whole stream is
+///
+/// ```text
+/// macLib: macro A is recursive (expanding macro B)
+/// macLib: macro B is recursive (expanding macro A)
+/// WARNING: 'rec.db' line 2 has undefined macros
+/// C1.DESC Has unexpanded macro
+/// ERROR: Can't set 'C1.DESC' to '$(B,recursive)'  : Bad Field value
+/// ```
+///
+/// This port's file reader used to build a `MacroTable` per LINE, so the
+/// pair repeated three times for three lines; `expand_includes_mapped`
+/// now holds one for the whole include tree, which is why the count here
+/// is C's.
+///
+/// The load is driven by `dbLoadTemplate`, so the refusal is a ROW's, and C
+/// closes it with `msiLoadRecords`' echo of the call it made and
+/// `yyerror("Error while reading included file")` before `YYABORT`
+/// (`dbLoadTemplate.y:49-57`). Measured, C's last three lines here are
+///
+/// ```text
+/// dbLoadRecords("rec.db", A="$(B)",B="$(A)")
+/// Substitution file error: Error while reading included file
+/// line 2: '}'
+/// ```
+///
+/// All three of those lines are matched, the last one being the lexer parked
+/// on the brace that closed the failing row.
 #[epics_macros_rs::epics_test]
 #[serial_test::serial(db_load_stderr)]
 async fn a_recursive_macro_is_refused_and_said_out_loud() {
@@ -419,17 +450,23 @@ async fn a_recursive_macro_is_refused_and_said_out_loud() {
     let got = stderr_of("dbLoadTemplate(\"rec.sub\")", Arc::new(PvDatabase::new()));
     unsafe { std::env::remove_var("EPICS_DB_INCLUDE_PATH") };
 
+    // ONE pair for the file, as C prints it — three lines of `rec.db`,
+    // one table, one expansion pass.
     let want = format!(
         "\
+macLib: macro A is recursive (expanding macro B)
 macLib: macro B is recursive (expanding macro A)
 WARNING: 'rec.db' line 2 has undefined macros
 C1.DESC Has unexpanded macro
-ERROR: Can't set 'C1.DESC' to '$(A,recursive)'  : Bad Field value
+ERROR: Can't set 'C1.DESC' to '$(B,recursive)'  : Bad Field value
 ERROR:  at or before ')' in path \"{found_under}\"  file \"rec.db\" line 2
 
- 2 |   field(DESC, \"$(A,recursive)\")
+ 2 |   field(DESC, \"$(B,recursive)\")
 
 ERROR: Failed to load 'rec.db'
+dbLoadRecords(\"rec.db\", A=\"$(B)\",B=\"$(A)\")
+Substitution file error: Error while reading included file
+line 2: '}}'
 "
     );
     assert_eq!(got, want, "\n--- got ---\n{got}\n--- want ---\n{want}");

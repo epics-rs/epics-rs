@@ -1090,7 +1090,13 @@ impl Token {
         match self {
             Token::Text(s) => s.clone(),
             Token::Int(i) => truncate(&EpicsValue::Int64(*i).convert_to(DbFieldType::String)),
-            Token::Double(d) => truncate(&EpicsValue::Double(*d).convert_to(DbFieldType::String)),
+            // `dbcj_double` hands the converter a NULL `paddr`
+            // (`dbConvertJSON.c:58`), so `cvt_d_st` finds no rset and renders
+            // at its own seeded precision of 6 — not Rust's `Display`, which
+            // gave `1` where C gives `1.000000`.
+            Token::Double(d) => truncate(&EpicsValue::String(
+                crate::types::codec::cvt_double_to_string(*d, 6).into(),
+            )),
         }
     }
 
@@ -1234,6 +1240,31 @@ mod tests {
         assert_eq!(
             db_put_convert_json("[1,\"b\"]", DbFieldType::String, 2).unwrap(),
             EpicsValue::StringArray(vec!["1".into(), "b".into()])
+        );
+    }
+
+    /// A REAL token into a `DBF_STRING` target renders at precision 6, not at
+    /// the record's PREC and not through Rust's `Display`: `dbcj_double`
+    /// passes `conv(&num, parser->pdest, NULL)` (`dbConvertJSON.c:58`), and
+    /// with a NULL `paddr` `cvt_d_st` finds no rset and keeps its own seed
+    /// (`dbFastLinkConv.c:1339-1344`).
+    ///
+    /// softIoc @`R7.0.10`, `T:WS` a `STRING` waveform with `NELM=4` and
+    /// `PREC=3`:
+    ///
+    /// ```text
+    /// dbpf T:WS "[1.0, 2.5, 1.23456789]"
+    /// dbgf T:WS -> DBF_STRING[3]: "1.000000"  "2.500000"  "1.234568"
+    /// ```
+    #[test]
+    fn a_real_token_into_a_string_target_renders_at_precision_six() {
+        assert_eq!(
+            db_put_convert_json("[1.0, 2.5, 1.23456789]", DbFieldType::String, 4).unwrap(),
+            EpicsValue::StringArray(vec![
+                "1.000000".into(),
+                "2.500000".into(),
+                "1.234568".into()
+            ])
         );
     }
 

@@ -262,6 +262,21 @@ impl IocBuilder {
         // overhead for IOCs that use none).
         let breaktable_registry = db.add_breaktables(self.breaktables).await;
 
+        // C's device support table and function registry, installed on the
+        // database BEFORE the first record is created — `registerRecord\
+        // DeviceDriver` before `dbLoadRecords`. The creation sink binds each
+        // record's dset from the first ahead of `init_record(0)` and resolves
+        // INAM/SNAM against the second from inside pass 1, which is C's order;
+        // this build used to do both AFTER the record's passes had already
+        // run, so `init_record` could not see its own dset and ran the tail C
+        // returns before.
+        db.install_device_support_resolver(crate::server::ioc_app::device_support_resolver(
+            self.device_factories,
+            self.dynamic_device_factory,
+        ));
+        db.install_subroutine_registry(self.subroutine_registry)
+            .await;
+
         // 1. Simple PVs
         for (name, value) in self.pvs {
             db.add_pv(&name, value).await?;
@@ -444,77 +459,6 @@ impl IocBuilder {
                 // constant load, and nothing outside the owner may run either
                 // half.
                 db.rec_gbl_init_constant_links(&rec_arc);
-
-                let mut instance = rec_arc.write();
-
-                // Device support based on DTYP
-                let dtyp = instance.common.dtyp.clone();
-                if !crate::server::device_support::is_soft_dtyp(&dtyp) {
-                    let dev_opt = if let Some(factory) = self.device_factories.get(&dtyp) {
-                        Some(factory())
-                    } else if let Some(ref dyn_factory) = self.dynamic_device_factory {
-                        // Same fallback shape as
-                        // `ioc_app::wire_device_support` — universal
-                        // drivers (asyn etc.) need this to attach.
-                        let ctx = DeviceSupportContext {
-                            dtyp: &dtyp,
-                            inp: &instance.common.inp,
-                            out: &instance.common.out,
-                        };
-                        dyn_factory(&ctx)
-                    } else {
-                        None
-                    };
-                    if let Some(dev) = dev_opt {
-                        // Canonical device-support init order (M1/M2):
-                        // set_record_info → apply_record_info → init.
-                        // Previously this path ran `init` FIRST and
-                        // discarded its `Result` with `let _ =`; the
-                        // IocApplication path ran info-setup first and
-                        // partially handled the error. Both paths now
-                        // share `wire_device_to_record`, so a driver
-                        // author can write one correct `init()` and an
-                        // init failure is logged + flags the record.
-                        device_support::wire_device_to_record(&mut instance, dev);
-                    }
-                }
-                // Subroutine resolution for sub / aSub records (C
-                // `init_record` -> `registryFunctionFind` for both types).
-                let rt = instance.record.record_type();
-                if rt == "sub" || rt == "aSub" {
-                    // INAM: invoke the init routine once, before SNAM
-                    // resolution (C `init_record`: `registryFunctionFind(inam)`
-                    // then `(*psubroutine)(prec)`, return discarded; a missing
-                    // function is an init error -> stderr).
-                    if let Some(EpicsValue::String(inam)) = instance.record.get_field("INAM") {
-                        let inam = inam.as_str_lossy();
-                        if !inam.is_empty() {
-                            match self.subroutine_registry.get(inam.as_ref()) {
-                                Some(init_fn) => {
-                                    let init_fn = init_fn.clone();
-                                    if let Err(e) = init_fn(&mut *instance.record) {
-                                        eprintln!(
-                                            "iocInit: {}.INAM '{inam}' init routine failed: {e}",
-                                            def.name
-                                        );
-                                    }
-                                }
-                                None => eprintln!(
-                                    "iocInit: {}.INAM function '{inam}' not found",
-                                    def.name
-                                ),
-                            }
-                        }
-                    }
-                    // Unconditional, as in `IocApp` — see the invariant on
-                    // `field_io::snam_special_after_put`.
-                    if let Some(EpicsValue::String(snam)) = instance.record.get_field("SNAM") {
-                        instance.subroutine = self
-                            .subroutine_registry
-                            .get(snam.as_str_lossy().as_ref())
-                            .cloned();
-                    }
-                }
             }
         }
 
@@ -543,12 +487,6 @@ impl IocBuilder {
         if let Some(&load) = failed_loads.iter().min() {
             return Err(CaError::DbLoadFailed(self.sources[load].clone()));
         }
-
-        // Retain the registry in the database for runtime re-resolution
-        // (aSub LFLG=READ / SUBL); the static SNAM wiring above already
-        // performed init-time resolution (C `init_record`).
-        db.install_subroutine_registry(self.subroutine_registry.clone())
-            .await;
 
         // 4. Autosave restore
         if let Some(ref autosave_cfg) = self.autosave_config {

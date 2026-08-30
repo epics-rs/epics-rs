@@ -46,9 +46,9 @@ record(mbbi, "$(P)$(R)Mode_RBV")
 # The two states below therefore use the port's own numbering, Zlib=5 and
 # LZ4HDF5=6, matching `CodecName::ordinal`. Upstream ADCore has since taken
 # 2 and 5 for ZLIB and LZ4HDF5 (NDCodec.h:7-15 at 926bb4c8); whether the port
-# realigns to that numbering is open and tracked as G13 in
-# `ad-core-rs/doc/parity-review-core.md`. If it is answered "match upstream"
-# these states move, but the record still fronts all seven codecs either way.
+# realigns to that numbering is open, and nothing here settles it. If it is
+# answered "match upstream" these states move, but the record still fronts all
+# seven codecs either way.
 record(mbbo, "$(P)$(R)Compressor")
 {
     field(PINI, "YES")

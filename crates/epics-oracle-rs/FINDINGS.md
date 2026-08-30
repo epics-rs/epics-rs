@@ -32,10 +32,14 @@ caput -c -t -w 2 T:CALC.INPM 1
 # ~/work/oracle-ioc/bin/linux-x86_64/softIoc   -> Channel write request failed
 ```
 
-So the default run diffs against **pre-`2ab1bb14c` C** and CBUG-F6 still fires,
-exactly as this document's put phase recorded. `EPICS_ORACLE_DBD` changes the
-denominator only; the IOC binary is `EPICS_ORACLE_IOC_BIN`, and a run that does
-not pin both has not pinned its ground truth.
+`EPICS_ORACLE_DBD` changes the denominator only; the IOC binary is
+`EPICS_ORACLE_IOC_BIN`, and a run that does not pin both has not pinned its
+ground truth.
+
+**Superseded 2026-08-30.** The fat tree has since been rebuilt past
+`2ab1bb14c`: the same eighteen `calc`/`calcout` `INPM`..`INPU` put cases now
+report `{"outcome": "completed"}` on BOTH sides. The two binaries no longer
+differ here, and CBUG-F6's allowlist row was retired for that reason.
 
 ## The denominator
 
@@ -187,17 +191,26 @@ so the zero is measured, not inherited.
 
 **CBUG-F6 fires as an EXPECTED DEVIATION on exactly the nine fields it names**
 (`calc.INPM`..`INPU`): C's `special()` rejects the `SPC_MOD` put, the port
-accepts it. That is the allowlist working as designed — the difference is
-justified by `doc/upstream-c-bugs.md` and is not counted as a defect.
+accepts it. That is the allowlist working as designed: `calcRecord.dbd` declares
+a `special` that `calcRecord.c`'s `special()` never implements, so it falls
+through to `S_db_badChoice` and nine documented link fields cannot be written
+over CA at all. The port declines to reproduce that, so the difference is
+justified and is not counted as a defect.
 
 It still does — but only against the ground truth the harness actually uses.
 Base `2ab1bb14c` (2026-07-21) dropped `special(SPC_MOD)` from `calcRecord.dbd`'s
-`INPM`..`INPU`, and a **stock** `softIoc` built from that tree accepts the nine
-puts, which would make the row STALE and fail the run. The default
-`EPICS_ORACLE_IOC_BIN` is the fat `softIoc`, built before that commit, and it
-still refuses them — measured 2026-08-25, see the ground-truth section above. So
-CBUG-F6 fires on 9 of 842, exactly as recorded here, and it will go STALE the
-moment the fat tree is rebuilt.
+`INPM`..`INPU`, and a `softIoc` built from that tree accepts the nine puts,
+which makes the row STALE and fails the run. The default `EPICS_ORACLE_IOC_BIN`
+was the fat `softIoc`, built before that commit, and it still refused them when
+this was written — measured 2026-08-25, see the ground-truth section above. So
+CBUG-F6 fired on 9 of 842, exactly as recorded here, and it would go STALE the
+moment the fat tree was rebuilt.
+
+**That happened.** A `--phase all` run on 2026-08-30 reported CBUG-F6 STALE:
+C now completes all eighteen `calc`/`calcout` `INPM`..`INPU` puts, the port
+always did, and the two agree. The row is retired. Nothing in the port moved —
+the same run at the preceding commit reports it identically, and the row was
+byte-identical to its state at `24756f664`.
 
 ### The dominant put defect: an empty CALC expression alarms on the port
 
@@ -284,6 +297,18 @@ and there is nothing to compare. They reproduce on every run.
 left both traces empty and `compare` called that agreement. Three cases the
 harness cannot drive is a coverage gap in the monitor probe, and it is named
 here rather than counted as a pass.
+
+SUPERSEDED 2026-08-30 — the gap is closed, and the three rows split two ways.
+`sel.VAL` was never a measurement failure: the `.dbd` declares it
+`special(SPC_NOMOD)`, so no client can drive it and it leaves the drive
+denominator, which is what the PVA monitor phase had always done and the CA
+probe had not (`surface::val_status` now owns the rule for both). The other two
+were the harness calling a reading an absence: a `caput -c` that times out on
+the *callback* over a connected channel and a landed write is the server
+declining to finish, not a write that did not happen, so it is now
+`PutOutcome::NeverCompleted` and the drive counts as a stimulus. Re-measured on
+`--phase all`: `sub.VAL` and `busy.VAL` monitor cases both AGREE (identical
+event streams on both sides), and the monitor phase reports 0 ERROR.
 
 The three original DEFECTs, kept as the record of what was fixed:
 
@@ -397,6 +422,31 @@ out the write callback on a PACT-latched record gets its own bucket with this
 citation attached. Neither is taken here.
 
 The remaining 5: 4 `busy` and 1 `sel`, also identical across both runs.
+
+SUPERSEDED 2026-08-30 — all 5 are closed, and none of them was a flake or an
+instrument failure. `sel.VAL` left the monitor drive denominator (above). The 4
+`busy` were C's `busy` record doing the one thing it exists to do: it declines
+`recGblFwdLink()` while `VAL` is non-zero (busy `docs/busyRecord.md`), and
+`recGblFwdLink()` is the only caller of `dbNotifyCompletion()`, so a `caput -c`
+that leaves the record Busy is *meant* never to complete. Measured at the same
+commit: the three put cases drove `VAL` to `1`, `2` and `-1` and timed out; the
+`0` case completed normally. With the non-completion carried as a reading, the
+monitor case AGREES and the three put cases become DEFECTs on `put_accepted` —
+C answers "accepted, never completed", the port answers "completed". That is a
+port divergence, not a C bug and not a harness failure. Re-measured
+`--phase all`: `ran 23935 = agreed 23448 + expected-deviation 20 + DEFECT 3 +
+no-completion 464 + ERROR 0`.
+
+FIXED 2026-08-30 in the port, and the divergence was structural rather than
+busy's own. `recGblFwdLink` is where `dbNotifyCompletion` lives, so a record
+type that gates the forward link gates the put-callback with it; the port had
+split that into two trait methods and honoured only one at the cycle tail. With
+both read in `complete_put_notify`, the three cases agree on
+"accepted, never completed" with identical readbacks (`Busy`,
+`Illegal_Value`, `Illegal_Value`) and no differences at all:
+`ran 23935 = agreed 23448 + expected-deviation 20 + DEFECT 0 +
+no-completion 467 + ERROR 0`. `--phase pva-monitor` unchanged: 57 ran, 0 DEFECT,
+0 ERROR.
 
 ## Reproducing
 

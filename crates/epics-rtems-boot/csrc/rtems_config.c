@@ -3,9 +3,9 @@
  *
  * Derived from EPICS base's POSIX arm,
  * `modules/libcom/RTEMS/posix/rtems_config.c` (read in full); every directive
- * below cites the base line it comes from, and `doc/rtems-boot-shim-design.md`
- * §1.1 lists what base configures that we deliberately do not — NFS, TFTP,
- * telnetd, ftpd, libblock/BDBUF, the RTC driver, the ~25-command shell.
+ * below cites the base line it comes from. What base configures and this file
+ * deliberately does not: NFS, TFTP, telnetd, ftpd, libblock/BDBUF, the RTC
+ * driver, the ~25-command shell.
  *
  * This is a *configuration* translation unit: `<rtems/confdefs.h>` at the
  * bottom turns the `CONFIGURE_*` macros above it into the actual RTEMS object
@@ -145,7 +145,7 @@ extern void *POSIX_Init(void *argument);
  * ---------------------------------------------------------------------------
  * THIS IS A DEVIATION: we run base's score-arm 150 on a target where base
  * itself compiles the POSIX arm and runs 64 (see the arm selection above).
- * Full record, with every measurement: `doc/rtems-fd-ceiling-deviation.md`.
+ * Every measurement behind it is below.
  * ---------------------------------------------------------------------------
  *
  * MEASURED on the bring-up box, identical driver (raw CA TCP, version

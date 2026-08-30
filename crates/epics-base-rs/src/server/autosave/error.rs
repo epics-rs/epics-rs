@@ -31,6 +31,16 @@ pub enum AutosaveError {
         source: String,
         line: usize,
     },
+    /// A `$(`/`${` whose closing delimiter never arrived. Distinct from
+    /// the two above because macLib names no macro for it — it copies
+    /// the reference and the whole rest of the line through verbatim
+    /// (`macCore.c:862-875`) — so what a `.req` author is shown is the
+    /// text that was passed through, not a key to go and define.
+    UnterminatedMacro {
+        reference: String,
+        source: String,
+        line: usize,
+    },
     CorruptSaveFile {
         path: String,
         message: String,
@@ -64,6 +74,16 @@ impl fmt::Display for AutosaveError {
             }
             Self::RecursiveMacro { key, source, line } => {
                 write!(f, "recursive macro '{key}' in {source} at line {line}")
+            }
+            Self::UnterminatedMacro {
+                reference,
+                source,
+                line,
+            } => {
+                write!(
+                    f,
+                    "unterminated macro reference '{reference}' in {source} at line {line}"
+                )
             }
             Self::CorruptSaveFile { path, message } => {
                 write!(f, "corrupt save file '{path}': {message}")

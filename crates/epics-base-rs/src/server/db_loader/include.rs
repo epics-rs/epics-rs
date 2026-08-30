@@ -6,8 +6,7 @@ use crate::error::{CaError, CaResult};
 
 use crate::runtime::log::ERL_ERROR;
 
-use super::substitute_macros;
-use super::{DbFaults, DbRecordDef};
+use super::{DbFaults, DbRecordDef, MacroDefs};
 
 /// Configuration for file-based DB loading with include support.
 pub struct DbLoadConfig {
@@ -29,7 +28,7 @@ impl Default for DbLoadConfig {
 /// and dropped — see [`super::parse_db`].
 pub fn parse_db_file(
     path: &Path,
-    macros: &HashMap<String, String>,
+    macros: impl Into<MacroDefs>,
     config: &DbLoadConfig,
 ) -> CaResult<Vec<DbRecordDef>> {
     let parsed = parse_db_file_with_breaktables(path, macros, config)?;
@@ -44,7 +43,7 @@ pub fn parse_db_file(
 /// into the database registry and resolves file-scope aliases against it.
 pub fn parse_db_file_with_breaktables(
     path: &Path,
-    macros: &HashMap<String, String>,
+    macros: impl Into<MacroDefs>,
     config: &DbLoadConfig,
 ) -> CaResult<super::ParsedDb> {
     // The include layer and the record parser both report through the
@@ -58,7 +57,7 @@ pub fn parse_db_file_with_breaktables(
 /// operator wrote it rather than by the path this process resolved.
 pub fn parse_db_opened_with_breaktables(
     opened: &DbOpenedFile,
-    macros: &HashMap<String, String>,
+    macros: impl Into<MacroDefs>,
     config: &DbLoadConfig,
 ) -> CaResult<super::ParsedDb> {
     // The include layer and the record parser both report through the
@@ -107,13 +106,28 @@ pub struct DbExpandedText {
 /// offset into a string that exists only inside this process.
 pub fn expand_includes_mapped(
     opened: &DbOpenedFile,
-    macros: &HashMap<String, String>,
+    macros: impl Into<MacroDefs>,
     config: &DbLoadConfig,
     faults: &mut DbFaults,
 ) -> CaResult<DbExpandedText> {
+    // ONE table for the whole read, includes and all. C `dbReadCOM`
+    // creates a single `MAC_HANDLE`, installs the caller's macros into it
+    // and reads `dbQuietMacroWarnings` into it once at open
+    // (`dbLexRoutines.c:256-300`), and `dbIncludeNew` pushes the included
+    // file onto `inputFileList` without touching the handle
+    // (`:443-461`) — so every line of every file in the tree is expanded
+    // through the same table. msi does the same with one `macCreateHandle`
+    // for the whole run (`msi.cpp:111`).
+    let mut table = super::MacroTable::new(
+        macros,
+        super::MacroExpandOptions {
+            suppress_warnings: super::db_quiet_macro_warnings(),
+            ..super::MacroExpandOptions::default()
+        },
+    );
     let mut stack = Vec::new();
     let mut out = Lines::default();
-    expand_includes_inner(opened, macros, config, &mut stack, faults, &mut out)?;
+    expand_includes_inner(opened, &mut table, config, &mut stack, faults, &mut out)?;
     Ok(DbExpandedText {
         text: out.text,
         source: super::DbSource::new(out.lines, out.frames),
@@ -150,7 +164,7 @@ impl Lines {
 /// Expand `include "..."` directives recursively.
 pub fn expand_includes(
     path: &Path,
-    macros: &HashMap<String, String>,
+    macros: impl Into<MacroDefs>,
     config: &DbLoadConfig,
     faults: &mut DbFaults,
 ) -> CaResult<String> {
@@ -174,7 +188,7 @@ struct OpenFile {
 
 fn expand_includes_inner(
     opened: &DbOpenedFile,
-    macros: &HashMap<String, String>,
+    table: &mut super::MacroTable,
     config: &DbLoadConfig,
     stack: &mut Vec<OpenFile>,
     faults: &mut DbFaults,
@@ -190,7 +204,7 @@ fn expand_includes_inner(
         let chain: Vec<&str> = stack.iter().map(|f| f.named.as_str()).collect();
         return Err(CaError::DbParseError {
             line: 0,
-            column: 0,
+            token: String::new(),
             message: format!("circular include: {} -> {named}", chain.join(" -> ")),
         });
     }
@@ -199,7 +213,7 @@ fn expand_includes_inner(
     if stack.len() >= config.max_include_depth {
         return Err(CaError::DbParseError {
             line: 0,
-            column: 0,
+            token: String::new(),
             message: format!(
                 "include depth limit ({}) exceeded at '{named}'",
                 config.max_include_depth,
@@ -209,7 +223,7 @@ fn expand_includes_inner(
 
     let content = std::fs::read_to_string(&identity).map_err(|e| CaError::DbParseError {
         line: 0,
-        column: 0,
+        token: String::new(),
         message: format!("cannot read '{named}': {e}"),
     })?;
 
@@ -218,9 +232,12 @@ fn expand_includes_inner(
         named: named.clone(),
     });
 
-    // Local macro overrides from `substitute` directives.
-    // These override the caller-provided macros for subsequent includes.
-    let mut local_macros = macros.clone();
+    // No per-file copy of the macros: a `substitute` inside an included
+    // file writes the shared table and its definition outlives the
+    // include, because msi shares one handle across `include` and pushes
+    // no scope for it (`msi.cpp:305-358`). Measured — a file defining
+    // `X=inner` under an outer `X=outer` leaves `after:[inner]` behind
+    // it, where this port used to restore `outer`.
 
     // Include search path. Starts from the caller-supplied config and
     // is mutated by `path`/`addpath` directives encountered in the
@@ -251,28 +268,47 @@ fn expand_includes_inner(
         let line_num = i as u32 + 1;
         let line = raw.strip_suffix('\n').unwrap_or(raw);
         if let Some(subst_str) = parse_substitute_directive(line) {
-            // Apply substitute overrides to local macros. Quote- and
-            // escape-aware splitting matches C `macParseDefns`
-            // (macUtil.c): a `,` or `=` inside `'...'`/`"..."` or after
-            // a `\` does not act as a separator.
-            for (k, v) in parse_macro_defns(&subst_str) {
-                let expanded_v = substitute_macros(&v, &local_macros);
-                local_macros.insert(k, expanded_v);
+            // msi is the reference for this one: C's `.db` grammar has no
+            // `substitute` directive at all. `makeSubstitutions` matches
+            // its two commands on the RAW line and sets `expand = 0`, so
+            // a command line is never itself expanded (`msi.cpp:305-358`),
+            // and `addMacroReplacements` hands the text between the outer
+            // quotes to `macParseDefns` and straight on to
+            // `macInstallMacros` (`:256-275`) — so what is installed is
+            // the RAW value. This port expanded it first, which froze a
+            // reference C leaves live.
+            for (name, value) in parse_macro_defns(&subst_str) {
+                match value {
+                    Some(rawval) => table.define(&name, rawval),
+                    // C `macPutValue( handle, name, NULL )`: a definition
+                    // with no `=` deletes, uncovering an outer one.
+                    None => table.undefine(&name),
+                }
             }
             emit(out, line_num, String::from("\n"));
-        } else if let Some(dirs) = parse_path_directive(line, "path") {
+            continue;
+        }
+        // Every other line goes through the file's one table exactly
+        // once, BEFORE anything looks at what it says. C `db_yyinput`
+        // (`dbLexRoutines.c:375-391`) expands each `fgets` line and hands
+        // the result to the lexer, so `include`, `path` and `addpath` are
+        // grammar productions reading already-expanded text and carry the
+        // same two per-line diagnostics as any other line. This port used
+        // to match them on the raw line and expand only the argument,
+        // which left an `include "$(NOPE)b.db"` line without the
+        // `WARNING: … has undefined macros` C prints for it.
+        let expanded = super::db_expand_line_in(table, raw, Some(&file_name), line_num);
+        let line = expanded.strip_suffix('\n').unwrap_or(&expanded);
+        if let Some(dirs) = parse_path_directive(line, "path") {
             // `path "a:b:c"` — replace the search path. C separates
             // entries with the OS path separator.
-            let expanded = substitute_macros(&dirs, &local_macros);
-            local_paths = db_path(&expanded);
+            local_paths = db_path(&dirs);
             emit(out, line_num, String::from("\n"));
         } else if let Some(dirs) = parse_path_directive(line, "addpath") {
             // `addpath "a:b"` — append to the search path.
-            let expanded = substitute_macros(&dirs, &local_macros);
-            local_paths.extend(db_add_path(&expanded));
+            local_paths.extend(db_add_path(&dirs));
             emit(out, line_num, String::from("\n"));
-        } else if let Some(filename) = parse_include_directive(line) {
-            let expanded_filename = substitute_macros(&filename, &local_macros);
+        } else if let Some(expanded_filename) = parse_include_directive(line) {
             // C `dbIncludeNew` (`dbLexRoutines.c:450-456`) prints this
             // exact line and calls `yyerror(NULL)`, NOT `yyerrorAbort`:
             // the include is skipped, everything already read stays, and
@@ -291,15 +327,9 @@ fn expand_includes_inner(
                 ));
                 continue;
             };
-            expand_includes_inner(&included, &local_macros, config, stack, faults, out)?;
+            expand_includes_inner(&included, table, config, stack, faults, out)?;
         } else {
-            // C `db_yyinput`: the macros in force at this line, and the
-            // two diagnostics macLib and the loader raise for it.
-            emit(
-                out,
-                line_num,
-                super::db_expand_line(raw, &local_macros, Some(&file_name), line_num),
-            );
+            emit(out, line_num, expanded);
         }
     }
 
@@ -337,30 +367,45 @@ pub(crate) fn parse_include_directive(line: &str) -> Option<String> {
 
 /// Parse a `substitute` directive line.
 ///
-/// EPICS DB files use `substitute "NAME=VALUE"` to override macros for subsequent
-/// `include` directives. Returns the quoted content if the line is a substitute directive.
+/// msi is the reference: C's `.db` grammar has no `substitute` at all.
+/// `makeSubstitutions` (`msi.cpp:305-358`) scans for the closing quote
+/// with `\"` skipped as a pair, and gives the text between the quotes to
+/// `macParseDefns` WITHOUT unescaping it — so a value written
+/// `A=\"1\"` reaches macLib as the six characters `\"1\"` and comes out
+/// of the level-1 pass as `"1"`. Reading the closing quote as the first
+/// `"` instead truncated the value at the escape.
+///
+/// After that quote msi allows only blanks before the end of the line;
+/// anything else and the line is not a command at all, and is expanded as
+/// ordinary text.
 pub(crate) fn parse_substitute_directive(line: &str) -> Option<String> {
     let trimmed = line.trim();
     if trimmed.starts_with('#') {
         return None;
     }
-    if !trimmed.starts_with("substitute") {
-        return None;
-    }
-    let rest = &trimmed["substitute".len()..];
-    if rest.is_empty() {
-        return None;
-    }
-    // SAFETY: `rest` is non-empty (checked by `is_empty()` above)
-    let first = rest.chars().next().unwrap();
+    let rest = trimmed.strip_prefix("substitute")?;
+    let first = rest.chars().next()?;
     if !first.is_whitespace() && first != '"' {
         return None;
     }
-    // Extract quoted content
     let quote_start = rest.find('"')?;
     let after_quote = &rest[quote_start + 1..];
-    let quote_end = after_quote.find('"')?;
-    Some(after_quote[..quote_end].to_string())
+    let mut end = 0;
+    let bytes = after_quote.as_bytes();
+    while end < bytes.len() && bytes[end] != b'"' {
+        end += if bytes[end] == b'\\' && end + 1 < bytes.len() && bytes[end + 1] == b'"' {
+            2
+        } else {
+            1
+        };
+    }
+    if end >= bytes.len() {
+        return None;
+    }
+    if !after_quote[end + 1..].chars().all(|c| c == ' ') {
+        return None;
+    }
+    Some(after_quote[..end].to_string())
 }
 
 /// Parse a `path "..."` / `addpath "..."` directive line. `keyword`
@@ -480,92 +525,167 @@ pub fn loaded_path() -> Option<Vec<PathBuf>> {
         .clone()
 }
 
-/// Parse a `name=value,name2=value2,...` macro-definition string into
-/// `(name, value)` pairs, quote- and escape-aware.
+/// Parse a `name=value,name2=value2,...` macro-definition string into the
+/// `macPutValue` calls C would make for it, in order.
 ///
-/// Mirrors C `macParseDefns` (`macUtil.c`): a `,` or `=` is only a
-/// separator when it is outside `'...'`/`"..."` and not immediately
-/// preceded by a backslash. Whitespace around names/values is
-/// trimmed; surrounding quotes are NOT stripped (macLib keeps them so
-/// the value can carry literal separators). Definitions with no `=`
-/// are dropped.
-pub(crate) fn parse_macro_defns(defns: &str) -> Vec<(String, String)> {
-    let chars: Vec<char> = defns.chars().collect();
-    let mut pairs: Vec<(String, String)> = Vec::new();
-    let mut name = String::new();
-    let mut value = String::new();
-    let mut quote: Option<char> = None;
-    // false = collecting name, true = collecting value
-    let mut in_value = false;
-    let mut has_eq = false;
-    let mut i = 0;
+/// C `macParseDefns` (`macUtil.c:31-247`). A `,` or `=` is a separator
+/// only outside `'...'`/`"..."` and not escaped by a backslash, and
+/// whitespace around a name or a value is trimmed. Three of its rules
+/// this port did not have, each measured through `msi`:
+///
+///   * quotes and escapes are removed from NAMES and left in VALUES
+///     ("unlike values, they will not be re-parsed", `:199-227`), because
+///     a value is re-read by `trans` at level 1 and a name never is. So
+///     `'A'=1` defines `A`, while `A="1"` defines `A` as `"1"` and it is
+///     the level-1 pass that strips those quotes. Measured with
+///     `msi -M B=preset` on `substitute "'A'=1,B"`: `A=[1]`.
+///   * a name with no `=` after it is a DELETION. `macParseDefns` leaves
+///     the value pointer NULL (`del[i]`, `:105-110`) and
+///     `macInstallMacros` passes it to `macPutValue` (`:275`), whose NULL
+///     arm deletes the entry — so an OUTER definition of the same name is
+///     uncovered. Same measurement: `B=[$(B)]`, undefined, not `preset`.
+///     This port dropped such a definition and left `B` standing.
+///   * an EMPTY name is a name. `=1` installs a macro called `""` and
+///     `$()` resolves it; measured with `msi` on `substitute "=1,B=2"`:
+///     `empty:[1]`.
+///
+/// `None` is C's NULL value: delete the name rather than define it.
+pub(crate) fn parse_macro_defns(defns: &str) -> Vec<(String, Option<String>)> {
+    /// C `macParseDefns`'s four states (`macUtil.c:57`), kept because the
+    /// fall-through between them is what decides where a `,` with no `=`
+    /// before it leaves the parse.
+    enum St {
+        PreName,
+        InName,
+        PreValue,
+        InValue,
+    }
 
-    let flush = |name: &mut String,
-                 value: &mut String,
-                 has_eq: &mut bool,
-                 pairs: &mut Vec<(String, String)>| {
-        let k = name.trim();
-        if *has_eq && !k.is_empty() {
-            pairs.push((k.to_string(), value.trim().to_string()));
+    let chars: Vec<char> = defns.chars().collect();
+    // C's `end[num]--` loop: trailing whitespace comes off the RAW field,
+    // before any quote is removed from it.
+    let trimmed = |from: usize, to: usize| -> String {
+        let mut end = to;
+        while end > from && chars[end - 1].is_whitespace() {
+            end -= 1;
         }
-        name.clear();
-        value.clear();
-        *has_eq = false;
+        chars[from..end].iter().collect()
     };
+
+    let mut pairs: Vec<(String, Option<String>)> = Vec::new();
+    let mut name = String::new();
+    let mut del = false;
+    let mut start = 0;
+    let mut state = St::PreName;
+    let mut quote: Option<char> = None;
+    let mut i = 0;
 
     while i < chars.len() {
         let c = chars[i];
-        // Escape: backslash + next char are a literal 2-char unit.
-        if c == '\\' && i + 1 < chars.len() {
-            if in_value {
-                value.push(c);
-                value.push(chars[i + 1]);
-            } else {
-                name.push(c);
-                name.push(chars[i + 1]);
-            }
-            i += 2;
-            continue;
-        }
-        // Quote state.
+        // C updates `quote` BEFORE the state switch, so the OPENING quote
+        // character is inside the quote and the CLOSING one is outside it.
         if let Some(q) = quote {
             if c == q {
                 quote = None;
             }
-            if in_value {
-                value.push(c);
-            } else {
-                name.push(c);
-            }
-            i += 1;
-            continue;
         } else if c == '\'' || c == '"' {
             quote = Some(c);
-            if in_value {
-                value.push(c);
-            } else {
-                name.push(c);
+        }
+        let quoted = quote.is_some();
+        let escape = c == '\\' && i + 1 < chars.len();
+
+        loop {
+            match state {
+                St::PreName => {
+                    if !quoted && !escape && (c.is_whitespace() || c == ',') {
+                        break;
+                    }
+                    start = i;
+                    state = St::InName;
+                }
+                St::InName => {
+                    if quoted || escape || (c != '=' && c != ',') {
+                        break;
+                    }
+                    name = trimmed(start, i);
+                    del = c == ',';
+                    state = St::PreValue;
+                    if c != ',' {
+                        break;
+                    }
+                }
+                St::PreValue => {
+                    if !quoted && !escape && c.is_whitespace() {
+                        break;
+                    }
+                    start = i;
+                    state = St::InValue;
+                }
+                St::InValue => {
+                    if quoted || escape || c != ',' {
+                        break;
+                    }
+                    let value = trimmed(start, i);
+                    pairs.push((dequote(&name), (!del).then_some(value)));
+                    del = false;
+                    state = St::PreName;
+                    break;
+                }
             }
+        }
+        i += if escape { 2 } else { 1 };
+    }
+
+    // C's "tidy up from state at end of string" (`macUtil.c:135-155`),
+    // whose own fall-through is why a trailing name with no `=` still
+    // produces a pair, and a trailing `,` produces none.
+    match state {
+        St::PreName => {}
+        St::InName => pairs.push((dequote(&trimmed(start, chars.len())), None)),
+        St::PreValue => pairs.push((dequote(&name), Some(String::new()))),
+        St::InValue => {
+            let value = trimmed(start, chars.len());
+            pairs.push((dequote(&name), (!del).then_some(value)));
+        }
+    }
+    pairs
+}
+
+/// C `macParseDefns`'s in-place name cleanup (`macUtil.c:199-227`):
+/// quotes are dropped and a backslash is dropped in favour of the
+/// character after it.
+///
+/// The two interact the way C's loop does and not the way a reader
+/// expects: the escape branch runs after the quote branch has already
+/// declined the character, so `\"` yields a LITERAL `"` in the name
+/// rather than opening a quoted region. That is why `substitute
+/// "\"A\"=1"` defines a macro whose name is `"A"`, quotes included, and
+/// `$(A)` stays undefined.
+fn dequote(name: &str) -> String {
+    let chars: Vec<char> = name.chars().collect();
+    let mut out = String::with_capacity(name.len());
+    let mut quote: Option<char> = None;
+    let mut i = 0;
+    while i < chars.len() {
+        let c = chars[i];
+        if let Some(q) = quote {
+            if c == q {
+                quote = None;
+                i += 1;
+                continue;
+            }
+        } else if c == '\'' || c == '"' {
+            quote = Some(c);
             i += 1;
             continue;
         }
-        // Unquoted separators.
-        match c {
-            '=' if !in_value => {
-                in_value = true;
-                has_eq = true;
-            }
-            ',' => {
-                flush(&mut name, &mut value, &mut has_eq, &mut pairs);
-                in_value = false;
-            }
-            _ if in_value => value.push(c),
-            _ => name.push(c),
+        if c == '\\' && i + 1 < chars.len() {
+            i += 1;
         }
+        out.push(chars[i]);
         i += 1;
     }
-    flush(&mut name, &mut value, &mut has_eq, &mut pairs);
-    pairs
+    out
 }
 
 /// C `dbOpenFile` (`dbLexRoutines.c:166-193`) — the single rule every
@@ -677,11 +797,21 @@ pub fn db_expand_file_name(filename: &str) -> Option<String> {
 mod macro_defns_tests {
     use super::*;
 
+    /// `(name, Some(value))` written compactly.
+    fn def(name: &str, value: &str) -> (String, Option<String>) {
+        (name.to_string(), Some(value.to_string()))
+    }
+
+    /// `(name, None)` — C's NULL value, which deletes.
+    fn del(name: &str) -> (String, Option<String>) {
+        (name.to_string(), None)
+    }
+
     #[test]
     fn simple_pairs() {
         assert_eq!(
             parse_macro_defns("A=1,B=2"),
-            vec![("A".into(), "1".into()), ("B".into(), "2".into())]
+            vec![def("A", "1"), def("B", "2")]
         );
     }
 
@@ -689,16 +819,17 @@ mod macro_defns_tests {
     fn whitespace_trimmed() {
         assert_eq!(
             parse_macro_defns(" A = 1 , B = 2 "),
-            vec![("A".into(), "1".into()), ("B".into(), "2".into())]
+            vec![def("A", "1"), def("B", "2")]
         );
     }
 
-    /// a comma inside a quoted value does NOT split the pair.
+    /// a comma inside a quoted value does NOT split the pair, and the
+    /// quotes stay on the value — `trans` at level 1 is what removes them.
     #[test]
     fn quoted_comma_not_split() {
         assert_eq!(
             parse_macro_defns(r#"MSG="a,b",N=1"#),
-            vec![("MSG".into(), r#""a,b""#.into()), ("N".into(), "1".into())]
+            vec![def("MSG", r#""a,b""#), def("N", "1")]
         );
     }
 
@@ -707,27 +838,64 @@ mod macro_defns_tests {
     fn quoted_equals_not_split() {
         assert_eq!(
             parse_macro_defns(r#"EXPR="x=y""#),
-            vec![("EXPR".into(), r#""x=y""#.into())]
+            vec![def("EXPR", r#""x=y""#)]
         );
     }
 
-    /// An unquoted comma still splits (C parity for `MSG=a,b`).
+    /// An unquoted comma still splits, and what follows it has no `=`, so
+    /// it is a DELETION of `b` rather than nothing at all.
     #[test]
-    fn unquoted_comma_splits() {
+    fn unquoted_comma_splits_and_the_tail_deletes() {
         assert_eq!(
             parse_macro_defns("MSG=a,b"),
-            // `b` has no `=` so it is dropped (not a definition).
-            vec![("MSG".into(), "a".into())]
+            vec![def("MSG", "a"), del("b")]
         );
     }
 
-    /// An escaped separator is literal, not a split point.
+    /// An escaped separator is literal, not a split point, and the
+    /// backslash stays in the VALUE for the level-1 pass to consume.
     #[test]
     fn escaped_separator_is_literal() {
+        assert_eq!(parse_macro_defns(r"K=a\,b"), vec![def("K", r"a\,b")]);
+    }
+
+    /// Quotes come OFF a name — measured with `msi -M B=preset` on
+    /// `substitute "'A'=1,B"`, which prints `A=[1] B=[$(B)]`.
+    #[test]
+    fn quotes_are_removed_from_a_name_and_a_bare_name_deletes() {
+        assert_eq!(parse_macro_defns("'A'=1,B"), vec![def("A", "1"), del("B")]);
+    }
+
+    /// An ESCAPED quote in a name is a literal quote character, because
+    /// C's cleanup loop reaches the escape branch only after the quote
+    /// branch has declined the character. `msi` on `substitute
+    /// "\"A\"=1"` leaves `$(A)` undefined for exactly this reason.
+    #[test]
+    fn an_escaped_quote_stays_in_the_name() {
+        assert_eq!(parse_macro_defns(r#"\"A\"=1"#), vec![def(r#""A""#, "1")]);
+    }
+
+    /// An empty name is a name: `msi` on `substitute "=1,B=2"` prints
+    /// `empty:[1]` for `$()`.
+    #[test]
+    fn an_empty_name_is_still_a_definition() {
         assert_eq!(
-            parse_macro_defns(r"K=a\,b"),
-            vec![("K".into(), r"a\,b".into())]
+            parse_macro_defns("=1,B=2"),
+            vec![def("", "1"), def("B", "2")]
         );
+    }
+
+    /// A trailing comma closes the previous pair and opens nothing.
+    #[test]
+    fn a_trailing_comma_adds_nothing() {
+        assert_eq!(parse_macro_defns("A=1,"), vec![def("A", "1")]);
+    }
+
+    /// A name with `=` and nothing after it defines the empty value, which
+    /// is not the same as deleting.
+    #[test]
+    fn an_empty_value_is_not_a_deletion() {
+        assert_eq!(parse_macro_defns("A="), vec![def("A", "")]);
     }
 
     #[test]

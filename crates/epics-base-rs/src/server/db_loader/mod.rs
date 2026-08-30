@@ -17,8 +17,10 @@ pub use include::{
     parse_db_file_with_breaktables, parse_db_opened_with_breaktables, set_loaded_path,
 };
 pub use source::{DbIncludeFrame, DbSource};
-pub(crate) use substitution::resolve_template;
-pub use substitution::{TemplateLoad, parse_substitutions, substitution_rows};
+pub use substitution::{
+    RowMacro, SubstitutionEvent, SubstitutionFault, Substitutions, TemplateLoad,
+    db_template_max_vars, parse_substitutions, set_db_template_max_vars,
+};
 
 /// Factory function that creates a record instance.
 pub type RecordFactory = Box<dyn Fn() -> Box<dyn Record> + Send + Sync>;
@@ -795,6 +797,22 @@ pub struct DbRecordDef {
     /// Mirrors `info` directives in EPICS db files; common tags include
     /// `asyn:READBACK` (asyn upstream PRs #60 / #208), `Q:form`, etc.
     pub info_tags: Vec<(String, String)>,
+    /// 1-based line of the flattened, macro-expanded text the record HEAD
+    /// ended on — the index [`DbSource::at`] takes, and C's
+    /// `pinputFileNow->line_num` when `dbRecordHead` reduces.
+    ///
+    /// The head and not the body, because that is where C decides the record
+    /// exists: `dbCreateRecord` runs from the `record_head` action
+    /// (`dbYacc.y:227-235`), so an unknown record type is refused with the
+    /// closing `)` still the last token the lexer matched — ` at or before
+    /// ')' … line 1` on `softIoc` @`R7.0.10`, not the line of the `}` far
+    /// below. It travels ON the record for the reason [`DbFieldDef::line`]
+    /// gives: the install loop reorders and drops entries, and a parallel
+    /// vector would hand the survivors somebody else's line.
+    ///
+    /// `0` is "no source behind this record" — one built programmatically,
+    /// where C has no line either.
+    pub line: u32,
 }
 
 /// One `field(NAME,"value")` element, with where it was read from.
@@ -839,11 +857,18 @@ impl DbFieldDef {
 ///
 /// The check runs **after** macro substitution, mirroring base where
 /// `dbRecordHead` is invoked from the lexer with the substituted name.
-pub(crate) fn validate_record_name(name: &str, line: usize, col: usize) -> CaResult<()> {
+///
+/// The third argument is no longer read. C locates both refusals at the `)`
+/// the `record_head`/`alias` production had just reduced — measured on
+/// `softIoc` @`R7.0.10`, `record(ai, "")` and `record(ai, "a b")` both print
+/// ` at or before ')'` — so the locator is a constant, not something a caller
+/// can know better. Dropping the parameter needs the iocsh caller that still
+/// passes one, which is another panel's file.
+pub(crate) fn validate_record_name(name: &str, line: usize, _col: usize) -> CaResult<()> {
     if name.is_empty() {
         return Err(CaError::DbParseError {
             line,
-            column: col,
+            token: String::from(")"),
             message: "record/alias name can't be empty".into(),
         });
     }
@@ -864,7 +889,7 @@ pub(crate) fn validate_record_name(name: &str, line: usize, col: usize) -> CaRes
         if matches!(c, ' ' | '\t' | '"' | '\'' | '.' | '$') {
             return Err(CaError::DbParseError {
                 line,
-                column: col,
+                token: String::from(")"),
                 message: format!("bad character '{c}' in record/alias name \"{name}\""),
             });
         }
@@ -948,22 +973,6 @@ impl DbDiagnostic {
     }
 }
 
-/// What the FIRST diagnostic of a text quotes to say WHERE in the line
-/// it is — C's ` at or before '%s'` (`dbYacc.y:378`).
-#[derive(Debug)]
-enum Locator {
-    /// C's `yytext`: the token the lexer had last matched. The port's
-    /// recoverable diagnostics know it because they are raised from a
-    /// grammar position C reduces with a known token — a field's
-    /// closing `)`, say.
-    Token(String),
-    /// The column the parser had reached. C has no counterpart because
-    /// its lexer always holds a `yytext`; this port's recursive-descent
-    /// parser keeps no such seat, and naming the column it DOES hold is
-    /// true where quoting a token it never recorded would be a guess.
-    Column(usize),
-}
-
 #[derive(Debug, Default)]
 pub struct DbFaults {
     messages: Vec<String>,
@@ -971,8 +980,15 @@ pub struct DbFaults {
     /// `my_buffer` (`dbYacc.y:374-381`) — for the whole flattened text.
     source: Option<source::DbSource>,
     /// Where in [`Self::source`] a diagnostic is currently about, i.e.
-    /// where C's `pinputFileNow` would be parked, together with the
-    /// locator that names the spot inside the line.
+    /// where C's `pinputFileNow` would be parked, together with C's
+    /// `yytext` — the token that names the spot inside the line.
+    ///
+    /// A token and not a column: C's ` at or before '%s'` quotes the text
+    /// the lexer had matched, and every abort this port raises knows that
+    /// text, because a recursive-descent parser rejects AT a token it has
+    /// just read or is looking at. Carrying a column instead was this
+    /// port's own invention and read ` at or before column 1` where C
+    /// reads ` at or before '}'`.
     ///
     /// ONE field, not a line beside a token, because the two must agree:
     /// a line from one diagnostic wearing another's token is a position
@@ -983,7 +999,7 @@ pub struct DbFaults {
     /// for the operator than no line number, so the position is CLEARED
     /// at the end of the parse rather than left to decay. See
     /// [`Self::seek`].
-    park: Option<(u32, Locator)>,
+    park: Option<(u32, String)>,
     /// C's `yyFailed` (`dbYacc.y:377-380`): ` at or before` and the
     /// include stack are printed for the FIRST diagnostic of a text
     /// only, and every one after it gets the line echo alone.
@@ -1002,7 +1018,7 @@ impl DbFaults {
     /// raised from here names that line. `yytext` is the token just
     /// consumed, which is what C quotes in ` at or before '%s'`.
     pub fn seek(&mut self, line: u32, yytext: &str) {
-        self.park = Some((line, Locator::Token(yytext.to_owned())));
+        self.park = Some((line, yytext.to_owned()));
     }
 
     /// Leave the lexer's seat. Every later diagnostic prints without
@@ -1038,7 +1054,7 @@ impl DbFaults {
         let message = match err {
             CaError::DbParseError {
                 line,
-                column,
+                token,
                 message,
             } => {
                 // `line: 0` is the include layer saying this failure has
@@ -1046,11 +1062,11 @@ impl DbFaults {
                 // that could not be read. The message stands alone then,
                 // which is also what C's `yyerror` degrades to when
                 // `dbIncludePrint` has no frame to walk.
-                self.park = (*line > 0).then_some((*line as u32, Locator::Column(*column)));
+                self.park = (*line > 0).then(|| (*line as u32, token.clone()));
                 // The `message` field, NOT the error's `Display`: that
-                // spells the position a second time, in this port's own
-                // words (`DB parse error at line 3, column 6: …`), and
-                // the position is what the two lines below say properly.
+                // spells the line a second time, in this port's own
+                // words (`DB parse error at line 3: …`), and the position
+                // is what the two lines below say properly.
                 message.clone()
             }
             _ => {
@@ -1125,12 +1141,9 @@ impl DbFaults {
     /// after the message slot — or `None` when this port cannot say
     /// where it was.
     fn position_context(&mut self) -> Option<String> {
-        let (line, locator) = self.park.as_ref()?;
+        let (line, token) = self.park.as_ref()?;
         let line = *line;
-        let clause = match locator {
-            Locator::Token(token) => format!(" at or before '{token}'"),
-            Locator::Column(column) => format!(" at or before column {column}"),
-        };
+        let clause = format!(" at or before '{token}'");
         let (frames, text) = self.source.as_ref()?.at(line)?;
         let mut out = String::new();
         if !self.yy_failed {
@@ -1353,7 +1366,7 @@ pub fn unknown_alias_message(alias: &str, target: &str) -> String {
 /// and dropped. C keeps the records it already read too — callers that
 /// own a database ([`crate::server::ioc_builder`], `dbLoadRecords`)
 /// take [`ParsedDb::unresolved_aliases`] instead and resolve them.
-pub fn parse_db(input: &str, macros: &HashMap<String, String>) -> CaResult<Vec<DbRecordDef>> {
+pub fn parse_db(input: &str, macros: impl Into<MacroDefs>) -> CaResult<Vec<DbRecordDef>> {
     let parsed = parse_db_with_breaktables(input, macros)?.load_status(DB_STRING_SOURCE)?;
     for (target, alias) in &parsed.unresolved_aliases {
         eprintln!("{}", unknown_alias_message(alias, target));
@@ -1399,32 +1412,46 @@ pub fn set_db_quiet_macro_warnings(quiet: bool) {
 /// straight to `dbLoadRecords`, where the two raw values walk into each
 /// other on the first expansion. Measured against `softIoc R7.0.10`:
 /// three lines C wrote that this used to swallow, now
-/// [`MacroExpansion::recursive`] and the notice in [`refer`].
+/// [`MacroFault::Recursive`] and the notice in [`refer`].
 ///
 /// The earlier reading that no such input existed came from testing
 /// through the iocsh command line, where the shell's own expansion
 /// consumes `$(…)` before `dbLoadRecords` is called — `A=$(B),B=$(A)`
 /// there is two UNDEFINED references, not a cycle.
 ///
-/// The unterminated arm (`macCore.c:865-875`) is a separate line C
-/// prints, `macLib: unterminated macro reference in …`, and this
-/// expander still has none: `refer` returns `None` and the caller copies
-/// the `$` through. UNFIXED, and untested against C either way.
+/// The unterminated arm (`macCore.c:862-875`) is a separate `macLib:`
+/// line C prints for a `$(`/`${` whose closing delimiter never matched,
+/// and it raises this same warning under it — measured on `softIoc
+/// R7.0.10`, two lines per bad line, and `var dbQuietMacroWarnings 1`
+/// drops the `macLib:` one and keeps this one, exactly as for the other
+/// two arms. [`MacroFault::Unterminated`] and the notice in [`refer`].
 ///
 /// `filename` is `None` for text that never came from a file — C has no
 /// such path (`dbReadDatabase` always names one), so the per-file warning
 /// is simply not raised rather than invented with a placeholder name.
 pub(crate) fn db_read_lines(
     text: &str,
-    macros: &HashMap<String, String>,
+    macros: impl Into<MacroDefs>,
     filename: Option<&str>,
 ) -> (String, DbSource) {
+    // One table for the file, because C holds one `MAC_HANDLE` for the
+    // whole `.db` (`dbReadCOM`, `dbLexRoutines.c:256-300`) and reads
+    // `dbQuietMacroWarnings` into it once, at open. So a macro whose own
+    // value is faulty is expanded — and complained about — once here,
+    // not once per line that mentions it.
+    let mut table = MacroTable::new(
+        macros,
+        MacroExpandOptions {
+            suppress_warnings: db_quiet_macro_warnings(),
+            ..MacroExpandOptions::default()
+        },
+    );
     let mut out = String::with_capacity(text.len());
     let mut lines = Vec::new();
     let mut frames = Vec::new();
     for (i, raw) in text.split_inclusive('\n').enumerate() {
         let line_num = i as u32 + 1;
-        let expanded = db_expand_line(raw, macros, filename, line_num);
+        let expanded = db_expand_line_in(&mut table, raw, filename, line_num);
         out.push_str(&expanded);
         lines.push(expanded);
         frames.push(std::sync::Arc::from(vec![DbIncludeFrame {
@@ -1444,17 +1471,19 @@ pub(crate) fn db_read_lines(
 /// it, because macLib quotes the string it was given: C's console shows
 /// the closing `)` of `(expanding string …)` on the NEXT line for that
 /// reason, and a caller that trimmed first would print a different shape.
-pub(crate) fn db_expand_line(
+///
+/// The table is always the caller's, and there is no variant that builds
+/// one per line: C has exactly one `MAC_HANDLE` for a whole `dbReadCOM`
+/// (`dbLexRoutines.c:256-300`) and msi one for a whole run
+/// (`msi.cpp:111`), so a per-line table can only ever announce a faulty
+/// definition once per line where C announces it once per file.
+pub(crate) fn db_expand_line_in(
+    table: &mut MacroTable,
     raw: &str,
-    macros: &HashMap<String, String>,
     filename: Option<&str>,
     line_num: u32,
 ) -> String {
-    let opts = MacroExpandOptions {
-        suppress_warnings: db_quiet_macro_warnings(),
-        ..MacroExpandOptions::default()
-    };
-    let expansion = expand_macros(raw, macros, opts);
+    let expansion = table.expand(raw);
     // C `entry->error`, not "an undefined name": `macExpandString`
     // returns the same negative length for a recursive reference, and
     // this warning is what tells the operator the line went out wrong.
@@ -1482,10 +1511,7 @@ pub(crate) fn db_expand_line(
 }
 
 /// Like [`parse_db`] but returns the whole [`ParsedDb`].
-pub fn parse_db_with_breaktables(
-    input: &str,
-    macros: &HashMap<String, String>,
-) -> CaResult<ParsedDb> {
+pub fn parse_db_with_breaktables(input: &str, macros: impl Into<MacroDefs>) -> CaResult<ParsedDb> {
     // Per LINE, not per file: C's loader expands each `fgets` line
     // separately (`dbLexRoutines.c:375-391`), so quote state cannot leak
     // across lines — see [`db_read_lines`].
@@ -1619,9 +1645,9 @@ fn parse_db_items(expanded: &str, faults: &mut DbFaults) -> CaResult<DbItems> {
             expect_char(&chars, &mut pos, &mut col, ',', line)?;
             skip_whitespace_and_comments(&chars, &mut pos, &mut line, &mut col);
             let alias_name = read_token_string(&chars, &mut pos, &mut line, &mut col)?;
-            validate_record_name(&alias_name, line, col)?;
             skip_whitespace_and_comments(&chars, &mut pos, &mut line, &mut col);
             expect_char(&chars, &mut pos, &mut col, ')', line)?;
+            validate_record_name(&alias_name, line, col)?;
             global_aliases.push((target, alias_name));
             continue;
         }
@@ -1651,7 +1677,7 @@ fn parse_db_items(expanded: &str, faults: &mut DbFaults) -> CaResult<DbItems> {
                 if pos >= chars.len() {
                     return Err(CaError::DbParseError {
                         line,
-                        column: col,
+                        token: String::new(),
                         message: "unexpected end of file in breaktable body".into(),
                     });
                 }
@@ -1665,7 +1691,6 @@ fn parse_db_items(expanded: &str, faults: &mut DbFaults) -> CaResult<DbItems> {
                     col += 1;
                     continue;
                 }
-                let start = col;
                 let mut tok = String::new();
                 while pos < chars.len() && is_number_char(chars[pos]) {
                     tok.push(chars[pos]);
@@ -1675,7 +1700,7 @@ fn parse_db_items(expanded: &str, faults: &mut DbFaults) -> CaResult<DbItems> {
                 if tok.is_empty() {
                     return Err(CaError::DbParseError {
                         line,
-                        column: col,
+                        token: yytext_at(&chars, pos),
                         message: format!(
                             "breaktable {bt_name}: expected a number, got '{}'",
                             chars[pos]
@@ -1684,7 +1709,7 @@ fn parse_db_items(expanded: &str, faults: &mut DbFaults) -> CaResult<DbItems> {
                 }
                 let num: f64 = tok.parse().map_err(|_| CaError::DbParseError {
                     line,
-                    column: start,
+                    token: tok.clone(),
                     message: format!("breaktable {bt_name}: non-numeric value '{tok}'"),
                 })?;
                 nums.push(num);
@@ -1694,7 +1719,7 @@ fn parse_db_items(expanded: &str, faults: &mut DbFaults) -> CaResult<DbItems> {
             if nums.len() % 2 != 0 {
                 return Err(CaError::DbParseError {
                     line,
-                    column: col,
+                    token: String::from("}"),
                     message: format!("breaktable {bt_name}: Raw value missing"),
                 });
             }
@@ -1702,7 +1727,7 @@ fn parse_db_items(expanded: &str, faults: &mut DbFaults) -> CaResult<DbItems> {
             let table = crate::server::cvt_bpt::BrkTable::build(bt_name, &pairs).map_err(|e| {
                 CaError::DbParseError {
                     line,
-                    column: col,
+                    token: String::from("}"),
                     message: e,
                 }
             })?;
@@ -1724,7 +1749,7 @@ fn parse_db_items(expanded: &str, faults: &mut DbFaults) -> CaResult<DbItems> {
             continue;
         }
         if word == "device" {
-            let a = parse_arg_list(&chars, &mut pos, &mut line, &mut col, 4, 4, "device")?;
+            let a = parse_arg_list(&chars, &mut pos, &mut line, &mut col, 4, 4)?;
             dbd.devices.push(DbdDevice {
                 record_type: a[0].clone(),
                 link_type: a[1].clone(),
@@ -1734,12 +1759,12 @@ fn parse_db_items(expanded: &str, faults: &mut DbFaults) -> CaResult<DbItems> {
             continue;
         }
         if word == "driver" {
-            let a = parse_arg_list(&chars, &mut pos, &mut line, &mut col, 1, 1, "driver")?;
+            let a = parse_arg_list(&chars, &mut pos, &mut line, &mut col, 1, 1)?;
             dbd.drivers.push(a[0].clone());
             continue;
         }
         if word == "link" {
-            let a = parse_arg_list(&chars, &mut pos, &mut line, &mut col, 2, 2, "link")?;
+            let a = parse_arg_list(&chars, &mut pos, &mut line, &mut col, 2, 2)?;
             dbd.link_types.push(DbdLinkType {
                 key: a[0].clone(),
                 lset: a[1].clone(),
@@ -1747,19 +1772,19 @@ fn parse_db_items(expanded: &str, faults: &mut DbFaults) -> CaResult<DbItems> {
             continue;
         }
         if word == "registrar" {
-            let a = parse_arg_list(&chars, &mut pos, &mut line, &mut col, 1, 1, "registrar")?;
+            let a = parse_arg_list(&chars, &mut pos, &mut line, &mut col, 1, 1)?;
             dbd.registrars.push(a[0].clone());
             continue;
         }
         if word == "function" {
-            let a = parse_arg_list(&chars, &mut pos, &mut line, &mut col, 1, 1, "function")?;
+            let a = parse_arg_list(&chars, &mut pos, &mut line, &mut col, 1, 1)?;
             dbd.functions.push(a[0].clone());
             continue;
         }
         if word == "variable" {
             // C `dbYacc.y:192-202`: the one-argument form is
             // `dbVariable($3, "int")`.
-            let a = parse_arg_list(&chars, &mut pos, &mut line, &mut col, 1, 2, "variable")?;
+            let a = parse_arg_list(&chars, &mut pos, &mut line, &mut col, 1, 2)?;
             dbd.variables.push(DbdVariable {
                 name: a[0].clone(),
                 dtype: a.get(1).cloned().unwrap_or_else(|| "int".to_string()),
@@ -1770,8 +1795,8 @@ fn parse_db_items(expanded: &str, faults: &mut DbFaults) -> CaResult<DbItems> {
         if word != "record" && word != "grecord" {
             return Err(CaError::DbParseError {
                 line,
-                column: col,
-                message: format!("expected 'record', got '{word}'"),
+                token: word.clone(),
+                message: SYNTAX_ERROR.into(),
             });
         }
 
@@ -1786,10 +1811,20 @@ fn parse_db_items(expanded: &str, faults: &mut DbFaults) -> CaResult<DbItems> {
 
         skip_whitespace_and_comments(&chars, &mut pos, &mut line, &mut col);
         let name = read_token_string(&chars, &mut pos, &mut line, &mut col)?;
-        validate_record_name(&name, line, col)?;
 
         skip_whitespace_and_comments(&chars, &mut pos, &mut line, &mut col);
         expect_char(&chars, &mut pos, &mut col, ')', line)?;
+        // Where C's lexer is parked when `dbRecordHead` reduces, which is the
+        // line every refusal of the head itself is reported on.
+        let head_line = line as u32;
+        // C runs `dbRecordNameValidate` from the `record_head` ACTION, which
+        // bison reduces only after the `)` (`dbYacc.y:227-235`), so a third
+        // argument is a grammar rejection at the comma and never reaches the
+        // name check: `record(ai, "", extra)` prints ` at or before ','` on
+        // `softIoc` @`R7.0.10`, while `record(ai, "")` prints the empty-name
+        // refusal located at `)`. Validating before the paren gave both of
+        // them the name refusal.
+        validate_record_name(&name, line, col)?;
 
         skip_whitespace_and_comments(&chars, &mut pos, &mut line, &mut col);
         let mut fields = Vec::new();
@@ -1809,7 +1844,7 @@ fn parse_db_items(expanded: &str, faults: &mut DbFaults) -> CaResult<DbItems> {
                 if pos >= chars.len() {
                     return Err(CaError::DbParseError {
                         line,
-                        column: col,
+                        token: String::new(),
                         message: "unexpected end of file in record body".into(),
                     });
                 }
@@ -1831,8 +1866,8 @@ fn parse_db_items(expanded: &str, faults: &mut DbFaults) -> CaResult<DbItems> {
                 if kw != "field" && kw != "info" && kw != "alias" {
                     return Err(CaError::DbParseError {
                         line,
-                        column: col,
-                        message: format!("expected 'field', got '{kw}'"),
+                        token: kw.clone(),
+                        message: SYNTAX_ERROR.into(),
                     });
                 }
 
@@ -1842,9 +1877,9 @@ fn parse_db_items(expanded: &str, faults: &mut DbFaults) -> CaResult<DbItems> {
                     expect_char(&chars, &mut pos, &mut col, '(', line)?;
                     skip_whitespace_and_comments(&chars, &mut pos, &mut line, &mut col);
                     let alias_name = read_token_string(&chars, &mut pos, &mut line, &mut col)?;
-                    validate_record_name(&alias_name, line, col)?;
                     skip_whitespace_and_comments(&chars, &mut pos, &mut line, &mut col);
                     expect_char(&chars, &mut pos, &mut col, ')', line)?;
+                    validate_record_name(&alias_name, line, col)?;
                     aliases.push(alias_name);
                     continue;
                 }
@@ -1958,6 +1993,7 @@ fn parse_db_items(expanded: &str, faults: &mut DbFaults) -> CaResult<DbItems> {
             fields,
             aliases,
             info_tags,
+            line: head_line,
         });
     }
 
@@ -2015,9 +2051,10 @@ pub struct MacroExpandOptions {
 /// Outcome of [`expand_macros`]: the expanded text, plus the fault that
 /// made it wrong if one did.
 ///
-/// Two faults reach here — a name with no definition and a name that
-/// resolves into itself — and they are C's single `entry->error`
-/// (`macCore.c:216-224`) split by cause. Both lists are therefore
+/// Three faults reach here — a name with no definition, a name that
+/// resolves into itself, and a reference whose closing delimiter never
+/// matched its opener — and they are C's single `entry->error`
+/// (`macCore.c:216-224`) split by cause. All three lists are therefore
 /// private, and the only way to read them is [`Self::fault`], or
 /// [`Self::errored`] for the same answer as a bool. A consumer able to
 /// reach one list directly hard-fails on the fault it named and returns
@@ -2027,6 +2064,21 @@ pub struct MacroExpandOptions {
 #[derive(Clone, Debug, Default)]
 pub struct MacroExpansion {
     pub text: String,
+    faults: MacroFaults,
+}
+
+/// C `MAC_ENTRY.error`, kept as the names that set it rather than a
+/// bool, and kept as ONE value because C keeps one: `refer` translates a
+/// reference name and a used default through the caller's own `entry`
+/// so their faults land here, and translates scoped definitions through
+/// a separate `MAC_ENTRY subs` whose `error` is never merged back
+/// (`macCore.c:820-826`). That second rule is why this is a struct and
+/// not three loose fields on [`ExpandCtx`] — [`ExpandCtx::detached`]
+/// swaps the whole set out for the scoped region in one move, so no
+/// future arm can leak into the caller by being added to only two of
+/// three lists.
+#[derive(Clone, Debug, Default)]
+struct MacroFaults {
     /// Every macro referenced with neither a definition (nor an env
     /// value, when `env_fallback`) nor a default. The text still carries
     /// C's `$(name,undefined)` placeholder for each
@@ -2039,11 +2091,19 @@ pub struct MacroExpansion {
     /// different placeholders, and a caller that hard-fails on an
     /// undefined name must not be told a recursive one was undefined.
     recursive: Vec<String>,
+    /// Every `$(`/`${` whose closing delimiter never arrived — C
+    /// `refer`'s first error arm (`macCore.c:862-875`). Each entry is
+    /// the raw text C copied through verbatim, from the `$` to the end
+    /// of the string, because that arm writes no placeholder and names
+    /// no macro: the reference never became a name to look up.
+    unterminated: Vec<String>,
 }
 
-/// Which fault an expansion hit, and the first macro name that hit it.
-/// One variant per placeholder C writes, so a caller cannot report a
-/// recursion as an undefined name.
+/// Which fault an expansion hit, and the first text that hit it — the
+/// macro name for the two arms that parsed one, the copied-through
+/// source for the arm that did not. One variant per way C sets
+/// `entry->error`, so a caller cannot report a recursion as an undefined
+/// name, nor either of them as a reference that was never closed.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum MacroFault<'a> {
     /// No definition, no env value, no default — C's
@@ -2052,26 +2112,36 @@ pub enum MacroFault<'a> {
     /// Resolving the name re-entered itself — C's `refentry->visited`
     /// guard (`macCore.c:895-904`).
     Recursive(&'a str),
+    /// The closing delimiter never matched the opener, so C copied the
+    /// reference and everything after it through verbatim
+    /// (`macCore.c:862-875`). The payload is that copied text — this arm
+    /// carries no macro NAME because the reference never produced one.
+    Unterminated(&'a str),
 }
 
 impl MacroExpansion {
     /// The single owner of "did this expansion come out wrong, and
-    /// why". Both arms are read here so that no caller can read only
-    /// one.
+    /// why". Every arm is read here so that no caller can read only
+    /// some of them.
     ///
-    /// A macro is never in both lists: `recursive` is recorded only
-    /// where the name resolved to a table entry, `undefined` only where
-    /// it resolved to nothing. So the order below decides nothing but
-    /// which of two independent faults a string carrying both reports
-    /// first.
+    /// A macro is never in more than one list: `recursive` is recorded
+    /// only where the name resolved to a table entry, `undefined` only
+    /// where it resolved to nothing, `unterminated` only where no name
+    /// was ever parsed. So the order below decides nothing but which of
+    /// several independent faults a string carrying more than one
+    /// reports first.
     #[must_use]
     pub fn fault(&self) -> Option<MacroFault<'_>> {
-        if let Some(name) = self.undefined.first() {
+        if let Some(name) = self.faults.undefined.first() {
             return Some(MacroFault::Undefined(name.as_str()));
         }
-        self.recursive
+        if let Some(name) = self.faults.recursive.first() {
+            return Some(MacroFault::Recursive(name.as_str()));
+        }
+        self.faults
+            .unterminated
             .first()
-            .map(|name| MacroFault::Recursive(name.as_str()))
+            .map(|raw| MacroFault::Unterminated(raw.as_str()))
     }
 
     /// C `MAC_ENTRY.error`: whether the expansion came out wrong, by any
@@ -2086,30 +2156,607 @@ impl MacroExpansion {
     }
 }
 
-/// Engine state threaded through [`trans`] / [`refer`] / [`parse_scoped`]:
-/// the base macro map, the resolution options, and the running list of
-/// undefined-macro names.
-struct ExpandCtx<'a> {
-    macros: &'a HashMap<String, String>,
+/// C `entry->type`: the word every `macLib:` notice prints in front of
+/// the entry name, and the reason those notices are not all about
+/// `string`. C carries six (`macCore.c:208`, `:283`, `:418`, `:595`,
+/// `:811`, `:826`); the `"default value"` seat is the one this port has
+/// no use for, because it slices a default out instead of running C's
+/// discarding first pass over it.
+const KIND_STRING: &str = "string";
+const KIND_MACRO: &str = "macro";
+const KIND_ENVIRONMENT: &str = "environment variable";
+const KIND_SCOPE_MARKER: &str = "scope marker";
+const KIND_SCOPED_MACRO: &str = "scoped macro";
+
+/// One `MAC_ENTRY.error`, carrying the text that raised it.
+///
+/// C keeps a bare `int error` and merges it with `entry->error =
+/// entry->error || refentry->error` (`macCore.c:885`), which is all its
+/// callers need: every one of them only compares `macExpandString`'s
+/// returned length against zero. This port's callers ask WHICH fault
+/// ([`MacroExpansion::fault`]), so the cause travels with the flag and a
+/// fault merged out of a cached value still names the macro that broke.
+#[derive(Clone, Debug)]
+enum TableFault {
+    Undefined(String),
+    Recursive(String),
+    Unterminated(String),
+}
+
+impl MacroFaults {
+    /// The only way a fault gets in, so an arm added to [`MacroFault`]
+    /// cannot be routed to the wrong list or to no list at all.
+    fn raise(&mut self, fault: TableFault) {
+        match fault {
+            TableFault::Undefined(name) => self.undefined.push(name),
+            TableFault::Recursive(name) => self.recursive.push(name),
+            TableFault::Unterminated(text) => self.unterminated.push(text),
+        }
+    }
+
+    /// C `entry->error = entry->error || refentry->error`
+    /// (`macCore.c:885`): a reference that resolves to a cached value
+    /// inherits that value's fault.
+    ///
+    /// C inherits one bit and so cannot say what the macro's fault was;
+    /// this inherits the causes, which costs nothing — only
+    /// [`MacroExpansion::fault`] reads them, and it reads the first.
+    fn merge(&mut self, other: &MacroFaults) {
+        self.undefined.extend_from_slice(&other.undefined);
+        self.recursive.extend_from_slice(&other.recursive);
+        self.unterminated.extend_from_slice(&other.unterminated);
+    }
+
+    /// Re-seat every recursion in this set onto `name`.
+    ///
+    /// A recursion is a property of the macro that could not be
+    /// resolved, not of the inner reference the resolution had to refuse
+    /// to find that out — C's own notice says so in as many words,
+    /// `macro A is recursive (expanding macro B)` (`macCore.c:895-901`).
+    /// So a fault merged out of `A`'s cached value reports `A`, which is
+    /// the name the caller wrote. The other two arms are properties of
+    /// something INSIDE the value — a name that resolves to nothing, a
+    /// bracket that never closes — and keep their own text.
+    fn rename_recursive(&mut self, name: &str) {
+        for entry in &mut self.recursive {
+            name.clone_into(entry);
+        }
+    }
+}
+
+/// C `MAC_ENTRY` (`macLib.h:34-45`): one macro, holding both the
+/// definition as given and the expansion cached from it.
+///
+/// The cache is the point of the type. C expands every raw value into
+/// `entry->value` in one pass over the whole table and then resolves a
+/// reference by COPYING that value (`refer`, `macCore.c:882-886`), so a
+/// macro whose own value is faulty raises its notice once, under its own
+/// name, before any caller's string is looked at — and every later
+/// reference to it reports the cached fault instead of deriving a fresh
+/// one from a different seat.
+#[derive(Clone, Debug)]
+struct MacEntry {
+    /// C `entry->name`. The scope markers carry the literal `<scope>`.
+    name: String,
+    /// C `entry->type` — one of the `KIND_*` constants above.
+    kind: &'static str,
+    /// C `entry->rawval`: the definition exactly as given.
+    rawval: String,
+    /// C `entry->value`: the definition with its own references
+    /// resolved. `None` until [`expand_table`] fills it, and set back to
+    /// `None` by any redefinition of this entry.
+    value: Option<String>,
+    /// C `entry->error`, as the causes that raised it — see
+    /// [`TableFault`]. Reset at the top of every [`expand_table`] pass,
+    /// exactly where C resets the bool (`macCore.c:670`).
+    faults: MacroFaults,
+    /// C `entry->visited`: raised around a translation of THIS entry's
+    /// raw value, so a reference that comes back round to it is refused
+    /// rather than followed (`macCore.c:888-893`).
+    visited: bool,
+    /// C `entry->special`: a `<scope>` marker rather than a macro
+    /// (`macPushScope`, `macCore.c:416-419`).
+    special: bool,
+    /// C `entry->level`: the scope depth this entry was defined at,
+    /// which decides whether a redefinition overwrites it or shadows it.
+    level: usize,
+}
+
+/// The `macPutValue` calls a caller wants made, in the order it wants
+/// them made in.
+///
+/// C builds its table one `macPutValue` at a time — `macInstallMacros`
+/// walks the `pairs` array `macParseDefns` produced, in file order
+/// (`macUtil.c:250-275`) — and `expand` then walks the table in that
+/// same order (`macCore.c:655`), so the sequence a `.db` load's macLib
+/// notices come out in is the sequence the definitions were written in.
+/// A [`HashMap`] cannot carry that, and sorting its keys by name only
+/// looked right because the shapes measured so far happened to be in
+/// alphabetical order already.
+///
+/// So the order is carried here instead, and the conversion from a
+/// [`HashMap`] is the one place the loss is named: those definitions
+/// arrive in no order at all, and sorting them by name at least makes
+/// the notices reproducible from run to run.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct MacroDefs {
+    /// Name/value pairs in definition order, at most one entry per name.
+    defs: Vec<(String, String)>,
+}
+
+impl MacroDefs {
+    /// An empty set of definitions.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// C `macPutValue` (`macCore.c:262-289`): a redefinition replaces the
+    /// value and keeps the entry where it is, because `rawval` writes
+    /// through the entry `lookup` found rather than appending a second
+    /// one.
+    pub fn put(&mut self, name: impl Into<String>, value: impl Into<String>) {
+        let name = name.into();
+        match self.defs.iter_mut().find(|(n, _)| *n == name) {
+            Some(slot) => slot.1 = value.into(),
+            None => self.defs.push((name, value.into())),
+        }
+    }
+
+    /// The definitions in order.
+    pub fn iter(&self) -> impl Iterator<Item = (&str, &str)> {
+        self.defs.iter().map(|(n, v)| (n.as_str(), v.as_str()))
+    }
+
+    /// How many names are defined.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.defs.len()
+    }
+
+    /// Whether nothing is defined.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.defs.is_empty()
+    }
+}
+
+impl FromIterator<(String, String)> for MacroDefs {
+    /// Definition order, last definition of a name winning — C's, since
+    /// every one of these is a `macPutValue`.
+    fn from_iter<I: IntoIterator<Item = (String, String)>>(iter: I) -> Self {
+        let mut defs = Self::new();
+        for (name, value) in iter {
+            defs.put(name, value);
+        }
+        defs
+    }
+}
+
+impl From<Vec<(String, String)>> for MacroDefs {
+    fn from(pairs: Vec<(String, String)>) -> Self {
+        pairs.into_iter().collect()
+    }
+}
+
+impl From<&MacroDefs> for MacroDefs {
+    fn from(defs: &MacroDefs) -> Self {
+        defs.clone()
+    }
+}
+
+impl From<&HashMap<String, String>> for MacroDefs {
+    /// The lossy direction, and the only one: a hash map has no
+    /// definition order to carry, so the names are sorted to make the
+    /// notice order at least the same on every run. A caller that knows
+    /// the order the operator wrote should build a [`MacroDefs`]
+    /// directly.
+    fn from(macros: &HashMap<String, String>) -> Self {
+        let mut names: Vec<&String> = macros.keys().collect();
+        names.sort_unstable();
+        names
+            .into_iter()
+            .map(|name| (name.clone(), macros[name].clone()))
+            .collect()
+    }
+}
+
+/// C `MAC_HANDLE` (`macLib.h:47-57`): the macro table, the scope depth,
+/// and the one bit that says whether the cached values can be trusted.
+///
+/// This is the unit C creates once per FILE and expands once per line
+/// (`dbReadCOM` holds `macHandle` across the whole `.db`,
+/// `dbLexRoutines.c:256-300`), which is what makes a macro's own fault a
+/// once-per-file notice rather than a once-per-line one. Callers that
+/// have a single string and no file keep using [`expand_macros`], which
+/// is this type for the length of one call.
+///
+/// Entries are in the order they were defined in, which is C's
+/// `macPutValue` call order and the order the expansion pass walks them
+/// in (C `expand`, `macCore.c:655`) — so it is the order the notices a
+/// faulty definition raises come out in.
+/// That order is a property of [`MacroDefs`], not of this type: a table
+/// built from one is in the caller's order by construction, and a table
+/// built from a [`HashMap`] is in the only order a hash map can offer.
+pub struct MacroTable {
+    /// C `handle->list`. Ordered and searched from the tail.
+    ///
+    /// While an expansion is running it is only appended to or truncated
+    /// at the tail — see [`MacroTable::pop_scope`] — which is what lets
+    /// `refer` hold an index across a nested translation.
+    /// [`MacroTable::undefine`] is the one mutation that removes from the
+    /// middle, and it is reachable only from the file reader, between
+    /// lines, where no such index exists.
+    entries: Vec<MacEntry>,
+    /// C `handle->level`: how many scopes are open.
+    level: usize,
+    /// C `handle->dirty`: some raw value has changed since the last
+    /// [`expand_table`], so no cached value may be used. Raised by every
+    /// definition and every scope pop, lowered only by a completed
+    /// expansion pass.
+    dirty: bool,
+    /// C's handle flags, plus this port's `$$` convenience.
     opts: MacroExpandOptions,
-    undefined: Vec<String>,
-    recursive: Vec<String>,
-    /// C's `MAC_ENTRY.name` for this expansion, which every `macLib:`
-    /// warning quotes. `macExpandString` fills in the source string
-    /// itself and the type `"string"` (`macCore.c:208-209`), and `trans`
-    /// hands the SAME entry down every recursion (`:849`, `:889`,
-    /// `:909`), so a warning raised while expanding a macro's value
-    /// still names the line the caller passed in.
-    expanding: &'a str,
+}
+
+impl MacroTable {
+    /// C `macCreateHandle` + one `macPutValue` per pair
+    /// (`macCore.c:64-118`). The table starts dirty: nothing is expanded
+    /// until something asks for an expansion.
+    ///
+    /// The definitions arrive in [`MacroDefs`] order and are installed in
+    /// it, so the notice order of the first expansion pass is the
+    /// caller's own definition order and does not have to be arranged
+    /// for afterwards.
+    #[must_use]
+    pub fn new(defs: impl Into<MacroDefs>, opts: MacroExpandOptions) -> Self {
+        let entries = defs
+            .into()
+            .defs
+            .into_iter()
+            .map(|(name, rawval)| MacEntry {
+                name,
+                kind: KIND_MACRO,
+                rawval,
+                value: None,
+                faults: MacroFaults::default(),
+                visited: false,
+                special: false,
+                level: 0,
+            })
+            .collect();
+        Self {
+            entries,
+            level: 0,
+            dirty: true,
+            opts,
+        }
+    }
+
+    /// C `macExpandString` (`macCore.c:175-227`): bring the cached
+    /// values up to date, then translate `src` under a stack entry typed
+    /// `"string"` whose name is `src` itself.
+    ///
+    /// Both halves matter to what comes out. The table pass is what
+    /// decides the text of a reference into a cycle and the seat of
+    /// every notice a macro's own value raises; the string pass is the
+    /// only place the caller's own text is ever looked at.
+    #[must_use]
+    pub fn expand(&mut self, src: &str) -> MacroExpansion {
+        let suppressed = self.opts.suppress_warnings;
+        let mut ctx = ExpandCtx {
+            table: self,
+            seat: Seat {
+                kind: KIND_STRING,
+                name: src.to_string(),
+                faults: MacroFaults::default(),
+            },
+            suppressed,
+        };
+        expand_table(&mut ctx);
+        let chars: Vec<char> = src.chars().collect();
+        let mut out = String::with_capacity(src.len());
+        trans(&chars, 0, &mut ctx, &mut out);
+        MacroExpansion {
+            text: out,
+            faults: ctx.seat.faults,
+        }
+    }
+
+    /// C `macPutValue( handle, name, value )` (`macCore.c:262-289`) with
+    /// a non-NULL value: install `rawval` for `name` at the current scope
+    /// level.
+    ///
+    /// The value is stored RAW. C never expands a definition as it is
+    /// installed — `macInstallMacros` hands `macPutValue` exactly the
+    /// bytes `macParseDefns` cut out (`macUtil.c:250-275`) — so a
+    /// definition that mentions another macro stays live and follows
+    /// whatever that macro is when it is finally read.
+    pub fn define(&mut self, name: &str, rawval: String) {
+        self.put(name, KIND_MACRO, rawval);
+    }
+
+    /// C `macPutValue( handle, name, NULL )` (`macCore.c:274-280`): the
+    /// name is deleted rather than defined, which is what a definition
+    /// with no `=` in it means (`macParseDefns`'s `del[i]`,
+    /// `macUtil.c:105-110`).
+    ///
+    /// Deleting is not the same as defining nothing: an OUTER definition
+    /// of the same name is uncovered by it, and a reference that finds
+    /// nothing at all is undefined rather than empty.
+    pub fn undefine(&mut self, name: &str) {
+        let Some(idx) = self.lookup(name) else {
+            return;
+        };
+        self.entries.remove(idx);
+        self.dirty = true;
+    }
+
+    /// C `lookup( handle, name, FALSE )` (`macCore.c:571-585`): search
+    /// backwards "so scoping works" — the newest definition of a name
+    /// wins — and never match a scope marker.
+    fn lookup(&self, name: &str) -> Option<usize> {
+        self.entries
+            .iter()
+            .rposition(|e| !e.special && e.name == name)
+    }
+
+    /// [`Self::lookup`] with the rest of C's `lookup`: on a miss under
+    /// `FLAG_USE_ENVIRONMENT`, the environment is read and the value is
+    /// INSTALLED as an entry typed `"environment variable"`
+    /// (`macCore.c:586-598`).
+    ///
+    /// Installing it is not an optimisation, it is why an environment
+    /// hit dirties the table: the entry arrives with no cached value, so
+    /// every reference after it in the same string resolves from raw
+    /// values until the next expansion pass.
+    fn lookup_or_env(&mut self, name: &str) -> Option<usize> {
+        if let Some(i) = self.lookup(name) {
+            return Some(i);
+        }
+        if !self.opts.env_fallback || name.is_empty() {
+            return None;
+        }
+        let value = crate::runtime::env::get(name)?;
+        Some(self.put(name, KIND_ENVIRONMENT, value))
+    }
+
+    /// C `macPutValue` (`macCore.c:262-289`) and the `rawval` it ends in
+    /// (`:610-619`).
+    ///
+    /// A definition at or below the current scope level overwrites in
+    /// place; one that came from an OUTER scope is shadowed by a new
+    /// entry instead, so popping the scope brings the outer value back.
+    /// Either way the whole table goes dirty, because any other entry
+    /// may reference this one and no cached value can be trusted until
+    /// they are all rebuilt.
+    fn put(&mut self, name: &str, kind: &'static str, rawval: String) -> usize {
+        let idx = match self.lookup(name) {
+            Some(i) if self.entries[i].level >= self.level => i,
+            _ => {
+                self.entries.push(MacEntry {
+                    name: name.to_string(),
+                    kind,
+                    rawval: String::new(),
+                    value: None,
+                    faults: MacroFaults::default(),
+                    visited: false,
+                    special: false,
+                    level: self.level,
+                });
+                self.entries.len() - 1
+            }
+        };
+        let entry = &mut self.entries[idx];
+        entry.kind = kind;
+        entry.rawval = rawval;
+        entry.value = None;
+        entry.faults = MacroFaults::default();
+        self.dirty = true;
+        idx
+    }
+
+    /// C `macPushScope` (`macCore.c:400-424`): a marker entry at the
+    /// tail, which everything defined from here on sits after.
+    fn push_scope(&mut self) {
+        self.level += 1;
+        self.entries.push(MacEntry {
+            name: String::from("<scope>"),
+            kind: KIND_SCOPE_MARKER,
+            rawval: String::new(),
+            value: None,
+            faults: MacroFaults::default(),
+            visited: false,
+            special: true,
+            level: self.level,
+        });
+    }
+
+    /// C `macPopScope` (`macCore.c:434-475`): delete the most recent
+    /// `<scope>` marker and every entry defined since it.
+    ///
+    /// Those entries are exactly the tail — nothing is ever inserted
+    /// before an existing entry — so the deletion is a truncation, and
+    /// an index held by an enclosing [`refer`] frame into anything below
+    /// the marker survives it. C's `delete` dirties the table for the
+    /// same reason a redefinition does: a surviving entry may have
+    /// referenced what just went away.
+    fn pop_scope(&mut self) {
+        let at = self
+            .entries
+            .iter()
+            .rposition(|e| e.special)
+            .expect("refer pushes the scope marker before it can pop one");
+        self.entries.truncate(at);
+        self.level -= 1;
+        self.dirty = true;
+    }
+}
+
+/// The `MAC_ENTRY` a translation runs under: the two words every
+/// `macLib:` notice prints, and the `error` field the faults land in.
+///
+/// C swaps it four ways and the swaps are the whole of why one notice
+/// says `string` and the next says `macro`. `macExpandString` seats a
+/// stack entry typed `"string"` whose name is the caller's whole source
+/// string (`macCore.c:206-209`); [`expand_table`] seats the table entry
+/// being expanded (`:668`); and `refer` seats a throwaway `dflt` around
+/// the default's discarding pass (`:805-816`) and a throwaway `subs`
+/// around the scoped definitions (`:820-826`), neither of which merges
+/// its error back. Everything else — a resolved value translated raw, a
+/// used default — keeps the caller's seat, which is why a fault found
+/// three macros deep still names the entry the chain started from.
+struct Seat {
+    kind: &'static str,
+    name: String,
+    faults: MacroFaults,
+}
+
+/// Engine state threaded through [`trans`] / [`refer`] / [`parse_scoped`]:
+/// the table being resolved against, the [`Seat`] the current
+/// translation runs under, and the suppression bit the guards below
+/// raise and lower.
+///
+/// The scope stack and the recursion stack that used to be here are both
+/// gone into the table, where C keeps them: a scoped definition is an
+/// entry between a `<scope>` marker and the tail, and "currently being
+/// expanded" is [`MacEntry::visited`].
+struct ExpandCtx<'a> {
+    table: &'a mut MacroTable,
+    seat: Seat,
+    /// C `handle->flags & FLAG_SUPPRESS_WARNINGS`, which `refer` raises
+    /// and lowers around regions rather than setting once
+    /// (`macCore.c:795-800`, `:805-816`, `:822-859`). Seeded from
+    /// [`MacroExpandOptions::suppress_warnings`] and read wherever a
+    /// `macLib:` notice is about to be written, so a caller's knob and a
+    /// region's own quiet are the same bit.
+    suppressed: bool,
+}
+
+impl ExpandCtx<'_> {
+    /// C's `flags = handle->flags; handle->flags |=
+    /// FLAG_SUPPRESS_WARNINGS; …; handle->flags = flags` around the
+    /// translation of a reference NAME (`macCore.c:795-800`). The
+    /// notices go quiet, but the seat is unchanged, so a fault inside the
+    /// name still fails the surrounding expansion. Measured on `softIoc
+    /// R7.0.10`: `$($(NAMEREF))` writes ONE line and it names the
+    /// suppressed placeholder, `macro $(NAMEREF) is undefined`.
+    fn suppressing<R>(&mut self, body: impl FnOnce(&mut Self) -> R) -> R {
+        let saved = std::mem::replace(&mut self.suppressed, true);
+        let out = body(self);
+        self.suppressed = saved;
+        out
+    }
+
+    /// Run `body` under a different [`Seat`] and hand back the faults it
+    /// raised, for the caller to merge or to drop. Every seat change in
+    /// C is this shape, so this is the only way the seat moves.
+    fn seated<R>(&mut self, seat: Seat, body: impl FnOnce(&mut Self) -> R) -> (R, MacroFaults) {
+        let saved = std::mem::replace(&mut self.seat, seat);
+        let out = body(self);
+        let raised = std::mem::replace(&mut self.seat, saved).faults;
+        (out, raised)
+    }
+
+    /// C's `MAC_ENTRY subs` for the scoped-definition region
+    /// (`macCore.c:820-826`): a fresh seat whose `error` is never merged
+    /// back, under a raised suppression flag. So a fault inside
+    /// `,K=$(UNDEF)` neither warns nor fails the expansion around it —
+    /// measured on `softIoc R7.0.10`, `$(P,K=$(UNDEF))` with `P` defined
+    /// is silent and loads as `pval`.
+    ///
+    /// `name` is C's `subs.name`, which it re-seats between the two
+    /// halves of a definition: the reference's own name while the
+    /// definition's NAME is translated, the definition's name while its
+    /// VALUE is (`:840`, `:847`).
+    fn detached<R>(&mut self, name: String, body: impl FnOnce(&mut Self) -> R) -> R {
+        let seat = Seat {
+            kind: KIND_SCOPED_MACRO,
+            name,
+            faults: MacroFaults::default(),
+        };
+        let (out, _discarded) = self.suppressing(|ctx| ctx.seated(seat, body));
+        out
+    }
+}
+
+/// C `expand` (`macCore.c:645-679`): translate every raw value into its
+/// cached value, each under its OWN entry, then mark the table clean.
+///
+/// This is not a pass over "the macros the string mentions" — C expands
+/// the whole table on the first use after any change, and that is what
+/// makes a resolved reference a COPY (`refer`, `:882-886`) rather than a
+/// re-translation. Both halves of the difference are observable.
+/// Measured on `softIoc R7.0.10` with `A=$(B)`, `B=$(A)` delivered
+/// through `dbLoadTemplate` and a `.db` line reading `$(A)`: C writes
+/// `macro A is recursive (expanding macro B)` and then `macro B is
+/// recursive (expanding macro A)` — both seated on the table entry, not
+/// on the string — and loads `$(B,recursive)`, which is `A`'s cached
+/// value and not anything the string pass could have produced.
+///
+/// The table stays dirty for the duration, so a reference met while
+/// expanding takes `refer`'s raw branch and [`MacEntry::visited`] is the
+/// only thing between a cycle and an unbounded recursion — exactly as in
+/// C, where `handle->dirty` is cleared only after the loop.
+fn expand_table(ctx: &mut ExpandCtx) {
+    if !ctx.table.dirty {
+        return;
+    }
+    let mut i = 0;
+    // Not a `for` over a snapshot: resolving one entry can APPEND
+    // another (an environment value materialises as an entry), and C's
+    // list walk reaches those too.
+    while i < ctx.table.entries.len() {
+        // A `<scope>` marker has no raw value at all — `create` leaves it
+        // NULL (`macCore.c:556`) and C would fault here. It never does,
+        // because every scope `refer` opens is closed inside the same
+        // reference, and the public `macPushScope` callers expand between
+        // scopes rather than inside one.
+        if ctx.table.entries[i].special {
+            i += 1;
+            continue;
+        }
+        let raw: Vec<char> = ctx.table.entries[i].rawval.chars().collect();
+        let seat = Seat {
+            kind: ctx.table.entries[i].kind,
+            name: ctx.table.entries[i].name.clone(),
+            faults: MacroFaults::default(),
+        };
+        let mut value = String::new();
+        // C starts at level 1 "so quotes and escapes will be removed
+        // from expanded value" (`macCore.c:672-673`) — a cached value is
+        // never the user's own text.
+        let (_, raised) = ctx.seated(seat, |ctx| trans(&raw, 1, ctx, &mut value));
+        let entry = &mut ctx.table.entries[i];
+        entry.value = Some(value);
+        entry.faults = raised;
+        i += 1;
+    }
+    ctx.table.dirty = false;
 }
 
 /// Expand `$(...)` / `${...}` macro references, mirroring the C `macLib`
-/// engine (`modules/libcom/src/macLib/macCore.c` `trans` / `refer`).
-/// This is the single macLib implementation for the crate; the `.db`
-/// parser, `dbLoadGroup`, and autosave all route through it (with
+/// engine (`modules/libcom/src/macLib/macCore.c` `expand` / `trans` /
+/// `refer`). This is the single macLib implementation for the crate; the
+/// `.db` parser, `dbLoadGroup`, and autosave all route through it (with
 /// per-caller [`MacroExpandOptions`]) rather than re-implementing it.
+///
+/// One call is one [`MacroTable`], which is C's handle for the length of
+/// one string. Callers that expand many strings against one set of
+/// macros — a file's worth of lines — should build the table once and
+/// call [`MacroTable::expand`] per line instead, because a macro whose
+/// own value is faulty raises its notice once per TABLE, not once per
+/// string.
+///
 /// Implemented behaviors:
 ///
+///   - every raw value is expanded into a cached value before the
+///     caller's string is looked at, and a reference to a macro COPIES
+///     that cached value with its error merged rather than translating
+///     the raw value again (C `expand`, `macCore.c:645-679`; `refer`,
+///     `:882-886`). A definition, a scope pop or an environment hit
+///     invalidates the cache, and until the next pass references
+///     resolve from raw values.
 ///   - `\<char>` blocks macro detection; both bytes reach the output in
 ///     the caller's own string, and the backslash is dropped from
 ///     anything that arrived through a macro (`trans:701-703,739-744`;
@@ -2120,56 +2767,45 @@ struct ExpandCtx<'a> {
 ///     (`refer` runs `trans` on the name — `$($(WHICH))`).
 ///   - the name terminates at `=`, `,` or the closing bracket
 ///     (`macEnd = "=,)"`); `,name=val` introduces scoped macro
-///     definitions visible only inside that reference's expansion.
-///   - a resolved macro value is re-scanned for further `$(...)`
-///     (chained expansion); a self-/mutually-referential macro stops
-///     at the `visiting` guard (C per-entry `visited`).
+///     definitions visible only inside that reference's expansion, and
+///     visible to the definitions AFTER them in the same list
+///     (`macPushScope` precedes the loop, `macCore.c:827-850`).
+///   - a self- or mutually-referential macro is refused at C's
+///     per-entry `visited` guard (`macCore.c:888-904`), leaving
+///     `$(name,recursive)` and [`MacroFault::Recursive`].
 ///   - an undefined macro with no default emits the placeholder
 ///     `$(name,undefined)` (`refer:errval = ",undefined)"`) and comes
 ///     back as [`MacroFault::Undefined`].
+///   - a reference whose closing delimiter never matched its opener is
+///     copied through verbatim together with everything after it, and
+///     nothing in that tail is expanded a second time
+///     (`refer`, `macCore.c:862-875`) — [`MacroFault::Unterminated`].
 ///   - with [`MacroExpandOptions::env_fallback`], an otherwise-unset
 ///     name resolves from the process environment before the default
 ///     (C `macCreateHandle(&h, environ)`).
+#[must_use]
 pub fn expand_macros(
     input: &str,
-    macros: &HashMap<String, String>,
+    macros: impl Into<MacroDefs>,
     opts: MacroExpandOptions,
 ) -> MacroExpansion {
-    let chars: Vec<char> = input.chars().collect();
-    let mut out = String::with_capacity(input.len());
-    let mut ctx = ExpandCtx {
-        macros,
-        opts,
-        undefined: Vec::new(),
-        recursive: Vec::new(),
-        expanding: input,
-    };
-    trans(
-        &chars,
-        0,
-        &mut ctx,
-        &mut Vec::new(),
-        &mut Vec::new(),
-        &mut out,
-    );
-    MacroExpansion {
-        text: out,
-        undefined: ctx.undefined,
-        recursive: ctx.recursive,
-    }
+    MacroTable::new(macros, opts).expand(input)
 }
 
 /// Expand `$(...)` / `${...}` macro references with the default
-/// macLib options (no env fallback, no `$$` escape, undefined →
-/// placeholder). Thin wrapper over [`expand_macros`]; `pub` so
-/// `dbLoadGroup` and other consumers reuse the one engine instead of
-/// re-implementing macLib.
-pub fn substitute_macros(input: &str, macros: &HashMap<String, String>) -> String {
+/// macLib options (no env fallback, no `$` escape, undefined →
+/// placeholder). Thin wrapper over [`expand_macros`], for the callers
+/// those defaults are right for: the `include` / `path` / `substitute`
+/// directives of the `.db` reader, and `.acf` text through
+/// [`substitute_macros_per_line`]. `dbLoadGroup` and autosave reuse the
+/// same engine but not this wrapper — both need options of their own,
+/// and both call [`expand_macros`] directly.
+pub fn substitute_macros(input: &str, macros: impl Into<MacroDefs>) -> String {
     expand_macros(input, macros, MacroExpandOptions::default()).text
 }
 
-/// [`substitute_macros`], one line at a time — how C's file readers feed
-/// macLib.
+/// [`substitute_macros`], one line at a time against ONE table — how C's
+/// file readers feed macLib.
 ///
 /// `dbLoadRecords` hands `macExpandString` a single `fgets` line
 /// (`dbLexRoutines.c:375-391`), and `asInitFile` does the same
@@ -2180,35 +2816,29 @@ pub fn substitute_macros(input: &str, macros: &HashMap<String, String>) -> Strin
 /// and silently disabled every `$(...)` on the lines after it, until the
 /// parser failed on an unexpanded record name. Within a line the quote
 /// rules are unchanged — `'$(X)'` still suppresses.
-pub fn substitute_macros_per_line(input: &str, macros: &HashMap<String, String>) -> String {
+///
+/// The table is the file's, not the line's, because C's is: `asInitFile`
+/// creates one handle and reads every line through it, so a macro whose
+/// own value is faulty is expanded — and complained about — once.
+pub fn substitute_macros_per_line(input: &str, macros: impl Into<MacroDefs>) -> String {
+    let mut table = MacroTable::new(macros, MacroExpandOptions::default());
     input
         .split_inclusive('\n')
-        .map(|line| substitute_macros(line, macros))
+        .map(|line| table.expand(line).text)
         .collect()
 }
 
 /// Translate `chars` into `out`, expanding macro references.
 ///
-/// `scopes` is the stack of scoped-macro frames pushed by enclosing
-/// `$(name,key=val)` references; lookup walks it innermost-first then
-/// falls back to `ctx.macros` (and, when enabled, the environment).
-/// `visiting` is the stack of macro names currently being expanded — it
-/// guards against a self-referential macro (`A=$(A)`) recursing forever,
-/// mirroring C `macCore.c`'s per-entry `visited` flag.
-fn trans(
-    chars: &[char],
-    level: usize,
-    ctx: &mut ExpandCtx,
-    scopes: &mut Vec<HashMap<String, String>>,
-    visiting: &mut Vec<String>,
-    out: &mut String,
-) {
+/// `level` is C's: 0 is the string the caller handed
+/// [`MacroTable::expand`], and every recursion — a macro's value, a
+/// reference name, a default, a scoped definition, a cached value being
+/// built — runs one deeper, which is what decides whether quotes and
+/// backslashes are syntax or text. Scopes and the recursion guard live
+/// in [`ExpandCtx::table`].
+fn trans(chars: &[char], level: usize, ctx: &mut ExpandCtx, out: &mut String) {
     // C `macCore.c:701-703`: "discard quotes and escapes if level is > 0
-    // (i.e. if these aren't the user's quotes and escapes)". Level 0 is
-    // the string the caller handed `macExpandString`; every recursion out
-    // of `refer` — a macro's value, a reference name, a default, a scoped
-    // definition — runs at `level + 1`, so a quote or a backslash that
-    // arrived through a macro is syntax and never reaches the output.
+    // (i.e. if these aren't the user's quotes and escapes)".
     let discard = level > 0;
     let mut quote: Option<char> = None;
     let mut i = 0;
@@ -2233,7 +2863,7 @@ fn trans(
         }
 
         // `$$` → literal `$` (opt-in; autosave `.req` convenience).
-        if ctx.opts.dollar_escape && c == '$' && i + 1 < chars.len() && chars[i + 1] == '$' {
+        if ctx.table.opts.dollar_escape && c == '$' && i + 1 < chars.len() && chars[i + 1] == '$' {
             out.push('$');
             i += 2;
             continue;
@@ -2255,10 +2885,8 @@ fn trans(
         let mac_ref =
             c == '$' && i + 1 < chars.len() && (chars[i + 1] == '(' || chars[i + 1] == '{');
         if mac_ref && quote != Some('\'') {
-            if let Some(next) = refer(chars, i, level, ctx, scopes, visiting, out) {
-                i = next;
-                continue;
-            }
+            i = refer(chars, i, level, ctx, out);
+            continue;
         }
 
         out.push(c);
@@ -2266,18 +2894,19 @@ fn trans(
     }
 }
 
-/// Expand one macro reference starting at `chars[start]` (`$`). On
-/// success returns the index just past the closing bracket; returns
-/// `None` if the reference is unterminated (caller copies `$` raw).
+/// Expand one macro reference starting at `chars[start]` (`$`). Returns
+/// the index just past the closing bracket, or — when the closing
+/// delimiter never matched the opener — the index past the whole
+/// remaining scan, which this then copies out verbatim (C
+/// `macCore.c:862-875`). `None` is never returned: every `$(`/`${` the
+/// caller hands over is consumed here, terminated or not.
 fn refer(
     chars: &[char],
     start: usize,
     level: usize,
     ctx: &mut ExpandCtx,
-    scopes: &mut Vec<HashMap<String, String>>,
-    visiting: &mut Vec<String>,
     out: &mut String,
-) -> Option<usize> {
+) -> usize {
     let close = if chars[start + 1] == '(' { ')' } else { '}' };
     // Find the matching close bracket, honoring nested `$(`/`${`.
     let body_start = start + 2;
@@ -2298,7 +2927,55 @@ fn refer(
         j += 1;
     }
     if depth != 0 {
-        return None; // unterminated — caller emits '$' literally
+        // C `refer`'s first error arm (`macCore.c:862-875`): the closing
+        // delimiter never matched the opener, so this is not a
+        // reference. C rewinds the output pointer to where the reference
+        // began (`v = *value`) and copies the raw text from the `$`
+        // through the last character `trans` scanned — the whole rest of
+        // the string, because the failed name translation ran to the end
+        // of it — then sets `entry->error` and says so.
+        //
+        // Copying the tail HERE, rather than handing the caller a `$` to
+        // re-scan, is what makes the text match: a re-scan re-enters
+        // `trans` just past the `$` and expands whatever `$(…)` follows,
+        // where C never looks at the tail again. Measured on `softIoc
+        // R7.0.10` with `Q=ZZZ`, C writes `x$(A $(Q) y` for the line
+        // `"x$(A $(Q) y"` — the inner `$(Q)` was consumed as part of the
+        // unterminated reference's NAME and is not expanded a second
+        // time. This port used to write `x$(A ZZZ y`.
+        //
+        // The arm is reached from a pre-scan for the matching bracket,
+        // before any scoped definition in the body has been parsed,
+        // where C discovers the mismatch only after parsing them and
+        // pushing a scope it then pops. Neither the text nor this notice
+        // can see the difference; the one thing that can is that C
+        // leaves the table dirty afterwards and this does not, so C may
+        // re-expand — and re-announce — a faulty macro value that this
+        // announces once.
+        let verbatim: String = chars[start..].iter().collect();
+        ctx.seat
+            .faults
+            .raise(TableFault::Unterminated(verbatim.clone()));
+        if !ctx.suppressed {
+            // C's third `macLib:` notice, alongside `undefined` and
+            // `recursive` below and painted by the same `ANSI_MAGENTA`
+            // (`errlog.h:301`) that `errlog` strips off a non-terminal
+            // console. It quotes `entry->type entry->name`, which is
+            // whatever seat this translation runs under: the caller's
+            // whole string when the `$(` is in the string, the macro's
+            // own name when it is in a macro's value.
+            let unterminated = if crate::runtime::log::errlog_console_paints() {
+                "\x1b[35;1munterminated\x1b[0m"
+            } else {
+                "unterminated"
+            };
+            crate::runtime::log::errlog_printf(&format!(
+                "macLib: {unterminated} macro reference in {} {}\n",
+                ctx.seat.kind, ctx.seat.name
+            ));
+        }
+        out.push_str(&verbatim);
+        return chars.len();
     }
     let body = &chars[body_start..j];
     let after = j + 1;
@@ -2312,87 +2989,79 @@ fn refer(
         None => (body, &body[body.len()..]),
     };
 
-    // the name itself may contain macro references — expand it.
+    // The name itself may contain macro references — expand it, quietly.
+    // C raises `FLAG_SUPPRESS_WARNINGS` for exactly this translation and
+    // lowers it again (`macCore.c:795-800`), so the placeholder an
+    // unresolved inner reference leaves in the name is the SHORT `$(X)`
+    // form and no notice is written for it. The fault still lands,
+    // because C hands the name translation the caller's own seat.
     let mut name = String::new();
-    trans(name_chars, level + 1, ctx, scopes, visiting, &mut name);
+    ctx.suppressing(|ctx| trans(name_chars, level + 1, ctx, &mut name));
 
     // Default value (`=...`) and scoped definitions (`,k=v`).
     let mut default: Option<&[char]> = None;
-    let mut scoped: Vec<(String, String)> = Vec::new();
+    let mut scoped: Option<&[char]> = None;
     if let Some(first) = rest.first() {
         if *first == '=' {
             // Default runs until the first top-level `,` or end.
             let dflt = &rest[1..];
-            let dsplit = top_level_comma(dflt);
-            match dsplit {
+            match top_level_comma(dflt) {
                 Some(k) => {
                     default = Some(&dflt[..k]);
-                    parse_scoped(&dflt[k..], level, ctx, scopes, visiting, &mut scoped);
+                    scoped = Some(&dflt[k..]);
                 }
                 None => default = Some(dflt),
             }
         } else if *first == ',' {
-            parse_scoped(rest, level, ctx, scopes, visiting, &mut scoped);
+            scoped = Some(rest);
         }
     }
 
-    // Push the scoped frame (visible only inside this expansion).
-    let mut frame: HashMap<String, String> = HashMap::new();
-    for (k, v) in scoped {
-        frame.insert(k, v);
+    // C pushes the scope only when a `,` list follows, and pops it at
+    // the single exit (`macCore.c:822-830`, `:932-935`). The condition
+    // is not a saving: a push and its pop each dirty the table, so an
+    // unconditional pair would make every reference in a string throw
+    // away the cached values the reference before it was resolved from.
+    //
+    // The frame goes on BEFORE the definitions are read, because C's
+    // `macPushScope` does and each `macPutValue` lands in it as the loop
+    // reaches it (`:850`). So definition N's value is translated with
+    // definitions 1..N-1 visible, and only those: measured on `softIoc
+    // R7.0.10` with an outer `A=outer`, `$(B,A=1,B=$(A))` is `1` while
+    // the reverse `$(B,B=$(A),A=1)` is `outer`.
+    let pop = scoped.is_some();
+    if let Some(defs) = scoped {
+        ctx.table.push_scope();
+        parse_scoped(defs, level, ctx, &name);
     }
-    scopes.push(frame);
 
-    // Look up: innermost scope first, then base macros, then (when
-    // enabled) the process environment — C `macCreateHandle(&h, environ)`
-    // installs env entries as macros, so env resolution sits at the same
-    // level as a defined macro, before any default.
-    let resolved = scopes
-        .iter()
-        .rev()
-        .find_map(|s| s.get(&name).cloned())
-        .or_else(|| ctx.macros.get(&name).cloned())
-        .or_else(|| {
-            if ctx.opts.env_fallback {
-                crate::runtime::env::get(&name)
-            } else {
-                None
-            }
-        });
-
-    match resolved {
-        Some(val) => {
-            if visiting.contains(&name) {
+    match ctx.table.lookup_or_env(&name) {
+        Some(idx) => {
+            if ctx.table.entries[idx].visited {
                 // C `refer` finding `refentry->visited` already set
                 // (`macCore.c:895-904`): the reference is refused, NOT
                 // resolved. The port used to emit the value verbatim,
                 // which broke the cycle but left the operator with a
-                // silently half-expanded `.db` — measured against
-                // `softIoc` on `A="$(B)", B="$(A)"` through a
-                // `.substitutions`, C wrote three lines here and this
-                // wrote none.
+                // silently half-expanded `.db`.
                 //
-                // `visiting.last()` is C's `entry` — the macro whose raw
-                // value is being translated when the cycle closes — and
-                // `name` is its `refentry`, which is why C's own output
-                // for that pair reads `macro A is recursive (expanding
-                // macro B)`.
-                //
-                // C detects this once per macro TABLE entry, in the
-                // `expand()` pass it runs when the table is dirty
-                // (`macCore.c:646-679`); this expander resolves lazily
-                // and so reports once per reference. Same cycle, same
-                // sentence, and the count follows the engine.
-                ctx.recursive.push(name.clone());
-                if !ctx.opts.suppress_warnings {
+                // The seat is the entry whose raw value was being
+                // translated when the cycle closed, and `name` is the
+                // reference that closed it — C's `entry` and
+                // `refentry`, in that order. Reached from
+                // [`expand_table`] the seat is a table entry, so the
+                // notice reads `macro A is recursive (expanding macro
+                // B)`, which is what `softIoc R7.0.10` writes.
+                let refkind = ctx.table.entries[idx].kind;
+                ctx.seat.faults.raise(TableFault::Recursive(name.clone()));
+                if !ctx.suppressed {
                     let recursive = if crate::runtime::log::errlog_console_paints() {
                         "\x1b[35;1mrecursive\x1b[0m"
                     } else {
                         "recursive"
                     };
-                    let entry = visiting.last().map_or("", String::as_str);
                     crate::runtime::log::errlog_printf(&format!(
-                        "macLib: macro {entry} is {recursive} (expanding macro {name})\n"
+                        "macLib: {} {} is {recursive} (expanding {refkind} {name})\n",
+                        ctx.seat.kind, ctx.seat.name
                     ));
                 }
                 out.push('$');
@@ -2400,17 +3069,34 @@ fn refer(
                 out.push_str(&name);
                 // Same knob, same two texts as the undefined arm
                 // (`macCore.c:920-928`).
-                if ctx.opts.suppress_warnings {
+                if ctx.suppressed {
                     out.push(')');
                 } else {
                     out.push_str(",recursive)");
                 }
+            } else if ctx.table.dirty {
+                // No cached value can be trusted, so translate the raw
+                // one under the CALLER's seat — C passes `entry`, not
+                // `refentry` (`macCore.c:890`) — with the entry's
+                // `visited` guard raised around it.
+                let raw: Vec<char> = ctx.table.entries[idx].rawval.chars().collect();
+                ctx.table.entries[idx].visited = true;
+                trans(&raw, level + 1, ctx, out);
+                ctx.table.entries[idx].visited = false;
             } else {
-                // re-scan the resolved value for further refs.
-                visiting.push(name.clone());
-                let val_chars: Vec<char> = val.chars().collect();
-                trans(&val_chars, level + 1, ctx, scopes, visiting, out);
-                visiting.pop();
+                // C `cpy2val( refentry->value, … )` plus `entry->error =
+                // entry->error || refentry->error` (`macCore.c:882-886`).
+                // The value is COPIED, not re-scanned: whatever the
+                // table pass made of it — including the placeholder a
+                // cycle left in it — is what the string gets, and the
+                // fault that produced it comes across without being
+                // raised a second time.
+                let entry = &ctx.table.entries[idx];
+                let value = entry.value.clone().unwrap_or_default();
+                let mut faults = entry.faults.clone();
+                faults.rename_recursive(&name);
+                out.push_str(&value);
+                ctx.seat.faults.merge(&faults);
             }
         }
         None => match default {
@@ -2418,30 +3104,26 @@ fn refer(
                 // C `refer` translates the default at `level + 1`
                 // (`macCore.c:909`), so every quote in it is discarded —
                 // not just a surrounding pair.
-                trans(def_chars, level + 1, ctx, scopes, visiting, out);
+                trans(def_chars, level + 1, ctx, out);
             }
             None => {
-                // L-4: undefined macro placeholder. Record the name so
-                // a hard-fail caller reaches it through
-                // `MacroExpansion::fault`, instead of accepting the
-                // placeholder as text.
-                ctx.undefined.push(name.clone());
-                if !ctx.opts.suppress_warnings {
-                    // C `refer` (`macCore.c:913-917`), through
-                    // `errlogPrintf` and not `fprintf` — which is why the
-                    // magenta on `undefined` follows the console while the
-                    // `ERROR`/`WARNING` words of the `.db` loader do not:
-                    // errlog strips escapes when its console is not a
-                    // terminal (`errlog.c:672-681`) and a direct `fprintf`
-                    // never enters that pump.
+                // C `refer` (`macCore.c:913-917`), through `errlogPrintf`
+                // and not `fprintf` — which is why the magenta on
+                // `undefined` follows the console while the
+                // `ERROR`/`WARNING` words of the `.db` loader do not:
+                // errlog strips escapes when its console is not a
+                // terminal (`errlog.c:672-681`) and a direct `fprintf`
+                // never enters that pump.
+                ctx.seat.faults.raise(TableFault::Undefined(name.clone()));
+                if !ctx.suppressed {
                     let undefined = if crate::runtime::log::errlog_console_paints() {
                         "\x1b[35;1mundefined\x1b[0m"
                     } else {
                         "undefined"
                     };
                     crate::runtime::log::errlog_printf(&format!(
-                        "macLib: macro {name} is {undefined} (expanding string {})\n",
-                        ctx.expanding
+                        "macLib: macro {name} is {undefined} (expanding {} {})\n",
+                        ctx.seat.kind, ctx.seat.name
                     ));
                 }
                 out.push('$');
@@ -2451,7 +3133,7 @@ fn refer(
                 // `,undefined)` tail otherwise (`macCore.c:920-928`), so
                 // the knob changes the loader's own view of the value and
                 // not just what the operator reads.
-                if ctx.opts.suppress_warnings {
+                if ctx.suppressed {
                     out.push(')');
                 } else {
                     out.push_str(",undefined)");
@@ -2460,20 +3142,29 @@ fn refer(
         },
     }
 
-    scopes.pop();
-    Some(after)
+    if pop {
+        ctx.table.pop_scope();
+    }
+    after
 }
 
-/// Parse a `,key=val,key2=val2,...` scoped-definition tail. A bare
-/// `,key` with no `=` defines nothing (C silently skips it).
-fn parse_scoped(
-    rest: &[char],
-    level: usize,
-    ctx: &mut ExpandCtx,
-    scopes: &mut Vec<HashMap<String, String>>,
-    visiting: &mut Vec<String>,
-    out: &mut Vec<(String, String)>,
-) {
+/// Parse a `,key=val,key2=val2,...` scoped-definition tail into the
+/// scope [`refer`] has already pushed. A bare `,key` with no `=`
+/// defines nothing (C silently skips it).
+///
+/// Each definition lands in the table as the loop reaches it, so a later
+/// one can reference an earlier one and not the other way round — C
+/// `macPutValue` inside the `while (*r == ',')` loop (`macCore.c:850`).
+/// Every definition also dirties the table, which is C's explicit
+/// `handle->dirty = TRUE` on the next line and the reason the rest of
+/// the enclosing string resolves from raw values.
+///
+/// Both halves of a definition are translated through
+/// [`ExpandCtx::detached`], C's `MAC_ENTRY subs` (`macCore.c:820-826`):
+/// a fault in a scoped name or value is neither warned about nor merged
+/// into the enclosing expansion. `refname` is the seat name C uses for
+/// the first half and the definition's own name the seat for the second.
+fn parse_scoped(rest: &[char], level: usize, ctx: &mut ExpandCtx, refname: &str) {
     let mut k = 0;
     while k < rest.len() {
         if rest[k] != ',' {
@@ -2482,24 +3173,29 @@ fn parse_scoped(
         k += 1; // step over ','
         // Scoped name: up to next top-level `=` or `,`.
         let seg = &rest[k..];
-        let term = top_level_terminator(seg);
-        let (name_part, tail) = match term {
+        let (name_part, tail) = match top_level_terminator(seg) {
             Some(t) => (&seg[..t], &seg[t..]),
             None => (seg, &seg[seg.len()..]),
         };
         let mut sname = String::new();
-        trans(name_part, level + 1, ctx, scopes, visiting, &mut sname);
+        ctx.detached(refname.to_string(), |ctx| {
+            trans(name_part, level + 1, ctx, &mut sname);
+        });
         k += name_part.len();
         if let Some('=') = tail.first() {
             let valseg = &tail[1..];
-            let vterm = top_level_comma(valseg);
-            let (val_part, _) = match vterm {
+            let (val_part, _) = match top_level_comma(valseg) {
                 Some(t) => (&valseg[..t], &valseg[t..]),
                 None => (valseg, &valseg[valseg.len()..]),
             };
             let mut sval = String::new();
-            trans(val_part, level + 1, ctx, scopes, visiting, &mut sval);
-            out.push((sname, sval));
+            ctx.detached(sname.clone(), |ctx| {
+                trans(val_part, level + 1, ctx, &mut sval);
+            });
+            // C `macPutValue`, which types the new entry `"macro"` even
+            // here (`macCore.c:283`) — `"scoped macro"` is the seat the
+            // definition was translated under, not the entry's own type.
+            ctx.table.put(&sname, KIND_MACRO, sval);
             k += 1 + val_part.len();
         }
         // else: bare `,name` — no value, defines nothing.
@@ -2552,6 +3248,12 @@ fn top_level_comma(body: &[char]) -> Option<usize> {
 
 /// Read `( a , b , ... )` and return the strings. `min`/`max` bound the
 /// count the way C's grammar does by having one production per arity.
+///
+/// The bound is checked WHERE C's grammar checks it, not after the list is
+/// built: an argument too many is rejected at the comma that would open it —
+/// `record(ai, "", extra)` prints ` at or before ','` on `softIoc` @`R7.0.10`,
+/// with the parser never reaching the `)` — and an argument too few at the `)`
+/// that ended the list, which is where `alias("C8")` reports.
 fn parse_arg_list(
     chars: &[char],
     pos: &mut usize,
@@ -2559,7 +3261,6 @@ fn parse_arg_list(
     col: &mut usize,
     min: usize,
     max: usize,
-    what: &str,
 ) -> CaResult<Vec<String>> {
     skip_whitespace_and_comments(chars, pos, line, col);
     let open_line = *line;
@@ -2571,6 +3272,13 @@ fn parse_arg_list(
         skip_whitespace_and_comments(chars, pos, line, col);
         match chars.get(*pos) {
             Some(',') => {
+                if args.len() >= max {
+                    return Err(CaError::DbParseError {
+                        line: *line,
+                        token: String::from(","),
+                        message: SYNTAX_ERROR.into(),
+                    });
+                }
                 *pos += 1;
                 *col += 1;
             }
@@ -2579,16 +3287,11 @@ fn parse_arg_list(
     }
     skip_whitespace_and_comments(chars, pos, line, col);
     expect_char(chars, pos, col, ')', *line)?;
-    if args.len() < min || args.len() > max {
-        let want = if min == max {
-            format!("{min}")
-        } else {
-            format!("{min} or {max}")
-        };
+    if args.len() < min {
         return Err(CaError::DbParseError {
             line: open_line,
-            column: *col,
-            message: format!("{what} takes {want} arguments, got {}", args.len()),
+            token: String::from(")"),
+            message: SYNTAX_ERROR.into(),
         });
     }
     Ok(args)
@@ -2602,7 +3305,7 @@ fn parse_menu(
     line: &mut usize,
     col: &mut usize,
 ) -> CaResult<DbdMenu> {
-    let name = parse_arg_list(chars, pos, line, col, 1, 1, "menu")?.remove(0);
+    let name = parse_arg_list(chars, pos, line, col, 1, 1)?.remove(0);
     skip_whitespace_and_comments(chars, pos, line, col);
     expect_char(chars, pos, col, '{', *line)?;
     let mut choices = Vec::new();
@@ -2612,7 +3315,7 @@ fn parse_menu(
             None => {
                 return Err(CaError::DbParseError {
                     line: *line,
-                    column: *col,
+                    token: String::new(),
                     message: format!("unexpected end of file in menu({name})"),
                 });
             }
@@ -2626,7 +3329,7 @@ fn parse_menu(
         let kw = read_word(chars, pos, col);
         match kw.as_str() {
             "choice" => {
-                let mut a = parse_arg_list(chars, pos, line, col, 2, 2, "choice")?;
+                let mut a = parse_arg_list(chars, pos, line, col, 2, 2)?;
                 let value = a.remove(1);
                 choices.push((a.remove(0), value));
             }
@@ -2637,8 +3340,8 @@ fn parse_menu(
             _ => {
                 return Err(CaError::DbParseError {
                     line: *line,
-                    column: *col,
-                    message: format!("expected 'choice' in menu({name}), got '{kw}'"),
+                    token: kw.clone(),
+                    message: SYNTAX_ERROR.into(),
                 });
             }
         }
@@ -2653,7 +3356,7 @@ fn parse_menu(
         let values: Vec<String> = choices.iter().map(|(_, value)| value.clone()).collect();
         crate::server::record::menu_scan::install(&values).map_err(|e| CaError::DbParseError {
             line: *line,
-            column: *col,
+            token: String::from("}"),
             message: format!("menu({name}): {e}"),
         })?;
     }
@@ -2670,7 +3373,7 @@ fn parse_recordtype(
     line: &mut usize,
     col: &mut usize,
 ) -> CaResult<DbdRecordType> {
-    let name = parse_arg_list(chars, pos, line, col, 1, 1, "recordtype")?.remove(0);
+    let name = parse_arg_list(chars, pos, line, col, 1, 1)?.remove(0);
     skip_whitespace_and_comments(chars, pos, line, col);
     expect_char(chars, pos, col, '{', *line)?;
     let mut fields = Vec::new();
@@ -2681,7 +3384,7 @@ fn parse_recordtype(
             None => {
                 return Err(CaError::DbParseError {
                     line: *line,
-                    column: *col,
+                    token: String::new(),
                     message: format!("unexpected end of file in recordtype({name})"),
                 });
             }
@@ -2720,8 +3423,8 @@ fn parse_recordtype(
             _ => {
                 return Err(CaError::DbParseError {
                     line: *line,
-                    column: *col,
-                    message: format!("expected 'field' in recordtype({name}), got '{kw}'"),
+                    token: kw.clone(),
+                    message: SYNTAX_ERROR.into(),
                 });
             }
         }
@@ -2741,7 +3444,7 @@ fn parse_recordtype_field(
     col: &mut usize,
     rtype: &str,
 ) -> CaResult<DbdField> {
-    let mut head = parse_arg_list(chars, pos, line, col, 2, 2, "field")?;
+    let mut head = parse_arg_list(chars, pos, line, col, 2, 2)?;
     let dbf_type = head.remove(1);
     let name = head.remove(0);
     skip_whitespace_and_comments(chars, pos, line, col);
@@ -2753,7 +3456,7 @@ fn parse_recordtype_field(
             None => {
                 return Err(CaError::DbParseError {
                     line: *line,
-                    column: *col,
+                    token: String::new(),
                     message: format!("unexpected end of file in {rtype}.{name}"),
                 });
             }
@@ -2772,11 +3475,11 @@ fn parse_recordtype_field(
         if key.is_empty() {
             return Err(CaError::DbParseError {
                 line: *line,
-                column: *col,
-                message: format!("expected a field item in {rtype}.{name}"),
+                token: yytext_at(chars, *pos),
+                message: SYNTAX_ERROR.into(),
             });
         }
-        let value = parse_arg_list(chars, pos, line, col, 1, 1, &key)?.remove(0);
+        let value = parse_arg_list(chars, pos, line, col, 1, 1)?.remove(0);
         items.push((key, value));
     }
     Ok(DbdField {
@@ -2833,8 +3536,8 @@ fn read_quoted_string(
     if *pos >= chars.len() || chars[*pos] != '"' {
         return Err(CaError::DbParseError {
             line: *line,
-            column: *col,
-            message: "expected '\"'".into(),
+            token: yytext_at(chars, *pos),
+            message: SYNTAX_ERROR.into(),
         });
     }
     *pos += 1;
@@ -2877,7 +3580,7 @@ fn read_quoted_string(
             // string, closing quote missing")`), not a literal char.
             return Err(CaError::DbParseError {
                 line: *line,
-                column: *col,
+                token: String::from("\""),
                 message: "Newline in string, closing quote missing".into(),
             });
         } else {
@@ -2890,7 +3593,7 @@ fn read_quoted_string(
     if *pos >= chars.len() {
         return Err(CaError::DbParseError {
             line: *line,
-            column: *col,
+            token: String::new(),
             message: "unterminated string".into(),
         });
     }
@@ -2931,17 +3634,21 @@ fn read_json_string(
         _ => {
             return Err(CaError::DbParseError {
                 line: *line,
-                column: *col,
-                message: "expected a quoted value".into(),
+                token: yytext_at(chars, *pos),
+                message: SYNTAX_ERROR.into(),
             });
         }
     };
+    // Where C's `yytext` for this token begins. Every abort below is raised
+    // from inside the one `jsonstr` rule (`dbLex.l:32`), so they all quote the
+    // same run of text and the locator is decided once.
+    let quote_start = *pos;
     *pos += 1;
     *col += 1;
 
-    let err = |line: usize, col: usize, message: &str| CaError::DbParseError {
+    let err = |line: usize, message: &str| CaError::DbParseError {
         line,
-        column: col,
+        token: yytext_at(chars, quote_start),
         message: message.into(),
     };
 
@@ -2950,7 +3657,7 @@ fn read_json_string(
     let mut escaped = String::new();
     loop {
         let Some(&c) = chars.get(*pos) else {
-            return Err(err(*line, *col, "unterminated string"));
+            return Err(err(*line, "unterminated string"));
         };
         if c == quote {
             *pos += 1;
@@ -2961,11 +3668,11 @@ fn read_json_string(
             // dbLex.l:131-133 — the JSON string rule cannot match a newline
             // (`normalchar` excludes every control character), and the
             // catch-all reports the missing quote.
-            return Err(err(*line, *col, "Newline in string, closing quote missing"));
+            return Err(err(*line, "Newline in string, closing quote missing"));
         }
         if c == '\\' {
             let Some(&esc) = chars.get(*pos + 1) else {
-                return Err(err(*line, *col, "unterminated string"));
+                return Err(err(*line, "unterminated string"));
             };
             // `escapedchar` is `{backslash}[^ux1-9]`; `x` and `u` introduce the
             // fixed-width `latinchar`/`unicodechar` forms, and `\1`..`\9` are
@@ -2981,7 +3688,6 @@ fn read_json_string(
                 'x' | 'u' | '1'..='9' => {
                     return Err(err(
                         *line,
-                        *col,
                         "invalid escape sequence (\\x needs 2 hex digits, \
                          \\u needs 4, and \\1..\\9 are not escapes)",
                     ));
@@ -3005,7 +3711,6 @@ fn read_json_string(
         if (c as u32) < 0x20 {
             return Err(err(
                 *line,
-                *col,
                 "a control character must be escaped inside a quoted value",
             ));
         }
@@ -3075,7 +3780,7 @@ fn read_json_value(
 
     Err(CaError::DbParseError {
         line: start_line,
-        column: *col,
+        token: String::new(),
         message: format!("unterminated JSON value (missing '{close}')"),
     })
 }
@@ -3124,11 +3829,10 @@ fn read_token_string(
         }
     }
     if s.is_empty() {
-        let got = chars.get(*pos).map_or("EOF".to_string(), |c| c.to_string());
         return Err(CaError::DbParseError {
             line: *line,
-            column: *col,
-            message: format!("expected a name (bareword or quoted string), got '{got}'"),
+            token: yytext_at(chars, *pos),
+            message: SYNTAX_ERROR.into(),
         });
     }
     Ok(s)
@@ -3198,14 +3902,70 @@ fn read_field_value(
     if *pos < chars.len() && chars[*pos] != ')' && chars[*pos] != ',' {
         return Err(CaError::DbParseError {
             line: *line,
-            column: *col,
-            message: format!(
-                "illegal character '{}' in unquoted value (expected a quoted string or bareword)",
-                chars[*pos]
-            ),
+            token: yytext_at(chars, *pos),
+            message: SYNTAX_ERROR.into(),
         });
     }
     Ok(PvString::from(s))
+}
+
+/// The sentence bison itself writes for EVERY grammar rejection
+/// (`yyerror("syntax error")`): `dbYacc.y` declares no `%error-verbose` and no
+/// per-production message, so `record(ai)`, `field(DESC "x")` and a stray `}`
+/// all print the same three words on `softIoc` @`R7.0.10`. The token is what
+/// tells them apart, and it is the ` at or before` clause's job.
+///
+/// This port used to name the expectation instead — `expected ')', got '}'` —
+/// which reads better and is not what an operator comparing against C sees.
+const SYNTAX_ERROR: &str = "syntax error";
+
+/// C's `yytext` at `pos`: the token the `.db` lexer would have matched there,
+/// which is what `yyerror` quotes (`dbYacc.y:378`).
+///
+/// The lexer's own token shapes, so the quoting matches C's. A quoted string
+/// is returned WITH its quotes — `field(DESC "x")` prints ` at or before '"x"'`
+/// on `softIoc` @`R7.0.10`, not the one character the port used to name — a
+/// bareword is the whole `{bareword}` run (`dbLex.l:20`), and anything else is
+/// the single character. End of input matched no token at all and answers with
+/// the empty string.
+fn yytext_at(chars: &[char], pos: usize) -> String {
+    let Some(&c) = chars.get(pos) else {
+        return String::new();
+    };
+    if c == '"' || c == '\'' {
+        // `{doublequote}({dqschar}|{escape})*{doublequote}` (`dbLex.l:88-92`):
+        // the escape is two characters and neither of them closes the string.
+        let mut out = String::from(c);
+        let mut i = pos + 1;
+        while let Some(&d) = chars.get(i) {
+            out.push(d);
+            i += 1;
+            if d == '\\' {
+                if let Some(&e) = chars.get(i) {
+                    out.push(e);
+                    i += 1;
+                }
+                continue;
+            }
+            if d == c || d == '\n' {
+                break;
+            }
+        }
+        return out;
+    }
+    if is_bareword_char(c) {
+        return chars[pos..]
+            .iter()
+            .take_while(|&&d| is_bareword_char(d))
+            .collect();
+    }
+    c.to_string()
+}
+
+/// `bareword [a-zA-Z0-9_\-+:.\[\]<>;]` (`dbLex.l:20`).
+fn is_bareword_char(c: char) -> bool {
+    c.is_ascii_alphanumeric()
+        || matches!(c, '_' | '-' | '+' | ':' | '.' | '[' | ']' | '<' | '>' | ';')
 }
 
 fn expect_char(
@@ -3216,15 +3976,10 @@ fn expect_char(
     line: usize,
 ) -> CaResult<()> {
     if *pos >= chars.len() || chars[*pos] != expected {
-        let got = if *pos < chars.len() {
-            chars[*pos].to_string()
-        } else {
-            "EOF".to_string()
-        };
         return Err(CaError::DbParseError {
             line,
-            column: *col,
-            message: format!("expected '{expected}', got '{got}'"),
+            token: yytext_at(chars, *pos),
+            message: SYNTAX_ERROR.into(),
         });
     }
     *pos += 1;
@@ -3424,7 +4179,7 @@ fn unregistered_record_type(record_type: &str) -> CaError {
     };
     CaError::DbParseError {
         line: 0,
-        column: 0,
+        token: String::new(),
         message,
     }
 }
@@ -5379,7 +6134,7 @@ record(ai, "REC") {
         let r = expand_macros("$(A)$(B=def)$(C)", &macros, MacroExpandOptions::default());
         assert_eq!(r.text, "$(A,undefined)def$(C,undefined)");
         // B had a default → not undefined; A and C are, in scan order.
-        assert_eq!(r.undefined, vec!["A".to_string(), "C".to_string()]);
+        assert_eq!(r.faults.undefined, vec!["A".to_string(), "C".to_string()]);
     }
 
     /// C `macCore.c:701-703` — "discard quotes and escapes if level
@@ -5447,7 +6202,7 @@ record(ai, "REC") {
         assert_eq!(substitute_macros("$$100", &macros), "$$100");
         let r = expand_macros("$$100", &macros, MacroExpandOptions::default());
         assert_eq!(r.text, "$$100");
-        assert!(r.undefined.is_empty());
+        assert!(r.faults.undefined.is_empty());
     }
 
     // `env_fallback` resolves an otherwise-unset name from the process
@@ -5471,7 +6226,7 @@ record(ai, "REC") {
             },
         );
         assert_eq!(on.text, "FROM_ENV");
-        assert!(on.undefined.is_empty());
+        assert!(on.faults.undefined.is_empty());
         unsafe { std::env::remove_var(var) };
     }
 
@@ -5567,21 +6322,32 @@ record(ai, "REC") {
     #[test]
     fn substitute_macros_self_reference_terminates() {
         // Re-expansion must not recurse forever on `A=$(A)`.
-        // The recursion guard emits the value once without re-scan.
+        // The guard REFUSES the reference rather than resolving it once:
+        // the text is C's `$(A,recursive)` placeholder and a `macLib:
+        // macro A is recursive` notice goes out with it
+        // (`macCore.c:895-904`).
         let mut macros = HashMap::new();
         macros.insert("A".to_string(), "$(A)".to_string());
-        // Must terminate; the exact text is the cycle-broken value.
-        let out = substitute_macros("$(A)", &macros);
-        assert!(out.contains("A"), "self-ref expansion produced: {out}");
+        assert_eq!(substitute_macros("$(A)", &macros), "$(A,recursive)");
     }
 
     #[test]
     fn substitute_macros_mutual_reference_terminates() {
-        // A=$(B), B=$(A) — mutual cycle must also terminate.
+        // A=$(B), B=$(A) — a mutual cycle must also terminate, and what
+        // it leaves behind is the OTHER member of the pair.
+        //
+        // `$(A)` copies A's cached value, and the table pass built that
+        // value by following `$(B)` and refusing the `$(A)` inside it,
+        // so the placeholder names B. Measured on `softIoc R7.0.10`
+        // through `dbLoadTemplate` with this exact pair: C loads
+        // `$(B,recursive)`. A lazy expander answers `$(A,recursive)`
+        // here — the reference it happened to refuse first — which is a
+        // wrong loaded VALUE and not a wording difference, and is why
+        // the engine keeps a table at all.
         let mut macros = HashMap::new();
         macros.insert("A".to_string(), "$(B)".to_string());
         macros.insert("B".to_string(), "$(A)".to_string());
-        let _ = substitute_macros("$(A)", &macros); // must not hang
+        assert_eq!(substitute_macros("$(A)", &macros), "$(B,recursive)");
     }
 
     /// The real `menuScan` body at `R7.0.10`

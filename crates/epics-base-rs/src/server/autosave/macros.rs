@@ -58,11 +58,13 @@ impl MacroContext {
     /// Autosave-specific options: `env_fallback` (C `macEnvExpand`) and
     /// `dollar_escape` (`$$` → literal `$`, a `.req` convenience).
     ///
-    /// Either fault the engine can record is a hard error here — an
-    /// undefined macro with no default, and a macro that resolves into
-    /// itself — because both leave a placeholder where the `.req` wanted
-    /// a PV name, and a `.req` line built from a placeholder names a PV
-    /// that does not exist. Which one it was is read from
+    /// Every fault the engine can record is a hard error here — an
+    /// undefined macro with no default, a macro that resolves into
+    /// itself, and a reference whose closing delimiter never arrived —
+    /// because all three leave text where the `.req` wanted a PV name,
+    /// and a `.req` line built from a placeholder (or from a raw
+    /// passed-through `$(`) names a PV that does not exist. Which one it
+    /// was is read from
     /// [`MacroExpansion::fault`], never from one of its lists, so a new
     /// fault arm cannot be silently accepted here.
     ///
@@ -90,6 +92,11 @@ impl MacroContext {
             },
             MacroFault::Recursive(key) => AutosaveError::RecursiveMacro {
                 key: key.to_string(),
+                source: source.to_string(),
+                line,
+            },
+            MacroFault::Unterminated(reference) => AutosaveError::UnterminatedMacro {
+                reference: reference.to_string(),
                 source: source.to_string(),
                 line,
             },

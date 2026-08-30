@@ -69,10 +69,15 @@ pub enum CaError {
     #[error("link error: {0}")]
     LinkError(String),
 
-    #[error("DB parse error at line {line}, column {column}: {message}")]
+    /// A `.db`/`.dbd` parse abort, carried as C `yyerror` prints it
+    /// (`dbYacc.y:370-383`): the line, the sentence, and `yytext` — the token
+    /// the lexer had matched when the parser rejected it, which is what C
+    /// quotes in its ` at or before '%s'` clause. An empty `token` is a
+    /// failure raised where no token was matched, and prints no such clause.
+    #[error("DB parse error at line {line}: {message}")]
     DbParseError {
         line: usize,
-        column: usize,
+        token: String,
         message: String,
     },
 

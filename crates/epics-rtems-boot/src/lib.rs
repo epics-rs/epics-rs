@@ -131,6 +131,7 @@
 //! | tree | pinned revision |
 //! | --- | --- |
 //! | `epics-base` | `R7.0.10` |
+//! | `iocStats` | `4.0.1` |
 //!
 //! **Resolve by symbol at the pin; the line is a hint.** Find the named
 //! function, struct, macro or field first, and treat the line number as a hint
@@ -166,6 +167,7 @@
 
 pub mod boot_args;
 pub mod contract;
+pub mod shell;
 pub mod stats;
 
 /// Undefined symbol deliberately left in this crate's object graph when it is

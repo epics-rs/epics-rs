@@ -1,6 +1,6 @@
 /*
  * Recorded RTEMS 6 / rtems-libbsd declarations — the subset that
- * csrc/rtems_init.c names, and nothing else.
+ * csrc/rtems_init.c and csrc/rtems_shell_cmds.c name, and nothing else.
  *
  * This is NOT a copy of the real header. Every block introduced by an
  * `@rtems-api <header>` marker is verbatim text from that header in an

@@ -37,6 +37,12 @@
 #   printf format checking RTEMS_PRINTFLIKE puts on rtems_panic. See that
 #   directory's README.md for what this does and does not prove.
 #
+#   `rtems_shell_cmds.c` is the same case as rtems_init.c and is compiled the
+#   same way: it is the RTEMS half of the operator commands base registers from
+#   `iocshRegisterRTEMS`, so every RTEMS and libbsd name it uses — including
+#   `rtems_shell_cmd_t`'s layout, which it dereferences — is checked against the
+#   record here rather than on the board.
+#
 # `rtems_config.c` and `rtems_stats.c` remain outside: the first ends in
 # `<rtems/confdefs.h>`, which generates the configuration table rather than
 # declaring an API, and the second reaches into RTEMS score internals whose
@@ -113,9 +119,16 @@ for config in "${INIT_CONFIGS[@]}"; do
         -c "$CSRC/rtems_init.c" -o "$work/rtems_init.o"
 done
 
+echo "==> compiling rtems_shell_cmds.c against the recorded RTEMS API with $CC_HOST"
+# One configuration: the file has no `#if` of its own, so there is no second
+# arm that could compile for the first time on the board.
+"$CC_HOST" "${INIT_CFLAGS[@]}" -c "$CSRC/rtems_shell_cmds.c" \
+    -o "$work/rtems_shell_cmds.o"
+
 echo "==> csrc-check: boot-argument path compiled and exercised on the host,"
 echo "    rtems_init.c compiled against the recorded RTEMS API in every"
-echo "    configuration it selects."
+echo "    configuration it selects, and rtems_shell_cmds.c against the same"
+echo "    record."
 echo "    NOT covered here: rtems_config.c (generates its table from"
 echo "    <rtems/confdefs.h>) and rtems_stats.c (RTEMS score internals) —" \
      "only an image build compiles them."

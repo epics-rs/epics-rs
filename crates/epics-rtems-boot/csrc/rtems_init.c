@@ -5,10 +5,9 @@
  * compile-time static address — then calls the Rust `main`. Derived from
  * EPICS base's POSIX arm,
  * `modules/libcom/RTEMS/posix/rtems_init.c`; each step cites the base line it
- * comes from, and `doc/rtems-boot-shim-design.md` §1.1 records what base does
- * here that we deliberately drop (NFS/TFTP mounts, iocsh registration and the
- * startup script, telnetd, NTP, the NVRAM boot path, the i386 QEMU e1000 NVM
- * hack).
+ * comes from. What base does here that this file deliberately drops: NFS/TFTP
+ * mounts, iocsh registration and the startup script, telnetd, NTP, the NVRAM
+ * boot path, the i386 QEMU e1000 NVM hack.
  *
  * The contract with Rust is one line: base's `main(argc, argv)` call at
  * :1184. rustc emits a C `main` that hands argc/argv to the Rust runtime, so

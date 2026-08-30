@@ -161,6 +161,40 @@ impl MemUsage {
     }
 }
 
+/// The malloc heap's lifetime accounting — the three numbers the `heapSpace`
+/// iocsh command is written against.
+///
+/// A distinct reading from [`MemUsage`], not a restatement of it. [`MemUsage`]
+/// is the free/used *block walk*; this is the allocator's own bookkeeping, and
+/// C base's `heapSpace` (`libcom/RTEMS/posix/rtems_init.c:560-586` @R7.0.10)
+/// derives its number from these rather than from the walk. The two differ by
+/// per-block header bytes, so a command that printed [`MemUsage::free`] would
+/// be printing a nearby number under C's name.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HeapSpace {
+    /// The allocatable area the heap was given, in bytes.
+    pub size: u64,
+    /// Bytes ever handed out, summed over block sizes.
+    pub lifetime_allocated: u64,
+    /// Bytes ever returned, summed over the same block sizes.
+    pub lifetime_freed: u64,
+}
+
+impl HeapSpace {
+    /// Bytes not currently inside an allocated block — C's
+    /// `size - (lifetime_allocated - lifetime_freed)`.
+    ///
+    /// Saturating where C wraps. C's subtraction is unsigned, so a heap whose
+    /// counters ever disagreed with its size would print a number near 2^32
+    /// rather than a small one; that reads as "plenty free" at exactly the
+    /// moment there is none. Zero is the honest answer to the same input, and
+    /// it is the direction an operator can act on.
+    pub fn free(&self) -> u64 {
+        self.size
+            .saturating_sub(self.lifetime_allocated.saturating_sub(self.lifetime_freed))
+    }
+}
+
 /// Read descriptor usage, or [`None`] on a build whose OS has no backend.
 pub fn fd_usage() -> Option<FdUsage> {
     backend::fd_usage()
@@ -171,6 +205,16 @@ pub fn fd_usage() -> Option<FdUsage> {
 /// them.
 pub fn mem_usage() -> MemUsage {
     backend::mem_usage()
+}
+
+/// Read the heap's lifetime accounting, or [`None`] on a build whose OS has no
+/// backend.
+///
+/// Whole-reading [`Option`] rather than per-field, unlike [`MemUsage`]: the
+/// three come from one structure the allocator fills together, and a partial
+/// one would make [`HeapSpace::free`] a subtraction over an unknown.
+pub fn heap_space() -> Option<HeapSpace> {
+    backend::heap_space()
 }
 
 /// Print the task census — thread count, kernel names, effective priorities —

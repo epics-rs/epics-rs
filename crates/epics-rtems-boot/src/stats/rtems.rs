@@ -17,7 +17,7 @@
 use core::ffi::c_char;
 use std::ffi::CString;
 
-use super::{FdUsage, MemUsage};
+use super::{FdUsage, HeapSpace, MemUsage};
 
 pub(super) fn fd_usage() -> Option<FdUsage> {
     let mut used = 0u32;
@@ -45,6 +45,24 @@ pub(super) fn mem_usage() -> MemUsage {
         used: Some(used),
         largest_free: Some(largest_free),
     }
+}
+
+/// The same `_Protected_heap_Get_information` call as [`mem_usage`], reading
+/// the `Stats` half instead of the block walk — see [`HeapSpace`] for why those
+/// are two readings and not one.
+pub(super) fn heap_space() -> Option<HeapSpace> {
+    let mut size = 0u64;
+    let mut lifetime_allocated = 0u64;
+    let mut lifetime_freed = 0u64;
+    // SAFETY: as above — three pointers to live locals of the right type.
+    let rc = unsafe {
+        ffi::epics_rtems_boot_heap_space(&mut size, &mut lifetime_allocated, &mut lifetime_freed)
+    };
+    (rc == 0).then_some(HeapSpace {
+        size,
+        lifetime_allocated,
+        lifetime_freed,
+    })
 }
 
 pub(super) fn dump_tasks(tag: &str) {
@@ -94,6 +112,11 @@ mod ffi {
             free_total: *mut u64,
             used_total: *mut u64,
             free_largest: *mut u64,
+        ) -> c_int;
+        pub fn epics_rtems_boot_heap_space(
+            size: *mut u64,
+            lifetime_allocated: *mut u64,
+            lifetime_freed: *mut u64,
         ) -> c_int;
         pub fn epics_rtems_boot_dump_tasks(tag: *const c_char);
         pub fn epics_rtems_boot_stack_report(tag: *const c_char);

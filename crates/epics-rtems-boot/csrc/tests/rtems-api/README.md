@@ -1,8 +1,8 @@
 # Recorded RTEMS API
 
-The declarations `../../rtems_init.c` names, copied verbatim out of an
-installed RTEMS 6 BSP, so that a CI runner with no cross toolchain can compile
-that file with `-Werror`.
+The declarations `../../rtems_init.c` and `../../rtems_shell_cmds.c` name,
+copied verbatim out of an installed RTEMS 6 BSP, so that a CI runner with no
+cross toolchain can compile those files with `-Werror`.
 
 ## Why this exists
 
@@ -41,6 +41,9 @@ Proved on every push, by `scripts/csrc-check.sh`:
 - `rtems_init.c` compiles under `-Wall -Wextra -Werror`, in all four
   configurations its `#if`s select (DHCP; static address; static address with a
   gateway; `EPICS_RTEMS_BSD_LOG_DEBUG=0`).
+- `rtems_shell_cmds.c` — the RTEMS half of the operator commands base registers
+  from `iocshRegisterRTEMS` — compiles under the same flags. It has no `#if` of
+  its own, so one configuration is all of it.
 - Every RTEMS and libbsd name it uses exists, with the right arity, argument
   types and return type — including the `printf` format checking that
   `RTEMS_PRINTFLIKE` puts on `rtems_panic`.

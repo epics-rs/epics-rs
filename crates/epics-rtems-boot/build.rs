@@ -23,6 +23,7 @@ fn main() {
     println!("cargo::rerun-if-changed=csrc/boot_args.h");
     println!("cargo::rerun-if-changed=csrc/rtems_config.c");
     println!("cargo::rerun-if-changed=csrc/rtems_init.c");
+    println!("cargo::rerun-if-changed=csrc/rtems_shell_cmds.c");
     println!("cargo::rerun-if-changed=csrc/rtems_stats.c");
     println!("cargo::rerun-if-changed=src/contract.rs");
     println!("cargo::rerun-if-env-changed={BSP_PREFIX_ENV}");
@@ -60,6 +61,7 @@ fn main() {
         .file("csrc/boot_args.c")
         .file("csrc/rtems_config.c")
         .file("csrc/rtems_init.c")
+        .file("csrc/rtems_shell_cmds.c")
         .file("csrc/rtems_stats.c")
         .include(&include_dir)
         // Base passes -DBSP_$(RTEMS_BSP) (modules/libcom/RTEMS/Makefile:41) so

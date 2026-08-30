@@ -592,6 +592,28 @@ mod ioc {
         //     VxWorks' takes this as a no-op.
         epics_rtems_boot::stats::register_task();
 
+        // (0-cmd) The RTEMS operator commands — C `iocshRegisterRTEMS`
+        //     ($EPICS_BASE/modules/libcom/RTEMS/posix/rtems_init.c:692-705 at
+        //     R7.0.10). C registers `netstat`, `heapSpace`, `zoneset`, `rt` and
+        //     `setlogmask` from its RTEMS boot path, so an IOC has them because
+        //     it booted on RTEMS; this is that boot path, so this is where they
+        //     are registered.
+        //
+        //     `cfg!` and not `#[cfg]`: the call compiles on every target this
+        //     binary builds for, and the condition is C's own — `iocshRegisterRTEMS`
+        //     exists only in the RTEMS build of libCom, so a host or VxWorks
+        //     image must not grow the names.
+        //
+        //     KNOWN, and not a defect in the registration: this target has no
+        //     iocsh (`rustyline` does not build for RTEMS, see above), so
+        //     nothing reads the table here yet. The commands are held to C's
+        //     names, arities and output by this workspace's host tests; a shell
+        //     on the target is what turns them into something an operator can
+        //     type.
+        if cfg!(target_os = "rtems") {
+            epics_base_rs::server::iocsh::register_rtems_commands();
+        }
+
         // (0-probe) STAGE-5 PROBE: the target's `EPICS_PVA_NAME_SERVERS`.
         // Set before `install_pvalink_resolver` builds the ONE client, because
         // `PvaClientBuilder`'s default reads the variable once at construction

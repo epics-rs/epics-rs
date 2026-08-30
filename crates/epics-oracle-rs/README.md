@@ -9,10 +9,14 @@ Ground truth is the **fat** C IOC built under `oracle-ioc/`, not base's stock
 denominator. There are two lanes — CA against `softIoc`, and PVA against pvxs
 QSRV2 in `softIocPVX`.
 
-It exists to make "clean" a measurement instead of an opinion. See
-`doc/strategy-2026-07-13.md` §3.2 for the rationale: nineteen audit rounds of
-reading C and Rust side by side never converged, because there was no
-denominator and "verified clean" verdicts kept turning out false.
+It exists to make "clean" a measurement instead of an opinion. It replaced
+reading C and Rust side by side, which ran nineteen rounds without converging:
+the per-round finding count stayed flat in the 22–54 band and then rose to 114
+once the auditor pool widened — the signature of a process bounded by how much
+surface it had looked at, not by how many defects were left — and Round 18
+reopened three entries previously recorded as *verified clean*. More rounds
+answer neither symptom, because reading has no denominator. The `.dbd` is one,
+which is why coverage below is a percentage rather than an impression.
 
 ## Shape
 
@@ -49,7 +53,7 @@ honest experiment puts a real C client in front of both.
 | verdict | meaning |
 |---|---|
 | **AGREED** | both sides produced a reading, and they match |
-| **EXPECTED DEVIATION** | they differ, and an enabled allowlist row justifies it. Four buckets, three justification bases: `NOT-REPRODUCED` and `REPRODUCED` must cite a `CBUG-…` id in `doc/upstream-c-bugs.md`; `DESIGN-DIVERGENCE` and `INSTRUMENT-SUPERSET` are justified by their own `why` and are exempt from that citation rule. All four match, fire and go stale identically |
+| **EXPECTED DEVIATION** | they differ, and an enabled allowlist row justifies it. Four buckets, three justification bases: `NOT-REPRODUCED` and `REPRODUCED` must name the `CBUG-…` id of the upstream C defect they refuse to reproduce, and say in their own `why` what C does and why it is wrong; `DESIGN-DIVERGENCE` and `INSTRUMENT-SUPERSET` are justified by their own `why` and are exempt from that citation rule. All four match, fire and go stale identically |
 | **DEFECT** | they differ and nothing justifies it |
 | **ERROR** | no reading was obtained — IOC would not boot, PV never connected, tool timed out. **Never scored as agreement.** |
 
@@ -143,8 +147,8 @@ was built to end.
   (`--phase pva-read`, `--phase pva-monitor`) are real and measured, but sit
   outside `--phase all` on purpose: different ground truth (`softIocPVX`), a
   different instrument (`pvxget`/`pvxinfo`/`pvxmonitor`), and no CA allowlist,
-  since `doc/upstream-c-bugs.md` is about C's CA behaviour and justifies nothing
-  about QSRV2. Folding them into `all` would merge two populations whose
+  since every `CBUG-…` row records C `softIoc`'s CA-side behaviour and justifies
+  nothing about QSRV2. Folding them into `all` would merge two populations whose
   verdicts are not comparable into one set of counts.
 
 ## What the first run measured

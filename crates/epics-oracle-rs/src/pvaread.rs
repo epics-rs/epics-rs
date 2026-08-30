@@ -494,6 +494,9 @@ pub fn report(
             record_types_unimplemented: surface.unimplemented_types.clone(),
             observable_fields: surface.denominator(),
             excluded_noaccess_fields: surface.excluded_noaccess,
+            // The read phase drives nothing, so it excludes nothing on that
+            // account; the drive denominator is the monitor phases' to state.
+            excluded_undrivable_val: Vec::new(),
         },
         channel_coverage: Coverage {
             enumerated: surface.denominator(),

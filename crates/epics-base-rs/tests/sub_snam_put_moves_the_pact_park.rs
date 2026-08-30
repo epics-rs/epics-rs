@@ -37,7 +37,7 @@
 use epics_base_rs::server::ioc_builder::IocBuilder;
 use epics_base_rs::types::EpicsValue;
 use std::collections::{HashMap, HashSet};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 const DB: &str = r#"
 record(sub, "BARE") { }
@@ -191,4 +191,102 @@ async fn a_put_to_an_unrelated_field_does_not_disturb_the_park() {
         .await
         .unwrap();
     assert_eq!(pact(&db, "BARE"), 1, "DESC is not a park field");
+}
+
+/// `epicsPrintf` is `errlogPrintf` (`errlog.h:90`), so the line lands on the
+/// errlog and not on stderr. Registered before `build()` and drained after it,
+/// so an init-time emitter — the same line from `subRecord.c:120`, which is a
+/// different function on a different branch — cannot be mistaken for the
+/// put-time one these tests are about.
+fn listen() -> Arc<Mutex<Vec<String>>> {
+    let heard = Arc::new(Mutex::new(Vec::new()));
+    let sink = Arc::clone(&heard);
+    epics_base_rs::runtime::log::errlog_add_listener(move |m| {
+        sink.lock().expect("sink").push(m.to_string());
+    });
+    heard
+}
+
+fn heard(sink: &Arc<Mutex<Vec<String>>>) -> String {
+    epics_base_rs::runtime::log::errlog_flush();
+    sink.lock().expect("sink").join("")
+}
+
+fn forget(sink: &Arc<Mutex<Vec<String>>>) {
+    epics_base_rs::runtime::log::errlog_flush();
+    sink.lock().expect("sink").clear();
+}
+
+/// Boundary: named -> empty, the arm C prints from. `subRecord.c:182-186` is
+/// one block — `epicsPrintf`, then `pact = TRUE` — so the record that parks is
+/// the record that must say why, with the record's own name and a trailing
+/// newline exactly as `"%s.SNAM is empty\n"` renders it.
+#[epics_macros_rs::epics_test]
+async fn emptying_a_running_subs_snam_says_why_it_parked() {
+    let sink = listen();
+    let db = build().await;
+    forget(&sink);
+
+    put_snam(&db, "NAMED", "").await.unwrap();
+
+    assert_eq!(pact(&db, "NAMED"), 1, "the park half");
+    assert_eq!(
+        heard(&sink),
+        "NAMED.SNAM is empty\n",
+        "subRecord.c:183, verbatim and once"
+    );
+}
+
+/// Boundary: empty -> empty. Pass 0 released the park and pass 1 re-took it, so
+/// C runs the whole block again and prints again — a no-op put is not a silent
+/// one.
+#[epics_macros_rs::epics_test]
+async fn re_emptying_an_already_parked_sub_says_it_again() {
+    let sink = listen();
+    let db = build().await;
+    forget(&sink);
+
+    put_snam(&db, "BARE", "").await.unwrap();
+
+    assert_eq!(heard(&sink), "BARE.SNAM is empty\n");
+}
+
+/// Boundary: empty -> named, the arm C does NOT print from — it falls through
+/// to `registryFunctionFind` (`subRecord.c:188`).
+#[epics_macros_rs::epics_test]
+async fn naming_a_parked_sub_says_nothing() {
+    let sink = listen();
+    let db = build().await;
+    forget(&sink);
+
+    put_snam(&db, "BARE", "bump").await.unwrap();
+
+    assert_eq!(heard(&sink), "", "a released park has nothing to report");
+}
+
+/// Boundary: the other record whose `special()` reaches an empty subroutine
+/// name. `aSubRecord.c:560-561` sets `pfunc = 0` and returns 0 — no line, no
+/// park — so the line must be the parking record's, not every SNAM's.
+#[epics_macros_rs::epics_test]
+async fn emptying_an_asubs_snam_says_nothing() {
+    let sink = listen();
+    let db = IocBuilder::new()
+        .register_subroutine("bump", step(1.0))
+        .db_string(
+            "record(aSub, \"ASUB\") { field(SNAM, \"bump\") field(LFLG, \"IGNORE\") }",
+            &HashMap::new(),
+        )
+        .unwrap()
+        .build()
+        .await
+        .unwrap()
+        .0;
+    forget(&sink);
+
+    db.put_record_field_from_ca_no_notify("ASUB", "SNAM", EpicsValue::String("".into()))
+        .await
+        .unwrap();
+
+    assert_eq!(pact(&db, "ASUB"), 0, "aSub never parks");
+    assert_eq!(heard(&sink), "", "and never reports");
 }

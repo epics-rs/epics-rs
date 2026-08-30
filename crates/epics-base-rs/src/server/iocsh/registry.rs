@@ -399,12 +399,28 @@ impl CommandRegistry {
     }
 }
 
-/// Tokenize a command line supporting both C++ EPICS and space-separated syntax.
+/// Break a command line into words the way C `split()` does
+/// (`iocsh.cpp:255-376`).
 ///
-/// C++ syntax: `command("arg1", arg2, $(VAR))` — parens delimit args, commas separate.
-/// Blanks between the name and `(` are insignificant, as in C's uniform
-/// separator set (iocsh.cpp:271).
-/// Legacy syntax: `command "arg1" arg2` — whitespace separates.
+/// C has ONE separator set — `strchr(" \t(),\r", c)` (`:271`) — and no
+/// notion of two syntaxes: `cmd(a, b)`, `cmd (a, b)` and `cmd a b` are
+/// the same line to it, and a `)` or a `,` anywhere outside a quote ends
+/// a word wherever it appears. Deciding between a "call" and a "legacy"
+/// shape first, and then giving each its own splitter, is what made
+/// `dbl)` an unregistered command and `dbl , ai` a three-token line here
+/// while C ran both.
+///
+/// Quotes are removed wherever they appear rather than stripped from the
+/// ends afterwards, so `echo(a"b"c)` is the one token `abc` (measured),
+/// and a backslash is special only OUTSIDE a quote — inside one it is
+/// ordinary data, which is why `epicsEnvSet X "a\\b"` sets two
+/// backslashes and `epicsEnvSet X "hello \"world\""` is an unbalanced
+/// quote rather than an escaped one (both measured).
+///
+/// The state behind all of that is [`ShellScan`], the same instance
+/// shape [`lint_line`] and [`super::parse_redirect`] run: C keeps one
+/// `quote`/`backslash` pair and answers every question from it, so a
+/// second implementation here could only disagree with them.
 ///
 /// C parity (`iocsh.cpp:1184` `macDefExpand` → `:1215` `tokenize.split`):
 /// macros are expanded across the WHOLE line *before* it is split into
@@ -415,252 +431,48 @@ impl CommandRegistry {
 /// ([`super::IocShell::execute_line`]) owns that one expansion; this
 /// function must not perform a second one.
 pub(crate) fn tokenize(line: &str) -> Vec<String> {
-    let line = line.trim();
-    if line.is_empty() {
-        return Vec::new();
-    }
+    // Only ASCII bytes can be a separator, a quote or an escape, and
+    // every byte of a multi-byte character is >= 0x80, so one such byte
+    // stands for the whole character: classifying per character reaches
+    // the same words C reaches per byte, without ever cutting a token
+    // inside a UTF-8 sequence.
+    const NON_ASCII: u8 = 0x80;
 
-    // Find the command name: everything up to first '(' or whitespace.
-    let cmd_end = line.find([' ', '\t', '(']).unwrap_or(line.len());
-    let cmd_name = &line[..cmd_end];
-    if cmd_name.is_empty() {
-        return Vec::new();
-    }
+    let mut tokens: Vec<String> = Vec::new();
+    let mut current = String::new();
+    let mut inword = false;
+    let mut scan = ShellScan::default();
 
-    // The whole line was expanded once by the caller, so the tokens are
-    // pushed verbatim (no per-token substitution).
-    let mut tokens = vec![cmd_name.to_string()];
-
-    // C `split()` has one uniform separator set — `strchr(" \t(),\r", c)`
-    // (iocsh.cpp:271) — so blanks between the command name and its `(`
-    // carry no meaning there: `cmd (args)` and `cmd(args)` tokenize
-    // identically. Skip them before deciding which syntax this line uses,
-    // instead of letting a space win the race against the paren.
-    let rest = &line[cmd_end..];
-    if let Some(call_args) = rest.trim_start_matches([' ', '\t']).strip_prefix('(') {
-        // C++ syntax: command(arg1, arg2, ...)
-        let paren_end = find_closing_paren(call_args);
-        let args_str = &call_args[..paren_end];
-
-        if !args_str.trim().is_empty() {
-            for arg in split_comma_args(args_str) {
-                tokens.push(arg);
+    for ch in line.chars() {
+        let byte = if ch.is_ascii() { ch as u8 } else { NON_ASCII };
+        match scan.feed(byte) {
+            // C `:275-278` `continue`s past the word builder, so the
+            // backslash neither starts a word nor ends one.
+            SplitRole::Escape => {}
+            // C `:312-317`: a separator closes an open word and, when
+            // none is open (`:331`), is simply skipped — which is why a
+            // run of them yields no empty tokens.
+            SplitRole::Separator => {
+                if inword {
+                    tokens.push(std::mem::take(&mut current));
+                    inword = false;
+                }
+            }
+            // C `:345-346` writes nothing for the quote itself, but the
+            // word has begun: `epicsEnvSet X ""` passes an empty token,
+            // not an absent one.
+            SplitRole::Quote => inword = true,
+            SplitRole::Data => {
+                current.push(ch);
+                inword = true;
             }
         }
-    } else {
-        // Legacy space-separated syntax
-        for arg in split_space_args(rest) {
-            tokens.push(arg);
-        }
     }
-
+    // C `:353-354` terminates the word the end of the line leaves open.
+    if inword {
+        tokens.push(current);
+    }
     tokens
-}
-
-/// Find the closing ')' in a string, respecting quoted strings, `$(...)`
-/// macro references, and `${...}` macro references (which C macLib treats
-/// equivalently — see macCore.c:777). A `)` inside a `${...}` body (e.g.
-/// `${foo(bar)}`) must NOT be mistaken for the outer call's closing paren.
-/// Returns the byte offset of ')' or the string length if not found.
-///
-/// Quoting and escaping follow the same rules as `lint_line` and the
-/// splitters, so the three scanners agree on where the call ends: both
-/// `"` and `'` quote, and a backslash escapes the next character in and
-/// out of quotes (C split(), measured: `echo(a\))` prints `a)`,
-/// `echo('a)b')` prints `a)b`).
-fn find_closing_paren(s: &str) -> usize {
-    // `0` = not in a quote; otherwise the opening quote byte.
-    let mut quote = 0u8;
-    let bytes = s.as_bytes();
-    let mut i = 0;
-    while i < bytes.len() {
-        let ch = bytes[i];
-        if ch == b'\\' {
-            i += 2; // skip the escaped char too
-            continue;
-        }
-        if quote != 0 {
-            if ch == quote {
-                quote = 0;
-            }
-        } else if ch == b'"' || ch == b'\'' {
-            quote = ch;
-        } else if ch == b'$' && i + 1 < bytes.len() && bytes[i + 1] == b'(' {
-            // Skip $(...) — find the matching ')' for the macro ref
-            if let Some(end) = bytes[i + 2..].iter().position(|&c| c == b')') {
-                i += 2 + end + 1; // skip past the macro's ')'
-                continue;
-            }
-        } else if ch == b'$' && i + 1 < bytes.len() && bytes[i + 1] == b'{' {
-            // Skip ${...} — find the matching '}' for the macro ref so any
-            // ')' inside the macro body doesn't terminate the outer call.
-            if let Some(end) = bytes[i + 2..].iter().position(|&c| c == b'}') {
-                i += 2 + end + 1; // skip past the macro's '}'
-                continue;
-            }
-        } else if ch == b')' {
-            return i;
-        }
-        i += 1;
-    }
-    s.len()
-}
-
-/// Split comma-separated arguments, respecting quoted strings.
-/// Trims whitespace around each argument and strips outer quotes.
-///
-/// both `"` and `'` open a quoted string; the quote is closed
-/// only by the *same* character it was opened with — matching C
-/// `iocsh.cpp` `split()` (`if ((c == '"') || (c == '\'')) quote = c;`).
-/// Outside a quote a backslash consumes itself and takes the next
-/// character literally (`iocsh.cpp:275-278,326`): `\,` does not split,
-/// `\"` does not open a quote. Escapes are interpreted in the first
-/// pass, exactly once; the second pass only trims and strips the outer
-/// quotes of a part whose first non-blank character was a *functional*
-/// quote — an escape-produced quote is data and stays. (The previous
-/// shape re-ran escape processing in the second pass, collapsing
-/// `"a\\\\b"` twice.)
-fn split_comma_args(s: &str) -> Vec<String> {
-    // First, split on commas respecting quoted strings. `opens_quoted`
-    // remembers whether the part's first non-blank char was a functional
-    // opening quote — the only parts the second pass may strip.
-    let mut raw_parts: Vec<(String, bool)> = Vec::new();
-    let mut current = String::new();
-    let mut opens_quoted = false;
-    // `0` = not in a quote; otherwise the opening quote char.
-    let mut quote: char = '\0';
-    let mut chars = s.chars().peekable();
-
-    while let Some(ch) = chars.next() {
-        if quote != '\0' {
-            if ch == '\\' {
-                if let Some(&next) = chars.peek() {
-                    match next {
-                        '"' | '\'' | '\\' => {
-                            current.push(chars.next().unwrap());
-                        }
-                        _ => {
-                            current.push(ch);
-                        }
-                    }
-                } else {
-                    current.push(ch);
-                }
-            } else if ch == quote {
-                quote = '\0';
-                current.push(ch);
-            } else {
-                current.push(ch);
-            }
-        } else if ch == '\\' {
-            // C split() outside a quote: the backslash is consumed and
-            // the next character is literal — it neither splits nor
-            // opens a quote. A trailing backslash is lint_line's
-            // "Trailing backslash." and never gets here.
-            if let Some(next) = chars.next() {
-                current.push(next);
-            }
-        } else if ch == '"' || ch == '\'' {
-            if current.chars().all(char::is_whitespace) {
-                opens_quoted = true;
-            }
-            quote = ch;
-            current.push(ch);
-        } else if ch == ',' {
-            raw_parts.push((std::mem::take(&mut current), opens_quoted));
-            opens_quoted = false;
-        } else {
-            current.push(ch);
-        }
-    }
-    raw_parts.push((current, opens_quoted));
-
-    // Now process each part: trim whitespace, then strip outer quotes.
-    let mut args = Vec::new();
-    for (part, opens_quoted) in raw_parts {
-        let trimmed = part.trim();
-        if trimmed.is_empty() && args.is_empty() {
-            continue; // skip leading empty
-        }
-        let outer_quote = trimmed
-            .chars()
-            .next()
-            .filter(|c| (*c == '"' || *c == '\'') && opens_quoted);
-        if let Some(q) = outer_quote {
-            if trimmed.len() >= 2 && trimmed.ends_with(q) {
-                args.push(trimmed[1..trimmed.len() - 1].to_string());
-                continue;
-            }
-        }
-        args.push(trimmed.to_string());
-    }
-
-    args
-}
-
-/// Split space/tab separated arguments, respecting quoted strings.
-///
-/// both `"` and `'` delimit a quoted string; the quote is closed
-/// only by the matching character — mirrors C `iocsh.cpp` `split()`.
-/// Outside a quote a backslash consumes itself and takes the next
-/// character literally (`iocsh.cpp:275-278,326`): `echo \"hello\"`
-/// yields the token `"hello"`, `a\ b` is one token `a b`.
-fn split_space_args(s: &str) -> Vec<String> {
-    let mut args = Vec::new();
-    let mut current = String::new();
-    // `0` = not in a quote; otherwise the opening quote char.
-    let mut quote: char = '\0';
-    let mut has_token = false;
-    let mut chars = s.chars().peekable();
-
-    while let Some(ch) = chars.next() {
-        if quote != '\0' {
-            if ch == '\\' {
-                if let Some(&next) = chars.peek() {
-                    match next {
-                        '"' | '\'' | '\\' => {
-                            current.push(chars.next().unwrap());
-                        }
-                        _ => {
-                            current.push(ch);
-                        }
-                    }
-                } else {
-                    current.push(ch);
-                }
-            } else if ch == quote {
-                quote = '\0';
-            } else {
-                current.push(ch);
-            }
-        } else if ch == '\\' {
-            // C split() outside a quote: consume the backslash, take the
-            // next character literally — a `\"` is data, a `\ ` is not a
-            // separator. A trailing backslash is lint_line's
-            // "Trailing backslash." and never gets here.
-            if let Some(next) = chars.next() {
-                current.push(next);
-                has_token = true;
-            }
-        } else if ch == '"' || ch == '\'' {
-            quote = ch;
-            has_token = true;
-        } else if ch == ' ' || ch == '\t' {
-            if has_token {
-                args.push(std::mem::take(&mut current));
-                has_token = false;
-            }
-        } else {
-            current.push(ch);
-            has_token = true;
-        }
-    }
-
-    if has_token {
-        args.push(current);
-    }
-
-    args
 }
 
 /// Scan a command line for the malformed-input conditions C
@@ -707,31 +519,63 @@ pub(crate) struct ShellScan {
     backslash: bool,
 }
 
+/// What C `split()`'s word builder does with one byte, given the
+/// `quote`/`backslash` state before it (`iocsh.cpp:306-349`).
+pub(crate) enum SplitRole {
+    /// In C's separator set `" \t(),\r"` (`:271`) and not covered by a
+    /// quote or an escape: it closes an open word and starts none.
+    Separator,
+    /// The quote character that opened or closed a quoted run: consumed,
+    /// written to no token (`:345-346`, `:307-309`), but a word has
+    /// begun.
+    Quote,
+    /// The backslash that armed the escape (`:275-278`): consumed, and
+    /// it neither starts nor ends a word.
+    Escape,
+    /// Everything else, including any byte inside a quote and the one
+    /// byte an escape covers — appended to the current word.
+    Data,
+}
+
 impl ShellScan {
-    /// Feed the next byte and report whether it is SYNTAX — C's
-    /// `!quote && !backslash`. Quote characters, escapes and everything
-    /// they cover are data and answer `false`.
-    pub(crate) fn feed(&mut self, c: u8) -> bool {
+    /// C's `!quote && !backslash` (`:271`, `:273`, `:311`) for the byte
+    /// about to be fed — the gate every syntactic decision in `split()`
+    /// sits behind. Read it BEFORE [`Self::feed`] consumes the byte.
+    pub(crate) fn is_syntax(&self) -> bool {
+        self.quote == 0 && !self.backslash
+    }
+
+    /// Feed the next byte and report what C's loop does with it.
+    pub(crate) fn feed(&mut self, c: u8) -> SplitRole {
         if self.backslash {
+            // C `:325-327`: whatever it is, the escaped byte is data,
+            // and `:350` clears the flag.
             self.backslash = false;
-            return false;
+            return SplitRole::Data;
         }
         if self.quote != 0 {
+            // C `:307-309`: only the byte that opened the quote closes
+            // it. Everything else inside is data — a backslash included,
+            // because `:273` sits inside the `!quote` block and never
+            // arms one here.
             if c == self.quote {
                 self.quote = 0;
+                return SplitRole::Quote;
             }
-            return false;
+            return SplitRole::Data;
         }
         match c {
             b'\\' => {
                 self.backslash = true;
-                false
+                SplitRole::Escape
             }
             b'"' | b'\'' => {
                 self.quote = c;
-                false
+                SplitRole::Quote
             }
-            _ => true,
+            // C `:271`, in full and in order.
+            b' ' | b'\t' | b'(' | b')' | b',' | b'\r' => SplitRole::Separator,
+            _ => SplitRole::Data,
         }
     }
 
@@ -744,15 +588,32 @@ impl ShellScan {
     }
 }
 
+/// Why C `cvtArg` refused an `iocshArgInt` token. C has two sentences
+/// here and reaches them from two different conditions, so one error
+/// value cannot stand for both: [`IntArgError::OutOfRange`] is the arm
+/// where `strtol` AND the `strtoul` retry under it both set `ERANGE`
+/// (`iocsh.cpp:824-831`), and [`IntArgError::Invalid`] is the `*endp`
+/// arm below that (`:833-837`). C returns from the range arm before it
+/// ever looks at `*endp`, so trailing garbage cannot downgrade an
+/// out-of-range value to an invalid one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum IntArgError {
+    /// C `iocsh.cpp:833-837` — `strtol` left characters unconsumed.
+    Invalid,
+    /// C `iocsh.cpp:824-831` — the value fits neither `long` nor
+    /// `unsigned long`.
+    OutOfRange,
+}
+
 /// Parse an `iocshArgInt` token the way C `cvtArg` does
-/// (`iocsh.cpp:814-836`): `strtol(arg, &endp, 0)`. Base-0 means a
+/// (`iocsh.cpp:820-842`): `strtol(arg, &endp, 0)`. Base-0 means a
 /// `0x`/`0X` prefix is hex and a leading `0` is octal — so `dbpr REC 010`
 /// is 8, not 10, and `postEvent 0x10` is 16, not an error. On signed
 /// overflow C retries with `strtoul` (`0xFFFFFFFFFFFFFFFF` → the same
 /// bit pattern reinterpreted into the signed `long`), and an empty arg
 /// defaults to 0. Trailing non-numeric characters are rejected, matching
 /// C's `if (*endp)` "Invalid integer" check.
-pub(super) fn parse_iocsh_int(token: &str) -> Result<i64, ()> {
+pub(super) fn parse_iocsh_int(token: &str) -> Result<i64, IntArgError> {
     // C `if (arg && *arg)` — an empty token defaults to 0.
     if token.is_empty() {
         return Ok(0);
@@ -762,7 +623,7 @@ pub(super) fn parse_iocsh_int(token: &str) -> Result<i64, ()> {
     if s.is_empty() {
         // Whitespace-only: strtol converts nothing and leaves *endp set
         // → C reports "Invalid integer".
-        return Err(());
+        return Err(IntArgError::Invalid);
     }
     let (neg, body) = match s.as_bytes()[0] {
         b'-' => (true, &s[1..]),
@@ -770,7 +631,7 @@ pub(super) fn parse_iocsh_int(token: &str) -> Result<i64, ()> {
         _ => (false, s),
     };
     // Base-0 prefix detection on the unsigned magnitude.
-    let (radix, digits): (u32, &str) =
+    let (radix, rest): (u32, &str) =
         if let Some(hex) = body.strip_prefix("0x").or_else(|| body.strip_prefix("0X")) {
             (16, hex)
         } else if body.len() > 1 && body.starts_with('0') {
@@ -780,20 +641,96 @@ pub(super) fn parse_iocsh_int(token: &str) -> Result<i64, ()> {
         } else {
             (10, body)
         };
+    // `strtol` converts the LONGEST valid prefix and points `endp` at the
+    // first character it could not use, so the digit run and what follows
+    // it are two separate facts: the run alone decides `ERANGE`, the
+    // leftover alone decides `*endp`. Reading them as one — parsing the
+    // whole tail and calling any failure the same thing — is what made
+    // `99999999999999999999abc` "invalid" here where C calls it out of
+    // range.
+    let run_len = rest
+        .find(|c: char| !c.is_digit(radix))
+        .unwrap_or(rest.len());
+    let (digits, leftover) = rest.split_at(run_len);
     if digits.is_empty() {
-        // e.g. a bare sign, or `0x` with no hex digits.
-        return Err(());
+        // strtol converted nothing — a bare sign, `0x` with no hex digit,
+        // octal `08` — so `endp == arg` and C takes the `*endp` arm.
+        return Err(IntArgError::Invalid);
     }
     // Signed first; on overflow fall back to unsigned (C `strtol`
     // ERANGE → `strtoul`) and reinterpret the bit pattern into the
-    // signed result exactly as C stores it in `long ival`. An invalid
-    // digit fails both parses → error (matches C's `*endp` check, e.g.
-    // octal `08`).
+    // signed result exactly as C stores it in `long ival`. `digits` holds
+    // only characters valid for the radix, so the unsigned parse can fail
+    // for one reason: the magnitude does not fit.
     let parsed = match i64::from_str_radix(digits, radix) {
         Ok(v) => v,
-        Err(_) => u64::from_str_radix(digits, radix).map_err(|_| ())? as i64,
+        Err(_) => u64::from_str_radix(digits, radix).map_err(|_| IntArgError::OutOfRange)? as i64,
     };
+    if !leftover.is_empty() {
+        return Err(IntArgError::Invalid);
+    }
     Ok(if neg { parsed.wrapping_neg() } else { parsed })
+}
+
+/// C `epicsStrtod(s, &endp)` under the `*endp == '\0'` whole-token check
+/// both of its iocsh callers apply — `cvtArg`'s double arm
+/// (`iocsh.cpp:844-856`) and `varHandler`'s (`:1431-1442`). One owner
+/// here because C has one function: a second port could only disagree
+/// with this one about which arguments the shell accepts.
+///
+/// Rust's own `f64` parser takes the decimal, exponent, `inf` and `nan`
+/// spellings C's does, but not the C99 hex form — which glibc's `strtod`
+/// accepts, so C accepts it too. Measured on `bin/linux-x86_64/softIoc`
+/// (R7.0.10-146-g8f5015b663d764ad75df): `var seqDLYlimit 0x10` leaves
+/// the variable reading `double seqDLYlimit = 16`, `var seqDLYlimit
+/// 0x1p3` leaves it at 8, and `epicsThreadSleep 0x10` sleeps 16.32 s.
+/// The hex arm below is that form; every other spelling goes to Rust's
+/// parser.
+pub(super) fn epics_strtod_whole(token: &str) -> Option<f64> {
+    // C's `strtod` skips leading whitespace before it converts anything,
+    // so a quoted `" 1"` is 1 to C and must be here.
+    let s = token.trim_start();
+    if s.is_empty() {
+        return None;
+    }
+    let (neg, body) = match s.as_bytes()[0] {
+        b'-' => (true, &s[1..]),
+        b'+' => (false, &s[1..]),
+        _ => (false, s),
+    };
+    let Some(hex) = body.strip_prefix("0x").or_else(|| body.strip_prefix("0X")) else {
+        return s.parse::<f64>().ok();
+    };
+    let (digits, exponent) = match hex.split_once(['p', 'P']) {
+        Some((digits, exponent)) => (digits, Some(exponent)),
+        None => (hex, None),
+    };
+    let (int_part, frac_part) = digits.split_once('.').unwrap_or((digits, ""));
+    if int_part.is_empty() && frac_part.is_empty() {
+        // `0x` with no hex digit: C's `strtod` converts the leading `0`
+        // and leaves `endp` on the `x`, which the whole-token check
+        // rejects.
+        return None;
+    }
+    let mut value = 0.0f64;
+    for c in int_part.chars() {
+        value = value * 16.0 + f64::from(c.to_digit(16)?);
+    }
+    let mut scale = 1.0f64 / 16.0;
+    for c in frac_part.chars() {
+        value += f64::from(c.to_digit(16)?) * scale;
+        scale /= 16.0;
+    }
+    if let Some(exponent) = exponent {
+        // `p<exp>` is a power of TWO, and C wants at least one decimal
+        // digit after it — without one `strtod` stops before the `p` and
+        // the whole-token check refuses the argument. The clamp only
+        // saturates to the infinity and the zero C's `strtod` returns
+        // for an exponent that far out.
+        let exponent = exponent.parse::<i64>().ok()?.clamp(-4096, 4096) as i32;
+        value *= 2f64.powi(exponent);
+    }
+    Some(if neg { -value } else { value })
 }
 
 /// Parse tokens into argument values according to argument descriptors.
@@ -841,15 +778,23 @@ pub(crate) fn parse_args(tokens: &[String], descs: &[ArgDesc]) -> Result<Vec<Arg
             // into the same default as an absent one. Only a non-empty
             // token that fails to parse is an error.
             ArgType::Int | ArgType::Double if token.is_empty() => ArgValue::Missing,
-            ArgType::Int => parse_iocsh_int(token).map(ArgValue::Int).map_err(|_| {
-                format!(
-                    "argument '{}': expected integer, got '{}'",
-                    desc.name, token
-                )
-            })?,
-            ArgType::Double => token.parse::<f64>().map(ArgValue::Double).map_err(|_| {
-                format!("argument '{}': expected number, got '{}'", desc.name, token)
-            })?,
+            // The sentence is C's own, and quotes the offending VALUE and
+            // nothing else. C names no argument here: `cvtArg` is handed
+            // the `iocshArg` but reads only its `type`
+            // (`iocsh.cpp:813-819`), so the name never reaches the text.
+            // The frame `showError` puts around it — `ERROR <file> line
+            // <n>: ` — already says which line, and adding the parameter
+            // name is the only thing on this stream that stops a site
+            // script's grep from matching.
+            ArgType::Int => parse_iocsh_int(token)
+                .map(ArgValue::Int)
+                .map_err(|why| match why {
+                    IntArgError::OutOfRange => format!("Integer '{token}' out of range."),
+                    IntArgError::Invalid => format!("Invalid integer '{token}'."),
+                })?,
+            ArgType::Double => epics_strtod_whole(token)
+                .map(ArgValue::Double)
+                .ok_or_else(|| format!("Invalid double '{token}'."))?,
             // Handled above: an `Argv` parameter never reaches the
             // one-token path.
             ArgType::Argv => unreachable!(),
@@ -880,17 +825,32 @@ mod tests {
         );
     }
 
+    /// C arms the backslash inside `if (!quote && !backslash)`
+    /// (`iocsh.cpp:273-278`), so within a quoted run a backslash is
+    /// ordinary data and the very next byte still closes the quote if it
+    /// matches. Measured on `bin/linux-x86_64/softIoc`
+    /// (R7.0.10-146-g8f5015b663d764ad75df) through `epicsEnvSet` +
+    /// `epicsEnvShow`, which pass their argument on untranslated where
+    /// `echo` would run it through `dbTranslateEscape`:
+    /// `epicsEnvSet X "a\\b"` → `X=a\\b`, and
+    /// `epicsEnvSet("X", "a\\\\b")` → `X=a\\\\b`.
     #[test]
-    fn test_tokenize_escaped_quotes() {
-        assert_eq!(
-            tokenize(r#"cmd "hello \"world\"""#),
-            vec!["cmd", r#"hello "world""#]
-        );
+    fn a_backslash_inside_a_quote_is_data() {
+        assert_eq!(tokenize(r#"cmd "a\\b""#), vec!["cmd", r#"a\\b"#]);
+        assert_eq!(tokenize(r#"cmd("a\\\\b")"#), vec!["cmd", r#"a\\\\b"#]);
     }
 
+    /// The same rule read from the other side: `\"` inside a quoted run
+    /// does not escape the quote, so the quote closes there and the one
+    /// that follows `world` opens a run nothing closes. Measured —
+    /// `epicsEnvSet X "hello \"world\""` answers `ERROR u1.cmd line 1:
+    /// Unbalanced quote.` and sets nothing.
     #[test]
-    fn test_tokenize_escaped_backslash() {
-        assert_eq!(tokenize(r#"cmd "a\\b""#), vec!["cmd", r#"a\b"#]);
+    fn an_escaped_quote_inside_a_quote_leaves_the_line_unbalanced() {
+        assert_eq!(
+            lint_line(r#"cmd "hello \"world\"""#),
+            Some("Unbalanced quote.")
+        );
     }
 
     /// C split() outside a quote (iocsh.cpp:275-278,326): the backslash
@@ -917,14 +877,6 @@ mod tests {
         // passed them and the splitters then mis-parsed.
         assert_eq!(lint_line(r#"echo \"hello\""#), None);
         assert_eq!(lint_line(r#"echo(a\,b)"#), None);
-    }
-
-    /// Escapes are interpreted exactly once: the call splitter's second
-    /// pass no longer re-processes them, so an in-quote `\\\\` (four
-    /// backslashes in the script) yields two, not one.
-    #[test]
-    fn call_syntax_escapes_are_not_double_processed() {
-        assert_eq!(tokenize(r#"cmd("a\\\\b")"#), vec!["cmd", r#"a\\b"#]);
     }
 
     #[test]
@@ -990,6 +942,31 @@ mod tests {
             tokenize(r#"dbLoadRecords("path/to/file.db","P=SIM1:,R=cam1:")"#),
             vec!["dbLoadRecords", "path/to/file.db", "P=SIM1:,R=cam1:"]
         );
+    }
+
+    /// C has one separator set and applies it everywhere, so a `)` or a
+    /// `,` outside a quote ends a word wherever it stands — there is no
+    /// "call syntax" for it to be inside of. Measured on
+    /// `bin/linux-x86_64/softIoc` (R7.0.10-146-g8f5015b663d764ad75df),
+    /// each line its own script against an empty database: `dbl)` and
+    /// `dbl , ai` both print nothing and raise nothing, where this port
+    /// answered `Command 'dbl)' not registered.` and passed `,` as a
+    /// record type; `echo(a"b"c)` prints `abc`, so a quote is removed
+    /// wherever it sits and not merely stripped off the ends; and
+    /// `echo(a,,b)` prints `a`, so a run of separators yields no empty
+    /// argument between them.
+    #[test]
+    fn one_separator_set_applies_off_the_call_shape_too() {
+        assert_eq!(tokenize("dbl)"), vec!["dbl"]);
+        assert_eq!(tokenize("dbl )"), vec!["dbl"]);
+        assert_eq!(tokenize("dbl , ai"), vec!["dbl", "ai"]);
+        assert_eq!(tokenize(r#"echo(a"b"c)"#), vec!["echo", "abc"]);
+        assert_eq!(tokenize(r#"echo "a"b"c""#), vec!["echo", "abc"]);
+        assert_eq!(tokenize("echo(a,,b)"), vec!["echo", "a", "b"]);
+        // An opening quote begins a word even when it closes at once, so
+        // an empty argument stays distinguishable from an absent one —
+        // `cvtArg` keeps `""` and NULL apart (`iocsh.cpp:858-862`).
+        assert_eq!(tokenize(r#"cmd "" x"#), vec!["cmd", "", "x"]);
     }
 
     #[test]
@@ -1176,12 +1153,101 @@ mod tests {
         assert_eq!(parse_iocsh_int("0xFFFFFFFFFFFFFFFF"), Ok(-1));
         assert_eq!(parse_iocsh_int("18446744073709551615"), Ok(-1));
         // Errors: trailing garbage, invalid octal digit, bare/oversized.
-        assert!(parse_iocsh_int("10abc").is_err());
-        assert!(parse_iocsh_int("08").is_err());
-        assert!(parse_iocsh_int("0x").is_err());
-        assert!(parse_iocsh_int("0x1FFFFFFFFFFFFFFFF").is_err());
-        assert!(parse_iocsh_int("   ").is_err());
-        assert!(parse_iocsh_int("abc").is_err());
+        // Which of C's two sentences each one earns is the point — C
+        // returns from the `ERANGE` arm before the `*endp` check, so a
+        // magnitude that fits neither `long` nor `unsigned long` is out
+        // of range even when garbage follows it.
+        assert_eq!(parse_iocsh_int("10abc"), Err(IntArgError::Invalid));
+        assert_eq!(parse_iocsh_int("08"), Err(IntArgError::Invalid));
+        assert_eq!(parse_iocsh_int("0x"), Err(IntArgError::Invalid));
+        assert_eq!(parse_iocsh_int("   "), Err(IntArgError::Invalid));
+        assert_eq!(parse_iocsh_int("abc"), Err(IntArgError::Invalid));
+        assert_eq!(
+            parse_iocsh_int("0x1FFFFFFFFFFFFFFFF"),
+            Err(IntArgError::OutOfRange)
+        );
+        assert_eq!(
+            parse_iocsh_int("99999999999999999999"),
+            Err(IntArgError::OutOfRange)
+        );
+        assert_eq!(
+            parse_iocsh_int("99999999999999999999abc"),
+            Err(IntArgError::OutOfRange)
+        );
+        // `LONG_MIN` itself is in range for `strtol`, and reaches the
+        // same value here through the unsigned retry.
+        assert_eq!(parse_iocsh_int("-9223372036854775808"), Ok(i64::MIN));
+    }
+
+    /// C `cvtArg` quotes the offending VALUE and never the parameter
+    /// name, and its integer refusal has two distinct sentences
+    /// (`iocsh.cpp:824-831`, `:833-837`). Measured on
+    /// `bin/linux-x86_64/softIoc` (R7.0.10-146-g8f5015b663d764ad75df):
+    /// `dbpr A1 notanumber` → `ERROR c.cmd line 1: Invalid integer
+    /// 'notanumber'.`, `dbpr A1 99999999999999999999` → `ERROR c.cmd
+    /// line 1: Integer '99999999999999999999' out of range.`,
+    /// `epicsThreadSleep 0.1abc` → `ERROR c.cmd line 1: Invalid double
+    /// '0.1abc'.`
+    #[test]
+    fn numeric_refusals_are_cs_own_sentences() {
+        let int_desc = vec![ArgDesc {
+            name: "level",
+            arg_type: ArgType::Int,
+        }];
+        assert_eq!(
+            parse_args(&["notanumber".to_string()], &int_desc).unwrap_err(),
+            "Invalid integer 'notanumber'."
+        );
+        assert_eq!(
+            parse_args(&["99999999999999999999".to_string()], &int_desc).unwrap_err(),
+            "Integer '99999999999999999999' out of range."
+        );
+        let double_desc = vec![ArgDesc {
+            name: "seconds",
+            arg_type: ArgType::Double,
+        }];
+        assert_eq!(
+            parse_args(&["0.1abc".to_string()], &double_desc).unwrap_err(),
+            "Invalid double '0.1abc'."
+        );
+    }
+
+    /// `epicsStrtod` is glibc's `strtod` here, so C takes the C99 hex
+    /// form. Measured on `bin/linux-x86_64/softIoc`
+    /// (R7.0.10-146-g8f5015b663d764ad75df): `var seqDLYlimit 0x10` then
+    /// `var seqDLYlimit` prints `double seqDLYlimit = 16`, `0x1p3`
+    /// prints `8`, `inf` prints `inf`, and `epicsThreadSleep 0x10`
+    /// sleeps 16.32 s rather than raising `Invalid double '0x10'.`
+    #[test]
+    fn epics_strtod_takes_cs_hex_form() {
+        assert_eq!(epics_strtod_whole("0x10"), Some(16.0));
+        assert_eq!(epics_strtod_whole("0X10"), Some(16.0));
+        assert_eq!(epics_strtod_whole("0x1p3"), Some(8.0));
+        assert_eq!(epics_strtod_whole("-0x1.8p1"), Some(-3.0));
+        assert_eq!(epics_strtod_whole("0x.8"), Some(0.5));
+        assert_eq!(epics_strtod_whole("inf"), Some(f64::INFINITY));
+        assert!(epics_strtod_whole("nan").is_some_and(f64::is_nan));
+        // The decimal spellings are unchanged.
+        assert_eq!(epics_strtod_whole("0.5"), Some(0.5));
+        assert_eq!(epics_strtod_whole("1e3"), Some(1000.0));
+        assert_eq!(epics_strtod_whole(" 1"), Some(1.0));
+        // `strtod` stops where the token stops being a number, and the
+        // whole-token check then refuses it.
+        assert_eq!(epics_strtod_whole("0.1abc"), None);
+        assert_eq!(epics_strtod_whole("0x"), None);
+        assert_eq!(epics_strtod_whole("0x1p"), None);
+        assert_eq!(epics_strtod_whole("0x1g"), None);
+        assert_eq!(epics_strtod_whole(""), None);
+        // The one port serves both callers, so `var` agrees with the
+        // argument converter about what a double is.
+        let descs = vec![ArgDesc {
+            name: "seconds",
+            arg_type: ArgType::Double,
+        }];
+        assert!(matches!(
+            parse_args(&["0x10".to_string()], &descs).unwrap()[0],
+            ArgValue::Double(v) if v == 16.0
+        ));
     }
 
     #[test]

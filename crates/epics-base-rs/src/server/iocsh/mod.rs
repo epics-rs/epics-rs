@@ -15,6 +15,7 @@ pub(crate) mod misc_commands;
 mod queue_commands;
 pub mod registry;
 mod registry_commands;
+mod rtems_commands;
 mod time_commands;
 /// The iocsh *variable* table — C `iocshRegisterVariable`
 /// (`iocsh.cpp:715-765`). Public because a knob registered this way can
@@ -27,6 +28,12 @@ pub mod vars;
 /// grammar so cross-crate macLib consumers (QSRV `dbLoadGroup`) reuse it
 /// rather than duplicating a raw comma splitter.
 pub use commands::macro_defn_pairs;
+
+/// The RTEMS operator commands — C `iocshRegisterRTEMS`. Re-exported because
+/// an RTEMS IOC's `main` is the only caller: C registers them from the RTEMS
+/// boot path rather than from a registrar every IOC runs, so a hosted
+/// `softioc-rs` must not reach them.
+pub use rtems_commands::register_rtems_commands;
 
 /// Declare `registrar()` lines that a sibling crate's compiled-in feature
 /// set provides, so `dbDumpRegistrar` reports them beside this crate's own.
@@ -504,6 +511,14 @@ impl IocShell {
     /// Enter the scope of one nested script, refusing past
     /// [`MAX_SCRIPT_DEPTH`] so a self-including script errors out at the
     /// include line instead of overflowing the thread stack.
+    ///
+    /// A DELIBERATE divergence, and the only one on this path: C sets no
+    /// depth at all — `iocshBody` simply re-enters itself (`:1233`) until
+    /// the process runs out of file descriptors. Measured on
+    /// `bin/linux-x86_64/softIoc` (R7.0.10-146-g8f5015b663d764ad75df), a
+    /// chain of 400 scripts each including the next runs to the bottom
+    /// and writes nothing to stderr. Matching that would trade a named
+    /// refusal for a stack overflow, so the cap stays and says so.
     fn enter_script(&self, path: &str) -> Result<ScopeGuard<'_>, String> {
         let depth = self
             .scopes
@@ -539,7 +554,7 @@ impl IocShell {
     /// the pushed `iocshLoad` scope and the environment (`:1033` `pairs[]
     /// = {"", "environ", NULL, NULL}` → `FLAG_USE_ENVIRONMENT`,
     /// `macCore.c:130-133`, `:589-594`). `Err` is C's NULL return: macLib
-    /// reports the undefined macro (`macCore.c:911-916`) and
+    /// reports the undefined macro (`macCore.c:895-900`) and
     /// `iocsh.cpp:1184-1187` skips the line instead of running it with the
     /// placeholder text. The `.db` and ACF readers deliberately keep the
     /// lenient rule — `macCreateHandle(&h, NULL)` with a warning
@@ -570,7 +585,7 @@ impl IocShell {
         });
         // C `macDefExpand` returns `NULL` on ANY negative length, so a
         // recursive reference fails the line exactly as an undefined one
-        // does (`macCore.c:216-224`, `iocsh.cpp:1189-1192`).
+        // does (`macCore.c:216-224`, `iocsh.cpp:1184-1187`).
         (!expanded.errored()).then_some(expanded.text)
     }
 
@@ -890,7 +905,7 @@ impl IocShell {
         };
 
         // C `cvtArg` failing breaks out of the argument loop WITHOUT reaching
-        // the call (`:1284-1288`), so the `:1251` set stands.
+        // the call (`:1288-1291`), so the `:1251` set stands.
         let args = match parse_args(arg_tokens, &def.args) {
             Ok(args) => args,
             Err(e) => return (Err(e), Dispatch::Nothing),
@@ -1655,10 +1670,10 @@ fn format_show_error(source: Option<&SourceFile>, msg: &str, color: bool) -> Str
 /// A script failure, and whether the operator has been told about it.
 ///
 /// C's `iocshBody` prints every diagnostic where it happens — the open
-/// failure at `:1053-1058`, a line's at `:1189` through `showError`, the
-/// error reaction's at `:1127-1132` — and returns a bare -1, so its two
-/// callers (`<` at `:1233`, `iocshLoadCallFunc` at `:1494`) set a flag and
-/// print nothing. This port has one failure C cannot produce, the include
+/// failure at `:1053-1058`, a line's at `:1302-1303` through `showError`,
+/// the error reaction's at `:1122-1143` — and returns a bare -1, so its
+/// two callers (`<` at `:1233`, `iocshLoadCallFunc` at `:1494`) set a flag
+/// and print nothing. This port has one failure C cannot produce, the include
 /// depth cap, which nothing has printed; without this distinction a caller
 /// must either say every failure twice or swallow that one.
 enum ScriptFailure {
@@ -1802,6 +1817,17 @@ pub(crate) fn join_backslash_continuations(input: &str) -> Vec<(usize, String)> 
         }
     }
     if !current.is_empty() {
+        // A DELIBERATE divergence: C loses this line. `epicsReadline`
+        // accumulates into a buffer and, on EOF, does `free (line);
+        // return NULL;` without ever looking at how much it had
+        // (`epicsReadline.c:87-96`), so a script whose last line has no
+        // trailing newline runs every line but that one, silently.
+        // Measured on `bin/linux-x86_64/softIoc`
+        // (R7.0.10-146-g8f5015b663d764ad75df): a two-line script ending
+        // `epicsEnvShow A` with no `\n` echoes and runs only the first
+        // line; adding the newline runs both. Matching that would mean
+        // dropping an operator's command with no diagnostic anywhere, so
+        // the port runs it.
         out.push((start_line.unwrap_or(1), current));
     }
     out
@@ -1836,7 +1862,10 @@ fn parse_redirect(line: &str) -> (&str, Option<Redirect>) {
 
     let mut i = 0;
     while i < bytes.len() {
-        let syntax = scan.feed(bytes[i]);
+        // C computes the gate from the state BEFORE the byte, then lets
+        // the byte update it (`iocsh.cpp:271-273`).
+        let syntax = scan.is_syntax();
+        scan.feed(bytes[i]);
         match bytes[i] {
             b'>' if syntax => {
                 // C parity: if the char before `>` is a single ASCII
@@ -2074,7 +2103,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
 
         // `dbLoadTemplate` with an empty subFile diagnoses and returns
-        // (C `dbLoadTemplate.y:344-347`). The message is stderr, so `2>`
+        // (C `dbLoadTemplate.y:350-352`). The message is stderr, so `2>`
         // must capture it.
         let err = dir.path().join("err.txt");
         shell
@@ -2362,13 +2391,19 @@ mod tests {
     #[test]
     fn test_execute_line_missing_required_arg() {
         let shell = make_shell();
-        // Neither `dbgf` nor `dbpf` belongs here any more: C answers a
-        // missing name with its own usage line (`dbTest.c:358-361`,
-        // `:400-403`), so both registrations mark their arguments
-        // optional. `epicsEnvSet` still declares its two required,
-        // which is what this exercises.
+        // No command has "required" arguments as far as the shell is
+        // concerned: `cvtArg` defaults every absent one and returns
+        // success (`iocsh.cpp:809-812`), so a short line always reaches
+        // the body. `epicsEnvSet` is one whose body refuses, and it does
+        // so C's way — its own sentence on stderr plus
+        // `iocshSetError(-1)` (`libComRegister.c:142-146`), which is a
+        // failed line carrying no diagnostic for the shell to frame.
         let result = shell.execute_line("epicsEnvSet");
-        assert!(result.is_err());
+        assert!(
+            matches!(result, Ok(CommandOutcome::Failed)),
+            "the shell must neither refuse the line nor frame the body's \
+             sentence"
+        );
     }
 
     /// C `epicsEnvSet` clears the shell macro of the same name before
@@ -3417,9 +3452,15 @@ mod tests {
 
         // macros non-empty x env ref present x iocshLoad (and, through
         // the third line, x `<` include).
+        // The macro list has to be quoted: C's `split()` separates on
+        // `,` as readily as on a blank (`iocsh.cpp:271`), so the bare
+        // form hands `iocshLoad` only `PORT=L0` and the rest becomes a
+        // further argument it never reads. Measured — `iocshLoad
+        // inner2.cmd PORT=L0,SUBDIR=sub` leaves `$(SUBDIR)` undefined
+        // inside the loaded script, while the quoted form defines it.
         shell
             .execute_line(&format!(
-                "iocshLoad {} PORT=L0,SUBDIR=sub",
+                "iocshLoad {} \"PORT=L0,SUBDIR=sub\"",
                 script_token(&loaded)
             ))
             .expect("iocshLoad with macros must not break env references");
@@ -3480,7 +3521,7 @@ mod tests {
     }
 
     /// I-R3-2: an undefined macro makes `macDefExpand` return NULL
-    /// (`macCore.c:911-913` + `:220`, `macEnv.c:59-61`) and
+    /// (`macCore.c:895-896` + `:220`, `macEnv.c:59-61`) and
     /// `iocsh.cpp:1184-1187` skips the line entirely. The port passed
     /// `$(P)` through as literal text and ran the command, installing a
     /// four-character literal as the IOC prefix.
@@ -3798,9 +3839,9 @@ mod tests {
     /// script failure. Measured on `softIoc` R7.0.10-146 with
     /// `nosuchcmd` / `dbl` / `exit`: stderr carries
     /// `ERROR a.cmd line 1: Command 'nosuchcmd' not registered.`, `dbl`
-    /// runs, and the process exits 0 — C leaves `ret` at its `:1037`
-    /// zero because only the Break and Halt arms (`:1127`, `:1132`)
-    /// assign it.
+    /// runs, and the process exits 0 — C leaves `ret` at its
+    /// `iocsh.cpp:1037` zero because only the Break and Halt arms
+    /// (`:1127`, `:1132`) assign it.
     #[test]
     fn an_unregistered_command_does_not_fail_the_script() {
         let shell = make_shell();
@@ -4096,7 +4137,8 @@ mod tests {
             .expect("the halted shell must be a SUSPEND row, not an OK one");
         assert!(
             halted.show_line().ends_with(" SUSPEND"),
-            "C's STATE column reads SUSPEND (osdThreadExtra.c:48-52), got {:?}",
+            "C's STATE column reads SUSPEND \
+             (os/Linux/osdThreadExtra.c:49-54), got {:?}",
             halted.show_line()
         );
         assert!(halted.resume(), "epicsThreadResume must find it suspended");

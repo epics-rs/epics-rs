@@ -467,12 +467,39 @@ fn print_fields_list(ctx: &CommandContext, name: &str, fields: &[String]) {
     let mut line = String::from(name);
     let record = ctx.db().get_record(name);
     for field in fields {
+        // C asks `dbFindField` and then `dbGetString`, and nothing else. The
+        // port asked the RECORD for its own fields instead — `get_field`,
+        // which knows nothing of `dbCommon` — so every `dbl "" "DESC"`,
+        // `"SCAN"` and `"INP"` printed the bare separator C reserves for a
+        // field the type does not declare, and the fields it did know were
+        // rendered by Rust's `Display` rather than by C's static renderer:
+        // measured on `softIoc` R7.0.10-146, an unwritten `waveform.VAL` read
+        // `T:WF, "[]"` where C reads `T:WF, ""`.
         let value = record.as_ref().and_then(|rec| {
             let inst = rec.read();
-            inst.record
-                .get_field(field)
-                .map(|v| v.to_string())
-                .or_else(|| (field == "recordType").then(|| inst.record.record_type().to_string()))
+            if let Some(desc) = inst.field_desc(field) {
+                // `dbGetString`'s switch has no case for `DBF_NOACCESS`, so
+                // that class takes its `default: return(NULL)`
+                // (`dbStaticLib.c:2053`) and `printFieldsList` prints the
+                // empty string for it (`dbTest.c:145`).
+                if desc.no_access() {
+                    return Some(String::new());
+                }
+                return Some(
+                    inst.resolve_field(field)
+                        .map(|v| db_get_string(&inst, desc, &v))
+                        .unwrap_or_default(),
+                );
+            }
+            // A `DBF_NOACCESS` row this port carries by NAME alone — the
+            // `dbCommon` pointers, `RSET` and friends — still has a
+            // `dbFldDes` in C, so `dbFindField` finds it and the NULL above
+            // is what `dbGetString` answers.
+            if inst.resolves_noaccess_name(&field.to_ascii_uppercase()) {
+                return Some(String::new());
+            }
+            // C's one exception to `dbFindField` failing (`dbTest.c:135-137`).
+            (field == "recordType").then(|| inst.record.record_type().to_string())
         });
         match value {
             Some(v) => line.push_str(&format!(", \"{v}\"")),
@@ -566,7 +593,7 @@ fn cmd_dbl() -> CommandDef {
             };
 
             // C's `dbl` names no `dbIsAlias` filter, so the alias nodes in
-            // the type's list are listed with the records (`dbTest.c:180-185`)
+            // the type's list are listed with the records (`dbTest.c:182-188`)
             // — a site that builds its PV inventory with `dbl > pvlist` gets
             // the alias names its clients use.
             let nodes = db_nodes_type_major(ctx);
@@ -611,8 +638,8 @@ fn cmd_dbl() -> CommandDef {
 /// what keeps a multi-element array wrapping where C wraps it.
 ///
 /// `tab` is a parameter for the same reason it is one in C: `dbgf`
-/// passes 10 (`dbTest.c:512`) and `dbpr` passes 20 (`dbTest.c:444`),
-/// and those two are the only values C accepts (`dbTest.c:1287-1290`).
+/// passes 10 (`dbTest.c:377`) and `dbpr` passes 20 (`dbTest.c:442`),
+/// and those two are the only values C accepts (`dbTest.c:1286-1289`).
 struct TabBuffer {
     out: String,
     tab: usize,
@@ -834,8 +861,18 @@ fn printbuffer_elements(dbr: DbfCode, val: &EpicsValue) -> Vec<String> {
         (DbfCode::Enum, EpicsValue::Enum(v)) => vec![v.to_string()],
         (DbfCode::Enum, EpicsValue::EnumWithChoices { index, .. }) => vec![index.to_string()],
         (DbfCode::Enum, EpicsValue::EnumArray(v)) => v.iter().map(|e| e.to_string()).collect(),
-        _ => vec![format!("Bad DBR type {}", dbr as i16)],
+        _ => vec![bad_dbr_type_text(dbr)],
     }
+}
+
+/// C `printBuffer`'s `default:` arm (`dbTest.c:1147`).
+///
+/// The one arm of that switch that is NOT a loop over `no_elements` — a plain
+/// `sprintf(pmsg, "Bad DBR type %d", dbr_type)` — so it speaks even under a
+/// zero-element header. The codes it answers for are exactly those
+/// [`dbr_request`] has no row for.
+fn bad_dbr_type_text(dbr: DbfCode) -> String {
+    format!("Bad DBR type {}", dbr as i16)
 }
 
 /// One `printBuffer` block for a field read in a DBR type (`dbTest.c:984-1151`)
@@ -871,7 +908,7 @@ fn printbuffer_block(label: &str, dbr: DbfCode, val: &EpicsValue) -> Vec<String>
     )
 }
 
-/// One `printBuffer` value block (`dbTest.c:1140-1151`): the
+/// One `printBuffer` value block (`dbTest.c:984-1151`): the
 /// `DBF_<T>:` header, then either `failed.` or the element renderings,
 /// laid out through one tab buffer and flushed as one line.
 ///
@@ -881,8 +918,13 @@ fn printbuffer_block(label: &str, dbr: DbfCode, val: &EpicsValue) -> Vec<String>
 /// every type: the zero-element header is built as ONE message with
 /// `(empty)` appended (`strcat(pmsg, "(empty)")`, `dbTest.c:1144`) so
 /// the pair shares a single tab stop rather than being padded apart,
-/// and every element loop in the switch is bounded by `no_elements`,
-/// so `count == 0` prints no element text whatever `elements` holds.
+/// and every TYPED arm of the switch is a loop bounded by `no_elements`. That
+/// bound belongs to the arms, so the producers ([`printbuffer_elements`] and
+/// the callers that hand over a slice directly) supply exactly as many
+/// renderings as C would print and this prints whatever it is given. Gating on
+/// `count` here instead would also silence C's `default:` arm (`:1147`), which
+/// is a plain `sprintf` outside any loop and speaks under a zero-element
+/// header.
 fn printbuffer_lines(dbr: &str, count: usize, elements: Option<&[String]>) -> Vec<String> {
     let mut buf = TabBuffer::new(10);
     match count {
@@ -893,12 +935,11 @@ fn printbuffer_lines(dbr: &str, count: usize, elements: Option<&[String]>) -> Ve
     match elements {
         // `status != 0` prints `failed.` regardless of the count.
         None => buf.insert("failed."),
-        Some(values) if count > 0 => {
+        Some(values) => {
             for v in values {
                 buf.insert(v);
             }
         }
-        Some(_) => {}
     }
     buf.finish()
 }
@@ -943,6 +984,38 @@ fn dbgf_lines(ctx: &CommandContext, pname: &str, val: &EpicsValue) -> Vec<String
     native_readback_lines(DbfCode::String, &EpicsValue::String(text))
 }
 
+/// C `dbgf(pname)` (`dbTest.c:370-388`) once the name has resolved and the
+/// `lset` gate has passed — the read, and BOTH of its outcomes.
+///
+/// It is a function because C calls it from two places: `dbgf` itself, and the
+/// last statement of `dbpf`, which runs it whatever `dbPutField` returned
+/// (`dbTest.c:431-434`):
+///
+/// ```c
+///     status = dbPutField(&addr, dbrType, pvalue, n);
+///     free(array);
+///     dbgf(pname);
+///     return status;
+/// ```
+///
+/// The port had `dbpf` re-implement the successful half inline, so a put whose
+/// read-back then FAILED printed nothing where C prints the type header and
+/// `failed.` — `dbpf T:AI.RSET, "1"` on a `DBF_NOACCESS` field was silent on
+/// stdout against `softIoc` R7.0.10-146.
+fn dbgf_echo(ctx: &CommandContext, pname: &str) {
+    match ctx.db().get_pv(pname) {
+        Ok(val) => {
+            for line in dbgf_lines(ctx, pname, &val) {
+                ctx.println(&line);
+            }
+        }
+        // C `dbgf` returns 0 whatever `dbGetField` returned
+        // (`dbTest.c:388`): the failure is a printed line, not a failed
+        // command.
+        Err(_) => dbgf_failed(ctx, pname),
+    }
+}
+
 /// C `nameToAddr` (`dbTest.c:787-795`) — the one place every
 /// `dbTest.c` command reports a name it cannot resolve. C prints this
 /// line on stdout and the caller then returns -1 without printing
@@ -950,6 +1023,116 @@ fn dbgf_lines(ctx: &CommandContext, pname: &str, val: &EpicsValue) -> Vec<String
 /// error channel, which writes to stderr and prefixes `Error:`.
 fn print_pv_not_found(ctx: &CommandContext, pname: &str) {
     ctx.println(&format!("PV '{pname}' not found"));
+}
+
+/// C `nameToAddr` (`dbTest.c:787-795`) — the ONE resolution every `dbTest.c`
+/// command makes before it does anything else, and the only place the
+/// not-found line above is printed:
+///
+/// ```c
+/// static long nameToAddr(const char *pname, DBADDR *paddr)
+/// {
+///     long status = dbNameToAddr(pname, paddr);
+///     if (status) {
+///         printf("PV '%s' not found\n", pname);
+///     }
+///     return status;
+/// }
+/// ```
+///
+/// All seven callers — `dba` (`:96`), `dbgf` (`:363`), `dbpf` (`:405`),
+/// `dbpr` (`:451`), `dbtr` (`:475`), `dbtgf` (`:519`) and `dbtpf` (`:620`) —
+/// go through it, so they agree about what a name selects by construction.
+/// The port had seven spellings of the test instead, and measured against
+/// `softIoc` R7.0.10-146 on one `record(ai,"T:AI")` they disagreed in three
+/// directions at once:
+///
+/// * `dbpr` and `dbtr` asked `get_record(pname)` without splitting
+///   `<record>.<FIELD>`, so `dbpr T:AI.VAL` answered `PV 'T:AI.VAL' not
+///   found` where C printed the record;
+/// * `dba`, `dbpf` and `dbtgf` read "resolved but unreadable" as unresolved,
+///   so `dbpf T:AI.RSET` answered not-found where C reached `dbPutField` and
+///   printed `failed.`;
+/// * `dbtpf` asked only for the RECORD, so `dbtpf T:AI.NOSUCHFLD` printed
+///   twelve `Put as DBR_… Failed.` lines where C printed not-found.
+///
+/// `dbNameToAddr` resolves any field the `.dbd` DECLARES, `DBF_NOACCESS`
+/// ones included; a declared field's READ then fails later, inside `dbGet`.
+/// That distinction already has an owner in this port — `PvDatabase::get_pv`
+/// answers `ChannelNotFound` only for a name that does not resolve and
+/// `BadDbrType` for one that resolves and cannot be read — so this asks it
+/// and adds nothing of its own.
+///
+/// The record handle comes back beside the field because six of the seven
+/// callers need it, and C's `DBADDR` likewise carries `precord` and
+/// `pfldDes` together: a caller that re-looked-up the record could pick a
+/// different one than the name resolved to.
+fn name_to_addr(ctx: &CommandContext, pname: &str) -> Option<DbAddr> {
+    let (base, field) = parse_pv_name(pname);
+    let resolved = ctx
+        .db()
+        .get_record(base)
+        .filter(|_| !matches!(ctx.db().get_pv(pname), Err(CaError::ChannelNotFound(_))));
+    match resolved {
+        Some(rec) => {
+            let field = field.to_ascii_uppercase();
+            let fld_des = rec.read().field_desc(&field);
+            Some(DbAddr {
+                rec,
+                field,
+                fld_des,
+            })
+        }
+        None => {
+            print_pv_not_found(ctx, pname);
+            None
+        }
+    }
+}
+
+/// What [`name_to_addr`] resolved — the port's `DBADDR`, filled once and read
+/// by every `dbTest.c` command, never re-derived.
+///
+/// C's commands work this way because `dbNameToAddr` is the only thing that
+/// answers "does this name exist?": once it returns, `paddr->pfldDes` is
+/// present and `dbpr`, `dba`, `dbtgf` and the rest just read it. The port had
+/// the resolution in one place and the DESCRIPTOR in each caller, asked for
+/// with a second, narrower question — `field_desc`, `snapshot_for_field` —
+/// which is how a name that resolved could then be reported not-found:
+/// measured on `softIoc` R7.0.10-146, `dba T:AI.RSET` prints the descriptor
+/// block and `dbtgf T:AI.RSET` the option block plus twelve `failed.` lines,
+/// where this port printed nothing and `PV 'T:AI.RSET' not found`.
+struct DbAddr {
+    rec: Arc<parking_lot::RwLock<crate::server::record::RecordInstance>>,
+    /// C's `pfldDes->name`: uppercased, and `VAL` when the name carried no
+    /// dot.
+    field: String,
+    /// C's `paddr->pfldDes`, which is never null after `dbNameToAddr`.
+    ///
+    /// `None` here is the one shape C has no counterpart for: the `dbCommon`
+    /// `DBF_NOACCESS` internals this port carries by NAME only
+    /// (`RecordInstance::resolves_noaccess_name`). C has a `dbFldDes` for
+    /// every one of them; the generator carries a descriptor only for the
+    /// rows whose `extra(...)` names a plain scalar, so `RSET`, `MLOK`,
+    /// `MLIS`, `DSET`, `DPVT`, `RDES`, `LSET`, `ASP`, `PPN`, `PPNR`, `SPVT`
+    /// and `BKLNK` arrive with the name and nothing else. They are still
+    /// RESOLVED — the declaration is what C resolves against — so this is a
+    /// missing width, not a missing field.
+    fld_des: Option<&'static FieldDesc>,
+}
+
+impl DbAddr {
+    /// C's `paddr->field_type` and `paddr->dbr_field_type`.
+    ///
+    /// Every name-only row above is declared `DBF_NOACCESS` in `dbCommon.dbd`,
+    /// and `mapDBFToDBR` is the identity on it, so both words are
+    /// `DBF_NOACCESS` with no descriptor to consult.
+    fn types(&self, value: Option<&EpicsValue>) -> (DbfCode, DbfCode) {
+        match self.fld_des {
+            Some(fd) => field_addr_types(fd, value),
+            None => (DbfCode::NoAccess, DbfCode::NoAccess),
+        }
+    }
 }
 
 /// The byte width of one element of `code`, as C's `dbFldDes.size` carries
@@ -1068,19 +1251,11 @@ fn dbgf_failed(ctx: &CommandContext, pname: &str) {
 /// synthesised `DBF_STRING`/`SPC_ATTRIBUTE` descriptor (`dbStaticLib.c:1265-1272`).
 /// This port has no attribute table — that is the subject `dbPutAttribute` is
 /// still waiting on — so an attribute name reports not-found here.
-fn print_db_addr(ctx: &CommandContext, pname: &str) -> bool {
-    let (rec_name, field) = parse_pv_name(pname);
-    let Some(rec) = ctx.db().get_record(rec_name) else {
-        return false;
-    };
-    let field = if field.is_empty() { "VAL" } else { field };
-    let inst = rec.read();
-    let Some(fd) = inst.field_desc(field) else {
-        return false;
-    };
-
+fn print_db_addr(ctx: &CommandContext, addr: &DbAddr) {
+    let inst = addr.rec.read();
+    let field = addr.field.as_str();
     let value = inst.resolve_field(field);
-    let (field_type, dbr) = field_addr_types(fd, value.as_ref());
+    let (field_type, dbr) = addr.types(value.as_ref());
     // C: `no_elements = 1` (`dbAccess.c:635`), overwritten by `cvt_dbaddr`
     // with the CAPACITY for an array — `paddr->no_elements = prec->nelm`
     // (`waveformRecord.c::cvt_dbaddr`), never `NORD`. Reading the current
@@ -1093,11 +1268,17 @@ fn print_db_addr(ctx: &CommandContext, pname: &str) -> bool {
         .or_else(|| inst.record.get_field(field).map(|v| v.count()))
         .unwrap_or(1);
 
-    ctx.println(&format!(
-        "Record Address: {:p} Field Address: (none) Field Description: {:p}",
-        Arc::as_ptr(&rec),
-        fd as *const FieldDesc,
-    ));
+    match addr.fld_des {
+        Some(fd) => ctx.println(&format!(
+            "Record Address: {:p} Field Address: (none) Field Description: {:p}",
+            Arc::as_ptr(&addr.rec),
+            fd as *const FieldDesc,
+        )),
+        None => ctx.println(&format!(
+            "Record Address: {:p} Field Address: (none) Field Description: (none)",
+            Arc::as_ptr(&addr.rec),
+        )),
+    }
     ctx.println(&format!("   No Elements: {elements}"));
     ctx.println(&format!("   Record Type: {}", inst.record.record_type()));
     ctx.println(&format!(
@@ -1105,17 +1286,27 @@ fn print_db_addr(ctx: &CommandContext, pname: &str) -> bool {
         field_type as i16,
         field_type.name(),
     ));
-    match c_field_size(field_type, fd.size) {
+    match addr
+        .fld_des
+        .and_then(|fd| c_field_size(field_type, fd.size))
+    {
         Some(n) => ctx.println(&format!("    Field Size: {n}")),
         None => ctx.println("    Field Size: (none)"),
     }
-    ctx.println(&format!("       Special: {}", fd.special as i16));
+    // `special(SPC_NOMOD)` — the declaration every one of the name-only
+    // `DBF_NOACCESS` rows carries in `dbCommon.dbd` (`MLOK` :88, `MLIS` :95,
+    // `ASP` :192, `SPVT` :210, `RSET` :218, `DSET` :225, `RDES` :237,
+    // `LSET` :243, and so on), which is why C prints `Special: 1` for all of
+    // them. It is read off the `.dbd`, not inferred.
+    let special = addr
+        .fld_des
+        .map_or(Special::NoMod as i16, |fd| fd.special as i16);
+    ctx.println(&format!("       Special: {special}"));
     ctx.println(&format!(
         "DBR Field Type: {} = DBR_{}",
         dbr as i16,
         dbr.name(),
     ));
-    true
 }
 
 fn cmd_dba() -> CommandDef {
@@ -1136,13 +1327,13 @@ fn cmd_dba() -> CommandDef {
                     return Ok(CommandOutcome::Failed);
                 }
             };
-            // C `dbTest.c:96-97` -> `nameToAddr` (`:785-793`), which prints
-            // the not-found line itself and returns -1. `dba` has no
+            // C `dbTest.c:96-97` -> `nameToAddr`, which prints the
+            // not-found line itself and returns -1. `dba` has no
             // `dbt_requires_ioc_init` gate: C reads dbStatic only.
-            if !print_db_addr(ctx, name) {
-                print_pv_not_found(ctx, name);
+            let Some(addr) = name_to_addr(ctx, name) else {
                 return Ok(CommandOutcome::Failed);
-            }
+            };
+            print_db_addr(ctx, &addr);
             Ok(CommandOutcome::Continue)
         },
     )
@@ -1171,26 +1362,14 @@ fn cmd_dbgf() -> CommandDef {
             // `nameToAddr` cannot resolve. A field the record type DECLARES
             // resolves, and its read then fails inside `dbGetField`, which is
             // a different outcome and prints differently.
-            let got = ctx.db().get_pv(name);
-            if matches!(got, Err(CaError::ChannelNotFound(_))) {
-                print_pv_not_found(ctx, name);
+            if name_to_addr(ctx, name).is_none() {
                 return Ok(CommandOutcome::Failed);
             }
             // C tests `lset` only AFTER `nameToAddr` (`dbTest.c:366-368`).
             if !dbt_requires_ioc_init(ctx, "dbgf") {
                 return Ok(CommandOutcome::Failed);
             }
-            match got {
-                Ok(val) => {
-                    for line in dbgf_lines(ctx, name, &val) {
-                        ctx.println(&line);
-                    }
-                }
-                // C `dbgf` returns 0 whatever `dbGetField` returned
-                // (`dbTest.c:388`): the failure is a printed line, not a
-                // failed command.
-                Err(_) => dbgf_failed(ctx, name),
-            }
+            dbgf_echo(ctx, name);
             Ok(CommandOutcome::Continue)
         },
     )
@@ -1224,8 +1403,7 @@ fn cmd_dbpf() -> CommandDef {
 
             // C resolves the name before it puts (`dbTest.c:405-406`),
             // so an unknown PV never reaches `dbPutField`; C returns -1.
-            if ctx.db().get_pv(name).is_err() {
-                print_pv_not_found(ctx, name);
+            if name_to_addr(ctx, name).is_none() {
                 return Ok(CommandOutcome::Failed);
             }
             // C tests `lset` only AFTER `nameToAddr` (`dbTest.c:408-410`).
@@ -1356,14 +1534,18 @@ fn cmd_dbpf() -> CommandDef {
                 // typed error, and a token that is neither a number nor a valid
                 // choice is refused downstream by `put_string`/`bad_choice`
                 // rather than silently landing as index 0.
-                match dbf {
-                    crate::types::DbFieldType::Short | crate::types::DbFieldType::Enum => {
-                        EpicsValue::parse(dbf, value_str)
-                            .unwrap_or_else(|_| EpicsValue::String(value_str.trim().into()))
-                    }
-                    _ => EpicsValue::parse(dbf, value_str)
-                        .map_err(|e| format!("cannot parse '{value_str}' as {dbf:?}: {e}"))?,
-                }
+                //
+                // The fallback is not the menu arm's alone. C hands `dbpf`'s
+                // scalar text to `dbPutField` as `DBR_STRING` and never parses
+                // it itself (`dbTest.c:413`, `:431`), so text no conversion
+                // takes is a failed PUT — value unchanged, nothing printed by
+                // `dbpf`, and the closing `dbgf` still run. Parsing here and
+                // raising the error instead put `ERROR <file> line <n>: cannot
+                // parse 'notanumber' as Double` on stderr and skipped the
+                // read-back entirely, where `softIoc` R7.0.10-146 printed only
+                // `DBF_DOUBLE:         1.5`.
+                EpicsValue::parse(dbf, value_str)
+                    .unwrap_or_else(|_| EpicsValue::String(value_str.trim().into()))
             } else {
                 // No type info available, try as string
                 EpicsValue::String(value_str.clone().into())
@@ -1395,11 +1577,7 @@ fn cmd_dbpf() -> CommandDef {
             // `dbPutField` returned, so the read-back is that one
             // printer rather than a second rendering, and a rejected
             // put still shows the value the record kept.
-            if let Ok(val) = ctx.db().get_pv(name) {
-                for line in dbgf_lines(ctx, name, &val) {
-                    ctx.println(&line);
-                }
-            }
+            dbgf_echo(ctx, name);
 
             if put_failed {
                 Ok(CommandOutcome::Failed)
@@ -1414,9 +1592,9 @@ fn cmd_dbpf() -> CommandDef {
 /// dbStatic-side renderer, and the ONLY one its callers may use.
 ///
 /// C has two renderers for the same field and they disagree. This one answers
-/// `dbpr` (`dbTest.c:1198-1203`) and `dbReportDeviceConfig` (`:3629`, `:3637`,
-/// `:3641`, `:3645`); the other, `dbConvert`'s `DBR_STRING` path, answers
-/// `dbgf` and every link read, and is
+/// `dbpr` (`dbTest.c:1198-1203`) and `dbReportDeviceConfig`
+/// (`dbStaticLib.c:3621`, `:3632`, `:3638`, `:3645`, `:3649`); the other,
+/// `dbConvert`'s `DBR_STRING` path, answers `dbgf` and every link read, and is
 /// [`RecordInstance::field_as_dbr_string`](crate::server::record::RecordInstance::field_as_dbr_string).
 /// They part on the two enum edges (see [`dbpr_choice_text`]) and on every
 /// float: `realToString` here, `cvtDoubleToString` with the record's `PREC`
@@ -1891,12 +2069,14 @@ pub(super) fn dbpr_report(ctx: &CommandContext, name: &str, level: i32) -> bool 
     // without printing anything else (`dbTest.c:449-450`, `:789-791`).
     // `false` is that failure: `dbpr` turns it into its -1, and `dbtr`
     // ignores it exactly as C does (`dbTest.c:494-495`).
-    let rec = match ctx.db().get_record(name) {
-        Some(rec) => rec,
-        None => {
-            print_pv_not_found(ctx, name);
-            return false;
-        }
+    //
+    // The FIELD the name selected is resolved and then dropped, because
+    // that is what C does too: `dbpr` prints the whole record whatever
+    // field the address landed on, so `dbpr T:AI.DESC` and `dbpr T:AI`
+    // are the same report — but a field the record type does not declare
+    // still has to fail the resolution first.
+    let Some(DbAddr { rec, .. }) = name_to_addr(ctx, name) else {
+        return false;
     };
 
     // C `dbpr_report` (`dbTest.c:1156-1276`) walks the record
@@ -1913,6 +2093,17 @@ pub(super) fn dbpr_report(ctx: &CommandContext, name: &str, level: i32) -> bool 
         let aliases = ctx.db().aliases_for_record(&rec_name);
 
         let inst = rec.read();
+        // DELIBERATE NON-MATCH, measured at level 4: C's walk is over
+        // `papFldDes`, so it reaches the fourteen `dbCommon` `DBF_NOACCESS`
+        // internals too and prints `ASP : PTR (nil)`,
+        // `MLIS: ELL 0 [(nil) .. (nil)]`, `MLOK: 50 83 b8 61 03 58 00 00`,
+        // `DSET: PTR 0x7de2e55c3aa0` and the rest (`dbTest.c:1228-1266`).
+        // Every one of those is a C storage fact — a `void *` read at a struct
+        // offset, an `ELLLIST` header, a raw byte dump of an `epicsMutexId` —
+        // and this port carries those rows by NAME only, with no width and no
+        // pointer, so the walk below has nothing to print for them. They are
+        // resolvable and `dba` reports them ([`DbAddr::fld_des`]); what is
+        // absent is a value, not the field.
         let mut descs: Vec<&crate::server::record::FieldDesc> =
             crate::server::record::dbd_generated::DB_COMMON_FIELDS
                 .iter()
@@ -1987,7 +2178,7 @@ pub(super) fn dbpr_report(ctx: &CommandContext, name: &str, level: i32) -> bool 
     });
 
     // C `%-4s: %s` per field (`dbTest.c:1201-1203`), packed by
-    // `dbpr_msgOut` at tab stop 20 (`dbTest.c:444`).
+    // `dbpr_msgOut` at tab stop 20 (`dbTest.c:442`).
     let mut buf = TabBuffer::new(20);
     for (name, value) in &fields {
         buf.insert(&format!("{name:<4}: {value}"));
@@ -2084,7 +2275,7 @@ fn dbtgf_string_elements(
 }
 
 /// C `epicsTimeToStrftime(.., "%Y-%m-%d %H:%M:%S.%09f", ..)` as
-/// `printBuffer` calls it (`dbTest.c:1053-1057`). A stamp still at the
+/// `printBuffer` calls it (`dbTest.c:871-873`). A stamp still at the
 /// EPICS epoch is the uninitialized one and renders `<undefined>`
 /// (`epicsTime.cpp::strftime`).
 fn dbtgf_time_text(ts: crate::types::WallTime) -> String {
@@ -2115,9 +2306,9 @@ fn dbtgf_time_text(ts: crate::types::WallTime) -> String {
 /// rather than a format:
 ///
 /// * `dbAccessDefs.h:35-47` renumbered the option bits to insert
-///   `DBR_AMSG` (0x2) and `DBR_UTAG` (0x20), and `getOptions`
-///   (`dbAccess.c:336-360`) writes both payloads into the buffer —
-///   `DB_AMSG_SIZE` is 40 bytes. `printBuffer` (`dbTest.c:1000-1090`)
+///   `DBR_AMSG` (0x2) and `DBR_UTAG` (0x20), and `getOptions` writes
+///   both payloads into the buffer (`dbAccess.c:366-375`, `:408-416`)
+///   — `DB_AMSG_SIZE` is 40 bytes. `printBuffer` (`dbTest.c:827-983`)
 ///   was never given a step for either, so it reads `units`,
 ///   `precision`, `time` and every gr/ctrl/al block from the wrong
 ///   offset. Measured on `bin/linux-x86_64/softIoc`
@@ -2139,21 +2330,67 @@ fn dbtgf_time_text(ts: crate::types::WallTime) -> String {
 ///
 /// [`PropertySupport`]: crate::server::snapshot::PropertySupport
 fn dbtgf_option_lines(
+    inst: &crate::server::record::RecordInstance,
     field_type: DbfCode,
-    snap: &crate::server::snapshot::Snapshot,
+    snap: Option<&crate::server::snapshot::Snapshot>,
 ) -> Vec<String> {
     use crate::calc::engine::cvt::fmt_g;
 
-    let g = |v: f64| fmt_g(v, 6, false, false);
-    // C `(epicsInt32)` on the double limit (`dbAccess.c:373-374`), and
-    // `finite(x) ? (epicsInt32)x : 0` for the alarm limits (`:428-435`).
-    let l = |v: f64| -> i32 { if v.is_finite() { v as i32 } else { 0 } };
+    // Every limit reaches C's block as a plain `double` field of the record,
+    // which is 0.0 until something sets it. This port's `Snapshot` encodes
+    // "the record states no limit" as NaN, and that encoding has no C
+    // counterpart, so it is converted once here rather than left to leak into
+    // whichever of the six lines happens to read an unset field: measured on
+    // `softIoc` R7.0.10-146, `dbtgf T:AI.DESC` prints
+    // `alDouble: 0 < 0 .. 0 < 0` where this printed `nan < nan .. nan < nan`.
+    // C's own casts agree with the rule — `(epicsInt32)` on the graphic and
+    // control longs (`dbAccess.c:226-227`, `:266-267`) and
+    // `finite(x) ? (epicsInt32)x : 0` on the alarm longs (`:303-310`) — which
+    // is why the long lines were already right and only the double lines were
+    // not.
+    let finite = |v: f64| if v.is_finite() { v } else { 0.0 };
+    let g = move |v: f64| fmt_g(finite(v), 6, false, false);
+    let l = move |v: f64| -> i32 { finite(v) as i32 };
 
     let mut out = Vec::new();
-    out.push(format!(
-        "status = {}, severity = {}",
-        snap.alarm.status, snap.alarm.severity
-    ));
+    out.push(match snap {
+        Some(snap) => format!(
+            "status = {}, severity = {}",
+            snap.alarm.status, snap.alarm.severity
+        ),
+        // C's `getOptions` copies `DBR_STATUS` off `paddr->precord`
+        // (`dbAccess.c:196-206`) and never off the field, so an address with
+        // no value still reports the record's alarm.
+        None => format!(
+            "status = {}, severity = {}",
+            inst.common.stat, inst.common.sevr as u16
+        ),
+    });
+    let Some(snap) = snap else {
+        // C's remaining `getOptions` arms for an address whose field is
+        // neither numeric nor enum-like, measured on `softIoc` R7.0.10-146 as
+        // `dbtgf T:AI.RSET`: `units` stays a set option holding the empty
+        // string (`:213-232` clears the buffer for every non-float,
+        // non-integer class), `DBR_PRECISION` is cleared outright
+        // (`:234-247`), no record answers `get_enum_strs` off a
+        // `DBF_NOACCESS` address, and every limit falls to
+        // `recGblGetGraphicDouble`'s zeros because a record's
+        // `get_graphic_double` fills HOPR/LOPR only for `VAL`.
+        out.push("units = \"\"".to_string());
+        out.push("precision not returned".to_string());
+        out.push(format!(
+            "time = {}",
+            dbtgf_time_text(crate::types::WallTime::from(inst.common.time))
+        ));
+        out.push("enum strings not returned".to_string());
+        for name in ["gr", "ctrl"] {
+            out.push(format!("{name}Long: 0 .. 0"));
+            out.push(format!("{name}Double: 0 .. 0"));
+        }
+        out.push("alLong: 0 < 0 .. 0 < 0".to_string());
+        out.push("alDouble: 0 < 0 .. 0 < 0".to_string());
+        return out;
+    };
     match snap.units() {
         Some(u) => out.push(format!("units = \"{}\"", u.as_str_lossy())),
         None => out.push("units not returned".to_string()),
@@ -2162,12 +2399,21 @@ fn dbtgf_option_lines(
         Some(p) => out.push(format!("precision = {p}")),
         None => out.push("precision not returned".to_string()),
     }
-    // C prints `time = <undefined>` for EVERY field here, whatever the
-    // record's stamp is, because `printBuffer` walks past the `DBR_AMSG` and
-    // `DBR_UTAG` payloads it was never given a step for and reads `time` from
-    // the wrong offset. That is output C itself calls undefined, so this port
-    // prints the record's real stamp rather than reproduce the misread — the
-    // one line of this block that is deliberately not C's value.
+    // DELIBERATE NON-MATCH from here down, for one reason: `getOptions`
+    // (`dbAccess.c:191-311`) WRITES a `DBR_AMSG` and a `DBR_UTAG` payload that
+    // `printBuffer` (`dbTest.c:900-982`) has no step for, so every option C
+    // reads after the alarm words comes off an offset 48 bytes short. Measured
+    // on `softIoc` R7.0.10-146, `dbtgf T:AI.VAL` on an `ai` with `EGU=V`,
+    // `PREC=3`, `HOPR=10` prints `units = ""`, `precision = 0`,
+    // `grLong: 0 .. 0` and `alLong: 1076101120 < 0 .. 0 < 10` — the record's
+    // own numbers landing one field late. This port prints what `getOptions`
+    // put there, so `units`, `precision`, `time` and the six limit lines carry
+    // the record's values and C's do not. The blocks agree wherever the record
+    // states nothing, which is why `dbtgf T:AI.DESC` and `dbtgf T:AI.RSET`
+    // match byte for byte.
+    //
+    // `time` is the first line the skew reaches: C prints `<undefined>` for
+    // every field, whatever the record's stamp is.
     out.push(format!("time = {}", dbtgf_time_text(snap.timestamp)));
     // C `get_enum_strs` (`dbAccess.c:160-180`) reaches the record's
     // `get_enum_strs` / the field's menu ONLY for `paddr->field_type` in
@@ -2276,45 +2522,51 @@ fn cmd_dbtgf() -> CommandDef {
                     return Ok(CommandOutcome::Failed);
                 }
             };
-            let (base, field) = parse_pv_name(name);
-            let field = field.to_ascii_uppercase();
-            let Some(rec) = ctx.db().get_record(base) else {
-                print_pv_not_found(ctx, name);
+            let Some(addr) = name_to_addr(ctx, name) else {
                 return Ok(CommandOutcome::Failed);
             };
             if !dbt_requires_ioc_init(ctx, "dbtgf") {
                 return Ok(CommandOutcome::Failed);
             }
-            let Some((snap, class, native)) = ({
-                let inst = rec.read();
-                inst.snapshot_for_field(&field).map(|snap| {
-                    // C prints `addr.dbr_field_type` here with NO `DBR_STRING`
-                    // substitution — that is `dbgf`'s alone — so a menu field's
-                    // native line reads `DBF_ENUM`. The option block below is
-                    // decided by the other word, `addr.field_type`.
-                    let (class, dbr) = inst
-                        .field_desc(&field)
-                        .map_or((DbfCode::String, DbfCode::String), |fd| {
-                            field_addr_types(fd, Some(&snap.value))
-                        });
-                    (snap, class, dbr)
-                })
-            }) else {
-                print_pv_not_found(ctx, name);
-                return Ok(CommandOutcome::Failed);
-            };
+            // C prints `addr.dbr_field_type` here with NO `DBR_STRING`
+            // substitution — that is `dbgf`'s alone — so a menu field's
+            // native line reads `DBF_ENUM`. The option block below is decided
+            // by the other word, `addr.field_type`. Both come from the address
+            // `nameToAddr` already resolved: a name it accepted is never
+            // re-tried against a second, narrower question here, which is what
+            // made `dbtgf T:AI.RSET` answer not-found where C prints the block.
+            let inst = addr.rec.read();
+            let snap = inst.snapshot_for_field(&addr.field);
+            let (class, native) = addr.types(snap.as_ref().map(|s| &s.value));
 
-            for line in dbtgf_option_lines(class, &snap) {
+            for line in dbtgf_option_lines(&inst, class, snap.as_ref()) {
                 ctx.println(&line);
             }
             // C's first `dbGetField` asks for the native type with
-            // `no_elements = 0` (`dbTest.c:529-532`), so the native
-            // block is always the empty-array header.
-            for line in printbuffer_lines(native.name(), 0, Some(&[])) {
+            // `no_elements = 0` (`dbTest.c:529-532`), so every typed arm of
+            // `printBuffer`'s switch prints nothing under the header. The one
+            // code no arm answers takes the `default:` instead, which is not a
+            // loop and speaks under that same zero-element header.
+            let native_body = match dbr_request(native) {
+                Some(_) => Vec::new(),
+                None => vec![bad_dbr_type_text(native)],
+            };
+            for line in printbuffer_lines(native.name(), 0, Some(&native_body)) {
                 ctx.println(&line);
             }
             // C `long precision = 6` before it asks the record
-            // (`dbConvert.c:778-783`).
+            // (`dbConvert.c:778-784`).
+            let Some(snap) = snap else {
+                // Nothing to convert FROM: C's twelve `dbGetField` calls all
+                // land in `dbGet`'s validity gate and `printBuffer` prints the
+                // header and `failed.` for each (`dbTest.c:994-997`).
+                for (dbr, _) in DBTGF_REQUEST_TYPES {
+                    for line in printbuffer_lines(dbr, 1, None) {
+                        ctx.println(&line);
+                    }
+                }
+                return Ok(CommandOutcome::Continue);
+            };
             let precision = snap.precision().unwrap_or(6);
             for (dbr, target) in DBTGF_REQUEST_TYPES {
                 let float_string = (target == crate::types::DbFieldType::String)
@@ -2364,12 +2616,10 @@ fn cmd_dbtpf() -> CommandDef {
                     return Ok(CommandOutcome::Failed);
                 }
             };
-            let (base, field) = parse_pv_name(name);
-            let field = field.to_ascii_uppercase();
-            if ctx.db().get_record(base).is_none() {
-                print_pv_not_found(ctx, name);
+            let (base, _) = parse_pv_name(name);
+            let Some(DbAddr { field, .. }) = name_to_addr(ctx, name) else {
                 return Ok(CommandOutcome::Failed);
-            }
+            };
             if !dbt_requires_ioc_init(ctx, "dbtpf") {
                 return Ok(CommandOutcome::Failed);
             }
@@ -2617,7 +2867,7 @@ fn ca_dump_real_limits(limits: &[f64]) -> String {
 /// call `ca_dump_dbr` makes for every `DBR_TIME_*`.
 ///
 /// Six digits rather than [`dbtgf_time_text`]'s nine, and six is where
-/// `epicsTime.cpp:527-535` actually rounds: `frac = nsec + div[6]/2` with
+/// `epicsTime.cpp:234-239` actually rounds: `frac = nsec + div[6]/2` with
 /// `div[6] = 1000`, clamped below a whole second so the carry can never reach
 /// `%S`.
 fn ca_dump_time_stamp(ts: crate::types::WallTime) -> String {
@@ -2641,13 +2891,13 @@ fn ca_dump_time_stamp(ts: crate::types::WallTime) -> String {
 ///
 /// `value` is the reply's elements ALREADY converted to `dbr`'s family and
 /// `snap` is where its metadata comes from; C assembles the same two halves
-/// in `dbChannel_get` (`db_access.c:143-806`) and hands one packed struct
-/// here. Metadata a record type does not supply reads as zero, which is C's
-/// answer too — `getOptions` memsets the payload of every slot it has to turn
-/// off (`dbAccess.c:229-230`, `:376-393`).
+/// in `dbChannel_get_count` (`db_access.c:143-818`) and hands one packed
+/// struct here. Metadata a record type does not supply reads as zero, which
+/// is C's answer too — `getOptions` memsets the payload of every slot it has
+/// to turn off (`dbAccess.c:229-230`, `:376-393`).
 ///
 /// The returned text carries C's embedded newlines but not its final one; the
-/// caller's `println` is C's closing `printf("\n")` (`:586`).
+/// caller's `println` is C's closing `printf("\n")` (`test_event.cpp:586`).
 ///
 /// How many elements to print is a property of the REPLY, not a second
 /// argument: C has to pass a count because a C buffer has no length, and
@@ -2661,10 +2911,11 @@ fn ca_dump_time_stamp(ts: crate::types::WallTime) -> String {
 ///
 /// Three C oddities are reproduced rather than corrected, because they are
 /// what a user comparing the two IOCs sees: `DBR_STS_SHORT` prints a SIGNED
-/// short through `%u` (`:161`) where `DBR_TIME_SHORT` prints the same value
-/// through `%d` (`:262`); `DBR_CTRL_DOUBLE` prints its value with six decimals
-/// (`:561`) where every other real family prints four; and `DBR_STRING` stops
-/// at the first EMPTY element instead of at `count` (`:69`).
+/// short through `%u` (`test_event.cpp:163`) where `DBR_TIME_SHORT` prints
+/// the same value through `%d` (`:264`); `DBR_CTRL_DOUBLE` prints its value
+/// with six decimals (`:561`) where every other real family prints four; and
+/// `DBR_STRING` stops at the first EMPTY element instead of at `count`
+/// (`:69`).
 fn ca_dump_dbr(dbr: u16, snap: &crate::server::snapshot::Snapshot) -> String {
     use crate::types::{
         DBR_CHAR, DBR_CLASS_NAME, DBR_CTRL_CHAR, DBR_CTRL_DOUBLE, DBR_CTRL_ENUM, DBR_CTRL_FLOAT,
@@ -2691,10 +2942,11 @@ fn ca_dump_dbr(dbr: u16, snap: &crate::server::snapshot::Snapshot) -> String {
     // for the display and control pairs, which `get_graphics`/`get_control`
     // `memset` when the rset slot is NULL, and NaN for the alarm four, which
     // `get_alarm` leaves at its `struct dbr_alDouble ald` initialiser
-    // (`:294`, `:318-323`). Reading an absent alarm slot as zero here made
-    // `gft <bo> DBR_CTRL_DOUBLE` print four zeros where C prints four `nan`.
-    // Shared with the CA wire encoder rather than re-seeded, because two
-    // seeds for one C initialiser is how this diverged in the first place.
+    // (`dbAccess.c:294`, `:318-323`). Reading an absent alarm slot as zero
+    // here made `gft <bo> DBR_CTRL_DOUBLE` print four zeros where C prints
+    // four `nan`. Shared with the CA wire encoder rather than re-seeded,
+    // because two seeds for one C initialiser is how this diverged in the
+    // first place.
     let limits = crate::types::codec::get_limits(snap, 8);
     let int_limits = crate::types::codec::limits_as_integers(limits);
     let (lo_ctrl, hi_ctrl) = (limits[7], limits[6]);
@@ -2889,19 +3141,19 @@ struct CaChannel {
     field_size: Option<u16>,
     /// The precision `getDoubleString`/`getFloatString` render a `DBR_STRING`
     /// row with — the record's own `get_precision`, or C's initialiser 6 when
-    /// the record type has no such slot (`dbConvert.c:778-783`). This is NOT
+    /// the record type has no such slot (`dbConvert.c:778-784`). This is NOT
     /// the `DBR_PRECISION` option [`ca_dump_dbr`] prints, which `getOptions`
-    /// zeroes for a non-float field (`dbAccess.c:386-393`).
+    /// zeroes for a non-float field (`dbAccess.c:387-395`).
     string_precision: i16,
 }
 
 impl CaChannel {
-    /// C `dbChannel_create` (`dbChannel.c:395-421`) as `gft`/`pft` use it.
+    /// C `dbChannel_create` (`db_access.c:105-119`) as `gft`/`pft` use it.
     /// `None` is its NULL return, which both commands report as
     /// `Channel couldn't be created`.
     ///
     /// C reads `ACKT`/`ACKS` out of `dbCommon` on the same `DBRstatus` option
-    /// every reply carries (`dbAccess.c:336-345`), so `DBR_STSACK_STRING` sees
+    /// every reply carries (`dbAccess.c:352-365`), so `DBR_STSACK_STRING` sees
     /// them. The port's `Snapshot` leaves them `None` on the GET path, so they
     /// are filled from the record here rather than defaulted to zero.
     fn create(ctx: &CommandContext, pname: &str) -> Option<Self> {
@@ -3222,7 +3474,7 @@ fn cmd_pft() -> CommandDef {
                 }
                 chan.refresh(ctx);
                 // C `pft` asks for one element on every rung
-                // (`db_test.c:122-193`).
+                // (`db_test.c:123-181`).
                 match chan.get(dbr, 1) {
                     None => out.push_str(get_failed),
                     Some(reply) => {
@@ -3352,8 +3604,7 @@ fn cmd_dbtr() -> CommandDef {
                 }
             };
             let (base, _) = parse_pv_name(name);
-            let Some(rec) = ctx.db().get_record(base) else {
-                print_pv_not_found(ctx, name);
+            let Some(DbAddr { rec, .. }) = name_to_addr(ctx, name) else {
                 return Ok(CommandOutcome::Failed);
             };
             if !dbt_requires_ioc_init(ctx, "dbtr") {
@@ -3493,21 +3744,22 @@ fn jlink_report_lines(raw: &str, level: i32, indent: usize) -> Vec<String> {
 /// This port has the driver half. Two differences, both structural rather than
 /// elective:
 ///
-/// * C's `No driver entry table is present for %s` (`:733-736`) cannot happen
-///   here. It is what a `.dbd` `driver(drvXxx)` declaration prints when nothing
-///   registered `drvXxx`'s entry table, and this port has no run-time `.dbd`
-///   load to declare a name without one — see
+/// * C's `No driver entry table is present for %s` (`dbTest.c:733-736`)
+///   cannot happen here. It is what a `.dbd` `driver(drvXxx)` declaration
+///   prints when nothing registered `drvXxx`'s entry table, and this port has
+///   no run-time `.dbd` load to declare a name without one — see
 ///   [`crate::server::driver_support`].
-/// * The DEVICE-support half (`:746-768`) is absent. C walks each record type's
-///   `devList` and calls `pdset->report(level)` once per (record type, device
-///   support name), because a `dset` is one static table shared by every record
-///   of that DTYP. The port has no such object: device support is a
-///   `DeviceSupportFactory` that mints a fresh instance PER RECORD
-///   (`ioc_builder.rs:119`), so there is nothing to call `report` on once per
-///   record type, and calling it per record would be a different report.
+/// * The DEVICE-support half (`dbTest.c:746-768`) is absent. C walks each
+///   record type's `devList` and calls `pdset->report(level)` once per
+///   (record type, device support name), because a `dset` is one static table
+///   shared by every record of that DTYP. The port has no such object: device
+///   support is a `DeviceSupportFactory` that mints a fresh instance PER
+///   RECORD (`ioc_builder.rs:119`), so there is nothing to call `report` on
+///   once per record type, and calling it per record would be a different
+///   report.
 ///
-/// The `No database loaded` guard (`:715-718`) is likewise unreachable: a
-/// `CommandContext` always carries a database.
+/// The `No database loaded` guard (`dbTest.c:715-718`) is likewise
+/// unreachable: a `CommandContext` always carries a database.
 fn cmd_dbior() -> CommandDef {
     CommandDef::new(
         "dbior",
@@ -4226,8 +4478,8 @@ fn cmd_dbgrep() -> CommandDef {
 /// `scanIoInit` from device support. Before then C has nothing to walk, and
 /// each command says so in its own shape — `scanppl` prints
 /// `scanppl: dbScan subsystem not initialized` and returns -1
-/// (`dbScan.c:388-392`), while `scanpel` (`:414-428`) and `scanpiol`
-/// (`:434-455`) walk an empty list, print nothing and return 0.
+/// (`dbScan.c:388-392`), while `scanpel` (`:411-428`) and `scanpiol`
+/// (`:430-453`) walk an empty list, print nothing and return 0.
 ///
 /// The port's three read the SCAN-field index instead, which exists from the
 /// moment the records load — so all three reported a scan subsystem that did
@@ -4862,40 +5114,16 @@ fn cmd_db_load_records() -> CommandDef {
                 _ => "",
             };
 
-            // C passes a hard `0` for the search path (`dbAccess.c:803`), so
-            // a `dbLoadRecords` list can only ever come from the environment.
+            // C says NOTHING on the success path: `dbLoadRecords` calls
+            // the (always-NULL in base) `dbLoadRecordsHook` and returns 0
+            // (`dbAccess.c:804-807`). A progress line here is output no C
+            // IOC produces, on the stream a startup script's own output
+            // shares. The failure path is [`db_load_records`], which owns
+            // the summary and has already written it.
             let mut faults = db_loader::DbFaults::default();
-            match db_read_database(ctx, path, "", macros_str, &mut faults) {
-                // C says NOTHING on the success path: `dbLoadRecords`
-                // calls the (always-NULL in base) `dbLoadRecordsHook` and
-                // returns 0 (`dbAccess.c:804-806`). A progress line here
-                // is output no C IOC produces, on the stream a startup
-                // script's own output shares.
+            match db_load_records(ctx, path, parse_macro_string(macros_str), &mut faults) {
                 Ok(()) => Ok(CommandOutcome::Continue),
-                // C `dbAccess.c:807-811`: the summary the command adds on
-                // top of whatever the read already reported, on every
-                // failure alike, and the second line only the load-phase
-                // refusal gets.
-                //
-                // ```text
-                // epics> iocInit
-                // epics> dbLoadRecords("b.db")
-                // ERROR: Failed to load 'b.db'
-                //     Records cannot be loaded after iocInit!
-                // ```
-                //
-                // Written HERE and answered with `Failed` rather than
-                // returned as `Err(...)`: C's `dbLoadRecords` prints its own
-                // summary and hands `iocshSetError` a bare status, so the
-                // shell adds nothing. Returning text made the shell print a
-                // second copy of a diagnostic the read had already written.
-                Err(failure) => {
-                    ctx.eprintln(&format!("{ERL_ERROR}: Failed to load '{path}'"));
-                    if matches!(failure, DbReadFailure::AfterIocInit) {
-                        ctx.eprintln("    Records cannot be loaded after iocInit!");
-                    }
-                    Ok(CommandOutcome::Failed)
-                }
+                Err(_) => Ok(CommandOutcome::Failed),
             }
         },
     )
@@ -5014,6 +5242,24 @@ fn db_read_database(
     substitutions: &str,
     faults: &mut db_loader::DbFaults,
 ) -> Result<(), DbReadFailure> {
+    db_read_database_macros(ctx, file, path, parse_macro_string(substitutions), faults)
+}
+
+/// [`db_read_database`] with C's `substitutions` string already parsed.
+///
+/// C only ever has the string — `dbLoadTemplate` builds `sub_collect` by
+/// `strcat` and hands the text to `dbLoadRecords` (`dbLoadTemplate.y:51`),
+/// which parses it again in `macParseDefns`. This port keeps a template
+/// row's substitutions in the structure the `.substitutions` parser already
+/// produced, so the round trip through a comma-joined string — and the
+/// quoting rules that make it lossless — never has to happen for real.
+fn db_read_database_macros(
+    ctx: &CommandContext,
+    file: &str,
+    path: &str,
+    macros: HashMap<String, String>,
+    faults: &mut db_loader::DbFaults,
+) -> Result<(), DbReadFailure> {
     // A load OPENS the load phase; it does not close it — the boundary a
     // record's links are classified against is `iocInit`, after EVERY load
     // in the `st.cmd`, so a forward reference to a record loaded by a later
@@ -5027,13 +5273,15 @@ fn db_read_database(
         return Err(DbReadFailure::AfterIocInit);
     }
 
-    let macros = parse_macro_string(substitutions);
-
-    // C installs the search path inside the read (`:245-253`), before the
-    // open, so a load that cannot find its file has still replaced the list
-    // `dbDumpPath` reports.
+    // C installs the search path inside the read
+    // (`dbLexRoutines.c:245-253`), before the open, so a load that cannot
+    // find its file has still replaced the list `dbDumpPath` reports.
     let (config, file_path) = resolve_db_file(file, path);
     let Some(file_path) = file_path else {
+        // The name the caller wrote, deliberately, where C prints
+        // `macEnvExpand`'s result (`dbLexRoutines.c:274-286`) and so prints
+        // `'(null)'` for exactly the case an operator most needs named — a
+        // path built from a macro that was never defined.
         ctx.eprintln(&format!("{ERL_ERROR}: Can't open file '{file}'"));
         return Err(DbReadFailure::CannotOpen);
     };
@@ -5087,6 +5335,52 @@ fn db_read_database(
     ))?;
 
     Ok(())
+}
+
+/// C `dbLoadRecords` (`dbAccess.c:796-814`) past its `file == NULL` check:
+/// the read, and the SUMMARY C writes when the read failed.
+///
+/// The ONE owner of that summary. `dbLoadTemplate` does not reimplement a
+/// load — it calls `dbLoadRecords` once per row through `msiLoadRecords`
+/// (`dbLoadTemplate.y:49-57`), so a row's failure must carry exactly the
+/// lines a directly loaded file's does, naming the ROW's `.db`. Writing the
+/// summary at each call site instead is what let the template command print
+/// `Failed to load '<subs>.substitutions'` for a refusal that happened
+/// inside a row, and skip `Can't open file` for a row whose `.db` was
+/// missing.
+///
+/// ```text
+/// epics> iocInit
+/// epics> dbLoadRecords("b.db")
+/// ERROR: Failed to load 'b.db'
+///     Records cannot be loaded after iocInit!
+/// ```
+///
+/// Written here and answered with a bare status rather than an `Err(String)`:
+/// C's `dbLoadRecords` prints its own summary and hands `iocshSetError` an
+/// `int`, so the shell adds nothing. Returning text made the shell print a
+/// second copy of a diagnostic the read had already written.
+fn db_load_records(
+    ctx: &CommandContext,
+    file: &str,
+    macros: HashMap<String, String>,
+    faults: &mut db_loader::DbFaults,
+) -> Result<(), DbReadFailure> {
+    // C passes a hard `0` for the search path (`dbAccess.c:803`), so a
+    // `dbLoadRecords` list can only ever come from the environment — for a
+    // template row too, which is why `dbLoadTemplate`'s own path argument
+    // reaches only the `.substitutions` lookup and never the templates.
+    let read = db_read_database_macros(ctx, file, "", macros, faults);
+    // C `dbAccess.c:808-812`: the summary the command adds on top of
+    // whatever the read already reported, on every failure alike, and the
+    // second line only the load-phase refusal gets.
+    if let Err(failure) = &read {
+        ctx.eprintln(&format!("{ERL_ERROR}: Failed to load '{file}'"));
+        if matches!(failure, DbReadFailure::AfterIocInit) {
+            ctx.eprintln("    Records cannot be loaded after iocInit!");
+        }
+    }
+    read
 }
 
 /// Build the DB include config the way `dbReadCOM` does
@@ -5144,29 +5438,181 @@ fn resolve_db_file(
 /// `dbLoadRecords`, i.e. [`resolve_db_file`]'s rule.
 ///
 /// `search_path` is the command's third argument, which C substitutes
-/// for `EPICS_DB_INCLUDE_PATH` when it is non-empty (`:363-366`). It
+/// for `EPICS_DB_INCLUDE_PATH` when it is non-empty (`:365-368`). It
 /// reaches only this lookup: `dbLoadRecords` resets the path list from
 /// the environment for every template, so the argument never affects
 /// the templates the file names.
-fn resolve_substitutions_file(
-    path: &str,
-    search_path: &str,
-) -> (db_loader::DbLoadConfig, std::path::PathBuf) {
+fn resolve_substitutions_file(path: &str, search_path: &str) -> std::path::PathBuf {
     let config = db_load_config("");
     let direct = std::path::PathBuf::from(path);
-    if direct.exists() {
-        return (config, direct);
-    }
-    if direct.is_absolute() {
-        return (config, direct);
+    if direct.exists() || direct.is_absolute() {
+        return direct;
     }
     let search = if search_path.is_empty() {
-        config.include_paths.clone()
+        config.include_paths
     } else {
         db_loader::db_path(search_path)
     };
-    let file_path = db_loader::db_open_file(path, &search).unwrap_or(direct);
-    (config, file_path)
+    db_loader::db_open_file(path, &search).unwrap_or(direct)
+}
+
+/// C's `sub_collect+1` — the substitution string `dbLoadTemplate` hands to
+/// `dbLoadRecords`, and the one `msiLoadRecords` echoes when a row fails
+/// (`dbLoadTemplate.y:53`). The command's own macro argument goes in first
+/// (`:387-389`), then every accumulated `global {}` definition and the row's
+/// own values in file order (`:301-323`), comma separated.
+///
+/// Built for the echo alone: the load itself takes the parsed macro set, so
+/// nothing depends on this string round-tripping. Which values wear quotes
+/// is not a property of the text — C has one grammar rule per token kind
+/// (`dbLoadTemplate.y:220-255`, `:301-323`) and always writes them back as
+/// `"` — so it is the token's own quotedness that decides, carried here on
+/// `RowMacro`.
+/// C `yyerror` (`dbLoadTemplate.y:330-338`) — every substitutions-file
+/// fault, lexer or grammar, is these two lines:
+///
+/// ```text
+/// Substitution file error: <message>
+/// line <line_num>: '<yytext>'
+/// ```
+///
+/// `yyerror(NULL)` writes `Substitution file error.` for the first line.
+fn eprint_substitution_fault(ctx: &CommandContext, fault: &db_loader::SubstitutionFault) {
+    match &fault.message {
+        Some(message) => ctx.eprintln(&format!("Substitution file error: {message}")),
+        None => ctx.eprintln("Substitution file error."),
+    }
+    ctx.eprintln(&format!("line {}: '{}'", fault.line, fault.yytext));
+}
+
+fn c_sub_collect(cmd_collect: &str, row: &[db_loader::RowMacro]) -> String {
+    let mut parts: Vec<String> = Vec::with_capacity(row.len() + 1);
+    if !cmd_collect.is_empty() {
+        parts.push(cmd_collect.to_owned());
+    }
+    for macro_ in row {
+        let db_loader::RowMacro { name, value, .. } = macro_;
+        if macro_.quoted {
+            parts.push(format!("{name}=\"{value}\""));
+        } else {
+            parts.push(format!("{name}={value}"));
+        }
+    }
+    parts.join(",")
+}
+
+/// The two ways C can fail to give a record its type, told apart by the
+/// same question C asks: is the type DECLARED?
+///
+/// C `dbRecordHead` reaches `dbFindRecordType` first
+/// (`dbLexRoutines.c:1161-1167`), and a type no loaded `.dbd` declares stops
+/// there with `Record type '%s' for record '%s' not found`. A type that IS
+/// declared gets past it and dies one call later inside `dbAllocRecord`
+/// (`dbStaticRun.c:91-96`), because nothing filled in its `rec_size` — the
+/// `.dbd` was read but `x_RegisterRecordDeviceDriver` never ran, so the
+/// recordtype has a shape and no support:
+///
+/// ```c
+///     if (pdbRecordType->rec_size == 0) {
+///         printf("\t*** Did you run x_RegisterRecordDeviceDriver(pdbbase) yet? ***\n");
+///         epicsPrintf("dbAllocRecord(%s) with %s rec_size = 0\n",
+///                     precordName, pdbRecordType->name);
+///         return(S_dbLib_noRecSup);
+///     }
+/// ```
+///
+/// Both then fall out of `dbCreateRecord` into the same `yyerrorAbort`
+/// (`dbLexRoutines.c:1189-1194`), so only the lines ABOVE it differ.
+///
+/// The port's two populations are the same two. `record_fields` is the
+/// vendored `.dbd`s read as a table, so a type it knows is a type this port
+/// declares; `create_record` failing on one of those means no factory is
+/// registered for it — `aCalcout`, `swait`, `busy` and the rest of the
+/// module-owned types an application opts into with `register_record_type`.
+/// That is C's rec_size == 0 exactly: declared, unsupported. Reporting it as
+/// "not found" sent an operator looking for a missing `.dbd` when the `.dbd`
+/// is the one thing that IS there.
+///
+/// One deviation, stated because it is the port's structure and not a
+/// choice: `record_fields` answers for every type this crate vendors, not
+/// for the ones a given IOC has actually loaded `.dbd`s for, because the
+/// port resolves record types from a compile-time table rather than from
+/// `pdbbase`. So a type C would call "not found" (no `.dbd` loaded) is
+/// "declared, unsupported" here whenever the crate vendors its `.dbd`.
+fn record_type_unavailable(ctx: &CommandContext, record_type: &str, name: &str) -> RecordFault {
+    if crate::server::record::dbd_generated::record_fields(record_type).is_some() {
+        // C's `printf`, on stdout, tab included.
+        ctx.println("\t*** Did you run x_RegisterRecordDeviceDriver(pdbbase) yet? ***");
+        // C's `epicsPrintf`, which is errlog and therefore the error
+        // stream, and which carries its own terminator.
+        crate::runtime::log::errlog_printf(&format!(
+            "dbAllocRecord({name}) with {record_type} rec_size = 0\n"
+        ));
+        return RecordFault::Fatal(format!(
+            "{ERL_ERROR}: Can't create {record_type} record '{name}'"
+        ));
+    }
+    RecordFault::Fatal(format!(
+        "{ERL_ERROR}: Record type '{record_type}' for record '{name}' not found"
+    ))
+}
+
+/// Put each field the way C's parser does — one element at a time, so a value
+/// the applier refuses costs that FIELD and nothing else.
+///
+/// C reduces one `field(NAME,"value")` at a time, and every failure arm of
+/// `dbRecordField` ends in `yyerror(NULL)` and `return`
+/// (`dbLexRoutines.c:1405-1416` @`R7.0.10-146-g8f5015b663d764ad75df`):
+///
+/// ```c
+///     status = dbPutString(pdbentry,value);
+///     if (status) {
+///         ...
+///         yyerror(NULL);
+///         return;
+///     }
+/// ```
+///
+/// so the record stays, its remaining fields still load, and only the file's
+/// status goes non-zero. Handing the whole slice to [`db_loader::apply_fields`]
+/// made the FIRST refusal cost the record and every field behind it as well:
+/// measured against `softIoc` R7.0.10 on a `record(ai,"N1"){field(RSET,"1")}`,
+/// C's `dbl` listed `N1` and the port's listed nothing.
+///
+/// Splitting the call is sound because `apply_fields` is itself a loop over
+/// `fields` that carries nothing between iterations — `check_link_syntax` is
+/// per field and `common_fields` is append-only — so N one-field calls are the
+/// same load as one N-field call, minus the abort.
+///
+/// That makes the rule uniform: the menu screen above drops a refused field and
+/// keeps the record, and now the applier's own refusals — `DBF_NOACCESS`, an
+/// unparsable value, a link the syntax check rejects — do the same, rather than
+/// each apply site deciding for itself how much of the file a bad field costs.
+///
+/// The sentence is C's, built from what this site holds: the record, the field
+/// and the value. C's two remaining slots, `pdbentry->message` and
+/// `errSymLookup(status)`, are produced inside `db_loader` and reach here as a
+/// single `CaError` blob, so the port's own text stands in for both.
+fn apply_fields_one_at_a_time(
+    record: &mut Box<dyn crate::server::record::Record>,
+    record_name: &str,
+    fields: &[db_loader::DbFieldDef],
+    common_fields: &mut Vec<(String, EpicsValue)>,
+    faults: &mut db_loader::DbFaults,
+) {
+    for f in fields {
+        let Err(e) = db_loader::apply_fields(record, std::slice::from_ref(f), common_fields) else {
+            continue;
+        };
+        // C's lexer names the line; the parse is over by the time this runs, so
+        // the element's own recorded line takes that seat — as in the screen.
+        faults.seek(f.line, ")");
+        faults.report(db_loader::DbDiagnostic::new(format!(
+            "{ERL_ERROR}: Can't set '{record_name}.{}' to '{}' {e}",
+            f.name,
+            f.value.as_str_lossy(),
+        )));
+    }
 }
 
 /// How C classifies a per-record `.db` failure. `dbRecordHead` and
@@ -5346,31 +5792,42 @@ async fn install_record_defs(
                 // existing record instance.
                 {
                     let mut inst = rec_arc.write();
-                    if let Err(e) =
-                        db_loader::apply_fields(&mut inst.record, &def.fields, &mut common_fields)
-                    {
-                        // C `dbRecordField` ends every one of its failure
-                        // arms in `yyerror(NULL)` — a bad field name or an
-                        // unconvertible value skips that record, never the
-                        // file (`dbLexRoutines.c:1206-1380`).
-                        return Err(RecordFault::Recoverable(format!("{e}")));
-                    }
+                    apply_fields_one_at_a_time(
+                        &mut inst.record,
+                        &def.name,
+                        &def.fields,
+                        &mut common_fields,
+                        faults,
+                    );
                 }
                 rec_arc
             } else {
                 // C `dbFindRecordType` failing is `yyerrorAbort`
-                // (`dbLexRoutines.c:1159-1165`) — an unknown record type
+                // (`dbLexRoutines.c:1162-1167`) — an unknown record type
                 // stops the load on both sides.
-                let mut record = db_loader::create_record(&def.record_type)
-                    .map_err(|e| RecordFault::Fatal(format!("{e}")))?;
+                //
+                // The sentence is built HERE because C builds it here, out
+                // of the two things only this site holds: the type and the
+                // RECORD NAME. The factory sees neither, so forwarding its
+                // error put `DB parse error at line 0, column 0: unknown
+                // record type: 'nosuchtype'` on the stream — this port's own
+                // words, and a position it did not have. The factory's
+                // `register_record_type` hint is dropped with it: it is
+                // addressed to whoever builds the IOC, and `IocBuilder`
+                // (`ioc_builder.rs:305`) still shows it to them.
+                let mut record = db_loader::create_record(&def.record_type).map_err(|_| {
+                    record_type_unavailable(ctx, &def.record_type, &def.name)
+                })?;
                 // The breakpoint-table registry is installed by the
                 // creation sink; apply_fields only needs the LINR
                 // index, already resolved above.
-                if let Err(e) =
-                    db_loader::apply_fields(&mut record, &def.fields, &mut common_fields)
-                {
-                    return Err(RecordFault::Recoverable(format!("{e}")));
-                }
+                apply_fields_one_at_a_time(
+                    &mut record,
+                    &def.name,
+                    &def.fields,
+                    &mut common_fields,
+                    faults,
+                );
                 // Record + its whole loaded field set in one call: the
                 // sink applies the common fields and info tags, THEN
                 // runs C's `iocInit` passes, so the initial UDF
@@ -5380,18 +5837,28 @@ async fn install_record_defs(
                     common_fields: std::mem::take(&mut common_fields),
                     info_tags: def.info_tags.clone(),
                 };
-                if let Err(e) = ctx.db().add_loaded_record(&def.name, record, load).await {
+                if ctx
+                    .db()
+                    .add_loaded_record(&def.name, record, load)
+                    .await
+                    .is_err()
+                {
                     // C `dbCreateRecord` failing for anything other than
                     // `S_dbLib_recExists` is `yyerrorAbort`
-                    // (`dbLexRoutines.c:1187-1192`).
+                    // (`dbLexRoutines.c:1189-1194`), with the same
+                    // site-built shape as the type miss above.
                     return Err(RecordFault::Fatal(format!(
-                        "dbLoadRecords: '{}' rejected: {e}",
-                        def.name
+                        "{ERL_ERROR}: Can't create {} record '{}'",
+                        def.record_type, def.name
                     )));
                 }
                 ctx.db().get_record(&def.name).ok_or_else(|| {
+                    // No C counterpart: this is the port's own invariant
+                    // (the creation sink installed it) failing. It wears
+                    // the `ERROR:` prefix because it now leaves by the same
+                    // exit as the two above.
                     RecordFault::Fatal(format!(
-                        "dbLoadRecords: '{}' vanished between add_record and get_record",
+                        "{ERL_ERROR}: dbLoadRecords: '{}' vanished between add_record and get_record",
                         def.name
                     ))
                 })?
@@ -5514,7 +5981,17 @@ async fn install_record_defs(
             // this record are still read.
             Err(RecordFault::Recoverable(msg)) => faults.recoverable(msg),
             Err(RecordFault::Fatal(msg)) => {
-                ctx.println(&msg);
+                // C `yyerrorAbort(NULL)` (`dbYacc.y:385-389`) is
+                // `yyerror(NULL)` plus `yyAbort = TRUE`: the sentence is
+                // the site's own `fprintf`, and the abort adds exactly the
+                // bare `ERROR: ` and the position that a RECOVERED fault
+                // gets. So the two arms print through the SAME owner and
+                // differ only in whether the loop goes on — which is what
+                // makes it impossible for an abort to reach the operator
+                // without the file, line and source echo the rest carry.
+                // This arm used to `ctx.println` the message instead:
+                // stdout, unframed, and invisible to a `2>` startup log.
+                faults.recoverable(msg);
                 return Err(DbReadFailure::Rejected);
             }
         }
@@ -5574,7 +6051,7 @@ fn cmd_db_load_template() -> CommandDef {
         ],
         "dbLoadTemplate subFile [globalMacros] [path] - Load records from a .substitutions file",
         |args: &[ArgValue], ctx: &CommandContext| {
-            // C `dbLoadTemplate.y:344-347` diagnoses a missing or empty
+            // C `dbLoadTemplate.y:350-352` diagnoses a missing or empty
             // name itself, on stderr, and returns -1 —
             // `dbLoadTemplateCallFunc` passes that status to `iocshSetError`
             // (`dbtoolsIocRegister.c:33-36`), so the line FAILED.
@@ -5594,72 +6071,112 @@ fn cmd_db_load_template() -> CommandDef {
                 _ => "",
             };
 
-            // Same load-phase gate as `dbLoadRecords`: opens the load phase
-            // (idempotent across the several loads a script issues) and
-            // refuses with C's diagnostic once `iocInit` has run — C's
-            // `dbLoadTemplate` delegates to `dbReadDatabase`/`dbLoadRecords`,
-            // which fail identically after init (dbAccess.c:808-812).
-            if ctx.db().begin_load().is_err() {
-                ctx.eprintln(&format!("{ERL_ERROR}: Failed to load '{path}'"));
-                ctx.eprintln("    Records cannot be loaded after iocInit!");
+            // C refuses a ceiling below 1 before it opens anything
+            // (`dbLoadTemplate.y:355-360`), returning -1: `vars` and
+            // `sub_collect` are `malloc`ed from that number, so a
+            // non-positive one has no load to attempt. Reachable because
+            // `var dbTemplateMaxVars` writes the global unvalidated.
+            let max_vars = db_loader::db_template_max_vars();
+            if max_vars < 1 {
+                ctx.eprintln(&format!(
+                    "{ERL_ERROR}: dbTemplateMaxVars = {max_vars}, must be +ve"
+                ));
                 return Ok(CommandOutcome::Failed);
             }
 
-            let macros = parse_macro_string(macros_str);
-
-            let (config, file_path) = resolve_substitutions_file(path, search_path);
-
-            // C `dbLoadTemplate` issues one `dbLoadRecords` per row from
-            // the `pattern_definition` action (`dbLoadTemplate.y:186`), so
-            // each row's records are committed before the next row is even
-            // read and a failing row costs only the rows after it. Resolve,
-            // parse and install one row at a time for the same reason: the
-            // port used to concatenate every row's records and install the
-            // batch, which threw away the rows that had already succeeded.
-            let rows = db_loader::substitution_rows(&file_path, &macros)
-                .map_err(|e| format!("parse error: {e}"))?;
-
-            for (file, merged) in rows {
-                let template = db_loader::resolve_template(&file, &config.include_paths)
-                    .map_err(|e| format!("parse error: {e}"))?;
-                // Reported by the loader, like `dbLoadRecords`'s own read
-                // above; the row's summary is all that is owed here, and
-                // C names the row's `.db` in it rather than the
-                // `.substitutions` (`dbLoadTemplate.y:186` ->
-                // `dbAccess.c:808`).
-                let Ok(parsed) =
-                    db_loader::parse_db_opened_with_breaktables(&template, &merged, &config)
-                else {
-                    ctx.eprintln(&format!("{ERL_ERROR}: Failed to load '{file}'"));
-                    return Ok(CommandOutcome::Failed);
-                };
-                // Each row IS a `dbLoadRecords`, so its `breaktable(...)`
-                // definitions join the database registry exactly as that
-                // command's do, and a later row's `LINR` name resolves
-                // against them.
-                let breaktable_registry =
-                    ctx.block_on(async { ctx.db().add_breaktables(parsed.breaktables).await });
-                // Identical install path to `dbLoadRecords`: same
-                // duplicate-name merge, field application, load-then-init
-                // ordering and post-load passes, so a template-loaded record
-                // is indistinguishable from a directly loaded one.
-                let mut faults = parsed.faults;
-                if ctx
-                    .block_on(install_record_defs(
-                        ctx,
-                        parsed.records,
-                        parsed.unresolved_aliases,
-                        &breaktable_registry,
-                        &mut faults,
-                    ))
-                    .is_err()
-                {
-                    // Each row IS a `dbLoadRecords`, so C's summary names the
-                    // row's own file (`dbLoadTemplate.y:186` ->
-                    // `dbAccess.c:808`), not the `.substitutions`.
-                    ctx.eprintln(&format!("{ERL_ERROR}: Failed to load '{file}'"));
+            // C opens the `.substitutions` file HERE, and reports the open
+            // failure in its own words with `strerror(errno)`
+            // (`dbLoadTemplate.y:362-374`) — before `pdbbase` is touched, and
+            // returning -1 rather than a parser status. No other load in the
+            // port has that shape, and it is one half of what the merged
+            // `parse error: <e>` could not say.
+            let file_path = resolve_substitutions_file(path, search_path);
+            let text = match std::fs::read_to_string(&file_path) {
+                Ok(text) => text,
+                Err(e) => {
+                    ctx.eprintln(&format!(
+                        "dbLoadTemplate: error opening sub file {path}: {}",
+                        super::c_strerror(&e)
+                    ));
                     return Ok(CommandOutcome::Failed);
                 }
+            };
+
+            // The other half: the file opened and the parse had something
+            // to say about it. C reports through one `yyerror`
+            // (`dbLoadTemplate.y:330-338`) whether the lexer hit a
+            // character it does not know or the grammar hit a token it
+            // cannot shift, and only the second one stops it.
+            let subs = db_loader::parse_substitutions(&text);
+
+            // C `dbLoadTemplate` issues one `dbLoadRecords` per row from the
+            // `pattern_definition` action (`dbLoadTemplate.y:185`), so each
+            // row's records are committed before the next row is even read
+            // and a failing row costs only the rows after it. One row at a
+            // time for the same reason: the port used to concatenate every
+            // row's records and install the batch, which threw away the rows
+            // that had already succeeded.
+            //
+            // A fault is reported where the lexer reached it, which is
+            // after the rows before it and before the rows after it, so
+            // the two are walked as one stream in C's order.
+            for event in subs.events {
+                let load = match event {
+                    db_loader::SubstitutionEvent::Fault(fault) => {
+                        eprint_substitution_fault(ctx, &fault);
+                        continue;
+                    }
+                    // C's plain `fprintf(stderr, ...)` notices reach the
+                    // operator's console like every other line here, not a
+                    // log the console never shows.
+                    db_loader::SubstitutionEvent::Notice(text) => {
+                        ctx.eprintln(&text);
+                        continue;
+                    }
+                    db_loader::SubstitutionEvent::Load(load) => load,
+                };
+                // macLib is last-definition-wins and C builds `sub_collect`
+                // as `cmd_collect` then globals then the row's own values
+                // (`:301-323`, `:387-389`), so the row overrides a global
+                // and a global overrides the command's argument.
+                let mut merged = parse_macro_string(macros_str);
+                merged.extend(
+                    load.macros
+                        .iter()
+                        .map(|m| (m.name.clone(), m.value.clone())),
+                );
+                // Every row IS a `dbLoadRecords`, down to the `Can't open
+                // file` / `Failed to load` pair and the after-`iocInit`
+                // refusal, so it goes through the same owner rather than a
+                // second install path of its own — the `.dbd` side effects
+                // (`registrar`, `link`) included.
+                let mut faults = db_loader::DbFaults::default();
+                if db_load_records(ctx, &load.file, merged, &mut faults).is_err() {
+                    // C `msiLoadRecords` (`dbLoadTemplate.y:49-57`) names the
+                    // row that failed, then `yyerror` + `YYABORT`: the rows
+                    // after this one are never read, and `yyparse` fails the
+                    // command.
+                    ctx.eprintln(&format!(
+                        "dbLoadRecords(\"{}\", {})",
+                        load.file,
+                        c_sub_collect(macros_str, &load.macros)
+                    ));
+                    eprint_substitution_fault(
+                        ctx,
+                        &db_loader::SubstitutionFault::row_failed(&load),
+                    );
+                    return Ok(CommandOutcome::Failed);
+                }
+            }
+
+            // A grammar error is the only thing that fails the command:
+            // `dbLoadTemplate` returns `yyparse`'s status
+            // (`dbLoadTemplate.y:417`), which a recovered lexer fault does
+            // not change — measured, a `.substitutions` whose only defect
+            // is a stray `%` loads every row and returns 0.
+            if let Some(fault) = subs.stopped {
+                eprint_substitution_fault(ctx, &fault);
+                return Ok(CommandOutcome::Failed);
             }
 
             // Silent on success like the `dbLoadRecords` each row is:
@@ -5685,14 +6202,22 @@ fn cmd_epics_env_set() -> CommandDef {
             },
         ],
         "epicsEnvSet name value - Set an environment variable",
-        |args: &[ArgValue], _ctx: &CommandContext| {
-            let name = match &args[0] {
-                ArgValue::String(s) => s,
-                _ => return Err("invalid argument".to_string()),
+        |args: &[ArgValue], ctx: &CommandContext| {
+            // A missing argument is not the shell's to refuse: `cvtArg`
+            // stores NULL for an absent string and returns success
+            // (`iocsh.cpp:858-862`), and the command body is what notices.
+            // C's body writes its own sentence and marks the line errored
+            // with no diagnostic of the shell's own
+            // (`libComRegister.c:142-151`), so it carries no `ERROR <file>
+            // line <n>: ` frame — hence `eprintln` plus `Failed`, not
+            // `Err`, which would print a frame C does not.
+            let ArgValue::String(name) = &args[0] else {
+                ctx.eprintln("Missing environment variable name argument.");
+                return Ok(CommandOutcome::Failed);
             };
-            let value = match &args[1] {
-                ArgValue::String(s) => s,
-                _ => return Err("invalid argument".to_string()),
+            let ArgValue::String(value) = &args[1] else {
+                ctx.eprintln("Missing environment variable value argument.");
+                return Ok(CommandOutcome::Failed);
             };
 
             // C `epicsEnvSet` (`osdEnv.c:47-52`) clears the shell macro
@@ -5731,28 +6256,30 @@ fn cmd_ioc_init() -> CommandDef {
                 // C `iocBuild_1` (`iocInit.c:116-121`) refuses from any state
                 // but `iocVoid`, and `iocInit` is that refusal's caller.
                 crate::server::ioc_app::ShellTransition::Refused => {
-                    crate::runtime::log::errlog_printf(&format!(
-                        "iocBuild: {} IOC can only be initialized from \
-                         uninitialized or stopped state\n",
-                        if crate::runtime::log::errlog_console_paints() {
-                            crate::runtime::log::ERL_ERROR
-                        } else {
-                            "ERROR"
-                        }
-                    ));
+                    crate::runtime::log::errlog_printf(&crate::server::ioc_app::build_refusal());
                     return Ok(CommandOutcome::Failed);
                 }
                 crate::server::ioc_app::ShellTransition::NotOurs => {}
             }
             // No `IocApplication` build to drive: every `CaServerBuilder`
-            // binary and every bare `PvDatabase` shell reaches here, and for
-            // them `iocInit` has only ever meant closing the record-load
-            // phase. A link that forward-references a record loaded by a LATER
-            // `dbLoadRecords` in the same `st.cmd` must still classify as a
-            // local PV (R18-92), which is what that close runs.
-            ctx.block_on(async { ctx.db().ioc_init().await });
-            ctx.println("iocInit: record initialization complete (scan/device init follows)");
-            Ok(CommandOutcome::Continue)
+            // binary and every bare `PvDatabase` shell reaches here. C has no
+            // such shell — `iocInit()` is `iocBuild() || iocRun()` for
+            // everyone (`iocInit.c:111-113`) — so this arm runs the same two
+            // halves over the same state cell, and the record-load close is
+            // what it contributes to the build. A link that forward-references
+            // a record loaded by a LATER `dbLoadRecords` in the same `st.cmd`
+            // must still classify as a local PV (R18-92), which is what that
+            // close runs.
+            if !crate::server::ioc_app::build_without_application(|| {
+                ctx.block_on(async { ctx.db().ioc_init().await });
+            }) {
+                return Ok(CommandOutcome::Failed);
+            }
+            if crate::server::ioc_app::ioc_run() == 0 {
+                Ok(CommandOutcome::Continue)
+            } else {
+                Ok(CommandOutcome::Failed)
+            }
         },
     )
 }
@@ -6017,7 +6544,7 @@ pub(super) fn check_pdbbase(arg: &ArgValue) -> Result<(), String> {
 
 /// C `printf("%e", v)`: six fraction digits and a signed exponent of at least
 /// two digits. Rust's `{:.6e}` writes the digits but spells the exponent `e2`
-/// where C writes `e+02`, so `dbDumpBreaktable` (`dbStaticLib.c:3547-3548`)
+/// where C writes `e+02`, so `dbDumpBreaktable` (`dbStaticLib.c:3549-3550`)
 /// needs the fixup to emit C's bytes.
 fn c_exponential(v: f64) -> String {
     if !v.is_finite() {
@@ -6132,11 +6659,11 @@ fn dblsr_set_lines(
 
 /// `dblsr [record name] [interest level]` — Database Lockset report.
 ///
-/// C `dblsr` (`dbLock.c:871-909`), registered at `dbIocRegister.c:624`.
+/// C `dblsr` (`dbLock.c:874-939`), registered at `dbIocRegister.c:624`.
 ///
 /// A record name selects that record's set alone; `*`, `""` and a missing
 /// argument select every active set, which is C's own normalisation
-/// (`dbLock.c:875-876`). A name no record answers to prints `Record not
+/// (`dbLock.c:887-888`). A name no record answers to prints `Record not
 /// found`, and a record that has no lock set yet — the database is loaded but
 /// `iocInit` has not run — prints nothing at all (`:900-901`).
 fn cmd_dblsr() -> CommandDef {
@@ -6637,6 +7164,15 @@ fn cmd_dbnr() -> CommandDef {
             use crate::server::record::dbd_generated::RECORD_TYPES;
 
             let verbose = matches!(args[0], ArgValue::Int(v) if v != 0);
+
+            // DELIBERATE NON-MATCH under `verbose`: the row set is whatever
+            // record types are REGISTERED, which is C's rule
+            // (`dbFirstRecordType` over `pdbbase->recordTypeList`), applied to
+            // a different registry. This crate links every record type it
+            // ports, so `dbnr 1` lists rows base's `softIoc` has no support
+            // for — `acalcout`, `asyn`, `busy`, `scalcout`, `sseq`, `swait`,
+            // `transform` when those modules are built in. Every row for a
+            // type BOTH sides carry, and the whole of `dbnr 0`, is C's bytes.
 
             // C counts through one list per record type that holds records AND
             // alias nodes, so it reports `dbGetNRecords - dbGetNAliases`
@@ -8483,7 +9019,7 @@ mod tests {
                 true
             )
         );
-        // C `:414-428` / `:434-455` walk an empty list: no output, no refusal,
+        // C `:411-428` / `:430-453` walk an empty list: no output, no refusal,
         // and the line did NOT fail.
         assert_eq!(
             run_cmd_outcome(&ctx, "scanpel", &[]),
@@ -8609,9 +9145,9 @@ mod tests {
     /// `dbAccess.c` seeds the reply's three limit groups differently, and a
     /// record type with no `get_alarm_double` is where that shows: the
     /// display and control pairs are `memset` to zero, the alarm four keep
-    /// `struct dbr_alDouble ald = {epicsNAN, …}` (`:294`, `:318-323`). The
-    /// integral options are the same four through `finite(x) ? (epicsInt32) x
-    /// : 0` (`:305-312`), so they read zero.
+    /// `struct dbr_alDouble ald = {epicsNAN, …}` (`dbAccess.c:294`,
+    /// `:318-323`). The integral options are the same four through
+    /// `finite(x) ? (epicsInt32) x : 0` (`:303-310`), so they read zero.
     ///
     /// Measured on `bin/linux-x86_64/softIoc` (EPICS 7.0.10),
     /// `gft B:ONE` on `record(bo, "B:ONE")`, the six limits being
@@ -10166,7 +10702,7 @@ BO_REC
     /// required made the port answer with the registry's "missing
     /// required argument" on stderr and never run the body at all.
     /// The C texts are `dbTest.c:308`, `:359`, `:401`, `:445`,
-    /// `dbAccess.c:801`, `dbLoadTemplate.y:345` (stderr) and
+    /// `dbAccess.c:800`, `dbLoadTemplate.y:351` (stderr) and
     /// `asDbLib.c:244`.
     #[test]
     fn a_missing_argument_reaches_c_s_own_diagnostic() {
@@ -10207,7 +10743,7 @@ BO_REC
             assert_eq!(err, "must specify variable substitution file\n");
             assert!(
                 matches!(result, Ok(CommandOutcome::Failed)),
-                "dbLoadTemplate.y:344-347 returns -1 and                  dbtoolsIocRegister.c:33-36 sets it as the shell error"
+                "dbLoadTemplate.y:350-352 returns -1 and                  dbtoolsIocRegister.c:33-36 sets it as the shell error"
             );
         }
         // Already C-shaped; pinned here so the family stays closed.
@@ -10733,7 +11269,7 @@ record(ai, "P:FL")      { field(FLNK, "L:B") }
             // PV_LINK, target local, no CA/CP/CPP — `dbDbInitLink`.
             ("P:LOCAL", "INP", "DB_LINK L:B.VAL NPP NMS"),
             // PV_LINK, target LOCAL but CPP set: C skips `dbDbInitLink`
-            // entirely (`dbAccess.c:1104`), so the local target still
+            // entirely (`dbLink.c:118-122`), so the local target still
             // becomes a CA link. This port keeps such a link on the DB
             // link set on purpose; only the printed identity follows C.
             ("P:LOCALCP", "INP", "CA_LINK L:B.VAL CPP MS"),
@@ -12191,6 +12727,32 @@ record(mbboDirect, "MBD0") {{ }}
         (out, std::fs::read_to_string(&err_path).unwrap(), result)
     }
 
+    /// C `cvtArg` stores NULL for a string argument the line never
+    /// supplied and returns success (`iocsh.cpp:858-862`), so the shell
+    /// runs the command and the BODY is what refuses. Measured on
+    /// `bin/linux-x86_64/softIoc` (R7.0.10-146-g8f5015b663d764ad75df),
+    /// script `c.cmd`: `epicsEnvSet` alone → stderr `Missing environment
+    /// variable name argument.`, `epicsEnvSet ONLYONE` → stderr `Missing
+    /// environment variable value argument.` — both bare, with no `ERROR
+    /// c.cmd line 1: ` frame, because `showError` never ran.
+    #[test]
+    fn a_missing_epics_env_set_argument_is_the_bodys_own_unframed_sentence() {
+        let (_db, ctx) = make_ctx();
+
+        let (out, err, result) = run_capturing(&ctx, "epicsEnvSet", &[]);
+        assert_eq!(err, "Missing environment variable name argument.\n");
+        assert_eq!(out, "", "the refusal is a diagnostic, not output");
+        assert!(
+            matches!(result, Ok(CommandOutcome::Failed)),
+            "C's `iocshSetError(-1)` fails the line without a diagnostic \
+             of the shell's own, which `Err` would frame"
+        );
+
+        let (_out, err, result) = run_capturing(&ctx, "epicsEnvSet", &["ONLYONE"]);
+        assert_eq!(err, "Missing environment variable value argument.\n");
+        assert!(matches!(result, Ok(CommandOutcome::Failed)));
+    }
+
     /// The `bptTypeKdegC.dbd` this crate ships, the file C names in
     /// `dbLoadDatabase("$(EPICS_BASE)/dbd/bptTypeKdegC.dbd")`.
     const SHIPPED_BPT_TYPE_KDEGC: &str =
@@ -12841,7 +13403,7 @@ file "a.db" {
     }
 
     /// R4-7: C `dbLoadTemplate` calls `dbLoadRecords` from the
-    /// `pattern_definition` action (`dbLoadTemplate.y:186`), so row 1's
+    /// `pattern_definition` action (`dbLoadTemplate.y:193`), so row 1's
     /// records are in `pdbbase` before row 2 is read and only the rows
     /// after the failure are lost. The port concatenated every row's
     /// records and installed the batch, so one unloadable row threw away
@@ -12997,7 +13559,12 @@ record(ai, "IOC:AI2") { field(VAL, "2.5") field(EGU, "amps") }
         }
     }
 
-    /// A missing `.substitutions` file returns an error, not a panic.
+    /// A `.substitutions` file that cannot be opened is C's OWN failure, not
+    /// the parser's: `dbLoadTemplate` does the `fopen` itself and writes
+    /// `dbLoadTemplate: error opening sub file <f>: <strerror(errno)>`
+    /// (`dbLoadTemplate.y:371-374`) before `pdbbase` is touched, returning
+    /// -1. Measured on softIoc: `dbLoadTemplate: error opening sub file
+    /// nosuch.sub: No such file or directory`.
     #[test]
     fn db_load_template_file_not_found_errors() {
         let (db, ctx) = make_ctx();
@@ -13006,14 +13573,22 @@ record(ai, "IOC:AI2") { field(VAL, "2.5") field(EGU, "amps") }
 
         let err = load_template(&ctx, &missing, None)
             .expect_err("a nonexistent substitutions file must error");
-        assert!(
-            err.contains("parse error"),
-            "expected a parse error, got: {err}"
+        assert_eq!(
+            err,
+            format!(
+                "dbLoadTemplate: error opening sub file {}: No such file or directory\n",
+                missing.display()
+            )
         );
         assert!(!exists(&db, &ctx, "IOC:AI1"), "nothing is created on error");
     }
 
-    /// A malformed `.substitutions` file returns an error, not a panic.
+    /// A malformed `.substitutions` file is the OTHER failure: the file
+    /// opened and the grammar refused it, which C reports through `yyerror`
+    /// (`dbLoadTemplate.y:330-338`) as `Substitution file error: <msg>` plus
+    /// the lexer's position, returning `yyparse`'s status. Measured on this
+    /// exact file, `bin/linux-x86_64/softIoc` writes the two lines asserted
+    /// here byte for byte.
     #[test]
     fn db_load_template_malformed_substitutions_errors() {
         let (_db, ctx) = make_ctx();
@@ -13024,10 +13599,7 @@ record(ai, "IOC:AI2") { field(VAL, "2.5") field(EGU, "amps") }
 
         let err = load_template(&ctx, &subs, None)
             .expect_err("a malformed substitutions file must error");
-        assert!(
-            err.contains("parse error"),
-            "expected a parse error, got: {err}"
-        );
+        assert_eq!(err, "Substitution file error: syntax error\nline 1: '{'\n");
     }
 
     /// The command is registered under its EPICS-base name.

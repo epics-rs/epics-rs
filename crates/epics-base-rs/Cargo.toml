@@ -16,9 +16,8 @@ hostname = "0.4"
 chrono = "0.4"
 parking_lot = "0.12"
 # Lock-free snapshot cells for the read-mostly database indices and the ACF
-# config cell — see `doc/rtems-priority-locks-design.md` §3/§5 step 3. Readers
-# take an `Arc` snapshot with no lock, so a low-priority reader can never hold
-# a high-priority scan thread off an index.
+# config cell. Readers take an `Arc` snapshot with no lock, so a low-priority
+# reader can never hold a high-priority scan thread off an index.
 arc-swap = "1"
 tracing = "0.1"
 epics-macros-rs = { workspace = true }

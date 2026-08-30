@@ -77,8 +77,8 @@ epics-tools-rs = { path = "crates/epics-tools-rs", version = "0.27.0" }
 
 # Deployable-image profile for the embedded targets (RTEMS / VxWorks), where
 # image size is a real resource: `cargo build --profile release-embedded ...`
-# reproduces row 5 of the measured matrix in `doc/vxworks-port.md` §5.5
-# (vs `--release`+strip: CA −15.6/−18.9 %, PVA −19.7/−22.6 %; cold build ~2×).
+# reproduces row 5 of the measured strip/LTO size matrix (vs `--release`+strip:
+# CA −15.6/−18.9 %, PVA −19.7/−22.6 %; cold build ~2×).
 # `release` itself is untouched, so host build times are unaffected.
 [profile.release-embedded]
 inherits = "release"
@@ -104,8 +104,7 @@ codegen-units = 1
 # 0.2.187, rust-lang/libc#5129) and `killpg` -- std imports all three, and the
 # SDK defines none of them, so they are always-failing shims rather than
 # extern declarations -- plus `getentropy` over the platform's `randABytes`.
-# Without these std itself does not compile for the target; see
-# `doc/upstream-rust-targets/`.
+# Without these std itself does not compile for the target.
 #
 # NOTE a manifest `[patch]` does NOT reach `-Zbuild-std`, which resolves std's
 # own libc from rust-src's lock; only a CONFIG-level patch does, and only at

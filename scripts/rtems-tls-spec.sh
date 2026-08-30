@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
 #
 # rtems-tls-spec.sh - emit the custom RTEMS target spec that carries
-# `has-thread-local: true`, the one-key deviation documented in
-# `doc/rtems-tls-spec-deviation.md`.
+# `has-thread-local: true`, this workspace's one-key deviation from the builtin
+# `armv7-rtems-eabihf` spec (measured to take std's per-thread TLS leak on
+# RTEMS from 136 B to 0).
 #
 # WHY GENERATE RATHER THAN COMMIT A FROZEN JSON
 #
@@ -59,8 +60,8 @@ fi
 # this script (and the whole wiring) should be retired, not silently no-op.
 if [[ "$(jq -r '."has-thread-local" // "absent"' <<<"$stock")" != "absent" ]]; then
     echo "error: the builtin $STOCK_TARGET spec already sets has-thread-local." >&2
-    echo "The deviation is retired upstream — delete this script, revert the" >&2
-    echo "rtems-check.sh spec wiring, and remove doc/rtems-tls-spec-deviation.md." >&2
+    echo "The deviation is retired upstream — delete this script and revert" >&2
+    echo "the rtems-check.sh spec wiring." >&2
     exit 2
 fi
 

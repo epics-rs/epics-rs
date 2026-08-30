@@ -127,9 +127,9 @@ TARGET="x86_64-wrs-vxworks"
 #     std.
 #   * `killpg` is referenced by std's own vxworks process code
 #     (`library/std/src/sys/process/unix/vxworks.rs:179`) and is declared for
-#     vxworks nowhere in libc, in any version. CONFIRMED — see
-#     `doc/upstream-rust-targets/` for the trace and the shim-not-extern
-#     conclusion.
+#     vxworks nowhere in libc, in any version. CONFIRMED by tracing std's
+#     imports back to libc: the fix has to be a shim, not an extern
+#     declaration.
 #
 # Which of the two you hit depends on the nightly, since build-std resolves
 # libc from rust-src's own lock: a 2026-07-09 nightly pins 0.2.185 and shows

@@ -12,7 +12,7 @@ cargo run -p dbd-codegen -- --check    # fail if it has drifted (CI)
 The port used to hand-copy the `.dbd` into 1,174 `FieldDesc` literals. A wrong
 `dbf_type` or a missed `special(SPC_NOMOD)` was then a *finding*, discovered by
 eye, one audit round at a time. Deriving the table from the spec makes that
-whole family unrepresentable — see `doc/strategy-2026-07-13.md` §3.1.
+whole family unrepresentable.
 
 ## What is vendored, and why
 

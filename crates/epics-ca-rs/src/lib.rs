@@ -33,6 +33,8 @@
 //! | `epics-base` | `R7.0.10` |
 //! | `pvxs` | `1.5.1-42-gb568e93` |
 //! | `ca-gateway` | `R2-1-3-0-54-g0666f21` |
+//! | `asyn` | `R4-45-19-ge2a281e2` |
+//! | `iocStats` | `4.0.1` |
 //!
 //! **Resolve by symbol at the pin; the line is a hint.** Find the named
 //! function, struct, macro or field first, and treat the line number as a hint

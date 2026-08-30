@@ -11,8 +11,8 @@ repository.workspace = true
 epics-base-rs = { workspace = true }
 epics-macros-rs = { workspace = true }
 # No `epics-rtems-boot`: this package produces no RTEMS binary. The boot shim
-# is a dependency of whichever package owns one, and `realtime-pva-ioc` moved to
-# `epics-bridge-rs` (doc/qsrv-rtems-design.md §9.7).
+# is a dependency of whichever package owns one, and `realtime-pva-ioc` moved
+# to `epics-bridge-rs`.
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 clap = { version = "4", features = ["derive"] }
@@ -102,8 +102,8 @@ client = []
 # of `epics-ca-rs/bringup-probes`, and forwarded from
 # `epics-bridge-rs/bringup-probes` so `realtime-pva-ioc`'s probe image can read
 # it. Compiles a dial-attempt counter and `client_native::dial_pool_probe()`,
-# which is how `doc/pvalink-rtems-design.md` §9.11's `MAX_DIAL_WORKERS` bound
-# is read on a target with no shell and no reachable `caget`. OFF by default:
+# which is how the `MAX_DIAL_WORKERS` bound is read on a target with no shell
+# and no reachable `caget`. OFF by default:
 # a default build compiles neither the counter nor the accessor.
 bringup-probes = []
 # TLS-secured pvAccess (`pvas://`) via rustls. ON by default. Turning it off
@@ -263,5 +263,5 @@ path = "src/bin/mshim-rs.rs"
 
 # `realtime-pva-ioc` used to be declared here. It moved to `epics-bridge-rs` when
 # it grew a QSRV group source: the mount needs the bridge, and this package
-# cannot depend on the bridge without a cyclic package dependency (measured —
-# doc/qsrv-rtems-design.md §9.7). This package now produces no target binary.
+# cannot depend on the bridge without a cyclic package dependency, which cargo
+# rejects outright (measured). This package now produces no target binary.

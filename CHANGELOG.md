@@ -6,10 +6,9 @@ Minor release. It lands the 2026-08-23 parallel C-parity round: fifteen
 agents ran interleaved review/fix rounds against the EPICS base, asyn,
 areaDetector, calc and pvxs originals, and the result is 314 one-per-finding
 fixes squashed into nine per-area commits. The public API moves with it — 18
-items removed and 24 signatures changed, measured item-by-item in
-`doc/breaking-2026-08-23.md`, which is why this is a minor and not a patch.
-`doc/c-parity-review-2026-08-23.md` records the four integration decisions
-worth auditing and the 160 root causes the round left open. Workspace version
+items removed and 24 signatures changed, measured item-by-item, which is why
+this is a minor and not a patch. The round also settled four integration
+decisions worth auditing and left 160 root causes open. Workspace version
 0.26.2 -> 0.27.0; the 18 `[workspace.dependencies]` pins and the hand-written
 `epics-pva-rs` pin in `epics-bridge-rs` move to 0.27.0 in lockstep.
 
@@ -246,7 +245,7 @@ rather than its startup address.
 Back-to-back on the same host, db and client (20,000 puts, 3 runs each), the
 shipped `qsrv-rs` reads 99.0–102.0 µs of server CPU per put at 3,781–3,842
 puts/s against pvxs `softIocPVX`'s 103.5–104.0 µs at 3,693–3,724 — every Rust
-run beats every pvxs run on both metrics (`doc/qsrv-put-perf.md`). What got it
+run beats every pvxs run on both metrics. What got it
 there: the server bins serve from one tokio worker (an idle multi-worker pool
 costs ~30 µs/put in wake/steal churn while one client's traffic is a single
 runnable task); per-peer channel resolution and the ACF grant per
@@ -257,8 +256,8 @@ scratch value; and a ready EXEC body runs inline instead of spawning a task.
 
 ### The upstream-issue audit lands its fixes
 
-The 2026-08-09 sweep (`doc/upstream-issue-audit-2026-08-09.md`, 115 open
-epics-base issues triaged) turned into fixes across the workspace:
+The 2026-08-09 sweep (115 open epics-base issues triaged) turned into fixes
+across the workspace:
 
 - Framework link reads honor the record's declared DBR type, and
   dbPut-analogue writes to DBF link fields are refused, as C refuses them.
@@ -273,7 +272,7 @@ epics-base issues triaged) turned into fixes across the workspace:
   substitutions-file entry that yields no template loads warns;
   `putStringUlong`'s via-double fallback is ported for DBF_ULONG.
 - CA server: a compound DBR put (`DBR_STS_*`, `DBR_TIME_*`, …) no longer
-  drops the circuit (`doc/ca-compound-dbr-put.md`).
+  drops the circuit.
 - PVA: the server writer queue is bounded in bytes, not frames; qsrv refuses
   a channel on a field the record does not have and serves
   `display.description` from DESC as pvxs does; a refused CREATE_CHANNEL's
@@ -353,8 +352,8 @@ the bounded `EvQue` ring and the ring coalesces, which is what C gets from
   the queued frame and is released by the drain owner's `Drop` once the bytes
   are in the socket writer, so the producer stops dequeuing and the backlog
   coalesces in the ring. In-loop reply handlers are exempt and unaffected.
-  Re-measured at 0.000 kB/s with the drain still provably parked; the harness
-  and all five run logs are in `doc/ca-stuck-reader-measurement.md`.
+  Re-measured at 0.000 kB/s across five runs, with the drain still provably
+  parked.
 
 ### A default `histogram` record no longer alarms on its first process
 
@@ -423,7 +422,7 @@ already complete; this was the client half alone.
   interface walk, the pump round-trip, the broadcast fanout and the
   `Drop`-releases-the-port regression. `SO_RCVTIMEO` is accepted here; it is
   `SO_SNDTIMEO` that this target refuses with `ENOPROTOOPT`, and the pump sets
-  none. Transcript and its seven claims: `doc/vxworks-port.md` §5.6.
+  none.
 
 ### A wedged CA client is reaped again on the embedded targets
 
@@ -503,7 +502,7 @@ implements no `SO_SNDTIMEO` to fall back on (`ENOPROTOOPT`, measured on
 target), so where this code was written to run the bound rested on an untested
 assumption. Both crates now own the socket's blocking mode at the single site
 where a socket becomes live, and poll both directions — C's shape under
-`USE_POLL`. `doc/darwin-send-dontwait-gap.md` carries the measurement.
+`USE_POLL`.
 
 ### CA server and client
 
@@ -553,9 +552,8 @@ where a socket becomes live, and poll both directions — C's shape under
 documenting private items on every row, and `asyn-rs` joins the
 `rustdoc-embedded` closure. The intra-doc links that had never resolved are
 resolved across every crate; where public documentation cited a crate-private
-item, the citation became a code span rather than a link.
-`doc/rustdoc-embedded-only-census.md` records which citations exist only on an
-embedded row.
+item, the citation became a code span rather than a link. The citations that
+resolve only on an embedded row were censused as part of that pass.
 
 ### Removed
 
@@ -620,10 +618,11 @@ Additive API only; no breaking changes. Workspace version 0.25.0 -> 0.25.1.
   proprietary Wind River SDK — a gap now stated as a fact rather than left as
   an absent gate.
 
-- `doc/vxworks-port.md` documents the target and toolchain contract, the cfg
-  architecture, the priority model, and what was measured on target: 11/11 gate
-  rows, CA and PVA round-trips over the wire, the census blocks verbatim, and
-  (§5.5) a five-row strip/LTO size matrix for both targets and both binaries.
+- The VxWorks target and toolchain contract, the cfg architecture and the
+  priority model were written up, together with what was measured on target:
+  11/11 gate rows, CA and PVA round-trips over the wire, the census blocks
+  verbatim, and a five-row strip/LTO size matrix for both targets and both
+  binaries.
 
 ### Runtime and asyn
 
@@ -750,8 +749,8 @@ QEMU xilinx-zynq with live client traffic.
 - **Opt-in SCHED_FIFO banding** on hosted targets via
   `EPICS_RS_ALLOW_RT_PRIORITY=YES` (default on for RTEMS, off elsewhere).
 - **Measured**: on a PREEMPT_RT kernel the record-gate priority inversion
-  collapses from 24.9 ms to 10.1 ms worst-case with PI on
-  (`doc/rtlinux-rt-measurement.md`); the scan leg is solved by FIFO
+  collapses from 24.9 ms to 10.1 ms worst-case with PI on;
+  the scan leg is solved by FIFO
   (84.7×). `examples/rt-probe` is the measurement rig.
 
 ### New crate: `epics-libcom-rs`
@@ -907,8 +906,8 @@ API only; no breaking changes. Workspace version 0.24.1 -> 0.24.2.
 
 ### Docs
 
-- `doc/upstream-c-bugs.md`: reconciled the upstream-PR submission status against
-  live GitHub (20 PRs by author, was 4 in the stale catalogue), added a single
+- The upstream-C-bug catalogue: reconciled the upstream-PR submission status
+  against live GitHub (20 PRs by author, was 4 in the stale catalogue), added a single
   authoritative filed-PR table, and reclassified CBUG-B25
   REPRODUCED -> NOT-REPRODUCED (fixed upstream #596).
 
@@ -2085,7 +2084,7 @@ the integrated branch.
 
 ### Merge-regression review
 
-`docs/merge-regression-review-2026-05-19.md` audited the integrated
+A merge-regression review audited the integrated
 branch for defects introduced while combining the punchlist tracks and
 catalogued 37 items — 25 branch-regression candidates (`MR-R1`..`MR-R25`)
 and 12 pre-existing defects observed during the review (`EX-R1`..`EX-R12`),
@@ -2223,8 +2222,7 @@ finding gated on the global *Fixes from reported defects* +
 every hit → bundle-fix in one commit). Rounds 6-11 focused
 exclusively on `epics-ca-rs` server/client wire correctness. Each
 fix carries its own audit-trail commit body; this entry is the
-summary. See `docs/c-parity-review-2026-05-15.md` (round 1) +
-`docs/c-parity-review-2026-05-15-round2.md` (round 2).
+summary.
 
 Workspace: `cargo nextest --workspace` 3633/3633 PASS (32 skipped),
 `cargo test --doc --workspace` clean, `cargo clippy --workspace
@@ -2405,11 +2403,9 @@ clients, masking real failures (`21240ad`).
 
 ### Documentation
 
-- **docs(parity)** `docs/c-parity-review-2026-05-15.md` — round 1
-  multi-team audit log (`5f61621`).
-- **docs(parity)** `docs/c-parity-review-2026-05-15-round2.md` —
-  round 2 audit log + tool-level retrospective on agent worktree
-  base divergence (`211cf3a`, `148c4b7` correction).
+- **docs(parity)** round 1 multi-team audit log (`5f61621`).
+- **docs(parity)** round 2 audit log + tool-level retrospective on
+  agent worktree base divergence (`211cf3a`, `148c4b7` correction).
 - **docs(ca-proto)** clarify `EPICS_CA_MAX_ARRAY_BYTES` default
   divergence from C (`e73b1c7`).
 - **docs(recgbl)** record `check_deadband_ext` NaN-as-sentinel
@@ -2428,7 +2424,7 @@ clients, masking real failures (`21240ad`).
 Upstream-features release: 192 commits closing out asyn-rs C-source
 audit, PVA IPv6 stages 1-6, server-side channel filters, record-layer
 processing parity, and a commit-by-commit C-source review pass that
-produced 13 targeted fixes (`docs/review-rounds-2026-05-14.md`).
+produced 13 targeted fixes.
 
 ### Wire-protocol breaking changes
 
@@ -2448,7 +2444,7 @@ attached via `caget` / `pvget` will see the C-correct values.
 ### asyn-rs — C source audit closure
 
 Full audit of `$EPICS_MODULES/asyn` against `crates/asyn-rs`.
-Every item in `docs/asyn-rs-c-audit.md` is now verified, ported, or
+Every one of the audit's 22 items is now verified, ported, or
 explicitly skipped with a one-line rationale.
 
 - **feat** `drvAsynIPServerPort` — full TCP child-port model with
@@ -2511,8 +2507,7 @@ explicitly skipped with a one-line rationale.
 
 ### epics-base-rs — record / processing / filter parity
 
-13 fixes from the commit-by-commit review (see
-`docs/review-rounds-2026-05-14.md`):
+13 fixes from the commit-by-commit review:
 
 - **feat(filters)** `ts` filter — full num/epoch/str modes
   (`Generate`/`Double`/`Seconds`/`Nanoseconds`/`Array`/`StringEpics`,
@@ -2596,10 +2591,10 @@ re-implemented properly afterward.
 
 ### Internal
 
-- **docs** `docs/review-rounds-2026-05-14.md` — 161-commit
-  commit-by-commit C-source review log producing 13 fixes.
-- **docs** `docs/asyn-rs-c-audit.md` — 22-item C-source audit
-  refreshed, all items resolved.
+- **docs** 161-commit commit-by-commit C-source review log
+  producing 13 fixes.
+- **docs** 22-item asyn-rs C-source audit refreshed, all items
+  resolved.
 
 ### Post-tag amendments (re-tagged 2026-05-14)
 
@@ -3015,9 +3010,9 @@ provenance per item).
   published in dependency order. Example crates
   (`examples/*`) and `*-fuzz` crates remain `publish = false`.
 - The `feat/upstream-pr-fixes` branch carries a parallel
-  `upstream-tracking` doc (`docs/upstream-tracking.md`) with
-  per-PR provenance for every feature in this release; consult
-  that file when wondering "which epics-base PR does X track?".
+  `upstream-tracking` doc with per-PR provenance for every
+  feature in this release; consult it when wondering "which
+  epics-base PR does X track?".
 
 ## v0.15.0 — 2026-05-07
 
@@ -3371,7 +3366,7 @@ same release.
 
 ### docs
 
-- **add**: `docs/reference-feature-map/{README,ca,pva}.md` — Layer 1
+- **add**: a reference feature map — Layer 1
   stable inventory of the CA and PVA public API and wire protocol
   surfaces, extracted from `epics-base/modules/ca` (libca + rsrv,
   177 entries, pinned at `c9817fa59`) and `pvxs` (174 entries,
@@ -3755,8 +3750,7 @@ protocol-level gaps.
   previously silent on the wire.
 
 ### Tooling / docs
-- `archaeology/pvxs/` — full pvxs 1220-commit cross-check with
-  per-batch verdicts.
+- Full pvxs 1220-commit cross-check with per-batch verdicts.
 
 ## v0.11.1 — 2026-04-29
 

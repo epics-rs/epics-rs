@@ -60,7 +60,7 @@
 # MEASURED PITFALLS THIS SCRIPT ENCODES
 #
 #   * libbsd's `waf install` is not parallel-safe (-j12 dies mid-copy);
-#     install runs -j1. doc/rtems-qemu-bringup-artefacts.md.
+#     install runs -j1.
 #   * RTEMS_POSIX_API defaults to false on both branches; without it libbsd's
 #     openssl apps fail to link (signal/alarm live in cpukit/posix) and an
 #     epics-rs image has no POSIX_Init. It is set in the generated config.ini.

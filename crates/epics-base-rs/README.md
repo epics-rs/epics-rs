@@ -127,11 +127,11 @@ for a blocking-front-end deployment (dedicated OS threads, no tokio reactor) —
 `crates/epics-libcom-rs/build.rs` states the intended Linux PREEMPT_RT use, and
 why the switch is an environment variable rather than a cargo feature.
 
-Measured on a PREEMPT_RT kernel in `doc/rtlinux-rt-measurement.md`: with PI on,
-the record-gate priority inversion the mutex was built to kill collapses to the
-critical-section bound (worst case 24.9 ms → 10.1 ms on the measured guest;
-absolute numbers are VM-relative, the ratios are the defensible part). The scan
-latency decomposition lives in `doc/rtlinux-scan-tail-decomposition.md`.
+Measured on a PREEMPT_RT kernel: with PI on, the record-gate priority inversion
+the mutex was built to kill collapses to the critical-section bound (worst case
+24.9 ms → 10.1 ms on the measured guest; absolute numbers are VM-relative, the
+ratios are the defensible part). The scan leg is not what PI solves — SCHED_FIFO
+banding is, at 84.7× on the same guest.
 
 ```
 epics-base-rs/src/

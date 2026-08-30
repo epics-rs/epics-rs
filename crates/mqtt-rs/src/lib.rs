@@ -9,6 +9,7 @@
 //! | `mqtt` | `278a6a4` (tree carries no tags) |
 //! | `autoparamDriver` | `v2.1.0` |
 //! | `asyn` | `R4-45-19-ge2a281e2` |
+//! | `modbus` | `R3-4-10-gb1009d0` |
 //! | `epics-base` | `R7.0.10` |
 //!
 //! **Resolve by symbol at the pin; the line is a hint.** Find the named

@@ -12,9 +12,9 @@
 #
 # WHY THIS FILE EXISTS
 #
-# The invocation used to live only in prose (doc/rtems-runtime-portability-
-# design.md §8.1). Two things followed from that, and the second is why this
-# script is here rather than another paragraph:
+# The invocation used to live only in prose, in a design document. Two things
+# followed from that, and the second is why this script is here rather than
+# another paragraph:
 #
 #   * The written form was `-p <crate> --lib`, and `--lib` never compiles
 #     `src/bin/*.rs`. The one binary anyone boots on the target — realtime-ca-ioc
@@ -78,10 +78,9 @@ cd "$REPO_ROOT"
 # The RTEMS target this gate compiles for.
 #
 # ADOPTED DEVIATION: by default this is the custom spec carrying
-# `has-thread-local: true` (measured to take the per-thread heap leak from
-# 136 B to 0 — `doc/rtems-tls-spec-deviation.md`, evidence in
-# `doc/upstream-rtems-bugs/rust-std-rtems-tls-thread-leak.md`). Every RTEMS
-# image this workspace ships is built with the flip, so the gate compiles the
+# `has-thread-local: true` (measured against stock rust-std to take the
+# per-thread heap leak from 136 B to 0). Every RTEMS image this workspace
+# ships is built with the flip, so the gate compiles the
 # same native-TLS codegen the image uses: `has-thread-local` flips
 # `cfg(target_thread_local)`, which selects a *different* std TLS path, and a
 # gate on the builtin triple would type-check the path the image does not take.
@@ -175,8 +174,8 @@ CRATES=(epics-libcom-rs epics-base-rs epics-ca-rs epics-pva-rs epics-rtems-boot 
 # `SearchUdpSocket` (the ratchet probe below measures zero), and does NOT
 # pull `tls`/`pkcs12` (no `ring`, no `getrandom 0.2`) because the bridge's
 # `epics-pva-rs` dependency is `default-features = false`. Before stage 4 this
-# was `qsrv-core` alone, because `client_native` was 47 errors on this target
-# (doc/qsrv-rtems-design.md §0 probe D); design §5 stage 4 closed them.
+# was `qsrv-core` alone, because `client_native` was 47 errors on this target;
+# the pvalink staging work closed them.
 #
 # `epics-ca-rs` selects `client-core` for the same reason, one protocol over:
 # `realtime-ca-ioc` mounts the `ca://` record-link resolver (design stage C5), and
@@ -205,9 +204,8 @@ BINS=(
     # `realtime-pva-ioc` is an `epics-bridge-rs` binary, not an `epics-pva-rs` one.
     # It moved when it grew a QSRV group source: the mount needs the bridge, and
     # `epics-pva-rs` cannot depend on the bridge without a cyclic package
-    # dependency, which cargo rejects outright (measured — see
-    # doc/qsrv-rtems-design.md §9.7). It is still the only target PVA binary, so
-    # this stays one entry, not two.
+    # dependency, which cargo rejects outright (measured). It is still the
+    # only target PVA binary, so this stays one entry, not two.
     #
     # It carries `required-features = ["qsrv-core", "pvalink"]`, which the loop
     # below supplies from CRATE_FEATURES. That combination is safe here and was
@@ -431,8 +429,8 @@ for config in "${CONFIGS[@]}"; do
         # Each target binary is checked twice: once as shipped by default (a
         # clean IOC — no probe records, no probe threads) and once with
         # `bringup-probes`, the measurement rig the bring-up box's build
-        # scripts select (doc/calink-rtems-design.md §11.7 item 3). Both are
-        # real images someone boots, so both are census, not choice.
+        # scripts select. Both are real images someone boots, so both are
+        # census, not choice.
         for probe in "" bringup-probes; do
             sel="${CRATE_FEATURES[$crate]:-}"
             [[ -n "$probe" ]] && sel="${sel:+$sel,}$probe"
@@ -455,18 +453,18 @@ fi
 # ---------------------------------------------------------------------------
 # The PVA client probe: a RATCHET, not a pass/fail build.
 #
-# `doc/pvalink-rtems-design.md` §5 stage 2 asks for this crate's target
-# selection to be "extended to include `client`". Taken literally — adding
-# `client` to CRATE_FEATURES — the whole gate goes red, because the client's
+# The pvalink staging asks for this crate's target selection to be extended to
+# include `client`. Taken literally — adding `client` to CRATE_FEATURES — the
+# whole gate goes red, because the client's
 # remaining errors are all UDP (newlib has no `recvmsg`/`cmsghdr`/`CMSG_*`, no
-# `IP_PKTINFO` original-destination recovery) and §4.2 stages that work AFTER
+# `IP_PKTINFO` original-destination recovery) and that UDP work is staged AFTER
 # this one, deliberately. A gate that is red for work nobody has started yet
-# reports nothing, and stages 3-5 all extend the green one above.
+# reports nothing, and the later stages all extend the green one above.
 #
 # So the selection is measured rather than built: the count is the artefact.
-# §1.2 could only report "47, and that is a lower bound" because an unresolved
-# import poisons its module and rustc then suppresses downstream errors in code
-# naming its items — so a file reporting zero was ambiguous between "compiles"
+# The first count could only be reported as "47, and that is a lower bound",
+# because an unresolved import poisons its module and rustc then suppresses
+# downstream errors in code naming its items — so a file reporting zero was ambiguous between "compiles"
 # and "hidden". Pinning the number here is what stops that count drifting
 # unobserved in either direction:
 #
@@ -542,9 +540,9 @@ fi
 # ---------------------------------------------------------------------------
 # The CA client had the same RATCHET, and no longer needs one.
 #
-# `doc/calink-rtems-design.md` §6 stage C5 mounts the `ca://` record-link
-# resolver in `realtime-ca-ioc`, which needs `epics-ca-rs`'s CLIENT to compile for
-# the target — `calink` drives a live `CaClient` (§2.1). While that was work in
+# Stage C5 of the calink staging mounts the `ca://` record-link resolver in
+# `realtime-ca-ioc`, which needs `epics-ca-rs`'s CLIENT to compile for the
+# target — `calink` drives a live `CaClient`. While that was work in
 # progress the selection was MEASURED rather than built, exactly as the PVA one
 # above still is, because a gate red for unstarted work reports nothing:
 #
@@ -596,7 +594,7 @@ if [[ "${RTEMS_USE_STOCK_SPEC:-0}" == "1" ]]; then
     log "target binary compiles for armv7-rtems-eabihf, in both the portability"
     log "and the image configuration."
 else
-    log "RTEMS gate (has-thread-local spec, doc/rtems-tls-spec-deviation.md): every"
+    log "RTEMS gate (has-thread-local spec): every"
     log "crate and target binary compiles for the generated native-TLS spec, in"
     log "both the portability and the image configuration."
 fi

@@ -4,8 +4,8 @@
 # `.cargo/config.toml`) that reroutes any invocation selecting the *builtin*
 # `armv7-rtems-eabihf` triple through the generated has-thread-local spec, so
 # a plain `cargo +nightly build --target armv7-rtems-eabihf` picks up the
-# one-key deviation (`doc/rtems-tls-spec-deviation.md`) without going through
-# `rtems-check.sh` or the box build scripts.
+# one-key deviation without going through `rtems-check.sh` or the box build
+# scripts.
 #
 # Every other invocation — host builds, and the explicit `-tls.json` spec
 # paths the gate and box scripts pass — execs straight through untouched, so

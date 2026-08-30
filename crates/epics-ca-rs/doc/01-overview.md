@@ -205,8 +205,8 @@ ring buffer.
 
 ## Where libca-parity is enforced
 
-`09-libca-parity.md` lists the cases where we deliberately mirror libca
-behaviour. The most important examples:
+The port deliberately mirrors libca behaviour rather than tidying it up.
+The cases that matter most:
 
 - **Search response parsing**: accept `cid == 0` and `cid == ~0u32` as
   "use UDP source address" (`client/search.rs::handle_udp_response`).
@@ -216,8 +216,11 @@ behaviour. The most important examples:
   `osiSockDiscoverBroadcastAddresses`.
 - **DBR_PUT_ACKT/ACKS** route to record `ACKT`/`ACKS` fields, never to
   the channel's normal write path.
-- **`CAS_USE_HOST_NAMES=NO` (default)** → server uses peer IP, ignores
-  client-supplied hostname.
+- **Client host name**: under C's default (`asCheckClientIP == 0`) the
+  server stores the name the client sent in `CA_PROTO_HOST_NAME` and does
+  not verify it; only `asCheckClientIP = 1` pins the peer's dotted-quad IP
+  instead. There is no `EPICS_CAS_USE_HOST_NAMES` variable, here or in
+  epics-base — see `08-environment.md`.
 
 ## Performance notes
 

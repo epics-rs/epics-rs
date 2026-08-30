@@ -46,8 +46,8 @@ at the pin and at the checkout alike, and the assignment is in the `.cpp`.
 ## ADSupport — 25 citations, pin `R1-10`
 
 `bitshuffle_core.c` and `bitshuffle.c` under `supportApp/bitshuffleSrc/`,
-reached from `src/codec.rs` (13 sites) and `doc/parity-review-compute.md` (12);
-13 distinct citation values.
+reached from `src/codec.rs` (13 sites) and a since-deleted workspace
+parity-review document (12); 13 distinct citation values.
 
 **`R1-10`** (`e5be67d7`, 2021-05-26) is the pin because it is byte-identical to
 the checkout in exactly these files, not because it is a tag. Both files have

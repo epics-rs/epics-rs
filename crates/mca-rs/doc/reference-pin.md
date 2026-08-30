@@ -9,9 +9,8 @@ that revision, not against whatever the local checkout happens to hold.
 | mca | **`687d563`** (tree carries no tags) | `687d563` — same commit | 64 |
 | epics-base | **`R7.0.10`** (tag object `e1c98a45`, commit `bf11a0c3`) | `R7.0.10-146-g8f5015b66` | 10 |
 
-Recorded 2026-08-26. Counted with `doc/parity-instruments/span-census.py`,
-which detects the full `file.ext:payload` form; a bare `:NNN` continuation is
-not counted again. The counts are of the crate **without this file**: the
+Recorded 2026-08-26. Counted by matching the full `file.ext:payload` form; a
+bare `:NNN` continuation is not counted again. The counts are of the crate **without this file**: the
 epics-base list below quotes five of its own citations, so a re-run over
 `crates/mca-rs` now reports 15 rather than 10 for those basenames.
 

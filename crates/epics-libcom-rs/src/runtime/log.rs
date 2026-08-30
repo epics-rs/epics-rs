@@ -75,8 +75,14 @@ fn console_subscriber_is_current() -> bool {
 /// subscriber is also what keeps `errlogPrintfNoConsole` off the console and
 /// makes `eltc(0)` mean what C means by it: both are decisions about *these*
 /// bytes, and a `tracing` event carries neither.
-fn console_fallback(line: &str) {
-    if (nothing_is_listening() || console_subscriber_is_current()) && errlog_to_console() {
+///
+/// `local_echo` is C's `msgbufCommit` argument, decided once per message by
+/// [`errlog_post`] under the queue lock. It is a parameter rather than another
+/// [`errlog_to_console`] call because the same answer also decides whether the
+/// producer waits for the drain: two reads of `eltc` would let one message
+/// print without back-pressure, or take back-pressure without printing.
+fn console_fallback(line: &str, local_echo: bool) {
+    if local_echo && (nothing_is_listening() || console_subscriber_is_current()) {
         write_console(&mut std::io::stderr().lock(), line);
     }
 }
@@ -555,8 +561,7 @@ pub fn errlog_sev_printf(severity: ErrlogSevEnum, message: &str) {
             tracing::error!(target: "epics_base_rs::errlog", "{record}")
         }
     }
-    errlog_enqueue(&line);
-    console_fallback(&line);
+    errlog_post(&line, ConsoleEcho::Yes);
 }
 
 /// Emit a pre-formatted message through the errlog facility
@@ -571,8 +576,7 @@ pub fn errlog_sev_printf(severity: ErrlogSevEnum, message: &str) {
 /// for the `"errlog"` output stream (`devStdio.c` `logPrintf`).
 pub fn errlog_printf(message: &str) {
     tracing::info!(target: "epics_base_rs::errlog", "{}", as_record(message));
-    errlog_enqueue(message);
-    console_fallback(message);
+    errlog_post(message, ConsoleEcho::Yes);
 }
 
 /// C `errlogPrintfNoConsole` (`errlog.c:343-364`): the same message queue,
@@ -580,7 +584,7 @@ pub fn errlog_printf(message: &str) {
 /// Listeners — the IOC log client among them — still receive it.
 pub fn errlog_printf_no_console(message: &str) {
     tracing::info!(target: "epics_base_rs::errlog", "{}", as_record(message));
-    errlog_enqueue(message);
+    errlog_post(message, ConsoleEcho::No);
 }
 
 /// C `errlogMessage` (`errlog.c:337-341`) — `errlogPrintf("%s", message)`.
@@ -685,6 +689,15 @@ struct Errlog {
     seq: std::sync::Condvar,
     listeners: std::sync::Mutex<Vec<(ErrlogListenerId, ErrlogListenerFn)>>,
     next_id: std::sync::atomic::AtomicU64,
+    /// Set once, after the worker thread is known to exist.
+    ///
+    /// C has no equivalent because C has no such state: `errlogInit2` calls
+    /// `cantProceed` when the thread will not start (`errlog.c:604-606`), so
+    /// every later line runs in a process that has a drainer. This port keeps
+    /// the IOC alive instead, which makes "no drainer" reachable — and a
+    /// producer that waits for a drain that can never happen would hang the
+    /// IOC on its first log line, turning a degraded log sink into a dead IOC.
+    worker_running: std::sync::atomic::AtomicBool,
 }
 
 static ERRLOG: std::sync::OnceLock<&'static Errlog> = std::sync::OnceLock::new();
@@ -729,6 +742,7 @@ fn errlog_pvt2(bufsize: usize, max_msg_size: usize) -> &'static Errlog {
             seq: std::sync::Condvar::new(),
             listeners: std::sync::Mutex::new(Vec::new()),
             next_id: std::sync::atomic::AtomicU64::new(1),
+            worker_running: std::sync::atomic::AtomicBool::new(false),
         }));
         // C `epicsThreadCreateOpt("errlog", …)` at `epicsThreadPriorityLow`
         // with `epicsThreadStackSmall` (`errlog.c:568-574`).
@@ -738,7 +752,11 @@ fn errlog_pvt2(bufsize: usize, max_msg_size: usize) -> &'static Errlog {
             crate::runtime::task::StackSizeClass::Small,
             move || errlog_worker(errlog),
         );
-        if spawned.is_err() {
+        if spawned.is_ok() {
+            errlog
+                .worker_running
+                .store(true, std::sync::atomic::Ordering::Relaxed);
+        } else {
             // C exits the process when the thread cannot be created
             // (`errlog.c:604-606`). Here the queue still accepts and still
             // accounts; only delivery stops, so say so rather than kill an
@@ -806,21 +824,76 @@ fn errlog_worker(errlog: &'static Errlog) {
     }
 }
 
-/// C `msgbufAlloc`/`msgbufCommit` (`errlog.c:113-180`) as one step.
+/// Whether this call site puts the message on the console at all — C's
+/// `localEcho` argument to `msgbufCommit`, which is `pvt.toConsole` for
+/// `errlogVprintf`/`errlogSevVprintf` and a hard `0` for the `NoConsole` pair
+/// (`errlog.c:334`, `:365`, `:388`).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ConsoleEcho {
+    Yes,
+    No,
+}
+
+/// C `msgbufAlloc`/`msgbufCommit` (`errlog.c:113-188`) as one step: admit the
+/// message, wake the worker, echo it, and — the part that makes the arena a
+/// bound on *latency* rather than on messages — wait for the drain.
 ///
-/// The admission rule is C's and is what makes the buffer a bound rather than
-/// a `Vec` that grows: a message is accepted only when the WORST CASE still
-/// fits — `bufSize - pos >= 1 + maxMsgSize` — so a burst is dropped and
+/// The admission rule is C's: a message is accepted only when the WORST CASE
+/// still fits — `bufSize - pos >= 1 + maxMsgSize` — so a burst is dropped and
 /// counted instead of consuming memory, and the count reaches the console as
 /// `errlog: lost N messages`.
-fn errlog_enqueue(message: &str) {
+///
+/// # Why the flush is not optional
+///
+/// C pairs that refusal with back-pressure in the same function: after a
+/// message that echoes to the console, logged from a thread that may block and
+/// outside shutdown, `msgbufCommit` runs `errlogFlush()` (`errlog.c:186-187`).
+/// The producer therefore cannot get ahead of the drainer by more than one
+/// message, and `pos` is back at 0 before the next call — which is why a C IOC
+/// boots a 400-line script through a 1280-byte arena and loses nothing.
+///
+/// Porting the arena without the flush turned a bound on memory into silent
+/// loss of listener copies: a boot burst filled `pos` and every further line
+/// was refused until the worker happened to run. The fix belongs here and not
+/// in [`MIN_BUFFER_SIZE`], because no buffer size is large enough — the rule C
+/// relies on is that the producer waits, not that the arena is big.
+///
+/// The three gates are C's and each closes a real path: `ok_to_block` keeps a
+/// scan or serving thread off the drain and, because
+/// [`enter_ioc_thread`](crate::runtime::task::enter_ioc_thread) clears it, also
+/// stops the errlog worker from flushing into itself when a listener logs;
+/// `at_exit` matches C's `!atExit`, the worker having stopped; `local_echo`
+/// matches C's argument, so `errlogPrintfNoConsole` and `eltc(0)` cost no wait.
+fn errlog_post(message: &str, echo: ConsoleEcho) {
     let errlog = errlog_pvt();
+    // C reads it before the lock (`errlog.c:147`); it is this thread's own.
+    let ok_to_block = crate::runtime::task::thread_is_ok_to_block();
+
     let mut q = errlog.queue.lock().expect("errlog queue");
     let was_empty = q.log.pos == 0;
+    let at_exit = q.at_exit;
+    // One read of `eltc` per message, under the same lock that admits it.
+    let local_echo = echo == ConsoleEcho::Yes && q.to_console;
     let accepted = q.accept(message);
     drop(q);
+
     if accepted && was_empty {
         errlog.work.notify_all();
+    }
+    console_fallback(message, local_echo);
+
+    // C `msgbufCommit`'s tail (`errlog.c:186-187`). `accepted` stands for C's
+    // `msgbufAlloc` having returned a buffer at all: a refused message never
+    // reaches `msgbufCommit` and so never flushes there either.
+    if accepted
+        && local_echo
+        && ok_to_block
+        && !at_exit
+        && errlog
+            .worker_running
+            .load(std::sync::atomic::Ordering::Relaxed)
+    {
+        errlog_flush();
     }
 }
 
@@ -1446,6 +1519,182 @@ mod tests {
         q.log.pos = q.buf_size - q.max_msg_size;
         assert!(!q.accept("x"), "one byte past it is not");
         assert_eq!(q.n_lost, 1);
+    }
+
+    /// The defect this arena had without C's back-pressure: a boot burst.
+    ///
+    /// 200 console-echoed messages is what a real `iocBoot` script produces,
+    /// and 1280/256 admits 86 of them at a time. C loses none of it because
+    /// `msgbufCommit` flushes after every echoed message (`errlog.c:186-187`),
+    /// so `pos` is 0 again before the next call. The observable is both halves
+    /// of "nothing was lost": the refusal counter, and the listener copies —
+    /// the console copy is written by the producer here and would survive the
+    /// loss, which is exactly why the counter alone would have looked fine.
+    ///
+    /// Deterministic, not a race: the last message's flush cannot return until
+    /// the worker has completed a pass with it in hand.
+    #[test]
+    #[serial(errlog_listeners)]
+    fn a_boot_sized_burst_of_console_messages_loses_none() {
+        let seen = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let sink = std::sync::Arc::clone(&seen);
+        let id = errlog_add_listener(move |_| {
+            sink.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        });
+
+        const BURST: usize = 200;
+        for i in 0..BURST {
+            errlog_printf(&format!("burst line {i}\n"));
+        }
+
+        let lost = errlog_messages_lost();
+        let heard = seen.load(std::sync::atomic::Ordering::SeqCst);
+        assert!(errlog_remove_listener(id));
+        assert_eq!(lost, 0, "the arena refused {lost} of {BURST}");
+        assert_eq!(heard, BURST, "every message reached the listeners");
+    }
+
+    /// The invariant the previous test rests on, stated directly and in both
+    /// directions: **a producer that echoes to the console and may block does
+    /// not return until the worker has drained its message; one that may not
+    /// block returns straight away.**
+    ///
+    /// C `msgbufCommit` (`errlog.c:186-187`). Holding the worker inside a
+    /// listener makes both halves decidable rather than timed: while the gate
+    /// is shut the drain cannot complete, so a producer that waits for it
+    /// cannot return, and a producer that does not wait must already have.
+    #[test]
+    #[serial(errlog_listeners)]
+    fn only_a_blocking_producer_waits_for_the_drain() {
+        for prologue in [false, true] {
+            let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+            let (entered_tx, entered_rx) = std::sync::mpsc::channel::<()>();
+            let release_rx = std::sync::Mutex::new(release_rx);
+            let holding = std::sync::atomic::AtomicBool::new(false);
+            let id = errlog_add_listener(move |_| {
+                if !holding.swap(true, std::sync::atomic::Ordering::SeqCst) {
+                    let _ = entered_tx.send(());
+                    let _ = release_rx.lock().expect("gate").recv();
+                }
+            });
+
+            // Shuts the gate, and is itself a producer of the kind under test
+            // only in the `false` pass — so the gate is entered from a message
+            // whose own wait has already been satisfied or never taken.
+            let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
+            let producer = std::thread::spawn(move || {
+                if prologue {
+                    let _ = crate::runtime::task::enter_ioc_thread(
+                        crate::runtime::task::ThreadPriority::ScanLow,
+                    );
+                }
+                errlog_printf("gated\n");
+                let _ = done_tx.send(());
+            });
+            entered_rx
+                .recv_timeout(std::time::Duration::from_secs(10))
+                .expect("the worker reaches the listener");
+
+            let returned_while_gated = done_rx
+                .recv_timeout(std::time::Duration::from_millis(300))
+                .is_ok();
+            let _ = release_tx.send(());
+            if !returned_while_gated {
+                done_rx
+                    .recv_timeout(std::time::Duration::from_secs(10))
+                    .expect("the producer returns once the drain completes");
+            }
+            producer.join().expect("the producer thread");
+            errlog_flush();
+            assert!(errlog_remove_listener(id));
+
+            assert_eq!(
+                returned_while_gated, prologue,
+                "prologue={prologue}: C waits exactly when `epicsThreadIsOkToBlock`"
+            );
+        }
+    }
+
+    /// The same burst with the console off, which is C's other answer and the
+    /// proof that the burst really does overflow.
+    ///
+    /// `eltc(0)` makes `localEcho` 0, so `msgbufCommit` takes no back-pressure
+    /// and the arena behaves as a pure bound: the messages past 86 are refused
+    /// and counted. Holding the worker inside a listener makes that the only
+    /// possible outcome rather than a race with the drain — and it is the same
+    /// hold that shows the previous test is measuring something, since without
+    /// the flush that burst is this one.
+    #[test]
+    #[serial(errlog_listeners)]
+    fn the_same_burst_with_the_console_off_overflows_and_is_counted() {
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel::<()>();
+        let release_rx = std::sync::Mutex::new(release_rx);
+        let holding = std::sync::atomic::AtomicBool::new(false);
+        let id = errlog_add_listener(move |_| {
+            if !holding.swap(true, std::sync::atomic::Ordering::SeqCst) {
+                let _ = entered_tx.send(());
+                let _ = release_rx.lock().expect("gate").recv();
+            }
+        });
+
+        let was = eltc(false);
+        errlog_printf("prime\n");
+        entered_rx
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("the worker reaches the listener");
+
+        for i in 0..200 {
+            errlog_printf(&format!("burst line {i}\n"));
+        }
+        let lost = errlog_messages_lost();
+
+        let _ = release_tx.send(());
+        errlog_flush();
+        eltc(was);
+        assert!(errlog_remove_listener(id));
+        assert!(
+            lost > 0,
+            "a stalled drain plus 200 messages must overflow a 1280-byte arena"
+        );
+    }
+
+    /// The gate that makes the flush safe: the errlog worker must never wait
+    /// for its own next pass.
+    ///
+    /// A listener runs on the worker thread, and a listener that logs is
+    /// ordinary — the IOC log client does it on a reconnect. C is protected by
+    /// `isOkToBlock`, which is 0 for every `epicsThreadCreate` thread; here
+    /// `enter_ioc_thread` clears the same flag for the worker. Without it this
+    /// test does not fail, it hangs, so the wait is bounded and the failure is
+    /// a timeout rather than a wedged process.
+    #[test]
+    #[serial(errlog_listeners)]
+    fn a_listener_that_logs_does_not_wait_for_its_own_drain() {
+        let logged = std::sync::atomic::AtomicBool::new(false);
+        let id = errlog_add_listener(move |_| {
+            if !logged.swap(true, std::sync::atomic::Ordering::SeqCst) {
+                errlog_printf("from inside the listener\n");
+            }
+        });
+
+        let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
+        let worker = std::thread::spawn(move || {
+            errlog_printf("trigger\n");
+            errlog_flush();
+            let _ = done_tx.send(());
+        });
+        let finished = done_rx
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .is_ok();
+        if finished {
+            worker.join().expect("the logging thread");
+        }
+        assert!(errlog_remove_listener(id));
+        assert!(
+            finished,
+            "the worker flushed into itself and the producer never returned"
+        );
     }
 
     /// Boundary: a message at `maxMsgSize`. C cuts it to `maxMsgSize - 1`

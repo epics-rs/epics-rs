@@ -3195,13 +3195,14 @@ mod tests {
     /// failure is specific to a libbsd socket and is not a general fcntl
     /// gap. The `F_DUPFD_CLOEXEC` variant additionally cannot work on
     /// **RTEMS 6** whatever the file is: `cpukit/libcsupport/src/fcntl.c`
-    /// has no case for it and falls to `default: EINVAL`. That is a
-    /// series-6 statement (`rtems-kernel_6` `51f962fb3`); the series-7
-    /// kernel was not read, and neither tree is checked out here
-    /// (`revisions.py` `ABSENT_HERE`).
+    /// has no case for it (`:146-220`) and falls to `default: EINVAL`.
+    /// That is a series-6 statement (`rtems-kernel_6` `51f962fb3`) and only
+    /// that: the series-7 kernel (`181e86a19`) DOES handle
+    /// `F_DUPFD_CLOEXEC`, at `:173-175`, so the ban rests on the series we
+    /// ship rather than on RTEMS in general.
     ///
     /// **Withdrawn:** this comment used to explain the plain-`F_DUPFD`
-    /// failure by saying `duplicate_iop` (`fcntl.c:47-77`) calls the file's
+    /// failure by saying `duplicate_iop` (`fcntl.c:47-79`) calls the file's
     /// `open_h` and that `rtems_bsd_sysgen_nodeops.open_h` is
     /// `rtems_bsd_sysgen_open_error`. The `duplicate_iop` half is right; the
     /// libbsd half is FALSE at **both** declared pins (`7-freebsd-14`

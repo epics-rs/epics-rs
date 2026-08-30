@@ -182,7 +182,40 @@ fn convert_value_to_dbr_string(
     // renders `%*.*e` (compiled: `caget -S` of a PREC=-1 ai gives
     // ` 3.70000000000000018e+00`). Clamping to 0 printed `4` instead.
     let prec = snapshot.precision().map(|p| p as u16).unwrap_or(6);
+    if let Some(rendered) = dbr_string_at_precision(value, prec) {
+        return Ok(rendered);
+    }
     Ok(match value {
+        // C `getEnumString` (dbConvert.c, `[DBF_ENUM][DBR_STRING]`) hands the
+        // value to the field's own string source — the record's `get_enum_str`
+        // rset, a menu's choice list, a device's choice list — and renders what
+        // comes back. See `enum_label`.
+        EpicsValue::Enum(v) => EpicsValue::String(enum_label(snapshot, *v)),
+        EpicsValue::EnumArray(a) => {
+            EpicsValue::StringArray(a.iter().map(|v| enum_label(snapshot, *v)).collect())
+        }
+        other => other.get_convert(DbFieldType::String)?,
+    })
+}
+
+/// The float/double rows of C's `DBR_STRING` column, **in both directions**.
+///
+/// `getFloatString`/`getDoubleString` (`dbConvert.c:735`/`:772`),
+/// `putFloatString`/`putDoubleString` (`:1558`/`:1600`) and the scalar twins
+/// `cvt_f_st`/`cvt_d_st` (`dbFastLinkConv.c:1216`/`:1333`) are four copies of
+/// one body: seed `long precision = 6`, overwrite it from
+/// `prset->get_precision`, render through `cvtFloatToString` /
+/// `cvtDoubleToString`. Every other numeric row of that column —
+/// `cvtCharToString` through `cvtUInt64ToString` — carries no precision at
+/// all, which is why this answers `None` for them and leaves them to the
+/// plain `convert_to` / `get_convert` projection.
+///
+/// One function because the two directions have to agree: the put path used
+/// Rust's `Display` and stored `1.0` into a `PREC=3` `DESC` as `"1"` where
+/// `dbtpf` gave `"1.000"` — one field reading back two ways depending on which
+/// door the value came through.
+pub(crate) fn dbr_string_at_precision(value: &EpicsValue, prec: u16) -> Option<EpicsValue> {
+    Some(match value {
         EpicsValue::Double(v) => EpicsValue::String(cvt_double_to_string(*v, prec).into()),
         EpicsValue::Float(v) => EpicsValue::String(cvt_float_to_string(*v, prec).into()),
         EpicsValue::DoubleArray(a) => EpicsValue::StringArray(
@@ -195,15 +228,7 @@ fn convert_value_to_dbr_string(
                 .map(|v| cvt_float_to_string(*v, prec).into())
                 .collect(),
         ),
-        // C `getEnumString` (dbConvert.c, `[DBF_ENUM][DBR_STRING]`) hands the
-        // value to the field's own string source — the record's `get_enum_str`
-        // rset, a menu's choice list, a device's choice list — and renders what
-        // comes back. See `enum_label`.
-        EpicsValue::Enum(v) => EpicsValue::String(enum_label(snapshot, *v)),
-        EpicsValue::EnumArray(a) => {
-            EpicsValue::StringArray(a.iter().map(|v| enum_label(snapshot, *v)).collect())
-        }
-        other => other.get_convert(DbFieldType::String)?,
+        _ => return None,
     })
 }
 

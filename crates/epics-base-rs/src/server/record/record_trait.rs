@@ -2313,15 +2313,56 @@ pub trait Record: Send + Sync + 'static {
         )
     }
 
-    /// Whether async processing has completed and put_notify can respond.
-    /// Records that return AsyncPendingNotify should return false while
-    /// async work is in progress, and true when done.
-    /// Default: true (synchronous records are always complete).
+    /// Has this cycle REACHED the record's `recGblFwdLink` line?
+    ///
+    /// C `if (!pact && prec->pact) return(0)` — device support took the write
+    /// asynchronously, so `process()` returns before the tail and the client's
+    /// `ca_put_callback` is still owed. A record that returns
+    /// `AsyncPendingNotify` answers `false` until its device round-trip is
+    /// done. Default: true, the synchronous record that runs to its own tail.
+    ///
+    /// One of the two inputs to `complete_put_notify`; see
+    /// [`Self::should_fire_forward_link`] for the other and for the invariant
+    /// they share.
     fn is_put_complete(&self) -> bool {
         true
     }
 
-    /// Whether this record should fire its forward link after processing.
+    /// Does this cycle TAKE the record's `recGblFwdLink` line, having reached
+    /// it?
+    ///
+    /// # Invariant (CONTRACT)
+    ///
+    /// A cycle completes an outstanding put-notify if and only if it runs
+    /// `recGblFwdLink`. C `recGbl.c:290-303` is why: `if (pdbc->ppn)
+    /// dbNotifyCompletion(pdbc)` sits INSIDE the function a record type
+    /// chooses whether to call, so declining the forward link withholds the
+    /// client's `ca_put_callback` by construction. The two are one decision in
+    /// C and must stay one here — mca's own source says so where it makes the
+    /// choice: "Process forward-linked record. Tell EPICS dbPutNotify
+    /// mechanism that processing is finished." (`mcaRecord.c:820-826`).
+    ///
+    /// The single owner of that decision is
+    /// `database::processing::complete_put_notify`, which reads this method
+    /// and [`Self::is_put_complete`] together. A record type states its C gate
+    /// HERE and nowhere else; it must not carry a second, separately-drifting
+    /// `is_put_complete` override to say the same thing.
+    ///
+    /// Six types gate the call, each transcribing one C line:
+    ///
+    /// - `busy` (`busyRecord.c:271`): `if ((prec->val == 0) || (prec->oval ==
+    ///   0)) recGblFwdLink(prec);`
+    /// - `motor` (`motorRecord.cc:1509`): `if (pmr->dmov != 0)`
+    /// - `mca` (`mcaRecord.c:824`): `if (!pmca->acqg)`
+    /// - `scaler` (`scalerRecord.c:475`): `if ((pscal->pcnt==0) && (pscal->us
+    ///   == USER_STATE_IDLE))` inside the `ss == SCALER_STATE_IDLE` arm
+    /// - `epid` (`epidRecord.c:201`): the UDF-gated `return(0)` above the
+    ///   `:212` call
+    /// - `throttle` (`throttleRecord.c:308`): the call is commented out in
+    ///   `process()` and fired only from `valuePut`'s real-OUT-write branch
+    ///   (`:582`)
+    ///
+    /// Default: true — the standard record, which calls it unconditionally.
     fn should_fire_forward_link(&self) -> bool {
         true
     }
@@ -4629,7 +4670,62 @@ pub fn coerce_put_value<R: Record + ?Sized>(
             )));
         }
     }
+    // The float/double rows of C's DBR_STRING put column render through the
+    // record's `get_precision`, seeded 6: `putFloatString`/`putDoubleString`
+    // (`dbConvert.c:1558`/`:1600`) for the array path,
+    // `cvt_f_st`/`cvt_d_st` (`dbFastLinkConv.c:1216`/`:1333`) for the scalar
+    // one that `dbAccess.c:1391` actually takes. `convert_to` cannot express
+    // it — it is field-blind by contract, and precision is the record's — so
+    // the row belongs here, next to the menu and enum rows it also cannot
+    // express. Rendering through the GET direction's own converter is what
+    // keeps `dbtgf REC.DESC` and a `caput` of the same number agreeing.
+    if target == DbFieldType::String
+        && let Some(rendered) =
+            crate::types::codec::dbr_string_at_precision(&value, put_string_precision(record))
+    {
+        return Ok(Converted::Stored(rendered));
+    }
     Ok(Converted::Stored(value.convert_to(target)))
+}
+
+/// C's `prset->get_precision` answer for a **`DBF_STRING`** destination — the
+/// precision `putFloatString`/`putDoubleString` render a numeric put with.
+///
+/// The seed is 6 and only `get_precision` overwrites it
+/// (`dbConvert.c:1562-1568`, `dbFastLinkConv.c:1220-1228`). For a STRING field
+/// the shared tail is a no-op: `recGblGetPrec`'s switch has no `DBF_STRING`
+/// case (`recGbl.c:141-142`), so whatever the body seeded survives. And no
+/// `get_precision` in base or in the ported modules names a `DBF_STRING` field
+/// in its own switch, so the answer is per RECORD rather than per field: it is
+/// `PREC` for every body that seeds `*precision = prec->prec` ahead of the tail
+/// — ai, ao, aai, aao, aSub, calc, calcout, compress, dfanout, sel, seq, sub,
+/// subArray, waveform, sCalcout, aCalcout, epid, mca, motor, scaler, sseq,
+/// swait, throttle, transform. The two ported types that do not seed:
+///
+/// * `histogram` — a switch with no seed and no case a dbCommon field reaches,
+///   so the caller's 6 arrives at `cvtDoubleToString`
+///   (`histogramRecord.c:420-438`).
+/// * `asyn` — `*precision = 0;` before the tail (`asynRecord.c::get_precision`).
+///
+/// `bo`, `busy`, `mbbiDirect` and `mbboDirect` are unseeded too and need no arm:
+/// none of them declares `PREC`, so the fallback is already C's 6. No record
+/// type declares `PREC` while NULLing `get_precision` (checked across base and
+/// the ported modules), which is what lets "has a PREC field" stand in for
+/// "supplies the slot" without a second table to keep in step.
+///
+/// A negative PREC is not clamped, for the reason
+/// [`crate::types::codec`]'s GET side spells out: C hands the `long` to
+/// `cvtDoubleToString`'s `epicsUInt16` parameter and the conversion
+/// reinterprets it.
+fn put_string_precision<R: Record + ?Sized>(record: &R) -> u16 {
+    match record.record_type() {
+        "histogram" => 6,
+        "asyn" => 0,
+        _ => record
+            .get_field("PREC")
+            .and_then(|v| v.as_int_i64())
+            .map_or(6, |p| p as i16 as u16),
+    }
 }
 
 /// C `putStringString`'s truncation: a `DBF_STRING` field stores at most

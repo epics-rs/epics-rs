@@ -436,12 +436,43 @@ impl AsyncDbHandle {
     }
 }
 
-/// C `dbNotifyCompletion`: this record finished its contribution to the
-/// put-notify (sync completion, async completion, or SDIS-disable bail).
-/// Take its wait-set membership and leave — the completion oneshot fires on
-/// the `leave` that empties the set. Idempotent: a record not in any
-/// put-notify is a no-op.
+/// C `dbNotifyCompletion` (`dbNotify.c:445`) reached the way a process cycle
+/// reaches it — through `recGblFwdLink` (`recGbl.c:295`), record support's only
+/// route to it. Take this record's wait-set membership and leave; the
+/// completion oneshot fires on the `leave` that empties the set.
+///
+/// # Invariant (CONTRACT)
+///
+/// A cycle completes an outstanding put-notify IF AND ONLY IF it runs
+/// `recGblFwdLink`. Two things stop it, and **both are read here** so no cycle
+/// tail can consult one and forget the other:
+///
+/// - [`Record::is_put_complete`](crate::server::record::Record::is_put_complete)
+///   — device support took the write async
+///   (`if (!pact && prec->pact) return(0)`), so this pass never reaches the
+///   tail.
+/// - [`Record::should_fire_forward_link`](crate::server::record::Record::should_fire_forward_link)
+///   — the tail was reached and the record type declined it.
+///   `dbNotifyCompletion` sits INSIDE the skipped call, so a suppressed
+///   forward link withholds the `ca_put_callback` too.
+///   `busy` is the clearest case: `busyRecord.c:271` runs the tail only for
+///   `val == 0 || oval == 0`, which is why `caput -c` on a busy record that
+///   stays at 1 is meant to hang until something writes "Done".
+///
+/// Reading them together HERE, rather than at each cycle tail, is what keeps a
+/// record type's C gate to one override: a type states its gate in
+/// `should_fire_forward_link` and gets the notify behaviour for free.
+///
+/// The SDIS-disable bail is C's OTHER `dbNotifyCompletion` caller
+/// (`dbAccess.c:623`), outside `recGblFwdLink` and so deliberately ungated —
+/// it open-codes the take/leave in `process_record_with_links_inner` and does
+/// not come through here.
+///
+/// Idempotent: a record in no put-notify is a no-op.
 fn complete_put_notify(inst: &mut RecordInstance) {
+    if !inst.record.is_put_complete() || !inst.record.should_fire_forward_link() {
+        return;
+    }
     if let Some(ws) = inst.notify.take() {
         ws.leave();
     }
@@ -2318,6 +2349,73 @@ impl PvDatabase {
                 // landing on a disabled record stalls until socket
                 // disconnect. `leave` fires the completion oneshot when
                 // this empties the wait-set.
+                if let Some(ws) = notify {
+                    ws.leave();
+                }
+                return Ok(());
+            }
+        }
+
+        // 0.4. The dset gate — the FIRST statement of every C `process()`
+        // that needs device support:
+        //
+        // ```c
+        // if( (pdset==NULL) || (pdset->read_ai==NULL) ) {
+        //     prec->pact=TRUE;
+        //     recGblRecordError(S_dev_missingSup, prec, "read_ai");
+        //     return(S_dev_missingSup);
+        // }
+        // ```
+        // (`aiRecord.c:143-147`, and the same four lines in 19 more
+        // `<rec>Record.c` files.) It sits here, after `dbProcess`'s PACT test
+        // and the SDIS disable bail and before anything of the body, because
+        // that is where C's is: `dbProcess` reaches `prset->process` only past
+        // those two, and `process` refuses on its first line.
+        //
+        // This is not a message. The PACT it takes is never released — the
+        // only release is a cycle tail this record never reaches — so the
+        // record is inert from its first process attempt onward, exactly as it
+        // is in C, and every later attempt is turned away by the PACT guard
+        // above without a second report. Reporting without taking PACT would
+        // have printed C's line over a record that then went on processing:
+        // measured against `softIoc` R7.0.10 on `asyn`'s `testErrors` IOC, C
+        // leaves `testErrors:AoInt32` at `PACT 1`, `STAT UDF`, `TIME
+        // <undefined>` where this port left it `PACT 0`, `STAT NO_ALARM` and
+        // stamped.
+        //
+        // The gate is `dev_sup_process_refusal`, which is `None` for every
+        // record type whose C `process()` has no dset test — `calc`, `sub`,
+        // `fanout`, and `calcout`, which refuses only at init.
+        {
+            let refusal = {
+                let instance = rec.read();
+                if crate::server::device_support::is_soft_dtyp(&instance.common.dtyp)
+                    || instance.device.is_some()
+                {
+                    None
+                } else {
+                    crate::server::recgbl::dev_sup_process_refusal(instance.record.record_type())
+                }
+            };
+            if let Some(message) = refusal {
+                let notify = {
+                    let mut instance = rec.write();
+                    instance.enter_pact();
+                    // C returns from `process()` without reaching
+                    // `recGblFwdLink`, so its `dbNotifyCompletion` never fires
+                    // and a put-notify parked on such a record waits for a
+                    // cycle that will never come. Releasing the wait-set is
+                    // the same thing the SDIS bail above does, and for the
+                    // same reason: a CA WRITE_NOTIFY caller must not be held
+                    // to a socket timeout by a record that has already decided
+                    // not to run.
+                    instance.notify.take()
+                };
+                crate::server::recgbl::rec_gbl_record_error(
+                    &crate::server::recgbl::DevSupStatus::MissingSup.text(),
+                    name,
+                    message,
+                );
                 if let Some(ws) = notify {
                     ws.leave();
                 }
@@ -4799,14 +4897,12 @@ impl PvDatabase {
             }
             // The record `leave`s the wait-set only here, after its full
             // OUT/FLNK/process-action tail has run — so every PP target it drove
-            // has already joined (`enter`ed). Gated on `is_put_complete`: a
-            // record reporting more work (e.g. motor mid-move via
-            // `is_put_complete()==false`) keeps its membership and leaves on the
-            // later cycle that completes the put. The completion oneshot fires on
-            // the `leave` that empties the set.
-            if guard.record.is_put_complete() {
-                complete_put_notify(&mut guard);
-            }
+            // has already joined (`enter`ed). Whether this cycle may leave at
+            // all is `complete_put_notify`'s decision, not this site's: a record
+            // reporting more work (motor mid-move) or declining its forward link
+            // (busy at VAL=1) keeps its membership and leaves on the later cycle
+            // that reaches C's `recGblFwdLink`.
+            complete_put_notify(&mut guard);
         }
         self.apply_pact_exit(name, rec, exit);
     }
@@ -6688,6 +6784,17 @@ impl PvDatabase {
 /// The body of the init-seed owner, over a locked record — shared by
 /// [`PvDatabase::rec_gbl_init_constant_links`] and `PvDatabase::add_record`.
 pub(crate) fn seed_constant_links(instance: &mut RecordInstance) {
+    // The SECOND seat of C's `init_record` body, and so it takes the same
+    // opening test: every step below sits BELOW `if (!pdset) { … return
+    // S_dev_noDSET; }` in the C source it ports — the soft dset's constant
+    // load, the record's own `recGblInitConstantLink` table (`aoRecord.c:112`),
+    // and the tail plus tracker seed at `aoRecord.c:156-161`. A record whose
+    // dset is NULL reaches none of them, which is why softIoc reads `MLST: 0`
+    // on an `ai` whose DTYP nobody registered where the port read its VAL.
+    if !instance.init_record_reaches_body() {
+        return;
+    }
+
     // 0. The long-string load, C `dbLoadLinkLS` — a lset entry of its own, NOT
     //    `recGblInitConstantLink`, and the only one that can write a
     //    long-string VAL: `lso` runs it on DOL (lsoRecord.c:82), `lsi`'s soft

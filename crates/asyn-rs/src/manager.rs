@@ -7,6 +7,7 @@ use crate::error::{AsynError, AsynResult};
 use crate::exception::ExceptionManager;
 use crate::port::PortDriver;
 use crate::port_handle::PortHandle;
+use crate::registry::PortEntry;
 use crate::runtime::{PortRuntimeHandle, RuntimeConfig, create_port_runtime};
 use crate::services::PortServices;
 use crate::trace::TraceManager;
@@ -247,6 +248,177 @@ impl Default for PortManager {
     }
 }
 
+/// The failure a manager *device* call returns: C's bare `asynError`.
+///
+/// Deliberately carries no message. C's manager writes its diagnostic into
+/// `pasynUser->errorMessage` and returns only the status
+/// (asynManager.c:1331-1346, :2331-2373), so the last call to touch a user owns
+/// what the caller reads: `asynRecord`'s `special()` splices the buffer *after*
+/// `connectDevice`'s tail has run `monitorStatus` over it, and therefore
+/// reports the `isEnabled` text for a failed connect (asynRecord.c:515). A
+/// message attached to this value would be a second, private copy no later call
+/// can update, and a caller splicing it would diverge from C on exactly the
+/// paths the shared buffer exists to model.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DeviceError;
+
+/// C's `pasynUser` as the manager's device calls see it: the port the user is
+/// connected to (`userPvt->pport`, asynManager.c:1345-1352) beside the
+/// `errorMessage` buffer those calls write their diagnostic into.
+///
+/// One object, both fields private, because the binding is what decides whether
+/// a query answers or writes the buffer — C resolves it with
+/// `findDpCommon(puserPvt)` and every `is*` fails with "asynUser not connected
+/// to device" when that comes back null (asynManager.c:2331-2373). A holder
+/// therefore cannot attach itself to a port except through
+/// [`Self::connect_device`], cannot detach except through [`Self::disconnect`],
+/// and cannot ask about a port it is not bound to.
+///
+/// Not [`crate::user::AsynUser`] itself: that type carries
+/// `user_data: Box<dyn Any + Send>` and so is not `Sync`, while a record that
+/// keeps this for its lifetime must be (`Record: Send + Sync`). This is the
+/// long-lived half of C's `pasynRecPvt->pasynUser` — the binding and the buffer
+/// that outlive any one call; the per-request halves stay on the `AsynUser`
+/// each call builds.
+///
+/// The address is part of the binding, not a per-call argument: C stores it as
+/// `userPvt->pdevice` when the user attaches (asynManager.c:1349-1352) and every
+/// later `findDpCommon` reads it back, so a caller cannot ask about one device
+/// on a user bound to another.
+pub struct DeviceUser {
+    device: Option<PortEntry>,
+    /// C `userPvt->pdevice`, as the address that selects it. `-1` is C's null
+    /// `pdevice`: `connectDevice` creates a device node only for `addr >= 0`
+    /// (asynManager.c:1349-1352), and `findDpCommon` then answers from the
+    /// port's own `dpc` (:541-544).
+    addr: i32,
+    error_message: String,
+}
+
+impl Default for DeviceUser {
+    fn default() -> Self {
+        Self {
+            device: None,
+            // C `pasynManager->createAsynUser` leaves `pdevice` null until
+            // `connectDevice` sets it; `-1` is that null in port addressing.
+            addr: -1,
+            error_message: String::new(),
+        }
+    }
+}
+
+impl DeviceUser {
+    /// The port this user is connected to — C `userPvt->pport`.
+    pub fn device(&self) -> Option<&PortEntry> {
+        self.device.as_ref()
+    }
+
+    /// The last diagnostic any call below left on this user — C
+    /// `pasynUser->errorMessage`.
+    ///
+    /// Never cleared: C's buffer is only ever overwritten by the next layer to
+    /// write one, which is what makes the *order* of the manager calls
+    /// observable in the text a caller splices.
+    pub fn error_message(&self) -> &str {
+        &self.error_message
+    }
+
+    /// C `connectDevice` (asynManager.c:1324-1355), in C's order: no port name,
+    /// then the registry lookup (`locatePort`), then a user that is already
+    /// connected to a device.
+    pub fn connect_device(&mut self, port_name: &str, addr: i32) -> Result<PortEntry, DeviceError> {
+        if port_name.is_empty() {
+            return Err(self.fail("asynManager:connectDevice no port name provided".to_string()));
+        }
+        let Some(entry) = crate::registry::get_port(port_name) else {
+            return Err(self.fail(format!(
+                "asynManager:connectDevice port {port_name} not found"
+            )));
+        };
+        if self.device.is_some() {
+            return Err(
+                self.fail("asynManager:connectDevice already connected to device".to_string())
+            );
+        }
+        self.device = Some(entry.clone());
+        self.addr = addr;
+        Ok(entry)
+    }
+
+    /// C `disconnect` (asynManager.c:1359-1391): sever the binding.
+    ///
+    /// C refuses while the user has a queued request, holds a block, or is on
+    /// the exception list, and reports each refusal in the buffer. A record
+    /// reaches it only after `exceptionCallbackRemove` and with no request of
+    /// its own outstanding (asynRecord.c:1153-1154, :522-524), so the path it
+    /// takes is the only one modelled.
+    pub fn disconnect(&mut self) {
+        // C clears both halves of the binding: `puserPvt->pport = 0;
+        // puserPvt->pdevice = 0` (asynManager.c:1386-1387).
+        self.device = None;
+        self.addr = -1;
+    }
+
+    /// C `isConnected` (asynManager.c:2331-2343).
+    ///
+    /// C reads `pdpCommon->connected`, a field read that cannot fail once the
+    /// user is bound. The actor query behind [`PortHandle`] can — a shut-down
+    /// port, or a call made from the actor's own thread, where waiting would be
+    /// the actor waiting on itself — and those answer `false` rather than
+    /// writing the buffer: they are not C's "not connected to device", and a
+    /// diagnostic C never writes must not displace one it did. Same for the two
+    /// below.
+    pub fn is_connected(&mut self) -> Result<bool, DeviceError> {
+        let addr = self.addr;
+        Ok(self
+            .handle_for("isConnected")?
+            .is_connected_blocking(addr)
+            .unwrap_or(false))
+    }
+
+    /// C `isEnabled` (asynManager.c:2345-2359).
+    pub fn is_enabled(&mut self) -> Result<bool, DeviceError> {
+        let addr = self.addr;
+        Ok(self
+            .handle_for("isEnabled")?
+            .is_enabled_blocking(addr)
+            .unwrap_or(false))
+    }
+
+    /// C `isAutoConnect` (asynManager.c:2361-2373).
+    pub fn is_auto_connect(&mut self) -> Result<bool, DeviceError> {
+        let addr = self.addr;
+        Ok(self
+            .handle_for("isAutoConnect")?
+            .is_auto_connect_blocking(addr)
+            .unwrap_or(false))
+    }
+
+    /// Bind to an already-resolved port, for tests that build a [`PortEntry`]
+    /// by hand rather than publishing it to the process registry.
+    #[cfg(test)]
+    pub(crate) fn attach_for_test(&mut self, entry: PortEntry, addr: i32) {
+        self.device = Some(entry);
+        self.addr = addr;
+    }
+
+    /// The bound port, or C's `findDpCommon` failure: the `is*` calls share one
+    /// message shape and one buffer, so they share this.
+    fn handle_for(&mut self, which: &str) -> Result<PortHandle, DeviceError> {
+        if let Some(entry) = self.device.as_ref() {
+            return Ok(entry.handle.clone());
+        }
+        Err(self.fail(format!(
+            "asynManager:{which} asynUser not connected to device"
+        )))
+    }
+
+    fn fail(&mut self, message: String) -> DeviceError {
+        self.error_message = message;
+        DeviceError
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -273,6 +445,109 @@ mod tests {
         fn base_mut(&mut self) -> &mut PortDriverBase {
             &mut self.base
         }
+    }
+
+    /// The three device queries on a user bound to nothing: each fails with its
+    /// own name in the shared buffer, so the *last* one asked is what a caller
+    /// reads back. C `isAutoConnect` / `isConnected` / `isEnabled` all write
+    /// `pasynUser->errorMessage` through `findDpCommon` (asynManager.c:2331-2373),
+    /// and `monitorStatus` asks them in that order (asynRecord.c:1085-1097) —
+    /// which is why `asynRecord`'s `special()` reports the `isEnabled` text for
+    /// a failed *connect*.
+    #[test]
+    fn an_unbound_user_reports_the_query_that_asked_last() {
+        let mut user = DeviceUser::default();
+        assert!(user.device().is_none());
+
+        assert_eq!(user.is_auto_connect(), Err(DeviceError));
+        assert_eq!(
+            user.error_message(),
+            "asynManager:isAutoConnect asynUser not connected to device"
+        );
+        assert_eq!(user.is_connected(), Err(DeviceError));
+        assert_eq!(
+            user.error_message(),
+            "asynManager:isConnected asynUser not connected to device"
+        );
+        assert_eq!(user.is_enabled(), Err(DeviceError));
+        assert_eq!(
+            user.error_message(),
+            "asynManager:isEnabled asynUser not connected to device"
+        );
+    }
+
+    /// `connectDevice`'s three rejections in C's order — no port name, an
+    /// unknown name, a user already connected — and the binding each leaves
+    /// behind (asynManager.c:1324-1355).
+    #[test]
+    fn connect_device_binds_once_and_refuses_the_second_attempt() {
+        let mgr = PortManager::new();
+        let mut drv = DummyDriver::new("devuser_port_1");
+        drv.base.create_param("VAL", ParamType::Int32).unwrap();
+        mgr.register_port(drv).unwrap();
+
+        let mut user = DeviceUser::default();
+        assert!(user.connect_device("", 0).is_err());
+        assert_eq!(
+            user.error_message(),
+            "asynManager:connectDevice no port name provided"
+        );
+        assert!(user.device().is_none(), "a rejected connect binds nothing");
+
+        assert!(user.connect_device("devuser_no_such_port", 0).is_err());
+        assert_eq!(
+            user.error_message(),
+            "asynManager:connectDevice port devuser_no_such_port not found"
+        );
+        assert!(user.device().is_none());
+
+        assert!(user.connect_device("devuser_port_1", 0).is_ok());
+        assert_eq!(
+            user.device()
+                .map(|entry| entry.handle.port_name().to_string()),
+            Some("devuser_port_1".to_string())
+        );
+
+        assert!(user.connect_device("devuser_port_1", 0).is_err());
+        assert_eq!(
+            user.error_message(),
+            "asynManager:connectDevice already connected to device"
+        );
+
+        mgr.unregister_port("devuser_port_1");
+    }
+
+    /// A bound user answers the queries from the port and leaves the buffer
+    /// alone — C writes `errorMessage` only on the `findDpCommon` failure — and
+    /// `disconnect` puts it back on the failing arm. The second half is the
+    /// regression: a holder that severed the binding by hand would keep
+    /// answering from a port it is no longer connected to.
+    #[test]
+    fn disconnect_returns_the_queries_to_the_unbound_arm() {
+        let mgr = PortManager::new();
+        let mut drv = DummyDriver::new("devuser_port_2");
+        drv.base.create_param("VAL", ParamType::Int32).unwrap();
+        mgr.register_port(drv).unwrap();
+
+        let mut user = DeviceUser::default();
+        user.connect_device("devuser_port_2", 0).unwrap();
+        assert_eq!(user.is_enabled(), Ok(true));
+        assert_eq!(user.is_connected(), Ok(true));
+        assert_eq!(
+            user.error_message(),
+            "",
+            "an answered query writes no diagnostic"
+        );
+
+        user.disconnect();
+        assert!(user.device().is_none());
+        assert_eq!(user.is_enabled(), Err(DeviceError));
+        assert_eq!(
+            user.error_message(),
+            "asynManager:isEnabled asynUser not connected to device"
+        );
+
+        mgr.unregister_port("devuser_port_2");
     }
 
     #[test]

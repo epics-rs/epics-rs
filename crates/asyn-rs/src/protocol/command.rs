@@ -96,21 +96,15 @@ pub enum PortCommand {
     ShutdownPort,
     ConnectAddr,
     DisconnectAddr,
-    EnableAddr,
-    DisableAddr,
-    /// Port-wide enable / disable (C parity:
-    /// `pasynManager->enable(pasynUser, value)`).
+    /// Enable / disable (C parity: `pasynManager->enable(pasynUser, value)`).
+    /// Port-wide or one device: `findDpCommon` picks from the request's addr
+    /// (asynManager.c:538-545).
     SetEnable {
         yes: bool,
     },
-    /// Port-wide auto-connect toggle (C parity:
-    /// `pasynManager->autoConnect(pasynUser, value)`).
+    /// Auto-connect toggle (C parity:
+    /// `pasynManager->autoConnect(pasynUser, value)`), same addr resolution.
     SetAutoConnect {
-        yes: bool,
-    },
-    /// Per-device auto-connect toggle — the `addr` half of the same C call,
-    /// selected by `findDpCommon` (asynManager.c:536-544).
-    SetAutoConnectAddr {
         yes: bool,
     },
     GetBoundsInt32,
@@ -261,11 +255,8 @@ mod tests {
             PortCommand::Disconnect,
             PortCommand::ConnectAddr,
             PortCommand::DisconnectAddr,
-            PortCommand::EnableAddr,
-            PortCommand::DisableAddr,
             PortCommand::SetEnable { yes: true },
             PortCommand::SetAutoConnect { yes: false },
-            PortCommand::SetAutoConnectAddr { yes: true },
             PortCommand::GetBoundsInt32,
             PortCommand::GetBoundsInt64,
             PortCommand::GetEnable,

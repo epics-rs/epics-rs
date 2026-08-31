@@ -261,10 +261,9 @@ enum DpKey {
 
 impl DpKey {
     fn of(multi_device: bool, addr: i32) -> Self {
-        if multi_device && addr >= 0 {
-            DpKey::Device(addr)
-        } else {
-            DpKey::Port
+        match crate::port::dp_common_key(multi_device, addr) {
+            Some(addr) => DpKey::Device(addr),
+            None => DpKey::Port,
         }
     }
 }
@@ -952,11 +951,8 @@ impl PortActor {
     fn c_dispatch(op: &RequestOp) -> CDispatch {
         match op {
             // Direct `pasynManager` calls under `asynManagerLock`.
-            RequestOp::EnableAddr
-            | RequestOp::DisableAddr
-            | RequestOp::SetEnable { .. }
+            RequestOp::SetEnable { .. }
             | RequestOp::SetAutoConnect { .. }
-            | RequestOp::SetAutoConnectAddr { .. }
             | RequestOp::GetEnable
             | RequestOp::GetAutoConnect
             | RequestOp::GetConnected
@@ -1396,9 +1392,8 @@ impl PortActor {
         }
 
         // --- Device level (C :723-737).
-        let ds = self.driver.base().device_states.get(&addr);
-        let dev_disconnected = !ds.is_none_or(|d| d.connected);
-        let dev_auto = ds.map_or(self.driver.base().auto_connect, |d| d.auto_connect);
+        let dev_disconnected = !self.driver.base().dp_connected(addr);
+        let dev_auto = self.driver.base().dp_auto_connect(addr);
         if dev_disconnected && dev_auto {
             if !self
                 .driver
@@ -1619,19 +1614,11 @@ impl PortActor {
                 self.driver.disconnect_addr(user)?;
                 Ok(RequestResult::write_ok())
             }
-            RequestOp::EnableAddr => {
-                self.driver.enable_addr(user)?;
-                Ok(RequestResult::write_ok())
-            }
-            RequestOp::DisableAddr => {
-                self.driver.disable_addr(user)?;
-                Ok(RequestResult::write_ok())
-            }
             RequestOp::SetEnable { yes } => {
-                // C parity: pasynManager->enable(pasynUser, enable) at
-                // asynManager.c — toggles per-port `enabled` state and
-                // emits `asynExceptionEnable`. Routed through the
-                // driver trait so subclasses can override.
+                // C `enable(pasynUser, yesNo)` (asynManager.c:2224-2251):
+                // `findDpCommon` resolves the slot from the requesting user's
+                // addr (:538-545), so one op serves both scopes. Routed through
+                // the driver trait so subclasses can override.
                 if *yes {
                     self.driver.enable(user)?;
                 } else {
@@ -1640,27 +1627,25 @@ impl PortActor {
                 Ok(RequestResult::write_ok())
             }
             RequestOp::SetAutoConnect { yes } => {
-                // C parity: pasynManager->autoConnect(pasynUser, value)
-                // at asynManager.c:2310-2324 — fires
-                // `asynExceptionAutoConnect` unconditionally.
-                self.driver.base_mut().set_auto_connect(*yes);
-                Ok(RequestResult::write_ok())
-            }
-            RequestOp::SetAutoConnectAddr { yes } => {
-                // The device half of the same C call: `findDpCommon` hands
-                // autoConnectAsyn the DEVICE's dpCommon when the user names one
-                // on a multi-device port (asynManager.c:536-544, 2314).
+                // C `autoConnectAsyn(pasynUser, value)` (asynManager.c:2312-2329)
+                // — one call, whose `findDpCommon` hands it the DEVICE's
+                // dpCommon when the user names one on a multi-device port
+                // (:538-545). Fires `asynExceptionAutoConnect` unconditionally.
                 self.driver
                     .base_mut()
                     .set_auto_connect_addr(user.addr, *yes);
                 Ok(RequestResult::write_ok())
             }
             RequestOp::GetEnable => {
-                let enabled = self.driver.base().enabled;
+                // C `isEnabled` reads `findDpCommon(puserPvt)->enabled`
+                // (asynManager.c:2345-2359): the addr on the requesting user
+                // picks the slot, exactly as it does for the write above.
+                let enabled = self.driver.base().dp_enabled(user.addr);
                 Ok(RequestResult::int32_read(i32::from(enabled)))
             }
             RequestOp::GetAutoConnect => {
-                let auto = self.driver.base().auto_connect;
+                // C `isAutoConnect` (asynManager.c:2361-2373), same resolution.
+                let auto = self.driver.base().dp_auto_connect(user.addr);
                 Ok(RequestResult::int32_read(i32::from(auto)))
             }
             RequestOp::PushEchoInterpose => {
@@ -1749,7 +1734,7 @@ impl PortActor {
                 // publishes, which `asynRecord` reads back into CNCT and gates
                 // its connect/disconnect request on (asynRecord.c:1089-1093,
                 // 858-888).
-                let connected = self.driver.base().is_connected();
+                let connected = self.driver.base().dp_connected(user.addr);
                 Ok(RequestResult::int32_read(i32::from(connected)))
             }
             RequestOp::GetBoundsInt32 => {
@@ -3548,7 +3533,12 @@ mod tests {
         );
 
         // Re-enable it: the parked request runs, with no resubmission.
-        send_and_wait(&tx, RequestOp::EnableAddr, AsynUser::new(0).with_addr(1)).unwrap();
+        send_and_wait(
+            &tx,
+            RequestOp::SetEnable { yes: true },
+            AsynUser::new(0).with_addr(1),
+        )
+        .unwrap();
         let r = parked
             .blocking_recv()
             .expect("actor dropped the parked reply")

@@ -393,10 +393,7 @@ impl PortTrace {
 /// sides through the same `puserPvt->pdevice`: `asynSetTraceMask P 5 0x3f`
 /// on a single-device port is `asynSetTraceMask P -1 0x3f`.
 fn device_slot(multi_device: bool, addr: Option<i32>) -> Option<i32> {
-    match addr {
-        Some(a) if multi_device && a >= 0 => Some(a),
-        _ => None,
-    }
+    crate::port::dp_common_key(multi_device, addr.unwrap_or(-1))
 }
 
 /// Global trace manager holding C's `dpCommon` tree.

@@ -198,32 +198,25 @@ pub enum RequestOp {
     ConnectAddr,
     /// Disconnect a specific device address (multi-device ports).
     DisconnectAddr,
-    /// Enable a specific device address (multi-device ports).
-    EnableAddr,
-    /// Disable a specific device address (multi-device ports).
-    DisableAddr,
-    /// Enable / disable the entire port. C parity:
-    /// `pasynManager->enable(pasynUser, enable)`
-    /// (`asynManager.c::enable`, fired by asynRecord `ENBL` writes
+    /// Enable / disable — C `pasynManager->enable(pasynUser, enable)`
+    /// (`asynManager.c::enable` :2224-2251, fired by asynRecord `ENBL` writes
     /// at `asynRecord.c:484-486`).
+    ///
+    /// One op for both scopes, as C has one call: `findDpCommon(puserPvt)`
+    /// (:538-545) hands `enable` the DEVICE's `dpCommon` when the port is
+    /// multi-device and the user names an address, the PORT's otherwise. The
+    /// addr rides on the request's own [`crate::user::AsynUser`], so the
+    /// resolution happens once, at the owner.
     SetEnable {
         yes: bool,
     },
-    /// Enable / disable auto-connect for the port. C parity:
+    /// Enable / disable auto-connect — C
     /// `pasynManager->autoConnect(pasynUser, autoConnect)`
-    /// (`asynManager.c::autoConnect`, fired by asynRecord `AUCT`
-    /// writes at `asynRecord.c:481-482`). `asynExceptionAutoConnect`
-    /// is emitted unconditionally on every call.
+    /// (`asynManager.c::autoConnectAsyn` :2312-2329, fired by asynRecord `AUCT`
+    /// writes at `asynRecord.c:481-482`). `asynExceptionAutoConnect` is emitted
+    /// unconditionally on every call. Same one-op-two-scopes resolution as
+    /// [`RequestOp::SetEnable`].
     SetAutoConnect {
-        yes: bool,
-    },
-    /// Enable / disable auto-connect for ONE device of a multi-device port —
-    /// the `user.addr` variant of [`RequestOp::SetAutoConnect`], symmetric with
-    /// [`RequestOp::EnableAddr`]. C reaches both through a single
-    /// `pasynManager->autoConnect`, which picks device-vs-port state via
-    /// `findDpCommon` (asynManager.c:536-544, 2314); the caller of the shell
-    /// command `asynAutoConnect portName addr yesNo` is what supplies the addr.
-    SetAutoConnectAddr {
         yes: bool,
     },
     /// Query int32 bounds (low, high).

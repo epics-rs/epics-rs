@@ -328,14 +328,6 @@ fn enable_style_args() -> Vec<ArgDesc> {
     ]
 }
 
-/// C `findDpCommon` (asynManager.c:536-544): an operation lands on a DEVICE's
-/// state only when the port is multi-device and the caller named a device;
-/// otherwise it lands on the port itself. `asynEnable`/`asynAutoConnect` both
-/// go through it, so the rule lives in one place here too.
-fn addresses_a_device(handle: &crate::port_handle::PortHandle, addr: i32) -> bool {
-    addr >= 0 && handle.is_multi_device()
-}
-
 /// Resolve the `portName addr yesNo` triple both enable-style commands take.
 /// `None` means the error is already on the shell.
 fn shell_enable_target(
@@ -905,7 +897,12 @@ pub fn build_asyn_commands(mgr: Arc<PortManager>) -> Vec<CommandDef> {
                 // be lost the other way round (C :3313-3316 registers the
                 // exception handler before it waits).
                 let waiter = crate::runtime::port::ConnectWaiter::arm(&services_wait, &port);
-                if handle.is_connected_blocking().unwrap_or(false) {
+                // `-1`, the PORT's own slot, even on a multi-device port: C's
+                // `waitConnect` resolves `findDpCommon` only to reject an
+                // unbound user, then reads `pport->dpc.connected` explicitly
+                // (asynManager.c:3327-3342). `asynWaitConnect portName` names no
+                // device, and the link it waits for is the port's.
+                if handle.is_connected_blocking(-1).unwrap_or(false) {
                     return Ok(CommandOutcome::Continue);
                 }
                 if !waiter.wait(timeout) {
@@ -1256,11 +1253,12 @@ pub fn build_asyn_commands(mgr: Arc<PortManager>) -> Vec<CommandDef> {
                     Some(t) => t,
                     None => return Ok(CommandOutcome::Continue),
                 };
-                let r = match (addresses_a_device(&handle, addr), yes) {
-                    (true, true) => handle.enable_addr_blocking(addr),
-                    (true, false) => handle.disable_addr_blocking(addr),
-                    (false, yes) => handle.set_enable_blocking(yes),
-                };
+                // C `asynEnable` builds a user, `connectDevice(pasynUser,
+                // portName, addr)`s it and calls the single
+                // `pasynManager->enable` (asynShellCommands.c:949-968);
+                // `findDpCommon` inside that call is what makes the addr select
+                // a device or the port. The shell itself does not choose.
+                let r = handle.set_enable_blocking(addr, yes);
                 if let Err(e) = r {
                     ctx.println(&format!("asynEnable: {e}"));
                 }
@@ -1283,11 +1281,9 @@ pub fn build_asyn_commands(mgr: Arc<PortManager>) -> Vec<CommandDef> {
                         Some(t) => t,
                         None => return Ok(CommandOutcome::Continue),
                     };
-                let r = if addresses_a_device(&handle, addr) {
-                    handle.set_auto_connect_addr_blocking(addr, yes)
-                } else {
-                    handle.set_auto_connect_blocking(yes)
-                };
+                // Same shape as `asynEnable` above — C `asynAutoConnect`
+                // (asynShellCommands.c:983-1002): one call, addr on the user.
+                let r = handle.set_auto_connect_blocking(addr, yes);
                 if let Err(e) = r {
                     ctx.println(&format!("asynAutoConnect: {e}"));
                 }
@@ -2329,7 +2325,7 @@ mod tests {
         assert!(
             !mgr.find_port_handle("wc_never")
                 .unwrap()
-                .is_connected_blocking()
+                .is_connected_blocking(-1)
                 .unwrap()
         );
 
@@ -2347,7 +2343,7 @@ mod tests {
             "must have returned on the connect, not on the timeout ({elapsed:?})"
         );
         let late = mgr.find_port_handle("wc_late").unwrap();
-        assert!(late.is_connected_blocking().unwrap());
+        assert!(late.is_connected_blocking(-1).unwrap());
 
         // Already connected: returns immediately, without waiting on an
         // exception that will never fire again.
@@ -2594,12 +2590,16 @@ mod tests {
         // addr >= 0 on a SINGLE-device port is still the port: findDpCommon has
         // no device to pick.
         call("asynEnable", "edp_single", 0, 0);
-        assert!(!single.is_enabled_blocking().unwrap());
+        assert!(!single.is_enabled_blocking(-1).unwrap());
 
         // addr >= 0 on a multi-device port is the device — the port itself must
         // stay enabled.
         call("asynEnable", "edp_multi", 1, 0);
-        assert!(multi.is_enabled_blocking().unwrap());
+        assert!(multi.is_enabled_blocking(-1).unwrap());
+        assert!(
+            !multi.is_enabled_blocking(1).unwrap(),
+            "the device the shell addressed is the one that went down"
+        );
         assert!(
             seen.lock()
                 .unwrap()
@@ -2609,12 +2609,12 @@ mod tests {
 
         // addr < 0 is always the port.
         call("asynEnable", "edp_multi", -1, 0);
-        assert!(!multi.is_enabled_blocking().unwrap());
+        assert!(!multi.is_enabled_blocking(-1).unwrap());
 
         // Same split for auto-connect.
         call("asynAutoConnect", "edp_multi", 1, 0);
         assert!(
-            multi.is_auto_connect_blocking().unwrap(),
+            multi.is_auto_connect_blocking(-1).unwrap(),
             "a device-addressed autoConnect must not touch the port's flag"
         );
         assert!(seen.lock().unwrap().contains(&(
@@ -2623,7 +2623,7 @@ mod tests {
             1
         )));
         call("asynAutoConnect", "edp_multi", -1, 0);
-        assert!(!multi.is_auto_connect_blocking().unwrap());
+        assert!(!multi.is_auto_connect_blocking(-1).unwrap());
     }
 
     /// `raw_from_escaped` decodes C-style escapes to raw bytes (parity with

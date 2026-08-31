@@ -550,6 +550,7 @@ fn a_channel_that_kills_the_server_does_not_cost_its_batch_mates_their_verdicts(
     );
 }
 
+#[cfg(tokio_backend)]
 #[test]
 fn an_unreachable_pv_scores_error_never_agreement() {
     let (t, pair) = boot("ai", "ORACLE:AI");

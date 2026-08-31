@@ -53,7 +53,8 @@ pub use record_trait::{
     FieldMetadataOverride, InputFetchPolicy, LinkReadAs, OutTarget, ProcessAction, ProcessContext,
     ProcessOutcome, ProcessSnapshot, RawSoftEntry, Record, RecordProcessResult, Special,
     SubroutineFn, ValuePostGate, arg_letter_offset, arg_link_field,
-    calc_class_link_backed_metadata_field, coerce_put_value, put_field_internal_default,
+    calc_class_link_backed_metadata_field, coerce_put_value, dbput_coerce_value,
+    link_value_in_field_shape, put_field_internal_default, put_value_in_field_shape,
     seed_input_links,
 };
 pub(crate) use record_trait::{AuxPostMask, value_gate};

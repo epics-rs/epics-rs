@@ -4509,6 +4509,167 @@ pub trait Record: Send + Sync + 'static {
 /// for the Double-only VAL arm, which otherwise drops it and never advances the
 /// buffer). An `EnumWithChoices` carrier is always collapsed to a bare index by
 /// `convert_to`, even when the target is already `Enum`.
+/// Render a put request in the DESTINATION field's shape — C `dbPut`'s value
+/// branch (`dbAccess.c:1350-1367`, tag `R7.0.10`) expressed as a value
+/// transform, and the single owner of both of its directions.
+///
+/// C never asks a record to accept a shape. `dbPut` copies `nRequest` elements
+/// through `dbPutConvertRoutine` into the field, so a ONE-element request over
+/// a `special(SPC_DBADDR)` destination lands element 0 of a BUFFER (which is
+/// how pvxs's `putScalar` — `doDbPut(chan, dbr, &value, 1)`,
+/// `iocsource.cpp:599-601` — writes a one-element channel), and a
+/// MULTI-element request over a scalar destination is clamped to `no_elements`
+/// at `:1360` and lands element 0 of a SCALAR. This port hands the record one
+/// `EpicsValue` whose variant its `put_field` arm matches on, so C's two arms
+/// have to be a rendering, and one every client put shares: the two PVA
+/// servers each carried the scalar-to-buffer half themselves, and a third
+/// caller would have needed its own copy.
+///
+/// This is the `dbPut` contract only — [`dbput_coerce_value`] is the entry
+/// that applies it. Internal delivery has [`link_value_in_field_shape`], and
+/// the two are separate functions rather than one with a flag because they
+/// disagree about the same request: one sample into a `compress` VAL is a
+/// one-element buffer to `dbPut` and a `compress_scalar` sample to a link.
+///
+/// An `EnumWithChoices` carrier is left alone in both — it is a transient link
+/// payload, not a stored value, and `convert_to` collapses it to a bare index.
+/// [`shaped_destination`] carries the rest of the shared rule.
+pub fn put_value_in_field_shape<R: Record + ?Sized>(
+    record: &R,
+    field: &str,
+    value: EpicsValue,
+) -> EpicsValue {
+    let Some(dest_is_array) = shaped_destination(record, field, &value) else {
+        return value;
+    };
+    match (dest_is_array, value.is_array()) {
+        // C's SCALAR arm: the clamp at `:1360` leaves one element.
+        (false, true) => value.first_element().unwrap_or(value),
+        // C's ARRAY arm at `nRequest == 1` — except into a long-string field.
+        // C's `cvt_dbaddr` re-types those five to `DBF_STRING`
+        // (`lsiRecord.c:127-134`), so their conversion row is
+        // `putStringString`, a byte copy of the text, and this port carries
+        // that text as the value itself — `lsi.VAL` as a `String`, `printf.VAL`
+        // as a `CharArray`. Wrapping a `String` request into a one-element
+        // `StringArray` hands that row an array and the record a variant no
+        // `put_field` arm takes.
+        (true, false) if !is_long_string_field(record, field) => {
+            one_element_buffer(&value).unwrap_or(value)
+        }
+        _ => value,
+    }
+}
+
+/// `field` is one of the record's long-string fields (`lsi`/`lso` VAL+OVAL,
+/// `printf` VAL), matched as [`Record::long_string_fields`] specifies.
+fn is_long_string_field<R: Record + ?Sized>(record: &R, field: &str) -> bool {
+    record
+        .long_string_fields()
+        .iter()
+        .any(|f| f.eq_ignore_ascii_case(field))
+}
+
+/// The same question for INTERNAL DELIVERY — an input link or device support
+/// handing a record a value — which has only C's scalar arm.
+///
+/// C's link layer asks for exactly ONE element (`dbGetLink(..., nRequest =
+/// NULL)`), so `dbGet` converts the field at offset 0 and the record sees a
+/// scalar: a waveform INP into an `ai.VAL` lands `wf[0]` rather than being
+/// dropped by the typed `put_field` arm it does not match.
+///
+/// There is no array arm to render into, and that is the whole reason this is
+/// a second entry rather than a flag on [`put_value_in_field_shape`]: internal
+/// delivery is not a `dbPut`. A `compress` INP delivering ONE sample means
+/// `compress_scalar` — the running `cvb` accumulator — and rendering it as a
+/// one-element buffer runs `push_array`'s array algorithm instead, which
+/// writes the N clamp back into the record.
+pub fn link_value_in_field_shape<R: Record + ?Sized>(
+    record: &R,
+    field: &str,
+    value: EpicsValue,
+) -> EpicsValue {
+    match shaped_destination(record, field, &value) {
+        Some(false) if value.is_array() => value.first_element().unwrap_or(value),
+        _ => value,
+    }
+}
+
+/// `Some(dest_is_array)` when `field` has a shape this row may render into,
+/// `None` when it must be left alone.
+///
+/// The destination test is the field's CURRENT VALUE SHAPE, not
+/// [`FieldDeclaration::field_is_dbaddr`]. `mbbo.VAL` is `special(SPC_DBADDR)`
+/// and stored as a scalar; wrapping it would put a one-element array in front
+/// of the menu row that owns that put.
+///
+/// The exempt shape is a `CharArray` into a `DBF_STRING` field: that is the
+/// dbChannel `$` char view of a string field, decoded by `convert_to`.
+fn shaped_destination<R: Record + ?Sized>(
+    record: &R,
+    field: &str,
+    value: &EpicsValue,
+) -> Option<bool> {
+    let target = record
+        .get_field(field)
+        .map(|v| v.db_field_type())
+        .or_else(|| super::record_instance::declared_field_type_of(record, field));
+    if matches!(value, EpicsValue::CharArray(_)) && target == Some(DbFieldType::String) {
+        return None;
+    }
+    Some(record.get_field(field).is_some_and(|v| v.is_array()))
+}
+
+/// The client `dbPut` entry to the write-side converter: C `dbPut`'s value
+/// branch in full — the destination-shape arm
+/// ([`put_value_in_field_shape`]) and then the `dbPutConvertRoutine` row for
+/// the request that arm produced ([`coerce_put_value`]).
+///
+/// Separate from `coerce_put_value` because the two ways a value enters a
+/// record field have different contracts, and one function that renders the
+/// shape for both means two things by context. Only a client `dbPut` gets the
+/// array arm; internal delivery calls `coerce_put_value` with a request whose
+/// shape [`link_value_in_field_shape`] already settled, and
+/// `RecordInstance::put_declared_override` calls it for a destination that has
+/// no shape at all (a shadow cell for a field the record does not serve).
+///
+/// It is UNCONDITIONAL. Its caller must not skip it when the request already
+/// carries the destination's DBF: that skip is what let a scalar reach a
+/// buffer field unrendered, so that `histogram.VAL` had to grow a scalar arm
+/// of its own to accept what `dbPut` converts for every other array field.
+pub fn dbput_coerce_value<R: Record + ?Sized>(
+    record: &R,
+    field: &str,
+    target: DbFieldType,
+    value: EpicsValue,
+) -> CaResult<Converted> {
+    let value = put_value_in_field_shape(record, field, value);
+    coerce_put_value(record, field, target, value)
+}
+
+/// `value` as the one-element buffer of its OWN element type. The element type
+/// is not this function's business — [`coerce_put_value`] runs C's
+/// `dbPutConvertRoutine` row over the request afterwards, array to array.
+fn one_element_buffer(value: &EpicsValue) -> Option<EpicsValue> {
+    Some(match value {
+        EpicsValue::Short(v) => EpicsValue::ShortArray(vec![*v]),
+        EpicsValue::Float(v) => EpicsValue::FloatArray(vec![*v]),
+        EpicsValue::Enum(v) => EpicsValue::EnumArray(vec![*v]),
+        EpicsValue::Double(v) => EpicsValue::DoubleArray(vec![*v]),
+        EpicsValue::Long(v) => EpicsValue::LongArray(vec![*v]),
+        EpicsValue::Int64(v) => EpicsValue::Int64Array(vec![*v]),
+        EpicsValue::UInt64(v) => EpicsValue::UInt64Array(vec![*v]),
+        EpicsValue::UShort(v) => EpicsValue::UShortArray(vec![*v]),
+        EpicsValue::ULong(v) => EpicsValue::ULongArray(vec![*v]),
+        EpicsValue::UChar(v) => EpicsValue::UCharArray(vec![*v]),
+        EpicsValue::Char(v) => EpicsValue::CharArray(vec![*v]),
+        EpicsValue::String(v) => EpicsValue::StringArray(vec![v.clone()]),
+        // Not a stored value; `convert_to` collapses it to a bare index.
+        EpicsValue::EnumWithChoices { .. } => return None,
+        // Already a buffer.
+        _ => return None,
+    })
+}
+
 pub fn put_field_internal_default<R: Record + ?Sized>(
     record: &mut R,
     name: &str,
@@ -4529,24 +4690,7 @@ pub fn put_field_internal_default<R: Record + ?Sized>(
         .get_field(name)
         .map(|v| v.db_field_type())
         .or_else(|| crate::server::record::record_instance::declared_field_type_of(record, name));
-    // An array source into a SCALAR destination delivers element 0. C's link
-    // layer asks for exactly one element (`dbGetLink(..., nRequest = NULL)`), so
-    // `dbGet` converts the field at offset 0 and the record sees a scalar — a
-    // waveform INP into an `ai.VAL` lands `wf[0]`, it is not dropped. Without the
-    // reduction the array reached the record's typed `put_field` arm, which
-    // rejected it and left the field at its stale value. Same clamp as
-    // `field_io::dbput_request` (C `dbPut` `nRequest -> no_elements`), through the
-    // same primitive; a `CharArray` into a `DBF_STRING` field is likewise exempt —
-    // that shape is the dbChannel `$` char view of a string field, decoded by
-    // `convert_to`.
-    let dest_is_array = record.get_field(name).is_some_and(|v| v.is_array());
-    let is_char_string_view =
-        matches!(value, EpicsValue::CharArray(_)) && target_type == Some(DbFieldType::String);
-    let value = if !dest_is_array && value.is_array() && !is_char_string_view {
-        value.first_element().unwrap_or(value)
-    } else {
-        value
-    };
+    let value = link_value_in_field_shape(&*record, name, value);
     let is_enum_carrier = matches!(value, EpicsValue::EnumWithChoices { .. });
     let value = match target_type {
         // A String target routes through the converter even on a type match: C's
@@ -4569,6 +4713,48 @@ pub fn put_field_internal_default<R: Record + ?Sized>(
         _ => value,
     };
     record.put_field(name, value)
+}
+
+/// C's `putString*` row when the destination is an ARRAY — `Some` when this row
+/// owns the put, `None` when it does not apply and the scalar rows below do.
+///
+/// `dbPut` reaches it for every `special(SPC_DBADDR)` field regardless of
+/// `nRequest` (`dbAccess.c:1350`), so a one-element string put is this row too;
+/// keeping the two counts on one owner is what stops them drifting apart.
+///
+/// The two array destinations whose row is a byte copy rather than a parse — a
+/// long-string field (`lsi`/`lso`/`printf` VAL, `DBF_STRING` in their
+/// `cvt_dbaddr`) and an `FTVL=STRING` buffer, whose `NumericField::of` is
+/// `None` — still belong to this row; it hands them the text unchanged for
+/// their record to store.
+fn put_string_array_row<R: Record + ?Sized>(
+    record: &R,
+    field: &str,
+    target: DbFieldType,
+    value: &EpicsValue,
+) -> CaResult<Option<Converted>> {
+    let texts: &[crate::types::PvString] = match value {
+        EpicsValue::String(s) => std::slice::from_ref(s),
+        EpicsValue::StringArray(a) => a,
+        _ => return Ok(None),
+    };
+    if !record.get_field(field).is_some_and(|v| v.is_array()) {
+        return Ok(None);
+    }
+    // `putStringString` is a byte copy, and the record stores the text: hand the
+    // value over unchanged rather than falling through to the SCALAR numeric
+    // row below, which would parse `printf.VAL`'s `"7"` into the number 7.
+    if record
+        .long_string_fields()
+        .iter()
+        .any(|f| f.eq_ignore_ascii_case(field))
+    {
+        return Ok(Some(Converted::Stored(value.clone())));
+    }
+    let Some(numeric) = c_parse::NumericField::of(target) else {
+        return Ok(Some(Converted::Stored(value.clone())));
+    };
+    c_parse::put_string_elements(field, numeric, texts).map(Some)
 }
 
 /// Coerce a written value to a field's stored type — the single owner of C
@@ -4596,19 +4782,44 @@ pub fn put_field_internal_default<R: Record + ?Sized>(
 /// no-op that drove `VAL` to state 0, and how `caput REC.PREC 32768` — which the
 /// compiled softIoc REFUSES — stored 32767.
 ///
-/// An ARRAY destination is exempt HERE, not exempt from the rule: C reaches it
-/// through the same `putString*` routine (`nRequest` elements, parsed one at a
-/// time), and this port's array records carry their own element-type
-/// conversion, so the row is theirs to run. `WaveformRecord::put_field("VAL")`
-/// runs it, refusing `"hi"` into an `FTVL=CHAR` buffer exactly as the compiled
-/// softIoc does. A string reaching a char buffer as its BYTES is the DBR_CHAR
-/// row (`caput -S`), which arrives as a `CharArray` and needs no conversion.
+/// This is the TYPE row alone. The request's shape is settled before it
+/// arrives, by whichever entry the value came through
+/// ([`dbput_coerce_value`] for a client `dbPut`,
+/// [`link_value_in_field_shape`] for internal delivery), so nothing here
+/// renders a destination shape that one of those two contracts would disagree
+/// with.
+///
+/// An ARRAY destination takes the same rule through
+/// [`c_parse::put_string_elements`], which runs `putString*` over every element
+/// of the request. It is run HERE rather than delegated to the record, because
+/// delegation made the row a convention nothing enforced: `waveform` ran it
+/// while `compress.VAL` and `histogram.VAL` answered `TypeMismatch` to a put the
+/// compiled softIoc accepts, and the `StringArray` half of the same row never
+/// reached this function at all — it fell through to the total `convert_to`,
+/// which stored `0.0` for text `epicsParseFloat64` refuses.
+///
+/// Two array destinations are outside the numeric row, and both are C's own
+/// distinction rather than a carve-out here: a LONG-STRING field
+/// ([`Record::long_string_fields`]) is `DBF_STRING` in its `cvt_dbaddr`, so its
+/// row is `putStringString`, a byte copy; and an `FTVL=STRING` buffer is the
+/// same copy per element. Those keep the string and their records store it. A
+/// string reaching a char buffer as its BYTES is the DBR_CHAR row (`caput -S`),
+/// which arrives as a `CharArray` and needs no conversion.
 pub fn coerce_put_value<R: Record + ?Sized>(
     record: &R,
     field: &str,
     target: DbFieldType,
     value: EpicsValue,
 ) -> CaResult<Converted> {
+    // The ARRAY row first, so both counts of the SAME C routine have one owner:
+    // a scalar `String` and a `StringArray` into an array destination are both
+    // `dbPutConvertRoutine[DBR_STRING][target]` over `nRequest` elements
+    // (`dbAccess.c:1350` takes that arm for every `special(SPC_DBADDR)` field,
+    // whatever the count). Menu/DTYP/enum fields are never array destinations,
+    // so nothing below is shadowed.
+    if let Some(converted) = put_string_array_row(record, field, target, &value)? {
+        return Ok(converted);
+    }
     if let EpicsValue::String(s) = &value {
         // DTYP (DBF_DEVICE) validates against the record type's FULL device
         // menu — static `device()` lines PLUS runtime-contributed device
@@ -4642,15 +4853,6 @@ pub fn coerce_put_value<R: Record + ?Sized>(
                 s,
             )
             .map(Converted::Stored);
-        }
-        // An ARRAY destination runs the row ITSELF: C applies the same
-        // `putString*` routine to each of the `nRequest` elements, and this
-        // port's array records carry their own element-type conversion, so the
-        // string is handed over untouched. Converting here would run a SECOND
-        // and DIFFERENT rule ahead of theirs — `convert_to`'s string→`DBF_CHAR[]`
-        // byte carry, which is the DBR_CHAR row (`caput -S`), not this one.
-        if record.get_field(field).is_some_and(|v| v.is_array()) {
-            return Ok(Converted::Stored(value));
         }
         if let Some(numeric) = c_parse::NumericField::of(target) {
             return c_parse::put_string(field, numeric, &s.as_str_lossy());
@@ -4904,5 +5106,36 @@ mod declaration_numbering_tests {
         let hand = FieldDesc::new("VAL", DbFieldType::Double, false);
         assert_eq!(hand.declared_dbf, DbfCode::Double);
         assert!(!hand.no_access());
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::server::records::compress::CompressRecord;
+
+    /// Internal delivery is not a `dbPut`, and the two entries have to stay
+    /// two. A `compress` INP reading a `DBF_LONG` source delivers ONE sample
+    /// as an `EpicsValue::Long`; C's link layer converts it to the target's
+    /// type and the record folds it into `compress_scalar`'s running `cvb`.
+    /// Rendering it as a one-element buffer sends it to `push_array` instead,
+    /// whose array algorithm writes the N clamp back into the record
+    /// (`compressRecord.c:171-172`) — a field the scalar algorithm never
+    /// touches.
+    #[test]
+    fn a_one_sample_link_delivery_is_not_a_one_element_buffer() {
+        let mut rec = CompressRecord::new(4, 0);
+        rec.put_field("N", EpicsValue::Long(0)).unwrap();
+        assert_eq!(rec.get_field("N"), Some(EpicsValue::ULong(0)));
+
+        // The source's DBF differs from VAL's, so this delivery reaches the
+        // converter rather than being handed over unchanged.
+        put_field_internal_default(&mut rec, "VAL", EpicsValue::Long(5)).unwrap();
+
+        assert_eq!(
+            rec.get_field("N"),
+            Some(EpicsValue::ULong(0)),
+            "compressRecord.c:273-304 never touches prec->n"
+        );
     }
 }

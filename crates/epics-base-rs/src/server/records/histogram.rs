@@ -654,13 +654,36 @@ impl Record for HistogramRecord {
 
     fn put_field(&mut self, name: &str, value: EpicsValue) -> CaResult<()> {
         match name {
-            "VAL" => match value {
-                EpicsValue::ULongArray(arr) => {
-                    self.val = arr;
-                    Ok(())
+            // C `get_array_info` (`histogramRecord.c:310-318`) answers
+            // `*no_elements = prec->nelm` and `*offset = 0` unconditionally, and
+            // `put_array_info` is `NULL` (`:56`), so the bin array is always
+            // NELM wide and a short request writes its head and leaves the tail.
+            // Storing the request verbatim shrank the channel — a one-element
+            // `caput` left `caget` reporting a single bin where the compiled
+            // softIoc still reports NELM.
+            //
+            // A SCALAR request is one of those short requests, not a type
+            // error: VAL is `special(SPC_DBADDR)`, so `dbAccess.c:1350` sends
+            // even `nRequest == 1` through the array arm, and pvxs's
+            // `putScalar` (`iocsource.cpp:599-601`) is exactly that put — it
+            // is what a channel whose `dbChannelFinalElements` is 1 writes.
+            // Refusing it made `histogram` the one array destination in the
+            // port that answered `TypeMismatch` where the compiled softIoc
+            // stores bin 0, which is the complaint `coerce_put_value`'s doc
+            // already records against this arm.
+            "VAL" => {
+                let arr = match value {
+                    EpicsValue::ULongArray(arr) => arr,
+                    EpicsValue::ULong(v) => vec![v],
+                    _ => return Err(CaError::TypeMismatch("VAL".into())),
+                };
+                let width = self.nelm.max(1) as usize;
+                self.val.resize(width, 0);
+                for (slot, v) in self.val.iter_mut().zip(arr.into_iter().take(width)) {
+                    *slot = v;
                 }
-                _ => Err(CaError::TypeMismatch("VAL".into())),
-            },
+                Ok(())
+            }
             // ULIM/LLIM/SDEL are `special(SPC_RESET)` — the arms STORE ONLY.
             // The side effects belong to `special()` (C runs them in
             // `dbPutSpecial(paddr, 1)`, after `dbPut` stored the value), which
@@ -846,6 +869,53 @@ mod tests {
     // C `histogramRecord.dbd.pod` `field(NELM,DBF_USHORT){ initial("1") }` —
     // a histogram built without an explicit NELM defaults to 1 bucket (and a
     // 1-element VAL), not the old hand-coded 10.
+    /// C `dbPut` sends a ONE-element request to VAL through its ARRAY arm —
+    /// VAL is `special(SPC_DBADDR)`, so `dbAccess.c:1350` takes that arm
+    /// whatever the count — and pvxs's `putScalar` (`iocsource.cpp:599-601`)
+    /// is exactly that put for a channel whose `dbChannelFinalElements` is 1.
+    /// Both the request that arrives already at the field's own DBF (the
+    /// client gate hands those over unconverted) and the one
+    /// [`dbput_coerce_value`] renders land bin 0 and leave the rest of the
+    /// buffer, which is what the compiled softIoc stores.
+    #[test]
+    fn a_one_element_val_request_lands_bin_zero() {
+        use crate::server::record::dbput_coerce_value;
+        use crate::types::c_parse::Converted;
+
+        let mut rec = HistogramRecord::new(4, 0.0, 10.0);
+        rec.put_field("VAL", EpicsValue::ULongArray(vec![9, 9, 9, 9]))
+            .unwrap();
+
+        rec.put_field("VAL", EpicsValue::ULong(7)).unwrap();
+        assert_eq!(
+            rec.get_field("VAL"),
+            Some(EpicsValue::ULongArray(vec![7, 9, 9, 9])),
+            "a scalar request is one bin, not a type error"
+        );
+
+        // A source whose type differs reaches the shared converter, which
+        // renders the shape and converts the element, array to array.
+        let Converted::Stored(rendered) =
+            dbput_coerce_value(&rec, "VAL", DbFieldType::ULong, EpicsValue::Double(5.0)).unwrap()
+        else {
+            panic!("the converter stores the rendered request");
+        };
+        assert_eq!(rendered, EpicsValue::ULongArray(vec![5]));
+        rec.put_field("VAL", rendered).unwrap();
+        assert_eq!(
+            rec.get_field("VAL"),
+            Some(EpicsValue::ULongArray(vec![5, 9, 9, 9]))
+        );
+
+        // A request wider than NELM still writes the head and keeps the width.
+        rec.put_field("VAL", EpicsValue::ULongArray(vec![1, 2, 3, 4, 5, 6]))
+            .unwrap();
+        assert_eq!(
+            rec.get_field("VAL"),
+            Some(EpicsValue::ULongArray(vec![1, 2, 3, 4]))
+        );
+    }
+
     #[test]
     fn nelm_defaults_to_one_per_dbd_initial() {
         let rec = HistogramRecord::default();

@@ -187,6 +187,204 @@ const PA_NAMES: [&str; 12] = [
     "PA", "PB", "PC", "PD", "PE", "PF", "PG", "PH", "PI", "PJ", "PK", "PL",
 ];
 
+/// AMEM/PMEM — the record's account of the array memory it has `calloc`'d, and
+/// the single owner of every change to it.
+///
+/// `aCalcoutRecord.c` allocates each of its `double *` array buffers LAZILY, and
+/// charges the allocation where it is made:
+///
+/// ```c
+/// if (pcalc->aval == NULL) {
+///     pcalc->aval = (double *)calloc(pcalc->nelm, sizeof(double));
+///     pcalc->amem += pcalc->nelm * sizeof(double);
+/// }
+/// ```
+///
+/// There are seventeen such buffers — AA..LL, AVAL, OAV, PAVL, POAV, PAA — and
+/// C writes that increment out at nineteen sites (`aCalcoutRecord.c:382`,
+/// `:386`, `:596`, `:604`, `:612`, `:655`, `:662`, `:668`, `:697`, `:705`,
+/// `:713`, `:974`, `:978`, `:1086`, `:1093`, `:1297`). The port has no lazy
+/// pointers: every array is a `Vec<f64>` that exists from `Default`. So what it
+/// must reproduce is not the allocation but C's LEDGER — WHICH buffers C would
+/// have `calloc`'d by now, each charged exactly once at
+/// `NELM * sizeof(double)`.
+///
+/// That ledger is [`ArrayMem`], and `amem` is private to it: no site can add to
+/// AMEM without naming the buffer it is charging for, and a buffer already in
+/// the set charges nothing however many times it is named. A scattered
+/// `self.amem += ...` — C's own shape — cannot express "once", because the
+/// `== NULL` test that made it once in C has no counterpart here.
+///
+/// The ledger is held in atomics and every operation takes `&self`. That is not
+/// a concurrency feature: it is what lets the charge sit at C's OWN seam.
+/// `cvt_dbaddr` runs when a client resolves a channel on an `SPC_DBADDR` field,
+/// which reaches this port as [`AcalcoutRecord::dbaddr_capacity`] — a `&self`
+/// hook, because answering "how many elements does this channel have" is a
+/// read. A charge is idempotent per [`ArrayBuf`] and the test-and-set is one
+/// `fetch_or`, so the ledger stays a pure function of which buffers have been
+/// demanded, whoever asks and however often.
+mod array_mem {
+    use super::CyclePostMask;
+    use std::sync::atomic::{AtomicI32, AtomicU8, AtomicU32, Ordering};
+
+    /// `post_pending` states — no post outstanding, C's literal
+    /// `DBE_VALUE|DBE_LOG`, C's `monitor_mask|DBE_VALUE|DBE_LOG`.
+    const POST_NONE: u8 = 0;
+    const POST_VALUE_LOG: u8 = 1;
+    const POST_MONITOR_VALUE_LOG: u8 = 2;
+
+    /// One of the seventeen lazily-`calloc`'d `double *` buffers of
+    /// `aCalcoutRecord.c`.
+    #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+    pub(super) enum ArrayBuf {
+        /// `pcalc->aa[i]` — one of AA..LL. Allocated by `cvt_dbaddr` (`:595`),
+        /// `get_array_info` (`:654`), `put_array_info` (`:696`),
+        /// `fetch_values` (`:1085`), and by `aCalcPerform` itself when the
+        /// expression STORES into it (`aCalcPerform.c:474`, `:515`), which the
+        /// record charges from the before/after pointer count (`:1293-1298`).
+        Arr(usize),
+        /// `pcalc->aval` — `process` (`:381`) plus the three dbAddr hooks.
+        Aval,
+        /// `pcalc->oav` — `process` (`:385`) plus the three dbAddr hooks.
+        Oav,
+        /// `pcalc->pavl` — `monitor` (`:973`), the previous-AVAL copy.
+        Pavl,
+        /// `pcalc->poav` — `monitor` (`:977`), the previous-OAV copy.
+        Poav,
+        /// `pcalc->paa` — `fetch_values`' ONE comparison scratch buffer
+        /// (`:1092`), shared by all twelve array links.
+        Paa,
+    }
+
+    impl ArrayBuf {
+        fn bit(self) -> u32 {
+            match self {
+                ArrayBuf::Arr(i) => 1 << i,
+                ArrayBuf::Aval => 1 << 12,
+                ArrayBuf::Oav => 1 << 13,
+                ArrayBuf::Pavl => 1 << 14,
+                ArrayBuf::Poav => 1 << 15,
+                ArrayBuf::Paa => 1 << 16,
+            }
+        }
+    }
+
+    /// C `pcalc->nelm * sizeof(double)`, the charge for one buffer. C's `nelm`
+    /// is `epicsUInt32` and the product widens to `size_t` before landing in the
+    /// `epicsInt32` AMEM, so the truncation is C's.
+    fn charge(nelm: u32) -> i32 {
+        (u64::from(nelm) * size_of::<f64>() as u64) as i32
+    }
+
+    #[derive(Default)]
+    pub(super) struct ArrayMem {
+        amem: AtomicI32,
+        pmem: AtomicI32,
+        /// The set of [`ArrayBuf`]s already charged — C's `ppd[i] != NULL`.
+        allocated: AtomicU32,
+        /// C's `db_post_events(pcalc, &pcalc->amem, ...)`, waiting for the
+        /// framework's post point, carrying the mask of the C site that made it.
+        /// Drained by `AcalcoutRecord::take_cycle_posted_fields`.
+        /// [`POST_NONE`] = no post outstanding.
+        post_pending: AtomicU8,
+    }
+
+    impl ArrayMem {
+        pub(super) fn amem(&self) -> i32 {
+            self.amem.load(Ordering::Relaxed)
+        }
+
+        pub(super) fn pmem(&self) -> i32 {
+            self.pmem.load(Ordering::Relaxed)
+        }
+
+        /// The RAW store — a `.db` field or an autosave restore landing in
+        /// `put_field`, C's `dbPut` into the field itself. It replaces the
+        /// reported number and deliberately does NOT touch the ledger: the
+        /// buffers C has allocated are a fact about the record, not about what
+        /// a client wrote into AMEM, so a later allocation still adds its own
+        /// charge on top — which is exactly `pcalc->amem += ...` in C.
+        pub(super) fn store_amem(&self, value: i32) {
+            self.amem.store(value, Ordering::Relaxed);
+        }
+
+        pub(super) fn store_pmem(&self, value: i32) {
+            self.pmem.store(value, Ordering::Relaxed);
+        }
+
+        /// C's bare `calloc` + `amem +=` pair — the sites in `process`
+        /// (`:379-387`), `monitor` (`:972-979`), `fetch_values` (`:1084-1094`)
+        /// and `call_aCalcPerform` (`:1293-1298`), none of which posts or
+        /// touches PMEM: `monitor()`'s tail does that for the whole cycle at
+        /// once ([`Self::sync`]).
+        ///
+        /// Returns true when this call was the allocation. The test-and-set is
+        /// one `fetch_or`, so the charge lands exactly once even when two
+        /// channel creations race on the same field under the record's READ
+        /// lock — the property that makes the ledger safe to run from `&self`.
+        pub(super) fn allocate(&self, buf: ArrayBuf, nelm: u32) -> bool {
+            let bit = buf.bit();
+            if self.allocated.fetch_or(bit, Ordering::Relaxed) & bit != 0 {
+                return false;
+            }
+            self.amem.fetch_add(charge(nelm), Ordering::Relaxed);
+            true
+        }
+
+        /// The SPC_DBADDR hooks' shape instead — `cvt_dbaddr` (`:594-599`),
+        /// `get_array_info` (`:653-658`) and `put_array_info` (`:695-700`) each
+        /// follow the charge immediately with
+        ///
+        /// ```c
+        /// db_post_events(pcalc, &pcalc->amem, DBE_VALUE|DBE_LOG);
+        /// pcalc->pmem = pcalc->amem;
+        /// ```
+        ///
+        /// because they run on a `dbGet`/`dbPut`, with no `monitor()` behind
+        /// them to close the cycle. The post is a LITERAL `DBE_VALUE|DBE_LOG`
+        /// there — no alarm mask is in scope.
+        pub(super) fn allocate_for_dbaddr(&self, buf: ArrayBuf, nelm: u32) {
+            if self.allocate(buf, nelm) {
+                self.post_pending.store(POST_VALUE_LOG, Ordering::Relaxed);
+                self.pmem
+                    .store(self.amem.load(Ordering::Relaxed), Ordering::Relaxed);
+            }
+        }
+
+        /// C `monitor()`'s tail (`:1044-1047`) — the ONE place a process cycle
+        /// commits the charges it accumulated:
+        ///
+        /// ```c
+        /// if (pcalc->amem != pcalc->pmem) {
+        ///     db_post_events(pcalc, &pcalc->amem, monitor_mask|DBE_VALUE|DBE_LOG);
+        ///     pcalc->pmem = pcalc->amem;
+        /// }
+        /// ```
+        ///
+        /// PMEM is therefore not a second AMEM: it is the value AMEM had when it
+        /// was last POSTED, which is why C compares the two rather than keeping a
+        /// dirty flag.
+        pub(super) fn sync(&self) {
+            let amem = self.amem.load(Ordering::Relaxed);
+            if amem != self.pmem.load(Ordering::Relaxed) {
+                self.post_pending
+                    .store(POST_MONITOR_VALUE_LOG, Ordering::Relaxed);
+                self.pmem.store(amem, Ordering::Relaxed);
+            }
+        }
+
+        pub(super) fn take_post(&self) -> Option<CyclePostMask> {
+            match self.post_pending.swap(POST_NONE, Ordering::Relaxed) {
+                POST_VALUE_LOG => Some(CyclePostMask::ValueLog),
+                POST_MONITOR_VALUE_LOG => Some(CyclePostMask::MonitorValueLog),
+                _ => None,
+            }
+        }
+    }
+}
+
+use array_mem::{ArrayBuf, ArrayMem};
+
 /// aCalcout record state. Field comments cite the `aCalcoutRecord.dbd`
 /// declaration; behaviour cites `aCalcoutRecord.c`.
 pub struct AcalcoutRecord {
@@ -288,8 +486,10 @@ pub struct AcalcoutRecord {
     cstat: i32,
     cact: u8,
     amask: u32,
-    amem: i32,
-    pmem: i32,
+    /// AMEM + PMEM, and the ledger of which array buffers C would have
+    /// `calloc`'d by now. The ONE thing allowed to add to AMEM — see
+    /// [`array_mem`].
+    mem: ArrayMem,
     newm: u32,
 
     // --- process flags ---
@@ -371,8 +571,7 @@ impl Default for AcalcoutRecord {
             cstat: 0,
             cact: 0,
             amask: 0,
-            amem: 0,
-            pmem: 0,
+            mem: ArrayMem::default(),
             newm: 0,
             calc_alarm: false,
             fetch_gate_failed: false,
@@ -422,6 +621,52 @@ impl AcalcoutRecord {
     /// Current array element count (C `acalcGetNumElements`,
     /// `aCalcoutRecord.c:160-168`): `NUSE` when `0 < NUSE < NELM`, else
     /// `NELM`. At least 1 (C always `calloc(nelm)` with `nelm >= 1`).
+    /// C `monitor()`'s array-memory half, and the ONLY way `process()` may say
+    /// "this cycle completed".
+    ///
+    /// `monitor()` allocates the two previous-value buffers before it uses them
+    /// and then closes the cycle's AMEM accounting:
+    ///
+    /// ```c
+    /// if (pcalc->pavl == NULL) { pcalc->pavl = calloc(...); pcalc->amem += ...; }
+    /// if (pcalc->poav == NULL) { pcalc->poav = calloc(...); pcalc->amem += ...; }
+    /// ...
+    /// if (pcalc->amem != pcalc->pmem) { db_post_events(...); pcalc->pmem = pcalc->amem; }
+    /// ```
+    ///
+    /// C reaches it from `process()`'s tail (`:442`) — so from every path that
+    /// does NOT `return(ASYNC)` first. That is exactly the set of paths here
+    /// that return [`ProcessOutcome::complete`]: the ODLY continuation (C's
+    /// `pcalc->dlya` branch falls through to the tail), the failed fetch gate
+    /// (C skips `doCalc`/`afterCalc` and falls through), and the normal tail.
+    /// The ODLY *delaying* cycle is the one C returns ASYNC from before
+    /// `monitor()`, and it returns `AsyncPendingNotify` here — it must not come
+    /// through this owner, and cannot, because it does not build a `complete()`.
+    ///
+    /// Returning the outcome rather than being a plain side-effect call is the
+    /// point: a completing return that skipped the previous-value charges would
+    /// have to write `ProcessOutcome::complete()` itself, and there is now no
+    /// reason to.
+    fn complete_cycle(&mut self) -> ProcessOutcome {
+        self.mem.allocate(ArrayBuf::Pavl, self.nelm);
+        self.mem.allocate(ArrayBuf::Poav, self.nelm);
+        self.mem.sync();
+        ProcessOutcome::complete()
+    }
+
+    /// The `SPC_DBADDR` field name → the buffer C's `cvt_dbaddr` /
+    /// `get_array_info` / `put_array_info` allocate for it
+    /// (`aCalcoutRecord.c:589-617`, `:646-670`, `:685-717`). The three hooks
+    /// share one `if/else if/else if` over the same fourteen names, so they
+    /// share one mapping here.
+    fn dbaddr_buf(field: &str) -> Option<ArrayBuf> {
+        match field {
+            "AVAL" => Some(ArrayBuf::Aval),
+            "OAV" => Some(ArrayBuf::Oav),
+            _ => Self::arr_index(field).map(ArrayBuf::Arr),
+        }
+    }
+
     fn num_elements(&self) -> usize {
         let n = if self.nuse > 0 && self.nuse < self.nelm {
             self.nuse
@@ -924,7 +1169,7 @@ impl Record for AcalcoutRecord {
             self.dlya = 0;
             self.cached_should_output = self.pending_output;
             self.pending_output = false;
-            return Ok(ProcessOutcome::complete());
+            return Ok(self.complete_cycle());
         }
 
         let n = self.num_elements();
@@ -932,6 +1177,14 @@ impl Record for AcalcoutRecord {
         // C `process` line 374-377 — through the one owner, so the post C makes
         // here cannot be dropped.
         self.clamp_nuse(CyclePostMask::ValueLog);
+
+        // C `process` lines 379-387, under its own comment: "If we're getting
+        // processed, we can no longer put off allocating memory". AVAL and OAV
+        // are the two buffers a process cycle always needs, so they are charged
+        // here, ahead of the fetch gate and of any calculation — a record whose
+        // input link fails still pays for them.
+        self.mem.allocate(ArrayBuf::Aval, self.nelm);
+        self.mem.allocate(ArrayBuf::Oav, self.nelm);
 
         // C `process` line 393-395: snapshot scalar inputs (so PA..PL track
         // the values used in this calc). The framework fetches inputs before
@@ -951,7 +1204,7 @@ impl Record for AcalcoutRecord {
         // link — still runs, and the framework owns that.
         if self.fetch_gate_failed {
             self.cached_should_output = false;
-            return Ok(ProcessOutcome::complete());
+            return Ok(self.complete_cycle());
         }
 
         self.calc_alarm = false;
@@ -1007,6 +1260,31 @@ impl Record for AcalcoutRecord {
                     }
                 }
                 None => calc_failed = true,
+            }
+        }
+
+        // C `call_aCalcPerform` (`:1279-1298`) counts the non-NULL AA..LL
+        // pointers before the first `aCalcPerform` and after the second, and
+        // charges the difference:
+        //
+        // ```c
+        // if (numAllocatedArraysPost > numAllocatedArraysPre) {
+        //     pcalc->amem += (numAllocatedArraysPost-numAllocatedArraysPre)
+        //                    * pcalc->nelm * sizeof(double);
+        //     db_post_events(pcalc,&pcalc->amem, DBE_VALUE|DBE_LOG);
+        // }
+        // ```
+        //
+        // The arrays that can have appeared are exactly the ones the expression
+        // STORED into: `aCalcPerform` allocates only in `STORE_AA..STORE_LL`
+        // and `A_ASTORE` (`aCalcPerform.c:474`, `:515`), and both set the AMASK
+        // bit it allocated for (`:487`, `:524`). So AMASK — already the union of
+        // the two passes here, as it is in C (`:1291`) — names the candidates,
+        // and the ledger drops the ones that were already allocated, which is
+        // what C's before/after count does.
+        for i in 0..ARR_NAMES.len() {
+            if self.amask & (1 << i) != 0 {
+                self.mem.allocate(ArrayBuf::Arr(i), self.nelm);
             }
         }
 
@@ -1084,7 +1362,7 @@ impl Record for AcalcoutRecord {
             });
         }
 
-        Ok(ProcessOutcome::complete())
+        Ok(self.complete_cycle())
     }
 
     fn check_alarms(&mut self, common: &mut crate::server::record::CommonFields) {
@@ -1246,7 +1524,37 @@ impl Record for AcalcoutRecord {
     /// so that client never saw the array widen when `NUSE` grew — the exact
     /// reconnect problem the `SIZE` menu's own comment (`:619-626`) describes,
     /// arriving under the setting chosen to avoid it.
-    fn dbaddr_capacity(&self, _field: &str) -> Option<u32> {
+    fn dbaddr_capacity(&self, field: &str) -> Option<u32> {
+        // This IS `cvt_dbaddr`, and its first act is the allocation
+        // (`aCalcoutRecord.c:589-617`) — the record cannot hand out a `pfield`
+        // for a buffer it has not `calloc`'d yet, so the charge belongs here and
+        // at no other read seam:
+        //
+        // ```c
+        // if (ppd[i] == NULL) {
+        //     ppd[i] = (double *)calloc(pcalc->nelm, sizeof(double));
+        //     pcalc->amem += pcalc->nelm * sizeof(double);
+        //     db_post_events(pcalc, &pcalc->amem, DBE_VALUE|DBE_LOG);
+        //     pcalc->pmem = pcalc->amem;
+        // }
+        // paddr->pfield = ppd[i];
+        // ```
+        //
+        // C reaches it from `dbNameToAddr`, i.e. once per resolved channel;
+        // the port reaches it from `FieldDeclaration::field_native_count`,
+        // whose callers are CA create-channel (`epics-ca-rs` `server/tcp.rs`)
+        // and the three `dbNameToAddr`-shaped iocsh commands. `get_field` is
+        // NOT this seam even though C's `get_array_info` (`:653-658`) charges
+        // too: the framework reads every field through `get_field` for its own
+        // change detection on every cycle, and C's `dbGet` does no such thing,
+        // so charging there would allocate all fourteen buffers on cycle one.
+        //
+        // `field_native_count` has already refused any field the `.dbd` does
+        // not declare `special(SPC_DBADDR)`, which is exactly AVAL, AA..LL and
+        // OAV (`aCalcoutRecord.dbd`) — the fourteen buffers C allocates here.
+        if let Some(buf) = Self::dbaddr_buf(field) {
+            self.mem.allocate_for_dbaddr(buf, self.nelm);
+        }
         Some(self.dbaddr_no_elements() as u32)
     }
 
@@ -1297,8 +1605,8 @@ impl Record for AcalcoutRecord {
             "CACT" => Some(EpicsValue::Char(self.cact)),
             "CSTAT" => Some(EpicsValue::Long(self.cstat)),
             "AMASK" => Some(EpicsValue::ULong(self.amask)),
-            "AMEM" => Some(EpicsValue::Long(self.amem)),
-            "PMEM" => Some(EpicsValue::Long(self.pmem)),
+            "AMEM" => Some(EpicsValue::Long(self.mem.amem())),
+            "PMEM" => Some(EpicsValue::Long(self.mem.pmem())),
             "VERS" => Some(EpicsValue::Double(VERSION)),
             _ => {
                 if let Some(idx) = Self::num_index(name) {
@@ -1354,6 +1662,13 @@ impl Record for AcalcoutRecord {
         let Some(i) = Self::arr_index(name) else {
             return crate::server::record::put_field_internal_default(self, name, value);
         };
+        // C `fetch_values` (`:1082-1094`) allocates the array field and, on the
+        // first array link it ever serves, the shared PAA compare buffer —
+        // ahead of the save/fetch/compare below, because it is about to write
+        // through both. Neither charge posts or advances PMEM here: this runs
+        // inside the process cycle, and `complete_cycle` closes it.
+        self.mem.allocate(ArrayBuf::Arr(i), self.nelm);
+        self.mem.allocate(ArrayBuf::Paa, self.nelm);
         let before = self.array_field_value(&self.arr_vals[i]);
         // The LINK's bound, and it is this path's alone: C asks the link for exactly
         // `nRequest = acalcGetNumElements(pcalc)` elements — the NUSE window
@@ -1397,6 +1712,9 @@ impl Record for AcalcoutRecord {
             "AVAL" => {
                 let src = Self::coerce_array(value)
                     .ok_or_else(|| CaError::TypeMismatch("AVAL".into()))?;
+                // C `put_array_info` (`:703-708`) — the dbAddr shape: charge,
+                // post AMEM, commit PMEM, all before the splice.
+                self.mem.allocate_for_dbaddr(ArrayBuf::Aval, self.nelm);
                 self.write_array_field(&src, self.dbaddr_no_elements(), |r| &mut r.aval);
                 Ok(())
             }
@@ -1473,6 +1791,8 @@ impl Record for AcalcoutRecord {
             "OAV" => {
                 let src =
                     Self::coerce_array(value).ok_or_else(|| CaError::TypeMismatch("OAV".into()))?;
+                // C `put_array_info` (`:711-716`).
+                self.mem.allocate_for_dbaddr(ArrayBuf::Oav, self.nelm);
                 self.write_array_field(&src, self.dbaddr_no_elements(), |r| &mut r.oav);
                 Ok(())
             }
@@ -1701,17 +2021,21 @@ impl Record for AcalcoutRecord {
                 Ok(())
             }
             "AMEM" => {
-                self.amem = value
-                    .to_f64()
-                    .ok_or_else(|| CaError::TypeMismatch("AMEM".into()))?
-                    as i32;
+                self.mem.store_amem(
+                    value
+                        .to_f64()
+                        .ok_or_else(|| CaError::TypeMismatch("AMEM".into()))?
+                        as i32,
+                );
                 Ok(())
             }
             "PMEM" => {
-                self.pmem = value
-                    .to_f64()
-                    .ok_or_else(|| CaError::TypeMismatch("PMEM".into()))?
-                    as i32;
+                self.mem.store_pmem(
+                    value
+                        .to_f64()
+                        .ok_or_else(|| CaError::TypeMismatch("PMEM".into()))?
+                        as i32,
+                );
                 Ok(())
             }
             // VERS is a fixed code-version constant; accept and ignore writes.
@@ -1726,6 +2050,8 @@ impl Record for AcalcoutRecord {
                 if let Some(idx) = Self::arr_index(name) {
                     let src = Self::coerce_array(value)
                         .ok_or_else(|| CaError::TypeMismatch(name.into()))?;
+                    // C `put_array_info` (`:694-700`).
+                    self.mem.allocate_for_dbaddr(ArrayBuf::Arr(idx), self.nelm);
                     self.write_array_field(&src, self.dbaddr_no_elements(), |r| {
                         &mut r.arr_vals[idx]
                     });
@@ -1783,12 +2109,35 @@ impl Record for AcalcoutRecord {
     /// values through to `put_field` (see `processing.rs`): the scalar
     /// `to_f64` coercion drops arrays, so without that path the AA..LL links
     /// would not populate.
-    /// C `aCalcoutRecord.c:213`: every CONSTANT input link is loaded into its value
-    /// field ONCE, at `init_record` (`recGblInitConstantLink(plink,
-    /// DBF_DOUBLE, pvalue)`); `dbGetLink` then delivers nothing for it on
-    /// every later process, so a client's `caput REC.A 99` stands.
+    /// C `aCalcoutRecord.c:209-216`: a CONSTANT input link is loaded into its
+    /// value field ONCE, at `init_record`; `dbGetLink` then delivers nothing
+    /// for it on every later process, so a client's `caput REC.A 99` stands.
+    ///
+    /// But only the NUMERIC half, and C says so in its own comment:
+    ///
+    /// ```c
+    /// for (i=0; i<(MAX_FIELDS+ARRAY_MAX_FIELDS+1); i++, plink++, pvalue++, plinkValid++) {
+    ///     if (plink->type == CONSTANT) {
+    ///         /* Don't InitConstantLink the array links or the output link. */
+    ///         if (i < MAX_FIELDS) {
+    ///             recGblInitConstantLink(plink,DBF_DOUBLE,pvalue);
+    ///             db_post_events(pcalc,pvalue,DBE_VALUE);
+    ///         }
+    ///         *plinkValid = acalcoutINAV_CON;
+    /// ```
+    ///
+    /// The reason is the same one that limits [`Self::special_reseed_input_links`]:
+    /// `pvalue` walks `&pcalc->a` as a scalar `double *`, so it has no meaning
+    /// past INPL — `field(INAA,"5")` gives AA a `CON` link status and NOTHING
+    /// else, and AA stays all zeros. Seeding it here wrote AA[0]=5, and once
+    /// AMEM became real that showed up as a boot-time charge for a buffer C
+    /// never allocated.
+    ///
+    /// It is the SAME guard as the `special()` one — C's `i < MAX_FIELDS` and
+    /// its `fieldIndex <= acalcoutRecordINPL` — so it is the same slice, and
+    /// the two cannot drift apart.
     fn constant_init_links(&self) -> Vec<crate::server::record::ConstantInitLink> {
-        crate::server::record::seed_input_links(self.multi_input_links())
+        crate::server::record::seed_input_links(self.special_reseed_input_links())
     }
 
     fn multi_input_links(&self) -> &[(&'static str, &'static str)] {
@@ -1921,10 +2270,16 @@ impl Record for AcalcoutRecord {
     /// `check_alarms` but C `monitor()` never posts. Listing them keeps the
     /// framework's generic change-detection from over-posting their monitors
     /// (cf. permissive/state OVAL).
+    /// PMEM is here for the reason the list exists: `aCalcoutRecord.c` posts
+    /// `&pcalc->amem` at all nine of its post sites and `&pcalc->pmem` at none
+    /// of them. PMEM is AMEM's last-posted copy — the guard in `monitor()`'s
+    /// `if (pcalc->amem != pcalc->pmem)` — so it moves on every cycle that
+    /// charges memory, and change detection would turn each of those into a
+    /// `.PMEM` event C never sends.
     fn event_posted_fields(&self) -> &'static [&'static str] {
         &[
-            "PVAL", "POVL", "LALM", "ALST", "MLST", "CSTAT", "PA", "PB", "PC", "PD", "PE", "PF",
-            "PG", "PH", "PI", "PJ", "PK", "PL",
+            "PVAL", "POVL", "LALM", "ALST", "MLST", "CSTAT", "PMEM", "PA", "PB", "PC", "PD", "PE",
+            "PF", "PG", "PH", "PI", "PJ", "PK", "PL",
         ]
     }
 
@@ -1984,6 +2339,14 @@ impl Record for AcalcoutRecord {
         // by `clamp_nuse`, the only site that can clamp.
         if let Some(mask) = self.nuse_post_pending.take() {
             marks.push(("NUSE", mask));
+        }
+        // C's `db_post_events(pcalc, &pcalc->amem, ...)`, marked by whichever
+        // `ArrayMem` operation made it — `monitor()`'s tail with the cycle's
+        // `monitor_mask`, or a `put_array_info` charge with a literal
+        // DBE_VALUE|DBE_LOG. The put path has no process cycle behind it, so
+        // without the mark that post has no carrier at all.
+        if let Some(mask) = self.mem.take_post() {
+            marks.push(("AMEM", mask));
         }
         for (i, name) in ARR_NAMES.iter().enumerate() {
             let bit = 1u32 << i;
@@ -2367,6 +2730,275 @@ mod tests {
             rec.get_field("AVAL"),
             aval_before,
             "AVAL is not IVOV's target"
+        );
+    }
+
+    /// The number a `softIoc` running `record(acalcout,"T:ACO") {}` reports.
+    /// C boots with every array pointer NULL and charges nothing until something
+    /// forces an allocation; the FIRST process forces four, at NELM=1 and
+    /// `sizeof(double)` each:
+    ///
+    /// * AVAL and OAV in `process` (`aCalcoutRecord.c:379-387`),
+    /// * PAVL and POAV in `monitor` (`:972-979`),
+    ///
+    /// and `monitor`'s tail then commits PMEM (`:1044-1047`). 4 * 8 = 32.
+    #[test]
+    fn boot_charges_nothing_and_one_process_charges_the_four_buffers_c_allocates() {
+        let mut rec = AcalcoutRecord::new();
+        assert_eq!(rec.get_field("AMEM"), Some(EpicsValue::Long(0)));
+        assert_eq!(rec.get_field("PMEM"), Some(EpicsValue::Long(0)));
+
+        rec.process().unwrap();
+        assert_eq!(
+            rec.get_field("AMEM"),
+            Some(EpicsValue::Long(32)),
+            "AVAL + OAV + PAVL + POAV at NELM=1"
+        );
+        assert_eq!(
+            rec.get_field("PMEM"),
+            Some(EpicsValue::Long(32)),
+            "monitor()'s tail committed it"
+        );
+    }
+
+    /// The `== NULL` boundary. C charges a buffer on the cycle that allocates it
+    /// and never again; every later cycle takes the `!= NULL` arm and adds
+    /// nothing, so AMEM is flat and `amem == pmem` keeps `monitor()` silent.
+    #[test]
+    fn a_buffer_is_charged_once_however_many_cycles_run() {
+        let mut rec = AcalcoutRecord::new();
+        rec.process().unwrap();
+        let _ = rec.take_cycle_posted_fields();
+
+        rec.process().unwrap();
+        assert_eq!(rec.get_field("AMEM"), Some(EpicsValue::Long(32)));
+        assert_eq!(rec.get_field("PMEM"), Some(EpicsValue::Long(32)));
+        assert!(
+            !rec.take_cycle_posted_fields()
+                .iter()
+                .any(|(f, _)| *f == "AMEM"),
+            "amem == pmem, so monitor() posts nothing (:1044)"
+        );
+    }
+
+    /// The charge is `pcalc->nelm * sizeof(double)`, not a constant: the same
+    /// four buffers cost 4 * 4 * 8 at NELM=4.
+    #[test]
+    fn the_charge_per_buffer_is_nelm_doubles() {
+        let mut rec = AcalcoutRecord::new();
+        rec.put_field("NELM", EpicsValue::ULong(4)).unwrap();
+        rec.process().unwrap();
+        assert_eq!(rec.get_field("AMEM"), Some(EpicsValue::Long(128)));
+    }
+
+    /// A failed input link is the other completing path through C's `process`:
+    /// `if (fetch_values(pcalc)==0)` skips `doCalc`/`afterCalc`, but the AVAL/OAV
+    /// charge sits ABOVE that test (`:379-387`) and `monitor()` still runs at the
+    /// tail (`:442`), so the cycle pays the full 32 all the same.
+    #[test]
+    fn a_failed_fetch_gate_still_charges_and_commits() {
+        let mut rec = AcalcoutRecord::new();
+        rec.set_fetch_gate_failed(true);
+        rec.process().unwrap();
+        assert_eq!(rec.get_field("AMEM"), Some(EpicsValue::Long(32)));
+        assert_eq!(rec.get_field("PMEM"), Some(EpicsValue::Long(32)));
+    }
+
+    /// The NON-completing path. C's ODLY delaying cycle `return(ASYNC)`s from
+    /// `afterCalc` (`:346`) before `process` reaches `monitor()`, so PAVL/POAV
+    /// are not allocated and PMEM is not committed on it — AMEM already carries
+    /// `process`'s own AVAL+OAV charge, and the two disagree until the delayed
+    /// continuation closes the cycle.
+    #[test]
+    fn the_odly_delaying_cycle_does_not_reach_monitor() {
+        let mut rec = AcalcoutRecord::new();
+        rec.put_field("CALC", EpicsValue::String("1".into()))
+            .unwrap();
+        rec.special("CALC", true).unwrap();
+        rec.put_field("ODLY", EpicsValue::Double(0.05)).unwrap();
+
+        rec.process().unwrap();
+        assert_eq!(rec.dlya, 1, "the delaying cycle");
+        assert_eq!(
+            rec.get_field("AMEM"),
+            Some(EpicsValue::Long(16)),
+            "AVAL + OAV only"
+        );
+        assert_eq!(
+            rec.get_field("PMEM"),
+            Some(EpicsValue::Long(0)),
+            "no monitor() ran to commit it"
+        );
+
+        rec.process().unwrap();
+        assert_eq!(rec.get_field("AMEM"), Some(EpicsValue::Long(32)));
+        assert_eq!(rec.get_field("PMEM"), Some(EpicsValue::Long(32)));
+    }
+
+    /// `aCalcPerform` allocates an AA..LL buffer when the expression STORES into
+    /// it (`aCalcPerform.c:474`) and flags it in AMASK; `call_aCalcPerform`
+    /// charges the arrays that appeared (`aCalcoutRecord.c:1293-1298`). A CALC
+    /// that only READS an array allocates nothing.
+    #[test]
+    fn an_expression_store_into_aa_charges_it_and_a_read_does_not() {
+        let mut stored = AcalcoutRecord::new();
+        stored
+            .put_field("CALC", EpicsValue::String("AA:=3;SUM(AA)".into()))
+            .unwrap();
+        stored.special("CALC", true).unwrap();
+        stored.process().unwrap();
+        assert_ne!(stored.amask & 1, 0, "STORE_AA set the mask bit");
+        assert_eq!(
+            stored.get_field("AMEM"),
+            Some(EpicsValue::Long(40)),
+            "the four process/monitor buffers plus AA"
+        );
+
+        let mut read = AcalcoutRecord::new();
+        read.put_field("CALC", EpicsValue::String("AA+1".into()))
+            .unwrap();
+        read.special("CALC", true).unwrap();
+        read.process().unwrap();
+        assert_eq!(
+            read.get_field("AMEM"),
+            Some(EpicsValue::Long(32)),
+            "a fetch allocates nothing"
+        );
+    }
+
+    /// The dbAddr sites do not wait for `monitor()`: `put_array_info` charges,
+    /// posts AMEM with a LITERAL `DBE_VALUE|DBE_LOG`, and commits PMEM on the
+    /// spot (`aCalcoutRecord.c:694-700`) — there is no process cycle behind a
+    /// `dbPut` to close it.
+    #[test]
+    fn a_client_put_into_an_array_field_charges_posts_and_commits_at_once() {
+        let mut rec = AcalcoutRecord::new();
+        rec.put_field("NELM", EpicsValue::ULong(2)).unwrap();
+        rec.put_field("AA", EpicsValue::DoubleArray(vec![1.0, 2.0]))
+            .unwrap();
+        assert_eq!(rec.get_field("AMEM"), Some(EpicsValue::Long(16)));
+        assert_eq!(
+            rec.get_field("PMEM"),
+            Some(EpicsValue::Long(16)),
+            "pmem = amem, right there (:699)"
+        );
+        assert_eq!(
+            rec.take_cycle_posted_fields(),
+            vec![("AMEM", CyclePostMask::ValueLog)],
+            "C's literal DBE_VALUE|DBE_LOG (:698)"
+        );
+
+        rec.put_field("AA", EpicsValue::DoubleArray(vec![3.0, 4.0]))
+            .unwrap();
+        assert_eq!(
+            rec.get_field("AMEM"),
+            Some(EpicsValue::Long(16)),
+            "the second put finds it allocated"
+        );
+        assert!(
+            !rec.take_cycle_posted_fields()
+                .iter()
+                .any(|(f, _)| *f == "AMEM"),
+            "and posts nothing"
+        );
+    }
+
+    /// C `init_record` (`aCalcoutRecord.c:209-216`) runs
+    /// `recGblInitConstantLink` only for `i < MAX_FIELDS` — its own comment
+    /// says "Don't InitConstantLink the array links or the output link" —
+    /// because `pvalue` is a scalar `double *` walking `&pcalc->a`. A constant
+    /// INAA therefore leaves AA untouched, and with it AMEM: no buffer was
+    /// allocated for a link that delivered nothing.
+    #[test]
+    fn a_constant_array_link_is_not_seeded_and_charges_nothing() {
+        let mut rec = AcalcoutRecord::new();
+        rec.put_field("INPA", EpicsValue::String("7".into()))
+            .unwrap();
+        rec.put_field("INAA", EpicsValue::String("5".into()))
+            .unwrap();
+
+        for seed in rec.constant_init_links() {
+            crate::server::record::rec_gbl_init_constant_link(&mut rec, &seed);
+        }
+
+        assert_eq!(
+            rec.get_field("A"),
+            Some(EpicsValue::Double(7.0)),
+            "the scalar half IS seeded (:213)"
+        );
+        assert_eq!(
+            rec.get_field("AA"),
+            Some(EpicsValue::DoubleArray(vec![0.0])),
+            "the array half is not (:212)"
+        );
+        assert_eq!(
+            rec.get_field("AMEM"),
+            Some(EpicsValue::Long(0)),
+            "and so nothing was allocated for it"
+        );
+    }
+
+    /// C posts `&pcalc->amem` at every one of its nine post sites and
+    /// `&pcalc->pmem` at none, so PMEM must never reach a subscriber.
+    #[test]
+    fn pmem_is_never_posted() {
+        let rec = AcalcoutRecord::new();
+        assert!(rec.event_posted_fields().contains(&"PMEM"));
+    }
+
+    /// C `cvt_dbaddr` (`aCalcoutRecord.c:589-617`) allocates the buffer it is
+    /// about to hand out a `pfield` for, charges it, posts AMEM with a literal
+    /// `DBE_VALUE|DBE_LOG` and commits PMEM — all before the record has ever
+    /// processed. Resolving a channel on `.AA` is what runs it, and here that
+    /// is `field_native_count` → `dbaddr_capacity`.
+    #[test]
+    fn resolving_a_channel_on_an_array_field_charges_it_like_cvt_dbaddr() {
+        let rec = AcalcoutRecord::new();
+        assert_eq!(rec.get_field("AMEM"), Some(EpicsValue::Long(0)));
+
+        assert_eq!(rec.field_native_count("AA"), Some(1));
+        assert_eq!(
+            rec.get_field("AMEM"),
+            Some(EpicsValue::Long(8)),
+            "one buffer at NELM=1"
+        );
+        assert_eq!(
+            rec.get_field("PMEM"),
+            Some(EpicsValue::Long(8)),
+            "pmem = amem, right there (:598)"
+        );
+
+        // A second client resolving the same channel finds it allocated.
+        assert_eq!(rec.field_native_count("AA"), Some(1));
+        assert_eq!(rec.get_field("AMEM"), Some(EpicsValue::Long(8)));
+        // A different field is a different buffer.
+        assert_eq!(rec.field_native_count("OAV"), Some(1));
+        assert_eq!(rec.get_field("AMEM"), Some(EpicsValue::Long(16)));
+    }
+
+    /// The reason the charge is at `dbaddr_capacity` and not at `get_field`.
+    /// The framework reads EVERY field through `get_field` on every cycle to
+    /// change-detect it; C's `dbGet` does nothing of the kind. A process cycle
+    /// must therefore charge its four buffers and no more — not the fourteen
+    /// `SPC_DBADDR` ones — however many times the record is read.
+    #[test]
+    fn an_internal_process_cycle_does_not_charge_the_dbaddr_buffers() {
+        let mut rec = AcalcoutRecord::new();
+        rec.process().unwrap();
+
+        // The change-detection walk, in full.
+        for desc in rec.field_list() {
+            let _ = rec.get_field(desc.name);
+        }
+        rec.process().unwrap();
+        for desc in rec.field_list() {
+            let _ = rec.get_field(desc.name);
+        }
+
+        assert_eq!(
+            rec.get_field("AMEM"),
+            Some(EpicsValue::Long(32)),
+            "AVAL + OAV + PAVL + POAV only — reading AA..LL allocates nothing"
         );
     }
 

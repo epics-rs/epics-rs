@@ -595,9 +595,15 @@ fn spawn_watcher(
             } else {
                 BootSignal::Other
             };
-            if tx.send(sig).is_err() {
-                return;
-            }
+            // A closed channel ends the SIGNALLING, not the watching. The boot
+            // loop drops its receiver the moment the IOC reports ready, but an
+            // IOC that dies later says why on the way out -- glibc's
+            // `corrupted size vs. prev_size` when a client read overruns a
+            // buffer, say -- and that line is the only evidence naming what
+            // killed it. Returning here discarded exactly the words
+            // `OutputTail` exists to keep, leaving every post-boot death as a
+            // budget expiring with no cause.
+            let _ = tx.send(sig);
         }
     });
 }
@@ -1288,6 +1294,124 @@ impl PvaPair {
     }
 }
 
+/// One side of the PVA pair, replaceable in place after it dies mid-sweep.
+///
+/// A pvxs client read can **kill the server it reads**: a channel whose ground
+/// truth overruns a buffer aborts `softIocPVX` outright, and every reading that
+/// side still owed then belongs to a process that no longer exists. Recovering
+/// from that is per-side — the surviving side keeps its port and its readings —
+/// so the reader needs one name for "is this side still there" and "put a
+/// proven-exclusive server back on it", across two sides that boot by different
+/// routes.
+///
+/// [`CIoc`] deliberately does NOT implement this: it boots from [`CTools`] and
+/// answers CA, so it is not a member of a PVA pair and has no port to keep
+/// disjoint from one.
+pub trait PvaServer: Ioc {
+    /// How the server process ended, or `None` while it still runs.
+    fn exit_status(&mut self) -> Option<std::process::ExitStatus>;
+
+    /// Is the server still running? A process that has exited cannot have
+    /// answered anything since, which is what makes a reading attributable.
+    fn alive(&mut self) -> bool {
+        self.exit_status().is_none()
+    }
+
+    /// Boot a replacement onto this side, on the same proof a first boot needs.
+    ///
+    /// `avoid` is the port the other side of the pair currently holds: both
+    /// sides serve the same PV names, so a replacement that landed there would
+    /// silently misattribute every reading rather than fail.
+    fn reboot(
+        &mut self,
+        tools: &PvxTools,
+        db: &Path,
+        probe_pv: &str,
+        avoid: u16,
+    ) -> Result<(), BootError>;
+}
+
+/// Admit a freshly booted server onto a side of the pair.
+///
+/// **The single owner of "a replacement is admitted only on the proof an
+/// original needs"**: reachable, sole server on its port, and on a port the
+/// other side does not hold. Assigning through `slot` is what retires the dead
+/// process — [`PvxIoc`]/[`RustIoc`]'s `Drop` reaps it — so no path can leave a
+/// side holding a corpse and a live replacement at once.
+fn adopt<S: Ioc>(
+    slot: &mut S,
+    tools: &PvxTools,
+    db: &Path,
+    probe_pv: &str,
+    avoid: u16,
+    mut boot: impl FnMut(&Path) -> Result<S, BootError>,
+) -> Result<(), BootError> {
+    let mut why = Vec::new();
+    for n in 1..=BOOT_ATTEMPTS {
+        let fresh = boot(db)?;
+        let proof = if fresh.port() == avoid {
+            Err(BootError::retryable(
+                fresh.side(),
+                format!("replacement landed on the other side's UDP port {avoid}"),
+            ))
+        } else {
+            wait_pva_reachable(tools, &fresh, probe_pv)
+                .and_then(|()| verify_sole_server(tools, &fresh))
+        };
+        match proof {
+            Ok(()) => {
+                *slot = fresh;
+                return Ok(());
+            }
+            Err(e) if e.retryable => {
+                why.push(format!("attempt {n}: {}", e.message));
+                continue;
+            }
+            Err(e) => return Err(e),
+        }
+    }
+    err(
+        slot.side(),
+        format!(
+            "could not put a proven-exclusive replacement server back in \
+             {BOOT_ATTEMPTS} attempts: {}",
+            why.join("; ")
+        ),
+    )
+}
+
+impl PvaServer for PvxIoc {
+    fn exit_status(&mut self) -> Option<std::process::ExitStatus> {
+        self.child.try_wait().ok().flatten()
+    }
+    fn reboot(
+        &mut self,
+        tools: &PvxTools,
+        db: &Path,
+        probe_pv: &str,
+        avoid: u16,
+    ) -> Result<(), BootError> {
+        adopt(self, tools, db, probe_pv, avoid, |db| {
+            PvxIoc::boot(tools, db)
+        })
+    }
+}
+
+impl PvaServer for RustIoc {
+    fn exit_status(&mut self) -> Option<std::process::ExitStatus> {
+        self.child.try_wait().ok().flatten()
+    }
+    fn reboot(
+        &mut self,
+        tools: &PvxTools,
+        db: &Path,
+        probe_pv: &str,
+        avoid: u16,
+    ) -> Result<(), BootError> {
+        adopt(self, tools, db, probe_pv, avoid, RustIoc::boot_pva)
+    }
+}
+
 /// Poll a known channel through the real pvxs client until it reads. The PVA
 /// sibling of [`wait_reachable`], sharing its [`wait_probe`] retry policy.
 ///
@@ -1355,6 +1479,34 @@ mod tests {
             OutputTail::new(),
         );
         rx.iter().collect()
+    }
+
+    /// The boot loop drops its receiver once the IOC is up; the tail must go on
+    /// filling anyway. Without this, an IOC that a later client read kills is
+    /// reported with the banner it printed at boot and nothing about the death
+    /// -- and the abort contract has no evidence to name.
+    #[test]
+    fn the_tail_keeps_filling_after_the_boot_loop_stops_listening() {
+        let tail = OutputTail::new();
+        let (tx, rx) = mpsc::channel::<BootSignal>();
+        drop(rx);
+        spawn_watcher(
+            std::io::Cursor::new(
+                b"iocRun: All initialization complete\nmalloc(): unaligned fastbin chunk detected\n"
+                    .to_vec(),
+            ),
+            tx,
+            tail.clone(),
+        );
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < deadline && !tail.text().contains("unaligned fastbin") {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            tail.text().contains("unaligned fastbin chunk detected"),
+            "the dying words must survive a dropped receiver, got {:?}",
+            tail.text()
+        );
     }
 
     /// The formerly-invisible outcome. `rsrv` losing its UDP port is silent

@@ -13,7 +13,7 @@
 //! port has a filed history of exactly that (R18-108: count fields declared
 //! LONG where C says ULONG).
 
-use crate::dbd::{DbfType, FieldDef};
+use crate::dbd::{DbaddrShape, DbfType, FieldDef, RecordType};
 
 /// One boundary value to write, with the class it is probing.
 #[derive(Debug, Clone, PartialEq, serde::Serialize)]
@@ -162,8 +162,20 @@ fn enum_cases(choices: Option<&[String]>) -> Vec<BoundaryCase> {
     v
 }
 
-/// The full boundary set for one field, derived from its declared type.
-pub fn boundary_cases(f: &FieldDef, menu_choices: Option<&[String]>) -> Vec<BoundaryCase> {
+/// The full boundary set for one field, derived from the type it is **served
+/// as** — which for a `special(SPC_DBADDR)` field is not the type it declares.
+///
+/// The record type comes along for exactly that reason. `lsi`, `lso` and
+/// `printf` declare `VAL` (and `lsi`/`lso` also `OVAL`) `DBF_NOACCESS`, and
+/// their `cvt_dbaddr` serves it as one `DBF_STRING` of `SIZV` bytes; reading
+/// the declared type alone gave those five fields an EMPTY case list, so the
+/// put phase drove nothing at all on the three long-string record types while
+/// reporting them measured.
+pub fn boundary_cases(
+    rt: &RecordType,
+    f: &FieldDef,
+    menu_choices: Option<&[String]>,
+) -> Vec<BoundaryCase> {
     match f.dbf {
         t if crate::surface::is_numeric(t) => numeric_cases(t),
         DbfType::String => string_cases(f.size),
@@ -179,8 +191,41 @@ pub fn boundary_cases(f: &FieldDef, menu_choices: Option<&[String]>) -> Vec<Boun
         // declare special(SPC_MOD) and the record then rejects the write, so the
         // fields are unwritable over CA in C but writable in the port).
         t if t.is_link() => vec![c("0", "link-constant")],
-        DbfType::NoAccess => Vec::new(),
+        // The record gets the last word. A `SIZV` buffer is a string field and
+        // takes the string family; an element sequence is the array phase's
+        // subject and takes no scalar `caput` here; anything else is a shape
+        // the `.dbd` cannot name, so nothing is asserted about it.
+        DbfType::NoAccess => match rt.dbaddr_shape(f) {
+            Some(DbaddrShape::LongString { sizv }) => string_cases(sizv),
+            _ => Vec::new(),
+        },
         _ => Vec::new(),
+    }
+}
+
+/// One array case: the puts that put the destination into the state under test,
+/// then the put whose result is measured.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ArrayCase {
+    /// Puts driven before the measured one, in order. Empty for every case whose
+    /// subject is a put into a fresh record.
+    ///
+    /// A prime that fails ERRORs the case: the measured put would otherwise run
+    /// against a destination in an unknown state, and two sides can agree on an
+    /// experiment neither of them ran.
+    pub prime: Vec<Vec<String>>,
+    /// The measured put.
+    pub values: Vec<String>,
+    pub class: &'static str,
+}
+
+impl ArrayCase {
+    fn fresh(values: Vec<String>, class: &'static str) -> Self {
+        Self {
+            prime: Vec::new(),
+            values,
+            class,
+        }
     }
 }
 
@@ -189,23 +234,42 @@ pub fn boundary_cases(f: &FieldDef, menu_choices: Option<&[String]>) -> Vec<Boun
 /// Zero-length and over-NELM are the two that actually break ports: a
 /// zero-length put must not be silently turned into a 1-element put, and an
 /// over-NELM put must be truncated to NELM (not rejected, not overflowed).
-pub fn array_cases(nelm: u32) -> Vec<(Vec<String>, &'static str)> {
+///
+/// The last case is a boundary of a different kind — the destination's STATE
+/// rather than the request's count. `dbPut` takes the array write offset from
+/// `get_array_info` (`dbAccess.c:1355-1360`), whose documented contract is the
+/// READ start because it exists to serve `dbGet`. On a fresh record the read
+/// start and the write cursor are the same index, so every count boundary above
+/// measures only the case where the two coincide, and a server that confuses
+/// them agrees on all of them. `compress` in FIFO mode is where they differ.
+pub fn array_cases(nelm: u32) -> Vec<ArrayCase> {
     let mk = |n: usize| (0..n).map(|i| i.to_string()).collect::<Vec<_>>();
     let mut v = vec![
         // `caput -a <pv> 0` with no values: the CA client sends a write of
         // count 0 (only `countIn > native count` is refused, nciu.cpp:354), so
         // what each server does with it is genuinely observable — and a port
         // that turns it into a 1-element put differs in NORD.
-        (mk(0), "array-zero-length"),
-        (mk(1), "array-single-element"),
-        (mk(nelm as usize), "array-exactly-nelm"),
+        ArrayCase::fresh(mk(0), "array-zero-length"),
+        ArrayCase::fresh(mk(1), "array-single-element"),
+        ArrayCase::fresh(mk(nelm as usize), "array-exactly-nelm"),
     ];
     if nelm > 1 {
-        v.push((mk((nelm / 2) as usize), "array-partial"));
+        v.push(ArrayCase::fresh(mk((nelm / 2) as usize), "array-partial"));
     }
     // One past capacity: C truncates to NELM. A port that rejects, or that
     // writes past the end, differs observably in NORD.
-    v.push((mk(nelm as usize + 1), "array-over-nelm"));
+    v.push(ArrayCase::fresh(mk(nelm as usize + 1), "array-over-nelm"));
+    // Half the capacity twice: the second put lands on a destination the first
+    // one left non-empty, which is the only state in which a write offset taken
+    // from the READ start is distinguishable from one taken at the write cursor.
+    if nelm > 1 {
+        let half = (nelm / 2) as usize;
+        v.push(ArrayCase {
+            prime: vec![mk(half)],
+            values: mk(half),
+            class: "array-into-non-empty",
+        });
+    }
     v
 }
 
@@ -216,6 +280,11 @@ mod tests {
 
     fn field(dbd: &Dbd, rt: &str, name: &str) -> FieldDef {
         dbd.record_type(rt).unwrap().field(name).unwrap().clone()
+    }
+
+    /// `boundary_cases` for a field, with its own record type.
+    fn cases_for(dbd: &Dbd, rt: &str, name: &str, ch: Option<&[String]>) -> Vec<BoundaryCase> {
+        boundary_cases(dbd.record_type(rt).unwrap(), &field(dbd, rt, name), ch)
     }
 
     const SAMPLE: &str = r#"
@@ -235,6 +304,25 @@ recordtype(ai) {
 }
 "#;
 
+    /// The three `special(SPC_DBADDR)` shapes, each with its own capacity
+    /// spelling, as the real `.dbd` declares them.
+    const DBADDR: &str = r#"
+recordtype(lsi) {
+    field(VAL, DBF_NOACCESS) { special(SPC_DBADDR) pp(TRUE) }
+    field(OVAL, DBF_NOACCESS) { special(SPC_DBADDR) }
+    field(SIZV, DBF_USHORT) { special(SPC_NOMOD) initial("41") }
+}
+recordtype(waveform) {
+    field(VAL, DBF_NOACCESS) { special(SPC_DBADDR) }
+    field(NELM, DBF_ULONG) { special(SPC_NOMOD) initial("1") }
+}
+recordtype(aSub) {
+    field(VAL, DBF_LONG) { }
+    field(A, DBF_NOACCESS) { special(SPC_DBADDR) }
+    field(NOA, DBF_ULONG) { initial("1") }
+}
+"#;
+
     fn classes(cases: &[BoundaryCase]) -> Vec<&str> {
         cases.iter().map(|c| c.class).collect()
     }
@@ -242,7 +330,7 @@ recordtype(ai) {
     #[test]
     fn doubles_get_nan_and_both_infinities() {
         let d = Dbd::parse(SAMPLE).unwrap();
-        let cs = boundary_cases(&field(&d, "ai", "VAL"), None);
+        let cs = cases_for(&d, "ai", "VAL", None);
         let cl = classes(&cs);
         assert!(cl.contains(&"nan"));
         assert!(cl.contains(&"positive-infinity"));
@@ -254,7 +342,7 @@ recordtype(ai) {
     #[test]
     fn signed_type_gets_min_max_and_one_past_each() {
         let d = Dbd::parse(SAMPLE).unwrap();
-        let cs = boundary_cases(&field(&d, "ai", "PREC"), None);
+        let cs = cases_for(&d, "ai", "PREC", None);
         let vals: Vec<&str> = cs.iter().map(|c| c.value.as_str()).collect();
         assert!(vals.contains(&"32767"), "SHORT max");
         assert!(vals.contains(&"-32768"), "SHORT min");
@@ -267,7 +355,7 @@ recordtype(ai) {
     #[test]
     fn unsigned_type_is_probed_with_negative_one() {
         let d = Dbd::parse(SAMPLE).unwrap();
-        let cs = boundary_cases(&field(&d, "ai", "NELM"), None);
+        let cs = cases_for(&d, "ai", "NELM", None);
         let neg = cs
             .iter()
             .find(|c| c.value == "-1")
@@ -281,7 +369,7 @@ recordtype(ai) {
     #[test]
     fn string_boundaries_respect_size_including_the_nul() {
         let d = Dbd::parse(SAMPLE).unwrap();
-        let cs = boundary_cases(&field(&d, "ai", "NAME"), None);
+        let cs = cases_for(&d, "ai", "NAME", None);
         let fits = cs.iter().find(|c| c.class == "exactly-fits").unwrap();
         assert_eq!(fits.value.len(), 60, "size(61) holds 60 chars + NUL");
         let over = cs.iter().find(|c| c.class == "one-over-capacity").unwrap();
@@ -296,7 +384,7 @@ recordtype(ai) {
             .iter()
             .map(|s| s.to_string())
             .collect();
-        let cs = boundary_cases(&field(&d, "ai", "SCAN"), Some(&choices));
+        let cs = cases_for(&d, "ai", "SCAN", Some(&choices));
         let vals: Vec<&str> = cs.iter().map(|c| c.value.as_str()).collect();
         assert!(vals.contains(&"2"), "last valid ordinal");
         assert!(vals.contains(&"3"), "one past the last choice: must refuse");
@@ -310,7 +398,7 @@ recordtype(ai) {
     #[test]
     fn links_get_a_constant_put_and_never_a_pv_reference() {
         let d = Dbd::parse(SAMPLE).unwrap();
-        let cs = boundary_cases(&field(&d, "ai", "INP"), None);
+        let cs = cases_for(&d, "ai", "INP", None);
         assert_eq!(cs.len(), 1);
         assert_eq!(cs[0].class, "link-constant");
         assert_eq!(cs[0].value, "0");
@@ -325,15 +413,59 @@ recordtype(ai) {
     #[test]
     fn array_cases_cover_zero_exact_and_over_nelm() {
         let cs = array_cases(4);
-        let cl: Vec<&str> = cs.iter().map(|c| c.1).collect();
+        let cl: Vec<&str> = cs.iter().map(|c| c.class).collect();
         assert!(cl.contains(&"array-zero-length"), "{cl:?}");
         assert!(cl.contains(&"array-exactly-nelm"), "{cl:?}");
         assert!(cl.contains(&"array-over-nelm"), "{cl:?}");
-        let zero = cs.iter().find(|c| c.1 == "array-zero-length").unwrap();
-        assert!(zero.0.is_empty(), "zero-length means no elements at all");
-        let exact = cs.iter().find(|c| c.1 == "array-exactly-nelm").unwrap();
-        assert_eq!(exact.0.len(), 4, "exactly NELM=4");
-        let over = cs.iter().find(|c| c.1 == "array-over-nelm").unwrap();
-        assert_eq!(over.0.len(), 5, "one past NELM=4");
+        let find = |class: &str| cs.iter().find(|c| c.class == class).unwrap();
+        assert!(
+            find("array-zero-length").values.is_empty(),
+            "zero-length means no elements at all"
+        );
+        assert_eq!(find("array-exactly-nelm").values.len(), 4, "exactly NELM=4");
+        assert_eq!(find("array-over-nelm").values.len(), 5, "one past NELM=4");
+    }
+
+    /// Every count boundary drives a fresh record, so all of them measure the
+    /// one state in which a read-start offset and a write cursor coincide. The
+    /// non-empty case is the only one that separates them.
+    #[test]
+    fn exactly_one_case_drives_a_non_empty_destination() {
+        let cs = array_cases(16);
+        let primed: Vec<&ArrayCase> = cs.iter().filter(|c| !c.prime.is_empty()).collect();
+        assert_eq!(primed.len(), 1, "{:?}", classes_of(&cs));
+        assert_eq!(primed[0].class, "array-into-non-empty");
+        assert_eq!(primed[0].prime, vec![primed[0].values.clone()]);
+        assert_eq!(primed[0].values.len(), 8, "half of NELM=16");
+    }
+
+    fn classes_of(cs: &[ArrayCase]) -> Vec<&'static str> {
+        cs.iter().map(|c| c.class).collect()
+    }
+
+    /// `lsi`/`lso`/`printf` serve VAL as ONE `SIZV`-sized string, so the put
+    /// phase owes it the string family — sized off `SIZV`, exactly as a
+    /// `size(N)` field is sized off `size()`.
+    #[test]
+    fn a_sizv_backed_val_takes_the_string_family_sized_from_sizv() {
+        let d = Dbd::parse(DBADDR).unwrap();
+        for f in ["VAL", "OVAL"] {
+            let cs = cases_for(&d, "lsi", f, None);
+            let cl = classes(&cs);
+            assert!(cl.contains(&"empty-string"), "{f}: {cl:?}");
+            assert!(cl.contains(&"exactly-fits"), "{f}: {cl:?}");
+            assert!(cl.contains(&"one-over-capacity"), "{f}: {cl:?}");
+            let fits = cs.iter().find(|c| c.class == "exactly-fits").unwrap();
+            assert_eq!(fits.value.len(), 40, "{f}: SIZV 41 counts the NUL");
+        }
+    }
+
+    /// The other two shapes get nothing here: an element sequence is the array
+    /// phase's subject, and an undeclared capacity is not predictable at all.
+    #[test]
+    fn the_other_two_dbaddr_shapes_take_no_scalar_put_cases() {
+        let d = Dbd::parse(DBADDR).unwrap();
+        assert!(cases_for(&d, "waveform", "VAL", None).is_empty());
+        assert!(cases_for(&d, "aSub", "A", None).is_empty());
     }
 }

@@ -401,6 +401,12 @@ pub struct Report {
     /// findings out of a narrowed scope.
     #[serde(default)]
     pub unexercised_allowlist_rows: Vec<StaleRow>,
+    /// Rows a case in their scope DID drive, but whose scope reaches record types
+    /// this run was restricted away from (`--record-types`). NOT findings, and
+    /// NOT stale: the staleness claim covers a row's whole scope, and this run
+    /// only saw a slice of it.
+    #[serde(default)]
+    pub partially_exercised_allowlist_rows: Vec<StaleRow>,
     pub fired_allowlist_rows: Vec<String>,
     pub cases: Vec<CaseResult>,
 }
@@ -514,6 +520,22 @@ impl Report {
                 s.push_str(&format!(
                     "  {} — its scope WAS exercised and it still never fired. Either the port\n     \
                      regressed back onto C's bug, or C fixed it upstream. Both are findings.\n",
+                    r.id
+                ));
+            }
+            s.push('\n');
+        }
+
+        if !self.partially_exercised_allowlist_rows.is_empty() {
+            s.push_str(
+                "PARTIALLY EXERCISED ALLOWLIST ROWS (not findings — this run drove only part \
+                 of their scope)\n",
+            );
+            for r in &self.partially_exercised_allowlist_rows {
+                s.push_str(&format!(
+                    "  {} — a case in its scope ran and it never fired, but --record-types kept\n     \
+                     this run off record types the row also covers, so the silence is not\n     \
+                     evidence the deviation stopped. Drop the filter to judge it.\n",
                     r.id
                 ));
             }
@@ -756,6 +778,7 @@ mod tests {
             counts: Counts::tally(&cases),
             stale_allowlist_rows: vec![],
             unexercised_allowlist_rows: vec![],
+            partially_exercised_allowlist_rows: vec![],
             fired_allowlist_rows: vec![],
             cases,
         };
@@ -881,6 +904,7 @@ mod tests {
             counts: Counts::tally(&cases),
             stale_allowlist_rows: vec![],
             unexercised_allowlist_rows: vec![],
+            partially_exercised_allowlist_rows: vec![],
             fired_allowlist_rows: vec![],
             cases,
         };
@@ -937,6 +961,7 @@ mod tests {
             counts: Counts::tally(&cases),
             stale_allowlist_rows: vec![],
             unexercised_allowlist_rows: vec![],
+            partially_exercised_allowlist_rows: vec![],
             fired_allowlist_rows: vec![],
             cases,
         };
@@ -1003,6 +1028,7 @@ mod tests {
                 driven_by: vec!["--phase all"],
             }],
             unexercised_allowlist_rows: vec![],
+            partially_exercised_allowlist_rows: vec![],
             fired_allowlist_rows: vec![],
             cases: vec![case(Verdict::Errored), case(Verdict::Defect)],
         };
@@ -1043,6 +1069,7 @@ mod tests {
             counts: Counts::tally(&[case(Verdict::Agreed)]),
             stale_allowlist_rows: vec![],
             unexercised_allowlist_rows: vec![],
+            partially_exercised_allowlist_rows: vec![],
             fired_allowlist_rows: vec![],
             cases: vec![case(Verdict::Agreed)],
         };
@@ -1085,6 +1112,7 @@ mod tests {
             counts: Counts::tally(std::slice::from_ref(&c)),
             stale_allowlist_rows: vec![],
             unexercised_allowlist_rows: vec![],
+            partially_exercised_allowlist_rows: vec![],
             fired_allowlist_rows: vec![],
             cases: vec![c],
         };
@@ -1186,6 +1214,7 @@ why = "C's special() rejects SPC_MOD; port accepts."
             counts,
             stale_allowlist_rows: stale,
             unexercised_allowlist_rows: vec![],
+            partially_exercised_allowlist_rows: vec![],
             fired_allowlist_rows: vec![],
             cases: vec![case(Verdict::Agreed)],
         };
@@ -1278,6 +1307,7 @@ why = "One row, both lanes."
             counts: Counts::tally(&[case(Verdict::Agreed)]),
             stale_allowlist_rows: vec![],
             unexercised_allowlist_rows: rows,
+            partially_exercised_allowlist_rows: vec![],
             fired_allowlist_rows: vec![],
             cases: vec![case(Verdict::Agreed)],
         };

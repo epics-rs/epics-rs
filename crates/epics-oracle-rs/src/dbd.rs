@@ -107,14 +107,17 @@ impl DbfType {
         })
     }
 
-    /// Can a CA client see this field at all?
+    /// Does the DECLARED type alone leave a field client-visible?
     ///
-    /// `DBF_NOACCESS` fields are raw C pointers in the record struct (`BPTR`,
-    /// `RPVT`, `DPVT`, ...). `dbNameToAddr` resolves them but CA refuses to
-    /// serve them, so they are *not* part of the observable surface and must
-    /// not be counted in the denominator — counting them would let the harness
-    /// claim coverage of fields no client can ever reach.
-    pub fn is_ca_observable(self) -> bool {
+    /// Half of the reachability question and never the whole of it, which is
+    /// why this is private: `DBF_NOACCESS` fields are raw C pointers in the
+    /// record struct (`BPTR`, `RPVT`, `DPVT`, ...) that CA refuses to serve —
+    /// *unless* the field is `special(SPC_DBADDR)`, where `dbNameToAddr` hands
+    /// the `DBADDR` to `cvt_dbaddr` and the record re-types it into something
+    /// a client reads and writes (`compress.VAL` becomes `DBF_DOUBLE[NSAM]`,
+    /// `printf.VAL` a `DBF_STRING`). Ask [`FieldDef::is_ca_observable`], which
+    /// has both halves.
+    fn declared_type_is_ca_observable(self) -> bool {
         self != Self::NoAccess
     }
 
@@ -193,6 +196,26 @@ impl FieldDef {
     pub fn rewrites_dbaddr(&self) -> bool {
         self.special.as_deref() == Some("SPC_DBADDR")
     }
+
+    /// **The single owner of "can a CA client reach this field".**
+    ///
+    /// A `DBF_NOACCESS` declaration is not the answer on its own. C resolves the
+    /// name, then gives the record the last word whenever the field is
+    /// `special(SPC_DBADDR)` (`dbAccess.c:639-648`), and the record routinely
+    /// re-types a `DBF_NOACCESS` pointer into a served channel:
+    /// `compressRecord.c:395-407` sets `field_type = DBF_DOUBLE`,
+    /// `no_elements = nsam`; `printfRecord.c:410-421` sets `DBF_STRING` over the
+    /// `SIZV` buffer. Both answer `caget` and `caput` on a compiled softIoc.
+    ///
+    /// Reading the declared type alone dropped 80 fields — every `aSub` A..U and
+    /// VALA..VALU, `acalcout`/`scalcout`'s buffers, `asyn.ERRS`, `lsi`/`lso`
+    /// OVAL and VAL, and the nine `VAL`s of `aai`/`aao`/`compress`/`histogram`/
+    /// `printf`/`subArray`/`waveform` — out of the denominator under the claim
+    /// that no client could reach them, which is how `CBUG-E1` read UNEXERCISED
+    /// in every run while the port refused a put C accepts.
+    pub fn is_ca_observable(&self) -> bool {
+        self.dbf.declared_type_is_ca_observable() || self.rewrites_dbaddr()
+    }
 }
 
 /// One `recordtype(name) { ... }` declaration.
@@ -207,10 +230,74 @@ impl RecordType {
         self.fields.iter().find(|f| f.name == name)
     }
 
-    /// Fields a CA client can actually reach (everything but `DBF_NOACCESS`).
+    /// Fields a CA client can actually reach ([`FieldDef::is_ca_observable`]).
     pub fn observable_fields(&self) -> impl Iterator<Item = &FieldDef> {
-        self.fields.iter().filter(|f| f.dbf.is_ca_observable())
+        self.fields.iter().filter(|f| f.is_ca_observable())
     }
+
+    /// The shape `cvt_dbaddr` serves for `field`, or `None` when the record
+    /// never gets the last word on it (`field` is not `special(SPC_DBADDR)`).
+    ///
+    /// **The single owner of "what is behind an `SPC_DBADDR` field".** Two
+    /// consumers ask it — the array phase, deciding whether `caput -a` has a
+    /// destination, and the put phase, deciding what boundary values a field
+    /// takes — and they must not answer it separately, because the answer is
+    /// one property of the record type and a disagreement shows up as a field
+    /// driven by neither.
+    pub fn dbaddr_shape(&self, field: &FieldDef) -> Option<DbaddrShape> {
+        if !field.rewrites_dbaddr() {
+            return None;
+        }
+        // No record type in base or the support modules declares more than one
+        // of these, so the order below is a spelling lookup, not a precedence.
+        if let Some(sizv) = self.field("SIZV") {
+            return Some(DbaddrShape::LongString {
+                sizv: sizv.initial.as_deref().and_then(|s| s.parse().ok()),
+            });
+        }
+        Some(
+            match ["NELM", "NSAM"]
+                .into_iter()
+                .find(|f| self.field(f).is_some())
+            {
+                Some(capacity_field) => DbaddrShape::Elements { capacity_field },
+                None => DbaddrShape::Opaque,
+            },
+        )
+    }
+}
+
+/// What `cvt_dbaddr` serves in place of a `special(SPC_DBADDR)` field's
+/// declared type, as far as the `.dbd` can say.
+///
+/// The `.dbd` cannot say it directly — that is the whole point of
+/// [`FieldDef::rewrites_dbaddr`] — but the record type's own *capacity*
+/// declaration is a faithful proxy for the three shapes that exist, and the C
+/// behind each is unambiguous:
+///
+/// - `NELM`/`NSAM` — a bounded element sequence (`waveform`, `aai`, `aao`,
+///   `subArray`, `histogram`, and `compress`, which spells it `NSAM`).
+/// - `SIZV` — ONE string over a char buffer. `lsiRecord.c`, `lsoRecord.c` and
+///   `printfRecord.c` all set `no_elements = 1`, `field_type = DBF_STRING`,
+///   `field_size = prec->sizv` in `cvt_dbaddr`, so the field IS a `DBF_STRING`
+///   whose `size()` is `SIZV` — NUL included, exactly as `size(N)` counts it
+///   (`put_array_info` truncates `nNew >= sizv` to `sizv - 1`, "truncated
+///   string").
+/// - neither — the `.dbd` names no capacity, so nothing static predicts the
+///   shape. `aSub` sizes each of A..U from its own `NOA`/`FTA` pair, `scalcout`
+///   serves PAA..PLL as `STRING_SIZE` ONE-BYTE strings
+///   (`sCalcoutRecord.c:588-596`), and `mbbo` re-types VAL to a `DBF_USHORT`
+///   scalar leaving `no_elements` at 1 (`mbboRecord.c:300-313`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DbaddrShape {
+    /// A bounded element sequence. The payload is the `.dbd` SPELLING of the
+    /// capacity field, which differs per record type.
+    Elements { capacity_field: &'static str },
+    /// One string of `SIZV` bytes, NUL included. `None` when the record type
+    /// declares `SIZV` without an `initial(...)`, which no base record does.
+    LongString { sizv: Option<u32> },
+    /// No `.dbd`-declared capacity: the served shape is not derivable here.
+    Opaque,
 }
 
 /// A `menu(name) { choice(id, "Label") ... }` — the string set a `DBF_MENU`
@@ -486,6 +573,11 @@ recordtype(ai) {
         prompt("Record Private")
         extra("void *rpvt")
     }
+    field(BUF, DBF_NOACCESS) {
+        prompt("Circular Buffer")
+        special(SPC_DBADDR)
+        extra("double *buf")
+    }
     field(STAT, DBF_MENU) {
         initial("UDF")
         menu(menuAlarmStat)
@@ -501,7 +593,7 @@ recordtype(ai) {
     fn parses_recordtype_and_all_its_fields() {
         let d = dbd();
         let ai = d.record_type("ai").expect("ai recordtype");
-        assert_eq!(ai.fields.len(), 5, "every field() must be captured");
+        assert_eq!(ai.fields.len(), 6, "every field() must be captured");
     }
 
     #[test]
@@ -568,13 +660,24 @@ recordtype(mbbo) {
         );
     }
 
+    /// The owner path and the path that used to bypass it, in one case: both
+    /// fields are declared `DBF_NOACCESS`, and only the one C hands to
+    /// `cvt_dbaddr` stays reachable.
     #[test]
     fn noaccess_is_excluded_from_the_observable_surface() {
         let d = dbd();
         let ai = d.record_type("ai").unwrap();
-        assert!(!DbfType::NoAccess.is_ca_observable());
+        assert!(!ai.field("RPVT").unwrap().is_ca_observable());
+        assert!(
+            ai.field("BUF").unwrap().is_ca_observable(),
+            "special(SPC_DBADDR) re-types the field, so a client reaches it"
+        );
         let obs: Vec<_> = ai.observable_fields().map(|f| f.name.as_str()).collect();
-        assert_eq!(obs, ["NAME", "VAL", "SCAN", "STAT"], "RPVT must be dropped");
+        assert_eq!(
+            obs,
+            ["NAME", "VAL", "SCAN", "BUF", "STAT"],
+            "RPVT must be dropped, BUF must not"
+        );
     }
 
     #[test]
@@ -632,5 +735,49 @@ recordtype(ai) {
     fn empty_dbd_is_an_error_not_an_empty_denominator() {
         let err = Dbd::parse("# nothing here\n").unwrap_err();
         assert!(err.contains("zero recordtypes"), "got: {err}");
+    }
+
+    /// The capacity spelling is per record type, and `dbaddr_shape` is the one
+    /// place that knows it.
+    #[test]
+    fn the_dbaddr_shape_is_read_from_the_record_types_own_capacity_field() {
+        let d = Dbd::parse(
+            r#"
+recordtype(compress) {
+    field(VAL, DBF_NOACCESS) { special(SPC_DBADDR) }
+    field(NSAM, DBF_ULONG) { initial("1") }
+}
+recordtype(printf) {
+    field(VAL, DBF_NOACCESS) { special(SPC_DBADDR) }
+    field(SIZV, DBF_USHORT) { initial("41") }
+    field(LEN, DBF_ULONG) { special(SPC_NOMOD) }
+}
+recordtype(mbbo) {
+    field(VAL, DBF_ENUM) { special(SPC_DBADDR) pp(TRUE) }
+    field(RVAL, DBF_ULONG) { }
+}
+"#,
+        )
+        .unwrap();
+        let shape = |rt: &str, f: &str| {
+            let r = d.record_type(rt).unwrap();
+            r.dbaddr_shape(r.field(f).unwrap())
+        };
+        assert_eq!(
+            shape("compress", "VAL"),
+            Some(DbaddrShape::Elements {
+                capacity_field: "NSAM"
+            })
+        );
+        assert_eq!(
+            shape("printf", "VAL"),
+            Some(DbaddrShape::LongString { sizv: Some(41) })
+        );
+        // `mbbo` IS SPC_DBADDR, but it declares no capacity: the `.dbd` cannot
+        // say that `cvt_dbaddr` leaves it a scalar, so nothing is claimed.
+        assert_eq!(shape("mbbo", "VAL"), Some(DbaddrShape::Opaque));
+        // Not SPC_DBADDR at all: the record never gets the last word.
+        assert_eq!(shape("mbbo", "RVAL"), None);
+        assert_eq!(shape("printf", "LEN"), None);
     }
 }

@@ -605,9 +605,10 @@ fn commit_special_reset_alarm(
 /// Coerce a write `value` to a record field's stored `target` type — C
 /// `dbConvert.c`'s `dbFastPutConvertRoutine[dbrType][field_type]` table.
 ///
-/// The client-`dbPut` half of the shared converter
-/// [`crate::server::record::coerce_put_value`]; the internal-delivery half is
-/// `put_field_internal_default`. A `DBR_STRING` write to a `DBF_MENU` or
+/// The client-`dbPut` entry
+/// ([`crate::server::record::dbput_coerce_value`]), which renders the request
+/// in the destination field's shape and then runs the type row; the
+/// internal-delivery entry is `put_field_internal_default`. A `DBR_STRING` write to a `DBF_MENU` or
 /// `DBF_ENUM` field has a converter of its own in C (`putStringMenu`,
 /// `putStringEnum`) and must not fall through to `EpicsValue::convert_to`,
 /// which is field-blind and turns any unrecognised string into index 0 —
@@ -618,7 +619,7 @@ fn coerce_write_value(
     target: crate::types::DbFieldType,
     value: EpicsValue,
 ) -> CaResult<crate::types::c_parse::Converted> {
-    crate::server::record::coerce_put_value(record, field, target, value)
+    crate::server::record::dbput_coerce_value(record, field, target, value)
 }
 
 /// What a `dbPut` of a given value means for a given field — the single owner
@@ -700,49 +701,32 @@ fn dbput_request(
         .map(|v| v.db_field_type())
         .or_else(|| crate::server::record::record_instance::declared_field_type_of(record, field));
 
-    // C `dbPut` clamps the request to the destination's element count —
-    // `if (no_elements < nRequest) nRequest = no_elements;` (dbAccess.c:1360),
-    // then converts `nRequest` elements. A multi-element request into a
-    // one-element destination therefore writes element 0 and SUCCEEDS; the
-    // surplus elements are dropped, not an error. Reduce the array to its
-    // first element here, so the record's typed `put_field` arm — and every
-    // `put_common_field` arm — sees the scalar C would have written instead of
-    // rejecting the array with a `TypeMismatch`.
+    // Both remaining halves of the branch belong to `coerce_write_value`, and
+    // this body must not re-derive either of them: the request is rendered in
+    // the destination field's shape and then converted, in that order, by the
+    // one `dbPut` entry (`record::dbput_coerce_value`).
     //
-    // One array shape is exempt: a `CharArray` into a `DBF_STRING` field is how
-    // this port carries the dbChannel `$` char-array view of a string field
-    // (`dbChannel.c:486-505` re-types it to `DBF_CHAR[field_size]`, i.e. an
-    // ARRAY destination in C — its element count is 40, not 1). The `$` flag
-    // lives on the CA channel and never reaches this layer, so the char view is
-    // recognised by its shape and left to `convert_to`, which decodes the bytes
-    // back into the string field.
-    let is_char_string_view = matches!(value, EpicsValue::CharArray(_))
-        && target == Some(crate::types::DbFieldType::String);
-    let value = if !dest_is_array && value.is_array() && !is_char_string_view {
-        value.first_element().unwrap_or(value)
-    } else {
-        value
-    };
-
+    // UNCONDITIONALLY. Skipping the converter when the request already carried
+    // the destination's DBF is what let a scalar reach a buffer field
+    // unrendered — the shape row lives inside the entry, so the type match says
+    // nothing about whether there is work to do — and a String target had to be
+    // named as an exception for the same reason (`putStringString` truncates to
+    // `field_size - 1`, so it is not a no-op on a type match either). With no
+    // gate there is no exception list to keep in step.
     match target {
-        // A String target always runs the converter even on a type match: C's
-        // `putStringString` is not a no-op, it truncates to `field_size - 1`
-        // (see `coerce_put_value`).
-        Some(target)
-            if value.db_field_type() != target || target == crate::types::DbFieldType::String =>
-        {
-            match coerce_write_value(record, field, target, value)? {
-                crate::types::c_parse::Converted::Stored(v) => Ok(PutRequest::Write(v)),
-                // C's `cvt_st_ul` returned success without storing: the same
-                // "nothing stored, status still 0" arm the zero-element
-                // request takes, and with no `recGblSetSevr` — the converter
-                // never reaches `dbAccess.c:1371`.
-                crate::types::c_parse::Converted::Unchanged => {
-                    Ok(PutRequest::StoreNothing { alarm: false })
-                }
+        Some(target) => match coerce_write_value(record, field, target, value)? {
+            crate::types::c_parse::Converted::Stored(v) => Ok(PutRequest::Write(v)),
+            // C's `cvt_st_ul` returned success without storing: the same
+            // "nothing stored, status still 0" arm the zero-element request
+            // takes, and with no `recGblSetSevr` — the converter never reaches
+            // `dbAccess.c:1371`.
+            crate::types::c_parse::Converted::Unchanged => {
+                Ok(PutRequest::StoreNothing { alarm: false })
             }
-        }
-        _ => Ok(PutRequest::Write(value)),
+        },
+        // Neither a current value nor a declaration says what this field takes,
+        // so there is no destination to render or convert against.
+        None => Ok(PutRequest::Write(value)),
     }
 }
 
@@ -3321,15 +3305,63 @@ impl PvDatabase {
                 special_before_put(&mut instance, &field);
 
                 let prev_value = instance.record.get_field(&field);
-                // A refused store is HELD, not returned: C runs the pass below
-                // either way (`dbAccess.c:1398`) and lets its status win.
-                let refused = match instance.record.put_field(&field, value.clone()) {
-                    Ok(()) => None,
-                    Err(CaError::FieldNotFound(_)) => {
-                        instance.put_common_field(&field, value)?;
-                        None
+                // C's `reboot_restore` writes through `dbPutField` → `dbPut`,
+                // which renders the request in the destination field's shape
+                // AND THEN runs the `dbPutConvertRoutine` type row
+                // (`dbAccess.c:1350-1391`) — a saved one-element `histogram`
+                // VAL is a buffer here, not a scalar the record's arm refuses,
+                // and a saved `DBF_STRING` reaches a menu/enum/numeric field
+                // through `putStringMenu`/`Enum`/`<numeric>` rather than the
+                // field-blind `convert_to` that stored `0` for a label and
+                // `32767` for a refused `PREC 32768`. A field the record
+                // SERVES routes through the same single owner the client
+                // `dbPut` path uses (`dbput_coerce_value` = shape THEN type);
+                // a `dbCommon` field the record does not serve has no served
+                // type to convert against, so it keeps the shape-only reshape
+                // its `put_common_field` fallback needs.
+                //
+                // A refused store is HELD, not returned: C runs the after pass
+                // below either way (`dbAccess.c:1398`) and lets its status win.
+                let refused = match instance.record.get_field(&field).map(|v| v.db_field_type()) {
+                    Some(target) => match crate::server::record::dbput_coerce_value(
+                        &*instance.record,
+                        &field,
+                        target,
+                        value,
+                    ) {
+                        Ok(crate::types::c_parse::Converted::Stored(v)) => {
+                            match instance.record.put_field(&field, v.clone()) {
+                                Ok(()) => None,
+                                Err(CaError::FieldNotFound(_)) => {
+                                    instance.put_common_field(&field, v)?;
+                                    None
+                                }
+                                Err(e) => Some(e),
+                            }
+                        }
+                        // C's converter returned success without storing
+                        // (`cvt_st_ul`'s skipped store): the field keeps its
+                        // old value and the restore still succeeds.
+                        Ok(crate::types::c_parse::Converted::Unchanged) => None,
+                        // A convert failure is HELD like a refused store, so the
+                        // unconditional after pass still runs before it returns.
+                        Err(e) => Some(e),
+                    },
+                    None => {
+                        let value = crate::server::record::put_value_in_field_shape(
+                            &*instance.record,
+                            &field,
+                            value,
+                        );
+                        match instance.record.put_field(&field, value.clone()) {
+                            Ok(()) => None,
+                            Err(CaError::FieldNotFound(_)) => {
+                                instance.put_common_field(&field, value)?;
+                                None
+                            }
+                            Err(e) => Some(e),
+                        }
                     }
-                    Err(e) => Some(e),
                 };
 
                 // C `dbPutSpecial(paddr, 1)` — the after-store pass, which
@@ -4595,6 +4627,52 @@ mod tests {
             matches!(db.get_pv("TY:CALC.DESC").unwrap(),
                      EpicsValue::String(s) if s.as_str_lossy() == "5"),
             "the control must show the refusal is the link route, not the string type"
+        );
+    }
+
+    /// An autosave restore is a `dbPutField`, so it must run the
+    /// `dbPutConvertRoutine` type row — not just the shape arm. A saved
+    /// `DBF_DOUBLE` field stored as a string (`"3.5"`) has to reach the record
+    /// through `putStringDouble`'s parse, the same row the client `dbPut` path
+    /// runs, instead of being handed to `put_field` as a raw `String` that its
+    /// numeric arm refuses. Before the type row was wired into
+    /// `put_pv_no_process`, the positive restore below failed with
+    /// `TypeMismatch` and the field kept its default `0.0`.
+    #[epics_macros_rs::epics_test]
+    async fn an_autosave_restore_runs_the_dbputconvertroutine_type_row() {
+        use crate::server::records::calc::CalcRecord;
+
+        let db = PvDatabase::new();
+        db.add_record("TY:CALC", Box::new(CalcRecord::new("A+1")))
+            .await
+            .unwrap();
+
+        // A served DBF_DOUBLE field restored from its saved string spelling is
+        // PARSED through the type row, exactly as `caput CALC.A 3.5` would be.
+        db.put_pv_no_process("TY:CALC.A", EpicsValue::String("3.5".into()))
+            .await
+            .expect("a numeric string restore parses through the convert row");
+        assert!(
+            matches!(db.get_pv("TY:CALC.A").unwrap(),
+                     EpicsValue::Double(v) if (v - 3.5).abs() < 1e-9),
+            "the restored A must be the parsed number 3.5, got {:?}",
+            db.get_pv("TY:CALC.A")
+        );
+
+        // And an unparseable one is REFUSED by `epicsParseFloat64`, leaving the
+        // field alone — the field-blind path would have stored `0.0` instead.
+        let bad = db
+            .put_pv_no_process("TY:CALC.A", EpicsValue::String("not_a_number".into()))
+            .await;
+        assert!(
+            bad.is_err(),
+            "an unparseable numeric restore is refused, got {bad:?}"
+        );
+        assert!(
+            matches!(db.get_pv("TY:CALC.A").unwrap(),
+                     EpicsValue::Double(v) if (v - 3.5).abs() < 1e-9),
+            "a refused restore leaves A at 3.5, got {:?}",
+            db.get_pv("TY:CALC.A")
         );
     }
 }

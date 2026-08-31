@@ -60,7 +60,7 @@
 //!
 //! Same shape as [`crate::stats`], for the same reason: one backend module
 //! selected by `#[cfg]` below, and no `#[cfg]` anywhere else in this file —
-//! `the_os_fork_happens_only_at_the_backend_selection` below holds that.
+//! `tests::the_os_fork_happens_only_at_the_backend_selection` holds that.
 //! [`zoneset`] is in the funnel rather than in a backend because it calls no
 //! RTEMS API: `setenv`/`unsetenv`/`tzset` is the whole of base's
 //! implementation (`:611-627`), and putting it here is what makes it testable

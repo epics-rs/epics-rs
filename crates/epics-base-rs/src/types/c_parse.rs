@@ -200,6 +200,51 @@ pub fn put_string_element(field: &str, target: NumericField, s: &str) -> CaResul
     }
 }
 
+/// C `dbPutConvertRoutine[DBR_STRING][target]` over the WHOLE `nRequest`-element
+/// request — [`put_string_element`] applied to every element, packed into the
+/// array variant the destination stores.
+///
+/// The single owner of that row for BOTH counts. `dbPut` selects it when
+/// `nRequest > 1` **or** the field is `special(SPC_DBADDR)`
+/// (`dbAccess.c:1350`), so a one-element string put into an array destination
+/// is this row and not the scalar one — the count does not decide. A refused
+/// element refuses the whole `dbPut` (`dbAccess.c:1362` returns on a non-zero
+/// status), which is why the `?` propagates rather than substituting a value.
+///
+/// A skipped element (`cvt_st_ul`'s via-double fallback landing outside the
+/// destination band) leaves the whole request unstored, as the one-element case
+/// already did: nothing is written and the put still succeeds.
+pub fn put_string_elements(
+    field: &str,
+    target: NumericField,
+    texts: &[crate::types::PvString],
+) -> CaResult<Converted> {
+    macro_rules! pack {
+        ($array:ident, $scalar:ident) => {{
+            let mut out = Vec::with_capacity(texts.len());
+            for t in texts {
+                match put_string_element(field, target, &t.as_str_lossy())? {
+                    Converted::Stored(EpicsValue::$scalar(v)) => out.push(v),
+                    _ => return Ok(Converted::Unchanged),
+                }
+            }
+            EpicsValue::$array(out)
+        }};
+    }
+    Ok(Converted::Stored(match target {
+        NumericField::Char => pack!(CharArray, Char),
+        NumericField::UChar => pack!(UCharArray, UChar),
+        NumericField::Short => pack!(ShortArray, Short),
+        NumericField::UShort => pack!(UShortArray, UShort),
+        NumericField::Long => pack!(LongArray, Long),
+        NumericField::ULong => pack!(ULongArray, ULong),
+        NumericField::Int64 => pack!(Int64Array, Int64),
+        NumericField::UInt64 => pack!(UInt64Array, UInt64),
+        NumericField::Float => pack!(FloatArray, Float),
+        NumericField::Double => pack!(DoubleArray, Double),
+    }))
+}
+
 /// C `dbFastGetConvertRoutine[DBF_STRING][target]` (`dbFastLinkConv.c:1642`) —
 /// the SCALAR get row.
 ///

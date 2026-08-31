@@ -65,6 +65,7 @@
 //! vendored third-party) are outside this table and carry no pin.
 
 pub mod auth;
+pub mod channel_shape;
 pub mod cli;
 // The native PVA client — connection pool, UDP search engine, per-operation
 // tasks. Behind the `client` feature (ON by default) so a server-only build

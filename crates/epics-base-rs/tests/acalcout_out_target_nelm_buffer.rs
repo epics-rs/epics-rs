@@ -250,9 +250,15 @@ async fn a_single_element_source_picks_the_scalar_buffer() {
 
     process(&db, "AC").await;
 
+    // ONE element is what `&oval` means; the array target's own `put_field`
+    // sees it as a one-element buffer because `dbPut` copies `nRequest`
+    // elements into an array destination (`dbAccess.c:1350-1362`,
+    // `record::put_value_in_field_shape`). The `&oav` buffer this test rules
+    // out would have arrived as the THREE stale elements the sibling case
+    // asserts.
     assert_eq!(
         *last.lock().unwrap(),
-        Some(EpicsValue::Double(42.0)),
+        Some(EpicsValue::DoubleArray(vec![42.0])),
         "source count 1 ⇒ nelm==1 ⇒ &oval, whatever the target"
     );
 }

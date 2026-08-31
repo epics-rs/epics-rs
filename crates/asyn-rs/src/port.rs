@@ -85,7 +85,24 @@ pub struct DeviceEos {
 /// with addr 0 and with addr -1 must reach the same terminator. That collapse
 /// is what the `-1` key below is.
 pub fn eos_device_key(multi_device: bool, addr: i32) -> i32 {
-    if multi_device { addr } else { -1 }
+    dp_common_key(multi_device, addr).unwrap_or(-1)
+}
+
+/// C `findDpCommon` (asynManager.c:538-545) as a key: which `dpCommon` a
+/// `(port, addr)` pair names. `Some(a)` is that device's own slot; `None` is
+/// the port's — C's `!(pport->attributes&ASYN_MULTIDEVICE) || !pdevice` arm,
+/// which a single-device port and a port-level user both take (`connectDevice`
+/// creates a device node only for `addr >= 0`, asynManager.c:1349-1352).
+///
+/// One function for every consumer of the resolution — connection state, the
+/// trace configuration ([`crate::trace`]) and the EOS terminators
+/// ([`eos_device_key`]) — because C asks it once, in `findDpCommon`, and then
+/// reads *every* field off the one struct it returned: `enabled`, `connected`,
+/// `autoConnect`, `numberConnects`, `lastConnectDisconnect` and `trace`
+/// (through `findTracePvt`, :546-551). Separate copies of the rule are how the
+/// trace mask came to be per-device while `enabled` beside it stayed port-wide.
+pub fn dp_common_key(multi_device: bool, addr: i32) -> Option<i32> {
+    (multi_device && addr >= 0).then_some(addr)
 }
 
 use crate::error::{AsynError, AsynResult, AsynStatus};
@@ -217,9 +234,31 @@ pub struct PortDriverBase {
     /// which clears `enabled` *and* sets `defunct` in the same breath (:2283-2284)
     /// with the comment that disabling is what short-circuits `queueRequest` —
     /// and indeed `queueRequest` has no defunct branch at all (:1541-1552): a
-    /// defunct port is refused as a *disabled* one, "port %s disabled". `defunct`
-    /// itself is only ever asked by `enable` (:2236, so the port cannot be
-    /// re-enabled) and by `findInterface` (:1487).
+    /// defunct port is refused as a *disabled* one, "port %s disabled". C asks
+    /// `defunct` in nine places, and which dpCommon it asks is what our model
+    /// deviates on: `report` (:1041), `findInterface` (:1487),
+    /// `registerInterrupt` (:2424), `getInterruptPvt` (:2475),
+    /// `addInterruptUser` (:2561) and `removeInterruptUser` (:2603) all read
+    /// `pport->dpc.defunct`, while `enable` (:2238, so the port cannot be
+    /// re-enabled), `lockPort` (:1792) and `shutdownPort`'s own idempotence
+    /// check (:2268) read `findDpCommon`'s.
+    ///
+    /// **We model `defunct` at the port, C at whatever dpCommon the shutting-down
+    /// user resolves to, and on a multi-device port that is observably
+    /// different.** `asynShutdownPort` binds at addr 0
+    /// (asynShellCommands.c:1331), so on an `ASYN_MULTIDEVICE` port C flags
+    /// device 0 and never sets `pport->dpc.defunct` at all. Measured against
+    /// libasyn at pin 731d616e, a port registered
+    /// `ASYN_MULTIDEVICE|ASYN_DESTRUCTIBLE` and shut down through an addr-0
+    /// user still answers `isEnabled`=1 at addr -1 and addr 1, still accepts
+    /// `enable` and `lockPort` there, still hands out the interface from
+    /// `findInterface` (with `drvPvt` now NULL — a latent deref, not a
+    /// refusal), and `asynReport` prints the port normally instead of
+    /// "destroyed". Only the single-device case, where `findDpCommon` resolves
+    /// to the port's own dpc, refuses port-wide the way we always do. Taking
+    /// the port down whole is deliberate: the interfaces C nulls belong to the
+    /// port, so the addresses C leaves enabled are enabled onto a driver that
+    /// is gone.
     ///
     /// The field is private so [`Self::shutdown_lifecycle`] is the only way to
     /// set it, which is what makes the invariant hold by construction: nothing can
@@ -603,6 +642,13 @@ impl PortDriverBase {
     /// The port-level transition owner [`Self::set_connected`] carries the
     /// reset.
     pub fn set_addr_connected(&mut self, addr: i32, connected: bool) -> bool {
+        // C reaches both levels through one `exceptionConnect`, and
+        // `findDpCommon` is what decides which: an addr the port resolves to
+        // its own `dpCommon` is a PORT transition, and the port owner carries
+        // the interpose reset and the retry timer that belong to it.
+        let Some(addr) = self.dp_addr(addr) else {
+            return self.set_connected(connected);
+        };
         let was = self.device_state(addr).connected;
         if was == connected {
             return false;
@@ -661,7 +707,34 @@ impl PortDriverBase {
     /// `device_states`, inventing a phantom device whose anchor no
     /// disconnect ever stamped.
     pub fn is_device_addr(&self, addr: i32) -> bool {
-        self.flags.multi_device && addr >= 0
+        self.dp_addr(addr).is_some()
+    }
+
+    /// The dpCommon slot this port resolves `addr` to — [`dp_common_key`]
+    /// against the port's own `ASYN_MULTIDEVICE` attribute. The single owner
+    /// of the resolution for every connection-state read and write below.
+    pub fn dp_addr(&self, addr: i32) -> Option<i32> {
+        dp_common_key(self.flags.multi_device, addr)
+    }
+
+    /// C `findDpCommon(puserPvt)->enabled` (asynManager.c:2352) — what
+    /// `pasynManager->isEnabled` answers for this address.
+    pub fn dp_enabled(&self, addr: i32) -> bool {
+        self.device(addr).map_or(self.enabled, |ds| ds.enabled)
+    }
+
+    /// C `findDpCommon(puserPvt)->connected` (asynManager.c:2340) — what
+    /// `pasynManager->isConnected` answers for this address.
+    pub fn dp_connected(&self, addr: i32) -> bool {
+        self.device(addr)
+            .map_or_else(|| self.is_connected(), |ds| ds.connected)
+    }
+
+    /// C `findDpCommon(puserPvt)->autoConnect` (asynManager.c:2370) — what
+    /// `pasynManager->isAutoConnect` answers for this address.
+    pub fn dp_auto_connect(&self, addr: i32) -> bool {
+        self.device(addr)
+            .map_or(self.auto_connect, |ds| ds.auto_connect)
     }
 
     /// Single owner for the post-attempt throttle stamp. C
@@ -707,6 +780,12 @@ impl PortDriverBase {
     /// devices with it), so a defunct port refuses per-device enable/disable
     /// too, matching C's `dpCommon.defunct` check on the resolved device.
     pub fn set_addr_enabled(&mut self, addr: i32, enabled: bool) -> AsynResult<()> {
+        // C `enable` writes `findDpCommon(puserPvt)->enabled` (asynManager.c:2245),
+        // so an addr that resolves to the port's own slot is the port's enable —
+        // not a device entry no reader would ever resolve to.
+        let Some(addr) = self.dp_addr(addr) else {
+            return self.set_enabled(enabled);
+        };
         if self.defunct {
             return Err(Self::shut_down_error());
         }
@@ -751,6 +830,12 @@ impl PortDriverBase {
     /// device pasynUser hits the device's dpc, otherwise the port's
     /// dpc (asynManager.c:2314 + findDpCommon).
     pub fn set_auto_connect_addr(&mut self, addr: i32, yes: bool) {
+        // Same `findDpCommon` split as [`Self::set_addr_enabled`]
+        // (asynManager.c:2314).
+        let Some(addr) = self.dp_addr(addr) else {
+            self.set_auto_connect(yes);
+            return;
+        };
         let device_down = {
             let dev = self.device_state(addr);
             dev.auto_connect = yes;
@@ -914,10 +999,7 @@ impl PortDriverBase {
     /// resolve it to the port's own `dpCommon` (not multi-device, or no device
     /// created at that address).
     fn device(&self, addr: i32) -> Option<&DeviceState> {
-        if !self.flags.multi_device {
-            return None;
-        }
-        self.device_states.get(&addr)
+        self.dp_addr(addr).and_then(|a| self.device_states.get(&a))
     }
 
     /// Check that the port is enabled, connected, and not defunct.
@@ -958,6 +1040,20 @@ impl PortDriverBase {
             });
         }
         self.enabled = false;
+        // The invariant is `defunct ⟹ !enabled` on *every* dpCommon this port
+        // owns, not only the port's own. Clearing the device slots here is what
+        // makes it hold by construction: [`Self::device_state`] seeds a new slot
+        // from the port's now-false `enabled`, and [`Self::set_addr_enabled`]
+        // refuses while defunct, so nothing can raise a slot back — and
+        // [`Self::dp_enabled`] needs no defunct branch to answer correctly.
+        // Without this, a slot that happened to exist before the shutdown kept
+        // `enabled = true`, so `isEnabled(ADDR)` answered true on a port that is
+        // gone while `isEnabled(-1)` answered false — the same read disagreeing
+        // with itself depending on whether anything had ever touched that
+        // address.
+        for ds in self.device_states.values_mut() {
+            ds.enabled = false;
+        }
         self.defunct = true;
         self.announce_exception(AsynException::Shutdown, -1);
         Ok(())
@@ -975,27 +1071,41 @@ impl PortDriverBase {
 
     /// Get or create a device state for the given address.
     ///
-    /// A device created here inherits the port's `auto_connect`, as C's
+    /// A device created here inherits the port's own `dpCommon`, as C's
     /// `locateDevice` does: `dpCommonInit(pport, pdevice, pport->dpc.autoConnect)`
-    /// (asynManager.c:584). Defaulting it to `true` on a manual-connect port
-    /// would make `asynReport`'s per-device `autoConnect Yes` a lie, and would
-    /// hand `autoConnectDevice` a device it may reconnect on a port whose
-    /// operator turned auto-connect off.
-    pub fn device_state(&mut self, addr: i32) -> &mut DeviceState {
-        let port_auto_connect = self.auto_connect;
-        self.device_states
-            .entry(addr)
-            .or_insert_with(|| DeviceState {
-                auto_connect: port_auto_connect,
-                ..DeviceState::default()
-            })
+    /// (asynManager.c:586). Defaulting `auto_connect` to `true` on a
+    /// manual-connect port would make `asynReport`'s per-device
+    /// `autoConnect Yes` a lie, and would hand `autoConnectDevice` a device it
+    /// may reconnect on a port whose operator turned auto-connect off.
+    ///
+    /// `enabled` and `connected` are seeded the same way, and for a stronger
+    /// reason: until this slot exists the reads [`Self::dp_enabled`] /
+    /// [`Self::dp_connected`] answer from the port's own, so seeding from
+    /// anything else would let an unrelated write — disabling a device on a
+    /// disconnected port, say — flip what a *different* field of that device
+    /// reports. The slot's creation is then invisible: every field starts at
+    /// the value the read it replaces was already giving.
+    /// `pub(crate)`, not `pub`: this hands out the raw slot, so a caller that
+    /// wrote through it would skip the `asynException` fan-out C raises from
+    /// `enable` / `exceptionConnect` (asynManager.c:2247, 2158) *and* could
+    /// create a device on a port that has none — a state C cannot represent,
+    /// since `locateDevice` refuses to allocate one unless
+    /// `attributes&ASYN_MULTIDEVICE` (:576). Outside callers use the three
+    /// owners [`Self::set_addr_connected`], [`Self::set_addr_enabled`] and
+    /// [`Self::set_auto_connect_addr`], each of which resolves the addr first.
+    pub(crate) fn device_state(&mut self, addr: i32) -> &mut DeviceState {
+        let seed = DeviceState {
+            connected: self.is_connected(),
+            enabled: self.enabled,
+            auto_connect: self.auto_connect,
+            last_connect_disconnect: None,
+        };
+        self.device_states.entry(addr).or_insert(seed)
     }
 
     /// Check if a specific device address is connected.
     pub fn is_device_connected(&self, addr: i32) -> bool {
-        self.device_states
-            .get(&addr)
-            .map_or(true, |ds| ds.connected)
+        self.dp_connected(addr)
     }
 
     /// Set a specific device address as connected.
@@ -1569,25 +1679,38 @@ pub trait PortDriver: Send + Sync + 'static {
 
     // --- AsynCommon ---
 
-    fn connect(&mut self, _user: &AsynUser) -> AsynResult<()> {
+    /// The trivial driver's `pasynCommon->connect`: C's own does its transport
+    /// work and then calls `pasynManager->exceptionConnect(pasynUser)`, which
+    /// resolves the slot it marks connected through `findDpCommon` on that same
+    /// user (asynManager.c:2142-2162). So the addr the request carries selects
+    /// the slot here too — [`PortDriverBase::set_addr_connected`] is the one
+    /// owner of that resolution, and a user addressing no device marks the
+    /// port's own. A driver that overrides this owns its transport's shape.
+    fn connect(&mut self, user: &AsynUser) -> AsynResult<()> {
         // Single owner-API: edge-guarded fire is in PortDriverBase::set_connected.
-        self.base_mut().set_connected(true);
+        self.base_mut().set_addr_connected(user.addr, true);
         Ok(())
     }
 
-    fn disconnect(&mut self, _user: &AsynUser) -> AsynResult<()> {
-        self.base_mut().set_connected(false);
+    fn disconnect(&mut self, user: &AsynUser) -> AsynResult<()> {
+        self.base_mut().set_addr_connected(user.addr, false);
         Ok(())
     }
 
-    fn enable(&mut self, _user: &AsynUser) -> AsynResult<()> {
+    /// C `enable(pasynUser, 1)` (asynManager.c:2224-2251): ONE call, whose
+    /// `findDpCommon(puserPvt)` picks the device's `dpCommon` or the port's from
+    /// the addr the caller's user carries (:538-545). There is no second,
+    /// device-only entry point in C and none here: [`PortDriverBase::
+    /// set_addr_enabled`] is that resolution, and a user addressing no device
+    /// lands on the port's own slot.
+    fn enable(&mut self, user: &AsynUser) -> AsynResult<()> {
         // C `enable` refuses a defunct port (asynManager.c:2236-2241);
         // the guard lives in the single owner.
-        self.base_mut().set_enabled(true)
+        self.base_mut().set_addr_enabled(user.addr, true)
     }
 
-    fn disable(&mut self, _user: &AsynUser) -> AsynResult<()> {
-        self.base_mut().set_enabled(false)
+    fn disable(&mut self, user: &AsynUser) -> AsynResult<()> {
+        self.base_mut().set_addr_enabled(user.addr, false)
     }
 
     fn connect_addr(&mut self, user: &AsynUser) -> AsynResult<()> {
@@ -1598,15 +1721,6 @@ pub trait PortDriver: Send + Sync + 'static {
     fn disconnect_addr(&mut self, user: &AsynUser) -> AsynResult<()> {
         self.base_mut().disconnect_addr(user.addr);
         Ok(())
-    }
-
-    fn enable_addr(&mut self, user: &AsynUser) -> AsynResult<()> {
-        // Guarded owner — propagates asynDisabled on a defunct port.
-        self.base_mut().set_addr_enabled(user.addr, true)
-    }
-
-    fn disable_addr(&mut self, user: &AsynUser) -> AsynResult<()> {
-        self.base_mut().set_addr_enabled(user.addr, false)
     }
 
     fn get_option(&self, key: &str) -> AsynResult<String> {
@@ -3721,11 +3835,26 @@ mod tests {
         // device down + ON via the addr variant → the PORT timer arms,
         // keyed on the device's dpCommon exactly as C's findDpCommon
         // resolution is; the port itself stays connected
-        let mut base = PortDriverBase::new("act4", 2, PortFlags::default());
+        let multi = PortFlags {
+            multi_device: true,
+            ..PortFlags::default()
+        };
+        let mut base = PortDriverBase::new("act4", 2, multi);
         base.device_state(1).connected = false;
         assert!(base.connect_retry_at.is_none());
         base.set_auto_connect_addr(1, true);
         assert!(base.connect_retry_at.is_some());
+
+        // the same call on a SINGLE-device port is a port write, because
+        // `findDpCommon` has no device to give it (asynManager.c:541-544): the
+        // port is connected, so it arms nothing at all.
+        let mut base = PortDriverBase::new("act5", 2, PortFlags::default());
+        base.set_auto_connect_addr(1, true);
+        assert!(base.connect_retry_at.is_none());
+        assert!(
+            base.dp_auto_connect(1),
+            "and it landed on the port's own slot"
+        );
     }
 
     #[test]
@@ -3870,6 +3999,38 @@ mod tests {
             enable_hits.load(Ordering::Relaxed),
             0,
             "no Enable exception may fire on a defunct port"
+        );
+    }
+
+    /// The `defunct ⟹ !enabled` invariant is over every dpCommon the port
+    /// owns, so `dp_enabled` must answer the same at every address. The two
+    /// boundaries are the two ways a device slot can be in the map at
+    /// shutdown time: one that already existed, and one created afterwards.
+    #[test]
+    fn shutdown_lifecycle_disables_every_device_dp_common() {
+        let flags = PortFlags {
+            multi_device: true,
+            destructible: true,
+            ..PortFlags::default()
+        };
+
+        // Boundary 1: a slot that exists before the shutdown.
+        let mut base = PortDriverBase::new("shut", 4, flags);
+        base.set_addr_enabled(1, true).unwrap();
+        assert!(base.device_states.contains_key(&1));
+        base.shutdown_lifecycle().unwrap();
+        assert!(!base.dp_enabled(1), "pre-existing device slot must go down");
+        assert!(!base.dp_enabled(-1), "the port's own dpCommon goes down");
+        assert!(!base.dp_enabled(0));
+
+        // Boundary 2: no slot at shutdown, one created afterwards — the seed
+        // in `device_state` takes the port's `enabled`, which is now false.
+        let mut base = PortDriverBase::new("shut2", 4, flags);
+        base.shutdown_lifecycle().unwrap();
+        assert!(!base.dp_enabled(1));
+        assert!(
+            !base.device_state(1).enabled,
+            "a slot seeded after the shutdown must come up disabled"
         );
     }
 

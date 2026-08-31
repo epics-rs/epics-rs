@@ -119,8 +119,10 @@ fn every_dbf_string_field_reports_dbf_string() {
         "a DBF_STRING field stored as another type rejects the .db text C accepts: {wrong:#?}"
     );
     assert_eq!(
-        scanned, 507,
+        scanned, 519,
         "record-owned DBF_STRING fields on this tree; a change here means a \
-         field left or joined the sweep and the new count needs reading"
+         field left or joined the sweep and the new count needs reading. \
+         507 before scalcout began answering for PAA..PLL, whose channel is \
+         forty one-byte DBF_STRING elements (sCalcoutRecord.c:588-596)"
     );
 }

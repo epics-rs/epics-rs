@@ -132,6 +132,10 @@ async fn run() -> Result<ExitCode, String> {
     let supported = probe_supported_record_types(&dbd).await?;
     let surface = Surface::build(&dbd, &supported);
     let types = select_types(&surface, &args.record_types);
+    // A run restricted to some record types has driven only part of every
+    // type-family allowlist row's scope, and must not read that partial silence
+    // as the deviation having stopped.
+    allowlist.note_types_driven(&types, &surface.covered_types);
 
     eprintln!(
         "denominator: {} CA-observable fields across {} record types ({} unimplemented)",
@@ -209,6 +213,11 @@ async fn run() -> Result<ExitCode, String> {
         .into_iter()
         .map(StaleRow::of)
         .collect();
+    let partial: Vec<StaleRow> = allowlist
+        .partially_exercised_rows()
+        .into_iter()
+        .map(StaleRow::of)
+        .collect();
     let fired: Vec<String> = allowlist.fired_rows().iter().cloned().collect();
 
     let report = Report {
@@ -225,6 +234,7 @@ async fn run() -> Result<ExitCode, String> {
         counts,
         stale_allowlist_rows: stale,
         unexercised_allowlist_rows: unexercised,
+        partially_exercised_allowlist_rows: partial,
         fired_allowlist_rows: fired,
         cases,
     };
@@ -292,6 +302,10 @@ async fn run_pva_read(args: &Args) -> Result<ExitCode, String> {
         Some(p) => Allowlist::load(p)?,
         None => Allowlist::load(&Allowlist::default_path())?,
     };
+    // A run restricted to some record types has driven only part of every
+    // type-family allowlist row's scope, and must not read that partial silence
+    // as the deviation having stopped.
+    allowlist.note_types_driven(&types, &surface.covered_types);
     let cases = pvaread::probe(&tools, &workdir(None)?, &surface, &types, &mut allowlist);
     let report = pvaread::report(&args.dbd.display().to_string(), &surface, cases, &allowlist);
     report.counts.check()?;
@@ -331,8 +345,12 @@ async fn run_pva_monitor(args: &Args) -> Result<ExitCode, String> {
         Some(p) => Allowlist::load(p)?,
         None => Allowlist::load(&Allowlist::default_path())?,
     };
-    let cases = pvamonitor::probe(&tools, &workdir(None)?, &surface, &types, &mut allowlist);
-    let report = pvamonitor::report(&args.dbd.display().to_string(), &surface, cases, &allowlist);
+    // A run restricted to some record types has driven only part of every
+    // type-family allowlist row's scope, and must not read that partial silence
+    // as the deviation having stopped.
+    allowlist.note_types_driven(&types, &surface.covered_types);
+    let probe = pvamonitor::probe(&tools, &workdir(None)?, &surface, &types, &mut allowlist);
+    let report = pvamonitor::report(&args.dbd.display().to_string(), &surface, probe, &allowlist);
     report.counts.check()?;
 
     if let Some(p) = &args.json {

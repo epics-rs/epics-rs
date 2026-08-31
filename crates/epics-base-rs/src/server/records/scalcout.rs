@@ -71,6 +71,21 @@ pub struct ScalcoutRecord {
     pub num_vals: [f64; 12],
     // String input values AA-LL
     pub str_vals: [PvString; 12],
+    /// PA..PL — C `sCalcoutRecord.c:341-344` copies A..L here at the TOP of
+    /// `process`, before `fetch_values`, so they hold the numeric inputs this
+    /// cycle STARTED with and `monitor` (`:855-861` for the string twin) can
+    /// post only what changed. `special(SPC_NOMOD)`: the record is the only
+    /// writer, and a client `caput` is refused before it reaches `put_field`.
+    pub pa: [f64; 12],
+    /// PAA..PLL — the same snapshot for the string inputs AA..LL
+    /// (`sCalcoutRecord.c:345-353`, `strNcpy(*psprev, *pscurr, STRING_SIZE)`).
+    ///
+    /// Held as the raw 40-byte buffer C allocates in `init_record`
+    /// (`:223-225`) rather than as a `PvString`, because every byte of it is
+    /// observable: `strNcpy` terminates without clearing the tail, and the
+    /// channel reads all forty bytes: `cvt_dbaddr` (`sCalcoutRecord.c:588-596`)
+    /// leaves `field_size` at 1, so it is forty one-character strings.
+    pub prev_str_vals: [[u8; PREV_STRING_SIZE]; 12],
     /// PVAL — C `sCalcoutRecord.dbd:60` `field(PVAL,DBF_DOUBLE)`, writable.
     ///
     /// The value VAL had at the END of the previous process cycle: C assigns
@@ -203,6 +218,8 @@ impl Default for ScalcoutRecord {
             link_gen: LinkStatusGen::default(),
             num_vals: [0.0; 12],
             str_vals: Default::default(),
+            pa: [0.0; 12],
+            prev_str_vals: [[0; PREV_STRING_SIZE]; 12],
             pval: 0.0,
             lalm: 0.0,
             mlst: 0.0,
@@ -441,6 +458,52 @@ impl ScalcoutRecord {
         NAMES.iter().position(|&n| n == name)
     }
 
+    fn pa_index(name: &str) -> Option<usize> {
+        SCALCOUT_PA_NAMES.iter().position(|&n| n == name)
+    }
+
+    fn prev_str_index(name: &str) -> Option<usize> {
+        SCALCOUT_PREV_STR_NAMES.iter().position(|&n| n == name)
+    }
+
+    /// The CHANNEL a client sees over one PAA..PLL buffer.
+    ///
+    /// C `cvt_dbaddr` (`sCalcoutRecord.c:588-596`) sets `no_elements =
+    /// STRING_SIZE`, `field_type = DBF_STRING` and `field_size = 1`, so
+    /// `getStringString` (`dbConvert.c`) copies ONE byte per element and
+    /// NUL-terminates it: the field is forty one-character strings over the
+    /// 40-byte buffer, not one 40-character string. `caget PAA` on a buffer
+    /// holding `hi` prints `40 h i` followed by 38 blanks, and the compiled
+    /// softIoc is what defines that shape.
+    fn prev_str_channel(buf: &[u8; PREV_STRING_SIZE]) -> EpicsValue {
+        EpicsValue::StringArray(
+            buf.iter()
+                .map(|&b| {
+                    if b == 0 {
+                        PvString::new()
+                    } else {
+                        PvString::from_bytes(vec![b])
+                    }
+                })
+                .collect(),
+        )
+    }
+
+    /// C `strNcpy` (`sCalcoutRecord.c:146-153`) — copy up to `N-1` source
+    /// bytes, stop at the source NUL, terminate. It does NOT clear the rest of
+    /// the destination, so a shorter value leaves the previous one's tail in
+    /// the buffer and the forty-element channel above still shows those bytes.
+    fn snapshot_prev_str(dst: &mut [u8; PREV_STRING_SIZE], src: &PvString) {
+        let src = src.as_bytes();
+        let n = src
+            .iter()
+            .take(PREV_STRING_SIZE - 1)
+            .take_while(|&&b| b != 0)
+            .count();
+        dst[..n].copy_from_slice(&src[..n]);
+        dst[n] = 0;
+    }
+
     fn inp_index(name: &str) -> Option<usize> {
         const NAMES: [&str; 12] = [
             "INPA", "INPB", "INPC", "INPD", "INPE", "INPF", "INPG", "INPH", "INPI", "INPJ", "INPK",
@@ -514,6 +577,21 @@ static SCALCOUT_INAV_NAMES: [&str; 12] = [
 static SCALCOUT_IAAV_NAMES: [&str; 12] = [
     "IAAV", "IBBV", "ICCV", "IDDV", "IEEV", "IFFV", "IGGV", "IHHV", "IIIV", "IJJV", "IKKV", "ILLV",
 ];
+
+/// PA..PL and PAA..PLL, in the index order of `num_vals` / `str_vals` — C
+/// walks both snapshots as one contiguous run from `&pcalc->pa` and
+/// `&pcalc->paa` (`sCalcoutRecord.c:341-353`).
+const SCALCOUT_PA_NAMES: [&str; 12] = [
+    "PA", "PB", "PC", "PD", "PE", "PF", "PG", "PH", "PI", "PJ", "PK", "PL",
+];
+const SCALCOUT_PREV_STR_NAMES: [&str; 12] = [
+    "PAA", "PBB", "PCC", "PDD", "PEE", "PFF", "PGG", "PHH", "PII", "PJJ", "PKK", "PLL",
+];
+
+/// C `sCalcoutRecord.c:198` `#define STRING_SIZE 40` — the width of the
+/// previous-value buffers `init_record` allocates, and the element COUNT
+/// `cvt_dbaddr` puts on their channels.
+const PREV_STRING_SIZE: usize = 40;
 
 /// C `sCalcoutRecord.c::fetch_values`' second loop (890-941): INAA..LL → AA..LL.
 /// Order is C's `sFldnames` order, i.e. the `str_vals` index order.
@@ -881,6 +959,12 @@ impl Record for ScalcoutRecord {
                 if let Some(idx) = Self::str_var_index(name) {
                     return Some(EpicsValue::String(self.str_vals[idx].clone()));
                 }
+                if let Some(idx) = Self::pa_index(name) {
+                    return Some(EpicsValue::Double(self.pa[idx]));
+                }
+                if let Some(idx) = Self::prev_str_index(name) {
+                    return Some(Self::prev_str_channel(&self.prev_str_vals[idx]));
+                }
                 if let Some(idx) = Self::inp_index(name) {
                     return Some(EpicsValue::String(self.inp_links[idx].clone().into()));
                 }
@@ -1080,6 +1164,23 @@ impl Record for ScalcoutRecord {
                         _ => return Err(CaError::TypeMismatch(name.into())),
                     }
                 }
+                if let Some(idx) = Self::prev_str_index(name) {
+                    // C `putStringString` (`dbConvert.c`) writes each element
+                    // with `strncpy(pdst, psrc, size)` and then
+                    // `pdst[size-1] = 0` — over the SAME byte, because
+                    // `cvt_dbaddr` left `field_size` at 1. A put therefore
+                    // stores nothing and CLEARS the first `nRequest` bytes;
+                    // `get_array_info` is NULL for this record, so the offset
+                    // is always 0 and byte 0 is always among them. The
+                    // compiled softIoc accepts the put and reads back short.
+                    let n = match &value {
+                        EpicsValue::String(_) => 1,
+                        EpicsValue::StringArray(a) => a.len().min(PREV_STRING_SIZE),
+                        _ => return Err(CaError::TypeMismatch(name.into())),
+                    };
+                    self.prev_str_vals[idx][..n].fill(0);
+                    return Ok(());
+                }
                 if let Some(idx) = Self::inp_index(name) {
                     match value {
                         EpicsValue::String(s) => {
@@ -1245,6 +1346,32 @@ impl Record for ScalcoutRecord {
     /// commit the cycle first and learn afterwards that it should have waited.
     fn pre_process_actions(&mut self) -> Vec<ProcessAction> {
         vec![ProcessAction::ResolveOutTarget { link_field: "OUT" }]
+    }
+
+    /// C `sCalcoutRecord.c:340-353` — the input snapshot into PA..PL and
+    /// PAA..PLL, which `monitor` (`:855-861`) then compares against A..L /
+    /// AA..LL to decide what to post.
+    ///
+    /// It sits inside the `!pact` arm and BEFORE `fetch_values`, so the
+    /// snapshot is the inputs the cycle STARTED with, not the ones it is about
+    /// to fetch. This hook is the only point earlier than the framework's
+    /// input-link fetch; `pre_process_actions` runs after it and would record
+    /// this cycle's own values. The two re-entry flags are C's `pact == TRUE`
+    /// arms (`:421-439`), which reach neither loop.
+    fn pre_input_link_actions(&mut self) -> Vec<ProcessAction> {
+        if !self.awaiting_out && self.dlya != 1 {
+            self.pa = self.num_vals;
+            for (dst, src) in self.prev_str_vals.iter_mut().zip(self.str_vals.iter()) {
+                Self::snapshot_prev_str(dst, src);
+            }
+        }
+        Vec::new()
+    }
+
+    /// C `cvt_dbaddr` (`sCalcoutRecord.c:588-596`) puts `no_elements =
+    /// STRING_SIZE` on PAA..PLL and nothing on any other field.
+    fn dbaddr_capacity(&self, field: &str) -> Option<u32> {
+        Self::prev_str_index(field).map(|_| PREV_STRING_SIZE as u32)
     }
 
     fn set_resolved_out_target(&mut self, link_field: &str, target: OutTarget) {

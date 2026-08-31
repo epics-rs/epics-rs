@@ -8,6 +8,7 @@
 #   * a deliberate refusal to reproduce a C defect     -> EXPECTED DEVIATION
 #   * an intentional port DESIGN divergence            -> EXPECTED DEVIATION
 #   * a ground-truth INSTRUMENT superset artifact      -> EXPECTED DEVIATION
+#   * a ground-truth INSTRUMENT that cannot be read    -> EXPECTED DEVIATION
 #   * anything else                                     -> PORT DEFECT
 #
 # That policy has three tiers. Interoperability -- the CA and PVA wire protocols,
@@ -19,7 +20,7 @@
 # are held to correctness against hardware and simulators, never to parity with
 # C source.
 #
-# THREE JUSTIFICATION BASES, FOUR BUCKETS
+# THREE JUSTIFICATION BASES, FIVE BUCKETS
 # Most rows are C-bug refusals. Each NOT-REPRODUCED (or, disabled, REPRODUCED)
 # row MUST cite the CBUG id of the upstream defect it refuses to reproduce, and
 # -- because this file is the record, not a pointer to one -- its `why` MUST
@@ -38,13 +39,29 @@
 # declares. The port is not pvxs and correctly serves the measured spec; the
 # difference is the instrument's, not the port's.
 #
-# Both DESIGN-DIVERGENCE and INSTRUMENT-SUPERSET are justified by their `why` —
-# the rationale stated in place — and cite NO CBUG. The CBUG requirement is
-# relaxed for these two buckets only; every row still needs a non-empty, unique
-# `id` (it keys the fired/stale ledger) and a non-empty `why`. Buckets are
-# validated at load (allowlist.rs::parse); an unknown bucket string is a parse
-# error, not a silent wildcard. All four buckets match, fire, and go stale by the
-# same rules — the bucket changes only what justifies a row.
+# An INSTRUMENT-DEFECT row is the third instrument case, and the sharpest: the
+# ground truth cannot be measured AT ALL, because reading the channel CRASHES the
+# instrument. There is no C answer to compare the port against -- not a different
+# answer, no answer -- so the row's `why` must name the upstream defect (project,
+# file, line) that destroys the server. The finding is real and it is cited; it
+# is simply charged to the project that owns the crash, not to the port.
+#
+# It is the one bucket that can legitimately be carried `enabled = false` on the
+# strength of a defect that still EXISTS. A crash is not a property of a channel
+# alone but of a channel and an allocation history, so an upstream heap overflow
+# can be reproducible in isolation and yet never surface under the harness's own
+# read sequence. Disabled, the row asserts nothing about this run and can never
+# go stale; it is the citation waiting for the crash to come back. And if it does
+# come back it comes back LOUD -- an abort with no enabled row justifying it is a
+# DEFECT and fails the run -- so the row is a reference, never a suppression.
+#
+# DESIGN-DIVERGENCE, INSTRUMENT-SUPERSET and INSTRUMENT-DEFECT are justified by
+# their `why` — the rationale stated in place — and cite NO CBUG. The CBUG
+# requirement is relaxed for these three buckets only; every row still needs a
+# non-empty, unique `id` (it keys the fired/stale ledger) and a non-empty `why`.
+# Buckets are validated at load (allowlist.rs::parse); an unknown bucket string
+# is a parse error, not a silent wildcard. All five buckets match, fire, and go
+# stale by the same rules — the bucket changes only what justifies a row.
 #
 # SELF-CHECKING, IN BOTH DIRECTIONS
 #   * a diff that matches a row      -> reported as EXPECTED DEVIATION, not a failure
@@ -82,15 +99,24 @@ upstream = "epics-base / db"
 record_types = ["compress"]
 fields = ["VAL"]
 surface = ["value_string", "value_numeric", "monitor_events"]
+classes = ["array-into-non-empty"]
 why = """
-In C, a scalar dbPut into a compress record's VAL takes its write offset from
-get_array_info(), which returns the READ start (it exists to serve dbGet). In FIFO
-mode that is the oldest element, so successive client puts overwrite the same slot
-instead of appending: three puts into an empty NSAM=3 FIFO leave [3,0,0] with NUSE
-still 0. The port appends at the write cursor and bumps NUSE, giving [1,2,3].
-One get_array_info serves two callers with opposite needs; dbPut consumes dbGet's
-answer.
-Expect: C and port disagree on VAL contents/NORD after scalar puts into compress.
+In C, a client dbPut into a compress record's VAL takes its array write offset from
+get_array_info() (dbAccess.c:1355-1360), whose documented contract is the READ start
+-- "the index of the first valid element" -- because it exists to serve dbGet. In
+FIFO mode that is (off + nsam - nuse) % nsam, not the write cursor off, so the put
+overwrites the oldest elements instead of appending after the newest. On an EMPTY
+ring the two indices coincide and both agree; the divergence needs data in the ring.
+Priming a NSAM=3 FIFO with (4,5) and then putting (7,8): C writes 7,8 over indices
+0,1 and reads back [8,0,7], having overwritten the 4 it should have kept and left
+the 5 stale in place. The port writes at the write cursor and reads back [5,7,8].
+NUSE and OFF agree on both sides (3 and 1) -- put_array_info bumps NUSE on every
+accepted put, and only the buffer contents differ.
+Expect: C and port disagree on VAL contents after a put into a NON-empty compress
+ring; an empty ring, NUSE and OFF all agree. That precondition is the `classes`
+constraint, not prose: the divergence is only reachable from the array phase's
+`array-into-non-empty` case, so a phase that reads VAL without priming it must
+not count as having looked.
 """
 
 [[deviation]]
@@ -356,4 +382,94 @@ created alarms on both paths, an EMPTY range (which is what an unconfigured
 record has) alarms on neither — and the residue is exactly C's dead-code/sticky
 split, which is what this row exists to allowlist. Those 10 SGNL cases are its
 live scope.
+"""
+
+# --------------------------------------------------------------------------
+
+[[deviation]]
+id = "CBUG-F13"
+bucket = "NOT-REPRODUCED"
+upstream = "asyn / asynManager"
+record_types = ["asyn"]
+fields = ["ENBL"]
+surface = ["value_numeric", "value_string"]
+requires = ["multidevice-asyn-port-shutdown"]
+why = """
+asynManager::shutdownPort (asynManager.c:2253-2308) writes enabled=FALSE and
+defunct=TRUE into findDpCommon(puserPvt) -- the dpCommon of the DEVICE the
+shutting-down user is bound to -- while nulling drvPvt on every interface of the
+whole PORT (:2296-2301). The shell command that drives it binds at addr 0
+(asynShellCommands.c:1331: connectDevice(pasynUser,portName,0)), so on an
+ASYN_MULTIDEVICE port pport->dpc.defunct is never set at all. Measured against
+libasyn at pin 731d616e, a port registered ASYN_MULTIDEVICE|ASYN_DESTRUCTIBLE and
+shut down through an addr-0 user still reports isEnabled=1 at addr -1 and addr 1
+(0 only at addr 0), still accepts enable() and lockPort() there, still hands out
+the interface from findInterface with drvPvt already NULL, and asynReport prints
+the port normally instead of "<port> destroyed" -- every port-level defunct check
+(report :1041, findInterface :1487, registerInterrupt :2424, getInterruptPvt
+:2475, add/removeInterruptUser :2561/:2603) reads pport->dpc.defunct and sees a
+live port. That is wrong: the interfaces C nulled belong to the port, so the
+addresses C leaves enabled are enabled onto a driver that is gone and the next
+call through them dereferences NULL. The single-device case, where findDpCommon
+resolves to the port's own dpc, refuses port-wide -- which is what shutdownPort
+means. The port models defunct at the port: shutdown_lifecycle clears the port's
+enabled and every device dpCommon's enabled together with defunct, so ENBL reads
+0 at every ADDR and asynReport prints "destroyed".
+Expect: after asynShutdownPort on a multi-device asyn port, C's asyn record at
+ADDR!=0 reads ENBL=1 (Enable) while the port reads ENBL=0 (Disable); at ADDR 0
+both read 0. Unexercised by the current oracle -- the fat softIoc registers no
+multi-device ASYN_DESTRUCTIBLE port and no phase issues asynShutdownPort -- so
+this row is coverage until such a port is staged.
+"""
+
+# --------------------------------------------------------------------------
+# INSTRUMENT-DEFECT: reading the channel destroys the ground-truth server, so
+# no C answer exists to diff the port against.
+# --------------------------------------------------------------------------
+
+[[deviation]]
+id = "INSTR-PVXS-SCALCOUT-STRING-ARRAY-OVERFLOW"
+bucket = "INSTRUMENT-DEFECT"
+enabled = false
+upstream = "pvxs / ioc"
+record_types = ["scalcout"]
+fields = ["PAA", "PBB", "PCC", "PDD", "PEE", "PFF", "PGG", "PHH", "PII", "PJJ", "PKK", "PLL"]
+surface = ["server_abort"]
+why = """
+CARRIED DISABLED. The defect below is real and was re-verified directly on
+2026-08-31 -- a `pvxget ORACLE:SCALCOUT.PAA` against a freshly booted
+softIocPVX serving one bare `record(scalcout, "ORACLE:SCALCOUT") {}` aborts it
+with `corrupted size vs. prev_size`, core dumped, 1 of 1 -- but the oracle's own
+read path does NOT trip it, and the row must not claim otherwise. Measured on the
+full `--phase pva-read`: 3468 of 3468 channels measured on both contracts,
+PAA..PLL included, both sides serving the same 40-element string array. Enabled,
+the row would be reported STALE every run and fail it, asserting that a bug pvxs
+has not fixed had gone away.
+
+The defect. sCalcoutRecord.c's cvt_dbaddr, for fieldIndex scalcoutRecordPAA
+through scalcoutRecordPLL, sets no_elements = STRING_SIZE (40) and then
+UNCONDITIONALLY field_type = DBF_STRING, field_size = 1, dbr_field_type =
+DBR_STRING -- a 40-element DBF_STRING array whose advertised element size is 1.
+pvxs ioc/iocsource.cpp:124 sizes its buffer dbChannelFinalElements *
+dbChannelFinalFieldSize = 40 * 1 = 40 bytes, then line 142 indexes that same
+buffer at &(*buf)[n * MAX_STRING_SIZE] and dbChannelGet(DBR_STRING, nReq = 40)
+writes 40 * 40 = 1600 bytes into it. 1560 bytes past the end. The fat
+softIoc.dbd declares exactly twelve scalcout fields special(SPC_DBADDR) -- PAA
+through PLL, each DBF_NOACCESS size(4) extra("char *pXX") -- and they are the
+only ones whose dbAddr reaches cvt_dbaddr, hence this row's scope.
+
+Why it does not fire here. The write corrupts the heap; the process then aborts
+on whatever allocation comes next, which may belong to a later channel or to no
+channel at all. So an abort is a property of a channel AND an allocation history,
+not of the channel alone: batching 171 scalcout channels into one pvxget kills
+the server outright, while reading the same 171 one at a time -- which is what
+the harness falls back to once a batch dies -- leaves it serving every one of
+them. pvaread.rs charges a channel only after it kills a server booted for it
+alone, and under that rule none of the twelve was charged.
+
+If it comes back, it comes back loud: an abort with no enabled row justifying it
+is a DEFECT and fails the run. Flip `enabled` to true at that point, and delete
+the row when pvxs fixes iocsource.cpp.
+
+Verified at pvxs bd2243db05dace325a4ebff48f470c2a89f17d2b.
 """

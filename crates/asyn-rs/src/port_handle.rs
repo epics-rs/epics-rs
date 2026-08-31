@@ -311,6 +311,18 @@ impl PortHandle {
         self.multi_device
     }
 
+    /// C `findDpCommon` (asynManager.c:538-545) as a key: which `dpCommon` an
+    /// operation carrying `addr` lands on — `Some(addr)` for a device of a
+    /// multi-device port, `None` for the port's own slot.
+    ///
+    /// Callers that need the distinction (an `asynRecord` deciding whether its
+    /// trace writes address a device) ask here rather than re-deriving it from
+    /// [`Self::is_multi_device`]; the ops themselves need not ask at all, since
+    /// the actor resolves the addr they carry.
+    pub fn dp_addr(&self, addr: i32) -> Option<i32> {
+        crate::port::dp_common_key(self.multi_device, addr)
+    }
+
     /// Maximum sub-device address (exclusive upper bound).
     /// Mirrors C `pport->numAddr` / the `maxAddr` constructor
     /// argument of `asynPortDriver`. Always at least 1.
@@ -1030,45 +1042,26 @@ impl PortHandle {
         Ok(())
     }
 
-    pub fn enable_addr_blocking(&self, addr: i32) -> AsynResult<()> {
+    /// C `pasynManager->enable(pasynUser, enable)` (asynManager.c:2224-2251),
+    /// fired by `asynRecord` `ENBL` field writes (`asynRecord.c:484-486`).
+    ///
+    /// `addr` is the address of the caller's user, not a scope switch: C has
+    /// one `enable`, and `findDpCommon` (:538-545) makes it land on the DEVICE's
+    /// `dpCommon` for a multi-device port the caller addressed, on the port's
+    /// own otherwise. `-1` names the port explicitly.
+    pub fn set_enable_blocking(&self, addr: i32, enable: bool) -> AsynResult<()> {
         let user = AsynUser::new(0).with_addr(addr);
-        self.submit_blocking(RequestOp::EnableAddr, user)?;
-        Ok(())
-    }
-
-    pub fn disable_addr_blocking(&self, addr: i32) -> AsynResult<()> {
-        let user = AsynUser::new(0).with_addr(addr);
-        self.submit_blocking(RequestOp::DisableAddr, user)?;
-        Ok(())
-    }
-
-    /// Enable or disable the entire port. C parity:
-    /// `pasynManager->enable(pasynUser, enable)` — fired by
-    /// `asynRecord` `ENBL` field writes (`asynRecord.c:484-486`).
-    pub fn set_enable_blocking(&self, enable: bool) -> AsynResult<()> {
-        let user = AsynUser::default();
         self.submit_blocking(RequestOp::SetEnable { yes: enable }, user)?;
         Ok(())
     }
 
-    /// Enable or disable auto-connect for the port. C parity:
-    /// `pasynManager->autoConnect(pasynUser, autoConnect)` — fired
-    /// by `asynRecord` `AUCT` field writes
+    /// C `pasynManager->autoConnect(pasynUser, autoConnect)`
+    /// (asynManager.c:2312-2329), fired by `asynRecord` `AUCT` field writes
     /// (`asynRecord.c:481-482`). Emits `asynExceptionAutoConnect`
-    /// unconditionally.
-    pub fn set_auto_connect_blocking(&self, yes: bool) -> AsynResult<()> {
-        let user = AsynUser::default();
-        self.submit_blocking(RequestOp::SetAutoConnect { yes }, user)?;
-        Ok(())
-    }
-
-    /// Enable or disable auto-connect for ONE device of a multi-device port —
-    /// the addressed half of [`Self::set_auto_connect_blocking`], symmetric
-    /// with [`Self::enable_addr_blocking`]. C picks between the two inside
-    /// `pasynManager->autoConnect` via `findDpCommon` (asynManager.c:536-544).
-    pub fn set_auto_connect_addr_blocking(&self, addr: i32, yes: bool) -> AsynResult<()> {
+    /// unconditionally; `addr` resolves as in [`Self::set_enable_blocking`].
+    pub fn set_auto_connect_blocking(&self, addr: i32, yes: bool) -> AsynResult<()> {
         let user = AsynUser::new(0).with_addr(addr);
-        self.submit_blocking(RequestOp::SetAutoConnectAddr { yes }, user)?;
+        self.submit_blocking(RequestOp::SetAutoConnect { yes }, user)?;
         Ok(())
     }
 
@@ -1094,22 +1087,33 @@ impl PortHandle {
 
     // --- Port-state query convenience methods ---
 
-    /// Query whether the port is currently enabled (blocking).
-    pub fn is_enabled_blocking(&self) -> AsynResult<bool> {
-        let result = self.submit_blocking(RequestOp::GetEnable, AsynUser::new(0))?;
+    /// C `pasynManager->isEnabled` (asynManager.c:2345-2359): the `enabled`
+    /// flag of the `dpCommon` this port resolves `addr` to.
+    ///
+    /// The address is not decoration. `findDpCommon` hands back the DEVICE's
+    /// slot on an `ASYN_MULTIDEVICE` port whenever the user names one
+    /// (:538-544), so a per-device `asynEnable P 1 0` is invisible at addr 0
+    /// and at the port. `-1` asks the port's own slot — the answer for every
+    /// single-device port, whatever addr is passed.
+    pub fn is_enabled_blocking(&self, addr: i32) -> AsynResult<bool> {
+        let result =
+            self.submit_blocking(RequestOp::GetEnable, AsynUser::new(0).with_addr(addr))?;
         Ok(result.int_val.unwrap_or(0) != 0)
     }
 
-    /// Query whether auto-connect is enabled for the port (blocking).
-    pub fn is_auto_connect_blocking(&self) -> AsynResult<bool> {
-        let result = self.submit_blocking(RequestOp::GetAutoConnect, AsynUser::new(0))?;
+    /// C `pasynManager->isAutoConnect` (asynManager.c:2361-2373) — same
+    /// per-address resolution as [`Self::is_enabled_blocking`].
+    pub fn is_auto_connect_blocking(&self, addr: i32) -> AsynResult<bool> {
+        let result =
+            self.submit_blocking(RequestOp::GetAutoConnect, AsynUser::new(0).with_addr(addr))?;
         Ok(result.int_val.unwrap_or(0) != 0)
     }
 
-    /// Query whether the port's transport is connected (blocking) — C
-    /// `pasynManager->isConnected`.
-    pub fn is_connected_blocking(&self) -> AsynResult<bool> {
-        let result = self.submit_blocking(RequestOp::GetConnected, AsynUser::new(0))?;
+    /// C `pasynManager->isConnected` (asynManager.c:2331-2343) — same
+    /// per-address resolution as [`Self::is_enabled_blocking`].
+    pub fn is_connected_blocking(&self, addr: i32) -> AsynResult<bool> {
+        let result =
+            self.submit_blocking(RequestOp::GetConnected, AsynUser::new(0).with_addr(addr))?;
         Ok(result.int_val.unwrap_or(0) != 0)
     }
 
@@ -1118,25 +1122,25 @@ impl PortHandle {
     /// the exception from inside its own op), so it cannot use the `_blocking`
     /// forms — a round trip to the actor from the actor would deadlock. The
     /// callback spawns the refresh onto the runtime instead and awaits these.
-    pub async fn is_enabled(&self) -> AsynResult<bool> {
+    pub async fn is_enabled(&self, addr: i32) -> AsynResult<bool> {
         let result = self
-            .submit_async(RequestOp::GetEnable, AsynUser::new(0))
+            .submit_async(RequestOp::GetEnable, AsynUser::new(0).with_addr(addr))
             .await?;
         Ok(result.int_val.unwrap_or(0) != 0)
     }
 
     /// Async twin of [`Self::is_auto_connect_blocking`].
-    pub async fn is_auto_connect(&self) -> AsynResult<bool> {
+    pub async fn is_auto_connect(&self, addr: i32) -> AsynResult<bool> {
         let result = self
-            .submit_async(RequestOp::GetAutoConnect, AsynUser::new(0))
+            .submit_async(RequestOp::GetAutoConnect, AsynUser::new(0).with_addr(addr))
             .await?;
         Ok(result.int_val.unwrap_or(0) != 0)
     }
 
     /// Async twin of [`Self::is_connected_blocking`].
-    pub async fn is_connected(&self) -> AsynResult<bool> {
+    pub async fn is_connected(&self, addr: i32) -> AsynResult<bool> {
         let result = self
-            .submit_async(RequestOp::GetConnected, AsynUser::new(0))
+            .submit_async(RequestOp::GetConnected, AsynUser::new(0).with_addr(addr))
             .await?;
         Ok(result.int_val.unwrap_or(0) != 0)
     }
@@ -1490,8 +1494,8 @@ mod tests {
         }
 
         let handle = make_handle(Drv { base });
-        handle.set_enable_blocking(false).unwrap();
-        handle.set_enable_blocking(true).unwrap();
+        handle.set_enable_blocking(-1, false).unwrap();
+        handle.set_enable_blocking(-1, true).unwrap();
         // C `enable` fires on every transition; both calls land.
         assert_eq!(hits.load(Ordering::Relaxed), 2);
     }
@@ -1623,9 +1627,9 @@ mod tests {
 
         let handle = make_handle(Drv { base });
         // Both true→true and true→false fire (C unconditional).
-        handle.set_auto_connect_blocking(true).unwrap();
-        handle.set_auto_connect_blocking(false).unwrap();
-        handle.set_auto_connect_blocking(false).unwrap();
+        handle.set_auto_connect_blocking(-1, true).unwrap();
+        handle.set_auto_connect_blocking(-1, false).unwrap();
+        handle.set_auto_connect_blocking(-1, false).unwrap();
         assert_eq!(hits.load(Ordering::Relaxed), 3);
     }
 

@@ -54,7 +54,7 @@ fn an_auto_connect_port_is_up_the_moment_it_is_created() {
     // (`ip_port.rs`: `connect_tcp()?` then `set_connected(true)`), so a live
     // `is_connected` proves the server's kernel has already accepted the circuit.
     assert!(
-        rt.port_handle().is_connected_blocking().unwrap(),
+        rt.port_handle().is_connected_blocking(-1).unwrap(),
         "CNCT must read 1 straight after configure (asynRecord.c:1089-1093 reads \
          pasynManager->isConnected)"
     );
@@ -98,7 +98,7 @@ fn a_no_auto_connect_port_stays_down_at_registration() {
         .expect("the port runtime thread must start");
 
     assert!(
-        !rt.port_handle().is_connected_blocking().unwrap(),
+        !rt.port_handle().is_connected_blocking(-1).unwrap(),
         "a noAutoConnect port is not connected by registration"
     );
     assert_eq!(

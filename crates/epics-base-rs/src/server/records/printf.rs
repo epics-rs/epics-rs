@@ -2,6 +2,19 @@ use crate::error::{CaError, CaResult};
 use crate::server::record::{ProcessOutcome, Record};
 use crate::types::{EpicsValue, PvString};
 
+/// EPICS `MAX_STRING_SIZE` — DBR_STRING buffers are 40 bytes.
+const MAX_STRING_SIZE: usize = 40;
+
+/// Truncate `s` to at most `max` bytes. C keeps the result in a fixed
+/// `char[SIZV]` and copies it byte for byte, so the cut is on a raw byte
+/// boundary and a non-UTF-8 value keeps its bytes verbatim.
+fn truncate_bytes(s: PvString, max: usize) -> PvString {
+    if s.len() <= max {
+        return s;
+    }
+    PvString::from_bytes(s.as_bytes()[..max].to_vec())
+}
+
 // printf record (EPICS 7).
 // Evaluates FMT as a printf format string with up to 10 inputs (INP0-INP9, values A-J).
 // Each format specifier in FMT consumes the next input in order. A `*`
@@ -882,6 +895,32 @@ impl Record for PrintfRecord {
                     // C printfRecord.c:337-342 clamps SIZV to [16, 0x7fff].
                     self.sizv = raw.clamp(16, 0x7fff) as u16;
                 }
+            }
+            // C `cvt_dbaddr` (`printfRecord.c:410-421`) types VAL `DBF_STRING`
+            // over a `SIZV`-wide buffer, so a client put is `putStringString` —
+            // a byte copy, capped at the field size. `pp(TRUE)` then reprocesses
+            // and `apply_fmt` overwrites what was stored, which is why the
+            // compiled softIoc accepts `caput PRF.VAL 7` and still reads back
+            // the formatted result; refusing the put was the divergence.
+            // Same shape as the `lsi`/`lso` VAL arms: a DBR_STRING source is
+            // already capped at `MAX_STRING_SIZE` by dbConvert, a DBR_CHAR
+            // long-string source is bounded only by SIZV.
+            "VAL" => {
+                let mut text = match value {
+                    EpicsValue::String(s) => truncate_bytes(s, MAX_STRING_SIZE - 1),
+                    EpicsValue::CharArray(bytes) => {
+                        let end = bytes.iter().position(|&b| b == 0).unwrap_or(bytes.len());
+                        PvString::from_bytes(bytes[..end].to_vec())
+                    }
+                    _ => return Err(CaError::TypeMismatch("VAL".into())),
+                };
+                let max = (self.sizv as usize).saturating_sub(1);
+                if text.len() > max {
+                    text = truncate_bytes(text, max);
+                }
+                self.val = text.as_str_lossy().into_owned();
+                // C `printfRecord.c:321-322`: LEN counts the bytes plus NUL.
+                self.len = (self.val.len() + 1) as u32;
             }
             "FMT" => {
                 if let EpicsValue::String(s) = value {

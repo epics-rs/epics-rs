@@ -9,6 +9,7 @@ use std::sync::Arc;
 
 use tokio::sync::mpsc;
 
+use crate::channel_shape::ChannelShape;
 use crate::nt::NTScalar;
 use crate::pvdata::{FieldDesc, PvField, PvStructure, ScalarType, ScalarValue, TypedScalarArray};
 use crate::server_native::source::{PutOptions, SourceRead};
@@ -805,7 +806,9 @@ async fn channel_snapshot(
             // field is served as its ordinary string snapshot: pvxs collapses
             // the `DBR_CHAR` `$` view back to a NUL-terminated `pvString`
             // (`ioc/iocsource.cpp:133-136`), so the view IS the string.
-            db.channel_snapshot_for_field(&rec, &cn.field, cn.string_view)?
+            let mut snap = db.channel_snapshot_for_field(&rec, &cn.field, cn.string_view)?;
+            record_channel_shape(&rec, &cn.field).shape(&mut snap);
+            snap
         }
     };
     if !filters.is_empty()
@@ -814,6 +817,20 @@ async fn channel_snapshot(
         snap.value = value;
     }
     Some(snap)
+}
+
+/// The shape a record-backed channel bound to `field` serves —
+/// [`ChannelShape`], the one owner of pvxs's `dbChannelFinalElements(chan)
+/// != 1`, asked of the record behind the entry.
+///
+/// A `SharedPV` never reaches it: a mailbox has no `dbChannel`, so it has no
+/// `special(SPC_DBADDR)` field and its value's own count is the answer by
+/// construction.
+fn record_channel_shape(
+    rec: &std::sync::Arc<parking_lot::RwLock<epics_base_rs::server::record::RecordInstance>>,
+    field: &str,
+) -> ChannelShape {
+    ChannelShape::of_record_channel(&rec.read(), field)
 }
 
 impl ChannelSource for PvDatabaseSource {
@@ -1280,12 +1297,17 @@ impl ChannelSource for PvDatabaseSource {
             let property_filters = &ch.property_filters;
             // A mailbox SharedPV posts a wholly-assigned value and has no
             // record events to classify — keep the unmarked default.
-            if !matches!(channel_entry(&db, cn).await?, PvEntry::Record(_)) {
+            let PvEntry::Record(rec) = channel_entry(&db, cn).await? else {
                 return self
                     .subscribe_checked_opts(checked, ctx, opts)
                     .await
                     .map(crate::server_native::source::plain_monitor_updates);
-            }
+            };
+            // The channel's shape is settled ONCE, here, exactly as pvxs
+            // settles it once per `dbChannel`: every event this stream yields
+            // is then rendered in it, so a one-element array field's updates
+            // are the scalars its descriptor advertised.
+            let shape = record_channel_shape(&rec, &cn.field);
 
             use epics_base_rs::server::database::db_access::DbSubscription;
             // pvxs's TWO subscriptions, not their union
@@ -1318,7 +1340,10 @@ impl ChannelSource for PvDatabaseSource {
             Some(MonitorStream::Upstream(UpstreamMonitor::from_db_pair(
                 value_sub,
                 property_sub,
-                marked_update,
+                match shape {
+                    ChannelShape::Scalar => marked_update_scalar,
+                    ChannelShape::Array => marked_update,
+                },
             )))
         }
     }
@@ -1365,7 +1390,8 @@ impl ChannelSource for PvDatabaseSource {
                         }
                     }
                 }
-                PvEntry::Record(_rec) => {
+                PvEntry::Record(rec) => {
+                    let shape = record_channel_shape(&rec, &cn.field);
                     // Subscribe via the public DbSubscription API. The mask
                     // is the one `DbSubscription::subscribe_filtered` picks
                     // for the unclassified entry (`db_access.rs:297`); it is
@@ -1384,7 +1410,10 @@ impl ChannelSource for PvDatabaseSource {
                     .await?;
                     Some(MonitorStream::Upstream(UpstreamMonitor::from_db(
                         sub,
-                        event_field,
+                        match shape {
+                            ChannelShape::Scalar => event_field_scalar,
+                            ChannelShape::Array => event_field,
+                        },
                     )))
                 }
             }
@@ -1418,6 +1447,39 @@ fn marked_update(
 /// event yields its snapshot as a `PvField`, none are filtered.
 fn event_field(ev: epics_base_rs::server::pv::MonitorEvent) -> Option<PvField> {
     Some(snapshot_to_pv_field(&ev.snapshot))
+}
+
+/// [`marked_update`] and [`event_field`] for a [`ChannelShape::Scalar`]
+/// channel — a one-element array field, whose events carry the buffer the
+/// record posted and whose descriptor advertises the element.
+///
+/// Two transforms rather than one carrying the shape: `UpstreamMonitor`'s map
+/// is a plain `fn` pointer, and the shape is a per-channel constant chosen
+/// once at subscribe time, so selecting the pointer IS carrying it.
+fn marked_update_scalar(
+    ev: epics_base_rs::server::pv::MonitorEvent,
+) -> Option<crate::server_native::source::MonitorUpdate> {
+    marked_update(scalar_shaped(ev))
+}
+
+fn event_field_scalar(ev: epics_base_rs::server::pv::MonitorEvent) -> Option<PvField> {
+    event_field(scalar_shaped(ev))
+}
+
+/// `ev` with its snapshot collapsed to the one element the channel serves.
+///
+/// A new `Snapshot` rather than a mutation: `MonitorEvent::snapshot` is the
+/// `Arc` every other subscriber this post reached is holding, and a channel's
+/// shape is not theirs to inherit.
+fn scalar_shaped(
+    mut ev: epics_base_rs::server::pv::MonitorEvent,
+) -> epics_base_rs::server::pv::MonitorEvent {
+    if let Some(value) = ChannelShape::Scalar.collapsed(&ev.snapshot.value) {
+        let mut snap = (*ev.snapshot).clone();
+        snap.value = value;
+        ev.snapshot = std::sync::Arc::new(snap);
+    }
+    ev
 }
 
 // ── PvField → EpicsValue (PUT path) ────────────────────────────────────

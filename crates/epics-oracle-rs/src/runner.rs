@@ -28,9 +28,9 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use crate::allowlist::{Allowlist, MatchContext};
-use crate::cases::{BoundaryCase, boundary_cases};
+use crate::cases::{ArrayCase, BoundaryCase, boundary_cases};
 use crate::catool::{CaTools, PutOutcome, ToolError, unattributed};
-use crate::dbd::{Dbd, DbfType};
+use crate::dbd::{DbaddrShape, Dbd, DbfType};
 use crate::diff::{Comparison, Observation, Verdict, compare};
 use crate::ioc::{CTools, Ioc, Pair, Side};
 use crate::report::{CasePhase, CaseResult, Reproducer};
@@ -45,6 +45,23 @@ const MONITOR_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 /// Array-phase capacity. Fixed so both sides declare the identical `NELM` and
 /// the over-capacity boundary is the same element count on each. Wide enough
 /// that "partial" (`NELM/2`) is a distinct case from "single".
+/// The `.db` fixture and readback shape one record type's array `VAL` needs,
+/// all of it read from the `.dbd` rather than assumed.
+struct ArrayFixture {
+    /// `VAL`'s DECLARED type — `DBF_NOACCESS` for every one of these, since the
+    /// declaration is the record's raw `BPTR`.
+    val_dbf: DbfType,
+    /// Fields the reproducer sets: the capacity under its own name, plus `FTVL`
+    /// where the record type has one.
+    fields: Vec<(&'static str, &'static str)>,
+    /// The field carrying how many elements are valid after a put — C's
+    /// `put_array_info` destination, `NORD` on `waveform`/`aai`/`aao`/`subArray`
+    /// and `NUSE` on `compress`. `None` for `histogram`, whose `put_array_info`
+    /// is NULL (`histogramRecord.c:56`) and whose bin array is always `NELM`
+    /// wide.
+    length_field: Option<&'static str>,
+}
+
 const ARRAY_NELM: u32 = 16;
 const ARRAY_NELM_STR: &str = "16";
 /// Element type for the array probe. `DOUBLE` because every array-capable
@@ -167,12 +184,15 @@ impl Runner {
     ) -> Vec<CaseResult> {
         // Build the case list first: (field, boundary) -> its own record.
         let mut plan: Vec<(FieldRef, BoundaryCase)> = Vec::new();
+        let Some(rt) = self.dbd.record_type(record_type) else {
+            return Vec::new();
+        };
         for fr in surface.fields_of(record_type) {
             if !is_put_candidate(&fr.field) {
                 continue;
             }
             let choices = self.dbd.menu_choices(&fr.field);
-            for bc in boundary_cases(&fr.field, choices) {
+            for bc in boundary_cases(rt, &fr.field, choices) {
                 plan.push((fr.clone(), bc));
             }
         }
@@ -400,25 +420,18 @@ impl Runner {
     /// and never reached by the read/put/monitor phases. This phase is the only
     /// one that exercises it, over CA, against the same C ground truth.
     pub fn probe_array(&self, record_type: &str, allowlist: &mut Allowlist) -> Vec<CaseResult> {
-        // Array-capable iff the record declares both a capacity (NELM) and an
-        // element type (FTVL). Determined from the .dbd, not hard-listed.
-        // `VAL`'s declared type comes along: it is `DBF_NOACCESS` for these
-        // types (the record's raw BPTR), and the allowlist has to see that
-        // rather than a guess, or a row scoped by destination type would match
-        // the array phase on a type it never named.
-        let val_dbf = self
-            .dbd
-            .record_type(record_type)
-            .filter(|r| r.field("NELM").is_some() && r.field("FTVL").is_some())
-            .and_then(|r| r.field("VAL"))
-            .map(|f| f.dbf);
-        let Some(val_dbf) = val_dbf else {
+        let Some(fixture) = array_fixture(&self.dbd, record_type) else {
             return Vec::new();
         };
+        let ArrayFixture {
+            val_dbf,
+            ref fields,
+            length_field,
+        } = fixture;
+        let fields = fields.as_slice();
 
         let plan = crate::cases::array_cases(ARRAY_NELM);
         let rec_of = |i: usize| format!("ORACLE:ARR:{}:{i}", record_type.to_uppercase());
-        let fields = &[("NELM", ARRAY_NELM_STR), ("FTVL", ARRAY_FTVL)];
 
         // One record per case (isolation), each declaring the same NELM/FTVL so
         // the capacity boundary is identical on both sides.
@@ -445,8 +458,8 @@ impl Runner {
         // Separate IOCs, separate ports, no shared state — concurrency changes
         // nothing either observes, it only stops each waiting on the other.
         let (obs_c, obs_r) = std::thread::scope(|s| {
-            let hc = s.spawn(|| drive_array(&c, &plan, &rec_of));
-            let hr = s.spawn(|| drive_array(&r, &plan, &rec_of));
+            let hc = s.spawn(|| drive_array(&c, &plan, &rec_of, length_field));
+            let hr = s.spawn(|| drive_array(&r, &plan, &rec_of, length_field));
             (
                 hc.join().expect("C array lane panicked"),
                 hr.join().expect("Rust array lane panicked"),
@@ -455,15 +468,20 @@ impl Runner {
 
         plan.iter()
             .enumerate()
-            .map(|(i, (values, class))| {
+            .map(|(i, case)| {
                 let rec = rec_of(i);
+                let caput = |values: &[String]| {
+                    format!("caput -a {rec} {} {}", values.len(), values.join(" "))
+                };
+                let mut ops: Vec<String> = case.prime.iter().map(|v| caput(v)).collect();
+                ops.push(caput(&case.values));
+                ops.push(format!(
+                    "caget -t -# {ARRAY_NELM} {rec}    # returned count + payload"
+                ));
+                ops.extend(length_field.map(|f| format!("caget {rec}.{f}")));
                 let repro = Reproducer {
                     db: crate::record_stmt_fields(record_type, &rec, fields),
-                    ops: vec![
-                        format!("caput -a {rec} {} {}", values.len(), values.join(" ")),
-                        format!("caget -t -# {ARRAY_NELM} {rec}    # returned count + payload"),
-                        format!("caget {rec}.NORD"),
-                    ],
+                    ops,
                 };
                 adjudicate(
                     CaseRef {
@@ -471,7 +489,7 @@ impl Runner {
                         phase: CasePhase::Array,
                         field: "VAL",
                         dbf: val_dbf,
-                        class: Some(class),
+                        class: Some(case.class),
                     },
                     repro,
                     &obs_c[i],
@@ -672,25 +690,96 @@ fn keep<T>(r: Result<T, ToolError>, errors: &mut Vec<ToolError>) -> Option<T> {
     }
 }
 
+/// The `.db` fixture that gives `record_type` a bounded array `VAL` of
+/// [`ARRAY_NELM`] elements, and `VAL`'s declared type — `None` when the
+/// record has no array `VAL` for this phase to drive.
+///
+/// `VAL`'s declared type comes along because it is `DBF_NOACCESS` for these
+/// types (the record's raw `BPTR`), and the allowlist has to see that rather
+/// than a guess, or a row scoped by destination type would match the array
+/// phase on a type it never named.
+///
+/// The property is `special(SPC_DBADDR)` on `VAL` plus a capacity field, and
+/// the SPELLING of that capacity is read from the `.dbd` rather than
+/// assumed. Requiring the `NELM`+`FTVL` pair silently dropped two of the
+/// record types whose `SPC_DBADDR` array `VAL` is this phase's entire
+/// subject: `compress` spells its capacity `NSAM` and declares no `FTVL`
+/// (`compressRecord.c:395-407` fixes the buffer at `DBF_DOUBLE`), and
+/// `histogram` has `NELM` but no `FTVL` (`histogramRecord.c:310-318` fixes
+/// its bins at `DBF_ULONG`). Both answer `caput -a` on a compiled softIoc,
+/// and neither had ever been driven here.
+fn array_fixture(dbd: &Dbd, record_type: &str) -> Option<ArrayFixture> {
+    let rt = dbd.record_type(record_type)?;
+    let val = rt.field("VAL")?;
+    // `special(SPC_DBADDR)` says the record re-types VAL in `cvt_dbaddr`; it
+    // does not say the result is an element sequence. Which of the three
+    // shapes it is belongs to `RecordType::dbaddr_shape`, and this phase and
+    // the put phase read the same answer so a field cannot fall between them.
+    let capacity = match rt.dbaddr_shape(val)? {
+        DbaddrShape::Elements { capacity_field } => capacity_field,
+        // Not a `caput -a REC n v0 v1 …` destination — named rather than
+        // dropped in silence.
+        DbaddrShape::LongString { .. } => {
+            eprintln!(
+                "    array phase excluded for {record_type}: VAL is special(SPC_DBADDR) but \
+                 cvt_dbaddr serves ONE string of SIZV bytes; the put phase drives it"
+            );
+            return None;
+        }
+        DbaddrShape::Opaque => {
+            eprintln!(
+                "    array phase excluded for {record_type}: VAL is special(SPC_DBADDR) but \
+                 the record type declares no capacity field, so the .dbd names no \
+                 bounded element sequence to drive"
+            );
+            return None;
+        }
+    };
+    let mut fields = vec![(capacity, ARRAY_NELM_STR)];
+    if rt.field("FTVL").is_some() {
+        fields.push(("FTVL", ARRAY_FTVL));
+    }
+    Some(ArrayFixture {
+        val_dbf: val.dbf,
+        fields,
+        length_field: ["NORD", "NUSE"].into_iter().find(|f| rt.field(f).is_some()),
+    })
+}
+
 fn drive_array(
     t: &CaTools,
-    plan: &[(Vec<String>, &'static str)],
+    plan: &[ArrayCase],
     rec_of: &(impl Fn(usize) -> String + Sync),
+    length_field: Option<&'static str>,
 ) -> Vec<Observation> {
     plan.iter()
         .enumerate()
-        .map(|(i, (values, _))| {
+        .map(|(i, case)| {
             let rec = rec_of(i);
             // Same rule as the scalar put phase: a put that could not be
             // measured is an ERROR for the case, never a refusal both sides
             // can agree on.
             let mut errors = Vec::new();
-            let put = match t.caput_array(&rec, values) {
-                Ok(p) => Some(p),
-                Err(e) => {
+            // The primes carry the destination into the state under test. A
+            // prime that failed leaves that state unknown, so the measured put
+            // is not run at all rather than run against the wrong record.
+            let primed = case
+                .prime
+                .iter()
+                .all(|values| match t.caput_array(&rec, values) {
+                    Ok(_) => true,
+                    Err(e) => {
+                        errors.push(e);
+                        false
+                    }
+                });
+            let put = match primed.then(|| t.caput_array(&rec, &case.values)) {
+                Some(Ok(p)) => Some(p),
+                Some(Err(e)) => {
                     errors.push(e);
                     None
                 }
+                None => None,
             };
 
             // Read back the whole declared capacity so a port that stored too
@@ -713,7 +802,11 @@ fn drive_array(
             Observation {
                 info,
                 value_string,
-                value_numeric: keep(t.caget_numeric(&format!("{rec}.NORD")), &mut errors),
+                // The valid-element count after a put, under whatever name this
+                // record type gives it — `histogram` gives it none, and reading
+                // a field that does not exist errored every one of its cases.
+                value_numeric: length_field
+                    .and_then(|f| keep(t.caget_numeric(&format!("{rec}.{f}")), &mut errors)),
                 stat: keep(t.caget_string(&format!("{rec}.STAT")), &mut errors),
                 sevr: keep(t.caget_string(&format!("{rec}.SEVR")), &mut errors),
                 put,
@@ -728,24 +821,25 @@ fn drive_array(
 /// prevented, never one aggregate and never silence.
 fn errored_array(
     record_type: &str,
-    plan: &[(Vec<String>, &'static str)],
+    plan: &[ArrayCase],
     db: &str,
     errors: &[ToolError],
 ) -> Vec<CaseResult> {
     plan.iter()
-        .map(|(values, class)| {
+        .map(|case| {
             errored_case(
                 record_type,
                 "VAL",
                 CasePhase::Array,
-                Some(class),
+                Some(case.class),
                 Reproducer {
                     db: db.to_string(),
-                    ops: vec![format!(
-                        "caput -a <rec> {} {}",
-                        values.len(),
-                        values.join(" ")
-                    )],
+                    ops: case
+                        .prime
+                        .iter()
+                        .chain(std::iter::once(&case.values))
+                        .map(|v| format!("caput -a <rec> {} {}", v.len(), v.join(" ")))
+                        .collect(),
                 },
                 errors.to_vec(),
             )
@@ -1595,6 +1689,71 @@ mod adjudicate_tests {
     /// `NORD` is the array phase's discriminator: C truncates an over-capacity
     /// put to `NELM`, and a port that rejects it or writes past the end often
     /// differs in nothing else. Dropping it with `.ok()` left both sides with
+    /// Every record type whose `VAL` is an `SPC_DBADDR` array is driven, under
+    /// whatever names ITS `.dbd` gives the capacity and the valid-element count.
+    /// Requiring the `NELM`+`FTVL` pair silently dropped `compress` and
+    /// `histogram` — the two whose spelling differs — from the only phase that
+    /// reaches their array `VAL` at all.
+    #[test]
+    fn the_array_fixture_is_read_from_each_record_types_own_spelling() {
+        const DBD: &str = r#"
+recordtype(waveform) {
+    field(VAL, DBF_NOACCESS) { special(SPC_DBADDR) }
+    field(NELM, DBF_ULONG) { }
+    field(FTVL, DBF_MENU) { }
+    field(NORD, DBF_ULONG) { }
+}
+recordtype(compress) {
+    field(VAL, DBF_NOACCESS) { special(SPC_DBADDR) }
+    field(NSAM, DBF_ULONG) { }
+    field(NUSE, DBF_ULONG) { }
+}
+recordtype(histogram) {
+    field(VAL, DBF_NOACCESS) { special(SPC_DBADDR) }
+    field(NELM, DBF_USHORT) { }
+}
+recordtype(lsi) {
+    field(VAL, DBF_NOACCESS) { special(SPC_DBADDR) }
+    field(SIZV, DBF_USHORT) { }
+}
+recordtype(ai) {
+    field(VAL, DBF_DOUBLE) { pp(TRUE) }
+    field(NELM, DBF_ULONG) { }
+}
+"#;
+        let dbd = Dbd::parse(DBD).expect("parse");
+        let of = |rt: &str| {
+            array_fixture(&dbd, rt).map(|f| (f.fields.clone(), f.length_field, f.val_dbf))
+        };
+
+        assert_eq!(
+            of("waveform"),
+            Some((
+                vec![("NELM", ARRAY_NELM_STR), ("FTVL", ARRAY_FTVL)],
+                Some("NORD"),
+                DbfType::NoAccess
+            ))
+        );
+        assert_eq!(
+            of("compress"),
+            Some((
+                vec![("NSAM", ARRAY_NELM_STR)],
+                Some("NUSE"),
+                DbfType::NoAccess
+            )),
+            "NSAM is the capacity and NUSE the count; compressRecord.c has no FTVL"
+        );
+        assert_eq!(
+            of("histogram"),
+            Some((vec![("NELM", ARRAY_NELM_STR)], None, DbfType::NoAccess)),
+            "put_array_info is NULL, so there is no valid-element count to read"
+        );
+        // A `SIZV`-sized long-string buffer is not an element sequence, and a
+        // `VAL` that is not `SPC_DBADDR` is not an array at all.
+        assert_eq!(of("lsi"), None);
+        assert_eq!(of("ai"), None);
+    }
+
     /// `value_numeric: None`, so `compare` skipped the surface and the
     /// truncation contract was reported AGREED while unverified.
     ///
@@ -1613,10 +1772,19 @@ mod adjudicate_tests {
         std::fs::write(&db, crate::record_stmt("ai", "ORACLE:ARR:0")).expect("write db");
         let pair = Pair::boot(&tools, &db, "ORACLE:ARR:0").expect("both IOCs must boot");
 
-        let plan: Vec<(Vec<String>, &'static str)> =
-            vec![(vec!["1".to_string()], "array-single-element")];
+        let plan = vec![ArrayCase {
+            prime: Vec::new(),
+            values: vec!["1".to_string()],
+            class: "array-single-element",
+        }];
         let rec_of = |_: usize| "ORACLE:ARR:0".to_string();
-        let side = |port: u16, s: Side| drive_array(&CaTools::new(&tools, port, s), &plan, &rec_of);
+        // `Some("NORD")` is the point: the field IS the case's discriminator and
+        // the record does not serve it, which is the failure under test. A type
+        // that declares no length field at all passes `None` and has nothing to
+        // fail on — a different situation, and not this one.
+        let side = |port: u16, s: Side| {
+            drive_array(&CaTools::new(&tools, port, s), &plan, &rec_of, Some("NORD"))
+        };
         let obs_c = side(pair.c.port(), Side::C);
         let obs_r = side(pair.rust.port(), Side::Rust);
         assert!(

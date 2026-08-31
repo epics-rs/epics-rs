@@ -82,8 +82,77 @@ fn surface_of(record_type: &str) -> Surface {
 }
 
 /// Sweep one record type through the real phase and report on it.
+/// The same sweep over a surface cut down to named fields.
+///
+/// The `.dbd` is the denominator everywhere else in this crate for good reason,
+/// and this is the one place a smaller one is right. What a sweep costs is not
+/// its reads: it is two boots of a re-proven replacement server, measured at
+/// 3.6 s each, for every channel that kills one. So the caller keeps ONE killer
+/// plus the channels its assertions name, and `scalcout`'s whole surface stops
+/// spending two minutes on a fallback eleven channels exercise identically. The
+/// record the IOCs load is untouched and still has all 171 fields.
+#[cfg(tokio_backend)]
+fn sweep_fields(record_type: &str, keep: &[&str]) -> (Surface, PvaReport) {
+    let dbd = Dbd::parse(&trimmed_recordtype(record_type, keep))
+        .unwrap_or_else(|e| panic!("the trimmed {record_type} recordtype must parse: {e}"));
+    let supported: BTreeSet<String> = [record_type.to_string()].into_iter().collect();
+    sweep_surface(record_type, Surface::build(&dbd, &supported))
+}
+
+/// One `recordtype(...)` block from the fat `.dbd`, carrying only `keep`'s
+/// fields — verbatim, so every type, size and `special` is the real one.
+#[cfg(tokio_backend)]
+fn trimmed_recordtype(record_type: &str, keep: &[&str]) -> String {
+    let text = std::fs::read_to_string(CTools::dbd_path()).expect("the fat dbd must be readable");
+    let head = format!("recordtype({record_type}) {{");
+    let start = text
+        .find(&head)
+        .unwrap_or_else(|| panic!("no {head} in the dbd"));
+    let mut out = format!("{head}\n");
+    let mut depth = 1usize;
+    let mut wanted = false;
+    let mut found: BTreeSet<&str> = BTreeSet::new();
+    for line in text[start..].lines().skip(1) {
+        if depth == 1 {
+            if line.trim() == "}" {
+                break;
+            }
+            wanted = line
+                .trim()
+                .strip_prefix("field(")
+                .and_then(|r| r.split(',').next())
+                .is_some_and(|f| {
+                    let hit = keep.contains(&f);
+                    if hit {
+                        found.insert(keep.iter().find(|k| **k == f).copied().unwrap());
+                    }
+                    hit
+                });
+        }
+        if wanted {
+            out.push_str(line);
+            out.push('\n');
+        }
+        depth = depth + line.matches('{').count() - line.matches('}').count();
+        if depth == 1 {
+            wanted = false;
+        }
+    }
+    out.push_str("}\n");
+    let missing: Vec<&&str> = keep.iter().filter(|k| !found.contains(**k)).collect();
+    assert!(
+        missing.is_empty(),
+        "the dbd declares no {record_type} field(s) {missing:?} — the trim would silently \
+         shrink the surface instead of failing"
+    );
+    out
+}
+
 fn sweep(record_type: &str) -> (Surface, PvaReport) {
-    let surface = surface_of(record_type);
+    sweep_surface(record_type, surface_of(record_type))
+}
+
+fn sweep_surface(record_type: &str, surface: Surface) -> (Surface, PvaReport) {
     let mut allowlist = epics_oracle_rs::allowlist::Allowlist::load(
         &epics_oracle_rs::allowlist::Allowlist::default_path(),
     )
@@ -414,6 +483,75 @@ fn at_least_one_channel_agrees() {
 /// PV, so a harness that compared *outcomes* rather than *readings* would find
 /// them equal and score AGREED. That is "exit 0 because I could not look", which
 /// is exactly what produced the false-clean verdicts this crate replaced.
+/// A channel that kills the ground-truth server must cost its batch-mates
+/// nothing.
+///
+/// `scalcout`'s PAA..PLL are `SPC_DBADDR` fields whose `cvt_dbaddr`
+/// (`sCalcoutRecord.c:579-599`) reports `field_type=DBF_STRING`,
+/// `no_elements=40`, `field_size=1`. pvxs sizes its buffer
+/// `dbChannelFinalElements * dbChannelFinalFieldSize` = 40 bytes
+/// (`ioc/iocsource.cpp:124`) and then indexes it at `n * MAX_STRING_SIZE` =
+/// 1600 (`:142`), so `softIocPVX` aborts on a corrupted heap. Read as one
+/// batch per side, that single channel took 44 of the type's 171 channels down
+/// with it and reported all 44 as unmeasurable.
+///
+/// What is pinned is NOT how many channels kill the server — pvxs may fix
+/// theirs, and then none do. It is that a channel whose only misfortune was
+/// sharing a batch with a killer is still measured.
+#[cfg(tokio_backend)]
+#[test]
+fn a_channel_that_kills_the_server_does_not_cost_its_batch_mates_their_verdicts() {
+    let (_surface, report) = sweep_fields(
+        "scalcout",
+        &[
+            "NAME", "DESC", "VAL", "AA", "LL", "MLST", "ALST", "LALM", "OVAL", "OSV", "PAA",
+        ],
+    );
+    // The twelve `special(SPC_DBADDR)` fields, the only ones whose `dbAddr`
+    // reaches sCalcoutRecord.c's cvt_dbaddr and so the only ones that can
+    // overflow pvxs's buffer. Named here, not derived from the run, so the run
+    // cannot define its own killers.
+    const KILLERS: [&str; 12] = [
+        "PAA", "PBB", "PCC", "PDD", "PEE", "PFF", "PGG", "PHH", "PII", "PJJ", "PKK", "PLL",
+    ];
+    let charged: Vec<&str> = report.aborts().map(|c| c.field.as_str()).collect();
+    for field in &charged {
+        assert!(
+            KILLERS.contains(field),
+            "scalcout.{field} reaches no cvt_dbaddr and cannot overflow anything, so an \
+             abort charged to it is a heap-delayed crash convicting the wrong channel; \
+             charged: {charged:?}"
+        );
+    }
+    let measured: BTreeSet<&str> = report
+        .cases
+        .iter()
+        .filter(|c| c.verdict != Verdict::Errored && !charged.contains(&c.field.as_str()))
+        .map(|c| c.field.as_str())
+        .collect();
+    // Every one of these was reported unmeasurable by the batched reader, and
+    // not one of them is a killer.
+    for field in ["AA", "LL", "OVAL", "OSV", "MLST", "ALST", "LALM"] {
+        assert!(
+            measured.contains(field),
+            "scalcout.{field} shared a batch with a killer, not its defect: {}",
+            why_unmeasured(&report)
+        );
+    }
+    let unmeasured: Vec<&str> = report
+        .cases
+        .iter()
+        .filter(|c| c.verdict == Verdict::Errored)
+        .map(|c| c.field.as_str())
+        .collect();
+    assert!(
+        unmeasured.len() <= 12,
+        "only the 12 SPC_DBADDR channels can kill the server; {} went unmeasured: \
+         {unmeasured:?}",
+        unmeasured.len()
+    );
+}
+
 #[cfg(tokio_backend)]
 #[test]
 fn an_unreachable_pv_scores_error_never_agreement() {
@@ -447,6 +585,7 @@ fn an_unreachable_pv_scores_error_never_agreement() {
         declared_type: None,
         value: None,
         errors: vec![v.unwrap_err()],
+        aborted: None,
     };
     let case = pvaread::adjudicate(
         &ch,

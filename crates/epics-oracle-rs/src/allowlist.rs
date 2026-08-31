@@ -10,10 +10,10 @@
 //! file, so the data is reviewable next to the catalogue it transcribes and can
 //! be edited without touching harness code.
 //!
-//! # Four buckets, three justification bases
+//! # Five buckets, three justification bases
 //!
 //! Most rows are C-bug refusals: a `NOT-REPRODUCED` (or, disabled, `REPRODUCED`)
-//! entry, and each such row MUST cite the `CBUG-…` id that justifies it. Two
+//! entry, and each such row MUST cite the `CBUG-…` id that justifies it. Three
 //! further buckets are justified by their `why` rather than by a catalogue
 //! entry, and cite no CBUG:
 //!
@@ -25,10 +25,15 @@
 //!   `.dbd` is a superset of the oracle's `softIoc.dbd`) serves more than the
 //!   spec. The difference is an artifact of the instrument exceeding the spec,
 //!   not of the port falling short of it.
+//! - `INSTRUMENT-DEFECT` — the instrument is not merely a superset, it is
+//!   *broken*: the ground truth cannot be measured on this channel because
+//!   reading it destroys the ground-truth server. The row names the upstream
+//!   defect so the abort is a cited finding against that project rather than a
+//!   silent hole in this one's coverage.
 //!
-//! The CBUG-citation rule is relaxed for those two buckets, and only them; every
-//! row still needs a non-empty `id` (it keys the fired/stale ledger) and a
-//! non-empty `why`. All four buckets match, fire, and go stale by the same rules
+//! The CBUG-citation rule is relaxed for those three buckets, and only them;
+//! every row still needs a non-empty `id` (it keys the fired/stale ledger) and a
+//! non-empty `why`. All five buckets match, fire, and go stale by the same rules
 //! — the bucket changes only what *justifies* the row, not how it behaves. See
 //! [`Allowlist::parse`].
 //!
@@ -71,6 +76,26 @@ pub const BUCKET_DESIGN_DIVERGENCE: &str = "DESIGN-DIVERGENCE";
 /// but `softIocPVX` (whose `.dbd` is a superset of the oracle's `softIoc.dbd`)
 /// serves more. Justified by its `why`; no `CBUG-…` `id` required.
 pub const BUCKET_INSTRUMENT_SUPERSET: &str = "INSTRUMENT-SUPERSET";
+/// A ground-truth **instrument** defect: reading the channel destroys the
+/// instrument, so no ground truth exists to compare the port against. The `why`
+/// must name the upstream defect (project, file, line); no `CBUG-…` `id`
+/// required, because the bug being cited is not in C base's record layer.
+///
+/// A row in this bucket is the only way a channel the harness could not measure
+/// leaves the run green — and it stays honest because it is re-driven every
+/// run: the moment upstream fixes the defect the abort stops, the row stops
+/// firing, and a row that stopped firing is reported STALE and fails the run.
+pub const BUCKET_INSTRUMENT_DEFECT: &str = "INSTRUMENT-DEFECT";
+
+/// The one precondition a row can require today: an `asynShutdownPort` driven
+/// through an addr-0 user against a port registered
+/// `ASYN_MULTIDEVICE|ASYN_DESTRUCTIBLE`. No phase stages such a port, so a row
+/// requiring it is honestly unexercised rather than falsely stale.
+pub const PRECOND_MULTIDEVICE_PORT_SHUTDOWN: &str = "multidevice-asyn-port-shutdown";
+
+/// Every precondition name a row may name in `requires`. Closed on purpose:
+/// an unknown name is a load error, so a typo cannot silently disarm a row.
+pub const PRECONDITIONS: &[&str] = &[PRECOND_MULTIDEVICE_PORT_SHUTDOWN];
 
 /// One expected-deviation rule: a C-bug refusal, or an intentional port
 /// design divergence.
@@ -87,7 +112,8 @@ pub struct Deviation {
     /// non-empty and unique — it keys the fired/exercised/stale sets.
     pub id: String,
     /// One of [`BUCKET_NOT_REPRODUCED`], [`BUCKET_REPRODUCED`],
-    /// [`BUCKET_DESIGN_DIVERGENCE`], or [`BUCKET_INSTRUMENT_SUPERSET`]. Selects
+    /// [`BUCKET_DESIGN_DIVERGENCE`], [`BUCKET_INSTRUMENT_SUPERSET`], or
+    /// [`BUCKET_INSTRUMENT_DEFECT`]. Selects
     /// what justifies the row (a CBUG id vs. a design/instrument rationale); it
     /// does not affect matching. Validated in [`Allowlist::parse`].
     pub bucket: String,
@@ -117,6 +143,18 @@ pub struct Deviation {
     /// Boundary classes (from `cases.rs`) this deviation is limited to.
     #[serde(default)]
     pub classes: Vec<String>,
+    /// What the RUN must have driven for this deviation to be producible at all,
+    /// from [`PRECONDITIONS`].
+    ///
+    /// A different axis from `classes`, which narrows *which cases are in scope*
+    /// among the cases a phase already drives. `requires` states a setup no case
+    /// vocabulary can name — CBUG-F13 needs an `asynShutdownPort` against a
+    /// multi-device port, which no phase stages. Without it a row is marked
+    /// exercised the moment a phase compares one of its `surface`s, and a
+    /// deviation that is merely unreachable gets reported as one that stopped
+    /// happening.
+    #[serde(default)]
+    pub requires: Vec<String>,
     /// Content constraint for a coarse-blob surface (the PVA `value_marking`
     /// surface is one whole `pvxget` rendering per channel, not a per-leaf
     /// difference). When non-empty, the deviation matches ONLY if the port's
@@ -171,6 +209,16 @@ pub struct Allowlist {
     /// on it. A row outside this set was never given the chance to fire, so its
     /// silence says nothing.
     exercised: BTreeSet<String>,
+    /// Preconditions this run actually performed (see [`PRECONDITIONS`]). A row
+    /// whose `requires` are not all in here was never in a position to fire.
+    satisfied: BTreeSet<String>,
+    /// The record types the run drove, when that is a strict subset of the
+    /// surface (`--record-types`). `None` means the run drove the whole thing.
+    ///
+    /// Staleness is a claim about a row's WHOLE scope, so it is only the run
+    /// that covered that whole scope which may make it — see
+    /// [`Allowlist::stale_rows`].
+    driven_types: Option<BTreeSet<String>>,
 }
 
 /// The context a difference occurred in, which the rules match against.
@@ -218,6 +266,16 @@ impl Allowlist {
                         .to_string(),
                 );
             }
+            for r in &d.requires {
+                if !PRECONDITIONS.contains(&r.as_str()) {
+                    return Err(format!(
+                        "allowlist row {} requires unknown precondition {r:?} — expected one \
+                         of {PRECONDITIONS:?}; an unrecognised name would disarm the row in \
+                         silence",
+                        d.id
+                    ));
+                }
+            }
             match d.bucket.as_str() {
                 // A C-bug refusal must name the CBUG it transcribes: the
                 // catalogue is the justification, so a row that cites none is not
@@ -231,15 +289,19 @@ impl Allowlist {
                         ));
                     }
                 }
-                // A design divergence or an instrument-superset artifact is
-                // justified by its `why` (rationale), not by a catalogue entry:
-                // the CBUG-citation rule is relaxed here, and here only.
-                BUCKET_DESIGN_DIVERGENCE | BUCKET_INSTRUMENT_SUPERSET => {}
+                // A design divergence, an instrument superset, or an instrument
+                // defect is justified by its `why` (rationale), not by a
+                // catalogue entry: the CBUG-citation rule is relaxed here, and
+                // here only.
+                BUCKET_DESIGN_DIVERGENCE
+                | BUCKET_INSTRUMENT_SUPERSET
+                | BUCKET_INSTRUMENT_DEFECT => {}
                 other => {
                     return Err(format!(
                         "allowlist row {} has unknown bucket {other:?} — expected one of \
                          {BUCKET_NOT_REPRODUCED}, {BUCKET_REPRODUCED}, \
-                         {BUCKET_DESIGN_DIVERGENCE}, {BUCKET_INSTRUMENT_SUPERSET}",
+                         {BUCKET_DESIGN_DIVERGENCE}, {BUCKET_INSTRUMENT_SUPERSET}, \
+                         {BUCKET_INSTRUMENT_DEFECT}",
                         d.id
                     ));
                 }
@@ -293,6 +355,8 @@ impl Allowlist {
             rows: f.deviations,
             fired: BTreeSet::new(),
             exercised: BTreeSet::new(),
+            satisfied: BTreeSet::new(),
+            driven_types: None,
         })
     }
 
@@ -304,6 +368,8 @@ impl Allowlist {
             rows: Vec::new(),
             fired: BTreeSet::new(),
             exercised: BTreeSet::new(),
+            satisfied: BTreeSet::new(),
+            driven_types: None,
         }
     }
 
@@ -319,6 +385,7 @@ impl Allowlist {
                 row.enabled
                     && row.in_scope(ctx)
                     && compared.iter().any(|s| row.covers_surface_str(s))
+                    && row.requires.iter().all(|r| self.satisfied.contains(r))
                     && !self.exercised.contains(&row.id)
             })
             .map(|row| row.id.clone())
@@ -358,11 +425,24 @@ impl Allowlist {
             if row.enabled
                 && row.in_scope(ctx)
                 && compared.iter().any(|s| row.covers_surface(*s))
+                && row.requires.iter().all(|r| self.satisfied.contains(r))
                 && !self.exercised.contains(&row.id)
             {
                 self.exercised.insert(row.id.clone());
             }
         }
+    }
+
+    /// Record that this run performed one of [`PRECONDITIONS`].
+    ///
+    /// Until a phase calls this, a row that `requires` it stays unexercised: the
+    /// run cannot have seen a deviation it never set up.
+    pub fn note_precondition(&mut self, precondition: &str) {
+        debug_assert!(
+            PRECONDITIONS.contains(&precondition),
+            "unknown precondition {precondition:?}"
+        );
+        self.satisfied.insert(precondition.to_string());
     }
 
     /// Find the row that justifies this difference, if any, and record that it
@@ -389,8 +469,54 @@ impl Allowlist {
     pub fn stale_rows(&self) -> Vec<&Deviation> {
         self.rows
             .iter()
-            .filter(|r| r.enabled && !self.fired.contains(&r.id) && self.exercised.contains(&r.id))
+            .filter(|r| self.silent_after_exercise(r) && self.scope_fully_driven(r))
             .collect()
+    }
+
+    /// Enabled rows a case in their scope DID drive, but whose scope reaches
+    /// record types this run was restricted away from.
+    ///
+    /// Not a finding, and the reason the [`Self::stale_rows`] claim is not
+    /// available here: `--record-types ai` drives `ai`'s integer destinations,
+    /// which is enough to mark `CBUG-E2` exercised, while the row's scope is
+    /// *every* integer destination of *every* record type. Reading that silence
+    /// as "the deviation stopped happening" reports a finding from evidence
+    /// covering a slice of the surface the row names.
+    pub fn partially_exercised_rows(&self) -> Vec<&Deviation> {
+        self.rows
+            .iter()
+            .filter(|r| self.silent_after_exercise(r) && !self.scope_fully_driven(r))
+            .collect()
+    }
+
+    /// The run was in a position to see this row fire, and it did not.
+    fn silent_after_exercise(&self, r: &Deviation) -> bool {
+        r.enabled && !self.fired.contains(&r.id) && self.exercised.contains(&r.id)
+    }
+
+    /// Did this run drive every record type the row's scope reaches?
+    ///
+    /// A row that names no `record_types` is scoped by type family or by field
+    /// and reaches the whole surface, so only an unrestricted run drives it
+    /// whole.
+    fn scope_fully_driven(&self, r: &Deviation) -> bool {
+        match &self.driven_types {
+            None => true,
+            Some(driven) => {
+                !r.record_types.is_empty() && r.record_types.iter().all(|t| driven.contains(t))
+            }
+        }
+    }
+
+    /// Tell the ledger which record types the run actually drove.
+    ///
+    /// `surface` is the full set the run could have driven; when `driven` is all
+    /// of it there is no restriction to record, and every row stays eligible for
+    /// the staleness claim.
+    pub fn note_types_driven(&mut self, driven: &[String], surface: &[String]) {
+        let driven: BTreeSet<String> = driven.iter().cloned().collect();
+        let whole = surface.iter().all(|t| driven.contains(t));
+        self.driven_types = (!whole).then_some(driven);
     }
 
     /// Enabled rows the run never put in a position to fire — no case in their
@@ -799,7 +925,9 @@ why = "  "
                         r.id
                     );
                 }
-                BUCKET_DESIGN_DIVERGENCE | BUCKET_INSTRUMENT_SUPERSET => {}
+                BUCKET_DESIGN_DIVERGENCE
+                | BUCKET_INSTRUMENT_SUPERSET
+                | BUCKET_INSTRUMENT_DEFECT => {}
                 other => panic!("row {:?} has unknown bucket {other:?}", r.id),
             }
         }
@@ -1104,6 +1232,108 @@ why = "cannot point both directions at once"
         assert!(err.contains("at most one content constraint"), "got: {err}");
     }
 
+    /// The shipped CBUG-F13 row: a setup no phase stages is unexercised, not stale.
+    ///
+    /// C's `asynShutdownPort` leaves a multi-device port's non-zero addresses
+    /// enabled onto a nulled driver; reproducing it needs a port registered
+    /// `ASYN_MULTIDEVICE|ASYN_DESTRUCTIBLE` and a shutdown, and no phase stages
+    /// either. The row still names `asyn.ENBL` on the read surfaces, so without
+    /// `requires` every `--phase read` marked it exercised and then reported the
+    /// live deviation STALE — the CBUG-E1 failure again, on a precondition no
+    /// boundary class can name.
+    #[test]
+    fn a_row_requiring_a_setup_no_phase_stages_is_unexercised_not_stale() {
+        let read_surfaces = [Surface::ValueString, Surface::ValueNumeric];
+        let asyn_enbl = ctx("asyn", "ENBL", DbfType::Menu, None);
+
+        let mut al = Allowlist::load(&Allowlist::default_path()).unwrap();
+        al.note_compared(&asyn_enbl, &read_surfaces);
+        assert!(
+            !al.stale_rows().iter().any(|r| r.id == "CBUG-F13"),
+            "reading ENBL without shutting the port down is not evidence"
+        );
+        assert!(
+            al.unexercised_rows().iter().any(|r| r.id == "CBUG-F13"),
+            "the row must be reported as coverage, not silently dropped"
+        );
+
+        // A run that DOES stage the shutdown judges the row: narrowed, not disarmed.
+        let mut al = Allowlist::load(&Allowlist::default_path()).unwrap();
+        al.note_precondition(PRECOND_MULTIDEVICE_PORT_SHUTDOWN);
+        al.note_compared(&asyn_enbl, &read_surfaces);
+        assert!(
+            al.stale_rows().iter().any(|r| r.id == "CBUG-F13"),
+            "once the precondition is staged, silence IS a finding"
+        );
+    }
+
+    /// A `requires` name outside [`PRECONDITIONS`] must not load: a typo that
+    /// parsed would disarm the row for good and read as coverage.
+    #[test]
+    fn an_unknown_precondition_is_a_load_error() {
+        let toml = r#"
+schema = 1
+[[deviation]]
+id = "CBUG-Z9"
+bucket = "NOT-REPRODUCED"
+requires = ["multidevice-asyn-port-shutdow"]
+why = "typo in the precondition name"
+"#;
+        let err = Allowlist::parse(toml).unwrap_err();
+        assert!(err.contains("unknown precondition"), "got: {err}");
+    }
+
+    /// The shipped CBUG-E1 row: a read that never primes the ring has not looked.
+    ///
+    /// C's compress put-offset bug needs data already in the ring — the row's own
+    /// `why` says an empty ring agrees — so only the array phase's
+    /// `array-into-non-empty` case can reach it. The row named the surfaces the
+    /// difference SHOWS on and left `classes` a wildcard, so `--phase read` and
+    /// `--phase monitor` compared `value_string` on `compress.VAL`, marked the row
+    /// exercised, and reported the live deviation STALE while `--phase array` was
+    /// firing it. Measured on this tree before the fix: prime a NSAM=3 FIFO with
+    /// (4,5) then put (7,8) — C reads back `[8,0,7]`, the port `[5,7,8]`.
+    #[test]
+    fn a_row_whose_deviation_needs_a_boundary_class_is_not_exercised_by_a_bare_read() {
+        let read_surfaces = [
+            Surface::NativeType,
+            Surface::ElementCount,
+            Surface::ValueString,
+            Surface::ValueNumeric,
+        ];
+
+        let mut al = Allowlist::load(&Allowlist::default_path()).unwrap();
+        al.note_compared(
+            &ctx("compress", "VAL", DbfType::NoAccess, None),
+            &read_surfaces,
+        );
+        assert!(
+            !al.stale_rows().iter().any(|r| r.id == "CBUG-E1"),
+            "a read probe that never primed the ring cannot call the deviation gone"
+        );
+        assert!(
+            al.unexercised_rows().iter().any(|r| r.id == "CBUG-E1"),
+            "and it must say so: the row is unexercised, not silently dropped"
+        );
+
+        // The array phase's primed case is in scope, and there the silence WOULD
+        // be a finding — the row is narrowed, not disarmed.
+        let mut al = Allowlist::load(&Allowlist::default_path()).unwrap();
+        al.note_compared(
+            &ctx(
+                "compress",
+                "VAL",
+                DbfType::NoAccess,
+                Some("array-into-non-empty"),
+            ),
+            &read_surfaces,
+        );
+        assert!(
+            al.stale_rows().iter().any(|r| r.id == "CBUG-E1"),
+            "the case that can produce the deviation still judges the row"
+        );
+    }
+
     /// The two SHIPPED instrument-superset rows fire on the residual QSRV2 diffs
     /// for both longin and waveform — the end-state the main worker's combined
     /// run reaches once the asyn menu fix is integrated.
@@ -1124,5 +1354,79 @@ why = "cannot point both directions at once"
             &dtyp_blob(WAVEFORM_PORT),
         );
         assert_eq!(waveform.as_deref(), Some("INSTR-QSRV2-WAVEFORM-DEMO"));
+    }
+
+    /// A type-family row (no `record_types`) reaches every record type, so a run
+    /// restricted to some of them has driven only a slice of its scope. Reading
+    /// that slice's silence as staleness is the finding this bucket kills:
+    /// `--record-types ai` marks CBUG-E2 exercised and then declared it stale
+    /// while never touching 39 of the 40 record types its scope covers.
+    #[test]
+    fn a_restricted_run_cannot_call_a_type_family_row_stale() {
+        const E2: &str = r#"
+schema = 1
+[[deviation]]
+id = "CBUG-E2"
+bucket = "NOT-REPRODUCED"
+dbf_types = ["DBF_SHORT"]
+surface = ["value_numeric"]
+why = "dbConvert's double->integer cast is UB out of range."
+"#;
+        let mut al = Allowlist::parse(E2).unwrap();
+        let c = ctx("ai", "PREC", DbfType::Short, Some("over-max"));
+
+        al.note_types_driven(&["ai".into()], &["ai".into(), "bi".into()]);
+        al.note_compared(&c, &[Surface::ValueNumeric]);
+        assert!(
+            al.stale_rows().is_empty(),
+            "the run drove ai only; the row's scope is every record type"
+        );
+        assert_eq!(al.partially_exercised_rows().len(), 1);
+        assert!(
+            al.unexercised_rows().is_empty(),
+            "it WAS exercised — it must not vanish into the coverage bucket"
+        );
+    }
+
+    /// The restriction only withholds the claim where the evidence is partial.
+    /// A run over the whole surface still judges staleness, and so does a
+    /// restricted run over a row whose own `record_types` it fully covered.
+    #[test]
+    fn a_row_the_restricted_run_fully_covered_is_still_judged() {
+        let mut al = Allowlist::parse(F6).unwrap();
+        let c = ctx("calc", "INPM", DbfType::InLink, Some("link-constant"));
+
+        al.note_types_driven(
+            &["calc".into(), "calcout".into()],
+            &["calc".into(), "calcout".into(), "ai".into()],
+        );
+        al.note_compared(&c, &[Surface::PutAccepted]);
+        assert_eq!(
+            al.stale_rows().len(),
+            1,
+            "the row names calc and calcout, and both ran"
+        );
+        assert!(al.partially_exercised_rows().is_empty());
+
+        // Drop calcout from the run and the same row is no longer fully driven.
+        let mut al = Allowlist::parse(F6).unwrap();
+        al.note_types_driven(&["calc".into()], &["calc".into(), "calcout".into()]);
+        al.note_compared(&c, &[Surface::PutAccepted]);
+        assert!(al.stale_rows().is_empty());
+        assert_eq!(al.partially_exercised_rows().len(), 1);
+    }
+
+    /// Driving every record type of the surface is not a restriction at all.
+    #[test]
+    fn an_unrestricted_run_records_no_restriction() {
+        let mut al = Allowlist::parse(F6).unwrap();
+        let c = ctx("calc", "INPM", DbfType::InLink, Some("link-constant"));
+        al.note_types_driven(
+            &["calc".into(), "calcout".into()],
+            &["calc".into(), "calcout".into()],
+        );
+        al.note_compared(&c, &[Surface::PutAccepted]);
+        assert_eq!(al.stale_rows().len(), 1);
+        assert!(al.partially_exercised_rows().is_empty());
     }
 }

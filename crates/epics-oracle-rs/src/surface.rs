@@ -84,7 +84,7 @@ impl Surface {
                 unimplemented_types.push(rt.name.clone());
             }
             for f in &rt.fields {
-                if !f.dbf.is_ca_observable() {
+                if !f.is_ca_observable() {
                     excluded_noaccess += 1;
                     continue;
                 }
@@ -207,9 +207,10 @@ pub async fn probe_supported_record_types(dbd: &Dbd) -> Result<BTreeSet<String>,
 ///   documented fields unwritable over CA). A harness that skipped link puts
 ///   would silently fail to observe it.
 ///
-/// Only `DBF_NOACCESS` is excluded, because no client can reach it at all.
+/// Only an unreachable field is excluded ([`FieldDef::is_ca_observable`]): a
+/// `DBF_NOACCESS` declaration that `special(SPC_DBADDR)` does not re-type.
 pub fn is_put_candidate(f: &FieldDef) -> bool {
-    f.dbf.is_ca_observable()
+    f.is_ca_observable()
 }
 
 /// Why a record type's `VAL` channel is, or is not, in a phase's **drive**

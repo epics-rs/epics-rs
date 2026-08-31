@@ -5,6 +5,7 @@
 use epics_base_rs::server::recgbl::EventMask;
 use epics_base_rs::server::snapshot::{ControlInfo, DisplayInfo, PropertySupport, Snapshot};
 use epics_base_rs::types::{EpicsValue, PvString, WallTime};
+use epics_pva_rs::channel_shape::ChannelShape;
 use epics_pva_rs::pvdata::{FieldDesc, PvField, PvStructure, ScalarType, ScalarValue};
 
 use crate::convert::{epics_to_pv_field, epics_to_scalar};
@@ -375,53 +376,6 @@ impl NtType {
     }
 }
 
-/// Choose the NormativeType for a channel bound to a field, the single
-/// owner of NT selection for both the single-record path
-/// ([`super::channel::BridgeChannel`]) and the QSRV group scalar-member
-/// path ([`super::group::GroupChannel`]).
-///
-/// The NT is chosen from the field's *resolved value's* final DBR/DBF
-/// type and element count, mirroring pvxs, which builds every channel
-/// prototype from `dbChannelFinalFieldType(chan)`
-/// (singlesource.cpp:189-206; group members via `getTypeDefForChannel` /
-/// `IOCSource::getChannelValueType`, groupconfigprocessor.cpp:867-974):
-/// `DBF_ENUM`/`DBF_MENU`/`DBF_DEVICE` resolve to `DBR_ENUM`
-/// (db/dbAccess.c:88-90) and select `NTEnum`, an array field selects
-/// `NTScalarArray`, and everything else is `NTScalar`.
-///
-/// This applies uniformly to `VAL` and every other field — there is no
-/// record-type-name short-circuit for `VAL`. A `bi`/`bo`/`mbbi`/`mbbo`
-/// **and** `busy` `VAL` all resolve to an enum value and become `NTEnum`;
-/// an `aai`/`waveform`/`compress` `VAL` resolves to an array and becomes
-/// `NTScalarArray`; a `REC.SCAN` member becomes `NTEnum`; a `BI.DESC`
-/// member stays `NTScalar` string. Deriving NT from the resolved value —
-/// not from `Record::record_type()` — keeps the advertised NT in lockstep
-/// with pvxs `dbChannelFinalFieldType` for every record, including the
-/// `DBF_ENUM` records (e.g. `busy`) a record-type name list would omit.
-pub(crate) fn nt_type_for_field(value: Option<&EpicsValue>) -> NtType {
-    match value {
-        // DBF_ENUM/MENU/DEVICE → DBR_ENUM → NTEnum (scalar index +
-        // choices). An enum *array* has no scalar-index NTEnum shape,
-        // so it falls through to NTScalarArray below.
-        Some(EpicsValue::Enum(_)) => NtType::Enum,
-        Some(
-            EpicsValue::ShortArray(_)
-            | EpicsValue::FloatArray(_)
-            | EpicsValue::EnumArray(_)
-            | EpicsValue::DoubleArray(_)
-            | EpicsValue::LongArray(_)
-            | EpicsValue::CharArray(_)
-            | EpicsValue::StringArray(_)
-            | EpicsValue::Int64Array(_)
-            | EpicsValue::UInt64Array(_)
-            | EpicsValue::UShortArray(_)
-            | EpicsValue::ULongArray(_)
-            | EpicsValue::UCharArray(_),
-        ) => NtType::ScalarArray,
-        _ => NtType::Scalar,
-    }
-}
-
 /// The port's `IOCSource::getChannelValueType` (pvxs
 /// `ioc/iocsource.cpp:619-644`): the NT a channel bound to
 /// `record.field` serves, INCLUDING the long-string collapse. Single
@@ -429,6 +383,25 @@ pub(crate) fn nt_type_for_field(value: Option<&EpicsValue>) -> NtType {
 /// and the group scalar-member path ([`super::group::GroupChannel`]) both
 /// resolve their NT here, so a long-string field cannot be a string on one
 /// surface and a byte array on the other.
+///
+/// The SHAPE is `bool isArray = dbChannelFinalElements(chan) != 1`
+/// ([`ChannelShape`]) and the ELEMENT TYPE is
+/// `fromDbrType(final_field_type)`, exactly as pvxs separates them: the
+/// count alone decides `valueType.arrayOf()`, and the same count routes the
+/// PUT through `putScalar` (`iocsource.cpp:599-601`) and an `+type:"any"`
+/// member's leaf (`ioc/field.cpp:41`). Keying the shape on the FTVL storage
+/// variant instead — which the port did — served every `NELM=1` array field
+/// (`aai`/`aao` VAL, `acalcout` AVAL/AA..LL/OAV, `compress` VAL) as an
+/// `NTScalarArray` where C serves an `NTScalar`, and made `pvxput` refuse
+/// the drive with "Unable to assign string[] with String".
+///
+/// `DBF_ENUM`/`DBF_MENU`/`DBF_DEVICE` resolve to `DBR_ENUM`
+/// (`db/dbAccess.c:88-90`) and select `NTEnum` — the one element type with
+/// a shape of its own, and only while the channel is a scalar. This applies
+/// uniformly to `VAL` and every other field: there is no record-type-name
+/// short-circuit, so a `busy` VAL is `NTEnum` on its resolved value the way
+/// a `bi` VAL is, and a `REC.SCAN` member is `NTEnum` while a `BI.DESC` one
+/// stays an `NTScalar` string.
 ///
 /// Three ways a channel is a long string. Two are pvxs's own test
 /// ("final field type is `DBR_CHAR`, the field is an array, and the
@@ -486,15 +459,32 @@ pub(crate) fn nt_type_for_channel(
     {
         return NtType::LongString;
     }
-    // `DBR_CHAR` (not `DBR_UCHAR` — pvxs tests `final_field_type ==
-    // DBR_CHAR`) array VAL with the `String` form tag.
-    if field_upper.eq_ignore_ascii_case("VAL")
+    // `final_field_type == DBR_CHAR && isArray && format == "String"`. The
+    // `DBR_CHAR` half is `DBR_CHAR`, not `DBR_UCHAR` — pvxs tests the signed
+    // one — and the `isArray` half is pvxs's own conjunct: a `Q:form,"String"`
+    // record whose VAL holds ONE element is a `DBR_CHAR` scalar, not a long
+    // string.
+    let is_array = ChannelShape::of_channel(&*instance.record, field_upper, resolved).is_array();
+    if is_array
+        && field_upper.eq_ignore_ascii_case("VAL")
         && matches!(resolved, Some(EpicsValue::CharArray(_)))
         && instance.get_info("Q:form") == Some("String")
     {
         return NtType::LongString;
     }
-    nt_type_for_field(resolved)
+    // `TypeCode valueType(fromDbrType(final_field_type)); if(isArray)
+    // valueType = valueType.arrayOf();` — the count decides the shape and
+    // nothing else does. The element type rides on the resolved value, which
+    // is `client_field_value`, i.e. the value already projected onto the
+    // field's DECLARED type, so reading the DBF off it IS reading the
+    // declaration.
+    if is_array {
+        return NtType::ScalarArray;
+    }
+    match resolved {
+        Some(EpicsValue::Enum(_)) => NtType::Enum,
+        _ => NtType::Scalar,
+    }
 }
 
 /// The bare leaf a `+type:"plain"` group member serves — **descriptor and
@@ -522,13 +512,13 @@ pub(crate) enum BareLeaf {
     /// A `DBR_CHAR` array whose channel format is `String` — pvxs
     /// `TypeCode::String` (`getChannelValueType`, `iocsource.cpp:635-636`).
     LongString,
-    /// The value is stored as an `*Array` variant ([`nt_type_for_field`])
-    /// — pvxs `valueType.arrayOf()`. Deliberate divergence: pvxs keys
-    /// array-ness on `dbChannelFinalElements() != 1`, so C QSRV serves a
-    /// `NELM=1` waveform as a scalar; the port pins the shape to the
-    /// FTVL storage variant and keeps it NTScalarArray.
+    /// The channel's `dbChannelFinalElements()` is not 1
+    /// ([`ChannelShape`]) — pvxs `valueType.arrayOf()`.
     Array(ScalarType),
-    /// A scalar-stored value — pvxs `fromDbrType(final_field_type)`.
+    /// A one-element channel — pvxs `fromDbrType(final_field_type)` with no
+    /// `arrayOf()`. The BACKING may still be an array variant (an `aai` with
+    /// `NELM=1` stores a one-element `DoubleArray`); [`Self::value`] is what
+    /// renders it as the scalar this descriptor advertises.
     Scalar(ScalarType),
 }
 
@@ -552,6 +542,28 @@ impl BareLeaf {
         )
     }
 
+    /// The leaf a `+type:"any"` member's payload carries — pvxs
+    /// `Field::Field`'s `anyType` (`ioc/field.cpp:38-45`).
+    ///
+    /// The SHAPE is the same `dbChannelFinalElements() != 1` every other
+    /// leaf takes, which is why it is asked here and not re-derived at the
+    /// read site. The ELEMENT TYPE is `fromDbrType(dbChannelFinalFieldType)`
+    /// with no long-string collapse: `anyType` is built from `fromDbrType`
+    /// alone, never `getChannelValueType`, so `getArrayValue`'s
+    /// `value.type() == TypeCode::String` test cannot fire and pvxs serves a
+    /// long-string field's `any` member as `int8_t[]`.
+    pub(crate) fn any_payload_of_channel(
+        instance: &epics_base_rs::server::record::RecordInstance,
+        field_upper: &str,
+        resolved: &EpicsValue,
+    ) -> Self {
+        let scalar = crate::convert::dbf_to_scalar_type(resolved.db_field_type());
+        match ChannelShape::of_channel(&*instance.record, field_upper, Some(resolved)) {
+            ChannelShape::Array => BareLeaf::Array(scalar),
+            ChannelShape::Scalar => BareLeaf::Scalar(scalar),
+        }
+    }
+
     /// The same classification, from an NT already resolved through
     /// [`nt_type_for_channel`] (the group's introspection pass, which needs
     /// the NT for its `+type:"scalar"` members anyway).
@@ -573,10 +585,18 @@ impl BareLeaf {
     }
 
     /// The leaf's value, rendered for the descriptor [`Self::desc`] emits.
+    ///
+    /// Each arm renders the SHAPE its `desc` twin advertises rather than the
+    /// shape the backing variant happens to have, which is what makes the two
+    /// renderings of one classification agree by construction: a `Scalar` leaf
+    /// over a one-element array buffer collapses to the element (pvxs
+    /// `getScalarValue`, `iocsource.cpp:104-125`), and an `Array` leaf keeps
+    /// the buffer.
     pub(crate) fn value(self, value: &EpicsValue) -> PvField {
         match self {
             BareLeaf::LongString => PvField::Scalar(ScalarValue::String(long_string_value(value))),
-            BareLeaf::Array(_) | BareLeaf::Scalar(_) => epics_to_pv_field(value),
+            BareLeaf::Scalar(_) => PvField::Scalar(epics_to_scalar(value)),
+            BareLeaf::Array(_) => epics_to_pv_field(value),
         }
     }
 }
@@ -1990,36 +2010,44 @@ mod tests {
         assert_eq!(NtType::from_record_type("mbbi"), NtType::Enum);
     }
 
-    /// `nt_type_for_field` derives the NT purely from the resolved value,
-    /// with no record-type-name short-circuit for `VAL`. A `busy` VAL
-    /// resolves to an enum value and must select NTEnum (was NTScalar
-    /// under the old name-list short-circuit that omitted `busy`); arrays
-    /// select NTScalarArray; scalars and an unresolved value select
-    /// NTScalar — matching pvxs `dbChannelFinalFieldType` for every record.
+    /// `BareLeaf` renders the shape it ADVERTISES, not the shape the backing
+    /// variant happens to have — the boundary [`ChannelShape`] puts a
+    /// one-element array field on.
+    ///
+    /// `Scalar` over a one-element array buffer is C's `NELM=1` `aai`/`aao`,
+    /// `acalcout` AA..LL and `compress` VAL: `getChannelValueType` never runs
+    /// `arrayOf()` for them, so the leaf is a scalar and `getScalarValue`
+    /// fills it from element 0. Rendering the buffer instead is what put an
+    /// `int8_t[]`/`string[]` value under a scalar descriptor and made `pvxput`
+    /// answer "Unable to assign string[] with String".
     #[test]
-    fn nt_type_for_field_derives_from_value() {
-        // DBF_ENUM value (bi/bo/mbbi/mbbo AND busy) → NTEnum.
-        assert_eq!(nt_type_for_field(Some(&EpicsValue::Enum(2))), NtType::Enum);
-        // Array value → NTScalarArray (aai/waveform/compress VAL etc.).
+    fn bare_leaf_renders_the_shape_it_advertises() {
+        let scalar = BareLeaf::Scalar(ScalarType::Double);
+        assert_eq!(scalar.desc(), FieldDesc::Scalar(ScalarType::Double));
         assert_eq!(
-            nt_type_for_field(Some(&EpicsValue::DoubleArray(vec![1.0, 2.0]))),
-            NtType::ScalarArray
+            scalar.value(&EpicsValue::DoubleArray(vec![2.5])),
+            PvField::Scalar(ScalarValue::Double(2.5)),
+            "a one-element array backing collapses to the element"
         );
         assert_eq!(
-            nt_type_for_field(Some(&EpicsValue::LongArray(vec![1, 2]))),
-            NtType::ScalarArray
+            scalar.value(&EpicsValue::Double(2.5)),
+            PvField::Scalar(ScalarValue::Double(2.5)),
+            "a scalar backing renders unchanged"
         );
-        // Plain scalar → NTScalar.
+
+        // `FTVL=STRING, NELM=1` — the shape pvxput refused to drive.
+        let text = BareLeaf::Scalar(ScalarType::String);
         assert_eq!(
-            nt_type_for_field(Some(&EpicsValue::Double(3.0))),
-            NtType::Scalar
+            text.value(&EpicsValue::StringArray(vec!["hi".into()])),
+            PvField::Scalar(ScalarValue::String("hi".into()))
         );
+
+        let array = BareLeaf::Array(ScalarType::Double);
+        assert_eq!(array.desc(), FieldDesc::ScalarArray(ScalarType::Double));
         assert_eq!(
-            nt_type_for_field(Some(&EpicsValue::Long(7))),
-            NtType::Scalar
+            array.value(&EpicsValue::DoubleArray(vec![1.0, 2.0])),
+            PvField::ScalarArray(vec![ScalarValue::Double(1.0), ScalarValue::Double(2.0)])
         );
-        // Unresolved value → NTScalar (uniform with the non-VAL path).
-        assert_eq!(nt_type_for_field(None), NtType::Scalar);
     }
 
     #[test]

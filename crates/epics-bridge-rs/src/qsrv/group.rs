@@ -23,7 +23,7 @@ use super::channel::MemberChannel;
 use super::group_config::{GroupMember, GroupPvDef, TriggerDef};
 use super::monitor::BridgeMonitor;
 use super::pvif::{self, FieldMapping, NtType};
-use crate::convert::{dbf_to_scalar_type, epics_to_pv_field};
+use crate::convert::dbf_to_scalar_type;
 use crate::error::{BridgeError, BridgeResult};
 
 // ---------------------------------------------------------------------------
@@ -1205,7 +1205,14 @@ impl GroupChannel {
                 // the converted value in a Variant tagged with its own
                 // wire-faithful descriptor so the slot decodes as `any`,
                 // not a fixed scalar.
-                let pv = epics_to_pv_field(&value);
+                //
+                // `anyType` is settled by the SAME element-count predicate
+                // every other leaf takes (`ioc/field.cpp:38-45`), so it is
+                // asked of the classifier rather than read off the stored
+                // variant — a one-element array field's `any` payload is a
+                // scalar, exactly as its plain and scalar members are.
+                let pv = pvif::BareLeaf::any_payload_of_channel(instance, &member.field, &value)
+                    .value(&value);
                 let desc = pv.wire_descriptor();
                 Ok(PvField::Variant(Box::new(VariantValue { desc, value: pv })))
             }

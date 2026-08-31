@@ -17,13 +17,14 @@
 //! the target's own selection for no reason.
 #![cfg(feature = "qsrv-core")]
 
-// RTEMS-EXEC-MODEL-ALLOW(26): checked - these run and pass in the exec-backend
+// RTEMS-EXEC-MODEL-ALLOW(31): checked - these run and pass in the exec-backend
 // suite.
 
 use std::sync::Arc;
 
 use epics_base_rs::server::database::PvDatabase;
 use epics_base_rs::server::records::ai::AiRecord;
+use epics_base_rs::server::records::histogram::HistogramRecord;
 use epics_base_rs::server::records::longin::LonginRecord;
 use epics_base_rs::server::records::lsi::LsiRecord;
 use epics_base_rs::server::records::stringin::StringinRecord;
@@ -1482,4 +1483,194 @@ async fn link_field_put_succeeds_in_every_process_mode() {
         };
         assert_eq!(text, target, "{mode:?} block={block}");
     }
+}
+
+/// The array-ness boundary is `dbChannelFinalElements(chan) != 1`
+/// (`iocsource.cpp:631`), not the FTVL storage variant.
+///
+/// C QSRV serves an `NELM=1` array field as an `NTScalar` with a scalar
+/// value leaf, and routes its PUT through `putScalar` (`iocsource.cpp:601`).
+/// The port keyed the shape on the stored `*Array` variant instead, which
+/// advertised `NTScalarArray` for every one-element array field the PVA
+/// oracle measures — `aai`/`aao` VAL, `acalcout` AVAL/AA..LL/OAV,
+/// `compress` VAL — and made `pvxput` refuse the drive with "Unable to
+/// assign string[] with String".
+///
+/// Both sides of the boundary are here, because a rule that holds at only
+/// one of them is the shape that produced the defect.
+#[tokio::test]
+async fn a_one_element_array_field_is_a_scalar_channel() {
+    let db = Arc::new(PvDatabase::new());
+    db.add_record(
+        "TEST:one",
+        Box::new(WaveformRecord::new(1, DbFieldType::Double)),
+    )
+    .await
+    .unwrap();
+    db.add_record(
+        "TEST:two",
+        Box::new(WaveformRecord::new(2, DbFieldType::Double)),
+    )
+    .await
+    .unwrap();
+
+    let one = BridgeChannel::new(db.clone(), "TEST:one")
+        .await
+        .expect("new");
+    assert_eq!(
+        one.nt_type(),
+        NtType::Scalar,
+        "NELM=1 is one element: `getChannelValueType` never runs arrayOf()"
+    );
+    match extract_value(&one.get(&empty_request()).await.expect("get")).expect("value") {
+        PvField::Scalar(ScalarValue::Double(_)) => {}
+        other => panic!("the value must be the scalar the descriptor advertises, got {other:?}"),
+    }
+
+    // `putScalar` into the one-element buffer, then read it back through the
+    // same scalar leaf.
+    let mut put = PvStructure::new("epics:nt/NTScalar:1.0");
+    put.fields
+        .push(("value".into(), PvField::Scalar(ScalarValue::Double(6.25))));
+    one.put(&put)
+        .await
+        .expect("scalar put into an NELM=1 field");
+    assert_eq!(
+        extract_value(&one.get(&empty_request()).await.expect("get")).expect("value"),
+        &PvField::Scalar(ScalarValue::Double(6.25))
+    );
+
+    let two = BridgeChannel::new(db.clone(), "TEST:two")
+        .await
+        .expect("new");
+    assert_eq!(two.nt_type(), NtType::ScalarArray, "NELM=2 keeps arrayOf()");
+}
+
+/// The same boundary on an `FTVL=STRING` buffer — the leaf whose mismatch
+/// `pvxput` reports as "Unable to assign string[] with String", and the one
+/// whose scalar-string PUT has to land in the array destination
+/// (`dbAccess.c:1350` takes the array arm for any `special(SPC_DBADDR)`
+/// field, whatever the count).
+#[tokio::test]
+async fn a_one_element_string_array_field_serves_and_takes_a_string_scalar() {
+    let db = Arc::new(PvDatabase::new());
+    db.add_record(
+        "TEST:s1",
+        Box::new(WaveformRecord::new(1, DbFieldType::String)),
+    )
+    .await
+    .unwrap();
+
+    let ch = BridgeChannel::new(db.clone(), "TEST:s1")
+        .await
+        .expect("new");
+    assert_eq!(ch.nt_type(), NtType::Scalar);
+
+    let mut put = PvStructure::new("epics:nt/NTScalar:1.0");
+    put.fields.push((
+        "value".into(),
+        PvField::Scalar(ScalarValue::String("hello".into())),
+    ));
+    ch.put(&put)
+        .await
+        .expect("string put into an NELM=1 buffer");
+
+    assert_eq!(
+        extract_value(&ch.get(&empty_request()).await.expect("get")).expect("value"),
+        &PvField::Scalar(ScalarValue::String("hello".into()))
+    );
+}
+
+/// `Q:form,"String"` carries pvxs's own `isArray` conjunct
+/// (`iocsource.cpp:635`): a one-element `DBF_CHAR` VAL is a `DBR_CHAR`
+/// scalar, not a long string.
+#[tokio::test]
+async fn q_form_string_needs_the_array_half_too() {
+    let db = Arc::new(PvDatabase::new());
+    db.add_record(
+        "TEST:c1",
+        Box::new(WaveformRecord::new(1, DbFieldType::Char)),
+    )
+    .await
+    .unwrap();
+    {
+        let rec = db.get_record("TEST:c1").expect("record");
+        rec.write().set_info("Q:form", "String");
+    }
+
+    let ch = BridgeChannel::new(db.clone(), "TEST:c1")
+        .await
+        .expect("new");
+    assert_eq!(
+        ch.nt_type(),
+        NtType::Scalar,
+        "one element: the long-string branch does not fire"
+    );
+    match extract_value(&ch.get(&empty_request()).await.expect("get")).expect("value") {
+        PvField::Scalar(ScalarValue::Byte(_)) => {}
+        other => panic!("expected a `DBR_CHAR` scalar, got {other:?}"),
+    }
+}
+
+/// The PUT half of the same predicate, against a destination that takes
+/// NOTHING but a buffer: `histogram` VAL answers `TypeMismatch` to a scalar,
+/// and C never sends it one — `putScalar` is `doDbPut(chan, dbr, &value, 1)`
+/// and `dbPut` takes its array arm for every `special(SPC_DBADDR)` field
+/// whatever the count (`dbAccess.c:1350`). The channel is a scalar on the
+/// wire and a one-element buffer in the record, and the two are one decision.
+#[tokio::test]
+async fn a_scalar_put_reaches_an_array_only_destination() {
+    let db = Arc::new(PvDatabase::new());
+    db.add_record("TEST:h1", Box::new(HistogramRecord::new(1, 0.0, 10.0)))
+        .await
+        .unwrap();
+
+    let ch = BridgeChannel::new(db.clone(), "TEST:h1")
+        .await
+        .expect("new");
+    assert_eq!(ch.nt_type(), NtType::Scalar, "NELM=1 histogram VAL");
+
+    let mut put = PvStructure::new("epics:nt/NTScalar:1.0");
+    put.fields
+        .push(("value".into(), PvField::Scalar(ScalarValue::UInt(7))));
+    ch.put(&put)
+        .await
+        .expect("a scalar PUT must reach the array-only VAL writer");
+    assert_eq!(
+        extract_value(&ch.get(&empty_request()).await.expect("get")).expect("value"),
+        &PvField::Scalar(ScalarValue::UInt(7))
+    );
+}
+
+/// The boundary the count cannot answer: an `lsi` holding ONE character.
+/// C's `cvt_dbaddr` reports `SIZV`, so the channel is never scalar-shaped and
+/// the long-string arms stay reachable; this port stores a `String`, whose
+/// count is 1, so the declaration has to answer instead. Getting this wrong
+/// serves a one-character `lsi` as a `DBR_CHAR` scalar.
+#[tokio::test]
+async fn a_one_character_long_string_stays_a_long_string() {
+    let db = Arc::new(PvDatabase::new());
+    db.add_record("TEST:ls1", Box::new(LsiRecord::new("x")))
+        .await
+        .unwrap();
+
+    let ch = BridgeChannel::new(db.clone(), "TEST:ls1")
+        .await
+        .expect("new");
+    assert_eq!(ch.nt_type(), NtType::LongString);
+    assert_eq!(
+        extract_value(&ch.get(&empty_request()).await.expect("get")).expect("value"),
+        &PvField::Scalar(ScalarValue::String("x".into()))
+    );
+
+    let mut put = PvStructure::new("epics:nt/NTScalar:1.0");
+    put.fields.push((
+        "value".into(),
+        PvField::Scalar(ScalarValue::String("yz".into())),
+    ));
+    ch.put(&put).await.expect("long-string put");
+    assert_eq!(
+        extract_value(&ch.get(&empty_request()).await.expect("get")).expect("value"),
+        &PvField::Scalar(ScalarValue::String("yz".into()))
+    );
 }

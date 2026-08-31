@@ -62,8 +62,8 @@
 //! difference indicts neither server.
 //!
 //! Which types those are is **measured, not listed**: before anything is
-//! driven, [`undriven_events`] watches the ground truth's scanned reproducer
-//! for [`SCAN_QUIET_WINDOW`], and a reference that posts in that window
+//! driven, `undriven_events` watches the ground truth's scanned reproducer
+//! for `SCAN_QUIET_WINDOW`, and a reference that posts in that window
 //! withdraws the scanned case for that type. A hand-kept list is what this
 //! replaces, and it had gone wrong exactly the way a hand-kept list does:
 //! `event` and `sseq` were on it, `printf` was not, and
@@ -199,7 +199,7 @@ const EPICS_EPOCH_POSIX_SECONDS: &str = "631152000";
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct SelfPosting {
     pub record_type: String,
-    /// Post-seed events the reference posted in [`SCAN_QUIET_WINDOW`].
+    /// Post-seed events the reference posted in `SCAN_QUIET_WINDOW`.
     pub undriven_events: usize,
 }
 
@@ -248,7 +248,7 @@ impl Drive {
 /// [`crate::puts_are_measurable`] refuses for the same record type.
 ///
 /// Self-posting is NOT decided here. A type whose own scanning posts undriven
-/// events is withdrawn by [`undriven_events`] measuring the reference, so this
+/// events is withdrawn by `undriven_events` measuring the reference, so this
 /// predicate never has to know which types those are — see the module docs.
 ///
 /// This is not a silent blind spot: `asyn` keeps its [`Drive::Passive`]

@@ -4533,7 +4533,7 @@ pub trait Record: Send + Sync + 'static {
 ///
 /// An `EnumWithChoices` carrier is left alone in both — it is a transient link
 /// payload, not a stored value, and `convert_to` collapses it to a bare index.
-/// [`shaped_destination`] carries the rest of the shared rule.
+/// `shaped_destination` carries the rest of the shared rule.
 pub fn put_value_in_field_shape<R: Record + ?Sized>(
     record: &R,
     field: &str,

@@ -2129,7 +2129,7 @@ impl Record for AcalcoutRecord {
     /// The reason is the same one that limits [`Self::special_reseed_input_links`]:
     /// `pvalue` walks `&pcalc->a` as a scalar `double *`, so it has no meaning
     /// past INPL — `field(INAA,"5")` gives AA a `CON` link status and NOTHING
-    /// else, and AA stays all zeros. Seeding it here wrote AA[0]=5, and once
+    /// else, and AA stays all zeros. Seeding it here wrote `AA[0]=5`, and once
     /// AMEM became real that showed up as a boot-time charge for a buffer C
     /// never allocated.
     ///

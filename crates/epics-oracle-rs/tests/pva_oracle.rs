@@ -91,6 +91,7 @@ fn surface_of(record_type: &str) -> Surface {
 /// plus the channels its assertions name, and `scalcout`'s whole surface stops
 /// spending two minutes on a fallback eleven channels exercise identically. The
 /// record the IOCs load is untouched and still has all 171 fields.
+#[cfg(tokio_backend)]
 fn sweep_fields(record_type: &str, keep: &[&str]) -> (Surface, PvaReport) {
     let dbd = Dbd::parse(&trimmed_recordtype(record_type, keep))
         .unwrap_or_else(|e| panic!("the trimmed {record_type} recordtype must parse: {e}"));
@@ -100,6 +101,7 @@ fn sweep_fields(record_type: &str, keep: &[&str]) -> (Surface, PvaReport) {
 
 /// One `recordtype(...)` block from the fat `.dbd`, carrying only `keep`'s
 /// fields — verbatim, so every type, size and `special` is the real one.
+#[cfg(tokio_backend)]
 fn trimmed_recordtype(record_type: &str, keep: &[&str]) -> String {
     let text = std::fs::read_to_string(CTools::dbd_path()).expect("the fat dbd must be readable");
     let head = format!("recordtype({record_type}) {{");

@@ -593,6 +593,16 @@ jobs:
       with:
         toolchain: nightly
         components: rust-src
+    # The VxWorks rows below are pinned to nightly-2026-08-30, the last nightly
+    # before rust#160170 (first in nightly-2026-08-31) removed the vxworks guard
+    # around `libc::O_NOFOLLOW` in std's `set_perm_nofollow`; see the
+    # `vxworks-census` header. The RTEMS rows keep the floating `nightly` above —
+    # the break is VxWorks-only. Drop this second toolchain and restore the
+    # VxWorks rows to `+nightly` once rust#162065 (the std-side fix) lands.
+    - uses: dtolnay/rust-toolchain@master
+      with:
+        toolchain: nightly-2026-08-30
+        components: rust-src
     - uses: Swatinem/rust-cache@v2
       with:
         key: rustdoc-embedded
@@ -639,7 +649,7 @@ jobs:
         trap 'mv -f Cargo.lock.rustdoc-bak Cargo.lock' EXIT
         cfg=()
         while IFS= read -r line; do cfg+=(--config "$line"); done \
-          < <(./scripts/libc-std-patch.sh nightly)
+          < <(./scripts/libc-std-patch.sh nightly-2026-08-30)
         rc=0
         for crate in epics-libcom-rs epics-base-rs epics-ca-rs epics-pva-rs \
                      epics-rtems-boot epics-bridge-rs asyn-rs; do
@@ -650,7 +660,7 @@ jobs:
             asyn-rs)         feats=(--features epics) ;;
           esac
           echo "::group::$crate --lib (x86_64-wrs-vxworks)"
-          cargo +nightly doc --no-deps --no-default-features --document-private-items \
+          cargo +nightly-2026-08-30 doc --no-deps --no-default-features --document-private-items \
             "${cfg[@]}" -Zbuild-std=std,panic_abort --target x86_64-wrs-vxworks \
             -p "$crate" --lib ${feats[@]+"${feats[@]}"} || rc=1
           echo "::endgroup::"

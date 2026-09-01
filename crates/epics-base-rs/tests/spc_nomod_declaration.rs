@@ -37,11 +37,21 @@ use epics_base_rs::server::record::{RecordInstance, dbd_generated};
 
 /// Fields whose no-modify-ness is NOT a static `.dbd` fact and so are exempt
 /// from the equality: `Record::field_no_mod` raises SPC_NOMOD from record state
-/// the way C's `cvt_dbaddr` does (compress `VAL` under `BALG=LIFO`,
-/// `compressRecord.c:404-405`). Those are covered by
-/// `epics-ca-rs/tests/access_rights_spc_nomod.rs`.
+/// the way C's `cvt_dbaddr` does.
+///
+/// * `compress` `VAL` under `BALG=LIFO` (`compressRecord.c:404-405`) — covered
+///   by `epics-ca-rs/tests/access_rights_spc_nomod.rs`.
+/// * `scalcout` PAA..PLL — calc#42 makes the previous-string fields
+///   `special(SPC_NOMOD)`, which the released-C `.dbd` this port mirrors still
+///   ships as `SPC_DBADDR`; the refusal is covered by
+///   `scalcout_snapshots_its_inputs.rs::a_put_into_a_prev_string_is_refused`.
 fn state_raised_nomod(record_type: &str, field: &str) -> bool {
-    matches!((record_type, field), ("compress", "VAL"))
+    matches!(
+        (record_type, field),
+        ("compress", "VAL")
+            | ("scalcout", "PAA" | "PBB" | "PCC" | "PDD" | "PEE" | "PFF")
+            | ("scalcout", "PGG" | "PHH" | "PII" | "PJJ" | "PKK" | "PLL")
+    )
 }
 
 #[test]

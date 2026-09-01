@@ -265,12 +265,24 @@ jobs:
   # red both when a binary is unclassified and when the closure stops
   # compiling.
   #
-  # `nightly` is unpinned for the same trip-wire reason `rtems-closure` gives
-  # — with one extra tooth here: the std-side patch is a clone of the manifest
-  # pin relabelled to whatever libc version the nightly's rust-src lock
-  # demands (`scripts/libc-std-patch.sh`), so version drift is absorbed by
-  # construction; what still fails loudly is a nightly whose std needs libc
-  # API the pinned content lacks — the signal to rebase the fork branch.
+  # `nightly` was unpinned here for the same trip-wire reason `rtems-closure`
+  # gives — a nightly whose std needs libc API the pinned content lacks fails
+  # loudly, the signal to rebase the fork. It is now PINNED to nightly-2026-08-30,
+  # the last nightly before rust-lang/rust#160170 (merged 2026-08-30, first
+  # shipped in nightly-2026-08-31) dropped the `not(target_os = "vxworks")` guard
+  # around `libc::O_NOFOLLOW` in std's `set_perm_nofollow`. VxWorks libc defines
+  # no `O_NOFOLLOW`, so from nightly-2026-08-31 on `-Zbuild-std` cannot compile
+  # std for x86_64-wrs-vxworks at all. Lift the pin (back to floating `nightly`)
+  # once rust-lang/rust#162065 — the std-side fix that returns `Unsupported` on
+  # VxWorks — merges and reaches nightly.
+  #
+  # Two consequences while pinned: the floating trip-wire above no longer fires
+  # in CI, so until the pin is lifted that check lives in a local
+  # `VXWORKS_TOOLCHAIN=nightly ./scripts/vxworks-check.sh` run; and at the pin
+  # itself the closure compiles against stock rust-src libc (`--locked`, no
+  # derived std patch), so the std graph here no longer leans on the fork.
+  # `VXWORKS_TOOLCHAIN` names the same dated nightly for the script, since a
+  # dated toolchain is not the bare `nightly` its patch-derivation keys on.
   vxworks-census:
     runs-on: ubuntu-latest
     timeout-minutes: 45
@@ -279,13 +291,15 @@ jobs:
     - uses: actions/checkout@v4
     - uses: dtolnay/rust-toolchain@master
       with:
-        toolchain: nightly
+        toolchain: nightly-2026-08-30
         components: rust-src
     - uses: Swatinem/rust-cache@v2
       with:
         key: vxworks-census
     - name: Census, then type-check the VxWorks closure
       run: ./scripts/vxworks-check.sh
+      env:
+        VXWORKS_TOOLCHAIN: nightly-2026-08-30
 
   # `linux-rt` swaps `PriorityInheritanceMutex` from the parking_lot fallback
   # onto a real `PTHREAD_PRIO_INHERIT` pthread mutex

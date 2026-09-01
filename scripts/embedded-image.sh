@@ -129,13 +129,21 @@ case "$OS" in
         apply_derived_libc_patch "$TOOLCHAIN"
         ;;
     vxworks)
-        TOOLCHAIN="${VXWORKS_TOOLCHAIN:-nightly}"
+        # Pinned to nightly-2026-08-30, the last nightly before rust#160170
+        # (first in nightly-2026-08-31) dropped the `not(target_os="vxworks")`
+        # guard around `libc::O_NOFOLLOW` in std's `set_perm_nofollow`; VxWorks
+        # libc has no `O_NOFOLLOW`, so `-Zbuild-std` stops compiling std for
+        # x86_64-wrs-vxworks from 08-31 on. Restore the bare `nightly` default
+        # once rust#162065 (the std-side fix) merges and reaches nightly.
+        TOOLCHAIN="${VXWORKS_TOOLCHAIN:-nightly-2026-08-30}"
         TARGET="x86_64-wrs-vxworks"
         if [[ -n "${VXWORKS_CARGO_CONFIG:-}" ]]; then
             ARGS+=(--config "$VXWORKS_CARGO_CONFIG")
-        elif [[ "$TOOLCHAIN" == nightly ]]; then
+        elif [[ "$TOOLCHAIN" == nightly* ]]; then
             # A prepared VXWORKS_TOOLCHAIN bundles its own fixed rust-src and
-            # needs no patch; the stock nightly does.
+            # needs no patch; a stock nightly — bare or a dated
+            # `nightly-YYYY-MM-DD` — does. The glob matches both stock forms
+            # while a prepared toolchain (named otherwise) falls through.
             apply_derived_libc_patch "$TOOLCHAIN"
         fi
         ;;

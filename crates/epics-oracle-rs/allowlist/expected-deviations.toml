@@ -250,6 +250,41 @@ Expect: on ORACLE:ASYN.BOUT the C softIocPVX serves int8[]{80} (zero-filled to
 the OMAX cap) and the port serves int8[]{0} (empty until written).
 """
 
+[[deviation]]
+id = "DESIGN-SCALCOUT-PREV-STRING-SCALAR"
+bucket = "DESIGN-DIVERGENCE"
+upstream = "calc / sCalcoutRecord (epics-modules/calc#42)"
+record_types = ["scalcout"]
+fields = ["PAA", "PBB", "PCC", "PDD", "PEE", "PFF", "PGG", "PHH", "PII", "PJJ", "PKK", "PLL"]
+surface = ["declared_type", "value_marking"]
+why = """
+sCalcoutRecord's cvt_dbaddr, for fieldIndex scalcoutRecordPAA through
+scalcoutRecordPLL, sets no_elements = STRING_SIZE (40) and then UNCONDITIONALLY
+field_type = DBF_STRING, field_size = 1 -- so the released C IOC serves each
+previous-string field as a 40-element DBF_STRING array whose advertised element
+size is one byte (getStringString copies one byte per element and NUL-terminates
+it). That shape is epics-modules/calc#42: the fields hold the previous cycle's
+string inputs AA..LL, one scalar string each, and anjohnson's fix makes them
+plain read-only DBF_STRING scalars -- special(SPC_NOMOD), no
+extra()/special(SPC_DBADDR). The port serves that fixed shape ahead of the
+upstream merge: ScalcoutRecord::prev_str_channel returns a scalar String read to
+the NUL and field_no_mod raises SPC_NOMOD, so pvxinfo declares an NTScalar
+string and pvxget reads the scalar value, where the C side declares and serves a
+40-element string array. This is an intentional design divergence, not a port
+defect. It will vanish the day calc#42 lands in the reference tree, at which
+point the row goes STALE and must be deleted.
+
+Matched on the PVA declared-type (pvxinfo) and value/marking (pvxget) contracts,
+scoped to exactly scalcout PAA..PLL. The two shape contracts are not raised for
+these fields -- the .dbd marks them special(SPC_DBADDR), so NtShape::expected
+declines to predict -- so declared_type and value_marking are the whole surface
+of this deviation.
+
+Expect: on ORACLE:SCALCOUT.PAA..PLL the C softIocPVX declares and serves a
+40-element DBF_STRING array, and the port declares and serves a scalar read-only
+DBF_STRING.
+"""
+
 # --------------------------------------------------------------------------
 # INSTRUMENT-SUPERSET entries: the PVA ground truth (softIocPVX) loads
 # softIocPVX.dbd, a superset of the oracle's measured softIoc.dbd. softIocPVX.dbd
@@ -442,9 +477,12 @@ softIocPVX serving one bare `record(scalcout, "ORACLE:SCALCOUT") {}` aborts it
 with `corrupted size vs. prev_size`, core dumped, 1 of 1 -- but the oracle's own
 read path does NOT trip it, and the row must not claim otherwise. Measured on the
 full `--phase pva-read`: 3468 of 3468 channels measured on both contracts,
-PAA..PLL included, both sides serving the same 40-element string array. Enabled,
-the row would be reported STALE every run and fail it, asserting that a bug pvxs
-has not fixed had gone away.
+PAA..PLL included. The port now serves each as a scalar read-only DBF_STRING
+(calc#42, charged to DESIGN-SCALCOUT-PREV-STRING-SCALAR) while the C side serves
+the 40-element array; this row is only the server_abort contract, on which both
+servers survive when the channels are read one at a time. Enabled, the row would
+be reported STALE every run and fail it, asserting that a bug pvxs has not fixed
+had gone away.
 
 The defect. sCalcoutRecord.c's cvt_dbaddr, for fieldIndex scalcoutRecordPAA
 through scalcoutRecordPLL, sets no_elements = STRING_SIZE (40) and then

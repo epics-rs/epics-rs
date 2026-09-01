@@ -81,10 +81,10 @@ fn num(db: &Db, field: &str) -> f64 {
         .expect("numeric")
 }
 
-/// The channel exactly as a client reads it: one `String` per element.
-fn prev_str(db: &Db, field: &str) -> Vec<String> {
+/// The channel exactly as a client reads it: a read-only scalar `DBF_STRING`.
+fn prev_str(db: &Db, field: &str) -> String {
     match db.get_pv(&format!("SCO.{field}")).expect("prev string") {
-        EpicsValue::StringArray(a) => a.iter().map(|s| s.as_str_lossy().into_owned()).collect(),
+        EpicsValue::String(s) => s.as_str_lossy().into_owned(),
         other => panic!("SCO.{field} is {other:?}"),
     }
 }
@@ -105,51 +105,56 @@ async fn processing_copies_the_numeric_inputs_into_pa_to_pl() {
     assert_eq!(num(&db, "PB"), 3.0);
 }
 
-/// The string half, and the channel shape it is served through.
+/// The string half, served as a read-only scalar `DBF_STRING` (calc#42).
 #[epics_macros_rs::epics_test]
 async fn processing_copies_the_string_inputs_into_paa_to_pll() {
     let db = build().await;
     put(&db, "AA", EpicsValue::String("hi".into())).await;
     process(&db).await;
 
-    let paa = prev_str(&db, "PAA");
-    assert_eq!(paa.len(), 40, "cvt_dbaddr sets no_elements = STRING_SIZE");
-    assert_eq!(&paa[..4], ["h", "i", "", ""], "field_size 1: one byte each");
-    assert!(paa[2..].iter().all(String::is_empty));
+    assert_eq!(
+        prev_str(&db, "PAA"),
+        "hi",
+        "PAA is the previous cycle's AA, a scalar string"
+    );
 }
 
-/// `strNcpy` terminates without clearing, so a shorter value leaves the
-/// previous one's tail in the buffer — and the 40-element channel shows it.
+/// `strNcpy` terminates without clearing the tail, but a scalar `DBF_STRING`
+/// reads only up to the NUL, so a shorter value no longer exposes the previous
+/// one's tail (calc#42 — released C served the raw 40 bytes and did leak it).
 #[epics_macros_rs::epics_test]
-async fn a_shorter_value_leaves_the_previous_tail_visible() {
+async fn a_shorter_value_reads_clean_over_a_longer_predecessor() {
     let db = build().await;
     put(&db, "AA", EpicsValue::String("hello".into())).await;
     process(&db).await;
-    assert_eq!(&prev_str(&db, "PAA")[..6], ["h", "e", "l", "l", "o", ""]);
+    assert_eq!(prev_str(&db, "PAA"), "hello");
 
     put(&db, "AA", EpicsValue::String("hi".into())).await;
     process(&db).await;
     assert_eq!(
-        &prev_str(&db, "PAA")[..6],
-        ["h", "i", "", "l", "o", ""],
-        "bytes 3 and 4 are `hello`'s tail, which strNcpy never cleared"
+        prev_str(&db, "PAA"),
+        "hi",
+        "the NUL after `hi` hides `hello`'s uncleared tail"
     );
 }
 
-/// `putStringString` with `field_size == 1` writes the byte and then the
-/// terminator over that same byte, so a put stores nothing and clears.
+/// PAA..PLL are `special(SPC_NOMOD)` (calc#42): a client `caput` is refused
+/// before it reaches the record, and the snapshot is untouched.
 #[epics_macros_rs::epics_test]
-async fn a_put_into_the_buffer_clears_its_head_and_stores_nothing() {
+async fn a_put_into_a_prev_string_is_refused() {
     let db = build().await;
     put(&db, "AA", EpicsValue::String("hi".into())).await;
     process(&db).await;
 
-    put(&db, "PAA", EpicsValue::String("zz".into())).await;
-    assert_eq!(
-        &prev_str(&db, "PAA")[..3],
-        ["", "i", ""],
-        "byte 0 cleared, nothing of `zz` stored"
+    let err = db
+        .put_record_field_from_ca_no_notify("SCO", "PAA", EpicsValue::String("zz".into()))
+        .await
+        .expect_err("PAA is SPC_NOMOD; the put must be refused");
+    assert!(
+        matches!(err, epics_base_rs::error::CaError::ReadOnlyField(ref f) if f == "PAA"),
+        "expected S_db_noMod (ReadOnlyField), got {err:?}"
     );
+    assert_eq!(prev_str(&db, "PAA"), "hi", "the snapshot is unchanged");
 }
 
 /// The snapshot belongs to every one of the twelve pairs, not just the first.
@@ -160,5 +165,5 @@ async fn the_snapshot_covers_all_twelve_pairs() {
     put(&db, "LL", EpicsValue::String("z".into())).await;
     process(&db).await;
     assert_eq!(num(&db, "PL"), 9.0);
-    assert_eq!(prev_str(&db, "PLL")[0], "z");
+    assert_eq!(prev_str(&db, "PLL"), "z");
 }

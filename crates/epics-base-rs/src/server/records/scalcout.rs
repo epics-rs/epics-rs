@@ -81,10 +81,10 @@ pub struct ScalcoutRecord {
     /// (`sCalcoutRecord.c:345-353`, `strNcpy(*psprev, *pscurr, STRING_SIZE)`).
     ///
     /// Held as the raw 40-byte buffer C allocates in `init_record`
-    /// (`:223-225`) rather than as a `PvString`, because every byte of it is
-    /// observable: `strNcpy` terminates without clearing the tail, and the
-    /// channel reads all forty bytes: `cvt_dbaddr` (`sCalcoutRecord.c:588-596`)
-    /// leaves `field_size` at 1, so it is forty one-character strings.
+    /// (`:223-225`): `strNcpy` terminates without clearing the tail, so the
+    /// bytes past the NUL are the previous value's. The channel over each is a
+    /// read-only scalar `DBF_STRING` (calc#42 — see `prev_str_channel`), which
+    /// reads only up to that NUL.
     pub prev_str_vals: [[u8; PREV_STRING_SIZE]; 12],
     /// PVAL — C `sCalcoutRecord.dbd:60` `field(PVAL,DBF_DOUBLE)`, writable.
     ///
@@ -466,27 +466,20 @@ impl ScalcoutRecord {
         SCALCOUT_PREV_STR_NAMES.iter().position(|&n| n == name)
     }
 
-    /// The CHANNEL a client sees over one PAA..PLL buffer.
+    /// The CHANNEL a client sees over one PAA..PLL buffer: a read-only scalar
+    /// `DBF_STRING`.
     ///
-    /// C `cvt_dbaddr` (`sCalcoutRecord.c:588-596`) sets `no_elements =
-    /// STRING_SIZE`, `field_type = DBF_STRING` and `field_size = 1`, so
-    /// `getStringString` (`dbConvert.c`) copies ONE byte per element and
-    /// NUL-terminates it: the field is forty one-character strings over the
-    /// 40-byte buffer, not one 40-character string. `caget PAA` on a buffer
-    /// holding `hi` prints `40 h i` followed by 38 blanks, and the compiled
-    /// softIoc is what defines that shape.
+    /// Released `sCalcoutRecord` declares PAA..PLL `DBF_NOACCESS`/
+    /// `special(SPC_DBADDR)`, and `cvt_dbaddr` (`sCalcoutRecord.c:588-596`)
+    /// reshapes each into forty one-character `DBF_STRING` elements over the
+    /// 40-byte buffer (`no_elements = STRING_SIZE`, `field_size = 1`), so a
+    /// `caget PAA` on `hi` prints `40 h i …`. That shape is calc#42; the fix
+    /// (anjohnson) makes them plain read-only `DBF_STRING` scalars. This port
+    /// serves the fixed shape ahead of the upstream merge — the buffer read up
+    /// to its NUL — so `caget PAA` on `hi` reads the scalar `hi`.
     fn prev_str_channel(buf: &[u8; PREV_STRING_SIZE]) -> EpicsValue {
-        EpicsValue::StringArray(
-            buf.iter()
-                .map(|&b| {
-                    if b == 0 {
-                        PvString::new()
-                    } else {
-                        PvString::from_bytes(vec![b])
-                    }
-                })
-                .collect(),
-        )
+        let end = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
+        EpicsValue::String(PvString::from_bytes(buf[..end].to_vec()))
     }
 
     /// C `strNcpy` (`sCalcoutRecord.c:146-153`) — copy up to `N-1` source
@@ -589,8 +582,8 @@ const SCALCOUT_PREV_STR_NAMES: [&str; 12] = [
 ];
 
 /// C `sCalcoutRecord.c:198` `#define STRING_SIZE 40` — the width of the
-/// previous-value buffers `init_record` allocates, and the element COUNT
-/// `cvt_dbaddr` puts on their channels.
+/// previous-value buffers `init_record` allocates and the capacity of the
+/// scalar `DBF_STRING` channel served over each (calc#42).
 const PREV_STRING_SIZE: usize = 40;
 
 /// C `sCalcoutRecord.c::fetch_values`' second loop (890-941): INAA..LL → AA..LL.
@@ -1164,23 +1157,10 @@ impl Record for ScalcoutRecord {
                         _ => return Err(CaError::TypeMismatch(name.into())),
                     }
                 }
-                if let Some(idx) = Self::prev_str_index(name) {
-                    // C `putStringString` (`dbConvert.c`) writes each element
-                    // with `strncpy(pdst, psrc, size)` and then
-                    // `pdst[size-1] = 0` — over the SAME byte, because
-                    // `cvt_dbaddr` left `field_size` at 1. A put therefore
-                    // stores nothing and CLEARS the first `nRequest` bytes;
-                    // `get_array_info` is NULL for this record, so the offset
-                    // is always 0 and byte 0 is always among them. The
-                    // compiled softIoc accepts the put and reads back short.
-                    let n = match &value {
-                        EpicsValue::String(_) => 1,
-                        EpicsValue::StringArray(a) => a.len().min(PREV_STRING_SIZE),
-                        _ => return Err(CaError::TypeMismatch(name.into())),
-                    };
-                    self.prev_str_vals[idx][..n].fill(0);
-                    return Ok(());
-                }
+                // PAA..PLL have no put arm: calc#42 makes them
+                // `special(SPC_NOMOD)` (`Self::field_no_mod`), so the framework
+                // read-only gate refuses the client put before it reaches here.
+                // The snapshot itself is the only writer (`snapshot_prev_str`).
                 if let Some(idx) = Self::inp_index(name) {
                     match value {
                         EpicsValue::String(s) => {
@@ -1368,10 +1348,13 @@ impl Record for ScalcoutRecord {
         Vec::new()
     }
 
-    /// C `cvt_dbaddr` (`sCalcoutRecord.c:588-596`) puts `no_elements =
-    /// STRING_SIZE` on PAA..PLL and nothing on any other field.
-    fn dbaddr_capacity(&self, field: &str) -> Option<u32> {
-        Self::prev_str_index(field).map(|_| PREV_STRING_SIZE as u32)
+    /// calc#42: PAA..PLL are read-only (`special(SPC_NOMOD)` in the fixed
+    /// declaration). The released `.dbd` this port mirrors still ships them
+    /// `SPC_DBADDR`, so the static `FieldDesc` cannot carry the bit; the record
+    /// raises it here, and the framework's `is_no_mod` gate refuses every
+    /// client put on the strength of it.
+    fn field_no_mod(&self, field: &str) -> bool {
+        Self::prev_str_index(field).is_some()
     }
 
     fn set_resolved_out_target(&mut self, link_field: &str, target: OutTarget) {

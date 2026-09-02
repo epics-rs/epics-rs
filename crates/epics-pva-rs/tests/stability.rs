@@ -401,6 +401,7 @@ async fn p2_auto_reconnect_after_server_restart() {
     };
     let server1 = PvaServer::start(source.clone(), cfg1).expect("test server must start");
     let tcp = server1.report().tcp_port;
+    let udp = server1.report().udp_port;
     let client = client_for(tcp);
 
     // First GET succeeds.
@@ -426,7 +427,7 @@ async fn p2_auto_reconnect_after_server_restart() {
     let source2 = source.clone();
     let cfg = PvaServerConfig {
         tcp_port: tcp,
-        udp_port: tcp + 1,
+        udp_port: udp,
         idle_timeout: Duration::from_secs(60),
         max_connections: 16,
         max_channels_per_connection: 64,
@@ -438,6 +439,11 @@ async fn p2_auto_reconnect_after_server_restart() {
         server2.report().tcp_port,
         tcp,
         "second server must rebind the exact same port the first one used"
+    );
+    assert_eq!(
+        server2.report().udp_port,
+        udp,
+        "second server must rebind the exact same UDP port too"
     );
     tokio::time::sleep(Duration::from_millis(100)).await;
 

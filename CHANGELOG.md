@@ -1,5 +1,37 @@
 # Changelog
 
+## v0.28.0 — 2026-09-02
+
+Minor release. It gathers the owned RTEMS BSP toolchain script and the
+2026-08-25 C-parity round (PRs #89–#93) into one version. Workspace
+0.27.0 -> 0.28.0; the 18 `[workspace.dependencies]` pins and the
+hand-written `epics-pva-rs` pin in `epics-bridge-rs` move in lockstep.
+
+### An owned RTEMS BSP toolchain
+
+`scripts/rtems-bsp.sh` builds the pinned RTEMS toolchain, kernel and
+libbsd into a BSP prefix and is now required to produce one; the boot
+crate reads its cross target off that prefix, and both RTEMS 6 and 7 are
+built and QEMU-verified.
+
+### C-parity round
+
+State is routed through the owner C gives it: `db_loader` holds one
+`MacroTable` across an include tree, `dbNotify` frees every put-notify
+slot its client abandons, `process` refuses a cycle the record has no
+dset for, device support binds before `init_record`, and `qsrv` runs
+`dbLoadGroup` through the base `macLib` rather than a fork. `scalcout`
+serves PAA..PLL as read-only scalar `DBF_STRING`, and every PUT now
+renders in its destination field's shape.
+
+### Build and platform
+
+The exec backend is selected by `EPICS_RS_BUILD_EXEC_BACKEND` rather
+than a cargo feature. VxWorks `-Zbuild-std` rows are pinned to
+nightly-2026-08-30, the last nightly before rust#160170 dropped std's
+`O_NOFOLLOW` guard; rust#162065 is the std-side fix and the pin lifts
+when it reaches nightly.
+
 ## v0.27.0 — 2026-08-24
 
 Minor release. It lands the 2026-08-23 parallel C-parity round: fifteen

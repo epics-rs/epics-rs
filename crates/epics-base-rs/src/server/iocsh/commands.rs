@@ -5873,6 +5873,15 @@ async fn install_record_defs(
                 install_alias(ctx, alias, &def.name, faults).await;
             }
 
+            // A record created during THIS load — fresh, or a merge whose
+            // original was created during the load — has its whole init deferred
+            // to C's `initDatabase` pass (`drain_deferred_record_inits` at
+            // `iocInit`), so none of the init tail below runs here for it: doing
+            // so would bind the dset against ports not yet configured and out of
+            // C's order. Only a merge into a record created BEFORE the load
+            // (programmatically, already eager-inited) re-inits in place.
+            let init_deferred = ctx.db().record_init_deferred(&def.name);
+
             // A MERGE re-applies the new block's fields to a record that
             // is already in the database and already initialised, so
             // the load-then-init ordering the creation sink guarantees
@@ -5928,47 +5937,43 @@ async fn install_record_defs(
                         }
                     }
                 }
-                // TODO: refactor to global two-pass if inter-record init dependencies arise.
-                // C `iocInit` calls init_record once per record AFTER
-                // all dbLoadRecords blocks, so init_record always
-                // sees the final merged field set. Rust shortcuts by
-                // running init_record inline at dbLoadRecords; on a
-                // merge we re-run it so the new field values
-                // (LINR / ESLO / ZRST / ...) take effect in
-                // convert routines and post-init derived state.
-                // The cost: stateful records (compress accum,
-                // first_output_done) get re-initialised. The
-                // alternative (skip init on merge) silently
-                // ignored field overrides that affect init —
-                // worse for typical use.
-                rec_arc.write().run_init_passes(&def.name);
+                // C `iocInit` calls init_record once per record AFTER all
+                // dbLoadRecords blocks, so init_record always sees the final
+                // merged field set. A merge into a record created during this
+                // load is left for that barrier pass (`init_deferred`); a merge
+                // into a record created BEFORE the load re-runs init in place so
+                // the new field values (LINR / ESLO / ZRST / ...) take effect in
+                // convert routines and post-init derived state. The cost of the
+                // in-place re-run: stateful records (compress accum,
+                // first_output_done) get re-initialised — still better than
+                // silently ignoring field overrides that affect init.
+                if !init_deferred {
+                    rec_arc.write().run_init_passes(&def.name);
+                }
             }
-            {
-                // Hand the record its resolved common link fields so
-                // a link-classifying record (calcout INAV..INUV/OUTV)
-                // runs its C `init_record` checkLinks step at load —
-                // the common OUT link is applied by the sink, after
-                // `set_async_context`. Defaulted no-op for records
-                // that do not classify common links.
-                let mut instance = rec_arc.write();
-                let inst = &mut *instance;
-                inst.record.init_links(&inst.common);
-            }
-            // C `recGblInitConstantLink(&prec->inp, …)` /
-            // `dbLoadLinkArray` from every soft INPUT dev support's
-            // `init_record` — the only site that loads a constant INP
-            // into the record's value.
-            ctx.db().rec_gbl_init_constant_links(&rec_arc);
-            if is_merge {
-                // A merge re-ran `run_init_passes` above against the new
-                // field set, so the rest of pass 1 owes a re-run too: a
-                // second block may have introduced SIML/SIOL or moved SDEL.
-                // A FRESH record takes both from the creation sink
-                // (`PvDatabase::add_loaded_record`) and must not repeat them
-                // here — `arm_watchdog` would spawn a second task and
-                // supersede the first for nothing.
-                ctx.db().rec_gbl_init_simm(&rec_arc);
-                ctx.db().arm_watchdog(&def.name);
+            // C's `init_record` checkLinks (`init_links`) and the constant-INP
+            // seed / `dbLoadLinkArray` (`rec_gbl_init_constant_links`). For a
+            // record whose init is deferred to `iocInit`, the barrier pass owns
+            // both; only an in-place re-init (pre-load record merged into) runs
+            // them here.
+            if !init_deferred {
+                {
+                    let mut instance = rec_arc.write();
+                    let inst = &mut *instance;
+                    inst.record.init_links(&inst.common);
+                }
+                ctx.db().rec_gbl_init_constant_links(&rec_arc);
+                if is_merge {
+                    // A merge re-ran `run_init_passes` above against the new
+                    // field set, so the rest of pass 1 owes a re-run too: a
+                    // second block may have introduced SIML/SIOL or moved SDEL.
+                    // A FRESH record takes both from the creation sink
+                    // (`PvDatabase::add_loaded_record`) and must not repeat them
+                    // here — `arm_watchdog` would spawn a second task and
+                    // supersede the first for nothing.
+                    ctx.db().rec_gbl_init_simm(&rec_arc);
+                    ctx.db().arm_watchdog(&def.name);
+                }
             }
             Ok(())
         }
@@ -12667,6 +12672,10 @@ record(mbboDirect, "MBD0") {{ }}
         ));
 
         ctx.block_on(async {
+            // C runs `init_record` at `iocInit`, not at `dbLoadRecords`, so the
+            // UDF tail this asserts is visible only after the barrier — the
+            // softIoc sequence the doc above cites is `dbLoadRecords` + `iocInit`.
+            db.ioc_init().await;
             let udf = |name: &'static str| {
                 let db = db.clone();
                 async move { db.get_record(name).unwrap().read().common.udf != 0 }

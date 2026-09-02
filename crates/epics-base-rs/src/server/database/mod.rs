@@ -531,6 +531,17 @@ struct PvDatabaseInner {
     /// in `records`, which is what makes "the init observes a registered
     /// record" hold by construction rather than by scheduler timing.
     record_init_waiting: std::sync::Mutex<HashMap<String, Vec<RecordInit>>>,
+    /// Records whose device-support binding and `init_record` passes are OWED
+    /// to [`PvDatabase::ioc_init`] because they were created during the LOAD
+    /// phase — C's `dbLoadRecords` links a record into `pdbbase` at once but
+    /// runs `init_record` only at `iocInit`. [`PvDatabase::add_loaded_record`]
+    /// used to bind the dset and run the passes eagerly at load time, so a
+    /// record whose device-support PORT is configured by a later `st.cmd`
+    /// command (ADCore's `NDTimeSeriesConfigure` builds the `*_TS` port AFTER
+    /// `dbLoadRecords(NDStats.template)`) bound to a missing port and lost its
+    /// device support. Names are pushed in load order and drained once, in that
+    /// order, by `ioc_init`. Empty on every path but a LOAD.
+    deferred_record_inits: std::sync::Mutex<Vec<String>>,
     /// C `plink->text != NULL` for the one case the port's link storage cannot
     /// tell apart on its own: a link field the `.db` assigned the EMPTY string.
     ///
@@ -1066,6 +1077,7 @@ impl PvDatabase {
                 registration_mutex: crate::runtime::sync::PriorityInheritanceMutex::new(()),
                 init_phase: std::sync::Mutex::new(DbInitPhase::Unloaded),
                 record_init_waiting: std::sync::Mutex::new(HashMap::new()),
+                deferred_record_inits: std::sync::Mutex::new(Vec::new()),
                 empty_link_assignments: std::sync::Mutex::new(HashMap::new()),
                 after_ioc_running: std::sync::Mutex::new(Vec::new()),
                 scan_started: std::sync::atomic::AtomicBool::new(false),
@@ -2212,6 +2224,15 @@ impl PvDatabase {
         // barrier is the one point every bring-up path crosses: the
         // `IocApplication` walk and `CaServer::run` both reach it, and only
         // one of them runs that lifecycle.
+        // C's `initDatabase` per-record init pass — bind each LOAD-deferred
+        // record's dset and run its `init_record`. The build lifecycle drains
+        // this explicitly BEFORE `setup_io_intr` (C's `scanInit`), so a record's
+        // dset is bound before I/O Intr wiring reads it; this call is the
+        // catch-all for a path that reaches the barrier directly (a unit test, a
+        // bare shell). Idempotent — the list is empty once drained. Before
+        // `ca_link_init` to keep the order the eager path had, where the init
+        // passes ran at load, ahead of the link worker.
+        self.drain_deferred_record_inits();
         self.ca_link_init();
         // C's `dbInitRecordLinks`: every link is typed, checked and opened at
         // `iocInit`, not at `dbLoadRecords`. That is where a `{state:"NAME"}`
@@ -2275,20 +2296,23 @@ impl PvDatabase {
     /// `lnkState_open` (`lnkState.c:110-116`) is `dbStateCreate`, find-or-create
     /// (`dbState.c:50-66`), and it is not called at all.
     ///
-    /// C runs this pass BEFORE `init_record`; this port still runs the init
-    /// passes in [`Self::add_loaded_record`], and that ordering IS observable.
-    /// Measured against softIoc R7.0.10 on
+    /// C runs this pass BEFORE `init_record`; this port runs the init passes
+    /// first — at load for a programmatic / `dbCreateRecord` record, and at the
+    /// barrier just above (`init_deferred_record` draining
+    /// `deferred_record_inits`) for a record loaded during the LOAD phase — so
+    /// the port's order is still init-then-link, and that ordering IS
+    /// observable. Measured against softIoc R7.0.10 on
     /// `record(calcout,"X"){field(INPA,"@instio p") field(OUT,"@instio q")}`:
     /// C reads `INAV`/`OUTV` as `Constant`, this port read `Ext PV NC`, because
-    /// calcout had classified both at load from text this pass then replaced.
+    /// calcout had classified both at init from text this pass then replaced.
     /// A record's cached link status is therefore re-derived where the text
     /// changes (see [`Self::set_link_text`]) and once per record at the end of
     /// the loop, which is the same seam a runtime re-point uses. What is NOT
-    /// closed is `init_record` itself: device support still reads the refused
-    /// text where C's reads the emptied link. That needs the init passes moved
-    /// to this barrier, which the two load callers that run the pass tail
-    /// (`iocsh::commands`' `dbLoadRecords` and `IocBuilder`) would have to
-    /// follow.
+    /// closed is the ORDER of the two passes: device support reads the refused
+    /// text at `init_record` where C reads the emptied link, because this pass
+    /// runs after the deferred-init drain rather than before it. Closing it
+    /// means running this pass ahead of that drain, a reordering the eager
+    /// (`IocBuilder`, non-LOAD `dbLoadRecords`) callers would have to follow too.
     async fn db_init_record_links(&self) {
         use crate::runtime::log::ERL_ERROR;
         use crate::server::record::{
@@ -2687,29 +2711,46 @@ impl PvDatabase {
         // — `ao`'s `prec->init = TRUE`, `sub`'s MLST/ALST/LALM seed and `ai`'s
         // are all BELOW that test, and running the passes first is what made
         // them reachable for a record C refuses.
-        crate::server::ioc_app::attach_device_support(
-            &mut instance,
-            name,
-            self.inner.device_support_resolver.load().as_deref(),
-        );
-        // C `registryFunctionFind` reads a process-global registry from inside
-        // `init_record` pass 1, so the record is handed the registry rather
-        // than resolved against it from out here: the lookup's failure is an
-        // early return that the init tail must not run past, and only the init
-        // owner can honour that.
-        instance.arm_init_subroutines(self.inner.subroutine_registry.load_full());
-        instance.run_init_passes(name);
+        //
+        // During the LOAD phase this whole span is OWED to `iocInit` instead:
+        // C links a record into `pdbbase` at `dbLoadRecords` but runs
+        // `init_record` at `iocInit`, and binding the dset eagerly here bound
+        // it against whatever device-support ports existed when the `.db` was
+        // parsed — wrong for a record whose port a later `st.cmd` command
+        // configures (ADCore's `NDTimeSeriesConfigure` builds the `*_TS` port
+        // AFTER `dbLoadRecords(NDStats.template)`). The record is still
+        // published below so a name check, an alias and `dbInitRecordLinks` all
+        // see it; only its device-support binding and passes wait for the
+        // barrier's drain of `deferred_record_inits`. Outside the LOAD phase —
+        // programmatic creation, `dbCreateRecord` after `iocInit` — there is no
+        // barrier to defer to, so the record is initialised in place, as before.
+        let defer = self.is_load_deferring();
+        if !defer {
+            crate::server::ioc_app::attach_device_support(
+                &mut instance,
+                name,
+                self.inner.device_support_resolver.load().as_deref(),
+            );
+            // C `registryFunctionFind` reads a process-global registry from
+            // inside `init_record` pass 1, so the record is handed the registry
+            // rather than resolved against it from out here: the lookup's
+            // failure is an early return that the init tail must not run past,
+            // and only the init owner can honour that.
+            instance.arm_init_subroutines(self.inner.subroutine_registry.load_full());
+            instance.run_init_passes(name);
 
-        // The init-seed owner: every CONSTANT link the record declares
-        // (`Record::constant_init_links`) is loaded into its value field ONCE,
-        // here — a constant delivers NOTHING at process time
-        // (`dbConstLink.c:219-225`). `add_record` is the creation sink every
-        // path funnels through, so this covers a record built programmatically
-        // as well as one loaded from a .db; `IocBuilder`/`dbLoadRecords` call
-        // the owner again after `init_record(1)`, once the record's final
-        // NELM/FTVL buffer exists for an array constant to land in. Seeding
-        // twice is a no-op — both run before any client put.
-        super::database::processing::seed_constant_links(&mut instance);
+            // The init-seed owner: every CONSTANT link the record declares
+            // (`Record::constant_init_links`) is loaded into its value field
+            // ONCE, here — a constant delivers NOTHING at process time
+            // (`dbConstLink.c:219-225`). `add_record` is the creation sink every
+            // path funnels through, so this covers a record built
+            // programmatically as well as one loaded from a .db;
+            // `IocBuilder`/`dbLoadRecords` call the owner again after
+            // `init_record(1)`, once the record's final NELM/FTVL buffer exists
+            // for an array constant to land in. Seeding twice is a no-op — both
+            // run before any client put.
+            super::database::processing::seed_constant_links(&mut instance);
+        }
 
         let scan = instance.common.scan;
         let phas = instance.common.phas;
@@ -2725,7 +2766,8 @@ impl PvDatabase {
         self.release_record_inits(name);
 
         // Assign a monotonic load-order sequence — the scan-index
-        // secondary sort key, so same-PHAS records keep load order.
+        // secondary sort key, so same-PHAS records keep load order. Assigned in
+        // both arms at load time so the deferred drain preserves load order.
         let seq = self
             .inner
             .load_order_counter
@@ -2733,6 +2775,18 @@ impl PvDatabase {
         self.inner.load_order.update(|m| {
             m.insert(name.to_string(), seq);
         });
+
+        if defer {
+            // The dset binding, init passes, scan-index insert and the
+            // `recGblInitSimm`/`wdogInit` tail are all owed to `ioc_init`; the
+            // record is published (above) so the barrier finds it by name.
+            self.inner
+                .deferred_record_inits
+                .lock()
+                .unwrap()
+                .push(name.to_string());
+            return Ok(());
+        }
 
         self.add_to_scan_list(scan, phas, record_type, seq, name);
 
@@ -2761,6 +2815,106 @@ impl PvDatabase {
         self.rec_gbl_init_simm(&rec_arc);
         self.arm_watchdog(name);
         Ok(())
+    }
+
+    /// Is the database in its LOAD phase, where a new record is published but
+    /// its device-support binding and `init_record` passes are deferred to
+    /// [`Self::ioc_init`]? See [`Self::add_loaded_record`] and
+    /// [`Self::init_deferred_record`].
+    fn is_load_deferring(&self) -> bool {
+        matches!(
+            *self.inner.init_phase.lock().unwrap(),
+            DbInitPhase::Loading(_)
+        )
+    }
+
+    /// Run every record's OWED init — C's `initDatabase` per-record pass — for
+    /// the records the LOAD phase deferred. The list is drained (`mem::take`),
+    /// so a second call is a no-op: the build lifecycle calls this BEFORE
+    /// `setup_io_intr`, and [`Self::ioc_init`] calls it again as a catch-all.
+    /// Load order is preserved because the list was pushed in load order.
+    pub(crate) fn drain_deferred_record_inits(&self) {
+        let owed = std::mem::take(&mut *self.inner.deferred_record_inits.lock().unwrap());
+        for name in owed {
+            self.init_deferred_record(&name);
+        }
+    }
+
+    /// Is `name` still awaiting its deferred init — created during the LOAD
+    /// phase and not yet drained by [`Self::drain_deferred_record_inits`]? The
+    /// merge arm of the iocsh loader uses this to tell a record it must init in
+    /// place (created before the load, already live) from one the barrier will
+    /// init against the final merged fields.
+    pub(crate) fn record_init_deferred(&self, name: &str) -> bool {
+        self.inner
+            .deferred_record_inits
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|n| n == name)
+    }
+
+    /// Run the OWED init half of [`Self::add_loaded_record`] for a record whose
+    /// creation was deferred to `iocInit` (the LOAD-phase arm). The record is
+    /// already published, its `.db` load applied and its load-order sequence
+    /// assigned; what runs here is C's `doInitRecord0`/`init_record` half —
+    /// bind the dset, arm subroutines, run the passes, seed constant links —
+    /// then the scan-index insert, the `recGblInitSimm`/`wdogInit` tail, and
+    /// the checkLinks / constant-INP seed the two loaders used to run right
+    /// after `add_loaded_record`. All in the same order the eager path ran them
+    /// across `add_loaded_record` and its caller.
+    ///
+    /// No registration gate is taken: the barrier drains this list from a
+    /// single synchronous loop with no `.await`, so no other creation
+    /// interleaves, and the gate's only job is to serialize concurrent
+    /// creation. Holding the record's write lock across the passes is safe —
+    /// no `init_record` path re-enters the records map for its own record
+    /// (the map-reading async-handle calls live only in processing/reentry).
+    /// `recGblInitSimm` reaches `update_scan_index`, which takes the gate
+    /// itself, so it runs after the write lock is dropped, exactly as the eager
+    /// arm runs it after its `drop(gate)`.
+    fn init_deferred_record(&self, name: &str) {
+        let Some(rec_arc) = self.get_record(name) else {
+            return;
+        };
+        let (scan, phas, record_type) = {
+            let mut guard = rec_arc.write();
+            let instance = &mut *guard;
+            crate::server::ioc_app::attach_device_support(
+                instance,
+                name,
+                self.inner.device_support_resolver.load().as_deref(),
+            );
+            instance.arm_init_subroutines(self.inner.subroutine_registry.load_full());
+            instance.run_init_passes(name);
+            super::database::processing::seed_constant_links(instance);
+            (
+                instance.common.scan,
+                instance.common.phas,
+                instance.record.record_type(),
+            )
+        };
+        let seq = self
+            .inner
+            .load_order
+            .load()
+            .get(name)
+            .copied()
+            .unwrap_or(u64::MAX);
+        self.add_to_scan_list(scan, phas, record_type, seq, name);
+        self.rec_gbl_init_simm(&rec_arc);
+        self.arm_watchdog(name);
+        // The tail both loaders ran right after `add_loaded_record`: C's
+        // `init_record` checkLinks (`init_links`), then the constant-INP seed /
+        // `dbLoadLinkArray` (`rec_gbl_init_constant_links`). For a deferred
+        // record they belong here, after the passes, in the eager path's order —
+        // the loaders no longer run them for a record the barrier owns.
+        {
+            let mut guard = rec_arc.write();
+            let inst = &mut *guard;
+            inst.record.init_links(&inst.common);
+        }
+        self.rec_gbl_init_constant_links(&rec_arc);
     }
 
     /// Verify that `name` is not currently registered in any of the

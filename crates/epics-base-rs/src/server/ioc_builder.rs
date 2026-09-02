@@ -433,33 +433,12 @@ impl IocBuilder {
                 }
             }
 
-            // Device support and the post-init owners for the RecordInstance
-            if let Some(rec_arc) = db.get_record(&def.name) {
-                // Hand the record its resolved common link fields so a
-                // link-classifying record (calcout INAV..INUV/OUTV) can run
-                // its C `init_record` checkLinks step now — the common OUT
-                // link is set above, after `set_async_context` already ran at
-                // `add_record`. Defaulted no-op for records that do not
-                // classify common links. The data guard is released at each
-                // block close before the init awaits below (parking_lot guards
-                // are `!Send`).
-                {
-                    let mut instance = rec_arc.write();
-                    let inst = &mut *instance;
-                    inst.record.init_links(&inst.common);
-                }
-                // C: a soft-channel INPUT dev support's `init_record` loads a
-                // CONSTANT INP into the record's value
-                // (`recGblInitConstantLink` / `dbLoadLinkArray`) — and it runs
-                // BEFORE the record seeds MLST/ALST/LALM from VAL (e.g.
-                // `aiRecord.c:115-129`: `pdset->common.init_record` first, then
-                // `prec->mlst = prec->val`). The owner ENDS in C's init tail —
-                // `init_record_tail` then `seed_deadband_tracking`, in that
-                // order — so running it here is what puts the tail after the
-                // constant load, and nothing outside the owner may run either
-                // half.
-                db.rec_gbl_init_constant_links(&rec_arc);
-            }
+            // The per-record init tail — `init_links` (checkLinks) and
+            // `rec_gbl_init_constant_links` (the constant-INP seed) — is not run
+            // here any more: `add_loaded_record` deferred this record's whole
+            // init to C's `initDatabase` pass, which `drain_deferred_record_inits`
+            // below runs once every record has loaded and every device-support
+            // port has been configured.
         }
 
         // File-scope `alias("record","new")` that no single `.db` could
@@ -495,6 +474,13 @@ impl IocBuilder {
                 eprintln!("autosave: restored {count} PVs");
             }
         }
+
+        // 4.5. C's `initDatabase` per-record pass: bind each record's dset and
+        // run its `init_record` now that every record has loaded — deferred from
+        // load time so a record's device-support port could be configured first.
+        // Before `setup_io_intr` (C's `scanInit`), so a dset is bound before I/O
+        // Intr wiring reads it.
+        db.drain_deferred_record_inits();
 
         // 5. I/O Intr setup — through the single owner shared with the
         // `IocApplication` iocInit path, so C `scanAdd`'s failure exits

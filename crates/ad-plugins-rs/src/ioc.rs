@@ -806,6 +806,21 @@ pub fn register_all_plugins(mut app: IocApplication, mgr: &Arc<PluginManager>) -
         ));
     }
 
+    // ad-core-rs's own templates use these record types — NDArrayBase (so
+    // every plugin) declares `busy` fields, NDStats/NDProcess `sseq` ones —
+    // the way every C ADCore IOC links busySupport.dbd and calcSupport.dbd
+    // through commonDriverMakefile:303-310. Both were dropped from the default
+    // registry with the stdRecords.dbd manifest, so any IOC that registers
+    // these plugins has to bring them back; registering here means every
+    // caller of `register_all_plugins` gets them, not just `AdIoc`. A later
+    // `register_record_type` call with the same name still overrides.
+    app = app.register_record_type("busy", || {
+        Box::new(epics_base_rs::server::records::busy::BusyRecord::default())
+    });
+    app = app.register_record_type("sseq", || {
+        Box::new(epics_base_rs::server::records::sseq::SseqRecord::default())
+    });
+
     app
 }
 
@@ -964,19 +979,9 @@ impl AdIoc {
         // creates its port and sets the EOS before `iocInit`.
         app = asyn_rs::iocsh::register_asyn_commands(app, ports.clone());
 
-        // ad-core-rs's own templates use these record types — NDArrayBase
-        // (so every plugin) declares `busy` fields, NDStats/NDProcess `sseq`
-        // ones — the way every C ADCore IOC links busySupport.dbd and
-        // calcSupport.dbd through commonDriverMakefile:303-310. Both were
-        // dropped from the default registry with the stdRecords.dbd
-        // manifest, so an AdIoc has to bring them back itself; a later
-        // `register_record_type` call with the same name still overrides.
-        app = app.register_record_type("busy", || {
-            Box::new(epics_base_rs::server::records::busy::BusyRecord::default())
-        });
-        app = app.register_record_type("sseq", || {
-            Box::new(epics_base_rs::server::records::sseq::SseqRecord::default())
-        });
+        // `busy` and `sseq` — the record types every AD plugin's templates
+        // need — are registered inside `register_all_plugins` above, so an
+        // `AdIoc` picks them up along that path.
 
         Self {
             app: Some(app),

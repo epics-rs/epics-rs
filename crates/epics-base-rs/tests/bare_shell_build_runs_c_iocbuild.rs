@@ -106,7 +106,7 @@ fn run(script_body: &str) -> (String, String) {
 fn assert_banner(lines: &[&str], out: &str) {
     assert_eq!(lines.len(), 5, "stdout was {out:?}");
     assert!(lines[0].starts_with("###"), "stdout was {out:?}");
-    assert!(lines[1].starts_with("## EPICS"), "stdout was {out:?}");
+    assert!(lines[1].starts_with("## epics-rs"), "stdout was {out:?}");
     assert!(lines[2].starts_with("## Rev. "), "stdout was {out:?}");
     assert!(lines[3].starts_with("## Rev. Date "), "stdout was {out:?}");
     assert!(lines[4].starts_with("###"), "stdout was {out:?}");

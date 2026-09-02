@@ -168,9 +168,17 @@ fn cmd_core_release() -> CommandDef {
 /// `printf` does.
 pub(crate) fn core_release_block() -> [String; 5] {
     let rule = "#".repeat(76);
+    // epics-rs brands its own name where C prints "EPICS R…"
+    // (`epicsReleaseVersion`, mirrored verbatim by EPICS_RELEASE_VERSION). The
+    // base-compat release token rides along unchanged so the line still names
+    // the EPICS Base level this tree tracks; the `-V` string
+    // (EPICS_VERSION_STRING) stays byte-identical to C for tool parity.
+    let release = crate::runtime::version::EPICS_RELEASE_VERSION
+        .strip_prefix("EPICS ")
+        .unwrap_or(crate::runtime::version::EPICS_RELEASE_VERSION);
     [
         rule.clone(),
-        format!("## {}", crate::runtime::version::EPICS_RELEASE_VERSION),
+        format!("## epics-rs {release}"),
         format!("## Rev. {VCS_VERSION}"),
         format!("## Rev. Date {VCS_VERSION_DATE}"),
         rule,
@@ -394,9 +402,13 @@ mod tests {
         assert_eq!(lines.len(), 5, "C prints five lines: {out:?}");
         assert_eq!(lines[0], "#".repeat(76));
         assert_eq!(lines[4], "#".repeat(76));
-        assert_eq!(
-            lines[1],
-            format!("## {}", crate::runtime::version::EPICS_RELEASE_VERSION)
+        let release = crate::runtime::version::EPICS_RELEASE_VERSION
+            .strip_prefix("EPICS ")
+            .expect("EPICS_RELEASE_VERSION mirrors C's \"EPICS R…\"");
+        assert_eq!(lines[1], format!("## epics-rs {release}"));
+        assert!(
+            !lines[1].contains("EPICS"),
+            "banner brands epics-rs, not EPICS: {out:?}"
         );
         assert_eq!(lines[2], format!("## Rev. {VCS_VERSION}"));
         assert_eq!(lines[3], format!("## Rev. Date {VCS_VERSION_DATE}"));

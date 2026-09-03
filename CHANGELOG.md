@@ -11,7 +11,10 @@ init likewise defers to the `iocInit` barrier, and the busy/sseq
 plugins register through `register_all_plugins`. The `coreRelease`
 banner is branded epics-rs without the base-version line, and the
 modbus example loads `modbus.db` via `$(MODBUS_IOC)` so `st.cmd` no
-longer depends on the launch directory.
+longer depends on the launch directory. The CA server's record-field
+snapshot reads now take the record's `dbScanLock` analogue, so an
+initial subscription event can no longer capture a concurrent put's
+new value beside its pre-put timestamp.
 
 ## v0.28.0 — 2026-09-02
 

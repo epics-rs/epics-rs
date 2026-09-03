@@ -28,6 +28,7 @@ pub mod epics_string;
 pub mod exit;
 pub mod fs;
 pub mod general_time;
+pub mod interrupt_accept;
 pub mod ioc_role;
 pub mod json_string;
 pub mod log;

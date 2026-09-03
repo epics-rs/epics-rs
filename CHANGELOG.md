@@ -1,5 +1,18 @@
 # Changelog
 
+## v0.28.1 — 2026-09-03
+
+Patch release. areaDetector read-only RBVs (`MaxSizeX`/`MaxSizeY`,
+`Manufacturer`, `Model`) now reach CA clients: `call_param_callbacks`
+is gated on `interruptAccept`, so the changed-flags a driver sets
+before `iocInit` are held rather than cleared, and the scan facility's
+false->true edge flushes every port once records are wired. Record
+init likewise defers to the `iocInit` barrier, and the busy/sseq
+plugins register through `register_all_plugins`. The `coreRelease`
+banner is branded epics-rs without the base-version line, and the
+modbus example loads `modbus.db` via `$(MODBUS_IOC)` so `st.cmd` no
+longer depends on the launch directory.
+
 ## v0.28.0 — 2026-09-02
 
 Minor release. It gathers the owned RTEMS BSP toolchain script and the

@@ -34,6 +34,13 @@ use epics_base_rs::types::EpicsValue;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn acquire_bo_returns_to_zero_after_single() {
+    // The acquire-finalize monitor that drives the bo back to Done posts through
+    // `call_param_callbacks`, which is gated on `interruptAccept` — a real IOC
+    // opens it at the `iocInit`/`scan_run` barrier. This test wires the record
+    // and acquisition path by hand with no scan facility, so it must establish
+    // that post-`iocInit` precondition itself.
+    epics_base_rs::runtime::interrupt_accept::set_interrupts_accepted(true);
+
     let rt = create_sim_detector("RBK_TEST", 32, 32, 10_000_000, NDArrayOutput::new()).unwrap();
     let handle = rt.port_handle().clone();
 

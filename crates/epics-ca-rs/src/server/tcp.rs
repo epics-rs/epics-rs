@@ -5061,6 +5061,35 @@ impl PendingWriteNotify {
     }
 }
 
+/// Read a record-field snapshot under the record's `dbScanLock` analogue — the
+/// per-record advisory gate (L1, [`PvDatabase::lock_record`]).
+///
+/// `dbPutField` commits the field's VAL under the record's `parking_lot` write
+/// lock, RELEASES it, and re-acquires a second write lock in the process cycle
+/// that stamps `TIME` (`field_io.rs` drops the put guard before
+/// `put_driven_process` re-locks). Only L1 — held by `acquire_put_gate` across
+/// the whole put+process — spans both. A snapshot that takes only the record's
+/// `RwLock` reads VAL and TIME atomically w.r.t. each other but NOT w.r.t. the
+/// put: landing in that gap it captures the put's new VAL with the pre-put
+/// TIME. C cannot produce that pair — `db_post_single_event` (the monitor
+/// initial event) and `dbGet` both run under `dbScanLock` — so it observes the
+/// pre-put or the post-process state and never the mix. Taking L1 here restores
+/// that serialisation for every record-field snapshot read the CA server does
+/// off the live record (initial monitor event, one-shot GET, access re-post);
+/// the steady-state monitor stream is unaffected, since those frames are posted
+/// by the process cycle itself, already under L1. The guard is `!Send` and
+/// dropped before return — the read is fully synchronous.
+fn record_field_snapshot_scan_locked(
+    db: &PvDatabase,
+    record: &Arc<parking_lot::RwLock<RecordInstance>>,
+    field: &str,
+    string_view: bool,
+) -> Option<epics_base_rs::server::snapshot::Snapshot> {
+    let name = record.read().name.clone();
+    let _scan_lock = db.lock_record(&name);
+    db.channel_snapshot_for_field(record, field, string_view)
+}
+
 fn get_full_snapshot(
     db: &PvDatabase,
     target: &ChannelTarget,
@@ -5081,7 +5110,7 @@ fn get_full_snapshot(
         // gate already ran at CREATE_CHANNEL (CREATE_CH_FAIL, this file's
         // `parse_channel_name` call site).
         ChannelTarget::RecordField { record, field } => {
-            db.channel_snapshot_for_field(record, field, false)
+            record_field_snapshot_scan_locked(db, record, field, false)
         }
     }
 }
@@ -5106,7 +5135,7 @@ async fn get_read_snapshot(
     match target {
         ChannelTarget::SimplePv(pv) => pv.read_snapshot().await.map(Some),
         ChannelTarget::RecordField { record, field } => {
-            Ok(db.channel_snapshot_for_field(record, field, false))
+            Ok(record_field_snapshot_scan_locked(db, record, field, false))
         }
     }
 }
@@ -5679,7 +5708,8 @@ pub(crate) async fn register_subscription(
                 // and points this way: C `event_add_action` registers first and
                 // posts second (`camessage.c:1853`), so a duplicate is the
                 // C-compatible direction and a drop is not.
-                let hoisted_snap = state.db.channel_snapshot_for_field(record, field, false);
+                let hoisted_snap =
+                    record_field_snapshot_scan_locked(&state.db, record, field, false);
                 let registered = 'registered: {
                     let mut instance = record.write();
                     let Some(rx) = instance.add_subscriber_on(
@@ -6556,7 +6586,7 @@ fn try_get_read_snapshot_local(
 ) -> Option<Option<epics_base_rs::server::snapshot::Snapshot>> {
     match target {
         ChannelTarget::RecordField { record, field } => {
-            Some(db.channel_snapshot_for_field(record, field, false))
+            Some(record_field_snapshot_scan_locked(db, record, field, false))
         }
         // `read_snapshot_local` is `None` exactly when a read hook is
         // installed — the async upstream-GET signal — so it maps straight to
@@ -12476,5 +12506,105 @@ mod cancel_confirmation_ordering_tests {
 
         drop(client);
         handle.abort();
+    }
+}
+
+#[cfg(test)]
+mod snapshot_scan_lock_tests {
+    //! The CA server's record-field snapshot reads (initial monitor event,
+    //! one-shot GET, access re-post) serialise against `dbPutField` through the
+    //! record's `dbScanLock` analogue (L1), exactly as C's `dbGet`/
+    //! `db_post_single_event` do — so a snapshot can never capture a put's new
+    //! VAL beside the pre-put TIME.
+
+    use super::record_field_snapshot_scan_locked;
+    use epics_base_rs::server::database::PvDatabase;
+    use epics_base_rs::server::records::ai::AiRecord;
+    use epics_base_rs::types::EpicsValue;
+    use std::sync::{Arc, Barrier};
+    use std::time::{Duration, SystemTime};
+
+    /// A put commits VAL under one record write-lock and stamps TIME under a
+    /// SECOND — `put_record_field_from_ca_body` drops the put guard between them
+    /// (`field_io.rs`), and only L1, held across the whole put+process by
+    /// `acquire_put_gate`, spans both. A snapshot that took only the record's
+    /// `RwLock` reads VAL and TIME atomically w.r.t. each other but not w.r.t.
+    /// the put: landing in that gap it captures the new VAL with the stale TIME
+    /// — the torn `(newVAL, oldTIME)` initial subscription event this fix
+    /// closes. The reader below is released the instant the writer has committed
+    /// the new VAL under L1 but not yet stamped TIME; taking L1,
+    /// `record_field_snapshot_scan_locked` must block behind the whole put and
+    /// so observe the post-stamp `(newVAL, newTIME)`, never the tear. Without
+    /// the L1 acquisition it reads straight through the open window and the
+    /// timestamp assertion fails.
+    #[epics_macros_rs::epics_test]
+    async fn initial_snapshot_never_tears_val_from_time_across_a_put() {
+        let db = Arc::new(PvDatabase::new());
+        db.add_record("SCAN:ai", Box::new(AiRecord::new(1.0)))
+            .await
+            .unwrap();
+        let rec = db.get_record("SCAN:ai").expect("record");
+
+        // Capture how the snapshot renders each of the two stamps, so the
+        // assertion names the exact `WallTime` a torn read could not produce —
+        // independent of whatever `set_val` does to `common.time`.
+        let t0 = SystemTime::UNIX_EPOCH + Duration::new(1_000, 0);
+        let t1 = SystemTime::UNIX_EPOCH + Duration::new(2_000, 0);
+        let stamp = |t: SystemTime| {
+            rec.write().common.time = t;
+            record_field_snapshot_scan_locked(&db, &rec, "VAL", false)
+                .expect("snapshot")
+                .timestamp
+        };
+        let stale_ts = stamp(t0);
+        let fresh_ts = stamp(t1);
+        assert_ne!(stale_ts, fresh_ts, "the two stamps must render differently");
+
+        // Pre-race state: old VAL, old TIME.
+        {
+            let mut inst = rec.write();
+            inst.record.set_val(EpicsValue::Double(1.0)).unwrap();
+            inst.common.time = t0;
+        }
+
+        let barrier = Arc::new(Barrier::new(2));
+        let writer = {
+            let db = db.clone();
+            let rec = rec.clone();
+            let barrier = barrier.clone();
+            std::thread::spawn(move || {
+                // L1 spans lock A .. lock B, as `acquire_put_gate` does.
+                let _l1 = db.lock_record("SCAN:ai");
+                {
+                    // lock A: VAL only.
+                    rec.write().record.set_val(EpicsValue::Double(2.0)).unwrap();
+                }
+                // New VAL committed, TIME still t0, L1 held: open the window.
+                barrier.wait();
+                // Widen it so an L1-less reader would certainly land inside.
+                std::thread::sleep(Duration::from_millis(100));
+                {
+                    // lock B: TIME stamp, closing the put.
+                    rec.write().common.time = t1;
+                }
+                // _l1 dropped here.
+            })
+        };
+
+        barrier.wait();
+        let snap =
+            record_field_snapshot_scan_locked(&db, &rec, "VAL", false).expect("raced snapshot");
+        writer.join().expect("writer thread");
+
+        assert_eq!(
+            snap.value,
+            EpicsValue::Double(2.0),
+            "the put's new VAL is visible"
+        );
+        assert_eq!(
+            snap.timestamp, fresh_ts,
+            "the snapshot must carry the put's stamped TIME, not the pre-put one \
+             — L1 serialises the read behind the whole put+process"
+        );
     }
 }

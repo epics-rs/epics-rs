@@ -4878,6 +4878,11 @@ mod tests {
         // must still post their monitors after a poll, because `publish_stats`
         // is independent of the per-record interrupt fan-out.
         let mut rx = driver.base.interrupts.subscribe_async();
+        // `publish_stats` posts through `call_param_callbacks`, which is gated on
+        // `interruptAccept` — a real IOC opens it at the `iocInit`/`scan_run`
+        // barrier. This unit test drives `poll_cycle` with no scan facility, so
+        // it must establish that post-`iocInit` precondition itself.
+        epics_base_rs::runtime::interrupt_accept::set_interrupts_accepted(true);
         driver.poll_cycle().expect("poll_cycle must succeed");
 
         // The statistics params live at addr 0; their monitors must have

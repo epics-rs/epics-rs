@@ -1135,7 +1135,7 @@ pub(crate) fn build_refusal() -> String {
 /// returned, leaving `iocState` at [`IocState::Void`], which is why a
 /// measured `iocBuild`/`iocRun` pair answered `iocRun: WARNING IOC not
 /// paused` where C answers `iocRun: All initialization complete`, why a
-/// second `iocBuild` was accepted where C refuses it, and why the five-line
+/// second `iocBuild` was accepted where C refuses it, and why the
 /// `coreRelease` banner C puts between the two command echoes was missing
 /// from stdout.
 ///
@@ -1428,17 +1428,22 @@ impl IocBuild {
         // (autosave pass 0) → initDatabase() (per-record init_record, where
         // devMotorAsyn's init_controller runs).
         //
-        // Both halves of C's `initDatabase` — the dset bind and the driver's
-        // own `init_record` — now run at the record's creation, from the
-        // database's own init owner, because C binds the dset BEFORE
-        // `init_record(0)` and a whole-database pass here could only bind it
-        // after. A pass0-restored field still lands as a plain pre-init field
-        // write (C dbPut before init_record) for the reason it always did:
-        // this hook fires before the startup script's `iocInit` line, and the
-        // records it restores were loaded before that. What changed is that
-        // `DeviceSupport::init` no longer waits for this point to anchor the
-        // command state such a write armed.
+        // C's `initDatabase` runs HERE, as a whole-database pass that binds each
+        // record's dset and only then runs its `init_record`
+        // (`drain_deferred_record_inits` → per record `attach_device_support`
+        // ahead of `run_init_passes`). The record was published at
+        // `dbLoadRecords` but its init deferred to this point, because a
+        // record's device-support PORT can be configured by a startup command
+        // AFTER the `dbLoadRecords` that created it (ADCore's
+        // `NDTimeSeriesConfigure` builds the `*_TS` port), so binding the dset
+        // at load would bind it against a port that does not exist yet. The
+        // pass runs before `setup_io_intr` (C's `scanInit`) so a dset is bound
+        // before I/O Intr wiring reads it. A pass0-restored field still lands as
+        // a plain pre-init field write (C dbPut before init_record): this hook
+        // fires before the startup script's `iocInit` line, and the records it
+        // restores were loaded before that.
         announce!(InitHookState::AfterInitDevSup);
+        db.drain_deferred_record_inits();
         let record_count = db.records_with_device_support().await;
         let io_intr_count = setup_io_intr(db.clone()).await;
         setup_property_posts(db.clone()).await;

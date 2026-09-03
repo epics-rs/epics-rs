@@ -29,7 +29,7 @@ drvModbusAsynConfigure("$(R)HR", "$(OCTET)", 0, 3, 0, 10, "UINT16", 100, "")
 # Write 10 holding registers (function 16) at address 100.
 drvModbusAsynConfigure("$(R)HW", "$(OCTET)", 0, 16, 100, 10, "UINT16", 0, "")
 
-dbLoadRecords("db/modbus.db", "P=$(P),R=$(R),HR=$(R)HR,HW=$(R)HW")
+dbLoadRecords("$(MODBUS_IOC)/db/modbus.db", "P=$(P),R=$(R),HR=$(R)HR,HW=$(R)HW")
 
 iocInit()
 

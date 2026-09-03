@@ -27,7 +27,7 @@
 //! lifecycle: `iocBuild` then `iocRun` answered `iocRun: WARNING IOC not
 //! paused` where C answers `iocRun: All initialization complete`; a second
 //! `iocBuild` was accepted where C refuses it; `iocPause` after `iocInit`
-//! said `WARNING IOC not running`; and the five-line `coreRelease` banner C
+//! said `WARNING IOC not running`; and the `coreRelease` banner C
 //! puts on stdout between the two command echoes was absent.
 //!
 //! The sink rule this also pins is uniform and countable: `iocInit.c` holds
@@ -102,14 +102,19 @@ fn run(script_body: &str) -> (String, String) {
 }
 
 /// The banner's two `Rev.` lines carry this tree's own VCS stamp, as C's carry
-/// C's, so its shape is what can be asserted.
+/// C's, so its shape is what can be asserted. The port drops C's
+/// `epicsReleaseVersion` line — epics-rs's release is not the base version —
+/// so four lines print where C prints five.
 fn assert_banner(lines: &[&str], out: &str) {
-    assert_eq!(lines.len(), 5, "stdout was {out:?}");
+    assert_eq!(lines.len(), 4, "stdout was {out:?}");
     assert!(lines[0].starts_with("###"), "stdout was {out:?}");
-    assert!(lines[1].starts_with("## epics-rs"), "stdout was {out:?}");
-    assert!(lines[2].starts_with("## Rev. "), "stdout was {out:?}");
-    assert!(lines[3].starts_with("## Rev. Date "), "stdout was {out:?}");
-    assert!(lines[4].starts_with("###"), "stdout was {out:?}");
+    assert!(lines[1].starts_with("## Rev. "), "stdout was {out:?}");
+    assert!(lines[2].starts_with("## Rev. Date "), "stdout was {out:?}");
+    assert!(lines[3].starts_with("###"), "stdout was {out:?}");
+    assert!(
+        !lines.iter().any(|l| l.contains("epics-rs")),
+        "the base-version identity line is dropped: {out:?}"
+    );
 }
 
 /// `iocBuild` then `iocRun`: C's banner lands between the two echoes and the
@@ -175,7 +180,7 @@ async fn eltc_zero_silences_everything_the_build_says() {
     assert_eq!(err, "", "eltc 0 leaves C's console empty");
 }
 
-/// `coreRelease` on its own still prints the same five lines, so the assertion
+/// `coreRelease` on its own still prints the same banner, so the assertion
 /// above is about where the build prints and not about a mute shell.
 #[epics_macros_rs::epics_test]
 async fn core_release_still_prints_its_banner_on_stdout() {

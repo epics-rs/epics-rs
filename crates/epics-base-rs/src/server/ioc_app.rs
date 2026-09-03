@@ -1135,7 +1135,7 @@ pub(crate) fn build_refusal() -> String {
 /// returned, leaving `iocState` at [`IocState::Void`], which is why a
 /// measured `iocBuild`/`iocRun` pair answered `iocRun: WARNING IOC not
 /// paused` where C answers `iocRun: All initialization complete`, why a
-/// second `iocBuild` was accepted where C refuses it, and why the five-line
+/// second `iocBuild` was accepted where C refuses it, and why the
 /// `coreRelease` banner C puts between the two command echoes was missing
 /// from stdout.
 ///

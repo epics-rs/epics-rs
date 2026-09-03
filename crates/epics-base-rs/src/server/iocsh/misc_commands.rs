@@ -133,8 +133,9 @@ fn cmd_ioc_pause() -> CommandDef {
 }
 
 /// `coreRelease` — C `coreRelease()` (`misc/epicsRelease.c:21-29`),
-/// a five-line banner around `epicsReleaseVersion` and the two
-/// `epicsVCS.h` macros.
+/// a banner around the two `epicsVCS.h` macros. C's identity line is
+/// `epicsReleaseVersion` ("EPICS R…"); this port drops it — see
+/// [`core_release_block`].
 ///
 /// C generates that header per build with `genVersionHeader.pl`, and it
 /// has two arms with no empty outcome between them: a VCS checkout gives
@@ -157,8 +158,17 @@ fn cmd_core_release() -> CommandDef {
     )
 }
 
-/// The five lines themselves, so the shell command and the build print one
+/// The banner lines themselves, so the shell command and the build print one
 /// text.
+///
+/// C prints five lines: a `#` rule, `epicsReleaseVersion` ("EPICS
+/// R7.0.10.1-DEV"), the two `epicsVCS.h` revision lines, and the rule again.
+/// This port drops the release-version line. epics-rs's release is not the
+/// EPICS Base version, and branding that line `## epics-rs R7.0.10.1-DEV` read
+/// as if the port claimed to BE that C dev build; the base level this tree
+/// tracks is named by `EPICS_VERSION_STRING` (every tool's `-V` banner)
+/// instead. What coreRelease keeps is this build's own revision and date — the
+/// port's real release identity.
 ///
 /// C has one `coreRelease()` and calls it from both places — the iocsh
 /// command and `iocBuild_1` (`iocInit.c:147`) — and the port had the wording
@@ -166,19 +176,10 @@ fn cmd_core_release() -> CommandDef {
 /// without a second copy. The command still renders through the iocsh
 /// context so a redirection applies to it; the build writes stdout, as C's
 /// `printf` does.
-pub(crate) fn core_release_block() -> [String; 5] {
+pub(crate) fn core_release_block() -> [String; 4] {
     let rule = "#".repeat(76);
-    // epics-rs brands its own name where C prints "EPICS R…"
-    // (`epicsReleaseVersion`, mirrored verbatim by EPICS_RELEASE_VERSION). The
-    // base-compat release token rides along unchanged so the line still names
-    // the EPICS Base level this tree tracks; the `-V` string
-    // (EPICS_VERSION_STRING) stays byte-identical to C for tool parity.
-    let release = crate::runtime::version::EPICS_RELEASE_VERSION
-        .strip_prefix("EPICS ")
-        .unwrap_or(crate::runtime::version::EPICS_RELEASE_VERSION);
     [
         rule.clone(),
-        format!("## epics-rs {release}"),
         format!("## Rev. {VCS_VERSION}"),
         format!("## Rev. Date {VCS_VERSION_DATE}"),
         rule,
@@ -391,32 +392,33 @@ mod tests {
         assert_eq!(get_ioc_state(), IocState::Running);
     }
 
-    /// C `coreRelease` prints exactly five lines: a 76-`#` rule, three
-    /// `## ` lines, and the rule again (`misc/epicsRelease.c:23-27`).
+    /// C `coreRelease` prints five lines: a 76-`#` rule, `epicsReleaseVersion`,
+    /// the two revision lines, and the rule again (`misc/epicsRelease.c:23-27`).
+    /// This port drops the `epicsReleaseVersion` line — epics-rs's release is
+    /// not the base version — so coreRelease prints four: the rule, the two
+    /// revision lines, the rule.
     #[test]
-    fn core_release_prints_c_s_five_line_banner() {
+    fn core_release_prints_four_lines_without_the_base_version() {
         let ctx = make_ctx();
         let (out, failed) = run(&ctx, "coreRelease", &[]);
         assert!(!failed, "coreRelease never fails in C");
         let lines: Vec<&str> = out.lines().collect();
-        assert_eq!(lines.len(), 5, "C prints five lines: {out:?}");
+        assert_eq!(lines.len(), 4, "the base-version line is dropped: {out:?}");
         assert_eq!(lines[0], "#".repeat(76));
-        assert_eq!(lines[4], "#".repeat(76));
-        let release = crate::runtime::version::EPICS_RELEASE_VERSION
-            .strip_prefix("EPICS ")
-            .expect("EPICS_RELEASE_VERSION mirrors C's \"EPICS R…\"");
-        assert_eq!(lines[1], format!("## epics-rs {release}"));
+        assert_eq!(lines[3], "#".repeat(76));
+        assert_eq!(lines[1], format!("## Rev. {VCS_VERSION}"));
+        assert_eq!(lines[2], format!("## Rev. Date {VCS_VERSION_DATE}"));
+        // No remaining line states a release version: the dropped line was the
+        // only "epics-rs …" identity line, and no line carries the base token.
         assert!(
-            !lines[1].contains("EPICS"),
-            "banner brands epics-rs, not EPICS: {out:?}"
+            !out.contains("epics-rs") && !out.contains("R7.0.10"),
+            "the base-version identity line is gone: {out:?}"
         );
-        assert_eq!(lines[2], format!("## Rev. {VCS_VERSION}"));
-        assert_eq!(lines[3], format!("## Rev. Date {VCS_VERSION_DATE}"));
         // The stamp reaches the line: neither renders as a bare label the
         // way `## Rev. Date ` did before `build.rs` filled the pair.
-        assert!(lines[2].len() > "## Rev. ".len(), "empty revision: {out:?}");
+        assert!(lines[1].len() > "## Rev. ".len(), "empty revision: {out:?}");
         assert!(
-            lines[3].len() > "## Rev. Date ".len(),
+            lines[2].len() > "## Rev. Date ".len(),
             "empty date: {out:?}"
         );
     }

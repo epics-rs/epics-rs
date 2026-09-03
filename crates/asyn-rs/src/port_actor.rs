@@ -4142,6 +4142,9 @@ mod tests {
     /// normally.
     #[test]
     fn a_publish_flushes_every_address_list_it_wrote() {
+        // Post-`iocInit` precondition: the scan facility has opened the
+        // interruptAccept gate. See `TestDriver::new` in `port.rs`.
+        epics_libcom_rs::runtime::interrupt_accept::set_interrupts_accepted(true);
         let mut base = PortDriverBase::new(
             "multi_addr",
             3,
@@ -4200,6 +4203,9 @@ mod tests {
     /// is delivered the same way.
     #[test]
     fn a_status_publish_delivers_the_alarm_without_touching_the_value() {
+        // Post-`iocInit` precondition: the scan facility has opened the
+        // interruptAccept gate. See `TestDriver::new` in `port.rs`.
+        epics_libcom_rs::runtime::interrupt_accept::set_interrupts_accepted(true);
         let mut base = PortDriverBase::new("status_pub", 1, PortFlags::default());
         let val = base.create_param("VAL", ParamType::Int32).unwrap();
         let seen = Arc::new(parking_lot::Mutex::new(Vec::new()));

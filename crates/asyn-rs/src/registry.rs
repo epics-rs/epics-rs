@@ -126,7 +126,53 @@ fn global_registry() -> &'static PortRegistry {
 /// Errors with [`AsynError::PortAlreadyRegistered`] on a duplicate name —
 /// see [`PortRegistry::register`].
 pub fn register_port(name: &str, handle: PortHandle, trace: Arc<TraceManager>) -> AsynResult<()> {
-    global_registry().register(name, handle, trace)
+    global_registry().register(name, handle, trace)?;
+    arm_boot_flush();
+    Ok(())
+}
+
+/// Arm the one-shot boot flush, once per process.
+///
+/// C creates a `callbackThread` in every `asynPortDriver` constructor
+/// (`asynPortDriver.cpp:4111`) that waits for `interruptAccept` and then does
+/// `callParamCallbacks(addr, addr)` once per addr (`:923-937`), delivering the
+/// changed-flags that accumulated while the IOC was building. This is the
+/// crate-level equivalent: a single callback on the gate's `false → true` edge
+/// sweeps every published port instead of one thread per port. Registered on
+/// first port registration so the cost exists only in a process that has asyn
+/// ports; the edge itself never fires in a bare-port process because nothing
+/// lowers the gate there (see [`epics_libcom_rs::runtime::interrupt_accept`]).
+fn arm_boot_flush() {
+    static ARMED: OnceLock<()> = OnceLock::new();
+    ARMED.get_or_init(|| {
+        epics_libcom_rs::runtime::interrupt_accept::on_interrupts_accepted(|| {
+            // C's callbackThread is a dedicated thread precisely so it does not
+            // block the caller that set interruptAccept (the scan facility on
+            // the iocRun path). Match that: the sweep uses the port actors'
+            // blocking bridge, which must not run on the scan/setup thread.
+            let _ = std::thread::Builder::new()
+                .name("asyn-boot-flush".into())
+                .spawn(flush_all_ports_once);
+        });
+    });
+}
+
+/// Flush every published port's accumulated changed params once — C
+/// `callbackThread::run` (`asynPortDriver.cpp:923-937`), summed over all ports.
+///
+/// The gate is already `true` when this runs (the edge is what scheduled it),
+/// so each `call_param_callbacks` proceeds past the interruptAccept check and
+/// delivers the seeds to the now-subscribed `_RBV` records.
+fn flush_all_ports_once() {
+    for name in port_names() {
+        let Some(entry) = get_port(&name) else {
+            continue;
+        };
+        // C sweeps `addr` in `0..maxAddr`; a single-device port is `maxAddr == 1`.
+        for addr in 0..entry.handle.max_addr().max(1) {
+            let _ = entry.handle.call_param_callbacks_blocking(addr);
+        }
+    }
 }
 
 /// Look up a port via the global registry.

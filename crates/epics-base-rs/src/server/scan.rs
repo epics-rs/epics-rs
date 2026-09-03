@@ -156,6 +156,10 @@ pub fn scan_is_running() -> bool {
 /// the `iocRun` transition, never by a protocol server.
 pub fn scan_run() {
     SCAN_CTL.store(SCAN_CTL_RUN, std::sync::atomic::Ordering::Release);
+    // C `scanRun` sets `interruptAccept = TRUE` here (`dbScan.c:218`). The
+    // false→true edge is what fires asyn's one-shot boot flush, delivering
+    // every seeded `_RBV` value to the records that registered during iocInit.
+    crate::runtime::interrupt_accept::set_interrupts_accepted(true);
 }
 
 /// C `scanPause` (`dbScan.c:225-237`). The periodic threads stay alive and
@@ -163,6 +167,8 @@ pub fn scan_run() {
 /// lets `iocRun` resume without rebuilding the facility.
 pub fn scan_pause() {
     SCAN_CTL.store(SCAN_CTL_PAUSE, std::sync::atomic::Ordering::Release);
+    // C `scanPause` clears `interruptAccept` (`dbScan.c:241`).
+    crate::runtime::interrupt_accept::set_interrupts_accepted(false);
 }
 
 /// C `scanStop` (`dbScan.c:154-178`), less the joins: the threads are
@@ -171,6 +177,8 @@ pub fn scan_pause() {
 /// the two see a stopped facility rather than a half-torn one.
 pub fn scan_stop() {
     SCAN_CTL.store(SCAN_CTL_EXIT, std::sync::atomic::Ordering::Release);
+    // C `scanStop` clears `interruptAccept` (`dbScan.c:165`).
+    crate::runtime::interrupt_accept::set_interrupts_accepted(false);
 }
 
 /// How this facility blocks a plain (banded) thread on a future — both a

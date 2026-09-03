@@ -273,6 +273,12 @@ fn unique_name(prefix: &str) -> String {
 }
 
 fn setup_scope() -> (PortManager, asyn_rs::port_handle::PortHandle) {
+    // Post-`iocInit` precondition: the scan facility has opened the
+    // interruptAccept gate, so `call_param_callbacks` delivers. An integration
+    // test has no scan facility, so it establishes the precondition itself —
+    // the analogue of C linking the non-IOC translation unit's
+    // `interruptAccept = 1`. See `interrupt_accept` in `epics-libcom-rs`.
+    epics_libcom_rs::runtime::interrupt_accept::set_interrupts_accepted(true);
     let mgr = PortManager::new();
     let rt = mgr
         .register_port(TestScopeDriver::new(&unique_name("SCOPE")))

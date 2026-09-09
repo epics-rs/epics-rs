@@ -114,18 +114,6 @@ pub struct PvaServerConfig {
     pub max_connections: usize,
     /// Maximum number of channels per single client connection.
     pub max_channels_per_connection: usize,
-    /// Maximum number of concurrent in-flight operations (GET / PUT /
-    /// MONITOR / RPC) that a single channel can accumulate. The
-    /// per-channel `ops` map grows on each `INIT` (subcmd 0x08) and
-    /// shrinks on `DESTROY` (subcmd 0x10). Without a cap, a malicious
-    /// client can `INIT` against the same channel with fresh IOIDs
-    /// indefinitely, exhausting server memory even when
-    /// `max_channels_per_connection` is enforced. Default: 64
-    /// (matches the typical `pvxs` per-channel concurrent op count
-    /// of `Subscription` + the occasional in-flight GET / PUT). Excess
-    /// `INIT`s are rejected with `ECA_ALLOCMEM`-equivalent error
-    /// status. Override via `EPICS_PVAS_MAX_OPS_PER_CHANNEL`.
-    pub max_ops_per_channel: usize,
     /// Idle timeout — server closes connections that haven't received
     /// anything in this window. Applied even if `op_timeout` is longer.
     pub idle_timeout: Duration,
@@ -399,7 +387,6 @@ impl Default for PvaServerConfig {
             bind_ip: IpAddr::V4(Ipv4Addr::UNSPECIFIED),
             max_connections: 1024,
             max_channels_per_connection: 1024,
-            max_ops_per_channel: 64,
             idle_timeout: Duration::from_secs(45),
             monitor_queue_depth: super::source::DEFAULT_MONITOR_QUEUE_LIMIT as usize,
             disable_plaintext: false,
@@ -490,9 +477,6 @@ impl PvaServerConfig {
         }
         if let Some(v) = env::max_channels_per_connection_opt() {
             self.max_channels_per_connection = v;
-        }
-        if let Some(v) = env::max_ops_per_channel_opt() {
-            self.max_ops_per_channel = v;
         }
         // Beacon periods: keep the pvxs short:long = 15:180 = 1:12 ratio
         // when only the short period is tuned; an explicit

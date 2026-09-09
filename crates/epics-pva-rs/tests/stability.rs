@@ -3011,3 +3011,55 @@ async fn multi_pv_fan_out_runs_on_whichever_executor_polls_it() {
 
     h.abort();
 }
+
+// ── No per-channel / per-connection caps (pvxs parity) ───────────────
+
+/// pvxs has no per-channel op cap: `ServerChan::opByIOID` is an unbounded
+/// map (serverconn.h:122) and MONITOR INIT (servermon.cpp:505-585) refuses
+/// only a duplicate IOID. A pvxs/p4p client keys channels by name, so N
+/// monitors on one PV are N ops on ONE server channel; the former
+/// `max_ops_per_channel = 64` rejected the 65th with "max ops per channel
+/// exceeded". Every one of the 100 subscriptions must deliver its initial
+/// snapshot.
+#[cfg(tokio_backend)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn monitors_on_one_channel_are_not_capped() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    const N: usize = 100;
+    let source = Arc::new(MemSource::new());
+    source.add_pv("STAB:MANYMON", 7.0).await;
+
+    let (tcp, _udp, h) = spawn_server(source.clone()).await;
+    let client = client_for(tcp);
+
+    let delivered = Arc::new(AtomicUsize::new(0));
+    let tasks: Vec<_> = (0..N)
+        .map(|_| {
+            let client = client.clone();
+            let delivered = delivered.clone();
+            tokio::spawn(async move {
+                client
+                    .pvmonitor("STAB:MANYMON", move |_value| {
+                        delivered.fetch_add(1, Ordering::SeqCst);
+                    })
+                    .await
+            })
+        })
+        .collect();
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    while delivered.load(Ordering::SeqCst) < N && tokio::time::Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let got = delivered.load(Ordering::SeqCst);
+    for t in &tasks {
+        t.abort();
+    }
+    h.abort();
+
+    assert_eq!(
+        got, N,
+        "{got} of {N} monitors on one channel delivered their initial snapshot"
+    );
+}

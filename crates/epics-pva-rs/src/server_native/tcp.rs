@@ -3764,9 +3764,8 @@ pub(super) async fn handle_connection_io(
     // `(sid, ioid, op_id)` here via `MonitorFinishGuard`; the select! arm
     // below removes the op through the owner, running the same
     // start-control / abort finalizers `DESTROY_REQUEST` runs. Unbounded
-    // so the guard's sync `Drop` never loses a signal; the queue is
-    // bounded in practice by the live op count, which `max_ops_per_channel`
-    // already caps.
+    // so the guard's sync `Drop` never loses a signal; the queue holds at
+    // most one entry per live op.
     let (mon_fin_tx, mut mon_fin_rx) = mpsc::unbounded_channel::<MonitorFinished>();
     // a spawned GET/PUT/RPC/PUT_GET/PROCESS data-phase task signals
     // here when its response is sent so the owner can return the op to `Idle`
@@ -4034,7 +4033,6 @@ pub(super) async fn handle_connection_io(
                             &tx,
                             &mut channels,
                             order,
-                            &config,
                             &mut rx_type_cache,
                             peer,
                             &cred,
@@ -4464,7 +4462,6 @@ pub(super) async fn handle_connection_io(
                     &tx,
                     &mut channels,
                     order,
-                    &config,
                     &mut rx_type_cache,
                     peer,
                     &cred,
@@ -4891,18 +4888,6 @@ async fn handle_put_get(
                 "duplicate PUT_GET INIT on live IOID {ioid}"
             )));
         }
-        if ch.ops.len() >= config.max_ops_per_channel {
-            send_chan_op_error(
-                &chan_tx,
-                OpKind::PutGet,
-                ioid,
-                subcmd,
-                Status::error("max ops per channel exceeded"),
-                order,
-            )
-            .await?;
-            return Ok(());
-        }
         // PUT_GET also requires a descriptor — park until one exists.
         let intro = match ch.introspection.clone() {
             Some(d) => d,
@@ -5249,7 +5234,6 @@ async fn handle_process(
     tx: &SrvTx,
     channels: &mut HashMap<u32, ChannelState>,
     order: ByteOrder,
-    config: &PvaServerConfig,
     // Connection-scope inbound decode cache (pvxs `rxRegistry`, conn.h:23).
     // PROCESS transfers no value but its INIT pvRequest descriptor is still
     // decoded, so it shares the same cache as every other inbound decode.
@@ -5325,18 +5309,6 @@ async fn handle_process(
             return Err(PvaError::Decode(format!(
                 "duplicate PROCESS INIT on live IOID {ioid}"
             )));
-        }
-        if ch.ops.len() >= config.max_ops_per_channel {
-            send_chan_op_error(
-                &chan_tx,
-                OpKind::Process,
-                ioid,
-                subcmd,
-                Status::error("max ops per channel exceeded"),
-                order,
-            )
-            .await?;
-            return Ok(());
         }
         // PROCESS still requires a descriptor — even though
         // PROCESS has no value payload, the source must commit to
@@ -5625,18 +5597,6 @@ async fn handle_channel_array(
             return Err(PvaError::Decode(format!(
                 "duplicate ARRAY INIT on live IOID {ioid}"
             )));
-        }
-        if ch.ops.len() >= config.max_ops_per_channel {
-            send_chan_op_error(
-                &chan_tx,
-                OpKind::Array,
-                ioid,
-                subcmd,
-                Status::error("max ops per channel exceeded"),
-                order,
-            )
-            .await?;
-            return Ok(());
         }
         // Decode the pvRequest selecting the array field, through the same
         // structured boundary as GET/PUT/PROCESS INIT. A malformed
@@ -6806,22 +6766,6 @@ async fn handle_op(
             return Err(PvaError::Decode(format!(
                 "duplicate INIT on live IOID {ioid} (pvxs serverget.cpp:378-384 protocol error)"
             )));
-        }
-        // per-channel concurrent-op cap — refuse fresh INITs
-        // once the channel's `ops` map hits the configured ceiling
-        // so a malicious peer can't accumulate IOID state forever
-        // by sending INIT … INIT … without ever issuing DESTROY.
-        if ch.ops.len() >= config.max_ops_per_channel {
-            send_chan_op_error(
-                &chan_tx,
-                kind,
-                ioid,
-                subcmd,
-                Status::error("max ops per channel exceeded"),
-                order,
-            )
-            .await?;
-            return Ok(());
         }
 
         // A non-RPC operation needs a prototype, and a channel that has
@@ -18904,7 +18848,6 @@ mod tests {
 
         let mut channels = primed_process_channels(sid, ioid, source.clone());
         let (tx, mut rx) = test_srv_tx(16);
-        let config = PvaServerConfig::default();
         let peer: SocketAddr = "127.0.0.1:5075".parse().unwrap();
 
         // PROCESS data-phase frame: sid + ioid + subcmd(0x00).
@@ -18921,7 +18864,6 @@ mod tests {
             &tx,
             &mut channels,
             order,
-            &config,
             &mut TypeCache::new(),
             peer,
             &x509_cred("MyCA"),
@@ -18970,7 +18912,6 @@ mod tests {
 
         let mut channels = primed_process_channels(sid, ioid, source.clone());
         let (tx, mut rx) = test_srv_tx(16);
-        let config = PvaServerConfig::default();
         let peer: SocketAddr = "127.0.0.1:5075".parse().unwrap();
 
         let mut payload = Vec::new();
@@ -18985,7 +18926,6 @@ mod tests {
             &tx,
             &mut channels,
             order,
-            &config,
             &mut TypeCache::new(),
             peer,
             &x509_cred("OtherCA"),
@@ -19074,7 +19014,6 @@ mod tests {
         // IOID initialised as a GET, not a PROCESS.
         let mut channels = primed_channels_with_kind(sid, ioid, OpKind::Get, source.clone());
         let (tx, _rx) = test_srv_tx(16);
-        let config = PvaServerConfig::default();
         let peer: SocketAddr = "127.0.0.1:5075".parse().unwrap();
 
         let mut payload = Vec::new();
@@ -19089,7 +19028,6 @@ mod tests {
             &tx,
             &mut channels,
             order,
-            &config,
             &mut TypeCache::new(),
             peer,
             &x509_cred("MyCA"),
@@ -19125,7 +19063,6 @@ mod tests {
 
         let mut channels = primed_channels_with_kind(sid, ioid, OpKind::Monitor, source.clone());
         let (tx, _rx) = test_srv_tx(16);
-        let config = PvaServerConfig::default();
         let peer: SocketAddr = "127.0.0.1:5075".parse().unwrap();
 
         let mut payload = Vec::new();
@@ -19140,7 +19077,6 @@ mod tests {
             &tx,
             &mut channels,
             order,
-            &config,
             &mut TypeCache::new(),
             peer,
             &x509_cred("MyCA"),
@@ -19215,7 +19151,6 @@ mod tests {
         let source: DynSource = std::sync::Arc::new(AuthorityGatedSource::new());
         let mut channels = process_channels_no_op(sid, source.clone());
         let (tx, mut rx) = test_srv_tx(16);
-        let config = PvaServerConfig::default();
         let peer: SocketAddr = "127.0.0.1:5076".parse().unwrap();
         let frame = process_init_frame(sid, ioid, pv_request, order);
 
@@ -19225,7 +19160,6 @@ mod tests {
             &tx,
             &mut channels,
             order,
-            &config,
             &mut TypeCache::new(),
             peer,
             &x509_cred("MyCA"),
@@ -19686,7 +19620,6 @@ mod tests {
         let mut channels = primed_process_channels(sid, ioid, source.clone());
         let (tx, mut rx) = test_srv_tx(16);
         let (exec_fin_tx, mut exec_fin_rx) = mpsc::unbounded_channel::<ExecFinished>();
-        let config = PvaServerConfig::default();
         let peer: SocketAddr = "127.0.0.1:5075".parse().unwrap();
 
         // PROCESS data frame carrying the last-request bit (QOS_DESTROY = 0x10).
@@ -19702,7 +19635,6 @@ mod tests {
             &tx,
             &mut channels,
             order,
-            &config,
             &mut TypeCache::new(),
             peer,
             &x509_cred("MyCA"),

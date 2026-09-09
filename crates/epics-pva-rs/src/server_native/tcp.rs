@@ -763,84 +763,6 @@ fn monitor_pipeline_options(
     }))
 }
 
-// Not `Clone`: `parked` owns the abort handles for the descriptor waits
-// suspended on this channel, and a second copy of those guards would let a
-// dropped clone cancel a wait the live channel still needs. Nothing clones
-// a channel — the read loop owns the one instance and hands out `&`/`&mut`.
-#[allow(dead_code)]
-struct ChannelState {
-    name: String,
-    cid: u32,
-    sid: u32,
-    /// Channel-invariant negotiated descriptor, shared by refcount with
-    /// every op minted on this channel — a per-op deep clone of a full
-    /// NTScalar tree was 11% of server CPU under a PUT load.
-    introspection: Option<Arc<FieldDesc>>,
-    /// Source bound at CREATE_CHANNEL that owns this channel. Every
-    /// operation (GET/PUT/MONITOR/RPC/PROCESS/GET_FIELD) dispatches
-    /// through this owner instead of re-resolving the top-level source
-    /// registry per operation, so a live channel cannot silently change
-    /// owner when a source is added or removed. pvxs binds the accepting
-    /// source's callbacks into the `ServerChan` at CREATE_CHANNEL
-    /// (`serverchan.cpp:70-112`); a later `removeSource` does not rewrite
-    /// them (`src/server.cpp:100-112`).
-    source: DynSource,
-    /// Shared per-channel report counters (name + tx/rx + ReportInfo),
-    /// the SAME `Arc` registered in this connection's `PeerEntry` under
-    /// the channel's SID. Handlers attribute per-PV traffic through this
-    /// (`stat.add_tx`/`add_rx`) so `PvaServer::report`
-    /// can show per-channel byte counters (pvxs `chan->statTx/statRx`,
-    /// src/server.cpp:260-268).
-    stat: Arc<crate::server_native::peers::ChannelStat>,
-    /// Credential snapshot taken when this channel was CREATED, used for
-    /// the channel *lifecycle* callbacks (`notify_channel_open` /
-    /// `notify_channel_close`) and nothing else. pvxs builds the channel's
-    /// `ServerChannelControl` with `conn->cred` at CREATE_CHANNEL
-    /// (`serverchan.cpp:62`); a later re-auth that reassigns `ServerConn::cred`
-    /// does NOT rewrite the credential captured by an already-open channel
-    /// control. Per-operation handlers still use the connection's *current*
-    /// credential (pvxs builds each `ConnectOp`/`ExecOp` from `conn->cred`),
-    /// so only the open/close edges are pinned here.
-    open_cred: Arc<ClientCredentials>,
-    /// ioid → (introspection negotiated for this op, kind)
-    ops: ChannelOps,
-    /// ioid → an operation INIT held because the channel has no
-    /// descriptor YET.
-    ///
-    /// pvxs never answers such an INIT with an error: `SharedPV::onOp`
-    /// inserts the `ConnectOp` into `pending` (`sharedpv.cpp:239-249`),
-    /// `onSubscribe` puts the `MonitorSetupOp` into `mpending`
-    /// (`:259-275`), and `SharedPV::open` walks both sets running
-    /// `connectOp`/`connectSub` (`:348-384`), so a client that connected
-    /// before `open()` gets its INIT reply the moment the PV opens. This
-    /// map is the connection's half of those two sets; the PV's half is
-    /// the task suspended in [`SharedPV::wait_open`](crate::server_native::SharedPV::wait_open),
-    /// whose abort handle each entry owns. Dropping the entry — channel
-    /// teardown, DESTROY_REQUEST, connection end — cancels the wait, which
-    /// is exactly what pvxs's `conn->onClose` erase does.
-    parked: ParkedOps,
-    /// Reusable PUT-delta decode scratch, keyed by the op intro it was
-    /// built for (`Arc::ptr_eq`). A PUT/PUT_GET EXEC takes it, decodes
-    /// the marked fields in place ([`decode_pv_field_with_bitset_into`])
-    /// and the exec body returns it through [`ExecFinished`] once the
-    /// source call is done. Channel-level (not per-op) because a pvput
-    /// client mints a fresh op per put (INIT/EXEC/DESTROY), which would
-    /// defeat a per-op scratch; ops of one channel negotiating the same
-    /// intro share the tree. Unmarked slots carry stale values from an
-    /// earlier EXEC — semantically dead under the `put_delta_checked`
-    /// contract (only `changed`-marked fields may be read).
-    put_scratch: Option<(Arc<FieldDesc>, PvField)>,
-    /// Memoized inline wire encoding of [`Self::introspection`] for
-    /// GET/PUT/MONITOR INIT replies, keyed by the descriptor Arc and
-    /// the reply byte order. Channel-level for the same reason as
-    /// `put_scratch`: a pvput client re-INITs per put against the one
-    /// negotiated descriptor, so the full `encode_type_desc` tree walk
-    /// would otherwise run on every operation. Only the default
-    /// (`!emit_type_cache`) branch consults it — the 0xFD/0xFE
-    /// TypeStore path already collapses repeats to 3-byte references.
-    intro_wire: Option<(Arc<FieldDesc>, ByteOrder, Vec<u8>)>,
-}
-
 // `source` is a `dyn ChannelSourceObj` trait object with no `Debug`
 // bound, so `ChannelState` cannot derive `Debug`; print the bound
 // owner as an opaque marker instead.
@@ -854,7 +776,7 @@ impl std::fmt::Debug for ChannelState {
             .field("source", &"<bound owner>")
             .field("stat", &self.stat)
             .field("open_cred", &self.open_cred)
-            .field("ops", &self.ops)
+            .field("ops", self.ops())
             .finish()
     }
 }
@@ -1034,7 +956,7 @@ fn finish_exec_data_task(
     subcmd: u8,
     abort: Option<epics_base_rs::runtime::task::TaskAbortHandle>,
 ) {
-    if let Some(op_mut) = ch.ops.get_mut(&ioid) {
+    if let Some(op_mut) = ch.op_mut(&ioid) {
         if subcmd & QosFlags::DESTROY != 0 {
             op_mut.last_request = true;
         }
@@ -1135,7 +1057,7 @@ impl Drop for MonitorFinishGuard {
 /// reused the ioid (the ABA guard described on [`MonitorFinished`]).
 fn apply_monitor_finish(channels: &mut ChannelTable, fin: MonitorFinished) {
     if let Some(mut ch) = channels.get_mut(&fin.sid)
-        && ch.ops.get(&fin.ioid).map(|op| op.monitor_op_id) == Some(fin.op_id)
+        && ch.ops().get(&fin.ioid).map(|op| op.monitor_op_id) == Some(fin.op_id)
     {
         ch.remove_op(fin.ioid);
     }
@@ -1163,7 +1085,7 @@ enum ExecState {
 /// (`OpState::monitor_op_id`, minted per op at INIT) tags this exec instance
 /// for the [`ExecFinished`] ABA guard.
 fn begin_exec(ch: &mut ChannelState, ioid: u32) -> Option<u64> {
-    match ch.ops.get_mut(&ioid) {
+    match ch.op_mut(&ioid) {
         Some(op) if op.exec_state == ExecState::Executing => None,
         Some(op) => {
             op.exec_state = ExecState::Executing;
@@ -1353,7 +1275,7 @@ fn apply_exec_finish(channels: &mut ChannelTable, fin: ExecFinished) {
     if let Some(s) = fin.scratch {
         ch.put_scratch = Some(s);
     }
-    let (matches, last_request, kind) = match ch.ops.get(&fin.ioid) {
+    let (matches, last_request, kind) = match ch.ops().get(&fin.ioid) {
         Some(op) => (op.monitor_op_id == fin.op_id, op.last_request, op.kind),
         None => return,
     };
@@ -1371,7 +1293,7 @@ fn apply_exec_finish(channels: &mut ChannelTable, fin: ExecFinished) {
     };
     if remove {
         ch.remove_op(fin.ioid);
-    } else if let Some(op) = ch.ops.get_mut(&fin.ioid) {
+    } else if let Some(op) = ch.op_mut(&fin.ioid) {
         op.exec_state = ExecState::Idle;
         op.data_task_abort = None;
     }
@@ -1387,31 +1309,189 @@ fn apply_exec_finish(channels: &mut ChannelTable, fin: ExecFinished) {
 /// `servermon.cpp:505-511`, `serverintrospect.cpp:157-178`) and the map
 /// CANCEL/DESTROY/MESSAGE key on before they consult the SID
 /// (`serverconn.cpp:262-346`). The op states themselves stay per channel
-/// ([`ChannelState::ops`] / [`ChannelState::parked`], pvxs's
+/// (`ChannelState::ops` / `ChannelState::parked`, pvxs's
 /// `ServerChan::opByIOID`), so the index is a second view of the same
-/// membership and must never drift from it. It cannot: [`ChannelOps`] and
-/// [`ParkedOps`] carry no membership mutators, and the only way to add or
-/// remove an op is a [`ChannelMut`] handed out by [`ChannelTable::get_mut`],
-/// which updates the index in the same call. Membership of the channel
-/// table itself goes through [`ChannelTable::insert`] / [`ChannelTable::remove`]
-/// / [`ChannelTable::drain`], which index or purge the channel's ops.
+/// membership and must never drift from it. It cannot: both fields are
+/// private to this module, their [`chan_table::ChannelOps`] /
+/// [`chan_table::ParkedOps`] wrappers carry no membership mutators, and the
+/// only way to add or remove an op is a [`ChannelMut`] handed out by
+/// [`ChannelTable::get_mut`], which updates the index in the same call.
+/// Membership of the channel table itself goes through
+/// [`ChannelTable::insert`] / [`ChannelTable::remove`] /
+/// [`ChannelTable::drain`], which index or purge the channel's ops.
 mod chan_table {
     use std::collections::HashMap;
     use std::ops::{Deref, DerefMut};
 
-    use super::{ChannelState, OpState, ParkedOp};
+    use super::{
+        Arc, ByteOrder, ClientCredentials, DynSource, FieldDesc, OpState, ParkedOp, PvField,
+    };
 
-    /// Operations live on one channel, keyed by connection-wide IOID.
-    /// Reads go through `Deref` to the map; membership changes only
-    /// through [`ChannelMut::insert_op`] / [`ChannelMut::remove_op`].
-    #[derive(Debug, Default)]
-    pub(super) struct ChannelOps(HashMap<u32, OpState>);
+    // Not `Clone`: `parked` owns the abort handles for the descriptor waits
+    // suspended on this channel, and a second copy of those guards would let a
+    // dropped clone cancel a wait the live channel still needs. Nothing clones
+    // a channel — the read loop owns the one instance and hands out `&`/`&mut`.
+    #[allow(dead_code)]
+    pub(super) struct ChannelState {
+        pub(super) name: String,
+        pub(super) cid: u32,
+        pub(super) sid: u32,
+        /// Channel-invariant negotiated descriptor, shared by refcount with
+        /// every op minted on this channel — a per-op deep clone of a full
+        /// NTScalar tree was 11% of server CPU under a PUT load.
+        pub(super) introspection: Option<Arc<FieldDesc>>,
+        /// Source bound at CREATE_CHANNEL that owns this channel. Every
+        /// operation (GET/PUT/MONITOR/RPC/PROCESS/GET_FIELD) dispatches
+        /// through this owner instead of re-resolving the top-level source
+        /// registry per operation, so a live channel cannot silently change
+        /// owner when a source is added or removed. pvxs binds the accepting
+        /// source's callbacks into the `ServerChan` at CREATE_CHANNEL
+        /// (`serverchan.cpp:70-112`); a later `removeSource` does not rewrite
+        /// them (`src/server.cpp:100-112`).
+        pub(super) source: DynSource,
+        /// Shared per-channel report counters (name + tx/rx + ReportInfo),
+        /// the SAME `Arc` registered in this connection's `PeerEntry` under
+        /// the channel's SID. Handlers attribute per-PV traffic through this
+        /// (`stat.add_tx`/`add_rx`) so `PvaServer::report`
+        /// can show per-channel byte counters (pvxs `chan->statTx/statRx`,
+        /// src/server.cpp:260-268).
+        pub(super) stat: Arc<crate::server_native::peers::ChannelStat>,
+        /// Credential snapshot taken when this channel was CREATED, used for
+        /// the channel *lifecycle* callbacks (`notify_channel_open` /
+        /// `notify_channel_close`) and nothing else. pvxs builds the channel's
+        /// `ServerChannelControl` with `conn->cred` at CREATE_CHANNEL
+        /// (`serverchan.cpp:62`); a later re-auth that reassigns `ServerConn::cred`
+        /// does NOT rewrite the credential captured by an already-open channel
+        /// control. Per-operation handlers still use the connection's *current*
+        /// credential (pvxs builds each `ConnectOp`/`ExecOp` from `conn->cred`),
+        /// so only the open/close edges are pinned here.
+        pub(super) open_cred: Arc<ClientCredentials>,
+        /// ioid → (introspection negotiated for this op, kind)
+        ops: ChannelOps,
+        /// ioid → an operation INIT held because the channel has no
+        /// descriptor YET.
+        ///
+        /// pvxs never answers such an INIT with an error: `SharedPV::onOp`
+        /// inserts the `ConnectOp` into `pending` (`sharedpv.cpp:239-249`),
+        /// `onSubscribe` puts the `MonitorSetupOp` into `mpending`
+        /// (`:259-275`), and `SharedPV::open` walks both sets running
+        /// `connectOp`/`connectSub` (`:348-384`), so a client that connected
+        /// before `open()` gets its INIT reply the moment the PV opens. This
+        /// map is the connection's half of those two sets; the PV's half is
+        /// the task suspended in [`SharedPV::wait_open`](crate::server_native::SharedPV::wait_open),
+        /// whose abort handle each entry owns. Dropping the entry — channel
+        /// teardown, DESTROY_REQUEST, connection end — cancels the wait, which
+        /// is exactly what pvxs's `conn->onClose` erase does.
+        parked: ParkedOps,
+        /// Reusable PUT-delta decode scratch, keyed by the op intro it was
+        /// built for (`Arc::ptr_eq`). A PUT/PUT_GET EXEC takes it, decodes
+        /// the marked fields in place ([`decode_pv_field_with_bitset_into`])
+        /// and the exec body returns it through [`ExecFinished`] once the
+        /// source call is done. Channel-level (not per-op) because a pvput
+        /// client mints a fresh op per put (INIT/EXEC/DESTROY), which would
+        /// defeat a per-op scratch; ops of one channel negotiating the same
+        /// intro share the tree. Unmarked slots carry stale values from an
+        /// earlier EXEC — semantically dead under the `put_delta_checked`
+        /// contract (only `changed`-marked fields may be read).
+        pub(super) put_scratch: Option<(Arc<FieldDesc>, PvField)>,
+        /// Memoized inline wire encoding of [`Self::introspection`] for
+        /// GET/PUT/MONITOR INIT replies, keyed by the descriptor Arc and
+        /// the reply byte order. Channel-level for the same reason as
+        /// `put_scratch`: a pvput client re-INITs per put against the one
+        /// negotiated descriptor, so the full `encode_type_desc` tree walk
+        /// would otherwise run on every operation. Only the default
+        /// (`!emit_type_cache`) branch consults it — the 0xFD/0xFE
+        /// TypeStore path already collapses repeats to 3-byte references.
+        pub(super) intro_wire: Option<(Arc<FieldDesc>, ByteOrder, Vec<u8>)>,
+    }
 
-    impl ChannelOps {
-        pub(super) fn get_mut(&mut self, ioid: &u32) -> Option<&mut OpState> {
-            self.0.get_mut(ioid)
+    /// What CREATE_CHANNEL knows about a channel at admission. Everything
+    /// else in a [`ChannelState`] starts empty, and its op membership is
+    /// reachable only through the [`ChannelMut`] the table hands out.
+    pub(super) struct ChannelOpen {
+        pub(super) name: String,
+        pub(super) cid: u32,
+        pub(super) sid: u32,
+        pub(super) introspection: Option<Arc<FieldDesc>>,
+        pub(super) source: DynSource,
+        pub(super) stat: Arc<crate::server_native::peers::ChannelStat>,
+        pub(super) open_cred: Arc<ClientCredentials>,
+    }
+
+    impl ChannelState {
+        pub(super) fn new(open: ChannelOpen) -> Self {
+            let ChannelOpen {
+                name,
+                cid,
+                sid,
+                introspection,
+                source,
+                stat,
+                open_cred,
+            } = open;
+            Self {
+                name,
+                cid,
+                sid,
+                introspection,
+                source,
+                stat,
+                open_cred,
+                ops: ChannelOps::default(),
+                parked: ParkedOps::default(),
+                put_scratch: None,
+                intro_wire: None,
+            }
+        }
+
+        /// Test fixtures open a channel with operations already live; the
+        /// table indexes them when the channel is inserted.
+        #[cfg(test)]
+        pub(super) fn with_ops(mut self, ops: HashMap<u32, OpState>) -> Self {
+            self.ops = ops.into();
+            self
+        }
+
+        pub(super) fn ops(&self) -> &ChannelOps {
+            &self.ops
+        }
+
+        #[cfg(test)]
+        pub(super) fn parked(&self) -> &ParkedOps {
+            &self.parked
+        }
+
+        /// Edit one live op in place. Membership stays with [`ChannelMut`].
+        pub(super) fn op_mut(&mut self, ioid: &u32) -> Option<&mut OpState> {
+            self.ops.0.get_mut(ioid)
+        }
+
+        /// Take the channel apart for its close callback. The parked waits
+        /// and the ops go first, aborting every task they own the way
+        /// pvxs's `conn->onClose` erases them from `pending` / `mpending`
+        /// (`sharedpv.cpp:231-237`, `:263-270`); the callback then runs
+        /// with what it needs.
+        pub(super) fn into_close(self) -> (String, DynSource, Arc<ClientCredentials>) {
+            let Self {
+                name,
+                source,
+                open_cred,
+                ops,
+                parked,
+                ..
+            } = self;
+            drop(parked);
+            drop(ops);
+            (name, source, open_cred)
         }
     }
+
+    /// Operations live on one channel, keyed by connection-wide IOID.
+    /// Reads go through `Deref` to the map; one op is edited in place via
+    /// [`ChannelState::op_mut`], and membership changes only through
+    /// [`ChannelMut::insert_op`] / [`ChannelMut::remove_op`].
+    #[derive(Debug, Default)]
+    pub(super) struct ChannelOps(HashMap<u32, OpState>);
 
     impl Deref for ChannelOps {
         type Target = HashMap<u32, OpState>;
@@ -1566,7 +1646,7 @@ mod chan_table {
         }
     }
 }
-use chan_table::{ChannelMut, ChannelOps, ChannelTable, ParkedOps};
+use chan_table::{ChannelMut, ChannelOpen, ChannelState, ChannelTable};
 
 /// Resolve which channel should service a data-phase (non-INIT) operation
 /// frame for `ioid`. pvxs looks the operation up in the connection-wide
@@ -4092,7 +4172,7 @@ pub(super) async fn handle_connection_io(
                     // `server.cpp`).
                     stat.set_report_info(resolved.report_info);
                     reply_stat = Some(stat.clone());
-                    channels.insert(sid, ChannelState {
+                    channels.insert(sid, ChannelState::new(ChannelOpen {
                         name: cc.name,
                         cid: cc.cid,
                         sid,
@@ -4100,11 +4180,7 @@ pub(super) async fn handle_connection_io(
                         source: resolved.owner,
                         stat: stat.clone(),
                         open_cred: cc.open_cred,
-                        ops: ChannelOps::default(),
-                        parked: ParkedOps::default(),
-                        put_scratch: None,
-                intro_wire: None,
-                    });
+                    }));
                     // Register the channel (live + lifetime counts and
                     // the per-channel report entry) in one owner call.
                     peer_entry.channel_opened(sid, stat);
@@ -5258,7 +5334,7 @@ async fn handle_put_get(
     }
 
     // PUT-GET data phase.
-    let op = ch.ops.get(&ioid).cloned();
+    let op = ch.ops().get(&ioid).cloned();
     let (intro, mask, put_mask, init_pv_request) = match op {
         Some(o) => {
             // the data-phase command must match the operation
@@ -5661,7 +5737,7 @@ async fn handle_process(
     }
 
     // PROCESS data phase — no payload to decode.
-    let init_pv_request = match ch.ops.get(&ioid) {
+    let init_pv_request = match ch.ops().get(&ioid) {
         None => {
             // silently drop — pvxs serverget.cpp:423-428 and servermon.cpp:611-619
             // return without reply here to handle the DESTROY_REQUEST race.
@@ -5961,7 +6037,7 @@ async fn handle_channel_array(
     }
 
     // Data phase. Bind to the INIT-registered op (kind must match).
-    let init_pv_request = match ch.ops.get(&ioid) {
+    let init_pv_request = match ch.ops().get(&ioid) {
         None => {
             // No op registered for this IOID at the data phase. pvAccessCPP —
             // the only ChannelArray server reference (pvxs has no ARRAY
@@ -5993,7 +6069,7 @@ async fn handle_channel_array(
     // Array introspection bound at INIT — drives the put-value decode and
     // the get-value encode.
     let array_desc = ch
-        .ops
+        .ops()
         .get(&ioid)
         .map(|o| o.intro.clone())
         .expect("op present");
@@ -6414,19 +6490,7 @@ fn channel_lifecycle_ctx(
 /// (`serverchan.cpp:62`), so a re-auth between open and teardown must not
 /// change the close identity.
 fn close_channel(ch: ChannelState, peer: SocketAddr) {
-    let ChannelState {
-        name,
-        source,
-        open_cred,
-        ops,
-        parked,
-        ..
-    } = ch;
-    // A channel teardown cancels every wait parked on it, exactly as
-    // pvxs's `conn->onClose` erases the op from `pending` / `mpending`
-    // (`sharedpv.cpp:231-237`, `:263-270`).
-    drop(parked);
-    drop(ops);
+    let (name, source, open_cred) = ch.into_close();
     let ctx = channel_lifecycle_ctx(peer, &open_cred);
     source.notify_channel_close(&name, &ctx);
 }
@@ -6692,7 +6756,7 @@ fn handle_cancel_request(frame: &Frame, channels: &mut ChannelTable) -> PvaResul
         }
     };
     if let Some(mut ch) = channels.get_mut(&osid)
-        && let Some(op) = ch.ops.get_mut(&ioid)
+        && let Some(op) = ch.op_mut(&ioid)
     {
         // pvxs `serverconn.cpp:262-295` applies CANCEL_REQUEST to EVERY
         // executing op kind by flipping `ServerOp::state` to `Idle`. The
@@ -7021,7 +7085,7 @@ async fn handle_op(
         // duplicate INIT on a live IOID is connection-fatal
         // per pvxs. `serverget.cpp:378-384` and `servermon.cpp:505-511`
         // reset the connection on `op->state != Created`; we model
-        // "already created" as `ch.ops.contains_key(&ioid)`. Pre-fix
+        // "already created" as `ch.ops().contains_key(&ioid)`. Pre-fix
         // Rust let the insert below silently REPLACE the existing
         // OpState, which could drop a MONITOR subscriber task and
         // redirect later data frames to a different descriptor/mask
@@ -7479,7 +7543,7 @@ async fn handle_op(
             // squashes against that one `op->limit` for pipeline and plain
             // monitors alike (`queue.size() < limit`, servermon.cpp:273).
             let queue_depth = ch
-                .ops
+                .ops()
                 .get(&ioid)
                 .map(|s| s.monitor_options.queue_size as usize)
                 .unwrap_or(config.monitor_queue_depth);
@@ -7487,7 +7551,7 @@ async fn handle_op(
             // Read the per-op state back out of the just-inserted `OpState`
             // (its construction consumed the `mask`/window/filter locals) into
             // a self-contained args bundle, so the spawn holds no `ch` borrow.
-            let args = ch.ops.get(&ioid).map(|s| {
+            let args = ch.ops().get(&ioid).map(|s| {
                 // ACF-aware MONITOR: forward the INIT pvRequest so the source
                 // can honor `record._options.DBE` (per-op event-mask selection,
                 // pvxs singlesource.cpp:115); data-phase START/ACK frames are
@@ -7522,7 +7586,7 @@ async fn handle_op(
             });
             if let Some(args) = args {
                 let (join, start_ctl) = spawn_monitor_subscriber(reactor, args);
-                if let Some(s) = ch.ops.get_mut(&ioid) {
+                if let Some(s) = ch.op_mut(&ioid) {
                     s.monitor_started = true;
                     s.monitor_abort = Some(Arc::new(AbortOnDrop(join.abort_handle())));
                     s.monitor_start_ctl = Some(start_ctl);
@@ -7587,7 +7651,7 @@ async fn handle_op(
     }
 
     // Data phase
-    let op = ch.ops.get(&ioid).cloned();
+    let op = ch.ops().get(&ioid).cloned();
     let (intro, mask, init_pv_request) = match op {
         Some(o) => {
             // data/control frames must match the operation
@@ -8085,7 +8149,7 @@ async fn handle_op(
                 // callback runs after it is dropped so `source` can
                 // borrow `ch.name` freely.
                 let mut fire_high: Option<(u64, u64)> = None;
-                if let Some(op) = ch.ops.get(&ioid) {
+                if let Some(op) = ch.ops().get(&ioid) {
                     if let (Some(w), Some(n)) = (
                         op.monitor_window.as_ref(),
                         op.monitor_window_notify.as_ref(),
@@ -8171,7 +8235,7 @@ async fn handle_op(
             // subscriber's emit gate (its `monitor_exec` watch) follows that
             // edge. `monitor_paused` mirrors the Idle/paused state for the
             // cancel-parity tests.
-            if let Some(op) = ch.ops.get(&ioid) {
+            if let Some(op) = ch.ops().get(&ioid) {
                 if is_stop {
                     op.monitor_paused
                         .store(true, std::sync::atomic::Ordering::Relaxed);
@@ -10902,7 +10966,7 @@ mod tests {
             let mut channels = ChannelTable::new();
             channels.insert(
                 sid,
-                ChannelState {
+                ChannelState::new(ChannelOpen {
                     name: "dut".into(),
                     cid: 0,
                     sid,
@@ -10910,11 +10974,7 @@ mod tests {
                     source,
                     stat: crate::server_native::peers::ChannelStat::new(String::new()),
                     open_cred: Arc::new(ClientCredentials::anonymous(TEST_PEER)),
-                    ops: ChannelOps::default(),
-                    parked: ParkedOps::default(),
-                    put_scratch: None,
-                    intro_wire: None,
-                },
+                }),
             );
             let (tx, _rx) = test_srv_tx(16);
             let config = PvaServerConfig::default();
@@ -10963,7 +11023,7 @@ mod tests {
                 // registered; assert it was not, to catch a silent
                 // downgrade even if the call returned Ok.
                 assert!(
-                    !channels.get(&sid).unwrap().ops.contains_key(&ioid),
+                    !channels.get(&sid).unwrap().ops().contains_key(&ioid),
                     "a malformed INIT pvRequest must not register the IOID"
                 );
             })
@@ -11007,7 +11067,7 @@ mod tests {
             let mut channels = ChannelTable::new();
             channels.insert(
                 sid,
-                ChannelState {
+                ChannelState::new(ChannelOpen {
                     name: "dut".into(),
                     cid: 0,
                     sid,
@@ -11015,11 +11075,7 @@ mod tests {
                     source,
                     stat: crate::server_native::peers::ChannelStat::new(String::new()),
                     open_cred: Arc::new(ClientCredentials::anonymous(TEST_PEER)),
-                    ops: ChannelOps::default(),
-                    parked: ParkedOps::default(),
-                    put_scratch: None,
-                    intro_wire: None,
-                },
+                }),
             );
             let (tx, mut rx) = test_srv_tx(16);
             let config = PvaServerConfig::default();
@@ -11063,7 +11119,7 @@ mod tests {
             )
             .await;
             let fatal = result.is_err();
-            let registered = channels.get(&sid).unwrap().ops.contains_key(&ioid);
+            let registered = channels.get(&sid).unwrap().ops().contains_key(&ioid);
             let replied = rx.try_recv().is_ok();
             (fatal, registered || replied)
         }
@@ -11111,7 +11167,7 @@ mod tests {
         let mut channels = ChannelTable::new();
         channels.insert(
             sid,
-            ChannelState {
+            ChannelState::new(ChannelOpen {
                 name: "dut".into(),
                 cid: 0,
                 sid,
@@ -11119,11 +11175,7 @@ mod tests {
                 source,
                 stat: crate::server_native::peers::ChannelStat::new(String::new()),
                 open_cred: Arc::new(ClientCredentials::anonymous(TEST_PEER)),
-                ops: ChannelOps::default(),
-                parked: ParkedOps::default(),
-                put_scratch: None,
-                intro_wire: None,
-            },
+            }),
         );
         let (tx, mut rx) = test_srv_tx(16);
         let config = PvaServerConfig::default();
@@ -11169,7 +11221,7 @@ mod tests {
             "an empty-selector descriptor-only GET INIT must not be fatal"
         );
         assert!(
-            channels.get(&sid).unwrap().ops.contains_key(&ioid),
+            channels.get(&sid).unwrap().ops().contains_key(&ioid),
             "an empty-selector GET INIT must register the IOID"
         );
         assert!(
@@ -11216,7 +11268,7 @@ mod tests {
             let mut channels = ChannelTable::new();
             channels.insert(
                 sid,
-                ChannelState {
+                ChannelState::new(ChannelOpen {
                     name: "dut".into(),
                     cid: 0,
                     sid,
@@ -11224,11 +11276,7 @@ mod tests {
                     source,
                     stat: crate::server_native::peers::ChannelStat::new(String::new()),
                     open_cred: Arc::new(ClientCredentials::anonymous(TEST_PEER)),
-                    ops: ChannelOps::default(),
-                    parked: ParkedOps::default(),
-                    put_scratch: None,
-                    intro_wire: None,
-                },
+                }),
             );
             let (tx, _rx) = test_srv_tx(16);
             let config = PvaServerConfig::default();
@@ -11271,7 +11319,7 @@ mod tests {
             )
             .await
             .is_err();
-            let op = channels.get(&sid).unwrap().ops.get(&ioid);
+            let op = channels.get(&sid).unwrap().ops().get(&ioid);
             (fatal, op.is_some(), op.map(|o| o.mask.clone()))
         }
 
@@ -11890,7 +11938,7 @@ mod tests {
         let mut channels = ChannelTable::new();
         channels.insert(
             sid,
-            ChannelState {
+            ChannelState::new(ChannelOpen {
                 name: "dut".into(),
                 cid: 0,
                 sid,
@@ -11898,11 +11946,7 @@ mod tests {
                 source: source.clone(),
                 stat: crate::server_native::peers::ChannelStat::new(String::new()),
                 open_cred: Arc::new(ClientCredentials::anonymous(TEST_PEER)),
-                ops: ChannelOps::default(),
-                parked: ParkedOps::default(),
-                put_scratch: None,
-                intro_wire: None,
-            },
+            }),
         );
 
         let (tx, mut rx) = test_srv_tx(64);
@@ -12010,7 +12054,7 @@ mod tests {
         let mut channels = ChannelTable::new();
         channels.insert(
             sid,
-            ChannelState {
+            ChannelState::new(ChannelOpen {
                 name: "dut".into(),
                 cid: 0,
                 sid,
@@ -12018,11 +12062,7 @@ mod tests {
                 source,
                 stat: crate::server_native::peers::ChannelStat::new(String::new()),
                 open_cred: Arc::new(ClientCredentials::anonymous(TEST_PEER)),
-                ops: ChannelOps::default(),
-                parked: ParkedOps::default(),
-                put_scratch: None,
-                intro_wire: None,
-            },
+            }),
         );
 
         let (tx, mut rx) = test_srv_tx(64);
@@ -12080,7 +12120,7 @@ mod tests {
             "pvxs resets before replying: no CMD_MESSAGE and no INIT reply"
         );
         assert!(
-            channels[&sid].ops.is_empty(),
+            channels[&sid].ops().is_empty(),
             "no monitor op is registered for a circuit pvxs never answers"
         );
     }
@@ -12113,7 +12153,7 @@ mod tests {
         let mut channels = ChannelTable::new();
         channels.insert(
             sid,
-            ChannelState {
+            ChannelState::new(ChannelOpen {
                 name: "dut".into(),
                 cid: 0,
                 sid,
@@ -12121,11 +12161,7 @@ mod tests {
                 source,
                 stat: crate::server_native::peers::ChannelStat::new(String::new()),
                 open_cred: Arc::new(ClientCredentials::anonymous(TEST_PEER)),
-                ops: ChannelOps::default(),
-                parked: ParkedOps::default(),
-                put_scratch: None,
-                intro_wire: None,
-            },
+            }),
         );
 
         let (tx, mut rx) = test_srv_tx(64);
@@ -12381,7 +12417,7 @@ mod tests {
         let mut channels = ChannelTable::new();
         channels.insert(
             sid,
-            ChannelState {
+            ChannelState::new(ChannelOpen {
                 name: "dut".into(),
                 cid: 0,
                 sid,
@@ -12389,11 +12425,7 @@ mod tests {
                 source: source.clone(),
                 stat: crate::server_native::peers::ChannelStat::new(String::new()),
                 open_cred: Arc::new(ClientCredentials::anonymous(TEST_PEER)),
-                ops: ChannelOps::default(),
-                parked: ParkedOps::default(),
-                put_scratch: None,
-                intro_wire: None,
-            },
+            }),
         );
 
         let (tx, mut rx) = test_srv_tx(64);
@@ -12564,7 +12596,7 @@ mod tests {
         let mut channels = ChannelTable::new();
         channels.insert(
             sid,
-            ChannelState {
+            ChannelState::new(ChannelOpen {
                 name: "dut".into(),
                 cid: 0,
                 sid,
@@ -12572,11 +12604,7 @@ mod tests {
                 source: source.clone(),
                 stat: crate::server_native::peers::ChannelStat::new(String::new()),
                 open_cred: Arc::new(ClientCredentials::anonymous(TEST_PEER)),
-                ops: ChannelOps::default(),
-                parked: ParkedOps::default(),
-                put_scratch: None,
-                intro_wire: None,
-            },
+            }),
         );
         (channels, source, pusher)
     }
@@ -13090,7 +13118,7 @@ mod tests {
             .expect("MonitorFinished");
         assert_eq!(fin.ioid, ioid, "the torn-down op is the DESTROYed one");
         assert!(
-            !channels[&sid].ops.contains_key(&ioid),
+            !channels[&sid].ops().contains_key(&ioid),
             "DESTROY removed the op from ch.ops"
         );
     }
@@ -13328,7 +13356,7 @@ mod tests {
         let mut channels = ChannelTable::new();
         channels.insert(
             sid,
-            ChannelState {
+            ChannelState::new(ChannelOpen {
                 name: "dut".into(),
                 cid: 0,
                 sid,
@@ -13336,11 +13364,7 @@ mod tests {
                 source: source.clone(),
                 stat: crate::server_native::peers::ChannelStat::new(String::new()),
                 open_cred: Arc::new(ClientCredentials::anonymous(TEST_PEER)),
-                ops: ChannelOps::default(),
-                parked: ParkedOps::default(),
-                put_scratch: None,
-                intro_wire: None,
-            },
+            }),
         );
         (channels, source, raw_tx)
     }
@@ -13560,7 +13584,7 @@ mod tests {
         let mut channels = ChannelTable::new();
         channels.insert(
             sid,
-            ChannelState {
+            ChannelState::new(ChannelOpen {
                 name: "dut".into(),
                 cid: 0,
                 sid,
@@ -13568,11 +13592,7 @@ mod tests {
                 source: source.clone(),
                 stat: crate::server_native::peers::ChannelStat::new(String::new()),
                 open_cred: Arc::new(ClientCredentials::anonymous(TEST_PEER)),
-                ops: ChannelOps::default(),
-                parked: ParkedOps::default(),
-                put_scratch: None,
-                intro_wire: None,
-            },
+            }),
         );
         let (tx, mut rx) = test_srv_tx(64);
         let config = PvaServerConfig::default();
@@ -13730,7 +13750,7 @@ mod tests {
         let mut channels = ChannelTable::new();
         channels.insert(
             sid,
-            ChannelState {
+            ChannelState::new(ChannelOpen {
                 name: "dut".into(),
                 cid: 0,
                 sid,
@@ -13738,11 +13758,7 @@ mod tests {
                 source: source.clone(),
                 stat: crate::server_native::peers::ChannelStat::new(String::new()),
                 open_cred: Arc::new(ClientCredentials::anonymous(TEST_PEER)),
-                ops: ChannelOps::default(),
-                parked: ParkedOps::default(),
-                put_scratch: None,
-                intro_wire: None,
-            },
+            }),
         );
         let (tx, mut rx) = test_srv_tx(64);
         let config = PvaServerConfig::default();
@@ -13829,7 +13845,7 @@ mod tests {
         let mut channels = ChannelTable::new();
         channels.insert(
             sid,
-            ChannelState {
+            ChannelState::new(ChannelOpen {
                 name: "dut".into(),
                 cid: 0,
                 sid,
@@ -13837,11 +13853,7 @@ mod tests {
                 source: source.clone(),
                 stat: crate::server_native::peers::ChannelStat::new(String::new()),
                 open_cred: Arc::new(ClientCredentials::anonymous(TEST_PEER)),
-                ops: ChannelOps::default(),
-                parked: ParkedOps::default(),
-                put_scratch: None,
-                intro_wire: None,
-            },
+            }),
         );
 
         let (tx, mut rx) = test_srv_tx(64);
@@ -13971,7 +13983,7 @@ mod tests {
         let mut channels = ChannelTable::new();
         channels.insert(
             sid,
-            ChannelState {
+            ChannelState::new(ChannelOpen {
                 name: "dut".into(),
                 cid: 0,
                 sid,
@@ -13979,11 +13991,7 @@ mod tests {
                 source: source.clone(),
                 stat: crate::server_native::peers::ChannelStat::new(String::new()),
                 open_cred: Arc::new(ClientCredentials::anonymous(TEST_PEER)),
-                ops: ChannelOps::default(),
-                parked: ParkedOps::default(),
-                put_scratch: None,
-                intro_wire: None,
-            },
+            }),
         );
 
         let (tx, mut rx) = test_srv_tx(64);
@@ -14036,7 +14044,7 @@ mod tests {
 
         let op = channels
             .get(&sid)
-            .and_then(|c| c.ops.get(&ioid))
+            .and_then(|c| c.ops().get(&ioid))
             .expect("op present after INIT");
         // pipeline flow control must stay OFF...
         assert!(
@@ -14082,7 +14090,7 @@ mod tests {
         let mut channels = ChannelTable::new();
         channels.insert(
             sid,
-            ChannelState {
+            ChannelState::new(ChannelOpen {
                 name: "dut".into(),
                 cid: 0,
                 sid,
@@ -14090,11 +14098,7 @@ mod tests {
                 source: source.clone(),
                 stat: crate::server_native::peers::ChannelStat::new(String::new()),
                 open_cred: Arc::new(ClientCredentials::anonymous(TEST_PEER)),
-                ops: ChannelOps::default(),
-                parked: ParkedOps::default(),
-                put_scratch: None,
-                intro_wire: None,
-            },
+            }),
         );
 
         let (tx, mut rx) = test_srv_tx(64);
@@ -14148,7 +14152,7 @@ mod tests {
         // not.
         let started = |chs: &ChannelTable| -> bool {
             chs.get(&sid)
-                .and_then(|c| c.ops.get(&ioid))
+                .and_then(|c| c.ops().get(&ioid))
                 .and_then(|o| o.monitor_start_ctl.as_ref())
                 .map(|ctl| ctl.is_executing())
                 .expect("op + start-control present after INIT")
@@ -14299,7 +14303,7 @@ mod tests {
         let mut channels = ChannelTable::new();
         channels.insert(
             sid,
-            ChannelState {
+            ChannelState::new(ChannelOpen {
                 name: "dut".into(),
                 cid: 0,
                 sid,
@@ -14307,11 +14311,8 @@ mod tests {
                 source,
                 stat: crate::server_native::peers::ChannelStat::new(String::new()),
                 open_cred: Arc::new(ClientCredentials::anonymous(TEST_PEER)),
-                ops: ops.into(),
-                parked: ParkedOps::default(),
-                put_scratch: None,
-                intro_wire: None,
-            },
+            })
+            .with_ops(ops),
         );
         channels
     }
@@ -14601,7 +14602,7 @@ mod tests {
         let mut channels = ChannelTable::new();
         channels.insert(
             sid,
-            ChannelState {
+            ChannelState::new(ChannelOpen {
                 name: "dut".into(),
                 cid: 0,
                 sid,
@@ -14609,11 +14610,8 @@ mod tests {
                 source: src.clone(),
                 stat: crate::server_native::peers::ChannelStat::new(String::new()),
                 open_cred: Arc::new(ClientCredentials::anonymous(TEST_PEER)),
-                ops: ops.into(),
-                parked: ParkedOps::default(),
-                put_scratch: None,
-                intro_wire: None,
-            },
+            })
+            .with_ops(ops),
         );
         channels
     }
@@ -15072,7 +15070,7 @@ mod tests {
         let mut channels = ChannelTable::new();
         channels.insert(
             1,
-            ChannelState {
+            ChannelState::new(ChannelOpen {
                 name: "dut:pv".into(),
                 cid: 0,
                 sid: 1,
@@ -15080,11 +15078,8 @@ mod tests {
                 source,
                 stat: crate::server_native::peers::ChannelStat::new(String::new()),
                 open_cred: Arc::new(ClientCredentials::anonymous(TEST_PEER)),
-                ops: ops.into(),
-                parked: ParkedOps::default(),
-                put_scratch: None,
-                intro_wire: None,
-            },
+            })
+            .with_ops(ops),
         );
 
         let msg = |ioid: u32| -> PvaResult<()> {
@@ -15120,7 +15115,7 @@ mod tests {
                     BitSet::new(),
                 ),
             );
-            ChannelState {
+            ChannelState::new(ChannelOpen {
                 name: format!("dut:pv{sid}"),
                 cid: 0,
                 sid,
@@ -15128,11 +15123,8 @@ mod tests {
                 source,
                 stat: crate::server_native::peers::ChannelStat::new(String::new()),
                 open_cred: Arc::new(ClientCredentials::anonymous(TEST_PEER)),
-                ops: ops.into(),
-                parked: ParkedOps::default(),
-                put_scratch: None,
-                intro_wire: None,
-            }
+            })
+            .with_ops(ops)
         };
         // Channel 1 owns IOID 7; channel 2 owns IOID 9.
         let mut channels = ChannelTable::new();
@@ -15211,7 +15203,7 @@ mod tests {
         let mut channels = ChannelTable::new();
         channels.insert(
             1,
-            ChannelState {
+            ChannelState::new(ChannelOpen {
                 name: "dut:pv".into(),
                 cid: 0,
                 sid: 1,
@@ -15219,11 +15211,8 @@ mod tests {
                 source,
                 stat: crate::server_native::peers::ChannelStat::new(String::new()),
                 open_cred: Arc::new(ClientCredentials::anonymous(TEST_PEER)),
-                ops: ops.into(),
-                parked: ParkedOps::default(),
-                put_scratch: None,
-                intro_wire: None,
-            },
+            })
+            .with_ops(ops),
         );
 
         let send = |ioid: u32, mtype: u8| {
@@ -15323,7 +15312,7 @@ mod tests {
         );
         channels.insert(
             sid,
-            ChannelState {
+            ChannelState::new(ChannelOpen {
                 name: "dut".into(),
                 cid: 1,
                 sid,
@@ -15331,11 +15320,8 @@ mod tests {
                 source: source.clone(),
                 stat: crate::server_native::peers::ChannelStat::new(String::new()),
                 open_cred: Arc::new(ClientCredentials::anonymous(TEST_PEER)),
-                ops: ops.into(),
-                parked: ParkedOps::default(),
-                put_scratch: None,
-                intro_wire: None,
-            },
+            })
+            .with_ops(ops),
         );
 
         // Build the CancelRequest payload: sid + ioid.
@@ -15350,7 +15336,7 @@ mod tests {
         // (subcmd 0x44) flips pause off via handle_op's resume path.
         let op = channels
             .get(&sid)
-            .and_then(|c| c.ops.get(&ioid))
+            .and_then(|c| c.ops().get(&ioid))
             .expect("op preserved across cancel");
         assert!(
             op.monitor_started,
@@ -15435,7 +15421,7 @@ mod tests {
         ops.insert(ioid, op);
         channels.insert(
             sid,
-            ChannelState {
+            ChannelState::new(ChannelOpen {
                 name: "dut".into(),
                 cid: 0,
                 sid,
@@ -15443,11 +15429,8 @@ mod tests {
                 source,
                 stat: crate::server_native::peers::ChannelStat::new(String::new()),
                 open_cred: Arc::new(ClientCredentials::anonymous(TEST_PEER)),
-                ops: ops.into(),
-                parked: ParkedOps::default(),
-                put_scratch: None,
-                intro_wire: None,
-            },
+            })
+            .with_ops(ops),
         );
 
         let mut payload = Vec::new();
@@ -15458,8 +15441,7 @@ mod tests {
 
         let mut ch = channels.get_mut(&sid).expect("channel survives cancel");
         let op = ch
-            .ops
-            .get_mut(&ioid)
+            .op_mut(&ioid)
             .expect("op preserved across cancel — cancel is not a teardown");
         assert_eq!(
             op.exec_state,
@@ -15530,7 +15512,7 @@ mod tests {
         ops.insert(ioid, op);
         channels.insert(
             sid,
-            ChannelState {
+            ChannelState::new(ChannelOpen {
                 name: "dut".into(),
                 cid: 0,
                 sid,
@@ -15538,11 +15520,8 @@ mod tests {
                 source,
                 stat: crate::server_native::peers::ChannelStat::new(String::new()),
                 open_cred: Arc::new(ClientCredentials::anonymous(TEST_PEER)),
-                ops: ops.into(),
-                parked: ParkedOps::default(),
-                put_scratch: None,
-                intro_wire: None,
-            },
+            })
+            .with_ops(ops),
         );
 
         // Cancel the in-flight last-request EXEC.
@@ -15554,7 +15533,7 @@ mod tests {
 
         // The op survives Idle with the sticky marker preserved and a fresh
         // op-instance id.
-        let live = &channels[&sid].ops[&ioid];
+        let live = &channels[&sid].ops()[&ioid];
         assert_eq!(
             live.exec_state,
             ExecState::Idle,
@@ -15580,7 +15559,7 @@ mod tests {
             },
         );
         assert!(
-            channels[&sid].ops.contains_key(&ioid),
+            channels[&sid].ops().contains_key(&ioid),
             "stale completion (old op id) must not destroy the re-EXEC-able op"
         );
 
@@ -15603,7 +15582,7 @@ mod tests {
             },
         );
         assert!(
-            !channels[&sid].ops.contains_key(&ioid),
+            !channels[&sid].ops().contains_key(&ioid),
             "the re-EXEC's reply must destroy the op (sticky last_request), \
              matching pvxs serverget.cpp:111-114"
         );
@@ -16147,7 +16126,7 @@ mod tests {
         let mut channels = ChannelTable::new();
         channels.insert(
             sid,
-            ChannelState {
+            ChannelState::new(ChannelOpen {
                 name: "dut".into(),
                 cid,
                 sid,
@@ -16155,11 +16134,7 @@ mod tests {
                 source: source.clone(),
                 stat: crate::server_native::peers::ChannelStat::new(String::new()),
                 open_cred: Arc::new(ClientCredentials::anonymous(TEST_PEER)),
-                ops: ChannelOps::default(),
-                parked: ParkedOps::default(),
-                put_scratch: None,
-                intro_wire: None,
-            },
+            }),
         );
         let (tx, mut rx) = test_srv_tx(8);
 
@@ -16208,7 +16183,7 @@ mod tests {
         let mut channels = ChannelTable::new();
         channels.insert(
             sid,
-            ChannelState {
+            ChannelState::new(ChannelOpen {
                 name: "dut".into(),
                 cid,
                 sid,
@@ -16216,11 +16191,7 @@ mod tests {
                 source: source.clone(),
                 stat: crate::server_native::peers::ChannelStat::new(String::new()),
                 open_cred: Arc::new(ClientCredentials::anonymous(TEST_PEER)),
-                ops: ChannelOps::default(),
-                parked: ParkedOps::default(),
-                put_scratch: None,
-                intro_wire: None,
-            },
+            }),
         );
         let (tx, mut rx) = test_srv_tx(8);
 
@@ -16370,7 +16341,7 @@ mod tests {
         let mut channels = ChannelTable::new();
         channels.insert(
             sid,
-            ChannelState {
+            ChannelState::new(ChannelOpen {
                 name: "dut".into(),
                 cid,
                 sid,
@@ -16378,11 +16349,7 @@ mod tests {
                 source: source.clone(),
                 stat: crate::server_native::peers::ChannelStat::new(String::new()),
                 open_cred: Arc::new(ClientCredentials::anonymous(TEST_PEER)),
-                ops: ChannelOps::default(),
-                parked: ParkedOps::default(),
-                put_scratch: None,
-                intro_wire: None,
-            },
+            }),
         );
         let (tx, mut _rx) = test_srv_tx(8);
 
@@ -16584,7 +16551,7 @@ mod tests {
         let sid = alloc_sid(&mut next_sid, &channels).expect("an empty table has a free SID");
         channels.insert(
             sid,
-            ChannelState {
+            ChannelState::new(ChannelOpen {
                 name: completion.name.clone(),
                 cid: completion.cid,
                 sid,
@@ -16592,11 +16559,7 @@ mod tests {
                 source: resolved.owner,
                 stat: crate::server_native::peers::ChannelStat::new(String::new()),
                 open_cred: completion.open_cred,
-                ops: ChannelOps::default(),
-                parked: ParkedOps::default(),
-                put_scratch: None,
-                intro_wire: None,
-            },
+            }),
         );
         let ch = channels.get(&sid).unwrap();
         let ctx = channel_lifecycle_ctx(peer, &ch.open_cred);
@@ -16631,7 +16594,7 @@ mod tests {
         let mut channels = ChannelTable::new();
         channels.insert(
             sid,
-            ChannelState {
+            ChannelState::new(ChannelOpen {
                 name: "dut".into(),
                 cid,
                 sid,
@@ -16640,11 +16603,7 @@ mod tests {
                 stat: crate::server_native::peers::ChannelStat::new(String::new()),
                 // Channel was created under alice/ca.
                 open_cred: cred_ca("alice"),
-                ops: ChannelOps::default(),
-                parked: ParkedOps::default(),
-                put_scratch: None,
-                intro_wire: None,
-            },
+            }),
         );
 
         let (tx, mut _rx) = test_srv_tx(8);
@@ -16697,7 +16656,7 @@ mod tests {
         let mut channels = ChannelTable::new();
         channels.insert(
             sid,
-            ChannelState {
+            ChannelState::new(ChannelOpen {
                 name: "dut".into(),
                 cid,
                 sid,
@@ -16705,11 +16664,7 @@ mod tests {
                 source,
                 stat: crate::server_native::peers::ChannelStat::new(String::new()),
                 open_cred: cred_ca("alice"),
-                ops: ChannelOps::default(),
-                parked: ParkedOps::default(),
-                put_scratch: None,
-                intro_wire: None,
-            },
+            }),
         );
 
         let (tx, mut _rx) = test_srv_tx(8);
@@ -16773,7 +16728,7 @@ mod tests {
         let mut channels = ChannelTable::new();
         channels.insert(
             sid,
-            ChannelState {
+            ChannelState::new(ChannelOpen {
                 name: "dut".into(),
                 cid: 0,
                 sid,
@@ -16782,11 +16737,8 @@ mod tests {
                 stat: crate::server_native::peers::ChannelStat::new(String::new()),
                 // Channel was created under alice/ca.
                 open_cred: cred_ca("alice"),
-                ops: ops.into(),
-                parked: ParkedOps::default(),
-                put_scratch: None,
-                intro_wire: None,
-            },
+            })
+            .with_ops(ops),
         );
 
         let (tx, mut rx) = test_srv_tx(16);
@@ -16856,7 +16808,7 @@ mod tests {
             let stat = crate::server_native::peers::ChannelStat::new(name.into());
             channels.insert(
                 sid,
-                ChannelState {
+                ChannelState::new(ChannelOpen {
                     name: name.into(),
                     cid,
                     sid,
@@ -16864,11 +16816,7 @@ mod tests {
                     source: source.clone(),
                     stat: stat.clone(),
                     open_cred: Arc::new(ClientCredentials::anonymous(TEST_PEER)),
-                    ops: ChannelOps::default(),
-                    parked: ParkedOps::default(),
-                    put_scratch: None,
-                    intro_wire: None,
-                },
+                }),
             );
             peer_entry.channel_opened(sid, stat);
         }
@@ -16932,7 +16880,7 @@ mod tests {
         let stat = crate::server_native::peers::ChannelStat::new("X".into());
         channels.insert(
             1,
-            ChannelState {
+            ChannelState::new(ChannelOpen {
                 name: "X".into(),
                 cid: 10,
                 sid: 1,
@@ -16940,11 +16888,7 @@ mod tests {
                 source: source.clone(),
                 stat: stat.clone(),
                 open_cred: Arc::new(ClientCredentials::anonymous(TEST_PEER)),
-                ops: ChannelOps::default(),
-                parked: ParkedOps::default(),
-                put_scratch: None,
-                intro_wire: None,
-            },
+            }),
         );
         peer_entry.channel_opened(1, stat);
 
@@ -17015,7 +16959,7 @@ mod tests {
         let mut channels = ChannelTable::new();
         channels.insert(
             sid,
-            ChannelState {
+            ChannelState::new(ChannelOpen {
                 name: "dut".into(),
                 cid: 0,
                 sid,
@@ -17023,11 +16967,7 @@ mod tests {
                 source: source.clone(),
                 stat: crate::server_native::peers::ChannelStat::new(String::new()),
                 open_cred: Arc::new(ClientCredentials::anonymous(TEST_PEER)),
-                ops: ChannelOps::default(),
-                parked: ParkedOps::default(),
-                put_scratch: None,
-                intro_wire: None,
-            },
+            }),
         );
 
         let (tx, mut rx) = test_srv_tx(16);
@@ -17169,7 +17109,7 @@ mod tests {
         let mut channels = ChannelTable::new();
         channels.insert(
             sid,
-            ChannelState {
+            ChannelState::new(ChannelOpen {
                 name: "P:AI".into(),
                 cid: 0,
                 sid,
@@ -17177,11 +17117,7 @@ mod tests {
                 source: source.clone(),
                 stat: crate::server_native::peers::ChannelStat::new(String::new()),
                 open_cred: Arc::new(ClientCredentials::anonymous(TEST_PEER)),
-                ops: ChannelOps::default(),
-                parked: ParkedOps::default(),
-                put_scratch: None,
-                intro_wire: None,
-            },
+            }),
         );
 
         let (tx, mut rx) = test_srv_tx(16);
@@ -17372,7 +17308,7 @@ mod tests {
         let mut channels = ChannelTable::new();
         channels.insert(
             sid,
-            ChannelState {
+            ChannelState::new(ChannelOpen {
                 name: "dut".into(),
                 cid: 0,
                 sid,
@@ -17380,11 +17316,7 @@ mod tests {
                 source: source.clone(),
                 stat: crate::server_native::peers::ChannelStat::new(String::new()),
                 open_cred: Arc::new(ClientCredentials::anonymous(TEST_PEER)),
-                ops: ChannelOps::default(),
-                parked: ParkedOps::default(),
-                put_scratch: None,
-                intro_wire: None,
-            },
+            }),
         );
 
         let (tx, mut rx) = test_srv_tx(16);
@@ -17533,7 +17465,7 @@ mod tests {
             let mut channels = ChannelTable::new();
             channels.insert(
                 sid,
-                ChannelState {
+                ChannelState::new(ChannelOpen {
                     name: "dut".into(),
                     cid: 0,
                     sid,
@@ -17541,11 +17473,8 @@ mod tests {
                     source: source.clone(),
                     stat: crate::server_native::peers::ChannelStat::new(String::new()),
                     open_cred: Arc::new(ClientCredentials::anonymous(TEST_PEER)),
-                    ops: ops.into(),
-                    parked: ParkedOps::default(),
-                    put_scratch: None,
-                    intro_wire: None,
-                },
+                })
+                .with_ops(ops),
             );
             channels
         };
@@ -17593,7 +17522,7 @@ mod tests {
             let op = channels
                 .get(&sid)
                 .unwrap()
-                .ops
+                .ops()
                 .get(&ioid)
                 .expect("last-request op stays reserved until its reply is sent");
             assert!(
@@ -17620,7 +17549,7 @@ mod tests {
             .expect("data task signals completion");
         apply_exec_finish(&mut channels, fin);
         assert!(
-            !channels.get(&sid).unwrap().ops.contains_key(&ioid),
+            !channels.get(&sid).unwrap().ops().contains_key(&ioid),
             "last-request GET op is removed once its response has been sent"
         );
 
@@ -17660,14 +17589,14 @@ mod tests {
             .expect("data task signals completion");
         apply_exec_finish(&mut channels, fin);
         assert!(
-            channels.get(&sid).unwrap().ops.contains_key(&ioid),
+            channels.get(&sid).unwrap().ops().contains_key(&ioid),
             "non-last-request GET EXEC keeps the op registered after completion"
         );
         assert_eq!(
             channels
                 .get(&sid)
                 .unwrap()
-                .ops
+                .ops()
                 .get(&ioid)
                 .unwrap()
                 .exec_state,
@@ -17707,7 +17636,7 @@ mod tests {
         let mut channels = ChannelTable::new();
         channels.insert(
             sid,
-            ChannelState {
+            ChannelState::new(ChannelOpen {
                 name: "dut".into(),
                 cid: 0,
                 sid,
@@ -17715,11 +17644,7 @@ mod tests {
                 source: source.clone(),
                 stat: crate::server_native::peers::ChannelStat::new(String::new()),
                 open_cred: Arc::new(ClientCredentials::anonymous(TEST_PEER)),
-                ops: ChannelOps::default(),
-                parked: ParkedOps::default(),
-                put_scratch: None,
-                intro_wire: None,
-            },
+            }),
         );
 
         let (tx, mut rx) = test_srv_tx(64);
@@ -17816,7 +17741,7 @@ mod tests {
         .expect("GET INIT referencing the cached pvRequest descriptor must succeed");
         let _ = rx.recv().await.expect("INIT #2 reply");
         assert!(
-            channels.get(&sid).unwrap().ops.contains_key(&ioid2),
+            channels.get(&sid).unwrap().ops().contains_key(&ioid2),
             "INIT #2's 0xFE reference resolved against the shared cache and registered the op"
         );
 
@@ -17825,7 +17750,7 @@ mod tests {
         let mut empty_channels = ChannelTable::new();
         empty_channels.insert(
             sid,
-            ChannelState {
+            ChannelState::new(ChannelOpen {
                 name: "dut".into(),
                 cid: 0,
                 sid,
@@ -17833,11 +17758,7 @@ mod tests {
                 source: source.clone(),
                 stat: crate::server_native::peers::ChannelStat::new(String::new()),
                 open_cred: Arc::new(ClientCredentials::anonymous(TEST_PEER)),
-                ops: ChannelOps::default(),
-                parked: ParkedOps::default(),
-                put_scratch: None,
-                intro_wire: None,
-            },
+            }),
         );
         let mut fresh_cache = TypeCache::new();
         let err = handle_op(
@@ -18236,7 +18157,7 @@ mod tests {
         let mut channels = ChannelTable::new();
         channels.insert(
             sid,
-            ChannelState {
+            ChannelState::new(ChannelOpen {
                 name: "dut".into(),
                 cid: 0,
                 sid,
@@ -18244,11 +18165,7 @@ mod tests {
                 source: source.clone(),
                 stat: crate::server_native::peers::ChannelStat::new(String::new()),
                 open_cred: Arc::new(ClientCredentials::anonymous(TEST_PEER)),
-                ops: ChannelOps::default(),
-                parked: ParkedOps::default(),
-                put_scratch: None,
-                intro_wire: None,
-            },
+            }),
         );
 
         let (tx, mut rx) = test_srv_tx(16);
@@ -18383,7 +18300,7 @@ mod tests {
         let mut channels = ChannelTable::new();
         channels.insert(
             sid,
-            ChannelState {
+            ChannelState::new(ChannelOpen {
                 name: "dut".into(),
                 cid: 0,
                 sid,
@@ -18391,11 +18308,7 @@ mod tests {
                 source: source.clone(),
                 stat: crate::server_native::peers::ChannelStat::new(String::new()),
                 open_cred: Arc::new(ClientCredentials::anonymous(TEST_PEER)),
-                ops: ChannelOps::default(),
-                parked: ParkedOps::default(),
-                put_scratch: None,
-                intro_wire: None,
-            },
+            }),
         );
 
         let (tx, mut rx) = test_srv_tx(16);
@@ -18747,7 +18660,7 @@ mod tests {
         let mut channels = ChannelTable::new();
         channels.insert(
             sid,
-            ChannelState {
+            ChannelState::new(ChannelOpen {
                 name: "dut".into(),
                 cid: 0,
                 sid,
@@ -18755,11 +18668,8 @@ mod tests {
                 source,
                 stat: crate::server_native::peers::ChannelStat::new(String::new()),
                 open_cred: Arc::new(ClientCredentials::anonymous(TEST_PEER)),
-                ops: ops.into(),
-                parked: ParkedOps::default(),
-                put_scratch: None,
-                intro_wire: None,
-            },
+            })
+            .with_ops(ops),
         );
         channels
     }
@@ -19242,7 +19152,7 @@ mod tests {
         let mut channels = ChannelTable::new();
         channels.insert(
             sid,
-            ChannelState {
+            ChannelState::new(ChannelOpen {
                 name: "dut".into(),
                 cid: 0,
                 sid,
@@ -19250,11 +19160,8 @@ mod tests {
                 source,
                 stat: crate::server_native::peers::ChannelStat::new(String::new()),
                 open_cred: Arc::new(ClientCredentials::anonymous(TEST_PEER)),
-                ops: ops.into(),
-                parked: ParkedOps::default(),
-                put_scratch: None,
-                intro_wire: None,
-            },
+            })
+            .with_ops(ops),
         );
         channels
     }
@@ -19262,7 +19169,7 @@ mod tests {
     /// Regression: the dedicated `handle_process` data phase must
     /// reject a frame whose IOID was initialised as a different
     /// operation class. Before the fix it only checked
-    /// `ch.ops.contains_key(ioid)`, so a client could INIT a GET (or
+    /// `ch.ops().contains_key(ioid)`, so a client could INIT a GET (or
     /// MONITOR) and then drive a PROCESS data frame through it,
     /// triggering record processing on an op that never negotiated
     /// PROCESS. pvxs `serverget.cpp:421-436` resets the connection on
@@ -19373,7 +19280,7 @@ mod tests {
         let mut channels = ChannelTable::new();
         channels.insert(
             sid,
-            ChannelState {
+            ChannelState::new(ChannelOpen {
                 name: "dut".into(),
                 cid: 0,
                 sid,
@@ -19381,11 +19288,7 @@ mod tests {
                 source,
                 stat: crate::server_native::peers::ChannelStat::new(String::new()),
                 open_cred: Arc::new(ClientCredentials::anonymous(TEST_PEER)),
-                ops: ChannelOps::default(),
-                parked: ParkedOps::default(),
-                put_scratch: None,
-                intro_wire: None,
-            },
+            }),
         );
         channels
     }
@@ -19438,7 +19341,7 @@ mod tests {
         .await;
         let fatal = result.is_err();
 
-        let registered = channels.get(&sid).unwrap().ops.contains_key(&ioid);
+        let registered = channels.get(&sid).unwrap().ops().contains_key(&ioid);
         let reply_success = rx.try_recv().ok().map(|resp| {
             let (rframe, _) = try_parse_frame(&resp)
                 .expect("frame parses")
@@ -19596,7 +19499,7 @@ mod tests {
         )
         .await;
         let fatal = result.is_err();
-        let registered = channels.get(&sid).unwrap().ops.contains_key(&ioid);
+        let registered = channels.get(&sid).unwrap().ops().contains_key(&ioid);
         let replied = rx.try_recv().is_ok();
         (fatal, registered, replied)
     }
@@ -19775,7 +19678,7 @@ mod tests {
         );
         channels.insert(
             sid,
-            ChannelState {
+            ChannelState::new(ChannelOpen {
                 name: "dut".into(),
                 cid: 0,
                 sid,
@@ -19783,11 +19686,8 @@ mod tests {
                 source: source.clone(),
                 stat: crate::server_native::peers::ChannelStat::new(String::new()),
                 open_cred: Arc::new(ClientCredentials::anonymous(TEST_PEER)),
-                ops: ops.into(),
-                parked: ParkedOps::default(),
-                put_scratch: None,
-                intro_wire: None,
-            },
+            })
+            .with_ops(ops),
         );
 
         let (tx, mut rx) = test_srv_tx(16);
@@ -19939,7 +19839,7 @@ mod tests {
         // IOID stays reserved until the reply completes, then the completion
         // owner frees it (pvxs cleanup() after the reply).
         assert!(
-            channels.get(&sid).unwrap().ops.contains_key(&ioid),
+            channels.get(&sid).unwrap().ops().contains_key(&ioid),
             "the op is reserved until its reply is sent"
         );
         let fin = exec_fin_rx
@@ -19948,7 +19848,7 @@ mod tests {
             .expect("process task signals completion");
         apply_exec_finish(&mut channels, fin);
         assert!(
-            !channels.get(&sid).unwrap().ops.contains_key(&ioid),
+            !channels.get(&sid).unwrap().ops().contains_key(&ioid),
             "the last-request PROCESS op is freed after its reply"
         );
     }
@@ -19975,7 +19875,7 @@ mod tests {
         let mut channels = ChannelTable::new();
         channels.insert(
             sid,
-            ChannelState {
+            ChannelState::new(ChannelOpen {
                 name: "dut".into(),
                 cid: 0,
                 sid,
@@ -19983,11 +19883,8 @@ mod tests {
                 source: source.clone(),
                 stat: crate::server_native::peers::ChannelStat::new(String::new()),
                 open_cred: Arc::new(ClientCredentials::anonymous(TEST_PEER)),
-                ops: ops.into(),
-                parked: ParkedOps::default(),
-                put_scratch: None,
-                intro_wire: None,
-            },
+            })
+            .with_ops(ops),
         );
 
         let (tx, mut rx) = test_srv_tx(16);
@@ -20057,7 +19954,7 @@ mod tests {
         );
 
         assert!(
-            channels.get(&sid).unwrap().ops.contains_key(&ioid),
+            channels.get(&sid).unwrap().ops().contains_key(&ioid),
             "the op is reserved until its reply is sent"
         );
         let fin = exec_fin_rx
@@ -20066,7 +19963,7 @@ mod tests {
             .expect("put_get task signals completion");
         apply_exec_finish(&mut channels, fin);
         assert!(
-            !channels.get(&sid).unwrap().ops.contains_key(&ioid),
+            !channels.get(&sid).unwrap().ops().contains_key(&ioid),
             "the last-request PUT_GET op is freed after its reply"
         );
     }
@@ -20123,7 +20020,7 @@ mod tests {
         );
         channels.insert(
             sid,
-            ChannelState {
+            ChannelState::new(ChannelOpen {
                 name: "dut".into(),
                 cid: 0,
                 sid,
@@ -20131,11 +20028,8 @@ mod tests {
                 source: source.clone(),
                 stat: crate::server_native::peers::ChannelStat::new(String::new()),
                 open_cred: Arc::new(ClientCredentials::anonymous(TEST_PEER)),
-                ops: ops.into(),
-                parked: ParkedOps::default(),
-                put_scratch: None,
-                intro_wire: None,
-            },
+            })
+            .with_ops(ops),
         );
 
         let (tx, mut rx) = test_srv_tx(4);
@@ -20187,7 +20081,7 @@ mod tests {
         let mut channels = ChannelTable::new();
         channels.insert(
             sid,
-            ChannelState {
+            ChannelState::new(ChannelOpen {
                 name: "dut".into(),
                 cid: 0,
                 sid,
@@ -20195,11 +20089,7 @@ mod tests {
                 source: source.clone(),
                 stat: crate::server_native::peers::ChannelStat::new(String::new()),
                 open_cred: Arc::new(ClientCredentials::anonymous(TEST_PEER)),
-                ops: ChannelOps::default(),
-                parked: ParkedOps::default(),
-                put_scratch: None,
-                intro_wire: None,
-            },
+            }),
         );
 
         let (tx, mut rx) = test_srv_tx(4);
@@ -20258,7 +20148,7 @@ mod tests {
         let mut channels = ChannelTable::new();
         channels.insert(
             sid,
-            ChannelState {
+            ChannelState::new(ChannelOpen {
                 name: "dut".into(),
                 cid: 0,
                 sid,
@@ -20266,11 +20156,7 @@ mod tests {
                 source: source.clone(),
                 stat: stat.clone(),
                 open_cred: Arc::new(ClientCredentials::anonymous(TEST_PEER)),
-                ops: ChannelOps::default(),
-                parked: ParkedOps::default(),
-                put_scratch: None,
-                intro_wire: None,
-            },
+            }),
         );
 
         let (tx, mut rx) = test_srv_tx(4);
@@ -20367,7 +20253,7 @@ mod tests {
             let mut channels = ChannelTable::new();
             channels.insert(
                 sid,
-                ChannelState {
+                ChannelState::new(ChannelOpen {
                     name: "dut".into(),
                     cid,
                     sid,
@@ -20375,11 +20261,7 @@ mod tests {
                     source: source.clone(),
                     stat: stat.clone(),
                     open_cred: Arc::new(ClientCredentials::anonymous(TEST_PEER)),
-                    ops: ChannelOps::default(),
-                    parked: ParkedOps::default(),
-                    put_scratch: None,
-                    intro_wire: None,
-                },
+                }),
             );
             let peer_entry = crate::server_native::peers::PeerEntry::new(false);
             peer_entry.channel_opened(sid, stat.clone());
@@ -20446,7 +20328,7 @@ mod tests {
         let mut channels = ChannelTable::new();
         channels.insert(
             sid,
-            ChannelState {
+            ChannelState::new(ChannelOpen {
                 name: "dut".into(),
                 cid: 0,
                 sid,
@@ -20454,11 +20336,7 @@ mod tests {
                 source: source.clone(),
                 stat: crate::server_native::peers::ChannelStat::new(String::new()),
                 open_cred: Arc::new(ClientCredentials::anonymous(TEST_PEER)),
-                ops: ChannelOps::default(),
-                parked: ParkedOps::default(),
-                put_scratch: None,
-                intro_wire: None,
-            },
+            }),
         );
 
         let (tx, mut rx) = test_srv_tx(4);
@@ -20534,7 +20412,7 @@ mod tests {
         let mut channels = ChannelTable::new();
         channels.insert(
             sid,
-            ChannelState {
+            ChannelState::new(ChannelOpen {
                 name: "dut".into(),
                 cid: 0,
                 sid,
@@ -20542,11 +20420,7 @@ mod tests {
                 source: source.clone(),
                 stat: crate::server_native::peers::ChannelStat::new(String::new()),
                 open_cred: Arc::new(ClientCredentials::anonymous(TEST_PEER)),
-                ops: ChannelOps::default(),
-                parked: ParkedOps::default(),
-                put_scratch: None,
-                intro_wire: None,
-            },
+            }),
         );
 
         let (tx, mut rx) = test_srv_tx(4);
@@ -20644,7 +20518,7 @@ mod tests {
         let mut channels = ChannelTable::new();
         channels.insert(
             sid,
-            ChannelState {
+            ChannelState::new(ChannelOpen {
                 name: "dut".into(),
                 cid: 0,
                 sid,
@@ -20652,11 +20526,7 @@ mod tests {
                 source: source.clone(),
                 stat: crate::server_native::peers::ChannelStat::new(String::new()),
                 open_cred: Arc::new(ClientCredentials::anonymous(TEST_PEER)),
-                ops: ChannelOps::default(),
-                parked: ParkedOps::default(),
-                put_scratch: None,
-                intro_wire: None,
-            },
+            }),
         );
 
         let (tx, mut rx) = test_srv_tx(8);
@@ -20685,7 +20555,7 @@ mod tests {
         .await
         .expect("first GET_FIELD Ok");
         assert!(
-            channels[&sid].ops.contains_key(&ioid),
+            channels[&sid].ops().contains_key(&ioid),
             "slow GET_FIELD must reserve its IOID in ch.ops"
         );
 
@@ -21075,7 +20945,7 @@ mod tests {
         let mut channels = ChannelTable::new();
         channels.insert(
             sid,
-            ChannelState {
+            ChannelState::new(ChannelOpen {
                 name: "dut".into(),
                 cid: 0,
                 sid,
@@ -21083,11 +20953,8 @@ mod tests {
                 source: src.clone(),
                 stat: crate::server_native::peers::ChannelStat::new(String::new()),
                 open_cred: Arc::new(ClientCredentials::anonymous(TEST_PEER)),
-                ops: ops.into(),
-                parked: ParkedOps::default(),
-                put_scratch: None,
-                intro_wire: None,
-            },
+            })
+            .with_ops(ops),
         );
         channels
     }
@@ -21415,7 +21282,7 @@ mod tests {
             },
         );
         assert!(
-            channels[&sid].ops.contains_key(&ioid),
+            channels[&sid].ops().contains_key(&ioid),
             "a stale op_id must NOT evict the live op (ABA guard)"
         );
         assert_eq!(
@@ -21427,7 +21294,7 @@ mod tests {
         // Matching signal removes the op and fires the terminal edge once.
         apply_monitor_finish(&mut channels, MonitorFinished { sid, ioid, op_id });
         assert!(
-            !channels[&sid].ops.contains_key(&ioid),
+            !channels[&sid].ops().contains_key(&ioid),
             "a matching op_id removes the op from ch.ops"
         );
         assert_eq!(
@@ -21438,7 +21305,7 @@ mod tests {
     }
 
     /// After a server-originated FINISH the ioid is freed in `ch.ops`, so
-    /// the duplicate-INIT fatal gate (`ch.ops.contains_key(&ioid)` in
+    /// the duplicate-INIT fatal gate (`ch.ops().contains_key(&ioid)` in
     /// `handle_op`) no longer trips and a re-INIT of the same ioid is
     /// accepted as a fresh operation. Revert-verify: skip the removal and
     /// `contains_key` stays true (pre-fix: re-INIT rejected as duplicate).
@@ -21455,12 +21322,12 @@ mod tests {
         let mut channels = bfr12_started_monitor_channels(sid, ioid, op_id, &src, &intro);
 
         assert!(
-            channels[&sid].ops.contains_key(&ioid),
+            channels[&sid].ops().contains_key(&ioid),
             "precondition: a started monitor op trips the duplicate-INIT gate"
         );
         apply_monitor_finish(&mut channels, MonitorFinished { sid, ioid, op_id });
         assert!(
-            !channels[&sid].ops.contains_key(&ioid),
+            !channels[&sid].ops().contains_key(&ioid),
             "after FINISH the ioid is free → a re-INIT is accepted as fresh, not duplicate"
         );
     }
@@ -21494,7 +21361,7 @@ mod tests {
         let mut channels = ChannelTable::new();
         channels.insert(
             sid,
-            ChannelState {
+            ChannelState::new(ChannelOpen {
                 name: "dut".into(),
                 cid: 0,
                 sid,
@@ -21502,11 +21369,7 @@ mod tests {
                 source: source.clone(),
                 stat: crate::server_native::peers::ChannelStat::new(String::new()),
                 open_cred: Arc::new(ClientCredentials::anonymous(TEST_PEER)),
-                ops: ChannelOps::default(),
-                parked: ParkedOps::default(),
-                put_scratch: None,
-                intro_wire: None,
-            },
+            }),
         );
 
         let (tx, mut rx) = test_srv_tx(64);
@@ -21555,7 +21418,7 @@ mod tests {
         let _ = rx.recv().await.expect("INIT reply");
 
         // The op-instance id minted at INIT — the guard signals THIS id.
-        let op_id = channels[&sid].ops[&ioid].monitor_op_id;
+        let op_id = channels[&sid].ops()[&ioid].monitor_op_id;
 
         // MONITOR START (subcmd 0x44 = start | process) spawns the task
         // and fires the Idle→Executing edge.
@@ -21589,7 +21452,7 @@ mod tests {
         .expect("MONITOR START ok");
 
         assert!(
-            channels[&sid].ops.contains_key(&ioid),
+            channels[&sid].ops().contains_key(&ioid),
             "op is live in ch.ops immediately after START"
         );
         assert_eq!(
@@ -21630,7 +21493,7 @@ mod tests {
         // Owner applies the signal: op removed, terminal Executing→Idle.
         apply_monitor_finish(&mut channels, fin);
         assert!(
-            !channels[&sid].ops.contains_key(&ioid),
+            !channels[&sid].ops().contains_key(&ioid),
             "owner removes the op from ch.ops on monitor finish"
         );
         assert_eq!(
@@ -21686,7 +21549,7 @@ mod tests {
         let mut channels = ChannelTable::new();
         channels.insert(
             1,
-            ChannelState {
+            ChannelState::new(ChannelOpen {
                 name: "dut".into(),
                 cid: 0,
                 sid: 1,
@@ -21694,11 +21557,7 @@ mod tests {
                 source,
                 stat: crate::server_native::peers::ChannelStat::new(String::new()),
                 open_cred: Arc::new(ClientCredentials::anonymous(TEST_PEER)),
-                ops: ChannelOps::default(),
-                parked: ParkedOps::default(),
-                put_scratch: None,
-                intro_wire: None,
-            },
+            }),
         );
         channels
     }
@@ -21834,7 +21693,7 @@ mod tests {
         for sid in [1u32, 2u32] {
             channels.insert(
                 sid,
-                ChannelState {
+                ChannelState::new(ChannelOpen {
                     name: format!("dut{sid}"),
                     cid: sid - 1,
                     sid,
@@ -21842,11 +21701,7 @@ mod tests {
                     source: source.clone(),
                     stat: crate::server_native::peers::ChannelStat::new(String::new()),
                     open_cred: Arc::new(ClientCredentials::anonymous(TEST_PEER)),
-                    ops: ChannelOps::default(),
-                    parked: ParkedOps::default(),
-                    put_scratch: None,
-                    intro_wire: None,
-                },
+                }),
             );
         }
         channels
@@ -21951,7 +21806,7 @@ mod tests {
         ops.insert(9, op_probe());
         channels.insert(
             3,
-            ChannelState {
+            ChannelState::new(ChannelOpen {
                 name: "dut3".into(),
                 cid: 2,
                 sid: 3,
@@ -21959,11 +21814,8 @@ mod tests {
                 source,
                 stat: crate::server_native::peers::ChannelStat::new(String::new()),
                 open_cred: Arc::new(ClientCredentials::anonymous(TEST_PEER)),
-                ops: ops.into(),
-                parked: ParkedOps::default(),
-                put_scratch: None,
-                intro_wire: None,
-            },
+            })
+            .with_ops(ops),
         );
         assert_eq!(channels.ioid_owner(9), Some(3));
         assert!(channels.remove(&3).is_some());
@@ -21982,7 +21834,7 @@ mod tests {
         channels.get_mut(&1).unwrap().insert_op(7, op_probe());
         let replacement = two_channel_conn(source).remove(&1).unwrap();
         let old = channels.insert(1, replacement).expect("sid 1 was live");
-        assert!(old.ops.contains_key(&7));
+        assert!(old.ops().contains_key(&7));
         assert!(!channels.ioid_live(7));
         channels.get_mut(&1).unwrap().insert_op(7, op_probe());
         assert_eq!(channels.ioid_owner(7), Some(1));
@@ -22092,7 +21944,7 @@ mod tests {
         handle_destroy_request(&frame, &mut channels).expect("DESTROY_REQUEST ok");
 
         assert!(
-            !channels.get(&1).unwrap().ops.contains_key(&ioid),
+            !channels.get(&1).unwrap().ops().contains_key(&ioid),
             "DESTROY keyed by IOID must remove the op from its real channel \
              regardless of the supplied SID"
         );
@@ -22330,7 +22182,7 @@ mod tests {
         );
         let ch = channels.get(&sid).expect("channel still open");
         assert!(
-            ch.parked.contains_key(&ioid),
+            ch.parked().contains_key(&ioid),
             "the INIT frame is held on the channel until the descriptor arrives"
         );
         assert!(
@@ -22736,7 +22588,7 @@ mod autoexec_tests {
         let mut channels = ChannelTable::new();
         channels.insert(
             sid,
-            ChannelState {
+            ChannelState::new(ChannelOpen {
                 name: "dut".into(),
                 cid: 0,
                 sid,
@@ -22744,11 +22596,7 @@ mod autoexec_tests {
                 source: source.clone(),
                 stat: crate::server_native::peers::ChannelStat::new(String::new()),
                 open_cred: Arc::new(ClientCredentials::anonymous(TEST_PEER)),
-                ops: ChannelOps::default(),
-                parked: ParkedOps::default(),
-                put_scratch: None,
-                intro_wire: None,
-            },
+            }),
         );
 
         let (tx, mut rx) = test_srv_tx(16);
@@ -22974,7 +22822,7 @@ mod r14_tests {
         );
         channels.insert(
             sid,
-            ChannelState {
+            ChannelState::new(ChannelOpen {
                 name: "slow".into(),
                 cid: 1,
                 sid,
@@ -22982,11 +22830,8 @@ mod r14_tests {
                 source: source.clone(),
                 stat: crate::server_native::peers::ChannelStat::new(String::new()),
                 open_cred: Arc::new(ClientCredentials::anonymous(TEST_PEER)),
-                ops: ops.into(),
-                parked: ParkedOps::default(),
-                put_scratch: None,
-                intro_wire: None,
-            },
+            })
+            .with_ops(ops),
         );
 
         let (tx, mut rx) = test_srv_tx(8);
@@ -23167,7 +23012,7 @@ mod bfr15_tests {
         let mut channels = ChannelTable::new();
         channels.insert(
             sid,
-            ChannelState {
+            ChannelState::new(ChannelOpen {
                 name: "dut".into(),
                 cid: 1,
                 sid,
@@ -23175,11 +23020,8 @@ mod bfr15_tests {
                 source,
                 stat: crate::server_native::peers::ChannelStat::new(String::new()),
                 open_cred: Arc::new(ClientCredentials::anonymous(TEST_PEER)),
-                ops: ops.into(),
-                parked: ParkedOps::default(),
-                put_scratch: None,
-                intro_wire: None,
-            },
+            })
+            .with_ops(ops),
         );
         channels
     }
@@ -23242,7 +23084,7 @@ mod bfr15_tests {
         channels
             .get(&sid)
             .expect("channel present")
-            .ops
+            .ops()
             .get(&ioid)
             .expect("op present")
             .exec_state
@@ -23252,7 +23094,7 @@ mod bfr15_tests {
         channels
             .get(&sid)
             .expect("channel present")
-            .ops
+            .ops()
             .get(&ioid)
             .expect("op present")
             .data_task_abort
@@ -23530,7 +23372,7 @@ mod bfr15_tests {
             .expect("DESTROY_REQUEST ok");
         wait_for(&get_cancelled, 1).await;
         assert!(
-            !channels.get(&sid).unwrap().ops.contains_key(&ioid),
+            !channels.get(&sid).unwrap().ops().contains_key(&ioid),
             "DESTROY_REQUEST must remove the op"
         );
     }
@@ -23803,7 +23645,7 @@ mod bfr15_tests {
         ops.insert(ioid, op);
         channels.insert(
             sid,
-            ChannelState {
+            ChannelState::new(ChannelOpen {
                 name: "dut".into(),
                 cid: 0,
                 sid,
@@ -23811,11 +23653,8 @@ mod bfr15_tests {
                 source,
                 stat: crate::server_native::peers::ChannelStat::new(String::new()),
                 open_cred: Arc::new(ClientCredentials::anonymous(TEST_PEER)),
-                ops: ops.into(),
-                parked: ParkedOps::default(),
-                put_scratch: None,
-                intro_wire: None,
-            },
+            })
+            .with_ops(ops),
         );
 
         // The owner does what the read loop's `biased` select does: apply any
@@ -23829,7 +23668,7 @@ mod bfr15_tests {
             apply_exec_finish(&mut channels, fin);
             assert!(
                 channels[&sid]
-                    .ops
+                    .ops()
                     .get(&ioid)
                     .is_none_or(|op| op.data_task_abort.is_none()),
                 "applying the signal must drop the task's abort guard"
@@ -23879,7 +23718,7 @@ mod bfr15_tests {
         ops.insert(ioid, op);
         channels.insert(
             sid,
-            ChannelState {
+            ChannelState::new(ChannelOpen {
                 name: "dut".into(),
                 cid: 0,
                 sid,
@@ -23887,11 +23726,8 @@ mod bfr15_tests {
                 source,
                 stat: crate::server_native::peers::ChannelStat::new(String::new()),
                 open_cred: Arc::new(ClientCredentials::anonymous(TEST_PEER)),
-                ops: ops.into(),
-                parked: ParkedOps::default(),
-                put_scratch: None,
-                intro_wire: None,
-            },
+            })
+            .with_ops(ops),
         );
 
         // ERROR completion of the last-request GET: the op survives, returns to
@@ -23907,7 +23743,7 @@ mod bfr15_tests {
             },
         );
         {
-            let op = &channels[&sid].ops[&ioid];
+            let op = &channels[&sid].ops()[&ioid];
             assert_eq!(
                 op.exec_state,
                 ExecState::Idle,
@@ -23935,7 +23771,7 @@ mod bfr15_tests {
             },
         );
         assert!(
-            !channels[&sid].ops.contains_key(&ioid),
+            !channels[&sid].ops().contains_key(&ioid),
             "a SUCCESSFUL last-request reply removes the op (serverget.cpp:111-114)"
         );
     }
@@ -23965,7 +23801,7 @@ mod bfr15_tests {
         ops.insert(ioid, op);
         channels.insert(
             sid,
-            ChannelState {
+            ChannelState::new(ChannelOpen {
                 name: "dut".into(),
                 cid: 0,
                 sid,
@@ -23973,11 +23809,8 @@ mod bfr15_tests {
                 source,
                 stat: crate::server_native::peers::ChannelStat::new(String::new()),
                 open_cred: Arc::new(ClientCredentials::anonymous(TEST_PEER)),
-                ops: ops.into(),
-                parked: ParkedOps::default(),
-                put_scratch: None,
-                intro_wire: None,
-            },
+            })
+            .with_ops(ops),
         );
 
         // Error completion (success = false) of a one-shot GET_FIELD still
@@ -23993,7 +23826,7 @@ mod bfr15_tests {
             },
         );
         assert!(
-            !channels[&sid].ops.contains_key(&ioid),
+            !channels[&sid].ops().contains_key(&ioid),
             "GET_FIELD one-shot is removed on every terminal reply, even an error"
         );
     }

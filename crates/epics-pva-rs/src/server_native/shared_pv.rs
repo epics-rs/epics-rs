@@ -201,6 +201,37 @@ pub struct MonitorRing<T = PvField> {
 /// alias because that is the only element type a `SharedPV` ever queues.
 pub type MonitorInbox = MonitorRing<PvField>;
 
+/// How a full ring folds a newer element into its tail — pvxs
+/// `servermon.cpp:283-286` `queue.back().assign(val)`.
+///
+/// The rule belongs to the element type, not to the ring: a whole value
+/// is simply replaced, but an element that carries its own changed set
+/// has to keep the tail's marks, or the leaves only the squashed-away
+/// update changed reach the client as "unchanged" and go stale there.
+pub trait SquashTail {
+    /// Fold `newer` into `self`, the ring's tail.
+    fn squash(&mut self, newer: Self);
+}
+
+impl SquashTail for PvField {
+    /// A `SharedPV` stores whole values, so the newest one is the state.
+    fn squash(&mut self, newer: Self) {
+        *self = newer;
+    }
+}
+
+impl<T> MonitorRing<T> {
+    /// A ring of at most `limit` queued elements (at least one) and its
+    /// producer endpoint. This is how a [`ChannelSource`] outside this crate
+    /// serves [`MonitorStream::Ring`] directly instead of pumping its own
+    /// queue into a channel from a task per subscriber.
+    ///
+    /// [`ChannelSource`]: super::source::ChannelSource
+    pub fn bounded(limit: usize) -> (MonitorOutbox<T>, MonitorRing<T>) {
+        make_monitor_queue(limit)
+    }
+}
+
 fn make_monitor_queue<T>(limit: usize) -> (MonitorOutbox<T>, MonitorRing<T>) {
     let limit = limit.max(1);
     let shared = Arc::new(MonitorQueueShared {
@@ -228,11 +259,11 @@ fn make_monitor_queue<T>(limit: usize) -> (MonitorOutbox<T>, MonitorRing<T>) {
     )
 }
 
-impl<T> MonitorOutbox<T> {
-    /// Post a value. `maybe=false`: full queue → squash tail (pvxs servermon.cpp:283-286).
-    /// `maybe=true`: full queue → drop silently.
+impl<T: SquashTail> MonitorOutbox<T> {
+    /// Post a value. `maybe=false`: full queue → squash tail (pvxs servermon.cpp:283-286,
+    /// the element's [`SquashTail`] rule). `maybe=true`: full queue → drop silently.
     /// Returns `false` when the receiver has been dropped (caller should remove this outbox).
-    fn post(&self, value: T, maybe: bool) -> bool {
+    pub fn post(&self, value: T, maybe: bool) -> bool {
         if self.shared.receiver_dropped.load(Ordering::Relaxed) {
             return false;
         }
@@ -246,7 +277,7 @@ impl<T> MonitorOutbox<T> {
         } else if !maybe {
             // pvxs servermon.cpp:283-286: queue.back().assign(val) — squash tail
             if let Some(tail) = inner.items.back_mut() {
-                *tail = value;
+                tail.squash(value);
             }
         }
         // maybe+full: drop silently — same as pvxs "nope" branch (servermon.cpp:287)
@@ -254,8 +285,12 @@ impl<T> MonitorOutbox<T> {
         self.shared.notify.notify_one();
         !self.shared.receiver_dropped.load(Ordering::Relaxed)
     }
+}
 
-    fn is_closed(&self) -> bool {
+impl<T> MonitorOutbox<T> {
+    /// True once the ring's receiver was dropped: nothing posted here can
+    /// be delivered any more, so the holder should drop this endpoint.
+    pub fn is_closed(&self) -> bool {
         self.shared.receiver_dropped.load(Ordering::Relaxed)
     }
 }

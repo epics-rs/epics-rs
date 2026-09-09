@@ -2018,6 +2018,48 @@ impl From<PvField> for MonitorUpdate {
     }
 }
 
+/// Append every path of `from` that `into` does not already hold.
+fn union_paths(into: &mut Vec<String>, from: &[String]) {
+    for p in from {
+        if !into.contains(p) {
+            into.push(p.clone());
+        }
+    }
+}
+
+impl crate::server_native::shared_pv::SquashTail for MonitorUpdate {
+    /// pvxs `queue.back().assign(val)`: the newer value wins, and the
+    /// changed sets union, because the tail's own marks were never
+    /// delivered — dropping them would tell the client those leaves are
+    /// unchanged. `None` means every leaf and absorbs the other side. A
+    /// leaf changed in BOTH updates lost a transition, which is what
+    /// `overrun` records (pva2pva `moncache.cpp:160-168`); with `None` on
+    /// one side that is the other side's whole set, and with `None` on
+    /// both there is no path list to name it by, so nothing is added. A
+    /// descriptor-change boundary stays set once seen: the loop emits
+    /// FINISH for it before it would read the (superseded) value.
+    fn squash(&mut self, newer: Self) {
+        let lost = self.marked.take();
+        let both = match (&lost, &newer.marked) {
+            (Some(a), Some(b)) => a.iter().filter(|p| b.contains(p)).cloned().collect(),
+            (None, Some(b)) => b.clone(),
+            (Some(a), None) => a.clone(),
+            (None, None) => Vec::new(),
+        };
+        union_paths(&mut self.overrun, &newer.overrun);
+        union_paths(&mut self.overrun, &both);
+        self.marked = match (lost, newer.marked) {
+            (Some(mut a), Some(b)) => {
+                union_paths(&mut a, &b);
+                Some(a)
+            }
+            _ => None,
+        };
+        self.value = newer.value;
+        self.type_changed |= newer.type_changed;
+    }
+}
+
 /// A value the server is about to FRAME with a changed-bitset — a GET
 /// reply, a PUT_GET readback, or a connect-time monitor seed — plus the
 /// leaves the source assigned into it. The read-side mirror of
@@ -3240,9 +3282,96 @@ impl<T: ChannelSource + 'static> ChannelSourceObj for T {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::server_native::shared_pv::{MonitorRing, SquashTail};
 
     fn batch(names: &[&str]) -> Arc<[String]> {
         names.iter().map(|s| s.to_string()).collect()
+    }
+
+    fn marked(v: i32, paths: &[&str]) -> MonitorUpdate {
+        MonitorUpdate {
+            value: PvField::Scalar(ScalarValue::Int(v)),
+            marked: Some(paths.iter().map(|p| p.to_string()).collect()),
+            type_changed: false,
+            overrun: Vec::new(),
+        }
+    }
+
+    fn paths(u: &MonitorUpdate) -> Option<Vec<&str>> {
+        u.marked
+            .as_ref()
+            .map(|m| m.iter().map(String::as_str).collect())
+    }
+
+    /// Boundary: both sides carry a marked set. The tail keeps every leaf
+    /// either update changed, the newest value, and records the leaf that
+    /// changed twice as overrun.
+    #[test]
+    fn squash_unions_marks_and_records_the_overlap_as_overrun() {
+        let mut tail = marked(1, &["value", "alarm.severity"]);
+        tail.squash(marked(2, &["value", "timeStamp.secondsPastEpoch"]));
+        assert_eq!(tail.value, PvField::Scalar(ScalarValue::Int(2)));
+        assert_eq!(
+            paths(&tail).unwrap(),
+            ["value", "alarm.severity", "timeStamp.secondsPastEpoch"]
+        );
+        assert_eq!(tail.overrun, ["value"]);
+        assert!(!tail.type_changed);
+    }
+
+    /// Boundary: `None` (every leaf) on either side. The union is every
+    /// leaf, and the overlap is the other side's whole set; with `None` on
+    /// both there is no list to name the overlap by.
+    #[test]
+    fn squash_treats_none_as_every_leaf() {
+        let mut tail = MonitorUpdate::from(PvField::Scalar(ScalarValue::Int(1)));
+        tail.squash(marked(2, &["value"]));
+        assert_eq!(paths(&tail), None);
+        assert_eq!(tail.overrun, ["value"]);
+
+        let mut tail = marked(1, &["value"]);
+        tail.squash(MonitorUpdate::from(PvField::Scalar(ScalarValue::Int(2))));
+        assert_eq!(paths(&tail), None);
+        assert_eq!(tail.overrun, ["value"]);
+
+        let mut tail = MonitorUpdate::from(PvField::Scalar(ScalarValue::Int(1)));
+        tail.squash(MonitorUpdate::from(PvField::Scalar(ScalarValue::Int(2))));
+        assert_eq!(paths(&tail), None);
+        assert!(tail.overrun.is_empty());
+    }
+
+    /// Boundary: a descriptor-change boundary is never squashed away, in
+    /// either position.
+    #[test]
+    fn squash_keeps_a_type_change_boundary() {
+        let mut tail = marked(1, &["value"]);
+        tail.squash(MonitorUpdate::type_change());
+        assert!(tail.type_changed);
+
+        let mut tail = MonitorUpdate::type_change();
+        tail.squash(marked(2, &["value"]));
+        assert!(tail.type_changed);
+        assert_eq!(tail.value, PvField::Scalar(ScalarValue::Int(2)));
+    }
+
+    /// The ring applies the element rule at its limit: three posts into a
+    /// two-deep ring leave the first intact and the last two folded.
+    #[epics_macros_rs::epics_test]
+    async fn bounded_ring_squashes_marked_updates_at_its_limit() {
+        let (outbox, mut ring) = MonitorRing::<MonitorUpdate>::bounded(2);
+        assert!(outbox.post(marked(1, &["value"]), false));
+        assert!(outbox.post(marked(2, &["value"]), false));
+        assert!(outbox.post(marked(3, &["alarm.severity"]), false));
+        let first = ring.recv().await.unwrap();
+        assert_eq!(first.value, PvField::Scalar(ScalarValue::Int(1)));
+        assert_eq!(paths(&first).unwrap(), ["value"]);
+        let folded = ring.recv().await.unwrap();
+        assert_eq!(folded.value, PvField::Scalar(ScalarValue::Int(3)));
+        assert_eq!(paths(&folded).unwrap(), ["value", "alarm.severity"]);
+        assert!(folded.overrun.is_empty());
+        drop(ring);
+        assert!(outbox.is_closed());
+        assert!(!outbox.post(marked(4, &["value"]), false));
     }
 
     /// The channel invalidator must be lossless under backlog: a connection

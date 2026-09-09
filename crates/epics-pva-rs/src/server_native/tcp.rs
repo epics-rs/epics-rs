@@ -3809,10 +3809,18 @@ pub(super) async fn handle_connection_io(
     // loop's `select!` (see `hb_tick` below), so it ends with the loop.
     let _writer_guard = AbortOnDrop(writer_task.abort_handle());
 
-    // Per-connection liveness for the idle-timeout watchdog. A plain local,
-    // not an `Arc<AtomicU64>`: the read loop both stamps it (on every frame)
-    // and reads it (in the heartbeat arm), so there is no second owner to
-    // share it with.
+    // Per-connection liveness for the idle and read-stall watchdogs. A
+    // plain local, not an `Arc<AtomicU64>`: the read loop both stamps it
+    // (on every frame) and reads it (in the two watchdog arms), so there
+    // is no second owner to share it with.
+    //
+    // Both watchdogs measure peer silence *while this loop is reading*. A
+    // CREATE_CHANNEL resolver pause (`!pending_creates.is_empty()`, the
+    // gate on the socket arm) is the loop's own choice — the peer's frames
+    // sit unread in the socket — so neither arm counts it, and the stamp
+    // restarts when reads resume. libevent runs a bufferevent's read
+    // timeout only while `EV_READ` is enabled, which is the bound pvxs's
+    // connection timeout rides on.
     let mut last_rx = now_nanos();
 
     // Server-side echo heartbeat as a deadline arm of the read loop rather
@@ -4329,6 +4337,11 @@ pub(super) async fn handle_connection_io(
                 if let Some(req) = pending_creates.pop_front() {
                     permit.send(req);
                 }
+                if pending_creates.is_empty() {
+                    // Reads resume. The pause was this loop's choice, not
+                    // peer silence, so the watchdog clocks restart here.
+                    last_rx = now_nanos();
+                }
                 continue;
             }
             inv_res = inv_rx.recv(), if !inv_closed => {
@@ -4376,7 +4389,7 @@ pub(super) async fn handle_connection_io(
                 // `out_order` through shared cells to this loop reading its
                 // own `last_rx` and `order` directly.
                 let elapsed = now_nanos().saturating_sub(last_rx);
-                if Duration::from_nanos(elapsed) > idle_timeout {
+                if pending_creates.is_empty() && Duration::from_nanos(elapsed) > idle_timeout {
                     warn!(?peer, "PVA client idle > {idle_timeout:?}; closing");
                     hb_stopped = true;
                     continue;
@@ -4396,10 +4409,11 @@ pub(super) async fn handle_connection_io(
                 // Read-stall bound, moved out of `read_frame` (see the
                 // ticker's construction above). `last_rx` stamps every
                 // completed frame, so this fires only when the peer has
-                // sent no complete frame for `op_timeout` — a wedged or
-                // byte-trickling circuit.
+                // sent no complete frame for `op_timeout` while the loop
+                // was reading — a wedged or byte-trickling circuit, never
+                // a resolver pause.
                 let elapsed = now_nanos().saturating_sub(last_rx);
-                if Duration::from_nanos(elapsed) >= op_timeout {
+                if pending_creates.is_empty() && Duration::from_nanos(elapsed) >= op_timeout {
                     return Err(PvaError::Timeout);
                 }
                 continue;

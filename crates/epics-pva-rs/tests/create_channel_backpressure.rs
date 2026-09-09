@@ -21,7 +21,9 @@ use tokio::sync::watch;
 
 use epics_pva_rs::proto::{ByteOrder, Command, PvaHeader, ReadExt, WriteExt, encode_string_into};
 use epics_pva_rs::pvdata::{FieldDesc, PvField, ScalarType};
-use epics_pva_rs::server_native::{ChannelSource, MonitorStream, OpError, PvaServer};
+use epics_pva_rs::server_native::{
+    ChannelSource, MonitorStream, OpError, PvaServer, PvaServerConfig,
+};
 
 const ORDER: ByteOrder = ByteOrder::Little;
 /// Frames the peer writes in one burst. Far above the server's request
@@ -139,6 +141,57 @@ async fn next_create_channel_cid(sock: &mut tokio::net::TcpStream) -> u32 {
     }
 }
 
+/// Wait until the gated burst has parked the read loop: a worker is inside
+/// `has_pv`, and the bytes consumed from `peer` have held still for a
+/// while (with the queue full the loop is parked on `reserve()` and reads
+/// nothing more). Returns the settled byte count.
+async fn wait_for_read_pause(
+    source: &GatedSource,
+    server: &PvaServer,
+    peer: std::net::SocketAddr,
+) -> u64 {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while source.entered.load(Ordering::SeqCst) == 0 {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the resolver never entered has_pv"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let mut last = bytes_in(server, peer);
+    let mut stable_since = tokio::time::Instant::now();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        let now = bytes_in(server, peer);
+        if now != last {
+            last = now;
+            stable_since = tokio::time::Instant::now();
+        } else if stable_since.elapsed() >= Duration::from_millis(400) {
+            return last;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "bytes_in never settled while the source was gated"
+        );
+    }
+}
+
+/// Read every CREATE_CHANNEL reply the burst is owed, sorted by cid.
+async fn read_burst_replies(sock: &mut tokio::net::TcpStream) -> Vec<u32> {
+    let mut replies = tokio::time::timeout(Duration::from_secs(20), async {
+        let mut cids = Vec::with_capacity(BURST);
+        for _ in 0..BURST {
+            cids.push(next_create_channel_cid(sock).await);
+        }
+        cids
+    })
+    .await
+    .expect("not every CREATE_CHANNEL reply arrived — resolver and read loop wedged");
+    replies.sort_unstable();
+    replies
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn create_channel_burst_is_backpressured() {
     let source = Arc::new(GatedSource::new());
@@ -156,35 +209,7 @@ async fn create_channel_burst_is_backpressured() {
     let burst: Vec<u8> = (0..BURST as u32).flat_map(create_channel_frame).collect();
     sock.write_all(&burst).await.expect("write burst");
 
-    // A worker has taken the first name and is parked in `has_pv`.
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
-    while source.entered.load(Ordering::SeqCst) == 0 {
-        assert!(
-            tokio::time::Instant::now() < deadline,
-            "the resolver never entered has_pv"
-        );
-        tokio::time::sleep(Duration::from_millis(10)).await;
-    }
-    // Wait until the read loop stops consuming: the byte count must hold
-    // still for a while. With the queue full the loop is parked on
-    // `reserve()` and nothing more is read.
-    let mut last = bytes_in(&server, me);
-    let mut stable_since = tokio::time::Instant::now();
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
-    loop {
-        tokio::time::sleep(Duration::from_millis(20)).await;
-        let now = bytes_in(&server, me);
-        if now != last {
-            last = now;
-            stable_since = tokio::time::Instant::now();
-        } else if stable_since.elapsed() >= Duration::from_millis(400) {
-            break;
-        }
-        assert!(
-            tokio::time::Instant::now() < deadline,
-            "bytes_in never settled while the source was gated"
-        );
-    }
+    let last = wait_for_read_pause(&source, &server, me).await;
     let consumed = last as usize / frame_len;
     assert!(
         consumed <= MAX_CONSUMED_FRAMES,
@@ -203,17 +228,7 @@ async fn create_channel_burst_is_backpressured() {
     // queue fills while the read loop is still waiting for request-queue
     // space, and every reply must still drain.
     source.gate.send_replace(true);
-    let replies = tokio::time::timeout(Duration::from_secs(20), async {
-        let mut cids = Vec::with_capacity(BURST);
-        for _ in 0..BURST {
-            cids.push(next_create_channel_cid(&mut sock).await);
-        }
-        cids
-    })
-    .await
-    .expect("not every CREATE_CHANNEL reply arrived — resolver and read loop wedged");
-    let mut replies = replies;
-    replies.sort_unstable();
+    let replies = read_burst_replies(&mut sock).await;
     let expected: Vec<u32> = (0..BURST as u32).collect();
     assert_eq!(replies, expected, "every cid must be answered exactly once");
     let in_flight = source.max_in_has_pv.load(Ordering::SeqCst);
@@ -228,5 +243,77 @@ async fn create_channel_burst_is_backpressured() {
     );
 
     drop(sock);
+    drop(server);
+}
+
+/// The read-stall watchdog (`op_timeout`) measures peer silence while the
+/// loop is reading. A resolver pause is the loop's own choice — the peer's
+/// frames sit unread in the socket — so it must not count as silence and
+/// tear down a connection whose open channels are healthy. Once reads
+/// resume and the peer really is silent, the watchdog runs again.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn stall_watchdog_skips_a_resolver_pause_and_runs_once_reads_resume() {
+    const OP_TIMEOUT: Duration = Duration::from_secs(1);
+    let source = Arc::new(GatedSource::new());
+    let config = PvaServerConfig {
+        op_timeout: OP_TIMEOUT,
+        ..PvaServerConfig::isolated()
+    };
+    let server = PvaServer::start(source.clone(), config).expect("isolated test server must start");
+    let port = server.report().tcp_port;
+
+    let mut sock = tokio::net::TcpStream::connect((std::net::Ipv4Addr::LOCALHOST, port))
+        .await
+        .expect("connect to test server");
+    let me = sock.local_addr().expect("local addr");
+    // Consume the server's SET_BYTE_ORDER so the socket holds nothing the
+    // liveness peek below could mistake for a live connection.
+    let mut hdr = [0u8; PvaHeader::SIZE];
+    sock.read_exact(&mut hdr)
+        .await
+        .expect("read SET_BYTE_ORDER");
+    let h = PvaHeader::decode(&mut std::io::Cursor::new(&hdr[..])).expect("decode header");
+    assert!(
+        h.flags.is_control(),
+        "first frame from the server is a control frame"
+    );
+    let burst: Vec<u8> = (0..BURST as u32).flat_map(create_channel_frame).collect();
+    sock.write_all(&burst).await.expect("write burst");
+    wait_for_read_pause(&source, &server, me).await;
+
+    // Paused well past `op_timeout`. A closed connection shows as EOF (or
+    // a reset) on a peek; a live one has nothing to read and times out.
+    tokio::time::sleep(OP_TIMEOUT * 5 / 2).await;
+    let mut probe = [0u8; 1];
+    let peeked = tokio::time::timeout(Duration::from_millis(100), sock.peek(&mut probe)).await;
+    assert!(
+        !matches!(peeked, Ok(Ok(0)) | Ok(Err(_))),
+        "the server closed the connection during the resolver pause ({peeked:?}); the stall \
+         watchdog counted the pause as peer silence"
+    );
+
+    // Release: the loop resumes reading and every reply must still arrive.
+    source.gate.send_replace(true);
+    let replies = read_burst_replies(&mut sock).await;
+    let expected: Vec<u32> = (0..BURST as u32).collect();
+    assert_eq!(replies, expected, "every cid must be answered exactly once");
+
+    // The peer now stays silent while the loop is reading: the watchdog
+    // must close the connection within `op_timeout` plus one tick.
+    let closed = tokio::time::timeout(OP_TIMEOUT * 3, async {
+        let mut sink = [0u8; 256];
+        loop {
+            match sock.read(&mut sink).await {
+                Ok(0) | Err(_) => break,
+                Ok(_) => {}
+            }
+        }
+    })
+    .await;
+    assert!(
+        closed.is_ok(),
+        "the server kept a silent peer past op_timeout once reads had resumed"
+    );
+
     drop(server);
 }

@@ -1,5 +1,21 @@
 # Changelog
 
+## v0.28.2 — 2026-09-09
+
+Patch release. The PVA server drops the two admission caps pvxs does
+not have: `PvaServerConfig::max_ops_per_channel` (64, which refused the
+65th monitor a p4p client placed on one PV) and
+`max_channels_per_connection` (1024, which failed the next PV of a
+client past it), together with `EPICS_PVAS_MAX_OPS_PER_CHANNEL` and
+`EPICS_PVAS_MAX_CHANNELS_PER_CONN`. What the caps had bounded is now
+bounded the way pvxs bounds it: CREATE_CHANNEL resolution runs on a
+fixed per-connection worker pool behind a queue the read loop stops
+reading for, SIDs are allocated per connection at admission and refused
+only when exhausted, the connection-wide IOID lookups are an index kept
+by the channel table rather than a scan over every channel, and the
+idle and read-stall watchdogs run only while the loop is reading. The
+two removed fields are the release's only public-API change.
+
 ## v0.28.1 — 2026-09-03
 
 Patch release. areaDetector read-only RBVs (`MaxSizeX`/`MaxSizeY`,

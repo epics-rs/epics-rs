@@ -83,7 +83,7 @@ pub use peers::{ChannelReport, PeerEntry, PeerRegistry, PeerSnapshot};
 #[cfg(tokio_backend)]
 pub use runtime::{PvaServer, ServerReportHandle, run_pva_server};
 pub use server_info::{SERVER_PV_NAME, SERVER_SOURCE_NAME, ServerInfoSource, USER_SOURCE_NAME};
-pub use shared_pv::{AddPvError, SharedPV, SharedSource};
+pub use shared_pv::{AddPvError, MonitorOutbox, MonitorRing, SharedPV, SharedSource, SquashTail};
 pub use source::{
     ChannelContext, ChannelInvalidator, ChannelSource, ChannelSourceObj, DynSource, MonitorOptions,
     MonitorStream, MonitorUpdate, OpError, OpErrorKind, RawMonitorEvent, UpstreamMonitor,

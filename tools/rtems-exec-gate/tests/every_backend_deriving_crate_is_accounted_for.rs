@@ -156,6 +156,7 @@ const SCOPE_GATED: &[(&str, &str)] = &[
         "tests/zero_length_array_write_is_not_a_short_frame.rs",
     ),
     ("epics-pva-rs", "tests/channel_array.rs"),
+    ("epics-pva-rs", "tests/create_channel_backpressure.rs"),
     ("epics-pva-rs", "tests/heartbeat_echo.rs"),
     ("epics-pva-rs", "tests/interop_pvxs_mods/access_denied.rs"),
     ("epics-pva-rs", "tests/interop_pvxs_mods/asg_cross_impl.rs"),

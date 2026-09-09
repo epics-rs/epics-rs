@@ -112,8 +112,6 @@ pub struct PvaServerConfig {
     /// Maximum number of concurrent client connections. Excess incoming
     /// connections are accepted then immediately closed.
     pub max_connections: usize,
-    /// Maximum number of channels per single client connection.
-    pub max_channels_per_connection: usize,
     /// Idle timeout — server closes connections that haven't received
     /// anything in this window. Applied even if `op_timeout` is longer.
     pub idle_timeout: Duration,
@@ -386,7 +384,6 @@ impl Default for PvaServerConfig {
             op_timeout: Duration::from_secs(64_000),
             bind_ip: IpAddr::V4(Ipv4Addr::UNSPECIFIED),
             max_connections: 1024,
-            max_channels_per_connection: 1024,
             idle_timeout: Duration::from_secs(45),
             monitor_queue_depth: super::source::DEFAULT_MONITOR_QUEUE_LIMIT as usize,
             disable_plaintext: false,
@@ -474,9 +471,6 @@ impl PvaServerConfig {
         }
         if let Some(v) = env::max_connections_opt() {
             self.max_connections = v;
-        }
-        if let Some(v) = env::max_channels_per_connection_opt() {
-            self.max_channels_per_connection = v;
         }
         // Beacon periods: keep the pvxs short:long = 15:180 = 1:12 ratio
         // when only the short period is tuned; an explicit

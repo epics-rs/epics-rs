@@ -194,7 +194,6 @@ async fn tls_client_to_tls_server_full_handshake() {
         tls_port: 0,
         idle_timeout: Duration::from_secs(60),
         max_connections: 16,
-        max_channels_per_connection: 64,
         monitor_queue_depth: 8,
         tls: Some(server_tls),
         ..Default::default()
@@ -449,7 +448,6 @@ async fn mtls_client_cert_populates_x509_credentials() {
         tls_port: 0,
         idle_timeout: Duration::from_secs(60),
         max_connections: 16,
-        max_channels_per_connection: 64,
         monitor_queue_depth: 8,
         tls: Some(server_tls),
         auth_complete: Some(auth_complete),
@@ -562,7 +560,6 @@ async fn mtls_partial_chain_authority_resolved_from_trust_roots() {
         tls_port: 0,
         idle_timeout: Duration::from_secs(60),
         max_connections: 16,
-        max_channels_per_connection: 64,
         monitor_queue_depth: 8,
         tls: Some(server_tls),
         auth_complete: Some(auth_complete),
@@ -652,7 +649,6 @@ async fn client_extracts_server_x509_identity() {
         tls_port: 0,
         idle_timeout: Duration::from_secs(60),
         max_connections: 16,
-        max_channels_per_connection: 64,
         monitor_queue_depth: 8,
         tls: Some(server_tls),
         ..Default::default()
@@ -705,7 +701,6 @@ async fn plain_connection_has_no_server_identity() {
         udp_port: 0,
         idle_timeout: Duration::from_secs(60),
         max_connections: 16,
-        max_channels_per_connection: 64,
         monitor_queue_depth: 8,
         tls: None,
         ..Default::default()
@@ -765,7 +760,6 @@ async fn pva_tls_nameserver_mixed_mode_listener() {
         tls_port: 0,
         idle_timeout: Duration::from_secs(60),
         max_connections: 16,
-        max_channels_per_connection: 64,
         monitor_queue_depth: 8,
         tls: Some(server_tls),
         ..Default::default()

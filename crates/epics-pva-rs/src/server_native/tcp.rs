@@ -3776,11 +3776,6 @@ pub(super) async fn handle_connection_io(
     // the waiting tasks back to this loop — the only owner of the channel
     // table, so the only place a parked INIT can be replayed or refused.
     let (intro_ready_tx, mut intro_ready_rx) = mpsc::unbounded_channel::<IntroReady>();
-    // Count of in-flight CREATE_CHANNEL resolver tasks. Used in the
-    // per-connection channel cap check: channels being resolved count
-    // against the limit to prevent a burst of concurrent requests from
-    // racing past it before the first completions arrive.
-    let mut pending_channel_spawns: usize = 0;
     // Drive the read loop inside a block so EVERY exit path funnels
     // through the channel-close fan-out below: the writer-died
     // `return Ok(())`, any `?`-propagated decode/IO error, and the
@@ -3825,7 +3820,6 @@ pub(super) async fn handle_connection_io(
             cc_opt = cc_rx.recv() => {
                 // A spawned CREATE_CHANNEL resolver finished.
                 if let Some(cc) = cc_opt {
-                    pending_channel_spawns = pending_channel_spawns.saturating_sub(1);
                     let mut payload = Vec::new();
                     payload.put_u32(cc.cid, order);
                     // On success the CREATE_CHANNEL reply is charged to the
@@ -4286,19 +4280,7 @@ pub(super) async fn handle_connection_io(
                 // of the loop. `peer_entry.channel_opened()` registers the
                 // channel (and its report stat) there, so we do not track
                 // it here.
-                handle_create_channel(
-                    &reactor,
-                    &source,
-                    &frame,
-                    &tx,
-                    &channels,
-                    order,
-                    config.max_channels_per_connection,
-                    peer,
-                    &cred,
-                    &cc_tx,
-                    &mut pending_channel_spawns,
-                )
+                handle_create_channel(&reactor, &source, &frame, peer, &cred, &cc_tx)
                 .await?;
             }
             Some(Command::DestroyChannel) => {
@@ -5956,29 +5938,21 @@ fn build_server_connection_validation(
     out
 }
 
-/// spawn-based CREATE_CHANNEL handler. For each (cid, name)
-/// pair in the frame, cap-exceeded pairs are rejected synchronously
-/// (no source call needed); all others spawn a background resolver
-/// task that calls `has_pv` + `get_introspection` and sends the result
+/// spawn-based CREATE_CHANNEL handler. The (cid, name) pairs in the
+/// frame are resolved by one background task that calls `has_pv` +
+/// `get_introspection` for each in order and sends the results
 /// through `cc_tx` back to the read loop, which inserts the channel
 /// and emits the wire response in FIFO order.
-#[allow(clippy::too_many_arguments)]
 async fn handle_create_channel(
     reactor: &epics_base_rs::runtime::task::Reactor,
     source: &DynSource,
     frame: &Frame,
-    tx: &SrvTx,
-    channels: &HashMap<u32, ChannelState>,
-    order: ByteOrder,
-    max_channels_per_connection: usize,
     peer: SocketAddr,
     cred: &Arc<ClientCredentials>,
     cc_tx: &CcTx,
-    pending_channel_spawns: &mut usize,
 ) -> PvaResult<()> {
     // Inbound payload decodes with the frame's own header order (pvxs
-    // latches `peerBE` per received message, conn.cpp:195-198); `order`
-    // (config) is used only for outbound reply frames.
+    // latches `peerBE` per received message, conn.cpp:195-198).
     let inbound_order = frame.order();
     let mut cur = frame.cursor();
     // pvxs `serverchan.cpp:269-358`: a single CREATE_CHANNEL frame
@@ -5988,10 +5962,10 @@ async fn handle_create_channel(
         .get_u16(inbound_order)
         .map_err(|e| PvaError::Decode(e.to_string()))?;
 
-    // Collect entries to resolve asynchronously. We allocate SIDs
-    // up-front so the cap is known before spawning, then spawn ONE
-    // task that resolves names sequentially — this guarantees responses
-    // arrive in arrival order (pvxs serverchan.cpp parity).
+    // Collect entries to resolve asynchronously. SIDs are allocated
+    // up-front, then ONE task resolves the names sequentially — this
+    // guarantees responses arrive in arrival order (pvxs serverchan.cpp
+    // parity).
     let mut batch: Vec<(u32, u32, String)> = Vec::new(); // (cid, sid, name)
 
     for _ in 0..count {
@@ -6010,34 +5984,6 @@ async fn handle_create_channel(
             break;
         }
 
-        // per-channel cap check: open channels + in-flight spawns
-        // from previous frames + already-batched names in this frame.
-        if channels.len() + *pending_channel_spawns + batch.len() >= max_channels_per_connection {
-            warn!(
-                ?peer,
-                pv = %name,
-                "rejecting CREATE_CHANNEL: per-connection limit reached"
-            );
-            let mut payload = Vec::new();
-            payload.put_u32(cid, order);
-            // CREATE_CHANNEL failure sid must be the no-channel sentinel
-            // 0xFFFFFFFF (pvxs serverchan.cpp:349, sid=-1), not 0.
-            payload.put_u32(CREATE_CHANNEL_NO_SID, order);
-            Status::error("max channels per connection reached".to_string())
-                .write_into(order, &mut payload);
-            let h = PvaHeader::application(
-                true,
-                order,
-                Command::CreateChannel.code(),
-                payload.len() as u32,
-            );
-            let mut buf = Vec::new();
-            h.write_into(&mut buf);
-            buf.extend_from_slice(&payload);
-            let _ = tx.send(buf).await;
-            continue;
-        }
-
         batch.push((cid, alloc_sid(), name));
     }
 
@@ -6046,7 +5992,6 @@ async fn handle_create_channel(
     // and reorder responses; sequential resolution inside one task is
     // both correct and sufficient for any well-behaved source.
     if !batch.is_empty() {
-        *pending_channel_spawns += batch.len();
         let src = source.clone();
         let cc = cc_tx.clone();
         // resolve existence + introspection under the
@@ -16263,10 +16208,8 @@ mod tests {
         });
 
         let peer: SocketAddr = "127.0.0.1:5075".parse().unwrap();
-        let (tx, _rx) = test_srv_tx(8);
         let (cc_tx, mut cc_rx) = tokio::sync::mpsc::channel::<CreateChannelCompletion>(8);
         let mut channels: HashMap<u32, ChannelState> = HashMap::new();
-        let mut pending = 0usize;
 
         // CREATE_CHANNEL for "dut", dispatched while the connection identity
         // is alice/ca.
@@ -16282,14 +16225,9 @@ mod tests {
             &crate::test_reactor(),
             &source,
             &frame,
-            &tx,
-            &channels,
-            order,
-            100,
             peer,
             &alice,
             &cc_tx,
-            &mut pending,
         )
         .await
         .expect("CREATE_CHANNEL dispatch ok");

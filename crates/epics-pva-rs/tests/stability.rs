@@ -305,7 +305,6 @@ async fn spawn_server(source: Arc<MemSource>) -> (u16, u16, tokio::task::JoinHan
         udp_port: 0,
         idle_timeout: Duration::from_secs(60),
         max_connections: 16,
-        max_channels_per_connection: 64,
         monitor_queue_depth: 8,
         ..Default::default()
     };
@@ -360,7 +359,6 @@ async fn spawn_server_capped(
         udp_port: 0,
         idle_timeout: Duration::from_secs(60),
         max_connections: 16,
-        max_channels_per_connection: 64,
         monitor_queue_depth: 8,
         max_message_size: Some(cap),
         ..Default::default()
@@ -395,7 +393,6 @@ async fn p2_auto_reconnect_after_server_restart() {
         udp_port: 0,
         idle_timeout: Duration::from_secs(60),
         max_connections: 16,
-        max_channels_per_connection: 64,
         monitor_queue_depth: 8,
         ..Default::default()
     };
@@ -430,7 +427,6 @@ async fn p2_auto_reconnect_after_server_restart() {
         udp_port: udp,
         idle_timeout: Duration::from_secs(60),
         max_connections: 16,
-        max_channels_per_connection: 64,
         monitor_queue_depth: 8,
         ..Default::default()
     };
@@ -1859,7 +1855,6 @@ async fn ex_r7_unadvertised_auth_reverts_credential_to_anonymous() {
         udp_port: 0,
         idle_timeout: Duration::from_secs(60),
         max_connections: 16,
-        max_channels_per_connection: 64,
         monitor_queue_depth: 8,
         auth_complete: Some(Arc::new(move |_peer, cred| {
             *captured_hook.lock().unwrap() = Some((cred.method.clone(), cred.account.clone()));
@@ -1966,7 +1961,6 @@ async fn r70_anonymous_method_yields_account_anonymous() {
         udp_port: 0,
         idle_timeout: Duration::from_secs(60),
         max_connections: 16,
-        max_channels_per_connection: 64,
         monitor_queue_depth: 8,
         auth_complete: Some(Arc::new(move |_peer, cred| {
             *captured_hook.lock().unwrap() = Some((cred.method.clone(), cred.account.clone()));
@@ -2053,7 +2047,6 @@ async fn r70_ca_without_user_falls_back_to_anonymous() {
         udp_port: 0,
         idle_timeout: Duration::from_secs(60),
         max_connections: 16,
-        max_channels_per_connection: 64,
         monitor_queue_depth: 8,
         auth_complete: Some(Arc::new(move |_peer, cred| {
             *captured_hook.lock().unwrap() = Some((cred.method.clone(), cred.account.clone()));
@@ -2227,7 +2220,6 @@ async fn ignore_addr_list_does_not_block_direct_tcp_connect() {
         udp_port: 0,
         idle_timeout: Duration::from_secs(60),
         max_connections: 16,
-        max_channels_per_connection: 64,
         monitor_queue_depth: 8,
         // Loopback is on the UDP-search ignore list…
         ignore_addrs: vec![(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST), 0)],
@@ -3061,5 +3053,50 @@ async fn monitors_on_one_channel_are_not_capped() {
     assert_eq!(
         got, N,
         "{got} of {N} monitors on one channel delivered their initial snapshot"
+    );
+}
+
+/// pvxs refuses CREATE_CHANNEL only when SIDs are exhausted
+/// (serverchan.cpp:286-289, "Too many Server channels"). A client
+/// multiplexes every channel to a server over one TCP connection, so the
+/// former `max_channels_per_connection` failed an ordinary large client's
+/// next PV once the cap was reached. All channels are cached by the
+/// client, so every one of the 1100 GETs must resolve over the single
+/// connection.
+#[cfg(tokio_backend)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn channels_on_one_connection_are_not_capped() {
+    const N: usize = 1100;
+    let source = Arc::new(MemSource::new());
+    let names: Vec<String> = (0..N).map(|i| format!("STAB:MANYCHAN:{i}")).collect();
+    for name in &names {
+        source.add_pv(name, 1.0).await;
+    }
+
+    let (tcp, _udp, h) = spawn_server(source.clone()).await;
+    let client = PvaClient::builder()
+        .timeout(Duration::from_secs(20))
+        .server_addr(std::net::SocketAddr::new(
+            std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+            tcp,
+        ))
+        .build();
+
+    let refs: Vec<&str> = names.iter().map(String::as_str).collect();
+    let results = tokio::time::timeout(Duration::from_secs(60), client.pvget_many(&refs))
+        .await
+        .expect("pvget_many over one connection timed out");
+    let failed: Vec<(usize, String)> = results
+        .iter()
+        .enumerate()
+        .filter_map(|(i, r)| r.as_ref().err().map(|e| (i, e.to_string())))
+        .collect();
+    h.abort();
+
+    assert!(
+        failed.is_empty(),
+        "{} of {N} channels failed on one connection; first failure: {:?}",
+        failed.len(),
+        failed.first()
     );
 }

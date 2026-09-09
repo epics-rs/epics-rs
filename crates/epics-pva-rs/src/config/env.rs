@@ -815,21 +815,6 @@ pub fn max_connections_opt() -> Option<usize> {
         .filter(|&v| v > 0)
 }
 
-/// `EPICS_PVAS_MAX_CHANNELS_PER_CONN` — server cap on channels created
-/// by a single client connection. Default 256.
-pub fn max_channels_per_connection() -> usize {
-    max_channels_per_connection_opt().unwrap_or(256)
-}
-
-/// Presence-aware [`max_channels_per_connection`] — `None` when
-/// `EPICS_PVAS_MAX_CHANNELS_PER_CONN` is unset or non-positive.
-pub fn max_channels_per_connection_opt() -> Option<usize> {
-    std::env::var("EPICS_PVAS_MAX_CHANNELS_PER_CONN")
-        .ok()
-        .and_then(|s| s.parse::<usize>().ok())
-        .filter(|&v| v > 0)
-}
-
 /// `EPICS_PVA_CONN_TMO` — connection idle timeout (default 30s, pvxs
 /// uses 30s for ECHO probe interval too). When the connection is idle
 /// for this long, the client sends an ECHO; without a response within
@@ -2473,10 +2458,8 @@ mod tests {
         // previous tests don't bleed in.
         unsafe {
             std::env::remove_var("EPICS_PVAS_MAX_CONNECTIONS");
-            std::env::remove_var("EPICS_PVAS_MAX_CHANNELS_PER_CONN");
         }
         assert_eq!(max_connections(), 1024);
-        assert_eq!(max_channels_per_connection(), 256);
     }
 
     /// server TLS options resolve PVAS-first, then shared PVA (pvxs

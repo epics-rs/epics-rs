@@ -3016,7 +3016,7 @@ async fn multi_pv_fan_out_runs_on_whichever_executor_polls_it() {
 #[cfg(tokio_backend)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn monitors_on_one_channel_are_not_capped() {
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicBool, Ordering};
 
     const N: usize = 100;
     let source = Arc::new(MemSource::new());
@@ -3025,34 +3025,53 @@ async fn monitors_on_one_channel_are_not_capped() {
     let (tcp, _udp, h) = spawn_server(source.clone()).await;
     let client = client_for(tcp);
 
-    let delivered = Arc::new(AtomicUsize::new(0));
+    // One flag per subscription, not a shared delivery count: a
+    // subscription that fires twice (reconnect, update) must not stand in
+    // for one that never fired. A subscription that ends with an error
+    // records it, so a refusal shows up by text rather than as a missing
+    // count.
+    let delivered: Arc<Vec<AtomicBool>> =
+        Arc::new((0..N).map(|_| AtomicBool::new(false)).collect());
+    let failures: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
     let tasks: Vec<_> = (0..N)
-        .map(|_| {
+        .map(|i| {
             let client = client.clone();
             let delivered = delivered.clone();
+            let failures = failures.clone();
             tokio::spawn(async move {
-                client
+                let ended = client
                     .pvmonitor("STAB:MANYMON", move |_value| {
-                        delivered.fetch_add(1, Ordering::SeqCst);
+                        delivered[i].store(true, Ordering::SeqCst);
                     })
-                    .await
+                    .await;
+                if let Err(e) = ended {
+                    failures.lock().await.push(format!("monitor {i}: {e}"));
+                }
             })
         })
         .collect();
 
+    let missing = |delivered: &[AtomicBool]| -> Vec<usize> {
+        (0..N)
+            .filter(|&i| !delivered[i].load(Ordering::SeqCst))
+            .collect()
+    };
     let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
-    while delivered.load(Ordering::SeqCst) < N && tokio::time::Instant::now() < deadline {
+    while !missing(&delivered).is_empty() && tokio::time::Instant::now() < deadline {
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
-    let got = delivered.load(Ordering::SeqCst);
+    let missing = missing(&delivered);
+    let failures = failures.lock().await.clone();
     for t in &tasks {
         t.abort();
     }
     h.abort();
 
-    assert_eq!(
-        got, N,
-        "{got} of {N} monitors on one channel delivered their initial snapshot"
+    assert!(
+        missing.is_empty(),
+        "{} of {N} monitors on one channel never delivered their initial snapshot: {missing:?}; \
+         monitor errors: {failures:?}",
+        missing.len()
     );
 }
 

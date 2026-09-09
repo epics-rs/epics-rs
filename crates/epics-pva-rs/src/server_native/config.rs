@@ -115,8 +115,8 @@ pub struct PvaServerConfig {
     /// This is the only admission cap. There is deliberately no cap on
     /// channels per connection or on operations per channel: pvxs has
     /// neither (`ServerConn::chanBySID`, serverconn.h:142, and
-    /// `ServerChan::opByIOID`, serverconn.h:122, are unbounded maps) and
-    /// refuses a CREATE_CHANNEL only once the SID space is exhausted
+    /// `ServerChan::opByIOID`, serverconn.h:122, are unbounded maps); its
+    /// only capacity refusal of a CREATE_CHANNEL is SID exhaustion
     /// (serverchan.cpp:285-288, "Too many Server channels"), which this
     /// server mirrors. A pvxs/p4p client multiplexes every channel over one
     /// connection and keys channels by PV name, so such caps failed

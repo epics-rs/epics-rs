@@ -3075,8 +3075,9 @@ async fn monitors_on_one_channel_are_not_capped() {
     );
 }
 
-/// pvxs refuses CREATE_CHANNEL only when SIDs are exhausted
-/// (serverchan.cpp:286-289, "Too many Server channels"). A client
+/// pvxs puts no limit on channels per connection; its only capacity
+/// refusal of a CREATE_CHANNEL is SID exhaustion (serverchan.cpp:285-288,
+/// "Too many Server channels"). A client
 /// multiplexes every channel to a server over one TCP connection, so the
 /// former `max_channels_per_connection` failed an ordinary large client's
 /// next PV once the cap was reached. All channels are cached by the

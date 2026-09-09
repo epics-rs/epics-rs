@@ -25,7 +25,7 @@
 use std::collections::{HashMap, VecDeque};
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -61,17 +61,35 @@ pub use super::accept::{run_tcp_server, run_tcp_server_on_listener, run_tcp_serv
 // pvxs seeds each ID namespace from a distinct non-zero base (commit
 // 3b641bed) so a value used as the wrong ID type fails loudly instead of
 // silently aliasing a live id of another kind. SID base = pvxs
-// `serverconn.h:141` `nextSID=0x07050301`.
-static NEXT_SID: AtomicU32 = AtomicU32::new(0x0705_0301);
-fn alloc_sid() -> u32 {
-    NEXT_SID.fetch_add(1, Ordering::Relaxed)
-}
+// `serverconn.h:141` `nextSID=0x07050301`, a per-connection counter.
+const FIRST_SID: u32 = 0x0705_0301;
 
 // serverChannelID sentinel in a CREATE_CHANNEL failure reply. pvxs
-// uses `sid = -1` (serverchan.cpp:273/338) and wires it as 0xFFFFFFFF;
-// `NEXT_SID` climbs monotonically from 0x07050301 and could never reach
-// 0xFFFFFFFF in any real session, so this value can never alias a live id.
+// uses `sid = -1` (serverchan.cpp:273/338) and wires it as 0xFFFFFFFF.
+// `alloc_sid` never hands this value out, so it cannot alias a live id.
 const CREATE_CHANNEL_NO_SID: u32 = u32::MAX;
+
+/// Allocate the SID for a channel about to be inserted into `channels`:
+/// the next value of the connection's counter that is neither live nor the
+/// failure sentinel, or `None` when the table cannot hold another channel.
+/// pvxs `serverchan.cpp:285-293`: refuse with "Too many Server channels"
+/// when `chanBySID` is full, else `do { sid = nextSID++; } while` the SID
+/// is in use. Called by the read loop at insert time — the one owner of
+/// `channels` — so a SID is checked against the live set it will join.
+fn alloc_sid(next: &mut u32, channels: &HashMap<u32, ChannelState>) -> Option<u32> {
+    // Every value but the sentinel is a candidate; a table holding all of
+    // them has no free SID and the skip loop below would never end.
+    if channels.len() >= u32::MAX as usize {
+        return None;
+    }
+    loop {
+        let sid = *next;
+        *next = next.wrapping_add(1);
+        if sid != CREATE_CHANNEL_NO_SID && !channels.contains_key(&sid) {
+            return Some(sid);
+        }
+    }
+}
 
 /// A pvxs `ServerConn::logRemote()` diagnostic emitted during MONITOR
 /// INIT option negotiation (`servermon.cpp:529,542,567,572`) when an
@@ -3466,7 +3484,6 @@ impl ChannelTxPermit<'_> {
 /// order; the peer matches each by `cid`.
 struct CreateChannelCompletion {
     cid: u32,
-    sid: u32,
     name: String,
     /// Credential in force when CREATE_CHANNEL was dispatched, captured
     /// before the async resolver runs and carried back so the channel's
@@ -3498,13 +3515,12 @@ struct ResolvedChannel {
 type CcTx = mpsc::Sender<CreateChannelCompletion>;
 
 /// One `(cid, name)` pair from a CREATE_CHANNEL frame, waiting for one of
-/// the connection's resolver workers. The SID is allocated at decode time
-/// so the wire reply and the channel-table insert agree on it; `open_cred`
-/// is the credential in force when the frame was dispatched (see
-/// [`CreateChannelCompletion::open_cred`]).
+/// the connection's resolver workers. It carries no SID: the read loop
+/// allocates one at insert time ([`alloc_sid`]), against the channels it
+/// will join. `open_cred` is the credential in force when the frame was
+/// dispatched (see [`CreateChannelCompletion::open_cred`]).
 struct CreateChannelRequest {
     cid: u32,
-    sid: u32,
     name: String,
     open_cred: Arc<ClientCredentials>,
 }
@@ -3718,6 +3734,9 @@ pub(super) async fn handle_connection_io(
     // Step 3+: drive the read loop.
     let mut rx_buf: Vec<u8> = Vec::with_capacity(8192);
     let mut channels: HashMap<u32, ChannelState> = HashMap::new();
+    // pvxs `ServerConn::nextSID` (`serverconn.h:141`): SIDs are scoped to
+    // the connection, like the table they index.
+    let mut next_sid = FIRST_SID;
     // Receiver on the server-wide channel invalidator. A source publishes a
     // batch of PV names that must be force-disconnected out of band (PVA
     // gateway operator `:drop`/`:flush`); the read-loop arm below
@@ -3882,8 +3901,14 @@ pub(super) async fn handle_connection_io(
                 // `ch->statTx += 16u`); the failure reply belongs to no
                 // channel and stays connection-level.
                 let mut reply_stat: Option<Arc<crate::server_native::peers::ChannelStat>> = None;
-                if let Some(resolved) = cc.resolved {
-                    payload.put_u32(cc.sid, order);
+                // A resolved name still needs a SID, allocated here at the
+                // insert — the one place that hands them out.
+                let admitted = cc
+                    .resolved
+                    .map(|resolved| (alloc_sid(&mut next_sid, &channels), resolved));
+                match admitted {
+                Some((Some(sid), resolved)) => {
+                    payload.put_u32(sid, order);
                     Status::ok().write_into(order, &mut payload);
                     // One shared per-channel report counter, held by both
                     // the connection's channel table and the PeerEntry
@@ -3897,10 +3922,10 @@ pub(super) async fn handle_connection_io(
                     // `server.cpp`).
                     stat.set_report_info(resolved.report_info);
                     reply_stat = Some(stat.clone());
-                    channels.insert(cc.sid, ChannelState {
+                    channels.insert(sid, ChannelState {
                         name: cc.name,
                         cid: cc.cid,
-                        sid: cc.sid,
+                        sid,
                         introspection: resolved.intro,
                         source: resolved.owner,
                         stat: stat.clone(),
@@ -3912,7 +3937,7 @@ pub(super) async fn handle_connection_io(
                     });
                     // Register the channel (live + lifetime counts and
                     // the per-channel report entry) in one owner call.
-                    peer_entry.channel_opened(cc.sid, stat);
+                    peer_entry.channel_opened(sid, stat);
                     // Notify the bound source that a channel attached,
                     // matching pvxs `SharedPV::attach` running
                     // `onFirstConnect` on the empty→non-empty edge
@@ -3920,7 +3945,7 @@ pub(super) async fn handle_connection_io(
                     // independent of monitor subscription, so a
                     // GET/PUT/RPC/GET_FIELD-only client drives lazy open
                     // too. Paired with `close_channel`'s onClose.
-                    if let Some(ch) = channels.get(&cc.sid) {
+                    if let Some(ch) = channels.get(&sid) {
                         // Pinned to the channel's CREATE-time credential, not
                         // the connection's current `cred` — a re-auth between
                         // CREATE dispatch and this completion must not change
@@ -3947,7 +3972,7 @@ pub(super) async fn handle_connection_io(
                     // already-resolved descriptor (the common case) is left
                     // untouched, so this adds no source round-trip for a PV
                     // that was open at resolve time.
-                    let refresh = channels.get(&cc.sid).and_then(|ch| {
+                    let refresh = channels.get(&sid).and_then(|ch| {
                         ch.introspection.is_none().then(|| {
                             (
                                 ch.source.clone(),
@@ -3958,11 +3983,25 @@ pub(super) async fn handle_connection_io(
                     });
                     if let Some((owner, name, ctx)) = refresh
                         && let Some(intro) = owner.get_introspection_checked(&name, ctx).await
-                        && let Some(ch) = channels.get_mut(&cc.sid)
+                        && let Some(ch) = channels.get_mut(&sid)
                     {
                         ch.introspection = Some(Arc::new(intro));
                     }
-                } else {
+                }
+                Some((None, _)) => {
+                    // No free SID: pvxs refuses with an Error status and
+                    // the `pvx:serv:chanidoverflow:` trace
+                    // (serverchan.cpp:285-288). The resolved owner is
+                    // dropped; no channel was opened on it.
+                    payload.put_u32(CREATE_CHANNEL_NO_SID, order);
+                    Status::Detailed {
+                        kind: crate::proto::status::StatusKind::Error,
+                        message: "Too many Server channels".to_string(),
+                        stack: "pvx:serv:chanidoverflow:".to_string(),
+                    }
+                    .write_into(order, &mut payload);
+                }
+                None => {
                     // CREATE_CHANNEL failure sid must be the
                     // no-channel sentinel 0xFFFFFFFF (pvxs
                     // serverchan.cpp:349, sid=-1), not 0.
@@ -3981,6 +4020,7 @@ pub(super) async fn handle_connection_io(
                         stack: "pvx:serv:refusechan:".to_string(),
                     }
                     .write_into(order, &mut payload);
+                }
                 }
                 let h = PvaHeader::application(
                     true, order,
@@ -6017,7 +6057,7 @@ fn build_server_connection_validation(
 /// Decode a CREATE_CHANNEL frame into the per-name requests the
 /// connection's resolver workers answer. pvxs `serverchan.cpp:269-358`: one
 /// frame carries `count` (cid, name) pairs and the server emits one reply
-/// per pair. SIDs are allocated here, and `cred` — the
+/// per pair. `cred` — the
 /// identity in force at dispatch — is snapshotted into every request so a
 /// re-auth while the name is still queued cannot change the identity the
 /// channel opens under (pvxs builds `ServerChannelControl` with
@@ -6052,7 +6092,6 @@ fn decode_create_channel(
         }
         batch.push(CreateChannelRequest {
             cid,
-            sid: alloc_sid(),
             name,
             open_cred: cred.clone(),
         });
@@ -6148,7 +6187,6 @@ async fn resolve_create_channel(
     };
     CreateChannelCompletion {
         cid: req.cid,
-        sid: req.sid,
         name: req.name,
         open_cred: req.open_cred,
         resolved,
@@ -16355,12 +16393,14 @@ mod tests {
         // Mirrors the read loop's completion arm (tcp.rs ~2895-2922): the
         // channel stores the completion's open_cred and the open callback is
         // built from `ch.open_cred`, never the (now bob) connection credential.
+        let mut next_sid = FIRST_SID;
+        let sid = alloc_sid(&mut next_sid, &channels).expect("an empty table has a free SID");
         channels.insert(
-            completion.sid,
+            sid,
             ChannelState {
                 name: completion.name.clone(),
                 cid: completion.cid,
-                sid: completion.sid,
+                sid,
                 introspection: resolved.intro,
                 source: resolved.owner,
                 stat: crate::server_native::peers::ChannelStat::new(String::new()),
@@ -16371,7 +16411,7 @@ mod tests {
                 intro_wire: None,
             },
         );
-        let ch = channels.get(&completion.sid).unwrap();
+        let ch = channels.get(&sid).unwrap();
         let ctx = channel_lifecycle_ctx(peer, &ch.open_cred);
         ch.source.notify_channel_open(&ch.name, &ctx);
 
@@ -21627,6 +21667,27 @@ mod tests {
             );
         }
         channels
+    }
+
+    /// pvxs `serverchan.cpp:290-293` advances past every SID still in use,
+    /// so a live channel sitting exactly at the counter is the boundary.
+    #[test]
+    fn alloc_sid_skips_a_live_sid_at_the_counter() {
+        let source: DynSource = Arc::new(Bfr13FailSource);
+        let channels = two_channel_conn(source);
+        let mut next = 1u32;
+        assert_eq!(alloc_sid(&mut next, &channels), Some(3));
+        assert_eq!(next, 4, "the counter moves past the skipped SIDs too");
+    }
+
+    /// The counter wraps like pvxs's `nextSID++`, but the wrap must step
+    /// over 0xFFFFFFFF: that value is the failure reply's no-channel
+    /// sentinel and a live channel may never carry it.
+    #[test]
+    fn alloc_sid_never_hands_out_the_failure_sentinel() {
+        let channels: HashMap<u32, ChannelState> = HashMap::new();
+        let mut next = CREATE_CHANNEL_NO_SID;
+        assert_eq!(alloc_sid(&mut next, &channels), Some(0));
     }
 
     #[cfg(tokio_backend)]

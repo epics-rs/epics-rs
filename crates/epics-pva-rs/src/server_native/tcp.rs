@@ -22,7 +22,7 @@
 
 // RTEMS-EXEC-MODEL-ALLOW(1): checked - these run and pass in the exec-backend
 // suite.
-use std::collections::{HashMap, VecDeque};
+use std::collections::VecDeque;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
@@ -76,7 +76,7 @@ const CREATE_CHANNEL_NO_SID: u32 = u32::MAX;
 /// when `chanBySID` is full, else `do { sid = nextSID++; } while` the SID
 /// is in use. Called by the read loop at insert time — the one owner of
 /// `channels` — so a SID is checked against the live set it will join.
-fn alloc_sid(next: &mut u32, channels: &HashMap<u32, ChannelState>) -> Option<u32> {
+fn alloc_sid(next: &mut u32, channels: &ChannelTable) -> Option<u32> {
     // Every value but the sentinel is a candidate; a table holding all of
     // them has no free SID and the skip loop below would never end.
     if channels.len() >= u32::MAX as usize {
@@ -803,7 +803,7 @@ struct ChannelState {
     /// so only the open/close edges are pinned here.
     open_cred: Arc<ClientCredentials>,
     /// ioid → (introspection negotiated for this op, kind)
-    ops: HashMap<u32, OpState>,
+    ops: ChannelOps,
     /// ioid → an operation INIT held because the channel has no
     /// descriptor YET.
     ///
@@ -818,7 +818,7 @@ struct ChannelState {
     /// whose abort handle each entry owns. Dropping the entry — channel
     /// teardown, DESTROY_REQUEST, connection end — cancels the wait, which
     /// is exactly what pvxs's `conn->onClose` erase does.
-    parked: HashMap<u32, ParkedOp>,
+    parked: ParkedOps,
     /// Reusable PUT-delta decode scratch, keyed by the op intro it was
     /// built for (`Arc::ptr_eq`). A PUT/PUT_GET EXEC takes it, decodes
     /// the marked fields in place ([`decode_pv_field_with_bitset_into`])
@@ -961,7 +961,7 @@ struct ParkCtx<'a> {
 #[allow(clippy::too_many_arguments)] // the `reactor` capability is the 8th
 fn park_op_for_intro(
     reactor: &epics_base_rs::runtime::task::Reactor,
-    ch: &mut ChannelState,
+    ch: &mut ChannelMut<'_>,
     frame: &Frame,
     kind: OpKind,
     subcmd: u8,
@@ -989,7 +989,7 @@ fn park_op_for_intro(
             desc: desc.map(Arc::new),
         });
     });
-    ch.parked.insert(
+    ch.park(
         ioid,
         ParkedOp {
             frame: frame.clone(),
@@ -1133,11 +1133,11 @@ impl Drop for MonitorFinishGuard {
 /// already a no-op for a task that ended on its own) — but gated on the
 /// op-instance id so a stale signal cannot evict a re-INIT'd op that
 /// reused the ioid (the ABA guard described on [`MonitorFinished`]).
-fn apply_monitor_finish(channels: &mut HashMap<u32, ChannelState>, fin: MonitorFinished) {
-    if let Some(ch) = channels.get_mut(&fin.sid)
+fn apply_monitor_finish(channels: &mut ChannelTable, fin: MonitorFinished) {
+    if let Some(mut ch) = channels.get_mut(&fin.sid)
         && ch.ops.get(&fin.ioid).map(|op| op.monitor_op_id) == Some(fin.op_id)
     {
-        ch.ops.remove(&fin.ioid);
+        ch.remove_op(fin.ioid);
     }
 }
 
@@ -1342,8 +1342,8 @@ impl Drop for ExecFinishGuard {
 /// kept reserved until exactly this point so a re-INIT racing a slow source
 /// could not reuse it mid-reply — is finally freed (on removal) and the
 /// (now-inert) abort guard is cleared (on return-to-Idle).
-fn apply_exec_finish(channels: &mut HashMap<u32, ChannelState>, fin: ExecFinished) {
-    let Some(ch) = channels.get_mut(&fin.sid) else {
+fn apply_exec_finish(channels: &mut ChannelTable, fin: ExecFinished) {
+    let Some(mut ch) = channels.get_mut(&fin.sid) else {
         return;
     };
     // Return the PUT decode scratch to its channel before any op
@@ -1370,41 +1370,203 @@ fn apply_exec_finish(channels: &mut HashMap<u32, ChannelState>, fin: ExecFinishe
         _ => last_request,
     };
     if remove {
-        ch.ops.remove(&fin.ioid);
+        ch.remove_op(fin.ioid);
     } else if let Some(op) = ch.ops.get_mut(&fin.ioid) {
         op.exec_state = ExecState::Idle;
         op.data_task_abort = None;
     }
 }
 
-/// True when `ioid` already names a live operation on *any* channel of
-/// this connection.
+/// The connection's channel table: every open channel by SID plus the
+/// IOID → owning-SID index that makes operation IDs unique across the
+/// whole connection.
 ///
-/// pvxs scopes operation IDs to the whole connection, not to one channel:
-/// `ServerConn::opByIOID` (`serverconn.h:142`) is the connection-wide map an
+/// pvxs scopes operation IDs to the connection, not to one channel:
+/// `ServerConn::opByIOID` (`serverconn.h:143`) is the connection-wide map an
 /// INIT consults to reject a reused IOID (`serverget.cpp:378-384`,
-/// `servermon.cpp:505-511`, `serverintrospect.cpp:157-178`). Modelling that as
-/// the per-channel `ChannelState::ops` lets two channels hold the same IOID,
-/// and because operation replies are tagged by IOID alone the two reply streams
-/// become indistinguishable to the client. The single source of truth stays
-/// `channels`; this helper widens the uniqueness *scope* to the connection so
-/// the duplicate-IOID rule holds across channels by construction rather than
-/// maintaining a redundant secondary index that could desync.
-fn ioid_live_on_conn(channels: &HashMap<u32, ChannelState>, ioid: u32) -> bool {
-    channels
-        .values()
-        .any(|c| c.ops.contains_key(&ioid) || c.parked.contains_key(&ioid))
-}
+/// `servermon.cpp:505-511`, `serverintrospect.cpp:157-178`) and the map
+/// CANCEL/DESTROY/MESSAGE key on before they consult the SID
+/// (`serverconn.cpp:262-346`). The op states themselves stay per channel
+/// ([`ChannelState::ops`] / [`ChannelState::parked`], pvxs's
+/// `ServerChan::opByIOID`), so the index is a second view of the same
+/// membership and must never drift from it. It cannot: [`ChannelOps`] and
+/// [`ParkedOps`] carry no membership mutators, and the only way to add or
+/// remove an op is a [`ChannelMut`] handed out by [`ChannelTable::get_mut`],
+/// which updates the index in the same call. Membership of the channel
+/// table itself goes through [`ChannelTable::insert`] / [`ChannelTable::remove`]
+/// / [`ChannelTable::drain`], which index or purge the channel's ops.
+mod chan_table {
+    use std::collections::HashMap;
+    use std::ops::{Deref, DerefMut};
 
-/// SID of the channel that owns the operation `ioid`, scanning the whole
-/// connection. pvxs keys CANCEL/DESTROY/MESSAGE on the connection-wide
-/// `opByIOID` and only then consults the SID (`serverconn.cpp:262-346`); with
-/// connection-wide IOID uniqueness an IOID maps to at most one channel.
-fn op_owner_sid(channels: &HashMap<u32, ChannelState>, ioid: u32) -> Option<u32> {
-    channels.iter().find_map(|(sid, c)| {
-        (c.ops.contains_key(&ioid) || c.parked.contains_key(&ioid)).then_some(*sid)
-    })
+    use super::{ChannelState, OpState, ParkedOp};
+
+    /// Operations live on one channel, keyed by connection-wide IOID.
+    /// Reads go through `Deref` to the map; membership changes only
+    /// through [`ChannelMut::insert_op`] / [`ChannelMut::remove_op`].
+    #[derive(Debug, Default)]
+    pub(super) struct ChannelOps(HashMap<u32, OpState>);
+
+    impl ChannelOps {
+        pub(super) fn get_mut(&mut self, ioid: &u32) -> Option<&mut OpState> {
+            self.0.get_mut(ioid)
+        }
+    }
+
+    impl Deref for ChannelOps {
+        type Target = HashMap<u32, OpState>;
+        fn deref(&self) -> &Self::Target {
+            &self.0
+        }
+    }
+
+    impl From<HashMap<u32, OpState>> for ChannelOps {
+        fn from(ops: HashMap<u32, OpState>) -> Self {
+            Self(ops)
+        }
+    }
+
+    /// INITs parked on one channel until its descriptor lands. Membership
+    /// changes only through [`ChannelMut::park`] / [`ChannelMut::unpark`].
+    #[derive(Debug, Default)]
+    pub(super) struct ParkedOps(HashMap<u32, ParkedOp>);
+
+    impl Deref for ParkedOps {
+        type Target = HashMap<u32, ParkedOp>;
+        fn deref(&self) -> &Self::Target {
+            &self.0
+        }
+    }
+
+    #[derive(Debug, Default)]
+    pub(super) struct ChannelTable {
+        by_sid: HashMap<u32, ChannelState>,
+        /// IOID → SID of the channel holding it in `ops` or `parked`.
+        owner_by_ioid: HashMap<u32, u32>,
+    }
+
+    impl ChannelTable {
+        pub(super) fn new() -> Self {
+            Self::default()
+        }
+
+        /// Open `ch` under `sid`, indexing every op it already holds. A
+        /// channel previously under the same SID is returned with its ops
+        /// dropped from the index.
+        pub(super) fn insert(&mut self, sid: u32, ch: ChannelState) -> Option<ChannelState> {
+            let replaced = self.remove(&sid);
+            for ioid in ch.ops.keys().chain(ch.parked.keys()) {
+                let prev = self.owner_by_ioid.insert(*ioid, sid);
+                debug_assert!(
+                    prev.is_none(),
+                    "IOID {ioid} is already live on another channel"
+                );
+            }
+            self.by_sid.insert(sid, ch);
+            replaced
+        }
+
+        pub(super) fn remove(&mut self, sid: &u32) -> Option<ChannelState> {
+            let ch = self.by_sid.remove(sid)?;
+            for ioid in ch.ops.keys().chain(ch.parked.keys()) {
+                if self.owner_by_ioid.get(ioid) == Some(sid) {
+                    self.owner_by_ioid.remove(ioid);
+                }
+            }
+            Some(ch)
+        }
+
+        pub(super) fn drain(&mut self) -> std::collections::hash_map::Drain<'_, u32, ChannelState> {
+            self.owner_by_ioid.clear();
+            self.by_sid.drain()
+        }
+
+        pub(super) fn get_mut(&mut self, sid: &u32) -> Option<ChannelMut<'_>> {
+            let ch = self.by_sid.get_mut(sid)?;
+            Some(ChannelMut {
+                sid: *sid,
+                ch,
+                owner_by_ioid: &mut self.owner_by_ioid,
+            })
+        }
+
+        /// SID of the channel that owns the operation `ioid`, if any.
+        pub(super) fn ioid_owner(&self, ioid: u32) -> Option<u32> {
+            self.owner_by_ioid.get(&ioid).copied()
+        }
+
+        /// True when `ioid` names a live or parked operation on *any*
+        /// channel of this connection.
+        pub(super) fn ioid_live(&self, ioid: u32) -> bool {
+            self.owner_by_ioid.contains_key(&ioid)
+        }
+    }
+
+    impl Deref for ChannelTable {
+        type Target = HashMap<u32, ChannelState>;
+        fn deref(&self) -> &Self::Target {
+            &self.by_sid
+        }
+    }
+
+    /// Mutable access to one channel that keeps the table's IOID index in
+    /// step with the channel's op membership.
+    pub(super) struct ChannelMut<'a> {
+        sid: u32,
+        ch: &'a mut ChannelState,
+        owner_by_ioid: &'a mut HashMap<u32, u32>,
+    }
+
+    impl ChannelMut<'_> {
+        pub(super) fn insert_op(&mut self, ioid: u32, op: OpState) -> Option<OpState> {
+            let prev = self.owner_by_ioid.insert(ioid, self.sid);
+            debug_assert!(
+                prev.is_none_or(|owner| owner == self.sid),
+                "IOID {ioid} is already live on another channel"
+            );
+            self.ch.ops.0.insert(ioid, op)
+        }
+
+        pub(super) fn remove_op(&mut self, ioid: u32) -> Option<OpState> {
+            let op = self.ch.ops.0.remove(&ioid);
+            if !self.ch.parked.0.contains_key(&ioid) {
+                self.owner_by_ioid.remove(&ioid);
+            }
+            op
+        }
+
+        pub(super) fn park(&mut self, ioid: u32, parked: ParkedOp) -> Option<ParkedOp> {
+            let prev = self.owner_by_ioid.insert(ioid, self.sid);
+            debug_assert!(
+                prev.is_none_or(|owner| owner == self.sid),
+                "IOID {ioid} is already live on another channel"
+            );
+            self.ch.parked.0.insert(ioid, parked)
+        }
+
+        pub(super) fn unpark(&mut self, ioid: u32) -> Option<ParkedOp> {
+            let parked = self.ch.parked.0.remove(&ioid);
+            if !self.ch.ops.0.contains_key(&ioid) {
+                self.owner_by_ioid.remove(&ioid);
+            }
+            parked
+        }
+    }
+
+    impl Deref for ChannelMut<'_> {
+        type Target = ChannelState;
+        fn deref(&self) -> &Self::Target {
+            self.ch
+        }
+    }
+
+    impl DerefMut for ChannelMut<'_> {
+        fn deref_mut(&mut self) -> &mut Self::Target {
+            self.ch
+        }
+    }
 }
+use chan_table::{ChannelMut, ChannelOps, ChannelTable, ParkedOps};
 
 /// Resolve which channel should service a data-phase (non-INIT) operation
 /// frame for `ioid`. pvxs looks the operation up in the connection-wide
@@ -1426,12 +1588,12 @@ fn op_owner_sid(channels: &HashMap<u32, ChannelState>, ioid: u32) -> Option<u32>
 /// gap where a data frame whose IOID is live on another channel was
 /// silently dropped because the frame SID's channel did not hold the op.
 fn data_phase_owner_sid(
-    channels: &HashMap<u32, ChannelState>,
+    channels: &ChannelTable,
     ioid: u32,
     frame_sid: u32,
     require_sid_match: bool,
 ) -> Result<Option<u32>, PvaError> {
-    match op_owner_sid(channels, ioid) {
+    match channels.ioid_owner(ioid) {
         Some(owner) if require_sid_match && owner != frame_sid => Err(PvaError::Decode(format!(
             "MONITOR data-phase SID {frame_sid} does not own IOID {ioid} \
              (owner channel {owner}); pvxs servermon.cpp:610-635 protocol error"
@@ -3733,7 +3895,7 @@ pub(super) async fn handle_connection_io(
 
     // Step 3+: drive the read loop.
     let mut rx_buf: Vec<u8> = Vec::with_capacity(8192);
-    let mut channels: HashMap<u32, ChannelState> = HashMap::new();
+    let mut channels = ChannelTable::new();
     // pvxs `ServerConn::nextSID` (`serverconn.h:141`): SIDs are scoped to
     // the connection, like the table they index.
     let mut next_sid = FIRST_SID;
@@ -3930,8 +4092,8 @@ pub(super) async fn handle_connection_io(
                         source: resolved.owner,
                         stat: stat.clone(),
                         open_cred: cc.open_cred,
-                        ops: HashMap::new(),
-                        parked: HashMap::new(),
+                        ops: ChannelOps::default(),
+                        parked: ParkedOps::default(),
                         put_scratch: None,
                 intro_wire: None,
                     });
@@ -3983,7 +4145,7 @@ pub(super) async fn handle_connection_io(
                     });
                     if let Some((owner, name, ctx)) = refresh
                         && let Some(intro) = owner.get_introspection_checked(&name, ctx).await
-                        && let Some(ch) = channels.get_mut(&sid)
+                        && let Some(mut ch) = channels.get_mut(&sid)
                     {
                         ch.introspection = Some(Arc::new(intro));
                     }
@@ -4074,8 +4236,8 @@ pub(super) async fn handle_connection_io(
                 // through its own handler is what keeps the parked and
                 // unparked paths one implementation.
                 let Some(ready) = ready_opt else { continue };
-                let Some(ch) = channels.get_mut(&ready.sid) else { continue };
-                let Some(parked) = ch.parked.remove(&ready.ioid) else { continue };
+                let Some(mut ch) = channels.get_mut(&ready.sid) else { continue };
+                let Some(parked) = ch.unpark(ready.ioid) else { continue };
                 let chan_tx = ChannelTx::new(tx.clone(), ch.stat.clone());
                 let Some(desc) = ready.desc else {
                     // The source has no descriptor for this channel and
@@ -4884,7 +5046,7 @@ async fn handle_put_get(
     reactor: &epics_base_rs::runtime::task::Reactor,
     frame: &Frame,
     tx: &SrvTx,
-    channels: &mut HashMap<u32, ChannelState>,
+    channels: &mut ChannelTable,
     order: ByteOrder,
     config: &PvaServerConfig,
     encode_cache: &mut EncodeTypeCache,
@@ -4939,7 +5101,7 @@ async fn handle_put_get(
 
     // Connection-wide IOID uniqueness (pvxs `ServerConn::opByIOID`),
     // evaluated before the per-channel borrow below.
-    let dup_ioid = subcmd & QosFlags::INIT != 0 && ioid_live_on_conn(channels, ioid);
+    let dup_ioid = subcmd & QosFlags::INIT != 0 && channels.ioid_live(ioid);
 
     // Data-phase frames resolve their channel via the connection-wide op
     // owner, not the frame SID (see `data_phase_owner_sid` / `handle_op`).
@@ -4951,7 +5113,7 @@ async fn handle_put_get(
         data_phase_owner_sid(channels, ioid, sid, false)?.unwrap_or(sid)
     };
 
-    let ch = match channels.get_mut(&sid) {
+    let mut ch = match channels.get_mut(&sid) {
         Some(c) => c,
         None => {
             send_op_error(
@@ -4990,7 +5152,16 @@ async fn handle_put_get(
         let intro = match ch.introspection.clone() {
             Some(d) => d,
             None => {
-                park_op_for_intro(reactor, ch, frame, OpKind::PutGet, subcmd, sid, ioid, park);
+                park_op_for_intro(
+                    reactor,
+                    &mut ch,
+                    frame,
+                    OpKind::PutGet,
+                    subcmd,
+                    sid,
+                    ioid,
+                    park,
+                );
                 return Ok(());
             }
         };
@@ -5045,7 +5216,7 @@ async fn handle_put_get(
         let mut put_get_op = non_monitor_op_state(intro.clone(), OpKind::PutGet, get_mask);
         put_get_op.put_mask = Some(put_mask);
         put_get_op.pv_request = req_value;
-        ch.ops.insert(ioid, put_get_op);
+        ch.insert_op(ioid, put_get_op);
 
         // INIT response: ioid + subcmd + status + putIF + getIF.
         // pvAccessJava protocol defines PUT_GET INIT with two type
@@ -5176,7 +5347,7 @@ async fn handle_put_get(
     // run this PUT_GET exec only when the op is `Idle`, and ignore a
     // second EXEC while the first is in flight rather than aborting it (pvxs
     // `serverget.cpp:467-476`/`:511-514`).
-    let op_id = match begin_exec(ch, ioid) {
+    let op_id = match begin_exec(&mut ch, ioid) {
         Some(id) => id,
         None => {
             debug!(ioid, "PUT_GET EXEC ignored: op already executing");
@@ -5305,7 +5476,7 @@ async fn handle_put_get(
     // last-request bit (`subcmd & 0x10`), defer the op's removal until its
     // reply has been sent — the same completion-owned cleanup GET/PUT/RPC use
     // (see [`finish_exec_data_task`]).
-    finish_exec_data_task(ch, ioid, subcmd, abort);
+    finish_exec_data_task(&mut ch, ioid, subcmd, abort);
     Ok(())
 }
 
@@ -5330,7 +5501,7 @@ async fn handle_process(
     reactor: &epics_base_rs::runtime::task::Reactor,
     frame: &Frame,
     tx: &SrvTx,
-    channels: &mut HashMap<u32, ChannelState>,
+    channels: &mut ChannelTable,
     order: ByteOrder,
     // Connection-scope inbound decode cache (pvxs `rxRegistry`, conn.h:23).
     // PROCESS transfers no value but its INIT pvRequest descriptor is still
@@ -5361,7 +5532,7 @@ async fn handle_process(
 
     // Connection-wide IOID uniqueness (pvxs `ServerConn::opByIOID`),
     // evaluated before the per-channel borrow below.
-    let dup_ioid = subcmd & QosFlags::INIT != 0 && ioid_live_on_conn(channels, ioid);
+    let dup_ioid = subcmd & QosFlags::INIT != 0 && channels.ioid_live(ioid);
 
     // Data-phase frames resolve their channel via the connection-wide op
     // owner, not the frame SID (see `data_phase_owner_sid` / `handle_op`).
@@ -5373,7 +5544,7 @@ async fn handle_process(
         data_phase_owner_sid(channels, ioid, sid, false)?.unwrap_or(sid)
     };
 
-    let ch = match channels.get_mut(&sid) {
+    let mut ch = match channels.get_mut(&sid) {
         Some(c) => c,
         None => {
             send_op_error(
@@ -5416,7 +5587,16 @@ async fn handle_process(
         let intro = match ch.introspection.clone() {
             Some(d) => d,
             None => {
-                park_op_for_intro(reactor, ch, frame, OpKind::Process, subcmd, sid, ioid, park);
+                park_op_for_intro(
+                    reactor,
+                    &mut ch,
+                    frame,
+                    OpKind::Process,
+                    subcmd,
+                    sid,
+                    ioid,
+                    park,
+                );
                 return Ok(());
             }
         };
@@ -5450,7 +5630,7 @@ async fn handle_process(
         let mask = BitSet::all_set(intro.total_bits());
         let mut process_op = non_monitor_op_state(intro, OpKind::Process, mask);
         process_op.pv_request = req_value;
-        ch.ops.insert(ioid, process_op);
+        ch.insert_op(ioid, process_op);
 
         // INIT response: ioid + subcmd + status. No type descriptor —
         // PROCESS negotiates no value.
@@ -5506,7 +5686,7 @@ async fn handle_process(
     // run this PROCESS exec only when the op is `Idle`, and ignore a
     // second EXEC while the first is in flight rather than aborting it (pvxs
     // `serverget.cpp:467-476`/`:511-514`).
-    let op_id = match begin_exec(ch, ioid) {
+    let op_id = match begin_exec(&mut ch, ioid) {
         Some(id) => id,
         None => {
             debug!(ioid, "PROCESS EXEC ignored: op already executing");
@@ -5563,7 +5743,7 @@ async fn handle_process(
     // last-request bit (`subcmd & 0x10`), defer the op's removal until its
     // reply has been sent — the same completion-owned cleanup GET/PUT/RPC use
     // (see [`finish_exec_data_task`]).
-    finish_exec_data_task(ch, ioid, subcmd, abort);
+    finish_exec_data_task(&mut ch, ioid, subcmd, abort);
     Ok(())
 }
 
@@ -5634,7 +5814,7 @@ async fn handle_channel_array(
     reactor: &epics_base_rs::runtime::task::Reactor,
     frame: &Frame,
     tx: &SrvTx,
-    channels: &mut HashMap<u32, ChannelState>,
+    channels: &mut ChannelTable,
     order: ByteOrder,
     config: &PvaServerConfig,
     encode_cache: &mut EncodeTypeCache,
@@ -5655,7 +5835,7 @@ async fn handle_channel_array(
         .map_err(|e| PvaError::Decode(e.to_string()))?;
     let subcmd = cur.get_u8().map_err(|e| PvaError::Decode(e.to_string()))?;
 
-    let dup_ioid = subcmd & QosFlags::INIT != 0 && ioid_live_on_conn(channels, ioid);
+    let dup_ioid = subcmd & QosFlags::INIT != 0 && channels.ioid_live(ioid);
 
     // Data-phase frames resolve their channel via the connection-wide op
     // owner, not the frame SID (see `data_phase_owner_sid` / `handle_op`).
@@ -5667,7 +5847,7 @@ async fn handle_channel_array(
         data_phase_owner_sid(channels, ioid, sid, false)?.unwrap_or(sid)
     };
 
-    let ch = match channels.get_mut(&sid) {
+    let mut ch = match channels.get_mut(&sid) {
         Some(c) => c,
         None => {
             send_op_error(
@@ -5724,7 +5904,7 @@ async fn handle_channel_array(
                 let mut array_op =
                     non_monitor_op_state(Arc::new(array_desc.clone()), OpKind::Array, mask);
                 array_op.pv_request = req_value;
-                ch.ops.insert(ioid, array_op);
+                ch.insert_op(ioid, array_op);
 
                 let mut payload = Vec::new();
                 payload.put_u32(ioid, order);
@@ -5847,7 +6027,7 @@ async fn handle_channel_array(
     // returns false and the server answers with a CMD_ARRAY error frame
     // (otherRequestPendingStatus, responseHandlers.cpp:2164) rather than
     // ignoring it. The in-flight op is left running, not aborted.
-    let op_id = match begin_exec(ch, ioid) {
+    let op_id = match begin_exec(&mut ch, ioid) {
         Some(id) => id,
         None => {
             debug!(ioid, "ARRAY sub-op rejected: op already executing");
@@ -5948,7 +6128,7 @@ async fn handle_channel_array(
         // ARRAY is one-shot (see the PUT_GET reply): the flag is unread.
         exec_fin_guard.reply(&tx_clone, buf, false).await;
     });
-    finish_exec_data_task(ch, ioid, subcmd, abort);
+    finish_exec_data_task(&mut ch, ioid, subcmd, abort);
     Ok(())
 }
 
@@ -6311,7 +6491,7 @@ async fn finalize_channel_destroy(
     sid: u32,
     cid: u32,
     cause: DestroyCause,
-    channels: &mut HashMap<u32, ChannelState>,
+    channels: &mut ChannelTable,
     ctx: &ChannelTeardownCtx<'_>,
 ) -> bool {
     // Removing the channel drops every OpState in `ops`, which drops each
@@ -6382,7 +6562,7 @@ async fn finalize_channel_destroy(
 /// name's GET/PUT/MONITOR together, matching pva2pva's per-channel destroy.
 async fn invalidate_named_channels(
     pv: &str,
-    channels: &mut HashMap<u32, ChannelState>,
+    channels: &mut ChannelTable,
     ctx: &ChannelTeardownCtx<'_>,
 ) -> usize {
     let victims: Vec<(u32, u32)> = channels
@@ -6404,7 +6584,7 @@ async fn invalidate_named_channels(
 /// [`finalize_channel_destroy`].
 async fn handle_destroy_channel(
     frame: &Frame,
-    channels: &mut HashMap<u32, ChannelState>,
+    channels: &mut ChannelTable,
     ctx: &ChannelTeardownCtx<'_>,
 ) -> PvaResult<()> {
     // Inbound payload decodes with the frame's own header order (pvxs
@@ -6468,10 +6648,7 @@ async fn handle_destroy_channel(
 /// Executing without a re-subscribe. DESTROY (`CMD_DESTROY_REQUEST`)
 /// still removes the op outright, dropping `monitor_abort` and
 /// aborting the task — the only path that releases source-side state.
-fn handle_cancel_request(
-    frame: &Frame,
-    channels: &mut HashMap<u32, ChannelState>,
-) -> PvaResult<()> {
+fn handle_cancel_request(frame: &Frame, channels: &mut ChannelTable) -> PvaResult<()> {
     // Decode with the frame's own header order (pvxs conn.cpp:195-198).
     let order = frame.order();
     let mut cur = frame.cursor();
@@ -6489,7 +6666,7 @@ fn handle_cancel_request(
     // `opByIOID`, then rejects it when the located op's channel SID does not
     // match the supplied SID ("Cancel inconsistent Op"). Locate by IOID across
     // the connection so the SID is validated against the op's real owner.
-    let osid = match op_owner_sid(channels, ioid) {
+    let osid = match channels.ioid_owner(ioid) {
         Some(s) if s == sid => s,
         Some(_) => {
             debug!(sid, ioid, "CANCEL_REQUEST with inconsistent SID: dropping");
@@ -6500,7 +6677,7 @@ fn handle_cancel_request(
             return Ok(());
         }
     };
-    if let Some(ch) = channels.get_mut(&osid)
+    if let Some(mut ch) = channels.get_mut(&osid)
         && let Some(op) = ch.ops.get_mut(&ioid)
     {
         // pvxs `serverconn.cpp:262-295` applies CANCEL_REQUEST to EVERY
@@ -6566,11 +6743,7 @@ fn handle_cancel_request(
 /// mapping, with the owning channel name in the log line. Without this
 /// gate a peer could emit warning/error-level server logs for an
 /// arbitrary IOID it never opened.
-fn handle_message(
-    frame: &Frame,
-    channels: &HashMap<u32, ChannelState>,
-    peer: &SocketAddr,
-) -> PvaResult<()> {
+fn handle_message(frame: &Frame, channels: &ChannelTable, peer: &SocketAddr) -> PvaResult<()> {
     // Decode with the frame's own header order (pvxs conn.cpp:195-198).
     let order = frame.order();
     let mut cur = frame.cursor();
@@ -6588,7 +6761,7 @@ fn handle_message(
         .unwrap_or_default();
     // IOID lookup gate (pvxs serverconn.cpp:338-342): absent → debug
     // only, no severity escalation.
-    let channel = op_owner_sid(channels, ioid).and_then(|sid| channels.get(&sid));
+    let channel = channels.ioid_owner(ioid).and_then(|sid| channels.get(&sid));
     let Some(channel) = channel else {
         debug!(
             ?peer,
@@ -6613,10 +6786,7 @@ fn handle_message(
     Ok(())
 }
 
-fn handle_destroy_request(
-    frame: &Frame,
-    channels: &mut HashMap<u32, ChannelState>,
-) -> PvaResult<()> {
+fn handle_destroy_request(frame: &Frame, channels: &mut ChannelTable) -> PvaResult<()> {
     // Decode with the frame's own header order (pvxs conn.cpp:195-198).
     let order = frame.order();
     let mut cur = frame.cursor();
@@ -6635,16 +6805,16 @@ fn handle_destroy_request(
     // connection — rather than only inside the frame's SID — destroys the op a
     // mis-addressed DESTROY would otherwise leak.
     let _ = sid;
-    if let Some(osid) = op_owner_sid(channels, ioid)
-        && let Some(ch) = channels.get_mut(&osid)
+    if let Some(osid) = channels.ioid_owner(ioid)
+        && let Some(mut ch) = channels.get_mut(&osid)
     {
         // Removing the op drops `monitor_abort: Option<Arc<AbortOnDrop>>`.
         // Once the last clone is dropped, the subscriber task aborts.
-        ch.ops.remove(&ioid);
+        ch.remove_op(ioid);
         // A DESTROY on an op still parked for its descriptor cancels the
         // wait — pvxs's `conn->onClose` erasing it from `pending` /
         // `mpending` (`sharedpv.cpp:231-237`, `:263-270`).
-        ch.parked.remove(&ioid);
+        ch.unpark(ioid);
     }
     Ok(())
 }
@@ -6735,7 +6905,7 @@ async fn handle_op(
     reactor: &epics_base_rs::runtime::task::Reactor,
     frame: &Frame,
     tx: &SrvTx,
-    channels: &mut HashMap<u32, ChannelState>,
+    channels: &mut ChannelTable,
     order: ByteOrder,
     // The connection's LIVE outbound byte-order cell (the read loop is its
     // single owner; it re-stores on every mid-stream SET_BYTE_ORDER). The
@@ -6784,7 +6954,7 @@ async fn handle_op(
 
     // Connection-wide IOID uniqueness, evaluated before the per-channel
     // borrow below (pvxs `ServerConn::opByIOID`, serverget.cpp:378-384).
-    let dup_ioid = subcmd & 0x08 != 0 && ioid_live_on_conn(channels, ioid);
+    let dup_ioid = subcmd & 0x08 != 0 && channels.ioid_live(ioid);
 
     // pvxs services a data-phase (non-INIT) frame via the connection-wide
     // `opByIOID` map and acts on `op->chan`, IGNORING the frame SID for
@@ -6800,7 +6970,7 @@ async fn handle_op(
         data_phase_owner_sid(channels, ioid, sid, kind == OpKind::Monitor)?.unwrap_or(sid)
     };
 
-    let ch = match channels.get_mut(&sid) {
+    let mut ch = match channels.get_mut(&sid) {
         Some(c) => c,
         None => {
             // unknown SID on INIT must be connection-fatal (pvxs serverget.cpp:378-384
@@ -6867,7 +7037,7 @@ async fn handle_op(
             (OpKind::Rpc, None) => Arc::new(FieldDesc::Variant),
             (_, Some(d)) => d,
             (_, None) => {
-                park_op_for_intro(reactor, ch, frame, kind, subcmd, sid, ioid, park);
+                park_op_for_intro(reactor, &mut ch, frame, kind, subcmd, sid, ioid, park);
                 return Ok(());
             }
         };
@@ -7253,7 +7423,7 @@ async fn handle_op(
             flush_remote_log(&init_ctx.log, ioid, order, &chan_tx).await;
         }
 
-        ch.ops.insert(
+        ch.insert_op(
             ioid,
             OpState {
                 intro: intro.clone(),
@@ -7449,7 +7619,7 @@ async fn handle_op(
             // only when the op is `Idle`, flips it to `Executing`, and
             // IGNORES a second EXEC that arrives while the first task is in
             // flight (`:511-514`) — it does NOT abort the in-flight task.
-            let op_id = match begin_exec(ch, ioid) {
+            let op_id = match begin_exec(&mut ch, ioid) {
                 Some(id) => id,
                 None => {
                     debug!(ioid, "GET EXEC ignored: op already executing");
@@ -7562,7 +7732,7 @@ async fn handle_op(
                 // error path above returned before reaching here.
                 exec_fin_guard.reply(&tx_clone, buf, true).await;
             });
-            finish_exec_data_task(ch, ioid, subcmd, abort);
+            finish_exec_data_task(&mut ch, ioid, subcmd, abort);
         }
         OpKind::Put => {
             // pvxs `serverget.cpp:364` derives `isput = cmd!=CMD_GET
@@ -7591,7 +7761,7 @@ async fn handle_op(
                 let init_pv_request_t = init_pv_request.clone();
                 // ignore a second EXEC while the readback task is in
                 // flight rather than aborting it (pvxs `serverget.cpp:511-514`).
-                let op_id = match begin_exec(ch, ioid) {
+                let op_id = match begin_exec(&mut ch, ioid) {
                     Some(id) => id,
                     None => {
                         debug!(ioid, "PUT readback EXEC ignored: op already executing");
@@ -7688,7 +7858,7 @@ async fn handle_op(
                     // every error path above returned before reaching here.
                     exec_fin_guard.reply(&tx_clone, buf, true).await;
                 });
-                finish_exec_data_task(ch, ioid, subcmd, abort);
+                finish_exec_data_task(&mut ch, ioid, subcmd, abort);
                 return Ok(());
             }
             // PUT EXEC (subcmd & 0x40 == 0): read bitset (which
@@ -7740,7 +7910,7 @@ async fn handle_op(
             let init_pv_request_t = init_pv_request.clone();
             // ignore a second PUT EXEC while the first write is in
             // flight rather than aborting it (pvxs `serverget.cpp:511-514`).
-            let op_id = match begin_exec(ch, ioid) {
+            let op_id = match begin_exec(&mut ch, ioid) {
                 Some(id) => id,
                 None => {
                     debug!(ioid, "PUT EXEC ignored: op already executing");
@@ -7827,7 +7997,7 @@ async fn handle_op(
                 buf.extend_from_slice(&payload);
                 exec_fin_guard.reply(&tx_clone, buf, replied_ok).await;
             });
-            finish_exec_data_task(ch, ioid, subcmd, abort);
+            finish_exec_data_task(&mut ch, ioid, subcmd, abort);
         }
         OpKind::Monitor => {
             // pvxs `servermon.cpp:643-708` splits the data-phase MONITOR
@@ -8024,7 +8194,7 @@ async fn handle_op(
             // IOID is now free for a fresh INIT (the duplicate-live-op guard
             // no longer trips).
             if is_destroy {
-                ch.ops.remove(&ioid);
+                ch.remove_op(ioid);
             }
         }
         OpKind::Rpc => {
@@ -8054,7 +8224,7 @@ async fn handle_op(
             };
             // ignore a second RPC EXEC while the first call is in
             // flight rather than aborting it (pvxs `serverget.cpp:511-514`).
-            let op_id = match begin_exec(ch, ioid) {
+            let op_id = match begin_exec(&mut ch, ioid) {
                 Some(id) => id,
                 None => {
                     debug!(ioid, "RPC EXEC ignored: op already executing");
@@ -8139,7 +8309,7 @@ async fn handle_op(
                 buf.extend_from_slice(&payload);
                 exec_fin_guard.reply(&tx_clone, buf, replied_ok).await;
             });
-            finish_exec_data_task(ch, ioid, subcmd, abort);
+            finish_exec_data_task(&mut ch, ioid, subcmd, abort);
         }
         // PUT_GET / PROCESS / GET_FIELD have dedicated handlers
         // (`handle_put_get`, `handle_process`, `handle_get_field`) and are
@@ -8160,7 +8330,7 @@ async fn handle_get_field(
     reactor: &epics_base_rs::runtime::task::Reactor,
     frame: &Frame,
     tx: &SrvTx,
-    channels: &mut HashMap<u32, ChannelState>,
+    channels: &mut ChannelTable,
     order: ByteOrder,
     peer: SocketAddr,
     cred: &Arc<ClientCredentials>,
@@ -8211,7 +8381,7 @@ async fn handle_get_field(
     // A reserved slow-path GET_FIELD op lives in `ch.ops` too (below), so a
     // duplicate GET_FIELD frame for an in-flight introspection is caught by
     // this same check rather than spawning a second task that double-replies.
-    if ioid_live_on_conn(channels, ioid) {
+    if channels.ioid_live(ioid) {
         debug!(
             sid,
             ioid, "GET_FIELD reuses IOID already live on connection: dropping (pvxs parity)"
@@ -8279,8 +8449,8 @@ async fn handle_get_field(
     reserve.exec_state = ExecState::Executing;
     reserve.last_request = true;
     let op_id = reserve.monitor_op_id;
-    let chan_mut = channels.get_mut(&sid).expect("SID presence verified above");
-    chan_mut.ops.insert(ioid, reserve);
+    let mut chan_mut = channels.get_mut(&sid).expect("SID presence verified above");
+    chan_mut.insert_op(ioid, reserve);
 
     let exec_fin = ExecFinished {
         sid,
@@ -8333,7 +8503,7 @@ async fn handle_get_field(
     // Install the abort guard on the reserved op so DESTROY_REQUEST /
     // teardown (which drop the op) cancel this task. `subcmd` is irrelevant
     // here — `last_request` is already set on the reserved op above.
-    finish_exec_data_task(chan_mut, ioid, 0, abort);
+    finish_exec_data_task(&mut chan_mut, ioid, 0, abort);
     Ok(())
 }
 
@@ -8880,6 +9050,8 @@ const TEST_PEER: std::net::SocketAddr = std::net::SocketAddr::new(
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
+
     use super::*;
     use crate::decode::{OpResponse, decode_op_response, try_parse_frame};
     use crate::pvdata::{PvStructure, ScalarType, ScalarValue};
@@ -10713,7 +10885,7 @@ mod tests {
             shared.add("dut", pv);
             let source: DynSource = Arc::new(shared);
 
-            let mut channels: HashMap<u32, ChannelState> = HashMap::new();
+            let mut channels = ChannelTable::new();
             channels.insert(
                 sid,
                 ChannelState {
@@ -10724,8 +10896,8 @@ mod tests {
                     source,
                     stat: crate::server_native::peers::ChannelStat::new(String::new()),
                     open_cred: Arc::new(ClientCredentials::anonymous(TEST_PEER)),
-                    ops: HashMap::new(),
-                    parked: HashMap::new(),
+                    ops: ChannelOps::default(),
+                    parked: ParkedOps::default(),
                     put_scratch: None,
                     intro_wire: None,
                 },
@@ -10818,7 +10990,7 @@ mod tests {
             shared.add("dut", pv);
             let source: DynSource = Arc::new(shared);
 
-            let mut channels: HashMap<u32, ChannelState> = HashMap::new();
+            let mut channels = ChannelTable::new();
             channels.insert(
                 sid,
                 ChannelState {
@@ -10829,8 +11001,8 @@ mod tests {
                     source,
                     stat: crate::server_native::peers::ChannelStat::new(String::new()),
                     open_cred: Arc::new(ClientCredentials::anonymous(TEST_PEER)),
-                    ops: HashMap::new(),
-                    parked: HashMap::new(),
+                    ops: ChannelOps::default(),
+                    parked: ParkedOps::default(),
                     put_scratch: None,
                     intro_wire: None,
                 },
@@ -10922,7 +11094,7 @@ mod tests {
         shared.add("dut", pv);
         let source: DynSource = Arc::new(shared);
 
-        let mut channels: HashMap<u32, ChannelState> = HashMap::new();
+        let mut channels = ChannelTable::new();
         channels.insert(
             sid,
             ChannelState {
@@ -10933,8 +11105,8 @@ mod tests {
                 source,
                 stat: crate::server_native::peers::ChannelStat::new(String::new()),
                 open_cred: Arc::new(ClientCredentials::anonymous(TEST_PEER)),
-                ops: HashMap::new(),
-                parked: HashMap::new(),
+                ops: ChannelOps::default(),
+                parked: ParkedOps::default(),
                 put_scratch: None,
                 intro_wire: None,
             },
@@ -11027,7 +11199,7 @@ mod tests {
             shared.add("dut", pv);
             let source: DynSource = Arc::new(shared);
 
-            let mut channels: HashMap<u32, ChannelState> = HashMap::new();
+            let mut channels = ChannelTable::new();
             channels.insert(
                 sid,
                 ChannelState {
@@ -11038,8 +11210,8 @@ mod tests {
                     source,
                     stat: crate::server_native::peers::ChannelStat::new(String::new()),
                     open_cred: Arc::new(ClientCredentials::anonymous(TEST_PEER)),
-                    ops: HashMap::new(),
-                    parked: HashMap::new(),
+                    ops: ChannelOps::default(),
+                    parked: ParkedOps::default(),
                     put_scratch: None,
                     intro_wire: None,
                 },
@@ -11701,7 +11873,7 @@ mod tests {
         shared.add("dut", pv);
         let source: DynSource = Arc::new(shared);
 
-        let mut channels: HashMap<u32, ChannelState> = HashMap::new();
+        let mut channels = ChannelTable::new();
         channels.insert(
             sid,
             ChannelState {
@@ -11712,8 +11884,8 @@ mod tests {
                 source: source.clone(),
                 stat: crate::server_native::peers::ChannelStat::new(String::new()),
                 open_cred: Arc::new(ClientCredentials::anonymous(TEST_PEER)),
-                ops: HashMap::new(),
-                parked: HashMap::new(),
+                ops: ChannelOps::default(),
+                parked: ParkedOps::default(),
                 put_scratch: None,
                 intro_wire: None,
             },
@@ -11821,7 +11993,7 @@ mod tests {
         shared.add("dut", pv);
         let source: DynSource = Arc::new(shared);
 
-        let mut channels: HashMap<u32, ChannelState> = HashMap::new();
+        let mut channels = ChannelTable::new();
         channels.insert(
             sid,
             ChannelState {
@@ -11832,8 +12004,8 @@ mod tests {
                 source,
                 stat: crate::server_native::peers::ChannelStat::new(String::new()),
                 open_cred: Arc::new(ClientCredentials::anonymous(TEST_PEER)),
-                ops: HashMap::new(),
-                parked: HashMap::new(),
+                ops: ChannelOps::default(),
+                parked: ParkedOps::default(),
                 put_scratch: None,
                 intro_wire: None,
             },
@@ -11924,7 +12096,7 @@ mod tests {
         shared.add("dut", pv);
         let source: DynSource = Arc::new(shared);
 
-        let mut channels: HashMap<u32, ChannelState> = HashMap::new();
+        let mut channels = ChannelTable::new();
         channels.insert(
             sid,
             ChannelState {
@@ -11935,8 +12107,8 @@ mod tests {
                 source,
                 stat: crate::server_native::peers::ChannelStat::new(String::new()),
                 open_cred: Arc::new(ClientCredentials::anonymous(TEST_PEER)),
-                ops: HashMap::new(),
-                parked: HashMap::new(),
+                ops: ChannelOps::default(),
+                parked: ParkedOps::default(),
                 put_scratch: None,
                 intro_wire: None,
             },
@@ -12192,7 +12364,7 @@ mod tests {
         shared.add("dut", pv);
         let source: DynSource = Arc::new(shared);
 
-        let mut channels: HashMap<u32, ChannelState> = HashMap::new();
+        let mut channels = ChannelTable::new();
         channels.insert(
             sid,
             ChannelState {
@@ -12203,8 +12375,8 @@ mod tests {
                 source: source.clone(),
                 stat: crate::server_native::peers::ChannelStat::new(String::new()),
                 open_cred: Arc::new(ClientCredentials::anonymous(TEST_PEER)),
-                ops: HashMap::new(),
-                parked: HashMap::new(),
+                ops: ChannelOps::default(),
+                parked: ParkedOps::default(),
                 put_scratch: None,
                 intro_wire: None,
             },
@@ -12365,7 +12537,7 @@ mod tests {
         sid: u32,
         intro: &FieldDesc,
     ) -> (
-        HashMap<u32, ChannelState>,
+        ChannelTable,
         DynSource,
         crate::server_native::shared_pv::SharedPV,
     ) {
@@ -12375,7 +12547,7 @@ mod tests {
         let shared = crate::server_native::SharedSource::new();
         shared.add("dut", pv);
         let source: DynSource = Arc::new(shared);
-        let mut channels: HashMap<u32, ChannelState> = HashMap::new();
+        let mut channels = ChannelTable::new();
         channels.insert(
             sid,
             ChannelState {
@@ -12386,8 +12558,8 @@ mod tests {
                 source: source.clone(),
                 stat: crate::server_native::peers::ChannelStat::new(String::new()),
                 open_cred: Arc::new(ClientCredentials::anonymous(TEST_PEER)),
-                ops: HashMap::new(),
-                parked: HashMap::new(),
+                ops: ChannelOps::default(),
+                parked: ParkedOps::default(),
                 put_scratch: None,
                 intro_wire: None,
             },
@@ -12402,7 +12574,7 @@ mod tests {
     async fn pvx61_drive(
         frame: &Frame,
         tx: &SrvTx,
-        channels: &mut HashMap<u32, ChannelState>,
+        channels: &mut ChannelTable,
         order: ByteOrder,
         config: &PvaServerConfig,
         encode_cache: &mut crate::pvdata::encode::EncodeTypeCache,
@@ -13129,7 +13301,7 @@ mod tests {
         sid: u32,
         intro: &FieldDesc,
     ) -> (
-        HashMap<u32, ChannelState>,
+        ChannelTable,
         DynSource,
         mpsc::Sender<crate::server_native::RawMonitorEvent>,
     ) {
@@ -13139,7 +13311,7 @@ mod tests {
             seed: three_field_value(0, 0, 0),
             raw_rx: std::sync::Mutex::new(Some(raw_rx.into())),
         });
-        let mut channels: HashMap<u32, ChannelState> = HashMap::new();
+        let mut channels = ChannelTable::new();
         channels.insert(
             sid,
             ChannelState {
@@ -13150,8 +13322,8 @@ mod tests {
                 source: source.clone(),
                 stat: crate::server_native::peers::ChannelStat::new(String::new()),
                 open_cred: Arc::new(ClientCredentials::anonymous(TEST_PEER)),
-                ops: HashMap::new(),
-                parked: HashMap::new(),
+                ops: ChannelOps::default(),
+                parked: ParkedOps::default(),
                 put_scratch: None,
                 intro_wire: None,
             },
@@ -13371,7 +13543,7 @@ mod tests {
             raw_rx: std::sync::Mutex::new(Some(raw_rx.into())),
             gate,
         });
-        let mut channels: HashMap<u32, ChannelState> = HashMap::new();
+        let mut channels = ChannelTable::new();
         channels.insert(
             sid,
             ChannelState {
@@ -13382,8 +13554,8 @@ mod tests {
                 source: source.clone(),
                 stat: crate::server_native::peers::ChannelStat::new(String::new()),
                 open_cred: Arc::new(ClientCredentials::anonymous(TEST_PEER)),
-                ops: HashMap::new(),
-                parked: HashMap::new(),
+                ops: ChannelOps::default(),
+                parked: ParkedOps::default(),
                 put_scratch: None,
                 intro_wire: None,
             },
@@ -13541,7 +13713,7 @@ mod tests {
         let (sid, ioid) = (10u32, 709u32);
         let intro = three_field_intro();
         let source: DynSource = Arc::new(DenyReadSource::new());
-        let mut channels: HashMap<u32, ChannelState> = HashMap::new();
+        let mut channels = ChannelTable::new();
         channels.insert(
             sid,
             ChannelState {
@@ -13552,8 +13724,8 @@ mod tests {
                 source: source.clone(),
                 stat: crate::server_native::peers::ChannelStat::new(String::new()),
                 open_cred: Arc::new(ClientCredentials::anonymous(TEST_PEER)),
-                ops: HashMap::new(),
-                parked: HashMap::new(),
+                ops: ChannelOps::default(),
+                parked: ParkedOps::default(),
                 put_scratch: None,
                 intro_wire: None,
             },
@@ -13640,7 +13812,7 @@ mod tests {
         shared.add("dut", pv);
         let source: DynSource = Arc::new(shared);
 
-        let mut channels: HashMap<u32, ChannelState> = HashMap::new();
+        let mut channels = ChannelTable::new();
         channels.insert(
             sid,
             ChannelState {
@@ -13651,8 +13823,8 @@ mod tests {
                 source: source.clone(),
                 stat: crate::server_native::peers::ChannelStat::new(String::new()),
                 open_cred: Arc::new(ClientCredentials::anonymous(TEST_PEER)),
-                ops: HashMap::new(),
-                parked: HashMap::new(),
+                ops: ChannelOps::default(),
+                parked: ParkedOps::default(),
                 put_scratch: None,
                 intro_wire: None,
             },
@@ -13782,7 +13954,7 @@ mod tests {
         shared.add("dut", pv);
         let source: DynSource = Arc::new(shared);
 
-        let mut channels: HashMap<u32, ChannelState> = HashMap::new();
+        let mut channels = ChannelTable::new();
         channels.insert(
             sid,
             ChannelState {
@@ -13793,8 +13965,8 @@ mod tests {
                 source: source.clone(),
                 stat: crate::server_native::peers::ChannelStat::new(String::new()),
                 open_cred: Arc::new(ClientCredentials::anonymous(TEST_PEER)),
-                ops: HashMap::new(),
-                parked: HashMap::new(),
+                ops: ChannelOps::default(),
+                parked: ParkedOps::default(),
                 put_scratch: None,
                 intro_wire: None,
             },
@@ -13893,7 +14065,7 @@ mod tests {
         shared.add("dut", pv);
         let source: DynSource = Arc::new(shared);
 
-        let mut channels: HashMap<u32, ChannelState> = HashMap::new();
+        let mut channels = ChannelTable::new();
         channels.insert(
             sid,
             ChannelState {
@@ -13904,8 +14076,8 @@ mod tests {
                 source: source.clone(),
                 stat: crate::server_native::peers::ChannelStat::new(String::new()),
                 open_cred: Arc::new(ClientCredentials::anonymous(TEST_PEER)),
-                ops: HashMap::new(),
-                parked: HashMap::new(),
+                ops: ChannelOps::default(),
+                parked: ParkedOps::default(),
                 put_scratch: None,
                 intro_wire: None,
             },
@@ -13960,7 +14132,7 @@ mod tests {
         // Executing edge owned by `MonitorStartControl`, not `monitor_started`.
         // A real START (0x44) flips it; a plain 0x00 or an ACK-only frame must
         // not.
-        let started = |chs: &HashMap<u32, ChannelState>| -> bool {
+        let started = |chs: &ChannelTable| -> bool {
             chs.get(&sid)
                 .and_then(|c| c.ops.get(&ioid))
                 .and_then(|o| o.monitor_start_ctl.as_ref())
@@ -14081,7 +14253,7 @@ mod tests {
         ioid: u32,
         window: std::sync::Arc<std::sync::atomic::AtomicU32>,
         source: DynSource,
-    ) -> HashMap<u32, ChannelState> {
+    ) -> ChannelTable {
         let mut ops = HashMap::new();
         ops.insert(
             ioid,
@@ -14110,7 +14282,7 @@ mod tests {
                 last_request: false,
             },
         );
-        let mut channels: HashMap<u32, ChannelState> = HashMap::new();
+        let mut channels = ChannelTable::new();
         channels.insert(
             sid,
             ChannelState {
@@ -14121,8 +14293,8 @@ mod tests {
                 source,
                 stat: crate::server_native::peers::ChannelStat::new(String::new()),
                 open_cred: Arc::new(ClientCredentials::anonymous(TEST_PEER)),
-                ops,
-                parked: HashMap::new(),
+                ops: ops.into(),
+                parked: ParkedOps::default(),
                 put_scratch: None,
                 intro_wire: None,
             },
@@ -14377,7 +14549,7 @@ mod tests {
         wm: Option<(usize, usize)>,
         src: &DynSource,
         intro: &FieldDesc,
-    ) -> HashMap<u32, ChannelState> {
+    ) -> ChannelTable {
         let (sid, ioid) = ids;
         let mut op = non_monitor_op_state(
             std::sync::Arc::new(intro.clone()),
@@ -14412,7 +14584,7 @@ mod tests {
         op.monitor_start_ctl = Some(ctl);
         let mut ops = HashMap::new();
         ops.insert(ioid, op);
-        let mut channels = HashMap::new();
+        let mut channels = ChannelTable::new();
         channels.insert(
             sid,
             ChannelState {
@@ -14423,8 +14595,8 @@ mod tests {
                 source: src.clone(),
                 stat: crate::server_native::peers::ChannelStat::new(String::new()),
                 open_cred: Arc::new(ClientCredentials::anonymous(TEST_PEER)),
-                ops,
-                parked: HashMap::new(),
+                ops: ops.into(),
+                parked: ParkedOps::default(),
                 put_scratch: None,
                 intro_wire: None,
             },
@@ -14837,7 +15009,7 @@ mod tests {
         // (pvxs serverconn.cpp:338-342) — still Ok.
         let order = ByteOrder::Little;
         let peer = "127.0.0.1:5075".parse::<SocketAddr>().unwrap();
-        let channels: HashMap<u32, ChannelState> = HashMap::new();
+        let channels = ChannelTable::new();
         for mtype in [0u8, 1, 2, 3, 9] {
             let mut payload = Vec::new();
             payload.put_u32(0xDEADBEEF, order); // ioid
@@ -14883,7 +15055,7 @@ mod tests {
                 BitSet::new(),
             ),
         );
-        let mut channels: HashMap<u32, ChannelState> = HashMap::new();
+        let mut channels = ChannelTable::new();
         channels.insert(
             1,
             ChannelState {
@@ -14894,8 +15066,8 @@ mod tests {
                 source,
                 stat: crate::server_native::peers::ChannelStat::new(String::new()),
                 open_cred: Arc::new(ClientCredentials::anonymous(TEST_PEER)),
-                ops,
-                parked: HashMap::new(),
+                ops: ops.into(),
+                parked: ParkedOps::default(),
                 put_scratch: None,
                 intro_wire: None,
             },
@@ -14942,14 +15114,14 @@ mod tests {
                 source,
                 stat: crate::server_native::peers::ChannelStat::new(String::new()),
                 open_cred: Arc::new(ClientCredentials::anonymous(TEST_PEER)),
-                ops,
-                parked: HashMap::new(),
+                ops: ops.into(),
+                parked: ParkedOps::default(),
                 put_scratch: None,
                 intro_wire: None,
             }
         };
         // Channel 1 owns IOID 7; channel 2 owns IOID 9.
-        let mut channels: HashMap<u32, ChannelState> = HashMap::new();
+        let mut channels = ChannelTable::new();
         channels.insert(1, mk_channel(1, 7));
         channels.insert(2, mk_channel(2, 9));
 
@@ -15022,7 +15194,7 @@ mod tests {
                 BitSet::new(),
             ),
         );
-        let mut channels: HashMap<u32, ChannelState> = HashMap::new();
+        let mut channels = ChannelTable::new();
         channels.insert(
             1,
             ChannelState {
@@ -15033,8 +15205,8 @@ mod tests {
                 source,
                 stat: crate::server_native::peers::ChannelStat::new(String::new()),
                 open_cred: Arc::new(ClientCredentials::anonymous(TEST_PEER)),
-                ops,
-                parked: HashMap::new(),
+                ops: ops.into(),
+                parked: ParkedOps::default(),
                 put_scratch: None,
                 intro_wire: None,
             },
@@ -15106,7 +15278,7 @@ mod tests {
         let paused = Arc::new(std::sync::atomic::AtomicBool::new(false));
 
         let source: DynSource = Arc::new(crate::server_native::SharedSource::new());
-        let mut channels: HashMap<u32, ChannelState> = HashMap::new();
+        let mut channels = ChannelTable::new();
         let mut ops = HashMap::new();
         ops.insert(
             ioid,
@@ -15145,8 +15317,8 @@ mod tests {
                 source: source.clone(),
                 stat: crate::server_native::peers::ChannelStat::new(String::new()),
                 open_cred: Arc::new(ClientCredentials::anonymous(TEST_PEER)),
-                ops,
-                parked: HashMap::new(),
+                ops: ops.into(),
+                parked: ParkedOps::default(),
                 put_scratch: None,
                 intro_wire: None,
             },
@@ -15197,7 +15369,7 @@ mod tests {
         assert!(join_attempt.is_ok(), "probe should not time out");
 
         // Now drop the OpState (simulating DESTROY); the task must abort.
-        channels.clear();
+        drop(channels);
         let join = tokio::time::timeout(Duration::from_millis(500), task).await;
         let outcome = join.expect("aborted task should finish quickly");
         assert!(
@@ -15244,7 +15416,7 @@ mod tests {
         // The sticky destroy
         // marker must SURVIVE this cancel (asserted below).
 
-        let mut channels: HashMap<u32, ChannelState> = HashMap::new();
+        let mut channels = ChannelTable::new();
         let mut ops = HashMap::new();
         ops.insert(ioid, op);
         channels.insert(
@@ -15257,8 +15429,8 @@ mod tests {
                 source,
                 stat: crate::server_native::peers::ChannelStat::new(String::new()),
                 open_cred: Arc::new(ClientCredentials::anonymous(TEST_PEER)),
-                ops,
-                parked: HashMap::new(),
+                ops: ops.into(),
+                parked: ParkedOps::default(),
                 put_scratch: None,
                 intro_wire: None,
             },
@@ -15270,9 +15442,10 @@ mod tests {
         let frame = synth_frame(Command::CancelRequest, order, payload);
         handle_cancel_request(&frame, &mut channels).expect("well-formed CancelRequest");
 
-        let op = channels
-            .get_mut(&sid)
-            .and_then(|c| c.ops.get_mut(&ioid))
+        let mut ch = channels.get_mut(&sid).expect("channel survives cancel");
+        let op = ch
+            .ops
+            .get_mut(&ioid)
             .expect("op preserved across cancel — cancel is not a teardown");
         assert_eq!(
             op.exec_state,
@@ -15296,7 +15469,7 @@ mod tests {
 
         // A subsequent EXEC is accepted now that the op is Idle.
         assert!(
-            begin_exec(channels.get_mut(&sid).unwrap(), ioid).is_some(),
+            begin_exec(&mut channels.get_mut(&sid).unwrap(), ioid).is_some(),
             "a second EXEC must be accepted after cancel (pvxs serverget.cpp:511-514)"
         );
 
@@ -15338,7 +15511,7 @@ mod tests {
         op.last_request = true; // a last-request EXEC, now about to be cancelled
         let stale_op_id = op.monitor_op_id;
 
-        let mut channels: HashMap<u32, ChannelState> = HashMap::new();
+        let mut channels = ChannelTable::new();
         let mut ops = HashMap::new();
         ops.insert(ioid, op);
         channels.insert(
@@ -15351,8 +15524,8 @@ mod tests {
                 source,
                 stat: crate::server_native::peers::ChannelStat::new(String::new()),
                 open_cred: Arc::new(ClientCredentials::anonymous(TEST_PEER)),
-                ops,
-                parked: HashMap::new(),
+                ops: ops.into(),
+                parked: ParkedOps::default(),
                 put_scratch: None,
                 intro_wire: None,
             },
@@ -15398,7 +15571,7 @@ mod tests {
         );
 
         // A subsequent EXEC is accepted; capture its op-instance id.
-        let exec_id = begin_exec(channels.get_mut(&sid).unwrap(), ioid)
+        let exec_id = begin_exec(&mut channels.get_mut(&sid).unwrap(), ioid)
             .expect("a non-last EXEC is accepted after cancel");
 
         // That EXEC's reply completes SUCCESSFULLY. Because the sticky
@@ -15917,7 +16090,7 @@ mod tests {
         let unknown_sid: u32 = 4242;
         let cid: u32 = 7;
 
-        let mut channels: HashMap<u32, ChannelState> = HashMap::new();
+        let mut channels = ChannelTable::new();
         let (tx, mut rx) = test_srv_tx(8);
 
         let mut payload = Vec::new();
@@ -15957,7 +16130,7 @@ mod tests {
         let cid: u32 = 22;
 
         let source: DynSource = Arc::new(crate::server_native::SharedSource::new());
-        let mut channels: HashMap<u32, ChannelState> = HashMap::new();
+        let mut channels = ChannelTable::new();
         channels.insert(
             sid,
             ChannelState {
@@ -15968,8 +16141,8 @@ mod tests {
                 source: source.clone(),
                 stat: crate::server_native::peers::ChannelStat::new(String::new()),
                 open_cred: Arc::new(ClientCredentials::anonymous(TEST_PEER)),
-                ops: HashMap::new(),
-                parked: HashMap::new(),
+                ops: ChannelOps::default(),
+                parked: ParkedOps::default(),
                 put_scratch: None,
                 intro_wire: None,
             },
@@ -16018,7 +16191,7 @@ mod tests {
         let cid: u32 = 0x0506_0708;
 
         let source: DynSource = Arc::new(crate::server_native::SharedSource::new());
-        let mut channels: HashMap<u32, ChannelState> = HashMap::new();
+        let mut channels = ChannelTable::new();
         channels.insert(
             sid,
             ChannelState {
@@ -16029,8 +16202,8 @@ mod tests {
                 source: source.clone(),
                 stat: crate::server_native::peers::ChannelStat::new(String::new()),
                 open_cred: Arc::new(ClientCredentials::anonymous(TEST_PEER)),
-                ops: HashMap::new(),
-                parked: HashMap::new(),
+                ops: ChannelOps::default(),
+                parked: ParkedOps::default(),
                 put_scratch: None,
                 intro_wire: None,
             },
@@ -16180,7 +16353,7 @@ mod tests {
         let source: DynSource = Arc::new(RecordingCloseSource {
             closed: closed.clone(),
         });
-        let mut channels: HashMap<u32, ChannelState> = HashMap::new();
+        let mut channels = ChannelTable::new();
         channels.insert(
             sid,
             ChannelState {
@@ -16191,8 +16364,8 @@ mod tests {
                 source: source.clone(),
                 stat: crate::server_native::peers::ChannelStat::new(String::new()),
                 open_cred: Arc::new(ClientCredentials::anonymous(TEST_PEER)),
-                ops: HashMap::new(),
-                parked: HashMap::new(),
+                ops: ChannelOps::default(),
+                parked: ParkedOps::default(),
                 put_scratch: None,
                 intro_wire: None,
             },
@@ -16347,7 +16520,7 @@ mod tests {
 
         let peer: SocketAddr = "127.0.0.1:5075".parse().unwrap();
         let (cc_tx, mut cc_rx) = tokio::sync::mpsc::channel::<CreateChannelCompletion>(8);
-        let mut channels: HashMap<u32, ChannelState> = HashMap::new();
+        let mut channels = ChannelTable::new();
 
         // CREATE_CHANNEL for "dut", dispatched while the connection identity
         // is alice/ca.
@@ -16405,8 +16578,8 @@ mod tests {
                 source: resolved.owner,
                 stat: crate::server_native::peers::ChannelStat::new(String::new()),
                 open_cred: completion.open_cred,
-                ops: HashMap::new(),
-                parked: HashMap::new(),
+                ops: ChannelOps::default(),
+                parked: ParkedOps::default(),
                 put_scratch: None,
                 intro_wire: None,
             },
@@ -16441,7 +16614,7 @@ mod tests {
             intro: FieldDesc::Variant,
             value: PvField::Scalar(ScalarValue::Int(0)),
         });
-        let mut channels: HashMap<u32, ChannelState> = HashMap::new();
+        let mut channels = ChannelTable::new();
         channels.insert(
             sid,
             ChannelState {
@@ -16453,8 +16626,8 @@ mod tests {
                 stat: crate::server_native::peers::ChannelStat::new(String::new()),
                 // Channel was created under alice/ca.
                 open_cred: cred_ca("alice"),
-                ops: HashMap::new(),
-                parked: HashMap::new(),
+                ops: ChannelOps::default(),
+                parked: ParkedOps::default(),
                 put_scratch: None,
                 intro_wire: None,
             },
@@ -16507,7 +16680,7 @@ mod tests {
             intro: FieldDesc::Variant,
             value: PvField::Scalar(ScalarValue::Int(0)),
         });
-        let mut channels: HashMap<u32, ChannelState> = HashMap::new();
+        let mut channels = ChannelTable::new();
         channels.insert(
             sid,
             ChannelState {
@@ -16518,8 +16691,8 @@ mod tests {
                 source,
                 stat: crate::server_native::peers::ChannelStat::new(String::new()),
                 open_cred: cred_ca("alice"),
-                ops: HashMap::new(),
-                parked: HashMap::new(),
+                ops: ChannelOps::default(),
+                parked: ParkedOps::default(),
                 put_scratch: None,
                 intro_wire: None,
             },
@@ -16583,7 +16756,7 @@ mod tests {
                 BitSet::all_set(intro.total_bits()),
             ),
         );
-        let mut channels: HashMap<u32, ChannelState> = HashMap::new();
+        let mut channels = ChannelTable::new();
         channels.insert(
             sid,
             ChannelState {
@@ -16595,8 +16768,8 @@ mod tests {
                 stat: crate::server_native::peers::ChannelStat::new(String::new()),
                 // Channel was created under alice/ca.
                 open_cred: cred_ca("alice"),
-                ops,
-                parked: HashMap::new(),
+                ops: ops.into(),
+                parked: ParkedOps::default(),
                 put_scratch: None,
                 intro_wire: None,
             },
@@ -16663,7 +16836,7 @@ mod tests {
 
         // Two live channels: "X" (sid 1) is the invalidation target; "Y"
         // (sid 2), a different name, must survive.
-        let mut channels: HashMap<u32, ChannelState> = HashMap::new();
+        let mut channels = ChannelTable::new();
         let peer_entry = crate::server_native::peers::PeerEntry::new(false);
         for (sid, cid, name) in [(1u32, 10u32, "X"), (2u32, 20u32, "Y")] {
             let stat = crate::server_native::peers::ChannelStat::new(name.into());
@@ -16677,8 +16850,8 @@ mod tests {
                     source: source.clone(),
                     stat: stat.clone(),
                     open_cred: Arc::new(ClientCredentials::anonymous(TEST_PEER)),
-                    ops: HashMap::new(),
-                    parked: HashMap::new(),
+                    ops: ChannelOps::default(),
+                    parked: ParkedOps::default(),
                     put_scratch: None,
                     intro_wire: None,
                 },
@@ -16740,7 +16913,7 @@ mod tests {
     async fn invalidate_named_channels_unknown_name_is_noop() {
         let order = ByteOrder::Little;
         let source: DynSource = Arc::new(crate::server_native::SharedSource::new());
-        let mut channels: HashMap<u32, ChannelState> = HashMap::new();
+        let mut channels = ChannelTable::new();
         let peer_entry = crate::server_native::peers::PeerEntry::new(false);
         let stat = crate::server_native::peers::ChannelStat::new("X".into());
         channels.insert(
@@ -16753,8 +16926,8 @@ mod tests {
                 source: source.clone(),
                 stat: stat.clone(),
                 open_cred: Arc::new(ClientCredentials::anonymous(TEST_PEER)),
-                ops: HashMap::new(),
-                parked: HashMap::new(),
+                ops: ChannelOps::default(),
+                parked: ParkedOps::default(),
                 put_scratch: None,
                 intro_wire: None,
             },
@@ -16825,7 +16998,7 @@ mod tests {
 
         // Pre-populate a ChannelState as if CREATE_CHANNEL had already
         // run, so we can drive the PUT INIT + EXEC frames directly.
-        let mut channels: HashMap<u32, ChannelState> = HashMap::new();
+        let mut channels = ChannelTable::new();
         channels.insert(
             sid,
             ChannelState {
@@ -16836,8 +17009,8 @@ mod tests {
                 source: source.clone(),
                 stat: crate::server_native::peers::ChannelStat::new(String::new()),
                 open_cred: Arc::new(ClientCredentials::anonymous(TEST_PEER)),
-                ops: HashMap::new(),
-                parked: HashMap::new(),
+                ops: ChannelOps::default(),
+                parked: ParkedOps::default(),
                 put_scratch: None,
                 intro_wire: None,
             },
@@ -16979,7 +17152,7 @@ mod tests {
             .expect("the record has an NTScalar descriptor");
         let source: DynSource = Arc::new(db_source);
 
-        let mut channels: HashMap<u32, ChannelState> = HashMap::new();
+        let mut channels = ChannelTable::new();
         channels.insert(
             sid,
             ChannelState {
@@ -16990,8 +17163,8 @@ mod tests {
                 source: source.clone(),
                 stat: crate::server_native::peers::ChannelStat::new(String::new()),
                 open_cred: Arc::new(ClientCredentials::anonymous(TEST_PEER)),
-                ops: HashMap::new(),
-                parked: HashMap::new(),
+                ops: ChannelOps::default(),
+                parked: ParkedOps::default(),
                 put_scratch: None,
                 intro_wire: None,
             },
@@ -17182,7 +17355,7 @@ mod tests {
         shared.add("dut", pv);
         let source: DynSource = Arc::new(shared);
 
-        let mut channels: HashMap<u32, ChannelState> = HashMap::new();
+        let mut channels = ChannelTable::new();
         channels.insert(
             sid,
             ChannelState {
@@ -17193,8 +17366,8 @@ mod tests {
                 source: source.clone(),
                 stat: crate::server_native::peers::ChannelStat::new(String::new()),
                 open_cred: Arc::new(ClientCredentials::anonymous(TEST_PEER)),
-                ops: HashMap::new(),
-                parked: HashMap::new(),
+                ops: ChannelOps::default(),
+                parked: ParkedOps::default(),
                 put_scratch: None,
                 intro_wire: None,
             },
@@ -17343,7 +17516,7 @@ mod tests {
                     BitSet::all_set(intro.total_bits()),
                 ),
             );
-            let mut channels: HashMap<u32, ChannelState> = HashMap::new();
+            let mut channels = ChannelTable::new();
             channels.insert(
                 sid,
                 ChannelState {
@@ -17354,8 +17527,8 @@ mod tests {
                     source: source.clone(),
                     stat: crate::server_native::peers::ChannelStat::new(String::new()),
                     open_cred: Arc::new(ClientCredentials::anonymous(TEST_PEER)),
-                    ops,
-                    parked: HashMap::new(),
+                    ops: ops.into(),
+                    parked: ParkedOps::default(),
                     put_scratch: None,
                     intro_wire: None,
                 },
@@ -17517,7 +17690,7 @@ mod tests {
         shared.add("dut", pv);
         let source: DynSource = Arc::new(shared);
 
-        let mut channels: HashMap<u32, ChannelState> = HashMap::new();
+        let mut channels = ChannelTable::new();
         channels.insert(
             sid,
             ChannelState {
@@ -17528,8 +17701,8 @@ mod tests {
                 source: source.clone(),
                 stat: crate::server_native::peers::ChannelStat::new(String::new()),
                 open_cred: Arc::new(ClientCredentials::anonymous(TEST_PEER)),
-                ops: HashMap::new(),
-                parked: HashMap::new(),
+                ops: ChannelOps::default(),
+                parked: ParkedOps::default(),
                 put_scratch: None,
                 intro_wire: None,
             },
@@ -17635,7 +17808,7 @@ mod tests {
 
         // Negative control: a fresh per-call cache (pre-fix behaviour) cannot
         // resolve the reference — the INIT is rejected as connection-fatal.
-        let mut empty_channels: HashMap<u32, ChannelState> = HashMap::new();
+        let mut empty_channels = ChannelTable::new();
         empty_channels.insert(
             sid,
             ChannelState {
@@ -17646,8 +17819,8 @@ mod tests {
                 source: source.clone(),
                 stat: crate::server_native::peers::ChannelStat::new(String::new()),
                 open_cred: Arc::new(ClientCredentials::anonymous(TEST_PEER)),
-                ops: HashMap::new(),
-                parked: HashMap::new(),
+                ops: ChannelOps::default(),
+                parked: ParkedOps::default(),
                 put_scratch: None,
                 intro_wire: None,
             },
@@ -18046,7 +18219,7 @@ mod tests {
         shared.add("dut", pv);
         let source: DynSource = Arc::new(shared);
 
-        let mut channels: HashMap<u32, ChannelState> = HashMap::new();
+        let mut channels = ChannelTable::new();
         channels.insert(
             sid,
             ChannelState {
@@ -18057,8 +18230,8 @@ mod tests {
                 source: source.clone(),
                 stat: crate::server_native::peers::ChannelStat::new(String::new()),
                 open_cred: Arc::new(ClientCredentials::anonymous(TEST_PEER)),
-                ops: HashMap::new(),
-                parked: HashMap::new(),
+                ops: ChannelOps::default(),
+                parked: ParkedOps::default(),
                 put_scratch: None,
                 intro_wire: None,
             },
@@ -18193,7 +18366,7 @@ mod tests {
         shared.add("dut", pv);
         let source: DynSource = Arc::new(shared);
 
-        let mut channels: HashMap<u32, ChannelState> = HashMap::new();
+        let mut channels = ChannelTable::new();
         channels.insert(
             sid,
             ChannelState {
@@ -18204,8 +18377,8 @@ mod tests {
                 source: source.clone(),
                 stat: crate::server_native::peers::ChannelStat::new(String::new()),
                 open_cred: Arc::new(ClientCredentials::anonymous(TEST_PEER)),
-                ops: HashMap::new(),
-                parked: HashMap::new(),
+                ops: ChannelOps::default(),
+                parked: ParkedOps::default(),
                 put_scratch: None,
                 intro_wire: None,
             },
@@ -18549,11 +18722,7 @@ mod tests {
     /// for `ioid`, so a PROCESS data-phase frame dispatches straight
     /// into the WRITE-gate check.
     #[cfg(test)]
-    fn primed_process_channels(
-        sid: u32,
-        ioid: u32,
-        source: DynSource,
-    ) -> HashMap<u32, ChannelState> {
+    fn primed_process_channels(sid: u32, ioid: u32, source: DynSource) -> ChannelTable {
         let intro = three_field_intro();
         let mut ops = HashMap::new();
         let mask = BitSet::all_set(intro.total_bits());
@@ -18561,7 +18730,7 @@ mod tests {
             ioid,
             non_monitor_op_state(std::sync::Arc::new(intro.clone()), OpKind::Process, mask),
         );
-        let mut channels = HashMap::new();
+        let mut channels = ChannelTable::new();
         channels.insert(
             sid,
             ChannelState {
@@ -18572,8 +18741,8 @@ mod tests {
                 source,
                 stat: crate::server_native::peers::ChannelStat::new(String::new()),
                 open_cred: Arc::new(ClientCredentials::anonymous(TEST_PEER)),
-                ops,
-                parked: HashMap::new(),
+                ops: ops.into(),
+                parked: ParkedOps::default(),
                 put_scratch: None,
                 intro_wire: None,
             },
@@ -19048,7 +19217,7 @@ mod tests {
         ioid: u32,
         kind: OpKind,
         source: DynSource,
-    ) -> HashMap<u32, ChannelState> {
+    ) -> ChannelTable {
         let intro = three_field_intro();
         let mask = BitSet::all_set(intro.total_bits());
         let mut ops = HashMap::new();
@@ -19056,7 +19225,7 @@ mod tests {
             ioid,
             non_monitor_op_state(std::sync::Arc::new(intro.clone()), kind, mask),
         );
-        let mut channels = HashMap::new();
+        let mut channels = ChannelTable::new();
         channels.insert(
             sid,
             ChannelState {
@@ -19067,8 +19236,8 @@ mod tests {
                 source,
                 stat: crate::server_native::peers::ChannelStat::new(String::new()),
                 open_cred: Arc::new(ClientCredentials::anonymous(TEST_PEER)),
-                ops,
-                parked: HashMap::new(),
+                ops: ops.into(),
+                parked: ParkedOps::default(),
                 put_scratch: None,
                 intro_wire: None,
             },
@@ -19185,9 +19354,9 @@ mod tests {
     /// registered ops, so a PROCESS INIT frame exercises the INIT
     /// pvRequest decode + registration path.
     #[cfg(test)]
-    fn process_channels_no_op(sid: u32, source: DynSource) -> HashMap<u32, ChannelState> {
+    fn process_channels_no_op(sid: u32, source: DynSource) -> ChannelTable {
         let intro = three_field_intro();
-        let mut channels = HashMap::new();
+        let mut channels = ChannelTable::new();
         channels.insert(
             sid,
             ChannelState {
@@ -19198,8 +19367,8 @@ mod tests {
                 source,
                 stat: crate::server_native::peers::ChannelStat::new(String::new()),
                 open_cred: Arc::new(ClientCredentials::anonymous(TEST_PEER)),
-                ops: HashMap::new(),
-                parked: HashMap::new(),
+                ops: ChannelOps::default(),
+                parked: ParkedOps::default(),
                 put_scratch: None,
                 intro_wire: None,
             },
@@ -19583,7 +19752,7 @@ mod tests {
         let source: DynSource = std::sync::Arc::new(src);
 
         let intro = three_field_intro();
-        let mut channels = HashMap::new();
+        let mut channels = ChannelTable::new();
         let mask = BitSet::all_set(intro.total_bits());
         let mut ops = HashMap::new();
         ops.insert(
@@ -19600,8 +19769,8 @@ mod tests {
                 source: source.clone(),
                 stat: crate::server_native::peers::ChannelStat::new(String::new()),
                 open_cred: Arc::new(ClientCredentials::anonymous(TEST_PEER)),
-                ops,
-                parked: HashMap::new(),
+                ops: ops.into(),
+                parked: ParkedOps::default(),
                 put_scratch: None,
                 intro_wire: None,
             },
@@ -19789,7 +19958,7 @@ mod tests {
             ioid,
             non_monitor_op_state(std::sync::Arc::new(intro.clone()), OpKind::PutGet, mask),
         );
-        let mut channels = HashMap::new();
+        let mut channels = ChannelTable::new();
         channels.insert(
             sid,
             ChannelState {
@@ -19800,8 +19969,8 @@ mod tests {
                 source: source.clone(),
                 stat: crate::server_native::peers::ChannelStat::new(String::new()),
                 open_cred: Arc::new(ClientCredentials::anonymous(TEST_PEER)),
-                ops,
-                parked: HashMap::new(),
+                ops: ops.into(),
+                parked: ParkedOps::default(),
                 put_scratch: None,
                 intro_wire: None,
             },
@@ -19909,7 +20078,7 @@ mod tests {
         let source: DynSource = Arc::new(shared);
 
         // Channel with an active op already bound to `ioid`.
-        let mut channels: HashMap<u32, ChannelState> = HashMap::new();
+        let mut channels = ChannelTable::new();
         let mut ops: HashMap<u32, OpState> = HashMap::new();
         ops.insert(
             ioid,
@@ -19948,8 +20117,8 @@ mod tests {
                 source: source.clone(),
                 stat: crate::server_native::peers::ChannelStat::new(String::new()),
                 open_cred: Arc::new(ClientCredentials::anonymous(TEST_PEER)),
-                ops,
-                parked: HashMap::new(),
+                ops: ops.into(),
+                parked: ParkedOps::default(),
                 put_scratch: None,
                 intro_wire: None,
             },
@@ -20001,7 +20170,7 @@ mod tests {
         let shared = SharedSource::new();
         let source: DynSource = Arc::new(shared);
 
-        let mut channels: HashMap<u32, ChannelState> = HashMap::new();
+        let mut channels = ChannelTable::new();
         channels.insert(
             sid,
             ChannelState {
@@ -20012,8 +20181,8 @@ mod tests {
                 source: source.clone(),
                 stat: crate::server_native::peers::ChannelStat::new(String::new()),
                 open_cred: Arc::new(ClientCredentials::anonymous(TEST_PEER)),
-                ops: HashMap::new(),
-                parked: HashMap::new(),
+                ops: ChannelOps::default(),
+                parked: ParkedOps::default(),
                 put_scratch: None,
                 intro_wire: None,
             },
@@ -20072,7 +20241,7 @@ mod tests {
         // the report.
         let stat = crate::server_native::peers::ChannelStat::new("dut".into());
 
-        let mut channels: HashMap<u32, ChannelState> = HashMap::new();
+        let mut channels = ChannelTable::new();
         channels.insert(
             sid,
             ChannelState {
@@ -20083,8 +20252,8 @@ mod tests {
                 source: source.clone(),
                 stat: stat.clone(),
                 open_cred: Arc::new(ClientCredentials::anonymous(TEST_PEER)),
-                ops: HashMap::new(),
-                parked: HashMap::new(),
+                ops: ChannelOps::default(),
+                parked: ParkedOps::default(),
                 put_scratch: None,
                 intro_wire: None,
             },
@@ -20181,7 +20350,7 @@ mod tests {
             let sid = 1u32;
             let cid = 10u32;
             let stat = crate::server_native::peers::ChannelStat::new("dut".into());
-            let mut channels: HashMap<u32, ChannelState> = HashMap::new();
+            let mut channels = ChannelTable::new();
             channels.insert(
                 sid,
                 ChannelState {
@@ -20192,8 +20361,8 @@ mod tests {
                     source: source.clone(),
                     stat: stat.clone(),
                     open_cred: Arc::new(ClientCredentials::anonymous(TEST_PEER)),
-                    ops: HashMap::new(),
-                    parked: HashMap::new(),
+                    ops: ChannelOps::default(),
+                    parked: ParkedOps::default(),
                     put_scratch: None,
                     intro_wire: None,
                 },
@@ -20260,7 +20429,7 @@ mod tests {
         let source: DynSource = Arc::new(SharedSource::new());
 
         // Channel exists but introspection was never cached → slow path.
-        let mut channels: HashMap<u32, ChannelState> = HashMap::new();
+        let mut channels = ChannelTable::new();
         channels.insert(
             sid,
             ChannelState {
@@ -20271,8 +20440,8 @@ mod tests {
                 source: source.clone(),
                 stat: crate::server_native::peers::ChannelStat::new(String::new()),
                 open_cred: Arc::new(ClientCredentials::anonymous(TEST_PEER)),
-                ops: HashMap::new(),
-                parked: HashMap::new(),
+                ops: ChannelOps::default(),
+                parked: ParkedOps::default(),
                 put_scratch: None,
                 intro_wire: None,
             },
@@ -20348,7 +20517,7 @@ mod tests {
         let source: DynSource = Arc::new(shared);
 
         // Channel introspection not cached → exercise the slow path.
-        let mut channels: HashMap<u32, ChannelState> = HashMap::new();
+        let mut channels = ChannelTable::new();
         channels.insert(
             sid,
             ChannelState {
@@ -20359,8 +20528,8 @@ mod tests {
                 source: source.clone(),
                 stat: crate::server_native::peers::ChannelStat::new(String::new()),
                 open_cred: Arc::new(ClientCredentials::anonymous(TEST_PEER)),
-                ops: HashMap::new(),
-                parked: HashMap::new(),
+                ops: ChannelOps::default(),
+                parked: ParkedOps::default(),
                 put_scratch: None,
                 intro_wire: None,
             },
@@ -20458,7 +20627,7 @@ mod tests {
             calls: calls.clone(),
         });
 
-        let mut channels: HashMap<u32, ChannelState> = HashMap::new();
+        let mut channels = ChannelTable::new();
         channels.insert(
             sid,
             ChannelState {
@@ -20469,8 +20638,8 @@ mod tests {
                 source: source.clone(),
                 stat: crate::server_native::peers::ChannelStat::new(String::new()),
                 open_cred: Arc::new(ClientCredentials::anonymous(TEST_PEER)),
-                ops: HashMap::new(),
-                parked: HashMap::new(),
+                ops: ChannelOps::default(),
+                parked: ParkedOps::default(),
                 put_scratch: None,
                 intro_wire: None,
             },
@@ -20870,7 +21039,7 @@ mod tests {
         op_id: u64,
         src: &DynSource,
         intro: &FieldDesc,
-    ) -> HashMap<u32, ChannelState> {
+    ) -> ChannelTable {
         let mut op = non_monitor_op_state(
             std::sync::Arc::new(intro.clone()),
             OpKind::Monitor,
@@ -20889,7 +21058,7 @@ mod tests {
         op.monitor_start_ctl = Some(ctl); // op now holds the only Arc ref
         let mut ops = HashMap::new();
         ops.insert(ioid, op);
-        let mut channels = HashMap::new();
+        let mut channels = ChannelTable::new();
         channels.insert(
             sid,
             ChannelState {
@@ -20900,8 +21069,8 @@ mod tests {
                 source: src.clone(),
                 stat: crate::server_native::peers::ChannelStat::new(String::new()),
                 open_cred: Arc::new(ClientCredentials::anonymous(TEST_PEER)),
-                ops,
-                parked: HashMap::new(),
+                ops: ops.into(),
+                parked: ParkedOps::default(),
                 put_scratch: None,
                 intro_wire: None,
             },
@@ -21308,7 +21477,7 @@ mod tests {
             starts: starts.clone(),
         });
 
-        let mut channels: HashMap<u32, ChannelState> = HashMap::new();
+        let mut channels = ChannelTable::new();
         channels.insert(
             sid,
             ChannelState {
@@ -21319,8 +21488,8 @@ mod tests {
                 source: source.clone(),
                 stat: crate::server_native::peers::ChannelStat::new(String::new()),
                 open_cred: Arc::new(ClientCredentials::anonymous(TEST_PEER)),
-                ops: HashMap::new(),
-                parked: HashMap::new(),
+                ops: ChannelOps::default(),
+                parked: ParkedOps::default(),
                 put_scratch: None,
                 intro_wire: None,
             },
@@ -21499,8 +21668,8 @@ mod tests {
 
     #[cfg(tokio_backend)]
     /// One channel `sid=1`/`dut` with the supplied prototype.
-    fn bfr13_channels(intro: Option<FieldDesc>, source: DynSource) -> HashMap<u32, ChannelState> {
-        let mut channels = HashMap::new();
+    fn bfr13_channels(intro: Option<FieldDesc>, source: DynSource) -> ChannelTable {
+        let mut channels = ChannelTable::new();
         channels.insert(
             1,
             ChannelState {
@@ -21511,8 +21680,8 @@ mod tests {
                 source,
                 stat: crate::server_native::peers::ChannelStat::new(String::new()),
                 open_cred: Arc::new(ClientCredentials::anonymous(TEST_PEER)),
-                ops: HashMap::new(),
-                parked: HashMap::new(),
+                ops: ChannelOps::default(),
+                parked: ParkedOps::default(),
                 put_scratch: None,
                 intro_wire: None,
             },
@@ -21646,8 +21815,8 @@ mod tests {
     /// build a two-channel connection (sid 1 and sid 2), each advertising
     /// `three_field_intro`, with no ops yet. Mirrors the connection-wide IOID
     /// scope of pvxs `ServerConn` (one `opByIOID` across all channels).
-    fn two_channel_conn(source: DynSource) -> HashMap<u32, ChannelState> {
-        let mut channels = HashMap::new();
+    fn two_channel_conn(source: DynSource) -> ChannelTable {
+        let mut channels = ChannelTable::new();
         for sid in [1u32, 2u32] {
             channels.insert(
                 sid,
@@ -21659,8 +21828,8 @@ mod tests {
                     source: source.clone(),
                     stat: crate::server_native::peers::ChannelStat::new(String::new()),
                     open_cred: Arc::new(ClientCredentials::anonymous(TEST_PEER)),
-                    ops: HashMap::new(),
-                    parked: HashMap::new(),
+                    ops: ChannelOps::default(),
+                    parked: ParkedOps::default(),
                     put_scratch: None,
                     intro_wire: None,
                 },
@@ -21685,9 +21854,136 @@ mod tests {
     /// sentinel and a live channel may never carry it.
     #[test]
     fn alloc_sid_never_hands_out_the_failure_sentinel() {
-        let channels: HashMap<u32, ChannelState> = HashMap::new();
+        let channels = ChannelTable::new();
         let mut next = CREATE_CHANNEL_NO_SID;
         assert_eq!(alloc_sid(&mut next, &channels), Some(0));
+    }
+
+    fn parked_probe(ioid: u32) -> ParkedOp {
+        ParkedOp {
+            frame: synth_frame(Command::Get, ByteOrder::Little, ioid.to_le_bytes().to_vec()),
+            kind: OpKind::Get,
+            subcmd: 0x08,
+            _wait: None,
+        }
+    }
+
+    fn op_probe() -> OpState {
+        non_monitor_op_state(
+            std::sync::Arc::new(three_field_intro()),
+            OpKind::Get,
+            BitSet::all_set(three_field_intro().total_bits()),
+        )
+    }
+
+    /// Invariant: `ioid_owner` answers exactly the IOIDs held in some
+    /// channel's `ops` or `parked`. Each transition below is one boundary
+    /// of that membership.
+    #[test]
+    fn channel_table_insert_op_and_remove_op_move_the_index() {
+        let source: DynSource = Arc::new(Bfr13FailSource);
+        let mut channels = two_channel_conn(source);
+        assert!(!channels.ioid_live(7));
+        channels.get_mut(&2).unwrap().insert_op(7, op_probe());
+        assert_eq!(channels.ioid_owner(7), Some(2));
+        assert!(channels.get_mut(&2).unwrap().remove_op(7).is_some());
+        assert!(!channels.ioid_live(7));
+        assert!(channels.get_mut(&2).unwrap().remove_op(7).is_none());
+    }
+
+    #[test]
+    fn channel_table_park_and_unpark_move_the_index() {
+        let source: DynSource = Arc::new(Bfr13FailSource);
+        let mut channels = two_channel_conn(source);
+        channels.get_mut(&1).unwrap().park(7, parked_probe(7));
+        assert_eq!(channels.ioid_owner(7), Some(1));
+        assert!(channels.get_mut(&1).unwrap().unpark(7).is_some());
+        assert!(!channels.ioid_live(7));
+    }
+
+    /// The slow GET_FIELD path holds one IOID in `ops` while a park for
+    /// the same IOID may still be pending: releasing one side must keep
+    /// the IOID live until the other side releases too.
+    #[test]
+    fn channel_table_ioid_stays_live_while_ops_or_parked_still_hold_it() {
+        let source: DynSource = Arc::new(Bfr13FailSource);
+        let mut channels = two_channel_conn(source);
+        let mut ch = channels.get_mut(&1).unwrap();
+        ch.insert_op(7, op_probe());
+        ch.park(7, parked_probe(7));
+        ch.remove_op(7);
+        assert_eq!(channels.ioid_owner(7), Some(1), "still parked");
+        channels.get_mut(&1).unwrap().unpark(7);
+        assert!(!channels.ioid_live(7));
+
+        let mut ch = channels.get_mut(&1).unwrap();
+        ch.insert_op(8, op_probe());
+        ch.park(8, parked_probe(8));
+        ch.unpark(8);
+        assert_eq!(channels.ioid_owner(8), Some(1), "still in ops");
+        channels.get_mut(&1).unwrap().remove_op(8);
+        assert!(!channels.ioid_live(8));
+    }
+
+    /// A channel inserted with ops already attached (the test fixtures'
+    /// path) is indexed on insert; removing the channel purges only its
+    /// own IOIDs.
+    #[test]
+    fn channel_table_insert_and_remove_index_the_channel_ops() {
+        let source: DynSource = Arc::new(Bfr13FailSource);
+        let mut channels = two_channel_conn(source.clone());
+        channels.get_mut(&1).unwrap().insert_op(7, op_probe());
+        let mut ops = HashMap::new();
+        ops.insert(9, op_probe());
+        channels.insert(
+            3,
+            ChannelState {
+                name: "dut3".into(),
+                cid: 2,
+                sid: 3,
+                introspection: Some(std::sync::Arc::new(three_field_intro())),
+                source,
+                stat: crate::server_native::peers::ChannelStat::new(String::new()),
+                open_cred: Arc::new(ClientCredentials::anonymous(TEST_PEER)),
+                ops: ops.into(),
+                parked: ParkedOps::default(),
+                put_scratch: None,
+                intro_wire: None,
+            },
+        );
+        assert_eq!(channels.ioid_owner(9), Some(3));
+        assert!(channels.remove(&3).is_some());
+        assert!(!channels.ioid_live(9));
+        assert_eq!(channels.ioid_owner(7), Some(1), "sibling channel untouched");
+        assert!(channels.remove(&1).is_some());
+        assert!(!channels.ioid_live(7));
+    }
+
+    /// Re-inserting under a live SID replaces the channel: the old
+    /// channel's IOIDs leave the index and the new channel's enter it.
+    #[test]
+    fn channel_table_insert_over_a_live_sid_reindexes() {
+        let source: DynSource = Arc::new(Bfr13FailSource);
+        let mut channels = two_channel_conn(source.clone());
+        channels.get_mut(&1).unwrap().insert_op(7, op_probe());
+        let replacement = two_channel_conn(source).remove(&1).unwrap();
+        let old = channels.insert(1, replacement).expect("sid 1 was live");
+        assert!(old.ops.contains_key(&7));
+        assert!(!channels.ioid_live(7));
+        channels.get_mut(&1).unwrap().insert_op(7, op_probe());
+        assert_eq!(channels.ioid_owner(7), Some(1));
+    }
+
+    #[test]
+    fn channel_table_drain_purges_the_index() {
+        let source: DynSource = Arc::new(Bfr13FailSource);
+        let mut channels = two_channel_conn(source);
+        channels.get_mut(&1).unwrap().insert_op(7, op_probe());
+        channels.get_mut(&2).unwrap().park(8, parked_probe(8));
+        assert_eq!(channels.drain().count(), 2);
+        assert!(!channels.ioid_live(7));
+        assert!(!channels.ioid_live(8));
+        assert!(channels.is_empty());
     }
 
     #[cfg(tokio_backend)]
@@ -21704,7 +22000,7 @@ mod tests {
         let source: DynSource = Arc::new(Bfr13FailSource);
         let mut channels = two_channel_conn(source.clone());
         // A live GET op on channel sid=1 reserves ioid=5 connection-wide.
-        channels.get_mut(&1).unwrap().ops.insert(
+        channels.get_mut(&1).unwrap().insert_op(
             ioid,
             non_monitor_op_state(
                 std::sync::Arc::new(three_field_intro()),
@@ -21765,7 +22061,7 @@ mod tests {
         let ioid = 9u32;
         let source: DynSource = Arc::new(Bfr13FailSource);
         let mut channels = two_channel_conn(source.clone());
-        channels.get_mut(&1).unwrap().ops.insert(
+        channels.get_mut(&1).unwrap().insert_op(
             ioid,
             non_monitor_op_state(
                 std::sync::Arc::new(three_field_intro()),
@@ -22024,7 +22320,7 @@ mod tests {
             "the INIT frame is held on the channel until the descriptor arrives"
         );
         assert!(
-            ioid_live_on_conn(&channels, ioid),
+            channels.ioid_live(ioid),
             "a parked ioid is live, so a re-used ioid is still refused as a duplicate"
         );
         let ready = ready_rx.recv().await.expect("descriptor wait reports back");
@@ -22423,7 +22719,7 @@ mod autoexec_tests {
         shared.add("dut", pv.clone());
         let source: DynSource = Arc::new(shared);
 
-        let mut channels: HashMap<u32, ChannelState> = HashMap::new();
+        let mut channels = ChannelTable::new();
         channels.insert(
             sid,
             ChannelState {
@@ -22434,8 +22730,8 @@ mod autoexec_tests {
                 source: source.clone(),
                 stat: crate::server_native::peers::ChannelStat::new(String::new()),
                 open_cred: Arc::new(ClientCredentials::anonymous(TEST_PEER)),
-                ops: HashMap::new(),
-                parked: HashMap::new(),
+                ops: ChannelOps::default(),
+                parked: ParkedOps::default(),
                 put_scratch: None,
                 intro_wire: None,
             },
@@ -22652,7 +22948,7 @@ mod r14_tests {
         let cred = Arc::new(ClientCredentials::anonymous(TEST_PEER));
 
         let intro = FieldDesc::Variant;
-        let mut channels: HashMap<u32, ChannelState> = HashMap::new();
+        let mut channels = ChannelTable::new();
         let mut ops: HashMap<u32, OpState> = HashMap::new();
         ops.insert(
             ioid,
@@ -22672,8 +22968,8 @@ mod r14_tests {
                 source: source.clone(),
                 stat: crate::server_native::peers::ChannelStat::new(String::new()),
                 open_cred: Arc::new(ClientCredentials::anonymous(TEST_PEER)),
-                ops,
-                parked: HashMap::new(),
+                ops: ops.into(),
+                parked: ParkedOps::default(),
                 put_scratch: None,
                 intro_wire: None,
             },
@@ -22847,19 +23143,14 @@ mod bfr15_tests {
     }
 
     /// Channel map with a single `Idle` op of `kind` bound to `ioid`.
-    fn channels_with_op(
-        sid: u32,
-        ioid: u32,
-        kind: OpKind,
-        source: DynSource,
-    ) -> HashMap<u32, ChannelState> {
+    fn channels_with_op(sid: u32, ioid: u32, kind: OpKind, source: DynSource) -> ChannelTable {
         let intro = nt_scalar_desc();
         let mut ops: HashMap<u32, OpState> = HashMap::new();
         ops.insert(
             ioid,
             non_monitor_op_state(std::sync::Arc::new(intro.clone()), kind, BitSet::new()),
         );
-        let mut channels = HashMap::new();
+        let mut channels = ChannelTable::new();
         channels.insert(
             sid,
             ChannelState {
@@ -22870,8 +23161,8 @@ mod bfr15_tests {
                 source,
                 stat: crate::server_native::peers::ChannelStat::new(String::new()),
                 open_cred: Arc::new(ClientCredentials::anonymous(TEST_PEER)),
-                ops,
-                parked: HashMap::new(),
+                ops: ops.into(),
+                parked: ParkedOps::default(),
                 put_scratch: None,
                 intro_wire: None,
             },
@@ -22933,7 +23224,7 @@ mod bfr15_tests {
         );
     }
 
-    fn op_exec_state(channels: &HashMap<u32, ChannelState>, sid: u32, ioid: u32) -> ExecState {
+    fn op_exec_state(channels: &ChannelTable, sid: u32, ioid: u32) -> ExecState {
         channels
             .get(&sid)
             .expect("channel present")
@@ -22943,7 +23234,7 @@ mod bfr15_tests {
             .exec_state
     }
 
-    fn op_abort_armed(channels: &HashMap<u32, ChannelState>, sid: u32, ioid: u32) -> bool {
+    fn op_abort_armed(channels: &ChannelTable, sid: u32, ioid: u32) -> bool {
         channels
             .get(&sid)
             .expect("channel present")
@@ -23330,8 +23621,8 @@ mod bfr15_tests {
         let source: DynSource = Arc::new(crate::server_native::SharedSource::new());
         let mut channels = channels_with_op(sid, ioid, OpKind::Get, source.clone());
         // Drive the op to Executing and capture its instance id.
-        let op_id =
-            begin_exec(channels.get_mut(&sid).unwrap(), ioid).expect("Idle op accepts the exec");
+        let op_id = begin_exec(&mut channels.get_mut(&sid).unwrap(), ioid)
+            .expect("Idle op accepts the exec");
         assert_eq!(op_exec_state(&channels, sid, ioid), ExecState::Executing);
 
         // Stale signal (id+1): no-op.
@@ -23493,7 +23784,7 @@ mod bfr15_tests {
         });
         op.data_task_abort = Some(Arc::new(AbortOnDrop(task.abort_handle())));
 
-        let mut channels: HashMap<u32, ChannelState> = HashMap::new();
+        let mut channels = ChannelTable::new();
         let mut ops = HashMap::new();
         ops.insert(ioid, op);
         channels.insert(
@@ -23506,8 +23797,8 @@ mod bfr15_tests {
                 source,
                 stat: crate::server_native::peers::ChannelStat::new(String::new()),
                 open_cred: Arc::new(ClientCredentials::anonymous(TEST_PEER)),
-                ops,
-                parked: HashMap::new(),
+                ops: ops.into(),
+                parked: ParkedOps::default(),
                 put_scratch: None,
                 intro_wire: None,
             },
@@ -23569,7 +23860,7 @@ mod bfr15_tests {
         op.last_request = true;
         let op_id = op.monitor_op_id;
 
-        let mut channels: HashMap<u32, ChannelState> = HashMap::new();
+        let mut channels = ChannelTable::new();
         let mut ops = HashMap::new();
         ops.insert(ioid, op);
         channels.insert(
@@ -23582,8 +23873,8 @@ mod bfr15_tests {
                 source,
                 stat: crate::server_native::peers::ChannelStat::new(String::new()),
                 open_cred: Arc::new(ClientCredentials::anonymous(TEST_PEER)),
-                ops,
-                parked: HashMap::new(),
+                ops: ops.into(),
+                parked: ParkedOps::default(),
                 put_scratch: None,
                 intro_wire: None,
             },
@@ -23615,7 +23906,7 @@ mod bfr15_tests {
         }
 
         // Re-EXEC drives it back to Executing.
-        let op_id2 = begin_exec(channels.get_mut(&sid).unwrap(), ioid)
+        let op_id2 = begin_exec(&mut channels.get_mut(&sid).unwrap(), ioid)
             .expect("re-EXEC accepted after an error reply");
 
         // SUCCESS completion now cleans the last-request op up.
@@ -23655,7 +23946,7 @@ mod bfr15_tests {
         op.last_request = true;
         let op_id = op.monitor_op_id;
 
-        let mut channels: HashMap<u32, ChannelState> = HashMap::new();
+        let mut channels = ChannelTable::new();
         let mut ops = HashMap::new();
         ops.insert(ioid, op);
         channels.insert(
@@ -23668,8 +23959,8 @@ mod bfr15_tests {
                 source,
                 stat: crate::server_native::peers::ChannelStat::new(String::new()),
                 open_cred: Arc::new(ClientCredentials::anonymous(TEST_PEER)),
-                ops,
-                parked: HashMap::new(),
+                ops: ops.into(),
+                parked: ParkedOps::default(),
                 put_scratch: None,
                 intro_wire: None,
             },

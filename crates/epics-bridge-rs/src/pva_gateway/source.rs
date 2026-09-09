@@ -314,10 +314,10 @@ pub struct GatewayChannelSource {
     /// an arbitrary 30 s ceiling. Default 30 s (matches pvxs).
     pub rpc_timeout: Duration,
     /// Hard cap on simultaneous live subscribe-bridge tasks across all
-    /// downstream peers. The PvaServer enforces a per-connection
-    /// channel cap; this is the gateway-wide ceiling that defends
-    /// against a coordinated burst from many peers exhausting the
-    /// gateway's monitor-fanout machinery. Default 100 000.
+    /// downstream peers. The PvaServer has no per-connection channel or
+    /// per-channel op cap (pvxs has none either), so this is the one
+    /// ceiling that defends against a coordinated burst from many peers
+    /// exhausting the gateway's monitor-fanout machinery. Default 100 000.
     pub max_subscribers: usize,
     /// Live subscribe-bridge counter (decremented when the bridge
     /// task exits). Shared via Arc so cloning the source preserves

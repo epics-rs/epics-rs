@@ -111,6 +111,22 @@ pub struct PvaServerConfig {
     pub bind_ip: IpAddr,
     /// Maximum number of concurrent client connections. Excess incoming
     /// connections are accepted then immediately closed.
+    ///
+    /// This is the only admission cap. There is deliberately no cap on
+    /// channels per connection or on operations per channel: pvxs has
+    /// neither (`ServerConn::chanBySID`, serverconn.h:142, and
+    /// `ServerChan::opByIOID`, serverconn.h:122, are unbounded maps) and
+    /// refuses a CREATE_CHANNEL only once the SID space is exhausted
+    /// (serverchan.cpp:285-288, "Too many Server channels"), which this
+    /// server mirrors. A pvxs/p4p client multiplexes every channel over one
+    /// connection and keys channels by PV name, so such caps failed
+    /// ordinary large clients: the former `max_channels_per_connection`
+    /// failed the next PV of a client past the cap, and the former
+    /// `max_ops_per_channel` refused the 65th monitor of one PV. The
+    /// per-connection CREATE_CHANNEL work is bounded by the read loop
+    /// instead: it stops reading the socket while its resolution queue
+    /// (`CREATE_CHANNEL_QUEUE_DEPTH`, served by
+    /// `CREATE_CHANNEL_RESOLVE_CONCURRENCY` workers) is full.
     pub max_connections: usize,
     /// Idle timeout — server closes connections that haven't received
     /// anything in this window. Applied even if `op_timeout` is longer.

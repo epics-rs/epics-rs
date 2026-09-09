@@ -22,7 +22,7 @@
 
 // RTEMS-EXEC-MODEL-ALLOW(1): checked - these run and pass in the exec-backend
 // suite.
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -3457,12 +3457,13 @@ impl ChannelTxPermit<'_> {
     }
 }
 
-/// result of a spawned CREATE_CHANNEL resolver task. The read
-/// loop's `channels` HashMap is owned by the loop task; spawned
-/// resolver tasks cannot touch it directly. Instead they send this
-/// completion record through a dedicated mpsc, and the read loop's
-/// `select!` arm applies the insertion and emits the wire response in
-/// frame-arrival order (mpsc is FIFO).
+/// result of one CREATE_CHANNEL resolution by one of the connection's
+/// resolver workers ([`spawn_create_channel_resolvers`]). The read loop's
+/// `channels` HashMap is owned by the loop task; a worker cannot touch it
+/// directly. Instead it sends this completion record through a dedicated
+/// mpsc, and the read loop's `select!` arm applies the insertion and emits
+/// the wire response. Replies complete in resolution order, not request
+/// order; the peer matches each by `cid`.
 struct CreateChannelCompletion {
     cid: u32,
     sid: u32,
@@ -3495,6 +3496,38 @@ struct ResolvedChannel {
 }
 /// Sender half of the CREATE_CHANNEL completion channel.
 type CcTx = mpsc::Sender<CreateChannelCompletion>;
+
+/// One `(cid, name)` pair from a CREATE_CHANNEL frame, waiting for one of
+/// the connection's resolver workers. The SID is allocated at decode time
+/// so the wire reply and the channel-table insert agree on it; `open_cred`
+/// is the credential in force when the frame was dispatched (see
+/// [`CreateChannelCompletion::open_cred`]).
+struct CreateChannelRequest {
+    cid: u32,
+    sid: u32,
+    name: String,
+    open_cred: Arc<ClientCredentials>,
+}
+
+/// Depth of the per-connection CREATE_CHANNEL request queue. pvxs resolves
+/// each name inline on the read path (`serverchan.cpp:298` `onCreate`), so
+/// a peer that sends CREATE_CHANNEL faster than the source answers is held
+/// by TCP backpressure with no counter at all. Here resolution runs on
+/// worker tasks, so the read loop stops reading the socket while this
+/// queue is full — the same bound, one queue deeper. Any finite depth
+/// gives the bound; the value trades reply latency against queued memory.
+const CREATE_CHANNEL_QUEUE_DEPTH: usize = 64;
+
+/// Resolver workers per connection: the most CREATE_CHANNEL names one
+/// connection can have inside the source (`has_pv` … `get_introspection`)
+/// at once. More than one because this server negotiates the channel's
+/// descriptor at CREATE_CHANNEL, where pvxs negotiates it per op
+/// (`serverget.cpp` / `servermon.cpp` INIT): a single worker would let one
+/// slow describe head-of-line block every sibling channel on the
+/// connection, which pvxs never does. Finite so that the in-flight work a
+/// peer can hold open is `CREATE_CHANNEL_RESOLVE_CONCURRENCY +
+/// CREATE_CHANNEL_QUEUE_DEPTH` names, not one per frame it manages to send.
+const CREATE_CHANNEL_RESOLVE_CONCURRENCY: usize = 16;
 
 /// Per-connection context the accept loop establishes before handing the
 /// split stream to [`handle_connection_io`]: the peer's report entry, the
@@ -3753,11 +3786,23 @@ pub(super) async fn handle_connection_io(
     // on the first segment before any synthetic frame is built.
     let mut seg_order = order;
     let mut expect_seg = false;
-    // CREATE_CHANNEL completion channel. Spawned resolver
-    // tasks send results here; the read loop's select! arm applies
-    // insertions into `channels` and emits wire responses in arrival
-    // order (mpsc FIFO preserves the per-frame ordering guarantee).
+    // CREATE_CHANNEL resolution. `decode_create_channel` turns each frame
+    // into per-name requests that wait in `pending_creates` until the
+    // `cc_req_tx.reserve()` arm below hands them to this connection's
+    // resolver workers; a worker answers through `cc_tx`, and the `cc_rx`
+    // arm inserts the channel and emits the wire reply. The request queue
+    // is bounded, the worker count is fixed, and the socket arm is gated on
+    // `pending_creates` being empty, so a peer that sends CREATE_CHANNEL
+    // faster than the source resolves is held by TCP backpressure — pvxs's
+    // bound, where `onCreate` runs inline on the read path
+    // (`serverchan.cpp:298`). The completion arms stay live while the loop
+    // waits for queue space, so a full completion queue cannot wedge the
+    // workers against a read loop that is waiting on them.
     let (cc_tx, mut cc_rx) = mpsc::channel::<CreateChannelCompletion>(64);
+    let (cc_req_tx, cc_req_rx) = mpsc::channel::<CreateChannelRequest>(CREATE_CHANNEL_QUEUE_DEPTH);
+    let _resolver_guards =
+        spawn_create_channel_resolvers(&reactor, source.clone(), peer, cc_req_rx, cc_tx);
+    let mut pending_creates: VecDeque<CreateChannelRequest> = VecDeque::new();
     // MONITOR subscriber-completion channel. A spawned subscriber
     // task that ends (source close, descriptor change, ACL deny, filter
     // mismatch, raw re-encode terminal, panic, abort) signals its
@@ -3799,11 +3844,12 @@ pub(super) async fn handle_connection_io(
         if tx.is_closed() {
             return Ok(());
         }
-        // select! between CREATE_CHANNEL completions (from
-        // spawned resolver tasks) and new frames from the socket.
-        // Servicing completions here rather than inline in the
-        // CREATE_CHANNEL handler lets the read loop stay unblocked
-        // while has_pv() / get_introspection() run in the background.
+        // select! between CREATE_CHANNEL completions (from the
+        // connection's resolver workers), CREATE_CHANNEL requests waiting
+        // for queue space, and new frames from the socket. Servicing
+        // completions here rather than inline in the CREATE_CHANNEL
+        // handler lets the read loop keep dispatching other frames while
+        // has_pv() / get_introspection() run in the background.
         //
         // `biased`, completions ahead of the socket: a signal a task has
         // already queued is APPLIED before the next frame is dispatched. It is
@@ -3818,128 +3864,136 @@ pub(super) async fn handle_connection_io(
         let frame = tokio::select! {
             biased;
             cc_opt = cc_rx.recv() => {
-                // A spawned CREATE_CHANNEL resolver finished.
-                if let Some(cc) = cc_opt {
-                    let mut payload = Vec::new();
-                    payload.put_u32(cc.cid, order);
-                    // On success the CREATE_CHANNEL reply is charged to the
-                    // newly-created channel (pvxs serverchan.cpp:151-152
-                    // `ch->statTx += 16u`); the failure reply belongs to no
-                    // channel and stays connection-level.
-                    let mut reply_stat: Option<Arc<crate::server_native::peers::ChannelStat>> = None;
-                    if let Some(resolved) = cc.resolved {
-                        payload.put_u32(cc.sid, order);
-                        Status::ok().write_into(order, &mut payload);
-                        // One shared per-channel report counter, held by both
-                        // the connection's channel table and the PeerEntry
-                        // (keyed by SID) so handler-side tx/rx attribution is
-                        // visible to the report (pvxs chan->statTx/statRx).
-                        let stat = crate::server_native::peers::ChannelStat::new(cc.name.clone());
-                        // Attach the source-supplied report info captured at
-                        // resolution — the single writer of the channel's
-                        // `report_info`, surfaced as `Report::Channel::info`
-                        // (pvxs copies `chan->reportInfo` into the report at
-                        // `server.cpp`).
-                        stat.set_report_info(resolved.report_info);
-                        reply_stat = Some(stat.clone());
-                        channels.insert(cc.sid, ChannelState {
-                            name: cc.name,
-                            cid: cc.cid,
-                            sid: cc.sid,
-                            introspection: resolved.intro,
-                            source: resolved.owner,
-                            stat: stat.clone(),
-                            open_cred: cc.open_cred,
-                            ops: HashMap::new(),
-                            parked: HashMap::new(),
-                            put_scratch: None,
-                    intro_wire: None,
-                        });
-                        // Register the channel (live + lifetime counts and
-                        // the per-channel report entry) in one owner call.
-                        peer_entry.channel_opened(cc.sid, stat);
-                        // Notify the bound source that a channel attached,
-                        // matching pvxs `SharedPV::attach` running
-                        // `onFirstConnect` on the empty→non-empty edge
-                        // (sharedpv.cpp:299-313). This is a CHANNEL edge,
-                        // independent of monitor subscription, so a
-                        // GET/PUT/RPC/GET_FIELD-only client drives lazy open
-                        // too. Paired with `close_channel`'s onClose.
-                        if let Some(ch) = channels.get(&cc.sid) {
-                            // Pinned to the channel's CREATE-time credential, not
-                            // the connection's current `cred` — a re-auth between
-                            // CREATE dispatch and this completion must not change
-                            // which identity the source sees the channel open under.
-                            let ctx = channel_lifecycle_ctx(peer, &ch.open_cred);
-                            ch.source.notify_channel_open(&ch.name, &ctx);
-                        }
-                        // The attach hook above can lazily open a SharedPV that
-                        // was still closed when the resolver snapshotted its
-                        // descriptor (`resolved.intro == None`), e.g.
-                        // `on_first_connect(|p| p.open(...))` (pvxs
-                        // `sharedpv.cpp:299-313` runs `onFirstConnect` on the
-                        // empty->non-empty channel edge). pvxs serves later
-                        // operations from the owner's post-open descriptor; bind
-                        // the owner, drive its open hook, THEN obtain and cache
-                        // the descriptor from that SAME owner — so a GET / PUT /
-                        // MONITOR INIT reads a real prototype straight away
-                        // instead of parking on a PV the hook just opened. This
-                        // is a cache warm, not a second gate: an INIT that still
-                        // finds no descriptor parks (`park_op_for_intro`) and is
-                        // replayed when one arrives, which is what covers an
-                        // ASYNCHRONOUS `open()` landing after CREATE_CHANNEL.
-                        // Only fires when the snapshot was absent; an
-                        // already-resolved descriptor (the common case) is left
-                        // untouched, so this adds no source round-trip for a PV
-                        // that was open at resolve time.
-                        let refresh = channels.get(&cc.sid).and_then(|ch| {
-                            ch.introspection.is_none().then(|| {
-                                (
-                                    ch.source.clone(),
-                                    ch.name.clone(),
-                                    channel_lifecycle_ctx(peer, &ch.open_cred),
-                                )
-                            })
-                        });
-                        if let Some((owner, name, ctx)) = refresh
-                            && let Some(intro) = owner.get_introspection_checked(&name, ctx).await
-                            && let Some(ch) = channels.get_mut(&cc.sid)
-                        {
-                            ch.introspection = Some(Arc::new(intro));
-                        }
-                    } else {
-                        // CREATE_CHANNEL failure sid must be the
-                        // no-channel sentinel 0xFFFFFFFF (pvxs
-                        // serverchan.cpp:349, sid=-1), not 0.
-                        payload.put_u32(CREATE_CHANNEL_NO_SID, order);
-                        // An unclaimed channel is a *refused* channel, which
-                        // pvxs reports as Fatal — not a recoverable Error —
-                        // with the fixed message "Refused to create Channel"
-                        // and the refusal trace "pvx:serv:refusechan:"
-                        // (serverchan.cpp:328-351). Matching the status kind
-                        // and trace lets conformance clients distinguish a
-                        // refused channel from a recoverable operation error,
-                        // and keeps the wire message PV-name-free like pvxs.
-                        Status::Detailed {
-                            kind: crate::proto::status::StatusKind::Fatal,
-                            message: "Refused to create Channel".to_string(),
-                            stack: "pvx:serv:refusechan:".to_string(),
-                        }
-                        .write_into(order, &mut payload);
+                // A worker finished one CREATE_CHANNEL entry. `None` means
+                // every resolver worker is gone (source panics inside
+                // `has_pv` / `get_introspection`): every queued and future
+                // CREATE_CHANNEL on this connection would go unanswered,
+                // and a closed receiver resolves `None` forever, so unwind
+                // the connection instead of spinning here.
+                let Some(cc) = cc_opt else {
+                    return Err(PvaError::Io(std::io::Error::other(
+                        "CREATE_CHANNEL resolver workers ended",
+                    )));
+                };
+                let mut payload = Vec::new();
+                payload.put_u32(cc.cid, order);
+                // On success the CREATE_CHANNEL reply is charged to the
+                // newly-created channel (pvxs serverchan.cpp:151-152
+                // `ch->statTx += 16u`); the failure reply belongs to no
+                // channel and stays connection-level.
+                let mut reply_stat: Option<Arc<crate::server_native::peers::ChannelStat>> = None;
+                if let Some(resolved) = cc.resolved {
+                    payload.put_u32(cc.sid, order);
+                    Status::ok().write_into(order, &mut payload);
+                    // One shared per-channel report counter, held by both
+                    // the connection's channel table and the PeerEntry
+                    // (keyed by SID) so handler-side tx/rx attribution is
+                    // visible to the report (pvxs chan->statTx/statRx).
+                    let stat = crate::server_native::peers::ChannelStat::new(cc.name.clone());
+                    // Attach the source-supplied report info captured at
+                    // resolution — the single writer of the channel's
+                    // `report_info`, surfaced as `Report::Channel::info`
+                    // (pvxs copies `chan->reportInfo` into the report at
+                    // `server.cpp`).
+                    stat.set_report_info(resolved.report_info);
+                    reply_stat = Some(stat.clone());
+                    channels.insert(cc.sid, ChannelState {
+                        name: cc.name,
+                        cid: cc.cid,
+                        sid: cc.sid,
+                        introspection: resolved.intro,
+                        source: resolved.owner,
+                        stat: stat.clone(),
+                        open_cred: cc.open_cred,
+                        ops: HashMap::new(),
+                        parked: HashMap::new(),
+                        put_scratch: None,
+                intro_wire: None,
+                    });
+                    // Register the channel (live + lifetime counts and
+                    // the per-channel report entry) in one owner call.
+                    peer_entry.channel_opened(cc.sid, stat);
+                    // Notify the bound source that a channel attached,
+                    // matching pvxs `SharedPV::attach` running
+                    // `onFirstConnect` on the empty→non-empty edge
+                    // (sharedpv.cpp:299-313). This is a CHANNEL edge,
+                    // independent of monitor subscription, so a
+                    // GET/PUT/RPC/GET_FIELD-only client drives lazy open
+                    // too. Paired with `close_channel`'s onClose.
+                    if let Some(ch) = channels.get(&cc.sid) {
+                        // Pinned to the channel's CREATE-time credential, not
+                        // the connection's current `cred` — a re-auth between
+                        // CREATE dispatch and this completion must not change
+                        // which identity the source sees the channel open under.
+                        let ctx = channel_lifecycle_ctx(peer, &ch.open_cred);
+                        ch.source.notify_channel_open(&ch.name, &ctx);
                     }
-                    let h = PvaHeader::application(
-                        true, order,
-                        Command::CreateChannel.code(),
-                        payload.len() as u32,
-                    );
-                    let mut buf = Vec::new();
-                    h.write_into(&mut buf);
-                    buf.extend_from_slice(&payload);
-                    if let Some(stat) = &reply_stat {
-                        stat.add_tx(buf.len());
+                    // The attach hook above can lazily open a SharedPV that
+                    // was still closed when the resolver snapshotted its
+                    // descriptor (`resolved.intro == None`), e.g.
+                    // `on_first_connect(|p| p.open(...))` (pvxs
+                    // `sharedpv.cpp:299-313` runs `onFirstConnect` on the
+                    // empty->non-empty channel edge). pvxs serves later
+                    // operations from the owner's post-open descriptor; bind
+                    // the owner, drive its open hook, THEN obtain and cache
+                    // the descriptor from that SAME owner — so a GET / PUT /
+                    // MONITOR INIT reads a real prototype straight away
+                    // instead of parking on a PV the hook just opened. This
+                    // is a cache warm, not a second gate: an INIT that still
+                    // finds no descriptor parks (`park_op_for_intro`) and is
+                    // replayed when one arrives, which is what covers an
+                    // ASYNCHRONOUS `open()` landing after CREATE_CHANNEL.
+                    // Only fires when the snapshot was absent; an
+                    // already-resolved descriptor (the common case) is left
+                    // untouched, so this adds no source round-trip for a PV
+                    // that was open at resolve time.
+                    let refresh = channels.get(&cc.sid).and_then(|ch| {
+                        ch.introspection.is_none().then(|| {
+                            (
+                                ch.source.clone(),
+                                ch.name.clone(),
+                                channel_lifecycle_ctx(peer, &ch.open_cred),
+                            )
+                        })
+                    });
+                    if let Some((owner, name, ctx)) = refresh
+                        && let Some(intro) = owner.get_introspection_checked(&name, ctx).await
+                        && let Some(ch) = channels.get_mut(&cc.sid)
+                    {
+                        ch.introspection = Some(Arc::new(intro));
                     }
-                    let _ = tx.send(buf).await;
+                } else {
+                    // CREATE_CHANNEL failure sid must be the
+                    // no-channel sentinel 0xFFFFFFFF (pvxs
+                    // serverchan.cpp:349, sid=-1), not 0.
+                    payload.put_u32(CREATE_CHANNEL_NO_SID, order);
+                    // An unclaimed channel is a *refused* channel, which
+                    // pvxs reports as Fatal — not a recoverable Error —
+                    // with the fixed message "Refused to create Channel"
+                    // and the refusal trace "pvx:serv:refusechan:"
+                    // (serverchan.cpp:328-351). Matching the status kind
+                    // and trace lets conformance clients distinguish a
+                    // refused channel from a recoverable operation error,
+                    // and keeps the wire message PV-name-free like pvxs.
+                    Status::Detailed {
+                        kind: crate::proto::status::StatusKind::Fatal,
+                        message: "Refused to create Channel".to_string(),
+                        stack: "pvx:serv:refusechan:".to_string(),
+                    }
+                    .write_into(order, &mut payload);
                 }
+                let h = PvaHeader::application(
+                    true, order,
+                    Command::CreateChannel.code(),
+                    payload.len() as u32,
+                );
+                let mut buf = Vec::new();
+                h.write_into(&mut buf);
+                buf.extend_from_slice(&payload);
+                if let Some(stat) = &reply_stat {
+                    stat.add_tx(buf.len());
+                }
+                let _ = tx.send(buf).await;
                 continue;
             }
             fin_opt = mon_fin_rx.recv() => {
@@ -4058,6 +4112,23 @@ pub(super) async fn handle_connection_io(
                 }
                 continue;
             }
+            permit = cc_req_tx.reserve(), if !pending_creates.is_empty() => {
+                // Queue space for the next decoded CREATE_CHANNEL entry.
+                // `reserve` rather than `send`: the arm's future is dropped
+                // whenever another arm wins, and a permit-less request stays
+                // in `pending_creates` instead of vanishing with the future.
+                // An `Err` here is the same worker death the `cc_rx` arm
+                // unwinds on, seen from the request side.
+                let Ok(permit) = permit else {
+                    return Err(PvaError::Io(std::io::Error::other(
+                        "CREATE_CHANNEL resolver workers ended",
+                    )));
+                };
+                if let Some(req) = pending_creates.pop_front() {
+                    permit.send(req);
+                }
+                continue;
+            }
             inv_res = inv_rx.recv(), if !inv_closed => {
                 // A source invalidated one or more channels out of band (PVA
                 // gateway operator `<prefix>:drop` / `:flush`). Force-disconnect
@@ -4131,7 +4202,13 @@ pub(super) async fn handle_connection_io(
                 }
                 continue;
             }
-            frame_result = read_frame(&mut reader, &mut rx_buf, max_msg_size) => {
+            // Gated: while a decoded CREATE_CHANNEL entry is still waiting
+            // for resolver queue space, no further frame is read — the
+            // socket fills and the peer sees TCP backpressure, the bound
+            // pvxs gets from resolving inline. Every other arm stays live.
+            frame_result = read_frame(&mut reader, &mut rx_buf, max_msg_size),
+                if pending_creates.is_empty() =>
+            {
                 frame_result?
             }
         };
@@ -4274,14 +4351,13 @@ pub(super) async fn handle_connection_io(
         // Application messages
         match Command::from_code(frame.header.command) {
             Some(Command::CreateChannel) => {
-                // spawning version. Resolver tasks run
-                // has_pv() + get_introspection() in the background;
-                // results arrive via cc_rx and are applied at the top
-                // of the loop. `peer_entry.channel_opened()` registers the
-                // channel (and its report stat) there, so we do not track
-                // it here.
-                handle_create_channel(&reactor, &source, &frame, peer, &cred, &cc_tx)
-                .await?;
+                // Decode only. The entries wait in `pending_creates` for
+                // the `cc_req_tx.reserve()` arm, which feeds the resolver
+                // workers; results arrive via `cc_rx` and are applied at the
+                // top of the loop. `peer_entry.channel_opened()` registers
+                // the channel (and its report stat) there, so we do not
+                // track it here.
+                pending_creates.extend(decode_create_channel(&frame, &cred)?);
             }
             Some(Command::DestroyChannel) => {
                 // Teardown + report bookkeeping (`channel_closed`) is owned
@@ -5938,36 +6014,27 @@ fn build_server_connection_validation(
     out
 }
 
-/// spawn-based CREATE_CHANNEL handler. The (cid, name) pairs in the
-/// frame are resolved by one background task that calls `has_pv` +
-/// `get_introspection` for each in order and sends the results
-/// through `cc_tx` back to the read loop, which inserts the channel
-/// and emits the wire response in FIFO order.
-async fn handle_create_channel(
-    reactor: &epics_base_rs::runtime::task::Reactor,
-    source: &DynSource,
+/// Decode a CREATE_CHANNEL frame into the per-name requests the
+/// connection's resolver workers answer. pvxs `serverchan.cpp:269-358`: one
+/// frame carries `count` (cid, name) pairs and the server emits one reply
+/// per pair. SIDs are allocated here, and `cred` — the
+/// identity in force at dispatch — is snapshotted into every request so a
+/// re-auth while the name is still queued cannot change the identity the
+/// channel opens under (pvxs builds `ServerChannelControl` with
+/// `conn->cred`, `serverchan.cpp:62`).
+fn decode_create_channel(
     frame: &Frame,
-    peer: SocketAddr,
     cred: &Arc<ClientCredentials>,
-    cc_tx: &CcTx,
-) -> PvaResult<()> {
+) -> PvaResult<Vec<CreateChannelRequest>> {
     // Inbound payload decodes with the frame's own header order (pvxs
     // latches `peerBE` per received message, conn.cpp:195-198).
     let inbound_order = frame.order();
     let mut cur = frame.cursor();
-    // pvxs `serverchan.cpp:269-358`: a single CREATE_CHANNEL frame
-    // can carry `count` (cid, name) pairs and the server must emit
-    // one CREATE_CHANNEL response frame per pair, in arrival order.
     let count = cur
         .get_u16(inbound_order)
         .map_err(|e| PvaError::Decode(e.to_string()))?;
 
-    // Collect entries to resolve asynchronously. SIDs are allocated
-    // up-front, then ONE task resolves the names sequentially — this
-    // guarantees responses arrive in arrival order (pvxs serverchan.cpp
-    // parity).
-    let mut batch: Vec<(u32, u32, String)> = Vec::new(); // (cid, sid, name)
-
+    let mut batch = Vec::new();
     for _ in 0..count {
         // truncated CID / malformed string is a protocol-
         // fatal decode error. pvxs `serverchan.cpp:364-368`.
@@ -5983,77 +6050,109 @@ async fn handle_create_channel(
         if name.is_empty() {
             break;
         }
-
-        batch.push((cid, alloc_sid(), name));
-    }
-
-    // Spawn ONE task per frame that resolves names in order and streams
-    // completions back via cc_tx. Per-name separate spawns would race
-    // and reorder responses; sequential resolution inside one task is
-    // both correct and sufficient for any well-behaved source.
-    if !batch.is_empty() {
-        let src = source.clone();
-        let cc = cc_tx.clone();
-        // resolve existence + introspection under the
-        // downstream connection's identity so a gateway opens upstream
-        // state under THIS peer's credentials, not the shared identity.
-        // pvxs builds `ServerChannelControl` with `conn->cred`
-        // (`serverchan.cpp:62`). `pv_request` is `None` — CREATE_CHANNEL
-        // carries no per-op pvRequest.
-        //
-        // Snapshot the credential in force NOW, before the resolver runs:
-        // the channel is created under this identity and its lifecycle
-        // callbacks must use it even if the connection re-authenticates to a
-        // different identity while the resolver is still in flight. The
-        // snapshot rides back in each completion and is stored on the channel.
-        // The resolver's `ChannelContext` is built from the same snapshot, so
-        // resolution and the open callback agree.
-        let open_cred = cred.clone();
-        let conn_ctx = channel_lifecycle_ctx(peer, &open_cred);
-        reactor.spawn(async move {
-            for (cid, sid, nm) in batch {
-                let resolved = if src.has_pv_checked(&nm, conn_ctx.clone()).await {
-                    // Bind the owner that accepted this channel so every
-                    // later op dispatches there, never re-resolving the
-                    // registry (pvxs serverchan.cpp:70-112). A leaf source
-                    // is its own owner (`resolve_owner` returns `None`);
-                    // a composite returns the matched inner.
-                    let owner = match src.resolve_owner(&nm, conn_ctx.clone()).await {
-                        Some(inner) => inner,
-                        None => src.clone(),
-                    };
-                    // Negotiate the descriptor through the bound owner, so
-                    // it matches the source that will serve the operations.
-                    let intro = owner
-                        .get_introspection_checked(&nm, conn_ctx.clone())
-                        .await
-                        .map(Arc::new);
-                    // Capture the owner's per-channel report info once at
-                    // admission — pvxs lets a Source stash a `ReportInfo`
-                    // on the channel control during onCreate
-                    // (`source.h:192`), surfaced later in `Report::Channel`.
-                    let report_info = owner.channel_report_info(&nm, conn_ctx.clone()).await;
-                    Some(ResolvedChannel {
-                        intro,
-                        owner,
-                        report_info,
-                    })
-                } else {
-                    None
-                };
-                let _ = cc
-                    .send(CreateChannelCompletion {
-                        cid,
-                        sid,
-                        name: nm,
-                        open_cred: open_cred.clone(),
-                        resolved,
-                    })
-                    .await;
-            }
+        batch.push(CreateChannelRequest {
+            cid,
+            sid: alloc_sid(),
+            name,
+            open_cred: cred.clone(),
         });
     }
-    Ok(())
+    Ok(batch)
+}
+
+/// Spawn this connection's CREATE_CHANNEL resolver workers,
+/// [`CREATE_CHANNEL_RESOLVE_CONCURRENCY`] of them sharing `requests`. Each
+/// takes one request at a time and runs `has_pv_checked` → `resolve_owner`
+/// → `get_introspection_checked` → `channel_report_info` under that
+/// request's snapshotted credential, then streams the
+/// [`CreateChannelCompletion`] back through `cc_tx`. The fixed pool over a
+/// bounded queue is what bounds the resolution a peer can hold open; the
+/// returned guards abort every worker when the read loop ends.
+fn spawn_create_channel_resolvers(
+    reactor: &epics_base_rs::runtime::task::Reactor,
+    source: DynSource,
+    peer: SocketAddr,
+    requests: mpsc::Receiver<CreateChannelRequest>,
+    cc_tx: CcTx,
+) -> Vec<AbortOnDrop> {
+    // The receiver is single-consumer; the workers take turns holding it
+    // while they wait for a request, and release it the moment one is
+    // taken, so the wait for a request and the resolution never overlap
+    // under the lock.
+    let requests = Arc::new(tokio::sync::Mutex::new(requests));
+    (0..CREATE_CHANNEL_RESOLVE_CONCURRENCY)
+        .map(|_| {
+            let requests = requests.clone();
+            let source = source.clone();
+            let cc_tx = cc_tx.clone();
+            let task = reactor.spawn(async move {
+                loop {
+                    let Some(req) = requests.lock().await.recv().await else {
+                        // The read loop dropped the sender: nothing left to answer.
+                        break;
+                    };
+                    let completion = resolve_create_channel(&source, peer, req).await;
+                    if cc_tx.send(completion).await.is_err() {
+                        // The read loop is gone; nothing is left to answer.
+                        break;
+                    }
+                }
+            });
+            AbortOnDrop(task.abort_handle())
+        })
+        .collect()
+}
+
+/// Resolve one CREATE_CHANNEL request against `source`: existence, owner
+/// binding, descriptor negotiation and report info, all under the
+/// downstream connection's identity so a gateway opens upstream state
+/// under THIS peer's credentials, not the shared identity (pvxs builds
+/// `ServerChannelControl` with `conn->cred`, `serverchan.cpp:62`).
+/// `pv_request` is `None` — CREATE_CHANNEL carries no per-op pvRequest.
+/// The context is built from the request's snapshot, so resolution and the
+/// open callback the read loop fires from `ChannelState::open_cred` agree.
+async fn resolve_create_channel(
+    source: &DynSource,
+    peer: SocketAddr,
+    req: CreateChannelRequest,
+) -> CreateChannelCompletion {
+    let conn_ctx = channel_lifecycle_ctx(peer, &req.open_cred);
+    let resolved = if source.has_pv_checked(&req.name, conn_ctx.clone()).await {
+        // Bind the owner that accepted this channel so every
+        // later op dispatches there, never re-resolving the
+        // registry (pvxs serverchan.cpp:70-112). A leaf source
+        // is its own owner (`resolve_owner` returns `None`);
+        // a composite returns the matched inner.
+        let owner = match source.resolve_owner(&req.name, conn_ctx.clone()).await {
+            Some(inner) => inner,
+            None => source.clone(),
+        };
+        // Negotiate the descriptor through the bound owner, so
+        // it matches the source that will serve the operations.
+        let intro = owner
+            .get_introspection_checked(&req.name, conn_ctx.clone())
+            .await
+            .map(Arc::new);
+        // Capture the owner's per-channel report info once at
+        // admission — pvxs lets a Source stash a `ReportInfo`
+        // on the channel control during onCreate
+        // (`source.h:192`), surfaced later in `Report::Channel`.
+        let report_info = owner.channel_report_info(&req.name, conn_ctx.clone()).await;
+        Some(ResolvedChannel {
+            intro,
+            owner,
+            report_info,
+        })
+    } else {
+        None
+    };
+    CreateChannelCompletion {
+        cid: req.cid,
+        sid: req.sid,
+        name: req.name,
+        open_cred: req.open_cred,
+        resolved,
+    }
 }
 
 /// Build the connection-scoped [`ChannelContext`](crate::server_native::ChannelContext) for a channel
@@ -16191,8 +16290,9 @@ mod tests {
     /// that captured identity; a later `ServerConn::cred` reassignment does
     /// not rewrite it. So a client that CREATEs under `alice/ca` and
     /// re-authenticates to `bob/ca` before the async resolver completes must
-    /// still see `notify_channel_open` fire as Alice. `handle_create_channel`
+    /// still see `notify_channel_open` fire as Alice. `decode_create_channel`
     /// snapshots the dispatch-time credential into
+    /// `CreateChannelRequest::open_cred`, the resolver worker carries it into
     /// `CreateChannelCompletion::open_cred`, and the read loop fires the open
     /// callback from the channel's stored `open_cred`, never the current `cred`.
     #[epics_macros_rs::epics_test]
@@ -16221,18 +16321,22 @@ mod tests {
         let frame = synth_frame(Command::CreateChannel, order, payload);
 
         let alice = cred_ca("alice");
-        handle_create_channel(
+        let (cc_req_tx, cc_req_rx) = tokio::sync::mpsc::channel::<CreateChannelRequest>(8);
+        let _resolvers = spawn_create_channel_resolvers(
             &crate::test_reactor(),
-            &source,
-            &frame,
+            source.clone(),
             peer,
-            &alice,
-            &cc_tx,
-        )
-        .await
-        .expect("CREATE_CHANNEL dispatch ok");
+            cc_req_rx,
+            cc_tx,
+        );
+        for req in decode_create_channel(&frame, &alice).expect("CREATE_CHANNEL decode ok") {
+            cc_req_tx
+                .send(req)
+                .await
+                .expect("resolvers accept the request");
+        }
 
-        let completion = cc_rx.recv().await.expect("resolver emits a completion");
+        let completion = cc_rx.recv().await.expect("a resolver emits a completion");
         assert_eq!(
             (
                 completion.open_cred.method.as_str(),

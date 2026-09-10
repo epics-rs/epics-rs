@@ -1456,11 +1456,6 @@ mod chan_table {
             &self.ops
         }
 
-        #[cfg(test)]
-        pub(super) fn parked(&self) -> &ParkedOps {
-            &self.parked
-        }
-
         /// Edit one live op in place. Membership stays with [`ChannelMut`].
         pub(super) fn op_mut(&mut self, ioid: &u32) -> Option<&mut OpState> {
             self.ops.0.get_mut(ioid)
@@ -22182,12 +22177,13 @@ mod tests {
         );
         let ch = channels.get(&sid).expect("channel still open");
         assert!(
-            ch.parked().contains_key(&ioid),
-            "the INIT frame is held on the channel until the descriptor arrives"
+            !ch.ops().contains_key(&ioid),
+            "a parked INIT is not a live op on the channel"
         );
         assert!(
             channels.ioid_live(ioid),
-            "a parked ioid is live, so a re-used ioid is still refused as a duplicate"
+            "the INIT frame is held on the channel until the descriptor arrives, \
+             so a re-used ioid is still refused as a duplicate"
         );
         let ready = ready_rx.recv().await.expect("descriptor wait reports back");
         assert_eq!((ready.sid, ready.ioid), (sid, ioid));

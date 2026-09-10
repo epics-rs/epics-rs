@@ -2033,7 +2033,7 @@ where
 /// [`PvaError::Disconnected`] and the caller decides whether to begin again.
 ///
 /// Dropping an uncommitted `PutOp` sends DESTROY_REQUEST and releases the
-/// ioid through its [`IoidGuard`].
+/// ioid through its `IoidGuard`.
 pub struct PutOp {
     server: Arc<super::server_conn::ServerConn>,
     sid: u32,
@@ -2217,7 +2217,7 @@ impl PutOp {
     }
 
     /// [`Self::commit`] of a delta built from dotted-path assignments against
-    /// the prototype — the same single owner ([`build_field_delta`]) the
+    /// the prototype — the same single owner (`build_field_delta`) the
     /// one-call multi-field PUTs use, so both produce identical wire deltas.
     pub async fn commit_fields_typed(self, assignments: &[(String, PutLeaf)]) -> PvaResult<()> {
         let (value, changed) = build_field_delta(&self.intro, assignments)?;

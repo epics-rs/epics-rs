@@ -1420,7 +1420,7 @@ pub fn canonical_changed_bitset(
 /// Bit numbering matches the rest of this module (pvData §5.4): root is
 /// bit 0, fields depth-first in declaration order.
 ///
-/// Each path is resolved to its bit span ([`FieldDesc::bit_span_for_path`])
+/// Each path is resolved to its bit span (`FieldDesc::bit_span_for_path`)
 /// and the span set: work proportional to the marked paths, not to the
 /// descriptor — this runs on every monitor post. A path that names no field
 /// marks nothing, and so does the empty path: the root is not a markable
@@ -1480,7 +1480,7 @@ pub fn marked_wire_changed_bitset(
 /// its subtree is not descended (matching how `marked_changed_bitset`
 /// expands a marked parent path back into the whole subtree). The walk's
 /// bit numbering and `total_bits` stride are those of
-/// [`FieldDesc::bit_span_for_path`], which `marked_changed_bitset` resolves
+/// `FieldDesc::bit_span_for_path`, which `marked_changed_bitset` resolves
 /// through, so the round trip
 /// `marked_changed_bitset(desc, &changed_bitset_paths(desc, &bs))`
 /// reproduces any node-aligned `bs`.

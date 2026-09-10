@@ -1385,8 +1385,8 @@ mod chan_table {
         parked: ParkedOps,
         /// Reusable PUT-delta decode scratch, keyed by the op intro it was
         /// built for (`Arc::ptr_eq`). A PUT/PUT_GET EXEC takes it, decodes
-        /// the marked fields in place ([`decode_pv_field_with_bitset_into`])
-        /// and the exec body returns it through [`ExecFinished`] once the
+        /// the marked fields in place ([`super::decode_pv_field_with_bitset_into`])
+        /// and the exec body returns it through [`super::ExecFinished`] once the
         /// source call is done. Channel-level (not per-op) because a pvput
         /// client mints a fresh op per put (INIT/EXEC/DESTROY), which would
         /// defeat a per-op scratch; ops of one channel negotiating the same

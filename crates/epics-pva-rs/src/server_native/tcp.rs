@@ -3450,6 +3450,14 @@ pub(super) const TCP_TX_LIMIT_MULT: usize = 2;
 /// deviation — a failed `getsockopt` is not worth a lost client.
 pub(super) const TX_LIMIT_FALLBACK: usize = TCP_TX_LIMIT_MULT * 256 * 1024;
 
+/// Bytes the writer task gathers from already-queued frames before one
+/// `write_all`. A monitor storm queues thousands of sub-100-byte frames
+/// and a write per frame is a syscall per frame; pvxs pays none of that
+/// because libevent's evbuffer drains everything pending in one
+/// `writev`. The cap only bounds the copy — a frame larger than it is
+/// written on its own, uncopied.
+const WRITER_COALESCE_BYTES: usize = 64 * 1024;
+
 /// Byte budget for one connection's writer queue — the port of pvxs
 /// `tcp_tx_limit`. Producers acquire `clamp(len, 1..=limit)` permits
 /// before a frame may enter the queue; the writer task releases the
@@ -3849,16 +3857,29 @@ pub(super) async fn handle_connection_io(
         // closes the byte budget so producers parked in `TxBudget::acquire`
         // fail instead of waiting on a writer that no longer exists.
         let _budget_guard = TxBudgetCloseGuard(writer_budget.clone());
-        while let Some(frame) = rx.recv().await {
-            match epics_base_rs::runtime::task::timeout(send_tmo, writer_raw.write_all(&frame))
+        // Lengths of the frames in the batch being written: the budget
+        // charge is per frame (`TxBudget::charge` clamps each one), so
+        // it is returned per frame, once the batch has left.
+        let mut frame_lens: Vec<usize> = Vec::new();
+        while let Some(mut batch) = rx.recv().await {
+            frame_lens.clear();
+            frame_lens.push(batch.len());
+            while batch.len() < WRITER_COALESCE_BYTES {
+                let Ok(frame) = rx.try_recv() else { break };
+                frame_lens.push(frame.len());
+                batch.extend_from_slice(&frame);
+            }
+            match epics_base_rs::runtime::task::timeout(send_tmo, writer_raw.write_all(&batch))
                 .await
             {
                 Ok(Ok(())) => {
                     // bytes_out counter for PvaServer::report().
-                    peer_entry_writer.touch_tx(frame.len());
-                    // The frame left the queue for the socket buffer;
-                    // return its bytes to the TX budget.
-                    writer_budget.release(frame.len());
+                    peer_entry_writer.touch_tx(batch.len());
+                    // The frames left the queue for the socket buffer;
+                    // return their bytes to the TX budget.
+                    for len in &frame_lens {
+                        writer_budget.release(*len);
+                    }
                 }
                 Ok(Err(e)) => {
                     debug!(peer = ?writer_peer, error = %e, "writer task: TCP write failed, dropping connection");

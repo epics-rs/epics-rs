@@ -498,9 +498,9 @@ pvxs reference:
 
 Impact: a lost warm-GET reply or send/routing error abandons the reusable server
 operation while the next cold GET allocates a new IOID. Repeated warm failures
-on a live TCP circuit can accumulate server-side operation slots until the
-server's per-channel operation cap rejects new operations. The leak is masked on
-connection close because both sides then reap all IOIDs.
+on a live TCP circuit can accumulate server-side operation slots without bound
+(the per-channel operation cap this once ran into was removed for pvxs parity).
+The leak is masked on connection close because both sides then reap all IOIDs.
 
 Fix direction: make warm GET state have a single cleanup owner. On warm failure,
 either restore the cache only when the operation is still known reusable, or send

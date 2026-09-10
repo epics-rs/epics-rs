@@ -111,21 +111,23 @@ pub struct PvaServerConfig {
     pub bind_ip: IpAddr,
     /// Maximum number of concurrent client connections. Excess incoming
     /// connections are accepted then immediately closed.
+    ///
+    /// This is the only admission cap. There is deliberately no cap on
+    /// channels per connection or on operations per channel: pvxs has
+    /// neither (`ServerConn::chanBySID`, serverconn.h:142, and
+    /// `ServerChan::opByIOID`, serverconn.h:122, are unbounded maps); its
+    /// only capacity refusal of a CREATE_CHANNEL is SID exhaustion
+    /// (serverchan.cpp:285-288, "Too many Server channels"), which this
+    /// server mirrors. A pvxs/p4p client multiplexes every channel over one
+    /// connection and keys channels by PV name, so such caps failed
+    /// ordinary large clients: the former `max_channels_per_connection`
+    /// failed the next PV of a client past the cap, and the former
+    /// `max_ops_per_channel` refused the 65th monitor of one PV. The
+    /// per-connection CREATE_CHANNEL work is bounded by the read loop
+    /// instead: it stops reading the socket while its resolution queue
+    /// (`CREATE_CHANNEL_QUEUE_DEPTH`, served by
+    /// `CREATE_CHANNEL_RESOLVE_CONCURRENCY` workers) is full.
     pub max_connections: usize,
-    /// Maximum number of channels per single client connection.
-    pub max_channels_per_connection: usize,
-    /// Maximum number of concurrent in-flight operations (GET / PUT /
-    /// MONITOR / RPC) that a single channel can accumulate. The
-    /// per-channel `ops` map grows on each `INIT` (subcmd 0x08) and
-    /// shrinks on `DESTROY` (subcmd 0x10). Without a cap, a malicious
-    /// client can `INIT` against the same channel with fresh IOIDs
-    /// indefinitely, exhausting server memory even when
-    /// `max_channels_per_connection` is enforced. Default: 64
-    /// (matches the typical `pvxs` per-channel concurrent op count
-    /// of `Subscription` + the occasional in-flight GET / PUT). Excess
-    /// `INIT`s are rejected with `ECA_ALLOCMEM`-equivalent error
-    /// status. Override via `EPICS_PVAS_MAX_OPS_PER_CHANNEL`.
-    pub max_ops_per_channel: usize,
     /// Idle timeout — server closes connections that haven't received
     /// anything in this window. Applied even if `op_timeout` is longer.
     pub idle_timeout: Duration,
@@ -398,8 +400,6 @@ impl Default for PvaServerConfig {
             op_timeout: Duration::from_secs(64_000),
             bind_ip: IpAddr::V4(Ipv4Addr::UNSPECIFIED),
             max_connections: 1024,
-            max_channels_per_connection: 1024,
-            max_ops_per_channel: 64,
             idle_timeout: Duration::from_secs(45),
             monitor_queue_depth: super::source::DEFAULT_MONITOR_QUEUE_LIMIT as usize,
             disable_plaintext: false,
@@ -487,12 +487,6 @@ impl PvaServerConfig {
         }
         if let Some(v) = env::max_connections_opt() {
             self.max_connections = v;
-        }
-        if let Some(v) = env::max_channels_per_connection_opt() {
-            self.max_channels_per_connection = v;
-        }
-        if let Some(v) = env::max_ops_per_channel_opt() {
-            self.max_ops_per_channel = v;
         }
         // Beacon periods: keep the pvxs short:long = 15:180 = 1:12 ratio
         // when only the short period is tuned; an explicit

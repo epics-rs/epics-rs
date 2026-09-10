@@ -305,7 +305,6 @@ async fn spawn_server(source: Arc<MemSource>) -> (u16, u16, tokio::task::JoinHan
         udp_port: 0,
         idle_timeout: Duration::from_secs(60),
         max_connections: 16,
-        max_channels_per_connection: 64,
         monitor_queue_depth: 8,
         ..Default::default()
     };
@@ -360,7 +359,6 @@ async fn spawn_server_capped(
         udp_port: 0,
         idle_timeout: Duration::from_secs(60),
         max_connections: 16,
-        max_channels_per_connection: 64,
         monitor_queue_depth: 8,
         max_message_size: Some(cap),
         ..Default::default()
@@ -395,7 +393,6 @@ async fn p2_auto_reconnect_after_server_restart() {
         udp_port: 0,
         idle_timeout: Duration::from_secs(60),
         max_connections: 16,
-        max_channels_per_connection: 64,
         monitor_queue_depth: 8,
         ..Default::default()
     };
@@ -430,7 +427,6 @@ async fn p2_auto_reconnect_after_server_restart() {
         udp_port: udp,
         idle_timeout: Duration::from_secs(60),
         max_connections: 16,
-        max_channels_per_connection: 64,
         monitor_queue_depth: 8,
         ..Default::default()
     };
@@ -1859,7 +1855,6 @@ async fn ex_r7_unadvertised_auth_reverts_credential_to_anonymous() {
         udp_port: 0,
         idle_timeout: Duration::from_secs(60),
         max_connections: 16,
-        max_channels_per_connection: 64,
         monitor_queue_depth: 8,
         auth_complete: Some(Arc::new(move |_peer, cred| {
             *captured_hook.lock().unwrap() = Some((cred.method.clone(), cred.account.clone()));
@@ -1966,7 +1961,6 @@ async fn r70_anonymous_method_yields_account_anonymous() {
         udp_port: 0,
         idle_timeout: Duration::from_secs(60),
         max_connections: 16,
-        max_channels_per_connection: 64,
         monitor_queue_depth: 8,
         auth_complete: Some(Arc::new(move |_peer, cred| {
             *captured_hook.lock().unwrap() = Some((cred.method.clone(), cred.account.clone()));
@@ -2053,7 +2047,6 @@ async fn r70_ca_without_user_falls_back_to_anonymous() {
         udp_port: 0,
         idle_timeout: Duration::from_secs(60),
         max_connections: 16,
-        max_channels_per_connection: 64,
         monitor_queue_depth: 8,
         auth_complete: Some(Arc::new(move |_peer, cred| {
             *captured_hook.lock().unwrap() = Some((cred.method.clone(), cred.account.clone()));
@@ -2227,7 +2220,6 @@ async fn ignore_addr_list_does_not_block_direct_tcp_connect() {
         udp_port: 0,
         idle_timeout: Duration::from_secs(60),
         max_connections: 16,
-        max_channels_per_connection: 64,
         monitor_queue_depth: 8,
         // Loopback is on the UDP-search ignore list…
         ignore_addrs: vec![(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST), 0)],
@@ -3010,4 +3002,121 @@ async fn multi_pv_fan_out_runs_on_whichever_executor_polls_it() {
     );
 
     h.abort();
+}
+
+// ── No per-channel / per-connection caps (pvxs parity) ───────────────
+
+/// pvxs has no per-channel op cap: `ServerChan::opByIOID` is an unbounded
+/// map (serverconn.h:122) and MONITOR INIT (servermon.cpp:505-585) refuses
+/// only a duplicate IOID. A pvxs/p4p client keys channels by name, so N
+/// monitors on one PV are N ops on ONE server channel; the former
+/// `max_ops_per_channel = 64` rejected the 65th with "max ops per channel
+/// exceeded". Every one of the 100 subscriptions must deliver its initial
+/// snapshot.
+#[cfg(tokio_backend)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn monitors_on_one_channel_are_not_capped() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    const N: usize = 100;
+    let source = Arc::new(MemSource::new());
+    source.add_pv("STAB:MANYMON", 7.0).await;
+
+    let (tcp, _udp, h) = spawn_server(source.clone()).await;
+    let client = client_for(tcp);
+
+    // One flag per subscription, not a shared delivery count: a
+    // subscription that fires twice (reconnect, update) must not stand in
+    // for one that never fired. A subscription that ends with an error
+    // records it, so a refusal shows up by text rather than as a missing
+    // count.
+    let delivered: Arc<Vec<AtomicBool>> =
+        Arc::new((0..N).map(|_| AtomicBool::new(false)).collect());
+    let failures: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+    let tasks: Vec<_> = (0..N)
+        .map(|i| {
+            let client = client.clone();
+            let delivered = delivered.clone();
+            let failures = failures.clone();
+            tokio::spawn(async move {
+                let ended = client
+                    .pvmonitor("STAB:MANYMON", move |_value| {
+                        delivered[i].store(true, Ordering::SeqCst);
+                    })
+                    .await;
+                if let Err(e) = ended {
+                    failures.lock().await.push(format!("monitor {i}: {e}"));
+                }
+            })
+        })
+        .collect();
+
+    let missing = |delivered: &[AtomicBool]| -> Vec<usize> {
+        (0..N)
+            .filter(|&i| !delivered[i].load(Ordering::SeqCst))
+            .collect()
+    };
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    while !missing(&delivered).is_empty() && tokio::time::Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let missing = missing(&delivered);
+    let failures = failures.lock().await.clone();
+    for t in &tasks {
+        t.abort();
+    }
+    h.abort();
+
+    assert!(
+        missing.is_empty(),
+        "{} of {N} monitors on one channel never delivered their initial snapshot: {missing:?}; \
+         monitor errors: {failures:?}",
+        missing.len()
+    );
+}
+
+/// pvxs puts no limit on channels per connection; its only capacity
+/// refusal of a CREATE_CHANNEL is SID exhaustion (serverchan.cpp:285-288,
+/// "Too many Server channels"). A client
+/// multiplexes every channel to a server over one TCP connection, so the
+/// former `max_channels_per_connection` failed an ordinary large client's
+/// next PV once the cap was reached. All channels are cached by the
+/// client, so every one of the 1100 GETs must resolve over the single
+/// connection.
+#[cfg(tokio_backend)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn channels_on_one_connection_are_not_capped() {
+    const N: usize = 1100;
+    let source = Arc::new(MemSource::new());
+    let names: Vec<String> = (0..N).map(|i| format!("STAB:MANYCHAN:{i}")).collect();
+    for name in &names {
+        source.add_pv(name, 1.0).await;
+    }
+
+    let (tcp, _udp, h) = spawn_server(source.clone()).await;
+    let client = PvaClient::builder()
+        .timeout(Duration::from_secs(20))
+        .server_addr(std::net::SocketAddr::new(
+            std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+            tcp,
+        ))
+        .build();
+
+    let refs: Vec<&str> = names.iter().map(String::as_str).collect();
+    let results = tokio::time::timeout(Duration::from_secs(60), client.pvget_many(&refs))
+        .await
+        .expect("pvget_many over one connection timed out");
+    let failed: Vec<(usize, String)> = results
+        .iter()
+        .enumerate()
+        .filter_map(|(i, r)| r.as_ref().err().map(|e| (i, e.to_string())))
+        .collect();
+    h.abort();
+
+    assert!(
+        failed.is_empty(),
+        "{} of {N} channels failed on one connection; first failure: {:?}",
+        failed.len(),
+        failed.first()
+    );
 }

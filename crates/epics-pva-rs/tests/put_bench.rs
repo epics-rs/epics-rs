@@ -232,8 +232,6 @@ async fn bulk_put_throughput_1000_pvs() {
     // but with headroom for 1000 channels on one connection.
     let cfg = PvaServerConfig {
         max_connections: 64,
-        max_channels_per_connection: 4096,
-        max_ops_per_channel: 4096,
         write_queue_depth: 8192,
         idle_timeout: Duration::from_secs(120),
         ..PvaServerConfig::isolated()

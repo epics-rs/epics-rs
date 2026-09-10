@@ -46,7 +46,6 @@ consulted in the source tree.
 | `EPICS_PVA_CONN_TMO` | 30 (s) | client-side TCP idle timeout (`PvaClientBuilder::tcp_timeout` default) |
 | `EPICS_PVA_PIPELINE_SIZE` | 4 | monitor pipeline depth (`ops_v2.rs::DEFAULT_PIPELINE_SIZE`) |
 | `EPICS_PVAS_MAX_CONNECTIONS` | 1024 | server hard cap (`PvaServerConfig::max_connections`) |
-| `EPICS_PVAS_MAX_CHANNELS_PER_CONN` | 256 | server hard cap (`PvaServerConfig::max_channels_per_connection`) |
 | `EPICS_PVAS_OP_TIMEOUT` | 60 (s) | server per-connection idle timeout (`PvaServerConfig::op_timeout`) |
 | `EPICS_PVAS_MONITOR_QUEUE_DEPTH` | 4 | server monitor squash threshold (`PvaServerConfig::monitor_queue_depth`) |
 | `EPICS_PVAS_MONITOR_HIGH_WATERMARK` | 64 | server monitor backpressure warning threshold |

@@ -177,6 +177,120 @@ pub fn value_matches_descriptor(
     }
 }
 
+/// Copy the marked subtrees of `delta` into `cur`, in place — pvxs
+/// `Value::assign`, which is what `SharedPV::post` does to its stored
+/// value (`sharedpv.cpp:431`). `marks` uses the wire bit numbering of
+/// `desc` (root 0, depth-first): a set structure bit copies the whole
+/// subtree, a set leaf bit copies that leaf, and an unmarked leaf of
+/// `delta` is neither read nor checked. Every marked subtree is checked
+/// against its descriptor ([`value_matches_descriptor`]) before anything
+/// is copied, so on `Err` `cur` is untouched. A marked subtree that
+/// `delta` lacks is `MissingField`; a non-structure where a marked bit
+/// lies below is `VariantMismatch`. `cur` must fit `desc`, as an opened
+/// value does; a marked child it lacks is appended.
+pub fn apply_marked_delta(
+    desc: &FieldDesc,
+    marks: &crate::proto::BitSet,
+    bit_offset: usize,
+    delta: &PvField,
+    cur: &mut PvField,
+) -> Result<(), ValueDescMismatch> {
+    check_marked(desc, marks, bit_offset, delta)?;
+    copy_marked(desc, marks, bit_offset, delta, cur);
+    Ok(())
+}
+
+fn check_marked(
+    desc: &FieldDesc,
+    marks: &crate::proto::BitSet,
+    bit: usize,
+    delta: &PvField,
+) -> Result<(), ValueDescMismatch> {
+    if marks.get(bit) {
+        return value_matches_descriptor(delta, desc);
+    }
+    let FieldDesc::Structure { fields, .. } = desc else {
+        return Ok(());
+    };
+    let marked_below = |start: usize, end: usize| (start..end).any(|b| marks.get(b));
+    let PvField::Structure(s) = delta else {
+        return if marked_below(bit + 1, bit + desc.total_bits()) {
+            Err(ValueDescMismatch::VariantMismatch {
+                desc: desc_label(desc),
+                value: value_label(delta),
+            })
+        } else {
+            Ok(())
+        };
+    };
+    let mut child_bit = bit + 1;
+    for (i, (name, child_desc)) in fields.iter().enumerate() {
+        let span = child_desc.total_bits();
+        match field_at(s, i, name) {
+            Some(child) => check_marked(child_desc, marks, child_bit, child)?,
+            None => {
+                if marked_below(child_bit, child_bit + span) {
+                    return Err(ValueDescMismatch::MissingField { name: name.clone() });
+                }
+            }
+        }
+        child_bit += span;
+    }
+    Ok(())
+}
+
+fn copy_marked(
+    desc: &FieldDesc,
+    marks: &crate::proto::BitSet,
+    bit: usize,
+    delta: &PvField,
+    cur: &mut PvField,
+) {
+    if marks.get(bit) {
+        cur.clone_from(delta);
+        return;
+    }
+    let FieldDesc::Structure { fields, .. } = desc else {
+        return;
+    };
+    // `check_marked` proved nothing is marked below a non-structure delta.
+    let (PvField::Structure(ds), PvField::Structure(cs)) = (delta, cur) else {
+        return;
+    };
+    let mut child_bit = bit + 1;
+    for (i, (name, child_desc)) in fields.iter().enumerate() {
+        if let Some(d) = field_at(ds, i, name) {
+            match field_at_mut(cs, i, name) {
+                Some(c) => copy_marked(child_desc, marks, child_bit, d, c),
+                None => {
+                    let mut c = d.clone();
+                    copy_marked(child_desc, marks, child_bit, d, &mut c);
+                    cs.fields.push((name.clone(), c));
+                }
+            }
+        }
+        child_bit += child_desc.total_bits();
+    }
+}
+
+/// The field named `name`, trying position `i` first: a value built from
+/// the descriptor keeps its order, so the lookup is O(1) on that path.
+fn field_at<'a>(s: &'a PvStructure, i: usize, name: &str) -> Option<&'a PvField> {
+    match s.fields.get(i) {
+        Some((n, v)) if n == name => Some(v),
+        _ => s.get_field(name),
+    }
+}
+
+fn field_at_mut<'a>(s: &'a mut PvStructure, i: usize, name: &str) -> Option<&'a mut PvField> {
+    let hit = matches!(s.fields.get(i), Some((n, _)) if n == name);
+    if hit {
+        s.fields.get_mut(i).map(|(_, v)| v)
+    } else {
+        s.get_field_mut(name)
+    }
+}
+
 /// A full value must carry the descriptor's exact member set: every
 /// descriptor field present (and fitting), and no field the descriptor
 /// does not name.
@@ -692,5 +806,182 @@ mod tests {
             value: PvField::Scalar(ScalarValue::Int(3)),
         }));
         assert!(value_matches_descriptor(&value, &desc).is_ok());
+    }
+
+    /// { value: Int, alarm { severity: Int, message: String } } — bits: 0
+    /// root, 1 value, 2 alarm, 3 severity, 4 message.
+    fn alarmed_desc() -> FieldDesc {
+        FieldDesc::Structure {
+            struct_id: NT_SCALAR.to_string(),
+            fields: vec![
+                ("value".to_string(), FieldDesc::Scalar(ScalarType::Int)),
+                (
+                    "alarm".to_string(),
+                    FieldDesc::Structure {
+                        struct_id: "alarm_t".to_string(),
+                        fields: vec![
+                            ("severity".to_string(), FieldDesc::Scalar(ScalarType::Int)),
+                            ("message".to_string(), FieldDesc::Scalar(ScalarType::String)),
+                        ],
+                    },
+                ),
+            ],
+        }
+    }
+
+    fn alarmed_value(value: ScalarValue, severity: ScalarValue, message: &str) -> PvField {
+        PvField::Structure(PvStructure {
+            struct_id: NT_SCALAR.to_string(),
+            fields: vec![
+                ("value".to_string(), PvField::Scalar(value)),
+                (
+                    "alarm".to_string(),
+                    PvField::Structure(PvStructure {
+                        struct_id: "alarm_t".to_string(),
+                        fields: vec![
+                            ("severity".to_string(), PvField::Scalar(severity)),
+                            (
+                                "message".to_string(),
+                                PvField::Scalar(ScalarValue::String(message.into())),
+                            ),
+                        ],
+                    }),
+                ),
+            ],
+        })
+    }
+
+    fn bits(set: &[usize]) -> crate::proto::BitSet {
+        let mut b = crate::proto::BitSet::new();
+        for &i in set {
+            b.set(i);
+        }
+        b
+    }
+
+    /// Per boundary of the mark test: a marked leaf is copied, an unmarked
+    /// leaf is left alone even when `delta` differs there, and a marked
+    /// structure bit copies its whole subtree.
+    #[test]
+    fn apply_marked_delta_copies_exactly_the_marked_subtrees() {
+        let desc = alarmed_desc();
+        let mut cur = alarmed_value(ScalarValue::Int(1), ScalarValue::Int(0), "ok");
+        let delta = alarmed_value(ScalarValue::Int(2), ScalarValue::Int(3), "hi");
+
+        apply_marked_delta(&desc, &bits(&[1]), 0, &delta, &mut cur).unwrap();
+        assert_eq!(
+            cur,
+            alarmed_value(ScalarValue::Int(2), ScalarValue::Int(0), "ok"),
+            "only the marked leaf moved"
+        );
+
+        apply_marked_delta(&desc, &bits(&[4]), 0, &delta, &mut cur).unwrap();
+        assert_eq!(
+            cur,
+            alarmed_value(ScalarValue::Int(2), ScalarValue::Int(0), "hi"),
+            "a nested marked leaf moved, its unmarked sibling did not"
+        );
+
+        apply_marked_delta(&desc, &bits(&[2]), 0, &delta, &mut cur).unwrap();
+        assert_eq!(
+            cur,
+            alarmed_value(ScalarValue::Int(2), ScalarValue::Int(3), "hi"),
+            "a marked structure bit copies the subtree"
+        );
+
+        let mut untouched = alarmed_value(ScalarValue::Int(1), ScalarValue::Int(0), "ok");
+        apply_marked_delta(&desc, &bits(&[]), 0, &delta, &mut untouched).unwrap();
+        assert_eq!(
+            untouched,
+            alarmed_value(ScalarValue::Int(1), ScalarValue::Int(0), "ok"),
+            "nothing marked, nothing copied"
+        );
+    }
+
+    /// The check covers only what is marked, and it runs before any copy:
+    /// a mismatch on an unmarked leaf is invisible, a mismatch on a marked
+    /// leaf refuses the whole delta with the earlier marked leaf still
+    /// uncopied.
+    #[test]
+    fn apply_marked_delta_checks_marked_leaves_only_and_before_copying() {
+        let desc = alarmed_desc();
+        let before = alarmed_value(ScalarValue::Int(1), ScalarValue::Int(0), "ok");
+        // `severity` carries a Double: wrong under the descriptor.
+        let delta = alarmed_value(ScalarValue::Int(2), ScalarValue::Double(3.0), "hi");
+
+        let mut cur = before.clone();
+        apply_marked_delta(&desc, &bits(&[1]), 0, &delta, &mut cur).unwrap();
+        assert_eq!(
+            cur,
+            alarmed_value(ScalarValue::Int(2), ScalarValue::Int(0), "ok"),
+            "the unmarked bad leaf is not checked"
+        );
+
+        let mut cur = before.clone();
+        let err = apply_marked_delta(&desc, &bits(&[1, 3]), 0, &delta, &mut cur).unwrap_err();
+        assert!(
+            matches!(err, ValueDescMismatch::ScalarTypeMismatch { .. }),
+            "{err:?}"
+        );
+        assert_eq!(cur, before, "a refused delta leaves the value untouched");
+
+        // A marked structure bit checks the subtree it would copy.
+        let mut cur = before.clone();
+        assert!(apply_marked_delta(&desc, &bits(&[2]), 0, &delta, &mut cur).is_err());
+        assert_eq!(cur, before);
+    }
+
+    /// A marked subtree the delta does not carry is `MissingField`; an
+    /// absent unmarked one is fine. A marked bit below a delta node that is
+    /// not a structure is `VariantMismatch`.
+    #[test]
+    fn apply_marked_delta_refuses_a_marked_subtree_the_delta_lacks() {
+        let desc = alarmed_desc();
+        let before = alarmed_value(ScalarValue::Int(1), ScalarValue::Int(0), "ok");
+        // Only `value`; no `alarm` member at all.
+        let delta = PvField::Structure(PvStructure {
+            struct_id: NT_SCALAR.to_string(),
+            fields: vec![("value".to_string(), PvField::Scalar(ScalarValue::Int(5)))],
+        });
+
+        let mut cur = before.clone();
+        apply_marked_delta(&desc, &bits(&[1]), 0, &delta, &mut cur).unwrap();
+        assert_eq!(
+            cur,
+            alarmed_value(ScalarValue::Int(5), ScalarValue::Int(0), "ok"),
+            "an absent unmarked member is not needed"
+        );
+
+        let mut cur = before.clone();
+        let err = apply_marked_delta(&desc, &bits(&[3]), 0, &delta, &mut cur).unwrap_err();
+        assert_eq!(
+            err,
+            ValueDescMismatch::MissingField {
+                name: "alarm".to_string()
+            }
+        );
+        assert_eq!(cur, before);
+
+        // `alarm` present but not a structure, with a leaf below it marked.
+        let flat = PvField::Structure(PvStructure {
+            struct_id: NT_SCALAR.to_string(),
+            fields: vec![
+                ("value".to_string(), PvField::Scalar(ScalarValue::Int(5))),
+                ("alarm".to_string(), PvField::Scalar(ScalarValue::Int(9))),
+            ],
+        });
+        let mut cur = before.clone();
+        let err = apply_marked_delta(&desc, &bits(&[4]), 0, &flat, &mut cur).unwrap_err();
+        assert!(
+            matches!(err, ValueDescMismatch::VariantMismatch { .. }),
+            "{err:?}"
+        );
+        assert_eq!(cur, before);
+        // ...and harmless when nothing below it is marked.
+        apply_marked_delta(&desc, &bits(&[1]), 0, &flat, &mut cur).unwrap();
+        assert_eq!(
+            cur,
+            alarmed_value(ScalarValue::Int(5), ScalarValue::Int(0), "ok")
+        );
     }
 }

@@ -736,6 +736,48 @@ impl SharedPV {
         Ok(inner.subscribers.len())
     }
 
+    /// Post by delta: copy the leaves `marks` selects out of `delta` into
+    /// the stored value, in place, and deliver the result — pvxs
+    /// `SharedPV::post` (`sharedpv.cpp:417-441`), whose store step is
+    /// `current.assign(val)`, a copy of the marked fields only. Where
+    /// [`Self::try_post_checked`] replaces the whole value and checks all
+    /// of it, this checks and copies only what is marked
+    /// ([`crate::pvdata::apply_marked_delta`]): an unmarked leaf of
+    /// `delta` is neither read nor checked, and `delta` is borrowed, so a
+    /// producer that keeps its value pays no clone. `marks` uses the wire
+    /// bit numbering of the opened descriptor. Nothing changes on `Err`.
+    /// Returns the live subscriber count, like `try_post_checked`.
+    pub fn post_delta(
+        &self,
+        marks: &crate::proto::BitSet,
+        delta: &PvField,
+    ) -> crate::error::PvaResult<usize> {
+        let mut g = self.inner.lock();
+        let inner = &mut *g;
+        let PvState::Open { desc, value: cur } = &mut inner.state else {
+            return Err(crate::error::PvaError::Protocol(
+                "SharedPV not open".to_string(),
+            ));
+        };
+        crate::pvdata::apply_marked_delta(desc, marks, 0, delta, cur).map_err(|e| {
+            crate::error::PvaError::InvalidValue(format!(
+                "SharedPV::post_delta: delta does not fit opened descriptor ({e})"
+            ))
+        })?;
+        inner.subscribers.retain(|tx| tx.post(cur.clone(), false));
+        Ok(inner.subscribers.len())
+    }
+
+    /// Read the opened descriptor and current value under the PV lock,
+    /// cloning neither ([`Self::introspection`] and [`Self::current`]
+    /// clone). `None` while closed. `f` must not touch this PV.
+    pub fn with_current<R>(&self, f: impl FnOnce(&FieldDesc, &PvField) -> R) -> Option<R> {
+        match &self.inner.lock().state {
+            PvState::Open { desc, value } => Some(f(desc, value)),
+            PvState::Closed => None,
+        }
+    }
+
     /// Add a subscriber. Returns a [`MonitorInbox`] that yields posted values
     /// with squash-to-tail semantics (pvxs `servermon.cpp:283-286`) when the
     /// `limit`-deep queue is full. Drops on the receiver side translate to
@@ -2875,5 +2917,55 @@ mod tests {
             "remove+re-add of the same name within one interval must still \
              advance beacon_change even though list_pvs is unchanged: {v3} -> {v4}"
         );
+    }
+
+    /// `post_delta` stores only the marked leaves, delivers the merged value
+    /// to every subscriber, and on a mismatch changes and delivers nothing.
+    /// Closed, it refuses like `try_post_checked`.
+    #[test]
+    fn shared_pv_post_delta_applies_marked_leaves_and_delivers_the_merge() {
+        let pv = SharedPV::new();
+        let desc = nt_scalar_ts_desc();
+        let mut marks = crate::proto::BitSet::new();
+        marks.set(1); // value
+
+        assert!(
+            pv.post_delta(&marks, &nt_scalar_ts_value(1, 0, 0)).is_err(),
+            "closed PV refuses a delta post"
+        );
+        assert!(pv.with_current(|_, _| ()).is_none());
+
+        pv.open(desc.clone(), nt_scalar_ts_value(1, 100, 7))
+            .unwrap();
+        let mut inbox = pv.subscribe(4).expect("open PV subscribes");
+        let _seed = inbox.try_recv().expect("seed");
+
+        // The delta's timeStamp differs but is unmarked: not stored.
+        let n = pv
+            .post_delta(&marks, &nt_scalar_ts_value(2, 999, 9))
+            .unwrap();
+        assert_eq!(n, 1, "one live subscriber");
+        let stored = pv.current().unwrap();
+        assert_eq!(stored, nt_scalar_ts_value(2, 100, 7));
+        assert_eq!(
+            inbox.try_recv().expect("delivered"),
+            stored,
+            "the subscriber sees the merged value"
+        );
+        assert_eq!(
+            pv.with_current(|d, v| (d.clone(), v.clone())).unwrap(),
+            (desc, stored),
+            "with_current reads the same state without a clone"
+        );
+
+        // A marked leaf of the wrong type: refused, nothing stored, nothing
+        // delivered.
+        let mut bad = nt_scalar_ts_value(3, 0, 0);
+        if let PvField::Structure(s) = &mut bad {
+            s.fields[0].1 = PvField::Scalar(ScalarValue::Double(3.0));
+        }
+        assert!(pv.post_delta(&marks, &bad).is_err());
+        assert_eq!(pv.current().unwrap(), nt_scalar_ts_value(2, 100, 7));
+        assert!(inbox.try_recv().is_err(), "a refused post reaches nobody");
     }
 }

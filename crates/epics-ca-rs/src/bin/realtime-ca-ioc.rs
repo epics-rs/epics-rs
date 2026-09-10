@@ -235,13 +235,12 @@ mod demo_db {
     ///   * `CMP` — a `compress` whose INP is `WF`, so processing consumes a
     ///     32,768-element array instead of a scalar.
     ///   * `H` → `L1..L32` — a 32-deep `FLNK` chain, four times the existing
-    ///     C1..C8 one, so the chain is longer than any depth bound the engine
-    ///     imposes and the bound itself becomes observable. MEASURED on
-    ///     `x86_64-wrs-vxworks`: a CA put to `H` processes `H` and `L1..L15`
-    ///     and stops, because `process_entry_prelude`'s `MAX_LINK_DEPTH = 16`
-    ///     bails at `L16` (`L15 = 1215.0`, `L16 = L17 = L18 = 0.0`). So this
-    ///     record set drives the recursion to its cap, which is what makes the
-    ///     `CAS-client` high-water below depth-inclusive.
+    ///     C1..C8 one. The engine, like C's `dbProcess`, imposes no depth
+    ///     bound, so a CA put to `H` processes `H` and all of `L1..L32`, and
+    ///     the `CAS-client` high-water below is depth-inclusive for 32 hops.
+    ///     (The `x86_64-wrs-vxworks` numbers were MEASURED while the engine
+    ///     still bailed at its former 16-hop bound, `L15 = 1215.0`,
+    ///     `L16 = 0.0`; a 32-hop run has not been re-measured since.)
     ///   * `WFBIG` — 131,072 `DOUBLE`, a 1,048,576 B reply, 4× `WF`. `WF`
     ///     alone cannot say whether stack high-water scales with payload
     ///     size; two array sizes an octave apart can.

@@ -1,4 +1,4 @@
-// RTEMS-EXEC-MODEL-ALLOW(4): three multi-thread-flavored tokio tests plus one hand-built runtime; run and pass in the exec-backend suite.
+// RTEMS-EXEC-MODEL-ALLOW(3): three multi-thread-flavored tokio tests; run and pass in the exec-backend suite.
 #![allow(unused_imports, clippy::all)]
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -2301,75 +2301,6 @@ async fn test_phas_scan_order() {
 
     let names = db.records_for_scan(ScanType::SEC1).await;
     assert_eq!(names, vec!["REC_A", "REC_B", "REC_C"]);
-}
-
-/// Run a deep FLNK-processing chain test on a thread with a large stack.
-///
-/// `process_record_with_links` polls the large `process_record_with_links_inner`
-/// future once per FLNK hop, up to `MAX_LINK_DEPTH` (16) frames deep. On
-/// linux-arm64 those frames are big enough that 16 of them overflow the default
-/// 2 MB test-thread stack (SIGABRT); x86_64 and macos-arm64 have smaller frames
-/// and fit. A 16 MB stack clears it. The future is built and awaited on the
-/// spawned thread, so it never crosses the thread boundary and needs no `Send`.
-fn run_deep_flnk_recursion<F, Fut>(body: F)
-where
-    F: FnOnce() -> Fut + Send + 'static,
-    Fut: std::future::Future<Output = ()>,
-{
-    std::thread::Builder::new()
-        .stack_size(16 * 1024 * 1024)
-        .spawn(move || {
-            tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .unwrap()
-                .block_on(body());
-        })
-        .unwrap()
-        .join()
-        .unwrap();
-}
-
-#[test]
-fn test_depth_limit() {
-    run_deep_flnk_recursion(|| async {
-        let db = PvDatabase::new();
-        for i in 0..20 {
-            db.add_record(&format!("CHAIN_{i}"), Box::new(AoRecord::new(0.0)))
-                .await
-                .unwrap();
-        }
-        for i in 0..19 {
-            if let Some(rec) = db.get_record(&format!("CHAIN_{i}")) {
-                let mut inst = rec.write();
-                inst.put_common_field(
-                    "FLNK",
-                    EpicsValue::String(format!("CHAIN_{}", i + 1).into()),
-                )
-                .unwrap();
-            }
-        }
-
-        let mut visited = HashSet::new();
-        db.process_record_with_links("CHAIN_0", &mut visited, 0)
-            .await
-            .unwrap();
-        // Reading the set after the call cannot show how far the chain
-        // walked any more; the refusal on the record at the bound can, and
-        // that is what an operator sees.
-        let refused = db
-            .get_record("CHAIN_16")
-            .expect("CHAIN_16 exists")
-            .read()
-            .common
-            .amsg
-            .clone();
-        assert!(
-            refused.contains("link chain depth limit"),
-            "the record at MAX_LINK_DEPTH must carry the reason, got {refused:?}"
-        );
-        assert!(visited.is_empty(), "the frame unwound: {visited:?}");
-    });
 }
 
 #[epics_macros_rs::epics_test]
@@ -5463,9 +5394,9 @@ async fn test_calc_multi_input_bare_does_not_process_source() {
 /// `INPA` PP links point at each other (`A.INPA="B PP"`,
 /// `B.INPA="A PP"`) form a PP-link cycle. Before the fix
 /// `process_passive_db_source` created a FRESH `visited` set and
-/// reset depth to 0 on every PP hop, so neither `MAX_LINK_DEPTH`
-/// nor the `visited` cycle guard fired across the hop — the cycle
-/// recursed unboundedly to a stack overflow / SIGABRT.
+/// reset depth to 0 on every PP hop, so the `visited` cycle guard
+/// never fired across the hop — the cycle recursed unboundedly to a
+/// stack overflow / SIGABRT.
 ///
 /// C terminates this cycle because `calcRecord.c::process` sets
 /// `prec->pact = TRUE` *before* `fetch_values()` (calcRecord.c:119),

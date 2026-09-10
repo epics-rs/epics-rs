@@ -11,10 +11,11 @@
 //! links.rs   self.process_record_with_links_recursive(target, visited, depth + 1)
 //! ```
 //!
-//! so a target that is then refused by `MAX_LINK_DEPTH`, or
-//! stopped by the `visited` cycle guard, was counted into the wait-set and
-//! never counted out. The set could not drain, the completion oneshot never
-//! fired, and a CA `WRITE_NOTIFY` driving that chain got no reply at all.
+//! so a target that is then stopped by the `visited` cycle guard — or, while
+//! the port still had one, refused by its 16-hop depth bound — was counted
+//! into the wait-set and never counted out. The set could not drain, the
+//! completion oneshot never fired, and a CA `WRITE_NOTIFY` driving that chain
+//! got no reply at all.
 //!
 //! C decides this with one flag and one finalizer. `callNotifyCompletion`
 //! starts FALSE (`dbAccess.c:494`) and is raised on the exits where the record
@@ -30,11 +31,12 @@
 //!         dbNotifyCompletion(precord);
 //! ```
 //!
-//! The port's bounds are the "will not run its cycle" shape, so they belong on
+//! The port's non-runs are the "will not run its cycle" shape, so they belong on
 //! C's `callNotifyCompletion = TRUE` side.
 //!
-//! Measured on x86_64-wrs-vxworks before the fix (`RTEMS:E8:H` is an `ao` at
-//! the head of an 18-record FLNK chain, `MAX_LINK_DEPTH` = 16):
+//! Measured on x86_64-wrs-vxworks before the fix, while the port still refused
+//! the 17th hop (`RTEMS:E8:H` is an `ao` at the head of an 18-record FLNK
+//! chain):
 //!
 //! ```text
 //! [    0.1s] discrim SOLO   RTEMS:AO      =601.0 budget= 45s elapsed=  0.012s OK    (ao, no FLNK, VAL preset)
@@ -56,9 +58,26 @@ use epics_base_rs::server::ioc_builder::IocBuilder;
 use epics_base_rs::server::record::ProcessCompletion;
 use epics_base_rs::types::EpicsValue;
 
-/// Well past `MAX_LINK_DEPTH` (16), so the bound is crossed wherever it sits
-/// below 32 — the same reason `link_chain_bound_is_audible` uses 24.
+/// Longer than the 16-hop bound the port used to have, so the chain also
+/// proves the whole cascade runs now; `link_chain_has_no_depth_bound` goes
+/// deeper still.
 const CHAIN: usize = 24;
+
+/// Run `body` on a 16 MB thread. Each hop of the chain is one poll frame of
+/// `process_record_with_links_inner`, and on linux-arm64 a debug-build frame
+/// is large enough that the default 2 MB test-thread stack cannot hold 24.
+fn on_a_deep_stack<F, Fut>(body: F)
+where
+    F: FnOnce() -> Fut + Send + 'static,
+    Fut: std::future::Future<Output = ()>,
+{
+    std::thread::Builder::new()
+        .stack_size(16 * 1024 * 1024)
+        .spawn(move || epics_base_rs::runtime::task::test_block_on(body()))
+        .unwrap()
+        .join()
+        .unwrap();
+}
 
 /// `ao` head + `calc` FLNK chain — the shape of `RTEMS:E8:H` -> `RTEMS:E8:L*`
 /// on the VxWorks rig. A put to an `ao`'s VAL drives processing, which is what
@@ -89,28 +108,31 @@ async fn chain_db(len: usize) -> Arc<PvDatabase> {
         .0
 }
 
-/// The boundary this closes: a chain LONGER than `MAX_LINK_DEPTH`. Every
-/// record in it is synchronous, so the whole cascade settles inside the call
-/// and the put-notify must report `Sync`. Before the fix this returned
-/// `Async(rx)` on a wait-set that no longer had anyone left to drain it.
-#[epics_macros_rs::epics_test]
-async fn a_put_notify_into_an_over_long_chain_completes() {
-    let db = chain_db(CHAIN).await;
-    let completion = db
-        .put_record_field_from_ca("H", "VAL", EpicsValue::Double(1.0))
-        .await
-        .expect("the put itself succeeds — the bound refuses a link target, not the head");
-    assert!(
-        matches!(completion, ProcessCompletion::Sync),
-        "every record in this chain is synchronous, so the refused entry at the \
-         depth bound is the only thing that can hold the wait-set open"
-    );
+/// A chain longer than the port's former depth bound. Every record in it is
+/// synchronous, so the whole cascade settles inside the call and the
+/// put-notify must report `Sync`. Before the fix this returned `Async(rx)` on
+/// a wait-set that no longer had anyone left to drain it; with no bound the
+/// cascade runs to `L23` and the set drains through the ordinary exits.
+#[test]
+fn a_put_notify_into_a_deep_chain_completes() {
+    on_a_deep_stack(|| async {
+        let db = chain_db(CHAIN).await;
+        let completion = db
+            .put_record_field_from_ca("H", "VAL", EpicsValue::Double(1.0))
+            .await
+            .expect("the put itself succeeds");
+        assert!(
+            matches!(completion, ProcessCompletion::Sync),
+            "every record in this chain is synchronous, so nothing can hold the \
+             wait-set open"
+        );
+    });
 }
 
-/// The other side of the same boundary: a chain that FITS. Without it the test
-/// above would still pass if the wait-set were never armed at all.
+/// A short chain, for the same reason: without it the test above would still
+/// pass if the wait-set were never armed at all.
 #[epics_macros_rs::epics_test]
-async fn a_put_notify_into_a_chain_inside_the_bound_completes() {
+async fn a_put_notify_into_a_short_chain_completes() {
     let db = chain_db(4).await;
     let completion = db
         .put_record_field_from_ca("H", "VAL", EpicsValue::Double(1.0))
@@ -119,13 +141,13 @@ async fn a_put_notify_into_a_chain_inside_the_bound_completes() {
     assert!(matches!(completion, ProcessCompletion::Sync));
 }
 
-/// The second port-only non-run: the `visited` cycle guard. Unlike the two
-/// above this one passes with or without the release, because a record
+/// The one port-only non-run left: the `visited` cycle guard. Unlike the chain
+/// tests this one passes with or without the release, because a record
 /// re-reached inside one depth-first cascade is still `pact` — so the link
 /// dispatcher takes the RPRO branch and never joins it in the first place. It
 /// is here as the boundary that must NOT change: routing the silent guard
-/// through the same exit as the loud bounds must not start completing a
-/// put-notify that the record's own live cycle still owns.
+/// through `entry_did_not_run` must not start completing a put-notify that
+/// the record's own live cycle still owns.
 #[epics_macros_rs::epics_test]
 async fn a_put_notify_into_a_cycle_completes() {
     let db_text = "record(ao, \"H\") { field(FLNK,\"C0\") }\n\
@@ -149,18 +171,20 @@ async fn a_put_notify_into_a_cycle_completes() {
 /// per run however many puts it made: a record left holding a stranded
 /// wait-set never joins a later one, so put #2 onward completed while put #1
 /// hung forever. Both puts must now report `Sync`.
-#[epics_macros_rs::epics_test]
-async fn a_second_put_notify_into_the_same_over_long_chain_also_completes() {
-    let db = chain_db(CHAIN).await;
-    for round in 1..=2 {
-        let completion = db
-            .put_record_field_from_ca("H", "VAL", EpicsValue::Double(round as f64))
-            .await
-            .unwrap();
-        assert!(
-            matches!(completion, ProcessCompletion::Sync),
-            "put #{round} must complete; before the fix only #1 hung and the rest \
-             passed because the refused record no longer joined"
-        );
-    }
+#[test]
+fn a_second_put_notify_into_the_same_deep_chain_also_completes() {
+    on_a_deep_stack(|| async {
+        let db = chain_db(CHAIN).await;
+        for round in 1..=2 {
+            let completion = db
+                .put_record_field_from_ca("H", "VAL", EpicsValue::Double(round as f64))
+                .await
+                .unwrap();
+            assert!(
+                matches!(completion, ProcessCompletion::Sync),
+                "put #{round} must complete; before the fix only #1 hung and the rest \
+                 passed because the refused record no longer joined"
+            );
+        }
+    });
 }

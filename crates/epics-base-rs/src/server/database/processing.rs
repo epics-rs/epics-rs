@@ -29,10 +29,9 @@ const STRING_FIELD_MAX_LEN: usize = 39;
 /// ```
 ///
 /// so a refusal is never a silent success: the record carries SCAN_ALARM /
-/// INVALID with the reason in `AMSG`, and the transition is posted. Every
-/// refusal the port can make routes through here — C's `MAX_LOCK` re-entry and
-/// the port's own `MAX_LINK_DEPTH` bound, which C does not have at all and
-/// which must therefore be at least as audible as C's.
+/// INVALID with the reason in `AMSG`, and the transition is posted. The one
+/// refusal the port can make, C's `MAX_LOCK` re-entry, routes through here;
+/// like C, the port has no link-depth bound.
 ///
 /// Returns the post set for the caller to hand to `notify_from_snapshot` after
 /// releasing the write guard, or `None` when the record already carries this
@@ -777,7 +776,7 @@ impl PvDatabase {
     }
 
     /// Process a record with full link handling (INP -> process -> alarms -> OUT -> FLNK).
-    /// Uses visited set for cycle detection and depth limit.
+    /// Uses the visited set for cycle detection.
     ///
     /// Foreign-caller entry: FLNK dispatch, scan loop, scan_event, CA put,
     /// process(PROC=1) etc. Hits the PACT entry guard (mirrors C `dbProcess`
@@ -944,10 +943,9 @@ impl PvDatabase {
         is_continuation: bool,
         device_callback: bool,
     ) -> CaResult<()> {
-        // A `None` here never inserted (the depth bound returns above the
-        // insert) or found the name already present, in which case the marker
-        // is the outer frame's — either way there is nothing to unwind.
-        let Some((name, rec)) = self.process_entry_prelude(name, visited, depth)? else {
+        // A `None` here found the name already present, so the marker is the
+        // outer frame's and there is nothing to unwind.
+        let Some((name, rec)) = self.process_entry_prelude(name, visited)? else {
             return Ok(());
         };
 
@@ -1711,8 +1709,8 @@ impl PvDatabase {
     }
 
     /// The entry bookkeeping every process entry shares, before the advisory
-    /// write gate is (or is not) taken: alias normalisation, the depth / ops
-    /// budgets, the `visited` cycle guard and the records-map lookup.
+    /// write gate is (or is not) taken: alias normalisation, the `visited`
+    /// cycle guard and the records-map lookup.
     ///
     /// Factored out so the gate-taking entry
     /// ([`Self::process_record_with_links_inner`]) and the two gate-free
@@ -1722,11 +1720,11 @@ impl PvDatabase {
     ///
     /// `Ok(None)` is "this entry did not run"; `Err` is C's `S_db_notFound`.
     ///
-    /// None of those non-runs is silent. Both resource bounds go through
-    /// [`Self::refuse_bounded_entry`], which raises the record's alarm and
-    /// logs before it hands back the `Ok(None)`; the cycle guard goes through
-    /// [`Self::count_refused_active_entry`], which is C's already-active arm.
-    /// So a non-run cannot be written as a bare `return Ok(None)` here.
+    /// A non-run is not silent: the cycle guard goes through
+    /// [`Self::count_refused_active_entry`], which is C's already-active arm,
+    /// so it cannot be written as a bare `return Ok(None)` here. There is no
+    /// other non-run — C's `dbProcess` (`dbAccess.c:485`) has no link-depth
+    /// counter, and neither does the port.
     ///
     /// Every `Ok(None)` is built by [`Self::entry_did_not_run`], which is
     /// also where the put-notify wait-set is released, so a non-run cannot
@@ -1735,20 +1733,13 @@ impl PvDatabase {
         &self,
         name: &str,
         visited: &mut HashSet<String>,
-        depth: usize,
     ) -> CaResult<Option<(String, Arc<parking_lot::RwLock<RecordInstance>>)>> {
-        const MAX_LINK_DEPTH: usize = 16;
-
         // Normalise to the canonical record name once at entry — both
         // for cycle-detection (`visited` would otherwise treat alias
         // and canonical as distinct entries) and for the records-map
         // lookup below. Mirrors epics-base PR #336.
         let name: String = self.resolve_alias(name).unwrap_or_else(|| name.to_string());
 
-        if depth >= MAX_LINK_DEPTH {
-            return self
-                .refuse_bounded_entry(&name, &format!("link chain depth limit {MAX_LINK_DEPTH}"));
-        }
         let rec = {
             let records = self.inner.records.read();
             records.get(&name).cloned()
@@ -1859,13 +1850,14 @@ impl PvDatabase {
     /// links.rs:1528   self.process_record_with_links_recursive(target, visited, depth + 1)
     /// ```
     ///
-    /// So by the time a bound, or the cycle guard, decides the entry will not
-    /// run, the target is already counted in the wait-set — and nothing
+    /// So by the time the cycle guard decides the entry will not run, the
+    /// target is already counted in the wait-set — and nothing
     /// downstream will ever `leave` for it, because the only `leave`s are on
     /// paths that ran a cycle. The set never drains, the completion oneshot
     /// never fires, and the client's `CA_PROTO_WRITE_NOTIFY` gets no reply
-    /// (measured on x86_64-wrs-vxworks: the first put into a chain past
-    /// `MAX_LINK_DEPTH` never replied over 90s, and `RTEMS:E8:L16` was left
+    /// (measured on x86_64-wrs-vxworks while the port still refused entries
+    /// past a 16-hop depth bound: the first put into a longer chain never
+    /// replied over 90s, and `RTEMS:E8:L16` was left
     /// holding a wait-set that could never drain — after which every later put
     /// completed, because `join_put_notify`'s `notify.is_none()` guard stops a
     /// record that already holds a stale set from joining a live one).
@@ -1897,67 +1889,6 @@ impl PvDatabase {
             }
         }
         Ok(None)
-    }
-
-    /// Refuse a process entry that hit one of the port's own resource bounds,
-    /// and make the refusal audible before returning it.
-    ///
-    /// C has no depth counter and no ops budget: `processTarget`
-    /// (`dbDbLink.c:427-436`) only marks the source `pact` and recurses, so a
-    /// chain of any length runs and only a genuine cycle stops. The port keeps
-    /// bounds because each link level is a `Pin<Box<dyn Future>>` on the
-    /// calling thread's stack and an unbounded chain is a stack overflow on an
-    /// embedded target — but a bound C does not have must not be quieter than
-    /// the refusal C does have. So the record ends in SCAN_ALARM / INVALID with
-    /// the reason in `AMSG` ([`scan_alarm_refusal`], C `dbAccess.c:544-556`),
-    /// and the reason goes to `errlog` where an operator reads it, not to a
-    /// bare `eprintln!` that no IOC log ever sees.
-    ///
-    /// Returns the prelude's "did not run" value so that the only way to write
-    /// a bound bail is through this function.
-    fn refuse_bounded_entry(
-        &self,
-        name: &str,
-        why: &str,
-    ) -> CaResult<Option<(String, Arc<parking_lot::RwLock<RecordInstance>>)>> {
-        let rec = {
-            let records = self.inner.records.read();
-            records.get(name).cloned()
-        };
-        // The record the chain could not reach may not exist — a dangling FLNK
-        // at the bound. The refusal is still reported; there is simply nothing
-        // to raise it on.
-        let repeat = match &rec {
-            Some(rec) => {
-                let snapshot = {
-                    let mut instance = rec.write();
-                    scan_alarm_refusal(&mut instance, why)
-                };
-                match snapshot {
-                    Some(snapshot) => {
-                        // Resolved with no guard held, as above.
-                        let backing = self.resolve_link_backed_metadata(rec);
-                        let backing = crate::server::database::LinkBacking::resolved(&backing);
-                        rec.read().notify_from_snapshot(&snapshot, backing);
-                        false
-                    }
-                    // Already refused and still in SCAN_ALARM/INVALID: C posts
-                    // nothing on a repeat, and repeating the log line for every
-                    // put into the same over-long chain would drown the first
-                    // one. Only the alarm and the log are debounced — the
-                    // wait-set release below is not, because every refused
-                    // entry joined its own put-notify.
-                    None => true,
-                }
-            }
-            None => false,
-        };
-        if !repeat {
-            crate::runtime::log::errlog_printf(&format!(
-                "dbProcess: {name} not processed, {why} exceeded\n"
-            ));
-        }
-        self.entry_did_not_run(rec.as_ref())
     }
 
     /// The gate-taking entry — the ONLY `.await` in the whole H6 chain.
@@ -3739,7 +3670,7 @@ impl PvDatabase {
                 // there is nothing to run — return without awaiting
                 // `execute_process_actions`, which would enlarge this hot
                 // recursive function's async frame (the FLNK chain nests one
-                // poll frame per hop up to MAX_LINK_DEPTH; the write guard
+                // poll frame per hop, unbounded as in C; the write guard
                 // `instance` is released on return).
                 debug_assert!(
                     process_actions.is_empty(),
@@ -4766,7 +4697,8 @@ impl PvDatabase {
         // dispatched by the shared deferred-actions site at the tail, NOT a
         // separate `execute_process_actions().await` here — adding one would
         // enlarge this hot recursive function's async frame (see the
-        // `CompleteNoEmit` note above; it overflowed the chain-depth guard).
+        // `CompleteNoEmit` note above; it overflowed the stack in the deep-chain
+        // tests).
         // Holding `processing=true` also makes the tail's putf-clear (gated on
         // `!is_processing()`) a no-op, leaving putf for the continuation.
         if result_is_defer_output {
@@ -6319,8 +6251,8 @@ impl PvDatabase {
     ///
     /// Kept as its own `async fn` so the `EpicsValue` it reads out of the
     /// record never enters `process_record_with_links_inner`'s async state —
-    /// that future is polled `MAX_LINK_DEPTH` frames deep on a FLNK chain, and
-    /// bloating it overflows the stack (the depth-limit regression tests).
+    /// that future is polled one frame deeper per FLNK hop, unbounded as in C,
+    /// and bloating it overflows the stack sooner (the deep-chain tests).
     fn write_simulated_output_siol(
         &self,
         rec: &Arc<parking_lot::RwLock<RecordInstance>>,

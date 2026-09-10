@@ -31,7 +31,7 @@ use crate::pvdata::{FieldDesc, PvField, RpcReply};
 
 use super::channel::{Channel, ConnectionPool};
 use super::ops_v2::{
-    MonitorConnEvent, MonitorEvent, MonitorEventMask, RpcArg, SubscriptionHandle, op_get,
+    MonitorConnEvent, MonitorEvent, MonitorEventMask, PutOp, RpcArg, SubscriptionHandle, op_get,
     op_get_get, op_get_put, op_monitor, op_monitor_events, op_monitor_handle,
     op_monitor_raw_frames_handle, op_monitor_raw_frames_handle_with_request, op_process,
     op_process_with_request, op_process_with_request_value, op_put, op_put_get, op_rpc,
@@ -1589,6 +1589,24 @@ impl PvaClient {
             self.inner.timeout,
         )
         .await
+    }
+
+    /// Open a two-phase PUT: INIT (with `request`, or every field when
+    /// `None`) and, when `fetch_present`, the current value read on the
+    /// put's own op (`GetOPut`). The returned [`PutOp`] carries the
+    /// server's type and that value; the caller builds the delta and
+    /// [`PutOp::commit`]s it, or drops the op to destroy it. pvxs
+    /// `PutBuilder::fetchPresent` + `build` parity for a caller whose
+    /// builder cannot run inside the library.
+    pub async fn pvput_begin(
+        &self,
+        pv_name: &str,
+        request: Option<&crate::pv_request::PvRequestExpr>,
+        fetch_present: bool,
+    ) -> PvaResult<PutOp> {
+        let ch = self.channel(pv_name).await?;
+        crate::client_native::ops_v2::op_put_begin(&ch, request, fetch_present, self.inner.timeout)
+            .await
     }
 
     /// PUT a pre-built [`PvField`] with a custom pvRequest. Like

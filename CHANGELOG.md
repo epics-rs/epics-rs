@@ -1,6 +1,6 @@
 # Changelog
 
-## v0.28.2 — 2026-09-09
+## v0.28.2 — 2026-09-10
 
 Patch release. The PVA server drops the two admission caps pvxs does
 not have: `PvaServerConfig::max_ops_per_channel` (64, which refused the

@@ -181,6 +181,7 @@ const SCOPE_GATED: &[(&str, &str)] = &[
     ),
     ("epics-pva-rs", "tests/monitor_finish_body.rs"),
     ("epics-pva-rs", "tests/multi_pv_streaming.rs"),
+    ("epics-pva-rs", "tests/put_two_phase.rs"),
     ("epics-pva-rs", "tests/report_info.rs"),
     ("epics-pva-rs", "tests/rpc_empty_reply.rs"),
     ("epics-pva-rs", "tests/rpc_pvrequest.rs"),

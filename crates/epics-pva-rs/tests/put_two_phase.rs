@@ -175,7 +175,10 @@ async fn commit_on_a_lost_circuit_is_disconnected_not_requeued() {
         .expect("timeout")
         .expect("begin");
     drop(server);
-    assert_eq!(next_conn_event(&mut rx).await, MonitorConnEvent::Disconnected);
+    assert_eq!(
+        next_conn_event(&mut rx).await,
+        MonitorConnEvent::Disconnected
+    );
 
     let err = tokio::time::timeout(
         T,
@@ -192,4 +195,24 @@ async fn commit_on_a_lost_circuit_is_disconnected_not_requeued() {
         "expected Disconnected, got {err:?}"
     );
     assert_eq!(value_of(&pv.current().unwrap()), 1.5);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn pvput_build_sees_the_readback_on_the_put_op() {
+    let (pv, _) = mailbox(1.5);
+    let server = serve(pv.clone());
+    let client = server.client_config();
+
+    tokio::time::timeout(
+        Duration::from_secs(5),
+        client.pvput_build("TP:VAL", |v| {
+            assert_eq!(value_of(v), 1.5, "builder must see the present value");
+            set_value(v, 3.0);
+            Ok(())
+        }),
+    )
+    .await
+    .expect("timeout")
+    .expect("pvput_build");
+    assert_eq!(value_of(&pv.current().unwrap()), 3.0);
 }

@@ -1875,7 +1875,7 @@ async fn op_put_inner(
 /// back to the no-snapshot path. A transport failure (send / timeout /
 /// malformed reply) fails the op instead, because the snapshot shares the
 /// op's frame stream and a late reply would desync the exec await.
-async fn op_put_inner_build<FB, WP>(
+pub(crate) async fn op_put_inner_build<FB, WP>(
     channel: &Arc<Channel>,
     raw_pv_req: Option<&[u8]>,
     op_timeout: Duration,

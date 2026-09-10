@@ -1384,19 +1384,34 @@ impl PvaClient {
     /// subfields.
     pub async fn pvput_build<F>(&self, pv_name: &str, build: F) -> PvaResult<()>
     where
-        F: FnOnce(&mut crate::pvdata::PvField) -> Result<(), String>,
+        F: Fn(&mut crate::pvdata::PvField) -> Result<(), String>,
     {
         let ch = self.channel(pv_name).await?;
-        // Fetch only `.value` so the closure sees exactly what the
-        // subsequent op_put_value will round-trip — alarm/timeStamp/
-        // etc. are out of scope and would be silently dropped at PUT
-        // time if the closure touched them.
-        let (_intro, mut value) =
-            crate::client_native::ops_v2::op_get(&ch, &["value"], self.inner.timeout).await?;
-        if let Err(msg) = build(&mut value) {
-            return Err(crate::error::PvaError::InvalidValue(msg));
-        }
-        crate::client_native::ops_v2::op_put_value(&ch, &value, self.inner.timeout).await
+        // The readback rides the put's own op (`GetOPut`), under the same
+        // `field(value)` request the DATA phase writes through, so the
+        // closure sees exactly what round-trips. `build` is `Fn` because a
+        // put lost to a reconnect is rebuilt against the new channel's
+        // prototype and readback (pvxs `GPROp::disconnected`).
+        crate::client_native::ops_v2::op_put_inner_build(
+            &ch,
+            None,
+            self.inner.timeout,
+            |_| true,
+            |intro, previous| {
+                let mut value = match previous {
+                    Some(p) => p.clone(),
+                    None => crate::pvdata::encode::default_value_for(intro),
+                };
+                build(&mut value).map_err(crate::error::PvaError::InvalidValue)?;
+                let mut changed = crate::proto::BitSet::new();
+                match intro.bit_for_path("value") {
+                    Some(bit) => changed.set(bit),
+                    None => changed.set(0),
+                }
+                Ok((value, changed))
+            },
+        )
+        .await
     }
 
     /// PUT a single dotted-path field of the channel's structure.

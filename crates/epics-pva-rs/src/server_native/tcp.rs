@@ -2265,6 +2265,39 @@ impl MonitorPost for crate::server_native::RawMonitorEvent {
     }
 }
 
+/// A decoded update in [`MonitorQueue`], paired with the wire changed-bitset
+/// its frame carries. The bitset is computed ONCE, at enqueue, where it is
+/// also the `testmask` gate; the payload builder takes it as is instead of
+/// walking the descriptor a second time per update.
+struct QueuedUpdate {
+    update: crate::server_native::MonitorUpdate,
+    changed: BitSet,
+}
+
+impl MonitorPost for QueuedUpdate {
+    fn is_terminal(&self) -> bool {
+        self.update.type_changed
+    }
+}
+
+/// [`coalesce_monitor_update`] on the queued pair. The wire bitset of the
+/// unioned marked sets is the union of the two wire bitsets: a marked path
+/// selects a subtree, the request mask intersects, and
+/// [`crate::pvdata::encode::canonical_changed_bitset`] keeps leaves — each
+/// step distributes over union — and a `marked: None` side already frames
+/// every selected leaf, which contains any marked subset.
+fn coalesce_queued_update(older: QueuedUpdate, newer: QueuedUpdate) -> QueuedUpdate {
+    let update = coalesce_monitor_update(older.update, newer.update);
+    let changed = if update.type_changed {
+        BitSet::new()
+    } else {
+        let mut changed = older.changed;
+        changed.union_with(&newer.changed);
+        changed
+    };
+    QueuedUpdate { update, changed }
+}
+
 /// Push one monitor event into the bounded FIFO, squashing the newest into the
 /// tail once the queue is full — the single producer rule covering both the
 /// INIT->START and STOP->START "Idle, accruing" windows AND the Executing
@@ -2327,7 +2360,7 @@ fn push_squash_monitor<T: MonitorPost>(
 /// with no seed leaves `first` set, so ITS first stream event is the exempt
 /// one — exactly `MonitorOp::first` ("set until first update queued").
 struct MonitorQueue<'a> {
-    pending: std::collections::VecDeque<crate::server_native::MonitorUpdate>,
+    pending: std::collections::VecDeque<QueuedUpdate>,
     /// The ONE negotiated squash limit (`MonitorOp::limit`).
     limit: usize,
     /// pvxs `MonitorOp::first` — set until the first update is queued.
@@ -2362,25 +2395,38 @@ impl<'a> MonitorQueue<'a> {
     /// framed by the same rule as every update.
     fn seed(&mut self, initial: crate::server_native::source::SourceRead) {
         self.first = false;
-        self.pending
-            .push_back(crate::server_native::MonitorUpdate::from(initial));
+        let update = crate::server_native::MonitorUpdate::from(initial);
+        let changed = self.wire_changed(&update);
+        self.pending.push_back(QueuedUpdate { update, changed });
     }
 
     /// pvxs `doPost`. Returns whether the update was queued (`false` = dropped
     /// by the mask test, i.e. `real == false`).
-    fn push(&mut self, ev: crate::server_native::MonitorUpdate) -> bool {
-        if !self.real(&ev) {
-            return false;
-        }
-        self.first = false;
-        push_squash_monitor(&mut self.pending, ev, self.limit, coalesce_monitor_update);
-        true
-    }
-
+    ///
     /// pvxs's `real || !val`: the first post and a terminal (pvxs's null Value
     /// — here the `type_changed` boundary, which MUST survive to become the
     /// MONITOR FINISH) always queue; anything else must pass `testmask`
     /// (`pvrequest.cpp:73-92`) — at least one marked bit inside `pvMask`.
+    fn push(&mut self, ev: crate::server_native::MonitorUpdate) -> bool {
+        let changed = self.wire_changed(&ev);
+        if !(self.first || ev.type_changed || !changed.is_empty()) {
+            return false;
+        }
+        self.first = false;
+        push_squash_monitor(
+            &mut self.pending,
+            QueuedUpdate {
+                update: ev,
+                changed,
+            },
+            self.limit,
+            coalesce_queued_update,
+        );
+        true
+    }
+
+    /// The wire changed-bitset `ev`'s frame carries — and the `testmask`
+    /// gate [`Self::push`] applies, so the two are one computation.
     ///
     /// `testmask` is a LEAF test, on both arms. It scans `store[idx].valid`,
     /// and `Value::mark` (`data.cpp:256-270`) sets `valid` on the marked field
@@ -2391,24 +2437,22 @@ impl<'a> MonitorQueue<'a> {
     /// struct, finds no `alarm.bogus`, and pre-sets the always-permitted bit
     /// 0), and pvxs stays silent for the life of that subscription.
     ///
-    /// The gate is therefore the frame's own changed-bitset — the SAME value
-    /// the payload builder about to serialize this update computes, on either
-    /// arm ([`read_changed_bitset`]: `marked_wire_changed_bitset` for a
-    /// declared leaf set, `canonical_changed_bitset` for a wholly-changed
-    /// post). That makes
-    /// `gate == wire` an invariant: an admitted update always frames a
+    /// The gate is therefore the frame's own changed-bitset, on either arm
+    /// ([`read_changed_bitset`]: `marked_wire_changed_bitset` for a declared
+    /// leaf set, `canonical_changed_bitset` for a wholly-changed post), and
+    /// the queued entry carries that very value to the payload builder. That
+    /// makes `gate == wire` an invariant: an admitted update always frames a
     /// non-empty changed-bitset, and a leafless mask frames none because it
     /// queues none.
-    fn real(&self, ev: &crate::server_native::MonitorUpdate) -> bool {
-        if self.first || ev.type_changed {
-            return true;
+    fn wire_changed(&self, ev: &crate::server_native::MonitorUpdate) -> BitSet {
+        if ev.type_changed {
+            return BitSet::new();
         }
         match ev.marked.as_ref() {
             Some(paths) => {
-                !crate::pvdata::encode::marked_wire_changed_bitset(self.intro, paths, self.mask)
-                    .is_empty()
+                crate::pvdata::encode::marked_wire_changed_bitset(self.intro, paths, self.mask)
             }
-            None => !self.unmarked_changed.is_empty(),
+            None => self.unmarked_changed.clone(),
         }
     }
 
@@ -2416,7 +2460,7 @@ impl<'a> MonitorQueue<'a> {
         self.pending.is_empty()
     }
 
-    fn pop(&mut self) -> Option<crate::server_native::MonitorUpdate> {
+    fn pop(&mut self) -> Option<QueuedUpdate> {
         self.pending.pop_front()
     }
 }
@@ -2698,12 +2742,16 @@ fn spawn_monitor_subscriber(
                                 mon_acl_version_at_subscribe_cell
                                     .store(live_v, std::sync::atomic::Ordering::Release);
                             }
+                            let changed = read_changed_bitset(
+                                &intro_clone,
+                                &mask_clone,
+                                initial.marked.as_deref(),
+                            );
                             let payload = build_monitor_payload(
                                 ioid,
                                 &intro_clone,
                                 &initial.value,
-                                initial.marked.as_deref(),
-                                &mask_clone,
+                                &changed,
                                 order_now(),
                             );
                             if tx_clone.send(payload).await.is_err() {
@@ -2893,7 +2941,10 @@ fn spawn_monitor_subscriber(
                 // Re-evaluate the gate when an ACK refills the window.
                 _ = wait_credit_refill(refill), if !has_credit => {}
                 _ = std::future::ready(()), if executing && has_credit && !pending.is_empty() => {
-                    let mut value = pending.pop().expect("guarded non-empty");
+                    let QueuedUpdate {
+                        update: value,
+                        changed,
+                    } = pending.pop().expect("guarded non-empty");
                     // Subscription boundary (upstream descriptor change): emit
                     // MONITOR FINISH and end — the decoded counterpart of the raw
                     // path's `type_changed` branch.
@@ -2931,7 +2982,6 @@ fn spawn_monitor_subscriber(
                         queue_over_high = false;
                         debug!(pv = %pv_name, "monitor outbound queue drained");
                     }
-                    let marked = value.marked.take();
                     let value = value.value;
                     // Server-side channel filters: skip when the chain drops this
                     // event (no wire frame => no credit consumed).
@@ -2962,14 +3012,9 @@ fn spawn_monitor_subscriber(
                     // pvxs's fully-marked `Value` — the full request mask.
                     // There is no third form: the port does not reconstruct a
                     // marked set by diffing snapshots, which pvxs never does.
-                    let payload = build_monitor_payload(
-                        ioid,
-                        &intro_clone,
-                        &value,
-                        marked.as_deref(),
-                        &mask_clone,
-                        order_now(),
-                    );
+                    // `changed` is that bitset, computed at enqueue.
+                    let payload =
+                        build_monitor_payload(ioid, &intro_clone, &value, &changed, order_now());
                     if tx_clone.send(payload).await.is_err() {
                         return;
                     }
@@ -8737,7 +8782,7 @@ const _: u8 = PVA_VERSION;
 /// * `marked = None` — a wholly-assigned value (pvxs's fully-marked `Value`):
 ///   every leaf the request selected.
 ///
-/// `MonitorQueue::real` gates on this same computation, so an admitted post
+/// `MonitorQueue::push` gates on this same computation, so an admitted post
 /// can never frame an empty changed-bitset.
 fn read_changed_bitset(intro: &FieldDesc, mask: &BitSet, marked: Option<&[String]>) -> BitSet {
     match marked {
@@ -8750,25 +8795,24 @@ fn read_changed_bitset(intro: &FieldDesc, mask: &BitSet, marked: Option<&[String
 }
 
 /// Build a complete MONITOR data frame (header + payload) for a single value
-/// emission. Pulled out so the back-pressure squashing loop can call it.
+/// emission. `changed` is the wire changed-bitset ([`read_changed_bitset`]),
+/// which [`MonitorQueue`] computes once per queued update.
 fn build_monitor_payload(
     ioid: u32,
     intro: &FieldDesc,
     value: &PvField,
-    marked: Option<&[String]>,
-    mask: &BitSet,
+    changed: &BitSet,
     order: ByteOrder,
 ) -> Vec<u8> {
     let mut payload = Vec::new();
     payload.put_u32(ioid, order);
     payload.put_u8(0x00);
     // PVA monitor data: changed bitset + partial value + overrun bitset.
-    let changed = read_changed_bitset(intro, mask, marked);
     changed.write_into(order, &mut payload);
     crate::pvdata::encode::encode_pv_field_with_bitset(
         value,
         intro,
-        &changed,
+        changed,
         0,
         order,
         &mut payload,
@@ -9897,7 +9941,7 @@ mod tests {
         let tags = |q: &MonitorQueue| {
             q.pending
                 .iter()
-                .map(|u| u.value.clone())
+                .map(|u| u.update.value.clone())
                 .collect::<Vec<PvField>>()
         };
         let tag = |t: i32| PvField::Scalar(ScalarValue::Int(t));
@@ -9988,7 +10032,7 @@ mod tests {
              not squash the newest one out of the tail"
         );
         assert!(
-            q.pending[2].type_changed,
+            q.pending[2].update.type_changed,
             "the terminal is the last entry, delivered after every real update"
         );
 
@@ -10164,6 +10208,95 @@ mod tests {
             vec![3],
             "the admitted frame carries exactly the selected leaf"
         );
+    }
+
+    /// [`coalesce_queued_update`] must leave `changed` equal to what the
+    /// enqueue gate computes for the coalesced marked set, on every arm the
+    /// union can take: two declared sets, a declared set against a wholly
+    /// changed side (either order), a mask that excludes part of a marked
+    /// subtree, and a terminal in the tail.
+    #[test]
+    fn coalesce_queued_update_keeps_changed_equal_to_the_gate() {
+        // { value, alarm { severity, status } } — bits: 0 root, 1 value,
+        // 2 alarm, 3 severity, 4 status.
+        let intro = FieldDesc::Structure {
+            struct_id: "epics:nt/NTScalar:1.0".into(),
+            fields: vec![
+                ("value".into(), FieldDesc::Scalar(ScalarType::Int)),
+                (
+                    "alarm".into(),
+                    FieldDesc::Structure {
+                        struct_id: "alarm_t".into(),
+                        fields: vec![
+                            ("severity".into(), FieldDesc::Scalar(ScalarType::Int)),
+                            ("status".into(), FieldDesc::Scalar(ScalarType::Int)),
+                        ],
+                    },
+                ),
+            ],
+        };
+        let upd = |tag: i32, marked: Option<&[&str]>| crate::server_native::MonitorUpdate {
+            value: PvField::Scalar(ScalarValue::Int(tag)),
+            marked: marked.map(|m| m.iter().map(|s| s.to_string()).collect()),
+            type_changed: false,
+            overrun: Vec::new(),
+        };
+        let tail_bits = |q: &MonitorQueue| {
+            q.pending
+                .back()
+                .expect("a tail")
+                .changed
+                .iter()
+                .collect::<Vec<usize>>()
+        };
+        let gate_bits = |q: &MonitorQueue| {
+            let tail = &q.pending.back().expect("a tail").update;
+            read_changed_bitset(&intro, q.mask, tail.marked.as_deref())
+                .iter()
+                .collect::<Vec<usize>>()
+        };
+
+        // limit 1: every push after the first coalesces into the tail.
+        let all = BitSet::all_set(intro.total_bits());
+        let mut q = MonitorQueue::new(1, &intro, &all);
+        assert!(q.push(upd(1, Some(&["value"]))));
+        assert!(q.push(upd(2, Some(&["alarm.status"]))));
+        assert_eq!(tail_bits(&q), vec![1, 4], "two declared sets union");
+        assert_eq!(tail_bits(&q), gate_bits(&q));
+        assert!(q.push(upd(3, None)));
+        assert_eq!(
+            tail_bits(&q),
+            vec![1, 3, 4],
+            "a wholly changed side frames every selected leaf"
+        );
+        assert_eq!(tail_bits(&q), gate_bits(&q));
+
+        let mut q = MonitorQueue::new(1, &intro, &all);
+        assert!(q.push(upd(1, None)));
+        assert!(q.push(upd(2, Some(&["alarm.severity"]))));
+        assert_eq!(tail_bits(&q), vec![1, 3, 4], "same with the sides swapped");
+        assert_eq!(tail_bits(&q), gate_bits(&q));
+
+        // field(value, alarm.severity): the marked `alarm` subtree loses
+        // `status` to the mask, in the union as at the gate.
+        let mut mask = BitSet::new();
+        mask.set(1);
+        mask.set(3);
+        let mut q = MonitorQueue::new(1, &intro, &mask);
+        assert!(q.push(upd(1, Some(&["value"]))));
+        assert!(q.push(upd(2, Some(&["alarm"]))));
+        assert_eq!(tail_bits(&q), vec![1, 3]);
+        assert_eq!(tail_bits(&q), gate_bits(&q));
+
+        // A terminal is appended past the limit and then wins the next
+        // squash; the coalesced entry carries no bits.
+        assert!(q.push(crate::server_native::MonitorUpdate::type_change()));
+        assert_eq!(q.pending.len(), 2);
+        assert!(q.push(upd(4, Some(&["value"]))));
+        assert_eq!(q.pending.len(), 2, "squashed into the terminal tail");
+        let tail = q.pending.back().expect("a tail");
+        assert!(tail.update.type_changed, "the boundary survives the squash");
+        assert!(tail.changed.is_empty());
     }
 
     /// Boundary test for the bounded server-side monitor FIFO
@@ -15618,8 +15751,9 @@ mod tests {
             .push(("value".into(), PvField::Scalar(ScalarValue::Double(42.5))));
 
         let mask = BitSet::all_set(intro.total_bits());
+        let changed = read_changed_bitset(&intro, &mask, None);
         let bytes =
-            build_monitor_payload(ioid, &intro, &PvField::Structure(value), None, &mask, order);
+            build_monitor_payload(ioid, &intro, &PvField::Structure(value), &changed, order);
         let (frame, used) = try_parse_frame(&bytes).unwrap().expect("complete frame");
         assert_eq!(used, bytes.len());
 
@@ -15674,7 +15808,8 @@ mod tests {
         // could carry server-side squash loss. The wire overrun bitset
         // must still be empty (pvxs placeholder).
         let marked = vec!["a".to_string()];
-        let bytes = build_monitor_payload(ioid, &intro, &value, Some(&marked), &mask, order);
+        let changed = read_changed_bitset(&intro, &mask, Some(&marked));
+        let bytes = build_monitor_payload(ioid, &intro, &value, &changed, order);
         let (frame, used) = try_parse_frame(&bytes).unwrap().expect("complete frame");
         assert_eq!(used, bytes.len());
         let data = match decode_op_response(&frame, Some(&intro)).unwrap() {
@@ -15689,7 +15824,8 @@ mod tests {
 
         // The plain full-value builder must likewise emit an empty
         // overrun bitset.
-        let bytes = build_monitor_payload(ioid, &intro, &value, None, &mask, order);
+        let changed = read_changed_bitset(&intro, &mask, None);
+        let bytes = build_monitor_payload(ioid, &intro, &value, &changed, order);
         let (frame, _) = try_parse_frame(&bytes).unwrap().expect("complete frame");
         let data = match decode_op_response(&frame, Some(&intro)).unwrap() {
             OpResponse::Data(d) => d,
@@ -15737,7 +15873,8 @@ mod tests {
         // Marked builder: a self-trigger event on member `a` marks only `a`
         // (bit 1), never `b` (bit 2).
         let marked = vec!["a".to_string()];
-        let narrowed = build_monitor_payload(ioid, &intro, &curr, Some(&marked), &mask, order);
+        let changed = read_changed_bitset(&intro, &mask, Some(&marked));
+        let narrowed = build_monitor_payload(ioid, &intro, &curr, &changed, order);
         let (frame, _) = try_parse_frame(&narrowed).unwrap().expect("complete frame");
         let data = match decode_op_response(&frame, Some(&intro)).unwrap() {
             OpResponse::Data(d) => d,
@@ -15757,7 +15894,8 @@ mod tests {
         // (dataencode.cpp:414-439) sets a wire bit only where
         // `store[bit].valid`, and `Value::mark` (data.cpp:256-270) never
         // validates a parent structure, so a root bit cannot appear.
-        let full = build_monitor_payload(ioid, &intro, &curr, None, &mask, order);
+        let changed = read_changed_bitset(&intro, &mask, None);
+        let full = build_monitor_payload(ioid, &intro, &curr, &changed, order);
         let (full_frame, _) = try_parse_frame(&full).unwrap().expect("complete frame");
         let full_data = match decode_op_response(&full_frame, Some(&intro)).unwrap() {
             OpResponse::Data(d) => d,
@@ -15932,10 +16070,12 @@ mod tests {
         let mut q = MonitorQueue::new(4, &intro, &mask);
         q.seed(seed.clone().into());
         let ev = q.pop().expect("seed queued");
-        assert!(ev.marked.is_none(), "the seed carries no explicit mark set");
+        assert!(
+            ev.update.marked.is_none(),
+            "the seed carries no explicit mark set"
+        );
 
-        let frame =
-            build_monitor_payload(ioid, &intro, &ev.value, ev.marked.as_deref(), &mask, order);
+        let frame = build_monitor_payload(ioid, &intro, &ev.update.value, &ev.changed, order);
         // 8-byte PVA header, then the payload.
         let payload = &frame[8..];
 

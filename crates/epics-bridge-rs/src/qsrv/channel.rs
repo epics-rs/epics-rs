@@ -687,7 +687,7 @@ impl BridgeChannel {
         // record-processing entry that runs record support, OUT
         // links, and FLNK side effects — not a value-only local
         // notification. The Rust analogue is `process_record_with_links`
-        // (INP/OUT/FLNK traversal with cycle/depth tracking), the same
+        // (INP/OUT/FLNK traversal with cycle tracking), the same
         // owner the CA-style passive PUT (`put_record_field_from_ca`)
         // re-enters; the bare `process_record` (process_local + notify)
         // would reply success after only the local record body ran,

@@ -138,7 +138,7 @@ async fn busy_record() -> Fixture {
     .unwrap();
 
     let mut visited = HashSet::new();
-    db.process_record_with_links("ASY", &mut visited, 0)
+    db.process_record_with_links("ASY", &mut visited)
         .await
         .unwrap();
 
@@ -555,9 +555,7 @@ async fn deferred_put_is_replayed_when_the_odly_continuation_releases_pact() {
     .unwrap();
 
     let mut v1 = HashSet::new();
-    db.process_record_with_links("ODL", &mut v1, 0)
-        .await
-        .unwrap();
+    db.process_record_with_links("ODL", &mut v1).await.unwrap();
     let rec = db.get_record("ODL").unwrap();
     assert!(
         rec.read().is_processing(),
@@ -573,7 +571,7 @@ async fn deferred_put_is_replayed_when_the_odly_continuation_releases_pact() {
 
     // The delay expires: the continuation ends the cycle and releases PACT.
     let mut v2 = HashSet::new();
-    db.process_record_continuation("ODL", &mut v2, 0)
+    db.process_record_continuation("ODL", &mut v2)
         .await
         .unwrap();
 
@@ -643,7 +641,7 @@ async fn deferred_put_is_replayed_when_the_sdly_input_continuation_releases_pact
     let db = sdly_input_record().await;
 
     let mut v1 = HashSet::new();
-    db.process_record_with_links("SIMAI", &mut v1, 0)
+    db.process_record_with_links("SIMAI", &mut v1)
         .await
         .unwrap();
     let rec = db.get_record("SIMAI").unwrap();
@@ -660,7 +658,7 @@ async fn deferred_put_is_replayed_when_the_sdly_input_continuation_releases_pact
         .expect("a deferred put-notify hands back a receiver");
 
     let mut v2 = HashSet::new();
-    db.process_record_continuation("SIMAI", &mut v2, 0)
+    db.process_record_continuation("SIMAI", &mut v2)
         .await
         .unwrap();
 
@@ -671,7 +669,7 @@ async fn deferred_put_is_replayed_when_the_sdly_input_continuation_releases_pact
     // The replay's own process re-armed SDLY; its continuation completes the
     // put-notify.
     let mut v3 = HashSet::new();
-    db.process_record_continuation("SIMAI", &mut v3, 0)
+    db.process_record_continuation("SIMAI", &mut v3)
         .await
         .unwrap();
     expect_callback(rx, "the simulated-input continuation").await;
@@ -696,7 +694,7 @@ async fn deferred_put_is_replayed_when_the_sdly_output_continuation_releases_pac
     db.add_record("SIMAO", Box::new(ao)).await.unwrap();
 
     let mut v1 = HashSet::new();
-    db.process_record_with_links("SIMAO", &mut v1, 0)
+    db.process_record_with_links("SIMAO", &mut v1)
         .await
         .unwrap();
     let rec = db.get_record("SIMAO").unwrap();
@@ -713,14 +711,14 @@ async fn deferred_put_is_replayed_when_the_sdly_output_continuation_releases_pac
         .expect("a deferred put-notify hands back a receiver");
 
     let mut v2 = HashSet::new();
-    db.process_record_continuation("SIMAO", &mut v2, 0)
+    db.process_record_continuation("SIMAO", &mut v2)
         .await
         .unwrap();
 
     await_replayed_value(&db, "SIMAO", 7.0).await;
 
     let mut v3 = HashSet::new();
-    db.process_record_continuation("SIMAO", &mut v3, 0)
+    db.process_record_continuation("SIMAO", &mut v3)
         .await
         .unwrap();
     expect_callback(rx, "the simulated-output continuation").await;
@@ -736,7 +734,7 @@ async fn deferred_put_is_replayed_when_the_illegal_simm_continuation_releases_pa
     let db = sdly_input_record().await;
 
     let mut v1 = HashSet::new();
-    db.process_record_with_links("SIMAI", &mut v1, 0)
+    db.process_record_with_links("SIMAI", &mut v1)
         .await
         .unwrap();
     let rec = db.get_record("SIMAI").unwrap();
@@ -758,7 +756,7 @@ async fn deferred_put_is_replayed_when_the_illegal_simm_continuation_releases_pa
     }
 
     let mut v2 = HashSet::new();
-    db.process_record_continuation("SIMAI", &mut v2, 0)
+    db.process_record_continuation("SIMAI", &mut v2)
         .await
         .unwrap();
 
@@ -770,7 +768,7 @@ async fn deferred_put_is_replayed_when_the_illegal_simm_continuation_releases_pa
     // runs on every `!pact` entry), so the record is back in SIMM=YES and
     // re-armed SDLY; its continuation completes the put-notify.
     let mut v3 = HashSet::new();
-    db.process_record_continuation("SIMAI", &mut v3, 0)
+    db.process_record_continuation("SIMAI", &mut v3)
         .await
         .unwrap();
     expect_callback(rx, "the illegal-SIMM continuation").await;

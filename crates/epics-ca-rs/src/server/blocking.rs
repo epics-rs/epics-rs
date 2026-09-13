@@ -274,8 +274,8 @@ const CAS_CLIENT_POOL_CAPACITY: usize = 141;
 ///   async state machine onto this stack — and it is what the class table, not
 ///   the class name, has to cover: 65,912 B proved invariant across payloads
 ///   from 8 B to 1,048,576 B, the `DBR_DOUBLE`/`TIME`/`CTRL` reply shapes,
-///   `subArray`, `compress`, the FLNK recursion at its `MAX_LINK_DEPTH` cap,
-///   and six monitors per connection.
+///   `subArray`, `compress`, a 16-deep inline FLNK chain, and six monitors per
+///   connection.
 ///
 ///   **The class is `Medium`, decided from a measurement on BOTH targets this
 ///   roster serves.** The second one closed the gap that used to hold this at
@@ -289,16 +289,15 @@ const CAS_CLIENT_POOL_CAPACITY: usize = 141;
 ///   | `x86_64-wrs-vxworks` | 65,912 B | 1,048,576 B | 15.9× |
 ///   | `armv7-rtems-eabihf` | 24,432 B | 524,288 B | 21.5× |
 ///
-///   Both numbers are only *bounds* because the FLNK recursion is bounded. The
+///   Both numbers were taken with a 16-deep FLNK chain, and the engine, like
+///   C's `dbProcess`, puts no bound on that depth: `processTarget`
+///   (`dbDbLink.c:427-436`) recurses until a record is already `pact`. The
 ///   armv7 measurement puts one inline FLNK hop at ~1,934 B and the chainless
 ///   floor at 8,960 B, so this high-water rises LINEARLY with the depth of the
-///   user's link graph. `MAX_LINK_DEPTH` is what caps it — and it is now a cap
-///   that announces itself rather than truncating in silence
-///   (`PvDatabase::refuse_bounded_entry`), so it cannot be raised or removed
-///   without the change being visible. **Raising or removing that bound reopens
-///   this stack to the user's DB depth and invalidates both numbers above**;
-///   at ~1,934 B/hop, `Medium` on armv7 covers roughly 266 hops of headroom and
-///   the x86_64 side about half that per byte of pointer width.
+///   user's link graph, exactly as the C stack does. At ~1,934 B/hop, `Medium`
+///   on armv7 covers roughly 266 hops of headroom and the x86_64 side about
+///   half that per byte of pointer width; a DB whose chains approach that is
+///   the DB author's to re-measure, as it is under C.
 ///
 ///   What the class buys: reservation, not usage, is the binding resource on
 ///   VxWorks (a thread costs its declared stack plus ~1 MiB of reserved address

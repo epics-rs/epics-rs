@@ -59,9 +59,7 @@ async fn db_out_link_write_to_a_link_field_is_refused() {
     )
     .await;
     let mut v = HashSet::new();
-    db.process_record_with_links("SRC", &mut v, 0)
-        .await
-        .unwrap();
+    db.process_record_with_links("SRC", &mut v).await.unwrap();
 
     assert_eq!(
         link_text(&db, "TGT.INP"),

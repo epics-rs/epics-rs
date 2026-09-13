@@ -104,7 +104,7 @@ async fn r11_c15_a_limit_driven_invalid_still_substitutes_ivov() {
     db.add_record("AC", Box::new(a)).await.unwrap();
 
     let mut v = HashSet::new();
-    db.process_record_with_links("AC", &mut v, 0).await.unwrap();
+    db.process_record_with_links("AC", &mut v).await.unwrap();
 
     let rec = db.get_record("AC").unwrap();
     let guard = rec.read();
@@ -158,7 +158,7 @@ async fn r11_c15_a_non_outputting_cycle_does_not_substitute_ivov() {
     db.add_record("AC", Box::new(a)).await.unwrap();
 
     let mut v = HashSet::new();
-    db.process_record_with_links("AC", &mut v, 0).await.unwrap();
+    db.process_record_with_links("AC", &mut v).await.unwrap();
 
     assert_eq!(writes.load(Ordering::SeqCst), 0, "OOPT=Never: no OUT write");
     let rec = db.get_record("AC").unwrap();

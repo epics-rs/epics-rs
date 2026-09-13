@@ -74,7 +74,7 @@ async fn a_device_read_defines_the_record() {
     .await;
 
     let mut visited = std::collections::HashSet::new();
-    db.process_record_with_links("TS", &mut visited, 0)
+    db.process_record_with_links("TS", &mut visited)
         .await
         .unwrap();
 

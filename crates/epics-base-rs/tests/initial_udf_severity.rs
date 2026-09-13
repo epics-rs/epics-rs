@@ -89,9 +89,7 @@ async fn ms_inherits_the_initial_udf_severity_from_an_unprocessed_source() {
     .await;
 
     let mut v = HashSet::new();
-    db.process_record_with_links("CON", &mut v, 0)
-        .await
-        .unwrap();
+    db.process_record_with_links("CON", &mut v).await.unwrap();
 
     let rec = db.get_record("CON").unwrap();
     let inst = rec.read();
@@ -225,7 +223,7 @@ async fn the_initial_severity_clears_on_the_first_successful_process() {
     let db = build(r#"record(calc, "C2") { field(INPA, "5") field(CALC, "A+1") }"#).await;
 
     let mut v = HashSet::new();
-    db.process_record_with_links("C2", &mut v, 0).await.unwrap();
+    db.process_record_with_links("C2", &mut v).await.unwrap();
 
     let rec = db.get_record("C2").unwrap();
     let inst = rec.read();

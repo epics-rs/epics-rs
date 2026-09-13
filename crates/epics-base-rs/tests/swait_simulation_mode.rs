@@ -86,7 +86,7 @@ async fn sim_db(siml: &str, simm: i16, sims: i16, siol: &str) -> PvDatabase {
 
 async fn process(db: &PvDatabase) {
     let mut visited = HashSet::new();
-    db.process_record_with_links("W", &mut visited, 0)
+    db.process_record_with_links("W", &mut visited)
         .await
         .unwrap();
 }
@@ -329,7 +329,7 @@ async fn r11_62_busy_simm_yes_redirects_the_output_to_siol() {
     }
 
     let mut visited = HashSet::new();
-    db.process_record_with_links("B", &mut visited, 0)
+    db.process_record_with_links("B", &mut visited)
         .await
         .unwrap();
 
@@ -379,7 +379,7 @@ async fn r11_62_busy_simm_no_drives_the_real_output() {
     }
 
     let mut visited = HashSet::new();
-    db.process_record_with_links("B2", &mut visited, 0)
+    db.process_record_with_links("B2", &mut visited)
         .await
         .unwrap();
 

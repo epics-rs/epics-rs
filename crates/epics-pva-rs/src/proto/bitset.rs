@@ -92,6 +92,16 @@ impl BitSet {
         self.bytes[byte_idx] & (1 << (i % 8)) != 0
     }
 
+    /// Set every bit that is set in `other`.
+    pub fn union_with(&mut self, other: &BitSet) {
+        if self.bytes.len() < other.bytes.len() {
+            self.bytes.resize(other.bytes.len(), 0);
+        }
+        for (dst, src) in self.bytes.iter_mut().zip(&other.bytes) {
+            *dst |= *src;
+        }
+    }
+
     /// True iff no bits are set.
     pub fn is_empty(&self) -> bool {
         self.bytes.iter().all(|&b| b == 0)

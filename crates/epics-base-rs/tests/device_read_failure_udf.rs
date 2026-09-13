@@ -156,7 +156,7 @@ const RAW: i32 = 7;
 
 async fn process(db: &Arc<PvDatabase>) {
     let mut visited = HashSet::new();
-    db.process_record_with_links(REC, &mut visited, 0)
+    db.process_record_with_links(REC, &mut visited)
         .await
         .unwrap();
 }

@@ -31,7 +31,7 @@ use crate::pvdata::{FieldDesc, PvField, RpcReply};
 
 use super::channel::{Channel, ConnectionPool};
 use super::ops_v2::{
-    MonitorConnEvent, MonitorEvent, MonitorEventMask, RpcArg, SubscriptionHandle, op_get,
+    MonitorConnEvent, MonitorEvent, MonitorEventMask, PutOp, RpcArg, SubscriptionHandle, op_get,
     op_get_get, op_get_put, op_monitor, op_monitor_events, op_monitor_handle,
     op_monitor_raw_frames_handle, op_monitor_raw_frames_handle_with_request, op_process,
     op_process_with_request, op_process_with_request_value, op_put, op_put_get, op_rpc,
@@ -1384,19 +1384,34 @@ impl PvaClient {
     /// subfields.
     pub async fn pvput_build<F>(&self, pv_name: &str, build: F) -> PvaResult<()>
     where
-        F: FnOnce(&mut crate::pvdata::PvField) -> Result<(), String>,
+        F: Fn(&mut crate::pvdata::PvField) -> Result<(), String>,
     {
         let ch = self.channel(pv_name).await?;
-        // Fetch only `.value` so the closure sees exactly what the
-        // subsequent op_put_value will round-trip — alarm/timeStamp/
-        // etc. are out of scope and would be silently dropped at PUT
-        // time if the closure touched them.
-        let (_intro, mut value) =
-            crate::client_native::ops_v2::op_get(&ch, &["value"], self.inner.timeout).await?;
-        if let Err(msg) = build(&mut value) {
-            return Err(crate::error::PvaError::InvalidValue(msg));
-        }
-        crate::client_native::ops_v2::op_put_value(&ch, &value, self.inner.timeout).await
+        // The readback rides the put's own op (`GetOPut`), under the same
+        // `field(value)` request the DATA phase writes through, so the
+        // closure sees exactly what round-trips. `build` is `Fn` because a
+        // put lost to a reconnect is rebuilt against the new channel's
+        // prototype and readback (pvxs `GPROp::disconnected`).
+        crate::client_native::ops_v2::op_put_inner_build(
+            &ch,
+            None,
+            self.inner.timeout,
+            |_| true,
+            |intro, previous| {
+                let mut value = match previous {
+                    Some(p) => p.clone(),
+                    None => crate::pvdata::encode::default_value_for(intro),
+                };
+                build(&mut value).map_err(crate::error::PvaError::InvalidValue)?;
+                let mut changed = crate::proto::BitSet::new();
+                match intro.bit_for_path("value") {
+                    Some(bit) => changed.set(bit),
+                    None => changed.set(0),
+                }
+                Ok((value, changed))
+            },
+        )
+        .await
     }
 
     /// PUT a single dotted-path field of the channel's structure.
@@ -1589,6 +1604,24 @@ impl PvaClient {
             self.inner.timeout,
         )
         .await
+    }
+
+    /// Open a two-phase PUT: INIT (with `request`, or every field when
+    /// `None`) and, when `fetch_present`, the current value read on the
+    /// put's own op (`GetOPut`). The returned [`PutOp`] carries the
+    /// server's type and that value; the caller builds the delta and
+    /// [`PutOp::commit`]s it, or drops the op to destroy it. pvxs
+    /// `PutBuilder::fetchPresent` + `build` parity for a caller whose
+    /// builder cannot run inside the library.
+    pub async fn pvput_begin(
+        &self,
+        pv_name: &str,
+        request: Option<&crate::pv_request::PvRequestExpr>,
+        fetch_present: bool,
+    ) -> PvaResult<PutOp> {
+        let ch = self.channel(pv_name).await?;
+        crate::client_native::ops_v2::op_put_begin(&ch, request, fetch_present, self.inner.timeout)
+            .await
     }
 
     /// PUT a pre-built [`PvField`] with a custom pvRequest. Like

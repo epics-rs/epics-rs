@@ -76,7 +76,7 @@ async fn seed_and_process(db: &epics_base_rs::server::database::PvDatabase, rec:
         .await
         .unwrap();
     let mut visited = HashSet::new();
-    db.process_record_with_links(rec, &mut visited, 0)
+    db.process_record_with_links(rec, &mut visited)
         .await
         .unwrap();
 }

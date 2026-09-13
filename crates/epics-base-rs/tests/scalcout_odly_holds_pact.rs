@@ -48,9 +48,7 @@ async fn scalcout_odly_holds_pact_foreign_process_does_not_fire_early() {
 
     // Delaying cycle: ODLY>0 defers, sets DLYA=1, OUT not written.
     let mut v1 = HashSet::new();
-    db.process_record_with_links("SC", &mut v1, 0)
-        .await
-        .unwrap();
+    db.process_record_with_links("SC", &mut v1).await.unwrap();
     assert_eq!(
         db.get_record("SC").unwrap().read().record.get_field("DLYA"),
         Some(EpicsValue::Short(1)),
@@ -66,9 +64,7 @@ async fn scalcout_odly_holds_pact_foreign_process_does_not_fire_early() {
     // the PACT entry guard, NOT re-enter process() while dlya==1 and fire the
     // deferred OUT early.
     let mut v2 = HashSet::new();
-    db.process_record_with_links("SC", &mut v2, 0)
-        .await
-        .unwrap();
+    db.process_record_with_links("SC", &mut v2).await.unwrap();
     assert_eq!(
         db.get_pv("TGT").unwrap().to_f64(),
         Some(0.0),
@@ -78,9 +74,7 @@ async fn scalcout_odly_holds_pact_foreign_process_does_not_fire_early() {
 
     // Continuation (bypasses the PACT guard): fires the deferred output once.
     let mut v3 = HashSet::new();
-    db.process_record_continuation("SC", &mut v3, 0)
-        .await
-        .unwrap();
+    db.process_record_continuation("SC", &mut v3).await.unwrap();
     assert_eq!(
         db.get_pv("TGT").unwrap().to_f64(),
         Some(42.0),

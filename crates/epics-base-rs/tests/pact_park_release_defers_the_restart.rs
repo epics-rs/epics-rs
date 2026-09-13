@@ -114,7 +114,7 @@ async fn settle_until(db: &Db, rec: &str, want: f64) -> f64 {
 /// Drive one process cycle, the way anything else in the IOC would.
 async fn process(db: &Db, rec: &str) {
     let mut visited = HashSet::new();
-    let _ = db.process_record_with_links(rec, &mut visited, 0).await;
+    let _ = db.process_record_with_links(rec, &mut visited).await;
 }
 
 /// The bare `dbPutField` release. It stores SNAM, clears PACT and RPRO

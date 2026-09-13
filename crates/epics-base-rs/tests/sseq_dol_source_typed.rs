@@ -37,7 +37,7 @@ use epics_base_rs::types::{DbFieldType, EpicsValue};
 /// means the read is done).
 async fn run_step(db: &PvDatabase, sseq: &str, dst: &str, label: &str) {
     let mut visited = HashSet::new();
-    db.process_record_with_links(sseq, &mut visited, 0)
+    db.process_record_with_links(sseq, &mut visited)
         .await
         .unwrap();
     for _ in 0..400 {
@@ -355,7 +355,7 @@ async fn rejected_link_store_raises_link_invalid() {
         .unwrap();
 
     let mut visited = HashSet::new();
-    db.process_record_with_links("SS_REJECT", &mut visited, 0)
+    db.process_record_with_links("SS_REJECT", &mut visited)
         .await
         .unwrap();
 

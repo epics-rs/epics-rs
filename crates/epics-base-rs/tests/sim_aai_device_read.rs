@@ -54,9 +54,7 @@ async fn sim_aai_reads_siol_array_into_val_and_raises_simm_alarm() {
     db.add_record("AAIIN", Box::new(aai)).await.unwrap();
 
     let mut v = HashSet::new();
-    db.process_record_with_links("AAIIN", &mut v, 0)
-        .await
-        .unwrap();
+    db.process_record_with_links("AAIIN", &mut v).await.unwrap();
 
     // 1. VAL read inward from SIOL (the soft device reads SIOL when SIMM=YES).
     let val = db.get_pv("AAIIN").unwrap();

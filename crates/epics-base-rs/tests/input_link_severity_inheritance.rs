@@ -49,7 +49,7 @@ async fn build(db_text: &str) -> std::sync::Arc<PvDatabase> {
 
 async fn process(db: &PvDatabase, rec: &str) {
     let mut v = HashSet::new();
-    db.process_record_with_links(rec, &mut v, 0).await.unwrap();
+    db.process_record_with_links(rec, &mut v).await.unwrap();
 }
 
 async fn alarm(db: &PvDatabase, rec: &str) -> (u16, AlarmSeverity) {

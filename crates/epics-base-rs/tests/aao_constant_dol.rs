@@ -115,7 +115,7 @@ async fn loaded_constant_writes_out_and_is_not_re_fetched() {
     let db = build().await;
 
     let mut visited = HashSet::new();
-    db.process_record_with_links("CL:ARRAY", &mut visited, 0)
+    db.process_record_with_links("CL:ARRAY", &mut visited)
         .await
         .unwrap();
     assert_eq!(
@@ -128,7 +128,7 @@ async fn loaded_constant_writes_out_and_is_not_re_fetched() {
         .await
         .unwrap();
     let mut visited = HashSet::new();
-    db.process_record_with_links("CL:ARRAY", &mut visited, 0)
+    db.process_record_with_links("CL:ARRAY", &mut visited)
         .await
         .unwrap();
     assert_eq!(

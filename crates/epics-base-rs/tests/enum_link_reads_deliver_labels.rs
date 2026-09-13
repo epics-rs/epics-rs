@@ -36,7 +36,7 @@ async fn build(db_text: &str) -> Arc<PvDatabase> {
 
 async fn process(db: &PvDatabase, rec: &str) {
     let mut v = HashSet::new();
-    db.process_record_with_links(rec, &mut v, 0).await.unwrap();
+    db.process_record_with_links(rec, &mut v).await.unwrap();
 }
 
 fn field(db: &PvDatabase, rec: &str, field: &str) -> EpicsValue {

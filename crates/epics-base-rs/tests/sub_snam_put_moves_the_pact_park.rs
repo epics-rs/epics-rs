@@ -92,7 +92,7 @@ fn val(db: &epics_base_rs::server::database::PvDatabase, rec: &str) -> f64 {
 
 async fn proc(db: &epics_base_rs::server::database::PvDatabase, rec: &str) {
     let mut visited = HashSet::new();
-    let _ = db.process_record_with_links(rec, &mut visited, 0).await;
+    let _ = db.process_record_with_links(rec, &mut visited).await;
 }
 
 /// Plain `caput REC.SNAM <name>` — the external put boundary, which is where C

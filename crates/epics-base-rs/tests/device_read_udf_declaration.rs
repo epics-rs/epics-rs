@@ -98,7 +98,7 @@ async fn read_once(record_type: &str, sourced: EpicsValue, step: Step) -> (u8, A
     );
     let mut visited = HashSet::new();
     database
-        .process_record_with_links(REC, &mut visited, 0)
+        .process_record_with_links(REC, &mut visited)
         .await
         .unwrap();
     let rec = database.get_record(REC).unwrap();

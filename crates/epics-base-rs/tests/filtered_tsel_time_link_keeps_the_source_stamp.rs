@@ -37,7 +37,7 @@ record(ai, "TSELF_JSON")  { field(DTYP, "Soft Channel") field(TSEL, "TSELF_SRC.T
 
 async fn proc(db: &Db, rec: &str) {
     let mut visited = HashSet::new();
-    db.process_record_with_links(rec, &mut visited, 0)
+    db.process_record_with_links(rec, &mut visited)
         .await
         .unwrap();
 }

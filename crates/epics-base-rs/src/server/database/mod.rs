@@ -4249,7 +4249,7 @@ mod tests {
         // the canonical name on the way IN: seed the set with "TARGET" and the
         // entry must find itself already on the stack and decline.
         let mut visited = std::collections::HashSet::new();
-        db.process_record_with_links("ALIAS", &mut visited, 0)
+        db.process_record_with_links("ALIAS", &mut visited)
             .await
             .unwrap();
         assert!(
@@ -4259,7 +4259,7 @@ mod tests {
 
         let mut seeded = std::collections::HashSet::new();
         seeded.insert("TARGET".to_string());
-        db.process_record_with_links("ALIAS", &mut seeded, 0)
+        db.process_record_with_links("ALIAS", &mut seeded)
             .await
             .unwrap();
         assert!(

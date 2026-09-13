@@ -35,7 +35,7 @@ use epics_base_rs::types::EpicsValue;
 
 async fn process(db: &PvDatabase, rec: &str) {
     let mut visited = HashSet::new();
-    db.process_record_with_links(rec, &mut visited, 0)
+    db.process_record_with_links(rec, &mut visited)
         .await
         .unwrap();
 }

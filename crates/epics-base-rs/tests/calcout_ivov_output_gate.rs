@@ -34,7 +34,7 @@ async fn calcout_ivov_not_applied_on_non_output_cycle() {
     db.add_record("CO_NOOUT", Box::new(co)).await.unwrap();
 
     let mut visited = HashSet::new();
-    db.process_record_with_links("CO_NOOUT", &mut visited, 0)
+    db.process_record_with_links("CO_NOOUT", &mut visited)
         .await
         .unwrap();
 
@@ -78,7 +78,7 @@ async fn calcout_ivov_applied_on_output_cycle() {
     db.add_record("CO_OUT", Box::new(co)).await.unwrap();
 
     let mut visited = HashSet::new();
-    db.process_record_with_links("CO_OUT", &mut visited, 0)
+    db.process_record_with_links("CO_OUT", &mut visited)
         .await
         .unwrap();
 

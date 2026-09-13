@@ -178,7 +178,7 @@ async fn an_unresolved_snam_leaves_the_sub_record_undefined() {
     db.add_record("S1", rec).await.unwrap();
 
     let mut visited = std::collections::HashSet::new();
-    db.process_record_with_links("S1", &mut visited, 0)
+    db.process_record_with_links("S1", &mut visited)
         .await
         .unwrap();
 

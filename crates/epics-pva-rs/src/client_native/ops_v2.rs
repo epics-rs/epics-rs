@@ -1875,7 +1875,7 @@ async fn op_put_inner(
 /// back to the no-snapshot path. A transport failure (send / timeout /
 /// malformed reply) fails the op instead, because the snapshot shares the
 /// op's frame stream and a late reply would desync the exec await.
-async fn op_put_inner_build<FB, WP>(
+pub(crate) async fn op_put_inner_build<FB, WP>(
     channel: &Arc<Channel>,
     raw_pv_req: Option<&[u8]>,
     op_timeout: Duration,
@@ -2017,6 +2017,212 @@ where
     let _ = server.send_for_channel(sid, destroy).await;
     server.unregister_ioid(ioid);
     result
+}
+
+// ── Two-phase PUT ──────────────────────────────────────────────────────
+
+/// A PUT held open between its INIT (plus the optional `GetOPut` readback)
+/// and its DATA phase, for a caller that builds the value outside the
+/// library — a binding assigning fields under its own interpreter lock —
+/// and still wants the readback on the put's own op rather than a
+/// separate GET. This is pvxs's two-phase application API
+/// (`PutBuilder::fetchPresent` + `build`, client.h), and it keeps pvxs's
+/// rule for it: [`op_put_begin`] is re-queued on a lost circuit like every
+/// other op, [`PutOp::commit`] is not (`clientget.cpp:380-404`,
+/// `state==Exec && !autoExec`) — a circuit lost between the phases answers
+/// [`PvaError::Disconnected`] and the caller decides whether to begin again.
+///
+/// Dropping an uncommitted `PutOp` sends DESTROY_REQUEST and releases the
+/// ioid through its `IoidGuard`.
+pub struct PutOp {
+    server: Arc<super::server_conn::ServerConn>,
+    sid: u32,
+    ioid: u32,
+    stream: mpsc::UnboundedReceiver<super::decode::Frame>,
+    ioid_guard: IoidGuard,
+    codec: PvaCodec,
+    order: ByteOrder,
+    intro: Arc<FieldDesc>,
+    present: Option<(PvField, BitSet)>,
+    op_timeout: Duration,
+}
+
+impl std::fmt::Debug for PutOp {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PutOp")
+            .field("sid", &self.sid)
+            .field("ioid", &self.ioid)
+            .field("present", &self.present.is_some())
+            .finish()
+    }
+}
+
+/// Open a PUT: INIT with `request` (`None` selects every field, as pvxs
+/// `Put` with no pvRequest does — the DATA frame's changed bitset says what
+/// is written), and when `fetch_present` the `GetOPut` readback on the same
+/// ioid (`subcmd=0x40`, pvxs `clientget.cpp:299-300`). A readback the
+/// server answers with an error status is best-effort: the op stays open
+/// with no present value, exactly as the one-call builder treats it.
+pub async fn op_put_begin(
+    channel: &Arc<Channel>,
+    request: Option<&crate::pv_request::PvRequestExpr>,
+    fetch_present: bool,
+    op_timeout: Duration,
+) -> PvaResult<PutOp> {
+    requeue_on_disconnect(channel, op_timeout, |budget| {
+        op_put_begin_attempt(channel, request, fetch_present, budget)
+    })
+    .await
+}
+
+/// One attempt of [`op_put_begin`]; [`requeue_on_disconnect`] runs it again
+/// from the top when the channel is lost mid-INIT or mid-readback.
+async fn op_put_begin_attempt(
+    channel: &Arc<Channel>,
+    request: Option<&crate::pv_request::PvRequestExpr>,
+    fetch_present: bool,
+    op_timeout: Duration,
+) -> PvaResult<PutOp> {
+    let (server, sid) = ensure_active_with_op_timeout(channel, op_timeout).await?;
+    let order = server.byte_order();
+    let big_endian = matches!(order, ByteOrder::Big);
+    let codec = PvaCodec { big_endian };
+    let ioid = alloc_ioid();
+
+    // Encoded per attempt: a reconnect may land on a server of the other
+    // byte order.
+    let pv_req = match request {
+        Some(req) => req.encode(big_endian),
+        None => sentinel_all_fields().to_vec(),
+    };
+    let mut stream = server.register_ioid_stream(sid, ioid, Command::Put.code());
+    let mut ioid_guard = IoidGuard::new(server.clone(), ioid);
+
+    let init_req = codec.build_put_init(sid, ioid, &pv_req);
+    server.send_for_channel(sid, init_req).await?;
+    let init_frame = await_frame(&mut stream, op_timeout).await?;
+    let init = match decode_op_or_reset(&server, &init_frame, None)? {
+        OpResponse::Init(i) => i,
+        other => {
+            // Wrong response kind for this op step == impossible op state.
+            // pvxs `M.fault()`s and `bev.reset()`s (clientget.cpp:456-493).
+            server.close();
+            return Err(PvaError::Protocol(format!(
+                "expected PUT INIT, got {other:?}"
+            )));
+        }
+    };
+    if !init.status.is_success() {
+        return Err(PvaError::RemoteError(init.status));
+    }
+    ioid_guard.arm_destroy(sid);
+    let intro = Arc::new(init.introspection);
+
+    let present = if fetch_present {
+        let get_oput = codec.build_put_get(sid, ioid);
+        server.send_for_channel(sid, get_oput).await?;
+        let snap_frame = await_frame(&mut stream, op_timeout).await?;
+        match decode_op_or_reset(&server, &snap_frame, Some(&intro))? {
+            OpResponse::Data(d) if d.status.is_success() => Some((d.value, d.changed)),
+            _ => None,
+        }
+    } else {
+        None
+    };
+
+    Ok(PutOp {
+        server,
+        sid,
+        ioid,
+        stream,
+        ioid_guard,
+        codec,
+        order,
+        intro,
+        present,
+        op_timeout,
+    })
+}
+
+impl PutOp {
+    /// The server's PUT-side introspection (the INIT reply).
+    pub fn introspection(&self) -> &Arc<FieldDesc> {
+        &self.intro
+    }
+
+    /// The readback: the current value and the leaves the server marked in
+    /// it. `None` when the op was begun without `fetch_present`, when the
+    /// server refused the readback, or once taken.
+    pub fn take_present(&mut self) -> Option<(PvField, BitSet)> {
+        self.present.take()
+    }
+
+    /// DATA phase: send `value` as the delta `changed` selects, await the
+    /// completion status, and destroy the op.
+    pub async fn commit(self, value: &PvField, changed: &BitSet) -> PvaResult<()> {
+        let PutOp {
+            server,
+            sid,
+            ioid,
+            mut stream,
+            mut ioid_guard,
+            codec,
+            order,
+            intro,
+            op_timeout,
+            ..
+        } = self;
+
+        let mut payload = Vec::new();
+        payload.put_u32(sid, order);
+        payload.put_u32(ioid, order);
+        payload.put_u8(0x00);
+        changed.write_into(order, &mut payload);
+        // pvxs `from_wire_valid` (serverget.cpp:451) decodes a BitSet delta —
+        // only the fields whose bit is set. Encode consistently.
+        encode_pv_field_with_bitset(value, &intro, changed, 0, order, &mut payload);
+        let header =
+            PvaHeader::application(false, order, Command::Put.code(), payload.len() as u32);
+        let mut frame = Vec::new();
+        header.write_into(&mut frame);
+        frame.extend_from_slice(&payload);
+        // A `?` here drops `ioid_guard`, which sends DESTROY and releases
+        // the ioid — the same finalizer every abandoned op reaches.
+        server.send_for_channel(sid, frame).await?;
+
+        let done_frame = await_frame(&mut stream, op_timeout).await?;
+        let result = match decode_op_or_reset(&server, &done_frame, Some(&intro))? {
+            OpResponse::Status(s) => {
+                if s.status.is_success() {
+                    Ok(())
+                } else {
+                    Err(PvaError::RemoteError(s.status))
+                }
+            }
+            other => {
+                // Wrong response kind for the PUT completion step == impossible
+                // op state → connection-fatal (pvxs clientget.cpp:456-493).
+                server.close();
+                Err(PvaError::Protocol(format!(
+                    "expected PUT done, got {other:?}"
+                )))
+            }
+        };
+
+        ioid_guard.disarm();
+        let destroy = codec.build_destroy_request(sid, ioid);
+        let _ = server.send_for_channel(sid, destroy).await;
+        server.unregister_ioid(ioid);
+        result
+    }
+
+    /// [`Self::commit`] of a delta built from dotted-path assignments against
+    /// the prototype — the same single owner (`build_field_delta`) the
+    /// one-call multi-field PUTs use, so both produce identical wire deltas.
+    pub async fn commit_fields_typed(self, assignments: &[(String, PutLeaf)]) -> PvaResult<()> {
+        let (value, changed) = build_field_delta(&self.intro, assignments)?;
+        self.commit(&value, &changed).await
+    }
 }
 
 // ── MONITOR (with reconnect) ───────────────────────────────────────────

@@ -131,7 +131,7 @@ async fn a_parked_notify_replays_when_the_release_arrives_by_alias() {
     // one — by ALIAS, which is the entry under test.
     let mut visited = std::collections::HashSet::new();
     let _ = db
-        .process_record_with_links("PARKED:NICK", &mut visited, 0)
+        .process_record_with_links("PARKED:NICK", &mut visited)
         .await;
 
     // `bump` runs twice: once for the cycle just driven, and once more for the

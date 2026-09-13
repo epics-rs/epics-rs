@@ -844,9 +844,9 @@ dependencies = [
 
 [[package]]
 name = "der"
-version = "0.8.0"
+version = "0.8.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "71fd89660b2dc699704064e59e9dba0147b903e85319429e131620d022be411b"
+checksum = "a878c850e9e421b20262e9b41f9c860e4785fa07541c266b62ff9d1ef998a80a"
 dependencies = [
  "const-oid 0.10.2",
  "der_derive",
@@ -1179,7 +1179,7 @@ dependencies = [
  "chrono",
  "clap",
  "dashmap",
- "der 0.8.0",
+ "der 0.8.2",
  "epics-base-rs",
  "epics-macros-rs",
  "futures-util",
@@ -2782,7 +2782,7 @@ checksum = "279a91971a1d8eb1260a30938eae3be9cb67b472dffecb222fbbbe2fd2dc1453"
 dependencies = [
  "aes",
  "cbc 0.2.0",
- "der 0.8.0",
+ "der 0.8.2",
  "pbkdf2",
  "scrypt",
  "sha2 0.11.0",
@@ -3857,7 +3857,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1d9efca8738c78ee9484207732f728b1ef517bbb1833d6fc0879ca898a522f6f"
 dependencies = [
  "base64ct",
- "der 0.8.0",
+ "der 0.8.2",
 ]
 
 [[package]]

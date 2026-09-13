@@ -456,7 +456,7 @@ impl PvaLinkResolver {
         if scan_target_should_process(&db_handle, record, passive_only) {
             let mut visited = std::collections::HashSet::new();
             let _ = db_handle
-                .process_record_with_links(record, &mut visited, 0)
+                .process_record_with_links(record, &mut visited)
                 .await;
         }
     }
@@ -1159,8 +1159,8 @@ async fn scan_once(
             // out via INP/OUT/FLNK — a pvalink feeding a calc record
             // must propagate to the calc's FLNK chain. Bare
             // `process_record` runs only `process_local` and would
-            // drop the chain. Fresh `visited` set + depth 0: this is
-            // the foreign-caller entry, like the scan loop and FLNK
+            // drop the chain. A fresh `visited` set: this is the
+            // foreign-caller entry, like the scan loop and FLNK
             // dispatch.
             //
             // An atomic target runs while the epoch (`lock_records` over
@@ -1171,7 +1171,7 @@ async fn scan_once(
             // gate-acquiring `process_record_with_links` would dead-lock
             // the epoch against itself.
             let mut visited = std::collections::HashSet::new();
-            let _ = db_handle.process_record_with_links_already_locked(record, &mut visited, 0);
+            let _ = db_handle.process_record_with_links_already_locked(record, &mut visited);
         }
     }
 
@@ -1188,7 +1188,7 @@ async fn scan_once(
         }
         let mut visited = std::collections::HashSet::new();
         let _ = db_handle
-            .process_record_with_links(record, &mut visited, 0)
+            .process_record_with_links(record, &mut visited)
             .await;
     }
 }

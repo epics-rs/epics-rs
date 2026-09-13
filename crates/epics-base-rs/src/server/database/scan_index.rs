@@ -264,7 +264,7 @@ impl PvDatabase {
         let mut cursor = self.scan_cursor(list);
         while let Some(name) = cursor.next(self) {
             let mut visited = std::collections::HashSet::new();
-            let _ = self.process_record_with_links(&name, &mut visited, 0).await;
+            let _ = self.process_record_with_links(&name, &mut visited).await;
         }
     }
 
@@ -371,7 +371,7 @@ impl PvDatabase {
                 }
                 if phas == this {
                     let mut visited = std::collections::HashSet::new();
-                    let _ = self.process_record_with_links(&name, &mut visited, 0).await;
+                    let _ = self.process_record_with_links(&name, &mut visited).await;
                 } else if phas > this && phas < next {
                     next = phas;
                 }
@@ -442,7 +442,7 @@ impl PvDatabase {
                 continue;
             }
             let mut visited = std::collections::HashSet::new();
-            let _ = self.process_record_with_links(&name, &mut visited, 0).await;
+            let _ = self.process_record_with_links(&name, &mut visited).await;
         }
     }
 }

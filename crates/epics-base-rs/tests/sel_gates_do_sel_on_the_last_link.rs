@@ -114,7 +114,7 @@ async fn seed_and_process(db: &PvDatabase, rec: &str, seed: f64) -> f64 {
         .put_field_internal("VAL", EpicsValue::Double(seed))
         .unwrap();
     let mut visited = HashSet::new();
-    db.process_record_with_links(rec, &mut visited, 0)
+    db.process_record_with_links(rec, &mut visited)
         .await
         .unwrap();
     db.get_record(rec)

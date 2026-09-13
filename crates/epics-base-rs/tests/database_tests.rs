@@ -1,4 +1,4 @@
-// RTEMS-EXEC-MODEL-ALLOW(4): three multi-thread-flavored tokio tests plus one hand-built runtime; run and pass in the exec-backend suite.
+// RTEMS-EXEC-MODEL-ALLOW(3): three multi-thread-flavored tokio tests; run and pass in the exec-backend suite.
 #![allow(unused_imports, clippy::all)]
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -46,7 +46,7 @@ async fn test_write_notify_follows_flnk() {
     }
 
     let mut visited = HashSet::new();
-    db.process_record_with_links("REC_A", &mut visited, 0)
+    db.process_record_with_links("REC_A", &mut visited)
         .await
         .unwrap();
     assert_eq!(db.get_pv("REC_A").unwrap().to_f64(), Some(1.0));
@@ -70,7 +70,7 @@ async fn test_inp_link_processing() {
     }
 
     let mut visited = HashSet::new();
-    db.process_record_with_links("DEST", &mut visited, 0)
+    db.process_record_with_links("DEST", &mut visited)
         .await
         .unwrap();
 
@@ -107,7 +107,7 @@ async fn test_soft_inp_read_failure_sets_link_alarm() {
     }
 
     let mut visited = HashSet::new();
-    db.process_record_with_links("BROKEN", &mut visited, 0)
+    db.process_record_with_links("BROKEN", &mut visited)
         .await
         .unwrap();
 
@@ -170,7 +170,7 @@ async fn test_single_inp_ms_propagates_link_alarm_no_msg() {
     }
 
     let mut visited = HashSet::new();
-    db.process_record_with_links("DST", &mut visited, 0)
+    db.process_record_with_links("DST", &mut visited)
         .await
         .unwrap();
 
@@ -222,7 +222,7 @@ async fn test_single_inp_mss_propagates_stat_and_amsg() {
     }
 
     let mut visited = HashSet::new();
-    db.process_record_with_links("DST", &mut visited, 0)
+    db.process_record_with_links("DST", &mut visited)
         .await
         .unwrap();
 
@@ -283,7 +283,7 @@ async fn test_out_link_ms_propagates_link_alarm_to_dest() {
     }
 
     let mut visited = HashSet::new();
-    db.process_record_with_links("SRC", &mut visited, 0)
+    db.process_record_with_links("SRC", &mut visited)
         .await
         .unwrap();
 
@@ -340,7 +340,7 @@ async fn test_out_link_nms_does_not_propagate_alarm_to_dest() {
     }
 
     let mut visited = HashSet::new();
-    db.process_record_with_links("SRC", &mut visited, 0)
+    db.process_record_with_links("SRC", &mut visited)
         .await
         .unwrap();
 
@@ -399,7 +399,7 @@ async fn test_pva_link_propagates_alarm_severity_into_link_alarm() {
     }
 
     let mut visited = HashSet::new();
-    db.process_record_with_links("PVADST", &mut visited, 0)
+    db.process_record_with_links("PVADST", &mut visited)
         .await
         .unwrap();
 
@@ -460,7 +460,7 @@ async fn test_pva_link_no_alarm_when_lset_reports_none() {
     }
 
     let mut visited = HashSet::new();
-    db.process_record_with_links("PVAQUIET", &mut visited, 0)
+    db.process_record_with_links("PVAQUIET", &mut visited)
         .await
         .unwrap();
 
@@ -561,7 +561,7 @@ async fn test_pva_out_link_writes_value_through_link_set() {
     }
 
     let mut visited = HashSet::new();
-    db.process_record_with_links("AO_PVAOUT", &mut visited, 0)
+    db.process_record_with_links("AO_PVAOUT", &mut visited)
         .await
         .unwrap();
     // Staged on the link-put queue and returned, as C `dbCaPutLink` does
@@ -615,7 +615,7 @@ async fn test_pva_out_link_no_link_set_fails_gracefully() {
 
     let mut visited = HashSet::new();
     // Must not panic; process completes cleanly.
-    db.process_record_with_links("AO_NOLSET", &mut visited, 0)
+    db.process_record_with_links("AO_NOLSET", &mut visited)
         .await
         .expect("process must complete despite the unresolvable OUT link");
 
@@ -674,7 +674,7 @@ async fn test_pva_out_link_put_notify_chain_uses_async_op() {
     }
 
     let mut visited = HashSet::new();
-    db.process_record_with_links("AO_PVAOUT_NOTIFY", &mut visited, 0)
+    db.process_record_with_links("AO_PVAOUT_NOTIFY", &mut visited)
         .await
         .unwrap();
     // The completion flavour stages and returns like the plain one (C
@@ -745,7 +745,7 @@ async fn test_mss_propagates_amsg_only_change_posts_amsg_event() {
 
     // Cycle 1: drives sevr 0→Major, amsg ""→"msg1" (alarm_changed=true).
     let mut visited = HashSet::new();
-    db.process_record_with_links("DST_AMSG", &mut visited, 0)
+    db.process_record_with_links("DST_AMSG", &mut visited)
         .await
         .unwrap();
 
@@ -767,7 +767,7 @@ async fn test_mss_propagates_amsg_only_change_posts_amsg_event() {
     // Cycle 2: dest picks up msg2. sevr stays Major (alarm_changed=false),
     // amsg "msg1"→"msg2" (amsg_changed=true). AMSG event must flow.
     let mut visited = HashSet::new();
-    db.process_record_with_links("DST_AMSG", &mut visited, 0)
+    db.process_record_with_links("DST_AMSG", &mut visited)
         .await
         .unwrap();
 
@@ -842,7 +842,7 @@ async fn test_record_posts_carry_per_event_dbe_mask() {
 
     // Cycle 1: value 0→7 (MDEL/ADEL fire) and sevr 0→Major in one pass.
     let mut visited = HashSet::new();
-    db.process_record_with_links("DST_MASK", &mut visited, 0)
+    db.process_record_with_links("DST_MASK", &mut visited)
         .await
         .unwrap();
 
@@ -870,7 +870,7 @@ async fn test_record_posts_carry_per_event_dbe_mask() {
     }
     // Cycle 2: value unchanged (deadband silent), amsg-only alarm update.
     let mut visited = HashSet::new();
-    db.process_record_with_links("DST_MASK", &mut visited, 0)
+    db.process_record_with_links("DST_MASK", &mut visited)
         .await
         .unwrap();
 
@@ -955,7 +955,7 @@ async fn test_process_cycle_posts_no_udf_event() {
         inst.common.udf = 1;
     }
     let mut visited = HashSet::new();
-    db.process_record_with_links("UDF_REC", &mut visited, 0)
+    db.process_record_with_links("UDF_REC", &mut visited)
         .await
         .unwrap();
     assert!(
@@ -1167,7 +1167,7 @@ async fn test_putf_stays_off_for_cp_chained_targets() {
     // Drive SRC's process directly. The CP dispatch enumerates TGT
     // and would (pre-fix) set TGT.common.putf=true before processing.
     let mut visited = HashSet::new();
-    db.process_record_with_links("SRC", &mut visited, 0)
+    db.process_record_with_links("SRC", &mut visited)
         .await
         .unwrap();
 
@@ -1320,7 +1320,7 @@ async fn test_simm_raw_input_runs_conversion_chain() {
     }
 
     let mut visited = HashSet::new();
-    db.process_record_with_links("AI:SIMRAW", &mut visited, 0)
+    db.process_record_with_links("AI:SIMRAW", &mut visited)
         .await
         .unwrap();
 
@@ -1371,7 +1371,7 @@ async fn test_cycle_detection() {
     }
 
     let mut visited = HashSet::new();
-    db.process_record_with_links("CYCLE_A", &mut visited, 0)
+    db.process_record_with_links("CYCLE_A", &mut visited)
         .await
         .unwrap();
     // What breaks the loop is that CYCLE_A is still ON THE STACK when its own
@@ -1427,7 +1427,7 @@ async fn test_ao_omsl_dol() {
     db.add_record("OUTPUT", Box::new(ao)).await.unwrap();
 
     let mut visited = HashSet::new();
-    db.process_record_with_links("OUTPUT", &mut visited, 0)
+    db.process_record_with_links("OUTPUT", &mut visited)
         .await
         .unwrap();
 
@@ -1457,7 +1457,7 @@ async fn test_ao_oif_incremental() {
     db.add_record("OUTPUT", Box::new(ao)).await.unwrap();
 
     let mut visited = HashSet::new();
-    db.process_record_with_links("OUTPUT", &mut visited, 0)
+    db.process_record_with_links("OUTPUT", &mut visited)
         .await
         .unwrap();
 
@@ -1491,7 +1491,7 @@ async fn test_ao_ivoa_dont_drive() {
     }
 
     let mut visited = HashSet::new();
-    db.process_record_with_links("OUTPUT", &mut visited, 0)
+    db.process_record_with_links("OUTPUT", &mut visited)
         .await
         .unwrap();
 
@@ -1578,7 +1578,7 @@ async fn test_ao_ivoa_set_to_ivov_writes_oval() {
     }
 
     let mut visited = HashSet::new();
-    db.process_record_with_links("SRC", &mut visited, 0)
+    db.process_record_with_links("SRC", &mut visited)
         .await
         .unwrap();
 
@@ -1612,7 +1612,7 @@ async fn test_bo_ivoa_set_to_ivov_writes_rval() {
     }
 
     let mut visited = HashSet::new();
-    db.process_record_with_links("BO_SRC", &mut visited, 0)
+    db.process_record_with_links("BO_SRC", &mut visited)
         .await
         .unwrap();
 
@@ -1661,7 +1661,7 @@ async fn test_calcout_ivoa_set_to_ivov_writes_oval_only() {
     }
 
     let mut visited = HashSet::new();
-    db.process_record_with_links("CO_SRC", &mut visited, 0)
+    db.process_record_with_links("CO_SRC", &mut visited)
         .await
         .unwrap();
 
@@ -1690,7 +1690,7 @@ async fn test_sim_mode_input() {
     db.add_record("SIM_AI", Box::new(ai)).await.unwrap();
 
     let mut visited = HashSet::new();
-    db.process_record_with_links("SIM_AI", &mut visited, 0)
+    db.process_record_with_links("SIM_AI", &mut visited)
         .await
         .unwrap();
 
@@ -1737,7 +1737,7 @@ async fn test_sim_value_trips_own_limit_and_maximizes_over_simm() {
     }
 
     let mut visited = HashSet::new();
-    db.process_record_with_links("SIM_AI2", &mut visited, 0)
+    db.process_record_with_links("SIM_AI2", &mut visited)
         .await
         .unwrap();
 
@@ -1781,7 +1781,7 @@ async fn test_sim_steady_cycle_does_not_repost_unchanged_fields() {
 
     // Cycle 1 commits the NO_ALARM -> MINOR/SIMM transition and VAL=42.
     let mut visited = HashSet::new();
-    db.process_record_with_links("SIM_AI3", &mut visited, 0)
+    db.process_record_with_links("SIM_AI3", &mut visited)
         .await
         .unwrap();
 
@@ -1813,7 +1813,7 @@ async fn test_sim_steady_cycle_does_not_repost_unchanged_fields() {
 
     // Cycle 2: same SIOL value, same alarm state — nothing posts.
     let mut visited = HashSet::new();
-    db.process_record_with_links("SIM_AI3", &mut visited, 0)
+    db.process_record_with_links("SIM_AI3", &mut visited)
         .await
         .unwrap();
 
@@ -1872,7 +1872,7 @@ async fn test_sim_alarm_transition_posts_per_field_masks() {
     };
 
     let mut visited = HashSet::new();
-    db.process_record_with_links("SIM_AI4", &mut visited, 0)
+    db.process_record_with_links("SIM_AI4", &mut visited)
         .await
         .unwrap();
 
@@ -1917,7 +1917,7 @@ async fn test_sim_val_respects_mdel_deadband() {
 
     // Cycle 1: VAL 0 -> 42 crosses MDEL, posts, MLST=42.
     let mut visited = HashSet::new();
-    db.process_record_with_links("SIM_AI5", &mut visited, 0)
+    db.process_record_with_links("SIM_AI5", &mut visited)
         .await
         .unwrap();
 
@@ -1933,7 +1933,7 @@ async fn test_sim_val_respects_mdel_deadband() {
         .await
         .unwrap();
     let mut visited = HashSet::new();
-    db.process_record_with_links("SIM_AI5", &mut visited, 0)
+    db.process_record_with_links("SIM_AI5", &mut visited)
         .await
         .unwrap();
     assert!(
@@ -1946,7 +1946,7 @@ async fn test_sim_val_respects_mdel_deadband() {
         .await
         .unwrap();
     let mut visited = HashSet::new();
-    db.process_record_with_links("SIM_AI5", &mut visited, 0)
+    db.process_record_with_links("SIM_AI5", &mut visited)
         .await
         .unwrap();
     assert!(
@@ -1980,7 +1980,7 @@ async fn test_sim_mode_toggle() {
     }
 
     let mut visited = HashSet::new();
-    db.process_record_with_links("TEST_AI", &mut visited, 0)
+    db.process_record_with_links("TEST_AI", &mut visited)
         .await
         .unwrap();
     let val = db.get_pv("TEST_AI").unwrap();
@@ -1991,7 +1991,7 @@ async fn test_sim_mode_toggle() {
 
     db.put_pv("SIM_SW", EpicsValue::Double(1.0)).await.unwrap();
     let mut visited = HashSet::new();
-    db.process_record_with_links("TEST_AI", &mut visited, 0)
+    db.process_record_with_links("TEST_AI", &mut visited)
         .await
         .unwrap();
     let val = db.get_pv("TEST_AI").unwrap();
@@ -2017,7 +2017,7 @@ async fn test_sim_mode_output() {
     db.add_record("TEST_AO", Box::new(ao)).await.unwrap();
 
     let mut visited = HashSet::new();
-    db.process_record_with_links("TEST_AO", &mut visited, 0)
+    db.process_record_with_links("TEST_AO", &mut visited)
         .await
         .unwrap();
 
@@ -2070,7 +2070,7 @@ async fn test_sim_mode_input_nonlocal_db_siol() {
     db.add_record("SIM_AI_NL", Box::new(ai)).await.unwrap();
 
     let mut visited = HashSet::new();
-    db.process_record_with_links("SIM_AI_NL", &mut visited, 0)
+    db.process_record_with_links("SIM_AI_NL", &mut visited)
         .await
         .unwrap();
 
@@ -2113,7 +2113,7 @@ async fn test_sim_mode_output_nonlocal_db_siol() {
     db.add_record("TEST_AO_NL", Box::new(ao)).await.unwrap();
 
     let mut visited = HashSet::new();
-    db.process_record_with_links("TEST_AO_NL", &mut visited, 0)
+    db.process_record_with_links("TEST_AO_NL", &mut visited)
         .await
         .unwrap();
 
@@ -2162,7 +2162,7 @@ async fn test_sdis_disable_skips_process() {
     }
 
     let mut visited = HashSet::new();
-    db.process_record_with_links("TARGET", &mut visited, 0)
+    db.process_record_with_links("TARGET", &mut visited)
         .await
         .unwrap();
 
@@ -2180,7 +2180,7 @@ async fn test_sdis_disable_skips_process() {
         .await
         .unwrap();
     let mut visited = HashSet::new();
-    db.process_record_with_links("TARGET", &mut visited, 0)
+    db.process_record_with_links("TARGET", &mut visited)
         .await
         .unwrap();
 
@@ -2223,7 +2223,7 @@ async fn test_constant_sdis_never_reaches_disa_but_db_sdis_does() {
         inst.put_common_field("DISS", EpicsValue::Short(1)).unwrap();
     }
     let mut visited = HashSet::new();
-    db.process_record_with_links("TARGET", &mut visited, 0)
+    db.process_record_with_links("TARGET", &mut visited)
         .await
         .unwrap();
     {
@@ -2250,7 +2250,7 @@ async fn test_constant_sdis_never_reaches_disa_but_db_sdis_does() {
             .unwrap();
     }
     let mut visited = HashSet::new();
-    db.process_record_with_links("TARGET", &mut visited, 0)
+    db.process_record_with_links("TARGET", &mut visited)
         .await
         .unwrap();
     {
@@ -2301,75 +2301,6 @@ async fn test_phas_scan_order() {
 
     let names = db.records_for_scan(ScanType::SEC1).await;
     assert_eq!(names, vec!["REC_A", "REC_B", "REC_C"]);
-}
-
-/// Run a deep FLNK-processing chain test on a thread with a large stack.
-///
-/// `process_record_with_links` polls the large `process_record_with_links_inner`
-/// future once per FLNK hop, up to `MAX_LINK_DEPTH` (16) frames deep. On
-/// linux-arm64 those frames are big enough that 16 of them overflow the default
-/// 2 MB test-thread stack (SIGABRT); x86_64 and macos-arm64 have smaller frames
-/// and fit. A 16 MB stack clears it. The future is built and awaited on the
-/// spawned thread, so it never crosses the thread boundary and needs no `Send`.
-fn run_deep_flnk_recursion<F, Fut>(body: F)
-where
-    F: FnOnce() -> Fut + Send + 'static,
-    Fut: std::future::Future<Output = ()>,
-{
-    std::thread::Builder::new()
-        .stack_size(16 * 1024 * 1024)
-        .spawn(move || {
-            tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .unwrap()
-                .block_on(body());
-        })
-        .unwrap()
-        .join()
-        .unwrap();
-}
-
-#[test]
-fn test_depth_limit() {
-    run_deep_flnk_recursion(|| async {
-        let db = PvDatabase::new();
-        for i in 0..20 {
-            db.add_record(&format!("CHAIN_{i}"), Box::new(AoRecord::new(0.0)))
-                .await
-                .unwrap();
-        }
-        for i in 0..19 {
-            if let Some(rec) = db.get_record(&format!("CHAIN_{i}")) {
-                let mut inst = rec.write();
-                inst.put_common_field(
-                    "FLNK",
-                    EpicsValue::String(format!("CHAIN_{}", i + 1).into()),
-                )
-                .unwrap();
-            }
-        }
-
-        let mut visited = HashSet::new();
-        db.process_record_with_links("CHAIN_0", &mut visited, 0)
-            .await
-            .unwrap();
-        // Reading the set after the call cannot show how far the chain
-        // walked any more; the refusal on the record at the bound can, and
-        // that is what an operator sees.
-        let refused = db
-            .get_record("CHAIN_16")
-            .expect("CHAIN_16 exists")
-            .read()
-            .common
-            .amsg
-            .clone();
-        assert!(
-            refused.contains("link chain depth limit"),
-            "the record at MAX_LINK_DEPTH must carry the reason, got {refused:?}"
-        );
-        assert!(visited.is_empty(), "the frame unwound: {visited:?}");
-    });
 }
 
 #[epics_macros_rs::epics_test]
@@ -2650,7 +2581,7 @@ async fn test_readback_cycle_runs_device_write_without_callback_contract() {
         inst.device = Some(Box::new(mock));
     }
     let mut visited = HashSet::new();
-    db.process_record_readback("AO_CB1", &mut visited, 0)
+    db.process_record_readback("AO_CB1", &mut visited)
         .await
         .unwrap();
     assert_eq!(
@@ -2681,7 +2612,7 @@ async fn test_readback_cycle_suppresses_device_write_with_callback_contract() {
         inst.device = Some(Box::new(mock));
     }
     let mut visited = HashSet::new();
-    db.process_record_readback("AO_CB2", &mut visited, 0)
+    db.process_record_readback("AO_CB2", &mut visited)
         .await
         .unwrap();
     assert_eq!(
@@ -2722,7 +2653,7 @@ async fn test_bi_raw_soft_channel_inp_applies_mask() {
             .unwrap();
     }
     let mut visited = HashSet::new();
-    db.process_record_with_links("BI_RAW", &mut visited, 0)
+    db.process_record_with_links("BI_RAW", &mut visited)
         .await
         .unwrap();
     if let Some(rec) = db.get_record("BI_RAW") {
@@ -2758,7 +2689,7 @@ async fn test_input_record_no_device_write() {
         inst.device = Some(Box::new(mock));
     }
     let mut visited = HashSet::new();
-    db.process_record_with_links("AI_REC", &mut visited, 0)
+    db.process_record_with_links("AI_REC", &mut visited)
         .await
         .unwrap();
     assert_eq!(read_count.load(Ordering::SeqCst), 1);
@@ -2810,7 +2741,7 @@ async fn test_device_support_utag_adopted_into_common() {
         inst.device = Some(Box::new(UtagDeviceSupport { utag: 0x9000_0000 }));
     }
     let mut visited = HashSet::new();
-    db.process_record_with_links("AI_UTAG", &mut visited, 0)
+    db.process_record_with_links("AI_UTAG", &mut visited)
         .await
         .unwrap();
     if let Some(rec) = db.get_record("AI_UTAG") {
@@ -2852,7 +2783,7 @@ async fn test_non_passive_output_ca_put_defers_write_until_scan() {
 
     // The periodic scan processes the record and writes the new VAL.
     let mut visited = HashSet::new();
-    db.process_record_with_links("AO_NP", &mut visited, 0)
+    db.process_record_with_links("AO_NP", &mut visited)
         .await
         .unwrap();
     assert_eq!(
@@ -3160,7 +3091,7 @@ async fn test_async_pending_skips_post_process() {
             .unwrap();
     }
     let mut visited = HashSet::new();
-    db.process_record_with_links("ASYNC", &mut visited, 0)
+    db.process_record_with_links("ASYNC", &mut visited)
         .await
         .unwrap();
     // `visited` is frame-scoped, so it says nothing after the call returns;
@@ -3187,7 +3118,7 @@ async fn test_complete_async_record() {
             .unwrap();
     }
     let mut visited = HashSet::new();
-    db.process_record_with_links("ASYNC", &mut visited, 0)
+    db.process_record_with_links("ASYNC", &mut visited)
         .await
         .unwrap();
     assert_eq!(
@@ -3276,7 +3207,7 @@ async fn test_complete_async_posts_sevr_with_per_field_mask() {
 
     // First cycle: record reports async_pending (PACT set).
     let mut visited = HashSet::new();
-    db.process_record_with_links("ASYNC_SEVR", &mut visited, 0)
+    db.process_record_with_links("ASYNC_SEVR", &mut visited)
         .await
         .unwrap();
 
@@ -3353,7 +3284,7 @@ async fn test_pact_entry_guard_silent_bail_until_max_lock() {
 
     // Drive ASYNC_PACT into PACT=true (async pending, lock released).
     let mut visited = HashSet::new();
-    db.process_record_with_links("ASYNC_PACT", &mut visited, 0)
+    db.process_record_with_links("ASYNC_PACT", &mut visited)
         .await
         .unwrap();
     {
@@ -3370,7 +3301,7 @@ async fn test_pact_entry_guard_silent_bail_until_max_lock() {
     // Up to MAX_LOCK = 10 re-entries while PACT=true must NOT raise alarm.
     for i in 1..=10 {
         let mut visited = HashSet::new();
-        db.process_record_with_links("ASYNC_PACT", &mut visited, 0)
+        db.process_record_with_links("ASYNC_PACT", &mut visited)
             .await
             .unwrap();
         let rec = db.get_record("ASYNC_PACT").unwrap();
@@ -3387,7 +3318,7 @@ async fn test_pact_entry_guard_silent_bail_until_max_lock() {
     // 11th attempt while pact (lcnt==10 before increment >= MAX_LOCK)
     // must raise SCAN_ALARM/INVALID and post VAL monitor.
     let mut visited = HashSet::new();
-    db.process_record_with_links("ASYNC_PACT", &mut visited, 0)
+    db.process_record_with_links("ASYNC_PACT", &mut visited)
         .await
         .unwrap();
     let rec = db.get_record("ASYNC_PACT").unwrap();
@@ -3426,7 +3357,7 @@ async fn test_pact_entry_guard_tpro_diagnostic_does_not_change_bail_outcome() {
 
     // Cycle 1: drive into PACT.
     let mut visited = HashSet::new();
-    db.process_record_with_links("ASYNC_TPRO", &mut visited, 0)
+    db.process_record_with_links("ASYNC_TPRO", &mut visited)
         .await
         .unwrap();
     {
@@ -3444,7 +3375,7 @@ async fn test_pact_entry_guard_tpro_diagnostic_does_not_change_bail_outcome() {
     // is emitted as a side effect (eprintln) but the bail outcome
     // matches the non-TPRO case (verified by the silent-bail test).
     let mut visited = HashSet::new();
-    db.process_record_with_links("ASYNC_TPRO", &mut visited, 0)
+    db.process_record_with_links("ASYNC_TPRO", &mut visited)
         .await
         .unwrap();
     let rec = db.get_record("ASYNC_TPRO").unwrap();
@@ -3468,12 +3399,12 @@ async fn test_pact_entry_guard_resets_lcnt_after_completion() {
 
     // Cycle 1: kick off async, accumulate lcnt via re-entries.
     let mut visited = HashSet::new();
-    db.process_record_with_links("ASYNC_RESET", &mut visited, 0)
+    db.process_record_with_links("ASYNC_RESET", &mut visited)
         .await
         .unwrap();
     for _ in 0..3 {
         let mut visited = HashSet::new();
-        db.process_record_with_links("ASYNC_RESET", &mut visited, 0)
+        db.process_record_with_links("ASYNC_RESET", &mut visited)
             .await
             .unwrap();
     }
@@ -3488,7 +3419,7 @@ async fn test_pact_entry_guard_resets_lcnt_after_completion() {
     // Next process_record_with_links should reset lcnt (path: enters
     // body since PACT is now false).
     let mut visited = HashSet::new();
-    db.process_record_with_links("ASYNC_RESET", &mut visited, 0)
+    db.process_record_with_links("ASYNC_RESET", &mut visited)
         .await
         .unwrap();
     let rec = db.get_record("ASYNC_RESET").unwrap();
@@ -3559,7 +3490,7 @@ async fn test_cp_burst_on_a_pact_target_alarms_instead_of_setting_rpro() {
             inst.record.put_field("VAL", EpicsValue::Double(v)).unwrap();
         }
         let mut visited = HashSet::new();
-        db.process_record_with_links("CPB_SRC", &mut visited, 0)
+        db.process_record_with_links("CPB_SRC", &mut visited)
             .await
             .unwrap();
     };
@@ -3713,7 +3644,7 @@ async fn test_reprocess_after_continuation_bypasses_pact_guard() {
 
     // First process: returns AsyncPending + ReprocessAfter(20ms).
     let mut visited = HashSet::new();
-    db.process_record_with_links("CONT_REC", &mut visited, 0)
+    db.process_record_with_links("CONT_REC", &mut visited)
         .await
         .unwrap();
 
@@ -3731,7 +3662,7 @@ async fn test_reprocess_after_continuation_bypasses_pact_guard() {
     // silently) — proves the guard still protects against FLNK/scan
     // dual-fire while the continuation timer is pending.
     let mut visited = HashSet::new();
-    db.process_record_with_links("CONT_REC", &mut visited, 0)
+    db.process_record_with_links("CONT_REC", &mut visited)
         .await
         .unwrap();
     assert_eq!(
@@ -3782,7 +3713,7 @@ async fn test_reprocess_after_continuation_bypasses_pact_guard() {
     // run `process()` again — proving the PACT entry guard no longer
     // fires (it would if `processing` had leaked true).
     let mut visited = HashSet::new();
-    db.process_record_with_links("CONT_REC", &mut visited, 0)
+    db.process_record_with_links("CONT_REC", &mut visited)
         .await
         .unwrap();
     assert_eq!(
@@ -3980,7 +3911,7 @@ async fn test_sdis_disable_clears_rpro_and_putf() {
     }
 
     let mut visited = HashSet::new();
-    db.process_record_with_links("DIS_TGT", &mut visited, 0)
+    db.process_record_with_links("DIS_TGT", &mut visited)
         .await
         .unwrap();
 
@@ -4029,7 +3960,7 @@ async fn test_sdis_disable_fires_put_notify_completion() {
     }
 
     let mut visited = HashSet::new();
-    db.process_record_with_links("DIS_NOT_TGT", &mut visited, 0)
+    db.process_record_with_links("DIS_NOT_TGT", &mut visited)
         .await
         .unwrap();
 
@@ -4493,7 +4424,7 @@ async fn test_sdis_disable_notifies_alarm() {
         .expect("subscribe should not be capped at default")
     };
     let mut visited = HashSet::new();
-    db.process_record_with_links("TARGET", &mut visited, 0)
+    db.process_record_with_links("TARGET", &mut visited)
         .await
         .unwrap();
     assert!(alarm_rx.try_recv().is_ok());
@@ -4510,7 +4441,7 @@ async fn test_udf_cleared_by_process_with_links() {
     let rec = db.get_record("REC").unwrap();
     assert!(rec.read().common.udf != 0);
     let mut visited = HashSet::new();
-    db.process_record_with_links("REC", &mut visited, 0)
+    db.process_record_with_links("REC", &mut visited)
         .await
         .unwrap();
     assert!(rec.read().common.udf == 0);
@@ -4609,7 +4540,7 @@ async fn test_empty_array_into_scalar_is_accepted_and_alarms_the_record() {
     // Process once so VAL is committed and UDF is clear — the baseline the
     // empty put must not disturb.
     let mut visited = HashSet::new();
-    db.process_record_with_links("EMPTYPUT", &mut visited, 0)
+    db.process_record_with_links("EMPTYPUT", &mut visited)
         .await
         .unwrap();
 
@@ -4781,7 +4712,7 @@ async fn r6_10_array_source_link_into_scalar_val_delivers_element_zero() {
     }
 
     let mut visited = HashSet::new();
-    db.process_record_with_links("LNKAI", &mut visited, 0)
+    db.process_record_with_links("LNKAI", &mut visited)
         .await
         .unwrap();
 
@@ -5066,7 +4997,7 @@ async fn test_ao_asyn_readback_clears_udf_via_framework() {
     }
 
     let mut visited = HashSet::new();
-    db.process_record_with_links("REC", &mut visited, 0)
+    db.process_record_with_links("REC", &mut visited)
         .await
         .unwrap();
 
@@ -5125,7 +5056,7 @@ async fn test_udf_not_cleared_by_clears_udf_false() {
     let rec = db.get_record("REC").unwrap();
     assert!(rec.read().common.udf != 0);
     let mut visited = HashSet::new();
-    db.process_record_with_links("REC", &mut visited, 0)
+    db.process_record_with_links("REC", &mut visited)
         .await
         .unwrap();
     assert!(rec.read().common.udf != 0);
@@ -5173,7 +5104,7 @@ async fn test_constant_inp_link() {
         .await
         .unwrap();
     let mut visited = HashSet::new();
-    db.process_record_with_links("AI_CONST", &mut visited, 0)
+    db.process_record_with_links("AI_CONST", &mut visited)
         .await
         .unwrap();
     match db.get_pv("AI_CONST").unwrap() {
@@ -5200,7 +5131,7 @@ async fn test_calc_multi_input_db_links() {
     calc.inpb = "SRC_B".to_string();
     db.add_record("CALC_REC", Box::new(calc)).await.unwrap();
     let mut visited = HashSet::new();
-    db.process_record_with_links("CALC_REC", &mut visited, 0)
+    db.process_record_with_links("CALC_REC", &mut visited)
         .await
         .unwrap();
     let val = db.get_pv("CALC_REC").unwrap();
@@ -5234,7 +5165,7 @@ async fn test_calc_multi_input_pp_processes_passive_source() {
     db.add_record("PP_DST", Box::new(dst)).await.unwrap();
 
     let mut visited = HashSet::new();
-    db.process_record_with_links("PP_DST", &mut visited, 0)
+    db.process_record_with_links("PP_DST", &mut visited)
         .await
         .unwrap();
 
@@ -5310,7 +5241,7 @@ async fn test_calc_multi_input_npp_does_not_process_source() {
     db.add_record("NPP_DST", Box::new(dst)).await.unwrap();
 
     let mut visited = HashSet::new();
-    db.process_record_with_links("NPP_DST", &mut visited, 0)
+    db.process_record_with_links("NPP_DST", &mut visited)
         .await
         .unwrap();
 
@@ -5392,7 +5323,7 @@ async fn test_link_to_digit_bearing_field_is_a_local_db_link() {
     }
 
     let mut visited = HashSet::new();
-    db.process_record_with_links("SINK", &mut visited, 0)
+    db.process_record_with_links("SINK", &mut visited)
         .await
         .unwrap();
 
@@ -5436,7 +5367,7 @@ async fn test_calc_multi_input_bare_does_not_process_source() {
     db.add_record("BARE_DST", Box::new(dst)).await.unwrap();
 
     let mut visited = HashSet::new();
-    db.process_record_with_links("BARE_DST", &mut visited, 0)
+    db.process_record_with_links("BARE_DST", &mut visited)
         .await
         .unwrap();
 
@@ -5462,16 +5393,16 @@ async fn test_calc_multi_input_bare_does_not_process_source() {
 /// Defect 1 regression (CRITICAL): two passive calc records whose
 /// `INPA` PP links point at each other (`A.INPA="B PP"`,
 /// `B.INPA="A PP"`) form a PP-link cycle. Before the fix
-/// `process_passive_db_source` created a FRESH `visited` set and
-/// reset depth to 0 on every PP hop, so neither `MAX_LINK_DEPTH`
-/// nor the `visited` cycle guard fired across the hop — the cycle
-/// recursed unboundedly to a stack overflow / SIGABRT.
+/// `process_passive_db_source` created a FRESH `visited` set on
+/// every PP hop, so the `visited` cycle guard
+/// never fired across the hop — the cycle recursed unboundedly to a
+/// stack overflow / SIGABRT.
 ///
 /// C terminates this cycle because `calcRecord.c::process` sets
 /// `prec->pact = TRUE` *before* `fetch_values()` (calcRecord.c:119),
 /// so the re-entrant `dbProcess` hits `if (precord->pact) goto
 /// all_done;` (dbAccess.c:536) and bails after one bounce. The Rust
-/// fix threads the caller's `visited` set / `depth` through the PP
+/// fix threads the caller's `visited` set through the PP
 /// hop so the existing `visited.insert` guard
 /// (`process_record_with_links_inner`) fires instead.
 ///
@@ -5496,9 +5427,7 @@ async fn test_calc_pp_link_cycle_terminates() {
     // Must return cleanly (Ok) without overflowing the stack — the
     // cycle guard terminates the A->B->A bounce.
     let mut visited = HashSet::new();
-    let result = db
-        .process_record_with_links("CALC_A", &mut visited, 0)
-        .await;
+    let result = db.process_record_with_links("CALC_A", &mut visited).await;
     assert!(
         result.is_ok(),
         "PP-link A<->B cycle must terminate cleanly, got {result:?}"
@@ -5528,7 +5457,7 @@ async fn test_calc_constant_inputs() {
     calc.inpb = "3.5".to_string();
     db.add_record("CALC_CONST", Box::new(calc)).await.unwrap();
     let mut visited = HashSet::new();
-    db.process_record_with_links("CALC_CONST", &mut visited, 0)
+    db.process_record_with_links("CALC_CONST", &mut visited)
         .await
         .unwrap();
     let val = db.get_pv("CALC_CONST").unwrap();
@@ -5571,7 +5500,7 @@ async fn test_calc_record_has_analog_alarm_limits() {
 
     // Process — CALC="A" with A=15 → VAL=15 > HIHI=10 → HIHI_ALARM/MAJOR.
     let mut visited = HashSet::new();
-    db.process_record_with_links("CALC_LIM", &mut visited, 0)
+    db.process_record_with_links("CALC_LIM", &mut visited)
         .await
         .unwrap();
     let rec = db.get_record("CALC_LIM").unwrap();
@@ -5609,7 +5538,7 @@ async fn test_calc_record_aftc_filter_delays_alarm() {
 
     // First process — filter seeds with NoAlarm (alarm_range=3, Normal).
     let mut visited = HashSet::new();
-    db.process_record_with_links("CALC_AFTC", &mut visited, 0)
+    db.process_record_with_links("CALC_AFTC", &mut visited)
         .await
         .unwrap();
 
@@ -5624,7 +5553,7 @@ async fn test_calc_record_aftc_filter_delays_alarm() {
         let _ = inst.record.put_field("VAL", EpicsValue::Double(15.0));
     }
     let mut visited = HashSet::new();
-    db.process_record_with_links("CALC_AFTC", &mut visited, 0)
+    db.process_record_with_links("CALC_AFTC", &mut visited)
         .await
         .unwrap();
     let inst = rec.read();
@@ -5653,7 +5582,7 @@ async fn test_fanout_all() {
         db.add_record(name, Box::new(tgt)).await.unwrap();
     }
     let mut visited = HashSet::new();
-    db.process_record_with_links("FANOUT", &mut visited, 0)
+    db.process_record_with_links("FANOUT", &mut visited)
         .await
         .unwrap();
     assert_eq!(db.get_pv("TARGET_1").unwrap().to_f64(), Some(1.0));
@@ -5688,7 +5617,7 @@ async fn test_fanout_specified() {
             .unwrap();
     }
     let mut visited = HashSet::new();
-    db.process_record_with_links("FANOUT", &mut visited, 0)
+    db.process_record_with_links("FANOUT", &mut visited)
         .await
         .unwrap();
     // SELN=1 → LNK1 → T1 processed; LNK2/T2 NOT processed.
@@ -5712,7 +5641,7 @@ async fn test_dfanout_value_write() {
         .await
         .unwrap();
     let mut visited = HashSet::new();
-    db.process_record_with_links("DFAN", &mut visited, 0)
+    db.process_record_with_links("DFAN", &mut visited)
         .await
         .unwrap();
     let val_a = db.get_pv("DEST_A").unwrap();
@@ -5762,7 +5691,7 @@ async fn test_dfanout_omsl_closed_loop_sources_val_from_dol() {
         .unwrap();
 
     let mut visited = HashSet::new();
-    db.process_record_with_links("DFAN_OMSL", &mut visited, 0)
+    db.process_record_with_links("DFAN_OMSL", &mut visited)
         .await
         .unwrap();
 
@@ -5803,7 +5732,7 @@ async fn test_dfanout_omsl_supervisory_ignores_dol() {
         .unwrap();
 
     let mut visited = HashSet::new();
-    db.process_record_with_links("DFAN_SUP", &mut visited, 0)
+    db.process_record_with_links("DFAN_SUP", &mut visited)
         .await
         .unwrap();
 
@@ -5866,7 +5795,7 @@ async fn test_dfanout_out_link_write_failure_raises_link_alarm() {
     define_val(&db, "DFAN_LINKFAIL").await;
 
     let mut visited = HashSet::new();
-    db.process_record_with_links("DFAN_LINKFAIL", &mut visited, 0)
+    db.process_record_with_links("DFAN_LINKFAIL", &mut visited)
         .await
         .unwrap();
 
@@ -5908,7 +5837,7 @@ async fn test_dfanout_out_link_write_success_no_link_alarm() {
     define_val(&db, "DFAN_OK").await;
 
     let mut visited = HashSet::new();
-    db.process_record_with_links("DFAN_OK", &mut visited, 0)
+    db.process_record_with_links("DFAN_OK", &mut visited)
         .await
         .unwrap();
 
@@ -5965,7 +5894,7 @@ async fn test_seq_dol_lnk_dispatch() {
     seq.lnk2 = "SEQ_DEST2".to_string();
     db.add_record("SEQ_REC", Box::new(seq)).await.unwrap();
     let mut visited = HashSet::new();
-    db.process_record_with_links("SEQ_REC", &mut visited, 0)
+    db.process_record_with_links("SEQ_REC", &mut visited)
         .await
         .unwrap();
     settle_seq(&db, "SEQ_REC").await;
@@ -6003,7 +5932,7 @@ async fn test_seq_writes_dol_readback_into_don() {
     db.add_record("SEQ9_REC", Box::new(seq)).await.unwrap();
 
     let mut visited = HashSet::new();
-    db.process_record_with_links("SEQ9_REC", &mut visited, 0)
+    db.process_record_with_links("SEQ9_REC", &mut visited)
         .await
         .unwrap();
     settle_seq(&db, "SEQ9_REC").await;
@@ -6043,7 +5972,7 @@ async fn test_seq_dol_only_group_updates_don_with_empty_lnk() {
     db.add_record("SEQ9B_REC", Box::new(seq)).await.unwrap();
 
     let mut visited = HashSet::new();
-    db.process_record_with_links("SEQ9B_REC", &mut visited, 0)
+    db.process_record_with_links("SEQ9B_REC", &mut visited)
         .await
         .unwrap();
     settle_seq(&db, "SEQ9B_REC").await;
@@ -6137,7 +6066,7 @@ async fn test_seq_bare_lnk_does_not_process_passive_target() {
     db.add_record("SEQ_NPP_REC", Box::new(seq)).await.unwrap();
 
     let mut visited = HashSet::new();
-    db.process_record_with_links("SEQ_NPP_REC", &mut visited, 0)
+    db.process_record_with_links("SEQ_NPP_REC", &mut visited)
         .await
         .unwrap();
     settle_seq(&db, "SEQ_NPP_REC").await;
@@ -6222,7 +6151,7 @@ async fn test_write_db_link_runs_before_flnk_target_reads_fresh() {
     }
 
     let mut visited = HashSet::new();
-    db.process_record_with_links("WF_PRODUCER", &mut visited, 0)
+    db.process_record_with_links("WF_PRODUCER", &mut visited)
         .await
         .unwrap();
 
@@ -6312,7 +6241,7 @@ async fn test_sseq_bare_lnk_does_not_process_passive_target() {
     db.add_record("SSEQ_NPP_REC", Box::new(sseq)).await.unwrap();
 
     let mut visited = HashSet::new();
-    db.process_record_with_links("SSEQ_NPP_REC", &mut visited, 0)
+    db.process_record_with_links("SSEQ_NPP_REC", &mut visited)
         .await
         .unwrap();
     // Step 2 (the PP target) is written in a later continuation; wait for
@@ -6369,7 +6298,7 @@ async fn test_sseq_per_step_dly_delays_step_write() {
     // first step is *scheduled* (PACT set); the per-step writes happen in
     // spawned re-entries, so the kick does NOT block until completion.
     let mut visited = HashSet::new();
-    db.process_record_with_links("SSEQ_DLY_REC", &mut visited, 0)
+    db.process_record_with_links("SSEQ_DLY_REC", &mut visited)
         .await
         .unwrap();
 
@@ -6407,7 +6336,7 @@ async fn test_sel_nvl_link() {
     sel.c = 30.0;
     db.add_record("SEL_REC", Box::new(sel)).await.unwrap();
     let mut visited = HashSet::new();
-    db.process_record_with_links("SEL_REC", &mut visited, 0)
+    db.process_record_with_links("SEL_REC", &mut visited)
         .await
         .unwrap();
     let seln = db.get_pv("SEL_REC.SELN").unwrap();
@@ -6437,7 +6366,7 @@ async fn test_sel_nvl_link_high_index_unsigned() {
     sel.nvl = "NVL_SRC_HI".to_string();
     db.add_record("SEL_REC_HI", Box::new(sel)).await.unwrap();
     let mut visited = HashSet::new();
-    db.process_record_with_links("SEL_REC_HI", &mut visited, 0)
+    db.process_record_with_links("SEL_REC_HI", &mut visited)
         .await
         .unwrap();
     let seln = db.get_pv("SEL_REC_HI.SELN").unwrap();
@@ -6476,7 +6405,7 @@ async fn test_dol_cp_link_triggers_processing() {
     db.add_record("DST", Box::new(ao)).await.unwrap();
     db.setup_cp_links().await;
     let mut visited = HashSet::new();
-    db.process_record_with_links("SRC", &mut visited, 0)
+    db.process_record_with_links("SRC", &mut visited)
         .await
         .unwrap();
     let val = db.get_pv("DST").unwrap();
@@ -6533,7 +6462,7 @@ async fn test_out_link_cp_modifier_is_not_registered_as_a_cp_holder() {
     // The rest of the OUT link's modifiers survive the mask: ` PP` still
     // processes the target (`dbDbLink.c:387-390`).
     let mut visited = HashSet::new();
-    db.process_record_with_links("CPOUT_HOLDER", &mut visited, 0)
+    db.process_record_with_links("CPOUT_HOLDER", &mut visited)
         .await
         .unwrap();
     assert!(
@@ -6583,7 +6512,7 @@ async fn test_cpp_link_skips_nonpassive_target() {
     }
     db.setup_cp_links().await;
     let mut visited = HashSet::new();
-    db.process_record_with_links("SRC", &mut visited, 0)
+    db.process_record_with_links("SRC", &mut visited)
         .await
         .unwrap();
     let val = db.get_pv("DST").unwrap();
@@ -6611,7 +6540,7 @@ async fn test_cpp_link_processes_passive_target() {
     // DST keeps the default Passive SCAN.
     db.setup_cp_links().await;
     let mut visited = HashSet::new();
-    db.process_record_with_links("SRC", &mut visited, 0)
+    db.process_record_with_links("SRC", &mut visited)
         .await
         .unwrap();
     let val = db.get_pv("DST").unwrap();
@@ -6642,7 +6571,7 @@ async fn test_cp_link_processes_nonpassive_target() {
     }
     db.setup_cp_links().await;
     let mut visited = HashSet::new();
-    db.process_record_with_links("SRC", &mut visited, 0)
+    db.process_record_with_links("SRC", &mut visited)
         .await
         .unwrap();
     let val = db.get_pv("DST").unwrap();
@@ -6765,7 +6694,7 @@ async fn test_tse_minus1_always_overwrites_via_best_time() {
         inst.common.time = stale;
     }
     let mut visited = HashSet::new();
-    db.process_record_with_links("REC", &mut visited, 0)
+    db.process_record_with_links("REC", &mut visited)
         .await
         .unwrap();
     let rec = db.get_record("REC").unwrap();
@@ -6790,7 +6719,7 @@ async fn test_tse_minus2_keeps_time_unchanged() {
         inst.common.time = fixed_time;
     }
     let mut visited = HashSet::new();
-    db.process_record_with_links("REC", &mut visited, 0)
+    db.process_record_with_links("REC", &mut visited)
         .await
         .unwrap();
     let rec = db.get_record("REC").unwrap();
@@ -6825,7 +6754,7 @@ async fn test_rpro_causes_reprocessing() {
             .unwrap();
     }
     let mut visited = HashSet::new();
-    db.process_record_with_links("DEST", &mut visited, 0)
+    db.process_record_with_links("DEST", &mut visited)
         .await
         .unwrap();
     let val = db.get_pv("DEST").unwrap();
@@ -6839,7 +6768,7 @@ async fn test_rpro_causes_reprocessing() {
         inst.common.rpro = 1;
     }
     let mut visited = HashSet::new();
-    db.process_record_with_links("DEST", &mut visited, 0)
+    db.process_record_with_links("DEST", &mut visited)
         .await
         .unwrap();
     let val = db.get_pv("DEST").unwrap();
@@ -6907,7 +6836,7 @@ async fn test_tsel_time_link_copies_source_time_and_utag() {
     }
 
     let mut visited = HashSet::new();
-    db.process_record_with_links("TS_DST", &mut visited, 0)
+    db.process_record_with_links("TS_DST", &mut visited)
         .await
         .unwrap();
 
@@ -6980,7 +6909,7 @@ async fn test_tsel_ca_time_link_copies_source_time() {
     }
 
     let mut visited = HashSet::new();
-    db.process_record_with_links("TS_CADST", &mut visited, 0)
+    db.process_record_with_links("TS_CADST", &mut visited)
         .await
         .unwrap();
 
@@ -7056,7 +6985,7 @@ async fn test_tsel_nonlocal_db_time_link_copies_remote_time() {
     }
 
     let mut visited = HashSet::new();
-    db.process_record_with_links("TS_NLDST", &mut visited, 0)
+    db.process_record_with_links("TS_NLDST", &mut visited)
         .await
         .unwrap();
 
@@ -7281,7 +7210,7 @@ async fn test_array_records_nord_monitor_uses_post_process_timestamp() {
                 .unwrap();
         }
         let mut visited = HashSet::new();
-        db.process_record_with_links(name, &mut visited, 0)
+        db.process_record_with_links(name, &mut visited)
             .await
             .unwrap();
 
@@ -7353,7 +7282,7 @@ async fn test_complete_async_record_gates_subscribed_field_on_change() {
     // DESC value unchanged since subscription, so the gate must
     // suppress the event.
     let mut visited = HashSet::new();
-    db.process_record_with_links("ASYNC_GATE", &mut visited, 0)
+    db.process_record_with_links("ASYNC_GATE", &mut visited)
         .await
         .unwrap();
     db.complete_async_record("ASYNC_GATE").await.unwrap();
@@ -7370,7 +7299,7 @@ async fn test_complete_async_record_gates_subscribed_field_on_change() {
             .unwrap();
     }
     let mut visited = HashSet::new();
-    db.process_record_with_links("ASYNC_GATE", &mut visited, 0)
+    db.process_record_with_links("ASYNC_GATE", &mut visited)
         .await
         .unwrap();
     db.complete_async_record("ASYNC_GATE").await.unwrap();
@@ -7386,7 +7315,7 @@ async fn test_complete_async_record_gates_subscribed_field_on_change() {
 
     // And another no-op cycle after the change must again be silent.
     let mut visited = HashSet::new();
-    db.process_record_with_links("ASYNC_GATE", &mut visited, 0)
+    db.process_record_with_links("ASYNC_GATE", &mut visited)
         .await
         .unwrap();
     db.complete_async_record("ASYNC_GATE").await.unwrap();
@@ -7541,7 +7470,7 @@ async fn test_output_link_cascade_uses_post_process_source_timestamp() {
         inst.record.set_val(EpicsValue::Double(7.5)).unwrap();
     }
     let mut visited = HashSet::new();
-    db.process_record_with_links("TS_SRC", &mut visited, 0)
+    db.process_record_with_links("TS_SRC", &mut visited)
         .await
         .unwrap();
 
@@ -7617,7 +7546,7 @@ async fn test_complete_async_record_updates_timestamp_at_completion() {
 
     // First half: process → AsyncPending early return; no notify yet.
     let mut visited = HashSet::new();
-    db.process_record_with_links("ASYNC_TS", &mut visited, 0)
+    db.process_record_with_links("ASYNC_TS", &mut visited)
         .await
         .unwrap();
     assert!(
@@ -7688,7 +7617,7 @@ async fn test_longout_oopt_on_change_first_cycle_emits_then_suppresses() {
     // First cycle: val == pval == 0 satisfies "no change", but the
     // first-output-done guard forces the OUT cascade to fire.
     let mut visited = HashSet::new();
-    db.process_record_with_links("LO_SRC", &mut visited, 0)
+    db.process_record_with_links("LO_SRC", &mut visited)
         .await
         .unwrap();
 
@@ -7721,7 +7650,7 @@ async fn test_longout_oopt_on_change_first_cycle_emits_then_suppresses() {
     let dst_time_before_second = dst_time_after_first;
     epics_base_rs::runtime::task::sleep(std::time::Duration::from_millis(5)).await;
     let mut visited = HashSet::new();
-    db.process_record_with_links("LO_SRC", &mut visited, 0)
+    db.process_record_with_links("LO_SRC", &mut visited)
         .await
         .unwrap();
     let dst_time_after_second = db
@@ -7782,7 +7711,7 @@ async fn test_self_link_out_does_not_loop() {
     let mut visited = HashSet::new();
     let result = epics_base_rs::runtime::task::timeout(
         Duration::from_secs(1),
-        db.process_record_with_links("SELF_LO", &mut visited, 0),
+        db.process_record_with_links("SELF_LO", &mut visited),
     )
     .await;
 
@@ -7804,7 +7733,7 @@ async fn test_self_link_out_does_not_loop() {
     let mut visited2 = HashSet::new();
     let result2 = epics_base_rs::runtime::task::timeout(
         Duration::from_secs(1),
-        db.process_record_with_links("SELF_LO", &mut visited2, 0),
+        db.process_record_with_links("SELF_LO", &mut visited2),
     )
     .await;
     assert!(
@@ -8470,7 +8399,7 @@ async fn test_lnk_calc_parses_and_evaluates() {
     let parsed = ParsedLink::Calc(calc);
     let mut visited = HashSet::new();
     let value = db
-        .read_link_value_soft(&parsed, true, &mut visited, 0)
+        .read_link_value_soft(&parsed, true, &mut visited)
         .expect("calc link evaluates");
     match value {
         EpicsValue::Double(v) => assert!((v - 13.0).abs() < 1e-9, "expected 3+5*2=13, got {v}"),
@@ -8542,7 +8471,6 @@ async fn test_lnk_calc_nonlocal_input_resolves_externally() {
             &epics_base_rs::server::record::ParsedLink::Calc(calc),
             true,
             &mut visited,
-            0,
         )
         .expect("calc with a non-local input must still evaluate");
     match value {
@@ -8668,7 +8596,7 @@ async fn test_simulation_mode_still_fires_forward_link() {
     }
 
     let mut visited = HashSet::new();
-    db.process_record_with_links("SIM:AI", &mut visited, 0)
+    db.process_record_with_links("SIM:AI", &mut visited)
         .await
         .unwrap();
 
@@ -8703,7 +8631,7 @@ async fn test_simulated_mbbi_reads_siol_not_writes_it() {
     db.add_record("MBBISIM:IN", Box::new(mbbi)).await.unwrap();
 
     let mut visited = HashSet::new();
-    db.process_record_with_links("MBBISIM:IN", &mut visited, 0)
+    db.process_record_with_links("MBBISIM:IN", &mut visited)
         .await
         .unwrap();
 
@@ -8795,7 +8723,7 @@ async fn test_fanout_resolves_sell_link_into_seln() {
     db.add_record("FANSELL:FAN", Box::new(fan)).await.unwrap();
 
     let mut visited = HashSet::new();
-    db.process_record_with_links("FANSELL:FAN", &mut visited, 0)
+    db.process_record_with_links("FANSELL:FAN", &mut visited)
         .await
         .unwrap();
 
@@ -8845,7 +8773,7 @@ async fn test_seq_skips_sell_in_all_mode_reads_in_specified() {
         db.add_record("SEQALL:REC", Box::new(seq)).await.unwrap();
 
         let mut visited = HashSet::new();
-        db.process_record_with_links("SEQALL:REC", &mut visited, 0)
+        db.process_record_with_links("SEQALL:REC", &mut visited)
             .await
             .unwrap();
 
@@ -8873,7 +8801,7 @@ async fn test_seq_skips_sell_in_all_mode_reads_in_specified() {
         db.add_record("SEQSPEC:REC", Box::new(seq)).await.unwrap();
 
         let mut visited = HashSet::new();
-        db.process_record_with_links("SEQSPEC:REC", &mut visited, 0)
+        db.process_record_with_links("SEQSPEC:REC", &mut visited)
             .await
             .unwrap();
 
@@ -9008,7 +8936,7 @@ async fn test_bare_out_link_does_not_process_target() {
     }
 
     let mut visited = HashSet::new();
-    db.process_record_with_links("SRC_OUT", &mut visited, 0)
+    db.process_record_with_links("SRC_OUT", &mut visited)
         .await
         .unwrap();
 
@@ -9042,7 +8970,7 @@ async fn test_pp_out_link_processes_passive_target() {
     }
 
     let mut visited = HashSet::new();
-    db.process_record_with_links("SRC_PP", &mut visited, 0)
+    db.process_record_with_links("SRC_PP", &mut visited)
         .await
         .unwrap();
 
@@ -9081,7 +9009,7 @@ async fn mr_r5_foreign_process_blocks_on_held_epoch() {
             // epoch holds.
             let mut visited = HashSet::new();
             let _ = db2
-                .process_record_with_links("MR_R5_MEMBER", &mut visited, 0)
+                .process_record_with_links("MR_R5_MEMBER", &mut visited)
                 .await;
             processed2.store(1, Ordering::SeqCst);
         });
@@ -9125,7 +9053,7 @@ async fn mr_r5_already_locked_process_does_not_self_deadlock() {
     // gate-acquiring entry back would not even compile here; before H6 this
     // was a `tokio::time::timeout` around the same call.
     let mut visited = HashSet::new();
-    let res = db.process_record_with_links_already_locked("MR_R5_OWNED", &mut visited, 0);
+    let res = db.process_record_with_links_already_locked("MR_R5_OWNED", &mut visited);
     res.expect("owner-path processing of an owned member must succeed");
     // The marker unwinds with the frame (`dbDbLink.c:521-526`), so what a
     // completed call leaves behind is an empty set, not a record of itself.
@@ -9338,7 +9266,7 @@ async fn br_fr3_ca_link_applies_maximize_switch_at_processing() {
             inst.common.udf = 0;
         }
         let mut visited = HashSet::new();
-        db.process_record_with_links("CADST", &mut visited, 0)
+        db.process_record_with_links("CADST", &mut visited)
             .await
             .unwrap();
         let rec = db.get_record("CADST").expect("record exists");
@@ -9425,7 +9353,7 @@ async fn test_lsi_mpst_always_posts_value_on_unchanged_cycle() {
         // Cycle 1 commits oval/olen for the seeded "hello", so cycle 2 is
         // genuinely unchanged (value_changed == false).
         let mut visited = HashSet::new();
-        db.process_record_with_links("LSI_MPST", &mut visited, 0)
+        db.process_record_with_links("LSI_MPST", &mut visited)
             .await
             .unwrap();
 
@@ -9440,7 +9368,7 @@ async fn test_lsi_mpst_always_posts_value_on_unchanged_cycle() {
         // Cycle 2: no new value. Without MPST this posts nothing; with
         // MPST == Always it must still post a DBE_VALUE event.
         let mut visited = HashSet::new();
-        db.process_record_with_links("LSI_MPST", &mut visited, 0)
+        db.process_record_with_links("LSI_MPST", &mut visited)
             .await
             .unwrap();
 
@@ -9495,7 +9423,7 @@ async fn sub_record_subroutine_runs_on_main_engine_path() {
 
     // Drive the MAIN engine path (not process_local).
     let mut visited = HashSet::new();
-    db.process_record_with_links("SUBM", &mut visited, 0)
+    db.process_record_with_links("SUBM", &mut visited)
         .await
         .unwrap();
 
@@ -9547,7 +9475,7 @@ async fn sub_record_hihi_alarm_fires_via_shared_owner() {
 
     for name in ["SUB_HIHI", "SUB_OK"] {
         let mut visited = HashSet::new();
-        db.process_record_with_links(name, &mut visited, 0)
+        db.process_record_with_links(name, &mut visited)
             .await
             .unwrap();
     }
@@ -9620,7 +9548,7 @@ async fn sub_record_mdel_gates_val_monitor() {
                 .unwrap();
         }
         let mut visited = HashSet::new();
-        db.process_record_with_links("SUB_MDEL", &mut visited, 0)
+        db.process_record_with_links("SUB_MDEL", &mut visited)
             .await
             .unwrap();
         let arc = db.get_record("SUB_MDEL").unwrap();
@@ -9700,7 +9628,7 @@ async fn sub_record_negative_status_raises_soft_alarm_at_brsv() {
     for name in ["SUB_SOFT", "SUB_OK0"] {
         for _ in 0..2 {
             let mut visited = HashSet::new();
-            db.process_record_with_links(name, &mut visited, 0)
+            db.process_record_with_links(name, &mut visited)
                 .await
                 .unwrap();
         }
@@ -9772,7 +9700,7 @@ async fn asub_record_val_is_return_status_and_negative_soft_alarms() {
 
     for name in ["ASUB_POS", "ASUB_NEG"] {
         let mut visited = HashSet::new();
-        db.process_record_with_links(name, &mut visited, 0)
+        db.process_record_with_links(name, &mut visited)
             .await
             .unwrap();
     }
@@ -9924,7 +9852,7 @@ async fn asub_lflg_read_reresolves_subroutine_from_subl_link() {
         let db = db.clone();
         async move {
             let mut visited = HashSet::new();
-            db.process_record_with_links("ASUB_L", &mut visited, 0)
+            db.process_record_with_links("ASUB_L", &mut visited)
                 .await
                 .unwrap();
         }
@@ -10026,7 +9954,7 @@ record(aSub, "ASUB_S") {
     // The routine was wired at init; processing runs it and publishes its
     // return status as VAL (C `aSubRecord.c:224`).
     let mut visited = HashSet::new();
-    db.process_record_with_links("ASUB_S", &mut visited, 0)
+    db.process_record_with_links("ASUB_S", &mut visited)
         .await
         .unwrap();
     let arc = db.get_record("ASUB_S").unwrap();
@@ -10109,7 +10037,7 @@ record(aSub, "ASUB_INIT") {
     // SNAM process routine is still wired alongside INAM: aSub publishes its
     // return status as VAL (C `aSubRecord.c:224`).
     let mut visited = HashSet::new();
-    db.process_record_with_links("ASUB_INIT", &mut visited, 0)
+    db.process_record_with_links("ASUB_INIT", &mut visited)
         .await
         .unwrap();
     assert_eq!(
@@ -10216,7 +10144,7 @@ async fn test_ao_incremental_dol_increments_from_pval_not_val() {
 
     // Cycle 1: PVAL=0, DOL=10 -> VAL = 0 + 10 = 10, PVAL becomes 10.
     let mut visited = HashSet::new();
-    db.process_record_with_links("AO_INCR_DST", &mut visited, 0)
+    db.process_record_with_links("AO_INCR_DST", &mut visited)
         .await
         .unwrap();
     let v1 = db.get_pv("AO_INCR_DST").unwrap();
@@ -10245,7 +10173,7 @@ async fn test_ao_incremental_dol_increments_from_pval_not_val() {
     // Cycle 2: increment from PVAL(10), not the caput VAL(100):
     // VAL = 10 + 5 = 15 (C), not 100 + 5 = 105 (pre-fix Rust).
     let mut visited2 = HashSet::new();
-    db.process_record_with_links("AO_INCR_DST", &mut visited2, 0)
+    db.process_record_with_links("AO_INCR_DST", &mut visited2)
         .await
         .unwrap();
     let v2 = db.get_pv("AO_INCR_DST").unwrap();
@@ -10280,7 +10208,7 @@ async fn ao_constant_dol_seeded_at_init_not_reapplied_at_process() {
 
     // Process once: the constant must not be re-sourced; VAL stays 7.
     let mut visited = HashSet::new();
-    db.process_record_with_links("AO_CONST", &mut visited, 0)
+    db.process_record_with_links("AO_CONST", &mut visited)
         .await
         .unwrap();
     let v1 = db.get_pv("AO_CONST").unwrap();
@@ -10299,7 +10227,7 @@ async fn ao_constant_dol_seeded_at_init_not_reapplied_at_process() {
     }
     // Reprocess: the constant DOL is never re-fetched, so the caput wins.
     let mut visited2 = HashSet::new();
-    db.process_record_with_links("AO_CONST", &mut visited2, 0)
+    db.process_record_with_links("AO_CONST", &mut visited2)
         .await
         .unwrap();
     let v2 = db.get_pv("AO_CONST").unwrap();
@@ -10328,7 +10256,7 @@ async fn ao_constant_dol_incremental_does_not_increment() {
     // Process three times: a constant must not accumulate (5, 10, 15...).
     for _ in 0..3 {
         let mut visited = HashSet::new();
-        db.process_record_with_links("AO_CONST_INCR", &mut visited, 0)
+        db.process_record_with_links("AO_CONST_INCR", &mut visited)
             .await
             .unwrap();
     }
@@ -10368,7 +10296,7 @@ async fn longout_constant_dol_seeded_at_init_not_reapplied_at_process() {
         inst.record.put_field("VAL", EpicsValue::Long(99)).unwrap();
     }
     let mut visited = HashSet::new();
-    db.process_record_with_links("LO_CONST", &mut visited, 0)
+    db.process_record_with_links("LO_CONST", &mut visited)
         .await
         .unwrap();
     let v1 = db.get_pv("LO_CONST").unwrap();
@@ -10412,7 +10340,7 @@ async fn stringout_constant_dol_seeded_at_init_not_reapplied_at_process() {
             .unwrap();
     }
     let mut visited = HashSet::new();
-    db.process_record_with_links("SO_CONST", &mut visited, 0)
+    db.process_record_with_links("SO_CONST", &mut visited)
         .await
         .unwrap();
     let v1 = db.get_pv("SO_CONST").unwrap();
@@ -10590,7 +10518,7 @@ async fn calcout_odly_defers_forward_link_to_delayed_cycle() {
     // delaying-cycle FLNK fires synchronously inside process_record_with_links
     // if at all, so this assertion is race-free.
     let mut visited = HashSet::new();
-    db.process_record_with_links("CO6_SRC", &mut visited, 0)
+    db.process_record_with_links("CO6_SRC", &mut visited)
         .await
         .unwrap();
     assert_eq!(
@@ -10601,7 +10529,7 @@ async fn calcout_odly_defers_forward_link_to_delayed_cycle() {
 
     // Delayed (callback) cycle: C fires recGblFwdLink exactly once here.
     let mut visited2 = HashSet::new();
-    db.process_record_continuation("CO6_SRC", &mut visited2, 0)
+    db.process_record_continuation("CO6_SRC", &mut visited2)
         .await
         .unwrap();
     assert_eq!(
@@ -10640,7 +10568,7 @@ async fn sel_specified_mode_fetches_only_the_selected_input() {
     db.add_record("R7_SEL", Box::new(sel)).await.unwrap();
 
     let mut visited = HashSet::new();
-    db.process_record_with_links("R7_SEL", &mut visited, 0)
+    db.process_record_with_links("R7_SEL", &mut visited)
         .await
         .unwrap();
 
@@ -10699,7 +10627,7 @@ async fn sel_high_mode_fetches_all_inputs() {
     db.add_record("R7H_SEL", Box::new(sel)).await.unwrap();
 
     let mut visited = HashSet::new();
-    db.process_record_with_links("R7H_SEL", &mut visited, 0)
+    db.process_record_with_links("R7H_SEL", &mut visited)
         .await
         .unwrap();
 
@@ -10750,7 +10678,7 @@ async fn sel_specified_mode_freezes_value_when_selected_link_fails() {
     db.add_record("R8_SEL", Box::new(sel)).await.unwrap();
 
     let mut visited = HashSet::new();
-    db.process_record_with_links("R8_SEL", &mut visited, 0)
+    db.process_record_with_links("R8_SEL", &mut visited)
         .await
         .unwrap();
 
@@ -10787,7 +10715,7 @@ async fn sel_specified_mode_freezes_value_when_nvl_link_fails() {
     db.add_record("R8N_SEL", Box::new(sel)).await.unwrap();
 
     let mut visited = HashSet::new();
-    db.process_record_with_links("R8N_SEL", &mut visited, 0)
+    db.process_record_with_links("R8N_SEL", &mut visited)
         .await
         .unwrap();
 
@@ -10819,7 +10747,7 @@ async fn sel_specified_mode_empty_selected_link_computes_nan_not_frozen() {
     db.add_record("R8_SEL_EMPTY", Box::new(sel)).await.unwrap();
 
     let mut visited = HashSet::new();
-    db.process_record_with_links("R8_SEL_EMPTY", &mut visited, 0)
+    db.process_record_with_links("R8_SEL_EMPTY", &mut visited)
         .await
         .unwrap();
 
@@ -11083,7 +11011,7 @@ async fn test_permissive_oval_oflg_not_monitor_posted() {
     }
 
     let mut visited = HashSet::new();
-    db.process_record_with_links("PERM", &mut visited, 0)
+    db.process_record_with_links("PERM", &mut visited)
         .await
         .unwrap();
 
@@ -11140,7 +11068,7 @@ async fn test_state_oval_not_monitor_posted() {
     }
 
     let mut visited = HashSet::new();
-    db.process_record_with_links("ST", &mut visited, 0)
+    db.process_record_with_links("ST", &mut visited)
         .await
         .unwrap();
 
@@ -11196,7 +11124,7 @@ async fn test_put_time_post_is_the_only_post_for_that_put() {
     // The next process cycle re-reads every subscribed field. SVAL has not
     // moved since the put published it, so C's `monitor()` sends nothing.
     let mut visited = HashSet::new();
-    db.process_record_with_links("PUTPOST", &mut visited, 0)
+    db.process_record_with_links("PUTPOST", &mut visited)
         .await
         .unwrap();
     assert!(
@@ -11214,7 +11142,7 @@ async fn test_put_time_post_is_the_only_post_for_that_put() {
             .unwrap();
     }
     let mut visited = HashSet::new();
-    db.process_record_with_links("PUTPOST", &mut visited, 0)
+    db.process_record_with_links("PUTPOST", &mut visited)
         .await
         .unwrap();
     sval_rx

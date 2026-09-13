@@ -65,7 +65,7 @@ fn val_of(rec: &str, v: i64) -> EpicsValue {
 async fn drive(db: &PvDatabase, rec: &str, val: i64) -> AlarmSeverity {
     db.put_pv(rec, val_of(rec, val)).await.unwrap();
     let mut visited = HashSet::new();
-    db.process_record_with_links(rec, &mut visited, 0)
+    db.process_record_with_links(rec, &mut visited)
         .await
         .unwrap();
     db.get_record(rec).unwrap().read().common.sevr

@@ -115,6 +115,13 @@ pub struct ConnConfig {
 /// nothing else (`MonitorOp::queueSize`, `clientmon.cpp:52,683-699`).
 pub(crate) enum IoidSlot {
     /// Pipelined two-frame ops (GET, PUT, RPC): FIFO queue of oneshots.
+    ///
+    /// The registrant owns the entry's lifetime: `unregister_ioid` (the
+    /// op's `IoidGuard`) removes it, or the warm-GET path replaces it
+    /// with [`Self::Reusable`]. The reader only pops senders — it never
+    /// removes a drained queue, because that removal races the op task's
+    /// replacement (the reader's send is what wakes that task) and would
+    /// delete the `Reusable` slot the next GET reply is routed to.
     TwoShot(VecDeque<oneshot::Sender<Frame>>),
     /// Multi-frame ops whose frame count the op itself bounds (GetField,
     /// PUT sequences, RPC, PUT_GET, ARRAY, PROCESS): unbounded channel.
@@ -1293,7 +1300,8 @@ impl ServerConn {
         backlog
     }
 
-    /// Register a reusable single-frame slot for warm-GET reuse.
+    /// Register a reusable single-frame slot for warm-GET reuse,
+    /// replacing the op's `TwoShot` entry for the same ioid.
     ///
     /// Caller keeps the returned `Arc<Mutex<Option<oneshot>>>` and
     /// refills it with a fresh oneshot before each warm-GET frame
@@ -1742,13 +1750,10 @@ fn route_frame_checked(
         if let Some(mut entry) = by_ioid.get_mut(&ioid) {
             match entry.value_mut() {
                 IoidSlot::TwoShot(q) => {
+                    // A drained queue stays registered: the entry belongs
+                    // to the op that registered it (see `IoidSlot::TwoShot`).
                     if let Some(tx) = q.pop_front() {
                         let _ = tx.send(frame);
-                    }
-                    // If queue is now empty, remove the entry entirely.
-                    if q.is_empty() {
-                        drop(entry);
-                        by_ioid.remove(&ioid);
                     }
                 }
                 IoidSlot::Stream(tx) => {
@@ -3721,5 +3726,74 @@ mod tests {
             assert_eq!(&got, b"live");
             acceptor.join().expect("acceptor thread");
         }
+    }
+
+    /// The reader only pops a `TwoShot` sender; it must not remove the
+    /// drained entry. The op task that registered it is woken by that very
+    /// send and immediately replaces the entry with a `Reusable` slot
+    /// (`register_ioid_reusable`), so a reader-side removal after the send
+    /// races the replacement and deletes the slot the next warm-GET reply
+    /// is routed to — the reply then drops silently and the GET times out.
+    #[test]
+    fn route_frame_leaves_a_drained_twoshot_entry_to_its_registrant() {
+        let (by_ioid, by_cid, by_sid_close, ioid_to_sid, ioid_to_cmd, writer_tx, cancel) =
+            fresh_router();
+        let ioid = 7u32;
+        let order = ByteOrder::Little;
+        let get_frame = || {
+            let mut payload = Vec::new();
+            payload.put_u32(ioid, order);
+            payload.put_u8(0x00);
+            let header =
+                PvaHeader::application(true, order, Command::Get.code(), payload.len() as u32);
+            Frame { header, payload }
+        };
+        let route = |frame: Frame| {
+            route_frame(
+                frame,
+                &by_ioid,
+                &by_cid,
+                &by_sid_close,
+                &ioid_to_sid,
+                &ioid_to_cmd,
+                &Arc::new(DashMap::new()),
+                &writer_tx,
+                &cancel,
+            )
+        };
+
+        let (tx_init, mut rx_init) = oneshot::channel::<Frame>();
+        let (tx_data, mut rx_data) = oneshot::channel::<Frame>();
+        let mut q = std::collections::VecDeque::new();
+        q.push_back(tx_init);
+        q.push_back(tx_data);
+        by_ioid.insert(ioid, IoidSlot::TwoShot(q));
+        ioid_to_cmd.insert(ioid, Command::Get.code());
+
+        route(get_frame());
+        route(get_frame());
+        assert!(
+            rx_init.try_recv().is_ok(),
+            "INIT reply must reach the first sender"
+        );
+        assert!(
+            rx_data.try_recv().is_ok(),
+            "DATA reply must reach the second sender"
+        );
+        assert!(
+            by_ioid.contains_key(&ioid),
+            "a drained TwoShot entry stays registered for the op that owns it"
+        );
+
+        // The op task's transition to the warm-GET slot, then one warm GET.
+        let (tx_warm, mut rx_warm) = oneshot::channel::<Frame>();
+        let slot = Arc::new(Mutex::new(Some(tx_warm)));
+        by_ioid.insert(ioid, IoidSlot::Reusable(slot));
+        route(get_frame());
+        assert!(
+            rx_warm.try_recv().is_ok(),
+            "the warm GET reply must route to the Reusable slot"
+        );
+        assert!(!cancel.is_cancelled());
     }
 }

@@ -112,7 +112,7 @@ record(aao, "AAO:CL") {
         .unwrap();
 
     let mut visited = HashSet::new();
-    db.process_record_with_links("AAO:CL", &mut visited, 0)
+    db.process_record_with_links("AAO:CL", &mut visited)
         .await
         .unwrap();
 

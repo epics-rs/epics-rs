@@ -935,7 +935,7 @@ impl epics_pva_rs::server_native::ChannelSource for QsrvPvStore {
             let mut visited = std::collections::HashSet::new();
             provider
                 .database()
-                .process_record_with_links(&cn.record, &mut visited, 0)
+                .process_record_with_links(&cn.record, &mut visited)
                 .await
                 .map_err(|e| OpError::failed(format!("PROCESS on '{name}': {e}")))
         }

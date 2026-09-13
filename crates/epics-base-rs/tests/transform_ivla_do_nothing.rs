@@ -44,9 +44,7 @@ async fn invalid_source(db: &PvDatabase) {
             .unwrap();
     }
     let mut v = HashSet::new();
-    db.process_record_with_links("SRC", &mut v, 0)
-        .await
-        .unwrap();
+    db.process_record_with_links("SRC", &mut v).await.unwrap();
     assert_eq!(
         db.get_record("SRC").unwrap().read().common.sevr,
         AlarmSeverity::Invalid,
@@ -81,7 +79,7 @@ async fn r9_61_ivla_do_nothing_skips_calc_and_every_output_link() {
     add_transform(&db, 1).await; // IVLA = "Do Nothing"
 
     let mut v = HashSet::new();
-    db.process_record_with_links("TR", &mut v, 0).await.unwrap();
+    db.process_record_with_links("TR", &mut v).await.unwrap();
 
     // C reads the input links BEFORE the IVLA test, so A carries the fresh
     // value even on the abandoned cycle.
@@ -124,7 +122,7 @@ async fn r9_61_ivla_ignore_error_still_calcs_and_drives_outputs() {
     add_transform(&db, 0).await; // IVLA = "Ignore error"
 
     let mut v = HashSet::new();
-    db.process_record_with_links("TR", &mut v, 0).await.unwrap();
+    db.process_record_with_links("TR", &mut v).await.unwrap();
 
     assert_eq!(
         tr_field(&db, "B").await,

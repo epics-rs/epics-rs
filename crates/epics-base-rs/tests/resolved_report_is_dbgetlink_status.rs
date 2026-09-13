@@ -116,7 +116,7 @@ async fn cycle(lnk: &str) -> (bool, f64, AlarmSeverity) {
     .unwrap();
 
     let mut visited = HashSet::new();
-    let _ = db.process_record_with_links("P", &mut visited, 0).await;
+    let _ = db.process_record_with_links("P", &mut visited).await;
 
     let inst = db.get_record("P").unwrap();
     let guard = inst.read();

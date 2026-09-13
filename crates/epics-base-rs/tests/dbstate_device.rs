@@ -43,13 +43,13 @@ record(bi, "DBST_BI") {
         .await
         .unwrap();
     let mut v = HashSet::new();
-    db.process_record_with_links("DBST_BO", &mut v, 0)
+    db.process_record_with_links("DBST_BO", &mut v)
         .await
         .unwrap();
 
     // bi process → reads the bit into VAL (device read, skip-convert).
     let mut v = HashSet::new();
-    db.process_record_with_links("DBST_BI", &mut v, 0)
+    db.process_record_with_links("DBST_BI", &mut v)
         .await
         .unwrap();
 
@@ -73,11 +73,11 @@ record(bi, "DBST_BI") {
         .await
         .unwrap();
     let mut v = HashSet::new();
-    db.process_record_with_links("DBST_BO", &mut v, 0)
+    db.process_record_with_links("DBST_BO", &mut v)
         .await
         .unwrap();
     let mut v = HashSet::new();
-    db.process_record_with_links("DBST_BI", &mut v, 0)
+    db.process_record_with_links("DBST_BI", &mut v)
         .await
         .unwrap();
     {
@@ -145,7 +145,7 @@ record(bi, "DBST_NONAME") {
 
     for _ in 0..3 {
         let mut v = HashSet::new();
-        db.process_record_with_links("DBST_NONAME", &mut v, 0)
+        db.process_record_with_links("DBST_NONAME", &mut v)
             .await
             .unwrap();
     }

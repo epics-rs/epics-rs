@@ -44,7 +44,7 @@ async fn load(db: &PvDatabase, name: &str, fields: &[(&str, &str)]) {
 
 async fn process(db: &PvDatabase, name: &str) {
     let mut visited = HashSet::new();
-    db.process_record_with_links(name, &mut visited, 0)
+    db.process_record_with_links(name, &mut visited)
         .await
         .unwrap();
 }

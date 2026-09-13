@@ -94,7 +94,7 @@ async fn r14_62_failing_local_out_put_raises_link_invalid_same_cycle() {
     add_ao_with_out(&db, "AO_BADOUT", "NO_SUCH_TARGET").await;
 
     let mut visited = HashSet::new();
-    db.process_record_with_links("AO_BADOUT", &mut visited, 0)
+    db.process_record_with_links("AO_BADOUT", &mut visited)
         .await
         .unwrap();
 
@@ -117,7 +117,7 @@ async fn r14_62_failing_external_out_put_raises_link_invalid() {
     add_ao_with_out(&db, "AO_BADCA", "ca://REMOTE:OUT").await;
 
     let mut visited = HashSet::new();
-    db.process_record_with_links("AO_BADCA", &mut visited, 0)
+    db.process_record_with_links("AO_BADCA", &mut visited)
         .await
         .unwrap();
 
@@ -146,7 +146,7 @@ async fn r14_62_failing_siol_sim_write_raises_link_invalid() {
     db.add_record("AO_BADSIOL", Box::new(ao)).await.unwrap();
 
     let mut visited = HashSet::new();
-    db.process_record_with_links("AO_BADSIOL", &mut visited, 0)
+    db.process_record_with_links("AO_BADSIOL", &mut visited)
         .await
         .unwrap();
 
@@ -170,7 +170,7 @@ async fn r14_62_successful_put_next_cycle_clears_the_link_alarm() {
     add_ao_with_out(&db, "AO_RECOVER", "ca://REMOTE:OUT").await;
 
     let mut visited = HashSet::new();
-    db.process_record_with_links("AO_RECOVER", &mut visited, 0)
+    db.process_record_with_links("AO_RECOVER", &mut visited)
         .await
         .unwrap();
     assert_eq!(
@@ -189,7 +189,7 @@ async fn r14_62_successful_put_next_cycle_clears_the_link_alarm() {
     .await;
 
     let mut visited = HashSet::new();
-    db.process_record_with_links("AO_RECOVER", &mut visited, 0)
+    db.process_record_with_links("AO_RECOVER", &mut visited)
         .await
         .unwrap();
 
@@ -223,7 +223,7 @@ async fn r14_62_successful_local_out_put_raises_no_alarm() {
     add_ao_with_out(&db, "AO_GOODOUT", "AO_GOOD_DEST").await;
 
     let mut visited = HashSet::new();
-    db.process_record_with_links("AO_GOODOUT", &mut visited, 0)
+    db.process_record_with_links("AO_GOODOUT", &mut visited)
         .await
         .unwrap();
 

@@ -35,7 +35,7 @@ async fn scalcout_ivov_drives_oval_not_val_on_calc_fail() {
     db.add_record("SC_IVOV", Box::new(sc)).await.unwrap();
 
     let mut visited = HashSet::new();
-    db.process_record_with_links("SC_IVOV", &mut visited, 0)
+    db.process_record_with_links("SC_IVOV", &mut visited)
         .await
         .unwrap();
 

@@ -143,7 +143,7 @@ async fn a_char_waveform_linked_into_an_enum_waveform_lands_signed() {
 
 async fn process(db: &PvDatabase, rec: &str) {
     let mut visited = HashSet::new();
-    db.process_record_with_links(rec, &mut visited, 0)
+    db.process_record_with_links(rec, &mut visited)
         .await
         .expect("process");
 }

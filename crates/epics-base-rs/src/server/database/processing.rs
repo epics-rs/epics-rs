@@ -29,10 +29,9 @@ const STRING_FIELD_MAX_LEN: usize = 39;
 /// ```
 ///
 /// so a refusal is never a silent success: the record carries SCAN_ALARM /
-/// INVALID with the reason in `AMSG`, and the transition is posted. Every
-/// refusal the port can make routes through here — C's `MAX_LOCK` re-entry and
-/// the port's own `MAX_LINK_DEPTH` bound, which C does not have at all and
-/// which must therefore be at least as audible as C's.
+/// INVALID with the reason in `AMSG`, and the transition is posted. The one
+/// refusal the port can make, C's `MAX_LOCK` re-entry, routes through here;
+/// like C, the port has no link-depth bound.
 ///
 /// Returns the post set for the caller to hand to `notify_from_snapshot` after
 /// releasing the write guard, or `None` when the record already carries this
@@ -216,7 +215,7 @@ impl AsyncToken {
             return Ok(());
         }
         let mut visited = HashSet::new();
-        db.process_record_continuation(&self.name, &mut visited, 0)
+        db.process_record_continuation(&self.name, &mut visited)
             .await
     }
 }
@@ -761,7 +760,7 @@ impl PvDatabase {
         // path now exists only as an internal record-body unit-test helper.
         // Acquires the entry record's advisory write gate (foreign caller).
         let mut visited = HashSet::new();
-        self.process_record_with_links(name, &mut visited, 0).await
+        self.process_record_with_links(name, &mut visited).await
     }
 
     /// `process_record` variant for a caller that already
@@ -773,11 +772,11 @@ impl PvDatabase {
         // Same delegation as [`Self::process_record`], but to the gate-held
         // engine entry since the caller already owns the advisory write gate.
         let mut visited = HashSet::new();
-        self.process_record_with_links_already_locked(name, &mut visited, 0)
+        self.process_record_with_links_already_locked(name, &mut visited)
     }
 
     /// Process a record with full link handling (INP -> process -> alarms -> OUT -> FLNK).
-    /// Uses visited set for cycle detection and depth limit.
+    /// Uses the visited set for cycle detection.
     ///
     /// Foreign-caller entry: FLNK dispatch, scan loop, scan_event, CA put,
     /// process(PROC=1) etc. Hits the PACT entry guard (mirrors C `dbProcess`
@@ -798,10 +797,9 @@ impl PvDatabase {
         &'a self,
         name: &'a str,
         visited: &'a mut HashSet<String>,
-        depth: usize,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = CaResult<()>> + Send + 'a>> {
         Box::pin(async move {
-            self.process_record_with_links_inner(name, visited, depth, false, true, false)
+            self.process_record_with_links_inner(name, visited, false, true, false)
                 .await
         })
     }
@@ -830,7 +828,6 @@ impl PvDatabase {
         &'a self,
         name: &'a str,
         visited: &'a mut HashSet<String>,
-        depth: usize,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = CaResult<()>> + Send + 'a>> {
         Box::pin(async move {
             // C `devAsynInt32.c::outputCallbackCallback` (asyn devEpics):
@@ -847,7 +844,7 @@ impl PvDatabase {
             // entry (C fallback `getCallbackValue`) so 1 callback == 1 pop.
             self.arm_readback_callback(name);
             let result = self
-                .process_record_with_links_inner(name, visited, depth, false, true, true)
+                .process_record_with_links_inner(name, visited, false, true, true)
                 .await;
             self.reconcile_readback_callback(name);
             result
@@ -911,9 +908,8 @@ impl PvDatabase {
         &self,
         name: &str,
         visited: &mut HashSet<String>,
-        depth: usize,
     ) -> CaResult<()> {
-        self.run_process_frame(name, visited, depth, false, false, false)
+        self.run_process_frame(name, visited, false, false, false)
     }
 
     /// One record's process frame: entry bookkeeping, the optional advisory
@@ -939,15 +935,13 @@ impl PvDatabase {
         &self,
         name: &str,
         visited: &mut HashSet<String>,
-        depth: usize,
         acquire_gate: bool,
         is_continuation: bool,
         device_callback: bool,
     ) -> CaResult<()> {
-        // A `None` here never inserted (the depth bound returns above the
-        // insert) or found the name already present, in which case the marker
-        // is the outer frame's — either way there is nothing to unwind.
-        let Some((name, rec)) = self.process_entry_prelude(name, visited, depth)? else {
+        // A `None` here found the name already present, so the marker is the
+        // outer frame's and there is nothing to unwind.
+        let Some((name, rec)) = self.process_entry_prelude(name, visited)? else {
             return Ok(());
         };
 
@@ -1008,7 +1002,6 @@ impl PvDatabase {
             &name,
             &rec,
             visited,
-            depth,
             is_continuation,
             device_callback,
         );
@@ -1037,7 +1030,7 @@ impl PvDatabase {
     /// call and on no other: the caller is the lock set's dedicated thread,
     /// which exists to be parked, never a runtime worker.
     pub(crate) fn process_record_for_breakpoint(&self, name: &str) -> CaResult<()> {
-        self.run_process_frame(name, &mut HashSet::new(), 0, true, false, false)
+        self.run_process_frame(name, &mut HashSet::new(), true, false, false)
     }
 
     /// recursive FLNK / OUT / CP fan-out entry within a single
@@ -1056,9 +1049,8 @@ impl PvDatabase {
         &self,
         name: &str,
         visited: &mut HashSet<String>,
-        depth: usize,
     ) -> CaResult<()> {
-        self.run_process_frame(name, visited, depth, false, false, false)
+        self.run_process_frame(name, visited, false, false, false)
     }
 
     /// Owner-driven continuation re-entry — bypasses the PACT entry guard.
@@ -1081,10 +1073,9 @@ impl PvDatabase {
         &'a self,
         name: &'a str,
         visited: &'a mut HashSet<String>,
-        depth: usize,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = CaResult<()>> + Send + 'a>> {
         Box::pin(async move {
-            self.process_record_with_links_inner(name, visited, depth, true, true, false)
+            self.process_record_with_links_inner(name, visited, true, true, false)
                 .await
         })
     }
@@ -1615,7 +1606,6 @@ impl PvDatabase {
                     field: link_field,
                 },
                 &mut visited,
-                0,
             );
         }
         // Release the initiator's own count (C `dbProcessNotify` holds one
@@ -1711,8 +1701,8 @@ impl PvDatabase {
     }
 
     /// The entry bookkeeping every process entry shares, before the advisory
-    /// write gate is (or is not) taken: alias normalisation, the depth / ops
-    /// budgets, the `visited` cycle guard and the records-map lookup.
+    /// write gate is (or is not) taken: alias normalisation, the `visited`
+    /// cycle guard and the records-map lookup.
     ///
     /// Factored out so the gate-taking entry
     /// ([`Self::process_record_with_links_inner`]) and the two gate-free
@@ -1722,11 +1712,11 @@ impl PvDatabase {
     ///
     /// `Ok(None)` is "this entry did not run"; `Err` is C's `S_db_notFound`.
     ///
-    /// None of those non-runs is silent. Both resource bounds go through
-    /// [`Self::refuse_bounded_entry`], which raises the record's alarm and
-    /// logs before it hands back the `Ok(None)`; the cycle guard goes through
-    /// [`Self::count_refused_active_entry`], which is C's already-active arm.
-    /// So a non-run cannot be written as a bare `return Ok(None)` here.
+    /// A non-run is not silent: the cycle guard goes through
+    /// [`Self::count_refused_active_entry`], which is C's already-active arm,
+    /// so it cannot be written as a bare `return Ok(None)` here. There is no
+    /// other non-run — C's `dbProcess` (`dbAccess.c:485`) has no link-depth
+    /// counter, and neither does the port.
     ///
     /// Every `Ok(None)` is built by [`Self::entry_did_not_run`], which is
     /// also where the put-notify wait-set is released, so a non-run cannot
@@ -1735,20 +1725,13 @@ impl PvDatabase {
         &self,
         name: &str,
         visited: &mut HashSet<String>,
-        depth: usize,
     ) -> CaResult<Option<(String, Arc<parking_lot::RwLock<RecordInstance>>)>> {
-        const MAX_LINK_DEPTH: usize = 16;
-
         // Normalise to the canonical record name once at entry — both
         // for cycle-detection (`visited` would otherwise treat alias
         // and canonical as distinct entries) and for the records-map
         // lookup below. Mirrors epics-base PR #336.
         let name: String = self.resolve_alias(name).unwrap_or_else(|| name.to_string());
 
-        if depth >= MAX_LINK_DEPTH {
-            return self
-                .refuse_bounded_entry(&name, &format!("link chain depth limit {MAX_LINK_DEPTH}"));
-        }
         let rec = {
             let records = self.inner.records.read();
             records.get(&name).cloned()
@@ -1853,19 +1836,20 @@ impl PvDatabase {
     /// on the will-process branch, *before* the recursion enters the prelude:
     ///
     /// ```text
-    /// links.rs:1514   let pact = tg.is_processing();
-    /// links.rs:1516   if !pact { tg.common.putf = src_putf;
-    /// links.rs:1517              join_put_notify(&mut tg, src_notify); }   // ws.enter()
-    /// links.rs:1528   self.process_record_with_links_recursive(target, visited, depth + 1)
+    /// links.rs:1561   let pact = tg.is_processing();
+    /// links.rs:1562   if !pact { tg.common.putf = src_putf;
+    /// links.rs:1564              tg.join_put_notify(src_notify); }   // ws.enter()
+    /// links.rs:1575   self.process_record_with_links_recursive(target, visited)
     /// ```
     ///
-    /// So by the time a bound, or the cycle guard, decides the entry will not
-    /// run, the target is already counted in the wait-set — and nothing
+    /// So by the time the cycle guard decides the entry will not run, the
+    /// target is already counted in the wait-set — and nothing
     /// downstream will ever `leave` for it, because the only `leave`s are on
     /// paths that ran a cycle. The set never drains, the completion oneshot
     /// never fires, and the client's `CA_PROTO_WRITE_NOTIFY` gets no reply
-    /// (measured on x86_64-wrs-vxworks: the first put into a chain past
-    /// `MAX_LINK_DEPTH` never replied over 90s, and `RTEMS:E8:L16` was left
+    /// (measured on x86_64-wrs-vxworks while the port still refused entries
+    /// past a 16-hop depth bound: the first put into a longer chain never
+    /// replied over 90s, and `RTEMS:E8:L16` was left
     /// holding a wait-set that could never drain — after which every later put
     /// completed, because `join_put_notify`'s `notify.is_none()` guard stops a
     /// record that already holds a stale set from joining a live one).
@@ -1899,67 +1883,6 @@ impl PvDatabase {
         Ok(None)
     }
 
-    /// Refuse a process entry that hit one of the port's own resource bounds,
-    /// and make the refusal audible before returning it.
-    ///
-    /// C has no depth counter and no ops budget: `processTarget`
-    /// (`dbDbLink.c:427-436`) only marks the source `pact` and recurses, so a
-    /// chain of any length runs and only a genuine cycle stops. The port keeps
-    /// bounds because each link level is a `Pin<Box<dyn Future>>` on the
-    /// calling thread's stack and an unbounded chain is a stack overflow on an
-    /// embedded target — but a bound C does not have must not be quieter than
-    /// the refusal C does have. So the record ends in SCAN_ALARM / INVALID with
-    /// the reason in `AMSG` ([`scan_alarm_refusal`], C `dbAccess.c:544-556`),
-    /// and the reason goes to `errlog` where an operator reads it, not to a
-    /// bare `eprintln!` that no IOC log ever sees.
-    ///
-    /// Returns the prelude's "did not run" value so that the only way to write
-    /// a bound bail is through this function.
-    fn refuse_bounded_entry(
-        &self,
-        name: &str,
-        why: &str,
-    ) -> CaResult<Option<(String, Arc<parking_lot::RwLock<RecordInstance>>)>> {
-        let rec = {
-            let records = self.inner.records.read();
-            records.get(name).cloned()
-        };
-        // The record the chain could not reach may not exist — a dangling FLNK
-        // at the bound. The refusal is still reported; there is simply nothing
-        // to raise it on.
-        let repeat = match &rec {
-            Some(rec) => {
-                let snapshot = {
-                    let mut instance = rec.write();
-                    scan_alarm_refusal(&mut instance, why)
-                };
-                match snapshot {
-                    Some(snapshot) => {
-                        // Resolved with no guard held, as above.
-                        let backing = self.resolve_link_backed_metadata(rec);
-                        let backing = crate::server::database::LinkBacking::resolved(&backing);
-                        rec.read().notify_from_snapshot(&snapshot, backing);
-                        false
-                    }
-                    // Already refused and still in SCAN_ALARM/INVALID: C posts
-                    // nothing on a repeat, and repeating the log line for every
-                    // put into the same over-long chain would drown the first
-                    // one. Only the alarm and the log are debounced — the
-                    // wait-set release below is not, because every refused
-                    // entry joined its own put-notify.
-                    None => true,
-                }
-            }
-            None => false,
-        };
-        if !repeat {
-            crate::runtime::log::errlog_printf(&format!(
-                "dbProcess: {name} not processed, {why} exceeded\n"
-            ));
-        }
-        self.entry_did_not_run(rec.as_ref())
-    }
-
     /// The gate-taking entry — the ONLY `.await` in the whole H6 chain.
     ///
     /// Everything after the guard is bound lives in
@@ -1972,7 +1895,6 @@ impl PvDatabase {
         &self,
         name: &str,
         visited: &mut HashSet<String>,
-        depth: usize,
         is_continuation: bool,
         acquire_gate: bool,
         // This cycle is driven by a driver interrupt callback
@@ -1985,7 +1907,6 @@ impl PvDatabase {
         self.run_process_frame(
             name,
             visited,
-            depth,
             acquire_gate,
             is_continuation,
             device_callback,
@@ -2197,7 +2118,6 @@ impl PvDatabase {
         name: &str,
         rec: &Arc<parking_lot::RwLock<RecordInstance>>,
         visited: &mut HashSet<String>,
-        depth: usize,
         is_continuation: bool,
         device_callback: bool,
     ) -> CaResult<()> {
@@ -2469,7 +2389,7 @@ impl PvDatabase {
         let sim_output = match sim_outcome {
             SimOutcome::NotSimulated => None,
             SimOutcome::Simulated(posts) => {
-                self.run_forward_link_tail(name, &rec, posts, visited, depth);
+                self.run_forward_link_tail(name, &rec, posts, visited);
                 self.end_process_cycle(name, &rec, cycle_end.take());
                 return Ok(());
             }
@@ -2497,7 +2417,7 @@ impl PvDatabase {
                         let mut instance = rec.write();
                         sim_process_tail(&mut instance, tsel, false, link_backing)
                     };
-                    self.run_forward_link_tail(name, &rec, posts, visited, depth);
+                    self.run_forward_link_tail(name, &rec, posts, visited);
                     self.end_process_cycle(name, &rec, cycle_end.take());
                     return Ok(());
                 }
@@ -2654,11 +2574,10 @@ impl PvDatabase {
                         matches!(a, crate::server::record::ProcessAction::ReadDbLink { .. })
                     });
                 if !reads.is_empty() {
-                    pre_input_resolved =
-                        self.execute_read_db_links(name, &rec, &reads, visited, depth);
+                    pre_input_resolved = self.execute_read_db_links(name, &rec, &reads, visited);
                 }
                 if !others.is_empty() {
-                    self.execute_process_actions(name, &rec, others, visited, depth);
+                    self.execute_process_actions(name, &rec, others, visited);
                 }
             }
         }
@@ -2668,7 +2587,7 @@ impl PvDatabase {
         // `devSiSoft.c:53`, `devLsiSoft.c:32` — so an ENUM/MENU source
         // delivers its state label, not the index).
         let inp_value = self
-            .read_link_value_soft(&inp_parsed, is_soft, visited, depth)
+            .read_link_value_soft(&inp_parsed, is_soft, visited)
             .and_then(|v| self.typed_input_value(&rec, "INP", &inp_parsed, v));
 
         // C `readLocked` (`devAiSoft.c:54-63`): the same `dbLinkDoLocked` that
@@ -2764,7 +2683,7 @@ impl PvDatabase {
                 // DOL with `DBR_STRING` (`stringoutRecord.c:141`), lso via
                 // `dbGetLinkLS` (`lsoRecord.c:114`) — an ENUM/MENU DOL source
                 // delivers its label, not the index.
-                let fetch = self.db_get_input_link(&rec, "DOL", dol_parsed, visited, depth);
+                let fetch = self.db_get_input_link(&rec, "DOL", dol_parsed, visited);
                 self.convert_link_fetch(&rec, "DOL", dol_parsed, fetch).0
             });
         // C's `if (status)` on the closed-loop DOL read, read twice below: once
@@ -2819,7 +2738,7 @@ impl PvDatabase {
             };
             if !nvl_str.is_empty() {
                 let parsed = crate::server::record::parse_link_v2(nvl_str.as_str_lossy().as_ref());
-                let fetch = self.db_get_input_link(&rec, "NVL", &parsed, visited, depth);
+                let fetch = self.db_get_input_link(&rec, "NVL", &parsed, visited);
                 sel_nvl_read_failed = !fetch.is_ok();
                 fetch.value()
             } else {
@@ -2925,7 +2844,7 @@ impl PvDatabase {
                     // path. Without this, calc/sel/sub/aSub INPA..INPL
                     // PP links read a stale source value.
                     if let crate::server::record::ParsedLink::Db(ref db) = parsed {
-                        self.process_passive_db_source(db, visited, depth);
+                        self.process_passive_db_source(db, visited);
                     }
                     // The record's declared per-link request (printf reads a
                     // `%s` slot with `DBR_STRING`, `printfRecord.c:291`) is
@@ -3073,7 +2992,7 @@ impl PvDatabase {
                 }
                 let parsed = crate::server::record::parse_link_v2(link_str);
                 if let crate::server::record::ParsedLink::Db(ref db) = parsed {
-                    self.process_passive_db_source(db, visited, depth);
+                    self.process_passive_db_source(db, visited);
                 }
                 // C `sCalcoutRecord.c:916` / `:934` read these with `dbGetLink`
                 // like every other input, so a failed one raises `setLinkAlarm`
@@ -3513,8 +3432,7 @@ impl PvDatabase {
             // await 1 (guard-free): pre-process ReadDbLink resolution. `name` is
             // the record's resolved canonical name (== `instance.name`).
             if !pre_actions.is_empty() {
-                let pre_resolved =
-                    self.execute_read_db_links(name, &rec, &pre_actions, visited, depth);
+                let pre_resolved = self.execute_read_db_links(name, &rec, &pre_actions, visited);
                 resolved_link_fields.extend(pre_resolved);
             }
 
@@ -3711,7 +3629,7 @@ impl PvDatabase {
 
                 // PACT stays set; skip alarm/timestamp/snapshot/OUT/FLNK.
                 // But still execute any actions (e.g., ReprocessAfter for delayed re-entry).
-                self.execute_process_actions(name, &rec, process_actions, visited, depth);
+                self.execute_process_actions(name, &rec, process_actions, visited);
                 // After every action this arm runs, so the ordering rule holds
                 // whatever the outcome carried. The `ReprocessAfter` a pending
                 // cycle usually arms cannot overtake this: the continuation
@@ -3739,7 +3657,7 @@ impl PvDatabase {
                 // there is nothing to run — return without awaiting
                 // `execute_process_actions`, which would enlarge this hot
                 // recursive function's async frame (the FLNK chain nests one
-                // poll frame per hop up to MAX_LINK_DEPTH; the write guard
+                // poll frame per hop, unbounded as in C; the write guard
                 // `instance` is released on return).
                 debug_assert!(
                     process_actions.is_empty(),
@@ -3855,13 +3773,13 @@ impl PvDatabase {
                                 | crate::server::record::ProcessAction::WriteDbLinkNotify { .. }
                         )
                     });
-                self.execute_process_actions(name, &rec, link_writes, visited, depth);
+                self.execute_process_actions(name, &rec, link_writes, visited);
                 self.publish_post_write_fields(name, post_write_fields);
                 {
                     let inst = rec.read();
                     inst.notify_from_snapshot(&snapshot, link_backing);
                 }
-                self.execute_process_actions(name, &rec, deferred_actions, visited, depth);
+                self.execute_process_actions(name, &rec, deferred_actions, visited);
                 // Same as the `AsyncPending` arm: run the restart check through the
                 // single drain owner, which is a no-op if this pass re-took PACT.
                 self.apply_pact_exit(name, &rec, cycle_end.take());
@@ -4563,7 +4481,7 @@ impl PvDatabase {
                     field: "OUT",
                 };
                 if let Some((ref link, ref out_val)) = out_info {
-                    self.write_out_link_value(&rec, link, out_val.clone(), src, visited, depth);
+                    self.write_out_link_value(&rec, link, out_val.clone(), src, visited);
                 }
                 // C `longoutRecord.c:492-493`, OUTSIDE `if (doDevSupWrite)`:
                 // the OOPT reference advances on a suppressed cycle too, which
@@ -4571,7 +4489,7 @@ impl PvDatabase {
                 if reached_conditional_write {
                     rec.write().record.after_output_decision();
                 }
-                self.dispatch_multi_output_values(&rec, src, skip_out, visited, depth);
+                self.dispatch_multi_output_values(&rec, src, skip_out, visited);
                 // The value-putting multi-output records — dfanout `OUTn`, seq
                 // `LNKn` — push HERE, with the record's other outputs, so the
                 // whole output stage sits between `checkAlarms` and the alarm
@@ -4586,10 +4504,9 @@ impl PvDatabase {
                     &rec,
                     super::links::MultiOutPhase::Output { skip_out },
                     visited,
-                    depth,
                 );
-                self.write_simulated_output_siol(&rec, &sim_output, skip_out, src, visited, depth);
-                self.execute_process_actions(name, &rec, link_writes, visited, depth);
+                self.write_simulated_output_siol(&rec, &sim_output, skip_out, src, visited);
+                self.execute_process_actions(name, &rec, link_writes, visited);
                 // Every link-carried output of the cycle has now run, so the
                 // withheld stores become visible here — still ahead of Segment
                 // E, which therefore change-detects against the published value
@@ -4607,7 +4524,7 @@ impl PvDatabase {
             // above; PACT was set by the dispatch before it spawned, so the
             // chain cannot complete ahead of it.
             if dispatched.went_async {
-                self.execute_process_actions(name, &rec, process_actions, visited, depth);
+                self.execute_process_actions(name, &rec, process_actions, visited);
                 self.apply_pact_exit(name, &rec, cycle_end.take());
                 return Ok(());
             }
@@ -4766,7 +4683,8 @@ impl PvDatabase {
         // dispatched by the shared deferred-actions site at the tail, NOT a
         // separate `execute_process_actions().await` here — adding one would
         // enlarge this hot recursive function's async frame (see the
-        // `CompleteNoEmit` note above; it overflowed the chain-depth guard).
+        // `CompleteNoEmit` note above; it overflowed the stack in the deep-chain
+        // tests).
         // Holding `processing=true` also makes the tail's putf-clear (gated on
         // `!is_processing()`) a no-op, leaving putf for the continuation.
         if result_is_defer_output {
@@ -4811,7 +4729,6 @@ impl PvDatabase {
                     posts,
                 },
                 visited,
-                depth,
             );
         }
 
@@ -4839,7 +4756,7 @@ impl PvDatabase {
         // output (C `transformRecord.c:605-621` / `scalerRecord.c:457-480`
         // put before `monitor()` + `recGblFwdLink()`), so a downstream FLNK
         // target still reads the freshly written value.
-        self.execute_process_actions(name, &rec, process_actions, visited, depth);
+        self.execute_process_actions(name, &rec, process_actions, visited);
 
         // 9. C `recGbl.c::recGblFwdLink:302` clears `putf = FALSE` at the
         // tail of every synchronous process cycle, NOT just on the
@@ -4972,7 +4889,6 @@ impl PvDatabase {
         rec: &Arc<parking_lot::RwLock<RecordInstance>>,
         posts: CyclePosts,
         visited: &mut std::collections::HashSet<String>,
-        depth: usize,
     ) {
         let (flnk_name, src_putf, src_notify) = {
             let instance = rec.read();
@@ -4997,7 +4913,6 @@ impl PvDatabase {
                 posts,
             },
             visited,
-            depth,
         );
     }
 
@@ -5013,7 +4928,6 @@ impl PvDatabase {
         flnk_name: Option<&str>,
         src: TailCtx<'_>,
         visited: &mut std::collections::HashSet<String>,
-        depth: usize,
     ) {
         // 4.5. Multi-output dispatch, forward-link phase: fanout only. Its
         // `LNK0..LNKF` are `DBF_FWDLINK` — `dbScanFwdLink`, no value, no put
@@ -5022,12 +4936,7 @@ impl PvDatabase {
         // `process_record_with_links_inner`, so a failed put's LINK_ALARM
         // folds into the same cycle's SEVR; the `ForwardLink` phase argument
         // skips them here (`multi_out_phase_of`).
-        let _ = self.dispatch_multi_output(
-            rec,
-            super::links::MultiOutPhase::ForwardLink,
-            visited,
-            depth,
-        );
+        let _ = self.dispatch_multi_output(rec, super::links::MultiOutPhase::ForwardLink, visited);
 
         // 4.55. event record: post the named software event.
         self.dispatch_event_record(rec);
@@ -5047,7 +4956,6 @@ impl PvDatabase {
                 src.putf,
                 src.notify,
                 visited,
-                depth,
             );
         }
 
@@ -5062,7 +4970,7 @@ impl PvDatabase {
         // 6. CP link targets -- holders of a CP/CPP link on this record,
         // driven by what this cycle POSTED (see `CyclePosts`), not by the
         // fact that it processed.
-        self.dispatch_cp_targets(name, src.posts, visited, depth);
+        self.dispatch_cp_targets(name, src.posts, visited);
 
         // 7. RPRO: if reprocess requested, clear flag and queue a
         // fresh process pass.
@@ -5075,7 +4983,7 @@ impl PvDatabase {
         //
         // Spawning a detached task is the Rust equivalent of the
         // scanOnce queue: the reprocess runs on its own task, so it must
-        // carry its own `visited` and start at depth 0 — the current
+        // carry its own `visited` — the current
         // chain's set is a `&mut` local to that stack and cannot be
         // shared. That is now the ONLY reason for the fresh set. It used
         // to be doing double duty as an escape hatch from the cycle
@@ -5103,7 +5011,7 @@ impl PvDatabase {
                     async move {
                         let mut fresh_visited = std::collections::HashSet::new();
                         let _ = db
-                            .process_record_with_links(&rpro_name, &mut fresh_visited, 0)
+                            .process_record_with_links(&rpro_name, &mut fresh_visited)
                             .await;
                     },
                 );
@@ -5216,7 +5124,6 @@ impl PvDatabase {
         link_field: &'static str,
         target_field: &'static str,
         visited: &mut HashSet<String>,
-        depth: usize,
     ) -> bool {
         let (reader_name, link_str) = {
             let instance = rec.read();
@@ -5255,7 +5162,7 @@ impl PvDatabase {
             return true;
         };
         use crate::server::recgbl::simm::LinkFetch;
-        match self.read_link_value_as(&parsed, read_as, visited, depth) {
+        match self.read_link_value_as(&parsed, read_as, visited) {
             // C `dbConstGetValue`: SUCCESS with nothing written. The target
             // field keeps what it holds (a client's `caput SELN 5` survives a
             // `field(SELL,"3")`), no LINK alarm is raised, and the link did NOT
@@ -5317,7 +5224,6 @@ impl PvDatabase {
         rec: &Arc<parking_lot::RwLock<RecordInstance>>,
         actions: &[crate::server::record::ProcessAction],
         visited: &mut HashSet<String>,
-        depth: usize,
     ) -> Vec<&'static str> {
         use crate::server::record::ProcessAction;
         let mut resolved = Vec::new();
@@ -5327,7 +5233,7 @@ impl PvDatabase {
                     link_field,
                     target_field,
                 } => {
-                    if self.read_db_link_into_field(rec, link_field, target_field, visited, depth) {
+                    if self.read_db_link_into_field(rec, link_field, target_field, visited) {
                         resolved.push(*link_field);
                     }
                 }
@@ -5378,7 +5284,6 @@ impl PvDatabase {
         rec: &Arc<parking_lot::RwLock<RecordInstance>>,
         actions: Vec<crate::server::record::ProcessAction>,
         visited: &mut HashSet<String>,
-        depth: usize,
     ) {
         use crate::server::record::ProcessAction;
 
@@ -5392,8 +5297,7 @@ impl PvDatabase {
                     // C `dbGetLink` -> `setLinkAlarm`) belongs to ONE owner, so
                     // an input link cannot fail silently on one stage and
                     // loudly on another.
-                    let _ =
-                        self.read_db_link_into_field(rec, link_field, target_field, visited, depth);
+                    let _ = self.read_db_link_into_field(rec, link_field, target_field, visited);
                 }
                 // A pre-process action (the record asks for the target BEFORE it
                 // decides), so it is a no-op if it reaches the post-process
@@ -5460,7 +5364,6 @@ impl PvDatabase {
                             field: link_field,
                         },
                         visited,
-                        depth,
                     );
                     // The record-owned half of the put's outcome. The alarm
                     // half was already raised by `write_out_link_value`; this
@@ -5538,7 +5441,7 @@ impl PvDatabase {
                             crate::runtime::task::CallbackPriority::Medium,
                             async move {
                                 let mut visited = HashSet::new();
-                                let _ = db.process_record_with_links(&name, &mut visited, 0).await;
+                                let _ = db.process_record_with_links(&name, &mut visited).await;
                             },
                         );
                     }
@@ -5595,7 +5498,6 @@ impl PvDatabase {
                                 field: link_field,
                             },
                             visited,
-                            depth,
                         );
                     }
                     // Release the initiator's own wait-set count (C
@@ -5651,7 +5553,7 @@ impl PvDatabase {
             let canonical: String = self.resolve_alias(name).unwrap_or_else(|| name.to_string());
             let _record_gate = self.lock_record(&canonical);
             let mut visited = HashSet::new();
-            self.complete_async_record_inner(name, &mut visited, 0)
+            self.complete_async_record_inner(name, &mut visited)
         })
     }
 
@@ -5659,7 +5561,6 @@ impl PvDatabase {
         &self,
         name: &str,
         visited: &mut HashSet<String>,
-        depth: usize,
     ) -> CaResult<()> {
         // Alias-aware entry — same pattern as
         // `process_record_with_links_inner`. `name` may arrive as an
@@ -5887,7 +5788,7 @@ impl PvDatabase {
                 field: "OUT",
             };
             if let Some((ref link, ref out_val)) = out_info {
-                self.write_out_link_value(&rec, link, out_val.clone(), src, visited, depth);
+                self.write_out_link_value(&rec, link, out_val.clone(), src, visited);
             }
             // Same `conditional_write` epilogue as the synchronous stage. C
             // runs it on the async device's first pass as well (the record
@@ -5897,7 +5798,7 @@ impl PvDatabase {
             if !skip_out {
                 rec.write().record.after_output_decision();
             }
-            self.dispatch_multi_output_values(&rec, src, skip_out, visited, depth);
+            self.dispatch_multi_output_values(&rec, src, skip_out, visited);
 
             // Phase 3 — fresh write guard for the alarm commit + monitor tail.
             let mut instance = rec.write();
@@ -6071,12 +5972,7 @@ impl PvDatabase {
         // completion — it is C's `asyncFinish` for the DLYn group chain
         // (`seqRecord.c:219-241`) — and its groups have already run, so
         // re-dispatching them here would drive every LNKn twice.
-        let _ = self.dispatch_multi_output(
-            &rec,
-            super::links::MultiOutPhase::ForwardLink,
-            visited,
-            depth,
-        );
+        let _ = self.dispatch_multi_output(&rec, super::links::MultiOutPhase::ForwardLink, visited);
 
         // event record: post the named software event.
         self.dispatch_event_record(&rec);
@@ -6091,7 +5987,6 @@ impl PvDatabase {
                 src_putf,
                 src_notify.as_ref(),
                 visited,
-                depth,
             );
         }
 
@@ -6103,11 +5998,11 @@ impl PvDatabase {
 
         // CP link targets — gated on what this cycle posted, as on the
         // synchronous tail.
-        self.dispatch_cp_targets(name, posts, visited, depth);
+        self.dispatch_cp_targets(name, posts, visited);
 
         // RPRO: C `recGblFwdLink` consumes a pending reprocess via
         // `scanOnce` — queued, not recursed. Mirror the synchronous
-        // path: spawn a fresh process pass (clean `visited`, depth 0).
+        // path: spawn a fresh process pass (clean `visited`).
         {
             let needs_rpro = {
                 let mut guard = rec.write();
@@ -6130,7 +6025,7 @@ impl PvDatabase {
                     async move {
                         let mut fresh_visited = std::collections::HashSet::new();
                         let _ = db
-                            .process_record_with_links(&rpro_name, &mut fresh_visited, 0)
+                            .process_record_with_links(&rpro_name, &mut fresh_visited)
                             .await;
                     },
                 );
@@ -6211,14 +6106,13 @@ impl PvDatabase {
         name: &str,
         posts: CyclePosts,
         visited: &mut std::collections::HashSet<String>,
-        depth: usize,
     ) {
         if !posts.triggers_cp() {
             return;
         }
         let cp_targets = self.get_cp_targets(name);
         for target in cp_targets {
-            self.process_one_cp_target(&target, visited, depth);
+            self.process_one_cp_target(&target, visited);
         }
     }
 
@@ -6238,7 +6132,6 @@ impl PvDatabase {
         &self,
         target: &super::CpTarget,
         visited: &mut std::collections::HashSet<String>,
-        depth: usize,
     ) {
         if visited.contains(&target.record) {
             return;
@@ -6269,7 +6162,7 @@ impl PvDatabase {
         }
         // recursive CP-target fan-out within one chain —
         // gate already held by the foreign entry record.
-        let _ = self.process_record_with_links_recursive(&target.record, visited, depth + 1);
+        let _ = self.process_record_with_links_recursive(&target.record, visited);
     }
 
     /// Process every holder of an EXTERNAL CP/CPP link to `external_pv` —
@@ -6282,7 +6175,7 @@ impl PvDatabase {
     /// only trigger; without it a `CP`/`CPP` link's holder never processes
     /// on a remote change.
     ///
-    /// A fresh `visited` set and `depth = 0` start a new process chain —
+    /// A fresh `visited` set starts a new process chain —
     /// the monitor event is an independent external trigger, like a scan,
     /// not a continuation of an in-flight local chain.
     pub fn dispatch_external_cp_targets(&self, external_pv: &str) {
@@ -6292,7 +6185,7 @@ impl PvDatabase {
         }
         let mut visited = std::collections::HashSet::new();
         for target in targets {
-            self.process_one_cp_target(&target, &mut visited, 0);
+            self.process_one_cp_target(&target, &mut visited);
         }
     }
 
@@ -6319,8 +6212,8 @@ impl PvDatabase {
     ///
     /// Kept as its own `async fn` so the `EpicsValue` it reads out of the
     /// record never enters `process_record_with_links_inner`'s async state —
-    /// that future is polled `MAX_LINK_DEPTH` frames deep on a FLNK chain, and
-    /// bloating it overflows the stack (the depth-limit regression tests).
+    /// that future is polled one frame deeper per FLNK hop, unbounded as in C,
+    /// and bloating it overflows the stack sooner (the deep-chain tests).
     fn write_simulated_output_siol(
         &self,
         rec: &Arc<parking_lot::RwLock<RecordInstance>>,
@@ -6328,7 +6221,6 @@ impl PvDatabase {
         skip_out: bool,
         src: super::links::OutLinkSrc<'_>,
         visited: &mut std::collections::HashSet<String>,
-        depth: usize,
     ) {
         let Some((siol, _sims, raw_mode)) = sim_output else {
             return;
@@ -6363,7 +6255,6 @@ impl PvDatabase {
                     ..src
                 },
                 visited,
-                depth,
             );
         }
     }
@@ -6468,10 +6359,9 @@ impl PvDatabase {
         link_field: &str,
         link: &crate::server::record::ParsedLink,
         visited: &mut HashSet<String>,
-        depth: usize,
     ) -> crate::server::recgbl::simm::LinkFetch {
         if let crate::server::record::ParsedLink::Db(db) = link {
-            self.process_passive_db_source(db, visited, depth);
+            self.process_passive_db_source(db, visited);
         }
         self.db_get_link(reader, link_field, link)
     }

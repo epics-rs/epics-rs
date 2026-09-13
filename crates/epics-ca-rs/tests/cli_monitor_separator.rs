@@ -78,7 +78,7 @@ async fn server_with_ao(pv: &'static str, val: f64) -> u16 {
     let mut visited = std::collections::HashSet::new();
     server
         .database()
-        .process_record_with_links(pv, &mut visited, 0)
+        .process_record_with_links(pv, &mut visited)
         .await
         .expect("seed process");
     tokio::spawn(async move { server.run().await });

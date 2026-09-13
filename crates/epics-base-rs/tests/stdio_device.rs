@@ -80,7 +80,7 @@ async fn build_and_process(db_content: &str, record: &str) -> AlarmSeverity {
         .unwrap();
 
     let mut visited = HashSet::new();
-    db.process_record_with_links(record, &mut visited, 0)
+    db.process_record_with_links(record, &mut visited)
         .await
         .unwrap();
 
@@ -146,7 +146,7 @@ async fn stdio_lso_prints_char_array_val_to_errlog() {
     .unwrap();
 
     let mut visited = HashSet::new();
-    db.process_record_with_links("LSO_ERR", &mut visited, 0)
+    db.process_record_with_links("LSO_ERR", &mut visited)
         .await
         .unwrap();
 

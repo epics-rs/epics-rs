@@ -62,7 +62,7 @@ async fn swait_db(mdel: f64, adel: f64) -> PvDatabase {
 
 async fn process(db: &PvDatabase, rec: &str) {
     let mut visited = HashSet::new();
-    db.process_record_with_links(rec, &mut visited, 0)
+    db.process_record_with_links(rec, &mut visited)
         .await
         .unwrap();
 }

@@ -182,7 +182,7 @@ async fn cycles_posted(mpst: i16, name: &str) -> usize {
     let mut events = 0;
     for _ in 0..6 {
         let mut visited = std::collections::HashSet::new();
-        db.process_record_with_links(name, &mut visited, 0)
+        db.process_record_with_links(name, &mut visited)
             .await
             .unwrap();
         while rx.try_recv().is_ok() {

@@ -27,7 +27,7 @@ use epics_base_rs::types::EpicsValue;
 
 async fn process(db: &PvDatabase, name: &str) {
     let mut v = HashSet::new();
-    db.process_record_with_links(name, &mut v, 0).await.unwrap();
+    db.process_record_with_links(name, &mut v).await.unwrap();
 }
 
 /// seq is an async record in C — `process` sets `prec->pact = TRUE` and hands

@@ -1183,7 +1183,7 @@ impl ChannelSource for PvDatabaseSource {
                     // PROCESS targets the whole record, not a field, so it
                     // runs on the resolved record name.
                     let mut visited = std::collections::HashSet::new();
-                    db.process_record_with_links(&cn.record, &mut visited, 0)
+                    db.process_record_with_links(&cn.record, &mut visited)
                         .await
                         .map_err(|e| OpError::failed(e.to_string()))
                 }

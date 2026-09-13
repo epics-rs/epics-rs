@@ -51,7 +51,7 @@ async fn add_source(db: &PvDatabase) {
 
 async fn process(db: &PvDatabase, name: &str) {
     let mut v = HashSet::new();
-    db.process_record_with_links(name, &mut v, 0).await.unwrap();
+    db.process_record_with_links(name, &mut v).await.unwrap();
 }
 
 async fn alarm_of(db: &PvDatabase, name: &str) -> (u16, AlarmSeverity) {

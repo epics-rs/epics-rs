@@ -1419,41 +1419,24 @@ pub fn canonical_changed_bitset(
 ///
 /// Bit numbering matches the rest of this module (pvData §5.4): root is
 /// bit 0, fields depth-first in declaration order.
+///
+/// Each path is resolved to its bit span (`FieldDesc::bit_span_for_path`)
+/// and the span set: work proportional to the marked paths, not to the
+/// descriptor — this runs on every monitor post. A path that names no field
+/// marks nothing, and so does the empty path: the root is not a markable
+/// node (only its leaves ever reach the wire).
 pub fn marked_changed_bitset(desc: &FieldDesc, marked_paths: &[String]) -> crate::proto::BitSet {
-    fn set_subtree(out: &mut crate::proto::BitSet, bit_offset: usize, desc: &FieldDesc) {
-        let total = desc.total_bits();
-        for i in 0..total {
-            out.set(bit_offset + i);
+    let mut out = crate::proto::BitSet::new();
+    for path in marked_paths {
+        if path.is_empty() {
+            continue;
         }
-    }
-    fn walk(
-        desc: &FieldDesc,
-        bit_offset: usize,
-        prefix: &str,
-        marked: &[String],
-        out: &mut crate::proto::BitSet,
-    ) {
-        // A node whose full path is explicitly marked contributes its
-        // whole subtree; no need to descend further.
-        if !prefix.is_empty() && marked.iter().any(|m| m == prefix) {
-            set_subtree(out, bit_offset, desc);
-            return;
-        }
-        if let FieldDesc::Structure { fields, .. } = desc {
-            let mut child_bit = bit_offset + 1;
-            for (name, child) in fields {
-                let child_path = if prefix.is_empty() {
-                    name.clone()
-                } else {
-                    format!("{prefix}.{name}")
-                };
-                walk(child, child_bit, &child_path, marked, out);
-                child_bit += child.total_bits();
+        if let Some((start, end)) = desc.bit_span_for_path(path) {
+            for bit in start..end {
+                out.set(bit);
             }
         }
     }
-    let mut out = crate::proto::BitSet::new();
-    walk(desc, 0, "", marked_paths, &mut out);
     out
 }
 
@@ -1495,9 +1478,10 @@ pub fn marked_wire_changed_bitset(
 /// paths whose bit is set in `changed`, respecting pvData parent-bit
 /// compression — a node whose OWN bit is set yields that node's path and
 /// its subtree is not descended (matching how `marked_changed_bitset`
-/// expands a marked parent path back into the whole subtree). The walk
-/// (bit numbering, prefix construction, `total_bits` stride) is identical
-/// to `marked_changed_bitset`'s, so the round trip
+/// expands a marked parent path back into the whole subtree). The walk's
+/// bit numbering and `total_bits` stride are those of
+/// `FieldDesc::bit_span_for_path`, which `marked_changed_bitset` resolves
+/// through, so the round trip
 /// `marked_changed_bitset(desc, &changed_bitset_paths(desc, &bs))`
 /// reproduces any node-aligned `bs`.
 ///
@@ -3853,6 +3837,11 @@ mod tests {
 
         // Empty target set and an unknown path both produce nothing.
         assert_eq!(marked_changed_bitset(&desc, &[]).count(), 0);
+        assert_eq!(
+            marked_changed_bitset(&desc, &[String::new()]).count(),
+            0,
+            "the empty path names the root, which is never a marked node"
+        );
         assert_eq!(
             marked_changed_bitset(&desc, &["nope".to_string()]).count(),
             0,

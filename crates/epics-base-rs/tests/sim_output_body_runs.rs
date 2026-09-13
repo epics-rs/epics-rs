@@ -59,7 +59,7 @@ async fn sim_output_runs_ao_oroc_body_writes_limited_oval_to_siol() {
         .unwrap();
 
     let mut v1 = HashSet::new();
-    db.process_record_with_links("AOROC", &mut v1, 0)
+    db.process_record_with_links("AOROC", &mut v1)
         .await
         .unwrap();
 
@@ -106,9 +106,7 @@ async fn sim_output_runs_bo_high_momentary_reset_in_sim_mode() {
 
     // Fresh cycle: body runs, writes VAL=1 to SIOL, and arms the HIGH reset.
     let mut v1 = HashSet::new();
-    db.process_record_with_links("BOHI", &mut v1, 0)
-        .await
-        .unwrap();
+    db.process_record_with_links("BOHI", &mut v1).await.unwrap();
 
     let tgt = db.get_pv("BOHI_TGT").unwrap();
     assert!(
@@ -129,7 +127,7 @@ async fn sim_output_runs_bo_high_momentary_reset_in_sim_mode() {
         );
     }
     let mut v2 = HashSet::new();
-    db.process_record_continuation("BOHI", &mut v2, 0)
+    db.process_record_continuation("BOHI", &mut v2)
         .await
         .unwrap();
 
@@ -171,9 +169,7 @@ async fn sim_output_sims_invalid_does_not_veto_siol_write() {
     db.add_record("AOIV", Box::new(ao)).await.unwrap();
 
     let mut v1 = HashSet::new();
-    db.process_record_with_links("AOIV", &mut v1, 0)
-        .await
-        .unwrap();
+    db.process_record_with_links("AOIV", &mut v1).await.unwrap();
 
     // SIMM_ALARM makes the committed SEVR INVALID...
     let sevr = db.get_pv("AOIV.SEVR").unwrap();
@@ -227,9 +223,7 @@ async fn sim_output_real_invalid_alarm_ivoa_dont_drive_suppresses() {
         .unwrap();
 
     let mut v1 = HashSet::new();
-    db.process_record_with_links("BOIV", &mut v1, 0)
-        .await
-        .unwrap();
+    db.process_record_with_links("BOIV", &mut v1).await.unwrap();
 
     let sevr = db.get_pv("BOIV.SEVR").unwrap();
     assert!(
@@ -287,7 +281,7 @@ async fn sim_output_simm_alarm_loses_stat_on_severity_tie() {
         .unwrap();
 
     let mut v1 = HashSet::new();
-    db.process_record_with_links("BOTIE", &mut v1, 0)
+    db.process_record_with_links("BOTIE", &mut v1)
         .await
         .unwrap();
 

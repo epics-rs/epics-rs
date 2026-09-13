@@ -53,7 +53,7 @@ async fn a_foreign_process_inside_the_high_window_does_not_release_the_pulse() {
     // `caput B 1` — the put, then the process it triggers.
     db.put_pv("B", EpicsValue::Enum(1)).await.unwrap();
     let mut visited = HashSet::new();
-    db.process_record_with_links("B", &mut visited, 0)
+    db.process_record_with_links("B", &mut visited)
         .await
         .unwrap();
     assert_eq!(db.get_pv("B").unwrap(), EpicsValue::Enum(1));
@@ -61,7 +61,7 @@ async fn a_foreign_process_inside_the_high_window_does_not_release_the_pulse() {
 
     // The second process is NOT the timer — it must leave the pulse alone.
     let mut visited = HashSet::new();
-    db.process_record_with_links("B", &mut visited, 0)
+    db.process_record_with_links("B", &mut visited)
         .await
         .unwrap();
     assert_eq!(
@@ -91,13 +91,13 @@ async fn a_foreign_process_does_not_clear_a_busy_flag_early() {
 
     db.put_pv("BSY", EpicsValue::Enum(1)).await.unwrap();
     let mut visited = HashSet::new();
-    db.process_record_with_links("BSY", &mut visited, 0)
+    db.process_record_with_links("BSY", &mut visited)
         .await
         .unwrap();
     assert_eq!(db.get_pv("BSY").unwrap(), EpicsValue::Enum(1));
 
     let mut visited = HashSet::new();
-    db.process_record_with_links("BSY", &mut visited, 0)
+    db.process_record_with_links("BSY", &mut visited)
         .await
         .unwrap();
     assert_eq!(
@@ -130,7 +130,7 @@ record(bo, "SB") {
 
     db.put_pv("SB", EpicsValue::Enum(1)).await.unwrap();
     let mut visited = HashSet::new();
-    db.process_record_with_links("SB", &mut visited, 0)
+    db.process_record_with_links("SB", &mut visited)
         .await
         .unwrap();
     assert_eq!(db.get_pv("ST").unwrap(), EpicsValue::Long(1));

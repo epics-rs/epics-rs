@@ -76,7 +76,7 @@ async fn the_declared_tse_decides_whether_the_remote_time_survives() {
 
     for name in ["TSEP_UNDEC", "TSEP_DEV"] {
         let mut visited = HashSet::new();
-        db.process_record_with_links(name, &mut visited, 0)
+        db.process_record_with_links(name, &mut visited)
             .await
             .unwrap();
     }

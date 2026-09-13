@@ -1582,7 +1582,7 @@ impl GroupChannel {
                     self.db.put_pv_already_locked(&pv, value).map_err(to_err)?;
                     let mut visited = std::collections::HashSet::new();
                     self.db
-                        .process_record_with_links_already_locked(record_name, &mut visited, 0)
+                        .process_record_with_links_already_locked(record_name, &mut visited)
                         .map_err(to_err)?;
                 }
             }
@@ -1629,7 +1629,7 @@ impl GroupChannel {
                     self.db.put_pv(&pv, value).await.map_err(to_err)?;
                     let mut visited = std::collections::HashSet::new();
                     self.db
-                        .process_record_with_links(record_name, &mut visited, 0)
+                        .process_record_with_links(record_name, &mut visited)
                         .await
                         .map_err(to_err)?;
                 }

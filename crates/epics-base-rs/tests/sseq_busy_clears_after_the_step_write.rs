@@ -109,7 +109,7 @@ async fn busy_is_still_set_while_the_step_write_is_being_made() {
     db.add_record("SS_ORD", Box::new(sseq)).await.unwrap();
 
     let mut visited = HashSet::new();
-    db.process_record_with_links("SS_ORD", &mut visited, 0)
+    db.process_record_with_links("SS_ORD", &mut visited)
         .await
         .unwrap();
 

@@ -513,15 +513,14 @@ impl PvDatabase {
 
     /// Read a value from a parsed link (DB, Constant, or external Ca/Pva).
     ///
-    /// `visited` / `depth` are the caller's processing-chain state so a
-    /// PP source is processed within the same chain — see
-    /// [`Self::process_passive_db_source`] for why a fresh set / depth 0
-    /// would defeat the cycle guard.
+    /// `visited` is the caller's processing-chain state so a PP source is
+    /// processed within the same chain — see
+    /// [`Self::process_passive_db_source`] for why a fresh set would
+    /// defeat the cycle guard.
     pub(crate) fn read_link_value(
         &self,
         link: &crate::server::record::ParsedLink,
         visited: &mut HashSet<String>,
-        depth: usize,
     ) -> Option<EpicsValue> {
         match link {
             crate::server::record::ParsedLink::None => None,
@@ -549,10 +548,10 @@ impl PvDatabase {
             crate::server::record::ParsedLink::Constant(_) => None,
             crate::server::record::ParsedLink::Db(db) => {
                 // PP: process source record if Passive before reading.
-                // Threads the caller's `visited`/`depth` so an A↔B PP
+                // Threads the caller's `visited` so an A↔B PP
                 // cycle terminates at the existing cycle guard instead
                 // of recursing with a fresh set.
-                self.process_passive_db_source(db, visited, depth);
+                self.process_passive_db_source(db, visited);
                 self.read_db_link_value(db)
             }
             // Hardware links are dispatched by device support directly
@@ -596,10 +595,9 @@ impl PvDatabase {
         link: &crate::server::record::ParsedLink,
         read_as: crate::server::record::LinkReadAs,
         visited: &mut HashSet<String>,
-        depth: usize,
     ) -> crate::server::recgbl::simm::LinkFetch {
         use crate::server::recgbl::simm::LinkFetch;
-        let Some(value) = self.read_link_value(link, visited, depth) else {
+        let Some(value) = self.read_link_value(link, visited) else {
             return empty_read_fetch(link);
         };
         match self.apply_link_read_as(link, read_as, value) {
@@ -686,7 +684,7 @@ impl PvDatabase {
     /// target record.
     ///
     /// Distinct from [`Self::read_link_value`], which threads
-    /// `visited`/`depth` to PP-process a Passive DB source before reading
+    /// `visited` to PP-process a Passive DB source before reading
     /// (the INPUT-link path). `dbGetLink` does no such processing, so the
     /// DB arm here reads with a plain `get_pv` exactly as the pre-fix
     /// control-link sites did.
@@ -1415,9 +1413,9 @@ impl PvDatabase {
     /// multi-input fetch loop (`INPA..INPL` for calc/sel/sub/aSub) so
     /// both paths get the identical C-correct PP-processing behavior.
     ///
-    /// The caller's `visited` set and `depth` are threaded through into
-    /// the source's processing cycle — NOT a fresh set / depth 0. This
-    /// is required for the cycle guard to span the PP hop: in C,
+    /// The caller's `visited` set is threaded through into the source's
+    /// processing cycle — NOT a fresh set. This is required for the
+    /// cycle guard to span the PP hop: in C,
     /// `calcRecord.c::process` sets `prec->pact = TRUE` *before*
     /// `fetch_values()` (calcRecord.c:119-120), so when a PP input link
     /// re-enters `dbProcess` on a record already mid-fetch, the
@@ -1429,12 +1427,11 @@ impl PvDatabase {
     /// cycle guard (`process_record_with_links_inner`, processing.rs)
     /// fire instead — an A↔B `PP` cycle bails when the second hop tries
     /// to re-insert a name already on the chain. The FLNK path threads
-    /// `visited`/`depth` the same way (processing.rs FLNK dispatch).
+    /// `visited` the same way (processing.rs FLNK dispatch).
     pub(crate) fn process_passive_db_source(
         &self,
         db: &crate::server::record::DbLink,
         visited: &mut HashSet<String>,
-        depth: usize,
     ) {
         if db.policy != crate::server::record::LinkProcessPolicy::ProcessPassive {
             return;
@@ -1445,14 +1442,14 @@ impl PvDatabase {
             if is_passive {
                 // recursive INP-link source processing within
                 // one chain — gate held by the foreign entry record.
-                let _ = self.process_record_with_links_recursive(&record, visited, depth + 1);
+                let _ = self.process_record_with_links_recursive(&record, visited);
             }
         }
     }
 
     /// Read a value from a parsed link for INP (only reads DB links when soft channel).
     ///
-    /// `visited` / `depth` are the caller's processing-chain state — a PP
+    /// `visited` is the caller's processing-chain state — a PP
     /// input link's source is processed *within* that same chain so the
     /// `visited` cycle guard spans the PP hop (see
     /// `Self::process_passive_db_source`).
@@ -1461,7 +1458,6 @@ impl PvDatabase {
         link: &crate::server::record::ParsedLink,
         is_soft: bool,
         visited: &mut HashSet<String>,
-        depth: usize,
     ) -> Option<EpicsValue> {
         match link {
             // A CONSTANT input link delivers NOTHING at process time. C
@@ -1484,7 +1480,7 @@ impl PvDatabase {
             crate::server::record::ParsedLink::Constant(_) => None,
             crate::server::record::ParsedLink::Db(db) if is_soft => {
                 // PP: process source record if Passive before reading
-                self.process_passive_db_source(db, visited, depth);
+                self.process_passive_db_source(db, visited);
                 self.read_db_link_value(db)
             }
             crate::server::record::ParsedLink::Ca(_)
@@ -1549,7 +1545,6 @@ impl PvDatabase {
         src_putf: bool,
         src_notify: Option<&Arc<NotifyWaitSet>>,
         visited: &mut HashSet<String>,
-        depth: usize,
     ) {
         let Some(target_rec) = self.get_record(target_name) else {
             return;
@@ -1577,7 +1572,7 @@ impl PvDatabase {
         // `dbProcess(pdst)` is: an active target is refused inside
         // `process_record_with_links_body`'s PACT arm, the single owner of
         // that decision, and the refusal is counted there.
-        let _ = self.process_record_with_links_recursive(target_name, visited, depth + 1);
+        let _ = self.process_record_with_links_recursive(target_name, visited);
     }
 
     /// Write a value through a DbLink, optionally processing the target if PP and Passive.
@@ -1610,7 +1605,6 @@ impl PvDatabase {
         value: EpicsValue,
         src: OutLinkSrc<'_>,
         visited: &mut HashSet<String>,
-        depth: usize,
     ) -> bool {
         let target = link.target();
         let target_name = local_pv_name(&target);
@@ -1705,7 +1699,7 @@ impl PvDatabase {
             // Through the single `processTarget` owner, which holds the gate.
             // Alias-aware: `process_target` resolves the name, as
             // `process_record_with_links` does at entry.
-            self.process_target(&target.record, gate, src.putf, src.notify, visited, depth);
+            self.process_target(&target.record, gate, src.putf, src.notify, visited);
         }
         // Successful local write (C `dbPutLink` status 0).
         false
@@ -2155,7 +2149,6 @@ impl PvDatabase {
         src: OutLinkSrc<'_>,
         skip_out: bool,
         visited: &mut HashSet<String>,
-        depth: usize,
     ) {
         let pairs = {
             let instance = rec.read();
@@ -2212,7 +2205,6 @@ impl PvDatabase {
                     ..src
                 },
                 visited,
-                depth,
             );
         }
     }
@@ -2265,11 +2257,10 @@ impl PvDatabase {
         value: EpicsValue,
         src: OutLinkSrc<'_>,
         visited: &mut HashSet<String>,
-        depth: usize,
     ) -> bool {
         let failed = match link {
             crate::server::record::ParsedLink::Db(db) => {
-                self.write_db_link_value(db, value, src, visited, depth)
+                self.write_db_link_value(db, value, src, visited)
             }
             crate::server::record::ParsedLink::Ca(_)
             | crate::server::record::ParsedLink::Pva(_)
@@ -2499,7 +2490,6 @@ impl PvDatabase {
         rec: &Arc<parking_lot::RwLock<RecordInstance>>,
         phase: MultiOutPhase,
         visited: &mut HashSet<String>,
-        depth: usize,
     ) -> MultiOutDispatch {
         // Phase gate, keyed on what the record's links ARE (see
         // `multi_out_phase_of`), not on which argument the caller passed.
@@ -2712,7 +2702,6 @@ impl PvDatabase {
                             src_putf,
                             src_notify.as_ref(),
                             visited,
-                            depth,
                         );
                     }
                 }
@@ -2757,7 +2746,6 @@ impl PvDatabase {
                                 ..out_src
                             },
                             visited,
-                            depth,
                         ) {
                             link_failed = true;
                         }
@@ -2830,7 +2818,7 @@ impl PvDatabase {
                                 // `:274`) — held for this group alone.
                                 let _gate = db.lock_record(&rec_name);
                                 let mut visited = HashSet::new();
-                                db.seq_group_step(&rec, &rec_name, &groups, idx, &mut visited, 0);
+                                db.seq_group_step(&rec, &rec_name, &groups, idx, &mut visited);
                             }
                         }
                         // `pgrp == NULL` → `prec->rset->process(prec)`
@@ -2905,7 +2893,6 @@ impl PvDatabase {
         groups: &[SeqGroup],
         idx: usize,
         visited: &mut HashSet<String>,
-        depth: usize,
     ) {
         // DOn value-storage field names (`linkGrp.dov`), index-aligned with
         // the LNKn/DOLn groups.
@@ -2923,7 +2910,7 @@ impl PvDatabase {
         // seq itself the way every other `dbGetLink` in the port does.
         let new_dov = if dol_real {
             let dol_parsed = crate::server::record::parse_link_v2(&grp.dol);
-            self.db_get_input_link(rec, DOL_LINK_FIELDS[idx], &dol_parsed, visited, depth)
+            self.db_get_input_link(rec, DOL_LINK_FIELDS[idx], &dol_parsed, visited)
                 .value()
                 .and_then(|v| v.to_f64())
                 .unwrap_or(grp.dov)
@@ -2971,7 +2958,6 @@ impl PvDatabase {
                     field: LNK_LINK_FIELDS[idx],
                 },
                 visited,
-                depth,
             );
         }
         // C `seqRecord.c:266-268`: store DOn and post a DBE_VALUE|DBE_LOG
@@ -3591,7 +3577,6 @@ mod out_link_put_fail_tests {
             EpicsValue::String("NOT_A_MENU_CHOICE".into()),
             src,
             &mut visited,
-            0,
         );
 
         // The failed write short-circuits before processTarget, so CALC was
@@ -3638,7 +3623,7 @@ mod out_link_put_fail_tests {
         };
         let mut visited = HashSet::new();
 
-        db.write_db_link_value(&link, EpicsValue::DoubleArray(vec![]), src, &mut visited, 0);
+        db.write_db_link_value(&link, EpicsValue::DoubleArray(vec![]), src, &mut visited);
 
         // The put succeeded (status 0), so the PP target processed: CALC = "7".
         assert!(
@@ -3735,7 +3720,6 @@ mod nonlocal_db_link_write_tests {
             EpicsValue::Double(42.0),
             out_src(&alarm),
             &mut visited,
-            0,
         );
         // Staged on the link-put queue and returned, as C `dbCaPutLink`
         // does (`dbCa.c:593-595`); `dbCaSync` (`dbCa.c:1126-1129`) is the
@@ -3777,7 +3761,6 @@ mod nonlocal_db_link_write_tests {
             EpicsValue::Double(7.0),
             out_src(&alarm),
             &mut visited,
-            0,
         );
 
         assert!(
@@ -3872,7 +3855,7 @@ mod nonlocal_db_link_write_tests {
         }
 
         let mut visited = HashSet::new();
-        db.process_record_with_links("SRC", &mut visited, 0)
+        db.process_record_with_links("SRC", &mut visited)
             .await
             .unwrap();
 
@@ -3913,7 +3896,7 @@ mod nonlocal_db_link_write_tests {
         }
 
         let mut visited = HashSet::new();
-        db.process_record_with_links("SRC", &mut visited, 0)
+        db.process_record_with_links("SRC", &mut visited)
             .await
             .unwrap();
 
@@ -4145,7 +4128,7 @@ mod nonlocal_db_link_read_tests {
         );
 
         let mut visited = HashSet::new();
-        let v = db.read_link_value(&link, &mut visited, 0);
+        let v = db.read_link_value(&link, &mut visited);
         assert_eq!(
             v,
             Some(EpicsValue::Double(42.0)),
@@ -4195,7 +4178,7 @@ mod nonlocal_db_link_read_tests {
 
         let link = parse_link_v2("SRC");
         let mut visited = HashSet::new();
-        let v = db.read_link_value(&link, &mut visited, 0);
+        let v = db.read_link_value(&link, &mut visited);
         assert_eq!(
             v,
             Some(EpicsValue::Double(7.0)),

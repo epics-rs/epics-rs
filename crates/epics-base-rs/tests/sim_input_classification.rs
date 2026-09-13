@@ -38,9 +38,7 @@ async fn sim_waveform_reads_siol_array_into_val() {
     db.add_record("WFIN", Box::new(wf)).await.unwrap();
 
     let mut v = HashSet::new();
-    db.process_record_with_links("WFIN", &mut v, 0)
-        .await
-        .unwrap();
+    db.process_record_with_links("WFIN", &mut v).await.unwrap();
 
     // VAL read inward from SIOL.
     let val = db.get_pv("WFIN").unwrap();
@@ -81,9 +79,7 @@ async fn sim_histogram_lands_siol_in_sgnl_and_bins_it() {
     db.add_record("HGIN", Box::new(hg)).await.unwrap();
 
     let mut v = HashSet::new();
-    db.process_record_with_links("HGIN", &mut v, 0)
-        .await
-        .unwrap();
+    db.process_record_with_links("HGIN", &mut v).await.unwrap();
 
     // SIOL source untouched — the record read from it, not wrote to it.
     let src = db.get_pv("HGIN_SRC").unwrap();
@@ -124,9 +120,7 @@ async fn sim_histogram_with_a_failed_siol_read_bins_nothing() {
     db.add_record("HGF", Box::new(hg)).await.unwrap();
 
     let mut v = HashSet::new();
-    db.process_record_with_links("HGF", &mut v, 0)
-        .await
-        .unwrap();
+    db.process_record_with_links("HGF", &mut v).await.unwrap();
 
     assert_eq!(
         db.get_pv("HGF.SGNL").unwrap(),

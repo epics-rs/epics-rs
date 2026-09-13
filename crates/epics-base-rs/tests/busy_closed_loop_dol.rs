@@ -48,7 +48,7 @@ async fn build(db_text: &str) -> Db {
 
 async fn proc(db: &Db, rec: &str) {
     let mut visited = HashSet::new();
-    let _ = db.process_record_with_links(rec, &mut visited, 0).await;
+    let _ = db.process_record_with_links(rec, &mut visited).await;
 }
 
 fn val(db: &Db, rec: &str) -> Option<f64> {

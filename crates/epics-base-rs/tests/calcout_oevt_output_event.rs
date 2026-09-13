@@ -104,7 +104,7 @@ async fn calcout_oevt_posts_string_event_on_output() {
     db.add_record("CALC_OEVT", Box::new(c)).await.unwrap();
 
     let mut v = HashSet::new();
-    db.process_record_with_links("CALC_OEVT", &mut v, 0)
+    db.process_record_with_links("CALC_OEVT", &mut v)
         .await
         .unwrap();
     settle(|| count.load(Ordering::SeqCst) >= 1).await;
@@ -135,7 +135,7 @@ async fn calcout_oevt_suppressed_on_dont_drive_invalid() {
     db.add_record("CALC_DD", Box::new(c)).await.unwrap();
 
     let mut v = HashSet::new();
-    db.process_record_with_links("CALC_DD", &mut v, 0)
+    db.process_record_with_links("CALC_DD", &mut v)
         .await
         .unwrap();
 
@@ -180,7 +180,7 @@ async fn scalcout_oevt_posts_numeric_event_on_output() {
     db.add_record("S_OEVT", Box::new(s)).await.unwrap();
 
     let mut v = HashSet::new();
-    db.process_record_with_links("S_OEVT", &mut v, 0)
+    db.process_record_with_links("S_OEVT", &mut v)
         .await
         .unwrap();
     settle(|| count.load(Ordering::SeqCst) >= 1).await;
@@ -207,7 +207,7 @@ async fn acalcout_oevt_posts_numeric_event_on_output() {
     db.add_record("A_OEVT", Box::new(a)).await.unwrap();
 
     let mut v = HashSet::new();
-    db.process_record_with_links("A_OEVT", &mut v, 0)
+    db.process_record_with_links("A_OEVT", &mut v)
         .await
         .unwrap();
     settle(|| count.load(Ordering::SeqCst) >= 1).await;
@@ -237,7 +237,7 @@ async fn swait_oevt_posts_numeric_event_on_output() {
     db.add_record("W_OEVT", Box::new(w)).await.unwrap();
 
     let mut v = HashSet::new();
-    db.process_record_with_links("W_OEVT", &mut v, 0)
+    db.process_record_with_links("W_OEVT", &mut v)
         .await
         .unwrap();
     settle(|| count.load(Ordering::SeqCst) >= 1).await;

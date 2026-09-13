@@ -52,7 +52,7 @@ async fn simm_yes_with_unset_siml_and_siol_simulates_from_sval() {
         .unwrap();
 
     let mut v = HashSet::new();
-    db.process_record_with_links("SIMCONST", &mut v, 0)
+    db.process_record_with_links("SIMCONST", &mut v)
         .await
         .unwrap();
 
@@ -94,7 +94,7 @@ async fn simm_no_with_unset_links_does_not_simulate() {
         .unwrap();
 
     let mut v = HashSet::new();
-    db.process_record_with_links("SIMOFF", &mut v, 0)
+    db.process_record_with_links("SIMOFF", &mut v)
         .await
         .unwrap();
 
@@ -299,7 +299,7 @@ async fn failed_siml_read_sets_nsta_link_alarm_without_touching_sevr() {
     db.put_pv("SIMLFAIL", EpicsValue::Long(5)).await.unwrap();
 
     let mut v = HashSet::new();
-    db.process_record_with_links("SIMLFAIL", &mut v, 0)
+    db.process_record_with_links("SIMLFAIL", &mut v)
         .await
         .unwrap();
 
@@ -328,7 +328,7 @@ async fn busy_failed_siml_read_raises_link_alarm_at_invalid_severity() {
     db.put_pv("BUSYFAIL", EpicsValue::Short(0)).await.unwrap();
 
     let mut v = HashSet::new();
-    db.process_record_with_links("BUSYFAIL", &mut v, 0)
+    db.process_record_with_links("BUSYFAIL", &mut v)
         .await
         .unwrap();
 
@@ -379,7 +379,7 @@ async fn failed_siol_read_raises_link_alarm_at_default_sims() {
     db.add_record("SIOLFAIL", Box::new(li)).await.unwrap();
 
     let mut v = HashSet::new();
-    db.process_record_with_links("SIOLFAIL", &mut v, 0)
+    db.process_record_with_links("SIOLFAIL", &mut v)
         .await
         .unwrap();
 
@@ -415,7 +415,7 @@ async fn failed_siol_read_loses_the_tie_to_simm_alarm_at_sims_invalid() {
     db.add_record("SIOLTIE", Box::new(li)).await.unwrap();
 
     let mut v = HashSet::new();
-    db.process_record_with_links("SIOLTIE", &mut v, 0)
+    db.process_record_with_links("SIOLTIE", &mut v)
         .await
         .unwrap();
 
@@ -473,9 +473,7 @@ async fn simm_raw_on_a_menu_yesno_input_is_soft_alarm_and_no_substitution() {
     db.put_pv("RAWIN.SIMM", EpicsValue::Short(2)).await.unwrap();
 
     let mut v = HashSet::new();
-    db.process_record_with_links("RAWIN", &mut v, 0)
-        .await
-        .unwrap();
+    db.process_record_with_links("RAWIN", &mut v).await.unwrap();
 
     assert_eq!(
         db.get_pv("RAWIN").unwrap(),
@@ -510,7 +508,7 @@ async fn simm_raw_on_a_menu_yesno_output_writes_nothing() {
     db.put_pv("RAWOUT", EpicsValue::Long(99)).await.unwrap();
 
     let mut v = HashSet::new();
-    db.process_record_with_links("RAWOUT", &mut v, 0)
+    db.process_record_with_links("RAWOUT", &mut v)
         .await
         .unwrap();
 
@@ -540,9 +538,7 @@ async fn busy_simm_raw_is_soft_alarm_and_writes_nothing() {
     db.put_pv("BRAW", EpicsValue::Short(1)).await.unwrap();
 
     let mut v = HashSet::new();
-    db.process_record_with_links("BRAW", &mut v, 0)
-        .await
-        .unwrap();
+    db.process_record_with_links("BRAW", &mut v).await.unwrap();
 
     assert_eq!(db.get_pv("BSINK").unwrap(), EpicsValue::Long(0));
     let rec = db.get_record("BRAW").unwrap();
@@ -566,9 +562,7 @@ async fn simm_raw_on_a_menu_simm_record_still_simulates() {
     db.put_pv("AIRAW.SIMM", EpicsValue::Short(2)).await.unwrap();
 
     let mut v = HashSet::new();
-    db.process_record_with_links("AIRAW", &mut v, 0)
-        .await
-        .unwrap();
+    db.process_record_with_links("AIRAW", &mut v).await.unwrap();
 
     let rec = db.get_record("AIRAW").unwrap();
     let inst = rec.read();
@@ -620,7 +614,7 @@ async fn w10_e5_busy_failed_siml_read_performs_no_output_write() {
     db.put_pv("E5BUSY", EpicsValue::Short(1)).await.unwrap();
 
     let mut v = HashSet::new();
-    db.process_record_with_links("E5BUSY", &mut v, 0)
+    db.process_record_with_links("E5BUSY", &mut v)
         .await
         .unwrap();
 
@@ -660,7 +654,7 @@ async fn w10_e5_busy_failed_siml_read_suppresses_the_siol_redirect_as_well() {
     db.put_pv("E5SBUSY", EpicsValue::Short(1)).await.unwrap();
 
     let mut v = HashSet::new();
-    db.process_record_with_links("E5SBUSY", &mut v, 0)
+    db.process_record_with_links("E5SBUSY", &mut v)
         .await
         .unwrap();
 

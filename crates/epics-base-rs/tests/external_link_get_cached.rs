@@ -107,7 +107,7 @@ async fn add_ai_with_inp(db: &PvDatabase, name: &str, inp: &str) {
 
 async fn process(db: &PvDatabase, name: &str) {
     let mut visited = HashSet::new();
-    db.process_record_with_links(name, &mut visited, 0)
+    db.process_record_with_links(name, &mut visited)
         .await
         .unwrap();
 }

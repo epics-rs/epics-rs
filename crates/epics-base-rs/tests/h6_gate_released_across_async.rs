@@ -88,7 +88,7 @@ async fn async_pending_record_does_not_hold_the_gate() {
         .unwrap();
 
     let mut visited = HashSet::new();
-    db.process_record_with_links("H6:ASYNC", &mut visited, 0)
+    db.process_record_with_links("H6:ASYNC", &mut visited)
         .await
         .unwrap();
 
@@ -137,7 +137,7 @@ async fn a_put_during_the_async_window_is_not_gate_blocked() {
         .unwrap();
 
     let mut visited = HashSet::new();
-    db.process_record_with_links("H6:ASYNC2", &mut visited, 0)
+    db.process_record_with_links("H6:ASYNC2", &mut visited)
         .await
         .unwrap();
     assert!(db.get_record("H6:ASYNC2").unwrap().read().is_processing());
@@ -200,7 +200,7 @@ async fn seq_delay_runs_outside_the_gate_and_fires_after_release() {
 
     let start = std::time::Instant::now();
     let mut visited = HashSet::new();
-    db.process_record_with_links("H6:SEQ", &mut visited, 0)
+    db.process_record_with_links("H6:SEQ", &mut visited)
         .await
         .unwrap();
     let returned_after = start.elapsed();
@@ -344,7 +344,7 @@ async fn seq_with_every_delay_zero_still_runs_on_the_callback_task() {
 
     let start = std::time::Instant::now();
     let mut visited = HashSet::new();
-    db.process_record_with_links("UI81:SEQ", &mut visited, 0)
+    db.process_record_with_links("UI81:SEQ", &mut visited)
         .await
         .unwrap();
     let returned_after = start.elapsed();
@@ -405,7 +405,7 @@ async fn the_async_completion_waits_for_the_gate() {
         .await
         .unwrap();
     let mut visited = HashSet::new();
-    db.process_record_with_links("H6:CMPL", &mut visited, 0)
+    db.process_record_with_links("H6:CMPL", &mut visited)
         .await
         .unwrap();
 

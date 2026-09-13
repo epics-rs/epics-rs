@@ -132,9 +132,7 @@ async fn a_put_queued_behind_a_failing_cycle_still_gets_its_restart() {
         .expect("the no-notify route has no PACT gate");
     assert_eq!(pact(&db, "PARKED"), 0, "the park is released");
     let mut visited = std::collections::HashSet::new();
-    let _ = db
-        .process_record_with_links("PARKED", &mut visited, 0)
-        .await;
+    let _ = db.process_record_with_links("PARKED", &mut visited).await;
 
     assert!(
         settled(first).await,
@@ -171,9 +169,7 @@ async fn a_put_queued_behind_a_succeeding_cycle_gets_its_restart_the_ordinary_wa
         .await
         .expect("the no-notify route has no PACT gate");
     let mut visited = std::collections::HashSet::new();
-    let _ = db
-        .process_record_with_links("PARKED", &mut visited, 0)
-        .await;
+    let _ = db.process_record_with_links("PARKED", &mut visited).await;
 
     assert!(settled(first).await, "the first replays");
     assert!(settled(second).await, "and its tail restarts the second");

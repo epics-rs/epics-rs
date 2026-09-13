@@ -68,9 +68,7 @@ async fn scalcout_odly_mslink_invalid_dont_drive_suppresses_out() {
 
     // Bring SRC to INVALID (finite VAL=200 over HIHI=100, HHSV=INVALID).
     let mut v0 = HashSet::new();
-    db.process_record_with_links("SRC", &mut v0, 0)
-        .await
-        .unwrap();
+    db.process_record_with_links("SRC", &mut v0).await.unwrap();
     assert_eq!(
         db.get_record("SRC").unwrap().read().common.sevr,
         AlarmSeverity::Invalid,
@@ -79,9 +77,7 @@ async fn scalcout_odly_mslink_invalid_dont_drive_suppresses_out() {
 
     // SC delaying cycle: ODLY>0 defers; OUT must NOT be written yet.
     let mut v1 = HashSet::new();
-    db.process_record_with_links("SC", &mut v1, 0)
-        .await
-        .unwrap();
+    db.process_record_with_links("SC", &mut v1).await.unwrap();
     assert_eq!(
         db.get_record("SC").unwrap().read().record.get_field("DLYA"),
         Some(EpicsValue::Short(1)),
@@ -97,9 +93,7 @@ async fn scalcout_odly_mslink_invalid_dont_drive_suppresses_out() {
     // sevr==INVALID and the §4.6 IVOA=Don't_drive gate suppresses the OUT
     // write — the target keeps its 0.0 sentinel.
     let mut v2 = HashSet::new();
-    db.process_record_continuation("SC", &mut v2, 0)
-        .await
-        .unwrap();
+    db.process_record_continuation("SC", &mut v2).await.unwrap();
     assert_eq!(
         db.get_record("SC").unwrap().read().common.sevr,
         AlarmSeverity::Invalid,

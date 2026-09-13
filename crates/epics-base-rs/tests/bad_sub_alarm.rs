@@ -43,7 +43,7 @@ const S_DB_BAD_SUB: i32 = (511 << 16) | 35;
 
 async fn process(db: &PvDatabase, name: &str) {
     let mut visited = HashSet::new();
-    db.process_record_with_links(name, &mut visited, 0)
+    db.process_record_with_links(name, &mut visited)
         .await
         .unwrap();
 }

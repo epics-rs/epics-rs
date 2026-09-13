@@ -1874,7 +1874,7 @@ impl PvDatabase {
             return;
         }
         let mut visited = HashSet::new();
-        self.execute_process_actions(record_name, rec, actions, &mut visited, 0);
+        self.execute_process_actions(record_name, rec, actions, &mut visited);
     }
 
     /// CA client's unified entry point for record field put.
@@ -2225,7 +2225,7 @@ impl PvDatabase {
             instance.common.putf = true;
         }
         let mut visited = HashSet::new();
-        self.process_record_with_links_already_locked(record_name, &mut visited, 0)
+        self.process_record_with_links_already_locked(record_name, &mut visited)
     }
 
     /// C `restartCheck` (dbNotify.c:149-170) plus the restarted
@@ -2334,7 +2334,7 @@ impl PvDatabase {
             }
         };
         let mut visited = HashSet::new();
-        self.process_record_with_links_already_locked(record_name, &mut visited, 0)?;
+        self.process_record_with_links_already_locked(record_name, &mut visited)?;
         Ok(Some(notify))
     }
 

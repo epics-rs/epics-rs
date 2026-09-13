@@ -226,7 +226,7 @@ async fn run(arm: Arm) -> (i32, EpicsValue, EpicsValue) {
     .unwrap();
 
     let mut visited = HashSet::new();
-    db.process_record_with_links("SRC", &mut visited, 0)
+    db.process_record_with_links("SRC", &mut visited)
         .await
         .unwrap();
 

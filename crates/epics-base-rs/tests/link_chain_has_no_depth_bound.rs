@@ -58,7 +58,7 @@ fn a_forty_deep_flnk_chain_processes_every_record() {
             epics_base_rs::runtime::task::test_block_on(async {
                 let db = chain_db().await;
                 let mut visited = HashSet::new();
-                db.process_record_with_links("L0", &mut visited, 0)
+                db.process_record_with_links("L0", &mut visited)
                     .await
                     .expect("the head processes");
                 assert!(visited.is_empty(), "the frame unwound: {visited:?}");

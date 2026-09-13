@@ -68,7 +68,7 @@ async fn compress_fires_flnk_only_on_emit_not_every_cycle() {
             .await
             .unwrap();
         let mut visited = HashSet::new();
-        db.process_record_with_links("cmp", &mut visited, 0)
+        db.process_record_with_links("cmp", &mut visited)
             .await
             .unwrap();
 

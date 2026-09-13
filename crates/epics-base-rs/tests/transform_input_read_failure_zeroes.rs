@@ -43,7 +43,7 @@ async fn r9_64_failed_input_link_zeroes_its_channel_and_drives_zero_out() {
     db.add_record("TR", Box::new(tr)).await.unwrap();
 
     let mut v = HashSet::new();
-    db.process_record_with_links("TR", &mut v, 0).await.unwrap();
+    db.process_record_with_links("TR", &mut v).await.unwrap();
 
     let inst = db.get_record("TR").unwrap();
     {

@@ -68,7 +68,7 @@ async fn caput(db: &PvDatabase, field: &str, value: EpicsValue) {
 
 async fn process(db: &PvDatabase) {
     let mut visited = std::collections::HashSet::new();
-    db.process_record_with_links("SCAL", &mut visited, 0)
+    db.process_record_with_links("SCAL", &mut visited)
         .await
         .unwrap();
 }

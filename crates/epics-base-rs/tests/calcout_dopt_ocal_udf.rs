@@ -32,7 +32,7 @@ async fn calcout_dopt_use_ocal_nan_oval_raises_udf_alarm() {
     db.add_record("CO_OCAL_NAN", Box::new(co)).await.unwrap();
 
     let mut visited = HashSet::new();
-    db.process_record_with_links("CO_OCAL_NAN", &mut visited, 0)
+    db.process_record_with_links("CO_OCAL_NAN", &mut visited)
         .await
         .unwrap();
 
@@ -87,7 +87,7 @@ async fn calcout_dopt_use_ocal_nan_val_finite_oval_stays_invalid() {
     db.add_record("CO_NANVAL", Box::new(co)).await.unwrap();
 
     let mut visited = HashSet::new();
-    db.process_record_with_links("CO_NANVAL", &mut visited, 0)
+    db.process_record_with_links("CO_NANVAL", &mut visited)
         .await
         .unwrap();
 
@@ -123,7 +123,7 @@ async fn calcout_dopt_use_ocal_both_finite_no_alarm() {
     db.add_record("CO_BOTHFIN", Box::new(co)).await.unwrap();
 
     let mut visited = HashSet::new();
-    db.process_record_with_links("CO_BOTHFIN", &mut visited, 0)
+    db.process_record_with_links("CO_BOTHFIN", &mut visited)
         .await
         .unwrap();
 

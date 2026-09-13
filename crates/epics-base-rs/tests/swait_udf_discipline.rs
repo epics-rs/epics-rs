@@ -36,7 +36,7 @@ const CALC_ALARM: u16 = 12;
 
 async fn process(db: &PvDatabase, name: &str) {
     let mut v = HashSet::new();
-    db.process_record_with_links(name, &mut v, 0).await.unwrap();
+    db.process_record_with_links(name, &mut v).await.unwrap();
 }
 
 async fn udf(db: &PvDatabase, name: &str) -> bool {

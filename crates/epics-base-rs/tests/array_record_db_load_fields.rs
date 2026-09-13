@@ -173,7 +173,7 @@ async fn loaded_sdly_defers_the_simulated_aai_read() {
     db.put_pv("SIM:SW", EpicsValue::Double(1.0)).await.unwrap();
 
     let mut visited = std::collections::HashSet::new();
-    db.process_record_with_links("ARR:AAI", &mut visited, 0)
+    db.process_record_with_links("ARR:AAI", &mut visited)
         .await
         .unwrap();
 

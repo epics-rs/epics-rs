@@ -190,7 +190,7 @@ async fn sseq_posts_machine_status_without_dbe_log() {
     let mut val_rx = subscribe_typed(&db, "Q", "BUSY", 6, EventMask::VALUE, DbFieldType::Short);
 
     let mut visited = std::collections::HashSet::new();
-    let _ = db.process_record_with_links("Q", &mut visited, 0).await;
+    let _ = db.process_record_with_links("Q", &mut visited).await;
     epics_base_rs::runtime::task::sleep(std::time::Duration::from_millis(50)).await;
 
     assert!(

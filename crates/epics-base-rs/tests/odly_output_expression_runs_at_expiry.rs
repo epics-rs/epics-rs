@@ -53,14 +53,14 @@ fn wire_out(db: &PvDatabase, name: &str, target: &str) {
 
 async fn process(db: &PvDatabase, name: &str) {
     let mut visited = HashSet::new();
-    db.process_record_with_links(name, &mut visited, 0)
+    db.process_record_with_links(name, &mut visited)
         .await
         .unwrap();
 }
 
 async fn expire(db: &PvDatabase, name: &str) {
     let mut visited = HashSet::new();
-    db.process_record_continuation(name, &mut visited, 0)
+    db.process_record_continuation(name, &mut visited)
         .await
         .unwrap();
 }

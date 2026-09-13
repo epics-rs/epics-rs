@@ -204,7 +204,7 @@ async fn r17_4_a_dol_read_posts_the_read_view_with_log_and_the_derived_view_with
     };
 
     let mut visited = HashSet::new();
-    db.process_record_with_links("VPP", &mut visited, 0)
+    db.process_record_with_links("VPP", &mut visited)
         .await
         .unwrap();
     for _ in 0..400 {

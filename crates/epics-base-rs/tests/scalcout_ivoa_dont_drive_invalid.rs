@@ -51,7 +51,7 @@ async fn scalcout_dont_drive_suppresses_out_on_noncalc_invalid() {
     db.add_record("SC_DD", Box::new(sc)).await.unwrap();
 
     let mut visited = HashSet::new();
-    db.process_record_with_links("SC_DD", &mut visited, 0)
+    db.process_record_with_links("SC_DD", &mut visited)
         .await
         .unwrap();
 

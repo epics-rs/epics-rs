@@ -75,7 +75,7 @@ async fn failed_sim_read_still_clears_udf_on_the_array_kinds() {
         );
 
         let mut visited = HashSet::new();
-        db.process_record_with_links(rec, &mut visited, 0)
+        db.process_record_with_links(rec, &mut visited)
             .await
             .unwrap();
 

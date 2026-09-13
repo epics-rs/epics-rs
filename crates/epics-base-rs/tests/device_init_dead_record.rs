@@ -117,7 +117,7 @@ fn field(db: &Arc<PvDatabase>, rec: &str, name: &str) -> EpicsValue {
 
 async fn process(db: &Arc<PvDatabase>, rec: &str) {
     let mut visited = HashSet::new();
-    db.process_record_with_links(rec, &mut visited, 0)
+    db.process_record_with_links(rec, &mut visited)
         .await
         .unwrap();
 }

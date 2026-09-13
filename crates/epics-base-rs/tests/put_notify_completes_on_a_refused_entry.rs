@@ -8,7 +8,7 @@
 //! links.rs   let pact = tg.is_processing();
 //! links.rs   if !pact { tg.common.putf = src_putf;
 //! links.rs              join_put_notify(&mut tg, src_notify); }   // ws.enter()
-//! links.rs   self.process_record_with_links_recursive(target, visited, depth + 1)
+//! links.rs   self.process_record_with_links_recursive(target, visited)
 //! ```
 //!
 //! so a target that is then stopped by the `visited` cycle guard — or, while

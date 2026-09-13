@@ -96,9 +96,7 @@ async fn acquire_bo_returns_to_zero_after_single() {
     tokio::spawn(async move {
         while intr_rx.recv().await.is_some() {
             let mut visited = HashSet::new();
-            let _ = db2
-                .process_record_readback("Acquire", &mut visited, 0)
-                .await;
+            let _ = db2.process_record_readback("Acquire", &mut visited).await;
         }
     });
 
@@ -111,7 +109,7 @@ async fn acquire_bo_returns_to_zero_after_single() {
     }
     {
         let mut visited = HashSet::new();
-        db.process_record_with_links("Acquire", &mut visited, 0)
+        db.process_record_with_links("Acquire", &mut visited)
             .await
             .unwrap();
     }

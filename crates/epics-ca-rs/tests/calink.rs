@@ -312,7 +312,7 @@ async fn record_with_ca_inp_link_reads_remote_value() {
     }
 
     let mut visited = HashSet::new();
-    db.process_record_with_links("CADST", &mut visited, 0)
+    db.process_record_with_links("CADST", &mut visited)
         .await
         .unwrap();
 

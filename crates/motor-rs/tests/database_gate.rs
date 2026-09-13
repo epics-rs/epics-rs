@@ -33,7 +33,7 @@ async fn anchor(db: &PvDatabase, state: &motor_rs::device_state::SharedDeviceSta
         },
     });
     let mut visited = std::collections::HashSet::new();
-    db.process_record_readback("M1", &mut visited, 0)
+    db.process_record_readback("M1", &mut visited)
         .await
         .unwrap();
     // Drop the anchor pass's mailbox batch so each test asserts only on
@@ -268,7 +268,7 @@ async fn retry_dispatched_on_callback_pass_reaches_the_driver() {
 
     // Startup pass consumes the init-seeded status (seq 1).
     let mut visited = HashSet::new();
-    db.process_record_readback("M1", &mut visited, 0)
+    db.process_record_readback("M1", &mut visited)
         .await
         .unwrap();
 
@@ -286,7 +286,7 @@ async fn retry_dispatched_on_callback_pass_reaches_the_driver() {
     };
     stamp(2);
     let mut visited = HashSet::new();
-    db.process_record_readback("M1", &mut visited, 0)
+    db.process_record_readback("M1", &mut visited)
         .await
         .unwrap();
     assert_eq!(
@@ -298,7 +298,7 @@ async fn retry_dispatched_on_callback_pass_reaches_the_driver() {
     // Retry landed on target: the next callback pass finalizes.
     stamp(3);
     let mut visited = HashSet::new();
-    db.process_record_readback("M1", &mut visited, 0)
+    db.process_record_readback("M1", &mut visited)
         .await
         .unwrap();
     assert_eq!(
@@ -460,7 +460,7 @@ async fn parked_pre_pulse_put_anchors_first_then_replays_as_a_move() {
     // now dispatches as an ordinary post-init move.
     stamp(2);
     let mut visited = HashSet::new();
-    db.process_record_readback("M1", &mut visited, 0)
+    db.process_record_readback("M1", &mut visited)
         .await
         .unwrap();
     assert_eq!(
@@ -472,7 +472,7 @@ async fn parked_pre_pulse_put_anchors_first_then_replays_as_a_move() {
     // Completion pass: the axis landed on target.
     stamp(3);
     let mut visited = HashSet::new();
-    db.process_record_readback("M1", &mut visited, 0)
+    db.process_record_readback("M1", &mut visited)
         .await
         .unwrap();
     assert_eq!(db.get_pv("M1.DMOV").unwrap(), EpicsValue::Short(1));

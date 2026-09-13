@@ -54,7 +54,7 @@ record(stringin, "GETENV_SI") {
         .unwrap();
 
     let mut visited = HashSet::new();
-    db.process_record_with_links("GETENV_SI", &mut visited, 0)
+    db.process_record_with_links("GETENV_SI", &mut visited)
         .await
         .unwrap();
 
@@ -131,7 +131,7 @@ record(stringin, "GETENV_UNSET") {
         .unwrap();
 
     let mut visited = HashSet::new();
-    db.process_record_with_links("GETENV_UNSET", &mut visited, 0)
+    db.process_record_with_links("GETENV_UNSET", &mut visited)
         .await
         .unwrap();
 
@@ -187,7 +187,7 @@ record(stringin, "GETENV_UDFS") {
         .unwrap();
 
     let mut visited = HashSet::new();
-    db.process_record_with_links("GETENV_UDFS", &mut visited, 0)
+    db.process_record_with_links("GETENV_UDFS", &mut visited)
         .await
         .unwrap();
 

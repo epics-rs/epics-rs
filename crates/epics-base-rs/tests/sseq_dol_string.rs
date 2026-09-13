@@ -74,7 +74,7 @@ async fn sseq_string_dol_forwards_string_byte_exact() {
     db.add_record("SSEQ_STR", Box::new(sseq)).await.unwrap();
 
     let mut visited = HashSet::new();
-    db.process_record_with_links("SSEQ_STR", &mut visited, 0)
+    db.process_record_with_links("SSEQ_STR", &mut visited)
         .await
         .unwrap();
 
@@ -118,7 +118,7 @@ async fn sseq_numeric_dol_forwards_double_unchanged() {
     db.add_record("SSEQ_NUM", Box::new(sseq)).await.unwrap();
 
     let mut visited = HashSet::new();
-    db.process_record_with_links("SSEQ_NUM", &mut visited, 0)
+    db.process_record_with_links("SSEQ_NUM", &mut visited)
         .await
         .unwrap();
 
@@ -155,7 +155,7 @@ async fn sseq_numeric_dol_refreshes_strn_with_prec() {
     db.add_record("SSEQ_STRN", Box::new(sseq)).await.unwrap();
 
     let mut visited = HashSet::new();
-    db.process_record_with_links("SSEQ_STRN", &mut visited, 0)
+    db.process_record_with_links("SSEQ_STRN", &mut visited)
         .await
         .unwrap();
 

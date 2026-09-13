@@ -59,7 +59,7 @@ async fn out_link_write_to_a_nomod_field_is_refused_and_alarms_the_writer() {
 
     db.put_pv("AO.VAL", EpicsValue::Double(2.0)).await.unwrap();
     let mut v = HashSet::new();
-    db.process_record_with_links("AO", &mut v, 0).await.unwrap();
+    db.process_record_with_links("AO", &mut v).await.unwrap();
 
     let wf = db.get_record("WF").unwrap();
     {

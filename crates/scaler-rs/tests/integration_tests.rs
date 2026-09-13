@@ -353,7 +353,7 @@ async fn test_count_start_posts_pr1_tp_freq_monitor_events() {
     }
 
     let mut visited = std::collections::HashSet::new();
-    db.process_record_with_links("TEST:SCMON", &mut visited, 0)
+    db.process_record_with_links("TEST:SCMON", &mut visited)
         .await
         .unwrap();
 
@@ -458,7 +458,7 @@ async fn test_value_change_post_is_value_only_no_log_bit() {
     }
 
     let mut visited = std::collections::HashSet::new();
-    db.process_record_with_links("TEST:SCVO", &mut visited, 0)
+    db.process_record_with_links("TEST:SCVO", &mut visited)
         .await
         .unwrap();
 
@@ -557,7 +557,7 @@ async fn test_count_start_guard_triggers_tp_recompute_and_post() {
     }
 
     let mut visited = std::collections::HashSet::new();
-    db.process_record_with_links("TEST:SCGUARD", &mut visited, 0)
+    db.process_record_with_links("TEST:SCGUARD", &mut visited)
         .await
         .unwrap();
 

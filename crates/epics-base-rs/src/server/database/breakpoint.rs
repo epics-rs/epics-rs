@@ -1569,7 +1569,7 @@ mod tests {
         // A foreign entry: C queues it and drops out of dbProcess without
         // running record support, handing the cycle to the continuation
         // thread. The `Ok` here is that fall-out, not a processed record.
-        db.process_record_with_links("BPX:a", &mut HashSet::new(), 0)
+        db.process_record_with_links("BPX:a", &mut HashSet::new())
             .await
             .expect("foreign entry falls out of dbProcess");
 

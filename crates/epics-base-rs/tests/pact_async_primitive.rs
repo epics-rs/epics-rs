@@ -511,7 +511,7 @@ async fn write_db_link_notify_action_drives_downstream_and_reenters_source() {
         .unwrap();
 
     let mut visited = HashSet::new();
-    db.process_record_with_links("SRC", &mut visited, 0)
+    db.process_record_with_links("SRC", &mut visited)
         .await
         .unwrap();
 
@@ -610,7 +610,7 @@ async fn async_pending_notify_runs_write_db_link_on_pending_cycle() {
     .unwrap();
 
     let mut visited = HashSet::new();
-    db.process_record_with_links("PEND_SRC", &mut visited, 0)
+    db.process_record_with_links("PEND_SRC", &mut visited)
         .await
         .unwrap();
 
@@ -653,7 +653,7 @@ async fn cancel_reprocess_action_supersedes_outstanding_token() {
 
     // Drive a process() that emits CancelReprocess.
     let mut visited = HashSet::new();
-    db.process_record_with_links("CR", &mut visited, 0)
+    db.process_record_with_links("CR", &mut visited)
         .await
         .unwrap();
 

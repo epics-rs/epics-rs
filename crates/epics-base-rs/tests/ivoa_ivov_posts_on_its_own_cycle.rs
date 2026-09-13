@@ -115,7 +115,7 @@ async fn one_cycle(
     while rx.try_recv().is_ok() {}
 
     let mut visited = HashSet::new();
-    db.process_record_with_links("R", &mut visited, 0)
+    db.process_record_with_links("R", &mut visited)
         .await
         .unwrap();
 

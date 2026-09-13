@@ -135,7 +135,7 @@ async fn calcout_outv_classifies_via_process() {
     .await
     .unwrap();
     let mut visited = HashSet::new();
-    db.process_record_with_links("CALC_OUT", &mut visited, 0)
+    db.process_record_with_links("CALC_OUT", &mut visited)
         .await
         .unwrap();
 

@@ -42,7 +42,7 @@ use epics_base_rs::types::{DbFieldType, EpicsValue};
 
 async fn process(db: &PvDatabase, name: &str) {
     let mut v = HashSet::new();
-    db.process_record_with_links(name, &mut v, 0).await.unwrap();
+    db.process_record_with_links(name, &mut v).await.unwrap();
 }
 
 /// A dfanout at VAL=200 driving OUTA, with IVOV=9 and the given IVOA.

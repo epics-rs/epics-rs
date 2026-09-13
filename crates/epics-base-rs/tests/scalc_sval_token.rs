@@ -189,7 +189,7 @@ async fn swait_calc_uses_the_numeric_engine_and_rejects_a_string_expression() {
 
     for name in ["SW_NUM", "SW_STR"] {
         let mut visited = HashSet::new();
-        db.process_record_with_links(name, &mut visited, 0)
+        db.process_record_with_links(name, &mut visited)
             .await
             .unwrap();
     }
@@ -227,7 +227,7 @@ async fn scalcout_calc_sval_reads_the_previous_sval() {
 
     for expected in ["x", "xx", "xxx"] {
         let mut visited = HashSet::new();
-        db.process_record_with_links("SC_SVAL", &mut visited, 0)
+        db.process_record_with_links("SC_SVAL", &mut visited)
             .await
             .unwrap();
 
@@ -265,7 +265,7 @@ async fn scalcout_ocal_sval_reads_the_previous_osv_not_the_current_sval() {
     // every cycle. Reading the previous OSV makes it grow "Z", "ZZ", "ZZZ".
     for expected in ["Z", "ZZ", "ZZZ"] {
         let mut visited = HashSet::new();
-        db.process_record_with_links("SC_OSV", &mut visited, 0)
+        db.process_record_with_links("SC_OSV", &mut visited)
             .await
             .unwrap();
 

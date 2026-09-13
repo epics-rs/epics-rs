@@ -52,7 +52,7 @@ async fn nuse(db: &PvDatabase) -> u32 {
 
 async fn process(db: &PvDatabase) {
     let mut visited = HashSet::new();
-    db.process_record_with_links("AC", &mut visited, 0)
+    db.process_record_with_links("AC", &mut visited)
         .await
         .unwrap();
 }

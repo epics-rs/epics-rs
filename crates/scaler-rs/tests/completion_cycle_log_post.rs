@@ -50,7 +50,7 @@ async fn watch(db: &PvDatabase, field: &str, sid: u32, mask: EventMask) -> Event
 
 async fn process(db: &PvDatabase) {
     let mut visited = std::collections::HashSet::new();
-    db.process_record_with_links("SCAL", &mut visited, 0)
+    db.process_record_with_links("SCAL", &mut visited)
         .await
         .unwrap();
 }

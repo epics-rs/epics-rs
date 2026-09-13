@@ -56,7 +56,7 @@ fn writes_val(marker: f64) -> Arc<SubroutineFn> {
 
 async fn process(db: &PvDatabase, name: &str) {
     let mut visited = HashSet::new();
-    db.process_record_with_links(name, &mut visited, 0)
+    db.process_record_with_links(name, &mut visited)
         .await
         .unwrap();
 }
@@ -196,7 +196,7 @@ async fn sub_empty_snam_put_parks_and_keeps_the_binding() {
         .put_field("VAL", EpicsValue::Double(0.0))
         .unwrap();
     let mut visited = HashSet::new();
-    let _ = db.process_record_with_links("Y", &mut visited, 0).await;
+    let _ = db.process_record_with_links("Y", &mut visited).await;
     assert_eq!(
         field(&db, "Y", "VAL").await,
         Some(EpicsValue::Double(0.0)),

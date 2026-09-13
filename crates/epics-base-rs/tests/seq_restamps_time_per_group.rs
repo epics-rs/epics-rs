@@ -70,7 +70,7 @@ async fn build() -> std::sync::Arc<PvDatabase> {
 /// clears it from the last hop.
 async fn run_chain(db: &PvDatabase, rec: &str) {
     let mut visited = HashSet::new();
-    db.process_record_with_links(rec, &mut visited, 0)
+    db.process_record_with_links(rec, &mut visited)
         .await
         .unwrap();
     for _ in 0..400 {

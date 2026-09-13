@@ -57,7 +57,7 @@ async fn sdly_async_defers_input_sim_read_to_continuation() {
     // Fresh (delaying) cycle: PACT held, sim read deferred — VAL untouched, no
     // alarm. C `process()` returns 0 on the async-start pass.
     let mut v1 = HashSet::new();
-    db.process_record_with_links("SDLY_AI", &mut v1, 0)
+    db.process_record_with_links("SDLY_AI", &mut v1)
         .await
         .unwrap();
 
@@ -83,7 +83,7 @@ async fn sdly_async_defers_input_sim_read_to_continuation() {
 
     // Continuation: sync SIOL read -> VAL=42, SIMM_ALARM raised, PACT cleared.
     let mut v2 = HashSet::new();
-    db.process_record_continuation("SDLY_AI", &mut v2, 0)
+    db.process_record_continuation("SDLY_AI", &mut v2)
         .await
         .unwrap();
 
@@ -124,7 +124,7 @@ async fn sdly_negative_reads_input_synchronously() {
     db.add_record("SDLYN_AI", Box::new(ai)).await.unwrap();
 
     let mut v1 = HashSet::new();
-    db.process_record_with_links("SDLYN_AI", &mut v1, 0)
+    db.process_record_with_links("SDLYN_AI", &mut v1)
         .await
         .unwrap();
 
@@ -168,7 +168,7 @@ async fn sdly_continuation_keeps_simm_latched_from_fresh_cycle() {
 
     // Fresh cycle: SIML reads 1 -> SIMM=YES, defer (PACT held), SIMM latched.
     let mut v1 = HashSet::new();
-    db.process_record_with_links("SDLYL_AI", &mut v1, 0)
+    db.process_record_with_links("SDLYL_AI", &mut v1)
         .await
         .unwrap();
     assert!(
@@ -190,7 +190,7 @@ async fn sdly_continuation_keeps_simm_latched_from_fresh_cycle() {
     // The SIML re-read is gated on `!is_continuation`, so SIMM is NOT
     // re-resolved to NO and the record does not fall through to the real device.
     let mut v2 = HashSet::new();
-    db.process_record_continuation("SDLYL_AI", &mut v2, 0)
+    db.process_record_continuation("SDLYL_AI", &mut v2)
         .await
         .unwrap();
 
@@ -246,9 +246,7 @@ async fn pact_false_retrigger_reresolves_simm_from_siml() {
     // Fresh cycle: SIML reads 0 -> SIMM=NO -> not simulated -> body runs and
     // arms the HIGH one-shot (returns Complete, so PACT is NOT held).
     let mut v1 = HashSet::new();
-    db.process_record_with_links("BOH", &mut v1, 0)
-        .await
-        .unwrap();
+    db.process_record_with_links("BOH", &mut v1).await.unwrap();
     let simm = db.get_pv("BOH.SIMM").unwrap();
     assert!(
         matches!(simm, EpicsValue::Short(0)),
@@ -268,7 +266,7 @@ async fn pact_false_retrigger_reresolves_simm_from_siml() {
     // (recGblGetSimm runs because !pact); the port must too — the gate is
     // `!pact_held`, not `!is_continuation`.
     let mut v2 = HashSet::new();
-    db.process_record_continuation("BOH", &mut v2, 0)
+    db.process_record_continuation("BOH", &mut v2)
         .await
         .unwrap();
     let simm = db.get_pv("BOH.SIMM").unwrap();
@@ -301,7 +299,7 @@ async fn sdly_async_defers_output_sim_write_to_continuation() {
 
     // Fresh (delaying) cycle: PACT held, SIOL write deferred — target untouched.
     let mut v1 = HashSet::new();
-    db.process_record_with_links("SDLYO_AO", &mut v1, 0)
+    db.process_record_with_links("SDLYO_AO", &mut v1)
         .await
         .unwrap();
 
@@ -317,7 +315,7 @@ async fn sdly_async_defers_output_sim_write_to_continuation() {
 
     // Continuation: VAL written to the SIOL target, PACT cleared.
     let mut v2 = HashSet::new();
-    db.process_record_continuation("SDLYO_AO", &mut v2, 0)
+    db.process_record_continuation("SDLYO_AO", &mut v2)
         .await
         .unwrap();
 

@@ -241,7 +241,7 @@ async fn r10_64_a_plain_process_cycle_fires_no_special_link() {
     let db = db_with_link_targets().await;
 
     let mut visited = HashSet::new();
-    db.process_record_with_links("SCAL", &mut visited, 0)
+    db.process_record_with_links("SCAL", &mut visited)
         .await
         .unwrap();
 

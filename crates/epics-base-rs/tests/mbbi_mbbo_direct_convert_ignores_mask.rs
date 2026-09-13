@@ -147,7 +147,7 @@ record(mbbiDirect, "M") {
         .unwrap();
 
     let mut visited = std::collections::HashSet::new();
-    db.process_record_with_links("M", &mut visited, 0)
+    db.process_record_with_links("M", &mut visited)
         .await
         .unwrap();
 

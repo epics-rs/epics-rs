@@ -135,7 +135,7 @@ async fn asub_clears_udf_when_subroutine_runs() {
     }
 
     let mut visited = std::collections::HashSet::new();
-    db.process_record_with_links("ASUB", &mut visited, 0)
+    db.process_record_with_links("ASUB", &mut visited)
         .await
         .unwrap();
 

@@ -38,7 +38,7 @@ record(ai, "TS_AI") {
         .unwrap();
 
     let mut visited = HashSet::new();
-    db.process_record_with_links("TS_AI", &mut visited, 0)
+    db.process_record_with_links("TS_AI", &mut visited)
         .await
         .unwrap();
 
@@ -73,7 +73,7 @@ record(stringin, "TS_SI") {
         .unwrap();
 
     let mut visited = HashSet::new();
-    db.process_record_with_links("TS_SI", &mut visited, 0)
+    db.process_record_with_links("TS_SI", &mut visited)
         .await
         .unwrap();
 

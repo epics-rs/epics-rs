@@ -2860,7 +2860,7 @@ pub(crate) async fn setup_io_intr(db: Arc<PvDatabase>) -> usize {
                     // record reads the value back into VAL and skips the
                     // device write; input records are unaffected.
                     let _ = db_clone
-                        .process_record_readback(&rec_name, &mut visited, 0)
+                        .process_record_readback(&rec_name, &mut visited)
                         .await;
                 }
             });
@@ -3568,7 +3568,7 @@ mod tests {
         // done). The record must read 0 back into VAL and must NOT write.
         {
             let mut visited = std::collections::HashSet::new();
-            db.process_record_readback("BO:RBK", &mut visited, 0)
+            db.process_record_readback("BO:RBK", &mut visited)
                 .await
                 .unwrap();
         }
@@ -3596,7 +3596,7 @@ mod tests {
         }
         {
             let mut visited = std::collections::HashSet::new();
-            db.process_record_with_links("BO:RBK", &mut visited, 0)
+            db.process_record_with_links("BO:RBK", &mut visited)
                 .await
                 .unwrap();
         }

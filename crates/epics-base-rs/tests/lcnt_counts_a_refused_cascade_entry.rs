@@ -74,7 +74,7 @@ async fn a_cycle_back_into_the_running_record_counts_in_lcnt() {
     .await;
 
     let mut visited = HashSet::new();
-    db.process_record_with_links("LCNT:A", &mut visited, 0)
+    db.process_record_with_links("LCNT:A", &mut visited)
         .await
         .unwrap();
 
@@ -124,7 +124,7 @@ async fn a_pact_link_target_accrues_lcnt_and_alarms_past_max_lock() {
 
     for i in 1..=10 {
         let mut visited = HashSet::new();
-        db.process_record_with_links("LCNTP:SRC", &mut visited, 0)
+        db.process_record_with_links("LCNTP:SRC", &mut visited)
             .await
             .unwrap();
         assert_eq!(
@@ -140,7 +140,7 @@ async fn a_pact_link_target_accrues_lcnt_and_alarms_past_max_lock() {
     }
 
     let mut visited = HashSet::new();
-    db.process_record_with_links("LCNTP:SRC", &mut visited, 0)
+    db.process_record_with_links("LCNTP:SRC", &mut visited)
         .await
         .unwrap();
     let (stat, sevr, amsg) = alarm_of(&db, "LCNTP:TGT");

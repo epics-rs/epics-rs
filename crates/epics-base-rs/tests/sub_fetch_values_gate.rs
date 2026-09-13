@@ -91,9 +91,7 @@ async fn r9_69_failed_inpn_read_skips_the_subroutine_and_freezes_val() {
     let db = sub_db("NOSUCHPV").await;
 
     let mut v = HashSet::new();
-    db.process_record_with_links("SUB", &mut v, 0)
-        .await
-        .unwrap();
+    db.process_record_with_links("SUB", &mut v).await.unwrap();
 
     let arc = db.get_record("SUB").unwrap();
     let inst = arc.read();
@@ -124,9 +122,7 @@ async fn r9_69_unset_link_is_not_a_fetch_failure() {
     let db = sub_db("").await;
 
     let mut v = HashSet::new();
-    db.process_record_with_links("SUB", &mut v, 0)
-        .await
-        .unwrap();
+    db.process_record_with_links("SUB", &mut v).await.unwrap();
 
     let arc = db.get_record("SUB").unwrap();
     let inst = arc.read();
@@ -168,9 +164,7 @@ async fn r9_69_asub_failed_inpn_read_skips_the_subroutine() {
     }
 
     let mut v = HashSet::new();
-    db.process_record_with_links("ASUB", &mut v, 0)
-        .await
-        .unwrap();
+    db.process_record_with_links("ASUB", &mut v).await.unwrap();
 
     let arc = db.get_record("ASUB").unwrap();
     let inst = arc.read();

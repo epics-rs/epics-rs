@@ -47,7 +47,7 @@ async fn add_scalcout(db: &PvDatabase, out: &str, dopt: i16) {
 
 async fn process(db: &PvDatabase, name: &str) {
     let mut v = HashSet::new();
-    db.process_record_with_links(name, &mut v, 0).await.unwrap();
+    db.process_record_with_links(name, &mut v).await.unwrap();
 }
 
 /// Boundary 1 — `DBF_MENU` target: `TGT.PRIO` is `menu(menuPriority)`

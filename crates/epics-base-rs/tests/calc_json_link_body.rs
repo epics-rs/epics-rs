@@ -303,7 +303,7 @@ async fn the_documented_two_literal_form_loads_and_evaluates() {
     let mut visited = std::collections::HashSet::new();
     let link = db.get_record("A").unwrap().read().parsed_inp.clone();
     let value = db
-        .read_link_value_soft(&link, true, &mut visited, 0)
+        .read_link_value_soft(&link, true, &mut visited)
         .expect("a calc link over two literals needs no records to evaluate");
     match value {
         EpicsValue::Double(v) => assert!((v - 4.5).abs() < 1e-9, "expected 3*1.5=4.5, got {v}"),

@@ -59,7 +59,7 @@ async fn r14_61_string_target_receives_osv_not_oval() {
         .unwrap();
 
     let mut visited = HashSet::new();
-    db.process_record_with_links("SC_STR", &mut visited, 0)
+    db.process_record_with_links("SC_STR", &mut visited)
         .await
         .unwrap();
 
@@ -84,7 +84,7 @@ async fn r14_61_char_array_target_receives_sval_bytes() {
         .unwrap();
 
     let mut visited = HashSet::new();
-    db.process_record_with_links("SC_WF", &mut visited, 0)
+    db.process_record_with_links("SC_WF", &mut visited)
         .await
         .unwrap();
 
@@ -113,7 +113,7 @@ async fn r14_61_numeric_target_still_receives_oval() {
     db.add_record("SC_NUM", Box::new(sc)).await.unwrap();
 
     let mut visited = HashSet::new();
-    db.process_record_with_links("SC_NUM", &mut visited, 0)
+    db.process_record_with_links("SC_NUM", &mut visited)
         .await
         .unwrap();
 

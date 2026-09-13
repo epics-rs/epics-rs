@@ -58,11 +58,11 @@ record(stringin, "TOD_STR") {
         .unwrap();
 
     let mut visited = HashSet::new();
-    db.process_record_with_links("TOD_SEC", &mut visited, 0)
+    db.process_record_with_links("TOD_SEC", &mut visited)
         .await
         .unwrap();
     let mut visited = HashSet::new();
-    db.process_record_with_links("TOD_STR", &mut visited, 0)
+    db.process_record_with_links("TOD_STR", &mut visited)
         .await
         .unwrap();
 

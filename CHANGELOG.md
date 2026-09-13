@@ -1,5 +1,35 @@
 # Changelog
 
+## v0.29.0 — 2026-09-13
+
+Minor release. Workspace 0.28.2 -> 0.29.0; the 18
+`[workspace.dependencies]` pins and the hand-written `epics-pva-rs` pin
+in `epics-bridge-rs` move in lockstep. Five `epics-base-rs` entries lose
+their `depth` argument, the release's only breaking change.
+
+### PVA put and post
+
+The client's `PutOp` (`op_put_begin`) keeps the op open after INIT and
+reads back on the put's own ioid, the non-autoExec rule pvxs follows;
+the TwoShot route that raced the warm-GET slot replacement beneath it is
+gone. The server stops walking the descriptor per update: `post_delta`
+copies only the marked fields as pvxs's `current.assign` does, the wire
+bitset is computed once at enqueue, and the writer drains its queue into
+one write per wake.
+
+### No link-chain depth bound
+
+C's `dbProcess` (`dbAccess.c:485`) has no depth counter — `processTarget`
+(`dbDbLink.c:427-436`) recurses until a record is already `pact`, which
+is what the port's `visited` set models — so the port's own 16-hop bound
+is gone. It had refused the 17th record of synApps' `scaler32.db`
+(`scaler` -> `_cts1..8` -> `_calc1..8`), leaving `_calc8` unprocessed.
+The `depth` argument nothing read any more goes with it:
+`process_record_with_links`, `process_record_with_links_already_locked`,
+`process_record_readback`, `process_record_continuation` and
+`read_link_value_soft` each take one fewer argument. A FLNK hop is still
+one stack frame, as it is under C.
+
 ## v0.28.2 — 2026-09-10
 
 Patch release. The PVA server drops the two admission caps pvxs does

@@ -104,7 +104,15 @@ dbLoadRecords("$(XRT_BEAMLINE)/db/xrt_detector.template", "P=$(PREFIX),R=cam1:,I
 # Restore top-level prefix
 epicsEnvSet("PREFIX", "bl:")
 
-# ===== Initial motor positions (after iocInit) =====
+# ===== Initial motor positions =====
+# These command the motors to a starting position, so unlike the HLM/LLM
+# macros above they cannot be folded into dbLoadRecords — only a running IOC
+# can accept them. dbpf refuses a record whose lock set is not built yet
+# (C dbTest.c:408-411, "dbpf only works after iocInit"), so the script runs
+# iocInit itself here; the IocApplication build that otherwise follows the
+# script finds the IOC already built.
+iocInit()
+
 # Set default positions for 8 keV operation
 dbpf("bl:und:gap.VAL", "6.1")
 dbpf("bl:dcm:theta.VAL", "14.31")

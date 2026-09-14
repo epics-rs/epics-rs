@@ -528,6 +528,11 @@ pub async fn run(
         config.pv("KohzuModeBO"),
         config.pv("KohzuMode2MO"),
         config.pv("KohzuOperAckBO"),
+        // C `monitor kohzuMoving; sync kohzuMoving kMbusy;` (kohzuCtl.st:87-91).
+        // The database asserts busy on every setpoint put, including one that
+        // writes the value already there; without this the sequencer never
+        // learns of such a put and the busy record never returns to done.
+        config.pv("KohzuMoving"),
         config.motor_pv(&config.m_theta, ".RBV"),
         config.motor_pv(&config.m_theta, ".HLM"),
         config.motor_pv(&config.m_theta, ".LLM"),
@@ -670,6 +675,7 @@ pub async fn run(
     let pv_auto_mode = config.pv("KohzuModeBO");
     let pv_cc_mode = config.pv("KohzuMode2MO");
     let pv_oper_ack = config.pv("KohzuOperAckBO");
+    let pv_moving = config.pv("KohzuMoving");
     let pv_theta_mot_rbv = config.motor_pv(&config.m_theta, ".RBV");
     let pv_theta_hilim = config.motor_pv(&config.m_theta, ".HLM");
     let pv_theta_lolim = config.motor_pv(&config.m_theta, ".LLM");
@@ -970,6 +976,31 @@ pub async fn run(
                 .await;
             let _ = ch_seq_msg2.put_string_process("Set to Manual Mode").await;
             proceed_to_theta_changed = true;
+        } else if changed_pv == pv_moving {
+            // C `state busyChanged` (kohzuCtl.st:865-887), reached from
+            // waitForCmnd on `efTestAndClear(kMbusy)` (:714). A put that
+            // writes a setpoint's existing value posts no monitor — C's own
+            // comment at :862-864 — yet BraggEAO/BraggLambdaAO/BraggThetaAO
+            // all FLNK to KohzuPutMoving, which asserts the busy record. C
+            // treats that assertion as the command: with no setpoint event
+            // left to consume it falls to `when (kohzuMoving > 0)` and enters
+            // eChanged, recomputing lambda and theta from the current E and
+            // running the move. A clearing edge is C's `when (kohzuMoving ==
+            // 0)`, which only returns to waitForCmndEnter.
+            if new_val as i16 != 0 {
+                lambda_val = energy_to_lambda(e_val);
+                let _ = ch_lambda.put_f64_process(lambda_val).await;
+                if lambda_val > two_d {
+                    let _ = ch_seq_msg1
+                        .put_string_process("Wavelength > 2d spacing.")
+                        .await;
+                    let _ = ch_alert.put_i16_process(1).await;
+                } else if let Some(th) = lambda_to_theta(lambda_val, two_d) {
+                    theta_val = th;
+                    let _ = ch_theta.put_f64_process(theta_val).await;
+                }
+                proceed_to_theta_changed = true;
+            }
         } else if changed_pv == pv_use_set {
             use_set_mode = new_val as i16 != 0;
             let set_val = if use_set_mode { 1i16 } else { 0i16 };

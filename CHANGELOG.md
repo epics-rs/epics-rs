@@ -1,5 +1,19 @@
 # Changelog
 
+## v0.29.1 — 2026-09-14
+
+Patch release. The Kohzu sequencer gains C's `busyChanged` state
+(`kohzuCtl.st:865-887`): a put that writes a setpoint's existing value
+posts no monitor, yet `BraggEAO`/`BraggLambdaAO`/`BraggThetaAO` all FLNK
+to `KohzuPutMoving`, which asserts the busy record, and C treats that
+assertion as the command — it falls to `when (kohzuMoving > 0)` and
+recomputes lambda and theta from the current E. Without the state the
+port never woke and `KohzuMoving` stayed asserted forever. The mini- and
+xrt-beamline `st.cmd` files stop issuing `dbpf` before `iocInit`, which
+C refuses (`dbTest.c:408-411`): the DCM Y/Z soft limits now ride
+`motor.template`'s `HLM`/`LLM` macros at `dbLoadRecords` time, and xrt's
+initial-position block runs after an explicit `iocInit()`.
+
 ## v0.29.0 — 2026-09-13
 
 Minor release. Workspace 0.28.2 -> 0.29.0; the 18

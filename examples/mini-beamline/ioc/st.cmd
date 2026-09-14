@@ -15,7 +15,7 @@ simMotorCreate("dot_mtrx", -500, 500, 100)
 simMotorCreate("dot_mtry", -500, 500, 100)
 
 # ===== Kohzu DCM (Double Crystal Monochromator) =====
-# Y/Z hard travel must cover the dbpf'd +-250 soft limits below: Z needs
+# Y/Z hard travel must cover the +-250 soft limits set below: Z needs
 # yOffset/sin(theta) (up to ~180mm over 5-20 keV at yOffset=17.5). With a
 # narrower simulated range the motor slams into the simulator's limit switch
 # mid-move and kohzuCtl aborts the whole move and drops to Manual mode
@@ -58,13 +58,13 @@ dbLoadRecords("$(MOTOR)/motor.template", "P=$(PREFIX),M=dot:mtry,PORT=dot_mtry,V
 # Theta down to a crawl (~0.04 deg/s) — the move looks frozen. Give Z the
 # highest velocity so its travel time, not Theta's, sets a sane move duration.
 dbLoadRecords("$(MOTOR)/motor.template", "P=$(PREFIX),M=dcm:theta,PORT=dcm_theta,VELO=5,ACCL=0.2")
-dbLoadRecords("$(MOTOR)/motor.template", "P=$(PREFIX),M=dcm:y,PORT=dcm_y,VELO=10,ACCL=0.2")
-dbLoadRecords("$(MOTOR)/motor.template", "P=$(PREFIX),M=dcm:z,PORT=dcm_z,VELO=50,ACCL=0.2")
-# Widen DCM Z soft limits for full energy range (5-20 keV needs Z up to ~200mm)
-dbpf("$(PREFIX)dcm:z.DHLM", "250")
-dbpf("$(PREFIX)dcm:z.DLLM", "-250")
-dbpf("$(PREFIX)dcm:y.DHLM", "250")
-dbpf("$(PREFIX)dcm:y.DLLM", "-250")
+# Y/Z soft limits are widened for the full energy range (5-20 keV needs Z up
+# to ~200mm) through motor.template's HLM/LLM macros, which land in DHLM/DLLM
+# at dbLoadRecords time. They cannot be dbpf'd here: st.cmd runs before
+# iocInit, and dbpf refuses a record whose lock set is not built yet
+# (C dbTest.c:408-411, "dbpf only works after iocInit").
+dbLoadRecords("$(MOTOR)/motor.template", "P=$(PREFIX),M=dcm:y,PORT=dcm_y,VELO=10,ACCL=0.2,HLM=250,LLM=-250")
+dbLoadRecords("$(MOTOR)/motor.template", "P=$(PREFIX),M=dcm:z,PORT=dcm_z,VELO=50,ACCL=0.2,HLM=250,LLM=-250")
 dbLoadRecords("$(OPTICS)/db/kohzuSeq.db", "P=$(PREFIX),M_THETA=dcm:theta,M_Y=dcm:y,M_Z=dcm:z,yOffHi=50,yOffLo=-50")
 
 # Load beam current

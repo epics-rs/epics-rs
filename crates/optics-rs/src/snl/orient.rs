@@ -790,7 +790,6 @@ pub async fn run(
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     use tokio::time::{Duration, sleep};
 
-    tokio::time::sleep(Duration::from_secs(3)).await;
     println!("orient: starting for prefix={}", config.prefix);
 
     let my_origin = alloc_origin();

@@ -365,9 +365,6 @@ pub async fn run(
     config: KohzuConfig,
     db: PvDatabase,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    // Wait for iocInit to complete — PVs are loaded during st.cmd but
-    // subscriber wiring happens during iocInit which runs after st.cmd finishes.
-    tokio::time::sleep(Duration::from_secs(3)).await;
     println!("kohzuCtl: starting for prefix={}", config.prefix);
 
     // Allocate a unique origin ID for this controller instance.

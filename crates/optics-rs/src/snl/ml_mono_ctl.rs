@@ -262,7 +262,6 @@ pub async fn run(
     config: MlMonoConfig,
     db: PvDatabase,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    tokio::time::sleep(Duration::from_secs(3)).await;
     println!("ml_monoCtl: starting for prefix={}", config.prefix);
 
     let my_origin = alloc_origin();

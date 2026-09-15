@@ -108,7 +108,7 @@ dbLoadRecords("$(MINI_BEAMLINE)/db/moving_dot.template", "P=$(PREFIX),R=cam1:,IO
 # Restore top-level prefix
 epicsEnvSet("PREFIX", "mini:")
 
-# ===== State machines (spawned here, wait internally for iocInit + PV availability) =====
+# ===== State machines (spawned here; each runs only after iocInit's PINI pass) =====
 seqStart("kohzuCtl", "P=$(PREFIX),M_THETA=dcm:theta,M_Y=dcm:y,M_Z=dcm:z")
 
 # ===== Autosave =====

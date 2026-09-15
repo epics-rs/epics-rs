@@ -18,6 +18,7 @@ pub mod record;
 pub mod records;
 pub mod scan;
 pub mod snapshot;
+pub mod snl;
 pub mod status_pv;
 
 use crate::server::record::Record;

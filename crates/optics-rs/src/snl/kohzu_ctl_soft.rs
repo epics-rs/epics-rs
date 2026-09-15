@@ -94,7 +94,6 @@ pub async fn run(
     config: KohzuSoftConfig,
     db: PvDatabase,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    tokio::time::sleep(Duration::from_secs(3)).await;
     println!(
         "kohzuCtl_soft: starting for prefix={}{}",
         config.prefix, config.mono

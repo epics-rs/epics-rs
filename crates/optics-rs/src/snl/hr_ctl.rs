@@ -326,7 +326,6 @@ pub async fn run(
     config: HrConfig,
     db: PvDatabase,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    tokio::time::sleep(Duration::from_secs(3)).await;
     println!("hrCtl: starting for prefix={}HR{}", config.prefix, config.n);
 
     let my_origin = alloc_origin();

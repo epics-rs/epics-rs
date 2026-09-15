@@ -657,7 +657,6 @@ pub async fn run(
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     use tokio::time::{Duration, sleep};
 
-    tokio::time::sleep(Duration::from_secs(3)).await;
     println!(
         "pf4: starting for prefix={}{} bank {}",
         config.prefix, config.hardware, config.bank

@@ -87,12 +87,10 @@ lto = "fat"
 codegen-units = 1
 
 
-# Both embedded targets need libc definitions that the published crate does
-# not yet carry, from the one fork branch `epics-rs-0.2`.
-#
-# RTEMS 6 (armv7-rtems-eabihf): `time_t`/`clock_t`/`clockid_t`/`dev_t`/`ino_t`/
-# `off_t`/`rlim_t` widths, the BSD length byte on every socket address struct,
-# and the libbsd values of the socket/poll/getaddrinfo constants.
+# RTEMS 6 (armv7-rtems-eabihf) needs libc definitions no published 0.2 release
+# carries yet: `time_t`/`clock_t`/`clockid_t`/`dev_t`/`ino_t`/`off_t`/`rlim_t`
+# widths, the BSD length byte on every socket address struct, and the libbsd
+# values of the socket/poll/getaddrinfo constants.
 # `-Zbuild-std` compiles `std` against this same crate, so a wrong `timespec`
 # or `sockaddr_in` corrupts std itself rather than only our code -- see the two
 # build-refusing asserts in `crates/epics-rtems-boot/src/lib.rs`
@@ -100,11 +98,13 @@ codegen-units = 1
 # is a patch and not a local type definition. `scripts/rtems-check.sh` fails
 # all six `image` targets without it.
 #
-# VxWorks 7 (x86_64-wrs-vxworks): `pread`/`pwrite` (removed upstream in
-# 0.2.187, rust-lang/libc#5129) and `killpg` -- std imports all three, and the
-# SDK defines none of them, so they are always-failing shims rather than
-# extern declarations -- plus `getentropy` over the platform's `randABytes`.
-# Without these std itself does not compile for the target.
+# VxWorks 7 (x86_64-wrs-vxworks) needs nothing from here any more. std stopped
+# importing all three symbols the fork had shimmed: `pread`/`pwrite` (its own
+# vxworks arm in `sys/fd/unix.rs`, rust-lang/libc#5328), `killpg` (`mod unix`
+# is not compiled for the target) and `getentropy` (`sys/random/vxworks.rs`
+# calls `randSecure`/`randABytes`, both published). MEASURED:
+# `scripts/vxworks-check.sh` goes green against a stock 0.2.189 with this whole
+# block deleted.
 #
 # NOTE a manifest `[patch]` does NOT reach `-Zbuild-std`, which resolves std's
 # own libc from rust-src's lock; only a CONFIG-level patch does, and only at
@@ -114,11 +114,11 @@ codegen-units = 1
 # clone of this rev, version-relabelled for the toolchain), keeping this
 # line the single source of truth for both resolutions.
 #
-# Pinned by rev; the branch is upstream `libc-0.2` (8c6e6710) plus the four
-# RTEMS commits (split upstream as PRs `rtems-sockaddr-len` and
-# `rtems-type-widths`) and the two VxWorks commits above. The retired
-# RTEMS-only pin 6f64e70d stays reachable via the tag `epics-rs-rtems-0.2.188`
-# and as an ancestor of `epics-rs-0.2`. Remove this patch once the fixes land
-# in a published 0.2 release.
+# Pinned by rev on upstream `libc-0.2` itself -- the `physwkim/libc` fork this
+# used to name is retired, both halves of it having landed or become moot. The
+# RTEMS fixes are commits 157b50eeb (socket addresses and constants) and
+# f93cde7fd (scalar type widths), merged 2026-09-04; 0.2.189 was cut 2026-07-21,
+# so they are merged but unreleased and the patch is still what carries them.
+# Delete this block once they ship in a published 0.2 release.
 [patch.crates-io]
-libc = { git = "https://github.com/physwkim/libc.git", rev = "31d5776f9952aa349813d7fbef3addae1bf0a5ef" }
+libc = { git = "https://github.com/rust-lang/libc.git", rev = "31503352774deadf65cc53257b59ee4f3299f644" }

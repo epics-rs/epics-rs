@@ -11,6 +11,7 @@ use std::collections::HashMap;
 
 use epics_base_rs::server::database::PvDatabase;
 use epics_base_rs::server::iocsh::macro_defn_pairs;
+use epics_base_rs::server::snl::spawn_program;
 
 /// Split a `seq` macro string into definitions.
 ///
@@ -60,11 +61,8 @@ pub fn seq_start(
                 &require_macro(&macros, "P", program)?,
                 &require_macro(&macros, "R", program)?,
             );
-            let db = db.clone();
-            bridge.spawn(async move {
-                if let Err(e) = crate::snl::delay_do::run(config, db).await {
-                    eprintln!("delayDo error: {e}");
-                }
+            spawn_program(bridge, db, "delayDo", move |db| {
+                crate::snl::delay_do::run(config, db)
             });
         }
         "femto" => {
@@ -77,11 +75,8 @@ pub fn seq_start(
                 &require_macro(&macros, "G3", program)?,
                 &require_macro(&macros, "NO", program)?,
             );
-            let db = db.clone();
-            bridge.spawn(async move {
-                if let Err(e) = crate::snl::femto::run(config, db).await {
-                    eprintln!("femto error: {e}");
-                }
+            spawn_program(bridge, db, "femto", move |db| {
+                crate::snl::femto::run(config, db)
             });
         }
         other => return Err(format!("seq_start: unknown std program '{other}'")),

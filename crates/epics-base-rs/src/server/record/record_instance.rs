@@ -4796,6 +4796,53 @@ impl RecordInstance {
         sub_updates
     }
 
+    /// The posts an `AsyncPendingNotify` pass publishes — the single owner both
+    /// dispatch paths call (`processing.rs`'s engine and [`Self::process_local`]),
+    /// so a mid-async post cannot obey one rule on one path and another rule on
+    /// the other.
+    ///
+    /// Each post carries `DBE_VALUE|DBE_LOG`: C motor's mid-move
+    /// `db_post_events` calls use `DBE_VAL_LOG` (motorRecord.cc:2606 DMOV, and
+    /// every other `do_work` post), and no alarm transition ran on this pending
+    /// pass.
+    ///
+    /// The deadband field is NOT change-detected against `last_posted` here.
+    /// Whether it posts, with which mask, and where MLST/ALST land belong to
+    /// [`Self::value_include_classes`] and [`Self::deadband_post`] on this pass
+    /// as on every other — C motor `monitor()` runs on the move-start pass too
+    /// (motorRecord.cc:1507) and posts RBV only on an MDEL/ADEL crossing,
+    /// moving `mlst` to RBV (motorRecord.cc:3468-3507). `deadband_post`
+    /// deliberately does not advance `last_posted`: MLST/ALST are where that
+    /// field's published value lives, so change-detecting it here compared
+    /// against a cache nothing maintains and re-posted the PREVIOUS readback at
+    /// every move start.
+    pub(crate) fn collect_notify_posts(
+        &mut self,
+        fields: Vec<(String, EpicsValue)>,
+    ) -> Vec<(String, EpicsValue, EventMask)> {
+        let deadband_field = self.record.monitor_deadband_field();
+        let mut posts = Vec::new();
+        for (name, val) in fields {
+            if name == deadband_field {
+                // The record's own value, not the notify's copy of it: C posts
+                // the field itself (`db_post_events(pmr, &pmr->rbv, ...)`).
+                let (include_val, include_archive) = self.value_include_classes();
+                // No alarm bits: `recGblResetAlarms` has not run on this pending
+                // pass, so the post carries only the classes MDEL/ADEL fired.
+                let deadband = self.deadband_post(EventMask::NONE, include_val, include_archive);
+                if let Some((field, value)) = deadband.field {
+                    posts.push((field, value, deadband.mask));
+                }
+                continue;
+            }
+            if self.posted_value(&name).is_none_or(|prev| prev != &val) {
+                self.record_value_post(&name, val.clone());
+                posts.push((name, val, EventMask::VALUE | EventMask::LOG));
+            }
+        }
+        posts
+    }
+
     /// Basic process: process record, evaluate alarms, timestamp, build snapshot.
     /// This does NOT handle links — see process_with_context in database.rs.
     ///
@@ -5040,29 +5087,9 @@ impl RecordInstance {
             // Unlike AsyncPending, we DO release the processing flag so
             // subsequent I/O Intr cycles can continue processing normally.
             self.common.time = crate::runtime::general_time::get_current();
-            // Filter out fields that haven't actually changed, and update
-            // MLST/last_posted for those that have. Each intermediate
-            // post carries DBE_VALUE|DBE_LOG — C motor's mid-move
-            // `db_post_events` calls use `DBE_VAL_LOG`
-            // (motorRecord.cc:2606 DMOV, and every other do_work post);
-            // no alarm transition ran on this pending pass.
-            let mut changed_fields = Vec::new();
-            for (name, val) in fields {
-                let changed = match self.posted_value(&name) {
-                    Some(prev) => prev != &val,
-                    None => true,
-                };
-                if changed {
-                    if name == "VAL" {
-                        if let Some(f) = val.to_f64() {
-                            self.put_coerced("MLST", EpicsValue::Double(f));
-                            self.common.mlst = Some(f);
-                        }
-                    }
-                    self.record_value_post(&name, val.clone());
-                    changed_fields.push((name, val, EventMask::VALUE | EventMask::LOG));
-                }
-            }
+            // The pass's posts, through the owner this path shares with the
+            // engine (`Self::collect_notify_posts`).
+            let changed_fields = self.collect_notify_posts(fields);
             // _guard drops here, clearing the processing flag
             return Ok((ProcessSnapshot { changed_fields }, Vec::new()));
         }

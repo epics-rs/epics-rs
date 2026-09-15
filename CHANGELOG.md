@@ -1,5 +1,19 @@
 # Changelog
 
+## v0.29.2 — 2026-09-15
+
+Patch release. SNL programs start through `spawn_program`, which awaits
+`PvDatabase::wait_for_pini` at the one spawn site, instead of each
+program sleeping 3 s in `run()`. A C seq program runs no state until its
+PVs connect, which needs rsrv and so iocRun, after initialProcess; the
+sleep raced iocInit, so `kohzuCtl` read the unprocessed lattice with
+`two_d = 0` and PINI then overwrote its write. The `libc` patch pin
+moves off the retired `physwkim` fork to upstream `rust-lang/libc`,
+where the RTEMS socket-layout and scalar-width fixes landed as
+157b50eeb and f93cde7fd; VxWorks needs nothing from the pin any more,
+and the CI VxWorks job floats on nightly again now that
+rust-lang/rust#162065 gave `set_perm_nofollow` a VxWorks arm.
+
 ## v0.29.1 — 2026-09-14
 
 Patch release. The Kohzu sequencer gains C's `busyChanged` state

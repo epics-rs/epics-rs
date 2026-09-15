@@ -4,25 +4,6 @@ Pure Rust implementation of the [EPICS](https://epics-controls.org/) control sys
 
 No C dependencies. No `libca`. No `libCom`. Just `cargo build`.
 
-## Why
-
-EPICS is the proven standard for large-scale control systems, but standing up
-a full simulation environment in C EPICS means building Base and each support
-module in dependency order, wiring `RELEASE` paths, `.dbd` registrations, and
-`Makefile` rules. In epics-rs the entire stack — Channel Access and pvAccess
-protocols, IOC runtime, asyn, motor, areaDetector plugins — is one Cargo
-workspace and one command:
-
-```bash
-cargo build --release --workspace
-```
-
-The wire protocol is identical to C EPICS, so existing clients (`caget`,
-`camonitor`, `pvget`, CSS, PyDM, Phoebus) work without modification. The goal
-is not to replace C EPICS in production facilities, but to provide a **fast
-path from idea to running simulation** — the sim-detector example boots 8,367
-records with the full areaDetector plugin chain from a single `cargo build`.
-
 ## What's included
 
 - **Channel Access** — client & server (UDP name resolution + TCP circuit, beacons, repeater)
@@ -43,7 +24,7 @@ The umbrella crate pulls in what you select by feature:
 
 ```toml
 [dependencies]
-epics-rs = { version = "0.28", features = ["ad"] }
+epics-rs = { version = "0.29", features = ["ad"] }
 ```
 
 ```rust
@@ -74,8 +55,8 @@ through the umbrella crate — depend on them directly when needed.
 You can also depend on sub-crates directly:
 
 ```toml
-epics-base-rs = "0.28"  # just the IOC runtime
-epics-ca-rs   = "0.28"  # just Channel Access
+epics-base-rs = "0.29"  # just the IOC runtime
+epics-ca-rs   = "0.29"  # just Channel Access
 ```
 
 ## Workspace
@@ -210,22 +191,17 @@ cargo +nightly build --release --locked \
 
 **The BSP prefix must be built with `scripts/rtems-bsp.sh`.** No RTEMS
 release carries the libbsd and kernel fixes an image relies on (rtems-libbsd
-!153/!154/!156/!159, kernel !1383/!1439 — the first release line to carry them
-is 6.3, which is not tagged), so the prefix is a source build, and the script
-is the one pinned, recorded way to make it: it asserts those fixes are in the
-tree it builds and writes the revisions into the prefix's `epics-rs-env.sh`.
-A prefix assembled any other way cannot be named in a bug report. Sourcing
-`epics-rs-env.sh` is the whole setup — `RTEMS_BSP_PREFIX`, `RTEMS_BSP`,
-`PATH` and the cargo linker override come from it.
+!153/!154/!156/!159, kernel !1383/!1439), so the prefix is a source build; the
+script pins the revisions, asserts the fixes are in the tree it builds, and
+records them in the prefix's `epics-rs-env.sh`. Sourcing that file is the
+whole setup.
 
-The custom target spec this workspace deviates on (`has-thread-local: true`,
-measured to take std's per-thread TLS leak on RTEMS from 136 B to 0) is applied
-automatically by a rustc-wrapper wired in `.cargo/config.toml` — plain
-`cargo build` is the whole interface.
+The custom target spec (`has-thread-local: true`, measured to take std's
+per-thread TLS leak on RTEMS from 136 B to 0) is applied by a rustc-wrapper
+wired in `.cargo/config.toml`, so plain `cargo build` is the whole interface.
 `./scripts/embedded-image.sh rtems ca` builds the same binary on the
-`release-embedded` profile (strip + fat LTO), which is what a deployment ships:
-4.6 MB against the dev build's 122.9 MB. The full build manual, including the
-PVA/QSRV image and the spec escape hatch, is in
+`release-embedded` profile (strip + fat LTO): 4.6 MB against the dev build's
+122.9 MB. Full build manual, including the PVA/QSRV image, in
 [`crates/epics-rtems-boot/README.md`](crates/epics-rtems-boot/README.md).
 
 ## Build for VxWorks 7 (x86_64-wrs-vxworks)
@@ -243,17 +219,17 @@ being a builtin triple it needs no custom spec:
 ./scripts/embedded-image.sh vxworks ca
 ```
 
-Both embedded targets take their `libc` fixes from one pinned public fork
-branch (`physwkim/libc`, `epics-rs-0.2`). A manifest `[patch.crates-io]` does
-not reach `-Zbuild-std`, which resolves std against rust-src's own lock, so
-`scripts/libc-std-patch.sh` derives a config-level patch from that same pin;
-`vxworks-check.sh` and `embedded-image.sh` both call it, leaving the manifest
-line the single source of truth for what libc is compiled. That is what lets
-the closure be type-checked on a stock nightly, CI included. Linking stays on a
-box with the SDK — producing or booting a `.vxe` is the one half no runner can
-do. What was measured on target: 11/11 gate rows, CA and PVA round-trips over
-the wire, and a five-row strip/LTO size matrix covering both embedded targets
-and both binaries.
+RTEMS pins `libc` to an upstream `rust-lang/libc` rev for the scalar-width
+and socket-layout fixes no published 0.2 release carries yet; VxWorks needs
+nothing from it. A manifest `[patch.crates-io]` does not reach `-Zbuild-std`,
+which resolves std against rust-src's own lock, so `scripts/libc-std-patch.sh`
+derives a config-level patch from that same pin — `vxworks-check.sh` and
+`embedded-image.sh` both call it, leaving the manifest line the single source
+of truth for what libc is compiled. That is what lets the closure be
+type-checked on a stock nightly, CI included; linking stays on a box with the
+SDK. Measured on target: 11/11 gate rows, CA and PVA round-trips over the
+wire, and a five-row strip/LTO size matrix covering both embedded targets and
+both binaries.
 
 ## Run on RT Linux (PREEMPT_RT)
 

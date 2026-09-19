@@ -487,7 +487,9 @@ impl WaveformRecord {
             EpicsValue::CharArray(v) => v.resize(n, 0),
             EpicsValue::UCharArray(v) => v.resize(n, 0),
             EpicsValue::ShortArray(v) => v.resize(n, 0),
+            EpicsValue::UShortArray(v) => v.resize(n, 0),
             EpicsValue::LongArray(v) => v.resize(n, 0),
+            EpicsValue::ULongArray(v) => v.resize(n, 0),
             EpicsValue::Int64Array(v) => v.resize(n, 0),
             EpicsValue::UInt64Array(v) => v.resize(n, 0),
             EpicsValue::FloatArray(v) => v.resize(n, 0.0),
@@ -2051,6 +2053,30 @@ mod array_kind_tests {
                 "the buffer is neither moved nor resized"
             );
             assert_eq!(wf.get_field("VAL"), Some(EpicsValue::LongArray(served)));
+        }
+    }
+
+    /// An NELM change keeps the elements already loaded, whatever the FTVL.
+    #[test]
+    fn an_nelm_resize_keeps_unsigned_elements() {
+        for (ftvl, loaded, grown) in [
+            (
+                DbFieldType::UShort,
+                EpicsValue::UShortArray(vec![1, 2]),
+                EpicsValue::UShortArray(vec![1, 2, 0, 0]),
+            ),
+            (
+                DbFieldType::ULong,
+                EpicsValue::ULongArray(vec![1, 2]),
+                EpicsValue::ULongArray(vec![1, 2, 0, 0]),
+            ),
+        ] {
+            let mut wf = WaveformRecord::new(2, ftvl);
+            wf.kind = ArrayKind::Waveform;
+            wf.put_field("VAL", loaded).unwrap();
+            wf.put_field("NELM", EpicsValue::Long(4)).unwrap();
+            assert_eq!(wf.val, grown);
+            assert_eq!(wf.nord, 2);
         }
     }
 

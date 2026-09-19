@@ -115,6 +115,7 @@ impl From<&RequestOp> for PortCommand {
                 value: value.clone(),
             },
             RequestOp::Report { level } => Self::Report { level: *level },
+            RequestOp::WithDriver(_) => Self::WithDriver,
             RequestOp::SetInputEos { eos } => Self::SetInputEos { eos: eos.clone() },
             RequestOp::SetOutputEos { eos } => Self::SetOutputEos { eos: eos.clone() },
             RequestOp::SetTimeStampSource { name } => {
@@ -255,6 +256,7 @@ impl From<&PortCommand> for RequestOp {
                 value: value.clone(),
             },
             PortCommand::Report { level } => Self::Report { level: *level },
+            PortCommand::WithDriver => Self::WithDriver(crate::request::DriverCall::spent()),
             PortCommand::SetInputEos { eos } => Self::SetInputEos { eos: eos.clone() },
             PortCommand::SetOutputEos { eos } => Self::SetOutputEos { eos: eos.clone() },
             PortCommand::SetTimeStampSource { name } => {

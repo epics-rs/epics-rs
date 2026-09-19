@@ -1,11 +1,44 @@
 //! Request types for the port actor.
 
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU8, Ordering as AtomicOrdering};
+use std::sync::{Arc, Mutex};
 use std::time::SystemTime;
 
 use crate::error::AsynStatus;
 use crate::param::ParamValue;
+use crate::port::PortDriver;
+
+/// The closure a [`RequestOp::WithDriver`] carries.
+///
+/// A request is `Clone`, a closure runs once: the clones share one slot and the
+/// first to reach the actor takes it. A call with nothing left to run — a second
+/// clone, or one rebuilt from a serialized `PortCommand`, which cannot carry
+/// code — is refused by the actor rather than silently succeeding.
+#[derive(Clone)]
+pub struct DriverCall(Arc<Mutex<Option<DriverFn>>>);
+
+type DriverFn = Box<dyn FnOnce(&mut dyn PortDriver) + Send>;
+
+impl DriverCall {
+    pub fn new(f: impl FnOnce(&mut dyn PortDriver) + Send + 'static) -> Self {
+        Self(Arc::new(Mutex::new(Some(Box::new(f)))))
+    }
+
+    /// A call with no closure, which the actor refuses.
+    pub fn spent() -> Self {
+        Self(Arc::new(Mutex::new(None)))
+    }
+
+    pub(crate) fn take(&self) -> Option<DriverFn> {
+        self.0.lock().unwrap_or_else(|e| e.into_inner()).take()
+    }
+}
+
+impl std::fmt::Debug for DriverCall {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("DriverCall")
+    }
+}
 
 /// A param value to set directly in the store (no writeInt32/on_param_change).
 /// Mirrors C ADCore's setIntegerParam/setDoubleParam.
@@ -331,6 +364,10 @@ pub enum RequestOp {
     Report {
         level: i32,
     },
+    /// Run caller code against the driver from the actor — what C driver
+    /// threads do between `lock()` and `unlock()` (asynPortDriver.cpp:3858).
+    /// Built by [`crate::port_handle::PortHandle::with_driver`].
+    WithDriver(DriverCall),
     /// Set the port's input EOS bytes — C `pasynOctet->setInputEos`.
     /// Drives the same `PortDriver::set_input_eos(&[u8])` hook the EOS
     /// interpose layer reads, so asynRecord IEOS writes survive a

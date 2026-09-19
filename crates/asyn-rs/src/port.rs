@@ -1720,7 +1720,7 @@ fn illegal_eoslen(port: &str, eoslen: usize) -> AsynError {
     }
 }
 
-pub trait PortDriver: Send + Sync + 'static {
+pub trait PortDriver: Any + Send + Sync {
     fn base(&self) -> &PortDriverBase;
     fn base_mut(&mut self) -> &mut PortDriverBase;
 

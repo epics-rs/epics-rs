@@ -12,9 +12,10 @@
 // itself, which the backend does not remove.
 
 use crate::param::ParamValue;
+use std::any::Any;
 use std::future::Future;
 use std::pin::pin;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll, Wake, Waker};
 use std::time::{Duration, Instant};
 
@@ -24,9 +25,9 @@ use tokio::sync::{mpsc, oneshot};
 use crate::error::{AsynError, AsynResult, AsynStatus};
 use crate::interfaces::{Capability, InterfaceType};
 use crate::interrupt::InterruptManager;
-use crate::port::{DrvUserInfo, DrvUserRequest};
+use crate::port::{DrvUserInfo, DrvUserRequest, PortDriver};
 use crate::port_actor::{ActorId, ActorMessage};
-use crate::request::{CancelToken, RequestOp, RequestResult};
+use crate::request::{CancelToken, DriverCall, RequestOp, RequestResult};
 use crate::user::AsynUser;
 
 /// Park the calling thread until `fut` resolves or `deadline` passes, from
@@ -912,6 +913,72 @@ impl PortHandle {
         })
     }
 
+    // --- Driver access ---
+
+    /// Run `f` against this port's driver, on the actor, and return what it
+    /// returns — the analog of a C driver thread's `lock()` … `unlock()`
+    /// (asynPortDriver.cpp:3858). `D` is the driver's concrete type; a port
+    /// whose driver is some other type is an error, not a panic.
+    pub async fn with_driver<D, R>(
+        &self,
+        f: impl FnOnce(&mut D) -> R + Send + 'static,
+    ) -> AsynResult<R>
+    where
+        D: PortDriver,
+        R: Send + 'static,
+    {
+        let (call, result) = self.driver_call(f);
+        self.submit_async(RequestOp::WithDriver(call), AsynUser::default())
+            .await?;
+        self.driver_result::<D, R>(result)
+    }
+
+    /// [`Self::with_driver`] for sync callers; refuses the port's own actor
+    /// thread like every blocking entry point.
+    pub fn with_driver_blocking<D, R>(
+        &self,
+        f: impl FnOnce(&mut D) -> R + Send + 'static,
+    ) -> AsynResult<R>
+    where
+        D: PortDriver,
+        R: Send + 'static,
+    {
+        let (call, result) = self.driver_call(f);
+        self.submit_blocking(RequestOp::WithDriver(call), AsynUser::default())?;
+        self.driver_result::<D, R>(result)
+    }
+
+    fn driver_call<D, R>(
+        &self,
+        f: impl FnOnce(&mut D) -> R + Send + 'static,
+    ) -> (DriverCall, Arc<Mutex<Option<R>>>)
+    where
+        D: PortDriver,
+        R: Send + 'static,
+    {
+        let result = Arc::new(Mutex::new(None));
+        let slot = result.clone();
+        let call = DriverCall::new(move |driver| {
+            let driver: &mut dyn Any = driver;
+            if let Some(driver) = driver.downcast_mut::<D>() {
+                *slot.lock().unwrap_or_else(|e| e.into_inner()) = Some(f(driver));
+            }
+        });
+        (call, result)
+    }
+
+    fn driver_result<D, R>(&self, result: Arc<Mutex<Option<R>>>) -> AsynResult<R> {
+        let value = result.lock().unwrap_or_else(|e| e.into_inner()).take();
+        value.ok_or_else(|| AsynError::Status {
+            status: AsynStatus::Error,
+            message: format!(
+                "port {}: driver is not a {}",
+                self.port_name,
+                std::any::type_name::<D>()
+            ),
+        })
+    }
+
     // --- Option convenience methods ---
 
     /// C `asynOption::getOption`, run under the caller's `AsynUser` for the same
@@ -1317,6 +1384,54 @@ mod tests {
             .spawn(move || actor.run())
             .unwrap();
         PortHandle::new(tx, "handle_test".into(), interrupts, actor_id)
+    }
+
+    /// `with_driver` hands the closure the driver's concrete type, runs it on
+    /// the actor (a param set there is visible to the next queued read), and
+    /// returns the closure's value.
+    #[test]
+    fn with_driver_runs_the_closure_on_the_concrete_driver() {
+        let handle = make_handle(TestDriver::new());
+        let name = handle
+            .with_driver_blocking(|d: &mut TestDriver| {
+                d.base.set_int32_param(0, 0, 41).unwrap();
+                d.base.port_name.clone()
+            })
+            .unwrap();
+        assert_eq!(name, "handle_test");
+        assert_eq!(handle.read_int32_blocking(0, 0).unwrap(), 41);
+    }
+
+    /// Boundary: the port's driver is some other type — an error naming the
+    /// type, and the closure never runs.
+    #[test]
+    fn with_driver_refuses_a_driver_of_another_type() {
+        struct Other(PortDriverBase);
+        impl PortDriver for Other {
+            fn base(&self) -> &PortDriverBase {
+                &self.0
+            }
+            fn base_mut(&mut self) -> &mut PortDriverBase {
+                &mut self.0
+            }
+        }
+        let handle = make_handle(TestDriver::new());
+        let err = handle
+            .with_driver_blocking(|_: &mut Other| unreachable!())
+            .unwrap_err();
+        assert!(err.to_string().contains("Other"), "{err}");
+    }
+
+    /// Boundary: a call with no closure — the second clone of a request, or one
+    /// rebuilt from a `PortCommand` — is refused rather than reported done.
+    #[test]
+    fn a_spent_driver_call_is_refused() {
+        let handle = make_handle(TestDriver::new());
+        let op = RequestOp::WithDriver(DriverCall::new(|_| {}));
+        handle
+            .submit_blocking(op.clone(), AsynUser::default())
+            .unwrap();
+        assert!(handle.submit_blocking(op, AsynUser::default()).is_err());
     }
 
     #[test]

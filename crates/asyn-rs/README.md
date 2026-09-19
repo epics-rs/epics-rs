@@ -41,7 +41,7 @@ asyn-rs provides the same driver model as C asyn, but uses Rust's type system an
 
 | Type | Description |
 |------|-------------|
-| `PortCommand` | 23-variant enum, 1:1 map from `RequestOp` |
+| `PortCommand` | One variant per `RequestOp`; payloads that cannot serialize (`CallParamCallbacks` updates, the `WithDriver` closure) are dropped |
 | `PortReply` | Response envelope with typed `ReplyPayload` |
 | `ParamValue` | Serializable value union (no `GenericPointer`) |
 | `PortRequest` | Request envelope with `RequestMeta` |

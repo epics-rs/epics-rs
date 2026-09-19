@@ -150,6 +150,9 @@ pub enum PortCommand {
     Report {
         level: i32,
     },
+    /// `RequestOp::WithDriver`. Code does not serialize, so only the kind of
+    /// request survives; converting back yields a call the actor refuses.
+    WithDriver,
     /// Set input EOS bytes — C `pasynOctet->setInputEos` /
     /// asynRecord IEOS.
     SetInputEos {
@@ -295,6 +298,7 @@ mod tests {
             },
             PortCommand::GpibIfc,
             PortCommand::GpibRen { enable: true },
+            PortCommand::WithDriver,
         ];
         for cmd in commands {
             let json = serde_json::to_string(&cmd).unwrap();

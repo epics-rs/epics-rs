@@ -645,8 +645,8 @@ impl DriverAttributes {
     /// (recognized by containing `<Attributes>`). The XML schema is the
     /// areaDetector `NDAttributesFile` schema: a root `<Attributes>` element
     /// with `<Attribute name="..." source="..." type="..." .../>` children.
-    /// Macro substitution (C++ `ND_ATTRIBUTES_MACROS`) is not supported and is
-    /// ignored. Attributes are stored on `self.list`; when a file is
+    /// The text is macro-expanded against `ND_ATTRIBUTES_MACROS` first; see
+    /// `expand_attribute_macros`. Attributes are stored on `self.list`; when a file is
     /// named, `ND_ATTRIBUTES_STATUS` is set to the resulting status code and
     /// every non-OK code is also returned as an `Err`. An empty name leaves
     /// the status alone, as C `:327` does.
@@ -783,6 +783,12 @@ impl DriverAttributes {
             }
         };
 
+        let macros = port_base
+            .get_string_param(params.attributes_macros, 0)
+            .map(octet_text)
+            .unwrap_or_default();
+        let xml = expand_attribute_macros(port_base, xml, &macros);
+
         match parse_attributes_xml(&xml, &self.functions) {
             Ok(attrs) => {
                 for attr in attrs {
@@ -890,6 +896,34 @@ impl DriverAttributes {
             ParamAttrType::Unknown => None,
         }
     }
+}
+
+/// The macro pass of C++ `readNDAttributesFile` (asynNDArrayDriver.cpp:345-381):
+/// `macParseDefns` on `NDAttributesMacros`, then `macExpandString` over the
+/// whole file against a handle with no environment behind it. Any failure —
+/// an undefined macro included — is traced and the text goes on to the XML
+/// parser unexpanded, as C's `goto done_macros` leaves `buffer` alone.
+fn expand_attribute_macros(port_base: &PortDriverBase, xml: String, macros: &str) -> String {
+    use epics_libcom_rs::runtime::mac_lib::{MacroExpandOptions, expand_macros, macro_defn_pairs};
+
+    if macros.is_empty() {
+        return xml;
+    }
+    // A name with no `=` is a deletion, which has nothing to delete in a
+    // handle created for this one call.
+    let defs: Vec<(String, String)> = macro_defn_pairs(macros)
+        .into_iter()
+        .filter_map(|(name, value)| value.map(|v| (name, v)))
+        .collect();
+    let expansion = expand_macros(&xml, defs, MacroExpandOptions::default());
+    if expansion.errored() {
+        port_base.trace_print(
+            asyn_rs::trace::TraceMask::ERROR,
+            "asynNDArrayDriver::readNDAttributesFile, error expanding macros\n",
+        );
+        return xml;
+    }
+    expansion.text
 }
 
 /// C++ `asynNDArrayDriver::checkPath()` on a port's `FilePath`; see
@@ -1818,6 +1852,91 @@ pub(crate) mod tests {
                 .get_int32_param(drv.params.attributes_status, 0)
                 .unwrap(),
             ATTR_STATUS_XML_SYNTAX_ERROR
+        );
+    }
+
+    fn load_with_macros(xml: &str, macros: &str) -> NDArrayDriverBase {
+        let mut drv = NDArrayDriverBase::new("TEST", 1_000_000).unwrap();
+        drv.port_base
+            .set_string_param(drv.params.attributes_macros, 0, macros)
+            .unwrap();
+        drv.port_base
+            .set_string_param(drv.params.attributes_file, 0, xml)
+            .unwrap();
+        let _ = drv.read_nd_attributes_file();
+        drv
+    }
+
+    /// C `readNDAttributesFile` expands the whole file against
+    /// `NDAttributesMacros` before parsing it; a quoted value keeps its comma.
+    #[test]
+    fn test_attributes_macros_expand_the_file() {
+        let drv = load_with_macros(
+            r#"<Attributes>
+                <Attribute name="$(N)Gain" type="PARAM" source="$(PARAM)" datatype="DOUBLE"/>
+                <Attribute name="Note" type="CONST" source="$(TEXT)" datatype="STRING"/>
+            </Attributes>"#,
+            r#"N=Det,PARAM=GAIN,TEXT="a,b""#,
+        );
+        assert_eq!(
+            drv.attributes()
+                .get("DetGain")
+                .unwrap()
+                .source
+                .source_string(),
+            "GAIN"
+        );
+        assert_eq!(
+            drv.attributes().get("Note").unwrap().value,
+            NDAttrValue::String("a,b".into())
+        );
+    }
+
+    /// Boundary: no macro string — the text is parsed as written.
+    #[test]
+    fn test_attributes_without_macros_are_not_expanded() {
+        let drv = load_with_macros(
+            r#"<Attributes><Attribute name="A" type="CONST" source="$(X)"/></Attributes>"#,
+            "",
+        );
+        assert_eq!(
+            drv.attributes().get("A").unwrap().source.source_string(),
+            "$(X)"
+        );
+    }
+
+    /// Boundary: a reference the macro string does not define. C's
+    /// `goto done_macros` parses the unexpanded buffer, so the defined macro
+    /// in the same file is not applied either.
+    #[test]
+    fn test_an_undefined_attributes_macro_leaves_the_file_unexpanded() {
+        let drv = load_with_macros(
+            r#"<Attributes>
+                <Attribute name="A" type="CONST" source="$(X)"/>
+                <Attribute name="B" type="CONST" source="$(MISSING)"/>
+            </Attributes>"#,
+            "X=1",
+        );
+        assert_eq!(
+            drv.attributes().get("A").unwrap().source.source_string(),
+            "$(X)"
+        );
+        assert_eq!(
+            drv.attributes().get("B").unwrap().source.source_string(),
+            "$(MISSING)"
+        );
+    }
+
+    /// The environment is not behind the handle (C `macCreateHandle(&h, 0)`).
+    #[test]
+    fn test_attributes_macros_do_not_read_the_environment() {
+        let drv = load_with_macros(
+            r#"<Attributes><Attribute name="A" type="CONST" source="$(PATH)"/></Attributes>"#,
+            "X=1",
+        );
+        assert_eq!(
+            drv.attributes().get("A").unwrap().source.source_string(),
+            "$(PATH)"
         );
     }
 

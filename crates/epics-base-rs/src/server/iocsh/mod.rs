@@ -27,7 +27,7 @@ pub mod vars;
 /// macro definition strings. Re-exported as the single owner of that
 /// grammar so cross-crate macLib consumers (QSRV `dbLoadGroup`) reuse it
 /// rather than duplicating a raw comma splitter.
-pub use commands::macro_defn_pairs;
+pub use crate::runtime::mac_lib::macro_defn_pairs;
 
 /// The RTEMS operator commands — C `iocshRegisterRTEMS`. Re-exported because
 /// an RTEMS IOC's `main` is the only caller: C registers them from the RTEMS

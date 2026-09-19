@@ -49,7 +49,7 @@ fn load_attributes(drv: &mut NDArrayDriverBase, xml: &str) -> Result<(), ()> {
 }
 
 fn attribute_value(drv: &NDArrayDriverBase, name: &str) -> NDAttrValue {
-    drv.attributes
+    drv.attributes()
         .get(name)
         .expect("the attribute is loaded")
         .epics_pv_source()

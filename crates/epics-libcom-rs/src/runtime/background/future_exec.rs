@@ -74,7 +74,7 @@
 //! `Shared::finalize` is the single owner of "this task has an outcome", and
 //! it is idempotent. Three paths reach it, covering every way a task can stop
 //! existing: the poll produced `Ready`/cancel/panic; the queued entry was
-//! dropped without ever running (ring full, or the band shut down under it);
+//! dropped without ever running (the band shut down under it);
 //! or the task became unreachable — no queue entry and no live waker — and its
 //! `Drop` ran. A [`JoinFuture`] therefore never strands.
 //!
@@ -305,19 +305,14 @@ impl<T: Send + 'static> Task<T> {
         self.enqueues.fetch_add(1, Ordering::Relaxed);
 
         // `Entry` finalizes the task if it is dropped without running — see its
-        // `Drop`. Both `request` failure modes drop the callback, so the ring
-        // rejecting us and the band shutting down under us are both covered.
+        // `Drop` — which is what the band does with it once shut down. That is
+        // the only way an entry goes un-run: it holds no ring slot, so a full
+        // ring cannot turn a wake into the silent end of a long-lived task.
         let mut entry = Entry {
             task: Some(Arc::clone(self)),
         };
-        let cb: Callback = Box::new(move || entry.run());
-        if self.callbacks.request(self.priority, cb).is_err() {
-            self.state.store(DONE, Ordering::Release);
-            tracing::error!(
-                target: "epics_base_rs::runtime::future_exec",
-                "spawn_future: callback ring full; task dropped, handle resolves cancelled"
-            );
-        }
+        self.callbacks
+            .schedule_task(self.priority, Box::new(move || entry.run()));
     }
 
     /// Poll the task once on the calling worker, then either publish its
@@ -448,11 +443,10 @@ impl<T> Drop for Task<T> {
     }
 }
 
-/// One ring entry for a task, with the "ran or was dropped" bookkeeping.
+/// One run-queue entry for a task, with the "ran or was dropped" bookkeeping.
 ///
-/// A [`Callback`] is a `FnOnce` that the pool may drop instead of calling — on
-/// a full ring, or when the band shuts down (`callback.c:237-284` semantics,
-/// see [`super::callback_executor::CallbackHandle::request`]). Either way this
+/// A [`Callback`] is a `FnOnce` that the pool drops instead of calling when the
+/// band shuts down (`callback.c:237-284` semantics). Then this
 /// task's only scheduled run is gone and its state is stuck at `SCHEDULED`, so
 /// no later wake would re-enqueue it. `Drop` closes that: an entry that is
 /// dropped un-run finalizes its task as cancelled.
@@ -1155,12 +1149,9 @@ mod tests {
 
     // -- every handle resolves ---------------------------------------------
 
-    #[test]
-    fn full_ring_resolves_the_handle_as_cancelled() {
-        // Boundary: the spawn never reaches a worker at all. C `S_db_bufFull`
-        // (callback.c:373) — the task is dropped, so the handle must resolve
-        // rather than strand its joiner.
-        let pool = CallbackPool::with_config(1, 1);
+    /// Pin the band's single worker and fill its single ring slot, so the
+    /// next `callbackRequest` is refused. Returns the release for the worker.
+    fn saturate(pool: &CallbackPool) -> mpsc::Sender<()> {
         let (pinned_tx, pinned_rx) = mpsc::channel::<()>();
         let (release_tx, release_rx) = mpsc::channel::<()>();
         pool.request(
@@ -1172,17 +1163,42 @@ mod tests {
         )
         .unwrap();
         pinned_rx.recv_timeout(T).unwrap();
-
-        // Fill the single ring slot, then latch overflow.
         pool.request(CallbackPriority::Medium, Box::new(|| {}))
             .unwrap();
-        let jf = spawn_future(&pool.handle(), CallbackPriority::Medium, async { 1u32 });
         assert!(
-            join(jf).unwrap_err().is_cancelled(),
-            "a rejected spawn must resolve its handle, not strand it"
+            pool.request(CallbackPriority::Medium, Box::new(|| {}))
+                .is_err()
         );
+        release_tx
+    }
 
-        release_tx.send(()).unwrap();
+    #[test]
+    fn a_spawn_onto_a_full_ring_still_runs() {
+        // Boundary: ring at capacity when the task is first queued.
+        let pool = CallbackPool::with_config(1, 1);
+        let release = saturate(&pool);
+        let jf = spawn_future(&pool.handle(), CallbackPriority::Medium, async { 1u32 });
+        release.send(()).unwrap();
+        assert_eq!(join(jf).unwrap(), 1);
+    }
+
+    #[test]
+    fn a_wake_onto_a_full_ring_is_not_lost() {
+        // Boundary: ring at capacity when a suspended task is woken. A
+        // long-lived consumer loop dies silently if this wake is refused.
+        let pool = CallbackPool::with_config(1, 1);
+        let (tx, rx) = tokio::sync::oneshot::channel::<u32>();
+        let (polled_tx, polled_rx) = mpsc::channel::<()>();
+        let jf = spawn_future(&pool.handle(), CallbackPriority::Medium, async move {
+            polled_tx.send(()).unwrap();
+            rx.await.unwrap()
+        });
+        polled_rx.recv_timeout(T).unwrap();
+
+        let release = saturate(&pool);
+        tx.send(7).unwrap();
+        release.send(()).unwrap();
+        assert_eq!(join(jf).unwrap(), 7);
     }
 
     #[test]

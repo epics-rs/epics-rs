@@ -33,6 +33,7 @@ pub mod ioc_role;
 pub mod json_string;
 pub mod log;
 pub mod log_client;
+pub mod mac_lib;
 pub mod net;
 pub mod socket;
 pub mod stdlib;

@@ -349,24 +349,18 @@ fn shell_enable_target(
 }
 
 fn report_ports(mgr: &Arc<PortManager>, level: i32, port: Option<&str>) {
-    if let Some(name) = port {
-        match mgr.find_runtime_handle(name) {
+    let names = match port {
+        Some(name) => vec![name.to_string()],
+        None => mgr.list_port_names(),
+    };
+    for name in names {
+        match mgr.find_port_handle(&name) {
             Ok(handle) => {
                 let _ = handle
-                    .port_handle()
                     .report_blocking(level)
                     .map_err(|e| eprintln!("asynReport {name}: {e}"));
             }
             Err(e) => eprintln!("asynReport: {e}"),
-        }
-    } else {
-        for name in mgr.list_port_names() {
-            if let Ok(handle) = mgr.find_runtime_handle(&name) {
-                let _ = handle
-                    .port_handle()
-                    .report_blocking(level)
-                    .map_err(|e| eprintln!("asynReport {name}: {e}"));
-            }
         }
     }
 }
@@ -3176,6 +3170,56 @@ mod tests {
         handle.report_blocking(0)?;
         handle.report_blocking(2)?;
         Ok(())
+    }
+
+    /// `asynReport` covers every port of the process registry, not only the
+    /// ones this manager built: an areaDetector driver publishes its port by
+    /// hand, and C's `asynReport` walks the one `asynPortList` they all share.
+    #[test]
+    fn report_ports_reaches_a_hand_registered_port() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        struct Reporting {
+            base: PortDriverBase,
+            reports: Arc<AtomicUsize>,
+        }
+        impl PortDriver for Reporting {
+            fn base(&self) -> &PortDriverBase {
+                &self.base
+            }
+            fn base_mut(&mut self) -> &mut PortDriverBase {
+                &mut self.base
+            }
+            fn report(&self, _out: &mut dyn std::fmt::Write, _level: i32) {
+                self.reports.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+
+        const PORT: &str = "report_by_hand";
+        let reports = Arc::new(AtomicUsize::new(0));
+        let (runtime, _actor) = crate::runtime::port::create_port_runtime(
+            Reporting {
+                base: PortDriverBase::new(PORT, 1, PortFlags::default()),
+                reports: reports.clone(),
+            },
+            crate::runtime::config::RuntimeConfig::default(),
+        )
+        .unwrap();
+        crate::registry::register_port(
+            PORT,
+            runtime.port_handle().clone(),
+            Arc::new(crate::trace::TraceManager::new()),
+        )
+        .unwrap();
+
+        let mgr = Arc::new(PortManager::new());
+        report_ports(&mgr, 0, Some(PORT));
+        assert_eq!(reports.load(Ordering::SeqCst), 1, "named");
+        report_ports(&mgr, 0, None);
+        assert!(reports.load(Ordering::SeqCst) >= 2, "unnamed sweep");
+
+        crate::registry::unregister_port(PORT);
+        runtime.shutdown();
     }
 
     /// Build a minimal `CommandContext` for exercising registered

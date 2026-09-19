@@ -582,23 +582,20 @@ impl Drop for CaMonitorSet {
     }
 }
 
-pub struct NDArrayDriverBase {
-    pub port_base: PortDriverBase,
-    pub params: NDArrayDriverParams,
-    pub pool: Arc<NDArrayPool>,
-    pub array_output: NDArrayOutput,
-    pub queued_counter: Arc<QueuedArrayCounter>,
-    /// Most recently prepared array (C++ `pArrays[0]`), used as the template
-    /// for `preAllocateBuffers`.
-    pub last_array: Option<Arc<NDArray>>,
-    /// NDArray attribute definitions loaded from `ND_ATTRIBUTES_FILE`
+/// The `NDAttributesFile` machinery of C++ `asynNDArrayDriver`: the attribute
+/// definitions, the function registry they resolve against and the CA monitors
+/// feeding them. One struct because [`NDArrayDriverBase`] and
+/// [`crate::driver::ADDriverBase`] each stand in for that C++ base class, and a
+/// detector driver needs `NDAttributesFile` as much as a bare NDArray port.
+pub struct DriverAttributes {
+    /// Attribute definitions loaded from `ND_ATTRIBUTES_FILE`
     /// (C++ `asynNDArrayDriver::pAttributeList`).
-    pub attributes: crate::attributes::NDAttributeList,
+    pub list: crate::attributes::NDAttributeList,
     /// Registry of named attribute functions for `FUNCTION`-type attributes
     /// (C++ `registryFunctionFind` / `registerNDAttributeFunction`).
-    pub attr_functions: std::sync::Arc<NDAttributeFunctionRegistry>,
+    pub functions: std::sync::Arc<NDAttributeFunctionRegistry>,
     /// CA client and the runtime its monitors live on, installed by the IOC
-    /// that owns this port ([`NDArrayDriverBase::set_ca_client`]). C++ has no
+    /// that owns this port ([`Self::set_ca_client`]). C++ has no
     /// equivalent because `PVAttribute` subscribes through the global CA
     /// context every IOC already has; here the client is a value someone must
     /// hand over, and without it an `EPICS_PV` attribute has no feeder.
@@ -610,6 +607,387 @@ pub struct NDArrayDriverBase {
     /// Monitors feeding the attributes currently loaded.
     #[cfg(feature = "ioc")]
     ca_monitors: CaMonitorSet,
+}
+
+impl Default for DriverAttributes {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl DriverAttributes {
+    pub fn new() -> Self {
+        Self {
+            list: crate::attributes::NDAttributeList::new(),
+            functions: NDAttributeFunctionRegistry::new(),
+            #[cfg(feature = "ioc")]
+            ca_feeder: None,
+            #[cfg(feature = "ioc")]
+            ca_monitors: CaMonitorSet::default(),
+        }
+    }
+
+    /// C++ `asynNDArrayDriver::getAttributes(pArray->pAttributeList)`:
+    /// re-evaluate every attribute and merge the values onto `array`. An empty
+    /// set leaves the array untouched, so a plain array is never deep-copied
+    /// through `Arc::make_mut`.
+    pub fn attach(&mut self, port_base: &PortDriverBase, array: &mut Arc<NDArray>) {
+        if !self.list.is_empty() {
+            let fresh = self.update(port_base);
+            Arc::make_mut(array).attributes.copy_from(&fresh);
+        }
+    }
+
+    /// Load NDArray attribute definitions from the `ND_ATTRIBUTES_FILE`
+    /// parameter, mirroring C++ `asynNDArrayDriver::readNDAttributesFile`.
+    ///
+    /// The parameter value is either a path to an XML file or inline XML
+    /// (recognized by containing `<Attributes>`). The XML schema is the
+    /// areaDetector `NDAttributesFile` schema: a root `<Attributes>` element
+    /// with `<Attribute name="..." source="..." type="..." .../>` children.
+    /// The text is macro-expanded against `ND_ATTRIBUTES_MACROS` first; see
+    /// `expand_attribute_macros`. Attributes are stored on `self.list`; when a file is
+    /// named, `ND_ATTRIBUTES_STATUS` is set to the resulting status code and
+    /// every non-OK code is also returned as an `Err`. An empty name leaves
+    /// the status alone, as C `:327` does.
+    ///
+    /// An `EPICS_PV` attribute is fed from here when the IOC has handed this
+    /// port a CA client through [`Self::set_ca_client`]; each one gets a
+    /// monitor and the status is OK. Without a client there is no feeder, so
+    /// such an attribute evaluates `Undefined` for the life of the IOC and is
+    /// dropped by every file writer — that case keeps a non-OK code rather
+    /// than letting the operator see "Attributes file OK". The rest of the
+    /// file is still loaded, because `PARAM`, `FUNCTION` and `CONST`
+    /// attributes are fed and work; only the status tells the truth about the
+    /// ones that are not. `NDAttributesStatus` is an mbbi with exactly four
+    /// states (NDArrayBase.template:805-822), so `XML_SYNTAX_ERROR` is the
+    /// nearest of C's codes rather than an accurate one.
+    ///
+    /// It is the nearest even though C's own vocabulary has a code for "no
+    /// attribute set is in effect": `NDAttributesFileNotFound` is what the
+    /// constructor seeds (C `asynNDArrayDriver.cpp:997`) and what an IOC that
+    /// never loads a file keeps. That is exactly why this case cannot borrow it
+    /// — code 1 is now the value every port carries before anything is loaded,
+    /// so reusing it here would make a file whose `PARAM`/`FUNCTION`/`CONST`
+    /// attributes are live and working indistinguishable from a port that
+    /// loaded nothing at
+    /// all. `write_octet` discards this `Err`, so the mbbi is the operator's
+    /// only signal that the `EPICS_PV` half is dead.
+    /// Install the CA client that feeds `EPICS_PV` attributes, and start
+    /// feeding any that are already loaded.
+    ///
+    /// Feeding the current set here rather than only at load time is what
+    /// makes the order the IOC does things in stop mattering: install first
+    /// then load, or load first then install, and either way every `EPICS_PV`
+    /// attribute ends up with a monitor.
+    ///
+    /// `runtime` is the handle the monitor tasks are spawned on; it is named
+    /// explicitly because `NDAttributesFile` writes arrive on an asyn port
+    /// thread with no ambient runtime.
+    #[cfg(feature = "ioc")]
+    pub fn set_ca_client(
+        &mut self,
+        client: std::sync::Arc<epics_ca_rs::client::CaClient>,
+        runtime: tokio::runtime::Handle,
+    ) {
+        self.ca_feeder = Some((client, runtime));
+        self.feed_epics_pv_attributes();
+    }
+
+    /// Replace the monitor set with one subscription per loaded `EPICS_PV`
+    /// attribute, and return the names left unfed.
+    ///
+    /// The assignment to `ca_monitors` is the finalizer: it drops the previous
+    /// set, and dropping aborts it, so re-reading the attributes file cannot
+    /// leave a monitor writing into a cell nothing reads.
+    #[cfg(feature = "ioc")]
+    fn feed_epics_pv_attributes(&mut self) -> Vec<String> {
+        let Some((client, runtime)) = self.ca_feeder.clone() else {
+            return self
+                .list
+                .iter()
+                .filter(|a| matches!(a.source, NDAttrSource::EpicsPV(_)))
+                .map(|a| a.name.clone())
+                .collect();
+        };
+        let handles: Vec<_> = self
+            .list
+            .iter()
+            .filter_map(|a| a.epics_pv_source())
+            .map(|src| crate::attributes::spawn_ca_monitor(&runtime, client.clone(), src))
+            .collect();
+        self.ca_monitors = CaMonitorSet(handles);
+        Vec::new()
+    }
+
+    /// Without the `ioc` feature there is no CA client to build a feeder from,
+    /// so every `EPICS_PV` attribute is unfed.
+    #[cfg(not(feature = "ioc"))]
+    fn feed_epics_pv_attributes(&mut self) -> Vec<String> {
+        self.list
+            .iter()
+            .filter(|a| matches!(a.source, NDAttrSource::EpicsPV(_)))
+            .map(|a| a.name.clone())
+            .collect()
+    }
+
+    /// Drop the loaded attributes together with the monitors feeding them.
+    ///
+    /// The two are only ever replaced as a pair; separating them is what would
+    /// let a monitor survive the attribute it writes into.
+    fn clear(&mut self) {
+        self.list.clear();
+        #[cfg(feature = "ioc")]
+        {
+            self.ca_monitors = CaMonitorSet::default();
+        }
+    }
+
+    pub fn read_file(
+        &mut self,
+        port_base: &mut PortDriverBase,
+        params: &NDArrayDriverParams,
+    ) -> AsynResult<()> {
+        let file_param = port_base
+            .get_string_param(params.attributes_file, 0)
+            .map(octet_text)?;
+
+        // Clear any existing attributes (C++ clears unconditionally first).
+        self.clear();
+        if file_param.is_empty() {
+            // C `:327` — `if (fileName.length() == 0) return asynSuccess;`
+            // with no `setIntegerParam`. The status keeps whatever it had,
+            // which for an IOC that never loaded a file is the constructor's
+            // `NDAttributesFileNotFound`. Writing OK here erased that value
+            // on every `NDAttributesFile` PINI write (NDArrayBase.template:793).
+            return Ok(());
+        }
+
+        // The parameter is inline XML if it contains the root element.
+        let xml = if file_param.contains("<Attributes>") {
+            file_param
+        } else {
+            match std::fs::read_to_string(&file_param) {
+                Ok(s) => s,
+                Err(_) => {
+                    port_base.set_int32_param(
+                        params.attributes_status,
+                        0,
+                        ATTR_STATUS_FILE_NOT_FOUND,
+                    )?;
+                    return Err(asyn_rs::error::AsynError::Status {
+                        status: asyn_rs::error::AsynStatus::Error,
+                        message: format!("readNDAttributesFile: cannot open {file_param}"),
+                    });
+                }
+            }
+        };
+
+        let macros = port_base
+            .get_string_param(params.attributes_macros, 0)
+            .map(octet_text)
+            .unwrap_or_default();
+        let xml = expand_attribute_macros(port_base, xml, &macros);
+
+        match parse_attributes_xml(&xml, &self.functions) {
+            Ok(attrs) => {
+                for attr in attrs {
+                    self.list.add(attr);
+                }
+                let unfed = self.feed_epics_pv_attributes();
+                if unfed.is_empty() {
+                    port_base.set_int32_param(params.attributes_status, 0, ATTR_STATUS_OK)?;
+                    return Ok(());
+                }
+                port_base.set_int32_param(
+                    params.attributes_status,
+                    0,
+                    ATTR_STATUS_XML_SYNTAX_ERROR,
+                )?;
+                Err(asyn_rs::error::AsynError::Status {
+                    status: asyn_rs::error::AsynStatus::Error,
+                    message: format!(
+                        "readNDAttributesFile: no CA client to monitor EPICS_PV \
+                         attribute(s) {}; they will evaluate Undefined",
+                        unfed.join(", ")
+                    ),
+                })
+            }
+            Err(msg) => {
+                port_base.set_int32_param(
+                    params.attributes_status,
+                    0,
+                    ATTR_STATUS_XML_SYNTAX_ERROR,
+                )?;
+                Err(asyn_rs::error::AsynError::Status {
+                    status: asyn_rs::error::AsynStatus::Error,
+                    message: format!("readNDAttributesFile: {msg}"),
+                })
+            }
+        }
+    }
+
+    /// Re-evaluate every live attribute, then return a snapshot of the list to
+    /// attach to an outgoing NDArray.
+    ///
+    /// Port of C++ `asynNDArrayDriver::getAttributes` →
+    /// `NDAttributeList::updateValues()`. `PARAM` attributes are refreshed from
+    /// this driver's asyn parameter library (mirroring
+    /// `paramAttribute::updateValue`, which reads `pDriver->getXxxParam`);
+    /// `FUNCTION` attributes call their registered function; `EPICS_PV`
+    /// attributes read whatever value a CA-monitor task last fed into their
+    /// cell. `CONST` / `DRIVER` attributes are static.
+    pub fn update(&mut self, port_base: &PortDriverBase) -> crate::attributes::NDAttributeList {
+        // 1. Feed each PARAM attribute's cell from the parameter library.
+        //    Done first (immutable borrow of attributes + port_base), so the
+        //    subsequent update_values() re-read picks up the fresh value.
+        for attr in self.list.iter() {
+            if let Some(param_src) = attr.param_source() {
+                if let Some(value) = Self::read_param_value(port_base, param_src) {
+                    param_src.cell().set(value);
+                }
+            }
+        }
+        // 2. Re-evaluate every attribute from its (now-fresh) source.
+        self.list.update_values();
+        // 3. Return a snapshot for the outgoing array.
+        self.list.clone()
+    }
+
+    /// Read a `Param` attribute's current value from the asyn parameter
+    /// library, using the read type the XML `datatype` selected — NOT the
+    /// param's runtime type. Mirrors C++ `paramAttribute::updateValue`
+    /// (paramAttribute.cpp:131-151), which dispatches on `paramType` to the
+    /// matching `getXxxParam` and publishes a fixed `NDAttrDataType`.
+    ///
+    /// Returns `None` (leaving the attribute's cell at its prior / `Undefined`
+    /// value) when the param is unknown, the value is undefined, the read type
+    /// mismatches the param's actual type, or the `datatype` was unrecognized
+    /// (`ParamAttrType::Unknown` — C's `paramAttrTypeUnknown`, which never
+    /// refreshes the attribute).
+    fn read_param_value(
+        port_base: &PortDriverBase,
+        src: &crate::attributes::ParamAttributeSource,
+    ) -> Option<NDAttrValue> {
+        use crate::attributes::ParamAttrType;
+        let index = port_base.params.find_param(&src.param_name)?;
+        let addr = src.addr;
+        match src.param_type {
+            ParamAttrType::Int32 => port_base
+                .params
+                .get_int32(index, addr)
+                .ok()
+                .map(NDAttrValue::Int32),
+            ParamAttrType::Int64 => port_base
+                .params
+                .get_int64(index, addr)
+                .ok()
+                .map(NDAttrValue::Int64),
+            ParamAttrType::Float64 => port_base
+                .params
+                .get_float64(index, addr)
+                .ok()
+                .map(NDAttrValue::Float64),
+            ParamAttrType::String => port_base
+                .params
+                .get_string(index, addr)
+                .ok()
+                .map(|s| NDAttrValue::String(octet_text(s))),
+            ParamAttrType::Unknown => None,
+        }
+    }
+}
+
+/// The macro pass of C++ `readNDAttributesFile` (asynNDArrayDriver.cpp:345-381):
+/// `macParseDefns` on `NDAttributesMacros`, then `macExpandString` over the
+/// whole file against a handle with no environment behind it. Any failure —
+/// an undefined macro included — is traced and the text goes on to the XML
+/// parser unexpanded, as C's `goto done_macros` leaves `buffer` alone.
+fn expand_attribute_macros(port_base: &PortDriverBase, xml: String, macros: &str) -> String {
+    use epics_libcom_rs::runtime::mac_lib::{MacroExpandOptions, expand_macros, macro_defn_pairs};
+
+    if macros.is_empty() {
+        return xml;
+    }
+    // A name with no `=` is a deletion, which has nothing to delete in a
+    // handle created for this one call.
+    let defs: Vec<(String, String)> = macro_defn_pairs(macros)
+        .into_iter()
+        .filter_map(|(name, value)| value.map(|v| (name, v)))
+        .collect();
+    let expansion = expand_macros(&xml, defs, MacroExpandOptions::default());
+    if expansion.errored() {
+        port_base.trace_print(
+            asyn_rs::trace::TraceMask::ERROR,
+            "asynNDArrayDriver::readNDAttributesFile, error expanding macros\n",
+        );
+        return xml;
+    }
+    expansion.text
+}
+
+/// C++ `asynNDArrayDriver::checkPath()` on a port's `FilePath`; see
+/// [`NDArrayDriverBase::check_path`].
+pub(crate) fn check_path(
+    port_base: &mut PortDriverBase,
+    params: &NDArrayDriverParams,
+) -> AsynResult<bool> {
+    let mut path = port_base
+        .get_string_param(params.file_path, 0)
+        .map(octet_text)?;
+    if path.is_empty() {
+        return Ok(false);
+    }
+
+    let exists = check_path_str(&mut path);
+    port_base.set_string_param(params.file_path, 0, path)?;
+    port_base.set_int32_param(params.file_path_exists, 0, exists as i32)?;
+    Ok(exists)
+}
+
+/// Handle a write to an Octet parameter, mirroring the relevant branches of
+/// C++ `asynNDArrayDriver::writeOctet`.
+///
+/// - `ND_ATTRIBUTES_FILE` / `ND_ATTRIBUTES_MACROS`: reload the attribute
+///   definitions via [`DriverAttributes::read_file`].
+/// - `FILE_PATH`: run `checkPath`; if the directory does not exist, attempt
+///   `createFilePath` bounded by `CREATE_DIR`, then re-check.
+///
+/// The caller is expected to have already stored `value` into the parameter
+/// library. Returns `true` when `param_index` was a recognized parameter.
+pub(crate) fn handle_write_octet(
+    port_base: &mut PortDriverBase,
+    params: &NDArrayDriverParams,
+    attributes: &mut DriverAttributes,
+    param_index: usize,
+    value: &str,
+) -> AsynResult<bool> {
+    if param_index == params.attributes_file || param_index == params.attributes_macros {
+        let _ = attributes.read_file(port_base, params);
+        Ok(true)
+    } else if param_index == params.file_path {
+        if !check_path(port_base, params)? {
+            let depth = port_base.get_int32_param(params.create_dir, 0).unwrap_or(0);
+            let _ = NDArrayDriverBase::create_file_path(value, depth);
+            check_path(port_base, params)?;
+        }
+        Ok(true)
+    } else {
+        Ok(false)
+    }
+}
+
+pub struct NDArrayDriverBase {
+    pub port_base: PortDriverBase,
+    pub params: NDArrayDriverParams,
+    pub pool: Arc<NDArrayPool>,
+    pub array_output: NDArrayOutput,
+    pub queued_counter: Arc<QueuedArrayCounter>,
+    /// Most recently prepared array (C++ `pArrays[0]`), used as the template
+    /// for `preAllocateBuffers`.
+    pub last_array: Option<Arc<NDArray>>,
+    /// The `NDAttributesFile` attribute set (C++ `pAttributeList`).
+    pub attributes: DriverAttributes,
 }
 
 impl NDArrayDriverBase {
@@ -640,12 +1018,7 @@ impl NDArrayDriverBase {
             array_output: NDArrayOutput::new(),
             queued_counter: Arc::new(QueuedArrayCounter::new()),
             last_array: None,
-            attributes: crate::attributes::NDAttributeList::new(),
-            attr_functions: NDAttributeFunctionRegistry::new(),
-            #[cfg(feature = "ioc")]
-            ca_feeder: None,
-            #[cfg(feature = "ioc")]
-            ca_monitors: CaMonitorSet::default(),
+            attributes: DriverAttributes::new(),
         })
     }
 
@@ -697,13 +1070,8 @@ impl NDArrayDriverBase {
         // library, FUNCTION from the registry, EPICS_PV from its CA cell) and
         // merge the fresh values onto the outgoing array. Port of C++
         // `asynNDArrayDriver::doCallbacksGenericPointer` calling
-        // `getAttributes(pArray->pAttributeList)` before the callback. Skipped
-        // when the driver has no attribute definitions, so a plain array is
-        // never needlessly deep-copied via `Arc::make_mut`.
-        if !self.attributes.is_empty() {
-            let fresh = self.update_attributes();
-            Arc::make_mut(&mut array).attributes.copy_from(&fresh);
-        }
+        // `getAttributes(pArray->pAttributeList)` before the callback.
+        self.attributes.attach(&self.port_base, &mut array);
 
         // G5/G6/G7: write all per-array parameters (size, dims, type, color,
         // Bayer, timestamps, codec).
@@ -815,20 +1183,7 @@ impl NDArrayDriverBase {
     /// [`check_path_str`], written back to the parameter, and `FilePathExists`
     /// is refreshed.
     pub fn check_path(&mut self) -> AsynResult<bool> {
-        let mut path = self
-            .port_base
-            .get_string_param(self.params.file_path, 0)
-            .map(octet_text)?;
-        if path.is_empty() {
-            return Ok(false);
-        }
-
-        let exists = check_path_str(&mut path);
-        self.port_base
-            .set_string_param(self.params.file_path, 0, path)?;
-        self.port_base
-            .set_int32_param(self.params.file_path_exists, 0, exists as i32)?;
-        Ok(exists)
+        check_path(&mut self.port_base, &self.params)
     }
 
     /// Recursively create the directory components of `path`.
@@ -885,299 +1240,42 @@ impl NDArrayDriverBase {
         Ok(())
     }
 
-    /// Handle a write to an Octet parameter, mirroring the relevant branches of
-    /// C++ `asynNDArrayDriver::writeOctet`.
-    ///
-    /// - `ND_ATTRIBUTES_FILE` / `ND_ATTRIBUTES_MACROS`: reload the attribute
-    ///   definitions via [`Self::read_nd_attributes_file`].
-    /// - `FILE_PATH`: run `checkPath`; if the directory does not exist, attempt
-    ///   `createFilePath` bounded by `CREATE_DIR`, then re-check.
-    ///
-    /// The caller is expected to have already stored `value` into the parameter
-    /// library. Returns `true` when `param_index` was a recognized parameter.
+    /// The octet-write branches of C++ `asynNDArrayDriver::writeOctet`; see
+    /// `handle_write_octet`.
     pub fn write_octet(&mut self, param_index: usize, value: &str) -> AsynResult<bool> {
-        if param_index == self.params.attributes_file
-            || param_index == self.params.attributes_macros
-        {
-            let _ = self.read_nd_attributes_file();
-            Ok(true)
-        } else if param_index == self.params.file_path {
-            if !self.check_path()? {
-                let depth = self
-                    .port_base
-                    .get_int32_param(self.params.create_dir, 0)
-                    .unwrap_or(0);
-                let _ = Self::create_file_path(value, depth);
-                self.check_path()?;
-            }
-            Ok(true)
-        } else {
-            Ok(false)
-        }
+        handle_write_octet(
+            &mut self.port_base,
+            &self.params,
+            &mut self.attributes,
+            param_index,
+            value,
+        )
     }
 
-    /// Load NDArray attribute definitions from the `ND_ATTRIBUTES_FILE`
-    /// parameter, mirroring C++ `asynNDArrayDriver::readNDAttributesFile`.
-    ///
-    /// The parameter value is either a path to an XML file or inline XML
-    /// (recognized by containing `<Attributes>`). The XML schema is the
-    /// areaDetector `NDAttributesFile` schema: a root `<Attributes>` element
-    /// with `<Attribute name="..." source="..." type="..." .../>` children.
-    /// Macro substitution (C++ `ND_ATTRIBUTES_MACROS`) is not supported and is
-    /// ignored. Attributes are stored on `self.attributes`; when a file is
-    /// named, `ND_ATTRIBUTES_STATUS` is set to the resulting status code and
-    /// every non-OK code is also returned as an `Err`. An empty name leaves
-    /// the status alone, as C `:327` does.
-    ///
-    /// An `EPICS_PV` attribute is fed from here when the IOC has handed this
-    /// port a CA client through [`Self::set_ca_client`]; each one gets a
-    /// monitor and the status is OK. Without a client there is no feeder, so
-    /// such an attribute evaluates `Undefined` for the life of the IOC and is
-    /// dropped by every file writer — that case keeps a non-OK code rather
-    /// than letting the operator see "Attributes file OK". The rest of the
-    /// file is still loaded, because `PARAM`, `FUNCTION` and `CONST`
-    /// attributes are fed and work; only the status tells the truth about the
-    /// ones that are not. `NDAttributesStatus` is an mbbi with exactly four
-    /// states (NDArrayBase.template:805-822), so `XML_SYNTAX_ERROR` is the
-    /// nearest of C's codes rather than an accurate one.
-    ///
-    /// It is the nearest even though C's own vocabulary has a code for "no
-    /// attribute set is in effect": `NDAttributesFileNotFound` is what the
-    /// constructor seeds (C `asynNDArrayDriver.cpp:997`) and what an IOC that
-    /// never loads a file keeps. That is exactly why this case cannot borrow it
-    /// — code 1 is now the value every port carries before anything is loaded,
-    /// so reusing it here would make a file whose `PARAM`/`FUNCTION`/`CONST`
-    /// attributes are live and working indistinguishable from a port that
-    /// loaded nothing at
-    /// all. `write_octet` discards this `Err`, so the mbbi is the operator's
-    /// only signal that the `EPICS_PV` half is dead.
-    /// Install the CA client that feeds `EPICS_PV` attributes, and start
-    /// feeding any that are already loaded.
-    ///
-    /// Feeding the current set here rather than only at load time is what
-    /// makes the order the IOC does things in stop mattering: install first
-    /// then load, or load first then install, and either way every `EPICS_PV`
-    /// attribute ends up with a monitor.
-    ///
-    /// `runtime` is the handle the monitor tasks are spawned on; it is named
-    /// explicitly because `NDAttributesFile` writes arrive on an asyn port
-    /// thread with no ambient runtime.
+    /// See [`DriverAttributes::set_ca_client`].
     #[cfg(feature = "ioc")]
     pub fn set_ca_client(
         &mut self,
         client: std::sync::Arc<epics_ca_rs::client::CaClient>,
         runtime: tokio::runtime::Handle,
     ) {
-        self.ca_feeder = Some((client, runtime));
-        self.feed_epics_pv_attributes();
+        self.attributes.set_ca_client(client, runtime);
     }
 
-    /// Replace the monitor set with one subscription per loaded `EPICS_PV`
-    /// attribute, and return the names left unfed.
-    ///
-    /// The assignment to `ca_monitors` is the finalizer: it drops the previous
-    /// set, and dropping aborts it, so re-reading the attributes file cannot
-    /// leave a monitor writing into a cell nothing reads.
-    #[cfg(feature = "ioc")]
-    fn feed_epics_pv_attributes(&mut self) -> Vec<String> {
-        let Some((client, runtime)) = self.ca_feeder.clone() else {
-            return self
-                .attributes
-                .iter()
-                .filter(|a| matches!(a.source, NDAttrSource::EpicsPV(_)))
-                .map(|a| a.name.clone())
-                .collect();
-        };
-        let handles: Vec<_> = self
-            .attributes
-            .iter()
-            .filter_map(|a| a.epics_pv_source())
-            .map(|src| crate::attributes::spawn_ca_monitor(&runtime, client.clone(), src))
-            .collect();
-        self.ca_monitors = CaMonitorSet(handles);
-        Vec::new()
-    }
-
-    /// Without the `ioc` feature there is no CA client to build a feeder from,
-    /// so every `EPICS_PV` attribute is unfed.
-    #[cfg(not(feature = "ioc"))]
-    fn feed_epics_pv_attributes(&mut self) -> Vec<String> {
-        self.attributes
-            .iter()
-            .filter(|a| matches!(a.source, NDAttrSource::EpicsPV(_)))
-            .map(|a| a.name.clone())
-            .collect()
-    }
-
-    /// Drop the loaded attributes together with the monitors feeding them.
-    ///
-    /// The two are only ever replaced as a pair; separating them is what would
-    /// let a monitor survive the attribute it writes into.
-    fn clear_attributes(&mut self) {
-        self.attributes.clear();
-        #[cfg(feature = "ioc")]
-        {
-            self.ca_monitors = CaMonitorSet::default();
-        }
-    }
-
+    /// See [`DriverAttributes::read_file`].
     pub fn read_nd_attributes_file(&mut self) -> AsynResult<()> {
-        let file_param = self
-            .port_base
-            .get_string_param(self.params.attributes_file, 0)
-            .map(octet_text)?;
-
-        // Clear any existing attributes (C++ clears unconditionally first).
-        self.clear_attributes();
-        if file_param.is_empty() {
-            // C `:327` — `if (fileName.length() == 0) return asynSuccess;`
-            // with no `setIntegerParam`. The status keeps whatever it had,
-            // which for an IOC that never loaded a file is the constructor's
-            // `NDAttributesFileNotFound`. Writing OK here erased that value
-            // on every `NDAttributesFile` PINI write (NDArrayBase.template:793).
-            return Ok(());
-        }
-
-        // The parameter is inline XML if it contains the root element.
-        let xml = if file_param.contains("<Attributes>") {
-            file_param
-        } else {
-            match std::fs::read_to_string(&file_param) {
-                Ok(s) => s,
-                Err(_) => {
-                    self.port_base.set_int32_param(
-                        self.params.attributes_status,
-                        0,
-                        ATTR_STATUS_FILE_NOT_FOUND,
-                    )?;
-                    return Err(asyn_rs::error::AsynError::Status {
-                        status: asyn_rs::error::AsynStatus::Error,
-                        message: format!("readNDAttributesFile: cannot open {file_param}"),
-                    });
-                }
-            }
-        };
-
-        match parse_attributes_xml(&xml, &self.attr_functions) {
-            Ok(attrs) => {
-                for attr in attrs {
-                    self.attributes.add(attr);
-                }
-                let unfed = self.feed_epics_pv_attributes();
-                if unfed.is_empty() {
-                    self.port_base.set_int32_param(
-                        self.params.attributes_status,
-                        0,
-                        ATTR_STATUS_OK,
-                    )?;
-                    return Ok(());
-                }
-                self.port_base.set_int32_param(
-                    self.params.attributes_status,
-                    0,
-                    ATTR_STATUS_XML_SYNTAX_ERROR,
-                )?;
-                Err(asyn_rs::error::AsynError::Status {
-                    status: asyn_rs::error::AsynStatus::Error,
-                    message: format!(
-                        "readNDAttributesFile: no CA client to monitor EPICS_PV \
-                         attribute(s) {}; they will evaluate Undefined",
-                        unfed.join(", ")
-                    ),
-                })
-            }
-            Err(msg) => {
-                self.port_base.set_int32_param(
-                    self.params.attributes_status,
-                    0,
-                    ATTR_STATUS_XML_SYNTAX_ERROR,
-                )?;
-                Err(asyn_rs::error::AsynError::Status {
-                    status: asyn_rs::error::AsynStatus::Error,
-                    message: format!("readNDAttributesFile: {msg}"),
-                })
-            }
-        }
+        self.attributes.read_file(&mut self.port_base, &self.params)
     }
 
     /// Access the driver's NDArray attribute list (populated by
     /// `read_nd_attributes_file`).
     pub fn attributes(&self) -> &crate::attributes::NDAttributeList {
-        &self.attributes
+        &self.attributes.list
     }
 
-    /// Re-evaluate every live attribute, then return a snapshot of the list to
-    /// attach to an outgoing NDArray.
-    ///
-    /// Port of C++ `asynNDArrayDriver::getAttributes` →
-    /// `NDAttributeList::updateValues()`. `PARAM` attributes are refreshed from
-    /// this driver's asyn parameter library (mirroring
-    /// `paramAttribute::updateValue`, which reads `pDriver->getXxxParam`);
-    /// `FUNCTION` attributes call their registered function; `EPICS_PV`
-    /// attributes read whatever value a CA-monitor task last fed into their
-    /// cell. `CONST` / `DRIVER` attributes are static.
+    /// See [`DriverAttributes::update`].
     pub fn update_attributes(&mut self) -> crate::attributes::NDAttributeList {
-        // 1. Feed each PARAM attribute's cell from the parameter library.
-        //    Done first (immutable borrow of attributes + port_base), so the
-        //    subsequent update_values() re-read picks up the fresh value.
-        for attr in self.attributes.iter() {
-            if let Some(param_src) = attr.param_source() {
-                if let Some(value) = self.read_param_value(param_src) {
-                    param_src.cell().set(value);
-                }
-            }
-        }
-        // 2. Re-evaluate every attribute from its (now-fresh) source.
-        self.attributes.update_values();
-        // 3. Return a snapshot for the outgoing array.
-        self.attributes.clone()
-    }
-
-    /// Read a `Param` attribute's current value from the asyn parameter
-    /// library, using the read type the XML `datatype` selected — NOT the
-    /// param's runtime type. Mirrors C++ `paramAttribute::updateValue`
-    /// (paramAttribute.cpp:131-151), which dispatches on `paramType` to the
-    /// matching `getXxxParam` and publishes a fixed `NDAttrDataType`.
-    ///
-    /// Returns `None` (leaving the attribute's cell at its prior / `Undefined`
-    /// value) when the param is unknown, the value is undefined, the read type
-    /// mismatches the param's actual type, or the `datatype` was unrecognized
-    /// (`ParamAttrType::Unknown` — C's `paramAttrTypeUnknown`, which never
-    /// refreshes the attribute).
-    fn read_param_value(
-        &self,
-        src: &crate::attributes::ParamAttributeSource,
-    ) -> Option<NDAttrValue> {
-        use crate::attributes::ParamAttrType;
-        let index = self.port_base.params.find_param(&src.param_name)?;
-        let addr = src.addr;
-        match src.param_type {
-            ParamAttrType::Int32 => self
-                .port_base
-                .params
-                .get_int32(index, addr)
-                .ok()
-                .map(NDAttrValue::Int32),
-            ParamAttrType::Int64 => self
-                .port_base
-                .params
-                .get_int64(index, addr)
-                .ok()
-                .map(NDAttrValue::Int64),
-            ParamAttrType::Float64 => self
-                .port_base
-                .params
-                .get_float64(index, addr)
-                .ok()
-                .map(NDAttrValue::Float64),
-            ParamAttrType::String => self
-                .port_base
-                .params
-                .get_string(index, addr)
-                .ok()
-                .map(|s| NDAttrValue::String(octet_text(s))),
-            ParamAttrType::Unknown => None,
-        }
+        self.attributes.update(&self.port_base)
     }
 }
 
@@ -1757,6 +1855,91 @@ pub(crate) mod tests {
         );
     }
 
+    fn load_with_macros(xml: &str, macros: &str) -> NDArrayDriverBase {
+        let mut drv = NDArrayDriverBase::new("TEST", 1_000_000).unwrap();
+        drv.port_base
+            .set_string_param(drv.params.attributes_macros, 0, macros)
+            .unwrap();
+        drv.port_base
+            .set_string_param(drv.params.attributes_file, 0, xml)
+            .unwrap();
+        let _ = drv.read_nd_attributes_file();
+        drv
+    }
+
+    /// C `readNDAttributesFile` expands the whole file against
+    /// `NDAttributesMacros` before parsing it; a quoted value keeps its comma.
+    #[test]
+    fn test_attributes_macros_expand_the_file() {
+        let drv = load_with_macros(
+            r#"<Attributes>
+                <Attribute name="$(N)Gain" type="PARAM" source="$(PARAM)" datatype="DOUBLE"/>
+                <Attribute name="Note" type="CONST" source="$(TEXT)" datatype="STRING"/>
+            </Attributes>"#,
+            r#"N=Det,PARAM=GAIN,TEXT="a,b""#,
+        );
+        assert_eq!(
+            drv.attributes()
+                .get("DetGain")
+                .unwrap()
+                .source
+                .source_string(),
+            "GAIN"
+        );
+        assert_eq!(
+            drv.attributes().get("Note").unwrap().value,
+            NDAttrValue::String("a,b".into())
+        );
+    }
+
+    /// Boundary: no macro string — the text is parsed as written.
+    #[test]
+    fn test_attributes_without_macros_are_not_expanded() {
+        let drv = load_with_macros(
+            r#"<Attributes><Attribute name="A" type="CONST" source="$(X)"/></Attributes>"#,
+            "",
+        );
+        assert_eq!(
+            drv.attributes().get("A").unwrap().source.source_string(),
+            "$(X)"
+        );
+    }
+
+    /// Boundary: a reference the macro string does not define. C's
+    /// `goto done_macros` parses the unexpanded buffer, so the defined macro
+    /// in the same file is not applied either.
+    #[test]
+    fn test_an_undefined_attributes_macro_leaves_the_file_unexpanded() {
+        let drv = load_with_macros(
+            r#"<Attributes>
+                <Attribute name="A" type="CONST" source="$(X)"/>
+                <Attribute name="B" type="CONST" source="$(MISSING)"/>
+            </Attributes>"#,
+            "X=1",
+        );
+        assert_eq!(
+            drv.attributes().get("A").unwrap().source.source_string(),
+            "$(X)"
+        );
+        assert_eq!(
+            drv.attributes().get("B").unwrap().source.source_string(),
+            "$(MISSING)"
+        );
+    }
+
+    /// The environment is not behind the handle (C `macCreateHandle(&h, 0)`).
+    #[test]
+    fn test_attributes_macros_do_not_read_the_environment() {
+        let drv = load_with_macros(
+            r#"<Attributes><Attribute name="A" type="CONST" source="$(PATH)"/></Attributes>"#,
+            "X=1",
+        );
+        assert_eq!(
+            drv.attributes().get("A").unwrap().source.source_string(),
+            "$(PATH)"
+        );
+    }
+
     #[test]
     fn test_epics_pv_attribute_is_not_reported_ok() {
         // An EPICS_PV attribute evaluates Undefined for the life of the IOC
@@ -1967,11 +2150,13 @@ pub(crate) mod tests {
         // Register a function whose return value changes on each call.
         let counter = std::sync::Arc::new(std::sync::atomic::AtomicI32::new(0));
         let c = counter.clone();
-        drv.attr_functions.register("tick", move |param: &str| {
-            let n = c.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
-            // The XML `param` string is passed through to the function.
-            NDAttrValue::String(format!("{param}={n}"))
-        });
+        drv.attributes
+            .functions
+            .register("tick", move |param: &str| {
+                let n = c.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+                // The XML `param` string is passed through to the function.
+                NDAttrValue::String(format!("{param}={n}"))
+            });
 
         let xml = r#"<Attributes>
             <Attribute name="Live" type="FUNCTION" source="tick" param="seq"/>
@@ -2020,7 +2205,7 @@ pub(crate) mod tests {
         // status it leaves behind is asserted by
         // `test_empty_attributes_file_keeps_the_constructor_status`.
         let mut drv = NDArrayDriverBase::new("TEST", 1_000_000).unwrap();
-        drv.attributes.add(NDAttribute::new_static(
+        drv.attributes.list.add(NDAttribute::new_static(
             "Gone",
             "",
             NDAttrSource::Constant("1".into()),

@@ -244,9 +244,24 @@ pub enum CallbackError {
     QueueFull,
 }
 
+/// One FIFO entry of a band.
+enum Queued {
+    /// A `callbackRequest` — holds one of the ring's `capacity` slots.
+    Ring(Callback),
+    /// A spawned future's run-queue entry. A task has at most one at a time
+    /// (its `SCHEDULED` state is the claim), so these are bounded by the live
+    /// task count and take no ring slot: a wake that the ring could reject
+    /// would strand a long-lived task forever.
+    Task(Callback),
+}
+
 /// Mutable, lock-guarded state of one priority band's ring.
 struct QueueState {
-    queue: VecDeque<Callback>,
+    queue: VecDeque<Queued>,
+    /// Ring slots in use — the `Queued::Ring` entries in `queue`. This, not
+    /// `queue.len()`, is what C's bounded ring measures: a task's run-queue
+    /// entry shares the FIFO but holds no ring slot.
+    ring_used: usize,
     /// C `epicsRingPointerGetHighWaterMark` on the band's ring — the
     /// deepest the queue has ever been. `callbackQueueShow` reports it
     /// and `callbackQueueStatus(reset=1)` clears it
@@ -276,6 +291,7 @@ impl PriorityQueue {
             capacity,
             state: Mutex::new(QueueState {
                 queue: VecDeque::with_capacity(capacity.min(1024)),
+                ring_used: 0,
                 high_water: 0,
                 overflow: false,
                 overflows: 0,
@@ -307,7 +323,7 @@ impl PriorityQueue {
             return Err(CallbackError::QueueFull);
         }
         // callback.c:367-374 — push; on a full ring, latch overflow and count.
-        if st.queue.len() >= self.capacity {
+        if st.ring_used >= self.capacity {
             st.overflow = true;
             st.overflows += 1;
             // callback.c:370 — `fullMessage[priority]`, printed once per
@@ -320,14 +336,28 @@ impl PriorityQueue {
             );
             return Err(CallbackError::QueueFull);
         }
-        st.queue.push_back(cb);
+        st.queue.push_back(Queued::Ring(cb));
+        st.ring_used += 1;
         // The ring's high-water mark moves on the push that made it
         // deepest, exactly where `epicsRingPointer` moves its own.
-        st.high_water = st.high_water.max(st.queue.len());
+        st.high_water = st.high_water.max(st.ring_used);
         drop(st);
         // callback.c:375 — signal the band's wake-up event.
         self.wake.notify_one();
         Ok(())
+    }
+
+    /// Queue a spawned future's run-queue entry. Never refused for capacity —
+    /// see [`Queued::Task`]. After shutdown `cb` is dropped un-run, which is
+    /// how the task learns it was cancelled.
+    fn schedule_task(&self, cb: Callback) {
+        let mut st = recover(FACILITY, self.state.lock());
+        if st.shutdown {
+            return;
+        }
+        st.queue.push_back(Queued::Task(cb));
+        drop(st);
+        self.wake.notify_one();
     }
 
     /// C `callbackQueueStatus` for one band (`callback.c:115-139`):
@@ -337,7 +367,7 @@ impl PriorityQueue {
         let mut st = recover(FACILITY, self.state.lock());
         let out = CallbackQueueStats {
             size: self.capacity,
-            num_used: st.queue.len(),
+            num_used: st.ring_used,
             max_used: st.high_water,
             num_overflow: st.overflows,
         };
@@ -378,9 +408,15 @@ fn worker_loop(pq: &PriorityQueue) {
             return;
         }
         // callback.c:223 — pop next entry.
-        let cb = st.queue.pop_front().unwrap();
-        // callback.c:227 — clear the overflow latch on every pop.
-        st.overflow = false;
+        let cb = match st.queue.pop_front().unwrap() {
+            Queued::Ring(cb) => {
+                st.ring_used -= 1;
+                // callback.c:227 — clear the overflow latch on every pop.
+                st.overflow = false;
+                cb
+            }
+            Queued::Task(cb) => cb,
+        };
         drop(st);
         // callback.c:228 — run the callback with the ring lock released.
         run_isolated(FACILITY, cb);
@@ -403,6 +439,13 @@ impl CallbackHandle {
     pub fn request(&self, priority: CallbackPriority, cb: Callback) -> Result<(), CallbackError> {
         let pq = &self.queues[priority.index()];
         pq.request(priority.name_prefix(), cb)
+    }
+
+    /// Queue a spawned future's run-queue entry on `priority`. Unlike
+    /// [`request`](Self::request) this cannot fail: the entry takes no ring
+    /// slot. The caller guarantees at most one such entry per task.
+    pub(super) fn schedule_task(&self, priority: CallbackPriority, cb: Callback) {
+        self.queues[priority.index()].schedule_task(cb);
     }
 
     /// Lifetime overflow count for a band — C `queueOverflows`

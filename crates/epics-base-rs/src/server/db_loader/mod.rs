@@ -1412,7 +1412,7 @@ pub fn set_db_quiet_macro_warnings(quiet: bool) {
 /// straight to `dbLoadRecords`, where the two raw values walk into each
 /// other on the first expansion. Measured against `softIoc R7.0.10`:
 /// three lines C wrote that this used to swallow, now
-/// [`MacroFault::Recursive`] and the notice in [`refer`].
+/// [`MacroFault::Recursive`] and the notice in `mac_lib`'s `refer`.
 ///
 /// The earlier reading that no such input existed came from testing
 /// through the iocsh command line, where the shell's own expansion
@@ -1424,7 +1424,7 @@ pub fn set_db_quiet_macro_warnings(quiet: bool) {
 /// and it raises this same warning under it — measured on `softIoc
 /// R7.0.10`, two lines per bad line, and `var dbQuietMacroWarnings 1`
 /// drops the `macLib:` one and keeps this one, exactly as for the other
-/// two arms. [`MacroFault::Unterminated`] and the notice in [`refer`].
+/// two arms. [`MacroFault::Unterminated`] and the notice in `mac_lib`'s `refer`.
 ///
 /// `filename` is `None` for text that never came from a file — C has no
 /// such path (`dbReadDatabase` always names one), so the per-file warning

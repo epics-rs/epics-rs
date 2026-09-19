@@ -1535,6 +1535,36 @@ impl PortDriverBase {
             iface: Some(iface),
         });
     }
+
+    /// Publish a new enum table for a parameter — C
+    /// `asynPortDriver::doCallbacksEnum`. Records bound to the parameter rewrite
+    /// their state strings/values/severities and post `DBE_PROPERTY`.
+    ///
+    /// An `Enum` parameter owns its table, so the table is stored and goes out
+    /// with the parameter's own callback. A parameter of any other type (C's
+    /// everyday case: an `asynParamInt32` behind an mbbi) has nowhere to keep
+    /// one; the table is fired on the asynEnum interface alone, where no value
+    /// subscriber sees it.
+    pub fn do_callbacks_enum(
+        &mut self,
+        index: usize,
+        addr: i32,
+        choices: Arc<[EnumEntry]>,
+    ) -> AsynResult<()> {
+        if self.params.get_enum(index, addr).is_ok() {
+            self.params.set_enum_choices(index, addr, choices)?;
+            return self.call_param_callbacks(addr);
+        }
+        self.notify_interface_value(
+            index,
+            addr,
+            InterfaceType::Enum,
+            ParamValue::Enum { index: 0, choices },
+            0,
+            AsynStatus::Success,
+        );
+        Ok(())
+    }
 }
 
 /// Result of resolving a record's driver-info string at bind time — the
@@ -3109,6 +3139,39 @@ mod tests {
         let v = rx.try_recv().unwrap();
         assert_eq!(v.reason, 0);
         assert!(matches!(v.value, ParamValue::Enum { index: 1, .. }));
+    }
+
+    /// `do_callbacks_enum` by parameter type: an `Enum` param keeps the table
+    /// and fires it with its value; any other param has the table fired on the
+    /// asynEnum interface and keeps its own value.
+    #[test]
+    fn do_callbacks_enum_by_param_type() {
+        use crate::param::{EnumEntry, ParamValue};
+
+        epics_libcom_rs::runtime::interrupt_accept::set_interrupts_accepted(true);
+        let mut base = PortDriverBase::new("test_cb_enum", 1, PortFlags::default());
+        let owner = base.create_param("MODE", ParamType::Enum).unwrap();
+        let plain = base.create_param("GAIN", ParamType::Int32).unwrap();
+        base.set_int32_param(plain, 0, 7).unwrap();
+        base.call_param_callbacks(0).unwrap();
+        let mut rx = base.interrupts.subscribe_async();
+        let choices: Arc<[EnumEntry]> = Arc::from(vec![EnumEntry {
+            string: "A".into(),
+            value: 3,
+            severity: 0,
+        }]);
+
+        base.do_callbacks_enum(owner, 0, choices.clone()).unwrap();
+        let v = rx.try_recv().unwrap();
+        assert_eq!((v.reason, v.iface), (owner, None));
+        assert_eq!(base.get_enum_param(owner, 0).unwrap().1, choices);
+
+        base.do_callbacks_enum(plain, 0, choices.clone()).unwrap();
+        let v = rx.try_recv().unwrap();
+        assert_eq!((v.reason, v.iface), (plain, Some(InterfaceType::Enum)));
+        assert!(matches!(v.value, ParamValue::Enum { choices: c, .. } if c == choices));
+        assert_eq!(base.get_int32_param(plain, 0).unwrap(), 7);
+        assert!(rx.try_recv().is_err());
     }
 
     #[test]

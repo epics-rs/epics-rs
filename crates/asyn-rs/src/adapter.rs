@@ -2068,6 +2068,10 @@ impl DeviceSupport for AsynDeviceSupport {
                         if let Some(buf) = st.buf.as_mut() {
                             buf.clear();
                         }
+                        // C `memset(pwf->bptr, 0, pwf->nelm*sizeof(EPICS_TYPE))`
+                        // (devAsynXXXTimeSeries.h:139-141): a VAL put leaves
+                        // the elements past its own length alone.
+                        wf.reallocate_val();
                         st.busy = true;
                     }
                     2 => st.busy = false,
@@ -4196,8 +4200,7 @@ mod tests {
     /// samples that follow start at index 0. C does the wipe explicitly with
     /// `pPvt->nord = 0` plus `memset(pwf->bptr, 0, pwf->nelm*sizeof(EPICS_TYPE))`
     /// (devAsynXXXTimeSeries.h:139-141); the port clears the accumulator and
-    /// commits it, and waveform's own reallocation zero-fills, so the residue
-    /// a client could reach with a NORD-exceeding request is identical.
+    /// wipes the record array with it.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn time_series_rearm_discards_the_previous_acquisition() {
         use epics_base_rs::server::records::waveform::WaveformRecord;

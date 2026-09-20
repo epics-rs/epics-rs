@@ -177,7 +177,7 @@ use super::search_engine::{
     Origin, SearchOutput, filter_inbound, process_search_datagram, random_guid,
 };
 use super::source::{ChannelInvalidator, DynSource};
-use super::tcp::{ConnInit, TCP_TX_LIMIT_MULT, TX_LIMIT_FALLBACK, handle_connection_io};
+use super::tcp::{ConnInit, TX_LIMIT_FALLBACK, handle_connection_io};
 use crate::error::{PvaError, PvaResult};
 
 /// The EPICS priority every PVA server thread runs at.
@@ -1118,6 +1118,8 @@ pub fn bind_udp_search(addr: SocketAddrV4) -> io::Result<UdpSocket> {
 #[cfg(unix)]
 pub(super) fn tx_limit_bytes(stream: &TcpStream) -> usize {
     use std::os::fd::AsRawFd;
+
+    use super::tcp::TCP_TX_LIMIT_MULT;
     let mut val: libc::c_int = 0;
     let mut len = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
     // SAFETY: the fd is a valid open socket borrowed from `stream`; `val`

@@ -26,18 +26,25 @@
 //! > waker, and only the task that then observed `WouldBlock` may arm it
 //! > again.
 //! > **MUST NOT** any path remove an fd from the armed set other than
-//! > `Registration`'s `Drop` and the one-shot removal above — in particular
-//! > no fd may be closed while still armed.
+//! > [`StreamInner`]'s `Drop` and the one-shot removal above — and no fd may
+//! > be closed while the kernel is still watching it, which is why the poll
+//! > thread is the one that closes it.
 //!
 //! The first half is what keeps the poll thread from spinning: a
 //! level-triggered backend reports a readable socket on every wait until the
 //! bytes are consumed, so an interest that survived its own wake-up would
 //! re-report immediately and burn the CPU that a reactor exists to save. The
-//! second half is what keeps it correct: an fd left armed past `close(2)` is a
-//! wait on a number the kernel may have already handed to a different socket.
-//! [`ReadyStream`] declares its `Registration` *before* the `TcpStream` it
-//! wraps for exactly that reason — Rust drops fields in declaration order, so
-//! the de-registration always precedes the close.
+//! second half is what keeps it correct: an fd left in a `select` set past
+//! `close(2)` is `EBADF` from the next call — at entry on Linux, on every
+//! rescan under the BSD `kern_select` libbsd carries — and a number the kernel
+//! may since have handed to a different socket. So dropping the last handle to
+//! a stream does not close its socket. It hands the socket to the poll thread,
+//! which closes it in the same `wait` that takes the fd out of the kernel's
+//! sets — after the removal and before it blocks — and a socket the kernel was
+//! never told about is closed on the spot, there being nothing to remove
+//! first. The order holds by construction rather than by convention: nothing
+//! else holds the socket once the last handle is gone, and the delete and the
+//! close travel in one changelist.
 //!
 //! One-shot arming is also what makes registering *after* a `WouldBlock` race-
 //! free. Between the failed read and the arm, the peer may have sent the byte
@@ -83,26 +90,29 @@
 //!   pair is what keeps kqueue from reporting a spurious event for an
 //!   add-then-delete that never left this process.
 //!
-//! A delete that does reach the kernel late is ordinary rather than
-//! exceptional: `Registration`'s `Drop` queues it and the socket closes
-//! immediately after, so by the time the poll thread submits it the fd is
-//! usually gone and the kqueue has already dropped the registration itself.
-//! That is why the kqueue backend ignores delete failures, and why `select`,
-//! whose sets live in this process, has nothing there to fail.
+//! A delete that misses in the kernel is ordinary rather than exceptional on
+//! `kqueue`: that backend closes the socket before the `kevent` call carrying
+//! the delete, because the same call also blocks and a close after it would
+//! wait for the next wake-up; `close(2)` drops the knotes itself, so the
+//! delete then finds nothing, and the backend ignores that. `select` closes
+//! after clearing the bits and before blocking, which is the order its
+//! kernel-side scan needs.
 //!
 //! New registrations arriving while the thread is blocked in the syscall are
 //! what `Backend::interrupt` is for; it is the only reason this module needs
 //! a self-pipe (`select`) or a user event (`kqueue`).
 
-// RTEMS-EXEC-MODEL-ALLOW(6): the six poller tests park a `tokio::spawn`ed task
-// on a `ReadyStream` half, so the property under test is that the poller wakes
-// a tokio task — the tokio flavor is the subject, not an accident. They run on
-// the driver `#[tokio::test]` builds and pass in the exec-backend suite
+// RTEMS-EXEC-MODEL-ALLOW(7): the seven poller tests park a `tokio::spawn`ed
+// task on a `ReadyStream` half, so the property under test is that the poller
+// wakes a tokio task — the tokio flavor is the subject, not an accident. They
+// run on the driver `#[tokio::test]` builds and pass in the exec-backend suite
 // (measured: `EPICS_RS_BUILD_EXEC_BACKEND=thread cargo nextest run
-// -p epics-libcom-rs -E 'test(/runtime::readiness::/)'`, 10/10).
+// -p epics-libcom-rs -E 'test(/runtime::readiness::/)'`, 22/22).
 
 use std::collections::HashMap;
 use std::io;
+use std::mem::ManuallyDrop;
+use std::net::TcpStream;
 use std::os::fd::{AsRawFd, RawFd};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -159,11 +169,16 @@ impl ActiveBackend {
 }
 
 impl Backend for ActiveBackend {
-    fn wait(&self, changes: &[Change], ready: &mut Vec<(RawFd, Interest)>) -> io::Result<()> {
+    fn wait(
+        &self,
+        changes: &[Change],
+        closing: &mut Vec<TcpStream>,
+        ready: &mut Vec<(RawFd, Interest)>,
+    ) -> io::Result<()> {
         match self {
-            Self::Select(b) => b.wait(changes, ready),
+            Self::Select(b) => b.wait(changes, closing, ready),
             #[cfg(target_os = "rtems")]
-            Self::Kqueue(b) => b.wait(changes, ready),
+            Self::Kqueue(b) => b.wait(changes, closing, ready),
         }
     }
 
@@ -298,13 +313,14 @@ fn check_fd(fd: RawFd) -> io::Result<()> {
 /// [`Backend::interrupt`], which is called from whichever thread arms an
 /// interest.
 trait Backend: Send + Sync + 'static {
-    /// Apply `changes`, then wait until at least one watched interest is
-    /// ready and push the ready ones into `ready`. Returns without error and
-    /// with an empty `ready` when only [`Backend::interrupt`] fired.
+    /// Apply `changes`, close every socket in `closing`, then wait until at
+    /// least one watched interest is ready and push the ready ones into
+    /// `ready`. Returns without error and with an empty `ready` when only
+    /// [`Backend::interrupt`] fired.
     ///
-    /// > **MUST** every change is applied before the call can block, so a
-    /// > `wait` that fails with [`io::ErrorKind::Interrupted`] has still taken
-    /// > them.
+    /// > **MUST** every change is applied and every socket in `closing` is
+    /// > closed before the call can block, so a `wait` that fails with
+    /// > [`io::ErrorKind::Interrupted`] has still taken both.
     ///
     /// That is what lets [`poll_loop`] treat `Interrupted` as "go round
     /// again" without re-queueing anything: a change leaves the armed set
@@ -313,7 +329,18 @@ trait Backend: Send + Sync + 'static {
     /// `select` satisfies it by keeping its fd sets in this process; `kqueue`
     /// by submitting the changelist in the same `kevent` call, which applies
     /// it before the wait begins.
-    fn wait(&self, changes: &[Change], ready: &mut Vec<(RawFd, Interest)>) -> io::Result<()>;
+    ///
+    /// The sockets in `closing` are the ones whose deletes are in `changes`.
+    /// `select` closes them after the bits are cleared, which is the order its
+    /// scan needs; `kqueue` closes them before the `kevent` that carries the
+    /// deletes, which then miss harmlessly, because that call is also the one
+    /// that blocks.
+    fn wait(
+        &self,
+        changes: &[Change],
+        closing: &mut Vec<TcpStream>,
+        ready: &mut Vec<(RawFd, Interest)>,
+    ) -> io::Result<()>;
 
     /// Break a concurrent [`Backend::wait`] out of its syscall.
     fn interrupt(&self) -> io::Result<()>;
@@ -343,6 +370,9 @@ impl Direction {
 struct Slot {
     read: Direction,
     write: Direction,
+    /// The socket, once its last handle is dropped, held until the delete the
+    /// kernel is owed for it goes out — see [`Inner::disarm_all`].
+    closing: Option<TcpStream>,
 }
 
 impl Slot {
@@ -362,7 +392,7 @@ impl Slot {
     }
 
     fn is_idle(&self) -> bool {
-        self.read.is_idle() && self.write.is_idle()
+        self.read.is_idle() && self.write.is_idle() && self.closing.is_none()
     }
 }
 
@@ -419,31 +449,57 @@ impl Inner {
         self.backend.interrupt()
     }
 
-    /// Drop every interest on `fd`. The one path that may do so besides the
-    /// one-shot removal in the poll loop — see the module invariant.
-    fn disarm_all(&self, fd: RawFd) {
-        {
+    /// Take a socket back: drop every interest on it and close it once the
+    /// kernel is no longer watching it. The one path that removes an fd
+    /// besides the one-shot removal in the poll loop — see the module
+    /// invariant.
+    ///
+    /// The close is the poll thread's when the kernel holds a registration for
+    /// the fd — the socket rides in the slot until the delete goes out — and
+    /// immediate when it does not: an fd the kernel was never told about, or
+    /// one on a poller whose thread is gone. `shutdown` is read under the
+    /// armed lock because [`Inner::retire`] sets it under the same lock, so
+    /// the two cannot both miss the socket.
+    fn disarm_all(&self, socket: TcpStream) {
+        let fd = socket.as_raw_fd();
+        let close_now = {
             let mut armed = self.armed.lock().expect("readiness armed set poisoned");
-            let Armed { slots, dirty } = &mut *armed;
-            let Some(slot) = slots.get_mut(&fd) else {
-                return;
-            };
-            let was_dirty = slot.is_dirty();
-            for interest in [Interest::Read, Interest::Write] {
-                let cell = slot.direction(interest);
-                cell.waker = None;
-                cell.pending = cell.registered.then_some(Action::Disarm);
+            if self.shutdown.load(Ordering::Acquire) {
+                Some(socket)
+            } else {
+                let Armed { slots, dirty } = &mut *armed;
+                match slots.get_mut(&fd) {
+                    None => Some(socket),
+                    Some(slot) => {
+                        let was_dirty = slot.is_dirty();
+                        for interest in [Interest::Read, Interest::Write] {
+                            let cell = slot.direction(interest);
+                            cell.waker = None;
+                            cell.pending = cell.registered.then_some(Action::Disarm);
+                        }
+                        if slot.is_dirty() {
+                            slot.closing = Some(socket);
+                            if !was_dirty {
+                                dirty.push(fd);
+                            }
+                            None
+                        } else {
+                            // Nothing registered — an add the poll thread
+                            // never drained was cancelled just above — so
+                            // there is nothing to remove before the close.
+                            slots.remove(&fd);
+                            Some(socket)
+                        }
+                    }
+                }
             }
-            if slot.is_idle() {
-                slots.remove(&fd);
-            } else if !was_dirty {
-                dirty.push(fd);
-            }
-        }
+        };
+        drop(close_now);
         // The armed set is no longer rebuilt from scratch on every wait, so
-        // this delete reaches the kernel only when the poll thread next
-        // drains. Waking it now is what holds that window to the wait already
-        // in flight rather than to whenever some other fd is next armed.
+        // this delete — and the close behind it — reaches the kernel only
+        // when the poll thread next drains. Waking it now is what holds that
+        // window to the wait already in flight rather than to whenever some
+        // other fd is next armed.
         let _ = self.backend.interrupt();
     }
 
@@ -476,15 +532,20 @@ impl Inner {
             .count()
     }
 
-    /// Move the pending changes into `out` and record that the kernel is about
-    /// to be told about them.
+    /// Move the pending changes into `out`, the sockets whose deletes they
+    /// carry into `closing`, and record that the kernel is about to be told
+    /// about them.
     ///
     /// `registered` is committed here rather than after the syscall because of
     /// the [`Backend::wait`] MUST: the only failure that leaves this poller
     /// running is `Interrupted`, and that one happens after the changelist is
     /// in.
-    fn drain_changes(&self, out: &mut Vec<Change>) {
+    fn drain_changes(&self, out: &mut Vec<Change>, closing: &mut Vec<TcpStream>) {
         out.clear();
+        debug_assert!(
+            closing.is_empty(),
+            "the backend owes every socket it was handed a close before it blocks"
+        );
         let mut armed = self.armed.lock().expect("readiness armed set poisoned");
         let Armed { slots, dirty } = &mut *armed;
         for fd in dirty.drain(..) {
@@ -503,9 +564,44 @@ impl Inner {
                     action,
                 });
             }
+            // Both directions' deletes are in `out` now — `disarm_all` queued
+            // them together with the socket — so the socket goes with them.
+            if let Some(socket) = slot.closing.take() {
+                closing.push(socket);
+            }
             if slot.is_idle() {
                 slots.remove(&fd);
             }
+        }
+    }
+
+    /// The poll thread's last act, on either exit: shut the poller, wake every
+    /// parked task, and close every socket held for a delete that will now
+    /// never go out — the kernel stops watching when the thread stops
+    /// waiting.
+    ///
+    /// `shutdown` is stored under the armed lock so that a concurrent
+    /// [`Inner::disarm_all`] either sees it set and closes its socket itself,
+    /// or has stored the socket in a slot this sweep takes. A task woken here
+    /// re-polls its socket, sees `WouldBlock` and re-arms, and it is the
+    /// refused re-arm that hands it the error it unwinds on.
+    fn retire(&self) {
+        let mut armed = self.armed.lock().expect("readiness armed set poisoned");
+        self.shutdown.store(true, Ordering::Release);
+        let Armed { slots, dirty } = &mut *armed;
+        dirty.clear();
+        for (_, slot) in slots.drain() {
+            let Slot {
+                read,
+                write,
+                closing,
+            } = slot;
+            for cell in [read, write] {
+                if let Some(w) = cell.waker {
+                    w.wake();
+                }
+            }
+            drop(closing);
         }
     }
 }
@@ -562,11 +658,8 @@ impl Poller {
         }
         Ok(ReadyStream {
             inner: Arc::new(StreamInner {
-                registration: Registration {
-                    poller: Arc::clone(self),
-                    fd,
-                },
-                stream,
+                poller: Arc::clone(self),
+                stream: ManuallyDrop::new(stream),
             }),
         })
     }
@@ -597,29 +690,25 @@ impl Drop for Poller {
 fn poll_loop(inner: &Arc<Inner>) {
     let mut ready: Vec<(RawFd, Interest)> = Vec::new();
     let mut changes: Vec<Change> = Vec::new();
+    let mut closing: Vec<TcpStream> = Vec::new();
     while !inner.shutdown.load(Ordering::Acquire) {
-        inner.drain_changes(&mut changes);
+        inner.drain_changes(&mut changes, &mut closing);
         ready.clear();
-        match inner.backend.wait(&changes, &mut ready) {
+        match inner.backend.wait(&changes, &mut closing, &mut ready) {
             Ok(()) => {}
             // The changes are not re-queued, and need not be: `Backend::wait`
-            // owes them to the kernel before it may block, so the interrupted
-            // call is one that already took them.
+            // owes them and the closes to the kernel before it may block, so
+            // the interrupted call is one that already took them.
             Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
-            Err(_) => {
-                // A backend that cannot wait cannot serve anyone: wake every
-                // armed task so each observes its own socket error and
-                // unwinds, rather than parking forever on a dead poller.
-                let mut armed = inner.armed.lock().expect("readiness armed set poisoned");
-                for (_, slot) in armed.slots.drain() {
-                    if let Some(w) = slot.read.waker {
-                        w.wake();
-                    }
-                    if let Some(w) = slot.write.waker {
-                        w.wake();
-                    }
-                }
-                return;
+            Err(e) => {
+                // A backend that cannot wait cannot serve anyone; `retire`
+                // below is what tells the parked tasks.
+                //
+                // `eprintln!` for the reason `ActiveBackend::new` uses it: a
+                // poller dying is a diagnostic that must not depend on a
+                // `tracing` subscriber being installed.
+                eprintln!("epics-rs: readiness poller cannot wait, shutting down: {e}");
+                break;
             }
         }
         for &(fd, interest) in &ready {
@@ -628,40 +717,38 @@ fn poll_loop(inner: &Arc<Inner>) {
             }
         }
     }
+    inner.retire();
+    // A wait that failed may have refused its `closing`; those sockets close
+    // with the vector, after the sweep, when the kernel is watching nothing.
 }
 
-/// One fd's presence in a poller's armed set. Dropping it disarms every
-/// interest on that fd — the only path that may, besides the one-shot removal
-/// in the poll loop.
-struct Registration {
-    poller: Arc<Poller>,
-    fd: RawFd,
-}
-
-impl Drop for Registration {
-    fn drop(&mut self) {
-        self.poller.inner.disarm_all(self.fd);
-    }
-}
-
-/// The fd's presence in a poller plus the socket itself — the state every
-/// handle to one connection shares.
+/// The socket and the poller it is registered with — the state every handle
+/// to one connection shares.
 ///
-/// Field order is load-bearing: `registration` is declared first so its `Drop`
-/// runs before `stream`'s, and the fd leaves the armed set before it is
-/// closed. Because the halves hold this behind one `Arc`, that ordering holds
-/// for whichever handle happens to be the last one dropped.
+/// Dropping the last handle does not close the socket. It hands the socket to
+/// the poller ([`Inner::disarm_all`]), which closes it once the kernel is no
+/// longer watching the fd — the module invariant, held by construction rather
+/// than by field order.
 struct StreamInner {
-    registration: Registration,
-    stream: std::net::TcpStream,
+    poller: Arc<Poller>,
+    /// Taken in `Drop`, once, to hand to the poller.
+    stream: ManuallyDrop<TcpStream>,
+}
+
+impl Drop for StreamInner {
+    fn drop(&mut self) {
+        // SAFETY: taken exactly once, here, and `self.stream` is never read
+        // again — `drop` is the last code to see `self`.
+        let socket = unsafe { ManuallyDrop::take(&mut self.stream) };
+        self.poller.inner.disarm_all(socket);
+    }
 }
 
 impl StreamInner {
     fn arm(&self, interest: Interest, waker: &Waker) -> io::Result<()> {
-        self.registration
-            .poller
+        self.poller
             .inner
-            .arm(self.registration.fd, interest, waker)
+            .arm(self.stream.as_raw_fd(), interest, waker)
     }
 
     fn poll_read(
@@ -674,7 +761,7 @@ impl StreamInner {
         // is avoided by going through `initialize_unfilled`, which is what
         // costs a memset and what keeps this file free of raw buffers.
         let dst = buf.initialize_unfilled();
-        match (&self.stream).read(dst) {
+        match (&*self.stream).read(dst) {
             Ok(n) => {
                 buf.advance(n);
                 std::task::Poll::Ready(Ok(()))
@@ -695,7 +782,7 @@ impl StreamInner {
         src: &[u8],
     ) -> std::task::Poll<io::Result<usize>> {
         use std::io::Write;
-        match (&self.stream).write(src) {
+        match (&*self.stream).write(src) {
             Ok(n) => std::task::Poll::Ready(Ok(n)),
             Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
                 match self.arm(Interest::Write, cx.waker()) {
@@ -743,7 +830,7 @@ impl ReadyStream {
 
     /// The wrapped socket, for the options a driver sets after accept
     /// (`SO_SNDBUF`, keepalive).
-    pub fn socket(&self) -> &std::net::TcpStream {
+    pub fn socket(&self) -> &TcpStream {
         &self.inner.stream
     }
 }
@@ -845,6 +932,14 @@ mod tests {
         (server, client)
     }
 
+    /// Whether `fd` is still open in this process. Sound as a test probe
+    /// because nextest runs each test in a process of its own, so a number
+    /// this test closed is reused only by this test.
+    fn is_open(fd: RawFd) -> bool {
+        // SAFETY: `F_GETFD` takes no pointer and touches nothing.
+        unsafe { libc::fcntl(fd, libc::F_GETFD) != -1 }
+    }
+
     /// Two round trips, not one: the second is what fails if the delete the
     /// first delivery queued outlives the re-arm that follows it, or if the
     /// re-arm is skipped because the kernel is thought to hold a registration
@@ -917,11 +1012,16 @@ mod tests {
         assert_eq!(drained.await.expect("join"), BYTES);
     }
 
+    /// The invariant end to end: the drop takes the fd out of the armed set
+    /// at once, and the socket closes only once the poll thread has drained
+    /// the delete — so the close is the poll thread's, never the dropping
+    /// task's.
     #[tokio::test]
-    async fn c_dropping_the_stream_disarms_the_fd_before_the_close() {
+    async fn c_dropping_the_stream_disarms_the_fd_and_the_poll_thread_closes_it() {
         let poller = Poller::new("RDT3", ThreadPriority::CaServerHigh).expect("poller");
         let (server, _client) = pair();
         let mut stream = poller.stream(server).expect("stream");
+        let fd = stream.socket().as_raw_fd();
 
         // Park a read so the fd is genuinely armed.
         let mut buf = [0u8; 1];
@@ -935,8 +1035,16 @@ mod tests {
         assert_eq!(
             poller.armed_fds(),
             0,
-            "Registration::Drop must clear the armed set before the fd closes"
+            "StreamInner::drop must clear the armed set at once"
         );
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while is_open(fd) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the poll thread must close the socket once its delete is out"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
     }
 
     #[tokio::test]
@@ -957,6 +1065,7 @@ mod tests {
                     interest: Interest::Read,
                     action: Action::Arm,
                 }],
+                &mut Vec::new(),
                 &mut Vec::new(),
             )
             .expect_err("a fd past capacity must be an error, not a silent skip");
@@ -1017,6 +1126,46 @@ mod tests {
         assert_eq!(err.kind(), io::ErrorKind::Other);
     }
 
+    /// A poller whose backend cannot wait is dead, and the tasks parked on it
+    /// must find out. Waking them is not enough: a woken task re-polls its
+    /// socket, sees `WouldBlock` again, and re-arms — and if the poller still
+    /// accepts the arm it parks there for good, on a thread that has exited.
+    /// The fatal path must shut the poller first, so the re-arm is refused
+    /// and the read completes with an error the connection can act on.
+    ///
+    /// The backend is made to fail through the one input it refuses: a
+    /// change naming an fd past capacity, which `Inner::arm` does not check
+    /// (`Poller::stream` does) and `Backend::wait` does.
+    #[tokio::test]
+    async fn l_a_poller_that_cannot_wait_fails_its_parked_reads() {
+        let poller = Poller::new("RDT7", ThreadPriority::CaServerHigh).expect("poller");
+        let (server, _client) = pair();
+        let mut stream = poller.stream(server).expect("stream");
+
+        let read = tokio::spawn(async move {
+            let mut buf = [0u8; 1];
+            stream.read(&mut buf).await
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert_eq!(poller.armed_fds(), 1, "the read is parked on the poller");
+
+        poller
+            .inner
+            .arm(
+                FD_CAPACITY as RawFd + 1,
+                Interest::Read,
+                std::task::Waker::noop(),
+            )
+            .expect("the armed set takes it; the backend is what refuses");
+
+        let outcome = tokio::time::timeout(std::time::Duration::from_secs(5), read)
+            .await
+            .expect("a read parked on a dead poller must not park forever")
+            .expect("join");
+        let err = outcome.expect_err("the read fails rather than pretending to wait");
+        assert_eq!(err.kind(), io::ErrorKind::Other, "{err}");
+    }
+
     /// The armed set and its changelist, without a poll thread to race the
     /// assertions. `Inner::drain_changes` is the poll thread's first act on
     /// every turn, so calling it by hand is calling the same code.
@@ -1049,15 +1198,17 @@ mod tests {
         let inner = bare_inner();
         let mut out = Vec::new();
 
+        let mut closing = Vec::new();
+
         arm(&inner, 7, Interest::Read);
-        inner.drain_changes(&mut out);
+        inner.drain_changes(&mut out, &mut closing);
         assert_eq!(out, [change(7, Interest::Read, Action::Arm)]);
 
         // Delivery queues the one-shot delete; the task re-arms before the
         // poll thread gets back round to draining it.
         assert!(inner.take_ready(7, Interest::Read).is_some());
         arm(&inner, 7, Interest::Read);
-        inner.drain_changes(&mut out);
+        inner.drain_changes(&mut out, &mut closing);
         assert_eq!(
             out,
             [change(7, Interest::Read, Action::Arm)],
@@ -1066,39 +1217,125 @@ mod tests {
     }
 
     /// libevent's second rule: a delete of something the kernel was never told
-    /// about is dropped rather than submitted.
+    /// about is dropped rather than submitted — and with nothing to remove
+    /// first, the socket closes on the spot.
     #[test]
     fn h_a_delete_of_an_unregistered_interest_is_cancelled() {
         let inner = bare_inner();
         let mut out = Vec::new();
+        let mut closing = Vec::new();
+        let (server, _client) = pair();
+        let fd = server.as_raw_fd();
 
-        arm(&inner, 7, Interest::Read);
+        arm(&inner, fd, Interest::Read);
         // The connection died before the poll thread ever drained the add.
-        inner.disarm_all(7);
-        inner.drain_changes(&mut out);
+        inner.disarm_all(server);
+        assert!(
+            !is_open(fd),
+            "nothing in the kernel to remove: closed at once"
+        );
+        inner.drain_changes(&mut out, &mut closing);
         assert!(out.is_empty(), "nothing to undo in the kernel: {out:?}");
+        assert!(
+            closing.is_empty(),
+            "nothing left for the poll thread to close"
+        );
         assert_eq!(inner.armed.lock().expect("armed").slots.len(), 0);
     }
 
     /// The other side of that rule, and the one-shot invariant's kernel half:
-    /// what the kernel does hold is deleted, exactly once.
+    /// what the kernel does hold is deleted, exactly once — and the socket
+    /// stays open until that delete is out, riding in the same drain.
     #[test]
     fn i_a_delete_of_a_registered_interest_is_emitted_once() {
         let inner = bare_inner();
         let mut out = Vec::new();
+        let mut closing = Vec::new();
+        let (server, _client) = pair();
+        let fd = server.as_raw_fd();
 
-        arm(&inner, 7, Interest::Write);
-        inner.drain_changes(&mut out);
-        inner.disarm_all(7);
-        inner.drain_changes(&mut out);
-        assert_eq!(out, [change(7, Interest::Write, Action::Disarm)]);
+        arm(&inner, fd, Interest::Write);
+        inner.drain_changes(&mut out, &mut closing);
+        inner.disarm_all(server);
+        assert!(is_open(fd), "registered: the close waits for the delete");
+        inner.drain_changes(&mut out, &mut closing);
+        assert_eq!(out, [change(fd, Interest::Write, Action::Disarm)]);
+        assert_eq!(closing.len(), 1, "the socket rides with its delete");
+        assert!(is_open(fd), "and is still open until the backend takes it");
+        // What a backend does once the delete is applied.
+        closing.clear();
+        assert!(!is_open(fd));
 
-        inner.drain_changes(&mut out);
+        inner.drain_changes(&mut out, &mut closing);
         assert!(
             out.is_empty(),
             "a drained change is not re-emitted: {out:?}"
         );
         assert_eq!(inner.armed.lock().expect("armed").slots.len(), 0);
+    }
+
+    /// Boundary: the poller is already shut down when the socket comes back.
+    /// No poll thread will ever drain the delete, so the close is immediate,
+    /// and the slot does not keep a socket nobody will take.
+    #[test]
+    fn o_a_socket_given_back_to_a_shut_down_poller_closes_at_once() {
+        let inner = bare_inner();
+        let mut out = Vec::new();
+        let mut closing = Vec::new();
+        let (server, _client) = pair();
+        let fd = server.as_raw_fd();
+
+        arm(&inner, fd, Interest::Read);
+        inner.drain_changes(&mut out, &mut closing);
+        inner.retire();
+        inner.disarm_all(server);
+        assert!(!is_open(fd), "no thread left to close it later");
+        assert_eq!(inner.armed.lock().expect("armed").slots.len(), 0);
+    }
+
+    /// The poll thread's exit sweep: a parked task is woken, its next arm is
+    /// refused, and a socket held for a delete that will never go out is
+    /// closed — on both exits, since both end in `retire`.
+    #[test]
+    fn p_retire_wakes_the_parked_and_closes_what_it_holds() {
+        struct Flag(AtomicBool);
+        impl std::task::Wake for Flag {
+            fn wake(self: Arc<Self>) {
+                self.0.store(true, Ordering::Release);
+            }
+        }
+        let inner = bare_inner();
+        let mut out = Vec::new();
+        let mut closing = Vec::new();
+        let (parked, _c1) = pair();
+        let parked_fd = parked.as_raw_fd();
+        let (dropped, _c2) = pair();
+        let dropped_fd = dropped.as_raw_fd();
+
+        let woken = Arc::new(Flag(AtomicBool::new(false)));
+        let waker = Waker::from(Arc::clone(&woken));
+        inner.arm(parked_fd, Interest::Read, &waker).expect("arm");
+        arm(&inner, dropped_fd, Interest::Read);
+        inner.drain_changes(&mut out, &mut closing);
+        inner.disarm_all(dropped);
+        assert!(
+            is_open(dropped_fd),
+            "held for a delete the thread now never sends"
+        );
+
+        inner.retire();
+        assert!(woken.0.load(Ordering::Acquire), "the parked task is woken");
+        assert!(
+            !is_open(dropped_fd),
+            "the held socket is closed by the sweep"
+        );
+        assert!(is_open(parked_fd), "a socket still owned by a task is not");
+        assert!(
+            inner.arm(parked_fd, Interest::Read, &waker).is_err(),
+            "the woken task's re-arm is refused, which is its error"
+        );
+        inner.disarm_all(parked);
+        assert!(!is_open(parked_fd), "and its own drop closes at once");
     }
 
     /// The whole point of the changelist: holding connections costs nothing
@@ -1109,13 +1346,15 @@ mod tests {
         let inner = bare_inner();
         let mut out = Vec::new();
 
+        let mut closing = Vec::new();
+
         for fd in 3..11 {
             arm(&inner, fd, Interest::Read);
         }
-        inner.drain_changes(&mut out);
+        inner.drain_changes(&mut out, &mut closing);
         assert_eq!(out.len(), 8, "eight arms, eight changes: {out:?}");
 
-        inner.drain_changes(&mut out);
+        inner.drain_changes(&mut out, &mut closing);
         assert!(
             out.is_empty(),
             "eight registrations already placed cost nothing to keep: {out:?}"
@@ -1131,28 +1370,33 @@ mod tests {
         let inner = bare_inner();
         let mut out = Vec::new();
 
-        arm(&inner, 7, Interest::Read);
-        arm(&inner, 7, Interest::Write);
-        assert_eq!(inner.armed.lock().expect("armed").dirty, [7]);
-        inner.drain_changes(&mut out);
+        let mut closing = Vec::new();
+        let (server, _client) = pair();
+        let fd = server.as_raw_fd();
+
+        arm(&inner, fd, Interest::Read);
+        arm(&inner, fd, Interest::Write);
+        assert_eq!(inner.armed.lock().expect("armed").dirty, [fd]);
+        inner.drain_changes(&mut out, &mut closing);
         out.sort_by_key(|c| c.interest == Interest::Write);
         assert_eq!(
             out,
             [
-                change(7, Interest::Read, Action::Arm),
-                change(7, Interest::Write, Action::Arm)
+                change(fd, Interest::Read, Action::Arm),
+                change(fd, Interest::Write, Action::Arm)
             ]
         );
 
-        inner.disarm_all(7);
-        inner.drain_changes(&mut out);
+        inner.disarm_all(server);
+        inner.drain_changes(&mut out, &mut closing);
         out.sort_by_key(|c| c.interest == Interest::Write);
         assert_eq!(
             out,
             [
-                change(7, Interest::Read, Action::Disarm),
-                change(7, Interest::Write, Action::Disarm)
+                change(fd, Interest::Read, Action::Disarm),
+                change(fd, Interest::Write, Action::Disarm)
             ]
         );
+        assert_eq!(closing.len(), 1, "one socket behind the two deletes");
     }
 }

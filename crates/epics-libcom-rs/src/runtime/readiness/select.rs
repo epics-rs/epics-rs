@@ -59,11 +59,16 @@
 //! pipe would block the arming thread, which is a hang in the path that exists
 //! to prevent one. [`SelectBackend::interrupt`] therefore writes only on the
 //! `false -> true` edge of `wake_pending`, and the poll thread clears that
-//! flag after it drains. The ordering that makes this lossless is that
-//! [`super::Inner::arm`] records its change *before* it calls `interrupt`: a
-//! byte that was already drained belongs to a change the next drain can see.
+//! flag after it drains — after, because a clear that preceded the read would
+//! let an `interrupt` slip a byte in between for the read to swallow, and the
+//! flag would then stay up over an empty pipe with nothing left to lower it.
+//! The ordering that makes the late clear lossless is that
+//! [`super::Inner::arm`] records its change *before* it calls `interrupt`: an
+//! interrupt suppressed by the flag belongs to a change the next drain can
+//! see.
 
 use std::io;
+use std::net::TcpStream;
 use std::os::fd::RawFd;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -187,9 +192,6 @@ impl SelectBackend {
 
     fn drain_wake(&self) {
         let mut sink = [0u8; 64];
-        // Clearing the flag before the read is what makes a concurrent
-        // `interrupt` write a byte we are still going to see rather than skip.
-        self.wake_pending.store(false, Ordering::Release);
         loop {
             // SAFETY: `self.wake[0]` is our open pipe read end; `sink` backs
             // the pointer for the whole call.
@@ -207,6 +209,15 @@ impl SelectBackend {
                 break;
             }
         }
+        // Cleared after the read, never before it. An `interrupt` that lands
+        // between a clear and the read would raise the flag and write a byte
+        // the read then swallows — the flag left up over an empty pipe, and
+        // since this runs only when the pipe is readable, nothing lowers it
+        // again. One that lands between the read and this clear is suppressed
+        // instead, and that loses nothing: its change was recorded before it
+        // was called, and the poll thread drains changes before it next
+        // blocks.
+        self.wake_pending.store(false, Ordering::Release);
     }
 }
 
@@ -246,7 +257,12 @@ fn collect(
 }
 
 impl Backend for SelectBackend {
-    fn wait(&self, changes: &[Change], ready: &mut Vec<(RawFd, Interest)>) -> io::Result<()> {
+    fn wait(
+        &self,
+        changes: &[Change],
+        closing: &mut Vec<TcpStream>,
+        ready: &mut Vec<(RawFd, Interest)>,
+    ) -> io::Result<()> {
         // Checked before anything is applied: a half-applied changelist would
         // leave the caller's armed set and these sets disagreeing, and there
         // is no path back from that.
@@ -275,6 +291,12 @@ impl Backend for SelectBackend {
             }
             (*read, *write, *nfds)
         };
+        // The sockets given back with this changelist close here, with their
+        // bits already clear, so the `select` below never names a closed fd.
+        // It would refuse one: `EBADF` at entry on Linux, and on every rescan
+        // under the BSD `kern_select` libbsd carries, where a wake-up walks
+        // the sets again.
+        closing.clear();
 
         // SAFETY: both sets outlive the call and are `nfds`-bit addressable by
         // construction (every fd was range-checked above); the null timeout is
@@ -347,6 +369,58 @@ mod tests {
         const { assert!(WORDS * WORD_BITS == FD_CAPACITY) };
     }
 
+    /// The clear must come after the read, not before it. An `interrupt`
+    /// landing between a clear-first and its read raises the flag and writes
+    /// a byte the read then swallows, leaving the flag up over an empty pipe;
+    /// nothing ever lowers it again, and every later `interrupt` is
+    /// suppressed. The observable invariant, once no drain is in progress:
+    /// `wake_pending` up means a byte is in the pipe.
+    ///
+    /// A stress test, since the window is between two instructions on one
+    /// thread: 20k interrupts against a drain loop, then the invariant is
+    /// checked with the pipe polled at zero timeout.
+    #[test]
+    fn an_interrupt_that_races_the_drain_is_never_lost() {
+        use std::sync::Arc;
+        use std::sync::atomic::AtomicBool;
+
+        let backend = Arc::new(SelectBackend::new().expect("backend"));
+        let done = Arc::new(AtomicBool::new(false));
+        let hammer = {
+            let backend = Arc::clone(&backend);
+            let done = Arc::clone(&done);
+            std::thread::spawn(move || {
+                for _ in 0..20_000 {
+                    backend.interrupt().expect("interrupt");
+                }
+                done.store(true, Ordering::Release);
+            })
+        };
+        let readable = |timeout_ms: libc::c_int| {
+            let mut pfd = libc::pollfd {
+                fd: backend.wake[0],
+                events: libc::POLLIN,
+                revents: 0,
+            };
+            // SAFETY: `pfd` backs the pointer for the whole call.
+            let rc = unsafe { libc::poll(&mut pfd, 1, timeout_ms) };
+            rc > 0 && pfd.revents & libc::POLLIN != 0
+        };
+        while !done.load(Ordering::Acquire) {
+            if readable(1) {
+                backend.drain_wake();
+            }
+        }
+        hammer.join().expect("join");
+        if readable(0) {
+            backend.drain_wake();
+        }
+        assert!(
+            !backend.wake_pending.load(Ordering::Acquire),
+            "wake_pending is up over an empty pipe: every later interrupt is lost"
+        );
+    }
+
     #[test]
     fn interrupt_writes_once_until_the_drain_clears_it() {
         let backend = SelectBackend::new().expect("backend");
@@ -391,14 +465,16 @@ mod tests {
         a.write_all(b"x").expect("peer write");
         let mut ready = Vec::new();
         backend
-            .wait(&[arm(fd, Interest::Read)], &mut ready)
+            .wait(&[arm(fd, Interest::Read)], &mut Vec::new(), &mut ready)
             .expect("first wait");
         assert_eq!(ready, [(fd, Interest::Read)]);
 
         // Nothing is read from the socket, so it is still level-ready. An
         // empty changelist must not mean an empty registration set.
         ready.clear();
-        backend.wait(&[], &mut ready).expect("second wait");
+        backend
+            .wait(&[], &mut Vec::new(), &mut ready)
+            .expect("second wait");
         assert_eq!(
             ready,
             [(fd, Interest::Read)],
@@ -414,7 +490,9 @@ mod tests {
             action: Action::Disarm,
         };
         backend.interrupt().expect("interrupt");
-        backend.wait(&[disarm], &mut ready).expect("third wait");
+        backend
+            .wait(&[disarm], &mut Vec::new(), &mut ready)
+            .expect("third wait");
         assert!(ready.is_empty(), "the disarmed fd is gone: {ready:?}");
     }
 
@@ -429,8 +507,85 @@ mod tests {
         let mut ready = Vec::new();
         // No armed fd at all: the only thing that can end this wait is the
         // self-pipe.
-        backend.wait(&[], &mut ready).expect("wait");
+        backend
+            .wait(&[], &mut Vec::new(), &mut ready)
+            .expect("wait");
         assert!(ready.is_empty());
         handle.join().expect("join");
+    }
+
+    /// A connected pair over loopback: (client, accepted server side).
+    fn pair() -> (std::net::TcpStream, std::net::TcpStream) {
+        let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).expect("bind");
+        let addr = listener.local_addr().expect("local_addr");
+        let client = std::net::TcpStream::connect(addr).expect("connect");
+        let (server, _) = listener.accept().expect("accept");
+        (client, server)
+    }
+
+    fn is_open(fd: RawFd) -> bool {
+        // SAFETY: `F_GETFD` takes no pointer and touches nothing.
+        unsafe { libc::fcntl(fd, libc::F_GETFD) != -1 }
+    }
+
+    /// The fact the deferred close is built on, pinned: a closed fd left in
+    /// the set is `EBADF` from the kernel, not a quiet skip. Linux checks at
+    /// entry; libbsd's `kern_select` also on every rescan, which no host test
+    /// can reach.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_kernel_refuses_a_closed_fd_left_in_the_set() {
+        use std::os::fd::AsRawFd;
+        let backend = SelectBackend::new().expect("backend");
+        let (_client, server) = pair();
+        let fd = server.as_raw_fd();
+        let mut ready = Vec::new();
+        backend.interrupt().expect("interrupt");
+        backend
+            .wait(&[arm(fd, Interest::Read)], &mut Vec::new(), &mut ready)
+            .expect("registered");
+
+        drop(server);
+        backend.interrupt().expect("interrupt");
+        let err = backend
+            .wait(&[], &mut Vec::new(), &mut ready)
+            .expect_err("a closed fd in the set must not be silently skipped");
+        assert_eq!(err.raw_os_error(), Some(libc::EBADF));
+    }
+
+    /// The order the invariant needs, on this backend: the delete clears the
+    /// bit, then the socket closes, then `select` runs — so the call that
+    /// follows a dropped connection is an ordinary wait, not the `EBADF`
+    /// above.
+    #[test]
+    fn a_socket_given_back_with_its_delete_closes_after_the_bit_clears() {
+        use std::io::Write;
+        use std::os::fd::AsRawFd;
+        let backend = SelectBackend::new().expect("backend");
+        let (mut client, server) = pair();
+        let fd = server.as_raw_fd();
+        let mut ready = Vec::new();
+        client.write_all(b"x").expect("peer write");
+        backend
+            .wait(&[arm(fd, Interest::Read)], &mut Vec::new(), &mut ready)
+            .expect("registered");
+        assert_eq!(ready, [(fd, Interest::Read)]);
+
+        // The connection is dropped: its delete and its socket arrive in one
+        // changelist, and the byte it never read is still in the socket.
+        let disarm = Change {
+            fd,
+            interest: Interest::Read,
+            action: Action::Disarm,
+        };
+        let mut closing = vec![server];
+        ready.clear();
+        backend.interrupt().expect("interrupt");
+        backend
+            .wait(&[disarm], &mut closing, &mut ready)
+            .expect("the bit is clear before the fd is closed");
+        assert!(closing.is_empty(), "the backend took the close");
+        assert!(!is_open(fd), "and performed it before blocking");
+        assert!(ready.is_empty(), "nothing else was armed: {ready:?}");
     }
 }

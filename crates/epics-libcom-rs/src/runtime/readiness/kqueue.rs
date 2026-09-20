@@ -91,6 +91,7 @@
 //! not worth arguing about on a quiet one.
 
 use std::io;
+use std::net::TcpStream;
 use std::os::fd::RawFd;
 use std::sync::Mutex;
 
@@ -264,7 +265,12 @@ impl Drop for KqueueBackend {
 }
 
 impl Backend for KqueueBackend {
-    fn wait(&self, changes: &[Change], ready: &mut Vec<(RawFd, Interest)>) -> io::Result<()> {
+    fn wait(
+        &self,
+        changes: &[Change],
+        closing: &mut Vec<TcpStream>,
+        ready: &mut Vec<(RawFd, Interest)>,
+    ) -> io::Result<()> {
         // Checked before anything is submitted: a half-applied changelist
         // would leave the caller's armed set and the kqueue disagreeing, and
         // there is no path back from that.
@@ -294,6 +300,13 @@ impl Backend for KqueueBackend {
             events.resize(submit.len(), KEvent::zeroed());
         }
 
+        // The sockets given back with this changelist close here, before the
+        // `kevent` that carries their deletes rather than after it, because
+        // that one call is also the one that blocks. `close(2)` drops the
+        // knotes itself, so the deletes below then miss — the `EV_ERROR` the
+        // result walk ignores.
+        closing.clear();
+
         // SAFETY: both buffers outlive the call; a null timeout is the
         // documented "block until an event" argument. Submitting the
         // changelist here rather than in a call of its own is what satisfies
@@ -316,11 +329,11 @@ impl Backend for KqueueBackend {
         for event in &events[..rc as usize] {
             if event.flags & EV_ERROR != 0 {
                 // A delete that missed is the ordinary case, not a defect.
-                // `Registration`'s `Drop` queues it and the socket closes
-                // immediately after, and closing an fd already takes its
-                // registrations out of the kqueue — so by the time this
-                // submits, there is usually nothing left to delete and the
-                // kernel says ENOENT or EBADF. libevent skips exactly these.
+                // The socket it names was closed just above, before this
+                // call submitted it, and closing an fd already takes its
+                // registrations out of the kqueue — so there is nothing left
+                // to delete and the kernel says ENOENT or EBADF. libevent
+                // skips exactly these.
                 //
                 // A failed *add* is the opposite: a task is parked behind it.
                 // Reporting it as readiness is what gets that task its own

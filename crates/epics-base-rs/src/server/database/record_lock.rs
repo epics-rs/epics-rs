@@ -366,7 +366,7 @@ use super::PvDatabase;
 /// The membership list is NOT here — a merge rewrites it, and it lives in
 /// [`Registry`] behind the registry mutex. What a guard needs at release time
 /// is here instead, so releasing never takes the registry lock: doing that
-/// while holding the set would close a cycle against [`Registry::set_of`],
+/// while holding the set would close a cycle against [`Registry::real_set_of`],
 /// which takes the registry lock and then the set.
 struct LockSet {
     /// C's `lockSet::id` (`dbLockPvt.h:33`). Assigned once by
@@ -425,8 +425,8 @@ type Set = &'static LockSet;
 /// `plock_set` is the association C guards with the `lockRecord`'s spinlock
 /// (`dbLockPvt.h:53-57`): written only by [`Registry`], which holds the
 /// registry mutex, and read with no lock at all, exactly as C reads it under
-/// either lock. A stale read is not a hazard — it is what the `retry:` loop in
-/// [`PvDatabase::acquire_through`] exists to catch.
+/// either lock. A stale read is not a hazard — it is what the re-check loop in
+/// [`Self::acquire_fresh`] exists to catch.
 pub(crate) struct LockRecord {
     plock_set: AtomicPtr<LockSet>,
 }

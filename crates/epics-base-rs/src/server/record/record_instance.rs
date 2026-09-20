@@ -1066,7 +1066,7 @@ pub(crate) struct ProcessPlan {
 ///
 /// Same-thread aliasing is what the `RwLock` used to refuse by deadlocking
 /// (a `write()` under a live guard of the same record never returned). The
-/// set recurses, so that refusal is [`Self::borrow`]'s now, and it panics —
+/// set recurses, so that refusal is `borrow`'s now, and it panics —
 /// on the thread that did it, naming the record — instead of parking it.
 pub struct RecordCell {
     /// C `dbCommon::lset` (`dbLockPvt.h:52`). Born pointing at the bootstrap
@@ -1086,7 +1086,7 @@ pub struct RecordCell {
     /// here without the lock set, as C reads `precord->bkpt` (see
     /// [`BkptFlag`]).
     bkpt: BkptFlag,
-    /// Which published `cp_links` map [`Self::sources_cp_edges`] was resolved
+    /// Which published `cp_links` map `PvDatabase::sources_cp_edges` was resolved
     /// from, or 0 before it ever was.
     ///
     /// The question the cache answers — "does any CP/CPP edge name this
@@ -3680,7 +3680,7 @@ impl RecordInstance {
 
     /// The field's value as C `dbGetLink(plink, DBR_STRING, ...)` delivers it —
     /// the SOURCE side of an input link read with
-    /// [`LinkReadAs::String`](super::record_trait::LinkReadAs::String).
+    /// [`LinkReadAs::String`].
     ///
     /// C converts at the source, through `dbConvert.c`'s
     /// `[field_type][DBR_STRING]` table: a `DBF_ENUM` field goes through

@@ -306,7 +306,7 @@ impl<'a> LinkBacking<'a> {
 }
 
 /// What a poster's resolve produced —
-/// [`PvDatabase::resolve_link_backed_metadata_for_posts`](crate::server::database::PvDatabase::resolve_link_backed_metadata_for_posts).
+/// `PvDatabase::resolve_link_backed_metadata_for_posts`.
 ///
 /// Owns the map so the borrowed [`LinkBacking`] can be taken from it at the
 /// post, and — the reason it exists rather than a bare `HashMap` — carries the
@@ -319,7 +319,7 @@ pub enum PostBacking {
     /// The resolve ran and had no link to walk: no link field was set, or the
     /// record backs no metadata with one. An answer, not a decline.
     Empty,
-    /// The resolve declined — see [`LinkBacking::declined`].
+    /// The resolve declined — see `LinkBacking::declined`.
     Declined,
 }
 

@@ -483,7 +483,7 @@ impl OutTarget {
 /// a `DBF_ENUM`/`DBF_MENU` source read with `DBR_STRING` delivers its state
 /// LABEL, and a `DBF_CHAR` array read with `DBF_CHAR` delivers bytes, not a
 /// number. The record declares the request
-/// ([`Record::input_link_read_as`]); the framework, which is the side that
+/// ([`Record::input_link_request`]); the framework, which is the side that
 /// can address the source, performs the conversion.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LinkReadAs {
@@ -3490,8 +3490,8 @@ pub trait Record: Send + Sync + 'static {
     ///
     /// C reads a link off `dbCommon` as a `struct link` and copies nothing; a
     /// scan cycle that asks [`Self::get_field`] instead pays a `String` clone,
-    /// a [`PvString`](crate::types::PvString) wrap, an
-    /// [`EpicsValue`](crate::types::EpicsValue) construction and a drop for
+    /// a [`PvString`] wrap, an
+    /// [`EpicsValue`] construction and a drop for
     /// every link the type declares — 21 of them per `calc` cycle, whether or
     /// not a single one is wired.
     ///
@@ -3510,12 +3510,12 @@ pub trait Record: Send + Sync + 'static {
     /// C `monitor()`'s four deadband cells, read in one question: the MDEL /
     /// ADEL thresholds and the MLST / ALST values the record last posted at.
     /// `None` is a cell this type does not carry, which is the "nothing
-    /// posted yet" state [`check_deadband`](crate::server::record::check_deadband)
+    /// posted yet" state `check_deadband`
     /// takes for MLST/ALST and a zero deadband for MDEL/ADEL.
     ///
     /// Asked as one question because the cycle otherwise asks
     /// [`Self::get_field`] four times through the vtable and pays an
-    /// [`EpicsValue`](crate::types::EpicsValue) per answer. This default body
+    /// [`EpicsValue`] per answer. This default body
     /// is codegen'd per record type, so the four asks inside it are static
     /// calls with literal field names on the type's own cells; overriding it
     /// buys nothing and no record type should.

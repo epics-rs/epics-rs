@@ -783,7 +783,7 @@ impl AlarmPosts {
 #[derive(Clone, Copy)]
 struct TailCtx<'a> {
     posts: CyclePosts,
-    /// The cycle's [`ProcessPlan`], so the tail's two type-static
+    /// The cycle's `ProcessPlan`, so the tail's two type-static
     /// dispatchers can be skipped without re-taking the record's lock to ask
     /// what type it is.
     plan: &'a crate::server::record::record_instance::ProcessPlan,
@@ -920,7 +920,7 @@ enum SimOutcome {
     DeferRead(std::time::Duration),
 }
 
-/// Which link fields of a [`Record::multi_input_links`] list are SET, read
+/// Which link fields of a [`Record::multi_input_links`](crate::server::record::Record::multi_input_links) list are SET, read
 /// once at the top of a process cycle and shared by both stages that want
 /// them.
 ///
@@ -928,15 +928,15 @@ enum SimOutcome {
 /// stock database wires none of them, so any per-link entry — a text, a
 /// parse, a set-link record — was a heap allocation per record per pass. The
 /// parse and target of a set link live in the record's own cache
-/// ([`RecordInstance::parsed_inputs`]) and are read from there, under the
+/// (`RecordInstance::parsed_inputs`) and are read from there, under the
 /// record's guard, by the fetch that uses them.
 pub struct InputLinkTexts {
     /// The list the mask indexes — a record's
-    /// [`Record::multi_input_links`], or the subset it selected for this pass.
+    /// [`Record::multi_input_links`](crate::server::record::Record::multi_input_links), or the subset it selected for this pass.
     /// Carried WITH the mask, and the only list a reader is offered, so no
     /// reader can pair one list's slots with another list's bits.
     links: &'static [(&'static str, &'static str)],
-    /// The record's own [`Record::multi_input_links`] — the list the parse
+    /// The record's own [`Record::multi_input_links`](crate::server::record::Record::multi_input_links) — the list the parse
     /// cache is indexed by, and what [`Self::links`] is unless the record
     /// narrowed it for this pass. Asked of the record once, here: the fetch
     /// loop and the resolved-links report take it from this value.
@@ -1094,10 +1094,10 @@ struct MultiInputLink<'a> {
     link_field: &'static str,
     val_field: &'static str,
     parsed: &'a crate::server::record::ParsedLink,
-    /// [`Record::input_link_request`] for the link — C's `dbrType` argument
+    /// [`Record::input_link_request`](crate::server::record::Record::input_link_request) for the link — C's `dbrType` argument
     /// to `dbGetLink`.
     request: crate::server::record::InputLinkRequest,
-    /// [`Record::input_link_failure_is_inert`] for the link.
+    /// [`Record::input_link_failure_is_inert`](crate::server::record::Record::input_link_failure_is_inert) for the link.
     failure_is_inert: bool,
 }
 
@@ -1174,7 +1174,7 @@ impl PvDatabase {
     /// caller and so packs the value and alarm into a fetch and a source
     /// alarm on the way. This frame asks nothing the general one does not;
     /// it only keeps the value where it is consumed. Which is why its
-    /// callers are gated on [`ProcessPlan::multi_inputs_read_native`]: the
+    /// callers are gated on `ProcessPlan::multi_inputs_read_native`: the
     /// conversion step it omits is a no-op for a native request, and the
     /// inert-failure test it omits is settled `false` by the same plan bit.
     /// Self-reads are excluded by the caller as C excludes them from
@@ -3152,7 +3152,7 @@ impl PvDatabase {
         tsel.stamp(&inst.name, &mut inst.common, /* is_soft */ true);
     }
 
-    /// The text every link in [`Record::multi_input_links`] held when this
+    /// The text every link in [`Record::multi_input_links`](crate::server::record::Record::multi_input_links) held when this
     /// process cycle started.
     ///
     /// One read serves both consumers. A by-name field read is a linear search
@@ -6176,7 +6176,7 @@ impl PvDatabase {
     /// fetch uses.
     ///
     /// The DBR class of the read is the RECORD's
-    /// ([`Record::input_link_read_as`](crate::server::record::Record::input_link_read_as), C's `dbGetLink` `dbrType` argument),
+    /// ([`Record::input_link_request`](crate::server::record::Record::input_link_request), C's `dbGetLink` `dbrType` argument),
     /// resolved from the SOURCE's metadata by the same owner the OUT side uses
     /// ([`Self::resolve_out_target`]): a record that switches on the source's
     /// DBF class (sseq `DOLn`, `sseqRecord.c:640-705`) gets the value C's
@@ -7329,7 +7329,7 @@ impl PvDatabase {
     }
 
     /// Apply the reader's declared `dbrType` request
-    /// ([`Record::input_link_read_as`](crate::server::record::Record::input_link_read_as))
+    /// ([`Record::input_link_request`](crate::server::record::Record::input_link_request))
     /// to one delivered link value — C's `dbGetLink(plink, dbrType, ...)`
     /// second argument, which the generic fetch paths never passed: they
     /// delivered the source's native value and let the target field coerce
@@ -7498,7 +7498,7 @@ impl PvDatabase {
     /// lookup plus the TARGET record's read lock, and it must run with no
     /// reader lock held — a self-referencing link would otherwise re-enter this
     /// record's own gate — so it cannot be deferred inside the record's answer.
-    /// Asking [`Record::input_link_request`] first is what keeps it off the
+    /// Asking [`Record::input_link_request`](crate::server::record::Record::input_link_request) first is what keeps it off the
     /// cycle of every record type whose C switch is on the link FIELD alone,
     /// which is all of them but `sseq`, `aSub`, `lsi` and `lso`.
     fn input_link_read_as(

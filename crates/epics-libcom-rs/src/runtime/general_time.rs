@@ -270,7 +270,7 @@ pub fn notify_clock_sync(t_synced: SystemTime) {
 /// Get the current time from the highest-priority provider that succeeds.
 ///
 /// C parity (`epicsGeneralTime.c:159-163`): while only the built-in
-/// OS clock can answer ([`USE_OSD_GET_CURRENT`]), this returns it
+/// OS clock can answer (`USE_OSD_GET_CURRENT`), this returns it
 /// directly — before the list lock, without walking the provider list
 /// and without touching any shared state. The monotonic ratchet is
 /// therefore **not** consulted: a backward wall-clock step (NTP slew,

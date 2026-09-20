@@ -26,7 +26,7 @@
 //! > waker, and only the task that then observed `WouldBlock` may arm it
 //! > again.
 //! > **MUST NOT** any path remove an fd from the armed set other than
-//! > [`StreamInner`]'s `Drop` and the one-shot removal above — and no fd may
+//! > `StreamInner`'s `Drop` and the one-shot removal above — and no fd may
 //! > be closed while the kernel is still watching it, which is why the poll
 //! > thread is the one that closes it.
 //!
@@ -127,7 +127,7 @@ mod select;
 /// Both arms are compiled on RTEMS rather than `cfg`-ed apart, so a type error
 /// in either fails the RTEMS gate; the choice between them is a runtime one
 /// because the fact it turns on — the BSP's own RTEMS version — is only
-/// knowable at runtime. See [`rtems_kqueue_usable`].
+/// knowable at runtime. See `rtems_kqueue_usable`.
 enum ActiveBackend {
     Select(select::SelectBackend),
     #[cfg(target_os = "rtems")]

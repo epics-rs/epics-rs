@@ -680,7 +680,7 @@ pub struct BlockingPvaServer {
     /// live connection.
     conn_pool: WorkerPool<3>,
     /// The executor connection futures spawn onto — see
-    /// [`pva_task_executor`](super::blocking::pva_task_executor). `None` on
+    /// [`pva_task_executor`]. `None` on
     /// `tokio_backend`, where the runtime is the executor.
     task_exec: Option<Arc<epics_base_rs::runtime::background::DedicatedExecutor>>,
     shutdown: AtomicBool,

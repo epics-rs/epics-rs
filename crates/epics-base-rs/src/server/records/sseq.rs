@@ -1532,7 +1532,7 @@ impl Record for SseqRecord {
     ///
     /// The per-cycle read never sees a constant again — C pins its
     /// `dol_field_type` to `DBF_NOACCESS`, which falls to `processCallback`'s
-    /// `default: break` ([`Self::input_link_read_as`]).
+    /// `default: break` ([`Self::input_link_read_as_from_source`]).
     ///
     /// `SELL → SELN` is the other seed C declares (`sseqRecord.c:187-192`,
     /// `recGblInitConstantLink(&pR->sell, DBF_USHORT, &pR->seln)` — the same one

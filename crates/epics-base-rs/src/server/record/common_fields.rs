@@ -18,7 +18,7 @@ use crate::types::PvString;
 /// for the whole of the chain it is stepping.
 ///
 /// `Clone` makes a fresh byte with the same value, as cloning a record's
-/// fields makes a different record; [`Self::share`] is the cell's handle to
+/// fields makes a different record; `Self::share` is the cell's handle to
 /// this one.
 #[derive(Debug, Default)]
 pub struct BkptFlag(Arc<AtomicU8>);
